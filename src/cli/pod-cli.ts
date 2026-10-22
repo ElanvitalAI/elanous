@@ -2,6 +2,12 @@
 // 산출 경로를 한 줄로 알리고 명령의 종료 코드로 끝난다. `--deadline` 생략 시 기존 Pod Job 상한.
 
 import type { Command } from 'commander';
+import { randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
+import { basename, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { putPodShelfImage, listPodShelfImages, type PodShelfImage } from '../task-orchestrator/surfaces/pod-image-source.js';
+import { defaultRemoteRun } from '../task-orchestrator/surfaces/pod-pool.js';
 import { debug } from '../debug/log.js';
 import { readPodMemoryAdvice } from './pod-memory-advice.js';
 import { getUserConfig } from '../user-config.js';
@@ -28,6 +34,10 @@ export interface PodCliDeps {
   poolSpec?: (explicit?: string) => string | null;
   harnessPool?: () => string | undefined;
   memoryAdvice?: (logsDb?: string) => ReturnType<typeof readPodMemoryAdvice>;
+  shelfConfig?: () => { harness?: { imageCommit?: unknown } };
+  shelfPut?: (ref: string, pool: string) => Promise<PodShelfImage>;
+  shelfList?: (pool: string) => Promise<string[]> | string[];
+  shelfTail?: (artifactsDir: string) => string;
 }
 
 const HELP = `elanous pod run [--pool <스펙>] [--skill <이름,…>] [--llm grok] [--clone] [--deadline <초>] -- <명령…>
@@ -63,6 +73,57 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
   };
   const run = deps.run ?? ((options: RunPodCommandOptions) => runPodCommand(options));
   const pod = program.command('pod').description('Pod 명령 Job — 하니스 없이 명령 하나를 돌리고 산출을 돌려받는다');
+  const shelf = pod.command('shelf').description('임의 PR·SHA·가지의 격리 하니스 이미지와 명령 Job');
+  const shelfPool = (explicit?: string) => {
+    const config = (deps.shelfConfig ?? getUserConfig)();
+    const spec = explicit || process.env.ELANOUS_POD_POOL || ('podPool' in (config.harness ?? {}) ? (config.harness as { podPool?: string }).podPool : undefined) || (config as { pod?: { pool?: string } }).pod?.pool;
+    if (!spec) throw new Error('pod shelf: remote pool is not configured');
+    return spec;
+  };
+  shelf.command('put <ref>').description('ref head 이미지를 빌드하거나 레지스트리 태그 재사용')
+    .option('--pool <spec>', '단일 원격 레지스트리 풀 멤버')
+    .action(async (ref: string, opts: { pool?: string }) => {
+      try {
+        const image = await (deps.shelfPut ?? putPodShelfImage)(ref, shelfPool(opts.pool));
+        io.log(`${image.image} (${image.action})`); io.exit(0);
+      } catch (err) { io.error(err instanceof Error ? err.message : String(err)); io.exit(1); }
+    });
+  shelf.command('ls').description('레지스트리의 커밋 이미지 태그 목록')
+    .option('--pool <spec>', '단일 원격 레지스트리 풀 멤버')
+    .action(async (opts: { pool?: string }) => {
+      try {
+        const images = await (deps.shelfList ?? ((pool) => listPodShelfImages(pool, defaultRemoteRun)))(shelfPool(opts.pool));
+        for (const image of images) io.log(image);
+        io.exit(0);
+      } catch (err) { io.error(err instanceof Error ? err.message : String(err)); io.exit(1); }
+    });
+  shelf.command('run <ref>').description('ref 이미지로 명령 Job 실행 · rc 와 출력 꼬리 반환')
+    .option('--pool <spec>', '단일 원격 레지스트리 풀 멤버')
+    .allowUnknownOption(true).allowExcessArguments(true)
+    .action(async (ref: string, opts: { pool?: string }) => {
+      const argv = process.argv.slice(2);
+      const sep = argv.indexOf('--');
+      const args = sep < 0 ? [] : argv.slice(sep + 1);
+      if (!args.length) { io.error('pod shelf run: `--` 뒤에 명령이 없다'); io.exit(2); return; }
+      try {
+        const pool = shelfPool(opts.pool);
+        const image = await (deps.shelfPut ?? putPodShelfImage)(ref, pool);
+        const seat = process.env.ELANOUS_SEAT?.trim();
+        const actor = seat || process.env.USER?.trim() || process.env.LOGNAME?.trim();
+        if (!actor) throw new Error('pod provenance actor missing: ELANOUS_SEAT or USER/LOGNAME required');
+        const runId = randomUUID();
+        const result = await run({ pool, image: image.image, shelfImage: image.image, imageCommit: image.commit,
+          clone: true, source: { kind: 'commit', sha: image.commit }, command: args, runId, returnLogs: true,
+          provenance: { actorKind: seat ? 'seat' : 'human', actor, character: 'command-runner', launchHost: hostname(),
+            entrance: 'pod-shelf-run', kind: 'command', run: runId, phase: 'exec', requestedAt: new Date().toISOString(), reason: 'unknown', argv: basename(args[0]!) },
+        });
+        io.error(`[pod shelf] image ${result.image ?? image.image} · rc ${result.exitCode} · job ${result.job}`);
+        io.log(result.artifactsDir);
+        const tail = (deps.shelfTail ?? ((dir) => readFileSync(join(dir, 'child.log'), 'utf8')))(result.artifactsDir);
+        io.log(tail.slice(-4096));
+        io.exit(result.exitCode);
+      } catch (err) { io.error(err instanceof Error ? err.message : String(err)); io.exit(1); }
+    });
   pod.command('memory').description('실측 기반 Pod 메모리 권고 (읽기 전용)')
     .command('advise').description('골 종류별 standard 16Gi / high 32Gi 권고와 근거')
     .option('--json', '권고와 측정 근거를 JSON 으로')
@@ -110,7 +171,9 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
         // This explicit observation runs after the admission calculation. A slow or failed external
         // probe can never change recommended/limitedBy or slow the ordinary lease status path.
         const externalGitHub = opts.githubEgress ? Object.fromEntries(members.map((member) => {
-          try { return [member.context, (deps.externalGitHub ?? probePoolGitHub)(member.context, kubectl)]; }
+          try {
+            return [member.context, (deps.externalGitHub ?? probePoolGitHub)(member.context, kubectl)];
+          }
           catch { return [member.context, { externalDns: null, githubHttps: null, measuredAt: null, reason: 'probe failed' }]; }
         })) : undefined;
         const result = { pool: spec, ...measure, accounts, perAccount, ...decision, reserved: host.reserved, waitingJobs,
@@ -132,8 +195,10 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
           }
           io.log(`예약(저작 중) ${host.reserved} · 대기 Job ${waitingJobs ?? '?'} · 실행 ${decision.running ?? '?'}`);
           io.log(`임대 없는 실행 ${decision.unleasedRunning ?? '?'}`);
-          if (externalGitHub) for (const [context, probe] of Object.entries(externalGitHub))
-            io.log(`GitHub 외부망 ${context}: DNS=${probe.externalDns ?? '?'} HTTPS=${probe.githubHttps ?? '?'} 측정=${probe.measuredAt ?? '?'}${probe.reason ? ` · ${probe.reason}` : ''}`);
+          if (externalGitHub) for (const [context, probe] of Object.entries(externalGitHub)) {
+            io.log(`GitHub 외부망 ${context}: DNS=${probe.externalDns ?? '?'} HTTPS=${probe.githubHttps ?? '?'} 측정=${probe.measuredAt ?? '?'}${probe.reason ? ` · ${probe.reason}` : ''}${probe.podName ? ` · Pod=${probe.podName}` : ''}`);
+            if (probe.podLog !== undefined) io.log(`GitHub 탐침 로그 ${probe.podName ?? context}: ${JSON.stringify(probe.podLog)}`);
+          }
           io.log(`capacity: ${decision.capacitySlots ?? '?'} 칸 (상한 ${members.reduce((sum, m) => sum + m.capacity, 0)} − Running ${decision.running ?? '?'} − Pending ${decision.pending ?? '?'}; 권장 수에서 건강한 멤버의 임대 없는 실행 차감)`);
           io.log(`memory: ${decision.memorySlots ?? '?'} 칸 (할당 가능 − Running 하니스 상한 합; 골당 16Gi · 모든 네임스페이스의 노드별 기존 예약을 반영해 배치 가능 ${decision.placeableSlots ?? '?'} 칸)`);
           io.log(`lite: ${decision.liteMemorySlots ?? '?'} 칸 (같은 여유를 lite 골 2Gi 로 센 값 · 관측만 — 권장 수는 위 standard 기준)`);
@@ -186,8 +251,17 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
         debug.log('pod.run', 'clone-without-install', { argv0: commandArgs[0], argv1: commandArgs[1] });
       }
       try {
+        const seat = process.env.ELANOUS_SEAT?.trim();
+        const user = process.env.USER?.trim() || process.env.LOGNAME?.trim();
+        const actor = seat || user;
+        if (!actor) throw new Error('pod provenance actor missing: ELANOUS_SEAT or USER/LOGNAME required');
+        const runId = randomUUID();
         const result = await run({
           command: commandArgs,
+          runId,
+          provenance: { actorKind: seat ? 'seat' : 'human', actor,
+            character: 'command-runner', launchHost: hostname(), entrance: 'pod-run', kind: 'command', run: runId,
+            phase: 'exec', requestedAt: new Date().toISOString(), reason: 'unknown', argv: basename(commandArgs[0] || '') },
           returnLogs: true,
           ...(opts.pool ? { pool: opts.pool } : {}),
           ...(skills.length ? { skills } : {}),

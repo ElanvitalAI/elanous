@@ -23,6 +23,8 @@ export type RunStopClass = typeof RUN_STOP_CLASSES[number];
 /** 런 원장 `event='stop'` 줄의 `data` 모양(STOP-AUTOHEAL 이 소비한다). */
 export interface RunStopRecord {
   class: RunStopClass;
+  /** Last known stop site; absent in older ledger rows. */
+  site?: string;
   /** 한 줄 · ≤120자 · 결정 라벨(원 로그 꼬리 금지). */
   cause: string;
   /** 근거 위치 — PR URL · `run-ledger:<runId>:<event>` · 파일 경로. */
@@ -31,6 +33,8 @@ export interface RunStopRecord {
   nextMove: string;
   /** Facts from the complete child JSON, lifted before the Pod stdout tail is shortened. */
   childEvidence?: PodChildEvidence;
+  /** Exact structured Pod error code, when the host received one. */
+  terminationReason?: 'pod-job-failed';
 }
 
 export const RUN_STOP_EVENT = 'stop';
@@ -48,6 +52,7 @@ export interface RunStopInput {
   /** 관측용 — 어느 자리가 불렀나(merge-hold · implement-aborted · draft-pr-open-failed · pod-exit · launch-failed). */
   site?: string;
   childEvidence?: PodChildEvidence;
+  terminationReason?: 'pod-job-failed';
 }
 
 export function isRunStopClass(value: unknown): value is RunStopClass {
@@ -100,10 +105,12 @@ export function forgetRunStop(runId: string): void {
 export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appendRunLedgerEntry): RunLedgerEntry {
   const record: RunStopRecord = {
     class: isRunStopClass(input.class) ? input.class : 'unclassified',
+    ...(input.site ? { site: input.site } : {}),
     cause: boundRunStopCause(input.cause),
     evidenceRef: input.evidenceRef,
     nextMove: input.nextMove,
     ...(input.childEvidence ? { childEvidence: input.childEvidence } : {}),
+    ...(input.terminationReason ? { terminationReason: input.terminationReason } : {}),
   };
   const entry: RunLedgerEntry = {
     timestamp: new Date().toISOString(), runId: input.runId, event: RUN_STOP_EVENT,
@@ -126,5 +133,7 @@ export function readRunStopRecord(entry: RunLedgerEntry): RunStopRecord | undefi
   const data = entry.data as Partial<RunStopRecord>;
   if (typeof data.cause !== 'string' || typeof data.evidenceRef !== 'string' || typeof data.nextMove !== 'string') return undefined;
   return { class: isRunStopClass(data.class) ? data.class : 'unclassified', cause: data.cause, evidenceRef: data.evidenceRef, nextMove: data.nextMove,
-    ...(data.childEvidence ? { childEvidence: data.childEvidence } : {}) };
+    ...(typeof data.site === 'string' ? { site: data.site } : {}),
+    ...(data.childEvidence ? { childEvidence: data.childEvidence } : {}),
+    ...(data.terminationReason === 'pod-job-failed' ? { terminationReason: data.terminationReason } : {}) };
 }

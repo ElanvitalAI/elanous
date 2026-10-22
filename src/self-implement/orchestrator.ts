@@ -91,7 +91,7 @@ import { classifyError } from '../session-runtime/retry-policy.js';
 import { decomposeSelfDevGoal, inferHotPaths, type SelfDevDecomposeOptions } from '../self-dev/decompose.js';
 import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
 import { askAtExecution, type ExecutionClarificationResult } from './execution-clarification.js';
-import { classifyOutOfScope } from './scope-adjacency.js';
+import { decideScopeExpansion, renderScopeExpansionSection, SCOPE_EXPANSION_CAP, type ScopeExpansion } from './scope-adjacency.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
 import { selectKnowhowPack } from './knowhow-pack.js';
 import { declaredNewFilePaths } from './goal-new-paths.js';
@@ -108,6 +108,7 @@ import { originObservationFields } from '../agent/origin-observation.js';
 import { resolveLaunchStamp, type LaunchStamp } from '../harness/launch-stamp.js';
 import { getHarnessSpace, normalizeSpaceId, resolveRunIdentity } from '../harness/harness-space.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { addNextMdReleaseNote, harnessReleaseNote, parseReleaseNoteSection, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment, type ReleaseNoteSection } from '../release-loop/release-note.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
@@ -257,7 +258,7 @@ import { hasModuleLoadFailure, type GateTestFailure } from './gate-baseline.js';
 import { commitWorktree, defaultBranchRef, preservationHasChanges } from './seams.js';
 import { detectUncommittedWork } from './uncommitted-work.js';
 import { spawnSync } from 'node:child_process';
-import { blockedDraftDisposition, decideDraftOnStop, nextMoveFor, parseDraftOnStopMode, salvageBranchForRun, type DraftOnStopMode } from './blocked-draft-policy.js';
+import { blockedDraftDisposition, blockedDraftTargetFor, decideDraftOnStop, nextMoveFor, parseDraftOnStopMode, repairSalvageLinkComment, salvageBranchForRun, syntheticRepairBasePr, type DraftOnStopMode } from './blocked-draft-policy.js';
 import { formatLlmMergeOutcome } from '../autopilot/build/llm-conflict-merge.js';
 import { FOUND_CITED_PATH_REFUTATION_QUOTE, MISSING_CITED_PATH_REFUTATION_QUOTE, MUST_FIX_REFUTATION_ACKNOWLEDGEMENT_WITH_REASON, REFUTATION_QUOTE_GRAMMAR, observeMustFixCitedPaths, parseMustFixRefutationAcknowledgement, parseMustFixRefutations, renderMustFixCitedPathFacts, snapshotMustFixFindings, stableMustFixId, type ReflectEvidenceFacts, type ReflectGateFacts, type MustFixCitedPathFact, type MustFixFinding, type MustFixRecurrenceHistory, type MustFixRefutation, type MustFixRefutationKind } from './reflect-mustfix.js';
 import type { IngestionEntry } from '../agent-substrate/execution/ingestion-policy.js';
@@ -279,7 +280,7 @@ import { AMBIGUOUS_STAGES, checkPipelineTraversal, nodesForStage, pipelineGraphI
 import { appendGateWorktreeFreshnessEvidence, gateEvidenceNote } from '../harness/review-adapter.js';
 import { diffHeaderPaths } from '../agent-substrate/self-review-cli.js';
 import { format as formatPrComment, type PrCommentRole } from '../agent-substrate/pr-comment-meta.js';
-import { changedFiles, commitTitles, type SelfImplementCompletionDisposition } from './seams.js';
+import { changedFiles, commitTitles, type OpenPrOutcome, type SelfImplementCompletionDisposition } from './seams.js';
 import {
   classifyAbandonedRun,
   isAbandonedClassificationOutcome,
@@ -1087,6 +1088,8 @@ export interface SelfImplementSeams {
   commitFinishedChildWork?: (cwd: string, paths: readonly string[], message: string) => { ok: boolean; out: string };
   /** --ground 코드베이스 prepass seam. cwd는 구현 대상 worktree이며 실패는 goal-loop를 막지 않는다. */
   groundGoal?: (goalText: string, deps: { cwd: string }) => Promise<string>;
+  /** E1 GOAL-ELABORATE-ON-ARRIVAL — 착수 구체화 카드 작성·판정 LLM. 미주입이면 카드 없이 진행(`goal-elaboration-skipped`). */
+  elaborateCallLLM?: (args: { prompt: string; systemPrompt?: string }) => Promise<string>;
   /** ③ 구현 — cwd(worktree)에서 코딩 에이전트 구동(P1: 헤드리스 elanous spawn·goal-loop 아밍).
    *  escalateTier(#2) — sol 단일 승급으로 재시도하고 seam 이 그 대상을 honor한다. */
   /** ⚠️ `runId` 는 **필수**(리뷰 should-fix) — 오케스트레이터가 항상 보장하므로 옵셔널로 두면 새 seam
@@ -1167,7 +1170,7 @@ export interface SelfImplementSeams {
   /** Persist a full oversized PR body so its bounded PR counterpart can link to it. */
   persistPrBodyArtifact?: (input: { origin: string; body: string; originalChars: number }) => { path: string };
   /** ⑥ PR 생성. labels=생성 시 부착할 GitHub 라벨(G8 auto-review 자기판단 통과 시). */
-  openPr: (opts: { title: string; body: string; head: string; base?: string; draft?: boolean; labels?: string[]; cwd: string }) => Promise<{ url: string; number: number }>;
+  openPr: (opts: { title: string; body: string; head: string; base?: string; draft?: boolean; labels?: string[]; cwd: string; runId?: string }) => Promise<OpenPrOutcome>;
   /** PR 생성 뒤 런의 라운드 대화를 게시한다. 실패는 PR 개설을 되돌리지 않는다. */
   postPrComment?: (opts: { number: number; body: string; cwd: string }) => Promise<void>;
   /** Read and edit the single marked status comment; missing seams fall back to individual comments. */
@@ -2326,6 +2329,12 @@ export interface SelfImplementResult {
   sessionId?: string;
   worktreePath?: string;
   branch?: string;
+  /** SCOPE-AS-DIRECTION: outside-target files the scope guard accepted, each with its kind; rendered as the PR body's «범위 확장». */
+  scopeExpansion?: ScopeExpansion;
+  /** Bounded names measured by the execution-scope guard on a held edit. */
+  outOfScopeEdits?: string[];
+  nameCapReached?: boolean;
+  outsideCount?: number;
   gate?: SelfImplementGateResult;
   review?: SelfImplementReview;
   rework?: ReviewRework;
@@ -2366,6 +2375,9 @@ export interface SelfImplementResult {
   mergeReason?: string;
   prUrl?: string;
   prNumber?: number;
+  /** REPAIR-BLOCKED-DRAFT-LINK-ORIGINAL: commit-only 수리가 멈춰 새 PR 대신 원 PR 에 이은 수확 가지. */
+  originalPr?: number;
+  salvageRef?: string;
   checkedHeadCommit?: string;
   detail?: string;
 }
@@ -3490,6 +3502,7 @@ async function autohealRecordedStop(stopEntry: RunLedgerEntry, s: SelfImplementS
     const loadLedger = s?.stopAutohealLoadLedger ?? (s?.writeRunLedger ? () => null : undefined);
     const result = await autohealFromStop({ runId: stopEntry.runId, ...(stopEntry.goalId ? { goalId: stopEntry.goalId } : {}), record }, {
       mode,
+      knowhowCandidateDir: join(effectiveInstanceRoot(), 'self-implement', 'knowhow-candidates'),
       ...(s?.stopAutohealActions ? { actions: s.stopAutohealActions } : {}),
       ...(loadLedger ? { loadLedger } : {}),
       ...(s?.writeRunLedger ? { writeLedger: s.writeRunLedger } : {}),
@@ -3764,6 +3777,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       openPr: async (args) => {
         openPrInvoked = true;
         const pr = await opts.seams.openPr(args);
+        if (pr.rebind) debug.log('self-implement.same-cell', 'rebind-result', pr.rebind);
         const number = recordedPrNumber(pr.number);
         if (number !== undefined) capturedPrNumber = number;
         return pr;
@@ -5018,6 +5032,8 @@ async function runSelfImplementInner(
   observe('start', {
     feature: boundedFeature.text, featureTruncated: boundedFeature.truncated, featureOriginalChars: boundedFeature.originalChars,
     branch, base: opts.base ?? null, draft: opts.draft ?? true,
+    // OPT #25551: 런 모드가 원장에 없었다 — PR 개설 의도 ⊕ commit-only 수리의 원 PR 번호(합성 base pr-<N>).
+    openPr: opts.completion === undefined ? null : opts.completion !== 'worktree-only', repairCommitOnly: syntheticRepairBasePr(opts.base) ?? null,
     willFork: !!(opts.parentSessionId && s.forkSession), parentSessionId: opts.parentSessionId ?? null,
     nestDepth: nestInfo().depth, goalSource, goalFile: opts.goalFile === undefined ? null : resolve(launchCwd, opts.goalFile),
     targetRoot: gitRootOf(launchCwd) ?? launchCwd, ...originObservationFields(),
@@ -5259,6 +5275,14 @@ async function runSelfImplementInner(
   if (knowhow.text) round0Feature = `${knowhow.text}\n\n${round0Feature}`;
   observe('knowhow-pack', { ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0 });
 
+  // E1 착수 구체화(RFC-progressive-goal-elaboration §2 E1 · §7 간선 ①) — 고정 층(KPI·판정 신호)은 그대로, 카드만 덧붙인다.
+  const elaboration = await (await import('./goal-elaborate.js')).runArrivalElaboration({ goal: opts.feature, prompt: round0Feature, cwd: wt.path, callLLM: s.elaborateCallLLM, observe });
+  round0Feature = elaboration.prompt;
+  if (elaboration.parked) {
+    progress('parked', '착수 구체화 카드가 골 고정 층과 어긋남(다시 쓰기 뒤에도) — 사람 판단 대기');
+    return { ok: false, stage: 'parked', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch, detail: elaboration.detail };
+  }
+
   const maxRework = Math.max(0, opts.maxReworkRounds ?? 2);
   const selfImplementConfig = (await import('../user-config.js')).getUserConfig().tools.selfImplement;
   const shadowStop = opts.reworkBudgetShadowStop ?? selfImplementConfig.reworkBudget.shadowStop;
@@ -5290,6 +5314,8 @@ async function runSelfImplementInner(
   let gate!: SelfImplementGateResult;
   /** GATE-ENV-RETRY: 재시도 뒤에도 남은 환경 결손의 종류. 정의되면 이 라운드의 gate 실패는 «수확 대기»로 끝난다. */
   let gateEnvDeficitKind: GateEnvDeficitKind | undefined;
+  /** SCOPE-AS-DIRECTION: outside-target files accepted by the scope guard (latest round); rendered in the PR body. */
+  let scopeExpansion: ScopeExpansion | undefined;
   let review: SelfImplementReview | undefined;
   let reviewedHeadCommit: string | undefined;
   /** Review-budget leftovers and the body that carried them, so a later merge drafts from the same text. */
@@ -5612,6 +5638,11 @@ async function runSelfImplementInner(
   // A goal-only retry spends its one allowance for this run even if a later
   // gate/review round removes the target diff and reaches the same disposition.
   let goalOnlyReworkUsed = false;
+  // E3 GOAL-REFINE-FROM-FIRST-IMPL — 첫 라운드 뒤 골 v2(재그라운딩). 둘째 라운드부터 프롬프트의 골은 roundGoal 이다.
+  //   방향·KPI 줄은 불변(goal-refine.ts 가 강제) · 되돌이는 런당 GOAL_REFINE_MAX_VISITS 번.
+  let roundGoal = opts.feature;
+  let goalRefineVisits = 0;
+  let goalRefinement: import('./goal-refine.js').GoalRefinement | undefined;
   // PR이 열리기 전에 프로세스가 죽으면 PR 자체가 없으므로 잃을 대화도 없다. 따라서 파일로 영속화하지 않는다.
   const prCommentBuffer: string[] = [];
   // GitHub PR comment bodies are bounded; retain the RFC header and disclose omitted source rather than losing the whole record.
@@ -5730,10 +5761,12 @@ async function runSelfImplementInner(
   };
   let blockedDraftNoChanges = false;
   let blockedDraftPrFailure: string | undefined;
+  let repairLink: { originalPr: number; salvageRef: string } | undefined;
   const reviewBlockedResult = (pr: { url: string; number: number } | undefined) => ({
     stage: blockedDraftNoChanges && podReviewBlockedDraft ? 'no-changes' as const : podReviewBlockedDraft && !pr ? 'aborted' as const : 'review-blocked' as const,
     mustFix: [...(review?.mustFix ?? [])],
     ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}),
+    ...(repairLink ?? {}),
   });
   const preserveBlockedArtifacts = async ({ stage, reason, verdict, gate: preservedGate, typecheck, decomposition, childSummary, reasonTruncated, failureKind, terminalStatus, salvageStatusExpected }: { stage: 'review-blocked' | 'gate-failed' | 'aborted'; reason: string; verdict?: ReworkBudgetVerdict; gate?: SelfImplementGateResult; typecheck?: { passed: boolean; log?: string }; decomposition?: TerminalDecomposition; childSummary?: string; reasonTruncated?: boolean; failureKind?: ReturnType<typeof classifyReviewProviderFailure> | null; terminalStatus?: ImplementTerminalStatus; salvageStatusExpected: boolean }): Promise<{ url: string; number: number } | undefined> => {
     let childSummaryArtifact: ChildSummaryArtifactRef | undefined;
@@ -5940,6 +5973,47 @@ async function runSelfImplementInner(
       progress(stage, '보존할 변경이 없어 draft PR을 열지 않음');
       return undefined;
     }
+    // REPAIR-BLOCKED-DRAFT-LINK-ORIGINAL: 합성 base pr-<N>(commit-only 수리)은 origin 에 없다 — 새 draft 대신 수확 가지를 원 PR #N 에 잇는다.
+    const blockedTarget = blockedDraftTargetFor(opts.base);
+    if (blockedTarget.action === 'link-original') {
+      const salvageRef = salvageBranchForRun(runId, wt.branch);
+      let salvageSha: string | undefined;
+      let pushError: string | undefined;
+      try {
+        if (s.preserveBlockedBranch) {
+          if (!await s.preserveBlockedBranch({ cwd: wt.path, branch: salvageRef, title: prTitle(opts.feature, opts.goalFile) })) throw new Error('수확 가지 push가 성공하지 않았음');
+        } else {
+          const commit = commitWorktree(wt.path, prTitle(opts.feature, opts.goalFile));
+          if (!commit.ok && !/nothing to commit/.test(commit.out)) throw new Error(`로컬 커밋 실패: ${commit.out}`);
+          const push = runGitCommand(wt.path, ['push', 'origin', `HEAD:refs/heads/${salvageRef}`]);
+          if (push.status !== 0) throw new Error(push.stderr || push.stdout || 'git push failed');
+        }
+        const head = existsSync(wt.path) ? runGitCommand(wt.path, ['rev-parse', 'HEAD']) : undefined;
+        if (head?.status === 0) salvageSha = head.stdout.trim();
+      } catch (error) {
+        pushError = safeErrorDescription(error);
+      }
+      let commentError: string | undefined;
+      if (pushError === undefined) {
+        try {
+          if (!s.postPrComment) throw new Error('postPrComment seam unavailable');
+          await s.postPrComment({ number: blockedTarget.originalPr, body: repairSalvageLinkComment({ salvageRef, ...(salvageSha ? { sha: salvageSha } : {}), runId, stage }), cwd: wt.path });
+        } catch (error) {
+          commentError = safeErrorDescription(error);
+        }
+      }
+      if (pushError === undefined) repairLink = { originalPr: blockedTarget.originalPr, salvageRef };
+      observe('rework-blocked-draft-pr', {
+        ...observation, skipped: 'repair-link-original', originalPr: blockedTarget.originalPr, salvageRef,
+        ...(salvageSha ? { salvageSha } : {}), pushed: pushError === undefined, ...(pushError ? { pushError } : {}),
+        commentPosted: pushError === undefined && commentError === undefined, ...(commentError ? { commentError } : {}),
+      }, pushError || commentError ? { level: 'warn' } : undefined);
+      blockedDraftPrFailure = pushError
+        ? `수리 산출물 수확 가지 push 실패(원 PR #${blockedTarget.originalPr} · 새 PR 안 엶): ${pushError}; worktree: ${wt.path}`
+        : `수리 산출물을 기존 PR #${blockedTarget.originalPr} 에 연결: salvage ${salvageRef}${commentError ? ` (코멘트 실패: ${commentError})` : ''}`;
+      progress('aborted', blockedDraftPrFailure);
+      return undefined;
+    }
     // DRAFT-NOT-ARCHIVE (RFC R1): harvestable 멈춤은 draft PR 대신 수확 가지 ⊕ 런 원장(사유·다음 수).
     // ⛔ Pod review-blocked 는 결과 stage 가 PR 유무로 갈리므로 이 조각에서는 건드리지 않는다.
     const draftOnStopMode = readDraftOnStopMode();
@@ -6051,6 +6125,7 @@ async function runSelfImplementInner(
     try {
       pr = await withStepTimeout(s.openPr({
         title: prTitle(opts.feature, opts.goalFile),
+        runId,
         body: assembled.body,
         head: wt.branch,
         ...(opts.base ? { base: opts.base } : {}),
@@ -6199,7 +6274,7 @@ async function runSelfImplementInner(
     // and pushes this worktree after the note is written and before creating the PR.
     addNextMdReleaseNote(wt.path, releaseNote);
     const preparedPrBody = preparePrBody(
-      `${prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, undefined, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote)}${followUpMustFix}`,
+      `${prBody(roundGoal, impl.summary, gate.log, review, reviewIntent, undefined, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote)}${renderScopeExpansionSection(scopeExpansion)}${goalRefinement ? `\n\n${(await import('./goal-refine.js')).renderGoalChangeSection(goalRefinement)}` : ''}${followUpMustFix}`,
       s.persistPrBodyArtifact,
       'self-implement-review-budget-pr',
       followUpMustFix,
@@ -6207,6 +6282,7 @@ async function runSelfImplementInner(
     preparedReviewBudgetPrBody = preparedPrBody.body;
     const pr = await withStepTimeout(s.openPr({
       title: prTitle(opts.feature, opts.goalFile),
+      runId,
       body: preparedPrBody.body,
       head: wt.branch,
       ...(opts.base ? { base: opts.base } : {}),
@@ -6822,8 +6898,22 @@ async function runSelfImplementInner(
         }, { level: 'warn' });
       }
     }
+    // 라운드 «번호»가 아니라 «첫 gate·리뷰 지적을 받은 뒤 첫 rework 진입»에서 한 번 — goal-only-rework·증거 되먹임이
+    //   번호를 당겨도(round = retryRound/nextRound) 한 번 돈다(리뷰 r1 should-fix 6).
+    if (round > 0 && goalRefineVisits === 0 && reworkNote.trim().length > 0) {
+      goalRefineVisits++;
+      // ta-journey author-dialogue 되돌이(judge findings → author → deliver v2) — 노트 LLM 은 E1 과 같은 저작 래퍼를 쓴다.
+      const firstRound = roundSummaryEntries.at(-1);
+      const refined = await (await import('./goal-refine.js')).runFirstRoundRefine({
+        goal: opts.feature, round, visit: goalRefineVisits, callLLM: s.elaborateCallLLM, observe,
+        evidence: { implSummary: firstRound?.tried, findings: reworkNote, changedFiles: firstRound?.filesTouched },
+      });
+      roundGoal = refined.goal;
+      // PR «골 변경» 절 — 유지(kept · no-provider 포함)여도 «시도 · v1 유지 · 사유» 한 줄을 싣는다(리뷰 r2).
+      goalRefinement = refined.refinement;
+    }
     const reworkFeature = round === 0 ? ''
-      : buildReworkFeature(opts.feature, round, effectiveMax, reworkPromptNote, stripReworkBudgetHeaders(diagnosis), appliedLastRound, refutableFindings, pendingPlanRevision, reworkKind, buildRefutationGuidance(), escalationJudgement);
+      : buildReworkFeature(roundGoal, round, effectiveMax, reworkPromptNote, stripReworkBudgetHeaders(diagnosis), appliedLastRound, refutableFindings, pendingPlanRevision, reworkKind, buildRefutationGuidance(), escalationJudgement);
     const card = round === 0 ? '' : renderRoundSummaryCard(roundSummaryEntries);
     const feature = round === 0 ? round0Feature : reworkFeature + (card ? `\n\n${card}` : '');
     if (card) {
@@ -7075,12 +7165,12 @@ async function runSelfImplementInner(
         const declared = goalDocument === undefined ? undefined : declaredPathsFromGoalDocumentText(goalDocument);
         const targets = declared?.readable
           ? declared.paths
-          : inferHotPaths(targetScopedGoalText(opts.feature));
+          : inferHotPaths(targetScopedGoalText(roundGoal));
         const eligible = [...new Set([...work.trackedChanges, ...work.untrackedFiles])]
           .filter((path) => !harnessSeededPaths.includes(path)
             && targets.some((target) => changedFileIsInsideDeclaredTarget(path, target)));
         if (eligible.length) {
-          inspectStaleReverts(revertGuardTargetPaths(opts.feature, goalDocument));
+          inspectStaleReverts(revertGuardTargetPaths(roundGoal, goalDocument)); // E3 — refine 뒤 v2 «대상 경로»
           const message = `self-implement: ${prTitle(opts.feature, opts.goalFile)}`;
           let outcome: { ok: boolean; out: string };
           try {
@@ -7148,9 +7238,10 @@ async function runSelfImplementInner(
     const evidenceText = diffEvidence ? `${childEvidenceSource}\n${diffEvidence}` : childEvidenceSource;
     evidenceSource = diffEvidence ? 'diff-added-lines' : harvested ? 'harvested' : 'summary-tail';
     offDiffEvidence = parseOffDiffEvidence(evidenceText);
-    const requiredEvidence = requiredEvidenceFromGoal(opts.feature);
-    const limitationCount = authorLimitationCountFromGoal(opts.feature);
-    const evidenceChecks = runRequiredEvidenceChecks(opts.feature, wt.path, runId);
+    // E3 — refine 뒤 라운드는 «현재 골»(v2)로 증거를 센다(REQUIRED EVIDENCE 절은 고정 칸이라 v1 과 같다).
+    const requiredEvidence = requiredEvidenceFromGoal(roundGoal);
+    const limitationCount = authorLimitationCountFromGoal(roundGoal);
+    const evidenceChecks = runRequiredEvidenceChecks(roundGoal, wt.path, runId);
     const tagCoverage = coverRequiredEvidence(requiredEvidence, offDiffEvidence.items);
     // EVIDENCE-WIRING-EXEMPT — a requirement whose own `|| bun test …` check passed is covered by what the harness measured.
     const settledByCheck = settleUncoveredEvidence(tagCoverage.uncovered, { checks: evidenceChecks, required: requiredEvidence });
@@ -7244,6 +7335,7 @@ async function runSelfImplementInner(
     // Unknown declaration or changed files cannot justify an invented choice.
     let gateRouteFiles: readonly string[] | undefined;
     try { gateRouteFiles = (s.changedFilesForGateRoute ?? changedFiles)(wt.path); } catch { gateRouteFiles = undefined; }
+    scopeExpansion = undefined;
     if (opts.goalFile) {
       let goalDocument: string | undefined;
       try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { /* unknown scope */ }
@@ -7257,20 +7349,24 @@ async function runSelfImplementInner(
         observe('execution-scope-undeclared', { outsideCount: scope.outsideCount });
         progress('implementing', `⚠️ 대상 경로를 하나도 못 읽었다 — 범위 밖 ${scope.outsideCount}개를 묻지 않고 게이트로 간다`);
       } else if (scope.status === 'known' && scope.outsideCount !== null && scope.outsideCount > 0) {
-        const impact = scope.outsideNames.some(file => {
+        // SCOPE-AS-DIRECTION — target paths are the starting point: outside edits are accepted by default and named for the
+        // reviewer. Only a deletion, a protected path, or more than SCOPE_EXPANSION_CAP outside files stops for the owner.
+        const deleted = scope.outsideNames.filter(file => {
           if (existsSync(join(wt.path, file))) return false;
           const tracked = runGitCommand(wt.path, ['ls-files', '--error-unmatch', '--', file], { encoding: 'utf8', timeout: 20_000 });
           return tracked.status === 0;
-        }) ? 'critical' : 'high';
+        });
+        const impact = deleted.length > 0 ? 'critical' : 'high';
         const declaredPaths = declaredPathsFromGoalDocumentText(goalDocument!).paths;
-        const { adjacent, other } = classifyOutOfScope(scope.outsideNames, declaredPaths);
-        // Only edits next to a declared file, none of them a deletion: the gate judges them — nobody has to answer first.
-        const adjacentOnly = impact !== 'critical' && !scope.nameCapReached && other.length === 0 && adjacent.length === scope.outsideCount;
-        if (adjacentOnly) {
-          observe('execution-scope-adjacent-accepted', { outsideCount: scope.outsideCount, adjacent });
-          progress('implementing', `범위 밖 인접 편집 ${adjacent.length}개(대상과 같은 폴더) — 묻지 않고 게이트로 간다: ${adjacent.join(' · ')}`);
+        const decision = decideScopeExpansion({ outsideFiles: scope.outsideNames, declaredPaths, deleted, nameCapReached: scope.nameCapReached,
+          readFile: file => { try { return readFileSync(join(wt.path, file), 'utf8'); } catch { return undefined; } } });
+        if (decision.accept) {
+          scopeExpansion = decision.expansion;
+          observe('execution-scope-accepted', { outsideCount: scope.outsideCount, count: decision.expansion.count, cap: SCOPE_EXPANSION_CAP,
+            files: decision.expansion.files, round });
+          progress('implementing', `범위 확장 ${decision.expansion.count}개 수용 — 대상 경로는 출발점, PR 본문 «범위 확장»에서 리뷰가 판단한다: ${decision.expansion.files.map(file => `${file.path}(${file.kind})`).join(' · ')}`);
         }
-        const result: ExecutionClarificationResult = adjacentOnly ? { choice: 'Expand scope', by: 'assumed' } : await (s.askExecutionClarification ?? askAtExecution)({
+        const result: ExecutionClarificationResult = decision.accept ? { choice: 'Expand scope', by: 'assumed' } : await (s.askExecutionClarification ?? askAtExecution)({
           id: 'execution_scope', decision: 'Changing files outside the authored target paths',
           prompt: 'Implementation changed files outside the authored target paths. Keep the original scope or expand it?',
           whyNow: 'Continuing to gate or publish these edits would expand the requested scope.',
@@ -7280,11 +7376,18 @@ async function runSelfImplementInner(
             { label: 'Expand scope', description: 'Accept the changed files outside the target paths.' },
           ],
         }, { runId, outsideFiles: scope.outsideNames, outsideCount: scope.outsideCount, declaredPaths }, { writeRunLedger: s.writeRunLedger });
+        if (!decision.accept && !('parked' in result) && !('deferred' in result) && result.choice === 'Expand scope') scopeExpansion = decision.expansion;
         if ('parked' in result || 'deferred' in result || result.choice !== 'Expand scope') {
           finalizeSupervisorDeliveries('execution-scope-not-approved');
-          observe('execution-scope-held', { outsideCount: scope.outsideCount, disposition: 'parked' in result ? 'parked' : 'in-scope-only' });
+          const outOfScopeEdits = [...scope.outsideNames];
+          observe('execution-scope-held', { outOfScopeEdits, nameCapReached: scope.nameCapReached,
+            outsideCount: scope.outsideCount, worktreePath: wt.path, branch: wt.branch,
+            disposition: 'parked' in result ? 'parked' : 'in-scope-only',
+            ...(!decision.accept ? { stopReasons: decision.reasons, deleted: decision.deleted, protectedPaths: decision.protectedPaths, cap: SCOPE_EXPANSION_CAP } : {}),
+            files: decision.expansion.files });
           if ('parked' in result) progress('parked', `critical 질문 ${result.questionId} 미응답 — 이 런만 대기`);
           return { ok: false, stage: 'parked' in result ? 'parked' : 'soft-stopped', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch,
+            outOfScopeEdits, nameCapReached: scope.nameCapReached, outsideCount: scope.outsideCount,
             detail: 'parked' in result ? `critical-unanswered: ${result.questionId}` : 'Out-of-scope edits held in the worktree; gate and publication skipped.' };
         }
       }
@@ -7600,7 +7703,8 @@ async function runSelfImplementInner(
     const reviewContext = {
       runId,
       ...runFacts,
-      goal: opts.feature,
+      // E3 — refine 뒤 라운드의 리뷰는 «현재 골»(v2)로 판정한다. v1 은 PR «골 변경» 절에만 남는다(리뷰 r1 must-fix).
+      goal: roundGoal,
       goalFile: opts.goalFile,
       ...(priorRunFindings.length ? { priorRunFindings } : {}),
       ...(goalDocumentPath ? { goalDocumentPath } : {}),
@@ -7721,7 +7825,7 @@ async function runSelfImplementInner(
         }, { category: 'self-dev.rework' });
       }
       const refutations = refutableFindings.length
-        ? parseMustFixRefutations(impl.summary, opts.feature, refutableFindings, ({ stage, findingId }) => {
+        ? parseMustFixRefutations(impl.summary, roundGoal, refutableFindings, ({ stage, findingId }) => {
           observe('refute-rejected', { round, stage, ...(findingId ? { findingId } : {}) });
         }, { citedPathFacts, round })
         : [];
@@ -7753,7 +7857,7 @@ async function runSelfImplementInner(
         try {
           const originalMustFix = refutableFindings.map((finding) => finding.item);
           const recurrenceHistory = recurrenceHistoryFor(originalMustFix);
-          const adjudicated = await withStepTimeout(s.reflectMustFix({ mustFix: originalMustFix, goal: opts.feature, cwd: wt.path, evidenceFacts, gateFacts: gate.reflectGateFacts, refutations, citedPathFacts, ...(recurrenceHistory.length ? { recurrenceHistory } : {}), runId, round }), T.review, 'review');
+          const adjudicated = await withStepTimeout(s.reflectMustFix({ mustFix: originalMustFix, goal: roundGoal, cwd: wt.path, evidenceFacts, gateFacts: gate.reflectGateFacts, refutations, citedPathFacts, ...(recurrenceHistory.length ? { recurrenceHistory } : {}), runId, round }), T.review, 'review');
           observe('review-refute-adjudicated', {
             round,
             submittedCount: refutations.length,
@@ -7771,7 +7875,7 @@ async function runSelfImplementInner(
           const oneLine = (text: string): string => text.replace(/\s+/g, ' ').trim().slice(0, 60);
           try {
             const recurrenceHistory = recurrenceHistoryFor(review.mustFix);
-            const reflected = await withStepTimeout(s.reflectMustFix({ mustFix: review.mustFix, goal: opts.feature, cwd: wt.path, evidenceFacts, gateFacts: gate.reflectGateFacts, citedPathFacts, ...(recurrenceHistory.length ? { recurrenceHistory } : {}), runId, round }), T.review, 'review');
+            const reflected = await withStepTimeout(s.reflectMustFix({ mustFix: review.mustFix, goal: roundGoal, cwd: wt.path, evidenceFacts, gateFacts: gate.reflectGateFacts, citedPathFacts, ...(recurrenceHistory.length ? { recurrenceHistory } : {}), runId, round }), T.review, 'review');
             const rejectedItems = new Set(reflected.rejected.filter((r) => r.reason && r.reason.trim().length > 0).map((r) => r.item));
             const rejected = reflected.rejected.filter((r) => rejectedItems.has(r.item));
             effectiveMustFix = review.mustFix.filter((m) => !rejectedItems.has(m));
@@ -7872,7 +7976,7 @@ async function runSelfImplementInner(
     }
     // EVIDENCE-WIRING-EXEMPT — a commandless [preservation] is covered once the changed-file gate passed.
     if (gate.passed && evidenceCoverage?.uncoveredCount) {
-      const settledByGate = settleUncoveredEvidence(evidenceCoverage.uncovered, { gatePassed: true, required: requiredEvidenceFromGoal(opts.feature) });
+      const settledByGate = settleUncoveredEvidence(evidenceCoverage.uncovered, { gatePassed: true, required: requiredEvidenceFromGoal(roundGoal) });
       if (settledByGate.coveredByGate.length) {
         debug.log('self-implement.evidence', 'covered-by-gate', { round, tags: settledByGate.coveredByGate });
         evidenceCoverage = { ...evidenceCoverage, uncovered: settledByGate.uncovered, uncoveredCount: settledByGate.uncovered.length };
@@ -7910,6 +8014,7 @@ async function runSelfImplementInner(
 
   const { decisionSignalPress, decisionSignalPressReason } = resolveDecisionSignalPress(opts.goalFile, wt.path, opts.decisionSignalPressSources);
   const decisionSignalResult = decisionSignalPress ? { decisionSignalPress } : {};
+  const scopeExpansionResult = scopeExpansion ? { scopeExpansion } : {};
   const decisionSignalRed = (decisionSignalPress?.pressedRed.length ?? 0) > 0;
   const decisionSignalBaselineOnly = decisionSignalPress?.pressedBaselineOnly.length ?? 0;
   const preservedCompletionResult = !decisionSignalRed && completionDisposition
@@ -7990,7 +8095,7 @@ async function runSelfImplementInner(
     progress('worktree-completed', '✅ 작업 트리 완료 — PR 생성 없이 worktree 보존');
     observe('worktree-completed', { branch: wt.branch, hadApprover: !!s.approvePr });
     return {
-      ok: true, stage: 'worktree-completed', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}),
+      ok: true, stage: 'worktree-completed', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}),
       detail: 'worktree-only completion: PR creation skipped',
     };
   }
@@ -8001,7 +8106,7 @@ async function runSelfImplementInner(
     recordMergeDecision();
     observe('pr-declined', { branch: wt.branch, hadApprover: !!s.approvePr });
     return {
-      ok: false, stage: 'pr-declined', node: 'open-pr', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}),
+      ok: false, stage: 'pr-declined', node: 'open-pr', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}),
       detail: s.approvePr ? 'PR not approved' : 'no approvePr seam — fail-closed(자동승인 금지)',
     };
   }
@@ -8012,7 +8117,7 @@ async function runSelfImplementInner(
     if (opts.goalFile) {
       try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { /* no documented targets */ }
     }
-    inspectStaleReverts(revertGuardTargetPaths(opts.feature, goalDocument));
+    inspectStaleReverts(revertGuardTargetPaths(roundGoal, goalDocument)); // E3 — refine 뒤 v2 «대상 경로»
     s.commitWork(wt.path, prTitle(opts.feature, opts.goalFile));
     // ⛔⭐ resume 경로와 «같은» 해석기를 쓴다 — 두 자리가 갈리면 같은 원인이 다른 얼굴로 나온다.
     const resolvedTarget = resolveDefaultBranchTarget(s.defaultBranchRef ?? defaultBranchRef, wt.path);
@@ -8027,7 +8132,7 @@ async function runSelfImplementInner(
       canAuto = false;
       mergeReason = 'default-branch-unresolved';
       recordMergeDecision();
-      return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), detail: 'pre-PR main sync default-branch-unresolved' };
+      return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), detail: 'pre-PR main sync default-branch-unresolved' };
     }
     progress('gating', `최신 ${mergeTarget} 정합 (병렬 드리프트·LLM 충돌해결)…`);
     onMainSyncStarted((s.headCommit ?? ((cwd: string) => {
@@ -8045,7 +8150,7 @@ async function runSelfImplementInner(
       mergeReason = 'main-sync-interrupted';
       recordMergeDecision();
       progress('merge-conflict', `⚠️ ${mergeTarget} 정합 중단 — 사람 수확 (${wt.branch})`);
-      return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), harvestable: true, detail: `pre-PR main sync interrupted: ${safeErrorDescription(error)}` };
+      return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), harvestable: true, detail: `pre-PR main sync interrupted: ${safeErrorDescription(error)}` };
     }
     // ⛔⭐ `OBS-T96` 🅐 — 「무엇을 봤는지」를 남긴다. 수만 남기면 정합 실패가 «재현 불가»가 된다.
     observe('pre-pr-sync', mainSyncObservation(sync, mergeTarget, opts.base, wt.branch));
@@ -8056,7 +8161,7 @@ async function runSelfImplementInner(
       recordMergeDecision();
       const harvestable = (sync.reason === 'conflict-input-too-large' || sync.reason === 'conflict-resolver-interrupted')
         && await preserveMergeHarvest(sync.reason, sync.inputChars);
-      return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(harvestable ? { harvestable: true } : {}), detail: harvestable ? sync.reason === 'conflict-input-too-large' ? `충돌 큼 — 사람 수확 (${wt.branch}, 입력 ${sync.inputChars}자)` : `충돌 해결 중단 — 사람 수확 (${wt.branch})` : `pre-PR main sync ${sync.status}` };
+      return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(harvestable ? { harvestable: true } : {}), detail: harvestable ? sync.reason === 'conflict-input-too-large' ? `충돌 큼 — 사람 수확 (${wt.branch}, 입력 ${sync.inputChars}자)` : `충돌 해결 중단 — 사람 수확 (${wt.branch})` : `pre-PR main sync ${sync.status}` };
     }
     if (sync.status === 'llm-resolved' || sync.status === 'merged' || sync.status === 'deterministic-resolved') {
       preservationBase = opts.base ?? mergeTarget;
@@ -8115,7 +8220,7 @@ async function runSelfImplementInner(
         mergeReason = 'post-sync-gate-failed';
         recordMergeDecision();
         const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate: regate, salvageStatusExpected: false });
-        return { ok: false, stage: 'gate-failed', node: 'regate', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate: regate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(review ? { review } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
+        return { ok: false, stage: 'gate-failed', node: 'regate', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate: regate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(review ? { review } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
       }
       if (!regate.passed) {
         progress('gating', timeoutOnlyPostSync
@@ -8129,7 +8234,7 @@ async function runSelfImplementInner(
   recordMergeDecision();
   if (!approved) {
     observe('pr-declined', { branch: wt.branch, hadApprover: !!s.approvePr });
-    return { ok: false, stage: 'pr-declined', node: 'open-pr', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason, detail: s.approvePr ? 'PR not approved' : 'no approvePr seam — fail-closed(자동승인 금지)' };
+    return { ok: false, stage: 'pr-declined', node: 'open-pr', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason, detail: s.approvePr ? 'PR not approved' : 'no approvePr seam — fail-closed(자동승인 금지)' };
   }
   if (canAuto) onMergeApprovalReceived();
   const extractedOriginalAsk = extractVerbatimOriginalAsk(opts.feature);
@@ -8164,7 +8269,7 @@ async function runSelfImplementInner(
   }
   const stoppedBeforePr = honorParentSoftStop('open-pr');
   if (stoppedBeforePr) {
-    return { ...stoppedBeforePr, ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, gate, ...(review ? { review } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}) };
+    return { ...stoppedBeforePr, ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, ...scopeExpansionResult, sessionId, gate, ...(review ? { review } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}) };
   }
   progress('pr-opening', 'PR 생성…');
   onNodeEntry('open-pr', round);
@@ -8204,7 +8309,8 @@ async function runSelfImplementInner(
   addNextMdReleaseNote(wt.path, releaseNote);
   const preparedPrBody = preparePrBody(
     [
-      prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, declineReasons, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote, revertGuard),
+      prBody(roundGoal, impl.summary, gate.log, review, reviewIntent, declineReasons, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote, revertGuard) + renderScopeExpansionSection(scopeExpansion),
+      ...(goalRefinement ? ['', (await import('./goal-refine.js')).renderGoalChangeSection(goalRefinement)] : []),
       ...(prEvidenceDecision.body ? ['', '---', '', prEvidenceDecision.body] : []),
     ].join('\n'),
     s.persistPrBodyArtifact,
@@ -8214,6 +8320,7 @@ async function runSelfImplementInner(
   try {
     pr = await withStepTimeout(s.openPr({
       title: prTitle(opts.feature, opts.goalFile),
+      runId,
       body: preparedPrBody.body,
       head: wt.branch,
       ...(opts.base ? { base: opts.base } : {}),
@@ -8290,7 +8397,7 @@ async function runSelfImplementInner(
     }
     recordMergeDecision();
     progress('pr-opened', `OP 승인 대기 (#${pr.number}): ${releaseHoldPath}`);
-    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason, prUrl: pr.url, prNumber: pr.number, detail: `OP approval required: ${releaseHoldPath}` };
+    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason, prUrl: pr.url, prNumber: pr.number, detail: `OP approval required: ${releaseHoldPath}` };
   }
   if (!releasePathInspectionError && labels?.includes(AUTO_REVIEW_LABEL)) {
     try {
@@ -8308,7 +8415,7 @@ async function runSelfImplementInner(
       : 'release-path-inspection-failed';
     recordMergeDecision();
     progress('pr-opened', `OP 승인 대기 (#${pr.number}): PR 경로 조회 실패`);
-    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason, prUrl: pr.url, prNumber: pr.number };
+    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason, prUrl: pr.url, prNumber: pr.number };
   }
 
   if (canAuto && (s.mergePr || opts.mergeByHost)) {
@@ -8358,12 +8465,12 @@ async function runSelfImplementInner(
       //    판정(mergeReason)이 아니라 «집행 직전 가드»가 막았으므로 그 사실을 값으로 말한다.
       //    ⛔ 안 그러면 마지막 줄이 침묵하고, 그건 이 착지가 없애려던 상태다(리뷰 must-fix 2R).
       const guardSkipReason = mergeSkipReason ?? (guardFailure ? 'merge-guard-unevaluated' : 'docs-deletion-threshold');
-      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: guardSkipReason, prUrl: pr.url, prNumber: pr.number, detail };
+      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: guardSkipReason, prUrl: pr.url, prNumber: pr.number, detail };
     }
     if (opts.mergeByHost) {
       observe('merge-ready', { number: pr.number, checkedHeadCommit });
       progress('pr-opened', `호스트 재게이트 대기 (#${pr.number})`);
-      return { ok: true, stage: 'merge-ready', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, ...(reviewDeferredToHost ? { mergeReason } : {}), checkedHeadCommit: checkedHeadCommit!, prUrl: pr.url, prNumber: pr.number };
+      return { ok: true, stage: 'merge-ready', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, ...(reviewDeferredToHost ? { mergeReason } : {}), checkedHeadCommit: checkedHeadCommit!, prUrl: pr.url, prNumber: pr.number };
     }
     // Landing freeze: the in-flight marker is written before the freeze is read, so a `freeze on` racing this merge waits.
     // The resume sweep merges from the repository that owns the run worktree (the worktree itself may be cleaned up).
@@ -8375,13 +8482,13 @@ async function runSelfImplementInner(
     };
     const landing = admitLandingMerge(heldEntry, undefined, {}, { prNumber: pr.number, repoRoot: owningRepoRoot(wt.path) ?? wt.path, ...(checkedHeadCommit ? { headCommit: checkedHeadCommit } : {}) });
     if (landing.kind === 'held' && !(checkedHeadCommit && /^[0-9a-f]{40}$/i.test(checkedHeadCommit))) {
-      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: 'merge-guard-unevaluated', prUrl: pr.url, prNumber: pr.number, detail: 'freeze: checked head SHA unavailable; PR left ready for review' };
+      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: 'merge-guard-unevaluated', prUrl: pr.url, prNumber: pr.number, detail: 'freeze: checked head SHA unavailable; PR left ready for review' };
     }
     if (landing.kind !== 'merge') {
       const detail = landing.kind === 'held' ? landingFreezeMessage(landing.freeze) : 'freeze lifted; a resume sweep is merging this PR';
       debug.log('harness.merge', 'frozen', { pr: pr.number, ...(landing.kind === 'held' ? { reason: landing.freeze.reason, until: landing.freeze.until } : { resumedElsewhere: true }) });
       progress('pr-opened', `#${pr.number} ready · ${detail}`);
-      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: landing.kind === 'held' ? 'frozen' : 'resumed-elsewhere', prUrl: pr.url, prNumber: pr.number, detail };
+      return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: landing.kind === 'held' ? 'frozen' : 'resumed-elsewhere', prUrl: pr.url, prNumber: pr.number, detail };
     }
     // The marker and claim live until the merge call itself settles — a step timeout does not stop a merge already
     // sent — and anything that throws before the merge call is made releases them.
@@ -8464,17 +8571,17 @@ async function runSelfImplementInner(
         ...(opts.goalId ? { cellId: opts.goalId } : {}),
         ...(opts.goalFile ? { goalFile: opts.goalFile } : {}),
       }, s.followUp);
-      return { ok: true, stage: 'merged', node: 'merge', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), merged: true, ...(mergedBase ? { mergedBase } : {}), prUrl: pr.url, prNumber: pr.number };
+      return { ok: true, stage: 'merged', node: 'merge', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), merged: true, ...(mergedBase ? { mergedBase } : {}), prUrl: pr.url, prNumber: pr.number };
     }
     progress('pr-opened', `병합 실패 — PR 개설됨(#${pr.number}·수동 병합). ${m.detail ?? ''}`);
     // ⛔⭐ 이 경로는 `canAuto` 가 «참»이었는데 병합이 안 된 자리다 ⇒ mergeSkipReason 은 undefined 다.
     //    그대로 두면 마지막 산출 줄이 «침묵»한다 — 이 착지가 없애려던 바로 그 상태다(리뷰 must-fix).
     //    ⇒ 판정이 아니라 «집행»에서 막힌 것이므로 그 사실을 별도 값으로 말한다.
     const mergeAttemptSkipReason = mergeSkipReason ?? 'merge-attempt-failed';
-    return { ok: true, stage: 'pr-opened', node: 'merge', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: mergeAttemptSkipReason, merged: false, prUrl: pr.url, prNumber: pr.number, ...(m.detail ? { detail: m.detail } : {}) };
+    return { ok: true, stage: 'pr-opened', node: 'merge', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, mergeReason: mergeAttemptSkipReason, merged: false, prUrl: pr.url, prNumber: pr.number, ...(m.detail ? { detail: m.detail } : {}) };
   }
   progress('pr-opened', `✅ PR 개설 (#${pr.number})`);
-  return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}), prUrl: pr.url, prNumber: pr.number };
+  return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...scopeExpansionResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...reviewedHeadResult, ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}), prUrl: pr.url, prNumber: pr.number };
 }
 
 /** 결정적 요청 거부 — 같은 요청을 다시 보내면 «같은» 답이 온다(BACKLOG B6).

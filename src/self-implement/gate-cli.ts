@@ -893,6 +893,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
         lines.push(`shard unmeasured: ${shardId} · ${sharded.unmeasuredByShard?.[shardId] ?? sharded.reason ?? 'cause unavailable'}`);
       }
       lines.push(`shards: unmeasured (${unmeasuredReason})`);
+      if (sharded.baselineStderrTail) lines.push(`baseline worktree-add git stderr: ${sharded.baselineStderrTail}`);
       capture.unmeasuredReason = unmeasuredReason;
     }
     else if (aggregate.report) {

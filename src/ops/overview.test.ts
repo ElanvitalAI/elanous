@@ -11,6 +11,8 @@ import type { Checklist, ChecklistItem } from '../release-loop/checklist.js';
 import type { TaskCard } from '../task-agent/task-hand.js';
 import { measureLandingThroughput } from '../task-agent/cover.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
+import { ResourceLedger, type ResourceView } from '../control-plane/ledger.js';
+import { measureLoad, startMemberHeartbeat } from '../control-plane/member.js';
 import { openSchedulesDb, schedulesDbPath } from '../domains/schedule-registry.js';
 import { runOpsOverview } from '../cli/ops-overview-cli.js';
 
@@ -172,6 +174,37 @@ describe('자원 지도 구속 조건 — 남은 비율 최소 축(RES-FLOOR-BIN
     const s = base();
     s.machines.hosts = [host('a', 0, 8, 32, 64), host('b', 0, 8, 32, 64)];
     expect(bindingResource(s)?.label).toBe('a 메모리');
+  });
+  const psiHost = (name: string, someAvg10: number, fullAvg10: number, freeGb = 60) => ({
+    name,
+    load: okCell({ load1: 1, load5: 1, load15: 1, cpuCount: 8, freeGb, totalGb: 64, ageSeconds: 5, ioPressure: { someAvg10, fullAvg10 } }, 't', AT),
+  });
+  const roomyCapacity = () => okCell({ podUsed: 1, podTarget: 10, localUsed: 0, localMax: 2, free: 11 }, 't', AT);
+  test('I/O 압박 축 — 하트비트 PSI 가 남은 비율 최소면 구속 자원으로 뽑는다', () => {
+    const s = base();
+    s.tasks.capacity = roomyCapacity();
+    s.machines.hosts = [psiHost('node-b', 96, 61)];
+    const b = bindingResource(s);
+    expect(b?.kind).toBe('io');
+    expect(b?.label).toBe('node-b I/O');
+    expect(b?.remainingRatio).toBeCloseTo(0.04, 5);
+    expect(bindingPhrase(b)).toBe('구속 자원 node-b I/O — 남은 비율 최소 4% (4/100(압박 96% · full 61% · 10초 평균))');
+    expect(renderOverview(s, computeVerdict(s), { elapsedMs: 12 }))
+      .toContain('↳ 구속 자원 node-b I/O — 남은 비율 최소 4% (4/100(압박 96% · full 61% · 10초 평균))');
+  });
+  test('I/O 가 넉넉하면 축 순서상 메모리가 이긴다 — I/O 는 늘 후보지만 이기지 않는다', () => {
+    const s = base();
+    s.tasks.capacity = roomyCapacity();
+    s.machines.hosts = [psiHost('node-b', 5, 1, 5)];
+    expect(bindingResource(s)?.label).toBe('node-b 메모리');
+  });
+  test('못 잰 I/O(null·항목 없음)는 «넉넉»이 아니라 후보 제외 — 슬롯이 이긴다', () => {
+    for (const ioPressure of [null, undefined]) {
+      const s = base();
+      s.tasks.capacity = roomyCapacity();
+      s.machines.hosts = [{ name: 'node-b', load: okCell({ load1: 1, load5: 1, load15: 1, cpuCount: 8, freeGb: 60, totalGb: 64, ageSeconds: 5, ioPressure }, 't', AT) }];
+      expect(bindingResource(s)?.label).toBe('슬롯');
+    }
   });
   test('포화 띠에 구속 문구가 둘째 사유로 붙는다 — 첫 문면은 그대로', () => {
     const s = base();
@@ -474,6 +507,102 @@ describe('collectOverview — 주입 원천으로 끝까지', () => {
     expect(computeVerdict(s).verdict).toBe('unobservable');
   });
 
+  test('하트비트 diskIo.io(PSI)가 스냅샷 → 구속 자원 판정까지 생산 수집 경로로 흐른다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ovw-io-root-'));
+    const seat = mkdtempSync(join(tmpdir(), 'ovw-io-seat-'));
+    try {
+      const now = Date.parse(AT);
+      const heartbeat = (diskIo: unknown): ResourceView => ({
+        id: 'm', kind: 'machine', machine: 'mbp', name: 'mbp', owner: 'x',
+        attrs: { load: { loadAvg: [1, 1, 1], cpuCount: 8, freeMem: 60 * 1024 ** 3, totalMem: 64 * 1024 ** 3, observedAt: now, diskIo } },
+        observedAt: now, ttlMs: 600_000, ageMs: 0, expired: false,
+      });
+      const collect = (diskIo: unknown) => collectOverview({ sinceMs: 3_600_000, sinceLabel: '최근 1h', now, root, seatEraDir: seat }, {
+        listSchedules: () => [], listChecklist: () => ({ version: '', released: '', dev: '', history: [], items: [] }),
+        readRuns: () => [], readCards: () => [], ledger: () => [heartbeat(diskIo)], poolSpec: () => null, ps: () => '',
+        gitLog: () => ({ lines: [], observedAt: AT }),
+      });
+
+      const pressured = await collect({ io: { status: 'ok', value: { someAvg10: 96, fullAvg10: 61 } } });
+      expect(pressured.machines.hosts[0]!.load.value?.ioPressure).toEqual({ someAvg10: 96, fullAvg10: 61 });
+      expect(computeVerdict(pressured).reasons)
+        .toContain('구속 자원 mbp I/O — 남은 비율 최소 4% (4/100(압박 96% · full 61% · 10초 평균))');
+      expect(renderOverview(pressured, computeVerdict(pressured), { elapsedMs: 1 })).toContain('I/O 압박 96% · full 61%');
+
+      const blind = await collect({ io: { status: 'unmeasured', reason: '/proc/pressure/io 없음' } });
+      expect(blind.machines.hosts[0]!.load.value?.ioPressure).toBeNull();
+      expect(computeVerdict(blind).reasons.join(' ')).not.toContain('mbp I/O');
+      expect(renderOverview(blind, computeVerdict(blind), { elapsedMs: 1 })).not.toContain('I/O 압박');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(seat, { recursive: true, force: true });
+    }
+  });
+
+  test('real heartbeat diskIo reaches the persistent ledger and production overview binding/output path', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ovw-heartbeat-io-root-'));
+    const seat = mkdtempSync(join(tmpdir(), 'ovw-heartbeat-io-seat-'));
+    const ledger = new ResourceLedger(root);
+    let onMachineRegistered!: () => void;
+    const machineRegistered = new Promise<void>((resolve) => { onMachineRegistered = resolve; });
+    const fetch: typeof globalThis.fetch = (async (input: URL | RequestInfo, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as {
+        id?: string; kind?: string; machine?: string; owner?: string; attrs?: Record<string, unknown>; ttlMs?: number;
+      };
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/register')) {
+        ledger.register({ id: body.id!, kind: body.kind!, name: '', machine: body.machine!, owner: body.owner!,
+          attrs: body.attrs, observedAt: Date.now(), ttlMs: body.ttlMs! } as never, 'member-a');
+        if (body.kind === 'machine') onMachineRegistered();
+      } else {
+        const id = decodeURIComponent(url.pathname.split('/').at(-2)!);
+        ledger.heartbeat(id, 'member-a', body.attrs, Date.now() + 60_000);
+      }
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    let stop: (() => void) | undefined;
+    try {
+      stop = startMemberHeartbeat({
+        coordinatorUrl: 'http://127.0.0.1:1', token: 'a'.repeat(64),
+        machine: { id: 'machine:local', name: 'local' },
+        instance: { id: 'instance:local', name: 'nexus', endpoint: 'http://127.0.0.1:43210' },
+        intervalMs: 60_000, fetch,
+        // Inject a deterministic measured PSI sample at the heartbeat's documented probe seam.
+        // The heartbeat, persistent ledger, collector, verdict, and renderer below are production code.
+        measure: async (now, baseline) => {
+          const measured = await measureLoad(now, baseline);
+          const observedAt = now();
+          return { ...measured, loadAvg: [0.1, 0.1, 0.1], cpuCount: 8, freeMem: 60 * 1024 ** 3, totalMem: 64 * 1024 ** 3,
+            diskIo: { ...measured.diskIo, io: { status: 'ok', source: 'test:deterministic-PSI', observedAt,
+              value: { someAvg10: 100, fullAvg10: 50 } } } };
+        },
+      });
+      await machineRegistered;
+      const stored = ledger.list({ kind: 'machine' })[0] as ResourceView;
+      expect((stored.attrs as { load?: { diskIo?: { io?: unknown } } }).load?.diskIo?.io)
+        .toMatchObject({ status: 'ok', value: { someAvg10: 100, fullAvg10: 50 } });
+
+      const now = Date.now();
+      const snapshot = await collectOverview({ sinceMs: 3_600_000, sinceLabel: '최근 1h', now, root, seatEraDir: seat }, {
+        listSchedules: () => [], readSchedulerRuns: () => [], listChecklist: () => ({ version: '', released: '', dev: '', history: [], items: [] }),
+        readRuns: () => [], readCards: () => [], ledger: () => ledger.list({ kind: 'machine' }), poolSpec: () => null, ps: () => '',
+        gitLog: () => ({ lines: [], observedAt: new Date(now).toISOString() }),
+      });
+      const host = snapshot.machines.hosts.find((row) => row.name === 'local');
+      expect(host?.load.value?.ioPressure).toEqual({ someAvg10: 100, fullAvg10: 50 });
+      const verdict = computeVerdict(snapshot);
+      expect(bindingResource(snapshot)).toMatchObject({ kind: 'io', label: 'local I/O', remainingRatio: 0 });
+      expect(verdict.reasons).toContain('구속 자원 local I/O — 남은 비율 최소 0% (0/100(압박 100% · full 50% · 10초 평균))');
+      const rendered = renderOverview(snapshot, verdict, { elapsedMs: 1 });
+      expect(rendered).toContain('I/O 압박 100% · full 50%');
+      expect(rendered).toContain('구속 자원 local I/O — 남은 비율 최소 0%');
+    } finally {
+      stop?.();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(seat, { recursive: true, force: true });
+    }
+  });
+
   test('cron-run production records flow through the persistent log, overview collector, cache, and renderer', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ovw-scheduler-root-'));
     const seat = mkdtempSync(join(tmpdir(), 'ovw-scheduler-seat-'));
@@ -504,7 +633,7 @@ describe('collectOverview — 주입 원천으로 끝까지', () => {
         listSchedules: () => [], listChecklist: () => ({ version: '', released: '', dev: '', history: [], items: [] }),
         readRuns: () => [], readCards: () => [], ledger: () => [], poolSpec: () => null, ps: () => '',
         gitLog: () => ({ lines: [], observedAt: new Date(now).toISOString() }),
-        readSchedulerRuns: (sinceMs, untilMs) => store.queryAll({ exactCategories: ['schedule.run'], sinceMs, untilMs })
+        readSchedulerRuns: (sinceMs, untilMs) => store!.queryAll({ exactCategories: ['schedule.run'], sinceMs, untilMs })
           .map(({ ts_ms, data }) => ({ ts_ms, data })),
       });
       const cache = createOverviewCache({ collect, measurePods: async () => [],

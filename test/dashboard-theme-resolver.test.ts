@@ -75,6 +75,48 @@ describe('FU G resolveActiveTheme — plugin branch', () => {
     expect(t.colors.accent).toBe('#abcdef');
   });
 
+  test('reports plugin theme application with token count and source', () => {
+    const events: Array<{ id: string; tokensCount: number; source: string }> = [];
+    const t = resolveActiveTheme({
+      raw: { active: 'plugin:test.acme' },
+      loadPlugin: () => ({ colors: { accent: '#abcdef', success: '#123456' } }),
+      onPluginApplied: (event) => events.push(event),
+    });
+
+    expect(t.colors.accent).toBe('#abcdef');
+    expect(events).toEqual([
+      { id: 'plugin:test.acme', tokensCount: 2, source: 'plugin' },
+    ]);
+  });
+
+  test('does not report plugin application on preset or failed plugin paths', () => {
+    const events: unknown[] = [];
+    resolveActiveTheme({
+      raw: { active: 'rose-pine-dawn' },
+      loadPlugin: () => ({ colors: { accent: '#abcdef' } }),
+      onPluginApplied: (event) => events.push(event),
+    });
+    resolveActiveTheme({
+      raw: { active: 'plugin:broken' },
+      loadPlugin: () => { throw new Error('load failed'); },
+      onPluginApplied: (event) => events.push(event),
+    });
+    expect(events).toEqual([]);
+  });
+
+  test('observation callback failure does not discard the applied plugin theme', () => {
+    let reportedError: string | null = null;
+    const t = resolveActiveTheme({
+      raw: { active: 'plugin:test.acme' },
+      loadPlugin: () => ({ colors: { accent: '#abcdef' } }),
+      onPluginApplied: () => { throw new Error('log unavailable'); },
+      onPluginError: (message) => { reportedError = message; },
+    });
+
+    expect(t.colors.accent).toBe('#abcdef');
+    expect(reportedError).toBeNull();
+  });
+
   test('preset wins over plugin when both would match', () => {
     const sneakyPlugin: PluginThemeLoader = () => ({
       ...DEFAULT_THEME_TOKENS,

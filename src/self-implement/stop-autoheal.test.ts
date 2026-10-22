@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { defaultOverlaysDir, loadGraphOverlays, selectOverlays } from './graph-overlay-yaml.js';
 import { GRAPH_SPECS } from './graph-templates.js';
@@ -7,10 +10,82 @@ import { RUN_STOP_CLASSES, type RunStopClass, type RunStopRecord } from './run-s
 import {
   AUTOHEAL_ACTION_BY_CLASS, AUTOHEAL_EVENT, autohealAlreadyAttempted, autohealFromStop, parseAutohealMode,
   repeatedStop,
+  captureStopKnowhowCandidate,
   pickAutohealAction, resetAutohealProcessMemory, type AutohealAction, type AutohealActions, type AutohealLadder,
 } from './stop-autoheal.js';
 
 beforeEach(() => { resetAutohealProcessMemory(); });
+
+describe('LOOP-STOP-KNOWHOW-CAPTURE', () => {
+  test('parent stop creates one candidate and groups a second run with the same cell and reason', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-knowhow-'));
+    try {
+      const first = { ...record('scope-escape', 'scope-escape: outside path'), site: 'implement-aborted' };
+      await autohealFromStop({ runId: 'run-first', goalId: 'CELL-A', record: first }, { mode: 'shadow', knowhowCandidateDir: dir, ...memLedger() });
+      await autohealFromStop({ runId: 'run-second', goalId: 'CELL-A', record: first }, { mode: 'shadow', knowhowCandidateDir: dir, ...memLedger() });
+      await autohealFromStop({ runId: 'run-second', goalId: 'CELL-A', record: first }, { mode: 'shadow', knowhowCandidateDir: dir, ...memLedger() });
+      const files = readdirSync(dir).filter((name) => name.endsWith('.json'));
+      expect(files).toHaveLength(1);
+      const candidate = JSON.parse(readFileSync(join(dir, files[0]!), 'utf8'));
+      expect(candidate).toMatchObject({ cell: 'CELL-A', reason: 'scope-escape', stage: 'implement-aborted', occurrences: 2, runIds: ['run-first', 'run-second'] });
+      expect(candidate.causeLine).toBe('scope-escape: outside path');
+      expect(candidate.nextLaunchChange).toContain('대상 경로');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('all four intermediate reasons are captured, normal or unrelated stops are not, unknown cell is explicit', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-knowhow-'));
+    try {
+      const cases = [
+        ['no-progress', { ...record('unclassified', 'unchanged'), childEvidence: { terminationReason: 'no-progress' } }],
+        ['scope-escape', record('scope-escape')],
+        ['wallclock-cap', { ...record('unclassified', 'elapsed'), childEvidence: { terminationReason: 'wallclock-cap' } }],
+        ['pod-job-failed', { ...record('pod-died'), terminationReason: 'pod-job-failed' }],
+      ] as const;
+      for (const [reason, stop] of cases) {
+        const result = captureStopKnowhowCandidate({ runId: `run-${reason}`, record: stop }, dir);
+        expect(result?.candidate).toMatchObject({ cell: null, reason, stage: '미상', cellUnknownReason: expect.stringContaining('칸 미상') });
+        expect(result?.candidate.stageUnknownReason).toContain('site');
+      }
+      expect(captureStopKnowhowCandidate({ runId: 'run-normal', record: record('main-sync') }, dir)).toBeUndefined();
+      expect(captureStopKnowhowCandidate({ runId: 'run-pod-child', record: record('pod-died', 'pod-child-failed') }, dir)).toBeUndefined();
+      expect(readdirSync(dir).filter((name) => name.endsWith('.json'))).toHaveLength(4);
+      const fromChild = captureStopKnowhowCandidate({ runId: 'run-child', goalId: 'CELL-B', record: {
+        ...record('unclassified', 'child stopped'),
+        childEvidence: { terminationReason: 'wallclock-cap', detail: 'first failure line\nsecond line' },
+      } }, dir);
+      expect(fromChild?.candidate).toMatchObject({ cell: 'CELL-B', reason: 'wallclock-cap', causeLine: 'first failure line' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a cause that merely mentions a stop reason does not create a candidate', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-knowhow-'));
+    try {
+      for (const reason of ['no-progress', 'scope-escape', 'wallclock-cap', 'pod-job-failed']) {
+        expect(captureStopKnowhowCandidate({ runId: `run-${reason}`, record: record('unclassified', `not ${reason}: ordinary failure`) }, dir)).toBeUndefined();
+      }
+      expect(readdirSync(dir).filter((name) => name.endsWith('.json'))).toHaveLength(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('new stops update the last site and cause while older run IDs remain deduplicated', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-knowhow-'));
+    try {
+      for (let index = 0; index < 33; index++) {
+        const result = captureStopKnowhowCandidate({ runId: `run-${index}`, goalId: 'CELL-A',
+          record: { ...record('scope-escape', `cause ${index}`), site: `site-${index}` } }, dir,
+        () => new Date(Date.UTC(2026, 9, 21, 0, index)));
+        expect(result?.candidate.occurrences).toBe(index + 1);
+      }
+      const again = captureStopKnowhowCandidate({ runId: 'run-0', goalId: 'CELL-A',
+        record: { ...record('scope-escape', 'old cause replayed'), site: 'old-site-replayed' } }, dir,
+      () => new Date(Date.UTC(2026, 9, 21, 2, 0)));
+      expect(again?.candidate).toMatchObject({ occurrences: 33, stage: 'site-32', causeLine: 'cause 32',
+        lastAt: new Date(Date.UTC(2026, 9, 21, 0, 32)).toISOString() });
+      expect(again?.candidate.runIds).toHaveLength(33);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 const record = (cls: RunStopClass, cause = `stopped: ${cls}`): RunStopRecord => ({
   class: cls, cause, evidenceRef: `run-ledger:r1:${cls}`, nextMove: 'next',

@@ -1,6 +1,10 @@
 import { debug } from '../debug/log.js';
+import type { GoalType } from '../self-implement/goal-author.js';
 import { frontObservationTemplate, visitBudgetOfVisits, type VisitBudgetReading } from '../self-implement/graph-authority.js';
 import { GRAPH_TEMPLATES_SOURCE, graphIdentityOf, pipelineNodeEntryPayload, type GraphTemplate } from '../self-implement/graph-templates.js';
+import { appendRunLedgerEntry, runLedgerDir } from '../self-implement/run-ledger.js';
+import { journeyJoinFields } from './graph-journey-nodes.js';
+import { journeySpec, readJourneyEdge, recordJourneyEdge, type JourneyRoute } from './graph-journey-route.js';
 
 /** ⭐ RFC §5 «5단계» — 전반부(저작·플랜·분해) 노드를 그래프 관측에 «잇는다».
  *
@@ -49,6 +53,25 @@ export function resetFrontVisitCountsForTesting(now?: () => number): void {
   frontNodeVisitCounts.clear();
   frontVisitNow = now ?? (() => Date.now());
   lastFrontVisitPruneMs = Number.NEGATIVE_INFINITY;
+}
+
+/** Record the actual front-half execution boundary, without controlling the stage. */
+export async function observeFrontNodeUnit<T>(node: FrontNodeId, runId: string | undefined, goalType: GoalType | undefined, execute: () => Promise<T>): Promise<T> {
+  const emit = (phase: 'enter' | 'exit'): void => {
+    if (!runId) return;
+    try {
+      const template = frontObservationTemplate(goalType);
+      const contractId = template.nodes.find((item) => item.nodeId === node)?.recipe ?? null;
+      const data = { graphId: template.graphId, nodeId: node, unit: node, contractId, phase };
+      try { appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId, event: 'graph.unit', data }, runLedgerDir()); }
+      catch { /* ledger failure cannot change execution */ }
+      try { debug.log('graph.unit', phase, { ...data, runId }); }
+      catch { /* debug failure cannot change execution */ }
+    } catch { /* template failure cannot change execution */ }
+  };
+  emit('enter');
+  try { return await execute(); }
+  finally { emit('exit'); }
 }
 
 function pruneIdleFrontVisitRuns(nowMs: number): void {
@@ -119,4 +142,93 @@ export function observeFrontNodeEntry(node: FrontNodeId, data: {
       graphTemplatesSource: GRAPH_TEMPLATES_SOURCE,
     });
   } catch { /* 판독 실패는 fail-soft — 예산은 관측이고 저작을 막지 않는다 */ }
+}
+
+/** GRAPH-AUTHOR-FAIL-EDGE — author 결과가 고르는 «앞단 결과 노드». ⛔ 런타임 값 — YAML 이 더한 노드를 시험이 센다. */
+export const AUTHOR_OUTCOME_NODE_IDS = ['re-ground', 'needs-human'] as const;
+
+/** author 노드의 결과 라벨 — implement-loop.yaml `from: author · on: outcome` 의 map 키와 «같은» 닫힌 집합. */
+export const AUTHOR_EXIT_OUTCOMES = ['ok', 're-authored', 'not-grounded', 'fail'] as const;
+export type AuthorExitOutcome = typeof AUTHOR_EXIT_OUTCOMES[number];
+
+export type FrontNodeExit =
+  | { readonly node: 'author'; readonly outcome: AuthorExitOutcome }
+  | { readonly node: 're-ground'; readonly outcome: 'retry' };
+
+export interface FrontNodeExitData {
+  /** 1 = 첫 저작 · 2 = 자동 재저작(re-ground 를 한 번 지난 뒤). */
+  readonly attempt: number;
+  /** 코드가 «실제로» 간 다음 노드 — 그래프 답과 다르면 graph-edge-taken 이 honored:false 로 남긴다. 없으면 그래프 답. */
+  readonly taken?: string;
+  readonly reason?: string;
+  readonly runId?: string;
+  readonly goalId?: string;
+  readonly goalType?: string;
+  readonly goalFile?: string;
+  /** 근거 카드 — needs-human 으로 갈 때 사람이 «무엇 때문에»를 다시 캐지 않게 막힘을 그대로 싣는다. */
+  readonly blockers?: readonly { readonly kind: string; readonly name: string; readonly detail?: string }[];
+}
+
+const EVIDENCE_DETAIL_CHARS = 400;
+
+/** 그래프가 고른 다음 노드에 «방문 예산»을 겹친다 — re-ground(max_visits 1)를 이미 지났으면 같은 결과의
+ *  두 번째는 re-ground 가 아니라 author 의 `fail` 출구(needs-human)로 간다. ⛔ 노드 이름·예산은 선언에서 읽는다. */
+function withVisitBudget(route: JourneyRoute, exit: FrontNodeExit, attempt: number): { readonly to: string | null; readonly budgetReason?: string } {
+  // ⛔ 예산을 겹치는 대상은 re-ground 뿐이다 — attempt-1 은 «re-ground 를 지난 횟수»이지 다른 노드의 방문 수가 아니다.
+  if (exit.node !== 'author' || route.to !== 're-ground') return { to: route.to };
+  const target = journeySpec({}).spec?.nodes.find((node) => node.nodeId === route.to);
+  const priorVisits = Math.max(0, attempt - 1);
+  if (target === undefined || priorVisits < target.maxVisits) return { to: route.to };
+  const exhausted = readJourneyEdge('author', 'fail');
+  return { to: exhausted.to, budgetReason: `${route.to}-visit-budget-exhausted (max_visits ${target.maxVisits})` };
+}
+
+/** ⭐ GRAPH-AUTHOR-FAIL-EDGE ① — 앞 노드의 «나감»을 결과와 함께 남긴다(진입만 있던 자리).
+ *  호출부(실행 경로): src/self-dev/ask-launch-flow.ts — 저작 끝(author ok · not-grounded · re-authored) ·
+ *    저작기 throw(author fail) · 자동 재저작 시작(re-ground retry).
+ *  🔎 관측: `self-implement` / `front-node-exit` ⊕ 같은 자리의 `graph-edge-taken`(from author|re-ground).
+ *  ⛔ 관측이지 제어가 아니다 — 다음 걸음은 여전히 코드가 정하고, 그래프 답과 다르면 honored:false 로 남는다.
+ *  ⛔ fail-soft — 관측 실패가 저작을 죽이지 않는다. */
+export function observeFrontNodeExit(exit: FrontNodeExit, data: FrontNodeExitData): JourneyRoute | null {
+  let recorded: JourneyRoute | null = null;
+  try {
+    const route = readJourneyEdge(exit.node, exit.outcome);
+    const budget = withVisitBudget(route, exit, data.attempt);
+    const graphRoute: JourneyRoute = { ...route, to: budget.to };
+    const taken = data.taken ?? budget.to ?? exit.outcome;
+    const reason = [budget.budgetReason, data.reason].filter((part): part is string => part !== undefined).join(' · ');
+    recordJourneyEdge(graphRoute, taken, reason.length > 0 ? reason : undefined);
+    recorded = graphRoute;
+    const payload = {
+      graphId: 'self-implement',
+      node: exit.node,
+      outcome: exit.outcome,
+      attempt: data.attempt,
+      to: budget.to,
+      taken,
+      honored: budget.to === null || budget.to === taken,
+      ...(reason.length > 0 ? { reason } : {}),
+      ...(data.runId === undefined ? {} : { runId: data.runId }),
+      ...(data.goalId === undefined ? {} : { goalId: data.goalId }),
+      ...(data.goalType === undefined ? {} : { goalType: data.goalType }),
+      ...(data.goalFile === undefined ? {} : { goalFile: data.goalFile }),
+      ...(data.blockers === undefined || data.blockers.length === 0 ? {} : {
+        evidenceCard: data.blockers.map((blocker) => ({
+          kind: blocker.kind, name: blocker.name,
+          ...(blocker.detail === undefined ? {} : { detail: blocker.detail.slice(0, EVIDENCE_DETAIL_CHARS) }),
+        })),
+      }),
+      phase: 'front',
+      graphTemplatesSource: GRAPH_TEMPLATES_SOURCE,
+      ...journeyJoinFields(),
+    };
+    try { debug.log('self-implement', 'front-node-exit', payload); }
+    catch { /* debug failure cannot change authoring */ }
+    // Pod 의 logs.db 는 Job 과 사라진다 — 원장에도 남겨 호스트가 NOT-GROUNDED 의 길을 사후에 읽게 한다.
+    if (data.runId !== undefined) {
+      try { appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId: data.runId, event: 'front-node-exit', data: payload }, runLedgerDir()); }
+      catch { /* ledger failure cannot change authoring */ }
+    }
+  } catch { /* 관측은 fail-soft — 저작을 죽이지 않는다 */ }
+  return recorded;
 }

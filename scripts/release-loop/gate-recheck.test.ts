@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { clearPartialPlan, partialPlanPath, planPartialRegate, planSameCommitRecheck, readPartialPlan,
-  recheckPlanPath, writePartialPlan, writeRecheckPlan } from './gate-partial';
+import { clearPartialPlan, partialPlanPath, planPartialRegate, planSameCommitRecheck, planStalledShardRecheck, readPartialPlan,
+  readPartialPlanResult, recheckPlanPath, writePartialPlan, writeRecheckPlan } from './gate-partial';
 import { existsTestFileAtCommit } from './gate-recheck-plan-node';
 
 const SHA = 'a'.repeat(40);
@@ -33,7 +33,7 @@ test('G1 recheck refuses another commit, absent failures, unsafe ids, and missin
   expect(planSameCommitRecheck({ ...input, existsAtCommit: () => { throw new Error('unavailable'); } })).toMatchObject({ ok: false, reason: expect.stringContaining('unreadable') });
 });
 
-test('G1 recheck shares the partial-plan slot with a distinct kind, stays shadow-only, rejects tampering', () => {
+test('G1 recheck shares the partial-plan slot, is consumed only on its commit, and rejects tampering as an error', () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-recheck-'));
   try {
     const result = planSameCommitRecheck(input);
@@ -42,18 +42,44 @@ test('G1 recheck shares the partial-plan slot with a distinct kind, stays shadow
     expect(path).toBe(recheckPlanPath(root, input.version));
     expect(path).toBe(partialPlanPath(root, input.version));
     expect(readFileSync(path, 'utf8')).toContain('src/a.test.ts');
+    // The legacy G1 plan is valid but not a stalled-shard plan; keep its existing full-gate behavior.
     expect(readPartialPlan([root], input.version, SHA)).toBeNull();
+    expect(readPartialPlanResult([root], input.version, SHA)).toMatchObject({ plan: null, fallbackReason: 'recheck-not-stalled-only' });
     expect(readPartialPlan([root], input.version, OTHER)).toBeNull();
+    expect(readPartialPlanResult([root], input.version, OTHER)).toMatchObject({ plan: null, fallbackReason: 'plan-commit-mismatch' });
     for (const bad of [
+      null,
       { ...result.plan, forCommit: OTHER },
       { ...result.plan, files: ['src/a.test.ts'] },
       { ...result.plan, files: ['src/a.test.ts', 'src/b.test.ts', 'src/passing.test.ts'] },
       { ...result.plan, priorFailures: ['../../x.test.ts > case'] },
     ]) {
       writeFileSync(path, JSON.stringify(bad));
-      expect(() => readPartialPlan([root], input.version, SHA)).toThrow('invalid gate recheck plan');
+      expect(() => readPartialPlan([root], input.version, SHA)).toThrow(/invalid gate (?:partial|recheck) plan/);
+      expect(() => readPartialPlanResult([root], input.version, SHA)).toThrow(/invalid gate (?:partial|recheck) plan/);
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('G1 stalled recheck reruns only incomplete-shard files and carries completed failures and errors', () => {
+  const result = planStalledShardRecheck({ version: input.version, measuredCommit: SHA, forCommit: SHA,
+    failures: ['src/done.test.ts > known fail'], errors: ['src/error.test.ts > [error]'],
+    stalledFiles: ['src/stalled.test.ts'], preservedShardCount: 4, existsAtCommit: () => true });
+  expect(result).toMatchObject({ ok: true, plan: { kind: 'recheck', files: ['src/stalled.test.ts'], preservedShardCount: 4,
+    stalledFiles: ['src/stalled.test.ts'], priorFailures: ['src/done.test.ts > known fail'], priorErrors: ['src/error.test.ts > [error]'] } });
+  if (!result.ok) return;
+  const root = mkdtempSync(join(tmpdir(), 'gate-stalled-recheck-'));
+  try {
+    writeRecheckPlan(root, result.plan);
+    expect(readPartialPlan([root], input.version, SHA)).toMatchObject({ files: result.plan.files, priorFailures: result.plan.priorFailures });
+    expect(readPartialPlan([root], input.version, OTHER)).toBeNull();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('G1 stalled recheck refuses to remeasure any file already measured by a completed shard', () => {
+  expect(planStalledShardRecheck({ version: input.version, measuredCommit: SHA, forCommit: SHA,
+    failures: ['src/stalled.test.ts > introduced'], errors: [], stalledFiles: ['src/stalled.test.ts'],
+    existsAtCommit: () => true })).toMatchObject({ ok: false, reason: expect.stringContaining('overlaps') });
 });
 
 test('G1 refuses to overwrite an active changed-commit partial plan', () => {

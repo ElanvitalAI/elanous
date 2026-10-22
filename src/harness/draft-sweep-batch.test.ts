@@ -11,8 +11,9 @@ import { mapBounded, runDraftSweep } from '../self-dev/draft-sweep.js';
 
 type Fixture = {
   number: number; draft: boolean; title: string; branch: string; body?: string; labels?: string[];
-  created: string; updated: string; merged?: string; mergeSha?: string; mergeMessage?: string;
+  created: string; updated: string; headCommittedDate?: string; merged?: string; mergeSha?: string; mergeMessage?: string;
   files: string[]; comments: string[]; head: string;
+  reviews?: Array<{ state: string; body: string; submittedAt: string; commitId: string }>;
   commits?: Array<{ sha: string; date: string; files: string[] }>;
 };
 
@@ -29,9 +30,11 @@ const OPEN: Fixture[] = [
   { number: 14, draft: true, title: 'kept', branch: 'self-impl/kept-14', labels: ['elanous:keep'], created: '2026-10-01T00:00:00Z',
     updated: '2026-10-01T00:00:00Z', files: [], comments: [], head: 'h14' },
   { number: 15, draft: true, title: 'old', branch: 'self-impl/old-15', created: '2026-09-20T00:00:00Z', updated: '2026-09-20T00:00:00Z',
-    files: ['src/old.ts'], comments: ['VERDICT: PASS'], head: 'h15' },
+    files: ['src/old.ts'], comments: ['VERDICT: PASS'], head: 'h15',
+    reviews: [{ state: 'APPROVED', body: 'VERDICT: PASS', submittedAt: '2026-10-02T00:00:00Z', commitId: 'h15' }] },
   { number: 16, draft: true, title: 'huge', branch: 'self-impl/huge-16', created: '2026-10-01T00:00:00Z', updated: '2026-10-01T00:00:00Z',
-    files: Array.from({ length: 150 }, (_, i) => `src/huge/${i}.ts`), comments: ['must-fix: 2'], head: 'h16' },
+    files: Array.from({ length: 150 }, (_, i) => `src/huge/${i}.ts`), comments: ['must-fix: 2'], head: 'h16',
+    reviews: [{ state: 'CHANGES_REQUESTED', body: 'must-fix: 2', submittedAt: '2026-10-02T00:00:00Z', commitId: 'h16' }] },
   { number: 17, draft: true, title: 'fresh', branch: 'self-impl/fresh-17', created: '2026-10-04T23:00:00Z', updated: '2026-10-04T23:00:00Z',
     files: ['src/f.ts'], comments: [], head: 'h17' },
   { number: 18, draft: false, title: 'ready human', branch: 'human/ready', created: '2026-10-01T00:00:00Z', updated: '2026-10-01T00:00:00Z',
@@ -58,8 +61,8 @@ const pull = (pr: Fixture) => ({
 const page = <T>(rows: T[], index: number) => rows.slice((index - 1) * 100, index * 100);
 const connection = <T>(rows: T[]) => ({ totalCount: rows.length, nodes: rows.slice(0, 100), pageInfo: { hasNextPage: rows.length > 100 } });
 
-function fakeGh(graphql: boolean, calls: string[]) {
-  const all = [...OPEN, ...MERGED];
+function fakeGh(graphql: boolean, calls: string[], fixtures: Fixture[] = [...OPEN, ...MERGED]) {
+  const all = fixtures;
   const byNumber = new Map(all.map((pr) => [pr.number, pr]));
   const byHead = new Map(all.map((pr) => [pr.head, pr]));
   return (args: string[]): string => {
@@ -68,29 +71,40 @@ function fakeGh(graphql: boolean, calls: string[]) {
     if (args[1] === 'graphql') {
       if (!graphql) throw new Error('GraphQL unavailable');
       const query = args[3]!;
+      let braceDepth = 0;
+      for (const character of query) {
+        if (character === '{') braceDepth += 1;
+        else if (character === '}' && --braceDepth < 0) throw new Error('GraphQL selection closes before it opens');
+      }
+      if (braceDepth !== 0) throw new Error('GraphQL selection is not closed');
       const repository: Record<string, unknown> = {};
       for (const match of query.matchAll(/p(\d+): pullRequest/g)) {
         const pr = byNumber.get(Number(match[1]))!;
         repository[`p${pr.number}`] = { number: pr.number, headRefOid: pr.head,
+          headRef: query.includes('committedDate') ? { target: { committedDate: pr.headCommittedDate ?? pr.updated } } : { target: {} },
           files: connection(pr.files.map((path) => ({ path }))), comments: connection(pr.comments.map((body) => ({ body }))),
-          reviews: connection([]), mergeCommit: pr.mergeSha ? { oid: pr.mergeSha, message: pr.mergeMessage } : null };
+          reviews: connection((pr.reviews ?? []).map((review) => ({ state: review.state, body: review.body,
+            submittedAt: review.submittedAt, commit: { oid: review.commitId } }))),
+          mergeCommit: pr.mergeSha ? { oid: pr.mergeSha, message: pr.mergeMessage } : null };
       }
       return JSON.stringify({ data: { repository } });
     }
     const endpoint = args[1]!;
     let match: RegExpExecArray | null;
-    if ((match = /pulls\?state=open.*&page=(\d+)$/.exec(endpoint))) return JSON.stringify(page(OPEN.map(pull), Number(match[1])));
-    if ((match = /pulls\?state=closed.*&page=(\d+)$/.exec(endpoint))) return JSON.stringify(page(MERGED.map(pull), Number(match[1])));
+    if ((match = /pulls\?state=open.*&page=(\d+)$/.exec(endpoint))) return JSON.stringify(page(all.filter((pr) => !pr.merged).map(pull), Number(match[1])));
+    if ((match = /pulls\?state=closed.*&page=(\d+)$/.exec(endpoint))) return JSON.stringify(page(all.filter((pr) => pr.merged).map(pull), Number(match[1])));
     if ((match = /\/pulls\/(\d+)\/files\?per_page=100&page=(\d+)$/.exec(endpoint)))
       return JSON.stringify(page(byNumber.get(Number(match[1]))!.files.map((filename) => ({ filename })), Number(match[2])));
     if ((match = /\/issues\/(\d+)\/comments\?per_page=100&page=(\d+)$/.exec(endpoint)))
       return JSON.stringify(page(byNumber.get(Number(match[1]))!.comments.map((body) => ({ body })), Number(match[2])));
     if ((match = /\/pulls\/(\d+)\/commits\?per_page=100&page=1$/.exec(endpoint)))
       return JSON.stringify((byNumber.get(Number(match[1]))!.commits ?? []).map((commit) => ({ sha: commit.sha, commit: { committer: { date: commit.date } } })));
-    if ((match = /\/pulls\/(\d+)\/reviews\?per_page=100$/.exec(endpoint))) return '[]';
+    if ((match = /\/pulls\/(\d+)\/reviews\?per_page=100(?:&page=\d+)?$/.exec(endpoint)))
+      return JSON.stringify((byNumber.get(Number(match[1]))!.reviews ?? []).map((review) => ({ state: review.state,
+        body: review.body, submitted_at: review.submittedAt, commit_id: review.commitId })));
     if ((match = /\/pulls\/(\d+)$/.exec(endpoint))) return JSON.stringify({ head: { sha: byNumber.get(Number(match[1]))!.head } });
     if ((match = /\/commits\/(\w+)\/status$/.exec(endpoint))) return JSON.stringify({ state: 'success' });
-    if ((match = /\/commits\/(\w+)\/check-runs\?per_page=100$/.exec(endpoint)))
+    if ((match = /\/commits\/(\w+)\/check-runs\?per_page=100&page=\d+$/.exec(endpoint)))
       return JSON.stringify({ check_runs: byHead.get(match[1]!)?.number === 16 ? [{ conclusion: 'failure' }] : [{ conclusion: 'success' }] });
     if ((match = /\/commits\/(\w+)\?per_page=100$/.exec(endpoint))) {
       const commit = OPEN.flatMap((pr) => pr.commits ?? []).find((entry) => entry.sha === match![1]);
@@ -165,7 +179,21 @@ test('batched GraphQL evidence classifies a fixture set exactly like the per-PR 
     'api repos/my/repo/pulls/10/commits?per_page=100&page=1', 'api repos/my/repo/pulls/11/commits?per_page=100&page=1']);
   // Review/gate posture is read only for the daily census (harness drafts older than 24h) — never for #17 or #18.
   expect(batched.calls.some((call) => /\/commits\/h1[78]\//.test(call))).toBe(false);
-});
+}, 120_000);
+
+test('triage uses the head commit time even when the PR updated time differs', async () => {
+  const calls: string[] = [];
+  const recentHead: Fixture = { number: 90, draft: true, title: 'recent head', branch: 'self-impl/recent-90',
+    body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12', labels: ['elanous:from-ux'],
+    created: '2026-10-01T00:00:00Z', updated: '2026-10-04T00:00:00Z', headCommittedDate: '2026-10-05T01:00:00Z',
+    files: ['src/recent.ts'], comments: [], head: 'h90' };
+  const result = await runDraftSweep({ repository: 'my/repo', now: new Date('2026-10-05T06:00:00Z'), includeTriage: true,
+    adapters: githubDraftSweepAdapters(fakeGh(true, calls, [recentHead]), git, '/tmp/main') });
+  const assessment = result.triage?.entries[0]?.assessment;
+  expect(assessment?.nextAction).toBe('human');
+  expect(assessment?.checks['recent-commit']).toMatchObject({ state: 'yes' });
+  expect(assessment?.evidence).toContain('last commit=2026-10-05T01:00:00Z; cutoff=09:30 KST');
+}, 120_000);
 
 test('real gh sweep reports exit status and auth stderr, logs once, and passes the App token without exposing it', async () => {
   const dir = mkdtempSync(join(stateDir, 'bin-'));

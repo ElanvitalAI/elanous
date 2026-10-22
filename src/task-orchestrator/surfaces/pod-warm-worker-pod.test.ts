@@ -154,7 +154,10 @@ test('two requests use kubectl exec in the same Pod, pass JSON by stdin, and kee
   expect(requests).toHaveLength(2);
   expect(execs.filter(call => call.args.includes(WARM_POD_ACK))).toHaveLength(2);
   for (const call of requests) {
-    expect(call.args).toEqual(['--context', 'node-b', '-n', spec.namespace, 'exec', '-i', spec.name, '-c', 'worker', '--', 'bun', '-e', WARM_POD_EXEC]);
+    expect(call.args).toEqual(['--context', 'node-b', '-n', spec.namespace, 'exec', '-i', spec.name, '-c', 'worker', '--',
+      'env', ...call.args.filter(arg => arg.startsWith('ELANOUS_POD_')), 'bun', '-e', WARM_POD_EXEC]);
+    expect(call.args).toContain('ELANOUS_POD_RUN=run-1');
+    expect(call.args).toContain('ELANOUS_POD_LEASE=lease-1');
     expect(call.args.join(' ')).not.toContain('src/example/worker.test.ts');
     expect(JSON.parse(call.input!).files).toEqual(['src/example/worker.test.ts']);
   }

@@ -7,26 +7,27 @@ import {
   activeImplementTemplate, activeTemplate, auditTestConsumedDocumentCoverage, discardedNodeFieldsSummary, frontObservationTemplate, graphAuthorityFields,
   graphTemplateIssuesObservation, nodeNameForStage, normalizeAuthorGrade, overlayDecisionObservation, repositoryTestSources, resolveGraphAuthority, resolveGraphAuthorityForUserConfig, routeGate, templateHasNode,
 } from './graph-authority.js';
-import { GRAPH_SPECS, GRAPH_TEMPLATES, compileGraphTemplate, type GraphTemplate } from './graph-templates.js';
+import { GRAPH_SPECS, GRAPH_TEMPLATES, GRAPH_TEMPLATES_ISSUES, compileGraphTemplate, type GraphTemplate } from './graph-templates.js';
 import { buildUserConfig } from '../user-config.js';
 import { tmpdir } from 'node:os';
 
 const REPO = join(import.meta.dir, '../..');
-// 0.2.33 recover 경로의 종결 gate 는 계약 없는 관측용 노드다.
-// 원장의 경고는 숨기지 않고 YAML의 현재 선언과 함께 전파한다.
-const EXPECTED_TEMPLATE_ISSUES = [
-  'default-loop.yaml/nodes/13/contract',
-  'document-loop.yaml/nodes/10/contract',
-  'document-loop.yaml/nodes/11/contract',
-  'operate-loop.yaml/nodes/11/contract',
-  'operate-loop.yaml/nodes/12/contract',
-  'plan-loop.yaml/nodes/0/contract',
-  'plan-loop.yaml/nodes/1/contract',
-  'plan-loop.yaml/nodes/2/contract',
-  'plan-loop.yaml/nodes/3/contract',
-  'research-loop.yaml/nodes/8/contract',
-  'research-loop.yaml/nodes/9/contract',
-].map((path) => ({ path, message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다' }));
+// #29685 added journey declarations without execution contracts; #30199 supplied
+// the research-loop contracts. Keep every remaining warning path exact even though
+// the ledger displays only the first 20.
+const MISSING_CONTRACT_INDICES: Record<string, readonly number[]> = {
+  'default-loop.yaml': [13, 15, 16, 17, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29],
+  'document-loop.yaml': [10, 11, 12, 13, 14, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27],
+  'operate-loop.yaml': [11, 12, 13, 14, 15, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28],
+  'plan-loop.yaml': [0, 1, 2, 3],
+  'research-loop.yaml': [8, 9],
+};
+const EXPECTED_TEMPLATE_ISSUES = Object.entries(MISSING_CONTRACT_INDICES)
+  .flatMap(([file, indices]) => indices.map((index) => ({
+    path: `${file}/nodes/${index}/contract`,
+    message: '계약(inputs·tools·outputs)이 없다 — 권한을 코드에서만 알 수 있다',
+  })));
+const EXPECTED_VISIBLE_TEMPLATE_ISSUES = EXPECTED_TEMPLATE_ISSUES.slice(0, 20);
 
 // ⛔ 이름을 «갈라» 둔다 — 같은 모듈이 export 하는 `repositoryTestSources`(경로→내용 맵)와
 //   이 지역 함수(경로 목록)는 «다른 값»이고, 한 이름이면 지역이 import 를 가려 조용히 틀린 모양이 흐른다.
@@ -133,6 +134,7 @@ describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
   });
 
   test('그래프 템플릿 이슈 관측은 빈 목록과 사용 불가를 구분하고 상한에서 절단을 명시한다', () => {
+    expect(GRAPH_TEMPLATES_ISSUES).toEqual(EXPECTED_TEMPLATE_ISSUES);
     expect(graphTemplateIssuesObservation([])).toEqual({ graphTemplatesIssues: [], graphTemplatesIssuesTruncated: false });
     expect(graphTemplateIssuesObservation(undefined)).toEqual({ graphTemplatesIssues: null, graphTemplatesIssuesTruncated: false });
 
@@ -154,8 +156,8 @@ describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
         activeGraphId: 'research-loop',
         graphTemplatesSource: 'yaml',
         graphTemplatesIssueCount: EXPECTED_TEMPLATE_ISSUES.length,
-        graphTemplatesIssues: EXPECTED_TEMPLATE_ISSUES,
-        graphTemplatesIssuesTruncated: false,
+        graphTemplatesIssues: EXPECTED_VISIBLE_TEMPLATE_ISSUES,
+        graphTemplatesIssuesTruncated: true,
         discardedNodeFields: compileGraphTemplate(GRAPH_SPECS['research-loop']!).discardedNodeFields,
       });
     expect(JSON.stringify(fields)).toContain('계약(inputs·tools·outputs)이 없다');
@@ -167,8 +169,8 @@ describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
         activeGraphId: 'self-implement',
         graphTemplatesSource: 'yaml',
         graphTemplatesIssueCount: EXPECTED_TEMPLATE_ISSUES.length,
-        graphTemplatesIssues: EXPECTED_TEMPLATE_ISSUES,
-        graphTemplatesIssuesTruncated: false,
+        graphTemplatesIssues: EXPECTED_VISIBLE_TEMPLATE_ISSUES,
+        graphTemplatesIssuesTruncated: true,
         discardedNodeFields: compileGraphTemplate(GRAPH_SPECS['self-implement']!).discardedNodeFields,
       });
   });
@@ -192,8 +194,8 @@ describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
       activeGraphId: 'no-such-graph',
       graphTemplatesSource: 'yaml',
       graphTemplatesIssueCount: EXPECTED_TEMPLATE_ISSUES.length,
-      graphTemplatesIssues: EXPECTED_TEMPLATE_ISSUES,
-      graphTemplatesIssuesTruncated: false,
+      graphTemplatesIssues: EXPECTED_VISIBLE_TEMPLATE_ISSUES,
+      graphTemplatesIssuesTruncated: true,
       discardedNodeFields: null,
     });
   });

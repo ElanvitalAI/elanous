@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 
 import { createChatPickerModalRuntime } from '../src/chat/pickers/modal-runtime.js';
 import type { ModalSurface } from '../src/display/modal-stack.js';
@@ -48,7 +48,6 @@ describe('chat picker modal runtime', () => {
     const runtime = createChatPickerModalRuntime({
       picker: createFakePicker({ consumed: true, action: null }),
       getBufferView: (): PickerBufferView => ({ lines: ['/h'], lineIdx: 0, colIdx: 2 }),
-      writeTerminal: () => {},
       getBounds: () => ({ row: 10, col: 1, width: 40, height: 1 }),
       getInputZoneHeight: () => 2,
       onDispatchResult: async (dispatched) => dispatched.consumed,
@@ -66,7 +65,6 @@ describe('chat picker modal runtime', () => {
     const runtime = createChatPickerModalRuntime({
       picker: createFakePicker({ consumed: true, action: null }),
       getBufferView: (): PickerBufferView => ({ lines: ['/h'], lineIdx: 0, colIdx: 2 }),
-      writeTerminal: () => {},
       getBounds: () => ({ row: 10, col: 1, width: 40, height: 1 }),
       getInputZoneHeight: () => 2,
       onDispatchResult: async () => true,
@@ -95,7 +93,6 @@ describe('chat picker modal runtime', () => {
     const runtime = createChatPickerModalRuntime({
       picker: createFakePicker({ consumed: true, action: null }),
       getBufferView: (): PickerBufferView => ({ lines: ['/h'], lineIdx: 0, colIdx: 2 }),
-      writeTerminal: () => {},
       getBounds: () => ({ row: 10, col: 1, width: 40, height: 1 }),
       getInputZoneHeight: () => 1,
       onDispatchResult: async (dispatched) => {
@@ -130,35 +127,41 @@ describe('chat picker modal runtime', () => {
       },
       picker: createFakePicker({ consumed: false }),
       getBufferView: (): PickerBufferView => ({ lines: ['/'], lineIdx: 0, colIdx: 1 }),
-      writeTerminal: (chunk) => clears.push(chunk),
       getBounds: () => ({ row: 12, col: 1, width: 30, height: 1 }),
       getInputZoneHeight: () => 1,
       onDispatchResult: async () => false,
     });
 
-    runtime.syncModal({
-      kind: 'slash',
-      active: true,
-      clearRows: 9,
-      createSurface: () => modal('chat:slash'),
-    });
-    runtime.syncModal({
-      kind: 'slash',
-      active: false,
-      clearRows: 9,
-      createSurface: () => modal('chat:slash'),
-    });
-    runtime.syncModal({
-      kind: 'arg',
-      active: true,
-      clearRows: 9,
-      createSurface: () => modal('chat:arg'),
-    });
-    runtime.clearAll();
+    const stdout = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      clears.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write);
+    try {
+      runtime.syncModal({
+        kind: 'slash',
+        active: true,
+        createSurface: () => modal('chat:slash'),
+      });
+      runtime.syncModal({
+        kind: 'slash',
+        active: false,
+        createSurface: () => modal('chat:slash'),
+      });
+      runtime.syncModal({
+        kind: 'arg',
+        active: true,
+        createSurface: () => modal('chat:arg'),
+      });
+      runtime.clearAll();
+    } finally {
+      stdout.mockRestore();
+    }
 
     expect(pushed).toEqual(['chat:slash', 'chat:arg']);
     expect(disposed).toEqual(['chat:slash', 'chat:arg']);
-    expect(clears.length).toBe(2);
+    // TUI-DIRECT-WRITE-ROWS — closing hands repaint to the sink (coordinator
+    // popModal forces a full frame); no direct terminal clear bypasses the cache.
+    expect(clears).toEqual([]);
   });
 
   test('syncFamily toggles the active picker and retires inactive siblings', () => {
@@ -176,7 +179,6 @@ describe('chat picker modal runtime', () => {
       },
       picker: createFakePicker({ consumed: false }),
       getBufferView: (): PickerBufferView => ({ lines: ['/'], lineIdx: 0, colIdx: 1 }),
-      writeTerminal: () => {},
       getBounds: () => ({ row: 12, col: 1, width: 30, height: 1 }),
       getInputZoneHeight: () => 1,
       onDispatchResult: async () => false,
@@ -184,7 +186,6 @@ describe('chat picker modal runtime', () => {
 
     runtime.syncFamily({
       activeKind: 'slash',
-      clearRows: 9,
       family: {
         createSurface: (kind) => modal(`chat:${kind}`),
         sources: {
@@ -198,7 +199,6 @@ describe('chat picker modal runtime', () => {
     });
     runtime.syncFamily({
       activeKind: 'arg',
-      clearRows: 9,
       family: {
         createSurface: (kind) => modal(`chat:${kind}`),
         sources: {

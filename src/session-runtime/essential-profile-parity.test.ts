@@ -39,14 +39,14 @@ function withDefaultModelSurface<T>(callback: () => T): T {
 // ⛔ 2026-08-19 — SelfOrchestrate 는 «은퇴»했다(대표 "self implement 만 남겨주세요. 그게 통합 방향입니다").
 //   능력은 self_implement 에 «이미» 흡수돼 있다(goals·decompose·concurrency… 스펙 선언 ⊕ :467 배선).
 //   🔄 되돌리기 = native-tool-catalog.ts 의 defaultEnabled 한 줄.
-// The eight in-process ops-ledger runtimes are deliberately in the fixed
+// The nine in-process ops-ledger runtimes are deliberately in the fixed
 // essential TUI catalog: an OP turn must be able to replace the corresponding
 // RunShell CLI calls.
 // TUI-DIET-D1-TAIL — the legacy rich coding profiles are gone, so the former
 // «essential-only vs rich» parity checks became membership checks on essential alone.
 const EXPECTED_ESSENTIAL_MEMBERS = [
   'SelfImplement',
-  'MsgList', 'MsgPost', 'MsgAck',
+  'MsgList', 'MsgPost', 'MsgAsk', 'MsgAck',
   'ChecklistList', 'ChecklistAdd', 'ChecklistSet', 'ChecklistEdit', 'ChecklistMove',
   'PersistentGrounding',
 ];
@@ -136,7 +136,7 @@ describe('essential fixed catalog and coding profile parity', () => {
     }
   });
 
-  it('keeps SelfImplement, eight ops-ledger tools, and PersistentGrounding in the essential catalog', () => {
+  it('keeps SelfImplement, nine ops-ledger tools, and PersistentGrounding in the essential catalog', () => {
     const missing = EXPECTED_ESSENTIAL_MEMBERS.filter(name => !essentialNames.includes(name));
     if (missing.length > 0) {
       throw new Error(`${PARITY_GUARD} essential catalog is missing: ${missing.join(', ')}`);

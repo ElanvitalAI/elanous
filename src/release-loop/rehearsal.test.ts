@@ -10,9 +10,10 @@ import { listLoops } from '../loops/registry.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
 import { runGraph } from '../graph-runner/runner.js';
 import type { LightRcResult } from './light-rc.js';
-import type { ReleaseSchedule } from './release-schedule.js';
+import { setSchedule, type ReleaseSchedule } from './release-schedule.js';
 import { planRehearsal as livePlanRehearsal, rehearsalLeakFailureDetail, runRehearsalLeakCheck, runRehearsalTick, sanitizeRehearsalLeakDetail, type HardGateResult, type RehearsalDeps, type StepId } from './rehearsal.js';
 import { planRehearsalShards } from './rehearsal-shard-plan.js';
+import { hardRehearsalGateVersion } from '../../scripts/release-loop/gate-radius-live.js';
 
 const cut = '2026-10-10T13:00:00Z';
 const schedule = { version: '0.2.23', cutAt: cut, publishAt: '2026-10-10T15:30:00Z' } as ReleaseSchedule;
@@ -119,11 +120,14 @@ test('an ok Pod verdict with introduced failures is recorded as an error', async
 
 test('default hard-gate execution passes twelve Pod shards and the pinned SHA to gate-node', async () => {
   const root = newRoot(), checkout = join(root, 'checkout'), bin = join(root, 'bin'), capture = join(root, 'gate-argv.txt');
+  const releaseVerdict = join(root, 'release', schedule.version, 'gate-verdict.json');
+  const originalVerdict = '{"owner":"release","bytes":"unchanged"}\n';
+  writeFileSync(releaseVerdict, originalVerdict);
   const sha = 'a'.repeat(40), h = harness(at(300)), priorPath = process.env.PATH;
   mkdirSync(checkout); mkdirSync(bin); mkdirSync(join(root, 'release', '0.2.22'), { recursive: true });
   writeFileSync(join(root, 'release', '0.2.22', 'release.json'), JSON.stringify({ version: '0.2.22', publishedAt: '2026-10-09T00:00:00Z' }));
   writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'k3d-elanous-pool@node-b:56' } } }));
-  writeFileSync(join(bin, 'bun'), `#!/bin/sh\nprintf '%s\\n' "$@" > "$REHEARSAL_CAPTURE"\nprintf '%s\\n' '{"outcome":"ok","commit":"${sha}","executor":"pod","introduced":[],"preexisting":0}'\n`);
+  writeFileSync(join(bin, 'bun'), `#!/bin/sh\nprintf '%s\\n' "$@" > "$REHEARSAL_CAPTURE"\nversion=''\nwhile [ "$#" -gt 0 ]; do\n  if [ "$1" = '--version' ]; then shift; version="$1"; fi\n  shift\ndone\nmkdir -p "$ELANOUS_STATE_DIR/release/$version"\nprintf '%s\\n' '{"commit":"${sha}","outcome":"ok"}' > "$ELANOUS_STATE_DIR/release/$version/gate-verdict.json"\nprintf '%s\\n' '{"outcome":"ok","commit":"${sha}","executor":"pod","introduced":[],"preexisting":0}'\n`);
   chmodSync(join(bin, 'bun'), 0o755);
   setElanousConfigDir(root);
   process.env.PATH = `${bin}:${priorPath}`;
@@ -137,7 +141,12 @@ test('default hard-gate execution passes twelve Pod shards and the pinned SHA to
     expect(argv.slice(argv.indexOf('--commit'), argv.indexOf('--commit') + 2)).toEqual(['--commit', sha]);
     expect(argv.slice(argv.indexOf('--pod-shards'), argv.indexOf('--pod-shards') + 2)).toEqual(['--pod-shards', '12']);
     expect(argv.slice(argv.indexOf('--executor'), argv.indexOf('--executor') + 2)).toEqual(['--executor', 'pod']);
-    expect(stamp(root, 'hard-5h').outcome).toBe('ok');
+    const hard = stamp(root, 'hard-5h');
+    expect(hard.outcome).toBe('ok');
+    const gateVersion = hardRehearsalGateVersion(schedule.version, hard.hardGateRunId!);
+    expect(argv.slice(argv.indexOf('--version'), argv.indexOf('--version') + 2)).toEqual(['--version', gateVersion]);
+    expect(readFileSync(releaseVerdict, 'utf8')).toBe(originalVerdict);
+    expect(JSON.parse(readFileSync(join(root, 'release', gateVersion, 'gate-verdict.json'), 'utf8'))).toMatchObject({ commit: sha, outcome: 'ok' });
   } finally { process.env.PATH = priorPath; delete process.env.REHEARSAL_CAPTURE; }
 });
 
@@ -1126,6 +1135,60 @@ test('release CLI two ticks report shard shortage, released claim, and same-stag
     expect(leakChecks).toBe(2);
   } finally { process.exitCode = exit ?? 0; process.stdout.write = original; console.error = oldError; }
 });
+
+test('production release CLI retries the same RC after a preflight shortage without leaving a stage claim', () => {
+  const root = newRoot(false), repo = resolve(import.meta.dir, '..', '..');
+  const checkout = join(root, 'checkout');
+  mkdirSync(join(checkout, 'scripts'), { recursive: true });
+  mkdirSync(join(checkout, 'src', 'util'), { recursive: true });
+  mkdirSync(join(checkout, 'release'), { recursive: true });
+  writeFileSync(join(checkout, 'release', 'public-export.yaml'), 'include: ["src/**"]\nexclude: []\nreplace: {}\n');
+  writeFileSync(join(checkout, 'src', 'plain.txt'), 'public content\n');
+  for (const file of ['scripts/public-export.ts', 'scripts/skill-boundary.ts', 'src/util/spawn-sync-output.ts'])
+    symlinkSync(join(repo, file), join(checkout, file));
+  symlinkSync(join(repo, 'node_modules'), join(checkout, 'node_modules'), 'dir');
+  writeFileSync(join(checkout, '.gitignore'), 'node_modules\nscripts/\nsrc/util/\n');
+  const git = (...args: string[]) => spawnSync('git', args, { cwd: checkout, encoding: 'utf8' });
+  expect(git('init', '-q', '-b', 'main').status).toBe(0);
+  expect(git('add', '.gitignore', 'release/public-export.yaml', 'src/plain.txt').status).toBe(0);
+  expect(git('-c', 'user.name=Rehearsal Test', '-c', 'user.email=rehearsal@example.invalid', 'commit', '-qm', 'fixture').status).toBe(0);
+  expect(git('remote', 'add', 'origin', checkout).status).toBe(0);
+  const version = '99.2.23';
+  const cutAt = new Date(Date.now() + 7 * 60 * 60_000).toISOString();
+  setSchedule(version, { cutAt }, 'test', root);
+  const dir = join(root, 'release', version, 'rehearsal');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'hard-mid.json'), JSON.stringify({ version, step: 'hard-mid', cutAt,
+    outcome: 'ok', startedAt: cutAt, endedAt: cutAt, notifiedAt: cutAt }));
+  const stage = join(dir, 'rc-7h.json');
+  const args = ['bin/elanous.mjs', '--test', '--config-dir', root, 'release', 'rehearsal', 'tick', '--apply', '--checkout', checkout, '--json'];
+  const before = existsSync(stage);
+  // The export preflight must not treat this host's unrelated test fixture paths as leaks.
+  const run = () => spawnSync('bun', args, { cwd: repo, encoding: 'utf8', timeout: 60_000,
+    env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_EXPORT_REDACTIONS: join(root, 'empty-redactions.tsv'),
+      ELANOUS_LEAK_HOME_USER: 'rehearsal-fixture' } });
+  writeFileSync(join(root, 'empty-redactions.tsv'), '');
+  const first = run(), afterFirst = existsSync(stage);
+  const second = run(), afterSecond = existsSync(stage);
+  expect(first.status).toBe(1);
+  expect(second.status).toBe(1);
+  const one = JSON.parse(first.stdout) as { ok: boolean; status: string; run: string; stamps: Array<{ outcome: string; summary: string; shardPlan: { gatePlanShards: number | null } }> };
+  const two = JSON.parse(second.stdout) as typeof one;
+  expect(one).toMatchObject({ status: 'due', run: 'rc-7h', stamps: [{ shardPlan: { gatePlanShards: null } }] });
+  expect([one.status, one.run, one.ok, one.stamps[0]?.outcome, one.stamps[0]?.shardPlan.gatePlanShards]).toEqual(['due', 'rc-7h', false, 'unmeasured', null]);
+  expect([two.status, two.run, two.ok, two.stamps[0]?.outcome, two.stamps[0]?.shardPlan.gatePlanShards]).toEqual(['due', 'rc-7h', false, 'unmeasured', null]);
+  expect(one.stamps[0]?.summary).toContain('rehearsal shard plan unavailable');
+  expect(two.stamps[0]?.summary).toContain('rehearsal shard plan unavailable');
+  for (const result of [first, second]) {
+    expect(result.stderr).toContain(`· 리허설 ${version} rc-7h · rehearsal shard plan unavailable`);
+    expect(result.stderr).toContain('· stage claim 해제 · 다음 tick 재시도');
+  }
+  expect([before, afterFirst, afterSecond]).toEqual([false, false, false]);
+  console.log(`CLI tick 1 rc=${first.status} stdout=${first.stdout.trim()} stderr=${first.stderr.trim()}`);
+  console.log(`stage before=${before} after tick 1=${afterFirst}`);
+  console.log(`CLI tick 2 rc=${second.status} stdout=${second.stdout.trim()} stderr=${second.stderr.trim()}`);
+  console.log(`stage after tick 2=${afterSecond}`);
+}, 120_000);
 
 test('CLI rejects invalid --shards and --remote before RC stamp', async () => {
   for (const args of [['--shards', '0'], ['--shards', 'NaN'], ['--remote', '-invalid']]) {

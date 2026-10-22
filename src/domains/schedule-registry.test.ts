@@ -417,6 +417,28 @@ describe('inventoryCrontab', () => {
     expect(listSchedules(d).length).toBe(7);
   });
 
+  test('unchanged crontab rows write last_seen at most every ten minutes; edits reconcile immediately', () => {
+    const d = db();
+    inventoryCrontab(d, { crontab: SAMPLE, now: '2026-07-07T10:00:00Z' });
+    const target = listSchedules(d).find(x => x.name === 'outbound-flush')!;
+    inventoryCrontab(d, { crontab: SAMPLE, now: '2026-07-07T10:09:59Z' });
+    expect(listSchedules(d).find(x => x.id === target.id)?.last_seen).toBe('2026-07-07T10:00:00Z');
+    inventoryCrontab(d, { crontab: SAMPLE, now: '2026-07-07T10:10:00Z' });
+    expect(listSchedules(d).find(x => x.id === target.id)?.last_seen).toBe('2026-07-07T10:10:00Z');
+
+    const edited = SAMPLE.replace('outbound-flush', 'outbound-flush-updated');
+    inventoryCrontab(d, { crontab: edited, now: '2026-07-07T10:10:01Z' });
+    expect(listSchedules(d).find(x => x.name === 'outbound-flush-updated')?.last_seen).toBe('2026-07-07T10:10:01Z');
+  });
+
+  test('vanished rows are transitioned only once', () => {
+    const d = db();
+    inventoryCrontab(d, { crontab: SAMPLE, now: '2026-07-07T10:00:00Z' });
+    const withoutFlush = SAMPLE.split('\n').filter(l => !l.includes('outbound-flush')).join('\n');
+    expect(inventoryCrontab(d, { crontab: withoutFlush, now: '2026-07-07T10:01:00Z' }).vanished).toBe(1);
+    expect(inventoryCrontab(d, { crontab: withoutFlush, now: '2026-07-07T10:02:00Z' }).vanished).toBe(0);
+  });
+
   test('deleteScheduleRow — registry 정합(crontab delete 반영·내부 기억 정리)', () => {
     const d = db();
     inventoryCrontab(d, { crontab: SAMPLE, now: '2026-07-07T10:00:00Z' });

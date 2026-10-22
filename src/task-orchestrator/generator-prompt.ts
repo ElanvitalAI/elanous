@@ -10,10 +10,13 @@
  */
 import type { DecomposeInput } from './generator.js';
 import type { ProposalValidationError } from './generator-schema.js';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 export type DecomposePromptProfile = 'goal-author-coarse';
 
-export const GOAL_AUTHOR_COARSE_MAX_SLICES = 6;
+/** TaskGenerator's safety ceiling, not an authoring target; goal-author splits by slice size. */
+export const GOAL_AUTHOR_SIZE_SAFETY_MAX_SLICES = 15;
 
 export interface BuildPromptOptions {
   maxTasks: number;
@@ -39,6 +42,35 @@ const CODING_GOAL_KINDS: ReadonlySet<string> = new Set([
   'agentic',
 ]);
 
+/** Read the existing device sources at authoring time; the LLM has no file tools in this phase. */
+let deviceInventoryCache: string[] | undefined;
+function deviceInventory(): string[] {
+  if (deviceInventoryCache) return deviceInventoryCache;
+  const root = resolve(import.meta.dir, '../..');
+  const fallback = ['- Device inventory unavailable in this installation; verify a named device before claiming it exists.'];
+  if (!existsSync(resolve(root, 'src/ux-sim'))) return deviceInventoryCache = fallback;
+  try {
+    const files = readdirSync(resolve(root, 'src/ux-sim'))
+      .filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts')).sort();
+    const monkey = readFileSync(resolve(root, 'src/ux-sim/event-monkey.ts'), 'utf8');
+    const kinds = monkey.match(/export const EVENT_MONKEY_KINDS = \[([\s\S]*?)\] as const;/)?.[1]
+      ?.match(/'[^']+'/g)?.map((kind) => kind.slice(1, -1)) ?? [];
+    let rows: string[] = [];
+    try {
+      const manual = readFileSync(resolve(root, 'docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md'), 'utf8');
+      rows = manual.split('\n').filter((line) => line.startsWith('|') && line.includes('`src/ux-sim/'));
+    } catch { /* Published packages omit docs/manual; source catalog still applies. */ }
+    return deviceInventoryCache = [
+      `- src/ux-sim files: ${files.join(', ')}`,
+      `- event-monkey kinds: ${kinds.join(', ')}`,
+      ...(rows.length ? [] : ['- manual §1 table unavailable in this installation; use the source files and event kinds above.']),
+      ...rows.map((row) => `- manual §1: ${row.replace(/\s*\|\s*/g, ' · ').slice(0, 500)}`),
+    ];
+  } catch {
+    return deviceInventoryCache = fallback;
+  }
+}
+
 export function buildDecomposePrompt(
   input: DecomposeInput,
   opts: BuildPromptOptions
@@ -53,7 +85,7 @@ export function buildDecomposePrompt(
   lines.push(
     'You are the monad-agent Task Orchestrator decomposition planner.',
     isGoalAuthorCoarse
-      ? `Break the objective into 1-${GOAL_AUTHOR_COARSE_MAX_SLICES} larger, concrete implementation slices.`
+      ? 'Break the objective into implementation slices that a low or medium tier model can finish. Split by slice size, not a target number of slices; the task count limit is only a safety ceiling.'
       : 'Break the objective into 3-7 concrete, single-responsibility tasks.',
     '',
     '## Output (STRICT JSON)',
@@ -119,9 +151,10 @@ export function buildDecomposePrompt(
     '- ★ Complete dependsOn contracts: if a phase CONSUMES another phase\'s output, that producing phase MUST be in this phase\'s `dependsOn` (by index). A consumer with no dependsOn on its producer looks like an ungrounded/orphan dependency to the critique. Trace every consumed symbol to either grounding (exists) or a dependsOn phase (produced this mission).',
     ...(isGoalAuthorCoarse
       ? [
-        '- Coarse scope: permit a larger implementation slice when its related definition, tests, and runtime wiring are necessary for an executable end-to-end path; do not split those related concerns into sibling tasks.',
-        '- One implementation run can complete a large multi-file slice, including its tests, so do not split work that fits in one run.',
-        '- Keep a coarse slice focused on one executable outcome, but it may combine related implementation concerns and exceed the default small-scope LOC guidance.',
+        '- Goal-author size: each slice should touch at most 4 target files, change at most 2 behaviors, and create at most 2 files. Count tests and runtime wiring among target files.',
+        '- Prefer low tier (at most 2 files, 1 behavior, 1 new file), then medium tier (at most 4 files, 2 behaviors, 2 new files). Do not make a high tier slice merely to reduce the number of slices.',
+        '- Keep the executable dependency path through dependsOn; split oversized work into dependent slices rather than hiding multiple behaviors in one title.',
+        '- A high tier slice is allowed only when it cannot be split further without breaking an inseparable operation. State its unavoidable reason in the rationale.',
       ]
       : [
         '- Small scope: keep each task ≈≤250 LOC of change. If a step is bigger, split it into sibling tasks or defer to a recursive decompose (depth) rather than one giant task.',
@@ -155,13 +188,29 @@ export function buildDecomposePrompt(
   if (isGoalAuthorCoarse) {
     lines.push(
       '',
-      '## Goal-author coarse slicing (follow strictly)',
-      '- Prefer fewer, larger implementation slices over small single-concern tasks; use the task budget as a ceiling, not a target.',
-      '- Keep related definition, tests, and runtime wiring together when they are required to make one implementation slice executable end-to-end.',
-      '- A slice may cover multiple related concerns and a larger change scope when splitting them would leave a definition unwired or an execution path incomplete.',
-      '- Every slice title MUST name at least one actual file path or function name because only the title is passed to the next stage; coarse slices must remain grounded and verifiable.',
+      '## Goal-author size-bounded slicing (follow strictly)',
+      '- Use the task budget as a safety ceiling, not a target. Add dependent slices whenever one slice would exceed medium size.',
+      '- Give each slice an executable outcome with tests or runtime wiring inside its size limit; place further wiring in a dependent slice.',
+      '- Every slice title MUST name at least one actual file path or function name because only the title is passed to the next stage; slices must remain grounded and verifiable.',
+      '- Every task JSON must include files, behaviours, newFiles and tier. Example: {"index":0,"title":"대상 경로: src/a.ts · 동작: 연결","files":1,"behaviours":1,"newFiles":0,"tier":"low","surface":{"kind":"llm-direct","prompt":"wire src/a.ts"}}.',
+      '- Only the title reaches the sizing fallback: start it with "대상 경로:" and name all touched paths; add one "동작:" clause per changed behavior and "신규 경로:" for each new file. Keep the title within 80 characters by splitting oversized work.',
       '- Fold non-code investigation or design into the implementation slice that needs it; do not emit it as a standalone slice.',
-      '- Use dependsOn only for genuine ordering between independently completable slices; do not split related definition and runtime wiring merely to create sibling tasks.',
+      '- Use dependsOn for genuine ordering between independently completable slices, including definition before dependent runtime wiring.',
+    );
+    // ── 장치 우선 분해 (DEVICE-FIRST-AUTHORING · 대표 10-21 18:1x 골 저작 지침) ──
+    // 골 저작의 검증 계획(TDD) 절이 무대·층을 고를 때 그 시험에 필요한 mock 장치·주입 사건 정의의
+    // 존재를 먼저 확인하게 한다. 장치가 없으면 «실물 없음»으로 초록이 막히므로 첫 조각이 장치 조각이 된다.
+    lines.push(
+      '',
+      '## Device-first decomposition (DEVICE-FIRST-AUTHORING — follow strictly)',
+      '### Existing device inventory (read from this checkout; use these names before proposing a new device)',
+      ...deviceInventory(),
+      '- The objective\'s verification plan (검증 계획/TDD) section picks a stage and ladder tier (무대·층) — e.g. a `src/ux-sim/*` stage at L2 (fake-llm·fake-bin·fake-clock). BEFORE writing slices, CHECK whether the mock device or injected event definition that this verification plan needs ALREADY EXISTS: look in `src/ux-sim/*`, the §1 device table of `docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md`, and the event-monkey event kinds.',
+      '- Two branches — exactly one applies per needed device:',
+      '  - Device EXISTS: its name MUST go into the verification plan wording — the slice that tests the feature carries the device\'s exact name (device file / §1 table row / event kind) in its acceptance criteria and reuses the device; never re-create it.',
+      '  - Device MISSING: the FIRST slice MUST be a device slice that develops that device feature first — the mock device or injected event definition under `src/ux-sim/*` — and every slice that tests the feature depends on it (구현할 때 해당 시험 mock 장치나 이벤트 정의가 있나 확인하고, 없으면 그 장치 피처를 먼저 개발).',
+      '- Do NOT create the device itself here beyond emitting that device slice (장치 자체는 만들지 않는다 — 조각으로 내보낼 뿐); consumer slices reference it only via dependsOn.',
+      '- Device slices obey the same size bounds and acceptance bar as every other slice — the size rules (TIER-SIZED-DECOMPOSE) and the green-judgment rules are UNCHANGED.',
     );
   }
 

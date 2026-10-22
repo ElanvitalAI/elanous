@@ -1,4 +1,4 @@
-import { executeClassifyNode } from '../workflow-runtime/nodes/classify.js';
+import { runGraphClassifyNode } from '../graph-runner/runner.js';
 import { buildPremiseCard, type PremiseReviewCard, type PremiseReviewInput } from './premise-review.js';
 import { SUPERVISION_REWORK_SOURCES, type SupervisionReworkSource } from './supervision-vocabulary.js';
 import type { ClassifyNode, JudgmentContext, JudgmentResult, NodeExecContext, WorkflowDefinition, WorkflowDeps } from '../workflow-runtime/types.js';
@@ -155,13 +155,10 @@ export function createReworkBudgetJudgment(callLLM: WorkflowDeps['callLLM'], opt
     };
     let modelReasoning = '';
     let premiseReview: PremiseReviewCard | undefined;
-    const result = await executeClassifyNode(node, execContext, {
-      callLLM: async (args) => {
-        modelReasoning = await callLLM(args);
-        return modelReasoning;
-      },
-      runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-    });
+    const result = await runGraphClassifyNode(node, execContext, async (args) => {
+      modelReasoning = await callLLM(args);
+      return modelReasoning;
+    }, { caller: 'rework-budget-judgment' });
     const evidence = (): ReworkBudgetEvidence => ({
       observations,
       modelReasoning,

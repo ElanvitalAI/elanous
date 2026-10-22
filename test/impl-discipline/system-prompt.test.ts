@@ -10,6 +10,13 @@ import {
 afterEach(() => resetPlanModeState());
 
 describe('promptForPhase', () => {
+  test('design-first requires an approved RFC before implementation', () => {
+    const body = promptForPhase('design-first');
+    expect(body).toContain('RFC.md');
+    expect(body).toContain('명시적 승인을 요청');
+    expect(body).toContain('승인 전에는 애플리케이션 코드·설정을 만들거나 시험을 실행하지 마세요');
+  });
+
   test('idle returns empty string', () => {
     expect(promptForPhase('idle')).toBe('');
   });
@@ -196,6 +203,15 @@ describe('buildImplDisciplineSystemMessages — dispatching', () => {
     expect(msgs).toHaveLength(1);
     expect(msgs[0]!.role).toBe('system');
     expect(msgs[0]!.content).toContain('PLAN/HANDOFF/SPEC');
+  });
+
+  test('explicit new-project request dispatches the RFC-first prompt', () => {
+    const msgs = buildImplDisciplineSystemMessages({
+      text: '새 저장소에서 독서 앱을 만들어줘',
+    });
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.content).toContain('RFC.md');
+    expect(msgs[0]!.content).toContain('명시적 승인을 요청');
   });
 
   test('implementation-ready text returns 1 system message with impl body', () => {

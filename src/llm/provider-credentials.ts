@@ -38,6 +38,7 @@ const ENV_KEY_OVERLAY: Readonly<Record<string, string>> = {
   // 결정 2026-09-23 — openrouter 모델은 BUILTIN_CATALOG 가 아니라 발견 폴드(`catalog/providers/openrouter.yaml`
   //   apiKeyEnv)에서 온다 ⇒ 파생 맵이 비어 하니스 자식에게 키가 릴레이되지 않았다(env 로만 키를 둔 사용자는 자식이 죽는다).
   openrouter: 'OPENROUTER_API_KEY',
+  opengateway: 'OPENGATEWAY_API_KEY',
 };
 
 /** 키가 필요 없는 provider — 자격증명 부재가 **정상**이다(누락 경고를 내면 안 됨).
@@ -188,6 +189,19 @@ interface ResolveCredentialInput {
  * ⚠️ ③ 이 마지막인 것이 이 수리의 핵심이다. 종전엔 ③ 이 **무조건 첫 번째**였고, 그래서 provider 가
  * 바뀌어도 옛 provider 의 키가 따라갔다(= 401 의 근본). provider 가 바뀌었으면 base 키는 **틀린 키**다.
  */
+/** Every explicit OpenGateway key in host config. The Pod compares all sources before apply. */
+export function configuredOpenGatewayKeys(llm: {
+  provider?: string;
+  apiKey?: string;
+  rotation?: readonly { provider: string; apiKey?: string }[];
+}): string[] {
+  const values = [
+    ...(llm.provider === 'opengateway' ? [llm.apiKey] : []),
+    ...(llm.rotation ?? []).filter((entry) => entry.provider === 'opengateway').map((entry) => entry.apiKey),
+  ];
+  return [...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value)))];
+}
+
 export function resolveProviderCredential(input: ResolveCredentialInput): ResolvedCredential {
   const { provider, rotation, baseApiKey, baseProvider } = input;
   const env = input.env ?? process.env;

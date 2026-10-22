@@ -51,7 +51,14 @@ export interface LaunchableInfo {
   interim: true;
 }
 export interface CapacityInfo { podUsed: number; podTarget: number; localUsed: number; localMax: number; free: number }
-export interface MachineLoad { load1: number; load5: number; load15: number; cpuCount: number; freeGb: number; totalGb: number; ageSeconds: number }
+/** 리눅스 PSI(/proc/pressure/io · 10초 평균) — 적어도 한 작업이 I/O 를 기다린 시간 비율(%). 100 이면 늘 막혀 있었다. */
+export interface IoPressure { someAvg10: number; fullAvg10: number }
+
+export interface MachineLoad {
+  load1: number; load5: number; load15: number; cpuCount: number; freeGb: number; totalGb: number; ageSeconds: number;
+  /** 하트비트가 실어 온 I/O 압박. 못 잼(맥·/proc/pressure/io 없음)은 null — 축에서 빼지 «넉넉»으로 읽지 않는다. */
+  ioPressure?: IoPressure | null;
+}
 export interface MachineRow { name: string; load: Cell<MachineLoad> }
 export interface PodMemberRow { context: string; capacity: number; occupied: Cell<number> }
 export interface ParentsInfo { count: number; staleOver6h: number; oldestHours: number | null }
@@ -100,10 +107,10 @@ export interface OverviewSnapshot {
 
 export interface VerdictResult { verdict: Verdict; reasons: string[]; nextActions: string[] }
 
-/** 부하/코어가 이 값을 넘으면 «기계 압박»(흐름 저하의 사유). 디스크 I/O 신호는 OVW-MACHINE-HB 전까지 없다. */
+/** 부하/코어가 이 값을 넘으면 «기계 압박»(흐름 저하의 사유). */
 export const LOAD_PER_CORE_PRESSURE = 3;
 
-/** 자원 지도의 축 어휘(닫힌 집합 · RES-FLOOR-BINDING). I/O·게이트 예약은 이 칸에 원천이 없어 늘 제외다. */
+/** 자원 지도의 축 어휘(닫힌 집합 · RES-FLOOR-BINDING). 게이트 예약은 이 칸에 원천이 없어 늘 제외다. */
 export type ResourceKind = 'memory' | 'cpu' | 'io' | 'slots' | 'gate';
 
 /** 구속 조건 — 남은 비율이 최소인 축. 남은 비율 = 남은 양/전체 양(CPU 는 압박선 LOAD_PER_CORE_PRESSURE×코어를 전체로 본다). */
@@ -111,7 +118,7 @@ export interface ResourceBinding {
   kind: ResourceKind;
   label: string;
   remainingRatio: number;
-  /** 남은 양/전체 양의 사람 표기 — `5/64GB` · `0/54코어(압박선 3/코어)` · `0/46자리`. */
+  /** 남은 양/전체 양의 사람 표기 — `5/64GB` · `0/54코어(압박선 3/코어)` · `4/100(압박 96% · full 61% · 10초 평균)` · `0/46자리`. */
   remainingText: string;
 }
 
@@ -125,8 +132,9 @@ function remainingAmount(n: number): string {
 
 /**
  * 구속 조건 규칙(RES-FLOOR-BINDING) — 메모리·CPU·I/O·슬롯·게이트 예약 중 «남은 비율 최소»인 축이 흐름을 묶는다.
- * 못 잰 축(하트비트 없는 호스트 · 용량 못 잼 · 원천 없는 I/O·게이트 예약)은 후보에서 뺀다 — «넉넉»으로도 «바닥»으로도 읽지 않는다.
- * 측정 축이 하나도 없으면 null. 동율은 정해진 순서(호스트 순 메모리→CPU, 그 다음 슬롯)의 첫 축이 이긴다.
+ * 못 잰 축(하트비트 없는 호스트 · 용량 못 잼 · 하트비트에 PSI 가 없는 I/O · 원천이 없는 게이트 예약)은 후보에서 뺀다
+ * — «넉넉»으로도 «바닥»으로도 읽지 않는다.
+ * 측정 축이 하나도 없으면 null. 동율은 정해진 순서(호스트 순 메모리→CPU→I/O, 그 다음 슬롯)의 첫 축이 이긴다.
  */
 export function bindingResource(s: OverviewSnapshot): ResourceBinding | null {
   const candidates: ResourceBinding[] = [];
@@ -141,6 +149,11 @@ export function bindingResource(s: OverviewSnapshot): ResourceBinding | null {
       const cpuCap = l.cpuCount * LOAD_PER_CORE_PRESSURE;
       const remaining = Math.max(0, cpuCap - l.load5);
       candidates.push({ kind: 'cpu', label: `${host.name} CPU`, remainingRatio: ratio01(remaining / cpuCap), remainingText: `${remainingAmount(remaining)}/${cpuCap.toFixed(0)}코어(압박선 ${LOAD_PER_CORE_PRESSURE}/코어)` });
+    }
+    const io = l.ioPressure;
+    if (io) {
+      const remaining = Math.max(0, 100 - io.someAvg10);
+      candidates.push({ kind: 'io', label: `${host.name} I/O`, remainingRatio: ratio01(remaining / 100), remainingText: `${remainingAmount(remaining)}/100(압박 ${remainingAmount(io.someAvg10)}% · full ${remainingAmount(io.fullAvg10)}% · 10초 평균)` });
     }
   }
   const capacity = s.tasks.capacity.value;
@@ -280,7 +293,7 @@ export function renderOverview(s: OverviewSnapshot, v: VerdictResult, meta: { el
   lines.push(`일꾼   ${owners} · 끝 ${show(s.tasks.done, String)}`);
   lines.push(`       발사 가능 ${show(s.tasks.launchable, (l) => `${l.count}${l.interim ? '(임시 술어)' : ''} · 대상 경로 없음 ${l.skipped.noTargetPath} · 선행 미완 ${l.skipped.predecessorOpen} · 이미 넘김 ${l.skipped.alreadyHanded}`)}`);
   lines.push(`       빈 자리 ${show(s.tasks.capacity, (c) => `${c.free} (Pod ${c.podUsed}/${c.podTarget} · 로컬 ${c.localUsed}/${c.localMax})`)} [${s.tasks.capacity.source}]`);
-  const hosts = s.machines.hosts.map((h) => `${h.name} ${show(h.load, (l) => `${l.load1.toFixed(0)}/${l.cpuCount}코어 여유 ${l.freeGb.toFixed(0)}/${l.totalGb.toFixed(0)}GB (${l.ageSeconds}s 전)`)}`);
+  const hosts = s.machines.hosts.map((h) => `${h.name} ${show(h.load, (l) => `${l.load1.toFixed(0)}/${l.cpuCount}코어 여유 ${l.freeGb.toFixed(0)}/${l.totalGb.toFixed(0)}GB${l.ioPressure ? ` · I/O 압박 ${l.ioPressure.someAvg10}% · full ${l.ioPressure.fullAvg10}%` : ''} (${l.ageSeconds}s 전)`)}`);
   lines.push(`기계   ${hosts.join(' · ') || '못 잼(하트비트 원장 비어 있음)'}`);
   lines.push(`       Pod ${s.machines.pods.map((p) => `${p.context} ${show(p.occupied, String)}/${p.capacity}`).join(' · ') || '못 잼(풀 설정 없음)'}`);
   lines.push(`       하니스 부모(이 기계) ${show(s.machines.parents, (p) => `${p.count} · 6h 넘음 ${p.staleOver6h}${p.oldestHours !== null ? ` · 최고 ${p.oldestHours}h` : ''}`)}`);

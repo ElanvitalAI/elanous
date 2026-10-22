@@ -14,11 +14,13 @@ test('LOOPS: four landing refusal routes resolve the same bounded recover@1 cont
     const call = validateUnitCalls(graph, path).get('recover');
     expect(call?.template.graphId).toBe('recover');
     expect(graph.edges.find(edge => edge.from === 'merge')?.map).toMatchObject({
-      merged: 'landed', 'land-refused': 'recover',
+      // HARNESS-FULL-GRAPH-LOOPS: a merge lands through the journey's post-merge cleanup node.
+      merged: 'cleanup', 'land-refused': 'recover',
       ok: name === 'default' ? 'stopped' : 'needs-human',
       fail: name === 'default' ? 'stopped' : 'needs-human',
       ...(name === 'default' ? { blocked: 'stopped' } : {}),
     });
+    expect(graph.edges.find(edge => edge.from === 'cleanup')?.to).toBe('landed');
     expect(graph.edges.find(edge => edge.from === 'recover')?.map).toMatchObject({
       done: name === 'default' ? 'stopped' : 'needs-human',
       rework: name === 'default' ? 'stopped' : 'needs-human',

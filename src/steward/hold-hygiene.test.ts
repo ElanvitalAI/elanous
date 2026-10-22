@@ -13,7 +13,7 @@ function fixture() {
   const trafficPath = join(root, 'traffic.json');
   const metaPath = join(root, 'hold-meta.jsonl');
   const now = new Date('2026-10-13T13:00:00Z');
-  const deps = { root, now, dispatcherDir, trafficPath, metaPath, cells: [] as Array<{ id: string; owner: string; status: string }> };
+  const deps = { root, now, dispatcherDir, trafficPath, metaPath, cells: [] as Array<{ id: string; owner: string; status: string; title?: string }> };
   return { deps, close: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -112,5 +112,41 @@ test('yellow held cells with absent reasons or expired until ask exactly their o
     expect(readFileSync(f.deps.trafficPath, 'utf8')).toBe(original);
     rmSync(f.deps.metaPath);
     expect(inspectHoldHygiene(f.deps).map(row => row.to)).toEqual(['TC', 'UX', 'MK']);
+  } finally { f.close(); }
+});
+
+test('hold hygiene follows handwork confirmation, relaunch title, and predecessor expiry instead of stale until alone', () => {
+  const f = fixture();
+  try {
+    f.deps.cells = [
+      { id: 'manual-fresh', owner: 'TC', status: 'yellow' },
+      { id: 'manual-legacy', owner: 'TC', status: 'yellow' },
+      { id: 'manual-no-confirm', owner: 'TC', status: 'yellow' },
+      { id: 'manual-overdue', owner: 'TC', status: 'yellow' },
+      { id: 'ban-same', owner: 'TC', status: 'yellow', title: 'original title' },
+      { id: 'ban-changed', owner: 'TC', status: 'yellow', title: 'new title' },
+      { id: 'predecessor-fresh', owner: 'TC', status: 'yellow' },
+      { id: 'predecessor-expired', owner: 'TC', status: 'yellow' },
+    ];
+    writeFileSync(f.deps.trafficPath, JSON.stringify({ global: 'green', hold: f.deps.cells.map(cell => cell.id) }));
+    writeFileSync(f.deps.metaPath, [
+      { id: 'manual-fresh', op: 'add', kind: '손작업', reason: 'manual', until: '202610110000', confirmedAt: '202610130900' },
+      { id: 'manual-legacy', op: 'add', kind: '손작업', reason: 'manual', until: '202610110000', at: '202610130900' },
+      { id: 'manual-no-confirm', op: 'add', kind: '손작업', reason: 'manual', until: '202610110000' },
+      { id: 'manual-overdue', op: 'add', kind: '손작업', reason: 'manual', until: '202610110000', confirmedAt: '202610122159' },
+      { id: 'ban-same', op: 'add', kind: '재발사금지', reason: 'blocked', until: '202610110000', title: 'original title' },
+      { id: 'ban-changed', op: 'add', kind: '재발사금지', reason: 'blocked', until: '202610110000', title: 'original title' },
+      { id: 'predecessor-fresh', op: 'add', kind: '선행대기', reason: 'waiting', until: '202610142200' },
+      { id: 'predecessor-expired', op: 'add', kind: '선행대기', reason: 'waiting', until: '202610132100' },
+    ].map(row => JSON.stringify(row)).join('\n'));
+    expect(inspectHoldHygiene(f.deps).map(row => row.key)).toEqual([
+      'hold:manual-no-confirm:TC', 'hold:manual-overdue:TC', 'hold:ban-changed:TC', 'hold:predecessor-expired:TC',
+    ]);
+    const notices = inspectHoldHygiene(f.deps);
+    expect(notices[1]?.body).toContain('재확인 시각·사유');
+    expect(notices[2]?.body).toContain('칸 제목과 기준 제목');
+    expect(notices[3]?.body).toContain('사유·until');
+    expect(runHoldHygiene(f.deps)).toHaveLength(4);
+    expect(runHoldHygiene(f.deps)).toEqual([]);
   } finally { f.close(); }
 });

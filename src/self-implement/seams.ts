@@ -1260,10 +1260,125 @@ type DefaultSeamsDiagnoseInput = Omit<Parameters<NonNullable<SelfImplementSeams[
   kind: SupervisionReworkSource;
 };
 
-type DefaultSeamsResult = Omit<SelfImplementSeams, 'diagnose'> & {
+/** 같은 칸 카드 재결속 사유 — debug.log `same-cell-card-rebind-<reason>` 이름과 1:1 로 대응한다. */
+export type SameCellCardRebindReason =
+  | 'card-id-absent'
+  | 'card-store-absent'
+  | 'card-missing'
+  | 'manual-ref'
+  | 'bound-other-pr'
+  | 'already-rebound'
+  | 'rebound'
+  | 'card-store-unreadable';
+
+/** openPr 반환이 싣는 재결속 관측 — `deferred` 면 PR 은 열렸고 카드 결속은 부모 pr-terminal(#29948) 몫이다. */
+export interface SameCellCardRebindObservation {
+  outcome: 'rebound' | 'already-rebound' | 'deferred';
+  reason: SameCellCardRebindReason;
+  cardId: string | null;
+  oldPr: number;
+  newPr: number;
+  boundPr?: number;
+  detail?: string;
+}
+
+export type OpenPrOutcome = { url: string; number: number; rebind?: SameCellCardRebindObservation };
+
+type DefaultSeamsResult = Omit<SelfImplementSeams, 'diagnose' | 'openPr'> & {
   diagnose: (ctx: DefaultSeamsDiagnoseInput) => Promise<string>;
   closePr: (prUrl: string, comment?: string) => boolean;
+  openPr: (input: Parameters<NonNullable<SelfImplementSeams['openPr']>>[0]) => Promise<OpenPrOutcome>;
 };
+
+type SameCellRebindDecision =
+  | { kind: 'rebound' }
+  | { kind: 'already-rebound' }
+  | { kind: 'card-missing' }
+  | { kind: 'manual-ref' }
+  | { kind: 'bound-other-pr'; boundPr: number };
+
+type SameCellRebindExtra = { boundPr?: number; detail?: string };
+
+/** 같은 칸 새 draft 뒤 카드 재결속 — 사유를 다섯 갈래로 나눠 남기고, 카드 저장소가 없는 실행은 던지지 않고
+ *  deferred 로 돌려준다(Pod 자식은 본부 카드 저장소가 없다 · 부모 pr-terminal 결속은 #29948 이 맡는다). */
+function rebindSameCellCardToPr(input: {
+  taskCardId: string | undefined;
+  storePath: string;
+  oldPr: number;
+  newPr: number;
+  url: string;
+}): SameCellCardRebindObservation {
+  const cardId = input.taskCardId ?? null;
+  const base = { cardId, oldPr: input.oldPr, newPr: input.newPr, url: input.url };
+  const observe = (reason: SameCellCardRebindReason, extra: SameCellRebindExtra = {}, level: 'info' | 'warn' = 'info'): void => {
+    debug.log('self-implement.pr', `same-cell-card-rebind-${reason}`, { ...base, ...extra }, { level });
+  };
+  const deferred = (reason: SameCellCardRebindReason, extra: SameCellRebindExtra = {}): SameCellCardRebindObservation => {
+    observe(reason, extra, 'warn');
+    debug.log('self-implement.pr', 'same-cell-card-rebind-deferred', { ...base, ...extra, reason }, { level: 'warn' });
+    return { outcome: 'deferred', reason, cardId, oldPr: input.oldPr, newPr: input.newPr, ...extra };
+  };
+  const failed = (reason: SameCellCardRebindReason, extra: SameCellRebindExtra = {}): never => {
+    const reasonText = reason === 'bound-other-pr' ? `bound-other-pr(${String(extra.boundPr)})` : reason;
+    observe(reason, extra, 'warn');
+    debug.log('self-implement.pr', 'same-cell-card-rebind-failed', { ...base, ...extra, reason }, { level: 'warn' });
+    throw new Error(`same-cell 새 draft ${input.url} 개설됨; 카드 재결속 실패(${reasonText}) — 새 PR 수확 필요`);
+  };
+  if (!input.taskCardId) return deferred('card-id-absent');
+  if (!existsSync(input.storePath)) return deferred('card-store-absent');
+  let decision: SameCellRebindDecision | undefined;
+  let updated: ReturnType<typeof updateTaskCard>;
+  try {
+    updated = updateTaskCard(input.storePath, input.taskCardId, (card) => {
+      if (!card) {
+        decision = { kind: 'card-missing' };
+        return undefined;
+      }
+      if (card.refSource === 'manual') {
+        decision = { kind: 'manual-ref' };
+        return undefined;
+      }
+      const currentPr = cardPrNumber(card);
+      if (currentPr !== undefined && currentPr !== input.oldPr && currentPr !== input.newPr) {
+        decision = { kind: 'bound-other-pr', boundPr: currentPr };
+        return undefined;
+      }
+      if (currentPr === input.newPr && card.history.some((event) => event.event === 'same-cell-pr-rebound' && event.pr === input.newPr)) {
+        decision = { kind: 'already-rebound' };
+        return undefined;
+      }
+      decision = { kind: 'rebound' };
+      return {
+        ...card,
+        pr: { number: input.newPr, url: input.url },
+        history: [...card.history, {
+          at: new Date().toISOString(), event: 'same-cell-pr-rebound', pr: input.newPr,
+          detail: `이전 draft #${input.oldPr} 정리 후속 · 새 PR #${input.newPr} 결속`,
+        }],
+      };
+    });
+  } catch (error) {
+    return failed('card-store-unreadable', { detail: error instanceof Error ? error.message : String(error) });
+  }
+  const decided: SameCellRebindDecision = decision ?? { kind: 'card-missing' };
+  switch (decided.kind) {
+    case 'bound-other-pr':
+      return failed('bound-other-pr', { boundPr: decided.boundPr });
+    case 'manual-ref':
+      return failed('manual-ref');
+    case 'card-missing':
+      return deferred('card-missing');
+    case 'already-rebound':
+      observe('already-rebound');
+      return { outcome: 'already-rebound', reason: 'already-rebound', cardId, oldPr: input.oldPr, newPr: input.newPr };
+    case 'rebound':
+      if (!updated || cardPrNumber(updated) !== input.newPr) {
+        return failed('card-store-unreadable', { detail: '카드 갱신 결과가 새 PR 을 가리키지 않는다' });
+      }
+      observe('rebound');
+      return { outcome: 'rebound', reason: 'rebound', cardId, oldPr: input.oldPr, newPr: input.newPr };
+  }
+}
 
 const GOAL_DESCRIPTION_MAX_CHARS = 250;
 const DEFAULT_GOAL_SUMMARY_TIMEOUT_MS = 10_000;
@@ -2492,14 +2607,16 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
     // ⛔ await 한다 — spawn 실패를 삼키면 발사 실패도 `salvage:'launched'` 로 거짓 관측된다(3차 M4).
     launchReworkSalvage: async (input) => { await launchReworkSalvage(input); },
 
-    openPr: async ({ title, body, head, base, draft, labels, cwd }) => {
+    openPr: async ({ title, body, head, base, draft, labels, cwd, runId }) => {
       const resolvedBase = assertBaseBranchOnOrigin(cwd, base);
       const harnessSeat = process.env.ELANOUS_HARNESS_SEAT;
       const taskCardId = process.env.ELANOUS_TASK_CARD_ID;
       const bodyWithCard = taskCardId && /^[A-Za-z0-9][A-Za-z0-9._:-]{2,}$/.test(taskCardId)
         ? `${body}\n\n카드: ${taskCardId}` : body;
+      const prRunId = runId ?? getHarnessRunId();
       const outcome = (o.prManager ?? makePrManager()).upsertPr({
         branch: head,
+        ...(prRunId ? { runId: prRunId } : {}),
         worktreePath: cwd,
         title,
         body: buildPrBody(cwd, bodyWithCard),
@@ -2515,34 +2632,18 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       });
       if (!outcome.ok) throw new Error(`self-implement PR ${outcome.reason} 실패: ${outcome.detail}`);
       const number = Number.parseInt(outcome.url.match(/\/pull\/(\d+)/)?.[1] ?? '', 10);
+      let rebind: SameCellCardRebindObservation | undefined;
       if (outcome.supersededPr && Number.isSafeInteger(number) && number > 0) {
-        const rebindFailed = (reason: string): never => {
-          debug.log('self-implement.pr', 'same-cell-card-rebind-failed', {
-            cardId: taskCardId ?? null, oldPr: outcome.supersededPr, newPr: number,
-            url: outcome.url, reason,
-          }, { level: 'warn' });
-          throw new Error(`same-cell 새 draft ${outcome.url} 개설됨; 카드 재결속 실패(${reason}) — 새 PR 수확 필요`);
-        };
         debug.log('self-implement.pr', 'same-cell-rebound', {
           cardId: taskCardId ?? null, oldPr: outcome.supersededPr, newPr: number, url: outcome.url,
           oldDraftCleanup: 'deferred',
         });
-        const cardId = taskCardId ?? rebindFailed('카드 ID 없음');
-        let rebound: ReturnType<typeof updateTaskCard>;
-        try {
-          rebound = updateTaskCard(taskAgentStatePath(), cardId, (card) => {
-            if (!card || card.refSource === 'manual' || (cardPrNumber(card) !== undefined
-              && cardPrNumber(card) !== outcome.supersededPr && cardPrNumber(card) !== number)) return undefined;
-            if (cardPrNumber(card) === number && card.history.some((event) => event.event === 'same-cell-pr-rebound' && event.pr === number)) return undefined;
-            return { ...card, pr: { number, url: outcome.url }, history: [...card.history, {
-              at: new Date().toISOString(), event: 'same-cell-pr-rebound', pr: number,
-              detail: `이전 draft #${outcome.supersededPr} 정리 후속 · 새 PR #${number} 결속`,
-            }] };
-          });
-        } catch (error) { rebindFailed(error instanceof Error ? error.message : String(error)); }
-        if (!rebound || cardPrNumber(rebound) !== number) rebindFailed('카드 없음 또는 기존 PR 결속 충돌');
+        rebind = rebindSameCellCardToPr({
+          taskCardId, storePath: taskAgentStatePath(), oldPr: outcome.supersededPr, newPr: number, url: outcome.url,
+        });
       }
-      return { url: outcome.url, number: Number.isFinite(number) ? number : 0 };
+      const opened: OpenPrOutcome = { url: outcome.url, number: Number.isFinite(number) ? number : 0, ...(rebind ? { rebind } : {}) };
+      return opened;
     },
 
     // 재발명 0 — PrManager.closePr 시그니처·동작을 그대로 위임한다(mission-lifecycle 이 이미 쓴다).
@@ -2720,6 +2821,8 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       //   소화(C1 Bug2 "replace it with" 자기모순류를 스스로 진단). llmReview(동일 LLM 래퍼) 재사용·fail-soft.
       judgmentCallLLM: async ({ prompt }) => o.llmReview!(prompt),
       classifyCallLLM: async ({ prompt }) => o.llmReview!(prompt),
+      // E1 GOAL-ELABORATE-ON-ARRIVAL — 착수 구체화 카드 작성·판정(같은 LLM 래퍼 · 실패는 카드 없이 진행).
+      elaborateCallLLM: async ({ prompt, systemPrompt }) => o.llmReview!(systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt),
       diagnose: async ({ runId, note, kind, round, goal, history, supervisorDecisionHistory = [], judgePredictionAccuracy: predictionAccuracy, effectiveMax, priorRuns, reviewFindingTelemetry, refutations = [], refutationRound, purpose = 'budget' }: DefaultSeamsDiagnoseInput): Promise<string> => {
         const goalDigest = supervisorGoalDigest(goal, 3000);
         const predictionAccuracyForPrompt = predictionAccuracy

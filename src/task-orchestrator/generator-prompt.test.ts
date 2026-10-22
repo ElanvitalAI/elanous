@@ -1,5 +1,6 @@
 import { test, expect, describe } from 'bun:test';
 import { buildDecomposePrompt } from './generator-prompt.js';
+import { TaskGenerator } from './generator.js';
 import type { DecomposeInput } from './generator.js';
 
 const baseInput: DecomposeInput = { objective: '적응형 투자 코디네이터를 구현하라' };
@@ -21,18 +22,20 @@ describe('buildDecomposePrompt — G1 분해기 근본(정의/배선 분리·한
     expect(p).not.toContain('Goal-author coarse slicing');
   });
 
-  test('goal-author coarse 프로필은 1-6개의 큰 구현 조각을 구체적 코드 대상으로 묶는다', () => {
-    const p = buildDecomposePrompt(baseInput, { maxTasks: 6, profile: 'goal-author-coarse' });
-    expect(p).toContain('Break the objective into 1-6 larger, concrete implementation slices.');
-    expect(p).toContain('Goal-author coarse slicing');
-    expect(p).toContain('One implementation run can complete a large multi-file slice, including its tests');
-    expect(p).toContain('do not split work that fits in one run');
-    expect(p).toContain('related definition, tests, and runtime wiring together');
-    expect(p).toContain('multiple related concerns and a larger change scope');
+  test('goal-author 프로필은 조각 수보다 중·하 크기와 선행 관계를 우선한다', () => {
+    const p = buildDecomposePrompt(baseInput, { maxTasks: 15, profile: 'goal-author-coarse' });
+    expect(p).toContain('Split by slice size, not a target number of slices');
+    expect(p).toContain('Goal-author size-bounded slicing');
+    expect(p).toContain('at most 4 target files, change at most 2 behaviors, and create at most 2 files');
+    expect(p).toContain('Add dependent slices whenever one slice would exceed medium size');
+    expect(p).not.toContain('Prefer fewer, larger implementation slices');
+    expect(p).not.toContain('Break the objective into 1-6');
     expect(p).toContain('Every slice title MUST name at least one actual file path or function name because only the title is passed to the next stage');
+    expect(p).toContain('"files":1,"behaviours":1,"newFiles":0,"tier":"low"');
+    expect(p).toContain('"대상 경로:"');
     expect(p).not.toContain('title or description MUST name at least one actual file path or function name');
     expect(p).toContain('Fold non-code investigation or design into the implementation slice that needs it');
-    expect(p).toContain('Coarse scope: permit a larger implementation slice');
+    expect(p).toContain('definition before dependent runtime wiring');
     expect(p).not.toContain('ONE CONCERN PER PHASE');
     expect(p).not.toContain('SEPARATE DEFINE FROM WIRE');
     expect(p).not.toContain('keep each task ≈≤250 LOC');
@@ -106,9 +109,7 @@ describe('buildDecomposePrompt — G1 분해기 근본(정의/배선 분리·한
 });
 
 describe('TaskGenerator maxTasks — 아크 붕괴 근본수복(B0 축①·2026-07-18)', () => {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
   test('arcCount 확정 시 낮은 maxTasks 를 arcCount*4 로 끌어올린다(모순 제거)', async () => {
-    const { TaskGenerator } = await import('./generator.js');
     let seen = '';
     const gen = new TaskGenerator({ callable: async ({ prompt }: { prompt: string }) => { seen = prompt; throw new Error('STOP'); } });
     try { await gen.decompose({ objective: 'x', constraints: { maxTasks: 8, arcCount: 5 } }); } catch { /* STOP */ }
@@ -118,7 +119,6 @@ describe('TaskGenerator maxTasks — 아크 붕괴 근본수복(B0 축①·2026-
   });
 
   test('arcCount 미지정 시 사용자 maxTasks 존중(종전)', async () => {
-    const { TaskGenerator } = await import('./generator.js');
     let seen = '';
     const gen = new TaskGenerator({ callable: async ({ prompt }: { prompt: string }) => { seen = prompt; throw new Error('STOP'); } });
     try { await gen.decompose({ objective: 'x', constraints: { maxTasks: 7 } }); } catch { /* STOP */ }
@@ -127,8 +127,7 @@ describe('TaskGenerator maxTasks — 아크 붕괴 근본수복(B0 축①·2026-
     expect(seen).not.toContain('Goal-author coarse slicing');
   });
 
-  test('coarse 프로필은 초기와 validation 재시도 프롬프트 모두에 전달된다', async () => {
-    const { TaskGenerator } = await import('./generator.js');
+  test('goal-author 프로필은 초기와 validation 재시도 프롬프트 모두에 전달된다', async () => {
     const prompts: string[] = [];
     const gen = new TaskGenerator({ callable: async ({ prompt }: { prompt: string }) => {
       prompts.push(prompt);
@@ -136,6 +135,134 @@ describe('TaskGenerator maxTasks — 아크 붕괴 근본수복(B0 축①·2026-
     } });
     await expect(gen.decompose({ objective: 'x', promptProfile: 'goal-author-coarse' })).rejects.toThrow('VALIDATION_FAILED');
     expect(prompts).toHaveLength(2);
-    expect(prompts.every((prompt) => prompt.includes('Goal-author coarse slicing'))).toBe(true);
+    expect(prompts.every((prompt) => prompt.includes('Goal-author size-bounded slicing'))).toBe(true);
+  });
+});
+
+describe('buildDecomposePrompt — DEVICE-FIRST-AUTHORING 장치 우선 분해(장치 확인 두 갈래)', () => {
+  test('두 갈래 ① — 장치가 있으면 그 이름이 검증 계획에 들어간다', () => {
+    const p = buildDecomposePrompt(baseInput, { maxTasks: 15, profile: 'goal-author-coarse' });
+    expect(p).toContain('## Device-first decomposition (DEVICE-FIRST-AUTHORING — follow strictly)');
+    expect(p).toContain('CHECK whether the mock device or injected event definition that this verification plan needs ALREADY EXISTS');
+    expect(p).toContain('src/ux-sim/*');
+    expect(p).toContain('docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md');
+    expect(p).toContain('event-monkey');
+    expect(p).toContain('Device EXISTS: its name MUST go into the verification plan wording');
+    expect(p).toContain('never re-create it');
+    expect(p).toContain('src/ux-sim files:');
+    expect(p).toContain('interaction.ts');
+    expect(p).toContain('event-monkey kinds: child-error-long');
+    expect(p).toContain('manual §1:');
+  });
+
+  test('두 갈래 ② — 장치가 없으면 첫 조각이 장치 조각이다', () => {
+    const p = buildDecomposePrompt(baseInput, { maxTasks: 15, profile: 'goal-author-coarse' });
+    expect(p).toContain('Device MISSING: the FIRST slice MUST be a device slice that develops that device feature first');
+    expect(p).toContain('every slice that tests the feature depends on it');
+  });
+
+  test('장치 확인 단계는 검증 계획(TDD) 절의 무대·층 선택에서 작동한다', () => {
+    const p = buildDecomposePrompt(baseInput, { maxTasks: 15, profile: 'goal-author-coarse' });
+    expect(p).toContain("The objective's verification plan (검증 계획/TDD) section picks a stage and ladder tier (무대·층)");
+    expect(p).toContain('L2 (fake-llm·fake-bin·fake-clock)');
+    expect(p).toContain('the §1 device table of `docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md`');
+  });
+
+  test('경계 — 장치 자체는 만들지 않고 크기·초록 규칙은 불변이다', () => {
+    const p = buildDecomposePrompt(baseInput, { maxTasks: 15, profile: 'goal-author-coarse' });
+    expect(p).toContain('장치 자체는 만들지 않는다');
+    expect(p).toContain('the size rules (TIER-SIZED-DECOMPOSE) and the green-judgment rules are UNCHANGED');
+    // TIER-SIZED-DECOMPOSE 크기 규칙 원문 불변(기존 절이 그대로 남는다)
+    expect(p).toContain('## Goal-author size-bounded slicing (follow strictly)');
+    expect(p).toContain('at most 4 target files, change at most 2 behaviors, and create at most 2 files');
+  });
+
+  test('프로필 없으면 장치 우선 규칙이 없다(미션 패브릭 기본 유지)', () => {
+    const p = buildDecomposePrompt(baseInput, { maxTasks: 7 });
+    expect(p).not.toContain('Device-first decomposition');
+    expect(p).not.toContain('Device MISSING');
+    expect(p).not.toContain('Device EXISTS');
+  });
+
+  test('프롬프트 전달 — 장치 목록·두 갈래 지침이 실제 분해 호출에 도달한다', async () => {
+    const objective =
+      '기능 골: 대시보드 카드 흔들기 실행취소 제스처 구현. 검증 계획(TDD): 무대: 새 무대 — bun test -- src/ux-sim/<관련 시험 파일>.test.ts · L2 (src/ux-sim fake-llm·fake-bin·fake-clock)';
+    // 장치 우선 규칙을 따르는 fake-llm 대본: 흔들기 제스처 mock 장치가 어디에도 없으므로
+    // 첫 조각을 장치 조각(src/ux-sim 장치 정의)으로, 소비 조각을 그 뒤에 둔다.
+    const script = {
+      rationale: '장치 없음 — 첫 조각이 장치 조각이다.',
+      tasks: [
+        {
+          index: 0,
+          title: '대상 경로: src/ux-sim/shake-gesture-device.ts · 동작: 흔들기 제스처 mock 장치 신규 정의(장치 조각)',
+          description: '검증 계획(TDD)이 요구하는 mock 장치가 src/ux-sim/* · §1 표 · event-monkey 사건 종류 어디에도 없으므로 첫 조각이 장치 조각이다.',
+          surface: { kind: 'llm-direct', prompt: 'add shake gesture mock device under src/ux-sim' },
+          dependsOn: [],
+          priority: 'high',
+          isolation: 'shared',
+          estimateMs: 1000,
+          estimateTokens: 1000,
+          estimateUsd: 0.01,
+          timeoutMs: 1000,
+          acceptance: { criteria: ['장치 조각: src/ux-sim/shake-gesture-device.ts 가 생긴다'], checks: [] },
+          files: 1,
+          behaviours: 1,
+          newFiles: 1,
+          tier: 'low',
+        },
+        {
+          index: 1,
+          title: '대상 경로: src/dashboard/card.ts · 동작: 흔들기 제스처 실행취소 배선',
+          description: '장치 조각(0)이 정의한 mock 장치를 재사용해 카드 제스처를 배선한다.',
+          surface: { kind: 'llm-direct', prompt: 'wire shake gesture into dashboard card' },
+          dependsOn: [0],
+          priority: 'medium',
+          isolation: 'shared',
+          estimateMs: 1000,
+          estimateTokens: 1000,
+          estimateUsd: 0.01,
+          timeoutMs: 1000,
+          acceptance: { criteria: ['카드 흔들기가 실행취소를 호출한다'], checks: [] },
+          files: 1,
+          behaviours: 1,
+          newFiles: 0,
+          tier: 'low',
+        },
+      ],
+    };
+    const prompts: string[] = [];
+    const fakeLlm = async ({ prompt }: { prompt: string }) => {
+      prompts.push(prompt);
+      return { text: JSON.stringify(script) };
+    };
+    const gen = new TaskGenerator({ callable: fakeLlm });
+    const result = await gen.decompose({ objective, promptProfile: 'goal-author-coarse' });
+    const sliceTitles = result.proposal.tasks.map((t) => t.title);
+    // 대본이 받은 실제 분해 프롬프트에 두 갈래 규칙이 실렸다(배선 — TaskGenerator.decompose → buildDecomposePrompt).
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('## Device-first decomposition (DEVICE-FIRST-AUTHORING — follow strictly)');
+    expect(prompts[0]).toContain('Device MISSING: the FIRST slice MUST be a device slice');
+    expect(prompts[0]).toContain('src/ux-sim files:');
+    expect(prompts[0]).toContain('event-monkey kinds:');
+    // 고정 대본이 분해 파서에서 보존되는지 확인한다. LLM의 선택을 증명하는 시험은 아니다.
+    expect(sliceTitles[0]).toBe('대상 경로: src/ux-sim/shake-gesture-device.ts · 동작: 흔들기 제스처 mock 장치 신규 정의(장치 조각)');
+    expect(sliceTitles[1]).toBe('대상 경로: src/dashboard/card.ts · 동작: 흔들기 제스처 실행취소 배선');
+  });
+
+  test('경계 — 새 무대 문구만으로 일반 골을 장치 조각에 강제하지 않는다', async () => {
+    const prompts: string[] = [];
+    const script = { rationale: '장치 조각을 건너뛴 잘못된 대본', tasks: [{
+      index: 0, title: '대상 경로: docs/manual/demo.md · 동작: 문서 문구 대조',
+      surface: { kind: 'llm-direct', prompt: 'check manual wording' }, dependsOn: [],
+      acceptance: { criteria: ['문서 문구가 요청과 일치한다'], checks: [] },
+    }] };
+    const gen = new TaskGenerator({ callable: async ({ prompt }) => {
+      prompts.push(prompt);
+      return { text: JSON.stringify(script) };
+    } });
+    const result = await gen.decompose({ objective: '문서 전용 골. 검증 계획(TDD): 무대: 새 무대: 문서 문구 대조',
+      promptProfile: 'goal-author-coarse' });
+    expect(result.proposal.tasks[0].title).toContain('docs/manual/demo.md');
+    expect(prompts).toHaveLength(1);
   });
 });

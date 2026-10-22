@@ -32,6 +32,9 @@ export function DecisionBoard() {
   const [busy, setBusy] = useState<string | null>(null);
   const [outcomes, setOutcomes] = useState<Record<string, Outcome>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [opOnly, setOpOnly] = useState(false);
+  const [bulkArm, setBulkArm] = useState(false);
+  const [bulkStatus, setBulkStatus] = useState('');
   const pending = useRef<string | null>(null);
   const readSequence = useRef(0);
   const activeClient = useRef(client);
@@ -75,6 +78,7 @@ export function DecisionBoard() {
     const sequence = ++readSequence.current;
     setBoard({ items: [], error: null, loading: true });
     setNotes({}); setConfirm(null); setBusy(null); setOutcomes({}); setErrors({});
+    setOpOnly(false); setBulkArm(false); setBulkStatus('');
     setReplyDrafts({}); setReplyBusy(null); setReplyStatus({});
     void listOpenDecisions(client).then(items => {
       if (active && readSequence.current === sequence) setBoard({ items: sortOpenDecisions(items), error: null, loading: false });
@@ -100,11 +104,57 @@ export function DecisionBoard() {
       if (activeClient.current !== client || readSequence.current !== sequence) return;
       const label = item.options.find(option => option.id === key)?.label ?? key;
       setOutcomes(previous => ({ ...previous, [item.id]: { label, at: result.decidedAt } }));
+      setBulkArm(false);
+      setBulkStatus('');
     } catch (error) {
       if (activeClient.current !== client || readSequence.current !== sequence) return;
       const message = error instanceof Error ? error.message : String(error);
       setErrors(previous => ({ ...previous, [item.id]: message.includes('decision failed: 409') ? '이미 결정됨'
         : message.includes('decision failed: 404') ? '사라진 결정' : `결정 실패 · ${message}` }));
+    } finally {
+      if (activeClient.current === client && readSequence.current === sequence) {
+        pending.current = null;
+        setBusy(null);
+      }
+    }
+  };
+
+  const visibleItems = opOnly ? board.items.filter(item => item.raisedBy?.agent === 'OP') : board.items;
+
+  const decideAllRecommended = async () => {
+    if (pending.current) return;
+    const targets = visibleItems.filter((item): item is OpenDecision & { recommendation: { option: string; why: string } } =>
+      !('skipped' in item.recommendation) && !outcomes[item.id]);
+    if (targets.length === 0) { setBulkArm(false); setBulkStatus('권고가 있는 대기 결정이 없습니다'); return; }
+    const irreversibleCount = targets.filter(item => item.irreversible).length;
+    if (irreversibleCount > 0 && !bulkArm) {
+      setBulkArm(true);
+      setBulkStatus(`되돌릴 수 없는 결정 ${irreversibleCount}건 포함 — 다시 누르면 권고대로 일괄 결정합니다`);
+      return;
+    }
+    setBulkArm(false);
+    setBulkStatus('');
+    const sequence = readSequence.current;
+    pending.current = 'bulk';
+    setBusy('bulk');
+    let done = 0;
+    try {
+      for (const target of targets) {
+        try {
+          const result = await decide(client, target.id, target.recommendation.option, noteText(notes[target.id] ?? '') || undefined);
+          if (activeClient.current !== client || readSequence.current !== sequence) return;
+          const label = target.options.find(option => option.id === target.recommendation.option)?.label ?? target.recommendation.option;
+          setOutcomes(previous => ({ ...previous, [target.id]: { label, at: result.decidedAt } }));
+          done += 1;
+        } catch (error) {
+          if (activeClient.current !== client || readSequence.current !== sequence) return;
+          const message = error instanceof Error ? error.message : String(error);
+          setErrors(previous => ({ ...previous, [target.id]: message.includes('decision failed: 409') ? '이미 결정됨'
+            : message.includes('decision failed: 404') ? '사라진 결정' : `결정 실패 · ${message}` }));
+        }
+      }
+      if (activeClient.current !== client || readSequence.current !== sequence) return;
+      setBulkStatus(`권고대로 ${done}건을 일괄 결정했습니다`);
     } finally {
       if (activeClient.current === client && readSequence.current === sequence) {
         pending.current = null;
@@ -132,8 +182,14 @@ export function DecisionBoard() {
           {replyStatus[notice.id] && <p role="status">{replyStatus[notice.id]}</p>}
         </li>)}</ol>}
     </section> : board.loading ? <p role="status">읽는 중</p> : board.error ? <p role="alert">못 읽음 · {board.error}</p>
-      : board.items.length === 0 ? <p>열린 결정이 없습니다.</p> : <ol className="space-y-4">
-        {board.items.map(item => {
+      : <div>
+        <div className="mb-3 flex flex-wrap gap-2">
+          <button type="button" aria-pressed={opOnly} onClick={() => { setOpOnly(value => !value); setBulkArm(false); setBulkStatus(''); }} className={`rounded-md border border-border px-3 py-1${opOnly ? ' bg-muted' : ''}`}>OP 거르기</button>
+          <button type="button" disabled={busy !== null || visibleItems.length === 0} onClick={() => { void decideAllRecommended(); }} className="rounded-md border border-border px-3 py-1 disabled:opacity-50">권고대로 일괄 결정</button>
+        </div>
+        {bulkStatus && <p role="status">{bulkStatus}</p>}
+        {visibleItems.length === 0 ? <p>{board.items.length === 0 ? '열린 결정이 없습니다.' : 'OP가 올린 열린 결정이 없습니다.'}</p> : <ol className="space-y-4">
+        {visibleItems.map(item => {
           const outcome = outcomes[item.id];
           const selected = confirm?.id === item.id ? item.options.find(option => option.id === confirm.key) : undefined;
           const recommendation = item.recommendation;
@@ -169,6 +225,7 @@ export function DecisionBoard() {
             </article>}
           </li>;
         })}
-      </ol>}
+        </ol>}
+      </div>}
   </main>;
 }

@@ -684,7 +684,21 @@ const LONG_BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*(?:[-—–]
 const KNOWN_NO_FINDING_REMARKS = new Set([
   // #27349 저장 JSON의 실제 무소견 문구.
   '문서 전용 변경이고 의도된 산출물이 실제로 존재하며 배선 누락·죽은 코드·Goodhart 해당 없음',
+  // #29974 ACP 실측: 단독 (없음) 뒤에 차단 결함 부재와 통과 근거를 적은 닫힌 문장.
+  '막는 결함은 찾지 못했다. ref → 전체 SHA 고정, 이미지 SHA12 태그, Job 쪽 `imageCommit==source.sha`·`image==shelfImage` 가드까지 한 줄로 이어진다.',
 ]);
+// #30028 ACP 저장 리뷰의 긍정 수용 서술. 광범위한 의미 추정보다 원문을 고정한다.
+const KNOWN_POSITIVE_FINDINGS = new Set([
+  '없음. 수용 기준은 코드와 시험 기준으로 충족한다.',
+  '프로토타입 키(`constructor`·`__proto__`)를 Map 으로 바르게 센다.',
+  '분모는 `task-agent/entrance-denominator` 별도 이벤트로만 나간다. `task-agent/action` 은 그대로다.',
+  'retro 사실과 tasks cover 집계는 분모 줄이 있든 없든 같다. 시험(`retro-cli.test.ts`)이 이를 고정하고, 임시 폴더는 `finally` 의 `rmSync` 로 지운다.',
+  // 이 후속 PR 자체의 ACP r2: 닫힌 무소견 문장.
+  '없음 — 막는 결함은 찾지 못했다.',
+]);
+function isPositiveNoFinding(text: string): boolean {
+  return KNOWN_POSITIVE_FINDINGS.has(text);
+}
 /** 괄호 안 `없음` 뒤 설명이 닫힌 무소견 문법에 정확히 들어가는가. */
 function isLongNoFindingBracket(text: string): boolean {
   const m = LONG_BRACKETED_SENTINEL.exec(text.trim());
@@ -699,8 +713,11 @@ function isLongNoFindingBracket(text: string): boolean {
 export function isNoneSentinelFinding(finding: string): boolean {
   const text = finding.trim();
   if (!text || isBracketedPlaceholder(text)) return true;
+  if (isPositiveNoFinding(text)) return true;
   if (/^[-—–]+$/.test(text)) return true;
   const markerText = text.replace(/^[—–-]+\s*|\s*[—–-]+$/g, '').trim();
+  const leadingNone = /^[（(]\s*(?:없음|none)\s*[）)]\s+(.+)$/i.exec(markerText);
+  if (leadingNone && KNOWN_NO_FINDING_REMARKS.has(leadingNone[1]!.trim())) return true;
   if (markerText && (BARE_SENTINEL.test(markerText) || DASH_ONLY_SENTINEL.test(markerText) || DASH_WRAPPED_BRACKETED_SENTINEL.test(markerText))) return true;
   const bracketed = BRACKETED_SENTINEL.exec(markerText);
   if (bracketed) {

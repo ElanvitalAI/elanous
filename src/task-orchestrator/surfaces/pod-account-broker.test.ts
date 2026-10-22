@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { makePodAccountBroker, ownerCodexMirrorCandidate, planOwnerCodexMirrorCandidates, planPodAccounts, planPodProvider, podAccountThresholdPercent } from './pod-account-broker.js';
+import { freshOwnerCodexMirrorAccounts, makePodAccountBroker, ownerCodexMirrorCandidate, parseOwnerCodexMirrorAccounts, planOwnerCodexMirrorCandidates, planPodAccounts, planPodProvider, podAccountThresholdPercent, selectOwnerCodexMirrorCandidates } from './pod-account-broker.js';
 
 const c = (name: string, usedPercent?: number, reached?: boolean) => ({ name, storeKey: `openai-codex:${name}`, home: `/h/${name}`, reached, ...(usedPercent !== undefined ? { usedPercent } : {}) });
 
@@ -35,6 +35,20 @@ describe('pod account broker — 병렬 Pod 가 한 계정에 몰리지 않게',
     ]);
     expect(ownerCodexMirrorCandidate([c('team', 74)], 'bad/name', 48)).toEqual([]);
     expect(ownerCodexMirrorCandidate([c('team', 74, true)], 'team')).toEqual([{ ...c('team'), reached: false }]);
+  });
+  test('HQ multi-account marker accepts only distinct bounded accounts and measured caps', () => {
+    const marker = JSON.stringify(['default', 'team', 'third'].map((account, index) => ({ account, usedPercent: index * 10, thresholdPercent: 95, expiresAt: 20_000_000 + index })));
+    expect(parseOwnerCodexMirrorAccounts(marker).map(({ account }) => account)).toEqual(['default', 'team', 'third']);
+    expect(freshOwnerCodexMirrorAccounts(parseOwnerCodexMirrorAccounts(marker), 20_000_000 - 3 * 60 * 60 * 1000 - 1).map(({ account }) => account)).toEqual(['default', 'team', 'third']);
+    expect(freshOwnerCodexMirrorAccounts(parseOwnerCodexMirrorAccounts(marker), 20_000_000 - 3 * 60 * 60 * 1000).map(({ account }) => account)).toEqual(['team', 'third']);
+    const selected = selectOwnerCodexMirrorCandidates([c('default', 99, true), c('team', 99, true), c('third', 99, true)], parseOwnerCodexMirrorAccounts(marker));
+    const plan = planPodAccounts(selected, { thresholdPercentByAccount: { default: 95, team: 95, third: 95 } });
+    const next = makePodAccountBroker(plan);
+    expect([next(), next(), next(), next()]).toEqual(['default', 'team', 'third', 'default']);
+    expect(() => selectOwnerCodexMirrorCandidates([c('default')], parseOwnerCodexMirrorAccounts(marker))).toThrow('원격 auth-store');
+    expect(() => parseOwnerCodexMirrorAccounts('[]')).toThrow();
+    expect(() => parseOwnerCodexMirrorAccounts(JSON.stringify([{ account: 'team', usedPercent: null, thresholdPercent: 60, expiresAt: 20_000_000 }, { account: 'team', usedPercent: 1, thresholdPercent: 60, expiresAt: 20_000_000 }]))).toThrow();
+    expect(() => parseOwnerCodexMirrorAccounts(JSON.stringify([{ account: 'team', usedPercent: 1, thresholdPercent: 0, expiresAt: 20_000_000 }]))).toThrow();
   });
   test('문턱(95%) 이상은 빼고, 신호 없는 계정은 뒤로(빼지 않음)', () => {
     expect(planPodAccounts([c('a', 96), c('b'), c('c', 10)]).usable).toEqual(['c', 'b']);

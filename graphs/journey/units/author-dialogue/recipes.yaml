@@ -1,0 +1,10 @@
+# 읽기 전용 관측 — 기존 실행 경로가 공급한 사건만 기록한다(성공을 추정하지 않는다).
+dialogue-author:
+  command: 'bun "$ELANOUS_GRAPH_DIR/observe.ts" author'
+  timeout_ms: 30000
+dialogue-implement:
+  command: 'bun "$ELANOUS_GRAPH_DIR/observe.ts" implement'
+  timeout_ms: 30000
+dialogue-judge:
+  command: 'bun "$ELANOUS_GRAPH_DIR/observe.ts" judge'
+  timeout_ms: 30000

@@ -93,7 +93,12 @@ export type Verdict = 'keep' | 'failing' | 'review';
 export type Proposal = 'delete' | 'shrink' | 'rewrite-cheap' | 'move-out-of-gate' | 'investigate';
 export interface Td1Disposition { disposition: string; alternative: string; guards: string; why_slow: string }
 export interface Judged extends Measurement { caught90: number; flags: string[]; verdict: Verdict; effectiveness?: Effectiveness; proposal?: Proposal | null; basis?: string | null }
-export interface LedgerLine { at: string; range: string; start: number; end: number; next: number; total: number; commit: string; budgetSecs: number; results: Judged[]; sweepVisited?: number; sweepCostSecs?: number; sweepSlices?: number }
+export interface LedgerLine {
+  at: string; range: string; start: number; end: number; next: number; total: number; commit: string; budgetSecs: number; results: Judged[];
+  /** Exact non-contiguous selection; `range` encodes these indices in selection order. */
+  selectedFiles?: string[]; selectedIndices?: number[];
+  sweepVisited?: number; sweepCostSecs?: number; sweepSlices?: number;
+}
 
 /** `file\tsecs\t…` (TD1 whole-gate TSV) → seconds per file. */
 export function costTable(tsv: string): Map<string, number> {

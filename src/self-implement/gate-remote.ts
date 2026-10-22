@@ -184,8 +184,8 @@ export const PUSH_TIMEOUT_MS = 10 * 60_000;
 
 export type RemoteRunOutcome =
   | { kind: 'ran'; rc: number; stdout: Buffer; stderr: Buffer; commit: string; host: string; ms: number }
-  | { kind: 'busy'; occupied?: number }
-  | { kind: 'infra'; reason: string };
+  | { kind: 'busy'; occupied?: number; rc?: number }
+  | { kind: 'infra'; reason: string; stage?: string; rc?: number | null; stderr?: string };
 
 export interface RemoteRunOptions {
   repo: string;
@@ -331,12 +331,12 @@ export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = r
   } catch (error) { return { kind: 'infra', reason: `argv: ${error instanceof Error ? error.message : String(error)}` }; }
   const shas = [...new Set([commit, mainSha, ...extra])];
   const pushTarget = `${opts.host}:${opts.mirror.startsWith('~/') ? opts.mirror.slice(2) : opts.mirror}`;
-  // Non-interactive and time-bounded: a stuck connection or auth prompt must end in a local fallback, not a hang.
+  // Non-interactive and time-bounded: a stuck connection or auth prompt must end without hanging.
   const push = runner.local('git', ['push', '--quiet', pushTarget, ...shas.map((sha) => `${sha}:refs/elanous/gate/${sha}`)], opts.repo, {
     timeoutMs: PUSH_TIMEOUT_MS,
     env: { ...process.env, GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10', GIT_TERMINAL_PROMPT: '0' },
   });
-  if (push.rc !== 0 || push.error) return { kind: 'infra', reason: `push-failed rc=${push.rc}: ${(push.stderr || push.error || '').trim().split('\n').slice(-2).join(' | ')}` };
+  if (push.rc !== 0 || push.error) return { kind: 'infra', stage: 'push', rc: push.rc, stderr: push.stderr || push.error || '', reason: `push-failed rc=${push.rc}: ${(push.stderr || push.error || '').trim().split('\n').slice(-2).join(' | ')}` };
   const script = remoteScript({ mirror: opts.mirror, commit, fetchShas: shas, mainSha, argv, installPwa: opts.installPwa ?? false, stableCheckout: opts.stableCheckout, payloadFiles: opts.payloadFiles, hostCap: opts.hostCap, slotDir: opts.slotDir });
   const run = runner.ssh(opts.host, script, opts.timeoutMs ?? 120 * 60_000);
   // The script prints "\n<marker><rc>\n": everything before that leading newline is the tool's own stderr, byte for byte.
@@ -350,17 +350,17 @@ export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = r
     const last = stderrText.trimEnd().split('\n').at(-1) ?? '';
     if (run.rc === 98) {
       const busy = /^__GATE_REMOTE_BUSY(?:=(\d+))?$/.exec(last);
-      if (busy) return { kind: 'busy', ...(busy[1] !== undefined ? { occupied: Number(busy[1]) } : {}) };
+      if (busy) return { kind: 'busy', rc: run.rc, ...(busy[1] !== undefined ? { occupied: Number(busy[1]) } : {}) };
     }
-    if (run.rc === 97 && last.startsWith(INFRA)) return { kind: 'infra', reason: `remote-${last.slice(INFRA.length).trim()}` };
+    if (run.rc === 97 && last.startsWith(INFRA)) return { kind: 'infra', stage: last.slice(INFRA.length).trim(), rc: run.rc, stderr: stderrText, reason: `remote-${last.slice(INFRA.length).trim()}` };
   }
   // No marker, or ssh did not end cleanly after it (the script always exits 0 once the marker is written): output may be cut.
-  if (marker < 0) return { kind: 'infra', reason: `ssh rc=${run.rc}${run.error ? ` ${run.error}` : ''}: ${stderrText.trim().split('\n').slice(-2).join(' | ')}` };
-  if (run.rc !== 0 || run.error) return { kind: 'infra', reason: `ssh-incomplete rc=${run.rc}${run.error ? ` ${run.error}` : ''}` };
+  if (marker < 0) return { kind: 'infra', stage: 'ssh', rc: run.rc, stderr: stderrText, reason: `ssh rc=${run.rc}${run.error ? ` ${run.error}` : ''}: ${stderrText.trim().split('\n').slice(-2).join(' | ')}` };
+  if (run.rc !== 0 || run.error) return { kind: 'infra', stage: 'ssh-incomplete', rc: run.rc, stderr: stderrText, reason: `ssh-incomplete rc=${run.rc}${run.error ? ` ${run.error}` : ''}` };
   // The marker is the last thing the script writes: exactly "\n<marker><digits>\n". Anything else (empty, cut) is infra.
   const tail = /^\n__GATE_REMOTE_RC=(\d{1,3})\n$/.exec(stderrBytes.subarray(marker).toString('utf8'));
   const rc = tail ? Number(tail[1]) : NaN;
-  if (!(rc >= 0 && rc <= 255)) return { kind: 'infra', reason: 'rc-unparsed' };
+  if (!(rc >= 0 && rc <= 255)) return { kind: 'infra', stage: 'rc-unparsed', rc: run.rc, stderr: stderrText, reason: 'rc-unparsed' };
   // The tool's stderr is exactly what came before the marker line.
   return { kind: 'ran', rc, stdout: stdoutBytes, stderr: stderrBytes.subarray(0, marker), commit, host: opts.host, ms: Date.now() - started };
 }
@@ -469,14 +469,21 @@ async function loadSettings(): Promise<GateRemoteSettings> {
   } catch { return resolveGateRemoteSettings(undefined); }
 }
 
-/** Decide local/remote, run, and return the tool's exit code. Automatic infra failure ⇒ visible local fallback. */
+/** Decide local/remote, run, and return the tool's exit code. Self gate remote failures are never local measurements. */
 export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDeps = {}): Promise<number> {
   const settings = deps.settings ?? await loadSettings();
   const env = deps.env ?? process.env;
   const write = deps.write ?? { out: (d: string | Uint8Array) => process.stdout.write(d), err: (d: string | Uint8Array) => process.stderr.write(d) };
-  const decision = decideGateDispatch({ flags: opts.flags, settings, load1: deps.load1 ?? loadavg()[0]!, env });
+  const flags = opts.tool === 'self-gate' && !opts.flags.local ? { ...opts.flags, remote: opts.flags.remote ?? true } : opts.flags;
+  const decision = decideGateDispatch({ flags, settings, load1: deps.load1 ?? loadavg()[0]!, env });
   debug.log('gate.remote', 'decision', { tool: opts.tool, mode: decision.mode, host: decision.host, reason: decision.reason, load1: decision.load1 });
   if (decision.mode === 'local') {
+    if (opts.tool === 'self-gate' && !opts.flags.local) {
+      const host = typeof flags.remote === 'string' ? flags.remote : settings.host;
+      debug.log('gate.remote', 'remote-unmeasured', { tool: opts.tool, host, reason: decision.reason, stage: 'placement', rc: null });
+      write.err(`[gate.remote] remote unmeasured on ${host} (stage=placement, rc=unknown) — ${decision.reason}\n`);
+      return 1;
+    }
     if (opts.explicitRemoteOnly && opts.flags.remote !== undefined && decision.reason !== 'flag-local') {
       write.err(`[gate.remote] remote unmeasured — ${decision.reason}\n`);
       return 1;
@@ -500,22 +507,26 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
       } else {
         const reason = `host-reserved: ${host} (${first.reason}); alternate ${alternate ?? '(none)'} ${other?.status ?? 'unavailable'}`;
         debug.log('gate.remote', 'host-reserved-unmeasured', { host, reason });
-        write.err(`[gate.remote] remote unmeasured — ${reason}\n`);
+        write.err(opts.tool === 'self-gate'
+          ? `[gate.remote] remote unmeasured on ${host} (stage=host-reserved, rc=unknown) — ${reason}\n`
+          : `[gate.remote] remote unmeasured — ${reason}\n`);
         return 1;
       }
     }
   }
-  const fallback = (reason: string) => {
-    if (opts.explicitRemoteOnly && opts.flags.remote !== undefined) {
-      debug.log('gate.remote', 'remote-unmeasured', { tool: opts.tool, host, reason });
-      write.err(`[gate.remote] remote unmeasured on ${host} — ${reason.replace(/\s+/g, ' ').trim()}\n`);
+  const fallback = (reason: string, failure?: { stage?: string; rc?: number | null; stderr?: string }) => {
+    const selfGateInfrastructureFailure = opts.tool === 'self-gate' && failure?.stage !== 'reproducibility';
+    if (selfGateInfrastructureFailure || (opts.explicitRemoteOnly && opts.flags.remote !== undefined)) {
+      debug.log('gate.remote', 'remote-unmeasured', { tool: opts.tool, host, reason, ...(opts.tool === 'self-gate' ? { stage: failure?.stage, rc: failure?.rc, stderr: failure?.stderr } : {}) });
+      write.err(`[gate.remote] remote unmeasured on ${host}${opts.tool === 'self-gate' && failure?.stage ? ` (stage=${failure.stage}, rc=${failure.rc ?? 'unknown'})` : ''} — ${reason.replace(/\s+/g, ' ').trim()}\n`);
+      if (opts.tool === 'self-gate' && failure?.stderr) write.err(failure.stderr.endsWith('\n') ? failure.stderr : `${failure.stderr}\n`);
       return 1;
     }
     debug.log('gate.remote', 'fallback', { tool: opts.tool, host, reason });
     write.err(`[gate.remote] fallback to local — ${reason}\n`);
     return opts.runLocal();
   };
-  if (opts.localOnlyReason) return fallback(opts.localOnlyReason);
+  if (opts.localOnlyReason) return fallback(opts.localOnlyReason, { stage: 'reproducibility', rc: null });
   const hostCap = gateRemoteHostCap(settings, host);
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? Date.now;
@@ -530,7 +541,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
     }
     if (outcome.kind !== 'busy') break;
     debug.log('gate.remote', 'host-busy', { tool: opts.tool, host, cap: hostCap, occupied: outcome.occupied ?? null });
-    // Never start an attempt past the deadline: an expired wait falls back only for automatic placement.
+    // Never start an attempt past the deadline: an expired self gate wait remains unmeasured.
     const left = deadline - now();
     if (left <= 0) break;
     await sleep(Math.min(15_000, left));
@@ -540,8 +551,8 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
     try { opts.onRemoteOutcome(outcome, host, deps.runner ?? realGateRemoteRunner); }
     catch (error) { debug.log('gate.remote', 'outcome-hook-failed', { tool: opts.tool, host, error: error instanceof Error ? error.message : String(error) }); }
   }
-  if (outcome.kind === 'busy') return fallback(`host-busy (occupied ${outcome.occupied ?? 'unknown'}/${hostCap}, held for ${settings.slotWaitSeconds}s)`);
-  if (outcome.kind === 'infra') return fallback(outcome.reason);
+  if (outcome.kind === 'busy') return fallback(`host-busy (occupied ${outcome.occupied ?? 'unknown'}/${hostCap}, held for ${settings.slotWaitSeconds}s)`, { stage: 'host-busy', rc: outcome.rc });
+  if (outcome.kind === 'infra') return fallback(outcome.reason, { ...outcome, stage: outcome.stage ?? 'preflight', rc: outcome.rc ?? null });
   // Parity: the tool's own stdout/stderr/rc pass through unchanged; JSON gains host · remote:true,
   // and the self gate CLI appends a host diagnostic to human-readable stderr.
   debug.log('gate.remote', 'result', { tool: opts.tool, host: outcome.host, commit: outcome.commit, rc: outcome.rc, ms: outcome.ms });

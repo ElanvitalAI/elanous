@@ -1,22 +1,13 @@
 #!/usr/bin/env bun
 // cron/launchd 최소 PATH 에서도 내부 gh/git subprocess 를 찾도록 PATH 를 먼저 보강(무음실패 근본·2026-07-25).
 import './ensure-bin-path.js';
+import './instance/resolve.js';
 import { WORKFLOW_NODE_VARIANT_KEYS } from './workflow-runtime/schema.js';
 import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import type { SelfDevRunParticipant, SelfDevRunState } from './self-dev/run-store.js';
 import { applyConfigDirFlagFromArgv } from './cli/config-dir-flag.js';
 import { LOGS_SINCE_OPTION, registerLogsCommands } from './cli/logs-cli.js';
-import { registerDocsCommands } from './cli/docs-cli.js';
-import { registerBenchCommands } from './cli/bench-cli.js';
-import { registerRetroCommands } from './cli/retro-cli.js';
-import { registerMemoryCommands } from './cli/memory-cli.js';
-import { registerA2ACommands } from './cli/a2a-cli.js';
-import { registerPluginCommands } from './cli/plugin-cli.js';
-import { registerMakeCommand } from './cli/make-cli.js';
-import { registerConnectCommand, registerSkillsCommands } from './cli/skills-cli.js';
-import { registerImportCommand } from './cli/import-cli.js';
-import { registerPersonaCommands } from './cli/persona-cli.js';
-import { registerFleetCommands } from './cli/fleet-cli.js';
+
 import { readPipedStdin } from './cli/piped-stdin.js';
 import { writeStdoutJson } from './cli/stdout-json.js';
 import { writeStdoutFully } from './cli/stdout-flush.js';
@@ -28,77 +19,26 @@ import { ensureRunIdentity, getHarnessSpace, normalizeSpaceId } from './harness/
 //   ⇒ «정적» import 로 올린다. 이 모듈은 부작용이 없어 부팅 비용이 사실상 0 이다.
 import { installDevCompletionGuard } from './self-dev/dev-completion-guard.js';
 import { formatOrchestrateResultLine } from './self-dev/orchestrate-summary-line.js';
-import { buildOrchestrateDecomposePrepareArgs, normalizeOrchestrateRequest, splitOrchestrateGoalTexts } from './self-dev/self-orchestrate-runtime.js';
+import { normalizeOrchestrateRequest, splitOrchestrateGoalTexts } from './self-dev/orchestrate-cli-text.js';
+import { DEV_PLAN_REPLACEMENT, formatDevPlanOptionHelp, HARNESS_RUN_DEPRECATION_HELP } from './self-dev/cli-help-text.js';
 import { CLI_ENTRANCE_BASELINE, evaluateCommandEntranceBaseline } from './self-dev/entrance-baseline.js';
 import { CLI_HARNESS_DOGFOOD_ENTRANCE, CLI_HARNESS_ORCHESTRATE_ENTRANCE, describeEntranceCommand, listEntrancesWithModelExposure, renderLaunchEntrances, summarizeEntrances, type EntranceId } from './self-dev/entrance-registry.js';
 import { isOldDoorInternalCall, refuseOldDoor } from './self-dev/old-door.js';
 import { collectCommandEntrances, renderCommandEntrances } from './self-dev/entrance-inventory.js';
 import { isGoalAuthorFileName } from './self-implement/goal-document.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surface.js';
-import { registerPrivateLedgerCommands } from './cli/private-ledger-commands.js';
-import { registerKnowCommand } from './cli/know-cli.js';
-import { registerSeatRequestsCommands } from './cli/seat-requests-cli.js';
-import { registerSeatBootCommands } from './cli/seat-cli.js';
+
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
 import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
-import { registerPtyTakeoverCommands } from './cli/pty-takeover-cli.js';
-import { registerPtyRecordCommand } from './cli/pty-record-cli.js';
-import { registerLeaderCommands } from './cli/leader-cli.js';
-import { registerRepoCommands } from './cli/repo-cli.js';
-import { registerAgentCommands, runChatTurnCli, emitDetachedProgress } from './cli/agent-cli.js';
-export { runChatTurnCli, buildCliAgentTools, setCliAgentDispatchForTesting, emitDetachedProgress, emitHarnessFeedbackProgress } from './cli/agent-cli.js';
-import { registerOpsCommands } from './cli/ops-cli.js';
-import { registerOutputsCommands } from './cli/outputs-cli.js';
-import { registerPublishCommands } from './cli/publish-cli.js';
-import { registerAutopilotCommands } from './cli/autopilot-cli.js';
-import { registerRoleCommands } from './cli/role-cli.js';
-import { registerMachineCommands } from './cli/machine-cli.js';
+
 import { recordImagePinFromConfigSet, registerImageCommands } from './cli/image-cli.js';
-import { registerAgentEnvCommands } from './cli/agent-env-cli.js';
-import { registerScheduleCommands } from './cli/schedule-cli.js';
-import { registerGuardianCommands } from './cli/guardian-cli.js';
+
 export { runSchedule, scheduleCreatePlan } from './cli/schedule-cli.js';
 export type { ScheduleDispatch } from './cli/schedule-cli.js';
 import { registerReviewLoopOptions, buildReviewLoopOpts } from './agent-mission/review-loop-cli.js';
-import { registerCapabilitiesCommand } from './agent-mission/capabilities-cli.js';
-import { registerSupervisorMetricsCommand } from './agent-mission/supervisor-metrics-cli.js';
-import { agentBackendNames } from './agent-mission/driver.js';
-import { registerWhereCommand } from './cli/where-cli.js';
-import { registerShadowCommand } from './cli/shadow-cli.js';
-import { registerLlmDetectCommand } from './cli/llm-detect-cli.js';
-import { registerStorageDetectCommand } from './cli/storage-cli.js';
-import { registerPodCommands } from './cli/pod-cli.js';
-import { registerBrowserAnnotateCommand } from './cli/browser-annotate-cli.js';
-import { registerPendingQuestionsCommand } from './cli/pending-questions-cli.js';
-import { registerUsageCommand } from './cli/usage-cli.js';
-import { registerUsageDailyCommand } from './cli/usage-daily-cli.js';
-import { registerLiveCommands } from './cli/live-cli.js';
-import { registerResearchCommand } from './cli/research-cli.js';
-import { registerReleaseCommands } from './cli/release-cli.js';
-import { registerFreezeCommands } from './cli/freeze-cli.js';
-import { registerFlowCommands } from './cli/flow-cli.js';
-import { registerModelWatchCommand } from './cli/model-watch-cli.js';
-import { registerIntakeCommands } from './cli/intake-cli.js';
-import { registerTasksCommands } from './cli/tasks-cli.js';
-import { registerBriefCommands } from './cli/brief-cli.js';
-import { registerNotifyCommand } from './cli/notify-cli.js';
-import { registerAwayCommand } from './cli/away-cli.js';
-import { registerLabelsCommands } from './cli/labels-cli.js';
-import { registerMsgCommands } from './cli/msg-cli.js';
-import { registerDoctorCommand } from './cli/doctor-cli.js';
-import { registerProviderCommands } from './cli/provider-cli.js';
+
 export { buildCodexAccountImportGuidance, setCodexAccountLogSinkModuleForTesting } from './cli/provider-cli.js';
-import { registerControlCommands } from './cli/control-cli.js';
-import { registerHooksCommands } from './cli/hooks-cli.js';
-import { registerSetupCommand } from './cli/setup-cli.js';
-import { registerStartCommand } from './cli/start-cli.js';
-import { registerGroundingSourcesCli } from './grounding/sources-cli.js';
-import { registerGraphCommands } from './graph-runner/graph-cli.js';
-import { registerLoopCommands } from './loops/loop-cli.js';
-import { registerResourceCommands } from './cli/resource-cli.js';
-import { registerHqMovePlanCommand } from './hq/hq.js';
-import { registerCardCommand } from './task-cards/card-cli.js';
-import { registerLaunchHeadCommands } from './launch-head/launch-head-cli.js';
+
 import { acpServerHelpText } from './boot/acp-server-help.js';
 // IMPORTANT: parse `--config-dir <dir>` + `--test-state-dir <dir>`
 // BEFORE Commander loads — the resolvers are read at module-init
@@ -116,54 +56,310 @@ applyTestFlagFromArgv();
 // test-instance default so scoped storage commands stay inside that directory.
 applyConfigDirFlagFromArgv();
 
+// Only unambiguous root commands take the small registrar path. Root help,
+// unknown commands and unrecognized global flags keep the complete tree.
+const INDEX_FAST_ROOTS = new Set(['a2a', 'agent-env', 'away', 'bench', 'brief', 'card', 'connect', 'control', 'docs', 'doctor', 'fleet', 'flow', 'freeze', 'graph', 'guardian', 'import', 'intake', 'know', 'labels', 'launch-head', 'leader', 'live', 'llm', 'loop', 'machine', 'make', 'memory', 'msg', 'notify', 'ops', 'outputs', 'plugin', 'pod', 'provider', 'pty', 'publish', 'questions', 'relay', 'release', 'repo', 'research', 'resource', 'retro', 'role', 'schedule', 'seat', 'shadow', 'skills', 'start', 'storage', 'tasks', 'where']);
+function selectedIndexFastRoot(args: readonly string[]): string | undefined {
+  if (process.env.ELANOUS_TEST_FLAG_AUDIT === '1') return undefined;
+  let index = 0;
+  while (index < args.length && args[index]?.startsWith('-')) {
+    const flag = args[index]!;
+    index++;
+    if (flag === '--test' || flag.startsWith('--test=')) continue;
+    if (flag === '--config-dir' || flag === '--test-state-dir') {
+      if (!args[index] || args[index]!.startsWith('-')) return undefined;
+      index++;
+      continue;
+    }
+    if (flag.startsWith('--config-dir=') || flag.startsWith('--test-state-dir=')) continue;
+    return undefined;
+  }
+  const root = args[index];
+  // We cannot know every registrar's local options before it is loaded. Keep
+  // only universally recognized help (and where's measured JSON action) on
+  // the small path; all other options take the complete parser.
+  const fastOptions = new Set(root === 'where' ? ['--help', '-h', '--json'] : ['--help', '-h']);
+  if (args.slice(index + 1).some((arg) => arg.startsWith('-') && !fastOptions.has(arg))) return undefined;
+  return root && INDEX_FAST_ROOTS.has(root) ? root : undefined;
+}
+// An explicit `--tui next` launch does not dispatch a CLI subcommand. Keep command
+// registrars out of the first-frame path while retaining the full tree for
+// help, unknown commands and unrecognized global flags.
+function selectedIndexNextTuiRoot(args: readonly string[]): '__tui_next__' | undefined {
+  const rootTui = extractRootTuiEntry(args);
+  if (rootTui.error || rootTui.entry !== 'next') return undefined;
+  const remaining = rootTui.args.filter((arg) => arg !== '--test' && !arg.startsWith('--test='));
+  return remaining.length === 0 ? '__tui_next__' : undefined;
+}
+// Test files import this module to inspect the complete Commander tree. An
+// empty test-runner argv also looks like a bare next launch, so only the real
+// CLI entry may take the next-only registrar path.
+const isCliEntry = import.meta.main || /[\\/]bin[\\/]elanous\.mjs$/.test(process.argv[1] ?? '');
+const INDEX_FAST_ROOT = selectedIndexFastRoot(process.argv.slice(2))
+  ?? (isCliEntry ? selectedIndexNextTuiRoot(process.argv.slice(2)) : undefined);
+// Keep the historical index exports without forcing the agent engine into
+// unrelated CLI commands at module load time.
+export const runChatTurnCli: typeof import('./cli/agent-cli.js').runChatTurnCli =
+  async (...args) => (await import('./cli/agent-cli.js')).runChatTurnCli(...args);
+export const buildCliAgentTools: typeof import('./cli/agent-cli.js').buildCliAgentTools =
+  (...args) => (require('./cli/agent-cli.js') as typeof import('./cli/agent-cli.js')).buildCliAgentTools(...args);
+export const setCliAgentDispatchForTesting: typeof import('./cli/agent-cli.js').setCliAgentDispatchForTesting =
+  (...args) => (require('./cli/agent-cli.js') as typeof import('./cli/agent-cli.js')).setCliAgentDispatchForTesting(...args);
+export const emitDetachedProgress: typeof import('./cli/agent-cli.js').emitDetachedProgress =
+  (...args) => (require('./cli/agent-cli.js') as typeof import('./cli/agent-cli.js')).emitDetachedProgress(...args);
+export const emitHarnessFeedbackProgress: typeof import('./cli/agent-cli.js').emitHarnessFeedbackProgress =
+  (...args) => (require('./cli/agent-cli.js') as typeof import('./cli/agent-cli.js')).emitHarnessFeedbackProgress(...args);
+
+// Selected root imports only its registrar; complete help and unknown routes load all.
+const registerDocsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'docs'
+  ? (() => undefined)
+  : (require('./cli/docs-cli.js') as typeof import('./cli/docs-cli.js')).registerDocsCommands) as typeof import('./cli/docs-cli.js').registerDocsCommands;
+const registerBenchCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'bench'
+  ? (() => undefined)
+  : (require('./cli/bench-cli.js') as typeof import('./cli/bench-cli.js')).registerBenchCommands) as typeof import('./cli/bench-cli.js').registerBenchCommands;
+const registerRetroCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'retro'
+  ? (() => undefined)
+  : (require('./cli/retro-cli.js') as typeof import('./cli/retro-cli.js')).registerRetroCommands) as typeof import('./cli/retro-cli.js').registerRetroCommands;
+const registerMemoryCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'memory'
+  ? (() => undefined)
+  : (require('./cli/memory-cli.js') as typeof import('./cli/memory-cli.js')).registerMemoryCommands) as typeof import('./cli/memory-cli.js').registerMemoryCommands;
+const registerA2ACommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'a2a'
+  ? (() => undefined)
+  : (require('./cli/a2a-cli.js') as typeof import('./cli/a2a-cli.js')).registerA2ACommands) as typeof import('./cli/a2a-cli.js').registerA2ACommands;
+const registerPluginCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'plugin'
+  ? (() => undefined)
+  : (await import('./cli/plugin-cli.js')).registerPluginCommands) as typeof import('./cli/plugin-cli.js').registerPluginCommands;
+const registerMakeCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'make'
+  ? (() => undefined)
+  : (require('./cli/make-cli.js') as typeof import('./cli/make-cli.js')).registerMakeCommand) as typeof import('./cli/make-cli.js').registerMakeCommand;
+const registerConnectCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'connect'
+  ? (() => undefined)
+  : (require('./cli/skills-cli.js') as typeof import('./cli/skills-cli.js')).registerConnectCommand) as typeof import('./cli/skills-cli.js').registerConnectCommand;
+const registerSkillsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'skills'
+  ? (() => undefined)
+  : (require('./cli/skills-cli.js') as typeof import('./cli/skills-cli.js')).registerSkillsCommands) as typeof import('./cli/skills-cli.js').registerSkillsCommands;
+const registerImportCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'import'
+  ? (() => undefined)
+  : (require('./cli/import-cli.js') as typeof import('./cli/import-cli.js')).registerImportCommand) as typeof import('./cli/import-cli.js').registerImportCommand;
+const registerPersonaCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (await import('./cli/persona-cli.js')).registerPersonaCommands) as typeof import('./cli/persona-cli.js').registerPersonaCommands;
+const registerFleetCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'fleet'
+  ? (() => undefined)
+  : (require('./cli/fleet-cli.js') as typeof import('./cli/fleet-cli.js')).registerFleetCommands) as typeof import('./cli/fleet-cli.js').registerFleetCommands;
+const registerPrivateLedgerCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/private-ledger-commands.js') as typeof import('./cli/private-ledger-commands.js')).registerPrivateLedgerCommands) as typeof import('./cli/private-ledger-commands.js').registerPrivateLedgerCommands;
+const registerKnowCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'know'
+  ? (() => undefined)
+  : (require('./cli/know-cli.js') as typeof import('./cli/know-cli.js')).registerKnowCommand) as typeof import('./cli/know-cli.js').registerKnowCommand;
+const registerSeatRequestsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'seat'
+  ? (() => undefined)
+  : (require('./cli/seat-requests-cli.js') as typeof import('./cli/seat-requests-cli.js')).registerSeatRequestsCommands) as typeof import('./cli/seat-requests-cli.js').registerSeatRequestsCommands;
+const registerSeatBootCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'seat'
+  ? (() => undefined)
+  : (require('./cli/seat-cli.js') as typeof import('./cli/seat-cli.js')).registerSeatBootCommands) as typeof import('./cli/seat-cli.js').registerSeatBootCommands;
+const registerPtyTakeoverCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'pty'
+  ? (() => undefined)
+  : (require('./cli/pty-takeover-cli.js') as typeof import('./cli/pty-takeover-cli.js')).registerPtyTakeoverCommands) as typeof import('./cli/pty-takeover-cli.js').registerPtyTakeoverCommands;
+const registerPtyRecordCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'pty'
+  ? (() => undefined)
+  : (require('./cli/pty-record-cli.js') as typeof import('./cli/pty-record-cli.js')).registerPtyRecordCommand) as typeof import('./cli/pty-record-cli.js').registerPtyRecordCommand;
+const registerLeaderCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'leader'
+  ? (() => undefined)
+  : (require('./cli/leader-cli.js') as typeof import('./cli/leader-cli.js')).registerLeaderCommands) as typeof import('./cli/leader-cli.js').registerLeaderCommands;
+const registerRepoCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'repo'
+  ? (() => undefined)
+  : (require('./cli/repo-cli.js') as typeof import('./cli/repo-cli.js')).registerRepoCommands) as typeof import('./cli/repo-cli.js').registerRepoCommands;
+const registerOpsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'ops'
+  ? (() => undefined)
+  : (require('./cli/ops-cli.js') as typeof import('./cli/ops-cli.js')).registerOpsCommands) as typeof import('./cli/ops-cli.js').registerOpsCommands;
+const registerOutputsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'outputs'
+  ? (() => undefined)
+  : (require('./cli/outputs-cli.js') as typeof import('./cli/outputs-cli.js')).registerOutputsCommands) as typeof import('./cli/outputs-cli.js').registerOutputsCommands;
+const registerPublishCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'publish'
+  ? (() => undefined)
+  : (require('./cli/publish-cli.js') as typeof import('./cli/publish-cli.js')).registerPublishCommands) as typeof import('./cli/publish-cli.js').registerPublishCommands;
+const registerAutopilotCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/autopilot-cli.js') as typeof import('./cli/autopilot-cli.js')).registerAutopilotCommands) as typeof import('./cli/autopilot-cli.js').registerAutopilotCommands;
+const registerRoleCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'role'
+  ? (() => undefined)
+  : (require('./cli/role-cli.js') as typeof import('./cli/role-cli.js')).registerRoleCommands) as typeof import('./cli/role-cli.js').registerRoleCommands;
+const registerMachineCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'machine'
+  ? (() => undefined)
+  : (require('./cli/machine-cli.js') as typeof import('./cli/machine-cli.js')).registerMachineCommands) as typeof import('./cli/machine-cli.js').registerMachineCommands;
+const registerAgentEnvCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'agent-env'
+  ? (() => undefined)
+  : (require('./cli/agent-env-cli.js') as typeof import('./cli/agent-env-cli.js')).registerAgentEnvCommands) as typeof import('./cli/agent-env-cli.js').registerAgentEnvCommands;
+const registerScheduleCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'schedule'
+  ? (() => undefined)
+  : (require('./cli/schedule-cli.js') as typeof import('./cli/schedule-cli.js')).registerScheduleCommands) as typeof import('./cli/schedule-cli.js').registerScheduleCommands;
+const registerGuardianCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'guardian'
+  ? (() => undefined)
+  : (require('./cli/guardian-cli.js') as typeof import('./cli/guardian-cli.js')).registerGuardianCommands) as typeof import('./cli/guardian-cli.js').registerGuardianCommands;
+const registerCapabilitiesCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./agent-mission/capabilities-cli.js') as typeof import('./agent-mission/capabilities-cli.js')).registerCapabilitiesCommand) as typeof import('./agent-mission/capabilities-cli.js').registerCapabilitiesCommand;
+const registerSupervisorMetricsCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./agent-mission/supervisor-metrics-cli.js') as typeof import('./agent-mission/supervisor-metrics-cli.js')).registerSupervisorMetricsCommand) as typeof import('./agent-mission/supervisor-metrics-cli.js').registerSupervisorMetricsCommand;
+const registerWhereCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'where'
+  ? (() => undefined)
+  : (require('./cli/where-cli.js') as typeof import('./cli/where-cli.js')).registerWhereCommand) as typeof import('./cli/where-cli.js').registerWhereCommand;
+const registerShadowCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'shadow'
+  ? (() => undefined)
+  : (require('./cli/shadow-cli.js') as typeof import('./cli/shadow-cli.js')).registerShadowCommand) as typeof import('./cli/shadow-cli.js').registerShadowCommand;
+const registerLlmDetectCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'llm'
+  ? (() => undefined)
+  : (require('./cli/llm-detect-cli.js') as typeof import('./cli/llm-detect-cli.js')).registerLlmDetectCommand) as typeof import('./cli/llm-detect-cli.js').registerLlmDetectCommand;
+const registerStorageDetectCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'storage'
+  ? (() => undefined)
+  : (require('./cli/storage-cli.js') as typeof import('./cli/storage-cli.js')).registerStorageDetectCommand) as typeof import('./cli/storage-cli.js').registerStorageDetectCommand;
+const registerPodCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'pod'
+  ? (() => undefined)
+  : (require('./cli/pod-cli.js') as typeof import('./cli/pod-cli.js')).registerPodCommands) as typeof import('./cli/pod-cli.js').registerPodCommands;
+const registerBrowserAnnotateCommand = (require('./cli/browser-annotate-cli.js') as typeof import('./cli/browser-annotate-cli.js')).registerBrowserAnnotateCommand;
+const registerPendingQuestionsCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'questions'
+  ? (() => undefined)
+  : (require('./cli/pending-questions-cli.js') as typeof import('./cli/pending-questions-cli.js')).registerPendingQuestionsCommand) as typeof import('./cli/pending-questions-cli.js').registerPendingQuestionsCommand;
+const registerUsageCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/usage-cli.js') as typeof import('./cli/usage-cli.js')).registerUsageCommand) as typeof import('./cli/usage-cli.js').registerUsageCommand;
+const registerUsageDailyCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/usage-daily-cli.js') as typeof import('./cli/usage-daily-cli.js')).registerUsageDailyCommand) as typeof import('./cli/usage-daily-cli.js').registerUsageDailyCommand;
+const registerLiveCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'live'
+  ? (() => undefined)
+  : (require('./cli/live-cli.js') as typeof import('./cli/live-cli.js')).registerLiveCommands) as typeof import('./cli/live-cli.js').registerLiveCommands;
+const registerResearchCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'research'
+  ? (() => undefined)
+  : (require('./cli/research-cli.js') as typeof import('./cli/research-cli.js')).registerResearchCommand) as typeof import('./cli/research-cli.js').registerResearchCommand;
+const registerReleaseCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'release'
+  ? (() => undefined)
+  : (require('./cli/release-cli.js') as typeof import('./cli/release-cli.js')).registerReleaseCommands) as typeof import('./cli/release-cli.js').registerReleaseCommands;
+const registerFreezeCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'freeze'
+  ? (() => undefined)
+  : (require('./cli/freeze-cli.js') as typeof import('./cli/freeze-cli.js')).registerFreezeCommands) as typeof import('./cli/freeze-cli.js').registerFreezeCommands;
+const registerFlowCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'flow'
+  ? (() => undefined)
+  : (require('./cli/flow-cli.js') as typeof import('./cli/flow-cli.js')).registerFlowCommands) as typeof import('./cli/flow-cli.js').registerFlowCommands;
+const registerModelWatchCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/model-watch-cli.js') as typeof import('./cli/model-watch-cli.js')).registerModelWatchCommand) as typeof import('./cli/model-watch-cli.js').registerModelWatchCommand;
+const registerIntakeCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'intake'
+  ? (() => undefined)
+  : (require('./cli/intake-cli.js') as typeof import('./cli/intake-cli.js')).registerIntakeCommands) as typeof import('./cli/intake-cli.js').registerIntakeCommands;
+const registerTasksCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'tasks'
+  ? (() => undefined)
+  : (require('./cli/tasks-cli.js') as typeof import('./cli/tasks-cli.js')).registerTasksCommands) as typeof import('./cli/tasks-cli.js').registerTasksCommands;
+const registerBriefCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'brief'
+  ? (() => undefined)
+  : (await import('./cli/brief-cli.js')).registerBriefCommands) as typeof import('./cli/brief-cli.js').registerBriefCommands;
+const registerNotifyCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'notify'
+  ? (() => undefined)
+  : (require('./cli/notify-cli.js') as typeof import('./cli/notify-cli.js')).registerNotifyCommand) as typeof import('./cli/notify-cli.js').registerNotifyCommand;
+const registerAwayCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'away'
+  ? (() => undefined)
+  : (await import('./cli/away-cli.js')).registerAwayCommand) as typeof import('./cli/away-cli.js').registerAwayCommand;
+const registerLabelsCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'labels'
+  ? (() => undefined)
+  : (require('./cli/labels-cli.js') as typeof import('./cli/labels-cli.js')).registerLabelsCommands) as typeof import('./cli/labels-cli.js').registerLabelsCommands;
+const registerMsgCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'msg'
+  ? (() => undefined)
+  : (require('./cli/msg-cli.js') as typeof import('./cli/msg-cli.js')).registerMsgCommands) as typeof import('./cli/msg-cli.js').registerMsgCommands;
+const registerDoctorCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'doctor'
+  ? (() => undefined)
+  : (require('./cli/doctor-cli.js') as typeof import('./cli/doctor-cli.js')).registerDoctorCommand) as typeof import('./cli/doctor-cli.js').registerDoctorCommand;
+const registerProviderCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'provider'
+  ? (() => undefined)
+  : (require('./cli/provider-cli.js') as typeof import('./cli/provider-cli.js')).registerProviderCommands) as typeof import('./cli/provider-cli.js').registerProviderCommands;
+const registerAgentCommands = (INDEX_FAST_ROOT
+  ? (() => undefined)
+  : (require('./cli/agent-cli.js') as typeof import('./cli/agent-cli.js')).registerAgentCommands) as typeof import('./cli/agent-cli.js').registerAgentCommands;
+const registerControlCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'control'
+  ? (() => undefined)
+  : (require('./cli/control-cli.js') as typeof import('./cli/control-cli.js')).registerControlCommands) as typeof import('./cli/control-cli.js').registerControlCommands;
+const registerHooksCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/hooks-cli.js') as typeof import('./cli/hooks-cli.js')).registerHooksCommands) as typeof import('./cli/hooks-cli.js').registerHooksCommands;
+const registerSetupCommand = (INDEX_FAST_ROOT === '__tui_next__'
+  ? (() => undefined)
+  : (require('./cli/setup-cli.js') as typeof import('./cli/setup-cli.js')).registerSetupCommand) as typeof import('./cli/setup-cli.js').registerSetupCommand;
+const registerStartCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'start'
+  ? (() => undefined)
+  : (require('./cli/start-cli.js') as typeof import('./cli/start-cli.js')).registerStartCommand) as typeof import('./cli/start-cli.js').registerStartCommand;
+const registerGroundingSourcesCli = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./grounding/sources-cli.js') as typeof import('./grounding/sources-cli.js')).registerGroundingSourcesCli) as typeof import('./grounding/sources-cli.js').registerGroundingSourcesCli;
+const registerGraphCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'graph'
+  ? (() => undefined)
+  : (require('./graph-runner/graph-cli.js') as typeof import('./graph-runner/graph-cli.js')).registerGraphCommands) as typeof import('./graph-runner/graph-cli.js').registerGraphCommands;
+const registerLoopCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'loop'
+  ? (() => undefined)
+  : (require('./loops/loop-cli.js') as typeof import('./loops/loop-cli.js')).registerLoopCommands) as typeof import('./loops/loop-cli.js').registerLoopCommands;
+const registerResourceCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'resource'
+  ? (() => undefined)
+  : (require('./cli/resource-cli.js') as typeof import('./cli/resource-cli.js')).registerResourceCommands) as typeof import('./cli/resource-cli.js').registerResourceCommands;
+const registerHqMovePlanCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./hq/hq.js') as typeof import('./hq/hq.js')).registerHqMovePlanCommand) as typeof import('./hq/hq.js').registerHqMovePlanCommand;
+const registerCardCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'card'
+  ? (() => undefined)
+  : (require('./task-cards/card-cli.js') as typeof import('./task-cards/card-cli.js')).registerCardCommand) as typeof import('./task-cards/card-cli.js').registerCardCommand;
+const registerLaunchHeadCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'launch-head'
+  ? (() => undefined)
+  : (require('./launch-head/launch-head-cli.js') as typeof import('./launch-head/launch-head-cli.js')).registerLaunchHeadCommands) as typeof import('./launch-head/launch-head-cli.js').registerLaunchHeadCommands;
+const registerIngestTokenCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/ingest-token-cli.js') as typeof import('./cli/ingest-token-cli.js')).registerIngestTokenCommands) as typeof import('./cli/ingest-token-cli.js').registerIngestTokenCommands;
+const registerMcpGatewayCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/mcp-gateway-cli.js') as typeof import('./cli/mcp-gateway-cli.js')).registerMcpGatewayCommands) as typeof import('./cli/mcp-gateway-cli.js').registerMcpGatewayCommands;
+const registerRelayCommand = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'relay'
+  ? (() => undefined)
+  : (require('./relay/relay-cli.js') as typeof import('./relay/relay-cli.js')).registerRelayCommand) as typeof import('./relay/relay-cli.js').registerRelayCommand;
+
+
 import { Command, Option } from 'commander';
 import { filterCliRootHelp } from './maturity/cli-maturity.js';
 import type { AdPipelinePlan, AdPipelineResult } from './ad-pipeline/run.js';
 import type { AcpPermissionApprover } from './acp/client.js';
 import { runGitCommand } from './git-fs/runner.js';
 import { debug, redactSecretText, redactSecrets } from './debug/log.js';
-import { installHarnessCliCommand, type HarnessAskSayChildLlmOptions, type HarnessAskSayOptions, type HarnessPlanOptions } from './harness/harness-cli-command.js';
+import type { HarnessAskSayChildLlmOptions, HarnessAskSayOptions, HarnessPlanOptions } from './harness/harness-cli-command.js';
 import { CliUserError, formatCliUserError, isCliUserError } from './cli/cli-user-error.js';
 import { classifyFriendlyError, formatFriendlyError } from './cli/friendly-errors.js';
 import { detectLocale } from './expression/locale.js';
-import { dispatchSolveMission } from './skills/tools/solve-mission.js';
 import { performBrowserAction, type BrowserActionDeps, type BrowserActionResult } from './harness/browser-act.js';
 import { decideTypeAction, type TypeActionDecision, type TypeTarget } from './harness/browser-act-type.js';
-import { resolveSelfSendTarget } from './harness/self-send-target.js';
 import { awaitGlobalPersonaLoad, describeMissingPersona, getGlobalPersonaRegistry } from './persona/global-registry.js';
-import { HARNESS_RUN_DEPRECATION_HELP } from './self-dev/harness-run-cli.js';
-import { DEV_PLAN_REPLACEMENT, formatDevPlanOptionHelp } from './self-dev/dev-cli.js';
 import type { InventoryMeta, SortKey } from './llm/local-manager/benchmark/scores.js';
 import { syncServers, SERVICE_NAMES } from './config.js';
 import { getLocalSkills, executeSync } from './sync.js';
-import { showSyncSelector, showSyncProgress } from './selector.js';  // kept for CLI sync subcommand
 import { inspectRemote } from './inspect.js';
 import { showRecentHistory, showSessionDetail, showSkillDetail, showTargetDetail, showStatus } from './history.js';
-import { showDashboard } from './dashboard/index.js';
 import { initTui, closeTui } from './tui.js';
+import { effectiveRootTuiEntry, extractRootTuiEntry } from './cli/root-tui-entry.js';
 import * as ui from './ui.js';
-import { DEFAULT_REVIEW_BACKEND } from './agent-substrate/acp-reviewer.js';
 import type { ReviewResult } from './agent-substrate/pr-reviewer.js';
 import type { ReviewVerdict } from './agent-mission/review-loop.js';
 import type { SyncMode } from './types.js';
-import { runOnboarding, runOnboardingStep, runOnboardingNonInteractive, needsOnboarding, needsFirstRun, handleOnboardingRefusal, type OnboardingStepId } from './onboarding.js';
-import { firstChatGate } from './onboarding/first-chat-gate.js';
+import type { OnboardingStepId } from './onboarding.js';
 import {
   getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig,
   backupUserConfig, backupConfigPath, addRotationEntry, type RotationEntry,
   resolveRoleLlm,
 } from './user-config.js';
 import { reviewReasoningEffort } from './model-tier/review-effort.js';
-import { isKeylessProvider, resolveProviderCredential } from './llm/provider-credentials.js';
+import { configuredOpenGatewayKeys, isKeylessProvider, resolveProviderCredential } from './llm/provider-credentials.js';
 import {
   listSessions, loadSession, deleteSession, resolveSessionId,
   setActiveSessionId, getActiveSessionId,
   lastConversationMessage, isSessionSource,
 } from './session/index.js';
 import { requestSessionTurnControl } from './session/session-turn-control.js';
-import { ensureCliSession, sessionBudget } from './session/chat.js';
 import { suggestProjectForFolder } from './project/project-store.js';
-import { botFromConfig, TelegramBot } from './telegram.js';
 import { acquireTelegramLock, TelegramLockError, defaultLockPath, safeReadLock } from './telegram-lock.js';
 import { basename, join as _joinPath, resolve } from 'node:path';
 import * as nodeReadline from 'node:readline/promises';
@@ -189,14 +385,13 @@ import { renderKeyHelp, CONTEXT_LABELS, type KeyContext } from './keybindings.js
 import { auditKeybindings, renderKeymapAudit } from './keymap-audit.js';
 import { runCodexSetup } from './codex/setup.js';
 import { renderAllModels } from './codex/models.js';
-import { realIO } from './onboarding.js';
 import { inspectActiveProvider, oneLineProvider } from './provider-summary.js';
 import { renderStatusLines, renderPrimaryStatus, renderSecondaryStatus } from './status/bar.js';
 import { initSessionWorkingDir } from './session/working-dir.js';
 import { rewriteBareNexusToStatus } from './cli/nexus-entry.js';
-import { registerIngestTokenCommands } from './cli/ingest-token-cli.js';
-import { registerMcpGatewayCommands } from './cli/mcp-gateway-cli.js';
-import { registerRelayCommand } from './relay/relay-cli.js';
+
+
+
 import type { ReviewImage } from './agent-substrate/pr-reviewer.js';
 import {
   describeMissionRouting,
@@ -217,6 +412,8 @@ function resolveCliDirOption(dir: string): string {
 
 import { cliVersion, setInstallMetadataRootForTesting } from './version/code-revision.js';
 export { cliVersion, setInstallMetadataRootForTesting };
+
+
 
 export const program = new Command();
 program.enablePositionalOptions();
@@ -379,8 +576,12 @@ async function runDefaultAskFileLaunchFlow(
     import('node:path'),
     import('./self-dev/entrance-registry.js'),
   ]);
-  const askText = readFileSync(askPath, 'utf8');
+  // Read the source bytes ONCE: the same bytes feed the ledger and the launch flow (a read failure → launch 0).
+  const askBytes = readFileSync(askPath);
+  const askText = askBytes.toString('utf8');
   if (!askText.trim()) throw new Error('--ask 파일 입력이 비었다');
+  const { newLaunchUtteranceId, recordLaunchUtterance } = await import('./harness/launch-utterance-ledger.js');
+  recordLaunchUtterance({ source: 'ask-file', utterance: askText, rawBytes: askBytes, launchId: newLaunchUtteranceId() });
   const askIo = await import('./self-dev/ask-launch-io.js');
   const askLogRows = await askIo.readAskPreflightLogRows();
   const askLaunchPrep = (await import('./self-dev/launch-preflight.js')).prepareAskLaunch(
@@ -401,7 +602,7 @@ async function runDefaultAskFileLaunchFlow(
     print: (line) => console.error(line),
     log: (event, data, level) => debug.log('dev-pipeline', event, data, { level }),
     readLine: (prompt) => readStdinLine(prompt),
-    readFile: (file) => readFileSync(file, 'utf8'),
+    readFile: (file) => file === askPath ? askText : readFileSync(file, 'utf8'),
     writeFile: (file, data) => writeFileSync(file, data, 'utf8'),
     cwd: () => process.cwd(),
     now: () => Date.now(),
@@ -1383,14 +1584,16 @@ registerDoctorCommand(program);
 registerControlCommands(program);
 registerHooksCommands(program);
 registerSetupCommand(program);
-program.commands.find(command => command.name() === 'setup')!
-  .option('--terminal', 'Run the terminal onboarding wizard')
-  .hook('preAction', async (_command, action) => {
-    if (action.name() === 'setup' && action.opts().terminal) {
-      const completed = await runOnboardingForCli();
-      process.exit(completed ? 0 : (process.exitCode || 2));
-    }
-  });
+if (INDEX_FAST_ROOT !== '__tui_next__') {
+  program.commands.find(command => command.name() === 'setup')!
+    .option('--terminal', 'Run the terminal onboarding wizard')
+    .hook('preAction', async (_command, action) => {
+      if (action.name() === 'setup' && action.opts().terminal) {
+        const completed = await runOnboardingForCli();
+        process.exit(completed ? 0 : (process.exitCode || 2));
+      }
+    });
+}
 registerStartCommand(program);
 registerGroundingSourcesCli(program);
 registerGraphCommands(program);
@@ -1601,6 +1804,8 @@ program
   )
   // Documentation-only — `readDashboardNameFlag` 가 Commander «전»에 argv 에서 걷어낸다.
   .option('--name <name>', '대시보드 TUI 의 PTY 행(tui:<pid>)에 별명을 달고 뜬다 — `elanous pty list` 에 보이고 `pty snapshot <name>` 으로 부른다. 뜬 뒤 바꾸려면 `elanous pty rename <ref> <name>`.')
+  .option('--legacy', '기존 대시보드 TUI로 시작한다(--tui classic 의 짧은 표기). 기본 진입도 기존 대시보드이며 새 TUI는 --tui next 로만 연다.')
+  .option('--tui <mode>', '루트 TUI를 명시한다(classic|next). 기본은 classic이고 새 TUI는 --tui next 로 연다. --legacy는 classic의 짧은 표기다.')
   .option('--help-all', '시스템 명령을 제외한 모든 최상위 명령 표시');
 program.addHelpText('after', acpServerHelpText());
 
@@ -2430,7 +2635,8 @@ async function runHarnessMissionLoop(
   }
 }
 
-const harnessCmd = installHarnessCliCommand(program, {
+const harnessCmd = (INDEX_FAST_ROOT ? new Command('harness')
+  : (require('./harness/harness-cli-command.js') as typeof import('./harness/harness-cli-command.js')).installHarnessCliCommand(program, {
   registerSink: async (surface) => { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink(surface); },
   resolveSurface: async () => {
     const { getHarnessSpace, harnessSpaceSurface } = await import('./harness/harness-space.js');
@@ -2444,9 +2650,65 @@ const harnessCmd = installHarnessCliCommand(program, {
   //     (그 함수는 planStaged dispatch → 대표 2026-09-04 은퇴한 staged 하니스로 간다).
   //   ⇒ 즉 이 «한 줄»이 은퇴를 되돌린다. 주입 자리는 시험용으로 남는다.
   mission: async (missionId, opts) => {
-    await dispatchSolveMission({ mission_id: missionId, ...opts });
+    await (await import('./skills/tools/solve-mission.js')).dispatchSolveMission({ mission_id: missionId, ...opts });
   },
   missionLoop: runHarnessMissionLoop,
+}));
+
+let podAskSnapshot: string | undefined;
+let podAskSnapshotCleanup: (() => void) | undefined;
+harnessCmd.hook('preAction', async (_parent, action) => {
+  if (action.name() === 'ask' && action.opts().substrate === 'pod' && typeof action.args[0] === 'string' && !isGoalAuthorFileName(basename(action.args[0]))) {
+    // Read the source once; onPod and its orchestrator consume the same private snapshot.
+    const askBytes = readFileSync(action.args[0]!);
+    const askText = askBytes.toString('utf8');
+    if (!askText.trim()) throw new Error('--ask 파일 입력이 비었다');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const snapshotDir = mkdtempSync(join(tmpdir(), 'elanous-ask-snapshot-'));
+    try {
+      const snapshot = join(snapshotDir, basename(action.args[0]!));
+      writeFileSync(snapshot, askBytes, { mode: 0o600 });
+      podAskSnapshot = snapshotDir;
+      podAskSnapshotCleanup = () => {
+        try { rmSync(snapshotDir, { recursive: true, force: true }); }
+        catch (error) { console.error(`[launch-utterance] snapshot cleanup failed: ${String(error)}`); }
+      };
+      process.once('exit', podAskSnapshotCleanup);
+      action.processedArgs[0] = snapshot;
+    } catch (error) {
+      rmSync(snapshotDir, { recursive: true, force: true });
+      throw error;
+    }
+    const { newLaunchUtteranceId, recordLaunchUtterance } = await import('./harness/launch-utterance-ledger.js');
+    recordLaunchUtterance({ source: 'ask-file', utterance: askText, rawBytes: askBytes, launchId: newLaunchUtteranceId() });
+    return;
+  }
+  if (action.name() !== 'say') return;
+  try {
+    const { consumeHandLaunchId, recordLaunchUtterance } = await import('./harness/launch-utterance-ledger.js');
+    const argv = (action.args as string[]).map(String);
+    if (argv.length === 0) return; // nothing was received — no empty start row
+    // New ID per process; only the explicit hand→say pair (same sentence sha ⊕ same run) inherits, once —
+    // and then records the hand's exact original text (recovers a failed hand-parent append in this instance).
+    const { launchId, utterance } = consumeHandLaunchId(argv.join(' '), process.env);
+    recordLaunchUtterance({ source: 'say', utterance, argv, launchId, dryRun: action.opts().dryRun === true });
+  } catch (error) {
+    try { debug.log('harness.launch-utterance', 'prepare-failed', { operation: 'say-hook', reason: String(error) }, { level: 'warn' }); } catch { /* fail-soft */ }
+  }
+});
+harnessCmd.hook('postAction', async (_parent, action) => {
+  if (action.name() !== 'ask' || !podAskSnapshot) return;
+  try {
+    const { rmSync } = await import('node:fs');
+    rmSync(podAskSnapshot, { recursive: true, force: true });
+    if (podAskSnapshotCleanup) process.removeListener('exit', podAskSnapshotCleanup);
+    podAskSnapshot = undefined;
+    podAskSnapshotCleanup = undefined;
+  } catch (error) {
+    console.error(`[launch-utterance] snapshot cleanup failed: ${String(error)}`);
+  }
 });
 
 // (internal) 데몬이 dev-harness 를 subprocess 로 위임(#24 A) — 하니스 동기 op 가 데몬 이벤트루프를
@@ -2484,6 +2746,7 @@ harnessCmd
         try { process.stdout.write(line, () => process.exit(code)); }
         catch { process.exit(code); }
       };
+      const { emitDetachedProgress } = await import('./cli/agent-cli.js');
       const detachedCtx = {
         cwd: process.cwd(),
         signal: new AbortController().signal,
@@ -3216,6 +3479,7 @@ export async function runHarnessOrchestrateExecution(
     const { prepareOrchestrateDecomposeGoals } = await import('./self-dev/self-orchestrate-runtime.js');
     return prepareOrchestrateDecomposeGoals(input as never) as Promise<HarnessOrchestratePreparedGoals>;
   });
+  const { buildOrchestrateDecomposePrepareArgs } = await import('./self-dev/self-orchestrate-runtime.js');
   const prepared = await prepareGoals(buildOrchestrateDecomposePrepareArgs({
     request,
     goals,
@@ -4446,7 +4710,7 @@ selfCmd
   .option('--fixed-shard-distribution', '--shards N 과 함께만: RSS 사전 측정 없이 정렬된 파일을 N 조각에 라운드로빈 고정 배정한다(opt-in · 메모리 보증 아님 · 조각 타임아웃/OOM = unmeasured)')
   .option('--include-importers', '변경 모듈을 가져오는 importer 시험도 실행한다 (기본 caller 한도 밖까지)')
   .option('--remote [host]', 'GATE-REMOTE — 같은 커밋을 원격 호스트(기본 config gateRemote.host=node-b)에서 돌리고 결과만 가져온다(깨끗한 트리 · --pr 은 로컬)')
-  .option('--local', '원격 자동 분배(로컬 1분 부하 > gateRemote.loadThreshold=20)를 끄고 로컬에서 돌린다')
+  .option('--local', '원격 실행을 끄고 명시적으로 로컬에서 돌린다')
   .option('--artifact-dir <dir>', '조각별 지금/기준 JUnit ⊕ summary.json 을 이 디렉토리에 남긴다(판정 불변 · JUnit 은 --shards 경로만 · 원격 실행이면 그 호스트에서 가져온다)')
   .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; fixedShardDistribution?: boolean; includeImporters?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string }) => {
     if (!opts.changed && opts.shards === undefined) { ui.error('self gate requires --changed or --shards'); process.exitCode = 2; return; }
@@ -4482,8 +4746,8 @@ selfCmd
       if (topLevel.status !== 0) throw new Error(`git rev-parse --show-toplevel failed: ${topLevel.stderr.trim() || `rc=${topLevel.status}`}`);
       const repo = topLevel.stdout.trim();
       // Only a committed --base range is reproducible on another host: the default mode measures uncommitted files, --pr
-      // reads files through gh on this host, and the remote checkout runs from the repository root — automatic placement
-      // falls back locally; an explicit --remote reports that this check was not measured.
+      // reads files through gh on this host, and the remote checkout runs from the repository root — these cases
+      // fall back locally for automatic placement; an explicitly requested remote run is unmeasured.
       const { realpathSync } = await import('node:fs');
       const localOnlyReason = opts.pr ? 'self gate --pr reads PR files through gh on this host'
         : !opts.base ? 'self gate without --base measures uncommitted files on this host'
@@ -4516,7 +4780,7 @@ selfCmd
             if (outcome.kind === 'ran') {
               target.fetch = fetchRemoteGateArtifacts({ host, remoteDir: target.dir, localDir: resolveArtifactDir(opts.artifactDir!, process.cwd()), ssh: runner.ssh });
             } else if (outcome.kind === 'infra') {
-              // The run may have started before it broke — remove the host-side dir; automatic placement's local fallback writes its own.
+              // The run may have started before it broke — remove the host-side dir; remote failure stays unmeasured.
               try { runner.ssh(host, remoteArtifactCleanupScript(target.dir), 30_000); } catch { /* best effort */ }
             }
           }) satisfies NonNullable<import('./self-implement/gate-remote.js').DispatchOptions['onRemoteOutcome']>,
@@ -4524,12 +4788,14 @@ selfCmd
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      if (opts.remote !== undefined) {
-        ui.error(`self gate remote unmeasured — ${reason.replace(/\s+/g, ' ').trim()}`);
-        process.exitCode = 1;
-      } else {
+      if (opts.local) {
         ui.error(`self gate dispatch failed: ${reason}`);
         process.exitCode = runLocal();
+      } else {
+        ui.error(opts.remote !== undefined
+          ? `self gate remote unmeasured — ${reason.replace(/\s+/g, ' ').trim()}`
+          : `self gate dispatch failed: ${reason}`);
+        process.exitCode = 1;
       }
     }
     // 원격에서 돌았으면 그 호스트의 산출을 가져와 같은 꼴로 썼다 — 못 가져왔으면 «조용히» 비우지 않고 summary 에 이유를 적는다(판정 불변).
@@ -4756,7 +5022,7 @@ const selfOrchestrateCmd = selfCmd
   .option('--no-pod-rebuild', 'pod: 이미지 판(elanous.commit)이 HEAD 와 달라도 다시 굽지 않는다 — 측정은 «이미지 판»을 잰다')
   .option('--pod-pass-env <keys>', 'pod: 호스트 env 에서 Pod 로 넘길 키(쉼표) — 예 OPENROUTER_API_KEY,ANTHROPIC_API_KEY(벤치마크 과금 경로)')
   .option('--bench-arms <spec>', 'pod 벤치마크: 골 1개를 팔마다 «라벨 한 줄만 다르게» 복제해 동시에 — "id=provider[:model][@KEY+KEY];…" (예 codex=openai-codex;or-kimi=openrouter:openrouter/moonshotai/kimi-k3@OPENROUTER_API_KEY) · --auto-merge 거부 · RFC fleet 슈퍼바이저 §A3')
-  .addOption(new Option('--child-llm-provider <id>', 'pod: 구현 자식 LLM provider(openai-codex|grok|openrouter|anthropic|bedrock|glm) — 하니스 --child-llm-provider 가 이 자리로 온다(10-05)').hideHelp())
+  .addOption(new Option('--child-llm-provider <id>', 'pod: 구현 자식 LLM provider(openai-codex|grok|openrouter|opengateway|anthropic|bedrock|glm) — 하니스 --child-llm-provider 가 이 자리로 온다(10-05)').hideHelp())
   .addOption(new Option('--child-llm-model <id>', 'pod: 구현 자식 LLM model(--child-llm-provider 와 함께)').hideHelp())
   .addOption(new Option('--child-llm-effort <level>', 'pod: 구현 자식 추론 노력(--child-llm-provider 와 함께)').hideHelp())
   .option('--help-all', '모든 orchestrate 옵션 표시')
@@ -4834,7 +5100,7 @@ const selfOrchestrateCmd = selfCmd
       let parentRequest: string | undefined;
       const request = normalizeOrchestrateRequest(joined);
       if (opts.decompose) parentRequest = request;
-      const { prepareOrchestrateDecomposeGoals } = await import('./self-dev/self-orchestrate-runtime.js');
+      const { prepareOrchestrateDecomposeGoals, buildOrchestrateDecomposePrepareArgs } = await import('./self-dev/self-orchestrate-runtime.js');
       const prepared = await prepareOrchestrateDecomposeGoals(buildOrchestrateDecomposePrepareArgs({
         request,
         goals: goalTexts.map((feature) => ({ feature, ...promoteDefaults })),
@@ -5046,11 +5312,24 @@ const selfOrchestrateCmd = selfCmd
         const grokKeyNames = ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'];
         // 명시 계정은 사람의 선택 — 공급자 폴백과 계정 브로커를 우회한다.
         const explicitPodAccount = (opts as { podAccount?: string }).podAccount;
-        const ownerMirrorAccount = process.env.ELANOUS_REMOTE_CODEX_ACCOUNT?.trim();
+        const ownerMirrorRaw = process.env.ELANOUS_REMOTE_CODEX_ACCOUNTS;
+        let ownerMirrorAccounts: import('./task-orchestrator/surfaces/pod-account-broker.js').OwnerCodexMirrorAccount[] | undefined;
+        if (ownerMirrorRaw !== undefined) {
+          try { ownerMirrorAccounts = (await import('./task-orchestrator/surfaces/pod-account-broker.js')).parseOwnerCodexMirrorAccounts(ownerMirrorRaw); }
+          catch { ui.error('pod: HQ Codex 미러 계정 목록이 유효하지 않다'); process.exit(2); }
+          const { freshOwnerCodexMirrorAccounts } = await import('./task-orchestrator/surfaces/pod-account-broker.js');
+          const fresh = freshOwnerCodexMirrorAccounts(ownerMirrorAccounts);
+          for (const { account } of ownerMirrorAccounts.filter(({ account }) => !fresh.some((item) => item.account === account))) {
+            debug.log('self-implement.pod', 'owner-access-mirror-excluded', { account, reason: 'access-expiring' });
+          }
+          ownerMirrorAccounts = fresh;
+          if (fresh.length === 0) { ui.error('pod: HQ Codex 미러 access token 이 모두 3시간 안에 만료된다'); process.exit(2); }
+        }
+        const ownerMirrorAccount = ownerMirrorAccounts?.[0]?.account ?? process.env.ELANOUS_REMOTE_CODEX_ACCOUNT?.trim();
         const childProvider = opts as { childLlmProvider?: string };
         const requestedChildProvider = childProvider.childLlmProvider?.trim();
-        if (ownerMirrorAccount && explicitPodAccount && explicitPodAccount !== ownerMirrorAccount) {
-          ui.error(`pod: HQ 미러 계정은 ${ownerMirrorAccount} 인데 --pod-account ${explicitPodAccount} 을 사용할 수 없다`);
+        if (ownerMirrorAccount && explicitPodAccount && !(ownerMirrorAccounts?.some(({ account }) => account === explicitPodAccount) ?? explicitPodAccount === ownerMirrorAccount)) {
+          ui.error(`pod: HQ 미러 계정 목록에 --pod-account ${explicitPodAccount} 이 없다`);
           process.exit(2);
         }
         if (ownerMirrorAccount && requestedChildProvider && requestedChildProvider !== 'openai-codex') {
@@ -5101,7 +5380,7 @@ const selfOrchestrateCmd = selfCmd
             ? 'pod: --child-llm-model/--child-llm-effort 는 --child-llm-provider 와 함께'
             : named && benchArms
               ? 'pod: --child-llm-provider 는 --bench-arms 와 함께 못 쓴다(팔마다 모델이 하나다)'
-              : (named === 'grok' || named === 'openrouter' || named === 'anthropic' || named === 'bedrock' || named === 'glm') && explicitPodAccount
+              : (named === 'grok' || named === 'openrouter' || named === 'opengateway' || named === 'anthropic' || named === 'bedrock' || named === 'glm') && explicitPodAccount
                 ? `pod: --child-llm-provider ${named} 은 --pod-account 와 함께 못 쓴다(그것은 codex 계정을 고정한다)`
                 : undefined;
           if (refuse) { ui.error(refuse); debug.log('self-implement.pod', 'child-provider-refused', { provider: named ?? null, reason: refuse }); process.exit(2); }
@@ -5163,19 +5442,27 @@ const selfOrchestrateCmd = selfCmd
           if (namedChild === 'openrouter' && !openrouterKeyPresent) {
             try { openrouterKeyPresent = Boolean(readPodKeyFile(podJoin(podHome(), '.cache', 'openrouter_api_key'), 'utf8').trim()); } catch { /* missing host cache */ }
           }
+          const openGatewayKeyPresent = namedChild === 'opengateway' && Boolean(
+            (await import('./config.js')).getOpenGatewayApiKey()?.trim()
+            || configuredOpenGatewayKeys(getUserConfig().llm).length);
           // POD-ANTHROPIC-PROVIDER — 제품 자격 해석(`getAnthropicApiKey` · 키 캐시 → env)으로 «있나»만 본다(값은 안 싣는다).
           const anthropicKeyPresent = namedChild === 'anthropic' && Boolean((await import('./config.js')).getAnthropicApiKey()?.trim());
           const namedChildDecision = podNamedChildProvider(namedChild, {
             grokSubscription: namedChild === 'grok' && credential?.kind === 'subscription' && (grokSubscriptionUsable || namedGrokUsable().usable),
             grokApiKey: credential?.kind === 'api_key' && grokApiKeyOptIn,
             openrouterKey: openrouterKeyPresent,
+            openGatewayKey: openGatewayKeyPresent,
             anthropicKey: anthropicKeyPresent,
           }, (opts as { childLlmModel?: string }).childLlmModel);
           if (namedChildDecision.refuse) { ui.error(namedChildDecision.refuse); debug.log('self-implement.pod', 'child-provider-refused', { provider: namedChild, reason: namedChildDecision.refuse }); process.exit(2); }
           // A named codex child must stay codex — the plan may not fall back to grok (post-review must-fix).
           const namedCodex = namedChildDecision.provider === 'openai-codex';
           let planCandidates = inspectCodexRotation().candidates;
-          if (ownerMirrorAccount) {
+          if (ownerMirrorAccounts) {
+            const { selectOwnerCodexMirrorCandidates } = await import('./task-orchestrator/surfaces/pod-account-broker.js');
+            try { planCandidates = selectOwnerCodexMirrorCandidates(planCandidates, ownerMirrorAccounts); }
+            catch { ui.error('pod: HQ Codex 미러 계정 일부가 원격 auth-store 후보에 없다'); process.exit(2); }
+          } else if (ownerMirrorAccount) {
             const used = process.env.ELANOUS_REMOTE_CODEX_USED_PERCENT;
             const parsedUsed = used && used !== 'unknown' ? Number(used) : undefined;
             const threshold = Number(process.env.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT);
@@ -5187,12 +5474,14 @@ const selfOrchestrateCmd = selfCmd
             planCandidates = ownerCodexMirrorCandidate(planCandidates, ownerMirrorAccount, parsedUsed !== undefined && Number.isFinite(parsedUsed) ? parsedUsed : undefined);
             if (planCandidates.length === 0) { ui.error(`pod: HQ Codex 미러 계정 ${ownerMirrorAccount} 이 원격 auth-store 후보에 없다`); process.exit(2); }
           }
-          const plan: import('./task-orchestrator/surfaces/pod-account-broker.js').PodProviderPlan | null = namedChildDecision.provider === 'openrouter' || namedChildDecision.provider === 'anthropic' || namedChildDecision.provider === 'bedrock' || namedChildDecision.provider === 'glm' ? null : namedChildDecision.provider === 'grok'
+          const plan: import('./task-orchestrator/surfaces/pod-account-broker.js').PodProviderPlan | null = namedChildDecision.provider === 'openrouter' || namedChildDecision.provider === 'opengateway' || namedChildDecision.provider === 'anthropic' || namedChildDecision.provider === 'bedrock' || namedChildDecision.provider === 'glm' ? null : namedChildDecision.provider === 'grok'
             ? { provider: 'grok', excluded: [], grokSubscriptionEligible: credential?.kind === 'subscription' }
             : planPodProvider({
             codexCandidates: planCandidates,
             // Per-account caps (대표 default:97) override the Pod default cap — without them default was dropped at 60%.
-            thresholdPercentByAccount: ownerMirrorAccount
+            thresholdPercentByAccount: ownerMirrorAccounts
+              ? Object.fromEntries(ownerMirrorAccounts.map(({ account, thresholdPercent }) => [account, thresholdPercent]))
+              : ownerMirrorAccount
               ? { [ownerMirrorAccount]: Number(process.env.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT) }
               : launchPolicy.llm?.codexAccountRotationThresholdPercentByAccount,
             // 대표 한도 정책 한 값(`llm.codexQuotaPolicy`) — 크레딧·폴백을 같이 정한다.
@@ -5213,7 +5502,7 @@ const selfOrchestrateCmd = selfCmd
             })() } : {}),
           });
           if (plan?.provider === null) { ui.error(`pod: 쓸 codex 계정이 없다 — ${plan.reasons.join(' · ')}${namedCodex ? ' · child provider 를 openai-codex 로 지정해 grok 으로 넘기지 않는다' : ''} · 계정을 명시하려면 --pod-account <이름>`); process.exit(2); }
-          podProvider = namedChildDecision.provider === 'openrouter' || namedChildDecision.provider === 'anthropic' || namedChildDecision.provider === 'bedrock' || namedChildDecision.provider === 'glm' ? namedChildDecision.provider : plan!.provider!;
+          podProvider = namedChildDecision.provider === 'openrouter' || namedChildDecision.provider === 'opengateway' || namedChildDecision.provider === 'anthropic' || namedChildDecision.provider === 'bedrock' || namedChildDecision.provider === 'glm' ? namedChildDecision.provider : plan!.provider!;
           if (plan?.provider === 'openai-codex') {
             accountBroker = makePodAccountBroker({ usable: plan.accounts, excluded: plan.excluded });
             rotationAccounts = plan.accounts;
@@ -5226,6 +5515,10 @@ const selfOrchestrateCmd = selfCmd
             const model = (opts as { childLlmModel?: string }).childLlmModel!.trim();
             debug.log('self-implement.pod', 'provider-named', { provider: 'openrouter', model, openrouterKeyPresent: true });
             if (!opts.json) ui.info(`[pod] child provider = openrouter(모델 ${model}) — 발사 인자로 지정됨`);
+          } else if (namedChildDecision.provider === 'opengateway') {
+            const model = (opts as { childLlmModel?: string }).childLlmModel!.trim();
+            debug.log('self-implement.pod', 'provider-named', { provider: 'opengateway', model, openGatewayKeyPresent: true, billing: 'api-key' });
+            if (!opts.json) ui.info(`[pod] child provider = opengateway(모델 ${model}) — 발사 인자로 지정됨 · API 키 과금`);
           } else if (namedChildDecision.provider === 'anthropic') {
             const model = (opts as { childLlmModel?: string }).childLlmModel?.trim() || null;
             // ⓔ 과금 관측 — anthropic 은 API 키 과금(구독 아님). 새 예산 체계는 없다 · 관측 한 줄만.
@@ -5254,7 +5547,7 @@ const selfOrchestrateCmd = selfCmd
             if (!opts.json) ui.info(`[pod] 쓸 codex 계정 없음(${plan.excluded.map((x) => `${x.name}: ${x.why}`).join(' · ')}) → grok 으로(모델 ${model})`);
           }
         }
-        const passEnv = podProvider === 'grok' ? requestedPassEnv.filter((key) => !grokKeyNames.includes(key)) : podProvider === 'openrouter' ? [...new Set([...requestedPassEnv, 'OPENROUTER_API_KEY'])] : podProvider === 'anthropic' ? [...new Set([...requestedPassEnv, 'ANTHROPIC_API_KEY'])] : requestedPassEnv;
+        const passEnv = podProvider === 'grok' ? requestedPassEnv.filter((key) => !grokKeyNames.includes(key)) : podProvider === 'openrouter' ? [...new Set([...requestedPassEnv, 'OPENROUTER_API_KEY'])] : podProvider === 'opengateway' ? [...new Set([...requestedPassEnv, 'OPENGATEWAY_API_KEY'])] : podProvider === 'anthropic' ? [...new Set([...requestedPassEnv, 'ANTHROPIC_API_KEY'])] : requestedPassEnv;
         const podSourceSpec = (opts as { podSource?: string }).podSource;
         const repairBaseHead = (opts as { repairCommitOnly?: string }).repairCommitOnly;
         if (repairBaseHead && (!/^pr:[1-9]\d*$/.test(podSourceSpec ?? '') || !/^[0-9a-f]{40}$/.test(repairBaseHead) || opts.autoMerge || opts.openPr || goalTexts.length !== 1)) {
@@ -5563,7 +5856,7 @@ selfCmd
   .action(async (space: string | undefined, opts: { stop?: boolean; memo?: string; run?: string; includeStale?: boolean; readWait?: string }) => {
     const { classifyRunScreenMissing, queryRunScreenKey, listRunLedgers } = await import('./self-implement/run-ledger.js');
     const { getPtyManifest, listPtyManifestRows } = await import('./pty-shell/pty-manifest.js');
-    const { readPodFragment, podFragmentFinished, listPodFragmentsForRun, dispatchPodSelfSend } = await import('./harness/self-send-target.js');
+    const { readPodFragment, podFragmentFinished, listPodFragmentsForRun, dispatchPodSelfSend, resolveSelfSendTarget } = await import('./harness/self-send-target.js');
     const { listHarnessScreens, readHarnessHeartbeat } = await import('./harness/harness-screen.js');
     const decision = decideSelfSend({ space, opts, now: Date.now() }, {
       resolveRunScreen: (runId) => {
@@ -5892,7 +6185,7 @@ selfCmd
   .option('--acp', '⭐ ACP(독립 프로세스)로 리뷰 — API 대신 선택한 ACP 백엔드로 독립 리뷰')
   .option('--acp-model <alias>', 'ACP 모델 tier (지정 시 고정, 생략 시 선택한 백엔드 기본값)')
   .option('--acp-backend <id>', 'ACP 백엔드 id (기본: 설정 acp.reviewBackend, 없으면 공유 기본값)')
-  .option('--acp-timeout <sec>', 'ACP 리뷰 1턴 최대 대기 초(초과 시 cancel·기본 300)', '300')
+  .option('--acp-timeout <sec>', 'ACP 리뷰 1턴 최대 대기 초(초과 시 cancel·기본 claude 600 · 그 외 300)')
   .option('--context <path>', '리뷰어가 함께 판단할 레포 상대 파일 경로(반복 가능)', (value: string, previous: string[] = []) => [...previous, value])
   .option('--context-text <text>', '리뷰어가 함께 판단할 텍스트(반복 가능)', (value: string, previous: string[] = []) => [...previous, value])
   .option('--json', '구조화 출력 {pr, verdict, mustFix, shouldFix, reviewed}')
@@ -5908,10 +6201,10 @@ selfCmd
     const { spawnSync } = await import('node:child_process');
     const { reviewPullRequest, renderReview } = await import('./agent-substrate/pr-reviewer.js');
     const { createRepositoryReferencedFileReader } = await import('./self-implement/goal-file-reader.js');
-    const { streamLLM, getProvider } = await import('./llm.js');
+    const { streamLLM, getProvider, getProviderForConfig } = await import('./llm.js');
     const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js');
     const { debug } = await import('./debug/log.js');
-    const { runSelfReviewCliCommand, reviewerContextArgs, selfReviewJsonLine } = await import('./agent-substrate/self-review-cli.js');
+    const { apiReviewModelFromRoleSpec, runSelfReviewCliCommand, reviewerContextArgs, selfReviewJsonLine } = await import('./agent-substrate/self-review-cli.js');
     const { subscriptionReviewerAvailability } = await import('./self-dev/review-provider-fallback.js');
     const { makeLazyAcpReviewLLM: makeRoleAcpReviewLLM } = await import('./agent-substrate/acp-reviewer.js');
     const { getOpenRouterApiKey: getOpenRouterApiKeyForReview } = await import('./config.js');
@@ -5922,8 +6215,12 @@ selfCmd
     //    The seam decides whether it applies (only without an explicit reviewer flag).
     const { loadLlmPolicy, resolveSubscriptionReviewer } = await import('./policy/llm-policy.js');
     const roleReviewerSelection = resolveSubscriptionReviewer(loadLlmPolicy(), getUserConfig().roleLlm);
+    const reviewRoleSpec = getUserConfig().roleLlm?.review;
+    const configuredReviewModel = apiReviewModelFromRoleSpec(reviewRoleSpec);
     const { results, failed } = await runSelfReviewCliCommand(prArgs, {
       ...opts,
+      ...(configuredReviewModel ? { configuredReviewModel } : {}),
+      ...(configuredReviewModel && reviewRoleSpec?.provider ? { configuredReviewProvider: reviewRoleSpec.provider } : {}),
       ...(configuredAcpBackend ? { configuredAcpBackend } : {}),
       ...(roleReviewerSelection ? { roleReviewer: roleReviewerSelection.spec } : {}),
       ...(contextOrder.length > 0 ? { contextOrder } : {}),
@@ -5947,15 +6244,29 @@ selfCmd
       //   명시 `--model` 이면 provider 를 그 모델의 것으로 «고정»한다 — 라우터 폴백(grok 등)으로 조용히 넘어가지 않고 오류로 낸다.
       makeApiLlm: (model, o) => {
         const effort = reviewReasoningEffort(resolveRoleLlm('review'));
-        return (prompt: string) =>
-          streamLLM([{ role: 'user', content: prompt }], () => {}, {
+        return (prompt: string) => {
+          let configuredProvider;
+          if (o?.providerName) {
+            try {
+              const config = getUserConfig();
+              configuredProvider = getProviderForConfig({ ...config, llm: { ...config.llm, provider: o.providerName } }, model);
+            } catch (error) {
+              debug.log('self-review', 'role-review-config-provider-error', {
+                provider: o.providerName, model, source: 'roleLlm.review',
+                reason: error instanceof Error ? error.message : String(error),
+              }, { level: 'error' });
+              throw error;
+            }
+          }
+          return streamLLM([{ role: 'user', content: prompt }], () => {}, {
             model,
             // ⛔ 어댑터 기본 2048 은 리뷰 응답을 자른다(VERDICT/MUST-FIX 줄이 잘리면 reviewed=false 로 접힌다).
             maxTokens: 16_000,
-            ...(o?.pinProvider ? { provider: getProvider(model) } : {}),
+            ...(configuredProvider ? { provider: configuredProvider } : o?.pinProvider ? { provider: getProvider(model) } : {}),
             ...(o?.onResolved ? { onResolvedProvider: o.onResolved } : {}),
             ...(effort ? { reasoningEffort: effort } : {}),
           });
+        };
       },
       makeAcpLlm: (o) => {
         // ⚠️ 동기 팩토리라 여기서 동적 import 를 쓸 수 없다 — 지연 로드해 첫 호출에 붙인다.
@@ -6508,7 +6819,8 @@ program.command('env').description('환경 감지')
 //   src/agent-mission/·관측 카테고리 agent-mission·U1 핸드오프 용어와 정합) — 최상위 `agent`(single-turn
 //   chat-with-tools)가 이미 점유해 충돌하므로 그 이름은 못 쓴다. 기존 cron/스크립트(`elanous codex review-watch`
 //   등)는 commander alias 로 그대로 resolvable(하위호환 불변). 상태경로 codex-mission 은 별도로 보존(아래 락/DB).
-const agentBackendHelpNames = agentBackendNames();
+const agentBackendHelpNames = INDEX_FAST_ROOT ? []
+  : (require('./agent-mission/driver.js') as typeof import('./agent-mission/driver.js')).agentBackendNames();
 const agentBackendHelpList = agentBackendHelpNames.map((name, index) => index === 0 ? `${name}[디폴트]` : name).join('·');
 const agentCmd = program
   .command('agent-mission')
@@ -6896,7 +7208,7 @@ agentCmd
     let initialReviewer: ((pr: string) => Promise<{ verdict: import('./agent-mission/review-loop.js').ReviewVerdict; asks: string[] } | null>) | undefined;
     if (opts.autoInitialReview === true && opts.dryRun !== true) {
       const { reviewDiffBudgetObservation, reviewPullRequest } = await import('./agent-substrate/pr-reviewer.js');
-      const { makeAcpReviewLLM } = await import('./agent-substrate/acp-reviewer.js');
+      const { makeAcpReviewLLM, DEFAULT_REVIEW_BACKEND } = await import('./agent-substrate/acp-reviewer.js');
       const { mapReviewToInjected } = await import('./agent-mission/pr-review-watch.js');
       const { execFileSync } = await import('node:child_process');
       const { lookupPrGoalAcceptance } = await import('./self-implement/run-ledger.js');
@@ -6958,6 +7270,7 @@ agentCmd
   .command('setup')
   .description('One command: OAuth / API-key auth + model picker + save config')
   .action(async () => {
+    const { realIO } = await import('./onboarding.js');
     const io = realIO();
     try {
       await runCodexSetup({ io });
@@ -7758,7 +8071,7 @@ const selfDevCmd = program
           humanReadableOutput: !opts.json,
           gitResidueSnapshot: { path: gitResiduePath, observation: gitResidue },
         }, {
-          runChatTurn: (text, chat) => runChatTurnCli({
+          runChatTurn: async (text, chat) => (await import('./cli/agent-cli.js')).runChatTurnCli({
             cfg: reloadUserConfig(),
             userText: text,
             explicitSessionId: chat.session,
@@ -8306,7 +8619,7 @@ program
       return;
     }
     const cfg = reloadUserConfig();
-    await runChatTurnCli({
+    await (await import('./cli/agent-cli.js')).runChatTurnCli({
       cfg,
       userText: parts.join(' '),
       explicitSessionId: opts.session,
@@ -8426,6 +8739,7 @@ program
   .option('--config <path>', 'Load answers from a JSON answer file (overrides interactive prompts)')
   .option('--non-interactive', 'Run without prompts — resolve all answers from --config + env vars')
   .action(async (step: string | undefined, opts: { config?: string; nonInteractive?: boolean }) => {
+    const { runOnboarding, runOnboardingStep, runOnboardingNonInteractive } = await import('./onboarding.js');
     // C-4e (cleanup ROADMAP 2026-05-08) restricted `elanous setup <step>`
     // to llm/skills/obsidian. Telegram/Discord setup migrated to NEXUS
     // — `elanous channel-setup --platform telegram|discord` (Track Q).
@@ -8699,7 +9013,8 @@ sessionCmd
 sessionCmd
   .command('new')
   .description('Create a fresh session and mark it active')
-  .action(() => {
+  .action(async () => {
+    const { ensureCliSession } = await import('./session/chat.js');
     const cfg = getUserConfig();
     const s = ensureCliSession(cfg);
     setActiveSessionId(s.id);
@@ -8728,7 +9043,8 @@ sessionCmd
   .command('show [prefix]')
   .description('Print the messages of a session (default: active)')
   .option('--include-tools', 'Include tool-call telemetry (role:tool · 실제 호출 도구·args·result 추적)')
-  .action((prefix: string | undefined, opts: { includeTools?: boolean }) => {
+  .action(async (prefix: string | undefined, opts: { includeTools?: boolean }) => {
+    const { sessionBudget } = await import('./session/chat.js');
     const id = prefix ? resolveSessionId(prefix) : getActiveSessionId();
     if (!id) { ui.error('no session'); process.exit(1); }
     const loaded = loadSession(id);
@@ -9147,6 +9463,7 @@ async function runFirstSetupForCli(cfg: ReturnType<typeof getUserConfig>, announ
 }
 
 async function runOnboardingForCli(): Promise<boolean> {
+  const { runOnboarding, handleOnboardingRefusal } = await import('./onboarding.js');
   try {
     await runOnboarding();
     return true;
@@ -9191,7 +9508,7 @@ program
     }
     if (opts.tools) announceChatToolsCompatibility();
     const cfg = getUserConfig();
-    if (await firstChatGate(cfg, {
+    if (await (await import('./onboarding/first-chat-gate.js')).firstChatGate(cfg, {
       isTTY: process.stdin.isTTY === true,
       runFirstRun: async (deps) => (await import('./onboarding/first-run.js')).runFirstRun(deps),
       runInteractive: () => {
@@ -9222,7 +9539,7 @@ program
     //   단일 턴 엔진(runChatTurnCli)은 cfg-바인딩 클로저로 주입(순환 회피). opts→DevChatOpts 매핑은 seam.
     const { runChatCliCommand } = await import('./chat/chat-cli.js');
     await runChatCliCommand(parts.join(' '), opts, {
-      runChatTurn: (text, chat) => runChatTurnCli({
+      runChatTurn: async (text, chat) => (await import('./cli/agent-cli.js')).runChatTurnCli({
         cfg: refreshed,
         userText: text,
         explicitSessionId: chat.session,
@@ -9267,7 +9584,7 @@ program
       process.exit(2);
     }
     const cfg = getUserConfig();
-    if (needsOnboarding(cfg)) {
+    if ((await import('./onboarding.js')).needsOnboarding(cfg)) {
       if (cfg.onboarding.webFirst === false) ui.info('No config yet — launching setup wizard first.');
       if (!await runFirstSetupForCli(cfg, true)) return;
     }
@@ -11613,6 +11930,7 @@ function writeSyncFailure(message: string): void {
 }
 
 async function runSyncFlow(fromDashboard: boolean): Promise<void> {
+  const { showSyncSelector, showSyncProgress } = await import('./selector.js');
   let result: Awaited<ReturnType<typeof showSyncSelector>>;
   try {
     result = await showSyncSelector(fromDashboard);
@@ -11778,6 +12096,15 @@ async function main(): Promise<void> {
 
   let rawArgs = process.argv.slice(2);
 
+  // The root flag can follow other launch options, but never a subcommand.
+  const rootTui = extractRootTuiEntry(rawArgs);
+  if (rootTui.error) {
+    console.error(rootTui.error);
+    process.exitCode = 1;
+    return;
+  }
+  rawArgs = rootTui.args;
+
   rawArgs = rewriteBareNexusToStatus({ rawArgs });
 
   // A leading --rich was a dashboard launch flag. The dashboard no longer
@@ -11921,6 +12248,9 @@ async function main(): Promise<void> {
     const resolved = await resolveRemoteTarget({});
     if (resolved) remote = resolved;
   }
+  // Bare entry is classic. The next TUI has no remote transport yet;
+  // an explicit --tui next still reports the unsupported combination below.
+  const tuiEntry = effectiveRootTuiEntry(rootTui, Boolean(remote));
 
   // Root dashboard resume accepts `--resume`. Only a
   // leading launch flag is owned here: a subcommand's `-r` stays
@@ -11985,8 +12315,13 @@ async function main(): Promise<void> {
   // (e.g. `session watch --debug`), stripping them here would silently
   // eat that subcommand's own option before commander ever sees it.
   const args = filterDashboardArgs(rawArgs, resumeFlagIdx);
+  if (tuiEntry === 'next' && rootTui.explicit && args.length > 0) {
+    console.error('elanous: --tui next is a standalone TUI entry, not a subcommand option');
+    process.exitCode = 1;
+    return;
+  }
 
-  // Bare `elanous` (no subcommand) → the dashboard, always. The former
+  // Bare `elanous` (no subcommand) → classic dashboard; next TUI only via `--tui next`. The former
   // `global.entry.defaultMode` switch (which could route here to the
   // headless NEXUS daemon) was removed 2026-07-24: T3/T4 deleted the
   // NEXUS interactive TUI, so every non-dashboard route was a dead-end
@@ -12048,7 +12383,7 @@ async function main(): Promise<void> {
   // Bare entry only requires an LLM; detailed setup stays behind `eln setup`.
   const firstRunStartedAt = Date.now();
   const cfg = getUserConfig();
-  if (needsFirstRun(cfg)) {
+  if ((await import('./onboarding.js')).needsFirstRun(cfg)) {
     if (cfg.onboarding.webFirst !== false) {
       const { runWebFirstSetup } = await import('./onboarding/web-first.js');
       if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt, startIfMissing: false }) === 'link-shown') return;
@@ -12125,14 +12460,32 @@ async function main(): Promise<void> {
     }
   }
   bootTimer.begin();
-  await showDashboard({
-    ...dashboardOpts,
-    onFirstFrameRendered: () => {
-      bootTimer.phase('show-dashboard');
-      bootTimer.done();
-    },
-  });
-  closeTui();
+  if (tuiEntry === 'next') {
+    if (remote) {
+      console.error('elanous: --tui next currently reads local sessions only; drop it (classic is the default) for remote attach');
+      process.exitCode = 1;
+      return;
+    }
+    if ((process.stdout.columns || 0) < 20 || (process.stdout.rows || 0) < 6) {
+      console.error('elanous: --tui next requires at least 20 columns and 6 rows');
+      process.exitCode = 1;
+      return;
+    }
+    const { showNextTui } = await import('./tui/entry.js');
+    await showNextTui({ resumeSessionId });
+    bootTimer.phase('show-next');
+    bootTimer.done();
+  } else {
+    const { showDashboard } = await import('./dashboard/index.js');
+    await showDashboard({
+      ...dashboardOpts,
+      onFirstFrameRendered: () => {
+        bootTimer.phase('show-dashboard');
+        bootTimer.done();
+      },
+    });
+    closeTui();
+  }
   // Force exit: the dashboard starts background timers (clipboard
   // poller, shimmer/blink animations) that keep the Bun event loop
   // alive even after the TUI tears down. Without this hard exit,

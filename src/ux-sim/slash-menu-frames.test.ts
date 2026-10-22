@@ -65,3 +65,31 @@ describe('TUI-SLASH-FLICKER — slash picker never erases the whole screen', () 
     expect(escaped.finalText).toBe('');
   });
 });
+
+// TUI-DIRECT-WRITE-ROWS — closing the picker must not erase rows outside the
+// picker band. The old direct clear (`paintChatPickerClear` via the textInput
+// `writeTerminal` bypass) erased one row ABOVE the band and the frame cache
+// never learned about it, so that row stayed blank until the next full
+// repaint (live: ChatLog header blank ~31ms on `/` → ↓ → Esc).
+describe('TUI-DIRECT-WRITE-ROWS — picker close erases nothing outside the picker band', () => {
+  const erasedRows = (bytes: string): number[] =>
+    (bytes.match(/\x1b\[(\d+);\d+H\x1b\[2K/g) ?? []).map((s) => Number(s.match(/\d+/)![0]));
+
+  test('Esc after «/abcd» ↓ — rows erased before the coordinator repaint ⊆ picker band', async () => {
+    const r = await simSlashMenuFrames({ typed: 'abcd', arrows: ['down'], commands });
+    const open = r.frames.find((f) => f.key === '↓')!;
+    const close = r.frames.find((f) => f.key === 'esc')!;
+    // Picker band = the rows the open frame painted with the modal box chars.
+    const band = [...open.bytes.matchAll(/\x1b\[(\d+);1H\x1b\[2K([╭│╰])/g)].map((m) => Number(m[1]));
+    const top = Math.min(...band);
+    const bottom = Math.max(...band);
+    expect(bottom - top).toBeGreaterThan(2);
+    // Everything before the first full-screen clear is the direct-write window
+    // the frame cache cannot see; nothing there may touch a row outside the band.
+    const preRepaint = close.bytes.split('\x1b[1;1H\x1b[J')[0]!;
+    const outside = erasedRows(preRepaint).filter((row) => row < top || row > bottom);
+    expect(outside).toEqual([]);
+    // The close still repaints exactly once (popModal's Q7 / F9 blanket force).
+    expect(close.fullClears).toBe(1);
+  });
+});

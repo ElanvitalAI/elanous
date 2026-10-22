@@ -28,6 +28,8 @@ export interface GreenSweepDecision {
   source: GreenSweepCandidate['source'];
   verdict: GreenSweepVerdict;
   reason: string;
+  /** Present when traffic hold state could not be read; preserves the decision reason while exposing its cause. */
+  holdDiagnostic?: string;
   evidence: string;
   existingEvidence: string;
   /** Preview only; a later live operation may persist this complete value. */
@@ -107,6 +109,7 @@ export function decideGreenSweep(input: {
   pr: GreenSweepPr | null;
   ancestor: boolean | null;
   hold: boolean | null;
+  holdDiagnostic?: string;
   repositoryMatches?: boolean | null;
   ambiguousAcrossCells?: boolean;
 }): GreenSweepDecision {
@@ -116,6 +119,7 @@ export function decideGreenSweep(input: {
     const landing = pr?.viaTrain ? ` via train #${pr.viaTrain.integrationPr}` : '';
     const evidence = `GREEN-FROM-LEDGER: PR #${candidate.pr}${landing}${mergeSha ? ` merged ${mergeSha}` : ''} · ${verdict} · ${reason}`;
     return { cell: item.id, pr: candidate.pr, mergeSha, source: candidate.source, verdict, reason,
+      ...(reason === 'hold-state-unreadable' && input.holdDiagnostic ? { holdDiagnostic: input.holdDiagnostic } : {}),
       evidence, existingEvidence: item.evidence ?? '', plannedEvidence: appendGreenSweepEvidence(item.evidence, evidence) };
   };
   if (item.status !== 'yellow' && item.status !== 'red') return result('skip', 'cell-not-yellow');

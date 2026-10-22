@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { runSelfImplement, type SelfImplementSeams } from './orchestrator.js';
 import { seams } from './test-seams.js';
+import { createTempGitRemote } from '../ux-sim/temp-git-remote.js';
+import { createFakeBins } from '../ux-sim/fake-bin.js';
 
 const codexNoCandidateSeams = (): Pick<SelfImplementSeams, 'currentProviderName' | 'inspectCodexRotation'> => ({
   currentProviderName: () => 'openai-codex',
@@ -344,5 +346,129 @@ test('environment branch is committed and pushed to an existing origin without o
   } finally {
     (debug as { log: typeof debug.log }).log = original;
     rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+// REPAIR-BLOCKED-DRAFT-LINK-ORIGINAL — commit-only 수리 런(base = 합성 로컬 가지 pr-<N>)이 리뷰 FAIL 로 멈추면
+// 새 draft PR 을 열지 않고(origin 에 pr-<N> 이 없어 반드시 실패했다) 수확 가지를 원 PR #N 에 코멘트로 잇는다.
+test('repair run on synthetic base pr-123 blocked by review links its salvage ref to PR #123 without opening a PR', async () => {
+  const fixture = createTempGitRemote();
+  const fakeBins = createFakeBins({ gh: { stdout: 'https://github.com/o/r/pull/123#issuecomment-1\n' } });
+  const original = debug.log;
+  const previousSubstrate = process.env.ELANOUS_SUBSTRATE;
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const openings: Array<{ head: string; base?: string }> = [];
+  try {
+    const repo = fixture.checkout;
+    const branch = 'self-impl/pr-123-head-abc-r1234ab';
+    fixture.git(repo, ['config', 'user.email', 'test@example.com']);
+    fixture.git(repo, ['config', 'user.name', 'Test']);
+    fixture.git(repo, ['checkout', '-b', branch]);
+    writeFileSync(join(repo, 'repair.ts'), 'export const repaired = true;\n');
+    process.env.ELANOUS_SUBSTRATE = 'pod';
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    const result = await runSelfImplement({
+      feature: '기존 PR #123 수리', base: 'pr-123', completion: 'worktree-only', maxReworkRounds: 0, memory: false,
+      seams: seams({
+        createWorktree: async () => ({ path: repo, branch, resolvedBase: fixture.git(repo, ['rev-parse', 'main']) }),
+        preservationHasChanges: () => true,
+        persistPrBodyArtifact: () => ({ path: '/tmp/repair-link-body.md' }),
+        reviewDiff: async () => ({ verdict: 'fail', mustFix: ['must A'], shouldFix: [], reviewed: true, summary: 'blocked' }),
+        openPr: async ({ head, base }) => { openings.push({ head, ...(base ? { base } : {}) }); throw new Error('base 브랜치 pr-123 가 origin 에 없다'); },
+        postPrComment: async ({ number, body, cwd }) => {
+          const posted = spawnSync('gh', ['pr', 'comment', String(number), '--body', body], { cwd, env: fakeBins.env, encoding: 'utf8' });
+          if (posted.status !== 0) throw new Error(posted.stderr);
+        },
+      }),
+    });
+    expect(openings).toHaveLength(0);
+    const salvageRef = result.salvageRef!;
+    expect(result.originalPr).toBe(123);
+    expect(salvageRef).toMatch(/^salvage\/run-[0-9a-f]{6}\/self-impl-pr-123-head-abc-r1234ab$/);
+    const head = fixture.git(repo, ['rev-parse', 'HEAD']);
+    expect(fixture.git(repo, ['ls-remote', '--heads', 'origin', salvageRef]).split('\t')[0]).toBe(head);
+    expect(fixture.git(repo, ['ls-remote', '--heads', 'origin', branch])).toBe('');
+    const comments = fakeBins.calls().filter((call) => call.name === 'gh');
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.argv.slice(0, 3)).toEqual(['pr', 'comment', '123']);
+    expect(comments[0]!.argv[4]).toContain(`수리 산출물 salvage ${salvageRef}`);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'start', data: expect.objectContaining({ repairCommitOnly: 123, openPr: false }) }));
+    const linked = events.find((entry) => entry.event === 'rework-blocked-draft-pr' && entry.data.skipped === 'repair-link-original');
+    expect(linked?.data).toMatchObject({ originalPr: 123, salvageRef, salvageSha: head, pushed: true, commentPosted: true });
+    // L2 영수증 — 관측 원문(fixture 런)을 시험 출력에 남긴다.
+    console.log(`[repair-link-original] ${JSON.stringify({ openPrCalls: openings.length, ghCalls: comments.map((call) => call.argv), observation: { skipped: linked?.data.skipped, originalPr: linked?.data.originalPr, salvageRef: linked?.data.salvageRef, salvageSha: linked?.data.salvageSha, pushed: linked?.data.pushed, commentPosted: linked?.data.commentPosted }, result: { stage: result.stage, originalPr: result.originalPr, salvageRef: result.salvageRef } })}`);
+  } finally {
+    (debug as { log: typeof debug.log }).log = original;
+    if (previousSubstrate === undefined) delete process.env.ELANOUS_SUBSTRATE;
+    else process.env.ELANOUS_SUBSTRATE = previousSubstrate;
+    fakeBins.cleanup();
+    fixture.cleanup();
+  }
+}, 60_000);
+
+test('needs-owner-only harvestable stop on pr-<N> base still links the original PR (not the draft-not-archive salvage path)', async () => {
+  const previousSubstrate = process.env.ELANOUS_SUBSTRATE;
+  delete process.env.ELANOUS_SUBSTRATE;
+  const pushes: string[] = [];
+  const comments: Array<{ number: number; body: string }> = [];
+  let opened = 0;
+  try {
+    const result = await runSelfImplement({
+      feature: '기존 PR #45 수리', base: 'pr-45', maxReworkRounds: 0, memory: false,
+      seams: seams({
+        draftOnStopMode: () => 'needs-owner-only',
+        gate: async () => ({ passed: false, log: 'implementation stopped gate' }),
+        preservationHasChanges: () => true,
+        persistPrBodyArtifact: () => ({ path: '/tmp/repair-link-needs-owner.md' }),
+        preserveBlockedBranch: async ({ branch }) => { pushes.push(branch); return true; },
+        openPr: async () => { opened++; return { url: 'https://pr/unexpected', number: 7 }; },
+        postPrComment: async ({ number, body }) => { comments.push({ number, body }); },
+      }),
+    });
+    expect(result.abandonedClassification?.classification).toBe('implementation-deficit');
+    expect(opened).toBe(0);
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toMatch(/^salvage\/run-[0-9a-f]{6}\//);
+    expect(comments).toEqual([{ number: 45, body: expect.stringContaining(`수리 산출물 salvage ${pushes[0]}`) }]);
+  } finally {
+    if (previousSubstrate === undefined) delete process.env.ELANOUS_SUBSTRATE;
+    else process.env.ELANOUS_SUBSTRATE = previousSubstrate;
+  }
+});
+
+test('failed salvage push on pr-<N> base opens no PR, posts no comment, and reports no salvageRef', async () => {
+  const previousSubstrate = process.env.ELANOUS_SUBSTRATE;
+  process.env.ELANOUS_SUBSTRATE = 'pod';
+  const original = debug.log;
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  let opened = 0;
+  let commented = 0;
+  (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+    events.push({ event, data: data as Record<string, unknown> });
+  }) as typeof debug.log;
+  try {
+    const result = await runSelfImplement({
+      feature: '기존 PR #46 수리', base: 'pr-46', completion: 'worktree-only', maxReworkRounds: 0, memory: false,
+      seams: seams({
+        preservationHasChanges: () => true,
+        persistPrBodyArtifact: () => ({ path: '/tmp/repair-link-push-failed.md' }),
+        reviewDiff: async () => ({ verdict: 'fail', mustFix: ['must A'], shouldFix: [], reviewed: true, summary: 'blocked' }),
+        preserveBlockedBranch: async () => false,
+        openPr: async () => { opened++; return { url: 'https://pr/unexpected', number: 7 }; },
+        postPrComment: async () => { commented++; },
+      }),
+    });
+    expect({ opened, commented }).toEqual({ opened: 0, commented: 0 });
+    expect(result.originalPr).toBeUndefined();
+    expect(result.salvageRef).toBeUndefined();
+    expect(result.detail).toContain('수확 가지 push 실패');
+    const linked = events.find((entry) => entry.event === 'rework-blocked-draft-pr' && entry.data.skipped === 'repair-link-original');
+    expect(linked?.data).toMatchObject({ originalPr: 46, pushed: false, commentPosted: false });
+  } finally {
+    (debug as { log: typeof debug.log }).log = original;
+    if (previousSubstrate === undefined) delete process.env.ELANOUS_SUBSTRATE;
+    else process.env.ELANOUS_SUBSTRATE = previousSubstrate;
   }
 });

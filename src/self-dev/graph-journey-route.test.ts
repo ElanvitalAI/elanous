@@ -7,15 +7,18 @@ import { freezeCheckHolds, intakeTakesQueue, readJourneyEdge, routeJourneyEdge, 
 afterEach(() => setJourneyOverlaysForTesting(undefined));
 
 const base = GRAPH_SPECS['self-implement']!;
+// GRAPH-AUTHOR-FAIL-EDGE: the real author edge now branches on outcome; the skip-chain fixtures below need a
+// linear author → plan chain, so they pin that one edge back (the skip mechanics, not the author map, is under test).
+const linear = { ...base, edges: base.edges.map((edge) => edge.from === 'author' ? { from: 'author', to: 'plan' } : edge) };
 const intakeEdge = base.edges.findIndex((edge) => edge.from === 'intake');
 
 describe('HARNESS-FULL-GRAPH 2판 — 경로를 그래프가 정한다', () => {
   test('ARG L1 실 경로 선택: 관측한 host 상태만 when 간선을 타고 optional node를 건너뛴다', () => {
     const profile = {
-      ...base,
+      ...linear,
       nodes: base.nodes.map(node => node.nodeId === 'plan'
         ? { ...node, skipWhen: 'substrate == local' } : node),
-      edges: base.edges,
+      edges: linear.edges,
     };
     expect(readJourneyEdge('decompose', 'local', { substrate: 'pod' }, { base: profile, overlays: [] }))
       .toMatchObject({ to: 'pool-admit', via: 'when', condition: 'substrate == pod' });
@@ -36,7 +39,7 @@ describe('HARNESS-FULL-GRAPH 2판 — 경로를 그래프가 정한다', () => {
   });
 
   test('ARG L1 연속 선택 노드는 모두 생략하고 각각 관측한다', () => {
-    const profile = { ...base, nodes: base.nodes.map(node =>
+    const profile = { ...linear, nodes: base.nodes.map(node =>
       node.nodeId === 'author' || node.nodeId === 'plan'
         ? { ...node, skipWhen: 'substrate == local' } : node) };
     const events: { event: string; data: Record<string, unknown> | undefined }[] = [];
@@ -76,9 +79,9 @@ describe('HARNESS-FULL-GRAPH 2판 — 경로를 그래프가 정한다', () => {
   });
 
   test('ARG L1 다른 출구가 있는 선택 노드는 런타임에서도 생략하지 않는다', () => {
-    const profile = { ...base,
+    const profile = { ...linear,
       nodes: base.nodes.map(node => node.nodeId === 'plan' ? { ...node, skipWhen: 'substrate == local' } : node),
-      edges: [...base.edges, { from: 'plan', to: 'implement', when: 'machines >= 1' }],
+      edges: [...linear.edges, { from: 'plan', to: 'implement', when: 'machines >= 1' }],
     };
     expect(readJourneyEdge('author', 'next', { substrate: 'local' }, { base: profile, overlays: [] }))
       .toMatchObject({ to: 'plan' });
@@ -102,9 +105,9 @@ describe('HARNESS-FULL-GRAPH 2판 — 경로를 그래프가 정한다', () => {
   });
 
   test('ARG L1 fallback 출구가 있는 선택 노드는 런타임에서도 생략하지 않는다', () => {
-    const profile = { ...base,
+    const profile = { ...linear,
       nodes: base.nodes.map(node => node.nodeId === 'plan' ? { ...node, skipWhen: 'substrate == local' } : node),
-      edges: base.edges.map(edge => edge.from === 'plan'
+      edges: linear.edges.map(edge => edge.from === 'plan'
         ? { ...edge, fallback: [{ node: 'implement', requires: ['probe'] }] } : edge),
     };
     expect(readJourneyEdge('author', 'next', { substrate: 'local' }, { base: profile, overlays: [] }))

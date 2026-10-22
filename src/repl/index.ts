@@ -47,6 +47,46 @@ import { buildReplayTurnsFromSession } from './replay.js';
 import type { LLMToolSpec, ContentBlock } from '../llm.js';
 import { inspectActiveProvider } from '../provider-summary.js';
 import { parse as parseYaml } from 'yaml';
+import type { PendingTaskNotification } from '../agent/task-notification.js';
+import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
+import { buildSeatBootSystemMessages, type SeatBootDeps } from '../dashboard/seat-boot-preamble.js';
+
+/** Private side channel for the next TUI. Ordinary REPL JSONL stdout is unchanged. */
+const NEXT_TUI_BG_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
+
+export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: () => number) {
+  if (process.env.ELANOUS_NEXT_TUI_BG_STATUS !== '1') return null;
+  const { globalAgentRegistry } = require('../agent/registry.js') as typeof import('../agent/registry.js');
+  const { globalTaskNotificationQueue } = require('../agent/task-notification.js') as typeof import('../agent/task-notification.js');
+  const unregisteredPromises = new Set<string>();
+  let last = '';
+  const emit = () => {
+    const tasks = globalAgentRegistry.list();
+    for (const task of tasks) unregisteredPromises.delete(task.id);
+    const running = tasks.filter((task) => task.background && (task.state === 'pending' || task.state === 'running')).length;
+    const frame = JSON.stringify({ sessionId, promised: unregisteredPromises.size > 0, running, pending: globalTaskNotificationQueue.size + bufferedCount() });
+    if (frame === last) return;
+    last = frame;
+    process.stderr.write(`${NEXT_TUI_BG_PREFIX}${frame}\n`);
+  };
+  const done = globalAgentRegistry.onTaskDone(emit);
+  const timer = setInterval(emit, 250);
+  timer.unref();
+  emit();
+  return {
+    beginTurn() { emit(); },
+    observeToolResult(name: string, args: Record<string, unknown>, result: unknown) {
+      if (name !== 'Agent' || args.run_in_background !== true) return;
+      if (!result || typeof result !== 'object') return;
+      const spawned = result as { taskId?: unknown; background?: unknown };
+      if (spawned.background !== true || typeof spawned.taskId !== 'string') return;
+      unregisteredPromises.add(spawned.taskId);
+      emit();
+    },
+    emit,
+    dispose() { clearInterval(timer); done.dispose(); },
+  };
+}
 
 /** REPL public entry — wires whichever input source the caller chose
  *  to the shared turn dispatcher. The CLI command (in src/index.ts)
@@ -141,6 +181,11 @@ function buildReplTools(): {
   })) {
     specs.push(spec);
   }
+  // The ops ledger is a runtime family, so the native-only catalog above
+  // cannot advertise it. Keep the REPL surface limited to seat mail.
+  const ledger = require('../skills/tools/ops-ledger.js') as typeof import('../skills/tools/ops-ledger.js');
+  const ask = require('../skills/tools/msg-ask.js') as typeof import('../skills/tools/msg-ask.js');
+  specs.push(ledger.buildMsgListTool(), ledger.buildMsgPostTool(), ask.buildMsgAskTool(), ledger.buildMsgAckTool());
   const bashMod = require('../skills/tools/index.js') as typeof import('../skills/tools/index.js');
   specs.push(bashMod.buildBashTool());
   dispatchByName.set('Bash', async (args) => bashMod.dispatchBash(args, { cwd: process.cwd() }));
@@ -149,6 +194,7 @@ function buildReplTools(): {
     try {
       const direct = dispatchByName.get(name);
       if (direct) return await direct(args);
+      if (isReplMessageTool(name)) return await dispatchReplMessageTool(name, args);
       return await sr.dispatchSessionRuntimeTool(name, args, {
         signal: undefined,
         userText: '',
@@ -192,6 +238,59 @@ function buildAgentSystemPrompt(
   }
 }
 
+/**
+ * 새 TUI REPL 의 시스템 프롬프트 «한 곳» — 범용 preamble ⊕ 자리 부트 카드(TUI-SESSION-BOOT).
+ *
+ * 새 TUI(`src/tui/entry.ts` → `src/tui-client/local-chat-turn.ts`)는 `elanous repl --json --stdin-jsonl`
+ * 자식으로 턴을 돌린다. 그래서 legacy 대시보드의 `buildDashboardTurnPreamble` 부트 경로는 지나지 않고
+ * «여기»만 지난다 — 자리 역할·미읽음 수를 첫 턴의 모델 입력에 싣는 자리도 여기 하나뿐이다.
+ *
+ * 카드는 `dashboard/seat-boot-preamble.ts` 의 `buildSeatBootSystemMessages` 를 그대로 쓴다(새 주입 로직 없음).
+ * 자리 판정이 서면 카드 한 장(대화마다 한 번 만든 같은 문면) · 자리가 아니면 빈 배열이라 주입 0건이다.
+ * 도구 표면이 꺼져 있으면(`enabledToolNames === undefined`) 종전처럼 범용 preamble 은 빠지고 카드만 남는다.
+ */
+export function buildReplSystemPrompt(ctx: {
+  cfg: UserConfig;
+  /** 도구 표면이 꺼져 있으면 undefined — 그때도 자리 부트 카드는 실린다. */
+  enabledToolNames: readonly string[] | undefined;
+  cwd: string;
+  sessionId?: string | undefined;
+  /** 시험·임베디드 호출부용 시임 — 기본은 실제 홈·msg 원장·process.env. */
+  seatBootDeps?: SeatBootDeps | undefined;
+}): string | undefined {
+  const base = ctx.enabledToolNames === undefined
+    ? undefined
+    : buildAgentSystemPrompt(ctx.cfg, ctx.enabledToolNames);
+  const card = buildSeatBootCardText(ctx);
+  if (card.length === 0) return base;
+  return base === undefined || base.length === 0 ? card : `${base}\n\n${card}`;
+}
+
+/** 자리 부트 카드 문면(system 메시지 0~1개를 이어 붙인 것). 자리가 아니면 ''. */
+function buildSeatBootCardText(ctx: {
+  cwd: string;
+  sessionId?: string | undefined;
+  seatBootDeps?: SeatBootDeps | undefined;
+}): string {
+  try {
+    return buildSeatBootSystemMessages(
+      { cwd: ctx.cwd, ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}) },
+      ctx.seatBootDeps ?? {},
+    )
+      .map((message) => (typeof message.content === 'string' ? message.content : ''))
+      .filter((text) => text.length > 0)
+      .join('\n\n');
+  } catch (error) {
+    // 카드 오류가 턴을 막지는 않지만, 조용히 자리 문맥을 잃지 않도록 실패를 기록한다.
+    debug.log('dashboard.seat-boot', 'card-error', {
+      cwd: ctx.cwd,
+      sessionId: ctx.sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return '';
+  }
+}
+
 function loadAttachment(rawPath: string, baseDir: string): PendingAttachment | null {
   const resolved = isAbsolute(rawPath) ? rawPath : resolvePath(baseDir, rawPath);
   if (!existsSync(resolved)) {
@@ -224,10 +323,12 @@ async function runOneTurn(
   tools: ReturnType<typeof buildReplTools> | undefined,
   systemPrompt: string | undefined,
   jsonOutput: boolean,
+  nextTuiDelivery?: { pending: PendingTaskNotification[] },
+  onJsonDelta?: (delta: string) => void,
 ): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null }> {
   const startedAt = Date.now();
   const replyChunks: string[] = [];
-  const userImages = pendingAttachments.length > 0 ? pendingAttachments.map(a => a.block) : undefined;
+  const userImages = pendingAttachments.length > 0 ? pendingAttachments.map(a => a.block) : [];
   if (!jsonOutput) {
     process.stdout.write('  ');
   }
@@ -238,14 +339,29 @@ async function runOneTurn(
     const { applyToolPolicy } = require('../tool-runtime/tool-policy.js') as typeof import('../tool-runtime/tool-policy.js');
     replToolSpecs = applyToolPolicy(replToolSpecs, { deny: cfg.chat.toolDeny }) ?? replToolSpecs;
   }
+  // The classic dashboard has its own turn preamble. The next TUI's sticky
+  // REPL must deliver this child's completed tasks on the next parent turn.
+  let nextTuiNotifications = '';
+  if (nextTuiDelivery) {
+    const { globalTaskNotificationQueue, renderTaskNotificationsXml } =
+      require('../agent/task-notification.js') as typeof import('../agent/task-notification.js');
+    nextTuiDelivery.pending.push(...globalTaskNotificationQueue.drain());
+    nextTuiNotifications = renderTaskNotificationsXml(nextTuiDelivery.pending);
+  }
+  // Completion output is untrusted task data. Carry it as a user-role content
+  // block for this call, leaving the human prompt and system prompt intact.
+  if (nextTuiNotifications) userImages.unshift({ type: 'text', text: nextTuiNotifications });
   const result = await runTurn({
     userConfig: cfg,
     sessionId,
     userText,
     systemPrompt,
-    userImages,
+    userImages: userImages.length > 0 ? userImages : undefined,
     onDelta: (d) => {
-      if (jsonOutput) replyChunks.push(d);
+      if (jsonOutput) {
+        replyChunks.push(d);
+        onJsonDelta?.(d);
+      }
       else process.stdout.write(d);
     },
     tools: replToolSpecs,
@@ -272,6 +388,8 @@ async function runOneTurn(
       }
     },
   });
+  // A failed turn keeps the buffered notifications for the next JSONL prompt.
+  nextTuiDelivery?.pending.splice(0);
   const reply = jsonOutput ? replyChunks.join('') : '';
   const logPath = (() => {
     try {
@@ -477,10 +595,24 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
   }
   const sessionIdRef = { current: session.id };
 
-  const tools = opts.enableTools ? buildReplTools() : undefined;
-  const systemPrompt = tools
-    ? buildAgentSystemPrompt(cfg, tools.specs.map(s => s.name))
-    : undefined;
+  const nextTuiDelivery = process.env.ELANOUS_NEXT_TUI_BG_STATUS === '1'
+    ? { pending: [] as PendingTaskNotification[] } : undefined;
+  const backgroundBridge = createNextTuiBackgroundBridge(session.id, () => nextTuiDelivery?.pending.length ?? 0);
+  const baseTools = opts.enableTools ? buildReplTools() : undefined;
+  const tools = baseTools && backgroundBridge ? {
+    ...baseTools,
+    dispatch: async (name: string, args: Record<string, unknown>) => {
+      const result = await baseTools.dispatch(name, args);
+      backgroundBridge.observeToolResult(name, args, result);
+      return result;
+    },
+  } : baseTools;
+  const systemPrompt = buildReplSystemPrompt({
+    cfg,
+    enabledToolNames: tools?.specs.map(s => s.name),
+    cwd: process.cwd(),
+    sessionId: session.id,
+  });
   const pendingAttachments: PendingAttachment[] = [];
 
   if (!opts.jsonOutput) {
@@ -548,6 +680,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         ui.header(`turn ${turnId}${turn.rotate ? ` · ${turn.rotate}` : ''}`);
         console.log(`  ❯ ${turn.prompt}`);
       }
+      backgroundBridge?.beginTurn();
       const result = await runOneTurn(
         cfg,
         sessionIdRef.current,
@@ -556,7 +689,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         tools,
         systemPrompt,
         opts.jsonOutput,
+        nextTuiDelivery,
       );
+      backgroundBridge?.emit();
       const failures = applyAsserts(result.reply, turn.asserts, sc.defaults?.asserts, turnId);
       if (opts.jsonOutput) {
         const out = {
@@ -577,7 +712,10 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       }
       assertFailures += failures.length;
     }
-    if (opts.exitAfterScenario) return assertFailures > 0 ? 2 : 0;
+    if (opts.exitAfterScenario) {
+      backgroundBridge?.dispose();
+      return assertFailures > 0 ? 2 : 0;
+    }
   } // end if (scriptedScenario)
 
   // Phase B — interactive (TTY) or JSONL stdin (pipe).
@@ -608,15 +746,29 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         const att = loadAttachment(ap, process.cwd());
         if (att) turnAttachments.push(att);
       }
-      const result = await runOneTurn(
-        cfg,
-        sessionIdRef.current,
-        turn.prompt,
-        turnAttachments,
-        tools,
-        systemPrompt,
-        true, // JSONL stream → always JSON output
-      );
+      backgroundBridge?.beginTurn();
+      let result: Awaited<ReturnType<typeof runOneTurn>>;
+      try {
+        result = await runOneTurn(
+          cfg,
+          sessionIdRef.current,
+          turn.prompt,
+          turnAttachments,
+          tools,
+          systemPrompt,
+          true, // JSONL stream → always JSON output
+          nextTuiDelivery,
+          process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
+            ? (delta) => { process.stdout.write(`${JSON.stringify({ event: 'delta', turnId: turn.id, text: delta })}\n`); }
+            : undefined,
+        );
+      } catch (error) {
+        if (!backgroundBridge) throw error;
+        backgroundBridge.emit();
+        console.log(JSON.stringify({ sessionId: sessionIdRef.current, error: error instanceof Error ? error.message : String(error) }));
+        continue;
+      }
+      backgroundBridge?.emit();
       const failures = applyAsserts(result.reply, turn.asserts, undefined, turn.id ?? 't?');
       const out = {
         turnId: turn.id ?? null,
@@ -630,6 +782,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       };
       console.log(JSON.stringify(out));
     }
+    backgroundBridge?.dispose();
     return 0;
   }
 
@@ -709,6 +862,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
     }
     // Ordinary prompt.
     const turnAttachments = pendingAttachments.splice(0);
+    backgroundBridge?.beginTurn();
     await runOneTurn(
       cfg,
       sessionIdRef.current,
@@ -717,10 +871,13 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       tools,
       systemPrompt,
       opts.jsonOutput,
+      nextTuiDelivery,
     );
+    backgroundBridge?.emit();
     if (exitRequested) break;
     rl.prompt();
   }
+  backgroundBridge?.dispose();
   return 0;
 }
 

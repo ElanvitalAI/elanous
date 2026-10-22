@@ -337,7 +337,13 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     executorResult = await executeNextAction(action, {
       mode: delivery ? (deps.mode ?? 'shadow') : liveRetry ? 'live' : 'shadow',
       command: deps.command ?? (async () => { throw new Error('task-agent shadow path must not run commands'); }),
-      observe: (_event, data) => { wouldDo = data.reason; },
+      observe: (event, data) => {
+        wouldDo = data.reason;
+        // Keep new denominator rows out of the legacy task-agent/action aggregate.
+        if (event !== 'task-agent.entrance-denominator') return;
+        try { (deps.log ?? ((category, name, row) => debug.log(category, name, row)))('task-agent', 'entrance-denominator', { ...data }); }
+        catch { /* Observation must not alter the selected move. */ }
+      },
       ...(liveRetry ? { liveMoves, retryLaunches, loadGate: deps.loadGate } : {}),
     });
     if (liveRetry && executorResult === 'done' && route) {

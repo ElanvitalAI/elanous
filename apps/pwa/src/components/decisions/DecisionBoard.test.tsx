@@ -160,3 +160,82 @@ test('409 and 404 stay on their respective cards while failed reads do not becom
   expect(text(failed)).toContain('못 읽음 · decisions list failed: 503');
   expect(text(failed)).not.toContain('열린 결정이 없습니다');
 });
+
+test('OP filter keeps only decisions raised by OP and toggling off restores the full list', async () => {
+  const cards = [item('op-1'), item('op-2'), { ...item('tc-1'), raisedBy: { agent: 'TC', track: 'TOX' } }];
+  const root = await mount(async (_path, init) => init?.method === 'POST' ? json({ decidedAt: '2026-10-07T00:00:00Z' }) : json({ decisions: cards }));
+  expect(root.findAllByType('article')).toHaveLength(3);
+  await act(async () => { button(root, 'OP 거르기').props.onClick(); });
+  expect(root.findAllByType('article').map(node => node.props['aria-label'])).toEqual(['결정 op-1', '결정 op-2']);
+  expect(button(root, 'OP 거르기').props['aria-pressed']).toBe(true);
+  await act(async () => { button(root, 'OP 거르기').props.onClick(); });
+  expect(root.findAllByType('article')).toHaveLength(3);
+  expect(button(root, 'OP 거르기').props['aria-pressed']).toBe(false);
+});
+
+test('bulk decision posts the recommendation for all eighteen visible pending cards', async () => {
+  const cards = Array.from({ length: 18 }, (_, index) => item(`bulk-${index + 1}`));
+  const posts: Array<{ path: string; body: { choice: string } }> = [];
+  const root = await mount(async (path, init) => {
+    if (init?.method === 'POST') { posts.push({ path, body: JSON.parse(String(init.body)) as { choice: string } }); return json({ decidedAt: '2026-10-07T00:00:00Z' }); }
+    return json({ decisions: cards });
+  });
+  await act(async () => { button(root, '권고대로 일괄 결정').props.onClick(); });
+  expect(posts).toHaveLength(18);
+  expect(new Set(posts.map(post => post.path)).size).toBe(18);
+  expect(new Set(posts.map(post => post.path))).toEqual(new Set(cards.map(card => `/v1/decisions/${card.id}/decide`)));
+  expect(posts.every(post => post.body.choice === 'a')).toBe(true);
+  expect(root.findAllByType('article')).toHaveLength(0);
+  expect(text(root)).toContain('권고대로 18건을 일괄 결정했습니다');
+});
+
+test('OP filter control stays visible for empty results and filter changes clear bulk re-confirmation', async () => {
+  const cards = [{ ...item('tc-only'), raisedBy: { agent: 'TC', track: 'TOX' } },
+    { ...item('irreversible', true), raisedBy: { agent: 'TC', track: 'TOX' } }];
+  const posts: unknown[] = [];
+  const root = await mount(async (_path, init) => {
+    if (init?.method === 'POST') { posts.push(init.body); return json({ decidedAt: '2026-10-07T00:00:00Z' }); }
+    return json({ decisions: cards });
+  });
+  await act(async () => { button(root, '권고대로 일괄 결정').props.onClick(); });
+  expect(text(root.findByProps({ role: 'status' }))).toContain('되돌릴 수 없는 결정 1건 포함');
+  await act(async () => { button(root, 'OP 거르기').props.onClick(); });
+  expect(button(root, 'OP 거르기').props['aria-pressed']).toBe(true);
+  expect(text(root)).toContain('OP가 올린 열린 결정이 없습니다.');
+  expect(button(root, '권고대로 일괄 결정').props.disabled).toBe(true);
+  await act(async () => { button(root, 'OP 거르기').props.onClick(); });
+  await act(async () => { button(root, '권고대로 일괄 결정').props.onClick(); });
+  expect(posts).toHaveLength(0);
+  expect(text(root.findByProps({ role: 'status' }))).toContain('되돌릴 수 없는 결정 1건 포함');
+});
+
+test('bulk decision over irreversible cards waits for one explicit re-confirmation', async () => {
+  const posts: unknown[] = [];
+  const root = await mount(async (_path, init) => {
+    if (init?.method === 'POST') { posts.push(JSON.parse(String(init.body))); return json({ decidedAt: '2026-10-07T00:00:00Z' }); }
+    return json({ decisions: [item('irrev', true)] });
+  });
+  await act(async () => { button(root, '권고대로 일괄 결정').props.onClick(); });
+  expect(posts).toHaveLength(0);
+  expect(text(root.findByProps({ role: 'status' }))).toContain('되돌릴 수 없는 결정 1건 포함');
+  await act(async () => { button(root, '권고대로 일괄 결정').props.onClick(); });
+  expect(posts).toEqual([{ choice: 'a' }]);
+  expect(root.findAllByType('article')).toHaveLength(0);
+});
+
+test('individual decision clears bulk re-confirmation after changing its target set', async () => {
+  const cards = [item('first', true), item('second', true)];
+  const posts: string[] = [];
+  const root = await mount(async (path, init) => {
+    if (init?.method === 'POST') { posts.push(path); return json({ decidedAt: '2026-10-07T00:00:00Z' }); }
+    return json({ decisions: cards });
+  });
+  await act(async () => { button(root, '권고대로 일괄 결정').props.onClick(); });
+  expect(text(root.findByProps({ role: 'status' }))).toContain('되돌릴 수 없는 결정 2건 포함');
+  await act(async () => { root.findAllByType('article')[0]!.findAllByType('button')[0]!.props.onClick(); });
+  await act(async () => { button(root, '예, 결정').props.onClick(); });
+  expect(posts).toEqual(['/v1/decisions/first/decide']);
+  await act(async () => { button(root, '권고대로 일괄 결정').props.onClick(); });
+  expect(posts).toHaveLength(1);
+  expect(text(root.findByProps({ role: 'status' }))).toContain('되돌릴 수 없는 결정 1건 포함');
+});

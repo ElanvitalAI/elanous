@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -6,6 +7,7 @@ import { aggregateGateTestShards } from './shard-aggregate.js';
 import { maxAutomaticShardCount, runBunShard, runBunShardWithSpawn, runShardedGateTests, SHARD_FAILURE_TAIL_BYTES, selfGateShardTimeoutMs, writeShardFailureEvidence, type ShardProcess } from './shard-run.js';
 import { GATE_SPAWN_LANE_FILES, isGateSpawnLaneFile } from './spawn-lane-files.js';
 import { planFixedGateTestShards, type GateTestShard } from './shard-plan.js';
+import { withFakeBins, type FakeBinSpec } from '../ux-sim/fake-bin.js';
 
 const xml = (files: readonly string[], failing: readonly string[]) => `<testsuites tests="${files.length}">`
   + files.map((file) => `<testsuite file="${file}" tests="1" failures="${failing.includes(file) ? 1 : 0}">`
@@ -163,6 +165,92 @@ test('each incomplete shard records the final child exit and diagnostic after re
   expect(result.aggregate).toEqual({ status: 'unmeasured', retryShardIds: ['shard-1'] });
   expect(result.unmeasuredByShard?.['shard-1']).toContain('current: exit 1, signal none, JUnit missing; stderr: ENOSPC in /tmp');
   expect(result.unmeasuredByShard?.['shard-1']).toContain('baseline: exit 0, signal none, JUnit present');
+});
+
+test('a baseline worktree-add failure carries its git stderr tail into every unmeasured shard reason', () => {
+  const files = ['test/a.test.ts'];
+  const run: ShardProcess = (_cwd, selected) => ({ exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1 });
+  const baseline = () => ({
+    status: 'unknown' as const, unknownReason: 'infrastructure-failure' as const, childResponsibility: 'none' as const,
+    log: 'baseline worktree-add-failed (code 128, elapsed 90900ms, limit 300000ms, target /tmp/b, base origin/main@0123456789ab)',
+    gitStderrTail: 'fatal: unable to write new index file',
+  });
+  const result = runShardedGateTests('/head', files, 'HEAD', 1, run,
+    baseline as unknown as typeof import('../self-implement/gate-baseline.js').withBaselineWorktree, 8);
+  expect(result.aggregate.status).toBe('unmeasured');
+  expect(result.baselineStderrTail).toBe('fatal: unable to write new index file');
+  expect(result.unmeasuredByShard?.['shard-1']).toBe('baseline worktree: baseline worktree-add-failed (code 128, elapsed 90900ms, limit 300000ms, target /tmp/b, base origin/main@0123456789ab) · git stderr: fatal: unable to write new index file');
+});
+
+describe('shared baseline worktree (--shards ≥2) · real withBaselineWorktree ⊕ fake git worktree add', () => {
+  // Real git subprocesses (rev-parse · worktree list) can exceed Bun's 5 s default under gate-pod load — per test, not file-wide.
+  const GIT_TIMEOUT_MS = 60_000;
+  const realGit = Bun.which('git');
+  const sh = (cwd: string, ...args: string[]) => {
+    const result = spawnSync(realGit!, args, { cwd, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  const repo = () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'shard-add-stderr-'));
+    sh(cwd, 'init', '-q');
+    sh(cwd, 'config', 'user.email', 'shard@example.test');
+    sh(cwd, 'config', 'user.name', 'Shard Test');
+    writeFileSync(join(cwd, 'a.txt'), 'a\n');
+    sh(cwd, 'add', 'a.txt');
+    sh(cwd, 'commit', '-qm', 'base');
+    return cwd;
+  };
+  const passing: ShardProcess = (_cwd, selected) => ({ exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1 });
+  const files = ['test/a.test.ts', 'test/b.test.ts'];
+  const failWith = async (spec: FakeBinSpec) => {
+    if (!realGit) throw new Error('git unavailable');
+    const cwd = repo();
+    try {
+      const head = sh(cwd, 'rev-parse', 'HEAD');
+      const result = await withFakeBins({ git: { whenArgsStartWith: ['worktree', 'add'], otherwise: realGit, ...spec } },
+        () => runShardedGateTests(cwd, files, 'HEAD', 2, passing, undefined, 8, { fixedDistribution: true }));
+      return { head, result };
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  };
+
+  test('stderr present: every shard reason names target, base@sha12 and the git stderr tail', async () => {
+    const { head, result } = await failWith({ exitCode: 128, stderr: "fatal: could not create leading directories of '/tmp/x/.git': Resource temporarily unavailable\n" });
+    expect(result.aggregate.status).toBe('unmeasured');
+    expect(Object.keys(result.unmeasuredByShard ?? {})).toEqual(['shard-1', 'shard-2']);
+    for (const reason of Object.values(result.unmeasuredByShard ?? {})) {
+      expect(reason).toMatch(/^baseline worktree: baseline worktree-add-failed \(code 128, elapsed \d+ms, limit \d+ms, target \S*elanous-gate-baseline-\S+, base HEAD@[0-9a-f]{12}\) · git stderr: fatal: could not create leading directories/);
+      expect(reason).toContain(`base HEAD@${head.slice(0, 12)}`);
+    }
+    expect(result.baselineStderrTail).toBe("fatal: could not create leading directories of '/tmp/x/.git': Resource temporarily unavailable");
+  }, GIT_TIMEOUT_MS);
+
+  test('killed without stderr: the reason still names target and base, and says the stderr was empty with the signal', async () => {
+    const { head, result } = await failWith({ killSignal: 'KILL' });
+    expect(result.aggregate.status).toBe('unmeasured');
+    const reasons = Object.values(result.unmeasuredByShard ?? {});
+    expect(reasons).toHaveLength(2);
+    for (const reason of reasons) {
+      expect(reason).toMatch(/^baseline worktree: baseline worktree-add-signal-SIGKILL \(code null, elapsed \d+ms, limit \d+ms, target \S*elanous-gate-baseline-\S+, base HEAD@[0-9a-f]{12}\) · git stderr: \(비었음 · signal=SIGKILL · errorCode=none\)$/);
+      expect(reason).toContain(`base HEAD@${head.slice(0, 12)}`);
+    }
+    expect(result.baselineStderrTail).toBe('(비었음 · signal=SIGKILL · errorCode=none)');
+  }, GIT_TIMEOUT_MS);
+
+  test('success path is unchanged: no stderr part, no baselineStderrTail', () => {
+    if (!realGit) throw new Error('git unavailable');
+    const cwd = repo();
+    try {
+      const result = runShardedGateTests(cwd, files, 'HEAD', 2, passing, undefined, 8, { fixedDistribution: true });
+      expect(result.aggregate.status).not.toBe('unmeasured');
+      expect(result.baselineStderrTail).toBeUndefined();
+      expect(result.unmeasuredByShard).toBeUndefined();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, GIT_TIMEOUT_MS);
 });
 
 test('large spawn files can expand beyond the normal three spawn bundles without mixing lanes', () => {

@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { KgsSqliteStore } from '../knowledge/kgs/sqlite-store.js';
 import { createPack } from '../knowledge/kgs/pack.js';
-import { buildCliAgentTools } from './agent-cli.js';
+import { buildCliAgentTools, runChatTurnCli } from './agent-cli.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleOnboardingRefusal, OnboardingRefusedError } from '../onboarding.js';
@@ -307,6 +307,61 @@ describe('agent CLI extraction', () => {
     expect(index.indexOf('registerAgentCommands(program);')).toBeLessThan(index.indexOf(".command('local')"));
     expect(index).not.toMatch(/\.command\('(agent|registry|tier)'\)/);
     expect(agent).not.toMatch(/from ['"]\.\.\/index\.js['"]/);
-    expect(index).toContain("export { runChatTurnCli, buildCliAgentTools, setCliAgentDispatchForTesting");
+    // 📏 10-22: #29738(필요할 때만 등록기 적재)이 정적 재수출을 lazy 래퍼(export const … = …import('./cli/agent-cli.js'))로 바꿨다 — 세 이름이 그대로 index 에서 나가는지 문다.
+    for (const name of ['runChatTurnCli', 'buildCliAgentTools', 'setCliAgentDispatchForTesting']) {
+      expect(index).toMatch(new RegExp(`export (?:const ${name}\\b|\\{[^}]*\\b${name}\\b)`));
+    }
   });
+});
+
+
+test('CLI goal-loop includes RFC-first discipline before the tool/model turn for a new-project request', () => {
+  const home = mkdtempSync(join(tmpdir(), 'elanous-cli-rfc-first-'));
+  const stateDir = join(home, '.elanous-test');
+  const capturePath = join(home, 'turn.json');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+    onboarding: { completed: true },
+    llm: { provider: 'auto', model: '', memoryJudge: { enabled: false } },
+  }));
+  const request = '빈 저장소에서 책 기록 CLI를 만들어 줘. 책 제목과 저자를 추가하고 목록을 보고 읽음 상태를 바꾸고 삭제할 수 있게 해 줘. JSON 파일에 저장하고 시험과 실행 안내도 포함해 줘.';
+  const script = `
+    const { writeFileSync } = await import('node:fs');
+    process.argv = ['bun', 'elanous', '--test=' + process.env.TEST_STATE_DIR,
+      'chat', '--new', '--json', '--tools', '--goal-loop', ${JSON.stringify(request)}];
+    const { setCliRunTurnForTesting } = await import(${JSON.stringify(new URL('./agent-cli.ts', import.meta.url).href)});
+    setCliRunTurnForTesting(async (turn) => {
+      writeFileSync(process.env.TEST_CAPTURE_PATH, JSON.stringify({
+        systemPrompt: turn.systemPrompt,
+        toolNames: turn.tools?.map((tool) => tool.name) ?? [],
+        goalLoop: turn.goalLoop ?? false,
+      }));
+      return { text: 'RFC 초안을 제시하고 승인을 기다립니다.', provider: 'test', model: 'test',
+        meta: { id: turn.sessionId }, usedTokens: 0, droppedMessages: 0, memoryIds: [] };
+    });
+    const { program } = await import(${JSON.stringify(new URL('../index.ts', import.meta.url).href)});
+    await program.parseAsync(process.argv);
+  `;
+  try {
+    const result = spawnSync(process.execPath, ['-e', script], {
+      cwd: root,
+      env: { ...process.env, HOME: home, ELANOUS_CONFIG_DIR: stateDir,
+        ELANOUS_STATE_DIR: stateDir, NODE_ENV: 'test', ELANOUS_TEST_FAKE_LLM: '0',
+        TEST_STATE_DIR: stateDir, TEST_CAPTURE_PATH: capturePath },
+      encoding: 'utf8', timeout: 30_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const turn = JSON.parse(readFileSync(capturePath, 'utf8')) as {
+      systemPrompt: string; toolNames: string[]; goalLoop: boolean;
+    };
+    expect(turn.systemPrompt.includes('# 새 프로젝트 구현 요청 — RFC 먼저')).toBe(true);
+    expect(turn.systemPrompt.includes('앱 코드·프로젝트 설정을 쓰거나 시험을 실행하기 전에')).toBe(true);
+    expect(turn.systemPrompt.includes('명시적 승인을 요청하세요')).toBe(true);
+    expect(turn.systemPrompt.includes('승인 전에는 애플리케이션 코드·설정을 만들거나 시험을 실행하지 마세요')).toBe(true);
+    expect(turn.toolNames.length).toBeGreaterThan(0);
+    expect(turn.goalLoop).toBe(true);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });

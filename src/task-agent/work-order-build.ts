@@ -6,6 +6,7 @@ export interface BuildWorkOrderInput {
   lifeId?: string;
   priority?: string;
   peers?: string;
+  boundary?: string;
 }
 
 /** Build the normalized nine-field core from already-grounded inputs; no CLI, filesystem, or launch side effects. */
@@ -16,6 +17,7 @@ export function buildWorkOrder(input: BuildWorkOrderInput): WorkOrder {
     version: input.version,
     priority: input.priority,
     peers: input.peers,
+    boundary: input.boundary,
   }));
   if (!parsed.ok) throw new Error(parsed.reason);
   return parsed.order;

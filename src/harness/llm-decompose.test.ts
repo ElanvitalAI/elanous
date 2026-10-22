@@ -137,7 +137,11 @@ describe('llmDecomposeSteps', () => {
       const callable: DecomposeCallable = async (inp) => { seenPrompts.push(inp.prompt); return { text: validProposal }; };
       await llmDecomposeSteps('기능 추가', callable, { promptProfile: 'goal-author-coarse' });
       await llmDecomposeSteps('기능 추가', callable);
-      expect(seenPrompts[0]).toContain('Goal-author coarse slicing');
+      // #29987 replaced the old coarse-by-count wording with size-bounded slices.
+      // Keep asserting both the profile-specific contract and its absence on the default path.
+      expect(seenPrompts[0]).toContain('Split by slice size, not a target number of slices');
+      expect(seenPrompts[0]).toContain('Goal-author size-bounded slicing');
+      expect(seenPrompts[1]).not.toContain('Goal-author size-bounded slicing');
       const observations = logs.filter((log) => log.category === 'harness.llm-decompose' && log.event === 'completed');
       expect(observations).toHaveLength(2);
       expect(observations[0]?.data).toEqual(expect.objectContaining({ promptProfile: 'goal-author-coarse' }));

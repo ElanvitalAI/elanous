@@ -4,6 +4,7 @@ import {
   cachedSelfAmbientBaseParts,
   refreshSelfAmbientCache,
   SELF_AMBIENT_FRESH_MS,
+  selfAmbientKeepWarmIntervalMs,
   SELF_AMBIENT_STALE_MAX_MS,
   type SelfAmbientCacheDeps,
 } from './self-ambient-cache.js';
@@ -33,6 +34,13 @@ function harness(start = 1_000_000) {
 
 describe('self-ambient cache (TUI turn path)', () => {
   afterEach(() => { _resetSelfAmbientCacheForTest(); });
+
+  test('keep-warm cadence backs off after two idle minutes while retaining active freshness', () => {
+    expect(selfAmbientKeepWarmIntervalMs(0)).toBe(25_000);
+    expect(selfAmbientKeepWarmIntervalMs(119_999)).toBe(25_000);
+    expect(selfAmbientKeepWarmIntervalMs(120_000)).toBe(8 * 60_000);
+    expect(selfAmbientKeepWarmIntervalMs(10 * 60_000)).toBe(8 * 60_000);
+  });
 
   test('a warmed cache serves the turn without a synchronous scan, fresh or stale', async () => {
     const h = harness();

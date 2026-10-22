@@ -5,7 +5,7 @@ import { opSeatStatePath, readTrafficSignal } from '../seat-loop/traffic-signal.
 
 const SEATS = ['OP', 'MK', 'TC', 'UX'] as const;
 type Seat = typeof SEATS[number];
-export type HygieneCell = { id: string; owner?: string | null; status: string };
+export type HygieneCell = { id: string; owner?: string | null; status: string; title?: string };
 export type HygieneNotice = { to: Seat; key: string; body: string };
 export type HygieneDeps = {
   root: string;
@@ -45,7 +45,7 @@ export function starvingCycles(log: string): { reasons: Record<string, number> }
   return { reasons };
 }
 
-type HoldMeta = { id?: unknown; op?: unknown; reason?: unknown; until?: unknown };
+type HoldMeta = { id?: unknown; op?: unknown; reason?: unknown; until?: unknown; kind?: unknown; confirmedAt?: unknown; at?: unknown; title?: unknown };
 function holdMetadata(path: string): Map<string, HoldMeta> {
   const latest = new Map<string, HoldMeta>();
   for (const line of (readOptional(path) ?? '').split(/\r?\n/)) {
@@ -63,6 +63,10 @@ function untilTime(value: unknown): number | null {
   const compact = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(value);
   const time = compact ? Date.parse(`${compact[1]}-${compact[2]}-${compact[3]}T${compact[4]}:${compact[5]}:00+09:00`) : Date.parse(value);
   return Number.isFinite(time) ? time : null;
+}
+
+function confirmedTime(value: unknown): number | null {
+  return typeof value === 'string' && /^\d{12}$/.test(value) ? untilTime(value) : null;
 }
 
 export function inspectHoldHygiene(deps: HygieneDeps): HygieneNotice[] {
@@ -88,11 +92,25 @@ export function inspectHoldHygiene(deps: HygieneDeps): HygieneNotice[] {
     if (!SEATS.some(seat => seat === owner)) continue;
     const meta = metadata.get(cell.id);
     const reason = meta?.op === 'add' && typeof meta.reason === 'string' ? meta.reason.trim() : '';
-    const expiry = untilTime(meta?.until);
-    const expired = typeof meta?.until === 'string' && meta.until.trim() !== '' && (expiry === null || expiry <= deps.now.getTime());
-    if (reason && !expired) continue;
+    let attention = '';
+    if (meta?.kind === '손작업') {
+      const confirmed = confirmedTime(meta.confirmedAt ?? meta.at);
+      if (confirmed === null) attention = '재확인 시각 없음';
+      else if (deps.now.getTime() - confirmed >= 24 * 60 * 60_000) attention = '24h 재확인 지연';
+    } else if (meta?.kind === '재발사금지') {
+      if (typeof meta.title !== 'string' || !meta.title || typeof cell.title !== 'string' || !cell.title) attention = '제목 기준 확인 불가';
+      else if (cell.title !== meta.title) attention = '칸 제목 변경';
+    } else if (meta?.kind === '선행대기' || meta?.kind === undefined || meta?.kind === '') {
+      const expiry = untilTime(meta?.until);
+      if (expiry === null) attention = 'until 확인 불가';
+      else if (expiry <= deps.now.getTime()) attention = `until ${String(meta?.until)} 지남`;
+    } else attention = 'hold 종류 확인 불가';
+    if (reason && !attention) continue;
+    const guidance = meta?.kind === '손작업' ? '재확인 시각·사유를 판단해 OP에 알려 주세요.'
+      : meta?.kind === '재발사금지' ? '칸 제목과 기준 제목·사유를 대조해 OP에 알려 주세요.'
+        : '풀기/유지(사유·until)를 판단해 OP에 알려 주세요.';
     notices.push({ to: owner as Seat, key: `hold:${cell.id}:${owner}`,
-      body: `노랑 칸 ${cell.id} traffic hold: ${!reason ? '사유 없음' : `사유 ${reason}`} ${expired ? `· until ${String(meta?.until)} 지남` : ''}. 풀기/유지(사유·until)를 판단해 OP에 알려 주세요. 자동 해제하지 않습니다.` });
+      body: `노랑 칸 ${cell.id} traffic hold: ${!reason ? '사유 없음' : `사유 ${reason}`} ${attention ? `· ${attention}` : ''}. ${guidance} 자동 해제하지 않습니다.` });
   }
   return notices;
 }

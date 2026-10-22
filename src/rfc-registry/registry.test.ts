@@ -71,7 +71,7 @@ test('CLI list/show reads the same fixture RFC and items, without changing check
   expect(JSON.parse(shown.out)).toEqual(detail);
   expect(cli(root, 'rfc', 'show', 'RFC-9999').code).not.toBe(0);
   expect(existsSync(join(root, 'release/features.sqlite'))).toBe(false);
-});
+}, 120_000); // 📏 10-21: 실물 CLI spawn 셋 — 기본 5초는 부하 아래 넘친다(#29963 SKIP)
 
 test('existing checklist rows and gate remain unchanged by RFC reads', () => {
   const root = fixture();

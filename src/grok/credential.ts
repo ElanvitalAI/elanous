@@ -87,6 +87,8 @@ export interface GrokCredential {
   baseUrl: string;
   /** Bearer 값. ⛔ 로그·관측에 실지 마라. */
   token: string;
+  /** Expiry for the selected subscription scope; absent for API-key credentials. */
+  expiresAt?: string | null;
   /** 이 자격에 «반드시» 붙어야 하는 헤더(Authorization 제외). */
   headers: Record<string, string>;
   /** 관측용 — 값이 아니라 «출처»만. */
@@ -120,8 +122,10 @@ function readSubscriptionToken(
   }
   if (!parsed || typeof parsed !== 'object') return null;
 
-  let best: { token: string; expiresAt: string | null; userId: string | null; ms: number } | null = null;
-  for (const scope of Object.values(parsed as Record<string, unknown>)) {
+  type SubscriptionToken = { token: string; expiresAt: string | null; userId: string | null; ms: number };
+  let best: SubscriptionToken | null = null;
+  let hqMirror: SubscriptionToken | null = null;
+  for (const [scopeName, scope] of Object.entries(parsed as Record<string, unknown>)) {
     if (!scope || typeof scope !== 'object') continue;
     const s = scope as GrokAuthScope;
     if (typeof s.key !== 'string' || s.key.length === 0) continue;
@@ -133,9 +137,11 @@ function readSubscriptionToken(
       userId: typeof s.user_id === 'string' ? s.user_id : null,
       ms: Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms,
     };
+    if (scopeName === 'https://auth.x.ai::hq-mirror') hqMirror = cand;
     if (best === null || cand.ms > best.ms) best = cand;
   }
-  return best ? { token: best.token, expiresAt: best.expiresAt, userId: best.userId } : null;
+  const selected = hqMirror ?? best;
+  return selected ? { token: selected.token, expiresAt: selected.expiresAt, userId: selected.userId } : null;
 }
 
 /** 호스트 발급 문이 응답에 실을 access. user id 는 반환하지 않는다. */
@@ -302,6 +308,7 @@ function readGrokCredential(opts: {
         kind: 'subscription',
         baseUrl: GROK_SUBSCRIPTION_BASE_URL,
         token: sub.token,
+        expiresAt: sub.expiresAt,
         headers: grokSubscriptionHeaders({
           ...(opts.model ? { model: opts.model } : {}),
           userId: sub.userId,

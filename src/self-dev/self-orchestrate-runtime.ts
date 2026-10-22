@@ -329,17 +329,7 @@ type OrchestrateRunIdentityResolver = (input: { explicit?: string; inherited?: s
 type OrchestrateResumeDisposition = 'skip' | 'rerun' | 'rerun-duplicate-risk';
 type OrchestrateResumeDispositionClassifier<T> = (result: T) => OrchestrateResumeDisposition;
 
-/** `harness orchestrate` 와 `self orchestrate` 가 공유하는 `;;` goal 분리 규칙. */
-export function splitOrchestrateGoalTexts(parts: readonly string[]): string[] {
-  const joined = parts.join(' ');
-  return (joined.includes(';;') ? joined.split(';;') : parts).map((goal) => goal.trim()).filter(Boolean);
-}
-
-/** `harness orchestrate` 와 `self orchestrate` 가 공유하는 `;;` 요청 문자열 결합 규칙. */
-export function normalizeOrchestrateRequest(input: readonly string[] | string): string {
-  const joined = typeof input === 'string' ? input : input.join(' ');
-  return joined.replace(/;;/g, ' ').trim();
-}
+export { splitOrchestrateGoalTexts, normalizeOrchestrateRequest } from './orchestrate-cli-text.js';
 
 /** `harness orchestrate` 와 `self orchestrate` 가 공유하는 분해 준비 인자 조립 규칙. */
 export function buildOrchestrateDecomposePrepareArgs<

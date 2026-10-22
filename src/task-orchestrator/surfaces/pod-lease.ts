@@ -236,6 +236,10 @@ export interface ExternalGitHubProbe {
   githubHttps: boolean | null;
   measuredAt: string | null;
   reason: string | null;
+  /** Name of the disposable Pod for matching this reading with its Kubernetes logs. */
+  podName?: string;
+  /** Unmodified stdout from `kubectl logs` for this Pod (only present when readable). */
+  podLog?: string;
 }
 const DNS_CACHE_MS = 10 * 60_000;
 const DNS_STALE_OK_MS = 30 * 60_000;
@@ -261,9 +265,11 @@ export function probePoolGitHub(context: string, kubectl: PoolKubectl = leaseKub
       if (typeof record?.at !== 'number' || now() < record.at || now() - record.at >= 60_000) return null;
       if (typeof record.measuredAt !== 'string' || ![true, false].includes(record.externalDns as boolean) ||
           ![true, false, null].includes(record.githubHttps as boolean | null) ||
-          !(record.reason === null || typeof record.reason === 'string')) return null;
+          !(record.reason === null || typeof record.reason === 'string') ||
+          typeof record.podName !== 'string' || typeof record.podLog !== 'string') return null;
       return { externalDns: record.externalDns as boolean, githubHttps: record.githubHttps as boolean | null,
-        measuredAt: record.measuredAt, reason: record.reason as string | null };
+        measuredAt: record.measuredAt, reason: record.reason as string | null,
+        podName: record.podName, podLog: record.podLog };
     } catch { return null; }
   };
   const fresh = cached();
@@ -285,6 +291,7 @@ export function probePoolGitHub(context: string, kubectl: PoolKubectl = leaseKub
     const shared = cached();
     if (shared) return shared;
     const result = runPoolGitHubProbe(context, kubectl, new Date(now()).toISOString());
+    debug.log('pod.lease', 'github-egress-probe', { context, ...result });
     if (result.measuredAt !== null) {
       const temp = `${cache}.${randomUUID()}.tmp`;
       try { writeFileSync(temp, JSON.stringify({ ...result, at: now() }), { mode: 0o600 }); renameSync(temp, cache); }
@@ -300,16 +307,18 @@ export function probePoolGitHub(context: string, kubectl: PoolKubectl = leaseKub
 function runPoolGitHubProbe(context: string, kubectl: PoolKubectl, measuredAt: string): ExternalGitHubProbe {
   const name = `elanous-egress-${randomUUID().slice(0, 12)}`;
   const base = ['--context', context, '--request-timeout=15s'];
-  const unknown = (reason: string): ExternalGitHubProbe => ({ externalDns: null, githubHttps: null, measuredAt: null, reason });
   let created = false;
+  const unknown = (reason: string): ExternalGitHubProbe => ({ externalDns: null, githubHttps: null, measuredAt: null, reason,
+    ...(created ? { podName: name } : {}) });
   try {
     const manifest = JSON.stringify({ apiVersion: 'v1', kind: 'Pod', metadata: { name, namespace: 'elanous-test', labels: { 'elanous.probe': 'github-egress' } }, spec: {
       restartPolicy: 'Never', activeDeadlineSeconds: 35, automountServiceAccountToken: false,
       containers: [{ name: 'probe', image: 'busybox:1.36', command: ['sh', '-c',
-        'if nslookup github.com >/dev/null 2>&1; then echo EXTERNAL_DNS_OK; if wget -q -T 8 -O /dev/null https://github.com/; then echo GITHUB_HTTPS_OK; else echo GITHUB_HTTPS_FAILED; fi; else echo EXTERNAL_DNS_FAILED; fi'],
+        'if nslookup github.com 2>&1; then echo EXTERNAL_DNS_OK; if wget -T 8 -O /dev/null https://github.com/ 2>&1; then echo GITHUB_HTTPS_OK; else echo GITHUB_HTTPS_FAILED; fi; else echo EXTERNAL_DNS_FAILED; fi'],
       resources: { requests: { cpu: '0', memory: '16Mi' }, limits: { cpu: '100m', memory: '64Mi' } } }],
     } });
-    if (kubectl([...base, 'create', '-f', '-'], manifest).status !== 0) return unknown('probe create failed');
+    const createdPod = kubectl([...base, 'create', '-f', '-'], manifest);
+    if (createdPod.status !== 0) return unknown(`probe create failed${createdPod.stderr.trim() ? `: ${createdPod.stderr.trim().split('\n').pop()!.slice(0, 160)}` : ''}`);
     created = true;
     const waited = kubectl([...base, '-n', 'elanous-test', 'wait', '--for=jsonpath={.status.phase}=Succeeded', `pod/${name}`, '--timeout=25s']);
     const podResult = kubectl([...base, '-n', 'elanous-test', 'get', `pod/${name}`, '-o', 'json']);
@@ -327,10 +336,10 @@ function runPoolGitHubProbe(context: string, kubectl: PoolKubectl, measuredAt: s
     const httpsOk = markers.includes('GITHUB_HTTPS_OK');
     const httpsFail = markers.includes('GITHUB_HTTPS_FAILED');
     if (dnsFail && !dnsOk && !httpsOk && !httpsFail)
-      return { externalDns: false, githubHttps: null, measuredAt, reason: 'external DNS failed' };
+      return { externalDns: false, githubHttps: null, measuredAt, reason: 'external DNS failed', podName: name, podLog: logs.stdout };
     if (dnsOk && !dnsFail && httpsOk !== httpsFail)
-      return { externalDns: true, githubHttps: httpsOk, measuredAt, reason: httpsFail ? 'GitHub HTTPS failed' : null };
-    return unknown(waited.status === 0 ? 'probe output unavailable' : 'probe timeout');
+      return { externalDns: true, githubHttps: httpsOk, measuredAt, reason: httpsFail ? 'GitHub HTTPS failed' : null, podName: name, podLog: logs.stdout };
+    return { ...unknown(waited.status === 0 ? 'probe output unavailable' : 'probe timeout'), podLog: logs.stdout };
   } catch { return unknown('probe failed'); }
   finally {
     if (created) try { kubectl([...base, '-n', 'elanous-test', 'delete', `pod/${name}`, '--ignore-not-found=true', '--wait=false']); }

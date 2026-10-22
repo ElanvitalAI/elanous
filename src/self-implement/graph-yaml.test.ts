@@ -6,9 +6,13 @@ import {
   canonicalGraphJson, edgeMapOf, graphVersionHash, loadGraphTemplates, parseGraphTemplateYaml,
   type GraphNodeKind, type GraphTemplateSpec,
 } from './graph-yaml.js';
-import { compileGraphTemplate } from './graph-templates.js';
-import { FRONT_NODE_IDS } from '../self-dev/graph-front-nodes.js';
-import { JOURNEY_NODE_IDS } from '../self-dev/graph-journey-nodes.js';
+import { compileGraphTemplate, GRAPH_TEMPLATES_SOURCE, templateForGoalType } from './graph-templates.js';
+import { flattenGraphTemplate } from './graph-unit-resolver.js';
+import { validateUnitCalls } from '../graph-runner/runner.js';
+import { JOURNEY_NODE_IDS, journeyTemplate } from '../self-dev/graph-journey-nodes.js';
+import { journeySpec, readJourneyEdge } from '../self-dev/graph-journey-route.js';
+import { activeTemplate, resolveGraphAuthority } from './graph-authority.js';
+import { AUTHOR_OUTCOME_NODE_IDS, FRONT_NODE_IDS } from '../self-dev/graph-front-nodes.js';
 import { inspectPipelineGraph } from './pipeline-shape.js';
 import { PIPELINE_EDGES_BY_NODE, TERMINAL_STAGES_BY_NODE } from './pipeline-shape.js';
 
@@ -227,6 +231,63 @@ describe('RFC §5 0단계 — 로더 (⛔ 뿌리를 «인자»로)', () => {
     expect(Object.keys(result.templates).sort()).toEqual(['ad-loop', 'default-loop', 'document-loop', 'operate-loop', 'plan-loop', 'research-loop', 'self-implement']);
   });
 
+  test('four goal loops route the shared journey through real YAML and ARG-UNIT-LIB calls', () => {
+    const loaded = loadGraphTemplates(GRAPHS_DIR);
+    expect(loaded.errors).toEqual([]);
+    expect(GRAPH_TEMPLATES_SOURCE).toBe('yaml');
+    const types = ['research', 'document', 'operate'] as const;
+    for (const goalType of types) {
+      const graph = templateForGoalType(goalType);
+      const spec = loaded.templates[`${goalType}-loop`]!;
+      expect(graph?.graphId).toBe(spec.graphId);
+      expect(graph?.entryNode).toBe('intake');
+      expect(journeyTemplate('intake', goalType).graphId).toBe(spec.graphId);
+      const selected = activeTemplate(goalType, resolveGraphAuthority());
+      expect(selected === graph).toBe(true);
+      expect(journeySpec({}, spec, []).spec).toBe(spec);
+    }
+    const preserved = {
+      'research-loop': { version: 5, docsOnlyGateSkip: true, producer: 'investigate' },
+      'document-loop': { version: 1, docsOnlyGateSkip: true, producer: 'document-draft' },
+      'operate-loop': { version: 1, docsOnlyGateSkip: false, producer: 'operate-plan' },
+      'default-loop': { version: 3, docsOnlyGateSkip: undefined, producer: 'author' },
+    } as const;
+    for (const id of Object.keys(preserved) as (keyof typeof preserved)[]) {
+      const spec = loaded.templates[id]!;
+      const nodes = new Map(spec.nodes.map((node) => [node.nodeId, node]));
+      for (const node of ['intake', 'dispatch', 'pool-admit', 'freeze-check', 'merge', 'next-move']) {
+        const outgoing = spec.edges.filter((edge) => edge.from === node);
+        expect(outgoing).toHaveLength(1);
+        expect(outgoing[0]?.on).toBe('outcome');
+      }
+      expect(spec.version).toBe(preserved[id].version);
+      expect(spec.docsOnlyGateSkip).toBe(preserved[id].docsOnlyGateSkip);
+      expect(nodes.has(preserved[id].producer)).toBe(true);
+      expect(spec.entryNode).toBe('intake');
+      expect(readJourneyEdge('intake', 'direct', {}, { base: spec, overlays: [] })).toMatchObject({ source: 'graph', to: 'launch-gate' });
+      expect(readJourneyEdge('intake', 'queued', {}, { base: spec, overlays: [] })).toMatchObject({ source: 'graph', to: 'queue' });
+      expect(readJourneyEdge('pool-admit', 'admitted', {}, { base: spec, overlays: [] })).toMatchObject({ source: 'graph', to: 'dispatch-pod-unit' });
+      expect(readJourneyEdge('dispatch', 'fresh', {}, { base: spec, overlays: [] }).to)
+        .toBe(id === 'research-loop' ? 'investigate' : id === 'document-loop' ? 'document-draft' : id === 'operate-loop' ? 'operate-plan' : 'author');
+      expect(nodes.get('entry-unit')?.call).toBe('entry@1');
+      expect(nodes.get('dispatch-pod-unit')?.call).toBe('dispatch-pod@1');
+      expect(nodes.get('recover')?.call).toBe('recover@1');
+      for (const node of ['dispatch', 'freeze-check', 'hold', 'cleanup', 'result-parse', 'salvage', 'next-move']) {
+        expect(nodes.has(node)).toBe(true);
+      }
+      expect(inspectPipelineGraph(edgeMapOf(spec), spec.entryNode)).toEqual([]);
+      const graphPath = join(GRAPHS_DIR, `${id === 'default-loop' ? 'default' : id.split('-')[0]}-loop.yaml`);
+      expect([...validateUnitCalls(spec, graphPath).keys()].sort()).toEqual(['dispatch-pod-unit', 'entry-unit', 'recover']);
+      const flattened = flattenGraphTemplate(spec, graphPath);
+      expect(flattened.nodes.some((node) => node.nodeId === 'entry-unit__queue')).toBe(true);
+      expect(flattened.nodes.some((node) => node.nodeId === 'dispatch-pod-unit__credential-refresh')).toBe(true);
+      expect(flattened.nodes.some((node) => node.nodeId === 'recover__plan')).toBe(true);
+      const alternateRecoverEntries = new Set(['recover__request-review', 'recover__wait-retry', 'recover__human-review']);
+      expect(inspectPipelineGraph(edgeMapOf(flattened), flattened.entryNode)
+        .filter((defect) => defect.kind !== 'unreachable-node' || !alternateRecoverEntries.has(defect.node))).toEqual([]);
+    }
+  });
+
   test('implement·research 리뷰는 PR 본문 요약 계약을 선언한다', () => {
     const templates = loadGraphTemplates(GRAPHS_DIR).templates;
     const implementReview = templates['self-implement']?.nodes.find((node) => node.nodeId === 'review');
@@ -309,12 +370,13 @@ describe('RFC §5 1단계 — YAML 이 «코드 상수»와 같은가', () => {
     expect(pipeline.filter((n) => !yaml.has(n))).toEqual([]);            // 빠진 것 0
     const extra = [...yaml].filter((n) => !pipeline.includes(n)).sort();
     // ⭐ HARNESS-FULL-GRAPH(10-08) — 앞쪽 셋 ⊕ «여정 노드»(입구·배치·착지·실패 쪽)만 더할 수 있다.
-    expect(extra).toEqual([...FRONT_NODE_IDS, ...JOURNEY_NODE_IDS].sort());
+    // ⭐ GRAPH-AUTHOR-FAIL-EDGE — author 결과 노드(re-ground · needs-human)도 «이름 있는 목록»으로만 더한다.
+    expect(extra).toEqual([...FRONT_NODE_IDS, ...AUTHOR_OUTCOME_NODE_IDS, ...JOURNEY_NODE_IDS].sort());
   });
 
   test('노드마다 terminal_stages 가 TERMINAL_STAGES_BY_NODE 와 «같다»', () => {
     // ⛔ 앞쪽 셋은 이 코드 상수에 «없다» — 그 셋을 여기서 세면 「없는 키」를 읽는다.
-    const added: readonly string[] = [...FRONT_NODE_IDS, ...JOURNEY_NODE_IDS];
+    const added: readonly string[] = [...FRONT_NODE_IDS, ...AUTHOR_OUTCOME_NODE_IDS, ...JOURNEY_NODE_IDS];
     for (const node of implement.nodes.filter((n) => !added.includes(n.nodeId))) {
       const declared = [...(TERMINAL_STAGES_BY_NODE as Record<string, readonly string[]>)[node.nodeId]!].sort();
       expect({ node: node.nodeId, stages: [...(node.terminalStages ?? [])].sort() })
@@ -531,4 +593,43 @@ edges: [{ from: enqueue, to: done }]
     expect(missingPolicy.template).toBeUndefined();
     expect(missingPolicy.errors.some((issue) => issue.path === 'land.yaml/policy')).toBe(true);
   });
+});
+
+describe('HARNESS-FULL-GRAPH-LOOPS — checked-in loops walk under graph run --dry-run', () => {
+  // The four goal loops are harness templates (catalog-role recipes, `changed-files` edges, named terminals).
+  // `graph run --dry-run` must plan their declared success route instead of stopping before the first node.
+  const loops = [
+    { file: 'research-loop.yaml', graphId: 'research-loop' },
+    { file: 'document-loop.yaml', graphId: 'document-loop' },
+    { file: 'operate-loop.yaml', graphId: 'operate-loop' },
+    { file: 'default-loop.yaml', graphId: 'default-loop' },
+  ];
+  for (const loop of loops) {
+    test(`${loop.file} dry-run reaches landed without executing a node`, () => {
+      const temp = mkdtempSync(join(tmpdir(), `loop-dry-${loop.graphId}-`));
+      try {
+        const cli = Bun.spawnSync([process.execPath, join(GRAPHS_DIR, '..', 'bin/elanous.mjs'),
+          `--test=${join(temp, 'config')}`, 'graph', 'run', join(GRAPHS_DIR, loop.file), '--dry-run', '--json'],
+        { cwd: temp, env: { ...process.env, NODE_ENV: 'test', HOME: temp }, timeout: 120_000 });
+        const stderr = cli.stderr.toString();
+        expect(stderr).not.toContain('unsupported terminal node');
+        expect(cli.exitCode, stderr).toBe(0);
+        const state = JSON.parse(cli.stdout.toString()) as {
+          graphId: string; status: string; reason?: string; path: string[]; executed: number; dryRun: boolean;
+          nodes: Array<{ nodeId: string; executed: boolean; output?: unknown }>;
+        };
+        expect(state.graphId).toBe(loop.graphId);
+        expect(state.status).toBe('done');
+        expect(state.reason).toBe('landed');
+        expect(state.dryRun).toBe(true);
+        expect(state.executed).toBe(0);
+        expect(state.path[0]).toBe('intake');
+        expect(state.path.at(-1)).toBe('landed');
+        for (const node of ['entry-unit', 'dispatch', 'open-pr', 'freeze-check', 'merge', 'cleanup']) expect(state.path).toContain(node);
+        expect(state.nodes.every((node) => node.executed === false)).toBe(true);
+        const merge = state.nodes.find((node) => node.nodeId === 'merge');
+        expect(JSON.parse(String(merge?.output)).outcome).toBe('merged');
+      } finally { rmSync(temp, { recursive: true, force: true }); }
+    }, 150_000);
+  }
 });

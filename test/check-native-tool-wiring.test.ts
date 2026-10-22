@@ -54,7 +54,7 @@ describe('HT3 — native-tool wiring lint', () => {
   test('self-implement P2 — implementation catalog ID inventory', () => {
     const implementationCatalogEntries = nativeToolCatalog.slice(SELF_COGNITION_MCP_CATALOG_ENTRIES.length);
     const ids = implementationCatalogEntries.map(entry => entry.id);
-    expect(ids).toHaveLength(186);
+    expect(ids).toHaveLength(187);
     expect(new Set(ids).size).toBe(ids.length);
     expect(Object.keys(retiredCatalogIds).sort()).toEqual(['baselineIds', 'retiredIds']);
     expect(retiredCatalogIds.retiredIds).toHaveLength(18);
@@ -62,7 +62,11 @@ describe('HT3 — native-tool wiring lint', () => {
     expect(ids.filter(id => retiredCatalogIds.retiredIds.includes(id))).toEqual([]);
     expect(retiredCatalogIds.baselineIds).toHaveLength(204);
     expect(new Set(retiredCatalogIds.baselineIds).size).toBe(retiredCatalogIds.baselineIds.length);
-    expect([...ids, ...retiredCatalogIds.retiredIds].sort()).toEqual([...retiredCatalogIds.baselineIds].sort());
+    // NTC1 baseline is historical: the new MsgAsk is an intentional addition,
+    // not part of the pre-retirement catalog snapshot.
+    expect(ids).toContain('msg_ask');
+    expect([...ids.filter(id => id !== 'msg_ask'), ...retiredCatalogIds.retiredIds].sort())
+      .toEqual([...retiredCatalogIds.baselineIds].sort());
     expect(ids).toContain('self_implement');
   });
 });

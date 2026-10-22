@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { resolveUnit } from '../../src/graph-runner/runner.js';
+import { observeDialogueNode } from './units/author-dialogue/observe.js';
+import { runArrivalElaboration } from '../../src/self-implement/goal-elaborate.js';
+import { runFirstRoundRefine } from '../../src/self-implement/goal-refine.js';
 
 const graphPath = join(import.meta.dir, 'ta-journey.yaml');
 setDefaultTimeout(60_000);
@@ -25,7 +28,7 @@ test('TA journey dry-run traverses the entire declared success path without effe
     expect(cli.status, cli.stderr).toBe(0);
     const state = JSON.parse(cli.stdout) as { status: string; path: string[]; executed: number; dryRun: boolean };
     expect(state.status).toBe('done');
-    expect(state.path).toEqual(['entry', 'author', 'dispatch-pod', 'pr', 'harvest', 'land', 'reflect', 'green', 'remember', 'done']);
+    expect(state.path).toEqual(['entry', 'author', 'author-dialogue', 'dispatch-pod', 'pr', 'harvest', 'land', 'reflect', 'green', 'remember', 'done']);
     expect(state.executed).toBe(0);
     expect(state.dryRun).toBe(true);
   } finally { rmSync(temp, { recursive: true, force: true }); }
@@ -40,17 +43,22 @@ test('every journey unit exit routes forward, to needs-human, or to failed', asy
   const nodeIds = new Set(graph.nodes.map(node => node.node_id));
   const calls = graph.nodes.filter(node => node.call);
   expect(graph.terminal_nodes).toEqual(['done', 'failed', 'needs-human', 'rework']);
-  expect(calls.map(node => node.node_id)).toEqual(['entry', 'author', 'dispatch-pod', 'pr', 'harvest', 'land', 'reflect', 'green', 'remember']);
+  expect(calls.map(node => node.node_id)).toEqual(['entry', 'author', 'author-dialogue', 'dispatch-pod', 'pr', 'harvest', 'land', 'reflect', 'green', 'remember']);
   for (const node of calls) {
     const edge = graph.edges.find(candidate => candidate.from === node.node_id);
     expect(edge).toBeDefined();
     expect(Object.keys(edge!.map)).toEqual(node.node_id === 'reflect'
-      ? ['done', 'wait', 'needs-human'] : ['done', 'rework', 'needs-human', 'failed']);
+      ? ['done', 'wait', 'needs-human']
+      : node.node_id === 'author-dialogue' ? ['done', 'needs-human', 'failed'] : ['done', 'rework', 'needs-human', 'failed']);
     for (const target of Object.values(edge!.map)) expect(nodeIds.has(target)).toBe(true);
     if (node.node_id === 'reflect') {
       expect(edge!.map.wait).toBe('reflect');
       expect(node.max_visits).toBe(3);
       expect(edge!.map.failed).toBeUndefined();
+    } else if (node.node_id === 'author-dialogue') {
+      // The dialogue unit has no rework exit: findings loop back to author inside the unit (RFC §7 edge ④).
+      expect(edge!.map.rework).toBeUndefined();
+      expect(edge!.map.failed).toBe('failed');
     } else {
       expect(edge!.map.rework).toBe('rework');
       expect(edge!.map.failed).toBe('failed');
@@ -177,7 +185,7 @@ test('journey branch scenarios preserve harvest done, rework, and needs-human ou
       }
       writeFileSync(join(graphDir, 'ta-journey.yaml'), stringifyYaml(graph));
       writeFileSync(join(graphDir, 'recipes.yaml'), '{}\n');
-      for (const id of ['entry', 'author', 'dispatch-pod', 'pr', 'harvest', 'land', 'reflect', 'green', 'remember']) {
+      for (const id of ['entry', 'author', 'author-dialogue', 'dispatch-pod', 'pr', 'harvest', 'land', 'reflect', 'green', 'remember']) {
         cpSync(journeyUnitSource(repoRoot, id), join(unitsDir, id), { recursive: true });
       }
       if (fixture.id === 'harvest') {
@@ -264,5 +272,216 @@ if (unit === 'reflect') {
     const attempts = readFileSync(tracePath, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { attempts: number; prior: { attempts?: number } | null });
     expect(attempts.map(call => call.attempts)).toEqual([1, 2, 3]);
     expect(attempts.map(call => call.prior?.attempts ?? null)).toEqual([0, 1, 2]);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('author-dialogue sits between author and dispatch-pod and declares the four dialogue edges', async () => {
+  const graph = parseYaml(await Bun.file(graphPath).text()) as {
+    nodes: Array<{ node_id: string; call?: string }>;
+    edges: Array<{ from: string; map: Record<string, string> }>;
+  };
+  expect(graph.edges.find(edge => edge.from === 'author')!.map.done).toBe('author-dialogue');
+  expect(graph.edges.find(edge => edge.from === 'author-dialogue')!.map.done).toBe('dispatch-pod');
+  const caller = graph.nodes.find(node => node.node_id === 'author-dialogue')!;
+  expect(caller.call).toBe('author-dialogue@1');
+  const resolved = resolveUnit(caller.call!, graphPath);
+  expect(resolved.path).toBe(join(import.meta.dir, 'units', 'author-dialogue', 'author-dialogue.yaml'));
+  const unit = parseYaml(readFileSync(resolved.path, 'utf8')) as {
+    unit: { exits: string[] };
+    entry_node: string;
+    nodes: Array<{ node_id: string; max_visits: number }>;
+    edges: Array<{ from: string; map: Record<string, string> }>;
+  };
+  expect(unit.unit.exits).toEqual(['done', 'needs-human', 'failed']);
+  expect(unit.entry_node).toBe('author');
+  const map = (from: string) => unit.edges.find(edge => edge.from === from)!.map;
+  expect(map('author').deliver).toBe('implement'); // ① vN · ③ vN+1
+  expect(map('implement').ask).toBe('author'); // ② discovery / question
+  expect(map('implement').done).toBe('judge'); // ④ into judge
+  expect(map('judge').findings).toBe('author'); // ④ findings re-enter the dialogue
+  expect(map('author')['needs-human']).toBe('needs-human'); // direction/KPI change goes to a human
+  for (const id of ['author', 'implement', 'judge']) expect(unit.nodes.find(node => node.node_id === id)!.max_visits).toBe(5);
+});
+
+test('author-dialogue observer reads the real E1 events emitted by runArrivalElaboration', async () => {
+  const goal = '바꿀 것: 카드를 붙인다.\n판정 신호: goal-elaborated 사건.\n경계: 저작기(goal-author.ts)는 바꾸지 않는다.';
+  const card = (files: string[]) => JSON.stringify({ files, newFiles: files, requirements: ['r'],
+    firstTest: { path: files[0], name: 't', redReason: 'missing' }, stage: 'unit', level: 'L2' });
+  const run = async (responses: string[] | undefined) => {
+    const observations: Record<string, { data: Record<string, unknown> }> = {};
+    await runArrivalElaboration({
+      goal, prompt: 'ROUND0', fileExists: () => false,
+      ...(responses ? { callLLM: async () => { const next = responses.shift(); if (next === undefined) throw new Error('exhausted'); return next; } } : {}),
+      observe: (event, data) => { observations[event] = { data }; },
+    });
+    return observeDialogueNode('author', { observations });
+  };
+  // (1) E1 inside the fixed layer -> deliver the card to implement.
+  expect((await run([card(['src/a.ts']), '{"consistent":true,"violations":[]}'])).outcome).toBe('deliver');
+  // Outside the fixed layer twice -> needs-human.
+  expect((await run([card(['src/goal-author.ts']), card(['src/goal-author.ts'])])).outcome).toBe('needs-human');
+  // No provider -> skipped -> the dialogue lets today's implementation through.
+  const skipped = await run(undefined);
+  expect(skipped.outcome).toBe('deliver');
+  expect(skipped.result.event).toBe('goal-elaboration-skipped');
+  // No supplied event -> missing evidence, never inferred success.
+  expect(observeDialogueNode('author', {}).result.reason).toBe('missing-observation:goal-elaborated');
+  expect(observeDialogueNode('author', {}).outcome).toBe('needs-human');
+});
+
+test('author-dialogue declared-only nodes map supplied values and never infer success', () => {
+  expect(observeDialogueNode('implement', { observations: { implement: { outcome: 'ask' } } }).outcome).toBe('ask');
+  // Declared-only edges have no observation supplier yet: they pass through with the reason recorded.
+  expect(observeDialogueNode('implement', {}).outcome).toBe('done');
+  expect(observeDialogueNode('implement', {}).result).toMatchObject({ observed: false, reason: 'declared-only:pass-through' });
+  expect(observeDialogueNode('judge', {}).outcome).toBe('done');
+  expect(observeDialogueNode('judge', { observations: { judge: { outcome: 'findings' } } }).outcome).toBe('findings');
+  expect(observeDialogueNode('judge', { observations: { judge: { outcome: 'weird' } } }).outcome).toBe('needs-human');
+});
+
+test('graph runner executes author-dialogue: E1 success reaches dispatch-pod with zero needs-human', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'ta-journey-dialogue-run-'));
+  const repoRoot = resolve(import.meta.dir, '../..');
+  const graphDir = join(temp, 'graphs', 'journey');
+  const unitsDir = join(graphDir, 'units');
+  mkdirSync(unitsDir, { recursive: true });
+  try {
+    // Real E1 payload: the events runArrivalElaboration emits for a card inside the fixed layer.
+    const observations: Record<string, { data: Record<string, unknown> }> = {};
+    const card = JSON.stringify({ files: ['src/a.ts'], newFiles: ['src/a.ts'], requirements: ['r'],
+      firstTest: { path: 'src/a.ts', name: 't', redReason: 'missing' }, stage: 'unit', level: 'L2' });
+    const responses = [card, '{"consistent":true,"violations":[]}'];
+    await runArrivalElaboration({
+      goal: '바꿀 것: 카드를 붙인다.\n판정 신호: goal-elaborated 사건.', prompt: 'ROUND0', fileExists: () => false,
+      callLLM: async () => responses.shift()!, observe: (event, data) => { observations[event] = { data }; },
+    });
+    expect(Object.keys(observations)).toEqual(['goal-elaborated']);
+
+    // The real journey node and the real unit (recipes + observer) run; neighbours are one-line stubs.
+    const journey = parseYaml(readFileSync(graphPath, 'utf8')) as {
+      graph_id: string; version: number; launcher: string; terminal_nodes: string[];
+      nodes: Array<Record<string, unknown> & { node_id: string }>;
+      edges: Array<{ from: string; on: string; map: Record<string, string> }>;
+    };
+    const dialogueNode = journey.nodes.find(node => node.node_id === 'author-dialogue')!;
+    const dialogueEdge = journey.edges.find(edge => edge.from === 'author-dialogue')!;
+    expect(dialogueEdge.map.done).toBe('dispatch-pod');
+    const stub = (id: string) => ({ node_id: id, kind: 'agent', recipe: `cmd:${id}`, max_visits: 1, contract: { inputs: ['ask', 'context'], tools: 'read-only', outputs: ['result', 'evidence'] } });
+    const graph = {
+      ...journey,
+      entry_node: 'seed',
+      nodes: [stub('seed'), dialogueNode, stub('dispatch-pod'), ...journey.nodes.filter(node => journey.terminal_nodes.includes(node.node_id))],
+      edges: [
+        { from: 'seed', on: 'outcome', map: { done: 'author-dialogue' } },
+        dialogueEdge,
+        { from: 'dispatch-pod', on: 'outcome', map: { done: 'done' } },
+      ],
+    };
+    writeFileSync(join(graphDir, 'ta-journey.yaml'), stringifyYaml(graph));
+    const done = (id: string) => `${id}:\n  command: "printf '{\\"outcome\\":\\"done\\",\\"result\\":{\\"stub\\":\\"${id}\\"},\\"evidence\\":{}}'"\n`;
+    writeFileSync(join(graphDir, 'recipes.yaml'), done('seed') + done('dispatch-pod'));
+    cpSync(join(repoRoot, 'graphs', 'journey', 'units', 'author-dialogue'), join(unitsDir, 'author-dialogue'), { recursive: true });
+
+    const cli = spawnSync(Bun.which('bun')!, [
+      join(repoRoot, 'bin/elanous.mjs'), `--test=${join(temp, 'config')}`,
+      'graph', 'run', join(graphDir, 'ta-journey.yaml'), '--json',
+      '--input', JSON.stringify({ ask: 'E1 dialogue run', context: { observations }, prior: {} }),
+    ], { cwd: temp, encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', HOME: temp }, timeout: 60_000 });
+    const state = JSON.parse(cli.stdout || JSON.stringify({ stderr: cli.stderr })) as {
+      status: string; path: string[];
+      unitCalls?: Array<{ nodeId: string; exit?: string; path?: string[] }>;
+      nodes: Array<{ nodeId: string; output?: string }>;
+    };
+    expect(cli.status, `${cli.stderr} ${cli.stdout}`).toBe(0);
+    expect(state.status).toBe('done');
+    expect(state.path).toEqual(['seed', 'author-dialogue', 'dispatch-pod', 'done']);
+    // No goal-refined / judge rounds: one pass, no refine back-edge (author → implement → judge → done).
+    expect((state.unitCalls as unknown as Array<{ node: string; steps?: number }> | undefined)?.find(unitCall => unitCall.node === 'author-dialogue')?.steps).toBe(4);
+    expect(state.path).not.toContain('needs-human');
+    expect(JSON.stringify(state)).not.toContain('"outcome":"needs-human"');
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('author-dialogue refine re-entry: judge findings -> author reads the real E3 goal-refined event', async () => {
+  const goal = '대상 경로: src/a.ts\n바꿀 것: 카드를 붙인다.\n- 완료 경계 코드: 결과가 적절하다.\n판정 신호: goal-refined 사건.';
+  const observations: Record<string, { data: Record<string, unknown> }> = {};
+  await runFirstRoundRefine({
+    goal, round: 1, visit: 1, evidence: { findings: '- 수용선이 모호하다' },
+    callLLM: async () => JSON.stringify({ edits: [{ from: '- 완료 경계 코드: 결과가 적절하다.', to: '- 완료 경계 코드: a() 가 1 을 돌려준다.', reason: '모호' }] }),
+    observe: (event, data) => { observations[event] = { data }; },
+  });
+  expect(Object.keys(observations)).toEqual(['goal-refined']);
+  const findings = { judge: { outcome: 'findings', result: { round: 1 } } };
+  const reentry = observeDialogueNode('author', { observations }, findings);
+  expect(reentry).toMatchObject({ outcome: 'deliver', result: { event: 'goal-refined', observed: true, value: 'refined' } });
+  // A kept event (v1 retained, e.g. no provider) is still a real E3 observation -> deliver v1, not needs-human.
+  const kept: Record<string, { data: Record<string, unknown> }> = {};
+  await runFirstRoundRefine({ goal, round: 1, visit: 1, evidence: {}, observe: (event, data) => { kept[event] = { data }; } });
+  expect(kept['goal-refined']!.data).toMatchObject({ outcome: 'kept', kept: 'no-provider' });
+  expect(observeDialogueNode('author', { observations: kept }, findings)).toMatchObject({ outcome: 'deliver', result: { event: 'goal-refined', observed: true, value: 'kept' } });
+  // Re-entry without the E3 event is unresolved evidence, never inferred success.
+  expect(observeDialogueNode('author', {}, findings)).toMatchObject({ outcome: 'needs-human', result: { reason: 'missing-observation:goal-refined' } });
+  // judge reads one value per round.
+  const rounds = { judge: { data: { rounds: ['findings', 'pass'] } } };
+  expect(observeDialogueNode('judge', { observations: rounds })).toMatchObject({ outcome: 'findings', result: { round: 1 } });
+  expect(observeDialogueNode('judge', { observations: rounds }, findings)).toMatchObject({ outcome: 'done', result: { round: 2 } });
+});
+
+test('graph runner executes the refine back-edge once: first-round findings -> author (goal-refined) -> implement -> judge pass -> dispatch-pod', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'ta-journey-refine-run-'));
+  const repoRoot = resolve(import.meta.dir, '../..');
+  const graphDir = join(temp, 'graphs', 'journey');
+  const unitsDir = join(graphDir, 'units');
+  mkdirSync(unitsDir, { recursive: true });
+  try {
+    const observations: Record<string, { data: Record<string, unknown> }> = {};
+    const card = JSON.stringify({ files: ['src/a.ts'], newFiles: ['src/a.ts'], requirements: ['r'],
+      firstTest: { path: 'src/a.ts', name: 't', redReason: 'missing' }, stage: 'unit', level: 'L2' });
+    const responses = [card, '{"consistent":true,"violations":[]}'];
+    const goal = '대상 경로: src/a.ts\n바꿀 것: 카드를 붙인다.\n- 완료 경계 코드: 결과가 적절하다.\n판정 신호: goal-refined 사건.';
+    const observe = (event: string, data: Record<string, unknown>) => { observations[event] = { data }; };
+    await runArrivalElaboration({ goal, prompt: 'ROUND0', fileExists: () => false, callLLM: async () => responses.shift()!, observe });
+    await runFirstRoundRefine({ goal, round: 1, visit: 1, evidence: { findings: '- 수용선이 모호하다' }, observe,
+      callLLM: async () => JSON.stringify({ edits: [{ from: '- 완료 경계 코드: 결과가 적절하다.', to: '- 완료 경계 코드: a() 가 1 을 돌려준다.', reason: '모호' }] }) });
+    // First-round review reports findings, the second round passes.
+    const context = { observations: { ...observations, judge: { data: { rounds: ['findings', 'pass'] } } } };
+    expect(Object.keys(observations)).toEqual(['goal-elaborated', 'goal-refined']);
+
+    const journey = parseYaml(readFileSync(graphPath, 'utf8')) as {
+      terminal_nodes: string[];
+      nodes: Array<Record<string, unknown> & { node_id: string }>;
+      edges: Array<{ from: string; on: string; map: Record<string, string> }>;
+    };
+    const stub = (id: string) => ({ node_id: id, kind: 'agent', recipe: `cmd:${id}`, max_visits: 1, contract: { inputs: ['ask', 'context'], tools: 'read-only', outputs: ['result', 'evidence'] } });
+    const graph = {
+      ...journey,
+      entry_node: 'seed',
+      nodes: [stub('seed'), journey.nodes.find(node => node.node_id === 'author-dialogue')!, stub('dispatch-pod'), ...journey.nodes.filter(node => journey.terminal_nodes.includes(node.node_id))],
+      edges: [
+        { from: 'seed', on: 'outcome', map: { done: 'author-dialogue' } },
+        journey.edges.find(edge => edge.from === 'author-dialogue')!,
+        { from: 'dispatch-pod', on: 'outcome', map: { done: 'done' } },
+      ],
+    };
+    writeFileSync(join(graphDir, 'ta-journey.yaml'), stringifyYaml(graph));
+    const done = (id: string) => `${id}:\n  command: "printf '{\\"outcome\\":\\"done\\",\\"result\\":{\\"stub\\":\\"${id}\\"},\\"evidence\\":{}}'"\n`;
+    writeFileSync(join(graphDir, 'recipes.yaml'), done('seed') + done('dispatch-pod'));
+    cpSync(join(repoRoot, 'graphs', 'journey', 'units', 'author-dialogue'), join(unitsDir, 'author-dialogue'), { recursive: true });
+
+    const cli = spawnSync(Bun.which('bun')!, [
+      join(repoRoot, 'bin/elanous.mjs'), `--test=${join(temp, 'config')}`,
+      'graph', 'run', join(graphDir, 'ta-journey.yaml'), '--json',
+      '--input', JSON.stringify({ ask: 'E3 refine run', context, prior: {} }),
+    ], { cwd: temp, encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', HOME: temp }, timeout: 60_000 });
+    const state = JSON.parse(cli.stdout || JSON.stringify({ stderr: cli.stderr })) as {
+      status: string; path: string[]; unitCalls?: Array<{ node: string; exit?: string; steps?: number }>;
+    };
+    expect(cli.status, `${cli.stderr} ${cli.stdout}`).toBe(0);
+    expect(state.status).toBe('done');
+    expect(state.path).toEqual(['seed', 'author-dialogue', 'dispatch-pod', 'done']);
+    // 7 steps = author → implement → judge(findings) → author(goal-refined) → implement → judge(pass) → done
+    //   (the E1-only pass is 4: author → implement → judge → done).
+    expect(state.unitCalls?.find(unitCall => unitCall.node === 'author-dialogue'), JSON.stringify(state.unitCalls)).toMatchObject({ exit: 'done', steps: 7 });
+    expect(JSON.stringify(state)).not.toContain('"outcome":"needs-human"');
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });

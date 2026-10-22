@@ -136,6 +136,7 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
     for (const placeholder of [
       '', '  ', '(없음 …)', '(해당 없음...)', '(none.)', '(n/a)', '(no blocker)',
       '(첫 조각 가시 범위 내 블로커 없음...)', '(visible chunk: no blockers…)', '(차단 없음。)',
+      '(없음) 막는 결함은 찾지 못했다. ref → 전체 SHA 고정, 이미지 SHA12 태그, Job 쪽 `imageCommit==source.sha`·`image==shelfImage` 가드까지 한 줄로 이어진다.',
     ]) {
       expect(isNoneSentinelFinding(placeholder)).toBe(true);
       expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${placeholder}`).mustFix).toEqual([]);
@@ -144,6 +145,7 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
       '(회귀 시험 없음)', '(none: no blockers are checked because access control is disabled)',
       '(첫 조각 블로커 없음, 뒤 조각은 미검토)', '(no blockers: release gate is skipped)',
       '회귀 시험 없음',
+      '(없음) 인증 검사가 없어 누구나 접근할 수 있다.',
     ]) {
       expect(isNoneSentinelFinding(finding)).toBe(false);
       expect(parseReviewResult(`VERDICT: WARN\nMUST-FIX:\n- ${finding}`).mustFix).toEqual([finding]);
@@ -287,6 +289,28 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
 
     for (const marker of ['없음', '(없음)', '- 없음 -', 'none', '(none)', 'N/A', '(N/A)', '- N/A -', '-', '(—)', '- none -', '(-)']) {
       expect(parseReviewResult(`VERDICT: PASS\nMUST-FIX:\n- ${marker}`).mustFix).toEqual([]);
+    }
+  });
+  it('ACP-REVIEW-NONE-PLACEHOLDER — #30028의 긍정 결론 네 문장과 후속 ACP 무소견은 차단 지적이 아니다', () => {
+    const positive = [
+      '없음. 수용 기준은 코드와 시험 기준으로 충족한다.',
+      '프로토타입 키(`constructor`·`__proto__`)를 Map 으로 바르게 센다.',
+      '분모는 `task-agent/entrance-denominator` 별도 이벤트로만 나간다. `task-agent/action` 은 그대로다.',
+      'retro 사실과 tasks cover 집계는 분모 줄이 있든 없든 같다. 시험(`retro-cli.test.ts`)이 이를 고정하고, 임시 폴더는 `finally` 의 `rmSync` 로 지운다.',
+      '없음 — 막는 결함은 찾지 못했다.',
+    ];
+    const raw = `VERDICT: WARN\nMUST-FIX:\n${positive.map((line) => `- ${line}`).join('\n')}`;
+    expect(parseReviewResult(raw).mustFix).toEqual([]);
+  });
+  it('ACP-REVIEW-NONE-PLACEHOLDER — 실제 누락·파손은 긍정 문장과 섞여도 남긴다', () => {
+    const real = [
+      '수용 기준을 충족하지 못한다: 시험이 누락됐다.', '분모 이벤트가 깨진다.', '인증 검사가 없다.',
+      '수용 기준 불충족함.', '수용 기준 중 일부만 충족한다.', '시험은 스텁 덕에만 통과한다.',
+      '검증은 합성 입력으로만 통과한다.', '시험이 우연히 통과함',
+    ];
+    for (const finding of real) {
+      const raw = `VERDICT: WARN\nMUST-FIX:\n- 없음. 수용 기준은 코드와 시험 기준으로 충족한다.\n- ${finding}`;
+      expect(parseReviewResult(raw).mustFix).toEqual([finding]);
     }
   });
   it('REVIEW-MUSTFIX-NONE-PARSE — «없음/none/n/a/—/해당 없음» 변형 6종(괄호·설명 꼬리 포함)은 mustFix 0', () => {

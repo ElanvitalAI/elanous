@@ -57,6 +57,13 @@ export function emitHarnessFeedbackProgress(
 type CliAgentDispatch = typeof import('../skills/tools/agent.js').dispatchAgent;
 let cliAgentDispatchForTesting: CliAgentDispatch | undefined;
 
+let cliRunTurnForTesting: typeof runTurn | undefined;
+
+/** Test seam for exercising the real Commander and pipeline path without an LLM call. */
+export function setCliRunTurnForTesting(runTurnForTesting: typeof runTurn | undefined): void {
+  cliRunTurnForTesting = runTurnForTesting;
+}
+
 export function setCliAgentDispatchForTesting(dispatch: CliAgentDispatch | undefined): void {
   cliAgentDispatchForTesting = dispatch;
 }
@@ -524,7 +531,11 @@ export async function runChatTurnCli(opts: {
       ...(modelFamily !== undefined ? { modelFamily } : {}),
       ...(enabledToolNames !== undefined ? { enabledTools: enabledToolNames } : {}),
     });
-    const joined = universal
+    const discipline = opts.goalLoop
+      ? (require('../impl-discipline/index.js') as typeof import('../impl-discipline/index.js'))
+        .buildImplDisciplineSystemMessages({ text: opts.userText })
+      : [];
+    const joined = [...universal, ...discipline]
       .map(m => (typeof m.content === 'string' ? m.content : ''))
       .filter(s => s.length > 0)
       .join('\n\n');
@@ -559,7 +570,7 @@ export async function runChatTurnCli(opts: {
   }
   let result: Awaited<ReturnType<typeof runTurn>>;
   try {
-    result = await (opts.runTurn ?? runTurn)({
+    result = await (opts.runTurn ?? cliRunTurnForTesting ?? runTurn)({
       userConfig: opts.cfg,
       sessionId: session.id,
       userText: opts.userText,

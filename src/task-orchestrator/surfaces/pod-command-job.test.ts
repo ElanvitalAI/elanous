@@ -16,10 +16,11 @@ import {
   resolvePodCpu,
   POD_RESULT_MARKER,
   POD_MARKER_LOG_RETRIES,
-  runPodCommand,
+  runPodCommand as runPodCommandImpl,
   splitPodResultMarker,
   tailBytes,
 } from './pod-command-job.js';
+import type { RunPodCommandOptions } from './pod-command-job.js';
 import type { Kubectl } from './self-implement-pod.js';
 import { PodPoolScheduler, syncPoolImages, type PodPoolMember, type RemoteRun } from './pod-pool.js';
 import { podSourceScript } from './pod-source-receive.js';
@@ -33,7 +34,15 @@ const base = {
   repoUrl: 'https://github.com/example/repo.git',
   deadlineSeconds: 60,
   command: ['echo', 'hi'],
+  provenance: { actorKind: 'seat', actor: 'OPC', kind: 'command', run: 'test-run-12345678',
+    phase: 'exec', requestedAt: '2026-10-20T09:00:00Z' },
 };
+
+const testProvenance = { actorKind: 'seat', actor: 'OPC', kind: 'command', run: 'test-run-12345678',
+  phase: 'exec', requestedAt: '2026-10-20T09:00:00Z' };
+// The required launch identity changes the baseline bytes; optional Job fields must still leave this baseline untouched.
+const PROVENANCE_MANIFEST_SHA256 = '9b927c763d685222d12552a5f43c94c7560096b06b43fef709976ea037d56760';
+const runPodCommand = (options: RunPodCommandOptions) => runPodCommandImpl({ provenance: testProvenance, ...options });
 
 function manifest(over: Partial<Parameters<typeof podCommandJobManifest>[0]> = {}) {
   return podCommandJobManifest({ ...base, skills: [], ...over });
@@ -65,7 +74,7 @@ describe('pod command job manifest', () => {
     const spec = (withMirror.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }> } } }).template.spec;
     expect(spec.volumes).toContainEqual({ name: 'host-mirror', hostPath: { path: '/mirror-host/elanous-agent.git', type: 'Directory' } });
     expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true });
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('68479bf3ebc70db6ad4c8f0862b75cf7764cd6f224053dd982c79d293991dd74');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe(PROVENANCE_MANIFEST_SHA256);
     expect(JSON.stringify(manifest({ clone: true, hostMirror: undefined }))).toBe(JSON.stringify(original));
   });
 
@@ -87,7 +96,7 @@ describe('pod command job manifest', () => {
     expect(spec.initContainers).toBeUndefined();
     expect(podCommandScript(cached)).toContain(`[host-dirs] could not prepare $d`);
     expect(podCommandScript(cached)).toContain('if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;');
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('68479bf3ebc70db6ad4c8f0862b75cf7764cd6f224053dd982c79d293991dd74');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe(PROVENANCE_MANIFEST_SHA256);
     expect(JSON.stringify(manifest({ clone: true, bunCache: undefined }))).toBe(JSON.stringify(original));
     expect(podCommandScript(original)).not.toContain('BUN_INSTALL_CACHE_DIR');
   });
@@ -160,7 +169,7 @@ describe('pod command job manifest', () => {
     const res = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { requests: Record<string, string>; limits: Record<string, string> } }> } } }).template.spec.containers[0]!.resources;
     const original = manifest({ clone: true });
     expect(res(original)).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
-    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('68479bf3ebc70db6ad4c8f0862b75cf7764cd6f224053dd982c79d293991dd74');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe(PROVENANCE_MANIFEST_SHA256);
     expect(JSON.stringify(manifest({ clone: true, cpu: undefined }))).toBe(JSON.stringify(original));
     expect(JSON.stringify(manifest({ clone: true, cpu: {} }))).toBe(JSON.stringify(original));
     expect(res(manifest({ clone: true, cpu: { request: '1', limit: '1' } }))).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '1' } });
@@ -284,7 +293,7 @@ describe('pod command job manifest', () => {
   // SHA-256 of the default JSON manifest (base + clone: true) — re-pinned 10-15 for GATE-POD-RESULT-MARKER (done-marker line) then GATE-WARM-BOOT-NO-INIT (no init container · probe in the child shell), 10-16 TA-POD-WARMBOOT-PARITY (MIRROR_SKIP reason line); a change here means the default manifest moved.
   test('commit source checks out the requested SHA; omitted source retains the default manifest bytes', () => {
     const source = { kind: 'commit' as const, sha: 'a'.repeat(40) };
-    const original = '68479bf3ebc70db6ad4c8f0862b75cf7764cd6f224053dd982c79d293991dd74';
+    const original = PROVENANCE_MANIFEST_SHA256;
     const script = podCommandScript(manifest({ clone: true, source }));
     expect(script).toContain(podSourceScript(source, base.repoUrl));
     expect(script).toContain(`git checkout --detach ${source.sha}`);
@@ -347,6 +356,36 @@ describe('pod command job manifest', () => {
 });
 
 describe('runPodCommand', () => {
+  test('shelf Job requires its commit and registry image; fails closed without the tag and keeps ordinary Job bytes', async () => {
+    const commit = 'a'.repeat(40);
+    const image = 'k3d-elanous-registry:5050/elanous-harness:aaaaaaaaaaaa';
+    const applied: Record<string, any>[] = [];
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool', registry: 'k3d-elanous-registry:5050' };
+    const run = (tag: boolean) => runPodCommand({ command: ['bun', 'bin/elanous.mjs', '--test', '--version'], image, shelfImage: image,
+      shelfLookup: () => tag ? image : null,
+      imageCommit: commit, clone: true, source: { kind: 'commit', sha: commit }, ghToken: () => 'test-token',
+      poolScheduler: new PodPoolScheduler([member]), configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-shelf-job-test',
+      kubectl: (args, input) => {
+        if (input) applied.push(JSON.parse(input));
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        if (args.includes('logs')) return { status: 0, stdout: 'version tail\n', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      },
+      syncImages: async () => { throw new Error('shelf must not re-sync a mutable image'); },
+      // Registry lookup is remote; a missing tag must fail rather than launching :local.
+      env: { ELANOUS_POD_POOL: 'pool-node-b@node-b:1#k3d-elanous-registry:5050' },
+    });
+    await expect(run(false)).rejects.toThrow('selected image unavailable');
+    expect(applied.find((entry) => entry.kind === 'Job')).toBeUndefined();
+    const result = await run(true);
+    expect(result).toMatchObject({ image, exitCode: 0 });
+    const job = applied.find((entry) => entry.kind === 'Job')!;
+    expect(job.spec.template.spec.containers[0]).toMatchObject({ image, imagePullPolicy: 'IfNotPresent' });
+    expect(podCommandScript(job)).toContain(`git checkout --detach ${commit}`);
+    expect(readFileSync(join(result.artifactsDir, 'child.log'), 'utf8')).toBe('version tail\n');
+    expect(createHash('sha256').update(JSON.stringify(manifest({ clone: true }))).digest('hex')).toBe(PROVENANCE_MANIFEST_SHA256);
+  });
+
   test('lite only when the caller says so: network-skill commands with --lite get the lite image and 2Gi; skills alone never switch', async () => {
     const variants = [
       { skills: ['omni-crawl'], lite: true, expected: 'elanous-harness-lite:local', memory: '2Gi' },

@@ -10,7 +10,9 @@ import { resetUserConfig } from '../../src/user-config.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
 import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
-import { planPartialRegate, writePartialPlan } from './gate-partial';
+import { planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial';
+import { hardRehearsalGateVersion } from './gate-radius-live';
+import { gateEnvFingerprint } from './gate-baseline-receipt';
 import { parseFailures, parseTimedOutFailures } from './gate-diff';
 import { parsePodCpu, runPodCommand, type RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { PodPoolScheduler, parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
@@ -253,6 +255,7 @@ test('pod counts only listed failing ids separately while still reporting a new 
   expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8')).failures).toEqual([listed, B]);
   expect(JSON.parse(readFileSync(join(dirname(instanceRoot), 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'))).toMatchObject({
     introduced: [B], knownEnv: [listed], preexisting: [], loadFlaky: [],
+    baselineReceipt: { valid: false, reason: 'gate was not a complete clean full sweep', commit: CUT },
   });
 });
 
@@ -417,6 +420,7 @@ test('judged identities persist in the machine ledger and a re-gate replaces the
     expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'regression', introduced: [B], preexisting: 1 });
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
       version: '1.0.1', commit: CUT, outcome: 'regression', introduced: [B], knownEnv: [], preexisting: [A], loadFlaky: [],
+      baselineReceipt: expect.objectContaining({ valid: false, commit: CUT, reason: 'gate was not a complete clean full sweep' }),
     });
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(events).toContainEqual(expect.objectContaining({
@@ -429,6 +433,7 @@ test('judged identities persist in the machine ledger and a re-gate replaces the
     expect(await judgeGate({ ...options(instanceRoot), commit: nextCommit }, runner)).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 1 });
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
       version: '1.0.1', commit: nextCommit, outcome: 'ok', introduced: [], knownEnv: [], preexisting: [A], loadFlaky: [],
+      baselineReceipt: expect.objectContaining({ valid: false, commit: nextCommit }),
     });
     expect(events.at(-1)).toEqual(expect.objectContaining({ commit: nextCommit, introduced: 0, preexisting: 1, introducedIds: [], preexistingIds: [A] }));
   } finally { observation.mockRestore(); }
@@ -457,6 +462,7 @@ test('second verdict-root write failure records the current error verdict and id
     expect(result).toMatchObject({ outcome: 'error', error: expect.stringContaining('second root write failed') });
     expect(JSON.parse(readFileSync(ledgerVerdict, 'utf8'))).toEqual({
       version: '1.0.1', commit: CUT, outcome: 'error', introduced: [B], knownEnv: [], preexisting: [A], loadFlaky: [],
+      baselineReceipt: expect.objectContaining({ valid: false, commit: CUT, reason: 'gate was not a complete clean full sweep' }),
     });
     expect(judgedEvents).toContainEqual(expect.objectContaining({
       commit: CUT, outcome: 'error', introducedIds: [B], preexistingIds: [A],
@@ -1419,6 +1425,8 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
   runner.removeSnapshot = fixtureRunner.removeSnapshot;
   const observed: Array<{ category: string; event: string; data: unknown }> = [];
   const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { observed.push({ category, event, data }); });
+  const previousEntrance = process.env.ELANOUS_RELEASE_ENTRANCE;
+  process.env.ELANOUS_RELEASE_ENTRANCE = ' release-run ';
   try {
     const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 3 } }, runner);
     expect(result).toMatchObject({ outcome: serial.outcome, introduced: serial.introduced, preexisting: serial.preexisting, fixed: serial.fixed });
@@ -1426,6 +1434,12 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     expect(podFailures.failures).toEqual(serialFailures.failures);
     expect(result.introduced).toEqual(serial.introduced);
     expect(invoked).toHaveLength(3);
+    expect(invoked.every((o) => o.provenanceGate === true
+      && o.provenance?.kind === 'gate-shard'
+      && !!o.provenance.actor && !!o.provenance.run
+      && !!o.provenance.phase && !!o.provenance.requestedAt
+      && !!o.provenance.shard)).toBe(true);
+    expect(invoked.every((o) => o.provenance?.entrance === 'release-run')).toBe(true);
     expect(peak).toBe(3);
     expect(invoked.every((o) => o.pool === 'pool-test' && o.clone === true && o.deadlineSeconds === 1200 && JSON.stringify(o.source) === JSON.stringify({ kind: 'commit', sha: treeHead }))).toBe(true);
     expect(new Set(invoked.map((o) => o.name)).size).toBe(3);
@@ -1457,7 +1471,11 @@ test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the se
     expect(board?.shards.every((row) => typeof row.endedAt === 'string')).toBe(true);
     // GATE-LIVE-OBS-RC-WORDING ⓒ: after judging, the same board carries the verdict, so the line leaves «판정 전».
     expect(board?.verdict).toEqual({ introduced: result.introduced.length, preexisting: result.preexisting });
-  } finally { log.mockRestore(); }
+  } finally {
+    if (previousEntrance === undefined) delete process.env.ELANOUS_RELEASE_ENTRANCE;
+    else process.env.ELANOUS_RELEASE_ENTRANCE = previousEntrance;
+    log.mockRestore();
+  }
 });
 
 test('Pod sweep opts into the Bun cache and records the first install timing', async () => {
@@ -1492,7 +1510,9 @@ test('Pod sweep opts into the Bun cache and records the first install timing', a
     expect(invoked[0]!.command[2]).toContain('(cd "$t" && bun install) >> "$O/install.log"');
     process.env.POD_BUN_CACHE_HOST_PATH = '  /srv/bun-cache  ';
     const cached = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
-    expect(cached).toEqual(uncached);
+    expect(cached.podSweep?.id).not.toBe(uncached.podSweep?.id);
+    expect({ ...cached, podSweep: { ...cached.podSweep, id: '<sweep>' } })
+      .toEqual({ ...uncached, podSweep: { ...uncached.podSweep, id: '<sweep>' } });
     expect(invoked).toHaveLength(2);
     expect(invoked[1]!.bunCache).toBe('/srv/bun-cache');
     const cachePrefix = 'if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;\n';
@@ -3165,6 +3185,103 @@ test('GATE-PARTIAL: the plan made by planPartialRegate re-runs exactly the chang
   expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8'))).toMatchObject({ commit: CUT, failures: [A] });
 });
 
+test('GATE-RESUME-STALLED-ONLY: the gate rechecks only stalled files and carries every completed result', async () => {
+  const { instanceRoot, runner } = fake([A], [A]);
+  const sweeps: Array<{ logDir?: string; only?: readonly string[] }> = [];
+  runner.sweep = async (_tree, logDir, _pod, only) => {
+    sweeps.push({ logDir, only });
+    return { rc: 0, output: '1 pass\n0 fail\n0 errors\nRan 1 tests across 1 files.\n' };
+  };
+  const planned = planStalledShardRecheck({ version: '1.0.1', measuredCommit: CUT, forCommit: CUT,
+    failures: [A], errors: [B], stalledFiles: ['src/c.test.ts'], existsAtCommit: () => true });
+  if (!planned.ok) throw new Error(planned.reason);
+  writeRecheckPlan(instanceRoot, planned.plan);
+  const result = await judgeGate(options(instanceRoot), runner);
+  expect(sweeps[0]!.only).toEqual(['src/c.test.ts']);
+  expect(sweeps[0]!.logDir).toEndWith(join('gate-logs', 'cut-partial'));
+  expect(result).toMatchObject({ outcome: 'regression', introduced: [B], preexisting: 1,
+    partial: { priorCommit: CUT, files: 1 } });
+  expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8')))
+    .toMatchObject({ commit: CUT, failures: [A], errors: [B] });
+});
+
+test('GATE-RESUME-STALLED-ONLY: a malformed recheck record returns an error before any sweep', async () => {
+  const { instanceRoot, runner } = fake([], []);
+  const onlys: Array<readonly string[] | undefined> = [];
+  const sweep = runner.sweep;
+  runner.sweep = async (tree, logDir, pod, only) => { onlys.push(only); return sweep(tree, logDir, pod, only); };
+  mkdirSync(join(instanceRoot, 'release/1.0.1'), { recursive: true });
+  writeFileSync(join(instanceRoot, 'release/1.0.1/gate-partial.json'), JSON.stringify({ kind: 'recheck', version: '1.0.1',
+    priorCommit: CUT, forCommit: CUT, files: ['../escape.test.ts'], stalledFiles: ['../escape.test.ts'], priorFailures: [], priorErrors: [] }));
+  const result = await judgeGate(options(instanceRoot), runner);
+  expect(onlys).toEqual([]);
+  expect(result).toMatchObject({ outcome: 'error', error: expect.stringContaining('invalid gate recheck plan') });
+});
+
+for (const mode of ['clean', 'image-drift', 'selection-gap'] as const) test(`RELEASE-GATE-RADIUS: next graph gate ${mode}`, async () => {
+  const { root, instanceRoot, runner } = fake([], []);
+  const repo = join(root, 'radius-repo');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  const git = (...args: string[]) => {
+    const run = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (run.status !== 0) throw new Error(run.stderr);
+    return run.stdout.trim();
+  };
+  git('init', '-q'); git('config', 'user.email', 'tc@test'); git('config', 'user.name', 'TC');
+  writeFileSync(join(repo, 'package.json'), '{"version":"1.0.0"}\n');
+  writeFileSync(join(repo, 'src/a.ts'), 'export const a = 1;\n');
+  writeFileSync(join(repo, 'src/a.test.ts'), "import { a } from './a'; test('a', () => a);\n");
+  writeFileSync(join(repo, 'src/b.test.ts'), "test('b', () => 1);\n");
+  git('add', '.'); git('commit', '-qm', 'rehearsal');
+  const prior = git('rev-parse', 'HEAD');
+  writeFileSync(join(repo, 'src/a.ts'), 'export const a = 2;\n');
+  if (mode === 'selection-gap') writeFileSync(join(repo, 'src/b.test.ts'), "test('b', () => 2);\n");
+  writeFileSync(join(repo, 'package.json'), '{"version":"1.0.1"}\n');
+  git('add', '.'); git('commit', '-qm', 'cut');
+  const commit = git('rev-parse', 'HEAD');
+  const runId = 'hard-12345678-1234-1234-1234-123456789abc';
+  const gateVersion = hardRehearsalGateVersion('1.0.1', runId);
+  const pins = { graphSha: 'c'.repeat(64), recipeSha: 'd'.repeat(64) };
+  const imageDigest = `sha256:${'f'.repeat(64)}`;
+  const envFingerprint = gateEnvFingerprint(process.env);
+  const stampDir = join(instanceRoot, 'release/1.0.1/rehearsal');
+  const gateDir = join(instanceRoot, 'release', gateVersion);
+  mkdirSync(stampDir, { recursive: true }); mkdirSync(join(gateDir, 'gate-logs/cut'), { recursive: true });
+  mkdirSync(join(instanceRoot, 'graph-runs/release-loop'), { recursive: true });
+  writeFileSync(join(instanceRoot, 'graph-runs/release-loop/run-radius.json'), JSON.stringify({ graphId: 'release-loop', runId: 'run-radius',
+    graphSnapshot: { graphSha: pins.graphSha, recipesSha: pins.recipeSha } }));
+  writeFileSync(join(stampDir, 'hard-5h.json'), JSON.stringify({ version: '1.0.1', step: 'hard-5h', outcome: 'ok', sha: prior,
+    endedAt: '2026-10-20T10:00:00.000Z',
+    hardGateRunId: runId, hardGate: { outcome: 'ok', commit: prior, executor: 'pod', introduced: [] } }));
+  writeFileSync(join(gateDir, 'gate-verdict.json'), JSON.stringify({ commit: prior, outcome: 'ok', baselineReceipt: {
+    schema: 1, valid: true, reason: 'complete clean full sweep', version: gateVersion, commit: prior,
+    ...pins, envFingerprint, imageDigest, files: 2, shards: 1 } }));
+  writeFileSync(join(gateDir, 'gate-failures.json'), JSON.stringify({ commit: prior, failures: [], errors: [] }));
+  writeFileSync(join(gateDir, 'gate-logs/cut/pod-0.json'), JSON.stringify({ commit: prior,
+    files: ['src/a.test.ts', 'src/b.test.ts'], imageDigest, shardCount: 1, sweepId: 'sweep-one', attemptId: 'attempt-one' }));
+  const sweeps: Array<readonly string[] | undefined> = [];
+  runner.sweep = async (_tree, logDir, _pod, only) => {
+    sweeps.push(only);
+    if (only) {
+      mkdirSync(logDir!, { recursive: true });
+      const observed = mode === 'selection-gap' ? only.slice(0, 1) : only;
+      writeFileSync(join(logDir!, 'pod-0.json'), JSON.stringify({ commit, files: observed,
+        imageDigest: mode === 'image-drift' ? `sha256:${'a'.repeat(64)}` : imageDigest,
+        sweepId: '12345678-1234-1234-1234-123456789abc', shardCount: 1, attemptId: 'attempt-one' }));
+      return { rc: 0, output: runOutput([]), podSweep: {
+        id: '12345678-1234-1234-1234-123456789abc', shards: 1, files: [...observed] } };
+    }
+    return { rc: 0, output: runOutput([]) };
+  };
+  const result = await judgeGate({ ...options(instanceRoot), repo, commit, graphRunId: 'run-radius',
+    pod: { pool: 'local-pod:1' } }, runner, () => imageDigest);
+  const chosen = mode === 'selection-gap' ? ['src/a.test.ts', 'src/b.test.ts'] : ['src/a.test.ts'];
+  expect(sweeps).toEqual(mode === 'clean' ? [chosen] : [chosen, undefined]);
+  expect(result).toMatchObject(mode === 'clean' ? { outcome: 'ok', partial: { priorCommit: prior, files: 1 } } : { outcome: 'ok' });
+  if (mode !== 'clean') expect(result.partial).toBeUndefined();
+  expect(existsSync(join(instanceRoot, 'release/1.0.1/gate-partial.json'))).toBe(false);
+});
+
 function carryCommits(root: string, changed: 'README.md' | 'src/changed.test.ts') {
   const repo = join(root, 'carry-repo');
   mkdirSync(repo);
@@ -4383,6 +4500,75 @@ test('GATE-SHARD-RESUME: a Job that exited non-zero with rc 0 and a clean log is
   expect(JSON.parse(readFileSync(join(logDir, 'pod-0.json'), 'utf8'))).toMatchObject({ rc: 0, jobExitCode: 1, jobFailed: false });
   await expect(runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1 })).rejects.toThrow();
   expect(podCalls).toBe(calls * 2);
+});
+
+test('GATE-SHARD-FAILURE-CAPTURE: a failed Job records redacted Pod termination and log tail without changing the verdict', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const logDir = join(root, 'gate-logs', 'cut');
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: 'src/a.test.ts' };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const member = await o.poolScheduler?.tryAcquire();
+    if (member) o.poolScheduler?.release(member);
+    const artifactsDir = join(root, 'failed-job');
+    mkdirSync(artifactsDir, { recursive: true });
+    return { exitCode: 137, artifactsDir, job: 'failed-job' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  const evidence = { termination: { reason: 'OOMKilled', exitCode: 137, finishedAt: '2026-10-20T09:01:00Z' } };
+  let logTail = `${'가'.repeat(7_000)}token=abc123def456secret\n`;
+  const kubectlCalls: string[][] = [];
+  const failureKubectl = (args: readonly string[]) => {
+    kubectlCalls.push([...args]);
+    return args.includes('get')
+      ? { status: 0, stdout: JSON.stringify({ items: [
+        { metadata: { name: 'old-running' }, status: { containerStatuses: [{ name: 'child', state: { running: {} }, lastState: { terminated: { reason: 'EarlierCrash', exitCode: 1 } } }] } },
+        { metadata: { name: 'earlier-failed' }, status: { containerStatuses: [{ name: 'child', state: { terminated: { reason: 'Error', exitCode: 1, finishedAt: '2026-10-20T09:00:00Z' } } }] } },
+        { metadata: { name: 'failed-pod' }, status: { containerStatuses: [{ name: 'child', state: { terminated: evidence.termination } }] } },
+      ] }), stderr: '' }
+      : { status: 0, stdout: logTail, stderr: '' };
+  };
+  await expect(runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1, failureKubectl })).rejects.toThrow();
+  const row = JSON.parse(readFileSync(join(logDir, 'pod-0.json'), 'utf8'));
+  expect(row).toMatchObject({ jobExitCode: 137, jobFailed: false, failureCapture: { podName: 'failed-pod', termination: evidence.termination } });
+  expect(row.failureCapture.logTail).toContain('token=***');
+  expect(row.failureCapture.logTail).not.toContain('abc123def456secret');
+  expect(Buffer.byteLength(row.failureCapture.logTail, 'utf8')).toBeLessThanOrEqual(16_384);
+  expect(kubectlCalls).toHaveLength(2);
+  expect(kubectlCalls[0]).toContain('pool-test');
+  expect(kubectlCalls[1]).toContain('pod/failed-pod');
+  // Old slice-before-redaction starts in the middle of this token and leaks its suffix.
+  // A later artifact read throws; the catch must keep the evidence already collected once.
+  mkdirSync(join(root, 'failed-job', 'shard.log'));
+  logTail = `token=abc123def456secret${'x'.repeat(16_375)}`;
+  await expect(runner.sweep(repo, join(root, 'gate-logs', 'boundary'), { pool: 'pool-test', shards: 1, failureKubectl })).rejects.toThrow();
+  const boundary = JSON.parse(readFileSync(join(root, 'gate-logs', 'boundary', 'pod-0.json'), 'utf8'));
+  expect(boundary.jobFailed).toBe(true);
+  expect(kubectlCalls).toHaveLength(4);
+  expect(boundary.failureCapture.logTail).toContain('token=***');
+  expect(boundary.failureCapture.logTail).not.toContain('def456secret');
+});
+
+test('GATE-SHARD-FAILURE-CAPTURE: collection errors are recorded without replacing Job failure', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const logDir = join(root, 'gate-logs', 'cut');
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: 'src/a.test.ts' };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async () => { throw new Error('Job status unreadable'); },
+  new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  await expect(runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1, failureEvidence: () => { throw new Error('kubectl timeout'); } })).rejects.toThrow();
+  expect(JSON.parse(readFileSync(join(logDir, 'pod-0.json'), 'utf8'))).toMatchObject({
+    jobFailed: true, failureCapture: { error: '수거 실패 · Error: kubectl timeout' },
+  });
 });
 
 test('GATE-SHARD-RESUME: a fresh run that fails while replacing a shard log leaves no reusable record behind (review r8·r9)', async () => {

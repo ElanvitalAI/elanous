@@ -3,6 +3,10 @@
  * Release-loop ④ — run the PWA scenario suite on one commit, in isolation, and print one verdict.
  *
  *   bun scripts/release-loop/pwa-scenarios-node.ts --commit <sha> [--with-costly] [--reruns 2] [--json]
+ *     [--remote <ssh-host> [--remote-mirror <path>]]
+ *
+ * `--remote` (release.loop.pwaRemote) runs the same steps on that host — see pwa-remote.ts.
+ * A remote failure is reported as `error` (exit 2); it never falls back to this machine.
  *
  * Steps: temp worktree at <sha> → `nexus build` → isolated nexus (`--test`, leased test port)
  * → warm-up pass (discarded — the first page load after boot is slow and made T4a/N5a fail on the
@@ -18,14 +22,17 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { decideVerdict, exitCodeFor, idsToRerun, type CellRun, type NodeVerdict } from './pwa-node-verdict';
 import { envLiteral } from '../../src/platform/env-literal.js';
+import { checkPwaRemote, runPwaRemote } from './pwa-remote';
 
-interface Options { commit: string; withCostly: boolean; reruns: number; json: boolean }
+interface Options { commit: string; withCostly: boolean; reruns: number; json: boolean; remote?: string; remoteMirror?: string }
 
-function parseArgs(argv: readonly string[]): Options {
+export function parseArgs(argv: readonly string[]): Options {
   const opts: Options = { commit: '', withCostly: false, reruns: 2, json: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--commit') opts.commit = argv[++i] ?? '';
+    else if (arg === '--remote') opts.remote = argv[++i] ?? '';
+    else if (arg === '--remote-mirror') opts.remoteMirror = argv[++i] ?? '';
     else if (arg === '--with-costly') opts.withCostly = true;
     else if (arg === '--json') opts.json = true;
     else if (arg === '--reruns') opts.reruns = Number(argv[++i] ?? '2');
@@ -33,6 +40,8 @@ function parseArgs(argv: readonly string[]): Options {
   }
   if (!/^[0-9a-f]{7,40}$/i.test(opts.commit)) throw new Error('--commit <sha> is required');
   if (!Number.isInteger(opts.reruns) || opts.reruns < 0 || opts.reruns > 5) throw new Error('--reruns must be 0..5');
+  if (opts.remoteMirror !== undefined && opts.remote === undefined) throw new Error('--remote-mirror requires --remote');
+  if (opts.remote !== undefined) checkPwaRemote(opts.remote, opts.remoteMirror);
   return opts;
 }
 
@@ -65,6 +74,13 @@ async function main(): Promise<number> {
   let opts: Options;
   try { opts = parseArgs(process.argv.slice(2)); } catch (e) { log(String(e)); return 2; }
   const repo = resolve('.');
+  if (opts.remote !== undefined) {
+    log(`remote ${opts.remote} · ${opts.commit.slice(0, 10)}`);
+    const remote = runPwaRemote({ host: opts.remote, ...(opts.remoteMirror ? { mirror: opts.remoteMirror } : {}), commit: opts.commit, withCostly: opts.withCostly, reruns: opts.reruns, repo });
+    if (opts.json) console.log(JSON.stringify(remote.output));
+    else console.log(`pwa-node: ${String(remote.output.verdict)} · ${opts.commit.slice(0, 10)} · host ${opts.remote}${typeof remote.output.error === 'string' ? `\n  error: ${remote.output.error}` : ''}`);
+    return remote.exitCode;
+  }
   const work = mkdtempSync(join(tmpdir(), 'pwa-node-'));
   const worktree = join(work, 'tree');
   let nexusPid: number | undefined;
@@ -137,4 +153,4 @@ async function main(): Promise<number> {
   return verdict ? exitCodeFor(verdict.verdict) : 2;
 }
 
-process.exit(await main());
+if (import.meta.main) process.exit(await main());

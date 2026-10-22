@@ -1,6 +1,12 @@
 import { BUDGET_SNAPSHOT_ENV } from '../../execution-loop/launch-gate.js';
 
-// Preserve the manifest contract except for two values generated per launch.
+/** The Pod push fence embeds a different six-hex run key in each independent launch. */
+export function stablePodRunGuard(text: string): string {
+  return text.replace(/pr-create-r[0-9a-f]{6}-/g, 'pr-create-r<run>-')
+    .replace(/-r[0-9a-f]{6}(?=[-|*])/g, '-r<run>');
+}
+
+// Preserve the manifest contract except for the budget timestamp and run identities generated per launch.
 export function stablePodManifestText(applied: Array<Record<string, any>>): string {
   const manifests = structuredClone(applied.filter((entry) => entry.kind === 'Job' || entry.kind === 'Secret'));
   let snapshots = 0;
@@ -19,5 +25,5 @@ export function stablePodManifestText(applied: Array<Record<string, any>>): stri
     }
   }
   if (snapshots === 0) throw new Error('manifest comparison requires a budget snapshot');
-  return JSON.stringify(manifests).replace(/run-[0-9a-f-]{36}/g, 'run-<id>');
+  return stablePodRunGuard(JSON.stringify(manifests).replace(/run-[0-9a-f-]{36}/g, 'run-<id>'));
 }

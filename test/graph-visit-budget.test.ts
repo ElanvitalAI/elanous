@@ -2,12 +2,13 @@ import { describe, expect, it } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { visitBudgetOf } from '../src/self-implement/graph-authority.js';
+import { decideTemplate, resolveGraphAuthority, visitBudgetOf } from '../src/self-implement/graph-authority.js';
 import { loadGraphTemplatesFrom, defaultGraphsDir, GRAPH_SPECS, type GraphTemplate } from '../src/self-implement/graph-templates.js';
 import type { GraphEdgeSpec } from '../src/self-implement/graph-yaml.js';
 import { runSelfImplement } from '../src/self-implement/orchestrator.js';
 import { appendRunLedgerEntry, runLedgerDir, runLedgerPath } from '../src/self-implement/run-ledger.js';
 import type { GraphOverlaySpec } from '../src/self-implement/graph-overlay-yaml.js';
+import { parseGraphOverlayYaml } from '../src/self-implement/graph-overlay-yaml.js';
 import { seams } from '../src/self-implement/test-seams.js';
 
 /** ⭐ RFC §5 — `max_visits` 를 실행이 «읽게» 한 뒤의 반증.
@@ -190,6 +191,18 @@ describe('research-loop 실행 경로가 예산 7 을 관측으로 넘긴다', (
   });
 
   it('⭐ 운영 런치 오버레이(research-wide-launch · investigate 예산 12)가 얹히면 같은 걸음이 예산 «안»이다 — 운영의 「0」은 이 오버레이 몫이다', async () => {
+    const overlaySource = readFileSync(join(defaultGraphsDir(), 'overlays/research-wide-launch.yaml'), 'utf8');
+    const parsedOverlay = parseGraphOverlayYaml(overlaySource, 'research-wide-launch.yaml');
+    expect(parsedOverlay.errors).toEqual([]);
+    const decision = decideTemplate({
+      goalType: 'research',
+      authority: resolveGraphAuthority({ flag: true }),
+      overlays: [parsedOverlay.overlay!],
+      state: { goal_id: '8890a94958dde35e' },
+      stage: 'launch',
+    });
+    expect(decision.appliedIds).toEqual(['research-wide-launch']);
+    expect(decision.rejections.filter((rejection) => rejection.kind === 'node-without-contract')).toEqual([]);
     const walk = await walkResearchLoop(undefined);
     const atEight = walk.budgets.find((row) => row.node === 'investigate' && row.visits === 8);
     expect(atEight).toMatchObject({ node: 'investigate', visits: 8, maxVisits: 12, exceeded: false });

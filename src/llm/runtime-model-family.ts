@@ -4,7 +4,7 @@ import type { LLMProviderName } from '../user-config.js';
  *  `src/llm/model-defaults.ts` (that module imports this file). */
 export type RuntimeLlmModelFamily =
   | 'grok' | 'anthropic' | 'openai' | 'openai-codex' | 'gemini' | 'local'
-  | 'kimi' | 'qwen' | 'glm' | 'openrouter' | 'bedrock' | 'unknown';
+  | 'kimi' | 'qwen' | 'glm' | 'openrouter' | 'opengateway' | 'bedrock' | 'unknown';
 
 export function inferRuntimeLlmModelFamily(model: string | undefined): RuntimeLlmModelFamily {
   if (!model) return 'unknown';
@@ -13,6 +13,7 @@ export function inferRuntimeLlmModelFamily(model: string | undefined): RuntimeLl
   // ⛔ 2026-09-23 — 게이트웨이 접두가 «먼저»다. 안 그러면 `openrouter/anthropic/claude-…` 가 `anthropic` 으로
   //   읽혀 openrouter 와 «비호환»이 되고, `openrouter/z-ai/…` 는 `unknown` 이라 아무 provider 와도 «호환»이 됐다.
   if (m.startsWith('openrouter/')) return 'openrouter';
+  if (m.startsWith('opengateway/')) return 'opengateway';
   // ⭐ BEDROCK-PROVIDER — Bedrock 전용 꼴(`anthropic.claude-…`·지역 접두·`bedrock/…`)이 `includes('claude')` 보다 «먼저».
   //   1st-party id(`claude-…`)는 그대로 anthropic 이다(불변).
   if (m.startsWith('bedrock/') || /^(?:[a-z]{2,6}\.)?anthropic\.claude-/.test(m)) return 'bedrock';

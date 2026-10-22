@@ -325,14 +325,14 @@ describe('nativeToolCatalog — metadata invariants', () => {
       expect(host).not.toContain('plugin');
     }
 
-    // Eight seat-message/checklist tools are skill+tui only. Keep the exact
+    // Nine seat-message/checklist tools are skill+tui only. Keep the exact
     // distribution so a new host exposure (notably MCP/chat) fails here.
-    expect(nativeToolCatalog).toHaveLength(191);
+    expect(nativeToolCatalog).toHaveLength(192);
     expect([...distribution.entries()].sort()).toEqual([
       // CTX2 #23185 — context_now(맥락 한 문 · READ-ONLY 자기관측)가 MCP 에 더해졌다.
       ['mcp', 17],
       ['skill', 33],
-      ['skill,tui', 98],
+      ['skill,tui', 99],
       // 🆕 AskUserQuestion — 챗에서 띄운 자식이 사람에게 «되물을» 수 있어야 한다(2026-09-08).
       //   ⛔ #16003 이 SelfImplement 만 열고 이 짝을 안 열어서 챗 자식은 물을 도구가 없었다.
       ['skill,tui,chat', 1],

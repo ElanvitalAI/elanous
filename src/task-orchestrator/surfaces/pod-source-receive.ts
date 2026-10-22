@@ -179,6 +179,24 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
       'if ! [[ "$pr_sha" =~ ^[0-9a-f]{40}$ ]]; then exit 5; fi',
       `if ! git cat-file -e "$pr_sha^{commit}" 2>/dev/null; then git fetch --depth 50 origin pull/${n}/head || exit 5; fi`,
       `git checkout -B pr-${n} "$pr_sha" || exit 5`,
+      // A pinned image starts at one shallow main commit. Fetching a PR tip at
+      // depth 50 can leave that pin and the PR in disconnected shallow spans.
+      // Deepen only after merge-base fails; the gate still reports unavailable
+      // if ancestry cannot be obtained.
+      'remote_info=$(git ls-remote --symref origin HEAD 2>/dev/null) || { printf \'ELANOUS_POD_COMPARISON_BASE unavailable\\n\'; exit 5; }',
+      `base_branch=$(printf '%s\\n' "$remote_info" | awk '$1=="ref:" && $3=="HEAD" && $2 ~ /^refs\\/heads\\// {sub(/^refs\\/heads\\//, "", $2); print $2}')`,
+      'if [ -n "$base_branch" ] && git check-ref-format --branch "$base_branch" >/dev/null 2>&1; then',
+      '  base_ref="refs/remotes/origin/$base_branch"',
+      '  git fetch --depth 50 origin "+refs/heads/$base_branch:$base_ref" || { printf \'ELANOUS_POD_COMPARISON_BASE unavailable\\n\'; exit 5; }',
+      '  git symbolic-ref refs/remotes/origin/HEAD "$base_ref" || exit 5',
+      '  if ! git merge-base HEAD "$base_ref" >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository)" = true ]; then',
+      `    git fetch --deepen=100 origin "+refs/heads/$base_branch:$base_ref" +refs/pull/${n}/head:refs/remotes/origin/pr-${n}-head || printf 'ELANOUS_POD_COMPARISON_BASE deepen-failed\\n'`,
+      '  fi',
+      '  if ! git merge-base HEAD "$base_ref" >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository)" = true ]; then',
+      `    git fetch --unshallow origin "+refs/heads/$base_branch:$base_ref" +refs/pull/${n}/head:refs/remotes/origin/pr-${n}-head || { printf 'ELANOUS_POD_COMPARISON_BASE unavailable\\n'; exit 5; }`,
+      '  fi',
+      "  if ! git merge-base HEAD \"$base_ref\" >/dev/null 2>&1; then printf 'ELANOUS_POD_COMPARISON_BASE unavailable\\n'; fi",
+      "else printf 'ELANOUS_POD_COMPARISON_BASE unavailable\\n'; exit 5; fi",
       'head=$(git rev-parse HEAD)',
       "printf 'ELANOUS_POD_SOURCE pr %s\\n' \"$head\"",
     ].join('\n');

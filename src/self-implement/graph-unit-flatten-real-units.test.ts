@@ -41,6 +41,9 @@ describe('real graph unit completion boundary (graphs/journey/ta-journey.yaml + 
     expect(flat.entryNode).toBe('entry__intake');
     expect(flat.terminalNodes).toEqual(['done', 'failed', 'needs-human', 'rework']);
     expect([...flat.nodes.map((node) => node.nodeId)].sort()).toEqual([
+      'author-dialogue__author',
+      'author-dialogue__implement',
+      'author-dialogue__judge',
       'author__observe',
       'dispatch-pod__credential-refresh',
       'dispatch-pod__image-sync',
@@ -68,6 +71,13 @@ describe('real graph unit completion boundary (graphs/journey/ta-journey.yaml + 
     });
     expect(edgeOf('entry__launch-gate')).toEqual(
       expect.objectContaining({ map: expect.objectContaining({ done: 'author__observe' }) }),
+    );
+    // RFC-progressive-goal-elaboration §7 — author → author-dialogue(대화 고리) → dispatch-pod.
+    expect(edgeOf('author__observe')).toEqual(
+      expect.objectContaining({ map: expect.objectContaining({ done: 'author-dialogue__author' }) }),
+    );
+    expect(edgeOf('author-dialogue__judge')).toEqual(
+      expect.objectContaining({ map: expect.objectContaining({ done: 'dispatch-pod__pool-admit', findings: 'author-dialogue__author' }) }),
     );
     expect(edgeOf('land__enqueue')).toEqual(
       expect.objectContaining({ map: expect.objectContaining({ done: 'reflect__reflect' }) }),

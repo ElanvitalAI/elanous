@@ -23,6 +23,15 @@ const PLAN_LOADED_PROMPT = `# 플랜/핸드오프 문서 참조 감지
 5. "should I proceed?" 같은 열린 질문 금지 — 확정된 선택지(2~4개) 로 묻거나 plan 을 제출.
 6. 사용자 확인이 명확히 있을 때만 Edit/Write 로 진입.`;
 
+const DESIGN_FIRST_PROMPT = `# 새 프로젝트 구현 요청 — RFC 먼저
+
+사용자가 새 저장소나 새 프로젝트의 구현을 요청했습니다. 앱 코드·프로젝트 설정을 쓰거나 시험을 실행하기 전에 저장소 루트에 RFC.md 초안을 작성하고 명시적 승인을 요청하세요.
+
+1. 요청에 PLAN/HANDOFF/SPEC 문서가 있으면 먼저 읽고 RFC 초안에 목표·범위·비목표·설계·수용 기준을 반영하세요.
+2. RFC 초안과 결정이 필요한 항목을 제시하고 승인을 요청하세요.
+3. 승인 전에는 애플리케이션 코드·설정을 만들거나 시험을 실행하지 마세요.
+4. 승인 뒤 RFC와 대조해 구현을 시작하세요.`;
+
 const IMPLEMENTATION_READY_PROMPT = `# 명시적 구현 요청 감지
 
 사용자가 구현을 요청했습니다. **구현 요청 자체가 실행 승인입니다.** 계획을 설명한 뒤 멈추지 말고, 이번 턴 안에서 실제 코드 편집(Edit/Write)까지 진행하세요.
@@ -79,6 +88,7 @@ function promptWithNativeStructure(phase: ImplPhase, enabledTools: readonly Nati
   const { listNativeToolDisplayNamesByKind } = require('../native-tool-catalog.js') as typeof import('../native-tool-catalog.js');
   const namesByKind = listNativeToolDisplayNamesByKind(enabledTools);
   switch (phase) {
+    case 'design-first': return DESIGN_FIRST_PROMPT;
     case 'plan-loaded': {
       let prompt = PLAN_LOADED_PROMPT;
       prompt = replaceDirective(prompt, '1. 먼저 Read 로 문서 전체를 읽으세요 (offset/limit 없이).', namesByKind, ['read']);
@@ -111,6 +121,7 @@ export function promptForPhase(phase: ImplPhase, options: ImplDisciplinePromptOp
   }
   switch (phase) {
     case 'plan-loaded': return PLAN_LOADED_PROMPT;
+    case 'design-first': return DESIGN_FIRST_PROMPT;
     case 'implementation-ready': return IMPLEMENTATION_READY_PROMPT;
     case 'idle': return '';
   }

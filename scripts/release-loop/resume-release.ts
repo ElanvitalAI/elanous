@@ -10,7 +10,7 @@ import { lastJsonObject, runGraph, verifyReleaseCommandRoot, type GraphRunState 
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
-import { changedFilesBetween, clearPartialPlan, planPartialRegate, writePartialPlan } from './gate-partial.js';
+import { changedFilesBetween, clearPartialPlan, planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
@@ -173,13 +173,50 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
   const reachesGate = (opts.from === 'gate' || opts.from === 'export-check') && fromIndex >= 0 && gateIndex >= fromIndex;
   // The default applies only where it can help: a gate re-run on a tip that moved. An unchanged tip re-uses its own
   // shard results by commit already.
-  if (opts.partial === false || (auto && (!reachesGate || !tip.changed))) return { requested: false };
+  if (opts.partial === false || (auto && (!reachesGate || (!tip.changed && opts.from !== 'gate')))) return { requested: false };
   const fallback = (reason: string): PartialOutcome => {
-    debug.log('release-loop.resume', 'partial-fallback', { version: tip.version, reason, auto });
+    debug.log('release-loop.resume', 'partial-fallback', { version: tip.version, reason, auto,
+      planKind: 'full', remeasureFileCount: 0, preservedShardCount: 0, fallbackReason: reason });
     return { requested: true, applied: false, reason, ...(auto ? { auto: true as const } : {}) };
   };
   if (!reachesGate) return fallback('--partial requires a restart that reaches gate');
-  if (!tip.changed) return fallback('release branch tip unchanged — nothing new to re-check');
+  if (!tip.changed) {
+    if (opts.from !== 'gate') return fallback('same-commit stalled-shard recheck requires --from gate');
+    const saved = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;
+    const gateRecord = saved.nodes.find((node) => node.nodeId === 'gate');
+    const previousGate = gateRecord ? lastJsonObject(gateRecord.output) as Record<string, unknown> | undefined : undefined;
+    const stalled = previousGate?.stalledShards;
+    const summary = previousGate?.partialSummary as { pass?: unknown; fail?: unknown; errors?: unknown; ran?: unknown; files?: unknown } | undefined;
+    const measured = previousGate?.partialFailures as { failures?: unknown; errors?: unknown } | undefined;
+    if (previousGate?.outcome !== 'error' || previousGate.commit !== tip.to || !Array.isArray(stalled) || !stalled.length || !summary || !measured
+      || !['pass', 'fail', 'errors', 'ran', 'files'].every((key) => Number.isSafeInteger(summary[key as keyof typeof summary]) && Number(summary[key as keyof typeof summary]) >= 0)
+      || !Array.isArray(measured.failures) || !measured.failures.every((id) => typeof id === 'string')
+      || !Array.isArray(measured.errors) || !measured.errors.every((id) => typeof id === 'string')
+      || measured.failures.length !== Number(summary.fail) || measured.errors.length !== Number(summary.errors))
+      return fallback('same-commit gate has no complete stalled-shard measurement record');
+    const stalledFiles: string[] = [];
+    for (const item of stalled) {
+      if (!item || typeof item !== 'object' || !Array.isArray((item as { files?: unknown }).files)
+        || !(item as { files: unknown[] }).files.every((file) => typeof file === 'string')
+        || !['incomplete', 'no-output', 'job-failed', 'exit-code', 'unattributed', 'timeout'].includes(String((item as { reason?: unknown }).reason)))
+        return fallback('stalled-shard record is malformed');
+      stalledFiles.push(...(item as { files: string[] }).files);
+    }
+    const closure = (deps.closureTree ?? ((commit: string) => gitClosureTree(deps.repo ?? process.cwd(), commit)))(tip.to);
+    const tracked = new Set(closure.files);
+    const preservedShardCount = Number.isSafeInteger(previousGate?.preservedShardCount)
+      && Number(previousGate?.preservedShardCount) >= 0 ? Number(previousGate?.preservedShardCount) : undefined;
+    const planned = planStalledShardRecheck({ version: tip.version, measuredCommit: tip.to, forCommit: tip.to,
+      failures: measured.failures as string[], errors: measured.errors as string[], stalledFiles,
+      ...(preservedShardCount === undefined ? {} : { preservedShardCount }),
+      existsAtCommit: (file) => tracked.has(file) });
+    if (!planned.ok) return fallback(planned.reason);
+    const path = writeRecheckPlan(root, planned.plan);
+    debug.log('release-loop.resume', 'stalled-recheck-planned', { version: tip.version, commit: tip.to,
+      planKind: planned.plan.kind, remeasureFileCount: planned.plan.files.length,
+      preservedShardCount: planned.plan.preservedShardCount ?? 0, fallbackReason: null, path });
+    return { requested: true, applied: true, files: planned.plan.files.length, priorCommit: tip.to, ...(auto ? { auto: true as const } : {}) };
+  }
   let prior: { commit?: unknown; failures?: unknown; errors?: unknown } | undefined;
   for (const location of [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])]) {
     const path = join(location, 'release', tip.version, 'gate-failures.json');

@@ -1,10 +1,11 @@
 // ── git-fs module (GT1) ──
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import {
   findGitDir,
   readGitHead,
@@ -23,6 +24,14 @@ import {
   __setGitSnapshotRebuildHoldForTest,
 } from '../src/git-fs/index.js';
 import { buildSessionRuntimeSystemMessages } from '../src/session-runtime/index.js';
+import { buildDashboardTurnPreamble } from '../src/dashboard/turn-preamble.js';
+import { resetTurnSessionLayers } from '../src/dashboard/turn-session-layers.js';
+import { refreshSelfAmbientCache, _resetSelfAmbientCacheForTest } from '../src/agent/self-ambient-cache.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+import { debug } from '../src/debug/log.js';
+import { openSurfaceEventsDb } from '../src/domains/surface-events.js';
+import { recordSelfEvent } from '../src/domains/self-awareness.js';
+import type { getUserConfig } from '../src/user-config.js';
 
 function runGit(cwd: string, args: string[]): void {
   execFileSync('git', args, {
@@ -424,6 +433,22 @@ describe('git-fs: async refresh + stale-while-revalidate snapshot', () => {
     try { rmSync(repo, { recursive: true, force: true }); } catch {}
   });
 
+  test('a slow real git snapshot probe does not block an event-loop timer', async () => {
+    const hook = join(repo, '.git', 'slow-fsmonitor');
+    const entered = join(repo, '.git', 'slow-probe-entered');
+    writeFileSync(hook, `#!/bin/sh\ntouch '${entered}'\nsleep 1\nprintf '\\0'\n`);
+    chmodSync(hook, 0o755);
+    runGit(repo, ['config', 'core.fsmonitor', hook]);
+    // Confirm the real git subprocess has entered its slow hook before observing the timer.
+    const snapshot = refreshGitSnapshotAsync(repo);
+    const deadline = Date.now() + 3_000;
+    while (!existsSync(entered) && Date.now() < deadline) await delay(10);
+    expect(existsSync(entered)).toBe(true);
+    const first = await Promise.race([delay(25).then(() => 'timer'), snapshot.then(() => 'snapshot')]);
+    expect(first).toBe('timer');
+    expect(await snapshot).toContain('Current branch: main');
+  }, 10_000);
+
   test('refreshDirtyAsync matches the sync probe and shares one in-flight probe', async () => {
     writeFileSync(join(repo, 'new.md'), 'x');
     const first = refreshDirtyAsync(repo, { force: true });
@@ -433,6 +458,33 @@ describe('git-fs: async refresh + stale-while-revalidate snapshot', () => {
     expect(view.dirty).toEqual(refreshDirty(repo, { force: true }).dirty);
     expect(view.dirty!.untracked).toBe(1);
   });
+
+  test('a late async dirty probe cannot replace a subsequent synchronous refreshDirty save', async () => {
+    const hook = join(repo, '.git', 'race-fsmonitor');
+    const entered = join(repo, '.git', 'race-probe-entered');
+    const release = join(repo, '.git', 'race-probe-release');
+    writeFileSync(hook, `#!/bin/sh\ntouch '${entered}'\nwhile [ ! -e '${release}' ]; do sleep 0.05; done\nprintf '\\0'\n`);
+    chmodSync(hook, 0o755);
+    runGit(repo, ['config', 'core.fsmonitor', hook]);
+    const pending = refreshDirtyAsync(repo, { force: true });
+    try {
+      const deadline = Date.now() + 3_000;
+      while (!existsSync(entered) && Date.now() < deadline) await delay(10);
+      expect(existsSync(entered)).toBe(true);
+      runGit(repo, ['config', '--unset', 'core.fsmonitor']);
+      writeFileSync(join(repo, 'saved.txt'), 'sync');
+      const saved = refreshDirty(repo, { force: true });
+      expect(saved.dirty!.untracked).toBe(1);
+      rmSync(join(repo, 'saved.txt'));
+      writeFileSync(release, '');
+      await pending;
+      expect(getGitStatusView(repo).dirty).toEqual(saved.dirty);
+      expect(getGitStatusView(repo).lastDirtyProbeAt).toBe(saved.lastDirtyProbeAt);
+    } finally {
+      writeFileSync(release, '');
+      await pending;
+    }
+  }, 10_000);
 
   test('refreshDirtyAsync throttles like the sync probe', async () => {
     await refreshDirtyAsync(repo, { force: true });
@@ -694,6 +746,57 @@ describe('git-fs: async refresh + stale-while-revalidate snapshot', () => {
     __setGitSnapshotRebuildHoldForTest(null);
     release();
   });
+
+  test('production TUI preamble consumes a warmed real git snapshot and ambient worker result', async () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), 'gitfs-tui-state-'));
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const wasEnabled = debug.enabled;
+    const events: string[] = [];
+    const snapshotEvents: string[] = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string) => {
+      if (category === 'self-ambient.cache') events.push(event);
+      if (category === 'git-fs.snapshot') snapshotEvents.push(event);
+    }) as typeof debug.log);
+    try {
+      process.env.ELANOUS_STATE_DIR = stateRoot;
+      setElanousConfigDir(stateRoot);
+      resetTurnSessionLayers();
+      _resetSelfAmbientCacheForTest();
+      if (!wasEnabled) debug.setDiagEnabled(true);
+      const db = openSurfaceEventsDb();
+      try { recordSelfEvent(db, { tool: 'gitfs-test', summary: 'tui-worker-real-store-marker' }); }
+      finally { db.close(); }
+      await Promise.all([refreshGitSnapshotAsync(repo), refreshSelfAmbientCache()]);
+      expect(events).toContain('worker-refreshed');
+      // Force the production 3s TTL to expire without aging beyond the 60s TUI stale window.
+      await delay(3_100);
+      writeFileSync(join(repo, 'after-warm.txt'), 'dirty');
+      const messages = buildDashboardTurnPreamble({
+        userText: 'continue', cwd: repo, userConfig: { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig>,
+        sessionId: 'gitfs-tui-worker', memory: false, controlEnv: {},
+      });
+      const gitMessage = messages.find(m => String(m.content).includes('## Git Snapshot'));
+      expect(String(gitMessage?.content)).toContain('Current branch: main');
+      expect(String(gitMessage?.content)).not.toContain('after-warm.txt');
+      expect(snapshotEvents).toContain('stale-hit');
+      expect(events).toContain('hit');
+      expect(events).not.toContain('sync');
+      expect(messages.some(m => String(m.content).includes('tui-worker-real-store-marker'))).toBe(true);
+      // The stale hit schedules an off-loop rebuild; no direct refresh is needed.
+      expect(await waitForPeek(repo, 'after-warm.txt')).toBe(true);
+      clearGitSnapshotCache();
+      expect(buildSessionRuntimeSystemMessages({ cwd: repo })[0]!.content).toContain('?? after-warm.txt');
+    } finally {
+      spy.mockRestore();
+      if (!wasEnabled) debug.setDiagEnabled(false);
+      resetTurnSessionLayers();
+      _resetSelfAmbientCacheForTest();
+      resetElanousConfigDir();
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   test('turn path (buildSessionRuntimeSystemMessages with a stale window) serves the warm snapshot without a sync rebuild', () => {
     // Warmed 10s ago: past the 3s TTL, inside the TUI stale window.

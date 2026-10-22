@@ -9,6 +9,7 @@ import { getUserConfig } from '../../user-config.js';
 import { resolveWarmPoolProfile, resolveWarmPoolQuota, type WarmPoolTier } from '../../self-implement/pod-warm-pool-profile.js';
 import { WarmPodTransport, probeWarmPodContext, warmWorkerPodManifest, type WarmPodSpec, type WarmPodTransportResult } from './pod-warm-worker-pod.js';
 import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
+import { patchWarmLeaseMetadata, warmLeaseMetadata } from './pod-warm-provenance.js';
 
 // Cold source install on node-b exceeded the old five-minute Ready wait (2026-10-20).
 const POD_READY_WAIT_SECONDS = 900;
@@ -282,7 +283,9 @@ export class WarmPodProvider {
     const row = acquired.value;
     const leasedId = row?.attrs?.leaseId;
     const generation = row?.attrs?.generation;
+    const podUid = row?.attrs?.podUid;
     if (!workerId(row?.name) || typeof leasedId !== 'string' || !leasedId
+      || typeof podUid !== 'string' || !podUid
       || !Number.isSafeInteger(generation) || generation < 1) return fallback('lease-unavailable');
     // Acquisition selects by host/key, not by worker ID. Resolve the returned worker
     // before choosing its transport; an unknown worker must not be executed or fenced.
@@ -295,13 +298,25 @@ export class WarmPodProvider {
       return fallback('lease-unavailable');
     }
     if (!row.attrs?.key || !keyEquals(row.attrs.key, leasedCandidate.spec.key)) {
-      const command: WarmWorkerCommand = { ...input, leaseId: leasedId, generation,
+      const command: WarmWorkerCommand = { ...input, leaseId: leasedId, generation, podUid,
+        requestedAt: new Date(this.now()).toISOString(),
         workerId: row.name, key: leasedCandidate.spec.key };
-      await this.quarantine(command, 'candidate-identity-mismatch');
+      await this.quarantine(command, 'candidate-identity-mismatch', false);
       return fallback('lease-unavailable');
     }
-    const command: WarmWorkerCommand = { ...input, leaseId: leasedId, generation,
+    const command: WarmWorkerCommand = { ...input, leaseId: leasedId, generation, podUid,
+      requestedAt: new Date(this.now()).toISOString(),
       workerId: row.name, key: leasedCandidate.spec.key };
+    const admitted = patchWarmLeaseMetadata(leasedCandidate.spec, command, 'leased', this.options.kubectl);
+    if (!admitted.ok) {
+      debug.log('pod.provenance', 'lease-patch-refused', { pod: leasedCandidate.spec.name,
+        podUid, leaseId: leasedId, reason: admitted.reason }, { level: 'warn' });
+      await this.quarantine(command, 'provenance-unavailable', false);
+      return fallback('lease-unavailable');
+    }
+    debug.log('pod.provenance', 'lease-start', { pod: leasedCandidate.spec.name, podUid,
+      leaseId: leasedId, runId: command.runId, attemptId: command.attemptId,
+      requestedAt: command.requestedAt, metadata: warmLeaseMetadata(command).annotations });
     let transport: WarmPodTransportResult;
     try { transport = await this.runTransport(leasedCandidate.spec, command); }
     catch { transport = { status: 'fallback', reason: 'exec-failed', reply: null }; }
@@ -330,16 +345,33 @@ export class WarmPodProvider {
     const released = await this.transition(command, 'release');
     const machineToken = this.options.machineTokens?.[candidate.host];
     // Sanitizing is the producer's machine-scoped acknowledgement, after transport's cleanup and ACK.
-    if (!released || !token(machineToken) || !await this.transition(command, 'sanitize', machineToken)) {
+    const cleared = released ? patchWarmLeaseMetadata(candidate.spec, command, 'idle', this.options.kubectl)
+      : { ok: false, reason: 'release-failed' };
+    if (!cleared.ok) debug.log('pod.provenance', 'lease-patch-refused', { pod: candidate.spec.name,
+      podUid: command.podUid, leaseId: command.leaseId, reason: cleared.reason }, { level: 'warn' });
+    if (!cleared.ok || !token(machineToken) || !await this.transition(command, 'sanitize', machineToken)) {
       await this.quarantine(command, 'sanitize-unavailable');
       throw new Error('warm sanitize unavailable');
     }
+    debug.log('pod.provenance', 'lease-end', { pod: candidate.spec.name, podUid: command.podUid,
+      leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId,
+      releasedAt: new Date(this.now()).toISOString(), result: 'sanitized' });
   }
 
-  async quarantine(command: WarmWorkerCommand, reason: string): Promise<void> {
+  /** `leaseStarted=false` marks a refusal before `lease-start`, so start/end history stays paired. */
+  async quarantine(command: WarmWorkerCommand, reason: string, leaseStarted = true): Promise<void> {
     if (!await this.transition(command, 'quarantine', this.options.memberToken, reason.slice(0, 120) || 'mismatch')) {
       throw new Error('warm quarantine unavailable');
     }
+    const candidate = this.options.candidates.find(row => row.spec.workerId === command.workerId);
+    if (candidate) {
+      const cleared = patchWarmLeaseMetadata(candidate.spec, command, 'quarantined', this.options.kubectl);
+      if (!cleared.ok && reason !== 'provenance-unavailable') debug.log('pod.provenance', 'lease-patch-refused', { pod: candidate.spec.name,
+        podUid: command.podUid, leaseId: command.leaseId, reason: cleared.reason }, { level: 'warn' });
+    }
+    debug.log('pod.provenance', leaseStarted ? 'lease-end' : 'lease-refused', { podUid: command.podUid,
+      leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId, leaseStarted,
+      releasedAt: new Date(this.now()).toISOString(), result: 'quarantined', reason });
   }
 
 

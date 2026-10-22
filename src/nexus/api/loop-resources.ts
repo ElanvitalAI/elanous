@@ -38,13 +38,25 @@ export function observeLoopResources(deps: {
   });
 }
 
+/** The waiting cell a seat is served: the single ID the Nexus API and the PWA resource screen agree on. */
+export function waitingCellId(cell: { id?: unknown } | null | undefined): string | null {
+  const id = cell?.id;
+  return typeof id === 'string' && id.trim() !== '' ? id : null;
+}
+
+/** A seat names a waiting cell only when that cell has a real ID; a blank ID is served as no cell. */
+export function withWaitingCellIds(resource: TrafficResult): TrafficResult {
+  return { ...resource, seats: resource.seats.map(row =>
+    row.nextCell && waitingCellId(row.nextCell) === null ? { ...row, nextCell: null } : row) };
+}
+
 /** The Nexus resource view reads the existing control ledger; it never allocates a second pool ledger. */
 export function handleLoopResourcesGet(
   observe: () => TrafficResult = observeLoopResources,
   listPodWorkers: () => ResourceView[] = () => new ResourceLedger(effectiveInstanceRoot()).list({ kind: 'pod-worker-lease' }),
 ): Response {
   try {
-    const resource = observe();
+    const resource = withWaitingCellIds(observe());
     try {
       const podWorkers = listPodWorkers().map(row => ({ id: row.id, machine: row.machine, workerId: row.name,
         key: row.attrs.key, state: row.attrs.state, generation: row.attrs.generation, ageMs: row.ageMs, expired: row.expired }));

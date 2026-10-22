@@ -1,27 +1,15 @@
 import { buildHarnessRunDevSpec, runDevPipeline, type DevHarnessDispatchArgs, type DevPipelineDeps } from './dev-pipeline.js';
 import type { SurfaceUxSource } from '../agent/surface-ux/build.js';
 import { debug } from '../debug/log.js';
-import { CLI_HARNESS_RUN_ENTRANCE, describeEntranceCommand, retiredEntranceNotice } from './entrance-registry.js';
+import { CLI_HARNESS_RUN_ENTRANCE, retiredEntranceNotice } from './entrance-registry.js';
+import { HARNESS_RUN_REPLACEMENT } from './cli-help-text.js';
+export { HARNESS_RUN_REPLACEMENT, HARNESS_RUN_DEPRECATION_HELP } from './cli-help-text.js';
 
 /** `elanous logs --category`로 레거시 입구의 제거 안전시점을 조회하는 브레드크럼. */
 export const HARNESS_RUN_DEPRECATION_LOG_CATEGORY = 'harness-cli.deprecated';
-export const HARNESS_RUN_REPLACEMENT = 'elanous harness say <objective>';
 /** 실행 «중»에 사람에게 내는 한 줄. ⛔ `--help` 용은 아래 HARNESS_RUN_DEPRECATION_HELP 다 —
  *  그쪽은 레지스트리가 은퇴 표시와 «갈 곳»을 이미 붙이므로 여기서 그것을 되풀이하지 않는다. */
 export const HARNESS_RUN_DEPRECATION_NOTICE = `ℹ️  \`elanous harness run\`은 deprecated 입구입니다 — \`${HARNESS_RUN_REPLACEMENT}\`로 이행하세요.`;
-
-/** `--help` 머리에 붙는 은퇴 표시.
- *
- *  ⛔⭐ **문면을 «손으로 짓지 않는다»** — 레지스트리가 낸다(RFC-one-door-many-entrances P2).
- *  📏 2026-08-20 실측: 은퇴로 «선언»된 입구 셋 중 `--help` 가 그 사실을 말한 것은 하나뿐이었고,
- *  ***그 하나(여기)조차 문면을 레지스트리와 «따로» 들고 있었다.***
- *  ⇒ 🔑 선언과 표면이 «두 곳»에 살면 한쪽만 고쳐지고 다른 쪽이 조용히 늙는다.
- *  ⚠️ 상수 «이름»은 유지한다 — 시험과 index.ts 가 이 이름으로 읽는다(뜻이 좁아지지 않는다). */
-export const HARNESS_RUN_DEPRECATION_HELP = describeEntranceCommand(
-  CLI_HARNESS_RUN_ENTRANCE,
-  HARNESS_RUN_REPLACEMENT,
-  '이 입구는 더 이상 실행되지 않습니다.',
-).trimEnd();
 
 /** ⭐ 진행 릴레이를 «단 곳» — 하니스 시퀀서가 스테이지마다 내는 progress 를 CLI 부모 stdout 까지 잇는다.
  *

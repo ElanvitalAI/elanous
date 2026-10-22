@@ -200,6 +200,13 @@ describe('-r bookmark resolution', () => {
       .toEqual({ present: false, value: '' });
   });
 
+  test('`--tui` consumes its value before a root `-r` bookmark flag', () => {
+    expect(readRemoteFlag(['--tui', 'next', '-r'])).toEqual({ present: true, value: '' });
+    expect(stripRemoteFlags(['--tui', 'next', '-r'])).toEqual(['--tui', 'next']);
+    expect(readRemoteFlag(['--tui', 'next', 'autopilot', 'link', '-r', 'friend']))
+      .toEqual({ present: false, value: '' });
+  });
+
   // ⭐⭐⭐ **목록이 늙는 것을 시험이 «먼저» 잡는다 — 이제 «소스 텍스트»가 아니라
   //    commander 자신의 «옵션 메타데이터»로 판정한다.**
   //

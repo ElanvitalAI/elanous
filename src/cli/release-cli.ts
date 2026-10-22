@@ -8,7 +8,7 @@
 //   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready] [--force-new]
 //   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--gate-pod-pool <pool>] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
-//   elanous release rehearsal tick [--apply] [--checkout <dir>] [--shards <n>] [--remote <host>] [--json]
+//   elanous release rehearsal tick [--apply] [--checkout <dir>] [--shards <n>] [--remote <host>] [--recovery-run <id>] [--json]
 //   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 − 60분 main export 포함 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
 //   elanous release cut-branch --version <x.y.z> --base <sha> --pick <sha>... [--dry-run]
 //
@@ -17,7 +17,7 @@
 // ⛔ prepare 는 «네트워크에 아무것도 쓰지 않는다»(공개 저장소를 «읽기»로 clone 만 한다) — 쓰는 것은 publish 뿐이고 `--yes` 가 있어야 한다.
 //    공개는 되돌릴 수 없다(그 판은 영구히 공개 라이선스).
 // ⛔ 공개본은 «원본 매니페스트»(`release/public-export.yaml`)대로만 만든다 — 매매 실행 코드는 그 매니페스트가 이미 뺀다(🅢 #20529).
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -27,10 +27,10 @@ import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
-import { getUserConfig, userConfigPath } from '../user-config.js';
-import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
+import { getUserConfig } from '../user-config.js';
+import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
-import { evidencePlan, landedButYellow, type MergedChecklistPr } from '../release-loop/landed-but-yellow.js';
+import { evidencePlan, fetchMergedChecklistPrs, landedButYellow, type MergedPrRunner } from '../release-loop/landed-but-yellow.js';
 import { formatSchedule, getSchedule, listSchedules, setSchedule } from '../release-loop/release-schedule.js';
 import { mergedPrsLast24h, placeCell, planPullForward, pullForwardPlacementConfig, rebalance, seatMove, type PlacementPriority } from '../release-loop/placement.js';
 import { readTrafficSignal } from '../seat-loop/traffic-signal.js';
@@ -43,7 +43,7 @@ import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
 import { publishAtError } from '../../scripts/release-loop/publish-at.js';
 import { cutReleaseBranch } from '../../scripts/release-loop/cut-branch.js';
-import { planResumeReleaseRun, resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
+import { planResumeReleaseRun, resumeReleaseRun, type ResumeReleaseDeps } from '../../scripts/release-loop/resume-release.js';
 import type { AcceptedRegression } from '../../scripts/release-loop/resume.js';
 import type { PrereleaseKind } from '../../scripts/release-loop/release-version.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
@@ -57,9 +57,11 @@ import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../
 import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
 import { applyWatchList, formatGateHistory, gateHistory, ghMergedPrs } from '../../scripts/release-loop/gate-history.js';
 import { registerRfcCommands } from './rfc-cli.js';
+import { checklistCodenames, checklistVersion, isReleaseVersion, readChecklistContext, registerChecklistReadCommands } from './release-checklist-read-cli.js';
+
+export { isReleaseVersion } from './release-checklist-read-cli.js';
 
 export const DEFAULT_PUBLIC_REPO = 'ElanvitalAI/elanous';
-const SEMVER = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
 
 export interface RunResult { status: number | null; stdout: string; stderr: string }
 export type Runner = (command: string, args: readonly string[], cwd: string, opts?: { env?: NodeJS.ProcessEnv; input?: string }) => RunResult;
@@ -69,7 +71,6 @@ export const defaultRunner: Runner = (command, args, cwd, opts = {}) => {
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.error ? String(r.error) : (r.stderr ?? '') };
 };
 
-export function isReleaseVersion(version: string): boolean { return SEMVER.test(version); }
 export function isPrerelease(version: string): boolean { return version.includes('-'); }
 
 export interface ReleaseManifest {
@@ -535,45 +536,12 @@ function warnChecklistTargetPaths(input: { title: string; evidence?: string; ref
   }
 }
 
-function checklistCodenames(): Record<string, string> {
-  const path = getElanousConfigDirOverride() ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath();
-  if (!existsSync(path)) return {};
-  const raw = JSON.parse(readFileSync(path, 'utf8')) as { release?: { codenames?: Record<string, string> } };
-  return raw.release?.codenames ?? {};
-}
-
-function checklistVersion(input: string | undefined, codenames: Record<string, string>): string {
-  const v = input ?? devVersion().replace(/-dev\.\d+$/, '');
-  const resolved = isReleaseVersion(v) ? v : Object.entries(codenames).find(([, name]) => name === v)?.[0] ?? v;
-  if (!isReleaseVersion(resolved)) throw new CliUserError(`체크리스트 판 또는 별칭이 아니다: ${v}`);
-  return resolved;
-}
-
-async function checklistOutput(v: string, codenames: Record<string, string>, mode: 'list' | 'status', json?: boolean, owner?: string): Promise<void> {
-  if (owner !== undefined) parseOwner(owner);
-  const snapshot = listChecklist(v);
-  const data = owner === undefined ? snapshot : { ...snapshot, items: snapshot.items.filter((item) => ownerMatches(item.owner, owner)) };
-  const summary = summarizeChecklist(data);
-  const parity = data.items.flatMap((item) => {
-    const why = item.kind === 'screen' ? parityGap(item.evidence) : null;
-    return why ? [{ id: item.id, why }] : [];
-  });
-  const result = { ...data, codename: codenames[v] ?? '', ...summary, parity };
-  for (const { id, why } of parity) debug.log('release.checklist', 'parity-warning', { version: v, id, why });
-  if (json) { await writeStdoutJson(`${JSON.stringify(result)}\n`); return; }
-  console.log(`⚠ 짝 경고 ${parity.length}: ${parity.map(({ id }) => id).join(', ') || '없음'}`);
-  console.log(`${v}${result.codename ? ` (${result.codename})` : ''} · 공개 ${data.released || '없음'} · 개발 ${data.dev}`);
-  if (mode === 'list') {
-    for (const item of data.items) console.log(`${({ green: '🟢', yellow: '🟡', red: '🔴', done: '✅' } as const)[item.status]} ${item.id} ${item.title}${item.owner ? ` · ${item.owner}` : ''}${item.ceoMinutes !== undefined ? ` · 대표 손 ${item.ceoMinutes}분${item.ceoDate ? ` (${item.ceoDate})` : ''}` : ''}`);
-  } else {
-    console.log(`🟢 ${summary.green} · 🟡 ${summary.yellow} · 🔴 ${summary.red} · ✅ ${summary.done}`);
-    console.log(`🔴 칸: ${summary.blocked.join(', ') || '없음'}`);
-    console.log(`담당별: ${Object.entries(summary.byOwner).map(([owner, count]) => `${owner} ${count}`).join(' · ') || '없음'}`);
-  }
-}
-
 export interface LandedButYellowDeps {
   run?: Runner;
+  /** Async gh for the merged-PR windows; wins over `run` (tests inject delay). */
+  runAsync?: MergedPrRunner;
+  /** logs.db sink for the stage timings; the default registers only on the real (uninjected) gh path. */
+  registerLogSink?: () => Promise<unknown>;
   checklist?: typeof listChecklist;
   now?: () => Date;
   evidenceAdd?: typeof features.evidenceAdd;
@@ -581,45 +549,18 @@ export interface LandedButYellowDeps {
   released?: typeof features.releasedVersion;
 }
 
-const MERGED_PR_LIMIT = 400;
-
-function mergedChecklistPrs(since: string, now: Date, run: Runner): { prs: MergedChecklistPr[]; truncated: boolean } {
-  const cwd = process.cwd();
-  const fetch = (lower: string, upper?: string, limit = MERGED_PR_LIMIT): MergedChecklistPr[] => {
-    const search = `merged:>=${lower}${upper ? ` merged:<${upper}` : ''}`;
-    const raw = must(run('gh', ['pr', 'list', '--state', 'merged', '--search', search, '--limit', String(limit), '--json', 'number,title,body,mergedAt'], cwd), '병합 PR 조회(gh)');
-    const page = JSON.parse(raw) as MergedChecklistPr[];
-    if (!Array.isArray(page)) throw new Error('병합 PR 조회(gh): 배열이 아니다');
-    return page;
-  };
-  const unique = new Map<number, MergedChecklistPr>();
-  let truncated = false;
-  const collect = (page: MergedChecklistPr[]) => {
-    for (const pr of page) if (!unique.has(pr.number)) unique.set(pr.number, pr);
-  };
-  const first = fetch(since);
-  if (first.length < MERGED_PR_LIMIT) return { prs: first, truncated: false };
-  const lower = Date.parse(`${since}T00:00:00Z`);
-  const upper = Math.max(lower + 1000, Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
-  const visit = (start: number, end: number): void => {
-    const from = new Date(start).toISOString();
-    const to = new Date(end).toISOString();
-    const page = fetch(from, to);
-    if (page.length < MERGED_PR_LIMIT) { collect(page); return; }
-    if (end - start <= 1000) {
-      // The second-precision search cannot be subdivided; probe one extra row to distinguish exactly 400 from a real truncation.
-      const probe = fetch(from, to, MERGED_PR_LIMIT + 1);
-      collect(probe.slice(0, MERGED_PR_LIMIT));
-      if (probe.length > MERGED_PR_LIMIT) truncated = true;
-      return;
-    }
-    const middle = start + Math.floor((end - start) / 2000) * 1000;
-    visit(start, middle);
-    visit(middle, end);
-  };
-  visit(lower, upper);
-  return { prs: [...unique.values()], truncated };
-}
+/** A spawn failure (gh missing from PATH) resolves `status: null` with the error text — the shape the sync runner gave. */
+const defaultMergedPrRunner: MergedPrRunner = (command, args, cwd) => new Promise((resolve) => {
+  const out: Buffer[] = [], err: Buffer[] = [];
+  const failed = (error: unknown) => resolve({ status: null, stdout: Buffer.concat(out).toString('utf8'), stderr: String(error) });
+  let child: ReturnType<typeof spawn>;
+  try { child = spawn(command, [...args], { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+  catch (error) { failed(error); return; }
+  child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
+  child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
+  child.on('error', failed);
+  child.on('close', (code) => resolve({ status: code, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }));
+});
 
 function printLandedRows(rows: ReturnType<typeof landedButYellow>, items: ReturnType<typeof listChecklist>['items']): void {
   const updatedAtById = new Map(items.map((item) => [item.id, item.updatedAt]));
@@ -647,7 +588,7 @@ function compareReleaseVersions(a: string, b: string): number {
   return 0;
 }
 
-export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}): void {
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: ResumeReleaseDeps = {}): void {
   registerRfcCommands(program);
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
@@ -789,11 +730,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--json', '결과 JSON')
     .option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
   const mayWrite = (cmd: Command) => mayWriteLedger(`release checklist ${cmd.name()}`, Boolean(cmd.optsWithGlobals().hqOverride), releaseLedgerRoot());
-  const context = (cmd: Command) => {
-    const opts = { ...(cmd.parent?.parent?.opts() as { version?: string; json?: boolean }), ...(cmd.parent?.opts() as { version?: string; json?: boolean }), ...(cmd.opts() as { version?: string; json?: boolean }) };
-    const codenames = checklistCodenames();
-    return { version: checklistVersion(opts.version, codenames), codenames, json: opts.json };
-  };
+  const context = readChecklistContext;
   const withContext = (cmd: Command) => cmd.option('--version <v>', '판 또는 별칭').option('--json', '결과 JSON').option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
   const actor = () => process.env.ELANOUS_TRACK || 'cli';
   withContext(checklist.command('rubric').description('루브릭 채점(읽기 전용)'))
@@ -843,20 +780,30 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       console.log(renderRefsStatus(rows));
       console.log(`칸 ${rows.length} · 🟢 ${byStatus.green} · 🟡 ${byStatus.yellow} · 🔴 ${byStatus.red} · ✅ ${byStatus.done}`);
     });
-  withContext(checklist.command('list').description('모든 칸')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
-    const { version, codenames, json } = context(cmd);
-    await checklistOutput(version, codenames, 'list', json, opts.owner);
-  });
-  withContext(checklist.command('status').description('상태 요약')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
-    const { version, codenames, json } = context(cmd);
-    await checklistOutput(version, codenames, 'status', json, opts.owner);
-  });
+  registerChecklistReadCommands(checklist);
   withContext(checklist.command('landed-but-yellow').description('병합 PR 이 있지만 노랑·빨강인 칸(기본 읽기 전용)'))
     .option('--owner <owner>', '자리 또는 하위 자리로 거르기')
     .option('--open', '미발행 일정 판 중 칸이 있는 판 전부')
     .option('--apply-evidence', '확실한 PR 짝의 근거를 붙인다(상태는 그대로)')
     .option('--dry-run', '근거 추가 없이 계획만 출력')
     .action(async (opts: { owner?: string; open?: boolean; applyEvidence?: boolean; dryRun?: boolean }, cmd: Command) => {
+      // Stage timings (LANDED-YELLOW-FAST): which step ate the time — `elanous logs --category release.landed-yellow`.
+      let stageAt = performance.now();
+      const stage = (name: string, data: Record<string, unknown>) => {
+        const at = performance.now();
+        debug.log('release.landed-yellow', 'stage', { stage: name, ms: Math.round(at - stageAt), ...data });
+        stageAt = at;
+      };
+      // A standalone CLI's debug.log reaches logs.db only through a registered sink (pr land #6701 lesson). Fail-open, 1s cap.
+      const registerLogSink = landedDeps.registerLogSink ?? (landedDeps.run || landedDeps.runAsync ? undefined
+        : async () => (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('release-landed-yellow'));
+      if (registerLogSink) {
+        let sinkTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([registerLogSink(), new Promise<void>((resolve) => { sinkTimer = setTimeout(resolve, 1000); })]);
+        } catch { /* observability is fail-open */ } finally { clearTimeout(sinkTimer); }
+      }
+      stageAt = performance.now();
       try {
         const inherited = cmd.parent?.opts() as { version?: string; json?: boolean } | undefined;
         const local = cmd.opts() as { version?: string; json?: boolean };
@@ -873,6 +820,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           .filter(({ version }) => isReleaseVersion(version) && (!released || compareReleaseVersions(version, released) > 0))
           .sort((a, b) => compareReleaseVersions(a.version, b.version))
           .map(({ version }) => (landedDeps.checklist ?? listChecklist)(version)).filter((snapshot) => snapshot.items.length > 0);
+        stage('snapshots', { n: openSnapshots.length, schedules: schedules.length });
         if (opts.open && !openSnapshots.length) {
           if (json) await writeStdoutJson('[]\n'); else console.log('열린 판 없음');
           return;
@@ -887,7 +835,10 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           .map((item) => Date.parse(item.updatedAt)).filter((at) => Number.isFinite(at)));
         const since = updated.length ? new Date(updated.reduce((earliest, at) => Math.min(earliest, at))).toISOString().slice(0, 10)
           : new Date(now.getTime() - 7 * 86_400_000).toISOString().slice(0, 10);
-        const { prs, truncated } = mergedChecklistPrs(since, now, landedDeps.run ?? defaultRunner);
+        const syncRun = landedDeps.run;
+        const runAsync: MergedPrRunner = landedDeps.runAsync ?? (syncRun ? async (command, args, cwd) => syncRun(command, args, cwd) : defaultMergedPrRunner);
+        const { prs, truncated, calls } = await fetchMergedChecklistPrs(since, now, runAsync, process.cwd());
+        stage('merged-prs', { n: prs.length, calls, since, truncated });
         const results: Array<{ version: string; rows?: ReturnType<typeof landedButYellow>; plan?: ReturnType<typeof evidencePlan> }> = [];
         let totalAdded = 0, totalSkipped = 0;
         for (const snapshot of snapshots) {
@@ -914,6 +865,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             results.push({ version, rows });
           }
         }
+        stage('match', { n: results.reduce((sum, result) => sum + (result.rows?.length ?? result.plan?.length ?? 0), 0), versions: snapshots.length, prs: prs.length });
         if (opts.open) {
           if (opts.applyEvidence && !opts.dryRun) debug.log('release.checklist', 'evidence-synced', { versions: snapshots.map(({ version }) => version), added: totalAdded, skippedMention: totalSkipped });
           if (!json) console.log(`판 ${snapshots.length} · 붙임 합 ${totalAdded} · 건너뜀(언급만) 합 ${totalSkipped}`);
@@ -1389,16 +1341,34 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--checkout <dir>', '깨끗한 git 체크아웃(기본 ELANOUS_REHEARSAL_GIT_CWD)')
     .option('--shards <n>', '시험 분할 수')
     .option('--remote <host>', '게이트 호스트')
+    .option('--recovery-run <id>', '기존 실패 release-loop 런을 gate에서 명시적으로 재개(기본 예약 틱과 분리)')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { apply?: boolean; checkout?: string; shards?: string; remote?: string; json?: boolean }) => {
+    .action(async (o: { apply?: boolean; checkout?: string; shards?: string; remote?: string; recoveryRun?: string; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         const ledgerRoot = scheduleLedgerRoot();
+        if (o.recoveryRun !== undefined) {
+          if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(o.recoveryRun)) throw new Error('release rehearsal recovery: invalid run id');
+          if (o.shards !== undefined || o.remote !== undefined) throw new Error('release rehearsal recovery: --shards and --remote are unsupported; use the saved gate settings');
+          const resumeOptions = { runId: o.recoveryRun, from: 'gate', commandRoot: o.checkout ?? process.cwd() };
+          if (!o.apply) {
+            const plan = await planResumeReleaseRun(resumeOptions, resumeDeps);
+            log(`· 리허설 복구 사전점검 ${plan.preflight} · run ${plan.runId} · ${plan.version} · from ${plan.fromNode} · gate ${plan.gatePlan.mode}`);
+            return { recovery: 'planned', ...plan };
+          }
+          if (!mayWriteLedger('release rehearsal recovery', false, ledgerRoot)) throw new Error('release rehearsal recovery: ledger write denied');
+          const result = await resumeReleaseRun(resumeOptions, resumeDeps);
+          log(`· 리허설 복구 완료 · run ${o.recoveryRun} · ${result.state.status} · gate에서 재개`);
+          return { recovery: 'resumed', runId: o.recoveryRun, status: result.state.status, ...result };
+        }
         if (o.apply && !mayWriteLedger('release rehearsal tick', false, ledgerRoot)) throw new Error('release rehearsal tick: ledger write denied');
-        // The tick reports a preflight shard shortage as an unmeasured attempt; its released stage can be claimed on the next CLI tick.
         const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, shards: o.shards === undefined ? undefined : Number(o.shards), remote: o.remote, ledgerRoot }, rehearsalDeps);
         log(`· 리허설 ${result.status}${'version' in result ? ` ${result.version}` : ''}${result.status === 'due' ? ` · 실행 ${result.run ?? '-'} · 건너뜀 ${result.supersede.join(', ') || '-'}` : ''}`);
+        for (const stamp of result.stamps ?? []) {
+          if (stamp.outcome === 'unmeasured' && !stamp.result && stamp.shardPlan && (stamp.shardPlan.testFiles === 0 || stamp.shardPlan.gatePlanShards === null))
+            log(`· 리허설 ${stamp.version} ${stamp.step} · ${stamp.summary} · stage claim 해제 · 다음 tick 재시도`);
+        }
         return result;
-      }, (result) => !result.notificationFailures && !result.stamps?.some((stamp) => !['ok', 'superseded'].includes(stamp.outcome)));
+      }, (result) => result.status !== 'failed' && !result.notificationFailures && !result.stamps?.some((stamp) => !['ok', 'superseded'].includes(stamp.outcome)));
     });
   release.command('auto-start')
     .description('판 일정의 컷 창에서 릴리스 시작을 미리 본다 · --apply 로 release run --if-ready 실행')

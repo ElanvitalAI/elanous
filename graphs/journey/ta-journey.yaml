@@ -18,6 +18,15 @@ nodes:
     max_visits: 1
     budget: { inner_steps: 10 }
     contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  # 저작 ↔ 구현 대화 고리(RFC-progressive-goal-elaboration §7) — 첫 왕복 = E1 착수 구체화(goal-elaborated) ·
+  # refine 되돌이 = E3 첫 라운드 → author(goal-refined · 골 v2 · 런당 1회) — 한 번 되돌아도 author·implement·judge ×2 + done = 7 걸음 ≤ inner_steps.
+  - node_id: author-dialogue
+    kind: subgraph
+    recipe: none
+    call: author-dialogue@1
+    max_visits: 1
+    budget: { inner_steps: 20 }
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
   - node_id: dispatch-pod
     kind: subgraph
     recipe: none
@@ -73,7 +82,8 @@ nodes:
   - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
 edges:
   - { from: entry, on: outcome, map: { done: author, rework: rework, needs-human: needs-human, failed: failed } }
-  - { from: author, on: outcome, map: { done: dispatch-pod, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: author, on: outcome, map: { done: author-dialogue, rework: rework, needs-human: needs-human, failed: failed } }
+  - { from: author-dialogue, on: outcome, map: { done: dispatch-pod, needs-human: needs-human, failed: failed } }
   - { from: dispatch-pod, on: outcome, map: { done: pr, rework: rework, needs-human: needs-human, failed: failed } }
   - { from: pr, on: outcome, map: { done: harvest, rework: rework, needs-human: needs-human, failed: failed } }
   - { from: harvest, on: outcome, map: { done: land, rework: rework, needs-human: needs-human, failed: failed } }

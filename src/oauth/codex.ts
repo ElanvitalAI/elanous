@@ -458,6 +458,10 @@ export async function loadFreshCodexAuthState(
     });
     return state;
   }
+  if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1') {
+    observeCodexAuth('no-credential', { storeKey: account.storeKey, mirrorPath: mirrorPath ?? null, reason: 'access-only-expiring' });
+    return null;
+  }
   observeCodexAuth('refresh-start', {
     storeKey: account.storeKey, remainingSeconds: remainingSeconds(state),
     mirrorPath: mirrorPath ?? null, bufferMs: CODEX_REFRESH_BUFFER_MS,
@@ -602,6 +606,9 @@ export async function refreshCodexAccountHome(
     now?: () => number;
   } = {},
 ): Promise<CodexAccountRefreshResult> {
+  if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1') {
+    return { ok: false, kind: 'no-tokens', message: '원격 access 미러는 refresh 권한이 없다' };
+  }
   // ⛔ The CEO's default account (~/.codex) is shared with the official CLI — refreshing it here
   //   rotates the refresh token out from under that CLI. Named accounts only.
   if (name === DEFAULT_CODEX_ACCOUNT) {

@@ -5,8 +5,9 @@ if (process.argv.length === 3 && (process.argv[2] === '--version' || process.arg
   const { cliVersion } = await import('../src/version/code-revision.ts');
   console.log(cliVersion());
 } else {
-  const { selectLightCliRoute } = await import('../src/cli/light-entry-route.ts');
-  const route = selectLightCliRoute(process.argv.slice(2));
+  const route = process.env.ELANOUS_FAST_ROUTER === '0'
+    ? undefined
+    : (await import('../src/cli/light-entry-route.ts')).selectLightCliRoute(process.argv.slice(2));
   if (route) {
     const { runLightCli } = await import('../src/light-cli.ts');
     await runLightCli(route);

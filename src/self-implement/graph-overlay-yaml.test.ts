@@ -240,6 +240,41 @@ describe('RFC §5 3단계 — 오버레이 적용 (⛔ 얹은 «결과»를 다�
     expect(malformedInputs.rejections).toContainEqual({ kind: 'node-without-contract', overlayId: 'test', nodeId: 'rework' });
   });
 
+  test('기존 여정 선언은 보존하지만 계약 없이 실행 내용을 바꾸는 오버레이는 거절한다', () => {
+    const journeyIndex = base.nodes.findIndex((node) => node.journeyStage !== undefined && node.contract === undefined);
+    expect(journeyIndex).toBeGreaterThanOrEqual(0);
+    const journeyNode = base.nodes[journeyIndex]!;
+    const baseline = applyGraphOverlays(base, []);
+    expect(baseline.ok).toBe(true);
+
+    const changed = applyGraphOverlays(base, [overlay([
+      { op: 'replace', path: `/nodes/${journeyIndex}/recipe`, value: 'cmd:unreviewed' },
+    ])]);
+    expect(changed.ok).toBe(false);
+    if (changed.ok) return;
+    expect(changed.rejections).toContainEqual({
+      kind: 'node-without-contract', overlayId: 'test', nodeId: journeyNode.nodeId,
+    });
+
+    const removedStage = applyGraphOverlays(base, [overlay([
+      { op: 'remove', path: `/nodes/${journeyIndex}/journeyStage` },
+    ])]);
+    expect(removedStage.ok).toBe(false);
+    if (removedStage.ok) return;
+    expect(removedStage.rejections).toContainEqual({
+      kind: 'node-without-contract', overlayId: 'test', nodeId: journeyNode.nodeId,
+    });
+
+    const newRoute = applyGraphOverlays(base, [overlay([
+      { op: 'add', path: '/edges/-', value: { from: journeyNode.nodeId, to: 'stopped' } },
+    ])]);
+    expect(newRoute.ok).toBe(false);
+    if (newRoute.ok) return;
+    expect(newRoute.rejections).toContainEqual({
+      kind: 'node-without-contract', overlayId: 'test', nodeId: journeyNode.nodeId,
+    });
+  });
+
   test('새 무계약 종결 gate 는 종결 목록에 넣어도 거절한다', () => {
     const recoverEdgeIndex = base.edges.findIndex((edge) => edge.from === 'recover');
     expect(recoverEdgeIndex).toBeGreaterThanOrEqual(0);

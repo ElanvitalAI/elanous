@@ -44,7 +44,7 @@ import {
   type GoalClarificationSelfResolver,
 } from '../self-implement/goal-author-clarification.js';
 import { classifyReauthoredAsk, countMissingAuthoredConstraintMarkers, askGoalTypeDeclaration, declaredGoalType, parseGoalId } from '../self-implement/goal-author.js';
-import { observeFrontNodeEntry } from './graph-front-nodes.js';
+import { observeFrontNodeEntry, observeFrontNodeExit, observeFrontNodeUnit, type AuthorExitOutcome } from './graph-front-nodes.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { decomposeSelfDevGoal, type SelfDevDecomposeOptions, type SelfDevDecomposition } from './decompose.js';
 import { observeDecomposerSelection, readFabricDecomposeConfig, selectFabricDecomposer } from './self-orchestrate-runtime.js';
@@ -392,7 +392,7 @@ export async function recommendLaunchDecomposition(
       ...(input.runId === undefined ? {} : { runId: input.runId }),
       ...(decomposeGoalType === null ? {} : { goalType: decomposeGoalType }),
     });
-    const result = await Promise.race([
+    const result = await observeFrontNodeUnit('decompose', input.runId ?? process.env.ELANOUS_RUN_ID, decomposeGoalType ?? undefined, () => Promise.race([
       deps.decomposeGoal
         ? deps.decomposeGoal(document!)
         : decomposeSelfDevGoal(document!, {
@@ -401,7 +401,7 @@ export async function recommendLaunchDecomposition(
           observation: prelaunchDecompositionObservation(document!),
         }),
       timeout,
-    ]);
+    ]));
     if (result === timedOut) {
       // ⛔ 「시간 초과」를 「못 쟀다」로 뭉개지 않는다 — 분해기는 «아직 답하는 중»이고
       //   그 답은 `prelaunch-decomposition` 이름으로 «따로» 내려앉는다(위 주석).
@@ -886,7 +886,7 @@ export async function runAskLaunchFlow(
   if (launchPreflight === false) return { kind: 'stopped-before-authoring' };
 
   await deps.beforeAuthoring?.();
-  const authorAndPreflight = async (authorAskText: string = input.askText, machineSuggestedTargetPaths: readonly string[] = []): Promise<{
+  const authorAndPreflight = async (authorAskText: string = input.askText, machineSuggestedTargetPaths: readonly string[] = [], attempt = 1): Promise<{
     readonly goalFile: string;
     readonly decision: ReturnType<typeof decideAskPreflight>;
   }> => {
@@ -918,6 +918,12 @@ export async function runAskLaunchFlow(
       })(),
       ...(launchPreflight === undefined ? {} : { launchPreflight }),
       selfResolveClarifications: selfResolveClarifications.value,
+    }).catch((error: unknown) => {
+      // GRAPH-AUTHOR-FAIL-EDGE: 저작기가 던진 자리 = author `fail` 출구. ⛔ 관측만 하고 같은 오류를 그대로 다시 던진다.
+      observeFrontNodeExit({ node: 'author', outcome: 'fail' }, {
+        ...frontObservation, attempt, reason: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
     });
     deps.print(`[ask] 저작됨: ${authored.path}`);
     // AUTHOR-TRACE: the authored goal file can be cleaned up later — keep path ⊕ sha256 ⊕ size in the run ledger and
@@ -1064,16 +1070,47 @@ export async function runAskLaunchFlow(
     return { goalFile, decision };
   };
 
+  // GRAPH-AUTHOR-FAIL-EDGE ① — 저작 «끝»의 결과를 그래프 이름으로 남긴다(관측 · 다음 걸음은 아래 코드가 그대로 정한다).
+  const authorNotGrounded = (decision: ReturnType<typeof decideAskPreflight>): boolean =>
+    decision.result.blockers.length > 0 && decision.result.blockers.every((blocker) => blocker.kind === 'no-target-paths');
+  const observeAuthorExit = (
+    attempt: number,
+    result: { readonly goalFile: string; readonly decision: ReturnType<typeof decideAskPreflight> },
+    outcome: AuthorExitOutcome,
+    taken?: { readonly node: string; readonly reason: string },
+  ): void => {
+    const goalType = input.goalType ?? declaredGoalType(input.askText);
+    observeFrontNodeExit({ node: 'author', outcome }, {
+      attempt,
+      goalFile: result.goalFile,
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(goalType === null ? {} : { goalType }),
+      ...(taken === undefined ? {} : { taken: taken.node, reason: taken.reason }),
+      ...(outcome === 'not-grounded' ? { blockers: result.decision.result.blockers } : {}),
+    });
+  };
+
   let authored = await authorAndPreflight();
   let reauthored = false;
   const retryableNoTargetPaths = !input.forceRequested
     && !authored.decision.shouldLaunch
     && authored.decision.result.blockers.length > 0
     && authored.decision.result.blockers.every((blocker) => blocker.kind === 'no-target-paths');
+  if (authorNotGrounded(authored.decision)) {
+    // 재시도 대상이면 그래프 답(re-ground) 그대로 · --force 로 재시도를 안 하면 코드가 간 곳을 실제 걸음으로 남긴다.
+    observeAuthorExit(1, authored, 'not-grounded', retryableNoTargetPaths ? undefined : {
+      node: authored.decision.shouldLaunch ? 'plan' : 'needs-human', reason: 'force-requested · no auto re-author',
+    });
+  } else {
+    observeAuthorExit(1, authored, 'ok');
+  }
   if (retryableNoTargetPaths) {
     const first = authored;
     reauthored = true;
     deps.print('[ask] ⑴ ⚠️ 대상 경로를 못 찾아 자동 재저작 한 번을 시도한다');
+    observeFrontNodeExit({ node: 're-ground', outcome: 'retry' }, {
+      attempt: 1, goalFile: first.goalFile, ...(input.runId === undefined ? {} : { runId: input.runId }),
+    });
     let candidates: ReturnType<typeof findAskPathCandidates> = { tokens: [], paths: [] };
     if (parseAskTargetPathHintsResult(input.askText).labelMissing) {
       try {
@@ -1107,7 +1144,9 @@ export async function runAskLaunchFlow(
     recordPodAuthoring('ask-auto-reauthor', { candidatePathCount: candidates.paths.length, firstPathCount: first.decision.result.paths.length, outcome: 'started' });
     authored = await authorAndPreflight(selectedPaths.length > 0
       ? `대상 경로: ${selectedPaths.join(' · ')}\n${input.askText}`
-      : input.askText, selectedPaths);
+      : input.askText, selectedPaths, 2);
+    // 두 번째 not-grounded 는 re-ground 예산(max_visits 1)을 넘어 needs-human(근거 카드)으로 — 판정은 observeFrontNodeExit 가 선언에서 읽는다.
+    observeAuthorExit(2, authored, !authored.decision.shouldLaunch && authorNotGrounded(authored.decision) ? 'not-grounded' : 're-authored');
     deps.log('ask-auto-reauthor', {
       candidatePathCount: candidates.paths.length,
       firstGoalFile: first.goalFile,

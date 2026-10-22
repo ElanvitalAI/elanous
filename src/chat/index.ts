@@ -1022,7 +1022,6 @@ export async function textInput(opts: {
     modalSink: opts.modalSink,
     picker,
     getBufferView: bufView,
-    writeTerminal,
     getBounds: () => ({ row: getRow(), col, width: getWidth(), height: 1 }),
     getInputZoneHeight: () => Math.min(lines.length, maxLines),
     onDispatchResult: async (dispatched) => processPickerDispatch(dispatched),
@@ -1336,7 +1335,6 @@ export async function textInput(opts: {
     }
     pickerModalRuntime.syncFamily({
       activeKind: activePickerKind(),
-      clearRows: MAX_PICKER + 3,
       debugLayout: { row: getRow(), col, width: getWidth() },
       family: pickerModalFamily,
     });

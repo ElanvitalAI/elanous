@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { blockedDraftDisposition, decideDraftOnStop, nextMoveFor, parseDraftOnStopMode, salvageBranchForRun, stopClassFor } from './blocked-draft-policy.js';
+import { blockedDraftDisposition, blockedDraftTargetFor, decideDraftOnStop, nextMoveFor, parseDraftOnStopMode, repairSalvageLinkComment, salvageBranchForRun, stopClassFor, syntheticRepairBasePr } from './blocked-draft-policy.js';
 import { runSuffixKey, selectRunSalvageRefs } from './salvage-branches.js';
 import type { AbandonedClassification } from './abandoned-classification.js';
 
@@ -50,5 +50,27 @@ describe('DRAFT-NOT-ARCHIVE policy', () => {
   test('every stop has a next move', () => {
     expect(nextMoveFor('implementation-deficit')).toContain('수확 가지');
     expect(nextMoveFor(undefined)).toContain('주인 자리');
+  });
+});
+
+describe('REPAIR-BLOCKED-DRAFT-LINK-ORIGINAL', () => {
+  test('a synthetic local base pr-<N> names the original PR; real branches do not', () => {
+    expect(syntheticRepairBasePr('pr-123')).toBe(123);
+    for (const base of [undefined, '', 'main', 'origin/main', 'pr-0', 'pr-12a', 'feature/pr-123', 'pr-123/x']) {
+      expect(syntheticRepairBasePr(base)).toBeUndefined();
+    }
+  });
+  test('blocked draft on a pr-<N> base links the original PR instead of opening a new draft', () => {
+    expect(blockedDraftTargetFor('pr-123')).toEqual({ action: 'link-original', originalPr: 123 });
+    expect(blockedDraftTargetFor('main')).toEqual({ action: 'open-draft' });
+    expect(blockedDraftTargetFor(undefined)).toEqual({ action: 'open-draft' });
+  });
+  test('the link comment is one line naming the salvage ref and sha', () => {
+    const body = repairSalvageLinkComment({ salvageRef: 'salvage/run-abc123/self-impl-x', sha: 'f'.repeat(40), runId: 'run-abc123', stage: 'review-blocked' });
+    expect(body.split('\n')).toHaveLength(1);
+    expect(body).toContain('수리 산출물 salvage salvage/run-abc123/self-impl-x');
+    expect(body).toContain('f'.repeat(12));
+    expect(body).toContain('run-abc123');
+    expect(repairSalvageLinkComment({ salvageRef: 'salvage/run-abc123/x', runId: 'run-abc123', stage: 'gate-failed' })).not.toContain('undefined');
   });
 });

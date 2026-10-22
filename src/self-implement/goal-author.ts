@@ -2619,6 +2619,244 @@ export function goalContextEvidence(root: string): string[] {
     });
 }
 
+/** ACCEPTANCE-FROM-VERIFY-MENU — 저작기가 모든 골에 직접 쓰는 TDD 다섯 줄 절(사람 손 저작 대체). */
+export const VERIFICATION_PLAN_HEADING = '### 검증 계획(TDD)';
+export type InjectionLadderLevel = 'L0' | 'L1' | 'L2' | 'L3' | 'L4';
+const INJECTION_LADDER: Record<InjectionLadderLevel, string> = {
+  L0: 'test 우주 합성 사건',
+  L1: '생산 함수 ⊕ 기록된 실제 입력',
+  L2: 'src/ux-sim fake-llm·fake-bin·fake-clock',
+  L3: '격리 실물 런 — bare origin ⊕ fake gh',
+  L4: '격리 fixture Pod Job',
+};
+const VERIFICATION_MENU_DOC = join('docs', 'goal-context', '03-verification-menu.md');
+const MOCK_CATALOG_DOC = join('docs', 'goal-context', '04-mock-scenarios.md');
+
+/** 저장소 안의 검증 메뉴·무대 카탈로그를 읽는다. 없으면 null(저작은 «새 무대»로 내려간다). */
+export function readVerificationMenuDocs(root: string | undefined): { menu: string | null; catalog: string | null } {
+  const read = (relativePath: string): string | null => {
+    if (!root) return null;
+    try { return readFileSync(join(root, relativePath), 'utf8'); } catch { return null; }
+  };
+  return { menu: read(VERIFICATION_MENU_DOC), catalog: read(MOCK_CATALOG_DOC) };
+}
+
+interface CatalogStage { id: string; name: string; run: string; level: InjectionLadderLevel; strong: string[]; weak: string[] }
+interface MenuRow { method: string; command: string; stages: string }
+
+const CATALOG_STOP_WORDS = new Set(['bun', 'bin', 'elanous', 'elanous.mjs', 'mjs', 'test', 'git', 'grep', 'head', 'json', 'path', 'paths']);
+const CATALOG_KOREAN_STOP_WORDS = new Set(['무대', '시험', '실제', '생산', '격리', '바퀴']);
+
+function catalogField(block: string, label: string): string {
+  return new RegExp(`^- \\*\\*${label}:\\*\\*\\s*(.*)$`, 'mu').exec(block)?.[1]?.trim() ?? '';
+}
+
+/** 우주 필드로 주입 사다리 단을 정한다 — 카탈로그 문면이 바뀌어도 코드가 MS 번호를 외우지 않게. */
+function ladderLevelForUniverse(universe: string): InjectionLadderLevel {
+  if (/Pod|Job/u.test(universe)) return 'L4';
+  if (/임시 git|bare|clone|stub|격리 HOME|가지/u.test(universe)) return 'L3';
+  if (/ux-sim|fake/u.test(universe)) return 'L2';
+  if (/test|--test/u.test(universe)) return 'L0';
+  return 'L1';
+}
+
+function parseCatalogStages(catalog: string): CatalogStage[] {
+  const blocks = catalog.split(/^(?=### )/mu).filter((block) => /^### .*\bMS-\d+\b/u.test(block));
+  return blocks.flatMap((block) => {
+    const header = /^### (?:<a [^>]*><\/a>\s*)?(MS-\d+)\s+(.*)$/mu.exec(block);
+    if (!header) return [];
+    const [, id, name] = header as unknown as [string, string, string];
+    const universe = catalogField(block, '우주');
+    const behaviour = catalogField(block, '증명하는 동작');
+    const run = catalogField(block, '실행');
+    const text = `${name} ${behaviour} ${run}`;
+    const strong = new Set<string>();
+    const weak = new Set<string>();
+    for (const span of text.match(/`[^`]+`/gu) ?? []) {
+      for (const word of span.slice(1, -1).match(/[A-Za-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*/gu) ?? []) strong.add(word.toLowerCase());
+    }
+    for (const word of text.match(/[A-Za-z][A-Za-z0-9_-]{3,}/gu) ?? []) {
+      const lower = word.toLowerCase();
+      if (!CATALOG_STOP_WORDS.has(lower) && !strong.has(lower)) weak.add(lower);
+      if (/[a-z][A-Z]/u.test(word)) strong.add(lower);
+    }
+    for (const word of name.split(/[^\p{Script=Hangul}]+/u)) {
+      if (word.length >= 2 && !CATALOG_KOREAN_STOP_WORDS.has(word)) weak.add(word);
+    }
+    for (const word of strong) weak.delete(word);
+    return [{ id, name: name.trim(), run, level: ladderLevelForUniverse(universe), strong: [...strong], weak: [...weak] }];
+  });
+}
+
+function parseMenuRows(menu: string): MenuRow[] {
+  return menu.split(/\r?\n/u)
+    .filter((line) => line.startsWith('|') && !/^\|\s*-/u.test(line) && !/^\|\s*방법\s*\|/u.test(line))
+    .map((line) => line.split('|').slice(1, -1).map((cell) => cell.trim()))
+    .filter((cells) => cells.length >= 5)
+    .map((cells) => ({ method: cells[0]!, command: cells[3]!, stages: cells[4]! }));
+}
+
+function oneLine(text: string, max = 160): string {
+  const flat = text.replace(/\s+/gu, ' ').trim();
+  return [...flat].length > max ? `${[...flat].slice(0, max - 1).join('')}…` : flat;
+}
+
+function firstTestTarget(targetPaths: readonly string[]): string {
+  const test = targetPaths.find((path) => /\.test\.[cm]?[jt]sx?$/u.test(path));
+  if (test) return test;
+  const source = targetPaths.find((path) => /\.[cm]?[jt]sx?$/u.test(path));
+  return source ? source.replace(/\.([cm]?[jt]sx?)$/u, '.test.$1') : '<대상>.test.ts';
+}
+
+function wiringSymbol(ask: string): string | null {
+  for (const span of ask.match(/`([A-Za-z_$][\w$]*)(?:\(\))?`/gu) ?? []) {
+    const name = /`([A-Za-z_$][\w$]*)/u.exec(span)?.[1];
+    if (name && /[a-z][A-Z]|^[A-Z][a-z]+[A-Z]/u.test(name)) return name;
+  }
+  return ask.match(/\b[a-z][a-z0-9]*[A-Z][A-Za-z0-9]*\b/u)?.[0] ?? null;
+}
+
+const OPERATIONAL_MENTION = /운영\s*(?:데이터|사건|실물)|production\s+(?:data|events?)/iu;
+const OPERATIONAL_EXCLUSION = /없이|제외|말고|금지|빼고|아니|않|못\s|쓰지|안\s*(?:쓴|쓰|읽|본)|대신|without|\bnot\b|\bno\b|never|avoid|exclud/iu;
+
+/** 운영 데이터·사건을 «입력»으로 선언한 문장이 하나라도 있나 — 배제·부정 문장은 세지 않는다(메뉴 §선택 원칙). */
+export function operationalInputDeclared(ask: string): boolean {
+  return ask.split(/(?<=[.!?。])\s+|\r?\n/u)
+    .some((sentence) => OPERATIONAL_MENTION.test(sentence) && !OPERATIONAL_EXCLUSION.test(sentence));
+}
+
+export interface VerificationPlanInput {
+  ask: string;
+  behaviour: string;
+  targetPaths: readonly string[];
+  menu: string | null;
+  catalog: string | null;
+}
+export interface VerificationPlan {
+  lines: string[];
+  stage: { source: 'catalog' | 'new-stage'; id: string | null; level: InjectionLadderLevel };
+  menuPresent: boolean;
+  catalogPresent: boolean;
+}
+
+/**
+ * 순수 함수: 검증 메뉴·무대 카탈로그를 근거로 «검증 계획(TDD)» 다섯 줄을 쓴다.
+ * ① 증명할 동작 ② 무대(MS-xx 또는 «새 무대: 이름 — 명령») ⊕ 주입 사다리 L0–L4
+ * ③ 먼저 쓸 RED 시험 ④ GREEN 뒤 같은 명령 ⑤ 생산 진입점 배선(MS-05).
+ * 운영 실물은 메뉴 원칙대로 «운영 데이터·사건이 입력일 때만» 가리킨다.
+ */
+export function authorVerificationPlan(input: VerificationPlanInput): VerificationPlan {
+  const { ask } = input;
+  const askLower = ask.toLowerCase();
+  const stages = input.catalog ? parseCatalogStages(input.catalog) : [];
+  const menuRows = input.menu ? parseMenuRows(input.menu) : [];
+  let best: { stage: CatalogStage; score: number } | null = null;
+  for (const stage of stages) {
+    if (stage.id === 'MS-05') continue;   // 배선은 ⑤ 줄 몫이다.
+    const score = stage.strong.filter((word) => askLower.includes(word)).length * 2
+      + stage.weak.filter((word) => askLower.includes(word)).length;
+    if (score >= 2 && (!best || score > best.score)) best = { stage, score };
+  }
+  // ⛔ 언급이 아니라 «입력»일 때만 — 「운영 실물 없이 fixture 로」처럼 배제하는 문장은 고르지 않는다(리뷰 must-fix).
+  //   글자 창이 아니라 «문장» 단위로 본다 — 운영 데이터를 말한 문장에 배제·부정 표현이 하나라도 있으면 그 문장은 입력 선언이 아니다.
+  const operational = operationalInputDeclared(ask);
+  const operationalRow = menuRows.find((row) => row.method.includes('운영 실물'));
+  const operationalNote = operational
+    ? ` · 운영 실물: 메뉴 «${operationalRow?.method ?? '운영 실물 로그 관측'}» — 운영 데이터가 입력일 때만${operationalRow ? ` (${oneLine(operationalRow.command.replace(/`/gu, ''), 120)})` : ''}`
+    : '';
+  const testFile = firstTestTarget(input.targetPaths);
+  const cellId = ask.match(/\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b/u)?.[0];
+  const behaviour = oneLine((input.behaviour || '').split(/\s*(?:판정선|판정\s*신호)\s*(?:\(반증\))?\s*:/u)[0] || 'ask 에서 동작 문장을 고르지 못했다 — 사람이 ① 을 채운다', 120);
+  // ⛔ 시험 이름이 ④ 의 인라인 코드 안 `-t` 정규식으로 들어간다 — 백틱·따옴표·정규식 메타문자가 남으면
+  //   명령이 깨지거나 자기 시험을 못 고른다. 칸 id 가 이미 문장에 있으면 다시 붙이지 않는다(실측 2026-10-21).
+  const testName = oneLine(`${cellId && !behaviour.includes(cellId) ? `${cellId}: ` : ''}${behaviour}`, 70)
+    .replace(/[`'"()[\]{}.*+?^$|\\…]/gu, '').trim();
+  const testCommand = `bun test ${testFile} -t '${testName}'`;
+  let stageLine: string;
+  let stage: VerificationPlan['stage'];
+  if (best) {
+    const row = menuRows.find((candidate) => candidate.stages.includes(best!.stage.id));
+    const run = /`([^`]+)`/u.exec(best.stage.run)?.[1];
+    stage = { source: 'catalog', id: best.stage.id, level: best.stage.level };
+    stageLine = `- ② 무대: ${best.stage.id} ${best.stage.name} · ${best.stage.level} (${INJECTION_LADDER[best.stage.level]})${row ? ` · 메뉴: ${row.method}` : ''}${run ? ` · 실행: \`${run}\`` : ''}${operationalNote}`;
+  } else {
+    const screen = /TUI|화면|렌더|위젯|ux-sim|fake-llm|fake-bin|fake-clock|타이머/iu.test(ask);
+    const level: InjectionLadderLevel = screen ? 'L2' : 'L1';
+    const uxRow = menuRows.find((row) => row.method.includes('ux-sim'));
+    const command = screen
+      ? (/`([^`]+)`/u.exec(uxRow?.command ?? '')?.[1] ?? "bun test -- 'src/ux-sim/<관련 시험 파일>.test.ts'")
+      : `bun test ${testFile}`;
+    const base = (input.targetPaths.find((path) => !/\.test\./u.test(path)) ?? testFile).split('/').pop()!.replace(/\.[^.]+$/u, '');
+    const name = screen ? `${base} ux-sim 고정 입력` : `${base} 기록된 실제 입력 fixture`;
+    stage = { source: 'new-stage', id: null, level };
+    stageLine = `- ② 무대: 새 무대: ${name} — \`${command}\` · ${level} (${INJECTION_LADDER[level]})${input.catalog ? ' · 카탈로그(04-mock-scenarios.md)에 맞는 MS 없음' : ' · 카탈로그 문서 없음'}${operationalNote}`;
+  }
+  const docOnly = input.targetPaths.length > 0 && input.targetPaths.every((path) => /\.md$/iu.test(path));
+  if (docOnly) {
+    // 문서 전용 골: 시험 파일·생산 호출부가 없다 — 문구 대조로 RED/GREEN 을 재고 ⑤ 는 비적용 사유·대체 증거를 쓴다(리뷰 must-fix).
+    const docs = input.targetPaths.join(' ');
+    const phrase = (/`([^`]+)`/u.exec(behaviour)?.[1] ?? behaviour.replace(/[`'"]/gu, '').slice(0, 30)).trim();
+    const check = `rg -n -F '${phrase.replace(/'/gu, '’')}' ${docs}`;
+    stage = { source: 'new-stage', id: null, level: 'L1' };
+    return {
+      lines: [
+        VERIFICATION_PLAN_HEADING,
+        `- ① 증명할 동작: ${behaviour}`,
+        `- ② 무대: 새 무대: 문서 문구 대조 — \`${check}\` · L1 (${INJECTION_LADDER.L1}) · 문서 전용 골이라 카탈로그 무대 비적용${operationalNote}`,
+        `- ③ 먼저 확인할 RED: \`${check}\` — 고치기 전에는 0행이다(그 문구가 아직 문서에 없다)`,
+        `- ④ GREEN 뒤 같은 명령: \`${check}\` → 1행 이상`,
+        `- ⑤ 생산 진입점 배선: 해당 없음 — 문서 전용 골이라 생산 호출부가 없다 · 대신 ④ 의 문구 대조와 문서 안 링크 대상이 실제 파일인지(\`test -f <링크 경로>\`)를 증거로 쓴다`,
+      ],
+      stage,
+      menuPresent: input.menu !== null,
+      catalogPresent: input.catalog !== null,
+    };
+  }
+  const symbol = wiringSymbol(ask);
+  const productionPaths = input.targetPaths.filter((path) => !/\.test\./u.test(path) && !/\.md$/u.test(path));
+  const wiring = `git grep -n -F '${symbol ?? '<새 함수>'}(' HEAD -- ${productionPaths.length ? productionPaths.join(' ') : 'src'}`;
+  return {
+    lines: [
+      VERIFICATION_PLAN_HEADING,
+      `- ① 증명할 동작: ${behaviour}`,
+      stageLine,
+      `- ③ 먼저 쓸 시험(RED): \`${testFile}\` › '${testName}' — ① 의 동작이 아직 없어 단언이 실패한다(구현 전에 먼저 쓰고 실패를 확인한다)`,
+      `- ④ GREEN 뒤 같은 명령: \`${testCommand}\` → 0 fail`,
+      `- ⑤ 생산 진입점 배선(MS-05): \`${wiring}\` — 호출부를 커밋한 뒤 PR head 에서 돌린다 · 정의·주석·시험 행이 아닌 생산 호출 문장 1건 이상(0건만으로 미배선 판정 금지)`,
+    ],
+    stage,
+    menuPresent: input.menu !== null,
+    catalogPresent: input.catalog !== null,
+  };
+}
+
+const NON_BEHAVIOUR_LINE = /^(?:[-*]\s*)?(?:대상\s*경로|신설|경계|불변식|판정선|판정\s*신호|완료\s*경계|답하지\s*못하는\s*것|칸\s*id)(?=\s|:|\(|$)|대상\s*경로(?:는|:)/u;
+
+/** ① 의 재료: 대상 경로·표지 줄을 되풀이한 요구는 «동작»이 아니다 — 첫 동작 문장을 고른다(실측 2026-10-21). */
+export function verificationBehaviour(checklist: readonly string[], ask: string): string {
+  const candidate = checklist.find((item) => item.trim() && !NON_BEHAVIOUR_LINE.test(item.trim()));
+  if (candidate) return candidate;
+  const line = ask.split(/\r?\n/u).map((text) => text.trim())
+    .find((text) => text && !NON_BEHAVIOUR_LINE.test(text) && !/^#/u.test(text));
+  return line ?? goalSummary(ask);
+}
+
+function observedVerificationPlan(input: Omit<VerificationPlanInput, 'menu' | 'catalog'>, repositoryRoot: string | undefined, authorRunId: string): string[] {
+  try {
+    const plan = authorVerificationPlan({ ...input, ...readVerificationMenuDocs(repositoryRoot) });
+    try {
+      observeGoalAuthor('goal-author', 'verification-plan', {
+        authorRunId, source: plan.stage.source, stageId: plan.stage.id, level: plan.stage.level,
+        menuPresent: plan.menuPresent, catalogPresent: plan.catalogPresent,
+      });
+    } catch { /* observation is fail-soft */ }
+    return plan.lines;
+  } catch (error) {
+    try { observeGoalAuthor('goal-author', 'verification-plan-failed', { authorRunId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+    return [VERIFICATION_PLAN_HEADING, '- UNVERIFIABLE: 검증 계획 저작이 실패했다 — 사람이 다섯 줄(동작·무대·RED·GREEN·배선)을 채운다.'];
+  }
+}
+
 function groundedProblem(facts: CodebaseGrounding, tracedPathsIncluded: boolean): string[] {
   const persistentEvidence = persistentEvidenceItems(facts);
   return [
@@ -5298,6 +5536,12 @@ async function authorGoalWithSupersededRootIntent(
       '## 답하지 못하는 것',
       '- No persistent grounding was performed in lite authoring.',
       '',
+      // ⭐ full 과 같은 자리 — `## 답하지 못하는 것` → `### 수용 구별 관측` → `### 검증 계획(TDD)` → `## 불변식`.
+      '### 수용 구별 관측',
+      '- Status: not-observed — lite authoring records no acceptance-distinction observation.',
+      '',
+      ...observedVerificationPlan({ ask, behaviour: verificationBehaviour(enhancement.checklist, ask), targetPaths }, deps.repositoryRoot, authorRunId),
+      '',
       '## 불변식',
       '- No persistent grounding was performed in lite authoring.',
       '',
@@ -5753,6 +5997,12 @@ async function authorGoalWithSupersededRootIntent(
     '',
     '### 수용 구별 관측',
     ...distinctionSection,
+    '',
+    ...observedVerificationPlan({
+      ask,
+      behaviour: verificationBehaviour(enhancement.checklist, ask),
+      targetPaths: [...new Set(declaredTargetPaths(ask))],
+    }, deps.repositoryRoot, authorRunId),
     '',
     '## 불변식',
     ...invariants.lines,

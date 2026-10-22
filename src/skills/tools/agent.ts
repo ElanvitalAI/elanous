@@ -60,8 +60,8 @@ export const AGENT_TOOL_DEFAULT_MAX_TURNS = 20;
 export const AGENT_TOOL_TURNS_CEILING = 50;
 
 /** Numeric ceiling on concurrent `run_in_background` Agent-tool fan-out.
- *  Pure declaration — enforcement in dispatchAgent is the follow-up cell
- *  TUI-AGENT-CAPS-WIRING (not wired here). */
+ *  Enforced at exactly one point in `dispatchAgent` (see the
+ *  `background-fanout-limit` block: after dedup, before `noteSeen`). */
 export const AGENT_TOOL_BACKGROUND_FANOUT_CEILING = 8;
 
 /** Clamp a caller-supplied `max_turns` onto `[1, AGENT_TOOL_TURNS_CEILING]`.
@@ -82,7 +82,9 @@ export function stripAgentToolForOneLevelNesting<T extends { name: string }>(
 }
 
 /** Live `run_in_background` tasks occupy fan-out slots until they terminal.
- *  Pure judgement — the ceiling check that uses it is TUI-AGENT-CAPS-WIRING. */
+ *  Counts a task list (e.g. `globalAgentRegistry.list()`). `dispatchAgent`
+ *  enforces the per-session ceiling over its own reservation ledger
+ *  (`backgroundFanoutSlots`) instead — see that field's doc. */
 export function countLiveBackgroundFanout(
   tasks: ReadonlyArray<{ background?: boolean; state?: string }>,
 ): number {
@@ -93,6 +95,35 @@ export function countLiveBackgroundFanout(
     n++;
   }
   return n;
+}
+
+/** Fallback fan-out session key for dispatches that carry no
+ *  `sessionCache` (agent-cli, one-off callers). All of their slots share
+ *  one process-wide bucket so the ceiling still binds for them. */
+const UNSCOPED_BACKGROUND_FANOUT_SESSION: object = Object.freeze({});
+
+/** Fan-out slots by session (the dispatching session's `SessionCache`
+ *  identity; WeakMap so a dropped session releases its key together with
+ *  the cache instance). A slot is RESERVED in the same synchronous block
+ *  as the ceiling check inside `dispatchAgent` — concurrent dispatches
+ *  that interleave at the async definition-resolution awaits cannot all
+ *  pass the check before any of them registers — and RELEASED when the
+ *  registered task reaches a terminal state (done/error/aborted) via
+ *  `globalAgentRegistry.onTaskDone`. A dispatch that throws before it
+ *  registers releases its own reservation (see
+ *  `releaseReservedFanoutSlot` inside `dispatchAgent`). */
+const backgroundFanoutSlots = new WeakMap<object, number>();
+
+/** Count this session's live fan-out slots (reserved or running). */
+export function countSessionBackgroundFanout(session: object): number {
+  return backgroundFanoutSlots.get(session) ?? 0;
+}
+
+/** Release one of this session's fan-out slots (floors at zero). */
+function releaseBackgroundFanoutSlot(session: object): void {
+  const live = backgroundFanoutSlots.get(session);
+  if (live === undefined || live <= 1) backgroundFanoutSlots.delete(session);
+  else backgroundFanoutSlots.set(session, live - 1);
 }
 
 /** Fallback agent when subagent_type is missing or unresolvable. The
@@ -374,19 +405,22 @@ export async function dispatchAgent(
   // burn another turn on the same work. Return a stub that points
   // the parent back to its existing history. Parents stuck in a
   // "keep re-spawning Data Collector" loop escape via this gate.
-  if (opts.sessionCache) {
-    const key = agentCacheKey(requestedType, requestedType, prompt);
+  const sessionCache = opts.sessionCache;
+  const cacheKey = sessionCache
+    ? agentCacheKey(requestedType, requestedType, prompt)
+    : undefined;
+  if (sessionCache && cacheKey) {
     // Key strategy: description is noisy (parents sometimes vary the
     // label between calls); we hash the FUNCTIONAL signature only
     // — subagent_type + prompt. Same prompt to same agent = same
     // expected work, regardless of how the call was labelled.
-    const hit = opts.sessionCache.check(key);
+    const hit = sessionCache.check(cacheKey);
     if (hit) {
       const label = `Agent[${requestedType}] "${description.slice(0, 60)}"`;
       logDedupHit('agent.dedup', label, hit, {
         requestedType,
         description: description.slice(0, 80),
-        consecutive: opts.sessionCache.consecutiveHits,
+        consecutive: sessionCache.consecutiveHits,
       });
 
       // Runtime-level block: same treatment as Read. When the parent
@@ -395,16 +429,16 @@ export async function dispatchAgent(
       // tool_result carries is_error=true. Soft stubs have been
       // observed to produce 6+ retries in the wild; an error break
       // the reflex loop more reliably.
-      if (opts.sessionCache.consecutiveHits >= CONSECUTIVE_DEDUP_BLOCK_THRESHOLD) {
+      if (sessionCache.consecutiveHits >= CONSECUTIVE_DEDUP_BLOCK_THRESHOLD) {
         debug.log('agent.dedup', 'consecutive-block', {
           requestedType,
           description: description.slice(0, 80),
-          consecutive: opts.sessionCache.consecutiveHits,
+          consecutive: sessionCache.consecutiveHits,
           threshold: CONSECUTIVE_DEDUP_BLOCK_THRESHOLD,
         });
         throw new Error(
           `RUNTIME BLOCKED — Agent[${requestedType}] "${description.slice(0, 60)}" ` +
-          `has been spawned ${opts.sessionCache.consecutiveHits} times in a row with ` +
+          `has been spawned ${sessionCache.consecutiveHits} times in a row with ` +
           `no intervening progress. The previous sub-agent's final message is in ` +
           `your conversation history above — use that. Spawn an Agent with a ` +
           `DIFFERENT persona (different subagent_type or a substantively different ` +
@@ -420,9 +454,9 @@ export async function dispatchAgent(
       // ~500 chars of history noise per hit. We now emit the debug
       // event past threshold for traceability but return the normal
       // "spawn a different persona" stub — same message every hit.
-      if (opts.sessionCache.totalHits >= DEDUP_CASCADE_HALT_THRESHOLD) {
+      if (sessionCache.totalHits >= DEDUP_CASCADE_HALT_THRESHOLD) {
         debug.log('agent.dedup', 'cascade-threshold', {
-          totalHits: opts.sessionCache.totalHits,
+          totalHits: sessionCache.totalHits,
           threshold: DEDUP_CASCADE_HALT_THRESHOLD,
           requestedType,
           description: description.slice(0, 80),
@@ -444,7 +478,79 @@ export async function dispatchAgent(
         taskId: 'dedup',
       };
     }
-    opts.sessionCache.noteSeen(key, `Agent[${requestedType}] ${description.slice(0, 60)}`);
+  }
+
+  // ── TUI-AGENT-CAPS-FU: background fan-out ceiling ──
+  //
+  // The ONE enforcement point for AGENT_TOOL_BACKGROUND_FANOUT_CEILING, and
+  // it sits exactly between the dedup short-circuit above and `noteSeen`
+  // below on purpose:
+  //   • after dedup — a repeat of an already-answered prompt still gets the
+  //     dedup stub instead of a fan-out refusal (it never reaches here);
+  //   • before `noteSeen` — a refused launch must NOT register its cache
+  //     key. Otherwise the caller's retry (same prompt, once a slot opens)
+  //     would be answered with "you already got this result" even though no
+  //     child ever ran, permanently poisoning the cache with a spawn that
+  //     never happened.
+  //
+  // Live slots are counted over the shared task ledger: `background` tasks
+  // that have not reached a terminal state (done / error / aborted). So a
+  // slot re-opens the moment any background agent finishes, which is what
+  // lets the next launch through again.
+  let fanoutSession: object | undefined;
+  if (runInBackground) {
+    // Per-session scope: slots count against THIS session's cache
+    // identity (shared fallback bucket for cache-less callers), so a
+    // busy OTHER session cannot starve this one's first launch.
+    fanoutSession = opts.sessionCache ?? UNSCOPED_BACKGROUND_FANOUT_SESSION;
+    const liveBackground = countSessionBackgroundFanout(fanoutSession);
+    if (liveBackground >= AGENT_TOOL_BACKGROUND_FANOUT_CEILING) {
+      debug.log('agent.spawn', 'background-fanout-limit', {
+        cid: debugCorrelationId,
+        requestedType,
+        description: description.slice(0, 80),
+        liveBackground,
+        ceiling: AGENT_TOOL_BACKGROUND_FANOUT_CEILING,
+      }, { level: 'warn' });
+      // Not spawned: no registry task, no provider call, no cache entry.
+      // taskId is a sentinel (like 'dedup' above) so a caller can tell a
+      // refusal from a real spawn without parsing the prose.
+      return {
+        output:
+          `NOT SPAWNED — ${liveBackground} background agents are already live and the ` +
+          `fan-out ceiling is ${AGENT_TOOL_BACKGROUND_FANOUT_CEILING}. A slot reopens as ` +
+          `soon as one of them reaches a terminal state (done/error/aborted); its result ` +
+          `then arrives as a task-notification. Either wait for one to finish, fold this ` +
+          `work into an existing background spawn, or re-issue it without ` +
+          `run_in_background so it runs in the foreground.`,
+        agent: requestedType,
+        cid: debugCorrelationId,
+        durationMs: 0,
+        maxTurns: requestedMaxTurns,
+        taskId: 'background-fanout-limit',
+      };
+    }
+  }
+
+  if (fanoutSession !== undefined) {
+    // Atomic reservation: taken in the SAME synchronous block as the
+    // ceiling check above, before any await — concurrent dispatches
+    // cannot all pass the check and push this session past the ceiling
+    // while their definitions resolve. Released when the registered
+    // task terminals (see the onTaskDone subscription at spawn); a
+    // dispatch that throws before registering releases it in the finally
+    // below, including failures from definition resolution and lazy imports.
+    backgroundFanoutSlots.set(fanoutSession, countSessionBackgroundFanout(fanoutSession) + 1);
+  }
+  const releaseReservedFanoutSlot = (): void => {
+    if (fanoutSession === undefined) return;
+    releaseBackgroundFanoutSlot(fanoutSession);
+    fanoutSession = undefined;
+  };
+
+  try {
+  if (sessionCache && cacheKey) {
+    sessionCache.noteSeen(cacheKey, `Agent[${requestedType}] ${description.slice(0, 60)}`);
   }
 
   // Resolve the agent definition. Try the 4-layer resolver first;
@@ -536,7 +642,9 @@ export async function dispatchAgent(
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes('is not inside a git repo')) throw error;
+      if (!message.includes('is not inside a git repo')) {
+        throw error;
+      }
       childCwd = opts.cwd ?? getSessionCwd();
       appliedIsolation = 'cwd';
       debug.log('agent.spawn', 'worktree-fallback-cwd', {
@@ -679,6 +787,19 @@ export async function dispatchAgent(
     ...(runInBackground ? { background: true } : {}),
   });
 
+  // Terminal release for this dispatch's reserved fan-out slot: the
+  // registry fires this exactly once per task when it reaches a
+  // terminal state (done/error/aborted); until then the slot counts as
+  // occupied against this session's ceiling above.
+  if (fanoutSession !== undefined) {
+    const fanoutSlotSession = fanoutSession;
+    const fanoutSlotSubscription = globalAgentRegistry.onTaskDone((task) => {
+      if (!task || task.id !== handle.task.id) return;
+      fanoutSlotSubscription.dispose();
+      releaseBackgroundFanoutSlot(fanoutSlotSession);
+    });
+    fanoutSession = undefined;  // the terminal subscription owns the release now
+  }
   // Forward parent abort to the spawned task. The registry owns the
   // child's controller; we just chain ours into it.
   if (opts.signal) {
@@ -907,4 +1028,9 @@ export async function dispatchAgent(
     ...(childCwd ? { cwd: childCwd } : {}),
     ...(appliedIsolation ? { isolation: appliedIsolation } : {}),
   };
+  } finally {
+    // The registered task owns its slot after the handoff above. Every
+    // pre-registration throw leaves fanoutSession set and releases it here.
+    releaseReservedFanoutSlot();
+  }
 }

@@ -11,6 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MsgStore } from '../../msg/msg-store.js';
+import { dispatchMsgAsk } from './msg-ask.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../instance/resolve.js';
 import { listChecklist } from '../../release-loop/checklist.js';
@@ -83,6 +84,188 @@ describe('ops-ledger msg tools (우편)', () => {
     await expect(dispatchMsgList({ to: 'TC', limit: 1001 }, msgDeps)).rejects.toThrow("'limit' must be an integer between 1 and 1000");
     await expect(dispatchMsgList({ to: 'TC', after: -1 }, msgDeps)).rejects.toThrow("'after'");
     await expect(dispatchMsgList({}, msgDeps)).rejects.toThrow("'to' must be a nonempty string");
+  });
+
+  test('MsgAsk는 같은 원장에 질문을 쓰고 replyTo로 연결된 첫 답만 돌려준다', async () => {
+    const store = msgDeps.openStore!();
+    try {
+      let replied = false;
+      const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '상태?', waitSeconds: 2 }, {
+        ...msgDeps,
+        sleep: async () => {
+          if (replied) return;
+          replied = true;
+          const question = store.list('TC')[0]!;
+          store.post({ from: 'TC', to: 'OP', body: '연결 없는 답' });
+          store.post({ from: 'UX', to: 'OP', body: '다른 발신자', replyTo: question.id });
+          store.post({ from: 'TC', to: 'UX', body: '다른 수신자', replyTo: question.id });
+          store.post({ from: 'TC', to: 'OP', body: '진행 중', replyTo: question.id });
+        },
+      });
+      expect(result.ok).toBe(true);
+      expect(result.question.to).toBe('TC');
+      expect(result.reply?.replyTo).toBe(result.question.id);
+      expect(result.reply?.body).toBe('진행 중');
+      expect(store.unreadCount('TC')).toBe(1);
+      expect(store.getCursor('TC')).toBe(0);
+    } finally { store.close(); }
+  });
+
+  test('MsgAsk timeout은 게시한 질문 id를 잃지 않고, 사전 취소·잘못된 인자는 쓰기 0', async () => {
+    const timeout = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '답?', waitSeconds: 0 }, msgDeps);
+    expect(timeout.ok).toBe(false);
+    expect(timeout.output).toContain(`#${timeout.question.id}`);
+    const store = msgDeps.openStore!();
+    try {
+      expect(store.list('TC')[0]?.id).toBe(timeout.question.id);
+      const abort = new AbortController();
+      abort.abort();
+      await expect(dispatchMsgAsk({ from: 'OP', to: 'TC', question: '취소' }, { ...msgDeps, signal: abort.signal })).rejects.toThrow('before posting');
+      await expect(dispatchMsgAsk({ from: 'ALL', to: 'TC', question: '거부' }, msgDeps)).rejects.toThrow('ALL cannot send');
+      await expect(dispatchMsgAsk({ from: 'OP', to: 'ALL', question: '거부' }, msgDeps)).rejects.toThrow('one recipient seat');
+      await expect(dispatchMsgAsk({ from: 'OP', to: 'TC', question: 'bad', waitSeconds: 301 }, msgDeps)).rejects.toThrow('waitSeconds');
+      expect(store.list('TC')).toHaveLength(1);
+    } finally { store.close(); }
+  });
+
+  test('MsgAsk 폴링이 늦어 기한 뒤 도착한 연결 답은 timeout으로 남긴다', async () => {
+    const store = msgDeps.openStore!();
+    try {
+      const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '기한?', waitSeconds: 1 }, {
+        ...msgDeps,
+        sleep: async () => {
+          await new Promise(resolve => setTimeout(resolve, 1100));
+          const question = store.list('TC')[0]!;
+          store.post({ from: 'TC', to: 'OP', body: '늦은 답', replyTo: question.id });
+        },
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reply).toBeNull();
+      expect(result.output).toContain(`#${result.question.id}`);
+      expect(store.listReplies(result.question.id)[0]?.body).toBe('늦은 답');
+    } finally { store.close(); }
+  });
+
+  test('MsgAsk 기한 직전 도착한 답은 마지막 조회에서 받는다', async () => {
+    const store = msgDeps.openStore!();
+    try {
+      const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '직전?', waitSeconds: 1 }, {
+        ...msgDeps,
+        sleep: async () => {
+          const question = store.list('TC')[0]!;
+          await new Promise(resolve => setTimeout(resolve, 900));
+          store.post({ from: 'TC', to: 'OP', body: '기한 안 답', replyTo: question.id });
+        },
+      });
+      expect(result.ok).toBe(true);
+      expect(result.reply?.body).toBe('기한 안 답');
+    } finally { store.close(); }
+  });
+
+  test('MsgAsk 대기 상한은 벽시계가 아닌 단조 경과 시간으로 판정한다', async () => {
+    let elapsed = 0;
+    const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '시계?', waitSeconds: 2 }, {
+      ...msgDeps,
+      monotonicNow: () => elapsed,
+      wallNow: () => 100_000 + elapsed,
+      sleep: async ms => { elapsed += ms; },
+    });
+    expect(result.ok).toBe(false);
+    expect(elapsed).toBe(2000);
+  });
+
+  test('MsgAsk는 계속 가득 찬 답 페이지에서도 단조 기한에 멈춘다', async () => {
+    const store = msgDeps.openStore!();
+    let pages = 0;
+    spyOn(store, 'listReplies').mockImplementation((_id, _limit, afterId = 0) => {
+      pages += 1;
+      return Array.from({ length: 1000 }, (_, index) => ({
+        id: afterId + index + 1, from: 'UX', to: 'OP', body: '다른 자리', replyTo: 1,
+        createdAt: new Date().toISOString(),
+      }));
+    });
+    let elapsed = 0;
+    const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '계속?', waitSeconds: 1 }, {
+      openStore: () => store,
+      monotonicNow: () => { elapsed += 100; return elapsed; },
+      wallNow: () => 100_000 + elapsed,
+      sleep: async () => {},
+    });
+    expect(result.ok).toBe(false);
+    expect(pages).toBeGreaterThan(1);
+    expect(pages).toBeLessThan(20);
+  });
+
+  test('MsgAsk는 단조 기한 뒤 벽시계상 적시 답도 수락하지 않는다', async () => {
+    const store = msgDeps.openStore!();
+    let elapsed = 0;
+    let polls = 0;
+    const wallBase = Date.now();
+    try {
+      spyOn(store, 'listReplies').mockImplementation((questionId) => ++polls === 1 ? [] : [{
+        id: questionId + 1, from: 'TC', to: 'OP', body: '벽시계상 적시 답', replyTo: questionId,
+        createdAt: new Date(wallBase + 900).toISOString(),
+      }]);
+      const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '기한?', waitSeconds: 1 }, {
+        openStore: () => store,
+        monotonicNow: () => elapsed,
+        wallNow: () => wallBase + elapsed - (elapsed > 0 ? 100 : 0),
+        sleep: async () => { elapsed = 1001; },
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reply).toBeNull();
+      expect(polls).toBe(2);
+    } finally { store.close(); }
+  });
+
+  test('MsgAsk는 가득 찬 답 페이지가 계속돼도 실제 타이머 취소를 받는다', async () => {
+    const store = msgDeps.openStore!();
+    const abort = new AbortController();
+    let pages = 0;
+    try {
+      spyOn(store, 'listReplies').mockImplementation((_id, _limit, afterId = 0) => {
+        pages += 1;
+        return Array.from({ length: 1000 }, (_, index) => ({
+          id: afterId + index + 1, from: 'UX', to: 'OP', body: '다른 자리', replyTo: 1,
+          createdAt: new Date().toISOString(),
+        }));
+      });
+      const started = performance.now();
+      const timer = setTimeout(() => abort.abort(), 20);
+      try {
+        const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '취소?', waitSeconds: 300 }, {
+          openStore: () => store, signal: abort.signal,
+        });
+        expect(result.ok).toBe(false);
+        expect(result.output).toContain('cancelled');
+        expect(pages).toBeGreaterThan(1);
+        expect(performance.now() - started).toBeLessThan(1000);
+      } finally { clearTimeout(timer); }
+    } finally { store.close(); }
+  });
+
+  test('MsgAsk는 대기 중 벽시계가 이동하면 답 판정을 보류하고 질문 ID를 남긴다', async () => {
+    const store = msgDeps.openStore!();
+    let elapsed = 0;
+    let wallShift = 0;
+    try {
+      const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '시각?', waitSeconds: 2 }, {
+        ...msgDeps,
+        monotonicNow: () => elapsed,
+        wallNow: () => 100_000 + elapsed + wallShift,
+        sleep: async ms => {
+          elapsed += ms;
+          wallShift -= 5_000;
+          const question = store.list('TC')[0]!;
+          store.post({ from: 'TC', to: 'OP', body: '시계 이동 중 답', replyTo: question.id });
+        },
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reply).toBeNull();
+      expect(result.output).toContain('clock adjusted');
+      expect(result.output).toContain(`#${result.question.id}`);
+      expect(store.listReplies(result.question.id)).toHaveLength(1);
+    } finally { store.close(); }
   });
 });
 
@@ -396,8 +579,8 @@ describe('ops-ledger 배선 — 카탈로그 ↔ 런타임 ↔ 등록부', () =>
     _resetToolRuntimeRegistryForTest();
   });
 
-  test('8개 런타임이 카탈로그 항목과 1:1 이고 별칭이 이름으로 풀린다', () => {
-    expect(ALL_OPS_LEDGER_RUNTIMES).toHaveLength(8);
+  test('9개 런타임이 카탈로그 항목과 1:1 이고 별칭이 이름으로 풀린다', () => {
+    expect(ALL_OPS_LEDGER_RUNTIMES).toHaveLength(9);
     for (const runtime of ALL_OPS_LEDGER_RUNTIMES) {
       const entry = findNativeTool(runtime.id);
       expect(entry).toBeDefined();
@@ -412,10 +595,11 @@ describe('ops-ledger 배선 — 카탈로그 ↔ 런타임 ↔ 등록부', () =>
       expect(getToolRuntime(runtime.spec.name)?.id).toBe(runtime.id);
     }
     expect(getToolRuntime('MsgPost')?.id).toBe('msg_post');
+    expect(getToolRuntime('MsgAsk')?.id).toBe('msg_ask');
     expect(getToolRuntime('checklist_move')?.id).toBe('checklist_move');
   });
 
-  test('기본 TUI 도구 목록에서 여덟 도구가 실제로 노출되고 디스패치된다', async () => {
+  test('기본 TUI 도구 목록에서 아홉 도구가 노출되고 기존 여덟 도구가 디스패치된다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ops-ledger-tui-'));
     const oldState = process.env.ELANOUS_STATE_DIR;
     const oldTrack = process.env.ELANOUS_TRACK;
@@ -449,6 +633,11 @@ describe('ops-ledger 배선 — 카탈로그 ↔ 런타임 ↔ 등록부', () =>
         expect(performance.now() - startedAt).toBeLessThan(300);
         expect('ok' in result && result.ok).toBe(true);
       }
+      const asked = await dispatchToolByName('MsgAsk', { from: 'OP', to: 'TC', question: 'follow-up?', waitSeconds: 0 }, { surface: 'tui' });
+      expect('ok' in asked && asked.ok).toBe(false);
+      expect(String(asked.output)).toMatch(/MsgAsk #\d+ posted/);
+      const received = await dispatchToolByName('MsgList', { to: 'TC' }, { surface: 'tui' });
+      expect(('messages' in received && (received.messages as Array<{ body: string }>).some(message => message.body === 'follow-up?'))).toBe(true);
     } finally {
       if (oldState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = oldState;
       if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
@@ -500,8 +689,8 @@ describe('ops-ledger 한 턴 시나리오 — OP 가 우편 5통을 읽고 판�
         ['MsgPost', { from: 'OP', to: 'TC', body: '5통 확인' }],
         ['MsgAck', { to: 'OP', id: 5 }],
       ];
-      // Every one of the eight native tools is exercised in this turn.
-      expect(calls.map(([name]) => name).sort()).toEqual(ALL_OPS_LEDGER_RUNTIMES.map(runtime => runtime.spec.name).sort());
+      // MsgAsk's linked reply path is exercised in its own focused test above.
+      expect(calls.map(([name]) => name).sort()).toEqual(ALL_OPS_LEDGER_RUNTIMES.filter(runtime => runtime.id !== 'msg_ask').map(runtime => runtime.spec.name).sort());
       const results: Record<string, Record<string, unknown>> = {};
       const wallMs: Record<string, number> = {};
       for (const [name, args] of calls) {

@@ -84,7 +84,10 @@ describe('olderThan — 휘발 대상', () => {
 
 describe('newestFirst / oldestFirst — 정렬도 정규화 대상', () => {
   test('★혼합 저장에서 최신순이 뒤집히지 않는다', () => {
-    const now = Date.now();
+    // 📏 10-22 0.2.35 gate r2: Date.now() 를 쓰면 UTC 자정 직후 30분 안에는 «30분 전» 이 전날 날짜가 되어
+    //   raw 문자열 정렬도 날짜 앞자리로 정해진다 — 단언 raw=['older','newest'] 가 시계에 따라 깨진다(ⓒ 시계 의존).
+    //   이 시험이 보증하는 것(같은 날짜에서 저장 형식이 raw 정렬을 뒤집는다 ⊕ newestFirst 는 정규화한다)은 정오 UTC 로 고정해 잰다.
+    const now = Date.UTC(2026, 9, 22, 12, 0, 0);
     const toSqlite = (iso: string) => iso.slice(0, 19).replace('T', ' ');
     const d = db();
     const ins = d.prepare(`INSERT INTO rows(id, ts) VALUES (?,?)`);

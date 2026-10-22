@@ -35,6 +35,10 @@ function statePath(): string {
   return join(mkdtempSync(join(tmpdir(), 'task-hand-')), 'task-agent-actions.json');
 }
 
+function liveGoal(text: string): string {
+  return `${text}\n- 완료 경계 코드: src/task-agent/task-hand.ts live hand 조건을 판정한다\n- 완료 경계 실물: 카드가 발사 전 완료 경계를 요구한다\n- 완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts`;
+}
+
 function compositionFixture(kind: string): string {
   const root = mkdtempSync(join(tmpdir(), 'task-composition-'));
   const work = join(root, 'graphs', 'work');
@@ -56,11 +60,13 @@ test('1판 조합: code-pr의 해석 결과를 기록하고 기존 harness say �
   let result: Awaited<ReturnType<typeof handTask>>;
   try {
     const text = 'ship code\n완료 경계 코드: src/task-agent/task-hand.ts 변경\n완료 경계 실물: code-pr 카드 발사\n완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts';
-    result = await handTask({ text, seat: 'MK', statePath: path, live: true,
+    result = await handTask({ text, seat: 'MK', statePath: path, live: true, preflightGoalDoneBoundary: true,
       launcher: (args) => { calls.push(args); } });
+    expect(result).toMatchObject({ mode: 'live', launched: true, card: { status: 'launched' } });
     expect(calls[0]?.at(-1)).toBe(text);
   } finally { off(); }
   expect(calls).toEqual([['harness', 'say', '--seat', 'MK', '--substrate', 'pod', '--merge-by-host', result.card.text]]);
+  expect(calls).toHaveLength(1);
   expect(readTaskCard(result.card.id, path)).toMatchObject({ composition: selected.composition,
     graphSelectedBy: 'completion', unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits });
   expect(events).toContainEqual(expect.objectContaining({ event: 'composition-selected', data: expect.objectContaining({
@@ -69,7 +75,7 @@ test('1판 조합: code-pr의 해석 결과를 기록하고 기존 harness say �
   } finally { resetElanousConfigDir(); }
 });
 
-test('live code-pr 완료 경계 누락은 카드에 수정 지시를 남기고 Pod launcher 호출 전에 멈춘다', async () => {
+test('live hand 완료 경계 누락은 카드 기록과 launcher 호출 전에 거부한다', async () => {
   const path = statePath();
   let launches = 0;
   const events: Array<{ category: string; event: string; data?: unknown }> = [];
@@ -77,15 +83,21 @@ test('live code-pr 완료 경계 누락은 카드에 수정 지시를 남기고 
   try {
     await expect(handTask({ id: 'ta-20261018-boundary', text: '대상 경로: src/task-agent/task-hand.ts',
       checklistId: 'AUT-AC-BOUNDARY-MISSING', live: true, statePath: path,
-      launcher: () => { launches++; } })).rejects.toThrow('goal-revision-required: 완료 경계 누락 완료 경계 코드 · 완료 경계 실물 · 완료 경계 증거 명령');
+      preflightGoalDoneBoundary: true, launcher: () => { launches++; } })).rejects.toThrow('goal-revision-required: 완료 경계 누락 완료 경계 코드 · 완료 경계 실물 · 완료 경계 증거 명령');
   } finally { off(); }
   expect(launches).toBe(0);
-  const card = readTaskCard('ta-20261018-boundary', path)!;
-  expect(card.status).toBe('failed');
-  expect(card.history.at(-1)).toMatchObject({ event: 'goal-revision-required', detail: expect.stringContaining('완료 경계 증거 명령') });
-  expect(nextMoveFor(card).kind).toBe('wait');
-  expect(events).toContainEqual(expect.objectContaining({ category: 'task-agent.hand', event: 'done-boundary-missing',
-    data: expect.objectContaining({ missing: ['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령'] }) }));
+  expect(readTaskCard('ta-20261018-boundary', path)).toBeUndefined();
+  expect(events).toHaveLength(0);
+});
+
+test('shadow hand는 완료 경계 없는 문면도 카드로만 기록하고 발사하지 않는다', async () => {
+  const path = statePath();
+  let launches = 0;
+  const result = await handTask({ id: 'ta-20261018-boundary-shadow', text: '대상 경로: src/task-agent/task-hand.ts',
+    statePath: path, launcher: () => { launches++; } });
+  expect(result).toMatchObject({ mode: 'shadow', launched: false });
+  expect(launches).toBe(0);
+  expect(readTaskCard(result.card.id, path)).toMatchObject({ status: 'handed' });
 });
 
 test('단위 해석은 러너 resolveUnit 규칙으로 id·판을 확인하고 실제 단위가 생기면 true가 된다', () => {
@@ -393,14 +405,46 @@ test('shadow hand → 카드 1장 · 명령에 --merge-by-host · launcher 안 �
 test('--live 는 주입한 launcher 를 한 번 부르고 카드를 launched 로', async () => {
   const path = statePath();
   const calls: string[][] = [];
-  const { lines } = await cli(['task', 'hand', 'ship it', '--live', '--json'], { taskStatePath: path, taskLauncher: (args) => { calls.push(args); } });
-  expect(calls).toEqual([['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'ship it']]);
+  const text = liveGoal('ship it');
+  const { lines } = await cli(['task', 'hand', text, '--live', '--json'], { taskStatePath: path, taskLauncher: (args) => { calls.push(args); } });
+  expect(calls).toEqual([['harness', 'say', '--substrate', 'pod', '--merge-by-host', text]]);
   const out = JSON.parse(lines[0]!);
   expect(Object.hasOwn(out, 'cwd')).toBe(false);
   expect(Object.hasOwn(out.card, 'project')).toBe(false);
   expect(Object.hasOwn(out.card, 'completion')).toBe(false);
   expect(out).toMatchObject({ mode: 'live', launched: true });
   expect(readTaskCard(out.card.id, path)?.status).toBe('launched');
+});
+
+test('tasks hand --live 완료 경계 누락은 설명과 exit 1을 내고 카드·launcher를 만들지 않는다', async () => {
+  const path = statePath();
+  const { lines, code } = await cli(['task', 'hand', 'ship it', '--live'], { taskStatePath: path });
+  expect(code).toBe(1);
+  expect(lines.join('\n')).toContain('완료 경계 코드 · 완료 경계 실물 · 완료 경계 증거 명령');
+  expect(readTaskAgentState<{ tasks?: Record<string, unknown> }>(path).tasks ?? {}).toEqual({});
+});
+
+test('live hand은 빠진 경계 한 줄을 거부하고 비-code-pr 비발사 조합의 기존 실패를 보존한다', async () => {
+  const boundaryLines = liveGoal('work').split('\n').slice(1);
+  for (const [index, missingLabel] of ['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령'].entries()) {
+    const path = statePath();
+    let launches = 0;
+    const text = ['work', ...boundaryLines.filter((_, line) => line !== index)].join('\n');
+    await expect(handTask({ id: `ta-live-partial-boundary-${index}`, text, live: true, preflightGoalDoneBoundary: true, statePath: path,
+      launcher: () => { launches++; } })).rejects.toThrow(missingLabel);
+    expect(launches).toBe(0);
+    expect(readTaskCard(`ta-live-partial-boundary-${index}`, path)).toBeUndefined();
+  }
+
+  const path = statePath();
+  const root = compositionFixture('artifact');
+  let launches = 0;
+  await expect(handTask({ id: 'ta-live-artifact-boundary', text: 'work', completion: 'artifact',
+    compositionRoot: root, live: true, statePath: path, launcher: () => { launches++; } }))
+    .rejects.toThrow('조합 실행기 없음');
+  expect(launches).toBe(0);
+  expect(readTaskCard('ta-live-artifact-boundary', path)).toMatchObject({ status: 'failed', completion: 'artifact',
+    history: [{ event: 'composition-launcher-unavailable' }] });
 });
 
 test('task show <ta-id> 는 카드와 다음 수를 보이고 넥서스를 부르지 않는다', async () => {
@@ -516,7 +560,8 @@ test('발사기: spawn 이벤트면 성공 · error 면 던진다 · 둘 다 없
 
 test('--live 발사 error → 카드 launch-failed(사유) · exit 1 · launched 아님', async () => {
   const path = statePath();
-  const { lines, code } = await cli(['task', 'hand', 'ship it', '--live'], {
+  const text = liveGoal('ship it');
+  const { lines, code } = await cli(['task', 'hand', text, '--live'], {
     taskStatePath: path,
     taskLauncher: (args) => spawnDetachedConfirmed(fakeSpawn('error'), 'node', args),
   });
@@ -578,14 +623,15 @@ test('--completion <kind> 는 카드에 종결 종류를 싣고 모르는 값은
 
 test('TA-LIVE-LAND-2: task hand --ta-land --live writes card taLand and launches with ELANOUS_TA_LAND=1 (command unchanged)', async () => {
   const path = statePath();
+  const text = liveGoal('ship it');
   const calls: Array<{ args: string[]; context?: TaskLaunchContext }> = [];
-  const { lines, code } = await cli(['task', 'hand', 'ship it', '--ta-land', '--live'], {
+  const { lines, code } = await cli(['task', 'hand', text, '--ta-land', '--live'], {
     taskStatePath: path,
     taskLauncher: (args, _cwd, context) => { calls.push({ args, context }); return { runId: context!.runId }; },
   });
   expect(code).toBe(0);
   expect(calls).toHaveLength(1);
-  expect(calls[0]!.args).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', 'ship it']);
+  expect(calls[0]!.args).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', text]);
   const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { id: string; taLand?: boolean; runId?: string }> }>(path).tasks);
   expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_TA_LAND: '1' });
   expect(cards).toHaveLength(1);
@@ -596,7 +642,7 @@ test('TA-LIVE-LAND-2: task hand --ta-land --live writes card taLand and launches
 test('TA-LIVE-LAND-2: without --ta-land the card has no taLand and the launch env carries only the run id', async () => {
   const path = statePath();
   const calls: Array<{ context?: TaskLaunchContext }> = [];
-  const { code } = await cli(['task', 'hand', 'ship it', '--live'], {
+  const { code } = await cli(['task', 'hand', liveGoal('ship it'), '--live'], {
     taskStatePath: path,
     taskLauncher: (_args, _cwd, context) => { calls.push({ context }); return { runId: context!.runId }; },
   });
@@ -612,25 +658,26 @@ test('TA-LIVE-LAND-2: --ta-land is refused with --mission (pieces keep today\'s 
   expect(lines.join('\n')).toContain('--ta-land');
 });
 
-test('TASKS-HAND-CHILD-LLM: without --child-llm the command line and card are byte-identical to today', async () => {
+test('TASKS-HAND-CHILD-LLM: without --child-llm the live command and card contain no child-LLM additions', async () => {
   const path = statePath();
+  const text = liveGoal('ship it');
   const calls: string[][] = [];
-  const { lines, code } = await cli(['task', 'hand', 'ship it', '--seat', 'UX', '--live', '--json'], {
+  const { lines, code } = await cli(['task', 'hand', text, '--seat', 'UX', '--live', '--json'], {
     taskStatePath: path,
     taskLauncher: (args, _cwd, context) => { calls.push(args); return { runId: context!.runId }; },
   });
   expect(code).toBe(0);
-  expect(calls).toEqual([['harness', 'say', '--seat', 'UX', '--substrate', 'pod', '--merge-by-host', 'ship it']]);
+  expect(calls).toEqual([['harness', 'say', '--seat', 'UX', '--substrate', 'pod', '--merge-by-host', text]]);
   const card = JSON.parse(lines[0]!).card as TaskCard;
   expect(Object.hasOwn(card, 'childLlm')).toBe(false);
-  // 저장된 카드 직렬화 전체를 기능 도입 전 모양과 비교한다(동적 id·시각·런 id 만 정규화 · 키 순서까지).
+  // 저장된 카드 직렬화에서 childLlm 필드·인자·관측이 빠져 있는지 확인한다(동적 id·시각·런 id 만 정규화).
   const stored = JSON.parse(readFileSync(path, 'utf8')).tasks[card.id] as TaskCard;
   const normalized = JSON.stringify(stored)
     .replaceAll(card.id, '<ID>').replaceAll(stored.runId!, '<RUN>').replaceAll(stored.launchId!, '<LAUNCH>')
     .replaceAll(stored.createdAt, '<T>').replaceAll(stored.history[0]!.at, '<T>');
   expect(normalized).toBe(JSON.stringify({
-    id: '<ID>', text: 'ship it', seat: 'UX', composition: { file: 'graphs/work/code-pr.yaml', version: 1 }, graphSelectedBy: 'completion', unitsResolved: false, missingUnits: ['make-code@1'], createdAt: '<T>', status: 'launched', history: [
-      { at: '<T>', event: 'launch', detail: 'harness say --seat UX --substrate pod --merge-by-host ship it' },
+    id: '<ID>', text, seat: 'UX', composition: { file: 'graphs/work/code-pr.yaml', version: 1 }, graphSelectedBy: 'completion', unitsResolved: false, missingUnits: ['make-code@1'], createdAt: '<T>', status: 'launched', history: [
+      { at: '<T>', event: 'launch', detail: `harness say --seat UX --substrate pod --merge-by-host ${text}` },
       { at: '<T>', event: 'run-bound', detail: '<RUN>', runId: '<RUN>' },
     ], runId: '<RUN>', launchId: '<LAUNCH>',
   }));
@@ -639,16 +686,17 @@ test('TASKS-HAND-CHILD-LLM: without --child-llm the command line and card are by
 
 test('TASKS-HAND-CHILD-LLM: --child-llm grok/grok-4.7 passes --child-llm-provider/--child-llm-model, records card ⊕ observation', async () => {
   const path = statePath();
+  const text = liveGoal('ship it');
   const calls: string[][] = [];
   const events: Array<{ event: string; data?: unknown }> = [];
   const off = debug.registerSink({ name: 'child-llm-capture', emit: (rec) => { if (rec.category === 'task-agent') events.push(rec); } });
   try {
-    const { lines, code } = await cli(['task', 'hand', 'ship it', '--child-llm', 'grok/grok-4.7', '--child-llm-effort', 'high', '--live', '--json'], {
+    const { lines, code } = await cli(['task', 'hand', text, '--child-llm', 'grok/grok-4.7', '--child-llm-effort', 'high', '--live', '--json'], {
       taskStatePath: path,
       taskLauncher: (args, _cwd, context) => { calls.push(args); return { runId: context!.runId }; },
     });
     expect(code).toBe(0);
-    expect(calls).toEqual([['harness', 'say', '--substrate', 'pod', '--merge-by-host', '--child-llm-provider', 'grok', '--child-llm-model', 'grok-4.7', '--child-llm-effort', 'high', 'ship it']]);
+    expect(calls).toEqual([['harness', 'say', '--substrate', 'pod', '--merge-by-host', '--child-llm-provider', 'grok', '--child-llm-model', 'grok-4.7', '--child-llm-effort', 'high', text]]);
     const id = JSON.parse(lines[0]!).card.id as string;
     expect(readTaskCard(id, path)?.childLlm).toEqual({ provider: 'grok', model: 'grok-4.7', effort: 'high' });
     expect(events.find((e) => e.event === 'child-llm')?.data).toMatchObject({ taskId: id, input: 'grok/grok-4.7', provider: 'grok', model: 'grok-4.7', effort: 'high', mode: 'live' });
@@ -702,7 +750,7 @@ test('TASKS-HAND-CHILD-LLM: bad values are rejected and nothing is launched or w
 test('TASKS-HAND-CHILD-LLM: --goal-file style path text ⊕ --child-llm coexist — file body inlined, card childLlm, flags before the body', async () => {
   const path = statePath();
   const goal = join(mkdtempSync(join(tmpdir(), 'task-hand-goal-')), 'GOAL-x.md');
-  writeFileSync(goal, '# 골\n본문 한 줄\n');
+  writeFileSync(goal, `# 골\n${liveGoal('본문 한 줄')}\n`);
   const calls: string[][] = [];
   const { lines, code } = await cli(['task', 'hand', goal, '--child-llm', 'openrouter/z-ai/glm-5.3', '--live', '--json'], {
     taskStatePath: path,
@@ -1252,6 +1300,15 @@ test('TA-WORK-ORDER ③ 깨진 JSON 과 칸 id 없음은 kind rejected 와 사�
   expect(events).toContainEqual(expect.objectContaining({ event: 'rejected', data: expect.objectContaining({ cellId: null, unknownFields: [] }) }));
 });
 
+test('TA-WORK-ORDER 경로에 줄바꿈이 있어도 깨진 JSON 을 거부한다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'task-work-order-line\nbreak-'));
+  const path = join(dir, 'broken.work-order.json');
+  writeFileSync(path, '{ "cellId": "TA-1" ');
+  expect(resolveHandText(path)).toMatchObject({
+    kind: 'rejected', path, reason: expect.stringContaining('JSON 이 깨졌다'),
+  });
+});
+
 test('TA-WORK-ORDER ④ md/txt 골 파일과 일반 json 은 종전대로 inlined — 지시서 검증은 .work-order.json 만', () => {
   const dir = mkdtempSync(join(tmpdir(), 'task-work-order-preserve-'));
   const goal = join(dir, 'GOAL.md');
@@ -1260,8 +1317,9 @@ test('TA-WORK-ORDER ④ md/txt 골 파일과 일반 json 은 종전대로 inline
   const plain = join(dir, 'plain.json');
   writeFileSync(plain, '{"cellId": "TA-1"}');
   expect(resolveHandText(plain)).toMatchObject({ kind: 'inlined' });
-  // 없는 .work-order.json 은 다른 확장자와 같이 글자 그대로의 과제 한 줄로 둔다(종전 규칙).
-  expect(resolveHandText(join(dir, 'absent.work-order.json'))).toEqual({ kind: 'unchanged', text: join(dir, 'absent.work-order.json') });
+  // 없는 지시서는 파일 검증을 우회해 경로 문자열로 카드를 만들 수 없다.
+  expect(resolveHandText(join(dir, 'absent.work-order.json'))).toEqual({ kind: 'rejected', path: join(dir, 'absent.work-order.json'), reason: '없다' });
+  expect(resolveHandText(join(dir, 'absent.json'))).toEqual({ kind: 'unchanged', text: join(dir, 'absent.json') });
 });
 
 test('TA-WORK-ORDER parseWorkOrder — 배열·스칼라 JSON 은 칸 id 없음, 비문자열 칸은 읽을 수 있는 문자열로 채운다', () => {
@@ -1273,14 +1331,108 @@ test('TA-WORK-ORDER parseWorkOrder — 배열·스칼라 JSON 은 칸 id 없음,
     unknownFields: ['lifeId', 'version', 'landBy', 'identityTags', 'priority', 'verdictSignal', 'contract', 'boundary', 'precedents', 'escalation'] } });
 });
 
-test('TA-WORK-ORDER — task hand <지시서 파일> 은 펼친 골 문면을 카드 text 로 싣는다', async () => {
+test('TA-WORK-ORDER — tasks hand 실명령이 지시서를 카드 원장에 싣고 cardId·landBy를 보존한다', async () => {
   const path = statePath();
-  const { lines, code } = await cli(['task', 'hand', workOrderFile(JSON.stringify(fullWorkOrder)), '--json'], { taskStatePath: path });
+  const file = workOrderFile(JSON.stringify(fullWorkOrder));
+  const { lines, code } = await cli(['tasks', 'hand', file, '--json'], { taskStatePath: path });
   expect(code).toBeFalsy();
-  const card = JSON.parse(lines[0]!).card as TaskCard;
+  const { card, move } = JSON.parse(lines[0]!) as { card: TaskCard; move: { command: string[] } };
+  const disk = JSON.parse(readFileSync(path, 'utf8')) as { tasks: Record<string, TaskCard> };
+  expect(card.id).toStartWith('ta-');
+  expect(Object.keys(disk.tasks)).toEqual([card.id]);
+  expect(disk.tasks[card.id]?.id).toBe(card.id);
   expect(card.text.split('\n')[0]).toBe(`대상 경로: ${fullWorkOrder.boundary}`);
   expect(card.text.split('\n')[1]).toBe(`현재 계약: ${fullWorkOrder.contract}`);
-  expect(readTaskCard(card.id, path)?.text).toBe(card.text);
+  expect(disk.tasks[card.id]?.text).toContain(fullWorkOrder.landBy);
+  expect(disk.tasks[card.id]?.text).toBe(card.text);
+  expect(move.command.at(-1)).toBe(card.text);
+});
+
+test('TA-WORK-ORDER — 공백 있는 파일명의 지시서도 tasks hand 가 파싱해 cardId·landBy를 원장에 보존한다', async () => {
+  const path = statePath();
+  const file = join(mkdtempSync(join(tmpdir(), 'task-work-order-space-')), 'cell order.work-order.json');
+  writeFileSync(file, JSON.stringify(fullWorkOrder));
+  const events: Array<{ category: string; event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'work-order-space-capture', emit: (rec) => { if (rec.category === 'task-agent.work-order') events.push(rec); } });
+  let result: Awaited<ReturnType<typeof cli>>;
+  try { result = await cli(['tasks', 'hand', file, '--json'], { taskStatePath: path }); } finally { off(); }
+  expect(result.code).toBeFalsy();
+  const { card, move } = JSON.parse(result.lines[0]!) as { card: TaskCard; move: { command: string[] } };
+  const stored = readTaskCard(card.id, path)!;
+  expect(Object.keys(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(path).tasks)).toEqual([card.id]);
+  expect(stored.id).toBe(card.id);
+  expect(stored.text.split('\n')[0]).toBe(`대상 경로: ${fullWorkOrder.boundary}`);
+  expect(stored.text.split('\n')[1]).toBe(`현재 계약: ${fullWorkOrder.contract}`);
+  expect(stored.text).toContain(fullWorkOrder.landBy);
+  expect(stored.text).toBe(card.text);
+  expect(move.command.at(-1)).toBe(stored.text);
+  expect(events).toContainEqual(expect.objectContaining({ event: 'parsed', data: expect.objectContaining({ cellId: fullWorkOrder.cellId, unknownFields: [] }) }));
+});
+
+test('TA-WORK-ORDER — 공백 있는 파일명의 깨진 JSON·칸 id 누락은 tasks hand 가 카드 작성 전에 거부한다', async () => {
+  const path = statePath();
+  const dir = mkdtempSync(join(tmpdir(), 'task-work-order-space-bad-'));
+  const file = join(dir, 'bad order.work-order.json');
+  const events: Array<{ category: string; event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'work-order-space-reject-capture', emit: (rec) => { if (rec.category === 'task-agent.work-order') events.push(rec); } });
+  try {
+    for (const [source, reason] of [['{ "cellId": "TA-1" ', 'JSON 이 깨졌다'], [JSON.stringify({ boundary: 'src/a.ts' }), '칸 id 가 없다']]) {
+      writeFileSync(file, source);
+      const { lines, code } = await cli(['tasks', 'hand', file, '--json'], { taskStatePath: path });
+      expect(code).toBe(1);
+      expect(lines[0]).toContain(`골 파일 ${file}: ${reason}`);
+      expect(readTaskAgentState(path)).toEqual({});
+    }
+  } finally { off(); }
+  expect(events).toHaveLength(2);
+  for (const event of events) expect(event).toEqual(expect.objectContaining({ event: 'rejected', data: expect.objectContaining({ cellId: null, unknownFields: [] }) }));
+});
+
+test('TA-WORK-ORDER — 줄바꿈 있는 파일명의 유효 지시서는 보존되고 깨진 JSON 은 tasks hand 가 거부한다', async () => {
+  const goodState = statePath();
+  const badState = statePath();
+  const dir = mkdtempSync(join(tmpdir(), 'task-work-order-line\nbreak-cli-'));
+  const valid = join(dir, 'valid.work-order.json');
+  const invalid = join(dir, 'invalid.work-order.json');
+  writeFileSync(valid, JSON.stringify(fullWorkOrder));
+  const handed = await cli(['tasks', 'hand', valid, '--json'], { taskStatePath: goodState });
+  expect(handed.code).toBeFalsy();
+  const { card } = JSON.parse(handed.lines[0]!) as { card: TaskCard };
+  expect(readTaskCard(card.id, goodState)).toMatchObject({ id: card.id, text: expect.stringContaining(fullWorkOrder.landBy) });
+
+  writeFileSync(invalid, '{ "cellId": "TA-1" ');
+  const rejected = await cli(['tasks', 'hand', invalid, '--json'], { taskStatePath: badState });
+  expect(rejected.code).toBe(1);
+  expect(rejected.lines[0]).toContain('JSON 이 깨졌다');
+  expect(readTaskAgentState(badState)).toEqual({});
+});
+
+test('TA-WORK-ORDER — 명시적으로 적힌 «모름»은 누락 필드가 아니다', () => {
+  const parsed = parseWorkOrder(JSON.stringify({ ...fullWorkOrder, budget: '모름' }));
+  expect(parsed).toMatchObject({ ok: true, order: { budget: '모름', unknownFields: [] } });
+});
+
+test('TA-WORK-ORDER — 없는 지시서 CLI 입력은 카드 기록 전에 거부한다', async () => {
+  const path = statePath();
+  const missing = join(mkdtempSync(join(tmpdir(), 'task-work-order-missing-')), 'absent.work-order.json');
+  const events: Array<{ category: string; event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'work-order-missing-capture', emit: (rec) => { if (rec.category === 'task-agent.work-order') events.push(rec); } });
+  let lines: string[];
+  let code: number | string | undefined;
+  try { ({ lines, code } = await cli(['tasks', 'hand', missing, '--json'], { taskStatePath: path })); } finally { off(); }
+  expect(code).toBe(1);
+  expect(lines).toEqual([`골 파일 ${missing}: 없다`]);
+  expect(readTaskAgentState(path)).toEqual({});
+  expect(events).toContainEqual(expect.objectContaining({ event: 'rejected', data: expect.objectContaining({ cellId: null, unknownFields: [] }) }));
+});
+
+test('TA-WORK-ORDER — 깨진 지시서 CLI 입력은 카드 기록 전에 거부한다', async () => {
+  const path = statePath();
+  const file = workOrderFile('{ "cellId": "TA-1" ');
+  const { lines, code } = await cli(['tasks', 'hand', file, '--json'], { taskStatePath: path });
+  expect(code).toBe(1);
+  expect(lines[0]).toContain('JSON 이 깨졌다');
+  expect(readTaskAgentState(path)).toEqual({});
 });
 
 test('abandonedDraftReleaseNote — failed 카드 ⊕ PR 있으면 그 PR 의 처리 끝 문면', () => {
@@ -1315,4 +1467,228 @@ test('abandonedDraftReleaseNote — PR 없는 포기 카드는 null', () => {
       status, history: [] };
     expect(abandonedDraftReleaseNote(card, at)).toBeNull();
   }
+});
+
+// ── TIER-SPLIT-BEFORE-LAUNCH (0.2.35 P0) — 상·특 hand 는 분해해 중 이하 조각으로 발사한다 ──
+import { decomposeToTierSizedSlices } from '../self-implement/goal-author-decompose.js';
+import { composeSliceHandText, DEFAULT_TIER_SIZED_DECOMPOSE, handTaskWithTierSplit, planTierSplit, type TierSizedDecompose, type SizedSlice } from './tier-split.js';
+
+function tierSplitHarness(decompose?: TierSizedDecompose | 'unwired') {
+  const path = statePath();
+  const calls: string[][] = [];
+  const decomposeCalls: string[] = [];
+  const records: Array<Record<string, unknown>> = [];
+  const off = debug.registerSink({ name: `tier-split-${Math.random()}`, emit: (rec) => {
+    if (rec.category === 'task-agent.hand' && rec.event === 'tier-split') records.push(rec.data as Record<string, unknown>);
+  } });
+  const deps: Parameters<typeof registerTasksCommands>[1] = {
+    taskStatePath: path,
+    taskLauncher: (args, _cwd, context) => { calls.push(args); return { runId: context!.runId }; },
+    ...(decompose === 'unwired' ? {} : { tierSizedDecompose: decompose
+      ? async (goal: string, opts?: { signal?: AbortSignal }) => { decomposeCalls.push(goal); return decompose(goal, opts); }
+      : undefined }),
+  };
+  return { path, calls, decomposeCalls, records, off, deps };
+}
+
+const slice = (name: string, tier: SizedSlice['tier'], extra: Partial<SizedSlice> = {}): SizedSlice =>
+  ({ goal: liveGoal(`대상 경로: src/${name}.ts\n${name} 조각`), files: 1, behaviours: 1, newFiles: 0, tier, ...extra });
+
+test('TIER-SPLIT planTierSplit: 이유 없는 상 조각 · ok:false · 빈 조각 · 잘못된 tier 는 blocked, 나머지는 split', () => {
+  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '하')] })).toMatchObject({ kind: 'split' });
+  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '상', { unavoidable: '한 트랜잭션 경계' })] })).toMatchObject({ kind: 'split' });
+  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '상')] })).toEqual({ kind: 'blocked', reason: 'unjustified-상-slice: #2' });
+  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '상', { unavoidable: '  ' })] })).toMatchObject({ kind: 'blocked' });
+  expect(planTierSplit({ ok: false, reason: 'llm-timeout' })).toEqual({ kind: 'blocked', reason: 'decompose-failed: llm-timeout' });
+  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [] })).toEqual({ kind: 'blocked', reason: 'no-slices' });
+  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [{ ...slice('a', '중'), tier: '특' as never }] })).toMatchObject({ kind: 'blocked' });
+  expect(DEFAULT_TIER_SIZED_DECOMPOSE).toBe(decomposeToTierSizedSlices);
+});
+
+test('TIER-SPLIT (a) 상 hand → 분해(중 2 · 하 1) → 조각 카드 3장을 각 tier 로 발사 ⊕ tier-split 기록', async () => {
+  const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 1, slices: [slice('a', '중', { files: 2, behaviours: 2 }), slice('b', '중'), slice('c', '하')] }));
+  try {
+    const text = liveGoal('대상 경로: src/a.ts · src/b.ts · src/c.ts\n큰 덩어리');
+    const { lines, code } = await cli(['task', 'hand', text, '--tier', '상', '--live', '--json'], h.deps);
+    expect(code).toBe(0);
+    expect(h.decomposeCalls).toEqual([text]);
+    expect(h.calls).toHaveLength(3);
+    expect(h.calls.map((args) => args.at(-1))).toEqual([slice('a', '중').goal, slice('b', '중').goal, slice('c', '하').goal]);
+    const out = JSON.parse(lines[0]!) as { kind: string; group: string; slices: Array<{ result: { card: TaskCard; launched: boolean } }> };
+    expect(out.kind).toBe('split');
+    const cards = out.slices.map((s) => readTaskCard(s.result.card.id, h.path)!);
+    expect(cards.map((c) => [c.tier, c.status, c.checklistId, c.tierSplit])).toEqual([
+      ['중', 'launched', undefined, { group: out.group, fromTier: '상', index: 1, total: 3 }],
+      ['중', 'launched', undefined, { group: out.group, fromTier: '상', index: 2, total: 3 }],
+      ['하', 'launched', undefined, { group: out.group, fromTier: '상', index: 3, total: 3 }],
+    ]);
+    expect(h.records).toEqual([{ cid: null, fromTier: '상', outcome: 'split', group: out.group,
+      slices: [{ tier: '중', files: 2, behaviours: 2 }, { tier: '중', files: 1, behaviours: 1 }, { tier: '하', files: 1, behaviours: 1 }], unavoidable: [] }]);
+  } finally { h.off(); }
+});
+
+test('TIER-SPLIT (b) 불가피 이유가 붙은 상 조각만 상으로 발사한다', async () => {
+  const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '상', { unavoidable: '스키마 이전과 읽기 경로가 한 커밋이어야 한다' }), slice('b', '중')] }));
+  try {
+    const { lines, code } = await cli(['task', 'hand', liveGoal('특 덩어리'), '--tier', '특', '--live', '--json'], h.deps);
+    expect(code).toBe(0);
+    expect(h.calls).toHaveLength(2);
+    const out = JSON.parse(lines[0]!) as { slices: Array<{ result: { card: TaskCard } }> };
+    const cards = out.slices.map((s) => readTaskCard(s.result.card.id, h.path)!);
+    expect(cards.map((c) => c.tier)).toEqual(['상', '중']);
+    expect(cards[0]!.tierSplit).toMatchObject({ fromTier: '특', unavoidable: '스키마 이전과 읽기 경로가 한 커밋이어야 한다' });
+    expect(cards[1]!.tierSplit?.unavoidable).toBeUndefined();
+    expect(h.records[0]).toMatchObject({ fromTier: '특', outcome: 'split', unavoidable: ['스키마 이전과 읽기 경로가 한 커밋이어야 한다'] });
+  } finally { h.off(); }
+});
+
+test('TIER-SPLIT (c) 이유 없는 상 조각 → 발사 0 · 카드 failed(tier-split-failed) · 한 덩어리로 쏘지 않는다', async () => {
+  const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '상')] }));
+  try {
+    const { lines, code } = await cli(['task', 'hand', liveGoal('상 덩어리'), '--tier', '상', '--live', '--json'], h.deps);
+    expect(code).toBe(1);
+    expect(h.calls).toEqual([]);
+    const card = readTaskCard((JSON.parse(lines[0]!) as { card: TaskCard }).card.id, h.path)!;
+    expect(card.status).toBe('failed');
+    expect(card.tier).toBe('상');
+    expect(card.history.at(-1)).toMatchObject({ event: 'tier-split-failed', detail: 'tier-split-failed: unjustified-상-slice: #2' });
+    expect(nextMoveFor(card).kind).toBe('wait');
+    expect(h.records).toEqual([{ cid: null, fromTier: '상', outcome: 'blocked', reason: 'unjustified-상-slice: #2', slices: [], unavoidable: [] }]);
+  } finally { h.off(); }
+});
+
+test('TIER-SPLIT (d) 분해 ok:false · throw → 발사 0 · 카드 failed ⊕ blocked 기록', async () => {
+  for (const [decompose, reason] of [
+    [async () => ({ ok: false as const, reason: 'llm-timeout' }), 'decompose-failed: llm-timeout'],
+    [async () => { throw new Error('boom'); }, 'decompose-threw: boom'],
+  ] as Array<[TierSizedDecompose, string]>) {
+    const h = tierSplitHarness(decompose);
+    try {
+      const { lines, code } = await cli(['task', 'hand', liveGoal('상 덩어리'), '--tier', '상', '--live'], h.deps);
+      expect(code).toBe(1);
+      expect(h.calls).toEqual([]);
+      expect(lines.join('\n')).toContain(`tier-split-failed — 발사 0 · 카드 failed · ${reason}`);
+      const card = readTaskAgentState<{ tasks: Record<string, TaskCard> }>(h.path).tasks;
+      expect(Object.values(card).map((c) => [c.status, c.history.at(-1)?.event])).toEqual([['failed', 'tier-split-failed']]);
+      expect(h.records).toEqual([{ cid: null, fromTier: '상', outcome: 'blocked', reason, slices: [], unavoidable: [] }]);
+    } finally { h.off(); }
+  }
+});
+
+test('TIER-SPLIT 디스패처 계약: 텍스트 출력 줄 머리 ta- = 카드 id 만 — 조각 발사는 첫 줄 ta-<조각 카드> · 막힘은 ta- 줄 0', async () => {
+  // ta-dispatcher.sh 는 `tasks hand … --live 2>&1 | grep -E '^ta-' | head -1` 로 성패를 가른다.
+  const split = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '하')] }));
+  try {
+    const { lines, code } = await cli(['task', 'hand', liveGoal('상 덩어리'), '--tier', '상', '--live'], split.deps);
+    expect(code).toBe(0);
+    const cards = Object.keys(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(split.path).tasks);
+    const taLines = lines.filter((l) => /^ta-/.test(l)).map((l) => l.split('\t')[0]);
+    expect(lines[0]!.split('\t')[0]).toBe(taLines[0]);
+    expect(taLines.sort()).toEqual(cards.sort());
+    expect(taLines).toHaveLength(2);
+  } finally { split.off(); }
+  const blocked = tierSplitHarness(async () => ({ ok: false as const, reason: 'llm-timeout' }));
+  try {
+    const { lines, code } = await cli(['task', 'hand', liveGoal('상 덩어리'), '--tier', '상', '--live'], blocked.deps);
+    expect(code).toBe(1);
+    expect(lines.filter((l) => /^ta-/.test(l))).toEqual([]);
+    expect(lines[0]).toMatch(/^tier-split-failed\tta-/);
+  } finally { blocked.off(); }
+});
+
+test('TIER-SPLIT 분해 시간 상한: 매달린 분해기 → signal abort ⊕ 발사 0 · 막힘(decompose-timeout)', async () => {
+  const h = tierSplitHarness();
+  try {
+    let aborted = false;
+    const out = await handTaskWithTierSplit({ text: liveGoal('상 덩어리'), tier: '상', live: true, statePath: h.path, launcher: h.deps.taskLauncher!,
+      decomposeTimeoutMs: 20,
+      decompose: (_goal, opts) => new Promise(() => { opts?.signal?.addEventListener('abort', () => { aborted = true; }); }) });
+    expect(out.kind).toBe('blocked');
+    if (out.kind !== 'blocked') return;
+    expect(out.reason).toBe('decompose-timeout: 20ms');
+    expect(aborted).toBe(true);
+    expect(h.calls).toEqual([]);
+  } finally { h.off(); }
+});
+
+test('TIER-SPLIT 조각 카드는 호출자 id·pr·goalId 를 복제하지 않고 버린 것을 기록한다', async () => {
+  const h = tierSplitHarness();
+  try {
+    const out = await handTaskWithTierSplit({ text: liveGoal('상 덩어리'), tier: '상', live: true, statePath: h.path, launcher: h.deps.taskLauncher!,
+      id: 'ta-caller-chosen', cardFields: { pr: { number: 4242 }, goalId: 'goal-x' },
+      decompose: async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '하')] }) });
+    expect(out.kind).toBe('split');
+    if (out.kind !== 'split') return;
+    for (const piece of out.slices) {
+      expect(piece.result?.card.id).not.toBe('ta-caller-chosen');
+      expect(piece.result?.card.pr).toBeUndefined();
+      expect(piece.result?.card.goalId).toBeUndefined();
+    }
+    expect(h.records[0]).toMatchObject({ outcome: 'split', dropped: { id: 'ta-caller-chosen', pr: { number: 4242 }, goalId: 'goal-x' } });
+  } finally { h.off(); }
+});
+
+test('TIER-SPLIT 조각 문면은 부모 칸의 계약·완료 경계를 물려받아 운영 골 검사를 통과한다(10-21 DEVICE-FIRST-AUTHORING 발사 0 회귀)', async () => {
+  const parent = '대상 경로: src/a.ts · src/b.ts · src/c.ts\n현재 계약: bun test src/a.test.ts → 0 fail.\n바꿀 것: 셋을 고친다.\n- 완료 경계 코드: 셋이 고쳐진다\n- 완료 경계 실물: fake 로 돌린 원문\n- 완료 경계 증거 명령: bun test src/a.test.ts\n경계: 셋만.';
+  const bare = (name: string): SizedSlice => ({ goal: `대상 경로: src/${name}.ts · 동작: ${name} 고침`, files: 1, behaviours: 1, newFiles: 0, tier: '하' });
+  const composed = composeSliceHandText(bare('a').goal, parent, { index: 1, total: 3, fromTier: '상', cid: 'CELL' });
+  expect(composed.split('\n')[0]).toBe('대상 경로: src/a.ts · 동작: a 고침');
+  expect(composed).toContain('조각 1/3 — 부모 CELL(상)');
+  expect(composed).toContain('- 완료 경계 증거 명령: bun test src/a.test.ts');
+  expect(composed).toContain('현재 계약: bun test src/a.test.ts → 0 fail.');
+  expect(composed).not.toContain('대상 경로: src/a.ts · src/b.ts');
+  expect(composeSliceHandText(bare('a').goal, '대상 경로: src/a.ts\n바꿀 것: 셋', { index: 1, total: 1, fromTier: '상', cid: null })).toBe(bare('a').goal);
+  const h = tierSplitHarness();
+  try {
+    const out = await handTaskWithTierSplit({ text: parent, tier: '상', live: true, checklistId: 'CELL', checklistCell: () => undefined,
+      preflightGoalDoneBoundary: true, statePath: h.path, launcher: h.deps.taskLauncher!,
+      decompose: async () => ({ ok: true, redecomposed: 0, slices: [bare('a'), bare('b'), bare('c')] }) });
+    expect(out.kind).toBe('split');
+    if (out.kind !== 'split') return;
+    expect(out.slices.map((s) => [s.error ?? null, s.result?.launched])).toEqual([[null, true], [null, true], [null, true]]);
+    expect(h.calls).toHaveLength(3);
+  } finally { h.off(); }
+});
+
+test('TIER-SPLIT (e) 중·하·tier 없음 hand 는 분해 호출 0 · 한 덩어리 발사 무변경', async () => {
+  for (const tier of ['중', '하', undefined]) {
+    const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '하')] }));
+    try {
+      const text = liveGoal('작은 일');
+      const { lines, code } = await cli(['task', 'hand', text, ...(tier ? ['--tier', tier] : []), '--live', '--json'], h.deps);
+      expect(code).toBe(0);
+      expect(h.decomposeCalls).toEqual([]);
+      expect(h.calls.map((args) => args.at(-1))).toEqual([text]);
+      expect((JSON.parse(lines[0]!) as { card: TaskCard }).card.tierSplit).toBeUndefined();
+      expect(h.records).toEqual([]);
+    } finally { h.off(); }
+  }
+});
+
+test('TIER-SPLIT (f) 분해기 미배선(seam undefined 명시) = decomposer-unavailable → 실패와 구분: 한 덩어리 발사 ⊕ 기록', async () => {
+  // 키 없음(기본 seam)은 이제 TC decomposeToTierSizedSlices = 실 LLM 이라 시험에서 부르지 않는다.
+  {
+    const h = tierSplitHarness(undefined);
+    try {
+      const text = liveGoal('상 덩어리');
+      const { lines, code } = await cli(['task', 'hand', text, '--tier', '상', '--live', '--json'], h.deps);
+      expect(code).toBe(0);
+      expect(h.calls.map((args) => args.at(-1))).toEqual([text]);
+      const card = readTaskCard((JSON.parse(lines[0]!) as { card: TaskCard }).card.id, h.path)!;
+      expect([card.status, card.tier, card.tierSplit]).toEqual(['launched', '상', undefined]);
+      expect(h.records).toEqual([{ cid: null, fromTier: '상', outcome: 'whole', reason: 'decomposer-unavailable', slices: [], unavoidable: [] }]);
+    } finally { h.off(); }
+  }
+});
+
+test('TIER-SPLIT 조각 카드는 부모 칸(checklistId)을 그대로 잇고 기록의 cid 가 그 칸이다', async () => {
+  const h = tierSplitHarness();
+  try {
+    const out = await handTaskWithTierSplit({ text: liveGoal('상 덩어리'), tier: '상', live: true, checklistId: 'TIER-CELL', checklistCell: () => undefined,
+      statePath: h.path, launcher: h.deps.taskLauncher!, decompose: async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '하')] }) });
+    expect(out.kind).toBe('split');
+    if (out.kind !== 'split') return;
+    expect(out.slices.map((s) => [s.result?.card.checklistId, s.result?.card.tier, s.result?.launched])).toEqual([['TIER-CELL', '중', true], ['TIER-CELL', '하', true]]);
+    expect(h.records[0]).toMatchObject({ cid: 'TIER-CELL', outcome: 'split' });
+  } finally { h.off(); }
 });

@@ -33,6 +33,12 @@ import { getTheme } from '../../themes/index.js';
 // same shape `pluginHost.loadThemeTokens` produces — not a full ThemeTokens.
 export type PluginThemeLoader = (id: string) => ThemeTokenInput | null | undefined;
 
+export interface PluginThemeAppliedEvent {
+  id: string;
+  tokensCount: number;
+  source: 'plugin';
+}
+
 export interface ResolveActiveThemeOptions {
   /** Raw `dashboard.theme` value from user-config. Shape is flexible:
    *  `null` | `string` | `{ active: string, ... }` | `{ tokens: {...} }`. */
@@ -44,17 +50,19 @@ export interface ResolveActiveThemeOptions {
    *  (so a broken plugin doesn't crash the dashboard) but reported
    *  here for visibility. */
   onPluginError?: (message: string) => void;
+  /** Called after plugin tokens have been merged into the resolved theme. */
+  onPluginApplied?: (event: PluginThemeAppliedEvent) => void;
 }
 
 /** Resolve the active dashboard theme from user-config, with preset
  *  + plugin + default fallback layers. Pure function — no I/O. */
 export function resolveActiveTheme(opts: ResolveActiveThemeOptions): ThemeTokens {
-  const { raw, loadPlugin, onPluginError } = opts;
+  const { raw, loadPlugin, onPluginError, onPluginApplied } = opts;
 
   // Extract active name + user overrides from the raw user-config
   // value. The config shape evolved over time — handle all known
   // forms defensively.
-  const activeName = extractActiveName(raw);
+  const activeName = getActiveThemeName(raw);
   const rawOverrides: ThemeTokenInput | undefined = extractOverrides(raw);
 
   // Branch 1: preset registry hit.
@@ -70,10 +78,20 @@ export function resolveActiveTheme(opts: ResolveActiveThemeOptions): ThemeTokens
     try {
       const contributed = loadPlugin(activeName);
       if (contributed) {
-        return mergeThemeTokens(
+        const resolved = mergeThemeTokens(
           mergeThemeTokens(DEFAULT_THEME_TOKENS, contributed),
           rawOverrides ?? {},
         );
+        try {
+          onPluginApplied?.({
+            id: activeName,
+            tokensCount: countTokenLeaves(contributed),
+            source: 'plugin',
+          });
+        } catch {
+          // Observation failures must not discard an already-resolved theme.
+        }
+        return resolved;
       }
     } catch (err: unknown) {
       const message =
@@ -86,7 +104,18 @@ export function resolveActiveTheme(opts: ResolveActiveThemeOptions): ThemeTokens
   return resolveThemeTokens(raw);
 }
 
-function extractActiveName(raw: unknown): string | null {
+function countTokenLeaves(value: unknown, isRoot = true): number {
+  if (value === null || value === undefined) return 0;
+  if (typeof value !== 'object') return 1;
+  if (Array.isArray(value)) {
+    return value.reduce((count, item) => count + countTokenLeaves(item, false), 0);
+  }
+  return Object.entries(value as Record<string, unknown>)
+    .filter(([key]) => !isRoot || key !== 'name')
+    .reduce((count, [, item]) => count + countTokenLeaves(item, false), 0);
+}
+
+export function getActiveThemeName(raw: unknown): string | null {
   if (typeof raw === 'string') return raw.trim() || null;
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     const active = (raw as Record<string, unknown>).active;

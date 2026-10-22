@@ -24,6 +24,7 @@
 // surfaces tier label + model id + per-turn rationale only.
 
 import type { LLMProviderName, ReasoningLevel } from '../user-config.js';
+import { OPENGATEWAY_DEFAULT_MODEL } from '../llm/opengateway-models.js';
 import type { ModelTier } from './types.js';
 
 export interface LlmTierSpec {
@@ -417,6 +418,18 @@ const OPENROUTER: TierMap = {
   loaded:   { model: 'openrouter/moonshotai/kimi-k3', reasoningLevel: 'high', label: 'Kimi K3 · reasoning high (OpenRouter)', rationale: 'Loaded · deep multi-step', status: 'shipping' },
 };
 
+// First OpenGateway slice has one measured model. Every explicit tier resolves to the same model
+// until distinct tiers have their own live evidence; no quality or price ordering is implied.
+const OPENGATEWAY_MODEL = OPENGATEWAY_DEFAULT_MODEL;
+// The provider has no effort/thinking control; all five tiers use the verified model without reasoning options.
+const OPENGATEWAY: TierMap = {
+  budget:   { model: OPENGATEWAY_MODEL, reasoningLevel: 'off', label: 'DeepSeek V4.1 Flash Ultrafast (OpenGateway)', rationale: 'Single verified first-slice model', status: 'shipping' },
+  balanced: { model: OPENGATEWAY_MODEL, reasoningLevel: 'off', label: 'DeepSeek V4.1 Flash Ultrafast (OpenGateway)', rationale: 'Single verified first-slice model', status: 'shipping' },
+  better:   { model: OPENGATEWAY_MODEL, reasoningLevel: 'off', label: 'DeepSeek V4.1 Flash Ultrafast (OpenGateway)', rationale: 'Single verified first-slice model', status: 'shipping' },
+  best:     { model: OPENGATEWAY_MODEL, reasoningLevel: 'off', label: 'DeepSeek V4.1 Flash Ultrafast (OpenGateway)', rationale: 'Single verified first-slice model', status: 'shipping' },
+  loaded:   { model: OPENGATEWAY_MODEL, reasoningLevel: 'off', label: 'DeepSeek V4.1 Flash Ultrafast (OpenGateway)', rationale: 'Single verified first-slice model', status: 'shipping' },
+};
+
 // ── AWS Bedrock (BEDROCK-PROVIDER · 2026-10-11) ───────────────────
 //   ⭐ 판단: ANTHROPIC 사다리의 «추론 수준·역할 배치»를 그대로 두고, 모델은 Bedrock 메시지 엔드포인트에서
 //   확인한 5.5 계열 id(`src/llm/bedrock.ts` BEDROCK_MODELS · 출처 platform.claude.com «Claude in Amazon Bedrock»
@@ -466,6 +479,7 @@ export const LLM_TIER_MAP_BY_PROVIDER: Readonly<Record<LlmTierProvider, TierMap>
   glm: GLM,
   grok: GROK,
   openrouter: OPENROUTER,
+  opengateway: OPENGATEWAY,
   bedrock: BEDROCK,
 } as const;
 
@@ -488,7 +502,7 @@ export function parseTierArg(raw: string): ModelTier | undefined {
  *  tsc 는 배열 누락을 못 잡는다(2026-09-23 `#19900` 이 `openrouter` 를 빠뜨려 배선 계약 자가 그것을
  *  한 번도 누르지 않았다). 자 = `provider-wiring-contract.test.ts`. */
 export const TIER_PROVIDERS: readonly LlmTierProvider[] = [
-  'anthropic', 'openai', 'openai-codex', 'gemini', 'grok', 'local', 'kimi', 'qwen', 'glm', 'openrouter', 'bedrock',
+  'anthropic', 'openai', 'openai-codex', 'gemini', 'grok', 'local', 'kimi', 'qwen', 'glm', 'openrouter', 'opengateway', 'bedrock',
 ];
 
 /** OpenRouter 모델 id(`openrouter/<vendor>/<model>` 또는 `<vendor>/<model>`)의 tier-map 칸.

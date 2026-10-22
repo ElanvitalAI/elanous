@@ -150,6 +150,7 @@ export type LLMProviderName =
   | 'kimi' | 'qwen' | 'glm'
   // 대표 2026-09-23 — OpenAI 호환 게이트웨이. kimi·qwen·glm 의 «첫 실제 경로»(모델 id `openrouter/<vendor>/<model>`).
   | 'openrouter'
+  | 'opengateway'
   // 대표 2026-10-10 (BEDROCK-PROVIDER) — AWS Bedrock 의 Claude. 자격 = AWS 기본 자격 체인 · 명시 선택 전용(auto·폴백 후보 아님).
   | 'bedrock';
 
@@ -157,12 +158,12 @@ export type LLMProviderName =
 // ⛔ 2026-09-23 — 손으로 적은 목록이라 새 provider 를 «조용히» 거른다: `openrouter` 를 배선(#19900)했는데
 //   여기 없어서 config 로 고르면 정규화가 `auto` 로 떨궜다(「직렬화 드롭」). 자 = `test/llm-provider-name-lists.test.ts`.
 export const CONFIG_LLM_PROVIDER_NAMES: readonly LLMProviderName[] = [
-  'auto', 'grok', 'openai', 'anthropic', 'local', 'openai-codex', 'gemini', 'openrouter', 'bedrock',
+  'auto', 'grok', 'openai', 'anthropic', 'local', 'openai-codex', 'gemini', 'openrouter', 'opengateway', 'bedrock',
 ];
 
 /** `ELANOUS_LLM_PROVIDER` additionally permits every declared runtime provider. */
 export const RUNTIME_LLM_PROVIDER_NAMES: readonly LLMProviderName[] = [
-  'auto', 'grok', 'openai', 'anthropic', 'local', 'openai-codex', 'gemini', 'kimi', 'qwen', 'glm', 'openrouter', 'bedrock',
+  'auto', 'grok', 'openai', 'anthropic', 'local', 'openai-codex', 'gemini', 'kimi', 'qwen', 'glm', 'openrouter', 'opengateway', 'bedrock',
 ];
 
 /** Provider-agnostic reasoning intensity. The HUD click cycle and the
@@ -6301,6 +6302,7 @@ export const PROVIDER_DEFAULT_MODEL: Record<LLMProviderName, string> = {
   grok: 'grok-4.7',
   // 대표 2026-09-23 — 사다리 balanced 와 같다(`llm.ts` OPENROUTER_MODEL). 자가 둘을 묶는다.
   openrouter: 'openrouter/z-ai/glm-5.3',
+  opengateway: 'opengateway/deepseek/deepseek-v4.1-flash-ultrafast',
   // ⛔ 2026-08-18: 'gemini-2.0-flash' 는 카탈로그의 «가장 낡은» 항목이었다. 같은 날 grok 을
   //    고치면서 이 줄이 빠졌다. 카탈로그가 recommended 로 표시한 실물 flash 로 맞춘다.
   gemini: 'gemini-3.8-flash',

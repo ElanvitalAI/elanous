@@ -18,8 +18,8 @@ import { rejudgeCandidates } from '../task-agent/rejudge-on-head.js';
 import { reviewResultPath } from '../task-agent/review-result-capture.js';
 import { repairReviewDigest } from '../task-agent/repair-review.js';
 import { adoptExistingPr, adoptedRunTerminal } from '../task-agent/adopt-pr.js';
-import type { BoardNode } from '../task-agent/board.js';
-import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TasksCliDeps } from './tasks-cli.js';
+import { cardsBoard, type BoardNode } from '../task-agent/board.js';
+import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
 const withDoneBoundary = (text: string): string => `${text}\n완료 경계 코드: src/cli/tasks-cli.ts 의 카드 발사\n완료 경계 실물: 지정한 체크리스트 칸이 한 번 발사된다\n완료 경계 증거 명령: bun test src/cli/tasks-cli.test.ts`;
@@ -1220,7 +1220,8 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['green-sweep', 'cover', 'list', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['work-order', 'green-sweep', 'cover', 'outcomes', 'list', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
+  expect(command?.commands.find((entry) => entry.name() === 'work-order')?.commands.map((entry) => entry.name())).toEqual(['build']);
 });
 
 test('tasks hand-move — 카드 history 에 손으로 쓴 한 줄을 남긴다 · 모르는 kind 는 원장을 건드리지 않는다', async () => {
@@ -1719,4 +1720,497 @@ test('tasks rejudge --all selects a formerly unbound remote parent after HQ mirr
   expect(readFileSync(join(dir, `${child}.jsonl`), 'utf8')).toContain('"runStatus":"completed"');
   expect((JSON.parse(readFileSync(taskStatePath, 'utf8')) as { tasks: Record<string, { pr?: { number: number }; runChildId?: string }> }).tasks['ta-remote'])
     .toMatchObject({ pr: { number: 30 }, runChildId: child });
+});
+
+test('TA-CARD-OUTCOMES-CLI — tasks outcomes --since 24h --json 은 카드·PR 종결 사실과 원문 부재를 센다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const ledgerDir = join(dir, 'run-ledger');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+    const url = 'https://github.com/ElanvitalAI/elanous/pull/123';
+    const urlRecovered = 'https://github.com/ElanvitalAI/elanous/pull/456';
+    writeTaskCards(statePath, [
+      { id: 'ta-out-pr', text: 'PR 성공', seat: 'TC', checklistId: 'CELL-PR', status: 'launched',
+        runId: 'run-out-a', createdAt: ago(30), pr: { number: 123, url },
+        prTerminal: { pr: 123, url, head: 'a'.repeat(40), state: 'MERGED', at: ago(2) },
+        history: [
+          { at: ago(6), event: 'live-move', kind: 'land', executed: true, ok: true, detail: 'land executed' },
+          { at: ago(5), event: 'postland', detail: 'MERGED #123 · 칸 green' },
+        ] },
+      // 종료 시각은 «종결 사건 줄»이 정한다 — 창 밖 run-bound(30시간 전)가 아니라 1시간 전 실패 줄이 종료 시각이다.
+      { id: 'ta-out-samecell', text: 'same-cell 거부', seat: 'TC', checklistId: 'CELL-SAME', status: 'failed',
+        runId: 'run-out-b', parentHost: { host: 'node-b' }, createdAt: ago(30),
+        history: [{ at: ago(30), event: 'run-bound', runId: 'run-out-b' }, { at: ago(1), event: 'failed' }] },
+      { id: 'ta-out-noprogress', text: 'no-progress', seat: 'TC', checklistId: 'CELL-NP', status: 'failed',
+        runId: 'run-out-c', createdAt: ago(30),
+        history: [{ at: ago(3), event: 'pr-bound', runId: 'run-out-c' }, { at: ago(1.5), event: 'failed' }] },
+      // 자식 런에서 오류 뒤 재시도가 이겨 PR 이 종결됐다 — 오류 원문은 이 행의 종결 사유가 아니다.
+      { id: 'ta-out-recovered', text: '재시도 종결', seat: 'TC', checklistId: 'CELL-REC', status: 'launched',
+        runId: 'run-out-d', createdAt: ago(30), pr: { number: 456, url: urlRecovered },
+        prTerminal: { pr: 456, url: urlRecovered, head: 'b'.repeat(40), state: 'MERGED', at: ago(2.5) },
+        history: [{ at: ago(6), event: 'failed', detail: 'same-cell 가드 — 초판은 중단됐다' }] },
+      // 이미 끝났다는 후보만으로 24시간 창의 «종결»로 올리지 않는다.
+      { id: 'ta-out-candidate', text: '후보', seat: 'TC', checklistId: 'CELL-CAND', status: 'failed',
+        runId: 'run-out-candidate', createdAt: ago(40), history: [
+          { at: ago(30), event: 'failed', detail: '옛 실패' },
+          { at: ago(0.5), event: 'already-done-candidate', detail: '검토 후보' },
+        ] },
+      // 카드 상태만 성공으로 바뀌고 성공 종료 사건/PR 종결이 없다면 과거 실패 시각을 재사용하지 않는다.
+      { id: 'ta-out-stale-success', text: '종결 시각 모름', seat: 'TC', checklistId: 'CELL-STALE', status: 'done',
+        createdAt: ago(30), history: [{ at: ago(1), event: 'failed', detail: '과거 실패' }] },
+      // 실패했지만 종결 줄이 없다 — 끝나기 전 사건(run-bound)을 종료 시각으로 단정하지 않고 undatedCards 로 센다.
+      { id: 'ta-out-undated', text: '시각 모름', seat: 'TC', checklistId: 'CELL-UD', status: 'failed',
+        runId: 'run-out-e', createdAt: ago(30), history: [{ at: ago(0.5), event: 'run-bound', runId: 'run-out-e' }] },
+      // 현재 실패 상태와 마지막 종결 사건이 성공이면 그 성공 시각에 실패를 집계하지 않는다.
+      { id: 'ta-out-mismatch', text: '상태 사건 불일치', seat: 'TC', checklistId: 'CELL-MISMATCH', status: 'failed',
+        createdAt: ago(30), history: [{ at: ago(0.5), event: 'postland', detail: '과거 성공' }] },
+      // 최근 24시간 창의 상한은 지금이다. 미래 사건은 결과에 들어가지 않는다.
+      { id: 'ta-out-future', text: '미래 사건', seat: 'TC', checklistId: 'CELL-FUTURE', status: 'failed',
+        createdAt: ago(30), history: [{ at: new Date(now + 3_600_000).toISOString(), event: 'failed' }] },
+    ]);
+    appendRunLedgerEntry({ runId: 'run-out-a', event: 'pod-child-run', data: { childRunId: 'run-out-a-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-a-child', event: 'pr-opened', data: { number: 123, url } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-a-child', event: 'run-status', data: { runStatus: 'completed' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-b', event: 'pod-child-run', data: { childRunId: 'run-out-b-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-b-child', event: 'child-error', data: { error: 'runs stopped: same-cell 가드 — 카드 ta-other 가 CELL-SAME 을 이미 잡고 있다' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-c', event: 'pod-child-run', data: { childRunId: 'run-out-c-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-c-child', event: 'pr-open-failed', data: { error: 'no-progress: 구현 자식이 세 번 연속 같은 파일만 고쳤다' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-d', event: 'pod-child-run', data: { childRunId: 'run-out-d-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-d-child', event: 'pr-open-failed', data: { error: 'same-cell 가드 — 초판은 중단됐다' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-d-child', event: 'pr-opened', data: { number: 456, url: urlRecovered } }, ledgerDir);
+    const result = await run(['tasks', 'outcomes', '--since', '24h', '--json'], { taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now });
+    expect(result.code ?? 0).toBe(0);
+    const body = JSON.parse(result.lines[0]!);
+    expect(body.rows).toEqual([
+      { cell: 'CELL-SAME', card: 'ta-out-samecell', runId: 'run-out-b', childRunId: null, host: 'node-b',
+        endedAt: ago(1), cardStatus: 'failed', pr: null,
+        reason: null, reasonFrom: null },
+      { cell: 'CELL-NP', card: 'ta-out-noprogress', runId: 'run-out-c', childRunId: null, host: null,
+        endedAt: ago(1.5), cardStatus: 'failed', pr: null,
+        reason: null, reasonFrom: null },
+      { cell: 'CELL-PR', card: 'ta-out-pr', runId: 'run-out-a', childRunId: null, host: null,
+        endedAt: ago(2), cardStatus: 'launched', pr: { number: 123, state: 'MERGED' },
+        reason: null, reasonFrom: null },
+      { cell: 'CELL-REC', card: 'ta-out-recovered', runId: 'run-out-d', childRunId: null, host: null,
+        endedAt: ago(2.5), cardStatus: 'launched', pr: { number: 456, state: 'MERGED' }, reason: null, reasonFrom: null },
+    ]);
+    expect(body.aggregate).toEqual({ cards: 4, missingReason: 4, reasons: [] });
+    expect(body.since).toBe(ago(24));
+    expect(body.until).toBe(new Date(now).toISOString());
+    expect(body.limitReached).toBe(false);
+    expect(body.stopReason).toBeNull();
+    expect(body.childLedgerObserved).toBe(false);
+    expect(body.reasonObserved).toBe(false);
+    expect(body.undatedCards).toBe(3);
+    expect(body.openCards).toBe(0);
+    // board가 아는 카드 원문은 확인하되 이 부분 CLI는 재결속 검증 전까지 사유를 투영하지 않는다.
+    const flat = (nodes: BoardNode[]): BoardNode[] => nodes.flatMap((node) => [node, ...flat(node.children ?? [])]);
+    const board = flat(cardsBoard(statePath, { ledger: true }));
+    const merged = board.find((node) => node.id === 'ta-out-pr');
+    expect(merged?.status).toBe('done');
+    expect(merged?.ledger?.lastEvent?.detail).toBe('MERGED #123 · 칸 green');
+    expect(merged?.ledger?.pr).toBe(123);
+    // 관측 줄만 남은 카드는 board 와 outcomes 모두 사유를 지어내지 않는다.
+    expect(board.find((node) => node.id === 'ta-out-samecell')?.ledger?.exitReason).toBeNull();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks outcomes 은 «원문 없음» 수를 세고, 페이지 상한에서 stopReason 을 붙여 절단을 숨기지 않는다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-bound-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+    writeTaskCards(statePath, [
+      { id: 'ta-out-quiet-a', text: 'a', checklistId: 'CELL-A', status: 'failed', createdAt: ago(30),
+        history: [{ at: ago(0.5), event: 'run-bound' }, { at: ago(0.25), event: 'failed' }] },
+      { id: 'ta-out-quiet-b', text: 'b', checklistId: 'CELL-B', status: 'launch-failed', createdAt: ago(30),
+        history: [{ at: ago(1), event: 'launch-failed' }] },
+      { id: 'ta-out-open', text: 'c', checklistId: 'CELL-C', status: 'launched', createdAt: ago(30),
+        history: [{ at: ago(3), event: 'launch' }] },
+    ]);
+    const deps: TasksCliDeps = { taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now };
+    const full = JSON.parse((await run(['tasks', 'outcomes', '--since', '2026-10-21T00:00:00Z', '--json'], deps)).lines[0]!);
+    expect(full.rows.map((row: { card: string }) => row.card)).toEqual(['ta-out-quiet-a', 'ta-out-quiet-b']);
+    expect(full.rows.every((row: { reason: string | null }) => row.reason === null)).toBe(true);
+    expect(full.aggregate).toEqual({ cards: 2, missingReason: 2, reasons: [] });
+    expect(full.openCards).toBe(1);
+    expect(full.undatedCards).toBe(0);
+    const bounded = JSON.parse((await run(['tasks', 'outcomes', '--since', '2026-10-21T00:00:00Z', '--json'], { ...deps, outcomesLimit: 1 })).lines[0]!);
+    expect(bounded.rows).toHaveLength(1);
+    expect(bounded.limitReached).toBe(true);
+    expect(bounded.stopReason).toBe('page-limit');
+    expect(bounded.warning).toContain('상한 1');
+    expect(bounded.aggregate).toEqual({ cards: 1, missingReason: 1, reasons: [] });
+    expect(bounded.childLedgerObserved).toBe(false);
+    const inverted = await run(['tasks', 'outcomes', '--since', '2026-10-21T00:00:00Z', '--until', '2026-10-20T00:00:00Z'], deps);
+    expect(inverted.code).toBe(1);
+    expect(JSON.parse(inverted.lines[0]!)).toEqual({ error: '--since 가 --until 보다 늦다' });
+    const notATime = await run(['tasks', 'outcomes', '--since', 'yesterday'], deps);
+    expect(notATime.code).toBe(1);
+    expect(JSON.parse(notATime.lines[0]!).error).toContain('--since');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('TA-CARD-OUTCOMES-LIVE — 실물 CLI 프로세스가 --test 우주의 세 카드를 세 행·집계·종료 코드로 보고한다', async () => {
+  // 주입 의존성 없이 생산 진입점 그대로 굴린다: bun bin/elanous.mjs --test=<우주> tasks outcomes --since 24h --json
+  const universe = mkdtempSync(join(tmpdir(), 'ta-outcomes-live-universe-'));
+  try {
+    // --test=<우주> 는 그 우주 디렉터리를 인스턴스 루트로 삼는다 — 카드 상태는 루트의 task-agent-actions.json.
+    const statePath = join(universe, 'task-agent-actions.json');
+    const now = Date.now();
+    const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+    writeTaskCards(statePath, [
+      { id: 'ta-live-failed', text: '실패', seat: 'TC', checklistId: 'CELL-LIVE-FAIL', status: 'failed', createdAt: ago(30),
+        history: [{ at: ago(30), event: 'run-bound' }, { at: ago(0.5), event: 'failed', detail: 'same-cell 가드 — 자식 런 실패\u001b[31m' }] },
+      { id: 'ta-live-merged', text: '종결', seat: 'TC', checklistId: 'CELL-LIVE-MERGE', status: 'launched', createdAt: ago(30),
+        pr: { number: 777, url: 'https://github.com/ElanvitalAI/elanous/pull/777' },
+        prTerminal: { pr: 777, url: 'https://github.com/ElanvitalAI/elanous/pull/777', head: 'c'.repeat(40), state: 'MERGED', at: ago(1) },
+        history: [{ at: ago(1.5), event: 'postland', detail: 'MERGED #777 · 칸 green' }] },
+      { id: 'ta-live-noprogress', text: '진척 없음', seat: 'TC', checklistId: 'CELL-LIVE-NP', status: 'failed', createdAt: ago(30),
+        runChildId: 'run-live-noprogress-child', history: [{ at: ago(2), event: 'failed' }] },
+    ]);
+    appendRunLedgerEntry({ runId: 'run-live-noprogress-child', event: 'pr-open-failed',
+      data: { error: 'no-progress: 변경 없이 종료' } }, join(universe, 'run-ledger'));
+    const env = { ...process.env } as Record<string, string | undefined>;
+    delete env.ELANOUS_CONFIG_DIR;
+    delete env.ELANOUS_STATE_DIR;
+    const proc = Bun.spawn([process.execPath, ELANOUS_CLI_ENTRY, `--test=${universe}`, 'tasks', 'outcomes', '--since', '24h', '--json'], {
+      cwd: universe, stdout: 'pipe', stderr: 'pipe', env,
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code, stderr).toBe(0);
+    const report = JSON.parse(stdout.trim());
+    expect(report.rows.map((row: TaskOutcomeRow) => [row.card, row.endedAt, row.reason])).toEqual([
+      ['ta-live-failed', ago(0.5), null],
+      ['ta-live-merged', ago(1), null],
+      ['ta-live-noprogress', ago(2), null],
+    ]);
+    expect(report.aggregate).toEqual({ cards: 3, missingReason: 3, reasons: [] });
+    expect(report.childLedgerObserved).toBe(false);
+    expect(report.reasonObserved).toBe(false);
+    expect(report.undatedCards).toBe(0);
+    expect(report.stopReason).toBeNull();
+  } finally { rmSync(universe, { recursive: true, force: true }); }
+}, 30_000);
+
+/**
+ * MODEL-SIZE-OUTCOME-MEASURE — 모델×조각 크기 칸별 성공률을 재는 fixture.
+ * 카드 셋(모델 셋) × 크기 둘 · 주입 사다리 L0(주입 deps)~L1(실물 CLI 프로세스).
+ */
+const modelSizeUniverse = (now: number) => {
+  const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+  const head = 'a'.repeat(40);
+  const url = (n: number) => `https://github.com/ElanvitalAI/elanous/pull/${n}`;
+  const smallText = '대상 경로: src/one.ts\n바꿀 것: 한 동작만 바꾼다';
+  const largeText = '대상 경로: src/one.ts · src/two.ts · src/three.ts\n바꿀 것:\n- 첫째 동작\n- 둘째 동작';
+  const small = { text: smallText, targetPaths: ['src/one.ts'] };
+  const large = { text: largeText, targetPaths: ['src/one.ts', 'src/two.ts', 'src/three.ts'] };
+  const childLlm = (provider: string, model: string) => ({ provider, model });
+  const cards: TaskCard[] = [
+    // grok × 작은 조각 — PR 착지(성공)
+    { id: 'ta-ms-grok-small', ...small, seat: 'TC', checklistId: 'CELL-MS-1', status: 'launched',
+      childLlm: childLlm('grok', 'grok-4.7'), tier: '중', createdAt: ago(30), pr: { number: 901, url: url(901) },
+      prTerminal: { pr: 901, url: url(901), head, state: 'MERGED', at: ago(1) },
+      history: [{ at: ago(6), event: 'live-move', kind: 'land', executed: true, ok: true, detail: 'land executed' },
+        { at: ago(1), event: 'postland', detail: 'MERGED #901' }] },
+    // grok × 큰 조각 — 수렴 실패
+    { id: 'ta-ms-grok-large', ...large, seat: 'TC', checklistId: 'CELL-MS-2', status: 'failed',
+      childLlm: childLlm('grok', 'grok-4.7'), tier: '중', createdAt: ago(30),
+      history: [{ at: ago(30), event: 'run-bound', runId: 'run-ms-grok-large' }, { at: ago(2), event: 'failed', detail: 'no-progress' }] },
+    // codex × 작은 조각 — PR 착지
+    { id: 'ta-ms-codex-small', ...small, seat: 'TC', checklistId: 'CELL-MS-3', status: 'landed',
+      childLlm: childLlm('codex', 'gpt-5.4'), tier: '상', createdAt: ago(30), pr: { number: 902, url: url(902) },
+      prTerminal: { pr: 902, url: url(902), head, state: 'MERGED', at: ago(1.5) },
+      history: [{ at: ago(1.5), event: 'postland', detail: 'MERGED #902' }] },
+    // codex × 큰 조각 — PR MERGED 종결 증거로 착지. post-land partial(남은 작업)만으로는 범위 이탈로 세지 않는다.
+    { id: 'ta-ms-codex-large', ...large, seat: 'TC', checklistId: 'CELL-MS-4', status: 'landed',
+      childLlm: childLlm('codex', 'gpt-5.4'), tier: '상', createdAt: ago(30), pr: { number: 903, url: url(903) },
+      prTerminal: { pr: 903, url: url(903), head, state: 'MERGED', at: ago(2) },
+      postLand: { pr: 903, head, at: ago(2), outcome: 'partial', evidence: [], remaining: ['남은 칸'] },
+      history: [{ at: ago(2), event: 'postland', detail: 'MERGED #903 · 칸 yellow' }] },
+    // claude × 작은 조각 — 수렴 실패
+    { id: 'ta-ms-claude-small', ...small, seat: 'TC', checklistId: 'CELL-MS-5', status: 'launch-failed',
+      childLlm: childLlm('claude', 'opus-4.6'), tier: '특', createdAt: ago(30),
+      history: [{ at: ago(3), event: 'launch-failed', detail: 'child rc=2' }] },
+    // claude × 큰 조각 — 결과 줄 없음(PR 은 닫혔지만 종결 사건 줄이 없다)
+    { id: 'ta-ms-claude-large', ...large, seat: 'TC', checklistId: 'CELL-MS-6', status: 'launched',
+      childLlm: childLlm('claude', 'opus-4.6'), tier: '특', createdAt: ago(30), pr: { number: 904, url: url(904) },
+      prTerminal: { pr: 904, url: url(904), head, state: 'CLOSED', at: ago(2.5) }, history: [] },
+    // 실제 범위 이탈 증거 — hand-move(trim-scope)로 범위를 잘랐다(관측된 사실). MERGED 증거가 있어도 범위 이탈로 분류한다.
+    { id: 'ta-ms-codex-trim-scope', ...small, seat: 'TC', checklistId: 'CELL-MS-8', status: 'launched',
+      childLlm: childLlm('codex', 'gpt-5.4'), tier: '상', createdAt: ago(28), pr: { number: 905, url: url(905) },
+      prTerminal: { pr: 905, url: url(905), head, state: 'MERGED', at: ago(2) },
+      history: [{ at: ago(2), event: 'postland', detail: 'MERGED #905' },
+        { at: ago(2), event: 'hand-move', kind: 'trim-scope', executed: true, ok: true, detail: '범위를 잘라 남은 칸을 버렸다' }] },
+    // 카드 상태가 done 이어도 PR 종결 증거(pr ⊕ 원장 prTerminal)가 없으면 착지로 단정하지 않는다.
+    { id: 'ta-ms-claude-done-no-evidence', ...small, seat: 'TC', checklistId: 'CELL-MS-9', status: 'done',
+      childLlm: childLlm('claude', 'opus-4.6'), tier: '특', createdAt: ago(22), pr: { number: 906, url: url(906) },
+      prTerminal: { pr: 906, url: url(906), head, state: 'CLOSED', at: ago(2) }, history: [] },
+    // 모델만 못 읽고 등급·크기는 읽히는 카드 — 그 칸의 unknown 수는 0 이 아니라 1 로 센다.
+    { id: 'ta-ms-model-unknown', ...small, seat: 'TC', checklistId: 'CELL-MS-10', status: 'failed', tier: '중',
+      createdAt: ago(20), history: [{ at: ago(4), event: 'failed', detail: '자식 모델 기록 없음' }] },
+    // 모델·등급·바꿀 동작을 못 읽은 카드 — «0» 이 아니라 unknown 으로 센다.
+    { id: 'ta-ms-unknown', text: '대상 경로: src/one.ts\n경계: 이 카드는 옛 원장이라 모델·등급·바꿀 동작 칸이 없다',
+      targetPaths: ['src/one.ts'], seat: 'TC', checklistId: 'CELL-MS-7', status: 'failed', createdAt: ago(30),
+      history: [{ at: ago(4), event: 'failed', detail: '옛 원장' }] },
+  ];
+  return { cards, ago, childLlm, smallText, largeText };
+};
+
+test('MODEL-SIZE-OUTCOME-MEASURE — outcomes --by model,size 는 카드마다 모델·등급·크기·결과를 묶고 칸별 성공률·표본·unknown 을 낸다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-by-model-size-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const fixture = modelSizeUniverse(now);
+    writeTaskCards(statePath, fixture.cards);
+    const result = await run(['tasks', 'outcomes', '--since', '24h', '--by', 'model,size', '--json'],
+      { taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now });
+    expect(result.code ?? 0).toBe(0);
+    const body = JSON.parse(result.lines[0]!);
+    const by = body.byModelSize;
+    expect(by.dimensions).toEqual(['model', 'size']);
+    expect(by.samples).toBe(10);
+    // 카드마다 자식 모델 · 등급 · 조각 크기(대상 경로 수 · 바꿀 동작 수) · 결과
+    const card = (id: string) => by.cards.find((row: { card: string }) => row.card === id);
+    expect(card('ta-ms-grok-small')).toEqual({ card: 'ta-ms-grok-small', model: 'grok/grok-4.7', tier: '중',
+      size: { targetPaths: 1, behaviors: 1 }, result: 'landed' });
+    expect(card('ta-ms-grok-large')).toEqual({ card: 'ta-ms-grok-large', model: 'grok/grok-4.7', tier: '중',
+      size: { targetPaths: 3, behaviors: 2 }, result: 'convergence-failure' });
+    expect(card('ta-ms-codex-small')).toMatchObject({ model: 'codex/gpt-5.4', tier: '상', size: { targetPaths: 1, behaviors: 1 }, result: 'landed' });
+    expect(card('ta-ms-codex-large')).toMatchObject({ model: 'codex/gpt-5.4', tier: '상', size: { targetPaths: 3, behaviors: 2 }, result: 'landed' });
+    // 범위 이탈은 partial 대리 신호가 아니라 hand-move(trim-scope) 관측으로만 분류한다.
+    expect(card('ta-ms-codex-trim-scope')).toMatchObject({ model: 'codex/gpt-5.4', tier: '상', size: { targetPaths: 1, behaviors: 1 }, result: 'scope-escape' });
+    // done 상태 + PR 종결 증거 없음 → 착지로 단정하지 않는다.
+    expect(card('ta-ms-claude-done-no-evidence')).toMatchObject({ model: 'claude/opus-4.6', tier: '특', size: { targetPaths: 1, behaviors: 1 }, result: 'no-result-line' });
+    // 모델만 못 읽어도 등급·크기는 읽은 그대로 낸다.
+    expect(card('ta-ms-model-unknown')).toEqual({ card: 'ta-ms-model-unknown', model: 'unknown', tier: '중',
+      size: { targetPaths: 1, behaviors: 1 }, result: 'convergence-failure' });
+    expect(card('ta-ms-claude-small')).toMatchObject({ model: 'claude/opus-4.6', tier: '특', size: { targetPaths: 1, behaviors: 1 }, result: 'convergence-failure' });
+    expect(card('ta-ms-claude-large')).toMatchObject({ model: 'claude/opus-4.6', tier: '특', size: { targetPaths: 3, behaviors: 2 }, result: 'no-result-line' });
+    // 못 읽은 값은 unknown — 0 이나 빈 크기로 지어내지 않는다.
+    expect(card('ta-ms-unknown')).toEqual({ card: 'ta-ms-unknown', model: 'unknown', tier: 'unknown',
+      size: { targetPaths: 1, behaviors: 'unknown' }, result: 'convergence-failure' });
+    expect(by.unknown).toEqual({ model: 2, tier: 1, size: 1 });
+    // 모델×크기 칸별 성공률 · 표본 수 · unknown 수
+    const cell = (model: string, size: string) => by.cells.find((row: { model: string; size: string }) => row.model === model && row.size === size);
+    expect(cell('grok/grok-4.7', 'paths=1·behaviors=1')).toEqual({ model: 'grok/grok-4.7', size: 'paths=1·behaviors=1',
+      samples: 1, landed: 1, successRate: 1, unknown: 0,
+      results: { landed: 1, 'scope-escape': 0, 'convergence-failure': 0, 'no-result-line': 0 } });
+    expect(cell('grok/grok-4.7', 'paths=3·behaviors=2')).toEqual({ model: 'grok/grok-4.7', size: 'paths=3·behaviors=2',
+      samples: 1, landed: 0, successRate: 0, unknown: 0,
+      results: { landed: 0, 'scope-escape': 0, 'convergence-failure': 1, 'no-result-line': 0 } });
+    expect(cell('codex/gpt-5.4', 'paths=3·behaviors=2')).toEqual({ model: 'codex/gpt-5.4', size: 'paths=3·behaviors=2',
+      samples: 1, landed: 1, successRate: 1, unknown: 0,
+      results: { landed: 1, 'scope-escape': 0, 'convergence-failure': 0, 'no-result-line': 0 } });
+    // 모델만 unknown 인 카드의 칸 — unknown 수는 1(한 축이라도 못 읽으면 unknown).
+    expect(cell('unknown', 'paths=1·behaviors=1')).toEqual({ model: 'unknown', size: 'paths=1·behaviors=1',
+      samples: 1, landed: 0, successRate: 0, unknown: 1,
+      results: { landed: 0, 'scope-escape': 0, 'convergence-failure': 1, 'no-result-line': 0 } });
+    expect(cell('unknown', 'unknown')).toEqual({ model: 'unknown', size: 'unknown', samples: 1, landed: 0,
+      successRate: 0, unknown: 1,
+      results: { landed: 0, 'scope-escape': 0, 'convergence-failure': 1, 'no-result-line': 0 } });
+    expect(by.cells).toHaveLength(8);
+    expect(by.limitReached).toBe(false);
+    // 보존: --by 없이는 지금 JSON 그대로 — byModelSize 칸이 생기지 않는다.
+    const plain = JSON.parse((await run(['tasks', 'outcomes', '--since', '24h', '--json'],
+      { taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now })).lines[0]!);
+    expect(plain.byModelSize).toBeUndefined();
+    expect(plain.aggregate).toEqual(body.aggregate);
+    expect(plain.rows).toEqual(body.rows);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MODEL-SIZE-OUTCOME-MEASURE — --by 는 model,size 외 값을 거부하고 아무것도 지어내지 않는다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-by-reject-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    writeTaskCards(statePath, []);
+    for (const value of ['model', 'tier,size', 'model,size,tier']) {
+      const result = await run(['tasks', 'outcomes', '--by', value, '--json'], { taskStatePath: statePath, registerSink: async () => {} });
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.lines[0]!).error).toContain('--by');
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MODEL-SIZE-OUTCOME-MEASURE 실물 — --test 우주의 실물 CLI 프로세스가 outcomes --by model,size 원문을 낸다', async () => {
+  const universe = mkdtempSync(join(tmpdir(), 'ta-model-size-live-universe-'));
+  try {
+    const statePath = join(universe, 'task-agent-actions.json');
+    const now = Date.now();
+    const fixture = modelSizeUniverse(now);
+    writeTaskCards(statePath, fixture.cards);
+    const env = { ...process.env } as Record<string, string | undefined>;
+    delete env.ELANOUS_CONFIG_DIR;
+    delete env.ELANOUS_STATE_DIR;
+    const proc = Bun.spawn([process.execPath, ELANOUS_CLI_ENTRY, `--test=${universe}`, 'tasks', 'outcomes', '--since', '24h', '--by', 'model,size', '--json'], {
+      cwd: universe, stdout: 'pipe', stderr: 'pipe', env,
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code, stderr).toBe(0);
+    const by = JSON.parse(stdout.trim()).byModelSize;
+    expect(by.samples).toBe(10);
+    expect(by.unknown).toEqual({ model: 2, tier: 1, size: 1 });
+    expect(by.cells).toContainEqual({ model: 'grok/grok-4.7', size: 'paths=1·behaviors=1', samples: 1, landed: 1,
+      successRate: 1, unknown: 0, results: { landed: 1, 'scope-escape': 0, 'convergence-failure': 0, 'no-result-line': 0 } });
+    expect(by.cells).toContainEqual({ model: 'codex/gpt-5.4', size: 'paths=3·behaviors=2', samples: 1, landed: 1,
+      successRate: 1, unknown: 0, results: { landed: 1, 'scope-escape': 0, 'convergence-failure': 0, 'no-result-line': 0 } });
+  } finally { rmSync(universe, { recursive: true, force: true }); }
+}, 30_000);
+
+test('TA-CARD-OUTCOMES-MANUAL — closed-by-hand는 landed-by-hand의 명시적 종결 시각이다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-manual-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const closedAt = new Date(now - 3_600_000).toISOString();
+    writeTaskCards(statePath, [{ id: 'ta-manual-landed', text: '손 착지', checklistId: 'CELL-MANUAL',
+      status: 'landed-by-hand', createdAt: new Date(now - 30 * 3_600_000).toISOString(),
+      history: [{ at: closedAt, event: 'closed-by-hand', reason: '  손 착지\n확인\t완료  ' }] }]);
+    const body = JSON.parse((await run(['tasks', 'outcomes', '--since', '24h', '--json'], {
+      taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now,
+    })).lines[0]!);
+    expect(body.rows).toMatchObject([{ card: 'ta-manual-landed', endedAt: closedAt,
+      reason: null, reasonFrom: null }]);
+    expect(body.aggregate).toEqual({ cards: 1, reasons: [], missingReason: 1 });
+    expect(body.undatedCards).toBe(0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('TA-CARD-OUTCOMES-PR-CHRONOLOGY — 재결속 전후 사건은 시각만 세고 사유는 모두 미측정한다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-pr-chronology-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+    const url = 'https://github.com/ElanvitalAI/elanous/pull/789';
+    const mergedUrl = 'https://github.com/ElanvitalAI/elanous/pull/790';
+    writeTaskCards(statePath, [{ id: 'ta-old-failure', text: '옛 실패', checklistId: 'CELL-OLD',
+      status: 'failed', createdAt: ago(30), pr: { number: 789, url },
+      prTerminal: { pr: 789, url, head: 'd'.repeat(40), state: 'CLOSED', at: ago(1) },
+      history: [{ at: ago(3), event: 'failed', detail: '  과거 실패 원문  ' }] },
+    { id: 'ta-new-failure', text: '새 실패', checklistId: 'CELL-NEW',
+      status: 'failed', createdAt: ago(30), pr: { number: 790, url: mergedUrl },
+      prTerminal: { pr: 790, url: mergedUrl, head: 'e'.repeat(40), state: 'MERGED', at: ago(3) },
+      history: [{ at: ago(1), event: 'failed', detail: '  병합 뒤 실패  ' }] },
+    { id: 'ta-space-reason', text: '공백 원문', checklistId: 'CELL-SPACE',
+      status: 'failed', createdAt: ago(30), history: [{ at: ago(0.5), event: 'failed', detail: ' \n\t ' }] }]);
+    const body = JSON.parse((await run(['tasks', 'outcomes', '--since', '24h', '--json'], {
+      taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now,
+    })).lines[0]!);
+    expect(body.rows.find((row: TaskOutcomeRow) => row.card === 'ta-old-failure')).toMatchObject({
+      endedAt: ago(1), pr: { number: 789, state: 'CLOSED' }, reason: null, reasonFrom: null });
+    expect(body.rows.find((row: TaskOutcomeRow) => row.card === 'ta-new-failure')).toMatchObject({
+      endedAt: ago(1), pr: { number: 790, state: 'MERGED' }, reason: null, reasonFrom: null });
+    expect(body.rows.find((row: TaskOutcomeRow) => row.card === 'ta-space-reason')).toMatchObject({
+      endedAt: ago(0.5), reason: null, reasonFrom: null });
+    expect(body.aggregate).toEqual({ cards: 3, reasons: [], missingReason: 3 });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MODEL-SIZE-OUTCOME-MEASURE 반례 — 실행·성공이 명시되지 않은 trim-scope 조정은 범위 이탈로 세지 않는다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-trim-exec-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+    const head = 'f'.repeat(40);
+    const url = (n: number) => `https://github.com/ElanvitalAI/elanous/pull/${n}`;
+    const trimLine = (executed?: boolean, ok?: boolean) => ({ at: ago(2), event: 'hand-move' as const, kind: 'trim-scope',
+      ...(executed === undefined ? {} : { executed }), ...(ok === undefined ? {} : { ok }), detail: '범위를 잘랐다는 기록' });
+    const card = (id: string, executed?: boolean, ok?: boolean): TaskCard => ({
+      id, text: '대상 경로: src/one.ts\n바꿀 것: 한 동작만 바꾼다', targetPaths: ['src/one.ts'], seat: 'TC',
+      checklistId: `CELL-${id}`, status: 'launched', childLlm: { provider: 'codex', model: 'gpt-5.4' }, tier: '상',
+      createdAt: ago(28), pr: { number: 931, url: url(931) },
+      prTerminal: { pr: 931, url: url(931), head, state: 'MERGED', at: ago(2) },
+      history: [{ at: ago(2), event: 'postland', detail: 'MERGED #931' }, trimLine(executed, ok)] });
+    // 여섯 카드의 MERGED 종결 증거는 같고 trim-scope 이력의 executed·ok 만 다르다.
+    writeTaskCards(statePath, [
+      card('ta-trim-executed-ok', true, true),
+      card('ta-trim-not-executed', false, true),
+      card('ta-trim-failed', true, false),
+      card('ta-trim-execution-unrecorded', undefined, true),
+      card('ta-trim-result-unrecorded', true, undefined),
+      card('ta-trim-both-unrecorded'),
+    ]);
+    const body = JSON.parse((await run(['tasks', 'outcomes', '--since', '24h', '--by', 'model,size', '--json'],
+      { taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now })).lines[0]!);
+    const cell = body.byModelSize.cells.find((c: { model: string; size: string }) =>
+      c.model === 'codex/gpt-5.4' && c.size === 'paths=1·behaviors=1');
+    expect(cell).toMatchObject({ samples: 6, landed: 5, unknown: 0,
+      results: { landed: 5, 'scope-escape': 1, 'convergence-failure': 0, 'no-result-line': 0 } });
+    expect(cell.successRate).toBeCloseTo(5 / 6, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MODEL-SIZE-OUTCOME-MEASURE 반례 — «바꿀 것: 다음» 뒤에 목록이 뒤따르면 선언 줄이 아니라 목록 동작 수를 센다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-list-pointer-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+    writeTaskCards(statePath, [{ id: 'ta-list-pointer', seat: 'TC', checklistId: 'CELL-LIST-POINTER',
+      status: 'failed', childLlm: { provider: 'grok', model: 'grok-4.7' }, tier: '중', createdAt: ago(30),
+      text: '대상 경로: src/one.ts\n바꿀 것: 다음\n- 첫째 동작\n- 둘째 동작', targetPaths: ['src/one.ts'],
+      history: [{ at: ago(2), event: 'failed', detail: 'no-progress' }] }]);
+    const body = JSON.parse((await run(['tasks', 'outcomes', '--since', '24h', '--by', 'model,size', '--json'],
+      { taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now })).lines[0]!);
+    expect(body.byModelSize.cells).toContainEqual({ model: 'grok/grok-4.7', size: 'paths=1·behaviors=2', samples: 1,
+      landed: 0, successRate: 0, unknown: 0,
+      results: { landed: 0, 'scope-escape': 0, 'convergence-failure': 1, 'no-result-line': 0 } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MODEL-SIZE-OUTCOME-MEASURE — 명시한 바꿀 동작 없음은 0, 선언 자체가 없으면 unknown', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-explicit-none-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const ended = new Date(now - 60_000).toISOString();
+    const cards = ['바꿀 것: 없음', '바꿀 동작 없음', '경계만 있고 동작 선언 없음'].map((text, i): TaskCard => ({
+      id: `ta-explicit-none-${i}`, text, targetPaths: ['src/one.ts'], seat: 'TC',
+      checklistId: `CELL-NONE-${i}`, status: 'failed', ...(i === 1 ? {} : { tier: '하' as const }),
+      childLlm: { provider: 'codex', model: 'gpt-5.4' }, createdAt: ended,
+      history: [{ at: ended, event: 'failed', detail: '종료' }],
+    }));
+    writeTaskCards(statePath, cards);
+    const body = JSON.parse((await run(['tasks', 'outcomes', '--since', '24h', '--by', 'model,size', '--json'], {
+      taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now,
+    })).lines[0]!);
+    const byId = (id: string) => body.byModelSize.cards.find((row: { card: string }) => row.card === id);
+    expect(byId('ta-explicit-none-0').size).toEqual({ targetPaths: 1, behaviors: 0 });
+    expect(byId('ta-explicit-none-1').size).toEqual({ targetPaths: 1, behaviors: 0 });
+    expect(byId('ta-explicit-none-2').size).toEqual({ targetPaths: 1, behaviors: 'unknown' });
+    expect(body.byModelSize.unknown.size).toBe(1);
+    expect(body.byModelSize.unknown.tier).toBe(1);
+    expect(body.byModelSize.cells.find((cell: { size: string }) => cell.size === 'paths=1·behaviors=0').unknown).toBe(0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('MODEL-SIZE-OUTCOME-MEASURE — 한 조회의 결과와 크기는 같은 카드 스냅샷을 쓴다', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-outcomes-snapshot-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const now = Date.parse('2026-10-21T02:00:00.000Z');
+    const ended = new Date(now - 60_000).toISOString();
+    const first: TaskCard = { id: 'ta-snapshot', text: '바꿀 것: 첫 동작', targetPaths: ['src/one.ts'],
+      checklistId: 'CELL-SNAPSHOT', status: 'failed', tier: '하', childLlm: { provider: 'codex', model: 'gpt-5.4' },
+      createdAt: ended, history: [{ at: ended, event: 'failed', detail: '종료' }] };
+    writeTaskCards(statePath, [first]);
+    const snapshot = { [first.id]: first };
+    const window = { sinceMs: now - 3_600_000, untilMs: now };
+    const deps = { taskStatePath: statePath };
+    const report = readTaskOutcomes(window, deps, snapshot);
+    writeTaskCards(statePath, [{ ...first, text: '바꿀 것: 다음\n- 첫 동작\n- 둘째 동작', targetPaths: ['src/one.ts', 'src/two.ts'] }]);
+    const dimensions = readTaskOutcomeModelSize(window, deps, report, snapshot);
+    expect(dimensions.cards).toMatchObject([{ card: 'ta-snapshot', size: { targetPaths: 1, behaviors: 1 }, result: 'convergence-failure' }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

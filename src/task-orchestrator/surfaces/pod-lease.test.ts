@@ -9,6 +9,8 @@ import { harnessCpuSlotsBesideGate, measurePoolLease, probePoolDns, probePoolGit
 import { podJobManifest } from './self-implement-pod.js';
 import { podCommandJobManifest } from './pod-command-job.js';
 import { debug } from '../../debug/log.js';
+import { Command } from 'commander';
+import { registerPodCommands } from '../../cli/pod-cli.js';
 
 const uncachedProbe = (context: string, kubectl: PoolKubectl) => {
   const dir = mkdtempSync(join(tmpdir(), 'dns-probe-test-'));
@@ -53,11 +55,112 @@ test('GitHub egress Pod records DNS and HTTPS separately, caches measured result
       expect(creates).toHaveLength(1);
       expect(deletes).toHaveLength(1);
       expect(deletes[0]).toContain(`pod/${createdName}`);
+      expect(result.podName).toBe(createdName);
+      if (scenario !== 'image') expect(calls.filter((args) => args.includes('logs'))[0]).toContain(`pod/${createdName}`);
+      if (scenario === 'image' || scenario === 'timeout') expect(result.podLog).toBeUndefined();
+      else expect(result.podLog).toBe(scenario === 'dns' ? 'EXTERNAL_DNS_FAILED\n'
+        : scenario === 'https' ? 'EXTERNAL_DNS_OK\nGITHUB_HTTPS_FAILED\n' : 'EXTERNAL_DNS_OK\nGITHUB_HTTPS_OK\n');
       if (result.measuredAt) {
         expect(probePoolGitHub('node-b', kubectl, { dir, now: () => Date.parse('2026-10-16T12:00:30Z') })).toEqual(result);
         expect(calls.filter((args) => args.includes('create'))).toHaveLength(1);
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+test('a legacy GitHub cache without Pod logs is remeasured for same-run evidence', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-legacy-cache-'));
+  const now = Date.parse('2026-10-16T12:00:00Z');
+  const cache = join(dir, `github-egress-${createHash('sha256').update('node-b').digest('hex')}.cache`);
+  writeFileSync(cache, JSON.stringify({ at: now, externalDns: true, githubHttps: true, measuredAt: new Date(now).toISOString(), reason: null }));
+  let created = 0;
+  const kubectl: PoolKubectl = (args) => {
+    if (args.includes('create')) created++;
+    return { status: 0, stderr: '', stdout: args.includes('get') ? JSON.stringify({ status: { phase: 'Succeeded' } })
+      : args.includes('logs') ? 'EXTERNAL_DNS_OK\nGITHUB_HTTPS_OK\n' : '' };
+  };
+  try {
+    const result = probePoolGitHub('node-b', kubectl, { dir, now: () => now + 1_000 });
+    expect(created).toBe(1);
+    expect(result).toMatchObject({ externalDns: true, githubHttps: true, podName: expect.stringMatching(/^elanous-egress-/), podLog: 'EXTERNAL_DNS_OK\nGITHUB_HTTPS_OK\n' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test('GitHub probe create failure has no Pod log identity to claim', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-create-failed-'));
+  try {
+    const result = probePoolGitHub('node-b', () => ({ status: 1, stdout: '', stderr: 'kubectl unavailable' }), { dir });
+    expect(result).toEqual({ externalDns: null, githubHttps: null, measuredAt: null, reason: 'probe create failed: kubectl unavailable' });
+    const lines: string[] = [];
+    const program = new Command(); program.exitOverride();
+    registerPodCommands(program, { io: { log: (line) => { lines.push(line); }, error: (line) => { throw new Error(line); }, exit: (code) => { expect(code).toBe(0); } },
+      poolSpec: () => 'node-b:2', accounts: () => 0, dns: () => 'ready',
+      kubectl: (args) => args.includes('create') ? { status: 1, stdout: '', stderr: 'kubectl unavailable' } :
+        args.includes('top') ? { status: 1, stdout: '', stderr: 'metrics unavailable' } : fixture([])(args), });
+    await program.parseAsync(['pod', 'lease', 'status', '--json'], { from: 'user' });
+    await program.parseAsync(['pod', 'lease', 'status', '--json', '--github-egress'], { from: 'user' });
+    const plain = JSON.parse(lines[0]!);
+    const observed = JSON.parse(lines[1]!);
+    expect(plain).not.toHaveProperty('externalGitHub');
+    expect(observed.externalGitHub.node-b).toEqual(result);
+    for (const key of ['recommended', 'limitedBy', 'capacitySlots', 'memorySlots', 'placeableSlots', 'running', 'pending', 'reserved', 'waitingJobs'])
+      expect(observed[key]).toEqual(plain[key]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test('pod lease status opt-in executes the GitHub Pod probe and exposes its exact log without changing launch slots', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-status-'));
+  const previous = process.env.ELANOUS_POD_LEASE_DIR;
+  process.env.ELANOUS_POD_LEASE_DIR = dir;
+  const probeLog = spyOn(debug, 'log');
+  const calls: string[][] = [];
+  let podName = '';
+  const kubectl: PoolKubectl = (args, input) => {
+    calls.push([...args]);
+    if (args.includes('create')) {
+      const manifest = JSON.parse(input!);
+      podName = manifest.metadata.name;
+      expect(manifest.spec.containers[0].command[2]).toContain('nslookup github.com 2>&1');
+      expect(manifest.spec.containers[0].command[2]).toContain('https://github.com/ 2>&1');
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    if (args.includes('wait') || args.includes('delete')) return { status: 0, stdout: '', stderr: '' };
+    if (args.includes('logs')) return { status: 0, stdout: 'Server: 10.43.0.10\nName: github.com\nEXTERNAL_DNS_OK\nwget: connection refused\nGITHUB_HTTPS_FAILED\n', stderr: '' };
+    if (args.includes('get') && args.includes(`pod/${podName}`)) return { status: 0, stdout: JSON.stringify({ status: { phase: 'Succeeded' } }), stderr: '' };
+    if (args.includes('top')) return { status: 1, stdout: '', stderr: 'metrics unavailable' };
+    return fixture([])(args, input);
+  };
+  const run = async (flags: string[]) => {
+    const lines: string[] = [];
+    const program = new Command(); program.exitOverride();
+    registerPodCommands(program, { io: { log: (line) => { lines.push(line); }, error: (line) => { throw new Error(line); }, exit: (code) => { expect(code).toBe(0); } },
+      kubectl, dns: () => 'ready', poolSpec: () => 'node-b:2', accounts: () => 0 });
+    await program.parseAsync(['pod', 'lease', 'status', ...flags], { from: 'user' });
+    return lines;
+  };
+  try {
+    const plain = JSON.parse((await run(['--json']))[0]!);
+    expect(calls.some((args) => args.includes('create'))).toBe(false);
+    expect(plain).not.toHaveProperty('externalGitHub');
+    const observed = JSON.parse((await run(['--json', '--github-egress']))[0]!);
+    expect(observed.externalGitHub.node-b).toEqual({ externalDns: true, githubHttps: false,
+      measuredAt: expect.any(String), reason: 'GitHub HTTPS failed', podName,
+      podLog: 'Server: 10.43.0.10\nName: github.com\nEXTERNAL_DNS_OK\nwget: connection refused\nGITHUB_HTTPS_FAILED\n' });
+    expect(podName).toStartWith('elanous-egress-');
+    expect(probeLog.mock.calls.filter((entry) => entry[0] === 'pod.lease' && entry[1] === 'github-egress-probe'))
+      .toEqual([['pod.lease', 'github-egress-probe', { context: 'node-b', ...observed.externalGitHub.node-b }]]);
+    expect(calls.filter((args) => args.includes('create'))).toHaveLength(1);
+    expect(calls.filter((args) => args.includes('logs'))[0]).toContain(`pod/${podName}`);
+    expect(calls.filter((args) => args.includes('delete'))[0]).toContain(`pod/${podName}`);
+    for (const key of ['recommended', 'limitedBy', 'capacitySlots', 'memorySlots', 'placeableSlots', 'running', 'pending', 'reserved', 'waitingJobs'])
+      expect(observed[key]).toEqual(plain[key]);
+    const table = (await run(['--github-egress'])).join('\n');
+    expect(table).toContain(`GitHub 외부망 node-b: DNS=true HTTPS=false 측정=${observed.externalGitHub.node-b.measuredAt} · GitHub HTTPS failed · Pod=${podName}`);
+    expect(table).toContain(`GitHub 탐침 로그 ${podName}: ${JSON.stringify(observed.externalGitHub.node-b.podLog)}`);
+    expect(table).toContain(`권장 지금 ${plain.recommended} 개 더 (limitedBy=${plain.limitedBy})`);
+    expect(calls.filter((args) => args.includes('create'))).toHaveLength(1); // same cached Pod run, not a second probe
+  } finally {
+    probeLog.mockRestore();
+    if (previous === undefined) delete process.env.ELANOUS_POD_LEASE_DIR;
+    else process.env.ELANOUS_POD_LEASE_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 const node = (memory = '263471132Ki', cpu = '32') => JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory, cpu }, conditions: [{ type: 'Ready', status: 'True' }] } }] });
@@ -281,7 +384,8 @@ describe('pod lease measurement and recommendation', () => {
   });
   test('both Job manifests share a 30-minute finished TTL without changing retry or active deadline', () => {
     const harness = podJobManifest({ name: 'si-task-example', namespace: 'elanous-test', image: 'image', repoUrl: 'repo', args: [], passEnv: [], deadlineSeconds: 123 });
-    const command = podCommandJobManifest({ name: 'cmd-example', namespace: 'elanous-test', image: 'image', repoUrl: 'repo', command: ['true'], skills: [], deadlineSeconds: 456 });
+    const command = podCommandJobManifest({ name: 'cmd-example', namespace: 'elanous-test', image: 'image', repoUrl: 'repo', command: ['true'], skills: [], deadlineSeconds: 456,
+      provenance: { actorKind: 'seat', actor: 'OPC', kind: 'command', run: 'test-run-12345678', phase: 'exec', requestedAt: '2026-10-20T09:00:00Z' } });
     expect(harness.spec).toMatchObject({ ttlSecondsAfterFinished: 1800, backoffLimit: 0, activeDeadlineSeconds: 123 });
     expect(command.spec).toMatchObject({ ttlSecondsAfterFinished: 1800, backoffLimit: 0, activeDeadlineSeconds: 456 });
   });

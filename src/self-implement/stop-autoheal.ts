@@ -25,11 +25,15 @@
  * 관측 = `debug.log('self-implement.autoheal', …)` ⊕ 원장 `event='autoheal'`.
  */
 import { debug } from '../debug/log.js';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { withFileLockSync } from '../storage/file-lock.js';
 import { applyGraphOverlays, defaultOverlaysDir, loadGraphOverlays, selectOverlays, type GraphOverlaySpec } from './graph-overlay-yaml.js';
 import type { GraphTemplateSpec } from './graph-yaml.js';
 import { GRAPH_SPECS } from './graph-templates.js';
 import { appendRunLedgerEntry, loadRunLedger, type RunLedgerEntry, type RunLedgerWriter } from './run-ledger.js';
-import type { RunStopClass, RunStopRecord } from './run-stop.js';
+import { boundRunStopCause, type RunStopClass, type RunStopRecord } from './run-stop.js';
 
 export const AUTOHEAL_EVENT = 'autoheal';
 export type AutohealMode = 'shadow' | 'live';
@@ -171,6 +175,80 @@ export interface AutohealDeps {
    * 안 주면 지금과 똑같이 동작한다.
    */
   priorStops?: readonly RunStopRecord[];
+  /** Parent-only candidate store. Omit in pure consumers/tests; the orchestrator supplies its instance root. */
+  knowhowCandidateDir?: string;
+}
+
+export type IntermediateStopReason = 'no-progress' | 'scope-escape' | 'wallclock-cap' | 'pod-job-failed';
+export interface StopKnowhowCandidate {
+  cell: string | null;
+  cellUnknownReason?: string;
+  reason: IntermediateStopReason;
+  stage: string;
+  stageUnknownReason?: string;
+  causeLine: string;
+  nextLaunchChange: string;
+  firstAt: string;
+  lastAt: string;
+  occurrences: number;
+  runIds: string[];
+}
+
+function intermediateStopReason(record: RunStopRecord): IntermediateStopReason | undefined {
+  const termination = record.childEvidence?.terminationReason;
+  if (record.class === 'scope-escape' || record.childEvidence?.scopeEscape === true || termination === 'scope-escape') return 'scope-escape';
+  if (termination === 'wallclock-cap') return 'wallclock-cap';
+  if (termination === 'no-progress') return 'no-progress';
+  if (record.terminationReason === 'pod-job-failed' || termination === 'pod-job-failed') return 'pod-job-failed';
+  return undefined;
+}
+
+const NEXT_LAUNCH_CHANGE: Record<IntermediateStopReason, string> = {
+  'no-progress': '골·완료 경계와 이미 끝난 범위를 다시 확인하고 남은 한 조각으로 고쳐 발사한다.',
+  'scope-escape': '허용 대상 경로와 범위 밖 편집 원문을 대조해 골의 경계를 수정한다.',
+  'wallclock-cap': '실행 시간을 넘긴 단계를 확인해 독립 조각으로 줄이고 중간 산출을 보존한다.',
+  'pod-job-failed': '자식 첫 오류와 Pod 종료 원인을 확인한 뒤 실행 환경 또는 골을 고쳐 발사한다.',
+};
+
+/** One file per cell and reason; the lock makes repeated parent stops one candidate. */
+export function captureStopKnowhowCandidate(ctx: AutohealContext, dir: string, now: () => Date = () => new Date()): { path: string; candidate: StopKnowhowCandidate; created: boolean } | undefined {
+  const reason = intermediateStopReason(ctx.record);
+  if (!reason) return undefined;
+  const cell = ctx.goalId?.trim() || null;
+  const key = createHash('sha256').update(`${cell ?? `unknown:${ctx.runId}`}\0${reason}`).digest('hex');
+  const path = join(dir, `${key}.json`);
+  mkdirSync(dir, { recursive: true });
+  return withFileLockSync(`${path}.lock`, () => {
+    const at = now().toISOString();
+    const old = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) as StopKnowhowCandidate : undefined;
+    if (old?.runIds.includes(ctx.runId)) return { path, candidate: old, created: false };
+    const created = old === undefined;
+    const candidate: StopKnowhowCandidate = old ? {
+      ...old,
+      stage: ctx.record.site ?? '미상',
+      ...(ctx.record.site ? { stageUnknownReason: undefined } : { stageUnknownReason: '기존 stop 원장에 site가 기록되지 않음' }),
+      causeLine: boundRunStopCause(String(ctx.record.childEvidence?.detail ?? ctx.record.cause)),
+      lastAt: at,
+      occurrences: old.occurrences + 1,
+      runIds: [...old.runIds, ctx.runId],
+    } : {
+      cell,
+      ...(cell ? {} : { cellUnknownReason: '칸 미상 · stop 호출에 goalId가 전달되지 않음' }),
+      reason,
+      stage: ctx.record.site ?? '미상',
+      ...(ctx.record.site ? {} : { stageUnknownReason: '기존 stop 원장에 site가 기록되지 않음' }),
+      causeLine: boundRunStopCause(String(ctx.record.childEvidence?.detail ?? ctx.record.cause)),
+      nextLaunchChange: NEXT_LAUNCH_CHANGE[reason],
+      firstAt: at,
+      lastAt: at,
+      occurrences: 1,
+      runIds: [ctx.runId],
+    };
+    const temp = `${path}.${randomUUID()}.tmp`;
+    writeFileSync(temp, `${JSON.stringify(candidate, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temp, path);
+    return { path, candidate, created };
+  });
 }
 
 /**
@@ -208,6 +286,14 @@ function observe(event: string, data: Record<string, unknown>): void {
  * stop 레코드 하나 → 최대 한 번의 힐 시도. 예외를 던지지 않는다(행동 seam 의 throw 도 needs-owner 로 접는다).
  */
 export async function autohealFromStop(ctx: AutohealContext, deps: AutohealDeps = {}): Promise<AutohealResult> {
+  if (deps.knowhowCandidateDir) {
+    try {
+      const captured = captureStopKnowhowCandidate(ctx, deps.knowhowCandidateDir);
+      if (captured) observe('knowhow-candidate', { runId: ctx.runId, cell: captured.candidate.cell, reason: captured.candidate.reason, created: captured.created, occurrences: captured.candidate.occurrences, path: captured.path });
+    } catch (error) {
+      observe('knowhow-candidate-failed', { runId: ctx.runId, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
   const mode = deps.mode ?? DEFAULT_AUTOHEAL_MODE;
   const cls = ctx.record.class;
   const { action, source, overlayId } = pickAutohealAction(cls, deps.loadLadder);

@@ -10,12 +10,20 @@ import { RESOURCE_NODE, zoomTier } from '@/components/inside/loop-activity-map';
 
 export interface ResourceGraph { nodes: Node[]; edges: Edge[] }
 
+type SeatRow = ResourceSnapshot['resource']['seats'][number];
+
+/** The waiting cell a seat shows: the same ID rule the Nexus resource API serves — a blank ID is no cell. */
+export function shownCell(row: SeatRow): SeatRow['nextCell'] {
+  return row.nextCell && row.nextCell.id.trim() !== '' ? row.nextCell : null;
+}
+
 /** The resource snapshot is read-only; labels are projections, not ledger entries. */
 export function resourceGraph(snapshot: ResourceSnapshot, near: boolean): ResourceGraph {
   const seats = snapshot.resource.seats;
-  const detail = near ? seats.map(row =>
-    `${row.seat} ${row.running}/${row.cap} · 몫 ${row.baseShare ?? '못 읽음'} · 발사 상한 ${row.launchCap} · 임대 ${row.borrowed} · 대여 ${row.lent} · ${row.nextCell ? `대기 잡 ${row.nextCell.id} ${row.nextCell.title} (${row.idle ? '요청 가능' : '대기 중'})` : '다음 잡 판정 없음'}`,
-  ).join(' / ') : `자리 ${seats.length} · 미배정 런 ${snapshot.resource.unassigned}`;
+  const detail = near ? seats.map(row => {
+    const cell = shownCell(row);
+    return `${row.seat} ${row.running}/${row.cap} · 몫 ${row.baseShare ?? '못 읽음'} · 발사 상한 ${row.launchCap} · 임대 ${row.borrowed} · 대여 ${row.lent} · ${cell ? `대기 잡 ${cell.id} ${cell.title} (${row.idle ? '요청 가능' : '대기 중'})` : '다음 잡 판정 없음'}`;
+  }).join(' / ') : `자리 ${seats.length} · 미배정 런 ${snapshot.resource.unassigned}`;
   return { nodes: [{ id: RESOURCE_NODE, type: 'resource', position: { x: 0, y: 0 }, data: { label: '자원 관리 루프', detail } }], edges: [] };
 }
 
@@ -43,7 +51,7 @@ export function ResourceMap({ snapshot }: { snapshot: ResourceSnapshot }) {
   const near = zoomTier(zoom) === 'near';
   const seats = snapshot.resource.seats;
   const { nodes, edges } = resourceGraph(snapshot, near);
-  return <section aria-label="자원 LOOP-INTERACT" className="space-y-3">
+  return <section aria-label="자원 LOOP-INTERACT" data-observed-at={snapshot.resource.now} className="space-y-3">
     <p className="text-sm">자리 · 잡 · 임대 · 대기 — 확대하면 자리 몫과 다음 잡을 볼 수 있습니다.</p>
     <div className="h-[520px] w-full min-w-0 rounded-xl border bg-[#10243b]">
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={TYPES} fitView minZoom={0.25} maxZoom={2.5}
@@ -52,10 +60,13 @@ export function ResourceMap({ snapshot }: { snapshot: ResourceSnapshot }) {
         <Background /><Controls showInteractive={false} />
       </ReactFlow>
     </div>
-    <ul aria-label="자원 목록" className="grid gap-2 sm:grid-cols-2">{seats.map(row => <li key={row.seat} className="rounded-lg border p-3">
-      <strong>{row.seat} {row.running}/{row.cap}</strong> · 몫 {row.baseShare ?? '못 읽음'} · 발사 상한 {row.launchCap}
-      {' · '}임대 {row.borrowed} · 대여 {row.lent} · {row.nextCell ? `대기 잡 ${toPublicText(row.nextCell.id)} · ${toPublicText(row.nextCell.title)} · ${row.idle ? '요청 가능' : '대기 중'}` : '다음 잡 판정 없음'}
-    </li>)}</ul>
+    <ul aria-label="자원 목록" className="grid gap-2 sm:grid-cols-2">{seats.map(row => {
+      const cell = shownCell(row);
+      return <li key={row.seat} data-cell-id={cell ? cell.id : undefined} className="rounded-lg border p-3">
+        <strong>{row.seat} {row.running}/{row.cap}</strong> · 몫 {row.baseShare ?? '못 읽음'} · 발사 상한 {row.launchCap}
+        {' · '}임대 {row.borrowed} · 대여 {row.lent} · {cell ? `대기 잡 ${toPublicText(cell.id)} · ${toPublicText(cell.title)} · ${row.idle ? '요청 가능' : '대기 중'}` : '다음 잡 판정 없음'}
+      </li>;
+    })}</ul>
   </section>;
 }
 

@@ -1,8 +1,8 @@
 // ── Ops-ledger tool runtimes (우편 msg · 판 release checklist) ──
 //
-// Registers the eight in-process ledger tools with the tool-runtime
+// Registers the nine in-process ledger tools with the tool-runtime
 // layer so every surface (skill-runner, TUI) can call them by name:
-// MsgList / MsgPost / MsgAck and ChecklistList / ChecklistAdd /
+// MsgList / MsgPost / MsgAsk / MsgAck and ChecklistList / ChecklistAdd /
 // ChecklistSet / ChecklistEdit / ChecklistMove. Dispatchers live in
 // src/skills/tools/ops-ledger.ts; this file is a thin adapter — the
 // same pattern as team-tool-runtimes.ts. Every call goes through
@@ -23,6 +23,7 @@ import {
   observeLedgerCall,
 } from '../skills/tools/ops-ledger.js';
 import type { ToolRuntime } from './types.js';
+import { buildMsgAskTool, dispatchMsgAsk, type MsgAskResult } from '../skills/tools/msg-ask.js';
 
 export const msgListRuntime: ToolRuntime<Record<string, unknown>, MsgListResult> = {
   id: 'msg_list',
@@ -34,6 +35,12 @@ export const msgPostRuntime: ToolRuntime<Record<string, unknown>, MsgPostResult>
   id: 'msg_post',
   spec: buildMsgPostTool(),
   async run(req) { return observeLedgerCall('MsgPost', req, () => dispatchMsgPost(req), (a, r) => ({ from: a.from, to: a.to, ...(r ? { id: r.message.id } : {}) })); },
+};
+
+export const msgAskRuntime: ToolRuntime<Record<string, unknown>, MsgAskResult> = {
+  id: 'msg_ask',
+  spec: buildMsgAskTool(),
+  async run(req, ctx) { return observeLedgerCall('MsgAsk', req, () => dispatchMsgAsk(req, { signal: ctx.signal }), (a, r) => ({ from: a.from, to: a.to, ...(r ? { id: r.question.id, replied: r.reply !== null } : {}) })); },
 };
 
 export const msgAckRuntime: ToolRuntime<Record<string, unknown>, MsgAckResult> = {
@@ -75,6 +82,7 @@ export const checklistMoveRuntime: ToolRuntime<Record<string, unknown>, Checklis
 export const ALL_OPS_LEDGER_RUNTIMES: ToolRuntime<any, any>[] = [
   msgListRuntime,
   msgPostRuntime,
+  msgAskRuntime,
   msgAckRuntime,
   checklistListRuntime,
   checklistAddRuntime,

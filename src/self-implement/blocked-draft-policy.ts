@@ -89,3 +89,23 @@ export function salvageBranchForRun(runId: string, branch: string): string {
   const leaf = branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '').replace(/\.\.+/g, '.').replace(/\.lock$/i, '-lock') || 'branch';
   return `salvage/${runShort}/${leaf}`;
 }
+
+/** REPAIR-BLOCKED-DRAFT-LINK-ORIGINAL — commit-only 수리 런의 base 는 합성 로컬 가지 `pr-<N>`(harness-pod-dispatch 가 넘긴다).
+ *  ⛔ origin 에 없는 가지라 그 base 로 새 draft 를 열면 반드시 실패한다. 이 꼴이면 원 PR 번호를 낸다. */
+export function syntheticRepairBasePr(base: string | undefined): number | undefined {
+  const match = /^pr-([1-9]\d*)$/.exec(base ?? '');
+  return match ? Number(match[1]) : undefined;
+}
+
+export type BlockedDraftTarget = { action: 'open-draft' } | { action: 'link-original'; originalPr: number };
+
+/** 중단 산출물을 어디에 남기나 — 합성 base `pr-<N>` 이면 새 draft 대신 «기존 PR #N 에 수확 가지 연결». */
+export function blockedDraftTargetFor(base: string | undefined): BlockedDraftTarget {
+  const originalPr = syntheticRepairBasePr(base);
+  return originalPr === undefined ? { action: 'open-draft' } : { action: 'link-original', originalPr };
+}
+
+/** 원 PR 에 다는 한 줄 — 수확 가지 이름·sha·런. (force push 없음 · 원 PR 가지는 그대로) */
+export function repairSalvageLinkComment(input: { salvageRef: string; sha?: string; runId: string; stage: string }): string {
+  return `수리 산출물 salvage ${input.salvageRef}${input.sha ? ` @ ${input.sha.slice(0, 12)}` : ''} — 런 ${input.runId} 이 ${input.stage} 로 멈춰 새 PR 대신 이 PR 에 잇는다(원 PR 가지 무변경)`;
+}

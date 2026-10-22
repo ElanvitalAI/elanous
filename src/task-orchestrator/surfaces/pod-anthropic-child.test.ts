@@ -31,7 +31,7 @@ const codexCreds = () => ({
 
 describe('POD-ANTHROPIC-PROVIDER — one list for the launch gate and the Pod', () => {
   test('ⓐ the Pod child list includes anthropic; codex alias still maps', () => {
-    expect(POD_CHILD_PROVIDERS).toEqual(['openai-codex', 'grok', 'openrouter', 'anthropic', 'bedrock', 'glm']);
+    expect(POD_CHILD_PROVIDERS).toEqual(['openai-codex', 'grok', 'openrouter', 'opengateway', 'anthropic', 'bedrock', 'glm']);
     expect(podChildProviderOf('anthropic')).toBe('anthropic');
     expect(podChildProviderOf('codex')).toBe('openai-codex');
     expect(podChildProviderOf('gemini')).toBeUndefined();
@@ -40,7 +40,7 @@ describe('POD-ANTHROPIC-PROVIDER — one list for the launch gate and the Pod', 
   test('ⓓ outside the list: the launch gate (pod substrate) and the Pod refuse with the same line; local is not judged', () => {
     const pod = podNamedChildProvider('gemini', { grokSubscription: false, grokApiKey: false, anthropicKey: true }).refuse;
     const gate = podChildProviderLaunchRefusal('pod', 'gemini');
-    expect(gate).toBe('pod: Pod 자식 provider 는 openai-codex|grok|openrouter|anthropic|bedrock|glm 만 — 받음 gemini');
+    expect(gate).toBe('pod: Pod 자식 provider 는 openai-codex|grok|openrouter|opengateway|anthropic|bedrock|glm 만 — 받음 gemini');
     expect(pod).toBe(gate);
     expect(podChildProviderRefusal('gemini')).toBe(gate);
     expect(podChildProviderLaunchRefusal('pod', 'anthropic')).toBeUndefined();

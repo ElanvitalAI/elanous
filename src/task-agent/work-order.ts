@@ -79,8 +79,9 @@ export function parseWorkOrder(source: string): ParseWorkOrderResult {
   const unknownFields: string[] = [];
   const cells = {} as Record<WorkOrderField, string>;
   for (const field of WORK_ORDER_FIELDS) {
-    const text = cellText(record[field]);
-    if (text === WORK_ORDER_UNKNOWN) unknownFields.push(field);
+    const value = record[field];
+    const text = cellText(value);
+    if (value == null || (typeof value === 'string' && !value.trim())) unknownFields.push(field);
     cells[field] = text;
   }
   return { ok: true, order: { cellId: rawCellId.trim(), ...cells, unknownFields } };

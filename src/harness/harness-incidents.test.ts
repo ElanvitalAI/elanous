@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { hostname, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { Command } from 'commander';
-import { detectBursts, detectCommonCauseBursts, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit, type RunExit } from './harness-incidents.js';
+import { detectBursts, detectCommonCauseBursts, findIncidentPrecedents, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit, type RunExit } from './harness-incidents.js';
 import { installHarnessCliCommand, recordClassifiedHarnessPodExit, warnRecentIncidentBurst } from './harness-cli-command.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { debug } from '../debug/log.js';
@@ -622,4 +622,28 @@ test('bursts are isolated by seat and entrance and a warning names only its own 
   expect(lines[0]).toContain('seat=MK entrance=cli-harness-ask');
   expect(lines[0]).not.toContain('UX');
   expect(formatIncidentBurstWarning(bursts.find((burst) => burst.seat === 'UX')!)).toContain('seat=UX');
+});
+
+test('findIncidentPrecedents returns only recorded same-reason exits before the current one, newest first', () => {
+  const dir = root();
+  const at = Date.parse('2026-10-02T13:49:07.000Z');
+  recordRunExit({ ...row('run-old', 'oom', at - 90 * 60_000) }, dir);
+  recordRunExit({ ...row('run-mid', 'oom', at - 30 * 60_000), lastLines: ['boom'] }, dir);
+  recordRunExit({ ...row('run-new', 'oom', at + 5 * 60_000) }, dir); // 현재 이후 — 선례 아님
+  recordRunExit({ ...row('run-other', 'signal', at - 10 * 60_000) }, dir); // 다른 reason — 선례 아님
+  const precedents = findIncidentPrecedents({ reason: 'oom', at: new Date(at).toISOString(), runId: 'run-current' }, dir);
+  expect(precedents.map((p) => p.runId)).toEqual(['run-mid', 'run-old']);
+  expect(precedents[0]).toMatchObject({ runId: 'run-mid', reason: 'oom', status: 143, signal: 'SIGTERM', lastLines: ['boom'] });
+  expect(precedents[1]!.lastLines).toBeUndefined();
+  // 현재 runId 자신은 제외된다
+  const self = findIncidentPrecedents({ reason: 'oom', at: new Date(at).toISOString(), runId: 'run-old' }, dir);
+  expect(self.map((p) => p.runId)).toEqual(['run-mid']);
+  // limit 절약
+  expect(findIncidentPrecedents({ reason: 'oom', at: new Date(at).toISOString() }, dir, { limit: 1 })).toHaveLength(1);
+  // 기록 없는 reason 은 «기록 없음» — 빈 배열(지어내기 금지)
+  expect(findIncidentPrecedents({ reason: 'no-record', at: new Date(at).toISOString() }, dir)).toEqual([]);
+  // 없는 원장 디렉터리도 빈 배열
+  expect(findIncidentPrecedents({ reason: 'oom', at: new Date(at).toISOString() }, join(dir, 'missing'))).toEqual([]);
+  // invalid at — 빈 배열
+  expect(findIncidentPrecedents({ reason: 'oom', at: 'not-a-date' }, dir)).toEqual([]);
 });

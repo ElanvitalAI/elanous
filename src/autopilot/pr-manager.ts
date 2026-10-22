@@ -11,21 +11,22 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { githubAutomationToken } from '../auth/github-app-token.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
 import { runGitWithRetry } from '../git-fs/retry.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { isElanousRuntimeArtifactPath } from '../self-implement/gate-scope.js';
 import { isTransientExecutionFailure } from '../self-dev/execution-transient.js';
 import { withGhRestFallback } from './gh-rest-fallback.js';
-import { cardIdFromBody, cellIdFromBody, guardNewPr, hasCardMarker, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, type GuardVerdict, type HunkOverlapMode, type Seat } from '../pr-tool/census.js';
+import { cardIdFromBody, cellIdFromBody, guardNewPr, hasCardMarker, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, sharedCensusDiffCache, sliceMarkerFromBody, spawnParallelCommands, type GuardVerdict, type HunkOverlapMode, type PrToolParallelCommand, type Seat } from '../pr-tool/census.js';
 import { labelsForAxis, PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { getUserConfig } from '../user-config.js';
+import { runSuffixKey } from '../self-implement/salvage-branches.js';
 
 /** ★ stderr 캡처(대표 2026-07-21·관측 갭) — 종전엔 stdout 만 담아 git/gh 실패 사유가 소실됐다
  *  (705308: makePr 실패가 bare null 로 뭉뚱그려져 triage 가 "인증·네트워크"로 환각 오라우팅).
  *  이제 err 에 stderr 를 담아 upsertPr 가 실패 단계·사유를 구조화해 반환한다. */
-export interface CmdResult { ok: boolean; out: string; err?: string }
+export interface CmdResult { ok: boolean; out: string; err?: string; /** 실제 종료 코드 — defaultCmdRunner 만 채운다(스텁은 ok 로만 판정). */ rc?: number }
 /** 명령 실행 추상화(주입형·테스트 스텁) — git/gh 를 실제로 돌리지 않고 로직 검증. */
 export type CmdRunner = (cmd: string, args: readonly string[], opts?: { cwd?: string }) => CmdResult;
 
@@ -77,7 +78,10 @@ export const defaultCmdRunner: CmdRunner = (cmd, args, opts) => {
     // never read an overflow as success.
     const r = spawnSync(cmd, [...args], { encoding: 'utf-8', timeout: 120_000, maxBuffer: 256 * 1024 * 1024, env, ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
     const overflow = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS';
-    return { ok: r.status === 0 && !overflow, out: (r.stdout ?? '').trim(), err: [(r.stderr ?? '').trim(), overflow ? 'output exceeded 256MiB (ENOBUFS)' : ''].filter(Boolean).join('\n') };
+    const result: CmdResult = { ok: r.status === 0 && !overflow, out: (r.stdout ?? '').trim(), err: [(r.stderr ?? '').trim(), overflow ? 'output exceeded 256MiB (ENOBUFS)' : ''].filter(Boolean).join('\n') };
+    // Keep the historical enumerable result shape while making the exit code available to PR incidents.
+    if (typeof r.status === 'number') Object.defineProperty(result, 'rc', { value: r.status, enumerable: false });
+    return result;
   } catch (e) { return { ok: false, out: '', err: e instanceof Error ? e.message : String(e) }; }
 };
 
@@ -90,6 +94,8 @@ export function extractPrNumber(prUrl: string): number | null {
 export interface UpsertPrInput {
   /** 안정 브랜치명(se/…-<phaseHex>) — 재활용 키. */
   branch: string;
+  /** Owning self-implement run; used to keep temporary upload refs inside its Pod push fence. */
+  runId?: string;
   /** 격리 worktree 경로(git cwd). */
   worktreePath: string;
   title: string;
@@ -122,7 +128,8 @@ export interface UpsertPrResult { url: string; reused: boolean }
 export type UpsertPrOutcome =
   | { ok: true; url: string; reused: boolean; labelsApplied?: boolean; labelsOmitted?: boolean;
       supersededPr?: number }
-  | { ok: false; reason: 'add' | 'commit' | 'base' | 'noop' | 'push' | 'gh' | 'guard'; detail: string };
+  | { ok: false; reason: 'add' | 'commit' | 'base' | 'noop' | 'push' | 'gh' | 'guard'; detail: string;
+      incident?: PrCreateFailureIncident };
 
 /** 관측된 문면 두 가지:
  *    could not add label: 'auto-review' not found
@@ -181,7 +188,7 @@ function readPrMergeState(run: CmdRunner, prNumber: number, cwd?: string): Merge
 export type FindPrForBranchOutcome =
   | { status: 'ok OUTPUT'; url: string }
   | { status: 'ok EMPTY'; url: null }
-  | { status: 'FAILED'; url: null }
+  | { status: 'FAILED'; url: null; rc?: number; stderrTail?: string }
   | { status: 'SKIPPED'; url: null };
 
 export interface PrManager {
@@ -319,10 +326,90 @@ function isTransientPushFailure(detail: string): boolean {
   return isTransientExecutionFailure(pushFailureMessageForTransientCheck(detail));
 }
 
+// ── 칸 PR-CREATE-FAIL-OBSERVE-FU — PR 생성 실패 incident(관측 단위) ──────────────
+//   run-7308cfbf·run-fabc2564·run-32bca71e·run-42876ab6 의 draft PR 생성 실패가
+//   outcome 원장만으로는 push·gh create·인증·원격 충돌 중 어느 단계인지 못 가렸다.
+//   하나의 incident 가 push 와 gh 단계를 각각 식별해 rc·stderr 꼬리·branch/remote·push 성패를 남긴다.
+/** PR 생성 경로에서 실패 관측 대상인 단계. */
+export type PrCreateStageId = 'push' | 'gh';
+/** 단계별 관측: 실행 여부 · 종료 코드 · (자격증명 제거된) stderr 꼬리 · push 성공 여부. */
+export interface PrCreateStageObservation {
+  stage: PrCreateStageId;
+  ran: boolean;
+  rc?: number;
+  stderrTail?: string;
+  /** push 단계 전용 — force-push 최종 성공 여부. */
+  ok?: boolean;
+}
+/** PR 생성 실패 한 건 — push/gh 두 단계 관측을 하나의 기록에. */
+export interface PrCreateFailureIncident {
+  runId?: string;
+  branch: string;
+  remote: string;
+  push: PrCreateStageObservation;
+  gh: PrCreateStageObservation;
+}
+/** stderr 꼬리로 남기는 최대 글자 수. */
+export const PR_CREATE_STDERR_TAIL_CHARS = 400;
+
+/** 토큰·URL 자격증명을 기록 전에 지운다(원문 꼬리는 살리고 비밀만 뭉개기). */
+const CREDENTIAL_REDACTION_PATTERNS: readonly { pattern: RegExp; replacement: string }[] = [
+  // GitHub token prefixes(ghp_/gho_/ghu_/ghs_/ghr_/github_pat_ …) — secret 부분만 치환.
+  { pattern: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}/g, replacement: '[REDACTED]' },
+  { pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}/g, replacement: '[REDACTED]' },
+  // URL userInfo(https://user:pass@host · ssh://user:pass@host) — 스킴은 살리고 자격증명만.
+  { pattern: /((?:https?|ssh|git\+ssh):\/\/)[^\s/@]+:[^\s/@]+@/g, replacement: '$1[REDACTED]@' },
+];
+
+/** stderr 텍스트에서 토큰·URL 자격증명을 제거한다. */
+export function sanitizeCredentialText(text: string): string {
+  let out = text;
+  for (const { pattern, replacement } of CREDENTIAL_REDACTION_PATTERNS) out = out.replace(pattern, replacement);
+  return redactSecretText(out);
+}
+
+/** stderr 를 자격증명 제거 뒤 꼬리(기본 400자)만 남긴다. 비면 undefined. */
+export function stderrTailOf(err: string | undefined, chars: number = PR_CREATE_STDERR_TAIL_CHARS): string | undefined {
+  const sanitized = sanitizeCredentialText(err ?? '').trim();
+  return sanitized ? sanitized.slice(-chars) : undefined;
+}
+
+/** PR 생성 실패 incident 를 원장(debug.log)에 남긴다. 성공 경로는 기록하지 않는다. */
+export function recordPrCreateFailureIncident(incident: PrCreateFailureIncident): PrCreateFailureIncident {
+  const safe: PrCreateFailureIncident = {
+    ...(incident.runId ? { runId: sanitizeCredentialText(incident.runId) } : {}),
+    branch: sanitizeCredentialText(incident.branch),
+    remote: sanitizeCredentialText(incident.remote),
+    push: { ...incident.push, ...(incident.push.stderrTail ? { stderrTail: stderrTailOf(incident.push.stderrTail) } : {}) },
+    gh: { ...incident.gh, ...(incident.gh.stderrTail ? { stderrTail: stderrTailOf(incident.gh.stderrTail) } : {}) },
+  };
+  debug.log('autopilot.pr-manager', 'pr-create-failure-incident', safe);
+  return safe;
+}
+
+function prCreateFailureOutcome(input: UpsertPrInput, reason: 'push' | 'gh' | 'guard', detail: string,
+  push: PrCreateStageObservation, gh: PrCreateStageObservation, targetBranch = input.branch): UpsertPrOutcome {
+  const incident = recordPrCreateFailureIncident({
+    ...(input.runId ? { runId: input.runId } : {}), branch: targetBranch, remote: 'origin', push, gh,
+  });
+  const safeDetail = sanitizeCredentialText(detail).slice(0, 300);
+  // The production caller carries detail into its child failure record.
+  return input.runId
+    ? { ok: false, reason, detail: `${safeDetail}\npr-create-incident=${JSON.stringify(incident)}`, incident }
+    : { ok: false, reason, detail: safeDetail };
+}
+
 function seatFromEnvironment(): Seat | null {
   // Production launchers stamp this in harness-pod-dispatch.ts and harness-cli-command.ts.
   const value = process.env.ELANOUS_HARNESS_SEAT;
   return value === 'OP' || value === 'TC' || value === 'MK' || value === 'UX' ? value : null;
+}
+
+function sameCellGuardDetail(verdict: GuardVerdict, candidateCardId: string | null): string {
+  const reasons = verdict.reasons.map(reason => `${reason.code}: ${reason.detail}${reason.prs?.length ? ` (${reason.prs.map(number => `#${number}`).join(', ')})` : ''}`).join('; ');
+  return verdict.sameCellConflicts?.length
+    ? `${reasons}; candidateCardId=${candidateCardId ?? 'unknown'}; blockers=${verdict.sameCellConflicts.map(({ pr, cardId }) => `#${pr}:${cardId ?? 'unknown'}`).join(',')}`
+    : reasons;
 }
 
 /** PR-GUARD-HUNK-WARN: config `prTool.hunkOverlap` — 'refuse' 만 옛 거부, 없거나 그 밖은 'warn'. */
@@ -330,6 +417,10 @@ export function configuredHunkOverlapMode(raw: Record<string, unknown> | undefin
   const prTool = raw?.prTool as { hunkOverlap?: unknown } | undefined;
   return prTool?.hunkOverlap === 'refuse' ? 'refuse' : 'warn';
 }
+
+/** PR-CENSUS-PARALLEL: the guard's `gh pr diff` fan-out, with the same gh credentials as {@link defaultCmdRunner}. */
+export const defaultCensusParallelRunner: PrToolParallelCommand = (calls, concurrency) =>
+  spawnParallelCommands(calls, { concurrency, env: ghAutomationEnv(process.env) });
 
 function defaultPrCreateGuard(input: { cwd: string; base: string | undefined; seat: Seat | null; body: string }, run: CmdRunner): GuardVerdict {
   if (!input.base) return guardNewPr({ files: null, seat: input.seat }, { status: 'unknown', reason: '비교 base 없음' });
@@ -340,8 +431,10 @@ function defaultPrCreateGuard(input: { cwd: string; base: string | undefined; se
   const boundRaw = process.env.ELANOUS_TASK_BOUND_PR;
   const boundPrNumber = boundRaw && /^[1-9]\d*$/.test(boundRaw) ? Number(boundRaw) : undefined;
   return guardNewPr({ files, seat: input.seat, cellId: cellIdFromBody(input.body), cardId: cardIdFromBody(input.body),
+    slice: sliceMarkerFromBody(input.body),
     ...(boundPrNumber && Number.isSafeInteger(boundPrNumber) ? { boundPrNumber } : {}),
-    hunks: parseDiffHunks(patch.out), hunkOverlap: configuredHunkOverlapMode() }, readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}) }));
+    hunks: parseDiffHunks(patch.out), hunkOverlap: configuredHunkOverlapMode() }, readOpenPrs(run, { cwd: input.cwd, ...(files ? { candidateFiles: files } : {}),
+      runParallel: defaultCensusParallelRunner, diffCache: sharedCensusDiffCache }));
 }
 
 function editExistingPr(run: CmdRunner, input: UpsertPrInput, url: string): UpsertPrOutcome {
@@ -375,7 +468,12 @@ function editExistingPr(run: CmdRunner, input: UpsertPrInput, url: string): Upse
  * checked again after the inventory snapshot; an ambiguous or moved PR stays refused. */
 function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullable<GuardVerdict['sameCellReuse']>, recheck: () => GuardVerdict): UpsertPrOutcome {
   const cwd = input.worktreePath;
-  const fail = (detail: string): UpsertPrOutcome => ({ ok: false, reason: 'guard', detail: `same-cell reuse: ${detail}` });
+  const pushEvidence = { ref: `refs/heads/${target.branch}`, remoteHead: target.headSha, cardId: target.cardId };
+  const fail = (detail: string): UpsertPrOutcome => {
+    const safeDetail = sanitizeCredentialText(detail).slice(0, 300);
+    debug.log('autopilot.pr-manager', 'same-cell-push-decision', { ...pushEvidence, outcome: 'refused', reason: safeDetail }, { level: 'warn' });
+    return { ok: false, reason: 'guard', detail: `same-cell reuse: ${safeDetail}` };
+  };
   if (!/^[0-9a-f]{40}$/i.test(target.headSha) || !Number.isSafeInteger(target.number) || target.number < 1
     || cellIdFromBody(input.body) !== target.cellId || cardIdFromBody(input.body) !== target.cardId)
     return fail('candidate identity mismatch');
@@ -389,6 +487,8 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
   if (pr.state !== 'OPEN' || pr.isCrossRepository !== false || pr.headRefOid !== target.headSha
     || pr.headRefName !== target.branch || typeof pr.body !== 'string'
     || cellIdFromBody(pr.body) !== target.cellId
+    || (sliceMarkerFromBody(input.body)?.slice ?? null) !== (sliceMarkerFromBody(pr.body)?.slice ?? null)
+    || (sliceMarkerFromBody(input.body)?.total ?? null) !== (sliceMarkerFromBody(pr.body)?.total ?? null)
     || (target.legacyBound ? hasCardMarker(pr.body) || process.env.ELANOUS_TASK_BOUND_PR !== String(target.number)
       : cardIdFromBody(pr.body) !== target.cardId)
     || typeof pr.url !== 'string' || extractPrNumber(pr.url) !== target.number)
@@ -429,7 +529,9 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
     if (!localHead.ok || !/^[0-9a-f]{40}$/i.test(localHead.out.trim())) return fail('new run head unreadable');
     // Upload the commit through a unique scratch ref. GitHub's create-ref API then
     // atomically refuses a concurrent writer of the intended branch name.
-    const scratch = `elanous-pr-create/${randomUUID()}`;
+    const runKey = input.runId ? runSuffixKey(input.runId) : null;
+    if (!runKey) return fail(input.runId ? 'new run id invalid for scratch ref' : 'run id required for scratch ref');
+    const scratch = `self-impl/pr-create-r${runKey}-${randomUUID()}`;
     const scratchRef = `refs/heads/${scratch}`;
     const uploaded = run('git', ['-C', cwd, 'push', 'origin', `HEAD:${scratchRef}`]);
     if (!uploaded.ok) return fail(`new run object upload failed: ${(uploaded.err || uploaded.out).slice(0, 220)}`);
@@ -466,6 +568,8 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
   if (!finalView.ok || finalPr.state !== 'OPEN' || finalPr.isCrossRepository !== false
     || finalPr.headRefOid !== target.headSha || finalPr.headRefName !== target.branch
     || typeof finalPr.body !== 'string' || cellIdFromBody(finalPr.body) !== target.cellId
+    || (sliceMarkerFromBody(input.body)?.slice ?? null) !== (sliceMarkerFromBody(finalPr.body)?.slice ?? null)
+    || (sliceMarkerFromBody(input.body)?.total ?? null) !== (sliceMarkerFromBody(finalPr.body)?.total ?? null)
     || (target.legacyBound ? hasCardMarker(finalPr.body) || process.env.ELANOUS_TASK_BOUND_PR !== String(target.number)
       : cardIdFromBody(finalPr.body) !== target.cardId)
     || finalPr.url !== pr.url) return fail('PR changed before push');
@@ -478,8 +582,18 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
     return fail('OPEN PR inventory changed before push');
   // The result descends from the exact fetched head. The explicit lease binds the
   // remote update to that head, so a delete or move between reads cannot be revived.
-  const pushed = run('git', ['-C', cwd, 'push', `--force-with-lease=${remoteRef}:${target.headSha}`, 'origin', `HEAD:${remoteRef}`]);
+  // The Pod hook receives these values for this one push only. It checks the Pod card,
+  // exact remote head and ancestry independently before allowing another run's ref.
+  const podReuseConfig = input.runId && process.env.ELANOUS_TASK_CARD_ID ? [
+    '-c', `elanous.sameCellReuseRef=${remoteRef}`,
+    '-c', `elanous.sameCellReuseHead=${target.headSha}`,
+    '-c', `elanous.sameCellReuseCard=${target.cardId}`,
+  ] : [];
+  const pushed = run('git', ['-C', cwd,
+    ...podReuseConfig,
+    'push', `--force-with-lease=${remoteRef}:${target.headSha}`, 'origin', `HEAD:${remoteRef}`]);
   if (!pushed.ok) return fail(`fast-forward push refused: ${(pushed.err || pushed.out).slice(0, 220)}`);
+  debug.log('autopilot.pr-manager', 'same-cell-push-decision', { ...pushEvidence, outcome: 'allowed', reason: 'bound-card-pr-head-fast-forward' });
   debug.log('autopilot.pr-manager', 'same-cell-reused', { pr: target.number, cellId: target.cellId, cardId: target.cardId, branch: target.branch });
   return editExistingPr(run, input, pr.url);
 }
@@ -509,7 +623,9 @@ export function makePrManager(
     const r = run('gh', ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'url', '--jq', '.[0].url // ""'], cwd ? { cwd } : undefined);
     const url = r.out.trim() || null;
     const outcome: FindPrForBranchOutcome = !r.ok
-      ? { status: 'FAILED', url: null }
+      ? { status: 'FAILED', url: null,
+          ...(typeof r.rc === 'number' ? { rc: r.rc } : {}),
+          ...(stderrTailOf(r.err || r.out) ? { stderrTail: stderrTailOf(r.err || r.out) } : {}) }
       : url
         ? { status: 'ok OUTPUT', url }
         : { status: 'ok EMPTY', url: null };
@@ -525,21 +641,34 @@ export function makePrManager(
   return {
     findPrForBranch,
     findPrForBranchOutcome,
-    upsertPr(input) {
+    upsertPr(candidateInput) {
+      // ★ sibling-slice(쪼개기 정착) — composeSliceHandText(tier-split.ts)가 hand 문면에 표지를 쓰고
+      //   prBody(orchestrator.ts)가 그 문면을 PR 본문에 보존한다. 조각 번호만 제목에 덧붙인다.
+      const candidateSlice = sliceMarkerFromBody(candidateInput.body);
+      const input: UpsertPrInput = candidateSlice
+        ? { ...candidateInput,
+            title: `${candidateInput.title} · 조각 ${candidateSlice.slice}/${candidateSlice.total}`,
+            body: candidateInput.body }
+        : candidateInput;
+      const taskCardId = process.env.ELANOUS_TASK_CARD_ID;
+      if (taskCardId && (!hasCardMarker(input.body) || cardIdFromBody(input.body) !== taskCardId))
+        return { ok: false, reason: 'guard', detail: `task card PR body missing or conflicting card marker: expected=${taskCardId}` };
       const cwd = input.worktreePath;
       const opts = { cwd };
       const runGitWrite = (args: string[]): CmdResult => {
+        let lastRc: number | undefined;
         const result = runGitWithRetry(
           args,
           (gitArgs) => {
             const command = run('git', gitArgs, opts);
-            return { status: command.ok ? 0 : 1, stdout: command.out, stderr: command.err ?? '' };
+            lastRc = command.rc;
+            return { status: command.ok ? 0 : (command.rc && command.rc !== 0 ? command.rc : 1), stdout: command.out, stderr: command.err ?? '' };
           },
           (attempt) => debug.log('autopilot.pr-manager', 'git-write.retry-succeeded', { attempt, args }),
         );
-        return { ok: result.status === 0, out: result.stdout, err: result.stderr };
+        return { ok: result.status === 0, out: result.stdout, err: result.stderr, rc: lastRc ?? (typeof result.status === 'number' ? result.status : undefined) };
       };
-      const detailOf = (r: CmdResult) => (r.err || r.out || '').slice(0, 300);
+      const detailOf = (r: CmdResult) => sanitizeCredentialText(r.err || r.out || '').slice(0, 300);
       // ★ gitignored 경로는 exclude pathspec 에서 뺀다(대표 2026-07-21·705308 근본). git add -A 는 gitignored
       //   (node_modules·apps/pwa/out 심링크)를 이미 자동 skip 하는데, `:(exclude)<ignored>` 로 명시 지목하면
       //   git 이 "paths ignored by .gitignore … use -f" 로 exit 1 을 뱉는다(staging 은 성공하지만 exit≠0).
@@ -651,16 +780,39 @@ export function makePrManager(
       const earlyGuard = candidateCardId && checkCreate
         ? checkCreate({ cwd, base: comparisonBase, seat: input.seat ?? seatFromEnvironment(), body: input.body }, run)
         : undefined;
+      // ★ sibling-slice 허용 분기 — 같은 칸의 «다른 조각» OPEN PR 은 충돌로 보지 않는다.
+      //   다른 조각 번호(같은 total) → same-cell 사유만 빼고 새 draft 허용 · 같은 조각 번호 → 기존
+      //   재사용/거부 그대로 · 후보에 표지 없음 → 기존 가드 그대로(siblingSliceAllowed 는 그대로 반환).
+      const siblingSliceAllowed = (verdict: GuardVerdict): GuardVerdict => {
+        // Injected guards may still use the old card-only reuse predicate. Never force-push
+        // one slice over another, even when the card lineage matches.
+        const reused = verdict.sameCellReuse;
+        const reusedConflict = reused && verdict.sameCellConflicts?.find(conflict => conflict.pr === reused.number);
+        const safeReuse = !reused || ((candidateSlice?.slice ?? null) === (reusedConflict?.slice?.slice ?? null)
+          && (candidateSlice?.total ?? null) === (reusedConflict?.slice?.total ?? null));
+        const checkedVerdict = safeReuse ? verdict : { ...verdict, sameCellReuse: undefined };
+        if (!candidateSlice || checkedVerdict.status !== 'refuse' || checkedVerdict.sameCellReuse || !checkedVerdict.sameCellConflicts?.length)
+          return checkedVerdict;
+        const conflicts = checkedVerdict.sameCellConflicts;
+        if (conflicts.some(conflict => !conflict.slice || conflict.slice.slice === candidateSlice.slice)) return checkedVerdict;
+        if (!conflicts.every(conflict => conflict.slice!.total === candidateSlice.total)) return checkedVerdict;
+        debug.log('autopilot.pr-manager', 'same-cell-sibling-slice', {
+          cell: cellIdFromBody(input.body), slice: candidateSlice.slice, total: candidateSlice.total,
+          existingSlice: conflicts[0]!.slice!.slice, outcome: 'allowed' });
+        const reasons = checkedVerdict.reasons.filter(reason => reason.code !== 'same-cell');
+        return reasons.length ? { ...checkedVerdict, reasons } : { ...checkedVerdict, status: 'allow', reasons: [] };
+      };
+      const earlyVerdict = earlyGuard ? siblingSliceAllowed(earlyGuard) : undefined;
       const freshGuard = () => checkCreate!({ cwd, base: comparisonBase, seat: input.seat ?? seatFromEnvironment(), body: input.body }, run);
-      if (earlyGuard?.sameCellReuse) return reuseSameCellPr(run, input, earlyGuard.sameCellReuse, freshGuard);
-      if (earlyGuard?.status === 'refuse') return { ok: false, reason: 'guard', detail: earlyGuard.reasons.map(reason => `${reason.code}: ${reason.detail}`).join('; ') };
-      const earlyInventoryUnknown = !!candidateCardId && (!checkCreate || (earlyGuard?.status === 'unknown'
-        && earlyGuard.reasons.length === 1 && earlyGuard.reasons[0]?.code === 'inventory-unknown'));
-      if (candidateCardId && earlyGuard?.status !== 'allow' && !earlyInventoryUnknown)
+      if (earlyVerdict?.sameCellReuse) return reuseSameCellPr(run, input, earlyVerdict.sameCellReuse, freshGuard);
+      if (earlyVerdict?.status === 'refuse') return { ok: false, reason: 'guard', detail: sameCellGuardDetail(earlyVerdict, candidateCardId) };
+      const earlyInventoryUnknown = !!candidateCardId && (!checkCreate || (earlyVerdict?.status === 'unknown'
+        && earlyVerdict.reasons.length === 1 && earlyVerdict.reasons[0]?.code === 'inventory-unknown'));
+      if (candidateCardId && earlyVerdict?.status !== 'allow' && !earlyInventoryUnknown)
         return { ok: false, reason: 'guard', detail: 'candidate card inventory unmeasured before push' };
       if (earlyInventoryUnknown) debug.log('pr-tool.open-guard', 'candidate-inventory-unmeasured', {
         branch: input.branch, cardId: candidateCardId, stage: 'before-push',
-        reason: earlyGuard?.reasons[0]?.detail ?? 'create guard unavailable',
+        reason: earlyVerdict?.reasons[0]?.detail ?? 'create guard unavailable',
       });
       if (candidateCardId) {
         const branchPr = findPrForBranchOutcome(input.branch, cwd);
@@ -671,6 +823,17 @@ export function makePrManager(
       //   있으면 GitHub 이 그 PR 을 자동 업데이트(닫고 새로 안 만듦). elanous 자체 SE 브랜치라 force 안전.
       //   일시 원격 실패(5xx·연결 끊김 등)만 최대 3회. 영구 거부는 한 번에 끝낸다.
       const waitForPushRetry = input.waitForPushRetry ?? defaultWaitForPushRetry;
+      // ★ 칸 PR-CREATE-FAIL-OBSERVE-FU — push/gh 단계 관측을 쌓아 실패 시 한 incident 로.
+      const pushStage: PrCreateStageObservation = { stage: 'push', ran: false };
+      const ghStage: PrCreateStageObservation = { stage: 'gh', ran: false };
+      const markGhRan = (r: CmdResult): CmdResult => {
+        ghStage.ran = true;
+        ghStage.rc = r.rc;
+        ghStage.stderrTail = stderrTailOf(r.err);
+        return r;
+      };
+      const failedCreate = (reason: 'push' | 'gh', detail: string): UpsertPrOutcome =>
+        prCreateFailureOutcome(input, reason, detail, pushStage, ghStage);
       const pushArgs = candidateCardId
         ? ['-C', cwd, 'push', '-u', 'origin', input.branch]
         : ['-C', cwd, 'push', '--force', '-u', 'origin', input.branch];
@@ -681,19 +844,32 @@ export function makePrManager(
         pushR = runGitWrite(pushArgs);
         pushAttempts += 1;
       }
+      pushStage.ran = true;
+      pushStage.ok = pushR.ok;
+      pushStage.rc = pushR.rc;
+      pushStage.stderrTail = stderrTailOf(pushR.err);
       if (!pushR.ok) {
         const detail = pushAttempts > 1
           ? `push ${pushAttempts}/${MAX_PUSH_ATTEMPTS} failed: ${detailOf(pushR)}`
           : detailOf(pushR);
-        return { ok: false, reason: 'push', detail };
+        return failedCreate('push', detail);
       }
       const existing = findPrForBranchOutcome(input.branch, cwd);
+      if (existing.status !== 'SKIPPED') {
+        ghStage.ran = true;
+        if (existing.status === 'FAILED') {
+          ghStage.rc = existing.rc;
+          ghStage.stderrTail = existing.stderrTail;
+        }
+      }
       if (existing.url) {
         if (candidateCardId)
           return { ok: false, reason: 'guard', detail: 'candidate run branch PR appeared after push; refuse edit' };
         return editExistingPr(run, input, existing.url);
       }
-      if (existing.status === 'FAILED') return { ok: false, reason: 'gh', detail: 'existing PR branch lookup failed' };
+      if (existing.status === 'FAILED') {
+        return failedCreate('gh', 'existing PR branch lookup failed');
+      }
       let guardUnmeasured = earlyInventoryUnknown;
       let hunkOverlapWarning: { prs: readonly number[]; files: readonly string[] } | null = null;
       if (checkCreate) {
@@ -701,28 +877,30 @@ export function makePrManager(
         // Another run may open a PR after the early inventory and before this create.
         // Read the complete OPEN inventory again after push, immediately before create.
         const verdict = checkCreate({ cwd, base: comparisonBase, seat, body: input.body }, run);
-        if (verdict.sameCellReuse)
+        // sibling-slice: 같은 칸의 다른 조각이 inventories 사이 열려도 생성은 허용한다(위 분기와 동일 규칙).
+        const siblingVerdict = siblingSliceAllowed(verdict);
+        if (siblingVerdict.sameCellReuse)
           return { ok: false, reason: 'guard', detail: 'same-cell PR appeared after run branch push; retry from fresh inventory' };
-        const hunkWarn = verdict.status === 'allow' ? verdict.warnings.find(warning => warning.code === 'hunk-overlap') : undefined;
+        const hunkWarn = siblingVerdict.status === 'allow' ? siblingVerdict.warnings.find(warning => warning.code === 'hunk-overlap') : undefined;
         if (hunkWarn) hunkOverlapWarning = { prs: hunkWarn.prs ?? [], files: hunkWarn.files ?? [] };
-        if (verdict.status === 'unknown' && verdict.reasons.length === 1 && verdict.reasons[0]?.code === 'inventory-unknown') {
+        if (siblingVerdict.status === 'unknown' && siblingVerdict.reasons.length === 1 && siblingVerdict.reasons[0]?.code === 'inventory-unknown') {
           const inPod = process.env.ELANOUS_SUBSTRATE === 'pod'
             || Object.keys(process.env).some(key => key.startsWith('ELANOUS_POD_'));
           if (inPod) {
             // Pod state and mailbox are local to this Job. Count and alert only
             // in the host parent, where the shared instance root is authoritative.
-            debug.log('pr-tool.open-guard', 'pod-unmeasured', { seat, reason: verdict.reasons[0].detail });
+            debug.log('pr-tool.open-guard', 'pod-unmeasured', { seat, reason: siblingVerdict.reasons[0].detail });
           } else {
-            const count = recordUnmeasured({ seat, reason: verdict.reasons[0].detail });
+            const count = recordUnmeasured({ seat, reason: siblingVerdict.reasons[0].detail });
             if (count.blocked) {
-              const alert = run('eln', ['msg', 'post', '--from', seat ?? 'HARNESS', '--to', 'OP', '--kind', 'alert', '--body', `PR open-guard 판정 불가 1시간 ${count.count}회 · ${candidateCardId ? '카드 후보는 draft 관측' : '새 PR 차단'} · ${count.reason ?? verdict.reasons[0].detail}`]);
+              const alert = run('eln', ['msg', 'post', '--from', seat ?? 'HARNESS', '--to', 'OP', '--kind', 'alert', '--body', `PR open-guard 판정 불가 1시간 ${count.count}회 · ${candidateCardId ? '카드 후보는 draft 관측' : '새 PR 차단'} · ${count.reason ?? siblingVerdict.reasons[0].detail}`]);
               if (!alert.ok) debug.log('pr-tool.open-guard', 'op-alert-failed', { seat, reason: alert.err || alert.out || 'eln msg post 실패' });
               if (!candidateCardId) return { ok: false, reason: 'guard', detail: `inventory-unknown: 1시간 ${count.count}회 · 새 PR 차단${count.reason ? ` (${count.reason})` : ''}` };
             }
           }
           guardUnmeasured = true;
-        } else if (verdict.status !== 'allow') {
-          return { ok: false, reason: 'guard', detail: verdict.reasons.map(reason => `${reason.code}: ${reason.detail}${reason.prs?.length ? ` (${reason.prs.map(number => `#${number}`).join(', ')})` : ''}`).join('; ') };
+        } else if (siblingVerdict.status !== 'allow') {
+          return { ok: false, reason: 'guard', detail: sameCellGuardDetail(siblingVerdict, candidateCardId) };
         }
       }
       const createArgs = ['pr', 'create', '--head', input.branch, '--title', input.title, '--body', input.body];
@@ -736,10 +914,10 @@ export function makePrManager(
       const requestedLabels = [...new Set([...(input.labels ?? []), ...creatableLabels].map((label) => label.trim()).filter(Boolean))];
       const labeledArgs = [...createArgs];
       for (const label of requestedLabels) labeledArgs.push('--label', label);
-      let created = run('gh', labeledArgs, opts);
+      let created = markGhRan(run('gh', labeledArgs, opts));
       if (!created.ok && creatableLabels.length && isLabelNotFoundFailure(created, creatableLabels)) {
         for (const label of creatableLabels) run('gh', ['label', 'create', label, '--color', 'BFDADC'], opts);
-        created = run('gh', labeledArgs, opts);
+        created = markGhRan(run('gh', labeledArgs, opts));
       }
       const logHunkOverlapWarn = (url: string): void => {
         if (hunkOverlapWarning) debug.log('pr-tool.guard', 'hunk-overlap-warn', { pr: extractPrNumber(url), files: hunkOverlapWarning.files, against: hunkOverlapWarning.prs });
@@ -759,7 +937,7 @@ export function makePrManager(
       if (requestedLabels.length > 0 && isLabelNotFoundFailure(created, requestedLabels)) {
         const retryArgs = [...createArgs];
         for (const label of requiredLabels) retryArgs.push('--label', label);
-        const retry = run('gh', retryArgs, opts);
+        const retry = markGhRan(run('gh', retryArgs, opts));
         if (retry.ok && retry.out) {
           logHunkOverlapWarn(retry.out);
           debug.log('autopilot.pr-manager', 'create.labels-omitted', {
@@ -770,9 +948,10 @@ export function makePrManager(
           });
           return { ok: true, url: retry.out, reused: false, labelsOmitted: true };
         }
-        return { ok: false, reason: 'gh', detail: detailOf(retry) || 'gh pr create 실패' };
+        return failedCreate('gh', detailOf(retry) || 'gh pr create 실패');
       }
-      return { ok: false, reason: 'gh', detail: detailOf(created) || 'gh pr create 실패' };
+      // 여기까지 흘러내려왔으면 성공 return 을 못 만났다 — 실패 incident 로 마무리.
+      return failedCreate('gh', detailOf(created) || 'gh pr create 실패');
     },
     closePr(prUrl, comment) {
       const n = extractPrNumber(prUrl);

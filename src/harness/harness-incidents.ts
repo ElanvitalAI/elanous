@@ -209,6 +209,39 @@ export function recentBurst(root: string, now: Date | number, { lookbackMs = 15 
   return recent.sort((a, b) => Date.parse(a.lastAt) - Date.parse(b.lastAt)).at(-1) ?? null;
 }
 
+/** 사고 선례 1건 — 현재 사고 이전의 같은 reason 종료 기록(결정론 · 기록된 실제 exit 만). */
+export interface IncidentPrecedent {
+  runId: string;
+  reason: string;
+  status: number | null;
+  signal: string | null;
+  at: string;
+  lastLines?: string[];
+}
+
+/**
+ * 사고 선례 연결 — 현재 사고(reason·at) 이전에 같은 reason 으로 종료된 기록된 실제 exit 만
+ * 돌려준다(유사 과거 지어내기 금지 · readRunExits 재사용 · READ-ONLY). 현재 runId 는 제외하고
+ * 시간 내림차순, 기본 5건까지. 기록이 없으면 빈 배열(«기록 없음»).
+ */
+export function findIncidentPrecedents(
+  current: { reason: string; at: string; runId?: string },
+  root: string,
+  { limit = 5 }: { limit?: number } = {},
+): IncidentPrecedent[] {
+  const at = Date.parse(current.at);
+  if (!current.reason.trim() || !Number.isFinite(at)) return [];
+  return readRunExits(root)
+    .filter((row) => row.reason === current.reason && row.runId !== current.runId
+      && Date.parse(row.at) < at)
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || b.runId.localeCompare(a.runId))
+    .slice(0, Math.max(0, limit))
+    .map((row) => ({
+      runId: row.runId, reason: row.reason, status: row.status, signal: row.signal, at: row.at,
+      ...(Array.isArray(row.lastLines) ? { lastLines: row.lastLines } : {}),
+    }));
+}
+
 export function formatIncidentBurstWarning(burst: IncidentBurst): string {
   const time = new Date(Date.parse(burst.lastAt) + KST_OFFSET_MS).toISOString().slice(11, 16);
   const owner = burst.seat || burst.entrance ? ` [seat=${burst.seat ?? '-'} entrance=${burst.entrance ?? '-'}]` : '';

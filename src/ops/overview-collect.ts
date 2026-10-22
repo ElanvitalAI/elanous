@@ -13,7 +13,7 @@ import type { ResourceView } from '../control-plane/ledger.js';
 import { cardPrNumber, type TaskCard } from '../task-agent/task-hand.js';
 import { measureLandingThroughput, type LandingThroughput } from '../task-agent/cover.js';
 import {
-  okCell, unmeasured, type Cell, type CapacityInfo, type ChecklistCounts, type LaunchableInfo, type LoopRow, type MachineRow,
+  okCell, unmeasured, type Cell, type CapacityInfo, type ChecklistCounts, type IoPressure, type LaunchableInfo, type LoopRow, type MachineRow,
   type OverviewSnapshot, type OwnerTaskRow, type ParentsInfo, type PodMemberRow, type ReleaseRunInfo, type ScheduleInfo,
   type SchedulerMetrics,
 } from './overview.js';
@@ -161,6 +161,20 @@ function collectRelease(root: string, version: string | null, schedules: Release
   return { version: versionCell, run, schedule, checklist };
 }
 
+/**
+ * 하트비트가 실어 온 I/O 압박(diskIo.io · PSI 10초 평균)을 꺼낸다.
+ * 못 잼(맥 · /proc/pressure/io 없음 · 항목 빠짐)은 null — «0%» 로 굳히지 않는다.
+ */
+function ioPressureOf(diskIo: unknown): IoPressure | null {
+  const cell = (diskIo as { io?: { status?: unknown; value?: { someAvg10?: unknown; fullAvg10?: unknown } } } | null | undefined)?.io;
+  if (!cell || cell.status !== 'ok') return null;
+  const someAvg10 = cell.value?.someAvg10;
+  const fullAvg10 = cell.value?.fullAvg10;
+  if (typeof someAvg10 !== 'number' || !Number.isFinite(someAvg10)) return null;
+  if (typeof fullAvg10 !== 'number' || !Number.isFinite(fullAvg10)) return null;
+  return { someAvg10, fullAvg10 };
+}
+
 function collectMachines(root: string, ledgerRows: ResourceView[] | Error, poolSpec: string | null, psOut: string | Error, now: number): OverviewSnapshot['machines'] {
   const expected = new Set<string>();
   const pods: PodMemberRow[] = [];
@@ -181,7 +195,7 @@ function collectMachines(root: string, ledgerRows: ResourceView[] | Error, poolS
     for (const r of machines) expected.add(r.machine);
     for (const name of [...expected].sort()) {
       const row = machines.find((r) => r.machine === name);
-      const load = (row?.attrs as { load?: { loadAvg?: number[]; cpuCount?: number; freeMem?: number; totalMem?: number; observedAt?: number } } | undefined)?.load;
+      const load = (row?.attrs as { load?: { loadAvg?: number[]; cpuCount?: number; freeMem?: number; totalMem?: number; observedAt?: number; diskIo?: unknown } } | undefined)?.load;
       if (!row || !load || !Array.isArray(load.loadAvg)) { hosts.push({ name, load: unmeasured('control ledger heartbeat', '하트비트 없음') }); continue; }
       const observed = typeof load.observedAt === 'number' ? load.observedAt : row.observedAt;
       const [l1, l5, l15] = load.loadAvg;
@@ -192,7 +206,8 @@ function collectMachines(root: string, ledgerRows: ResourceView[] | Error, poolS
       }
       const age = Math.max(0, Math.round((now - observed) / 1000));
       const value = { load1: l1, load5: l5, load15: l15, cpuCount: load.cpuCount,
-        freeGb: load.freeMem / GB, totalGb: load.totalMem / GB, ageSeconds: age };
+        freeGb: load.freeMem / GB, totalGb: load.totalMem / GB, ageSeconds: age,
+        ioPressure: ioPressureOf(load.diskIo) };
       hosts.push({ name, load: age > HEARTBEAT_STALE_S
         ? unmeasured('control ledger heartbeat', `낡음(${age}초)`, iso(observed))
         : okCell(value, 'control ledger heartbeat', iso(observed)) });

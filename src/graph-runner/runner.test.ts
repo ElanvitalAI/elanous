@@ -6,15 +6,157 @@ import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { decideGraphApproval, latestGraphRun, manageGraphRun, resolveUnit, runGraph, verifyReleaseCommandRoot } from './runner.js';
+import { decideGraphApproval, latestGraphRun, listGraphRuns, manageGraphRun, resolveUnit, runGraph, runGraphClassifyNode, verifyReleaseCommandRoot } from './runner.js';
+import { classifyReworkBudgetShadow } from '../self-implement/classify-shadow.js';
+import { createReworkBudgetJudgment, REWORK_BUDGET_JUDGMENT } from '../self-implement/rework-budget-judgment.js';
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { readFailureInbox, recordFailureEvent } from '../self-implement/heal-intake.js';
+import { runSelfImplement } from '../self-implement/orchestrator.js';
+import { seams } from '../self-implement/test-seams.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+async function withIsolatedClassifyState<T>(run: (root: string) => Promise<T>): Promise<T> {
+  const root = mkdtempSync(join(tmpdir(), 'graph-classify-state-'));
+  dirs.push(root);
+  const previous = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  try { return await run(root); }
+  finally {
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+  }
+}
+
+test('self-implement consumers run the same persisted classify node and preserve verdicts', async () => withIsolatedClassifyState(async (root) => {
+  const before = new Set(listGraphRuns(root).runs.map(run => run.statePath));
+  const seen: string[] = [];
+  const shadow = await classifyReworkBudgetShadow('BUDGET: EXTEND', async ({ prompt }) => {
+    seen.push(prompt);
+    return 'EXTEND';
+  });
+  const judgment = await createReworkBudgetJudgment(async ({ prompt }) => {
+    seen.push(prompt);
+    return 'EXTEND';
+  })(REWORK_BUDGET_JUDGMENT, { kind: 'review', goal: 'fix' });
+  expect(shadow).toMatchObject({ picked: 'EXTEND', ok: true });
+  expect(judgment).toMatchObject({ output: 'EXTEND', verdict: 'continue', ok: true });
+  expect(seen).toHaveLength(2);
+  const runs = listGraphRuns(root).runs.filter(run => run.graphId === 'self-implement-classify' && !before.has(run.statePath));
+  expect(runs).toHaveLength(2);
+  const shadowRun = runs.find(run => (run.input as { caller?: string }).caller === 'rework-budget-shadow');
+  const judgmentRun = runs.find(run => (run.input as { caller?: string }).caller === 'rework-budget-judgment');
+  expect((shadowRun?.input as { arguments: string }).arguments).toBe('BUDGET: EXTEND');
+  expect((judgmentRun?.input as { arguments: string }).arguments).toContain('"observations"');
+  const observed = debug.events(500).filter(entry => entry.category === 'graph.classify' && entry.event === 'node-result' &&
+    runs.some(run => run.runId === (entry.data as { runId?: string }).runId));
+  expect(observed.map(entry => (entry.data as { caller: string }).caller).sort()).toEqual(['rework-budget-judgment', 'rework-budget-shadow']);
+  for (const entry of observed) {
+    const run = runs.find(candidate => candidate.runId === (entry.data as { runId: string }).runId)!;
+    expect(entry.data).toMatchObject({ nodeId: 'classify', caller: (run.input as { caller: string }).caller,
+      input: (run.input as { arguments: string }).arguments, verdict: 'EXTEND', output: 'EXTEND', ok: true });
+  }
+  for (const run of [shadowRun, judgmentRun]) {
+    expect(run?.nodes[0]).toMatchObject({ nodeId: 'classify', ok: true, executed: true });
+    expect(run?.input).toMatchObject({ arguments: expect.any(String), classify: { classes: expect.arrayContaining(['EXTEND']) } });
+    expect(JSON.parse(run?.nodes[0]?.output as string)).toMatchObject({ input: (run?.input as { arguments: string }).arguments,
+      verdict: 'EXTEND', output: 'EXTEND', ok: true });
+    expect(JSON.parse(readFileSync(run!.statePath, 'utf8')).nodes[0].output).toBe(run?.nodes[0]?.output);
+  }
+}));
+
+test('isolated self-implement rework round records matching shadow and judgment classify ledgers', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-classify-round-'));
+  dirs.push(root);
+  const previous = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  const observations: Array<{ event: string; data: Record<string, unknown> }> = [];
+  try {
+    await runSelfImplement({ feature: 'classify production rework round', maxReworkRounds: 1, memory: false,
+      seams: seams({ gateResults: [false, true],
+        diagnose: async () => 'BUDGET: EXTEND\nREASON: retry the narrow fix',
+        classifyCallLLM: async () => 'EXTEND',
+        writeRunLedger: entry => { observations.push({ event: entry.event, data: entry.data }); },
+      }),
+    });
+    const budget = observations.find(entry => entry.event === 'rework-budget');
+    expect(budget?.data).toMatchObject({ verdict: 'EXTEND', evidence: { modelReasoning: 'EXTEND' } });
+    const fabric = observations.find(entry => entry.event === 'rework-budget-fabric-shadow');
+    expect(fabric?.data).toMatchObject({ runId: budget?.data.runId, legacyVerdict: 'EXTEND', fabricPicked: 'EXTEND', agree: true });
+    const runs = listGraphRuns(root).runs.filter(run => run.graphId === 'self-implement-classify');
+    expect(runs).toHaveLength(2);
+    for (const run of runs) {
+      const saved = JSON.parse(readFileSync(run.statePath, 'utf8'));
+      expect(saved).toMatchObject({ status: 'done', path: ['classify', 'done'],
+        input: { arguments: expect.any(String), classify: { classes: expect.arrayContaining(['EXTEND']) } },
+        nodes: [{ nodeId: 'classify', ok: true, executed: true }, { nodeId: 'done' }],
+      });
+      expect(JSON.parse(saved.nodes[0].output)).toMatchObject({ input: saved.input.arguments,
+        verdict: 'EXTEND', output: 'EXTEND', ok: true });
+    }
+    expect(runs.some(run => (run.input as { arguments: string }).arguments.startsWith('BUDGET: EXTEND'))).toBe(true);
+    expect(runs.some(run => (run.input as { arguments: string }).arguments.includes('"observations"'))).toBe(true);
+    expect(runs.map(run => (run.input as { caller?: string }).caller).sort()).toEqual(['rework-budget-judgment', 'rework-budget-shadow']);
+    expect(typeof budget?.data.runId).toBe('string');
+    // Replayable receipt for the cell's «실물» box: GRAPH_CLASSIFY_RECEIPT=1 prints the saved ledgers this production round wrote.
+    if (process.env.GRAPH_CLASSIFY_RECEIPT === '1') {
+      for (const run of runs) {
+        const saved = JSON.parse(readFileSync(run.statePath, 'utf8'));
+        console.log(`[receipt] ${JSON.stringify({ runId: saved.runId, status: saved.status, path: saved.path, caller: saved.input.caller,
+          input: saved.input.arguments, classes: saved.input.classify.classes, classifyNode: JSON.parse(saved.nodes[0].output) })}`);
+      }
+      console.log(`[receipt] ${JSON.stringify({ ledger: 'rework-budget', verdict: budget?.data.verdict })}`);
+      console.log(`[receipt] ${JSON.stringify({ ledger: 'rework-budget-fabric-shadow', legacyVerdict: fabric?.data.legacyVerdict,
+        fabricPicked: fabric?.data.fabricPicked, agree: fabric?.data.agree })}`);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+  }
+}, 20_000);
+
+test('graph classify wraps workflow retries, unknown and failures without changing the result', async () => withIsolatedClassifyState(async (root) => {
+  const node = { id: 'classify', classify: { input: '$ARGUMENTS', classes: ['EXTEND'], retries: 1, retryDelayMs: 0 } };
+  const ctx = { arguments: 'evidence', artifactsDir: '', outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {} };
+  let attempts = 0;
+  const resolved = await runGraphClassifyNode(node, ctx, async () => ++attempts === 1 ? 'not sure' : 'EXTEND');
+  expect(resolved).toMatchObject({ ok: true, output: 'EXTEND' });
+  expect(attempts).toBe(2);
+  const unknown = await runGraphClassifyNode(node, ctx, async () => 'not sure');
+  expect(unknown).toMatchObject({ ok: true, output: 'unknown' });
+  const failed = await runGraphClassifyNode(node, ctx, async () => { throw new Error('offline'); });
+  expect(failed).toMatchObject({ ok: false, output: 'unknown', error: 'offline' });
+  const ledger = latestGraphRun('self-implement-classify', root);
+  expect(JSON.parse(ledger!.nodes[0]!.output as string)).toMatchObject({ input: 'evidence', verdict: 'unknown', output: 'unknown', error: 'offline' });
+  expect(ledger?.path).toEqual(['classify', 'failed']);
+}));
+
+test('graph classify node keeps dry runs off the LLM and records the real verdict', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-classify-dry-'));
+  dirs.push(root);
+  const graph = join(root, 'classify.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), '{}\n');
+  writeFileSync(graph, ['graph_id: classify-dry', 'version: 1', 'entry_node: classify', 'terminal_nodes: [done, failed]', 'nodes:',
+    '  - { node_id: classify, kind: classify, recipe: none, max_visits: 1 }',
+    '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }',
+    'edges:', '  - { from: classify, on: outcome, map: { ok: done, fail: failed } }', ''].join('\n'));
+  const input = { arguments: 'evidence', classify: { input: '$ARGUMENTS', classes: ['EXTEND'] } };
+  let calls = 0;
+  const callLLM = async () => { calls++; return 'EXTEND'; };
+  const dry = await runGraph(graph, { input, dryRun: true, deps: { root, callLLM } });
+  expect(calls).toBe(0);
+  expect(dry.nodes[0]).toMatchObject({ nodeId: 'classify', executed: false });
+  expect(dry.nodes[0]?.output).toBeUndefined();
+  const real = await runGraph(graph, { input, deps: { root, callLLM } });
+  expect(calls).toBe(1);
+  expect(real).toMatchObject({ status: 'done', path: ['classify', 'done'] });
+  expect(JSON.parse(real.nodes[0]!.output as string)).toMatchObject({ verdict: 'EXTEND', ok: true });
+});
 
 test('unit resolver discovers verb units in nested graphs/units/verbs', () => {
   const unit = resolveUnit('verb-make-doc@1', join(process.cwd(), 'graphs/work/research-report.yaml'));
@@ -1137,6 +1279,28 @@ test('loop graph still rejects undeclared terminal names before running', async 
       expect(executed).toBe(0);
     }
   }
+});
+
+test('harness loop template without recipes sidecar is planned by dry run and refused for a real run', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-runner-loop-plan-'));
+  dirs.push(root);
+  const graph = join(root, 'research-loop.yaml');
+  // No recipes.yaml beside it: the recipes are harness labels, and `changed-files` has no runner condition.
+  writeFileSync(graph, `graph_id: research-loop\nversion: 1\nentry_node: work\nterminal_nodes: [landed, needs-human]\nnodes:\n  - { node_id: work, kind: agent, recipe: headless-goal-loop, max_visits: 1 }\n  - { node_id: gate, kind: gate, recipe: gate-baseline, max_visits: 1 }\n  - { node_id: merge, kind: git, recipe: seams-gh-merge-squash, max_visits: 1 }\n  - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: work, on: changed-files, map: { code-changed: gate, documents-only: merge } }\n  - { from: gate, on: outcome, map: { pass: merge, fail: needs-human } }\n  - { from: merge, on: outcome, map: { ok: needs-human, merged: landed, fail: needs-human } }\n`);
+  let executed = 0;
+  const runBash = async () => { executed++; return { stdout: '', stderr: '', exitCode: 0 }; };
+  await expect(runGraph(graph, { deps: { root, runBash } })).rejects.toThrow('graph run only plans it with --dry-run');
+  const planned = await runGraph(graph, { dryRun: true, deps: { root, runBash } });
+  expect(planned.status).toBe('done');
+  expect(planned.reason).toBe('landed');
+  expect(planned.path).toEqual(['work', 'merge', 'landed']);
+  expect(planned.executed).toBe(0);
+  expect(executed).toBe(0);
+  expect(planned.nodes.map(node => node.output === undefined ? undefined : JSON.parse(String(node.output)).outcome)).toEqual(['documents-only', 'merged', undefined]);
+  // A loop whose declared edges never reach a success terminal fails before walking.
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace('merged: landed', 'merged: needs-human'));
+  await expect(runGraph(graph, { dryRun: true, deps: { root, runBash } })).rejects.toThrow('has no declared route from work to a success terminal');
+  expect(executed).toBe(0);
 });
 
 test('ops recipes register a human-readable publication approval', () => {

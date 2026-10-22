@@ -17,9 +17,10 @@ import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.j
 import { podBunCacheVolume } from './pod-bun-cache.js';
 import { POD_JOB_TTL_AFTER_FINISHED_SECONDS } from './pod-lease.js';
 import { podHostDirsCheckScript, podInstallSlotsVolume, prepareHostDirsOnce, type HostDirsPrepResult, podHostDirsScript } from './pod-install-slots.js';
-import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
+import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, registryImageRef, type PoolKubectl } from './pod-pool.js';
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
+import { podProvenanceMetadata, type PodProvenance } from './pod-provenance.js';
 import { seedMirrorOnce, type MirrorSeedResult } from './pod-mirror-seed.js';
 import {
   POD_CHILD_REQUESTS,
@@ -201,6 +202,8 @@ if [ -d "$HOME/outbox" ]; then
 fi`;
 
 export interface PodCommandJobInput {
+  provenance?: Partial<PodProvenance>;
+  provenanceGate?: boolean;
   /** POD1 — this launch's own label; cleanup selects by it, never by name alone. */
   launch?: string;
   name: string;
@@ -236,8 +239,21 @@ function bashSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function assertGateProvenanceException(gate: boolean | undefined, provenance: Partial<PodProvenance> | undefined,
+  clone: boolean | undefined, source: PodSource | undefined): void {
+  if (!gate) return;
+  const shardEntrance = process.env.ELANOUS_RELEASE_ENTRANCE?.trim() || 'release-run';
+  const shard = provenance?.kind === 'gate-shard' && provenance.entrance === shardEntrance;
+  const recheck = provenance?.kind === 'gate-recheck' && provenance.entrance === 'release-recheck';
+  if (!(shard || recheck) || clone !== true || source?.kind !== 'commit') {
+    throw new Error('pod provenance gate exception requires a release shard/recheck commit Job');
+  }
+}
+
 /** 명령 Job 매니페스트. `skills`·`llm` 을 안 주면 Secret 키를 하나도 참조하지 않는다. */
 export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unknown> {
+  assertGateProvenanceException(o.provenanceGate, o.provenance, o.clone, o.source);
+  const provenance = podProvenanceMetadata(o.provenance, o.provenanceGate);
   const skillNames = [...new Set(o.skills.map((s) => s.trim()).filter(Boolean))];
   for (const name of skillNames) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(name)) throw new Error(`pod command skill name rejected: ${name}`);
@@ -284,13 +300,13 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
   return {
     apiVersion: 'batch/v1',
     kind: 'Job',
-    metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, 'elanous.kind': 'command', ...(o.launch ? { 'elanous.launch': o.launch } : {}) } },
+    metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, 'elanous.kind': 'command', ...(o.launch ? { 'elanous.launch': o.launch } : {}), ...provenance?.labels }, ...(provenance ? { annotations: provenance.annotations } : {}) },
     spec: {
       backoffLimit: 0,
       ttlSecondsAfterFinished: POD_JOB_TTL_AFTER_FINISHED_SECONDS,
       activeDeadlineSeconds: o.deadlineSeconds,
       template: {
-        metadata: { labels: { 'elanous.job': o.name, 'elanous.kind': 'command', ...(o.launch ? { 'elanous.launch': o.launch } : {}) } },
+        metadata: { labels: { 'elanous.job': o.name, 'elanous.kind': 'command', ...(o.launch ? { 'elanous.launch': o.launch } : {}), ...provenance?.labels }, ...(provenance ? { annotations: provenance.annotations } : {}) },
         spec: {
           restartPolicy: 'Never',
           securityContext: { runAsUser: 1000, fsGroup: 1000 },
@@ -306,6 +322,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
               { name: 'ELANOUS_SUBSTRATE', value: 'pod' },
               { name: 'ELANOUS_POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
+              ...(provenance?.env ?? []),
               ...(tmpfs ? [{ name: 'TMPDIR', value: POD_TMPFS_MOUNT_PATH }] : []),
             ],
             ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs ? { volumeMounts: [
@@ -382,6 +399,9 @@ export interface PodCommandResult {
 }
 
 export interface RunPodCommandOptions {
+  provenance?: Partial<PodProvenance>;
+  /** Release gate keeps availability: missing required identity becomes unknown and emits a warning. */
+  provenanceGate?: boolean;
   command: readonly string[];
   /** pod run opt-in; other runPodCommand callers keep their existing Job script. */
   returnLogs?: boolean;
@@ -434,6 +454,9 @@ export interface RunPodCommandOptions {
   checkPool?: typeof checkPodPool;
   syncImages?: typeof syncPoolImages;
   imageCommit?: string | null;
+  /** Shelf: require this exact registry tag; never fall back to a mutable local image. */
+  shelfImage?: string;
+  shelfLookup?: typeof registryImageRef;
   readSkillEnv?: (skills: readonly string[]) => Record<string, string>;
   grokCredentials?: () => { grokAuth?: string; grokApiKey?: string; ghToken: string };
   artifactsRoot?: string;
@@ -510,6 +533,9 @@ function awaitPodCommandAbort<T>(pending: Promise<T>, signal?: AbortSignal): Pro
 
 /** 풀 자리 · 이미지 판 · Job 적용 · 완료 대기 · 산출 회수 · Secret 정리. */
 export async function runPodCommand(options: RunPodCommandOptions): Promise<PodCommandResult> {
+  // A non-gate Job must have its owner before a pool lease, Secret, or Job is created.
+  assertGateProvenanceException(options.provenanceGate, options.provenance, options.clone, options.source);
+  const provenance = podProvenanceMetadata(options.provenance, options.provenanceGate);
   const nowMs = options.nowMs ?? Date.now;
   const ensureLive = () => {
     if (options.signal?.aborted) throw options.signal.reason ?? new Error('pod command aborted');
@@ -521,11 +547,15 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const skills = [...new Set((options.skills ?? []).map((s) => s.trim()).filter(Boolean))];
   const llm = options.llm;
   const log = options.log ?? ((c, e, d) => debug.log(c, e, d));
+  if (provenance.missing.length) log('pod.provenance', 'missing-gate-fields', { missing: provenance.missing });
   const baseKubectl = options.kubectl ?? ((args: readonly string[], input?: string) =>
     defaultKubectl(args, input, options.signal ? POD_COMMAND_CANCEL_KUBECTL_TIMEOUT_MS : undefined));
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const namespace = options.namespace ?? 'elanous-test';
   const image = options.image ?? podCommandImageFor(skills, options.clone === true, options.lite === true);
+  if (options.shelfImage && (options.image !== options.shelfImage || !options.imageCommit || !options.clone || options.source?.kind !== 'commit' || options.source.sha !== options.imageCommit)) {
+    throw new Error('pod shelf: image and source commit must match');
+  }
   const memoryLimit = options.memoryLimit ?? (image === POD_LITE_IMAGE ? POD_LITE_MEMORY_LIMIT : undefined);
   const repoUrl = options.repoUrl ?? 'https://github.com/ElanvitalAI/elanous';
   const deadlineSeconds = options.deadlineSeconds ?? POD_COMMAND_DEADLINE_SECONDS;
@@ -579,6 +609,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     if (member && pool) pool.release(member);
     ensureLive();
   }
+  if (options.shelfImage && !member) throw new Error('pod shelf: remote pool member required');
   const currentContext = member || options.kubectl ? null : baseKubectl(['config', 'current-context']);
   const context = member?.context ?? (currentContext?.status === 0 ? currentContext.stdout.trim() : '');
   const kubectlRaw: Kubectl = (args, stdin) => baseKubectl(context ? ['--context', context, ...args] : [...args], stdin);
@@ -617,10 +648,16 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       const localSkillsDigest = options.kubectl ? null : image === POD_LITE_IMAGE
         ? podSkillsDigest(POD_NETWORK_SKILLS, resolve(import.meta.dir, '../../../skills')).digest
         : podSkillsDigest(resolvePodSkills(env).skills).digest;
-      const syncs = await awaitPodCommandAbort((options.syncImages ?? syncPoolImages)([member], image, imageCommit, { localSkillsDigest }), options.signal);
-      const synced = syncs.get(member.context);
-      if (synced && !synced.ok) throw new Error(`pod command: 이미지 판을 못 맞췄다: ${synced.detail}`);
-      if (synced?.imageRef) member = { ...member, imageRef: synced.imageRef };
+      if (options.shelfImage) {
+        const found = (options.shelfLookup ?? registryImageRef)(member, imageCommit);
+        if (found !== options.shelfImage) throw new Error(`pod shelf: selected image unavailable on ${member.context}`);
+        member = { ...member, imageRef: found };
+      } else {
+        const syncs = await awaitPodCommandAbort((options.syncImages ?? syncPoolImages)([member], image, imageCommit, { localSkillsDigest }), options.signal);
+        const synced = syncs.get(member.context);
+        if (synced && !synced.ok) throw new Error(`pod command: 이미지 판을 못 맞췄다: ${synced.detail}`);
+        if (synced?.imageRef) member = { ...member, imageRef: synced.imageRef };
+      }
     }
     const imageRef = member?.imageRef;
     if (!imageRef) log('pod.command-job', 'image-fallback-local', { reason: !member ? 'no-pool-member' : !imageCommit ? 'image-commit-unavailable' : 'registry-tag-unavailable' });
@@ -661,6 +698,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     }
     const manifest = podCommandJobManifest({
       name, namespace, launch, image: imageRef ?? image,
+      provenance: options.provenance, provenanceGate: options.provenanceGate,
       ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(options.returnLogs ? { returnLogs: true } : {}), ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
       ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), ...(options.tmpfsSizeLimit ? { tmpfsSizeLimit: options.tmpfsSizeLimit } : {}), deadlineSeconds,

@@ -689,7 +689,7 @@ const SESSION_RUNTIME_TOOL_FAMILY_RULES: SessionRuntimeToolFamilyRule[] = [
   {
     id: 'ops-ledger',
     description: 'In-process seat messages and release checklist operations.',
-    names: ['msg_list', 'msg_post', 'msg_ack', 'checklist_list', 'checklist_add', 'checklist_set', 'checklist_edit', 'checklist_move'],
+    names: ['msg_list', 'msg_post', 'msg_ask', 'msg_ack', 'checklist_list', 'checklist_add', 'checklist_set', 'checklist_edit', 'checklist_move'],
     match: () => false,
   },
   {

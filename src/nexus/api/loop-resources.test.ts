@@ -27,6 +27,17 @@ test('production observation returns pending MK work with no running processes a
   });
 });
 
+test('a blank waiting cell id is served as no cell, so the API and the PWA screen cannot name different cells', async () => {
+  const unnamed = trafficTick({ now, caps: { OP: 2, TC: 4, MK: 6, UX: 2 }, totalSlots: 14,
+    processes: [{ seat: 'MK', elapsedSeconds: 2400, command: 'bun bin/elanous.mjs harness ask goal' }],
+    openCells: [{ owner: 'MK', status: 'yellow', id: '   ', title: 'unnamed work' }], nextRound: [] });
+  expect(unnamed.seats.find(row => row.seat === 'MK')?.nextCell?.id).toBe('   ');
+  const response = handleLoopResourcesGet(() => unnamed, () => []);
+  expect(response.status).toBe(200);
+  const body = await response.json() as { resource: { seats: Array<{ seat: string; nextCell: { id: string } | null }> } };
+  expect(body.resource.seats.find(row => row.seat === 'MK')?.nextCell).toBeNull();
+});
+
 test('resource GET returns the actual traffic decision without writing a new ledger shape', async () => {
   const response = handleLoopResourcesGet(() => result, () => []);
   expect(response.status).toBe(200);

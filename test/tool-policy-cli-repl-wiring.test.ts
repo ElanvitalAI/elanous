@@ -42,7 +42,8 @@ describe('Archon-port T1.2 — CLI + REPL apply chat.toolDeny', () => {
     // must precede the call site.
     // ⛔ 포맷에 «안 기댄다» — 직접 호출이든 주입 이음매든(`(opts.runTurn ?? runTurn)`) 문다.
     const hookIdx = src.indexOf('applyToolPolicy');
-    const runTurnIdx = src.search(/await\s*\(?\s*(?:opts\.runTurn\s*\?\?\s*)?runTurn\)?\(\{/);
+    // 📏 10-22: #29822 가 시험 이음매(`cliRunTurnForTesting ??`)를 하나 더 끼웠다 — 이음매가 몇 겹이든 마지막이 runTurn 인 호출 자리를 문다.
+    const runTurnIdx = src.search(/await\s*\(?\s*(?:[\w.]+\s*\?\?\s*)*runTurn\)?\(\{/);
     expect(hookIdx).toBeGreaterThan(0);
     expect(runTurnIdx).toBeGreaterThan(hookIdx);
     // ⛔⭐⭐ 진짜 계약 — ***거른 값이 «실제로 넘어가나».***

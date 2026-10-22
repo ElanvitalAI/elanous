@@ -198,28 +198,33 @@ export const SURVIVAL_VALUE_FLAGS = ['--survival-keep', '--survival-keep-daily',
 
 /** Throw when a survival-keep / prune-survival flag is present without its value/target — same rule as `${flag} requires a value`. */
 export function assertSurvivalKeepArgs(argv: string[]): void {
-  for (const flag of SURVIVAL_VALUE_FLAGS) {
-    for (let i = 0; i < argv.length; i += 1) {
-      const token = argv[i];
-      if (token.startsWith(`${flag}=`)) {
-        if (token === `${flag}=`) throw new Error(`${flag} requires a value`);
-        continue;
-      }
-      if (token !== flag) continue;
-      const value = argv[i + 1];
-      if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    const equalsAt = token.indexOf('=');
+    const flag = equalsAt < 0 ? token : token.slice(0, equalsAt);
+    if (!SURVIVAL_VALUE_FLAGS.some(candidate => candidate === flag)) continue;
+    if (equalsAt >= 0) {
+      if (token.slice(equalsAt + 1).length === 0) throw new Error(`${flag} requires a value`);
+      continue;
     }
+    const value = argv[i + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
   }
 }
 
-if (import.meta.main) {
-  const argv = process.argv.slice(2);
+function preflightStandbySnapshotArgs(argv: string[]): void {
+  // Preflight survival argument values before tier selection, staging, or snapshot work.
   try {
     assertSurvivalKeepArgs(argv);
   } catch (error) {
     console.error(`standby-snapshot: ${String(error)}`);
     process.exit(2);
   }
+}
+
+if (import.meta.main) {
+  const argv = process.argv.slice(2);
+  preflightStandbySnapshotArgs(argv);
   const val = (k: string) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : undefined; };
   const tier = (val('--tier') ?? 'core') as Tier;
   if (tier !== 'core' && tier !== 'big' && tier !== 'obs') { console.error('--tier core|big|obs'); process.exit(2); }

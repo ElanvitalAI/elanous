@@ -1320,4 +1320,186 @@ describe('Pod terminal residue', () => {
       rmSync(binDir, { recursive: true, force: true });
     }
   });
+
+  test('RUN-STOP-RELEASES-RUNNING-LABEL: one terminal record removes the running state label once with a ledger effect', async () => {
+    const current = pr(200, 'self-impl/new-goalid-def456-run', '칸: CELL-A', ['elanous:running'], '2026-10-09T00:00:00Z');
+    const f = fixture(current, []);
+    f.adapters.getPr = (number) => number === 200 ? current : undefined;
+    f.adapters.listOpenDrafts = () => [];
+    f.adapters.removeLabel = (_repo, number, label) => {
+      f.calls.push(`remove:${number}:${label}`);
+      current.labels = current.labels.filter((name) => name !== label);
+    };
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: 'draft-residue-running-release-test', emit: (row) => {
+      if (row.category === 'draft.residue') events.push({ event: row.event, data: row.data as Record<string, unknown> });
+    } });
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
+      expect(f.calls.filter((call) => call.startsWith('remove:'))).toEqual(['remove:200:elanous:running']);
+      expect(current.labels).not.toContain('elanous:running');
+      expect(loadRunLedger(runId, f.dir)?.some((row) => row.event === 'pr-terminal-effect'
+        && row.data.effect === 'running-label-released' && row.data.number === 200)).toBe(true);
+      expect(events.some((row) => row.event === 'running-label-released' && row.data.prNumber === 200)).toBe(true);
+      expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'skipped', reason: 'already-recorded' });
+      expect(f.calls.filter((call) => call.startsWith('remove:'))).toHaveLength(1);
+    } finally { off(); f.cleanup(); }
+  });
+
+  test('a failed running-label release observes label-release-failed and still completes the terminal record', async () => {
+    const current = pr(200, 'self-impl/new-goalid-def456-run', '칸: CELL-A', ['elanous:running'], '2026-10-09T00:00:00Z');
+    const f = fixture(current, []);
+    f.adapters.getPr = (number) => number === 200 ? current : undefined;
+    f.adapters.listOpenDrafts = () => [];
+    f.adapters.removeLabel = (_repo, number, label) => {
+      f.calls.push(`remove:${number}:${label}`);
+      throw new Error('transient label removal failure');
+    };
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: 'draft-residue-running-release-fail-test', emit: (row) => {
+      if (row.category === 'draft.residue') events.push({ event: row.event, data: row.data as Record<string, unknown> });
+    } });
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
+      expect(f.calls.filter((call) => call === 'remove:200:elanous:running')).toHaveLength(1);
+      expect(events.some((row) => row.event === 'label-release-failed'
+        && String(row.data.reason).includes('transient label removal failure'))).toBe(true);
+      expect(current.labels).toContain('elanous:running');
+      expect(loadRunLedger(runId, f.dir)?.some((row) => row.event === 'pr-terminal-effect'
+        && row.data.effect === 'running-label-released' && row.data.number === 200)).toBe(false);
+      expect(loadRunLedger(runId, f.dir)?.some((row) => row.event === 'pr-terminal')).toBe(true);
+      // The failure reason reaches the ledger too (not only debug.log) — the terminal record still completes.
+      expect(loadRunLedger(runId, f.dir)?.some((row) => row.event === 'pr-terminal-effect'
+        && row.data.effect === 'label-release-failed' && row.data.number === 200
+        && String(row.data.reason).includes('transient label removal failure'))).toBe(true);
+      expect(loadRunLedger(runId, f.dir)?.some((row) => row.event === 'pr-terminal-effect'
+        && row.data.effect === 'complete' && row.data.number === 200)).toBe(true);
+    } finally { off(); f.cleanup(); }
+  });
+
+  test('a ledger failure after a successful release is retryable — never mislabeled label-release-failed, effect recorded on replay', async () => {
+    const current = pr(200, 'self-impl/new-goalid-def456-run', '칸: CELL-A', ['elanous:running'], '2026-10-09T00:00:00Z');
+    const f = fixture(current, []);
+    f.adapters.getPr = (number) => number === 200 ? { ...current, labels: [...current.labels] } : undefined;
+    f.adapters.listOpenDrafts = () => [];
+    f.adapters.removeLabel = (_repo, number, label) => {
+      f.calls.push(`remove:${number}:${label}`);
+      current.labels = current.labels.filter((name) => name !== label);
+    };
+    let failOnce = true;
+    f.adapters.appendLedger = (entry, dir) => {
+      if (failOnce && entry.data.effect === 'running-label-released') { failOnce = false; throw new Error('ledger disk full'); }
+      appendRunLedgerEntry(entry, dir);
+    };
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: 'draft-residue-running-release-ledger-fail-test', emit: (row) => {
+      if (row.category === 'draft.residue') events.push({ event: row.event, data: row.data as Record<string, unknown> });
+    } });
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'failed', step: 'ledger' });
+      expect(events.some((row) => row.event === 'label-release-failed')).toBe(false);
+      const effects = () => (loadRunLedger(runId, f.dir) ?? []).filter((row) => row.event === 'pr-terminal-effect').map((row) => row.data.effect);
+      expect(effects()).not.toContain('label-release-failed');
+      expect(effects()).not.toContain('complete');
+      // Replay: the label is already gone on GitHub, yet the release fact is still recorded exactly once.
+      expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
+      expect(f.calls.filter((call) => call.startsWith('remove:'))).toEqual(['remove:200:elanous:running']);
+      expect(effects().filter((effect) => effect === 'running-label-released')).toHaveLength(1);
+      expect(effects()).toContain('complete');
+    } finally { off(); f.cleanup(); }
+  });
+
+  test('a ledger failure while recording label-release-failed is retryable — the reason is never silently dropped (review r2)', async () => {
+    const current = pr(200, 'self-impl/new-goalid-def456-run', '칸: CELL-A', ['elanous:running'], '2026-10-09T00:00:00Z');
+    const f = fixture(current, []);
+    f.adapters.getPr = (number) => number === 200 ? current : undefined;
+    f.adapters.listOpenDrafts = () => [];
+    f.adapters.removeLabel = () => { throw new Error('transient label removal failure'); };
+    let failOnce = true;
+    f.adapters.appendLedger = (entry, dir) => {
+      if (failOnce && entry.data.effect === 'label-release-failed') { failOnce = false; throw new Error('ledger disk full'); }
+      appendRunLedgerEntry(entry, dir);
+    };
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    const effects = () => (loadRunLedger(runId, f.dir) ?? []).filter((row) => row.event === 'pr-terminal-effect');
+    try {
+      expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'failed', step: 'ledger' });
+      expect(effects().some((row) => row.data.effect === 'complete')).toBe(false);
+      expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
+      expect(effects().some((row) => row.data.effect === 'label-release-failed'
+        && String(row.data.reason).includes('transient label removal failure'))).toBe(true);
+      expect(effects().some((row) => row.data.effect === 'complete' && row.data.number === 200)).toBe(true);
+    } finally { f.cleanup(); }
+  });
+
+  test('RUN-STOP-RELEASES-RUNNING-LABEL L2: production defaultAdapters releases elanous:running through gh exactly once (fake gh)', async () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'draft-residue-gh-release-'));
+    const callLog = join(binDir, 'calls.jsonl');
+    const labelState = join(binDir, 'labels.json');
+    writeFileSync(labelState, JSON.stringify(['elanous:running', 'elanous:stalled']));
+    writeFileSync(join(binDir, 'gh'), [
+      `#!${process.execPath}`,
+      `const fs = require('node:fs');`,
+      `const args = process.argv.slice(2);`,
+      `fs.appendFileSync(${JSON.stringify(callLog)}, JSON.stringify(args) + '\\n');`,
+      `// Stateful remote: pr edit --add-label/--remove-label mutate the PR's labels.`,
+      `let labels = JSON.parse(fs.readFileSync(${JSON.stringify(labelState)}, 'utf8'));`,
+      `if (args[0] === 'pr' && args[1] === 'edit') {`,
+      `  for (let i = 0; i < args.length; i++) {`,
+      `    if (args[i] === '--remove-label') labels = labels.filter((name) => name !== args[i + 1]);`,
+      `    if (args[i] === '--add-label' && !labels.includes(args[i + 1])) labels.push(args[i + 1]);`,
+      `  }`,
+      `  fs.writeFileSync(${JSON.stringify(labelState)}, JSON.stringify(labels));`,
+      `}`,
+      `if (args[0] === 'pr' && args[1] === 'view') process.stdout.write(JSON.stringify({ number: 200, title: 'Goal 200',`,
+      `  headRefName: 'self-impl/new-goalid-def456-run', headRefOid: '${'a'.repeat(40)}', isDraft: true, createdAt: '2026-10-09T00:00:00Z',`,
+      `  body: '칸: CELL-A', labels: labels.map((name) => ({ name })), comments: [], state: 'OPEN' }));`,
+      `else if (args[0] === 'api' && args.includes('--slurp')) process.stdout.write('[[]]');`,
+      `else if (args[0] === 'api') process.stdout.write('[]');`,
+    ].join('\n'));
+    chmodSync(join(binDir, 'gh'), 0o755);
+    const dir = mkdtempSync(join(tmpdir(), 'draft-residue-release-ledger-'));
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: 'draft-residue-running-release-l2', emit: (row) => {
+      if (row.category === 'draft.residue') events.push({ event: row.event, data: row.data as Record<string, unknown> });
+    } });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}${previousPath ? `:${previousPath}` : ''}`;
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
+      stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
+    try {
+      // Production adapters (real gh argv), only the git-worktree / run-status probes are pinned.
+      const adapters: DraftResidueAdapters = { ...defaultAdapters(), listLiveBranches: () => new Set<string>(), getRunStatus: () => 'failed' };
+      expect(await applyPodTerminal(record, { ledgerRunId: runId, ledgerDir: dir, adapters })).toEqual({ status: 'recorded' });
+      const calls = readFileSync(callLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string[]);
+      const removals = calls.filter((args) => args.includes('--remove-label'));
+      // Only the running state label is released; the other state label (stalled) is never touched.
+      expect(removals).toEqual([['pr', 'edit', '200', '-R', 'ElanvitalAI/elanous', '--remove-label', 'elanous:running']]);
+      expect(calls.some((args) => args.includes('elanous:stalled'))).toBe(false);
+      // Remote state after the terminal record: running gone, the other state label kept.
+      const remoteLabels = JSON.parse(readFileSync(labelState, 'utf8')) as string[];
+      expect(remoteLabels).not.toContain('elanous:running');
+      expect(remoteLabels).toContain('elanous:stalled');
+      const ledgerFile = readdirSync(dir, { recursive: true }).map(String).find((name) => name.endsWith(`${runId}.jsonl`));
+      const ledgerLine = readFileSync(join(dir, ledgerFile!), 'utf8').split('\n').find((line) => line.includes('running-label-released'));
+      expect(ledgerLine).toBeDefined();
+      expect(JSON.parse(ledgerLine!)).toMatchObject({ event: 'pr-terminal-effect', data: { effect: 'running-label-released', number: 200 } });
+      expect(events.filter((row) => row.event === 'running-label-released' && row.data.prNumber === 200)).toHaveLength(1);
+      expect(events.some((row) => row.event === 'label-release-failed')).toBe(false);
+      console.log(`[L2] gh remove-label call: ${JSON.stringify(removals[0])}`);
+      console.log(`[L2] ledger line: ${ledgerLine}`);
+    } finally {
+      off();
+      process.env.PATH = previousPath;
+      rmSync(binDir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

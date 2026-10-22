@@ -33,4 +33,6 @@ src/tui/
 
 ## 현황 (M2 착수)
 - ✅ `tui/chat/execution-badge.ts` — 실행모델 뱃지 리졸버 (dashboard/ 에서 이전, shim 유지)
+- ✅ `tui/entry.ts` · `tui/chat/log-view.ts` · `tui/input/composer.ts` — `elanous --tui next` 로 여는 로컬 대화 화면. 공용 inline editor 로 입력·전송하고 공용 REPL 턴 경로를 JSONL stdin 자식으로 호출한다. `--tui classic` 과 기본 진입은 기존 dashboard 를 사용한다.
+- ✅ `tui/size-contract.test.ts` — 이 디렉토리 TypeScript 파일의 4,000줄 상한을 검사한다.
 - ⬜ render · input · rich/* — 후속 슬라이스

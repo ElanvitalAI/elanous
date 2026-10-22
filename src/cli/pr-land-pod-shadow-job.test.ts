@@ -70,12 +70,16 @@ test('PRLAND-SHADOW-HOST-TIMEOUT: landing resumes after real runner deletes Job 
   const result = await runHeavyOnPodShadow({ enabled: true, pr: 77, head, local,
     runPod: () => runLandingPodShadowJob({ head, main }, {
       armTimeout: (fire) => { fireTimeout = fire; return () => {}; },
-      runPod: (options) => runPodCommand({ ...options, name: 'shadow-integration', poolScheduler: pool,
+      runPod: (options) => {
+        expect(options.provenance).toMatchObject({ actorKind: 'loop', actor: 'pr-land-shadow',
+          kind: 'land-shadow', run: head, phase: 'land-shadow', entrance: 'pr-land', commit: head });
+        return runPodCommand({ ...options, name: 'shadow-integration', poolScheduler: pool,
         kubectl: (args) => { commands.push([...args]); return { status: 0, stdout: '', stderr: '' }; },
         syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
         sleep: async () => { fireTimeout!(); }, ghToken: () => 'test-token', imageCommit: null,
         env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-shadow-integration', log: () => {},
-      }),
+        });
+      },
     }),
     log: () => {}, warn: (message) => warnings.push(message),
   });

@@ -7,12 +7,13 @@ import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
-import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { CardStore } from '../../src/task-cards/card-store.js';
 import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-node.js';
 import { isCredentialKey } from '../lib/deterministic-env.js';
 import { appendLedger, costTable, judge, lastLedgerLine, ledgerPath, mainFailureFiles, nightlyAuditLedgerPath, pickRange, propose, td1Dispositions, writeCardDraft, writeMainFailureDay, type LedgerLine, type MainFailureResult, type Measurement, type Td1Disposition } from './lib.js';
 import { fixedCountAssertions, flakeVerdict, sweepSlice, unreachableImports, type Mutation, type TestRun } from './effectiveness.js';
+import { gateHistory, type GateHistoryRow } from '../release-loop/gate-history.js';
 
 type Context = { graphId?: string; input: Record<string, unknown>; outputs: Record<string, Record<string, unknown> | null> };
 function context(): Context {
@@ -27,6 +28,129 @@ function emit(result: Record<string, unknown> & { outcome: 'ok' | 'fail' | 'erro
 }
 const git = (args: string[]) => spawnSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).stdout ?? '';
 
+/**
+ * GATE-FAIL-HISTORY → per-file failure likelihood (boundary ①): a file the landed gate already failed on is picked
+ * before one it never failed on, and preexisting/knownEnv repeat offenders outrank one-off introduced/load-flaky hits.
+ */
+const GATE_FAIL_WEIGHT = { preexisting: 4, knownEnv: 3, flaky: 3, introduced: 2 } as const;
+
+/** Only the buckets the pick order and the prescription both read — no write-only fields. */
+export type GateFailWeight = { file: string; weight: number; preexisting: number; knownEnv: number; flaky: number };
+
+export function gateFailWeights(rows: readonly GateHistoryRow[]): Map<string, GateFailWeight> {
+  const weights = new Map<string, GateFailWeight>();
+  for (const row of rows) {
+    const weight = row.preexisting * GATE_FAIL_WEIGHT.preexisting + row.env * GATE_FAIL_WEIGHT.knownEnv
+      + row.flaky * GATE_FAIL_WEIGHT.flaky + row.introduced * GATE_FAIL_WEIGHT.introduced;
+    if (weight <= 0) continue;
+    const file = String(row.file);
+    weights.set(file, { file, weight, preexisting: row.preexisting, knownEnv: row.env, flaky: row.flaky });
+  }
+  return weights;
+}
+
+/** Reads the gate's own failure ledger; an unreadable ledger is an empty history, never a failed pick. */
+export function loadGateFailWeights(deps: {
+  instanceRoots?: readonly string[]; ledgerRoots?: readonly string[]; rows?: readonly GateHistoryRow[];
+} = {}): Map<string, GateFailWeight> {
+  if (deps.rows) return gateFailWeights(deps.rows);
+  try {
+    const report = gateHistory({
+      instanceRoots: deps.instanceRoots ?? [effectiveInstanceRoot()],
+      ledgerRoots: deps.ledgerRoots ?? [releaseLedgerRoot()],
+    }, { mergedPrs: () => [] });
+    return gateFailWeights(report.rows);
+  } catch (error) {
+    debug.log('test-diet', 'history-read-failed', { error: String(error) });
+    return new Map();
+  }
+}
+
+/**
+ * `pickRange` with the history-weighted order on top: every gate-failed file that fits the budget comes first
+ * (weight desc, then cheaper), the cursor slice fills the rest. Cursor `next` only advances past cursor files the
+ * budget actually selected — an unselected cursor file stays before `next`, so no file is skipped in a daily verdict
+ * or a sweep.
+ */
+export function pickWithHistory(files: readonly string[], start: number, costs: ReadonlyMap<string, number>, budgetSecs: number,
+  weights: ReadonlyMap<string, GateFailWeight>): ReturnType<typeof pickRange> & {
+    historyFiles: GateFailWeight[]; selectedIndices: number[]; rangeLabel: string; cursorVisitedCount: number;
+  } {
+  const range = pickRange(files, start, costs, budgetSecs);
+  const cost = (file: string) => costs.get(file) ?? 10;
+  const historyFiles = [...weights.values()].filter((entry) => files.includes(entry.file))
+    .sort((a, b) => b.weight - a.weight || cost(a.file) - cost(b.file) || a.file.localeCompare(b.file));
+  const describeSelection = (selectedFiles: string[]) => {
+    const selectedIndices = selectedFiles.map((file) => files.indexOf(file));
+    const contiguous = selectedIndices.length > 0
+      && selectedIndices.every((index, position) => position === 0 || index === selectedIndices[position - 1]! + 1);
+    const rangeLabel = selectedIndices.length === 0 ? '#empty'
+      : contiguous ? `#${selectedIndices[0]}~#${selectedIndices.at(-1)}`
+        : selectedIndices.map((index) => `#${index}`).join(',');
+    return { selectedIndices, rangeLabel };
+  };
+  if (historyFiles.length === 0) return { ...range, historyFiles, cursorVisitedCount: range.files.length, ...describeSelection(range.files) };
+  const ordered: string[] = [];
+  let estimatedSecs = 0;
+  for (const file of [...historyFiles.map((entry) => entry.file), ...range.files]) {
+    if (ordered.includes(file)) continue;
+    const added = cost(file);
+    if (ordered.length > 0 && estimatedSecs + added > budgetSecs) continue;
+    ordered.push(file);
+    estimatedSecs += added;
+  }
+  // 예산을 이력 파일로 채웠을 때: 커서는 실제로 선택한 커서 조각까지만 전진한다.
+  // 선택되지 않은 커서 파일을 next 너머로 건너뛰면 일일 판정·sweep에서 영구 누락된다.
+  const firstUnpicked = range.files.findIndex((file) => !ordered.includes(file));
+  const next = firstUnpicked === -1 ? range.next : (range.start + firstUnpicked) % files.length;
+  return { ...range, files: ordered, estimatedSecs, historyFiles, next,
+    cursorVisitedCount: range.files.filter((file) => ordered.includes(file)).length, ...describeSelection(ordered) };
+}
+
+/** MANUAL-gate-regression-response-recipe §2 T1~T7, plus TA for a verdict that is only a draft for the card. */
+export type CleanseRecipeType = 'T1' | 'T2' | 'T3' | 'T4' | 'T5' | 'T6' | 'T7' | 'TA';
+export type CleanseRecipe = { type: CleanseRecipeType; file: string; action: string; basis: string };
+
+const RECIPE_ACTIONS: Record<CleanseRecipeType, string> = {
+  T1: 'fixture·단언을 새 계약으로 고쳐 쓴다(제품 동작은 그대로)',
+  T2: '제품 회귀 — 제품 동작을 고친다(시험 완화 금지)',
+  T3: '규칙 문면을 규칙 원본과 맞춘다',
+  T4: '시험 문면을 지금 문안으로 맞춘다(프로토콜·기본 동작은 그대로)',
+  T5: '빈 환경 의존을 주입으로 없앤다(credential·경로·도구를 명시 주입)',
+  T6: '간섭을 격리한다(단독 실행·임시 HOME·동시성 낮춤)',
+  T7: '인프라 실패 — 재게이트하고 TA 카드로 사람에게 넘긴다',
+  TA: '결과를 TA 카드로 남긴다(지우기·이동은 사람·주인 확인)',
+};
+
+export type RecipeInput = { file: string; verdict: string; reason?: string; flaky?: boolean; effectiveness?: { flake?: string };
+  history?: { preexisting: number; knownEnv: number; flaky?: number } };
+
+/** Exactly one prescription per verdict — the draft only, never a deletion. */
+export function recipeFor(result: RecipeInput): CleanseRecipe {
+  const reason = (result.reason ?? '').toLowerCase();
+  const flaky = result.flaky === true || result.effectiveness?.flake === 'flaky';
+  const history = result.history;
+  // The gate ledger's flaky bucket is the same «history» the pick weighs, so a repeat-flaky file that measures
+  // keep still gets the isolation prescription (T6) instead of falling through to a bare TA card.
+  const historyFlaky = history?.flaky ?? 0;
+  const type: CleanseRecipeType = result.verdict === 'failing'
+    ? (/enospc|out of memory|cannot allocate|oomkilled|no space|pod .*(restart|terminat)|preempt/.test(reason) ? 'T7'
+      : flaky ? 'T6'
+        : /enoent|eacces|no llm provider|command not found|cannot find module|credential|api key|not found: |git config/.test(reason) ? 'T5'
+          : /timed out|timeout|waitfor|expected text|wording|문면/.test(reason) ? 'T4'
+            : /rules-contract|(^|\/)\.rules\//.test(result.file) ? 'T3'
+              : /typeerror|referenceerror|is not a function|is not defined|syntaxerror/.test(reason) ? 'T2'
+                : 'T1')
+    : history?.knownEnv ? 'T5'
+      : flaky || history?.preexisting || historyFlaky > 0 ? 'T6'
+        : 'TA';
+  const tail = reason.split('\n')[0]?.slice(0, 160) ?? '';
+  const historyBasis = history && (history.preexisting > 0 || history.knownEnv > 0 || historyFlaky > 0)
+    ? ` · gate history preexisting ${history.preexisting} · knownEnv ${history.knownEnv}`
+      + `${historyFlaky > 0 ? ` · flaky ${historyFlaky}` : ''}` : '';
+  return { type, file: result.file, action: RECIPE_ACTIONS[type], basis: `${result.verdict}${tail ? `: ${tail}` : ''}${historyBasis}` };
+}
+
 function pick(ctx: Context, sweep = false): number {
   const files = git(['ls-files', '*.test.ts']).split('\n').filter(Boolean).sort();
   const costs = costTable(readFileSync(join(process.cwd(), 'docs/measurements/td1-whole-gate-mechanical-2026-10-01.tsv'), 'utf8'));
@@ -35,7 +159,7 @@ function pick(ctx: Context, sweep = false): number {
   const totalCostSecs = sweep ? files.reduce((sum, file) => sum + (costs.get(file) ?? 10), 0) : 0;
   // `start` re-looks a slice on purpose; otherwise continue from the ledger cursor.
   const startAt = typeof ctx.input.start === 'number' && ctx.input.start >= 0 ? ctx.input.start : last?.next ?? 0;
-  const continuing = ctx.input.start === undefined && last?.sweepVisited && last.sweepVisited < files.length && last.next === startAt && last.total === files.length;
+  const continuing = ctx.input.start === undefined && typeof last?.sweepVisited === 'number' && last.sweepVisited < files.length && last.next === startAt && last.total === files.length;
   const remaining = continuing ? files.length - last.sweepVisited! : files.length;
   const elapsed = continuing ? last.sweepSlices ?? 0 : 0;
   const slotsLeft = Math.max(1, 28 - elapsed);
@@ -43,8 +167,13 @@ function pick(ctx: Context, sweep = false): number {
     slotsLeft, minBudgetSecs: continuing ? last.budgetSecs : 0 }) : undefined;
   const budgetSecs = sweepPlan?.budgetSecs
     ?? (typeof ctx.input.budgetSecs === 'number' && ctx.input.budgetSecs > 0 ? ctx.input.budgetSecs : 1800);
-  const range = pickRange(files, startAt, costs, budgetSecs);
-  return emit({ outcome: 'ok', summary: `test-diet pick #${range.start}~#${range.end} of ${files.length} (≈${Math.round(range.estimatedSecs)}s)`, ...range, total: files.length, budgetSecs,
+  const measuredLastSlice = new Set((last?.results ?? []).map((result) => result.file));
+  const cursorParked = last?.next === startAt && last.selectedIndices?.every((index) => index !== startAt);
+  // When a prior history-only slice left the cursor parked, force the next slice onto the cursor.
+  // Suppressing only the last history winner allows two weighted files to alternate forever.
+  const availableHistory = cursorParked ? new Map() : new Map([...loadGateFailWeights()].filter(([file]) => !measuredLastSlice.has(file)));
+  const range = pickWithHistory(files, startAt, costs, budgetSecs, availableHistory);
+  return emit({ outcome: 'ok', summary: `test-diet pick ${range.rangeLabel} of ${files.length} (≈${Math.round(range.estimatedSecs)}s)`, ...range, total: files.length, budgetSecs,
     ...(sweep ? { sweep: true, totalCostSecs, slicesNeeded: sweepPlan?.slicesNeeded, sweepElapsed: elapsed } : {}) });
 }
 
@@ -180,6 +309,23 @@ function recordNightlyAudit(ctx: Context): number {
   return emit({ outcome: failing ? 'fail' : 'ok', summary: `nightly audit ${results.length} · failing ${failing}${card ? ' · card draft' : ''}`, failing, ledger: path, ...(card ? { card } : {}) });
 }
 
+/** The pick's own gate-history snapshot — `record` reads the files `pick` actually selected from, never a fresh
+ * ledger query, so the prescription and the ledger line keep the same basis even if the gate ledger changed
+ * between the two graph steps. */
+function pickHistoryFiles(p: Record<string, unknown> | null): GateFailWeight[] {
+  const raw = p?.historyFiles;
+  if (!Array.isArray(raw)) return [];
+  const files: GateFailWeight[] = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const x = entry as GateFailWeight;
+    if (typeof x.file !== 'string' || typeof x.weight !== 'number' || !Number.isFinite(x.weight)
+      || typeof x.preexisting !== 'number' || typeof x.knownEnv !== 'number' || typeof x.flaky !== 'number') continue;
+    files.push({ file: x.file, weight: x.weight, preexisting: x.preexisting, knownEnv: x.knownEnv, flaky: x.flaky });
+  }
+  return files;
+}
+
 export function record(ctx: Context, deps: { createStore?: (root: string) => Pick<CardStore, 'createCard' | 'appendSection' | 'close'>; td1?: ReadonlyMap<string, Td1Disposition> } = {}): number {
   const p = ctx.outputs.pick;
   const m = ctx.outputs.measure;
@@ -188,27 +334,61 @@ export function record(ctx: Context, deps: { createStore?: (root: string) => Pic
   const td1 = deps.td1 ?? td1Dispositions(readFileSync(join(process.cwd(), 'docs/measurements/td1-top200-content-review-2026-10-01.tsv'), 'utf8'));
   const results = measurements.map((x) => propose(judge(x, git(['log', '--since=90.days', '--format=%s', '--', x.file]).split('\n').filter((s) => /^fix\b/i.test(s)).length), td1));
   const previous = p.sweep === true ? lastLedgerLine(effectiveInstanceRoot()) : null;
-  const continuing = previous?.sweepVisited && previous.sweepVisited < Number(p.total)
+  const continuing = typeof previous?.sweepVisited === 'number' && previous.sweepVisited < Number(p.total)
     && previous.next === Number(p.start) && previous.total === Number(p.total);
-  const visited = p.sweep === true ? Math.min(Number(p.total), (continuing ? previous.sweepVisited! : 0) + results.length) : undefined;
+  const visited = p.sweep === true ? Math.min(Number(p.total), (continuing ? previous.sweepVisited! : 0) + Number(p.cursorVisitedCount ?? results.length)) : undefined;
   const sweepCostSecs = p.sweep === true ? (continuing ? previous.sweepCostSecs ?? 0 : 0) + Number(p.estimatedSecs) : undefined;
   const sweepSlices = p.sweep === true ? Number(p.sweepElapsed ?? (continuing ? previous.sweepSlices ?? 0 : 0)) + 1 : undefined;
-  const line = {
-    at: new Date().toISOString(), range: `#${p.start}~#${p.end}`, start: Number(p.start), end: Number(p.end), next: Number(p.next), total: Number(p.total),
-    commit: String(m?.commit ?? '?'), budgetSecs: Number(p.budgetSecs), results, ...(visited === undefined ? {} : { sweepVisited: visited, sweepCostSecs, sweepSlices }),
-  };
   const root = effectiveInstanceRoot();
+  const historyFiles = pickHistoryFiles(p);
+  const weights = new Map(historyFiles.map((entry) => [entry.file, entry]));
+  const historyFailures = results.map((result) => weights.get(result.file))
+    .filter((entry): entry is GateFailWeight => entry !== undefined);
+  const slicePreexisting = historyFailures.reduce((sum, entry) => sum + entry.preexisting, 0);
+  const slicePreexistingKnownEnv = historyFailures.reduce((sum, entry) => sum + entry.knownEnv, 0);
+  // Metric (boundary ③): each ledger line carries its slice's preexisting ⊕ knownEnv totals AND their delta
+  // against the previous slice line, so «판마다 이월» is readable row by row — even on a zero line.
+  const previousHistory = (lastLedgerLine(root) as { gateHistory?: { preexisting?: number; knownEnv?: number } } | null)?.gateHistory;
+  const history = {
+    preexisting: slicePreexisting,
+    knownEnv: slicePreexistingKnownEnv,
+    total: slicePreexisting + slicePreexistingKnownEnv,
+    files: historyFailures.map((entry) => entry.file),
+    deltaPreexisting: slicePreexisting - Number(previousHistory?.preexisting ?? 0),
+    deltaKnownEnv: slicePreexistingKnownEnv - Number(previousHistory?.knownEnv ?? 0),
+  };
+  const selectedFiles = Array.isArray(p.files) ? p.files.filter((file): file is string => typeof file === 'string') : results.map((result) => result.file);
+  const selectedIndices = Array.isArray(p.selectedIndices) && p.selectedIndices.every((index) => typeof index === 'number')
+    ? p.selectedIndices as number[] : [];
+  const line = {
+    // start/end/next are cursor coordinates; range + selectedIndices describe the exact weighted selection.
+    at: new Date().toISOString(), range: typeof p.rangeLabel === 'string' ? p.rangeLabel : `#${p.start}~#${p.end}`,
+    start: Number(p.start), end: Number(p.end), next: Number(p.next), total: Number(p.total), selectedFiles, selectedIndices,
+    commit: String(m?.commit ?? '?'), budgetSecs: Number(p.budgetSecs), results, ...(visited === undefined ? {} : { sweepVisited: visited, sweepCostSecs, sweepSlices }),
+    gateHistory: { preexisting: history.preexisting, knownEnv: history.knownEnv, total: history.total,
+      deltaPreexisting: history.deltaPreexisting, deltaKnownEnv: history.deltaKnownEnv },
+  };
   appendLedger(root, line);
   const card = writeCardDraft(root, line);
+  const recipes = new Map(results.map((result) => {
+    const entry = weights.get(result.file);
+    return [result.file, recipeFor(entry ? { ...result, history: entry } : result)] as const;
+  }));
+  const recipeCounts: Record<string, number> = {};
+  for (const recipe of recipes.values()) recipeCounts[recipe.type] = (recipeCounts[recipe.type] ?? 0) + 1;
   const proposals: Record<string, number> = {};
   for (const result of results) {
-    if (!result.proposal) continue;
-    proposals[result.proposal] = (proposals[result.proposal] ?? 0) + 1;
+    if (td1.get(result.file)?.disposition === 'keep' && result.verdict === 'keep' && !result.proposal) continue;
+    const recipe = recipes.get(result.file)!;
+    const historyEntry = weights.get(result.file);
+    // YAML이 약속한 «판정마다 처방 카드 초안 하나» — 제안·실패·이력이 없는 keep 판정도 카드를 건너뛰지 않는다.
+    const proposal = result.proposal ?? (result.verdict === 'failing' ? 'failing' : historyEntry !== undefined ? `gate-history:${recipe.type}` : `verdict:${recipe.type}`);
+    proposals[proposal] = (proposals[proposal] ?? 0) + 1;
     let store: Pick<CardStore, 'createCard' | 'appendSection' | 'close'> | undefined;
     try {
       store = deps.createStore?.(root) ?? new CardStore(root);
-      const task = store.createCard({ goalId: `test-diet:${result.file}:${result.proposal}`, title: `시험 다이어트 제안 — ${result.file} · ${result.proposal}` });
-      const observation = { proposal: result.proposal, basis: result.basis, guards: td1.get(result.file)?.guards ?? '',
+      const task = store.createCard({ goalId: `test-diet:${result.file}:${proposal}`, title: `시험 다이어트 제안 — ${result.file} · ${proposal} · ${recipe.type}` });
+      const observation = { proposal: result.proposal, recipe, basis: result.basis, guards: td1.get(result.file)?.guards ?? '',
         secs: result.secs, rssMb: result.rssMb, caught90: result.caught90, range: line.range, ...(result.effectiveness ? { effectiveness: result.effectiveness } : {}) };
       const fingerprint = createHash('sha256').update(JSON.stringify(observation)).digest('hex');
       const key = `test-diet:${line.commit}:${fingerprint}`;
@@ -233,8 +413,9 @@ export function record(ctx: Context, deps: { createStore?: (root: string) => Pic
   }
   debug.log('test-diet', 'proposed', { range: line.range, proposals });
   const counts = { keep: results.filter((r) => r.verdict === 'keep').length, review: results.filter((r) => r.verdict === 'review').length, failing: results.filter((r) => r.verdict === 'failing').length };
+  debug.log('test-diet', 'prescriptions', { range: line.range, recipes: recipeCounts, preexisting: history.preexisting, knownEnv: history.knownEnv });
   debug.log('test-diet', 'recorded', { range: line.range, ...counts, card: card !== null });
-  return emit({ outcome: 'ok', summary: `test-diet ${line.range} · keep ${counts.keep} · review ${counts.review} · failing ${counts.failing}${card ? ' · card draft' : ''}`, range: line.range, ...counts, ...(card ? { card } : {}) });
+  return emit({ outcome: 'ok', summary: `test-diet ${line.range} · keep ${counts.keep} · review ${counts.review} · failing ${counts.failing}${card ? ' · card draft' : ''}`, range: line.range, ...counts, ...(card ? { card } : {}), recipes: recipeCounts, history });
 }
 
 export function mainFailures(ctx: Context, deps: { root?: string; checkout?: string; runFile?: (file: string, cwd: string) => MainFailureResult; now?: Date } = {}): number {

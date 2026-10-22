@@ -889,7 +889,8 @@ import {
   refreshDirtyAsync as refreshGitDirtyAsync,
   refreshGitSnapshotAsync,
 } from '../git-fs/index.js';
-import { refreshSelfAmbientCache } from '../agent/self-ambient-cache.js';
+import { createIdleGitPoll, dashboardIdleMs, gitDirtyRefreshIntervalMs } from '../git-fs/idle-refresh.js';
+import { refreshSelfAmbientCache, selfAmbientKeepWarmIntervalMs } from '../agent/self-ambient-cache.js';
 import { getPty, listPty, requestPtyTakeover } from '../pty-shell/registry.js';
 import { listPtyManifestRowsAt } from '../pty-shell/pty-manifest.js';
 import { ptyManifestTargets } from '../domains/fleet.js';
@@ -1183,7 +1184,7 @@ export function registerDashboardCoreHostTools(host: Pick<PluginHost, 'registerH
 }
 import { registerDashboardPaneHostTools } from './panes/host-tools.js';
 import { type ThemeTokens } from '../theme/tokens.js';
-import { resolveActiveTheme } from './render/theme-resolver.js';
+import { getActiveThemeName, resolveActiveTheme } from './render/theme-resolver.js';
 import { getTheme } from '../themes/index.js';
 import type { PaneFocus, PreviewSource, WorkingDirView } from '../workspace-types.js';
 import type { DisplayMouseEvent } from '../display/types.js';
@@ -2876,6 +2877,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // current value so log analysis can filter "what keys fired while
   // a turn was in flight".
   let streamingInFlight = false;
+  let noteClipboardActivity: () => void = () => {};
+  let noteClipboardBusyChange: () => void = () => {};
+  let noteClipboardPanelState: (active: boolean, reason: string) => void = () => {};
+  let dashboardAcpIsBusy: () => boolean = () => false;
+  let lastDashboardInputAt = Date.now();
   /** 지금 턴의 escGate 중단 — 외부 `/stop`(TUI-STOP-INPUT-BYPASS)이 대기열을 건너뛰어 부른다. 턴 밖이면 null. */
   let currentTurnExternalStop: (() => void) | null = null;
   const resolveTmuxStatusLabel = (): string | null => {
@@ -4049,6 +4055,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       // makes the "*N" suffix tick up within the same frame so the
       // user sees feedback for their own action immediately.
       // TUI-TYPING-LAG — async probe: `git status` must not block key input.
+      lastDashboardInputAt = Date.now();
+      lastGitDirtyProbeAt = lastDashboardInputAt;
       void refreshGitDirtyAsync(getSessionCwd(), { force: true })
         .then(() => { try { draw(); } catch { /* TUI torn down */ } }, () => { /* noop */ });
     });
@@ -4073,9 +4081,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   //      extras.
   //   3. SWD flip → dispose + re-wire (fresh repo root).
   let gitUnsub: (() => void) | null = null;
+  let lastGitDirtyProbeAt = Date.now();
   const wireGitForSwd = (): void => {
     if (gitUnsub) { try { gitUnsub(); } catch {} gitUnsub = null; }
     const swd = getSessionCwd();
+    lastGitDirtyProbeAt = Date.now();
     gitUnsub = subscribeGitChanges(swd, () => {
       try { draw(); } catch { /* noop */ }
     });
@@ -4113,17 +4123,18 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // the git snapshot (async subprocesses) and the self-ambient store scan (worker thread). A turn
   // then serves them from cache instead of rebuilding synchronously on the turn path. Both are
   // no-ops while the cached value is younger than the threshold; failures are fail-soft.
+  const currentDashboardIdleMs = (): number =>
+    dashboardIdleMs(Date.now(), lastDashboardInputAt, streamingInFlight || dashboardAcpIsBusy());
   const warmTurnPreambleCaches = (): void => {
-    try { void refreshGitSnapshotAsync(getSessionCwd(), { ifOlderThanMs: 30_000 }); } catch { /* noop */ }
-    try { void refreshSelfAmbientCache({}, { ifOlderThanMs: 25_000 }); } catch { /* noop */ }
+    const ambientCacheTtlMs = selfAmbientKeepWarmIntervalMs(currentDashboardIdleMs());
+    try { void refreshSelfAmbientCache({}, { ifOlderThanMs: ambientCacheTtlMs }); } catch { /* noop */ }
   };
-  warmTurnPreambleCaches();
-  const gitDirtyTimer: ReturnType<typeof setInterval> = setInterval(() => {
-    warmTurnPreambleCaches();
+  const probeGitDirty = (minIntervalMs: number): void => {
+    lastGitDirtyProbeAt = Date.now();
     try {
       const before = getGitStatusView(getSessionCwd());
       // TUI-TYPING-LAG — the 5s probe ran `git status` synchronously (130ms+, hundreds under load).
-      void refreshGitDirtyAsync(getSessionCwd(), { minIntervalMs: 4_000 }).then((after) => {
+      void refreshGitDirtyAsync(getSessionCwd(), { minIntervalMs }).then((after) => {
         if (
           (before.dirty?.total ?? -1) !== (after.dirty?.total ?? -1) ||
           (before.aheadBehind?.ahead ?? -1) !== (after.aheadBehind?.ahead ?? -1)
@@ -4132,6 +4143,26 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         }
       }, () => { /* noop */ });
     } catch { /* noop */ }
+  };
+  // CLASSIC-IDLE-GIT-POLL — no git children while idle (2 min without input); the next key warms once
+  // off the input path (deferred) and polling resumes. `git-fs.idle poll-state` records each flip.
+  const gitIdlePoll = createIdleGitPoll({
+    idleMs: currentDashboardIdleMs,
+    poll: (idleMs) => {
+      try { void refreshGitSnapshotAsync(getSessionCwd(), { ifOlderThanMs: 30_000 }); } catch { /* noop */ }
+      if (Date.now() - lastGitDirtyProbeAt < gitDirtyRefreshIntervalMs(idleMs)) return;
+      probeGitDirty(gitDirtyRefreshIntervalMs(idleMs));
+    },
+    warm: () => {
+      try { void refreshGitSnapshotAsync(getSessionCwd(), { ifOlderThanMs: 30_000 }); } catch { /* noop */ }
+      probeGitDirty(0);
+    },
+  });
+  warmTurnPreambleCaches();
+  try { void refreshGitSnapshotAsync(getSessionCwd(), { ifOlderThanMs: 30_000 }); } catch { /* noop */ }
+  const gitDirtyTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    warmTurnPreambleCaches();
+    gitIdlePoll.tick();
   }, 5_000);
   (gitDirtyTimer as unknown as { unref?: () => void }).unref?.();
   // The running module's installed version, not the user's working directory, is the baseline.
@@ -4546,6 +4577,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   };
   let pluginHost: PluginHost;
   let lastThemeLoadError = '';
+  let lastThemeResolutionName: string | null = null;
+  let lastPluginThemeAppliedDebugKey: string | null = null;
   let iulThemePreviewOverride: string | null = null;
   let lastHostChromePolicyDebugKey = '';
   const observeEssentialFrameCursor = createDashboardEssentialCursorObserver({
@@ -4560,9 +4593,26 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const raw = iulThemePreviewOverride
       ? { ...(getUserConfig().dashboard.theme as object ?? {}), active: iulThemePreviewOverride }
       : getUserConfig().dashboard.theme;
+    const activeThemeName = getActiveThemeName(raw);
+    if (activeThemeName !== lastThemeResolutionName) {
+      lastThemeResolutionName = activeThemeName;
+      lastPluginThemeAppliedDebugKey = null;
+    }
     return resolveActiveTheme({
       raw,
-      loadPlugin: (id) => pluginHost?.loadThemeTokens(id) ?? null,
+      loadPlugin: (id) => {
+        const tokens = pluginHost?.loadThemeTokens(id) ?? null;
+        if (!tokens) lastPluginThemeAppliedDebugKey = null;
+        return tokens;
+      },
+      onPluginApplied: (event) => {
+        const key = `${event.id}:${event.tokensCount}:${event.source}`;
+        if (key === lastPluginThemeAppliedDebugKey) return;
+        try {
+          debug.log('tui.theme', 'plugin-theme-applied', event);
+          lastPluginThemeAppliedDebugKey = key;
+        } catch { /* observation is best-effort */ }
+      },
       onPluginError: (message) => {
         if (lastThemeLoadError !== message) {
           lastThemeLoadError = message;
@@ -6011,6 +6061,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }
   };
   const syncCompanionPopups = (): void => {
+    // CLASSIC-IDLE-CLIPBOARD: every clipboard open/close/dock path ends here — keep it the only gate.
+    noteClipboardPanelState(companionPopupHost.isActive('clipboard'), companionPopupHost.isDocked('clipboard') ? 'panel-docked' : companionPopupHost.isOpen('clipboard') ? 'panel-open' : 'panel-close');
     const { cols, rows } = termSize();
     const workspaceHost = display.workspaceHostAPI();
     const ownerId = companionPopupHost.ownerId;
@@ -7011,6 +7063,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     };
 
     const cleanup = attachStreamingKeys(async (key) => {
+      noteClipboardActivity();
       // ── Pre-dispatch gates ────────────────────────────────────
       //
       // These run BEFORE `routeInputEventAsync` because:
@@ -7108,6 +7161,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // ⛔ TUI-STALE-BUSY-MARKER — busy 는 «끄는 closure 를 돌려주기 직전»에 켠다. 위 준비(ESC 게이트·키 리스너)가
     //    던지면 호출자는 cleanup 을 못 받으므로, 먼저 켜 두면 아무도 못 끄는 busy 가 남는다(#37).
     streamingInFlight = true;
+    noteClipboardBusyChange();
     reportTuiTurn('busy');
     const externalStop = (): void => { stopTurnViaEscGate(escGate); };
     currentTurnExternalStop = externalStop;
@@ -7126,6 +7180,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       } finally {
         userScrolledDuringStream = false;
         streamingInFlight = false;
+        noteClipboardBusyChange();
         reportTuiTurn('idle');
         const failedTurnRaw = autowakeTurnFailureRaw;
         autowakeTurnFailureRaw = null;
@@ -7196,6 +7251,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const dashboardAcpChat = new DashboardAcpChat({
     cwd: () => workingDir.cwd,
     log: (msg) => pushLog('debug', `  [acp] ${msg}`),
+    onBusyChange: () => noteClipboardBusyChange(),
     // Follow-up #9 — wrap the modal approver so BG records flip to
     // `waiting_for_confirmation` even when the peer (codex-acp /
     // gemini-cli) doesn't emit the `tool_call_update.status` field.
@@ -7205,6 +7261,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       globalBackgroundManager(),
     ),
   });
+  dashboardAcpIsBusy = () => dashboardAcpChat.isBusy();
   activeAcpRuntimeModel = () => dashboardAcpChat.activeRuntimeModel();
 
   // Obsidian vault browser (Phase O3). Shares the FsEntry shape and
@@ -12358,7 +12415,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // ticks every ~1.5s on Darwin and stores up to 50 unique text
   // snapshots. Stopped during dashboard teardown to avoid leaking
   // intervals if the host re-enters showDashboard.
-  const clipHistory: ClipboardHistory = startClipboardHistory({});
+  // CLASSIC-IDLE-CLIPBOARD: dormant until the clipboard companion is open.
+  const clipHistory: ClipboardHistory = startClipboardHistory({
+    active: companionPopupHost.isActive('clipboard'),
+    isBusy: () => streamingInFlight || dashboardAcpChat.isBusy(),
+  });
+  noteClipboardPanelState = (active, reason) => clipHistory.setActive(active, reason);
+  noteClipboardActivity = () => {
+    lastDashboardInputAt = Date.now();
+    clipHistory.noteActivity();
+  };
+  noteClipboardBusyChange = () => clipHistory.noteBusyChange();
   process.once('beforeExit', () => { clipHistory.stop(); });
   // Re-render whenever the poller picks up a new entry — only when
   // we're actually showing the history viewer, otherwise the side-
@@ -15160,6 +15227,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       const key: import('../tui.js').Key = wdAutoInput
         ? { name: CHAT_MAIN_AUTO_ENTRY_KEY_NAME, ctrl: false, shift: false }
         : await readKey();
+      if (!wdAutoInput) { noteClipboardActivity(); gitIdlePoll.noteActivity('input'); }
       const helpModal = currentTransientTerminalModal('dashboard-help');
       if (key.name === 'escape' && helpModal) {
         helpModal.dispose();

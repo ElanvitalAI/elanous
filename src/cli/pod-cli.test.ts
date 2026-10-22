@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -174,6 +174,7 @@ describe('elanous pod lease status', () => {
     let launched: ReturnType<ReturnType<typeof podSelfImplementSpawn>> | undefined;
     try {
       const spawn = podSelfImplementSpawn({ pool, kubectl: spawnKubectl, pollMs: 2, imageCommit: null,
+        budgetSnapshot: () => undefined,
         credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }) });
       launched = spawn({ spaceId: 'pending-actual-apply', feature: 'f', signal: controller.signal });
       for (let n = 0; n < 100 && !appliedJob; n++) await Bun.sleep(5);
@@ -354,7 +355,46 @@ describe('elanous pod lease status', () => {
   });
 });
 
+describe('elanous pod shelf — production pod command tree', () => {
+  test('put, ls and run select a ref image, keep the operational pin, and return rc and output tail', async () => {
+    const cap = capture();
+    const program = new Command(); program.exitOverride();
+    const pin = { harness: { imageCommit: 'f'.repeat(40), podPool: 'pool-node-b@node-b:1#k3d-elanous-registry:5050' } };
+    const image = { commit: 'a'.repeat(40), image: 'k3d-elanous-registry:5050/elanous-harness:aaaaaaaaaaaa', action: 'built' as const };
+    const runs: RunPodCommandOptions[] = [];
+    registerPodCommands(program, {
+      io: cap.io,
+      shelfConfig: () => pin,
+      shelfPut: async (ref) => { expect(ref).toBe('123'); return image; },
+      shelfList: async () => [image.image],
+      run: async (options) => { runs.push(options); return { exitCode: 3, artifactsDir: '/tmp/shelf-job', job: 'shelf-job', image: image.image }; },
+      shelfTail: () => 'child output tail',
+    });
+    const prev = process.argv;
+    const previousUser = process.env.USER;
+    process.env.USER = 'shelf-test-user';
+    try {
+      process.argv = ['bun', 'elanous', 'pod', 'shelf', 'put', '123'];
+      await program.parseAsync(['pod', 'shelf', 'put', '123'], { from: 'user' });
+      process.argv = ['bun', 'elanous', 'pod', 'shelf', 'ls'];
+      await program.parseAsync(['pod', 'shelf', 'ls'], { from: 'user' });
+      process.argv = ['bun', 'elanous', 'pod', 'shelf', 'run', '123', '--', 'bun', 'bin/elanous.mjs', '--test', '--version'];
+      await program.parseAsync(['pod', 'shelf', 'run', '123', '--', 'bun', 'bin/elanous.mjs', '--test', '--version'], { from: 'user' });
+    } finally { process.argv = prev; if (previousUser === undefined) delete process.env.USER; else process.env.USER = previousUser; }
+    expect(cap.lines).toContain(`${image.image} (${image.action})`);
+    expect(cap.lines).toContain(image.image);
+    expect(runs[0]).toMatchObject({ image: image.image, imageCommit: image.commit, command: ['bun', 'bin/elanous.mjs', '--test', '--version'], returnLogs: true });
+    expect(cap.errors).toContain(`[pod shelf] image ${image.image} · rc 3 · job shelf-job`);
+    expect(cap.lines).toContain('child output tail');
+    expect(cap.code()).toBe(3);
+    expect(pin.harness.imageCommit).toBe('f'.repeat(40));
+  });
+});
+
 describe('elanous pod run', () => {
+  let previousUser: string | undefined;
+  beforeEach(() => { previousUser = process.env.USER; process.env.USER = 'pod-cli-test-user'; });
+  afterEach(() => { if (previousUser === undefined) delete process.env.USER; else process.env.USER = previousUser; });
   test('도움말은 deadline 생략 시 기존 Pod Job 상한을 적는다', () => {
     const program = new Command();
     program.exitOverride();
@@ -536,6 +576,9 @@ exit 0
 });
 
 describe('elanous pod run --clone 설치 없는 bun 시험 경고 (TA-LIVE-LAND-PROOF-1)', () => {
+  let previousUser: string | undefined;
+  beforeEach(() => { previousUser = process.env.USER; process.env.USER = 'pod-cli-test-user'; });
+  afterEach(() => { if (previousUser === undefined) delete process.env.USER; else process.env.USER = previousUser; });
   const launch = async (argv: string[]) => {
     const cap = capture();
     const seen: RunPodCommandOptions[] = [];
@@ -590,12 +633,35 @@ describe('elanous pod run --clone 설치 없는 bun 시험 경고 (TA-LIVE-LAND-
     expect(launched.observations()).toEqual([
       { category: 'pod.run', event: 'clone-without-install', data: { argv0: 'bun', argv1: 'test' } },
     ]);
-    expect(launched.seen).toEqual([
+    expect(launched.seen).toMatchObject([
       { command: ['bun', 'test', 'src/steward/launch.test.ts'], returnLogs: true, clone: true },
     ]);
+    expect(launched.seen[0]?.provenance).toMatchObject({ actorKind: 'human', kind: 'command', phase: 'exec', entrance: 'pod-run', reason: 'unknown' });
+    expect(launched.seen[0]?.provenance?.run).toBe(launched.seen[0]?.runId);
     expect(launched.cap.lines).toEqual(['/artifacts/job']);
     expect(launched.cap.code()).toBe(0);
     expect(launched.atLaunch).toEqual([{ errors: [POD_CLONE_WITHOUT_INSTALL_WARNING], observations: 1 }]);
+  });
+
+  test('출처 argv 요약은 실행 파일 이름만 기록한다', async () => {
+    const launched = await launch(['pod', 'run', '--', '/usr/bin/bash', '-c', 'echo hello']);
+    expect(launched.seen[0]?.provenance?.argv).toBe('bash');
+  });
+
+  test('주체 환경값이 없으면 명령 Job을 발사하지 않는다', async () => {
+    const previous = { seat: process.env.ELANOUS_SEAT, user: process.env.USER, logname: process.env.LOGNAME };
+    delete process.env.ELANOUS_SEAT;
+    delete process.env.USER;
+    delete process.env.LOGNAME;
+    try {
+      const launched = await launch(['pod', 'run', '--', 'true']);
+      expect(launched.seen).toHaveLength(0);
+      expect(launched.cap.errors.some((line) => line.includes('pod provenance actor missing'))).toBe(true);
+    } finally {
+      for (const [key, value] of Object.entries({ ELANOUS_SEAT: previous.seat, USER: previous.user, LOGNAME: previous.logname })) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
   });
 
   test('`install` 은 argv 토큰 그대로만 센다 — 인자 하나 안의 «install helper» 는 설치가 아니다', async () => {
@@ -623,7 +689,7 @@ describe('elanous pod run --clone 설치 없는 bun 시험 경고 (TA-LIVE-LAND-
     expect(launched.warnings()).toEqual([]);
     expect(launched.cap.errors).toEqual([]);
     expect(launched.observations()).toEqual([]);
-    expect(launched.seen).toEqual([{ command: ['sh', '-c', wrapped], returnLogs: true, clone: true }]);
+    expect(launched.seen).toMatchObject([{ command: ['sh', '-c', wrapped], returnLogs: true, clone: true }]);
   });
 
   test('`--clone` 없는 경로는 `bun test` 여도 경고 0건 · Job 사양 그대로', async () => {
@@ -631,22 +697,22 @@ describe('elanous pod run --clone 설치 없는 bun 시험 경고 (TA-LIVE-LAND-
     expect(launched.warnings()).toEqual([]);
     expect(launched.cap.errors).toEqual([]);
     expect(launched.observations()).toEqual([]);
-    expect(launched.seen).toEqual([{ command: ['bun', 'test', 'src/steward/launch.test.ts'], returnLogs: true }]);
+    expect(launched.seen).toMatchObject([{ command: ['bun', 'test', 'src/steward/launch.test.ts'], returnLogs: true }]);
   });
 
   test('경계 보존: --lite · bun 아닌 다른 명령 · `bun install` 은 경고 0건, 출력·Job 사양 동일', async () => {
     const lite = await launch(['pod', 'run', '--lite', '--', 'bun', 'test', 'x.test.ts']);
     expect(lite.warnings()).toEqual([]);
     expect(lite.cap.errors).toEqual([]);
-    expect(lite.seen).toEqual([{ command: ['bun', 'test', 'x.test.ts'], returnLogs: true, lite: true }]);
+    expect(lite.seen).toMatchObject([{ command: ['bun', 'test', 'x.test.ts'], returnLogs: true, lite: true }]);
     const other = await launch(['pod', 'run', '--clone', '--', 'pnpm', 'test']);
     expect(other.warnings()).toEqual([]);
     expect(other.observations()).toEqual([]);
-    expect(other.seen).toEqual([{ command: ['pnpm', 'test'], returnLogs: true, clone: true }]);
+    expect(other.seen).toMatchObject([{ command: ['pnpm', 'test'], returnLogs: true, clone: true }]);
     const install = await launch(['pod', 'run', '--clone', '--', 'bun', 'install']);
     expect(install.warnings()).toEqual([]);
     expect(install.observations()).toEqual([]);
-    expect(install.seen).toEqual([{ command: ['bun', 'install'], returnLogs: true, clone: true }]);
+    expect(install.seen).toMatchObject([{ command: ['bun', 'install'], returnLogs: true, clone: true }]);
   });
 
   test('경계 보존: `pod run` 도움말 문면은 그대로다 — 새 옵션 없음 · 경고 문면 미노출', () => {

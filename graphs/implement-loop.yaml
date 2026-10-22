@@ -46,7 +46,7 @@ version: 1
 #   ⛔ 여정 노드(intake … stopped)의 id 는 원장·라이브 그래프 화면의 조인 키다 — 바꾸지 마라.
 #   🔀 분기는 «데이터»다(`on:` 상태 키 ⊕ `map:` 값→노드) — 기본 = 풀세트, 환경(substrate·freeze·queue)이 일부를 건너뛴다.
 entry_node: intake
-terminal_nodes: [cleanup, stopped]
+terminal_nodes: [cleanup, stopped, needs-human, decision-card]
 
 # Runner-provided inputs are declared here so contract-flow can distinguish them from undeclared gaps.
 runner_inputs: [ask_text, goal, worktree, branch, review-intent, head-sha, base-branch]
@@ -419,6 +419,46 @@ nodes:
       tools: none
       outputs: []
 
+  # GRAPH-AUTHOR-FAIL-EDGE (0.2.35 첫 조각 · 선언 ⊕ 관측 · 동작 무변경):
+  #   author 의 결과가 «길»이 된다 — 코드에 이미 있던 자동 재저작 한 번(ask-launch-flow.ts retryableNoTargetPaths)과
+  #   NOT-GROUNDED 범위 카드 거절(launch-preflight.ts)을 그래프가 이름으로 안다. 관측 = graph-front-nodes.ts observeFrontNodeExit.
+  - node_id: re-ground
+    group: author
+    journey_stage: author
+    kind: judge
+    recipe: ask-auto-reauthor          # ask-launch-flow.ts — 대상 경로 후보 검색 → 한 번 더 저작
+    max_visits: 1                      # ⛔ 두 번째 not-grounded 는 여기로 «안» 온다 — needs-human
+    terminal_stages: []
+    contract:
+      inputs: [ask_text, blockers]
+      tools: read-only
+      outputs: [target_path_candidates]
+
+  - node_id: needs-human
+    group: end
+    journey_stage: end
+    kind: hitl
+    recipe: launch-preflight-blocked   # ask-launch-flow.ts resolveBlockedInteractively — 근거 카드(막힘 이름·사유) 동반
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [blockers]
+      tools: none
+      outputs: [evidence_card]
+
+  # next-move 의 wait 가 «조용히» stopped 로 가지 않게 — task-agent 의 결정 카드 경로(judge.ts 'decision-card')로 모은다.
+  - node_id: decision-card
+    group: recover
+    journey_stage: recover
+    kind: hitl
+    recipe: task-agent-decision-card   # src/task-agent/judge.ts move 'decision-card' → 결정 카드 발신
+    max_visits: 1
+    terminal_stages: []
+    contract:
+      inputs: [next_action]
+      tools: none
+      outputs: [decision_card]
+
   # LAND-REFUSAL-EDGES: destinations only; recovery execution is a later slice.
   - node_id: ready
     group: land
@@ -478,8 +518,17 @@ edges:
       fresh: author
       pr-source: pool-admit          # 같은 PR 수리: author·plan·decompose를 건너뛰고 Pod rework
 
+  # GRAPH-AUTHOR-FAIL-EDGE — 결과 값은 observeFrontNodeExit 가 그 자리(ask-launch-flow.ts)에서 낸다.
   - from: author
-    to: plan
+    on: outcome
+    map:
+      ok: plan
+      re-authored: plan                # 자동 재저작 뒤 발사 가능
+      not-grounded: re-ground          # 대상 경로 0 · NOT-GROUNDED 범위 카드 — 두 번째면 re-ground 예산(1) 소진 → needs-human
+      fail: needs-human                # 저작기가 던졌다
+
+  - from: re-ground
+    to: author
 
   - from: plan
     to: decompose
@@ -536,8 +585,8 @@ edges:
       salvage-relaunch: dispatch
       alternative: dispatch
       wait-retry: dispatch
-      decision-card: stopped
-      wait: stopped
+      decision-card: decision-card
+      wait: decision-card              # GRAPH-AUTHOR-FAIL-EDGE ③ — 조용한 stopped 0
 
   - from: implement
     to: gate

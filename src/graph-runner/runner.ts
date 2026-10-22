@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile, spawnSync } from 'node:child_process';
-import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
@@ -23,8 +24,9 @@ export { UnitNotFoundError } from '../self-implement/graph-unit-resolver.js';
 import { createGraphVariant, type GraphVariantPlan } from '../self-implement/graph-variant.js';
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
+import { executeClassifyNode } from '../workflow-runtime/nodes/classify.js';
 import { interpolate } from '../workflow-runtime/variables.js';
-import type { BashNode, NodeExecContext, WorkflowDeps } from '../workflow-runtime/types.js';
+import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride, type GatePodPoolOverride } from '../../scripts/release-loop/resume.js';
 
 type BashRun = WorkflowDeps['runBash'];
@@ -83,6 +85,47 @@ function topLevelTerminalStatus(graphId: string, terminal: string): 'done' | 'fa
   return terminal === 'done' || terminal === 'failed' ? terminal : undefined;
 }
 
+/** HARNESS-FULL-GRAPH-LOOPS — the four goal loops are self-implement harness templates: their recipes are
+ *  catalog roles (no `recipes.yaml` sidecar) and some edges branch on `changed-files`. `graph run` can only
+ *  *plan* them: `--dry-run` walks the declared success route; a real run is refused (the harness owns effects). */
+const HARNESS_LOOP_GRAPH_IDS: ReadonlySet<string> = new Set(['default-loop', 'document-loop', 'operate-loop', 'research-loop']);
+
+type PlannedStep = { outcome?: string; to: string };
+
+/** Shortest declared route (map/to edges only — fallbacks are not a success branch) to a terminal that maps to `done`.
+ *  Ties keep the first declared outcome, so the plan follows the YAML's own order. A unit call only takes its first
+ *  declared exit (the same stand-in a plain dry run uses) — its `rework` exit is a shortcut, not the success path. */
+function planHarnessLoopRoute(graph: GraphTemplateSpec, unitSuccessExit: (nodeId: string) => string | undefined): Map<string, PlannedStep> {
+  const candidates = new Map<string, PlannedStep[]>();
+  for (const node of graph.nodes) {
+    const edge = graph.edges.find((e) => e.from === node.nodeId);
+    if (!edge) continue;
+    const exit = unitSuccessExit(node.nodeId);
+    candidates.set(node.nodeId, edge.to !== undefined ? [{ to: edge.to }]
+      : Object.entries(edge.map ?? {}).filter(([outcome]) => exit === undefined || outcome === exit).map(([outcome, to]) => ({ outcome, to })));
+  }
+  const distance = new Map<string, number>();
+  for (const terminal of graph.terminalNodes) if (topLevelTerminalStatus(graph.graphId, terminal) === 'done') distance.set(terminal, 0);
+  const route = new Map<string, PlannedStep>();
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [nodeId, steps] of candidates) {
+      if (graph.terminalNodes.includes(nodeId)) continue;
+      let best: { step: PlannedStep; d: number } | undefined;
+      for (const step of steps) {
+        const d = distance.get(step.to);
+        if (d !== undefined && (!best || d + 1 < best.d)) best = { step, d: d + 1 };
+      }
+      if (best && (distance.get(nodeId) ?? Infinity) > best.d) {
+        distance.set(nodeId, best.d);
+        route.set(nodeId, best.step);
+        changed = true;
+      }
+    }
+  }
+  return route;
+}
+
 export interface GraphRunState {
   graphId: string;
   runId: string;
@@ -125,6 +168,46 @@ export interface GraphRunState {
   statePath: string;
 }
 
+export interface GraphClassifyInput {
+  arguments: string;
+  classify: ClassifyNode['classify'];
+  /** Production consumer that asked for the verdict, so one ledger shape separates callers. */
+  caller?: string;
+}
+
+/** Run the workflow classifier as a persisted harness graph node. The workflow verdict is unchanged. */
+export async function runGraphClassifyNode(node: ClassifyNode, ctx: NodeExecContext, callLLM: WorkflowDeps['callLLM'],
+  meta: { caller?: string } = {}): Promise<NodeOutput> {
+  const dir = mkdtempSync(join(tmpdir(), 'elanous-graph-classify-'));
+  try {
+    const path = join(dir, 'graph.yaml');
+    writeFileSync(join(dir, 'recipes.yaml'), '{}\n');
+    writeFileSync(path, stringifyYaml({
+      graph_id: 'self-implement-classify', version: 1, entry_node: 'classify', terminal_nodes: ['done', 'failed'],
+      nodes: [
+        { node_id: 'classify', kind: 'classify', recipe: 'none', max_visits: 1 },
+        { node_id: 'done', kind: 'gate', recipe: 'none', max_visits: 1 },
+        { node_id: 'failed', kind: 'gate', recipe: 'none', max_visits: 1 },
+      ],
+      edges: [{ from: 'classify', on: 'outcome', map: { ok: 'done', fail: 'failed' } }],
+    }));
+    const run = await runGraph(path, { input: { arguments: ctx.arguments, classify: node.classify,
+      ...(meta.caller === undefined ? {} : { caller: meta.caller }) } satisfies GraphClassifyInput,
+      quiet: true,
+      deps: { callLLM: async (prompt) => callLLM({ prompt, ...(ctx.resolvedModel === undefined ? {} : { model: ctx.resolvedModel }),
+        ...(ctx.resolvedProvider === undefined ? {} : { provider: ctx.resolvedProvider }),
+        ...(ctx.signal === undefined ? {} : { signal: ctx.signal }) }) } });
+    const recorded = lastJsonObject(run.nodes[0]?.output);
+    if (!recorded || typeof recorded.durationMs !== 'number' || typeof recorded.ok !== 'boolean' || !('output' in recorded)) {
+      throw new Error(`classify graph did not record a result: ${run.statePath}`);
+    }
+    return { ok: recorded.ok, output: recorded.output, durationMs: recorded.durationMs,
+      ...(typeof recorded.error === 'string' ? { error: recorded.error } : {}) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export interface GraphRunOptions {
   input?: unknown;
   /** Bytes already checked by the tick gate, used for a current-graph start or legacy resume. */
@@ -135,6 +218,8 @@ export interface GraphRunOptions {
   resumeRunId?: string;
   resumeGraphId?: string;
   fromNodeId?: string;
+  /** Embedded runs (a classify verdict inside self-implement) keep the per-node `[graph]` stderr lines off the caller's terminal; debug.log still records every node. */
+  quiet?: boolean;
   /** Release-only: accept the recorded failed node without executing it, and expose its regression to known-issues. */
   releaseWaiver?: { nodeId: string; reason: string; requestedRegressions: AcceptedRegression[]; acceptedRegressions: AcceptedRegression[]; unmeasured?: string };
   /** Release-only: add accepted issues independently of a waiver at a restart boundary. */
@@ -614,7 +699,15 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       throw new Error(`unsupported terminal node: ${terminal} (expected ${graph.unit ? graph.unit.exits.join(' or ') : 'done or failed'})`);
     }
   }
-  const recipeSource = readFileSync(graphMode === 'snapshot' ? join(snapshotDir!, 'recipes.yaml') : join(dirname(path), 'recipes.yaml'), 'utf8');
+  const recipePath = graphMode === 'snapshot' ? join(snapshotDir!, 'recipes.yaml') : join(dirname(path), 'recipes.yaml');
+  // A harness loop template without a command sidecar is planned, never executed, by this runner.
+  const harnessLoopTemplate = !graph.unit && HARNESS_LOOP_GRAPH_IDS.has(graph.graphId) && graphMode === 'current' && !existsSync(recipePath);
+  if (harnessLoopTemplate && (options.dryRun !== true || options.resumeRunId)) {
+    debug.log('graph.run', 'harness-loop-refused', { graphId: graph.graphId, path: resolve(path), why: 'real-run' });
+    throw new Error(`harness loop template ${graph.graphId} runs through the self-implement harness — graph run only plans it with --dry-run`);
+  }
+  const harnessLoopRoute = harnessLoopTemplate ? planHarnessLoopRoute(graph, (nodeId) => units.get(nodeId)?.template.unit?.exits[0]) : undefined;
+  const recipeSource = harnessLoopTemplate ? '{}\n' : readFileSync(recipePath, 'utf8');
   if (graphMode === 'snapshot' && saved?.graphSnapshot &&
     (createHash('sha256').update(source).digest('hex') !== saved.graphSnapshot.graphSha ||
       createHash('sha256').update(recipeSource).digest('hex') !== saved.graphSnapshot.recipesSha)) {
@@ -626,9 +719,19 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const approvalSourceHash = createHash('sha256').update(variantSource).update('\0').update(recipeSource).digest('hex');
   // Resolve all commands before executing any node; an unknown recipe must never produce a partial publication.
   for (const node of graph.nodes) {
+    if (node.kind === 'classify' && node.recipe !== 'none') throw new Error(`classify node cannot execute a recipe: ${node.nodeId}`);
     if (node.recipe === 'none') continue;
     const resolved = resolveNodeRecipe(node, recipes, catalogRoles);
+    // Harness loop recipes are labels the self-implement harness dispatches by node id (most are outside the
+    // node catalog — graph-catalog.test.ts); a planned loop never executes them, and a real run is refused above.
+    if (harnessLoopRoute) continue;
     if (!resolved.command && !resolved.prompt && !resolved.approval) throw new Error(`unknown command recipe for ${node.nodeId}: ${node.recipe}`);
+  }
+  if (harnessLoopRoute) {
+    if (!harnessLoopRoute.has(graph.entryNode)) throw new Error(`harness loop ${graph.graphId} has no declared route from ${graph.entryNode} to a success terminal`);
+    const planned: string[] = [graph.entryNode];
+    for (let at = harnessLoopRoute.get(graph.entryNode); at; at = harnessLoopRoute.get(at.to)) planned.push(at.to);
+    debug.log('graph.run', 'harness-loop-plan', { graphId: graph.graphId, path: resolve(path), route: planned });
   }
   const graphId = safeSegment(graph.graphId);
   const isReleaseLoop = graphId === 'release-loop';
@@ -951,7 +1054,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const startedAt = performance.now();
     const nodeStartedAt = new Date().toISOString();
     if (!resumingCompleted) state.currentNode = { nodeId: current, startedAt: nodeStartedAt };
-    console.error(`[graph] ${current} start (0.00s)`);
+    if (!options.quiet) console.error(`[graph] ${current} start (0.00s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: 'start', dryRun: state.dryRun });
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: 'start' });
     log('node-start', { graphId, runId, nodeId: current, visit: visits.get(current), dryRun: state.dryRun });
@@ -1030,7 +1133,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       state.executed++;
     }
     let unitExecuted = false;
-    if (units.has(current) && !waiving && state.dryRun && !resumingCompleted) {
+    const plannedStep: PlannedStep | undefined = harnessLoopRoute?.get(current);
+    if (harnessLoopRoute && !graph.terminalNodes.includes(current)) {
+      if (!plannedStep) throw new Error(`harness loop ${graphId} has no declared success route from ${current}`);
+      // The planned outcome stands in for the harness node (or unit) that a real loop run would execute.
+      output = JSON.stringify({ outcome: plannedStep.outcome ?? 'ok', dryRun: true, plannedNext: plannedStep.to });
+    } else if (units.has(current) && !waiving && state.dryRun && !resumingCompleted) {
       // Dry run plans the walk only: no child run, no unit event, no unitCalls entry; the first declared exit stands in.
       output = JSON.stringify({ outcome: units.get(current)!.template.unit!.exits[0], dryRun: true });
     } else if (units.has(current) && !waiving && !resumingCompleted) {
@@ -1132,6 +1240,39 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       }
       state.executed++;
     }
+    if (node.kind === 'classify' && !waiving && !state.dryRun && !resumingCompleted) {
+      const input = state.input as GraphClassifyInput | undefined;
+      const classify = input?.classify;
+      if (!input || typeof input.arguments !== 'string' || !classify || typeof classify.input !== 'string' ||
+          !Array.isArray(classify.classes) || !classify.classes.length || !classify.classes.every(c => typeof c === 'string' && c.length > 0) ||
+          (classify.retries !== undefined && (!Number.isSafeInteger(classify.retries) || classify.retries < 0)) ||
+          (classify.retryDelayMs !== undefined && (!Number.isSafeInteger(classify.retryDelayMs) || classify.retryDelayMs < 0))) {
+        throw new Error('classify node requires input.arguments and a valid input.classify');
+      }
+      try {
+        const result = await executeClassifyNode({ id: current, classify }, {
+          arguments: input.arguments, artifactsDir: dirname(statePath), outputs: {},
+          resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {},
+        }, { callLLM: async ({ prompt }) => {
+          if (!options.deps?.callLLM) throw new Error('classify node requires an injected LLM (deps.callLLM)');
+          return options.deps.callLLM(prompt);
+        }, runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }) });
+        output = JSON.stringify({ input: input.arguments, ok: result.ok, verdict: result.output, output: result.output,
+          durationMs: result.durationMs, ...(result.error ? { error: result.error } : {}) });
+        ok = result.ok;
+        error = result.error;
+      } catch (cause) {
+        ok = false;
+        error = cause instanceof Error ? cause.message : String(cause);
+        output = JSON.stringify({ input: input.arguments, ok, verdict: 'unknown', output: 'unknown', durationMs: 0, error });
+      }
+      const recorded = lastJsonObject(output);
+      debug.log('graph.classify', 'node-result', { graphId, runId, nodeId: current, caller: input.caller ?? null,
+        input: input.arguments, inputChars: input.arguments.length, classes: classify.classes,
+        verdict: recorded?.verdict ?? 'unknown', output: recorded?.output ?? 'unknown', ok,
+        ...(error ? { error } : {}) });
+      state.executed++;
+    }
     const seconds = Number(((performance.now() - startedAt) / 1000).toFixed(2));
     // A wall clock stepped back mid-node must not record an end before the start.
     const nodeEndedAt = new Date(Math.max(Date.now(), Date.parse(nodeStartedAt))).toISOString();
@@ -1152,7 +1293,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', graphId, runId, nodeId: current,
           ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
-      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || unitExecuted), ...((waiving || units.has(current) || ((command || prompt || approval) && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...((waiving || harnessLoopRoute || units.has(current) || ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
         ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, ...(options.releaseWaiver!.unmeasured === undefined ? {} : { unmeasured: options.releaseWaiver!.unmeasured }), original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
@@ -1165,9 +1306,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       delete state.pending;
       delete state.approvalSourceHash;
     }
-    const reported = waiving || units.has(current) || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
-    const namedOutcome = typeof reported === 'string' ? reported : undefined;
-    console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
+    const reported: unknown = waiving || harnessLoopRoute || units.has(current) || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
+    const namedOutcome: string | undefined = typeof reported === 'string' ? reported : undefined;
+    if (!options.quiet) console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit });
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds });
     publishInsideEvent({ kind: 'verdict', graphId, runId, nodeId: current, verdict: ok ? 'ok' : 'fail', ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }) });
@@ -1225,7 +1366,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       }
       persist();
     }
-    current = nextNode(graph.edges, current, state.dryRun && !command?.dry_run_command ? 'ok' : ok ? 'ok' : 'fail', namedOutcome);
+    // A planned harness loop follows its route directly: `changed-files` edges have no runner condition.
+    current = plannedStep ? plannedStep.to
+      : nextNode(graph.edges, current, state.dryRun && !command?.dry_run_command ? 'ok' : ok ? 'ok' : 'fail', namedOutcome);
     resumedGrowth = false;
     if (current !== undefined) publishInsideEvent({ kind: 'edge', graphId, runId, from: fromNodeId, to: current });
     if (current === undefined) {

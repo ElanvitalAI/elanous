@@ -15,6 +15,7 @@ import { LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightRcResult } from './light-r
 import { planRehearsalShards, type RehearsalShardPlan, type RehearsalShardPlanDeps } from './rehearsal-shard-plan.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
+import { hardRehearsalGateArgs } from '../../scripts/release-loop/gate-radius-live.js';
 
 export type StepId = 'hard-mid' | 'rc-7h' | 'hard-5h' | 'rc-150m';
 export type RehearsalOutcome = 'ok' | 'regression' | 'unmeasured' | 'error' | 'no-checkout' | 'checkout-dirty' | 'superseded' | 'interrupted';
@@ -200,8 +201,7 @@ async function runHardGate(version: string, checkout: string, sha: string, ledge
   mkdirSync(dirname(logPath), { recursive: true });
   const run = (() => {
     const log = openSync(logPath, 'wx', 0o600);
-    try { return spawnSync('bun', ['scripts/release-loop/gate-node.ts', '--commit', sha, '--version', version,
-      '--baseline-version', previous, '--executor', 'pod', '--pod-pool', pool, '--pod-shards', '12', '--json'], {
+    try { return spawnSync('bun', hardRehearsalGateArgs(version, runId, sha, previous, pool), {
       cwd: checkout, encoding: 'utf8', stdio: ['ignore', log, log], timeout: 4 * 60 * 60_000,
       env: { ...process.env, ELANOUS_STATE_DIR: ledgerRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(ledgerRoot) },
     }); } finally { closeSync(log); }

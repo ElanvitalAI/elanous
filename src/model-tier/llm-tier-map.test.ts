@@ -47,6 +47,14 @@ describe('lookupLlmTierSpec — SSOT 회귀 (대표 지적)', () => {
       }
     }
   });
+  it('OpenGateway의 모든 tier는 실제 선택 경로에서 정의되며 지원하지 않는 reasoning 제어를 끈다', () => {
+    for (const tier of MODEL_TIERS) {
+      const spec = lookupLlmTierSpec('opengateway', tier);
+      expect(spec).toBeDefined();
+      expect(spec.model).toBe('opengateway/deepseek/deepseek-v4.1-flash-ultrafast');
+      expect(spec.reasoningLevel).toBe('off');
+    }
+  });
   it('OpenRouter GLM-5.3 측정 가격·창과 flash 의 미측정 가격을 구별한다', () => {
     const balanced = lookupLlmTierSpec('openrouter', 'balanced');
     expect(balanced.model).toBe('openrouter/z-ai/glm-5.3');

@@ -3,6 +3,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { captureFunnelCandidates, collectFunnelCandidates, runRequirementFunnel, type DirectiveRow, type FunnelDirectiveRow, type IncomingRequirement, type RequirementSources } from './requirement-funnel.js';
+import type { AlreadyBuiltFeature } from './already-built-hint.js';
+import { hashContent } from '../hasher.js';
 import { RequirementLedger } from '../requirements/requirement-ledger.js';
 import { debug } from '../debug/log.js';
 import type { TaskCard } from '../task-cards/card-store.js';
@@ -214,4 +216,65 @@ test('REQ-INTAKE-ALL ④: offset times are stored as UTC Z and one failing candi
   expect(store.list()).toHaveLength(total - failedIds.length);
   expect(store.list().every(row => row.source.at.endsWith('Z'))).toBe(true);
   expect(events.filter(entry => entry.event === 'ledger-capture-failed').map(entry => (entry.payload as { id: string }).id)).toEqual(failedIds);
+});
+
+// ── ALREADY-BUILT-HINT (0.2.34 · RFC-harness-full-journey-as-graph §4f) — 생산 경로 intake.hint 관측 ──
+// E4 부재 원문: seat-state/MK/green-e4/ALREADY-BUILT-HINT.md — «이미 있는 기능» 알림이 인테이크 생산
+// 경로에서 실제로 나오는지, 무관·근거 없음·거절 짝이 계속 침묵하는지 여기서 고정한다.
+const builtFeature: AlreadyBuiltFeature = {
+  devProject: 'elanous-core', feature: 'session-search-rank',
+  text: '세션 검색 관련도 랭킹을 trigram BM25 로 매긴다',
+  evidence: { commit: 'f345b450b4', file: 'src/session/search-index.ts' },
+};
+const hintSources = (text: string): RequirementSources => ({ grounding: [
+  { id: 'hint-req', text, link: 'https://example.test/hint', receivedAt: directive.ts }] });
+const withHintObserver = <T>(run: () => T): { value: T; hints: { payload: unknown }[] } => {
+  const events: { category: unknown; event: unknown; payload: unknown }[] = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) =>
+    events.push({ category: args[0], event: args[1], payload: args[2] })) as typeof debug.log);
+  try {
+    const value = run();
+    return { value, hints: events.filter(entry => entry.category === 'requirements.intake' && entry.event === 'hint') };
+  } finally { spy.mockRestore(); }
+};
+
+test('ALREADY-BUILT ①: an overlapping requirement emits exactly one intake.hint with its evidence link', () => {
+  const { value, hints } = withHintObserver(() => runRequirementFunnel({ now, cells: [], sources: hintSources('trigram BM25 로 매긴다'), placement,
+    features: [builtFeature] }));
+  expect(hints).toHaveLength(1);
+  expect(hints[0]?.payload).toEqual({ id: 'hint-req', link: 'https://example.test/hint', kind: 'already',
+    devProject: 'elanous-core', feature: 'session-search-rank',
+    evidence: { commit: 'f345b450b4', file: 'src/session/search-index.ts' }, score: expect.any(Number) });
+  // 힌트는 곁기록이다 — 깔때기 결과는 기능 지도 없이 돈 것과 같다.
+  expect(value).toEqual(runRequirementFunnel({ now, cells: [], sources: hintSources('trigram BM25 로 매긴다'), placement }));
+});
+
+test('ALREADY-BUILT ②: unrelated requirement, evidence-less row and refused pair stay silent (0 hints)', () => {
+  const unrelated = withHintObserver(() => runRequirementFunnel({ now, cells: [], sources: hintSources('회계 장부 집계를 자동으로 정리한다'),
+    placement, features: [builtFeature] }));
+  expect(unrelated.hints).toHaveLength(0);
+  const noEvidence = withHintObserver(() => runRequirementFunnel({ now, cells: [], sources: hintSources('trigram BM25 로 매긴다'),
+    placement, features: [{ ...builtFeature, evidence: {} }] }));
+  expect(noEvidence.hints).toHaveLength(0);
+  const refused = withHintObserver(() => runRequirementFunnel({ now, cells: [], sources: hintSources('trigram BM25 로 매긴다'),
+    placement, features: [builtFeature], refusedFeatures: [{ requestHash: hashContent('trigram BM25 로 매긴다'), feature: builtFeature.feature }] }));
+  expect(refused.hints).toHaveLength(0);
+  // 거절한 짝은 그 feature 만 조용히 시킨다 — 다른 행은 계속 알린다.
+  const otherPair = withHintObserver(() => runRequirementFunnel({ now, cells: [], sources: hintSources('trigram BM25 로 매긴다'),
+    placement, features: [builtFeature], refusedFeatures: [{ requestHash: hashContent('trigram BM25 로 매긴다'), feature: 'other-feature' }] }));
+  expect(otherPair.hints).toHaveLength(1);
+});
+
+test('ALREADY-BUILT ③: a hint failure is a side-record — the funnel result is unchanged', () => {
+  const exploding: AlreadyBuiltFeature = { ...builtFeature, get text(): string { throw new Error('hint boom'); } };
+  const base = { now, cells: [], sources: hintSources('trigram BM25 로 매긴다'), placement };
+  const baseline = runRequirementFunnel(base);
+  const events: { category: unknown; event: unknown; payload: unknown }[] = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) =>
+    events.push({ category: args[0], event: args[1], payload: args[2] })) as typeof debug.log);
+  let failed: ReturnType<typeof runRequirementFunnel> | undefined;
+  try { failed = runRequirementFunnel({ ...base, features: [exploding] }); }
+  finally { spy.mockRestore(); }
+  expect(failed).toEqual(baseline);
+  expect(events.filter(entry => entry.event === 'hint-failed').map(entry => (entry.payload as { id: string }).id)).toEqual(['hint-req']);
 });

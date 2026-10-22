@@ -1247,7 +1247,7 @@ describe('harness ask production entry wiring', () => {
             rounds: 1,
             completion: 'worktree-only',
             readProposals: () => ({
-              proposals: new Map([['run-piece', { shardId: 'run-piece', pieces: [
+              proposals: new Map([['run-piece', { shardId: 'run-piece', hotPathOverlaps: [], pieces: [
                 { id: 'first', feature: 'first fragment', dependsOn: [] },
                 { id: 'second', feature: 'second fragment', dependsOn: [] },
               ] }]]),
@@ -1502,7 +1502,7 @@ describe('harness ask production entry wiring', () => {
             rounds: 1,
             completion: 'worktree-only',
             readProposals: () => ({
-              proposals: new Map([['run-dev-piece', { shardId: 'run-dev-piece', pieces: [
+              proposals: new Map([['run-dev-piece', { shardId: 'run-dev-piece', hotPathOverlaps: [], pieces: [
                 { id: 'first', feature: 'first fragment', dependsOn: [] },
                 { id: 'second', feature: 'second fragment', dependsOn: [] },
               ] }]]),
@@ -3632,7 +3632,7 @@ describe('dev CLI help tiers', () => {
 });
 
 describe('self gate explicit remote CLI wiring', () => {
-  test('three explicit remote failures never invoke the local gate; automatic fallback is visible; remote rc and host survive', async () => {
+  test('remote self-gate failures never invoke the local gate; automatic fallback remains visible for other tools; remote rc and host survive', async () => {
     const remote = await import('./self-implement/gate-remote.js');
     const reservationRoot = mkdtempSync(join(tmpdir(), 'index-gate-reservation-'));
     mkdirSync(join(reservationRoot, 'release', 'gate-host-reservations'), { recursive: true });
@@ -3673,9 +3673,9 @@ describe('self gate explicit remote CLI wiring', () => {
       expect(await invoke(['--base', 'HEAD', '--remote', 'node-b'])).toBe(1);
       expect(localCalls).toBe(0);
       expect(errors.join('')).toContain('host-busy');
-      expect(await invoke(['--base', 'HEAD'])).toBe(7);
-      expect(localCalls).toBe(1);
-      expect(errors.join('')).toContain('fallback to local — host-busy');
+      expect(await invoke(['--base', 'HEAD'])).toBe(1);
+      expect(localCalls).toBe(0);
+      expect(errors.join('')).toContain('remote unmeasured on node-b (stage=host-busy, rc=98)');
       remoteResult = { rc: 0, stdout: 'auto success\n', stderr: '\n__GATE_REMOTE_RC=0\n' };
       expect(await invoke(['--base', 'HEAD'])).toBe(0);
       expect(localCalls).toBe(0);
@@ -3691,7 +3691,7 @@ describe('self gate explicit remote CLI wiring', () => {
     } finally { dispatch.mockRestore(); await rm(reservationRoot, { recursive: true, force: true }); }
   });
 
-  test('dispatch setup exception refuses local execution only for an explicit --remote', async () => {
+  test('dispatch setup exception refuses local execution for an explicit --remote', async () => {
     const git = await import('./git-fs/runner.js');
     const gate = await import('./self-implement/gate-cli.js');
     const ui = await import('./ui.js');
@@ -3704,10 +3704,6 @@ describe('self gate explicit remote CLI wiring', () => {
       expect(process.exitCode).toBe(1);
       expect(runLocal).not.toHaveBeenCalled();
       expect(error).toHaveBeenCalledWith('self gate remote unmeasured — git setup unavailable');
-      process.exitCode = 0;
-      await program.parseAsync(['node', 'elanous', 'self', 'gate', '--changed']);
-      expect(process.exitCode).toBe(7);
-      expect(runLocal).toHaveBeenCalledTimes(1);
     } finally {
       error.mockRestore();
       runGit.mockRestore();

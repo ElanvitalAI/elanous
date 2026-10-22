@@ -31,7 +31,7 @@ export interface ProviderDetectDeps {
 
 const LIMIT_MS = 3_000;
 const CLAUDE_LIMIT_MS = 5_000;
-const ORDER = ['openai-codex', 'anthropic', 'grok', 'gemini', 'openrouter', 'openai', 'ollama', 'local'] as const;
+const ORDER = ['openai-codex', 'anthropic', 'grok', 'gemini', 'openrouter', 'openai', 'ollama', 'local', 'opengateway'] as const;
 const AGENT_RANK = { 'claude-code': -2, antigravity: -1 } as const;
 const SOURCE_PRIORITY: Readonly<Record<string, number>> = {
   'elanous-auth': 0,
@@ -44,6 +44,7 @@ const ENV_KEYS: Readonly<Record<string, readonly string[]>> = {
   grok: ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'],
   gemini: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
   openrouter: ['OPENROUTER_API_KEY'],
+  opengateway: ['OPENGATEWAY_API_KEY'],
   openai: ['OPENAI_API_KEY'],
 };
 
@@ -158,6 +159,12 @@ export async function detectProviders(deps: ProviderDetectDeps = {}): Promise<De
     updateClaude();
     const agyInstall = Promise.resolve().then(() => isDirectory(join(home, '.gemini', 'antigravity-cli'))).catch(() => false);
     const files = [
+      // The installed CLI can discover the key even when the shell has not exported it.
+      // Read only; the value is never included in the detection result.
+      Promise.resolve().then(async () => {
+        const path = join(env.ELANOUS_KEY_CACHE_DIR?.trim() || join(home, '.cache'), 'opengateway_api_key');
+        if (await isFile(path) && populated(await file(path))) add('opengateway', 'apikey', 'cache:OPENGATEWAY_API_KEY');
+      }).catch(() => {}),
       json(storePath).then((store) => {
         const providers = record(store?.providers);
         if (!providers) return;

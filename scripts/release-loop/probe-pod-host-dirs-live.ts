@@ -20,6 +20,8 @@ function option(name: string, fallback?: string): string {
 }
 
 async function main(): Promise<void> {
+  const actor = process.env.ELANOUS_SEAT?.trim() || process.env.USER?.trim() || process.env.LOGNAME?.trim();
+  if (!actor) throw new Error('pod provenance actor missing: ELANOUS_SEAT or USER/LOGNAME required');
   const context = option('context');
   const host = option('host');
   const cluster = option('cluster', 'elanous-pool');
@@ -51,6 +53,9 @@ async function main(): Promise<void> {
       let completed = false;
       try {
         const result = await runPodCommand({
+          provenance: { actorKind: process.env.ELANOUS_SEAT?.trim() ? 'seat' : 'human', actor, character: 'host-dirs-probe',
+            entrance: 'probe', kind: 'probe', run: name, phase: 'exec', requestedAt: new Date().toISOString(),
+            reason: `host directory probe ${arm}` },
           command: ['sh', '-c', 'printf cache-ok > /bun-cache/.host-dir-probe && printf slots-ok > /gate-install-slots/.host-dir-probe && test "$(cat /bun-cache/.host-dir-probe)" = cache-ok && test "$(cat /gate-install-slots/.host-dir-probe)" = slots-ok && rm /bun-cache/.host-dir-probe /gate-install-slots/.host-dir-probe && echo HOST_DIRS_WRITTEN'],
           name,
           namespace, image, imageCommit: null, deadlineSeconds: 120, pollMs: 1_000, statusUnreadableMs: 30_000,

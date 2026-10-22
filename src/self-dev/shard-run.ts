@@ -25,6 +25,8 @@ export interface ShardRunResult {
   failureEvidence?: ShardFailureEvidence[];
   /** Latest failed attempt's reason for each incomplete shard; copied into the gate artifact summary. */
   unmeasuredByShard?: Record<string, string>;
+  /** git stderr tail (redacted · ≤2KB · one line) when the baseline worktree could not be added. */
+  baselineStderrTail?: string;
 }
 
 /** What a failed shard process leaves behind so «test failure vs runner error» can be told apart after the fact. */
@@ -275,6 +277,7 @@ function runPlannedShards(
           currentSignal: current.signal, baselineSignal: base.signal,
           currentDiagnostic: current.diagnostic, baselineDiagnostic: base.diagnostic,
           baselineFiles,
+          currentRoot: cwd, baselineRoot: dir,
         });
       }
       const retry = new Set(aggregateGateTestShards(shards, attempts).retryShardIds);
@@ -288,9 +291,13 @@ function runPlannedShards(
     ...(baseline.retryShardIds.length ? { unmeasuredByShard: incompleteShardReasons(baseline.retryShardIds, attempts) } : {}),
   };
   const retryShardIds = shards.map((shard) => shard.id);
+  // The stderr tail has its own budget (≤2KB, already redacted) so the 500-char log cut cannot drop it.
+  const stderrTail = baseline.gitStderrTail;
+  const stderrPart = stderrTail ? ` · git stderr: ${stderrTail}` : '';
   return {
     aggregate: { status: 'unmeasured', retryShardIds }, shards, attempts, reason: baseline.log, ...evidence,
-    unmeasuredByShard: Object.fromEntries(retryShardIds.map((id) => [id, `baseline worktree: ${redactSecretText(baseline.log).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500)}`])),
+    unmeasuredByShard: Object.fromEntries(retryShardIds.map((id) => [id, `baseline worktree: ${redactSecretText(baseline.log).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500)}${stderrPart}`])),
+    ...(stderrTail ? { baselineStderrTail: stderrTail } : {}),
   };
 }
 

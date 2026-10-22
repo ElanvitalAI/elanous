@@ -130,7 +130,7 @@ export function trackTablePrompt(tracks?: Record<string, string>): string {
   return `\n담당 트랙(owner) — 아래 중 하나(${keys.map(k => JSON.stringify(k)).join('|')}) · 이슈가 어느 트랙 일인지:\n${keys.map(k => `- ${k}: ${tracks[k]}`).join('\n')}`;
 }
 
-export async function triageIssues(issues: TriageIssue[], judge?: NonNullable<StewardDeps['judge']>, decide: typeof emitDecision = emitDecision, tracks?: Record<string, string>, previous: Array<TriageDecision & { inputHash?: string }> = [], ask: StewardAsk = askSteward): Promise<TriageDecision[]> {
+export async function triageIssues(issues: TriageIssue[], judge?: NonNullable<StewardDeps['judge']>, decide: typeof emitDecision = emitDecision, tracks?: Record<string, string>, previous: Array<TriageDecision & { inputHash?: string }> = [], ask: StewardAsk = askSteward, budget?: { deadlineMs: number; perIssueMs: number; concurrency: number }): Promise<TriageDecision[]> {
   const started = judge ? 0 : Date.now();
   const classified: ClassifiedIssue[] = [];
   const classifiedIds = new Set<string>();
@@ -144,7 +144,7 @@ export async function triageIssues(issues: TriageIssue[], judge?: NonNullable<St
     decide({ kind: result.rung === 'hitl' ? 'ESCALATE' : 'ROUTE', what: result.issue, reason: result.why,
       purpose: 'steward triage', target: result.owner ? `${result.rung} · ${result.owner}` : String(result.rung), refs: { issue: result.issue } });
   };
-  const { decisions } = await triageWithinBudget({ issues, previous, tracks, judge: async (issue, observedIssues) => {
+  const { decisions } = await triageWithinBudget({ issues, previous, tracks, ...(budget ?? {}), judge: async (issue, observedIssues) => {
     try {
       if (judge) return parseJudgment(issue, await judge(issue, observedIssues ?? issues, tracks), tracks);
       const byRule = ruleJudgment(issue, observedIssues ?? issues);
@@ -487,7 +487,24 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
         Array.isArray(item.dependsOn) && item.dependsOn.every((dep: unknown) => typeof dep === 'string') &&
         typeof item.priority === 'number' && Number.isFinite(item.priority) && typeof item.why === 'string')) previous = parsed;
     } catch { /* Missing or corrupt previous judgments are an empty cache. */ }
-    writeFileSync(judgments, JSON.stringify(await triageIssues(issues, judge, deps.decide, settings.tracks, previous, deps.ask)));
+    const { appendTriageTick, readTriageTicks, triageItemEvents, triageItemMetrics, triageTickBudget, triageTickCycle,
+      triageTickHealth, triageTickKey } = await import('./triage-budget.js');
+    const ticks = readTriageTicks(root);
+    const cycle = triageTickCycle(ticks.at(-1), triageTickKey(issues));
+    const budget = triageTickBudget({ cycle, issueCount: issues.length });
+    const decisions = await triageIssues(issues, judge, deps.decide, settings.tracks, previous, deps.ask, budget);
+    writeFileSync(judgments, JSON.stringify(decisions));
+    const events = triageItemEvents({ cycle, issues, decisions, previous });
+    const metrics = triageItemMetrics(events);
+    const mode = settings.mode ?? 'shadow';
+    const health = triageTickHealth({ previous: ticks.at(-1), mode, events });
+    for (const event of events) debug.log('steward.triage', 'item-event', { ...event, health: health.health });
+    debug.log('steward.triage', 'tick', { cycle, basis: budget.basis, perIssueMs: budget.perIssueMs,
+      concurrency: budget.concurrency, ...metrics, ...health });
+    appendTriageTick(root, { at: new Date().toISOString(), mode, key: cycle.key, ticks: cycle.ticks, issues: issues.length,
+      deadlineMs: budget.deadlineMs, perIssueMs: budget.perIssueMs, concurrency: budget.concurrency,
+      reused: metrics.byOutcome.reused, judged: metrics.byOutcome.judged, timedOut: metrics.byOutcome['timed-out'],
+      deferred: metrics.byOutcome.deferred, ...health, events });
   } else if (stage === 'schedule') {
     const decisions = JSON.parse(readFileSync(judgments, 'utf8')) as TriageDecision[];
     const pending = new Set(decisions.flatMap(decision => decision.dependsOn));

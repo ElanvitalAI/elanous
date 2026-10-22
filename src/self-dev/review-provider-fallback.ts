@@ -107,6 +107,36 @@ export function parseTeamclaudeBaseUrl(stdout: string): string | undefined {
   return match?.[1];
 }
 
+export interface TeamclaudeReviewRoute {
+  /** Present only when teamclaude printed its proxy base URL: the cct ACP spawn (billing scrub ⊕ base-url). */
+  spawn?: ReturnType<typeof subscriptionReviewerSpawn>;
+  reason: 'teamclaude-base-url' | 'teamclaude-no-base-url' | 'teamclaude-unavailable';
+  exit?: number | null;
+}
+
+/**
+ * ACP-REVIEW-VIA-TEAMCLAUDE (0.2.35): the explicit `--acp-backend claude` review reuses the cct route of the
+ * subscription lane — `teamclaude env --no-mitm` → base URL → `subscriptionReviewerSpawn` — without the quota gate
+ * (an explicit flag is the operator's choice). teamclaude missing or silent = no spawn; the caller keeps its prior path.
+ */
+export function resolveTeamclaudeReviewRoute(
+  env: NodeJS.ProcessEnv = process.env,
+  runStatus: NonNullable<SubscriptionReviewerDeps['runStatus']> = (command, args, cleanEnv) =>
+    spawnSync(command, args, { env: { ...cleanEnv, NODE_ENV: process.env.NODE_ENV }, encoding: 'utf8', timeout: 5_000 }),
+): TeamclaudeReviewRoute {
+  const spec: SubscriptionReviewerSpec = { provider: 'claude-acp', executor: 'cct' };
+  try {
+    const proxy = runStatus('teamclaude', ['env', '--no-mitm'], subscriptionReviewerSpawn(spec, env).env);
+    // Bun reports a missing binary as `status: undefined` (Node: null) — both mean «no teamclaude here».
+    if (proxy.status == null) return { reason: 'teamclaude-unavailable' };
+    const baseUrl = proxy.status === 0 ? parseTeamclaudeBaseUrl(String(proxy.stdout ?? '')) : undefined;
+    if (!baseUrl) return { reason: 'teamclaude-no-base-url', exit: proxy.status };
+    return { spawn: subscriptionReviewerSpawn(spec, env, baseUrl), reason: 'teamclaude-base-url' };
+  } catch {
+    return { reason: 'teamclaude-unavailable' };
+  }
+}
+
 /** Guard the ACP review before spawning. An unmeasured quota never authorizes subscription use. */
 export function subscriptionReviewerAvailability(
   spec: SubscriptionReviewerSpec,
@@ -291,7 +321,7 @@ export interface ReviewFallbackObservation {
 export async function runReviewWithFallback(
   attempts: readonly ReviewProviderAttempt[],
   call: (attempt: ReviewProviderAttempt, observeResolvedProvider: (provider?: string) => void) => Promise<string>,
-  observe: (event: 'attempt' | 'resolved' | 'fallback' | 'exhausted', data: ReviewFallbackObservation) => void = () => {},
+  observe: (event: 'attempt' | 'resolved' | 'completed' | 'fallback' | 'exhausted', data: ReviewFallbackObservation) => void = () => {},
 ): Promise<{ text: string; used: ReviewProviderAttempt; attemptIndex: number }> {
   if (attempts.length === 0) throw new Error('review fallback: no attempts configured');
   let lastError: unknown;
@@ -317,6 +347,10 @@ export async function runReviewWithFallback(
       const text = await call(attempt, (provider) => { resolvedProvider = provider; });
       if (resolvedProvider) {
         try { observe('resolved', { ...base, resolvedProvider }); } catch { /* fail-soft */ }
+      }
+      // Provider calls are attempts; only a non-empty artifact completes a logical review round.
+      if (text.trim()) {
+        try { observe('completed', { ...base, ...(resolvedProvider ? { resolvedProvider } : {}) }); } catch { /* fail-soft */ }
       }
       return { text, used: attempt, attemptIndex: i };
     } catch (error) {

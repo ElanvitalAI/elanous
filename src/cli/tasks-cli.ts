@@ -1,6 +1,7 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { loadRunLedger as loadRunLedgerSync, loadRunLedgerWithMetadata, runLedgerDir, resolveFederatedRunLedgerDirectories } from '../self-implement/run-ledger.js';
 import { goalRunDbPath, loadGoalRunQuery } from '../self-implement/goal-run-store.js';
 import { loadGoalAskRecords } from '../self-implement/goal-ask-store.js';
@@ -14,14 +15,16 @@ import { assignedVersions, releasedVersion, validateVersion } from '../release-l
 import { compareVersions } from '../directives/version-at.js';
 import { cardsBoard, countBoardTasks, INTERNAL_PACK_PROJECT, mergeBoards, releasePackBoard, type BoardNode } from '../task-agent/board.js';
 import type { Task } from '../task-orchestrator/types.js';
-import { cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, handTask, updateTaskCard, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, runTagChange, taskAgentStatePath as taskStatePathDefault, taskCardLabelContext, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
+import { boundPrTerminal, cardPrNumber, CLOSED_BY_HAND_EVENT, closeTaskCard, COMPLETION_KINDS, HAND_MOVE_HISTORY_EVENT, updateTaskCard, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, nextMoveFor, resolveHandText, readTaskAgentState, readTaskCard, runTagChange, taskAgentStatePath as taskStatePathDefault, taskCardLabelContext, shellQuote, TASK_CARD_PREFIX, TASK_SEATS, type CompletionKind, type TaskCard, type TaskCardEvent, type TaskLaunchContext, type TaskLaunchReceipt, type TaskLauncher, type TaskSeat } from '../task-agent/task-hand.js';
 import { RUN_TAG_KEYS, runIdentityFieldText, runPriorityClass } from '../task-agent/run-identity.js';
 import { readCardSalvageBranch, recordWiringLiveVerified, refreshCardRunBinding, type CardRunEvidenceDeps } from '../task-agent/card-evidence.js';
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
 import { replayRemoteCardMoves } from '../task-agent/shadow.js';
 import { remoteLedgerMirrorDirs } from '../task-agent/parent-host.js';
+import { buildWorkOrder } from '../task-agent/work-order-build.js';
 import { ambiguousGreenSweepPrs, decideGreenSweep, greenSweepCandidates, observeGreenSweep, type GreenSweepPr } from '../task-agent/green-sweep.js';
 import { HAND_MOVE_KINDS, recordHandMove } from '../task-agent/live-move-history.js';
+import { handTaskWithTierSplit, type TierSizedDecompose } from '../task-agent/tier-split.js';
 import { advanceMission, handMission, MissionAdvanceError, openMissionIds, recordPieceRef, type AdvanceMissionResult, type MissionDecompose, type PieceEvidenceReader } from '../task-agent/mission.js';
 import { formatSevenVerbLive, formatTaskAgentCover, measureSevenVerbLive, measureTaskAgentCover, type CoverRow, type ImplementCardRunBinding, type ImplementRunMergeEvent, type SevenVerbLive, type TaskAgentCoverInput } from '../task-agent/cover.js';
 import { LogStore, STORE_SAFETY_MAX, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
@@ -49,6 +52,8 @@ export interface TasksCliDeps {
   registerSink?: (surface: string) => Promise<unknown>;
   /** `task hand --mission` 의 분해기(시험 주입). 기본 = 나열형은 결정론 · 아니면 `decomposeSelfDevGoal`. */
   missionDecompose?: MissionDecompose;
+  /** TIER-SPLIT-BEFORE-LAUNCH — `tasks hand --tier 상|특 --live` 의 분해기(시험 주입). 키가 없으면 `DEFAULT_TIER_SIZED_DECOMPOSE`. */
+  tierSizedDecompose?: TierSizedDecompose;
   /** `task advance` 의 착지 근거 읽기(시험 주입). 기본 = `predecessorState`(gh · 런 원장). */
   pieceEvidence?: PieceEvidenceReader;
   /** `task board` 의 내부 팩 어댑터(시험 주입). 기본 = 현재 판(`checklistDevVersion()`)의 `releasePackBoard` — 읽기만. */
@@ -57,6 +62,8 @@ export interface TasksCliDeps {
   releaseVersions?: () => string[];
   /** Isolated checklist read for PR adoption. */
   adoptChecklist?: typeof listChecklist;
+  /** Isolated checklist read for work-order build. */
+  workOrderChecklist?: typeof listChecklist;
   /** `tasks adopt-pr` live PR read seam; default is gh in this repository. */
   adoptPrView?: (number: number, cwd: string) => import('../task-agent/adopt-pr.js').AdoptPrView;
   /** Isolated ledger proof for a launched card being adopted. */
@@ -85,6 +92,10 @@ export interface TasksCliDeps {
   coverImplementRunMerges?: () => ReadonlyMap<string, ImplementRunMergeEvent> | null;
   /** Read test-universe ledgers only when --include-test was requested. */
   coverIncludeTest?: boolean;
+  /** `tasks outcomes` 의 «지금» — 상대 기간(`--since 24h`)을 푸는 기준(시험 주입). 기본 = `Date.now()`. */
+  outcomesNow?: () => number;
+  /** `tasks outcomes` 페이지 상한(시험 주입). 기본 = `OUTCOMES_QUERY_LIMIT`. */
+  outcomesLimit?: number;
   /** TA-REJUDGE-ON-HEAD — `tasks rejudge` 의 판단 의존(시험 주입 · 기본 = 설정 liveMoves ⊕ 실물 gh·리뷰·재게이트·land). */
   rejudge?: Partial<import('../task-agent/rejudge-on-head.js').RejudgeDeps>;
   /** TA-REJUDGE-ON-HEAD — `tasks regate-run` 의 재게이트(시험 주입 · 기본 `runHostRegate`). */
@@ -163,10 +174,16 @@ export interface DefaultTaskLauncherDeps {
   /** HQ 판(시험 주입). */
   localVersion?: string;
   /** HQ-owned, refresh-less Codex access mirror to install before a remote parent launch. */
-  codexAccessMirror?: () => Promise<{ elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number } | null>;
+  codexAccessMirror?: () => Promise<{ elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number; mirrors?: Array<{ elanousAuth: string; codexAuth: string; account: string; usedPercent?: number; thresholdPercent: number; expiresAt: number }> } | null>;
+  /** HQ-owned Grok subscription access mirror; resolved before the first remote SSH call. */
+  grokAccessMirror?: () => import('../task-agent/parent-host.js').OwnerGrokAccessMirror;
+  /** Clock used to recheck mirror freshness immediately before installation. */
+  now?: () => number;
   /** Isolated integration seam; production still reads the HQ rotation snapshot and config directly. */
   ownerCodexRotation?: () => ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation>;
   ownerCodexRotationConfig?: { accountOrder?: readonly string[]; thresholdPercentByAccount?: Readonly<Record<string, unknown>> };
+  /** The HQ owner fence is checked before any token refresh. */
+  ownerCodexLeaseHolder?: () => boolean;
   /** 원격 → 로컬 되돌림 알림(시험 주입). 기본 = stderr 한 줄. */
   notice?: (line: string) => void;
 }
@@ -187,13 +204,17 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   const multi = Array.isArray(configured);
   const targets = configured === null ? [] : parentHostModule.resolveParentHosts(configured, deps.parentHost === undefined ? process.env : { ...process.env, ELANOUS_TA_PARENT_HOST: undefined });
   if (!targets.length) return null;
+  const providerFromArgs = args.find((arg) => arg.startsWith('--child-llm-provider='))?.slice('--child-llm-provider='.length)
+    ?? (args.includes('--child-llm-provider') ? args[args.indexOf('--child-llm-provider') + 1] : undefined);
+  const effectiveChildProvider = context.effectiveChildProvider ?? providerFromArgs;
   const notice = deps.notice ?? ((line: string) => { try { process.stderr.write(`${line}\n`); } catch { /* ignore */ } });
   const failed = (target: typeof targets[number], gaps: string[], facts: Record<string, string> = {}): void => {
     try { debug.log('task-agent', 'parent-host-fallback', { host: target.host, runId: context.runId, gaps, facts }); } catch { /* fail-soft */ }
     notice(`[parent-host] ${target.host} 로 못 띄움 — ${multi ? '다음 호스트 또는 로컬 발사로 간다' : '로컬 발사로 간다'}: ${gaps.join(' · ')}`);
   };
-  let accessMirror: { elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number } | null | undefined;
-  const getAccessMirror = async (): Promise<{ elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number } | null> => {
+  type OwnerMirror = { elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number; mirrors?: Array<{ elanousAuth: string; codexAuth: string; account: string; usedPercent?: number; thresholdPercent: number; expiresAt: number }> };
+  let accessMirror: OwnerMirror | null | undefined;
+  const getAccessMirror = async (): Promise<OwnerMirror | null> => {
     if (accessMirror !== undefined) return accessMirror;
     if (deps.codexAccessMirror) {
       accessMirror = await deps.codexAccessMirror();
@@ -212,6 +233,10 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     const config = getUserConfig();
     const ownerConfig = deps.ownerCodexRotationConfig;
     const candidates = [...rotation.candidates];
+    // No local credential preserves the established local-launch fallback.
+    if (candidates.length === 0) { accessMirror = null; return null; }
+    const ownerLeaseHeld = deps.ownerCodexLeaseHolder?.() ?? hq.hqFenceDecision('ledger-cli').run;
+    if (!ownerLeaseHeld) throw new NoEligibleOwnerCodexAccountError('HQ Codex 토큰 주인 임대가 없어 원격 미러 발사를 거부한다');
     const eligible = planOwnerCodexMirrorCandidates(candidates, {
       accountOrder: ownerConfig?.accountOrder ?? config.llm?.codexAccountOrder ?? [],
       thresholdPercentByAccount: ownerConfig?.thresholdPercentByAccount ?? config.llm?.codexAccountRotationThresholdPercentByAccount,
@@ -220,22 +245,44 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     const prerefreshDeps = {
       credentials: (account: string) => pod.hostCredentials(account, authStore.authStorePath(), () => '', { requireExplicitChatgptAuthMode: true }),
       refresh: (account: string) => codex.refreshCodexAccountHome(account),
-      isLeaseHolder: () => hq.hqFenceDecision('ledger-cli').run,
+      isLeaseHolder: () => deps.ownerCodexLeaseHolder?.() ?? hq.hqFenceDecision('ledger-cli').run,
     };
-    for (const candidate of eligible) {
-      // The account's refresh token stays on HQ. Only the selected account's access-only mirror crosses SSH.
+    const mirrors: NonNullable<OwnerMirror['mirrors']> = [];
+    for (const [index, candidate] of eligible.entries()) {
+      const usedPercent = candidate.usedPercent;
+      const thresholdPercent = podAccountThresholdPercent(candidate.name, {
+        thresholdPercentByAccount: ownerConfig?.thresholdPercentByAccount ?? config.llm?.codexAccountRotationThresholdPercentByAccount,
+      });
+      // HQ is the sole refresh owner. Send every usable account as an access-only snapshot
+      // so the remote Pod broker can rotate instead of pinning all jobs to one account.
       let credential: Awaited<ReturnType<typeof pod.podCodexCredentialWithPrerefresh>> = null;
       try { credential = await pod.podCodexCredentialWithPrerefresh(candidate.name, prerefreshDeps); }
-      catch { continue; }
-      if (!credential) continue;
-      accessMirror = { elanousAuth: credential.elanousAuth, codexAuth: credential.codexAuth, account: candidate.name,
-        ...(candidate.usedPercent !== undefined ? { usedPercent: candidate.usedPercent } : {}),
-        thresholdPercent: podAccountThresholdPercent(candidate.name, {
-          thresholdPercentByAccount: ownerConfig?.thresholdPercentByAccount ?? config.llm?.codexAccountRotationThresholdPercentByAccount,
-        }) };
-      return accessMirror;
+      catch {
+        try { debug.log('task-agent.parent-host', 'codex-access-mirror-account-skipped', { account: candidate.name, reason: 'credential-error' }); } catch { /* fail-soft */ }
+        continue;
+      }
+      if (!credential) {
+        try { debug.log('task-agent.parent-host', 'codex-access-mirror-account-skipped', { account: candidate.name, reason: 'expiring-or-refresh-failed' }); } catch { /* fail-soft */ }
+        continue;
+      }
+      const expiresAt = (JSON.parse(credential.elanousAuth) as { providers?: { 'openai-codex'?: { tokens?: { expiresAt?: unknown } } } }).providers?.['openai-codex']?.tokens?.expiresAt;
+      if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= (deps.now?.() ?? Date.now()) + 3 * 60 * 60 * 1000) {
+        try { debug.log('task-agent.parent-host', 'codex-access-mirror-account-skipped', { account: candidate.name, reason: 'access-expiring' }); } catch { /* fail-soft */ }
+        continue;
+      }
+      mirrors.push({ elanousAuth: credential.elanousAuth, codexAuth: credential.codexAuth, account: candidate.name,
+        expiresAt,
+        ...(usedPercent !== undefined ? { usedPercent } : {}), thresholdPercent });
+      // The receiving marker parser accepts at most 16 distinct accounts.
+      // Apply the same bound before writing credentials on the remote parent.
+      if (mirrors.length === 16) {
+        for (const skipped of eligible.slice(index + 1)) {
+          try { debug.log('task-agent.parent-host', 'codex-access-mirror-account-skipped', { account: skipped.name, reason: 'snapshot-limit-16' }); } catch { /* fail-soft */ }
+        }
+        break;
+      }
     }
-    accessMirror = null;
+    accessMirror = mirrors.length ? { ...mirrors[0]!, mirrors } : null;
     return accessMirror;
   };
   if (cwd) {
@@ -248,6 +295,11 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   //   그 앞의 readParentHostCapacity 도 ssh). 가드를 아래로 내리면 hold 경로에서 시험이 실 ssh 를 쏜다(R7 사고 모양).
   //   hold 경로를 재는 시험은 deps.ssh 가짜 또는 parentHost:null 을 주입한다(real-launch-guard.test 가 이 순서를 문다).
   if (!deps.ssh) (await import('../task-agent/real-launch-guard.js')).refuseRealLaunchUnderTest('remote-parent-ssh', targets.map((target) => target.host).join(','));
+  // Grok access is selected/refreshed on HQ before preflight performs any SSH call. A missing or stale
+  // subscription must fail closed without touching the remote host or falling back to a local launch.
+  const grokAccessMirror = effectiveChildProvider === 'grok'
+    ? (deps.grokAccessMirror?.() ?? parentHostModule.resolveOwnerGrokAccessMirror())
+    : undefined;
   let launchHoldActive = false;
   try {
     if (deps.launchHoldActive) launchHoldActive = deps.launchHoldActive();
@@ -264,6 +316,8 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   delete remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNT;
   delete remoteEnv.ELANOUS_REMOTE_CODEX_USED_PERCENT;
   delete remoteEnv.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT;
+  delete remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNTS;
+  delete remoteEnv.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
   if (podGoal) for (const key of ['ELANOUS_POD_MEMORY_TIER', 'ELANOUS_POD_MEMORY', 'ELANOUS_POD_MEMORY_HIGH', 'ELANOUS_POD_MEMORY_LITE', 'ELANOUS_POD_GOAL_TYPE'] as const) {
     const value = context.env[key] ?? process.env[key];
     if (value !== undefined) remoteEnv[key] = value;
@@ -300,30 +354,63 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     if (preflight.warnings.length) notice(`⚠ ${target.host} 자격: ${preflight.warnings.join(' · ')}`);
     try {
       if (parentHostModule.shouldInstallRemoteCodexAccess(context.effectiveChildProvider)) {
-        let mirror: { elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number } | null = null;
+        let mirror: OwnerMirror | null = null;
         let mirrorReason = 'credential-source-empty';
         try { mirror = await getAccessMirror(); }
         catch (error) {
           if (error instanceof NoEligibleOwnerCodexAccountError) throw error;
           mirrorReason = 'credential-source-error';
         }
-        if (mirror) parentHostModule.installRemoteCodexAccess(target, mirror, deps.ssh);
+        // The receiver accepts at most 16 accounts. Use this same bounded
+        // snapshot for installation, the launch marker, and the selected account,
+        // including mirrors supplied by the injected credential source.
+        const mirrors = mirror?.mirrors?.slice(0, 16);
+        const selected = mirrors?.[0] ?? mirror;
+        if (mirror) {
+          // Snapshot construction can outlive the HQ owner lease. Fresh tokens
+          // bypass prerefresh's lock, so recheck before any credential leaves HQ.
+          if (!(deps.ownerCodexLeaseHolder?.() ?? (await import('../hq/hq.js')).hqFenceDecision('ledger-cli').run)) {
+            try { debug.log('task-agent.parent-host', 'codex-access-mirror-owner-lease-lost', { host: target.host, runId: context.runId, reason: 'owner-lease-lost-before-install' }); } catch { /* fail-soft */ }
+            throw new NoEligibleOwnerCodexAccountError('HQ Codex 토큰 주인 임대가 설치 직전에 사라져 원격 미러 발사를 거부한다');
+          }
+          if (mirror.mirrors && mirror.mirrors.length > 16) {
+            for (const skipped of mirror.mirrors.slice(16)) {
+              try { debug.log('task-agent.parent-host', 'codex-access-mirror-account-skipped', { account: skipped.account, reason: 'snapshot-limit-16' }); } catch { /* fail-soft */ }
+            }
+          }
+          // Each detached parent keeps its own auth store and Codex homes for
+          // its full lifetime, including the legacy single-account source.
+          const identity = createHash('sha256').update(`${context.runId}\0${context.launchId}`).digest('hex').slice(0, 20);
+          const xdgRoot = `${target.configDir ?? '$HOME/.elanous'}/remote-parent-credentials/${identity}`;
+          const mirrorDir = `${xdgRoot}/elanous`;
+          const installed = mirrors ?? [{ ...mirror, account: mirror.account ?? 'default' }];
+          parentHostModule.installRemoteCodexAccessBatch({ ...target, configDir: mirrorDir }, installed, deps.ssh);
+          remoteEnv.XDG_CONFIG_HOME = xdgRoot;
+          remoteEnv.CODEX_HOME = `${mirrorDir}/codex-default`;
+          // XDG isolation is for Codex credentials only. gh otherwise loses
+          // the remote host's existing login before a Pod can be created.
+          remoteEnv.GH_CONFIG_DIR = '$HOME/.config/gh';
+        }
         else {
           try { debug.log('task-agent.parent-host', 'codex-access-mirror-unavailable', { host: target.host, runId: context.runId, reason: mirrorReason }); } catch { /* fail-soft */ }
           failed(target, ['codex-access-mirror-unavailable']);
           return null;
         }
-        if (mirror.account) {
-          remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNT = mirror.account;
-          remoteEnv.ELANOUS_REMOTE_CODEX_USED_PERCENT = mirror.usedPercent === undefined ? 'unknown' : String(mirror.usedPercent);
-          if (mirror.thresholdPercent !== undefined) remoteEnv.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT = String(mirror.thresholdPercent);
+        if (selected?.account) {
+          remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNT = selected.account;
+          remoteEnv.ELANOUS_REMOTE_CODEX_USED_PERCENT = selected.usedPercent === undefined ? 'unknown' : String(selected.usedPercent);
+          if (selected.thresholdPercent !== undefined) remoteEnv.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT = String(selected.thresholdPercent);
         }
+        if (mirrors) remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNTS = JSON.stringify(mirrors.map(({ account, usedPercent, thresholdPercent, expiresAt }) => ({ account, usedPercent: usedPercent ?? null, thresholdPercent, expiresAt })));
+        remoteEnv.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
       }
-      const launched = parentHostModule.launchRemoteParent(target, args, remoteEnv, deps.ssh);
+      const launched = parentHostModule.launchRemoteParent(target, args, remoteEnv, deps.ssh,
+        grokAccessMirror ? () => grokAccessMirror : undefined, effectiveChildProvider, deps.now);
       try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
       return { runId: context.runId, parentHost: { host: target.host, ...(target.configDir ? { configDir: target.configDir } : {}), pid: launched.pid, log: launched.log } };
     } catch (error) {
       if (error instanceof parentHostModule.RemoteParentNotLaunchedError) { failed(target, [error.message]); continue; }
+      if (error instanceof NoEligibleOwnerCodexAccountError) throw error;
       try { debug.log('task-agent', 'parent-host-launch-uncertain', { host: target.host, runId: context.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
       throw error;
     }
@@ -344,6 +431,7 @@ function firstStderrLine(path: string): string {
 }
 
 export async function defaultTaskLauncher(args: string[], cwd?: string, context?: TaskLaunchContext, deps: DefaultTaskLauncherDeps = {}): Promise<void | TaskLaunchReceipt> {
+  if (context) context = (await import('../harness/launch-utterance-ledger.js')).withHandLaunchPairContext(args, context); // LAUNCH-UTTERANCE-LEDGER hand→say pair env
   if (context) {
     const remote = await tryRemoteParent(args, cwd, context, deps);
     if (remote) return remote;
@@ -897,6 +985,332 @@ export function readTaskAgentCover(
     limitReached: truncated.taskAgentActions || truncated.allLands || moveRead?.limitReached === true || orderRead?.limitReached === true || goalAsksTruncated || goalRunsTruncated, unreadableStores };
 }
 
+const OUTCOMES_QUERY_LIMIT = STORE_SAFETY_MAX;
+
+/** «끝났다»로 읽는 카드 상태 — 이 밖(handed·launched)은 PR 종결 관측이 있어야 끝난 것으로 센다. */
+const OUTCOME_TERMINAL_STATUSES: ReadonlySet<TaskCard['status']> = new Set(['failed', 'launch-failed', 'landed', 'landed-by-hand', 'done']);
+
+/** 카드 원장에서 «종결»로 읽는 사건 — 이 줄의 시각만 종료 시각으로 쓴다(run-bound · launch 같은 끝나기 전 사건은 종료 시각이 아니다). */
+const OUTCOME_TERMINAL_HISTORY_EVENTS: ReadonlySet<string> = new Set([
+  'failed', 'launch-failed', 'closed-by-hand', 'landed-via-train', 'postland-card', 'postland',
+]);
+const OUTCOME_SUCCESS_HISTORY_EVENTS: ReadonlySet<string> = new Set(['landed-via-train', 'postland-card', 'postland']);
+
+/** `--since`/`--until` 의 상대 기간 — `24h` · `90m` · `3d`. */
+const OUTCOMES_RELATIVE_WINDOW = /^\d+(?:\.\d+)?(?:m|h|d)$/;
+
+/** `--since`/`--until` — ISO 시각 또는 상대 기간. 그 밖의 모양은 창을 지어내지 않고 거부한다. */
+function parseOutcomeTime(value: string | undefined, flag: string, now: number): number | undefined {
+  if (value === undefined) return undefined;
+  const text = value.trim();
+  if (OUTCOMES_RELATIVE_WINDOW.test(text)) {
+    const amount = Number(text.slice(0, -1));
+    const unit = text.slice(-1);
+    const hours = unit === 'd' ? amount * 24 : unit === 'm' ? amount / 60 : amount;
+    return now - hours * 3_600_000;
+  }
+  const time = Date.parse(text);
+  if (!/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d\d:\d\d)$/.test(text) || !Number.isFinite(time)) {
+    throw new Error(`${flag} 는 ISO 시각 또는 상대 기간(24h·3d)이어야 한다`);
+  }
+  return time;
+}
+
+/** `tasks outcomes` 한 줄 — 카드 하나의 결과. 모르는 칸은 null(지어내지 않는다). */
+export interface TaskOutcomeRow {
+  /** 칸(체크리스트 id) — 칸 없이 넘긴 카드는 null. */
+  cell: string | null;
+  card: string;
+  runId: string | null;
+  /** 자식(구현) 런 — 카드가 직접 적은 결속만 사용한다. */
+  childRunId: string | null;
+  /** 부모 호스트 원격 이름 — HQ 로컬 발사면 null. */
+  host: string | null;
+  /** 종료 시각 = 카드 원장의 마지막 종결 사건 시각 ⊕ PR 종결 시각 중 늦은 것(ISO). */
+  endedAt: string;
+  /** 원시 카드 상태. board가 PR 종결로 투영한 상태와 구별한다. */
+  cardStatus: TaskCard['status'];
+  /** PR 결속 — 번호 ⊕ 종결 상태(종결을 못 봤으면 state null). */
+  pr: { number: number; state: 'MERGED' | 'CLOSED' | null } | null;
+  /** 종결 사유는 후속 조각까지 미측정. */
+  reason: null;
+  reasonFrom: null;
+}
+
+export interface TaskOutcomeReport {
+  since: string | null;
+  until: string | null;
+  rows: TaskOutcomeRow[];
+  /** 사유별 집계 — 이 부분 조각에서는 reasons=[], missingReason=cards. */
+  aggregate: { cards: number; reasons: Array<{ reason: string; count: number }>; missingReason: number };
+  /** 조회 상한에 닿아 절단됐나 — 그때 집계는 «이 창 안에서 센 행»만 센다. */
+  limitReached: boolean;
+  /** 절단 사유 — 카드 조회 상한. */
+  stopReason: 'page-limit' | null;
+  /** 자식 원장 관측은 후속 조각에서 연결한다. */
+  childLedgerObserved: false;
+  /** 재결속 검증 전까지 카드 사유도 후속 조각에서 연결한다. */
+  reasonObserved: false;
+  /** 끝났는데 종료 시각을 몰라 창에 넣지 못한 카드 수. */
+  undatedCards: number;
+  /** 아직 끝나지 않은 카드 수(창 대상 아님). */
+  openCards: number;
+  warning?: string;
+}
+
+/** 마지막 실제 종결 사건. 후보·발사·run-bound·관측 줄은 종료 증거가 아니다. */
+function outcomeTerminalHistoryLine(card: TaskCard): TaskCardEvent | undefined {
+  return (card.history ?? []).filter((item) => OUTCOME_TERMINAL_HISTORY_EVENTS.has(item.event)).at(-1);
+}
+
+/**
+ * TA 카드·PR 종결 사실을 기간으로 센다(읽기 전용). 창은 «종료 시각»에 걸린다.
+ * 사유는 재결속 증거를 확인할 때까지 미측정으로 드러낸다.
+ */
+export function readTaskOutcomes(
+  window: { sinceMs?: number; untilMs?: number } = {},
+  deps: Pick<TasksCliDeps, 'taskStatePath' | 'outcomesLimit'> = {},
+  snapshot?: Record<string, TaskCard>,
+): Omit<TaskOutcomeReport, 'since' | 'until'> {
+  const statePath = deps.taskStatePath ?? taskStatePathDefault();
+  const cards = snapshot ?? readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {};
+  const limit = deps.outcomesLimit ?? OUTCOMES_QUERY_LIMIT;
+  const candidates: Array<{ card: TaskCard; terminal: TaskCard['prTerminal']; endedAt: string }> = [];
+  let undatedCards = 0;
+  let openCards = 0;
+  for (const card of Object.values(cards)) {
+    if (!card || typeof card.id !== 'string') continue;
+    const terminal = boundPrTerminal(card);
+    // 결과란 «끝난 카드»다 — 종결 상태이거나 PR 이 종결로 관측된 카드. 아직 도는 카드는 창 대상이 아니다(따로 센다).
+    if (!OUTCOME_TERMINAL_STATUSES.has(card.status) && terminal === undefined) { openCards++; continue; }
+    const terminalHistory = outcomeTerminalHistoryLine(card);
+    const successfulStatus = card.status === 'done' || card.status === 'landed' || card.status === 'landed-by-hand';
+    const manualClosure = (card.status === 'done' || card.status === 'landed-by-hand')
+      && terminalHistory?.event === CLOSED_BY_HAND_EVENT;
+    const failedStatus = card.status === 'failed' || card.status === 'launch-failed';
+    const history = successfulStatus
+      ? (OUTCOME_SUCCESS_HISTORY_EVENTS.has(terminalHistory?.event ?? '') || manualClosure ? terminalHistory : undefined)
+      : failedStatus && (terminalHistory?.event === 'failed' || terminalHistory?.event === 'launch-failed')
+        ? terminalHistory : undefined;
+    // 종료 시각은 «종결 관측»에서만 온다 — 마지막 종결 사건 줄 ⊕ PR 종결 관측 중 늦은 것.
+    // run-bound 같은 끝나기 전 사건을 종료 시각으로 단정하지 않는다(모르면 undatedCards 로 세고 창에 넣지 않는다).
+    const endedAt = [history?.at, terminal?.at]
+      .filter((at): at is string => typeof at === 'string' && Number.isFinite(Date.parse(at)))
+      .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+    if (endedAt === undefined) { undatedCards++; continue; }
+    const time = Date.parse(endedAt);
+    if ((window.sinceMs !== undefined && time < window.sinceMs) || (window.untilMs !== undefined && time > window.untilMs)) continue;
+    candidates.push({ card, terminal, endedAt });
+  }
+  candidates.sort((a, b) => Date.parse(b.endedAt) - Date.parse(a.endedAt) || a.card.id.localeCompare(b.card.id));
+  const limitReached = candidates.length > limit;
+  const selected = limitReached ? candidates.slice(0, limit) : candidates;
+  const rows = selected.map(({ card, terminal, endedAt }): TaskOutcomeRow => {
+    // 이 조각은 카드·PR 종결 사실만 관측한다. 재결속 검증 전까지 사유는 확정하지 않는다.
+    const number = cardPrNumber(card);
+    return {
+      cell: card.checklistId ?? null,
+      card: card.id,
+      runId: card.runId ?? null,
+      childRunId: card.runChildId ?? null,
+      host: card.parentHost?.host ?? null,
+      endedAt,
+      cardStatus: card.status,
+      pr: number === undefined ? null : { number, state: terminal?.state ?? null },
+      reason: null,
+      reasonFrom: null,
+    };
+  });
+  const missingReason = rows.length;
+  const warnings = [
+    limitReached ? `카드 조회 상한 ${limit} 도달 — 창 안 ${candidates.length}장 중 ${rows.length}장만 셌다(집계도 이 행들만 센다)` : null,
+    missingReason > 0 ? `종결 사유 미측정 — ${missingReason}장은 재결속 검증 전까지 사유를 모른다` : null,
+  ].filter((line): line is string => line !== null);
+  return {
+    rows,
+    aggregate: { cards: rows.length, reasons: [], missingReason },
+    limitReached,
+    stopReason: limitReached ? 'page-limit' : null,
+    childLedgerObserved: false,
+    reasonObserved: false,
+    undatedCards,
+    openCards,
+    ...(warnings.length ? { warning: warnings.join(' · ') } : {}),
+  };
+}
+
+/** MODEL-SIZE-OUTCOME-MEASURE — `tasks outcomes --by` 가 아는 집계 축. */
+export const TASK_OUTCOME_BY_DIMENSIONS = ['model', 'size'] as const;
+
+/** 못 읽은 값의 이름 — 0 이나 빈 문자열로 지어내지 않는다. */
+export const TASK_OUTCOME_UNKNOWN = 'unknown';
+
+/** 카드 하나의 결과 — PR 착지 · 범위 이탈 · 수렴 실패 · 결과 줄 없음. */
+export type TaskOutcomeModelSizeResult = 'landed' | 'scope-escape' | 'convergence-failure' | 'no-result-line';
+
+/** 카드 하나의 측정 줄 — 자식 모델 · 등급 · 조각 크기(대상 경로 수 · 바꿀 동작 수) · 결과. */
+export interface TaskOutcomeModelSizeCard {
+  card: string;
+  /** `provider/model`(카드 childLlm) · 못 읽으면 `unknown`. */
+  model: string;
+  /** 디스패처 난이도(하|중|상|특) · 못 읽으면 `unknown`. */
+  tier: string;
+  size: { targetPaths: number | typeof TASK_OUTCOME_UNKNOWN; behaviors: number | typeof TASK_OUTCOME_UNKNOWN };
+  result: TaskOutcomeModelSizeResult;
+}
+
+/** 모델×크기 칸 하나 — 성공률 · 표본 수 · unknown 수. */
+export interface TaskOutcomeModelSizeCell {
+  model: string;
+  /** 크기 칸 이름(`paths=<n>·behaviors=<n>`) · 못 읽은 칸은 `unknown`. */
+  size: string;
+  samples: number;
+  landed: number;
+  /** landed / samples. */
+  successRate: number | null;
+  /** 이 칸에서 한 축이라도 못 읽은 카드 수. */
+  unknown: number;
+  results: Record<TaskOutcomeModelSizeResult, number>;
+}
+
+export interface TaskOutcomeModelSizeReport {
+  dimensions: readonly ['model', 'size'];
+  cells: TaskOutcomeModelSizeCell[];
+  cards: TaskOutcomeModelSizeCard[];
+  /** 축별 «못 읽음» 수 — 카드 합계가 아니라 축마다 센다(한 카드가 둘을 못 읽을 수 있다). */
+  unknown: { model: number; tier: number; size: number };
+  samples: number;
+  limitReached: boolean;
+}
+
+const OUTCOME_MODEL_SIZE_RESULTS: readonly TaskOutcomeModelSizeResult[] = ['landed', 'scope-escape', 'convergence-failure', 'no-result-line'];
+
+/** `--by` 인자 — 지금은 `model,size` 하나뿐이다(순서 무관 · 그 밖은 거부). */
+function parseOutcomeDimensions(value: string | undefined): readonly ['model', 'size'] | undefined {
+  if (value === undefined) return undefined;
+  const parts = [...new Set(value.split(',').map((part) => part.trim().toLowerCase()).filter(Boolean))];
+  if (parts.length !== TASK_OUTCOME_BY_DIMENSIONS.length || !TASK_OUTCOME_BY_DIMENSIONS.every((dimension) => parts.includes(dimension))) {
+    throw new Error(`--by 는 ${TASK_OUTCOME_BY_DIMENSIONS.join(',')} 다(모델×조각 크기): ${value}`);
+  }
+  return ['model', 'size'];
+}
+
+/** 카드 문면의 «바꿀 동작 수» — `바꿀` 선언 줄 ⊕ 그 아래 항목. 선언이 없으면 null(0 으로 지어내지 않는다). */
+function declaredChangeCount(text: string): number | null {
+  let declared = 0;
+  let explicitlyNone = false;
+  let insideChangeList = false;
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (/^바꿀(?:\s|:|것|동작)/.test(trimmed)) {
+      const at = trimmed.indexOf(':');
+      const inline = at < 0 ? '' : trimmed.slice(at + 1).trim();
+      if (/^바꿀\s*(?:것|동작)?\s*:?[\s]*(?:없음|없다)$/u.test(trimmed)) {
+        explicitlyNone = true;
+        insideChangeList = false;
+        continue;
+      }
+      // «바꿀 것: 하나» 처럼 한 줄에 적었으면 그 줄이 한 동작이고, 목록이 뒤따르지 않는다.
+      // «바꿀 것: 다음» 처럼 목록을 가리키는 선언은 그 줄이 동작이 아니고, 뒤따르는 목록을 센다.
+      insideChangeList = inline.length === 0 || /^다음[.!?]?$/.test(inline);
+      if (!insideChangeList) declared++;
+      continue;
+    }
+    if (!insideChangeList) continue;
+    if (/^[-*·]\s+\S/.test(trimmed)) { declared++; continue; }
+    if (trimmed.length > 0) insideChangeList = false;
+  }
+  return declared > 0 ? declared : explicitlyNone ? 0 : null;
+}
+
+/** 조각 크기 — 대상 경로 수(카드가 적은 목록) ⊕ 바꿀 동작 수(문면의 바꿀 선언). */
+function outcomeCardSize(card: TaskCard | undefined): TaskOutcomeModelSizeCard['size'] {
+  const targetPaths = Array.isArray(card?.targetPaths) ? card.targetPaths.length : TASK_OUTCOME_UNKNOWN;
+  const behaviors = card && typeof card.text === 'string' ? declaredChangeCount(card.text) ?? TASK_OUTCOME_UNKNOWN : TASK_OUTCOME_UNKNOWN;
+  return { targetPaths, behaviors };
+}
+
+function outcomeCardModel(card: TaskCard | undefined): string {
+  const llm = card?.childLlm;
+  if (!llm || typeof llm.provider !== 'string' || !llm.provider || typeof llm.model !== 'string' || !llm.model) return TASK_OUTCOME_UNKNOWN;
+  return `${llm.provider}/${llm.model}`;
+}
+
+function outcomeCardTier(card: TaskCard | undefined): string {
+  const tier = card?.tier;
+  return tier === '하' || tier === '중' || tier === '상' || tier === '특' ? tier : TASK_OUTCOME_UNKNOWN;
+}
+
+/**
+ * 결과 판정 — 카드 원장에 있는 사실만 쓴다(문면 추측 없음).
+ * ① 실제 실행·성공한 손 범위 자르기 hand-move(trim-scope)가 있으면 «범위 이탈» — 실행·성공 값이
+ *    없거나 false인 조정 · post-land partial(남은 작업)만으로는 범위 이탈이 아니다.
+ * ② PR MERGED 종결 증거(row.pr ⊕ 원장 prTerminal) 또는 손 착지 종결 기록(closed-by-hand)이 있으면 «PR 착지» —
+ *    카드 상태(landed·done)만으로는 착지로 단정하지 않는다.
+ * ③ 실패 종결 줄이 있으면 «수렴 실패» ④ 그 밖은 «결과 줄 없음».
+ */
+function classifyOutcomeResult(card: TaskCard | undefined, row: TaskOutcomeRow): TaskOutcomeModelSizeResult {
+  if ((card?.history ?? []).some((item) => item.event === HAND_MOVE_HISTORY_EVENT && item.kind === 'trim-scope'
+    && item.executed === true && item.ok === true)) return 'scope-escape';
+  const terminal = card ? boundPrTerminal(card) : undefined;
+  const landedByHand = row.cardStatus === 'landed-by-hand'
+    && (card?.history ?? []).some((item) => item.event === CLOSED_BY_HAND_EVENT);
+  if (row.pr?.state === 'MERGED' || terminal?.state === 'MERGED' || landedByHand) return 'landed';
+  const terminalLine = card ? outcomeTerminalHistoryLine(card) : undefined;
+  if (terminalLine?.event === 'failed' || terminalLine?.event === 'launch-failed') return 'convergence-failure';
+  if (row.cardStatus === 'failed' || row.cardStatus === 'launch-failed') return 'convergence-failure';
+  return 'no-result-line';
+}
+
+/**
+ * MODEL-SIZE-OUTCOME-MEASURE — `tasks outcomes --by model,size`(읽기 전용).
+ * 창 안에서 «끝난» 카드(readTaskOutcomes 와 같은 판정)를 모델×조각 크기 칸으로 묶어 성공률·표본 수·unknown 수를 낸다.
+ * `report` 와 `snapshot` 을 함께 주면 같은 원장 시점으로 창·크기·결과를 센다.
+ */
+export function readTaskOutcomeModelSize(
+  window: { sinceMs?: number; untilMs?: number } = {},
+  deps: Pick<TasksCliDeps, 'taskStatePath' | 'outcomesLimit'> = {},
+  report?: Omit<TaskOutcomeReport, 'since' | 'until'>,
+  snapshot?: Record<string, TaskCard>,
+): TaskOutcomeModelSizeReport {
+  const cards = snapshot ?? readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(deps.taskStatePath ?? taskStatePathDefault()).tasks ?? {};
+  const observed = report ?? readTaskOutcomes(window, deps, cards);
+  const unknown = { model: 0, tier: 0, size: 0 };
+  const cells = new Map<string, TaskOutcomeModelSizeCell>();
+  const rows = observed.rows.map((row): TaskOutcomeModelSizeCard => {
+    const card = cards[row.card];
+    const model = outcomeCardModel(card);
+    const tier = outcomeCardTier(card);
+    const size = outcomeCardSize(card);
+    const result = classifyOutcomeResult(card, row);
+    if (model === TASK_OUTCOME_UNKNOWN) unknown.model++;
+    if (tier === TASK_OUTCOME_UNKNOWN) unknown.tier++;
+    const sizeKey = size.targetPaths === TASK_OUTCOME_UNKNOWN || size.behaviors === TASK_OUTCOME_UNKNOWN
+      ? TASK_OUTCOME_UNKNOWN : `paths=${size.targetPaths}·behaviors=${size.behaviors}`;
+    if (sizeKey === TASK_OUTCOME_UNKNOWN) unknown.size++;
+    // Cell unknown belongs to its two grouping axes; tier is reported separately per card and in unknown.tier.
+    const unresolved = model === TASK_OUTCOME_UNKNOWN || sizeKey === TASK_OUTCOME_UNKNOWN;
+    const key = `${model}\u0000${sizeKey}`;
+    const cell = cells.get(key) ?? { model, size: sizeKey, samples: 0, landed: 0, successRate: null, unknown: 0,
+      results: Object.fromEntries(OUTCOME_MODEL_SIZE_RESULTS.map((name) => [name, 0])) as Record<TaskOutcomeModelSizeResult, number> };
+    cell.samples++;
+    if (result === 'landed') cell.landed++;
+    if (unresolved) cell.unknown++;
+    cell.results[result]++;
+    cell.successRate = cell.landed / cell.samples;
+    cells.set(key, cell);
+    return { card: row.card, model, tier, size, result };
+  });
+  return {
+    dimensions: ['model', 'size'],
+    cells: [...cells.values()].sort((a, b) => a.model.localeCompare(b.model) || a.size.localeCompare(b.size)),
+    cards: rows,
+    unknown,
+    samples: rows.length,
+    limitReached: observed.limitReached,
+  };
+}
+
 export function registerTasksCommands(program: Command, deps: TasksCliDeps = {}): void {
   let activeToken: string | undefined;
   const output = deps.output ?? console.log;
@@ -908,6 +1322,38 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     return auth;
   };
   const tasks = program.command('tasks').alias('task').description('TOX 태스크 조회 및 승인 · TASK-AGENT 과제 넘기기(hand)');
+
+  tasks.command('work-order').description('TASK-AGENT 작업 지시서')
+    .command('build')
+    .description('체크리스트 칸으로 작업 지시서를 만들어 파일에 쓴다')
+    .requiredOption('--checklist <cellId>', '체크리스트 칸 id')
+    .requiredOption('--version <version>', '체크리스트 판')
+    .requiredOption('--out <path>', '작업 지시서 출력 파일')
+    .action((opts: { checklist: string; version: string; out: string }) => {
+      try {
+        validateVersion(opts.version);
+        const item = (deps.workOrderChecklist ?? listChecklist)(opts.version).items.find((cell) => cell.id === opts.checklist);
+        if (!item) throw new Error(`체크리스트 칸 없음: ${opts.checklist}`);
+        const targets = /^대상 경로:[ \t]*(.*)$/.exec(item.title.split(/\r?\n/, 1)[0]!)?.[1]?.split(' · ').map((path) => path.trim()).filter(Boolean) ?? [];
+        const missing = targets.filter((path) => !existsSync(resolve(process.cwd(), path)));
+        const boundary = [
+          ...(targets.length ? [`대상 경로: ${targets.join(' · ')}`] : []),
+          ...(missing.length ? [`boundary.missing: ${missing.join(' · ')}`] : []),
+        ].join('\n');
+        const order = buildWorkOrder({
+          cellId: item.id,
+          version: opts.version,
+          priority: item.priority,
+          boundary: boundary || undefined,
+        });
+        mkdirSync(dirname(opts.out), { recursive: true });
+        writeFileSync(opts.out, `${JSON.stringify(order, null, 2)}\n`);
+        out(opts.out);
+      } catch (error) {
+        out(error instanceof Error ? error.message : '작업 지시서 작성 실패');
+        process.exitCode = 1;
+      }
+    });
 
   tasks.command('green-sweep')
     .description('병합된 과제 PR 과 칸 근거를 대조해 green/기록만/건너뜀을 미리 본다 (항상 dry-run)')
@@ -923,6 +1369,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 }));
         const cards = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(deps.taskStatePath ?? taskStatePathDefault()).tasks ?? {});
         let holds: Set<string> | null = null;
+        let holdDiagnostic: string | undefined;
         if (opts.traffic) {
           try {
             const traffic: unknown = JSON.parse(readFileSync(opts.traffic, 'utf8'));
@@ -930,8 +1377,13 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
               && Array.isArray((traffic as { hold?: unknown }).hold)
               && (traffic as { hold: unknown[] }).hold.every((id) => typeof id === 'string'))
               holds = new Set((traffic as { hold: string[] }).hold);
-          } catch { /* unknown is not an empty hold set */ }
-        }
+            else holdDiagnostic = `invalid-traffic-shape: ${opts.traffic} must contain hold: string[]`;
+          } catch (error) {
+            const code = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+              ? error.code : error instanceof SyntaxError ? 'invalid-json' : 'read-error';
+            holdDiagnostic = `${code}: ${opts.traffic}`;
+          }
+        } else holdDiagnostic = 'traffic-path-not-provided: pass --traffic ~/elanous-hq/seat-state/OP/traffic.json';
         const prCache = new Map<number, GreenSweepPr | null>();
         const ambiguousPrs = ambiguousGreenSweepPrs(snapshot.items, opts.version, cards);
         const origin = run('git', ['remote', 'get-url', 'origin']);
@@ -981,7 +1433,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
               return check.status === 0 ? true : check.status === 1 ? false : null;
             })();
             const decision = decideGreenSweep({ item, candidate, candidateCount: candidates.length,
-              pr: landingPr ?? null, ancestor, hold: holds === null ? null : holds.has(item.id), repositoryMatches,
+              pr: landingPr ?? null, ancestor, hold: holds === null ? null : holds.has(item.id), holdDiagnostic, repositoryMatches,
               ambiguousAcrossCells: ambiguousPrs.has(candidate.pr) });
             observeGreenSweep(decision);
             return decision;
@@ -993,8 +1445,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         if (opts.json) out(JSON.stringify({ dryRun: true, version: opts.version, counts, decisions }));
         else {
           out(`dry-run · ${opts.version} · 후보 ${counts.candidate} · green ${counts.green} · 기록만 ${counts.recordOnly} · 건너뜀 ${counts.skipped}`);
-          for (const d of decisions) out(`${d.verdict}\t${d.cell}\t#${d.pr}\t${d.mergeSha ?? '-'}\t${d.reason}\t${d.evidence}\tbefore=${JSON.stringify(d.existingEvidence)}\tafter=${JSON.stringify(d.plannedEvidence)}`);
-          if (holds === null) out('⚠ hold 원장을 읽지 못해 green 없이 기록만 판정');
+          for (const d of decisions) out(`${d.verdict}\t${d.cell}\t#${d.pr}\t${d.mergeSha ?? '-'}\t${d.reason}\t${d.evidence}\tbefore=${JSON.stringify(d.existingEvidence)}\tafter=${JSON.stringify(d.plannedEvidence)}\tholdDiagnostic=${d.holdDiagnostic ?? ''}`);
         }
       } catch (error) { out(`green-sweep 조회 실패: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
     });
@@ -1049,6 +1500,41 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           if (storeWarning) out(`⚠ ${storeWarning}`);
         }
       } catch (error) { out(error instanceof Error ? error.message : '커버 조회 실패'); process.exitCode = 1; }
+    });
+
+  tasks.command('outcomes')
+    .description('TA 카드·PR 종결 결과를 기간으로 센다 — JSON 한 건, 자식 원장 미측정(읽기 전용 · 카드 페이지 상한)')
+    .option('--since <기간>', '시작 시각 — ISO 또는 상대 기간(24h · 3d)')
+    .option('--until <기간>', '끝 시각 — ISO 또는 지금에서 뺀 상대 기간(24h · 3d)')
+    .option('--by <축>', '집계 축 — model,size = 카드마다 자식 모델 · 등급 · 조각 크기(대상 경로 수·바꿀 동작 수) · 결과(PR 착지 · 범위 이탈 · 수렴 실패 · 결과 줄 없음)를 묶어 모델×크기 칸별 성공률 · 표본 수 · unknown 수를 낸다(읽기 전용)')
+    .option('--json', 'JSON 출력(기본값)')
+    .action((opts: { since?: string; until?: string; by?: string; json?: boolean }) => {
+      try {
+        const now = deps.outcomesNow?.() ?? Date.now();
+        const sinceMs = parseOutcomeTime(opts.since, '--since', now);
+        const untilMs = parseOutcomeTime(opts.until, '--until', now) ?? now;
+        // 창이 뒤집혔으면 아무것도 읽지 않는다(«빈 결과»로 속이지 않는다).
+        if (sinceMs !== undefined && untilMs !== undefined && sinceMs > untilMs) throw new Error('--since 가 --until 보다 늦다');
+        // 축 이름이 틀렸으면 원장도 읽지 않는다(지어낸 집계를 내지 않게).
+        const dimensions = parseOutcomeDimensions(opts.by);
+        const snapshot = dimensions
+          ? readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(deps.taskStatePath ?? taskStatePathDefault()).tasks ?? {}
+          : undefined;
+        const observed = readTaskOutcomes({ sinceMs, untilMs }, deps, snapshot);
+        const report: TaskOutcomeReport = {
+          since: sinceMs === undefined ? null : new Date(sinceMs).toISOString(),
+          until: untilMs === undefined ? null : new Date(untilMs).toISOString(),
+          ...observed,
+        };
+        try { debug.log('task-agent', 'card-outcomes', { since: report.since, until: report.until, rows: report.rows.length,
+          missingReason: report.aggregate.missingReason, stopReason: report.stopReason,
+          childLedgerObserved: false, reasonObserved: false }); } catch { /* fail-soft */ }
+        // `--by model,size` 는 지금 JSON 에 «한 칸»을 더할 뿐 — 없으면 종전 JSON 그대로다.
+        out(JSON.stringify(dimensions ? { ...report, byModelSize: readTaskOutcomeModelSize({ sinceMs, untilMs }, deps, observed, snapshot) } : report));
+      } catch (error) {
+        out(JSON.stringify({ error: error instanceof Error ? error.message : '결과 조회 실패' }));
+        process.exitCode = 1;
+      }
     });
 
   tasks.command('list')
@@ -1227,7 +1713,8 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         if (resolved.kind === 'inlined') {
           try { debug.log('task-agent.hand', 'goal-file-inlined', { path: resolved.path, chars: resolved.chars, sha256: resolved.sha256 }); } catch { /* fail-soft */ }
         }
-        const result = await handTask({
+        const handed = await handTaskWithTierSplit({
+          ...('tierSizedDecompose' in deps ? { decompose: deps.tierSizedDecompose } : {}),
           text: resolved.text,
           ...(opts.project !== undefined && opts.target !== undefined ? { project: { id: opts.project, target: opts.target } } : {}),
           ...(opts.goal !== undefined ? { goal: opts.goal } : {}),
@@ -1236,6 +1723,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           ...(opts.checklist ? { checklistId: opts.checklist } : {}),
           ...(opts.completion ? { completion: opts.completion } : {}),
           live: opts.live === true,
+          preflightGoalDoneBoundary: opts.live === true && deps.taskLauncher === undefined,
           ...(opts.taLand === true ? { taLand: true } : {}),
           ...(opts.childLlm !== undefined ? { childLlm: opts.childLlm } : {}),
           ...(opts.childLlmEffort !== undefined ? { childLlmEffort: opts.childLlmEffort } : {}),
@@ -1246,8 +1734,29 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
           ...(deps.taskCompositionRoot ? { compositionRoot: deps.taskCompositionRoot } : {}),
           launcher: deps.taskLauncher ?? defaultTaskLauncher,
         });
+        if (handed.kind === 'split') {
+          // TIER-SPLIT-BEFORE-LAUNCH — 상·특 hand 를 조각으로 나눠 쐈다: 첫 줄 = 묶음 · 조각마다 한 줄(미션 출력과 같은 꼴).
+          if (opts.json) out(JSON.stringify(handed));
+          else {
+            // 디스패처 계약(ta-dispatcher.sh · `grep -E '^ta-' | head -1`): 줄 머리 `ta-` 는 «카드 id» 만 — 조각 카드 줄이 먼저, 묶음 줄은 끝에 `tier-split` 머리로.
+            for (const piece of handed.slices) {
+              out([piece.result?.card.id ?? '-', piece.result?.launched ? 'launched' : piece.error ? 'failed' : 'not launched', `tier ${piece.slice.tier} · 파일 ${piece.slice.files} · 행동 ${piece.slice.behaviours}`, headLine(piece.slice.goal)].join('\t'));
+              if (piece.slice.unavoidable) out(`  불가피: ${piece.slice.unavoidable}`);
+              if (piece.error) out(`  ${piece.error}`);
+            }
+            out(`tier-split\t${handed.group}\t${handed.fromTier} → 조각 ${handed.slices.length}`);
+          }
+          if (handed.slices.some((piece) => piece.error)) process.exitCode = 1;
+          return;
+        }
+        const result = handed.result;
+        if (handed.kind === 'blocked') process.exitCode = 1;
         if (opts.json) out(JSON.stringify(result));
-        else {
+        else if (handed.kind === 'blocked') {
+          // 발사 0 — 디스패처가 «넘김 실패» 로 읽도록 어느 줄도 `ta-` 로 시작하지 않는다.
+          out(`tier-split-failed\t${result.card.id}\tnot launched`);
+          out(`(tier-split-failed — 발사 0 · 카드 failed · ${handed.reason})`);
+        } else {
           out(`${result.card.id}\t${result.mode}\t${result.launched ? 'launched' : 'not launched'}`);
           if (result.move.command) out(`elanous ${result.move.command.map(shellQuote).join(' ')}`);
           else out(result.move.reason);

@@ -20,20 +20,32 @@ import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, safeLogText } from './review-observation.js';
-import { DEFAULT_REVIEW_BACKEND } from './acp-reviewer.js';
+import { DEFAULT_REVIEW_BACKEND, defaultAcpReviewTimeoutSec } from './acp-reviewer.js';
+import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
+import { debug } from '../debug/log.js';
 import { ACP_BACKENDS, canonicalizeBackendId } from '../acp/backend-registry.js';
 import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationFromPr, reviewIntentTruncationObservation } from './review-intent.js';
 import { budgetReviewerContext, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
-import { getUserConfig, type SubscriptionReviewerSpec } from '../user-config.js';
+import { getUserConfig, type LLMProviderName, type RoleLlmSpec, type SubscriptionReviewerSpec } from '../user-config.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
 
 /** SUBSCRIPTION-EXHAUST-REROUTE — API reviewer when the configured `roleLlm.reviewer` lane is unavailable (off codex). */
 export const ROLE_REVIEWER_FALLBACK_MODEL = 'openrouter/z-ai/glm-5.3';
 
+/** Only an explicit provider+model role setting selects the API review model. */
+export function apiReviewModelFromRoleSpec(spec: RoleLlmSpec | undefined): string | undefined {
+  const model = spec?.model?.trim();
+  if (!spec?.provider || !model) return undefined;
+  return spec.provider === 'openrouter' && !model.startsWith('openrouter/') ? `openrouter/${model}` : model;
+}
+
 export interface SelfReviewCliOpts {
   intent?: string | undefined;
   model?: string | undefined;
+  /** Explicit `roleLlm.review` provider+model, normalized by the CLI entry. */
+  configuredReviewModel?: string | undefined;
+  configuredReviewProvider?: LLMProviderName | undefined;
   acp?: boolean | undefined;
   acpModel?: string | undefined;
   acpBackend?: string | undefined;
@@ -73,7 +85,7 @@ export interface SelfReviewCliDeps {
    * 라우터 폴백(grok 등)으로 조용히 넘어가지 않고 실패를 오류로 낸다.
    * `o.onResolved` — streamLLM 이 «실제로 응답한» provider·model 을 알린다.
    */
-  makeApiLlm(model: string, o?: { pinProvider?: boolean; onResolved?: (provider: string, model: string) => void }): (prompt: string) => Promise<string>;
+  makeApiLlm(model: string, o?: { pinProvider?: boolean; providerName?: LLMProviderName; onResolved?: (provider: string, model: string) => void }): (prompt: string) => Promise<string>;
   /** `--acp` 경로 리뷰어 LLM(독립 프로세스). */
   /**
    * ⭐ `P4b` — 두 번째 인자가 **멀티미디어 통로**다.
@@ -1371,7 +1383,9 @@ async function runSelfReviewCliCommandPinned(
     return { results: [], failed: 1 };
   }
 
-  const useAcp = opts.acp === true;
+  // An explicit API model is the caller's reviewer choice even when a default ACP lane supplied both flags.
+  const requestedModel = opts.model?.trim() || undefined;
+  const useAcp = opts.acp === true && !requestedModel;
   const acpModel = opts.acpModel?.trim() || undefined;
   const acpBackendResolution = opts.acpBackend
     ? { backend: opts.acpBackend, source: 'cli' as const }
@@ -1379,7 +1393,6 @@ async function runSelfReviewCliCommandPinned(
       ? { backend: opts.configuredAcpBackend, source: 'config' as const }
       : { backend: DEFAULT_REVIEW_BACKEND, source: 'default' as const };
   const acpBackend = acpBackendResolution.backend;
-  const requestedModel = opts.model?.trim() || undefined;
   const rawReviewDenyBackends = (getUserConfig().raw?.acp as { reviewDenyBackends?: unknown } | undefined)?.reviewDenyBackends;
   const denyCheckedAt = Date.now();
   const configuredReviewDenyBackends = validateReviewDenyBackends(rawReviewDenyBackends, denyCheckedAt);
@@ -1396,11 +1409,15 @@ async function runSelfReviewCliCommandPinned(
     ? [canonicalizeBackendId(opts.acpBackend)]
     : automaticFallbacks.backends;
   const skippedAcpFallbackBackends = opts.acpBackend ? [] : automaticFallbacks.skipped;
-  const acpTimeoutSec = Number.isFinite(Number(opts.acpTimeout)) && Number(opts.acpTimeout) > 0
-    ? Number(opts.acpTimeout) : 300;
+  // ACP-REVIEW-VIA-TEAMCLAUDE: no `--acp-timeout` = the backend's default (claude 600s · others 300s).
+  const explicitAcpTimeoutSec = Number.isFinite(Number(opts.acpTimeout)) && Number(opts.acpTimeout) > 0
+    ? Number(opts.acpTimeout) : undefined;
+  const acpTimeoutSecFor = (backend: string): number => explicitAcpTimeoutSec ?? defaultAcpReviewTimeoutSec(backend);
+  const acpTimeoutSec = explicitAcpTimeoutSec ?? 300;
+  const primaryAcpTimeoutSec = acpTimeoutSecFor(acpBackend);
   let acpReviewLLM: ((prompt: string, images?: readonly ReviewImage[]) => Promise<string>) | null = null;
   if (useAcp) {
-    acpReviewLLM = deps.makeAcpLlm({ backend: acpBackend, ...(acpModel ? { model: acpModel } : {}), timeoutMs: acpTimeoutSec * 1000 });
+    acpReviewLLM = deps.makeAcpLlm({ backend: acpBackend, ...(acpModel ? { model: acpModel } : {}), timeoutMs: primaryAcpTimeoutSec * 1000 });
   }
   // ⭐ Reviewer selection source. An explicit flag always wins byte-for-byte; only without one does
   //    `roleLlm.reviewer` (the harness's reviewer row) pick the ACP lane. Worst case = today's API review.
@@ -1422,7 +1439,9 @@ async function runSelfReviewCliCommandPinned(
     deps.error(message);
     return { results: opts.json ? [{ error: message, requestedModel }] : [], failed: 1 };
   }
-  const model = useAcp ? `acp:${acpBackend}${acpModel ? `/${acpModel}` : ''}` : (opts.model || envModel || roleFallbackModel || tierModel('better'));
+  const configuredReviewModel = opts.configuredReviewModel?.trim() || undefined;
+  const model = useAcp ? `acp:${acpBackend}${acpModel ? `/${acpModel}` : ''}` : (opts.model || envModel || configuredReviewModel || roleFallbackModel || tierModel('better'));
+  const configuredReviewSelected = !opts.model?.trim() && !envModel && Boolean(configuredReviewModel);
   let roleReviewer: { llm: (prompt: string, images?: readonly ReviewImage[]) => Promise<string>; model: string } | undefined;
   let roleReviewerUnavailableReason: string | undefined;
   let roleReviewerAvailabilityMs: number | undefined;
@@ -1444,7 +1463,7 @@ async function runSelfReviewCliCommandPinned(
       deps.log('role-reviewer-fallback', {
         reviewerSource, roleReviewerProvider: opts.roleReviewer.provider, roleReviewerAvailabilityMs,
         stage: 'availability', reason: roleReviewerUnavailableReason, fallbackModel: safeLogText(model),
-        fallbackModelSource: roleFallbackModel ? 'role-fallback' : 'default',
+        fallbackModelSource: configuredReviewSelected ? 'role-review-config' : roleFallbackModel ? 'role-fallback' : 'default',
       }, { level: 'warn' });
     }
   }
@@ -1668,7 +1687,7 @@ async function runSelfReviewCliCommandPinned(
     } else if (mergeState.kind === 'unpinnable') reviewCwdPinFallbackReason = mergeState.reason;
     const reviewCwd = reviewPin?.cwd;
     const prAcpReviewLLM = reviewCwd && useAcp
-      ? deps.makeAcpLlm({ backend: acpBackend, ...(acpModel ? { model: acpModel } : {}), timeoutMs: acpTimeoutSec * 1000, cwd: reviewCwd })
+      ? deps.makeAcpLlm({ backend: acpBackend, ...(acpModel ? { model: acpModel } : {}), timeoutMs: primaryAcpTimeoutSec * 1000, cwd: reviewCwd })
       : acpReviewLLM;
     let prRoleReviewer = roleReviewer;
     if (reviewCwd && roleReviewer && opts.roleReviewer && deps.makeRoleReviewerLlm) {
@@ -1684,7 +1703,8 @@ async function runSelfReviewCliCommandPinned(
     // Role-config lane builds the API reviewer only when it falls back (`made().api` stays 0 on ACP success).
     const responded: { provider?: string; model?: string } = {};
     const makeApi = () => deps.makeApiLlm(model, {
-      pinProvider: Boolean(opts.model?.trim()),
+      pinProvider: Boolean(opts.model?.trim() || configuredReviewSelected),
+      ...(configuredReviewSelected && opts.configuredReviewProvider ? { providerName: opts.configuredReviewProvider } : {}),
       onResolved: (provider, respondedModel) => { responded.provider = provider; responded.model = respondedModel; },
     });
     const llmReview = prRoleReviewer ? undefined : (prAcpReviewLLM ?? makeApi());
@@ -1748,7 +1768,7 @@ async function runSelfReviewCliCommandPinned(
         try {
           const fallbackReview = await deps.reviewPullRequest(
             reviewInput,
-            deps.makeAcpLlm({ backend, timeoutMs: acpTimeoutSec * 1000, ...(reviewCwd ? { cwd: reviewCwd } : {}) }),
+            deps.makeAcpLlm({ backend, timeoutMs: acpTimeoutSecFor(backend) * 1000, ...(reviewCwd ? { cwd: reviewCwd } : {}) }),
           );
           if (fallbackReview.reviewed === true) {
             review = fallbackReview;
@@ -1763,6 +1783,34 @@ async function runSelfReviewCliCommandPinned(
           fallbackFailures.push({ backend, reason });
         }
       }
+    }
+    // OP #25981: an explicit ACP claude review that ends without a verdict («Autocompact is thrashing …» ·
+    //   reviewed:false · no JSON) goes once to GLM on the same head — never a claude retry (subscription quota).
+    //   An explicit `--acp-model` is the operator's model choice: it is not silently swapped for GLM.
+    //   GLM that throws or also ends without a verdict keeps the claude result, and says so (`glmReviewed`).
+    let claudeFallbackGlm: { reason: string; model: string; glmReviewed: boolean; glmFailureReason?: string } | undefined;
+    if (useAcp && !roleReview && !acpModel && canonicalizeBackendId(acpBackend) === 'claude' && review.reviewed !== true) {
+      const reason = safeLogText(review.failureReason || 'reviewed=false', 400);
+      debug.log('review.acp', 'claude-fallback-glm', { reason }, { level: 'warn' });
+      fallbackAttempted = true;
+      fallbackTriggerReason = reason;
+      let glmFailureReason: string | undefined;
+      try {
+        const glmReview = await deps.reviewPullRequest(reviewInput, deps.makeApiLlm(ZAI_OPENROUTER_FALLBACK_MODEL, {
+          pinProvider: true,
+          onResolved: (provider, respondedModel) => { responded.provider = provider; responded.model = respondedModel; },
+        }));
+        if (glmReview.reviewed === true) {
+          review = glmReview;
+          selectedModel = ZAI_OPENROUTER_FALLBACK_MODEL;
+          reviewRoute = 'api';
+        } else glmFailureReason = safeLogText(glmReview.failureReason || 'reviewed=false', 400);
+      } catch (error) {
+        glmFailureReason = safeLogText(error instanceof Error ? error.message : String(error), 400);
+      }
+      if (glmFailureReason !== undefined) fallbackFailures.push({ backend: ZAI_OPENROUTER_FALLBACK_MODEL, reason: glmFailureReason });
+      claudeFallbackGlm = { reason, model: ZAI_OPENROUTER_FALLBACK_MODEL, glmReviewed: glmFailureReason === undefined,
+        ...(glmFailureReason !== undefined ? { glmFailureReason } : {}) };
     }
     reviewPin?.remove();
     // reviewCwdCommit 은 «최종 판정을 낸 LLM 이 실제로 그 cwd 를 받았을 때만» 싣는다(role 실패 → API 폴백이면 안 싣는다).
@@ -1783,6 +1831,7 @@ async function runSelfReviewCliCommandPinned(
       ...(fallbackBackend ? { requestedModel: primaryModel, actualBackend: `acp:${fallbackBackend}` } : {}),
       ...(fallbackNotAttemptedReason ? { fallbackNotAttemptedReason } : {}),
       ...(fallbackTriggerReason ? { fallbackTriggerReason } : {}),
+      ...(claudeFallbackGlm ? { claudeFallbackGlm } : {}),
       ...(fallbackFailures.length ? { fallbackFailures } : {}),
       ...(skippedAcpFallbackBackends.length ? { skippedAcpFallbackBackends } : {}),
     };

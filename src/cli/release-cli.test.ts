@@ -2,13 +2,14 @@ import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { checklistHistory, listChecklist, devVersion, refRoots, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { CliUserError } from './cli-user-error.js';
 import { getSchedule, setSchedule } from '../release-loop/release-schedule.js';
 import type { RehearsalDeps } from '../release-loop/rehearsal.js';
 import type { LightRcResult } from '../release-loop/light-rc.js';
+import type { ResumeReleaseDeps } from '../../scripts/release-loop/resume-release.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -23,6 +24,40 @@ import { readActiveForceReleaseRun } from './release-single-flight.js';
 
 const originalCwd = process.cwd();
 afterEach(() => { if (process.cwd() !== originalCwd) process.chdir(originalCwd); });
+
+async function seedFailedReleaseRun(root: string, runId = 'recovery-fixture') {
+  const version = '9.9.9', checkout = join(root, 'checkout'), bare = join(root, 'origin.git');
+  mkdirSync(checkout, { recursive: true });
+  const git = (cwd: string, ...args: string[]) => {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  git(root, 'init', '--bare', '-q', bare);
+  git(checkout, 'init', '-q');
+  git(checkout, 'config', 'user.name', 'MK test');
+  git(checkout, 'config', 'user.email', 'mk-test@example.invalid');
+  mkdirSync(join(checkout, 'graphs', 'release'), { recursive: true });
+  for (const file of ['release-loop.yaml', 'recipes.yaml'])
+    copyFileSync(join(import.meta.dir, '../../graphs/release', file), join(checkout, 'graphs', 'release', file));
+  writeFileSync(join(checkout, 'release-fixture.txt'), 'local recovery fixture\n');
+  git(checkout, 'add', 'graphs/release/release-loop.yaml', 'graphs/release/recipes.yaml', 'release-fixture.txt');
+  git(checkout, 'commit', '-q', '-m', 'seed local recovery fixture');
+  git(checkout, 'branch', '-M', `release/${version}`);
+  git(checkout, 'remote', 'add', 'origin', bare);
+  git(checkout, 'push', '-q', '-u', 'origin', `release/${version}`);
+  const sha = git(checkout, 'rev-parse', 'HEAD');
+  const graphPath = join(checkout, 'graphs', 'release', 'release-loop.yaml');
+  const state = await runGraph(graphPath, { runId, input: { version, branchCut: true }, deps: { root,
+    runBash: async (command) => {
+      const gateFailed = command.includes('/gate-node.ts');
+      return { stdout: JSON.stringify(command.includes('version-node.ts release')
+        ? { outcome: 'ok', version, commit: sha, branch: `release/${version}` }
+        : { outcome: gateFailed ? 'fail' : 'ok' }), stderr: '', exitCode: gateFailed ? 1 : 0 };
+    } } });
+  if (state.status !== 'failed' || !state.path.includes('gate')) throw new Error('fixture did not produce a failed release gate run');
+  return { checkout, runId, state, statePath: state.statePath!, sha, version, graphPath };
+}
 
 test('rehearsal CLI refuses malformed shards and remote before making any stamp', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-cli-'));
@@ -48,6 +83,133 @@ test('rehearsal CLI refuses malformed shards and remote before making any stamp'
       expect(existsSync(join(root, 'release'))).toBe(false);
     }
   } finally { out.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('rehearsal recovery validates its ID and refuses ignored RC selection flags', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-recovery-cli-'));
+  const exit = process.exitCode;
+  const lines: string[] = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  let scheduledReads = 0, rcCalls = 0;
+  const deps: RehearsalDeps = {
+    schedules: () => { scheduledReads++; return []; },
+    lightRc: async () => { rcCalls++; throw new Error('recovery unexpectedly launched the scheduled RC'); },
+  };
+  try {
+    setElanousConfigDir(root);
+    const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, deps);
+    for (const [args, message] of [
+      [['--recovery-run', '../bad'], 'invalid run id'],
+      [['--recovery-run', 'fixture', '--remote', 'node-c'], '--shards and --remote are unsupported'],
+      [['--recovery-run', 'fixture', '--shards', '12'], '--shards and --remote are unsupported'],
+    ] as const) {
+      lines.length = 0;
+      process.exitCode = 0;
+      await cmd.parseAsync(['release', 'rehearsal', 'tick', '--json', ...args], { from: 'user' });
+      expect(JSON.parse(lines[0]!)).toMatchObject({ ok: false, error: expect.stringContaining(message) });
+      expect(process.exitCode).toBe(1);
+    }
+    expect(scheduledReads).toBe(0);
+    expect(rcCalls).toBe(0);
+    expect(existsSync(join(root, 'release'))).toBe(false);
+  } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('valid recovery ID preflights the saved failed run without reading schedules or mutating its ledger', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-recovery-preflight-'));
+  const exit = process.exitCode, lines: string[] = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  const fixture = await seedFailedReleaseRun(root);
+  const before = readFileSync(fixture.statePath, 'utf8');
+  let scheduledReads = 0, rcCalls = 0;
+  const rehearsalDeps: RehearsalDeps = {
+    schedules: () => { scheduledReads++; return []; },
+    lightRc: async () => { rcCalls++; throw new Error('recovery preflight launched scheduled RC'); },
+  };
+  const resumeDeps: ResumeReleaseDeps = { root, repo: fixture.checkout };
+  try {
+    setElanousConfigDir(root);
+    const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, rehearsalDeps, resumeDeps);
+    process.exitCode = 0;
+    await cmd.parseAsync(['release', 'rehearsal', 'tick', '--recovery-run', fixture.runId, '--checkout', fixture.checkout, '--json'], { from: 'user' });
+    const result = JSON.parse(lines[0]!) as { ok: boolean; recovery: string; runId: string; preflight: string; gatePlan: { mode: string } };
+    expect(result).toMatchObject({ ok: true, recovery: 'planned', runId: fixture.runId, preflight: 'passed', gatePlan: { mode: 'full' } });
+    expect(process.exitCode).toBe(0);
+    expect(scheduledReads).toBe(0);
+    expect(rcCalls).toBe(0);
+    expect(readFileSync(fixture.statePath, 'utf8')).toBe(before);
+    expect(existsSync(join(root, 'release', fixture.version, 'resume-attempts', `${fixture.runId}.json`))).toBe(false);
+  } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('recovery apply executes the real release graph from gate through gate-triage and stops before mac-smoke', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-recovery-apply-'));
+  const exit = process.exitCode, lines: string[] = [], visits: string[] = [], commands: string[] = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  const fixture = await seedFailedReleaseRun(root);
+  let scheduledReads = 0, rcCalls = 0;
+  const rehearsalDeps: RehearsalDeps = {
+    schedules: () => { scheduledReads++; return []; },
+    lightRc: async () => { rcCalls++; throw new Error('recovery apply launched scheduled RC'); },
+  };
+  const resumeDeps: ResumeReleaseDeps = {
+    root, repo: fixture.checkout,
+    runBash: async (body) => {
+      commands.push(body);
+      visits.push(body.includes('gate-node.ts') ? 'gate' : body.includes('gate-triage-node.ts') ? 'gate-triage' : 'unexpected');
+      return { stdout: '{"outcome":"fail"}', stderr: '', exitCode: 1 };
+    },
+  };
+  try {
+    setElanousConfigDir(root);
+    const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, rehearsalDeps, resumeDeps);
+    process.exitCode = 0;
+    await cmd.parseAsync(['release', 'rehearsal', 'tick', '--recovery-run', fixture.runId, '--apply', '--checkout', fixture.checkout, '--json'], { from: 'user' });
+    const result = JSON.parse(lines[0]!) as { ok: boolean; recovery: string; runId: string; status: string; state: { nodes: Array<{ nodeId: string }> } };
+    expect(result).toMatchObject({ ok: false, recovery: 'resumed', runId: fixture.runId, status: 'failed' });
+    expect(process.exitCode).toBe(1);
+    expect(visits).toEqual(['gate', 'gate-triage']);
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toContain('gate-node.ts');
+    expect(commands[1]).toContain('gate-triage-node.ts');
+    expect(result.state.nodes.filter((node) => node.nodeId === 'gate')).toHaveLength(1);
+    expect(result.state.nodes.filter((node) => node.nodeId === 'gate-triage')).toHaveLength(1);
+    expect(result.state.nodes.filter((node) => node.nodeId === 'mac-smoke')).toHaveLength(0);
+    expect(scheduledReads).toBe(0);
+    expect(rcCalls).toBe(0);
+    expect(readFileSync(join(root, 'release', fixture.version, 'resume-attempts', `${fixture.runId}.json`), 'utf8')).toContain(fixture.runId);
+  } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('recovery apply write-fence denial does not invoke the resume graph', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-recovery-fence-'));
+  const instance = join(root, 'instance'), ledger = join(root, 'operational-ledger');
+  const exit = process.exitCode, lines: string[] = [];
+  const track = process.env.ELANOUS_TRACK;
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  const fixture = await seedFailedReleaseRun(root);
+  const store = fileLeaseStore(join(instance, 'hq', 'lease.json'), () => 100);
+  const hq: HqDeps = { store, config: { hostName: 'mbp', standby: 'node-b' }, localPath: join(instance, 'hq', 'local.json'),
+    seenPath: join(instance, 'hq', 'seen-generation'), now: () => 100, log: (() => {}) as HqDeps['log'] };
+  let runBashCalls = 0;
+  const rehearsalDeps: RehearsalDeps = { schedules: () => [], lightRc: async () => { throw new Error('write fence bypassed'); } };
+  const resumeDeps: ResumeReleaseDeps = { root, repo: fixture.checkout, runBash: async () => { runBashCalls++; return { stdout: '', stderr: '', exitCode: 0 }; } };
+  try {
+    setElanousConfigDir(instance);
+    process.env.ELANOUS_TRACK = 'OP';
+    expect(store.cas(null, serializeLease({ holder: 'node-b', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
+    const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: ledger }, {}, hq, {}, rehearsalDeps, resumeDeps);
+    process.exitCode = 0;
+    await cmd.parseAsync(['release', 'rehearsal', 'tick', '--recovery-run', fixture.runId, '--apply', '--checkout', fixture.checkout, '--json'], { from: 'user' });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ ok: false, error: expect.stringContaining('ledger write denied') });
+    expect(process.exitCode).toBe(1);
+    expect(runBashCalls).toBe(0);
+    expect(existsSync(join(root, 'release', fixture.version, 'resume-attempts', `${fixture.runId}.json`))).toBe(false);
+  } finally {
+    output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0;
+    if (track === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = track;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('rehearsal CLI no-option tick forwards planned shards and records a measured gate failure as error', async () => {

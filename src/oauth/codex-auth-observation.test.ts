@@ -26,6 +26,7 @@ const observedEvents = new Set<string>();
 let home: string;
 let savedXdg: string | undefined;
 let savedCodexHome: string | undefined;
+let savedRemoteAccessOnly: string | undefined;
 
 function setStore(state: unknown): void {
   const path = authStorePath();
@@ -58,6 +59,7 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'codex-obs-'));
   savedXdg = process.env.XDG_CONFIG_HOME;
   savedCodexHome = process.env.CODEX_HOME;
+  savedRemoteAccessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
   process.env.XDG_CONFIG_HOME = join(home, '.config');
   process.env.CODEX_HOME = join(home, '.codex');
   _setCodexAuthObserverForTesting((event, data) => { seen.push({ event, data }); observedEvents.add(event); });
@@ -68,6 +70,7 @@ afterEach(() => {
   // ⛔ 원래 값을 «복원»한다 — 지우면 실행 환경·병렬 테스트를 오염시킨다(리뷰 should-fix).
   if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = savedXdg;
   if (savedCodexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = savedCodexHome;
+  if (savedRemoteAccessOnly === undefined) delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY; else process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = savedRemoteAccessOnly;
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -97,6 +100,17 @@ describe('codex 갱신 관측 — 일곱 갈래를 «실제로 태워» 문다',
     expect(e?.data.refreshed).toBe(false);
     expect(typeof e?.data.remainingSeconds).toBe('number');
     expectNoSecrets();
+  });
+
+  test('remote access-only host refuses refresh before a network call', async () => {
+    setStore(state(1_000));
+    process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
+    let calls = 0;
+    const fetchImpl = (async () => { calls++; throw new Error('network must not be called'); }) as unknown as typeof fetch;
+    expect(await loadFreshCodexAuthState({ fetchImpl })).toBeNull();
+    expect(calls).toBe(0);
+    expect(events()).not.toContain('refresh-start');
+    expect(events()).toContain('no-credential');
   });
 
   test('③④ refresh-start → refreshed (성공) ⊕ 회전 여부를 값으로', async () => {

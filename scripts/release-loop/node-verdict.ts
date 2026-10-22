@@ -72,6 +72,17 @@ export function cutoffNotesEmpty(data: Record<string, unknown> | undefined): boo
   return Array.isArray(data?.escalate) && (data.escalate as Array<{ kind?: string }>).some((item) => item?.kind === 'notes-empty');
 }
 
+/**
+ * RELEASE-PWA-NODE-RESILIENCE ① — the pwa node's argv. `release.loop.pwaRemote` (copied into the run input) picks
+ * the SSH host the suite runs on; absent = this machine (today's argv, byte-identical). One setting, like `gateRemote`.
+ */
+export function pwaNodeArgs(commit: string, input: Record<string, unknown>): string[] {
+  const remote = input.pwaRemote;
+  if (remote !== undefined && (typeof remote !== 'string' || !remote.trim())) throw new Error(`release.loop.pwaRemote must be an ssh host: ${String(remote)}`);
+  return ['scripts/release-loop/pwa-scenarios-node.ts', '--commit', commit, '--with-costly', '--json',
+    ...(typeof remote === 'string' ? ['--remote', remote.trim()] : [])];
+}
+
 // Existing cutoff/PWA/TUI programs have different output conventions; normalize them at the graph boundary.
 if (import.meta.main) {
   const node = process.argv[2];
@@ -84,7 +95,7 @@ if (import.meta.main) {
     const predecessor = node === 'pwa' ? 'gate' : node === 'tui' ? 'upgrade' : 'version-release';
     if (context.outputs[predecessor]?.outcome !== 'ok') throw new Error(`${predecessor} did not pass`);
     const args = node === 'cutoff' ? ['scripts/release-loop/cutoff.ts', '--version', version, '--cutoff', commit, '--baseline', `v${context.input.previousVersion}`, '--json']
-      : node === 'pwa' ? ['scripts/release-loop/pwa-scenarios-node.ts', '--commit', commit, '--with-costly', '--json']
+      : node === 'pwa' ? pwaNodeArgs(commit, context.input)
       : node === 'tui' ? ['scripts/release-loop/tui-sim-node.ts', '--commit', commit, '--json'] : (() => { throw new Error(`unknown node: ${node}`); })();
     const run = runCommand('bun', args);
     if (run.stderr) process.stderr.write(run.stderr);

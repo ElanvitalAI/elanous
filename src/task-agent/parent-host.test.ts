@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,9 +7,10 @@ import { defaultTaskLauncher, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
 import { LogStore, StoreSink } from '../mss/logging/log-store.js';
 import { hostCredentials } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { _resetGrokRefreshCooldownForTesting, resolveGrokCredential } from '../grok/credential.js';
 import {
   judgeParentHostCredentials, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript, shouldInstallRemoteCodexAccess,
-  installRemoteCodexAccess, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, orderParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, type ParentHostConfig, type SshRunner,
+  installRemoteCodexAccess, installRemoteCodexAccessBatch, installRemoteGrokAccess, resolveOwnerGrokAccessMirror, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, orderParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, type ParentHostConfig, type SshRunner,
 } from './parent-host.js';
 import { handTask } from './task-hand.js';
 
@@ -36,7 +37,7 @@ function stubSsh(responses: Array<{ match: RegExp; stdout?: string; status?: num
 
 async function launchWithTestMirror(args: string[], cwd: string | undefined, context: Parameters<typeof defaultTaskLauncher>[2],
   deps: Parameters<typeof defaultTaskLauncher>[3] = {}): ReturnType<typeof defaultTaskLauncher> {
-  return defaultTaskLauncher(args, cwd, context, { codexAccessMirror: async () => TEST_CODEX_MIRROR, ...deps });
+  return defaultTaskLauncher(args, cwd, context, { codexAccessMirror: async () => TEST_CODEX_MIRROR, ownerCodexLeaseHolder: () => true, ...deps });
 }
 
 describe('resolveParentHost — 기본 OFF', () => {
@@ -312,8 +313,8 @@ describe('multi-host parent routing', () => {
     await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined,
       { runId: 'run-mirror-install-failed', launchId: 'tl-mirror-install-failed', env: { ELANOUS_RUN_ID: 'run-mirror-install-failed' } },
       { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
-        codexAccessMirror: async () => TEST_CODEX_MIRROR,
-        spawn: () => { localLaunches++; throw Error('should not fall back locally'); } })).rejects.toThrow('remote Codex access mirror failed');
+        codexAccessMirror: async () => TEST_CODEX_MIRROR, ownerCodexLeaseHolder: () => true,
+        spawn: () => { localLaunches++; throw Error('should not fall back locally'); } })).rejects.toThrow('remote Codex access mirror batch failed');
     expect(installs).toBe(1);
     expect(remoteLaunches).toBe(0);
     expect(localLaunches).toBe(0);
@@ -440,6 +441,237 @@ describe('defaultTaskLauncher — 원격 부모', () => {
     expect(receipt).toMatchObject({ runId: context.runId, parentHost: { host: 'node-b', pid: 4242 } });
     expect(ssh.calls.some((call) => call.includes('--no-auto-merge') && !call.includes('--merge-by-host'))).toBe(true);
     expect(ssh.calls.find((call) => call.includes('nohup'))).toContain('ELANOUS_STATE_DIR="$HOME"/.elanous');
+  });
+
+  test('Grok mirror refreshes on HQ and returns only fresh access metadata', () => {
+    const home = mkdtempSync(join(tmpdir(), 'parent-grok-owner-'));
+    const auth = join(home, '.grok', 'auth.json');
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    const before = '2026-10-20T00:01:00.000Z';
+    const after = '2030-01-01T00:00:00.000Z';
+    writeFileSync(auth, JSON.stringify({
+      'https://auth.x.ai::hq-selected': { key: 'old-access-test-value', refresh_token: 'hq-refresh-test-only', expires_at: before },
+      'https://auth.x.ai::other': { key: 'other-access-test-value', refresh_token: 'other-refresh-test-only', expires_at: '2026-10-20T00:00:30.000Z' },
+    }));
+    _resetGrokRefreshCooldownForTesting();
+    try {
+      const mirror = resolveOwnerGrokAccessMirror({ home, now: () => Date.parse('2026-10-20T00:00:00Z'), execImpl: (cmd, args) => {
+        expect(cmd).toBe('grok');
+        expect(args).toEqual(['models']);
+        const scopes = JSON.parse(readFileSync(auth, 'utf8')) as Record<string, Record<string, unknown>>;
+        scopes['https://auth.x.ai::hq-selected'] = { ...scopes['https://auth.x.ai::hq-selected'], key: 'fresh-selected-access', expires_at: after };
+        writeFileSync(auth, JSON.stringify(scopes));
+      } });
+      expect(mirror).toEqual({ key: 'fresh-selected-access', expiresAt: after });
+      expect(Object.keys(mirror).sort()).toEqual(['expiresAt', 'key']);
+    } finally {
+      _resetGrokRefreshCooldownForTesting();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('actual remote-parent launch sends only selected Grok access through SSH stdin before launch', () => {
+    const home = mkdtempSync(join(tmpdir(), 'parent-grok-launch-'));
+    const expiry = '2030-01-01T00:00:00.000Z';
+    const selected = 'selected-grok-access-test-value';
+    const unselected = 'other-grok-access-test-value';
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+      'https://auth.x.ai::hq-selected': { key: selected, expires_at: expiry },
+      'https://auth.x.ai::other': { key: unselected, expires_at: '2035-01-01T00:00:00.000Z', refresh_token: 'preserved-refresh-fixture' },
+    }));
+    const calls: Array<{ script: string; stdin?: string }> = [];
+    const ssh: SshRunner = (_host, script, _timeout, stdin) => {
+      calls.push({ script, ...(stdin !== undefined ? { stdin } : {}) });
+      return script.includes('nohup')
+        ? { status: 0, stdout: 'pid=4242\n', stderr: '' }
+        : { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      const receipt = launchRemoteParent(TARGET, ['harness', 'say', '--child-llm-provider', 'grok', 'goal'],
+        { ELANOUS_RUN_ID: context.runId }, ssh, () => ({ key: selected, expiresAt: expiry }));
+      expect(receipt).toMatchObject({ pid: 4242, log: expect.any(String) });
+      const install = calls.find((call) => call.stdin !== undefined);
+      const launch = calls.find((call) => call.script.includes('nohup'));
+      expect(install).toBeDefined();
+      expect(launch).toBeDefined();
+      expect(calls.indexOf(install!)).toBeLessThan(calls.indexOf(launch!));
+      expect(JSON.parse(install!.stdin!)).toEqual({ key: selected, expires_at: expiry });
+      expect(calls.every((call) => !call.script.includes(selected) && !call.script.includes(unselected))).toBe(true);
+      expect(launch!.script).toContain('--child-llm-provider grok');
+      expect(calls).toHaveLength(2);
+      const installedMirrorToken = 'installed-hq-mirror-access-test-value';
+      installRemoteGrokAccess(TARGET, { key: installedMirrorToken, expiresAt: expiry }, localShell(home));
+      const installed = JSON.parse(readFileSync(join(home, '.grok', 'auth.json'), 'utf8')) as Record<string, Record<string, unknown>>;
+      expect(Object.keys(installed).sort()).toEqual([
+        'https://auth.x.ai::hq-mirror', 'https://auth.x.ai::hq-selected', 'https://auth.x.ai::other',
+      ]);
+      expect(Object.keys(installed['https://auth.x.ai::hq-mirror']!).sort()).toEqual(['expires_at', 'key']);
+      expect(installed['https://auth.x.ai::hq-selected']?.key).toBe(selected);
+      expect(installed['https://auth.x.ai::other']?.key).toBe(unselected);
+      expect(installed['https://auth.x.ai::other']?.refresh_token).toBe('preserved-refresh-fixture');
+      expect(resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv })?.token).toBe(installedMirrorToken);
+      expect(statSync(join(home, '.grok', 'auth.json')).mode & 0o777).toBe(0o600);
+      expect(statSync(join(home, '.grok')).mode & 0o777).toBe(0o700);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('Grok mirror is rejected at installation when the two-minute safety margin elapsed after preflight', () => {
+    const now = Date.parse('2026-10-20T00:00:00.000Z');
+    let sshCalls = 0;
+    const ssh: SshRunner = () => {
+      sshCalls++;
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    expect(() => installRemoteGrokAccess(TARGET, {
+      key: 'selected-grok-access-test-value',
+      expiresAt: new Date(now + 119_999).toISOString(),
+    }, ssh, () => now)).toThrow('invalid Grok access mirror');
+    expect(sshCalls).toBe(0);
+    expect(() => installRemoteGrokAccess(TARGET, {
+      key: 'selected-grok-access-test-value',
+      expiresAt: new Date(now + 120_001).toISOString(),
+    }, ssh, () => now)).not.toThrow();
+    expect(sshCalls).toBe(1);
+  });
+
+  test('defaultTaskLauncher blocks Grok install when preflight consumes the safety margin', async () => {
+    const start = Date.parse('2026-10-20T00:00:00.000Z');
+    let clock = start;
+    const calls: Array<{ script: string; stdin?: string }> = [];
+    const { defaultTaskLauncher } = await import('../cli/tasks-cli.js');
+    const ssh: SshRunner = (_host, script, _timeout, stdin) => {
+      calls.push({ script, ...(stdin !== undefined ? { stdin } : {}) });
+      if (script.includes('--version')) {
+        clock += 2_000;
+        return { status: 0, stdout: GOOD_FACTS, stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    await expect(defaultTaskLauncher(['harness', 'say', 'goal'], undefined, {
+      runId: context.runId, launchId: 'grok-expiry-preflight', effectiveChildProvider: 'grok',
+      env: { ELANOUS_RUN_ID: context.runId },
+    }, {
+      parentHost: TARGET, ssh, localVersion: '0.2.20-dev.0', now: () => clock,
+      grokAccessMirror: () => ({ key: 'selected-grok-access-test-value', expiresAt: new Date(start + 121_000).toISOString() }),
+      launchHoldActive: () => false,
+      spawn: () => { throw new Error('local launch after stale remote credential'); },
+    })).rejects.toThrow('invalid Grok access mirror');
+    expect(clock).toBe(start + 2_000);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.stdin).toBeUndefined();
+    expect(calls.every((call) => !call.script.includes('nohup'))).toBe(true);
+  });
+
+  test('defaultTaskLauncher resolves Grok from isolated HOME before remote launch', () => {
+    const home = mkdtempSync(join(tmpdir(), 'parent-grok-launcher-isolated-'));
+    const selected = 'isolated-grok-access-fixture';
+    const expiry = '2030-01-01T00:00:00.000Z';
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+      'https://auth.x.ai::isolated': { key: selected, expires_at: expiry },
+      'https://auth.x.ai::other': { key: 'unselected-grok-access-fixture', expires_at: '2029-01-01T00:00:00.000Z' },
+    }));
+    const child = `
+      const { defaultTaskLauncher } = await import('./src/cli/tasks-cli.ts');
+      const { handTask } = await import('./src/task-agent/task-hand.ts');
+      const calls = [];
+      const ssh = (_host, script, _timeout, stdin) => {
+        calls.push({ script, stdin });
+        if (script.includes('--version')) return { status: 0, stdout: ${JSON.stringify(GOOD_FACTS)}, stderr: '' };
+        if (script.includes('nohup')) return { status: 0, stdout: 'pid=4242\\n', stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      const handed = await handTask({ text: 'docs Grok owner mirror integration fixture', seat: 'UX',
+        childLlm: 'grok/grok-4.7', live: true, statePath: process.env.HOME + '/task-agent-actions.json',
+        prelaunchInspector: () => ({ reason: 'isolated-test-fixture' }),
+        launcher: (taskArgs, cwd, context) => defaultTaskLauncher(taskArgs, cwd, context,
+          { parentHost: ${JSON.stringify(TARGET)}, ssh, launchHoldActive: () => false,
+            localVersion: '0.2.20-dev.0', spawn: () => { throw new Error('local launch forbidden'); } }) });
+      const install = calls.find((call) => call.stdin !== undefined);
+      const launch = calls.find((call) => call.script.includes('nohup'));
+      const payload = install ? JSON.parse(install.stdin) : null;
+      console.log(JSON.stringify({ cardProvider: handed.card.childLlm?.provider, receipt: handed.card.parentHost,
+        count: calls.length, installBeforeLaunch: calls.indexOf(install) < calls.indexOf(launch),
+        payloadKeys: payload ? Object.keys(payload).sort() : [], payloadIsFixture: payload?.key === ${JSON.stringify(selected)},
+        scriptHasFixture: calls.some((call) => call.script.includes(${JSON.stringify(selected)})),
+        launchHasGrok: launch?.script.includes('--child-llm-provider grok') }));
+      process.exit(0);
+    `;
+    try {
+      const result = spawnSync(process.execPath, ['-e', child], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, HOME: home },
+      });
+      expect(result.status).toBe(0);
+      const evidence = JSON.parse(result.stdout.trim()) as {
+        cardProvider: string; receipt?: { host: string; pid: number };
+        count: number; installBeforeLaunch: boolean; payloadKeys: string[];
+        payloadIsFixture: boolean; scriptHasFixture: boolean; launchHasGrok: boolean;
+      };
+      expect(evidence.cardProvider).toBe('grok');
+      expect(evidence.receipt).toMatchObject({ host: 'node-b', pid: 4242 });
+      expect(evidence.count).toBe(3); // version check, access install, and parent launch
+      expect(evidence.installBeforeLaunch).toBe(true);
+      expect(evidence.payloadKeys).toEqual(['expires_at', 'key']);
+      expect(evidence.payloadIsFixture).toBe(true);
+      expect(evidence.scriptHasFixture).toBe(false);
+      expect(evidence.launchHasGrok).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, { timeout: 35_000 });
+
+  test('defaultTaskLauncher refuses a Grok launch before any SSH call when owner access is missing', () => {
+    const home = mkdtempSync(join(tmpdir(), 'parent-grok-launcher-empty-'));
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    writeFileSync(join(home, '.grok', 'auth.json'), '{}');
+    const child = `
+      const { defaultTaskLauncher } = await import('./src/cli/tasks-cli.ts');
+      const calls = [];
+      let error = '';
+      try {
+        await defaultTaskLauncher(['harness', 'say', 'goal'], undefined,
+          { runId: 'run-11112222-3333-4444-5555-666677778888', launchId: 'isolated-missing',
+            effectiveChildProvider: 'grok', env: { ELANOUS_RUN_ID: 'run-11112222-3333-4444-5555-666677778888' } },
+          { parentHost: ${JSON.stringify(TARGET)}, ssh: (_host, script) => { calls.push(script); return { status: 0, stdout: '', stderr: '' }; },
+            launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+            spawn: () => { throw new Error('local launch forbidden'); } });
+      } catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
+      console.log(JSON.stringify({ calls: calls.length, error }));
+      process.exit(0);
+    `;
+    try {
+      const result = spawnSync(process.execPath, ['-e', child], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, HOME: home },
+      });
+      expect(result.status).toBe(0);
+      const evidence = JSON.parse(result.stdout.trim()) as { calls: number; error: string };
+      expect(evidence.error).toContain('Grok subscription mirror unavailable');
+      expect(evidence.calls).toBe(0);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, { timeout: 35_000 });
+
+  test('expired, unrefreshable Grok subscription refuses SSH install and parent launch', () => {
+    const home = mkdtempSync(join(tmpdir(), 'parent-grok-expired-'));
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({ 'https://auth.x.ai::hq': { key: 'expired-access-test-value', expires_at: '2020-01-01T00:00:00.000Z' } }));
+    const calls: string[] = [];
+    const ssh: SshRunner = (_host, script) => { calls.push(script); return { status: 0, stdout: '', stderr: '' }; };
+    try {
+      expect(() => launchRemoteParent(TARGET, ['harness', 'say', '--child-llm-provider=grok', 'goal'],
+        { ELANOUS_RUN_ID: context.runId }, ssh, () => resolveOwnerGrokAccessMirror({
+          home, now: () => Date.parse('2026-10-20T00:00:00Z'), execImpl: () => { throw new Error('refresh unavailable'); },
+        }))).toThrow('expired-or-refresh-did-not-produce-fresh-access');
+      expect(calls).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test('effective provider만 Codex 미러 적용 여부를 결정하고 미지정은 기존 Codex 기본을 쓴다', () => {
@@ -598,6 +830,50 @@ function fakeHome(body: string): { home: string; cwd: string } {
 
 describe('원격 스크립트 — 실제 셸', () => {
   const env = { ELANOUS_RUN_ID: 'run-shell0001' };
+
+  test('HQ의 세 access 미러를 한 스냅샷으로 설치하고 원격에는 refresh 권한이 없다', () => {
+    const { home } = fakeHome('true');
+    const mirror = (account: string) => ({
+      account,
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, refreshToken: '', refresh_token: '' } } } }),
+      codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: `access-${account}`, refresh_token: '', refreshToken: '' } }),
+    });
+    try {
+      const target = { host: 'h', cwd: '/repo' };
+      const shell = localShell(home);
+      installRemoteCodexAccessBatch(target, ['default', 'team', 'third'].map(mirror), shell);
+      const store = JSON.parse(readFileSync(join(home, '.elanous', 'auth.json'), 'utf8'));
+      expect(Object.keys(store.providers).sort()).toEqual(['openai-codex', 'openai-codex:team', 'openai-codex:third']);
+      for (const account of ['default', 'team', 'third']) {
+        const key = account === 'default' ? 'openai-codex' : `openai-codex:${account}`;
+        const path = account === 'default' ? join(home, '.elanous', 'codex-default', 'auth.json') : join(home, '.elanous', 'codex-accounts', account, 'auth.json');
+        const auth = JSON.parse(readFileSync(path, 'utf8'));
+        expect(store.providers[key].tokens).toMatchObject({ accessToken: `access-${account}`, refreshToken: '', refresh_token: '' });
+        expect(auth.tokens).toMatchObject({ access_token: `access-${account}`, refresh_token: '', refreshToken: '' });
+      }
+      expect(() => installRemoteCodexAccessBatch(target, [mirror('team'), mirror('team')], shell)).toThrow('duplicate');
+      const staleLock = join(home, '.elanous', 'remote-codex-mirror.lock');
+      writeFileSync(staleLock, 'dead installer');
+      utimesSync(staleLock, new Date(0), new Date(0));
+      installRemoteCodexAccessBatch(target, [mirror('default'), mirror('team')], shell);
+      expect(existsSync(staleLock)).toBe(false);
+      expect(JSON.parse(readFileSync(join(home, '.elanous', 'auth.json'), 'utf8')).providers['openai-codex:third']).toBeUndefined();
+      expect(existsSync(join(home, '.elanous', 'codex-accounts', 'third'))).toBe(false);
+      const firstParent = { ...target, configDir: join(home, 'parent-a', 'elanous') };
+      const secondParent = { ...target, configDir: join(home, 'parent-b', 'elanous') };
+      installRemoteCodexAccessBatch(firstParent, [mirror('team'), mirror('third')], shell);
+      installRemoteCodexAccessBatch(secondParent, [mirror('team')], shell);
+      expect(JSON.parse(readFileSync(join(firstParent.configDir, 'auth.json'), 'utf8')).providers['openai-codex:third']).toBeDefined();
+      expect(existsSync(join(firstParent.configDir, 'codex-accounts', 'third', 'auth.json'))).toBe(true);
+      expect(JSON.parse(readFileSync(join(secondParent.configDir, 'auth.json'), 'utf8')).providers['openai-codex:third']).toBeUndefined();
+      const parentEntry = spawnSync('bun', [join(process.cwd(), 'bin', 'elanous.mjs'), '--config-dir', join(home, '.elanous'), 'provider', 'codex', 'account', 'list'], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 15_000,
+        env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, 'parent-a'), CODEX_HOME: join(firstParent.configDir, 'codex-default') },
+      });
+      expect(parentEntry.status).toBe(0);
+      expect(parentEntry.stdout).toContain('third');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
 
   test('remote owner mirror installs only the selected account when account tokens differ', () => {
     const { home } = fakeHome('true');
@@ -887,7 +1163,7 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
     };
     const context = { runId: 'run-mirror0001', launchId: 'tl-mirror', env: { ELANOUS_RUN_ID: 'run-mirror0001' } };
     const deps = { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
-      codexAccessMirror: async () => { mirrorReads++; return { ...TEST_CODEX_MIRROR, account: 'third', usedPercent: 47, thresholdPercent: 60 }; }, spawn: () => { throw Error('local fallback'); } };
+      codexAccessMirror: async () => { mirrorReads++; return { ...TEST_CODEX_MIRROR, account: 'third', usedPercent: 47, thresholdPercent: 60 }; }, ownerCodexLeaseHolder: () => true, spawn: () => { throw Error('local fallback'); } };
 
     const first = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context, deps);
     const second = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context, deps);
@@ -899,7 +1175,7 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
     for (const call of installs) {
       expect(call.script).not.toContain(ACCESS_TOKEN);
       expect(call.script).not.toContain('refreshCodexAccountHome');
-      const payload = JSON.parse(call.stdin!);
+      const payload = JSON.parse(call.stdin!)[0];
       expect(payload.provider.tokens.refreshToken).toBe('');
       expect(payload.provider.tokens.refresh_token).toBe('');
       expect(payload.codexAuth.tokens.refresh_token).toBe('');
@@ -912,10 +1188,51 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
     expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_ACCOUNT=third');
     expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_USED_PERCENT=47');
     expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT=60');
+    expect(launchScript).toContain('XDG_CONFIG_HOME=');
+    expect(launchScript).toContain('CODEX_HOME=');
+    expect(launchScript).toContain('GH_CONFIG_DIR="$HOME"/.config/gh');
     expect(launchScript).not.toContain(ACCESS_TOKEN);
   });
 
-  test('real HQ selector chooses one ordered account, mirrors only its access, and refuses when all owner accounts exceed caps', async () => {
+  test('single-account injection gives consecutive parents separate auth stores', async () => {
+    const { home } = fakeHome('true');
+    const configDir = join(home, '.elanous');
+    const mirror = (account: string) => ({ account,
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, refreshToken: '', refresh_token: '' } } } }),
+      codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: `access-${account}`, refresh_token: '', refreshToken: '' } }),
+    });
+    const launches: string[] = [];
+    const shell = localShell(home);
+    const ssh: SshRunner = (host, script, timeoutMs, stdin) => {
+      if (stdin !== undefined) return shell(host, script, timeoutMs, stdin);
+      if (script.includes('--version')) return { status: 0, stdout: GOOD_FACTS, stderr: '' };
+      if (script.includes('nohup')) { launches.push(script); return { status: 0, stdout: 'pid=5151\n', stderr: '' }; }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const credentials = join(configDir, 'remote-parent-credentials');
+    try {
+      for (const [account, runId] of [['team', 'run-singlea'], ['third', 'run-singleb']] as const) {
+        await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+          { runId, launchId: `tl-${account}`, env: { ELANOUS_RUN_ID: runId } },
+          { parentHost: { ...TARGET, configDir }, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+            codexAccessMirror: async () => mirror(account), ownerCodexLeaseHolder: () => true, spawn: () => { throw Error('local fallback'); } });
+        const dirs = readdirSync(credentials);
+        expect(dirs).toHaveLength(account === 'team' ? 1 : 2);
+      }
+      const stores = readdirSync(credentials).map((name) => join(credentials, name, 'elanous'));
+      const installed = stores.map((store) => JSON.parse(readFileSync(join(store, 'auth.json'), 'utf8')).providers['openai-codex'].tokens.accessToken).sort();
+      expect(installed).toEqual(['access-team', 'access-third']);
+      expect(launches).toHaveLength(2);
+      for (const script of launches) {
+        expect(script).toContain('XDG_CONFIG_HOME=');
+        expect(script).toContain('CODEX_HOME=');
+        expect(script).toContain('remote-parent-credentials/');
+      }
+      expect(existsSync(join(home, '.codex', 'auth.json'))).toBe(false);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('real HQ selector mirrors every eligible account in order and refuses when all owner accounts exceed caps', async () => {
     const root = mkdtempSync(join(tmpdir(), 'owner-mirror-selector-'));
     const previousXdg = process.env.XDG_CONFIG_HOME;
     process.env.XDG_CONFIG_HOME = root;
@@ -941,6 +1258,7 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
         return { status: 0, stdout: script.includes('--version') ? GOOD_FACTS : script.includes('nohup') ? 'pid=5152\n' : '', stderr: '' };
       };
       const baseDeps = { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw Error('local fallback'); },
+        ownerCodexLeaseHolder: () => true,
         ownerCodexRotation: () => rotation as unknown as ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation>,
         ownerCodexRotationConfig: { accountOrder: ['team', 'third'], thresholdPercentByAccount: { third: 60, team: 60 } } };
       const launched = await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
@@ -948,17 +1266,49 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
           env: { ELANOUS_RUN_ID: 'run-ownerselect01', ELANOUS_POD_MEMORY_TIER: 'high', ELANOUS_POD_MEMORY: '16Gi' } }, baseDeps);
       expect(launched && 'parentHost' in launched ? launched.parentHost?.host : undefined).toBe('node-b');
       const install = calls.find((call) => call.stdin !== undefined)!;
+      const firstInstallScript = install.script;
       const installed = JSON.parse(install.stdin!);
-      expect(installed.storeKey).toBe('openai-codex:team');
-      expect(installed.provider.tokens.accessToken).toBe(accessByAccount.team);
-      expect(install.stdin).not.toContain(accessByAccount.third);
+      expect(installed.map((entry: { account: string }) => entry.account)).toEqual(['team', 'third']);
+      expect(installed.map((entry: { provider: { tokens: { accessToken: string } } }) => entry.provider.tokens.accessToken)).toEqual([accessByAccount.team, accessByAccount.third]);
       expect(install.stdin).not.toContain('refresh-team');
       expect(install.stdin).not.toContain('refresh-third');
       const launchScript = calls.find((call) => call.script.includes('nohup'))?.script ?? '';
       expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT=60');
       expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_ACCOUNT=team');
+      expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_ACCOUNTS=');
+      expect(launchScript).toContain('ELANOUS_REMOTE_CODEX_ACCESS_ONLY=1');
+      expect(launchScript).toContain('XDG_CONFIG_HOME=');
+      expect(launchScript).toContain('CODEX_HOME=');
+      expect(launchScript).toContain('remote-parent-credentials/');
       expect(launchScript).toContain('ELANOUS_POD_MEMORY_TIER=high');
       expect(launchScript).toContain('ELANOUS_POD_MEMORY=16Gi');
+
+      // A broken owner credential skips team; the other owner credential still reaches node-b.
+      calls.length = 0;
+      const teamAuthPath = join(root, 'codex-team', 'auth.json');
+      const teamAuthBefore = readFileSync(teamAuthPath, 'utf8');
+      writeFileSync(teamAuthPath, JSON.stringify({ auth_mode: 'apikey', tokens: { access_token: accessByAccount.team, refresh_token: 'refresh-team' } }));
+      const withBrokenTeam = await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-ownerselect02', launchId: 'tl-ownerselect2', substrate: 'pod', podGoal: 'document this behavior', env: { ELANOUS_RUN_ID: 'run-ownerselect02' } },
+        baseDeps);
+      expect(withBrokenTeam && 'parentHost' in withBrokenTeam ? withBrokenTeam.parentHost?.host : undefined).toBe('node-b');
+      expect(JSON.parse(calls.find((call) => call.stdin !== undefined)!.stdin!).map((entry: { account: string }) => entry.account)).toEqual(['third']);
+      expect(calls.find((call) => call.stdin !== undefined)!.script).not.toBe(firstInstallScript);
+      writeFileSync(teamAuthPath, teamAuthBefore);
+
+      // The owner lease can transfer after candidate planning. The stale
+      // account is not refreshed, and the fresh account must not be installed.
+      calls.length = 0;
+      const expiring = accountToken(Math.floor(Date.now() / 1000) + 3_600);
+      writeFileSync(teamAuthPath, JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: expiring, id_token: expiring, refresh_token: 'refresh-team' } }));
+      const teamAuthExpiring = readFileSync(teamAuthPath, 'utf8');
+      let leaseChecks = 0;
+      await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-ownerselect03', launchId: 'tl-ownerselect3', substrate: 'pod', podGoal: 'document this behavior', env: { ELANOUS_RUN_ID: 'run-ownerselect03' } },
+        { ...baseDeps, ownerCodexLeaseHolder: () => ++leaseChecks === 1 })).rejects.toThrow('임대가 설치 직전에 사라져');
+      expect(leaseChecks).toBeGreaterThan(1);
+      expect(readFileSync(teamAuthPath, 'utf8')).toBe(teamAuthExpiring);
+      expect(calls.some((call) => call.stdin !== undefined || call.script.includes('nohup'))).toBe(false);
 
       calls.length = 0;
       const exhausted = { ...rotation, candidates: candidates.map((candidate) => ({ ...candidate, usedPercent: 99 })) };
@@ -966,6 +1316,51 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
         { runId: 'run-ownerempty01', launchId: 'tl-ownerempty', env: { ELANOUS_RUN_ID: 'run-ownerempty01' } },
         { ...baseDeps, ownerCodexRotation: () => exhausted as unknown as ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation> })).rejects.toThrow('모두 사용 임계');
       expect(calls.some((call) => call.stdin !== undefined || call.script.includes('nohup'))).toBe(false);
+
+      // The receiver rejects a marker above 16 accounts. The sender must
+      // bound the installed batch and marker together before remote launch.
+      calls.length = 0;
+      const manyNames = Array.from({ length: 17 }, (_, index) => `acct${String(index).padStart(2, '0')}`);
+      const manyCandidates = manyNames.map((name) => {
+        const home = join(root, `codex-${name}`);
+        mkdirSync(home, { recursive: true });
+        const token = accountToken(1_900_000_003);
+        writeFileSync(join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: token, id_token: token, refresh_token: `refresh-${name}` } }));
+        providers[`openai-codex:${name}`] = { authMode: 'chatgpt', codexHome: home, tokens: { accessToken: token, refreshToken: `refresh-${name}` } };
+        return { name, storeKey: `openai-codex:${name}`, home, reached: false, usedPercent: 10 };
+      });
+      writeFileSync(storePath, JSON.stringify({ version: 1, providers }));
+      await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-ownercap17', launchId: 'tl-ownercap17', substrate: 'pod', podGoal: 'document this behavior', env: { ELANOUS_RUN_ID: 'run-ownercap17' } },
+        { ...baseDeps, ownerCodexRotation: () => ({ ...rotation, candidates: manyCandidates }) as unknown as ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation>,
+          ownerCodexRotationConfig: { accountOrder: manyNames } });
+      expect(JSON.parse(calls.find((call) => call.stdin !== undefined)!.stdin!).map((entry: { account: string }) => entry.account)).toEqual(manyNames.slice(0, 16));
+      const cappedLaunch = calls.find((call) => call.script.includes('nohup'))!.script;
+      const markerAccounts = (script: string) => {
+        const quoted = /ELANOUS_REMOTE_CODEX_ACCOUNTS='([^']+)'/.exec(script)?.[1];
+        expect(quoted).toBeDefined();
+        return JSON.parse(quoted!).map((entry: { account: string }) => entry.account);
+      };
+      expect(markerAccounts(cappedLaunch)).toEqual(manyNames.slice(0, 16));
+
+      // The injected owner source must obey the same installation and marker cap.
+      calls.length = 0;
+      const injected = manyNames.map((account) => ({ account, expiresAt: 1_900_000_003_000, thresholdPercent: 60,
+        elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, refreshToken: '', refresh_token: '' } } } }),
+        codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: `access-${account}`, refresh_token: '', refreshToken: '' } }),
+      }));
+      await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-ownerinject17', launchId: 'tl-ownerinject17', substrate: 'pod', podGoal: 'document this behavior', env: { ELANOUS_RUN_ID: 'run-ownerinject17' } },
+        { ...baseDeps, codexAccessMirror: async () => ({ ...injected[16]!, mirrors: injected }) });
+      const injectedInstall = JSON.parse(calls.find((call) => call.stdin !== undefined)!.stdin!).map((entry: { account: string }) => entry.account);
+      const injectedLaunch = calls.find((call) => call.script.includes('nohup'))!.script;
+      expect(injectedInstall).toEqual(manyNames.slice(0, 16));
+      expect(markerAccounts(injectedLaunch)).toEqual(injectedInstall);
+      expect(injectedLaunch).toContain('ELANOUS_REMOTE_CODEX_ACCOUNT=acct00');
+
+      await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-ownernolease', launchId: 'tl-ownernolease', env: { ELANOUS_RUN_ID: 'run-ownernolease' } },
+        { ...baseDeps, ownerCodexLeaseHolder: () => false })).rejects.toThrow('주인 임대');
     } finally {
       if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = previousXdg;

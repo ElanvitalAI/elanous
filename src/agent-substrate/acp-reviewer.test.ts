@@ -1,12 +1,13 @@
 import { describe, it, expect, spyOn } from 'bun:test';
-import { DEFAULT_REVIEW_BACKEND, isReadOnlyReviewTool, makeAcpReviewLLM, makeLazyAcpReviewLLM } from './acp-reviewer.js';
+import { DEFAULT_REVIEW_BACKEND, defaultAcpReviewTimeoutSec, isReadOnlyReviewTool, makeAcpReviewLLM, makeLazyAcpReviewLLM } from './acp-reviewer.js';
 import { debug } from '../debug/log.js';
 import { AcpAgent, type AcpAgentOpts } from '../acp/client.js';
 import { AcpAgentManager } from '../acp/agent-manager.js';
 import { CODEX_APP_SERVER_CAPS } from '../acp/codex-app-server-agent.js';
 import type { ReviewImage } from './pr-reviewer.js';
 import type { ElanousCapabilities } from '../acp/capabilities.js';
-import { subscriptionReviewerSpawn } from '../self-dev/review-provider-fallback.js';
+import { resolveTeamclaudeReviewRoute, subscriptionReviewerSpawn } from '../self-dev/review-provider-fallback.js';
+import { withFakeBins } from '../ux-sim/fake-bin.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -245,7 +246,7 @@ describe('ACP reviewer backend factory', () => {
     const prompt = spyOn(AcpAgent.prototype, 'prompt').mockResolvedValue({ stopReason: 'end_turn' });
     const stop = spyOn(AcpAgent.prototype, 'stop').mockResolvedValue();
     try {
-      const review = makeAcpReviewLLM({ cwd: process.cwd(), backend: 'claude' });
+      const review = makeAcpReviewLLM({ cwd: process.cwd(), backend: 'claude', resolveClaudeRoute: () => ({ reason: 'teamclaude-unavailable' }) });
       await review('first review');
       await review('second review');
       expect(stop).toHaveBeenCalledTimes(2);
@@ -269,7 +270,7 @@ describe('ACP reviewer backend factory', () => {
     const start = spyOn(AcpAgent.prototype, 'start').mockRejectedValue(new Error('start rejected'));
     const stop = spyOn(AcpAgent.prototype, 'stop').mockResolvedValue();
     try {
-      await expect(makeAcpReviewLLM({ cwd: process.cwd(), backend: 'claude' })('review prompt'))
+      await expect(makeAcpReviewLLM({ cwd: process.cwd(), backend: 'claude', resolveClaudeRoute: () => ({ reason: 'teamclaude-unavailable' }) })('review prompt'))
         .rejects.toThrow('start rejected');
       expect(process.listenerCount('exit')).toBe(baseline.exit);
       expect(process.listenerCount('SIGINT')).toBe(baseline.sigint);
@@ -520,5 +521,97 @@ describe('makeAcpReviewLLM — 백엔드 해석 실패 관측', () => {
     // ⭐ 계측 «필드»도 문다 — stage·message 만 보면 나머지가 사라져도 통과한다(#7495 should-fix).
     expect(failure!.data?.requestedBackend).toBe('claude-code');
     expect(failure!.data?.backend).toBe('claude-code');
+  });
+});
+
+// ACP-REVIEW-VIA-TEAMCLAUDE (0.2.35 · 대표 10-21 «리뷰도 cct(teamclaude) 버전으로 acp claude»).
+//   `--acp-backend claude` 리뷰는 ANTHROPIC_BASE_URL 을 스스로 넣지 않아 teamclaude(계정 회전)를 안 거쳤다.
+//   두 갈래: teamclaude 가 base-url 을 주면 자식 env 에 들어가고, 없으면 종전 경로(맨 claude 로그인) 그대로.
+describe('ACP claude review routes through teamclaude', () => {
+  const BASE = 'http://localhost:3456';
+  function captureRouteLog() {
+    const events: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      events.push({ category, event, data });
+    }) as never);
+    return { events, log };
+  }
+
+  it('teamclaude base-url → the ACP child env carries ANTHROPIC_BASE_URL and claude-route says viaTeamclaude', async () => {
+    const route = resolveTeamclaudeReviewRoute({ PATH: '/bin', ANTHROPIC_API_KEY: 'key' },
+      () => ({ status: 0, stdout: `export ANTHROPIC_BASE_URL=${BASE}\nexport ANTHROPIC_API_KEY=proxy-secret\n` }));
+    let created: AcpAgentOpts | undefined;
+    const { events, log } = captureRouteLog();
+    try {
+      await makeAcpReviewLLM({
+        cwd: process.cwd(), backend: 'claude',
+        resolveClaudeRoute: () => route,
+        createAgent: (opts) => { created = opts; return reviewAgent(opts); },
+      })('review');
+    } finally { log.mockRestore(); }
+    expect(route.spawn).toBeDefined();
+    expect(created?.env?.ANTHROPIC_BASE_URL).toBe(BASE);
+    // The billing scrub still applies: no API key reaches the subscription child, and the proxy key is never read.
+    expect(created?.env?.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(created?.backendSpec?.command).toBe(getAcpBackend('claude').command);
+    expect(events).toContainEqual({ category: 'review.acp', event: 'claude-route',
+      data: { viaTeamclaude: true, baseUrlSet: true, timeoutSec: 600, reason: 'teamclaude-base-url' } });
+  });
+
+  it('teamclaude absent → the prior path (no backendSpec, no env) and claude-route says not viaTeamclaude', async () => {
+    let created: AcpAgentOpts | undefined;
+    const { events, log } = captureRouteLog();
+    try {
+      await makeAcpReviewLLM({
+        cwd: process.cwd(), backend: 'claude', timeoutMs: 120_000,
+        resolveClaudeRoute: () => ({ reason: 'teamclaude-unavailable' }),
+        createAgent: (opts) => { created = opts; return reviewAgent(opts); },
+      })('review');
+    } finally { log.mockRestore(); }
+    expect(created).toBeDefined();
+    expect(created?.backendSpec).toBeUndefined();
+    expect(created?.env).toBeUndefined();
+    expect(events).toContainEqual({ category: 'review.acp', event: 'claude-route',
+      data: { viaTeamclaude: false, baseUrlSet: false, timeoutSec: 120, reason: 'teamclaude-unavailable' } });
+  });
+
+  it('a non-claude backend never probes teamclaude', async () => {
+    let probed = false;
+    await makeAcpReviewLLM({
+      cwd: process.cwd(), backend: 'codex',
+      resolveClaudeRoute: () => { probed = true; return { reason: 'teamclaude-unavailable' }; },
+      createAgent: (opts) => reviewAgent(opts),
+    })('review');
+    expect(probed).toBe(false);
+  });
+
+  it('acp claude review default timeout is 600s; other backends stay 300s', () => {
+    expect(defaultAcpReviewTimeoutSec('claude')).toBe(600);
+    expect(defaultAcpReviewTimeoutSec('cc')).toBe(600);
+    expect(defaultAcpReviewTimeoutSec('codex')).toBe(300);
+    expect(defaultAcpReviewTimeoutSec('grok')).toBe(300);
+  });
+
+  it('the production resolver runs the real `teamclaude env --no-mitm` (fake-bin) and reads only the base-url line', async () => {
+    await withFakeBins({ teamclaude: { stdout: `export ANTHROPIC_BASE_URL=${BASE}\nexport ANTHROPIC_API_KEY=proxy-secret\n` } }, async (fakeBins) => {
+      const route = resolveTeamclaudeReviewRoute({ ...fakeBins.env, ANTHROPIC_API_KEY: 'key' });
+      expect(route.reason).toBe('teamclaude-base-url');
+      expect(route.spawn?.env.ANTHROPIC_BASE_URL).toBe(BASE);
+      expect(route.spawn?.env.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(fakeBins.calls().map((c) => c.argv)).toEqual([['env', '--no-mitm']]);
+    });
+  });
+
+  it('the production resolver falls back when teamclaude is missing or prints no base-url', async () => {
+    await withFakeBins({ teamclaude: { exitCode: 1 } }, async (fakeBins) => {
+      expect(resolveTeamclaudeReviewRoute(fakeBins.env)).toEqual({ reason: 'teamclaude-no-base-url', exit: 1 });
+    });
+    await withFakeBins({ teamclaude: { stdout: 'no url here\n' } }, async (fakeBins) => {
+      expect(resolveTeamclaudeReviewRoute(fakeBins.env)).toEqual({ reason: 'teamclaude-no-base-url', exit: 0 });
+    });
+    const empty = mkdtempSync(join(tmpdir(), 'no-teamclaude-'));
+    try {
+      expect(resolveTeamclaudeReviewRoute({ PATH: empty }).reason).toBe('teamclaude-unavailable');
+    } finally { rmSync(empty, { recursive: true, force: true }); }
   });
 });

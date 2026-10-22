@@ -14,8 +14,11 @@ test('core catalog shares the parser vocabulary, is idempotent and graph-scoped'
   expect(WORKFLOW_CORE_KINDS).toHaveLength(24);
   expect(WORKFLOW_CORE_KINDS).toContain('knowledge');
   expect(WORKFLOW_CORE_KINDS).toContain('subworkflow');
-  expect(HARNESS_CORE_KINDS).toHaveLength(8);
+  expect(HARNESS_CORE_KINDS).toHaveLength(9);
   expect(hasNodeKind('harness', 'prompt')).toBe(true);
+  expect(hasNodeKind('harness', 'classify')).toBe(true);
+  expect(hasNodeKind('workflow', 'classify')).toBe(true);
+  expect(parseGraphTemplateYaml(yaml('classify')).template?.nodes[0]?.kind).toBe('classify');
   expect(parseGraphTemplateYaml(yaml('prompt')).template?.nodes[0]?.kind).toBe('prompt');
   expect(listNodeKinds('workflow').filter((entry) => entry.core).every((entry) => entry.description.length > 0)).toBe(true);
   expect(hasNodeKind('workflow', 'hitl')).toBe(false);

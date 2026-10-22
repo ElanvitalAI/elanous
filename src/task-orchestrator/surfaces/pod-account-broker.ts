@@ -149,6 +149,39 @@ export function ownerCodexMirrorCandidate(candidates: readonly RotationCandidate
   });
 }
 
+export interface OwnerCodexMirrorAccount { account: string; usedPercent: number | null; thresholdPercent: number; expiresAt: number }
+
+/** The remote may rotate only across the accounts HQ actually installed in this launch snapshot. */
+export function parseOwnerCodexMirrorAccounts(raw: string): OwnerCodexMirrorAccount[] {
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error('HQ Codex 미러 계정 목록이 잘못됐다'); }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 16) throw new Error('HQ Codex 미러 계정 목록이 잘못됐다');
+  const seen = new Set<string>();
+  return parsed.map((item: unknown) => {
+    if (!item || typeof item !== 'object') throw new Error('HQ Codex 미러 계정 항목이 잘못됐다');
+    const value = item as Record<string, unknown>;
+    const { account, usedPercent, thresholdPercent, expiresAt } = value;
+    if (typeof account !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(account) || seen.has(account)
+      || (usedPercent !== null && (typeof usedPercent !== 'number' || !Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100))
+      || typeof thresholdPercent !== 'number' || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0 || thresholdPercent > 100
+      || typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= 0)
+      throw new Error('HQ Codex 미러 계정 항목이 잘못됐다');
+    seen.add(account);
+    return { account, usedPercent: usedPercent as number | null, thresholdPercent, expiresAt };
+  });
+}
+
+/** Do not plan a Pod against an access token that might expire while it starts and runs. */
+export function freshOwnerCodexMirrorAccounts(accounts: readonly OwnerCodexMirrorAccount[], now = Date.now()): OwnerCodexMirrorAccount[] {
+  return accounts.filter(({ expiresAt }) => expiresAt > now + 3 * 60 * 60 * 1000);
+}
+
+export function selectOwnerCodexMirrorCandidates(candidates: readonly RotationCandidate[], accounts: readonly OwnerCodexMirrorAccount[]): RotationCandidate[] {
+  const selected = accounts.flatMap(({ account, usedPercent }) => ownerCodexMirrorCandidate(candidates, account, usedPercent ?? undefined));
+  if (selected.length !== accounts.length) throw new Error('HQ Codex 미러 계정 일부가 원격 auth-store 후보에 없다');
+  return selected;
+}
+
 /** Job 마다 다음 계정 — 잔량 순으로 돌려 가며. 쓸 계정이 없으면 만들 때 이유를 대고 던진다. */
 export function makePodAccountBroker(plan: PodAccountPlan): () => string {
   if (plan.usable.length === 0) {

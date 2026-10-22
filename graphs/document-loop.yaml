@@ -1,6 +1,7 @@
 graph_id: document-loop
 version: 1
-entry_node: document-draft
+journey_stages: [entry, author, dispatch, run, land, recover, end]
+entry_node: intake
 terminal_nodes: [landed, document-blocked, needs-human]
 runner_inputs: [goal, worktree, branch, review-intent, head-sha, base-branch, ask, context, prior]
 docs_only_gate_skip: true
@@ -117,7 +118,45 @@ nodes:
   - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
   - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
 
+  - { node_id: intake, kind: observe, recipe: harness-entrance, journey_stage: entry, max_visits: 1 }
+  - { node_id: queue, kind: gate, recipe: harness-queue, journey_stage: entry, max_visits: 1 }
+  - { node_id: launch-gate, kind: gate, recipe: pre-launch-gate, journey_stage: entry, max_visits: 1 }
+  - node_id: entry-unit
+    kind: subgraph
+    recipe: none
+    journey_stage: entry
+    max_visits: 1
+    call: entry@1
+    budget: { inner_steps: 4 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: dispatch, kind: judge, recipe: harness-substrate-select, journey_stage: dispatch, max_visits: 2 }
+  - { node_id: pool-admit, kind: gate, recipe: pod-pool-admission, journey_stage: dispatch, max_visits: 4 }
+  - node_id: dispatch-pod-unit
+    kind: subgraph
+    recipe: none
+    journey_stage: dispatch
+    max_visits: 4
+    call: dispatch-pod@1
+    budget: { inner_steps: 4 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: freeze-check, kind: gate, recipe: landing-freeze-admission, journey_stage: land, max_visits: 4 }
+  - { node_id: hold, kind: hitl, recipe: frozen-merge-queue, journey_stage: land, max_visits: 4 }
+  - { node_id: cleanup, kind: git, recipe: post-merge-cleanup, journey_stage: land, max_visits: 1 }
+  - { node_id: result-parse, kind: observe, recipe: pod-failure-reason, journey_stage: recover, max_visits: 4 }
+  - { node_id: salvage, kind: git, recipe: salvage-branch, journey_stage: recover, max_visits: 4 }
+  - { node_id: heal, kind: judge, recipe: heal-intake, journey_stage: recover, max_visits: 4 }
+  - { node_id: next-move, kind: judge, recipe: task-agent-judge, journey_stage: recover, max_visits: 4 }
+  - { node_id: ready, kind: gate, recipe: none, journey_stage: land, max_visits: 1 }
+  - { node_id: pr-head-checkout, kind: gate, recipe: none, journey_stage: land, max_visits: 1 }
+
 edges:
+  - { from: intake, on: outcome, map: { queued: queue, direct: launch-gate, ok: launch-gate, fail: needs-human } }
+  - { from: queue, on: outcome, map: { launched: launch-gate, waiting: needs-human, refused: needs-human, ok: launch-gate, fail: needs-human } }
+  - { from: launch-gate, on: outcome, map: { pass: entry-unit, refuse: needs-human, ok: entry-unit, fail: needs-human } }
+  - { from: entry-unit, on: outcome, map: { done: dispatch, rework: document-draft, needs-human: needs-human, failed: needs-human } }
+  - { from: dispatch, on: outcome, map: { local: document-draft, pod: pool-admit, fresh: document-draft, pr-source: pool-admit, ok: document-draft, fail: needs-human } }
+  - { from: pool-admit, on: outcome, map: { admitted: dispatch-pod-unit, refused: needs-human, ok: dispatch-pod-unit, fail: needs-human } }
+  - { from: dispatch-pod-unit, on: outcome, map: { done: document-draft, rework: document-draft, needs-human: needs-human, failed: result-parse } }
   - from: document-draft
     on: changed-files
     map:
@@ -156,11 +195,20 @@ edges:
       fail: document-rework
 
   - from: open-pr
-    to: merge
+    to: freeze-check
+  - { from: freeze-check, on: outcome, map: { open: merge, frozen: hold, taken: needs-human, ok: merge, fail: needs-human } }
+  - { from: hold, to: freeze-check }
 
   - from: merge
     on: outcome
-    map: { merged: landed, land-refused: recover, ok: needs-human, fail: needs-human }
+    map: { merged: cleanup, land-refused: recover, draft: ready, head-branch: pr-head-checkout, not-ancestor: main-sync, review-missing: document-review, other: next-move, ok: needs-human, fail: needs-human }
+  - { from: cleanup, to: landed }
+  - { from: result-parse, to: salvage }
+  - { from: salvage, to: heal }
+  - { from: heal, to: next-move }
+  - { from: ready, to: next-move }
+  - { from: pr-head-checkout, to: next-move }
+  - { from: next-move, on: outcome, map: { narrow-relaunch: dispatch, salvage-relaunch: dispatch, alternative: dispatch, wait-retry: dispatch, decision-card: needs-human, wait: needs-human, ok: needs-human, fail: needs-human } }
 
   - from: recover
     on: outcome

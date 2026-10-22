@@ -211,6 +211,7 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     expect(calls[0]!.alwaysInclude).toContain('scripts/discord-seat-probe.test.ts');
     expect(calls[0]!.alwaysInclude).toContain('scripts/ratchets/test-interference-patterns.test.ts');
     expect(dispatched[0]!.flags).toEqual({ remote: true, local: false });
+    expect(dispatched[0]!.tool).toBe('self-gate');
     expect(result).toMatchObject({ version: '0.2.19', base: 'abc123', introduced: 0, preexisting: 0, alwaysInclude: 7, alwaysIncludeMissing: [], ok: true, remote: null });
   });
 

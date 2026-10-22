@@ -75,6 +75,26 @@ describe('detectImplPhase — implementation-ready', () => {
   });
 });
 
+describe('detectImplPhase — explicit new-project RFC boundary', () => {
+  test('new repository implementation routes to design-first', () => {
+    expect(detectImplPhase({ text: '새 저장소에 독서 앱을 만들어줘' }))
+      .toBe('design-first');
+    expect(detectImplPhase({ text: '빈 저장소에서 독서 앱 만들어줘' }))
+      .toBe('design-first');
+    expect(detectImplPhase({ text: '독서 앱을 처음부터 만들어줘' }))
+      .toBe('design-first');
+    expect(detectImplPhase({ text: '새 저장소에 이 앱을 포팅해줘' }))
+      .toBe('design-first');
+  });
+
+  test('small code change remains immediate implementation', () => {
+    expect(detectImplPhase({ text: '이 함수 구현해줘' }))
+      .toBe('implementation-ready');
+    expect(detectImplPhase({ text: '이 함수 처음부터 구현해줘' }))
+      .toBe('implementation-ready');
+  });
+});
+
 describe('detectImplPhase — idle', () => {
   test('empty string', () => {
     expect(detectImplPhase({ text: '' })).toBe('idle');

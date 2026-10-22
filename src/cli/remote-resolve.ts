@@ -203,7 +203,7 @@ function hasFlag(args: readonly string[], name: string): boolean {
  *  읽어 `<값>` 을 받는 것이 전부 여기 있는지 확인한다(`root value-taking flags are enumerated`).
  *  ⇒ 루트에 값 받는 플래그를 더하면 그 시험이 «먼저» 깨진다. */
 // ⭐ `--name <name>` = 대시보드 TUI 별명(dashboard-name-flag.ts) — 값이 다음 토큰이라 `elanous --name op -r` 의 `-r` 이 루트로 남게 센다.
-export const ROOT_FLAGS_TAKING_VALUE = new Set(['--remote', '--config-dir', '--name']);
+export const ROOT_FLAGS_TAKING_VALUE = new Set(['--remote', '--config-dir', '--name', '--tui']);
 
 /** 이 토큰이 루트 «선행 플래그 구간» 안에 있나 — 즉 전역 선처리가 소유하나.
  *  ⛔ 없으면 다른 명령의 `-r` 을 «탈취»한다(`autopilot link … -r friend`).

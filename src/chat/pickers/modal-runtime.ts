@@ -1,5 +1,5 @@
 import { debug } from '../../debug/log.js';
-import { ansi, type Key } from '../../tui.js';
+import type { Key } from '../../tui.js';
 import { createChatPickerModalFamily, type ChatPickerFamilySources, type ChatPickerModalBindings, type ChatPickerModalFamily, type PickerOnKey, type PickerOnRowClick } from './modals.js';
 import { CHAT_PICKER_KINDS, type ChatPickerKind } from './kinds.js';
 import type { ModalSink } from '../index.js';
@@ -10,7 +10,6 @@ export interface ChatPickerModalRuntimeDeps {
   modalSink?: ModalSink;
   picker: PickerState;
   getBufferView: () => PickerBufferView;
-  writeTerminal: (s: string) => void;
   getBounds: () => { row: number; col: number; width: number; height: number };
   getInputZoneHeight: () => number;
   onDispatchResult: (
@@ -26,28 +25,13 @@ interface PickerHandle {
 interface SyncPickerModalSpec {
   kind: ChatPickerKind;
   active: boolean;
-  clearRows: number;
   createSurface: () => ModalSurface;
 }
 
 interface SyncPickerFamilySpec {
   activeKind: ChatPickerKind | null;
-  clearRows: number;
   debugLayout?: { row: number; col: number; width: number };
   family: ChatPickerModalFamily;
-}
-
-export function paintChatPickerClear(spec: {
-  bounds: { row: number; col: number };
-  rows: number;
-  inputZoneHeight: number;
-}): string {
-  const out: string[] = [];
-  for (let i = 0; i < spec.rows; i++) {
-    const r = spec.bounds.row - spec.inputZoneHeight - 1 - i;
-    if (r >= 1) out.push(ansi.moveTo(r, spec.bounds.col) + '\x1b[2K');
-  }
-  return out.join('');
 }
 
 export function createChatPickerModalRuntime(deps: ChatPickerModalRuntimeDeps): {
@@ -112,15 +96,15 @@ export function createChatPickerModalRuntime(deps: ChatPickerModalRuntimeDeps): 
     });
   };
 
-  const clearHandle = (kind: ChatPickerKind, clearRows: number): void => {
+  // TUI-DIRECT-WRITE-ROWS — no direct terminal clear here. The sink is the
+  // display coordinator, whose popModal marks every row dirty and forces the
+  // next frame (Q7 / F9), so the picker rows repaint through the frame cache.
+  // The old CUP+EL clear bypassed that cache and was off by one row: it
+  // erased the row above the picker band (ChatLog header) and left it blank
+  // until the forced repaint arrived.
+  const clearHandle = (kind: ChatPickerKind): void => {
     const handle = handles.get(kind);
     if (!handle) return;
-    const bounds = deps.getBounds();
-    deps.writeTerminal(paintChatPickerClear({
-      bounds,
-      rows: clearRows,
-      inputZoneHeight: deps.getInputZoneHeight(),
-    }));
     handle.dispose();
     handles.delete(kind);
   };
@@ -133,7 +117,7 @@ export function createChatPickerModalRuntime(deps: ChatPickerModalRuntimeDeps): 
       return;
     }
     if (!spec.active && handle) {
-      clearHandle(spec.kind, spec.clearRows);
+      clearHandle(spec.kind);
     }
   };
 
@@ -188,7 +172,6 @@ export function createChatPickerModalRuntime(deps: ChatPickerModalRuntimeDeps): 
       syncModal({
         kind,
         active: kind === input.activeKind && itemCount > 0,
-        clearRows: input.clearRows,
         createSurface: () => input.family.createSurface(kind),
       });
     }
@@ -196,7 +179,7 @@ export function createChatPickerModalRuntime(deps: ChatPickerModalRuntimeDeps): 
 
   const clearAll = (): void => {
     for (const kind of [...handles.keys()]) {
-      clearHandle(kind, 9);
+      clearHandle(kind);
     }
   };
 

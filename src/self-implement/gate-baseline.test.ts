@@ -16,6 +16,8 @@ import {
   classifyAgainstBaseline,
   classifyBaselineProcess,
   classifyBaselineWorktreeAddFailure,
+  baselineGitStderrTail,
+  BASELINE_GIT_STDERR_TAIL_LIMIT,
   withBaselineWorktree,
   classifyTimeoutRerunVariability,
   decideGateChildResponsibility,
@@ -39,6 +41,8 @@ import { defaultSeams } from './seams.js';
 import { gateEvidenceNote } from '../harness/review-adapter.js';
 import { debug } from '../debug/log.js';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
+import { withFakeBins } from '../ux-sim/fake-bin.js';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -1375,6 +1379,76 @@ describe('gate baseline — 시험 타임아웃은 introduced 회귀가 아니�
     expect(readdirSync(tmpdir()).filter((name) => name.startsWith('elanous-gate-junit-')).sort()).toEqual(junitReportsBefore);
   });
 
+  // ⊕ 실물 JUnit 입력 — 합성 XML 주입 없이 저장소의 실제 `bun test --reporter=junit` 산출물을
+  //    runGateBaseline 이 읽게 하고, base 에서 «다른 파일» 아래에만 있는 시험명으로 head 의 새 파일이
+  //    실패하는 사건을 만든다. 판정은 unknown(귀속 불일치) 이고 기존 판정 경로는 손대지 않는다.
+  test('실물 Bun JUnit — base 다른 파일에만 있는 시험명으로 head 새 파일이 실패하면 unknown(귀속 불일치)이다', () => {
+    const cwd = repo();
+    writeFileSync(join(cwd, 'package.json'), '{"type":"module"}\n');
+    mkdirSync(join(cwd, 'test'), { recursive: true });
+    const ownerFile = 'test/owner.test.js';
+    const copyFile = 'test/copied.test.js';
+    const caseName = 'shared gate case';
+    writeFileSync(join(cwd, ownerFile), [
+      "import { expect, test } from 'bun:test';",
+      `test('${caseName}', () => expect(Bun.file('package.json').size).toBeGreaterThan(0));`,
+    ].join('\n'));
+    git(cwd, 'add', '-A');
+    git(cwd, 'commit', '-m', 'base owner passes');
+
+    writeFileSync(join(cwd, ownerFile), [
+      "import { expect, test } from 'bun:test';",
+      `test('${caseName}', () => expect(true).toBe(false));`,
+    ].join('\n'));
+    writeFileSync(join(cwd, copyFile), [
+      "import { expect, test } from 'bun:test';",
+      `test('${caseName}', () => expect(true).toBe(false));`,
+    ].join('\n'));
+    const head = spawnSync('bun', ['test', ownerFile, copyFile], { cwd, encoding: 'utf8' });
+    expect(head.status).toBe(1);
+    expect(`${head.stdout}${head.stderr}`).toContain(`(fail) ${caseName}`);
+
+    const baseline = runGateBaseline(cwd, [ownerFile, copyFile]);
+    expect(baseline).toMatchObject({
+      status: 'pass',
+      missingAtBase: [copyFile],
+      passedTestEvidence: { status: 'available' },
+    });
+    expect(baseline.passedTestEvidence?.testCases).toEqual([{ file: ownerFile, name: `${ownerFile} > ${caseName}` }]);
+
+    const original = debug.log;
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    let report: ReturnType<typeof buildGateBaselineReport>;
+    try {
+      report = buildGateBaselineReport(`${head.stdout}\n${head.stderr}`, baseline);
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+
+    expect(report).toMatchObject({ introduced: 1, unknown: 1, missingAtBase: 1 });
+    expect(report.failures).toHaveLength(2);
+    expect(report.failures.find((failure) => failure.file === copyFile)).toMatchObject({
+      name: `${copyFile} > ${caseName}`,
+      attribution: 'unknown',
+      unknownReason: '귀속 불일치',
+      baselinePresence: 'missing',
+    });
+    // 같은 실물 입력 위에서 기존 판정 보존: base 에서 통과하던 같은 파일·같은 시험은 introduced 그대로다.
+    expect(report.failures.find((failure) => failure.file === ownerFile)).toMatchObject({
+      name: `${ownerFile} > ${caseName}`,
+      attribution: 'introduced',
+    });
+    expect(events).toContainEqual({
+      category: 'self-implement.gate',
+      event: 'attribution-mismatch',
+      data: { name: `${copyFile} > ${caseName}`, file: copyFile },
+    });
+    expect(formatGateBaselineNote(report, 0)).toContain(`- unknown: ${copyFile} > ${caseName} [baseline=missing] (귀속 불일치)`);
+  });
+
   test('baseline에서 통과한 같은 파일·시험의 timeout은 introduced로 요약하고 passed-at-base를 붙인다', () => {
     const worktree = timeoutFailLog('test/a.test.ts', 'intermittent');
     const baseline = [
@@ -1965,18 +2039,93 @@ describe('defaultSeams gate blocking', () => {
   test('git worktree add가 timeout으로 status null이면 시험 미측정이 아니라 준비 인프라 실패로 남긴다', () => {
     const result = classifyBaselineWorktreeAddFailure({
       status: null, signal: 'SIGKILL', errorCode: 'ETIMEDOUT', stdout: 'Preparing worktree', stderr: '',
-    }, 60_001);
+    }, 60_001, 300_000);
     expect(result).toMatchObject({ status: 'unknown', unknownReason: 'infrastructure-failure', childResponsibility: 'none' });
     expect(result.log).toContain('worktree-add-timeout');
     expect(result.log).toContain('code null');
     expect(result.output).toContain('Preparing worktree');
   });
 
+  test('worktree add 128 실패는 git stderr 꼬리(2KB · 줄바꿈 정리 · 토큰 가림)와 대상·base 를 남긴다', () => {
+    const noisy = `${'x'.repeat(3_000)}\r\nfatal: could not lock ghp_${'A'.repeat(36)}\r\n\n`;
+    const tail = baselineGitStderrTail(noisy);
+    expect(Buffer.byteLength(tail, 'utf8')).toBeLessThanOrEqual(BASELINE_GIT_STDERR_TAIL_LIMIT);
+    expect(tail).toContain('fatal: could not lock ghp_***');
+    const korean = baselineGitStderrTail(`${'가'.repeat(1_000)}\nfatal: 끝`);
+    expect(Buffer.byteLength(korean, 'utf8')).toBeLessThanOrEqual(BASELINE_GIT_STDERR_TAIL_LIMIT);
+    expect(korean.startsWith('가')).toBe(true);
+    expect(korean.endsWith('⏎ fatal: 끝')).toBe(true);
+    expect(tail).not.toMatch(/[\r\n]/);
+    expect(tail.endsWith('***')).toBe(true);
+    const result = classifyBaselineWorktreeAddFailure({ status: 128, stdout: 'Preparing worktree (detached HEAD 1234)', stderr: 'fatal: invalid reference: deadbeef\n' },
+      90_900, 300_000, { dir: '/tmp/elanous-gate-baseline-abc', baseRef: 'origin/main', baseSha: '0123456789abcdef0123' });
+    expect(result.log).toBe('baseline worktree-add-failed (code 128, elapsed 90900ms, limit 300000ms, target /tmp/elanous-gate-baseline-abc, base origin/main@0123456789ab)');
+    expect(result.gitStderrTail).toBe('fatal: invalid reference: deadbeef');
+    expect(result.output).toContain('Preparing worktree');
+    expect(classifyBaselineWorktreeAddFailure({ status: 128, stdout: '', stderr: '' }, 1, 2).gitStderrTail).toBe('(비었음 · signal=none · errorCode=none)');
+    expect(classifyBaselineWorktreeAddFailure({ status: null, signal: 'SIGKILL', errorCode: 'ETIMEDOUT', stdout: '', stderr: ' \n' }, 1, 2).gitStderrTail).toBe('(비었음 · signal=SIGKILL · errorCode=ETIMEDOUT)');
+    const note = formatGateBaselineNote(buildGateBaselineReport('', result), 0).split('\n');
+    const at = note.indexOf(result.log);
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(note[at + 1]).toBe('baseline worktree-add git stderr: fatal: invalid reference: deadbeef');
+  });
+
+  test('가짜 git(worktree add 만 128 · 나머지는 진짜 git)으로 생산 진입점이 stderr 꼬리·base sha·debug 사건을 남긴다', async () => {
+    const cwd = repo();
+    const head = git(cwd, 'rev-parse', 'HEAD');
+    const realGit = Bun.which('git');
+    if (!realGit) throw new Error('git unavailable');
+    const originalLog = debug.log;
+    const events: Array<{ category: string; event: string; data: any }> = [];
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      await withFakeBins({ git: {
+        whenArgsStartWith: ['worktree', 'add'], exitCode: 128, otherwise: realGit,
+        stderr: "fatal: could not create leading directories of '/tmp/x/.git': Resource temporarily unavailable\n",
+      } }, (fakeBins) => {
+        let ran = false;
+        const result = withBaselineWorktree(cwd, 'HEAD', () => { ran = true; return 'ran'; }) as { status: string; log: string; gitStderrTail?: string };
+        expect(ran).toBe(false);
+        expect(fakeBins.calls().some((call) => call.argv[0] === 'worktree' && call.argv[1] === 'add')).toBe(true);
+        expect(result.status).toBe('unknown');
+        expect(result.log).toMatch(/^baseline worktree-add-failed \(code 128, elapsed \d+ms, limit \d+ms, target \S*elanous-gate-baseline-\S+, base HEAD@[0-9a-f]{12}\)$/);
+        expect(result.log).toContain(`base HEAD@${head.slice(0, 12)}`);
+        expect(result.gitStderrTail).toBe("fatal: could not create leading directories of '/tmp/x/.git': Resource temporarily unavailable");
+      });
+      const failed = events.find((entry) => entry.event === 'worktree-add-failed');
+      expect(failed?.category).toBe('self-implement.gate-baseline');
+      expect(failed?.data).toMatchObject({ code: 128, baseRef: 'HEAD', baseSha: head, stderrTail: expect.stringContaining('fatal: could not create leading directories') });
+      expect(typeof failed?.data.elapsedMs).toBe('number');
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+    }
+  });
+
   test('실제 baseline 진입점도 null Git 종료를 시험 실패로 오귀속하지 않는다', () => {
     const cwd = repo();
+    const currentHead = git(cwd, 'rev-parse', 'HEAD');
+    const blob = git(cwd, 'hash-object', '-w', 'README.md');
+    const indexInfo = Array.from({ length: 24_999 }, (_, index) =>
+      `100644 ${blob}\ttarget-file-${String(index).padStart(5, '0')}.txt\n`).join('');
+    const index = spawnSync('git', ['update-index', '--index-info'], { cwd, encoding: 'utf8', input: indexInfo });
+    if (index.status !== 0) throw new Error(`git update-index failed: ${index.stderr}`);
+    const baselineTree = git(cwd, 'write-tree');
+    const baselineHead = git(cwd, 'commit-tree', baselineTree, '-p', currentHead, '-m', 'large baseline tree');
+    const restoredIndex = spawnSync('git', ['read-tree', currentHead], { cwd, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+    if (restoredIndex.status !== 0) throw new Error(`git read-tree failed: ${restoredIndex.stderr}`);
+    const currentIndex = spawnSync('git', ['ls-files', '-z'], { cwd, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+    if (currentIndex.status !== 0) throw new Error(`git ls-files failed: ${currentIndex.stderr}`);
+    expect((currentIndex.stdout ?? '').split('\0').filter(Boolean)).toEqual(['README.md']);
     let testRan = false;
     let observedTimeout: number | undefined;
     let observedKillSignal: string | number | undefined;
+    const originalLog = debug.log;
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
     setGitCommandRunnerForTesting((_cwd, args, options) => {
       if (args[0] === 'worktree' && args[1] === 'add') {
         observedTimeout = options?.timeout;
@@ -1986,13 +2135,19 @@ describe('defaultSeams gate blocking', () => {
       return { status: 0, stdout: '', stderr: '' };
     });
     try {
-      const result = withBaselineWorktree(cwd, 'HEAD', () => { testRan = true; return 'ran'; });
+      const result = withBaselineWorktree(cwd, baselineHead, () => { testRan = true; return 'ran'; });
       expect(testRan).toBe(false);
-      expect(observedTimeout).toBe(180_000);
+      expect(observedTimeout).toBe(600_000);
       expect(observedKillSignal).toBe('SIGKILL');
       expect(result).toMatchObject({ status: 'unknown', unknownReason: 'infrastructure-failure' });
       expect((result as { log: string }).log).toContain('worktree-add-timeout');
-    } finally { setGitCommandRunnerForTesting(undefined); }
+      expect(events).toContainEqual({ category: 'self-implement.gate-baseline', event: 'worktree-add-result', data: expect.objectContaining({
+        phase: 'baseline', timeoutMs: 600_000, trackedFileCount: 25_000, timeoutSource: 'tracked-files',
+      }) });
+    } finally {
+      setGitCommandRunnerForTesting(undefined);
+      (debug as { log: typeof debug.log }).log = originalLog;
+    }
   });
 
   test('서로 다른 unknown 사유도 생산 분류에서 child-responsibility=none을 보존한다', () => {

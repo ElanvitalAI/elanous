@@ -141,7 +141,7 @@ describe('dashboard tool catalog observability', () => {
       'Read', 'Grep', 'Glob', 'ListDir', 'Edit', 'Write',
       'Agent', 'AgentOutput', 'AgentReply', 'AgentStop', 'AgentList', 'SelfImplement',
       'Bash', 'RunShell',
-      'MsgList', 'MsgPost', 'MsgAck',
+      'MsgList', 'MsgPost', 'MsgAsk', 'MsgAck',
       'ChecklistList', 'ChecklistAdd', 'ChecklistSet', 'ChecklistEdit', 'ChecklistMove',
       'PtyShellStart', 'PtyShellPoll', 'PtyShellSend',
       'PtyShellKill', 'PtyShellList', 'run_tests', 'elanous_skills_list', 'skill_exec',

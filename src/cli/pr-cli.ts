@@ -30,6 +30,7 @@ import { queryRunningRuns, type RunningRunsResult } from '../self-implement/runn
 import { debug } from '../debug/log.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import {
+  defaultCensusParallelRunner,
   defaultCmdRunner,
   makePrManager,
   resolveDeliverableBase,
@@ -71,7 +72,7 @@ import { readTaskAgentState, taskAgentStatePath, type TaskCard } from '../task-a
 import { INFLIGHT_REGISTRY_FILE, removeInflightForPr } from '../pr-tool/inflight-registry.js';
 import { PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { enqueueL8ShadowQueue, runL8ShadowQueue, shadowPrNumber, statusL8ShadowQueue, type L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
-import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, type Seat } from '../pr-tool/census.js';
+import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, sharedCensusDiffCache, type Seat } from '../pr-tool/census.js';
 
 export { branchLineageSlug, findSiblingPrs };
 
@@ -2542,7 +2543,9 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
       const diff = prToolRun('git', ['-C', cwd, 'diff', '--name-only', '-z', `${opts.base}...HEAD`]);
       const files = diff.ok ? diff.out.split('\0').filter(Boolean) : null;
       const patch = prToolRun('git', ['-C', cwd, 'diff', '--unified=0', `${opts.base}...HEAD`]);
-      const inventory = readOpenPrs(prToolRun, { cwd, ...(files ? { candidateFiles: files } : {}) });
+      // PR-CENSUS-PARALLEL: the real runner fans `gh pr diff` out (cap 6); an injected runner stays one by one.
+      const inventory = readOpenPrs(prToolRun, { cwd, ...(files ? { candidateFiles: files } : {}),
+        ...(deps.run ? {} : { runParallel: defaultCensusParallelRunner, diffCache: sharedCensusDiffCache }) });
       const result = guardNewPr({ files: patch.ok ? files : null, seat: opts.seat as Seat | undefined, seatCap: Number(opts.seatCap), cellId: opts.cell, hunks: patch.ok ? parseDiffHunks(patch.out) : undefined }, inventory);
       // Inspection never spends the three-creation unmeasured allowance.
       // Only pr-manager records an actual new-PR attempt in that ledger.

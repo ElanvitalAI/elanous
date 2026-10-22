@@ -1,10 +1,13 @@
-import { describe, expect, it, spyOn } from 'bun:test';
+import { describe, expect, it, spyOn, afterEach, beforeEach } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
-import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, shouldHoldSeatNewLaunch, DRAFT_SWEEP_CLOSE_CAP, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, runDraftSweep, supersedeDraftsOnMerge, sweptReasonLabel, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
+import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, shouldHoldSeatNewLaunch, DRAFT_SWEEP_CLOSE_CAP, DRAFT_SWEEP_CONCURRENCY, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, newerSameCellDraft, runDraftSweep, supersedeDraftsOnMerge, sweptReasonLabel, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
 import { branchLineageKey } from '../harness/worktree-branch-prefix.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
-import { activeClaimOwnerFromBodies, activeClaimRunIdFromBodies, lastClaimReleaseAtFromBodies } from '../harness/harness-cli-command.js';
+import { activeClaimOwnerFromBodies, activeClaimRunIdFromBodies, githubDraftSweepAdapters, lastClaimReleaseAtFromBodies } from '../harness/harness-cli-command.js';
 import type { TaskCard } from '../task-agent/task-hand.js';
 import type { PrTerminalRecord } from './draft-residue.js';
 
@@ -854,6 +857,151 @@ describe('overlap metrics — DRAFT-NOT-ARCHIVE salvage siblings', () => {
 });
 
 describe('runDraftSweep', () => {
+  it('bounds active-claim owner lookups during explicit triage', async () => {
+    const rows = Array.from({ length: DRAFT_SWEEP_CONCURRENCY * 2 }, (_, index) => draft(600 + index));
+    const fixture = make(rows);
+    fixture.adapters.listTaskCards = async () => [];
+    let active = 0;
+    let maxActive = 0;
+    let calls = 0;
+    fixture.adapters.getActiveClaimOwner = async () => {
+      calls++;
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active--;
+      return undefined;
+    };
+    await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now, includeTriage: true });
+    expect(calls).toBe(rows.length);
+    expect(maxActive).toBeGreaterThan(1);
+    expect(maxActive).toBeLessThanOrEqual(DRAFT_SWEEP_CONCURRENCY);
+  });
+
+  it('reports newer same-card evidence without recommending close-b', async () => {
+    const provenance = { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12',
+      latestCommitAt: '2026-09-28T00:00:00Z' };
+    const harvestPosture = draft(501, { ...provenance, body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-zzzz99' });
+    const oldTwin = draft(502, provenance);
+    const newerTwin = draft(503, { ...provenance, createdAt: '2026-09-29T00:00:00Z' });
+    const noEvidence = draft(504, { labels: [], body: '' });
+    const fixture = make([harvestPosture, oldTwin, newerTwin, noEvidence]);
+    const writes: string[] = [];
+    fixture.statuses.set(502, 'completed');
+    fixture.adapters.getReviewGate = async () => ({ gate: 'pass', review: 'pass', triageReview: 'approved' });
+    fixture.adapters.listTaskCards = async () => [];
+    fixture.adapters.setLabels = async (_repo, number) => { writes.push(`label:${number}`); };
+    fixture.adapters.closeDraft = async (_repo, number) => { writes.push(`close:${number}`); };
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now,
+      includeTriage: true, apply: false });
+    expect(result.triage?.entries.map(({ number, assessment }) => [number, assessment.nextAction])).toEqual([
+      [501, 'human'], [502, 'human'], [503, 'human'], [504, 'human'],
+    ]);
+    expect(result.triage?.counts).toEqual({ human: 4 });
+    expect(result.triage?.entries[0]?.assessment).toMatchObject({ gate: 'pass', review: 'approved' });
+    expect(result.triage?.entries.find(({ number }) => number === 502)?.assessment.checks['newer-same-card'].state).toBe('yes');
+    expect(result.triage?.entries.find(({ number }) => number === 504)?.assessment.checks.provenance.state).toBe('unknown');
+    expect(writes).toEqual([]);
+  });
+
+  it('keeps newer same-card unknown when a newer candidate lacks provenance', async () => {
+    const known = { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12',
+      latestCommitAt: '2026-09-28T00:00:00Z', createdAt: '2026-09-28T00:00:00Z' };
+    const target = draft(510, known);
+    const missingProvenance = draft(511, { labels: [], body: '', createdAt: '2026-09-29T00:00:00Z' });
+    const fixture = make([target, missingProvenance]);
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now, includeTriage: true });
+    const assessment = result.triage?.entries.find(({ number }) => number === 510)?.assessment;
+    expect(assessment?.checks['newer-same-card'].state).toBe('unknown');
+  });
+
+  it('allows close-c for self-implement.result final through the full sweep path', async () => {
+    const target = draft(513, { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12',
+      createdAt: '2026-09-28T00:00:00Z', latestCommitAt: '2026-09-28T00:00:00Z' });
+    const fixture = make([target]);
+    fixture.statuses.set(513, 'self-implement.result final');
+    fixture.adapters.listTaskCards = async () => [{ id: 'ta-20261021-abcd12', text: 'draft', seat: 'UX', status: 'launched',
+      completion: 'code-pr', createdAt: now.toISOString(), history: [], runId: 'run-513', pr: { number: 513 } }];
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now, includeTriage: true });
+    expect(result.triage?.entries[0]?.assessment).toMatchObject({ nextAction: 'close-c', checks: { running: { state: 'no' } } });
+  });
+
+  it('fetches missing head timestamps only for explicit triage', async () => {
+    const target = draft(509, { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12' });
+    const fixture = make([target]);
+    let headTimeCalls = 0;
+    fixture.adapters.getHeadCommitTime = async () => { headTimeCalls++; return '2026-10-18T00:00:00Z'; };
+    await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now });
+    expect(headTimeCalls).toBe(0);
+    await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now, includeTriage: true });
+    expect(headTimeCalls).toBe(1);
+  });
+
+  it('keeps gate and review observable while harvest stays out of recommendation scope', async () => {
+    const target = draft(507, { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12',
+      latestCommitAt: '2026-09-28T00:00:00Z' });
+    const fixture = make([target]);
+    fixture.adapters.getReviewGate = async () => ({ gate: 'pass', review: 'pass', triageReview: 'dismissed' });
+    fixture.adapters.listTaskCards = async () => [];
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now, includeTriage: true });
+    expect(result.triage?.entries[0]?.assessment).toMatchObject({ nextAction: 'human', gate: 'pass', review: 'dismissed' });
+  });
+
+  it('keeps cell state unknown without repository-bound evidence and does not infer relaunch from draft observations', async () => {
+    const row = draft(505, { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12',
+      changedFiles: [], latestCommitAt: '2026-09-28T00:00:00Z' });
+    const terminalOnly = draft(506, { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-efgh34',
+      changedFiles: [], latestCommitAt: '2026-09-28T00:00:00Z' });
+    const fixture = make([row, terminalOnly]);
+    fixture.adapters.listTaskCards = async () => [{ id: 'ta-20261021-abcd12', text: 'draft', seat: 'UX', status: 'failed',
+      createdAt: now.toISOString(), history: [{ at: now.toISOString(), event: 'failed', runId: 'run-fail', detail: 'UNCONVERGEABLE' }] }];
+    fixture.adapters.listPrTerminals = async () => [{ childRunId: 'run-terminal-fail', prNumber: 506,
+      prUrl: 'https://github.com/owner/repo/pull/506', repository: 'owner/repo', headSha: null, terminalClass: 'failed-with-pr',
+      stage: 'goal-revision-required', owner: 'UX', ownerSource: 'seat', card: 'DRAFT-TRIAGE-ANYTIME', at: now.toISOString(),
+      hostRegateFailure: null }];
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now, includeTriage: true });
+    const assessment = result.triage?.entries.find((entry) => entry.number === 505)?.assessment;
+    expect(assessment?.nextAction).toBe('human');
+    expect(assessment?.cellStatus).toBe('unknown');
+    expect(assessment?.checks['cell-complete'].state).toBe('unknown');
+    expect(assessment?.nextAction).toBe('human');
+    expect(assessment?.evidence).toContain('PrTerminalRecord: cell=DRAFT-TRIAGE-ANYTIME matched=0');
+    const terminalAssessment = result.triage?.entries.find((entry) => entry.number === 506)?.assessment;
+    expect(terminalAssessment?.nextAction).toBe('human');
+    expect(terminalAssessment?.checks['owner-confirmed'].state).toBe('unknown');
+    expect(terminalAssessment?.evidence).toContain('PrTerminalRecord: cell=DRAFT-TRIAGE-ANYTIME matched=1');
+    expect(fixture.calls.filter((call) => call.startsWith('close:') || call.startsWith('label:'))).toEqual([]);
+  });
+
+  it('does not apply another PR terminal in the same cell to this draft', async () => {
+    const row = draft(508, { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12',
+      latestCommitAt: '2026-09-28T00:00:00Z' });
+    const fixture = make([row]);
+    fixture.adapters.listTaskCards = async () => [];
+    fixture.adapters.listPrTerminals = async () => [
+      { childRunId: 'run-cross-repo-same-pr', prNumber: 508, prUrl: 'https://github.com/other/repo/pull/508',
+        repository: 'other/repo', headSha: null, terminalClass: 'failed-with-pr', stage: 'goal-revision-required',
+        owner: 'UX', ownerSource: 'seat', card: 'DRAFT-TRIAGE-ANYTIME', at: now.toISOString(), hostRegateFailure: null },
+      { childRunId: 'run-other-pr-failed', prNumber: 509, prUrl: 'https://github.com/owner/repo/pull/509',
+        repository: 'owner/repo', headSha: null, terminalClass: 'failed-with-pr', stage: 'goal-revision-required',
+        owner: 'UX', ownerSource: 'seat', card: 'DRAFT-TRIAGE-ANYTIME', at: now.toISOString(), hostRegateFailure: null },
+    ];
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now, includeTriage: true });
+    expect(result.triage?.entries[0]?.assessment.nextAction).not.toBe('reauthor');
+    expect(result.triage?.entries[0]?.assessment.evidence).toContain('PrTerminalRecord: cell=DRAFT-TRIAGE-ANYTIME matched=0');
+  });
+
+  it('triage owner lookup survives an unreadable card inventory instead of rejecting the sweep', async () => {
+    const row = draft(512, { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME', latestCommitAt: '2026-09-28T00:00:00Z' });
+    const fixture = make([row]);
+    fixture.adapters.listTaskCards = async () => undefined;
+    const looked: number[] = [];
+    fixture.adapters.getActiveClaimOwner = async (_repo, number) => { looked.push(number); return undefined; };
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now, includeTriage: true });
+    expect(result.triage?.entries.map(({ number }) => number)).toContain(512);
+    expect(looked).toEqual([512]);
+  });
+
   it('reuses paged open drafts to supersede an older matching attempt and logs the existing reason', async () => {
     const rows = Array.from({ length: 100 }, (_, i) => draft(i + 100, { labels: [stalled], createdAt: '2026-09-29T23:00:00Z' }));
     const older = draft(1, { labels: [stalled], title: 'T', branch: 'self-impl/x-aaaaaaaa-r1', createdAt: '2026-09-29T22:00:00Z' });
@@ -1545,4 +1693,212 @@ describe('runDraftSweep — lineage key (forceRequeue duplicates)', () => {
     expect(newerLineageDraft(older(), [older(), newer(), draft(3, { createdAt: '2026-09-29T23:10:00Z', branch: 'self-impl/goalid-abc-z-33333333' })])?.number).toBe(3);
     expect(newerLineageDraft(newer(), [older(), newer()])).toBeUndefined();
   });
+});
+
+describe('newerSameCellDraft — 칸 keyed duplicates across goal ids', () => {
+  // Same 칸 marker as the PR creation guard reads (`cellIdFromBody`), one goal id per PR number in the default branch.
+  const cell = (number: number, options: Partial<SweepDraft> = {}) => draft(number, {
+    body: '칸: CELL-A0\n\n대상 경로: src/x.ts', createdAt: `2026-09-29T2${number}:00:00Z`, ...options,
+  });
+
+  it('matches a newer draft of the same 칸 under a different goal id', () => {
+    expect(newerSameCellDraft(cell(1), [cell(1), cell(2)])?.number).toBe(2);
+  });
+
+  it('never matches a same-칸 draft of the same goal — the lineage rule owns that pair', () => {
+    const same = { branch: 'self-impl/goalid-1-other-words-22222222-rbbbbbb', createdAt: '2026-09-29T23:00:00Z' };
+    expect(newerSameCellDraft(cell(1), [cell(1), cell(2, same)])).toBeUndefined();
+    expect(newerLineageDraft(cell(1), [cell(1), cell(2, same)])?.number).toBe(2);
+  });
+
+  it('does not infer a different goal when either branch lineage is unknown', () => {
+    const unknownOlder = cell(1, { branch: 'work/legacy-old' });
+    const unknownNewer = cell(2, { branch: 'work/legacy-new' });
+    expect(branchLineageKey(unknownOlder.branch)).toBeNull();
+    expect(branchLineageKey(unknownNewer.branch)).toBeNull();
+    expect(newerSameCellDraft(unknownOlder, [unknownOlder, cell(2)])).toBeUndefined();
+    expect(newerSameCellDraft(cell(1), [cell(1), unknownNewer])).toBeUndefined();
+  });
+
+  it('never matches a draft with no 칸 line, or a different 칸, on either side', () => {
+    expect(newerSameCellDraft(cell(1), [cell(1), cell(2, { body: undefined })])).toBeUndefined();
+    expect(newerSameCellDraft(cell(1, { body: undefined }), [cell(1, { body: undefined }), cell(2)])).toBeUndefined();
+    expect(newerSameCellDraft(cell(1), [cell(1), cell(2, { body: '칸: CELL-B0' })])).toBeUndefined();
+  });
+
+  it('needs a strictly newer creation and picks the newest match', () => {
+    expect(newerSameCellDraft(cell(1), [cell(1), cell(2, { createdAt: '2026-09-28T00:00:00Z' })])).toBeUndefined();
+    expect(newerSameCellDraft(cell(1), [cell(1), cell(2), cell(3, { createdAt: '2026-09-29T23:10:00Z' })])?.number).toBe(3);
+  });
+});
+
+describe('runDraftSweep — 칸 (cell) key: different goal, same 칸 is duplicate-of-open', () => {
+  const fresh = '2026-09-29T23:30:00Z';
+  const older = (options: Partial<SweepDraft> = {}) => draft(1, {
+    title: 'old attempt', branch: 'self-impl/goalid-abc-foo-11111111-raaaaaa', body: '칸: CELL-A0\n\n대상 경로: src/x.ts',
+    createdAt: '2026-09-29T22:00:00Z', updatedAt: fresh, ...options,
+  });
+  const newer = (options: Partial<SweepDraft> = {}) => draft(2, {
+    title: 'another goal, same cell', branch: 'self-impl/goalid-def-bar-22222222-rbbbbbb', body: '칸: CELL-A0\n\n대상 경로: src/x.ts',
+    createdAt: '2026-09-29T23:00:00Z', updatedAt: fresh, ...options,
+  });
+  const mutations = (calls: string[]) => calls.filter((call) => /^(label|close):/.test(call));
+  // Closes and superseded labels only — the pre-existing stalled marking of an ended run is not this rule's business.
+  const supersedes = (calls: string[]) => calls.filter((call) => call.startsWith('close:') || call.endsWith(`=>${superseded}`));
+
+  it('classifies a different-goal same-칸 draft as duplicate-of-open and closes it', async () => {
+    const fixture = make([older(), newer()]);
+    const preview = await sweep(fixture.adapters);
+    expect(preview.entries[0]).toMatchObject({ number: 1, action: 'close', reason: 'duplicate-of-open #2 (cell CELL-A0)', applied: false });
+    expect(preview.counts['duplicate-of-open #2 (cell CELL-A0)']).toBe(1);
+    expect(preview.lineage).toEqual({ closed: 1, harvestableClosed: 0, fallThrough: {}, cellClosed: 1 });
+    expect(mutations(fixture.calls)).toEqual([]);
+    const applied = await sweep(fixture.adapters, true);
+    expect(applied.entries[0]).toMatchObject({ number: 1, action: 'close', statusLabel: superseded, applied: true });
+    expect(mutations(fixture.calls)).toEqual([`label:1:${running}=>${superseded}`, 'close:1']);
+    // The label taxonomy is the existing one — no new swept kind for the 칸 path.
+    expect(fixture.sweptLabels).toEqual(['1:elanous:swept:duplicate-of-open']);
+    expect(sweptReasonLabel('duplicate-of-open #2 (cell CELL-A0)')).toBe('elanous:swept:duplicate-of-open');
+  });
+
+  it('leaves a same-칸 same-goal pair to the lineage key — the reason names the lineage, not the 칸', async () => {
+    const sameGoal = newer({ branch: 'self-impl/goalid-abc-bar-22222222-rbbbbbb' });
+    const fixture = make([older(), sameGoal]);
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[0]).toMatchObject({ number: 1, action: 'close', reason: 'duplicate-of-open #2 (lineage goalid:abc)' });
+    expect(result.lineage).toEqual({ closed: 1, harvestableClosed: 0, fallThrough: {} });
+  });
+
+  it('keeps a draft whose 칸 is unknown on exactly the rules it had before this rule existed', async () => {
+    const noCell = { body: undefined };
+    const control = make([older(noCell), newer({ body: '칸: CELL-B0' })]);
+    const baseline = (await sweep(control.adapters, true)).entries[0];
+    const fixture = make([older(noCell), newer()]);
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[0]).toEqual(baseline);
+    expect(result.entries[0]?.reason).not.toContain('(cell ');
+    expect(result.lineage).toEqual({ closed: 0, harvestableClosed: 0, fallThrough: {} });
+    expect(mutations(fixture.calls)).toEqual(mutations(control.calls));
+  });
+
+  it('does not close a same-칸 draft through the sweep when either branch lineage is unknown', async () => {
+    const unknownOlder = older({ branch: 'work/legacy-old' });
+    const unknownNewer = newer({ branch: 'work/legacy-new' });
+    const olderUnknown = await sweep(make([unknownOlder, newer()]).adapters, true);
+    const newerUnknown = await sweep(make([older(), unknownNewer]).adapters, true);
+    for (const result of [olderUnknown, newerUnknown]) {
+      expect(result.entries.find((entry) => entry.number === 1)?.reason).not.toContain('(cell ');
+      expect(result.lineage?.cellClosed).toBeUndefined();
+    }
+  });
+
+  it('keeps a review-pass harvestable draft when the newer same-칸 draft has not passed review (fail-closed)', async () => {
+    const harvestable = PR_LABELS.find((entry) => entry.name === 'elanous:harvestable')!.name;
+    const fixture = make([older({ labels: [harvestable] }), newer({ labels: [harvestable] })]);
+    fixture.statuses.set(1, 'self-implement.result final');
+    fixture.adapters.getReviewGate = async (pr) => pr.number === 1 ? { review: 'pass', gate: 'pass' } : {};
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[0]).toMatchObject({ number: 1, action: 'keep', reason: 'harvestable' });
+    expect(result.lineage).toEqual({ closed: 0, harvestableClosed: 0, fallThrough: { 'lineage-harvestable-review-pass-protected': 1 } });
+    expect(supersedes(fixture.calls)).toEqual([]);
+  });
+
+  it('never stops another goal\'s live run — a live 칸 duplicate falls through to the existing rules', async () => {
+    const live = (fixture: ReturnType<typeof make>) => {
+      fixture.statuses.set(1, 'running');
+      fixture.setLive(new Set([older().branch]));
+      fixture.adapters.supersedeRun = async () => { fixture.calls.push('stop'); };
+    };
+    const control = make([older(), newer({ body: '칸: CELL-B0' })]);
+    live(control);
+    const baseline = (await sweep(control.adapters, true)).entries[0];
+    const fixture = make([older(), newer()]);
+    live(fixture);
+    const result = await sweep(fixture.adapters, true);
+    expect(fixture.calls).not.toContain('stop');
+    expect(result.entries[0]).toEqual(baseline);
+    expect(result.entries[0]?.reason).not.toContain('(cell ');
+    expect(result.lineage?.fallThrough).toEqual({ 'cell-duplicate-run-live': 1 });
+    expect(result.lineage?.cellClosed).toBeUndefined();
+    expect(mutations(fixture.calls)).toEqual(mutations(control.calls));
+  });
+});
+
+// The production entry `elanous harness drafts sweep` reads its drafts through `githubDraftSweepAdapters`, whose
+// `listDrafts` maps each PR's `body` into `SweepDraft.body`. That body is what carries the `칸:` marker, so the 칸 rule
+// is exercised here through the real adapter and the real `runDraftSweep` (gh/git injected, no network, no writes).
+describe('runDraftSweep — 칸 duplicate through the production GitHub adapter', () => {
+  const OLD = { number: 30, branch: 'self-impl/goalid-abc123-first-words-11111111-raaaaaa', created: '2026-10-04T20:00:00Z', head: 'h30' };
+  const NEW = { number: 31, branch: 'self-impl/goalid-def456-other-words-22222222-rbbbbbb', created: '2026-10-04T22:00:00Z', head: 'h31' };
+  const pull = (pr: typeof OLD) => ({
+    number: pr.number, draft: true, state: 'open', title: `attempt ${pr.number}`,
+    body: '칸: CELL-A0\n\n대상 경로: src/x.ts', head: { ref: pr.branch, sha: pr.head }, base: { ref: 'main' }, labels: [],
+    created_at: pr.created, updated_at: '2026-10-04T23:30:00Z', merged_at: null, merge_commit_sha: null,
+  });
+  const fakeGh = (calls: string[]) => (args: string[]): string => {
+    calls.push(args.join(' '));
+    if (args[0] === 'pr' || (args[0] === 'label' && args[1] === 'create')) return '';
+    if (args[0] !== 'api') throw new Error(`unexpected gh ${args.join(' ')}`);
+    if (args[1] === 'graphql') throw new Error('GraphQL unavailable');
+    const endpoint = args[1]!;
+    if (/pulls\?state=open.*&page=1$/.test(endpoint)) return JSON.stringify([pull(OLD), pull(NEW)]);
+    if (/pulls\?state=(open|closed).*&page=\d+$/.test(endpoint)) return '[]';
+    if (/\/pulls\/\d+\/files\?per_page=100&page=1$/.test(endpoint)) return JSON.stringify([{ filename: 'src/x.ts' }]);
+    if (/\/issues\/\d+\/comments\?per_page=100&page=1$/.test(endpoint)) return '[]';
+    if (/\/pulls\/\d+\/reviews\?per_page=100&page=\d+$/.test(endpoint)) return '[]';
+    if (/\/pulls\/\d+\/commits\?per_page=100&page=1$/.test(endpoint)) return '[]';
+    const single = /\/pulls\/(\d+)$/.exec(endpoint);
+    if (single) return JSON.stringify({ head: { sha: `h${single[1]}` } });
+    if (/\/commits\/\w+\/status$/.test(endpoint)) return JSON.stringify({ state: 'success' });
+    if (/\/commits\/\w+\/check-runs\?per_page=100&page=\d+$/.test(endpoint)) return JSON.stringify({ check_runs: [] });
+    throw new Error(`unexpected endpoint ${endpoint}`);
+  };
+  // No worktree carries either branch (= neither run is live) and the repository matches the sweep target.
+  const git = (_cwd: string, args: string[]) => ({ status: 0, stderr: '',
+    stdout: args[0] === 'config' ? 'https://github.com/my/repo.git\n' : ['worktree /tmp/main', 'branch refs/heads/main'].join('\n') + '\n' });
+
+  let stateDir = '';
+  let previous: string | undefined;
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), 'draft-sweep-cell-'));
+    previous = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = stateDir;
+  });
+  afterEach(() => {
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous;
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  const run = async (apply: boolean) => {
+    const calls: string[] = [];
+    const logged: Array<{ event: string; data: unknown }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'self-dev.draft-sweep') logged.push({ event, data });
+    });
+    try {
+      const result = await runDraftSweep({ repository: 'my/repo', apply, now: new Date('2026-10-05T00:00:00Z'),
+        adapters: githubDraftSweepAdapters(fakeGh(calls), git, '/tmp/main') });
+      return { result, writes: calls.filter((call) => call.startsWith('pr ') || call.startsWith('label create ')), logged };
+    } finally { log.mockRestore(); }
+  };
+
+  it('closes a different-goal same-칸 draft through the real adapter', async () => {
+    const dry = await run(false);
+    expect(dry.result.entries.find((entry) => entry.number === OLD.number)).toMatchObject({ action: 'close', applied: false,
+      reason: 'duplicate-of-open #31 (cell CELL-A0)' });
+    expect(dry.writes).toEqual([]);
+    const applied = await run(true);
+    expect(applied.result.entries.find((entry) => entry.number === OLD.number)).toMatchObject({ action: 'close', applied: true,
+      statusLabel: superseded });
+    expect(applied.result.entries.find((entry) => entry.number === NEW.number)?.action).toBe('keep');
+    expect(applied.result.lineage).toMatchObject({ closed: 1, cellClosed: 1 });
+    expect(applied.writes).toEqual([
+      expect.stringMatching(/^pr edit 30 --repo my\/repo --add-label elanous:superseded/),
+      expect.stringMatching(/^label create elanous:swept:duplicate-of-open --repo my\/repo /),
+      'pr edit 30 --repo my/repo --add-label elanous:swept:duplicate-of-open',
+      'pr close 30 --repo my/repo',
+    ]);
+    expect(applied.logged.filter((entry) => entry.event === 'lineage-summary'))
+      .toEqual([{ event: 'lineage-summary', data: { closed: 1, harvestableClosed: 0, fallThrough: {}, apply: true, cellClosed: 1 } }]);
+  }, 60_000);
 });

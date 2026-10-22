@@ -1,9 +1,7 @@
-import { Document, isMap, isSeq, parse as parseYaml, type YAMLMap } from 'yaml';
+import { Document, isMap, isSeq, parse as parseYaml } from 'yaml';
 import type { GraphValidationResponse } from '@/nexus/client';
 import {
-  addRunGraphEdge,
   addRunGraphNode,
-  addRunGraphToEdge,
   readRunGraphYaml,
   writeRunGraphYaml,
 } from '@/lib/run-graph-yaml-edit';
@@ -79,6 +77,8 @@ export interface CanvasEdge {
   from: string;
   to: string;
   outcome: string;
+  /** Original YAML map index; preserves distinct `on` maps while the canvas splits their entries. */
+  sourceMapIndex?: number;
   /** Edge fields the canvas does not edit (`on` of a loaded map edge, fallback, observed) — kept as loaded. */
   extra?: Record<string, unknown>;
 }
@@ -333,10 +333,33 @@ export function toYaml(graph: CanvasGraph): string {
   for (const node of graph.nodes) {
     addRunGraphNode(doc, { nodeId: node.id, kind: node.kind, recipe: node.recipe, maxVisits: node.maxVisits });
   }
-  for (const edge of graph.edges) {
-    if (edge.outcome) addRunGraphEdge(doc, { from: edge.from, outcome: edge.outcome, to: edge.to });
-    else addRunGraphToEdge(doc, edge.from, edge.to);
-  }
+  const serializedEdges: Array<Record<string, unknown>> = [];
+  const outcomeGroups = new Map<string, Record<string, unknown>>();
+  const firstOutcomeGroupByRoute = new Map<string, string>();
+  const plainEdges = new Set<string>();
+  graph.edges.forEach((edge) => {
+    if (!edge.outcome) {
+      const edgeKey = `${edge.from}\u0000${edge.to}`;
+      if (plainEdges.has(edgeKey)) return;
+      plainEdges.add(edgeKey);
+      serializedEdges.push({ ...edge.extra, from: edge.from, to: edge.to });
+      return;
+    }
+    const on = typeof edge.extra?.on === 'string' ? edge.extra.on : 'outcome';
+    const routeKey = `${edge.from}:${on}`;
+    const groupKey = edge.sourceMapIndex === undefined
+      ? firstOutcomeGroupByRoute.get(routeKey) ?? `new:${routeKey}`
+      : `source:${edge.sourceMapIndex}`;
+    let group = outcomeGroups.get(groupKey);
+    if (!group) {
+      group = { ...edge.extra, from: edge.from, on, map: {} };
+      outcomeGroups.set(groupKey, group);
+      if (!firstOutcomeGroupByRoute.has(routeKey)) firstOutcomeGroupByRoute.set(routeKey, groupKey);
+      serializedEdges.push(group);
+    }
+    (group.map as Record<string, string>)[edge.outcome] = edge.to;
+  });
+  doc.set('edges', doc.createNode(serializedEdges));
   // Fields the canvas does not edit go back on the same node/edge/root they were loaded from.
   for (const [key, value] of Object.entries(graph.extra ?? {})) if (!doc.has(key)) doc.set(key, doc.createNode(value));
   const nodeSeq = doc.get('nodes');
@@ -344,13 +367,6 @@ export function toYaml(graph: CanvasGraph): string {
     const map = isSeq(nodeSeq) ? nodeSeq.items[index] : undefined;
     if (isMap(map)) for (const [key, value] of Object.entries(node.extra ?? {})) if (!map.has(key)) map.set(key, doc.createNode(value));
   });
-  const edgeSeq = doc.get('edges');
-  const edgeMaps = isSeq(edgeSeq) ? edgeSeq.items.filter((item): item is YAMLMap => isMap(item)) : [];
-  for (const edge of graph.edges) {
-    const map = edgeMaps.find((item) => item.get('from') === edge.from && (edge.outcome ? item.has('map') : item.get('to') === edge.to));
-    if (!map) continue;
-    for (const [key, value] of Object.entries(edge.extra ?? {})) if (key === 'on' || !map.has(key)) map.set(key, doc.createNode(value));
-  }
   return writeRunGraphYaml(doc);
 }
 
@@ -418,14 +434,14 @@ export function fromYaml(text: string): CanvasGraph {
       ...extrasOf(n, ['node_id', 'kind', 'recipe', 'max_visits']),
     }];
   });
-  const edges = (Array.isArray(raw.edges) ? raw.edges : []).flatMap((entry): CanvasEdge[] => {
+  const edges = (Array.isArray(raw.edges) ? raw.edges : []).flatMap((entry, sourceMapIndex): CanvasEdge[] => {
     const e = entry as Record<string, unknown> | null;
     if (!e || typeof e.from !== 'string') return [];
     if (typeof e.to === 'string') return [{ from: e.from, to: e.to, outcome: '', ...extrasOf(e, ['from', 'to']) }];
     if (e.map && typeof e.map === 'object') {
       return Object.entries(e.map as Record<string, unknown>)
         .filter((pair): pair is [string, string] => typeof pair[1] === 'string')
-        .map(([outcome, to]) => ({ from: e.from as string, to, outcome, ...extrasOf(e, ['from', 'map', ...(e.on === OUTCOME_ON ? ['on'] : [])]) }));
+        .map(([outcome, to]) => ({ from: e.from as string, to, outcome, sourceMapIndex, ...extrasOf(e, ['from', 'map', ...(e.on === OUTCOME_ON ? ['on'] : [])]) }));
     }
     return [];
   });

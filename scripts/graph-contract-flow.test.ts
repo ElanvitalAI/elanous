@@ -355,8 +355,8 @@ describe('graph-contract-flow', () => {
         .filter(([, other]) => other.graph_id !== graph.graph_id)
         .flatMap(([, other]) => other.nodes.flatMap(node => node.contract?.outputs ?? [])));
       const normalizedOtherOutputs = new Set([...otherOutputs].map(name => name.replace(/[-_]/g, '').toLowerCase()));
-      const consumedNoProducerInputs = new Set(graph.nodes
-        .flatMap(node => node.contract?.inputs ?? [])
+      const consumedInputs = new Set(graph.nodes.flatMap(node => node.contract?.inputs ?? []));
+      const consumedNoProducerInputs = new Set([...consumedInputs]
         .filter(input => !otherOutputs.has(input) && !normalizedOtherOutputs.has(input.replace(/[-_]/g, '').toLowerCase())));
       // The common runner surface comes from implement-loop. A called unit may
       // also require graph-specific entry inputs (recover@1: ask/context/prior).
@@ -364,14 +364,28 @@ describe('graph-contract-flow', () => {
       const calledUnitInputs = new Set(graph.nodes
         .filter(node => node.call)
         .flatMap(node => node.contract?.inputs ?? []));
-      const expected = [...consumedNoProducerInputs]
-        .filter(input => implementInputs.has(input) || calledUnitInputs.has(input))
+      // A value produced by another graph can still be part of the shared runner
+      // contract (for example, `worktree`). Preserve those common inputs while
+      // keeping graph-specific called-unit inputs limited to true entry inputs.
+      const expected = [...consumedInputs]
+        .filter(input => implementInputs.has(input) || (consumedNoProducerInputs.has(input) && calledUnitInputs.has(input)))
         .sort();
       expect([...actual].sort(), graphName).toEqual(expected);
     }
 
     const measurement = measureGraphContractFlow({ graphsDirectory: defaultGraphsDir() });
-    expect(measurement.runnerInputsProducedBySameGraph).toBe(0);
+    const runnerOutputOverlaps = [...parsed].flatMap(([graphName, graph]) => {
+      if (!Object.hasOwn(graph, 'runner_inputs')) return [];
+      const outputs = new Set(graph.nodes.flatMap(node => node.contract?.outputs ?? []));
+      return declaredRunnerInputs(graph, graphName)
+        .filter(input => outputs.has(input))
+        .map(input => `${graph.graph_id}:${input}`);
+    });
+    // `worktree` enters research-loop from the shared runner, then cleanup and
+    // pr-head-checkout return its updated value. Keep that intentional overlap
+    // explicit so unrelated runner/output collisions still fail this contract.
+    expect(runnerOutputOverlaps).toEqual(['research-loop:worktree']);
+    expect(measurement.runnerInputsProducedBySameGraph).toBe(runnerOutputOverlaps.length);
   });
 
 

@@ -51,6 +51,8 @@ describe('M2-1 · LLM_TIER_MAP_BY_PROVIDER · invariants', () => {
 
   test('loaded tier uses the provider-specific reasoning ceiling', () => {
     for (const provider of providers) {
+      // 📏 10-22: #29770 opengateway 첫 조각은 «실측 모델 하나 · reasoning off» 를 모든 칸에 둔다(llm-tier-map.ts 주석) — 그 계약은 아래 전용 시험이 문다.
+      if (provider === 'opengateway') continue;
       const level = provider === 'local' ? undefined : provider === 'openai-codex' ? 'medium' : 'high';
       expect(LLM_TIER_MAP_BY_PROVIDER[provider].loaded.reasoningLevel).toBe(level);
     }
@@ -58,10 +60,18 @@ describe('M2-1 · LLM_TIER_MAP_BY_PROVIDER · invariants', () => {
 
   test('budget and best resolve to distinct complete specs on every provider', () => {
     for (const provider of providers) {
+      if (provider === 'opengateway') continue; // 📏 #29770 · 아래 전용 시험
       const budget = LLM_TIER_MAP_BY_PROVIDER[provider].budget;
       const best = LLM_TIER_MAP_BY_PROVIDER[provider].best;
       expect(budget).not.toEqual(best);
     }
+  });
+
+  test('opengateway first slice: every tier is the one measured model with reasoning off (#29770)', () => {
+    const ladder = LLM_TIER_MAP_BY_PROVIDER.opengateway;
+    const models = new Set(Object.values(ladder).map((spec) => spec.model));
+    expect(models.size).toBe(1);
+    expect(ladder.loaded.reasoningLevel).toBe('off');
   });
 });
 

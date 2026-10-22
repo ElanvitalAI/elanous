@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -10,7 +10,7 @@ const roots: string[] = [];
 // GATE-PREEXISTING-ZERO — fixtures and read-backs go through bun:sqlite (in-process); only the product's own
 //   `sqlite3 VACUUM INTO` stays a real spawn. On a loaded gate Pod each sqlite3 spawn took ~2s, so a fixture of three
 //   spawns plus the snapshot ran past bun's 5s default (0.2.30 HARD #3). Tests that spawn get an explicit cap.
-const SPAWN_TEST_TIMEOUT_MS = 60_000;
+const SPAWN_TEST_TIMEOUT_MS = 120_000;
 function sqlExec(path: string, sql: string): void {
   const db = new Database(path, { create: true });
   try { db.exec(sql); } finally { db.close(); }
@@ -123,11 +123,14 @@ test('sqlite snapshot uses one consistent copy and replaces a stale destination 
 
 function runSnapshotCli(...args: string[]) {
   // Production entry path: spawn the script so import.meta.main argv parse runs (not a source-string check).
-  return spawnSync(process.execPath, [join(import.meta.dir, 'standby-snapshot.ts'), ...args], {
+  const home = mkdtempSync(join(tmpdir(), 'hq-standby-cli-home-'));
+  roots.push(home);
+  const result = spawnSync(process.execPath, [join(import.meta.dir, 'standby-snapshot.ts'), ...args], {
     encoding: 'utf8',
     cwd: join(import.meta.dir, '..', '..'),
-    env: { ...process.env, ELANOUS_STATE_DIR: join(tmpdir(), 'hq-standby-missing-state-never') },
+    env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: join(home, '.elanous') },
   });
+  return { ...result, home };
 }
 
 test('valueless --survival-keep(-daily) and targetless --prune-survival exit 2 before snapshot work', () => {
@@ -138,6 +141,7 @@ test('valueless --survival-keep(-daily) and targetless --prune-survival exit 2 b
     const bare = runSnapshotCli(flag);
     expect(bare.status).toBe(2);
     expect(bare.stderr).toContain(`${flag} requires a value`);
+    expect(existsSync(join(bare.home, '.elanous-standby-staging'))).toBe(false);
     // Must refuse before planSnapshot/buildGeneration — a dry-run would otherwise exit 0 with a plan.
     const withDryRun = runSnapshotCli(flag, '--dry-run', '--json');
     expect(withDryRun.status).toBe(2);

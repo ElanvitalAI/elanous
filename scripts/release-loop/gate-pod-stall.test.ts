@@ -7,13 +7,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   createGateRunner, gateBeatScript, gateEnvBaselineLine, gateShardAbortScript, gateShardShell, graphGateResult, readShardArtifacts, readShardLiveLog, runGateNode,
-  shardStallWatchRecord, watchShardStall, GATE_POD_MIDRUN_STALL_SECONDS_DEFAULT, GATE_SHARD_ABORT_TRIES, POD_SHARD_FILE_CAP, type GateOptions, type GateResult, type GateRunner,
+  shardStallWatchRecord, watchShardStall, partialFailuresOf, GATE_POD_MIDRUN_STALL_SECONDS_DEFAULT, GATE_SHARD_ABORT_TRIES, POD_SHARD_FILE_CAP, type GateOptions, type GateResult, type GateRunner,
 } from './gate-node';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import type { RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { debug } from '../../src/debug/log.js';
 import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { gateUnmeasuredDetail, releaseResumeWaiver } from './resume.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { resumeReleaseRun } from './resume-release.js';
 
 const CUT = 'c'.repeat(40);
 const CHECKOUT = `Cloning into 'repo'...\nELANOUS_POD_SOURCE_VIA mirror\nELANOUS_POD_SOURCE commit ${CUT}\n`;
@@ -74,6 +76,21 @@ function captureGateEvents() {
   });
   return { events, restore: () => spy.mockRestore() };
 }
+
+test('a malformed completed-shard log is reported but cannot replace the stalled-shard failure', () => {
+  const { events, restore } = captureGateEvents();
+  let partial: ReturnType<typeof partialFailuresOf>;
+  try {
+    partial = partialFailuresOf([
+      { rc: 1, output: 'src/kept.test.ts:\n(fail) existing case [1.00ms]\n1 pass\n1 fail\nRan 2 tests across 1 files.', files: 1 },
+      { rc: 2, output: 'completed job with truncated output', files: 1 },
+    ]);
+  } finally { restore(); }
+  expect(partial!).toEqual({ failures: ['src/kept.test.ts > existing case'], errors: [] });
+  expect(events.filter((item) => item.event === 'pod-partial-failures-unreadable')).toMatchObject([
+    { data: { files: 1, reason: expect.stringContaining('pod partial shard 1 incomplete') } },
+  ]);
+});
 
 test('a shard that prints only its checkout is stopped within the stall window, retried once fresh, never split, and the sweep fails as unmeasured', async () => {
   // More files than the cap: a «no-output» root shard would otherwise cap-split into -c0/-c1 after its retry.
@@ -184,6 +201,7 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
   expect(record.waiver).toBeUndefined();
   const line = JSON.parse(String(record.output).trim().split('\n').at(-1)!) as Record<string, unknown>;
   expect(line).toMatchObject({ outcome: 'error', verdict: 'fail', introduced: [],
+    commit: CUT, partialFailures: { failures: [], errors: [] },
     stalledShards: [{ shard: 0, files, reason: 'no-output', stall: { seconds: 0.3, sinceCheckoutMs: expect.any(Number) } }] });
   expect(String(line.error)).toContain('unmeasured: no test output within 0.3s of checkout');
   // The unmeasured marker the waiver rule reads off that saved record.
@@ -193,6 +211,24 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
   expect(waived).toMatchObject({ nodeId: 'gate', reason, acceptedRegressions: [{ id: 'waive:gate', note: reason }] });
   expect(waived?.unmeasured).toStartWith('sweep incomplete: pod sweep incomplete: stalled shards 0 (unmeasured: no test output within 0.3s of checkout');
   expect(waived?.unmeasured).toContain('stalled shards 1 (no-output×1)');
+  // Exercise the persisted graph output all the way through resume planning; don't inject a synthetic gate result.
+  setElanousConfigDir(ledger);
+  try {
+    let graphCalled = false;
+    let plan: Record<string, unknown> | undefined;
+    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'gate' }, { root: ledger,
+      git: (args) => args[0] === 'ls-remote' ? `${CUT}\trefs/heads/release/9.9.97` : args[0] === 'rev-parse' ? CUT : '',
+      isAncestor: () => true, closureTree: () => ({ files }) as never,
+      graph: async () => {
+        graphCalled = true;
+        const planPath = join(ledger, 'release/9.9.97/gate-partial.json');
+        if (existsSync(planPath)) plan = JSON.parse(readFileSync(planPath, 'utf8'));
+        return { status: 'done', runId: first.runId } as never;
+      } });
+    expect(graphCalled).toBe(true);
+    expect(resumed.partial).toMatchObject({ requested: true, applied: true, files: files.length, priorCommit: CUT });
+    expect(plan).toMatchObject({ kind: 'recheck', priorCommit: CUT, forCommit: CUT, files, stalledFiles: files });
+  } finally { resetElanousConfigDir(); }
 }, 30_000);
 
 test('a shard that prints test output is unaffected: no stop, no retry, same result and record as without the watch', async () => {
@@ -210,9 +246,14 @@ test('a shard that prints test output is unaffected: no stop, no retry, same res
   let without;
   try { without = await plain.runner.sweep(plain.repo, join(plain.root, 'logs'), { pool: 'pool-test', shards: 1, stallSeconds: 0 }); }
   finally { off.restore(); }
-  expect(withWatch).toEqual(without);
+  // Each sweep has its own identity even when the measured files and verdict are identical.
+  expect(withWatch.podSweep?.id).toBeString();
+  expect(without.podSweep?.id).toBeString();
+  expect(withWatch.podSweep?.id).not.toBe(without.podSweep?.id);
+  expect({ ...withWatch, podSweep: { ...withWatch.podSweep, id: undefined } })
+    .toEqual({ ...without, podSweep: { ...without.podSweep, id: undefined } });
   // stallWatch is observation only (GATE-WARM-BOOT-SCAN) — it differs by design and is checked on its own.
-  const strip = (meta: Record<string, unknown>) => { const { durationMs: _d, attemptId: _a, phaseTimes: _t, stallWatch: _w, ...rest } = meta; return rest; };
+  const strip = (meta: Record<string, unknown>) => { const { durationMs: _d, attemptId: _a, phaseTimes: _t, stallWatch: _w, sweepId: _s, ...rest } = meta; return rest; };
   const metaWith = JSON.parse(readFileSync(join(watched.root, 'logs', 'pod-0.json'), 'utf8'));
   const metaWithout = JSON.parse(readFileSync(join(plain.root, 'logs', 'pod-0.json'), 'utf8'));
   expect(metaWith.stallWatch).toEqual({ armed: true, disarmedBy: 'test-output', firstTestAtSec: 0, stallSeconds: 0.3 });

@@ -22,7 +22,8 @@ import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { appendRunLedgerEntry, listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerEntry, type RunLedgerMatch, type RunLedgerWriter } from '../self-implement/run-ledger.js';
 import { classifyPodExit, type PodExitClass } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
-import { classifyPodExitStop, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
+import { classifyPodExitStop, readRunStopRecord, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
+import { captureStopKnowhowCandidate } from '../self-implement/stop-autoheal.js';
 import { ensureOpenRouterChildModelLive, resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { buildRunProgressRows, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable } from '../self-implement/running-runs.js';
@@ -450,7 +451,7 @@ export function classifyHarnessPodExit(
     loadCheckpoint?: typeof loadSelfDevRun;
     runId?: string;
   } = {},
-): { lines: string[]; reason: PodExitReason | 'pod-failure' } {
+): { lines: string[]; reason: PodExitReason | 'pod-failure'; podErrorCode?: 'pod-job-failed' } {
   const occupiedNewLine = output.split('\n').find((line) =>
     /^\[self-dev\] run run-[a-z0-9_-]{8,64} \[preflight:new-path-occupied:[0-9a-f-]{36}\] /.test(line));
   const observedRunId = deps.runId ?? harnessPodRunId(output);
@@ -475,6 +476,7 @@ export function classifyHarnessPodExit(
   }
   let podFailure: string | undefined;
   let podJobFailed = false;
+  let podJobFailedFromResult = false;
   let podChildFailed = false;
   for (const line of output.split('\n').reverse()) {
     if (!line.trimStart().startsWith('[{') || !line.includes('"error"')) continue;
@@ -487,6 +489,7 @@ export function classifyHarnessPodExit(
         if (typeof error?.code !== 'string' || typeof error.message !== 'string' || !error.code.startsWith('pod-')) continue;
         podFailure = error.message;
         podJobFailed = error.code === 'pod-job-failed';
+        podJobFailedFromResult = podJobFailed;
         podChildFailed = error.code === 'pod-child-failed';
         break;
       }
@@ -505,7 +508,7 @@ export function classifyHarnessPodExit(
   if (podFailure) {
     const childError = podJobFailed ? podFailure.split('childError=')[1]?.split('\\n', 1)[0]?.split('\n', 1)[0] : undefined;
     try { debug.log('harness.pod', 'exit-classified', { runId, reason: 'pod-failure', status: exit.status, signal: exit.signal ?? null }); } catch { /* observation is fail-soft */ }
-    return { reason: 'pod-failure', lines: [podChildFailed
+    return { reason: 'pod-failure', ...(podJobFailedFromResult ? { podErrorCode: 'pod-job-failed' as const } : {}), lines: [podChildFailed
       ? `Pod 안 자식이 실패했다 — ${podFailure.split('\\n', 1)[0]}`
       : podJobFailed && childError && childError !== 'no-result-line'
         ? `Pod 안 자식이 실패했다 — ${childError}`
@@ -769,7 +772,7 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
 export function recordHarnessPodStop(
   runId: string | undefined,
   status: number,
-  classified: { reason: string; lines: string[] },
+  classified: { reason: string; lines: string[]; podErrorCode?: 'pod-job-failed' },
   output?: string,
   deps: { loadLedger?: typeof loadRunLedger; record?: typeof recordRunStop; write?: RunLedgerWriter } = {},
 ): boolean {
@@ -805,11 +808,32 @@ export function recordHarnessPodStop(
     }
     // The classified line is our own one-line verdict («Pod 안 자식이 실패했다 — OOMKilled»), not the raw output tail.
     const verdict = classified.lines[0]?.split(' — ').slice(1).join(' — ').trim();
-    (deps.record ?? recordRunStop)({
+    const stopEntry = (deps.record ?? recordRunStop)({
       runId, site: 'pod-exit', class: scopeEscape ? 'scope-escape' : classifyPodExitStop(classified.reason),
       cause: `Pod exit ${status}: ${scopeEscape ? 'scope-escape' : classified.reason}${verdict ? ` — ${verdict}` : ''}`,
       evidenceRef, nextMove, ...(childEvidence ? { childEvidence } : {}),
+      ...(classified.podErrorCode === 'pod-job-failed' ? { terminationReason: classified.podErrorCode } : {}),
     }, ...(deps.write ? [deps.write] : []));
+    // Host-only Pod exits do not pass through orchestrator.autohealRecordedStop. Capture the
+    // exact Job failure here, after the durable stop write, without initiating a heal action.
+    if (classified.podErrorCode === 'pod-job-failed' && stopEntry) {
+      try {
+        const record = readRunStopRecord(stopEntry);
+        if (record) {
+          const goalId = ledger?.find((entry) => entry.goalId)?.goalId;
+          const captured = captureStopKnowhowCandidate({ runId, ...(goalId ? { goalId } : {}), record },
+          join(effectiveInstanceRoot(), 'self-implement', 'knowhow-candidates'));
+          if (captured) debug.log('self-implement.autoheal', 'knowhow-candidate', {
+            runId, cell: captured.candidate.cell, reason: captured.candidate.reason,
+            created: captured.created, occurrences: captured.candidate.occurrences, path: captured.path,
+          });
+        }
+      } catch (error) {
+        try { debug.log('self-implement.autoheal', 'knowhow-candidate-failed', {
+          runId, error: error instanceof Error ? error.message : String(error),
+        }); } catch { /* observation is fail-soft */ }
+      }
+    }
     return true;
   } catch { return false; /* ledger observation cannot change Pod output or exit */ }
 }
@@ -2378,8 +2402,9 @@ function githubRemoteRepository(url: string): string | undefined {
 interface GraphqlPrDetail {
   readonly files: string[] | null;
   readonly comments: string[] | null;
-  readonly reviews: Array<{ state?: string; body?: string }> | null;
+  readonly reviews: Array<{ state?: string; body?: string; submittedAt?: string; commitOid?: string }> | null;
   readonly headSha: string | null;
+  readonly headCommittedAt: string | null;
   readonly mergeCommit: { oid: string; message: string } | null;
 }
 
@@ -2407,10 +2432,10 @@ async function graphqlPrDetails(repository: string, numbers: readonly number[],
   // Fields the batch could not prove complete (each one is read again over REST by the caller).
   const incompleteFields = { files: 0, comments: 0, reviews: 0 };
   await mapBounded(batches, DRAFT_SWEEP_CONCURRENCY, async (batch) => {
-    const fields = batch.map((number) => `p${number}: pullRequest(number: ${number}) { number headRefOid `
+    const fields = batch.map((number) => `p${number}: pullRequest(number: ${number}) { number headRefOid headRef { target { ... on Commit { committedDate } } } `
       + 'files(first: 100) { totalCount nodes { path } pageInfo { hasNextPage } } '
       + 'comments(first: 100) { totalCount nodes { body } pageInfo { hasNextPage } } '
-      + 'reviews(first: 100) { totalCount nodes { state body } pageInfo { hasNextPage } } '
+      + 'reviews(first: 100) { totalCount nodes { state body submittedAt commit { oid } } pageInfo { hasNextPage } } '
       + 'mergeCommit { oid message } }').join(' ');
     const query = `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ${fields} } }`;
     let repositoryNode: Record<string, unknown> | undefined;
@@ -2421,9 +2446,10 @@ async function graphqlPrDetails(repository: string, numbers: readonly number[],
     if (!repositoryNode || typeof repositoryNode !== 'object' || Array.isArray(repositoryNode)) { failedBatches += 1; return; }
     for (const number of batch) {
       const pr = repositoryNode[`p${number}`] as {
-        number?: number; headRefOid?: string;
+        number?: number; headRefOid?: string; headRef?: { target?: { committedDate?: string } | null } | null;
         files?: GraphqlConnection<{ path?: string }>; comments?: GraphqlConnection<{ body?: string }>;
-        reviews?: GraphqlConnection<{ state?: string; body?: string }>; mergeCommit?: { oid?: string; message?: string } | null;
+        reviews?: GraphqlConnection<{ state?: string; body?: string; submittedAt?: string; commit?: { oid?: string } | null }>;
+        mergeCommit?: { oid?: string; message?: string } | null;
       } | null | undefined;
       if (!pr || pr.number !== number) continue;
       const files = completeNodes(pr.files);
@@ -2433,8 +2459,10 @@ async function graphqlPrDetails(repository: string, numbers: readonly number[],
         files: files && files.every((file) => typeof file?.path === 'string') ? files.map((file) => file.path!) : null,
         comments: comments && comments.every((comment) => typeof comment?.body === 'string') ? comments.map((comment) => comment.body!) : null,
         reviews: reviews && reviews.every((review) => review && typeof review === 'object')
-          ? reviews.map((review) => ({ state: review.state, body: review.body })) : null,
+          ? reviews.map((review) => ({ state: review.state, body: review.body, submittedAt: review.submittedAt,
+            commitOid: review.commit?.oid })) : null,
         headSha: typeof pr.headRefOid === 'string' && pr.headRefOid ? pr.headRefOid : null,
+        headCommittedAt: typeof pr.headRef?.target?.committedDate === 'string' ? pr.headRef.target.committedDate : null,
         mergeCommit: pr.mergeCommit && typeof pr.mergeCommit.oid === 'string' && typeof pr.mergeCommit.message === 'string'
           ? { oid: pr.mergeCommit.oid, message: pr.mergeCommit.message } : null,
       };
@@ -2565,30 +2593,80 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     }
     throw new Error(`${what === 'review' ? 'Review' : what === 'same-cell' ? 'Same-cell' : 'Landing'} comment inventory exceeded pagination limit`);
   };
+  const reviewsFor = async (repository: string, number: number): Promise<Array<{ state?: string; body?: string; submittedAt?: string; commitOid?: string }>> => {
+    const reviews: Array<{ state?: string; body?: string; submittedAt?: string; commitOid?: string }> = [];
+    for (let page = 1; page <= 100; page++) {
+      const batch = await ghJsonAsync<Array<{ state?: string; body?: string; submitted_at?: string; commit_id?: string }>>(
+        ['api', `repos/${repository}/pulls/${number}/reviews?per_page=100&page=${page}`]);
+      if (!Array.isArray(batch) || batch.length > 100) throw new Error('Incomplete review inventory');
+      reviews.push(...batch.map((review) => ({ state: review.state, body: review.body,
+        submittedAt: review.submitted_at, commitOid: review.commit_id })));
+      if (batch.length < 100) return reviews;
+    }
+    throw new Error('Review inventory exceeded pagination limit');
+  };
+  const checkRunsFor = async (repository: string, sha: string): Promise<Array<{ conclusion?: string | null }> | undefined> => {
+    const runs: Array<{ conclusion?: string | null }> = [];
+    for (let page = 1; page <= 100; page++) {
+      const result = await ghJsonAsync<{ total_count?: number; check_runs?: Array<{ conclusion?: string | null }> }>(
+        ['api', `repos/${repository}/commits/${sha}/check-runs?per_page=100&page=${page}`]);
+      if (!Array.isArray(result?.check_runs) || result.check_runs.length > 100) throw new Error('Incomplete check-run inventory');
+      runs.push(...result.check_runs);
+      if (Number.isSafeInteger(result.total_count) && runs.length >= result.total_count!) return runs;
+      if (result.check_runs.length < 100) return Number.isSafeInteger(result.total_count) && runs.length < result.total_count! ? undefined : runs;
+    }
+    return undefined;
+  };
+  const headCommitTimeFor = async (repository: string, number: number): Promise<string | undefined> => {
+    let latest: string | undefined;
+    for (let page = 1; page <= 100; page++) {
+      const batch = await ghJsonAsync<Array<{ commit?: { committer?: { date?: string } } }>>(
+        ['api', `repos/${repository}/pulls/${number}/commits?per_page=100&page=${page}`]);
+      if (!Array.isArray(batch) || batch.length > 100) throw new Error('Incomplete PR commit inventory');
+      for (const commit of batch) {
+        const date = commit.commit?.committer?.date;
+        if (!date || !Number.isFinite(Date.parse(date))) throw new Error('Incomplete PR commit timestamp');
+        latest = date;
+      }
+      if (batch.length < 100) return latest;
+    }
+    throw new Error('PR commit inventory exceeded pagination limit');
+  };
   const reviewGateForDraft = async (draft: SweepDraft, repository: string): Promise<SweepReviewGate | undefined> => {
     const cached = await detailFor(repository, draft.number);
     const sha = cached?.headSha
       ?? (await ghJsonAsync<{ head?: { sha?: string } }>(['api', `repos/${repository}/pulls/${draft.number}`]))?.head?.sha;
     if (!sha) return undefined;
+    const reviews = cached?.reviews ?? await reviewsFor(repository, draft.number);
+    if (!Array.isArray(reviews)) throw new Error('Incomplete review inventory');
     const comments = cached?.comments ?? await issueCommentsFor(repository, draft.number, 'review');
-    const reviews = cached?.reviews
-      ?? await ghJsonAsync<Array<{ state?: string; body?: string }>>(['api', `repos/${repository}/pulls/${draft.number}/reviews?per_page=100`]);
-    if (!Array.isArray(reviews) || reviews.length > 100) throw new Error('Incomplete review inventory');
-    const text = [...comments, ...reviews.map((review) => review.body ?? '')].join('\n');
+    const legacyText = [...comments, ...reviews.map((review) => review.body ?? '')].join('\n');
+    const currentHeadReviews = reviews.filter((review) => review && typeof review === 'object'
+      && review.commitOid === sha
+      && typeof review.submittedAt === 'string' && Number.isFinite(Date.parse(review.submittedAt)))
+      .sort((a, b) => Date.parse(a.submittedAt!) - Date.parse(b.submittedAt!));
+    const latestHeadReview = currentHeadReviews.at(-1);
+    const triageReview = latestHeadReview?.state === 'APPROVED' ? 'approved'
+      : latestHeadReview?.state === 'CHANGES_REQUESTED' ? 'changes-requested'
+        : latestHeadReview?.state === 'COMMENTED' ? 'commented'
+          : latestHeadReview?.state === 'DISMISSED' ? 'dismissed'
+            : latestHeadReview?.state === 'PENDING' ? 'pending' : 'unknown';
     const [status, checkRuns] = await Promise.all([
       ghJsonAsync<{ state?: string }>(['api', `repos/${repository}/commits/${sha}/status`]),
-      ghJsonAsync<{ check_runs?: Array<{ conclusion?: string | null }> }>(['api', `repos/${repository}/commits/${sha}/check-runs?per_page=100`]),
+      checkRunsFor(repository, sha),
     ]);
-    if (!checkRuns || !Array.isArray(checkRuns.check_runs)) throw new Error('Incomplete check-run inventory');
-    const conclusions = checkRuns.check_runs.map((run) => run.conclusion ?? null);
-    const gatePass = (status?.state === 'success' || status?.state === undefined)
-      && conclusions.length > 0 && conclusions.every((conclusion) => conclusion === 'success' || conclusion === 'skipped' || conclusion === 'neutral');
+    const conclusions = checkRuns?.map((run) => run.conclusion ?? null) ?? [];
+    const gatePass = status?.state === 'success'
+      && checkRuns !== undefined && conclusions.length > 0
+      && conclusions.every((conclusion) => conclusion === 'success' || conclusion === 'skipped' || conclusion === 'neutral');
     const gateFail = status?.state === 'failure' || status?.state === 'error'
       || conclusions.some((conclusion) => conclusion === 'failure' || conclusion === 'cancelled' || conclusion === 'timed_out' || conclusion === 'action_required');
     return {
-      ...(reviews.some((review) => review.state === 'APPROVED') || /(?:^|\n)\s*VERDICT:\s*PASS\b/i.test(text) ? { review: 'pass' as const } : {}),
-      ...(mustFixRemains(text) ? { mustFix: true } : {}),
+      ...(reviews.some((review) => review.state === 'APPROVED') || /(?:^|\n)\s*VERDICT:\s*PASS\b/i.test(legacyText)
+        ? { review: 'pass' as const } : {}),
+      ...(mustFixRemains(legacyText) ? { mustFix: true } : {}),
       ...(gatePass && !gateFail ? { gate: 'pass' as const } : gateFail ? { gate: 'fail' as const } : {}),
+      triageReview,
     };
   };
   const claimCommentsFor = async (repository: string, number: number): Promise<string[]> => {
@@ -2618,11 +2696,15 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
       const prs = (await listed(open, repository, 'open')).filter((pr) => pr.draft);
       await prefetchDetails(repository, prs.map((pr) => pr.number));
       const matches = ledgerMatches ??= listRunLedgers().matches;
-      return mapBounded(prs, DRAFT_SWEEP_CONCURRENCY, async (pr): Promise<SweepDraft> => ({
-        number: pr.number, title: pr.title, branch: pr.head.ref,
-        labels: pr.labels.map((item) => item.name), createdAt: pr.created_at, body: pr.body ?? undefined,
-        changedFiles: await prFiles(repository, pr.number), ...(pr.updated_at ? { updatedAt: pr.updated_at } : {}),
-        runId: currentDraftSweepRunId(matches, repository, pr.number) }));
+      return mapBounded(prs, DRAFT_SWEEP_CONCURRENCY, async (pr): Promise<SweepDraft> => {
+        return {
+          number: pr.number, title: pr.title, branch: pr.head.ref,
+          labels: pr.labels.map((item) => item.name), createdAt: pr.created_at, body: pr.body ?? undefined,
+          changedFiles: await prFiles(repository, pr.number),
+          ...(pr.updated_at ? { updatedAt: pr.updated_at } : {}),
+          runId: currentDraftSweepRunId(matches, repository, pr.number),
+        };
+      });
     })());
     return draftRows.get(repository)!;
   };
@@ -2677,6 +2759,8 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     },
     listDrafts: async (page, perPage, repository): Promise<SweepDraft[]> =>
       (await enrichedDrafts(repository)).slice((page - 1) * perPage, page * perPage),
+    getHeadCommitTime: async (repository, number) => (await detailFor(repository, number))?.headCommittedAt
+      ?? await headCommitTimeFor(repository, number).catch(() => undefined),
     listMerged: async (page, perPage, repository): Promise<SweepMergedPr[]> =>
       (await enrichedMerged(repository)).slice((page - 1) * perPage, page * perPage),
     getRunStatus: async (draft, repository) => runStatusFor(draft, repository),
@@ -2943,7 +3027,7 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
               owner: 'unknown', ownerSource: 'unknown', step: 'replay', reason: sweepFailureReason(error) });
           }
         }
-        const result: DraftSweepResult = await runDraftSweep({ repository, apply: opts.apply === true, adapters: deps.adapters ?? github!,
+        const result: DraftSweepResult = await runDraftSweep({ repository, apply: opts.apply === true, includeTriage: opts.json === true, adapters: deps.adapters ?? github!,
           closeCap: cap.closeCap, closeCapSource: cap.closeCapSource, alreadyClosed: replayClosed });
         const reason = result.error ? sweepFailureReason(result.error) : undefined;
         const ttlStarted = Date.now();

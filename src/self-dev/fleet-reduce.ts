@@ -3,7 +3,7 @@
 //
 // 순서: 기준(origin/<base>)에서 임시 워크트리 → 조각 브랜치를 차례로 `merge --no-ff`
 //   → 충돌이면 «그 조각 ⊕ 충돌 파일»을 이름으로 대고 병합을 되돌린 뒤 멈춘다(추측으로 풀지 않는다)
-//   → 다 합쳐지면 `self gate --base <base>`(새 회귀만 빨강) → 통합 브랜치 푸시 → PR 하나(조각 PR 나열)
+//   → 다 합쳐지면 `self gate --local --base <base>`(새 회귀만 빨강) → 통합 브랜치 푸시 → PR 하나(조각 PR 나열)
 //   → 조각 PR 에 «통합 PR 로 대체됨» 코멘트(닫지는 않는다 — 사람 몫).
 // ⛔ 조각 PR 을 main 에 따로 병합하지 않는다 — 그건 `--auto-merge` 의 일이고 reduce 는 «하나로»다.
 
@@ -116,7 +116,8 @@ export async function reduceShards(opts: ReduceOptions): Promise<ReduceOutcome> 
       // 게이트는 저장소 코드로 돈다 — 통합 워크트리에 의존성을 잇는다(설치 없이).
       const nm = join(opts.repoRoot, 'node_modules');
       if (existsSync(nm) && !existsSync(join(wt, 'node_modules'))) symlinkSync(nm, join(wt, 'node_modules'));
-      const g = run('bun', ['bin/elanous.mjs', 'self', 'gate', '--changed', '--base', `origin/${base}`], wt);   // 📏 `--changed` 가 없으면 rc 2 로 거절한다(첫 실물)
+      // This gate measures the local integration worktree; remote SSH availability is unrelated to the merge result.
+      const g = run('bun', ['bin/elanous.mjs', 'self', 'gate', '--local', '--changed', '--base', `origin/${base}`], wt);   // 📏 `--changed` 가 없으면 rc 2 로 거절한다(첫 실물)
       const tail = `${g.stdout}\n${g.stderr}`.trim().split('\n').slice(-6).join('\n');
       if (g.status !== 0) {
         debug.log('self-dev.reduce', 'gate-failed', { branch, merged: merged.length, rc: g.status });

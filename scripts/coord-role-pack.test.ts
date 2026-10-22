@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { buildCoordRolePack, buildCoordRolePackManifest, type RolePack } from './coord-role-pack.js';
@@ -249,5 +249,116 @@ test('CLI entry rejects missing or invalid --role with usage and exit code 2', (
     });
     expect(run.status).toBe(2);
     expect(run.stderr).toContain('usage: bun scripts/coord-role-pack.ts --role coordinator|guardian [--json]');
+  }
+});
+
+const CARD_BODY = [
+  '- 신호(관측): 이 칸의 판정 근거를 잰다.',
+  '- 원인(인지): 관측이 비어 있으면 판정도 비어 있다.',
+  '- 처방(힐링): 먼저 재는 명령으로 관측을 채운다.',
+  '- 재는 명령: `rg -c GEV ~/elanous-hq/bin/ta-dispatcher.sh`',
+  '- 기대: ≥1',
+  '- 유효 조건: 항상',
+  '- 검증: 2026-10-14 참 (OP · #27510)',
+  '- 출처: OP · 상태: active',
+];
+
+const buildFixturePack = (knowhow: string, prefix: string): RolePack => {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const write = (path: string, content: string) => {
+    const target = join(root, path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  };
+  try {
+    write('package.json', '{"version":"0.2.35-test"}');
+    for (const path of ['AGENTS.md', 'docs/roles/OP.md', 'docs/handbook/LOOP-AGENTS.md', 'docs/handbook/OPERATIONS.md', 'scripts/coord-role-pack.ts']) write(path, '# Fixture\n');
+    write('docs/roles/OP/KNOWHOW.md', knowhow);
+    return buildCoordRolePackManifest('coordinator', root);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+};
+
+// 판정선 ① — 린트 문법을 벗어난 카드 제목은 "통과도 제외 기록도 아닌" 채로 조용히 사라지면 안 된다.
+// 조용히 사라지면 실패 카드가 실린 것과 구별되지 않고, 번호를 잘라 읽으면 엉뚱한 아이디가 제외 기록에 남는다.
+test('a card-shaped heading that deviates from the lint grammar fails instead of vanishing', () => {
+  const knowhow = [
+    '## K-OP-901 린트 통과 항목',
+    '- 상황: 901 은 정상 카드다.',
+    ...CARD_BODY,
+    '',
+    '## K-OP-901extra 제목 문법이 어긋난 카드',
+    '- 상황: 이 카드는 제목이 K-<자리>-<번호>를 벗어난다.',
+    ...CARD_BODY,
+  ].join('\n');
+  expect(() => buildFixturePack(knowhow, 'coord-role-pack-heading-')).toThrow(/카드 제목 형식이 K-<자리>-<번호>를 벗어남/);
+});
+
+// 판정선 ② — 린트가 카드 제목으로 인정하는 들여쓰기(0~3칸)는 자를 때도 카드 경계다.
+// 자를 때 놓치면 앞 카드에 흡수돼 이 카드가 린트조차 못 본 채 사라진다.
+test('a card heading indented up to three spaces still splits its own card', () => {
+  const knowhow = [
+    '## K-OP-910 첫 카드',
+    '- 상황: 첫 카드다.',
+    ...CARD_BODY,
+    '',
+    '   ## K-OP-911 들여 쓴 둘째 카드',
+    '- 상황: 둘째 카드다.',
+    ...CARD_BODY,
+  ].join('\n');
+  const pack = buildFixturePack(knowhow, 'coord-role-pack-indent-');
+  expect(pack.excludedCardIds).toEqual([]);
+  expect(pack.body).toContain('- K-OP-910 · 첫 카드');
+  expect(pack.body).toContain('- K-OP-911 · 들여 쓴 둘째 카드');
+});
+
+// 생산 CLI 실물 — 실제 CLI가 읽는 KNOWHOW 에 문법 위반 카드와 고유 비밀 표식을 심는다.
+// 구현과 같은 카드 제목 정규식으로 원본 카드를 세는 전수 회계는 정규식이 놓친 제목을 잡지 못한다(양쪽이
+// 같은 정규식을 쓰면 회계가 통과해도 누락은 안 보인다). 그래서 이 시험은 회계를 하지 않는다.
+test('production CLI makes a planted grammar-violating KNOWHOW card fail or excluded explicitly, never silently', () => {
+  const repo = join(import.meta.dir, '..');
+  // 시험의 독립적 기대값 — 구현의 회계 정규식을 빌리지 않고 심은 카드에서 나온다:
+  // `## K-OP-9901X` 제목은 K-<자리>-<번호> 뒤에 글자가 붙어 문법을 벗어뜨렸다.
+  const violatingCardId = 'K-OP-9901X';
+  const secretMarker = 'knowhow-canary-8f2d47c1';
+  const root = mkdtempSync(join(tmpdir(), 'coord-role-pack-canary-'));
+  const write = (path: string, content: string) => {
+    const target = join(root, path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, content);
+  };
+  try {
+    // 실제 CLI 바이트와 실제 src 구현이 읽는 루트 — CLI 는 스크립트 위치(import.meta.dir/..)를 루트로 쓴다.
+    write('scripts/coord-role-pack.ts', readFileSync(join(repo, 'scripts/coord-role-pack.ts'), 'utf8'));
+    symlinkSync(join(repo, 'src'), join(root, 'src'), 'dir');
+    write('package.json', '{"version":"0.2.35-canary"}');
+    // 실제 KNOWHOW 원본에 문법 위반 카드(몸에 고유 비밀 표식)를 심는다.
+    const original = readFileSync(join(repo, 'docs/roles/OP/KNOWHOW.md'), 'utf8');
+    const planted = [
+      `## ${violatingCardId} 제목 문법을 고의로 벗어뜨린 카드`,
+      `- 상황: 이 카드 몸에는 ${secretMarker} 비밀 표식이 있다.`,
+      '- 신호(관측): 제목이 K-<자리>-<번호> 뒤에 글자를 붙여 문법을 벗어뜨렸다.',
+    ].join('\n');
+    write('docs/roles/OP/KNOWHOW.md', `${original}${original.endsWith('\n') ? '' : '\n'}${planted}\n`);
+    const run = spawnSync(process.execPath, ['scripts/coord-role-pack.ts', '--role', 'coordinator', '--json'], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+    // 관측: CLI 실행 결과에서 심은 카드가 어찌 다뤄졌는지 읽는다.
+    const output = `${run.stdout}${run.stderr}`;
+    const explicitFailure = run.status !== 0
+      && run.stderr.includes(violatingCardId)
+      && run.stderr.includes('카드 제목 형식이 K-<자리>-<번호>를 벗어남');
+    const explicitExclusion = run.status === 0
+      && (JSON.parse(run.stdout) as RolePack).excludedCardIds.includes(violatingCardId);
+    // 독립 기대값과의 대조 — (a) 이 카드는 명시적으로 실패하거나 제외된다. (b) 비밀 표식은 출력에 나오지 않는다.
+    // 카드가 조용히 사라지면(실패도 제외도 없으면) 첫 단정이, 표식이 출력에 새면 둘째 단정이 잡는다.
+    expect(explicitFailure || explicitExclusion).toBe(true);
+    expect(output.includes(secretMarker)).toBe(false);
+  } finally {
+    rmSync(join(root, 'src'), { force: true });
+    rmSync(root, { recursive: true, force: true });
   }
 });

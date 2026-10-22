@@ -112,6 +112,14 @@ export interface PodChildEvidence {
   goalCauseObserved?: true;
   terminationReason?: unknown;
   accountAvailability?: Record<string, unknown>;
+  prFailure?: {
+    stage: 'pr-open-failed';
+    source?: 'child-ledger' | 'terminal-result';
+    errorTail: string;
+    blockingPrNumber?: number;
+    candidateCardId?: string;
+    blockingCardId?: string;
+  };
 }
 
 /** Preserve only named terminal facts; the full child detail may contain logs or credentials. */
@@ -157,6 +165,21 @@ export function podChildEvidenceFromResult(o: Record<string, unknown>): PodChild
     ...(o.terminationReason !== undefined ? { terminationReason: scrubValue(o.terminationReason) } : {}),
     ...(accountAvailability ? { accountAvailability } : {}),
   };
+  if (o.ok === false && typeof o.error === 'string'
+    && /draft PR 생성 실패|PR (?:gh|guard) 실패|same-cell reuse:/u.test(o.error)) {
+    const safe = redactSecretText(o.error).replace(/\/home\/[^/\s]+\//gu, '~/');
+    const blocker = /(?:blockers=|blockingPr=)\s*#?(\d+)(?::([A-Za-z0-9_-]{1,128}))?/u.exec(safe);
+    const number = blocker ? Number(blocker[1]) : null;
+    const candidate = /candidateCardId=([A-Za-z0-9_-]{1,128})/u.exec(safe)?.[1];
+    const card = blocker?.[2];
+    evidence.prFailure = {
+      stage: 'pr-open-failed',
+      errorTail: (safe.split(/\r\n|\n|\r/u).filter(Boolean).at(-1) ?? safe).slice(-240),
+      ...(number && Number.isSafeInteger(number) ? { blockingPrNumber: number } : {}),
+      ...(candidate && candidate !== 'unknown' ? { candidateCardId: candidate } : {}),
+      ...(card && card !== 'unknown' ? { blockingCardId: card } : {}),
+    };
+  }
   return Object.keys(evidence).length ? evidence : undefined;
 }
 

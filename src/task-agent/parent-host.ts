@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { resolveFreshGrokCredential } from '../grok/credential.js';
 import { memoryQuantityBytes } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { shellQuote } from './task-hand.js';
@@ -210,7 +211,9 @@ export function remoteLaunchScript(target: ParentHostConfig, args: readonly stri
   const elanous = target.elanous ?? DEFAULT_REMOTE_ELANOUS;
   const configDir = target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR;
   const log = remoteParentLogPath(target, env.ELANOUS_RUN_ID ?? 'unknown');
-  const envPart = [...Object.entries(env).filter(([key]) => key !== 'ELANOUS_STATE_DIR' && /^[A-Z_][A-Z0-9_]*$/.test(key)).map(([key, value]) => `${key}=${shellQuote(value)}`), `ELANOUS_STATE_DIR=${remotePath(configDir)}`].join(' ');
+  // --config-dir keeps the parent's operational config/state; authStorePath()
+  // reads XDG_CONFIG_HOME/elanous/auth.json first, as the entrypoint test proves.
+  const envPart = [...Object.entries(env).filter(([key]) => key !== 'ELANOUS_STATE_DIR' && /^[A-Z_][A-Z0-9_]*$/.test(key)).map(([key, value]) => `${key}=${key === 'XDG_CONFIG_HOME' || key === 'CODEX_HOME' || key === 'GH_CONFIG_DIR' ? remotePath(value) : shellQuote(value)}`), `ELANOUS_STATE_DIR=${remotePath(configDir)}`].join(' ');
   const argv = [remotePath(elanous), '--config-dir', remotePath(configDir), ...remoteParentArgs(args, target.podPool).map(shellQuote)].join(' ');
   // 준비가 실패하면 «확실히 안 띄웠다»(not-launched=…)를 찍고 끝낸다 — 그때만 호출부가 로컬로 돌아간다.
   // 띄운 뒤에는 짧게 살아 있는지 보고 pid 를 찍는다(조기 종료면 early-exit — 역시 «안 돈다»가 확실).
@@ -342,8 +345,27 @@ export class RemoteParentNotLaunchedError extends Error {
  * 그 밖(ssh 끊김·시간 초과·알 수 없는 답)은 «떴는지 모른다» — 일반 Error 로 던져 카드가 launch-failed 로 남게 한다
  * (⛔ 로컬로 또 띄우면 원격에 이미 뜬 부모와 중복이 될 수 있다).
  */
-export function launchRemoteParent(target: ParentHostConfig, args: readonly string[], env: Record<string, string>, ssh: SshRunner = defaultSshRunner): { pid: number; log: string } {
-  const result = ssh(target.host, remoteLaunchScript(target, args, env), 30_000);
+export function launchRemoteParent(
+  target: ParentHostConfig,
+  args: readonly string[],
+  env: Record<string, string>,
+  ssh: SshRunner = defaultSshRunner,
+  grokMirrorResolver: () => OwnerGrokAccessMirror = resolveOwnerGrokAccessMirror,
+  effectiveChildProvider?: string,
+  now: () => number = Date.now,
+): { pid: number; log: string } {
+  const argvProvider = childProviderFromArgs(args);
+  if (effectiveChildProvider && argvProvider && argvProvider !== effectiveChildProvider) {
+    throw new Error(`effective child provider mismatch (context=${effectiveChildProvider}, argv=${argvProvider})`);
+  }
+  const launchArgs = effectiveChildProvider && !argvProvider
+    ? [...args.slice(0, 2), '--child-llm-provider', effectiveChildProvider, ...args.slice(2)]
+    : args;
+  if ((effectiveChildProvider ?? argvProvider) === 'grok') {
+    const mirror = grokMirrorResolver();
+    installRemoteGrokAccess(target, mirror, ssh, now);
+  }
+  const result = ssh(target.host, remoteLaunchScript(target, launchArgs, env), 30_000);
   const log = remoteParentLogPath(target, env.ELANOUS_RUN_ID ?? 'unknown');
   const pid = Number(/^pid=(\d+)$/m.exec(result.stdout)?.[1]);
   if (result.status === 0 && Number.isSafeInteger(pid) && pid > 0) return { pid, log };
@@ -353,6 +375,65 @@ export function launchRemoteParent(target: ParentHostConfig, args: readonly stri
     throw new RemoteParentNotLaunchedError(target.host, `${refused}${tail ? `: ${tail.slice(0, 160)}` : ''}`);
   }
   throw new Error(`원격 부모 발사 결과 불확실(${target.host} · rc=${result.status}) — 중복을 피해 로컬로 다시 띄우지 않는다 · 원격에서 ELANOUS_RUN_ID=${env.ELANOUS_RUN_ID ?? '?'} 를 확인: ${(result.stderr.trim().split('\n').pop() || '').slice(0, 160)}`);
+}
+
+/** The provider selection travels as an argv pair or assignment; absent remains the existing Codex default. */
+function childProviderFromArgs(args: readonly string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === '--child-llm-provider') return args[i + 1];
+    if (arg.startsWith('--child-llm-provider=')) return arg.slice('--child-llm-provider='.length);
+  }
+  return undefined;
+}
+
+export interface OwnerGrokAccessMirror { key: string; expiresAt: string }
+
+/** Resolve/refresh on HQ and return only a still-usable subscription access token. */
+export function resolveOwnerGrokAccessMirror(opts: {
+  home?: string;
+  env?: NodeJS.ProcessEnv;
+  now?: () => number;
+  execImpl?: (cmd: string, args: string[], timeoutMs: number) => void;
+} = {}): OwnerGrokAccessMirror {
+  const credential = resolveFreshGrokCredential({
+    ...(opts.home ? { home: opts.home } : {}),
+    ...(opts.env ? { env: opts.env } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
+    ...(opts.execImpl ? { execImpl: opts.execImpl } : {}),
+  });
+  if (!credential || credential.kind !== 'subscription') throw new Error('Grok subscription mirror unavailable: no-usable-subscription');
+  // Expiry travels with the selected credential so a second auth-file read cannot pair another scope's
+  // expiry with this access token if the file changes between reads.
+  if (!credential.expiresAt) throw new Error('Grok subscription mirror unavailable: access-state-incomplete');
+  const expiresAt = Date.parse(credential.expiresAt);
+  // Keep the same two-minute safety margin that triggers HQ refresh before remote installation.
+  if (!Number.isFinite(expiresAt) || expiresAt <= (opts.now ?? Date.now)() + 120_000) {
+    throw new Error('Grok subscription mirror unavailable: expired-or-refresh-did-not-produce-fresh-access');
+  }
+  return { key: credential.token, expiresAt: credential.expiresAt };
+}
+
+/** Install one HQ-selected Grok access token over SSH stdin; never copy refresh or other scopes. */
+export function installRemoteGrokAccess(
+  target: ParentHostConfig,
+  mirror: OwnerGrokAccessMirror,
+  ssh: SshRunner = defaultSshRunner,
+  now: () => number = Date.now,
+): void {
+  if (!mirror || typeof mirror.key !== 'string' || !mirror.key || typeof mirror.expiresAt !== 'string'
+    || !Number.isFinite(Date.parse(mirror.expiresAt)) || Date.parse(mirror.expiresAt) <= now() + 120_000) {
+    throw new Error('invalid Grok access mirror');
+  }
+  const payload = JSON.stringify({ key: mirror.key, expires_at: mirror.expiresAt });
+  const code = [
+    'const fs=require("node:fs"),path=require("node:path"),os=require("node:os");',
+    'const p=JSON.parse(fs.readFileSync(0,"utf8"));if(!p||typeof p.key!=="string"||!p.key||typeof p.expires_at!=="string"||!Number.isFinite(Date.parse(p.expires_at))||Date.parse(p.expires_at)<=Date.now()+120000||Object.keys(p).some(k=>!new Set(["key","expires_at"]).has(k)))process.exit(2);',
+    'const dir=path.join(os.homedir(),".grok"),file=path.join(dir,"auth.json"),temp=file+"."+process.pid+".tmp";fs.mkdirSync(dir,{recursive:true,mode:0o700});fs.chmodSync(dir,0o700);',
+    'try{let auth={};try{const prior=JSON.parse(fs.readFileSync(file,"utf8"));if(!prior||typeof prior!=="object"||Array.isArray(prior))process.exit(3);auth=prior}catch(e){if(e.code!=="ENOENT")throw e}auth["https://auth.x.ai::hq-mirror"]={key:p.key,expires_at:p.expires_at};fs.writeFileSync(temp,JSON.stringify(auth),{mode:0o600});fs.chmodSync(temp,0o600);fs.renameSync(temp,file)}catch(e){try{fs.unlinkSync(temp)}catch{};throw e}',
+  ].join('');
+  const result = ssh(target.host, `umask 077; bun -e ${shellQuote(code)}`, 20_000, payload);
+  if (result.status !== 0) throw new Error(`remote Grok access mirror failed (ssh rc=${result.status ?? 'unknown'})`);
 }
 
 /** Install access-only Codex copies over SSH stdin; credentials never enter argv, shell text, or logs. */
@@ -390,6 +471,45 @@ export function installRemoteCodexAccess(target: ParentHostConfig, mirror: { ela
   ].join('');
   const result = ssh(target.host, `umask 077; mkdir -p ${configDir} "$HOME/.codex" && bun -e ${shellQuote(code)} ${configDir}`, 20_000, payload);
   if (result.status !== 0) throw new Error(`remote Codex access mirror failed (ssh rc=${result.status ?? 'unknown'})`);
+}
+
+/** Replace the remote Codex account set with one HQ-owned, refresh-free snapshot. */
+export function installRemoteCodexAccessBatch(target: ParentHostConfig, mirrors: readonly { elanousAuth: string; codexAuth: string; account: string }[], ssh: SshRunner = defaultSshRunner): void {
+  if (!mirrors.length) throw new Error('Codex access mirror batch is empty');
+  const seen = new Set<string>();
+  const accounts = mirrors.map((mirror) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(mirror.account) || seen.has(mirror.account)) throw new Error('invalid or duplicate Codex mirror account name');
+    seen.add(mirror.account);
+    let elanous: { version?: number; providers?: Record<string, Record<string, unknown>> };
+    let codex: { auth_mode?: string; tokens?: Record<string, unknown> };
+    try { elanous = JSON.parse(mirror.elanousAuth); codex = JSON.parse(mirror.codexAuth); }
+    catch { throw new Error('invalid local Codex access mirror'); }
+    const provider = elanous.providers?.['openai-codex'];
+    const token = provider?.tokens as Record<string, unknown> | undefined;
+    if (!Number.isSafeInteger(elanous.version) || Number(elanous.version) < 1
+      || typeof token?.accessToken !== 'string' || !token.accessToken || token.refreshToken !== '' || token.refresh_token !== ''
+      || codex.auth_mode !== 'chatgpt' || typeof codex.tokens?.access_token !== 'string' || !codex.tokens.access_token
+      || codex.tokens.refresh_token !== '' || codex.tokens.refreshToken !== '')
+      throw new Error('Codex access mirror batch requires access tokens and empty refresh tokens');
+    return { account: mirror.account, provider, codexAuth: codex, version: elanous.version };
+  });
+  const configDir = remotePath(target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR);
+  const code = [
+    'const fs=require("node:fs"),path=require("node:path"),os=require("node:os");',
+    'const items=JSON.parse(fs.readFileSync(0,"utf8"));const dir=process.argv[1],file=path.join(dir,"auth.json"),defaultHome=path.join(dir,"codex-default"),managed=path.join(dir,"codex-accounts");',
+    'const read=(p)=>{try{return JSON.parse(fs.readFileSync(p,"utf8"))}catch{return {}}};',
+    'const write=(p,v)=>{fs.mkdirSync(path.dirname(p),{recursive:true,mode:0o700});const tmp=p+"."+process.pid+".tmp";try{fs.writeFileSync(tmp,JSON.stringify(v),{mode:0o600});fs.chmodSync(tmp,0o600);fs.renameSync(tmp,p)}catch(e){try{fs.unlinkSync(tmp)}catch{};throw e}};',
+    // A remote parent can launch concurrently with another parent. Serialize the
+    // entire auth-store + named-home transition, including stale-home pruning.
+    'const lock=path.join(dir,"remote-codex-mirror.lock"),deadline=Date.now()+15000,sleep=new Int32Array(new SharedArrayBuffer(4));fs.mkdirSync(dir,{recursive:true,mode:0o700});while(true){try{fs.writeFileSync(lock,String(process.pid),{flag:"wx",mode:0o600});break}catch(e){if(e.code!=="EEXIST")throw e;try{if(Date.now()-fs.statSync(lock).mtimeMs>60000)fs.rmSync(lock,{force:true})}catch{}if(Date.now()>=deadline)throw new Error("remote Codex mirror lock timeout");Atomics.wait(sleep,0,0,25)}}try{',
+    'const store=read(file);store.version=typeof store.version==="number"?store.version:items[0].version;store.providers={...(store.providers||{})};for(const key of Object.keys(store.providers)){if(key==="openai-codex"||key.startsWith("openai-codex:"))delete store.providers[key]}',
+    'for(const item of items){const home=item.account==="default"?defaultHome:path.join(managed,item.account),key=item.account==="default"?"openai-codex":"openai-codex:"+item.account;const current=read(path.join(home,"auth.json")),auth={...current,...item.codexAuth,auth_mode:"chatgpt",tokens:{...(item.codexAuth.tokens||{}),refresh_token:"",refreshToken:""}};write(path.join(home,"auth.json"),auth);store.providers[key]={...item.provider,codexHome:home,tokens:{...(item.provider.tokens||{}),refreshToken:"",refresh_token:""}}}',
+    'if(!store.providers["openai-codex"]){const first=items[0],home=path.join(managed,first.account);write(path.join(defaultHome,"auth.json"),{...first.codexAuth,auth_mode:"chatgpt",tokens:{...(first.codexAuth.tokens||{}),refresh_token:"",refreshToken:""}});store.providers["openai-codex"]={...store.providers["openai-codex:"+first.account],codexHome:defaultHome}}',
+    'write(file,store);const keep=new Set(items.filter(x=>x.account!=="default").map(x=>x.account));try{for(const name of fs.readdirSync(managed)){if(!keep.has(name))fs.rmSync(path.join(managed,name),{recursive:true,force:true})}}catch(e){if(e.code!=="ENOENT")throw e}fs.rmSync(path.join(dir,"remote-codex-mirror.json"),{force:true});',
+    '}finally{fs.rmSync(lock,{force:true})}',
+  ].join('');
+  const result = ssh(target.host, `umask 077; mkdir -p ${configDir} "$HOME/.codex" && bun -e ${shellQuote(code)} ${configDir}`, 20_000, JSON.stringify(accounts));
+  if (result.status !== 0) throw new Error(`remote Codex access mirror batch failed (ssh rc=${result.status ?? 'unknown'})`);
 }
 
 // ── 관측: 원격 런 원장 거울 ─────────────────────────────────────────────────────────────

@@ -4888,3 +4888,148 @@ describe('launchDevGoalFileDetached — 사용자 프로젝트에서도 진입 �
     expect(calls[0]!.args.slice(1, 4)).toEqual(['dev', '--file', '/tmp/GOAL.md']);
   });
 });
+
+import { taskAgentStatePath } from '../task-agent/task-hand.js';
+
+// SAMECELL-REBIND-IN-POD — 같은 칸 새 draft 뒤 `openPr` 시임의 카드 재결속 결과가 사유별로 갈리고,
+// 카드 저장소가 없는 실행(Pod 자식 · 격리 HOME)은 실패가 아니라 deferred 로 PR 번호를 반환한다.
+describe('openPr — 같은 칸 카드 재결속 사유 분리', () => {
+  const CARD_ID = 'task-card-samecell';
+  const OLD_PR = 111;
+  const NEW_PR = 333;
+  const NEW_URL = `https://github.com/example/repo/pull/${NEW_PR}`;
+  const BOUND_ELSEWHERE_PR = 222;
+  const ENV_KEYS = ['ELANOUS_STATE_DIR', 'ELANOUS_TASK_CARD_ID', 'ELANOUS_HARNESS_SEAT'] as const;
+
+  let root = '';
+  let events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+  let restoreLog: () => void = () => {};
+  const savedEnv = new Map<string, string | undefined>();
+
+  const fakePrManager = {
+    upsertPr: () => ({ ok: true, url: NEW_URL, supersededPr: OLD_PR }),
+  } as unknown as PrManager;
+
+  function writeCardStore(pr: { number: number; url: string }, extra: {
+    refSource?: 'manual';
+    history?: Array<{ event: string; pr?: number }>;
+  } = {}): void {
+    const storePath = taskAgentStatePath();
+    expect(storePath.startsWith(root)).toBe(true);
+    mkdirSync(dirname(storePath), { recursive: true });
+    writeFileSync(storePath, JSON.stringify({
+      tasks: {
+        [CARD_ID]: {
+          id: CARD_ID,
+          text: 'same-cell draft 재결속',
+          createdAt: new Date().toISOString(),
+          status: 'launched',
+          pr,
+          ...(extra.refSource ? { refSource: extra.refSource } : {}),
+          history: extra.history ?? [],
+        },
+      },
+    }, null, 2));
+  }
+
+  async function openSameCellDraft(): Promise<Awaited<ReturnType<ReturnType<typeof defaultSeams>['openPr']>>> {
+    return await defaultSeams({ prManager: fakePrManager }).openPr({
+      title: 'same-cell', body: '본문', head: 'feat/same-cell', cwd: root,
+    });
+  }
+
+  function rebindEvents(): string[] {
+    return events.map((entry) => entry.event).filter((event) => event.startsWith('same-cell-card-rebind-'));
+  }
+
+  beforeEach(() => {
+    savedEnv.clear();
+    for (const key of ENV_KEYS) savedEnv.set(key, process.env[key]);
+    root = mkdtempSync(join(tmpdir(), 'seams-samecell-'));
+    process.env.ELANOUS_STATE_DIR = root;
+    process.env.ELANOUS_TASK_CARD_ID = CARD_ID;
+    delete process.env.ELANOUS_HARNESS_SEAT;
+    events = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((
+      category: string, event: string, payload?: Record<string, unknown>,
+    ) => {
+      if (category === 'self-implement.pr') events.push({ event, payload: payload ?? {} });
+    }) as unknown as typeof debug.log);
+    restoreLog = () => spy.mockRestore();
+  });
+
+  afterEach(() => {
+    restoreLog();
+    for (const key of ENV_KEYS) {
+      const value = savedEnv.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test('카드 저장소 없는 실행(격리 HOME)은 rebind-deferred 로 PR 번호를 반환한다', async () => {
+    const storePath = taskAgentStatePath();
+    expect(storePath.startsWith(root)).toBe(true);
+    expect(existsSync(storePath)).toBe(false);
+
+    const outcome = await openSameCellDraft();
+
+    expect(outcome.number).toBe(NEW_PR);
+    expect(outcome.url).toBe(NEW_URL);
+    expect(outcome.rebind).toMatchObject({
+      outcome: 'deferred', reason: 'card-store-absent', cardId: CARD_ID, oldPr: OLD_PR, newPr: NEW_PR,
+    });
+    expect(rebindEvents()).toContain('same-cell-card-rebind-card-store-absent');
+    expect(rebindEvents()).toContain('same-cell-card-rebind-deferred');
+    expect(existsSync(storePath)).toBe(false);
+  });
+
+  test('다른 PR 에 결속된 카드는 bound-other-pr(번호) 로 실패한다', async () => {
+    writeCardStore({ number: BOUND_ELSEWHERE_PR, url: `https://github.com/example/repo/pull/${BOUND_ELSEWHERE_PR}` });
+
+    const failure = await openSameCellDraft().then(() => undefined, (error: unknown) => error as Error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure?.message).toContain(`bound-other-pr(${BOUND_ELSEWHERE_PR})`);
+    const boundEvent = events.find((entry) => entry.event === 'same-cell-card-rebind-bound-other-pr');
+    expect(boundEvent?.payload.boundPr).toBe(BOUND_ELSEWHERE_PR);
+    expect(rebindEvents()).toContain('same-cell-card-rebind-failed');
+    const stored = JSON.parse(readFileSync(taskAgentStatePath(), 'utf8')) as { tasks: Record<string, { pr?: { number?: number } }> };
+    expect(stored.tasks[CARD_ID]?.pr?.number).toBe(BOUND_ELSEWHERE_PR);
+  });
+
+  test('수동 ref 카드는 manual-ref 로 실패한다', async () => {
+    writeCardStore({ number: OLD_PR, url: `https://github.com/example/repo/pull/${OLD_PR}` }, { refSource: 'manual' });
+
+    const failure = await openSameCellDraft().then(() => undefined, (error: unknown) => error as Error);
+
+    expect(failure?.message).toContain('manual-ref');
+    expect(rebindEvents()).toContain('same-cell-card-rebind-manual-ref');
+    expect(rebindEvents()).toContain('same-cell-card-rebind-failed');
+  });
+
+  test('저장소는 있으나 카드가 없으면 card-missing 으로 deferred 된다', async () => {
+    writeFileSync(taskAgentStatePath(), JSON.stringify({ tasks: {} }));
+
+    const outcome = await openSameCellDraft();
+
+    expect(outcome.number).toBe(NEW_PR);
+    expect(outcome.rebind).toMatchObject({ outcome: 'deferred', reason: 'card-missing', cardId: CARD_ID });
+    expect(rebindEvents()).toContain('same-cell-card-rebind-card-missing');
+    expect(rebindEvents()).toContain('same-cell-card-rebind-deferred');
+  });
+
+  test('이미 새 PR 에 결속된 카드는 already-rebound 로 남고 실패하지 않는다', async () => {
+    writeCardStore(
+      { number: NEW_PR, url: NEW_URL },
+      { history: [{ event: 'same-cell-pr-rebound', pr: NEW_PR }] },
+    );
+
+    const outcome = await openSameCellDraft();
+
+    expect(outcome.number).toBe(NEW_PR);
+    expect(outcome.rebind).toMatchObject({ outcome: 'already-rebound', reason: 'already-rebound', newPr: NEW_PR });
+    expect(rebindEvents()).toContain('same-cell-card-rebind-already-rebound');
+  });
+});

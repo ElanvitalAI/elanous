@@ -20,6 +20,9 @@ export interface WarmWorkerCommand {
   leaseId: string;
   generation: number;
   workerId: string;
+  /** Acquired Pod identity and lease timestamp, carried only by the host control path. */
+  podUid?: string;
+  requestedAt?: string;
   key: WarmWorkerKey;
   deadlineAt: number;
   files: readonly string[];

@@ -64,7 +64,7 @@ export interface ActionDeps {
   releaseLanding?(day: string): void;
   /** 실패 한 번을 잠금 안에서 디스크에 더한다(다른 프로세스의 실패를 덮지 않게) · 더한 뒤의 값을 돌려준다. */
   incrementFailure?(key: string): number;
-  observe(event: 'task-agent.action', data: { taskId: string; kind: NextActionKind; result: string; reason: string }): void;
+  observe(event: 'task-agent.action' | 'task-agent.entrance-denominator', data: ActionObservation): void;
   /** 사다리 R4 — 실제로 할 재발사 수의 허용 목록(`taskAgent.liveMoves` 어휘). 없으면 종전 그대로(재발사에 목록 검사 없음) · 목록에 없는 수는 shadow. */
   liveMoves?: ReadonlySet<string>;
   /** 한 판단 회차의 발사 칸 — 호출부가 회차마다 새로 준다. 없으면 회당 상한 없음(종전). 발사를 시도할 때마다 `count` 가 오른다. */
@@ -75,6 +75,49 @@ export interface ActionDeps {
 
 /** 재발사는 한 판단 회차에 한 건만 발사한다. */
 export const RETRY_LAUNCHES_PER_CYCLE = 1;
+
+export interface ActionObservation {
+  taskId: string;
+  kind: NextActionKind | 'entrance-tick';
+  result: string;
+  reason: string;
+  reviewed?: number;
+  allowed?: number;
+  refused?: number;
+  reasons?: Record<string, number>;
+}
+
+export interface EntranceCandidateReview {
+  taskId: string;
+  kind: NextActionKind;
+  refusal?: string;
+}
+
+export interface EntranceTickCandidate {
+  action: NextAction;
+  refusal?: string;
+}
+
+export interface EntranceRefusalDenominator {
+  reviewed: number;
+  allowed: number;
+  refused: number;
+  reasons: Record<string, number>;
+}
+
+/** Count a tick's candidate refusals without confusing special object keys with prototypes. */
+export function buildEntranceRefusalDenominator(reviews: readonly EntranceCandidateReview[]): EntranceRefusalDenominator {
+  const reasonCounts = new Map<string, number>();
+  let refused = 0;
+  for (const review of reviews) {
+    const reason = typeof review.refusal === 'string' ? review.refusal.trim() : '';
+    if (!reason) continue;
+    refused += 1;
+    reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
+  }
+  const reasons = Object.fromEntries(reasonCounts) as Record<string, number>;
+  return { reviewed: reviews.length, allowed: reviews.length - refused, refused, reasons };
+}
 
 /** live 인데도 shadow 로 내릴 사유 — 없으면 발사해도 된다(재발사 아닌 수는 늘 없다). 기다림(wait)은 발사가 아니라 부하·회당 상한을 보지 않는다. */
 function retryShadowReason(action: NextAction, deps: ActionDeps): string | undefined {
@@ -262,6 +305,31 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     return 'done';
   }
   return record('done', action.rationale);
+}
+
+/** Execute the allowed candidates in a caller-supplied tick and emit one isolated denominator event. */
+export async function executeEntranceTick(candidates: readonly EntranceTickCandidate[], deps: ActionDeps): Promise<string[]> {
+  const denominator = buildEntranceRefusalDenominator(candidates.map(({ action, refusal }) => ({
+    taskId: action.taskId,
+    kind: action.kind,
+    ...(typeof refusal === 'string' ? { refusal } : {}),
+  })));
+  const observeDenominator = (result: string) => {
+    try {
+      deps.observe('task-agent.entrance-denominator', {
+        taskId: candidates[0]?.action.taskId ?? 'entrance-tick',
+        kind: 'entrance-tick', result, reason: 'entrance refusal denominator', ...denominator,
+      });
+    } catch { /* Logging must not change the actions selected for this tick. */ }
+  };
+  const results: string[] = [];
+  for (const { action, refusal } of candidates) {
+    if (typeof refusal === 'string' && refusal.trim()) continue;
+    try { results.push(await executeNextAction(action, deps)); }
+    catch (error) { observeDenominator('failed'); throw error; }
+  }
+  observeDenominator(results.at(-1) ?? 'refused-all');
+  return results;
 }
 
 /** 재발사 문면 — 원문은 고치지 않고 앞에 둔다 · 갈래 문면 · must-fix · 직전 런 순서. */

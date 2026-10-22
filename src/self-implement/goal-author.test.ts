@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
-import { explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary } from './goal-author.js';
+import { explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
 import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6020,7 +6020,7 @@ ${report}`);
       enhance: async (raw) => ({ original: raw, checklist: [codeCriterion, ...liveCriteria], verbatimPreserved: true }),
     });
     const acceptance = authored.document.slice(authored.document.indexOf('## ACCEPTANCE CRITERIA'), authored.document.indexOf('## REQUIRED EVIDENCE'));
-    const boundary = authored.document.slice(authored.document.indexOf('## SCOPE BOUNDARY'), authored.document.indexOf('## 불변식'));
+    const boundary = authored.document.slice(authored.document.indexOf('## SCOPE BOUNDARY'), authored.document.indexOf(VERIFICATION_PLAN_HEADING));
 
     expect(acceptance).toContain(`- Checkable requested criterion: ${codeCriterion}`);
     expect(acceptance.match(/^- Checkable requested criterion: /gm)).toHaveLength(1);
@@ -6044,7 +6044,7 @@ ${report}`);
       enhance: async (raw) => ({ original: raw, checklist: nonLiveCriteria, verbatimPreserved: true }),
     });
     const acceptance = authored.document.slice(authored.document.indexOf('## ACCEPTANCE CRITERIA'), authored.document.indexOf('## REQUIRED EVIDENCE'));
-    const boundary = authored.document.slice(authored.document.indexOf('## SCOPE BOUNDARY'), authored.document.indexOf('## 불변식'));
+    const boundary = authored.document.slice(authored.document.indexOf('## SCOPE BOUNDARY'), authored.document.indexOf(VERIFICATION_PLAN_HEADING));
 
     expect(acceptance.match(/^- Checkable requested criterion: /gm)).toHaveLength(nonLiveCriteria.length);
     for (const criterion of nonLiveCriteria) {
@@ -10608,6 +10608,110 @@ describe('TRACED PATHS declaration token classification', () => {
       expect(classifyTracedPathToken('row.ts', root).kind).toBe('bare');
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
+  const repoRoot = join(import.meta.dir, '..', '..');
+  const docs = readVerificationMenuDocs(repoRoot);
+
+  test('catalog stage: an ask naming release resume selects MS-02 with an injection-ladder level and five lines', () => {
+    const plan = authorVerificationPlan({
+      ask: '대상 경로: src/release-loop/resume.ts\n실패한 발행 런에서 `release resume --dry-run` 이 계획을 내고 런 원장은 불변이다.',
+      behaviour: '실패 런 resume 이 계획을 내고 원장은 불변이다',
+      targetPaths: ['src/release-loop/resume.ts'],
+      ...docs,
+    });
+    expect(plan.lines[0]).toBe(VERIFICATION_PLAN_HEADING);
+    expect(plan.lines.slice(1).map((line) => line.slice(0, 3))).toEqual(['- ①', '- ②', '- ③', '- ④', '- ⑤']);
+    expect(plan.stage).toMatchObject({ source: 'catalog', id: 'MS-02', level: 'L3' });
+    expect(plan.lines[2]).toContain('MS-02');
+    expect(plan.lines[2]).toContain('L3');
+    expect(plan.lines[3]).toContain('src/release-loop/resume.test.ts');
+    expect(plan.lines[4]).toContain('bun test src/release-loop/resume.test.ts');
+    expect(plan.lines[5]).toContain('git grep -n -F');
+    expect(plan.lines[5]).toContain('src/release-loop/resume.ts');
+  });
+
+  test('no catalog fit: the plan writes «새 무대: <name> — <command>» instead of inventing a catalog id', () => {
+    const plan = authorVerificationPlan({
+      ask: '대상 경로: src/util/format-bytes.ts\n`formatBytes` 가 1024 경계에서 KiB 로 바꾼다.',
+      behaviour: 'formatBytes 가 1024 경계에서 KiB 로 바꾼다',
+      targetPaths: ['src/util/format-bytes.ts'],
+      ...docs,
+    });
+    expect(plan.stage.source).toBe('new-stage');
+    expect(plan.lines[2]).toMatch(/새 무대: .+ — `.+`/);
+    expect(plan.lines[2]).toMatch(/L[0-4]/);
+    expect(plan.lines[2]).not.toMatch(/MS-0[1-4]/);
+    expect(plan.lines[5]).toContain("git grep -n -F 'formatBytes(' HEAD -- src/util/format-bytes.ts");
+  });
+
+  test('real-run defects: ① skips target-path restatements and ④ stays one intact inline command', () => {
+    const ask = '대상 경로: src/release-loop/resume.ts\nVERIFY-SAMPLE-A: 실패한 발행 런에서 `release resume --dry-run` 이 계획을 낸다.';
+    const behaviour = verificationBehaviour(['대상 경로는 `src/release-loop/resume.ts`이다.', '실패 런 resume 이 계획을 낸다.'], ask);
+    expect(behaviour).toBe('실패 런 resume 이 계획을 낸다.');
+    expect(verificationBehaviour(['대상 경로는 `src/a.ts`이다.'], ask)).toBe('VERIFY-SAMPLE-A: 실패한 발행 런에서 `release resume --dry-run` 이 계획을 낸다.');
+    const plan = authorVerificationPlan({ ask, behaviour: verificationBehaviour([], ask), targetPaths: ['src/release-loop/resume.ts'], ...docs });
+    expect(plan.lines[4]!.match(/`/gu)).toHaveLength(2);
+  });
+
+  test('review must-fix: 판정선(반증) lines are not behaviour, doc-only goals get a doc check, excluded 운영 실물 is not selected', () => {
+    expect(verificationBehaviour([], '판정선(반증): 해시가 같다.\n실패 런이 계획을 낸다.')).toBe('실패 런이 계획을 낸다.');
+    expect(verificationBehaviour(['판정선(반증): 해시가 같다.'], '실패 런이 계획을 낸다.')).toBe('실패 런이 계획을 낸다.');
+    const doc = authorVerificationPlan({ ask: '대상 경로: docs/x.md\n`L0` 사다리를 적는다', behaviour: '`L0` 사다리를 적는다', targetPaths: ['docs/x.md'], ...docs });
+    expect(doc.lines[3]).toContain("rg -n -F 'L0' docs/x.md");
+    expect(doc.lines[5]).toContain('해당 없음');
+    expect(doc.lines.join('\n')).not.toContain('git grep');
+    expect(doc.lines.join('\n')).not.toContain('.test.ts');
+    const excluded = authorVerificationPlan({ ask: '운영 실물 없이 fixture로 검증한다', behaviour: 'x', targetPaths: ['src/a/b.ts'], ...docs });
+    expect(excluded.lines[2]).not.toContain('운영 실물');
+    for (const ask of ['운영 데이터 저장 금지.', '운영 데이터를 쓰지 않는다.', '이 집계는 운영 사건을 입력으로 받지 않고 fixture 로 잰다.', 'Do not read production data.']) {
+      expect(operationalInputDeclared(ask)).toBe(false);
+    }
+    expect(operationalInputDeclared('운영 데이터 저장 금지.\n집계는 운영 사건 로그를 입력으로 받는다.')).toBe(true);
+    expect(operationalInputDeclared('운영 데이터가 입력인 집계')).toBe(true);
+  });
+
+  test('screen-shaped ask without a catalog fit chooses the ux-sim rung (L2)', () => {
+    const plan = authorVerificationPlan({ ask: 'TUI 상태줄 위젯 렌더가 잘린다', behaviour: '상태줄 렌더', targetPaths: ['src/tui/status-line.ts'], ...docs });
+    expect(plan.stage).toMatchObject({ source: 'new-stage', level: 'L2' });
+  });
+
+  test('missing menu/catalog degrades to «새 무대» and reports what was absent', () => {
+    const empty = mkdtempSync(join(tmpdir(), 'verify-menu-missing-'));
+    try {
+      const missing = readVerificationMenuDocs(empty);
+      expect(missing).toEqual({ menu: null, catalog: null });
+      const plan = authorVerificationPlan({ ask: '`release resume` 계획', behaviour: 'resume', targetPaths: [], ...missing });
+      expect(plan.stage.source).toBe('new-stage');
+      expect(plan.menuPresent).toBe(false);
+      expect(plan.catalogPresent).toBe(false);
+      expect(plan.lines).toHaveLength(6);
+    } finally { rmSync(empty, { recursive: true, force: true }); }
+  });
+
+  test('operational-data asks are pointed at the menu «운영 실물» row; others never ask for production evidence', () => {
+    const ops = authorVerificationPlan({ ask: '운영 데이터가 입력인 집계', behaviour: '집계', targetPaths: ['src/a/b.ts'], ...docs });
+    expect(ops.lines[2]).toContain('운영 실물');
+    const plain = authorVerificationPlan({ ask: '`formatBytes` 경계', behaviour: 'x', targetPaths: ['src/a/b.ts'], ...docs });
+    expect(plain.lines[2]).not.toContain('운영 실물');
+  });
+
+  test('authorGoal (full and lite) writes the «검증 계획(TDD)» section without breaking canonical structure', async () => {
+    for (const grade of ['full', 'lite'] as const) {
+      const authored = await authorGoal('대상 경로: src/example.ts\n판정선(반증): 기존 기능을 시험한다.', {
+        ...deps, repositoryRoot: repoRoot, authorGrade: { grade, source: 'flag' },
+      });
+      const lines = authored.document.split('\n');
+      const at = lines.indexOf(VERIFICATION_PLAN_HEADING);
+      expect(at).toBeGreaterThan(-1);
+      expect(lines.slice(at + 1, at + 6).map((line) => line.slice(0, 3))).toEqual(['- ①', '- ②', '- ③', '- ④', '- ⑤']);
+      const headings = lines.filter((line) => /^#{2,3} /u.test(line));
+      const planHeading = headings.indexOf(VERIFICATION_PLAN_HEADING);
+      expect(headings.slice(planHeading - 2, planHeading + 2)).toEqual(['## 답하지 못하는 것', '### 수용 구별 관측', VERIFICATION_PLAN_HEADING, '## 불변식']);
+      expect(lintGoalFile(authored.document, 'b').filter((finding) => finding.tag === 'required-section-order')).toEqual([]);
     }
   });
 });

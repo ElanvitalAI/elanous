@@ -1,4 +1,5 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
+import { debug } from '../../debug/log.js';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,7 +18,29 @@ const spec: WarmPodSpec = { name: 'warm-test-1', namespace: 'elanous-test', kube
 const candidate = { host: 'node-c', tier: 'standard' as const, spec };
 const input = () => ({ protocol: 1 as const, runId: 'run-1', attemptId: 'attempt-1', cutSha: spec.cutSha,
   deadlineAt: Date.now() + 60_000, files: ['src/example/worker.test.ts'], envProfile: 'gate-v1' });
-const lease = () => ({ name: spec.workerId, attrs: { key, leaseId: 'lease-1', generation: 1, state: 'leased' } });
+const lease = () => ({ name: spec.workerId, attrs: { key, leaseId: 'lease-1', generation: 1,
+  podUid: 'lease-pod-uid', state: 'leased' } });
+const leaseKubectl = (specs: WarmPodSpec[] = [spec]) => {
+  const pods = new Map(specs.map(item => [item.name, { metadata: {
+    ...(warmWorkerPodManifest(item).metadata as { labels: Record<string, string>; annotations: Record<string, string> }),
+    uid: 'lease-pod-uid', resourceVersion: '1',
+  } }]));
+  return (args: readonly string[]) => {
+    const name = args[6]!;
+    const pod = pods.get(name);
+    if (!pod) return { status: 1, stdout: '', stderr: 'pod missing' };
+    if (args[4] === 'get') return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
+    if (args[4] === 'patch') {
+      const patch = JSON.parse(args[args.indexOf('-p') + 1]!) as Array<{ op: string; value: any }>;
+      if (patch[0]?.value !== pod.metadata.uid || patch[1]?.value !== pod.metadata.resourceVersion)
+        return { status: 1, stdout: '', stderr: 'precondition failed' };
+      pod.metadata = { ...pod.metadata, labels: patch[2]!.value, annotations: patch[3]!.value,
+        resourceVersion: String(Number(pod.metadata.resourceVersion) + 1) };
+      return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
+    }
+    return { status: 1, stdout: '', stderr: 'unexpected kubectl' };
+  };
+};
 
 test('unconfigured replay fails closed without making a control or kubectl request', async () => {
   configureWarmPodProvider(null);
@@ -368,6 +391,7 @@ test('provider retains the lease through gate comparison, then releases and mach
   const calls: Array<{ path: string; token: string; body: any }> = [];
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
     memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    kubectl: leaseKubectl(),
     fetch: async (url, init) => {
       const path = new URL(String(url)).pathname;
       const body = JSON.parse(String(init?.body));
@@ -389,12 +413,60 @@ test('provider retains the lease through gate comparison, then releases and mach
   expect(calls[1]!.body).toMatchObject({ leaseId: 'lease-1', generation: 1 });
 });
 
+test('a replaced Pod refuses the acquired lease before transport and quarantines it', async () => {
+  const paths: string[] = [];
+  let transported = 0;
+  const manifest = warmWorkerPodManifest(spec);
+  const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), kubectl: args => {
+      expect(args[4]).toBe('get');
+      return { status: 0, stdout: JSON.stringify({ metadata: { ...(manifest.metadata as object),
+        name: spec.name, namespace: spec.namespace, uid: 'replacement-uid', resourceVersion: '1' } }), stderr: '' };
+    },
+    fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      return Response.json(path === '/v1/leases/pod-worker' ? lease() : {});
+    },
+    transport: () => ({ request: async () => {
+      transported++;
+      return { status: 'observed', reason: 'complete', reply: null };
+    } }),
+  });
+  expect(await provider.request(input())).toMatchObject({ command: null,
+    transport: { status: 'fallback', reason: 'lease-unavailable' } });
+  expect(transported).toBe(0);
+  expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
+});
+
+test('a lease refused before start logs lease-refused, never an unpaired lease-end', async () => {
+  const events: Array<{ event: string; data: any }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.provenance') events.push({ event, data });
+  }) as typeof debug.log);
+  try {
+    const manifest = warmWorkerPodManifest(spec);
+    const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+      memberToken: '1'.repeat(64), kubectl: () => ({ status: 0, stdout: JSON.stringify({ metadata: {
+        ...(manifest.metadata as object), name: spec.name, namespace: spec.namespace,
+        uid: 'replacement-uid', resourceVersion: '1' } }), stderr: '' }),
+      fetch: async url => Response.json(new URL(String(url)).pathname === '/v1/leases/pod-worker' ? lease() : {}) });
+    await provider.request(input());
+  } finally { log.mockRestore(); }
+  const names = events.map(row => row.event);
+  expect(names).not.toContain('lease-start');
+  expect(names).not.toContain('lease-end');
+  expect(events.find(row => row.event === 'lease-refused')?.data)
+    .toMatchObject({ leaseId: 'lease-1', leaseStarted: false, reason: 'provenance-unavailable' });
+});
+
 test('a host/key lease executes the worker ID returned by the control plane', async () => {
   const secondSpec = { ...spec, name: 'warm-test-2', workerId: 'warm-test-2-uid' };
   const paths: string[] = [];
   let transported = '';
   const provider = new WarmPodProvider({ candidates: [candidate, { ...candidate, spec: secondSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    kubectl: leaseKubectl([spec, secondSpec]),
     fetch: async url => {
       const path = new URL(String(url)).pathname; paths.push(path);
       return Response.json(path === '/v1/leases/pod-worker'
@@ -437,7 +509,8 @@ test('transport mismatch quarantines the leased worker and never sanitizes it', 
     memberToken: '1'.repeat(64), fetch: async (url) => {
       const path = new URL(String(url)).pathname; paths.push(path);
       return Response.json(path === '/v1/leases/pod-worker' ? lease() : {});
-    }, transport: () => ({ request: async () => ({ status: 'fallback', reason: 'invalid-result', reply: null }) }) });
+    }, kubectl: leaseKubectl(),
+    transport: () => ({ request: async () => ({ status: 'fallback', reason: 'invalid-result', reply: null }) }) });
   const result = await provider.request(input());
   expect(result.transport.reason).toBe('invalid-result');
   expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
@@ -467,7 +540,7 @@ test('missing remote-internal context refuses before lease, Pod exec or quaranti
 test('a zero shadow budget never starts kubectl and quarantines its acquired lease', async () => {
   const paths: string[] = [];
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), maxShadowMs: 0, fetch: async (url) => {
+    memberToken: '1'.repeat(64), maxShadowMs: 0, kubectl: leaseKubectl(), fetch: async (url) => {
       const path = new URL(String(url)).pathname; paths.push(path);
       return Response.json(path === '/v1/leases/pod-worker' ? lease() : {});
     } });
@@ -488,7 +561,7 @@ test('a timed-out kubectl child is stopped before the acquired lease is quaranti
     process.env.PATH = `${directory}:${oldPath}`;
     process.env.WARM_TEST_MARKER = marker;
     const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-      memberToken: '1'.repeat(64), maxShadowMs: 8_000, fetch: async (url) => {
+      memberToken: '1'.repeat(64), maxShadowMs: 8_000, kubectl: leaseKubectl(), fetch: async (url) => {
         const path = new URL(String(url)).pathname; paths.push(path);
         if (path.endsWith('/quarantine')) {
           const pid = readFileSync(marker, 'utf8').trim();

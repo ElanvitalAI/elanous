@@ -77,6 +77,28 @@ const seams = (over: Parameters<typeof baseSeams>[0]): SelfImplementSeams => bas
 import type { DecisionSignalPressResult } from './decision-signal-press.js';
 import type { SoftStopRequestRead } from '../harness/control-inbox.js';
 
+test('observes the rebind result returned by the production openPr caller', async () => {
+  const originalLog = debug.log;
+  const observations: unknown[] = [];
+  (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+    if (category === 'self-implement.same-cell' && event === 'rebind-result') observations.push(data);
+  }) as typeof debug.log;
+  try {
+    await runSelfImplement({
+      feature: 'same cell rebind observation',
+      seams: seams({
+        openPr: async () => ({
+          url: 'https://pr/42', number: 42,
+          rebind: { outcome: 'deferred', reason: 'card-store-absent', cardId: 'card-7', oldPr: 7, newPr: 42 },
+        }),
+      }),
+    });
+  } finally {
+    (debug as { log: typeof debug.log }).log = originalLog;
+  }
+  expect(observations).toEqual([{ outcome: 'deferred', reason: 'card-store-absent', cardId: 'card-7', oldPr: 7, newPr: 42 }]);
+});
+
 describe('goal-only implementation rework', () => {
   test('continues only after the retry changes a declared target and reports a RESULT', async () => {
     const root = mkdtempSync(join(tmpdir(), 'goal-only-rework-success-'));
@@ -14747,7 +14769,7 @@ describe('design-gate review-only wiring', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 120_000); // 📏 10-21: 부하 아래 기본 5초에 걸려 열차를 막았다(#29963 SKIP) — 동작 무변경 · 상한만
 });
 
 // ⭐⭐⭐ JDG-S4·S5 셋째 얼굴 — **배선 회귀**(리뷰 1R should-fix). 빌더만 테스트하면

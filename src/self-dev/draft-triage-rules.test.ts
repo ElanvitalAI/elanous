@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { branchStem, decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, isAutoTitle, sameGoalPr, sameVerifiedGoal, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
+import { assessDraftTriage, branchStem, decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, isAutoTitle, sameGoalPr, sameVerifiedGoal, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
 
 it('preserves manual claim bytes and distinguishes missing timestamps from expiry', () => {
   const now = new Date('2026-09-30T00:00:00Z');
@@ -203,5 +203,127 @@ describe('sameGoalPr (TC 10-05 · identifier first, title only with harness stem
     expect(sameGoalPr(a, { number: 2, title: 'Same', branch: 'feature/x' })).toBe(false);
     expect(sameGoalPr(a, { number: 2, title: 'Same', branch: 'self-impl/y-bbbbbbbb-r2' })).toBe(false);
     expect(sameGoalPr(a, { number: 2, title: 'Other', branch: 'self-impl/x-bbbbbbbb-r2' })).toBe(false);
+  });
+});
+
+const triageNow = new Date('2026-10-21T04:00:00.000Z');
+const triageDraft: DraftTriagePr = {
+  number: 101, branch: 'work/example', labels: ['elanous:from-ux'],
+  body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12',
+  latestCommitAt: '2026-10-19T03:00:00.000Z',
+};
+
+describe('assessDraftTriage', () => {
+  it('requires repository-bound cell status before recommending close-a', () => {
+    const unbound = assessDraftTriage({ draft: triageDraft, now: triageNow,
+      runStatus: 'completed', cellStatus: 'done' });
+    expect(unbound.nextAction).toBe('human');
+    expect(unbound.checks['cell-complete'].state).toBe('unknown');
+    expect(unbound.checks['cell-status-repository-bound'].state).toBe('unknown');
+
+    const bound = assessDraftTriage({ draft: triageDraft, now: triageNow,
+      runStatus: 'completed', cellStatus: 'done', cellStatusRepository: 'owner/repo', targetRepository: 'owner/repo' });
+    expect(bound.nextAction).toBe('close-a');
+    expect(bound.checks['cell-complete'].state).toBe('yes');
+    expect(bound.checks['cell-status-repository-bound'].state).toBe('yes');
+
+    const mismatched = assessDraftTriage({ draft: triageDraft, now: triageNow,
+      runStatus: 'completed', cellStatus: 'done', cellStatusRepository: 'other/repo', targetRepository: 'owner/repo' });
+    expect(mismatched.nextAction).toBe('human');
+    expect(mismatched.checks['cell-status-repository-bound'].state).toBe('no');
+  });
+
+  it('newer same-cell same-card evidence alone does not authorize closure', () => {
+    const result = assessDraftTriage({ draft: triageDraft, now: triageNow, runStatus: 'completed',
+      cellStatus: 'yellow', newerSameCellSameCard: true });
+    expect(result.nextAction).toBe('human');
+    expect(result.checks.provenance.state).toBe('yes');
+    expect(result.checks['newer-same-card'].state).toBe('yes');
+    expect(result.checks['newer-same-card'].evidence).toContain('관측 표지이며 대체 증거가 아님');
+  });
+
+  it('treats conflicting or malformed cell markers as unknown provenance and withholds close recommendations', () => {
+    for (const body of [
+      '칸: DRAFT-TRIAGE-ANYTIME\n칸: ANOTHER-CELL\n카드: ta-20261021-abcd12',
+      '칸: DRAFT-TRIAGE-ANYTIME\n  칸: ANOTHER-CELL\n카드: ta-20261021-abcd12',
+    ]) {
+      const draftWithConflictingCells = { ...triageDraft, body, latestCommitAt: '2026-09-18T00:00:00Z' };
+      const result = assessDraftTriage({ draft: draftWithConflictingCells, now: triageNow,
+        runStatus: 'self-implement.result final', ownerConfirmed: true });
+      expect(result.nextAction).toBe('human');
+      expect(result.cellId).toBeNull();
+      expect(result.checks.provenance.state).toBe('unknown');
+    }
+  });
+
+  it('requires unique same-line card markers for provenance', () => {
+    for (const body of [
+      '칸: DRAFT-TRIAGE-ANYTIME\n카드:\nta-20261021-abcd12',
+      '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12\n  카드: ta-20261021-other34',
+    ]) {
+      const result = assessDraftTriage({ draft: { ...triageDraft, body, latestCommitAt: '2026-09-18T00:00:00Z' },
+        now: triageNow, runStatus: 'self-implement.result final', ownerConfirmed: true });
+      expect(result.nextAction).toBe('human');
+      expect(result.cardId).toBeNull();
+      expect(result.checks.provenance.state).toBe('unknown');
+    }
+  });
+
+  it('keeps gate and exact-head review as observed facts without a harvest recommendation', () => {
+    const result = assessDraftTriage({ draft: triageDraft, now: triageNow, runStatus: 'completed',
+      gate: 'pass', review: 'approved' });
+    expect(result.nextAction).toBe('human');
+    expect(result.gate).toBe('pass');
+    expect(result.review).toBe('approved');
+    expect(result.checks.gate.state).toBe('yes');
+    expect(result.checks.review.state).toBe('yes');
+  });
+
+  it('keeps replacement landing unknown when no adapter proves the PR relationship', () => {
+    const result = assessDraftTriage({ draft: triageDraft, now: triageNow, runStatus: 'completed' });
+    expect(result.nextAction).toBe('human');
+    expect(result.checks['replacement-landed'].state).toBe('unknown');
+    expect(result.checks['replacement-landed'].evidence).toContain('대체 관계를 증명하지 않음');
+  });
+
+  it('unknown provenance and owner never recommend closing; 48h close requires known owner', () => {
+    const unknown = assessDraftTriage({ draft: { ...triageDraft, body: '' }, now: triageNow, runStatus: 'completed' });
+    expect(unknown.nextAction).toBe('human');
+    const unknownHead = assessDraftTriage({ draft: { ...triageDraft, latestCommitAt: undefined }, now: triageNow,
+      runStatus: 'completed', cellStatus: 'done' });
+    expect(unknownHead.nextAction).toBe('human');
+    expect(unknownHead.checks['recent-commit'].state).toBe('unknown');
+    const idle: DraftTriagePr = { ...triageDraft, latestCommitAt: '2026-10-18T00:00:00.000Z' };
+    expect(assessDraftTriage({ draft: idle, now: triageNow, runStatus: 'completed', ownerConfirmed: false }).nextAction).toBe('human');
+    expect(assessDraftTriage({ draft: idle, now: triageNow, runStatus: 'completed', ownerConfirmed: true }).nextAction).toBe('close-c');
+  });
+
+  it('running, protected label, and post-09:30 KST commit suppress close actions', () => {
+    expect(assessDraftTriage({ draft: triageDraft, now: triageNow, runStatus: 'running', cellStatus: 'done' }).nextAction).toBe('human');
+    expect(assessDraftTriage({ draft: { ...triageDraft, labels: [...triageDraft.labels!, 'triage:active'] }, now: triageNow,
+      runStatus: 'completed', cellStatus: 'done' }).nextAction).toBe('human');
+    expect(assessDraftTriage({ draft: { ...triageDraft, latestCommitAt: '2026-10-21T00:31:00.000Z' }, now: triageNow,
+      runStatus: 'completed', cellStatus: 'done' }).nextAction).toBe('human');
+  });
+
+  it('does not recommend closure until a non-running run state is observed', () => {
+    const ready = { draft: triageDraft, now: triageNow };
+    expect(assessDraftTriage({ ...ready, runStatus: undefined }).nextAction).toBe('human');
+    expect(assessDraftTriage({ ...ready, runStatus: 'running' }).nextAction).toBe('human');
+    for (const closeSignal of [
+      { cellStatus: 'done' as const },
+      { cellStatus: 'yellow' as const, newerSameCellSameCard: true },
+      { cellStatus: 'yellow' as const, ownerConfirmed: true },
+    ]) {
+      expect(assessDraftTriage({ draft: triageDraft, now: triageNow, ...closeSignal }).nextAction).toBe('human');
+    }
+    expect(assessDraftTriage({ draft: triageDraft, now: triageNow, runStatus: 'unknown', cellStatus: 'done' }).nextAction).toBe('human');
+    expect(assessDraftTriage({ draft: triageDraft, now: triageNow, runStatus: 'unknown', cellStatus: 'done' }).checks.running.state).toBe('unknown');
+  });
+
+  it('never recommends relaunch from this triage; relaunch preflight owns that decision', () => {
+    const result = assessDraftTriage({ draft: triageDraft, now: triageNow, runStatus: 'completed', cellStatus: 'yellow' });
+    expect(result.nextAction).toBe('human');
+    expect(result.checks).not.toHaveProperty('relaunch-conditions');
   });
 });

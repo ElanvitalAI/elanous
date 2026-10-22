@@ -74,7 +74,11 @@ RESULT: 51 pass, 0 fail, 390 expect() calls; Ran 51 tests across 2 files.
 | 파일 | 무엇 | 원본(전문) |
 |---|---|---|
 | [`01-goal-authoring-checks.md`](01-goal-authoring-checks.md) | 골을 쓰기 «전»에 답하는 여섯 | [`CONCEPT-self-implement-closed-loop-map`](../CONCEPT-self-implement-closed-loop-map-2026-08-08.md) §8 |
+| [`03-verification-menu.md`](03-verification-menu.md) | 수용선의 주장에 맞춰 검증 방법을 고르는 안내 메뉴 | 해당 방법의 정본 매뉴얼 링크는 메뉴 안에 둔다 |
+| [`04-mock-scenarios.md`](04-mock-scenarios.md) | 표준 검증 무대 템플릿과 MS-01~05 재사용 예시 | initial source: `~/elanous-hq/seat-state/OP/MOCK-SCENARIO-CATALOG.md` |
 | [`refactoring.md`](../refactoring.md) | 리팩터링·seam·큰 파일 쪼개기 골은 냄새 → seam → 패턴 순서를 따르고, 이론상 깔끔함만으로 패턴을 도입하지 않는다 | [`refactoring.md`](../refactoring.md) |
+
+골의 수용선을 쓸 때는 [`03-verification-menu.md`](03-verification-menu.md)에서 주장에 맞는 검증 방법을 고른다. 이는 안내이며 골 발사를 막는 관문이 아니다.
 
 ## Cross-ref
 [[CONCEPT-self-implement-closed-loop-map-2026-08-08]](폐루프 전도 · §7a 가 이 두 계층의 근거) ·

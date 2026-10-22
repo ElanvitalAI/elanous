@@ -3,10 +3,10 @@ import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import type { GitRunResult } from '../git-fs/retry.js';
-import { linkWorktreeDependencies } from '../git-fs/worktree.js';
+import { linkWorktreeDependencies, worktreeAddTimeoutForRepo } from '../git-fs/worktree.js';
 import { reapStaleGateWorktrees } from './gate-baseline-reap.js';
 
 export type GateFailureAttribution = 'introduced' | 'preexisting' | 'unknown' | 'precondition-unmet' | 'flaky-timeout' | 'flaky-rerun';
@@ -192,7 +192,6 @@ type BaselineUnknownReason = 'module-load-error' | 'infrastructure-failure' | 't
 
 const BASELINE_TIMEOUT_PER_FILE_MS = 300_000;
 const BASELINE_TIMEOUT_TOTAL_CAP_MS = 600_000;
-const BASELINE_WORKTREE_ADD_TIMEOUT_MS = 180_000;
 
 export function baselineTimeoutForFiles(fileCount: number): number {
   return Math.min(Math.max(1, fileCount) * BASELINE_TIMEOUT_PER_FILE_MS, BASELINE_TIMEOUT_TOTAL_CAP_MS);
@@ -214,6 +213,8 @@ export interface BaselineProcessResult {
   childResponsibility?: 'none';
   output?: string;
   log: string;
+  /** Redacted, single-line tail (≤2KB) of git's stderr when the baseline `worktree add` failed; «(비었음 · signal=… · errorCode=…)» when git wrote none — so «truthy» does NOT mean git wrote stderr. */
+  gitStderrTail?: string;
   missingAtBase?: readonly string[];
   passedTestEvidence?: GatePassedTestEvidence;
 }
@@ -810,15 +811,54 @@ function cgroupMemoryBytes(name: 'memory.current' | 'memory.max'): number | null
   } catch { return null; }
 }
 
-/** A failed checkout never proves that a baseline test ran. Preserve the Git failure's signal and timeout. */
-export function classifyBaselineWorktreeAddFailure(add: GitRunResult, elapsedMs: number): BaselineProcessResult {
+export const BASELINE_GIT_STDERR_TAIL_LIMIT = 2_048;
+
+/** git's own messages only, but a token-shaped string is still masked; lines are joined so one gate.log line holds it. */
+export function baselineGitStderrTail(stderr: string): string {
+  const lines = String(stderr ?? '').replace(/\r\n?/g, '\n').split('\n').map((line) => line.trimEnd()).filter((line) => line !== '');
+  const flat = redactSecretText(lines.join(' ⏎ ')).replace(/[\u0000-\u001F\u007F]/g, '·');
+  const bytes = Buffer.from(flat, 'utf8');
+  if (bytes.length <= BASELINE_GIT_STDERR_TAIL_LIMIT) return flat;
+  // Byte cap (UTF-8): a cut inside a multi-byte character decodes to U+FFFD at the front — drop it.
+  return bytes.subarray(bytes.length - BASELINE_GIT_STDERR_TAIL_LIMIT).toString('utf8').replace(/^�+/, '');
+}
+
+export interface BaselineWorktreeAddContext {
+  dir: string;
+  baseRef: string;
+  /** Resolved commit of baseRef; absent when it could not be resolved. */
+  baseSha?: string;
+}
+
+/** A failed checkout never proves that a baseline test ran. Preserve the Git failure's signal, timeout and stderr. */
+export function classifyBaselineWorktreeAddFailure(add: GitRunResult, elapsedMs: number, timeoutMs: number, context?: BaselineWorktreeAddContext): BaselineProcessResult {
   const reason = add.errorCode === 'ETIMEDOUT' ? 'worktree-add-timeout'
     : add.signal ? `worktree-add-signal-${add.signal}` : 'worktree-add-failed';
+  const where = context ? `, target ${context.dir}, base ${context.baseRef}@${context.baseSha ? context.baseSha.slice(0, 12) : 'unresolved'}` : '';
+  // An empty stderr is a finding (git died without a word), not «nothing to say» — name the signal and errorCode instead.
+  const stderrTail = baselineGitStderrTail(add.stderr ?? '')
+    || `(비었음 · signal=${add.signal ?? 'none'} · errorCode=${add.errorCode ?? 'none'})`;
+  debug.log('self-implement.gate-baseline', 'worktree-add-failed', {
+    code: add.status, signal: add.signal ?? null, errorCode: add.errorCode ?? null, elapsedMs, timeoutMs,
+    stderrTail, ...(context ? { dir: context.dir, baseRef: context.baseRef, baseSha: context.baseSha ?? null } : {}),
+  });
   return {
     status: 'unknown', unknownReason: 'infrastructure-failure', childResponsibility: 'none',
-    log: `baseline ${reason} (code ${String(add.status)}, elapsed ${elapsedMs}ms, limit ${BASELINE_WORKTREE_ADD_TIMEOUT_MS}ms)`,
+    log: `baseline ${reason} (code ${String(add.status)}, elapsed ${elapsedMs}ms, limit ${timeoutMs}ms${where})`,
     output: `${add.stdout}\n${add.stderr}`,
+    gitStderrTail: stderrTail,
   };
+}
+
+/** Only on the failure path: one extra rev-parse (5s cap · not counted in the add's elapsedMs) so the reason names the commit. */
+function worktreeAddFailureContext(cwd: string, dir: string, baseRef: string): BaselineWorktreeAddContext {
+  try {
+    const parsed = runGitCommand(cwd, ['rev-parse', '--verify', '--quiet', `${baseRef}^{commit}`], { encoding: 'utf8', timeout: 5_000 });
+    const sha = parsed.status === 0 ? (parsed.stdout ?? '').trim() : '';
+    return { dir, baseRef, ...(/^[0-9a-f]{40,64}$/.test(sha) ? { baseSha: sha } : {}) };
+  } catch {
+    return { dir, baseRef };
+  }
 }
 
 function junitReportTemporaryDirectory(): string {
@@ -949,15 +989,16 @@ export function withBaselineWorktree<T>(cwd: string, baseRef: string, run: (base
   let attached = false;
   try {
     const started = Date.now();
-    const add = runGitCommand(cwd, gateWorktreeAddArgs(baselineDir, baseRef), { encoding: 'utf8', timeout: BASELINE_WORKTREE_ADD_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    const addTimeout = worktreeAddTimeoutForRepo(cwd, undefined, baseRef);
+    const add = runGitCommand(cwd, gateWorktreeAddArgs(baselineDir, baseRef), { encoding: 'utf8', timeout: addTimeout.ms, killSignal: 'SIGKILL' });
     const elapsedMs = Date.now() - started;
     debug.log('self-implement.gate-baseline', 'worktree-add-result', {
       phase: 'baseline',
       status: add.status, signal: add.signal ?? null, errorCode: add.errorCode ?? null,
-      elapsedMs, timeoutMs: BASELINE_WORKTREE_ADD_TIMEOUT_MS, parentRssBytes: process.memoryUsage().rss,
+      elapsedMs, timeoutMs: addTimeout.ms, trackedFileCount: addTimeout.trackedFileCount, timeoutSource: addTimeout.source, parentRssBytes: process.memoryUsage().rss,
       cgroupMemoryCurrentBytes: cgroupMemoryBytes('memory.current'), cgroupMemoryLimitBytes: cgroupMemoryBytes('memory.max'),
     });
-    if (add.status !== 0) return classifyBaselineWorktreeAddFailure(add, elapsedMs);
+    if (add.status !== 0) return classifyBaselineWorktreeAddFailure(add, elapsedMs, addTimeout.ms, worktreeAddFailureContext(cwd, baselineDir, baseRef));
     attached = true;
     linkDependencies(cwd, baselineDir);
     return run(baselineDir);
@@ -990,15 +1031,16 @@ function withVerifyWorktree<T>(cwd: string, baseRef: string, run: (dir: string) 
   try {
     dir = mkdtempSync(join(tmpdir(), 'elanous-gate-baseline-'));
     const started = Date.now();
-    const add = runGitCommand(cwd, gateWorktreeAddArgs(dir, baseRef), { encoding: 'utf8', timeout: BASELINE_WORKTREE_ADD_TIMEOUT_MS, killSignal: 'SIGKILL' });
+    const addTimeout = worktreeAddTimeoutForRepo(cwd, undefined, baseRef);
+    const add = runGitCommand(cwd, gateWorktreeAddArgs(dir, baseRef), { encoding: 'utf8', timeout: addTimeout.ms, killSignal: 'SIGKILL' });
     const elapsedMs = Date.now() - started;
     debug.log('self-implement.gate-baseline', 'worktree-add-result', {
       phase: 'verify',
       status: add.status, signal: add.signal ?? null, errorCode: add.errorCode ?? null,
-      elapsedMs, timeoutMs: BASELINE_WORKTREE_ADD_TIMEOUT_MS, parentRssBytes: process.memoryUsage().rss,
+      elapsedMs, timeoutMs: addTimeout.ms, trackedFileCount: addTimeout.trackedFileCount, timeoutSource: addTimeout.source, parentRssBytes: process.memoryUsage().rss,
       cgroupMemoryCurrentBytes: cgroupMemoryBytes('memory.current'), cgroupMemoryLimitBytes: cgroupMemoryBytes('memory.max'),
     });
-    if (add.status !== 0) return classifyBaselineWorktreeAddFailure(add, elapsedMs);
+    if (add.status !== 0) return classifyBaselineWorktreeAddFailure(add, elapsedMs, addTimeout.ms, worktreeAddFailureContext(cwd, dir, baseRef));
     attached = true;
     linkDependencies(cwd, dir);
     return run(dir);
@@ -1023,10 +1065,7 @@ export function runGateBaseline(cwd: string, failedFiles: readonly string[], bas
   const files = [...new Set(failedFiles.filter(Boolean))];
   if (files.length === 0) return { status: 'unknown', log: 'baseline skipped: failed test files could not be identified' };
   const result = withBaselineWorktree(cwd, baseRef, (baselineDir) => {
-    const missingAtBase = files.filter((f) => {
-      const probe = runGitCommand(cwd, ['cat-file', '-e', `${baseRef}:${f}`], { encoding: 'utf8', timeout: 15_000 });
-      return probe.status === 1;
-    });
+    const missingAtBase = files.filter((f) => probeBaseTestFilePresence(cwd, baseRef, f) === 'missing');
     const timeoutMs = baselineTimeoutForFiles(files.length);
     const process = runBaselineBunTest(baselineDir, files, timeoutMs);
     const baseline = classifyBaselineProcess(process, { timeoutMs, fileCount: files.length });
@@ -1461,7 +1500,7 @@ export function buildGateBaselineReport(
     worktreeFailuresParsed,
     files: [...new Set(failures.flatMap((failure) => failure.file ? [failure.file] : []))],
     baselineStatus: baseline.status,
-    log: baseline.log,
+    log: baseline.gitStderrTail ? `${baseline.log}\nbaseline worktree-add git stderr: ${baseline.gitStderrTail}` : baseline.log,
   };
 }
 

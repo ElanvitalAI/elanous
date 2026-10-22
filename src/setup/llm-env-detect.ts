@@ -77,6 +77,11 @@ export const PROVIDER_ENV_SPEC: readonly ProviderEnvSpec[] = [
     primaryKeyEnv: 'OPENROUTER_API_KEY',
     modelEnv: 'OPENROUTER_MODEL',
   },
+  {
+    provider: 'opengateway',
+    primaryKeyEnv: 'OPENGATEWAY_API_KEY',
+    modelEnv: 'OPENGATEWAY_MODEL',
+  },
 ] as const;
 
 export interface ProviderEnvDetection {

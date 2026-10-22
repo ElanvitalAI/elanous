@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
+import { randomUUID } from 'node:crypto';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
-import { FRONT_VISIT_IDLE_TTL_MS, frontVisitRunCountForTesting, observeFrontNodeEntry, resetFrontVisitCountsForTesting } from './graph-front-nodes.js';
+import { runLedgerPath } from '../self-implement/run-ledger.js';
+import { spawnRealCli } from '../testing/real-cli-spawn.js';
+import { CLI_DEV_ASK_ENTRANCE } from './entrance-registry.js';
+import { runAskLaunchFlow } from './ask-launch-flow.js';
+import { FRONT_VISIT_IDLE_TTL_MS, frontVisitRunCountForTesting, observeFrontNodeEntry, observeFrontNodeExit, observeFrontNodeUnit, resetFrontVisitCountsForTesting } from './graph-front-nodes.js';
 
 function observedFrontEntries(run: () => void): Array<{
   readonly category: string;
@@ -40,6 +48,213 @@ function observedFrontEvents(run: () => void): Array<{
     debug.log = originalLog;
   }
 }
+
+test('real --test harness ask records decompose boundaries before the goal-done launch guard', async () => {
+  const scratch = join(process.cwd(), '.elanous-test', 'scratch');
+  mkdirSync(scratch, { recursive: true });
+  const root = mkdtempSync(join(scratch, 'front-unit-cli-'));
+  const runId = `run-${randomUUID()}`;
+  const goalFile = join(root, 'GOAL-front-unit-observation-2026-10-20.txt');
+  try {
+    writeFileSync(goalFile, [
+      '- GoalId: 1111111111111111',
+      '- GoalType: implement',
+      '## WHAT TO BUILD',
+      'Observe the front-half decomposition of a goal without launching its superseded work.',
+      '## TRACED PATHS',
+      '1. src/self-dev/graph-front-nodes.ts',
+      '## ACCEPTANCE CRITERIA',
+      '- Completed: Do not launch this superseded goal.',
+    ].join('\n'));
+    const result = await spawnRealCli([
+      process.execPath, 'bin/elanous.mjs', '--test', 'harness', 'ask', goalFile, '--no-auto-merge',
+    ], { cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'development', ELANOUS_TEST_HOME: undefined,
+      ELANOUS_RUN_ID: runId, ELANOUS_TASK_CARD_ID: 'ta-front-unit-observation' }, timeoutMs: 120_000 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('[ask] ⑷ 발사 전 분해 권고');
+    expect(result.stderr).toContain('골 완료 경계 누락');
+    const lines = readFileSync(runLedgerPath(runId, join(process.cwd(), '.elanous-test', 'run-ledger')), 'utf8')
+      .trim().split('\n').filter((line) => JSON.parse(line).event === 'graph.unit');
+    expect(lines).toHaveLength(2);
+    expect(lines.map((line) => JSON.parse(line))).toEqual([
+      expect.objectContaining({ runId, event: 'graph.unit', data: expect.objectContaining({ unit: 'decompose', phase: 'enter', contractId: 'fabric-decompose-adapter' }) }),
+      expect.objectContaining({ runId, event: 'graph.unit', data: expect.objectContaining({ unit: 'decompose', phase: 'exit', contractId: 'fabric-decompose-adapter' }) }),
+    ]);
+    console.log(`REAL CLI GRAPH.UNIT RAW ${lines.join(' | ')}`);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120_000);
+
+test('isolated ask launch entrance records actual decompose boundaries in one run ledger', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'front-unit-'));
+  const previousState = process.env.ELANOUS_STATE_DIR;
+  const previousRunId = process.env.ELANOUS_RUN_ID;
+  process.env.ELANOUS_STATE_DIR = join(root, '.elanous-test');
+  const runId = 'run-11111111-2222-4333-8444-555555555555';
+  process.env.ELANOUS_RUN_ID = runId;
+  const goalFile = join(root, 'goal.md');
+  const sourceFile = join(root, 'src', 'one.ts');
+  try {
+    mkdirSync(join(root, 'src'));
+    writeFileSync(sourceFile, 'export {};');
+    writeFileSync(goalFile, '## TRACED PATHS\n- src/one.ts\n');
+    const events: string[] = [];
+    const result = await runAskLaunchFlow({
+      entrance: CLI_DEV_ASK_ENTRANCE, inputSource: 'say', askText: '대상 경로: src/one.ts\n검증',
+      liveRunWindowMinutes: 30, recentChangeWindowDays: 7, forceRequested: false,
+      decomposeBeforeLaunch: true,
+    }, {
+      cwd: () => root, print: () => undefined, log: () => undefined,
+      readLine: async () => '', isInteractive: () => false, now: () => 1_000,
+      measureToolTreeBehindDefaultBranch: () => null,
+      readFile: (path) => readFileSync(path, 'utf8'), writeFile: (path, value) => writeFileSync(path, value),
+      relativeToCwd: (path) => path.replace(`${root}/`, ''),
+      authorGoal: async () => { events.push('author'); return { path: goalFile }; },
+      decomposeGoal: async () => {
+        events.push('decompose');
+        return { decomposition: { outcome: 'single-no-subtasks', actualTaskCount: 1,
+          recommendedMaxTasks: 6, truncatedAtHardMax: false, exceededRecommendedMax: false }, goals: [] };
+      },
+      buildPreflightDeps: async () => ({
+        readGoalDocument: (path) => readFileSync(path, 'utf8'), tracedPaths: () => ['src/one.ts'],
+        askTargetPaths: () => ['src/one.ts'], listOpenPrs: () => [], listUnfinishedRuns: () => [],
+        countRecentChanges: () => ({}),
+      }),
+      priorBlockSamples: () => [], recentAuthoringSamples: () => [],
+    });
+    const lines = readFileSync(runLedgerPath(runId, join(root, '.elanous-test', 'run-ledger')), 'utf8')
+      .trim().split('\n').filter((line) => JSON.parse(line).event === 'graph.unit');
+    expect(events).toEqual(['author', 'decompose']);
+    expect(result.kind).toBe('launch');
+    expect(lines).toHaveLength(2);
+    expect(lines.map((line) => JSON.parse(line))).toEqual([
+      expect.objectContaining({ runId, event: 'graph.unit', data: expect.objectContaining({ unit: 'decompose', phase: 'enter', contractId: 'fabric-decompose-adapter' }) }),
+      expect.objectContaining({ runId, event: 'graph.unit', data: expect.objectContaining({ unit: 'decompose', phase: 'exit', contractId: 'fabric-decompose-adapter' }) }),
+    ]);
+    console.log(`GRAPH.UNIT RAW ${lines.join(' | ')}`);
+  } finally {
+    if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousState;
+    if (previousRunId === undefined) delete process.env.ELANOUS_RUN_ID;
+    else process.env.ELANOUS_RUN_ID = previousRunId;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+// ⭐ GRAPH-AUTHOR-FAIL-EDGE — 생산 흐름(runAskLaunchFlow)을 그대로 돌려 author 의 «나감»과 그 간선을 센다.
+//   ⛔ 소스 문자열을 보지 않는다 — 저작기·전제 검사만 주입하고 나머지는 실제 코드다.
+// 실제 전제 검사(우주·원장 조회 포함)를 그대로 돌리므로 부하 높은 호스트에서 수십 초가 걸린다.
+const AUTHOR_FLOW_TIMEOUT_MS = 120_000;
+async function runAuthorFlow(grounded: readonly boolean[], options: { readonly authorThrows?: Error } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'author-exit-'));
+  // 가상 골 문서(디스크에 없음) — 전제 검사의 파일 실재 축을 빼고 «대상 경로» 축만 남긴다(ask-launch-flow.test 의 /repo/goal 꼴).
+  const goalFile = join(root, 'virtual-goal.md');
+  const goalDocument = '## TRACED PATHS\n- src/one.ts\n';
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const originalLog = debug.log;
+  debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
+    if (category === 'self-implement' && (event === 'front-node-exit' || event === 'graph-edge-taken')) events.push({ event, data: data ?? {} });
+  }) as typeof debug.log;
+  let authorCalls = 0;
+  try {
+    mkdirSync(join(root, 'src'));
+    writeFileSync(join(root, 'src', 'one.ts'), 'export {};');
+    // 접지 실패 = 골에서 대상 경로를 하나도 못 뽑았다(대상 경로 0 · 다른 막힘 없음) — NOT-GROUNDED 저작의 모양.
+    const isGrounded = (): boolean => grounded[Math.max(0, authorCalls - 1)] === true;
+    const paths = (): string[] => (isGrounded() ? ['src/one.ts'] : []);
+    const outcome = await runAskLaunchFlow({
+      entrance: CLI_DEV_ASK_ENTRANCE, inputSource: 'say', askText: 'one 모듈을 고친다',
+      liveRunWindowMinutes: 30, recentChangeWindowDays: 7, forceRequested: false, decomposeBeforeLaunch: false,
+    }, {
+      cwd: () => root, print: () => undefined, log: () => undefined,
+      readLine: async () => '', isInteractive: () => false, now: () => 1_000,
+      measureToolTreeBehindDefaultBranch: () => null, measureInvokerBehindDefaultBranch: () => ({ state: 'unmeasurable', reason: 'test' }),
+      readFile: (path) => (path === goalFile ? goalDocument : readFileSync(path, 'utf8')), writeFile: () => undefined,
+      relativeToCwd: (path) => path.replace(`${root}/`, ''),
+      findPathCandidates: () => ({ tokens: [], paths: [] }),
+      authorGoal: async () => {
+        authorCalls += 1;
+        if (options.authorThrows) throw options.authorThrows;
+        return { path: goalFile };
+      },
+      decomposeGoal: async () => ({ decomposition: { outcome: 'single-no-subtasks', actualTaskCount: 1,
+        recommendedMaxTasks: 6, truncatedAtHardMax: false, exceededRecommendedMax: false }, goals: [] }),
+      buildPreflightDeps: async () => ({
+        readGoalDocument: () => goalDocument, tracedPaths: paths, askTargetPaths: paths,
+        listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+      }),
+      priorBlockSamples: () => [], recentAuthoringSamples: () => [],
+    });
+    return { outcome, events, authorCalls };
+  } finally {
+    debug.log = originalLog;
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe('observeFrontNodeExit — GRAPH-AUTHOR-FAIL-EDGE', () => {
+  test('author exit records not-grounded and the edge to re-ground', async () => {
+    const { outcome, events, authorCalls } = await runAuthorFlow([false, true]);
+    expect(authorCalls).toBe(2);
+    expect(outcome.kind).toBe('launch');
+    const exits = events.filter((row) => row.event === 'front-node-exit').map((row) => row.data);
+    expect(exits).toEqual([
+      expect.objectContaining({ graphId: 'self-implement', node: 'author', outcome: 'not-grounded', attempt: 1, to: 're-ground', taken: 're-ground', honored: true,
+        evidenceCard: [expect.objectContaining({ kind: 'no-target-paths' })] }),
+      expect.objectContaining({ node: 're-ground', outcome: 'retry', to: 'author', taken: 'author' }),
+      expect.objectContaining({ node: 'author', outcome: 're-authored', attempt: 2, to: 'plan', taken: 'plan', honored: true }),
+    ]);
+    const edges = events.filter((row) => row.event === 'graph-edge-taken').map((row) => row.data);
+    expect(edges).toEqual([
+      expect.objectContaining({ graphId: 'self-implement', from: 'author', on: 'outcome', label: 'not-grounded', to: 're-ground', taken: 're-ground', source: 'graph', honored: true }),
+      expect.objectContaining({ from: 're-ground', to: 'author', taken: 'author', source: 'graph' }),
+      expect.objectContaining({ from: 'author', label: 're-authored', to: 'plan', taken: 'plan', honored: true }),
+    ]);
+  }, AUTHOR_FLOW_TIMEOUT_MS);
+
+  test('second not-grounded ends at needs-human', async () => {
+    const { outcome, events, authorCalls } = await runAuthorFlow([false, false]);
+    // ⛔ 단언 «전»에 찍는다 — bun 의 toMatchObject 가 받은 객체 칸을 비대칭 매처로 바꿔 놓아 뒤에 찍으면 {} 가 된다.
+    console.log(`AUTHOR EXIT RAW ${events.map((row) => JSON.stringify({ event: row.event, data: row.data })).join(' | ')}`);
+    expect(authorCalls).toBe(2);
+    expect(outcome.kind).toBe('stopped-by-preflight');
+    const second = events.filter((row) => row.event === 'front-node-exit' && row.data.node === 'author').map((row) => row.data)[1];
+    expect(second).toMatchObject({ outcome: 'not-grounded', attempt: 2, to: 'needs-human', taken: 'needs-human', honored: true,
+      evidenceCard: [expect.objectContaining({ kind: 'no-target-paths', name: '(대상 경로 0)' })] });
+    expect(String(second?.reason)).toContain('re-ground-visit-budget-exhausted');
+    const last = events.filter((row) => row.event === 'graph-edge-taken').at(-1)?.data;
+    expect(last).toMatchObject({ from: 'author', label: 'not-grounded', to: 'needs-human', taken: 'needs-human', honored: true });
+  }, AUTHOR_FLOW_TIMEOUT_MS);
+
+  test('ok author takes plan and a throwing author records fail toward needs-human while rethrowing', async () => {
+    const ok = await runAuthorFlow([true]);
+    expect(ok.authorCalls).toBe(1);
+    expect(ok.events.map((row) => [row.event, row.data.node ?? row.data.from, row.data.outcome ?? row.data.label, row.data.taken]))
+      .toEqual([['graph-edge-taken', 'author', 'ok', 'plan'], ['front-node-exit', 'author', 'ok', 'plan']]);
+    const error = new Error('author exploded');
+    let caught: unknown;
+    let failed: Awaited<ReturnType<typeof runAuthorFlow>> | undefined;
+    try { failed = await runAuthorFlow([true], { authorThrows: error }); } catch (thrown) { caught = thrown; }
+    expect(failed).toBeUndefined();
+    expect(caught).toBe(error);
+  }, AUTHOR_FLOW_TIMEOUT_MS);
+
+  test('observation failure does not change the author flow', async () => {
+    const previous = debug.log;
+    debug.log = (() => { throw new Error('observer failed'); }) as typeof debug.log;
+    try {
+      expect(observeFrontNodeExit({ node: 'author', outcome: 'not-grounded' }, { attempt: 2 })).toMatchObject({ to: 'needs-human' });
+    } finally { debug.log = previous; }
+  });
+});
+
+test('unit boundary is fail-soft and preserves rejected stage result', async () => {
+  const error = new Error('stage failed');
+  const previousLog = debug.log;
+  debug.log = (() => { throw new Error('observer failed'); }) as typeof debug.log;
+  try {
+    await expect(observeFrontNodeUnit('author', 'invalid/run', 'implement', async () => { throw error; })).rejects.toBe(error);
+  } finally { debug.log = previousLog; }
+});
 
 describe('observeFrontNodeEntry', () => {
   // 모듈 수준 계수는 시험 사이에 남는다 — 매 시험 비운다(runId 가 겹쳐도 간섭하지 않게).

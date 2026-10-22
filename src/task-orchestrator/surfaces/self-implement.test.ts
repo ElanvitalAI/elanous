@@ -1,5 +1,5 @@
 import { test, expect, describe, spyOn } from 'bun:test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -27,7 +27,7 @@ async function assertDefaultSpawnBin(cwd: string, expectedBin: string, expectedB
   const shimDir = mkdtempSync(join(tmpdir(), 'self-implement-bun-shim-'));
   const capturePath = join(shimDir, 'spawn.txt');
   const bunShim = join(shimDir, 'bun');
-  writeFileSync(bunShim, '#!/bin/sh\nprintf "%s\\n%s\\n%s\\n%s\\n" "$PWD" "$1" "$4" "$(cat "$5")" > "$ELANOUS_TEST_SPAWN_CAPTURE"\n');
+  writeFileSync(bunShim, '#!/bin/sh\nprintf "%s\\n%s\\n%s\\n%s\\n" "$(pwd -P)" "$1" "$4" "$(cat "$5")" > "$ELANOUS_TEST_SPAWN_CAPTURE"\n');
   chmodSync(bunShim, 0o755);
   const launches: Array<{ bin: unknown; binSource: unknown }> = [];
   const logSpy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
@@ -76,6 +76,62 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
       terminationReason: 'goal-only-rework-exhausted', accountAvailability });
     expect(parsed?.failureClassification).toBe('implementation-deficit');
   });
+  test('self implement --json prints a real out-of-scope Git edit and its stdout reaches parent childEvidence', () => {
+    const root = mkdtempSync(join(tmpdir(), 'scope-cli-fixture-'));
+    const repo = join(root, 'repo');
+    const worktree = join(root, 'worktree');
+    const home = join(root, 'home');
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    mkdirSync(home);
+    writeFileSync(join(repo, 'src/inside.ts'), 'export const inside = 1;\n');
+    writeFileSync(join(repo, 'LICENSE'), 'original\n');
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
+    try {
+      git('init', '-q');
+      git('config', 'user.name', 'scope test');
+      git('config', 'user.email', 'scope@example.invalid');
+      git('add', '-A');
+      git('commit', '-qm', 'baseline');
+      git('worktree', 'add', '-q', '-b', 'scope-fixture', worktree);
+      const goalFile = join(root, 'goal.txt');
+      writeFileSync(goalFile, '## PROBLEM\nOriginal ask (verbatim, unmodified):\n```\n대상 경로: src/inside.ts\nImplement the change.\n```\n');
+      const orchestrator = resolve(import.meta.dir, '../../self-implement/orchestrator.ts');
+      const seamFile = resolve(import.meta.dir, '../../self-implement/test-seams.ts');
+      const preload = join(root, 'scope-preload.ts');
+      writeFileSync(preload, `import { mock } from 'bun:test';
+import { seams } from ${JSON.stringify(seamFile)};
+const original = await import(${JSON.stringify(orchestrator + '?scope-fixture-original')});
+mock.module(${JSON.stringify(orchestrator)}, () => ({ ...original, runSelfImplement: async (options) =>
+  original.runSelfImplement({ ...options, runId: 'run-scope-cli', goalFile: ${JSON.stringify(goalFile)}, memory: false,
+    writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
+    seams: seams({ createWorktree: async ({ branch, base }) => ({ path: ${JSON.stringify(worktree)}, branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
+      // A deletion is a critical scope expansion; ordinary outside edits are now accepted by default.
+      implement: async () => { require('node:fs').rmSync(${JSON.stringify(join(worktree, 'LICENSE'))}, { force: true }); return { ok: true, summary: 'impl' }; },
+      askExecutionClarification: async () => ({ choice: 'Stay in scope', by: 'owner' }),
+      gate: async () => { throw new Error('gate must not run'); },
+      openPr: async () => { throw new Error('PR must not open'); } }) }) }));
+`);
+      const entry = resolve(import.meta.dir, '../../../bin/elanous.mjs');
+      const launched = spawnSync('bun', ['--preload', preload, entry, '--test', 'self', 'implement', '--json', 'implement scoped change'], {
+        cwd: repo, encoding: 'utf8', timeout: 60_000,
+        env: { ...process.env, HOME: home, LOCAL_LLM_URL: 'http://127.0.0.1:9', ELANOUS_TEST_MODE: '1', ELANOUS_HARNESS_ENTRANCE: 'self-implement', ELANOUS_STATE_DIR: join(root, 'state') },
+      });
+      expect(launched.error).toBeUndefined();
+      expect(launched.status, `stdout: ${launched.stdout}\nstderr: ${launched.stderr}`).toBe(0);
+      expect(execFileSync('git', ['status', '--porcelain', '--', 'LICENSE'], { cwd: worktree, encoding: 'utf8' }),
+        `stdout: ${launched.stdout}\nstderr: ${launched.stderr}`).toContain('LICENSE');
+      const output = launched.stdout;
+      const terminal = JSON.parse(output.trim().split('\n').at(-1)!) as { result?: Record<string, unknown> } & Record<string, unknown>;
+      const child = terminal.result ?? terminal;
+      expect(child).toMatchObject({ stage: 'soft-stopped', outOfScopeEdits: ['LICENSE'], outsideCount: 1,
+        nameCapReached: false, worktreePath: worktree, branch: expect.any(String) });
+      expect(parseSelfImplementJson(output)).toMatchObject({ worktreePath: worktree, branch: child.branch,
+        childEvidence: { classification: 'scope-escape', scopeEscape: true, outOfScopeEdits: ['LICENSE'] } });
+      console.log(`[scope-cli] command=bun --preload ${preload} ${entry} --test self implement --json "implement scoped change" rc=${launched.status} stdout-tail=${output.trim().split('\n').at(-1)}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
   test('Pod scope escape requires held edits, and lifted facts redact tokens', () => {
     for (const row of [
       { outOfScopeEdits: { count: 0 }, detail: 'No out-of-scope edits held in the worktree.' },
@@ -113,6 +169,19 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
     const successful = parseSelfImplementJson(JSON.stringify({ stage: 'merged', ok: true,
       error: 'gh pr create succeeded', detail: 'success detail', stderr: 'warning only', exitCode: 0 }));
     expect(successful?.childEvidence).toBeUndefined();
+  });
+  test('PR open failure retains bounded cause and blocker identities in parent child evidence', () => {
+    const error = `draft PR 생성 실패(worktree·branch 보존 · ${'very-long-path-'.repeat(35)})\nself-implement PR guard 실패: same-cell; candidateCardId=ta-next; blockers=#29829:ta-first`;
+    const parsed = parseSelfImplementJson(JSON.stringify({ stage: 'error', ok: false, error }));
+    expect(parsed?.childEvidence?.prFailure).toEqual({
+      stage: 'pr-open-failed', errorTail: 'self-implement PR guard 실패: same-cell; candidateCardId=ta-next; blockers=#29829:ta-first',
+      blockingPrNumber: 29829, candidateCardId: 'ta-next', blockingCardId: 'ta-first',
+    });
+    const unknown = parseSelfImplementJson(JSON.stringify({ stage: 'error', ok: false,
+      error: 'draft PR 생성 실패\nself-implement PR guard 실패: same-cell; candidateCardId=unknown; blockers=#29829:unknown' }));
+    expect(unknown?.childEvidence?.prFailure).toMatchObject({ blockingPrNumber: 29829 });
+    expect(unknown?.childEvidence?.prFailure).not.toHaveProperty('candidateCardId');
+    expect(unknown?.childEvidence?.prFailure).not.toHaveProperty('blockingCardId');
   });
   test('exit 0 → completed', async () => {
     const spawn: SelfImplementJobSpawn = () => ({
@@ -270,9 +339,16 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
     }
   });
 
-  test('production spawn keeps this elanous repository bin', async () => {
-    const elanousRoot = resolve(import.meta.dir, '../../..');
-    await assertDefaultSpawnBin(elanousRoot, join(elanousRoot, 'bin', 'elanous.mjs'), 'cwd-repository');
+  test('production spawn keeps the current elanous repository bin', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'self-implement-bin-own-repo-'));
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: repo });
+      mkdirSync(join(repo, 'bin'));
+      writeFileSync(join(repo, 'bin', 'elanous.mjs'), '// isolated repository entrypoint\n');
+      await assertDefaultSpawnBin(repo, join(realpathSync(repo), 'bin', 'elanous.mjs'), 'cwd-repository');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 
   test('resolveSpawnElanousBin uses only regular repository entrypoints and reports missing candidates', () => {

@@ -3,10 +3,11 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import type { Checklist, ChecklistItem } from '../release-loop/checklist.js';
+import { addItem, setItem, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
 import type { ReleaseSchedule } from '../release-loop/release-schedule.js';
 import type { ContextNowAnswer } from '../context-bus/context-now.js';
 import { dispatchReleaseStatus, RELEASE_STATUS_SPEC, type ReleaseToolDeps } from './release-tool.js';
+import { buildSharedAppTools } from '../agent/shared-app-tools.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); resetElanousConfigDir(); });
@@ -132,4 +133,45 @@ test('topic=features beside an action throws one error naming both before any re
   const topicOnly = dispatchReleaseStatus({ topic: 'features' }, deps);
   expect(topicOnly.structured).toMatchObject({ total: 1, truncated: false, counts: { yellow: 1 } });
   expect(topicOnly.text).toContain('1칸');
+});
+
+test('the TUI/PWA shared app surface (buildSharedAppTools → buildCoreTools) rejects the exact S5-01 args naming both before any ledger read, and contract-correct args answer the yellow count as a number (contract check only — the model retry and the on-screen number are the live S5-01 re-measurement, open in the goal doc)', async () => {
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  const root = mkdtempSync(join(tmpdir(), 'release-s5-01-'));
+  roots.push(root);
+  process.env.ELANOUS_STATE_DIR = root;
+  setElanousConfigDir(root);
+  try {
+    const version = '0.2.25';
+    addItem(version, { id: 'UX-NL-1', title: 'UX 노랑 첫째', owner: 'UX' });
+    addItem(version, { id: 'UX-NL-2', title: 'UX 노랑 둘째', owner: 'UX' });
+    addItem(version, { id: 'OP-GREEN-1', title: 'OP 초록', owner: 'OP' });
+    setItem(version, 'UX-NL-1', { status: 'yellow' }, 'UX');
+    setItem(version, 'UX-NL-2', { status: 'yellow' }, 'UX');
+    setItem(version, 'OP-GREEN-1', { status: 'green' }, 'OP');
+    const shared = buildSharedAppTools();
+    expect(shared.names.has('release_status')).toBe(true);
+    // S5-01 (10-15): the args the TUI model actually sent for «0.2.25 UX 노랑 칸 몇 개야?».
+    let rejected: unknown;
+    try {
+      await shared.dispatch('release_status', { version: '', topic: 'features', action: 'landed', owner: '', status: '', id: '' });
+    } catch (error) {
+      rejected = error;
+    }
+    expect(rejected).toBeInstanceOf(Error);
+    const message = (rejected as Error).message;
+    expect(message).toContain('topic');
+    expect(message).toContain('action');
+    expect(message).toContain('둘 중 하나만');
+    // Contract check, not a retry observation: the corrected args here are hand-built. The model's actual
+    // retry — same-runId tool args·result plus the TUI screen's UX 노랑 number — is the required passing
+    // proof (must-fix #1) and stays an open item in the goal doc.
+    const answered = await shared.dispatch('release_status', { topic: 'features', version, owner: 'UX', status: 'yellow' }) as
+      { text: string; structured: { counts?: { yellow?: unknown } } };
+    expect(answered.text).toContain('노랑 2');
+    expect(answered.structured.counts?.yellow).toBe(2);
+  } finally {
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+  }
 });

@@ -253,6 +253,28 @@ describe('runReviewWithFallback — 계약 넷', () => {
     ]);
   });
 
+  test('provider 시도와 비어 있지 않은 논리 리뷰 완료를 분리한다', async () => {
+    const count = async (run: (observe: (event: string, data: ReviewFallbackObservation) => void) => Promise<unknown>) => {
+      const seen: string[] = [];
+      await run((event) => { seen.push(event); });
+      return {
+        attempts: seen.filter((event) => event === 'attempt').length,
+        completed: seen.filter((event) => event === 'completed').length,
+      };
+    };
+
+    await expect(count((observe) => runReviewWithFallback([A, B], async () => 'PASS', observe)))
+      .resolves.toEqual({ attempts: 1, completed: 1 });
+    await expect(count((observe) => runReviewWithFallback([A, B], async (attempt) => {
+      if (attempt === A) throw new Error('Our servers are currently overloaded.');
+      return 'PASS';
+    }, observe))).resolves.toEqual({ attempts: 2, completed: 1 });
+    await expect(count((observe) => runReviewWithFallback([A, B], async (attempt) => {
+      if (attempt === A) throw new Error('Our servers are currently overloaded.');
+      return '   ';
+    }, observe))).resolves.toEqual({ attempts: 2, completed: 0 });
+  });
+
   test('확정 뒤 실패도 실제 프로바이더를 남기며 다음 시도로 새지 않는다', async () => {
     const seen: Array<{ event: string; data: ReviewFallbackObservation }> = [];
     await expect(runReviewWithFallback([A, B], async (attempt, resolved) => {
@@ -281,7 +303,7 @@ describe('runReviewWithFallback — 계약 넷', () => {
     }, (e, d) => { seen.push({ e, label: d.label, after: d.afterReason }); });
     expect(r.used.label).toBe('grok');
     expect(r.attemptIndex).toBe(1);
-    expect(seen.map((s) => s.e)).toEqual(['attempt', 'fallback', 'attempt']);
+    expect(seen.map((s) => s.e)).toEqual(['attempt', 'fallback', 'attempt', 'completed']);
     // ⛔ 「왜 넘어갔나」가 값으로 남는다 — 나중에 세려면 이게 있어야 한다
     expect(seen[1]!.after).toBe('overloaded');
     expect(seen[2]!.after).toBe('overloaded');
@@ -327,6 +349,7 @@ describe('runReviewWithFallback — 계약 넷', () => {
       { event: 'attempt', reason: undefined, message: undefined },
       { event: 'fallback', reason: 'unknown-model-provider', message: 'review fallback: unable to infer provider for model unregistered-review-model' },
       { event: 'attempt', reason: 'unknown-model-provider', message: undefined },
+      { event: 'completed', reason: 'unknown-model-provider', message: undefined },
     ]);
   });
 

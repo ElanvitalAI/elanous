@@ -199,10 +199,21 @@ export function applyGraphOverlays(
     applied.push(overlay.overlayId);
   }
 
-  // ⑵ 계약 없는 실행 노드를 거부한다. 원본부터 계약이 없는 종결 gate 는
-  // 실행 권한을 갖지 않으므로 원본·결과 모두 recipe=none·출구 없음이고 선언이 그대로일 때만 허용한다.
+  // ⑵ 계약 없는 실행 노드를 거부한다. 기존 종결 gate 와 여정 선언은
+  // 원본 그대로일 때만 예외로 보존한다. 오버레이가 바꾼 노드에는 계약이 필요하다.
   for (const node of next.nodes) {
     const original = template.nodes.find((candidate) => candidate.nodeId === node.nodeId);
+    // 기존 무계약 여정 선언은 노드와 그 출입 간선·종결 지위가 모두 그대로일 때만 보존한다.
+    // 새 경로가 실행 권한 없는 노드를 노출하면 계약 검사를 다시 건다.
+    const touchesNode = (edge: GraphTemplateSpec['edges'][number]) => edge.from === node.nodeId
+      || edge.to === node.nodeId
+      || Object.values(edge.map ?? {}).includes(node.nodeId)
+      || (edge.fallback ?? []).some((fallback) => fallback.node === node.nodeId);
+    const untouchedJourneyDeclaration = original?.journeyStage !== undefined
+      && original.contract === undefined
+      && JSON.stringify(node) === JSON.stringify(original)
+      && JSON.stringify(next.edges.filter(touchesNode)) === JSON.stringify(template.edges.filter(touchesNode))
+      && next.terminalNodes.includes(node.nodeId) === template.terminalNodes.includes(node.nodeId);
     const existingTerminalGate = original?.kind === 'gate' && original.recipe === 'none'
       && original.contract === undefined
       && JSON.stringify(node) === JSON.stringify(original)
@@ -216,7 +227,7 @@ export function applyGraphOverlays(
       && typeof contract.tools === 'string' && contract.tools.trim() !== ''
       && Array.isArray(contract.outputs)
       && contract.outputs.every((output) => typeof output === 'string');
-    if (!existingTerminalGate && !validContract) {
+    if (!untouchedJourneyDeclaration && !existingTerminalGate && !validContract) {
       rejections.push({ kind: 'node-without-contract', overlayId: applied.join(',') || '<none>', nodeId: node.nodeId });
     }
   }

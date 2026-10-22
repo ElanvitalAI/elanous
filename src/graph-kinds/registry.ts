@@ -20,13 +20,13 @@ export interface NodeKindEntry {
   run?: NodeKindRun;
 }
 
-export const HARNESS_CORE_KINDS = ['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'subgraph', 'prompt'] as const;
+export const HARNESS_CORE_KINDS = ['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'subgraph', 'prompt', 'classify'] as const;
 
 // Workflow validation, the palette, and executor variant labels read the same keys.
 export const WORKFLOW_CORE_KINDS = ['prompt', 'bash', 'skill', 'cft', 'approval', 'if', 'switch', 'iteration', 'classify', 'extract', 'set', 'filter', 'template', 'http', 'showroom', 'task', 'scheduleTrigger', 'webhookTrigger', 'discordTrigger', 'telegramTrigger', 'manualTrigger', 'chatTrigger', 'subworkflow', 'knowledge'] as const;
 
 const descriptions: Record<GraphKind, readonly string[]> = {
-  harness: ['Run an agent', 'Check an execution gate', 'Perform git operations', 'Judge an outcome', 'Observe a result', 'Request human input', 'Run a child graph', 'Run an LLM prompt'],
+  harness: ['Run an agent', 'Check an execution gate', 'Perform git operations', 'Judge an outcome', 'Observe a result', 'Request human input', 'Run a child graph', 'Run an LLM prompt', 'Classify input'],
   workflow: ['Run an LLM prompt', 'Run a shell command', 'Invoke a skill', 'Invoke a CFT method', 'Request approval', 'Branch on a condition', 'Select a case', 'Iterate items', 'Classify input', 'Extract structured data', 'Assign variables', 'Filter items', 'Render a template', 'Make an HTTP request', 'Run a showroom', 'Create a task', 'Start on a schedule', 'Start on a webhook', 'Start on Discord', 'Start on Telegram', 'Start manually', 'Start on chat', 'Call another workflow', 'Search the vault for context'],
 };
 

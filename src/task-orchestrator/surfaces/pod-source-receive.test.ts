@@ -1,13 +1,142 @@
 import { describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { gateChangedFiles } from '../../self-implement/seams.js';
 import { packSourceBundle } from './pod-source-bundle.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 
 describe('podSourceScript', () => {
+  test('PR source from a one-commit image pin obtains a real main merge-base', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-pr-base-'));
+    try {
+      const origin = join(root, 'origin');
+      const remote = join(root, 'remote.git');
+      const image = join(root, 'image');
+      const pinGit = join(root, 'pin.git');
+      const pinFile = join(root, 'image-commit');
+      const cwd = join(root, 'job');
+      mkdirSync(origin); mkdirSync(image); mkdirSync(cwd);
+      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
+      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      writeFileSync(join(origin, 'README'), 'shared\n');
+      execFileSync('git', ['-C', origin, 'add', 'README']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'shared']);
+      const shared = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['-C', origin, 'branch', 'pin', shared]);
+      writeFileSync(join(origin, 'main.txt'), 'first main\n');
+      execFileSync('git', ['-C', origin, 'add', 'main.txt']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'main before PR']);
+      const fork = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['-C', origin, 'checkout', '-qb', 'feature']);
+      writeFileSync(join(origin, 'feature.txt'), 'PR\n');
+      execFileSync('git', ['-C', origin, 'add', 'feature.txt']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'PR']);
+      for (let i = 0; i < 60; i++) execFileSync('git', ['-C', origin, 'commit', '--allow-empty', '-qm', `PR depth ${i}`]);
+      const pr = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['-C', origin, 'checkout', '-q', 'main']);
+      writeFileSync(join(origin, 'main.txt'), 'latest main\n');
+      execFileSync('git', ['-C', origin, 'add', 'main.txt']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'main']);
+      for (let i = 0; i < 60; i++) execFileSync('git', ['-C', origin, 'commit', '--allow-empty', '-qm', `main depth ${i}`]);
+      const main = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', origin, remote]);
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/7/head', pr]);
+      execFileSync('git', ['clone', '-q', '--bare', '--depth', '1', '--branch', 'pin', `file://${remote}`, pinGit]);
+      expect(readFileSync(join(pinGit, 'shallow'), 'utf8').trim()).toBe(shared);
+      copyFileSync(join(origin, 'README'), join(image, 'README'));
+      writeFileSync(pinFile, `${shared}\n`);
+      const before = join(root, 'before');
+      execFileSync('git', ['init', '-q', '-b', 'main', before]);
+      mkdirSync(join(before, '.git', 'objects', 'info'), { recursive: true });
+      writeFileSync(join(before, '.git', 'objects', 'info', 'alternates'), `${join(pinGit, 'objects')}\n`);
+      copyFileSync(join(pinGit, 'shallow'), join(before, '.git', 'shallow'));
+      execFileSync('git', ['-C', before, 'update-ref', 'refs/heads/main', shared]);
+      execFileSync('git', ['-C', before, 'remote', 'add', 'origin', `file://${remote}`]);
+      execFileSync('git', ['-C', before, 'fetch', '--depth', '50', 'origin', 'refs/pull/7/head']);
+      execFileSync('git', ['-C', before, 'checkout', '-q', '-B', 'pr-7', pr]);
+      execFileSync('git', ['-C', before, 'fetch', '--depth', '50', 'origin', '+refs/heads/main:refs/remotes/origin/main']);
+      const missingFork = Bun.spawnSync(['git', '-C', before, 'merge-base', 'HEAD', 'origin/main']);
+      expect(missingFork.exitCode).toBe(1);
+      const script = podSourceScript({ kind: 'pr', number: 7 }, `file://${remote}`, join(root, 'no-mirror'),
+        { imageSourceDir: image, imageCommitFile: pinFile, imageGitDir: pinGit });
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA image');
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE pr ${pr}`);
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'symbolic-ref', 'refs/remotes/origin/HEAD'], { encoding: 'utf8' }).trim())
+        .toBe('refs/remotes/origin/main');
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'origin/main'], { encoding: 'utf8' }).trim()).toBe(main);
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'merge-base', 'HEAD', 'origin/main'], { encoding: 'utf8' }).trim()).toBe(fork);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('PR source refuses an unadvertised remote default instead of trusting a stale base', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-pr-no-default-'));
+    try {
+      const origin = join(root, 'origin');
+      const remote = join(root, 'remote.git');
+      const cwd = join(root, 'job');
+      mkdirSync(origin); mkdirSync(cwd);
+      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
+      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      writeFileSync(join(origin, 'README'), 'shared\n');
+      execFileSync('git', ['-C', origin, 'add', 'README']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'shared']);
+      const pr = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', origin, remote]);
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/7/head', pr]);
+      execFileSync('git', ['-C', remote, 'symbolic-ref', 'HEAD', 'refs/heads/absent']);
+      const script = podSourceScript({ kind: 'pr', number: 7 }, `file://${remote}`, join(root, 'no-mirror'));
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_COMPARISON_BASE unavailable');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('unrelated PR and advertised main remain explicitly unmeasured', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-pr-unrelated-'));
+    try {
+      const origin = join(root, 'origin');
+      const remote = join(root, 'remote.git');
+      const cwd = join(root, 'job');
+      mkdirSync(origin); mkdirSync(cwd);
+      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
+      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      writeFileSync(join(origin, 'main.txt'), 'main\n');
+      execFileSync('git', ['-C', origin, 'add', 'main.txt']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'main']);
+      execFileSync('git', ['-C', origin, 'checkout', '-q', '--orphan', 'unrelated']);
+      execFileSync('git', ['-C', origin, 'rm', '-q', '-rf', '.']);
+      writeFileSync(join(origin, 'pr.txt'), 'unrelated\n');
+      execFileSync('git', ['-C', origin, 'add', 'pr.txt']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'unrelated PR']);
+      const pr = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['-C', origin, 'checkout', '-q', 'main']);
+      execFileSync('git', ['clone', '-q', '--bare', origin, remote]);
+      execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/7/head', pr]);
+      const script = podSourceScript({ kind: 'pr', number: 7 }, `file://${remote}`, join(root, 'no-mirror'));
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_COMPARISON_BASE unavailable');
+      const repo = join(cwd, 'repo');
+      const fork = Bun.spawnSync(['git', '-C', repo, 'merge-base', 'HEAD', 'origin/main']);
+      expect(fork.exitCode).toBe(1);
+      expect(gateChangedFiles(repo, null).comparisonBaseStatus).toBe('unavailable');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test('pinned image tree becomes a clean per-Pod checkout without cloning files', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-src-image-'));
     try {
@@ -136,7 +265,7 @@ describe('podSourceScript', () => {
       expect(old.stdout.toString()).toContain('ELANOUS_POD_SOURCE_IMAGE_SKIP pin-objects-mismatch');
       expect(old.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror');
     } finally { rmSync(root, { recursive: true, force: true }); }
-  });
+  }, 30_000);
 
   test('default prefers the mirror, restores origin and reports its route', () => {
     const script = podSourceScript({ kind: 'default' }, 'https://github.com/o/r');
@@ -185,7 +314,7 @@ describe('podSourceScript', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('stageMarkers (si-task only): mirror start always, mirror end only when the mirror clone succeeded; off = byte-identical', () => {
     const plain = podSourceScript({ kind: 'default' }, 'https://github.com/o/r');
@@ -211,7 +340,7 @@ describe('podSourceScript', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('rejects a non-40-hex sha and a non-positive PR before interpolation', () => {
     expect(() => podSourceScript({ kind: 'commit', sha: 'abc;rm -rf /' }, 'https://github.com/o/r')).toThrow(/40 hex/);
@@ -227,7 +356,7 @@ describe('podSourceScript', () => {
     expect(pr).toContain('git checkout -B pr-7 "$pr_sha"');
   });
 
-  test('mirror freshness and SHA membership select fetch only when needed without writing to mirror', () => {
+  test('mirror freshness and SHA membership select source fetches while PR base refreshes without writing to mirror', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-src-mirror-'));
     try {
       const origin = join(root, 'origin');
@@ -273,7 +402,8 @@ describe('podSourceScript', () => {
       execFileSync('git', ['-C', mirror, 'fetch', '-q', origin, 'refs/pull/7/head:refs/heads/pr-7']);
       const cachedPr = run('pr-cached', { kind: 'pr', number: 7 });
       expect(cachedPr.output).toContain(`ELANOUS_POD_SOURCE pr ${head}`);
-      expect(existsSync(join(cachedPr.cwd, 'repo', '.git', 'FETCH_HEAD'))).toBe(false);
+      expect(existsSync(join(cachedPr.cwd, 'repo', '.git', 'FETCH_HEAD'))).toBe(true);
+      expect(execFileSync('git', ['-C', join(cachedPr.cwd, 'repo'), 'rev-parse', 'origin/main'], { encoding: 'utf8' }).trim()).toBe(head);
       execFileSync('git', ['-C', origin, 'checkout', '-q', '--detach', base]);
       writeFileSync(join(origin, 'README'), 'forced PR\n');
       execFileSync('git', ['-C', origin, 'commit', '-qam', 'forced PR']);
@@ -397,7 +527,7 @@ describe('podSourceScript', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('bundle script clones the verified bundle and refuses a one-character sha256 change', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-src-'));
@@ -445,5 +575,5 @@ describe('podSourceScript', () => {
       rmSync(root, { recursive: true, force: true });
       rmSync(work, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

@@ -124,7 +124,11 @@ describe('GREEN-FROM-LEDGER pure decision', () => {
     const base = { item, candidate, pr: merged, ancestor: true, hold: false, repositoryMatches: true };
     expect(decideGreenSweep({ ...base, candidateCount: 2 }).reason).toBe('multiple-piece-prs');
     expect(decideGreenSweep({ ...base, candidateCount: 1, hold: true })).toMatchObject({ verdict: 'skip', reason: 'traffic-hold' });
-    expect(decideGreenSweep({ ...base, candidateCount: 1, hold: null }).reason).toBe('hold-state-unreadable');
+    const unreadable = decideGreenSweep({ ...base, candidateCount: 1, hold: null, holdDiagnostic: 'ENOENT: /traffic.json' });
+    expect(unreadable).toMatchObject({ verdict: 'record-only', reason: 'hold-state-unreadable', holdDiagnostic: 'ENOENT: /traffic.json' });
+    const masked = decideGreenSweep({ ...base, candidateCount: 1, pr: null, hold: null, holdDiagnostic: 'ENOENT: /traffic.json' });
+    expect(masked).toMatchObject({ verdict: 'skip', reason: 'pr-unreadable' });
+    expect(masked.holdDiagnostic).toBeUndefined();
     expect(decideGreenSweep({ ...base, item: cell({ evidence: '남은 것: 운영 실물' }), candidateCount: 1 }).reason)
       .toBe('remaining-or-multiple-piece-evidence');
     expect(decideGreenSweep({ ...base, item: cell({ evidence: 'PR #123 merged · 후속 작업: 운영 확인' }), candidateCount: 1 }))

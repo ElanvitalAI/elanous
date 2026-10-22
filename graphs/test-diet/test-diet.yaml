@@ -1,5 +1,8 @@
 # TD2 — daily test review (shadow): pick a cost-weighted slice from the cursor ledger, measure each file alone on a
 # remote host, judge mechanically, append one ledger line «#a~#b» and draft a card. It never deletes or moves a test.
+# pick weighs the gate's own failure history (preexisting · knownEnv · flaky · repeated introduced) on top of cost, so
+# the files most likely to fail come first; record turns each verdict into exactly one T1~T7 prescription card draft and
+# writes the slice's preexisting ⊕ knownEnv totals (with their delta) into the same ledger line. Deletion stays human.
 # Inputs: budgetSecs (default 1800) · remote (default node-b) · mirror (default ~/mirror/elanous-agent.git)
 graph_id: test-diet
 loop:

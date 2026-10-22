@@ -3,7 +3,7 @@ import { debug } from '../debug/log.js';
 import * as llmDecomposeActual from '../harness/llm-decompose.js';
 import * as adversarialPlanActual from '../harness/adversarial-plan.js';
 import * as llmActual from '../llm.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetLiveDetailCacheForTesting, writeLiveDetail } from '../live/detail-switch.js';
@@ -27,12 +27,15 @@ let decomposeCallablePrompt: string | undefined;
 let criticPrompt: string | undefined;
 let captureStreamLlm = false;
 const streamLlmCalls: { messages: unknown[]; opts: object | undefined }[] = [];
+let useRealDecompose = false;
+const scriptedLlmReplies: string[] = [];
 let stateRoot: string;
 let originalStateDir: string | undefined;
 
 mock.module('../harness/llm-decompose.js', () => ({
   llmDecomposeSteps: async (_objective: string, callable: unknown, options?: Record<string, unknown>) => {
     decompositionOptions = options;
+    if (useRealDecompose) return llmDecomposeOriginal.llmDecomposeSteps(_objective, callable as Parameters<typeof llmDecomposeOriginal.llmDecomposeSteps>[1], options);
     if (decomposeCallablePrompt !== undefined && typeof callable === 'function') {
       await (callable as (input: { prompt: string }) => Promise<{ text: string }>)({ prompt: decomposeCallablePrompt });
     }
@@ -57,14 +60,21 @@ mock.module('../harness/adversarial-plan.js', () => ({
 mock.module('../llm.js', () => ({
   ...llmActual,
   streamLLM: async (...args: Parameters<typeof llmActual.streamLLM>) => {
+    if (scriptedLlmReplies.length) return scriptedLlmReplies.shift()!;
+    if (JSON.stringify(args[0]).includes('GOAL_AUTHOR_SLICE_SIZE')) {
+      const content = String((args[0][0] as { content?: unknown })?.content ?? '');
+      const steps = JSON.parse(content.split('STEPS_JSON: ')[1] ?? '[]') as string[];
+      return JSON.stringify({ slices: steps.map(() => ({ files: 1, actions: 1, newFiles: 0, tier: 'low' })) });
+    }
     if (!captureStreamLlm) return llmActual.streamLLM(...args);
     streamLlmCalls.push({ messages: args[0], opts: args[2] });
     return 'MOCK STREAM LLM TEXT';
   },
 }));
 
-const { classifyShadowFirstSplit, createGoalAuthorDecomposeSteps, readRecentStepCountsFailOpen, SHADOW_FIRST_SPLIT_MARKER } = await import('./goal-author-decompose.js');
-const { authorGoal } = await import('./goal-author.js');
+const { classifyShadowFirstSplit, createGoalAuthorDecomposeSteps, decomposeToTierSizedSlices,
+  readRecentStepCountsFailOpen, SHADOW_FIRST_SPLIT_MARKER } = await import('./goal-author-decompose.js');
+const { authorGoal, writeAuthoredGoal } = await import('./goal-author.js');
 const { runGoalAuthorCli } = await import('./goal-author-cli.js');
 const {
   _setCreateGoalAuthorDecomposeStepsForTesting,
@@ -87,6 +97,8 @@ beforeEach(() => {
   criticPrompt = undefined;
   captureStreamLlm = false;
   streamLlmCalls.length = 0;
+  useRealDecompose = false;
+  scriptedLlmReplies.length = 0;
   _setRecentStepCountReaderForTesting();
   _setCreateGoalAuthorDecomposeStepsForTesting();
   setUserConfigOverlay((config) => ({
@@ -210,6 +222,188 @@ describe('runGoalAuthorCli recent step count observations', () => {
   });
 });
 
+describe('TIER-SIZED-DECOMPOSE fake-LLM L2', () => {
+  const proposal = (titles: string[]) => JSON.stringify({ rationale: 'Implement each slice independently.',
+    tasks: titles.map((title, index) => ({ index, title, surface: { kind: 'llm-direct', prompt: title } })) });
+  const sizes = (slices: object[]) => JSON.stringify({ slices });
+
+  test('missing size JSON derives only from explicit paths and action clauses', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(
+      proposal(['대상 경로: src/a.ts, src/a.test.ts · 동작: 연결 · 동작: 검증']),
+      '{"slices":[{"tier":"medium"}]}',
+    );
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      expect(await decomposeToTierSizedSlices('wire a and test it')).toEqual({ ok: true, redecomposed: 0,
+        slices: [{ goal: '대상 경로: src/a.ts, src/a.test.ts · 동작: 연결 · 동작: 검증',
+          files: 2, behaviours: 2, newFiles: 0, tier: '중' }] });
+      expect(log).toHaveBeenCalledWith('goal-author.decompose', 'slice-sized', expect.objectContaining({
+        sizeSource: 'derived', retry: 0,
+      }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('restores basename target and new-file paths from the parent goal', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal([
+      '대상 경로: precedent-lookup.ts · 동작: 조회 · 신규 경로: precedent-lookup.test.ts',
+      '대상 경로: doctor-cli.ts · 동작: 배선',
+    ]), sizes([
+      { files: 2, actions: 1, newFiles: 1, tier: 'low' },
+      { files: 1, actions: 1, newFiles: 0, tier: 'low' },
+    ]));
+    const result = await decomposeToTierSizedSlices('대상 경로: src/cli/doctor-cli.ts\n신설: src/self-implement/precedent-lookup.ts · src/self-implement/precedent-lookup.test.ts');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.slices.map((slice) => slice.goal)).toEqual([
+      '대상 경로: src/self-implement/precedent-lookup.ts · 동작: 조회 · 신규 경로: src/self-implement/precedent-lookup.test.ts',
+      '대상 경로: src/cli/doctor-cli.ts · 동작: 배선',
+    ]);
+  });
+
+  test('restores every basename in a multi-path target clause', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal(['대상 경로: a.ts · b.ts · 동작: 연결']),
+      sizes([{ files: 2, actions: 1, newFiles: 0, tier: 'low' }]));
+    const result = await decomposeToTierSizedSlices('대상 경로: src/a.ts · src/b.ts');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.slices[0]?.goal).toBe('대상 경로: src/a.ts · src/b.ts · 동작: 연결');
+  });
+
+  test('keeps a root file and reads bulleted parent and slice paths', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal(['- 대상 경로: package.json · 작업: 검사\n- 신설: new.test.ts']),
+      sizes([{ files: 2, actions: 1, newFiles: 1, tier: 'low' }]));
+    const result = await decomposeToTierSizedSlices('- 대상 경로: package.json\n- 신설: src/new.test.ts');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.slices[0]?.goal).toBe('- 대상 경로: package.json · 작업: 검사\n- 신설: src/new.test.ts');
+  });
+
+  test('omits ambiguous and absent basename slices and records each unresolved path', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal([
+      '대상 경로: shared.ts · 동작: 충돌',
+      '대상 경로: missing.ts · 동작: 누락',
+      '대상 경로: src/cli/doctor-cli.ts · 동작: 배선',
+    ]), sizes(Array.from({ length: 3 }, () => ({ files: 1, actions: 1, newFiles: 0, tier: 'low' }))));
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const result = await decomposeToTierSizedSlices('대상 경로: src/a/shared.ts · src/b/shared.ts · src/cli/doctor-cli.ts');
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.slices.map((slice) => slice.goal)).toEqual(['대상 경로: src/cli/doctor-cli.ts · 동작: 배선']);
+      expect(log).toHaveBeenCalledWith('self-implement.decompose', 'slice-path-unresolved',
+        { sliceIndex: 0, path: 'shared.ts', candidates: ['src/a/shared.ts', 'src/b/shared.ts'] });
+      expect(log).toHaveBeenCalledWith('self-implement.decompose', 'slice-path-unresolved',
+        { sliceIndex: 1, path: 'missing.ts', candidates: [] });
+    } finally { log.mockRestore(); }
+  });
+
+  test('blocks the whole split when every basename path is unresolved', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal(['대상 경로: missing.ts · 동작: 누락']),
+      sizes([{ files: 1, actions: 1, newFiles: 0, tier: 'low' }]));
+    expect(await decomposeToTierSizedSlices('대상 경로: src/a.ts')).toEqual({ ok: false, reason: 'slice-path-unresolved' });
+  });
+
+  test('size JSON accepts the requested behaviours field', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal(['wire a']),
+      sizes([{ files: 2, behaviours: 1, newFiles: 1, tier: 'low', unavoidableReason: null }]));
+    expect(await decomposeToTierSizedSlices('wire a')).toEqual({ ok: true, redecomposed: 0,
+      slices: [{ goal: 'wire a', files: 2, behaviours: 1, newFiles: 1, tier: '하' }] });
+  });
+
+  test('missing metadata without explicit path and action remains blocked after one retry', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal(['implement a feature']), '{}', proposal(['still vague']), '{}');
+    expect(await decomposeToTierSizedSlices('build goal')).toEqual({ ok: false,
+      reason: 'goal-author slice sizing: size metadata missing after one retry' });
+  });
+
+  test('public hand seam returns each final goal, tier, size and retry count', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(
+      proposal(['large slice']),
+      sizes([{ files: 6, actions: 3, newFiles: 3, tier: 'high' }]),
+      proposal(['small A', 'small B']),
+      sizes([{ files: 3, actions: 2, newFiles: 1, tier: 'medium' },
+        { files: 2, actions: 1, newFiles: 0, tier: 'low' }]),
+    );
+    expect(await decomposeToTierSizedSlices('build large goal')).toEqual({ ok: true, redecomposed: 1,
+      slices: [{ goal: 'small A', files: 3, behaviours: 2, newFiles: 1, tier: '중' },
+        { goal: 'small B', files: 2, behaviours: 1, newFiles: 0, tier: '하' }] });
+  });
+
+  test('an oversized first proposal is regenerated once into medium slices with observed sizes', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(
+      proposal(['large slice']),
+      sizes([{ files: 6, actions: 3, newFiles: 3, tier: 'high' }]),
+      proposal(['small A', 'small B']),
+      sizes([{ files: 3, actions: 2, newFiles: 1, tier: 'medium' },
+        { files: 2, actions: 1, newFiles: 0, tier: 'low' }]),
+    );
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const result = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })('build large goal');
+      expect(result).toEqual(['small A', 'small B']);
+      expect(scriptedLlmReplies).toHaveLength(0);
+      expect(log).toHaveBeenCalledWith('goal-author.decompose', 'slice-sized', expect.objectContaining({
+        retry: 1, slices: [expect.objectContaining({ files: 3, actions: 2, tier: 'medium' }),
+          expect.objectContaining({ files: 2, actions: 1, tier: 'low' })],
+      }));
+      expect(log).toHaveBeenCalledWith('goal-author.decompose', 'slice-oversize', expect.objectContaining({
+        retry: 0, indexes: [0], reasons: [null], sizeSource: 'planner-estimate',
+      }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('an unavoidable high slice survives one retry only with its reason', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(
+      proposal(['inseparable integration']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high' }]),
+      proposal(['inseparable integration']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: 'shared transaction must change together' }]),
+    );
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      expect(await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })('build atomic integration'))
+        .toEqual(['inseparable integration']);
+      expect(log).toHaveBeenCalledWith('goal-author.decompose', 'slice-oversize', expect.objectContaining({
+        retry: 1, reasons: ['shared transaction must change together'],
+      }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('a high slice without an unavoidable reason fails after its single retry', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(
+      proposal(['large slice']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high' }]),
+      proposal(['still large']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: null }]),
+    );
+    await expect(createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })('build large goal'))
+      .rejects.toThrow('high slice lacks unavoidable reason after one retry');
+    expect(scriptedLlmReplies).toHaveLength(0);
+  });
+
+  test('a revised adversarial plan keeps its sizing failure instead of falling back to the original', async () => {
+    useRealDecompose = true;
+    critique = { revisedSteps: ['revised large slice'], issues: ['scope too large'] };
+    scriptedLlmReplies.push(
+      proposal(['original slice']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high' }]),
+      proposal(['still large']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: null }]),
+    );
+    await expect(createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })('build large goal'))
+      .rejects.toThrow('high slice lacks unavoidable reason after one retry');
+    expect(scriptedLlmReplies).toHaveLength(0);
+  });
+});
+
 describe('goal-author decomposition Live MAX decisions', () => {
   test.each([true, false])('three fragments with MAX %s retain the steps and emit only when on', async (enabled) => {
     decomposition = ['첫 조각', '둘째 조각', '셋째 조각'];
@@ -302,7 +496,7 @@ describe('createGoalAuthorDecomposeSteps adversarial red-team', () => {
     await createGoalAuthorDecomposeSteps()('implement a robust goal author seam', { context: 'GOAL_AUTHOR_CONTEXT' });
     expect(decompositionOptions).toEqual(expect.objectContaining({
       context: 'GOAL_AUTHOR_CONTEXT',
-      maxTasks: 6,
+      maxTasks: 15,
       promptProfile: 'goal-author-coarse',
     }));
   });
@@ -564,7 +758,7 @@ describe('createGoalAuthorDecomposeSteps adversarial red-team', () => {
     const log = spyOn(debug, 'log').mockImplementation(() => undefined);
     try {
       await createGoalAuthorDecomposeSteps()('implement a robust goal author seam');
-      expect(log.mock.calls).toEqual([[
+      expect(log.mock.calls.filter(([category]) => category === 'goal-author')).toEqual([[
         'goal-author',
         'adversarial-review',
         {
@@ -694,7 +888,7 @@ afterAll(() => {
 });
 
 // ⭐ AUTHOR-SHADOW-FIRST-SPLIT ① — #27040 이 «분류기를 부르는 시험 0» 으로 수렴 실패했다.
-//    발동은 명시 표지 «분할: 그림자 먼저» 한 줄뿐이다(OP 결정 10-15 — 자연어 감지 발동은 후속 개선).
+//    발동은 명시 표지 «분할: 그림자 먼저» 한 줄 ⊕ 자연어 요청(0.2.35 must-fix ① — 그림자 우선 어휘 ⊕ 분할 지시 어휘쌍)이다.
 //    여기 시험은 분류기 단독이 아니라 «실제 호출 경로»(runGoalAuthorCli → 기본 분해 seam → authorGoal 의 ## STEPS)를
 //    통과해, 분기를 지우면 실패한다(표지 골에서 LLM 분해 mock 의 originalSteps 가 대신 나온다).
 const MARKED_ASK = '대상 경로: src/task-agent/live-moves.ts\nTA 가 리뷰 통과 뒤 스스로 착지한다.\n분할: 그림자 먼저\n판정: 운영 원장에 TA 자가 착지가 실제로 1건 이상 일어난다.';
@@ -723,6 +917,22 @@ const NEAR_MISS_MARKER_ASKS = [
   '  분할: 그림자 먼저',
   '분할: 그림자 먼저  ',
 ];
+// 리뷰 r4~r6 자연어 반례의 짝 — 표지 없이 실제로 분할을 요청하는 문면(+)과 부정·거절·콜론형 문면(−)을 나란히 고정한다.
+const NL_TRIGGER_ASKS = [
+  '그림자 먼저 두 조각으로 분할해',
+  '이 골은 그림자 먼저 분할해서 착지시킨다',
+  'shadow first 로 나눠',
+  'shadow-first split 두 조각으로 나누어',
+  '이 골을 그림자 먼저 쪼개',
+];
+const NL_NON_TRIGGER_ASKS = [
+  '그림자 먼저 분할해선 안 된다',
+  '그림자 먼저로 나눠서는 안 된다',
+  '그림자 먼저 쪼개는 것을 금지한다',
+  '그림자 먼저 쪼개지 말라',
+  '그림자 먼저로 쪼개지 않는다',
+  '분할: 그림자 먼저로 나눠',
+];
 
 function shadowFirstSplitLogs(log: { mock: { calls: unknown[][] } }): unknown[][] {
   return log.mock.calls.filter(([category, event]) => category === 'goal-author' && event === 'shadow-first-split');
@@ -736,6 +946,7 @@ describe('AUTHOR-SHADOW-FIRST-SPLIT ① explicit-marker classifier', () => {
     expect(verdict.pieces[0].dependsOn).toEqual([]);
     expect(verdict.pieces[1].dependsOn).toEqual(['shadow']);
     expect(verdict.pieces.reduce((edges, piece) => edges + piece.dependsOn.length, 0)).toBe(1);
+    expect(verdict.trigger).toBe('explicit-marker');
     expect(verdict.pieces[0].step).toContain('«기록만»');
     expect(verdict.pieces[1].step).toContain('선행 = ①');
   });
@@ -756,6 +967,43 @@ describe('AUTHOR-SHADOW-FIRST-SPLIT ① explicit-marker classifier', () => {
 
   test.each(NEAR_MISS_MARKER_ASKS)('a near-miss of the exact marker form does not trigger: %s', (ask) => {
     expect(classifyShadowFirstSplit(ask)).toEqual({ kind: 'single-piece' });
+  });
+});
+
+describe('AUTHOR-SHADOW-FIRST-SPLIT ① natural-language trigger (0.2.35 must-fix ①)', () => {
+  test.each(NL_TRIGGER_ASKS)('a natural-language split request triggers without the marker line: %s', (ask) => {
+    const verdict = classifyShadowFirstSplit(ask);
+    if (verdict.kind !== 'shadow-first-split') throw new Error(`expected split, got ${verdict.kind}`);
+    expect(verdict.trigger).toBe('natural-language');
+    expect(verdict.pieces.map((piece) => piece.id)).toEqual(['shadow', 'live']);
+    expect(verdict.pieces[1].dependsOn).toEqual(['shadow']);
+  });
+
+  test.each(NL_NON_TRIGGER_ASKS)('negated · refused · colon-form lines stay single-piece: %s', (ask) => {
+    expect(classifyShadowFirstSplit(ask)).toEqual({ kind: 'single-piece' });
+  });
+
+  test('the r1~r6 counterexamples keep their trigger-free single-piece verdicts', () => {
+    for (const ask of UNMARKED_ASKS) {
+      expect(classifyShadowFirstSplit(ask)).toEqual({ kind: 'single-piece' });
+    }
+  });
+
+  test('the seam logs trigger natural-language and the NL rationale on the same call path', async () => {
+    captureStreamLlm = true;
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })(NL_TRIGGER_ASKS[0]!, { runId: 'run-nl' });
+      expect(steps).toHaveLength(2);
+      expect(steps[0]).toStartWith('① 그림자');
+      expect(steps[1]).toStartWith('② live 스위치');
+      expect(decompositionOptions).toBeUndefined();
+      expect(critiqueCalls).toBe(0);
+      expect(streamLlmCalls).toHaveLength(0);
+      expect(shadowFirstSplitLogs(log)).toEqual([[
+        'goal-author', 'shadow-first-split', expect.objectContaining({ verdict: 'shadow-first-split', trigger: 'natural-language', pieces: ['shadow', 'live'], edges: 1, runId: 'run-nl' }),
+      ]]);
+    } finally { log.mockRestore(); }
   });
 });
 
@@ -793,7 +1041,7 @@ describe('AUTHOR-SHADOW-FIRST-SPLIT ① decomposition seam', () => {
   });
 });
 
-// ⚠️ 범위: CLI 기본 seam → authorGoal 의 저작 문서(## STEPS)까지다. 파일 쓰기(write)는 stub — 디스크 출력은 이 시험이 증명하지 않는다.
+// ⚠️ 범위: CLI 기본 seam → authorGoal 의 저작 문서(## STEPS)까지다. 파일 쓰기(write)는 stub — 디스크 출력은 아래 «disk proof» 블록이 맡는다.
 describe('AUTHOR-SHADOW-FIRST-SPLIT ① production call path (runGoalAuthorCli → default seam → authorGoal ## STEPS · write stubbed)', () => {
   const authorFacts = {
     grounded: true, context: '', files: ['src/example.ts'],
@@ -836,6 +1084,18 @@ describe('AUTHOR-SHADOW-FIRST-SPLIT ① production call path (runGoalAuthorCli �
     expect(decompositionOptions).toBeUndefined();
   });
 
+  test('a natural-language ask (no marker line) is authored with shadow then live steps through the same CLI path', async () => {
+    const documents: string[] = [];
+    await runGoalAuthorCli([NL_TRIGGER_ASKS[0]!], { cwd: process.cwd(), disableAdversarialReview: true }, {
+      recentStepCountReader: () => [], write: authorThroughGoalAuthor(documents),
+    });
+    const steps = stepsSection(documents[0]!);
+    expect(steps).toHaveLength(2);
+    expect(steps[0]).toStartWith('① 그림자');
+    expect(steps[1]).toStartWith('② live 스위치 — 선행 = ①');
+    expect(decompositionOptions).toBeUndefined();
+  });
+
   test.each(UNMARKED_ASKS)('an unmarked ask is authored with the unchanged LLM decomposition (one piece stays one piece): %s', async (ask) => {
     decomposition = ['한 조각'];
     const documents: string[] = [];
@@ -852,5 +1112,68 @@ describe('AUTHOR-SHADOW-FIRST-SPLIT ① production call path (runGoalAuthorCli �
       recentStepCountReader: () => [], write: authorThroughGoalAuthor(documents),
     });
     expect(stepsSection(documents[0]!)).toEqual(originalSteps);
+  });
+});
+
+// ⭐ 디스크 실증: write stub 를 걷어낸다 — CLI 기본 writeFile 이 실물 writeAuthoredGoal 이 만든 경로에 실제 파일을 남기고,
+// 그 파일을 다시 읽어 ## STEPS 두 줄을 확인한다. 임시 cwd 안에서만 쓰므로 저장소 docs/goals 는 건드리지 않는다.
+describe('AUTHOR-SHADOW-FIRST-SPLIT ① disk proof (runGoalAuthorCli → default seam → writeAuthoredGoal → file on disk)', () => {
+  const authorFacts = {
+    grounded: true, context: '', files: ['src/example.ts'],
+    persistentEvidence: ['src/example.ts:42 — authorGoal receives this Read-verified call path.'],
+    codeFacts: ['[code:src/example.ts] exampleExport'], skillFacts: [], memoryFacts: [],
+    documentFacts: ['docs/example.md'], refFacts: [], ptyFacts: [],
+  };
+  let writtenPaths: string[] = [];
+  const writeThroughRealWriter = (cwd: string): NonNullable<Parameters<typeof runGoalAuthorCli>[2]>['write'] => async (ask, _cwd, deps) => {
+    const result = await writeAuthoredGoal(ask, cwd, {
+      ...deps,
+      ground: async () => authorFacts,
+      enhance: async (raw) => ({ original: raw, checklist: ['embed the exact ask in the authored document'], verbatimPreserved: true }),
+      slugFn: async () => 'shadow-first-split',
+    });
+    writtenPaths.push(result.path);
+    return result;
+  };
+
+  test('the marked ask leaves two ordered steps in a real goal file on disk', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'goal-author-shadow-disk-'));
+    writtenPaths = [];
+    try {
+      mkdirSync(join(cwd, 'docs', 'goals'), { recursive: true });
+      await runGoalAuthorCli([MARKED_ASK], { cwd, disableAdversarialReview: true }, {
+        recentStepCountReader: () => [], write: writeThroughRealWriter(cwd),
+      });
+      expect(writtenPaths).toHaveLength(1);
+      const onDisk = readFileSync(writtenPaths[0]!, 'utf8');
+      const lines = onDisk.split('\n');
+      const start = lines.indexOf('## STEPS');
+      expect(start).toBeGreaterThan(-1);
+      expect(lines.slice(start + 1, start + 3)).toEqual([
+        expect.stringMatching(/^- ① 그림자/),
+        expect.stringMatching(/^- ② live 스위치 — 선행 = ①/),
+      ]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('an unmarked ask writes the unchanged LLM decomposition to disk', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'goal-author-unmarked-disk-'));
+    writtenPaths = [];
+    try {
+      mkdirSync(join(cwd, 'docs', 'goals'), { recursive: true });
+      await runGoalAuthorCli([UNMARKED_ASKS[0]!], { cwd, disableAdversarialReview: true }, {
+        recentStepCountReader: () => [], write: writeThroughRealWriter(cwd),
+      });
+      expect(writtenPaths).toHaveLength(1);
+      const onDisk = readFileSync(writtenPaths[0]!, 'utf8');
+      const lines = onDisk.split('\n');
+      const start = lines.indexOf('## STEPS');
+      expect(start).toBeGreaterThan(-1);
+      expect(lines.slice(start + 1, start + 1 + originalSteps.length).map((line) => line.replace(/^- /, ''))).toEqual(originalSteps);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });

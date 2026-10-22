@@ -9,6 +9,33 @@ import { runSelfImplement } from '../self-implement/orchestrator.js';
 import { seams } from '../self-implement/test-seams.js';
 import { superviseRun } from '../self-dev/run-supervisor.js';
 import { collectRetroFacts, parseRetroSince, registerRetroCommands } from './retro-cli.js';
+import { readTaskAgentCover } from './tasks-cli.js';
+
+test('dedicated entrance denominator event does not change retro or tasks action aggregates', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'entrance-denominator-aggregate-'));
+  const now = Date.now();
+  const action: { category: string; event: string; data: Record<string, unknown> } = { category: 'task-agent', event: 'action', data: { taskId: 'ta-1', kind: 'review', result: 'done', reason: 'review pass' } };
+  const denominator: typeof action = { category: 'task-agent', event: 'entrance-denominator', data: { taskId: 'ta-1', kind: 'entrance-tick', result: 'shadow', reviewed: 3, allowed: 2, refused: 1, reasons: { 'elanous:keep': 1 } } };
+  const writeRows = (path: string, rows: typeof action[]) => {
+    const store = new LogStore(path);
+    store.insertBatch(rows.map((row) => ({ rec: { ts: new Date(now - 1000).toISOString(), ...row }, surface: 'test' })));
+    store.close();
+  };
+  try {
+    const withoutPath = join(dir, 'without.db');
+    const withPath = join(dir, 'with.db');
+    writeRows(withoutPath, [action]);
+    writeRows(withPath, [action, denominator]);
+    const facts = (path: string) => collectRetroFacts(now - 3600000, [{ name: 'fixture', dbPath: path }], dir).facts;
+    expect(facts(withPath)).toEqual(facts(withoutPath));
+
+    const cover = (rows: typeof action[]) => readTaskAgentCover({}, (query) => rows
+      .filter((row) => query.exactCategories?.includes(row.category) && query.events?.includes(row.event))
+      .map((row, id) => ({ id, ts: new Date(now - 1000).toISOString(), ts_ms: now - 1000, level: 'info', instance: 'test', surface: 'test',
+        category: row.category, event: row.event, session_id: null, trace_id: null, data: JSON.stringify(row.data) })));
+    expect(cover([action, denominator])).toEqual(cover([action]));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('retro facts reads the requested event families within the time window without changing the ledger', () => {
   const dir = mkdtempSync(join(tmpdir(), 'retro-facts-'));

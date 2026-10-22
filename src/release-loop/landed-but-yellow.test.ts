@@ -4,7 +4,8 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { evidencePlan, landedButYellow, type MergedChecklistPr } from './landed-but-yellow.js';
+import { evidencePlan, fetchMergedChecklistPrs, landedButYellow, MERGED_PR_CONCURRENCY, MERGED_PR_LIMIT, type MergedChecklistPr, type MergedPrRunner } from './landed-but-yellow.js';
+import { withFakeBins } from '../ux-sim/fake-bin.js';
 import { debug } from '../debug/log.js';
 import type { LandedButYellowDeps } from '../cli/release-cli.js';
 import * as checklist from './checklist.js';
@@ -288,5 +289,297 @@ describe('release checklist landed-but-yellow CLI', () => {
     expect(result.exitCode).toBe(1);
     expect(result.reads).toBe(1);
     expect(result.stderr).toEqual(['⛔ 병합 PR 조회(gh) 실패 rc=1: authentication required']);
+  });
+});
+
+// ── LANDED-YELLOW-FAST · 출력 불변 ⊕ 단계 속도 ────────────────────────────────────────────────
+// The pre-index matcher, verbatim (2026-10-21 · abcbbf255d). The indexed one must return the same rows.
+function referenceLandedButYellow(items: readonly ChecklistItem[], prs: readonly MergedChecklistPr[], { owner }: { owner?: string } = {}) {
+  const rows: ReturnType<typeof landedButYellow> = [];
+  for (const item of items) {
+    if (item.status !== 'yellow' && item.status !== 'red') continue;
+    if (owner !== undefined && !checklist.ownerMatches(item.owner, owner)) continue;
+    const id = item.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const word = new RegExp(`(?<![A-Za-z0-9])${id}(?![A-Za-z0-9])`);
+    const shortId = /^[A-Z]{1,2}\d{1,2}[a-z]?$/.test(item.id);
+    const titleStart = shortId
+      ? new RegExp(`^${id}(?:$|\\s+(?:수확|(?:첫|둘째|셋째)\\s*조각|fixed|new|old)(?=\\s|:|$))`)
+      : new RegExp(`^${id}(?:\\s|$)`);
+    const explicitTitle = new RegExp(`(?<![A-Za-z0-9])${id}\\s+(?:수확|(?:첫|둘째|셋째)\\s*조각)(?![A-Za-z0-9가-힣])|\\(${id}\\)`);
+    const rank = { 'cell-line': 0, 'title-strong': 1, mention: 2 } as const;
+    const matched = prs.flatMap((pr) => {
+      const cellLine = (pr.body ?? '').split('\n').some((line) => {
+        const match = /^[ \t]*칸(?:[ \t]*:[ \t]*|[ \t]+)([A-Za-z0-9_-]+(?:[ \t]*,[ \t]*[A-Za-z0-9_-]+)*)[ \t]*$/.exec(line.endsWith('\r') ? line.slice(0, -1) : line);
+        return match?.[1]?.split(',').some((candidate) => candidate.trim() === item.id) ?? false;
+      });
+      const basis = cellLine ? 'cell-line' as const
+        : titleStart.test(pr.title) || explicitTitle.test(pr.title) ? 'title-strong' as const
+          : !shortId && (word.test(pr.title) || word.test(pr.body ?? '')) ? 'mention' as const : undefined;
+      return basis ? [{ number: pr.number, title: pr.title, mergedAt: pr.mergedAt, basis }] : [];
+    }).sort((a, b) => rank[a.basis] - rank[b.basis] || b.mergedAt.localeCompare(a.mergedAt) || b.number - a.number);
+    if (!matched.length) continue;
+    const shown = matched.slice(0, 5);
+    rows.push({
+      id: item.id, owner: item.owner, status: item.status, prs: shown,
+      alreadyInEvidence: shown.map(({ number }) => new RegExp(`(?<![A-Za-z0-9_#])#${number}(?![A-Za-z0-9_])`).test(item.evidence ?? '')),
+      newer: matched.some((p) => p.mergedAt > item.updatedAt),
+    });
+  }
+  return rows.sort((a, b) => Number(b.newer) - Number(a.newer));
+}
+
+/** Deterministic corpus: short/long/dashed/underscored/dotted/non-alnum-leading ids against every match shape. */
+function corpus(prCount: number) {
+  let seed = 7;
+  const rand = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const ids = ['W3', 'W3d', 'R1', 'AB12c', 'LANDED-YELLOW-FAST', 'LANDED-YELLOW', 'MOCK_B-FLEET', 'v0.2-GATE', '_HIDDEN', 'X-1', 'CL-AUTO', 'Q9', 'TA', 'SEAMS-2'];
+  const items = ids.map((id, i) => item(id, i % 5 === 4 ? 'green' : i % 3 === 0 ? 'red' : 'yellow', { owner: i % 2 ? 'UX' : 'TC', updatedAt: `2026-10-0${1 + (i % 8)}T0${i % 10}:00:00Z`, evidence: i % 4 === 0 ? `#${100 + i} · ##${101 + i} · #${102 + i}abc` : undefined }));
+  const shapes = [
+    (id: string) => ({ title: `${id} fixed`, body: '' }),
+    (id: string) => ({ title: 'misc', body: `## 칸\n칸: ${id}\n` }),
+    (id: string) => ({ title: 'misc', body: `칸: OTHER, ${id}\r\nmore` }),
+    (id: string) => ({ title: 'misc', body: `  칸 ${id}  ` }),
+    (id: string) => ({ title: `[TC] (${id}) 착지`, body: '' }),
+    (id: string) => ({ title: `x ${id} 첫 조각`, body: '' }),
+    (id: string) => ({ title: 'misc', body: `see ${id}, also ${id}x and x${id}` }),
+    (id: string) => ({ title: `${id}수확`, body: '' }),
+    (id: string) => ({ title: `pre-${id}-post`, body: `칸: ${id}-NOT` }),
+    (id: string) => ({ title: `${id}`, body: `> 칸: ${id}` }),
+    (id: string) => ({ title: 'misc', body: `\`${id}\` mentioned` }),
+    () => ({ title: 'unrelated work', body: 'nothing to see\r\n칸: NOPE' }),
+  ];
+  const prs = Array.from({ length: prCount }, (_, i) => {
+    const shape = shapes[rand(shapes.length)]!(ids[rand(ids.length)]!);
+    return pr(100 + i, shape.title, shape.body, `2026-10-0${1 + rand(9)}T${String(rand(24)).padStart(2, '0')}:00:00Z`);
+  });
+  return { items, prs };
+}
+
+describe('LANDED-YELLOW-FAST — indexed matcher is byte-identical to the pre-index matcher', () => {
+  test('every owner filter returns the same rows in the same order (JSON bytes)', () => {
+    const { items, prs } = corpus(600);
+    for (const owner of [undefined, 'UX', 'TC']) {
+      const expected = JSON.stringify(referenceLandedButYellow(items, prs, { owner }));
+      expect(JSON.stringify(landedButYellow(items, prs, { owner }))).toBe(expected);
+    }
+    // Reusing one PR list across versions reuses its index and still answers each item set exactly.
+    const subset = items.slice(3, 9);
+    expect(JSON.stringify(landedButYellow(subset, prs))).toBe(JSON.stringify(referenceLandedButYellow(subset, prs)));
+    expect(JSON.parse(JSON.stringify(landedButYellow(items, prs))).length).toBeGreaterThan(5);
+  });
+
+  test('null bodies and duplicate PR numbers keep the reference order', () => {
+    const prs = [pr(5, 'W3 fixed'), { ...pr(5, 'W3 fixed'), body: null }, pr(6, 'LANDED-YELLOW-FAST', '칸: LANDED-YELLOW-FAST')];
+    const items = [item('W3'), item('LANDED-YELLOW-FAST')];
+    expect(JSON.stringify(landedButYellow(items, prs))).toBe(JSON.stringify(referenceLandedButYellow(items, prs)));
+  });
+
+  test('the indexed matcher reads only candidate PRs (deterministic access count), same bytes as the reference', () => {
+    const { items, prs } = corpus(3000);
+    const many = Array.from({ length: 20 }, () => items).flat().map((entry, i) => ({ ...entry, id: i < items.length ? entry.id : `${entry.id}${i % 7 ? '' : `-${i}`}` }));
+    // Count element reads: the reference reads every PR for every open item; the index reads each PR once to build, then candidates only.
+    const counted = (rows: MergedChecklistPr[]) => {
+      let reads = 0;
+      const proxy = new Proxy(rows, { get(target, key, receiver) { if (typeof key === 'string' && /^\d+$/.test(key)) reads++; return Reflect.get(target, key, receiver); } });
+      return { proxy, reads: () => reads };
+    };
+    const reference = counted([...prs]);
+    const expected = JSON.stringify(referenceLandedButYellow(many, reference.proxy));
+    const indexed = counted([...prs]);
+    const actual = JSON.stringify(landedButYellow(many, indexed.proxy));
+    expect(actual).toBe(expected);
+    const open = many.filter(({ status }) => status === 'yellow' || status === 'red').length;
+    expect(reference.reads()).toBe(open * prs.length);
+    expect(indexed.reads()).toBeLessThan(reference.reads() / 4);
+  });
+
+  test('an in-place change of the PR list (length or edge numbers) re-indexes instead of answering from a stale index', () => {
+    const prs: MergedChecklistPr[] = [pr(1, 'misc')];
+    const items = [item('LANDED-YELLOW-FAST')];
+    expect(landedButYellow(items, prs)).toEqual([]);
+    prs.push(pr(2, 'misc', '칸: LANDED-YELLOW-FAST'));
+    expect(JSON.stringify(landedButYellow(items, prs))).toBe(JSON.stringify(referenceLandedButYellow(items, prs)));
+    expect(landedButYellow(items, prs)[0]!.prs.map(({ number }) => number)).toEqual([2]);
+  });
+});
+
+/** The pre-change sequential bisection (release-cli.ts mergedChecklistPrs · abcbbf255d) — the expected set. */
+async function referenceFetch(since: string, now: Date, run: MergedPrRunner) {
+  const fetch = async (lower: string, upper?: string, limit = 400) => {
+    const r = await run('gh', ['pr', 'list', '--state', 'merged', '--search', `merged:>=${lower}${upper ? ` merged:<${upper}` : ''}`, '--limit', String(limit), '--json', 'number,title,body,mergedAt'], '.');
+    return JSON.parse(r.stdout) as MergedChecklistPr[];
+  };
+  const unique = new Map<number, MergedChecklistPr>();
+  let truncated = false;
+  const first = await fetch(since);
+  if (first.length < 400) return { prs: first, truncated };
+  const lower = Date.parse(`${since}T00:00:00Z`);
+  const upper = Math.max(lower + 1000, Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const visit = async (start: number, end: number): Promise<void> => {
+    const from = new Date(start).toISOString(), to = new Date(end).toISOString();
+    const page = await fetch(from, to);
+    if (page.length < 400) { for (const p of page) if (!unique.has(p.number)) unique.set(p.number, p); return; }
+    if (end - start <= 1000) {
+      const probe = await fetch(from, to, 401);
+      for (const p of probe.slice(0, 400)) if (!unique.has(p.number)) unique.set(p.number, p);
+      if (probe.length > 400) truncated = true;
+      return;
+    }
+    const middle = start + Math.floor((end - start) / 2000) * 1000;
+    await visit(start, middle);
+    await visit(middle, end);
+  };
+  await visit(lower, upper);
+  return { prs: [...unique.values()], truncated };
+}
+
+/** A gh that honours `merged:>=` / `merged:<` and `--limit`, newest first, after `delayMs`; records argv and peak concurrency. */
+function windowedGh(all: MergedChecklistPr[], delayMs: number) {
+  const argv: string[][] = [];
+  let active = 0, peak = 0;
+  const run: MergedPrRunner = async (_command, args) => {
+    argv.push([...args]);
+    active++; peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    active--;
+    const search = args[args.indexOf('--search') + 1]!;
+    const from = search.match(/merged:>=(\S+)/)![1]!;
+    const until = search.match(/merged:<(\S+)/)?.[1];
+    const fromMs = Date.parse(from.length === 10 ? `${from}T00:00:00Z` : from);
+    const untilMs = until ? Date.parse(until) : Infinity;
+    const rows = all.filter((row) => Date.parse(row.mergedAt) >= fromMs && Date.parse(row.mergedAt) < untilMs)
+      .sort((a, b) => b.mergedAt.localeCompare(a.mergedAt) || b.number - a.number)
+      .slice(0, Number(args[args.indexOf('--limit') + 1]));
+    return { status: 0, stdout: JSON.stringify(rows), stderr: '' };
+  };
+  return { run, argv, peak: () => peak };
+}
+
+describe('LANDED-YELLOW-FAST — merged PR fetch', () => {
+  // 21 days × ~170 merges/day ≈ the 10-21 prod shape (3,276 PRs since 10-01): the first page is full.
+  const now = new Date('2026-10-21T10:00:00Z');
+  const all = Array.from({ length: 3600 }, (_, i) => pr(10_000 + i, i % 97 === 0 ? 'LANDED-YELLOW-FAST fixed' : `work ${i}`, i % 89 === 0 ? '칸: W3' : 'body',
+    new Date(Date.parse('2026-10-01T00:00:00Z') + Math.floor(i * (20.9 * 86_400_000) / 3600)).toISOString().replace('.000Z', 'Z')));
+  const byNumber = (rows: MergedChecklistPr[]) => [...rows].sort((a, b) => a.number - b.number);
+
+  test('same PR set and truncation flag as the sequential bisection, fewer calls, bounded parallel (deterministic counts)', async () => {
+    const delay = 20;
+    const reference = windowedGh(all, delay);
+    let at = performance.now();
+    const before = await referenceFetch('2026-10-01', now, reference.run);
+    const beforeMs = performance.now() - at;
+    const current = windowedGh(all, delay);
+    at = performance.now();
+    const after = await fetchMergedChecklistPrs('2026-10-01', now, current.run, '.');
+    const afterMs = performance.now() - at;
+    expect(byNumber(after.prs)).toEqual(byNumber(before.prs));
+    expect(after.prs).toHaveLength(3600);
+    expect(after.truncated).toBe(before.truncated);
+    expect(after.calls).toBe(current.argv.length);
+    // The first call is unchanged — the small-range fast path keeps its exact argv.
+    expect(current.argv[0]).toEqual(reference.argv[0]!);
+    expect(current.argv.length).toBeLessThan(reference.argv.length);
+    expect(current.peak()).toBe(MERGED_PR_CONCURRENCY);
+    expect(reference.peak()).toBe(1);
+    expect(before.prs.length).toBeGreaterThanOrEqual(MERGED_PR_LIMIT);
+    // Generous ceilings only — the counts above are the verdict; wall time just guards a hang.
+    expect(beforeMs).toBeLessThan(60_000);
+    expect(afterMs).toBeLessThan(60_000);
+    // Rows the CLI prints from either set are byte-identical.
+    const items = [item('LANDED-YELLOW-FAST', 'yellow', { updatedAt: '2026-10-01T00:00:00Z' }), item('W3', 'red')];
+    expect(JSON.stringify(landedButYellow(items, after.prs))).toBe(JSON.stringify(referenceLandedButYellow(items, before.prs)));
+  }, 30_000);
+
+  test('an injected concurrency cap bounds the pool and returns the same set', async () => {
+    const gh = windowedGh(all, 5);
+    const capped = await fetchMergedChecklistPrs('2026-10-01', now, gh.run, '.', { concurrency: 2 });
+    expect(gh.peak()).toBe(2);
+    expect(byNumber(capped.prs)).toEqual(byNumber(all));
+    const serial = windowedGh(all, 1);
+    await fetchMergedChecklistPrs('2026-10-01', now, serial.run, '.', { concurrency: 1 });
+    expect(serial.peak()).toBe(1);
+  });
+
+  test('a full one-second window still probes 401 and flags truncation', async () => {
+    const crowded = Array.from({ length: 401 }, (_, i) => pr(i + 1, 'W3', '', '2026-10-03T02:00:00Z'));
+    const gh = windowedGh(crowded, 1);
+    const result = await fetchMergedChecklistPrs('2026-10-03', new Date('2026-10-04T04:00:00Z'), gh.run, '.');
+    expect(result.truncated).toBe(true);
+    expect(result.prs).toHaveLength(400);
+    expect(gh.argv.some((args) => args.includes('401'))).toBe(true);
+    const exact = await fetchMergedChecklistPrs('2026-10-03', new Date('2026-10-04T04:00:00Z'), windowedGh(crowded.slice(0, 400), 1).run, '.');
+    expect(exact.truncated).toBe(false);
+  });
+
+  test('one failing window rejects with the gh reason and starts no new calls after it', async () => {
+    const gh = windowedGh(all, 20);
+    let seen = 0;
+    const failing: MergedPrRunner = async (command, args, cwd) => {
+      seen++;
+      if (seen === 3) return { status: 1, stdout: '', stderr: 'API rate limit exceeded' };
+      return gh.run(command, args, cwd);
+    };
+    await expect(fetchMergedChecklistPrs('2026-10-01', now, failing, '.')).rejects.toThrow('병합 PR 조회(gh) 실패 rc=1: API rate limit exceeded');
+    expect(seen).toBeLessThanOrEqual(1 + 6 + 1);
+  });
+
+  test('CLI on a fake gh (fake-bin · 300 merged PRs · 1s per call) prints the same JSON within 15s and logs stage timings', async () => {
+    const items = [item('LANDED-YELLOW-FAST', 'yellow', { updatedAt: '2026-10-01T00:00:00Z' }), item('W3', 'red'), item('G1', 'green')];
+    const page = all.slice(0, 300);
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const debugLog = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
+    const written: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, callback?: unknown) => {
+      written.push(String(chunk));
+      if (typeof callback === 'function') callback();
+      return true;
+    }) as typeof process.stdout.write);
+    const started = performance.now();
+    try {
+      await withFakeBins({ gh: { stdout: JSON.stringify(page), sleepSeconds: 1 } }, async (bins) => {
+        const program = new Command();
+        registerReleaseCommands(program, {}, {
+          checklist: (version) => ({ version, dev: version, released: '', items, history: [] }),
+          now: () => now,
+          schedules: () => [],
+          released: () => '',
+          registerLogSink: async () => {},
+        });
+        await program.parseAsync(['release', 'checklist', 'landed-but-yellow', '--version', '0.2.12', '--json'], { from: 'user' });
+        expect(bins.calls()).toEqual([{ name: 'gh', argv: ['pr', 'list', '--state', 'merged', '--search', 'merged:>=2026-10-01', '--limit', '400', '--json', 'number,title,body,mergedAt'] }]);
+      });
+    } finally { write.mockRestore(); debugLog.mockRestore(); }
+    expect(performance.now() - started).toBeLessThan(60_000);
+    expect(process.exitCode ?? 0).toBe(0);
+    expect(written.join('')).toBe(`${JSON.stringify(referenceLandedButYellow(items, page))}\n`);
+    const stages = events.filter(({ category, event }) => category === 'release.landed-yellow' && event === 'stage').map(({ data }) => (data as { stage: string }).stage);
+    expect(stages).toEqual(['snapshots', 'merged-prs', 'match']);
+    expect(events).toContainEqual(expect.objectContaining({ category: 'release.landed-yellow', data: expect.objectContaining({ stage: 'merged-prs', n: 300, calls: 1 }) }));
+  }, 90_000);
+
+  test('gh missing from PATH: the async runner reports rc=null with the spawn error, like the sync runner did', async () => {
+    const stderr: string[] = [];
+    const error = spyOn(console, 'error').mockImplementation((line) => { stderr.push(String(line)); });
+    const debugLog = spyOn(debug, 'log').mockImplementation(() => {});
+    const previousPath = process.env.PATH;
+    const empty = mkdtempSync(join(tmpdir(), 'landed-no-gh-'));
+    process.env.PATH = empty;
+    try {
+      const program = new Command();
+      registerReleaseCommands(program, {}, {
+        checklist: (version) => ({ version, dev: version, released: '', items: [item('W3')], history: [] }),
+        now: () => now, schedules: () => [], released: () => '', registerLogSink: async () => {},
+      });
+      await program.parseAsync(['release', 'checklist', 'landed-but-yellow', '--version', '0.2.12', '--json'], { from: 'user' });
+    } finally {
+      process.env.PATH = previousPath;
+      error.mockRestore(); debugLog.mockRestore();
+      rmSync(empty, { recursive: true, force: true });
+    }
+    expect(process.exitCode).toBe(1);
+    expect(stderr).toHaveLength(1);
+    // Same error text as the old spawnSync runner (Bun: «Executable not found»; Node: ENOENT). The old runner printed
+    // `rc=undefined` here because Bun's spawnSync leaves status undefined on a spawn error; null is the documented RunResult value.
+    expect(stderr[0]).toMatch(/^⛔ 병합 PR 조회\(gh\) 실패 rc=null: Error: (?:Executable not found in \$PATH: "gh"|.*ENOENT)/);
   });
 });

@@ -1,0 +1,25 @@
+id: opengateway
+displayName: OpenGateway
+aliases: []
+modelPrefixes: [opengateway/]
+apiKeyEnv: OPENGATEWAY_API_KEY
+endpointPattern: https://apis.opengateway.ai/v1
+defaultStreaming: sse
+toolCallingFormat: native-openai
+catalogFromDiscovery: false
+capabilities:
+  sessionResume: false
+  mcp: false
+  hooks: false
+  skills: true
+  agents: false
+  toolRestrictions: true
+  structuredOutput: true
+  envInjection: false
+  costControl: false
+  effortControl: false
+  thinkingControl: false
+  fallbackModel: false
+  sandbox: false
+  multiHostFanout: false
+builtIn: true

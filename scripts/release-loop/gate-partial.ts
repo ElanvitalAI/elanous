@@ -27,7 +27,13 @@ export interface PartialPlan {
 
 /** G1: a second measurement of only the failed files on the very same release commit.
  * This is deliberately separate from PartialPlan, which compares two different commits. */
-export interface RecheckPlan extends PartialPlan { kind: 'recheck' }
+export interface RecheckPlan extends PartialPlan {
+  kind: 'recheck';
+  /** Files from shards that could not produce a measurement; completed shard results remain in priorFailures/errors. */
+  stalledFiles?: string[];
+  /** Count of complete shards whose measurements are preserved in this recheck. */
+  preservedShardCount?: number;
+}
 
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 const RELEASE_VERSION = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
@@ -92,11 +98,47 @@ function validateRecheckPlan(raw: Partial<RecheckPlan>, version: string, path: s
       typeof raw.forCommit !== 'string' || !FULL_SHA.test(raw.forCommit) || raw.priorCommit !== raw.forCommit ||
       !Array.isArray(raw.priorFailures) || !raw.priorFailures.every((id) => typeof id === 'string') ||
       !Array.isArray(raw.priorErrors) || !raw.priorErrors.every((id) => typeof id === 'string') ||
-      !Array.isArray(raw.files) || !raw.files.length || !raw.files.every((file) => typeof file === 'string')) invalid();
+      !Array.isArray(raw.files) || !raw.files.length || !raw.files.every((file) => typeof file === 'string') ||
+      (raw.preservedShardCount !== undefined && (!Number.isSafeInteger(raw.preservedShardCount) || raw.preservedShardCount < 0))) invalid();
   let expected: string[] = [];
-  try { expected = [...new Set([...raw.priorFailures!, ...raw.priorErrors!].map(testFileOfId))].sort(); }
+  try {
+    const measuredFiles = [...raw.priorFailures!, ...raw.priorErrors!].map(testFileOfId);
+    const stalledFiles = raw.stalledFiles === undefined ? [] : raw.stalledFiles;
+    if (!Array.isArray(stalledFiles) || !stalledFiles.every((file) => typeof file === 'string' && TEST_FILE.test(file) && !file.split('/').includes('..'))) invalid();
+    if (raw.stalledFiles !== undefined && stalledFiles.some((file) => measuredFiles.includes(file))) invalid();
+    expected = [...new Set(stalledFiles)].sort();
+    // Legacy plans recheck every prior failed file. Stalled plans re-run only files from incomplete shards; all
+    // completed shard outcomes, including runtime errors, are preserved for the combined verdict.
+    if (raw.stalledFiles === undefined) expected = [...new Set(measuredFiles)].sort();
+  }
   catch { invalid(); }
   if (JSON.stringify(raw.files) !== JSON.stringify(expected)) invalid();
+}
+
+/** Plan a same-commit retry after a Pod sweep reports stalled shards. Reuse completed outcomes and rerun stalled files. */
+export function planStalledShardRecheck(input: { version: string; measuredCommit: string; forCommit: string;
+  failures: readonly string[]; errors: readonly string[]; stalledFiles: readonly string[]; preservedShardCount?: number;
+  existsAtCommit: (file: string) => boolean }):
+  { ok: true; plan: RecheckPlan } | { ok: false; reason: string } {
+  if (!RELEASE_VERSION.test(input.version)) return { ok: false, reason: 'invalid release version' };
+  if (!FULL_SHA.test(input.measuredCommit) || !FULL_SHA.test(input.forCommit)) return { ok: false, reason: 'commit is not a full sha' };
+  if (input.measuredCommit !== input.forCommit) return { ok: false, reason: 'recheck requires the same commit' };
+  try { [...input.failures, ...input.errors].forEach(testFileOfId); }
+  catch (error) { return { ok: false, reason: String(error instanceof Error ? error.message : error) }; }
+  const stalledFiles = [...new Set(input.stalledFiles)].sort();
+  if (!stalledFiles.length) return { ok: false, reason: 'no stalled test files to recheck' };
+  if (stalledFiles.some((file) => !TEST_FILE.test(file) || file.split('/').includes('..'))) return { ok: false, reason: 'unsafe stalled test path' };
+  const measuredFiles = [...new Set([...input.failures, ...input.errors].map(testFileOfId))];
+  if (stalledFiles.some((file) => measuredFiles.includes(file)))
+    return { ok: false, reason: 'stalled file overlaps a completed shard result' };
+  const files = stalledFiles;
+  try {
+    const missing = files.find((file) => !input.existsAtCommit(file));
+    if (missing) return { ok: false, reason: `failed test file missing at commit: ${missing}` };
+  } catch (error) { return { ok: false, reason: `test file existence unreadable: ${String(error)}` }; }
+  return { ok: true, plan: { kind: 'recheck', version: input.version, priorCommit: input.measuredCommit,
+    forCommit: input.forCommit, files, stalledFiles, ...(input.preservedShardCount === undefined ? {} : { preservedShardCount: input.preservedShardCount }),
+    priorFailures: [...input.failures], priorErrors: [...input.errors] } };
 }
 
 export const partialPlanPath = (root: string, version: string) => join(root, 'release', version, 'gate-partial.json');
@@ -182,24 +224,32 @@ export function clearPartialPlan(root: string, version: string): void {
 }
 
 /** The plan for exactly this commit, or null. A malformed plan is an error (never silently a full or partial gate). */
-export function readPartialPlan(roots: readonly string[], version: string, commit: string): PartialPlan | null {
+export function readPartialPlanResult(roots: readonly string[], version: string, commit: string):
+  { plan: PartialPlan | null; fallbackReason: string | null } {
+  let fallbackReason: string | null = 'no-applicable-plan';
   for (const root of roots) {
     const path = partialPlanPath(root, version);
     if (!existsSync(path)) continue;
     const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<PartialPlan>;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`invalid gate partial plan: ${path}`);
     if ((raw as Partial<RecheckPlan>).kind !== undefined && (raw as Partial<RecheckPlan>).kind !== 'recheck' && raw.kind !== 'carry')
       throw new Error(`invalid gate partial plan: ${path}`);
-    // Until the gate consumer connects G1, the opt-in recheck plan is a shadow record.
-    // A legacy full gate may run, but it must never interpret a same-commit recheck as a changed-tip partial gate.
+    // Only a well-formed stalled-shard recheck for this exact release commit enters the same-commit consumer path.
     if ((raw as Partial<RecheckPlan>).kind === 'recheck') {
-      validateRecheckPlan(raw as Partial<RecheckPlan>, version, path);
+      const recheck = raw as Partial<RecheckPlan>;
+      validateRecheckPlan(recheck, version, path);
+      if (recheck.forCommit === commit && recheck.stalledFiles !== undefined)
+        return { plan: recheck, fallbackReason: null };
+      if (recheck.forCommit === commit) { fallbackReason = 'recheck-not-stalled-only'; continue; }
+      fallbackReason = 'plan-commit-mismatch';
       continue;
     }
     if (raw.version !== version || typeof raw.priorCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(raw.priorCommit)
       || typeof raw.forCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(raw.forCommit) || raw.priorCommit === raw.forCommit
       || !Array.isArray(raw.files) || (raw.files.length === 0) !== (raw.kind === 'carry')
       || !raw.files.every((file) => typeof file === 'string' && TEST_FILE.test(file) && !file.split('/').includes('..'))
-      || !Array.isArray(raw.priorFailures) || !Array.isArray(raw.priorErrors)) throw new Error(`invalid gate partial plan: ${path}`);
+      || !Array.isArray(raw.priorFailures) || !Array.isArray(raw.priorErrors))
+      throw new Error(`invalid gate partial plan: ${path}`);
     if (raw.kind === 'carry' && (raw.priorFailures.length || raw.priorErrors.length)) throw new Error(`invalid gate partial plan: ${path}`);
     // Every prior failure's file is re-run (planPartialRegate guarantees it) — a plan that would carry a failure it did
     // not re-run is malformed, not «partial».
@@ -208,10 +258,14 @@ export function readPartialPlan(roots: readonly string[], version: string, commi
     try { failureFiles = [...raw.priorFailures, ...raw.priorErrors].map((id) => testFileOfId(String(id))); }
     catch { throw new Error(`invalid gate partial plan: ${path}`); }
     if (failureFiles.some((file) => !rerun.has(file))) throw new Error(`invalid gate partial plan (prior failure not re-run): ${path}`);
-    if (raw.forCommit !== commit) continue;
-    return raw as PartialPlan;
+    if (raw.forCommit !== commit) { fallbackReason = 'plan-commit-mismatch'; continue; }
+    return { plan: raw as PartialPlan, fallbackReason: null };
   }
-  return null;
+  return { plan: null, fallbackReason };
+}
+
+export function readPartialPlan(roots: readonly string[], version: string, commit: string): PartialPlan | null {
+  return readPartialPlanResult(roots, version, commit).plan;
 }
 
 /** Cut failures after a partial re-run: prior results for files not re-run ⊕ this run's results for the re-run files. */

@@ -94,6 +94,8 @@ interface CacheEntry {
   dirty: DirtyCount | null;
   aheadBehind: AheadBehind | null;
   lastDirtyProbeAt: number;
+  /** Prevent an older asynchronous probe from replacing a synchronous refresh. */
+  dirtyVersion: number;
   watcher: GitFileWatcher;
   listeners: Set<() => void>;
 }
@@ -139,6 +141,7 @@ function ensureEntry(cwd: string): CacheEntry | null {
     dirty: null,
     aheadBehind: null,
     lastDirtyProbeAt: 0,
+    dirtyVersion: 0,
     watcher,
     listeners: new Set(),
   };
@@ -212,6 +215,8 @@ export function refreshDirty(
       lastDirtyProbeAt: entry.lastDirtyProbeAt,
     };
   }
+  // A synchronous save wins over any asynchronous probe that began before it.
+  entry.dirtyVersion += 1;
   entry.dirty = probeDirty(entry.located.root);
   entry.aheadBehind = probeAheadBehind(entry.located.root);
   entry.lastDirtyProbeAt = Date.now();
@@ -268,13 +273,19 @@ function probeDirtyAsyncFor(entry: CacheEntry, opts: { fresh: boolean }): Promis
   const running = dirtyInFlight.get(entry);
   if (running && !opts.fresh) return running;
   const root = entry.located.root;
-  const start = (): Promise<GitStatusView> => Promise.all([probeDirtyAsync(root), probeAheadBehindAsync(root)])
-    .then(([dirty, aheadBehind]) => {
-      entry.dirty = dirty;
-      entry.aheadBehind = aheadBehind;
-      entry.lastDirtyProbeAt = Date.now();
-      return viewOf(entry);
-    });
+  const start = (): Promise<GitStatusView> => {
+    const version = entry.dirtyVersion;
+    return Promise.all([probeDirtyAsync(root), probeAheadBehindAsync(root)])
+      .then(([dirty, aheadBehind]) => {
+        if (entry.dirtyVersion === version) {
+          entry.dirtyVersion += 1;
+          entry.dirty = dirty;
+          entry.aheadBehind = aheadBehind;
+          entry.lastDirtyProbeAt = Date.now();
+        }
+        return viewOf(entry);
+      });
+  };
   const probe = (running ? running.then(start, start) : start())
     .finally(() => { if (dirtyInFlight.get(entry) === probe) dirtyInFlight.delete(entry); });
   dirtyInFlight.set(entry, probe);

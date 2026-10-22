@@ -65,6 +65,45 @@ test('docs-land records MK backlog after publish even on deploy failure; status 
   expect(listSeatRequests(root, { seat: 'MK' })).toHaveLength(1);
 });
 
+test('docs-land accepts only the current run owned docs-prefetch tree', () => {
+  const root = join(tmpdir(), `release-docs-owner-${Math.random().toString(36).slice(2)}`);
+  const runId = '01234567-89ab-cdef-0123-456789abcdef';
+  const prefetchRoot = join(root, 'graph-runs', 'release-loop', `${runId}.json.contexts`, 'docs-prefetch');
+  const ownTree = join(prefetchRoot, 'tree-11111111-2222-4333-8444-555555555555');
+  const foreignTree = join(root, 'graph-runs', 'release-loop', 'another-run.json.contexts', 'docs-prefetch', 'tree-11111111-2222-4333-8444-555555555555');
+  mkdirSync(ownTree, { recursive: true });
+  mkdirSync(join(root, 'release/9.9.9'), { recursive: true });
+  mkdirSync(foreignTree, { recursive: true });
+  writeFileSync(join(prefetchRoot, 'claim'), 'worker');
+  writeFileSync(join(root, 'release/9.9.9/manifest.json'), JSON.stringify({ version: '9.9.9', in: [] }));
+  scratch.push(root);
+  process.env.ELANOUS_STATE_DIR = root;
+  setElanousConfigDir(root);
+  const context = (worktree: string) => JSON.stringify({ graphId: 'release-loop', runId,
+    input: { version: '9.9.9', previousVersion: '9.9.8' },
+    outputs: { publish: { outcome: 'ok', tag: 'v9.9.9' }, docs: { branch: 'release-docs/9.9.9', worktree } } });
+  let calls = 0;
+  const run: CommandRunner = (command, args) => {
+    calls += 1;
+    if (command === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: 'a'.repeat(40), stderr: '' };
+    if (command === 'git' && args[0] === 'worktree' && args[1] === 'remove' && args[3] === ownTree) {
+      rmSync(ownTree, { recursive: true, force: true });
+    }
+    return { status: 0, stdout: '', stderr: '' };
+  };
+
+  process.env.ELANOUS_GRAPH_CONTEXT = context(ownTree);
+  expect(runDocsLand(run, root, root)).toMatchObject({ outcome: 'ok' });
+  expect(calls).toBeGreaterThan(1);
+  expect(readFileSync(join(prefetchRoot, 'claim'), 'utf8')).toBe('worker');
+  expect(() => readFileSync(join(ownTree, 'missing'), 'utf8')).toThrow();
+
+  calls = 0;
+  process.env.ELANOUS_GRAPH_CONTEXT = context(foreignTree);
+  expect(() => runDocsLand(run, root, root)).toThrow('invalid docs worktree');
+  expect(calls).toBe(0);
+});
+
 test('deploy failure retains its original error when follow-up evidence cannot be read', () => {
   const state = join(tmpdir(), `release-docs-${Math.random().toString(36).slice(2)}`);
   const tree = join(state, 'tree');

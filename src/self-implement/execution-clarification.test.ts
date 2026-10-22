@@ -13,6 +13,8 @@ import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { DecisionCardService, type CardView } from '../decisions/decision-cards.js';
 import { readPendingQuestionAnswer, writePendingQuestion, removePendingQuestion, removePendingQuestionAnswer } from '../ask-user-question/pending-questions.js';
 import { runSelfImplement } from './orchestrator.js';
+import { buildSelfImplementDevSpec, executeSelfImplementReroute } from '../self-dev/dev-pipeline.js';
+import { parseSelfImplementJson } from '../task-orchestrator/surfaces/self-implement.js';
 import { seams } from './test-seams.js';
 import { mapStageToRunStatus } from './run-status-mapping.js';
 import type { RunLedgerEntry } from './run-ledger.js';
@@ -38,6 +40,7 @@ function scratchRepo(): string {
   writeFileSync(join(repo, 'src/inside.ts'), 'export const inside = 1;\n');
   writeFileSync(join(repo, 'LICENSE'), 'license\n');
   writeFileSync(join(repo, 'README.md'), 'readme\n');
+  writeFileSync(join(repo, '.env'), 'A=1\n');
   git('add', '-A');
   git('commit', '-q', '-m', 'base');
   return repo;
@@ -232,7 +235,7 @@ describe('askAtExecution', () => {
         runId: 'run-owner-scope', feature: 'implement scoped change', goalFile, memory: false,
         writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
         seams: seams({
-          changedFilesForGateRoute: () => ['lib/outside.ts'],
+          changedFilesForGateRoute: () => ['.rules/outside.md'],
           writeRunLedger: entry => { events.push(entry); },
           askExecutionClarification: (choice, ctx, deps) => askAtExecution(choice, ctx, {
             ...deps, createId: () => 'scope-owner-question',
@@ -279,7 +282,7 @@ describe('askAtExecution', () => {
       const result = await runSelfImplement({ runId, feature: 'implement scoped change', goalFile, memory: false,
         writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
         seams: seams({
-          changedFilesForGateRoute: () => ['lib/outside.ts'],
+          changedFilesForGateRoute: () => ['.rules/outside.md'],
           writeRunLedger: () => {},
           askExecutionClarification: (candidate, context, deps) => askAtExecution(candidate, context, {
             ...deps, createId: () => questionId,
@@ -316,14 +319,16 @@ describe('askAtExecution', () => {
       '대상 경로: src/inside.ts', 'Implement the change.', '```', '',
     ].join('\n'));
     const questions: PendingQuestion[] = [];
+    const observations: RunLedgerEntry[] = [];
     let gates = 0;
     let opened = 0;
+    const prBodies: string[] = [];
     const run = (runId: string) => runSelfImplement({
       runId, feature: 'implement scoped change', goalFile, memory: false,
       writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
       seams: seams({
         createWorktree: async ({ branch, base }) => ({ path: worktree, branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
-        writeRunLedger: () => {},
+        writeRunLedger: entry => { observations.push(entry); },
         askExecutionClarification: (choice, ctx, deps) => askAtExecution(choice, ctx, {
           ...deps, createId: () => 'real-scope-question',
           resolverDeps: {
@@ -333,31 +338,95 @@ describe('askAtExecution', () => {
           },
         }),
         gate: async () => { gates++; return { passed: true, log: 'ok' }; },
-        openPr: async () => { opened++; return { url: 'https://pr/7', number: 7 }; },
+        openPr: async ({ body }) => { opened++; prBodies.push(body); return { url: 'https://pr/7', number: 7 }; },
       }),
     });
     try {
       // In-scope edit only: default detection sees no outside file, so no question and the gate runs.
       writeFileSync(join(worktree, 'src/inside.ts'), 'export const inside = 2;\n');
-      await run('run-real-scope-inside');
+      const inScope = await run('run-real-scope-inside');
+      expect(inScope).toMatchObject({ ok: true });
+      expect(inScope).not.toHaveProperty('outOfScopeEdits');
+      expect(inScope).not.toHaveProperty('outsideCount');
+      expect(inScope).not.toHaveProperty('nameCapReached');
       expect(questions).toHaveLength(0);
       expect(gates).toBe(1);
       const gatesBefore = gates;
       const openedBefore = opened;
-      // Now an edit outside the authored targets: the same default detection must ask and hold.
+      // SCOPE-AS-DIRECTION: an unrelated edit outside the authored targets is accepted, named, and the gate runs.
       writeFileSync(join(worktree, 'LICENSE'), 'license\nreal worktree change outside the authored targets\n');
       expect(execFileSync('git', ['status', '--porcelain', '--', 'LICENSE'], { cwd: worktree, encoding: 'utf8' })).toContain('LICENSE');
+      const accepted = await run('run-real-scope-accepted');
+      expect(accepted).toMatchObject({ ok: true, scopeExpansion: { count: 1, files: [{ path: 'LICENSE', kind: 'other' }] } });
+      expect(questions).toHaveLength(0);
+      expect(gates).toBe(gatesBefore + 1);
+      const acceptedObs = observations.find(entry => entry.event === 'execution-scope-accepted');
+      expect(acceptedObs?.data).toMatchObject({ count: 1, files: [{ path: 'LICENSE', kind: 'other' }] });
+      console.log(`[scope-as-direction:real-accepted] ${JSON.stringify(acceptedObs?.data)}`);
+      expect(prBodies.at(-1)).toContain('## 범위 확장 (1)');
+      expect(prBodies.at(-1)).toContain('- `LICENSE` — other');
+      console.log(`[scope-as-direction:pr-body] ${prBodies.at(-1)!.slice(prBodies.at(-1)!.indexOf('## 범위 확장')).split('\n').slice(0, 3).join(' | ')}`);
+      execFileSync('git', ['checkout', '--', 'LICENSE'], { cwd: worktree });
+      // A protected path (.env) outside the authored targets: the same default detection must ask and hold.
+      writeFileSync(join(worktree, '.env'), 'A=2\n');
       const result = await run('run-real-scope');
-      expect(result).toMatchObject({ ok: false, stage: 'soft-stopped' });
+      const terminalJson = JSON.parse(JSON.stringify(result));
+      expect(terminalJson).toMatchObject({ ok: false, stage: 'soft-stopped', worktreePath: worktree,
+        outOfScopeEdits: ['.env'], outsideCount: 1, nameCapReached: false });
+      expect(typeof terminalJson.branch).toBe('string');
+      expect(observations).toContainEqual(expect.objectContaining({ event: 'execution-scope-held',
+        data: expect.objectContaining({ outOfScopeEdits: ['.env'], outsideCount: 1, nameCapReached: false,
+          worktreePath: worktree, branch: terminalJson.branch, disposition: 'in-scope-only', stopReasons: ['protected-path'] }) }));
+      console.log(`[scope-as-direction:real-protected] ${JSON.stringify(observations.find(entry => entry.event === 'execution-scope-held')?.data)}`);
+      expect(parseSelfImplementJson(JSON.stringify(terminalJson))).toMatchObject({
+        worktreePath: worktree, branch: terminalJson.branch,
+        childEvidence: { scopeEscape: true, outOfScopeEdits: ['.env'] },
+      });
       expect(questions).toHaveLength(1);
       expect(questions[0]).toMatchObject({ runId: 'run-real-scope', questions: [{ id: 'execution_scope', impact: 'high', recommendedIndex: 0 }] });
       expect(questions[0]!.questions[0]!.question).toContain('Run ID: run-real-scope');
-      expect(questions[0]!.questions[0]!.question).toContain('- LICENSE (declared-path sibling test: no)');
-      expect(gates).toBe(gatesBefore);
-      expect(opened).toBe(openedBefore);
+      expect(questions[0]!.questions[0]!.question).toContain('- .env (declared-path sibling test: no)');
+      expect(gates).toBe(gatesBefore + 1);
+      expect(opened).toBe(openedBefore + 1);
     } finally {
       rmSync(worktree, { recursive: true, force: true });
       rmSync(directory, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  test('production self reroute carries a held Git edit to the terminal result without mocking dispatch', async () => {
+    const repo = scratchRepo();
+    const worktree = mkdtempSync(join(tmpdir(), 'scope-reroute-worktree-'));
+    const goalFile = join(repo, 'goal.txt');
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
+    let gates = 0;
+    let opened = 0;
+    try {
+      rmSync(worktree, { recursive: true, force: true });
+      git('worktree', 'add', '-q', '-b', 'scope-reroute', worktree);
+      writeFileSync(goalFile, '## PROBLEM\nOriginal ask (verbatim, unmodified):\n```\n대상 경로: src/inside.ts\nImplement the change.\n```\n');
+      const spec = buildSelfImplementDevSpec({ feature: 'implement scoped change', draft: true, openPr: false, goalFile });
+      const answer = await executeSelfImplementReroute(spec, { pipelineDeps: {
+        cwd: repo,
+        runSelfImplement: options => runSelfImplement({ ...options, memory: false,
+          writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {} }),
+        buildSelfImplementSeams: () => seams({
+          createWorktree: async ({ branch, base }) => ({ path: worktree, branch, base, resolvedBase: git('rev-parse', 'HEAD').trim(), invokedHead: git('rev-parse', 'HEAD').trim() }),
+          implement: async () => { writeFileSync(join(worktree, '.env'), 'edited by child\n'); return { ok: true, summary: 'impl' }; },
+          askExecutionClarification: async () => ({ choice: 'Stay in scope', by: 'owner' }),
+          gate: async () => { gates++; throw new Error('gate must not run'); },
+          openPr: async () => { opened++; throw new Error('PR must not open'); },
+        }),
+      } });
+      const branch = answer.result.branch;
+      expect(typeof branch).toBe('string');
+      expect(answer.result).toMatchObject({ stage: 'soft-stopped', outOfScopeEdits: ['.env'], outsideCount: 1,
+        nameCapReached: false, worktreePath: worktree, branch });
+      expect([gates, opened]).toEqual([0, 0]);
+      console.log(`[scope-reroute] rc=${answer.exitCode} result=${JSON.stringify({ stage: answer.result.stage, outOfScopeEdits: answer.result.outOfScopeEdits, outsideCount: answer.result.outsideCount, worktreePath: answer.result.worktreePath, branch: answer.result.branch })}`);
+    } finally {
+      rmSync(worktree, { recursive: true, force: true });
+      rmSync(repo, { recursive: true, force: true });
     }
   });
 
@@ -400,7 +469,13 @@ describe('askAtExecution', () => {
       });
       expect(asked).toHaveLength(1);
       expect(asked[0]).toMatchObject({ runId: 'run-critical-scope', questions: [{ impact: 'critical', recommendedIndex: 0 }] });
-      expect(result).toMatchObject({ ok: false, stage: 'parked', detail: 'critical-unanswered: critical-scope-question' });
+      expect(result).toMatchObject({ ok: false, stage: 'parked', detail: 'critical-unanswered: critical-scope-question',
+        worktreePath: worktree, outOfScopeEdits: ['README.md'], outsideCount: 1, nameCapReached: false });
+      expect(ledger).toContainEqual(expect.objectContaining({ event: 'execution-scope-held', data: expect.objectContaining({
+        outOfScopeEdits: ['README.md'], outsideCount: 1, nameCapReached: false, worktreePath: worktree,
+        branch: result.branch, disposition: 'parked', stopReasons: ['deletion'], deleted: ['README.md'],
+      }) }));
+      console.log(`[scope-as-direction:deletion] ${JSON.stringify(ledger.find(entry => entry.event === 'execution-scope-held')?.data)}`);
       expect(ledger).toContainEqual(expect.objectContaining({ event: 'parked', data: expect.objectContaining({ questionId: 'critical-scope-question' }) }));
       expect(mapStageToRunStatus(result.stage)).toEqual({ runStatus: 'parked' });
       expect(ledger).toContainEqual(expect.objectContaining({ event: 'run-status', data: expect.objectContaining({ stage: 'parked', runStatus: 'parked' }) }));
@@ -412,7 +487,7 @@ describe('askAtExecution', () => {
     }
   });
 
-  test('the actual implement boundary asks on measured edits outside declared targets and holds gate without owner consent', async () => {
+  test('the actual implement boundary asks only on protected · over-cap edits and holds gate without owner consent', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'execution-scope-run-'));
     const goalFile = join(directory, 'goal.txt');
     writeFileSync(goalFile, [
@@ -440,18 +515,21 @@ describe('askAtExecution', () => {
           openPr: async () => { opened++; return { url: 'https://pr/7', number: 7 }; },
         }),
       });
-      const held = await run(['lib/outside.ts'], 'Stay in scope');
+      // A protected path (.rules/**) still asks and holds without consent.
+      const held = await run(['.rules/outside.md'], 'Stay in scope');
       expect(asked).toEqual(['run-execution-scope-test:high:Stay in scope']);
       expect(held).toMatchObject({ ok: false, stage: 'soft-stopped' });
+      expect(runLedger).toContainEqual(expect.objectContaining({ event: 'execution-scope-held', data: expect.objectContaining({
+        stopReasons: ['protected-path'], protectedPaths: ['.rules/outside.md'], files: [{ path: '.rules/outside.md', kind: 'other' }] }) }));
       expect(gates).toBe(0);
       expect(opened).toBe(0);
       await run(['src/inside.ts'], 'Stay in scope');
       expect(asked).toHaveLength(1);
       expect(gates).toBe(1);
-      await run(['lib/outside.ts'], 'Expand scope');
+      await run(['.rules/outside.md'], 'Expand scope');
       expect(asked).toHaveLength(2);
       expect(gates).toBe(2);
-      const parked = await run(['lib/outside.ts'], 'parked');
+      const parked = await run(['.rules/outside.md'], 'parked');
       expect(parked).toMatchObject({ ok: false, stage: 'parked', detail: 'critical-unanswered: scope-question-1' });
       expect(mapStageToRunStatus(parked.stage)).toEqual({ runStatus: 'parked' });
       expect(runLedger).toContainEqual(expect.objectContaining({ event: 'run-status', data: expect.objectContaining({ stage: 'parked', runStatus: 'parked' }) }));
@@ -460,11 +538,27 @@ describe('askAtExecution', () => {
       const adjacent = await run(['src/inside.ts', 'src/helper.ts', 'src/plugin.json'], 'Stay in scope');
       expect(asked).toHaveLength(3);
       expect(gates).toBe(3);
-      expect(adjacent).toMatchObject({ ok: true });
-      // One file elsewhere among them: the question comes back.
-      await run(['src/helper.ts', 'lib/outside.ts'], 'Stay in scope');
+      expect(adjacent).toMatchObject({ ok: true, scopeExpansion: { count: 2, files: [
+        { path: 'src/helper.ts', kind: 'neighbour' }, { path: 'src/plugin.json', kind: 'neighbour' }] } });
+      // SCOPE-AS-DIRECTION: an unrelated file elsewhere is accepted, named in the result and the ledger, and the gate runs.
+      const unrelated = await run(['src/helper.ts', 'lib/outside.ts'], 'Stay in scope');
+      expect(asked).toHaveLength(3);
+      expect(gates).toBe(4);
+      expect(unrelated).toMatchObject({ ok: true, scopeExpansion: { count: 2, files: [
+        { path: 'src/helper.ts', kind: 'neighbour' }, { path: 'lib/outside.ts', kind: 'other' }] } });
+      const accepted = runLedger.filter(entry => entry.event === 'execution-scope-accepted').at(-1);
+      expect(accepted?.data).toMatchObject({ count: 2, cap: 10, files: [
+        { path: 'src/helper.ts', kind: 'neighbour' }, { path: 'lib/outside.ts', kind: 'other' }] });
+      console.log(`[scope-as-direction:accepted] ${JSON.stringify(accepted?.data)}`);
+      // Over the cap: the question comes back and the run holds.
+      const many = Array.from({ length: 11 }, (_, i) => `lib/o${i}.ts`);
+      const overCap = await run(many, 'Stay in scope');
       expect(asked).toHaveLength(4);
-      expect(gates).toBe(3);
+      expect(gates).toBe(4);
+      expect(overCap).toMatchObject({ ok: false, stage: 'soft-stopped', outsideCount: 11 });
+      const overCapHeld = runLedger.filter(entry => entry.event === 'execution-scope-held').at(-1);
+      expect(overCapHeld?.data).toMatchObject({ stopReasons: ['over-cap'], outsideCount: 11 });
+      console.log(`[scope-as-direction:over-cap] ${JSON.stringify(overCapHeld?.data)}`);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

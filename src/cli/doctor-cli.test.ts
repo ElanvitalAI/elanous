@@ -9,7 +9,9 @@ import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorRepo
 import { checkReadiness } from './doctor-readiness.js';
 import { debug } from '../debug/log.js';
 import { applySudoFixes } from './doctor-fix.js';
-import { DOCTOR_SYMPTOMS } from '../self-implement/doctor-visit.js';
+import { DOCTOR_SYMPTOMS, doctorVisitIncidentRoot } from '../self-implement/doctor-visit.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { recordRunExit } from '../harness/harness-incidents.js';
 import type { UserConfig } from '../user-config.js';
 
 const example = [
@@ -2520,6 +2522,8 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
     registerDoctorCommand(program, {
       ...options(),
       doctorVisitLedgerDir: dir,
+      // 사고 선례 연결을 결정론적으로 고정(호스트 원장 의존 금지) — 기본은 빈 원장 루트.
+      doctorVisitIncidentRoot: join(dir, 'incidents'),
       out: { log: (line: string) => outputs.push(line) },
       err: { error: (line: string) => errors.push(line) },
       setExitCode: (code: number) => exitCodes.push(code),
@@ -2565,7 +2569,7 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
       observation.mockRestore();
     }
     const visitEvents = events.filter((entry) => entry.category === 'run-doctor' && entry.event === 'visit');
-    expect(visitEvents).toEqual([{ category: 'run-doctor', event: 'visit', data: { runId: canonicalRunId, from: 'child', symptom: 'oom' } }]);
+    expect(visitEvents).toEqual([{ category: 'run-doctor', event: 'visit', data: { runId: canonicalRunId, from: 'child', symptom: 'oom', incidentPrecedents: 0 } }]);
   });
 
   test('status --run refuses a runId with no ledger instead of reporting zero visits (rc!=0)', async () => {
@@ -2637,5 +2641,54 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
     expect(text).toContain('Credentials: ');
     expect(text).not.toContain('Doctor visits:');
     expect(cli.exitCodes).toEqual([]);
+  });
+
+  test('visit links recorded incident precedents for the same symptom into the ledger and output', async () => {
+    const dir = seedDoctorVisitLedger();
+    const incidentRoot = mkdtempSync(join(tmpdir(), 'doctor-visit-incidents-'));
+    seededRoots.push(incidentRoot);
+    recordRunExit({
+      runId: 'run-1a2b3c4d-0000-4000-8000-00000000abcd',
+      reason: 'oom',
+      status: 143,
+      signal: 'SIGTERM',
+      at: '2026-10-01T00:00:00.000Z',
+      lastLines: ['child OOM-killed'],
+    }, incidentRoot);
+    const outputs: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options(),
+      doctorVisitLedgerDir: dir,
+      doctorVisitIncidentRoot: incidentRoot,
+      out: { log: (line: string) => outputs.push(line) },
+      err: { error: () => {} },
+      setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', 'oom', '--from', 'child'], { from: 'user' });
+    expect(outputs[0]).toContain('incident-precedents=1');
+    const visit = ledgerEntries(dir, canonicalRunId).filter((entry) => entry.event === 'doctor-visit').at(-1)!;
+    expect(visit.data.incidentPrecedents).toEqual([
+      expect.objectContaining({ runId: 'run-1a2b3c4d-0000-4000-8000-00000000abcd', reason: 'oom', status: 143, signal: 'SIGTERM' }),
+    ]);
+    // --json 에코에도 선례가 그대로 실린다
+    await program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', 'oom', '--from', 'child', '--json'], { from: 'user' });
+    const echoed = JSON.parse(outputs.at(-1)!);
+    expect(echoed.incidentPrecedents).toEqual([expect.objectContaining({ reason: 'oom' })]);
+  });
+
+  test('doctorVisitIncidentRoot delegates to the elanousStateRoot resolver (no homedir hardcode)', () => {
+    const previous = process.env.ELANOUS_STATE_DIR;
+    try {
+      const isolated = mkdtempSync(join(tmpdir(), 'doctor-incident-root-'));
+      seededRoots.push(isolated);
+      process.env.ELANOUS_STATE_DIR = isolated;
+      expect(doctorVisitIncidentRoot()).toBe(elanousStateRoot());
+      delete process.env.ELANOUS_STATE_DIR;
+      expect(doctorVisitIncidentRoot()).toBe(elanousStateRoot());
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previous;
+    }
   });
 });

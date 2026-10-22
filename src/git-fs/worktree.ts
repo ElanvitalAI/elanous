@@ -24,15 +24,51 @@ const GIT_TIMEOUT_MS = 30_000;
  *  ⛔ 깊이 없이 얕은 저장소로 다른 브랜치를 fetch 하면 그 브랜치의 «전 이력»을 받는다(실측 193s vs 4s · 30s 에 SIGTERM). */
 const SHALLOW_BASE_FETCH_DEPTH = 50;
 const WORKTREE_ADD_TIMEOUT_MS = 5 * 60_000;
+const WORKTREE_ADD_TIMEOUT_PER_TRACKED_FILE_MS = 600_000 / 25_000;
+const WORKTREE_ADD_TIMEOUT_MAX_MS = 15 * 60_000;
+const TRACKED_FILE_COUNT_MAX_BUFFER = 16 * 1024 * 1024;
 
 export interface WorktreeAddDeps {
   spawn?: (command: string, args: string[], options: { cwd: string; encoding: 'utf8'; timeout: number; maxBuffer: number }) => SpawnSyncReturns<string>;
+  countTrackedFiles?: (repoRoot: string, ref?: string) => number | null;
 }
 
-function worktreeAddTimeoutMs(): number {
+function countTrackedFiles(repoRoot: string, ref?: string): number | null {
+  const args = ref ? ['ls-tree', '-r', '-z', '--name-only', ref] : ['ls-files', '-z'];
+  const result = spawnSync('git', args, {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    timeout: GIT_TIMEOUT_MS,
+    maxBuffer: TRACKED_FILE_COUNT_MAX_BUFFER,
+  });
+  if (result.status !== 0 || result.error) return null;
+  const output = result.stdout ?? '';
+  if (output.length === 0) return 0;
+  let count = 0;
+  for (const character of output) if (character === '\0') count++;
+  return count;
+}
+
+type WorktreeAddTimeout = { ms: number; trackedFileCount: number | null; source: 'config' | 'tracked-files' | 'fallback' };
+
+function worktreeAddTimeoutForTrackedFileCount(trackedFileCount: number | null): WorktreeAddTimeout {
+  if (trackedFileCount === null || !Number.isSafeInteger(trackedFileCount) || trackedFileCount < 0) {
+    return { ms: WORKTREE_ADD_TIMEOUT_MS, trackedFileCount: null, source: 'fallback' };
+  }
+  const scaledMs = Math.ceil(trackedFileCount * WORKTREE_ADD_TIMEOUT_PER_TRACKED_FILE_MS);
+  return { ms: Math.min(WORKTREE_ADD_TIMEOUT_MAX_MS, Math.max(WORKTREE_ADD_TIMEOUT_MS, scaledMs)), trackedFileCount, source: 'tracked-files' };
+}
+
+export function worktreeAddTimeoutForRepo(
+  repoRoot: string,
+  countTrackedFilesForRepo: (repoRoot: string, ref?: string) => number | null = countTrackedFiles,
+  trackedFileRef?: string,
+): WorktreeAddTimeout {
   const seconds = getUserConfig().harness?.worktreeAddTimeoutSec;
-  return typeof seconds === 'number' && Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 2_147_483
-    ? seconds * 1000 : WORKTREE_ADD_TIMEOUT_MS;
+  if (typeof seconds === 'number' && Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 2_147_483) {
+    return { ms: seconds * 1000, trackedFileCount: null, source: 'config' };
+  }
+  return worktreeAddTimeoutForTrackedFileCount(countTrackedFilesForRepo(repoRoot, trackedFileRef));
 }
 
 function worktreeAddFailureLines(stderr: string): { lastProgress: string | null; details: string[] } {
@@ -729,7 +765,9 @@ export function createWorktree(opts: CreateWorktreeOpts, deps: WorktreeAddDeps =
   // ★ 병렬 안전 재시도(2026-07-21) — 동시 worktree add 가 git 락에서 경쟁하면 즉시 실패 → 락/일시적
   //   에러면 백오프 재시도(패자가 승자의 락 해제를 기다렸다 성공). non-transient 는 재시도 없이 throw.
   const MAX_ATTEMPTS = 6;
-  const addTimeoutMs = worktreeAddTimeoutMs();
+  const addTimeout = worktreeAddTimeoutForRepo(repoRoot, deps.countTrackedFiles ?? countTrackedFiles, baseCheckout);
+  const addTimeoutMs = addTimeout.ms;
+  debug.log('git-fs.worktree', 'add.start', { branch, timeoutMs: addTimeoutMs, trackedFileCount: addTimeout.trackedFileCount, timeoutSource: addTimeout.source });
   const addSpawn = deps.spawn ?? spawnSync;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const res = addSpawn(

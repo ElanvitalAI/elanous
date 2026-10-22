@@ -1,5 +1,5 @@
-import { executeClassifyNode } from '../workflow-runtime/nodes/classify.js';
-import type { ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
+import { runGraphClassifyNode } from '../graph-runner/runner.js';
+import type { ClassifyNode, NodeExecContext, WorkflowDeps } from '../workflow-runtime/types.js';
 import { REWORK_BUDGET_VERDICTS, type ReworkBudgetVerdict } from './run-outcome.js';
 
 export type ClassifyShadowCallLLM = WorkflowDeps['callLLM'];
@@ -36,11 +36,7 @@ export async function classifyReworkBudgetShadow(
       resolvedModel: undefined,
       toolPolicy: {},
     };
-    const deps: WorkflowDeps = {
-      callLLM,
-      runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-    };
-    const result: NodeOutput = await executeClassifyNode(node, context, deps);
+    const result = await runGraphClassifyNode(node, context, callLLM, { caller: 'rework-budget-shadow' });
     const picked = isReworkBudgetVerdict(result.output) ? result.output : 'unknown';
     return {
       picked,

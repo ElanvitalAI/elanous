@@ -75,10 +75,11 @@ function configuredUsageHosts(): { local: string; remote: string[] } {
   return { local, remote: [...new Set(entries.map((entry) => entry.host?.trim()).filter((host): host is string => !!host && host !== local))] };
 }
 
-type UsageAxis = 'stage' | 'model' | 'account';
+type UsageAxis = 'stage' | 'phase' | 'model' | 'account';
 type ExtendedRunUsageInput = RunUsageInput & { stage?: string | null; account?: string | null; origin?: string; podJob?: string; job?: string; measured?: boolean };
 type AxisUsageRow = {
   stage?: string;
+  phase?: string;
   model?: string;
   account?: string;
   hostIds: string[];
@@ -97,7 +98,7 @@ type AxisUsageRow = {
 };
 
 type FederatedUsageRow = {
-  runId?: string; role?: string; site?: string; stage?: string; model?: string; account?: string;
+  runId?: string; role?: string; site?: string; stage?: string; phase?: string; model?: string; account?: string;
   billingProvider?: string; billing?: string; hostIds: string[]; rankUsd?: number;
   calls: number; inputTokens: number; outputTokens: number; cacheReadInputTokens: number;
   cacheCreationInputTokens: number; reasoningOutputTokens: number; usdKnown: number;
@@ -122,7 +123,7 @@ function validUsageRows(value: unknown, axis: 'run' | 'role' | UsageAxis): value
         const number = row[field];
         return typeof number === 'number' && Number.isFinite(number) && number >= 0;
       })
-      && (axis !== 'stage' && axis !== 'model' && axis !== 'account'
+      && (axis !== 'stage' && axis !== 'phase' && axis !== 'model' && axis !== 'account'
         || typeof row.rankUsd === 'number' && Number.isFinite(row.rankUsd));
   });
 }
@@ -137,7 +138,7 @@ function mergeUsageRows(groups: readonly FederatedUsageRow[][], axis: 'run' | 'r
     if (!previous) { merged.set(key, { ...row, hostIds: [...row.hostIds] }); continue; }
     for (const field of SUM_FIELDS) previous[field] += row[field];
     previous.hostIds = [...new Set([...previous.hostIds, ...row.hostIds])];
-    if (axis === 'stage' || axis === 'model' || axis === 'account') previous.rankUsd = previous.usdKnown + previous.apiEquivalentUsd;
+    if (axis === 'stage' || axis === 'phase' || axis === 'model' || axis === 'account') previous.rankUsd = previous.usdKnown + previous.apiEquivalentUsd;
   }
   return [...merged.values()];
 }
@@ -186,6 +187,7 @@ function rollupByAxis(inputs: readonly ExtendedRunUsageInput[], axis: UsageAxis)
   const groups = new Map<string, ExtendedRunUsageInput[]>();
   for (const data of inputs) {
     const value = axis === 'stage' ? stageForUsage(data)
+      : axis === 'phase' ? (typeof data.phase === 'string' && data.phase.length > 0 ? data.phase : '(none)')
       : axis === 'model' ? (data.model || '(none)')
         : (data.account || '(none)');
     const group = groups.get(value) ?? [];
@@ -216,7 +218,7 @@ function rollupByAxis(inputs: readonly ExtendedRunUsageInput[], axis: UsageAxis)
 }
 
 function isUsageAxis(value: string): value is 'run' | 'role' | UsageAxis {
-  return value === 'run' || value === 'role' || value === 'stage' || value === 'model' || value === 'account';
+  return value === 'run' || value === 'role' || value === 'stage' || value === 'phase' || value === 'model' || value === 'account';
 }
 
 function formatAxisUsage(row: AxisUsageRow, axis: UsageAxis): string {
@@ -249,9 +251,9 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
 
   usage
     .command('runs')
-    .description('저장된 llm-usage 로그를 런·역할·단계·모델·계정별로 집계한다')
+    .description('저장된 llm-usage 로그를 런·역할·단계·phase·모델·계정별로 집계한다')
     .option('--run <runId>', '런 ID 정확 일치')
-    .option('--by <axis>', '집계 축 (run | role | stage | model | account)', 'run')
+    .option('--by <axis>', '집계 축 (run | role | stage | phase | model | account)', 'run')
     .option(...LOGS_SINCE_OPTION)
     .option('--hosts <scope>', '호스트 연합 (all: 이 호스트 + 설정된 taskAgent.parentHost)')
     .option('--json', '집계 행 JSON 출력')
@@ -298,14 +300,14 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
         const complete = !rosterReason && hosts.every((host) => host.status === 'ok');
         const rows = mergeUsageRows(parts, opts.by as 'run' | 'role' | UsageAxis);
         if (opts.by === 'role') rows.sort((a, b) => b.calls - a.calls);
-        if (opts.by === 'stage' || opts.by === 'model' || opts.by === 'account') rows.sort((a, b) => (b.rankUsd ?? 0) - (a.rankUsd ?? 0) || b.calls - a.calls);
+        if (opts.by === 'stage' || opts.by === 'phase' || opts.by === 'model' || opts.by === 'account') rows.sort((a, b) => (b.rankUsd ?? 0) - (a.rankUsd ?? 0) || b.calls - a.calls);
         if (json) { out.log(JSON.stringify({ rows, hosts, complete, ...(rosterReason ? { reason: rosterReason } : {}) }, null, 2)); return; }
         out.log(`호스트 ${hosts.filter((host) => host.status === 'ok').length}/${hosts.length} 측정 · ${complete ? '완결' : '부분 합계'}`);
         if (rosterReason) out.log(`호스트 목록: 못 잼 (${rosterReason})`);
         for (const host of hosts) if (host.status === 'unmeasured') out.log(`${host.host}: 못 잼 (${host.reason})`);
         if (rows.length === 0) { out.log('(일치하는 런 사용량 없음)'); return; }
         for (const row of rows) {
-          if (opts.by === 'stage' || opts.by === 'model' || opts.by === 'account') out.log(formatAxisUsage(row as AxisUsageRow, opts.by));
+          if (opts.by === 'stage' || opts.by === 'phase' || opts.by === 'model' || opts.by === 'account') out.log(formatAxisUsage(row as AxisUsageRow, opts.by));
           else if (opts.by === 'role') out.log(`${row.role}  ${row.site}  ${row.model}  ${row.billingProvider}/${row.billing}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
           else out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
         }
@@ -323,14 +325,14 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
           localFailure = '로컬 logs.db 조회 실패';
         }
       }
-      const unwrapPod = opts.by === 'stage' || opts.by === 'model' || opts.by === 'account';
+      const unwrapPod = opts.by === 'stage' || opts.by === 'phase' || opts.by === 'model' || opts.by === 'account';
       // ⭐ METER-POD-ROLLUP-GAP-2 — Pod 사용량 재방출 행(podRollupKey)은 «더 완전한 한 행»만 센다(키 없는 행은 그대로).
       const selected = rows.map((row) => usageData(row, unwrapPod))
         .filter((data): data is ExtendedRunUsageInput => data !== null)
         .filter((data) => opts.run === undefined || data.runId === opts.run);
       // A returned Pod raw row and its host rollup describe the same usage. Keep raw rows when no measured rollup exists.
       const inputs = dedupePodRollupRows(unwrapPod ? excludeCoveredPodRawRows(selected) : selected);
-      if (opts.by === 'stage' || opts.by === 'model' || opts.by === 'account') {
+      if (opts.by === 'stage' || opts.by === 'phase' || opts.by === 'model' || opts.by === 'account') {
         const report = rollupByAxis(inputs, opts.by);
         if (opts.hosts === 'all') { emitFederated(report, localFailure); return; }
         if (json) {

@@ -39,6 +39,8 @@ export interface ReleaseLoopConfig {
   gatePodCpu?: number | string | { request?: number | string; limit?: number | string };
   gateRemote?: string;
   gateRemoteMirror?: string;
+  /** RELEASE-PWA-NODE-RESILIENCE ① — SSH host the `pwa` node runs its scenario suite on (e.g. `node-b`); absent = this machine. No fallback. */
+  pwaRemote?: string;
   opsHosts?: string[];
   internalDist?: string;
   opsRestart?: boolean;

@@ -12,6 +12,7 @@ import { getUserConfig } from '../user-config.js';
 import { dateKey } from '../time/format.js';
 import { cardIndexPath, CardStore, type TaskCard } from '../task-cards/card-store.js';
 import { loadIntakeLedger, type IntakeItem } from './items.js';
+import { alreadyBuiltHints, type AlreadyBuiltFeature, type AlreadyBuiltRefusedPair } from './already-built-hint.js';
 import { RequirementLedger } from '../requirements/requirement-ledger.js';
 import { parseRubric, rubricGrade, rubricScore } from '../release-loop/rubric.js';
 
@@ -70,6 +71,10 @@ export interface FunnelOptions {
   adopt?: (candidate: RequirementCandidate, version: string, cellId: string, evidence: string) => void;
   /** REQ-INTAKE-ALL (0.2.25) piece 1: REQ-LEDGER side-record — every candidate captured once (idempotent on candidate id); adopted decisions fold to `placed`. */
   ledger?: RequirementLedger;
+  /** ALREADY-BUILT-HINT (0.2.34 · RFC-harness-full-journey-as-graph §4f): the DEV-FEATURE-MAP rows to compare arrivals against. Absent → no comparison, no `intake.hint` events. Intentional boundary (next piece): the live state-based caller (`src/briefing/brief-items.ts` — `readRequirementFunnel({ stateDir, now })`) does not yet supply these rows, so hints stay silent in live runs until the DEV-FEATURE-MAP cell supplies them. */
+  features?: readonly AlreadyBuiltFeature[];
+  /** Rejected pairs (request hash ⊕ feature) — a refused pair is never asked again. */
+  refusedFeatures?: readonly AlreadyBuiltRefusedPair[];
 }
 
 /** How many of the last 24 hours' unlinked directives the single P0 brief line names (the full backlog is one count). */
@@ -118,6 +123,26 @@ function gate(candidate: RequirementCandidate, options: FunnelOptions, used: num
   return null;
 }
 
+/**
+ * ALREADY-BUILT-HINT (0.2.34 · RFC-harness-full-journey-as-graph §4f) — compare one arrival group's statement
+ * against the DEV-FEATURE-MAP evidence rows through the pure `alreadyBuiltHints` function. Each returned hint
+ * becomes one `intake.hint` observation carrying the match's evidence link (commit · file); no match, an
+ * evidence-less row or a refused pair yields nothing (silence). Side-record only — a hint failure must never
+ * change the funnel result (same try/catch shape as the ledger capture below). E4 absence note:
+ * seat-state/MK/green-e4/ALREADY-BUILT-HINT.md.
+ */
+function recordAlreadyBuiltHints(candidate: RequirementCandidate, options: FunnelOptions): void {
+  if (!options.features?.length) return;
+  try {
+    for (const hint of alreadyBuiltHints(candidate.text, options.features, options.refusedFeatures ?? [])) {
+      debug.log('requirements.intake', 'hint', { id: candidate.id, link: candidate.link, kind: hint.kind,
+        devProject: hint.devProject, feature: hint.feature, evidence: { ...hint.evidence }, score: hint.score });
+    }
+  } catch (error) {
+    debug.log('requirements.intake', 'hint-failed', { id: candidate.id, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 /** RUBRIC-PLACE: use the release placement engine's priority, deadline, capacity and predecessor checks, not an invented score. */
 export function runRequirementFunnel(options: FunnelOptions): RequirementFunnelResult {
   const { sources, cells, now } = options;
@@ -139,6 +164,7 @@ export function runRequirementFunnel(options: FunnelOptions): RequirementFunnelR
   for (const members of groups.values()) {
     members.sort((a, b) => a.receivedAt.localeCompare(b.receivedAt));
     const candidate = members.find(member => member.source === 'directive') ?? members[0]!;
+    recordAlreadyBuiltHints(candidate, options);
     const linked = members.map(member => linkFor(member, cells)).find(Boolean);
     const evidence = members.map(member => `${member.link} (${member.receivedAt})`).join(' · ');
     if (linked) {
@@ -256,7 +282,8 @@ export function captureFunnelCandidates(candidates: readonly RequirementDecision
 /** Existing ledgers only; no source collector or sender is started here. Side effect: captures every candidate into this universe's REQ-LEDGER (REQ-INTAKE-ALL). */
 export function readRequirementFunnel(options: { stateDir?: string; now?: Date; mode?: 'shadow' | 'live'; dailyCap?: number;
   allowedLicenses?: readonly string[]; grounding?: readonly IncomingRequirement[]; coordination?: readonly IncomingRequirement[];
-  linear?: readonly IncomingRequirement[]; placement?: PlacementDeps } = {}): RequirementFunnelResult {
+  linear?: readonly IncomingRequirement[]; placement?: PlacementDeps; features?: readonly AlreadyBuiltFeature[];
+  refusedFeatures?: readonly AlreadyBuiltRefusedPair[] } = {}): RequirementFunnelResult {
   const stateDir = options.stateDir ?? elanousStateRoot();
   const now = options.now ?? new Date();
   const config = (getUserConfig().raw.intake as { requirementFunnel?: { mode?: 'shadow' | 'live'; dailyCap?: number; allowedLicenses?: string[] } } | undefined)?.requirementFunnel;
@@ -328,6 +355,7 @@ export function readRequirementFunnel(options: { stateDir?: string; now?: Date; 
     coordination: today(options.coordination ?? cardRequests.coordination), linear: today(options.linear ?? cardRequests.linear) }, historicalDirectives, cells, now, mode,
     dailyCap, adoptedToday: todayCount, allowedLicenses, placement: { ...options.placement, schedules },
     ledger: new RequirementLedger({ stateDir }),
+    features: options.features, refusedFeatures: options.refusedFeatures,
     adopt: (candidate, version, cellId, evidence) => {
       placeCell({ id: cellId, title: candidate.text, owner: candidate.owner ?? 'OP', priority: candidate.priority ?? 'P1',
         predecessors: [], ...(candidate.deadlineVersion ? { deadlineVersion: candidate.deadlineVersion } : {}) }, { ...options.placement, now, schedules });

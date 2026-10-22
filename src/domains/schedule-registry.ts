@@ -381,9 +381,17 @@ export function readCrontab(): string {
 export function inventoryCrontab(db: Database, opts: { crontab?: string; now?: string } = {}): { total: number; added: number; disabled: number; vanished: number } {
   const text = opts.crontab ?? readCrontab();
   const now = opts.now ?? new Date().toISOString();
-  const existing = new Map((db.prepare(`SELECT id, name, command, source, run_via FROM schedule_registry`).all() as Array<{
+  const nowMs = Date.parse(now);
+  const existing = new Map((db.prepare(`SELECT id, name, command, source, run_via, cron, category, enabled, disabled_reason, last_seen, raw FROM schedule_registry`).all() as Array<{
     id: string; name: string; command: string | null; source: string; run_via: string;
+    cron: string | null; category: string; enabled: number;
+    disabled_reason: string | null; last_seen: string | null; raw: string | null;
   }>).map(r => [r.id, r]));
+  const lastSeenDue = (lastSeen: string | null): boolean => {
+    if (!lastSeen) return true;
+    const lastSeenMs = Date.parse(lastSeen);
+    return !Number.isFinite(lastSeenMs) || !Number.isFinite(nowMs) || nowMs - lastSeenMs >= 10 * 60_000;
+  };
   let total = 0, added = 0, disabled = 0, vanished = 0;
   const seenIds = new Set<string>();
   for (const line of text.split('\n')) {
@@ -398,8 +406,10 @@ export function inventoryCrontab(db: Database, opts: { crontab?: string; now?: s
       const off = parseDisabledCronLine(line);
       if (!off) continue;
       const offId = cronEntryId(off.cron, unwrapCronCommand(off.command));
-      if (existing.get(offId)?.source !== 'crontab' || existing.get(offId)?.run_via === 'trigger') continue;
+      const prior = existing.get(offId);
+      if (prior?.source !== 'crontab' || prior.run_via === 'trigger') continue;
       seenIds.add(offId);
+      if (prior.enabled === 0 && prior.disabled_reason === 'manual' && !lastSeenDue(prior.last_seen)) continue;
       db.run(`UPDATE schedule_registry SET enabled = 0, disabled_reason = 'manual', last_seen = ? WHERE id = ?`, [now, offId]);
       disabled++;
       continue;
@@ -417,6 +427,10 @@ export function inventoryCrontab(db: Database, opts: { crontab?: string; now?: s
     // trigger's state (including an explicit disable). Keep the migrated row intact.
     if (prior?.run_via === 'trigger') continue;
     if (!prior) added++;
+    const unchanged = prior?.source === 'crontab' && prior.name === name && prior.cron === parsed.cron
+      && prior.command === parsed.command && prior.category === category
+      && prior.enabled === 1 && prior.disabled_reason == null && prior.raw === line.trim();
+    if (unchanged && !lastSeenDue(prior.last_seen)) continue;
     db.run(
       `INSERT INTO schedule_registry (id, name, source, cron, command, category, domain, enabled, last_seen, managed_by, raw)
        VALUES (?, ?, 'crontab', ?, ?, ?, 'finance', 1, ?, 'manual', ?)

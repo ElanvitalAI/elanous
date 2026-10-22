@@ -4,9 +4,34 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerAutopilotCommands } from '../cli/autopilot-cli.js';
-import { executeNextAction, failureKey, readDeliveryEvidence, type ActionDeps, type NextAction } from './actions.js';
+import { buildEntranceRefusalDenominator, executeEntranceTick, executeNextAction, failureKey, readDeliveryEvidence, type ActionDeps, type NextAction } from './actions.js';
 import { judgeNextMove, LIVE_RETRY_MOVES, retryMoveOf, SAME_MOVE_FAILURE_LIMIT } from './judge.js';
 import { resolveTaskAgentLiveMoves } from './live-moves.js';
+
+test('entrance refusal denominator counts prototype-like reasons as ordinary keys', () => {
+  const result = buildEntranceRefusalDenominator([
+    { taskId: 'ta-1', kind: 'review', refusal: 'constructor' },
+    { taskId: 'ta-2', kind: 'review', refusal: '__proto__' },
+    { taskId: 'ta-3', kind: 'review', refusal: '__proto__' },
+  ]);
+  expect(result).toEqual({ reviewed: 3, allowed: 0, refused: 3, reasons: { constructor: 1, ['__proto__']: 2 } });
+  expect(Object.prototype.hasOwnProperty.call(result.reasons, '__proto__')).toBe(true);
+});
+
+test('entrance denominator uses a dedicated event while actions keep the legacy event', async () => {
+  const action: NextAction = { kind: 'review', taskId: 'ta-1', rationale: 'ready', pr: 7, runId: 'run-1', original: 'ask', checklistId: 'TA' };
+  const observations: Array<{ event: string; data: { kind: string; reviewed?: number; refused?: number } }> = [];
+  const deps: ActionDeps = { mode: 'shadow', command: async () => { throw new Error('shadow must not launch'); },
+    observe: (event, data) => { observations.push({ event, data }); } };
+  await expect(executeEntranceTick([
+    { action },
+    { action: { ...action, taskId: 'ta-2' }, refusal: 'constructor' },
+  ], deps)).resolves.toEqual(['shadow']);
+  expect(observations).toEqual([
+    { event: 'task-agent.action', data: expect.objectContaining({ taskId: 'ta-1', kind: 'review' }) },
+    { event: 'task-agent.entrance-denominator', data: expect.objectContaining({ kind: 'entrance-tick', reviewed: 2, refused: 1 }) },
+  ]);
+});
 
 test('deliver live copies and checks evidence then proposes green without PR; shadow copies nothing', async () => {
   const root = mkdtempSync(join(tmpdir(), 'action-deliver-'));

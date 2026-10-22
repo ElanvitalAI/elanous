@@ -4,7 +4,7 @@ import { gunzipSync } from 'node:zlib';
 import { basename, dirname, join } from 'node:path';
 import { findGitDir } from '../git-fs/locate.js';
 import { debug } from '../debug/log.js';
-import { PR_LABELS } from '../github/pr-labels.js';
+import { PR_LABELS, PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { appendRunLedgerEntry, listRunLedgers, loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { clipRegateDetail, regateFailureFacts, type HostRegateFailure } from '../self-implement/regate-detail.js';
@@ -64,6 +64,7 @@ function sameCardSlot(previous: ResiduePr, current: ResiduePr, slot: string): bo
   return cardOf(previous.body) === slot && cardOf(current.body) === slot;
 }
 const harvestable = PR_LABELS.find((label) => label.name === 'elanous:harvestable')!.name;
+const running = PR_LABELS.find((label) => label.name === PR_LABEL_NAMES.running)!.name;
 const superseded = PR_LABELS.find((label) => label.name === 'elanous:superseded')!.name;
 
 export function classifyPodTerminal(input: PodTerminalInput): PrTerminalRecord {
@@ -120,6 +121,8 @@ export interface DraftResidueAdapters {
   /** Complete changed-path inventory for the newly opened PR; undefined is unmeasured. */
   listPrChangedPaths?(repository: string, number: number): Promise<readonly string[] | undefined> | readonly string[] | undefined;
   addLabel(repository: string, number: number, label: string): Promise<void> | void;
+  /** Remove one state label from a PR — RUN-STOP-RELEASES-RUNNING-LABEL drops `elanous:running` on terminal record. */
+  removeLabel?(repository: string, number: number, label: string): Promise<void> | void;
   setLabels(repository: string, number: number, change: { add: string; remove: readonly string[] }): Promise<void> | void;
   comment(repository: string, number: number, body: string): Promise<void> | void;
   closePr(repository: string, number: number): Promise<void> | void;
@@ -243,6 +246,7 @@ export function defaultAdapters(sources: ResidueRunStatusSources = defaultRunSta
       } catch { return undefined; }
     },
     addLabel: (repository, number, label) => { gh(['pr', 'edit', String(number), '-R', repository, '--add-label', label]); },
+    removeLabel: (repository, number, label) => { gh(['pr', 'edit', String(number), '-R', repository, '--remove-label', label]); },
     setLabels: (repository, number, change) => {
       const flags = [...(change.add ? ['--add-label', change.add] : []), ...change.remove.flatMap((label) => ['--remove-label', label])];
       if (flags.length) gh(['pr', 'edit', String(number), '-R', repository, ...flags]);
@@ -455,6 +459,38 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
       return skipped('protected');
     }
     if (record.terminalClass !== 'landed') {
+      // RUN-STOP-RELEASES-RUNNING-LABEL: a finished run must not stay protected by its own `elanous:running`
+      // state label. Release only that state label; other state labels stay. A failed release is observed,
+      // never a reason to abort the terminal record. Only the GitHub write is guarded: a ledger write failure is a
+      // normal (retryable) terminal failure. An `attempt` effect written before the GitHub write lets a replay
+      // record the release even when the label is already gone (review r1: success must not be lost).
+      if (!completed('running-label-released', pr.number)) {
+        const attempted = completed('running-label-release-attempt', pr.number);
+        let released = false;
+        if (pr.labels.includes(running)) {
+          step = 'ledger';
+          if (!attempted) acknowledge('running-label-release-attempt', pr.number);
+          try {
+            if (!adapters.removeLabel) throw new Error('remove-label-unobserved');
+            step = 'remove-label';
+            await adapters.removeLabel(record.repository, pr.number, running);
+            released = true;
+          } catch (labelError) {
+            const reason = labelError instanceof Error ? labelError.message : String(labelError);
+            log('label-release-failed', { prNumber: pr.number, reason });
+            // The failure reason belongs in the ledger as well. Writing it is outside the GitHub guard: a ledger
+            // failure here is a normal retryable terminal failure (review r2), never a silently dropped reason.
+            step = 'ledger';
+            adapters.appendLedger({ runId: ctx.ledgerRunId, event: 'pr-terminal-effect',
+              data: { childRunId: record.childRunId, effect: 'label-release-failed', number: pr.number, reason } }, ctx.ledgerDir);
+          }
+        } else if (attempted) released = true;
+        if (released) {
+          step = 'ledger';
+          acknowledge('running-label-released', pr.number);
+          log('running-label-released', { prNumber: pr.number });
+        }
+      }
       if (!completed('harvestable', pr.number)) {
         if (!pr.labels.includes(harvestable)) {
           step = 'add-label';

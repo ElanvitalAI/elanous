@@ -392,7 +392,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
   // OP TUI turns drove msg list/post/ack and release checklist
   // list/move/set/add through `eln` RunShell calls — 1.3–2s of CLI
   // startup each, 30+ spawns per turn, shell stdout amplifying screen
-  // defects. These eight tools reuse the SAME durable services
+  // defects. These ledger tools reuse the SAME durable services
   // in-process (msg-store SQLite ledger · release-loop checklist
   // ledger), preserving the structured results, the seat/OP permission
   // boundaries (ELANOUS_TRACK actor routing, seatMove rules, the HQ
@@ -422,6 +422,20 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     displayName: 'MsgPost',
     description: 'Post a durable seat-addressed message. Same SQLite ledger as `elanous msg post`, in-process — no CLI startup. ALL may receive but never send; `kind` tags the message; `replyTo` points a reply at a question message ID.',
     promptSummary: '`MsgPost(from, to, body, kind?, replyTo?)` (post durable seat message · in-process)',
+    host: ['skill', 'tui'],
+    safety: ['mutating'],
+    supportsParallel: false,
+    defaultEnabled: true,
+    intentScope: 'ops-fleet',
+    cleanerFitThanShell: true,
+  },
+  {
+    id: 'msg_ask',
+    kind: 'other',
+    aliases: ['MsgAsk', 'msg_ask'],
+    displayName: 'MsgAsk',
+    description: 'Post a durable seat question and wait for its first replyTo-linked reply. On timeout the question remains in the ledger and its ID is returned.',
+    promptSummary: '`MsgAsk(from, to, question, waitSeconds?)` (durable question + linked reply · in-process)',
     host: ['skill', 'tui'],
     safety: ['mutating'],
     supportsParallel: false,

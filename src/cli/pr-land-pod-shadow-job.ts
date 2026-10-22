@@ -63,6 +63,9 @@ export async function runLandingPodShadowJob(input: LandingPodShadowInput, deps:
     // Wait for the runner to observe abort and finish Job/Secret/lease cleanup before landing continues.
     job = await (deps.runPod ?? runPodCommand)({
       command: ['bash', '-lc', script], clone: true, source: { kind: 'commit', sha: input.head },
+      provenance: { actorKind: 'loop', actor: 'pr-land-shadow', kind: 'land-shadow',
+        run: input.head, phase: 'land-shadow', requestedAt: new Date().toISOString(),
+        entrance: 'pr-land', commit: input.head, reason: 'landing typecheck and changed gate shadow' },
       returnLogs: true, deadlineSeconds: 45 * 60,
       statusUnreadableMs: LANDING_POD_SHADOW_STATUS_UNREADABLE_MS,
       hostDeadlineAtMs: Date.now() + LANDING_POD_SHADOW_HOST_TIMEOUT_MS,

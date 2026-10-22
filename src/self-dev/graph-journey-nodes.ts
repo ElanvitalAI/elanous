@@ -39,6 +39,7 @@ export const JOURNEY_NODE_IDS = [
   'salvage',
   'heal',
   'next-move',
+  'decision-card',
   'ready',
   'pr-head-checkout',
   'stopped',

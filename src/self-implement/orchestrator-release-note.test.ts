@@ -10,6 +10,21 @@ import { debug } from '../debug/log.js';
 import { defaultSeams } from './seams.js';
 import { makePrManager, type CmdRunner } from '../autopilot/pr-manager.js';
 
+test('default PR seam passes the orchestrator run id to the PR manager', async () => {
+  let receivedRunId = '';
+  const manager = makePrManager();
+  const openPr = defaultSeams({ prManager: {
+    ...manager,
+    upsertPr: (input) => {
+      receivedRunId = input.runId ?? '';
+      return { ok: true, url: 'https://github.com/o/r/pull/777', reused: false };
+    },
+  } }).openPr;
+  expect(await openPr({ title: 'run identity', body: 'body', head: 'feature', cwd: tmpdir(),
+    runId: 'run-a1b2c3d4-1111-2222-3333-444444444444' })).toEqual({ url: 'https://github.com/o/r/pull/777', number: 777 });
+  expect(receivedRunId).toBe('run-a1b2c3d4-1111-2222-3333-444444444444');
+});
+
 const root = mkdtempSync(join(tmpdir(), 'orchestrator-release-note-'));
 const previousStateDir = process.env.ELANOUS_STATE_DIR;
 beforeAll(() => { process.env.ELANOUS_STATE_DIR = root; });
@@ -33,12 +48,14 @@ test('ordinary PR body renders the goal release note immediately after the imple
   const goalFile = join(root, 'goal-release.txt');
   writeFileSync(goalFile, goalDocument);
   let body = '';
+  let openedRunId = '';
   const result = await runSelfImplement({
-    feature: 'release note title', goalFile, memory: false,
+    feature: 'release note title', goalFile, runId: 'run-a1b2c3d4-1111-2222-3333-444444444444', memory: false,
     writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
-    seams: seams({ openPr: async (input) => { body = input.body; return { url: 'https://pr/501', number: 501 }; } }),
+    seams: seams({ openPr: async (input) => { body = input.body; openedRunId = input.runId ?? ''; return { url: 'https://pr/501', number: 501 }; } }),
   });
   expect(result.stage).toBe('pr-opened');
+  expect(openedRunId).toBe('run-a1b2c3d4-1111-2222-3333-444444444444');
   expect(body).toContain('## 구현 요약\nimpl\n\n## 릴리스 노트\n- 한 줄: 설정 오류를 고쳤다\n- 종류: fix\n- 문서: docs/fix.md\n- 대상: later');
   expect(body).not.toContain('mergeSha:');
   expect(body).not.toContain('mergeCommit:');

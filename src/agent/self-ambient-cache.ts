@@ -18,7 +18,15 @@ import { elanousSelfAmbientBaseParts } from './self-ambient.js';
 
 export const SELF_AMBIENT_FRESH_MS = 30_000;
 export const SELF_AMBIENT_STALE_MAX_MS = 10 * 60_000;
+export const SELF_AMBIENT_KEEP_WARM_ACTIVE_MS = 25_000;
+export const SELF_AMBIENT_KEEP_WARM_IDLE_MS = 8 * 60_000;
+const SELF_AMBIENT_IDLE_AFTER_MS = 2 * 60_000;
 const WORKER_TIMEOUT_MS = 60_000;
+
+/** Keep turn context warm while active; avoid periodic ambient scans during a long idle. */
+export function selfAmbientKeepWarmIntervalMs(idleMs: number): number {
+  return idleMs >= SELF_AMBIENT_IDLE_AFTER_MS ? SELF_AMBIENT_KEEP_WARM_IDLE_MS : SELF_AMBIENT_KEEP_WARM_ACTIVE_MS;
+}
 
 interface CacheEntry { at: number; version: number; parts: string[] }
 

@@ -63,7 +63,7 @@ describe('recordRunStop', () => {
       const entry = recordRunStop({ runId, site: 'merge-hold', class: 'main-sync', cause: 'merge held: main-sync', evidenceRef: 'pr', nextMove: 'sync' }, () => {});
       expect(runStopRecorded(runId)).toBe(true);
       expect(log).toHaveBeenCalledWith('self-implement.run-stop', 'recorded', expect.objectContaining({ runId, site: 'merge-hold', class: 'main-sync' }));
-      expect(readRunStopRecord(entry)).toEqual({ class: 'main-sync', cause: 'merge held: main-sync', evidenceRef: 'pr', nextMove: 'sync' });
+      expect(readRunStopRecord(entry)).toEqual({ class: 'main-sync', site: 'merge-hold', cause: 'merge held: main-sync', evidenceRef: 'pr', nextMove: 'sync' });
       expect(readRunStopRecord({ runId, event: 'merge-decision', data: {} })).toBeUndefined();
     } finally { log.mockRestore(); }
   });

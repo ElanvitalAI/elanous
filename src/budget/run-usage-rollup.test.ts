@@ -1,7 +1,9 @@
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { Command } from 'commander';
+import { debug } from '../debug/log.js';
+import { streamLLM, streamLLMWithTools, type LLMProvider } from '../llm.js';
+import { LogStore, type LogStoreRow } from '../mss/logging/log-store.js';
 import { registerUsageCommand } from '../cli/usage-cli.js';
-import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { excludeCoveredPodRawRows, rollupRunUsage, type RunUsageInput } from './run-usage-rollup.js';
 
 describe('returned Pod raw usage coverage', () => {
@@ -118,6 +120,61 @@ describe('rollupRunUsage', () => {
     ], { by: 'role' });
     expect(rows).toHaveLength(6);
     expect(rows[0]).toMatchObject({ runId: '(all)', role: '(none)', site: '(none)', calls: 1 });
+  });
+});
+
+describe('usage runs --by phase', () => {
+  it('aggregates the call-specified phase, retaining the original token counts and default run shape', async () => {
+    const phases = ['authoring', 'implement', 'review', 'summary', 'landing/re-gate', 'repair-relaunch', 'coordination', 'release-gate', 'other'];
+    const inputs = phases.map((phase, index) => ({ runId: 'phase-run', phase, model: 'm', inputTokens: index + 1, outputTokens: 2 }));
+    const read = () => [...inputs, { runId: 'phase-run', model: 'm', inputTokens: 9 }].map(logRow);
+    const rows = JSON.parse((await usageRuns(['--by', 'phase', '--json'], read))[0]!);
+    for (const [index, phase] of phases.entries()) {
+      expect(rows.find((entry: { phase: string }) => entry.phase === phase)).toMatchObject({ calls: 1, inputTokens: index + 1, outputTokens: 2 });
+    }
+    expect(rows.find((entry: { phase: string }) => entry.phase === '(none)')).toMatchObject({ calls: 1, inputTokens: 9 });
+    expect((await usageRuns(['--by', 'phase'], read)).some((line) => line.startsWith('phase=review  hosts='))).toBe(true);
+    const defaults = JSON.parse((await usageRuns(['--json'], read))[0]!);
+    expect(defaults).toEqual(rollupRunUsage(read().map((entry) => JSON.parse(entry.data!))));
+    expect(defaults[0]).not.toHaveProperty('phase');
+  });
+
+  it('passes a phase-specified LLM stream through the usage ledger and the actual CLI aggregation', async () => {
+    const provider: LLMProvider = {
+      name: 'meter-test', defaultModel: 'meter-model', available: () => true,
+      async *chat() { yield 'ok'; },
+      async *streamChat() {
+        yield { type: 'usage', usage: { inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 } };
+        yield { type: 'text', delta: 'ok' };
+      },
+    };
+    const store = new LogStore(':memory:');
+    const observed: Record<string, unknown>[] = [];
+    const original = debug.log.bind(debug);
+    const spy = spyOn(debug, 'log').mockImplementation((category, event, data, options) => {
+      if (category === 'llm.usage' && event === 'llm-usage') {
+        observed.push(data as Record<string, unknown>);
+        store.insertBatch([{ rec: { ts: '2026-10-20T00:00:00Z', category, event, data: data as Record<string, unknown> }, surface: 'tui' }]);
+      } else original(category, event, data, options);
+    });
+    try {
+      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider, usagePhase: 'review' })).toBe('ok');
+      expect(await streamLLMWithTools([{ role: 'user', content: 'measure' }], { onText() {}, dispatchTool: async () => 'unused' }, { provider, usagePhase: 'implement' })).toBe('ok');
+      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider })).toBe('ok');
+      expect(observed).toHaveLength(3);
+      expect(observed[0]).toMatchObject({ phase: 'review', inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
+      expect(observed[1]).toMatchObject({ phase: 'implement', inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
+      expect(observed[2]).not.toHaveProperty('phase');
+      const read = (query: Parameters<LogStore['query']>[0]) => store.query(query);
+      const rows = JSON.parse((await usageRuns(['--by', 'phase', '--json'], read))[0]!);
+      for (const phase of ['review', 'implement', '(none)']) {
+        expect(rows.find((entry: { phase: string }) => entry.phase === phase)).toMatchObject({ calls: 1, inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
+      }
+      expect(JSON.parse((await usageRuns(['--json'], read))[0]!)[0]).not.toHaveProperty('phase');
+    } finally {
+      spy.mockRestore();
+      store.close();
+    }
   });
 });
 

@@ -1,0 +1,42 @@
+# 저작 ↔ 구현 «대화 고리» (내부 문서 `RFC-progressive-goal-elaboration-2026-10-21` §7).
+# author(고정 층 소유 · 구체화 층 편집자) ⇄ implement(질문자/제안자) · judge(gate·review) 지적도 같은 대화로.
+# 간선 ① author→implement «구체화 층 vN» · ② implement→author «발견/질문» · ③ author→implement «답 = vN+1»
+#      ④ implement→judge→(findings)→author. 왕복 상한 = max_visits 5. 방향·KPI 를 바꿔야 하면 author 가 needs-human.
+# 실행: 첫 왕복(① = E1 착수 구체화 · 사건 goal-elaborated · GOAL-ELABORATE-ON-ARRIVAL) ⊕
+#       ④→③ refine 되돌이(첫 라운드 judge findings → author 가 E3 goal-refined 를 읽어 v2 deliver · GOAL-REFINE-FROM-FIRST-IMPL ·
+#       orchestrator 는 런당 한 번 — goal-refine.ts GOAL_REFINE_MAX_VISITS). judge 는 라운드별 값(data.rounds)을 읽는다.
+#       값 공급자가 없는 implement·judge 는 «통과»(done · reason declared-only:pass-through)라 E1 성공 → dispatch-pod 로 간다.
+graph_id: author-dialogue
+version: 1
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, needs-human, failed]
+entry_node: author
+terminal_nodes: [done, needs-human, failed]
+nodes:
+  - node_id: author
+    kind: agent
+    recipe: 'cmd:dialogue-author'
+    max_visits: 5
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - node_id: implement
+    kind: agent
+    recipe: 'cmd:dialogue-implement'
+    max_visits: 5
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - node_id: judge
+    kind: gate
+    recipe: 'cmd:dialogue-judge'
+    max_visits: 5
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: hitl, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  # ① vN 전달(첫 회 = E1) · ③ 답 = vN+1 은 같은 간선 «deliver» — 판은 spec ledger(goal-elaborated · goal-refined)가 가른다.
+  - { from: author, on: outcome, map: { deliver: implement, needs-human: needs-human, failed: failed } }
+  # ② 발견/질문 «ask» → author · 구현을 마치면 judge 로.
+  - { from: implement, on: outcome, map: { done: judge, ask: author, needs-human: needs-human, failed: failed } }
+  # ④ judge 지적 «findings» 은 같은 대화의 발견으로 author 에.
+  - { from: judge, on: outcome, map: { done: done, findings: author, needs-human: needs-human, failed: failed } }

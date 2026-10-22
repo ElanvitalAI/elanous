@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withFakeBins } from '../ux-sim/fake-bin.js';
 import {
   annotateJsonStdout, decideGateDispatch, dispatchHeavyCheck, extractGateRemoteFlags, GATE_REMOTE_DEFAULTS, relativizeArgs,
   gateRemoteHostCap, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type SshResult,
@@ -220,7 +221,7 @@ describe('host lock wiring', () => {
   test('busy marker carries the host-observed occupied slots', () => {
     const runner = fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY=4\n' } });
     expect(runOnRemote({ repo: '/r', host: 'node-b', mirror: '~/m.git', argv: ['x'], hostCap: 4 }, runner))
-      .toEqual({ kind: 'busy', occupied: 4 });
+      .toEqual({ kind: 'busy', occupied: 4, rc: 98 });
     expect(runner.scripts[0]).toContain('while [ $n -le 4 ]');
   });
 
@@ -228,27 +229,28 @@ describe('host lock wiring', () => {
     const runner = fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY=3\n' } });
     const io = sink();
     const configured = resolveGateRemoteSettings({ hostCaps: { node-b: 6, node-c: 3 }, slotWaitSeconds: 0 }, {});
-    await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-c' }, remoteArgv: ['x'], runLocal: () => 0 },
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-c' }, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('local gate must not run'); } },
       { runner, settings: configured, env: {}, load1: 1, write: io.write });
+    expect(rc).toBe(1);
     expect(runner.scripts[0]).toContain('while [ $n -le 3 ]');
     expect(io.err.join('')).toContain('occupied 3/3');
   });
 
-  test('a busy host is retried, then the check runs locally with a fallback reason', async () => {
+  test('a busy host is retried, then self gate fails without running locally', async () => {
     const runner = fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY\n' } });
     const io = sink();
     let local = 0;
     let clock = 0;
-    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
       { runner, settings: { ...settings, slotWaitSeconds: 30 }, env: {}, load1: 1, write: io.write, now: () => clock, sleep: async (ms) => { clock += ms; } });
-    expect(rc).toBe(0);
-    expect(local).toBe(1);
+    expect(rc).toBe(1);
+    expect(local).toBe(0);
     // Attempts at t=0 and t=15s; the wait to t=30s reaches the deadline, so no third attempt.
     expect(runner.calls.filter((c) => c[0] === 'ssh').length).toBe(2);
-    expect(io.err.join('')).toContain('fallback to local — host-busy');
+    expect(io.err.join('')).toContain('remote unmeasured on node-b (stage=host-busy, rc=98) — host-busy');
   });
 
-  test('a slot that frees exactly at the deadline is not used — the expired wait runs locally', async () => {
+  test('a slot that frees exactly at the deadline is not used — the expired wait stays remote-unmeasured', async () => {
     let calls = 0;
     const runner = fakeRunner({ ssh: () => (++calls < 3
       ? { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY\n' }
@@ -256,10 +258,11 @@ describe('host lock wiring', () => {
     const io = sink();
     let local = 0;
     let clock = 0;
-    await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
+    await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
       { runner, settings: { ...settings, slotWaitSeconds: 20 }, env: {}, load1: 1, write: io.write, now: () => clock, sleep: async (ms) => { clock += ms; } });
     expect(calls).toBe(2);
-    expect(local).toBe(1);
+    expect(local).toBe(0);
+    expect(io.err.join('')).toContain('remote unmeasured on node-b (stage=host-busy, rc=98) — host-busy');
     expect(io.out.join('')).toBe('');
   });
 });
@@ -285,12 +288,12 @@ describe('onRemoteOutcome hook (self gate --artifact-dir fetch)', () => {
     expect(rc).toBe(0);
   });
 
-  test('infra sees the hook before the local fallback; a local decision never calls it', async () => {
+  test('infra reaches the hook without a local fallback; a local decision never calls it', async () => {
     const order: string[] = [];
-    await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, remoteArgv: ['x'], runLocal: () => { order.push('local'); return 0; },
+    await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { order.push('local'); return 0; },
       onRemoteOutcome: (outcome) => { order.push(outcome.kind); } },
       { runner: fakeRunner({ ssh: { rc: 255, stdout: '', stderr: 'timed out' } }), settings, env: {}, load1: 1, write: sink().write });
-    expect(order).toEqual(['infra', 'local']);
+    expect(order).toEqual(['infra']);
     const none: string[] = [];
     await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: true }, remoteArgv: ['x'], runLocal: () => 0, onRemoteOutcome: (o) => { none.push(o.kind); } },
       { runner: fakeRunner(), settings, env: {}, load1: 1, write: sink().write });
@@ -361,7 +364,7 @@ describe('self gate explicit remote placement', () => {
     { runner, settings, env: {}, load1: 1, write: io.write });
     expect(rc).toBe(1);
     expect(runner.calls.some(call => call[0] === 'ssh')).toBe(false);
-    expect(io.err.join('')).toContain('remote unmeasured — host-reserved: node-b');
+    expect(io.err.join('')).toContain('remote unmeasured on node-b (stage=host-reserved, rc=unknown) — host-reserved: node-b');
   });
 
   test('a reserved non-node-b request is refused without changing its explicit host', async () => {
@@ -388,38 +391,66 @@ describe('self gate explicit remote placement', () => {
       { runner: fakeRunner(), settings, env: { ELANOUS_GATE_REMOTE_CHILD: '1' }, load1: 1, write: io.write });
     expect(rc).toBe(1);
     expect(local).toBe(0);
-    expect(io.err).toEqual(['[gate.remote] remote unmeasured — remote-child\n']);
+    expect(io.err).toEqual(['[gate.remote] remote unmeasured on node-b (stage=placement, rc=unknown) — remote-child\n']);
   });
 
   test.each([
-    ['local-only', { localOnlyReason: 'self gate without --base measures uncommitted files on this host' }, 'without --base'],
-    ['SSH/remote infra', { runner: fakeRunner({ ssh: { rc: 255, stdout: '', stderr: 'ssh: timed out\nconnection lost' } }) }, 'ssh rc=255'],
-    ['host-busy', { runner: fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY\n' } }) }, 'host-busy'],
+    ['SSH/remote infra', { runner: fakeRunner({ ssh: { rc: 255, stdout: '', stderr: 'ssh: timed out\nconnection lost' } }) }, 'stage=ssh, rc=255'],
+    ['host-busy', { runner: fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY\n' } }) }, 'stage=host-busy, rc=98'],
   ])('%s refuses local execution with a single reason line', async (_case, setup, reason) => {
     const io = sink();
     let local = 0;
     const runner = 'runner' in setup ? setup.runner : fakeRunner();
     const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, explicitRemoteOnly: true,
-      remoteArgv: ['x'], ...('localOnlyReason' in setup ? { localOnlyReason: setup.localOnlyReason } : {}),
+      remoteArgv: ['x'],
       runLocal: () => { local++; return 0; } }, { runner, settings, env: {}, load1: 1, write: io.write });
     expect(rc).toBe(1);
     expect(local).toBe(0);
     expect(io.out.join('')).toBe('');
-    expect(io.err).toHaveLength(1);
     expect(io.err[0]).toContain(reason);
     expect(io.err[0]!.trimEnd().split('\n')).toHaveLength(1);
     expect(io.err[0]).toContain('remote unmeasured on node-b');
+    if (_case === 'SSH/remote infra') expect(io.err[1]).toBe('ssh: timed out\nconnection lost\n');
+    else expect(io.err).toHaveLength(1);
   });
 
-  test('automatic remote placement retains a reason-visible local fallback', async () => {
+  test('self gate runs locally only with an explicit --local request', async () => {
+    let local = 0;
+    const io = sink();
+    const options = { tool: 'self-gate' as const, repo: '/r', remoteArgv: ['x'], runLocal: () => { local++; return 7; } };
+    const runner = fakeRunner();
+    const deps = { runner, settings, env: {}, load1: 1, write: io.write };
+    expect(await dispatchHeavyCheck({ ...options, flags: { local: false } }, deps)).toBe(0);
+    expect(runner.calls).toContainEqual(['ssh', 'node-b']);
+    expect(local).toBe(0);
+    expect(await dispatchHeavyCheck({ ...options, flags: { local: true } }, deps)).toBe(7);
+    expect(local).toBe(1);
+  });
+
+  test('automatic self gate without a reproducible base falls back locally; explicit remote remains unmeasured', async () => {
+    const runner = fakeRunner();
+    let local = 0;
+    const io = sink();
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', localOnlyReason: 'self gate without --base',
+      flags: { local: false }, remoteArgv: ['x'], runLocal: () => { local++; return 7; } },
+    { runner, settings, env: {}, load1: 1, write: io.write });
+    expect(rc).toBe(7);
+    expect(local).toBe(1);
+    expect(runner.calls.length).toBe(0);
+    expect(io.err.join('')).toContain('fallback to local');
+  });
+
+
+  test('automatic self gate remote failure stays unmeasured without local execution', async () => {
     const io = sink();
     let local = 0;
     const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false }, explicitRemoteOnly: false,
       remoteArgv: ['x'], runLocal: () => { local++; return 7; } },
       { runner: fakeRunner({ ssh: { rc: 255, stdout: '', stderr: 'ssh: timed out' } }), settings, env: {}, load1: 25, write: io.write });
-    expect(rc).toBe(7);
-    expect(local).toBe(1);
-    expect(io.err.join('')).toContain('fallback to local — ssh rc=255');
+    expect(rc).toBe(1);
+    expect(local).toBe(0);
+    expect(io.err.join('')).toContain('remote unmeasured on node-b (stage=ssh, rc=255) — ssh rc=255');
+    expect(io.err.join('')).toContain('ssh: timed out');
   });
 
   test('remote success names its execution host without overriding the remote return code', async () => {
@@ -463,7 +494,7 @@ describe('remote run and fallback', () => {
     const runner = fakeRunner({ ssh: { rc: 0, stdout: 'FAIL\n', stderr: '\n__GATE_REMOTE_RC=1\n' } });
     const io = sink();
     let local = 0;
-    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
       { runner, settings, env: {}, load1: 1, write: io.write });
     expect(rc).toBe(1);
     expect(local).toBe(0);
@@ -522,23 +553,23 @@ describe('remote run and fallback', () => {
     expect(io.out.join('')).toBe('out');
   });
 
-  test('a remote decision for a non-reproducible invocation is a logged fallback, not a silent local run', async () => {
+  test('a remote decision for a non-reproducible self gate invocation is unmeasured, not a local run', async () => {
     const runner = fakeRunner();
     const io = sink();
     let local = 0;
-    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', localOnlyReason: 'self gate without --base measures uncommitted files on this host', flags: { local: false, remote: true }, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', localOnlyReason: 'self gate without --base measures uncommitted files on this host', flags: { local: false, remote: true }, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
       { runner, settings, env: {}, load1: 1, write: io.write });
-    expect(rc).toBe(0);
-    expect(local).toBe(1);
+    expect(rc).toBe(1);
+    expect(local).toBe(0);
     expect(runner.calls.length).toBe(0);
-    expect(io.err.join('')).toContain('fallback to local — self gate without --base');
+    expect(io.err.join('')).toContain('remote unmeasured on node-b (stage=reproducibility, rc=unknown) — self gate without --base');
     // --local stays quiet: nothing was asked of a remote host.
     const quiet = sink();
     await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', localOnlyReason: 'x', flags: { local: true }, remoteArgv: ['x'], runLocal: () => 0 }, { runner, settings, env: {}, load1: 99, write: quiet.write });
     expect(quiet.err.join('')).toBe('');
   });
 
-  test('the push is non-interactive and time-bounded; a hung push falls back', async () => {
+  test('the push is non-interactive and time-bounded; a hung push leaves self gate unmeasured', async () => {
     const seen: Array<{ timeoutMs?: number; env?: NodeJS.ProcessEnv }> = [];
     const base = fakeRunner();
     const runner: GateRemoteRunner = { ...base, local(cmd, args, cwd, options) {
@@ -547,9 +578,9 @@ describe('remote run and fallback', () => {
     } };
     const io = sink();
     let local = 0;
-    await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
+    await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: true }, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { local++; return 0; } },
       { runner, settings, env: {}, load1: 1, write: io.write });
-    expect(local).toBe(1);
+    expect(local).toBe(0);
     expect(seen[0]!.timeoutMs).toBeGreaterThan(0);
     expect(seen[0]!.env!.GIT_SSH_COMMAND).toContain('BatchMode=yes');
     expect(io.err.join('')).toContain('push-failed');
@@ -744,9 +775,49 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     expect(tsc.status).toBe(1);
     expect(`${tsc.stdout}${tsc.stderr}`).not.toContain('[tsc-gate]');
     const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b'], { cwd: scratch, encoding: 'utf8', env });
-    expect(gate.stderr).toContain('[gate.remote] remote unmeasured on node-b — origin-main-unresolved');
+    expect(gate.stderr).toContain('[gate.remote] remote unmeasured on node-b (stage=preflight, rc=unknown) — origin-main-unresolved');
     expect(gate.status).toBe(1);
     expect(`${gate.stdout}${gate.stderr}`).not.toContain('gate: no changed files');
+  });
+
+  test('spawned self gate --remote preserves the SSH failure and never starts the local gate', async () => {
+    await withFakeBins({ ssh: { stderr: 'ssh: isolated gate failure\noriginal detail: connection refused\n', exitCode: 255 } }, async (fakeBins) => {
+    const scratch = slotDir();
+    expect(spawnSync('git', ['init', '-q'], { cwd: scratch }).status).toBe(0);
+    expect(spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: scratch }).status).toBe(0);
+    expect(spawnSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: scratch }).status).toBe(0);
+    mkdirSync(join(scratch, '.elanous-test', 'release', 'gate-host-reservations'), { recursive: true });
+    writeFileSync(join(scratch, '.git', 'info', 'exclude'), 'bin/\n.elanous-test/\nlog/\n');
+    const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = fakeBins.env;
+    const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'isolated-host'], {
+      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test' },
+    });
+    expect(gate.status).toBe(1);
+    expect(gate.stderr).toContain('remote unmeasured on isolated-host (stage=push, rc=128)');
+    expect(gate.stderr).toContain('ssh: isolated gate failure\noriginal detail: connection refused\n');
+    const localRuns = (gate.stdout.match(/\[self gate\]/g) ?? []).length;
+    expect(localRuns).toBe(0);
+    expect(`${gate.stdout}${gate.stderr}`).not.toContain('[tsc-gate]');
+    expect(gate.stdout).toBe('');
+    console.log(`isolated self gate CLI: rc=${gate.status} local=${localRuns} stdout=${JSON.stringify(gate.stdout)} stderr=${JSON.stringify(gate.stderr)}`);
+    const automatic = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD'], {
+      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test' },
+    });
+    expect(automatic.status).toBe(1);
+    expect(automatic.stderr).toContain('remote unmeasured on node-b (stage=push, rc=128)');
+    expect(automatic.stderr).toContain('ssh: isolated gate failure\noriginal detail: connection refused\n');
+    expect(automatic.stdout).toBe('');
+    const local = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--local'], {
+      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test' },
+    });
+    expect(local.status).toBe(0);
+    expect(local.stdout).toContain('[self gate] changed=0 base=HEAD reason=no-changes');
+    expect((local.stdout.match(/\[self gate\]/g) ?? []).length).toBe(1);
+    expect(`${local.stdout}${local.stderr}`).not.toContain('ssh: isolated gate failure');
+    expect(fakeBins.calls().filter((call) => call.name === 'ssh').length).toBe(2);
+    expect(fakeBins.calls()[0]?.argv).toContain('isolated-host');
+    expect(fakeBins.calls()[1]?.argv).toContain('node-b');
+    });
   });
 
   test('the spawned self gate CLI reads the live release reservation from its selected state root', () => {
@@ -761,7 +832,7 @@ describe('entry-point wiring (spawned, no remote work)', () => {
         { cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test', ELANOUS_STATE_DIR: state } });
       expect(gate.status).toBe(1);
       expect(gate.stderr).toContain('node-b reserved (release gate graph-run-live holds node-b) — using node-c');
-      expect(gate.stderr).toContain('remote unmeasured on node-c — origin-main-unresolved');
+      expect(gate.stderr).toContain('remote unmeasured on node-c (stage=preflight, rc=unknown) — origin-main-unresolved');
     } finally { release(); }
   });
 

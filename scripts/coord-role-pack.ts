@@ -22,8 +22,16 @@ export interface RolePack {
 const KNOWHOW_PATH = 'docs/roles/OP/KNOWHOW.md';
 
 /**
+ * 카드 제목 문법은 src/seat-loop/knowhow-lint.ts 의 CARD_HEADING 과 같아야 한다.
+ * 다르면 린트가 카드로 못 본 제목이 자를 때 조용히 사라지거나, 번호만 잘려 엉뚱한 아이디로 제외 기록에 남는다.
+ */
+const CARD_HEADING = /^[ \t]{0,3}##\s+(K-[A-Za-z]+-\d+)(?=$|\s|:|—)(.*)$/u;
+const CARD_HEADING_LIKE = /^[ \t]{0,3}##\s*(K-[^\s:]*)/iu;
+const SECTION_HEADING = /^[ \t]{0,3}##\s/u;
+
+/**
  * KNOWHOW.md 를 `##` 제목 단위 카드로 자른다(코드 울타리 안은 본문으로 본다).
- * 유효한 `## K-<role>-<number>` 제목을 가진 카드만 반환한다.
+ * 린트 문법을 지킨 `## K-<role>-<number>` 제목만 카드로 반환하고, 카드처럼 보이지만 문법을 벗어난 제목은 파일 단위 린트처럼 실패한다.
  */
 export function splitKnowhowCards(body: string): Array<{ id: string; title: string; text: string }> {
   const segments: Array<{ heading: string | null; lines: string[] }> = [{ heading: null, lines: [] }];
@@ -40,7 +48,7 @@ export function splitKnowhowCards(body: string): Array<{ id: string; title: stri
       segments.at(-1)!.lines.push(line);
       continue;
     }
-    if (/^##\s/u.test(line)) {
+    if (SECTION_HEADING.test(line)) {
       segments.push({ heading: line, lines: [] });
       continue;
     }
@@ -49,9 +57,14 @@ export function splitKnowhowCards(body: string): Array<{ id: string; title: stri
   const cards: Array<{ id: string; title: string; text: string }> = [];
   for (const segment of segments) {
     if (!segment.heading) continue;
-    const heading = segment.heading.match(/^##\s+(K-[A-Za-z]+-\d+)\s*(.*)$/u);
-    if (!heading) continue;
-    cards.push({ id: heading[1]!, title: heading[2]!.trim(), text: [segment.heading, ...segment.lines].join('\n') });
+    const heading = segment.heading.match(CARD_HEADING);
+    if (!heading) {
+      // 카드처럼 보이는 제목이 문법을 벗어나면 통과도 제외 기록도 불가능하다 — 조용히 빼지 않고 그 자리에서 실패한다.
+      const like = segment.heading.match(CARD_HEADING_LIKE);
+      if (like) throw new KnowhowLintError(KNOWHOW_PATH, like[1]!, '카드 제목 형식이 K-<자리>-<번호>를 벗어남');
+      continue;
+    }
+    cards.push({ id: heading[1]!, title: heading[2]!.replace(/^[:\s—]+/u, '').trim(), text: [segment.heading, ...segment.lines].join('\n') });
   }
   return cards;
 }
@@ -141,7 +154,7 @@ export function buildCoordRolePackManifest(role: RolePackRole, root = resolve(im
   // The pack body is inline. Source docs only contribute hashes, so an installed package without them still builds.
   const present = SOURCE_PATHS.filter((path) => existsSync(resolve(repo, path)));
   const missingSources = SOURCE_PATHS.filter((path) => !present.includes(path));
-  const sources = present.map((path) => ({ path, sha256: sha256(readFileSync(resolve(repo, path), 'utf8')) }));
+  const sources: RolePack['sources'] = present.map((path) => ({ path, sha256: sha256(readFileSync(resolve(repo, path), 'utf8')) }));
   const knowhow = collectVerifiedKnowhow(repo);
   if (knowhow.fileBody !== null) sources.push({ path: KNOWHOW_PATH, sha256: sha256(knowhow.fileBody) });
   const packageJson = resolve(repo, 'package.json');

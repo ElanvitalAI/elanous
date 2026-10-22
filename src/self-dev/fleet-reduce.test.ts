@@ -26,7 +26,7 @@ describe('fleet reduce — 조각 PR 들을 하나로', () => {
     const r = await reduceShards({ repoRoot: '/repo', shards, branch: 'reduce/t', run: f.run, log: () => {} });
     expect(r).toMatchObject({ kind: 'pr-opened', prUrl: 'https://github.com/o/r/pull/9', branch: 'reduce/t' });
     expect(f.calls.filter((c) => c.startsWith('git merge --no-ff'))).toHaveLength(2);
-    expect(f.calls.filter((c) => c.includes('self gate --changed --base origin/main'))).toHaveLength(1);
+    expect(f.calls.filter((c) => c.includes('self gate --local --changed --base origin/main'))).toHaveLength(1);
     expect(f.calls.some((c) => c.startsWith('git push -q origin reduce/t:reduce/t'))).toBe(true);
     expect(f.calls.filter((c) => c.startsWith('gh pr comment'))).toHaveLength(2);
     expect(f.calls.some((c) => c.startsWith('gh pr close'))).toBe(false);

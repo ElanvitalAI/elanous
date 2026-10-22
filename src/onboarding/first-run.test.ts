@@ -394,8 +394,10 @@ describe('first run', () => {
         OPENROUTER_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '',
         LOCAL_LLM_URL: '',
       };
+      // `script` 로 파이프 입력 위에 세운 PTY 는 창 크기가 0×0 이라 TUI 가 «requires at least 20 columns and 6 rows» 로 죽는다 —
+      // 대시보드 진입을 보는 시험이므로 PTY 크기를 먼저 고정한다.
       const processChild = spawn('sh', ['-c', 'script -q -e -c "$1" /dev/null', 'sh',
-        `${process.execPath} ${resolve(import.meta.dir, '../../bin/elanous.mjs')} --test --config-dir ${configDir}`],
+        `stty rows 40 cols 120; exec ${process.execPath} ${resolve(import.meta.dir, '../../bin/elanous.mjs')} --test --config-dir ${configDir}`],
         { cwd: resolve(import.meta.dir, '../..'), env, stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';

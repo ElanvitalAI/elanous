@@ -15,15 +15,28 @@
 // tests that run where the tool exists.
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, isAbsolute, join } from 'node:path';
 
 export interface FakeBinSpec {
   readonly stdout?: string;
   readonly stderr?: string;
   /** Exit code (default 0). */
   readonly exitCode?: number;
-  /** Stay alive this long before exiting — for long-running daemons a test kills. */
+  /** Stay alive this long before exiting — for long-running daemons a test kills, or a fractional
+   *  per-call latency (e.g. 0.2) for a test that measures fan-out. */
   readonly sleepSeconds?: number;
+  /**
+   * Fake only the calls whose argv starts with these words (e.g. `['worktree', 'add']`);
+   * every other call `exec`s `otherwise` with the same argv. Needs `otherwise`.
+   */
+  readonly whenArgsStartWith?: readonly string[];
+  /** Absolute path of the real executable that serves the calls `whenArgsStartWith` does not match. */
+  readonly otherwise?: string;
+  /**
+   * After stdout/stderr (and any sleep), the fake kills itself with this signal instead of exiting —
+   * a «died without a word» failure (`status` null · `signal` set). `exitCode` is then never reached.
+   */
+  readonly killSignal?: 'KILL' | 'TERM' | 'INT' | 'HUP' | 'ABRT' | 'SEGV';
 }
 
 export interface FakeBinCall {
@@ -48,6 +61,7 @@ export interface FakeBins {
 }
 
 const NAME = /^[A-Za-z0-9._+-]+$/;
+const KILL_SIGNALS: ReadonlySet<string> = new Set(['KILL', 'TERM', 'INT', 'HUP', 'ABRT', 'SEGV']);
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -57,25 +71,37 @@ function script(name: string, spec: FakeBinSpec, dataDir: string, logPath: strin
   const lines = ['#!/bin/sh'];
   // One record per call: name and each argv entry NUL-terminated (one printf), then an ASCII record
   // separator \x1e (a second printf). `calls()` drops the unterminated tail, so a reader never sees half a record.
-  lines.push(`{ printf '%s\\0' ${shellQuote(name)} "$@"; printf '\\036'; } >> ${shellQuote(logPath)}`);
+  // The record is staged in its own file and appended by one `cat` (one write), so concurrent calls never interleave.
+  // The fake PATH may itself contain mktemp, cat, or rm. Use the shell's default utility path
+  // for recorder and payload reads so a fake of one of those names cannot recursively call itself.
+  lines.push(`rec=$(command -p mktemp ${shellQuote(join(dataDir, 'rec.XXXXXX'))})`);
+  lines.push(`{ printf '%s\\0' ${shellQuote(name)} "$@"; printf '\\036'; } > "$rec"; command -p cat "$rec" >> ${shellQuote(logPath)}; command -p rm -f "$rec"`);
+  if (spec.whenArgsStartWith !== undefined && spec.otherwise !== undefined) {
+    const words = spec.whenArgsStartWith;
+    const tests = [`[ "$#" -ge ${words.length} ]`, ...words.map((word, index) => `[ "$${index + 1}" = ${shellQuote(word)} ]`)];
+    lines.push(`if ${tests.join(' && ')}; then :; else exec ${shellQuote(spec.otherwise)} "$@"; fi`);
+  }
   if (spec.stdout !== undefined) {
     const file = join(dataDir, `${name}.stdout`);
     writeFileSync(file, spec.stdout);
-    lines.push(`cat ${shellQuote(file)}`);
+    lines.push(`command -p cat ${shellQuote(file)}`);
   }
   if (spec.stderr !== undefined) {
     const file = join(dataDir, `${name}.stderr`);
     writeFileSync(file, spec.stderr);
-    lines.push(`cat ${shellQuote(file)} >&2`);
+    lines.push(`command -p cat ${shellQuote(file)} >&2`);
   }
   const exitCode = spec.exitCode ?? 0;
   if (spec.sleepSeconds !== undefined && spec.sleepSeconds > 0) {
-    const seconds = Math.ceil(spec.sleepSeconds);
+    // Whole seconds stay as they were; a fraction keeps millisecond precision (`sleep 0.2` — BSD · GNU · busybox).
+    const seconds = Number.isInteger(spec.sleepSeconds) ? spec.sleepSeconds : Math.ceil(spec.sleepSeconds * 1000) / 1000;
     // exit 0: `exec` so killing the fake kills the sleep itself. Any other code needs the shell to
     // outlive the sleep; a fake killed mid-sleep then leaves `sleep` until `sleepSeconds` ends.
-    if (exitCode === 0) lines.push(`exec sleep ${seconds}`);
+    // killSignal must outlive the sleep too, or `exec` would replace the shell before the kill line.
+    if (exitCode === 0 && spec.killSignal === undefined) lines.push(`exec sleep ${seconds}`);
     else lines.push(`sleep ${seconds}`);
   }
+  if (spec.killSignal !== undefined) lines.push(`kill -s ${spec.killSignal} $$`);
   lines.push(`exit ${exitCode}`);
   return `${lines.join('\n')}\n`;
 }
@@ -83,6 +109,15 @@ function script(name: string, spec: FakeBinSpec, dataDir: string, logPath: strin
 export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): FakeBins {
   for (const name of Object.keys(specs)) {
     if (!NAME.test(name) || name === '.' || name === '..') throw new Error(`fake-bin: invalid executable name ${JSON.stringify(name)}`);
+    const spec = specs[name]!;
+    if (spec.killSignal !== undefined && !KILL_SIGNALS.has(spec.killSignal)) throw new Error(`fake-bin: ${name}: killSignal must be one of ${[...KILL_SIGNALS].join(', ')}`);
+    if (spec.whenArgsStartWith !== undefined) {
+      if (spec.whenArgsStartWith.length === 0) throw new Error(`fake-bin: ${name}: whenArgsStartWith needs at least one word`);
+      if (spec.otherwise === undefined) throw new Error(`fake-bin: ${name}: whenArgsStartWith needs otherwise (the real executable)`);
+      if (!isAbsolute(spec.otherwise)) throw new Error(`fake-bin: ${name}: otherwise must be an absolute path, got ${JSON.stringify(spec.otherwise)}`);
+    } else if (spec.otherwise !== undefined) {
+      throw new Error(`fake-bin: ${name}: otherwise is only used with whenArgsStartWith`);
+    }
   }
   const root = mkdtempSync(join(tmpdir(), 'ux-sim-fake-bin-'));
   const dir = join(root, 'bin');

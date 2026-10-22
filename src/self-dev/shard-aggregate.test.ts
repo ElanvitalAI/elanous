@@ -1,6 +1,8 @@
-import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
+import { debug } from '../debug/log.js';
 import { allowsBaselineOnlyFailure, buildGateBaselineReport } from '../self-implement/gate-baseline.js';
 import { aggregateGateTestShards, type GateShardAttempt } from './shard-aggregate.js';
 import type { GateTestShard } from './shard-plan.js';
@@ -37,6 +39,24 @@ describe('aggregateGateTestShards', () => {
     expect(aggregate.report?.failures.map((failure) => [failure.name, failure.attribution])).toEqual(whole.failures.map((failure) => [failure.name, failure.attribution]));
     expect(allowsBaselineOnlyFailure(aggregate.report!)).toBe(allowsBaselineOnlyFailure(whole));
     expect(aggregate.retryShardIds).toEqual([]);
+  });
+
+  test('a shard baseline testcase named only under another file is an attribution mismatch, not an introduced failure', () => {
+    const a = 'test/a.test.ts';
+    const b = 'test/b.test.ts';
+    const c = 'test/c.test.ts';
+    const results = [
+      attempt(1, junit(a, [{ name: 'owner', failed: true }, { name: 'copied', failed: true }, { name: 'brand-new', failed: true }]), junit(a, [{ name: 'owner' }]), 1, 0),
+      attempt(2, junit(b, [{ name: 'copied' }]), junit(b, [{ name: 'copied' }]), 0, 0),
+      attempt(3, junit(c, [{ name: 'ok' }]), junit(c, [{ name: 'ok' }]), 0, 0),
+    ];
+    const aggregate = aggregateGateTestShards(shards, results);
+    expect(aggregate.status).toBe('failed');
+    expect(aggregate.report).toMatchObject({ introduced: 2, unknown: 1 });
+    const judged = new Map(aggregate.report!.failures.map((failure) => [failure.name, [failure.attribution, failure.unknownReason]]));
+    expect(judged.get(`${a} > copied`)).toEqual(['unknown', '귀속 불일치']);
+    expect(judged.get(`${a} > owner`)).toEqual(['introduced', undefined]);
+    expect(judged.get(`${a} > brand-new`)).toEqual(['introduced', undefined]);
   });
 
   test('a dead shard is the only reassignment; a completed sibling remains usable on retry', () => {
@@ -116,6 +136,43 @@ describe('aggregateGateTestShards', () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  test('real bun JUnit: a failure whose name lives only in another baseline file is attributed unknown, not introduced', () => {
+    const directory = mkdtempSync(join(process.cwd(), 'shard-attribution-'));
+    try {
+      const owner = relative(process.cwd(), join(directory, 'owner.test.ts'));
+      const source = relative(process.cwd(), join(directory, 'source.test.ts'));
+      const files = [owner, source];
+      const run = (outfile: string) => {
+        const spawned = Bun.spawnSync(['bun', 'test', ...files, '--reporter=junit', `--reporter-outfile=${outfile}`], {
+          cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+        });
+        return { exitCode: spawned.exitCode, xml: readFileSync(outfile, 'utf8') };
+      };
+      writeFileSync(owner, "import { expect, test } from 'bun:test';\ntest('owner', () => { expect(1).toBe(1); });\n");
+      writeFileSync(source, "import { expect, test } from 'bun:test';\ntest('copied', () => { expect(1).toBe(1); });\n");
+      const baseline = run(join(directory, 'baseline.xml'));
+      expect(baseline.exitCode).toBe(0);
+      writeFileSync(owner, "import { expect, test } from 'bun:test';\n"
+        + "test('owner', () => { expect(1).toBe(2); });\n"
+        + "test('copied', () => { expect(1).toBe(2); });\n"
+        + "test('brand-new', () => { expect(1).toBe(2); });\n");
+      const current = run(join(directory, 'current.xml'));
+      expect(current.exitCode).toBe(1);
+      const result = aggregateGateTestShards([{ id: 'shard-1', files, plannedRssMb: 1, plannedSeconds: 1 }], [
+        { shardId: 'shard-1', attempt: 1, currentJUnit: current.xml, baselineJUnit: baseline.xml, currentExitCode: 1, baselineExitCode: 0 },
+      ]);
+      expect(result.status).toBe('failed');
+      expect(result.retryShardIds).toEqual([]);
+      expect(result.report).toMatchObject({ introduced: 2, unknown: 1 });
+      const judged = new Map(result.report!.failures.map((failure) => [failure.name, [failure.attribution, failure.unknownReason]]));
+      expect(judged.get(`${owner} > copied`)).toEqual(['unknown', '귀속 불일치']);
+      expect(judged.get(`${owner} > owner`)).toEqual(['introduced', undefined]);
+      expect(judged.get(`${owner} > brand-new`)).toEqual(['introduced', undefined]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   test('a case skipped now but passed at base is counted unknown, not unmeasured — skips no longer void the shard, but a skip must not hide a regression (TC decision 10-10 · LIGHT-RC-MEASURE ②)', () => {
     const file = 'test/a.test.ts';
@@ -205,4 +262,60 @@ describe('aggregateGateTestShards', () => {
     expect(result.report).toMatchObject({ introduced: 1, timeoutPassedAtBase: 1 });
     expect(result.report?.failures[0]).toMatchObject({ attribution: 'introduced', timeoutRegression: 'passed-at-base' });
   });
+});
+
+describe('SHARD-JUNIT-ABS-PATH — absolute JUnit file attributes', () => {
+  // bun writes an absolute `file` once a test process.chdir()s (10-21 #29988 · subworkflow.test.ts). On macOS that
+  // path is the realpath (/private/tmp/…) while the gate root may be /tmp/… — both sides are realpath-compared.
+  const withRoot = (body: (root: string, real: string) => void) => {
+    const root = mkdtempSync(join(tmpdir(), 'shard-abs-'));
+    try {
+      mkdirSync(join(root, 'test'), { recursive: true });
+      for (const name of ['a', 'b']) writeFileSync(join(root, 'test', `${name}.test.ts`), '');
+      body(root, realpathSync(root));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+
+  test('an absolute file attribute under the shard root is normalized and the shard is measured', () => withRoot((root, real) => {
+    const file = 'test/a.test.ts';
+    const log = spyOn(debug, 'log');
+    try {
+      const current = junit(join(real, file), [{ name: 'one' }, { name: 'two' }]);
+      const baseline = junit(join(real, file), [{ name: 'one' }, { name: 'two' }]);
+      const result = aggregateGateTestShards([shards[0]!], [{ ...attempt(1, current, baseline, 0, 0), currentRoot: root, baselineRoot: root }]);
+      expect(result).toEqual({ status: 'passed', retryShardIds: [] });
+      expect(log.mock.calls.some(([category, event, data]) => category === 'gate.shard' && event === 'junit-path-normalized'
+        && (data as { to?: string }).to === file && (data as { from?: string }).from === join(real, file))).toBe(true);
+    } finally { log.mockRestore(); }
+  }));
+
+  test('normalized current failures keep the baseline attribution', () => withRoot((root, real) => {
+    const file = 'test/a.test.ts';
+    const current = junit(join(real, file), [{ name: 'old', failed: true }, { name: 'new', failed: true }]);
+    const baseline = junit(file, [{ name: 'old', failed: true }, { name: 'new' }]);
+    const result = aggregateGateTestShards([shards[0]!], [{ ...attempt(1, current, baseline, 1, 1), currentRoot: root }]);
+    expect(result.status).toBe('failed');
+    expect(result.report?.failures.map((failure) => [failure.name, failure.attribution]))
+      .toEqual([[`${file} > old`, 'preexisting'], [`${file} > new`, 'introduced']]);
+  }));
+
+  test('an absolute file attribute outside the shard root is still rejected and recorded', () => withRoot((root) => {
+    const outside = mkdtempSync(join(tmpdir(), 'shard-abs-outside-'));
+    const log = spyOn(debug, 'log');
+    try {
+      const file = 'test/a.test.ts';
+      const current = junit(join(outside, file), [{ name: 'one' }]);
+      const baseline = junit(file, [{ name: 'one' }]);
+      const result = aggregateGateTestShards([shards[0]!], [{ ...attempt(1, current, baseline, 0, 0), currentRoot: root }]);
+      expect(result).toEqual({ status: 'unmeasured', retryShardIds: ['shard-1'] });
+      expect(log.mock.calls.some(([category, event, data]) => category === 'gate.shard' && event === 'junit-path-outside-root'
+        && (data as { from?: string }).from === join(outside, file))).toBe(true);
+    } finally { log.mockRestore(); rmSync(outside, { recursive: true, force: true }); }
+  }));
+
+  test('without a shard root an absolute file attribute stays rejected (old shape)', () => withRoot((_root, real) => {
+    const file = 'test/a.test.ts';
+    const result = aggregateGateTestShards([shards[0]!], [attempt(1, junit(join(real, file), [{ name: 'one' }]), junit(file, [{ name: 'one' }]), 0, 0)]);
+    expect(result.retryShardIds).toEqual(['shard-1']);
+  }));
 });

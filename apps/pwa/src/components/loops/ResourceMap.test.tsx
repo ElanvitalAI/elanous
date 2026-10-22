@@ -41,6 +41,10 @@ test('GET /v1/loops/resources production observation reaches the resource screen
     const html = renderToStaticMarkup(<ResourceMap snapshot={body} />);
     expect(html).toContain('RES-LOOP-M3');
     expect(resourceGraph(body, true).nodes[0]?.data.detail).toContain('대기 잡 RES-LOOP-M3');
+    const servedCellIds = body.resource.seats.flatMap(row => row.nextCell ? [row.nextCell.id] : []);
+    expect(servedCellIds).toEqual(['RES-LOOP-M3']);
+    expect(html.match(/data-cell-id="([^"]*)"/g)).toEqual(['data-cell-id="RES-LOOP-M3"']);
+    expect(html).toContain(`data-observed-at="${body.resource.now}"`);
   } finally { server.stop(); }
 });
 
@@ -54,6 +58,9 @@ test('one resource loop node contains measured seats, jobs, loans and waits with
   const html = renderToStaticMarkup(<ResourceMap snapshot={snapshot} />);
   for (const text of ['자원 관리 루프', '자리', '잡', '임대 1', '대여 1', '대기 잡 CMO-1', '2/6']) expect(html).toContain(text);
   expect(html.match(/data-id="loop:resources"/g)).toHaveLength(1);
+  expect(html).toContain('data-cell-id="MK-1"');
+  expect(html.match(/data-cell-id=/g)).toHaveLength(1);
+  expect(html).toContain('data-observed-at="2026-10-05T00:00:00Z"');
   const near = resourceGraph(snapshot, true);
   expect(near.nodes).toHaveLength(1);
   expect(near.nodes[0]?.id).toBe(RESOURCE_NODE);
@@ -62,4 +69,15 @@ test('one resource loop node contains measured seats, jobs, loans and waits with
   expect(near.nodes[0]?.data.detail).toContain('대기 잡 MK-1 다음 잡');
   expect(near.edges).toEqual([]);
   expect(resourceGraph(snapshot, false).nodes[0]?.data.detail).toBe('자리 2 · 미배정 런 1');
+});
+
+test('a blank waiting cell id shows as no cell on the resource screen, the same rule the API serves', () => {
+  const blank: ResourceSnapshot = { resource: { ...snapshot.resource, seats: [
+    { ...snapshot.resource.seats[0]!, nextCell: { id: '   ', title: 'unnamed work' } },
+    snapshot.resource.seats[1]!,
+  ] } };
+  const html = renderToStaticMarkup(<ResourceMap snapshot={blank} />);
+  expect(html.match(/data-cell-id=/g)).toBeNull();
+  expect(html.match(/다음 잡 판정 없음/g)!.length).toBeGreaterThanOrEqual(2);
+  expect(resourceGraph(blank, true).nodes[0]?.data.detail).not.toContain('unnamed work');
 });

@@ -85,6 +85,16 @@ describe('auth.json 읽기 — ⛔ flat 이 아니고, 판본마다 키가 다�
     expect(resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv })?.token).toBe('new-token');
   });
 
+  it('원격 hq-mirror 가 있으면 기존 다른 스코프를 보존하면서 그 access 를 우선한다', () => {
+    const home = homeWithAuth({
+      'https://auth.x.ai::other': { key: 'other-token', expires_at: '2035-12-01T00:00:00Z', refresh_token: 'existing-refresh' },
+      'https://auth.x.ai::hq-mirror': { key: 'hq-mirror-token', expires_at: '2030-12-01T00:00:00Z' },
+    });
+    const credential = resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv });
+    expect(credential?.token).toBe('hq-mirror-token');
+    expect(credential?.expiresAt).toBe('2030-12-01T00:00:00Z');
+  });
+
   it('README 판본 키(accounts.x.ai/sign-in)도 «훑어서» 잡는다', () => {
     // 벤더 README 의 jq 예제가 쓰는 키. 이 기계의 실제 키와 다르다 — 그래서 훑는다.
     const home = homeWithAuth({ 'https://accounts.x.ai/sign-in': { key: 'readme-shape', expires_at: '2026-12-01T00:00:00Z' } });

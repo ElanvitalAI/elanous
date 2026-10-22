@@ -11,6 +11,7 @@ import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { debug } from '../../debug/log.js';
 import { parseWarmWorkerReply, type WarmWorkerCommand, type WarmWorkerKey, type WarmWorkerReply } from './pod-warm-worker-protocol.js';
 import type { WarmWorkerOutcome } from './pod-warm-worker-runtime.js';
+import { warmExecEnv } from './pod-warm-provenance.js';
 
 const SHA = /^[a-f0-9]{40}$/;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
@@ -424,7 +425,9 @@ export class WarmPodTransport {
     try { nodeArch = node.status === 0 ? JSON.parse(node.stdout)?.metadata?.labels?.['kubernetes.io/arch'] : null; }
     catch { nodeArch = null; }
     if (nodeArch !== this.spec.key.architecture) return fallback('pod-unready');
-    if (this.podUid && uid !== this.podUid) { this.quarantined = true; return fallback('pod-replaced'); }
+    if ((command.podUid && uid !== command.podUid) || (this.podUid && uid !== this.podUid)) {
+      this.quarantined = true; return fallback('pod-replaced');
+    }
     this.podUid = uid;
     const ledgerKey = sha256([this.spec.kubectlContext, this.spec.namespace, this.spec.name, uid].join('\0'));
     const ledgerPath = this.ledgerDir ? join(this.ledgerDir, ledgerKey) : null;
@@ -434,7 +437,8 @@ export class WarmPodTransport {
       this.quarantined = true;
       return fallback('worker-quarantined');
     }
-    const exec = this.kubectl([...prefix, 'exec', '-i', this.spec.name, '-c', 'worker', '--', 'bun', '-e', WARM_POD_EXEC], JSON.stringify(command));
+    const exec = this.kubectl([...prefix, 'exec', '-i', this.spec.name, '-c', 'worker', '--',
+      'env', ...warmExecEnv(command), 'bun', '-e', WARM_POD_EXEC], JSON.stringify(command));
     if (exec.status !== 0) { this.quarantined = true; return fallback('exec-failed'); }
     // UID alone is insufficient: ephemeral containers can be added to a live Pod under the same UID.
     const after = this.kubectl([...prefix, 'get', 'pod', this.spec.name, '-o', 'json']);

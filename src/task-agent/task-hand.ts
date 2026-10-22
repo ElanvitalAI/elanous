@@ -17,6 +17,7 @@ import { validateUnitCalls } from '../graph-runner/runner.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
 import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harness-space.js';
+import { newLaunchUtteranceId, recordLaunchUtterance } from '../harness/launch-utterance-ledger.js';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { withFileLockSync } from '../storage/file-lock.js';
@@ -51,38 +52,35 @@ function missingOrReadFailure(error: unknown): '없다' | '읽기 실패' {
   return code === 'ENOENT' || code === 'ENOTDIR' ? '없다' : '읽기 실패';
 }
 
-/**
- * TA-WORK-ORDER — `.work-order.json` 골 파일의 내용을 지시서로 검증한다.
- * 통과하면 골 문면으로 펼쳐 `work-order` 로, 깨진 JSON·칸 id 없음은 `rejected`(사유) 로 돌린다.
- * 관측: `debug.log('task-agent.work-order', 'parsed' | 'rejected', { cellId, unknownFields })`.
- */
-function resolveWorkOrderFile(content: string, path: string): ResolvedHandText {
-  const parsed = parseWorkOrder(content);
-  if (!parsed.ok) {
-    try { debug.log('task-agent.work-order', 'rejected', { cellId: null, unknownFields: [] }); } catch { /* fail-soft */ }
-    return { kind: 'rejected', path, reason: parsed.reason };
-  }
-  try { debug.log('task-agent.work-order', 'parsed', { cellId: parsed.order.cellId, unknownFields: parsed.order.unknownFields }); } catch { /* fail-soft */ }
-  return { kind: 'work-order', text: renderWorkOrderGoal(parsed.order), path, order: parsed.order };
-}
-
-/** 파일 판정만 한다. 관측과 카드 작성은 호출자가 결과에 따라 수행한다. */
+/** 파일 판정만 한다. 카드 작성은 호출자가 결과에 따라 수행한다. */
 export function resolveHandText(text: string, deps: ResolveHandTextDeps = { cwd: process.cwd(), stat: statSync, readFile: readFileSync }): ResolvedHandText {
-  if (!text || /\s/.test(text)) return { kind: 'unchanged', text };
+  const workOrder = WORK_ORDER_FILE_PATTERN.test(text);
+  if (!text || (/\s/.test(text) && !workOrder)) return { kind: 'unchanged', text };
   const path = resolve(deps.cwd, text);
   const extension = /\.(?:md|markdown|txt)$/i.test(text);
+  const reject = (reason: string): ResolvedHandText => {
+    if (workOrder) {
+      try { debug.log('task-agent.work-order', 'rejected', { cellId: null, unknownFields: [] }); } catch { /* fail-soft */ }
+    }
+    return { kind: 'rejected', path, reason };
+  };
   let file: Pick<Stats, 'isFile' | 'isDirectory'>;
   try { file = deps.stat(path); } catch (error) {
-    if (!extension) return { kind: 'unchanged', text };
-    return { kind: 'rejected', path, reason: missingOrReadFailure(error) };
+    if (!extension && !workOrder) return { kind: 'unchanged', text };
+    return reject(missingOrReadFailure(error));
   }
-  if (!file.isFile() && !extension && !file.isDirectory()) return { kind: 'unchanged', text };
-  if (!file.isFile()) return { kind: 'rejected', path, reason: file.isDirectory() ? '디렉터리' : '읽기 실패' };
+  if (!file.isFile() && !extension && !workOrder && !file.isDirectory()) return { kind: 'unchanged', text };
+  if (!file.isFile()) return reject(file.isDirectory() ? '디렉터리' : '읽기 실패');
   let content: string;
   // stat 과 read 사이에 지워지거나 경로가 바뀌어도 사유는 같은 규칙(없다/읽기 실패)으로 가른다.
-  try { content = deps.readFile(path, 'utf8'); } catch (error) { return { kind: 'rejected', path, reason: missingOrReadFailure(error) }; }
+  try { content = deps.readFile(path, 'utf8'); } catch (error) { return reject(missingOrReadFailure(error)); }
   // TA-WORK-ORDER — 지시서 골 파일은 인라인하지 않고 지시서로 검증해 골 문면으로 펼친다.
-  if (WORK_ORDER_FILE_PATTERN.test(text)) return resolveWorkOrderFile(content, path);
+  if (workOrder) {
+    const parsed = parseWorkOrder(content);
+    if (!parsed.ok) return reject(parsed.reason);
+    try { debug.log('task-agent.work-order', 'parsed', { cellId: parsed.order.cellId, unknownFields: parsed.order.unknownFields }); } catch { /* fail-soft */ }
+    return { kind: 'work-order', text: renderWorkOrderGoal(parsed.order), path, order: parsed.order };
+  }
   const carried = content.trim();
   if (!carried) return { kind: 'rejected', path, reason: '비었다' };
   return { kind: 'inlined', text: content, path, chars: carried.length, sha256: createHash('sha256').update(carried).digest('hex') };
@@ -305,6 +303,11 @@ export interface TaskCard {
   childLlm?: TaskChildLlm;
   /** Dispatch difficulty, fixed at handoff so repair uses the same judgement. */
   tier?: '하' | '중' | '상' | '특';
+  /**
+   * TIER-SPLIT-BEFORE-LAUNCH — 상·특 hand 를 분해해 나온 조각 카드(`tier-split.ts`). group = 같은 hand 에서 나온 조각들의 묶음 id
+   * (칸 연결은 `checklistId` 가 그대로 잇는다) · fromTier = 원래 난이도 · unavoidable = 상으로 남은 조각의 불가피 이유.
+   */
+  tierSplit?: { group: string; fromTier: '상' | '특'; index: number; total: number; unavoidable?: string };
   /** RUN-IDENTITY-TAGS — 출생 신분 묶음(`run-identity.js` 정본): 칸 우선순위·대표 표시에서 태어나고 `--tag k=v` 가 덮는다. 카드 상태 파일이 원장 정본이다. */
   identity?: RunIdentity;
   /** Same-PR repair launches; exact source head and worker result are retained for CAS and retry limits. */
@@ -577,7 +580,7 @@ export function shellQuote(arg: string): string {
 }
 
 /** 발사기에 넘기는 연결 — env(`ELANOUS_RUN_ID`)를 자식 환경에 얹으면 하니스 런이 `runId` 로 돈다(`resolveRunIdentity` 상속). launchId 는 카드에만 남는 발사 토큰이다. */
-export interface TaskLaunchContext { runId: string; launchId: string; env: Record<string, string>; cardLabelContext?: TaskCardLabelContext; substrate?: 'pod'; podGoal?: string; effectiveChildProvider?: string }
+export interface TaskLaunchContext { runId: string; launchId: string; env: Record<string, string>; /** exact untrimmed hand text (launch-utterance ledger pair) */ launchUtterance?: string; cardLabelContext?: TaskCardLabelContext; substrate?: 'pod'; podGoal?: string; effectiveChildProvider?: string }
 /** 발사기가 «이 런 id 로 띄웠다»고 돌려주는 영수증 — 없으면 카드에 런 id 를 적지 않는다(추측하지 않는다). */
 export interface TaskLaunchReceipt {
   runId?: string;
@@ -597,12 +600,18 @@ export interface HandTaskOptions {
   goal?: string;
   milestone?: string;
   live?: boolean;
+  /** Production `tasks hand --live` guard; test launchers opt in explicitly. */
+  preflightGoalDoneBoundary?: boolean;
   /** TA-LIVE-LAND-2 — `--ta-land`: card field `taLand` ⊕ launch env `ELANOUS_TA_LAND=1`. */
   taLand?: boolean;
   /** TASKS-HAND-CHILD-LLM — `<provider>/<model>`(`parseChildLlm`) ⊕ 선택 추론 노력. effort 만 주면 거부. */
   childLlm?: string;
   childLlmEffort?: string;
   tier?: TaskCard['tier'];
+  /** TIER-SPLIT-BEFORE-LAUNCH — 조각 카드에 싣는 분해 연결(`tier-split.ts` 만 준다). */
+  tierSplit?: TaskCard['tierSplit'];
+  /** TIER-SPLIT-BEFORE-LAUNCH — 분해 실패 사유. 주면 카드를 발사 없이 failed(history `tier-split-failed`)로 남기고 launched:false 로 돌아온다. */
+  tierSplitBlocked?: string;
   /** RUN-IDENTITY-TAGS — `tasks hand --tag k=v`(반복): 출생 신분을 덮는다. 목록 밖 값은 거부한다(`run-identity.js`). */
   tags?: string[];
   /** RUN-IDENTITY-TAGS — 칸 읽기 seam(우선순위·대표 표시). 주면 그 답이 최종이다(«칸 없음» 포함). */
@@ -682,6 +691,7 @@ export function dispatchDeliverableCompletion(id: string, input: { ref: string; 
 export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const text = opts.text.trim();
   if (!text) throw new Error('과제 한 줄이 비어 있다');
+  const path = opts.statePath ?? taskAgentStatePath();
   const targetPathHints = parseAskTargetPathHintsResult(text);
   const targetPaths = canonicalTargetPaths(targetPathHints.paths);
   if (opts.seat !== undefined && !TASK_SEATS.includes(opts.seat)) throw new Error(`자리는 ${TASK_SEATS.join('|')} 중 하나다: ${opts.seat}`);
@@ -691,6 +701,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   }
   if (opts.childLlmEffort !== undefined && opts.childLlm === undefined) throw new Error('--child-llm-effort 는 --child-llm <provider>/<model> 과 함께 준다');
   if (opts.tier !== undefined && !['하', '중', '상', '특'].includes(opts.tier)) throw new Error(`--tier 는 하|중|상|특 중 하나다: ${opts.tier}`);
+  const tierSplitBlocked = opts.tierSplitBlocked;
   // RUN-IDENTITY-TAGS — 출생 신분: 칸 우선순위(P0 = critical·special·protect · P1 = normal · 그 외 normal)·대표 표시에서 단다.
   // `--tag k=v`(반복) 이 덮는다 — 칸·태그 없는 손은 오늘 모양 그대로다(신분 없음). 목록 밖 값은 카드를 적기 전에 거부한다(`run-identity.js` 정본).
   const birthCell = opts.checklistId === undefined ? undefined
@@ -732,7 +743,6 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const now = (opts.now ?? (() => new Date()))();
   const id = opts.id ?? `${TASK_CARD_PREFIX}${now.toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(3).toString('hex')}`;
   const mode = opts.live ? 'live' : 'shadow';
-  const path = opts.statePath ?? taskAgentStatePath();
   const card: TaskCard = {
     id, text,
     ...(!targetPathHints.labelMissing ? { targetPaths } : {}),
@@ -749,18 +759,21 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.taLand === true ? { taLand: true as const } : {}),
     ...(childLlm ? { childLlm } : {}),
     ...(opts.tier ? { tier: opts.tier } : {}),
+    ...(opts.tierSplit ? { tierSplit: opts.tierSplit } : {}),
     ...(identity ? { identity } : {}),
     createdAt: now.toISOString(),
-    status: selectionFailure ? 'failed' : 'handed',
+    status: selectionFailure || tierSplitBlocked !== undefined ? 'failed' : 'handed',
     history: selectionFailure ? [{ at: now.toISOString(), event: !selected.composition ? 'composition-missing'
-      : selected.error ? 'composition-invalid' : 'composition-launcher-unavailable', detail: selectionFailure }] : [],
+      : selected.error ? 'composition-invalid' : 'composition-launcher-unavailable', detail: selectionFailure }]
+      : tierSplitBlocked !== undefined ? [{ at: now.toISOString(), event: 'tier-split-failed', detail: `tier-split-failed: ${tierSplitBlocked}` }] : [],
     ...(opts.mission ? { mission: opts.mission, after: [...(opts.after ?? [])] } : {}),
     ...(opts.cardFields?.pr !== undefined ? { pr: opts.cardFields.pr } : {}),
     ...(opts.cardFields?.goalId !== undefined ? { goalId: opts.cardFields.goalId } : {}),
     ...(opts.cardFields?.handed !== undefined ? { handed: opts.cardFields.handed } : {}),
   };
   const move = selectionFailure ? undefined : nextMoveFor(card, opts.landed);
-  if (move && move.kind !== 'launch') throw new Error(`발사할 수 없는 과제다 — ${move.reason}`);
+  // 분해 실패로 막은 카드는 wait(failed 사유)가 정답이다 — 던지지 않고 카드를 적은 뒤 발사 0 으로 돌아간다.
+  if (move && move.kind !== 'launch' && tierSplitBlocked === undefined) throw new Error(`발사할 수 없는 과제다 — ${move.reason}`);
   const guard = opts.writeGuard;
   const writeCard = (target: string, next: TaskCard): void => {
     if (!guard) { writeTaskCards(target, [next]); return; }
@@ -775,6 +788,15 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     });
     if (!owned.ok) throw new TaskCardSupersededError(next.id);
   };
+  // Production Pod launches use the remote-parent lint's shared boundary judge.
+  // Injected launchers are test seams and opt in explicitly at the contract test.
+  if (opts.live && opts.preflightGoalDoneBoundary && !selectionFailure && move?.kind === 'launch') {
+    readTaskAgentState(path);
+    const { missing } = inspectGoalDoneBoundary(text);
+    if (missing.length > 0) {
+      throw new Error(`goal-revision-required: 완료 경계 누락 ${missing.join(' · ')} — 골 문면에 완료 경계 코드·완료 경계 실물·완료 경계 증거 명령을 적은 뒤 다시 넘기세요`);
+    }
+  }
   writeCard(path, card);
   try { debug.log('task-agent.hand', 'target-paths', { card: id, count: targetPaths.length, labelMissing: targetPathHints.labelMissing }); } catch { /* fail-soft */ }
   try { debug.log('task-agent.graph-select', !selected.composition ? 'composition-missing' : selected.error ? 'composition-invalid' : 'composition-selected', {
@@ -783,6 +805,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(selected.error ? { error: selected.error } : {}),
   }); } catch { /* fail-soft */ }
   if (selectionFailure) throw new Error(`${selectionFailure} (카드 ${id})`);
+  if (tierSplitBlocked !== undefined && move) return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (!move || move.kind !== 'launch') throw new Error('조합 선택 뒤 발사 수가 없다');
   try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode, projectId: project?.id ?? null, targetIsGit, taLand: card.taLand === true, runPriority: card.identity ? runPriorityClass(card.identity) : null }); } catch { /* fail-soft */ }
   if (childLlm) {
@@ -790,17 +813,6 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   }
   if (mode === 'shadow') return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
-  if (completion === 'code-pr' && card.checklistId) {
-    const { missing } = inspectGoalDoneBoundary(text);
-    if (missing.length > 0) {
-      const reason = `goal-revision-required: 완료 경계 누락 ${missing.join(' · ')} — 골 문면을 고친 뒤 다시 넘기세요`;
-      const failed: TaskCard = { ...card, status: 'failed', history: [...card.history,
-        { at: (opts.now ?? (() => new Date()))().toISOString(), event: 'goal-revision-required', detail: reason }] };
-      writeCard(path, failed);
-      try { debug.log('task-agent.hand', 'done-boundary-missing', { taskId: id, checklistId: card.checklistId ?? null, missing, reason }); } catch { /* fail-soft */ }
-      throw new Error(`${reason} (카드 ${id})`);
-    }
-  }
   let prelaunch: AlreadyDoneDecision;
   try { prelaunch = completion === 'code-pr'
     ? (opts.prelaunchInspector ?? ((input, target) => inspectPrelaunchAlreadyDone(input, target,
@@ -817,8 +829,9 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     return { card: candidate, move: nextMoveFor(candidate), mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   }
   const runId = mintRunId();
-  const launchId = `tl-${randomBytes(6).toString('hex')}`;
-  const context: TaskLaunchContext = { runId, launchId, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id,
+  const launchId = newLaunchUtteranceId();
+  recordLaunchUtterance({ source: 'hand', utterance: opts.text, launchId });
+  const context: TaskLaunchContext = { runId, launchId, launchUtterance: opts.text, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id,
     ...(cardPrNumber(card) ? { ELANOUS_TASK_BOUND_PR: String(cardPrNumber(card)) } : {}),
     ...(card.checklistId ? { ELANOUS_POD_SLOT_ID: card.checklistId } : {}),
     ...(card.seat ? { ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: card.seat } : {}),

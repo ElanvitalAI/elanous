@@ -1,4 +1,6 @@
 import { debug } from '../debug/log.js';
+import { findIncidentPrecedents, type IncidentPrecedent } from '../harness/harness-incidents.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import {
   appendRunLedgerEntry,
   listRunLedgers,
@@ -6,6 +8,10 @@ import {
   lookupRunLedger,
   type RunLedgerLookupOptions,
 } from './run-ledger.js';
+/** 사고 원장 루트 기본값 — 운영/시험 우주 상태 디렉터리(없으면 빈 선례 · fail-soft). */
+export function doctorVisitIncidentRoot(): string {
+  return elanousStateRoot();
+}
 
 /** DOCTOR-VISIT 증상 닫힌 목록 — 이 밖의 값은 기록·조회 모두 거부한다. */
 export const DOCTOR_SYMPTOMS = [
@@ -49,6 +55,8 @@ export interface RecordDoctorVisitInput {
   evidence?: string;
   /** 원장 디렉터리(시험 seam) — 기본 = `runLedgerDir()`. */
   dir?: string;
+  /** 사고 원장 루트(시험 seam) — 기본 = `doctorVisitIncidentRoot()`. `null` 이면 선례 연결을 건너뛴다. */
+  incidentRoot?: string | null;
 }
 
 export interface DoctorVisit {
@@ -57,6 +65,8 @@ export interface DoctorVisit {
   symptom: DoctorSymptom;
   evidence?: string;
   timestamp?: string;
+  /** 사고 선례 연결 — 같은 reason 으로 이전에 기록된 실제 exit(기록 없으면 빈 배열). */
+  incidentPrecedents?: IncidentPrecedent[];
 }
 
 /**
@@ -74,15 +84,22 @@ export function recordDoctorVisit(visit: RecordDoctorVisitInput): DoctorVisit {
     throw new Error(`없음: 런 원장이 없습니다 (runId=${visit.runId}) — 새 원장을 만들지 않습니다`);
   }
   const timestamp = new Date().toISOString();
+  // 사고 선례 연결 — 기록된 실제 exit 만(지어내기 금지). 원장이 없으면 빈 배열(fail-soft).
+  const incidentRoot = 'incidentRoot' in visit ? visit.incidentRoot ?? null : doctorVisitIncidentRoot();
+  const incidentPrecedents = incidentRoot === null
+    ? []
+    : findIncidentPrecedents({ reason: visit.symptom, at: timestamp, runId: visit.runId }, incidentRoot);
   const data: Record<string, unknown> = { from: visit.from, symptom: visit.symptom };
   if (typeof visit.evidence === 'string' && visit.evidence.length > 0) data.evidence = visit.evidence;
+  if (incidentPrecedents.length > 0) data.incidentPrecedents = incidentPrecedents;
   appendRunLedgerEntry({ timestamp, runId: visit.runId, event: 'doctor-visit', data }, visit.dir);
-  debug.log('run-doctor', 'visit', { runId: visit.runId, from: visit.from, symptom: visit.symptom });
+  debug.log('run-doctor', 'visit', { runId: visit.runId, from: visit.from, symptom: visit.symptom, incidentPrecedents: incidentPrecedents.length });
   return {
     runId: visit.runId,
     from: visit.from,
     symptom: visit.symptom,
     ...(typeof visit.evidence === 'string' && visit.evidence.length > 0 ? { evidence: visit.evidence } : {}),
+    ...(incidentPrecedents.length > 0 ? { incidentPrecedents } : {}),
     timestamp,
   };
 }

@@ -35,8 +35,9 @@ describe('createWorktree — add timeout and stderr diagnostics', () => {
   const failed = (stderr: string, extra: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> => ({
     pid: 0, output: [], stdout: '', stderr, status: 128, signal: null, ...extra,
   });
-  const run = (result: SpawnSyncReturns<string>) => {
+  const run = (result: SpawnSyncReturns<string>, trackedFileCount: number | null = 0) => {
     const calls: number[] = [];
+    const countedRefs: string[] = [];
     const spawn: NonNullable<WorktreeAddDeps['spawn']> = (_command, _args, options) => {
       calls.push(options.timeout);
       return result;
@@ -47,10 +48,12 @@ describe('createWorktree — add timeout and stderr diagnostics', () => {
       try {
         createWorktree({ repoRoot: repo, worktreeRoot: tmp, branch: 'se/timeout' }, {
           spawn,
+          countTrackedFiles: (_repoRoot, ref) => { countedRefs.push(ref ?? ''); return trackedFileCount; },
         });
       } catch (error) { message = (error as Error).message; }
       const failureLog = log.mock.calls.find(([, event]) => event === 'add.failed');
-      return { message, calls, failureLog };
+      const startLog = log.mock.calls.find(([, event]) => event === 'add.start');
+      return { message, calls, countedRefs, failureLog, startLog };
     } finally { log.mockRestore(); }
   };
 
@@ -116,14 +119,37 @@ describe('createWorktree — add timeout and stderr diagnostics', () => {
     writeFileSync(join(tmp, 'elanous', 'config.json'), JSON.stringify({ harness: { worktreeAddTimeoutSec: 600 } }));
     resetUserConfig();
     try {
-      const add = run(failed('fatal: no space'));
+      const add = run(failed('fatal: no space'), 50_000);
       expect(add.calls).toEqual([600_000]);
+      expect(add.startLog?.[2]).toEqual({ branch: 'se/timeout', timeoutMs: 600_000, trackedFileCount: null, timeoutSource: 'config' });
     } finally {
       if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = previousConfigHome;
       resetElanousConfigDir();
       resetUserConfig();
     }
+  });
+
+  test('unset timeout scales with tracked file count from a 300 second floor', () => {
+    const twentyFiveThousand = run(failed('fatal: no space'), 25_000);
+    const thirtyThousand = run(failed('fatal: no space'), 30_000);
+    expect(twentyFiveThousand.calls).toEqual([600_000]);
+    expect(twentyFiveThousand.countedRefs).toEqual(['HEAD']);
+    expect(thirtyThousand.calls).toEqual([720_000]);
+    expect(thirtyThousand.startLog?.[2]).toEqual({ branch: 'se/timeout', timeoutMs: 720_000, trackedFileCount: 30_000, timeoutSource: 'tracked-files' });
+    expect(run(failed('fatal: no space'), 1).calls).toEqual([300_000]);
+  });
+
+  test('tracked-file timeout is capped at 900 seconds', () => {
+    const result = run(failed('fatal: no space'), 100_000);
+    expect(result.calls).toEqual([900_000]);
+    expect(result.startLog?.[2]).toMatchObject({ timeoutMs: 900_000, trackedFileCount: 100_000, timeoutSource: 'tracked-files' });
+  });
+
+  test('failed tracked-file count falls back to 300 seconds and logs it as unmeasured', () => {
+    const result = run(failed('fatal: no space'), null);
+    expect(result.calls).toEqual([300_000]);
+    expect(result.startLog?.[2]).toEqual({ branch: 'se/timeout', timeoutMs: 300_000, trackedFileCount: null, timeoutSource: 'fallback' });
   });
 });
 

@@ -4,8 +4,10 @@
 // 넣으면 근거 링크(커밋·파일) 붙은 알림을 낸다 · 관련 없으면 0건 · 거절한 짝은 다시 묻지
 // 않는다. 순수 함수·부수효과 0. 관련도 점수는 세션 검색의 trigram FTS5 원시함수
 // (src/session/search-index.ts rankByTrigramFts — BM25, 낮을수록 관련도 높음)를 그대로
-// 재사용한다. DEV-FEATURE-MAP 행을 넘겨 부르는 인테이크·저작 경로 배선(intake.hint
-// 관측)은 다음 조각(남은 것)이다.
+// 재사용한다. 호출 지점은 인테이크 요구 퍼널이다 — readRequirementFunnel(요구 퍼널 입구)이
+// features/refusedFeatures 를 runRequirementFunnel 로 넘기고, recordAlreadyBuiltHints 가
+// alreadyBuiltHints 를 불러 결과를 requirements.intake/hint 로 관측한다. 그 행 자체를
+// 생산하는 쪽(DEV-FEATURE-MAP)은 별도 칸 몫이다.
 
 import { rankByTrigramFts, type RankedDoc, type RankResult } from '../session/search-index.js';
 import { hashContent } from '../hasher.js';

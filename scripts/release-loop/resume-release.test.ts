@@ -21,7 +21,7 @@ function installReleaseRecipes(checkout: string): void {
   for (const name of ['release-loop.yaml', 'recipes.yaml']) copyFileSync(join(releaseGraphDir, name), join(target, name));
 }
 
-function writeFailedRun(root: string, runId = 'r'): { statePath: string; original: string } {
+function writeFailedRun(root: string, runId = 'r', gateOutput = '{"outcome":"ok"}'): { statePath: string; original: string } {
   const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
   mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
   const state = {
@@ -30,7 +30,7 @@ function writeFailedRun(root: string, runId = 'r'): { statePath: string; origina
     path: ['version-release', 'gate', 'tui', 'failed'],
     nodes: [
       { nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) },
-      { nodeId: 'gate', ok: true, exit: 0, executed: true, output: '{"outcome":"ok"}' },
+      { nodeId: 'gate', ok: true, exit: 0, executed: true, output: gateOutput },
       { nodeId: 'tui', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' },
       { nodeId: 'failed', ok: true, exit: 0, executed: false },
     ],
@@ -178,6 +178,70 @@ test('release command root checks the real checkout HEAD and rejects a different
     expect(seatGit(root, 'status', '--porcelain')).toBe('');
     expect(() => verifyReleaseCommandRoot(root, cut)).toThrow('--command-root');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-RESUME-STALLED-ONLY: same-commit resume plans stalled files and preserves completed shard outcomes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resume-stalled-only-'));
+  setElanousConfigDir(root);
+  const state = writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: SHA,
+    stalledShards: [{ shard: 4, files: ['src/stalled.test.ts'], reason: 'job-failed' }],
+    partialSummary: { pass: 10, fail: 1, errors: 1, ran: 10, files: 10 }, preservedShardCount: 5,
+    partialFailures: { failures: ['src/completed.test.ts > kept'], errors: ['src/error.test.ts > [error]'] } }));
+  try {
+    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git: gitStub, isAncestor: () => true,
+      closureTree: () => ({ files: ['src/stalled.test.ts', 'src/completed.test.ts', 'src/error.test.ts'] }) as never,
+      graph: async () => ({ status: 'done', runId: 'r' }) as never });
+    expect(resumed.partial).toMatchObject({ requested: true, applied: true, files: 1, priorCommit: SHA });
+    expect(JSON.parse(readFileSync(join(root, 'release', VERSION, 'gate-partial.json'), 'utf8'))).toMatchObject({
+      kind: 'recheck', forCommit: SHA, stalledFiles: ['src/stalled.test.ts'],
+      files: ['src/stalled.test.ts'], preservedShardCount: 5,
+      priorFailures: ['src/completed.test.ts > kept'], priorErrors: ['src/error.test.ts > [error]'],
+    });
+    expect(readFileSync(state.statePath, 'utf8')).toContain('partialFailures');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-RESUME-STALLED-ONLY: an incomplete saved gate record falls back to a full sweep plan', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resume-stalled-fallback-'));
+  setElanousConfigDir(root);
+  writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', stalledShards: [{ files: ['src/stalled.test.ts'], reason: 'job-failed' }] }));
+  try {
+    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git: gitStub, isAncestor: () => true,
+      graph: async () => ({ status: 'done', runId: 'r' }) as never });
+    expect(resumed.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('no complete stalled-shard') });
+    expect(existsSync(join(root, 'release', VERSION, 'gate-partial.json'))).toBe(false);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-RESUME-STALLED-ONLY: a saved gate result from another commit cannot authorize a partial recheck', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resume-stalled-wrong-commit-'));
+  setElanousConfigDir(root);
+  writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: 'b'.repeat(40),
+    stalledShards: [{ files: ['src/stalled.test.ts'], reason: 'job-failed' }],
+    partialSummary: { pass: 10, fail: 0, errors: 0, ran: 10, files: 10 },
+    partialFailures: { failures: [], errors: [] } }));
+  try {
+    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git: gitStub, isAncestor: () => true,
+      closureTree: () => ({ files: ['src/stalled.test.ts'] }) as never,
+      graph: async () => ({ status: 'done', runId: 'r' }) as never });
+    expect(resumed.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('no complete stalled-shard') });
+    expect(existsSync(join(root, 'release', VERSION, 'gate-partial.json'))).toBe(false);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-RESUME-STALLED-ONLY: missing measured failure IDs cannot authorize a partial recheck', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resume-stalled-missing-failure-'));
+  setElanousConfigDir(root);
+  writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', stalledShards: [{ files: ['src/stalled.test.ts'], reason: 'job-failed' }],
+    partialSummary: { pass: 10, fail: 1, errors: 0, ran: 11, files: 10 },
+    partialFailures: { failures: [], errors: [] } }));
+  try {
+    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git: gitStub, isAncestor: () => true,
+      closureTree: () => ({ files: ['src/stalled.test.ts'] }) as never,
+      graph: async () => ({ status: 'done', runId: 'r' }) as never });
+    expect(resumed.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('no complete stalled-shard') });
+    expect(existsSync(join(root, 'release', VERSION, 'gate-partial.json'))).toBe(false);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('an injected graph cannot skip command checkout verification at resume start', async () => {

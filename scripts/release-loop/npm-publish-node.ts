@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { sendOutbound } from '../../src/domains/outbound-alert.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
@@ -10,8 +10,11 @@ import { emitNodeResult, readGraphContext, type GraphContext } from './node-verd
 import { prereleaseKind } from './release-version.js';
 
 type Result = { outcome: 'ok' | 'fail'; verdict: 'pass' | 'fail'; summary: string; npm?: 'published' | 'already-published' | 'staged-not-visible'; humanAction?: 'npm-support' };
-type Exec = (command: string, args: string[], env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
+type ExecResult = { status: number | null; stdout: string; stderr: string; durationMs?: number; signal?: NodeJS.Signals | null };
+type Exec = (command: string, args: string[], env?: NodeJS.ProcessEnv) => ExecResult;
 type Registry = (url: string) => Promise<{ status: number; body: unknown }>;
+const REGISTRY_FETCH_TIMEOUT_MS = 15_000;
+type PublishSpawn = { version: string; durationMs: number; status: number | null; signal: NodeJS.Signals | null };
 export interface NpmPublishDeps {
   exec?: Exec;
   registry?: Registry;
@@ -21,16 +24,27 @@ export interface NpmPublishDeps {
   productionRoot?: string;
   alert?: (text: string, kind: string) => boolean;
   log?: (version: string, waitedMinutes: number) => void;
+  publishSpawn?: (event: PublishSpawn) => void;
 }
 
 const exec: Exec = (command, args, env) => {
+  const startedAt = performance.now();
   const result = spawnSync(command, args, { encoding: 'utf8', env: env ?? process.env, maxBuffer: 1024 * 1024, timeout: 300_000 });
-  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? String(result.error ?? '') };
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? String(result.error ?? ''), durationMs: Math.ceil(performance.now() - startedAt), signal: result.signal };
 };
-const registry: Registry = async (url) => {
-  const response = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-  return { status: response.status, body: response.ok ? await response.json() : null };
-};
+export async function fetchNpmRegistry(url: string, timeoutMs = REGISTRY_FETCH_TIMEOUT_MS): Promise<{ status: number; body: unknown }> {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: { accept: 'application/json' }, signal: timeout });
+    return { status: response.status, body: response.ok ? await response.json() : null };
+  }
+  catch (error) {
+    if (timeout.aborted) throw Object.assign(new Error(`registry request exceeded ${timeoutMs}ms`), { name: 'NpmRegistryFetchTimeoutError', timeoutMs });
+    throw error;
+  }
+}
+const registry: Registry = fetchNpmRegistry;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const PACKAGE_URL = 'https://registry.npmjs.org/elanous';
 
@@ -43,6 +57,33 @@ function reason(error: unknown, token: string): string {
 function metadata(value: unknown): { name?: string; version?: string } {
   if (!value || typeof value !== 'object') return {};
   return value as { name?: string; version?: string };
+}
+function registryFailure(error: unknown, url: string): Error {
+  const name = error instanceof Error ? error.name : '';
+  const message = error instanceof Error ? error.message : String(error);
+  const endpoint = (() => { try { return new URL(url).pathname; } catch { return url; } })();
+  if (name === 'NpmRegistryFetchTimeoutError') {
+    const timeoutMs = error && typeof error === 'object' && 'timeoutMs' in error && typeof error.timeoutMs === 'number' ? error.timeoutMs : REGISTRY_FETCH_TIMEOUT_MS;
+    return new Error(`npm registry fetch timeout after ${timeoutMs}ms (${endpoint || '/'})`);
+  }
+  return new Error(`npm registry fetch failed (${endpoint || '/'}): ${message}`);
+}
+function publishLogDirectory(context: GraphContext, stateDir: string): string {
+  const contextLocation = process.env.ELANOUS_GRAPH_CONTEXT;
+  if (contextLocation && !contextLocation.trimStart().startsWith('{')) {
+    const contextPath = resolve(contextLocation);
+    const runDirectory = dirname(contextPath);
+    const runDirectoryName = basename(runDirectory);
+    if (basename(contextPath).endsWith('.json') && runDirectoryName.endsWith('.json.contexts')) {
+      const pathRunId = runDirectoryName.slice(0, -'.json.contexts'.length);
+      if (context.runId && pathRunId !== context.runId) throw new Error('npm publish graph context runId/path mismatch');
+      return join(runDirectory, 'npm-publish');
+    }
+  }
+  if (context.runId && /^[a-zA-Z0-9._-]+$/.test(context.runId))
+    return join(stateDir, 'graph-runs', 'release-loop', `${context.runId}.json.contexts`, 'npm-publish');
+  // Direct non-graph calls have no run folder; retain compatibility in their version output directory.
+  return join(stateDir, 'release', context.input.version, 'npm-publish');
 }
 
 export async function runNpmPublish(context: GraphContext = readGraphContext(), deps: NpmPublishDeps = {}): Promise<Result> {
@@ -68,9 +109,16 @@ export async function runNpmPublish(context: GraphContext = readGraphContext(), 
     const pkg = metadata(JSON.parse(archive.stdout));
     if (pkg.name !== 'elanous' || pkg.version !== version) throw new Error('npm archive package name/version mismatch');
     const inspect = async (): Promise<{ visible: boolean; tagged: boolean }> => {
-      const [manifest, tags] = await Promise.all([readRegistry(`${PACKAGE_URL}/${version}`), readRegistry(PACKAGE_URL)]);
-      if (manifest.status !== 200 && manifest.status !== 404) throw new Error(`npm registry version lookup failed (${manifest.status})`);
-      if (tags.status !== 200) throw new Error(`npm registry tags lookup failed (${tags.status})`);
+      const versionUrl = `${PACKAGE_URL}/${version}`;
+      const tagsUrl = PACKAGE_URL;
+      let manifest: { status: number; body: unknown };
+      let tags: { status: number; body: unknown };
+      const read = (url: string) => readRegistry(url).catch((error: unknown) => { throw registryFailure(error, url); });
+      [manifest, tags] = await Promise.all([read(versionUrl), read(tagsUrl)]);
+      if (manifest.status !== 200 && manifest.status !== 404)
+        throw new Error(`npm registry version lookup failed (${manifest.status}; ${new URL(versionUrl).pathname})`);
+      if (tags.status !== 200)
+        throw new Error(`npm registry tags lookup failed (${tags.status}; ${new URL(tagsUrl).pathname})`);
       const tagged = tags.body && typeof tags.body === 'object' && 'dist-tags' in tags.body
         ? (tags.body as { 'dist-tags'?: Record<string, unknown> })['dist-tags']?.[distTag] : undefined;
       if (manifest.status === 200 && (metadata(manifest.body).name !== 'elanous' || metadata(manifest.body).version !== version))
@@ -90,7 +138,13 @@ export async function runNpmPublish(context: GraphContext = readGraphContext(), 
       try {
         const npmrc = join(dir, 'npmrc');
         writeFileSync(npmrc, `//registry.npmjs.org/:_authToken=${token}\n`, { mode: 0o600, flag: 'wx' });
-        published = run('npm', ['publish', candidate, '--ignore-scripts', '--tag', distTag, '--access', 'public'], { ...process.env, NPM_CONFIG_USERCONFIG: npmrc });
+        const logDir = publishLogDirectory(context, stateDir);
+        mkdirSync(logDir, { recursive: true, mode: 0o700 });
+        chmodSync(logDir, 0o700);
+        const publishStartedAt = performance.now();
+        published = run('npm', ['publish', candidate, '--ignore-scripts', '--tag', distTag, '--access', 'public', '--logs-dir', logDir], { ...process.env, NPM_CONFIG_USERCONFIG: npmrc });
+        const durationMs = published.durationMs ?? Math.ceil(performance.now() - publishStartedAt);
+        try { (deps.publishSpawn ?? ((event) => debug.log('release-loop.npm', 'publish-spawn', event)))({ version, durationMs, status: published.status, signal: published.signal ?? null }); } catch { /* telemetry must not mask publish result */ }
       } finally { rmSync(dir, { recursive: true, force: true }); }
       const output = `${published.stdout}\n${published.stderr}`;
       const staged = published.status !== 0 && /\bE409\b/i.test(output) && /previously staged/i.test(output);

@@ -1,11 +1,11 @@
 import { expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 import { debug } from '../debug/log.js';
-import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable, renderRunningRuns } from './running-runs.js';
+import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, distinctPhysicalLedgerDirectories, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable, renderRunningRuns } from './running-runs.js';
 import { appendRunLedgerEntry, queryFederatedUnfinishedRunLedgers, recordNonBlockingRunPending, recordNonBlockingRunResult, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from './run-ledger.js';
 
 const ledger = (
@@ -842,6 +842,39 @@ const quietDeps = (directory: string) => ({
   listPtyRefs: () => ({ refs: [], unreadable: [] }),
   readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
   observeQuery: () => {},
+});
+
+test('running-runs scans one physical ledger once while retaining a missing universe observation', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-alias-'));
+  const directory = join(root, 'run-ledger');
+  const alias = join(root, 'legacy-alias');
+  const missing = join(root, 'missing-run-ledger');
+  try {
+    mkdirSync(directory);
+    symlinkSync(directory, alias, 'dir');
+    const runId = fixtureRunId(0);
+    writeFileSync(join(directory, `${runId}.jsonl`), completedLedgerLine(runId));
+    const result = queryRunningRuns({}, { ...quietDeps(directory), ledgerDirectories: () => [directory, alias, missing] });
+    expect(result.ledger.ledgerDirectories).toEqual([directory]);
+    expect(result.ledger.missingLedgerDirectoryCount).toBe(1);
+    expect(result.ledger.cacheMisses).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ledger identity keeps distinct BigInt inodes above Number precision and unreadable targets', () => {
+  const identities = new Map([
+    ['/first', 9_007_199_254_740_992n],
+    ['/different', 9_007_199_254_740_993n],
+    ['/alias', 9_007_199_254_740_992n],
+  ]);
+  const directories = distinctPhysicalLedgerDirectories(['/first', '/different', '/alias', '/unreadable'], (directory) => {
+    const ino = identities.get(directory);
+    if (ino === undefined) throw Object.assign(new Error('Permission denied'), { code: 'EACCES' });
+    return { dev: 1n, ino, isDirectory: () => true };
+  });
+  expect(directories).toEqual(['/first', '/different', '/unreadable']);
 });
 
 test('noCache bypasses the process-lifetime ledger cache without evicting it', () => {

@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { DaemonSessionHistory } from '../boot/daemon-runtime.js';
 import { abortAgentTurn, createAgentTurnRunner } from './agent-turn.js';
+import { buildReplSystemPrompt } from './index.js';
+import { resetSeatBootCacheForTest } from '../dashboard/seat-boot-preamble.js';
+import { MsgStore } from '../msg/msg-store.js';
+import type { UserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 
 const context = {
@@ -176,6 +183,134 @@ describe('REPL agent goal-loop selection', () => {
     await started;
     expect(abortAgentTurn('abort-session', 'abort-terminal')).toBe(true);
     await expect(pending).resolves.toMatchObject({ stopReason: 'aborted', goalLoop: true });
+  });
+});
+
+// 🪪 TUI-SESSION-BOOT — 새 TUI(`src/tui/entry.ts` → `elanous repl --json --stdin-jsonl`)는
+//    legacy 대시보드 preamble 부트 경로를 지나지 않는다. 그래서 자리 역할·미읽음 수는
+//    `src/repl/index.ts` 의 시스템 프롬프트 «한 곳»(`buildReplSystemPrompt`)에서 실린다.
+describe('새 TUI REPL 시스템 프롬프트 — 자리 부트 카드(TUI-SESSION-BOOT)', () => {
+  const fakeConfig = {
+    llm: { model: '' },
+    chat: { conciseness: 'balanced', toolDeny: [] },
+  } as unknown as UserConfig;
+
+  /** 홈에 자리(seat-state/OP ⊕ seats/OP/AGENTS.local.md)와 OP 앞 미읽은 우편 1통을 세운다.
+   *  cwd 는 «자리가 아닌» 임시 디렉터리 — 자리 판정은 COORD_ID 로만 선다(그래서 두 호출의 base 가 같다). */
+  function seatFixture(): { home: string; cwd: string; msgPath: string; store: MsgStore } {
+    const home = mkdtempSync(join(tmpdir(), 'repl-seatboot-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'repl-turn-'));
+    mkdirSync(join(home, 'elanous-hq', 'seat-state', 'OP'), { recursive: true });
+    const seatDir = join(home, 'elanous-hq', 'seats', 'OP');
+    mkdirSync(seatDir, { recursive: true });
+    writeFileSync(join(seatDir, 'AGENTS.local.md'), '역할 = 판정 제안 담당\n');
+    const msgPath = join(home, 'state', 'msg', 'messages.db');
+    const store = new MsgStore(msgPath);
+    store.post({ from: 'TC', to: 'OP', body: 'repl-zero-guidance-mail' });
+    return { home, cwd, msgPath, store };
+  }
+
+  const seatDeps = (home: string, msgPath: string) => ({ home, msgPath, env: { COORD_ID: 'OP' } });
+  const plainDeps = (home: string, msgPath: string) => ({ home, msgPath, env: {} });
+
+  test('자리 REPL 첫 턴 — 역할·미읽음 수가 «한 번» 들어간다', () => {
+    const f = seatFixture();
+    try {
+      resetSeatBootCacheForTest();
+      const prompt = buildReplSystemPrompt({
+        cfg: fakeConfig,
+        enabledToolNames: undefined,
+        cwd: f.cwd,
+        sessionId: 'repl-seat-session',
+        seatBootDeps: seatDeps(f.home, f.msgPath),
+      });
+
+      expect(prompt).toBeDefined();
+      const text = prompt!;
+      expect(text).toContain('# OP 자리 부팅 카드');
+      expect(text).toContain('역할: 판정 제안 담당');
+      expect(text).toContain('안 읽은 msg 1 (OP)');
+      // «한 번» — 카드 머리말과 자리 제목이 각각 정확히 한 번이다.
+      expect(text.split('## 자리 부트 카드').length - 1).toBe(1);
+      expect(text.split('# OP 자리 부팅 카드').length - 1).toBe(1);
+      // 같은 대화의 다음 턴도 같은 문면 — 매 턴 카드가 겹쳐 붙지 않는다.
+      expect(buildReplSystemPrompt({
+        cfg: fakeConfig,
+        enabledToolNames: undefined,
+        cwd: f.cwd,
+        sessionId: 'repl-seat-session',
+        seatBootDeps: seatDeps(f.home, f.msgPath),
+      })).toBe(text);
+    } finally {
+      f.store.close();
+      rmSync(f.home, { recursive: true, force: true });
+      rmSync(f.cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('비자리 REPL — 주입 0건', () => {
+    const f = seatFixture();
+    try {
+      resetSeatBootCacheForTest();
+      // 자리 상태·역할은 홈에 «있지만» cwd 가 자리가 아니고 COORD_ID 도 없다 ⇒ 카드 없음.
+      expect(buildReplSystemPrompt({
+        cfg: fakeConfig,
+        enabledToolNames: undefined,
+        cwd: f.cwd,
+        sessionId: 'repl-plain-session',
+        seatBootDeps: plainDeps(f.home, f.msgPath),
+      })).toBeUndefined();
+      // 도구가 켜져 범용 preamble 이 실려도 자리 카드는 한 줄도 안 섞인다.
+      const withTools = buildReplSystemPrompt({
+        cfg: fakeConfig,
+        enabledToolNames: [],
+        cwd: f.cwd,
+        sessionId: 'repl-plain-session',
+        seatBootDeps: plainDeps(f.home, f.msgPath),
+      });
+      expect(withTools ?? '').not.toContain('자리 부트 카드');
+      expect(withTools ?? '').not.toContain('안 읽은 msg');
+    } finally {
+      f.store.close();
+      rmSync(f.home, { recursive: true, force: true });
+      rmSync(f.cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('자리 카드는 앞선 범용 preamble 을 밀어내지 않고 뒤에 붙는다', () => {
+    const f = seatFixture();
+    try {
+      resetSeatBootCacheForTest();
+      const plain = buildReplSystemPrompt({
+        cfg: fakeConfig,
+        enabledToolNames: [],
+        cwd: f.cwd,
+        sessionId: 'repl-compose-session',
+        seatBootDeps: plainDeps(f.home, f.msgPath),
+      });
+      resetSeatBootCacheForTest();
+      const cardOnly = buildReplSystemPrompt({
+        cfg: fakeConfig,
+        enabledToolNames: undefined,
+        cwd: f.cwd,
+        sessionId: 'repl-compose-session',
+        seatBootDeps: seatDeps(f.home, f.msgPath),
+      });
+      const seated = buildReplSystemPrompt({
+        cfg: fakeConfig,
+        enabledToolNames: [],
+        cwd: f.cwd,
+        sessionId: 'repl-compose-session',
+        seatBootDeps: seatDeps(f.home, f.msgPath),
+      });
+
+      expect(cardOnly).toBeDefined();
+      expect(seated).toBe(plain === undefined ? cardOnly! : `${plain}\n\n${cardOnly!}`);
+    } finally {
+      f.store.close();
+      rmSync(f.home, { recursive: true, force: true });
+      rmSync(f.cwd, { recursive: true, force: true });
+    }
   });
 });
 

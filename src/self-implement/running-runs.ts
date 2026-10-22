@@ -424,6 +424,34 @@ export function assessRunningRuns(
   return { ...(partial ? { completeness: 'partial' as const, unreadable, count: { count: null, lowerBound: counts.running + counts['probable-running'], unreadable } } : {}), entries, counts, total, countedStatuses, quantities: quantitySummary({ entries, counts, total, countedStatuses, observation }), observation, lingeringLaunchParents: { observation: 'indeterminate' }, ledger: { ledgerDirectories: [], unreadableLedgerCount: ledgerObservation.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledgerObservation.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledgerObservation.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledgerObservation.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledgerObservation.indeterminateLedgerDirectoryCount }, pty: { unreadable: [...pty.unreadable], observedRefCount: pty.refs.length, withoutRunIdCount, notCountedRefCount }, phases: { targetCount: 0, readableTargetCount: 0, unreadableTargetCount: 0, unreadableTargets: [], discardedNonStageEventCount: 0 } };
 }
 
+/** A legacy state alias can point at the same physical ledger. Keep missing or unreadable
+ * directories in the query so they still contribute an incomplete-observation signal. */
+type LedgerDirectoryIdentity = { dev: bigint; ino: bigint; isDirectory(): boolean };
+
+export function distinctPhysicalLedgerDirectories(
+  directories: readonly string[],
+  statDirectory: (directory: string) => LedgerDirectoryIdentity = (directory) => statSync(directory, { bigint: true }),
+): string[] {
+  const seen = new Map<string, string>();
+  const distinct: string[] = [];
+  for (const directory of directories) {
+    try {
+      const stat = statDirectory(directory);
+      if (stat.isDirectory()) {
+        const identity = `${stat.dev}:${stat.ino}`;
+        const first = seen.get(identity);
+        if (first !== undefined) {
+          debug.log('self-implement.running-runs', 'ledger-directory-alias', { first, alias: directory });
+          continue;
+        }
+        seen.set(identity, directory);
+      }
+    } catch { /* Preserve this target for the federated query's missing/unreadable judgment. */ }
+    distinct.push(directory);
+  }
+  return distinct;
+}
+
 export function queryRunningRuns(options: { includeTest?: boolean; runIds?: readonly string[]; caller?: string; noCache?: boolean } = {}, deps: RunningRunsQueryDeps = {}): QueriedRunningRunsResult {
   const directoryFailures = new Map<string, ReturnType<typeof classifyFederatedLedgerDirectoryReadFailure>>();
   const queryLedgers = deps.queryLedgers ?? ((queryOptions: Parameters<typeof queryFederatedUnfinishedRunLedgers>[0]) => queryFederatedUnfinishedRunLedgers({
@@ -466,7 +494,7 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     if (collectLedgerDirectories) {
       const ledgerDirectoryCollectionStartedAt = Date.now();
       try {
-        collectedLedgerDirectories = ledgerDirectories({ includeTest: options.includeTest });
+        collectedLedgerDirectories = distinctPhysicalLedgerDirectories(ledgerDirectories({ includeTest: options.includeTest }));
       } finally {
         ledgerDirectoryCollectionElapsedMs = Date.now() - ledgerDirectoryCollectionStartedAt;
       }

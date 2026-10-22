@@ -3,7 +3,7 @@
 // OP TUI turns previously drove `elanous msg list/post/ack` and
 // `elanous release checklist list/move/set/add` through RunShell:
 // 1.3–2s of CLI startup per call, 30+ spawns per turn, and the CLI's
-// human-oriented stdout amplifying TUI screen defects. These eight
+// human-oriented stdout amplifying TUI screen defects. These
 // tools reuse the SAME durable services in-process —
 //
 //   • msg tools → src/msg/msg-store.ts (the SQLite ledger `elanous msg`
@@ -11,6 +11,7 @@
 //   • checklist tools → src/release-loop/checklist.ts + feature-store.ts
 //     (the same per-version ledger, claim history, seat/OP move rules)
 //
+// MsgAsk joins this family through msg-ask.ts; the other dispatchers live here.
 // The permission and audit contract is preserved 1:1:
 //   • writes record the actor from ELANOUS_TRACK (seat identity),
 //   • ChecklistMove keeps the CLI routing — anonymous (no ELANOUS_TRACK)

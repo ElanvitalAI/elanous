@@ -10,13 +10,18 @@ const source = readFileSync(join(defaultGraphsDir(), file), 'utf8');
 const parsed = parseGraphTemplateYaml(source, file);
 
 describe('document-loop YAML graph', () => {
-  test('loads as the distinct document graph with document-specific nodes and landing recovery', () => {
+  test('loads as the document graph through intake, document work, and landing recovery', () => {
     expect(parsed.errors).toEqual([]);
     expect(parsed.template?.graphId).toBe('document-loop');
-    expect(parsed.template?.entryNode).toBe('document-draft');
-    expect(parsed.template?.nodes.map((node) => node.nodeId)).toEqual([
+    expect(parsed.template?.entryNode).toBe('intake');
+    expect(parsed.template?.journeyStages).toEqual(['entry', 'author', 'dispatch', 'run', 'land', 'recover', 'end']);
+    const nodeIds = parsed.template?.nodes.map((node) => node.nodeId) ?? [];
+    expect(nodeIds).toEqual([
       'document-draft', 'gate', 'document-review', 'document-rework', 'document-blocked',
       'main-sync', 'regate', 'open-pr', 'merge', 'recover', 'landed', 'needs-human',
+      'intake', 'queue', 'launch-gate', 'entry-unit', 'dispatch', 'pool-admit',
+      'dispatch-pod-unit', 'freeze-check', 'hold', 'cleanup', 'result-parse', 'salvage',
+      'heal', 'next-move', 'ready', 'pr-head-checkout',
     ]);
     expect(parsed.template?.terminalNodes).toEqual(['landed', 'document-blocked', 'needs-human']);
     expect(loadGraphTemplatesFrom(defaultGraphsDir()).templates['document-loop']?.graphId).toBe('document-loop');

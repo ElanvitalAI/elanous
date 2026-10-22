@@ -77,6 +77,30 @@ describe('self gate --artifact-dir (R2 입력 재료)', () => {
     });
     expect(result.lines).toContain('shards: unmeasured (baseline setup failed: ENOSPC in /tmp)');
     expect(result.lines).toContain('shard unmeasured: shard-1 · baseline worktree: baseline setup failed: ENOSPC in /tmp');
+    expect(result.lines.some((line) => line.includes('git stderr'))).toBe(false);
+  });
+
+  test('baseline worktree-add failure puts the git stderr tail right under the unmeasured line and into every shard reason', () => {
+    const dir = join(tmp(), 'out');
+    const log = 'baseline worktree-add-failed (code 128, elapsed 90900ms, limit 300000ms, target /tmp/b, base origin/main@0123456789ab)';
+    const failingBaseline = () => ({
+      status: 'unknown' as const, unknownReason: 'infrastructure-failure' as const, childResponsibility: 'none' as const,
+      log, gitStderrTail: 'fatal: Unable to create /repo/.git/worktrees/b/index.lock: File exists.',
+    });
+    const result = runSelfGateCli('/repo', { base: 'origin/main', shards: 2, artifactDir: dir }, {
+      changedFiles: () => ({ files, baseRef: 'origin/main' }), exists: () => true,
+      runShards: (cwd, selected, base, count) => runShardedGateTests(cwd, selected, base, count,
+        () => ({ exitCode: 0, junit: '<testsuite/>', rssMb: 100, seconds: 1 }),
+        failingBaseline as typeof import('./gate-baseline.js').withBaselineWorktree,
+        8, { hostResources: { cores: 8, freeMemoryGiB: 64, freeTmpGiB: 8 } }),
+      ...quietGates, ...artifactDeps,
+    });
+    const reason = `baseline worktree: ${log} · git stderr: fatal: Unable to create /repo/.git/worktrees/b/index.lock: File exists.`;
+    const summary = JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8'));
+    expect(summary.unmeasuredByShard).toEqual({ 'shard-1': reason, 'shard-2': reason });
+    const at = result.lines.indexOf(`shards: unmeasured (${log})`);
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(result.lines[at + 1]).toBe('baseline worktree-add git stderr: fatal: Unable to create /repo/.git/worktrees/b/index.lock: File exists.');
   });
 
   test('writes summary.json and per-shard current/baseline JUnit; a side without JUnit gets no junitPath, only a diagnostic', () => {

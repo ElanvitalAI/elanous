@@ -6,6 +6,10 @@
  *   TA-REVIEW-RESULT-CAPTURE — 자식 stdout(`--json`)은 결과 파일로 받고, 자식 완료 뒤 해당 카드만 회수·재판정한다.
  *   회수한 pass 는 그 틱의 판단부·land 관문 입력(`selfReview`)이 될 뿐 land 판정 로직은 그대로다.
  * - `propose-green`: 카드에 green «제안»(`greenProposal`)만 적는다 — 체크리스트는 손대지 않는다.
+ * - `propose-close`: TA-PROPOSE-CLOSE-MOVE — draft 정리(0.2.36 · 대표 10-21 · 열린 draft 301)의 닫기를 판단한다.
+ *   close-a(착지/대체)·close-b(같은 칸 새 draft)·close-c(48h+ 무커밋 ⊕ 주인 확인)의 근거 조건이
+ *   «모두 참»일 때만 그 draft 의 닫기 명령을 만든다. 보호 라벨·running·못 읽음은 근거가 참이어도 닫지 않는다(보류).
+ *   `propose` 모드는 닫기 명령 원문만 만들고, `live` 모드만 실제로 닫는다(실패는 ok:false 로 드러난다).
  * - `propose-land`: 카드·현재 머리의 self review 통과(pass «또는» warn ⊕ must-fix 0 · TA-LAND-WARN-MUSTFIX0)·non-draft 를 확인한다. 큐 설정이 있으면 원격 changed gate 뒤 착지 줄에 등록하고, 없으면 기존 `pr land` 를 머리 고정으로 한 번 부른다.
  * - 사다리 R4: `narrow-relaunch` · `wait-retry` · `salvage-relaunch` · `alternative` 도 허용 목록 어휘다 — 실제 발사는 실행부
  *   `executeNextAction`(`actions.ts`)이 «목록 ⊕ 같은 수 2회 상한 ⊕ 회당 1건 ⊕ 부하 관문»을 모두 넘을 때만 한다.
@@ -32,7 +36,7 @@ import { buildPriorFixContext, PRIOR_FIX_SCOPE_LINE, priorFixBlock, priorFixObse
 import { createLandWorktree, localBranch, localHead, observeLandWorktree, type LandWorktree, type LandWorktreeFailure, type LandWorktreeInput, type LandWorktreeRemoval } from './land-worktree.js';
 import { runQueuedLanding, type QueueLandingInput } from './land-queue.js';
 
-export const TASK_AGENT_LIVE_MOVES = ['review', 'propose-green', 'propose-land', 'decision-card', ...LIVE_RETRY_MOVES] as const;
+export const TASK_AGENT_LIVE_MOVES = ['review', 'propose-green', 'propose-land', 'propose-close', 'decision-card', ...LIVE_RETRY_MOVES] as const;
 export type TaskAgentLiveMove = typeof TASK_AGENT_LIVE_MOVES[number];
 export const TASK_AGENT_LIVE_MOVES_ENV = 'ELANOUS_TASK_AGENT_LIVE_MOVES';
 
@@ -207,9 +211,9 @@ export async function defaultPrHead(pr: number, cwd?: string, gh: GhRun = runGh)
   } catch { return null; }
 }
 
-/** 리뷰 요청 argv — 진입점 · 같은 우주(`--config-dir`) · `self review <PR> --json --intent`. */
+/** TA live reviews use the independent Claude ACP reviewer; self review owns same-head GLM fallback. */
 export function liveReviewArgs(entry: string, configDir: string, pr: number, intent: string): string[] {
-  return [resolve(entry), '--config-dir', configDir, 'self', 'review', String(pr), '--json', '--intent', intent];
+  return [resolve(entry), '--config-dir', configDir, 'self', 'review', String(pr), '--json', '--intent', intent, '--acp', '--acp-backend', 'claude'];
 }
 
 /** Use the configured node-b checkout for heavy TA workers; absence of parentHost preserves the legacy local path. */
@@ -246,7 +250,7 @@ export async function defaultRequestReview(pr: number, intent: string, cwd?: str
     [TA_REVIEW_COMPLETION_STATE_ENV]: opts.statePath,
     [TA_REVIEW_COMPLETION_RESULT_ENV]: opts.resultPath,
   } : undefined;
-  const workerCommand = remote ? remoteTaWorkerCommand(remote, ['self', 'review', String(pr), '--json', '--model', 'gpt-6-sol', '--intent', intent]) : null;
+  const workerCommand = remote ? remoteTaWorkerCommand(remote, ['self', 'review', String(pr), '--json', '--intent', intent, '--acp', '--acp-backend', 'claude']) : null;
   const command = remote ? 'ssh' : process.execPath;
   const workerArgs = remote ? ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', remote.host, workerCommand!] : args;
   if (!opts.resultPath) { await spawnDetachedConfirmed(base, command, workerArgs, undefined, cwd); return; }
@@ -874,6 +878,158 @@ export function executeLiveGreenProposal(card: TaskCard | undefined, evidence: R
   if (wrote.missing) return observe(deps, { kind, executed: false, card: card.id, ok: false, detail: 'task card not in state file' });
   if (!wrote.proposed) return observe(deps, { kind, executed: false, card: card.id, ok: true, detail: 'already proposed' });
   return observe(deps, { kind, executed: true, card: card.id, ok: true, detail: `green proposed (${Object.values(refs).join(', ')}) · checklist untouched` });
+}
+
+/**
+ * TA-PROPOSE-CLOSE-MOVE — draft 정리(0.2.36 · 대표 10-21)의 닫기 근거와 보류 조건.
+ * - close-a: draft 내용이 다른 곳에 착지되거나 대체됐다.
+ * - close-b: 같은 칸에 새 draft 가 열렸다(이 draft 는 대체됐다).
+ * - close-c: 48h+ 커밋 없음 ⊕ 칸 주인 확인 — 두 조건이 «모두» 참이어야 한다.
+ * - 보류: 보호 라벨·running·못 읽음(gh pr view 실패)·draft 아님·근거 없음 — 근거가 참이어도 닫지 않는다.
+ */
+export const CLOSE_IDLE_HOURS = 48;
+export const CLOSE_PROTECTED_LABELS = ['protected', 'do-not-close', 'keep-open'] as const;
+
+/** 가짜·실제 gh 우주가 돌려주는 draft 한 건의 닫기 판단 재료. */
+export interface DraftCloseView {
+  pr: number;
+  /** gh 로 draft 를 읽었는가 — 못 읽으면 닫지 않는다(fail-closed). */
+  readable: boolean;
+  isDraft: boolean;
+  labels?: readonly string[];
+  /** 진행 중 런에 붙은 draft — 닫지 않는다. */
+  running?: boolean;
+  /** close-a — 착지/대체. */
+  landedElsewhere?: boolean;
+  /** close-b — 같은 칸에 새 draft. */
+  newerDraftInSameCell?: boolean;
+  /** close-c — 마지막 커밋 이후 경과 시간(시). */
+  idleHours?: number;
+  /** close-c — 칸 주인 확인. */
+  ownerConfirmed?: boolean;
+}
+
+export interface DraftCloseGrounds { closeA: boolean; closeB: boolean; closeC: boolean; idle48h: boolean; ownerConfirmed: boolean }
+
+export type DraftCloseHeldBy = 'unreadable' | 'not-a-draft' | 'protected-label' | 'running' | 'no-grounds';
+
+export interface DraftCloseDecision {
+  pr: number;
+  /** 닫기 명령을 만들어도 되는가 — 근거가 참이고 보류 조건이 하나도 없을 때만. */
+  close: boolean;
+  /** 조건별 참/거짓 — 코멘트·관측의 재료. */
+  grounds: DraftCloseGrounds;
+  /** 근거 코멘트 — 조건별 참/거짓을 그대로 적는다. */
+  comment: string;
+  /** 닫기 명령 원문(보류면 null). */
+  command: string | null;
+  heldBy?: DraftCloseHeldBy;
+}
+
+/** 근거 코멘트 — 조건별 참/거짓을 전부 적는다(못 읽은 draft 도 같은 문면). */
+export function draftCloseGroundsComment(grounds: DraftCloseGrounds): string {
+  return `close-a(착지/대체)=${grounds.closeA} · close-b(같은 칸 새 draft)=${grounds.closeB}`
+    + ` · close-c(48h+ 무커밋=${grounds.idle48h}, 주인 확인=${grounds.ownerConfirmed})`;
+}
+
+/** draft 한 건의 닫기 판단 — 근거 조건이 모두 참이어야 그 근거가 성립하고, 보류 조건이 하나라도 있으면 닫지 않는다. */
+export function evaluateDraftClose(draft: DraftCloseView): DraftCloseDecision {
+  const grounds: DraftCloseGrounds = {
+    closeA: draft.landedElsewhere === true,
+    closeB: draft.newerDraftInSameCell === true,
+    closeC: false,
+    idle48h: typeof draft.idleHours === 'number' && Number.isFinite(draft.idleHours) && draft.idleHours >= CLOSE_IDLE_HOURS,
+    ownerConfirmed: draft.ownerConfirmed === true,
+  };
+  grounds.closeC = grounds.idle48h && grounds.ownerConfirmed;
+  const protectedLabel = (draft.labels ?? []).some((label) => (CLOSE_PROTECTED_LABELS as readonly string[]).includes(label));
+  const heldBy: DraftCloseHeldBy | undefined = !draft.readable ? 'unreadable'
+    : protectedLabel ? 'protected-label'
+    : draft.running === true ? 'running'
+    : draft.isDraft !== true ? 'not-a-draft'
+    : !(grounds.closeA || grounds.closeB || grounds.closeC) ? 'no-grounds'
+    : undefined;
+  const close = heldBy === undefined;
+  const comment = close
+    ? `draft 정리 — ${draftCloseGroundsComment(grounds)}`
+    : `draft 정리 보류(${heldBy}) — ${draftCloseGroundsComment(grounds)}`;
+  const command = close ? `gh pr close ${draft.pr} --comment ${shellQuote(comment)}` : null;
+  return { pr: draft.pr, close, grounds, comment, command, ...(close ? {} : { heldBy }) };
+}
+
+/** `gh pr close <pr> --comment <comment>` 인자 — 그대로 gh 로 간다. */
+export function liveCloseArgs(pr: number, comment: string): string[] {
+  return ['pr', 'close', String(pr), '--comment', comment];
+}
+
+/** 실물 닫기 — 같은 우주의 `gh pr close` 한 번(시험은 `closeDraft` 를 주입한다). */
+export async function defaultCloseDraft(pr: number, comment: string): Promise<void> {
+  const out = runGh(liveCloseArgs(pr, comment), { env: process.env });
+  if (out.status !== 0) throw new Error(`gh pr close ${pr} 실패: ${out.stdout.slice(-200)}`);
+}
+
+export interface LiveCloseDeps extends LiveMoveDeps {
+  /** `propose`(기본)는 명령 원문만 만들고, `live` 만 실제로 닫는다. */
+  mode?: 'propose' | 'live';
+  closeDraft?: (pr: number, comment: string) => Promise<void> | void;
+}
+
+export interface LiveCloseResult extends LiveMoveResult { proposals: DraftCloseDecision[] }
+
+function observeClose(deps: LiveMoveDeps, result: LiveCloseResult): LiveCloseResult {
+  try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'live-move', { ...result, live: true }); } catch { /* fail-soft */ }
+  return result;
+}
+
+/**
+ * `propose-close` — 카드에 묶인 draft 들의 닫기를 판단한다.
+ * propose 모드는 닫기 명령 원문(근거 코멘트 포함)만 만들고, live 모드만 `gh pr close`(또는 주입한 `closeDraft`)를 부른다.
+ * 보류(보호 라벨·running·못 읽음)는 어느 모드에서도 닫지 않는다.
+ */
+export async function executeLiveCloseProposal(
+  card: TaskCard | undefined,
+  drafts: readonly DraftCloseView[],
+  deps: LiveCloseDeps = {},
+): Promise<LiveCloseResult> {
+  const kind = 'propose-close' as const;
+  const proposals = drafts.map(evaluateDraftClose);
+  if (!card) return observeClose(deps, { kind, executed: false, card: null, ok: false, detail: 'no task card — stays shadow', proposals });
+  const detail = proposals.map((proposal) => proposal.close ? `#${proposal.pr} close — ${proposal.command}` : `#${proposal.pr} hold — ${proposal.heldBy}`).join(' · ') || 'no drafts';
+  if (deps.mode !== 'live') return observeClose(deps, { kind, executed: false, card: card.id, ok: true, detail, proposals });
+  const path = deps.statePath ?? taskAgentStatePath();
+  const at = (deps.now ?? (() => new Date()))().toISOString();
+  const closable = proposals.filter((proposal) => proposal.close);
+  const failures: string[] = [];
+  for (const proposal of closable) {
+    try {
+      await (deps.closeDraft ?? defaultCloseDraft)(proposal.pr, proposal.comment);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      failures.push(`#${proposal.pr}: ${reason.slice(-200)}`);
+      try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'live-close-failed', { card: card.id, pr: proposal.pr, reason }); } catch { /* fail-soft */ }
+    }
+  }
+  const executed = closable.length > 0;
+  const ok = failures.length === 0;
+  try {
+    updateTaskCard(path, card.id, (current) => current ? {
+      ...current,
+      history: [...(current.history ?? []), ...closable.map((proposal) => ({
+        at,
+        event: LIVE_MOVE_HISTORY_EVENT,
+        kind,
+        executed,
+        executorResult: 'live' as const,
+        pr: proposal.pr,
+        ok: !failures.some((failure) => failure.startsWith(`#${proposal.pr}:`)),
+        detail: `close #${proposal.pr} — ${proposal.comment}`,
+        effect: `draft #${proposal.pr} close 명령 실행 · 근거 ${draftCloseGroundsComment(proposal.grounds)}`,
+      }))],
+    } : undefined);
+  } catch (error) {
+    return observeClose(deps, { kind, executed, card: card.id, ok: false, detail: `${detail} · card update failed: ${String(error).slice(-200)}`, proposals });
+  }
+  return observeClose(deps, { kind, executed, card: card.id, ok, detail: ok ? detail : `close 실패 — ${failures.join(' · ')}`, proposals });
 }
 
 export interface LiveDecisionCardContext {

@@ -1,6 +1,6 @@
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
 import { debug } from '../debug/log.js';
-import { decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, laterMergedTwins, sameGoalPr, PROTECTED_LABELS, type DraftTriagePr } from './draft-triage-rules.js';
+import { assessDraftTriage, decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, laterMergedTwins, sameGoalPr, PROTECTED_LABELS, type DraftTriageAssessment, type DraftTriagePr, type DraftTriageReviewState } from './draft-triage-rules.js';
 import { cellIdFromBody } from '../pr-tool/census.js';
 import { cardPrNumber, draftTaskOwner, type TaskCard } from '../task-agent/task-hand.js';
 import type { PrTerminalRecord } from './draft-residue.js';
@@ -26,6 +26,8 @@ export interface SweepMergedPr extends DraftTriagePr {
 export interface DraftSweepAdapters {
   /** Each call returns one complete page; a rejection must not be mistaken for an empty page. */
   listDrafts(page: number, perPage: number, repository: string): Promise<readonly SweepDraft[]>;
+  /** Head commit time is fetched only for explicit triage, where it gates idle/close recommendations. */
+  getHeadCommitTime?(repository: string, number: number): Promise<string | undefined>;
   listMerged(page: number, perPage: number, repository: string): Promise<readonly SweepMergedPr[]>;
   /** Complete closed PR inventory for the creation cohort (including closed without merge). */
   listRecentClosed?(repository: string, createdSince: Date): Promise<readonly SweepMergedPr[]>;
@@ -77,6 +79,8 @@ export interface SweepReviewGate {
   readonly review?: 'pass' | 'fail';
   readonly mustFix?: boolean;
   readonly gate?: 'pass' | 'fail';
+  /** Exact-head review posture for triage; unknown stays distinct from legacy census posture. */
+  readonly triageReview?: DraftTriageReviewState;
 }
 
 export interface DraftSweepOptions {
@@ -89,6 +93,8 @@ export interface DraftSweepOptions {
   closeCapSource?: DraftSweepCloseCapSource;
   /** Closes already made this tick by the pod-terminal replay — they count against the same cap. */
   alreadyClosed?: number;
+  /** Include evidence-backed next-action recommendations in JSON output; never authorizes writes. */
+  includeTriage?: boolean;
 }
 
 export interface DraftSweepEntry {
@@ -107,6 +113,7 @@ export interface DraftSweepResult {
   apply: boolean;
   complete: boolean;
   entries: DraftSweepEntry[];
+  triage?: { entries: Array<{ number: number; assessment: DraftTriageAssessment }>; counts: Record<string, number> };
   counts: Record<string, number>;
   /** Drafts whose run could not be observed from here (kept, or closed by the idle rule). */
   unobserved?: number;
@@ -136,6 +143,11 @@ export interface DraftSweepLineageCounts {
   closed: number;
   harvestableClosed: number;
   fallThrough: Record<string, number>;
+  /**
+   * Of `closed`, the ones the 칸 (cell) key decided instead of the branch lineage key. Absent while the 칸 rule
+   * closes nothing, so every existing lineage count and log line keeps its exact shape.
+   */
+  cellClosed?: number;
 }
 
 /** A review counts as passed only on an observed PASS with no must-fix left. */
@@ -774,6 +786,30 @@ export function newerLineageDraft(draft: SweepDraft, openDrafts: readonly SweepD
 }
 
 /**
+ * The newest open draft of the same 칸 (cell) that was created strictly after `draft` and belongs to a different
+ * goal lineage — two runs of different goals working the same cell are duplicates of one deliverable.
+ * Reads the canonical cell identity (`cellIdFromBody`, the same `칸: <CELL>` marker the PR creation guard uses),
+ * never a re-derived marker, and keeps `branchLineageKey` byte-compatible: only a *different* key is a cell match.
+ * ⛔ A draft whose body names no 칸 never matches (keep), and a same-칸 draft of the same goal is `newerLineageDraft`.
+ */
+export function newerSameCellDraft(draft: SweepDraft, openDrafts: readonly SweepDraft[]): SweepDraft | undefined {
+  const cellId = cellIdFromBody(draft.body ?? '');
+  const created = Date.parse(draft.createdAt);
+  if (cellId === null || !Number.isFinite(created)) return undefined;
+  const key = branchLineageKey(draft.branch);
+  // A missing goal id is not evidence of a different goal. Keep unknown lineage on either side.
+  if (key === null) return undefined;
+  return openDrafts
+    .filter((pr) => {
+      const openKey = branchLineageKey(pr.branch);
+      return pr.number !== draft.number && cellIdFromBody(pr.body ?? '') === cellId
+        && openKey !== null && openKey !== key
+        && Number.isFinite(Date.parse(pr.createdAt)) && Date.parse(pr.createdAt) > created;
+    })
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.number - a.number)[0];
+}
+
+/**
  * Census of harness drafts older than 24h. Same-goal landing uses `sameGoalPr` unchanged.
  * A draft counts as closable when a same-goal merged PR exists, harvestable when review PASS and the gate passed,
  * and blocked when must-fix remains. Unknown review/gate is neither harvestable nor blocked.
@@ -800,7 +836,7 @@ export function draftSweepDaily(
 }
 
 /** A failed inventory or liveness lookup is never treated as proof that a draft can be closed. */
-export async function runDraftSweep({ repository, adapters, apply = false, now = new Date(), closeCap: requestedCap, closeCapSource: requestedSource, alreadyClosed = 0 }: DraftSweepOptions): Promise<DraftSweepResult> {
+export async function runDraftSweep({ repository, adapters, apply = false, now = new Date(), closeCap: requestedCap, closeCapSource: requestedSource, alreadyClosed = 0, includeTriage = false }: DraftSweepOptions): Promise<DraftSweepResult> {
   const validCap = validCloseCap(requestedCap);
   const closeCap = validCap ?? DRAFT_SWEEP_CLOSE_CAP;
   const closeCapSource: DraftSweepCloseCapSource = validCap === undefined ? 'default' : requestedSource ?? 'flag';
@@ -878,7 +914,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   const reviewGate = new Map<number, SweepReviewGate | undefined>();
   if (adapters.getReviewGate) {
     // Review/gate posture only feeds the daily census, which only counts harness drafts older than 24h.
-    const censused = drafts.filter((draft) => dailyCensusDraft(draft, now));
+    const censused = includeTriage ? drafts : drafts.filter((draft) => dailyCensusDraft(draft, now));
     try {
       await mapBounded(censused, DRAFT_SWEEP_CONCURRENCY, async (draft) => {
         reviewGate.set(draft.number, await adapters.getReviewGate!(draft, repository));
@@ -894,11 +930,88 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   // Card and terminal inventories are observations, not closing authority. An unreadable source cannot mint a claim.
   let cards: readonly TaskCard[] | undefined;
   let terminals: readonly PrTerminalRecord[] | undefined;
-  if (apply) {
+  if (apply || includeTriage) {
     try { cards = await adapters.listTaskCards?.(); if (cards && !Array.isArray(cards)) cards = undefined; }
     catch (error) { debug.log('draft.residue', 'claim-skipped', { prNumber: null, owner: null, runId: null, reason: `cards-unreadable: ${sweepFailureReason(error)}` }); }
     try { terminals = await adapters.listPrTerminals?.(); if (terminals && !Array.isArray(terminals)) terminals = undefined; }
     catch (error) { debug.log('draft.residue', 'claim-skipped', { prNumber: null, owner: null, runId: null, reason: `terminals-unreadable: ${sweepFailureReason(error)}` }); }
+  }
+  if (includeTriage) {
+    const latestCommitTimes = new Map<number, string | undefined>();
+    if (adapters.getHeadCommitTime) {
+      await mapBounded(drafts, DRAFT_SWEEP_CONCURRENCY, async (draft) => {
+        latestCommitTimes.set(draft.number, draft.latestCommitAt ?? await adapters.getHeadCommitTime!(repository, draft.number).catch(() => undefined));
+      });
+    }
+    const triageDrafts = drafts.map((draft) => ({ ...draft,
+      ...(latestCommitTimes.has(draft.number) ? { latestCommitAt: latestCommitTimes.get(draft.number) } : {}),
+    }));
+    const triageRows: Array<{ number: number; assessment: DraftTriageAssessment }> = [];
+    const initial = triageDrafts.map((draft) => {
+      const posture = reviewGate.get(draft.number);
+      return assessDraftTriage({ draft, now, runStatus: statuses.get(draft.number),
+        ...(posture?.gate ? { gate: posture.gate } : {}),
+        ...(posture?.triageReview ? { review: posture.triageReview } : {}),
+      });
+    });
+    const activeOwnerObservations = new Map<number, { owner?: string; observed: boolean }>();
+    if (adapters.getActiveClaimOwner) {
+      const ownerLookupDrafts = triageDrafts.filter((draft) => !(cards && draftTaskOwner(cards, draft)));
+      await mapBounded(ownerLookupDrafts, DRAFT_SWEEP_CONCURRENCY, async (draft) => {
+        try {
+          activeOwnerObservations.set(draft.number, { owner: await adapters.getActiveClaimOwner!(repository, draft.number), observed: true });
+        } catch {
+          activeOwnerObservations.set(draft.number, { observed: false });
+        }
+      });
+    }
+    for (let index = 0; index < drafts.length; index++) {
+      const draft = triageDrafts[index]!;
+      const identity = initial[index]!;
+      // A generic sweep can target any repository, while the checklist is machine-wide.
+      // Until checklist observations are repository-bound, leave cell status unknown so close-a stays human.
+      const draftCreatedAt = Date.parse(draft.createdAt);
+      let newerSameCellSameCard: boolean | undefined;
+      if (identity.origin && identity.cellId && identity.cardId && Number.isFinite(draftCreatedAt)) {
+        let uncertainMatch = false;
+        newerSameCellSameCard = false;
+        for (let otherIndex = 0; otherIndex < triageDrafts.length; otherIndex++) {
+          if (otherIndex === index) continue;
+          const other = triageDrafts[otherIndex]!;
+          const otherIdentity = initial[otherIndex];
+          const otherCreatedAt = Date.parse(other.createdAt);
+          if (Number.isFinite(otherCreatedAt) && otherCreatedAt <= draftCreatedAt) continue;
+          if (otherIdentity?.origin && otherIdentity.origin !== identity.origin) continue;
+          if (otherIdentity?.cellId && otherIdentity.cellId !== identity.cellId) continue;
+          if (otherIdentity?.cardId && otherIdentity.cardId !== identity.cardId) continue;
+          if (!Number.isFinite(otherCreatedAt) || !otherIdentity?.origin || !otherIdentity.cellId || !otherIdentity.cardId) {
+            uncertainMatch = true;
+            continue;
+          }
+          newerSameCellSameCard = true;
+          break;
+        }
+        if (newerSameCellSameCard !== true && uncertainMatch) newerSameCellSameCard = undefined;
+      }
+      const ownerCard = cards ? draftTaskOwner(cards, draft) : undefined;
+      // A cell can have several cards and PRs. Terminal evidence belongs to this draft only by exact PR number;
+      // the terminal `card` field can identify the cell, not this card.
+      const cellTerminals = terminals?.filter((terminal) => terminal.repository === repository && terminal.prNumber === draft.number);
+      const activeOwnerObservation = ownerCard ? undefined : activeOwnerObservations.get(draft.number);
+      const posture = reviewGate.get(draft.number);
+      const assessment = assessDraftTriage({ draft, now, runStatus: statuses.get(draft.number),
+        ...(posture?.gate ? { gate: posture.gate } : {}),
+        ...(posture?.triageReview ? { review: posture.triageReview } : {}),
+        newerSameCellSameCard,
+        ownerConfirmed: ownerCard?.seat ? true : !activeOwnerObservation?.observed ? undefined : Boolean(activeOwnerObservation.owner?.trim()),
+      });
+      const terminalEvidence = terminals === undefined ? 'PrTerminalRecord 미관측'
+        : `PrTerminalRecord: cell=${identity.cellId ?? 'unknown'} matched=${cellTerminals?.length ?? 0}`;
+      triageRows.push({ number: draft.number, assessment: { ...assessment, evidence: [...assessment.evidence, terminalEvidence] } });
+    }
+    const triageCounts: Record<string, number> = {};
+    for (const row of triageRows) triageCounts[row.assessment.nextAction] = (triageCounts[row.assessment.nextAction] ?? 0) + 1;
+    result.triage = { entries: triageRows, counts: triageCounts };
   }
   result.complete = true;
   let closes = Number.isSafeInteger(alreadyClosed) && alreadyClosed > 0 ? alreadyClosed : 0;
@@ -907,6 +1020,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   let claimExpired = 0;
   const lineageCounts: DraftSweepLineageCounts = { closed: 0, harvestableClosed: 0, fallThrough: {} };
   result.lineage = lineageCounts;
+  // 칸-keyed closes this tick; published on `lineageCounts` only when the 칸 rule fires (existing shapes stay byte-identical).
+  let cellClosed = 0;
   // Review posture for the harvestable lineage check, reusing the census lookups (one lookup per PR per tick).
   const postureFor = async (pr: SweepDraft): Promise<SweepReviewGate | undefined> => {
     if (!reviewGate.has(pr.number)) reviewGate.set(pr.number, await adapters.getReviewGate!(pr, repository));
@@ -1029,7 +1144,11 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     // reruns open until the 24h idle expiry. It is still protected when its own review passed and the newer one's did not.
     const harvestable = draft.labels.includes(harvestableLabel);
     const lineageNewer = contradiction ? undefined : newerLineageDraft(draft, drafts);
-    if (lineageNewer) {
+    // A different goal working the same 칸 is invisible to the branch lineage key, so the canonical 칸 identity decides it.
+    // The lineage key keeps priority: a same-goal rerun stays a lineage outcome even when both drafts share the 칸.
+    const cellNewer = contradiction || lineageNewer ? undefined : newerSameCellDraft(draft, drafts);
+    const duplicateNewer = lineageNewer ?? cellNewer;
+    if (duplicateNewer) {
       const base = decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
         finalRunResult, ageHours: runStatus ? ageHours : idleHours });
       if (!base.reason.startsWith('label:') && !base.reason.startsWith('superseded-by #') && !base.reason.startsWith('duplicate-of-open #')) {
@@ -1037,12 +1156,14 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
           || (status !== 'self-implement.result final' && liveBranches.has(branch));
         const runLive = live(runStatus, draft.branch);
         const lineageKey = branchLineageKey(draft.branch);
-        const reason = `duplicate-of-open #${lineageNewer.number} (lineage ${lineageKey})${runLive ? ` · stop run ${draft.runId ?? 'unknown'}` : ''}`;
+        const cellId = cellNewer ? cellIdFromBody(draft.body ?? '') : null;
+        const duplicateOf = cellNewer ? `cell ${cellId}` : `lineage ${lineageKey}`;
+        const reason = `duplicate-of-open #${duplicateNewer.number} (${duplicateOf})${runLive ? ` · stop run ${draft.runId ?? 'unknown'}` : ''}`;
         // Every lineage outcome that does not close falls through to the existing rules (preservation contract):
         // a duplicate this rule cannot settle is decided exactly as it was before this rule existed.
         const fallThrough = (why: string) => {
           lineageCounts.fallThrough[why] = (lineageCounts.fallThrough[why] ?? 0) + 1;
-          try { debug.log('self-dev.draft-sweep', 'lineage-fall-through', { number: draft.number, newer: lineageNewer.number, lineageKey, why, harvestable }); } catch { /* fail-soft */ }
+          try { debug.log('self-dev.draft-sweep', 'lineage-fall-through', { number: draft.number, newer: duplicateNewer.number, lineageKey, ...(cellId === null ? {} : { cellId }), why, harvestable }); } catch { /* fail-soft */ }
         };
         // A harvestable draft yields only to a newer draft at least as complete: an observed review PASS on the old one
         // is kept unless the newer one passed review too. Unobservable review posture keeps the old draft (fail-closed).
@@ -1051,17 +1172,19 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
           if (!adapters.getReviewGate) harvestProtection = 'lineage-harvestable-review-unobserved';
           else {
             try {
-              const [oldPosture, newPosture] = [await postureFor(draft), await postureFor(lineageNewer)];
+              const [oldPosture, newPosture] = [await postureFor(draft), await postureFor(duplicateNewer)];
               if (oldPosture === undefined) harvestProtection = 'lineage-harvestable-review-unobserved';
               else if (reviewPassed(oldPosture) && !reviewPassed(newPosture)) harvestProtection = 'lineage-harvestable-review-pass-protected';
             } catch { harvestProtection = 'lineage-harvestable-review-unobserved'; }
           }
         }
         if (harvestProtection) fallThrough(harvestProtection);
+        // `supersedeRun` is same-lineage authority only: a live 칸 duplicate is kept for the existing rules instead.
+        else if (cellNewer && runLive) fallThrough('cell-duplicate-run-live');
         else if (runLive && !adapters.supersedeRun) fallThrough('lineage-duplicate-run-live');
         // Safety (OP 10-11): a live run is stopped only when the newer run of the same lineage is itself live —
         // never trade a running attempt for one that already ended or was never observed running.
-        else if (runLive && !live(statuses.get(lineageNewer.number), lineageNewer.branch)) fallThrough('lineage-newer-run-not-live');
+        else if (runLive && !live(statuses.get(duplicateNewer.number), duplicateNewer.branch)) fallThrough('lineage-newer-run-not-live');
         else if (closes >= closeCap) {
           record({ number: draft.number, action: 'keep', reason: 'close-cap', applied: false });
           continue;
@@ -1069,9 +1192,9 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
           let stopFailed = false;
           // --apply only: the run is stopped before anything is written; a stop that cannot be confirmed writes nothing.
           if (apply && runLive) {
-            const observed = { number: draft.number, newer: lineageNewer.number, runId: draft.runId ?? null, newerRunId: lineageNewer.runId ?? null, lineageKey };
+            const observed = { number: draft.number, newer: duplicateNewer.number, runId: draft.runId ?? null, newerRunId: duplicateNewer.runId ?? null, lineageKey };
             try {
-              await adapters.supersedeRun!(draft, repository, lineageNewer);
+              await adapters.supersedeRun!(draft, repository, duplicateNewer);
               try { debug.log('self-dev.draft-sweep', 'supersede-run', observed); } catch { /* fail-soft */ }
             } catch (error) {
               stopFailed = true;
@@ -1084,6 +1207,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
             closes += 1;
             lineageCounts.closed += 1;
             if (harvestable) lineageCounts.harvestableClosed += 1;
+            if (cellNewer) cellClosed += 1;
             const entry: DraftSweepEntry = { number: draft.number, action: 'close', reason, statusLabel: supersededLabel, applied: false };
             record(entry);
             if (!apply) continue;
@@ -1103,6 +1227,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
                 closes -= 1;
                 lineageCounts.closed -= 1;
                 if (harvestable) lineageCounts.harvestableClosed -= 1;
+                if (cellNewer) cellClosed -= 1;
               }
               entry.error = String(error);
             }
@@ -1212,6 +1337,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
   }
   timing('decide', drafts.length);
+  if (cellClosed > 0) lineageCounts.cellClosed = cellClosed;
   try { debug.log('self-dev.draft-sweep', 'lineage-summary', { ...lineageCounts, apply }); } catch { /* fail-soft */ }
   try { debug.log('self-dev.draft-sweep', 'timing', { phase: 'total', ms: Date.now() - started, count: drafts.length, closed: closes, closeCap, closeCapSource }); } catch { /* fail-soft */ }
   result.unobserved = unobserved;

@@ -9,7 +9,8 @@
 
 graph_id: research-loop
 version: 5
-entry_node: investigate
+journey_stages: [entry, author, dispatch, run, land, recover, end]
+entry_node: intake
 terminal_nodes: [landed, needs-human]
 runner_inputs: [goal, worktree, branch, review-intent, head-sha, base-branch, ask, context, prior]
 # ⛔ 키 이름은 파서(`src/self-implement/graph-yaml.ts:201`)가 아는 것뿐이다 — 다른 이름은 «조용히» 무시된다.
@@ -121,7 +122,122 @@ nodes:
   - { node_id: landed, kind: gate, recipe: none, max_visits: 1 }
   - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
 
+  # Entry and Pod dispatch reuse the existing ARG-UNIT-LIB units.
+  - node_id: intake
+    kind: observe
+    recipe: harness-entrance
+    journey_stage: entry
+    max_visits: 1
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [route, reason] }
+  - node_id: queue
+    kind: gate
+    recipe: harness-queue
+    journey_stage: entry
+    max_visits: 1
+    contract: { inputs: [goal], tools: read-only, outputs: [queue_status, card_id] }
+  - node_id: launch-gate
+    kind: gate
+    recipe: pre-launch-gate
+    journey_stage: entry
+    max_visits: 1
+    contract: { inputs: [goal], tools: read-only, outputs: [decision, reason] }
+  - node_id: entry-unit
+    kind: subgraph
+    recipe: none
+    journey_stage: entry
+    max_visits: 1
+    call: entry@1
+    budget: { inner_steps: 4 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - node_id: dispatch
+    kind: judge
+    recipe: harness-substrate-select
+    journey_stage: dispatch
+    max_visits: 2
+    contract: { inputs: [launch_decision], tools: read-only, outputs: [substrate] }
+  - node_id: pool-admit
+    kind: gate
+    recipe: pod-pool-admission
+    journey_stage: dispatch
+    max_visits: 4
+    contract: { inputs: [goal, substrate], tools: read-only, outputs: [admission, reason] }
+  - node_id: dispatch-pod-unit
+    kind: subgraph
+    recipe: none
+    journey_stage: dispatch
+    max_visits: 4
+    call: dispatch-pod@1
+    budget: { inner_steps: 4 }
+    contract: { inputs: [ask, context, prior], tools: worktree-write, outputs: [result, evidence] }
+  - node_id: freeze-check
+    kind: gate
+    recipe: landing-freeze-admission
+    journey_stage: land
+    max_visits: 4
+    contract: { inputs: [worktree, changed-files], tools: read-and-run-tests, outputs: [decision, reason] }
+  - node_id: hold
+    kind: hitl
+    recipe: frozen-merge-queue
+    journey_stage: land
+    max_visits: 4
+    contract: { inputs: [pr-number, freeze-state], tools: human-selection, outputs: [decision] }
+  - node_id: cleanup
+    kind: git
+    recipe: post-merge-cleanup
+    journey_stage: land
+    max_visits: 1
+    contract: { inputs: [pr-number, merge-sha, worktree], tools: git-write, outputs: [cleaned, worktree] }
+  - node_id: result-parse
+    kind: observe
+    recipe: pod-failure-reason
+    journey_stage: recover
+    max_visits: 4
+    contract: { inputs: [failure-log], tools: read-only, outputs: [failure-class, evidence] }
+  - node_id: salvage
+    kind: git
+    recipe: salvage-branch
+    journey_stage: recover
+    max_visits: 4
+    contract: { inputs: [worktree, branch], tools: git-write, outputs: [salvage-branch, ref] }
+  - node_id: heal
+    kind: judge
+    recipe: heal-intake
+    journey_stage: recover
+    max_visits: 4
+    contract: { inputs: [failure-class, evidence], tools: read-only, outputs: [repair-plan, reason] }
+  - node_id: next-move
+    kind: judge
+    recipe: task-agent-judge
+    journey_stage: recover
+    max_visits: 4
+    contract: { inputs: [repair-results, card-state], tools: read-only, outputs: [next-action, reason] }
+  - node_id: ready
+    kind: gate
+    recipe: none
+    journey_stage: land
+    max_visits: 1
+    contract: { inputs: [pr-number, head-sha], tools: read-only, outputs: [ready, reason] }
+  - node_id: pr-head-checkout
+    kind: gate
+    recipe: none
+    journey_stage: land
+    max_visits: 1
+    contract: { inputs: [pr-number, worktree], tools: git-write, outputs: [checked-out-head, worktree] }
+
 edges:
+  - { from: intake, on: outcome, map: { queued: queue, direct: launch-gate, ok: launch-gate, fail: needs-human } }
+  - { from: queue, on: outcome, map: { launched: launch-gate, waiting: needs-human, refused: needs-human, ok: launch-gate, fail: needs-human } }
+  - { from: launch-gate, on: outcome, map: { pass: entry-unit, refuse: needs-human, ok: entry-unit, fail: needs-human } }
+  - from: entry-unit
+    on: outcome
+    map: { done: dispatch, rework: investigate, needs-human: needs-human, failed: needs-human }
+  - from: dispatch
+    on: outcome
+    map: { local: investigate, pod: pool-admit, fresh: investigate, pr-source: pool-admit, ok: investigate, fail: needs-human }
+  - { from: pool-admit, on: outcome, map: { admitted: dispatch-pod-unit, refused: needs-human, ok: dispatch-pod-unit, fail: needs-human } }
+  - from: dispatch-pod-unit
+    on: outcome
+    map: { done: investigate, rework: investigate, needs-human: needs-human, failed: result-parse }
   # ⛔⭐ 유일하게 implement-loop 과 «다른» 자리 — gate 를 «건너뛸 수 있다».
   #   조건은 코드가 낸다: 변경 파일에 «코드»가 있나(routeGate). 못 세면 «돈다»(fail-safe).
   - from: investigate
@@ -161,11 +277,29 @@ edges:
     to: open-pr
 
   - from: open-pr
-    to: merge
+    to: freeze-check
+  - from: freeze-check
+    on: outcome
+    map: { open: merge, frozen: hold, taken: needs-human, ok: merge, fail: needs-human }
+  - from: hold
+    to: freeze-check
 
   - from: merge
     on: outcome
-    map: { merged: landed, land-refused: recover, ok: needs-human, fail: needs-human }
+    map: { merged: cleanup, land-refused: recover, draft: ready, head-branch: pr-head-checkout, not-ancestor: main-sync, review-missing: judge, other: next-move, ok: needs-human, fail: needs-human }
+  - from: cleanup
+    to: landed
+  - from: result-parse
+    to: salvage
+  - from: salvage
+    to: heal
+  - from: heal
+    to: next-move
+  - { from: ready, to: next-move }
+  - { from: pr-head-checkout, to: next-move }
+  - from: next-move
+    on: outcome
+    map: { narrow-relaunch: dispatch, salvage-relaunch: dispatch, alternative: dispatch, wait-retry: dispatch, decision-card: needs-human, wait: needs-human, ok: needs-human, fail: needs-human }
 
   # The train/TA owns retry effects; the unit only classifies the refusal.
   - from: recover

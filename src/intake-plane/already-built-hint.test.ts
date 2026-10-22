@@ -2,11 +2,20 @@
 // 같은 기능 문면 → 근거 링크 붙은 힌트 1건 · 관련 없는 요구 0건 · 근거 없는 행 0건 ·
 // 거절한 짝(요구 해시 ⊕ feature) 0건 · 상위 매칭은 kind=already|similar.
 // 템플릿: test/session-p5-search-rank.test.ts
+// 생산 진입점 배선도 이 파일이 문다 — readRequirementFunnel(인테이크 요구 퍼널 입구)이
+// features/refusedFeatures 를 넘겨 runRequirementFunnel → alreadyBuiltHints → requirements.intake/hint
+// 관측으로 이어지는 경로를 실제 호출로 확인한다(임시 stateDir·shadow 모드로 운영 루트 무접촉).
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, spyOn } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { hashContent } from '../hasher.js';
 import { rankByTrigramFts } from '../session/search-index.js';
 import { alreadyBuiltHints } from './already-built-hint.js';
+import { readRequirementFunnel } from './requirement-funnel.js';
+import { debug } from '../debug/log.js';
 
 const FEATURE = {
   devProject: 'elanous-core',
@@ -98,5 +107,53 @@ describe('alreadyBuiltHints — «이미 있는 기능» 힌트(UX 0.2.34)', () 
     const byFeature = new Map(hints.map((h) => [h.feature, h.evidence.file] as const));
     expect(byFeature.get(FEATURE.feature)).toBe('src/session/search-index.ts');
     expect(byFeature.get('session-search-rank-ui')).toBe('apps/pwa/src/search.ts');
+  });
+});
+
+// ── 생산 진입점 배선 — 인테이크 요구 퍼널(readRequirementFunnel) → alreadyBuiltHints → intake.hint 관측 ──
+// (의도적 경계 · 다음 조각) 아래 describe 는 실제 인테이크 진입점 readRequirementFunnel 에
+// features/refusedFeatures 를 주입해 입구 계약(겹침 → 근거가 붙은 힌트 1건, 무관/거절 짝 → 0건)만 증명한다.
+// 실제 상태 기반 생산 호출자(src/briefing/brief-items.ts — readRequirementFunnel({ stateDir, now }))는
+// 아직 DEV-FEATURE-MAP 근거 행을 넘기지 않는다 — 실 데이터 공급(DEV-FEATURE-MAP 칸)은 다음 조각이며,
+// 이번 PR 의 완료 주장은 '생산 실행 중 힌트 발화'가 아니라 '입구 배선 ⊕ 주입 계약 증명'으로 정정한다.
+describe('readRequirementFunnel — 생산 진입점이 힌트를 intake.hint 로 관측한다', () => {
+  const hintsThroughFunnel = (
+    text: string,
+    refusedFeatures: readonly { requestHash: string; feature: string }[] = [],
+  ) => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'already-built-hint-'));
+    const now = new Date();
+    const receivedAt = new Date(now.getTime() - 60_000).toISOString();
+    const seen: { category: string; event: string; payload: unknown }[] = [];
+    const spy = spyOn(debug, 'log').mockImplementation((category: string, event: string, payload: unknown) => {
+      seen.push({ category, event, payload });
+    });
+    // 릴리스 원장·사용자 설정도 임시 루트로 격리한다(운영 루트 무접촉).
+    setElanousConfigDir(stateDir);
+    try {
+      readRequirementFunnel({ stateDir, now, mode: 'shadow', dailyCap: 0,
+        grounding: [{ id: 'hint-req', text, link: 'https://example.test/hint', receivedAt }],
+        features: [FEATURE], refusedFeatures });
+    } finally {
+      resetElanousConfigDir();
+      spy.mockRestore();
+    }
+    return seen.filter((entry) => entry.category === 'requirements.intake' && entry.event === 'hint');
+  };
+
+  test('겹치는 요구 1건 → 커밋·파일 근거가 붙은 힌트 1건 · 무관 요구 → 0건', () => {
+    const overlapping = hintsThroughFunnel('trigram BM25 로 매긴다');
+    expect(overlapping).toHaveLength(1);
+    expect(overlapping[0]?.payload).toMatchObject({ id: 'hint-req', kind: 'already',
+      devProject: FEATURE.devProject, feature: FEATURE.feature,
+      evidence: { commit: FEATURE.evidence.commit, file: FEATURE.evidence.file } });
+
+    expect(hintsThroughFunnel('회계 장부 집계를 자동으로 정리한다')).toHaveLength(0);
+  });
+
+  test('거절한 짝(요구 해시 ⊕ feature)은 인테이크 진입점에서도 0건', () => {
+    const hints = hintsThroughFunnel('trigram BM25 로 매긴다',
+      [{ requestHash: hashContent('trigram BM25 로 매긴다'), feature: FEATURE.feature }]);
+    expect(hints).toHaveLength(0);
   });
 });

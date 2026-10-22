@@ -14,6 +14,9 @@ import {
 } from './spawn-discipline.js';
 import { GIT_SPAWN_BASELINE } from './spawn-discipline-baseline.js';
 
+/** `man git-status` 의 NAME 줄 — git 산출이 아니라 **호스트 매뉴얼 페이지 자산**이 내는 문면이다. */
+const GIT_STATUS_MANUAL_TITLE = 'git-status - Show the working tree status';
+
 describe('findGitSpawnSites — 네 형태를 각각 문다', () => {
   // ⛔ 한 픽스처에 다 넣고 "N건" 만 세면 **한 패턴을 지워도 통과한다**(Goodhart).
   //    형태마다 따로 단언해 패턴 하나를 지우면 그 케이스가 반드시 깨지게 한다.
@@ -277,17 +280,46 @@ describe('실제 저장소 — 이 게이트가 지키는 것', () => {
     expect(spawned.status).toBe(0);
   }, 90_000);
 
+  // ⛔⭐⭐⭐ 원인 확정(0.2.35 GATE-PREEXISTING-ZERO · 0.2.34 gate preexisting 1건):
+  //    기대 문면 `git-status - Show the working tree status` 는 git 의 산출이 아니라 **`man git-status` 의 NAME 줄**이다.
+  //    ⇒ 그 문면을 내는 것은 *호스트의 매뉴얼 페이지 자산*이고, git 도 프론트도어도 아니다.
+  //    최소 이미지(Ubuntu minimized)의 `/usr/bin/man` 은 **실패하지 않는 스텁**이다 — 안내문만 stdout 에 쓰고 0 으로 끝난다.
+  //    그래서 git 은 --help 경로를 정상 수행하고 0 으로 끝나며, 프론트도어도 세 불변식을 다 지켰는데도
+  //    «문면만» 사라져 이 시험만 preexisting 으로 울었다(실측: 나머지 34 pass · 이 1건 fail).
+  //    ⇒ 기대값을 호스트 자산에 걸지 않는다. **같은 호스트의 실물 git**을 기준선으로 삼아 바이트로 대조한다.
+  //      `--help` 를 삼키면(elanous 자기 help) · 떨어뜨리면(진짜 `git status` 실행) stdout 이 즉시 갈린다.
+  //    ⇒ 매뉴얼 페이지가 «실재하는» 호스트에서는 본문 단언을 그대로 건다(호스트에 맞춘 조건부 유지 · 약화 아님).
   test('실물 git 프론트도어는 --help를 git argv로 전달하고 상태 줄과 git 종료 코드를 보존한다', () => {
+    const direct = spawnSync('git', ['status', '--help'], { encoding: 'utf8', timeout: 60_000 });
+    // 기준선이 무효면(타임아웃·미실행) 아래 대조가 «우연히» 맞을 수 있다 ⇒ 먼저 기준선의 유효성을 잰다.
+    expect(direct.status).not.toBeNull();
+    const directOut = direct.stdout ?? '';
+    const directErr = direct.stderr ?? '';
+
     const spawned = spawnSync('bun', ['bin/elanous.mjs', 'git', 'status', '--help'], {
       encoding: 'utf8',
       timeout: 60_000,
     });
     const stdout = spawned.stdout ?? '';
     const stderr = spawned.stderr ?? '';
-    expect(`${stdout}${stderr}`).toContain('git-status - Show the working tree status');
-    // Status is stderr by decision so stdout remains byte-preserving for JSON pipelines.
-    expect(stderr.trimEnd().split('\n').at(-1)).toBe('[git] status ok rc=0');
-    expect(spawned.status).toBe(0);
+
+    // ① --help 전달: 프론트도어의 stdout 은 git 이 낸 바이트 «그대로» 다(상태 줄은 stderr 로 가기로 한 결정).
+    expect(stdout).toBe(directOut);
+    // man/mandoc 의 진단 stderr 는 직접 호출과 래퍼 호출 사이에도 달라질 수 있다.
+    // stdout 바이트·종료 코드·상태 줄로 argv 전달과 프론트도어 계약을 판정한다.
+    // ② 상태 줄: 마지막 줄이 «실제» git 종료 코드를 말한다(0 을 상수로 박지 않는다).
+    //    ⛔ 상태 «단어» 도 종료 코드를 따라야 한다(프론트도어 규약 · git-cli.ts: rc=0 → ok, 0이 아니면 FAILED).
+    //    리뷰 must-fix: `--help` 가 0이 아닌 호스트에서도 프론트도어가 종료 코드를 올바르게 보존하면
+    //    상태 줄은 «FAILED» 다 — `ok` 를 무조건 요구하면 매뉴얼 자산 차이로 정상 동작을 실패로 판정하는
+    //    문제가 다시 생긴다. 기대 상태 줄 전체를 실제 종료 코드에 맞춘다.
+    expect(stderr.trimEnd().split('\n').at(-1))
+      .toBe(`[git] status ${direct.status === 0 ? 'ok' : 'FAILED'} rc=${direct.status}`);
+    // ③ 종료 코드 보존.
+    expect(spawned.status).toBe(direct.status);
+    // 매뉴얼 페이지가 실재하는 호스트에서만 본문까지 확인한다.
+    if (`${directOut}${directErr}`.includes(GIT_STATUS_MANUAL_TITLE)) {
+      expect(`${stdout}${stderr}`).toContain(GIT_STATUS_MANUAL_TITLE);
+    }
   }, 90_000);
 
   test('실물 git 프론트도어는 성공·실패·파이프에 상태 줄과 실제 종료 코드를 남긴다', () => {

@@ -222,6 +222,8 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   hostDoctorMachineResources?: () => Promise<ResourceView[]>;
   /** `doctor visit`/`doctor status` 원장 디렉터리(시험 seam) — 기본 = `runLedgerDir()`. */
   doctorVisitLedgerDir?: string;
+  /** `doctor visit` 사고 선례 연결 루트(시험 seam) — 기본 = `doctorVisitIncidentRoot()` · `null` 이면 건너뛴다. */
+  doctorVisitIncidentRoot?: string | null;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1378,8 +1380,9 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           symptom: opts.symptom,
           ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}),
           ...(deps.doctorVisitLedgerDir !== undefined ? { dir: deps.doctorVisitLedgerDir } : {}),
+          ...(deps.doctorVisitIncidentRoot !== undefined ? { incidentRoot: deps.doctorVisitIncidentRoot } : {}),
         });
-        out.log(json ? JSON.stringify(visit) : `doctor visit recorded: runId=${runId} from=${opts.from} symptom=${opts.symptom}${visit.evidence !== undefined ? ` evidence=${visit.evidence}` : ''}`);
+        out.log(json ? JSON.stringify(visit) : `doctor visit recorded: runId=${runId} from=${opts.from} symptom=${opts.symptom}${visit.evidence !== undefined ? ` evidence=${visit.evidence}` : ''}${visit.incidentPrecedents !== undefined ? ` incident-precedents=${visit.incidentPrecedents.length}` : ''}`);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         if (json) out.log(JSON.stringify({ status: 'rejected', reason }));

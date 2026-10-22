@@ -132,6 +132,28 @@ function mentionedPaths(text: string): string[] {
   return [...text.matchAll(PATH_TOKEN)].map((match) => match[1]!).filter((path) => !path.split('/').includes('..'));
 }
 
+/** `docs/goal-context/03-verification-menu.md` §선택 원칙: merge SHA·타입검사는 수용선이 아니다. */
+export const MERGE_OR_TYPECHECK_ONLY_REAL_WARNING = '- 완료 경계 실물: merge sha·타입검사만으로는 실물이 아니다 — docs/goal-context/03-verification-menu.md 에서 동작을 재는 방법을 고른다';
+/** 통합 이력·정적 타입 상태만 말하는 낱말(조사 뗀 꼴). 이 밖의 낱말이 하나라도 있으면 실물 주장으로 본다. */
+const MERGE_OR_TYPECHECK_WORD = /^(?:pr|merge|merged|머지|병합|착지|landed|land|sha|merge-sha|commit|커밋|origin|main|tsc|typecheck|type-check|typecheck-changed|타입검사|타입|검사|type|check|changed|통과|pass|passed|green|clean|errors?|error|오류|에러|없음|후|뒤|완료|확인|and|및|만|됨|된다)$/i;
+const MERGE_OR_TYPECHECK_SIGNAL = /^(?:merge|merged|머지|병합|착지|landed|land|sha|merge-sha|tsc|typecheck|type-check|타입검사)$/i;
+const KOREAN_PARTICLE_TAIL = /(?:했다|했음|하였다|했고|함|으로|로|이|가|은|는|을|를|와|과|에|의|만|됨|된|된다)$/u;
+
+/** 「완료 경계 실물」 값이 merge sha·PR 착지·타입검사 낱말로만 이뤄졌나(동작 관측이 하나도 없나). */
+export function isMergeOrTypecheckOnlyEvidence(value: string): boolean {
+  const words = value.split(/[\s.!?。…~`'"·,⊕+()[\]:;/=|→-]+/u).map((word) => word.replace(/^#/, '')).filter(Boolean);
+  if (!words.length) return false;
+  let signal = false;
+  for (const raw of words) {
+    if (/^\d+$/.test(raw) || /^[0-9a-f]{7,40}$/i.test(raw)) continue;
+    let word = raw;
+    for (let strip = 0; strip < 3 && !MERGE_OR_TYPECHECK_WORD.test(word); strip++) word = word.replace(KOREAN_PARTICLE_TAIL, '');
+    if (!MERGE_OR_TYPECHECK_WORD.test(word)) return false;
+    if (MERGE_OR_TYPECHECK_SIGNAL.test(word)) signal = true;
+  }
+  return signal;
+}
+
 /** Shadow check at checklist authorship. Callers supply the origin/main file probe and merged-PR file reader. */
 export function inspectChecklistTargetPaths(input: {
   title: string; evidence?: string; refs?: readonly string[]; dispatchKind?: ChecklistDispatchKind;
@@ -179,6 +201,8 @@ export function inspectChecklistTargetPaths(input: {
       if (!lines.some((line) => line.startsWith(`- 완료 경계 ${label}:`) && line.slice(`- 완료 경계 ${label}:`.length).trim()))
         warnings.push(`- 완료 경계 ${label}: 줄이 없다`);
     }
+    const real = lines.find((line) => line.startsWith('- 완료 경계 실물:'))?.slice('- 완료 경계 실물:'.length).trim();
+    if (real && isMergeOrTypecheckOnlyEvidence(real)) warnings.push(MERGE_OR_TYPECHECK_ONLY_REAL_WARNING);
   }
   if (!warnings.length) return { targets, warnings, candidates: [] };
   const sources = [input.title, input.evidence ?? '', ...(input.refs ?? [])].join('\n');

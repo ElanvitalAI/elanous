@@ -209,6 +209,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
   };
   const captured: Buffer[] = [];
   const rc = await (deps.dispatch ?? dispatchHeavyCheck)({
+    // Keep the self-gate contract: an unavailable remote leaves this release check unmeasured; do not start a heavy gate locally.
     tool: 'self-gate', repo: cwd, installPwa: true, refs: [base], json: true, commit: measuredCommit,
     // The host re-runs this command with --local (and ELANOUS_GATE_REMOTE_CHILD=1), so it never recurses.
     remoteArgv: (sha) => ['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', version, '--base', sha(base), '--head', measuredCommit, '--shards', String(shards), ...(opts.fixedShardDistribution ? ['--fixed-shard-distribution'] : []), '--local', '--json', ...(opts.rehearsalTui ? ['--rehearsal-tui'] : [])],

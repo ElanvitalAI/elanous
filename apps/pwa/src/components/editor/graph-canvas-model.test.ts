@@ -76,10 +76,33 @@ describe('graph canvas model (CGE-EDIT)', () => {
     expect(parseGraphTemplateYaml(yaml).errors).toEqual([]);
     expect(parseYaml(yaml).edges).toEqual([{ from: 'A', to: 'B' }, { from: 'B', on: 'outcome', map: { pass: 'C', fail: 'A' } }]);
     const back = fromYaml(yaml);
-    expect(back.edges).toEqual(graph.edges);
+    expect(back.edges.map(({ sourceMapIndex: _sourceMapIndex, ...edge }) => edge)).toEqual(graph.edges);
     // Layered layout ranks by forward edges only (GRAPH-EDGE-TIDY): the B→A fail route does not reorder the line.
     const [a, b, c] = back.nodes.map((node) => node.x);
     expect(a! < b! && b! < c!).toBe(true);
+  });
+
+  test('outcome edges preserve distinct on maps and add new outcomes to the matching existing map', () => {
+    const source = `graph_id: cge-demo\nentry: A\nnodes:\n  - node_id: A\n    kind: agent\n    recipe: a\n  - node_id: B\n    kind: gate\n    recipe: b\n  - node_id: C\n    kind: observe\n    recipe: c\nterminal_nodes: [C]\nedges:\n  - from: A\n    on: heal_action\n    map:\n      failed: B\n  - from: A\n    on: pod_result\n    map:\n      failed: C\n  - from: B\n    on: outcome\n    map:\n      pass: C\n`;
+    let graph = fromYaml(source);
+    graph = connect(graph, 'B', 'A', 'fail');
+    const yaml = toYaml(graph);
+    const edges = parseYaml(yaml).edges;
+    expect(parseGraphTemplateYaml(yaml).errors).toEqual([]);
+    expect(edges).toEqual([
+      { from: 'A', on: 'heal_action', map: { failed: 'B' } },
+      { from: 'A', on: 'pod_result', map: { failed: 'C' } },
+      { from: 'B', on: 'outcome', map: { pass: 'C', fail: 'A' } },
+    ]);
+    const back = fromYaml(yaml);
+    expect(back.edges.map(({ sourceMapIndex: _sourceMapIndex, ...edge }) => edge)).toEqual(
+      graph.edges.map(({ sourceMapIndex: _sourceMapIndex, ...edge }) => edge),
+    );
+  });
+
+  test('plain edges with the same source and target serialize only once', () => {
+    const graph = { ...threeNodeLine(), edges: [...threeNodeLine().edges, { from: 'A', to: 'B', outcome: '' }] };
+    expect(parseYaml(toYaml(graph)).edges).toEqual([{ from: 'A', to: 'B' }, { from: 'B', to: 'C' }]);
   });
 
   test('negative: a dangling edge fails locally and in the harness loader, pinned to its source node', () => {

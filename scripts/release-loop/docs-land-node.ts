@@ -1,13 +1,27 @@
 #!/usr/bin/env bun
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { listChecklist } from '../../src/release-loop/checklist.js';
 import type { ReleaseManifest } from '../../src/release-loop/manifest.js';
 import { recordDocsFollow, type DocsFollowItem } from './release-docs.js';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { errorResult, finishNode, nodeOutput, readGraphContext, runCommand, type CommandRunner } from './node-verdict.js';
+import { errorResult, finishNode, nodeOutput, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
 import { prereleaseKind } from './release-version.js';
+
+function isRunOwnedDocsPrefetchTree(worktree: string, context: GraphContext, ledgerRoot: string): boolean {
+  const runId = context.runId;
+  if (!runId || !/^[A-Za-z0-9._-]+$/.test(runId)) return false;
+  const prefetchRoot = join(ledgerRoot, 'graph-runs', 'release-loop', `${runId}.json.contexts`, 'docs-prefetch');
+  try {
+    // Resolve symlinks too: an in-run path that points outside this run does not establish ownership.
+    const owner = realpathSync(prefetchRoot);
+    const tree = realpathSync(worktree);
+    return dirname(tree) === owner && /^tree(?:-[0-9a-f-]{36})?$/.test(basename(tree));
+  } catch {
+    return false;
+  }
+}
 
 export function runDocsLand(run: CommandRunner = runCommand, stateRoot = effectiveInstanceRoot(), ledgerRoot = releaseLedgerRoot()) {
   const context = readGraphContext();
@@ -18,7 +32,9 @@ export function runDocsLand(run: CommandRunner = runCommand, stateRoot = effecti
   if (branch !== `release-docs/${version}`) throw new Error('docs branch/version mismatch');
   const worktree = nodeOutput(context, 'docs', 'worktree');
   const scratch = dirname(worktree);
-  if (dirname(scratch) !== tmpdir() || !/^release-docs-[A-Za-z0-9]+$/.test(scratch.split('/').at(-1) ?? '') || worktree !== join(scratch, 'tree')) throw new Error('invalid docs worktree');
+  const tmpWorktree = dirname(scratch) === tmpdir() && /^release-docs-[A-Za-z0-9]+$/.test(basename(scratch))
+    && worktree === join(scratch, 'tree');
+  if (!tmpWorktree && !isRunOwnedDocsPrefetchTree(worktree, context, ledgerRoot)) throw new Error('invalid docs worktree');
   const recordFollow = (deployed: boolean) => {
     const releaseDir = join(stateRoot, 'release', version);
     const manifest: ReleaseManifest = JSON.parse(readFileSync(join(releaseDir, 'manifest.json'), 'utf8'));
@@ -88,7 +104,7 @@ export function runDocsLand(run: CommandRunner = runCommand, stateRoot = effecti
       const remove = run('git', ['worktree', 'remove', '--force', worktree]);
       if (remove.status !== 0) throw new Error(`docs worktree cleanup failed: ${remove.stderr}`);
     }
-    rmSync(scratch, { recursive: true, force: true });
+    if (tmpWorktree) rmSync(scratch, { recursive: true, force: true });
     // 배포 성공 — 후속 기록 실패(manifest 없음 등)는 결과를 «실패»로 바꾸지 않는다. 알리고 넘어간다.
     let follow: ReturnType<typeof recordFollow> | undefined;
     try { follow = recordFollow(true); }

@@ -35,6 +35,22 @@ export interface AcpReviewerOpts {
   timeoutMs?: number;
   /** One deadline for spawn → initialize → session/new → model select (ms). A child that never answers ACP must not hang the review. Default min(timeoutMs, 60000). */
   handshakeTimeoutMs?: number;
+  /**
+   * ACP-REVIEW-VIA-TEAMCLAUDE: how a `claude` review without an explicit `backendSpec` finds the teamclaude
+   * (cct) route. Default (production, non-injected) = `resolveTeamclaudeReviewRoute()`; an injected agent
+   * without this seam does not probe the host.
+   */
+  resolveClaudeRoute?: () => import('../self-dev/review-provider-fallback.js').TeamclaudeReviewRoute
+    | Promise<import('../self-dev/review-provider-fallback.js').TeamclaudeReviewRoute>;
+}
+
+/** ACP claude reviews read the repo with tools and ran 228–345s in practice (OPC #25934); 300s cut them. */
+const ACP_CLAUDE_REVIEW_TIMEOUT_SEC = 600;
+const ACP_REVIEW_TIMEOUT_SEC = 300;
+
+/** Default per-review deadline (seconds) when the caller gives none. */
+export function defaultAcpReviewTimeoutSec(backend: string): number {
+  return canonicalizeBackendId(backend) === 'claude' ? ACP_CLAUDE_REVIEW_TIMEOUT_SEC : ACP_REVIEW_TIMEOUT_SEC;
 }
 
 /**
@@ -96,6 +112,26 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     // The injected seam deliberately accepts arbitrary test backends. The
     // production path alone resolves aliases and transport through the factory.
     const backend = canonicalizeBackendId(requestedBackend);
+    const timeoutMs = opts.timeoutMs ?? defaultAcpReviewTimeoutSec(backend) * 1000;
+    // ACP-REVIEW-VIA-TEAMCLAUDE (대표 10-21): a claude review goes through teamclaude (multi-account proxy) when it
+    //   answers with a base URL — same cct spawn as the subscription lane. No answer = the prior path, recorded.
+    let backendSpec = opts.backendSpec;
+    let childEnv = opts.env;
+    const resolveClaudeRoute = backend === 'claude' && !opts.backendSpec
+      ? opts.resolveClaudeRoute ?? (injected ? undefined
+        : async () => (await import('../self-dev/review-provider-fallback.js')).resolveTeamclaudeReviewRoute())
+      : undefined;
+    if (resolveClaudeRoute) {
+      let route: import('../self-dev/review-provider-fallback.js').TeamclaudeReviewRoute;
+      try { route = await resolveClaudeRoute(); } catch { route = { reason: 'teamclaude-unavailable' }; }
+      if (route.spawn) { backendSpec = route.spawn.backendSpec; childEnv = route.spawn.env; }
+      debug.log('review.acp', 'claude-route', {
+        viaTeamclaude: Boolean(route.spawn),
+        baseUrlSet: Boolean(childEnv?.ANTHROPIC_BASE_URL),
+        timeoutSec: Math.round(timeoutMs / 1000),
+        reason: route.reason,
+      });
+    }
     // ⛔⭐⭐⭐ 백엔드 해석은 «`try` 밖»이라 여기서 던지면 아래 `catch` 의 `acp-review/error` 가
     //   «안 걸린다**. 그래서 `--acp-backend claude-code`(미등록) 같은 오타를 주면 레지스트리가
     //   ***`Unknown ACP backend "claude-code". Known: …"`*** 라는 «완벽한» 오류를 던지는데도
@@ -105,14 +141,13 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     //   ⇒ 이 한 줄만 자기 catch 로 감싼다(전체 try 를 앞당기면 `start` 관측이 그 안으로 들어간다).
     let transport: string | null;
     try {
-      transport = injected ? null : opts.backendSpec?.transport ?? getAcpBackend(backend).transport ?? 'acp';
+      transport = injected ? null : backendSpec?.transport ?? getAcpBackend(backend).transport ?? 'acp';
     } catch (e) {
       debug.log('acp-review', 'error', {
         requestedBackend, backend, stage: 'resolve-backend', message: (e as Error).message,
       }, { level: 'error' });
       throw e;
     }
-    const timeoutMs = opts.timeoutMs ?? 300_000;
     debug.log('acp-review', 'start', {
       requestedBackend,
       backend,
@@ -130,7 +165,7 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     let capabilitiesObserved = false;
     const agentOpts: Omit<AcpAgentOpts, 'backendId'> = {
       cwd: opts.cwd,
-      ...(opts.backendSpec ? { backendSpec: opts.backendSpec, env: opts.env } : {}),
+      ...(backendSpec ? { backendSpec, env: childEnv } : {}),
       log: (message) => debug.log('acp-review', 'agent-log', { backend, message }),
       onCapabilities: (capabilities) => {
         capabilitiesObserved = true;
@@ -159,7 +194,7 @@ export function makeAcpReviewLLM(opts: AcpReviewerOpts): (prompt: string, images
     // chat agents, whose callbacks and lifecycle must not be mutated here.
     // Grok's start can hang before the manager registers the subprocess;
     // own it directly so the handshake timeout can stop that child.
-    const directAgent = injected || Boolean(opts.backendSpec) || backend === 'grok';
+    const directAgent = injected || Boolean(backendSpec) || backend === 'grok';
     const reviewManager = directAgent ? undefined : new AcpAgentManager();
     let agent: AcpAgent | undefined;
     let text = '';

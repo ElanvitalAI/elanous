@@ -1,16 +1,32 @@
 import { Command } from 'commander';
-import { applyConfigDirFlagFromArgv } from './cli/config-dir-flag.js';
-import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
-import { applyTestFlagFromArgv } from './cli/test-flag.js';
 import type { LightCliRoute } from './cli/light-entry-route.js';
 
-/** Dispatch a small read-only command without loading the full command registry. */
+/** Dispatch a small operational command without loading the full command registry. */
 export async function runLightCli(route: LightCliRoute): Promise<void> {
-  // Keep the same pre-import isolation order as src/index.ts. In particular,
-  // config-touching command modules must not load before these flags apply.
-  applyTestStateDirFlagFromArgv();
-  applyTestFlagFromArgv();
-  applyConfigDirFlagFromArgv();
+  // Root instance flags stay on the full entry for the four hot commands.
+  // Other light routes can still accept them; invoke the same shared bootstrap
+  // helpers as src/index.ts, and only load those helpers when a flag is present.
+  const args = process.argv.slice(2);
+  // The legacy entry resolves the config root for operational commands and
+  // warns when the removed ELANOUS_CONFIG_DIR env var disagrees with it.
+  // Preserve that observable warning on hot routes without loading the
+  // resolver for the common case where the ignored env var is absent.
+  if (['msg', 'pty', 'logs', 'tasks'].includes(route) && process.env.ELANOUS_CONFIG_DIR !== undefined) {
+    const { getElanousConfigDir } = await import('./elanous-config-dir.js');
+    getElanousConfigDir();
+  }
+  const hasRootInstanceFlag = args.some(arg => ['--test', '--config-dir', '--test-state-dir', '--state-dir']
+    .some(flag => arg === flag || arg.startsWith(`${flag}=`)));
+  if (hasRootInstanceFlag) {
+    const [{ applyTestStateDirFlagFromArgv }, { applyTestFlagFromArgv }, { applyConfigDirFlagFromArgv }] = await Promise.all([
+      import('./cli/test-state-dir-flag.js'),
+      import('./cli/test-flag.js'),
+      import('./cli/config-dir-flag.js'),
+    ]);
+    applyTestStateDirFlagFromArgv();
+    applyTestFlagFromArgv();
+    applyConfigDirFlagFromArgv();
+  }
 
   const program = new Command().name('elanous').enablePositionalOptions();
   switch (route) {
@@ -20,8 +36,8 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
       break;
     }
     case 'release': {
-      const { registerReleaseCommands } = await import('./cli/release-cli.js');
-      registerReleaseCommands(program);
+      const { registerReleaseChecklistReadCommands } = await import('./cli/release-checklist-read-cli.js');
+      registerReleaseChecklistReadCommands(program);
       break;
     }
     case 'tasks': {

@@ -16,6 +16,18 @@ afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rm
 
 describe('release checklist ledger', () => {
   const boundary = '\n- 완료 경계 코드: src/real.ts 변경\n- 완료 경계 실물: 설치본 호출\n- 완료 경계 증거 명령: bun test src/real.test.ts';
+  test('ACCEPTANCE-FROM-VERIFY-MENU: a «완료 경계 실물» made only of merge sha / typecheck wording is warned (so --strict rejects it)', () => {
+    const deps = { existsAtMain: (path: string) => path === 'src/real.ts' };
+    const cell = (real: string) => `대상 경로: src/real.ts\n- 완료 경계 코드: src/real.ts 변경\n- 완료 경계 실물: ${real}\n- 완료 경계 증거 명령: bun test src/real.test.ts`;
+    const rejected = '- 완료 경계 실물: merge sha·타입검사만으로는 실물이 아니다 — docs/goal-context/03-verification-menu.md 에서 동작을 재는 방법을 고른다';
+    for (const real of ['PR 착지 · merge sha', 'merge sha 확인', 'tsc 0 errors', 'PR #29953 머지 ⊕ tsc 통과', '머지 sha 901ec231f2 · typecheck green', '`merge sha`', 'merge sha 확인했다', 'PR 착지했고 tsc 통과함', 'PR 착지 · merge sha 확인.', 'merge sha 확인!', 'tsc 통과…']) {
+      expect(inspectChecklistTargetPaths({ title: cell(real) }, deps).warnings).toEqual([rejected]);
+    }
+    for (const real of ['설치본 호출', 'bun bin/elanous.mjs --test release resume --dry-run 이 계획을 낸다', 'merge sha 뒤 eln logs 로 이벤트 확인', 'PR 착지 후 TUI 화면에 배지가 뜬다']) {
+      expect(inspectChecklistTargetPaths({ title: cell(real) }, deps).warnings).toEqual([]);
+    }
+  });
+
   test('CELL-PATH-GATE: shadow warning names missing origin/main paths and existing title/ref/merged PR candidates', () => {
     const existing = new Set(['src/real.ts', 'src/ref.ts', 'src/merged.ts', 'src/view.vue', 'bin/eln', 'Makefile']);
     const deps = {

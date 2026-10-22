@@ -1,12 +1,15 @@
 import { describe, it, expect, spyOn } from 'bun:test';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
-import { ghAutomationEnv, defaultCmdRunner, makePrManager, configuredHunkOverlapMode, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, type CmdRunner, type CmdResult } from './pr-manager.js';
+import { ghAutomationEnv, defaultCmdRunner, makePrManager, configuredHunkOverlapMode, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, recordPrCreateFailureIncident, sanitizeCredentialText, stderrTailOf, type PrCreateFailureIncident, type CmdRunner, type CmdResult } from './pr-manager.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { debug } from '../debug/log.js';
 import { cardIdFromBody, guardNewPr } from '../pr-tool/census.js';
+import { composeSliceHandText } from '../task-agent/tier-split.js';
+import { prBody } from '../self-implement/orchestrator.js';
 
 /** 호출 기록 + 프로그램된 응답을 주는 스텁 러너. */
 function stubRunner(responses: Record<string, CmdResult> = {}): { run: CmdRunner; calls: string[][] } {
@@ -170,7 +173,7 @@ describe('makePrManager.findPrForBranchOutcome', () => {
       const manager = makePrManager(run);
       expect(manager.findPrForBranchOutcome('feature/found', '/wt')).toEqual({ status: 'ok OUTPUT', url: 'https://github.com/o/r/pull/9' });
       expect(manager.findPrForBranchOutcome('feature/empty', '/wt')).toEqual({ status: 'ok EMPTY', url: null });
-      expect(manager.findPrForBranchOutcome('feature/failed', '/wt')).toEqual({ status: 'FAILED', url: null });
+      expect(manager.findPrForBranchOutcome('feature/failed', '/wt')).toEqual({ status: 'FAILED', url: null, stderrTail: 'network unavailable' });
       expect(manager.findPrForBranchOutcome(DEFAULT_BRANCH_WORKTREE_BASE, '/wt')).toEqual({ status: 'SKIPPED', url: null });
       expect(manager.findPrForBranch('feature/failed', '/wt')).toBeNull();
       expect(calls.some((call) => call.includes(DEFAULT_BRANCH_WORKTREE_BASE))).toBe(false);
@@ -210,6 +213,71 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     expect(create).toContain('pr-guard:unmeasured');
   });
 
+  it('★ sibling-slice: 같은 칸의 다른 조각(2/6) OPEN draft 가 있어도 조각 5/6 은 새 draft 를 연다(outcome=allowed)', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const head = 'a'.repeat(40);
+      // 운영 생산자(tier-split hand) → PR 본문 조립 → pr-manager 파서의 실제 문면.
+      const body = `칸: PR-SAME-CELL-SLICE\n카드: ta-slice-5\n${prBody(composeSliceHandText('대상 경로: src/new.ts',
+        '현재 계약: 부모 계약 유지', { index: 5, total: 6, fromTier: '상', cid: 'TUI-SEAT-PILOT' }), '구현 완료')}`;
+      const existing = { number: 7, headRefName: 'se/slice-2', title: '조각 2/6', draft: true,
+        updatedAt: '2026-10-21T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
+        cellId: 'PR-SAME-CELL-SLICE', cardId: 'ta-slice-5', slice: { slice: 2, total: 6 } };
+      const { run, calls } = stubRunner({
+        'pr list': { ok: true, out: '' },
+        'pr create': { ok: true, out: 'https://github.com/o/r/pull/95' },
+      });
+      const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-SLICE', cardId: 'ta-slice-5',
+        slice: { slice: 5, total: 6 } },
+        { status: 'checked', prs: [existing] });
+      const result = makePrManager(run, guard).upsertPr({ ...input, body, draft: true });
+      expect(result).toMatchObject({ ok: true, reused: false, url: 'https://github.com/o/r/pull/95' });
+      expect(calls.some(call => call[0] === 'git' && call.some(arg => arg.startsWith('--force')))).toBe(false);
+      const create = calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create');
+      expect(create).toContain('--draft');
+      expect(create?.[create.indexOf('--title') + 1]).toContain('조각 5/6');
+      expect(create?.[create.indexOf('--body') + 1]).toContain('조각 5/6');
+      expect(log).toHaveBeenCalledWith('autopilot.pr-manager', 'same-cell-sibling-slice', {
+        cell: 'PR-SAME-CELL-SLICE', slice: 5, total: 6, existingSlice: 2, outcome: 'allowed',
+      });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('★ sibling-slice: 같은 조각(2/6) 재발사는 기존 재사용 경로를 그대로 쓴다', () => {
+    const head = 'a'.repeat(40);
+    const body = '칸: PR-SAME-CELL-SLICE\n카드: ta-slice-2\n조각 2/6 — 부모 TUI-SEAT-PILOT';
+    const url = 'https://github.com/o/r/pull/7';
+    const { run, calls } = stubRunner({
+      'pr view 7 --json state': { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: head, headRefName: 'old-branch', body, isCrossRepository: false, url }) },
+      'ls-remote --exit-code origin refs/heads/old-branch': { ok: true, out: `${head}\trefs/heads/old-branch` },
+      'rev-parse refs/elanous/pr-reuse/7-aaaaaaaaaaaa': { ok: true, out: head },
+    });
+    const inventory = { status: 'checked' as const, prs: [{ number: 7, headRefName: 'old-branch', title: 'old', draft: true,
+      updatedAt: '2026-10-19T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
+      cellId: 'PR-SAME-CELL-SLICE', cardId: 'ta-slice-2', slice: { slice: 2, total: 6 } }] };
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-SLICE', cardId: 'ta-slice-2',
+      slice: { slice: 2, total: 6 } }, inventory);
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toEqual({ ok: true, url, reused: true });
+    expect(calls).toContainEqual(['git', '-C', '/wt', 'push', `--force-with-lease=refs/heads/old-branch:${head}`, 'origin', 'HEAD:refs/heads/old-branch']);
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
+  });
+
+  it('★ sibling-slice: 조각 표지 없는 일반 런의 같은 칸 가드는 그대로 거부한다', () => {
+    const head = 'a'.repeat(40);
+    const body = '칸: PR-SAME-CELL-SLICE\n카드: ta-slice-5';
+    const { run, calls } = stubRunner();
+    const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-SLICE', cardId: 'ta-slice-5' },
+      { status: 'checked', prs: [{ number: 7, headRefName: 'se/slice-2', title: '조각 2/6', draft: true,
+        updatedAt: '2026-10-21T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
+        cellId: 'PR-SAME-CELL-SLICE', cardId: 'ta-slice-2', slice: { slice: 2, total: 6 } }] });
+    const result = makePrManager(run, guard).upsertPr({ ...input, body });
+    expect(result).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('same-cell') });
+    expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(false);
+    expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
+  });
+
   it('같은 칸·같은 카드의 기존 PR 머리를 합쳐 빠른 전진으로 갱신하고 새 PR을 열지 않는다', () => {
     const head = 'a'.repeat(40);
     const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
@@ -238,6 +306,11 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     expect(stderr.length).toBeGreaterThan(220);
     expect(stdout.length).toBeGreaterThan(220);
     const log = spyOn(debug, 'log').mockImplementation(() => {});
+    // 하니스 디스패치 env 의 ELANOUS_TASK_CARD_ID(이 런의 과업 카드)가 새어 들면 upsertPr 입구의
+    // 카드 계보 가드가 무대 카드(ta-123)와 충돌해 cleanup 경로에 못 미치게 차단한다 — 무대의
+    // 카드 표식이 지배하도록 잠시 비우고 끝내 복원한다.
+    const savedCardId = process.env.ELANOUS_TASK_CARD_ID;
+    delete process.env.ELANOUS_TASK_CARD_ID;
     try {
       const { run, calls } = stubRunner({
         'pr view 7 --json state': { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: head,
@@ -247,26 +320,74 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
         'merge --no-edit': { ok: false, out: '', err: 'merge conflict' },
         'rev-parse HEAD': { ok: true, out: 'b'.repeat(40) },
         'repo view --json nameWithOwner': { ok: true, out: 'o/r' },
-        'push origin :refs/heads/elanous-pr-create/': { ok: false, out: stdout, err: stderr },
+        'push origin :refs/heads/self-impl/pr-create-ra1b2c3-': { ok: false, out: stdout, err: stderr },
         'pr create': { ok: true, out: 'https://github.com/o/r/pull/8' },
       });
       const inventory = { status: 'checked' as const, prs: [{ number: 7, headRefName: 'old-branch', title: 'old', draft: true,
         updatedAt: '2026-10-19T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
         cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }] };
       const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, inventory);
-      expect(makePrManager(run, guard).upsertPr({ ...input, body })).toEqual({
+      expect(makePrManager(run, guard).upsertPr({ ...input, body, runId: 'run-a1b2c3d4-1111-2222-3333-444444444444' })).toEqual({
         ok: true, url: 'https://github.com/o/r/pull/8', reused: false, supersededPr: 7,
       });
       const scratchRemoval = calls.find(call => call[0] === 'git' && call.includes('push')
-        && call.some(arg => arg.startsWith(':refs/heads/elanous-pr-create/')));
+        && call.some(arg => arg.startsWith(':refs/heads/self-impl/pr-create-ra1b2c3-')));
       expect(scratchRemoval).toBeDefined();
       const cleanupLog = log.mock.calls.find(([, event]) => event === 'same-cell-scratch-cleanup-failed');
       expect(cleanupLog).toBeDefined();
       expect(cleanupLog![2]).toMatchObject({ detail: stderr, stderr, stdout, truncated: false,
-        scratchRef: expect.stringMatching(/^refs\/heads\/elanous-pr-create\//) });
+        scratchRef: expect.stringMatching(/^refs\/heads\/self-impl\/pr-create-ra1b2c3-/) });
       expect(cleanupLog![3]).toEqual({ level: 'warn' });
     } finally {
       log.mockRestore();
+      if (savedCardId === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+      else process.env.ELANOUS_TASK_CARD_ID = savedCardId;
+    }
+  });
+
+  it('짧은 원문의 scratch ref 삭제 실패도 그대로 남긴다(220자 미만 무절단)', () => {
+    const head = 'a'.repeat(40);
+    const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-123';
+    const url = 'https://github.com/o/r/pull/7';
+    const stderr = 'remote: short cleanup failure';
+    const stdout = 'notice: brief stdout';
+    expect(stderr.length).toBeLessThan(220);
+    expect(stdout.length).toBeLessThan(220);
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    // 무대 카드(ta-123)가 지배하도록 하니스 디스패치 env 의 과업 카드 표식을 잠시 비우고 끝내 복원한다.
+    const savedCardId = process.env.ELANOUS_TASK_CARD_ID;
+    delete process.env.ELANOUS_TASK_CARD_ID;
+    try {
+      const { run, calls } = stubRunner({
+        'pr view 7 --json state': { ok: true, out: JSON.stringify({ state: 'OPEN', headRefOid: head,
+          headRefName: 'old-branch', body, isCrossRepository: false, isDraft: true, url }) },
+        'ls-remote --exit-code origin refs/heads/old-branch': { ok: true, out: `${head}\trefs/heads/old-branch` },
+        'rev-parse refs/elanous/pr-reuse/7-aaaaaaaaaaaa': { ok: true, out: head },
+        'merge --no-edit': { ok: false, out: '', err: 'merge conflict' },
+        'rev-parse HEAD': { ok: true, out: 'b'.repeat(40) },
+        'repo view --json nameWithOwner': { ok: true, out: 'o/r' },
+        'push origin :refs/heads/self-impl/pr-create-ra1b2c3-': { ok: false, out: stdout, err: stderr },
+        'pr create': { ok: true, out: 'https://github.com/o/r/pull/8' },
+      });
+      const inventory = { status: 'checked' as const, prs: [{ number: 7, headRefName: 'old-branch', title: 'old', draft: true,
+        updatedAt: '2026-10-19T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
+        cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }] };
+      const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, inventory);
+      expect(makePrManager(run, guard).upsertPr({ ...input, body, runId: 'run-a1b2c3d4-1111-2222-3333-444444444444' })).toEqual({
+        ok: true, url: 'https://github.com/o/r/pull/8', reused: false, supersededPr: 7,
+      });
+      const scratchRemoval = calls.find(call => call[0] === 'git' && call.includes('push')
+        && call.some(arg => arg.startsWith(':refs/heads/self-impl/pr-create-ra1b2c3-')));
+      expect(scratchRemoval).toBeDefined();
+      const cleanupLog = log.mock.calls.find(([, event]) => event === 'same-cell-scratch-cleanup-failed');
+      expect(cleanupLog).toBeDefined();
+      expect(cleanupLog![2]).toMatchObject({ detail: stderr, stderr, stdout, truncated: false,
+        scratchRef: expect.stringMatching(/^refs\/heads\/self-impl\/pr-create-ra1b2c3-/) });
+      expect(cleanupLog![3]).toEqual({ level: 'warn' });
+    } finally {
+      log.mockRestore();
+      if (savedCardId === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+      else process.env.ELANOUS_TASK_CARD_ID = savedCardId;
     }
   });
 
@@ -977,6 +1098,12 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     const { run } = stubRunner({ 'push': { ok: false, out: '', err: 'remote: rejected' } });
     expect(makePrManager(run).upsertPr(input)).toEqual({ ok: false, reason: 'push', detail: 'remote: rejected' });
   });
+
+  it('ok=false/rc=0 명령 실패는 push 성공으로 뒤집히지 않고 실제 rc=0을 incident에 남긴다', () => {
+    const { run } = stubRunner({ 'push --force': { ok: false, out: '', err: 'output exceeded 256MiB (ENOBUFS)', rc: 0 } });
+    const r = makePrManager(run).upsertPr({ ...input, runId: 'run-buffer-overflow' });
+    expect(r).toMatchObject({ ok: false, reason: 'push', incident: { push: { ran: true, ok: false, rc: 0 }, gh: { ran: false } } });
+  });
   it('push 가 처음 두 번은 remote: Internal Server Error 로 실패하고 세 번째에 성공하면 ok 이고 push 는 3번', () => {
     const pushResults: CmdResult[] = [
       { ok: false, out: '', err: 'remote: Internal Server Error' },
@@ -1422,4 +1549,314 @@ it('ghAutomationEnv: App token when the caller set no GH_TOKEN · a caller GH_TO
   expect(ghAutomationEnv(env, () => 'ghs_app').GH_TOKEN).toBe('ghs_app');
   expect(ghAutomationEnv({ ...env, GH_TOKEN: 'caller' }, () => 'ghs_app').GH_TOKEN).toBe('caller');
   expect(ghAutomationEnv(env, () => null)).toBe(env);
+});
+
+// ── 칸 PR-CREATE-FAIL-OBSERVE-FU — PR 생성 실패 incident 관측 단위 ─────────────
+describe('PrCreateFailureIncident — 단위·자격증명 제거', () => {
+  it('sanitizeCredentialText 는 gh 토큰과 URL 자격증명을 지운다', () => {
+    expect(sanitizeCredentialText('token ghp_supersecret1234567890abcdef leaked')).toBe('token [REDACTED] leaked');
+    expect(sanitizeCredentialText('github_pat_2_SUPERSECRETSECRETSECRETSECRETSECRET')).toBe('[REDACTED]');
+    expect(sanitizeCredentialText('https://bot:hunter2@github.com/o/r.git')).toBe('https://[REDACTED]@github.com/o/r.git');
+    expect(sanitizeCredentialText('ssh://bot:hunter2@github.com/o/r.git')).toBe('ssh://[REDACTED]@github.com/o/r.git');
+    expect(sanitizeCredentialText('Authorization: Bearer secret123')).toBe('Authorization: Bearer ***');
+    expect(sanitizeCredentialText('plain text keeps words')).toBe('plain text keeps words');
+  });
+
+  it('stderrTailOf 는 자격증명을 지운 뒤 꼬리만 남기고, 비거나 공백이면 undefined', () => {
+    const sanitizedTail = stderrTailOf('x'.repeat(600) + 'tail ghp_supersecret1234567890abc');
+    expect(sanitizedTail!.length).toBe(400);
+    expect(sanitizedTail).toContain('tail [REDACTED]');
+    expect(sanitizedTail).not.toContain('ghp_supersecret1234567890abc');
+    expect(stderrTailOf(undefined)).toBeUndefined();
+    expect(stderrTailOf('   ')).toBeUndefined();
+  });
+
+  it('recordPrCreateFailureIncident 는 push/gh 단계 구분 구조를 원장 이벤트 하나에 남긴다', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const incident: PrCreateFailureIncident = {
+        branch: 'se/apm-x-abc', remote: 'origin',
+        push: { stage: 'push', ran: true, rc: 1, ok: false, stderrTail: 'remote: rejected' },
+        gh: { stage: 'gh', ran: false },
+      };
+      recordPrCreateFailureIncident(incident);
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith('autopilot.pr-manager', 'pr-create-failure-incident', incident);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('기록 경계는 branch·runId·단계 stderr 의 비밀을 모두 가린다', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const incident = recordPrCreateFailureIncident({
+        branch: 'se/ghp_supersecret1234567890abcdef', runId: 'run-ghp_supersecret1234567890abcdef', remote: 'origin',
+        push: { stage: 'push', ran: true, ok: false, rc: 2, stderrTail: 'Authorization: Bearer secret123' },
+        gh: { stage: 'gh', ran: false },
+      });
+      expect(JSON.stringify(incident)).not.toContain('ghp_supersecret1234567890abcdef');
+      expect(JSON.stringify(incident)).not.toContain('secret123');
+      expect(incident.push.stderrTail).toBe('Authorization: Bearer ***');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('ghp_supersecret1234567890abcdef');
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
+// ── 칸 PR-CREATE-FAIL-OBSERVE-FU — 완료 경계 실물(격리 bare origin + 가짜 gh) ────
+describe('upsertPr — 실패 incident 실물(bare origin + 가짜 gh)', () => {
+  // 격리 bare origin 은 이 런의 원격이 아니다 — Pod 글로벌 git-guard 훅(core.hooksPath)을
+  // GIT_CONFIG_GLOBAL=/dev/null 로 무력화하고, 씬의 pre-receive 거부 훅만 그대로 돌게 한다.
+  const ISOLATED_GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' };
+  const git = (args: string[], opts?: { cwd?: string }): void => {
+    const r = spawnSync('git', args, { encoding: 'utf8', env: ISOLATED_GIT_ENV, ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')} → exit ${r.status}: ${r.stderr}`);
+  };
+
+  const makeScene = (preReceive?: string): { root: string; work: string } => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-manager-incident-'));
+    const origin = join(root, 'origin.git');
+    const work = join(root, 'work');
+    git(['init', '--bare', '-b', 'main', origin]);
+    git(['clone', origin, work]);
+    git(['-C', work, 'config', 'user.email', 't@example.com']);
+    git(['-C', work, 'config', 'user.name', 't']);
+    writeFileSync(join(work, 'seed.txt'), 'seed\n');
+    git(['-C', work, 'add', '.']);
+    git(['-C', work, 'commit', '-m', 'seed']);
+    git(['-C', work, 'push', '-u', 'origin', 'main']);
+    if (preReceive) {
+      // 씬 시드(main) push 뒤에만 설치 — 훅이 시드 push 까지 거부하면 씬 자체가 안 선다.
+      mkdirSync(join(origin, 'hooks'), { recursive: true });
+      writeFileSync(join(origin, 'hooks', 'pre-receive'), preReceive);
+      chmodSync(join(origin, 'hooks', 'pre-receive'), 0o755);
+    }
+    git(['-C', work, 'checkout', '-b', 'se/incident-x']);
+    writeFileSync(join(work, 'change.txt'), 'change\n');
+    return { root, work };
+  };
+
+  const writeFakeGh = (dir: string, createStderr: string, failList = false): void => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'gh'), [
+      '#!/bin/sh',
+      failList
+        ? 'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf "%s\\n" "Authorization: Bearer secret123 lookup failed" >&2; exit 9; fi'
+        : 'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf ""; exit 0; fi',
+      `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then printf '%s\\n' '${createStderr}' >&2; exit 7; fi`,
+      'exit 0',
+      '',
+    ].join('\n'));
+    chmodSync(join(dir, 'gh'), 0o755);
+  };
+
+  it('gh create 실패 — push 성공·gh rc=7·자격증명 제거 stderr 꼬리가 한 incident 에 남는다', () => {
+    const { root, work } = makeScene();
+    const ghDir = join(root, 'ghbin');
+    writeFakeGh(ghDir, 'gh create failed token ghp_supersecret1234567890abcdef https://bot:hunter2@github.com/o/r');
+    const saved = { path: process.env.PATH, token: process.env.GH_TOKEN, gitcfg: process.env.GIT_CONFIG_GLOBAL };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    process.env.GH_TOKEN = 'test-token';
+    process.env.PATH = `${ghDir}:${saved.path ?? ''}`;
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+    try {
+      const manager = makePrManager(defaultCmdRunner, () => ({ status: 'allow' as const, reasons: [], warnings: [] }));
+      const r = manager.upsertPr({
+        branch: 'se/incident-x', worktreePath: work, title: '[SE] incident', body: 'b',
+        base: 'main', commitMessage: 'm', runId: 'run-incident-gh',
+      });
+      expect(r).toMatchObject({ ok: false, reason: 'gh' });
+      if (r.ok) throw new Error('expected gh failure');
+      expect(r.incident).toMatchObject({ runId: 'run-incident-gh', gh: { ran: true, rc: 7 } });
+      expect(r.detail).toContain('pr-create-incident=');
+      expect(r.detail).toContain('"rc":7');
+      expect(r.detail).toContain('gh create failed');
+      expect(r.detail).not.toContain('ghp_supersecret1234567890abcdef');
+      expect(r.detail).not.toContain('hunter2');
+      const incident = log.mock.calls.find(([, event]) => event === 'pr-create-failure-incident')?.[2] as PrCreateFailureIncident;
+      expect(incident).toBeDefined();
+      expect(incident.branch).toBe('se/incident-x');
+      expect(incident.remote).toBe('origin');
+      expect(incident.push).toMatchObject({ stage: 'push', ran: true, ok: true, rc: 0 });
+      expect(incident.gh).toMatchObject({ stage: 'gh', ran: true, rc: 7 });
+      expect(incident.gh.stderrTail).toContain('gh create failed');
+      expect(incident.gh.stderrTail).not.toContain('ghp_supersecret1234567890abcdef');
+      expect(incident.gh.stderrTail).not.toContain('hunter2');
+      expect(incident.gh.stderrTail).toContain('[REDACTED]');
+    } finally {
+      log.mockRestore();
+      if (saved.path === undefined) delete process.env.PATH; else process.env.PATH = saved.path;
+      if (saved.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved.token;
+      if (saved.gitcfg === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = saved.gitcfg;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('push 실패 — pre-receive 거부 rc·자격증명 제거 stderr 꼬리·gh 미실행이 한 incident 에 남는다', () => {
+    const hook = '#!/bin/sh\ncat >/dev/null\nprintf \'%s\\n\' "remote: push refused by policy token ghp_leak1234567890abcdef" >&2\nexit 3\n';
+    const { root, work } = makeScene(hook);
+    const saved = { path: process.env.PATH, token: process.env.GH_TOKEN, gitcfg: process.env.GIT_CONFIG_GLOBAL };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    process.env.GH_TOKEN = 'test-token';
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+    try {
+      const manager = makePrManager(defaultCmdRunner, () => ({ status: 'allow' as const, reasons: [], warnings: [] }));
+      const r = manager.upsertPr({
+        branch: 'se/incident-x', worktreePath: work, title: '[SE] incident', body: 'b',
+        base: 'main', commitMessage: 'm', runId: 'run-incident-push',
+      });
+      expect(r).toMatchObject({ ok: false, reason: 'push' });
+      if (r.ok) throw new Error('expected push failure');
+      expect(r.incident).toMatchObject({ runId: 'run-incident-push', push: { ran: true, ok: false }, gh: { ran: false } });
+      expect(r.detail).toContain('pr-create-incident=');
+      expect(r.detail).toContain('push refused by policy');
+      expect(r.detail).not.toContain('ghp_leak1234567890abcdef');
+      const incident = log.mock.calls.find(([, event]) => event === 'pr-create-failure-incident')?.[2] as PrCreateFailureIncident;
+      expect(incident).toBeDefined();
+      expect(incident.branch).toBe('se/incident-x');
+      expect(incident.push).toMatchObject({ stage: 'push', ran: true, ok: false });
+      expect(typeof incident.push.rc).toBe('number');
+      expect(incident.push.stderrTail).toContain('push refused by policy');
+      expect(incident.push.stderrTail).not.toContain('ghp_leak1234567890abcdef');
+      expect(incident.push.stderrTail).toContain('[REDACTED]');
+      expect(incident.gh).toMatchObject({ stage: 'gh', ran: false });
+    } finally {
+      log.mockRestore();
+      if (saved.path === undefined) delete process.env.PATH; else process.env.PATH = saved.path;
+      if (saved.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved.token;
+      if (saved.gitcfg === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = saved.gitcfg;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('gh branch 조회 실패 — 실제 gh rc·가린 stderr 를 자식 실패 detail 에 전달한다', () => {
+    const { root, work } = makeScene();
+    const ghDir = join(root, 'ghbin');
+    writeFakeGh(ghDir, 'create must not run', true);
+    const saved = { path: process.env.PATH, token: process.env.GH_TOKEN, gitcfg: process.env.GIT_CONFIG_GLOBAL };
+    process.env.GH_TOKEN = 'test-token';
+    process.env.PATH = `${ghDir}:${saved.path ?? ''}`;
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+    try {
+      const manager = makePrManager(defaultCmdRunner, () => ({ status: 'allow' as const, reasons: [], warnings: [] }));
+      const r = manager.upsertPr({
+        branch: 'se/incident-x', worktreePath: work, title: '[SE] incident', body: 'b',
+        base: 'main', commitMessage: 'm', runId: 'run-incident-lookup',
+      });
+      expect(r).toMatchObject({ ok: false, reason: 'gh' });
+      if (r.ok) throw new Error('expected gh lookup failure');
+      expect(r.incident).toMatchObject({
+        runId: 'run-incident-lookup', push: { ran: true, ok: true, rc: 0 },
+        gh: { ran: true, rc: 9, stderrTail: 'Authorization: Bearer *** lookup failed' },
+      });
+      expect(r.detail).toContain('pr-create-incident=');
+      expect(r.detail).not.toContain('secret123');
+    } finally {
+      if (saved.path === undefined) delete process.env.PATH; else process.env.PATH = saved.path;
+      if (saved.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved.token;
+      if (saved.gitcfg === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = saved.gitcfg;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('same-cell 충돌 draft의 scratch ref cleanup 실패 긴 stderr 원문이 잘리지 않고 남는다 — 원문 대조', () => {
+    // REVIEW-IO-COMPLETE-SIGNAL 첫 조각 완료 경계 실물: 격리 bare origin(pre-receive 가 «삭제만»
+    // 긴 stderr 로 거부) + 가짜 gh 에서 superseding draft 경로의 cleanup 1회가 실패하면,
+    // same-cell-scratch-cleanup-failed 기록이 원본 출력과 글자 단위로 같고 truncated:false 다.
+    const refusal = `remote: scratch ref deletion refused by policy ${'cleanup detail '.repeat(26)}SCRATCH-CLEANUP-TAIL-MARKER`;
+    const hook = [
+      '#!/bin/sh',
+      'reject=0',
+      'while read old new ref; do',
+      '  case "$new" in 0000000000000000000000000000000000000000) reject=1;; esac',
+      'done',
+      `if [ "$reject" = "1" ]; then printf '%s\\n' "${refusal}" >&2; exit 1; fi`,
+      'exit 0',
+      '',
+    ].join('\n');
+    const { root, work } = makeScene(hook);
+    // ⛔ 무대 hermetic 핀 — bun test 의 preload-child-env 계약상 env 를 안 넘긴 spawnSync 자식은
+    // «시작 시점» env 를 물려받는다. 그 env 에선 pod 글로벌 git-guard(core.hooksPath)가 살아 있어
+    // 원문 대조의 재실행 push 가 씬 pre-receive 에 못 가고 pod pre-push 한 줄로 막힌다. 두 무대
+    // 저장소의 hooksPath 를 각자 것으로 못 박는다(국소 설정이 글로벌을 이긴다) — work 는 빈 훅
+    // 디렉터리로 클라이언트 훅을 끄고, origin 은 자기 hooks 디렉터리로 씬 pre-receive 를 고정한다.
+    const sceneOrigin = join(root, 'origin.git');
+    mkdirSync(join(root, 'scene-no-hooks'), { recursive: true });
+    git(['-C', work, 'config', 'core.hooksPath', join(root, 'scene-no-hooks')]);
+    git(['-C', sceneOrigin, 'config', 'core.hooksPath', join(sceneOrigin, 'hooks')]);
+    // 낡은 PR 가지 — 실제 커밋을 밀어 머지 충돌을 만든다(superseding draft 경로의 입구).
+    git(['-C', work, 'checkout', '-b', 'old-branch']);
+    writeFileSync(join(work, 'conflict.txt'), 'B\n');
+    git(['-C', work, 'add', 'conflict.txt']);
+    git(['-C', work, 'commit', '-m', 'old pr change']);
+    git(['-C', work, 'push', 'origin', 'old-branch']);
+    const headSha = spawnSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: ISOLATED_GIT_ENV }).stdout.trim();
+    git(['-C', work, 'checkout', 'se/incident-x']);
+    writeFileSync(join(work, 'conflict.txt'), 'C\n');
+    // 가짜 gh — 같은 칸 OPEN draft(#7) 고정 응답 ⊕ 대체 draft(#8) 개설.
+    const body = '칸: PR-SAME-CELL-CLEANUP\n카드: ta-cleanup-1';
+    const viewJson = JSON.stringify({ state: 'OPEN', headRefOid: headSha, headRefName: 'old-branch', body,
+      isCrossRepository: false, url: 'https://github.com/o/r/pull/7', isDraft: true, labels: [] });
+    const ghDir = join(root, 'ghbin-cleanup');
+    mkdirSync(ghDir, { recursive: true });
+    writeFileSync(join(ghDir, 'gh'), [
+      '#!/bin/sh',
+      'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf ""; exit 0; fi',
+      `if [ "$1" = "pr" ] && [ "$2" = "view" ]; then printf '%s\\n' '${viewJson}'; exit 0; fi`,
+      'if [ "$1" = "repo" ]; then printf \'%s\\n\' "o/r"; exit 0; fi',
+      'if [ "$1" = "api" ]; then printf \'%s\\n\' \'{"ref":"refs/heads/se/incident-x"}\'; exit 0; fi',
+      'if [ "$1" = "pr" ] && [ "$2" = "create" ]; then printf \'%s\\n\' "https://github.com/o/r/pull/8"; exit 0; fi',
+      'exit 0',
+      '',
+    ].join('\n'));
+    chmodSync(join(ghDir, 'gh'), 0o755);
+    const saved = { path: process.env.PATH, token: process.env.GH_TOKEN, gitcfg: process.env.GIT_CONFIG_GLOBAL,
+      cardId: process.env.ELANOUS_TASK_CARD_ID };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    process.env.GH_TOKEN = 'test-token';
+    process.env.PATH = `${ghDir}:${saved.path ?? ''}`;
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+    // 하니스 디스패치 env 의 ELANOUS_TASK_CARD_ID(이 런의 과업 카드)가 새어 들면 upsertPr 입구의
+    // 카드 계보 가드가 무대 카드(ta-cleanup-1)와 충돌해 cleanup 경로에 못 미치게 차단한다 —
+    // 무대의 카드 표식이 지배하도록 잠시 비우고 끝내 복원한다.
+    delete process.env.ELANOUS_TASK_CARD_ID;
+    try {
+      const inventory = { status: 'checked' as const, prs: [{ number: 7, headRefName: 'old-branch', title: 'old', draft: true,
+        updatedAt: '2026-10-21T00:00:00Z', headSha, labels: [], files: ['src/old.ts'], seat: null,
+        cellId: 'PR-SAME-CELL-CLEANUP', cardId: 'ta-cleanup-1' }] };
+      const manager = makePrManager(defaultCmdRunner, () =>
+        guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-CLEANUP', cardId: 'ta-cleanup-1' }, inventory));
+      const r = manager.upsertPr({
+        branch: 'se/incident-x', worktreePath: work, title: '[SE] cleanup', body,
+        base: 'main', commitMessage: 'm', runId: 'run-a11ce5-1111-2222-3333-444444444444',
+      });
+      expect(r).toEqual({ ok: true, url: 'https://github.com/o/r/pull/8', reused: false, supersededPr: 7 });
+      const cleanupLog = log.mock.calls.find(([, event]) => event === 'same-cell-scratch-cleanup-failed');
+      expect(cleanupLog).toBeDefined();
+      const record = cleanupLog![2] as { scratchRef: string; detail: string; stderr: string; stdout: string; truncated: boolean };
+      expect(cleanupLog![3]).toEqual({ level: 'warn' });
+      // 삭제 거부로 scratch ref 가 원격에 그대로 남았다 — 기록이 지목한 바로 그 ref 인지, 그리고
+      // 같은 실패 명령의 원본 출력과 대조(원문 길이 ⊕ truncated 표지).
+      const leftovers = spawnSync('git', ['ls-remote', 'origin'], { encoding: 'utf8', cwd: work });
+      expect(leftovers.stdout).toContain(record.scratchRef);
+      expect(record.scratchRef).toMatch(/^refs\/heads\/self-impl\/pr-create-ra11ce5-/);
+      const raw = spawnSync('git', ['-C', work, 'push', 'origin', `:${record.scratchRef}`], { encoding: 'utf8', env: process.env });
+      expect(raw.status).not.toBe(0);
+      expect(record.truncated).toBe(false);
+      expect(record.stderr).toBe(raw.stderr.trim());
+      expect(record.stdout).toBe(raw.stdout.trim());
+      expect(record.stderr.length).toBeGreaterThan(220);
+      expect(record.stderr).toContain('SCRATCH-CLEANUP-TAIL-MARKER');
+      expect(record.detail).toBe(record.stderr);
+    } finally {
+      log.mockRestore();
+      if (saved.path === undefined) delete process.env.PATH; else process.env.PATH = saved.path;
+      if (saved.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved.token;
+      if (saved.gitcfg === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = saved.gitcfg;
+      if (saved.cardId === undefined) delete process.env.ELANOUS_TASK_CARD_ID; else process.env.ELANOUS_TASK_CARD_ID = saved.cardId;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

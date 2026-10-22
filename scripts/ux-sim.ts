@@ -17,6 +17,7 @@
 //   bun scripts/ux-sim.ts --fault pod-death   # 결함 주입: PARTIAL 줄을 남긴 Pod 가 SIGTERM 으로 지워짐 → 호스트 재방출 판정
 //   bun scripts/ux-sim.ts --fault pool-cap    # 결함 주입: --pod-pool 에 :N 이 빠진 풀 → 승인 판정(limitedBy)
 //   bun scripts/ux-sim.ts --fault sqlite-busy # 결함 주입: 실제 SQLite 잠금 → 로그 배치 버퍼·복구
+//   bun scripts/ux-sim.ts emit child-error-long --json # 사건 주입(L0): 격리 우주 원장에 주입 줄 → 소비자 목록
 //
 // ⛔ 이 CLI 는 «실제 위젯 render()» 를 부른다 — 흉내 렌더러가 아니다.
 import { simRenderLogFrame } from '../src/ux-sim/render-frame.js';
@@ -28,6 +29,44 @@ const PHASES: TurnPhase[] = [
 ];
 
 const argv = process.argv.slice(2);
+
+// ── 사건 주입 «이벤트 몽키» (SIM-EVENT-MONKEY · L0) — 자기 플래그를 가진 하위 명령 ──
+//   bun scripts/ux-sim.ts emit <kind> [--run <id>] [--variant allowed|refused] [--state-dir <dir>] [--json]
+//   bun scripts/ux-sim.ts emit --list
+//   ⛔ 운영 우주(~/.elanous)면 쓰기 전에 거부(rc 3). 격리 우주는 ELANOUS_STATE_DIR 또는 --state-dir.
+if (argv[0] === 'emit') {
+  // 얇은 별칭 — 해석은 `eln sim emit` 과 «같은» runEventMonkeyCli 하나가 한다.
+  const rest = argv.slice(1);
+  const EMIT_FLAGS = new Set(['--run', '--variant', '--state-dir', '--json', '--list']);
+  const VALUED = new Set(['--run', '--variant', '--state-dir']);
+  const unknown = rest.filter((a) => a.startsWith('--') && !EMIT_FLAGS.has(a));
+  if (unknown.length > 0) {
+    console.error(`⛔ 모르는 인자다: ${unknown.join(' ')} — 아는 것: ${[...EMIT_FLAGS].join(' · ')}`);
+    process.exit(2);
+  }
+  const value = (flag: string): string | undefined => {
+    const i = rest.indexOf(flag);
+    if (i < 0) return undefined;
+    const v = rest[i + 1];
+    if (!v || v.startsWith('--')) { console.error(`⛔ ${flag} 에 값이 필요하다`); process.exit(2); }
+    return v;
+  };
+  const { renderEventMonkeyKinds, runEventMonkeyCli } = await import('../src/ux-sim/event-monkey.js');
+  if (rest.includes('--list')) { console.log(renderEventMonkeyKinds(rest.includes('--json')).join('\n')); process.exit(0); }
+  const positional = rest.filter((a, i) => !a.startsWith('--') && !VALUED.has(rest[i - 1] ?? ''));
+  if (positional.length > 1) {
+    console.error(`⛔ 사건은 하나만 받는다 — 남는 인자: ${positional.slice(1).join(' ')}`);
+    process.exit(2);
+  }
+  const runId = value('--run');
+  const variant = value('--variant');
+  const stateDir = value('--state-dir');
+  const out = runEventMonkeyCli({ kindName: positional[0], json: rest.includes('--json'),
+    ...(runId ? { runId } : {}), ...(variant ? { variant } : {}), ...(stateDir ? { stateDir } : {}) });
+  for (const line of out.stdout) console.log(line);
+  for (const line of out.stderr) console.error(line);
+  process.exit(out.code);
+}
 
 // ⛔⭐ 모르는 인자를 «조용히 삼키지» 않는다 — 이름을 대고 거부한다.
 //

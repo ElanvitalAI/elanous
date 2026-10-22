@@ -17,7 +17,7 @@ process.env.ELANOUS_STATE_DIR = stateDir;
 let manifestDbPath = '';
 
 const {
-  addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestFrame, readPtyManifestFrame, markPtyManifestClosed,
+  addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestFrame, readPtyManifestFrame, markPtyManifestClosed, updatePtyManifestTurn,
   removePtyManifest, listPtyManifest, listPtyManifestRows, getPtyManifest, ptyManifestDbPath, setPtyManifestDbPathForTesting,
   purgeClosedPtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, reapOrphanedOwnedPtyManifest,
   reapStalePtyManifest, touchLivePtyManifest, PTY_MANIFEST_STALE_MS, migratePtyManifestSchema,
@@ -281,6 +281,38 @@ describe('pty-manifest store (크로스-프로세스 관측)', () => {
     expect(r.alive).toBe(false);
     expect(r.exitCode).toBe(0);
     expect(r.snapshot).toBe('final screen');
+  });
+
+  test('한 자리(seat)의 시작·산출·종료 lifecycle 사건이 원장에 같은 seatId·purpose·산출 총량으로 이어진다', () => {
+    const t = 31_000_000;
+    upsertPtyManifest({ id: 'seat-flow', kind: 'tui', cmd: 'elanous tui', seat: 'OP', purpose: 'tui-shell:OP', startedAt: t, now: t });
+    addPtyManifestOutputBytes('seat-flow', 5, t + 1);
+    addPtyManifestOutputBytes('seat-flow', 6, t + 2);
+    updatePtyManifestTurn('seat-flow', 'busy', t + 3);
+    markPtyControlled('seat-flow', t + 4);
+    markPtyManifestClosed('seat-flow', 0, t + 5);
+
+    const events = lifecycleEvents('seat-flow').map((event) => JSON.parse(event.payload!));
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: 'spawned', ptyId: 'seat-flow', seat: 'OP', purpose: 'tui-shell:OP', outputBytesTotal: 0 }),
+      expect.objectContaining({ event: 'exited', ptyId: 'seat-flow', seat: 'OP', purpose: 'tui-shell:OP', outputBytesTotal: 11, turnState: 'busy', lastControlAt: t + 4 }),
+    ]));
+    // 같은 seatId 한 흐름: 시작 → 종료 순서로 원장에 남는다.
+    const seqs = Object.fromEntries(events.map((payload) => [payload.event, payload]));
+    expect(seqs.exited!.closedAt).toBe(t + 5);
+    expect(seqs.spawned!.startedAt).toBe(t);
+    // 원장 이벤트마다 같은 자리 정체성이 실린다(빠짐 없이).
+    for (const payload of events) expect(payload.seat).toBe('OP');
+  });
+
+  test('오류 종료도 같은 seatId와 산출 총량을 lifecycle 사건에 보존한다', () => {
+    const t = 32_000_000;
+    upsertPtyManifest({ id: 'seat-error', kind: 'tui', cmd: 'elanous tui', seat: 'OP', purpose: 'tui-shell:OP', startedAt: t, now: t });
+    addPtyManifestOutputBytes('seat-error', 9, t + 1);
+    markPtyManifestClosed('seat-error', 1, t + 2);
+
+    const exited = lifecycleEvents('seat-error').map((event) => JSON.parse(event.payload!)).find((payload) => payload.event === 'exited');
+    expect(exited).toMatchObject({ ptyId: 'seat-error', seat: 'OP', purpose: 'tui-shell:OP', exitCode: 1, outputBytesTotal: 9 });
   });
 
   test('markClosed 는 alive=1→0 실제 전이에만 exited lifecycle 사건을 남긴다', () => {

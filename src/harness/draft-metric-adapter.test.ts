@@ -77,7 +77,8 @@ test('DRAFT-METRIC: needs-owner reads the batched GraphQL comments — no per-dr
           const number = Number(match[1]);
           const nodes = (rows: unknown[]) => ({ totalCount: rows.length, nodes: rows, pageInfo: { hasNextPage: false } });
           repository[`p${number}`] = { number, headRefOid: `h${number}`, files: nodes([{ path: 'src/a.ts' }]),
-            comments: nodes(comments(number).map((body) => ({ body }))), reviews: nodes([]), mergeCommit: null };
+          headRef: { target: { committedDate: '2026-10-07T23:00:00Z' } },
+          comments: nodes(comments(number).map((body) => ({ body }))), reviews: nodes([]), mergeCommit: null };
         }
         return JSON.stringify({ data: { repository } });
       }

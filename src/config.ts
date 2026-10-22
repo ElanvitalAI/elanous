@@ -6,6 +6,7 @@ import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
 import { listSshHosts } from './ssh/ssh-hosts.js';
 import { isInstalledPackagePath } from './instance/installed-package.js';
 import { defaultObsidianVault } from './obsidian/default-vault.js';
+import { OPENGATEWAY_DEFAULT_MODEL } from './llm/opengateway-models.js';
 
 // ── User config ──
 export const REMOTE_HOME = homedir();
@@ -191,7 +192,7 @@ export function refreshKeyFromCache(envName: string): boolean {
  * 자식 프로세스도 이 env 를 물려받는다. 반환 = 캐시로 채운 이름(값은 절대 안 싣는다).
  */
 export const DAEMON_KEY_ENV_NAMES = [
-  'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'XAI_API_KEY', 'OPENROUTER_API_KEY',
+  'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'OPENAI_API_KEY', 'XAI_API_KEY', 'OPENROUTER_API_KEY', 'OPENGATEWAY_API_KEY',
   'ELANOUS_OPENAI_RELAY_SHARED_SECRET',
 ] as const;
 
@@ -239,6 +240,12 @@ export const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions
 // 기본 = 사다리 `balanced`(`llm-tier-map.ts` OPENROUTER). 카탈로그 id 는 `openrouter/<vendor>/<model>`,
 //   wire 로는 `openrouter/` 를 떼고 보낸다(`makeOpenRouterProvider`).
 export const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'openrouter/z-ai/glm-5.3';
+/** Optional OpenAI-compatible gateway. Cache wins over inherited env, as for other API keys. */
+export function getOpenGatewayApiKey(): string | undefined {
+  return keyFromCacheOrEnv('OPENGATEWAY_API_KEY');
+}
+export const OPENGATEWAY_API_URL = 'https://apis.opengateway.ai/v1/chat/completions';
+export const OPENGATEWAY_MODEL = process.env.OPENGATEWAY_MODEL || OPENGATEWAY_DEFAULT_MODEL;
 export function getLocalLLMUrl(): string | undefined {
   return process.env.LOCAL_LLM_URL; // e.g. http://localhost:11434/v1 (ollama)
 }

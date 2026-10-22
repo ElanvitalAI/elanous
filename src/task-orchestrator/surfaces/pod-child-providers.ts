@@ -9,7 +9,7 @@
  */
 // BEDROCK-PROVIDER ② (0.2.24) — bedrock 은 «이름 있는 AWS Secret» 이 클러스터에 있을 때만 뜬다(pod-bedrock-child.ts · 발사 전 거부).
 // ZAI-POD-CHILD (0.2.24) — glm 은 Z.ai GLM Coding Plan(정액 구독) · «이름 있는 ZAI Secret» 이 클러스터에 있을 때만 뜬다(pod-zai-child.ts · 발사 전 거부 · 동시 상한 넘치면 정책대로).
-export const POD_CHILD_PROVIDERS = ['openai-codex', 'grok', 'openrouter', 'anthropic', 'bedrock', 'glm'] as const;
+export const POD_CHILD_PROVIDERS = ['openai-codex', 'grok', 'openrouter', 'opengateway', 'anthropic', 'bedrock', 'glm'] as const;
 export type PodChildProvider = typeof POD_CHILD_PROVIDERS[number];
 
 /** 사람이 쓰는 별칭 → 정식 이름. */

@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { podImageMissingMessage, podImageRegistry, podPoolImageLookup, preparePodImage, resolvePodImageSource } from './pod-image-source.js';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { getUserConfig, resetUserConfig, userConfigPath } from '../../user-config.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
+import { listPodShelfImages, podImageMissingMessage, podImageRegistry, podPoolImageLookup, preparePodImage, putPodShelfImage, resolvePodImageSource, resolvePodShelfRef } from './pod-image-source.js';
 import type { RemoteRun } from './pod-pool.js';
 
 type Member = { context: string; sshHost?: string; registry?: string };
@@ -46,6 +51,53 @@ function rig(remote: ReturnType<typeof fakeRemote>) {
     },
   };
 }
+
+describe('shelf image source', () => {
+  const pool = 'pool-node-b@node-b:1#k3d-elanous-registry:5050';
+  test('PR number uses headRefOid; SHA and branch use git commit resolution without touching imageCommit', () => {
+    const calls: string[][] = [];
+    const exec = ((_cmd: string, args: string[]) => { calls.push(args); return { status: 0, stdout: `${COMMIT}\n` }; }) as typeof import('node:child_process').spawnSync;
+    expect(resolvePodShelfRef('123', '/repo', exec)).toBe(COMMIT);
+    expect(resolvePodShelfRef('#123', '/repo', exec)).toBe(COMMIT);
+    expect(resolvePodShelfRef(COMMIT, '/repo', exec)).toBe(COMMIT);
+    expect(resolvePodShelfRef('feature/branch', '/repo', exec)).toBe(COMMIT);
+    expect(calls[0]).toEqual(['pr', 'view', '123', '--json', 'headRefOid', '--jq', '.headRefOid']);
+    expect(calls[3]).toEqual(['rev-parse', '--verify', 'feature/branch^{commit}']);
+    expect(() => resolvePodShelfRef('--help', '/repo', exec)).toThrow('invalid ref');
+  });
+
+  test('same SHA12 tag is reused, missing tag built under existing sync lock, without writing operational pin', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-shelf-config-'));
+    const pin = 'f'.repeat(40);
+    setElanousConfigDir(root);
+    resetUserConfig();
+    try {
+      const path = userConfigPath();
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, JSON.stringify({ harness: { imageCommit: pin } }));
+      expect(getUserConfig().harness?.imageCommit).toBe(pin);
+      const before = readFileSync(path, 'utf8');
+      const actions: string[] = [];
+      const image = `k3d-elanous-registry:5050/elanous-harness:${TAG}`;
+      const deps = { resolve: () => COMMIT, hasRegistry: () => true, tempDir: () => '/fake/shelf', checkout: (sha: string) => { expect(sha).toBe(COMMIT); }, remove: () => {},
+        sync: async (_members: unknown, localImage: string, commit: string, options: { buildScript: string }) => {
+          expect(localImage).toBe('elanous-harness:local'); expect(commit).toBe(COMMIT);
+          expect(options.buildScript).toBe('/fake/shelf/docker/harness/build.sh');
+          return new Map([['pool-node-b', { ok: true, action: actions.length ? 'built' as const : 'fresh' as const, imageRef: image, detail: 'ready', ms: 1 }]]);
+        },
+      };
+      const first = await putPodShelfImage('123', pool, deps as Parameters<typeof putPodShelfImage>[2]); actions.push(first.action);
+      const second = await putPodShelfImage('branch', pool, deps as Parameters<typeof putPodShelfImage>[2]);
+      expect([first, second]).toEqual([{ commit: COMMIT, image, action: 'fresh' }, { commit: COMMIT, image, action: 'built' }]);
+      resetUserConfig();
+      expect(getUserConfig().harness?.imageCommit).toBe(pin);
+      expect(readFileSync(path, 'utf8')).toBe(before);
+      expect(listPodShelfImages(pool, () => ({ status: 0, stdout: JSON.stringify({ tags: [TAG, 'latest'] }), stderr: '' }))).toEqual([image]);
+    } finally {
+      resetElanousConfigDir(); resetUserConfig(); rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('resolvePodImageSource', () => {
   test('build.sh 와 같은 레지스트리 규칙 · 태그 = 커밋 앞 12자리', () => {

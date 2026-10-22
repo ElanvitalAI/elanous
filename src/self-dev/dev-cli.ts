@@ -66,14 +66,9 @@ import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import { BEDROCK_DEFAULT_MODEL, BEDROCK_MODELS, findBedrockModel, resolveBedrockModelId } from '../llm/bedrock.js';
 import { ZAI_CODING_DEFAULT_MODEL, ZAI_CODING_MODELS } from '../llm/zai-coding-plan.js';
-
-/** `dev --plan` 도움말이 가리키는 대응 문. ⛔ 도움말에 이 문자열을 리터럴로 다시 적지 마라. */
-export const DEV_PLAN_REPLACEMENT = 'elanous harness say';
-
-/** `dev --plan` 옵션 도움말. 목적지는 인자(기본=상수)에서만 온다. */
-export function formatDevPlanOptionHelp(replacement: string = DEV_PLAN_REPLACEMENT): string {
-  return `은퇴한 staged 하니스 옵션 — 지정하면 명시적으로 거부됨 · 대응 문 \`${replacement}\``;
-}
+import { isVerifiedOpenGatewayModel, OPENGATEWAY_DEFAULT_MODEL, OPENGATEWAY_VERIFIED_MODELS } from '../llm/opengateway-models.js';
+import { DEV_PLAN_REPLACEMENT } from './cli-help-text.js';
+export { DEV_PLAN_REPLACEMENT, formatDevPlanOptionHelp } from './cli-help-text.js';
 
 /** dev CLI 옵션(commander) — `--no-*` 는 false 로 도착. input/executor 는 액션이 빌드해 별도 전달. */
 /** `src/index.ts` dev command wrapper must not append a second JSON document after hold emits its result. */
@@ -1369,7 +1364,7 @@ function childModelCatalogProvider(provider: string): string {
 
 function isKnownChildLlmProvider(provider: string): boolean {
   // ZAI-POD-CHILD (0.2.24) — glm = Z.ai GLM Coding Plan 직결(`ZAI_API_KEY` · src/llm/zai-coding-plan.ts). Pod 자식이 `--child-llm-provider glm` 으로 뜬다.
-  return ['grok', 'anthropic', 'claude-acp', 'gemini', 'openai', 'openai-codex', 'local', 'openrouter', 'bedrock', 'glm'].includes(normalizeChildLlmProvider(provider));
+  return ['grok', 'anthropic', 'claude-acp', 'gemini', 'openai', 'openai-codex', 'local', 'openrouter', 'opengateway', 'bedrock', 'glm'].includes(normalizeChildLlmProvider(provider));
 }
 
 function findPickerCatalogModel(provider: string, id: string): CatalogModelView | undefined {
@@ -1380,6 +1375,7 @@ function findPickerCatalogModel(provider: string, id: string): CatalogModelView 
     case 'openai':
     case 'openai-codex': return findCodexModel(id);
     case 'openrouter': return findOpenRouterChildModel(id);
+    case 'opengateway': return findOpenGatewayChildModel(id);
     case 'bedrock': return findBedrockChildModel(id);
     case 'glm': return (ZAI_CODING_MODELS as readonly string[]).includes(id)
       ? { id, tier: /flash/i.test(id) ? 'budget' : 'balanced', supportsThinking: true, recommended: id === ZAI_CODING_DEFAULT_MODEL }
@@ -1410,6 +1406,11 @@ function findOpenRouterChildModel(id: string): CatalogModelView | undefined {
     supportsThinking: folded ? folded.reasoning != null : true,
     recommended: id === LLM_TIER_MAP_BY_PROVIDER.openrouter.balanced.model,
   };
+}
+
+function findOpenGatewayChildModel(id: string): CatalogModelView | undefined {
+  if (!isVerifiedOpenGatewayModel(id)) return undefined;
+  return { id, tier: 'better', supportsThinking: false, recommended: id === OPENGATEWAY_DEFAULT_MODEL };
 }
 
 function thinkingFromBuiltin(tags: readonly string[] | undefined, reasoningEffortCeiling: string | undefined): boolean {
@@ -1448,6 +1449,7 @@ function listImplementationChildModelCandidates(provider: string): string[] {
       case 'openai':
       case 'openai-codex': return CODEX_MODELS.map((model) => model.id);
       case 'openrouter': return [...new Set(MODEL_TIERS.map((t) => LLM_TIER_MAP_BY_PROVIDER.openrouter[t].model))];
+      case 'opengateway': return [...OPENGATEWAY_VERIFIED_MODELS];
       case 'bedrock': return BEDROCK_MODELS.map((model) => model.id);
       case 'glm': return [...ZAI_CODING_MODELS];
       default: return [];

@@ -1,3 +1,6 @@
+import { realpathSync } from 'node:fs';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { debug } from '../debug/log.js';
 import {
   allowsBaselineOnlyFailure,
   buildGateBaselineReport,
@@ -21,6 +24,10 @@ export interface GateShardAttempt {
   /** LIGHT-RC-MEASURE — the shard files that exist in the baseline tree, i.e. what the baseline side actually ran.
    *  Absent = every shard file (the old shape). Empty = the baseline side was not run and contributes zero cases. */
   baselineFiles?: readonly string[];
+  /** SHARD-JUNIT-ABS-PATH — the tree each side ran in. bun writes an absolute JUnit `file` once a test process.chdir()s;
+   *  such a path under this root is read as the cohort-relative file. Absent = absolute paths stay rejected (old shape). */
+  currentRoot?: string;
+  baselineRoot?: string;
 }
 
 export interface GateShardAggregate {
@@ -125,7 +132,32 @@ function textOf(element: XmlElement): string {
   return element.text + element.children.map(textOf).join('');
 }
 
-function readJUnit(xml: string, files: readonly string[]): JUnitCase[] | undefined {
+const realOrResolved = (path: string): string => {
+  try { return realpathSync(path); } catch { return resolve(path); }
+};
+
+/** SHARD-JUNIT-ABS-PATH — an absolute JUnit `file` under `root` becomes the cohort-relative path. Both sides are
+ *  realpath'd (macOS /tmp ↔ /private/tmp). A path outside the root is returned unchanged, so the cohort check rejects it. */
+function junitPathNormalizer(root: string | undefined): (file: string | undefined) => string | undefined {
+  if (!root) return (file) => file;
+  const realRoot = realOrResolved(root);
+  const seen = new Map<string, string>();
+  return (file) => {
+    if (file === undefined || !isAbsolute(file)) return file;
+    const cached = seen.get(file);
+    if (cached !== undefined) return cached;
+    const rel = relative(realRoot, realOrResolved(file));
+    const inside = rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+    const to = inside ? rel.split(sep).join('/') : file;
+    seen.set(file, to);
+    if (inside) debug.log('gate.shard', 'junit-path-normalized', { from: file, to });
+    else debug.log('gate.shard', 'junit-path-outside-root', { from: file, root: realRoot });
+    return to;
+  };
+}
+
+function readJUnit(xml: string, files: readonly string[], treeRoot?: string): JUnitCase[] | undefined {
+  const normalize = junitPathNormalizer(treeRoot);
   const root = parseXml(xml);
   if (!root || (root.name !== 'testsuites' && root.name !== 'testsuite')) return undefined;
   const expected = new Set(files);
@@ -140,7 +172,7 @@ function readJUnit(xml: string, files: readonly string[]): JUnitCase[] | undefin
     || (/^(0|[1-9]\d*)$/.test(value) && Number(value) === actual);
   // Each suite's tests attribute covers its descendants too: compare subtree totals.
   const walkSuite = (suite: XmlElement, parentFile: string | undefined): { tests: number; failures: number; errors: number } | undefined => {
-    const file = suite.attrs.file ?? parentFile;
+    const file = normalize(suite.attrs.file) ?? parentFile;
     const declared = Number(suite.attrs.tests);
     if ((file && !expected.has(file)) || !Number.isSafeInteger(declared) || declared < 0) return undefined;
     const total = { tests: 0, failures: 0, errors: 0 };
@@ -150,7 +182,7 @@ function readJUnit(xml: string, files: readonly string[]): JUnitCase[] | undefin
         if (!sub) return undefined;
         total.tests += sub.tests; total.failures += sub.failures; total.errors += sub.errors;
       } else if (child.name === 'testcase') {
-        const caseFile = child.attrs.file ?? file;
+        const caseFile = normalize(child.attrs.file) ?? file;
         const leaf = child.attrs.name;
         if (!caseFile || !expected.has(caseFile) || !leaf || (file && file !== caseFile)) return undefined;
         total.tests++;
@@ -245,14 +277,16 @@ export function aggregateGateTestShards(shards: readonly GateTestShard[], attemp
   const retryShardIds: string[] = [];
   const current: JUnitCase[] = [];
   const baseline: JUnitCase[] = [];
+  // 기준선 JUnit 전체 testcase(통과·실패·스킵 포함). 귀속 일치 확인용이라 판정 재료인 `baseline`(스킵 제외)과 분리한다.
+  const baselineTestCases: JUnitCase[] = [];
   const skippedRegressions: JUnitCase[] = [];
   for (const shard of shards) {
     const attempt = selected.get(shard.id);
-    const head = attempt?.currentJUnit === undefined ? undefined : readJUnit(attempt.currentJUnit, shard.files);
+    const head = attempt?.currentJUnit === undefined ? undefined : readJUnit(attempt.currentJUnit, shard.files, attempt.currentRoot);
     // LIGHT-RC-MEASURE ① — the baseline side reads only the files that exist in the baseline tree; none = not run.
     const baselineFiles = attempt?.baselineFiles ?? shard.files;
     const baselineSkipped = baselineFiles.length === 0;
-    const base = baselineSkipped ? [] : attempt?.baselineJUnit === undefined ? undefined : readJUnit(attempt.baselineJUnit, baselineFiles);
+    const base = baselineSkipped ? [] : attempt?.baselineJUnit === undefined ? undefined : readJUnit(attempt.baselineJUnit, baselineFiles, attempt.baselineRoot);
     if (!attempt || attempt.currentExitCode === null || attempt.currentSignal
       || ![0, 1].includes(attempt.currentExitCode)
       || baselineFiles.some((file) => !shard.files.includes(file))
@@ -267,6 +301,7 @@ export function aggregateGateTestShards(shards: readonly GateTestShard[], attemp
     }
     current.push(...head.filter((test) => !test.skipped));
     baseline.push(...base.filter((test) => !test.skipped));
+    baselineTestCases.push(...base);
     const passedAtBase = new Set(base.filter((test) => !test.skipped && test.failure === undefined).map((test) => `${test.file}\u0000${test.name}`));
     skippedRegressions.push(...head.filter((test) => test.skipped && passedAtBase.has(`${test.file}\u0000${test.name}`)));
   }
@@ -279,6 +314,8 @@ export function aggregateGateTestShards(shards: readonly GateTestShard[], attemp
   const passedTestEvidence: GatePassedTestEvidence = {
     status: 'available',
     tests: baseline.filter((test) => test.failure === undefined).map(({ file, name }) => ({ file, name: `${file} > ${name}` })),
+    // #27844 귀속 불일치 — 비샤드 경로(runBaselineBunTest)와 같은 계약으로 기준선 전체 testcase 를 넘긴다.
+    testCases: baselineTestCases.map(({ file, name }) => ({ file, name: `${file} > ${name}` })),
   };
   const report = buildGateBaselineReport(asGateLog(current), {
     status: baselineStatus,

@@ -9,9 +9,9 @@ import { getUserConfig, reloadUserConfig, userConfigPath } from '../user-config.
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import type { LandWorktree, LandWorktreeFailure, LandWorktreeInput } from './land-worktree.js';
 import { decisionRaiseArgs, executeNextAction } from './actions.js';
-import { defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveDecisionCard, executeLiveLand, executeLiveReview, type LiveDecisionCardContext, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, type TaskAgentLiveMove } from './live-moves.js';
+import { CLOSE_IDLE_HOURS, CLOSE_PROTECTED_LABELS, type DraftCloseView, evaluateDraftClose, executeLiveCloseProposal, defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveDecisionCard, executeLiveLand, executeLiveReview, type LiveDecisionCardContext, liveCloseArgs, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, TASK_AGENT_LIVE_MOVES, type TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
-import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
+import { readTaskCard, shellQuote, writeTaskCards, type TaskCard } from './task-hand.js';
 import { captureReviewResults } from './review-result-capture.js';
 
 // GATE-PREEXISTING-ZERO-1 — 이 파일의 시험은 전부 «HQ(비-Pod) 판단부»를 단언한다. 그런데 정식 게이트는 Pod 안에서 돌고
@@ -315,6 +315,7 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
     expect(spawned[0]!.command).toBe(process.execPath);
     expect(spawned[0]!.args.slice(0, 8)).toEqual(['/repo/bin/elanous.mjs', '--config-dir', '/universe', 'self', 'review', '11', '--json', '--intent']);
     expect(spawned[0]!.args[8]).toContain('목표: feature ask');
+    expect(spawned[0]!.args.slice(9)).toEqual(['--acp', '--acp-backend', 'claude']);
     expect(spawned[0]!.options).toMatchObject({ detached: true, stdio: 'ignore', cwd: '/tmp/wt-live' });
   });
 
@@ -346,7 +347,9 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
       expect(calls[0]!.command).toBe('ssh');
       expect(calls[0]!.args.slice(0, 5)).toEqual(['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5']);
       expect(calls[0]!.args[5]).toBe('node-b');
-      expect(calls[0]!.args[6]).toContain(`cd ${root} && ${worker} --config-dir ${root} self review 77 --json --model gpt-6-sol`);
+      expect(calls[0]!.args[6]).toContain(`cd ${root} && ${worker} --config-dir ${root} self review 77 --json --intent`);
+      expect(calls[0]!.args[6]).toContain('--acp --acp-backend claude');
+      expect(calls[0]!.args[6]).not.toContain('--model');
       expect(calls[0]!.options.stdio).toEqual(['ignore', expect.any(Number), 'ignore']);
       expect(JSON.parse(readFileSync(resultPath, 'utf8'))).toMatchObject({ pr: 77, headCommit: HEAD_A, verdict: 'pass' });
       captureReviewResults(statePath, { cardIds: ['ta-remote-review'] });
@@ -408,7 +411,7 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
     const { existsSync, readFileSync, realpathSync } = await import('node:fs');
     for (let i = 0; i < 100 && !existsSync(out); i++) await new Promise((r) => setTimeout(r, 50));
     const written = JSON.parse(readFileSync(out, 'utf8')) as { argv: string[]; cwd: string };
-    expect(written.argv).toEqual(['--config-dir', join(dir, 'universe'), 'self', 'review', '13', '--json', '--intent', 'intent text']);
+    expect(written.argv).toEqual(['--config-dir', join(dir, 'universe'), 'self', 'review', '13', '--json', '--intent', 'intent text', '--acp', '--acp-backend', 'claude']);
     expect(realpathSync(written.cwd)).toBe(realpathSync(dir));
   });
 
@@ -468,8 +471,8 @@ describe('taskAgent.liveMoves 해석 — config > env > 없음 · 모르는 항�
     expect(f.reviews).toHaveLength(0);
   });
 
-  test('기본 리뷰 요청 argv — 진입점 · 같은 우주 config-dir · self review <PR> --json --intent', () => {
-    expect(liveReviewArgs('/repo/bin/elanous.mjs', '/universe', 9, 'intent')).toEqual(['/repo/bin/elanous.mjs', '--config-dir', '/universe', 'self', 'review', '9', '--json', '--intent', 'intent']);
+  test('기본 리뷰 요청 argv — 진입점 · 같은 우주 config-dir · Claude ACP', () => {
+    expect(liveReviewArgs('/repo/bin/elanous.mjs', '/universe', 9, 'intent')).toEqual(['/repo/bin/elanous.mjs', '--config-dir', '/universe', 'self', 'review', '9', '--json', '--intent', 'intent', '--acp', '--acp-backend', 'claude']);
   });
 });
 
@@ -1327,7 +1330,135 @@ describe('TA-LIVE-DECISION — 막힌 과제를 근거 붙은 결정 카드로',
     expect(t.raised).toHaveLength(1);
   });
 
-  test('보존 — 종전 실행부의 decision 카드 인자와 --ref 만 빼고 같다', async () => {
+describe('TA-PROPOSE-CLOSE-MOVE — draft 정리: 근거가 모두 참일 때만 닫기 명령', () => {
+  const draft = (over: Partial<DraftCloseView>): DraftCloseView => ({ pr: 61, readable: true, isDraft: true, ...over });
+  /** 가짜 gh 우주 — closeDraft 주입으로 닫기만 기록한다(propose 모드는 기록 0). */
+  function closeFixture() {
+    const f = fixture();
+    const closed: Array<{ command: string; args: string[] }> = [];
+    const deps = {
+      statePath: f.statePath,
+      log: () => {},
+      closeDraft: async (pr: number, comment: string) => { closed.push({ command: 'gh', args: liveCloseArgs(pr, comment) }); },
+    };
+    return { f, closed, deps, card: () => readTaskCard('ta-live-1', f.statePath)! };
+  }
+  /** draft 넷 — close-a 참 · close-b 참 · 보호 라벨 · 주인 미상(48h+ 지만 확인 없음). */
+  const drafts = (): readonly DraftCloseView[] => [
+    draft({ pr: 61, landedElsewhere: true }),
+    draft({ pr: 62, newerDraftInSameCell: true }),
+    draft({ pr: 63, labels: [...CLOSE_PROTECTED_LABELS].slice(0, 1) }),
+    draft({ pr: 64, idleHours: CLOSE_IDLE_HOURS + 24 }),
+  ];
+
+  test("어휘 — 'propose-close' 는 설정·env 허용 항목이다", () => {
+    expect(TASK_AGENT_LIVE_MOVES).toContain('propose-close');
+    expect([...resolveTaskAgentLiveMoves(['propose-close'], {}, () => {}).moves]).toEqual(['propose-close']);
+  });
+
+  test('propose 모드 1회 → 닫기 둘(원문)·보류 둘 · 가짜 gh 기록 0 · 카드 기록 0', async () => {
+    const t = closeFixture();
+    const out = await executeLiveCloseProposal(t.card(), drafts(), { ...t.deps, mode: 'propose' });
+    expect(out).toMatchObject({ kind: 'propose-close', card: 'ta-live-1', ok: true, executed: false });
+    expect(out.proposals.filter((p) => p.close).map((p) => p.pr)).toEqual([61, 62]);
+    expect(out.proposals.filter((p) => !p.close).map((p) => p.heldBy)).toEqual(['protected-label', 'no-grounds']);
+    // 닫기 명령 원문 — gh pr close <pr> --comment <근거 코멘트>.
+    const closeA = out.proposals.find((p) => p.pr === 61)!;
+    const closeB = out.proposals.find((p) => p.pr === 62)!;
+    expect(closeA.command).toBe(`gh pr close 61 --comment ${shellQuote(closeA.comment)}`);
+    expect(closeA.comment).toContain('close-a(착지/대체)=true');
+    expect(closeA.comment).toContain('close-b(같은 칸 새 draft)=false');
+    expect(closeA.comment).toContain('close-c(48h+ 무커밋=false, 주인 확인=false)');
+    expect(closeB.comment).toContain('close-b(같은 칸 새 draft)=true');
+    // 근거 코멘트에 조건별 참/거짓 — 주인 미상(64)은 48h+ 만 참.
+    const held = out.proposals.find((p) => p.pr === 64)!;
+    expect(held.comment).toContain('close-c(48h+ 무커밋=true, 주인 확인=false)');
+    expect(t.closed).toHaveLength(0);
+    expect(t.card().history).toEqual([]);
+  });
+
+  test('live 모드 1회 → 가짜 gh 에 close 둘만 기록 · 보류 둘은 기록 없음 · 카드 history 두 줄', async () => {
+    const t = closeFixture();
+    const out = await executeLiveCloseProposal(t.card(), drafts(), { ...t.deps, mode: 'live' });
+    expect(out).toMatchObject({ kind: 'propose-close', card: 'ta-live-1', ok: true, executed: true });
+    expect(t.closed.map((entry) => entry.args[2])).toEqual(['61', '62']);
+    expect(t.closed.every((entry) => entry.args[0] === 'pr' && entry.args[1] === 'close' && entry.args[3] === '--comment')).toBe(true);
+    const rows = t.card().history.filter((entry) => entry.event === 'live-move' && entry.kind === 'propose-close');
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.pr)).toEqual([61, 62]);
+    expect(rows.every((row) => row.executed === true && row.ok === true && row.executorResult === 'live')).toBe(true);
+    expect([{ ...rows[0]!, executed: false }, ...rows.slice(1)]
+      .every((row) => row.executed === true && row.ok === true && row.executorResult === 'live')).toBe(false);
+  });
+
+  test('보호 라벨·running·못 읽음·draft 아님은 근거가 참이어도 닫지 않는다(live 모드)', async () => {
+    const t = closeFixture();
+    const out = await executeLiveCloseProposal(t.card(), [
+      draft({ pr: 71, labels: ['do-not-close'], landedElsewhere: true }),
+      draft({ pr: 72, running: true, landedElsewhere: true }),
+      draft({ pr: 73, readable: false, landedElsewhere: true }),
+      draft({ pr: 74, isDraft: false, landedElsewhere: true }),
+    ], { ...t.deps, mode: 'live' });
+    expect(out.proposals.map((p) => [p.pr, p.close, p.heldBy])).toEqual([
+      [71, false, 'protected-label'],
+      [72, false, 'running'],
+      [73, false, 'unreadable'],
+      [74, false, 'not-a-draft'],
+    ]);
+    expect(out).toMatchObject({ ok: true, executed: false });
+    expect(t.closed).toHaveLength(0);
+    expect(t.card().history).toEqual([]);
+  });
+
+  test('close-c 는 48h+ 무커밋 ⊕ 주인 확인이 모두 참일 때만 닫는다', async () => {
+    const t = closeFixture();
+    const out = await executeLiveCloseProposal(t.card(), [
+      draft({ pr: 81, idleHours: CLOSE_IDLE_HOURS - 1, ownerConfirmed: true }),
+      draft({ pr: 82, idleHours: CLOSE_IDLE_HOURS + 1 }),
+      draft({ pr: 83, idleHours: CLOSE_IDLE_HOURS + 1, ownerConfirmed: true }),
+    ], { ...t.deps, mode: 'live' });
+    expect(out.proposals.map((p) => [p.pr, p.close, p.grounds.idle48h, p.grounds.ownerConfirmed])).toEqual([
+      [81, false, false, true],
+      [82, false, true, false],
+      [83, true, true, true],
+    ]);
+    expect(out.proposals.find((p) => p.pr === 81)!.heldBy).toBe('no-grounds');
+    expect(t.closed.map((entry) => entry.args[2])).toEqual(['83']);
+  });
+
+  test('evaluateDraftClose — 닫기 판단은 순수함수 · 48h 경계는 포함', () => {
+    expect(evaluateDraftClose(draft({ idleHours: CLOSE_IDLE_HOURS, ownerConfirmed: true })).close).toBe(true);
+    expect(evaluateDraftClose(draft({})).heldBy).toBe('no-grounds');
+    expect(CLOSE_PROTECTED_LABELS).toContain('protected');
+  });
+
+  test('카드 없음 → 그림자 · 판단은 하되 가짜 gh 기록 0', async () => {
+    const t = closeFixture();
+    const out = await executeLiveCloseProposal(undefined, drafts(), { ...t.deps, mode: 'live' });
+    expect(out).toMatchObject({ kind: 'propose-close', ok: false, executed: false, card: null });
+    expect(out.proposals.map((p) => p.close)).toEqual([true, true, false, false]);
+    expect(t.closed).toHaveLength(0);
+  });
+
+  test('live 닫기 실패 → ok false · 사유에 PR · 성공 줄은 그대로', async () => {
+    const t = closeFixture();
+    const deps = { ...t.deps, closeDraft: async (pr: number, comment: string) => {
+      if (pr === 62) throw new Error('gh pr close 403');
+      t.closed.push({ command: 'gh', args: liveCloseArgs(pr, comment) });
+    } };
+    const out = await executeLiveCloseProposal(t.card(), drafts(), { ...deps, mode: 'live' });
+    expect(out).toMatchObject({ ok: false, executed: true });
+    expect(out.detail).toContain('#62');
+    expect(out.detail).toContain('403');
+    expect(t.closed.map((entry) => entry.args[2])).toEqual(['61']);
+    const rows = t.card().history.filter((entry) => entry.kind === 'propose-close');
+    expect(rows.map((row) => row.pr)).toEqual([61, 62]);
+    expect(rows.find((row) => row.pr === 61)!.ok).toBe(true);
+    expect(rows.find((row) => row.pr === 62)!.ok).toBe(false);
+  });
+});
+
+test('보존 — 종전 실행부의 decision 카드 인자와 --ref 만 빼고 같다', async () => {
     const t = harness();
     const sent: string[][] = [];
     await executeNextAction({ kind: 'decision', taskId: 'ta-live-1', rationale: 'blocked twice on the same screen', pr: 9, runId: 'run-live', original: 'x', checklistId: '' },

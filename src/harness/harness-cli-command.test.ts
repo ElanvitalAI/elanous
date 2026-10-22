@@ -1,12 +1,13 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, spyOn, test } from 'bun:test';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { loadRunLedger, runLedgerDir, appendRunLedgerEntry } from '../self-implement/run-ledger.js';
+import { readRunStopRecord } from '../self-implement/run-stop.js';
 import { debug } from '../debug/log.js';
 import { addHarnessQueue, listHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps } from './harness-queue.js';
 import { getUserConfig, setUserConfigOverlay } from '../user-config.js';
@@ -1471,6 +1472,84 @@ describe('harness CLI command', () => {
     expect(requests).toEqual([['api', '--paginate', '--slurp', 'repos/my/repo/issues/123/comments?per_page=100']]);
   });
 
+  test('preserves legacy census PASS while exposing a dismissed exact-head review as dismissed', async () => {
+    const adapters = githubDraftSweepAdapters((args) => {
+      const endpoint = args[1] ?? '';
+      if (endpoint === 'repos/my/repo/pulls/123') return JSON.stringify({ head: { sha: 'a'.repeat(40) } });
+      if (endpoint.includes('/pulls/123/reviews?')) return JSON.stringify([{ state: 'DISMISSED', body: 'VERDICT: PASS',
+        submitted_at: '2026-10-21T00:00:00Z', commit_id: 'a'.repeat(40) }]);
+      if (endpoint.includes('/issues/123/comments?')) return JSON.stringify([{ body: 'VERDICT: PASS' }]);
+      if (endpoint.includes(`/commits/${'a'.repeat(40)}/status`)) return JSON.stringify({ state: 'success' });
+      if (endpoint.includes(`/commits/${'a'.repeat(40)}/check-runs`)) return JSON.stringify({ check_runs: [{ conclusion: 'success' }] });
+      throw new Error(`unexpected endpoint: ${endpoint}`);
+    });
+    const posture = await adapters.getReviewGate?.({ number: 123, branch: 'self-impl/draft', title: 'draft',
+      labels: [], createdAt: '2026-10-20T00:00:00Z' }, 'my/repo');
+    expect(posture).toMatchObject({ review: 'pass', gate: 'pass', triageReview: 'dismissed' });
+  });
+
+  test('paginates all REST reviews and exposes the latest exact-head state', async () => {
+    const requests: string[] = [];
+    const head = 'a'.repeat(40);
+    const adapters = githubDraftSweepAdapters((args) => {
+      const endpoint = args[1] ?? '';
+      requests.push(endpoint);
+      if (endpoint === 'graphql') throw new Error('force REST fallback');
+      if (endpoint === 'repos/my/repo/pulls/123') return JSON.stringify({ head: { sha: head } });
+      if (endpoint === `repos/my/repo/pulls/123/reviews?per_page=100&page=1`) return JSON.stringify(Array.from({ length: 100 }, (_, index) => ({
+        state: 'COMMENTED', body: `old review ${index}`, submitted_at: '2026-10-20T00:00:00Z', commit_id: null,
+      })));
+      if (endpoint === `repos/my/repo/pulls/123/reviews?per_page=100&page=2`) return JSON.stringify([{ state: 'APPROVED',
+        body: 'current head approved', submitted_at: '2026-10-21T00:00:00Z', commit_id: head }]);
+      if (endpoint === 'repos/my/repo/issues/123/comments?per_page=100&page=1') return JSON.stringify([{ body: 'VERDICT: PASS' }]);
+      if (endpoint === `repos/my/repo/commits/${head}/status`) return JSON.stringify({ state: 'success' });
+      if (endpoint === `repos/my/repo/commits/${head}/check-runs?per_page=100&page=1`) return JSON.stringify({ check_runs: [{ conclusion: 'success' }] });
+      throw new Error(`unexpected endpoint: ${endpoint}`);
+    });
+    const posture = await adapters.getReviewGate?.({ number: 123, branch: 'self-impl/draft', title: 'draft',
+      labels: [], createdAt: '2026-10-20T00:00:00Z' }, 'my/repo');
+    expect(posture).toMatchObject({ review: 'pass', gate: 'pass', triageReview: 'approved' });
+    expect(requests).toContain('repos/my/repo/pulls/123/reviews?per_page=100&page=2');
+  });
+
+  test('exact-head gate reads all check-run pages before reporting pass', async () => {
+    const head = 'b'.repeat(40);
+    const requests: string[] = [];
+    const adapters = githubDraftSweepAdapters((args) => {
+      const endpoint = args[1] ?? '';
+      requests.push(endpoint);
+      if (endpoint === `repos/my/repo/pulls/123`) return JSON.stringify({ head: { sha: head } });
+      if (endpoint.includes('/pulls/123/reviews?')) return JSON.stringify([]);
+      if (endpoint.includes('/issues/123/comments?')) return JSON.stringify([]);
+      if (endpoint === `repos/my/repo/commits/${head}/status`) return JSON.stringify({ state: 'success' });
+      if (endpoint === `repos/my/repo/commits/${head}/check-runs?per_page=100&page=1`)
+        return JSON.stringify({ check_runs: Array.from({ length: 100 }, () => ({ conclusion: 'success' })) });
+      if (endpoint === `repos/my/repo/commits/${head}/check-runs?per_page=100&page=2`)
+        return JSON.stringify({ check_runs: [{ conclusion: 'failure' }] });
+      throw new Error(`unexpected endpoint: ${endpoint}`);
+    });
+    const posture = await adapters.getReviewGate?.({ number: 123, branch: 'self-impl/draft', title: 'draft', labels: [],
+      createdAt: '2026-10-20T00:00:00Z' }, 'my/repo');
+    expect(posture?.gate).toBe('fail');
+    expect(requests).toContain(`repos/my/repo/commits/${head}/check-runs?per_page=100&page=2`);
+  });
+
+  test('keeps exact-head gate unknown when combined status has no state', async () => {
+    const head = 'c'.repeat(40);
+    const adapters = githubDraftSweepAdapters((args) => {
+      const endpoint = args[1] ?? '';
+      if (endpoint === 'repos/my/repo/pulls/123') return JSON.stringify({ head: { sha: head } });
+      if (endpoint.includes('/pulls/123/reviews?') || endpoint.includes('/issues/123/comments?')) return JSON.stringify([]);
+      if (endpoint === `repos/my/repo/commits/${head}/status`) return JSON.stringify({});
+      if (endpoint === `repos/my/repo/commits/${head}/check-runs?per_page=100&page=1`)
+        return JSON.stringify({ total_count: 1, check_runs: [{ conclusion: 'success' }] });
+      throw new Error(`unexpected endpoint: ${endpoint}`);
+    });
+    const posture = await adapters.getReviewGate?.({ number: 123, branch: 'self-impl/draft', title: 'draft', labels: [],
+      createdAt: '2026-10-20T00:00:00Z' }, 'my/repo');
+    expect(posture).not.toHaveProperty('gate');
+  });
+
   test('draft sweep reads closed PRs only back to the oldest open draft — a large repository does not exhaust pagination', async () => {
     const requests: string[] = [];
     const closedPage = (page: number) => Array.from({ length: 100 }, (_, i) => ({
@@ -1923,7 +2002,14 @@ describe('harness CLI command', () => {
       const ledger = loadRunLedger(runId, runLedgerDir(root))!;
       expect(ledger.filter((entry) => entry.event === 'stop')).toHaveLength(1);
       expect(ledger[0]).toMatchObject({ event: 'start', data: { original: true } });
-      expect(ledger[1]).toMatchObject({ event: 'stop', data: { class: 'pod-died', cause: 'Pod exit 1: pod-failure — OOMKilled', evidenceRef: expect.any(String), nextMove: expect.any(String) } });
+      const stop = readRunStopRecord(ledger[1]!);
+      expect(stop).toBeDefined();
+      const candidateDir = join(root, 'self-implement', 'knowhow-candidates');
+      const files = readdirSync(candidateDir).filter((name) => name.endsWith('.json'));
+      expect(files).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(candidateDir, files[0]!), 'utf8')))
+        .toMatchObject({ reason: 'pod-job-failed', stage: 'pod-exit', occurrences: 1, runIds: [runId] });
+      expect(ledger[1]).toMatchObject({ event: 'stop', data: { class: 'pod-died', terminationReason: 'pod-job-failed', cause: 'Pod exit 1: pod-failure — OOMKilled', evidenceRef: expect.any(String), nextMove: expect.any(String) } });
       expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified', expect.objectContaining({ runId, reason: 'pod-failure', status: 1 }));
       expect(process.exitCode).toBe(1);
       await program.parseAsync(['node', 'elanous', 'harness', 'say', 'a request', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
@@ -4075,9 +4161,10 @@ describe('recordHarnessPodStop — AUT-POD-EXIT-UNCLASSIFIED wiring', () => {
       expect(recordHarnessPodStop(runId, 1, { reason: 'no-launch', lines: ['Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라'] }, output, { loadLedger: noLedger, write: write as never })).toBe(true);
       expect(logSpy.mock.calls.some(([, event]) => event === 'exit-classified-detail')).toBe(false);
     } finally { logSpy.mockRestore(); }
-    expect(Object.keys(entries[0]!.data).sort()).toEqual(['cause', 'class', 'evidenceRef', 'nextMove']);
+    expect(Object.keys(entries[0]!.data).sort()).toEqual(['cause', 'class', 'evidenceRef', 'nextMove', 'site']);
     expect(entries[0]!.data).toEqual({
       class: 'launch-failed',
+      site: 'pod-exit',
       cause: 'Pod exit 1: no-launch — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라',
       evidenceRef: `logs:harness.pod/exit-classified:${runId}`,
       nextMove: 'Check Pod launch gate and pool, then relaunch',
@@ -4089,7 +4176,7 @@ describe('recordHarnessPodStop — AUT-POD-EXIT-UNCLASSIFIED wiring', () => {
     const { entries, write } = capture();
     expect(recordHarnessPodStop(runId, 137, { reason: 'OOMKilled', lines: ['Pod 종료 출력에서 확인한 원인: OOMKilled'] }, 'OOMKilled', { loadLedger: noLedger, write: write as never })).toBe(true);
     expect(entries[0]!.data).toEqual({
-      class: 'pod-died', cause: 'Pod exit 137: OOMKilled', evidenceRef: `logs:harness.pod/exit-classified:${runId}`,
+      class: 'pod-died', site: 'pod-exit', cause: 'Pod exit 137: OOMKilled', evidenceRef: `logs:harness.pod/exit-classified:${runId}`,
       nextMove: 'Inspect Pod exit classification and harvest the branch before relaunch',
     });
   });

@@ -226,8 +226,8 @@ test('GET /v1/graphs reads real YAML, retains labelled research branches and den
   const list = await request('/v1/graphs');
   expect(list?.status).toBe(200);
   const graphs = (await list!.json() as { graphs: Array<{ id: string; source: string; editable: boolean; nodeCount: number }> }).graphs;
-  // recover@1 및 성공/사람 개입 종결 노드가 추가된 YAML의 현재 목록이다.
-  expect(graphs).toContainEqual({ id: 'research-loop', source: 'core', editable: false, nodeCount: 10 });
+  const researchListItem = graphs.find((graph) => graph.id === 'research-loop');
+  expect(researchListItem).toMatchObject({ id: 'research-loop', source: 'core', editable: false, nodeCount: 26 });
 
   const response = await request('/v1/graphs/research-loop');
   expect(response?.status).toBe(200);
@@ -236,7 +236,9 @@ test('GET /v1/graphs reads real YAML, retains labelled research branches and den
     nodes: Array<{ node_id: string; kind: string; recipe: string; max_visits: number }>;
     edges: Array<{ from: string; on?: string; map?: Record<string, string> }>;
   };
-  expect(detail.entry_node).toBe('investigate');
+  expect(detail.entry_node).toBe('intake');
+  expect(researchListItem?.nodeCount).toBe(detail.nodes.length);
+  expect(detail.nodes.map((node) => node.node_id)).toEqual(expect.arrayContaining(['intake', 'investigate', 'landed', 'needs-human']));
   expect(detail.terminal_nodes).toEqual(['landed', 'needs-human']);
   expect(detail.nodes).toContainEqual({ node_id: 'investigate', kind: 'agent', recipe: 'headless-goal-loop', max_visits: 7 });
   expect(detail.edges.find((edge) => edge.from === 'investigate')).toMatchObject({

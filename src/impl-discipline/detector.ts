@@ -1,6 +1,6 @@
 // Phase detector for implementation discipline.
 //
-// Given the current turn's user text, classify into one of three
+// Given the current turn's user text, classify into one of four
 // phases. The system-prompt builder reads this result to decide
 // which discipline guidance (if any) to inject as a system message.
 //
@@ -8,15 +8,16 @@
 //   plan-loaded         — PLAN-*.md / HANDOFF-*.md / SPEC-*.md file-ref
 //                         OR Korean/English doc keyword (핸드오프, 플랜
 //                         문서, handoff, plan doc, 스펙 문서).
+//   design-first        — implementation request contains an explicit new
+//                         project, empty repository, or from-scratch signal.
 //   implementation-ready — starts with an implementation verb
 //                         (구현/implement/build/포팅/port/만들어) AND
 //                         NOT paired with an exploration verb
 //                         (설명/분석/리뷰).
 //   idle                — everything else.
 //
-// plan-loaded wins over implementation-ready when both would fire —
-// when a plan doc is in play, the LLM must read-and-confirm before
-// diving into edits, even if the user also said "구현해".
+// An explicit new-project request wins over plan-loaded; otherwise the
+// existing plan-loaded and implementation-ready precedence is unchanged.
 
 import type { DetectInput, ImplPhase } from './types.js';
 
@@ -38,6 +39,11 @@ const DOC_KEYWORDS = [
 ];
 
 const IMPL_VERB_RE = /(^|[\s\u3000])(구현|implement|build|포팅|port|만들어)/i;
+const PROJECT_IMPL_VERB_RE = /(^|[\s\u3000])(구현|implement|build|포팅|port|개발|develop|생성|create|만들어)/i;
+const NEW_PROJECT_SIGNAL_RE = /(?:새(?:로운)?\s*(?:저장소|프로젝트)|빈\s*저장소|(?:new|empty)\s+(?:repository|repo|project)\b)/i;
+const FROM_SCRATCH_RE = /(?:\bfrom\s+scratch\b|처음부터)/i;
+const PROJECT_TARGET_RE = /(?:\b(?:project|app|service)\b|프로젝트|앱|서비스|웹앱)/i;
+const FUNCTION_TARGET_RE = /(?:함수|function|method)/i;
 
 // Exploration verbs that, when co-occurring with an implementation
 // verb, downgrade the turn to idle. "이 함수 구현 방식 분석해줘"
@@ -57,6 +63,12 @@ export function detectImplPhase(input: DetectInput): ImplPhase {
   const trimmed = raw.trim();
   if (!trimmed) return 'idle';
   const lower = trimmed.toLowerCase();
+
+  const explicitProjectScope = NEW_PROJECT_SIGNAL_RE.test(trimmed)
+    || (FROM_SCRATCH_RE.test(trimmed) && PROJECT_TARGET_RE.test(trimmed) && !FUNCTION_TARGET_RE.test(trimmed));
+  if (explicitProjectScope && PROJECT_IMPL_VERB_RE.test(trimmed)) {
+    return 'design-first';
+  }
 
   if (FILE_REF_RE.test(trimmed) || hasDocKeyword(lower)) {
     return 'plan-loaded';

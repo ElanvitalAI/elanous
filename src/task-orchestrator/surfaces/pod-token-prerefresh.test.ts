@@ -170,6 +170,24 @@ describe('PREREFRESH-LOCK — per-account refresh serialization', () => {
     expect([...events].sort()).toEqual(['refresh-skipped-already-fresh', 'refreshed']);
   });
 
+  test('lease transfer while queued for the account lock prevents refresh', async () => {
+    const { homes, credentials } = fixture(2.5);
+    let leaseChecks = 0;
+    let refreshCalls = 0;
+    const { deps, events } = lockDeps(homes, credentials, async () => {
+      refreshCalls++;
+      return { ok: true, beforeH: 2.5, afterH: 240 };
+    });
+    const cred = await podCodexCredentialWithPrerefresh('third', {
+      ...deps,
+      isLeaseHolder: () => ++leaseChecks === 1,
+    });
+    expect(cred).toBeNull();
+    expect(leaseChecks).toBe(2);
+    expect(refreshCalls).toBe(0);
+    expect(events).toEqual(['no-lease']);
+  });
+
   test('refresh fails but the re-check shows a fresh credential (a peer refreshed it) → account kept', async () => {
     const { homes, credentials } = fixture(2.5);
     const { deps, events } = lockDeps(homes, credentials, async (name) => {

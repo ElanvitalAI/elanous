@@ -14,9 +14,12 @@
  *   이미지는 표준판(elanous-harness)만 — 이 발사 경로는 lite 를 쓰지 않는다.
  */
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { debug } from '../../debug/log.js';
-import { memberHasRegistry, registryImageRef, type RemoteRun } from './pod-pool.js';
+import { memberHasRegistry, registryImageRef, syncPoolImages, parsePodPool, type PodPoolMember, type RemoteRun } from './pod-pool.js';
 
 const POD_IMAGE = 'elanous-harness';
 
@@ -57,6 +60,91 @@ export function resolvePodImageSource(
   const commit = raw.trim().toLowerCase();
   const registry = podImageRegistry(deps.env ?? process.env);
   return { kind: 'pinned', ref: podImageRef(registry, commit), commit, registry };
+}
+
+export interface PodShelfImage { readonly commit: string; readonly image: string; readonly action: 'fresh' | 'built' }
+
+export function resolvePodShelfRef(ref: string, cwd = process.cwd(), exec = spawnSync): string {
+  const requested = ref.trim();
+  if (!requested || requested.startsWith('-') || /[\s\x00-\x1f]/u.test(requested)) throw new Error('pod shelf: invalid ref');
+  const spec = /^#?(\d+)$/u.exec(requested);
+  if (spec) {
+    const pr = exec('gh', ['pr', 'view', spec[1]!, '--json', 'headRefOid', '--jq', '.headRefOid'], { cwd, encoding: 'utf8', timeout: 30_000 });
+    const sha = String(pr.stdout ?? '').trim().toLowerCase();
+    if (pr.status !== 0 || !/^[0-9a-f]{40}$/u.test(sha)) throw new Error(`pod shelf: PR head unavailable: ${requested}`);
+    return sha;
+  }
+  const git = exec('git', ['rev-parse', '--verify', `${requested}^{commit}`], { cwd, encoding: 'utf8', timeout: 30_000 });
+  const sha = String(git.stdout ?? '').trim().toLowerCase();
+  if (git.status !== 0 || !/^[0-9a-f]{40}$/u.test(sha)) throw new Error(`pod shelf: ref unavailable: ${requested}`);
+  return sha;
+}
+
+/** Checkout only the requested commit; syncPoolImages retains its per-host build lock and SHA12 registry check. */
+export async function putPodShelfImage(ref: string, pool: string, deps: {
+  resolve?: (ref: string) => string;
+  sync?: typeof syncPoolImages;
+  checkout?: (commit: string, dir: string) => void;
+  tempDir?: () => string;
+  remove?: (dir: string) => void;
+  hasRegistry?: (member: PodPoolMember) => boolean;
+} = {}): Promise<PodShelfImage> {
+  const members = parsePodPool(pool);
+  if (members.length !== 1 || !members[0]!.sshHost) throw new Error('pod shelf: one remote registry pool member is required');
+  const member: PodPoolMember = members[0]!;
+  if (!(deps.hasRegistry ?? memberHasRegistry)(member)) throw new Error('pod shelf: remote registry unavailable');
+  const commit = (deps.resolve ?? resolvePodShelfRef)(ref);
+  if (!/^[0-9a-f]{40}$/u.test(commit)) throw new Error('pod shelf: full commit required');
+  const registry = member.registry ?? podImageRegistry();
+  const image = podImageRef(registry, commit);
+  if (!deps.sync && registryImageRef(member, commit) === image) return { commit, image, action: 'fresh' };
+  const dir = (deps.tempDir ?? (() => mkdtempSync(join(tmpdir(), 'pod-shelf-'))))();
+  try {
+    if (deps.checkout) deps.checkout(commit, dir);
+    else {
+      const clone = spawnSync('git', ['clone', '-q', '--no-checkout', process.cwd(), dir], { encoding: 'utf8', timeout: 120_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      if (clone.status !== 0) throw new Error(`pod shelf: clone failed: ${clone.stderr}`);
+      const fetch = spawnSync('git', ['-C', dir, 'fetch', '-q', 'origin', commit], { encoding: 'utf8', timeout: 120_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      if (fetch.status !== 0) {
+        const remote = spawnSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+        if (remote.status !== 0) throw new Error(`pod shelf: fetch failed: ${fetch.stderr}`);
+        const fromOrigin = spawnSync('git', ['-C', dir, 'fetch', '-q', String(remote.stdout).trim(), commit], { encoding: 'utf8', timeout: 120_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+        if (fromOrigin.status !== 0) throw new Error(`pod shelf: fetch failed: ${fromOrigin.stderr}`);
+      }
+      const checkout = spawnSync('git', ['-C', dir, 'checkout', '--detach', commit], { encoding: 'utf8', timeout: 120_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      if (checkout.status !== 0) throw new Error(`pod shelf: checkout failed: ${checkout.stderr}`);
+    }
+    const sync = deps.sync ?? syncPoolImages;
+    const results = await sync([member], 'elanous-harness:local', commit, {
+      buildScript: join(dir, 'docker/harness/build.sh'),
+      ...(deps.sync ? {} : { ship: () => ({ ok: false, action: 'failed' as const, detail: 'shelf build failed; local image fallback prohibited' }) }),
+      remoteBuild: deps.sync ? undefined : async (host, cluster, registry) => {
+        const { spawn } = await import('node:child_process');
+        return new Promise((done) => {
+          const child = spawn('bash', [join(dir, 'docker/harness/build.sh')], { env: { ...process.env, ELANOUS_BUILD_REMOTE: host, ELANOUS_L2_CLUSTER: cluster, ...(registry ? { ELANOUS_BUILD_REGISTRY: registry } : {}) }, stdio: ['ignore', 'pipe', 'pipe'] });
+          let output = '';
+          child.stdout.on('data', (chunk) => { output += chunk; });
+          child.stderr.on('data', (chunk) => { output += chunk; });
+          child.on('close', (code) => done({ ok: code === 0, detail: output.slice(-300) }));
+          child.on('error', (error) => done({ ok: false, detail: error.message }));
+        });
+      },
+    });
+    const result = results.get(member.context);
+    if (!result?.ok || result.imageRef !== image) throw new Error(`pod shelf: image unavailable: ${result?.detail ?? image}`);
+    return { commit, image, action: result.action === 'fresh' ? 'fresh' : 'built' };
+  } finally { (deps.remove ?? ((path) => rmSync(path, { recursive: true, force: true })))(dir); }
+}
+
+export function listPodShelfImages(pool: string, run: RemoteRun): string[] {
+  const member = parsePodPool(pool)[0];
+  if (!member?.sshHost) throw new Error('pod shelf: remote pool member required');
+  const registry = member.registry ?? podImageRegistry();
+  const port = registry.slice(registry.lastIndexOf(':') + 1);
+  const result = run(member.sshHost, `curl -fsS --max-time 5 http://localhost:${port}/v2/elanous-harness/tags/list 2>/dev/null`);
+  if (result.status !== 0) throw new Error(`pod shelf: registry unavailable: ${result.stderr}`);
+  const tags: unknown = JSON.parse(result.stdout).tags;
+  return Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === 'string' && /^[0-9a-f]{12}$/u.test(tag)).map((tag) => `${registry}/elanous-harness:${tag}`) : [];
 }
 
 export function podImageMissingMessage(ref: string): string {

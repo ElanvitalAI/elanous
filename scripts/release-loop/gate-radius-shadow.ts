@@ -38,7 +38,7 @@ function blob(repo: string, commit: string, file: string): unknown {
 }
 
 /** Remove only the fields version-node itself changes; any other JSON difference leaves a full shadow plan. */
-function versionOnlyBumps(repo: string, from: string, to: string, version: string, changed: readonly string[]): string[] {
+export function versionOnlyBumps(repo: string, from: string, to: string, version: string, changed: readonly string[]): string[] {
   if (!changed.includes('package.json')) return [];
   const prior = blob(repo, from, 'package.json') as Record<string, unknown>;
   const next = blob(repo, to, 'package.json') as Record<string, unknown>;

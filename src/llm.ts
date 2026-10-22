@@ -19,11 +19,13 @@ import {
   getOpenAIApiKey, OPENAI_MODEL, OPENAI_API_URL,
   getAnthropicApiKey, ANTHROPIC_MODEL, ANTHROPIC_API_URL,
   getOpenRouterApiKey, OPENROUTER_API_URL, OPENROUTER_MODEL,
+  getOpenGatewayApiKey, OPENGATEWAY_API_URL, OPENGATEWAY_MODEL,
   getLocalLLMUrl, LOCAL_LLM_MODEL,
   getGeminiApiKey, GEMINI_MODEL,
   DEFAULT_PROVIDER,
 } from './config.js';
 import { debug, redactSecrets, redactSecretText } from './debug/log.js';
+import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
 import { ACTION_PHASE_OPS_TOOLS, isSteeredShellRejection, REPAIR_PHASE_READ_ONLY_OPS_TOOLS } from './llm/tool-loop-steered-rejection.js';
@@ -354,6 +356,8 @@ export interface LLMOpts {
   onUsage?(usage: LLMUsage): void;
   /** Optional model role attached to this request's usage observation. */
   usageRole?: ModelRole;
+  /** Optional per-call metering phase; absent calls keep the existing ledger shape. */
+  usagePhase?: string;
   /** Optional streamLLM usage-ledger site override (defaults to "stream-llm"). */
   usageSite?: string;
   /**
@@ -1229,8 +1233,10 @@ export async function* parseOpenAISSELines(
     }
   };
   for await (const line of lines as AsyncIterable<string>) {
-    if (!line.startsWith('data: ')) continue;
-    const data = line.slice(6).trim();
+    // SSE permits both `data: {...}` and `data:{...}`. OpenGateway emits
+    // the latter, so requiring a space silently discarded its whole stream.
+    if (!line.startsWith('data:')) continue;
+    const data = line.slice(5).trim();
     if (data === '[DONE]') continue;
     let parsed: any;
     try { parsed = JSON.parse(data); } catch { continue; }
@@ -1413,6 +1419,7 @@ function retryOptsFor(
 
 function inferOpenAIProviderName(url: string): string {
   if (/^https?:\/\/openrouter\.ai(?::\d+)?(?:\/|$)/i.test(url)) return 'openrouter';
+  if (/^https?:\/\/apis\.opengateway\.ai(?::\d+)?(?:\/|$)/i.test(url)) return 'opengateway';
   if (url.includes('x.ai')) return 'grok';
   if (url.includes('openai.com')) return 'openai';
   if (url.includes('localhost') || url.includes('127.0.0.1')) return 'local';
@@ -4044,6 +4051,14 @@ export const PROVIDERS: Record<string, LLMProvider> = {
     streamChat: (messages, opts = {}) => makeOpenRouterProvider({ provider: 'openrouter' }).streamChat!(messages, opts),
     chat: (messages, opts = {}) => makeOpenRouterProvider({ provider: 'openrouter' }).chat!(messages, opts),
   },
+  // Explicit choice only. A new key never changes the established auto-provider order.
+  opengateway: {
+    name: 'opengateway',
+    get defaultModel() { return OPENGATEWAY_MODEL; },
+    available: () => !!getOpenGatewayApiKey(),
+    streamChat: (messages, opts = {}) => makeOpenGatewayProvider({ provider: 'opengateway' }).streamChat!(messages, opts),
+    chat: (messages, opts = {}) => makeOpenGatewayProvider({ provider: 'opengateway' }).chat!(messages, opts),
+  },
   bedrock: BedrockProvider, // 명시 선택 전용 — 자동 순서·폴백 체인에 «안» 넣는다(src/llm/bedrock-provider.ts)
 };
 
@@ -4231,13 +4246,15 @@ export function decideProviderForConfig(
       return { provider, model: selectedModel, auth: baseUrl || getLocalLLMUrl() ? 'local' : 'none' };
     case 'openrouter':
       return { provider, model: selectedModel, auth: apiKey || getOpenRouterApiKey() ? 'apikey' : 'none' };
+    case 'opengateway':
+      return { provider, model: selectedModel, auth: apiKey || getOpenGatewayApiKey() ? 'apikey' : 'none' };
     case 'bedrock': return { provider, model: selectedModel, auth: authKindForProvider('bedrock', selectedModel) };
   }
   throw new Error(`unknown provider: ${provider as string}`);
 }
 
 function isKnownProviderName(provider: string): provider is ConcreteProviderName {
-  return provider === 'grok' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic' || provider === 'gemini' || provider === 'local' || provider === 'openrouter' || provider === 'bedrock';
+  return provider === 'grok' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic' || provider === 'gemini' || provider === 'local' || provider === 'openrouter' || provider === 'opengateway' || provider === 'bedrock';
 }
 
 function authKindForProvider(provider: string, model: string, apiKey?: string): ProviderDecisionAuth {
@@ -4252,6 +4269,7 @@ function authKindForProvider(provider: string, model: string, apiKey?: string): 
   if (provider === 'anthropic') return getAnthropicApiKey() ? 'apikey' : 'none';
   if (provider === 'gemini') return getGeminiApiKey() ? 'apikey' : 'none';
   if (provider === 'openrouter') return getOpenRouterApiKey() ? 'apikey' : 'none';
+  if (provider === 'opengateway') return getOpenGatewayApiKey() ? 'apikey' : 'none';
   if (provider === 'bedrock') return BedrockProvider.available() ? 'apikey' : 'none';
   if (provider === 'openai-codex') {
     try {
@@ -4272,6 +4290,7 @@ function defaultModelForProvider(provider: ConcreteProviderName): string {
     case 'gemini': return GEMINI_MODEL;
     case 'local': return LOCAL_LLM_MODEL;
     case 'openrouter': return OPENROUTER_MODEL;
+    case 'opengateway': return OPENGATEWAY_MODEL;
     case 'bedrock': return BedrockProvider.defaultModel;
   }
   throw new Error(`unknown provider: ${provider as string}`);
@@ -4837,7 +4856,7 @@ export async function streamLLM(
     if (consumed.ok) {
       if (consumed.usage !== 'unmeasured') {
         try {
-          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole });
+          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase });
         } catch { /* best-effort observation */ }
       }
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'ok', kind: 'streamLLM', durationMs: Date.now() - started });
@@ -8069,15 +8088,17 @@ export function billingRouteForProvider(provider: string | undefined, model: str
 }
 
 /** Observe usage with optional site/role metadata; a provider-name string remains supported. */
-export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: ModelRole }): void {
+export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: ModelRole; phase?: string }): void {
   try {
     const providerName = typeof providerNameOrOptions === 'string' ? providerNameOrOptions : providerNameOrOptions?.providerName;
     const site = (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.site) ?? 'agent-turn';
     const role = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.role;
+    const phase = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.phase;
     const billing = billingRouteForProvider(providerName, model);
     debug.log('llm.usage', 'llm-usage', {
       site,
       ...(role !== undefined ? { role } : {}),
+      ...(phase !== undefined ? { phase } : {}),
       model,
       ...(usage.provider !== undefined && { provider: usage.provider }),
       // ⭐ `provider` 는 «선 어댑터»(openai/anthropic)다 — 과금 주체는 별칭 칸으로(BACKLOG B10).
@@ -8126,6 +8147,84 @@ export function attachFinalAnswerSupplement(
   return base + '\n\n' + supplement.trim();
 }
 
+export const GPT6_CODEX_GUARD_IDS = [
+  'anchor-grep',
+  'anchor-read',
+  'literal-glob',
+  'search-only-streak',
+  'post-read-broad-search',
+  'same-args-dedup',
+  'broad-spot-repeat',
+  'exploration-budget',
+  'inspect-budget',
+  'followup-hard-stop',
+  'max-turns',
+  'force-synthesis',
+] as const;
+export type Gpt6CodexGuardId = typeof GPT6_CODEX_GUARD_IDS[number];
+export type Gpt6CodexGuardStats = Record<Gpt6CodexGuardId, { wouldBlock: number; blocked: number }>;
+
+type Gpt6CodexGuardFlags = Record<Gpt6CodexGuardId, boolean>;
+const GPT6_CODEX_GUARD_DEFAULTS: Gpt6CodexGuardFlags = Object.fromEntries(
+  GPT6_CODEX_GUARD_IDS.map((id) => [id, false]),
+) as Gpt6CodexGuardFlags;
+let gpt6CodexGuardOverrides: Partial<Gpt6CodexGuardFlags> = {};
+const gpt6CodexGuardStats: Gpt6CodexGuardStats = Object.fromEntries(
+  GPT6_CODEX_GUARD_IDS.map((id) => [id, { wouldBlock: 0, blocked: 0 }]),
+) as Gpt6CodexGuardStats;
+
+export function getGpt6CodexGuardFlags(): Gpt6CodexGuardFlags {
+  return { ...GPT6_CODEX_GUARD_DEFAULTS, ...gpt6CodexGuardOverrides };
+}
+
+export function getGpt6CodexGuardStats(): Gpt6CodexGuardStats {
+  return Object.fromEntries(
+    GPT6_CODEX_GUARD_IDS.map((id) => [id, { ...gpt6CodexGuardStats[id] }]),
+  ) as Gpt6CodexGuardStats;
+}
+
+export function resetGpt6CodexGuardObservations(): void {
+  for (const id of GPT6_CODEX_GUARD_IDS) {
+    gpt6CodexGuardStats[id].wouldBlock = 0;
+    gpt6CodexGuardStats[id].blocked = 0;
+  }
+}
+
+/** @internal Test seam for the staged GPT-6 guard rollout. */
+export function _setGpt6CodexGuardFlagsForTest(flags: Partial<Gpt6CodexGuardFlags> | undefined): void {
+  gpt6CodexGuardOverrides = flags ? { ...flags } : {};
+}
+
+// Counter semantics (GPT-6 models only): `wouldBlock` = the guard predicate held;
+// `blocked` = the guard actually stopped/rejected. Grace burns and arming are NOT blocks.
+// `force-synthesis` is an intervention, not a rejection: blocked = the no-tools pass was
+// attempted; its met/unmet outcome is told apart only by events (`force-synthesis-pass.emitted`
+// vs `synthesis-ignored.hard-stop`).
+// ⚠️ Scope: the tally is module-level (process-global) — concurrent streams in one process
+// add into the same counters; there is no per-stream / per-run split.
+function gpt6CodexGuardEnabled(id: Gpt6CodexGuardId, model: string, legacyEnabled = false): boolean {
+  // Rollout flags may add guards, but cannot disable behavior already active.
+  return !isGpt6GenerationModel(model) || legacyEnabled || getGpt6CodexGuardFlags()[id];
+}
+
+function noteGpt6CodexGuard(id: Gpt6CodexGuardId, model: string, blocked: boolean): void {
+  if (!isGpt6GenerationModel(model)) return;
+  gpt6CodexGuardStats[id].wouldBlock++;
+  if (blocked) gpt6CodexGuardStats[id].blocked++;
+}
+
+function applyCodexBehaviorGuard(
+  id: Gpt6CodexGuardId,
+  model: string,
+  wouldBlock: boolean,
+  legacyEnabled = false,
+): boolean {
+  if (!wouldBlock) return false;
+  const enabled = gpt6CodexGuardEnabled(id, model, legacyEnabled);
+  noteGpt6CodexGuard(id, model, enabled);
+  return enabled;
+}
+
 export async function streamLLMWithTools(
   messages: LLMMessage[],
   handlers: StreamWithToolsHandlers,
@@ -8141,14 +8240,14 @@ export async function streamLLMWithTools(
   let blockedProviders: ProviderFallbackAttempt[] = [];
   const effectiveModel = activeModel;
   const modelFamily = getModelFamily(effectiveModel);
-  // TUI-GPT6-GUARD-PARITY — codex «모델 행동» 가드 켬 여부(단일 원천 = models/prompts.ts
-  // usesCodexBehaviorGuards). gpt-6 세대도 true. 넓힌 자리·안 넓힌 자리는 그 함수 주석이 정본.
+  // Preserve pre-existing GPT-6 behavior while observing Codex-only sites.
   const codexBehaviorGuards = usesCodexBehaviorGuards(effectiveModel);
+  const codexGuardCandidate = codexBehaviorGuards || isGpt6GenerationModel(effectiveModel);
   debug.log('llm.router', 'streamLLMWithTools', {
     provider: provider.name,
     model: effectiveModel,
     modelFamily,
-    codexBehaviorGuards,
+    codexBehaviorGuards: codexGuardCandidate,
     messageCount: messages.length,
     messageRoles: summarizeRoles(messages),
     tools: opts.tools?.map(t => t.name),
@@ -8872,7 +8971,7 @@ export async function streamLLMWithTools(
         // ⭐ 주 에이전트 턴의 토큰·비용을 «게이트 없이» 남긴다(2026-09-24 실측: 이 줄이 없어 3시간 `llm.usage`
         //   18행이 전부 곁가지 두 자리였고, 하니스 런 비용의 거의 전부가 관측 밖이었다). 곁가지와 같은 모양 ·
         //   모르는 모델은 금액 대신 `cost.kind='unknown'`. runId 는 debug.log 가 붙인다. 실패해도 턴은 계속.
-        logAgentTurnUsage(activeModel, ev.usage, { providerName: activeProvider.name, role: opts.usageRole });
+        logAgentTurnUsage(activeModel, ev.usage, { providerName: activeProvider.name, role: opts.usageRole, phase: opts.usagePhase });
         // Wave A1 (2026-05-04) — turn-level cache hit rate forensic.
         // Each provider's usage event carries inputTokens / outputTokens
         // / cacheReadInputTokens (when cache hit). Emit the per-turn
@@ -9087,19 +9186,27 @@ export async function streamLLMWithTools(
     // the notice in a tool_result but keeps making tool calls until
     // maxTurns hard-stops it, producing 0 chars of output. Hard
     // rejection forces the synthesis that soft pressure couldn't.
-    const inSynthesisPhase =
+    const inSynthesisPhase = applyCodexBehaviorGuard(
+      'max-turns',
+      effectiveModel,
       !terminalOnlyTurn
-      && maxTurns >= BUDGET_WARNING_MIN_TURNS
-      && turn >= maxTurns - FINAL_SYNTHESIS_TURNS;
-    const codexInspectionStillProgressing =
-      modelFamily === 'codex'
+        && maxTurns >= BUDGET_WARNING_MIN_TURNS
+        && turn >= maxTurns - FINAL_SYNTHESIS_TURNS,
+      true,
+    );
+    const codexInspectionStillProgressing = codexGuardCandidate
+      && (modelFamily === 'codex' || getGpt6CodexGuardFlags()['inspect-budget'])
       && autoNarrowedReadCount > 0
       && autoNarrowedReadCount < inspectBudgetThreshold;
-    const inExplorationSynthesisPhase =
+    const inExplorationSynthesisPhase = applyCodexBehaviorGuard(
+      'exploration-budget',
+      effectiveModel,
       !terminalOnlyTurn
-      && exploratoryTurnStreak >= explorationThresholdForTurn
-      && isExploratoryTurn(pendingCalls)
-      && !codexInspectionStillProgressing;
+        && exploratoryTurnStreak >= explorationThresholdForTurn
+        && isExploratoryTurn(pendingCalls)
+        && !codexInspectionStillProgressing,
+      true,
+    );
     const inInspectSynthesisPhase =
       !terminalOnlyTurn
       && inspectSynthesisArmed
@@ -9232,8 +9339,19 @@ export async function streamLLMWithTools(
       // as in the original PR #768 design. Forensic events at both the
       // grace-burn and the hard-stop branches so log/latest can audit
       // exactly which path each turn took.
-      const codexImmediateInspectStop = inInspectSynthesisPhase && modelFamily === 'codex';
-      const codexImmediateRepairStop = inRepairActionPhase && modelFamily === 'codex';
+      // followup-hard-stop counting happens once per turn below the grace branches:
+      // wouldBlock when any predicate held, blocked only when a grace=0 immediate stop fired.
+      const followupHardStopEnabled = codexGuardCandidate
+        && gpt6CodexGuardEnabled('followup-hard-stop', effectiveModel);
+      const followupInspectActionHeld =
+        inInspectActionPhase
+        && !verifyActionArmed
+        && editedFilePaths.length === 0
+        && !executionLoopState.lastCommand;
+      const followupHardStopHeld = codexGuardCandidate
+        && (inInspectSynthesisPhase || inRepairActionPhase || followupInspectActionHeld);
+      const codexImmediateInspectStop = inInspectSynthesisPhase && followupHardStopEnabled;
+      const codexImmediateRepairStop = inRepairActionPhase && followupHardStopEnabled;
       // codexImmediateInspectActionStop predicate (PR #768 original):
       // restricted to pure-exploration state (no edits applied AND no
       // execution attempted). When edits/execution already happened the
@@ -9241,12 +9359,13 @@ export async function streamLLMWithTools(
       // logic (`buildFinalizationPolicySnapshot` → `[FINAL ANSWER
       // REQUIRED]`) can run — that branch produces a tailored "verify
       // done, just write the answer" UX which we must not preempt.
-      const codexImmediateInspectActionStop =
-        inInspectActionPhase
-        && modelFamily === 'codex'
-        && !verifyActionArmed
-        && editedFilePaths.length === 0
-        && !executionLoopState.lastCommand;
+      const codexImmediateInspectActionStop = followupInspectActionHeld && followupHardStopEnabled;
+      if (followupHardStopHeld) {
+        noteGpt6CodexGuard('followup-hard-stop', effectiveModel,
+          (codexImmediateInspectStop && codexInspectSynthesisGrace <= 0)
+          || (codexImmediateRepairStop && codexRepairActionGrace <= 0)
+          || (codexImmediateInspectActionStop && codexInspectActionGrace <= 0));
+      }
       if (codexImmediateInspectStop && codexInspectSynthesisGrace <= 0) {
         debug.log('llm.router', 'tool-loop.inspect-synthesis-phase.codex-immediate-stop', {
           turn,
@@ -9370,7 +9489,11 @@ export async function streamLLMWithTools(
         inspectRejectionCount++;
         explorationRejectionCount = 0;
         synthesisRejectionCount = 0;
-        if (modelFamily === 'codex' || inspectRejectionCount >= 2) {
+        // Already tallied above (followupHardStopHeld) — no second count for the same turn.
+        // When followupHardStopEnabled is true this branch is unreachable for this phase
+        // (codexImmediateInspectStop takes the turn), so a stop here is the generic
+        // second-rejection path, not the GPT-6 guard — it is intentionally not `blocked`.
+        if (followupHardStopEnabled || inspectRejectionCount >= 2) {
           hardStopText = buildIgnoredSynthesisNotice('inspect');
         }
       } else if (inInspectActionPhase) {
@@ -9985,7 +10108,7 @@ export async function streamLLMWithTools(
           debug.log('llm.router', 'tool-loop.dedup-blocked', { turn, tool: call.name, signature: signatureOf(call), priorCount: repeatedError.count, threshold: DEDUP_THRESHOLD, reason: 'repeated-error' });
           return { result: `${buildDedupStub(call, repeatedError.count)} Every one of those calls failed with the same error: ${repeatedError.error.slice(0, 200)}`, isError: false, phaseRejected: false };
         }
-        if (codexBehaviorGuards && EXPLORATORY_TOOLS.has(call.name)) {
+        if (codexGuardCandidate && EXPLORATORY_TOOLS.has(call.name)) {
           // W4-anchor — Anchor file Grep blocking. AGENTS.md / CLAUDE.md
           // are already in the system prompt; greppling them is pure
           // token waste and trains codex to ignore the in-prompt copy.
@@ -9993,7 +10116,7 @@ export async function streamLLMWithTools(
           // every attempt gets the redirect. No threshold — anchor
           // grep is structurally redundant.
           const anchor = isAnchorGrep(call);
-          if (anchor !== null) {
+          if (anchor !== null && applyCodexBehaviorGuard('anchor-grep', effectiveModel, true, true)) {
             if (debug.enabled) {
               debug.log('llm.router', 'tool-loop.anchor-grep-blocked', {
                 turn,
@@ -10042,6 +10165,7 @@ export async function streamLLMWithTools(
             && autoNarrowedReadCount === 0
             && searchOnlyTurnStreak >= 3
             && SEARCH_ONLY_TOOLS.has(call.name)
+            && applyCodexBehaviorGuard('search-only-streak', effectiveModel, true, true)
           ) {
             if (debug.enabled) {
               debug.log('llm.router', 'tool-loop.search-only-streak-blocked', {
@@ -10087,7 +10211,7 @@ export async function streamLLMWithTools(
               }
               return false;
             })();
-            if (isBroadPostRead) {
+            if (isBroadPostRead && applyCodexBehaviorGuard('post-read-broad-search', effectiveModel, true, true)) {
               if (debug.enabled) {
                 debug.log('llm.router', 'tool-loop.post-read-broad-blocked', {
                   turn,
@@ -10122,7 +10246,7 @@ export async function streamLLMWithTools(
           // decided per-call by `anchorStubContext`, which inspects the
           // fences in `messages`. Companion to W4-anchor (Grep).
           const anchorRead = isAnchorRead(call);
-          if (anchorRead !== null) {
+          if (anchorRead !== null && applyCodexBehaviorGuard('anchor-read', effectiveModel, true, true)) {
             if (debug.enabled) {
               debug.log('llm.router', 'tool-loop.anchor-read-blocked', {
                 turn,
@@ -10150,7 +10274,7 @@ export async function streamLLMWithTools(
           // path is the next step. Block FIRST so the model is steered
           // to Read directly instead of Glob → Read pair.
           const literalPath = literalGlobPath(call);
-          if (literalPath !== null) {
+          if (literalPath !== null && applyCodexBehaviorGuard('literal-glob', effectiveModel, true, true)) {
             if (debug.enabled) {
               debug.log('llm.router', 'tool-loop.literal-glob-blocked', {
                 turn,
@@ -10179,7 +10303,8 @@ export async function streamLLMWithTools(
           const sig = signatureOf(call);
           const priorCount = seenToolCallSignatures.get(sig) ?? 0;
           seenToolCallSignatures.set(sig, priorCount + 1);
-          if (priorCount + 1 >= DEDUP_THRESHOLD) {
+          if (priorCount + 1 >= DEDUP_THRESHOLD
+            && applyCodexBehaviorGuard('same-args-dedup', effectiveModel, true, true)) {
             const stub = buildDedupStub(call, priorCount);
             if (debug.enabled) {
               debug.log('llm.router', 'tool-loop.dedup-blocked', {
@@ -10199,7 +10324,8 @@ export async function streamLLMWithTools(
           if (spotInfo !== null) {
             const priorSpot = seenBroadSpots.get(spotInfo.key) ?? 0;
             seenBroadSpots.set(spotInfo.key, priorSpot + 1);
-            if (priorSpot + 1 >= spotInfo.threshold) {
+            if (priorSpot + 1 >= spotInfo.threshold
+              && applyCodexBehaviorGuard('broad-spot-repeat', effectiveModel, true, true)) {
               if (debug.enabled) {
                 debug.log('llm.router', 'tool-loop.broad-spot-blocked', {
                   turn,
@@ -10324,7 +10450,7 @@ export async function streamLLMWithTools(
         // W4-A — Track Read dispatches (only successful ones; error
         // results don't count as "the file is in your context"). The
         // post-Read broad-search guard above reads this counter.
-        if (call.name === 'Read' && !isError && codexBehaviorGuards) {
+        if (call.name === 'Read' && !isError && codexGuardCandidate) {
           dispatchedReadCount++;
         }
         return { result, isError, phaseRejected: false };
@@ -10676,28 +10802,31 @@ export async function streamLLMWithTools(
         && looksLikeStructuralAnalysis(history)
         && autoNarrowedInspections.length >= 2
         && narrowingBlockedCount >= 1;
-      if (modelFamily === 'codex' && autoNarrowedReadCount >= inspectBudgetThreshold) {
+      if (codexGuardCandidate
+        && (modelFamily === 'codex' || getGpt6CodexGuardFlags()['inspect-budget'])
+        && autoNarrowedReadCount >= inspectBudgetThreshold) {
         inspectSynthesisArmed = true;
       }
+      const inspectBudgetExecutionHeld = codexGuardCandidate
+        && autoNarrowedThisTurn > 0
+        && autoNarrowedInspections.length > 0
+        && autoNarrowedReadCount >= inspectBudgetThreshold
+        && inspectFollowupMode === 'execution';
+      // Arming is a would-block signal only: it rejects nothing this turn, so blocked stays 0.
+      if (inspectBudgetExecutionHeld) noteGpt6CodexGuard('inspect-budget', effectiveModel, false);
       if (structuralInspectFallbackReady) {
         hardStopText = buildInspectFallbackSummary(autoNarrowedInspections);
         hardStopReason = 'structural-inspect-fallback-ready';
       } else if (
-        modelFamily === 'codex'
-        && autoNarrowedThisTurn > 0
+        autoNarrowedThisTurn > 0
         && autoNarrowedInspections.length > 0
         && autoNarrowedReadCount >= inspectBudgetThreshold
         && inspectFollowupMode === 'synthesis'
+        && applyCodexBehaviorGuard('inspect-budget', effectiveModel, codexGuardCandidate)
       ) {
         hardStopText = buildInspectFallbackSummary(autoNarrowedInspections);
         hardStopReason = 'codex-inspect-budget-synthesis';
-      } else if (
-        modelFamily === 'codex'
-        && autoNarrowedThisTurn > 0
-        && autoNarrowedInspections.length > 0
-        && autoNarrowedReadCount >= inspectBudgetThreshold
-        && inspectFollowupMode === 'execution'
-      ) {
+      } else if (inspectBudgetExecutionHeld && gpt6CodexGuardEnabled('inspect-budget', effectiveModel)) {
         inspectSynthesisArmed = true;
         debug.log('llm.router', 'tool-loop.inspect-synthesis-armed', {
           turn,
@@ -10904,12 +11033,12 @@ export async function streamLLMWithTools(
       // forceSynthesisOutcome="skipped" (was: non-codex-family). Same
       // fix shape (no-tools synthesis with prior tool_results as
       // context) lifts the empty reply to substantive answer.
-      const isForceSynthesisFamily =
-        codexBehaviorGuards || modelFamily === 'gemini';
+      const isForceSynthesisFamily = codexGuardCandidate || modelFamily === 'gemini';
       const shouldForceSynthesis =
-        isForceSynthesisFamily
-        && !isUserInterventionRequired
-        && !forceSynthesisAttempted;
+        !isUserInterventionRequired
+        && !forceSynthesisAttempted
+        && (modelFamily === 'gemini'
+          || applyCodexBehaviorGuard('force-synthesis', effectiveModel, codexGuardCandidate, true));
       let synthesizedText: string | null = null;
       if (shouldForceSynthesis) {
         forceSynthesisAttempted = true;
@@ -10988,9 +11117,10 @@ export async function streamLLMWithTools(
     // synthesis attempt. Extended to gemini 2026-05-04 alongside
     // W5-E/W5-F for the same pathology shape.
     if (
-      (modelFamily === 'codex' || modelFamily === 'gemini')
-      && !forceSynthesisAttempted
+      !forceSynthesisAttempted
       && noContentReadTurnStreak >= 4
+      && (modelFamily === 'gemini'
+        || applyCodexBehaviorGuard('force-synthesis', effectiveModel, codexGuardCandidate, true))
     ) {
       forceSynthesisAttempted = true;
       const earlyText = await tryForceSynthesisPass({
@@ -11073,8 +11203,9 @@ export async function streamLLMWithTools(
   let synthesizedText: string | null = null;
   const shouldForceSynthesisOnBudget =
     loopTermination === 'budget-exhausted'
-    && (codexBehaviorGuards || modelFamily === 'gemini')
-    && !forceSynthesisAttempted;
+    && !forceSynthesisAttempted
+    && (modelFamily === 'gemini'
+      || applyCodexBehaviorGuard('force-synthesis', effectiveModel, codexGuardCandidate, true));
   if (shouldForceSynthesisOnBudget) {
     forceSynthesisAttempted = true;
     synthesizedText = await tryForceSynthesisPass({
@@ -11367,6 +11498,27 @@ function makeOpenRouterProvider(cfg: UCLLMConfig): LLMProvider {
   //   결정 「codex 처럼 넉넉하게」(같은 날 저녁)로 ***아예 안 보낸다*** — codex 도 `max_output_tokens` 를 안 보낸다.
   //   📏 실측: kimi-k3·glm-5.3 둘 다 생략 시 200 · finish=stop. 쓴 만큼만 과금된다.
   return inner;
+}
+
+/** The OpenGateway wire is standard OpenAI Chat Completions with a distinct URL and credential. */
+function makeOpenGatewayProvider(cfg: UCLLMConfig): LLMProvider {
+  const selectedModel = cfg.model || OPENGATEWAY_MODEL;
+  if (!isVerifiedOpenGatewayModel(selectedModel)) throw new Error(`opengateway model not verified: ${selectedModel}`);
+  const portableKey = getOpenGatewayApiKey();
+  if (cfg.apiKey?.trim() && portableKey && cfg.apiKey.trim() !== portableKey)
+    throw new Error('opengateway config apiKey conflicts with env/cache key');
+  const inner = makeOpenAICompatProvider('opengateway', selectedModel, OPENGATEWAY_API_URL,
+    { ...cfg, reasoningLevel: undefined, apiKey: cfg.apiKey?.trim() || portableKey },
+    { model: (model) => model.startsWith('opengateway/') ? model.slice('opengateway/'.length) : model,
+      omitDefaultTemperature: true, omitMaxTokens: true,
+      extraBody: { stream_options: { include_usage: true } } });
+  return { ...inner, async *streamChat(messages, opts = {}) {
+    if (opts.model && !isVerifiedOpenGatewayModel(opts.model)) throw new Error(`opengateway model not verified: ${opts.model}`);
+    yield* inner.streamChat!(messages, { ...opts, reasoningEffort: undefined });
+  }, async *chat(messages, opts = {}) {
+    if (opts.model && !isVerifiedOpenGatewayModel(opts.model)) throw new Error(`opengateway model not verified: ${opts.model}`);
+    yield* inner.chat!(messages, { ...opts, reasoningEffort: undefined });
+  } };
 }
 
 /** OR-TOOLARGS-REPAIR — 깨진 도구 인자 호출에 돌려주는 오류 문면(도구는 실행되지 않았다). */
@@ -11833,7 +11985,7 @@ export function anyProviderAvailable(userConfig?: UserConfig): boolean {
       } catch { return false; }
     }
   } catch { /* fall through to env check */ }
-  return Object.values(PROVIDERS).some(p => p.name !== 'bedrock' && p.available()); // bedrock 은 auto 후보가 아니다
+  return Object.values(PROVIDERS).some(p => p.name !== 'bedrock' && p.name !== 'opengateway' && p.available()); // 명시 전용 공급자는 auto 가용성 아님
 }
 
 /** 직결 배선이 없는 계열 → OpenRouter 에서 그 벤더의 대표 모델(사다리 `openrouter` 에 선 것). */
@@ -11890,6 +12042,9 @@ export function getProviderForConfig(
       // Preserve the requesting config for OpenRouter, not the config-free singleton.
       return makeOpenRouterProvider({ provider: 'openrouter', model: decision.model, reasoningLevel: userConfig.llm.reasoningLevel });
     }
+    if (resolvedProviderName === 'opengateway') {
+      return makeOpenGatewayProvider({ provider: 'opengateway', model: decision.model, reasoningLevel: userConfig.llm.reasoningLevel });
+    }
     return PROVIDERS[resolvedProviderName]!;
   }
   if (!isKnownProviderName(resolvedProviderName)) {
@@ -11930,6 +12085,8 @@ export function getProviderForConfig(
       return makeCodexProvider(llm);
     case 'openrouter':
       return makeOpenRouterProvider(userConfig.llm.provider === 'openrouter' ? llm : { provider: 'openrouter', model: decision.model, reasoningLevel: llm.reasoningLevel });
+    case 'opengateway':
+      return makeOpenGatewayProvider(userConfig.llm.provider === 'opengateway' ? llm : { provider: 'opengateway', model: decision.model, reasoningLevel: llm.reasoningLevel });
     case 'anthropic':
       return makeAnthropicProvider(llm);
     case 'bedrock': return makeBedrockProvider(llm);
@@ -11958,7 +12115,7 @@ export function getProviderForConfig(
   // union without a case here fails loud at first call.
   throw new Error(`unknown provider: ${provider as string}`);
 }
-import { getModelFamily, usesCodexBehaviorGuards } from './models/prompts.js';
+import { getModelFamily, isGpt6GenerationModel, usesCodexBehaviorGuards } from './models/prompts.js';
 import type { ModelFamily } from './models/prompts.js';
 
 // COMPAT(llm-facade-openai-sampling-fields) · 기존 llm.ts 공개 API 유지.

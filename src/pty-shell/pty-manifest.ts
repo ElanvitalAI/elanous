@@ -251,6 +251,13 @@ function recordPtyLifecycle(event: PtyLifecycleEvent, row: PtyManifestRow, now: 
       exitCode: row.exitCode,
       startedAt: row.startedAt,
       closedAt: row.closedAt,
+      // 시작·종료·오류·산출을 같은 seatId 한 흐름으로 대조할 수 있게
+      // 매니페스트 행의 자리 정체성과 산출 총량을 원장 이벤트에도 싣는다.
+      ...(row.seat ? { seat: row.seat } : {}),
+      ...(row.purpose ? { purpose: row.purpose } : {}),
+      outputBytesTotal: row.outputBytesTotal,
+      ...(row.lastControlAt === undefined ? {} : { lastControlAt: row.lastControlAt }),
+      ...(row.turnState ? { turnState: row.turnState, turnAt: row.turnAt } : {}),
     },
   });
   if (seq === 0) debug.log('pty.manifest', 'ledger-write-failed', { ptyId: row.id, event });

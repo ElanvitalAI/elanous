@@ -137,6 +137,8 @@ export interface DashboardAcpChatOpts {
   /** Logger for subprocess stderr / protocol events. Route into the
    *  dashboard debug log (pushLog). */
   log?: (msg: string) => void;
+  /** Notify idle-sensitive dashboard services when an ACP turn starts or ends. */
+  onBusyChange?: () => void;
   /** Dependency injection hook for tests — overrides the default
    *  `globalAcpAgentManager()` lookup. Production call sites omit
    *  this field. */
@@ -180,6 +182,7 @@ export interface DashboardAcpChatOpts {
 export class DashboardAcpChat {
   private readonly getCwd: () => string;
   private readonly log: (msg: string) => void;
+  private readonly onBusyChange?: () => void;
   private readonly agentManager: NonNullable<DashboardAcpChatOpts['agentManager']>;
   private readonly sessionStore: NonNullable<DashboardAcpChatOpts['sessionStore']>;
   private readonly permissionApprover?: AcpPermissionApprover;
@@ -209,6 +212,7 @@ export class DashboardAcpChat {
       this.getCwd = () => getSessionCwd();
     }
     this.log = opts.log ?? ((_m) => { /* default: drop */ });
+    this.onBusyChange = opts.onBusyChange;
     this.agentManager = opts.agentManager ?? {
       getAgent: (backendId, o) => globalAcpAgentManager().getAgent(backendId, o) as any,
     };
@@ -321,6 +325,7 @@ export class DashboardAcpChat {
         throw new Error(`${displayBackendName(backendId)} already has a turn in flight — /acp cancel first`);
       }
       sess.inFlight = true;
+      this.onBusyChange?.();
       if (debug.enabled) {
         handlers.pushLine(`  → sending to ${displayBackendName(backendId)}…`);
       }
@@ -359,11 +364,14 @@ export class DashboardAcpChat {
       }
       this.closeStreamBuffer(sess, 'flush');
       sess.inFlight = false;
+      this.onBusyChange?.();
       handlers.onDone(result.stopReason);
     } catch (err) {
       if (sess) {
         this.closeStreamBuffer(sess, 'flush');
+        const wasBusy = sess.inFlight;
         sess.inFlight = false;
+        if (wasBusy) this.onBusyChange?.();
       }
       handlers.onError(err instanceof Error ? err : new Error(formatAcpError(err)));
     }

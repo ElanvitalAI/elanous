@@ -91,7 +91,14 @@ describe('draft-cleanup graph', () => {
       expect(githubCalls.filter((call) => call.includes('pulls?state=open'))).toHaveLength(mode === 'live' ? 2 : 1);
       expect(githubCalls.filter((call) => call.includes('pulls?state=closed'))).toHaveLength(mode === 'live' ? 2 : 1);
       // Read-only GETs and the batched GraphQL `query` feed the classifier; label creation, edits and closes are mutations.
-      const readOnly = (call: string) => /^api graphql -f query=query \{ repository\(/.test(call) || /^api repos\/[^ ]+\/(?:pulls\/\d+(?:\/(?:files|commits|reviews))?|issues\/\d+\/comments|commits\/[0-9a-f]+)\b/.test(call) && !/\s-X\s|--method/.test(call);
+      const readOnly = (call: string) => {
+        // gh API pagination flags precede the endpoint in argv; normalize them before classifying the default GET.
+        const normalized = call.replace(/^api (?:(?:--paginate|--slurp) )+/, 'api ');
+        return /^api graphql -f query=query \{ repository\(/.test(normalized)
+          || /^api repos\/[^ ]+\/(?:pulls\/\d+(?:\/(?:files|commits|reviews))?|issues\/\d+\/comments|commits\/[0-9a-f]+)\b/.test(normalized)
+            && !/\s-X\s|--method/.test(normalized);
+      };
+      expect(readOnly('api --paginate -X DELETE repos/test/repo/issues/81/comments?per_page=100')).toBe(false);
       const mutations = githubCalls.filter((call) => !call.startsWith('repo view') && !call.includes('pulls?state=') && !readOnly(call));
       if (mode === 'shadow') expect(mutations).toEqual([]);
       else {

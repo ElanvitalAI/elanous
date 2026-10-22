@@ -5,13 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makePrManager, type CmdRunner } from './pr-manager.js';
 import { cardIdFromBody, guardNewPr, hasCardMarker } from '../pr-tool/census.js';
+import { podGitPushGuardScript } from '../task-orchestrator/surfaces/self-implement-pod.js';
 
 const head40 = /^[0-9a-f]{40}$/;
 setDefaultTimeout(30_000);
 
 function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = false, moveAtPush = false,
   raceNewBranch = false,
-  existingNewBranch = false) {
+  existingNewBranch = false, runId?: string) {
   const root = mkdtempSync(join(tmpdir(), 'same-cell-pr-'));
   const bare = join(root, 'origin.git');
   const work = join(root, 'work');
@@ -34,6 +35,12 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
   const mainHead = inWork('rev-parse', 'main');
   expect(oldHead).toMatch(head40);
   inWork('checkout', 'main'); inWork('checkout', '-b', 'new-branch');
+  if (runId) {
+    const install = spawnSync('sh', ['-c', podGitPushGuardScript(runId)],
+      { cwd: work, env: { ...process.env, HOME: root }, encoding: 'utf8' });
+    if (install.status !== 0) throw new Error(`install Pod push guard: ${install.stderr}`);
+    inWork('config', 'core.hooksPath', join(root, '.elanous-git-hooks'));
+  }
   if (existingNewBranch) git('--git-dir', bare, 'update-ref', 'refs/heads/new-branch', mainHead);
   writeFileSync(join(work, conflict ? 'shared.txt' : 'new.txt'), 'new\n');
   const body = '칸: PR-SAME-CELL-REUSE\n카드: ta-integration';
@@ -79,7 +86,7 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
       seat: null, cellId: 'PR-SAME-CELL-REUSE', cardId: cardIdFromBody(oldBody), cardMarkerPresent: hasCardMarker(oldBody) }],
   });
   const deliver = () => makePrManager(run, guard).upsertPr({ branch: 'new-branch', worktreePath: work,
-    title: 'new work', body, commitMessage: 'new work', base: 'main' });
+    title: 'new work', body, commitMessage: 'new work', base: 'main', ...(runId ? { runId } : {}) });
   return { root, work, oldHead, mainHead, calls, deliver, inWork, url };
 }
 
@@ -129,14 +136,14 @@ test('exact-head lease rejects a remote move after the final read and before pus
 
 
 test('real git merge conflict opens a new draft and returns the new card PR', () => {
-  const f = fixture(true);
+  const f = fixture(true, false, false, false, false, false, 'run-a1b2c3d4-1111-2222-3333-444444444444');
   try {
     expect(f.deliver()).toEqual({ ok: true, url: 'https://github.com/o/r/pull/8', reused: false, supersededPr: 7 });
     expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/old-branch').split('\t')[0]).toBe(f.oldHead);
     expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/new-branch').split('\t')[0]).toBe(f.inWork('rev-parse', 'HEAD'));
     const pushes = f.calls.filter(call => call[0] === 'git' && call.includes('push'));
     expect(pushes).toHaveLength(2);
-    expect(pushes[0]![5]).toMatch(/^HEAD:refs\/heads\/elanous-pr-create\/[0-9a-f-]+$/);
+    expect(pushes[0]![5]).toMatch(/^HEAD:refs\/heads\/self-impl\/pr-create-ra1b2c3-[0-9a-f-]+$/);
     expect(pushes[1]![5]).toBe(`:${pushes[0]![5]!.slice(5)}`);
     expect(f.calls.some(call => call[0] === 'gh' && call[1] === 'api' && call.includes('POST'))).toBe(true);
     const create = f.calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')!;
@@ -144,6 +151,14 @@ test('real git merge conflict opens a new draft and returns the new card PR', ()
     expect(create[create.indexOf('--body') + 1]).toContain('카드: ta-integration\n\nSupersedes: #7');
     expect(f.calls.some(call => call[0] === 'gh' && call[1] === 'pr' && (call[2] === 'edit' || call[2] === 'close'))).toBe(false);
     expect(f.inWork('status', '--porcelain')).toBe('');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('same-cell reuse without a run id fails before any push', () => {
+  const f = fixture(true);
+  try {
+    expect(f.deliver()).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('run id required') });
+    expect(f.calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(false);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -159,7 +174,7 @@ test('an existing fast-forwardable new branch is refused without changing that b
 
 
 test('a branch created after the remote precheck loses the atomic create race without being overwritten', () => {
-  const f = fixture(true, false, false, false, true);
+  const f = fixture(true, false, false, false, true, false, 'run-a1b2c3d4-1111-2222-3333-444444444444');
   try {
     expect(f.deliver()).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('new run branch create refused') });
     expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/new-branch').split('\t')[0]).toBe(f.mainHead);

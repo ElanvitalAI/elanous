@@ -3,7 +3,6 @@
 // coordinator's modal-stack pipeline.
 
 import { describe, expect, test } from 'bun:test';
-import { paintChatPickerClear } from '../src/chat/pickers/modal-runtime.js';
 import {
   createChatPickerTestFamily,
   createChatPickerTestSources,
@@ -314,28 +313,5 @@ describe('chat picker family modal · at flavor', () => {
   test('empty items → empty paint output', () => {
     const m = atModal({ getItems: () => [] });
     expect(m.paint()).toBe('');
-  });
-});
-
-describe('paintChatPickerClear', () => {
-  test('emits one clear escape per requested row budget', () => {
-    const out = paintChatPickerClear({
-      bounds: { row: 30, col: 1, width: 80, height: 1 },
-      rows: 3,
-      inputZoneHeight: 1,
-    });
-    const matches = out.match(/\x1b\[2K/g);
-    expect(matches?.length).toBe(3);
-  });
-
-  test('skips rows that would be above the screen (row < 1)', () => {
-    const out = paintChatPickerClear({
-      bounds: { row: 5, col: 1, width: 80, height: 1 },
-      rows: 20,                   // would push above row 1
-      inputZoneHeight: 1,
-    });
-    // Only the rows that fit within the screen.
-    const matches = out.match(/\x1b\[2K/g);
-    expect(matches?.length).toBeLessThanOrEqual(4);
   });
 });

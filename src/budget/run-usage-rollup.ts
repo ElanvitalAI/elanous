@@ -5,6 +5,7 @@ export interface RunUsageInput {
   hostId?: string | null;
   site?: string | null;
   role?: string | null;
+  phase?: string | null;
   model?: string | null;
   billingProvider?: string | null;
   billing?: BillingRoute | null;
