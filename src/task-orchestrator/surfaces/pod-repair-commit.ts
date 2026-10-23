@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
+import { classifyGateEnvDeficit, GATE_ENV_DEFICIT_HARVESTABLE_MARK } from '../../self-implement/gate-env-retry.js';
 
 export const REPAIR_REF = 'refs/elanous/repair/result';
 export const REPAIR_BUNDLE_MAX_BYTES = 5 * 1024 * 1024;
@@ -39,15 +40,29 @@ function completedWorktree(output: string): { path: string; runId: string } {
     let value: Record<string, unknown>;
     try { value = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
     if (value.kind === 'self' && value.result && typeof value.result === 'object') value = value.result as Record<string, unknown>;
-    if (value.stage !== 'worktree-completed' || value.ok !== true || typeof value.worktreePath !== 'string'
+    const completed = value.stage === 'worktree-completed' && value.ok === true;
+    // The gate could not measure an environmental failure. Keep the implementation as a
+    // bundle for the pinned PR; the parent still has to review and rejudge that head.
+    const gate = value.gate && typeof value.gate === 'object' && !Array.isArray(value.gate)
+      ? value.gate as { passed?: unknown; log?: unknown; reflectGateFacts?: { introduced?: number; unknownReason?: string; childResponsibility?: string } }
+      : null;
+    const environmentHarvest = value.stage === 'gate-failed' && value.ok === false
+      && value.harvestable === true && typeof value.detail === 'string'
+      && value.detail.includes(GATE_ENV_DEFICIT_HARVESTABLE_MARK)
+      && gate?.passed === false
+      && gate.reflectGateFacts?.introduced === 0
+      && gate.reflectGateFacts?.childResponsibility === 'none'
+      && classifyGateEnvDeficit({ passed: false, ...(typeof gate.log === 'string' ? { log: gate.log } : {}),
+        ...(gate.reflectGateFacts ? { reflectGateFacts: gate.reflectGateFacts } : {}) }).envDeficit;
+    if ((!completed && !environmentHarvest) || typeof value.worktreePath !== 'string'
       || typeof value.runId !== 'string' || !value.runId)
-      throw new Error('repair child final result is not a successful worktree-only result');
+      throw new Error('repair child final result is neither successful worktree-only nor environment-deficit harvestable');
     return { path: value.worktreePath, runId: value.runId };
   }
   throw new Error('repair child did not return a successful worktree-only result');
 }
 
-/** Called in the Pod after the child exits successfully and before artifact export. */
+/** Called in the Pod after a successful child or a verified environment-deficit harvest. */
 export function writePodRepairCommit(input: { pr: number; baseHead: string; runId: string; output: string; repo: string; outbox: string }): PodRepairResult {
   if (!Number.isSafeInteger(input.pr) || input.pr < 1 || !SHA40.test(input.baseHead)) throw new Error('invalid repair PR or base head');
   if (!input.runId.trim()) throw new Error('repair parent run id missing');

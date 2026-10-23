@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
 import { tracedPathReferences, verbatimOriginalAsk } from './goal-author.js';
 import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
@@ -408,6 +409,49 @@ export function describeFederatedMissingRunLedger(runId: string, options: Federa
   };
 }
 
+/** 런 원장 옆 `.graph.yaml` 경로 — 원장 경로 계약(runLedgerPath)에서 파생한다. */
+export function runGraphVariantPath(runId: string, dir = runLedgerDir()): string {
+  return `${runLedgerPath(runId, dir)}.graph.yaml`;
+}
+
+/** 최초 graph variant 선택의 원장 옆 재조회 계약 — 같은 runId·파일이면 같은 id·선택 이유가 돌아온다. */
+export interface RunGraphVariantSelection {
+  /** createGraphVariant 가 골 종류·대상 경로 수에서 유도한 최초 variant id. */
+  readonly variantId: string;
+  /** 그 variant가 최초로 선택된 근거(종류·경로 수 기반) — 저장·재조회가 같은 문자열. */
+  readonly reason: string;
+}
+
+/** 런 원장 옆 .graph.yaml 을 처음 한 번 쓰고 저장 경로를 돌려준다 — 이미 있으면 덮쓰지 않는다(flag wx). */
+export function saveRunGraphVariant(runId: string, yamlText: string, dir = runLedgerDir()): string {
+  mkdirSync(dir, { recursive: true });
+  const path = runGraphVariantPath(runId, dir);
+  writeFileSync(path, yamlText, { flag: 'wx' });
+  return path;
+}
+
+/** 런 원장 옆 .graph.yaml 에서 최초 graph variant 선택(id·이유)을 재조회한다 — 파일·선택이 없으면 null. */
+export function loadRunGraphVariant(runId: string, dir = runLedgerDir()): RunGraphVariantSelection | null {
+  const path = runGraphVariantPath(runId, dir);
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new Error(`unable to read run graph variant ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(text);
+  } catch (error) {
+    throw new Error(`invalid run graph variant YAML at ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const record = parsed as { variant_id?: unknown; reason?: unknown };
+  if (typeof record.variant_id !== 'string' || typeof record.reason !== 'string') return null;
+  return { variantId: record.variant_id, reason: record.reason };
+}
+
 /** Append one observer event. Callers own fail-soft handling. */
 export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()): void {
   if (refuseProductionLedgerWriteInTest(dir, 'run-ledger')) return;
@@ -420,6 +464,70 @@ export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()
   withRunLedgerLock(dir, entry.runId, () => {
     const line = `${JSON.stringify(row)}\n`;
     if (!restoreArchivedRunLedger(dir, entry.runId, line)) appendFileSync(live, line, 'utf8');
+  });
+}
+
+/** Caller decision inside `appendRunLedgerEntryChecked`: either `append` exactly one entry, or skip with `result`. */
+export type RunLedgerCheckedAppendDecision<T> =
+  | { append: false; result: T }
+  | { append: true; entry: RunLedgerEntry };
+
+export interface RunLedgerCheckedAppendOutcome<T> {
+  appended: boolean;
+  result: T | null;
+  /** Named reason when `appended:false` was produced without calling the decision — e.g. a test-universe refusal of an operating-ledger write. */
+  refusal: 'ledger-write-refused' | null;
+}
+
+/**
+ * Thrown (typed, with the stable `runId-mismatch` reason) when a checked-append
+ * decision returns an entry whose `runId` differs from the locked `runId`. Callers
+ * classify identity violations from `error.reason === 'runId-mismatch'` instead of
+ * parsing message substrings.
+ */
+export class RunLedgerCheckedAppendRunIdMismatchError extends Error {
+  readonly reason = 'runId-mismatch' as const;
+  constructor(readonly decisionRunId: string, readonly lockedRunId: string) {
+    super(
+      `runId-mismatch: appendRunLedgerEntryChecked: decision entry runId ${JSON.stringify(decisionRunId)} does not match locked runId ${JSON.stringify(lockedRunId)}`,
+    );
+    this.name = 'RunLedgerCheckedAppendRunIdMismatchError';
+  }
+}
+
+/**
+ * Atomically decide-and-append under a single per-run lock: the caller-supplied
+ * decision runs on the loaded ledger inside `withRunLedgerLock`, and at most one
+ * append is written by the same lock. Never calls `appendRunLedgerEntry` inside
+ * the lock (that function acquires the same lock itself, so nesting it would
+ * time out). Preserves the archived-ledger restore contract exactly like
+ * `appendRunLedgerEntry`. A missing ledger yields `null` entries to the
+ * decision (which may throw); a corrupt ledger throws before any append.
+ * Test-universe writes are refused before any lock directory or ledger path is created.
+ * The caller-supplied entry must carry the same `runId` as the acquired lock — on mismatch,
+ * the lock is released and a runId mismatch error is thrown before any append or archive restore.
+ */
+export function appendRunLedgerEntryChecked<T>(
+  runId: string,
+  decide: (entries: RunLedgerEntry[] | null) => RunLedgerCheckedAppendDecision<T>,
+  dir = runLedgerDir(),
+): RunLedgerCheckedAppendOutcome<T> {
+  if (refuseProductionLedgerWriteInTest(dir, 'run-ledger')) return { appended: false, result: null, refusal: 'ledger-write-refused' as const };
+  return withRunLedgerLock(dir, runId, () => {
+    const decision = decide(loadRunLedger(runId, dir));
+    if (!decision.append) return { appended: false, result: decision.result, refusal: null };
+    const entry = decision.entry;
+    if (entry.runId !== runId) {
+      throw new RunLedgerCheckedAppendRunIdMismatchError(entry.runId, runId);
+    }
+    const live = runLedgerPath(entry.runId, dir);
+    const devProject = process.env.ELANOUS_DEV_PROJECT;
+    const row = entry.devProject === undefined && typeof devProject === 'string' && devProject.startsWith('prj-')
+      ? { ...entry, devProject }
+      : entry;
+    const line = `${JSON.stringify(row)}\n`;
+    if (!restoreArchivedRunLedger(dir, entry.runId, line)) appendFileSync(live, line, 'utf8');
+    return { appended: true, result: null, refusal: null };
   });
 }
 

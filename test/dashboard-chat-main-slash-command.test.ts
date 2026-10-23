@@ -17,6 +17,11 @@ describe('dashboard chat main slash command', () => {
     });
   });
 
+  test('TUI-RESUME-PICKER: a bare /resume is left as resume (the picker handler), not rewritten', () => {
+    expect(resolveDashboardChatMainSlashCommand('/resume')).toEqual({ cmdLower: 'resume', args: [] });
+    expect(resolveDashboardChatMainSlashCommand('/resume   ')).toEqual({ cmdLower: 'resume', args: [] });
+  });
+
   test('returns empty command metadata for bare slash', () => {
     expect(resolveDashboardChatMainSlashCommand('/')).toEqual({
       cmdLower: '',

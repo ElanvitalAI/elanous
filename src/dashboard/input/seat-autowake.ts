@@ -331,21 +331,23 @@ export function createSeatAutowake(deps: SeatAutowakeDeps): SeatAutowakeControll
         lastFingerprint = null;
         consecutive = 0;
       }
-      // The production failed-turn path renders this exact 400 notice and
-      // stages its raw detail. Ordinary assistant text can quote the same API
-      // error, so it must never be parsed as a failed turn by itself.
-      const is400Notice = result.lastLine.includes('모델 API 가 요청을 400 으로 거절')
-        && result.lastLine.includes('원문 /detail open');
-      const match = is400Notice
-        ? /\bCodex API 400\b[^\n]*?No tool call found for function call output with call_id\s+([\w-]+)/iu.exec(result.errorDetail ?? '')
+      // Only the production failed-turn path stages `errorDetail` (pushFailureNotice), so its presence is what
+      // marks a failed turn — ordinary assistant text that quotes the same API error never carries it.
+      // TUI-ORPHAN-AUTO-RESUME-STOP E4 (10-23): the visible line is not a usable gate — this 400 goes through
+      // autoheal, whose notice reads «⚠ 자동 회복 N회 실패…», and the turn footer «✘ 실패 …» is the last line.
+      // The old gate («모델 API 가 요청을 400 으로 거절» in lastLine) therefore never matched in the live TUI.
+      const match = result.errorDetail !== undefined
+        ? /\bCodex API 400\b[^\n]*?No tool call found for function call output with call_id\s+([\w-]+)/iu.exec(result.errorDetail)
         : null;
       if (!match || !activeSessionId) {
+        if (result.errorDetail !== undefined) log('tui.autowake', 'turn-failure', { sessionId: activeSessionId, orphan400: false, count: 0, detailHead: result.errorDetail.slice(0, 160) });
         lastOrphanFailure = null;
         return;
       }
       const callId = match[1]!;
       lastOrphanFailure = lastOrphanFailure?.callId === callId
         ? { callId, count: lastOrphanFailure.count + 1 } : { callId, count: 1 };
+      log('tui.autowake', 'turn-failure', { sessionId: activeSessionId, orphan400: true, callId, count: lastOrphanFailure.count });
       if (lastOrphanFailure.count < 2 || terminalCallId) return;
       terminalCallId = callId;
       log('tui.autowake', 'terminal', {

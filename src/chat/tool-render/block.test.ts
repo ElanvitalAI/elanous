@@ -2,8 +2,14 @@ import { describe, expect, spyOn, test } from 'bun:test';
 
 import { debug } from '../../debug/log.js';
 import { foldHint } from '../../log-entry.js';
+import {
+  DEFAULT_LONG_SLEEP_WARN_SECONDS,
+  detectLongSleep,
+  formatLongSleepWarning,
+} from '../../skills/tools/shell.js';
 import { renderToolBlock, toolBlockGrouping } from './block.js';
-import type { ToolRenderModel } from './types.js';
+import { renderToolResultVariants } from './dispatch.js';
+import type { ToolRenderConfig, ToolRenderModel, ToolRenderResult } from './types.js';
 
 const model: ToolRenderModel = {
   kind: 'Read',
@@ -148,5 +154,99 @@ describe('renderToolBlock fold modes', () => {
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+const strip = (row: string): string => row.replace(/\x1b\[[0-9;]*m/g, '');
+
+// ❗ 실물: 생산 경로가 만드는 RunShell long-sleep 경고 한 줄(`detectLongSleep` 판정 →
+// `formatLongSleepWarning` 문면)을 손으로 적지 않고 그대로 되살린다. filler 는
+// `sleep 70` 이 돌려준 출력(yield 줄)을 대신한다.
+const LONG_SLEEP_WARNING = formatLongSleepWarning(
+  detectLongSleep(['sleep', '70'], DEFAULT_LONG_SLEEP_WARN_SECONDS)!,
+  false,
+  'generic',
+);
+const filler = Array.from({ length: 14 }, (_, index) => `tick ${index + 1}`);
+const runShellCall: ToolRenderResult = {
+  id: 'call-sleep-70',
+  name: 'RunShell',
+  args: { command: 'sleep 70' },
+  result: { command: 'sleep 70', exitCode: 0, output: [LONG_SLEEP_WARNING, ...filler].join('\n') },
+};
+
+const BLOCK_PREFIX = /^(?: {2}⎿ {2}| {5})/;
+
+/** 헤더를 떼고 toolResult 프리픽스까지 벗긴 본문 줄. */
+function bodyText(rows: string[]): string[] {
+  return rows.slice(1).map((row) => row.replace(BLOCK_PREFIX, ''));
+}
+
+function collapsedRows(config: ToolRenderConfig): string[] {
+  const variants = renderToolResultVariants(runShellCall, config);
+  if (!variants) throw new Error('RunShell must enter the inline-to-block renderer');
+  return variants.collapsed.map(strip);
+}
+
+describe('renderToolBlock keeps ⚠ warning lines outside the fold', () => {
+  test('task-unit fold: sleep 70 long-sleep warning sits above the fold hint', () => {
+    const rows = collapsedRows({ displayMode: 'inline-to-block', blockMaxLines: 8, foldMode: 'task-unit' });
+
+    const warningIndex = rows.findIndex((row) => row.includes(LONG_SLEEP_WARNING));
+    const hintIndex = rows.findIndex((row) => row.includes(foldHint('line', filler.length)));
+
+    expect(warningIndex).toBe(1);
+    expect(hintIndex).toBeGreaterThan(warningIndex);
+    expect(rows.join('\n')).not.toContain(foldHint('line', filler.length + 1));
+  });
+
+  test('kind-unit fold: sleep 70 long-sleep warning sits above the fold hint', () => {
+    const rows = collapsedRows({ displayMode: 'inline-to-block', blockMaxLines: 8, foldMode: 'kind-unit' });
+
+    const warningIndex = rows.findIndex((row) => row.includes(LONG_SLEEP_WARNING));
+    const hintIndex = rows.findIndex((row) => row.includes(foldHint('line', filler.length)));
+
+    expect(warningIndex).toBe(1);
+    expect(hintIndex).toBeGreaterThan(warningIndex);
+  });
+
+  test('line budget: pinned warning is excluded from the folded line count', () => {
+    const rows = collapsedRows({ displayMode: 'inline-to-block', blockMaxLines: 8, foldMode: 'line' });
+
+    expect(rows[1]).toContain(LONG_SLEEP_WARNING);
+    // 예산 8 = 고정 경고 1 + 본문 6 + 힌트 1 ⇒ 접힌 줄은 filler 14 - 6 = 8.
+    expect(rows).toHaveLength(9);
+    expect(rows[8]).toContain(foldHint('line', filler.length - 6));
+  });
+
+  test('a warning mid-body is hoisted to the top of the block body', () => {
+    const rows = renderToolBlock({
+      ...model,
+      bodyLines: ['alpha', LONG_SLEEP_WARNING, 'beta'],
+      collapsedSummary: '3 lines',
+    }, 10, 'line').map(strip);
+
+    expect(bodyText(rows)).toEqual([LONG_SLEEP_WARNING, 'alpha', 'beta']);
+  });
+
+  test('an all-warning body renders as-is without a fold hint', () => {
+    const warnings = [LONG_SLEEP_WARNING, '⚠ second warning', '⚠ third warning'];
+
+    const line = renderToolBlock({ ...model, bodyLines: warnings }, 2, 'line').map(strip);
+    const task = renderToolBlock({ ...model, bodyLines: warnings }, 2, 'task-unit').map(strip);
+
+    expect(bodyText(line)).toEqual(warnings);
+    expect(bodyText(task)).toEqual(warnings);
+    expect(line.join('\n')).not.toContain('more lines folded');
+    expect(task.join('\n')).not.toContain('more lines folded');
+  });
+
+  test('bodies without warning lines keep the current fold output', () => {
+    const full = renderToolBlock(model, Number.POSITIVE_INFINITY, 'line').map(strip);
+    const folded = renderToolBlock(model, 4, 'line').map(strip);
+
+    expect(bodyText(folded)).toEqual([...bodyText(full).slice(0, 3), foldHint('line', 2)]);
+    expect(bodyText(folded)).toHaveLength(4);
+    expect(folded.join('\n')).not.toContain('⚠');
   });
 });

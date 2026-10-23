@@ -189,6 +189,7 @@ function lastReviewRecord(text: string): Record<string, unknown> | undefined {
 function hasResolvedPriorDeclaration(review: Record<string, unknown> | undefined): boolean {
   if (!review) return false;
   const value = review.resolvedPrior;
+  if (value === true) return true;
   if (Array.isArray(value) && value.length > 0) return true;
   if (value && typeof value === 'object' && Object.keys(value).length > 0) return true;
   return [review.intent, review.intentBlock, review.reviewIntent, review.reviewIntentBlock]
@@ -199,8 +200,21 @@ function normalizedFinding(value: string): string {
   return value.trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+// `status open` / `status pending` in prose counts the same as `status: pending` in a field.
+const UNRESOLVED_STATUS = /^(?:open|unresolved|pending|in[- ]progress)$/i;
+
 function containsUnresolvedClaim(value: string): boolean {
-  return /\b(?:unresolved|not(?:\s+yet)?[\s-]+resolved|not(?:\s+yet)?[\s-]+fixed|not(?:\s+yet)?[\s-]+addressed|still[\s-]+open|remains?[\s-]+open|still[\s-]+present|status\s*[:=]\s*(?:open|unresolved|pending|in[- ]progress))\b/i.test(value);
+  return /\b(?:unresolved|not(?:\s+yet)?[\s-]+resolved|not(?:\s+yet)?[\s-]+fixed|not(?:\s+yet)?[\s-]+addressed|still[\s-]+open|remains?[\s-]+open|still[\s-]+present|status\s*(?:[:=]\s*|\s+)(?:open|unresolved|pending|in[- ]progress))\b/i.test(value);
+}
+
+/** A record cannot claim resolution while carrying its own OPEN/PENDING status — refuse both fields. */
+function unresolvedStatusDeclared(record: Record<string, unknown>): boolean {
+  if (record.resolved === false) return true;
+  return ['status', 'resolutionStatus', 'resolution']
+    .some((key) => {
+      const value = record[key];
+      return typeof value === 'string' && UNRESOLVED_STATUS.test(value.trim());
+    });
 }
 
 function containsUnresolvedDeclaration(value: unknown): boolean {
@@ -208,7 +222,7 @@ function containsUnresolvedDeclaration(value: unknown): boolean {
   if (Array.isArray(value)) return value.some(containsUnresolvedDeclaration);
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
-  if (record.resolved === false || (typeof record.status === 'string' && /^(?:open|unresolved|pending|in[- ]progress)$/i.test(record.status))) return true;
+  if (unresolvedStatusDeclared(record)) return true;
   return Object.values(record).some(containsUnresolvedDeclaration);
 }
 
@@ -233,11 +247,16 @@ function reviewAttemptExplicitlyResolved(input: VerifyOverlapEvidenceInput, sele
   if (findings.length === 0) return false;
 
   const declared = selected.resolvedPrior;
-  if (declared !== undefined && containsUnresolvedDeclaration(declared)) return false;
+  if (declared !== undefined && declared !== false && containsUnresolvedDeclaration(declared)) return false;
   const intentBlocks = [selected.intent, selected.intentBlock, selected.reviewIntent, selected.reviewIntentBlock]
     .filter((value): value is string => typeof value === 'string');
   // A resolution in one field cannot override an OPEN/PENDING declaration in another.
   if (intentBlocks.some(containsUnresolvedClaim)) return false;
+  // Contradiction axis 1 (structured): the record declares the prior attempt resolved while a
+  // separate lifecycle field still says open/pending — neither claim can be trusted, so refuse.
+  const declaresResolution = (declared !== undefined && declared !== false)
+    || intentBlocks.some((intent) => /^resolved prior review findings:\s*$/im.test(intent));
+  if (declaresResolution && unresolvedStatusDeclared(selected)) return false;
 
   let resolved: string[] = [];
   if (Array.isArray(declared)) {
@@ -261,7 +280,7 @@ function reviewAttemptExplicitlyResolved(input: VerifyOverlapEvidenceInput, sele
       if (ref !== undefined && !referencesReview(ref, failedPath)) continue;
       if (item.head !== undefined && (typeof item.head !== 'string' || item.head.toLowerCase() !== head)) continue;
       if (item.headCommit !== undefined && (typeof item.headCommit !== 'string' || item.headCommit.toLowerCase() !== head)) continue;
-      if (item.resolved === false || item.status === 'unresolved'
+      if (unresolvedStatusDeclared(item)
         || Object.values(item).some((value) => typeof value === 'string' && containsUnresolvedClaim(value))) continue;
       const listed = findingList(item.mustFix ?? item.resolvedMustFix ?? item.findings ?? item.axes ?? item.finding ?? item.axis);
       if (listed.some(containsUnresolvedClaim)) continue;

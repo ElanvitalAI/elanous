@@ -8,8 +8,11 @@ import { debug, redactSecretText } from '../debug/log.js';
 import { gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type RemoteRunOutcome } from '../self-implement/gate-remote.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
-// WSL is excluded until its push permissions and gate environment are proven stable.
-export const PR_LAND_HEAVY_HOSTS = ['node-b', 'node-c'] as const;
+// WSL still lands last: its gate environment was repaired (WSL-GATE-ENV, 2026-10-17 — baselineWorkspaceRoot in
+// scripts/ci-typecheck-changed.ts now picks the host disk /var/tmp instead of WSL's 20GiB tmpfs), so the host is
+// allowlisted as the third slot while node-b/node-c keep discovery order — the recorded host order stays part of the
+// evidence contract.
+export const PR_LAND_HEAVY_HOSTS = ['node-b', 'node-c', 'host-e-wsl'] as const;
 export const PR_LAND_HEAVY_HOST = PR_LAND_HEAVY_HOSTS[0];
 export type PrLandHeavyHost = typeof PR_LAND_HEAVY_HOSTS[number];
 const allowedHost = (host: string): host is PrLandHeavyHost => PR_LAND_HEAVY_HOSTS.some((candidate) => candidate === host);
@@ -234,7 +237,7 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
       // A completed run or infrastructure failure is a verdict. Only a full host slot asks for another host.
       if (outcome.kind !== 'busy') break wait;
     }
-    // Both allowlisted hosts were busy. Wait the same slotWaitSeconds window as self gate, then retry.
+    // Every allowlisted host was busy. Wait the same slotWaitSeconds window as self gate, then retry.
     debug.log('pr.land', 'host-busy', { host: selectedHost, occupied: outcome.occupied ?? null, slotWaitSeconds: settings.slotWaitSeconds });
     const left = deadline - now();
     if (left <= 0) break;

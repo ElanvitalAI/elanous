@@ -1316,6 +1316,129 @@ export function typecheckDispatchFlags(flags: GateRemoteFlags, env: NodeJS.Proce
     ? { ...flags, remote: 'node-b' } : flags;
 }
 
+// ── WSL-GATE-ENV (0.2.36) — base 환경 해석 · 원격 push 실패 «원인» 보고 ─────────────────────────
+//   🩸 wsl·node-c 가 «같은 head·base» 를 쟀는데 introduced·preexisting 이 갈렸고, 남는 출력은
+//      `push-failed rc=128: …` 한 줄이었다. 그 한 줄로는 «미러 쓰기 권한» 인지 «base 가 달랐다» 인지
+//      읽을 수 없었고, base env 가 원격에 무엇으로 전달됐는지도 어디에도 찍히지 않았다.
+//   ⇒ (1) 원격 디스패치마다 base env 를 `ref@sha` 로 «풀어서» 한 줄 찍는다 — 두 호스트가 같은 줄을
+//        찍는 것이 교차 측정의 전제다. (2) push 실패는 rc·문면으로 «권한/자격증명» 과 «그 밖»을 가르고
+//        처방을 같이 찍는다. (3) base ref 를 이 트리에서 풀 수 없으면 원격을 «띄우지 않고» 멈춘다 —
+//        다른 base 로 잰 판정을 두 호스트가 «같다»고 믿게 만든 것이 이 칸의 사고였다.
+//   ⛔ 로컬 경로(--local · Pod · CI)의 출력·원장 형식은 건드리지 않는다 — 아래 줄은 원격 디스패치 안에서만 나온다.
+const BASE_ENV_KEYS = ['NODE_OPTIONS', 'TSC_BASE_REF', 'TSC_HEAP_MB'] as const;
+
+export interface RemoteBaseEnv {
+  /** 원격으로 push 해 sha 로 받아야 하는 ref. TSC_BASE_REF 가 없으면 비어 있다(merge-base 는 HEAD 의 조상이라 HEAD 와 함께 간다). */
+  refs: string[];
+  /** 무엇을 base 로 골랐나 — TSC_BASE_REF 의 ref 이름, 없으면 `merge-base(origin/main)`. */
+  baseLabel: string;
+  /** base 를 이 트리에서 푼 sha — 두 호스트가 같은 값을 찍어야 교차 측정이 성립한다. */
+  baseSha?: string;
+  /** 원격 명령에 전달하는 env 키들. */
+  keys: string[];
+  /** 원격 명령 앞에 붙일 `KEY=VALUE`. TSC_BASE_REF 는 «항상» 이 트리에서 고정한 sha 로 넘긴다
+   *  (ref 는 dispatch 가 push 한 sha · 없으면 merge-base sha) — 원격이 제 origin/main 으로 다시 풀지 않는다. */
+  forward: (sha: (ref: string) => string) => string[];
+  /** 이 트리에서 base 를 sha 로 고정할 수 없을 때의 사유 — 있으면 원격 디스패치를 멈춘다. */
+  failure?: string;
+}
+
+const firstErrorLine = (thrown: unknown): string => (thrown instanceof Error ? thrown.message : String(thrown)).split('\n')[0].trim();
+
+export function remoteBaseEnv(
+  env: NodeJS.ProcessEnv,
+  resolve: (ref: string) => string = (ref) => execFileSync('git', ['rev-parse', '--verify', '--quiet', ref], { encoding: 'utf8' }).trim(),
+  mergeBase: () => string = () => execFileSync('git', ['merge-base', 'HEAD', 'origin/main'], { encoding: 'utf8' }).trim(),
+): RemoteBaseEnv {
+  const baseRef = env.TSC_BASE_REF;
+  let baseSha: string | undefined;
+  let failure: string | undefined;
+  if (baseRef) {
+    try { baseSha = resolve(baseRef) || undefined; } catch (thrown) {
+      failure = `TSC_BASE_REF=${baseRef} 를 이 트리에서 sha 로 풀 수 없다 (${firstErrorLine(thrown) || 'git rev-parse 실패'})`;
+    }
+    if (!baseSha && !failure) failure = `TSC_BASE_REF=${baseRef} 를 이 트리에서 sha 로 풀 수 없다 (git rev-parse 빈 출력)`;
+  } else {
+    // TSC_BASE_REF 가 없으면 원격 쪽 기본(merge-base(origin/main))을 «여기서» 미리 풀어 sha 로 못 박는다 —
+    //   원격 미러의 origin/main 은 이 트리와 다를 수 있다(같은 head 인데 base 가 갈린 이 칸의 사고 · 리뷰 r1 must-fix).
+    try { baseSha = mergeBase() || undefined; } catch (thrown) {
+      failure = `merge-base(HEAD, origin/main) 을 이 트리에서 풀 수 없다 (${firstErrorLine(thrown) || 'git merge-base 실패'})`;
+    }
+    if (!baseSha && !failure) failure = 'merge-base(HEAD, origin/main) 을 이 트리에서 풀 수 없다 (git merge-base 빈 출력)';
+  }
+  const passKeys = BASE_ENV_KEYS.filter((key) => key !== 'TSC_BASE_REF' && env[key]);
+  return {
+    refs: baseRef ? [baseRef] : [],
+    baseLabel: baseRef || 'merge-base(origin/main)',
+    baseSha,
+    keys: ['TSC_BASE_REF', ...passKeys],
+    forward: (sha) => [`TSC_BASE_REF=${baseRef ? sha(baseRef) : baseSha}`, ...passKeys.map((key) => `${key}=${env[key]}`)],
+    failure,
+  };
+}
+
+/** 두 호스트가 같은 head·base 를 쟀는지 «눈으로» 비교할 수 있는 한 줄. 호스트 이름만 다르다. */
+export function describeRemoteBaseEnv(env: RemoteBaseEnv, host: string): string {
+  const base = `${env.baseLabel}@${env.baseSha ?? '미해석'}`;
+  return `[tsc-gate] base env [${host}] — base=${base} · refs=${env.refs.length} · forward=${env.keys.join(',') || '없음'}`;
+}
+
+export type RemoteInfraCause = 'base-env' | 'push-permission' | 'push-failed' | 'other';
+
+export interface RemoteDiagnosis { cause: RemoteInfraCause; message: string; hints: string[] }
+
+/** push 거부 문면에서 «미러 쓰기 권한·자격증명» 을 가리키는 신호. */
+export const PUSH_PERMISSION_SIGNAL = /permission denied|publickey|could not read (?:Username|Password)|authentication failed|host key verification failed|access denied|terminal prompts disabled/i;
+
+export const BASE_ENV_HINTS = [
+  'base 는 두 호스트가 «같은 커밋» 이어야 한다 — 위 base= 줄에서 @뒤 sha 가 같은지 먼저 본다.',
+  'TSC_BASE_REF 는 양쪽 트리에 존재하는 ref(또는 sha)로 준다 — 한쪽에만 있는 브랜치면 introduced 가 갈린다.',
+];
+
+export function baseEnvDiagnosis(env: RemoteBaseEnv, host: string): RemoteDiagnosis | undefined {
+  if (!env.failure) return undefined;
+  return { cause: 'base-env', message: `${env.failure} — ${host} 를 띄우지 않는다`, hints: BASE_ENV_HINTS };
+}
+
+export function formatRemoteDiagnosis(diagnosis: RemoteDiagnosis): string[] {
+  return [
+    `[tsc-gate] ⛔ 원격 판정 실패 원인 [${diagnosis.cause}] — ${diagnosis.message}`,
+    ...diagnosis.hints.map((hint) => `[tsc-gate]   ${hint}`),
+  ];
+}
+
+export function diagnoseRemoteOutcome(
+  outcome: { kind: 'ran' | 'busy' | 'infra'; reason?: string },
+  host: string,
+  env: RemoteBaseEnv,
+): RemoteDiagnosis | undefined {
+  const base = baseEnvDiagnosis(env, host);
+  if (base) return base;
+  if (outcome.kind !== 'infra') return undefined;
+  const reason = outcome.reason ?? '';
+  const push = /^push-failed rc=(\d+)/.exec(reason);
+  if (!push) return {
+    cause: 'other',
+    message: `원격 판정 인프라 실패 — ${reason}`,
+    hints: [`같은 head·base 인데 이 호스트에서만 실패하면 위 base env 줄을 호스트끼리 비교한다.`],
+  };
+  const rc = Number(push[1]);
+  if (rc === 128 && PUSH_PERMISSION_SIGNAL.test(reason)) return {
+    cause: 'push-permission',
+    message: `원격 push 거부 rc=128 — ${host} 미러에 쓰기 권한/자격증명이 없다`,
+    hints: [
+      `호스트 접근부터 확인: ssh -o BatchMode=yes ${host} true (rc=0 이어야 한다 — 아니면 키·호스트 항목 문제다)`,
+      `미러 쓰기 확인: ssh ${host} -- 'test -w <mirror>.git' — 권한이 없으면 ELANOUS_GATE_REMOTE_MIRROR 로 쓰기 가능한 미러를 준다`,
+      'push 는 자격증명이 없으면 «터미널 프롬프트 없이» 죽는다 — 대화형 ssh 로 한 번 손으로 push 해 rc 를 본다.',
+    ],
+  };
+  return {
+    cause: 'push-failed',
+    message: `원격 push 실패 rc=${rc} — ${host}`,
+    hints: [`push 출력: ${reason}`, '미러 경로·디스크 여유를 확인하고, 반복되면 같은 트리에서 손으로 push 해 원문을 남긴다.'],
+  };
+}
+
 if (import.meta.main) void (async () => {
   // GATE-REMOTE (10-06): the only accepted arguments are the dispatch flags `--remote [host]` / `--local` — they choose
   //   «where» the same commit is measured, never «what» (the base stays merge-base(origin/main) on both sides).
@@ -1333,15 +1456,26 @@ if (import.meta.main) void (async () => {
   const repo = sh('git rev-parse --show-toplevel').trim();
   const onMbp = forbidFullTypecheckOnLocal(process.env, hostname(), repo);
   const dispatchFlags = typecheckDispatchFlags(flags, process.env, hostname(), repo);
-  const baseRef = process.env.TSC_BASE_REF;
-  const passEnv = (sha: (ref: string) => string) => (['NODE_OPTIONS', 'TSC_BASE_REF', 'TSC_HEAP_MB'] as const).filter((key) => process.env[key])
-    .map((key) => `${key}=${key === 'TSC_BASE_REF' && baseRef !== 'origin/main' ? sha(baseRef!) : process.env[key]}`);
+  const baseEnv = remoteBaseEnv(process.env);
+  // 원격만 재는 자리에서 base ref 를 «이 트리에서» 못 풀면, 두 호스트가 «다른 base» 로 잰 판정을
+  //   «같은 답»처럼 찍게 된다 — 그래서 띄우지 않고 멈춘다(원인과 처방을 남긴다). --local 은 그대로 간다.
+  if (baseEnv.failure && dispatchFlags.remote !== undefined && !flags.local) {
+    for (const line of formatRemoteDiagnosis(baseEnvDiagnosis(baseEnv, dispatchFlags.remote === true ? '기본 원격' : dispatchFlags.remote)!)) console.error(line);
+    console.error('[tsc-gate]   ⇒ 원격을 띄우지 않는다. base 를 양쪽 호스트가 «같이» 푸는 ref/sha 로 고친 뒤 다시 돌려라.');
+    process.exit(2);
+  }
   // exitCode, not exit(): piped stdout/stderr drain before the process ends.
   process.exitCode = await dispatchHeavyCheck({
     tool: 'ci-typecheck-changed', repo, flags: dispatchFlags, explicitRemoteOnly: dispatchFlags.remote !== undefined,
     stableCheckout: true, installPwa: true,
-    remoteArgv: (sha) => { const vars = passEnv(sha); return [...(vars.length ? ['env', ...vars] : []), 'bun', 'run', 'scripts/ci-typecheck-changed.ts', '--local']; },
-    refs: baseRef ? [baseRef] : [],
+    remoteArgv: (sha) => { const vars = baseEnv.forward(sha); return [...(vars.length ? ['env', ...vars] : []), 'bun', 'run', 'scripts/ci-typecheck-changed.ts', '--local']; },
+    refs: baseEnv.refs,
+    // 원격 판정이 «무엇으로» 났는지 호스트마다 같은 문면으로 남긴다 — 교차 측정의 대조 줄.
+    onRemoteOutcome: (outcome, host) => {
+      console.error(describeRemoteBaseEnv(baseEnv, host));
+      const diagnosis = diagnoseRemoteOutcome(outcome, host, baseEnv);
+      if (diagnosis) for (const line of formatRemoteDiagnosis(diagnosis)) console.error(line);
+    },
     runLocal: () => { runGate({ forbidFullLocal: onMbp }); return 0; },
   });
 })();

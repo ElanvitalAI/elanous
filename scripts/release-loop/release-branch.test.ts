@@ -13,6 +13,11 @@ import { parseOptions as gateOptions } from './gate-node.js';
 import { debug } from '../../src/debug/log.js';
 import { TRACEABLE_RELEASE_JSON } from './gate-closure.js';
 
+const releaseSnapshot = {
+  graphSha: createHash('sha256').update(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'))).digest('hex'),
+  recipesSha: createHash('sha256').update(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'))).digest('hex'),
+};
+
 // RELEASE-BRANCH ⊕ RELEASE-REHEARSAL-RC (10-06): real git against a temporary bare origin; install is injected and
 // nothing is published.
 setDefaultTimeout(60_000);
@@ -158,7 +163,7 @@ test('RELEASE-BRANCH resume refuses a non-fast-forward tip, a run that is not fa
       nodes: [{ nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: '0.2.18-rc.0', commit: 'a'.repeat(40), ...(branch ? { branch } : {}) }) },
         ...['cutoff', 'gate', 'prepare'].map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true, output: '{"outcome":"ok"}' })),
         { nodeId: 'npm-publish', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' }],
-      executed: 1, dryRun: false, statePath: runFile }));
+      executed: 1, dryRun: false, statePath: runFile, graphSnapshot: releaseSnapshot }));
     const git = (args: string[]) => args[0] === 'ls-remote' ? `${'b'.repeat(40)}\trefs/heads/release/0.2.18-rc.0` : args[0] === 'rev-parse' ? 'b'.repeat(40) : '';
     // A main-cut or --cut-commit run has no branch of its own: never re-pointed at a same-named branch.
     write('failed', { version: '0.2.18-rc.0' }, undefined);
@@ -216,6 +221,7 @@ test('GATE-REUSE-BY-DIFF: a current-graph export-check resume plans the later ga
     writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'r', status: 'failed',
       input: { version, branchCut: true }, path: ['version-release', 'export-check', 'prefetch', 'gate', 'failed'],
       nodes: [{ nodeId: 'version-release', ok: true, output: JSON.stringify({ outcome: 'ok', version, branch: `release/${version}`, commit: old }) }],
+      graphSnapshot: releaseSnapshot,
     }));
     writeFileSync(join(releaseDir, 'gate-failures.json'), JSON.stringify({ commit: old, failures: [] }));
     writeFileSync(join(releaseDir, 'gate-verdict.json'), JSON.stringify({ commit: old, outcome: 'ok' }));
@@ -240,6 +246,7 @@ test('RELEASE-APPEND-SCOPE-SKIP: export-check resume plans only the verified JSO
     const savedRun = { graphId: 'release-loop', runId: 'r', status: 'failed',
       input: { version, branchCut: true }, path: ['version-release', 'export-check', 'prefetch', 'gate', 'failed'],
       nodes: [{ nodeId: 'version-release', ok: true, output: JSON.stringify({ outcome: 'ok', version, branch: `release/${version}`, commit: old }) }],
+      graphSnapshot: releaseSnapshot,
     };
     writeFileSync(runFile, JSON.stringify(savedRun));
     writeFileSync(join(releaseDir, 'gate-failures.json'), JSON.stringify({ commit: old, failures: [] }));
@@ -389,8 +396,8 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     const resumed = await resumeReleaseRun({ runId: first.runId, from: 'export-check', commandRoot }, { root: state, repo: f.repo, runBash });
     expect(resumed.tip).toMatchObject({ changed: true, from: cut, to: tip });
     expect(resumed.state.status).toBe('done');
-    expect(seen.map((item) => item.nodeId)).toEqual(['export-check', 'prefetch', 'gate', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues',
-      'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump']);
+    expect(seen.map((item) => item.nodeId)).toEqual(['export-check', 'prefetch', 'gate', 'traffic-gate-passed', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues',
+      'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump']);
     // Shadow publication on the real resume path: the three post-approval visits must dispatch three
     // distinct commands. The injected runner never publishes anything outside this temporary test universe.
     expect(seen.filter((item) => ['publish', 'npm-publish', 'docs-land'].includes(item.nodeId)).map((item) => [item.nodeId, item.command]))
@@ -496,7 +503,7 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
       nodes: [{ nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: '0.2.18', commit: recorded, branch: 'release/0.2.18' }) },
         { nodeId: 'cutoff', ok: true, exit: 0, executed: true, output: '{"outcome":"ok"}' },
         { nodeId: 'gate', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' }],
-      executed: 1, dryRun: false, statePath: runFile }));
+      executed: 1, dryRun: false, statePath: runFile, graphSnapshot: releaseSnapshot }));
     };
     let changed = 'scripts/audit.test.ts\n';
     const git = (args: string[]) => args[0] === 'ls-remote' ? `${tip}\trefs/heads/release/0.2.18` : args[0] === 'rev-parse' ? tip : args[0] === 'diff' ? changed : '';

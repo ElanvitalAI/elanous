@@ -1,5 +1,7 @@
 graph_id: work-research-report-rehearsal
 version: 1
+# TASK-HAND-GRAPH-RUN — `tasks hand --completion research-report` 가 이 조합을 실제 graph run(runGraph)으로 발사한다.
+launcher: graph-run
 entry_node: make-doc
 terminal_nodes: [done, failed]
 nodes:

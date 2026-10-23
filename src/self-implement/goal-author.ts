@@ -8,6 +8,8 @@ import { extractSlugSource, generateMissionSlug, slugify } from '../autopilot/mi
 import { enhancePrompt, type EnhanceOpts, type EnhanceResult } from '../prompt-enhance/enhance.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { debug } from '../debug/log.js';
+import { ensureDeviceFirstSteps, inspectDeviceFirstGoal } from './device-first.js';
+import { COMPLETION_BOUNDARY_STEP_PREFIX, FOLDED_DEVICE_FIRST_ACTION_MARKER } from './goal-author-decompose.js';
 
 function observeGoalAuthor(
   category: 'goal-author' | 'goal-author.clarify',
@@ -48,6 +50,7 @@ import { resolveGoalDocumentsDir } from './goal-documents-dir.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR } from './off-diff-evidence.js';
 import { renderLaunchPreflight, siblingTestPath, type LaunchPreflightResult } from '../self-dev/launch-preflight-text.js';
 import { quoteShellArg } from '../cli/logs-cli.js';
+import { focusedEvidenceTestPath } from './evidence-command-budget.js';
 import type { HarnessGroundingProvenance } from './context-capsule.js';
 import { hasGoalStepCodeName } from './goal-step-code-name.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
@@ -2369,7 +2372,7 @@ const CONSTANT_DOCUMENT_INSTRUCTION_POLICY = [
 ] as const;
 
 export const GOAL_RULES_POLICY = [
-  '- Do not run the whole test suite. If tests apply, name the focused file(s) and read only each summary line; a full suite can exhaust the implementer context window.',
+  '- Do not run the whole test suite. If tests apply, name the focused file(s) and read only each summary line; a full suite can exhaust the implementer context window. If the same evidence test times out twice, stop rerunning it and switch to a narrower direct-import test; report the timeout and replacement command.',
   '- Do not infer a code path from a symbol grep. Trace a candidate before naming it as an implementation target.',
   '- Do not create a planner, milestones, steps, task decomposition, worktree, PR, mission, daemon call, or dev-pipeline hand-off; this artifact is authoring only.',
   '- Do not write an acceptance criterion that cannot hold at the same time as another one. Naming a field to add while demanding that same return value stay completely unchanged is a trap, not a contract: name the fields and values that must stay identical.',
@@ -2844,13 +2847,24 @@ export function verificationBehaviour(checklist: readonly string[], ask: string)
 function observedVerificationPlan(input: Omit<VerificationPlanInput, 'menu' | 'catalog'>, repositoryRoot: string | undefined, authorRunId: string): string[] {
   try {
     const plan = authorVerificationPlan({ ...input, ...readVerificationMenuDocs(repositoryRoot) });
+    const device = inspectDeviceFirstGoal(input.ask, repositoryRoot);
+    if (device.required) {
+      try { debug.log('goal-author.verify', 'device-check', {
+        authorRunId, device: device.device, exists: device.exists, inventoryMeasured: device.inventoryMeasured,
+        firstSlice: device.firstSliceKind,
+      }); } catch { /* observation is fail-soft */ }
+    }
     try {
       observeGoalAuthor('goal-author', 'verification-plan', {
         authorRunId, source: plan.stage.source, stageId: plan.stage.id, level: plan.stage.level,
         menuPresent: plan.menuPresent, catalogPresent: plan.catalogPresent,
       });
     } catch { /* observation is fail-soft */ }
-    return plan.lines;
+    return device.required
+      ? [...plan.lines.slice(0, 3), device.inventoryMeasured
+        ? `- 쓸 장치: ${device.device} · ${device.exists ? '기존 장치' : '필요한 장치 · 없음 — 첫 조각에서 개발'}`
+        : `- 장치 재고: 미측정(대상 루트 미상) · 후보: ${device.device}`, ...plan.lines.slice(3)]
+      : plan.lines;
   } catch (error) {
     try { observeGoalAuthor('goal-author', 'verification-plan-failed', { authorRunId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
     return [VERIFICATION_PLAN_HEADING, '- UNVERIFIABLE: 검증 계획 저작이 실패했다 — 사람이 다섯 줄(동작·무대·RED·GREEN·배선)을 채운다.'];
@@ -5228,15 +5242,18 @@ function requiredEvidenceInformation(criteria: readonly CheckableCriterion[]): s
   return [`${REQUIRED_EVIDENCE_ANNOTATION_PREFIX} acceptance-criterion evidence kinds: ${[...counts.entries()].map(([type, count]) => `${type} ${count}`).join(', ')}.`];
 }
 
-function requiredEvidence(criteria: readonly CheckableCriterion[], targetPaths: readonly string[], authorRunId: string): string[] {
+function requiredEvidence(criteria: readonly CheckableCriterion[], targetPaths: readonly string[], authorRunId: string, repositoryRoot?: string): string[] {
   const lines = [
     ...collapseEvidenceKinds(criteria).map(({ tag, evidence }) => `- [${tag}] ${evidence}`),
     ...requiredEvidenceInformation(criteria),
   ];
-  const siblingTests = [...new Set(targetPaths.flatMap((path) => {
-    const sibling = siblingTestPath(path);
-    return sibling ? [sibling] : [];
-  }))];
+  const choices = targetPaths.map((path) => ({ path, sibling: siblingTestPath(path), selected: focusedEvidenceTestPath(path, repositoryRoot) }));
+  const siblingTests = [...new Set(choices.flatMap(({ selected }) => selected ? [selected] : []))];
+  const budgetDecisions = choices.filter(({ sibling, selected }) => sibling && sibling !== selected);
+  if (budgetDecisions.length) {
+    try { observeGoalAuthor('goal-author', 'required-evidence-command-budget', { authorRunId, decisions: budgetDecisions }); }
+    catch { /* observation is fail-soft */ }
+  }
   const firstEvidenceLine = lines.findIndex((line) => line.startsWith('- ['));
   const appendedSiblingTestCount = siblingTests.length && firstEvidenceLine >= 0 ? siblingTests.length : 0;
   if (appendedSiblingTestCount) {
@@ -5688,6 +5705,14 @@ async function authorGoalWithSupersededRootIntent(
       } catch { /* observation is fail-soft */ }
     }
   }
+  if (goalType === 'implement' && resolvedSteps?.length) {
+    // ⭐ must-fix — 경계 분기가 내준 «접힌» step 은 장치 RED 가 «같은 런의 첫 동작» 으로 이미 들어 있다.
+    //   다시 staging 하면 «운영 코드 변경 0» 장치 조각이 step 앞에 이중으로 끼워져 모순 문면이 된다.
+    const foldedBoundaryStep = resolvedSteps.length === 1
+      && resolvedSteps[0]!.includes(COMPLETION_BOUNDARY_STEP_PREFIX)
+      && resolvedSteps[0]!.includes(FOLDED_DEVICE_FIRST_ACTION_MARKER);
+    if (!foldedBoundaryStep) resolvedSteps = ensureDeviceFirstSteps(ask, resolvedSteps, deps.repositoryRoot).steps;
+  }
   const explicitGoalTitle = deps.goalTitle === undefined ? undefined : validGoalSummary(deps.goalTitle);
   if (deps.goalTitle !== undefined && !explicitGoalTitle) throw new Error('goalTitle must contain non-whitespace text');
   endAssembleSubphase();
@@ -5986,7 +6011,7 @@ async function authorGoalWithSupersededRootIntent(
     ...preservationAmbiguityClarification(clarificationQuestions, clarificationResponses),
     '',
     '## REQUIRED EVIDENCE',
-    ...requiredEvidence(criteria, facts ? implementationCandidates(facts) : [], authorRunId),
+    ...requiredEvidence(criteria, facts ? implementationCandidates(facts) : [], authorRunId, deps.repositoryRoot),
     '',
     ...(goalType === 'implement' ? ['## TRACED PATHS', ...tracedPathsSection(facts, ask, deps.repositoryRoot, narrative.tracedPathsUnavailableEvidence), ''] : []),
     '## SCOPE BOUNDARY',

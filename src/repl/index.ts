@@ -50,6 +50,7 @@ import { parse as parseYaml } from 'yaml';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
 import { buildSeatBootSystemMessages, type SeatBootDeps } from '../dashboard/seat-boot-preamble.js';
+import { installNextTuiSelfHealthTracker } from '../tui/chat/self-health-status.js';
 
 /** Private side channel for the next TUI. Ordinary REPL JSONL stdout is unchanged. */
 const NEXT_TUI_BG_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
@@ -189,6 +190,14 @@ function buildReplTools(): {
   const bashMod = require('../skills/tools/index.js') as typeof import('../skills/tools/index.js');
   specs.push(bashMod.buildBashTool());
   dispatchByName.set('Bash', async (args) => bashMod.dispatchBash(args, { cwd: process.cwd() }));
+  // TUI-NEXT-QUEUE-AND-WAKE: the next TUI parent opens an IPC hop only for its own REPL children;
+  // the classic ScheduleWakeup spec is advertised and each call is answered by the parent's scheduler.
+  const wakeMod = require('../tui-client/next-wakeup.js') as typeof import('../tui-client/next-wakeup.js');
+  const wakeup = wakeMod.createReplWakeupTool(process as unknown as import('../tui-client/next-wakeup.js').WakeupIpcProcess);
+  if (wakeup) {
+    specs.push(wakeup.spec);
+    dispatchByName.set(wakeup.spec.name, wakeup.dispatch);
+  }
   const planner = sr.createSearchPlannerState({ maxAutoNarrowCandidates: 2 });
   const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
     try {
@@ -594,6 +603,8 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
     } catch { /* suggestions must not interrupt the REPL */ }
   }
   const sessionIdRef = { current: session.id };
+  const selfHealthTracker = installNextTuiSelfHealthTracker();
+  selfHealthTracker?.setSessionId(session.id);
 
   const nextTuiDelivery = process.env.ELANOUS_NEXT_TUI_BG_STATUS === '1'
     ? { pending: [] as PendingTaskNotification[] } : undefined;
@@ -747,6 +758,11 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         if (att) turnAttachments.push(att);
       }
       backgroundBridge?.beginTurn();
+      const selfHealth = selfHealthTracker?.snapshot(sessionIdRef.current) ?? null;
+      if (selfHealth && typeof turn.id === 'string') {
+        process.stdout.write(`${JSON.stringify({ event: 'self-health', turnId: turn.id, sessionId: sessionIdRef.current, selfHealth })}\n`);
+      }
+      const turnSystemPrompt = selfHealth ? `${systemPrompt}\n\n${selfHealth.line}` : systemPrompt;
       let result: Awaited<ReturnType<typeof runOneTurn>>;
       try {
         result = await runOneTurn(
@@ -755,7 +771,7 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
           turn.prompt,
           turnAttachments,
           tools,
-          systemPrompt,
+          turnSystemPrompt,
           true, // JSONL stream → always JSON output
           nextTuiDelivery,
           process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
@@ -779,10 +795,12 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         durationMs: result.durationMs,
         logPath: result.logPath,
         assertFailures: failures,
+        selfHealth,
       };
       console.log(JSON.stringify(out));
     }
     backgroundBridge?.dispose();
+    selfHealthTracker?.dispose();
     return 0;
   }
 

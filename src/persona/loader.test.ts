@@ -196,3 +196,28 @@ describe('offsiteNavigation — 파서가 «읽나»', () => {
     if (r.ok) expect(r.profile.offsiteNavigation).toBeUndefined();
   });
 });
+
+/** 🗣️ TUI-SPEECH-STYLE-CHARACTER — 「타입에 있다」와 「파서가 읽는다」는 «다른 값»이다(이 파일의 규율). */
+describe('parsePersonaYaml speechStyle', () => {
+  const base = 'personaId: mira\ndisplayName: Mira\n';
+
+  test('선언한 말투를 «실제로» 옮긴다', () => {
+    const r = parsePersonaYaml(`${base}speechStyle: 짧고 단정하게 — 결론 먼저\n`, 'mira.yaml');
+    expect(r.ok && r.profile.speechStyle).toBe('짧고 단정하게 — 결론 먼저');
+    if (r.ok) expect(Object.isFrozen(r.profile)).toBe(true);
+  });
+
+  test('안 적으면 «없다» — 기본 말투를 조용히 채우지 않는다', () => {
+    const r = parsePersonaYaml(base, 'mira.yaml');
+    expect(r.ok && r.profile.speechStyle).toBeUndefined();
+  });
+
+  test.each(['speechStyle: ""\n', 'speechStyle: "  "\n', 'speechStyle:\n', 'speechStyle: 123\n', 'speechStyle: [짧게]\n'])(
+    'rejects empty or non-string speechStyle: %s',
+    (declaration) => {
+      expect(parsePersonaYaml(`${base}${declaration}`, 'mira.yaml')).toEqual({
+        ok: false, error: { code: 'invalid-shape', path: 'mira.yaml', message: 'speechStyle must be a non-empty string' },
+      });
+    },
+  );
+});

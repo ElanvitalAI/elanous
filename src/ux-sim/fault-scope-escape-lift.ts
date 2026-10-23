@@ -10,6 +10,11 @@
 //    ② 원장 줄 pod-child-run ⊕ pod-child-evidence — self-implement-pod.ts 가 쓰는 꼴 그대로 appendRunLedgerEntry
 //    ③ classifyHarnessPodExit → recordHarnessPodStop(부모 stop) → recordClassifiedHarnessPodExit(incident) · harness-cli-command.ts
 //    부모 출력 줄은 formatOrchestrateResultLine(운영 요약 줄) ⊕ extractPodFailureReason(운영 Pod 사유)로 만든다.
+//    ④ 처방 = AUTOHEAL_ACTION_BY_CLASS[stop.class](stop-autoheal.ts 표) — «런 계속(resume-from-salvage)» vs «정지(needs-owner)».
+//
+// 🔀 SCOPE-ESCAPE-AS-REFINE (2026-10-22 · 대표 «범위 밖 허용도 로직으로») — 정지 사유(삭제·보호 경로·상한) 없는 held 편집은
+//    scope-escape 가 아니라 newScope(«구현이 알려준 새 범위»)로 기록된다. 사례 셋:
+//    'scope-escape' = 사유 없는 held(옛 정지 → 이제 계속) · 'scope-stop' = 삭제 사유 held(여전히 정지) · 'implementation-deficit' = held 없음.
 //    kubectl·Pod·네트워크는 없다. 쓰기는 임시 ELANOUS_STATE_DIR 하나에만 가고 끝에 지운다.
 
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -23,8 +28,9 @@ import { classifyHarnessPodExit, recordClassifiedHarnessPodExit, recordHarnessPo
 import { readRunExits } from '../harness/harness-incidents.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { readRunStopRecord, type RunStopRecord } from '../self-implement/run-stop.js';
+import { AUTOHEAL_ACTION_BY_CLASS, type AutohealAction } from '../self-implement/stop-autoheal.js';
 
-export type ScopeEscapeLiftCase = 'scope-escape' | 'implementation-deficit';
+export type ScopeEscapeLiftCase = 'scope-escape' | 'scope-stop' | 'implementation-deficit';
 
 /** 두 입력이 공유하는 자식 끝 JSON 몸통 — `attachAbandonedClassification` 이 붙이는 분류 꼴 그대로. */
 function childBase(): Record<string, unknown> {
@@ -55,6 +61,11 @@ export function scopeEscapeChildResult(): Record<string, unknown> {
   return { ...childBase(), ...held };
 }
 
+/** 정지 사유가 있는 범위 이탈 — orchestrator decideScopeExpansion 이 삭제를 보고 held 한 끝 JSON(scopeStopReasons 한 칸 더). */
+export function scopeStopChildResult(): Record<string, unknown> {
+  return { ...scopeEscapeChildResult(), scopeStopReasons: ['deletion'] };
+}
+
 /** 구현 결손 — held 편집 없이 같은 분류(implementation-deficit)로 멈춘 끝 JSON. */
 export function implementationDeficitChildResult(): Record<string, unknown> {
   return childBase();
@@ -74,6 +85,10 @@ export interface ScopeEscapeLiftObservation {
   readonly stop: RunStopRecord | undefined;
   /** recordClassifiedHarnessPodExit 가 incidents 에 쓴 한 줄. */
   readonly incident: { reason: string; childEvidence?: PodChildEvidence } | undefined;
+  /** stop class 의 기본 처방(AUTOHEAL_ACTION_BY_CLASS) — needs-owner 면 정지, 아니면 런이 이어진다. */
+  readonly autohealAction: AutohealAction | undefined;
+  /** childEvidence.newScope — «구현이 알려준 새 범위»(정지 사유 없는 범위 밖 편집). */
+  readonly newScope: readonly string[] | undefined;
 }
 
 function withTempState<T>(fn: (root: string) => T): T {
@@ -91,7 +106,8 @@ function withTempState<T>(fn: (root: string) => T): T {
 /** 한 자식 실패를 부모 기록 경로 전체에 흘리고 각 층의 필드를 돌려준다. */
 export function simScopeEscapeLift(
   which: ScopeEscapeLiftCase,
-  childResult: Record<string, unknown> = which === 'scope-escape' ? scopeEscapeChildResult() : implementationDeficitChildResult(),
+  childResult: Record<string, unknown> = which === 'scope-escape' ? scopeEscapeChildResult()
+    : which === 'scope-stop' ? scopeStopChildResult() : implementationDeficitChildResult(),
 ): ScopeEscapeLiftObservation {
   const suffix = randomBytes(4).toString('hex');
   const runId = `run-sim-scope-lift-${suffix}`;
@@ -121,6 +137,7 @@ export function simScopeEscapeLift(
     const ledger = loadRunLedger(runId, dir) ?? [];
     const stopEntry = ledger.find((entry) => entry.event === 'stop');
     const incidentRow = readRunExits(root).find((row) => row.runId === runId);
+    const stop = stopEntry ? readRunStopRecord(stopEntry) : undefined;
     return {
       case: which,
       disposition: {
@@ -130,9 +147,11 @@ export function simScopeEscapeLift(
       childEvidence,
       ledgerChildEvidence: ledger.find((entry) => entry.event === 'pod-child-evidence')?.data.childEvidence,
       parentExitReason: classified.reason,
-      stop: stopEntry ? readRunStopRecord(stopEntry) : undefined,
+      stop,
       incident: incidentRow ? { reason: incidentRow.reason,
         ...(incidentRow.childEvidence ? { childEvidence: incidentRow.childEvidence } : {}) } : undefined,
+      autohealAction: stop ? AUTOHEAL_ACTION_BY_CLASS[stop.class] : undefined,
+      newScope: childEvidence?.newScope,
     };
   });
 }
@@ -140,6 +159,8 @@ export function simScopeEscapeLift(
 export interface ScopeEscapeLiftPair {
   readonly scopeEscape: ScopeEscapeLiftObservation;
   readonly implementationDeficit: ScopeEscapeLiftObservation;
+  /** 정지 사유(삭제) 있는 범위 이탈 — 비교 밖 · 정지가 남아 있음을 같은 화면에 보인다. */
+  readonly scopeStop: ScopeEscapeLiftObservation;
   /** 두 결과가 갈린 칸(고정 순서). */
   readonly differingFields: readonly string[];
   /** 두 결과가 같은 칸(고정 순서). */
@@ -152,23 +173,27 @@ const COMPARED: ReadonlyArray<readonly [string, (o: ScopeEscapeLiftObservation) 
   ['childEvidence.classification', (o) => o.childEvidence?.classification],
   ['childEvidence.scopeEscape', (o) => o.childEvidence?.scopeEscape],
   ['childEvidence.outOfScopeEdits', (o) => o.childEvidence?.outOfScopeEdits],
+  ['childEvidence.newScope', (o) => o.childEvidence?.newScope],
   ['childEvidence.detail', (o) => o.childEvidence?.detail],
   ['parentExitReason', (o) => o.parentExitReason],
   ['stop.class', (o) => o.stop?.class],
-  ['stop.cause', (o) => o.stop?.cause],
+  // 무작위 Job 이름 접미는 비교에서 뺀다 — 같은 사유가 Job 이름 때문에 «갈렸다» 고 읽히지 않게.
+  ['stop.cause', (o) => o.stop?.cause.replace(/si-sim-scope-lift-[0-9a-f]+/g, 'si-sim-scope-lift-*')],
   ['incident.reason', (o) => o.incident?.reason],
+  ['autohealAction', (o) => o.autohealAction],
 ];
 
 /** 두 입력을 나란히 흘리고 갈린 칸을 센다. */
 export function simScopeEscapeLiftPair(): ScopeEscapeLiftPair {
   const scopeEscape = simScopeEscapeLift('scope-escape');
   const implementationDeficit = simScopeEscapeLift('implementation-deficit');
+  const scopeStop = simScopeEscapeLift('scope-stop');
   const differingFields: string[] = [];
   const sameFields: string[] = [];
   for (const [name, read] of COMPARED) {
     (JSON.stringify(read(scopeEscape)) === JSON.stringify(read(implementationDeficit)) ? sameFields : differingFields).push(name);
   }
-  return { scopeEscape, implementationDeficit, differingFields, sameFields };
+  return { scopeEscape, implementationDeficit, scopeStop, differingFields, sameFields };
 }
 
 /** CLI·시험 출력 한 화면 — 두 분류 원문을 나란히. */
@@ -176,10 +201,12 @@ export function renderScopeEscapeLift(pair: ScopeEscapeLiftPair): string[] {
   const row = (o: ScopeEscapeLiftObservation): string =>
     `  ${o.case} · classification=${o.childEvidence?.classification ?? '-'} · scopeEscape=${String(o.childEvidence?.scopeEscape ?? '-')}`
     + ` · exit=${o.parentExitReason} · stop=${o.stop?.class ?? '-'} · incident=${o.incident?.reason ?? '-'}`
-    + ` · failureClassification=${o.disposition.failureClassification ?? '-'}`;
+    + ` · failureClassification=${o.disposition.failureClassification ?? '-'}`
+    + ` · newScope=${o.newScope ? JSON.stringify(o.newScope) : '-'} · autoheal=${o.autohealAction ?? '-'}`;
   return [
     'scope-escape-lift · 층 L1 · 운영 함수 직접 호출(kubectl·네트워크 0)',
     row(pair.scopeEscape),
+    row(pair.scopeStop),
     row(pair.implementationDeficit),
     `  다른 칸: ${pair.differingFields.join(', ') || '없음'}`,
     `  같은 칸: ${pair.sameFields.join(', ') || '없음'}`,

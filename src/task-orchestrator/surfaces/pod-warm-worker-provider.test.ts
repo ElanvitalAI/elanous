@@ -1,10 +1,12 @@
-import { expect, spyOn, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WarmPodProvider, requestWarmPodReplay, configureWarmPodProvider } from './pod-warm-worker-provider.js';
+import { WarmPodProvider, requestWarmPodReplay, configureWarmPodProvider, parseWarmPodProviderArgs,
+  pairWarmReuseTimeLegs, readWarmReuseTimePairs } from './pod-warm-worker-provider.js';
+import { LogStore, StoreSink } from '../../mss/logging/log-store.js';
 import { warmWorkerPodManifest, type WarmPodSpec } from './pod-warm-worker-pod.js';
 import { ensureControlTokens, startControlServer } from '../../control-plane/server.js';
 import { issueMemberToken } from '../../control-plane/member-tokens.js';
@@ -61,6 +63,436 @@ test('--prepare reports a private-config parse failure as prepared:false with rc
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('--reconcile reports a private-config parse failure as unavailable with rc2', () => {
+  const root = mkdtempSync(join(tmpdir(), 'warm-provider-reconcile-invalid-'));
+  try {
+    const file = join(root, 'provider.json');
+    writeFileSync(file, '{not-json', { mode: 0o600 });
+    const run = spawnSync(process.execPath,
+      [join(import.meta.dir, 'pod-warm-worker-provider.ts'), '--reconcile'],
+      { encoding: 'utf8', env: { ...process.env, ELANOUS_WARM_POD_PROVIDER_CONFIG: file } });
+    expect(run.status).toBe(2);
+    expect(JSON.parse(run.stdout)).toEqual({ target: 0, ready: 0, failed: ['config-unavailable'] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('named slots are independently reconciled and bounded by the measured host quota', async () => {
+  const first = { ...spec, name: 'warm-node-c', workerId: 'node-c-uid-1', nodeName: 'pool-node-c-server-0' };
+  const second = { ...spec, name: 'warm-node-c-2', workerId: 'node-c-uid-2', nodeName: 'pool-node-c-server-0' };
+  const candidates = [first, second].map(item => ({ ...candidate, spec: item }));
+  const created: string[] = [];
+  const registered = new Map<string, string>();
+  const pods = new Map<string, any>();
+  const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
+  const provider = new WarmPodProvider({ candidates, controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    kubectl: (args, input) => {
+      if (args[4] === 'get' && args[5] === 'pods') return result({ items: [...pods.values()] });
+      if (args[4] === 'create') {
+        const manifest = JSON.parse(input!);
+        const pod = { ...manifest, metadata: { ...manifest.metadata, uid: `${manifest.metadata.name}-uid` },
+          status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } };
+        pods.set(manifest.metadata.name, pod);
+        created.push(manifest.metadata.name);
+        return result(pod);
+      }
+      if (args[4] === 'wait') return result({});
+      if (args[4] === 'get') return result(pods.get(args[5]!.slice(4)));
+      throw new Error(`unexpected ${args.join(' ')}`);
+    },
+    fetch: async (url, init) => {
+      if (new URL(String(url)).pathname === '/v1/resources') {
+        const name = new URL(String(url)).searchParams.get('name')!;
+        return Response.json({ resources: registered.has(name) ? [{ name, kind: 'pod-worker-lease',
+          machine: 'node-c', observedAt: Date.now(), ttlMs: 1_800_000,
+          attrs: { state: 'idle', podUid: registered.get(name), idleTtlMs: 1_800_000, key } }] : [] });
+      }
+      const body = JSON.parse(String(init?.body));
+      registered.set(body.workerId, body.podUid);
+      return Response.json({ name: body.workerId, attrs: { state: 'idle', podUid: body.podUid, key } });
+    },
+  });
+  expect(await provider.reconcilePool()).toMatchObject({ target: 2, ready: 2, failed: [] });
+  expect(await provider.reconcilePool()).toMatchObject({ target: 2, ready: 2, failed: [] });
+  expect(created).toEqual(['warm-node-c', 'warm-node-c-2']);
+  expect(() => new WarmPodProvider({ candidates: [candidates[0]!, candidates[0]!],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64) })).toThrow();
+  expect(() => new WarmPodProvider({ candidates: Array.from({ length: 5 }, (_, index) => ({
+    ...candidate, spec: { ...second, name: `warm-node-c-${index + 1}`, workerId: `node-c-uid-${index + 1}` },
+  })), controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64) })).toThrow('quota');
+});
+
+test('a pinned template expands to every measured profile slot with separate Pod and worker identities', async () => {
+  const template = { ...candidate, spec: { ...spec, name: 'unused-template',
+    workerId: 'generation-20261022', nodeName: 'pool-node-c-server-0' } };
+  const provider = new WarmPodProvider({ candidates: [], poolTemplates: [template],
+    profileConfig: { pod: { warmPoolProfile: 'gate' } },
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64) });
+  const names: string[] = [];
+  const ids: string[] = [];
+  const prepare = spyOn(provider, 'ensureStandingWorker').mockImplementation(async row => {
+    names.push(row.spec.name); ids.push(row.spec.workerId); return true;
+  });
+  try {
+    expect(await provider.reconcilePool()).toMatchObject({ profile: 'gate', target: 4, ready: 4, failed: [] });
+    expect(names).toEqual(['warm-node-c-standard-1', 'warm-node-c-standard-2',
+      'warm-node-c-standard-3', 'warm-node-c-standard-4']);
+    expect(new Set(ids).size).toBe(4);
+  } finally { prepare.mockRestore(); }
+});
+
+test('an old physical warm Pod consumes quota even when absent from configured candidates', async () => {
+  const active = { ...candidate, spec: { ...spec, name: 'warm-node-c-standard-1',
+    workerId: 'new-generation-1', nodeName: 'pool-node-c-server-0' } };
+  const old = Array.from({ length: 4 }, (_, index) => ({
+    metadata: { name: `old-generation-${index}`, labels: { 'elanous.kind': 'warm-worker' } },
+    spec: { nodeName: 'pool-node-c-server-0', containers: [{ resources: { limits: { memory: '16Gi' } } }] },
+    status: { phase: 'Running' },
+  }));
+  const calls: string[] = [];
+  const provider = new WarmPodProvider({ candidates: [active],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { node-c: '2'.repeat(64) },
+    kubectl: args => { calls.push(args[4]!); return {
+      status: 0, stdout: JSON.stringify({ items: old }), stderr: '',
+    }; },
+    fetch: async () => { throw new Error('physical quota must refuse before control access'); },
+  });
+  expect(await provider.reconcilePool()).toMatchObject({ target: 1, ready: 0, failed: ['new-generation-1'] });
+  expect(calls).toEqual(['get']);
+});
+
+test('a busy or unavailable first host lets the request lease a matching worker on the next host', async () => {
+  const first = { ...candidate, spec: { ...spec, name: 'warm-node-c',
+    workerId: 'node-c-worker', nodeName: 'pool-node-c-server-0' } };
+  const second = { host: 'elangram-wsl', tier: 'standard' as const,
+    spec: { ...spec, name: 'warm-elangram-wsl-standard-1', workerId: 'elangram-worker',
+      nodeName: 'pool-elangram-server-0' } };
+  for (const firstFailure of ['busy', 'network', 'unavailable'] as const) {
+    const hosts: string[] = [];
+    const provider = new WarmPodProvider({ candidates: [first, second],
+      controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+      machineTokens: { node-c: '2'.repeat(64), 'elangram-wsl': '3'.repeat(64) },
+      kubectl: leaseKubectl([first.spec, second.spec]),
+      fetch: async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        if (body.machine) {
+          hosts.push(body.machine);
+          if (body.machine === 'node-c') {
+            if (firstFailure === 'network') throw new Error('unavailable');
+            return new Response('{}', { status: firstFailure === 'busy' ? 409 : 503 });
+          }
+          return Response.json({ name: second.spec.workerId, attrs: { key, leaseId: 'lease-2',
+            generation: 1, podUid: 'lease-pod-uid', state: 'leased' } });
+        }
+        return Response.json({});
+      },
+      transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+    });
+    const replay = await provider.request(input());
+    expect(hosts).toEqual(['node-c', 'elangram-wsl']);
+    expect(replay.command?.workerId).toBe('elangram-worker');
+    expect(replay.command).toMatchObject({ podName: second.spec.name, podContext: second.spec.kubectlContext, image: second.spec.image,
+      podUid: 'lease-pod-uid', generation: 1, leaseId: 'lease-2' });
+  }
+});
+
+test('WARM-POD-PRODUCER-UID-FU: delayed install and competing prepares register one pinned Pod UID', async () => {
+  const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+  const manifest = warmWorkerPodManifest(prepareSpec);
+  const createdPod = { ...manifest, metadata: { ...(manifest.metadata as object), uid: 'cold-uid' } };
+  const readyPod = { ...createdPod, status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } };
+  const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
+  const created: string[] = [];
+  const waits: string[] = [];
+  const registrations: string[] = [];
+  let releasePreflight!: () => void;
+  let preflightStarted!: () => void;
+  const preflight = new Promise<void>(resolve => { releasePreflight = resolve; });
+  const started = new Promise<void>(resolve => { preflightStarted = resolve; });
+  let preflightCalls = 0;
+  const pods: any[] = [];
+  const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { node-c: '2'.repeat(64) },
+    kubectl: args => {
+      if (args[4] === 'get' && args[5] === 'pods') return result({ items: pods });
+      if (args[4] === 'create') { created.push(prepareSpec.name); pods.push(createdPod); return result(createdPod); }
+      if (args[4] === 'wait') { waits.push(args.find(arg => arg.startsWith('--timeout='))!); return result({}); }
+      if (args[4] === 'get') return result(readyPod);
+      throw new Error(`unexpected ${args.join(' ')}`);
+    },
+    fetch: async (url, init) => {
+      if (new URL(String(url)).pathname === '/v1/resources') {
+        if (++preflightCalls === 1) { preflightStarted(); await preflight; }
+        return Response.json({ resources: [] });
+      }
+      registrations.push(JSON.parse(String(init?.body)).podUid);
+      return Response.json({ name: prepareSpec.workerId, attrs: { state: 'idle', podUid: 'cold-uid', key } });
+    },
+  });
+  const first = provider.prepareWorker(prepareSpec.workerId);
+  await started;
+  const competing = provider.prepareWorker(prepareSpec.workerId);
+  await Promise.resolve();
+  releasePreflight();
+  expect(await Promise.all([first, competing])).toEqual([true, true]);
+  expect(created).toHaveLength(1);
+  expect(waits).toEqual(['--timeout=300s']);
+  expect(registrations).toEqual(['cold-uid']);
+});
+
+test('WARM-POD-PRODUCER-UID-FU: separate providers serialize the same host worker prepare', async () => {
+  const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+  const lockRoot = mkdtempSync(join(tmpdir(), 'warm-provider-prepare-lock-'));
+  const pods = new Map<string, any>();
+  const created: string[] = [];
+  const actions: string[] = [];
+  const registrations: string[] = [];
+  const controlCalls: string[] = [];
+  let registeredUid: string | null = null;
+  let releaseFirst!: () => void;
+  let preflightStarted!: () => void;
+  const pause = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const started = new Promise<void>(resolve => { preflightStarted = resolve; });
+  let pauseNextPreflight = true;
+  const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
+  const kubectl = (args: readonly string[], input?: string) => {
+    actions.push(args[4]!);
+    if (args[4] === 'get' && args[5] === 'pods') return result({ items: [...pods.values()] });
+    if (args[4] === 'create') {
+      const body = JSON.parse(input!);
+      const pod = { ...body, metadata: { ...body.metadata, uid: 'one-pod-uid' },
+        spec: { ...body.spec, nodeName: prepareSpec.nodeName } };
+      pods.set(body.metadata.name, pod);
+      created.push(body.metadata.name);
+      return result(pod);
+    }
+    if (args[4] === 'wait') return result({});
+    if (args[4] === 'get') return result({ ...pods.get(prepareSpec.name),
+      status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } });
+    throw new Error(`unexpected ${args.join(' ')}`);
+  };
+  const fetch = async (url: string | URL | Request, init?: RequestInit) => {
+    controlCalls.push(`${init?.method} ${new URL(String(url)).pathname}`);
+    if (new URL(String(url)).pathname === '/v1/resources') {
+      if (pauseNextPreflight) { pauseNextPreflight = false; preflightStarted(); await pause; }
+      return Response.json({ resources: registeredUid ? [{ kind: 'pod-worker-lease', machine: 'node-c',
+        name: prepareSpec.workerId, observedAt: Date.now(), ttlMs: 1_800_000,
+        attrs: { state: 'idle', podUid: registeredUid, idleTtlMs: 1_800_000, key } }] : [] });
+    }
+    const body = JSON.parse(String(init?.body));
+    registrations.push(body.podUid);
+    registeredUid = body.podUid;
+    return Response.json({ name: prepareSpec.workerId, attrs: { state: 'idle', podUid: body.podUid, key } });
+  };
+  const options = { candidates: [{ ...candidate, spec: prepareSpec }],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { node-c: '2'.repeat(64) }, kubectl, fetch, prepareLockDirectory: lockRoot };
+  try {
+    const firstProvider = new WarmPodProvider(options);
+    const secondProvider = new WarmPodProvider(options);
+    const first = firstProvider.prepareWorker(prepareSpec.workerId);
+    await started;
+    const second = secondProvider.prepareWorker(prepareSpec.workerId);
+    releaseFirst();
+    expect(await Promise.all([first, second])).toEqual([true, true]);
+    expect({ actions, created, registrations, controlCalls }).toEqual({
+      actions: ['get', 'create', 'wait', 'get', 'get', 'wait', 'get'],
+      created: [prepareSpec.name], registrations: ['one-pod-uid'],
+      controlCalls: ['GET /v1/resources', 'GET /v1/resources', 'POST /v1/workers/pod', 'GET /v1/resources'],
+    });
+    expect(created).toEqual([prepareSpec.name]);
+    expect(registrations).toEqual(['one-pod-uid']);
+  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+}, 20_000);
+
+test('prepare lease wait is cancellable, records the reason, and kernel unlock permits retry', async () => {
+  const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+  const lockRoot = mkdtempSync(join(tmpdir(), 'warm-provider-abort-lock-'));
+  const events: Array<{ event: string; data: any }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm') events.push({ event, data });
+  }) as typeof debug.log);
+  let releaseFirst!: () => void;
+  let firstStarted!: () => void;
+  const pause = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const started = new Promise<void>(resolve => { firstStarted = resolve; });
+  let blockFirst = true;
+  const pods = new Map<string, any>();
+  const created: string[] = [];
+  let registrations = 0;
+  let registeredUid: string | null = null;
+  const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
+  const providerOptions = (prepareAbortSignal?: AbortSignal) => ({
+    candidates: [{ ...candidate, spec: prepareSpec }], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    prepareLockDirectory: lockRoot, prepareAbortSignal,
+    kubectl: (args: readonly string[], body?: string) => {
+      if (args[4] === 'get' && args[5] === 'pods') return result({ items: [...pods.values()] });
+      if (args[4] === 'create') {
+        const manifest = JSON.parse(body!);
+        const pod = { ...manifest, metadata: { ...manifest.metadata, uid: 'retry-pod-uid' },
+          spec: { ...manifest.spec, nodeName: prepareSpec.nodeName },
+          status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } };
+        pods.set(prepareSpec.name, pod); created.push(prepareSpec.name); return result(pod);
+      }
+      if (args[4] === 'wait') return result({});
+      if (args[4] === 'get') return result(pods.get(prepareSpec.name));
+      throw new Error(`unexpected ${args.join(' ')}`);
+    },
+    fetch: async (url: string | URL | Request, init?: RequestInit) => {
+        if (new URL(String(url)).pathname === '/v1/resources') {
+          if (blockFirst) { blockFirst = false; firstStarted(); await pause; }
+          return Response.json({ resources: registeredUid ? [{ kind: 'pod-worker-lease', machine: 'node-c',
+            name: prepareSpec.workerId, observedAt: Date.now(), ttlMs: 1_800_000,
+            attrs: { state: 'idle', podUid: registeredUid, idleTtlMs: 1_800_000, key } }] : [] });
+        }
+        registrations++;
+        const body = JSON.parse(String(init?.body));
+        registeredUid = body.podUid;
+        return Response.json({ name: prepareSpec.workerId, attrs: { state: 'idle', podUid: body.podUid, key } });
+
+    },
+  });
+  try {
+    const firstProvider = new WarmPodProvider(providerOptions());
+    const first = firstProvider.prepareWorker(prepareSpec.workerId);
+    await started;
+    const abort = new AbortController();
+    const waitingProvider = new WarmPodProvider(providerOptions(abort.signal));
+    const waiting = waitingProvider.prepareWorker(prepareSpec.workerId);
+    abort.abort();
+    await expect(waiting).rejects.toThrow('warm prepare lock wait cancelled');
+    expect(events).toContainEqual({ event: 'prepare-lease-failed', data: {
+      host: 'node-c', workerId: prepareSpec.workerId, reason: 'warm prepare lock wait cancelled',
+    } });
+    releaseFirst();
+    expect(await first).toBe(true);
+    const retry = new WarmPodProvider(providerOptions());
+    expect(await retry.prepareWorker(prepareSpec.workerId)).toBe(true);
+    expect(created).toEqual([prepareSpec.name]);
+    expect(registrations).toBe(1);
+  } finally { releaseFirst(); log.mockRestore(); rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+test('prepare cancellation after acquiring the lease stops before Pod creation and records its reason', async () => {
+  const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+  const abort = new AbortController();
+  const events: Array<{ event: string; data: any }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm') events.push({ event, data });
+  }) as typeof debug.log);
+  let releasePreflight!: () => void;
+  let preflightStarted!: () => void;
+  const pause = new Promise<void>(resolve => { releasePreflight = resolve; });
+  const started = new Promise<void>(resolve => { preflightStarted = resolve; });
+  const actions: string[] = [];
+  const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { node-c: '2'.repeat(64) }, prepareAbortSignal: abort.signal,
+    kubectl: args => { actions.push(args[4]!); return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' }; },
+    fetch: async () => { preflightStarted(); await pause; return Response.json({ resources: [] }); },
+  });
+  try {
+    const preparing = provider.prepareWorker(prepareSpec.workerId);
+    await started;
+    abort.abort(new Error('operator cancelled prepare'));
+    releasePreflight();
+    await expect(preparing).rejects.toThrow('operator cancelled prepare');
+    expect(actions).toEqual(['get']);
+    expect(events).toContainEqual({ event: 'prepare-lease-failed', data: {
+      host: 'node-c', workerId: prepareSpec.workerId, reason: 'operator cancelled prepare',
+    } });
+  } finally { releasePreflight(); log.mockRestore(); }
+});
+
+test('a failed kubectl wait backs off and its retry delay is cancellable', async () => {
+  const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+  const manifest = warmWorkerPodManifest(prepareSpec);
+  const createdPod = { ...manifest, metadata: { ...(manifest.metadata as object), uid: 'retry-uid' } };
+  const abort = new AbortController();
+  const actions: string[] = [];
+  const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { node-c: '2'.repeat(64) }, prepareAbortSignal: abort.signal,
+    kubectl: args => {
+      actions.push(args[4]!);
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: '{"items":[]}', stderr: '' };
+      if (args[4] === 'create') return { status: 0, stdout: JSON.stringify(createdPod), stderr: '' };
+      if (args[4] === 'wait') { abort.abort(new Error('cancel retry')); return { status: 1, stdout: '', stderr: 'transient API failure' }; }
+      throw new Error(`unexpected ${args.join(' ')}`);
+    },
+    fetch: async () => Response.json({ resources: [] }),
+  });
+  await expect(provider.prepareWorker(prepareSpec.workerId)).rejects.toThrow('cancel retry');
+  expect(actions).toEqual(['get', 'create', 'wait']);
+});
+
+test('an immediate kubectl wait failure retries after a bounded delay and registers only the pinned UID', async () => {
+  const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+  const manifest = warmWorkerPodManifest(prepareSpec);
+  const createdPod = { ...manifest, metadata: { ...(manifest.metadata as object), uid: 'delayed-ready-uid' } };
+  const readyPod = { ...createdPod, status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } };
+  const actions: string[] = [];
+  let waitCalls = 0;
+  let registrations = 0;
+  const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { node-c: '2'.repeat(64) },
+    kubectl: args => {
+      actions.push(args[4]!);
+      if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: '{"items":[]}', stderr: '' };
+      if (args[4] === 'create') return { status: 0, stdout: JSON.stringify(createdPod), stderr: '' };
+      if (args[4] === 'wait') return { status: ++waitCalls === 1 ? 1 : 0, stdout: '', stderr: 'temporary wait failure' };
+      if (args[4] === 'get') return { status: 0, stdout: JSON.stringify(waitCalls > 1 ? readyPod : createdPod), stderr: '' };
+      throw new Error(`unexpected ${args.join(' ')}`);
+    },
+    fetch: async (url, init) => {
+      if (new URL(String(url)).pathname === '/v1/resources') return Response.json({ resources: [] });
+      registrations++;
+      expect(JSON.parse(String(init?.body)).podUid).toBe('delayed-ready-uid');
+      return Response.json({ name: prepareSpec.workerId, attrs: { state: 'idle', podUid: 'delayed-ready-uid', key } });
+    },
+  });
+  const startedAt = Date.now();
+  expect(await provider.prepareWorker(prepareSpec.workerId)).toBe(true);
+  expect(Date.now() - startedAt).toBeGreaterThanOrEqual(900);
+  expect(waitCalls).toBe(2);
+  expect(registrations).toBe(1);
+  expect(actions).toEqual(['get', 'create', 'wait', 'get', 'wait', 'get']);
+});
+
+test('a Pod UID replaced during the Ready recheck is never registered', async () => {
+  const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+  const manifest = warmWorkerPodManifest(prepareSpec);
+  const createdPod = { ...manifest, metadata: { ...(manifest.metadata as object), uid: 'created-uid' } };
+  const replacementPod = { ...manifest, metadata: { ...(manifest.metadata as object), uid: 'replacement-uid' } };
+  const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
+  const actions: string[] = [];
+  let registrations = 0;
+  const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { node-c: '2'.repeat(64) },
+    kubectl: args => {
+      actions.push(args[4]!);
+      if (args[4] === 'get' && args[5] === 'pods') return result({ items: [] });
+      if (args[4] === 'create') return result(createdPod);
+      if (args[4] === 'wait') return { status: 1, stdout: '', stderr: 'timed out' };
+      if (args[4] === 'get') return result(replacementPod);
+      throw new Error(`unexpected ${args.join(' ')}`);
+    },
+    fetch: async (url, init) => {
+      if (new URL(String(url)).pathname === '/v1/resources') return Response.json({ resources: [] });
+      registrations++;
+      return Response.json({ name: prepareSpec.workerId, attrs: { state: 'idle', podUid: 'created-uid', key } });
+    },
+  });
+  expect(await provider.prepareWorker(prepareSpec.workerId)).toBe(false);
+  expect(actions).toEqual(['get', 'create', 'wait', 'get']);
+  expect(registrations).toBe(0);
+});
+
 test('cold init beyond five minutes reaches Ready and registers its exact created UID', async () => {
   const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
   const manifest = warmWorkerPodManifest(prepareSpec);
@@ -68,7 +500,10 @@ test('cold init beyond five minutes reaches Ready and registers its exact create
   const readyPod = { ...createdPod, status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } };
   const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
   let registeredUid: string | undefined;
+  let waitCalls = 0;
+  let clock = 1_000_000;
   const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
+    now: () => clock,
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
     machineTokens: { node-c: '2'.repeat(64) },
     kubectl: args => {
@@ -76,11 +511,12 @@ test('cold init beyond five minutes reaches Ready and registers its exact create
       if (args[4] === 'create') return result(createdPod);
       if (args[4] === 'wait') {
         const timeout = args.find(arg => arg.startsWith('--timeout='));
-        // The cold install takes seven minutes; kubectl's old 300s bound fails here.
-        return timeout && Number.parseInt(timeout.slice('--timeout='.length), 10) >= 420
-          ? result({}) : { status: 1, stdout: '', stderr: 'timed out' };
+        expect(timeout).toBe('--timeout=300s');
+        waitCalls++;
+        clock += 300_000;
+        return { status: 1, stdout: '', stderr: 'timed out' };
       }
-      if (args[4] === 'get') return result(readyPod);
+      if (args[4] === 'get') return waitCalls >= 2 ? result(readyPod) : result(createdPod);
       throw new Error(`unexpected ${args.join(' ')}`);
     },
     fetch: async (url, init) => {
@@ -116,7 +552,7 @@ test('Ready deadline leaves a created Pod unregistered for explicit recovery', a
     },
   });
   expect(await provider.prepareWorker(prepareSpec.workerId)).toBe(false);
-  expect(actions).toEqual(['get', 'create', 'wait']);
+  expect(actions).toEqual(['get', 'create', 'wait', 'get']);
   expect(controlPaths).toEqual(['/v1/resources']);
 });
 
@@ -409,8 +845,69 @@ test('provider retains the lease through gate comparison, then releases and mach
     '/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/release`,
     `/v1/leases/pod-worker/${spec.workerId}/sanitize`,
   ]);
+  await provider.finalize(result.command!);
+  expect(calls).toHaveLength(3);
   expect(calls[2]!.token).toBe(`Bearer ${'2'.repeat(64)}`);
   expect(calls[1]!.body).toMatchObject({ leaseId: 'lease-1', generation: 1 });
+});
+
+test('a sanitize failure followed by the gate fallback quarantines one lease only once', async () => {
+  const paths: string[] = [];
+  const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      return path === '/v1/leases/pod-worker' ? Response.json(lease())
+        : new Response('{}', { status: path.endsWith('/sanitize') ? 503 : 200 });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  });
+  const result = await provider.request(input());
+  expect(result.command).not.toBeNull();
+  await expect(provider.finalize(result.command!)).rejects.toThrow('warm sanitize unavailable');
+  await provider.quarantine(result.command!, 'gate-finalize-failed');
+  expect(paths.filter(path => path.endsWith('/quarantine'))).toHaveLength(1);
+});
+
+test('concurrent quarantine callers share one fenced lease transition', async () => {
+  const paths: string[] = [];
+  let releaseQuarantine: (() => void) | undefined;
+  const quarantinePause = new Promise<void>(resolve => { releaseQuarantine = resolve; });
+  const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      if (path.endsWith('/quarantine')) await quarantinePause;
+      return path === '/v1/leases/pod-worker' ? Response.json(lease()) : Response.json({ attrs: { state: 'quarantined' } });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  });
+  const result = await provider.request(input());
+  const first = provider.quarantine(result.command!, 'first-failure');
+  const second = provider.quarantine(result.command!, 'same-failure');
+  releaseQuarantine!();
+  await Promise.all([first, second]);
+  expect(paths.filter(path => path.endsWith('/quarantine'))).toHaveLength(1);
+});
+
+test('a failed quarantine transition can retry the same lease', async () => {
+  let quarantineCalls = 0;
+  const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/v1/leases/pod-worker') return Response.json(lease());
+      if (path.endsWith('/quarantine')) return new Response('{}', { status: ++quarantineCalls === 1 ? 503 : 200 });
+      return Response.json({ attrs: { state: 'idle' } });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  });
+  const result = await provider.request(input());
+  await expect(provider.quarantine(result.command!, 'first-failure')).rejects.toThrow('warm quarantine unavailable');
+  await provider.quarantine(result.command!, 'retry');
+  expect(quarantineCalls).toBe(2);
 });
 
 test('a replaced Pod refuses the acquired lease before transport and quarantines it', async () => {
@@ -584,6 +1081,176 @@ test('a timed-out kubectl child is stopped before the acquired lease is quaranti
   }
 }, 20_000);
 
+test('WARM-REUSE-TIME-PAIRS: production --reconcile wires pairingGateFile and echoes its cold leg on stdout', () => {
+  const root = mkdtempSync(join(tmpdir(), 'warm-provider-pairing-cli-'));
+  try {
+    const file = join(root, 'provider.json');
+    const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+    const gateFile = 'src/example/worker.test.ts';
+    writeFileSync(file, JSON.stringify({
+      candidates: [{ host: 'node-c', tier: 'standard', spec: prepareSpec }],
+      controlUrl: 'http://127.0.0.1:31413/',
+      memberToken: '1'.repeat(64),
+      machineTokens: { node-c: '2'.repeat(64) },
+      pairingGateFile: gateFile,
+    }), { mode: 0o600 });
+    // The private config path is the real production loadWarmPodProvider call chain; kubectl
+    // without a cluster fails closed, so this leg lands as a measured, unsuccessful cold row.
+    // The child registers a logs.db sink, so HOME/state/config are isolated to this temp root.
+    const run = spawnSync(process.execPath,
+      [join(import.meta.dir, 'pod-warm-worker-provider.ts'), '--reconcile'],
+      { encoding: 'utf8', env: { ...process.env, ELANOUS_WARM_POD_PROVIDER_CONFIG: file,
+        HOME: join(root, 'home'), ELANOUS_STATE_DIR: join(root, 'state'), ELANOUS_STATE_DIR_SOURCE: 'explicit',
+        ELANOUS_CONFIG_DIR: join(root, 'config') } });
+    expect(run.status).toBe(2);
+    const lines = run.stdout.trim().split('\n').map(line => JSON.parse(line));
+    expect(lines[0]).toMatchObject({ target: 1, ready: 0, failed: [prepareSpec.workerId] });
+    // The CLI echoes only its own cold leg; the pair is joined from logs.db (readWarmReuseTimePairs / --pairs).
+    const legs = lines[1]?.warmReuseTimeLegs;
+    expect(Array.isArray(legs)).toBe(true);
+    expect(legs.length).toBe(1);
+    expect(legs[0]).toMatchObject({ gateKey: `${gateFile}/${prepareSpec.cutSha}/node-c`, leg: 'cold',
+      file: gateFile, commit: prepareSpec.cutSha, host: 'node-c', reuse: false, podUid: '', success: false });
+    expect(legs[0].totalDurationMs).toBe(legs[0].prepareDurationMs);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('WARM-REUSE-TIME-PAIRS: unset pairingGateFile skips the cold measurement row entirely', async () => {
+  const events: Array<{ event: string; data: any }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm' && event === 'warm-reuse-time-pair') events.push({ event, data });
+  }) as typeof debug.log);
+  try {
+    const provider = new WarmPodProvider({ candidates: [{ ...candidate,
+      spec: { ...spec, nodeName: 'pool-node-c-server-0' } }],
+      controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+      machineTokens: { node-c: '2'.repeat(64) },
+      kubectl: () => ({ status: 1, stdout: '', stderr: 'unavailable' }) });
+    expect(await provider.prepareWorker(spec.workerId)).toBe(false);
+    // No unpaired `file: ''` row may reach the pairing store or the ledger when the gate file is unset.
+    expect(provider.warmReuseTimeLegs()).toEqual([]);
+    expect(events).toEqual([]);
+  } finally { log.mockRestore(); }
+});
+
+/** Two separate provider instances — the cold CLI process and the warm gate process — share one fake cluster. */
+const pairingFixture = () => {
+  const gateFile = 'src/example/worker.test.ts';
+  const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+  const pods = new Map<string, any>();
+  let clock = Date.now();
+  const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
+  const kubectl = (args: readonly string[], createInput?: string) => {
+    const verb = args[4]!;
+    if (verb === 'config') return result(prepareSpec.kubectlContext);
+    if (verb === 'get' && args[5] === 'pods') return result({ items: [...pods.values()] });
+    if (verb === 'get') return result(pods.get(args[5] === 'pod' ? args[6]! : args[5]!.slice('pod/'.length)));
+    if (verb === 'create') {
+      clock += 5_000; // the cold leg pays the whole Pod create + Ready wait
+      const created = JSON.parse(createInput!);
+      const pod = { ...created, metadata: { ...created.metadata, uid: 'new-uid', resourceVersion: '1' },
+        status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } };
+      pods.set(created.metadata.name, pod);
+      return result(pod);
+    }
+    if (verb === 'wait') return result({});
+    if (verb === 'patch') {
+      const pod = pods.get(args[5] === 'pod' ? args[6]! : args[5]!.slice('pod/'.length));
+      const patch = JSON.parse(args[args.indexOf('-p') + 1]!) as Array<{ op: string; value: any }>;
+      if (!pod || patch[0]?.value !== pod.metadata.uid || patch[1]?.value !== pod.metadata.resourceVersion)
+        return { status: 1, stdout: '', stderr: 'precondition failed' };
+      pod.metadata = { ...pod.metadata, labels: patch[2]!.value, annotations: patch[3]!.value,
+        resourceVersion: String(Number(pod.metadata.resourceVersion) + 1) };
+      return result(pod);
+    }
+    throw new Error(`unexpected kubectl ${args.join(' ')}`);
+  };
+  const fetch = async (url: string | URL | Request, init?: RequestInit) => {
+    const path = new URL(String(url)).pathname;
+    if (path === '/v1/resources') return Response.json({ resources: [] });
+    if (path === '/v1/workers/pod') {
+      const body = JSON.parse(String(init?.body));
+      return Response.json({ name: body.workerId, attrs: { state: 'idle', podUid: body.podUid, key } });
+    }
+    if (path === '/v1/leases/pod-worker')
+      return Response.json({ name: prepareSpec.workerId, attrs: { key, leaseId: 'lease-1',
+        generation: 1, podUid: 'new-uid', state: 'leased' } });
+    return Response.json({});
+  };
+  const base = { candidates: [{ ...candidate, spec: prepareSpec }], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, now: () => clock,
+    kubectl, fetch: fetch as typeof globalThis.fetch };
+  // The warm leg's exec takes 300ms on the already-standing Pod.
+  const transport = () => ({ request: async () => { clock += 300;
+    return { status: 'observed' as const, reason: 'complete' as const, reply: null }; } });
+  // Cold process: the --prepare/--reconcile/--serve CLI binds the gate file (loadWarmPodProvider(file, gateFile)).
+  const cold = new WarmPodProvider({ ...base, pairingGateFile: gateFile, transport } as any);
+  // Warm process: gate-node's requestWarmPodReplay → currentProvider() → loadWarmPodProvider(file) — no gate file.
+  const warm = new WarmPodProvider({ ...base, transport } as any);
+  return { gateFile, prepareSpec, cold, warm };
+};
+
+test('WARM-REUSE-TIME-PAIRS: separate cold and warm provider processes pair into one row through the shared logs.db', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'warm-pair-logs-'));
+  const store = new LogStore(join(dir, 'logs', 'logs.db'));
+  const sink = new StoreSink(store, 'pod-warm', { installExitHandlers: false });
+  const off = debug.registerSink(sink);
+  try {
+    const { gateFile, prepareSpec, cold, warm } = pairingFixture();
+    expect(await cold.prepareWorker(prepareSpec.workerId)).toBe(true);
+    expect((await warm.request({ ...input(), files: [gateFile] })).transport)
+      .toMatchObject({ status: 'observed', reason: 'complete' });
+    sink.flush();
+    // Neither process holds the pair in memory; the read-only reader joins the shared rows.
+    const pairs = readWarmReuseTimePairs(store);
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0]).toEqual({ gateKey: `${gateFile}/${spec.cutSha}/node-c`, file: gateFile,
+      commit: spec.cutSha, host: 'node-c',
+      cold: { file: gateFile, commit: spec.cutSha, host: 'node-c', reuse: false, podUid: 'new-uid',
+        success: true, prepareDurationMs: 5_000, totalDurationMs: 5_000 },
+      warm: { file: gateFile, commit: spec.cutSha, host: 'node-c', reuse: true, podUid: 'new-uid',
+        success: true, prepareDurationMs: 0, totalDurationMs: 300 } });
+    // Concrete saving: cold prepare 5000ms vs warm total 300ms on the same Pod.
+    expect(pairs[0]!.cold!.prepareDurationMs - pairs[0]!.warm!.totalDurationMs).toBe(4_700);
+  } finally {
+    off(); sink.close(); store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('WARM-REUSE-TIME-PAIRS: a multi-file gate never becomes a warm leg and logs its skip reason', async () => {
+  const { gateFile, prepareSpec, cold, warm } = pairingFixture();
+  // The standing Pod must exist first so the warm lease really reaches the exec path.
+  expect(await cold.prepareWorker(prepareSpec.workerId)).toBe(true);
+  const events: Array<{ event: string; data: any }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm' && event.startsWith('warm-reuse-time-pair')) events.push({ event, data });
+  }) as typeof debug.log);
+  try {
+    const replay = await warm.request({ ...input(), files: [gateFile, 'src/example/other.test.ts'] });
+    expect(replay.transport).toMatchObject({ status: 'observed', reason: 'complete' });
+    expect(warm.warmReuseTimeLegs()).toEqual([]);
+    expect(events).toEqual([{ event: 'warm-reuse-time-pair-skipped',
+      data: { reason: 'not-single-file-gate', fileCount: 2, commit: spec.cutSha, host: 'node-c' } }]);
+  } finally { log.mockRestore(); }
+});
+
+test('WARM-REUSE-TIME-PAIRS: pairing joins only the same file·commit·host and skips malformed rows', () => {
+  const leg = (over: Record<string, unknown>) => ({ gateKey: 'f.test.ts/c/node-c', leg: 'cold', file: 'f.test.ts',
+    commit: 'c', host: 'node-c', reuse: false, prepareDurationMs: 5_000, totalDurationMs: 5_000,
+    podUid: 'u', success: true, ...over });
+  const pairs = pairWarmReuseTimeLegs([
+    leg({}),
+    leg({ leg: 'warm', reuse: true, prepareDurationMs: 0, totalDurationMs: 300 }),
+    leg({ gateKey: 'f.test.ts/c/node-b', host: 'node-b', leg: 'warm', reuse: true, prepareDurationMs: 0, totalDurationMs: 200 }),
+    leg({ gateKey: 'forged/key' }),
+    leg({ totalDurationMs: 'slow' }),
+    null,
+  ]);
+  expect(pairs.map(row => [row.gateKey, row.cold?.totalDurationMs ?? null, row.warm?.totalDurationMs ?? null]))
+    .toEqual([['f.test.ts/c/node-c', 5_000, 300], ['f.test.ts/c/node-b', null, 200]]);
+});
+
 test('standing Pod preparation refuses a candidate without a pinned node', async () => {
   let calls = 0;
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
@@ -592,4 +1259,23 @@ test('standing Pod preparation refuses a candidate without a pinned node', async
   });
   expect(await provider.ensureStandingWorker(candidate)).toBe(false);
   expect(calls).toBe(0);
+});
+
+describe('parseWarmPodProviderArgs — CLI 인자 배선', () => {
+  test('--reconcile/--serve 의 둘째 칸은 gateFile 이다(workerId 아님)', () => {
+    expect(parseWarmPodProviderArgs(['--reconcile', 'src/a.test.ts'])).toEqual({ action: '--reconcile', gateFile: 'src/a.test.ts' });
+    expect(parseWarmPodProviderArgs(['--serve', 'src/a.test.ts'])).toEqual({ action: '--serve', gateFile: 'src/a.test.ts' });
+    expect(parseWarmPodProviderArgs(['--serve'])).toEqual({ action: '--serve' });
+    expect(parseWarmPodProviderArgs(['--pairs'])).toEqual({ action: '--pairs' });
+  });
+  test('--prepare 는 workerId 필수 · gateFile 은 셋째 칸', () => {
+    expect(parseWarmPodProviderArgs(['--prepare', 'w1', 'src/a.test.ts'])).toEqual({ action: '--prepare', workerId: 'w1', gateFile: 'src/a.test.ts' });
+    expect(() => parseWarmPodProviderArgs(['--prepare'])).toThrow('usage:');
+  });
+  test('남는 인자·빈 gateFile·모르는 동작은 usage 오류', () => {
+    expect(() => parseWarmPodProviderArgs(['--serve', 'a', 'b'])).toThrow('usage:');
+    expect(() => parseWarmPodProviderArgs(['--reconcile', ' '])).toThrow('usage:');
+    expect(() => parseWarmPodProviderArgs(['--nope'])).toThrow('usage:');
+    expect(() => parseWarmPodProviderArgs(['--pairs', 'x'])).toThrow('usage:');
+  });
 });

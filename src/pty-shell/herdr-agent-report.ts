@@ -3,7 +3,10 @@
 // `herdr agent list` 에 안 잡힌다 — pane CLI 로 생애·세션을 직접 알린다.
 //
 // 활성은 HERDR_ENV=1 ⊕ HERDR_PANE_ID ⊕ 킬스위치가 아닐 때뿐.
-// 실패(rc≠0·timeout·spawn·ENOENT)는 던지지 않고 한 번 로그한 뒤 그 신고기를 끈다.
+// 실패(rc≠0·spawn·ENOENT·오류 봉투)는 던지지 않고 한 번 로그한 뒤 그 신고기를 끈다.
+// 단 turn 신고의 timeout 은 끄지 않는다(TUI-HERDR-STATUS-STALE · 10-22 n8n): herdr 가 바쁜 한 번의 2s 초과로
+// 신고기가 꺼져 턴 끝 idle 이 영영 안 나가 herdr 가 1.9h 동안 working 을 보였다. timeout 은 «결과 모름»이라
+// 마지막 턴 상태를 잠시 뒤 다시 신고하고(새 seq · 더 새 턴이 오면 그만) 이후 턴 신고도 그대로 보낸다.
 //
 // herdr 는 같은 pane·source 에서 «직전보다 큰 seq» 만 받는다(작으면 rc0 인데 무시).
 // 같은 pane 에서 TUI 를 다시 띄워도 신고가 살도록 seq 는 max(직전+1 · 시각 · pane 기록+1) 이다.
@@ -15,6 +18,8 @@
 // 실패로 꺼지는 것은 «이후 turn» 뿐이다. release(권한 반납)는 start 실패가 «확인»됐을 때만 건너뛴다.
 // start 의 비동기 신고가 아직 안 끝났으면(결과 모름) 반납을 미루지 않고 바로 동기로 시도한다(관측 `release-start-pending`) —
 // 종료 경로에서 미루면 exit 뒤 반납이 영영 안 나간다. 반납 실패(rc≠0 등)는 `release-failed` 로 늘 남긴다.
+// 그때 반납 직전에 더 큰 seq 로 동기 재등록한다(TUI-HERDR-EXIT-RACE) — 미등록 반납은 seq 를 안 남겨
+// 늦게 닿은 비동기 등록이 유령이 되던 경합을 «동기 재등록 → 동기 반납» 순서로 닫는다.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -29,6 +34,8 @@ export type HerdrTurn = 'busy' | 'idle';
 export interface HerdrRunResult {
   readonly ok: boolean;
   readonly stderr?: string;
+  /** 시간 안에 답을 못 받았다 — herdr 가 이미 적용했을 수도 있는 «결과 모름»(TUI-HERDR-STATUS-STALE). */
+  readonly timedOut?: boolean;
 }
 
 export interface HerdrRunOpts {
@@ -50,7 +57,14 @@ export interface HerdrAgentReporterDeps {
   readonly now?: () => number;
   /** pane 별 마지막 seq 기록. 기본 = tmpdir 파일(`createFileSeqStore`). */
   readonly seqStore?: HerdrSeqStore;
+  /** 재신고 타이머 — 기본 setTimeout(unref). 시험이 가짜 시계를 준다. */
+  readonly schedule?: (fn: () => void, ms: number) => void;
 }
+
+const defaultSchedule = (fn: () => void, ms: number): void => {
+  const t = setTimeout(fn, ms);
+  (t as unknown as { unref?: () => void }).unref?.();
+};
 
 /** 같은 pane 에서 마지막으로 낸 seq — 프로세스 사이 단조를 잇는다. 실패는 던져도 된다(신고기가 삼킨다). */
 export interface HerdrSeqStore {
@@ -89,6 +103,10 @@ export interface HerdrAgentReporterLike {
 }
 
 const ASYNC_TIMEOUT_MS = 2000;
+/** turn 신고가 timeout 이면 이만큼 뒤에 마지막 상태를 다시 신고한다. */
+export const HERDR_TURN_RETRY_DELAY_MS = 3000;
+/** 같은 턴 상태의 재신고 상한 — 넘으면 `report-gave-up` 을 남기고 다음 턴 신고를 기다린다(신고기는 켜 둔다). */
+export const HERDR_TURN_RETRY_MAX = 3;
 const SYNC_TIMEOUT_MS = 300;
 const STDERR_HEAD = 240;
 const STDOUT_CAP = 4096;
@@ -149,7 +167,10 @@ export function defaultHerdrRunner(env: NodeJS.ProcessEnv): HerdrRunner {
     if (opts.sync) {
       try {
         const r = spawnSync(bin, argv, { timeout: cap, encoding: 'utf8', windowsHide: true });
-        if (r.error) return { ok: false, stderr: r.error.message };
+        if (r.error) {
+          const timedOut = (r.error as NodeJS.ErrnoException).code === 'ETIMEDOUT';
+          return { ok: false, stderr: r.error.message, ...(timedOut ? { timedOut: true } : {}) };
+        }
         const out = typeof r.stdout === 'string' ? r.stdout : '';
         const overflow = Buffer.byteLength(out, 'utf8') > STDOUT_CAP;
         return judgeHerdr(r.status, overflow ? '' : out, typeof r.stderr === 'string' ? r.stderr : '', overflow);
@@ -178,7 +199,7 @@ export function defaultHerdrRunner(env: NodeJS.ProcessEnv): HerdrRunner {
       };
       const timer = setTimeout(() => {
         try { child.kill(); } catch { /* already gone */ }
-        finish({ ok: false, stderr: stderr || 'timeout' });
+        finish({ ok: false, stderr: stderr || 'timeout', timedOut: true });
       }, cap);
       child.stderr?.on('data', (chunk: Buffer | string) => {
         if (stderr.length < STDERR_HEAD) stderr += String(chunk);
@@ -201,6 +222,43 @@ export function defaultHerdrRunner(env: NodeJS.ProcessEnv): HerdrRunner {
   };
 }
 
+/** 신호 지킴이가 쓰는 process 의 좁은 면 — 시험이 가짜를 준다. */
+export interface HerdrSignalTarget {
+  readonly pid: number;
+  on(sig: NodeJS.Signals, fn: (sig: NodeJS.Signals) => void): unknown;
+  removeListener(sig: NodeJS.Signals, fn: (sig: NodeJS.Signals) => void): unknown;
+  listenerCount(sig: NodeJS.Signals): number;
+  kill(pid: number, sig?: string | number): unknown;
+}
+
+const RELEASE_SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
+
+/**
+ * SIGINT·SIGTERM 기본 죽음에도 반납한다(TUI-HERDR-EXIT-RACE).
+ * 대시보드가 raw 모드에 들기 «전»의 ctrl+c 는 SIGINT 기본 동작으로 프로세스를 죽여(rc130) 'exit' 훅이 안 돈다 —
+ * 10-22 격리 세션 실측: 반납 0 · `agent list` 에 elanous idle 이 남았다.
+ * 신호가 오면 반납(동기) → 자기 리스너를 걷고, 이제 아무도 안 들으면 같은 신호를 다시 올려 기본 죽음을 지킨다.
+ * 다른 리스너가 있으면 그쪽이 같은 신호를 이미 받았다 — 다시 올리지 않는다.
+ * @returns 해제(정상 종료 경로에서 부른다).
+ */
+export function guardHerdrReleaseOnSignal(release: () => void, proc: HerdrSignalTarget = process): () => void {
+  let off = false;
+  const remove = (): void => {
+    if (off) return;
+    off = true;
+    for (const sig of RELEASE_SIGNALS) { try { proc.removeListener(sig, onSignal); } catch { /* 종료 경로를 깨지 않는다 */ } }
+  };
+  function onSignal(sig: NodeJS.Signals): void {
+    try { release(); } catch { /* 신호 경로를 깨지 않는다 */ }
+    remove();
+    let alone = true;
+    try { alone = proc.listenerCount(sig) === 0; } catch { alone = true; }
+    if (alone) { try { proc.kill(proc.pid, sig); } catch { /* 이미 끝나는 중 */ } }
+  }
+  for (const sig of RELEASE_SIGNALS) proc.on(sig, onSignal);
+  return remove;
+}
+
 /**
  * herdr pane 안에서만 신고기. 비활성이면 null (skipped 로그 한 번).
  * 반환 메서드는 실패해도 던지지 않는다.
@@ -219,7 +277,7 @@ export function createHerdrAgentReporter(deps: HerdrAgentReporterDeps = {}): Her
   }
   const run = deps.run ?? defaultHerdrRunner(env);
   const sessionId = deps.sessionId ?? '';
-  return new Reporter(paneId, sessionId, run, log, deps.now ?? Date.now, deps.seqStore ?? createFileSeqStore(paneId));
+  return new Reporter(paneId, sessionId, run, log, deps.now ?? Date.now, deps.seqStore ?? createFileSeqStore(paneId), deps.schedule ?? defaultSchedule);
 }
 
 type IssueResult = boolean | Promise<boolean>;
@@ -256,7 +314,13 @@ class Reporter implements HerdrAgentReporterLike {
     private readonly log: (event: string, data: Record<string, unknown>) => void,
     private readonly now: () => number,
     private readonly seqStore: HerdrSeqStore,
+    private readonly schedule: (fn: () => void, ms: number) => void,
   ) {}
+
+  /** 마지막으로 요청된 턴 상태와 그 세대 — 재신고는 세대가 그대로일 때만(더 새 턴이 오면 그만). */
+  private lastTurn: HerdrTurn | null = null;
+  private turnGen = 0;
+  private turnRetries = 0;
 
   start(): void {
     if (this.startState !== 'none') return;
@@ -314,6 +378,13 @@ class Reporter implements HerdrAgentReporterLike {
   turn(t: HerdrTurn): void {
     // 반납 뒤 신고는 반납한 에이전트를 더 큰 seq 로 다시 등록한다 — 막는다.
     if (this.disabled || this.released) return;
+    this.lastTurn = t;
+    this.turnGen += 1;
+    this.turnRetries = 0;
+    this.issueTurn(t);
+  }
+
+  private issueTurn(t: HerdrTurn): void {
     const state = t === 'busy' ? 'working' : 'idle';
     this.issue([
       'pane', 'report-agent',
@@ -328,11 +399,24 @@ class Reporter implements HerdrAgentReporterLike {
     if (this.released) return;
     // idle 등록 실패가 확인됐거나 start 전이면 건너뛴다. pending = 결과 모름 → 반납을 시도한다.
     if (this.startState === 'none' || this.startState === 'failed' || this.idleFailed) return;
+    this.released = true;
     if (this.startState === 'pending') {
       this.log('release-start-pending', {});
       this.releasedWhilePending = true;
+      // 즉시 종료 경합(TUI-HERDR-EXIT-RACE): 비동기 idle 등록은 herdr 자식 프로세스라 부모가 죽어도 간다.
+      //   herdr 0.9.1 실측 — 미등록 에이전트 반납은 rc0 인데 seq 를 안 남긴다 ⇒ 반납 «뒤에» 닿은 작은 seq 등록이
+      //   유령으로 남는다(10-22 격리 세션 tf-exit-race). 기다릴 수 없으니(동기 ≤300ms) 순서를 동기로 고정한다:
+      //   더 큰 seq 로 동기 재등록 → 동기 반납. 반납이 «등록된» 에이전트를 지우며 seq 를 남기므로
+      //   늦게 닿는 앞 등록(작은 seq)은 herdr 가 버린다. 재등록 실패여도 반납은 그대로 시도한다(결과 모름).
+      this.issue([
+        'pane', 'report-agent',
+        '--source', HERDR_SOURCE, '--agent', HERDR_AGENT,
+        '--state', 'idle',
+        '--agent-session-id', this.sessionId,
+        '--seq', this.nextSeq(),
+        this.paneId,
+      ], true, 'release');
     }
-    this.released = true;
     const seq = this.nextSeq();
     // pane 기록 쓰기는 여기(동기 종료 경로)뿐이다.
     try { this.seqStore.write(this.seq); } catch (error) { this.seqStoreFail(error); }
@@ -344,6 +428,27 @@ class Reporter implements HerdrAgentReporterLike {
       '--source', HERDR_SOURCE, '--agent', HERDR_AGENT,
       '--seq', seq,
     ], true, 'release');
+  }
+
+  /**
+   * turn 신고 timeout — 신고기를 끄지 않고 마지막 턴 상태를 잠시 뒤 다시 신고한다(TUI-HERDR-STATUS-STALE).
+   * herdr 가 그 신고를 이미 적용했어도(답만 늦었다) 다시 보내는 것은 무해하다 — 더 큰 seq 의 같은 상태다.
+   */
+  private retryTurnAfterTimeout(argv: string[], stderr: string | undefined): void {
+    const gen = this.turnGen;
+    const state = this.lastTurn;
+    const attempt = this.turnRetries + 1;
+    if (state === null) return;
+    if (attempt > HERDR_TURN_RETRY_MAX) {
+      this.log('report-gave-up', { cmd: argv[1] ?? '', state: state === 'busy' ? 'working' : 'idle', attempts: HERDR_TURN_RETRY_MAX, stderrHead: stderrHead(stderr) });
+      return;
+    }
+    this.turnRetries = attempt;
+    this.log('report-timeout-retry', { cmd: argv[1] ?? '', state: state === 'busy' ? 'working' : 'idle', attempt, delayMs: HERDR_TURN_RETRY_DELAY_MS, stderrHead: stderrHead(stderr) });
+    this.schedule(() => {
+      if (this.disabled || this.released || this.turnGen !== gen) return;
+      this.issueTurn(state);
+    }, HERDR_TURN_RETRY_DELAY_MS);
   }
 
   private seqStoreFail(error: unknown): void {
@@ -388,7 +493,7 @@ class Reporter implements HerdrAgentReporterLike {
       const judged = (result as Promise<HerdrRunResult>).then(
         (r) => {
           if (r.ok) return true;
-          this.fail(argv, phase, r.stderr);
+          this.fail(argv, phase, r.stderr, r.timedOut === true);
           return false;
         },
         (error: unknown) => {
@@ -401,7 +506,7 @@ class Reporter implements HerdrAgentReporterLike {
     }
     const syncResult = result as HerdrRunResult;
     if (!syncResult.ok) {
-      this.fail(argv, phase, syncResult.stderr);
+      this.fail(argv, phase, syncResult.stderr, syncResult.timedOut === true);
       return false;
     }
     return true;
@@ -419,7 +524,7 @@ class Reporter implements HerdrAgentReporterLike {
     try {
       const r = await this.run(argv, opts);
       if (r.ok) return true;
-      this.fail(argv, phase, r.stderr);
+      this.fail(argv, phase, r.stderr, r.timedOut === true);
       return false;
     } catch (error) {
       this.fail(argv, phase, error instanceof Error ? error.message : String(error));
@@ -427,7 +532,11 @@ class Reporter implements HerdrAgentReporterLike {
     }
   }
 
-  private fail(argv: string[], phase: 'start' | 'session' | 'turn' | 'release', stderr: string | undefined): void {
+  private fail(argv: string[], phase: 'start' | 'session' | 'turn' | 'release', stderr: string | undefined, timedOut = false): void {
+    if (phase === 'turn' && timedOut && !this.disabled) {
+      this.retryTurnAfterTimeout(argv, stderr);
+      return;
+    }
     if (phase === 'start') this.idleFailed = true;
     // 반납 실패는 신고기가 이미 꺼졌어도 늘 남긴다(종료 경로의 유일한 흔적).
     if (phase === 'release') {

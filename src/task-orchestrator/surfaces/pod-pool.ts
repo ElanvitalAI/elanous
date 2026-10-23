@@ -89,19 +89,82 @@ function defaultLocalImageInspect(image: string): { status: number | null; stdou
   return { status: r.status, stdout: r.stdout ?? '' };
 }
 
+/** 레지스트리 안 이미지 이름 — `docker/harness/build.sh` 의 full/lite 규칙 그대로. */
+function podRegistryImageName(image: string): string {
+  return image === 'elanous-harness-lite:local' ? 'elanous-harness-lite' : 'elanous-harness';
+}
+
+/** 레지스트리 태그 = 커밋 앞 12자리 (build.sh:295 와 같은 규칙). */
+function podRegistryTag(commit: string): string {
+  return commit.slice(0, 12);
+}
+
+/** 노드 로컬 레지스트리의 HTTP 포트 — 호스트에서는 같은 포트의 localhost 로 조회한다. */
+function memberRegistryPort(member: PodPoolMember): string {
+  const registry = memberRegistry(member);
+  return registry.slice(registry.lastIndexOf(':') + 1);
+}
+
 /** 이 커밋의 이미지가 노드 레지스트리에 있나 — 있으면 클러스터 안 이미지 주소. */
 export function registryImageRef(member: PodPoolMember, commit: string | null, run: RemoteRun = defaultRemoteRun, image = 'elanous-harness:local'): string | null {
   if (!member.sshHost || !commit) return null;
-  const imageName = image === 'elanous-harness-lite:local' ? 'elanous-harness-lite' : 'elanous-harness';
-  const tag = commit.slice(0, 12);
+  const imageName = podRegistryImageName(image);
+  const tag = podRegistryTag(commit);
   const registry = memberRegistry(member);
-  const port = registry.slice(registry.lastIndexOf(':') + 1);
-  const r = run(member.sshHost, `curl -fsS --max-time 5 http://localhost:${port}/v2/${imageName}/tags/list 2>/dev/null`);
+  const r = run(member.sshHost, `curl -fsS --max-time 5 http://localhost:${memberRegistryPort(member)}/v2/${imageName}/tags/list 2>/dev/null`);
   if (r.status !== 0) return null;
   try {
     const tags = (JSON.parse(r.stdout) as { tags?: string[] }).tags ?? [];
     return tags.includes(tag) ? `${registry}/${imageName}:${tag}` : null;
   } catch { return null; }
+}
+
+/** 레지스트리 HTTP 한 번 — 노드에서 `curl -fsS --max-time 5`(registryImageRef 와 같은 규칙). 실패면 null. */
+function registryHttpGet(member: PodPoolMember, path: string, run: RemoteRun, accept?: string): string | null {
+  if (!member.sshHost) return null;
+  const header = accept ? `-H 'Accept: ${accept}' ` : '';
+  const r = run(member.sshHost, `curl -fsS --max-time 5 ${header}http://localhost:${memberRegistryPort(member)}/v2/${path} 2>/dev/null`);
+  return r.status === 0 && r.stdout.trim() ? r.stdout : null;
+}
+
+function registryLabelValue(raw: unknown): string | null {
+  return typeof raw === 'string' && raw.trim() && raw !== '<no value>' ? raw.trim() : null;
+}
+
+/**
+ * GATE-REGISTRY-IMAGE-FASTPATH (0.2.36): 레지스트리 HTTP 만으로 이 커밋 태그 이미지의 config label 을 읽는다 —
+ * 노드 Docker 데몬(`docker image inspect`)을 부르지 않는다. 태그 결손 · HTTP 오류 · manifest list(단일 config 없음) ·
+ * 비JSON 은 null 이다(판정하지 않고 종전 경로로 떨어진다).
+ *   GET /v2/<이미지>/manifests/<커밋12> → config.digest → GET /v2/<이미지>/blobs/<digest> → config.Labels
+ */
+export function registryImageLabels(member: PodPoolMember, image: string, commit: string | null, run: RemoteRun = defaultRemoteRun): { commit: string | null; skills: string | null } | null {
+  if (!member.sshHost || !commit) return null;
+  const imageName = podRegistryImageName(image);
+  const manifest = registryHttpGet(member, `${imageName}/manifests/${podRegistryTag(commit)}`, run, 'application/vnd.docker.distribution.manifest.v2+json');
+  if (!manifest) return null;
+  let digest: string | undefined;
+  try { digest = (JSON.parse(manifest) as { config?: { digest?: string } }).config?.digest; } catch { return null; }
+  if (!digest) return null;
+  // config digest 는 `sha256:<64 hex>` — 이 형태가 아니면 경로에 넣지 않는다.
+  if (!/^sha256:[0-9a-f]{64}$/u.test(digest)) return null;
+  const blob = registryHttpGet(member, `${imageName}/blobs/${digest}`, run);
+  if (!blob) return null;
+  let labels: Record<string, unknown> | undefined;
+  try { labels = (JSON.parse(blob) as { config?: { Labels?: Record<string, unknown> } }).config?.Labels; } catch { return null; }
+  if (!labels || typeof labels !== 'object') return null;
+  return { commit: registryLabelValue(labels['elanous.commit']), skills: registryLabelValue(labels['elanous.pod-skills']) };
+}
+
+/**
+ * 이 커밋 태그의 이미지 label 이 이번 발사 값과 모두 맞나 — 맞으면 Docker 조회 없이 그 판을 쓸 수 있다.
+ * 커밋 label 은 발사 커밋과 «정확히» 같아야 한다(태그가 다른 판을 가리키는 경우를 거른다).
+ * `localSkillsDigest` 가 없으면(모르는 값) 커밋 label 만 본다 — syncPoolImages 의 종전 skillsSame 과 같은 뜻.
+ */
+export function registryImageLabelsMatch(member: PodPoolMember, image: string, commit: string | null, opts: { localSkillsDigest?: string | null; run?: RemoteRun } = {}): boolean {
+  if (!commit) return false;
+  const labels = registryImageLabels(member, image, commit, opts.run ?? defaultRemoteRun);
+  if (!labels || labels.commit !== commit) return false;
+  return opts.localSkillsDigest == null || labels.skills === opts.localSkillsDigest;
 }
 
 /** IMAGE-ONE-SOURCE: 이 멤버의 노드에 레지스트리 컨테이너가 있나(syncPoolImages 의 판정과 같은 명령). 로컬 멤버는 false. */
@@ -873,6 +936,15 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
   await Promise.all(members.map(async (m) => {
     const t0 = Date.now();
     if (!m.sshHost) { results.set(m.context, { ok: true, action: 'local', detail: 'this machine', ms: 0 }); return; }
+    // ⭐ GATE-REGISTRY-IMAGE-FASTPATH (0.2.36 · OP): 레지스트리 커밋 태그의 config label(commit ⊕ pod-skills)이 이번 발사
+    //   값과 같으면 노드 Docker 데몬을 «한 번도» 부르지 않고 그 커밋 ref 로 끝난다 — 데몬 조회가 느려도 gate 첫 Pod 이 뜬다.
+    //   태그 결손 · label 불일치 · HTTP 오류면 아래 종전 경로(원격 inspect → 노드 빌드 → 통째 전송)가 그대로 판정한다.
+    if (localCommit && registryImageLabelsMatch(m, image, localCommit, { ...(deps.localSkillsDigest !== undefined ? { localSkillsDigest: deps.localSkillsDigest } : {}), run })) {
+      const imageRef = `${memberRegistry(m)}/${podRegistryImageName(image)}:${podRegistryTag(localCommit)}`;
+      debug.log('pod.pool', 'image-fresh-registry-label', { context: m.context, host: m.sshHost, commit: localCommit, imageRef, skills: deps.localSkillsDigest ?? null, waitedMs: 0 });
+      results.set(m.context, { ok: true, action: 'fresh', detail: localCommit.slice(0, 12), ms: Date.now() - t0, imageRef });
+      return;
+    }
     const before = remoteImageCommit(m, image, run);
     const skillsNow = deps.localSkillsDigest;
     const refBefore = registryImageRef(m, localCommit, run, image);

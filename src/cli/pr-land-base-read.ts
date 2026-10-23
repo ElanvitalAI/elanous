@@ -1,7 +1,16 @@
 import type { CmdRunner } from '../autopilot/pr-manager.js';
 
 export const PR_LAND_BASE_READ_RETRIES = 2;
-export const PR_LAND_BASE_READ_RETRY_DELAY_MS = 100;
+/** Increasing backoff: 1s after the first unreadable read, 3s after the second (OPT #24215). */
+export const PR_LAND_BASE_READ_RETRY_DELAYS_MS = [1_000, 3_000] as const;
+/** Fixed ceiling: no retry sleep ever exceeds the last scheduled delay. */
+export const PR_LAND_BASE_READ_RETRY_DELAY_CAP_MS = 3_000;
+
+/** Backoff for the sleep that follows `attempt`; the schedule stops growing at the cap. */
+export function prLandBaseReadRetryDelayMs(attempt: number): number {
+  const index = Math.min(Math.max(attempt, 1), PR_LAND_BASE_READ_RETRY_DELAYS_MS.length) - 1;
+  return Math.min(PR_LAND_BASE_READ_RETRY_DELAYS_MS[index], PR_LAND_BASE_READ_RETRY_DELAY_CAP_MS);
+}
 
 export interface PrBaseReadResult {
   baseRefName: string | null;
@@ -30,7 +39,7 @@ export async function readPrBaseNameWithRetry(input: {
 
     if (baseRefName !== null) return { baseRefName, attempts: attempt };
     input.onUnreadable?.(attempt, viewed.err);
-    if (attempt <= PR_LAND_BASE_READ_RETRIES) await input.sleep(PR_LAND_BASE_READ_RETRY_DELAY_MS);
+    if (attempt <= PR_LAND_BASE_READ_RETRIES) await input.sleep(prLandBaseReadRetryDelayMs(attempt));
   }
   return { baseRefName: null, attempts: PR_LAND_BASE_READ_RETRIES + 1 };
 }

@@ -48,6 +48,8 @@ export interface NextAction {
   cwd?: string;
   risk?: 'money' | 'security' | 'irreversible-publication';
   delivery?: { kind: DeliveryKind; worktreePath: string; projectTarget: string; files: string[] };
+  /** NEXTMOVE-GENERAL-RELAUNCH-MOVEID — 이 재발사를 고른 next-move 결정의 수 id(결정 순간 한 번 · 다시 만들지 않는다). 있으면 `harness say --move-id` 로 싣는다. */
+  moveId?: string;
 }
 export interface ActionDeps {
   command(args: string[]): Promise<{ status: number; stdout: string; stderr?: string }>;
@@ -273,7 +275,7 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     return card('review verdict or must-fix unavailable');
   }
   // 여기 닿는 종류는 land · retry 둘뿐이다(green·decision·review 는 위에서 끝난다).
-  const args = action.kind === 'land' ? ['pr', 'land', '--cwd', action.cwd!] : ['harness', 'say', retryText(action)];
+  const args = action.kind === 'land' ? ['pr', 'land', '--cwd', action.cwd!] : ['harness', 'say', retryText(action), ...(action.moveId ? ['--move-id', action.moveId] : [])];
   const day = deps.landingDay ?? new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });
   if (action.kind === 'retry' && deps.retryLaunches) deps.retryLaunches.count++;
   const outcome = await deps.command(args);

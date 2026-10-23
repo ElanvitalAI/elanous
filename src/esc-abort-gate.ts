@@ -145,6 +145,75 @@ export function createHarnessEscHint(pushLine: (line: string) => void): (targets
   };
 }
 
+export interface EscAbortPendingSoftStopRunnerDeps {
+  getActiveHarnessSpace: () => string | null;
+  pushChatLine: (line: string) => void;
+  showHarnessEscHint: (targets: readonly string[]) => boolean;
+}
+
+export interface EscAbortPendingSoftStopOutcomeLike {
+  outcome: 'stopped' | 'failed' | 'hint' | 'waiting';
+  stoppedHarnessSpace: string | null;
+}
+
+export interface EscAbortPendingGateDeps {
+  /**
+   * Production soft-stop runner (`runEscAbortPendingSoftStop` in
+   * src/dashboard/index.ts): enqueues the durable soft-stop marker,
+   * verifies it, and paints the stopped/failure line. Injected (not
+   * imported) to keep this module free of a dashboard import cycle.
+   */
+  runSoftStop: (targets: readonly string[], deps: EscAbortPendingSoftStopRunnerDeps) => EscAbortPendingSoftStopOutcomeLike;
+  formatWaitingTargets: (targets: readonly string[]) => string;
+  getActiveHarnessSpace: () => string | null;
+  pushChatLine: (line: string) => void;
+  showHarnessEscHint: (targets: readonly string[]) => boolean;
+  /** Dashboard paint hook (chatScrollOffset reset) after each callback. */
+  afterAbortEvent?: () => void;
+}
+
+export interface EscAbortPendingGate {
+  onAbortPending(event: { running: number; repeat: number; targets: readonly string[] }): void;
+  onAbortRepeat(event: { running: number; repeat: number; targets: readonly string[]; phase: 'confirming' | 'pending' }): void;
+  getStoppedHarnessSpace(): string | null;
+}
+
+/**
+ * ⭐ TUI-ESC-EXIT production seam — the onAbortPending/onAbortRepeat
+ * callback pair that `attachChatStreamingKeys` wires into
+ * `createEscAbortGate`. Extracted from the dashboard inline closure so the
+ * incident test exercises the same function the dashboard executes.
+ *
+ * ⛔ Preservation rule: `stoppedHarnessSpace` only advances on a successful
+ * soft stop (a real stopped space). Later waiting/hint/failed callbacks must
+ * NOT clear a previously successful space — `onAbortRepeat` and the
+ * teardown `settleEscAbortPendingLines` decision depend on the retained value.
+ */
+export function createEscAbortPendingGate(deps: EscAbortPendingGateDeps): EscAbortPendingGate {
+  let stoppedHarnessSpace: string | null = null;
+  return {
+    onAbortPending({ targets }) {
+      const softStop = deps.runSoftStop(targets, {
+        getActiveHarnessSpace: deps.getActiveHarnessSpace,
+        pushChatLine: deps.pushChatLine,
+        showHarnessEscHint: deps.showHarnessEscHint,
+      });
+      if (softStop.stoppedHarnessSpace) stoppedHarnessSpace = softStop.stoppedHarnessSpace;
+      if (softStop.outcome === 'waiting') {
+        deps.pushChatLine(`  ⏳ 중단 요청됨 — ${deps.formatWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
+      }
+      deps.afterAbortEvent?.();
+    },
+    onAbortRepeat({ repeat, targets }) {
+      if (!stoppedHarnessSpace && !deps.showHarnessEscHint(targets)) {
+        deps.pushChatLine(`  ⏳ ESC 재시도 ${repeat}회 — ${deps.formatWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
+      }
+      deps.afterAbortEvent?.();
+    },
+    getStoppedHarnessSpace: () => stoppedHarnessSpace,
+  };
+}
+
 export function createEscAbortGate(deps: EscAbortGateDeps): EscAbortGate {
   let current: ApprovalModalHandle | null = null;
   let currentDispose: (() => void) | null = null;

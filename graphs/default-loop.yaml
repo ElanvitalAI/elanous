@@ -360,9 +360,14 @@ edges:
       blocked: stopped
       fail: stopped
 
+  # recover@1 의 출구는 «다음 걸음»이다 — 전부 stopped 로 접으면 재진입이 사라져
+  # land-refused 한 걸음이 수렴하지 못한다(관측: pod-child-failed · 수렴 못 함).
+  #   done        = 거절 사유가 이미 풀렸다 → 착지 마무리(cleanup)
+  #   rework      = 같은 착지 단계를 «한 번» 다시 밟는다(wait-retry · request-review)
+  #   needs-human · failed = 사람/판정에게 넘긴다
   - from: recover
     on: outcome
-    map: { done: stopped, rework: stopped, needs-human: stopped, failed: stopped }
+    map: { done: cleanup, rework: merge, needs-human: stopped, failed: stopped }
 
   - { from: freeze-check, on: outcome, map: { open: merge, frozen: hold, taken: stopped, ok: merge, fail: stopped } }
   - { from: hold, to: freeze-check }

@@ -12,6 +12,17 @@ export function stablePodManifestText(applied: Array<Record<string, any>>): stri
   let snapshots = 0;
   for (const manifest of manifests) {
     if (manifest.kind !== 'Job') continue;
+    // POD-LAUNCH-PROVENANCE — the request time and the 8-char run/parent labels are per launch like the run id.
+    for (const meta of [manifest.metadata, manifest.spec?.template?.metadata]) {
+      for (const bag of [meta?.labels, meta?.annotations]) {
+        if (!bag) continue;
+        if (bag['elanous.ai/requested-at'] !== undefined) bag['elanous.ai/requested-at'] = '<requested-at>';
+        if (meta?.labels === bag) for (const key of ['elanous.ai/run', 'elanous.ai/parent']) if (bag[key] !== undefined) bag[key] = '<run-label>';
+      }
+    }
+    for (const container of manifest.spec?.template?.spec?.containers ?? []) {
+      for (const entry of container.env ?? []) if (entry.name === 'ELANOUS_POD_REQUESTED_AT') entry.value = '<requested-at>';
+    }
     for (const container of manifest.spec?.template?.spec?.containers ?? []) {
       for (const entry of container.env ?? []) {
         if (entry.name !== BUDGET_SNAPSHOT_ENV) continue;

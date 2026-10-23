@@ -460,6 +460,67 @@ export function inheritDecomposedTargetPaths(parentFeature: string, goals: SelfD
     .flatMap(inferHotPaths))];
   const parentTargets = declaredTargets(parentFeature);
   if (!parentTargets.length) return goals;
+  // A two-part implementation must not hand a pathless child its sibling's
+  // target as part of the parent edit fence. Keep other decompositions below.
+  if (goals.length === 2 && parentTargets.length >= 2
+    && goals.every((goal) => goal.goalType === undefined || goal.goalType === 'implement')) {
+    const own = goals.map((goal) => declaredTargets(goal.feature ?? ''));
+    const undeclared = own.map((paths, index) => paths.length ? -1 : index).filter((index) => index >= 0);
+    const declared = own.flat();
+    const canDivide = undeclared.length === 2
+      || (undeclared.length === 1 && declared.length > 0
+        && declared.some((path) => parentTargets.includes(path))
+        && parentTargets.some((path) => !declared.includes(path)));
+    if (canDivide) {
+      const claims = goals.map((goal, index) => own[index]!.length
+        ? own[index]!
+        : (goal.hotPaths ?? []).filter((path) => parentTargets.includes(path)));
+      const claimedOwners = parentTargets.map((path) => goals.flatMap((_, index) => claims[index]!.includes(path) ? [index] : []));
+      const conflictingClaims = claimedOwners.some((indices) => indices.length > 1);
+      const nameOwners = parentTargets.map((path) => {
+        const stemWords = path.split('/').at(-1)!.replace(/\.[^.]+$/, '').toLowerCase().match(/[a-z0-9]+/g) ?? [];
+        if (!stemWords.length || stemWords.join('').length < 4) return [];
+        return goals.flatMap((goal, childIndex) => {
+          const words = (goal.feature ?? '').toLowerCase().match(/[a-z0-9]+/g) ?? [];
+          return words.some((_, start) => stemWords.every((word, offset) => words[start + offset] === word)) ? [childIndex] : [];
+        });
+      });
+      const ambiguousName = nameOwners.some((indices, index) => claimedOwners[index]!.length === 0 && indices.length > 1);
+      const conflictingNameClaim = claimedOwners.some((indices, index) => indices.length === 1
+        && nameOwners[index]!.some((namedOwner) => namedOwner !== indices[0]));
+      const claimCounts = [0, 1].map((index) => claimedOwners.filter((indices) => indices.length === 1 && indices[0] === index).length);
+      const soleClaimant = claimCounts[0]! > 0 && claimCounts[1] === 0 ? 0
+        : claimCounts[1]! > 0 && claimCounts[0] === 0 ? 1 : undefined;
+      const conflictingUnclaimedHint = soleClaimant !== undefined && nameOwners.some((indices, index) =>
+        claimedOwners[index]!.length === 0 && indices.includes(soleClaimant));
+      const owners = parentTargets.map((_, index) => claimedOwners[index]!.length === 1
+        ? claimedOwners[index]![0]
+        : soleClaimant !== undefined ? 1 - soleClaimant
+          : nameOwners[index]!.length === 1 ? nameOwners[index]![0] : undefined);
+      const ownerCounts = [owners.filter((owner) => owner === 0).length, owners.filter((owner) => owner === 1).length];
+      owners.forEach((owner, index) => {
+        if (owner !== undefined) return;
+        const next = ownerCounts[0]! <= ownerCounts[1]! ? 0 : 1;
+        owners[index] = next;
+        ownerCounts[next] = (ownerCounts[next] ?? 0) + 1;
+      });
+      // A named path wins over model order; if every path points at one child,
+      // keep the old scope rather than inventing work for the other child.
+      const partitions = goals.map((_, index) => parentTargets.filter((_, pathIndex) => owners[pathIndex] === index));
+      const sharedOtherPaths = (goals[0]?.hotPaths ?? []).some((path) =>
+        !parentTargets.includes(path) && (goals[1]?.hotPaths ?? []).includes(path));
+      const conflictingParentReference = goals.some((goal, index) =>
+        own[index]!.length > 0 && (goal.hotPaths ?? []).some((path) =>
+          parentTargets.includes(path) && !own[index]!.includes(path)));
+      if (partitions.every((paths) => paths.length > 0)
+        && !conflictingClaims && !ambiguousName && !conflictingNameClaim && !conflictingUnclaimedHint
+        && !sharedOtherPaths && !conflictingParentReference) return goals.map((goal, index) => {
+        const targets = partitions[index]!;
+        return { ...goal, hotPaths: [...new Set([...(goal.hotPaths ?? []), ...targets])],
+          feature: `${goal.feature}${own[index]!.length ? '' : `\n대상 경로: ${targets.join(' · ')}`}\n완료 기준: ${targets.join(' · ')}의 변경을 확인하고 관련 시험을 통과한다.` };
+      });
+    }
+  }
   return goals.map((goal) => {
     // hotPaths also contains inferred references; only an explicit target line establishes child scope.
     const own = declaredTargets(goal.feature ?? '');

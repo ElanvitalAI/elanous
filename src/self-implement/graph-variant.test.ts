@@ -1,8 +1,13 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { GRAPH_SPECS } from './graph-templates.js';
-import { createGraphVariant, type GraphVariantPlan } from './graph-variant.js';
+import { createGraphVariant, initialGraphVariantSelection, type GraphVariantPlan } from './graph-variant.js';
 import { edgeMapOf, type GraphTemplateSpec } from './graph-yaml.js';
 import { selectOverlays } from './graph-overlay-yaml.js';
+import { loadRunGraphVariant, runGraphVariantPath, runLedgerPath, saveRunGraphVariant } from './run-ledger.js';
+import { stringify } from 'yaml';
 
 const template = GRAPH_SPECS['self-implement'] as GraphTemplateSpec;
 const plan: GraphVariantPlan = { maxVisits: { rework: 5 }, routes: [{ from: 'review', outcome: 'pass', to: 'open-pr' }] };
@@ -104,6 +109,22 @@ describe('harness graph variant', () => {
     if (!invalid.ok) expect(invalid.rejections[0]?.kind).toBe('invalid-goal');
   });
 
+  test('growth rejects invalid goal analysis along with invalid node, and never accepts it with a valid node', () => {
+    const goalAnalysis = { goalType: 'implement' as const, targetPathCount: -1 };
+    const noGrowth = createGraphVariant({ template, goal: 'g_abc123', goalAnalysis, plan: {} });
+    expect(noGrowth.ok).toBe(false);
+    if (!noGrowth.ok) expect(noGrowth.rejections.map((rejection) => rejection.kind)).toEqual(['invalid-goal-analysis']);
+    const invalidNode = createGraphVariant({ template, goal: 'g_abc123', goalAnalysis,
+      plan: { growth: { node: null as never, from: 'review', outcome: 'other', returnTo: 'review' } } });
+    expect(invalidNode.ok).toBe(false);
+    if (!invalidNode.ok) expect(invalidNode.rejections.map((rejection) => rejection.kind)).toEqual(['invalid-goal-analysis', 'invalid-growth']);
+    const existingNode = template.nodes[0]!;
+    const validNode = createGraphVariant({ template, goal: 'g_abc123', goalAnalysis,
+      plan: { growth: { node: { ...existingNode, nodeId: 'new-growth-node' }, from: 'review', outcome: 'other', returnTo: 'review' } } });
+    expect(validNode.ok).toBe(false);
+    if (!validNode.ok) expect(validNode.rejections.some((rejection) => rejection.kind === 'invalid-goal-analysis')).toBe(true);
+  });
+
   test('an outcome declared on two conditional edges of one node is rejected, not half-patched', () => {
     const reviewEdge = template.edges.find((edge) => edge.from === 'review' && edge.map?.pass);
     expect(reviewEdge).toBeDefined();
@@ -111,5 +132,47 @@ describe('harness graph variant', () => {
     const result = generate({ routes: [{ from: 'review', outcome: 'pass', to: 'open-pr' }] }, doubled);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.rejections).toEqual([{ kind: 'ambiguous-outcome', from: 'review', outcome: 'pass' }]);
+  });
+
+  test('L2 발사 때 상황별 최초 설계 — 골 종류·대상 경로 수를 주면 최초 graph variant id·선택 이유가 결정론적으로 나온다', () => {
+    // 격리 골 한 건의 기록된 실제 입력 — 이 런의 골 문서(종류 implement · 대상 경로 5).
+    const goalAnalysis = { goalType: 'implement' as const, targetPathCount: 5 };
+    // ① 최초 variant id·선택 이유 산출 — 결정론: 같은 두 입력이면 같은 값, 어느 하나라도 다르면 다른 id.
+    const first = initialGraphVariantSelection(goalAnalysis);
+    expect(initialGraphVariantSelection(goalAnalysis)).toEqual(first);
+    expect(initialGraphVariantSelection({ goalType: 'document', targetPathCount: 5 }).variantId).not.toBe(first.variantId);
+    expect(initialGraphVariantSelection({ goalType: 'implement', targetPathCount: 1 }).variantId).not.toBe(first.variantId);
+    expect(first.reason).toContain('implement');
+    expect(first.reason).toContain('5');
+
+    // 생산 검증 경로 — createGraphVariant 결과에 그 선택이 그대로 실리고, 계획이 달라져도 선택은 두 입력만 따른다.
+    const variant = createGraphVariant({ template, goal: 'g_variant_slice', plan, goalAnalysis });
+    expect(variant.ok).toBe(true);
+    if (!variant.ok) return;
+    expect(variant.selection).toEqual(first);
+    const otherPlan = createGraphVariant({ template, goal: 'g_variant_slice', plan: { maxVisits: { review: 6 } }, goalAnalysis });
+    expect(otherPlan.ok).toBe(true);
+    if (otherPlan.ok) expect(otherPlan.selection).toEqual(first);
+  });
+
+  test('최초 graph variant id·선택 이유가 런 원장 옆 .graph.yaml 에 저장되고 loadRunGraphVariant 재조회가 같다', () => {
+    const selection = initialGraphVariantSelection({ goalType: 'implement', targetPathCount: 5 });
+
+    // ② 런 원장 옆 저장 경로 확보 + 저장(.graph.yaml) — ③ 재조회 동일성(id·reason·경로).
+    const dir = mkdtempSync(join(tmpdir(), 'graph-variant-ledger-'));
+    try {
+      const runId = 'run-0a0b0c0d-1111-4222-8333-444455556666';
+      const graphFile = runGraphVariantPath(runId, dir);
+      expect(graphFile).toBe(`${runLedgerPath(runId, dir)}.graph.yaml`);
+      expect(loadRunGraphVariant(runId, dir)).toBe(null);
+      expect(saveRunGraphVariant(runId, stringify({
+        graph_id: 'self-implement', variant_id: selection.variantId, reason: selection.reason,
+        nodes: [], edges: [],
+      }), dir)).toBe(graphFile);
+      expect(loadRunGraphVariant(runId, dir)).toEqual({ variantId: selection.variantId, reason: selection.reason });
+      expect(runGraphVariantPath(runId, dir)).toBe(graphFile);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

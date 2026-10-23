@@ -10,8 +10,29 @@
 
 import { inspectActiveProvider, type ActiveProviderInfo } from '../provider-summary.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
+import { currentRouteDecision, currentRouteExecution } from '../llm/route-decision.js';
+import type { ModelExecutionActual } from './bar.js';
 
-export type StatusProviderInfo = Pick<ActiveProviderInfo, 'provider' | 'model'>;
+export type StatusProviderInfo = Pick<ActiveProviderInfo, 'provider' | 'model'> & {
+  /** TUI-MODEL-BADGE-ACTUAL (10-16) — 이번 턴 «실제» 실행. 있으면 배지는 이 값을 «지금» 으로 쓴다. */
+  actual?: ModelExecutionActual | null;
+};
+
+/** 표면의 이번 턴 «실제» 실행을 배지 입력 꼴로 옮긴다 — 결정(턴 시작에 고른 값)과 다르면
+ *  `fallbackFrom` 이 채워져 배지가 `고른 → 실제` 를 보인다. 실행 기록이 없으면 null(꾸미지 않는다).
+ *  원천은 완료 배지와 «같은» 맵(`src/llm/route-decision.ts`)이다 — 두 표면이 다른 말을 하지 않게. */
+export function statusModelActual(surface = 'dashboard'): ModelExecutionActual | null {
+  const execution = currentRouteExecution(surface);
+  const model = execution?.model?.trim();
+  if (!model) return null;
+  const provider = execution?.provider?.trim();
+  const planned = currentRouteDecision(surface)?.model?.trim();
+  return {
+    model,
+    ...(provider ? { provider } : {}),
+    ...(planned && planned !== model ? { fallbackFrom: planned } : {}),
+  };
+}
 
 export interface StatusProviderInfoReaderDeps {
   readConfig?: () => UserConfig;
@@ -23,9 +44,15 @@ export interface StatusProviderInfoReaderDeps {
   maxAgeMs?: number;
 }
 
+/** 상태줄이 매 렌더 부르는 리더 — `actual`(이번 턴 실제 실행)은 선택이라 종전 호출 그대로도 된다. */
+export type StatusProviderInfoReader = (
+  runtimeModel?: string,
+  actual?: ModelExecutionActual | null,
+) => StatusProviderInfo;
+
 export function createStatusProviderInfoReader(
   deps: StatusProviderInfoReaderDeps = {},
-): (runtimeModel?: string) => StatusProviderInfo {
+): StatusProviderInfoReader {
   const readConfig = deps.readConfig ?? (() => getUserConfig());
   const inspect = deps.inspect ?? ((cfg, runtimeModel) => inspectActiveProvider(cfg, runtimeModel));
   const now = deps.now ?? Date.now;
@@ -39,20 +66,24 @@ export function createStatusProviderInfoReader(
     inspectedAt: number;
   } | null = null;
 
-  return (runtimeModel?: string): StatusProviderInfo => {
+  /** `actual` — 이번 턴 실제 실행(있으면). 기억은 설정/런타임 값만 하고, 실행은 «매 렌더»
+   *  달라지므로 기억 밖에서 덧씌운다(낡은 실행이 굳지 않게). */
+  return (runtimeModel?: string, actual?: ModelExecutionActual | null): StatusProviderInfo => {
     const t = now();
     // ⛔ 조기 반환에도 최대 수명을 건다 — TTL 만 보면 «29초에 설정 확인 → 30.001초 렌더»가 재판정 없이 지나간다.
     const fresh = memo !== null && t - memo.inspectedAt < maxAgeMs;
-    if (memo && fresh && memo.runtimeModel === runtimeModel && t - memo.checkedAt < ttlMs) return memo.info;
+    if (memo && fresh && memo.runtimeModel === runtimeModel && t - memo.checkedAt < ttlMs) {
+      return actual ? { ...memo.info, actual } : memo.info;
+    }
     // getUserConfig() 는 파일 mtime 이 같으면 «같은 객체»를, 바뀌면 새 객체를 돌려준다(user-config.ts getUserConfig).
     const cfg = readConfig();
     if (memo && fresh && memo.cfg === cfg && memo.runtimeModel === runtimeModel) {
       memo.checkedAt = t;
-      return memo.info;
+      return actual ? { ...memo.info, actual } : memo.info;
     }
     const full = inspect(cfg, runtimeModel);
     const info: StatusProviderInfo = { provider: full.provider, model: full.model };
     memo = { info, cfg, runtimeModel, checkedAt: t, inspectedAt: t };
-    return info;
+    return actual ? { ...info, actual } : info;
   };
 }

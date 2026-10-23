@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordHarnessWorktreeProvenance } from '../../harness/harness-worktree-add.js';
 import { REPAIR_REF, readPodRepairArtifact, writePodRepairCommit } from './pod-repair-commit.js';
+import { GATE_ENV_DEFICIT_HARVESTABLE_MARK } from '../../self-implement/gate-env-retry.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -66,7 +67,26 @@ test('repair refuses a stale source head and a result without successful worktre
   expect(() => writePodRepairCommit({ runId: 'run-parent', pr: 42, baseHead: stale, repo: f.repo, outbox: join(f.root, 'outbox'),
     output: JSON.stringify({ ok: true, stage: 'worktree-completed', runId: 'run-child', worktreePath: f.worktree }) })).toThrow('source head changed');
   expect(() => writePodRepairCommit({ runId: 'run-parent', pr: 42, baseHead: f.baseHead, repo: f.repo, outbox: join(f.root, 'outbox'),
-    output: JSON.stringify({ ok: true, stage: 'pr-opened', runId: 'run-child', worktreePath: f.worktree }) })).toThrow('successful worktree-only');
+    output: JSON.stringify({ ok: true, stage: 'pr-opened', runId: 'run-child', worktreePath: f.worktree }) })).toThrow('neither successful worktree-only nor environment-deficit harvestable');
+});
+
+test('environment-deficit harvest exports a pinned repair bundle after child exit 1; other gate failures cannot', () => {
+  const f = fixture();
+  writeFileSync(join(f.worktree, 'file.txt'), 'implementation kept for rejudge\n');
+  const base = { ok: false, stage: 'gate-failed', runId: 'run-child', worktreePath: f.worktree, harvestable: true,
+    gate: { passed: false, reflectGateFacts: { introduced: 0, childResponsibility: 'none', unknownReason: 'infrastructure-failure' } } };
+  const outbox = join(f.root, 'outbox');
+  const request = { runId: 'run-parent', pr: 42, baseHead: f.baseHead, repo: f.repo, outbox };
+  expect(() => writePodRepairCommit({ ...request, output: JSON.stringify({ ...base, detail: 'introduced test failure' }) }))
+    .toThrow('neither successful worktree-only nor environment-deficit harvestable');
+  expect(() => writePodRepairCommit({ ...request, output: JSON.stringify({ ...base,
+    gate: { passed: false, reflectGateFacts: { introduced: 1, childResponsibility: 'none', unknownReason: 'infrastructure-failure' } },
+    detail: GATE_ENV_DEFICIT_HARVESTABLE_MARK }) })).toThrow('neither successful worktree-only nor environment-deficit harvestable');
+  expect(git(f.worktree, 'diff', '--cached', '--name-only')).toBe('');
+  const result = writePodRepairCommit({ ...request,
+    output: JSON.stringify({ ...base, detail: `gate failed after retry; ${GATE_ENV_DEFICIT_HARVESTABLE_MARK} — implementation kept` }) });
+  expect(result.commit).not.toBe(f.baseHead);
+  expect(readPodRepairArtifact(join(outbox, 'repair'), { pr: 42, baseHead: f.baseHead, runId: 'run-parent' })).toEqual(result);
 });
 
 test('repair rejects a child result that points at the original Pod checkout', () => {
@@ -81,12 +101,12 @@ test('repair rejects a final failure even when an earlier JSON line reported suc
   const output = [JSON.stringify({ ok: true, stage: 'worktree-completed', runId: 'run-child', worktreePath: f.worktree }),
     JSON.stringify({ ok: false, stage: 'failed', reason: 'child gate failed' })].join('\n');
   expect(() => writePodRepairCommit({ runId: 'run-parent', pr: 42, baseHead: f.baseHead, repo: f.repo,
-    outbox: join(f.root, 'outbox'), output })).toThrow('final result is not a successful worktree-only result');
+    outbox: join(f.root, 'outbox'), output })).toThrow('final result is neither successful worktree-only nor environment-deficit harvestable');
   expect(git(f.worktree, 'rev-parse', 'HEAD')).toBe(f.baseHead);
   const untypedError = [JSON.stringify({ ok: true, stage: 'worktree-completed', runId: 'run-child', worktreePath: f.worktree }),
     JSON.stringify({ error: 'child gate failed' })].join('\n');
   expect(() => writePodRepairCommit({ runId: 'run-parent', pr: 42, baseHead: f.baseHead, repo: f.repo,
-    outbox: join(f.root, 'outbox'), output: untypedError })).toThrow('final result is not a successful worktree-only result');
+    outbox: join(f.root, 'outbox'), output: untypedError })).toThrow('final result is neither successful worktree-only nor environment-deficit harvestable');
 });
 
 test('installed CLI exports a repair bundle while the old PR checkout has no exporter source', () => {

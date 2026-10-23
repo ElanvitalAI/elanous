@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { closeMergedTaskCard, reconcileHandMergedCard, type LandedTaskPr } from './postland-card.js';
+import { executeLiveLand } from './live-moves.js';
 import { judgeLandedCell } from '../release-loop/landed-to-green.js';
 import { updateTaskCard, type TaskCard } from './task-hand.js';
 import type { Checklist, ChecklistItem } from '../release-loop/checklist.js';
@@ -519,6 +520,86 @@ describe('TA hand-merge reconcile', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); rmSync(settled.dir, { recursive: true, force: true }); rmSync(offMain.dir, { recursive: true, force: true }); }
   });
 
+  test('the ancestry gate asks git about the merge SHA against origin/main by default', () => {
+    const f = handFixture();
+    const calls: Array<{ cwd: string; args: string[] }> = [];
+    try {
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, f.dir, { statePath: f.statePath, log: () => {},
+        git: (cwd: string, args: string[]) => { calls.push({ cwd, args }); return { status: 0, stdout: '', stderr: '' }; } });
+      expect(out).toMatchObject({ outcome: 'reconciled', status: 'landed-by-hand', mergeSha });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.cwd).toBe(f.dir);
+      expect(calls[0]!.args[0]).toBe('merge-base');
+      expect(calls[0]!.args).toContain('--is-ancestor');
+      expect(calls[0]!.args).toContain(mergeSha);
+      expect(calls[0]!.args.at(-1)).toBe('origin/main');
+      expect(f.read().status).toBe('landed-by-hand');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('a same-number card on another url or without taLand is not the bound card', () => {
+    const otherUrl = handFixture();
+    const noLand = handFixture();
+    try {
+      const disk = JSON.parse(readFileSync(otherUrl.statePath, 'utf8'));
+      disk.tasks['ta-79'].pr.url = 'https://github.com/example/repo/pull/79/files';
+      writeFileSync(otherUrl.statePath, JSON.stringify(disk));
+      expect(reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, otherUrl.dir, handDeps(otherUrl.statePath)))
+        .toMatchObject({ outcome: 'not-reconciled', reason: 'no-bound-card' });
+      expect(otherUrl.read().status).toBe('failed');
+      expect(otherUrl.read().history).toHaveLength(1);
+      const land = JSON.parse(readFileSync(noLand.statePath, 'utf8'));
+      delete land.tasks['ta-79'].taLand;
+      writeFileSync(noLand.statePath, JSON.stringify(land));
+      expect(reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, noLand.dir, handDeps(noLand.statePath)))
+        .toMatchObject({ outcome: 'not-reconciled', reason: 'no-bound-card' });
+      expect(noLand.read().status).toBe('failed');
+      expect(noLand.read().history).toHaveLength(1);
+      expect(noLand.read().prTerminal).toBeUndefined();
+    } finally { rmSync(otherUrl.dir, { recursive: true, force: true }); rmSync(noLand.dir, { recursive: true, force: true }); }
+  });
+
+  test('a failed card with no recorded history still settles and keeps the prior status in the hand-move line', () => {
+    const f = handFixture();
+    try {
+      const disk = JSON.parse(readFileSync(f.statePath, 'utf8'));
+      disk.tasks['ta-79'].history = [];
+      writeFileSync(f.statePath, JSON.stringify(disk));
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit: mergeSha }, f.dir, handDeps(f.statePath));
+      expect(out).toMatchObject({ outcome: 'reconciled', status: 'landed-by-hand' });
+      expect(f.read().status).toBe('landed-by-hand');
+      expect(f.read().history).toHaveLength(1);
+      expect(f.read().history[0].event).toBe('hand-move');
+      expect(f.read().history[0].detail).toContain('이전 status: failed');
+      expect(f.read().history[0].detail).toContain('이전 사유:');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('real git ancestry survives main advancing past the hand merge', () => {
+    const gitEnv: Record<string, string | undefined> = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+    delete gitEnv.GIT_CONFIG_COUNT;
+    delete gitEnv.GIT_CONFIG_PARAMETERS;
+    delete gitEnv.GIT_TEMPLATE_DIR;
+    const dir = mkdtempSync(join(tmpdir(), 'ta-postland-git-advance-'));
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', env: gitEnv }).trim();
+    const commit = (message: string) => git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'commit', '--allow-empty', '-m', message);
+    git('init', '-b', 'main');
+    commit('base');
+    git('checkout', '-b', 'feature');
+    commit('feature');
+    git('checkout', 'main');
+    git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'merge', '--no-ff', '-m', 'hand merge feature', 'feature');
+    const mergeCommit = git('rev-parse', 'HEAD');
+    commit('later work on main');
+    const f = handFixture();
+    try {
+      const out = reconcileHandMergedCard({ ...pr, mergeCommit }, dir, { statePath: f.statePath, mainRef: 'main', log: () => {} });
+      expect(out).toMatchObject({ outcome: 'reconciled', status: 'landed-by-hand', mergeSha: mergeCommit });
+      expect(f.read().status).toBe('landed-by-hand');
+      expect(f.read().history[1].event).toBe('hand-move');
+    } finally { rmSync(dir, { recursive: true, force: true }); rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
   for (const number of [26668, 27043, 27032, 26945]) {
     test(`hand-landed card #${number}: merged+main-ancestor reconciles to landed-by-hand with prior status and reason preserved`, () => {
       const reason = `failed/needs-owner — run died; 손수리 PR #${number} 병합됨`;
@@ -537,4 +618,41 @@ describe('TA hand-merge reconcile', () => {
       } finally { rmSync(f.dir, { recursive: true, force: true }); }
     });
   }
+
+  test('the production entry executeLiveLand reaches reconcileHandMergedCard and settles the failed card', async () => {
+    const gitEnv: Record<string, string | undefined> = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+    delete gitEnv.GIT_CONFIG_COUNT;
+    delete gitEnv.GIT_CONFIG_PARAMETERS;
+    delete gitEnv.GIT_TEMPLATE_DIR;
+    const repo = mkdtempSync(join(tmpdir(), 'ta-postland-entry-'));
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', env: gitEnv }).trim();
+    const commit = (message: string) => git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'commit', '--allow-empty', '-m', message);
+    git('init', '-b', 'main');
+    commit('base');
+    git('checkout', '-b', 'feature');
+    commit('feature');
+    git('checkout', 'main');
+    git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'merge', '--no-ff', '-m', 'hand merge feature', 'feature');
+    const mergeCommit = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', mergeCommit);
+    const stateDir = mkdtempSync(join(tmpdir(), 'ta-postland-entry-state-'));
+    const statePath = join(stateDir, 'task-agent-actions.json');
+    const reason = 'failed/needs-owner — run died';
+    const card: TaskCard = { id: 'ta-79', text: 'implement', createdAt: '2026-10-12T00:00:00Z', status: 'failed',
+      history: [{ event: 'judge', detail: reason, at: '2026-10-13T00:00:00Z' }], pr: { number: 79, url: pr.url }, taLand: true,
+      landAttempts: [{ pr: 79, head, at: '2026-10-13T00:00:00Z' }] };
+    writeFileSync(statePath, JSON.stringify({ tasks: { [card.id]: card } }));
+    try {
+      const out = await executeLiveLand(card, 79, { cwd: repo }, { statePath, log: () => {},
+        landPrHead: async () => ({ head, state: 'MERGED', isDraft: false, url: pr.url }),
+        handMergePr: async () => ({ state: 'MERGED', url: pr.url, baseRefName: 'main', mergedAt: '2026-10-14T00:00:00Z', mergeCommit }) });
+      expect(out).toMatchObject({ kind: 'land', card: 'ta-79', ok: true, executed: true });
+      expect(out.detail).toContain('landed-by-hand');
+      const settled = JSON.parse(readFileSync(statePath, 'utf8')).tasks['ta-79'];
+      expect(settled.status).toBe('landed-by-hand');
+      expect(settled.history[0]).toMatchObject({ event: 'judge', detail: reason });
+      expect(settled.history[1].event).toBe('hand-move');
+      expect(settled.history[1].detail).toContain('이전 status: failed');
+    } finally { rmSync(repo, { recursive: true, force: true }); rmSync(stateDir, { recursive: true, force: true }); }
+  });
 });

@@ -15,6 +15,41 @@ const input: RaiseInput = {
 const options = (stateDir: string): DecisionLedgerOptions => ({ stateDir, now: () => new Date('2026-10-16T04:00:00Z'),
   resolveVersion: () => ({ released: '0.2.30', dev: '0.2.31-dev.0', codename: null }) });
 
+test('production decisions CLI sends one notice to the raised track; retry adds none', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'decided-notify-cli-'));
+  const output: string[] = [];
+  const program = new Command();
+  registerDecisionsCommands(program, options(stateDir), { log: line => output.push(line) });
+  const run = (...args: string[]) => {
+    output.length = 0;
+    program.parse(['decisions', ...args], { from: 'user' });
+    return JSON.parse(output.at(-1)!);
+  };
+  try {
+    const raised = run('raise', '--title', 'UX 알림 검증', '--category', 'scope', '--s', '결정이 올라왔다.',
+      '--c', '수신 자리를 확인한다.', '--option', 'a=승인:전달', '--option', 'b=보류:대기', '--recommend', 'a',
+      '--why', '알림 경로 확인', '--track', 'UX', '--agent', 'UX', '--no-xcheck', '격리 회귀', '--json') as { id: string };
+    const decided = run('decide', raised.id, 'a', '--note', '실행 경로 통과', '--json') as {
+      status: string; notice: { status: string; seat: string; messageId: number };
+    };
+    expect(decided.status).toBe('decided');
+    expect(decided.notice).toMatchObject({ status: 'sent', seat: 'UX' });
+    const retried = run('retry-notify', raised.id, '--json') as typeof decided.notice;
+    expect(retried).toEqual(decided.notice);
+    const store = openMsgStore(join(stateDir, 'msg', 'messages.db'));
+    try {
+      const allMessages = store.listAfter(0);
+      expect(allMessages).toHaveLength(1);
+      expect(allMessages[0]?.id).toBe(decided.notice.messageId);
+      expect(allMessages[0]?.id).toBe(retried.messageId);
+      const messages = store.listByRecipient('UX');
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ id: decided.notice.messageId, from: 'OP', to: 'UX', kind: 'info' });
+      expect(messages[0]!.body).toContain(`${raised.id} · UX 알림 검증 · 선택 a: 승인 · 근거 실행 경로 통과`);
+    } finally { store.close(); }
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});
+
 test('decided sends the raised-by seat one durable choice and rationale; retry stays one message', () => {
   const stateDir = mkdtempSync(join(tmpdir(), 'decided-notify-'));
   try {

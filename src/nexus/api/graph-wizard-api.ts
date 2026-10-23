@@ -1,5 +1,7 @@
 import { debug } from '../../debug/log.js';
-import { GraphWizardInputError, generateGraphFromPrompt, wizardInstalledPacks, type GraphWizardDeps, type GraphWizardTurn } from '../../graph-wizard/generate.js';
+import { GraphWizardInputError, designGraphVariantPlan, generateGraphFromPrompt, wizardInstalledPacks, type GraphWizardDeps, type GraphWizardTurn } from '../../graph-wizard/generate.js';
+import { defaultGraphsDir } from '../../self-implement/graph-templates.js';
+import { loadGraphTemplates } from '../../self-implement/graph-yaml.js';
 import { jsonResponse } from './json-response.js';
 
 export function handleGraphWizardPacksGet(deps: GraphWizardDeps = {}): Response {
@@ -10,7 +12,8 @@ const MAX_PROMPT = 4000;
 const MAX_YAML = 200_000;
 
 /**
- * POST /v1/graphs/wizard {prompt, kind?, currentYaml?, history?}
+ * POST /v1/graphs/wizard {prompt, kind?, currentYaml?, history?} or
+ * {mode:'variant', prompt, goal, templateId} for one validated L2 plan (no YAML generation).
  * → 200 {ok:true, id, yaml, base, baseReason, issues:[], attempts, summary, labels, steps, recipes, dryRun} · 422 {ok:false, …} · 400 빈 prompt.
  * (labels·steps·recipes·dryRun·baseReason 는 v2 추가 필드 — 기존 필드는 그대로.)
  * currentYaml 이 빈 문자열이면 «빈 캔버스»로 보고 새 그래프를 짓는다(의도) · 내용이 있는데 id 가 없거나 형식 밖이면 400.
@@ -26,6 +29,9 @@ export async function handleGraphWizardPost(req: Request, deps: GraphWizardDeps 
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
   if (!prompt) return jsonResponse({ error: 'bad_request', reason: 'prompt required' }, 400);
   if (prompt.length > MAX_PROMPT) return jsonResponse({ error: 'bad_request', reason: `prompt longer than ${MAX_PROMPT}` }, 400);
+  if (body.mode !== undefined && body.mode !== 'variant') {
+    return jsonResponse({ error: 'bad_request', reason: 'mode must be variant when supplied' }, 400);
+  }
   if (body.kind !== undefined && body.kind !== 'harness' && body.kind !== 'workflow') {
     return jsonResponse({ error: 'bad_request', reason: 'kind must be harness or workflow' }, 400);
   }
@@ -44,6 +50,18 @@ export async function handleGraphWizardPost(req: Request, deps: GraphWizardDeps 
     history = body.history as GraphWizardTurn[];
   }
   try {
+    if (body.mode === 'variant') {
+      if (typeof body.goal !== 'string' || !/^g_[a-z0-9_-]+$/i.test(body.goal) ||
+          typeof body.templateId !== 'string' || !/^[a-z0-9-]+$/.test(body.templateId) ||
+          body.kind === 'workflow' || body.currentYaml !== undefined || body.packId !== undefined || history !== undefined) {
+        return jsonResponse({ error: 'bad_request', reason: 'variant requires goal and templateId; YAML, workflow, pack and history are unsupported' }, 400);
+      }
+      // Resolve the base on the server. Client-supplied graph YAML never becomes variant authority.
+      const template = loadGraphTemplates(deps.graphsDir ?? defaultGraphsDir()).templates[body.templateId];
+      if (!template) return jsonResponse({ error: 'bad_request', reason: `unknown templateId: ${body.templateId}` }, 400);
+      const result = await designGraphVariantPlan({ goal: body.goal, prompt, template }, deps);
+      return jsonResponse({ mode: 'variant', ...result });
+    }
     const result = await generateGraphFromPrompt({
       prompt,
       ...(body.kind ? { kind: body.kind as 'harness' | 'workflow' } : {}),

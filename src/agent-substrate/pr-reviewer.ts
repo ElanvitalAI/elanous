@@ -36,10 +36,25 @@ export function isScopeRevertMustFix(mustFix: string): boolean {
   return scopeSignal && revertSignal;
 }
 
+/**
+ * SCOPE-ESCAPE-AS-REFINE (대표 10-22 «범위 밖 허용도 로직으로») — 범위-되돌림 must-fix 중 강등하지 «않는» 것:
+ * 삭제·보호 경로(규칙·자격증명·운영 config)를 되돌리라는 지적. 오케스트레이터 자동 정지 사유(scope-adjacency
+ * `ScopeStopReason`)와 같은 선이다 — 상한은 리뷰 문면으로 잴 수 없으니 여기서 다루지 않는다.
+ */
+// ⚠️ 영어 `remove` 는 «되돌려라» 동사로도 흔하다(«unrelated change, remove it») — 삭제 신호는 `delet` 만 본다.
+const SCOPE_REVERT_KEEP_BLOCKER = /삭제|지웠|지운|delet|\.rules\b|credential|secret|auth\.json|\.env\b|config\.json|보호\s*경로|protected/i;
+
+/** 범위-되돌림 must-fix 를 shouldFix 로 강등할 대상인가(결정론 · 문자열만). */
+export function isDemotableScopeRevertMustFix(mustFix: string): boolean {
+  return isScopeRevertMustFix(mustFix) && !SCOPE_REVERT_KEEP_BLOCKER.test(mustFix);
+}
+
 export interface ReviewResult {
   verdict: ReviewVerdict;
   mustFix: string[];
   shouldFix: string[];
+  /** SCOPE-ESCAPE-AS-REFINE — 리뷰어가 must-fix 로 냈지만 «범위 밖이니 되돌려라» 라서 shouldFix 로 내린 원문(관측용). */
+  scopeRevertDemoted?: string[];
   /** 리뷰어가 판정에 앞서 더 보아야 한다고 관측한 저장소 맥락. 소비·판정에는 아직 쓰지 않는다. */
   requirements?: string[];
   /** 실제 리뷰가 돌았나(LLM 응답 파싱 성공). 미주입/예외로 verdict='pass' 된 경우와 진짜 PASS 구분. */
@@ -302,7 +317,7 @@ export function planReviewChunks(
  */
 export function foldReviewResults(
   results: readonly ReviewResult[],
-): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback'> {
+): Pick<ReviewResult, 'verdict' | 'mustFix' | 'shouldFix' | 'scopeRevertDemoted' | 'requirements' | 'reviewed' | 'failureReason' | 'reviewerFallback'> {
   const dedupe = (values: readonly string[]): string[] => [...new Set(values)];
   const collect = (pick: (r: ReviewResult) => readonly string[] | undefined): string[] =>
     dedupe(results.flatMap((r) => [...(pick(r) ?? [])]));
@@ -312,12 +327,14 @@ export function foldReviewResults(
   const mustFix = collect((r) => r.mustFix).slice(0, 6);
   const shouldFix = collect((r) => r.shouldFix).slice(0, 6);
   const requirements = collect((r) => r.requirements);
+  const scopeRevertDemoted = collect((r) => r.scopeRevertDemoted);
   const failed = results.find((r) => r.reviewed !== true);
   const reviewerFallback = results.find((r) => r.reviewerFallback)?.reviewerFallback;
   return {
     verdict,
     mustFix,
     shouldFix,
+    ...(scopeRevertDemoted.length ? { scopeRevertDemoted } : {}),
     ...(requirements.length ? { requirements } : {}),
     reviewed: results.length > 0 && failed === undefined,
     ...(failed?.failureReason ? { failureReason: failed.failureReason } : {}),
@@ -678,6 +695,8 @@ const NO_FINDING_REMARK = new RegExp([
   String.raw`^수용\s*기준(?:을|이)?\s*(?:(?:모두|전부)\s*)?충족(?:함|됨|했다|합니다)?[.。]?$`,
   String.raw`^(?:all\s+)?acceptance\s+criteria\s+(?:are\s+)?(?:all\s+)?met\.?$`,
 ].join('|'), 'i');
+// Unbracketed free text is more ambiguous; fold only explicit blocker-absence statements.
+const UNBRACKETED_NO_FINDING_REMARK = /^(?:(?:블로커|차단)\s*)?(?:수준의?\s*)?(?:결함|문제|이슈|지적|블로커)(?:은|는|이|가)?\s*(?:발견되지\s*않(?:음|았(?:다|습니다)?)|없(?:음|다|습니다))[.。]?$/i;
 // OP #3173 — 설명은 의미 추정하지 않는다. 실측으로 무소견임을 확인한 문장만 등록한다.
 // 문법 밖 `없음 — 설명`은 실제 결함일 수 있으므로 mustFix에 남긴다.
 const LONG_BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*(?:[-—–]+\s*)?${NONE_WORD}\s*[—–\-:·]\s*([\s\S]+?)\s*[)\]）】]$`, 'i');
@@ -695,6 +714,20 @@ const KNOWN_POSITIVE_FINDINGS = new Set([
   'retro 사실과 tasks cover 집계는 분모 줄이 있든 없든 같다. 시험(`retro-cli.test.ts`)이 이를 고정하고, 임시 폴더는 `finally` 의 `rmSync` 로 지운다.',
   // 이 후속 PR 자체의 ACP r2: 닫힌 무소견 문장.
   '없음 — 막는 결함은 찾지 못했다.',
+  // REVIEW-MUSTFIX-NONE-NORMALIZE · 2026-10-22 ACP 저장 결과 #30199/#30188/#30183.
+  // 설명을 의미 추정으로 삭제하지 않는다. 원문 전체 일치만 무결함으로 접는다.
+  '(없음) #30188(UX)과 #30189(MK)는 서로 다른 파일만 고쳐서 글자 단위로 겹치는 곳이 없습니다. 합친 뒤에 새로 생긴 회귀도 찾지 못했습니다.',
+  '없음. 네 고침 모두 지금 저장소 계약과 맞는다. 하나씩 대조했다.',
+  '`catalog.yaml:24` kinds 끝에 `classify`가 있다.',
+  '`research-loop.yaml`은 노드 26개이고 `entry_node: intake`다.',
+  '`self-implement.ts:247`이 `cwd-repository`를 돌려준다.',
+  '기본 확장 판정(`scope-adjacency.ts:121`)은 삭제를 `deletion` 정지 사유로 본다.',
+  "`tier-split.ts`의 `planTierSplit`은 두 경우를 `kind:'blocked'`로 돌려보냅니다.",
+  'device-test 조각 없이 feature 조각만 있는 경우: `device-first-stage-missing`',
+  'device-test 조각이 2개 이상이거나, 첫 조각이 아니거나, 그 뒤에 feature가 아닌 조각이 섞인 경우: `device-first-order-invalid`',
+  '이 반환은 `tier-split.ts:114`에서 `handTask({ ...hand, tierSplitBlocked: plan.reason })` 한 곳으로만 이어집니다. decomposer의 timeout이나 throw도 같은 blocked 경로를 탑니다.',
+  '`task-hand.ts`는 다음 세 줄에서 이 경우를 처리합니다.',
+  "`:1066`: 카드 status를 `'failed'`로 정하고, history에 `tier-split-failed: <reason>`을 남깁니다.",
 ]);
 function isPositiveNoFinding(text: string): boolean {
   return KNOWN_POSITIVE_FINDINGS.has(text);
@@ -712,10 +745,13 @@ function isLongNoFindingBracket(text: string): boolean {
  *  ⭐ export — `parseReviewResultOutput` 가 «같은» 판정으로 저장된 결과의 표지 줄을 다시 접는다(PR-LAND-MUSTFIX-NONE · 복제 금지). */
 export function isNoneSentinelFinding(finding: string): boolean {
   const text = finding.trim();
-  if (!text || isBracketedPlaceholder(text)) return true;
+  if (!text || text === '[]' || isBracketedPlaceholder(text)) return true;
   if (isPositiveNoFinding(text)) return true;
+  if (text === '(없음 — 막는 결함은 찾지 못했다.)') return true;
   if (/^[-—–]+$/.test(text)) return true;
   const markerText = text.replace(/^[—–-]+\s*|\s*[—–-]+$/g, '').trim();
+  const unbracketedNone = new RegExp(String.raw`^${NONE_WORD}\s*[—–\-:·]\s*(.+)$`, 'i').exec(markerText);
+  if (unbracketedNone && UNBRACKETED_NO_FINDING_REMARK.test(unbracketedNone[1]!.trim())) return true;
   const leadingNone = /^[（(]\s*(?:없음|none)\s*[）)]\s+(.+)$/i.exec(markerText);
   if (leadingNone && KNOWN_NO_FINDING_REMARKS.has(leadingNone[1]!.trim())) return true;
   if (markerText && (BARE_SENTINEL.test(markerText) || DASH_ONLY_SENTINEL.test(markerText) || DASH_WRAPPED_BRACKETED_SENTINEL.test(markerText))) return true;
@@ -767,11 +803,27 @@ export function parseReviewResult(text: string): ReviewResult {
     const first = shouldFix.shift() ?? fallbackFinding;
     mustFix.push(first ?? 'PR 리뷰 FAIL — 재작업 필요(구체 지적 미파싱).');
   }
+  // SCOPE-ESCAPE-AS-REFINE — 골의 대상 경로는 출발점이다: «범위 밖이니 되돌려라/분리하라» 는 블로커가 아니라 비블로커.
+  //   삭제·보호 경로 지적은 블로커로 남긴다. 남은 블로커가 없으면 FAIL → WARN(위 «FAIL 인데 must-fix 없음» 승격을 다시 타지 않는다).
+  const scopeRevertDemoted = mustFix.filter(isDemotableScopeRevertMustFix);
+  let finalVerdict = verdict;
+  if (scopeRevertDemoted.length > 0) {
+    const kept = mustFix.filter((finding) => !isDemotableScopeRevertMustFix(finding));
+    mustFix.splice(0, mustFix.length, ...kept);
+    // 리뷰어가 원래 낸 should-fix 를 앞에 둔다 — 아래 상한(6)이 원래 지적을 밀어내지 않게(강등 원문은 scopeRevertDemoted 에 전부 남는다).
+    shouldFix.push(...scopeRevertDemoted);
+    if (verdict === 'fail' && kept.length === 0) finalVerdict = 'warn';
+    try {
+      debug.log('review.parse', 'scope-revert-demoted', { count: scopeRevertDemoted.length, verdictBefore: verdict, verdictAfter: finalVerdict,
+        remainingMustFix: kept.length, heads: scopeRevertDemoted.map((finding) => safeLogText(finding, 120)) });
+    } catch { /* observation must not change parsed review data */ }
+  }
   const fallback = text.match(/\n\[reviewer fallback: ([^\r\n]+)\]$/);
   return {
-    verdict,
+    verdict: finalVerdict,
     mustFix: mustFix.slice(0, 6),
     shouldFix: shouldFix.slice(0, 6),
+    ...(scopeRevertDemoted.length ? { scopeRevertDemoted } : {}),
     ...(fallback ? { reviewerFallback: fallback[1] } : {}),
     ...(requirements.length ? { requirements } : {}),
   };

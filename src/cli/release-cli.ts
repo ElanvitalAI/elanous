@@ -48,7 +48,7 @@ import type { AcceptedRegression } from '../../scripts/release-loop/resume.js';
 import type { PrereleaseKind } from '../../scripts/release-loop/release-version.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { runReleaseIfReady } from './release-run-if-ready.js';
-import { ReleaseRunClaimConflict, findActiveReleaseRun, readActiveForceReleaseRun, readReleaseRunLock, withDirectReleaseRunLock, withForceReleaseRunMarker } from './release-single-flight.js';
+import { ReleaseRunClaimConflict, findActiveReleaseRun, readActiveForceReleaseRun, isPidAlive, readReleaseRunLock, withDirectReleaseRunLock, withForceReleaseRunMarker } from './release-single-flight.js';
 import { formatPreflight, releasePreflight } from '../../scripts/release-loop/preflight.js';
 import { defaultReleaseGraphRunsRoot, formatPublishProposal, measurePublishWindow, proposePublishAt, publishWindowWarning } from '../../scripts/release-loop/publish-window.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
@@ -1278,7 +1278,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           const gate = plan.gatePlan.mode === 'not-run' ? 'gate 실행 없음'
             : plan.gatePlan.mode === 'partial' ? `부분 gate 계획 ${plan.partial.requested && plan.partial.applied ? `${plan.partial.files}파일` : '미상'}`
               : `전체 gate${plan.gatePlan.reason ? ` (${plan.gatePlan.reason})` : ''}`;
-          log(`· 재개 preflight 통과 · ${plan.version} · ${plan.fromNode}부터 · tip ${plan.tip.to.slice(0, 12)}${plan.tip.changed ? ` (기록 tip ${plan.tip.from.slice(0, 12)}에서 이동)` : ''} · ${gate} · 시도 ${plan.nextAttempt}/${plan.attemptLimit} · 실행·원장 변경 없음`);
+          log(`· 재개 preflight 통과 · ${plan.version} · ${plan.fromNode}부터 · tip ${plan.tip.to.slice(0, 12)}${plan.tip.changed ? ` (기록 tip ${plan.tip.from.slice(0, 12)}에서 이동)` : ''} · ${gate} · ${plan.priorCountKnown ? `시도 ${plan.nextAttempt}` : `새 원장 기록 ${plan.nextAttempt} (이전 횟수 미측정)`} · 실행·원장 변경 없음`);
           return plan;
         }
         const result = await resumeReleaseRun(resumeOptions, { onSource: log });
@@ -1368,7 +1368,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             log(`· 리허설 ${stamp.version} ${stamp.step} · ${stamp.summary} · stage claim 해제 · 다음 tick 재시도`);
         }
         return result;
-      }, (result) => result.status !== 'failed' && !result.notificationFailures && !result.stamps?.some((stamp) => !['ok', 'superseded'].includes(stamp.outcome)));
+      // Recovery results carry no tick fields; the widened view keeps the same runtime verdict (main's tsc touch-clean).
+      }, (raw) => {
+        const result = raw as { status?: string; notificationFailures?: number; stamps?: readonly { outcome: string }[] };
+        return result.status !== 'failed' && !result.notificationFailures && !result.stamps?.some((stamp) => !['ok', 'superseded'].includes(stamp.outcome));
+      });
     });
   release.command('auto-start')
     .description('판 일정의 컷 창에서 릴리스 시작을 미리 본다 · --apply 로 release run --if-ready 실행')
@@ -1377,20 +1381,32 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--json', '결과 한 줄 JSON(stdout)')
     .action(async (o: { windowMinutes: string; apply?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
+        // Same authority as `release run`'s refusal: graph-run ledger, then a live force marker, then a run.lock whose
+        // pid is alive — the same liveness releaseReadiness refuses on, so the reason line can name the lock's startedAt.
+        const activeRun = (version: string, ledgerRoot: string) => {
+          const live = findActiveReleaseRun(version, ledgerRoot) ?? readActiveForceReleaseRun(version, ledgerRoot);
+          if (live) return live;
+          const lock = readReleaseRunLock(version, ledgerRoot);
+          return lock?.pid !== undefined && Number.isSafeInteger(lock.pid) && lock.pid > 0 && isPidAlive(lock.pid)
+            ? { runId: 'pending', pid: lock.pid, startedAt: lock.startedAt ?? 'unknown' } : undefined;
+        };
         const result = await autoStartScheduledRelease({
-          windowMinutes: Number(o.windowMinutes), apply: o.apply, ledgerRoot: scheduleLedgerRoot(),
+          windowMinutes: Number(o.windowMinutes), apply: o.apply, ledgerRoot: scheduleLedgerRoot(), activeRun,
           readiness: (version, ledgerRoot, now) => releaseReadiness(version, { ledgerRoot, now: () => now, checklist: releaseRunDeps.checklist }),
           launch: async (version, launchOptions) => {
             const ran = await runAction({ version, ifReady: true, publishAt: launchOptions?.publishAt, json: false }, log);
             if (ran && typeof ran === 'object' && ran.deferred) return ran;
+            // A run that appeared between readiness and launch is the same refusal, with its identity.
+            if (ran === false && activeRun(version, scheduleLedgerRoot())) return { deferred: true, reason: 'already-running' };
             if (ran !== true) throw new Error(`release run 미시작 또는 실패: ${version}`);
           },
         });
         if (result.status === 'planned') log(`· 미리 보기 ${result.version} · 컷 ${result.cutAt} · 실행하려면 --apply`);
         else if (result.status === 'started') log(`▶ 릴리스 시작 ${result.version} · 컷 ${result.cutAt}${result.publishAt ? ` · 발행 ${result.publishAt}` : ''}`);
         else if (result.status === 'skipped') log(`· 릴리스 연기 ${result.version} · ${result.reason}`);
+        else if (result.status === 'already-running') console.error(`⛔ 릴리스 이미 실행 중 ${result.version} · runId=${result.runId} pid=${result.pid} startedAt=${result.startedAt} · auto-start 거부`);
         else log('· 선택할 컷 없음');
         return result;
-      }, () => true);
+      }, (result) => result.status !== 'already-running');
     });
 }

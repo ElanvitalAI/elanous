@@ -1,4 +1,4 @@
-import { setDefaultTimeout, afterAll, afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerOpsCommands } from './cli/ops-cli.js';
 import { setUserConfigOverlay } from './user-config.js';
@@ -14,6 +14,9 @@ import { spawnRealCliBytes, type RealCliSpawnBytesResult } from './testing/real-
 import { basename, join, resolve } from 'node:path';
 import { assembleAskLaunchPolicy, buildCodexAccountImportGuidance, buildHarnessOrchestratePlan, executeDevPipelineInvocation, filterDashboardArgs, formatReviewStatsPercentage, formatSelfSendCandidateDisplay, runHarnessBrowserAction, runHarnessOrchestrateExecution, runSchedule, scheduleCreatePlan, readSelfOrchestrateGoals, setCodexAccountLogSinkModuleForTesting, type HarnessOrchestrateExecutionDeps, type ScheduleDispatch } from './index.js';
 import { selectFabricDecomposer } from './self-dev/self-orchestrate-runtime.js';
+import { exitTuiRun, planTuiRestartArgv, runTuiSelfRestartOnStaleBuild } from './index.js';
+import { claimTuiOwnedSession, decideTuiRestartSession, getTuiOwnedSession, requestTuiSelfRestart, takeTuiSelfRestartRequest } from './capture/tui-self-report.js';
+import { clearActiveSessionId, createSession, listSessions, setActiveSessionId } from './session/index.js';
 import { debug } from './debug/log.js';
 import { LogStore, logsDbPath } from './mss/logging/log-store.js';
 import { _resetGlobalPersonaRegistryForTest, setGlobalPersonaRegistryDir } from './persona/global-registry.js';
@@ -667,9 +670,17 @@ describe('agent-mission backend help', () => {
 describe('harness ask production entry wiring', () => {
   asHarnessInternalCaller();
   const originalElanousRunId = process.env.ELANOUS_RUN_ID;
+  // The outer harness run carries its own TA card; the in-process `harness ask` handlers
+  // must not lint the tests' goal files against that foreign card.
+  const originalTaskCardId = process.env.ELANOUS_TASK_CARD_ID;
+  beforeEach(() => {
+    delete process.env.ELANOUS_TASK_CARD_ID;
+  });
   afterEach(() => {
     if (originalElanousRunId === undefined) delete process.env.ELANOUS_RUN_ID;
     else process.env.ELANOUS_RUN_ID = originalElanousRunId;
+    if (originalTaskCardId === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+    else process.env.ELANOUS_TASK_CARD_ID = originalTaskCardId;
   });
 
   const withHarnessRunIdentity = <T extends object>(spec: T) => ({
@@ -792,7 +803,10 @@ describe('harness ask production entry wiring', () => {
     const selections: Array<{ entrance: 'ask' | 'say'; selection: { groundingCwd?: string } }> = [];
     const lines: string[] = [];
     const originalCwd = process.cwd();
+    const originalAuthorGradeEnv = process.env.ELANOUS_AUTHOR_GRADE;
     try {
+      // The ambient shell may carry ELANOUS_AUTHOR_GRADE; the selection contract below is the default-grade shape.
+      delete process.env.ELANOUS_AUTHOR_GRADE;
       process.chdir(launchCwd);
       setRunDevAskFromGoalFileDepsForTesting({
         ...passingPreflightDeps(lines),
@@ -850,6 +864,8 @@ describe('harness ask production entry wiring', () => {
         expect(warnings[0]).toContain(reason);
       }
     } finally {
+      if (originalAuthorGradeEnv === undefined) delete process.env.ELANOUS_AUTHOR_GRADE;
+      else process.env.ELANOUS_AUTHOR_GRADE = originalAuthorGradeEnv;
       process.chdir(originalCwd);
       await rm(launchCwd, { recursive: true, force: true });
       setRunDevAskFromGoalFileDepsForTesting(undefined);
@@ -5308,4 +5324,289 @@ describe('decide / ax-screen / decide-recipe JSON stdout completion', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+});
+
+// ── TUI-H9-ACTIVE-SESSION-ID · 0.2.36 ──────────────────────────────────────────
+//
+// 무대(mock 시나리오 · 임시 ELANOUS_STATE_DIR 실물 저장소): «진짜» 대화 두 개를 만든다 —
+// A = 이 TUI 가 화면으로 보여 주던 대화, B = 전역 최신(다른 자리). 그 위에서 실제 소유 기록·실제
+// 저장소·실제 재기동 계획 함수를 지나 자식 argv 를 잰다(자식 프로세스 spawn 만 캡처).
+describe('TUI-H9-ACTIVE-SESSION-ID — 재기동은 이 TUI 가 보여 주던 대화로만 잇는다', () => {
+  const savedStateDir = process.env.ELANOUS_STATE_DIR;
+  const savedGeneration = process.env.ELANOUS_TUI_RESTART_GEN;
+  let tempRoot = '';
+  let thisTuiSession = '';
+  let otherSeatNewestSession = '';
+
+  beforeAll(() => {
+    tempRoot = mkdtempSync(join(tmpdir(), 'elanous-h9-active-session-'));
+    process.env.ELANOUS_STATE_DIR = tempRoot;
+    thisTuiSession = createSession({ title: 'H9 this TUI' }).id;
+    otherSeatNewestSession = createSession({ title: 'H9 other seat (newest)' }).id;
+    delete process.env.ELANOUS_TUI_RESTART_GEN;
+  });
+
+  afterAll(async () => {
+    if (savedStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = savedStateDir;
+    if (savedGeneration === undefined) delete process.env.ELANOUS_TUI_RESTART_GEN;
+    else process.env.ELANOUS_TUI_RESTART_GEN = savedGeneration;
+    claimTuiOwnedSession(null);
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  test('전역 최신이 다른 대화여도 자식 argv 의 --resume 은 이 TUI 활성 id 다', async () => {
+    setActiveSessionId(thisTuiSession);
+    claimTuiOwnedSession(thisTuiSession, Date.now());
+    const globalLatest = listSessions({ limit: 1 })[0]?.id ?? null;
+    expect(getTuiOwnedSession()?.sessionId).toBe(thisTuiSession);
+    expect(globalLatest).toBe(otherSeatNewestSession);
+
+    const spawned: (readonly string[])[] = [];
+    const result = await runTuiSelfRestartOnStaleBuild({
+      scriptPath: '/opt/elanous/bin/elanous.mjs',
+      args: ['--tui', 'next', '--resume', otherSeatNewestSession, '--continue'],
+      stale: () => ({ stale: true, reason: 'installed-sha-advanced' }),
+      spawnChild: async (_command, argv) => { spawned.push(argv); return 0; },
+      log: () => {},
+    });
+
+    expect(result.outcome).toBe('relaunch');
+    expect(result.sessionId).toBe(thisTuiSession);
+    expect(spawned).toHaveLength(1);
+    const argv = spawned[0]!;
+    expect(argv[0]).toBe('/opt/elanous/bin/elanous.mjs');
+    expect(argv[argv.indexOf('--resume') + 1]).toBe(thisTuiSession);
+    expect(argv.filter(arg => arg === '--resume')).toHaveLength(1);
+    expect(argv).not.toContain(otherSeatNewestSession);
+    expect(argv).not.toContain('--continue');
+    expect(argv).toContain('--tui');
+    expect(result.exitCode).toBe(0);
+  });
+
+  test('활성 대화를 확인하지 못하면 다시 뜨지 않고 전역 최신으로 메우지 않는다', async () => {
+    let spawns = 0;
+    const spawnChild = async () => { spawns += 1; return 0; };
+
+    clearActiveSessionId();
+    claimTuiOwnedSession(null);
+    const noActive = await runTuiSelfRestartOnStaleBuild({
+      stale: () => ({ stale: true, reason: 'installed-sha-advanced' }),
+      spawnChild,
+      log: () => {},
+    });
+    expect(noActive.outcome).toBe('blocked');
+    expect(noActive.reason).toBe('no-active-session');
+
+    const mismatch = await runTuiSelfRestartOnStaleBuild({
+      stale: () => ({ stale: true, reason: 'installed-sha-advanced' }),
+      owned: () => ({ sessionId: thisTuiSession, at: Date.now() }),
+      liveActiveSessionId: () => otherSeatNewestSession,
+      sessionExists: () => true,
+      spawnChild,
+      log: () => {},
+    });
+    expect(mismatch.outcome).toBe('blocked');
+    expect(mismatch.reason).toBe('owned-session-mismatch');
+
+    const missing = await runTuiSelfRestartOnStaleBuild({
+      stale: () => ({ stale: true, reason: 'installed-sha-advanced' }),
+      owned: () => ({ sessionId: 'session-gone', at: Date.now() }),
+      liveActiveSessionId: () => 'session-gone',
+      sessionExists: () => false,
+      spawnChild,
+      log: () => {},
+    });
+    expect(missing.outcome).toBe('blocked');
+    expect(missing.reason).toBe('active-session-missing');
+    expect(spawns).toBe(0);
+  });
+
+  test('설치본이 그대로면 재기동하지 않는다', async () => {
+    setActiveSessionId(thisTuiSession);
+    claimTuiOwnedSession(thisTuiSession, Date.now());
+    const skip = await runTuiSelfRestartOnStaleBuild({
+      stale: () => ({ stale: false, reason: 'matches-installed' }),
+      spawnChild: async () => { throw new Error('spawn 하면 안 된다'); },
+      log: () => {},
+    });
+    expect(skip.outcome).toBe('skip');
+    expect(skip.reason).toBe('matches-installed');
+  });
+
+  test('기본 낡음 판정은 실제 실행 판(runningBuild)을 읽는다 — 이 체크아웃은 아직 낡지 않았다', async () => {
+    setActiveSessionId(thisTuiSession);
+    claimTuiOwnedSession(thisTuiSession, Date.now());
+    let spawns = 0;
+    const result = await runTuiSelfRestartOnStaleBuild({
+      spawnChild: async () => { spawns += 1; return 0; },
+      log: () => {},
+    });
+    expect(result.outcome).toBe('skip');
+    expect(result.reason).toBe('same-as-checkout');
+    expect(spawns).toBe(0);
+  });
+
+  test('사용자 종료(q) — 재기동 요청이 없으면 낡은 판이어도 다시 뜨지 않고 0 으로 끝난다(기본 동작 보존)', async () => {
+    setActiveSessionId(thisTuiSession);
+    claimTuiOwnedSession(thisTuiSession, Date.now());
+    takeTuiSelfRestartRequest();
+    let staleCalls = 0;
+    let spawns = 0;
+    const exitCall: { code: number | null } = { code: null };
+    await exitTuiRun({
+      stale: () => { staleCalls += 1; return { stale: true, reason: 'checkout-head-advanced' }; },
+      spawnChild: async () => { spawns += 1; return 7; },
+      exit: (code: number): never => { exitCall.code = code; throw new Error('exit'); },
+    }).catch(() => {});
+    expect(exitCall.code).toBe(0);
+    expect(spawns).toBe(0);
+    expect(staleCalls).toBe(0);
+  });
+
+  test('TUI 종료 경계(exitTuiRun)가 재기동 요청을 받으면 이 TUI 의 대화로 자식을 띄우고 그 종료 코드로 끝난다', async () => {
+    setActiveSessionId(thisTuiSession);
+    claimTuiOwnedSession(thisTuiSession, Date.now());
+    requestTuiSelfRestart('idle-stale-build');
+    const spawned: (readonly string[])[] = [];
+    const exitCall: { code: number | null } = { code: null };
+    await exitTuiRun({
+      stale: () => ({ stale: true, reason: 'checkout-head-advanced' }),
+      scriptPath: '/opt/elanous/bin/elanous.mjs',
+      args: [],
+      spawnChild: async (_command, argv) => { spawned.push(argv); return 7; },
+      exit: (code: number): never => { exitCall.code = code; throw new Error('exit'); },
+    }).catch(() => {});
+
+    expect(exitCall.code).toBe(7);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]![spawned[0]!.indexOf('--resume') + 1]).toBe(thisTuiSession);
+    expect(takeTuiSelfRestartRequest()).toBeNull(); // 요청은 한 번 쓰고 사라진다
+  });
+
+  test('planTuiRestartArgv · decideTuiRestartSession 는 확인 실패를 그대로 드러낸다', () => {
+    expect(planTuiRestartArgv({
+      scriptPath: '/opt/elanous/bin/elanous.mjs',
+      args: ['--tui', 'next', '--resume=old-session', '--continue'],
+      sessionId: 'mine',
+    })).toEqual(['/opt/elanous/bin/elanous.mjs', '--tui', 'next', '--resume', 'mine']);
+    // 값 없는 `--resume` 뒤의 플래그를 삼키지 않는다.
+    expect(planTuiRestartArgv({
+      scriptPath: '/opt/elanous/bin/elanous.mjs',
+      args: ['--resume', '--tui', 'next', '--resume', 'old', '--yolo'],
+      sessionId: 'mine',
+    })).toEqual(['/opt/elanous/bin/elanous.mjs', '--tui', 'next', '--yolo', '--resume', 'mine']);
+
+    expect(decideTuiRestartSession({ owned: null, liveActiveSessionId: 'x', sessionExists: () => true }))
+      .toEqual({ ok: false, reason: 'no-owned-session' });
+    expect(decideTuiRestartSession({ owned: { sessionId: 'a', at: 1 }, liveActiveSessionId: null, sessionExists: () => true }))
+      .toEqual({ ok: false, reason: 'no-active-session' });
+    expect(decideTuiRestartSession({ owned: { sessionId: 'a', at: 1 }, liveActiveSessionId: 'a', sessionExists: () => true }))
+      .toEqual({ ok: true, sessionId: 'a', claimedAt: 1 });
+  });
+});
+
+// ── TUI-BOOT-TIMING-HOLES · 0.2.36 — «프로세스→sink» 구간 ────────────────────
+// 10:40 실측 9.3s 는 `tui.boot` 가 log-sink 직전에 시작하던 탓에 어느 단계에도
+// 잡히지 않았다. 생산 진입점(`main()`)이 log-sink 등록 «전» 에 타이머를 열고
+// `proc-to-log-sink` 단계를 발행한다 — 이 시험은 그 계측을 실물 진입점
+// (`runCli()`)을 자식 프로세스로 띄우고 debug sink 로 받아서 확인한다.
+describe('TUI-BOOT-TIMING-HOLES — 생산 진입점의 proc→sink 계측', () => {
+  test('실물 runCli() 부팅이 proc-to-log-sink 를 log-sink 이전에 발행한다', async () => {
+    const repoRoot = resolve(import.meta.dir, '..');
+    const dir = mkdtempSync(join(tmpdir(), 'tui-boot-proc-'));
+    const outFile = join(dir, 'boot.jsonl');
+    const driver = join(dir, 'boot-driver.ts');
+    const cfgDir = join(dir, 'config');
+    mkdirSync(cfgDir, { recursive: true });
+    // 온보딩을 건너뛴 상태의 최소 config — 첫 실행 분기가 `main()` 을 일찍
+    // 반환하면 log-sink 등록 지점에 닿지 못해 구간이 관측되지 않는다.
+    writeFileSync(
+      join(cfgDir, 'config.json'),
+      JSON.stringify({ onboarding: { completed: true, ready: true } }, null, 2) + '\n',
+    );
+    writeFileSync(driver, [
+      "import { appendFileSync } from 'node:fs';",
+      `const outFile = ${JSON.stringify(outFile)};`,
+      `const cfgDir = ${JSON.stringify(cfgDir)};`,
+      "const { setElanousConfigDir } = await import(" + JSON.stringify(join(repoRoot, 'src/elanous-config-dir.ts')) + ');',
+      'setElanousConfigDir(cfgDir);',
+      "const { debug } = await import(" + JSON.stringify(join(repoRoot, 'src/debug/log.ts')) + ');',
+      'debug.enable();',
+      "debug.registerSink({ name: 'tui-boot-capture', emit(rec) { appendFileSync(outFile, JSON.stringify({ category: rec?.category, event: rec?.event, data: rec?.data }) + '\\n'); } });",
+      // 진입점 import 前 기준점 — 프로세스→sink 구간이 «모듈 로드» 까지 덮는지 재는 자.
+      "appendFileSync(outFile, JSON.stringify({ category: 'tui.boot', event: 'driver-import-start', data: { ms: performance.now() } }) + '\\n');",
+      'const { runCli } = await import(' + JSON.stringify(join(repoRoot, 'src/index.ts')) + ');',
+      'await runCli();',
+    ].join('\n'));
+
+    const result = await spawnRealCliBytes([process.execPath, driver], {
+      cwd: dir,
+      env: {
+        ...process.env,
+        HOME: join(dir, 'home'),
+        ELANOUS_STATE_DIR: join(dir, 'state'),
+        // 부모(bun test)의 NODE_ENV=test 를 물려주면 log-store 가 «비활성» 으로
+        // 스스로 꺼져(debug: `disabled because NODE_ENV=test`) sink 등록 신호가
+        // 사라진다 — 실물 CLI 와 같은 조건으로 지운다.
+        NODE_ENV: undefined,
+        TERM: 'dumb',
+        CI: '1',
+      },
+      timeoutMs: 120_000,
+    });
+
+    const decoder = new TextDecoder();
+    try {
+      const captured = existsSync(outFile) ? readFileSync(outFile, 'utf8') : '';
+      if (!captured.trim()) {
+        throw new Error(
+          `tui.boot 기록 0건 · rc=${result.exitCode} · signal=${result.signal} · stderr=${decoder.decode(result.stderr).slice(-800)}`,
+        );
+      }
+      const records = captured
+        .split('\n')
+        .filter((line) => line.trim())
+        .map((line) => JSON.parse(line) as {
+          category?: string; event?: string; data?: { phase?: string; ms?: number };
+        });
+      const phases = records
+        .filter((rec) => rec.category === 'tui.boot' && rec.event === 'phase')
+        .map((rec) => ({ phase: String(rec.data?.phase), ms: Number(rec.data?.ms) }));
+      const names = phases.map((p) => p.phase);
+      expect(names).toContain('proc-to-log-sink');
+      expect(names).toContain('log-sink');
+      expect(names.indexOf('proc-to-log-sink')).toBeLessThan(names.indexOf('log-sink'));
+      const procToSink = phases.find((p) => p.phase === 'proc-to-log-sink');
+      expect(Number.isFinite(procToSink?.ms)).toBe(true);
+      expect(procToSink?.ms ?? -1).toBeGreaterThanOrEqual(0);
+      // 두 번째 값 — main() 진입~sink. 프로세스 시작 기준 창은 그보다 작을 수 없다.
+      const mainEnterToSink = phases.find((p) => p.phase === 'main-enter-to-log-sink');
+      expect(Number.isFinite(mainEnterToSink?.ms)).toBe(true);
+      expect(mainEnterToSink?.ms ?? -1).toBeGreaterThanOrEqual(0);
+      expect(procToSink?.ms ?? -1).toBeGreaterThanOrEqual(mainEnterToSink?.ms ?? Infinity);
+      // «프로세스→sink» 는 진입점 모듈 로드까지 덮어야 한다 — 드라이버가 import 直前에
+      // 남긴 기준점보다 창의 끝(절대 performance.now())이 뒤여야 한다.
+      const importStart = records.find(
+        (rec) => rec.category === 'tui.boot' && rec.event === 'driver-import-start',
+      );
+      expect(Number.isFinite(importStart?.data?.ms)).toBe(true);
+      // 창 끝 절대값 = main-enter-to-log-sink 시작점 + 그 값.
+      const bootMainEnteredAt = (procToSink?.ms ?? 0) - (mainEnterToSink?.ms ?? 0);
+      expect(procToSink?.ms ?? -1).toBeGreaterThanOrEqual(importStart?.data?.ms ?? Infinity);
+      expect(bootMainEnteredAt).toBeGreaterThanOrEqual(importStart?.data?.ms ?? Infinity);
+      // sink 이 살아 있기 «전» 에 발행하면 debug.log 가 no-op 이라 원장에 안 닿는다 —
+      // 생산 sink 등록(`registerStandaloneLogSink`)이 남기는 신호보다 뒤에 도착해야 한다.
+      const sinkLiveAt = records.findIndex(
+        (rec) => rec.category === 'instance.identity' && rec.event === 'log-sink-registered',
+      );
+      const procPhaseAt = records.findIndex(
+        (rec) => rec.category === 'tui.boot' && rec.event === 'phase' && rec.data?.phase === 'proc-to-log-sink',
+      );
+      expect(sinkLiveAt).toBeGreaterThanOrEqual(0);
+      expect(procPhaseAt).toBeGreaterThan(sinkLiveAt);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 180_000);
 });

@@ -115,7 +115,21 @@ test('heavy-remote landing retries an empty final base read and observes gh stde
   expect(result.lines).toContain('⚠ heavy-remote: gh pr view base read attempt 1/3 stderr: temporary gh read failure');
   expect(result.lines.some((line) => line.includes('PR base≠main'))).toBe(false);
   expect(result.merges()).toBe(1);
-  expect(result.waits).toEqual([100]);
+  expect(result.waits).toEqual([1_000]);
+});
+
+test('heavy-remote landing backs off 1s then 3s while two base reads fail and recovers on the third', async () => {
+  const result = await land('main', { heavyRemote: true, pr: '26022', base: 'main', expectedHead: 'a'.repeat(40) }, [
+    { ok: false, out: '', err: 'temporary gh read failure 1' },
+    { ok: false, out: '', err: 'temporary gh read failure 2' },
+    { ok: true, out: JSON.stringify({ baseRefName: 'main', url: PR_URL }) },
+  ]);
+  expect(result.code).toBe(0);
+  expect(result.merges()).toBe(1);
+  expect(result.waits).toEqual([1_000, 3_000]);
+  expect(result.lines).toContain('⚠ heavy-remote: gh pr view base read attempt 1/3 stderr: temporary gh read failure 1');
+  expect(result.lines).toContain('⚠ heavy-remote: gh pr view base read attempt 2/3 stderr: temporary gh read failure 2');
+  expect(result.lines).toContain(`✓ merge: squash ${PR_URL} → main`);
 });
 
 test('heavy-remote final base read retries and preserves a successful landing', async () => {
@@ -184,7 +198,7 @@ test('heavy-remote landing refuses an unreadable base after exactly three reads'
   expect(result.code).toBe(1);
   expect(result.merges()).toBe(0);
   expect(result.baseReads).toBe(3);
-  expect(result.waits).toEqual([100, 100]);
+  expect(result.waits).toEqual([1_000, 3_000]);
   expect(result.lines).toContain('✗ heavy-remote: PR base 조회 불가 (3회) — 통과한 head/main 쌍을 확인하지 못했다. 병합하지 않는다.');
   expect(result.lines.some((line) => line.includes('base=unreadable ≠ main'))).toBe(false);
 });

@@ -735,6 +735,38 @@ describe('control inbox', () => {
     expect(readFileSync(freshPath, 'utf8')).toBe('memo:fresh memo\n');
   });
 
+  test('cleanup removes only old orphan Pod ack markers after the sender wait budget', () => {
+    const isolated = env();
+    const spaceId = 'cleanup-pod-ack';
+    const orphan = enqueueControlMemo(spaceId, 'orphan', { env: isolated });
+    const live = enqueueControlMemo(spaceId, 'live', { env: isolated });
+    const fresh = enqueueControlMemo(spaceId, 'fresh', { env: isolated });
+    rmSync(orphan);
+    rmSync(fresh);
+    const oldAt = new Date(Date.now() - 180_000);
+    for (const suffix of ['.ack', '.ack-request']) {
+      writeFileSync(`${orphan}${suffix}`, '');
+      utimesSync(`${orphan}${suffix}`, oldAt, oldAt);
+      writeFileSync(`${live}${suffix}`, '');
+      utimesSync(`${live}${suffix}`, oldAt, oldAt);
+      writeFileSync(`${fresh}${suffix}`, '');
+    }
+    const ready = `${controlInboxPath(spaceId, isolated)}.ready`;
+    const oldTemp = join(ready, '.write-ABC12345');
+    const freshTemp = join(ready, '.write-ZYX98765');
+    writeFileSync(oldTemp, 'pending');
+    utimesSync(oldTemp, oldAt, oldAt);
+    writeFileSync(freshTemp, 'pending');
+    expect(cleanupStaleControlInbox(spaceId, 1_000, { env: isolated })).toBe(0);
+    expect(existsSync(`${orphan}.ack`)).toBe(false);
+    expect(existsSync(`${orphan}.ack-request`)).toBe(false);
+    expect(existsSync(live)).toBe(true);
+    expect(existsSync(`${live}.ack`)).toBe(true);
+    expect(existsSync(`${fresh}.ack`)).toBe(true);
+    expect(existsSync(oldTemp)).toBe(false);
+    expect(existsSync(freshTemp)).toBe(true);
+  });
+
   test('cleanup rejects invalid ages before mutating ready records', () => {
     const isolated = env();
     const spaceId = 'cleanup-invalid-age';
@@ -1334,6 +1366,30 @@ describe('control inbox', () => {
 });
 
 describe('enqueueControlMemo return value', () => {
+  test('Pod read acknowledgement is written only after this exact record is decoded and drained', () => {
+    const root = mkdtempSync(join(tmpdir(), 'control-inbox-pod-ack-'));
+    try {
+      const env = { ELANOUS_STATE_DIR: root } as NodeJS.ProcessEnv;
+      const path = enqueueControlMemo('pod-f6', 'F6 unique token', { env });
+      writeFileSync(`${path}.ack-request`, '');
+      expect(existsSync(`${path}.ack`)).toBe(false);
+      expect(drainControlInbox('pod-f6', { env }).memos).toEqual(['F6 unique token']);
+      expect(readFileSync(`${path}.ack`, 'utf8')).toBe('');
+      expect(existsSync(`${path}.ack-request`)).toBe(false);
+      writeFileSync(`${path}.ack-request`, 'memo:fake sibling\n');
+      expect(drainControlInbox('pod-f6', { env }).count).toBe(0);
+      expect(existsSync(`${path}.ack`)).toBe(true);
+      expect(existsSync(`${path}.ack-request`)).toBe(true);
+      const ordinary = enqueueControlMemo('pod-f6', 'without request', { env });
+      expect(drainControlInbox('pod-f6', { env }).memos).toEqual(['without request']);
+      expect(existsSync(`${ordinary}.ack`)).toBe(false);
+      const expired = enqueueControlMemo('pod-f6', 'sender already timed out', { env });
+      writeFileSync(`${expired}.ack-request`, '');
+      rmSync(`${expired}.ack-request`);
+      expect(drainControlInbox('pod-f6', { env }).memos).toEqual(['sender already timed out']);
+      expect(existsSync(`${expired}.ack`)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test('returns the published record path, which disappears once a drain claims it', () => {
     const root = mkdtempSync(join(tmpdir(), 'control-inbox-return-'));
     try {

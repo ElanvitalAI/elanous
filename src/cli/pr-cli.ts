@@ -62,8 +62,8 @@ import { admitLandingMerge } from '../self-implement/frozen-merges.js';
 import { resolveOverlapEvidencePath, verifyAllSameHeadReviews, verifyAncestorAutoPass, verifyOverlapEvidence, verifyOverlapEvidenceVirtualRebase } from './pr-land-overlap-evidence.js';
 import type { VerifyOverlapEvidenceInput } from './pr-land-overlap-evidence.js';
 import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
-import { observeDirectPrLandRefusal, observePrLandRefusal } from './pr-land-refusal.js';
-import { planPrLandRecovery } from './pr-land-recovery.js';
+import { classifyPrLandRefusal, observeDirectPrLandRefusal, observePrLandRefusal } from './pr-land-refusal.js';
+import { bindPrLandRefusalToRecover, PR_LAND_CARD_ID_ENV } from './pr-land-recovery.js';
 import { ensurePrLandHeavyRemote, type HeavyRemoteInput, type HeavyRemoteResult } from './pr-land-heavy-remote.js';
 import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
 import { runHeavyOnPodShadow } from './pr-land-pod-shadow.js';
@@ -1319,26 +1319,39 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   };
   // Observe actual merge refusals, including the measured remote gate and public export leak.
   // Option syntax and unmeasured prerequisite errors do not describe a recovery edge.
+  // LAND-REFUSAL-EDGES — a pinned refusal is also bound to the recover@1 edge with its raw line and card.
+  // The card arrives only through the child env set by TA defaultLand — never a shell export.
+  const cardId = process.env[PR_LAND_CARD_ID_ENV]?.trim() || undefined;
+  const bindRecover = (message: string, context: { isDraft?: boolean } = {}) => {
+    const pr = Number(opts.pr);
+    if (!Number.isSafeInteger(pr) || pr <= 0 || !opts.expectedHead) return undefined;
+    try { return bindPrLandRefusalToRecover({ refusal: message, pr, head: opts.expectedHead, isDraft: context.isDraft, cardId }); }
+    catch { return undefined; }
+  };
   const refuse = (message: string, context: { isDraft?: boolean } = {}): void => {
     out.error(message);
     observePrLandRefusal(message, context);
-    const pr = Number(opts.pr);
-    if (Number.isSafeInteger(pr) && pr > 0 && opts.expectedHead) {
-      try {
-        const plan = planPrLandRecovery({ refusal: message, pr, head: opts.expectedHead, isDraft: context.isDraft });
-        debug.log('pr.land', 'recover-shadow', {
-          pr, head: opts.expectedHead, label: plan.evidence.label, route: plan.evidence.route,
-          outcome: plan.outcome, action: plan.result.action, reason: plan.result.reason,
-          delayMs: plan.result.delayMs ?? null, execution: 'none',
-        });
-      } catch {
-        // Recovery observation must never replace the original landing refusal.
-      }
+    const plan = bindRecover(message, context);
+    if (!plan) return;
+    try {
+      debug.log('pr.land', 'recover-shadow', {
+        pr: Number(opts.pr), head: opts.expectedHead, label: plan.evidence.label, route: plan.evidence.route,
+        outcome: plan.outcome, action: plan.result.action, reason: plan.result.reason,
+        delayMs: plan.result.delayMs ?? null, execution: 'none',
+      });
+    } catch {
+      // Recovery observation must never replace the original landing refusal.
     }
+  };
+  // A direct failure binds only when today's refusal shape is recognized — the same measured sample
+  // as observeDirectPrLandRefusal (#28939). An unclassified direct error is not a landing refusal.
+  const observeDirect = (message: string): void => {
+    observeDirectPrLandRefusal(message);
+    if (classifyPrLandRefusal(message) !== 'other') bindRecover(message);
   };
   const refuseDirect = (message: string): void => {
     out.error(message);
-    observeDirectPrLandRefusal(message);
+    observeDirect(message);
   };
   if (opts.title !== undefined && opts.titleFile !== undefined) {
     out.error('✗ title: --title과 --title-file은 함께 사용할 수 없습니다.');
@@ -2043,7 +2056,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   nextMdWarning(body ?? '', changedPaths, out);
   if (!conflictMarkerBlock(changedPaths, cwd, out)) return 1;
   publicLeakWarning(changedPaths, deps.runPublicLeakGate ?? ((files, sink) => runPrLandPublicLeakGate(files, sink, cwd, base)), out);
-  if (!exportLeakBlock(changedPaths, () => (deps.runExportLeakCheck ?? runPrLandExportLeakCheck)(changedPaths ?? [], cwd), opts.allowPublicLeak === true, out, cwd, observeDirectPrLandRefusal)) return 1;
+  if (!exportLeakBlock(changedPaths, () => (deps.runExportLeakCheck ?? runPrLandExportLeakCheck)(changedPaths ?? [], cwd), opts.allowPublicLeak === true, out, cwd, observeDirect)) return 1;
   if (!await exportImportBlock(changedPaths, () => (deps.runExportImportCheck ?? runPrLandExportImportCheck)(changedPaths ?? [], cwd), out)) return 1;
   if (publicDocPaths(changedPaths, () => true).length > 0) {
     const top = run('git', ['rev-parse', '--show-toplevel'], { cwd });

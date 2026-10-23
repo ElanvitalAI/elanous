@@ -1,6 +1,6 @@
 // web-publish 공식 팩 — run-step 의 workdir 가두기 회귀 시험(가벼운 판 · 본격 보안 검토는 별도 칸).
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -216,7 +216,8 @@ test('vendored files equal the pinned upstream blobs once the added source line 
     'references/media-production.md': '1224fa3c0485ea279ac337d002cb8bc82b8348d2',
     'references/scroll-and-mobile.md': '38187aced8313069e19bf6c21c97afb1ca384a81',
     'references/verification-and-release.md': '05ab7683a12602dcef0a41c0b297d788716bc959',
-    'scripts/audit-media.mjs': '748c7ffb0e2e0259363389738d7a77a3fde3c40a',
+    // audit-media.mjs 은 로컬 작업 폴더 경계 패치가 적용되어 이 핀은 로컬 내용이다(업스트림 fe5e8b0 원본이 아님).
+    'scripts/audit-media.mjs': 'df922bdea1ee6455916d56ae5ef2aabbf95d4c6c',
   };
   const skill = join(GRAPHS, '..', 'skills', 'business-motion-websites');
   const blob = (text: string) => { const bytes = Buffer.from(text, 'utf8'); return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex'); };
@@ -612,6 +613,208 @@ test('folder verify refuses an out/ link swapped in after publishing', () => {
   expect(step('verify-public', ws, ctx).outcome).toBe('fail');
 });
 
+// vendored audit-media.mjs CLI — 작업 폴더(manifest 디렉터리) 경계 회귀: 3반증(../ 탈출 · 밖 --out · 밖 --ffprobe) 거부 ⊕ 폴더 안 정상 수용.
+const AUDIT_MEDIA = join(GRAPHS, '..', 'skills', 'business-motion-websites', 'scripts', 'audit-media.mjs');
+/** 스텁 ffprobe: ffprobe 형식 JSON 을 내고, 실행 여부를 자기 옆 executed.txt 로 남긴다. */
+const PROBE_STUB = '#!/bin/sh\necho ran > "$(dirname "$0")/executed.txt"\ncat <<\'EOF\'\n{"streams":[{"codec_type":"video","codec_name":"png","width":2,"height":2}],"format":{"duration":"1"}}\nEOF\n';
+const installProbe = (dir: string, name = 'ffprobe') => {
+  writeFileSync(join(dir, name), PROBE_STUB);
+  chmodSync(join(dir, name), 0o755);
+};
+
+test('audit-media CLI refuses input paths, --out, and --ffprobe that leave the manifest work folder, and accepts an in-folder run', () => {
+  const ws = temp();
+  const outside = temp();
+  writeFileSync(join(ws, 'a.png'), 'x');
+  const manifest = join(ws, 'manifest.json');
+  const manifestWith = (assets: unknown[]) => writeFileSync(manifest, JSON.stringify({ assets }));
+  const run = (args: string[]) => {
+    const proc = Bun.spawnSync([process.execPath, AUDIT_MEDIA, ...args]);
+    return { rc: proc.exitCode ?? -1, err: new TextDecoder().decode(proc.stderr) };
+  };
+  // ① 입력 경로의 ../ 탈출 ⊕ 절대경로 탈출 ⊕ poster 탈출
+  for (const file of ['../escape.png', 'media/../../escape.png', join(outside, 'secret.png')]) {
+    manifestWith([{ id: 'e', kind: 'image', file }]);
+    const r = run([manifest]);
+    expect(`${file} ${r.rc}`).toBe(`${file} 2`);
+    expect(r.err).toContain('작업 폴더 밖');
+  }
+  manifestWith([{ id: 'e', kind: 'image', file: 'a.png', poster: '../poster.png' }]);
+  const poster = run([manifest]);
+  expect(`${poster.rc} ${poster.err.includes('작업 폴더 밖')}`).toBe('2 true');
+  // ② 작업 폴더 밖 임의 --out
+  manifestWith([{ id: 'a', kind: 'image', file: 'a.png' }]);
+  const out = run([manifest, '--out', join(outside, 'report.json')]);
+  expect(`${out.rc} ${out.err.includes('작업 폴더 밖')}`).toBe('2 true');
+  expect(existsSync(join(outside, 'report.json'))).toBe(false);
+  // ③ 작업 폴더 밖 임의 --ffprobe 실행 파일
+  writeFileSync(join(outside, 'evilprobe'), '#!/bin/sh\necho {}\n');
+  chmodSync(join(outside, 'evilprobe'), 0o755);
+  const probe = run([manifest, '--ffprobe', join(outside, 'evilprobe')]);
+  expect(`${probe.rc} ${probe.err.includes('작업 폴더 밖')}`).toBe('2 true');
+  expect(readdirSync(outside)).toEqual(['evilprobe']); // 밖 폴더는 실행 파일 외 그 무엇도 쓰지 않는다
+  // ④ 폴더 안 정상 사례 수용(가짜 ffprobe 를 작업 폴더 안에 둔다)
+  writeFileSync(join(ws, 'ffprobe'), '#!/bin/sh\ncat <<\'EOF\'\n{"streams":[{"codec_type":"video","codec_name":"png","width":2,"height":2}],"format":{"duration":"1"}}\nEOF\n');
+  chmodSync(join(ws, 'ffprobe'), 0o755);
+  const ok = run([manifest, '--out', join(ws, 'media-audit.json'), '--ffprobe', join(ws, 'ffprobe')]);
+  expect(`${ok.rc} ${ok.err}`).toBe('0 ');
+  expect(JSON.parse(readFileSync(join(ws, 'media-audit.json'), 'utf8')).status).toBe('PASS');
+});
+
+test('audit-media CLI boundary hardening: bare PATH --ffprobe, --out through a linked directory, and a symlinked work root', () => {
+  const ws = temp();
+  const outside = temp();
+  writeFileSync(join(ws, 'a.png'), 'x');
+  writeFileSync(join(ws, 'ffprobe'), '#!/bin/sh\ncat <<\'EOF\'\n{"streams":[{"codec_type":"video","codec_name":"png","width":2,"height":2}],"format":{"duration":"1"}}\nEOF\n');
+  chmodSync(join(ws, 'ffprobe'), 0o755);
+  const manifest = join(ws, 'manifest.json');
+  writeFileSync(manifest, JSON.stringify({ assets: [{ id: 'a', kind: 'image', file: 'a.png' }] }));
+  const run = (args: string[], env: Record<string, string> = {}) => {
+    const proc = Bun.spawnSync([process.execPath, AUDIT_MEDIA, ...args], { env: { ...process.env, ...env } });
+    return { rc: proc.exitCode ?? -1, err: new TextDecoder().decode(proc.stderr) };
+  };
+  // ① 슬래시 없는 --ffprobe 이름은 PATH 조회로 작업 폴더 밖 실행이 되므로 거부한다.
+  writeFileSync(join(outside, 'evilprobe'), '#!/bin/sh\nexit 0\n');
+  chmodSync(join(outside, 'evilprobe'), 0o755);
+  const viaPath = run([manifest, '--ffprobe', 'evilprobe'], { PATH: `${outside}:${process.env.PATH}` });
+  expect(viaPath.rc).toBe(2);
+  expect(viaPath.err).toContain('작업 폴더 밖');
+  // ② --out 대상이 아직 없어도 symlink 디렉터리(linkdir → 밖)를 타면 거부한다.
+  const beyond = temp();
+  symlinkSync(beyond, join(ws, 'linkdir'));
+  const throughLink = run([manifest, '--out', join(ws, 'linkdir', 'report.json')]);
+  expect(throughLink.rc).toBe(2);
+  expect(throughLink.err).toContain('작업 폴더 밖');
+  expect(readdirSync(beyond)).toEqual([]);
+  // ③ 작업 폴더 루트 자체가 symlink 뒤에 있어도 정상 asset 은 통과한다(realDir 기준 일관 비교).
+  const rootLink = join(temp(), 'wslink');
+  symlinkSync(ws, rootLink);
+  const ok = run([join(rootLink, 'manifest.json'), '--out', join(ws, 'media-audit.json'), '--ffprobe', join(ws, 'ffprobe')]);
+  expect(`${ok.rc} ${ok.err}`).toBe('0 ');
+  expect(JSON.parse(readFileSync(join(ws, 'media-audit.json'), 'utf8')).status).toBe('PASS');
+});
+
+test('audit-media CLI refuses --out that is a broken symlink whose relative target passes through a linked directory outside the work folder', () => {
+  const ws = temp();
+  const outside = temp();
+  writeFileSync(join(ws, 'a.png'), 'x');
+  writeFileSync(join(ws, 'ffprobe'), '#!/bin/sh\ncat <<\'EOF\'\n{"streams":[{"codec_type":"video","codec_name":"png","width":2,"height":2}],"format":{"duration":"1"}}\nEOF\n');
+  chmodSync(join(ws, 'ffprobe'), 0o755);
+  const manifest = join(ws, 'manifest.json');
+  writeFileSync(manifest, JSON.stringify({ assets: [{ id: 'a', kind: 'image', file: 'a.png' }] }));
+  // ws/indir → 밖(존재) ⊕ ws/report.json → indir/new.json(끊긴 링크): 문자열상으로는 폴더 안이지만
+  // 실제로는 중간 symlink 디렉터리를 타서 밖 new.json 이 생기는 클래스다.
+  symlinkSync(outside, join(ws, 'indir'));
+  symlinkSync('indir/new.json', join(ws, 'report.json'));
+  const proc = Bun.spawnSync([process.execPath, AUDIT_MEDIA, manifest, '--out', 'report.json', '--ffprobe', join(ws, 'ffprobe')]);
+  const err = new TextDecoder().decode(proc.stderr);
+  expect(proc.exitCode).toBe(2);
+  expect(err).toContain('작업 폴더 밖');
+  expect(existsSync(join(outside, 'new.json'))).toBe(false);
+});
+
+test('audit-media CLI refuses --out that is a broken symlink pointing at a not-yet-existing file outside the work folder', () => {
+  const ws = temp();
+  const outside = temp();
+  writeFileSync(join(ws, 'a.png'), 'x');
+  writeFileSync(join(ws, 'ffprobe'), '#!/bin/sh\ncat <<\'EOF\'\n{"streams":[{"codec_type":"video","codec_name":"png","width":2,"height":2}],"format":{"duration":"1"}}\nEOF\n');
+  chmodSync(join(ws, 'ffprobe'), 0o755);
+  const manifest = join(ws, 'manifest.json');
+  writeFileSync(manifest, JSON.stringify({ assets: [{ id: 'a', kind: 'image', file: 'a.png' }] }));
+  // 끊긴 링크: 존재하지 않는 밖 파일을 가리킨다 — existsSync 로는 «없음»이지만 lstatSync 로는 잡힌다.
+  symlinkSync(join(outside, 'new.json'), join(ws, 'report.json'));
+  const proc = Bun.spawnSync([process.execPath, AUDIT_MEDIA, manifest, '--out', join(ws, 'report.json'), '--ffprobe', join(ws, 'ffprobe')]);
+  const err = new TextDecoder().decode(proc.stderr);
+  expect(proc.exitCode).toBe(2);
+  expect(err).toContain('작업 폴더 밖');
+  expect(existsSync(join(outside, 'new.json'))).toBe(false);
+});
+
+test('audit-media CLI checks and executes --ffprobe by the same CWD-resolved path: relative binaries outside the run CWD are refused without running, in-folder relative binaries run', () => {
+  const ws = temp();
+  const cwdDir = temp(); // 스폰된 CLI 의 실제 CWD — 작업 폴더 밖
+  writeFileSync(join(ws, 'a.png'), 'x');
+  const manifest = join(ws, 'manifest.json');
+  writeFileSync(manifest, JSON.stringify({ assets: [{ id: 'a', kind: 'image', file: 'a.png' }] }));
+  const run = (cwd: string, binaryArg: string) => {
+    const proc = Bun.spawnSync([process.execPath, AUDIT_MEDIA, manifest, '--ffprobe', binaryArg], { cwd });
+    return { rc: proc.exitCode ?? -1, err: new TextDecoder().decode(proc.stderr) };
+  };
+  // 스텁 ffprobe: 어떤 인자든 ffprobe 형식 JSON 을 내고, 실행 자체를 executed.txt 로 남긴다.
+  const fake = '#!/bin/sh\necho ran > "$(dirname "$0")/executed.txt"\ncat <<\'EOF\'\n{"streams":[{"codec_type":"video","codec_name":"png","width":2,"height":2}],"format":{"duration":"1"}}\nEOF\n';
+  // ① CWD(작업 폴더 밖)의 ./ffprobe — 가드가 realDir 기준으로 공허하게 통과시키고 실행이 CWD 기준으로
+  //    풀리면 이 밖 바이너리가 실제 돈다. 거부 ⊕ 미실행(executed.txt 미생성)을 둘 다 확인한다.
+  writeFileSync(join(cwdDir, 'ffprobe'), fake);
+  chmodSync(join(cwdDir, 'ffprobe'), 0o755);
+  const outsideRun = run(cwdDir, './ffprobe');
+  expect(outsideRun.rc).toBe(2);
+  expect(outsideRun.err).toContain('작업 폴더 밖');
+  expect(existsSync(join(cwdDir, 'executed.txt'))).toBe(false);
+  // ② 같은 밖 CWD 의 하위 상대 경로(sub/ffprobe)도 거부한다.
+  const outsideSubRun = run(cwdDir, 'sub/ffprobe');
+  expect(outsideSubRun.rc).toBe(2);
+  expect(outsideSubRun.err).toContain('작업 폴더 밖');
+  expect(existsSync(join(cwdDir, 'executed.txt'))).toBe(false);
+  // ③ 작업 폴더 안 CWD 의 ./ffprobe 는 정상 수용·실행된다(정상 경로 회귀 없음).
+  writeFileSync(join(ws, 'ffprobe'), fake);
+  chmodSync(join(ws, 'ffprobe'), 0o755);
+  const insideRun = run(ws, './ffprobe');
+  expect(`${insideRun.rc} ${insideRun.err}`).toBe('0 ');
+  expect(existsSync(join(ws, 'executed.txt'))).toBe(true);
+  // ④ 작업 폴더 안 하위 상대 경로(sub/ffprobe)도 정상 수행된다.
+  mkdirSync(join(ws, 'sub'));
+  writeFileSync(join(ws, 'sub', 'ffprobe'), fake);
+  chmodSync(join(ws, 'sub', 'ffprobe'), 0o755);
+  const subRun = run(ws, 'sub/ffprobe');
+  expect(`${subRun.rc} ${subRun.err}`).toBe('0 ');
+  expect(existsSync(join(ws, 'sub', 'executed.txt'))).toBe(true);
+});
+
+test('audit-media CLI refuses every in-folder link that resolves outside the work folder (input · linked dir · --ffprobe · --out) and keeps in-folder links accepted', () => {
+  const ws = temp();
+  const outside = temp();
+  const fake = '#!/bin/sh\ncat <<\'EOF\'\n{"streams":[{"codec_type":"video","codec_name":"png","width":2,"height":2}],"format":{"duration":"1"}}\nEOF\n';
+  writeFileSync(join(ws, 'ffprobe'), fake);
+  chmodSync(join(ws, 'ffprobe'), 0o755);
+  writeFileSync(join(ws, 'a.png'), 'x');
+  writeFileSync(join(outside, 'secret.png'), 'secret');
+  const manifest = join(ws, 'manifest.json');
+  const manifestWith = (assets: unknown[]) => writeFileSync(manifest, JSON.stringify({ assets }));
+  const run = (args: string[]) => {
+    const proc = Bun.spawnSync([process.execPath, AUDIT_MEDIA, ...args], { cwd: ws });
+    return { rc: proc.exitCode ?? -1, err: new TextDecoder().decode(proc.stderr) };
+  };
+  const refused = (label: string, r: { rc: number; err: string }) =>
+    expect(`${label} ${r.rc} ${r.err.includes('작업 폴더 밖')}`).toBe(`${label} 2 true`);
+  // ① 작업 폴더 안 링크가 밖의 «존재하는» 파일을 가리킨다(끊긴 링크가 아니어도 걸려야 한다).
+  symlinkSync(join(outside, 'secret.png'), join(ws, 'link.png'));
+  manifestWith([{ id: 'a', kind: 'image', file: 'link.png' }]);
+  refused('input link', run([manifest, '--ffprobe', join(ws, 'ffprobe')]));
+  // ② 작업 폴더 안 링크 디렉터리를 타고 밖 파일 — 문자열상 폴더 안, 실제로는 밖.
+  symlinkSync(outside, join(ws, 'outdir'));
+  manifestWith([{ id: 'a', kind: 'image', file: 'outdir/secret.png' }]);
+  refused('linked dir', run([manifest, '--ffprobe', join(ws, 'ffprobe')]));
+  // ③ --ffprobe 가 폴더 안 링크지만 실제 실행 파일은 밖 — 조회·실행 모두 거부.
+  writeFileSync(join(outside, 'evilprobe'), '#!/bin/sh\nexit 0\n');
+  chmodSync(join(outside, 'evilprobe'), 0o755);
+  symlinkSync(join(outside, 'evilprobe'), join(ws, 'linkprobe'));
+  manifestWith([{ id: 'a', kind: 'image', file: 'a.png' }]);
+  refused('ffprobe link', run([manifest, '--ffprobe', 'linkprobe']));
+  // ④ --out 이 폴더 안 링크지만 실제 대상은 밖의 기존 파일 — 밖 파일은 손대지 않는다.
+  writeFileSync(join(outside, 'target.json'), 'keep');
+  symlinkSync(join(outside, 'target.json'), join(ws, 'outlink.json'));
+  refused('out link', run([manifest, '--out', 'outlink.json', '--ffprobe', join(ws, 'ffprobe')]));
+  expect(readFileSync(join(outside, 'target.json'), 'utf8')).toBe('keep');
+  // ⑤ 정상 보존: 링크라도 «폴더 안» 실제 파일을 가리키면 종전대로 수용한다.
+  mkdirSync(join(ws, 'media'));
+  writeFileSync(join(ws, 'media', 'real.png'), 'x');
+  symlinkSync(join(ws, 'media', 'real.png'), join(ws, 'inner.png'));
+  manifestWith([{ id: 'a', kind: 'image', file: 'inner.png' }]);
+  const ok = run([manifest, '--out', join(ws, 'media-audit.json'), '--ffprobe', join(ws, 'ffprobe')]);
+  expect(`${ok.rc} ${ok.err}`).toBe('0 ');
+  expect(JSON.parse(readFileSync(join(ws, 'media-audit.json'), 'utf8')).status).toBe('PASS');
+});
+
 test('assets that are not probed must still exist as real files in the workspace', () => {
   const ws = temp();
   writeFileSync(join(ws, 'media-manifest.json'), JSON.stringify({ assets: [{ id: 'a', kind: 'audio', file: 'site/missing.mp3', role: 'mood', rights: 'own' }] }));
@@ -619,4 +822,48 @@ test('assets that are not probed must still exist as real files in the workspace
   mkdirSync(join(ws, 'site'));
   writeFileSync(join(ws, 'site', 'missing.mp3'), 'ID3');
   expect(step('audit-media', ws).outcome).toBe('skip');
+});
+
+test('audit-media CLI refuses an explicitly named bare `ffprobe` --ffprobe whose PATH lookup would run a binary outside the work folder', () => {
+  const ws = temp();
+  const outside = temp();
+  const fakebin = join(outside, 'fakebin');
+  mkdirSync(fakebin);
+  installProbe(fakebin);
+  writeFileSync(join(ws, 'a.png'), 'x');
+  const manifest = join(ws, 'manifest.json');
+  writeFileSync(manifest, JSON.stringify({ assets: [{ id: 'a', kind: 'image', file: 'a.png' }] }));
+  // 이름만 준 --ffprobe 는 PATH 조회로 풀린다 — PATH 앞에 밖 폴더를 두면 밖 바이너리가 실제로 돈다.
+  const proc = Bun.spawnSync([process.execPath, AUDIT_MEDIA, manifest, '--ffprobe', 'ffprobe'], {
+    cwd: ws,
+    env: { ...process.env, PATH: `${fakebin}:${process.env.PATH}` },
+  });
+  const err = new TextDecoder().decode(proc.stderr);
+  expect(err).toContain('작업 폴더 밖');
+  expect(proc.exitCode).toBe(2);
+  expect(existsSync(join(fakebin, 'executed.txt'))).toBe(false);
+});
+
+test('audit-media CLI refuses --out that is a hard link sharing its inode with a file outside the work folder, and still accepts a fresh in-folder report', () => {
+  const ws = temp();
+  const outside = temp();
+  installProbe(ws);
+  writeFileSync(join(ws, 'a.png'), 'x');
+  const manifest = join(ws, 'manifest.json');
+  writeFileSync(manifest, JSON.stringify({ assets: [{ id: 'a', kind: 'image', file: 'a.png' }] }));
+  // realpath 로는 폴더 안처럼 보이지만 inode 를 밖 파일과 공유한다 — O_TRUNC 가 밖 파일을 덮어쓴다.
+  writeFileSync(join(outside, 'target.json'), 'keep');
+  linkSync(join(outside, 'target.json'), join(ws, 'report.json'));
+  const run = (out: string) => {
+    const proc = Bun.spawnSync([process.execPath, AUDIT_MEDIA, manifest, '--out', out, '--ffprobe', join(ws, 'ffprobe')], { cwd: ws });
+    return { rc: proc.exitCode ?? -1, err: new TextDecoder().decode(proc.stderr) };
+  };
+  const refused = run(join(ws, 'report.json'));
+  expect(refused.err).toContain('작업 폴더 밖');
+  expect(refused.rc).toBe(2);
+  expect(readFileSync(join(outside, 'target.json'), 'utf8')).toBe('keep');
+  // 정상 보존: 폴더 안 새 파일로의 --out 은 종전대로 수용한다.
+  const ok = run(join(ws, 'media-audit.json'));
+  expect(`${ok.rc} ${ok.err}`).toBe('0 ');
+  expect(JSON.parse(readFileSync(join(ws, 'media-audit.json'), 'utf8')).status).toBe('PASS');
 });

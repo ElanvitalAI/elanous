@@ -1,5 +1,7 @@
 import { test, expect, describe } from 'bun:test';
 import { pickDecomposeProposals, readDecomposeProposals, orderPiecesTopologically } from './decompose-proposal.js';
+import { planShadowFirstDispatch, readDecomposeDocument, SHADOW_PIECE_ID } from './decompose-proposal.js';
+import { debug } from '../debug/log.js';
 
 const ev = (shardId: string, pieces: unknown[], round?: number) => ({
   event: 'decomposition-shadow-goals',
@@ -446,5 +448,192 @@ describe('orderPiecesTopologically — 「의존 0」이 아니라 「DAG 인가
   test('같은 입력이면 같은 출력 — 동률은 «원래 순서»로 깬다', () => {
     const pieces = [Q('z'), Q('y'), Q('x')];
     expect(orderPiecesTopologically(pieces).ordered?.map((p) => p.id)).toEqual(['z', 'y', 'x']);
+  });
+});
+
+describe('planShadowFirstDispatch — shadow 관측이 live 발사보다 «앞선다» (AUTHOR-SHADOW-FIRST-SPLIT ② · #26884)', () => {
+  const S = (dependsOn: string[] = []) => ({ id: SHADOW_PIECE_ID, feature: '① 그림자', dependsOn });
+  const L = (dependsOn: string[] = []) => ({ id: 'live', feature: '② live 스위치', dependsOn });
+  const Pc = (id: string, dependsOn: string[] = []) => ({ id, feature: `feat ${id}`, dependsOn });
+
+  test('⭐ shadow 조각이 맨 앞으로 올라오고 live 조각은 shadow 선행 간선을 유지한다', () => {
+    const plan = planShadowFirstDispatch([L(['shadow']), S()]);
+    expect(plan.kind).toBe('ok');
+    if (plan.kind !== 'ok') return;
+    expect(plan.pieces.map((p) => p.id)).toEqual(['shadow', 'live']);
+    expect(plan.pieces[1]!.dependsOn).toEqual(['shadow']);
+    expect(plan.shadowFirst).toEqual({ shadowId: 'shadow', liveIds: ['live'], restoredEdges: 0 });
+    // 위상 정렬도 같은 선후를 낸다 — shadow 가 먼저, 간선 1.
+    const ordering = orderPiecesTopologically(plan.pieces);
+    expect(ordering.ordered?.map((p) => p.id)).toEqual(['shadow', 'live']);
+    expect(ordering.dependsOnEdges).toBe(1);
+  });
+
+  test('⭐ live 조각이 shadow 간선을 잃어도 «되살린다» — 되살린 수를 센다', () => {
+    const plan = planShadowFirstDispatch([S(), L([])]);
+    expect(plan.kind).toBe('ok');
+    if (plan.kind !== 'ok') return;
+    expect(plan.pieces.map((p) => p.id)).toEqual(['shadow', 'live']);
+    expect(plan.pieces[1]!.dependsOn).toEqual(['shadow']);
+    expect(plan.shadowFirst?.restoredEdges).toBe(1);
+    expect(orderPiecesTopologically(plan.pieces).dependsOnEdges).toBe(1);
+  });
+
+  test('live 조각의 «다른» 의존은 잃지 않고 shadow 를 뒤에 붙인다', () => {
+    const plan = planShadowFirstDispatch([
+      { id: 'helper', feature: 'helper', dependsOn: [] },
+      { id: 'live', feature: '② live 스위치', dependsOn: ['helper'] },
+      S(),
+    ]);
+    expect(plan.kind).toBe('ok');
+    if (plan.kind !== 'ok') return;
+    expect(plan.pieces.map((p) => p.id)).toEqual(['shadow', 'helper', 'live']);
+    expect(plan.pieces[2]!.dependsOn).toEqual(['helper', 'shadow']);
+    expect(plan.shadowFirst).toEqual({ shadowId: 'shadow', liveIds: ['helper', 'live'], restoredEdges: 1 });
+  });
+
+  test('⛔ 매달린 dependsOn 은 «거부»다 — 없는 조각을 선행으로 단 제안은 승격하지 않는다', () => {
+    const plan = planShadowFirstDispatch([S(), L(['ghost'])]);
+    expect(plan.kind).toBe('rejected');
+    if (plan.kind !== 'rejected') return;
+    expect(plan.reason).toBe('dangling-dependsOn');
+    expect(plan.danglingIds).toEqual(['ghost']);
+  });
+
+  test('shadow-first 가 아닌 제안은 «그대로» — 순서도 간선도 건드리지 않는다', () => {
+    const pieces = [Pc('1'), Pc('2', ['1'])];
+    const plan = planShadowFirstDispatch(pieces);
+    expect(plan.kind).toBe('ok');
+    if (plan.kind !== 'ok') return;
+    expect(plan.pieces).toEqual(pieces);
+    expect(Object.prototype.hasOwnProperty.call(plan, 'shadowFirst')).toBe(false);
+  });
+
+  test('shadow 조각이 «둘»이면 가드하지 않는다 — 어느 쪽이 관측인지 모르는 제안을 고치지 않는다', () => {
+    const pieces = [S(), { id: SHADOW_PIECE_ID, feature: 'dup', dependsOn: [] }, L([])];
+    const plan = planShadowFirstDispatch(pieces);
+    expect(plan.kind).toBe('ok');
+    if (plan.kind !== 'ok') return;
+    expect(plan.pieces).toEqual(pieces);
+    expect(plan.shadowFirst).toBeUndefined();
+  });
+});
+
+describe('readDecomposeDocument — 혼합 문서를 조용히 «다시 매기지» 않는다', () => {
+  test('⭐ 조각꼴만 있으면 조각꼴 그대로 읽는다', () => {
+    const doc = readDecomposeDocument([
+      { id: 'a', feature: 'part a', dependsOn: ['b', 3], hotPaths: ['src/a.ts', 7] },
+      { id: 'b', feature: 'part b' },
+    ]);
+    expect(doc.kind).toBe('pieces');
+    if (doc.kind !== 'pieces') return;
+    expect(doc.pieces.map((p) => p.id)).toEqual(['a', 'b']);
+    expect(doc.pieces[0]!.dependsOn).toEqual(['b']);
+    expect(doc.pieces[0]!.hotPaths).toEqual(['src/a.ts']);
+    expect(doc.pieces[1]!.dependsOn).toEqual([]);
+  });
+
+  test('⛔ 단계꼴(step)과 조각꼴(feature)이 섞인 문서는 «거부» — 버려진 자리를 다시 매기지 않는다', () => {
+    // 단계꼴은 feature 가 없어 지금까지 «조용히» 버려졌고, 남은 조각은 자리 번호로 다시 매겨졌다.
+    // 그 재번호가 shadow→live 선행 간선을 «매달린» 것으로 만들어 관측 없는 live 발사를 일으킨다.
+    const doc = readDecomposeDocument([
+      { id: 'shadow', step: '① 그림자 — 기록만 한다' },
+      { id: 'live', feature: '② live 스위치', dependsOn: ['shadow'] },
+    ]);
+    expect(doc.kind).toBe('rejected');
+    if (doc.kind !== 'rejected') return;
+    expect(doc.reason).toBe('mixed-document');
+    expect(doc.stepEntries).toBe(1);
+    expect(doc.pieceEntries).toBe(1);
+  });
+
+  test('⛔ 문자열 단계와 조각이 섞여도 같은 판정이다', () => {
+    const doc = readDecomposeDocument(['① 그림자', { id: 'live', feature: '② live 스위치', dependsOn: [] }]);
+    expect(doc.kind).toBe('rejected');
+  });
+
+  test('순수 단계꼴 문서는 조각 문서가 «아니다» — empty', () => {
+    expect(readDecomposeDocument([{ step: 'a' }, 'b']).kind).toBe('empty');
+    expect(readDecomposeDocument(undefined).kind).toBe('empty');
+  });
+
+  test('⛔ 혼합 문서 제안은 pickDecomposeProposals 가 «뽑지 않는다»', () => {
+    const m = pickDecomposeProposals([
+      ev('task:mixed', [
+        { id: 'shadow', step: '① 그림자 — 기록만 한다' },
+        { id: 'live', feature: '② live 스위치', dependsOn: ['shadow'] },
+      ]),
+    ]);
+    expect(m.size).toBe(0);
+  });
+});
+
+describe('applyDecomposeProposals — caller shadow 관측이 live 발사 «앞»에 남는다', () => {
+  const captureDebug = () => {
+    const original = debug.log;
+    const events: Array<{ category: string; event: string; data?: unknown }> = [];
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    return { events, restore: () => { (debug as { log: typeof debug.log }).log = original; } };
+  };
+
+  test('⭐ shadow-first 제안은 shadow 조각이 먼저 나오고 live 는 shadow 를 선행으로 갖는다', () => {
+    const r = applyDecomposeProposals(
+      [G('big')],
+      [R('big', [
+        { id: 'live', feature: '② live 스위치', dependsOn: [] },
+        { id: 'shadow', feature: '① 그림자', dependsOn: [] },
+      ] as never)],
+    );
+    expect(r.decomposed).toEqual(['big']);
+    expect(r.goals.map((g) => g.id)).toEqual(['shadow', 'live']);
+    expect(r.goals[1]!.dependsOn).toEqual(['shadow']);
+  });
+
+  test('⭐ live 발사 «전»에 shadow 관측이 caller 로그에 먼저 남는다', () => {
+    const { events, restore } = captureDebug();
+    try {
+      applyDecomposeProposals(
+        [G('big')],
+        [R('big', [
+          { id: 'shadow', feature: '① 그림자', dependsOn: [] },
+          { id: 'live', feature: '② live 스위치', dependsOn: [] },
+        ] as never)],
+      );
+    } finally {
+      restore();
+    }
+    const observation = events.find((e) => e.event === 'shadow-first-dispatch');
+    expect(observation?.category).toBe('self-dev.decompose');
+    expect(observation?.data).toEqual({
+      feature: 'big', shadowId: 'shadow', liveIds: ['live'], restoredEdges: 1,
+    });
+    // 관측은 «live 조각을 내보내기 전» 자리에서 «한 번» 남는다 — 다른 어떤 사건도 그 앞에 없다.
+    expect(events.map((e) => e.event)).toEqual(['shadow-first-dispatch']);
+    const appliedIndex = events.findIndex((e) => e.event === 'shadow-first-dispatch');
+    expect(appliedIndex).toBe(0);
+  });
+
+  test('⛔ 매달린 dependsOn 제안은 «쪼개지 않는다» — 원본을 두고 사유를 값으로 남긴다', () => {
+    const r = applyDecomposeProposals(
+      [G('big')],
+      [R('big', [
+        { id: 'p1', feature: 'part 1', dependsOn: [] },
+        { id: 'p2', feature: 'part 2', dependsOn: ['ghost'] },
+      ])],
+    );
+    expect(r.decomposed).toEqual([]);
+    expect(r.goals.map((g) => g.feature)).toEqual(['big']);
+    expect(r.rejected).toEqual([{ feature: 'big', reason: 'dangling-dependsOn', detail: ['ghost'] }]);
+  });
+
+  test('거부 없이 통과한 제안은 rejected 가 [] 이다', () => {
+    const r = applyDecomposeProposals(
+      [G('big')],
+      [R('big', [{ id: 'p1', feature: 'part 1', dependsOn: [] }, { id: 'p2', feature: 'part 2', dependsOn: ['p1'] }])],
+    );
+    expect(r.rejected).toEqual([]);
+    expect(r.decomposed).toEqual(['big']);
   });
 });

@@ -8,7 +8,7 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeBackend, codexBackend, decideRuntimeFallback, grokBackend, initialRuntimeFallback, resolveBackend, resolveDefaultBackend, resolveBackendSpawn } from './driver.js';
-import { decideFallback } from '../oauth/fallback-chain.js';
+import { decideFallback, type FallbackStep } from '../oauth/fallback-chain.js';
 import { judgeClaudePtyMaturity } from '../oauth/claude-pty-maturity.js';
 
 describe('⑴ resolveDefaultBackend — 체인이 실행 경로에 «있다»', () => {
@@ -48,8 +48,8 @@ describe('⑴ resolveDefaultBackend — 체인이 실행 경로에 «있다»', 
 });
 
 describe('runtime fallback — 한도 실패만 미시도 다음 칸으로 재판정한다', () => {
-  const state = (overrides: Partial<{ attemptedSteps: ReadonlySet<'codex-rotate' | 'grok' | 'claude-pty'>; descents: number; maxDescents: number }> = {}) => ({
-    attemptedSteps: new Set<'codex-rotate' | 'grok'>(['codex-rotate']), descents: 0, maxDescents: 1, ...overrides,
+  const state = (overrides: Partial<{ attemptedSteps: ReadonlySet<FallbackStep>; descents: number; maxDescents: number }> = {}) => ({
+    attemptedSteps: new Set<FallbackStep>(['codex-rotate']), descents: 0, maxDescents: 1, ...overrides,
   });
 
   it('회전된 codex 자격의 한도 오류는 새 grok 칸으로 내려간다', () => {
@@ -61,7 +61,7 @@ describe('runtime fallback — 한도 실패만 미시도 다음 칸으로 재�
   });
 
   it('grok 한도 실패는 미시도 claude 칸으로 내려가며 재시도는 차단한다', () => {
-    const attemptedSteps = new Set<'codex-rotate' | 'grok' | 'claude-pty'>(['codex-rotate', 'grok']);
+    const attemptedSteps = new Set<FallbackStep>(['codex-rotate', 'grok']);
     const decide = () => ({ action: 'switch-backend', backend: 'claude' });
     expect(decideRuntimeFallback(new Error('429 rate limit'), 'grok', state({ attemptedSteps, maxDescents: 2, descents: 1 }), decide))
       .toBe(claudeBackend);
@@ -79,7 +79,7 @@ describe('runtime fallback — 한도 실패만 미시도 다음 칸으로 재�
     const backend = resolveDefaultBackend({ decide: () => first });
     const runtime = initialRuntimeFallback(backend, chain);
     expect(runtime).toEqual({ fallbackEligible: true, attemptedSteps: new Set(['grok']), descents: 0, maxDescents: 1 });
-    const decide = ({ currentStep, currentCredentialRateLimited }: { currentStep: 'codex-rotate' | 'grok' | 'claude-pty'; currentCredentialRateLimited: true }) =>
+    const decide = ({ currentStep, currentCredentialRateLimited }: { currentStep: FallbackStep; currentCredentialRateLimited: true }) =>
       decideFallback({ chain, rotation, grokAvailable: true, claudePtyMaturity: mature, currentStep, currentCredentialRateLimited });
     expect(decideRuntimeFallback(new Error('429 rate limit'), 'grok', runtime, decide)).toBe(claudeBackend);
     const attemptedSteps = new Set([...runtime.attemptedSteps, 'claude-pty'] as const);

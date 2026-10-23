@@ -7,6 +7,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { perf } from './perf-counters.js';
 import { noteInputLagKey, noteInputLagPaint } from './tui/input-lag-probe.js';
 import { debug } from './debug/log.js';
+import { startForegroundGuard } from './tty-foreground.js';
 
 // ── ANSI escape sequences ──
 const CSI = '\x1b[';
@@ -441,8 +442,12 @@ function trailingUtf8Carry(data: Buffer): Buffer {
 let _raw = false;
 let _alt = false;
 let _cancelReadKey: (() => void) | undefined;
+/** TUI-SIGTTIN-SUSPEND — stops the tty-foreground guard (src/tty-foreground.ts). */
+let _stopForegroundGuard: (() => void) | undefined;
 
 function cleanup(): void {
+  _stopForegroundGuard?.();
+  _stopForegroundGuard = undefined;
   resetRenderCache();
   _cancelReadKey?.();
   resetInputState();
@@ -473,11 +478,40 @@ function runExitNotice(): void {
   try { fn?.(); } catch { /* 알림 실패가 종료를 막지 않는다 */ }
 }
 
+/**
+ * TUI-SIGCONT-RESTORE-TERM (0.2.36 · 2026-10-22) — 멈췄다(SIGTSTP·SIGTTIN · 상태 T) `fg` 로 돌아오면 셸의 작업 제어가
+ * 터미널을 cooked 로 돌려놓았다. raw 모드·kitty/modifyOtherKeys·마우스·붙여넣기·alt 화면을 다시 세우지 않으면
+ * Enter 가 «^M», Ctrl+C 가 «^[[99;5u» 로 입력창에 박혀 먹통이 된다(10-22 OPT 실물).
+ * 지금 켜 둔 것만 다시 켜고, 렌더 캐시를 비운 뒤 `resize` 를 내 화면 전체를 다시 그리게 한다.
+ */
+export interface TerminalRestoreIo {
+  stdin: { isTTY?: boolean; setRawMode?: (mode: boolean) => unknown; resume?: () => unknown };
+  stdout: { write: (chunk: string) => unknown; emit?: (event: string) => unknown };
+}
+export function restoreTerminalAfterContinue(state: { raw: boolean; alt: boolean }, io: TerminalRestoreIo): boolean {
+  if (!state.raw && !state.alt) return false;
+  if (state.raw && io.stdin.isTTY) {
+    io.stdin.setRawMode?.(true);
+    io.stdin.resume?.();
+  }
+  io.stdout.write(ansi.mouseOn + ansi.pasteOn + ansi.kittyKbOn + ansi.modKeysOn);
+  io.stdout.write(state.alt ? ansi.altOn + ansi.hideCursor : ansi.hideCursor);
+  resetRenderCache();
+  debug.log('tui.lifecycle', 'sigcont-restored', { raw: state.raw, alt: state.alt });
+  // 화면 주인(대시보드·next)은 resize 에서 전체를 다시 그린다.
+  io.stdout.emit?.('resize');
+  return true;
+}
+
 let _exitHandlersRegistered = false;
 function registerExitHandlers(): void {
   if (_exitHandlersRegistered) return;
   _exitHandlersRegistered = true;
   process.on('exit', cleanup);
+  process.on('SIGCONT', () => {
+    try { restoreTerminalAfterContinue({ raw: _raw, alt: _alt }, { stdin: process.stdin, stdout: process.stdout }); }
+    catch { /* fail-soft: 복구 실패가 프로세스를 죽이지 않는다 */ }
+  });
   process.on('SIGINT',  () => { cleanup(); runExitNotice(); process.exit(130); });
   process.on('SIGTERM', () => { cleanup(); runExitNotice(); process.exit(143); });
 }
@@ -490,6 +524,9 @@ export function initTui(altScreen = true): void {
   process.stdin.setEncoding('utf8'); // decode UTF-8 for CJK/IME support
   process.stdin.resume();
   _raw = true;
+  // TUI-SIGTTIN-SUSPEND (10-23 n8n): a child that steals the terminal's foreground group would leave
+  // us to be stopped by SIGTTIN on the next keystroke. The guard takes it back from our own children.
+  _stopForegroundGuard ??= startForegroundGuard();
   // Enable mouse + paste globally. Kitty keyboard protocol + xterm
   // modifyOtherKeys are ALSO enabled dashboard-wide so Ctrl+M / Ctrl+J /
   // Ctrl+I / Ctrl+H can be distinguished from Enter / Tab / Backspace

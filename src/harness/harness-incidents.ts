@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { redactSecretText } from '../debug/log.js';
 import { refuseProductionLedgerWriteInTest } from './ledger-write-guard.js';
 import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
+import { parsePodTermination, type PodTermination } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 
 export interface RunExit {
   runId: string;
@@ -18,6 +19,14 @@ export interface RunExit {
   pid?: number;
   lastLines?: string[];
   childEvidence?: PodChildEvidence;
+  /** JOB-FAILURE-TERMINATION-CAPTURE — the current attempt's Job/Pod termination facts, captured before GC. */
+  podTermination?: PodTermination;
+  /** INCIDENT-REASON-FROM-LASTLINES — 기록된 reason 이 unknown 이라 lastLines 로 다시 분류했으면 원래 값. */
+  recordedReason?: string;
+  /** reason 을 어디서 얻었나 — 'lastLines' 면 위 분류 규칙으로 정했다(기록 원문은 recordedReason). */
+  reasonSource?: 'lastLines';
+  /** lastLines 에 ux-sim 장치 조각 경로가 보였다 — 장치 먼저 조각의 실패를 따로 셀 수 있게. */
+  slice?: 'device';
 }
 
 export interface IncidentBurst {
@@ -42,6 +51,40 @@ const INCIDENT_FILE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
 
 function kstDate(at: number): string {
   return new Date(at + KST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+// ── INCIDENT-REASON-FROM-LASTLINES (0.2.36 · 10-22 · OP 대응 피처) ───────────────────────────────
+// 기록된 reason 이 «unknown» 인데 마지막 출력 줄에 사유가 그대로 있는 사고가 다수(10-22 경보) — 읽는 쪽에서
+// 결정론으로 다시 분류한다. 우선순위 = 더 구체적인 종료 사유 먼저. 아무것도 안 맞으면 unknown 그대로(추측 0).
+const LAST_LINE_REASONS: ReadonlyArray<[RegExp, string]> = [
+  // 근본 원인 먼저 — 뒤 조각의 DEPENDENCY_NEEDS_HUMAN 은 앞 조각 실패의 «증상»이라 맨 뒤 쪽.
+  [/goal-elaboration needs-human:\s*goal-elaboration-ungrounded-path\b/, 'goal-elaboration-ungrounded-path'],
+  [/goal-elaboration needs-human:\s*goal-elaboration-protected-path\b/, 'goal-elaboration-protected-path'],
+  [/goal-elaboration needs-human:\s*goal-elaboration-scope-conflict\b/, 'goal-elaboration-scope-conflict'],
+  [/goal-elaboration needs-human:\s*goal-elaboration-fixed-layer-conflict\b/, 'goal-elaboration-fixed-layer-conflict'],
+  [/pod-deadline-exceeded|DeadlineExceeded/, 'pod-deadline-exceeded'],
+  [/GOAL_DONE_BOUNDARY_MISSING/, 'goal-done-boundary-missing'],
+  [/BackoffLimitExceeded/, 'pod-backoff-limit'],
+  [/childError=no-resul/, 'pod-child-no-result'],
+  [/pod-job-failed/, 'pod-job-failed'],
+  [/DEPENDENCY_NEEDS_HUMAN/, 'dependency-needs-human'],
+  [/\[needs-human\]|needs-human/, 'needs-human'],
+];
+const DEVICE_SLICE_PATH = /src\/ux-sim\/[\w.-]*-device(?:\.test)?\.ts|DEVICE-FIRST/;
+
+/** lastLines 에서 종료 사유를 꺼낸다 — 안 맞으면 null(unknown 유지). */
+export function classifyIncidentReasonFromLastLines(lines: readonly string[] | undefined): string | null {
+  if (!lines?.length) return null;
+  const text = lines.join('\n');
+  for (const [pattern, reason] of LAST_LINE_REASONS) if (pattern.test(text)) return reason;
+  return null;
+}
+
+function refinedReasonFields(reason: string, lines: readonly string[] | undefined): Pick<RunExit, 'reason' | 'recordedReason' | 'reasonSource' | 'slice'> {
+  const slice = lines?.some((line) => DEVICE_SLICE_PATH.test(line)) ? { slice: 'device' as const } : {};
+  if (reason !== 'unknown') return { reason, ...slice };
+  const refined = classifyIncidentReasonFromLastLines(lines);
+  return refined ? { reason: refined, recordedReason: reason, reasonSource: 'lastLines', ...slice } : { reason, ...slice };
 }
 
 /** Read only recorded exits. Missing ledgers are not evidence that no runs failed. */
@@ -71,7 +114,8 @@ export function readRunExits(root: string): RunExit[] {
         || !(row.status === null || typeof row.status === 'number')
         || !(row.signal === null || typeof row.signal === 'string')) continue;
       seen.add(row.runId);
-      rows.push({ runId: row.runId, reason: row.reason, status: row.status, signal: row.signal, at: row.at,
+      const lines = Array.isArray(row.lastLines) && row.lastLines.every((line) => typeof line === 'string') ? row.lastLines : undefined;
+      rows.push({ runId: row.runId, ...refinedReasonFields(row.reason, lines), status: row.status, signal: row.signal, at: row.at,
         ...(typeof row.entrance === 'string' ? { entrance: row.entrance } : {}),
         ...(typeof row.seat === 'string' ? { seat: row.seat } : {}),
         ...(typeof row.cwd === 'string' ? { cwd: row.cwd } : {}),
@@ -81,10 +125,17 @@ export function readRunExits(root: string): RunExit[] {
           ? { lastLines: row.lastLines } : {}),
         ...(row.childEvidence && typeof row.childEvidence === 'object' && !Array.isArray(row.childEvidence)
           ? { childEvidence: row.childEvidence } : {}),
+        ...podTerminationField(row.podTermination),
       });
     }
   }
   return rows.sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.runId.localeCompare(b.runId));
+}
+
+function podTerminationField(value: unknown): { podTermination?: PodTermination } {
+  const job = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>).job : undefined;
+  const parsed = typeof job === 'string' ? parsePodTermination(value, job) : undefined;
+  return parsed ? { podTermination: parsed } : {};
 }
 
 /** SQLite's process-owned write lock serializes ledger checks and appends across processes. */

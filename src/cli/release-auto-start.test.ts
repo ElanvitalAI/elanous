@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { setSchedule } from '../release-loop/release-schedule.js';
 import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
+import { psProcessStartMs } from '../harness/harness-stop.js';
 import { registerReleaseCommands } from './release-cli.js';
 
 const version = '0.2.8';
@@ -153,17 +154,79 @@ test('auto-start --apply does not launch an already-running or out-of-window cut
   const body = JSON.stringify({ pid: process.pid, startedAt: current() });
   writeFileSync(lock, body);
   const lines: string[] = [];
+  const errors: string[] = [];
   const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+  const error = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
+  const before = process.exitCode;
   const cli = new Command();
   registerReleaseCommands(cli, { ledgerRoot: root, checklist: () => { throw new Error('running cut reached checklist'); }, graph: async () => { throw new Error('running cut started graph'); } });
   try {
+    process.exitCode = 0;
     await cli.parseAsync(['release', 'auto-start', '--window-minutes', '2', '--apply'], { from: 'user' });
-    expect(lines.at(-1)).toBe(`· 릴리스 연기 ${version} · already-running`);
+    expect(process.exitCode).toBe(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBe(`⛔ 릴리스 이미 실행 중 ${version} · runId=pending pid=${process.pid} startedAt=${JSON.parse(body).startedAt} · auto-start 거부`);
     expect(readFileSync(lock, 'utf8')).toBe(body);
+    process.exitCode = 0;
     await cli.parseAsync(['release', 'auto-start', '--window-minutes', '0.01', '--apply'], { from: 'user' });
     expect(lines.at(-1)).toBe('· 선택할 컷 없음');
+    expect(process.exitCode).toBe(0);
     expect(readFileSync(lock, 'utf8')).toBe(body);
-  } finally { output.mockRestore(); }
+  } finally { process.exitCode = before ?? 0; error.mockRestore(); output.mockRestore(); }
+});
+
+function writeRunningGraph(runId: string, runVersion: string, startedAt: string) {
+  const dir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${runId}.json`), JSON.stringify({ graphId: 'release-loop', runId, status: 'running', pid: process.pid,
+    pidStartedAt: new Date(psProcessStartMs(process.pid)!).toISOString(), startedAt, input: { version: runVersion } }));
+}
+
+test('auto-start --apply refuses a live same-version graph run with rc1 and its runId/startedAt, before readiness or launch', async () => {
+  setup();
+  const startedAt = '2026-10-22T03:00:00.000Z';
+  writeRunningGraph('live-same-version', version, startedAt);
+  const stdout: string[] = [];
+  const human: string[] = [];
+  const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  const error = spyOn(console, 'error').mockImplementation((line: string) => { human.push(line); });
+  const before = process.exitCode;
+  let checks = 0;
+  let graphs = 0;
+  const cli = new Command();
+  registerReleaseCommands(cli, { ledgerRoot: root, checklist: () => { checks++; return { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
+    graph: async () => { graphs++; return { status: 'done' } as never; } });
+  try {
+    process.exitCode = 0;
+    await cli.parseAsync(['release', 'auto-start', '--window-minutes', '2', '--apply', '--json'], { from: 'user' });
+    expect(process.exitCode).toBe(1);
+    expect(stdout).toHaveLength(1);
+    expect(JSON.parse(stdout[0]!)).toEqual({ ok: false, status: 'already-running', version, runId: 'live-same-version', pid: process.pid, startedAt });
+    expect(human).toEqual([`⛔ 릴리스 이미 실행 중 ${version} · runId=live-same-version pid=${process.pid} startedAt=${startedAt} · auto-start 거부`]);
+    expect(checks).toBe(0);
+    expect(graphs).toBe(0);
+  } finally { process.exitCode = before ?? 0; error.mockRestore(); write.mockRestore(); }
+});
+
+test('auto-start --apply is not blocked by a live graph run of another version', async () => {
+  setup();
+  writeRunningGraph('live-other-version', '0.2.7', '2026-10-22T03:00:00.000Z');
+  const stdout: string[] = [];
+  const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  const error = spyOn(console, 'error').mockImplementation(() => {});
+  const before = process.exitCode;
+  let graphs = 0;
+  const cli = new Command();
+  registerReleaseCommands(cli, { ledgerRoot: root, config: { gatePodPool: 'pool' },
+    checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+    graph: async () => { graphs++; return { status: 'done' } as never; } });
+  try {
+    process.exitCode = 0;
+    await cli.parseAsync(['release', 'auto-start', '--window-minutes', '2', '--apply', '--json'], { from: 'user' });
+    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: true, status: 'started', version });
+    expect(graphs).toBe(1);
+    expect(process.exitCode).toBe(0);
+  } finally { process.exitCode = before ?? 0; error.mockRestore(); write.mockRestore(); }
 });
 
 test('auto-start --apply defers when freeze turns on after the entry check (LandingFrozenError at the run boundary)', async () => {

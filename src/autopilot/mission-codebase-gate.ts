@@ -28,6 +28,116 @@ import { llmUsageCostFields } from '../budget/llm-cost.js';
 
 const execFileAsync = promisify(execFile);
 
+/** git 서브프로세스 대역 — term grep 동시성 계약을 실제 git 없이 재기 위한 교체점. */
+export type ExecFileLike = (
+  file: string,
+  args: readonly string[],
+  options: { cwd?: string; encoding: 'utf-8'; maxBuffer: number },
+) => Promise<{ stdout: string; stderr?: string }>;
+
+const defaultExecFile: ExecFileLike = execFileAsync as unknown as ExecFileLike;
+let execFileImpl: ExecFileLike = defaultExecFile;
+
+/** 테스트 seam — null/미지정이면 실제 git 서브프로세스로 되돌린다. */
+export function setExecFileForTest(fn?: ExecFileLike | null): void {
+  execFileImpl = fn ?? defaultExecFile;
+}
+
+/** term 별 git grep 동시 실행 상한(기본 3 · OP 06:3x 실측 13개 동시 부하 101 을 막는다). */
+export const TERM_GREP_CONCURRENCY = 3;
+let termGrepConcurrency: number = TERM_GREP_CONCURRENCY;
+
+/** 테스트 seam — 상한 없음(Infinity)과 결과 불변을 비교하기 위해 올린다. */
+export function setTermGrepConcurrencyForTest(value?: number | null): void {
+  termGrepConcurrency = value ?? TERM_GREP_CONCURRENCY;
+}
+
+/** 상한 클램프 — 풀 크기와 관측값이 같은 규칙을 쓰게 한 곳에 둔다. */
+function effectiveConcurrency(concurrency: number, width: number): number {
+  const limit = Number.isFinite(concurrency) ? Math.max(1, Math.floor(concurrency)) : width;
+  return Math.max(1, Math.min(limit, width));
+}
+
+/** 동시 실행 상한 풀 — 결과 순서는 입력 순서 그대로(순위 계산이 순서에 의존하지 않게). */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  const size = effectiveConcurrency(concurrency, items.length);
+  let cursor = 0;
+  await Promise.all(
+    Array.from({ length: size }, async () => {
+      for (let index = cursor++; index < items.length; index = cursor++) {
+        results[index] = await worker(items[index]!);
+      }
+    }),
+  );
+  return results;
+}
+
+/** cwd seam 복원의 **단일 소유** — `process.chdir` 로 되돌리는 곳은 이 묶음(acquire/release) 하나뿐이다.
+ *
+ *  ⛔ 왜 «생산» 이 소유하나: 한 번의 grounding 런은 persistent 코드 채널·skill 도구처럼 **임의 코드**를
+ *  지나고(`dispatchTool` → shell·pty), 그 코드가 cwd 를 옮긴 채 끝날 수 있다. 되돌리기를 «각 의존성» 에
+ *  맡기면 런이 마감(타임아웃)·예외로 끝나는 순간 그 되돌리기가 통째로 빠지고, 다음 런의 seam
+ *  (`deps.cwd ?? process.cwd()`)이 **엉뚱한 트리를 저장소 루트로 읽어** 조용히 0건 grounding 을 낸다
+ *  (#29343 r3 지적: 타임아웃 뒤 cwd seam 오염).
+ *
+ *  ⛔ 소유는 «런마다» 가 아니라 «겹친 런 묶음» 하나다 — cwd 는 프로세스 전역이므로 런별 스냅샷은 겹침에서
+ *  깨진다(A 가 임시 트리로 옮긴 사이 B 가 시작하면 B 가 그 임시 트리를 «시작 자리» 로 저장하고, A 가 되돌린
+ *  뒤 B 가 다시 임시 트리로 되돌린다). ⇒ 첫 런이 시작 자리를 한 번 스냅샷하고, 겹쳐 들어온 런은 그 값을
+ *  seam 으로 «물려받으며», 마지막으로 나가는 런만 되돌린다. 마감으로 «버려진» 런도 본문이 끝날 때까지
+ *  holder 로 남으므로, 마감 뒤에 재개된 본문이 cwd 를 옮겨도 그 뒤의 런은 오염된 자리를 seam 으로 읽지 않고
+ *  본문이 끝나는 순간 되돌려진다.
+ *  ⛔ 복원 보장의 «경계»: 복원은 런의 수명 안에서만 소유한다. 호출자가 마감으로 버렸는데 본문이 «끝나지
+ *  않으면» 전역 cwd 는 그 본문이 끝날 때까지 옮겨진 채 남는다 — 이 함수에는 호출자의 마감 신호가 들어오지
+ *  않고, 진행 중인 본문 밑의 cwd 를 남이 바꾸면 그 본문을 깨뜨린다. 그 사이 보장되는 것은 «겹쳐 들어온
+ *  grounding 런의 seam 이 오염된 자리를 읽지 않는다» 이고, 본문이 끝나는 순간 마지막 holder 가 되돌린다
+ *  (mission-codebase-gate.test.ts «마감 뒤 재개» 시험이 이 경계를 그대로 잰다).
+ *  ⛔ 되돌리기 실패는 grounding 결과를 바꾸지 않되 «조용히 삼키지» 않는다 — `mission.grounding`
+ *  `cwd-restore-failed` 로 남긴다(기존 이벤트 형식은 그대로). */
+interface CwdSeamOwner { root: string; holders: number }
+let cwdSeamOwner: CwdSeamOwner | null = null;
+
+/** 소유 토큰 — `owned=false` 면 이 런은 묶음에 들지 않았다(시작 자리를 못 읽었다) ⇒ 되돌릴 것도 없다.
+ *  ⛔ 절대 throw 하지 않는다: 지워진 cwd 에서도 `deps.cwd` 를 받은 호출은 예전처럼 진행해야 한다. */
+interface CwdSeamLease { root: string | null; owned: boolean }
+
+function acquireCwdSeam(): CwdSeamLease {
+  if (!cwdSeamOwner) {
+    let root: string;
+    try { root = process.cwd(); } catch { return { root: null, owned: false }; }
+    cwdSeamOwner = { root, holders: 0 };
+  }
+  cwdSeamOwner.holders += 1;
+  return { root: cwdSeamOwner.root, owned: true };
+}
+
+function releaseCwdSeam(lease: CwdSeamLease): void {
+  if (!lease.owned) return;
+  const owner = cwdSeamOwner;
+  if (!owner) return;
+  owner.holders -= 1;
+  if (owner.holders > 0) return;
+  cwdSeamOwner = null;
+  let current: string | null = null;
+  try { current = process.cwd(); } catch { /* 지워진 자리 — 아래에서 되돌린다 */ }
+  if (current === owner.root) return;
+  try {
+    process.chdir(owner.root);
+  } catch (e) {
+    try {
+      debug.log('mission.grounding', 'cwd-restore-failed', {
+        root: owner.root,
+        current,
+        error: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200),
+      }, { level: 'warn' });
+    } catch { /* 관측 실패가 grounding 을 바꾸지 않는다 */ }
+  }
+}
+
 function logLlmUsage(site: 'codebase-gate-injected' | 'codebase-gate-dynamic', model: string, usage: LLMUsage): void {
   try {
     debug.log('llm.usage', 'llm-usage', {
@@ -215,28 +325,37 @@ export function commonTermCoverageWeight(matchLines: number): number {
 }
 
 async function searchRepository(terms: string[], limit: number, cwd: string | undefined, paths: string[], commonPaths = paths): Promise<string[]> {
-  if (!terms.length) return [];
+  // 같은 키워드는 한 번만 실행한다 — 실행·랭킹이 같은 목록을 쓰므로 결과는 결정적이다.
+  const uniqueTerms = [...new Set(terms)];
+  if (!uniqueTerms.length) return [];
   const fileTerms = new Map<string, Set<string>>(); // file → 매칭된 서로 다른 term
   const fileLines = new Map<string, number>();       // file → 총 매칭 라인 수
   const fileTermLines = new Map<string, Map<string, number>>(); // file → term별 매칭 라인 수
   const tooCommon = new Set<string>();               // 200+ 파일 매칭 = 밀도 감쇠 대상
-  const trackedPaths = await execFileAsync('git', ['ls-files', '--', ...paths], { ...(cwd ? { cwd } : {}), encoding: 'utf-8', maxBuffer: 8_000_000 })
+  const trackedPaths = await execFileImpl('git', ['ls-files', '--', ...paths], { ...(cwd ? { cwd } : {}), encoding: 'utf-8', maxBuffer: 8_000_000 })
     .then(({ stdout }) => stdout.split('\n').filter(Boolean))
     .catch(() => [] as string[]);
-  const pathMatches = new Map(terms.map((term) => [term, trackedPaths.filter((file) => file.toLowerCase().includes(term)).length]));
-  // term별 git grep 을 병렬 실행(순차 spawnSync ~16초 → 병렬 ~2초). git grep=현재 워킹트리
-  // 파일 검색(history 아님)·gitignore/바이너리 자동 제외. 호출자가 코드와 문서를 분리한다.
-  const perTerm = await Promise.all(terms.map(async (t) => {
+  const pathMatches = new Map(uniqueTerms.map((term) => [term, trackedPaths.filter((file) => file.toLowerCase().includes(term)).length]));
+  // term별 git grep 을 동시 실행 상한 풀(기본 3)로 돌린다 — 무제한 병렬은 mbp 1분 부하 101·git grep
+  // 13개 동시(OP 06:3x 실측)를 만들었다. git grep=현재 워킹트리 파일 검색(history 아님)·
+  // gitignore/바이너리 자동 제외. 호출자가 코드와 문서를 분리한다.
+  const termGrepStartedAt = Date.now();
+  const perTerm = await mapWithConcurrency(uniqueTerms, termGrepConcurrency, async (t) => {
     try {
       // -c: file:count. -i 무시·-I 바이너리제외. term 하나씩(어느 term 이 걸렸는지 추적).
-      const { stdout } = await execFileAsync('git', ['grep', '-c', '-i', '-I', '-e', t, '--', ...paths], { ...(cwd ? { cwd } : {}), encoding: 'utf-8', maxBuffer: 8_000_000 });
+      const { stdout } = await execFileImpl('git', ['grep', '-c', '-i', '-I', '-e', t, '--', ...paths], { ...(cwd ? { cwd } : {}), encoding: 'utf-8', maxBuffer: 8_000_000 });
       const rows = stdout.split('\n').filter(Boolean);
-      const commonRows = commonPaths === paths ? rows : await execFileAsync('git', ['grep', '-c', '-i', '-I', '-e', t, '--', ...commonPaths], { ...(cwd ? { cwd } : {}), encoding: 'utf-8', maxBuffer: 8_000_000 })
+      const commonRows = commonPaths === paths ? rows : await execFileImpl('git', ['grep', '-c', '-i', '-I', '-e', t, '--', ...commonPaths], { ...(cwd ? { cwd } : {}), encoding: 'utf-8', maxBuffer: 8_000_000 })
         .then(({ stdout }) => stdout.split('\n').filter(Boolean))
         .catch(() => [] as string[]);
       return { t, rows, commonCount: commonRows.length };
     } catch { return { t, rows: [] as string[], commonCount: 0 }; } // git grep no-match = exit 1(throw) → 빈 결과
-  }));
+  });
+  debug.log('grounding.search', 'term-grep-batch', {
+    terms: uniqueTerms.length,
+    concurrency: effectiveConcurrency(termGrepConcurrency, uniqueTerms.length),
+    ms: Date.now() - termGrepStartedAt,
+  });
   for (const { t, rows, commonCount } of perTerm) {
     if (commonCount > 200) {
       tooCommon.add(t);
@@ -260,7 +379,7 @@ async function searchRepository(terms: string[], limit: number, cwd: string | un
     const cover = [...ts].reduce((total, term) => total + (tooCommon.has(term)
       ? commonTermCoverageWeight(termLines?.get(term) ?? 0)
       : 1), 0);
-    const nameTerms = terms.filter((t) => f.toLowerCase().includes(t));
+    const nameTerms = uniqueTerms.filter((t) => f.toLowerCase().includes(t));
     const nameWeight = nameTerms.reduce((total, term) => {
       const matches = pathMatches.get(term) ?? 0;
       // 경로상 유일한 식별자는 강한 +25를 유지하고, 공유 조각은 매칭 경로 수에 반비례해 감쇠한다.
@@ -531,8 +650,12 @@ export async function groundMissionInCodebase(
   goal: string, deps: { cwd?: string; seedPaths?: readonly string[]; searchTerms?: SearchTermFn; skillIndex?: SkillIndexFn; pickSkills?: SkillPickFn; recallMemory?: RecallMemoryFn; recallSelf?: RecallSelfFn; refDigest?: RefDigestFn; persistent?: PersistentGroundingDeps | false } & CapsuleGroundingDeps = {},
 ): Promise<CodebaseGrounding> {
   // 호출자가 준 root를 모든 저장소 채널과 corpus 관측에 공유한다. 미지정 호출은 기존처럼 프로세스 cwd를 쓴다.
+  // ⛔ seam 은 «읽기» 만 하지 않는다 — 시작 자리를 소유자(acquireCwdSeam)에게서 받고 finally 에서 돌려준다.
+  //    겹친 런은 첫 런의 스냅샷을 물려받으므로, 다른 런이 옮겨 놓은 cwd 를 시작 자리로 읽지 않는다.
+  const cwdLease = acquireCwdSeam();
   const cwdSource = deps.cwd === undefined ? 'process' : 'caller';
-  const searchRoot = deps.cwd ?? process.cwd();
+  // 시작 자리를 못 읽었으면(지워진 cwd) 소유하지 않는다 — caller root 는 그대로 쓰고, 미지정이면 예전처럼 process.cwd() 가 판정한다.
+  const searchRoot = deps.cwd ?? cwdLease.root ?? process.cwd();
   const startedAt = performance.now();
   let searchTermsElapsedMs = 0;
   let persistentElapsedMs = 0;
@@ -695,7 +818,13 @@ export async function groundMissionInCodebase(
     debug.log('mission.grounding', 'corpus', { grounded: false, reason: 'error', cwd: searchRoot, cwdSource, error: e instanceof Error ? e.message.slice(0, 200) : String(e).slice(0, 200), persistentEvidence: null, persistentStopReason: null, codeChannel: 'failed' }, { level: 'warn' });
     return { grounded: false, context: '', files: [], persistentEvidence: [], skillFacts: [], codeFacts: [], memoryFacts: [], documentFacts: [], refFacts: [], ptyFacts: [] };
   } finally {
-    observeTiming();
+    // 정상·예외·타임아웃 어느 경로로 끝났든 소유를 돌려준다 — 마지막 holder 가 시작 자리로 되돌린다.
+    //    되돌리기를 관측보다 «먼저» 둔다: 관측이 무엇을 하든 복원이 빠지지 않는다.
+    try {
+      releaseCwdSeam(cwdLease);
+    } finally {
+      observeTiming();
+    }
   }
 }
 

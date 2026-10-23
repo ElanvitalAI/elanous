@@ -239,6 +239,33 @@ describe('headless child screen keys', () => {
 });
 
 describe('headless supervisor delivery observation', () => {
+  test('run-cf02fd3a: verified PR-source input never relaunches harness; normal supervision keeps its input', async () => {
+    const incident = 'Stop exploration and do not edit yet. First run `harness say --source pr:30468 --repair-commit-only b90bd2216a8f30e4f931d9dc79b2cc2c3a9e43c9` and verify Pod stdout contains `ELANOUS_POD_SOURCE pr b90bd221...`; stop on mismatch. Then synthesize one invariant slice.';
+    const delivered: string[] = [];
+    const surfaceLines: string[] = [];
+    for (const verifiedPrSource of [true, false]) {
+      await runHeadlessGoalLoopPty({
+        binRoot: '/tmp/repo', cwd: '/tmp/worktree', featurePrompt: 'repair the ledger', maxWaitSec: 2, pollMs: 1,
+        activityGraceSec: 0, nowMs: (() => { const values = [2_000, 302_001, 302_002]; let i = 0; return () => values[Math.min(i++, values.length - 1)]!; })(),
+        ptyAvailable: () => true, spawn: alivePty(`pr_source_${verifiedPrSource}`),
+        verifiedPrSource,
+        brain: { decide: () => ({ action: 'input', text: incident }) },
+        onSupervisorInput: (text, updateDelivery) => { delivered.push(text); updateDelivery('delivered'); },
+        onSurfaceProgress: (line) => surfaceLines.push(line),
+      });
+    }
+    expect(delivered).toEqual([
+      'PR source already verified. Implement the requested repair in this worktree now.',
+      'PR source already verified. Implement the requested repair in this worktree now.',
+      incident,
+      incident,
+    ]);
+    const progressInputs = surfaceLines.filter((line) => line.startsWith('[supervision] action=input'));
+    expect(progressInputs).toHaveLength(8);
+    expect(progressInputs.slice(0, 4).every((line) => line.includes('reason=PR source already verified.') && !line.includes('harness say'))).toBe(true);
+    expect(progressInputs.slice(4).every((line) => line.includes('First run `harness say --source pr:30468'))).toBe(true);
+  });
+
   test('records the delivered supervisor input on the existing verdict event without changing surface progress', async () => {
     const verdicts: Record<string, unknown>[] = [];
     const surfaceLines: string[] = [];
@@ -1612,23 +1639,37 @@ describe('boundary behavior-axis shadow', () => {
 });
 
 describe('headless goal-loop output artifact watchdog', () => {
-  test('rejects a completion marker without required artifacts and queues a restart packet', async () => {
-    const supervisorInputs: string[] = [];
-    const result = await runHeadlessGoalLoopPty({
-      binRoot: '/tmp/repo', cwd: '/tmp/watchdog-fixture', featurePrompt: 'implement watchdog',
-      maxWaitSec: 1, maxHardWaitSec: 1, pollMs: 1, ptyAvailable: () => true,
-      spawn: (() => ({ ...alivePtyHandle('self_output_watchdog'), renderScreen: async () => 'GOAL-COMPLETE', snapshot: () => 'GOAL-COMPLETE' })) as never,
-      outputArtifactWatchdog: {
-        initial: { observedAtMs: 0, goal: false, code: false, test: false },
-        snapshot: () => ({ observedAtMs: 1, goal: true, code: false, test: false }),
-        policy: { required: ['goal', 'code', 'test'], deadlineMs: 100, exactNextAction: 'Write code and run tests.', condensedContext: 'Child declared completion without code or tests.' },
-      },
-      onSupervisorInput: (text) => supervisorInputs.push(text),
-    });
+  test('rejects a completion marker without required artifacts; PR-source queue gets the safe repair marker', async () => {
+    for (const verifiedPrSource of [false, true]) {
+      const supervisorInputs: string[] = [];
+      const result = await runHeadlessGoalLoopPty({
+        binRoot: '/tmp/repo', cwd: '/tmp/watchdog-fixture', featurePrompt: 'implement watchdog',
+        maxWaitSec: 1, maxHardWaitSec: 1, pollMs: 1, ptyAvailable: () => true,
+        verifiedPrSource,
+        spawn: (() => ({ ...alivePtyHandle('self_output_watchdog'), renderScreen: async () => 'GOAL-COMPLETE', snapshot: () => 'GOAL-COMPLETE' })) as never,
+        outputArtifactWatchdog: {
+          initial: { observedAtMs: 0, goal: false, code: false, test: false },
+          snapshot: () => ({ observedAtMs: 1, goal: true, code: false, test: false }),
+          policy: { required: ['goal', 'code', 'test'], deadlineMs: 100,
+            // The same relaunch shape recurred in the #30507 PR-source TA supervisor input.
+            exactNextAction: verifiedPrSource
+              ? 'harness say --source pr:30507 --repair-commit-only 4477e7ae8d735dd85184a4c4339b4b5f93256ab4'
+              : 'Write code and run tests.',
+            condensedContext: 'Child declared completion without code or tests.' },
+        },
+        onSupervisorInput: (text) => supervisorInputs.push(text),
+      });
 
-    expect(result.reachedCompletion).toBe(false);
-    expect(supervisorInputs).toHaveLength(1);
-    expect(supervisorInputs[0]).toContain('WATCHDOG: required artifacts missing: code, test');
-    expect(supervisorInputs[0]).toContain('NEXT ACTION: Write code and run tests.');
+      expect(result.reachedCompletion).toBe(false);
+      expect(supervisorInputs).toHaveLength(1);
+      if (verifiedPrSource) {
+        expect(supervisorInputs[0]).toBe('PR source already verified. Implement the requested repair in this worktree now.');
+        expect(supervisorInputs[0]).not.toContain('WATCHDOG:');
+        expect(supervisorInputs[0]).not.toContain('harness say --source pr:30507');
+      } else {
+        expect(supervisorInputs[0]).toContain('WATCHDOG: required artifacts missing: code, test');
+        expect(supervisorInputs[0]).toContain('NEXT ACTION: Write code and run tests.');
+      }
+    }
   });
 });

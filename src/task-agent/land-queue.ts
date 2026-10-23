@@ -4,6 +4,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parseReviewResultOutput } from './review-result-capture.js';
+import { executeBoundPrLandRecover, PR_LAND_CARD_ID_ENV } from '../cli/pr-land-recovery.js';
 
 type CommandResult = { status: number; stdout: string; stderr: string };
 export interface QueueLandingInput {
@@ -13,6 +14,8 @@ export interface QueueLandingInput {
 export interface QueueLandingDeps {
   run?: (command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv) => Promise<CommandResult>;
   read?: (path: string) => string;
+  /** LAND-REFUSAL-EXEC — observe a refusal on the recover@1 edge and run that unit once (never an effect). */
+  recover?: typeof executeBoundPrLandRecover;
 }
 
 async function run(command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): Promise<CommandResult> {
@@ -31,14 +34,24 @@ export async function runQueuedLanding(input: QueueLandingInput, deps: QueueLand
   const invoke = deps.run ?? run;
   const read = deps.read ?? ((path: string) => readFileSync(path, 'utf8'));
   const fail = (stage: string, reason: string): CommandResult => ({ status: 1, stdout: '', stderr: `${stage}: ${reason.slice(-500)}` });
+  // LAND-REFUSAL-EXEC — a judged refusal (not an unmeasured prerequisite) is bound to recover@1 with this card
+  // and that unit runs once. The returned refusal is unchanged; recovery observation never replaces it.
+  const refuse = async (stage: string, reason: string): Promise<CommandResult> => {
+    const refused = fail(stage, reason);
+    try { await (deps.recover ?? executeBoundPrLandRecover)({ refusal: refused.stderr, pr: input.pr, head: input.head, cardId: input.card }, { root: dirname(input.statePath) }); }
+    catch { /* fail-soft */ }
+    return refused;
+  };
+  // The card rides along to every child that may land or record this PR (same env as TA defaultLand).
+  const cardEnv = (extra: Record<string, string> = {}): NodeJS.ProcessEnv => ({ ...process.env, ...extra, [PR_LAND_CARD_ID_ENV]: input.card });
   if (!/^[a-f0-9]{40}$/i.test(input.head) || !Number.isSafeInteger(input.pr) || input.pr < 1) return fail('input', 'invalid PR/head');
   if (!isAbsolute(input.command) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(input.remote)) return fail('config', 'land queue command/remote invalid');
   let review: ReturnType<typeof parseReviewResultOutput>;
   try { review = parseReviewResultOutput(read(input.reviewResult)); }
-  catch (error) { return fail('review', String(error)); }
+  catch (error) { return refuse('review', String(error)); }
   if (!review || review.pr !== input.pr || review.head?.toLowerCase() !== input.head.toLowerCase()
     || review.reviewed !== true || !['pass', 'warn'].includes(review.verdict ?? '') || review.mustFix !== 0 || review.error) {
-    return fail('review', `exact head #${input.pr} ${input.head.slice(0, 12)} PASS/WARN mf0 not proven`);
+    return refuse('review', `exact head #${input.pr} ${input.head.slice(0, 12)} PASS/WARN mf0 not proven`);
   }
   const git = async (args: string[]) => invoke(process.execPath, [input.entry, '--config-dir', input.configDir, 'git', ...args], input.cwd);
   const fetched = await git(['fetch', '--quiet', 'origin', 'main']);
@@ -52,15 +65,15 @@ export async function runQueuedLanding(input: QueueLandingInput, deps: QueueLand
   const artifact = join(dirname(input.statePath), 'land-queue-gates', `${safeCard}-${input.pr}-${input.head.slice(0, 12)}-${randomUUID()}`);
   mkdirSync(artifact, { recursive: true });
   const gate = await invoke(process.execPath, [input.entry, '--config-dir', input.configDir,
-    'self', 'gate', '--changed', '--base', baseHead!, '--remote', input.remote, '--shards', '4', '--artifact-dir', artifact], input.cwd);
-  if (gate.status !== 0) return fail('remote-changed-gate', gate.stderr || gate.stdout || `exit ${gate.status}`);
+    'self', 'gate', '--changed', '--base', baseHead!, '--remote', input.remote, '--shards', '4', '--artifact-dir', artifact], input.cwd, cardEnv());
+  if (gate.status !== 0) return refuse('remote-changed-gate', gate.stderr || gate.stdout || `exit ${gate.status}`);
   let summary: Record<string, unknown>;
   try { summary = JSON.parse(read(join(artifact, 'summary.json'))) as Record<string, unknown>; }
   catch (error) { return fail('remote-changed-gate', `summary unreadable: ${String(error)}`); }
   if (summary.head40 !== input.head || summary.base40 !== baseHead || summary.remoteHost !== input.remote
     || summary.verdict !== 'passed' || summary.exitCode !== 0 || summary.introduced !== 0
     || summary.unknown !== 0 || summary.preconditionUnmet !== 0) {
-    return fail('remote-changed-gate', 'summary does not prove this head/base/remote passed with zero unknown');
+    return refuse('remote-changed-gate', 'summary does not prove this head/base/remote passed with zero unknown');
   }
   const fresh = await invoke('gh', ['pr', 'view', String(input.pr), '--json', 'headRefOid,state,isDraft'], input.cwd);
   let latest: { headRefOid?: unknown; state?: unknown; isDraft?: unknown };
@@ -68,12 +81,12 @@ export async function runQueuedLanding(input: QueueLandingInput, deps: QueueLand
   catch { return fail('pr-head', `current PR state unreadable: ${fresh.stderr || fresh.stdout || fresh.status}`); }
   if (fresh.status !== 0 || latest.state !== 'OPEN' || latest.isDraft !== false
     || typeof latest.headRefOid !== 'string' || latest.headRefOid.toLowerCase() !== input.head.toLowerCase()) {
-    return fail('pr-head', `PR #${input.pr} changed after gate or is not ready`);
+    return refuse('pr-head', `PR #${input.pr} changed after gate or is not ready`);
   }
   const enrolled = await invoke(input.command, [String(input.pr), input.cwd, '--review', input.reviewResult, '--expected-head', input.head], input.cwd,
-    { ...process.env, LAND_RR_DIR: dirname(input.reviewResult) });
+    cardEnv({ LAND_RR_DIR: dirname(input.reviewResult) }));
   if (enrolled.status !== 0 || !new RegExp(`^OK #${input.pr} head=${input.head.slice(0, 12)}(?:\\s|$)`, 'm').test(enrolled.stdout)) {
-    return fail('land-enqueue-refused', enrolled.stdout || enrolled.stderr || `exit ${enrolled.status}`);
+    return refuse('land-enqueue-refused', enrolled.stdout || enrolled.stderr || `exit ${enrolled.status}`);
   }
   return { status: 0, stdout: `queued #${input.pr} head ${input.head.slice(0, 12)} gate ${artifact} · ${enrolled.stdout.slice(-250)}`, stderr: '' };
 }

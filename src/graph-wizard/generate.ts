@@ -16,11 +16,13 @@ import { debug } from '../debug/log.js';
 import { listNodeKinds, type GraphKind } from '../graph-kinds/registry.js';
 import { validateGraphYaml } from '../nexus/api/graph-kinds.js';
 import { defaultGraphsDir } from '../self-implement/graph-templates.js';
+import { createGraphVariant, type GraphVariantPlan, type GraphVariantResult } from '../self-implement/graph-variant.js';
+import type { GraphTemplateSpec } from '../self-implement/graph-yaml.js';
 import { WORKFLOW_SYNTH_SYSTEM_PROMPT } from '../workflow-synth/system-prompt.js';
 import { WIZARD_ARCHETYPES } from './archetypes.js';
 import { listInstalledPacks, queryInstalledPack } from '../knowledge/query.js';
 import { parsePackIdString } from '../knowledge/kgs/pack.js';
-import { WIZARD_MAX_RETRIES, WIZARD_STEPS, WIZARD_STEP_IDS, recipesYamlFor, type WizardNodeStep } from './steps.js';
+import { WIZARD_MAX_RETRIES, WIZARD_STEPS, WIZARD_STEP_IDS, recipesSiblingOf, recipesYamlFor, type WizardNodeStep } from './steps.js';
 
 export interface GraphWizardTurn { role: 'user' | 'assistant'; text: string }
 
@@ -71,6 +73,104 @@ export interface GraphWizardDeps {
 
 export const GRAPH_WIZARD_MAX_ATTEMPTS = 3;
 
+export interface KnownGraphUnit {
+  readonly id: string;
+  readonly call: string;
+  readonly inputs: readonly string[];
+  readonly outputs: readonly string[];
+  readonly exits: readonly string[];
+}
+
+/** Use the same validated template inventory as the wizard; only templates declaring a unit are candidates. */
+export function listKnownGraphUnits(dir = defaultGraphsDir()): KnownGraphUnit[] {
+  return listWizardTemplates(dir).flatMap((template) => {
+    let raw: { version?: unknown; unit?: { inputs?: unknown; outputs?: unknown; exits?: unknown } };
+    try { raw = parseYaml(template.text) as typeof raw; } catch { return []; }
+    if (!raw?.unit || !Number.isSafeInteger(raw.version)) return [];
+    const { inputs, outputs, exits } = raw.unit;
+    if (![inputs, outputs, exits].every((value) => Array.isArray(value) && value.every((item) => typeof item === 'string'))) return [];
+    return [{ id: template.id, call: `${template.id}@${raw.version}`, inputs: inputs as string[], outputs: outputs as string[], exits: exits as string[] }];
+  }).sort((a, b) => a.call.localeCompare(b.call));
+}
+
+export type GraphVariantDesignResult =
+  | { readonly status: 'composed'; readonly plan: GraphVariantPlan; readonly variant: Extract<GraphVariantResult, { ok: true }> }
+  | { readonly status: 'fallback-standard'; readonly template: GraphTemplateSpec; readonly reason: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** One L2 designer proposal. The model returns only a plan; the existing variant authority decides whether it may run. */
+export async function designGraphVariantPlan(input: {
+  readonly goal: string;
+  readonly prompt: string;
+  readonly template: GraphTemplateSpec;
+  readonly knownUnits?: readonly KnownGraphUnit[];
+}, deps: Pick<GraphWizardDeps, 'callLLM' | 'graphsDir'> = {}): Promise<GraphVariantDesignResult> {
+  const units = input.knownUnits ?? listKnownGraphUnits(deps.graphsDir);
+  const unitCalls = new Set(units.map((unit) => unit.call));
+  const lines = [
+    '알려진 그래프 유닛(새 노드를 짓기 전에 먼저 찾는다):',
+    ...units.map((unit) => `- ${unit.call} · inputs=${unit.inputs.join(',')} · outputs=${unit.outputs.join(',')} · exits=${unit.exits.join(',')}`),
+    '', '너는 발사 시점 L2 그래프 설계자다. 전체 YAML 대신 GraphVariantPlan JSON 객체 하나만 출력하라. 설명·코드 펜스·추가 키 금지.',
+    '허용 키: maxVisits(기존 nodeId→양의 정수), routes([{from,outcome,to}] 기존 조건 간선), growth({node,from,outcome,returnTo}) 한 개.',
+    '유닛 추가가 필요하면 growth.node는 kind=subgraph, call=<위 목록의 id@version>, recipe=none, maxVisits=1로 제안하라.',
+    'growth.node.contract는 선택한 유닛의 inputs와 outputs를 위 목록에서 순서까지 그대로 복사하고 tools="read-only"로 쓴다. 빈 배열로 바꾸거나 이름을 지어내지 마라.',
+    'growth는 기존 from 노드의 비어 있는 outcome에서만 가능하며 returnTo는 기존 노드여야 한다. 삭제·무조건 간선 변경·전체 그래프 생성은 불가하다.',
+    `골: ${input.goal}`, `요청: ${input.prompt}`, `기반: ${input.template.graphId}@${input.template.version}`,
+    `기존 노드: ${input.template.nodes.map((node) => `${node.nodeId}(${node.kind},maxVisits=${node.maxVisits})`).join(', ')}`,
+    `기존 간선: ${input.template.edges.map((edge) => `${edge.from}:${edge.on ?? 'direct'}→${edge.to ?? JSON.stringify(edge.map ?? {})}`).join(', ')}`,
+  ];
+  let raw: unknown;
+  try { raw = JSON.parse((await (deps.callLLM ?? defaultCallLLM)(lines.join('\n'))).trim()); }
+  catch (error) {
+    const reason = `designer-output: ${error instanceof Error ? error.message : String(error)}`;
+    debug.log('graph.compose', 'fallback-standard', { goal: input.goal, reason });
+    return { status: 'fallback-standard', template: input.template, reason };
+  }
+  const record = isRecord(raw) ? raw : null;
+  const allowed = new Set(['maxVisits', 'routes', 'growth']);
+  const maxVisits = record?.maxVisits;
+  const routes = record?.routes;
+  const growth = record?.growth;
+  const growthRecord = isRecord(growth) ? growth : null;
+  const growthNode = isRecord(growthRecord?.node) ? growthRecord.node : null;
+  const growthContract = isRecord(growthNode?.contract) ? growthNode.contract : null;
+  const selectedUnit = typeof growthNode?.call === 'string' ? units.find((unit) => unit.call === growthNode.call) : undefined;
+  const valid = record !== null && Object.keys(record).every((key) => allowed.has(key)) &&
+    (maxVisits === undefined || (maxVisits !== null && typeof maxVisits === 'object' && !Array.isArray(maxVisits) &&
+      Object.values(maxVisits).every((value) => Number.isSafeInteger(value) && (value as number) > 0))) &&
+    (routes === undefined || (Array.isArray(routes) && routes.every((route) => route !== null && typeof route === 'object' &&
+      !Array.isArray(route) && Object.keys(route).sort().join(',') === 'from,outcome,to' &&
+      [route.from, route.outcome, route.to].every((value) => typeof value === 'string')))) &&
+    (growth === undefined || (growthRecord !== null &&
+      Object.keys(growthRecord).sort().join(',') === 'from,node,outcome,returnTo' &&
+      typeof growthRecord.from === 'string' && typeof growthRecord.outcome === 'string' && typeof growthRecord.returnTo === 'string' &&
+      growthNode !== null && Object.keys(growthNode).sort().join(',') === 'call,contract,kind,maxVisits,nodeId,recipe' &&
+      typeof growthNode.nodeId === 'string' && growthNode.kind === 'subgraph' && growthNode.recipe === 'none' &&
+      growthNode.maxVisits === 1 && typeof growthNode.call === 'string' && unitCalls.has(growthNode.call) && selectedUnit !== undefined &&
+      growthContract !== null && growthContract.tools === 'read-only' &&
+      Array.isArray(growthContract.inputs) && growthContract.inputs.every((value) => typeof value === 'string') &&
+      Array.isArray(growthContract.outputs) && growthContract.outputs.every((value) => typeof value === 'string') &&
+      JSON.stringify(growthContract.inputs) === JSON.stringify(selectedUnit.inputs) &&
+      JSON.stringify(growthContract.outputs) === JSON.stringify(selectedUnit.outputs)));
+  if (!valid) {
+    const reason = 'designer-output: invalid GraphVariantPlan or unknown unit';
+    debug.log('graph.compose', 'fallback-standard', { goal: input.goal, reason });
+    return { status: 'fallback-standard', template: input.template, reason };
+  }
+  const plan = record as GraphVariantPlan;
+  const variant = createGraphVariant({ template: input.template, goal: input.goal, plan });
+  if (!variant.ok) {
+    const reason = `variant-rejected: ${JSON.stringify(variant.rejections)}`;
+    debug.log('graph.compose', 'fallback-standard', { goal: input.goal, reason });
+    return { status: 'fallback-standard', template: input.template, reason };
+  }
+  debug.log('graph.compose', 'composed', { goal: input.goal, overlayId: variant.overlay.overlayId, patches: variant.patches.length });
+  return { status: 'composed', plan, variant };
+}
+
 /** Inventory used by the editor's pack picker and the wizard's validation. */
 export function wizardInstalledPacks(deps: GraphWizardDeps = {}): Array<{ id: string; title: string }> {
   return (deps.packs ?? listInstalledPacks)();
@@ -80,7 +180,7 @@ export function wizardInstalledPacks(deps: GraphWizardDeps = {}): Array<{ id: st
 export class GraphWizardInputError extends Error { override name = 'GraphWizardInputError'; }
 const GRAPH_ID = /^[a-z0-9-]+$/;
 
-interface TemplateEntry { id: string; description: string; text: string; runnable: boolean; keywords?: string[] }
+interface TemplateEntry { id: string; description: string; text: string; runnable: boolean; keywords?: string[]; recipes?: string }
 
 function walkYaml(dir: string, depth = 0): string[] {
   if (depth > 3 || !existsSync(dir)) return [];
@@ -123,7 +223,8 @@ export function listWizardTemplates(dir = defaultGraphsDir()): TemplateEntry[] {
     const description = [loop.title, loop.description].filter((v): v is string => typeof v === 'string').join(' — ') || raw.graph_id;
     const terminals = Array.isArray(raw.terminal_nodes) ? raw.terminal_nodes : [];
     seen.add(raw.graph_id);
-    out.push({ id: raw.graph_id, description: description.slice(0, 160), text, runnable: terminals.every((t) => t === 'done' || t === 'failed') });
+    const recipes = recipesSiblingOf(file);
+    out.push({ id: raw.graph_id, description: description.slice(0, 160), text, runnable: terminals.every((t) => t === 'done' || t === 'failed'), ...(recipes ? { recipes } : {}) });
   }
   return out;
 }
@@ -521,7 +622,10 @@ function buildPrompt(input: {
   ];
   if (kind === 'harness' && !editing) {
     lines.push('', '기존 템플릿 목록(id — 설명):', ...templates.filter((t) => t.runnable).slice(0, 30).map((t) => `- ${t.id} — ${t.description}`));
-    if (base) lines.push('', `가장 가까운 템플릿(${base.id}) — 구조를 참고하라:`, '```yaml', base.text.trim(), '```');
+    if (base) {
+      lines.push('', `가장 가까운 템플릿(${base.id}) — 구조를 참고하라:`, '```yaml', base.text.trim(), '```');
+      if (base.recipes) lines.push('', `같은 템플릿의 recipes.yaml — 같은 단계의 명령·타임아웃·승인 문구를 그대로 재사용하라:`, '```yaml', base.recipes.trim(), '```');
+    }
   }
   if (req.history?.length) {
     lines.push('', '지금까지의 대화:', ...req.history.slice(-10).map((t) => `${t.role === 'user' ? '사용자' : '마법사'}: ${t.text.slice(0, 500)}`));

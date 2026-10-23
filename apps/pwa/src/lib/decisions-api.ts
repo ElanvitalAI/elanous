@@ -16,6 +16,22 @@ export async function replyToBoardNotice(client: Pick<DaemonClient, 'fetchRespon
   return (await response.json() as { reply: BoardNotice }).reply;
 }
 
+export type DecisionHistoryEvent = {
+  type: 'raised' | 'options-added' | 'decided' | 'withdrawn';
+  at?: string;
+  by: string;
+  choice?: string;
+  reason?: string;
+};
+
+export type DecisionPrecedent = {
+  id: string;
+  title: string;
+  choice: string;
+  decidedAt?: string;
+  decidedBy?: 'human' | 'auto';
+};
+
 export interface OpenDecision {
   id: string;
   title: string;
@@ -33,6 +49,8 @@ export interface OpenDecision {
   crossCheck?: Array<{ seat: string; at: string; note: string }>;
   crossCheckSkipped?: string;
   pendingQuestion?: string;
+  history?: DecisionHistoryEvent[];
+  precedent?: DecisionPrecedent | null;
 }
 
 export async function listOpenDecisions(client: Pick<DaemonClient, 'fetchResponse'>): Promise<OpenDecision[]> {

@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensurePrLandHeavyRemote } from './pr-land-heavy-remote.js';
+import { ensurePrLandHeavyRemote, PR_LAND_HEAVY_HOSTS } from './pr-land-heavy-remote.js';
 import { GATE_REMOTE_DEFAULTS, type RemoteRunOptions } from '../self-implement/gate-remote.js';
 import { runBunShard } from '../self-dev/shard-run.js';
 import { runSelfGateCli } from '../self-implement/gate-cli.js';
@@ -10,6 +10,7 @@ import { runSelfGateCli } from '../self-implement/gate-cli.js';
 const HEAD = 'a'.repeat(40);
 const MAIN = 'b'.repeat(40);
 const NEXT_MAIN = 'c'.repeat(40);
+const extraPass = Buffer.from('[pr-land-extra-gates] pass global=measured interference=measured files=2\n');
 
 test('a remote pass is reused only for the same PR head and main tip', () => {
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
@@ -47,8 +48,8 @@ test('unreachable host and failed gate refuse without a local fallback or reusab
     expect(ensurePrLandHeavyRemote(input, { settings: GATE_REMOTE_DEFAULTS, observe: () => {}, runRemote: () => ({
       kind: 'ran', rc: 1, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), commit: HEAD, host: 'node-b', ms: 2,
     }) })).toMatchObject({ ok: false, source: 'unmeasured', reason: expect.stringContaining('gate-rc-1 · remote-log:') });
-    expect(ensurePrLandHeavyRemote(input, { settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' } }))
-      .toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-mismatch (host-e-wsl)' });
+    expect(ensurePrLandHeavyRemote(input, { settings: { ...GATE_REMOTE_DEFAULTS, host: 'unknown-host' } }))
+      .toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-mismatch (unknown-host)' });
     expect(ensurePrLandHeavyRemote(input, {
       settings: GATE_REMOTE_DEFAULTS, observe: () => {},
       runRemote: () => ({ kind: 'ran', rc: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), commit: HEAD, host: 'node-c', ms: 2 }),
@@ -388,10 +389,10 @@ test('a valid matching cache does not bypass a configured host outside the allow
   let remoteCalls = 0;
   try {
     expect(ensurePrLandHeavyRemote(input, {
-      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' },
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'unknown-host' },
       observe: () => {},
       runRemote: () => { remoteCalls += 1; return { kind: 'infra', reason: 'should-not-run' }; },
-    })).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-mismatch (host-e-wsl)', elapsedMs: 0 });
+    })).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-mismatch (unknown-host)', elapsedMs: 0 });
     expect(remoteCalls).toBe(0);
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
@@ -404,10 +405,10 @@ test('a successful remote run outside the allowlist is not pass evidence', () =>
     const result = ensurePrLandHeavyRemote(input, {
       settings: GATE_REMOTE_DEFAULTS,
       observe: (_event, data) => { events.push(data); },
-      runRemote: () => ({ kind: 'ran', rc: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), commit: HEAD, host: 'host-e-wsl', ms: 4 }),
+      runRemote: () => ({ kind: 'ran', rc: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), commit: HEAD, host: 'unknown-host', ms: 4 }),
     });
-    expect(result).toMatchObject({ ok: false, source: 'unmeasured', reason: expect.stringContaining('gate-host-mismatch (host-e-wsl) · remote-log:'), host: 'host-e-wsl', attemptedHost: 'node-b' });
-    expect(events[0]).toMatchObject({ host: 'host-e-wsl', attemptedHost: 'node-b' });
+    expect(result).toMatchObject({ ok: false, source: 'unmeasured', reason: expect.stringContaining('gate-host-mismatch (unknown-host) · remote-log:'), host: 'unknown-host', attemptedHost: 'node-b' });
+    expect(events[0]).toMatchObject({ host: 'unknown-host', attemptedHost: 'node-b' });
     expect(existsSync(join(evidenceDir, '51.json'))).toBe(false);
     expect(ensurePrLandHeavyRemote(input, {
       settings: GATE_REMOTE_DEFAULTS,
@@ -434,11 +435,56 @@ test('schema 2 success without new extra-gate status cannot skip remote gates', 
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
 
-test('an old WSL pass is never reusable landing evidence', () => {
+test('the WSL host is allowlisted third and its run is reusable landing evidence', () => {
+  expect(PR_LAND_HEAVY_HOSTS).toEqual(['node-b', 'node-c', 'host-e-wsl']);
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
   const input = { pr: 54, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
-  writeFileSync(join(evidenceDir, '54.json'), `${JSON.stringify({
-    schema: 2, pr: 54, head: HEAD, main: MAIN, host: 'host-e-wsl', passedAt: '2026-10-14T00:00:00.000Z',
+  const hosts: string[] = [];
+  const events: Record<string, unknown>[] = [];
+  try {
+    const result = ensurePrLandHeavyRemote(input, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' }, observe: (_event, data) => { events.push(data); },
+      runRemote: (options: RemoteRunOptions) => {
+        hosts.push(options.host);
+        return { kind: 'ran', rc: 0, stdout: extraPass, stderr: Buffer.alloc(0), commit: HEAD, host: options.host, ms: 7 };
+      },
+    });
+    expect(result).toMatchObject({ ok: true, source: 'remote', host: 'host-e-wsl' });
+    expect(hosts).toEqual(['host-e-wsl']);
+    expect(events[0]).toMatchObject({ host: 'host-e-wsl', attemptedHost: 'host-e-wsl', outcome: 'pass' });
+    expect(JSON.parse(readFileSync(join(evidenceDir, '54.json'), 'utf8')))
+      .toMatchObject({ schema: 2, host: 'host-e-wsl', head: HEAD, main: MAIN, interferenceMeasured: true });
+    expect(ensurePrLandHeavyRemote(input, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' }, observe: () => {},
+      runRemote: () => { throw new Error('cached WSL pass must be reused, not re-run'); },
+    })).toMatchObject({ ok: true, source: 'cached', host: 'host-e-wsl' });
+  } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
+
+test('a busy WSL primary falls back to the stable hosts in allowlist order', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
+  const input = { pr: 55, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
+  const hosts: string[] = [];
+  try {
+    const result = ensurePrLandHeavyRemote(input, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' }, observe: () => {},
+      runRemote: (options: RemoteRunOptions) => {
+        hosts.push(options.host);
+        return options.host === 'node-b'
+          ? { kind: 'ran' as const, rc: 0, stdout: extraPass, stderr: Buffer.alloc(0), commit: HEAD, host: 'node-b', ms: 5 }
+          : { kind: 'busy' as const };
+      },
+    });
+    expect(result).toMatchObject({ ok: true, source: 'remote', host: 'node-b' });
+    expect(hosts).toEqual(['host-e-wsl', 'node-b']);
+  } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
+
+test('cached evidence from a host outside the allowlist is not reusable', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
+  const input = { pr: 56, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
+  writeFileSync(join(evidenceDir, '56.json'), `${JSON.stringify({
+    schema: 2, pr: 56, head: HEAD, main: MAIN, host: 'unknown-host', passedAt: '2026-10-14T00:00:00.000Z',
     elapsedMs: 12, rootPlan: null, interferenceMeasured: true,
   })}\n`);
   try {
@@ -446,6 +492,7 @@ test('an old WSL pass is never reusable landing evidence', () => {
       settings: GATE_REMOTE_DEFAULTS, observe: () => {},
       runRemote: () => ({ kind: 'infra', reason: 'fresh-remote-required' }),
     })).toMatchObject({ ok: false, source: 'unmeasured', reason: 'fresh-remote-required' });
+    expect(JSON.parse(readFileSync(join(evidenceDir, '56.json'), 'utf8'))).toMatchObject({ host: 'unknown-host' });
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
 
@@ -502,7 +549,7 @@ test('busy node-b selects node-c and caches only its exact head/main evidence', 
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
 
-test('both hosts busy block landing and a failed gate never tries the second host', () => {
+test('all three allowlisted hosts busy block landing and a failed gate never tries the next host', () => {
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
   const input = { pr: 53, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
   const busyHosts: string[] = [];
@@ -512,10 +559,10 @@ test('both hosts busy block landing and a failed gate never tries the second hos
       settings: { ...GATE_REMOTE_DEFAULTS, slotWaitSeconds: 0 }, observe: (_event, data) => { busyEvents.push(data); },
       runRemote: (options: RemoteRunOptions) => { busyHosts.push(options.host); return { kind: 'busy' }; },
     });
-    expect(busy).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-busy', attemptedHost: 'node-c' });
+    expect(busy).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-busy', attemptedHost: 'host-e-wsl' });
     expect(busy.host).toBeUndefined();
-    expect(busyEvents[0]).toMatchObject({ host: null, attemptedHost: 'node-c' });
-    expect(busyHosts).toEqual(['node-b', 'node-c']);
+    expect(busyEvents[0]).toMatchObject({ host: null, attemptedHost: 'host-e-wsl' });
+    expect(busyHosts).toEqual(['node-b', 'node-c', 'host-e-wsl']);
     expect(existsSync(join(evidenceDir, '53.json'))).toBe(false);
     const failedHosts: string[] = [];
     expect(ensurePrLandHeavyRemote(input, {
@@ -528,8 +575,6 @@ test('both hosts busy block landing and a failed gate never tries the second hos
     expect(failedHosts).toEqual(['node-b']);
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
-
-const extraPass = Buffer.from('[pr-land-extra-gates] pass global=measured interference=measured files=2\n');
 
 test('busy hosts wait slotWaitSeconds then retry before gate-host-busy', () => {
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
@@ -545,9 +590,9 @@ test('busy hosts wait slotWaitSeconds then retry before gate-host-busy', () => {
       sleep: (ms) => { clock += ms; },
       runRemote: (options: RemoteRunOptions) => { hosts.push(options.host); return { kind: 'busy' }; },
     });
-    expect(result).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-busy', attemptedHost: 'node-c' });
+    expect(result).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-busy', attemptedHost: 'host-e-wsl' });
     // Rounds at t=0 and t=15s; the wait to t=30s hits the deadline, so no third round (same cadence as self gate).
-    expect(hosts).toEqual(['node-b', 'node-c', 'node-b', 'node-c']);
+    expect(hosts).toEqual(['node-b', 'node-c', 'host-e-wsl', 'node-b', 'node-c', 'host-e-wsl']);
     expect(clock).toBe(30_000);
     expect(existsSync(join(evidenceDir, '70.json'))).toBe(false);
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
@@ -566,12 +611,13 @@ test('a busy host that frees within slotWaitSeconds is used for landing', () => 
       sleep: (ms) => { clock += ms; },
       runRemote: (options: RemoteRunOptions) => {
         hosts.push(options.host);
-        if (hosts.length < 3) return { kind: 'busy' as const };
+        if (hosts.length <= 3) return { kind: 'busy' as const };
         return { kind: 'ran' as const, rc: 0, stdout: extraPass, stderr: Buffer.alloc(0), commit: HEAD, host: options.host, ms: 8 };
       },
     });
     expect(result).toMatchObject({ ok: true, source: 'remote', host: 'node-b' });
-    expect(hosts).toEqual(['node-b', 'node-c', 'node-b']);
+    expect(hosts).toEqual(['node-b', 'node-c', 'host-e-wsl', 'node-b']);
+    expect(JSON.parse(readFileSync(join(evidenceDir, '71.json'), 'utf8'))).toMatchObject({ host: 'node-b' });
     expect(clock).toBe(15_000);
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
@@ -589,13 +635,13 @@ test('a slot that frees exactly at the deadline is not used', () => {
       sleep: (ms) => { clock += ms; },
       runRemote: (options: RemoteRunOptions) => {
         hosts.push(options.host);
-        return hosts.length < 5
+        return hosts.length < 7
           ? { kind: 'busy' as const }
           : { kind: 'ran' as const, rc: 0, stdout: extraPass, stderr: Buffer.alloc(0), commit: HEAD, host: options.host, ms: 8 };
       },
     });
     expect(result).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-busy' });
-    expect(hosts).toEqual(['node-b', 'node-c', 'node-b', 'node-c']);
+    expect(hosts).toEqual(['node-b', 'node-c', 'host-e-wsl', 'node-b', 'node-c', 'host-e-wsl']);
     expect(clock).toBe(20_000);
     expect(existsSync(join(evidenceDir, '72.json'))).toBe(false);
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }

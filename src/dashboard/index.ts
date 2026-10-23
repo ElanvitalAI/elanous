@@ -328,6 +328,7 @@ import { composeDashboardKeyHandlers, dispatchDashboardKey } from './input/key-d
 import { runDashboardChatMainEntry } from './input/chat-main-entry-runtime.js';
 import { createMirrorDrawThrottle } from './mirror-draw-throttle.js';
 import { runDashboardChatMainPlainTurn } from './input/chat-main-plain-turn-runtime.js';
+import { createDashboardTurnAutoheal } from './input/turn-autoheal.js';
 import {
   createDashboardChatMainTurnSubmit,
   runDashboardChatMainSubmitIntent,
@@ -451,7 +452,7 @@ import { FoldStack } from '../fold-stack.js';
 import { getSkillIndex, reloadSkillIndex, applySkillFilter, skillIndexProblems } from '../skills/index.js';
 import { skillRepairNotice } from '../skills/repair.js';
 import type { DetectResult } from '../skills/router.js';
-import { detectUrlRoute } from '../skills/url-router.js';
+import { detectUrlRoute, extractUrls, workContextGuardReason } from '../skills/url-router.js';
 import {
   observeDevRequestRouteFailSoft,
   type DevRequestRoutingConfig,
@@ -539,6 +540,54 @@ export function settleEscAbortPendingLines(lines: string[], fromIndex: number): 
       index += 1;
     }
   }
+}
+
+export interface EscAbortPendingSoftStopDeps {
+  /** Live foreground harness space for this turn — null when unidentified or multiple runs. */
+  getActiveHarnessSpace: () => string | null;
+  /** Push a line into the chat transcript. */
+  pushChatLine: (line: string) => void;
+  /** Self-implement hint line; returns true when it consumed the event. */
+  showHarnessEscHint: (targets: readonly string[]) => boolean;
+}
+
+export type EscAbortPendingSoftStopOutcome = 'stopped' | 'failed' | 'hint' | 'waiting';
+
+export interface EscAbortPendingSoftStopResult {
+  outcome: EscAbortPendingSoftStopOutcome;
+  /** Harness space that received the durable stop marker, when any. */
+  stoppedHarnessSpace: string | null;
+}
+
+/**
+ * ⭐ TUI-ESC-EXIT production seam — the ESC soft-stop callback that
+ * `attachChatStreamingKeys` wires into `createEscAbortGate`'s
+ * `onAbortPending`, extracted as a directly callable export so the incident
+ * test (test/esc-harness-stop.test.ts) exercises the same function the
+ * dashboard executes. Identified foreground harness space → enqueue the real
+ * durable soft-stop marker (`enqueueSoftStop`) and verify it
+ * (`readSoftStopRequestStatus`), pushing the Korean stopped/failure line;
+ * unidentified/multiple-run falls back to the self-implement hint, else the
+ * caller paints the waiting line (`waiting`).
+ */
+export function runEscAbortPendingSoftStop(
+  targets: readonly string[],
+  deps: EscAbortPendingSoftStopDeps,
+): EscAbortPendingSoftStopResult {
+  const spaceId = deps.getActiveHarnessSpace();
+  if (spaceId) {
+    try {
+      enqueueSoftStop(spaceId);
+      if (readSoftStopRequestStatus(spaceId).status !== 'present') throw new Error('soft-stop marker not persisted');
+      deps.pushChatLine('  ⏹ 멈췄다 — 해당 하니스 런에 중단 요청을 보냈습니다.');
+      return { outcome: 'stopped', stoppedHarnessSpace: spaceId };
+    } catch {
+      deps.pushChatLine('  ⚠ 하니스 런 중단 요청을 보내지 못했습니다. /harness runs 에서 확인해 주세요.');
+      return { outcome: 'failed', stoppedHarnessSpace: null };
+    }
+  }
+  if (deps.showHarnessEscHint(targets)) return { outcome: 'hint', stoppedHarnessSpace: null };
+  return { outcome: 'waiting', stoppedHarnessSpace: null };
 }
 
 export type DashboardToolDispatchSignalSource = 'parent-turn' | 'fallback';
@@ -646,7 +695,7 @@ import { getModelFamily, getModelTier } from '../models/prompts.js';
 import { buildPromptInjection, getPromptBankStore } from '../prompt-bank/index.js';
 import { getInputHistoryStore } from '../input-history.js';
 import { inspectActiveProvider } from '../provider-summary.js';
-import { createStatusProviderInfoReader } from '../status/status-provider-info.js';
+import { createStatusProviderInfoReader, statusModelActual } from '../status/status-provider-info.js';
 import { activeCodexAccountView } from '../oauth/codex-account-store.js';
 import { buildDashboardStatusLines, readDashboardSeatsNow, type DashboardStatusLinesInput } from './dashboard-status-lines.js';
 import { buildFirstScreenBand, resolveTuiDaemonLink, type TuiDaemonLink } from './first-screen-band.js';
@@ -1039,7 +1088,9 @@ import { createQuitConfirmationState, gracefulQuit, type QuitConfirmationState }
 import { consumeTurnEndInterrupted, handoffTurnTypeaheadAtTurnEnd, releaseTurnTypeaheadPending, runTurnTypeaheadPushNow, steerLastTurnTypeaheadSubmission } from './input/turn-steer-bridge.js';
 import { abortTurnOnly } from '../turn-abort-scope.js';
 import { consumeInternalTurnYield, createInternalTurnGate, formatInternalTurnBanner, resolveInternalTurnSubmitIntent, type InternalTurnRequest } from './input/internal-turn.js';
+import { createClassicInterimFold } from './input/goal-interim.js';
 import { createSeatAutowake } from './input/seat-autowake.js';
+import { createGoalContinue } from './input/goal-continue.js';
 import { createDashboardWakeupScheduler, registerScheduleWakeupHostTool } from '../skills/tools/schedule-wakeup.js';
 import { createAttachmentRowMap } from '../log-pane/attachment-row-map.js';
 import { createAttachmentPopup, type AttachmentPopupAction } from '../log-pane/attachment-popup.js';
@@ -1067,7 +1118,7 @@ import {
   AGENT_ACTIVITY_SEGMENT_KEY,
   PULSE_HALF_PERIOD_MS,
 } from '../agent-activity-hud.js';
-import { DASHBOARD_CLARIFICATION_REQUEST, consumeStreamingTopModalEscape, createEscAbortGate, createHarnessEscHint, routeStreamingEscapeKey } from '../esc-abort-gate.js';
+import { DASHBOARD_CLARIFICATION_REQUEST, consumeStreamingTopModalEscape, createEscAbortGate, createEscAbortPendingGate, createHarnessEscHint, routeStreamingEscapeKey } from '../esc-abort-gate.js';
 import { enqueueSoftStop, readSoftStopRequestStatus } from '../harness/control-inbox.js';
 import { setSelfImplementSoftStopSpaceObserver } from '../self-implement/self-implement-runtime.js';
 import { createViEditor, type ViEditorHandle } from '../vi-editor.js';
@@ -1161,13 +1212,32 @@ import { agentBatchScratchTitle, renderAgentBatchScratch } from '../display/agen
 import { type ExecutionSurfaceHandle } from '../display/index.js';
 import { AgentSurfaceStore, renderAgentDetail, renderAgentRoster, type AgentSurfaceState } from '../display/agent-surface.js';
 import { globalAgentFlash } from '../display/agent-flash.js';
-import { globalTaskNotificationQueue } from '../agent/task-notification.js';
+import { globalTaskNotificationQueue, type TaskNotificationQueue, type PendingTaskNotification } from '../agent/task-notification.js';
 import { createDashboardAgentWakeNotify, installAgentWake, wrapAgentWakePort } from './input/agent-wake.js';
 import { renderDebugEventDetail, renderDebugEventRows, renderDebugStack, renderPromptInjectionDebug } from '../display/debug-surface.js';
 import { buildDebugCallStack } from '../debug/call-stack.js';
 import { buildAstGrepHostTool } from '../skills/tools/ast-grep.js';
 import { buildLspHostTool } from '../skills/tools/lsp/index.js';
 import { PluginHost } from '../plugins/core/host.js';
+
+/** Keep wake notifications immediate; display completed results only when a turn drains them. */
+export function subscribeDashboardAgentResults(
+  queue: TaskNotificationQueue,
+  listener: (notification: PendingTaskNotification) => void,
+  pushHistoryLine: (line: string) => void,
+): () => void {
+  const offWake = queue.onEnqueue(listener);
+  const offDrain = queue.onDrain((items) => {
+    for (const notification of items) {
+      if (notification.resultPath) {
+        pushHistoryLine(`  Agent result · full result: ${notification.resultPath} · summary: ${notification.output}`);
+      } else if (notification.preservationError) {
+        pushHistoryLine(`  Agent result preservation failed: ${notification.preservationError} · ${notification.output}`);
+      }
+    }
+  });
+  return () => { offWake(); offDrain(); };
+}
 
 /** Register the same L2 host tools used by the live TUI before each turn's catalog is assembled. */
 export function registerDashboardCoreHostTools(host: Pick<PluginHost, 'registerHostTool'>): void {
@@ -1403,6 +1473,10 @@ const isPluginBusy = (host: { active(): { plugin: { isBusy?: (s: any) => boolean
 // ── Main dashboard ──
 
 export interface ShowDashboardOptions {
+  /** Internal startup timing signal for the completed synchronous setup: persona load,
+   *  input-core bootstrap, plugin discovery and the widget host. This is the pre-frame block
+   *  that `onFirstFrameRendered` used to hide behind one number. Elapsed ms since entry. */
+  onSyncSetupComplete?: (elapsedMs: number) => void;
   /** Internal startup timing signal for the first successfully flushed dashboard frame. */
   onFirstFrameRendered?: () => void;
   /** Force debug sinks on at launch (file + mirror). Equivalent to
@@ -1877,7 +1951,34 @@ export function applyDashboardStreamingTypeaheadKey(
   return applyTurnTypeaheadKey(state, key, isImmediate);
 }
 
+/** TUI-BOOT-TIMING-HOLES — show-dashboard 동기 셋업 창(첫 프레임 직전) 계측기.
+ *  `finish()` 는 한 번만 보고하고, 보고가 던져도 부팅을 막지 않는다(fail-open). */
+export interface SyncSetupWindow {
+  /** 셋업이 끝난 지점에서 호출 — 진입 이후 경과 ms 를 보고한다. */
+  finish(): void;
+}
+
+export function openSyncSetupWindow(
+  report: ((elapsedMs: number) => void) | undefined,
+  now: () => number = () => performance.now(),
+): SyncSetupWindow {
+  const startedAt = now();
+  let finished = false;
+  return {
+    finish(): void {
+      if (finished) return;
+      finished = true;
+      if (!report) return;
+      try {
+        report(now() - startedAt);
+      } catch { /* timing signal must never break boot */ }
+    },
+  };
+}
+
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
+  // TUI-BOOT-TIMING-HOLES — 첫 프레임 직전 동기 셋업 구간을 여기서 연다(셋업 종료 지점에서 닫는다).
+  const syncSetupWindow = openSyncSetupWindow(opts.onSyncSetupComplete);
   let firstDashboardFrameRendered = false;
   await awaitGlobalPersonaLoad().catch(() => {});
   const dashboardQuitConfirmationState = createQuitConfirmationState();
@@ -3357,7 +3458,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // ⭐ H2 내부 턴 문(TUI-H2-INTERNAL-TURN) — 자율 재개(H3·H4·H5)가 지나갈 «문 하나». 판정은 모듈,
   //   여기선 상태를 읽어 넘기기만 한다(⚠️ promptCtl·가시성 함수는 아래에서 선언 — 호출 시점엔 있다).
   const internalTurnGate = createInternalTurnGate({
-    isTurnRunning: () => streamingInFlight,
+    isTurnRunning: () => streamingInFlight || dashboardAcpChat.isBusy() || internalTurnGate.isInternalTurnActive(),
     isInputForeground: () =>
       chatMainInputVisibilityState().inputOwnership?.owner === 'chat-main' && !topBlockingForegroundModal(),
     getBufferText: () => promptCtl.getBufferText?.(),
@@ -3373,7 +3474,21 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   });
   // Set only by the failed-turn callback and consumed by that turn's streaming cleanup.
   let autowakeTurnFailureRaw: string | null = null;
-  const internalTurnYieldPort = wrapAgentWakePort(seatAutowake.wrapPort(internalTurnGate.port));
+  // ⭐ TURN-END-BEFORE-GOAL 골 이어가기 — 답이 «…하겠습니다/해야 합니다» 로 끝났는데 결과물이 없으면 H2 문으로 한 턴 더.
+  //   판정·상한은 모듈(goal-continue.ts), 여기선 배선만(입력칸 무접촉).
+  const goalContinue = createGoalContinue({
+    startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts),
+    notify: (line) => { chatLines.push(C.muted(line)); draw(); },
+  });
+  const internalTurnYieldPort = wrapAgentWakePort(goalContinue.wrapPort(seatAutowake.wrapPort(internalTurnGate.port)));
+  // ⭐ TUI-GOAL-INTERIM-QUIET — 이어가기 내부 턴이 열리면 «바로 앞» 중간 보고(못 했다·약속) 문단을 한 줄로 접는다.
+  //   끼워 넣은 사람 에코가 있으면 줄 위치를 믿지 않고 접지 않는다(판정·관측은 goal-interim.ts).
+  const goalInterimFold = createClassicInterimFold({ canFold: () => liveTypeaheadEchoes.length === 0 });
+  /** 지금 턴의 스트림 런타임 — 턴 끝에 «마지막 답 블록» 시작을 읽는다(없으면 null → 접지 않는다). */
+  let latestTurnStream: { getAssistantStart(): number } | null = null;
+  const latestTurnReplyStart = (): number | null => {
+    try { return latestTurnStream?.getAssistantStart() ?? null; } catch { return null; }
+  };
   // ⭐ H5 자기 예약 깨움(TUI-H5-SCHEDULE-WAKEUP) — 프로세스 안 타이머가 그 시각에 H2 문으로 한 턴을 청한다.
   //   직전 회차 판정 = 그 예약이 연 내부 턴이 아직 도나. 도구 등록은 아래 host tool 자리(하니스 자식 제외).
   const wakeupScheduler = createDashboardWakeupScheduler(internalTurnGate, {
@@ -3741,7 +3856,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       return mouseWiring.buildStatusLine({
         swd,
         gitState,
-        providerInfo: readStatusProviderInfo(activeAcpRuntimeModel()),
+        // TUI-MODEL-BADGE-ACTUAL (10-16) — 배지의 «지금» 은 이번 턴 실제 실행(폴백이면 «처음 → 실제»).
+        providerInfo: readStatusProviderInfo(activeAcpRuntimeModel(), statusModelActual('dashboard')),
         contextUsedTokens: metrics.lastContextUsed,
         tmuxLabel: tmuxStatusLabel,
         sshLabel: sshStatusLabel,
@@ -6582,7 +6698,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   });
   let clarificationModalId: string | null = null;
 
-  const attachChatStreamingKeys = (abortCtrl: AbortController): () => void => {
+  // `turnEnd: false` — a phase inside a turn (skill-route detection) that attaches the same keys: its teardown is
+  // not a turn end (TUI-ORPHAN-AUTO-RESUME-STOP E4 · 10-23: it reset seat-autowake's orphan-400 streak every turn).
+  const attachChatStreamingKeys = (abortCtrl: AbortController, phase: { turnEnd?: boolean } = {}): () => void => {
     const chatLinesStartIndex = chatLines.length;
     userScrolledDuringStream = false;
     const SCROLL_KEYS = new Set(['j', 'k', 'down', 'up', 'pageup', 'pagedown', 'home', 'end', 'g', 'G']);
@@ -6592,8 +6710,20 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // so the user can make an informed call.
     let abortGateModalId: string | null = null;
     const showHarnessEscHint = createHarnessEscHint((line) => pushChatLine(line));
-    let stoppedHarnessSpace: string | null = null;
     const activeHarnessSpace = (): string | null => activeEscHarnessSpace(escAbortToolState, escHarnessSpacesByCallId);
+    // ⭐ TUI-ESC-EXIT — `createEscAbortPendingGate` is the production
+    // onAbortPending/onAbortRepeat seam shared with the incident test in
+    // test/esc-harness-stop.test.ts; `runEscAbortPendingSoftStop` remains the
+    // production soft-stop callback. The gate keeps an earlier successful
+    // stopped space across later waiting/hint/failed callbacks.
+    const escAbortPendingGate = createEscAbortPendingGate({
+      runSoftStop: runEscAbortPendingSoftStop,
+      formatWaitingTargets: formatEscAbortWaitingTargets,
+      getActiveHarnessSpace: activeHarnessSpace,
+      pushChatLine: (line) => pushChatLine(line),
+      showHarnessEscHint,
+      afterAbortEvent: () => { chatScrollOffset = -1; },
+    });
     const escGate = createEscAbortGate({
       abortCtrl,
       getRunningCount: () => getEscAbortRunningCount(escAbortToolState),
@@ -6608,28 +6738,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       getTheme: () => currentThemeTokens(),
       getWaitingTargetNames: () => getEscAbortWaitingToolNames(escAbortToolState),
       shouldAbortImmediately: () => activeHarnessSpace() !== null,
-      onAbortPending: ({ targets }) => {
-        const spaceId = activeHarnessSpace();
-        if (spaceId) {
-          try {
-            enqueueSoftStop(spaceId);
-            if (readSoftStopRequestStatus(spaceId).status !== 'present') throw new Error('soft-stop marker not persisted');
-            stoppedHarnessSpace = spaceId;
-            pushChatLine('  ⏹ 멈췄다 — 해당 하니스 런에 중단 요청을 보냈습니다.');
-          } catch {
-            pushChatLine('  ⚠ 하니스 런 중단 요청을 보내지 못했습니다. /harness runs 에서 확인해 주세요.');
-          }
-        } else if (!showHarnessEscHint(targets)) {
-          pushChatLine(`  ⏳ 중단 요청됨 — ${formatEscAbortWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
-        }
-        chatScrollOffset = -1;
-      },
-      onAbortRepeat: ({ repeat, targets }) => {
-        if (!stoppedHarnessSpace && !showHarnessEscHint(targets)) {
-          pushChatLine(`  ⏳ ESC 재시도 ${repeat}회 — ${formatEscAbortWaitingTargets(targets)} 종료를 기다리는 중입니다.`);
-        }
-        chatScrollOffset = -1;
-      },
+      // ⭐ TUI-ESC-EXIT — `runEscAbortPendingSoftStop` is the production
+      // soft-stop callback seam; the incident test in
+      // test/esc-harness-stop.test.ts exercises this same function.
+      onAbortPending: escAbortPendingGate.onAbortPending,
+      onAbortRepeat: escAbortPendingGate.onAbortRepeat,
       // ⭐⭐⭐ 턴을 멈추기 «전»에 살아남을 자식을 백그라운드 라우팅으로 넘긴다(`R4a` · 2026-08-19).
       //   ⛔ 없으면 `R1` 이후 자식이 «고아»가 된다 — 살아 있는데 완료를 실어 나를 채널이 없다
       //     (`task-notification` 은 background 만 본다 · 부모 툴 루프는 턴과 함께 사라졌다).
@@ -6874,6 +6987,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const r = applyDashboardStreamingTypeaheadKey(turnTypeaheadRef.state, k, isStreamingImmediateSlash);
           if (r.consumed) {
             turnTypeaheadRef.state = r.state;
+            // TUI-PASTE-WHILE-STREAMING — 턴 중 붙여넣기를 버퍼가 받았다(종전엔 조용히 버려졌다).
+            if (r.pasted) { try { debug.log('tui.paste', r.pasted.folded ? 'folded' : 'kept', { during: 'streaming', lines: r.pasted.lines, chars: r.pasted.chars }); } catch { /* fail-soft */ } }
             if (r.submissionDisposition) {
               debug.log('dashboard.turn-typeahead', 'submission-classified', {
                 length: (r.immediateSubmission ?? turnTypeaheadRef.state.queuedSubmissions.at(-1))?.length ?? 0,
@@ -7171,7 +7286,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       runTurnTeardownStep('stream-keys-detach', cleanup);
       runTurnTeardownStep('esc-gate-dispose', () => { escGate.dispose(); });
       try {
-        if (!stoppedHarnessSpace) settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
+        if (!escAbortPendingGate.getStoppedHarnessSpace()) settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const stackHead = err instanceof Error ? err.stack?.split('\n')[1]?.trim() : undefined;
@@ -7184,7 +7299,18 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         reportTuiTurn('idle');
         const failedTurnRaw = autowakeTurnFailureRaw;
         autowakeTurnFailureRaw = null;
-        seatAutowake.noteTurnEnded({ sessionId: currentChatPersonaSessionId(), lastLine: chatLines.at(-1) ?? '', errorDetail: failedTurnRaw ?? undefined });
+        if (phase.turnEnd !== false) seatAutowake.noteTurnEnded({ sessionId: currentChatPersonaSessionId(), lastLine: chatLines.at(-1) ?? '', errorDetail: failedTurnRaw ?? undefined });
+        try {
+          // «이번 턴»이 그린 줄만 본다 — 앞 턴의 ✘·취소 표시가 이번 턴 판정에 새지 않게(r1 must-fix).
+          const turnLines = chatLines.slice(chatLinesStartIndex);
+          const tailLines = turnLines.slice(-16);
+          // 실패(✘)·취소로 끝난 턴은 이어가지 않는다 — 사람이 판단할 자리다.
+          const failed = failedTurnRaw !== null || turnLines.some((line) => /✘ 실패|응답 취소|취소됨/.test(line));
+          // 마지막 답 블록만 — 스트림 applier 의 assistantStart(이번 턴 범위 안일 때). 도구 줄은 그 앞에 남는다.
+          const replyStart = latestTurnReplyStart();
+          goalInterimFold.noteTurnEnded(chatLines, replyStart !== null && replyStart >= chatLinesStartIndex ? replyStart : chatLines.length);
+          goalContinue.noteTurnEnded({ lines: tailLines, failed });
+        } catch { /* fail-soft: 골 이어가기는 턴 정리를 막지 않는다 */ }
       }
     };
   };
@@ -11552,8 +11678,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const frameCursorDecision = display.cursorDecision();
     renderDashboardFrame(baseLines, composeDashboardFrameWithCoordinatorModal(display, {
       onFrameWriteComplete: firstDashboardFrameRendered ? undefined : (error) => {
-        if (error || firstDashboardFrameRendered) return;
+        if (firstDashboardFrameRendered) return;
+        // TUI-BOOT-TIMING-HOLES — 셋업 창은 «첫 프레임 flush 완료» 에 닫는다(진입~flush).
+        //  실패한 flush 도 창을 닫아 신호가 영영 오지 않는 일을 막는다(재시도 의미론은 그대로:
+        //  첫 프레임 신호는 다음 성공 flush 가 낸다).
+        if (error) {
+          syncSetupWindow.finish();
+          return;
+        }
         firstDashboardFrameRendered = true;
+        syncSetupWindow.finish();
         try { opts.onFirstFrameRendered?.(); } catch { /* timing must not break dashboard */ }
       },
       overlay: modalFrame,
@@ -13134,7 +13268,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     //   채팅 한 줄 «✓ 위임 끝: <이름> — 다음 턴에 결과» · 결과는 다음 턴 preamble 이 싣는다.
     //   ⛔ 입력칸·injectKey·pty 주입 0(대표 비침투). dedupe·수명은 모듈, 여기선 배선만.
     const agentWake = installAgentWake({
-      subscribe: (listener) => globalTaskNotificationQueue.onEnqueue(listener),
+      subscribe: (listener) => subscribeDashboardAgentResults(
+        globalTaskNotificationQueue, listener, (line) => { pushChatLine(C.muted(line)); draw(); },
+      ),
       // 그리기 실패는 삼키지 않는다 — 모듈이 잡아 notified{shown:false} 로 남긴다.
       notify: createDashboardAgentWakeNotify((line) => { chatLines.push(C.muted(line)); }, () => draw()),
       // 조각 2 — 자리 TUI ∧ 유휴면 H2 문으로 다음 턴(origin child-complete) · 판정은 모듈.
@@ -14841,7 +14977,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     let acpDispatchToolSelf: CoreTurnDispatchTool | null = null;
     let acpToolDispatchCount = 0;
     const trMod = await import('../tool-runtime/index.js');
-    trMod.registerAllDefaultToolRuntimes();
+    trMod.registerAllDefaultToolRuntimes({ mcpLazyBoot: true });
     acpToolRuntime = trMod;
     acpPersistToolOutputPreview = (
       await import('../tool-runtime/truncation-store.js')
@@ -16240,6 +16376,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // those tokens into the initial buffer so the user can just type
           // their question next to the pre-filled [PDF #N] tokens.
           let nextInitial: string | undefined = inputEntry.initialText;
+          // TUI-PASTE-WHILE-STREAMING — 턴 중 접은 붙여넣기 토큰의 원문(넘김 입력창이 넘겨받는다 · 글에 토큰이 없으면 버린다).
+          let nextInitialPastes: Array<[string, string]> = [];
           let exitInputLoop = false;
           let lastTurnFinalStatus: 'completed' | 'interrupted' | 'failed' | undefined;
 
@@ -16271,6 +16409,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           });
           lastTurnFinalStatus = undefined;
           nextInitial = drained.nextInitial;
+          nextInitialPastes = [...nextInitialPastes, ...(drained.initialPastes ?? [])].filter(([token]) => nextInitial?.includes(token));
           const queuedTurnEndText = drained.injectEnter ? drained.nextInitial : undefined;
           if (interrupted && queuedBeforeDrain > 0) {
             debug.log('dashboard.turn-typeahead', 'restored-after-interrupt', { count: queuedBeforeDrain });
@@ -16310,6 +16449,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             debugLog: debug.enabled ? (event, label, payload) => debug.log(event, label, payload) : undefined,
             textInputOpts: {
               internalTurnYield: internalTurnYieldPort,
+              ...(nextInitialPastes.length ? { initialPastes: nextInitialPastes } : {}),
               onScrollKey: (name) => {
                 const { rows } = termSize();
                 const viewport = computePromptFrameLogViewportBounds(
@@ -16808,7 +16948,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
           // Save to durable input history. Up/down reads the in-memory
           // tail, while slash/LLM tools can search the full store.
-          if (!internalTurn) internalTurnGate.noteHumanTurn();
+          if (!internalTurn) { internalTurnGate.noteHumanTurn(); goalContinue.noteHumanTurn(); goalInterimFold.noteHumanTurn(); }
           if (postTurn.historyRecord && !internalTurn) {
             inputHistoryStore.record(postTurn.historyRecord);
             refreshInputHistory();
@@ -17713,18 +17853,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 setWorkingFocusPreview: () => { setWorkingFocus('preview', 'slash-term-move-preview'); },
                 nextTerminalVwSlotId: (terminalId) => `term-slot:${terminalId}`,
               },
-              // TUI-LOOP-COMMAND — /loop <간격> <프롬프트> · 쉬는 동안만 발사
-              // (src/dashboard/loop-scheduler.ts · 판정: idle 발사 1 · busy 미룸 · stop 0).
-              // idle/busy 신호는 대시보드 루프가 이미 쓰는 것을 그대로 쓴다 —
-              // 스트리밍 턴(streamingInFlight · reportTuiTurn busy/idle) +
-              // ACP 세션 바쁨(dashboardAcpChat.isBusy()). 프롬프트 제출은
-              // 플러그인 submitDashboardText 와 같은 기존 제출 틈
-              // (dispatchDashboardSubmitText)으로 낸다 — 새 제출 경로를 만들지 않는다.
+              // TUI-LOOP-COMMAND — the scheduler ticks; H2 alone judges whether
+              // an internal turn can open. A rejection waits for the next tick.
               loopCommand: {
-                isIdle: () => !streamingInFlight && !dashboardAcpChat.isBusy(),
+                isIdle: () => true,
                 submitPrompt: (prompt: string) => {
-                  if (dispatchDashboardSubmitText) dispatchDashboardSubmitText(prompt);
-                  else chatLines.push(C.muted('  /loop: 입력 루프가 아직 제출을 받지 않는다 — 다음 틱을 기다린다'));
+                  const result = internalTurnGate.startTurnIfIdle(prompt, { origin: 'scheduled', reason: '/loop' });
+                  if (result.opened) debug.log('dashboard.loop', 'fired', { turnId: result.turnId });
+                  else debug.log('dashboard.loop', 'rejected', { reason: result.reason });
                 },
                 schedulerRef: dashboardLoopSchedulerRef,
               },
@@ -18176,6 +18312,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // array but doesn't paint until after the skill router's
           // classifier LLM call returns (~1-2s of visual silence).
           if (internalTurn) {
+            try { goalInterimFold.foldBeforeInternalTurn(chatLines, internalTurn.origin, C.muted); } catch { /* fail-soft: 접기는 턴을 막지 않는다 */ }
             chatLines.push(C.muted(`  ${formatInternalTurnBanner(internalTurn)}`));
             chatScrollOffset = -1;
           } else {
@@ -18221,6 +18358,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // through to keyword routing in those cases.
           {
             const urlDec = detectUrlRoute(tok.text, getUserConfig().skills.urlRouting);
+            const urlGuard = urlDec ? null : workContextGuardReason(tok.text);
+            if (urlGuard && extractUrls(tok.text).length > 0) {
+              debug.log('skill.router', 'url-route-guarded', { reason: urlGuard, textLength: tok.text.length });
+            }
             if (urlDec) {
               debug.log('skill.router', 'url-route', {
                 kind: urlDec.kind, skill: urlDec.skill, absorb: urlDec.absorb,
@@ -18272,7 +18413,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               const detectTier = getModelTier(getUserConfig().llm.provider, getUserConfig().llm.model);
               const routeStartedAt = Date.now();
               const route = await runAbortableDashboardSkillRoute({
-                attachKeys: attachChatStreamingKeys,
+                attachKeys: (ctrl: AbortController) => attachChatStreamingKeys(ctrl, { turnEnd: false }),
                 detect: (signal) => detectDashboardSkillRoute(tok.text, visibleIndex, {
                   llmFallback: userCfg.llmFallback,
                   keywordScoreThreshold: userCfg.keywordScoreThreshold,
@@ -18537,7 +18678,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               return buildDashboardOptionalToolSpecs({
                 userConfig: uc,
                 termSize,
-                registerAllDefaultToolRuntimes: () => { toolRuntime.registerAllDefaultToolRuntimes(); },
+                registerAllDefaultToolRuntimes: () => { toolRuntime.registerAllDefaultToolRuntimes({ mcpLazyBoot: true }); },
                 setTerminalModalRuntimeDeps: (deps) => { toolRuntime.setTerminalModalRuntimeDeps(deps); },
                 ...buildDefaultDashboardToolBuilders(),
               }) as unknown[];
@@ -18584,6 +18725,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 renderedToolRuntime,
                 brainIcon: ICONS.brain,
               });
+              latestTurnStream = turnStreamRuntime;
               return {
                 ...turnStreamRuntime,
                 onText: (chunk, accumulated) => {
@@ -18642,6 +18784,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             },
             resetAcpTurnRef: () => resetDashboardAcpTurnRef(acpTurnRef),
             acpSession: dashboardAcpSession,
+            // TUI-400-AUTOHEAL-FALLBACK(대표 10-22) — 400(대화 기록 어긋남)이면 ① 새 세션 ⊕ 요약 ② 다음 공급자로 스스로 회복.
+            autoheal: createDashboardTurnAutoheal({
+              session: dashboardAcpSession,
+              getCwd: getSessionCwd,
+              onRenewed: (sessionId) => {
+                acpSessionIdRef.current = sessionId;
+                observeSessionStart({ surface: 'tui', origin: 'new', reason: 'autoheal-400', sessionId });
+              },
+              remote: daemonAttached,
+              activeModel: () => resolveDashboardActiveModel(tok.text) ?? undefined,
+            }),
             control: {
               signalBus: dashboardControlSignals,
             },

@@ -19,6 +19,16 @@ async function guardianPlan(): Promise<{ db: Database; plan: GuardianPlan }> {
 
 export function registerGuardianCommands(program: Command): void {
   const guardian = program.command('guardian').description('크론 수호자 그림자 관측(기존 크론·알림 무변경)');
+  guardian.command('doctor-shadow')
+    .description('기록된 admit-starved 진료 요청을 재평가 처방으로 기록(집행 없음)')
+    .requiredOption('--run <runId>', '진료 요청이 기록된 런')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { run: string; json?: boolean }) => {
+      const { recordShadowDoctorReevaluation } = await import('../self-implement/doctor-visit.js');
+      const result = recordShadowDoctorReevaluation(opts.run);
+      if (opts.json) await writeStdoutJson(JSON.stringify(result) + '\n');
+      else console.log(`doctor shadow: runId=${opts.run} status=${result.status} rx=${result.rx ?? 'none'} outcome=${result.outcome ?? 'none'} executed=0`);
+    });
   guardian.command('grok-expiry').description('현재 호스트 Grok 구독 만료 시각과 4시간 경보 상태 출력')
     .action(async () => {
       const { readGrokSubscriptionExpiry } = await import('../grok/credential.js');

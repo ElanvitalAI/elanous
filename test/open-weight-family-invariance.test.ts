@@ -2,6 +2,9 @@
 // for any id outside it. Expected values below were measured on origin/main b9c25abcfc
 // (before the family existed) with this same fingerprint function; if one of them moves,
 // a codex · claude · grok · gpt · gemini · local · other path changed.
+// codex/gpt representative addon shas re-measured after TUI-OPS-TURN-GUARD gap ② added the
+// ops-turn guard rule to both TOOL_DISCIPLINE addons (2026-10-22; same values as
+// test/openrouter-openai-gpt-family.test.ts GPT_ADDON/CODEX_ADDON) — every other field unchanged.
 import { createHash } from 'node:crypto';
 import { describe, expect, test } from 'bun:test';
 import { resolveToolDiscipline, selectIntentClassificationMessages, streamLLMWithTools } from '../src/llm';
@@ -72,27 +75,27 @@ const EXPECTED: Record<(typeof IDS)[number], Awaited<ReturnType<typeof fingerpri
   },
   'gpt-5.6-terra': {
     family: 'codex', discipline: 'b8623476f31f08d5e1269d7ad5edb4f922c0d820a9cfaccbe41f9756d7151d97',
-    addon: 'fb553a1ac45cdf93055abf248bb7ca25442af7f5a3af249b8130363729de8500',
+    addon: 'c02b394d304c5b0c4619651fee8f0cd11f20a4ebc8bd087d29c3a7afab65a2ef',
     firstTurn: 'c04fb52dfc902dd0d1d717cae28bf5b90a87ddd54fb120f11784677d5942ee54',
   },
   'gpt-5.4-mini': {
     family: 'codex', discipline: 'b8623476f31f08d5e1269d7ad5edb4f922c0d820a9cfaccbe41f9756d7151d97',
-    addon: 'fb553a1ac45cdf93055abf248bb7ca25442af7f5a3af249b8130363729de8500',
+    addon: 'c02b394d304c5b0c4619651fee8f0cd11f20a4ebc8bd087d29c3a7afab65a2ef',
     firstTurn: 'c04fb52dfc902dd0d1d717cae28bf5b90a87ddd54fb120f11784677d5942ee54',
   },
   'codex-mini-latest': {
     family: 'codex', discipline: 'b8623476f31f08d5e1269d7ad5edb4f922c0d820a9cfaccbe41f9756d7151d97',
-    addon: 'fb553a1ac45cdf93055abf248bb7ca25442af7f5a3af249b8130363729de8500',
+    addon: 'c02b394d304c5b0c4619651fee8f0cd11f20a4ebc8bd087d29c3a7afab65a2ef',
     firstTurn: 'c04fb52dfc902dd0d1d717cae28bf5b90a87ddd54fb120f11784677d5942ee54',
   },
   'gpt-4.1': {
     family: 'gpt', discipline: null,
-    addon: '9e31146d530121080d0c6e9cdfd40b16721a15803fc86b713a9dd14cca371be2',
+    addon: '4b5c577102c6930f9eb821218bd7150ec944445a5e0c5069e9f448721f5b8ad4',
     firstTurn: '847b7010258182a01a4397318734230e382b2f34e4d11c87a46ccafdf4e1ede2',
   },
   'o3-mini': {
     family: 'gpt', discipline: null,
-    addon: '9e31146d530121080d0c6e9cdfd40b16721a15803fc86b713a9dd14cca371be2',
+    addon: '4b5c577102c6930f9eb821218bd7150ec944445a5e0c5069e9f448721f5b8ad4',
     firstTurn: '847b7010258182a01a4397318734230e382b2f34e4d11c87a46ccafdf4e1ede2',
   },
   'grok-4.6': {

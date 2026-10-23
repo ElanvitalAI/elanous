@@ -28,6 +28,7 @@ import { getUserConfig, userConfigPath } from '../user-config.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import { LIVE_MOVE_HISTORY_EVENT, shellQuote, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 import { reconcileHandMergedCard } from './postland-card.js';
+import { advanceLandedPieceMission } from './mission.js';
 import { resolveParentHosts, type ParentHostConfig } from './parent-host.js';
 import { LIVE_RETRY_MOVES } from './judge.js';
 import { decisionCardGrounds, decisionRaiseArgs, type DecisionCardEvidence, type NextAction } from './actions.js';
@@ -93,7 +94,7 @@ export interface LiveMoveDeps {
   handMergePr?: (pr: number, cwd: string) => Promise<HandMergePrView | null>;
   /** One existing pr land operation; inject in tests instead of invoking the CLI. */
   /** TA-REJUDGE-ON-HEAD — `opts.overlapEvidence` 가 있으면 `pr land --overlap-evidence <file>` 로 넘긴다(없으면 종전 인자). */
-  land?: (pr: number, head: string, cwd: string, opts?: { overlapEvidence?: string }) => Promise<{ status: number; stdout: string; stderr?: string }>;
+  land?: (pr: number, head: string, cwd: string, opts?: { overlapEvidence?: string; cardId?: string }) => Promise<{ status: number; stdout: string; stderr?: string }>;
   /** `decision-card` — `decisions raise` 한 번(시험 주입 · 기본 = 같은 우주의 CLI 자식). */
   raiseDecision?: (args: string[]) => Promise<{ status: number; stdout: string; stderr?: string }>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
@@ -102,6 +103,8 @@ export interface LiveMoveDeps {
   /** TA-LAND-AFTER-REVIEW — injected queue adapter; absent uses configured command after a remote changed gate. */
   queueLanding?: (input: QueueLandingInput) => Promise<{ status: number; stdout: string; stderr?: string }>;
   landQueueConfig?: { command: string; remote: string } | null;
+  /** Confirmed direct landing wakes successor pieces; tests inject an observation-only seam. */
+  advanceLandedPiece?: (pieceId: string, statePath: string) => Promise<unknown>;
 }
 
 /** `executed` = 부작용을 실제로 냈다(리뷰를 띄웠다 · 제안을 적었다). ok 이지만 이미 한 수(같은 머리·이미 제안)면 false. */
@@ -280,13 +283,16 @@ export function liveLandArgs(entry: string, configDir: string, pr: number, head:
 }
 
 /** The CLI owns the freeze, gate and merge checks; no direct gh merge or bypass flags. */
-export async function defaultLand(pr: number, head: string, cwd: string, opts: { overlapEvidence?: string } = {}): Promise<{ status: number; stdout: string; stderr?: string }> {
+export async function defaultLand(pr: number, head: string, cwd: string, opts: { overlapEvidence?: string; cardId?: string } = {}): Promise<{ status: number; stdout: string; stderr?: string }> {
   const { ELANOUS_CLI_ENTRY } = await import('../cli/tasks-cli.js');
   const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
   const { effectiveInstanceRoot } = await import('../instance/resolve.js');
   const args = liveLandArgs(ELANOUS_CLI_ENTRY, getElanousConfigDirOverride() ?? effectiveInstanceRoot(), pr, head, cwd, opts.overlapEvidence);
+  const cardEnv = opts.cardId ? { [(await import('../cli/pr-land-recovery.js')).PR_LAND_CARD_ID_ENV]: opts.cardId } : undefined;
   return new Promise((resolveResult, reject) => {
-    const child = spawn(process.execPath, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    // LAND-REFUSAL-EDGES — the card rides along so a refusal row can be bound to this card (observation only).
+    const env = cardEnv ? { ...process.env, ...cardEnv } : undefined;
+    const child = spawn(process.execPath, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], ...(env ? { env } : {}) });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => { stdout = (stdout + chunk.toString()).slice(-300); });
@@ -660,8 +666,13 @@ export async function executeLiveLand(
         const settled = reconcileHandMergedCard({ number: pr, url: hand.url ?? view.url ?? '', headRefOid: view.head, state: 'MERGED',
           baseRefName: hand.baseRefName ?? 'main', mergedAt: hand.mergedAt ?? '', mergeCommit: hand.mergeCommit },
           cwd, deps.statePath ? { statePath: deps.statePath } : {});
-        if (settled.outcome === 'reconciled')
+        if (settled.outcome === 'reconciled') {
+          const path = deps.statePath ?? taskAgentStatePath();
+          try { await (deps.advanceLandedPiece ?? ((pieceId, statePath) => advanceLandedPieceMission(pieceId, { statePath })))(card.id, path); }
+          catch (error) { try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'mission-auto-advance-error',
+            { card: card.id, pr, error: String(error).slice(0, 250) }); } catch { /* fail-soft */ } }
           return withRepo(observe(deps, { kind, card: card.id, ok: true, executed: true, detail: `PR #${pr} 손 병합 정산 — card ${settled.status} (merge ${settled.mergeSha.slice(0, 12)})` }));
+        }
       }
     }
     return reject(card.id, `PR #${pr} is ${view.state}`, reviewRepo);
@@ -802,8 +813,8 @@ export async function executeLiveLand(
         entry: (await import('../cli/tasks-cli.js')).ELANOUS_CLI_ENTRY,
         configDir: (await import('../elanous-config-dir.js')).getElanousConfigDirOverride() ?? (await import('../instance/resolve.js')).effectiveInstanceRoot() })
       : overlapEvidence
-        ? await (deps.land ?? defaultLand)(pr, view.head, landCwd, { overlapEvidence })
-        : await (deps.land ?? defaultLand)(pr, view.head, landCwd);
+        ? await (deps.land ?? defaultLand)(pr, view.head, landCwd, { overlapEvidence, cardId: card.id })
+        : await (deps.land ?? defaultLand)(pr, view.head, landCwd, { cardId: card.id });
     ok = outcome.status === 0;
     detail = (ok ? outcome.stdout || `${queueConfig ? 'queued' : 'land merged'} #${pr} head ${view.head.slice(0, 12)}` : outcome.stderr || outcome.stdout || `exit ${outcome.status}`).slice(-300);
     if (!ok) failure = classifyLandFailure(outcome);
@@ -856,6 +867,11 @@ export async function executeLiveLand(
   } catch (error) {
     return observe(deps, withRepo({ kind, card: card.id, ok: false, executed: true, landAttempt,
       detail: `land ${ok ? 'succeeded' : 'failed'} but card update failed: ${String(error).slice(-230)}` }));
+  }
+  if (ok && !queueConfig) {
+    try { await (deps.advanceLandedPiece ?? ((pieceId, statePath) => advanceLandedPieceMission(pieceId, { statePath })))(card.id, path); }
+    catch (error) { try { (deps.log ?? ((c, e, d) => debug.log(c, e, d)))('task-agent', 'mission-auto-advance-error',
+      { card: card.id, pr, error: String(error).slice(0, 250) }); } catch { /* fail-soft */ } }
   }
   return observe(deps, withRepo({ kind, card: card.id, ok, executed: true, detail, landAttempt, ...(queueConfig && ok ? { queued: true } : {}) }));
 }

@@ -13,9 +13,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { defaultSeams, preservationHasChanges, parseBehindCount, removeMatchingGoalCopy, toReviewIntentInput } from './seams.js';
 import { runSelfImplementCliCommand } from './self-implement-cli.js';
+import { runDraftSweep } from '../self-dev/draft-sweep.js';
 import { GoalRunStore } from './goal-run-store.js';
 import { appendRunLedgerEntry, runLedgerPath } from './run-ledger.js';
 import { compactForLog, debug } from '../debug/log.js';
+import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { disableLandingFreeze, enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { instanceNameForStateDir } from '../instance-identity.js';
@@ -23,7 +25,9 @@ import { getAskUserQuestionResolver, setAskUserQuestionResolver } from '../ask-u
 import { setUserConfigOverlay } from '../user-config.js';
 import { createSession, subscribeSession } from '../session/index.js';
 import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, goalChecklistIds, prTitle, routePodMergeToHost, runSelfImplement, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
+import * as orchestratorModule from './orchestrator.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
+import { decideDraft } from '../self-dev/draft-triage-rules.js';
 import { resetAutohealProcessMemory } from './stop-autoheal.js';
 import { defaultGitMergeSeam, defaultLlmResolve, mergeMainIntoWorktreeWithResolveOptions, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { stableMustFixId } from './reflect-mustfix.js';
@@ -34,6 +38,274 @@ import type { DocumentReferenceStatus } from './self-implement-runtime.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-cli-sink-surface.js';
 import { PIPELINE_EDGES_BY_NODE, PIPELINE_GRAPH_ID, TERMINAL_STAGES_BY_NODE, pipelineGraphIdentity, pipelineGraphVersion, type PipelineNodeId } from './pipeline-shape.js';
 import { GRAPH_TEMPLATES, measureL0Coverage } from './graph-templates.js';
+
+
+test('harvest marker helper is available on the production module', () => {
+  const markHarvestDeferredBody = (orchestratorModule as { markHarvestDeferredBody?: unknown }).markHarvestDeferredBody;
+  expect(typeof markHarvestDeferredBody).toBe('function');
+});
+
+test('harvest marker helper rejects non-failed, unknown, or unconfirmed inputs', () => {
+  const markHarvestDeferredBody = (orchestratorModule as { markHarvestDeferredBody?: (input: { runStatus: string | undefined; prNumber: number | undefined; body: string | undefined }) => string | undefined }).markHarvestDeferredBody;
+  expect(typeof markHarvestDeferredBody).toBe('function');
+  if (typeof markHarvestDeferredBody !== 'function') return;
+  const cases = [
+    { runStatus: 'completed', prNumber: 30588, body: 'body' },
+    { runStatus: 'running', prNumber: 30588, body: 'body' },
+    { runStatus: undefined, prNumber: 30588, body: 'body' },
+    { runStatus: 'failed', prNumber: undefined, body: 'body' },
+    { runStatus: 'failed', prNumber: 0, body: 'body' },
+    { runStatus: 'failed', prNumber: -1, body: 'body' },
+    { runStatus: 'failed', prNumber: 1.5, body: 'body' },
+    { runStatus: 'failed', prNumber: Number.MAX_SAFE_INTEGER + 1, body: 'body' },
+    { runStatus: 'failed', prNumber: 30588, body: undefined },
+  ] as const;
+  for (const input of cases) expect(markHarvestDeferredBody(input)).toBeUndefined();
+  expect(markHarvestDeferredBody({ runStatus: 'failed', prNumber: 30588, body: 'old note: 수확보류: harvest-deferred' }))
+    .toBe(`old note: 수확보류: harvest-deferred\n\n수확보류: harvest-deferred`);
+});
+
+test('completed and unknown terminal runs preserve the existing PR body', async () => {
+  const updates: string[] = [];
+  const readBody = async () => ({ state: 'OPEN', isDraft: true, body: 'unchanged body' });
+  const updateBody = async ({ body }: { number: number; body: string; cwd: string }) => { updates.push(body); };
+
+  const completed = await runSelfImplement({
+    feature: 'harvest marker completed counterexample',
+    seams: seams({
+      gateResults: [true],
+      openPr: async () => ({ url: 'https://pr/30588', number: 30588 }),
+      readPrBodyForHarvest: readBody,
+      updatePrBodyForHarvest: updateBody,
+    }),
+  });
+  expect(completed).toMatchObject({ stage: 'pr-opened', outcome: 'completed' });
+  expect(updates).toEqual([]);
+
+  await expect(runSelfImplement({
+    feature: 'harvest marker unknown counterexample',
+    seams: seams({
+      createWorktree: async () => { throw new Error('worktree state unknown'); },
+      readPrBodyForHarvest: readBody,
+      updatePrBodyForHarvest: updateBody,
+    }),
+  })).rejects.toThrow('worktree state unknown');
+  expect(updates).toEqual([]);
+});
+
+test('a captured PR is not marked when auto-merge throws before terminal status is known', async () => {
+  const reads: number[] = [];
+  const updates: string[] = [];
+  await expect(runSelfImplement({
+    feature: 'harvest marker unknown terminal after auto-merge error',
+    autoMerge: true,
+    seams: seams({
+      reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'review pass', reviewed: true, diffTruncated: false }),
+      openPr: async () => ({ url: 'https://pr/30588', number: 30588 }),
+      mergePr: async () => { throw new Error('merge observation unavailable'); },
+      readPrBodyForHarvest: async ({ number }) => { reads.push(number); return { state: 'OPEN', isDraft: true, body: 'unchanged body' }; },
+      updatePrBodyForHarvest: async ({ body }) => { updates.push(body); },
+    }),
+  })).rejects.toThrow('merge observation unavailable');
+  expect(reads).toEqual([]);
+  expect(updates).toEqual([]);
+});
+
+test('a confirmed PR remains unmarked when post-open observation is unavailable', async () => {
+  const updates: string[] = [];
+  let fileReads = 0;
+  const result = await runSelfImplement({
+    feature: 'harvest marker post-open observation counterexample',
+    seams: seams({
+      openPr: async () => ({ url: 'https://pr/30588', number: 30588 }),
+      readPrFiles: async () => { fileReads += 1; throw new Error('PR file observation unavailable'); },
+      readPrBodyForHarvest: async () => ({ state: 'OPEN', isDraft: true, body: 'unchanged body' }),
+      updatePrBodyForHarvest: async ({ body }) => { updates.push(body); },
+    }),
+  });
+  expect(result).toMatchObject({ stage: 'pr-opened', outcome: 'completed', prNumber: 30588 });
+  expect(fileReads).toBe(1);
+  expect(updates).toEqual([]);
+});
+
+test('the same captured PR body stays unmarked for completed, running, and undefined cleaner observations', async () => {
+  let openedBody: string | undefined;
+  const updates: string[] = [];
+  const completed = await runSelfImplement({
+    feature: 'harvest marker cleaner counterexamples',
+    seams: seams({
+      openPr: async ({ body }) => { openedBody = body; return { url: 'https://pr/30588', number: 30588 }; },
+      readPrBodyForHarvest: async () => ({ state: 'OPEN', isDraft: true, body: openedBody ?? '' }),
+      updatePrBodyForHarvest: async ({ body }) => { updates.push(body); },
+    }),
+  });
+  expect(completed).toMatchObject({ stage: 'pr-opened', outcome: 'completed', prNumber: 30588 });
+  expect(typeof openedBody).toBe('string');
+  expect(updates).toEqual([]);
+  const draft = {
+    number: 30588,
+    title: 'harvest marker cleaner counterexamples',
+    branch: 'self-impl/harvest-marker-cleaner-aaaaaaaa-r30588',
+    body: openedBody!,
+    labels: ['elanous:harvestable'],
+  };
+  const cleanerObservations = [
+    ['completed', decideDraft({ draft, runStatus: 'completed', mergedTwins: [], ageHours: 1, liveBranches: new Set() })],
+    ['running', decideDraft({ draft, runStatus: 'running', mergedTwins: [], ageHours: 1, liveBranches: new Set([draft.branch]) })],
+    ['undefined', decideDraft({ draft, runStatus: undefined, mergedTwins: [], ageHours: 1, liveBranches: new Set() })],
+  ] as const;
+  expect(cleanerObservations).toEqual([
+    ['completed', { action: 'keep', reason: 'recent' }],
+    ['running', { action: 'keep', reason: 'live' }],
+    ['undefined', { action: 'keep', reason: 'unobserved' }],
+  ]);
+  expect(cleanerObservations.every(([, observation]) => observation.reason !== 'harvest-deferred')).toBe(true);
+  expect(draft.body ?? '').toBe(openedBody ?? '');
+});
+
+test('an open PR stays unchanged while runSelfImplement is still running', async () => {
+  let openedBody: string | undefined;
+  let prBody: string | undefined;
+  const updates: string[] = [];
+  let signalOpened!: () => void;
+  let releaseOpen!: () => void;
+  const opened = new Promise<void>((resolve) => { signalOpened = resolve; });
+  const openingMayFinish = new Promise<void>((resolve) => { releaseOpen = resolve; });
+  const run = runSelfImplement({
+    feature: 'harvest marker running production path',
+    seams: seams({
+      openPr: async ({ body }) => {
+        openedBody = body;
+        prBody = body;
+        return { url: 'https://pr/30588', number: 30588 };
+      },
+      readPrFiles: async ({ number }) => {
+        // The orchestrator has received this PR number and is still running
+        // its post-open inspection, before the terminal preservation path.
+        expect(number).toBe(30588);
+        signalOpened();
+        await openingMayFinish;
+        return ['src/self-implement/orchestrator.ts'];
+      },
+      readPrBodyForHarvest: async () => prBody === undefined ? undefined : ({ state: 'OPEN', isDraft: true, body: prBody }),
+      updatePrBodyForHarvest: async ({ body }) => { updates.push(body); prBody = body; },
+    }),
+  });
+  try {
+    await opened;
+    // This is the actual run held after openPr returned its PR number,
+    // not a synthetic `decideDraft({ runStatus: 'running' })` after completion.
+    expect(openedBody).toBeDefined();
+    expect(prBody).toBe(openedBody);
+    expect(updates).toEqual([]);
+  } finally {
+    releaseOpen();
+  }
+  const result = await run;
+  expect(result).toMatchObject({ stage: 'pr-opened', outcome: 'completed', prNumber: 30588 });
+  expect(prBody).toBe(openedBody);
+  expect(updates).toEqual([]);
+});
+
+test('aborted terminal run is failed and marks only the confirmed existing draft PR', async () => {
+  let body = 'aborted body';
+  const updates: string[] = [];
+  const result = await runSelfImplement({
+    feature: 'harvest marker aborted failure path',
+    seams: seams({
+      implement: async () => ({ ok: false, summary: 'aborted' }),
+      openPr: async () => ({ url: 'https://pr/30588', number: 30588 }),
+      readPrBodyForHarvest: async () => ({ state: 'OPEN', isDraft: true, body }),
+      updatePrBodyForHarvest: async ({ body: next }) => { body = next; updates.push(next); },
+      writeRunLedger: (entry) => { appendRunLedgerEntry(entry); },
+    }),
+  });
+  expect(result).toMatchObject({ stage: 'aborted', ok: false });
+  expect(updates).toEqual(['aborted body\n\n수확보류: harvest-deferred']);
+});
+
+test('failed terminal run updates only the confirmed existing draft PR body once across reruns', async () => {
+  const bodies: string[] = [];
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  let openedBody: string | undefined;
+  let currentBody: string | undefined;
+  const run = () => runSelfImplement({
+    feature: 'harvest marker production seam',
+    maxReworkRounds: 0,
+    seams: seams({
+      gateResults: [false],
+      preservationHasChanges: () => true,
+      readPrBodyForHarvest: async () => currentBody === undefined ? undefined : ({ state: 'OPEN', isDraft: true, body: currentBody }),
+      updatePrBodyForHarvest: async ({ number, body }) => { expect(number).toBe(30588); currentBody = body; bodies.push(body); },
+      openPr: async ({ body }) => {
+        if (openedBody === undefined) { openedBody = body; currentBody = body; }
+        return { url: 'https://pr/30588', number: 30588 };
+      },
+      writeRunLedger: (entry) => {
+        appendRunLedgerEntry(entry);
+        if (entry.event === 'run-status') events.push({ event: entry.event, data: entry.data as Record<string, unknown> });
+      },
+    }),
+  });
+  const first = await run();
+  const second = await run();
+  expect(first.stage).toBe('gate-failed');
+  expect(second.stage).toBe('gate-failed');
+  expect(openedBody).toBeDefined();
+  expect(bodies).toEqual([`${openedBody}${openedBody!.endsWith('\n') ? '\n' : '\n\n'}수확보류: harvest-deferred`]);
+  expect(currentBody!.match(/수확보류: harvest-deferred/g)).toHaveLength(1);
+  const terminalStatuses = events.filter(({ data }) => data.runStatus === 'failed');
+  expect(terminalStatuses).toHaveLength(2);
+  // Feed the exact PR number and body updated by runSelfImplement into the
+  // actual cleaner, not a direct decideDraft invocation or a different PR.
+  const draft = {
+    number: 30588,
+    title: 'harvest marker production seam',
+    branch: 'self-impl/harvest-marker-aaaaaaaa-r30588',
+    body: currentBody,
+    labels: ['elanous:harvestable'],
+    createdAt: '2026-10-21T00:00:00Z',
+  };
+  let writes = 0;
+  const sweep = await runDraftSweep({
+    repository: 'fixture/elanous',
+    now: new Date('2026-10-23T00:00:00Z'),
+    apply: false,
+    adapters: {
+      listDrafts: async (page) => page === 1 ? [draft] : [],
+      listMerged: async () => [],
+      listLiveBranches: async () => new Set<string>(),
+      getRunStatus: async (listed) => {
+        expect(listed.number).toBe(30588);
+        return terminalStatuses.at(-1)!.data.runStatus as string;
+      },
+      closeDraft: async () => { writes += 1; },
+      setLabels: async () => { writes += 1; },
+    },
+  });
+  expect(sweep.complete).toBe(true);
+  expect(sweep.entries.find(({ number }) => number === 30588)).toMatchObject({ action: 'keep', reason: 'harvest-deferred', applied: false });
+  expect(writes).toBe(0);
+});
+
+test('failed terminal run without changes never opens a PR solely for the harvest marker', async () => {
+  const updates: string[] = [];
+  let openPrCalls = 0;
+  const result = await runSelfImplement({
+    feature: 'harvest marker no pr',
+    maxReworkRounds: 0,
+    seams: seams({
+      gateResults: [false],
+      preservationHasChanges: () => false,
+      readPrBodyForHarvest: async () => undefined,
+      updatePrBodyForHarvest: async ({ body }) => { updates.push(body); },
+      openPr: async () => { openPrCalls += 1; return { url: 'https://pr/not-created', number: undefined as never }; },
+    }),
+  });
+  expect(result.stage).toBe('gate-failed');
+  expect(openPrCalls).toBe(0);
+  expect(updates).toEqual([]);
+});
 
 const isolatedStateDir = mkdtempSync(join(tmpdir(), 'elanous-orchestrator-goal-run-store-'));
 const priorStateDir = process.env.ELANOUS_STATE_DIR;
@@ -100,18 +372,116 @@ test('observes the rebind result returned by the production openPr caller', asyn
 });
 
 describe('goal-only implementation rework', () => {
-  test('continues only after the retry changes a declared target and reports a RESULT', async () => {
+  test('a committed target diff outranks a stale completed-without-changes terminal report', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'pod-terminal-committed-changes-'));
+    const runGit = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      return result.stdout.trim();
+    };
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    let implementCalls = 0;
+    try {
+      runGit('init');
+      mkdirSync(join(repo, 'src'));
+      writeFileSync(join(repo, 'src/doctor.ts'), 'export const recorded = false;\n');
+      runGit('add', 'src/doctor.ts');
+      runGit('-c', 'user.name=UX Test', '-c', 'user.email=ux-test@example.invalid', 'commit', '-m', 'baseline');
+      const base = runGit('rev-parse', 'HEAD');
+      runGit('update-ref', 'refs/remotes/origin/main', base);
+      (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+        events.push({ event, data: data as Record<string, unknown> });
+      }) as typeof debug.log;
+      const result = await runSelfImplement({
+        feature: '대상 경로: src/doctor.ts', completion: 'worktree-only',
+        seams: seams({
+          createWorktree: async () => ({ path: repo, branch: 'self-impl/doctor', resolvedBase: base, invokedHead: base }),
+          implement: async () => {
+            implementCalls++;
+            writeFileSync(join(repo, 'src/doctor.ts'), 'export const recorded = true;\n');
+            runGit('add', 'src/doctor.ts');
+            runGit('-c', 'user.name=UX Test', '-c', 'user.email=ux-test@example.invalid', 'commit', '-m', 'doctor implementation');
+            return { ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+              toolCalls: 52, terminalStatus: { reached: true, changed: false, toolCalls: 52, timedOut: false } };
+          },
+        }),
+      });
+      expect(implementCalls).toBe(1);
+      expect(result).toMatchObject({ ok: true, stage: 'worktree-completed' });
+      expect(events).toContainEqual(expect.objectContaining({
+        event: 'terminal-change-reconciled',
+        data: expect.objectContaining({ source: 'post-launch-git-diff', launchHead: base, paths: ['src/doctor.ts'], pathCount: 1 }),
+      }));
+      expect(events.some(entry => entry.event === 'blocked-draft-classification')).toBe(false);
+
+      // PR-source repair starts with the earlier commit already on its branch.
+      // That existing diff must not make an idle second child appear productive.
+      const prSourceHead = runGit('rev-parse', 'HEAD');
+      const idle = await runSelfImplement({
+        feature: '대상 경로: src/doctor.ts', completion: 'worktree-only',
+        seams: seams({
+          createWorktree: async () => ({ path: repo, branch: 'self-impl/doctor-repair', resolvedBase: prSourceHead, invokedHead: base }),
+          implement: async () => ({ ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+            toolCalls: 3, terminalStatus: { reached: true, changed: false, toolCalls: 3, timedOut: false } }),
+        }),
+      });
+      expect(idle).toMatchObject({ ok: false, stage: 'aborted', completionDisposition: 'completed-without-changes' });
+      expect(events.filter(entry => entry.event === 'terminal-change-reconciled')).toHaveLength(1);
+      expect(events.filter(entry => entry.event === 'worktree').at(-1)?.data).toMatchObject({ terminalLaunchHead: prSourceHead });
+
+      // The worktree can already contain an uncommitted repair before this
+      // child starts. Its unchanged path is not this child's new evidence.
+      writeFileSync(join(repo, 'src/doctor.ts'), 'export const recorded = "preexisting dirty";\n');
+      const dirty = await runSelfImplement({
+        feature: '대상 경로: src/doctor.ts', completion: 'worktree-only',
+        seams: seams({
+          createWorktree: async () => ({ path: repo, branch: 'self-impl/doctor-dirty', resolvedBase: prSourceHead, invokedHead: base }),
+          implement: async () => ({ ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+            terminalStatus: { reached: true, changed: false, toolCalls: 3, timedOut: false } }),
+        }),
+      });
+      expect(dirty).toMatchObject({ ok: false, stage: 'aborted' });
+      expect(events.filter(entry => entry.event === 'terminal-change-reconciled')).toHaveLength(1);
+      expect(events.filter(entry => entry.event === 'worktree').at(-1)?.data).toMatchObject({
+        terminalLaunchHead: prSourceHead, terminalLaunchDirtyPaths: ['src/doctor.ts'],
+      });
+      expect(events).toContainEqual(expect.objectContaining({ event: 'terminal-change-evidence',
+        data: expect.objectContaining({ status: 'unmeasured', reason: 'preexisting-dirty-path', paths: ['src/doctor.ts'] }) }));
+      runGit('checkout', '--', 'src/doctor.ts');
+
+      const unknown = await runSelfImplement({
+        feature: '대상 경로: src/doctor.ts', completion: 'worktree-only',
+        seams: seams({
+          createWorktree: async () => ({ path: join(repo, 'missing-worktree'), branch: 'self-impl/doctor-unknown' }),
+          implement: async () => ({ ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
+            terminalStatus: { reached: true, changed: false, toolCalls: 3, timedOut: false } }),
+        }),
+      });
+      expect(unknown).toMatchObject({ ok: false, stage: 'aborted' });
+      expect(events).toContainEqual(expect.objectContaining({ event: 'terminal-change-evidence',
+        data: expect.objectContaining({ status: 'unmeasured', reason: 'launch-head-unavailable' }) }));
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  for (const failBaseRead of [false, true]) test(failBaseRead
+    ? 'a base read that times out is observed as a wiring-check failure and does not stop the run'
+    : 'continues only after the retry changes a declared target and reports a RESULT', async () => {
     const root = mkdtempSync(join(tmpdir(), 'goal-only-rework-success-'));
     const repo = join(root, 'repo');
     mkdirSync(join(repo, 'src'), { recursive: true });
     writeFileSync(join(repo, 'src/example.ts'), 'export const done = false;\n');
+    writeFileSync(join(repo, 'src/example.test.ts'), "import { unwired } from './example.js'; unwired;\n");
     const git = (...args: string[]) => {
       const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
       expect(result.status).toBe(0);
       return result.stdout.trim();
     };
     git('init');
-    git('add', 'src/example.ts');
+    git('add', 'src/example.ts', 'src/example.test.ts');
     git('-c', 'user.name=TC Test', '-c', 'user.email=tc-test@example.invalid', 'commit', '-m', 'baseline');
     const base = git('rev-parse', 'HEAD');
     git('update-ref', 'refs/remotes/origin/main', base);
@@ -123,6 +493,12 @@ describe('goal-only implementation rework', () => {
     (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
       events.push({ event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
+    // Only the wiring check lists the base tree; every other git call stays real.
+    if (failBaseRead) setGitCommandRunnerForTesting((cwd, args, options) => {
+      if (args[0] === 'ls-tree') return { status: null, signal: 'SIGTERM', errorCode: 'ETIMEDOUT', stdout: '', stderr: '' };
+      const real = spawnSync('git', args, { ...options, cwd });
+      return { status: real.status, stdout: String(real.stdout ?? ''), stderr: String(real.stderr ?? '') };
+    });
     try {
       const result = await runSelfImplement({
         feature: '대상 경로: src/example.ts', goalFile, maxReworkRounds: 1, completion: 'worktree-only',
@@ -132,7 +508,7 @@ describe('goal-only implementation rework', () => {
             calls += 1;
             if (calls === 1) return { ok: false, summary: 'GOAL-COMPLETE', completionDisposition: 'completed-without-changes',
               toolCalls: 13, terminalStatus: { reached: true, changed: false, toolCalls: 13, timedOut: false } };
-            writeFileSync(join(repo, 'src/example.ts'), 'export const done = true;\n');
+            writeFileSync(join(repo, 'src/example.ts'), 'export const done = true;\nexport const unwired = 1;\n');
             return { ok: true, summary: 'RESULT: src/example.ts 구현·검증', evidenceTranscript: 'RESULT: src/example.ts 구현·검증',
               toolCalls: 7, terminalStatus: { reached: true, changed: true, toolCalls: 7, timedOut: false } };
           },
@@ -143,11 +519,23 @@ describe('goal-only implementation rework', () => {
       expect(git('diff', '--name-only', base, 'HEAD')).toContain('src/example.ts');
       expect(events.filter(entry => entry.event === 'implementation-goal-only-rework').map(entry => entry.data.status))
         .toEqual(['started', 'succeeded']);
+      const wiring = events.filter(entry => entry.event === 'wiring-check').map(entry => entry.data);
+      if (failBaseRead) {
+        expect(wiring).toEqual([expect.objectContaining({ checked: 0, unwired: 0, examples: [], mode: 'warn',
+          failure: 'base-read-failed: src/example.ts: ls-tree status=null signal=SIGTERM error=ETIMEDOUT' })]);
+        expect(events.some(entry => entry.event === 'unmeasured' && entry.data.failure === wiring[0]!.failure)).toBe(true);
+      } else {
+        // `done` existed at base; only the new `unwired` export is measured, and a test-only use does not wire it.
+        expect(wiring).toEqual([expect.objectContaining({ checked: 1, unwired: 1, mode: 'warn',
+          examples: [{ file: 'src/example.ts', name: 'unwired', reason: 'no-production-importer' }] })]);
+        expect(wiring[0]).not.toHaveProperty('failure');
+      }
     } finally {
+      if (failBaseRead) setGitCommandRunnerForTesting(undefined);
       (debug as { log: typeof debug.log }).log = original;
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 60_000); // real git in a temp repo: the 5s default is exceeded on a loaded host
 
   test('retries one completed child with readable targets, then stops without opening a PR when target diff stays empty', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'goal-only-rework-'));
@@ -4073,6 +4461,36 @@ describe('runSelfImplement — Fix A rework', () => {
     expect(checks[1]?.data).toEqual({ count: 0, runs: [] });
   }, 10_000);
 
+  test('evidence budget follows the orchestrator across two failed gate rounds', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'orchestrator-evidence-budget-'));
+    const dir = join(repo, 'src', 'self-implement');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'orchestrator.ts'), 'export const run = () => 1;\n');
+    writeFileSync(join(dir, 'orchestrator.test.ts'), 'x'.repeat(64 * 1024 + 1));
+    writeFileSync(join(dir, 'orchestrator-focused.test.ts'), "import { run } from './orchestrator.js';\nexpect(run()).toBe(1);\n");
+    const heavy = "bun test -- 'src/self-implement/orchestrator.test.ts'";
+    const narrow = "bun test -- 'src/self-implement/orchestrator-focused.test.ts'";
+    const calls: string[] = [];
+    try {
+      await runSelfImplement({
+        feature: `골\n## REQUIRED EVIDENCE\n- [requested] target check || ${heavy}`,
+        maxReworkRounds: 2,
+        seams: seams({
+          gateResults: [false, false, true],
+          createWorktree: async ({ branch, base }) => ({ path: repo, branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
+          headCommit: () => 'a'.repeat(40),
+          evidenceCommandRunner: (command) => {
+            calls.push(command);
+            return { status: null, stdout: '', stderr: '', error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) };
+          },
+        }),
+      });
+      expect(calls).toEqual([heavy, heavy, narrow]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test('⭐ 요구된 증거의 충족/결손이 관측에 실린다(요구가 없으면 필드도 없다)', async () => {
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
     const original = (debug as { log: typeof debug.log }).log;
@@ -7417,7 +7835,7 @@ describe('runSelfImplement — verify-by-breaking merge observation', () => {
   //   📏 근거: merge-decision 300건 전수에서 verifyByBreaking 이 실린 auto 8건 중 ***5건***이
   //     ran=true·distinguishes=0 이었고 그 다섯이 «전부» `review-clean-armed` 였다.
   const mergeReasonCases: Array<[string, { ran: boolean; distinguishes: number; 'does-not-distinguish': number; unknown: number; missingAtBase?: number; skippedReason?: string }, string, boolean]> = [
-    ['base에 시험 파일이 없음', { ran: true, distinguishes: 0, 'does-not-distinguish': 0, unknown: 0, missingAtBase: 1 }, 'review-clean-verify-nothing-at-base', true],
+    ['base에 시험 파일이 없음', { ran: true, distinguishes: 0, 'does-not-distinguish': 0, unknown: 0, missingAtBase: 1 }, 'review-clean-verify-structural-red', true],
     ['돌았는데 아무것도 안 가름(does-not-distinguish)', { ran: true, distinguishes: 0, 'does-not-distinguish': 2, unknown: 0 }, 'review-clean-verify-inconclusive', true],
     ['돌았는데 전부 unknown', { ran: true, distinguishes: 0, 'does-not-distinguish': 0, unknown: 1 }, 'review-clean-verify-inconclusive', true],
     ['하나라도 갈랐다', { ran: true, distinguishes: 1, 'does-not-distinguish': 3, unknown: 2 }, 'review-clean-armed', true],

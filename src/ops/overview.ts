@@ -141,17 +141,17 @@ export function bindingResource(s: OverviewSnapshot): ResourceBinding | null {
   for (const host of s.machines.hosts) {
     const l = host.load.value;
     if (!l) continue;
-    if (l.totalGb > 0) {
+    if (Number.isFinite(l.freeGb) && Number.isFinite(l.totalGb) && l.totalGb > 0) {
       const remaining = Math.max(0, l.freeGb);
       candidates.push({ kind: 'memory', label: `${host.name} 메모리`, remainingRatio: ratio01(remaining / l.totalGb), remainingText: `${remainingAmount(remaining)}/${l.totalGb.toFixed(0)}GB` });
     }
-    if (l.cpuCount > 0) {
+    if (Number.isFinite(l.load5) && Number.isFinite(l.cpuCount) && l.cpuCount > 0) {
       const cpuCap = l.cpuCount * LOAD_PER_CORE_PRESSURE;
       const remaining = Math.max(0, cpuCap - l.load5);
       candidates.push({ kind: 'cpu', label: `${host.name} CPU`, remainingRatio: ratio01(remaining / cpuCap), remainingText: `${remainingAmount(remaining)}/${cpuCap.toFixed(0)}코어(압박선 ${LOAD_PER_CORE_PRESSURE}/코어)` });
     }
     const io = l.ioPressure;
-    if (io) {
+    if (io && Number.isFinite(io.someAvg10) && Number.isFinite(io.fullAvg10)) {
       const remaining = Math.max(0, 100 - io.someAvg10);
       candidates.push({ kind: 'io', label: `${host.name} I/O`, remainingRatio: ratio01(remaining / 100), remainingText: `${remainingAmount(remaining)}/100(압박 ${remainingAmount(io.someAvg10)}% · full ${remainingAmount(io.fullAvg10)}% · 10초 평균)` });
     }

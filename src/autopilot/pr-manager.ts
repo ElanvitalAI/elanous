@@ -533,17 +533,37 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
     if (!runKey) return fail(input.runId ? 'new run id invalid for scratch ref' : 'run id required for scratch ref');
     const scratch = `self-impl/pr-create-r${runKey}-${randomUUID()}`;
     const scratchRef = `refs/heads/${scratch}`;
+    // ⛔ push 보고는 원격의 진실이 아니다 — ref 를 만든 뒤에도 exit≠0 으로 끝날 수 있고, 삭제가
+    //    실패로 보고돼도 이미 지워졌을 수 있다. 그래서 새 draft 결과가 확정되는 즉시 **이 시도가
+    //    만든 scratch ref 하나만** 상대로 「남았나 보고 → 지운다」. 지우지 못하면 그 이유를 원장에
+    //    남긴다(다른 ref·가지·PR 은 건드리지 않는다).
+    const reapScratchRef = (outcome: 'branch-created' | 'create-refused' | 'upload-failed'): void => {
+      // 업로드가 실패로 보고돼도 원격에 ref 가 남아 있을 수 있다 — 먼저 읽고 건너뛰면 «읽은 뒤
+      // 늦게 착지한» ref 가 남는 창이 생긴다. 그래서 결과와 무관하게 늘 삭제를 시도하고,
+      // 원격이 «그런 ref 없음» 이라 답하면 이미 없는 것이므로 정리 실패로 세지 않는다.
+      let removed = run('git', ['-C', cwd, 'push', 'origin', `:${scratchRef}`]);
+      if (!removed.ok && isTransientPushFailure(removed.err || removed.out))
+        removed = run('git', ['-C', cwd, 'push', 'origin', `:${scratchRef}`]);
+      if (removed.ok) return;
+      if (/remote ref does not exist/i.test(`${removed.err ?? ''}\n${removed.out ?? ''}`)) {
+        debug.log('autopilot.pr-manager', 'same-cell-scratch-absent', { scratchRef, outcome });
+        return;
+      }
+      debug.log('autopilot.pr-manager', 'same-cell-scratch-cleanup-failed',
+        { scratchRef, outcome, detail: removed.err || removed.out,
+          stderr: removed.err ?? '', stdout: removed.out, truncated: false }, { level: 'warn' });
+    };
     const uploaded = run('git', ['-C', cwd, 'push', 'origin', `HEAD:${scratchRef}`]);
-    if (!uploaded.ok) return fail(`new run object upload failed: ${(uploaded.err || uploaded.out).slice(0, 220)}`);
+    if (!uploaded.ok) {
+      reapScratchRef('upload-failed');
+      return fail(`new run object upload failed: ${(uploaded.err || uploaded.out).slice(0, 220)}`);
+    }
     const repository = run('gh', ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'], { cwd });
     const repoName = repository.out.trim();
     const createdRef = repository.ok && /^[^/\s]+\/[^/\s]+$/.test(repoName)
       ? run('gh', ['api', '--method', 'POST', `repos/${repoName}/git/refs`, '-f', `ref=${newRef}`, '-f', `sha=${localHead.out.trim()}`], { cwd })
       : { ok: false, out: '', err: 'repository identity unavailable' };
-    const removedScratch = run('git', ['-C', cwd, 'push', 'origin', `:${scratchRef}`]);
-    if (!removedScratch.ok) debug.log('autopilot.pr-manager', 'same-cell-scratch-cleanup-failed',
-      { scratchRef, detail: removedScratch.err || removedScratch.out,
-        stderr: removedScratch.err ?? '', stdout: removedScratch.out, truncated: false }, { level: 'warn' });
+    reapScratchRef(createdRef.ok ? 'branch-created' : 'create-refused');
     if (!createdRef.ok) return fail(`new run branch create refused: ${(createdRef.err || createdRef.out).slice(0, 220)}`);
     const stateLabels = new Set(labelsForAxis('state').map(label => label.name));
     const labels = [...new Set([...(input.labels ?? []).filter(label => !stateLabels.has(label as typeof PR_LABEL_NAMES.running)),

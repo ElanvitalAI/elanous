@@ -11,7 +11,7 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
   // warns when the removed ELANOUS_CONFIG_DIR env var disagrees with it.
   // Preserve that observable warning on hot routes without loading the
   // resolver for the common case where the ignored env var is absent.
-  if (['msg', 'pty', 'logs', 'tasks'].includes(route) && process.env.ELANOUS_CONFIG_DIR !== undefined) {
+  if (['msg', 'pty', 'logs', 'tasks', 'tasks-read'].includes(route) && process.env.ELANOUS_CONFIG_DIR !== undefined) {
     const { getElanousConfigDir } = await import('./elanous-config-dir.js');
     getElanousConfigDir();
   }
@@ -43,6 +43,11 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
     case 'tasks': {
       const { registerTasksCommands } = await import('./cli/tasks-cli.js');
       registerTasksCommands(program);
+      break;
+    }
+    case 'tasks-read': {
+      const { registerTaskReadCommands } = await import('./cli/tasks-read-cli.js');
+      registerTaskReadCommands(program);
       break;
     }
     case 'pty': {

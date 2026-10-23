@@ -22,6 +22,11 @@ function fail(message) {
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
+/** target 이 dir 안(링크를 풀어도 안)에 있는가 — '..' 탈출과 절대경로 탈출을 모두 잡는다. */
+function insideWork(dir, target) {
+  const rel = path.relative(dir, target);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
 function probe(file, binary) {
   return JSON.parse(execFileSync(binary, ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', file], {
     encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe']
@@ -56,6 +61,66 @@ function run() {
     if (a.maxBytes !== undefined && (!Number.isSafeInteger(a.maxBytes) || a.maxBytes <= 0)) throw new Error(`maxBytes must be a positive integer for ${a.id}.`);
   }
   const directory = path.dirname(manifestPath);
+  // 작업 폴더(manifest 디렉터리) 경계: 입력·출력·ffprobe 실행 파일이 폴더 밖(심볼릭 링크를 타서라도)으로 나가면 거부한다.
+  // realDir 를 기준으로 resolve 하고 realpath 로 편 뒤 비교한다 — 링크 경로와 실제 경로를 섞지 않는다.
+  const realDir = fs.existsSync(directory) ? fs.realpathSync(directory) : directory;
+  /** p 를 실제 파일시스템 경로로 완전히 편다. 존재하지 않는 끝 칸은 «존재하는 가장 가까운 조상»의 realpath 뒤에 tail 로 붙인다.
+   * 각 칸을 lstatSync 로 링크 자체로 본다 — existsSync 는 끊긴 symlink 를 «없음»으로 보지만 lstatSync 는 링크로 잡아
+   * readlink 로 재귀적으로 풀므로, «문자열상으로는 폴더 안이지만 중간 symlink 디렉터리를 타서 실제로는 밖»인 경로도
+   * 밖 실제 경로로 펼쳐 경계 검사에 걸린다. 존재하지 않는 tail 칸은 엔트리가 없으므로 링크를 탈 수 없다. */
+  const resolveReal = (p, depth = 0) => {
+    if (depth > 16) throw new Error('심볼릭 링크가 너무 깊다.');
+    let cur = p;
+    let tail = '';
+    for (;;) {
+      let stat = null;
+      try { stat = fs.lstatSync(cur); }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        const parent = path.dirname(cur);
+        if (parent === cur) return cur + tail;
+        tail = cur.slice(parent.length) + tail;
+        cur = parent;
+        continue;
+      }
+      if (stat.isSymbolicLink()) {
+        const target = path.resolve(path.dirname(cur), fs.readlinkSync(cur));
+        return resolveReal(target, depth + 1) + tail;
+      }
+      return fs.realpathSync(cur) + tail;
+    }
+  };
+  /** value 를 realDir 기준으로 resolve 하고 실제 경로로 편다. realDir 안이 아니면 거부한다.
+   * write=true(쓰기 대상)면 폴더 안으로 풀린 경로라도 inode 를 밖 이름과 공유하는 하드 링크를 거부한다 —
+   * realpath 는 하드 링크를 «안»으로 보지만 O_TRUNC 는 같은 inode 인 폴더 밖 파일을 덮어쓴다. */
+  const guardInside = (label, value, write = false) => {
+    const real = resolveReal(path.resolve(realDir, value));
+    if (!insideWork(realDir, real)) throw new Error(`작업 폴더 밖 ${label} 은 거부한다: ${value}`);
+    if (write) {
+      let stat = null;
+      try { stat = fs.lstatSync(real); } catch {}
+      if (stat && !stat.isSymbolicLink() && stat.nlink > 1)
+        throw new Error(`작업 폴더 밖 ${label} 은 거부한다(하드 링크가 폴더 밖 이름과 inode 를 공유한다): ${value}`);
+    }
+    return real;
+  };
+  for (const a of manifest.assets) {
+    for (const entry of [a.file, a.poster]) {
+      if (typeof entry !== 'string' || !entry.trim()) continue;
+      guardInside('경로', entry);
+    }
+  }
+  if (out) out = guardInside('--out', out, true);
+  // «--ffprobe 를 줬는가»로 가른다 — 값이 우연히 'ffprobe' 인지로 가르면 `--ffprobe ffprobe` 가
+  // 경계 검사를 통째로 건너뛰고 PATH 조회로 폴더 밖 바이너리를 실행한다.
+  if (flags.has('--ffprobe')) {
+    if (!binary.includes('/') && !binary.includes('\\'))
+      throw new Error(`작업 폴더 밖 --ffprobe 실행 파일은 거부한다(PATH 조회는 허용하지 않는다): ${binary}`);
+    // execFileSync 는 상대 경로를 CWD 기준으로 푼다 — 가드도 CWD 기준으로 확정한 그 경로를 검사하고,
+    // 확정된 실경로를 그대로 실행한다(검사 경로 = 실행 경로). realDir 기준으로만 검사하면
+    // `--ffprobe ./ffprobe` 같은 상대 경로가 폴더 안으로 공허하게 통과한 뒤 CWD 의 밖 바이너리가 실행된다.
+    binary = guardInside('--ffprobe 실행 파일', path.resolve(binary));
+  }
   const localFiles = manifest.assets.flatMap(a => [a.file, ...(a.poster ? [a.poster] : [])]).map(f => path.resolve(directory, f));
   const resolvedOut = out && fs.existsSync(out) ? fs.realpathSync(out) : out;
   const inputPaths = [manifestPath, ...localFiles].map(f => fs.existsSync(f) ? fs.realpathSync(f) : f);
@@ -101,7 +166,15 @@ function run() {
     status: assets.some(a => a.issues.length) ? 'FAIL' : 'PASS', assets,
     limits: 'Metadata checks only; visual motion, audible content, rights and device playback require separate verification.'
   };
-  if (out) fs.writeFileSync(out, `${JSON.stringify(report, null, 2)}\n`);
+  if (out) {
+    // O_NOFOLLOW 로 마지막 칸이 symlink 면 링크를 따라가지 않고 실패한다(경계 우회 2중 방지).
+    const text = `${JSON.stringify(report, null, 2)}\n`;
+    let linked = null;
+    try { linked = fs.lstatSync(out); } catch {}
+    if (linked?.isSymbolicLink()) throw new Error(`--out 대상이 링크면 거부한다: ${out}`);
+    const fd = fs.openSync(out, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW ?? 0));
+    try { fs.writeFileSync(fd, text); } finally { fs.closeSync(fd); }
+  }
   console.log(JSON.stringify(report, null, 2));
   if (report.status === 'FAIL') process.exitCode = 1;
 }

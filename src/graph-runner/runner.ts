@@ -38,6 +38,7 @@ const RELEASE_NODE_COMMANDS: Readonly<Record<string, { recipe: string; command?:
   'checklist-gate': { recipe: 'cmd:checklist-gate', command: 'bun scripts/release-loop/checklist-gate-node.ts' },
   prefetch: { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
   gate: { recipe: 'cmd:gate', command: 'bun scripts/release-loop/gate-node.ts --json' },
+  'traffic-gate-passed': { recipe: 'cmd:traffic-gate-passed', command: 'bun scripts/release-loop/traffic-node.ts traffic-gate-passed' },
   'gate-triage': { recipe: 'cmd:gate-triage', command: 'bun scripts/release-loop/gate-triage-node.ts' },
   'mac-smoke': { recipe: 'cmd:mac-smoke', command: 'bun scripts/release-loop/mac-smoke-node.ts' },
   'export-check': { recipe: 'cmd:export-check', command: 'bun scripts/release-loop/export-check-node.ts' },
@@ -48,12 +49,15 @@ const RELEASE_NODE_COMMANDS: Readonly<Record<string, { recipe: string; command?:
   docs: { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
   'known-issues': { recipe: 'cmd:known-issues', command: 'bun scripts/release-loop/known-issues-node.ts' },
   'notes-check': { recipe: 'cmd:notes-check', command: 'bun scripts/announce-loop/check-node.ts --json' },
+  'notes-repair': { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
+  'notes-recheck': { recipe: 'cmd:notes-check', command: 'bun scripts/announce-loop/check-node.ts --json' },
   'auto-approve': { recipe: 'cmd:auto-approve', command: 'bun scripts/release-loop/auto-approve-node.ts' },
   'approve-publish': { recipe: 'approval:publish' },
   publish: { recipe: 'cmd:publish-command', command: 'bun scripts/release-loop/publish-node.ts' },
   'npm-publish': { recipe: 'cmd:npm-publish', command: 'bun scripts/release-loop/npm-publish-node.ts' },
   'docs-land': { recipe: 'cmd:docs-land', command: 'bun scripts/release-loop/docs-land-node.ts' },
   verify: { recipe: 'cmd:verify', command: 'bun scripts/release-loop/verify-node.ts' },
+  'traffic-verify-complete': { recipe: 'cmd:traffic-verify-complete', command: 'bun scripts/release-loop/traffic-node.ts traffic-verify-complete' },
   'vault-note': { recipe: 'cmd:vault-note', command: 'bun scripts/release-loop/vault-note-node.ts' },
   'release-story': { recipe: 'cmd:release-story', command: 'bun scripts/release-story/draft.ts --graph' },
   'ops-upgrade': { recipe: 'cmd:ops-upgrade', command: 'bun scripts/release-loop/ops-upgrade-node.ts' },
@@ -264,6 +268,20 @@ export function verifyReleaseCommandRoot(root: string, cutTip: string, git?: (ar
     throw new Error(`release command root ${commandRoot}@${head.slice(0, 12)} differs from cut tip ${cutTip.slice(0, 12)} — use --command-root <컷 tip checkout>`);
   }
   return commandRoot;
+}
+
+/** Reject a checkout whose saved release graph or recipes differ, including before an injected graph runner is called. */
+export function verifyReleaseRecipeSnapshot(commandRoot: string, snapshot?: { graphSha: string; recipesSha: string }): void {
+  if (!snapshot) throw new Error('release recipe snapshot missing — cannot pin command source');
+  const cutGraph = join(commandRoot, 'graphs', 'release', 'release-loop.yaml');
+  const cutRecipes = join(commandRoot, 'graphs', 'release', 'recipes.yaml');
+  const hashFile = (file: string): string => {
+    try { return createHash('sha256').update(readFileSync(file)).digest('hex'); }
+    catch { throw new Error(`release recipe source missing in cut checkout: ${file}`); }
+  };
+  if (hashFile(cutGraph) !== snapshot.graphSha || hashFile(cutRecipes) !== snapshot.recipesSha) {
+    throw new Error('release recipe source differs from the saved graph snapshot at cut tip');
+  }
 }
 
 function safeSegment(value: string): string {
@@ -780,16 +798,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const commandRoot = verifyReleaseCommandRoot(source.root, savedCutTip, source.git);
     // The ledger snapshot must be the recipe that the cut checkout actually carries.
     // HEAD alone does not bind a saved graph to that checkout.
-    if (!state.graphSnapshot) throw new Error('release recipe snapshot missing — cannot pin command source');
-    const cutGraph = join(commandRoot, 'graphs', 'release', 'release-loop.yaml');
-    const cutRecipes = join(commandRoot, 'graphs', 'release', 'recipes.yaml');
-    const hashFile = (file: string): string => {
-      try { return createHash('sha256').update(readFileSync(file)).digest('hex'); }
-      catch { throw new Error(`release recipe source missing in cut checkout: ${file}`); }
-    };
-    if (hashFile(cutGraph) !== state.graphSnapshot.graphSha || hashFile(cutRecipes) !== state.graphSnapshot.recipesSha) {
-      throw new Error('release recipe source differs from the saved graph snapshot at cut tip');
-    }
+    verifyReleaseRecipeSnapshot(commandRoot, state.graphSnapshot);
     return commandRoot;
   };
   verifyReleaseSource();
@@ -1070,7 +1079,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       for (const previous of state.nodes) outputs[previous.nodeId] = lastJsonObject(previous.output) ?? previous.output ?? null;
       const contextPath = join(`${statePath}.contexts`, `${state.path.length}.json`);
       mkdirSync(dirname(contextPath), { recursive: true });
-      writeFileSync(contextPath, JSON.stringify({ graphId, runId, nodeId: current, input: state.input ?? null, outputs }, null, 2) + '\n');
+      writeFileSync(contextPath, JSON.stringify({ graphId, runId, startedAt: state.startedAt, nodeId: current, input: state.input ?? null, outputs }, null, 2) + '\n');
       let code: number | null = null;
       const redactCredentials = (text: string) => Object.values(credentials).filter(value => value.length > 0)
         .reduce((safe, value) => safe.replaceAll(value, '[REDACTED]'), text);

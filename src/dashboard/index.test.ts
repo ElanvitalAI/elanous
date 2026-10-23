@@ -1,6 +1,6 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { createProject } from '../project/project-store.js';
@@ -8,6 +8,7 @@ import { setElanousConfigDir, getElanousConfigDirOverride, resetElanousConfigDir
 import { createSession, listSessions } from '../session/index.js';
 import { join, resolve } from 'node:path';
 import ts from 'typescript';
+import { Terminal as XtermHeadless } from '@xterm/headless';
 
 import { debug } from '../debug/log.js';
 import { LogStore, StoreSink } from '../mss/logging/log-store.js';
@@ -23,6 +24,7 @@ import {
   dispatchLogZoneClick,
   flattenForkableSessionHistory,
   observeDashboardToolDispatchSignal,
+  openSyncSetupWindow,
   activeEscHarnessSpace,
   createEscAbortToolState,
   trackEscAbortToolCall,
@@ -30,6 +32,7 @@ import {
   registerDashboardFinderAndHistoryKeys,
   activeDashboardTypeaheadSessionId,
   applyDashboardStreamingTypeaheadKey,
+  subscribeDashboardAgentResults,
   type LogZoneClickWidgetHost,
 } from './index.js';
 import { buildAdRunSetup } from '../ad-pipeline/ad-run-setup.js';
@@ -43,9 +46,261 @@ import { handoffTurnTypeaheadAtTurnEnd, steerLastTurnTypeaheadSubmission } from 
 import { clearPendingUserInput, drainPendingUserInput, pendingUserInputCount } from '../session/pending-input.js';
 import { streamLLMWithTools, type LLMProvider } from '../llm.js';
 import { ptyAvailable, startPty, unregisterPty } from '../pty-shell/registry.js';
+import { AgentRegistry } from '../agent/registry.js';
+import { TaskNotificationQueue, renderTaskNotificationsXml } from '../agent/task-notification.js';
+import { wireTaskNotifications } from '../agent/task-notification.js';
+
+// 시험이 process.chdir 로 옮긴 cwd 를 시간 초과에도 되돌린다(비동기 본문의 finally 는 afterEach 보다 늦을 수 있다 · test-interference 래칫).
+const FILE_START_CWD = process.cwd();
+afterEach(() => {
+  if (process.cwd() !== FILE_START_CWD) process.chdir(FILE_START_CWD);
+});
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const dashboard = tuiSourceText();
+
+test('agent completion enters dashboard history with a 500-char preview and openable full result after drain', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-agent-result-'));
+  const registry = new AgentRegistry();
+  const queue = new TaskNotificationQueue(root);
+  const lines: string[] = [];
+  const offRegistry = wireTaskNotifications(queue, registry);
+  const offHistory = subscribeDashboardAgentResults(queue, () => {}, line => { lines.push(line); });
+  const result = 'r'.repeat(49_990) + 'TAIL-12345';
+  try {
+    const provider: LLMProvider = {
+      name: 'result-test', defaultModel: 'test', available: () => true,
+      async *chat() { yield result; },
+      async *streamChat() { yield { type: 'text' as const, delta: result }; },
+    };
+    const handle = registry.spawn({
+      definition: { name: 'result-child', systemPrompt: 'Test child' },
+      prompt: 'complete', provider, background: true,
+    });
+    for await (const _event of handle.events) { /* wait for actual runner completion */ }
+    expect(lines).toHaveLength(0);
+    const notifications = queue.drain();
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]!.state).toBe('done');
+    expect(notifications[0]!.output.length).toBeLessThanOrEqual(500);
+    expect(lines).toHaveLength(1);
+    const renderedHistory = lines.join('\n');
+    const path = renderedHistory.split(' · full result: ')[1]?.split(' · summary: ')[0];
+    expect(path ?? '').toBe(notifications[0]!.resultPath ?? '');
+    expect(renderTaskNotificationsXml(notifications)).toContain(path!);
+    const opened = readFileSync(path as string, 'utf8');
+    expect(opened).toBe(result);
+    expect(opened.slice(-10)).toBe('TAIL-12345');
+    console.log(`DASHBOARD_RESULT history-length=${renderedHistory.length} summary-length=${notifications[0]!.output.length} opened-path=${path} opened-length=${opened.length} tail=${opened.slice(-10)}`);
+  } finally {
+    offHistory(); offRegistry();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('isolated dashboard renders the 50,000-character child result only after queue drain', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-result-screen-'));
+  const state = join(root, 'state');
+  mkdirSync(state);
+  writeFileSync(join(root, 'config.json'), JSON.stringify({
+    onboarding: { completed: true }, llm: { provider: 'local', model: 'test-model' }, mcp: { enabled: false },
+  }));
+  const readyPath = join(root, 'ready');
+  const drainPath = join(root, 'drain');
+  const childScript = `
+    import { showDashboard } from './src/dashboard/index.ts';
+    import { globalAgentRegistry } from './src/agent/registry.ts';
+    import { globalTaskNotificationQueue } from './src/agent/task-notification.ts';
+    import { existsSync, writeFileSync } from 'node:fs';
+    const evidencePath = __EVIDENCE_PATH__;
+    const readyPath = __READY_PATH__;
+    const drainPath = __DRAIN_PATH__;
+    process.on('uncaughtException', error => { writeFileSync(evidencePath, 'ERROR ' + String(error)); process.exit(1); });
+    process.on('unhandledRejection', error => { writeFileSync(evidencePath, 'ERROR ' + String(error)); process.exit(1); });
+    const result = 'r'.repeat(49_990) + 'TAIL-12345';
+    let firstFrame = () => {};
+    const rendered = new Promise(resolve => { firstFrame = resolve; });
+    void (async () => {
+      try {
+        await rendered;
+        await Bun.sleep(1000);
+        const handle = globalAgentRegistry.spawn({
+          definition: { name: 'screen-child', systemPrompt: 'Test child' },
+          prompt: 'complete', background: true,
+          provider: { name: 'screen-fake', defaultModel: 'test', available: () => true,
+            async *chat() { yield result; },
+            async *streamChat() { yield { type: 'text', delta: result }; } },
+        });
+        for await (const _ of handle.events) {}
+        if (globalTaskNotificationQueue.size !== 1) throw new Error('completion did not enqueue');
+        writeFileSync(readyPath, 'enqueued');
+        while (!existsSync(drainPath)) await Bun.sleep(50);
+        const notices = globalTaskNotificationQueue.drain();
+        writeFileSync(evidencePath, JSON.stringify({ count: notices.length, state: notices[0]?.state,
+          resultPath: notices[0]?.resultPath, summaryLength: notices[0]?.output.length }));
+      } catch (error) { writeFileSync(evidencePath, 'ERROR ' + String(error)); process.exit(1); }
+    })();
+    await showDashboard({ onFirstFrameRendered: () => firstFrame() });
+  `;
+  const scriptPath = join(repoRoot, '.elanous-test', 'scratch', `dashboard-result-${process.pid}.ts`);
+  mkdirSync(join(repoRoot, '.elanous-test', 'scratch'), { recursive: true });
+  const evidencePath = join(root, 'screen-result.txt');
+  writeFileSync(scriptPath, childScript.replaceAll("'./src/", "'../../src/")
+    .replace('__EVIDENCE_PATH__', JSON.stringify(evidencePath))
+    .replace('__READY_PATH__', JSON.stringify(readyPath))
+    .replace('__DRAIN_PATH__', JSON.stringify(drainPath)));
+  // 격리 무대: HOME·state·data 를 뿌리 안으로(전문 파일이 저장소 data/ 나 ~/.elanous 로 새지 않게),
+  // 로그인 셸 env 수입 끔, 공급자 자격 모양 env 는 지운다.
+  const dataDir = join(root, 'data');
+  const env: Record<string, string> = { ...process.env as Record<string, string>, NODE_ENV: 'development',
+    HOME: root, ELANOUS_STATE_DIR: state, ELANOUS_STATE_DIR_SOURCE: 'explicit', ELANOUS_DATA_DIR: dataDir,
+    ELANOUS_SKIP_LOGIN_ENV: '1', TERM: 'xterm-256color', COLUMNS: '400', LINES: '40' };
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  const credentialEnv = /(_API_KEY|_TOKEN|_AUTH|_SECRET)$|^(ANTHROPIC|OPENAI|OPENROUTER|XAI|GROK|GEMINI|GOOGLE|CODEX|CLAUDE|AWS|BEDROCK|ELANOUS_CODEX)/i;
+  for (const key of Object.keys(env)) if (credentialEnv.test(key)) delete env[key];
+  const pty = ptyAvailable() && process.env.ELANOUS_TEST_SCREEN_PIPE !== '1' ? startPty({ cmd: 'bun', args: [scriptPath], workdir: repoRoot,
+    cols: 400, rows: 40, env, unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] }) : null;
+  const terminal = pty ? null : new XtermHeadless({ cols: 400, rows: 40, allowProposedApi: true });
+  const child = pty ? null : spawn('script', ['-q', '-c', `stty cols 400 rows 40; bun ${JSON.stringify(scriptPath)}`, '/dev/null'],
+    { cwd: repoRoot, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  child?.stdout?.on('data', (chunk: Buffer) => { terminal?.write(chunk.toString('utf8')); });
+  let stderr = '';
+  child?.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+  const handle = pty ?? { renderScreen: async (): Promise<string> => {
+    await new Promise<void>(resolveWrite => terminal!.write('', resolveWrite));
+    const buffer = terminal!.buffer.active;
+    return Array.from({ length: 40 }, (_, row) => buffer.getLine(row)?.translateToString(true) ?? '').join('\n');
+  } };
+  const chatLog = (screen: string): string[] => {
+    const rows = screen.split('\n');
+    const title = rows.findIndex(row => row.includes('ChatLog'));
+    if (title < 0) return [];
+    const end = rows.findIndex((row, index) => index > title && (row.includes('❯') || row.includes('Debug Log')));
+    return rows.slice(title + 1, end > title ? end : undefined);
+  };
+  try {
+    const deadline = Date.now() + 45_000;
+    while (!existsSync(readyPath) && Date.now() < deadline) await Bun.sleep(100);
+    expect(existsSync(readyPath)).toBe(true);
+    const beforeRows = chatLog(await handle.renderScreen());
+    expect(beforeRows.length).toBeGreaterThan(0);
+    expect(beforeRows.some(line => line.includes('Agent result · full result:'))).toBe(false);
+    writeFileSync(drainPath, 'drain');
+    while (!existsSync(evidencePath) && Date.now() < deadline) await Bun.sleep(100);
+    const evidence = existsSync(evidencePath) ? readFileSync(evidencePath, 'utf8') : `missing; stderr=${stderr}`;
+    expect(evidence).not.toStartWith('ERROR');
+    const notice = JSON.parse(evidence) as { count: number; state: string; resultPath: string; summaryLength: number };
+    expect(notice.count).toBe(1);
+    expect(notice.state).toBe('done');
+    expect(notice.summaryLength).toBeLessThanOrEqual(500);
+    let historyLine: string | undefined;
+    const historyDeadline = Date.now() + 5_000;
+    while (!historyLine && Date.now() < historyDeadline) {
+      historyLine = chatLog(await handle.renderScreen()).find(line => line.includes('Agent result · full result:'));
+      if (!historyLine) await Bun.sleep(100);
+    }
+    expect(historyLine).toBeDefined();
+    const path = historyLine!.split('full result: ')[1]?.split(' · summary: ')[0];
+    expect(path).toBe(notice.resultPath);
+    expect(path!.startsWith(join(dataDir, 'agent-results') + '/')).toBe(true);
+    expect(historyLine).toContain(' · summary: ' + 'r'.repeat(30));
+    expect(historyLine!.length).toBeLessThanOrEqual(400);
+    const opened = readFileSync(path!, 'utf8');
+    expect(opened).toBe('r'.repeat(49_990) + 'TAIL-12345');
+    expect(opened.slice(-10)).toBe('TAIL-12345');
+    console.log(`SCREEN_RESULT before-chatlog-line=false history-length=${historyLine!.length} opened-path=${path} opened-length=${opened.length} tail=${opened.slice(-10)}`);
+  } finally {
+    pty?.kill();
+    if (pty) unregisterPty(pty.id);
+    child?.kill();
+    terminal?.dispose();
+    rmSync(scriptPath, { force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 35_000);
+
+test('dashboard history reports preservation failures without a success path', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-agent-failure-'));
+  const queue = new TaskNotificationQueue(root, 500);
+  const lines: string[] = [];
+  const off = subscribeDashboardAgentResults(queue, () => {}, line => { lines.push(line); });
+  try {
+    queue.enqueue({ taskId: 'limit-failure', agentName: 'child', state: 'done', output: 'x'.repeat(700), truncated: false, durationMs: 1, finishedAt: 1 });
+    expect(lines).toHaveLength(0);
+    const [notice] = queue.drain();
+    expect(notice?.state).toBe('error');
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('result length 700 exceeds limit 500');
+    expect(lines[0]).not.toContain('full result:');
+  } finally {
+    off();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(!ptyAvailable())('legacy production log-search modal: same PTY direct-write rows and caret before/after', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-legacy-modal-'));
+  mkdirSync(join(root, 'state'));
+  // Pin a local provider so the idle prompt is the bare `❯` on every host. Without it the
+  // screen depends on the runner's HOME credentials: an empty HOME (self gate child env)
+  // renders `❯ /quit /clear (run `elanous setup` — no LLM provider available)` instead.
+  const server = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    fetch(request) {
+      if (new URL(request.url).pathname === '/v1/models') return Response.json({ data: [{ id: 'test-model' }] });
+      return new Response('not found', { status: 404 });
+    },
+  });
+  writeFileSync(join(root, 'config.json'), JSON.stringify({
+    onboarding: { completed: true }, llm: { provider: 'local', model: 'test-model', baseUrl: `http://127.0.0.1:${server.port}/v1` },
+    mcp: { enabled: false }, skillRouter: { llmFallback: false },
+  }));
+  const env: Record<string, string> = {
+    ...process.env as Record<string, string>,
+    NODE_ENV: 'development', ELANOUS_STATE_DIR: join(root, 'state'), TERM: 'xterm-256color',
+  };
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  const handle = startPty({ cmd: 'bun', args: ['bin/elanous.mjs', `--test=${root}`, '--legacy'],
+    workdir: repoRoot, cols: 120, rows: 30, env,
+    unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
+  const trigger = '/log search\r';
+  try {
+    const deadline = Date.now() + 80_000;
+    const wait = async (predicate: () => Promise<boolean>) => {
+      while (Date.now() < deadline) {
+        if (await predicate()) return;
+        await Bun.sleep(100);
+      }
+      throw new Error(`legacy modal timeout: ${JSON.stringify((await handle.renderScreen()).slice(-1200))}`);
+    };
+    await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
+    const before = await handle.renderScreen();
+    const rawBefore = handle.snapshot();
+    handle.drainDelta();
+    handle.write(trigger);
+    await wait(async () => (await handle.renderScreen()).includes('Log search'));
+    const after = await handle.renderScreen();
+    const rawAfter = handle.drainDelta();
+    const beforeRows = before.split('\n');
+    const afterRows = after.split('\n');
+    const modalWrite = rawAfter.slice(rawAfter.lastIndexOf('\x1b[3;30H'));
+    console.log(`LEGACY_MODAL trigger=${JSON.stringify(trigger)} before=${JSON.stringify(before)} after=${JSON.stringify(after)} rawBeforeTail=${JSON.stringify(rawBefore.slice(-120))} rawAfterModalRows=${JSON.stringify(modalWrite.slice(0, 430))} rawAfterNewlines=${JSON.stringify(rawAfter.match(/\n/g) ?? [])}`);
+    expect(beforeRows[0]).toMatch(/^\[screen 120x30 cursor=\(row \d+, col \d+, visible (true|false)\)\]$/);
+    expect(afterRows[0]).toMatch(/^\[screen 120x30 cursor=\(row \d+, col \d+, visible (true|false)\)\]$/);
+    expect(afterRows[0]).not.toBe(beforeRows[0]);
+    expect(afterRows[3]).toContain('Log search');
+    expect(afterRows[4]).toContain('/');
+    expect(beforeRows.slice(1, 3)).toEqual(afterRows.slice(1, 3));
+    expect(rawAfter).toContain('\x1b[3;30H');
+    expect(rawAfter).toContain('\x1b[4;30H');
+    expect(rawAfter).not.toContain('\n');
+  } finally {
+    handle.kill();
+    unregisterPty(handle.id);
+    server.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 100_000);
 
 test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique word once into local model requests', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dashboard-dedup-live-'));
@@ -95,7 +350,10 @@ test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique wo
     handle.write('first prompt\r');
     await wait(() => requests.length === 1 && !!reply);
     handle.write(`${word}\r`);
-    await wait(async () => (await handle.renderScreen()).includes(word));
+    await wait(async () => {
+      const screen = await handle.renderScreen();
+      return screen.split('\n').some(line => line.includes(word) && line.includes('다음 도구 경계에 넣음'));
+    });
     reply?.();
     await wait(() => requests.length >= 2);
     await Bun.sleep(400);
@@ -1508,4 +1766,203 @@ describe('dashboard ad run setup factory', () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+});
+
+// ── TUI-BOOT-TIMING-HOLES · 0.2.36 — show-dashboard 동기 셋업 구간 ───────────
+// 종전에는 `onFirstFrameRendered` 하나에 묶여 첫 프레임 前 동기 셋업(2.3s)이
+// 통째로 가려졌다. 생산 `showDashboard()` 가 셋업 종료 지점에서
+// `onSyncSetupComplete` 를 부르는지, 그 신호가 첫 프레임 신호보다 «먼저»
+// 도착하는지를 실물 부팅으로 잰다.
+describe('TUI-BOOT-TIMING-HOLES — show-dashboard 동기 셋업 계측', () => {
+  test('openSyncSetupWindow 는 한 번만 보고하고 보고가 던져도 부팅을 막지 않는다', () => {
+    const reported: number[] = [];
+    let clock = 100;
+    const window = openSyncSetupWindow((ms) => reported.push(ms), () => clock);
+    clock = 2_450;
+    window.finish();
+    window.finish();
+    expect(reported).toEqual([2_350]);
+
+    const throwing = openSyncSetupWindow(() => {
+      throw new Error('sink closed');
+    });
+    expect(() => throwing.finish()).not.toThrow();
+    expect(() => openSyncSetupWindow(undefined).finish()).not.toThrow();
+  });
+
+  test('실물 showDashboard() 부팅이 첫 프레임 前 셋업 구간을 보고한다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dashboard-sync-setup-'));
+    const folder = join(root, 'folder');
+    const configRoot = join(root, 'config');
+    const sessionDir = join(root, 'sessions');
+    const markerFile = join(root, 'boot-markers.jsonl');
+    const driver = join(root, 'sync-setup-driver.ts');
+    const previousConfig = getElanousConfigDirOverride();
+    const previousSessionRoot = process.env.ELANOUS_SESSION_ROOT;
+    const previousCwd = process.cwd();
+    try {
+      mkdirSync(folder);
+      mkdirSync(configRoot, { recursive: true });
+      setElanousConfigDir(configRoot);
+      process.env.ELANOUS_SESSION_ROOT = sessionDir;
+      process.chdir(folder);
+      writeFileSync(
+        driver,
+        [
+          "import { appendFileSync } from 'node:fs';",
+          `const markerFile = ${JSON.stringify(markerFile)};`,
+          "const mark = (line: string) => appendFileSync(markerFile, line + '\\n');",
+          `const { setElanousConfigDir } = await import(${JSON.stringify(join(import.meta.dir, '../elanous-config-dir.ts'))});`,
+          `setElanousConfigDir(${JSON.stringify(configRoot)});`,
+          "setTimeout(() => { mark('timeout'); process.exit(1); }, 90_000).unref();",
+          `const { showDashboard } = await import(${JSON.stringify(join(import.meta.dir, 'index.ts'))});`,
+          'await showDashboard({',
+          '  onSyncSetupComplete: (ms) => { mark(`setup=${ms}`); },',
+          "  onFirstFrameRendered: () => { mark('first-frame'); process.exit(0); },",
+          '});',
+          "mark('dashboard-returned');",
+        ].join('\n'),
+      );
+
+      const child = spawn(process.execPath, [driver], {
+        cwd: folder,
+        env: {
+          ...process.env,
+          HOME: join(root, 'home'),
+          ELANOUS_STATE_DIR: configRoot,
+          ELANOUS_SESSION_ROOT: sessionDir,
+          TERM: process.env.TERM ?? 'xterm-256color',
+          CI: '1',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => {
+        stderr += chunk;
+      });
+      let stdout = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => {
+        stdout += chunk;
+      });
+      const code = await new Promise<number | null>((resolveExit, reject) => {
+        child.on('error', reject);
+        child.on('close', resolveExit);
+      });
+
+      const markers = readFileSync(markerFile, 'utf8')
+        .split('\n')
+        .filter((line) => line.trim());
+      if (code !== 0) {
+        throw new Error(`dashboard boot driver rc=${code} stderr=${stderr.slice(-900)} stdout=${stdout.slice(-900)}`);
+      }
+      const setupIndex = markers.findIndex((line) => line.startsWith('setup='));
+      const frameIndex = markers.indexOf('first-frame');
+      expect(setupIndex).toBeGreaterThanOrEqual(0);
+      expect(frameIndex).toBeGreaterThan(setupIndex);
+      const setupMs = Number(markers[setupIndex]?.slice('setup='.length));
+      expect(Number.isFinite(setupMs)).toBe(true);
+      expect(setupMs).toBeGreaterThanOrEqual(0);
+      expect(markers).not.toContain('dashboard-returned');
+    } finally {
+      process.chdir(previousCwd);
+      if (previousConfig !== undefined) setElanousConfigDir(previousConfig);
+      else resetElanousConfigDir();
+      if (previousSessionRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+      else process.env.ELANOUS_SESSION_ROOT = previousSessionRoot;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  test('셋업 창은 화면 조립이 아니라 첫 프레임 flush 완료 시점에 닫힌다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dashboard-sync-setup-flush-'));
+    const folder = join(root, 'folder');
+    const configRoot = join(root, 'config');
+    const sessionDir = join(root, 'sessions');
+    const markerFile = join(root, 'flush-markers.jsonl');
+    const driver = join(root, 'sync-setup-flush-driver.ts');
+    const previousConfig = getElanousConfigDirOverride();
+    const previousSessionRoot = process.env.ELANOUS_SESSION_ROOT;
+    const previousCwd = process.cwd();
+    try {
+      mkdirSync(folder);
+      mkdirSync(configRoot, { recursive: true });
+      setElanousConfigDir(configRoot);
+      process.env.ELANOUS_SESSION_ROOT = sessionDir;
+      process.chdir(folder);
+      writeFileSync(
+        driver,
+        [
+          "import { appendFileSync } from 'node:fs';",
+          `const markerFile = ${JSON.stringify(markerFile)};`,
+          "const mark = (line: string) => appendFileSync(markerFile, line + '\\n');",
+          'const realWrite = process.stdout.write.bind(process.stdout);',
+          'process.stdout.write = ((chunk: any, encodingOrCallback?: any, callback?: any) => {',
+          "  const done = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback;",
+          '  const settled = (error?: Error | null) => {',
+          "    try { mark('flush'); } catch { /* marker must not break drawing */ }",
+          "    if (typeof done === 'function') done(error);",
+          '  };',
+          "  return typeof encodingOrCallback === 'string' ? realWrite(chunk, encodingOrCallback, settled) : realWrite(chunk, settled);",
+          '}) as typeof process.stdout.write;',
+          `const { setElanousConfigDir } = await import(${JSON.stringify(join(import.meta.dir, '../elanous-config-dir.ts'))});`,
+          `setElanousConfigDir(${JSON.stringify(configRoot)});`,
+          "setTimeout(() => { mark('timeout'); process.exit(1); }, 90_000).unref();",
+          `const { showDashboard } = await import(${JSON.stringify(join(import.meta.dir, 'index.ts'))});`,
+          'await showDashboard({',
+          '  onSyncSetupComplete: (ms) => { mark(`setup=${ms}`); },',
+          "  onFirstFrameRendered: () => { mark('first-frame'); process.exit(0); },",
+          '});',
+          "mark('dashboard-returned');",
+        ].join('\n'),
+      );
+
+      const child = spawn(process.execPath, [driver], {
+        cwd: folder,
+        env: {
+          ...process.env,
+          HOME: join(root, 'home'),
+          ELANOUS_STATE_DIR: configRoot,
+          ELANOUS_SESSION_ROOT: sessionDir,
+          TERM: process.env.TERM ?? 'xterm-256color',
+          CI: '1',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => {
+        stderr += chunk;
+      });
+      let stdout = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => {
+        stdout += chunk;
+      });
+      const code = await new Promise<number | null>((resolveExit, reject) => {
+        child.on('error', reject);
+        child.on('close', resolveExit);
+      });
+
+      const markers = readFileSync(markerFile, 'utf8')
+        .split('\n')
+        .filter((line) => line.trim());
+      if (code !== 0) {
+        throw new Error(`dashboard flush driver rc=${code} stderr=${stderr.slice(-900)} stdout=${stdout.slice(-900)}`);
+      }
+      const setupIndex = markers.findIndex((line) => line.startsWith('setup='));
+      expect(setupIndex).toBeGreaterThan(0);
+      expect(markers).toContain('flush');
+      expect(markers[setupIndex - 1]).toBe('flush');
+      expect(markers.indexOf('first-frame')).toBeGreaterThan(setupIndex);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousConfig !== undefined) setElanousConfigDir(previousConfig);
+      else resetElanousConfigDir();
+      if (previousSessionRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+      else process.env.ELANOUS_SESSION_ROOT = previousSessionRoot;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 180_000);
 });

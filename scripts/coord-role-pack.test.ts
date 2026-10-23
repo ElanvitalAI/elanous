@@ -25,7 +25,7 @@ test('coordinator and guardian packs start with L0 prohibitions and have determi
     expect(first.body).not.toMatch(role === 'coordinator' ? /^- G\d+ · /m : /^- C\d+ · /m);
     expect(first.body).not.toMatch(/- L(?:[1-9]|[12]\d) · /);
     for (const id of first.excludedCardIds) {
-      expect(id).toMatch(/^K-[A-Za-z]+-\d+$/);
+      expect(id).toMatch(/^K-[A-Za-z]+(?:-[A-Za-z]{1,4})?-\d+$/);
       expect(first.body).not.toContain(`- ${id} · `);
     }
     expect(first.body).not.toMatch(/K-1014-\d+|\/Users\/[A-Za-z0-9._-]+|\u{1F451}/u);
@@ -229,7 +229,7 @@ test('CLI entry emits the lint-filtered pack deterministically through the produ
   expect(pack).toEqual(buildCoordRolePackManifest('coordinator'));
   expect(pack.body.startsWith('# 금지 목록\n')).toBe(true);
   expect(pack.sha256).toBe(createHash('sha256').update(pack.body).digest('hex'));
-  for (const id of pack.excludedCardIds) expect(id).toMatch(/^K-[A-Za-z]+-\d+$/);
+  for (const id of pack.excludedCardIds) expect(id).toMatch(/^K-[A-Za-z]+(?:-[A-Za-z]{1,4})?-\d+$/);
   // 같은 입력 → 프로세스 경계를 넘어도 같은 출력(결정적 해시).
   expect(runCli(['--role', 'coordinator', '--json']).stdout).toBe(jsonRun.stdout);
   // 비밀값은 CLI 출력 전체(JSON 메타데이터 포함)에 없다.

@@ -70,6 +70,8 @@ export function providerLabel(entries: readonly RunLedgerEntry[]): string {
 }
 
 function blockReason(entry: RunLedgerEntry): string | undefined {
+  // Intermediate events (notably node-skipped(reason=condition)) are not stop reasons.
+  if (entry.event !== 'failed' && !(entry.event === 'run-status' && entry.data.runStatus === 'failed')) return undefined;
   return stringField(entry.data, 'stopReason')
     ?? stringField(entry.data, 'reason')
     ?? stringField(entry.data, 'verdict')
@@ -95,11 +97,13 @@ export function classifyLedgerRun(entries: readonly RunLedgerEntry[], nowMs: num
   ).size;
   const merged = [...entries].reverse().find((entry) => entry.event === 'merged' && entry.data.merged === true);
   const drafted = [...entries].reverse().find((entry) => entry.event === 'pr-opened' && entry.data.draft !== false);
-  const failed = [...entries].reverse().find((entry) => entry.event === 'failed' || entry.event === 'run-status' && (entry.data.runStatus === 'failed' || entry.data.runStatus === 'stopped'));
+  const failed = [...entries].reverse().find((entry) => entry.event === 'failed'
+    || entry.event === 'run-status' && entry.data.runStatus === 'failed');
   const outcome: OutcomeKind = merged ? 'landed' : drafted ? 'draft' : failed ? 'failed' : 'open';
-  const reason = outcome === 'failed' || outcome === 'open'
-    ? (failed ? blockReason(failed) : undefined)
-      ?? entries.map(blockReason).reverse().find((value) => value !== undefined)
+  // Only failure events may explain a stop. A trailing failed status marker can
+  // omit the reason supplied by an earlier failed event; intermediate skips cannot.
+  const reason = outcome === 'failed'
+    ? [...entries].reverse().map(blockReason).find((value) => value !== undefined) ?? 'unclassified'
     : undefined;
   return {
     provider: providerLabel(entries),

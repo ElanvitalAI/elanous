@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildControllerSystemMessage, buildDashboardTurnPreamble } from './turn-preamble.js';
-import { startSeatBootConversation } from './seat-boot-preamble.js';
+import { SEAT_MEMORY_RECALL_PREFIX, startSeatBootConversation } from './seat-boot-preamble.js';
 import { LAST_SESSION_FILE } from './seat-local-instructions.js';
 import { globalTaskNotificationQueue } from '../agent/task-notification.js';
 import { getUserConfig } from '../user-config.js';
@@ -24,6 +24,7 @@ describe('buildDashboardTurnPreamble — L1 자리 부트 카드(TUI-SESSION-BOO
     mkdirSync(join(home, 'elanous-hq', 'seat-state', 'OP'), { recursive: true });
     writeFileSync(join(cwd, 'AGENTS.local.md'), '역할 = 판정 제안 담당\n');
     writeFileSync(join(cwd, LAST_SESSION_FILE), '## 지난 세션 (TUI 가 대화 끝마다 갈아 쓴다 · 사람이 고치지 않는 파일)\n- 마지막 요청: 세션 정리해줘\n- 열린 일: 대시보드 첫 화면 검토\n');
+    writeFileSync(join(home, 'elanous-hq', 'seat-state', 'OP', 'HANDOFF-now.md'), '# OP 이어받기 — 10-22\n클래식 회상 줄 확인\n');
     const msgPath = join(home, 'state', 'msg', 'messages.db');
     const store = new MsgStore(msgPath);
     try {
@@ -36,6 +37,10 @@ describe('buildDashboardTurnPreamble — L1 자리 부트 카드(TUI-SESSION-BOO
       expect(firstText).toContain('역할: 판정 제안 담당');
       expect(firstText).toContain('## 지난 세션');
       expect(firstText).toContain('열린 일: 대시보드 첫 화면 검토');
+      // TUI-SEAT-MEMORY-RECALL — 클래식 대시보드 첫 턴에도 직전 인계 회상 한 줄.
+      expect(firstText.split('\n').filter((line) => line.startsWith(SEAT_MEMORY_RECALL_PREFIX))).toEqual([
+        expect.stringContaining('클래식 회상 줄 확인'),
+      ]);
       startSeatBootConversation({ reason: 'session-new' });
       store.post({ from: 'TC', to: 'OP', body: 'second-mail' });
       store.post({ from: 'MK', to: 'ALL', body: 'broadcast-mail' });

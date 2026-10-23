@@ -30,13 +30,18 @@ import { controlInboxEnv } from '../../harness/control-inbox.js';
 import { finishPodFragment, writePodFragment } from '../../harness/self-send-target.js';
 import { mintRunId, normalizeRunId } from '../../harness/harness-space.js';
 import { TA_LAND_ENV } from '../../task-agent/task-hand.js';
-import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath, type RunLedgerEntry } from '../../self-implement/run-ledger.js';
 import { runSuffixKey } from '../../self-implement/salvage-branches.js';
 import type { GoalExecutionRecord } from '../../self-implement/orchestrator.js';
 import { hostRepositoryUnavailable, runHostRegate, type HostRegateResult } from '../../self-implement/host-regate.js';
 import { resolvePodHostAcpReview, runPodHostAcpReview, type PodHostAcpReviewOutcome } from './pod-host-acp-review.js';
 import { REVIEW_DEFERRED_TO_HOST_ENV, REVIEW_DEFERRED_TO_HOST_MERGE_REASON } from '../../self-implement/review-deferred-to-host.js';
 import { classifyPodTerminal, applyPodTerminal, podTerminalPrBody, type PrTerminalRecord, type DraftResidueContext } from '../../self-dev/draft-residue.js';
+import { assessSiWarmReply, decideSiWarmNextStep, type SiWarmCommand, type SiWarmReply,
+  type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
+import { cleanAndReturnChildPod, type ChildPodReuseOperations } from './pod-child-reuse.js';
+import { executeSiWarmTransport, type SiWarmFixedRunner,
+  type SiWarmPodIdentity } from './pod-si-warm-transport.js';
 
 export const POD_CONTROL_INBOX_DIR = '/tmp/elanous-control.inbox';
 /** Pod Job 수명 상한(`activeDeadlineSeconds`) — 대표 2026-09-26 90분 → 180분(90분에 `DeadlineExceeded` 로 죽은 런 둘). */
@@ -59,6 +64,9 @@ export const POD_JOB_DEADLINE_SECONDS = 10_800;
 // POD-DIET (10-06 03:47~05:18 · node-b goal Pods · 89 one-minute samples · 42 Pods): per-Pod observed max median 4.6Gi ·
 // p75 6.2Gi · p90 11.7Gi — 23/42 went above the old 4Gi request, so the scheduler over-packed. 6Gi ≈ p75; limits stay.
 // Node allocatable ≈ 343Gi ≫ 25 × 6Gi. One-minute samples can miss the true peak (lower bound).
+import { POD_LAUNCH_FINISHED_EVENT, POD_LAUNCH_STARTED_EVENT, provenanceRowFromAnnotations, siTaskPodProvenance } from './pod-launch-history.js';
+import { podProvenanceMetadata, type PodProvenanceMetadata } from './pod-provenance.js';
+import { packageVersion } from '../../version/code-revision.js';
 import { podWorkLabels, type PodWorkIdentity, type PodPlacement, type PodPlacementKind, type PodPoolMember, type PodPoolScheduler } from './pod-pool.js';
 export { POD_CHILD_REQUESTS } from './pod-lease.js';
 import { measurePoolLease, recommendConcurrency, POD_CHILD_REQUESTS, POD_SI_ADMISSION_CAP_BYTES, POD_HOST_LEASE_ANNOTATION, POD_JOB_TTL_AFTER_FINISHED_SECONDS, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
@@ -97,7 +105,7 @@ import { ZAI_POD_EGRESS_LABEL, checkZaiPodSecret, countActiveZaiJobs, decideZaiP
 import { ZAI_CODING_DEFAULT_MODEL, ZAI_OPENROUTER_FALLBACK_MODEL, zaiSettingsFromConfig, type ZaiCodingPlanSettings } from '../../llm/zai-coding-plan.js';
 import { normalizePlanningFallbackReason, selectEnhanceLlm } from '../../prompt-enhance/enhance.js';
 import { inferProviderFromModel } from '../../llm.js';
-import { classifyPodExit, extractPodFailureReason, podTerminalRow, type PodExitClass } from './pod-failure-reason.js';
+import { classifyPodExit, extractPodFailureReason, podChildFailureAttribution, podTerminalRow, POD_TERMINATION_JOB_JSONPATH, POD_TERMINATION_PODS_JSONPATH, readPodTermination, type PodExitClass, type PodTermination } from './pod-failure-reason.js';
 import { kubectlTransientReason, retryKubectlTransient } from './kubectl-transient-retry.js';
 import { OLD_DOOR_STAMP_ENV } from '../../self-dev/old-door.js';
 import { resolveDefaultSourceHead, seedMirrorOnce, type MirrorSeedResult } from './pod-mirror-seed.js';
@@ -105,7 +113,22 @@ import { decideWarmReuse, type WarmReuseEvidenceByConsumer, type WarmReuseSwitch
 import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
 import type { WarmPodTransportResult } from './pod-warm-worker-pod.js';
 
-export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
+export type Kubectl = (args: readonly string[], input?: string, timeoutMs?: number) => { status: number | null; stdout: string; stderr: string };
+
+/** TC's si-v1 transport supplies this receipt. No lease is considered reusable from a Job exit alone. */
+export interface SiWarmChildAttempt {
+  leaseFenced: boolean;
+  command: SiWarmCommand | null;
+  /** The consumer executes this fenced transport. A provider cannot assert its own reply verdict. */
+  transport: { pod: SiWarmPodIdentity; runner: SiWarmFixedRunner; now?: () => number };
+  payload: Uint8Array;
+  credentialBundle: Uint8Array;
+  /** Collect verified ledger/artifact bytes into the existing host stores. */
+  adopt: (command: SiWarmCommand, reply: SiWarmReply, bytes: SiWarmReturnedBytes) => Promise<void>;
+  cleanup: ChildPodReuseOperations;
+  /** The provider fences a worker even when a transport failure hides its command receipt. */
+  quarantineUnknown: (reason: string) => Promise<void>;
+}
 type OpenPrByBranch = { status: 'found'; prNumber: number; prUrl: string }
   | { status: 'not-found' | 'failed'; reason: string };
 
@@ -123,6 +146,13 @@ const APP_GH_AUTH_COMMAND = `bun -e '${APP_GH_AUTH_SCRIPT}'`;
 const APP_GH_EXEC = `unset GH_TOKEN GITHUB_TOKEN; GH_CONFIG_DIR="${APP_GH_CONFIG_PATH}" exec "$@"`;
 
 export interface PodSpawnOptions {
+  /** si-v1 living worker consumer. Absent means the existing one-shot Job path. */
+  siWarmAttempt?: (input: Parameters<SelfImplementJobSpawn>[0]) => Promise<SiWarmChildAttempt | null>;
+  /** POD-REUSE-SI-PROVIDER-WIRE: must apply cold-path host regate, ACP, terminal and repair checks before warm adoption. */
+  siWarmHostPostprocess?: (result: SelfImplementJobDone, attempt: SiWarmChildAttempt,
+    input: Parameters<SelfImplementJobSpawn>[0]) => Promise<SelfImplementJobDone>;
+  /** Injected test ledger; production writes to the existing run ledger. */
+  siWarmLedger?: (entry: RunLedgerEntry) => void;
   /** 이미지 판(라벨 elanous.commit) — 주입(시험·감독기가 이미 잰 값). 없으면 docker 로 잰다. */
   imageCommit?: string | null;
   /** codex 계정 이름(`~/.elanous/auth.json` 의 `openai-codex:<이름>`). 기본 team. */
@@ -1116,7 +1146,7 @@ export function podSigtermTrapScript(seqFile: string = POD_USAGE_PARTIAL_SEQ_FIL
   return `trap '{ [ -n "$si_pid" ] && kill "$si_pid" 2>/dev/null || true; [ -n "\${usage_partial_pid:-}" ] && kill "$usage_partial_pid" 2>/dev/null || true; si_seq=$(cat ${seqFile} 2>/dev/null || true); case "$si_seq" in ""|*[!0-9]*) si_seq=0;; esac; si_seq=$((10#$si_seq + 1)); { [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$si_seq"; } & si_rollup_pid=$!; for si_i in 1 2 3 4 5 6 7 8; do kill -0 "$si_rollup_pid" 2>/dev/null || break; sleep 1; done; kill "$si_rollup_pid" 2>/dev/null || true; wait "$si_rollup_pid" 2>/dev/null || true; exit 143; }' TERM`;
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; boundPrNumber?: number; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; repairCommitOnly?: { pr: number; baseHead: string }; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec; /** Codex Job may use the same named Secret only for an explicitly admitted ZAI fallback. */ zaiFallback?: ZaiPodSpec; fallbackChain?: { steps: readonly FallbackStep[]; source: 'host' | 'default' }; /** TA-POD-WARMBOOT-PARITY — the child's final line (podResultMarkerShellLine), just before `exit $rc`. */ resultMarkerLine?: string }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; workIdentity?: PodWorkIdentity; boundPrNumber?: number; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; repairCommitOnly?: { pr: number; baseHead: string }; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; memoryRequest?: string; goalDoc?: string; /** AUTHOR-POD2 — run `harness say` on /creds/feature inside the Pod (authoring happens off the host). */ authorSentence?: boolean; authorGrade?: 'full' | 'lite'; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number; /** Which goal execution and attempt this Job is — a resumed host verifies it before following the Job (POD9). */ execution?: { key: string; attempt: number }; hostLeaseAdmitted?: boolean; /** POD-ROLE-LLM — OpenRouter 자식 Pod 에 리뷰어용 codex 자격을 깐다. */ reviewerCodexAuth?: boolean; /** BEDROCK-PROVIDER ② — bedrock 자식만: 이름 있는 AWS Secret 의 키(secretKeyRef) ⊕ 리전 ⊕ 이그레스 라벨. */ bedrock?: BedrockPodSpec; /** ZAI-POD-CHILD — glm(ZAI) 자식만: 이름 있는 ZAI Secret 의 키(secretKeyRef) ⊕ 이그레스·동시 상한 라벨(Pod ⊕ Job). */ zai?: ZaiPodSpec; /** Codex Job may use the same named Secret only for an explicitly admitted ZAI fallback. */ zaiFallback?: ZaiPodSpec; fallbackChain?: { steps: readonly FallbackStep[]; source: 'host' | 'default' }; /** TA-POD-WARMBOOT-PARITY — the child's final line (podResultMarkerShellLine), just before `exit $rc`. */ resultMarkerLine?: string; /** POD-LAUNCH-PROVENANCE — the shared provenance set (labels ⊕ annotations ⊕ child env) for this si-task Job. */ provenance?: PodProvenanceMetadata }): Record<string, unknown> {
   if (o.repairCommitOnly && (o.source?.kind !== 'pr' || o.source.number !== o.repairCommitOnly.pr || !/^[0-9a-f]{40}$/.test(o.repairCommitOnly.baseHead) || o.args.includes('--open-pr') || o.args.includes('--merge-by-host') || o.args.includes('--auto-merge'))) {
     throw new Error('repair commit-only requires matching PR source and no PR/merge flags');
   }
@@ -1183,6 +1213,9 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     // Record that fact before the main command, without treating clone completion as install completion.
     `printf 'ELANOUS_POD_DEPS skipped %s image-prepared-no-install\\n' "$(date +%s)" || true`,
     ...(o.repairCommitOnly ? [`[ "$(git rev-parse HEAD)" = '${o.repairCommitOnly.baseHead}' ] || { echo 'ELANOUS_POD_REPAIR_FAILED source-head-mismatch'; exit 8; }`] : []),
+    // PR checkout and, when requested, the repair HEAD pin have passed before this child starts.
+    // A supervisor input may continue the repair, but cannot launch its source again.
+    ...(o.source?.kind === 'pr' ? ['export ELANOUS_POD_VERIFIED_PR_SOURCE=1'] : []),
     ...(goalPath ? [
       `mkdir -p -- "$(dirname -- ${goalPath})" && cp -- /creds/goal-doc ${goalPath} || exit 6`,
     ] : []),
@@ -1201,7 +1234,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     // AUTHOR-LITE2-POD — 등급은 환경변수 `ELANOUS_AUTHOR_GRADE` 로 싣는다(옛 Pod elanous 는 모르는 환경변수를 무시하고 full 로 돈다).
     siTaskPodStageShell('run', 'start'),
     o.repairCommitOnly
-      ? `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json --no-open-pr ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; if [ "$rc" -eq 0 ]; then elanous self repair-commit-export '${o.repairCommitOnly.pr}' '${o.repairCommitOnly.baseHead}' /tmp/si.out "$PWD" "$HOME/outbox" || rc=8; fi`
+      ? `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json --no-open-pr ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; if elanous self repair-commit-export '${o.repairCommitOnly.pr}' '${o.repairCommitOnly.baseHead}' /tmp/si.out "$PWD" "$HOME/outbox"; then rc=0; elif [ "$rc" -eq 0 ]; then rc=8; fi`
       : o.authorSentence
       ? `echo "ELANOUS_AUTHOR_ON_POD started host=$(hostname) at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; author_t0=$(date +%s); ${o.authorGrade === 'lite' || o.authorGrade === 'full' ? `ELANOUS_AUTHOR_GRADE=${o.authorGrade} ` : ''}elanous harness say --substrate local --json${quotedAsk}${quotedChildLlm} -- "$(cat /creds/feature)" > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; echo "ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc seconds=$(( $(date +%s) - author_t0 ))"; ${POD_RESULT_FLATTEN}`
       : goalPath
@@ -1276,15 +1309,15 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
   return {
     apiVersion: 'batch/v1',
     kind: 'Job',
-    metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, ...podRunLabels(o), ...(o.workIdentity ? podWorkLabels(o.workIdentity) : {}), ...(o.zai || o.zaiFallback ? { [ZAI_POD_EGRESS_LABEL]: 'true' } : {}) },
-      ...((o.execution || o.hostLeaseAdmitted) ? { annotations: { ...(o.execution ? { [POD_EXECUTION_KEY_ANNOTATION]: o.execution.key, [POD_ATTEMPT_ANNOTATION]: String(o.execution.attempt) } : {}), ...(o.hostLeaseAdmitted ? { [POD_HOST_LEASE_ANNOTATION]: 'true' } : {}) } } : {}) },
+    metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, ...podRunLabels(o), ...(o.workIdentity ? podWorkLabels(o.workIdentity) : {}), ...(o.zai || o.zaiFallback ? { [ZAI_POD_EGRESS_LABEL]: 'true' } : {}), ...o.provenance?.labels },
+      ...((o.execution || o.hostLeaseAdmitted || o.provenance) ? { annotations: { ...o.provenance?.annotations, ...(o.execution ? { [POD_EXECUTION_KEY_ANNOTATION]: o.execution.key, [POD_ATTEMPT_ANNOTATION]: String(o.execution.attempt) } : {}), ...(o.hostLeaseAdmitted ? { [POD_HOST_LEASE_ANNOTATION]: 'true' } : {}) } } : {}) },
     spec: {
       backoffLimit: 0,
       ttlSecondsAfterFinished: POD_JOB_TTL_AFTER_FINISHED_SECONDS,
       activeDeadlineSeconds: o.deadlineSeconds,
       template: {
         // ⭐ Pod 라벨 — local 팔만 `elanous.egress/local-llm` 을 단다. docker/h1/policy-local-llm.yaml 이 그 라벨에만 호스트 LLM 포트 «하나»를 연다.
-        metadata: { labels: { 'elanous.job': o.name, ...podRunLabels(o), ...(o.workIdentity ? podWorkLabels(o.workIdentity) : {}), ...(o.armEnv?.ELANOUS_LLM_PROVIDER === 'local' ? { 'elanous.egress/local-llm': 'true' } : {}), ...(o.bedrock ? { [BEDROCK_POD_EGRESS_LABEL]: 'true' } : {}), ...(o.zai || o.zaiFallback ? { [ZAI_POD_EGRESS_LABEL]: 'true' } : {}) } },
+        metadata: { labels: { 'elanous.job': o.name, ...podRunLabels(o), ...(o.workIdentity ? podWorkLabels(o.workIdentity) : {}), ...(o.armEnv?.ELANOUS_LLM_PROVIDER === 'local' ? { 'elanous.egress/local-llm': 'true' } : {}), ...(o.bedrock ? { [BEDROCK_POD_EGRESS_LABEL]: 'true' } : {}), ...(o.zai || o.zaiFallback ? { [ZAI_POD_EGRESS_LABEL]: 'true' } : {}), ...o.provenance?.labels }, ...(o.provenance ? { annotations: o.provenance.annotations } : {}) },
         spec: {
           restartPolicy: 'Never',
           securityContext: { runAsUser: 1000, fsGroup: 1000 },
@@ -1311,6 +1344,8 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
               { name: 'ELANOUS_POD_NAMESPACE', valueFrom: { fieldRef: { fieldPath: 'metadata.namespace' } } },
               ...(o.hostId ? [{ name: 'ELANOUS_HOST_ID', value: o.hostId }] : []),
               ...(o.imageCommit ? [{ name: 'ELANOUS_IMAGE_COMMIT', value: o.imageCommit }] : []),
+              // POD-LAUNCH-PROVENANCE — the child knows who launched it, why and when (ELANOUS_POD_<key> · no secrets).
+              ...(o.provenance?.env ?? []),
               // ⭐ 런 계약(graph-run-contract.ts) — 이 칸이 «실제로» Pod 이고, 부모가 정한 계약도 Pod 다. 안의 그래프가 노드마다 대조한다.
               { name: ACTUAL_SUBSTRATE_ENV, value: 'pod' }, { name: RUN_CONTRACT_ENV, value: carryRunContract({ substrate: 'pod' }) },
               ...Object.entries(o.armEnv ?? {}).map(([name, value]) => ({ name, value })),
@@ -1421,6 +1456,14 @@ function readJobPodImage(kubectl: Kubectl, namespace: string, job: string, jobUi
   return { podName: pod.metadata.name, podUid, podCreatedAt, imageID, digest, digestUnavailable: digest ? null : 'nonstandard-image-id' };
 }
 
+/** A repair Pod succeeds only with a verified result/bundle, even if its child gate exited 1. */
+export function repairPodExitCode(input: { state: string; repairCommitOnly: boolean; repairArtifactReady: boolean;
+  disposition?: { stage?: string; ok?: boolean } }): 0 | 1 {
+  if (input.state !== 'complete') return 1;
+  if (input.repairCommitOnly) return input.repairArtifactReady ? 0 : 1;
+  return input.disposition?.stage !== 'host-regate-failed' && input.disposition?.ok !== false ? 0 : 1;
+}
+
 export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplementJobSpawn {
   if (options.repairCommitOnly && (options.source?.kind !== 'pr' || options.source.number !== options.repairCommitOnly.pr || !/^[0-9a-f]{40}$/.test(options.repairCommitOnly.baseHead))) {
     throw new Error('repair commit-only requires a matching PR source and exact head');
@@ -1436,9 +1479,289 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
   if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
   const hostSupervised = options.hostSupervised ?? true;
   const resultMarkerOn = options.resultMarker ?? !options.kubectl;
+  const writeWarmLedger = options.siWarmLedger
+    ?? ((entry: RunLedgerEntry) => appendRunLedgerEntry(entry, runLedgerDir(env.ELANOUS_STATE_DIR)));
   return (input) => {
     if (options.repairCommitOnly && (input.autoMerge || input.openPr || input.base !== `pr-${options.repairCommitOnly.pr}`)) {
       throw new Error('repair commit-only refuses auto merge, new PR, or a different base');
+    }
+    if (options.siWarmAttempt && !options.siWarmHostPostprocess) {
+      throw new Error('si-v1 warm execution requires cold-path host postprocess parity');
+    }
+    if (options.siWarmAttempt) {
+      const done = (async (): Promise<SelfImplementJobDone> => {
+        let attempt: SiWarmChildAttempt;
+        try {
+          const acquired = await options.siWarmAttempt!(input);
+          if (!acquired) {
+            // No lease was fenced: use the existing one-shot Job path.
+            const { siWarmAttempt: _unused, siWarmHostPostprocess: _postprocess, ...coldOptions } = options;
+            return podSelfImplementSpawn(coldOptions)(input).done;
+          }
+          attempt = acquired;
+        }
+        catch (error) {
+          // A lost exec reply may conceal an already opened PR. Never start another child here.
+          const message = error instanceof Error ? error.message : String(error);
+          debug.log('pod.reuse', 'attempt-unavailable', { spaceId: input.spaceId, reason: message }, { level: 'warn' });
+          return { exitCode: 1, output: '', error: { code: 'si-warm-reconcile-only', message } };
+        }
+        let transport: Awaited<ReturnType<typeof executeSiWarmTransport>>;
+        try {
+          transport = await executeSiWarmTransport({ command: attempt.command,
+            pod: attempt.transport.pod, runner: attempt.transport.runner,
+            leaseFenced: attempt.leaseFenced, payload: attempt.payload,
+            credentialBundle: attempt.credentialBundle, now: attempt.transport.now });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          try { await attempt.quarantineUnknown('transport-exception'); }
+          catch (quarantineError) {
+            // Both failures must survive: the first transport error names the cause, the
+            // quarantine error names the unfinished disposition. Record the judgement.
+            const quarantineMessage = quarantineError instanceof Error ? quarantineError.message : String(quarantineError);
+            const combined = `transport:${message}; quarantine:${quarantineMessage}`;
+            try { writeWarmLedger({ runId: attempt.command?.runId ?? input.spaceId,
+              event: 'pod-reuse-quarantine-failed',
+              data: { spaceId: input.spaceId, workerId: attempt.command?.workerId ?? null,
+                leaseId: attempt.command?.leaseId ?? null, reason: combined } }); }
+            catch (ledgerError) { debug.log('pod.reuse', 'ledger-unavailable', { spaceId: input.spaceId,
+              event: 'pod-reuse-quarantine-failed', reason: ledgerError instanceof Error ? ledgerError.message : String(ledgerError) }, { level: 'warn' }); }
+            debug.log('pod.reuse', 'quarantine-failed', { spaceId: input.spaceId, reason: combined }, { level: 'error' });
+            return { exitCode: 1, output: '', error: { code: 'si-warm-worker-state-unknown', message: combined } };
+          }
+          // The quarantine is confirmed: record the settled disposal (fail-soft — the
+          // disposition survives a ledger write failure) before the reconcile-only return.
+          try { writeWarmLedger({ runId: attempt.command?.runId ?? input.spaceId,
+            event: 'pod-reuse-quarantined',
+            data: { spaceId: input.spaceId, workerId: attempt.command?.workerId ?? null,
+              leaseId: attempt.command?.leaseId ?? null, reason: 'transport-exception' } }); }
+          catch (ledgerError) { debug.log('pod.reuse', 'ledger-unavailable', { spaceId: input.spaceId,
+            event: 'pod-reuse-quarantined', reason: ledgerError instanceof Error ? ledgerError.message : String(ledgerError) }, { level: 'warn' }); }
+          return { exitCode: 1, output: '', error: { code: 'si-warm-reconcile-only', message } };
+        }
+        const validation = transport.boundary === 'exec-attempted'
+          ? assessSiWarmReply(attempt.command, transport.reply, transport.bytes,
+            attempt.payload, attempt.credentialBundle)
+          : undefined;
+        const next = decideSiWarmNextStep({ boundary: transport.boundary,
+          leaseFenced: attempt.leaseFenced, ...(validation ? { validation } : {}) });
+        debug.log('pod.reuse', 'admission-decision', { spaceId: input.spaceId, boundary: transport.boundary,
+          next: next.next, reason: transport.reason, validationReason: transport.validationReason ?? null });
+        if (next.next === 'cold-job' && transport.boundary === 'not-entered' && attempt.leaseFenced) {
+          const { siWarmAttempt: _unused, ...coldOptions } = options;
+          // The acquired lease must not silently ride along into a cold Job: dispose it first,
+          // record the disposition, and refuse to start the cold Job when disposal fails.
+          const coldLease = attempt.command ? { workerId: attempt.command.workerId,
+            podUid: attempt.command.podUid, leaseId: attempt.command.leaseId,
+            generation: attempt.command.generation, key: attempt.command.key,
+            sourceSha: attempt.command.sourceSha } : null;
+          if (coldLease) {
+            const recordColdDisposition = (event: string, action: string, residue: Record<string, unknown> = {}) => {
+              debug.log('pod.reuse', event, { spaceId: input.spaceId, workerId: coldLease.workerId,
+                leaseId: coldLease.leaseId, action, reason: transport.reason, ...residue });
+              try { writeWarmLedger({ runId: attempt.command?.runId ?? input.spaceId, event,
+                data: { spaceId: input.spaceId, workerId: coldLease.workerId, leaseId: coldLease.leaseId,
+                  action, reason: transport.reason, ...residue } }); }
+              catch (error) { debug.log('pod.reuse', 'ledger-unavailable', { spaceId: input.spaceId, event,
+                reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+            };
+            try {
+              // The acquired lease is disposed by the same eligibility standard as the
+              // entered path: process count zero, pinned-source git reset/clean/status,
+              // credential count zero, and an observable return decision — before the
+              // lease can go back into the warm pool or a cold Job starts.
+              const returned = await cleanAndReturnChildPod(coldLease, { ...attempt.cleanup,
+                observe: (event, data) => {
+                  debug.log('pod.reuse', event, { spaceId: input.spaceId, ...data },
+                    { level: event === 'return-decision'
+                      && ((data as { outcome?: string }).outcome === 'eligible'
+                        || (data as { outcome?: string }).outcome === 'returned') ? 'info' : 'warn' });
+                  attempt.cleanup.observe(event, data);
+                  // A ledger write failure is an observation failure: the settled return
+                  // or quarantine disposition must survive it (fail-soft after the decision).
+                  try { writeWarmLedger({ runId: attempt.command?.runId ?? input.spaceId,
+                    event: `pod-reuse-${event}`,
+                    data: { spaceId: input.spaceId, ...data } }); }
+                  catch (ledgerError) { debug.log('pod.reuse', 'ledger-unavailable', { spaceId: input.spaceId,
+                    runId: attempt.command?.runId ?? input.spaceId, event: `pod-reuse-${event}`,
+                    reason: ledgerError instanceof Error ? ledgerError.message : String(ledgerError) },
+                    { level: 'warn' }); }
+                } });
+              recordColdDisposition('pod-reuse-cold-fallback-dispose', returned.outcome,
+                { dispositionReason: returned.reason });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              try { await attempt.cleanup.quarantine(coldLease, { clean: false, reason: 'cold-fallback-dispose-failed', observedResidue: null }); }
+              catch (quarantineError) {
+                const quarantineMessage = quarantineError instanceof Error ? quarantineError.message : String(quarantineError);
+                recordColdDisposition('pod-reuse-cold-fallback-dispose-failed', 'quarantine-failed',
+                  { error: `disposal:${message}; quarantine:${quarantineMessage}` });
+                return { exitCode: 1, output: '', error: { code: 'si-warm-worker-state-unknown',
+                  message: `disposal:${message}; quarantine:${quarantineMessage}` } };
+              }
+              recordColdDisposition('pod-reuse-cold-fallback-dispose-failed', 'quarantined', { error: message });
+              return { exitCode: 1, output: '', error: { code: 'si-warm-worker-state-unknown', message } };
+            }
+          }
+          return podSelfImplementSpawn(coldOptions)(input).done;
+        }
+        const command = attempt.command;
+        const lease = command && { workerId: command.workerId, podUid: command.podUid,
+          leaseId: command.leaseId, generation: command.generation, key: command.key,
+          sourceSha: command.sourceSha };
+        const recordQuarantine = (event: string, reason: string, residue: Record<string, unknown> = {}) => {
+          debug.log('pod.reuse', event, { spaceId: input.spaceId, workerId: command?.workerId ?? null,
+            leaseId: command?.leaseId ?? null, reason, ...residue }, { level: 'warn' });
+          try { writeWarmLedger({ runId: command?.runId ?? input.spaceId, event,
+            data: { spaceId: input.spaceId, workerId: command?.workerId ?? null,
+              leaseId: command?.leaseId ?? null, reason, ...residue } }); }
+          catch (error) { debug.log('pod.reuse', 'ledger-unavailable', { spaceId: input.spaceId,
+            event, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+        };
+        const retireLease = async (reason: string) => {
+          recordQuarantine('pod-reuse-quarantine-intent', reason);
+          if (!lease) {
+            try { await attempt.quarantineUnknown(reason); }
+            catch (error) {
+              // The unsettled quarantine is an account of its own: keep both the
+              // primary path reason and the quarantine cause in the run ledger,
+              // then let the caller surface the unknown worker state.
+              const message = error instanceof Error ? error.message : String(error);
+              recordQuarantine('pod-reuse-quarantine-failed', `${reason}; quarantine:${message}`);
+              throw error;
+            }
+            recordQuarantine('pod-reuse-quarantined', reason);
+            return;
+          }
+          // An uncertain exec may still be running. Keep it fenced and revoke its run credentials.
+          let processRemaining: number | null = null;
+          let credentialRemaining: number | null = null;
+          try { processRemaining = (await attempt.cleanup.stopChildProcesses(lease)).remaining; }
+          catch (error) { debug.log('pod.reuse', 'process-stop-failed', { spaceId: input.spaceId,
+            reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+          try { credentialRemaining = (await attempt.cleanup.removeRunCredentials(lease)).remaining; }
+          catch (error) { debug.log('pod.reuse', 'credential-revoke-failed', { spaceId: input.spaceId,
+            reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+          const observedResidue = [processRemaining, credentialRemaining]
+            .filter((value): value is number => typeof value === 'number'
+              && Number.isSafeInteger(value) && value >= 0)
+            .reduce((sum, value) => sum + value, 0);
+          try {
+            await attempt.cleanup.quarantine(lease, { clean: false, reason,
+              observedResidue: observedResidue > 0 ? observedResidue : null });
+          } catch (error) {
+            // The lease stays unfenced and the worker state unknown: record the
+            // unsettled disposal (primary reason plus the quarantine cause)
+            // before the caller reports the unknown worker state.
+            const message = error instanceof Error ? error.message : String(error);
+            recordQuarantine('pod-reuse-quarantine-failed', `${reason}; quarantine:${message}`);
+            throw error;
+          }
+          recordQuarantine('pod-reuse-quarantined', reason, { processRemaining, credentialRemaining });
+        };
+        if (next.next !== 'adopt-warm' || !transport.measured || !command
+          || !transport.reply || !transport.bytes) {
+          const reconcileDisposition = transport.verifiedBytesForReconcile
+            ? parseSelfImplementJson(new TextDecoder().decode(transport.verifiedBytesForReconcile.terminal))
+            : null;
+          const hostDisposition = reconcileDisposition ? (({ worktreePath: _podOnly, ...host }) => host)(reconcileDisposition) : null;
+          let quarantineError: string | undefined;
+          try { await retireLease(validation?.reason ?? 'response-unknown'); }
+          catch (error) { debug.log('pod.reuse', 'quarantine-failed', { spaceId: input.spaceId,
+            reason: error instanceof Error ? error.message : String(error) }, { level: 'error' });
+            quarantineError = error instanceof Error ? error.message : String(error); }
+          return { exitCode: 1, output: '',
+            ...(hostDisposition ? { disposition: hostDisposition } : {}),
+            error: { code: quarantineError
+            || (transport.quarantineWorker && !transport.quarantineRecorded)
+            ? 'si-warm-worker-state-unknown' : 'si-warm-reconcile-only',
+            message: `si-v1 exec may have run; reconcile before retry (${transport.reason})${transport.quarantineError ? `; transport quarantine: ${transport.quarantineError}` : ''}${quarantineError ? `; worker-state-unknown: ${quarantineError}` : ''}` } };
+        }
+        const terminal = new TextDecoder().decode(transport.bytes.terminal);
+        const disposition = parseSelfImplementJson(terminal);
+        if (!disposition) {
+          let quarantineError: string | undefined;
+          try { await retireLease('terminal-disposition-unreadable'); }
+          catch (error) { debug.log('pod.reuse', 'quarantine-failed', { spaceId: input.spaceId,
+            reason: error instanceof Error ? error.message : String(error) }, { level: 'error' });
+            quarantineError = error instanceof Error ? error.message : String(error); }
+          return { exitCode: 1, output: '', error: { code: quarantineError
+            ? 'si-warm-worker-state-unknown' : 'si-warm-terminal-unreadable',
+            message: quarantineError ?? 'validated si-v1 terminal was not a self-implement disposition' } };
+        }
+        try { await attempt.adopt(command, transport.reply, transport.bytes); }
+        catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          let quarantineError: string | undefined;
+          try { await retireLease('adopt-failed'); }
+          catch (quarantineFailure) { debug.log('pod.reuse', 'quarantine-failed', { spaceId: input.spaceId,
+            reason: quarantineFailure instanceof Error ? quarantineFailure.message : String(quarantineFailure) }, { level: 'error' });
+            quarantineError = quarantineFailure instanceof Error ? quarantineFailure.message : String(quarantineFailure); }
+          debug.log('pod.reuse', 'adopt-failed', { spaceId: input.spaceId, reason: message }, { level: 'warn' });
+          return { exitCode: 1, output: '', disposition, error: { code: quarantineError
+            ? 'si-warm-worker-state-unknown' : 'si-warm-reconcile-only', message: quarantineError ?? message } };
+        }
+        let returnOutcome: 'returned' | 'quarantined' = 'quarantined';
+        let workerStateUnknown: string | undefined;
+        try {
+          const returned = await cleanAndReturnChildPod(lease!, { ...attempt.cleanup,
+            observe: (event, data) => {
+              debug.log('pod.reuse', event, { spaceId: input.spaceId, ...data },
+                { level: event === 'return-decision' && (data.outcome === 'eligible' || data.outcome === 'returned') ? 'info' : 'warn' });
+              attempt.cleanup.observe(event, data);
+              // The lease disposition is already settled by the time this callback runs; the warm
+              // ledger is an observation of it. A ledger write failure must stay an observation
+              // failure — escaping here would quarantine a lease that was already returned.
+              try { writeWarmLedger({ runId: command.runId, event: `pod-reuse-${event}`,
+                data: { spaceId: input.spaceId, ...data } }); }
+              catch (error) { debug.log('pod.reuse', 'ledger-unavailable', { spaceId: input.spaceId, runId: command.runId,
+                event: `pod-reuse-${event}`, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+            } });
+          returnOutcome = returned.outcome;
+        } catch (error) {
+          workerStateUnknown = error instanceof Error ? error.message : String(error);
+          debug.log('pod.reuse', 'return-unavailable', { spaceId: input.spaceId,
+            reason: workerStateUnknown }, { level: 'error' });
+          // The inner return/quarantine result is unclear: quarantine the lease explicitly,
+          // and only a second quarantine failure leaves the worker state unknown.
+          try {
+            await attempt.quarantineUnknown(`return-quarantine-unavailable:${workerStateUnknown}`);
+            try { writeWarmLedger({ runId: command!.runId, event: 'pod-reuse-quarantined',
+              data: { spaceId: input.spaceId, workerId: command!.workerId, leaseId: command!.leaseId,
+                reason: `return-quarantine-unavailable:${workerStateUnknown}` } }); }
+            catch { /* ledger loss must not mask the quarantine outcome */ }
+            // The explicit quarantine settled the disposal: the caller result must
+            // account for it as quarantined instead of claiming an unknown state.
+            workerStateUnknown = undefined;
+          } catch (quarantineError) {
+            const quarantineMessage = quarantineError instanceof Error ? quarantineError.message : String(quarantineError);
+            workerStateUnknown = `return:${workerStateUnknown}; quarantine:${quarantineMessage}`;
+            try { writeWarmLedger({ runId: command!.runId, event: 'pod-reuse-quarantine-failed',
+              data: { spaceId: input.spaceId, workerId: command!.workerId, leaseId: command!.leaseId,
+                reason: workerStateUnknown } }); }
+            catch { debug.log('pod.reuse', 'ledger-unavailable', { spaceId: input.spaceId,
+              event: 'pod-reuse-quarantine-failed', reason: workerStateUnknown }, { level: 'warn' }); }
+          }
+        }
+        const log = new TextDecoder().decode(transport.bytes.log);
+        // Pod checkout paths cannot be used by the host supervisor.
+        const { worktreePath: _podOnly, ...hostDisposition } = disposition;
+        if (workerStateUnknown) return { exitCode: 1, output: log.slice(-4096), disposition: hostDisposition,
+          error: { code: 'si-warm-worker-state-unknown', message: workerStateUnknown } };
+        debug.log('pod.reuse', 'child-result', { spaceId: input.spaceId, workerId: command.workerId,
+          leaseId: command.leaseId, returnOutcome, stage: disposition.stage ?? null });
+        try {
+          return await options.siWarmHostPostprocess!({ exitCode: transport.reply.exitCode,
+            output: log.slice(-4096), disposition: hostDisposition }, attempt, input);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          debug.log('pod.reuse', 'host-postprocess-failed', { spaceId: input.spaceId,
+            reason: message }, { level: 'error' });
+          return { exitCode: 1, output: log.slice(-4096), disposition: hostDisposition,
+            error: { code: 'si-warm-host-postprocess-failed', message } };
+        }
+      })();
+      return { address: `self-impl:${input.spaceId}`, done };
     }
     const name = podJobName(input.spaceId);
     let parentGoal: string | undefined;
@@ -2313,7 +2636,22 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           debug.log('self-implement.pod', fit.fitted ? 'grok-deadline-fitted' : 'grok-deadline-kept', { job: name, requestedSeconds: jobDeadlineSeconds, deadlineSeconds: fit.deadlineSeconds, availableSeconds: fit.availableSeconds, relay: Boolean(credentialRelay), marginMs: POD_GROK_EXPIRY_MARGIN_MS });
           jobDeadlineSeconds = fit.deadlineSeconds;
         }
-        const job = podJobManifest({ name, namespace, fallbackChain, ...(resultMarkerLine ? { resultMarkerLine } : {}), image: jobImage, workIdentity, ...(env.ELANOUS_TASK_BOUND_PR && /^[1-9]\d*$/.test(env.ELANOUS_TASK_BOUND_PR) && Number.isSafeInteger(Number(env.ELANOUS_TASK_BOUND_PR)) ? { boundPrNumber: Number(env.ELANOUS_TASK_BOUND_PR) } : {}), ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(options.repairCommitOnly ? { repairCommitOnly: options.repairCommitOnly } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: jobDeadlineSeconds, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: jobImageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(roleCodexCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}), ...(zaiFallbackSpec ? { zaiFallback: zaiFallbackSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
+        // POD-LAUNCH-PROVENANCE — fail-closed: a si-task Job without its ★ identity is never applied.
+        let provenance: PodProvenanceMetadata;
+        try {
+          let version: string | undefined;
+          try { version = packageVersion(); } catch { version = undefined; }
+          provenance = podProvenanceMetadata(siTaskPodProvenance({ env, runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), workIdentity,
+            requestedAt: new Date((options.now ?? Date.now)()).toISOString(), feature: input.feature, launchHost: resolveHostId(env),
+            commit: seedSource.kind === 'commit' ? seedSource.sha : seedCommit ?? jobImageCommit, ...(version ? { version } : {}),
+            ...(memoryRequest ? { memReq: memoryRequest } : {}) }));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          debug.log('pod.provenance', 'si-task-refused', { job: name, reason: message }, { level: 'warn' });
+          cleanupSecret();
+          return { exitCode: 1, output: '', error: { code: 'pod-provenance', message } };
+        }
+        const job = podJobManifest({ provenance, name, namespace, fallbackChain, ...(resultMarkerLine ? { resultMarkerLine } : {}), image: jobImage, workIdentity, ...(env.ELANOUS_TASK_BOUND_PR && /^[1-9]\d*$/.test(env.ELANOUS_TASK_BOUND_PR) && Number.isSafeInteger(Number(env.ELANOUS_TASK_BOUND_PR)) ? { boundPrNumber: Number(env.ELANOUS_TASK_BOUND_PR) } : {}), ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(options.repairCommitOnly ? { repairCommitOnly: options.repairCommitOnly } : {}), ...(hostMirror ? { hostMirror } : {}), args: jobArgs, passEnv: jobPassEnv, deadlineSeconds: jobDeadlineSeconds, ...(goalDoc ? { goalDoc } : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? { authorSentence: true, ...(env.ELANOUS_POD_AUTHOR_GRADE === 'lite' || env.ELANOUS_POD_AUTHOR_GRADE === 'full' ? { authorGrade: env.ELANOUS_POD_AUTHOR_GRADE } : {}) } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, memoryRequest, imageCommit: jobImageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}), execution: { key: executionKey, attempt: oomRetried ? 2 : 1 }, hostLeaseAdmitted: !!releaseAdmission, ...(roleCodexCredential ? { reviewerCodexAuth: true } : {}), ...(bedrockSpec ? { bedrock: bedrockSpec } : {}), ...(zaiSpec ? { zai: zaiSpec } : {}), ...(zaiFallbackSpec ? { zaiFallback: zaiFallbackSpec } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const carriedBranch = goalDoc ? 'goal-doc' as const : env.ELANOUS_POD_AUTHOR_ON_POD === '1' && !shard ? 'author' as const : undefined;
         const carriedChildLlm = carriedBranch ? podDelegatedChildLlm(jobArgs) : undefined;
         jobApplyStartedAt = Date.now();
@@ -2322,6 +2660,11 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         if (a.status !== 0) { cleanupSecret(); return { exitCode: 1, output: a.stderr, error: { code: 'pod-apply', message: a.stderr.trim() } }; }
         releaseAdmission?.applied?.(name, context, namespace);
         const imageFacts = { job: name, childRunId: liveChildRunId, image: jobImage, imageCommit: jobImageCommit, context };
+        // POD-LAUNCH-PROVENANCE — append-only «started» row: who · why · when, on the parent's existing run ledger.
+        const startedRow = { job: name, run: launchRunId, attempt: oomRetried ? 2 : 1, provenance: provenanceRowFromAnnotations(provenance.annotations) };
+        try { appendRunLedgerEntry({ runId: ledgerRunId, event: POD_LAUNCH_STARTED_EVENT, timestamp: new Date((options.now ?? Date.now)()).toISOString(), data: startedRow }, ledgerDir); }
+        catch (error) { debug.log('pod.provenance', 'history-unavailable', { job: name, row: 'started', reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+        debug.log('pod.provenance', 'job-started', startedRow);
         try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-job-image', data: imageFacts }, ledgerDir); }
         catch (error) { debug.log('self-implement.pod', 'job-image-ledger-unavailable', { job: name, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
         debug.log('self-implement.pod', 'job-image', imageFacts);
@@ -2396,6 +2739,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         let failedReason = '';
         let containerReason: string | null = null;
         let containerExitCode: number | null = null;
+        // JOB-FAILURE-TERMINATION-CAPTURE — this Job's Kubernetes facts, read once at the failure verdict (before GC).
+        //   Observation only: failedReason · containerReason · containerExitCode keep driving the classification.
+        let podTermination: PodTermination | null = null;
         // METER-POD-ROLLUP-GAP — abort 때 Job 삭제 «전»에 거둔 로그 사본(삭제 뒤엔 PARTIAL 줄도 못 읽는다).
         let abortLogs = '';
         // ⭐ 런 «도중» 원장 증분 회수 — 호스트 슈퍼바이저가 Pod 걸음을 실시간으로 본다(🅣 요청 · 힐 루프 runtime 성형의 전제).
@@ -2447,10 +2793,17 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           if (/Failed|FailureTarget/.test(types)) {
             releaseAdmission?.observed?.();
             state = 'failed';
-            const reason = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.status.conditions[?(@.type=="Failed")].reason}']);
-            failedReason = reason.status === 0 ? reason.stdout.trim() : '';
+            // One Job read serves both: column one is the classification reason, all three the capture (no re-read a GC could empty).
+            let jobRead: { status: number | null; stdout: string } | null = null;
+            let jobReadError: unknown;
+            try { jobRead = kubectl(['-n', namespace, 'get', 'job', name, '-o', `jsonpath=${POD_TERMINATION_JOB_JSONPATH}`]); }
+            catch (error) { jobReadError = error; }
+            failedReason = jobRead?.status === 0 ? (jobRead.stdout.split('\t')[0] ?? '').trim() : '';
+            // One Pods read serves both: its first three columns are the classification layout, the rest the termination capture.
+            let podsRead: { status: number | null; stdout: string } | null = null;
             try {
-              const pods = kubectl(['-n', namespace, 'get', 'pods', '-l', `job-name=${name}`, '-o', 'jsonpath={range .items[*]}{.metadata.creationTimestamp}{"\\t"}{range .status.containerStatuses[?(@.name=="child")]}{.state.terminated.reason}{"\\t"}{.state.terminated.exitCode}{end}{"\\n"}{end}']);
+              const pods = kubectl(['-n', namespace, 'get', 'pods', '-l', `job-name=${name}`, '-o', `jsonpath=${POD_TERMINATION_PODS_JSONPATH}`]);
+              podsRead = pods;
               if (pods.status === 0 && pods.stdout) {
                 const rows = pods.stdout.trimEnd().split('\n').map((line) => line.split('\t'));
                 const latest = rows.filter(([created]) => created && !Number.isNaN(Date.parse(created)))
@@ -2463,6 +2816,14 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               }
             } catch { /* Pod 가 사라졌거나 조회 불가 — 종료 사유는 미상. */ }
             debug.log('self-implement.pod', 'container-terminated', { job: name, container: 'child', reason: containerReason, exitCode: containerExitCode, jobReason: failedReason || null, memoryLimit });
+            podTermination = readPodTermination({ kubectl, namespace, job: name, path: 'job-failed-condition', jobRead, podsRead, jobUid: lifecycleJobUid });
+            if (jobReadError !== undefined) {
+              // Today's outcome stays (the throw ends the spawn as pod-error); the capture is in the ledger first.
+              try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: liveChildRunId, job: name, podTermination } }, ledgerDir); }
+              catch (error) { debug.log('self-implement.pod', 'child-evidence-write-failed', { job: name, childRunId: liveChildRunId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+              debug.log('self-implement.pod', 'pod-termination-captured', { job: name, podTermination, jobReadThrew: true }, { level: 'warn' });
+              throw jobReadError;
+            }
             break;
           }
           // TA-POD-WARMBOOT-PARITY: the condition is not there yet — the child may already be done (k3d condition lag).
@@ -2474,6 +2835,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               state = seen === 0 ? 'complete' : 'failed';
               // The child's own rc (the Pod's terminated state may lag like the condition) — exit-code paths read it as before.
               if (seen !== 0) containerExitCode = seen;
+              if (seen !== 0) podTermination = readPodTermination({ kubectl, namespace, job: name, path: 'result-marker', jobUid: lifecycleJobUid });
               debug.log('self-implement.pod', 'result-marker-early', { job: name, waitedMs: Date.now() - waitStartedAt, rc: seen });
               break;
             }
@@ -2745,7 +3107,17 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         if (noResultDiagnostic && !noResultDiagnostic.includes('stage=unknown')) {
           debug.log('self-implement.pod', 'no-result-ledger-diagnostic', { job: name, childRunId: liveChildRunId, diagnostic: noResultDiagnostic }, { compact: { stringMax: 500 } });
         }
+        // POD-LAUNCH-PROVENANCE — append-only «finished» row paired with its started row on job·run.
+        // Keyed on launchRunId like the started row; a reattached Job's inherited child run rides along as childRun.
+        // exitCode stays null when the container's code was not read (never filled in as 0).
+        const finishedRow = { job: name, run: launchRunId, ...(liveChildRunId !== launchRunId ? { childRun: liveChildRunId } : {}),
+          attempt: oomRetried ? 2 : 1, phase: state, exitCode: containerExitCode,
+          reason: failedReason || containerReason || (state === 'complete' ? 'complete' : 'unknown') };
+        try { appendRunLedgerEntry({ runId: ledgerRunId, event: POD_LAUNCH_FINISHED_EVENT, timestamp: new Date((options.now ?? Date.now)()).toISOString(), data: finishedRow }, ledgerDir); }
+        catch (error) { debug.log('pod.provenance', 'history-unavailable', { job: name, row: 'finished', reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+        debug.log('pod.provenance', 'job-finished', finishedRow);
         debug.log('self-implement.pod', 'job-finished', { job: name, ...(member ? { context: member.context } : {}), state, containerReason, stage: disposition?.stage ?? null, prUrl: disposition?.prUrl ?? null, childRunId: liveChildRunId, ledgerCompleteness,
+          ...(podTermination ? { podTermination } : {}),
           ...(state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
             ? { ...(childFailure ? { childStage: childFailure.stage } : disposition?.stage ? { childStage: disposition.stage } : {}),
               // POD-NORESULT: a parsed result row without error text is not a missing result line (UX 10-07 01:01: 28 of 28 exit-2 Jobs printed one).
@@ -2838,7 +3210,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           // Every terminal attempt writes a marker, including one with no parseable child facts.
           // The next attempt must never inherit an earlier Pod's classification.
           const childEvidence = noResultLogEvidence ?? disposition?.childEvidence ?? null;
-          try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-evidence', data: { childEvidence, childRunId: liveChildRunId, job: name } }, ledgerDir); }
+          try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-evidence', data: { childEvidence, childRunId: liveChildRunId, job: name, ...(podTermination ? { podTermination } : {}) } }, ledgerDir); }
           catch (error) { debug.log('self-implement.pod', 'child-evidence-write-failed', { job: name, childRunId: liveChildRunId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
         }
         let prLookup: OpenPrByBranch | undefined;
@@ -2888,11 +3260,14 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const finishedDisposition = deadlineExceeded && disposition
           ? { ...disposition, failureClassification: 'run-deadline-exceeded' as const }
           : disposition;
-        const podExitCode = state === 'complete' && disposition?.stage !== 'host-regate-failed' && disposition?.ok !== false ? 0 : 1;
+        // A gate environment deficit can exit the child with 1 while still yielding a
+        // verified repair bundle. The host rejudges the new PR head after CAS apply.
+        const podExitCode = repairPodExitCode({ state, repairCommitOnly: !!options.repairCommitOnly,
+          repairArtifactReady, disposition });
         // SCHED-CONTRACT: a failed child must say why outside the Pod, not «no error diagnostic».
         const rawPodReason = podExitCode === 1 ? extractPodFailureReason({ logs, logTailReason, containerReason, jobReason: failedReason || undefined, deadlineSeconds, result: disposition ? { stage: disposition.stage, prUrl: disposition.prUrl ?? null, prNumber: disposition.prNumber ?? null } : null }) : undefined;
         const podReason = rawPodReason
-          ? noResultLogEvidence ? boundedPodLogText(rawPodReason, POD_NO_RESULT_LOG_REASON_MAX_CHARS) : rawPodReason
+          ? redactSecretText(noResultLogEvidence ? boundedPodLogText(rawPodReason, POD_NO_RESULT_LOG_REASON_MAX_CHARS) : rawPodReason)
           : undefined;
         if (podReason) debug.log('self-implement.pod', 'failure-reason', { job: name, reason: podReason });
         if (podExitCode === 1) {
@@ -3016,6 +3391,10 @@ function podPrOpenFailure(ledger: Record<string, unknown> | undefined | null, te
 }
 
 function lastPodChildFailure(logs: string): { stage: string; error: string; rawError: string } | null {
+  // Keep canonical duplicate-cap attribution while preserving the raw terminal error
+  // used by PR-open failure diagnosis below.
+  const attribution = podChildFailureAttribution(logs);
+  if (!attribution) return null;
   for (const line of logs.split('\n').reverse()) {
     if (!line.trimStart().startsWith('{')) continue;
     let result: unknown;
@@ -3025,10 +3404,8 @@ function lastPodChildFailure(logs: string): { stage: string; error: string; rawE
     const terminal = podTerminalRow(row);
     if (!terminal) continue;
     if (terminal.ok !== false || typeof terminal.error !== 'string') return null;
-    const lines = redactSecretText(terminal.error).replace(/\/home\/[^/\s]+\//g, '~/').split(/\r\n|\n|\r/);
-    const first = lines[0]!.slice(0, 240);
-    const last = lines.at(-1)!.slice(0, 240);
-    return { stage: terminal.stage, error: first === last ? first : `${first}\n${last}`, rawError: terminal.error };
+    if (terminal.stage !== attribution.stage) return null;
+    return { ...attribution, error: redactSecretText(attribution.error), rawError: terminal.error };
   }
   return null;
 }

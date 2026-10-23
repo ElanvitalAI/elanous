@@ -3,7 +3,11 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
-import { composeDaily, main, runDaily, collectGrid, collectLoops, collectRelease, collectLandings, type DailyDeps, type DailyParts, type DailySendRequest } from './daily.js';
+import { composeDaily, main, runDaily, collectGrid, collectLoops, collectRelease, collectLandings,
+  collectClosedDrafts, recordDraftCloseSummary, composeDraftCloseSummaryText, sweptReasonKind, DRAFT_CLOSE_BRIEF_SOURCE,
+  type DailyDeps, type DailyParts, type DailySendRequest } from './daily.js';
+import { LogStore } from '../../src/mss/logging/log-store.js';
+import { BriefItemsLedger } from '../../src/briefing/brief-items.js';
 import { devVersion, listChecklist } from '../../src/release-loop/checklist.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
@@ -1038,4 +1042,153 @@ test('graph stages fail the node on a send failure or a failed vault copy instea
     if (prev === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = prev;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ── DRAFT-SWEEP-DAILY-SUMMARY — 닫힌 draft 사유를 «하루 한 번 브리핑 원장 1건» 으로 ─────────────
+// 사유의 정본은 DRAFT-SWEEP-QUIET 이 닫을 때 남기는 `self-dev.draft-sweep` `closed` 로그(실제 logs.db),
+// 출력은 브리핑 원장(`<state>/briefing/items.sqlite`, `eln brief`)이다. 수집기 밖 경계(GitHub·텔레그램)만 주입한다.
+
+const releaseValue = (parts.release as Extract<DailyParts['release'], { status: 'ok' }>).value;
+const draftSummaryDeps = (root: string, over: Partial<DailyDeps> = {}): DailyDeps => ({
+  now: () => now, root, vaultRoot: null, sendEnabled: false,
+  landings: async () => [], release: async () => releaseValue,
+  loops: async () => [], grid: async () => [], decisions: async () => [], news: async () => [],
+  send: () => { throw new Error('collect must not send'); }, log: () => {}, print: () => {}, ...over,
+});
+const seedClosedDraftLog = (root: string, rows: { ts: string; event: string; data: Record<string, unknown> }[]): void => {
+  const store = new LogStore(join(root, 'logs', 'logs.db'), { instance: 'test:rhythm' });
+  try {
+    store.insertBatch(rows.map(row => ({ rec: { ts: row.ts, category: 'self-dev.draft-sweep', event: row.event, data: row.data },
+      surface: 'harness' })));
+  } finally { store.close(); }
+};
+const briefItems = (root: string) => new BriefItemsLedger({ stateDir: root, now: () => now, log: () => {} });
+
+test('DRAFT-SWEEP-DAILY-SUMMARY · 어제 닫힌 draft 사유가 오늘 브리핑 원장 1건에 실리고 PR별 댓글·발송은 0', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-draft-summary-'));
+  const bin = join(root, 'bin');
+  const spawned = join(root, 'spawned.txt');
+  const previousPath = process.env.PATH;
+  const previousGraph = process.env.ELANOUS_GRAPH_DIR;
+  try {
+    seedClosedDraftLog(root, [
+      { ts: '2026-10-04T01:00:00Z', event: 'closed', data: { pr: 24001, reason: 'harvest-expired' } },
+      { ts: '2026-10-04T02:00:00Z', event: 'closed', data: { pr: 24002, reason: 'harvest-expired' } },
+      { ts: '2026-10-04T03:00:00Z', event: 'closed', data: { pr: 24003, reason: 'superseded-by #24010' } },
+      // 닫힘이 아닌 결정 줄은 세지 않는다.
+      { ts: '2026-10-04T04:00:00Z', event: 'decided', data: { number: 24004, action: 'keep', reason: 'recent' } },
+    ]);
+    // GitHub·CLI 를 부르면 여기에 남는다 — 이 경로는 PR 댓글을 만들 수 있도록 아무 데도 스폰하지 않는다.
+    mkdirSync(bin);
+    for (const name of ['bun', 'gh']) {
+      writeFileSync(join(bin, name), `#!/bin/sh\nprintf '%s\\n' "$@" >> '${spawned}'\nprintf '[]\\n'\n`);
+      chmodSync(join(bin, name), 0o755);
+    }
+    process.env.PATH = `${bin}:${previousPath ?? ''}`;
+    process.env.ELANOUS_GRAPH_DIR = join(root, 'graphs', 'rhythm');
+    const deps = draftSummaryDeps(root);
+    const collected = await main(['collect'], deps);
+    expect(collected.draftCloseSummary).toMatchObject({ day: '2026-10-04', closed: 3, state: 'recorded',
+      text: '어제 닫힌 draft 3건 — harvest-expired 2 · superseded-by 1' });
+    const items = briefItems(root).list();
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ text: '어제 닫힌 draft 3건 — harvest-expired 2 · superseded-by 1',
+      domain: '운영', priority: 'P2', source: DRAFT_CLOSE_BRIEF_SOURCE,
+      evidence: 'elanous logs --category self-dev.draft-sweep --event closed --since 24h', created_at: now.toISOString() });
+    // 브리핑 화면(`eln brief`)이 그 한 줄을 보여준다.
+    expect(briefItems(root).compose('22:00')).toContain('- [P2] 어제 닫힌 draft 3건 — harvest-expired 2 · superseded-by 1 (근거: elanous logs --category self-dev.draft-sweep --event closed --since 24h · 출처: rhythm.daily.draft-close)');
+    // 같은 날 다시 돌아도 원장 1건 — PR마다 댓글 대신 브리핑 원장 1건이 이 칸의 계약이다.
+    const repeated = await main(['collect'], deps);
+    expect(repeated.draftCloseSummary).toMatchObject({ state: 'already-recorded', itemId: items[0]!.id });
+    expect(briefItems(root).list()).toHaveLength(1);
+    expect(existsSync(spawned)).toBe(false);
+    expect(existsSync(join(root, 'rhythm', 'daily', 'delivery.sqlite'))).toBe(false);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousGraph === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = previousGraph;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('DRAFT-SWEEP-DAILY-SUMMARY · 어제 창 밖의 닫힌 draft 는 세지 않고 표본이 없으면 미측정으로 남긴다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-draft-summary-window-'));
+  try {
+    seedClosedDraftLog(root, [{ ts: '2026-10-03T03:00:00Z', event: 'closed', data: { pr: 23999, reason: 'stale-unobserved' } }]);
+    const observed: unknown[] = [];
+    const collected = await runDaily({ stage: 'collect' }, draftSummaryDeps(root));
+    expect(collected.draftCloseSummary).toMatchObject({ day: '2026-10-04', closed: 0, text: null, state: 'unmeasured', detail: '닫힌 draft 없음' });
+    recordDraftCloseSummary(root, now, (_c, _e, data) => { observed.push(data); });
+    expect(observed.at(-1)).toMatchObject({ day: '2026-10-04', closed: 0, state: 'unmeasured', detail: '닫힌 draft 없음' });
+    expect(briefItems(root).list()).toEqual([]);
+    // 그 닫힘이 있던 날을 «어제» 로 보는 실행은 같은 사유를 브리핑 원장에 싣는다.
+    const earlier = recordDraftCloseSummary(root, new Date('2026-10-04T00:30:00Z'), () => {});
+    expect(earlier).toMatchObject({ day: '2026-10-03', closed: 1, state: 'recorded', text: '어제 닫힌 draft 1건 — stale-unobserved 1' });
+    expect(briefItems(root).list()).toHaveLength(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DRAFT-SWEEP-DAILY-SUMMARY · 로그 원장을 못 읽으면 미측정으로 남기고 데일리 브리핑은 그대로 나간다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-draft-summary-unreadable-'));
+  const previousGraph = process.env.ELANOUS_GRAPH_DIR;
+  try {
+    mkdirSync(join(root, 'logs'), { recursive: true });
+    writeFileSync(join(root, 'logs', 'logs.db'), 'not a sqlite store');
+    expect(() => collectClosedDrafts(root, now)).toThrow();
+    expect(recordDraftCloseSummary(root, now, () => {})).toMatchObject({ state: 'unreadable', closed: 0, text: null,
+      detail: expect.stringContaining('로그 원장 못 읽음') });
+    expect(briefItems(root).list()).toEqual([]);
+    process.env.ELANOUS_GRAPH_DIR = join(root, 'graphs', 'rhythm');
+    const collected = await main(['collect'], draftSummaryDeps(root));
+    expect(collected.draftCloseSummary?.state).toBe('unreadable');
+    expect(collected.markdown).toContain('## ⑥ 위험 톱 5');
+    expect(existsSync(collected.file)).toBe(true);
+  } finally {
+    if (previousGraph === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = previousGraph;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('DRAFT-SWEEP-DAILY-SUMMARY · 사유를 못 읽은 closed 로그가 섞이면 닫힘 총수를 단정하지 않는다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-draft-summary-partial-'));
+  const previousGraph = process.env.ELANOUS_GRAPH_DIR;
+  try {
+    seedClosedDraftLog(root, [
+      { ts: '2026-10-04T01:00:00Z', event: 'closed', data: { pr: 24011, reason: 'harvest-expired' } },
+      // 사유를 못 읽은 closed 로그 — 읽힌 1건만으로 총수를 적으면 안 된다.
+      { ts: '2026-10-04T02:00:00Z', event: 'closed', data: { pr: 24012 } },
+    ]);
+    expect(collectClosedDrafts(root, now)).toMatchObject({ closed: 1, unreadable: 1,
+      reasons: [{ reason: 'harvest-expired', count: 1 }] });
+    process.env.ELANOUS_GRAPH_DIR = join(root, 'graphs', 'rhythm');
+    const collected = await main(['collect'], draftSummaryDeps(root));
+    // 읽힌 건수만으로 «어제 닫힌 draft 1건» 확정 기록은 보류 — 부분 미측정으로 남긴다.
+    expect(collected.draftCloseSummary).toMatchObject({ day: '2026-10-04', closed: 1, text: null,
+      state: 'unmeasured', detail: expect.stringContaining('부분 미측정') });
+    expect(briefItems(root).list()).toEqual([]);
+  } finally {
+    if (previousGraph === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = previousGraph;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('DRAFT-SWEEP-DAILY-SUMMARY · --dry-run 은 브리핑 원장에 쓰지 않는다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-draft-summary-dry-'));
+  try {
+    seedClosedDraftLog(root, [{ ts: '2026-10-04T03:00:00Z', event: 'closed', data: { pr: 24003, reason: 'claim-expired' } }]);
+    const collected = await main(['--dry-run'], draftSummaryDeps(root));
+    expect(collected.draftCloseSummary).toBeUndefined();
+    expect(briefItems(root).list()).toEqual([]);
+    expect(collectClosedDrafts(root, now)).toMatchObject({ closed: 1, unreadable: 0,
+      reasons: [{ reason: 'claim-expired', count: 1 }] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('DRAFT-SWEEP-DAILY-SUMMARY · 사유는 DRAFT-SWEEP-QUIET 종류로 접고 상위 5종만 적는다', () => {
+  expect(sweptReasonKind('superseded-by #24010')).toBe('superseded-by');
+  expect(sweptReasonKind('duplicate-of-open #24010 (cell CELL-A0)')).toBe('duplicate-of-open');
+  expect(sweptReasonKind('claim-expired (self-implement.result final; worktree is not live)')).toBe('claim-expired');
+  expect(sweptReasonKind('something-new')).toBe('other');
+  const reasons = ['a', 'b', 'c', 'd', 'e', 'f'].map((reason, i) => ({ reason, count: 6 - i }));
+  expect(composeDraftCloseSummaryText(reasons)).toBe('어제 닫힌 draft 21건 — a 6 · b 5 · c 4 · d 3 · e 2 · 외 1종');
+  expect(composeDraftCloseSummaryText([])).toBe('어제 닫힌 draft 0건');
 });

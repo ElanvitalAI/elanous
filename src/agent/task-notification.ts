@@ -30,6 +30,10 @@ import {
 import type { AgentTask } from './types.js';
 import { globalAgentFlash } from '../display/agent-flash.js';
 import { debug } from '../debug/log.js';
+import { DATA_DIR } from '../config.js';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 /** Max chars of the child's final result we echo in the notification.
  *  The parent can still fetch the full text via the registry if it
@@ -49,6 +53,10 @@ export interface PendingTaskNotification {
   output: string;
   /** Whether output was truncated (for XML `truncated` attribute). */
   truncated: boolean;
+  /** Openable full result when the completion exceeds the inline cap. */
+  resultPath?: string;
+  /** Why preservation failed; never present on a successful full-result notification. */
+  preservationError?: string;
   /** When state === 'error', the error message from runner. */
   errorMessage?: string;
   /** Wall-clock ms from task.startedAt to task.finishedAt. */
@@ -57,6 +65,11 @@ export interface PendingTaskNotification {
 }
 
 export class TaskNotificationQueue {
+  constructor(
+    private readonly resultDir = join(DATA_DIR, 'agent-results'),
+    private readonly maxResultChars = 10_000_000,
+  ) {}
+
   private queue: PendingTaskNotification[] = [];
   /** De-dup guard — same task.finishedAt can fire twice if a caller
    *  listens to both runner events and a separate `onTaskDone` hook.
@@ -67,6 +80,13 @@ export class TaskNotificationQueue {
    *  signal so an idle parent can open the next turn. Opening the turn
    *  itself is deliberately NOT wired here (next shard). */
   private wakeListeners = new Set<(n: PendingTaskNotification) => void>();
+  private drainListeners = new Set<(items: readonly PendingTaskNotification[]) => void>();
+
+  /** Register a drain listener for notifications actually delivered to a turn. */
+  onDrain(listener: (items: readonly PendingTaskNotification[]) => void): () => void {
+    this.drainListeners.add(listener);
+    return () => { this.drainListeners.delete(listener); };
+  }
 
   /** Register a wake listener; returns an unsubscribe function.
    *  Listeners survive `clear()` — they belong to the wiring, not the
@@ -78,12 +98,31 @@ export class TaskNotificationQueue {
 
   enqueue(n: PendingTaskNotification): void {
     if (this.seen.has(n.taskId)) return;
+    let pending = n;
+    if (n.output.length > TASK_NOTIFICATION_OUTPUT_CAP) {
+      const summary = n.output.slice(0, TASK_NOTIFICATION_OUTPUT_CAP);
+      try {
+        if (n.output.length > this.maxResultChars) {
+          throw new Error(`result length ${n.output.length} exceeds limit ${this.maxResultChars}`);
+        }
+        mkdirSync(this.resultDir, { recursive: true });
+        const resultPath = join(this.resultDir, `${randomUUID()}.txt`);
+        writeFileSync(resultPath, n.output, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+        pending = { ...n, output: summary, truncated: true, resultPath };
+        debug.log('agent.task-notification', 'result-preserved', { taskId: n.taskId, resultPath, length: n.output.length });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        pending = { ...n, state: 'error', output: summary, truncated: true,
+          preservationError: `full result unavailable: ${reason}`, resultPath: undefined };
+        debug.log('agent.task-notification', 'result-preservation-failed', { taskId: n.taskId, reason }, { level: 'warn' });
+      }
+    }
     this.seen.add(n.taskId);
-    this.queue.push(n);
+    this.queue.push(pending);
     debug.log('agent.task-notification', 'wake', { taskId: n.taskId, size: this.queue.length });
     for (const listener of this.wakeListeners) {
       try {
-        listener(n);
+        listener(pending);
       } catch (error) {
         // fail-soft — a throwing wake listener must not lose the
         // queued notification or break sibling listeners.
@@ -106,6 +145,16 @@ export class TaskNotificationQueue {
     // time for the same task (rare but possible under races) still
     // can't double-inject. `seen` grows unbounded across a session;
     // acceptable — a session produces O(100) tasks at most.
+    if (out.length > 0) {
+      for (const listener of this.drainListeners) {
+        try { listener(out); }
+        catch (error) {
+          debug.log('agent.task-notification', 'drain-listener-failed', {
+            reason: error instanceof Error ? error.message : String(error),
+          }, { level: 'warn' });
+        }
+      }
+    }
     return out;
   }
 
@@ -139,11 +188,7 @@ export const globalTaskNotificationQueue = new TaskNotificationQueue();
 function buildPendingFromTask(task: AgentTask): PendingTaskNotification | null {
   const state = task.state;
   if (state !== 'done' && state !== 'error' && state !== 'aborted') return null;
-  const raw = task.result ?? '';
-  const truncated = raw.length > TASK_NOTIFICATION_OUTPUT_CAP;
-  const output = truncated
-    ? raw.slice(0, TASK_NOTIFICATION_OUTPUT_CAP) + '…(truncated)'
-    : raw;
+  const output = task.result ?? '';
   return {
     taskId: task.id,
     agentName: task.definition.name,
@@ -151,7 +196,7 @@ function buildPendingFromTask(task: AgentTask): PendingTaskNotification | null {
     ...(task.teamName ? { teamName: task.teamName } : {}),
     state,
     output,
-    truncated,
+    truncated: false,
     ...(task.error ? { errorMessage: task.error } : {}),
     durationMs: (task.finishedAt ?? Date.now()) - (task.startedAt ?? Date.now()),
     finishedAt: task.finishedAt ?? Date.now(),
@@ -256,12 +301,13 @@ export function renderTaskNotificationsXml(
       p.truncated ? `truncated="true"` : null,
     ].filter(Boolean).join(' ');
     lines.push(`  <task ${attrs}>`);
-    if (p.state === 'error' && p.errorMessage) {
-      lines.push(`    <error>${escapeXml(p.errorMessage)}</error>`);
+    if (p.state === 'error' && (p.preservationError || p.errorMessage)) {
+      lines.push(`    <error>${escapeXml(p.preservationError ?? p.errorMessage!)}</error>`);
     }
     if (p.output) {
       lines.push(`    <output>${escapeXml(p.output)}</output>`);
     }
+    if (p.resultPath) lines.push(`    <result-path>${escapeXml(p.resultPath)}</result-path>`);
     lines.push(`  </task>`);
   }
   lines.push('</task-notification>');

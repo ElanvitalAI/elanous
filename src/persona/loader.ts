@@ -154,6 +154,16 @@ export function validatePersonaShape(
     todo = obj['todo'];
   }
 
+  // 🗣️ 말투(speech style) — TUI-SPEECH-STYLE-CHARACTER. ⛔ 위 `actionHosts` 주석이
+  //    못 박은 그 이유로 ***여기에 명시로 옮긴다*** — 타입에만 더하면 YAML 의 그 줄은 영영 안 읽힌다.
+  let speechStyle: string | undefined;
+  if (Object.hasOwn(obj, 'speechStyle')) {
+    if (typeof obj['speechStyle'] !== 'string' || !obj['speechStyle'].trim()) {
+      return err(path, 'speechStyle must be a non-empty string');
+    }
+    speechStyle = obj['speechStyle'];
+  }
+
   let mentionPatterns: readonly string[] | undefined;
   if (obj['mentionPatterns'] !== undefined) {
     if (!Array.isArray(obj['mentionPatterns'])
@@ -169,6 +179,7 @@ export function validatePersonaShape(
     ...(todo !== undefined ? { todo } : {}),
     ...(description.value !== undefined ? { description: description.value } : {}),
     ...(systemPrompt.value !== undefined ? { systemPrompt: systemPrompt.value } : {}),
+    ...(speechStyle !== undefined ? { speechStyle } : {}),
     ...(brand !== undefined ? { brand } : {}),
     ...(models !== undefined ? { models } : {}),
     ...(mentionPatterns !== undefined ? { mentionPatterns } : {}),

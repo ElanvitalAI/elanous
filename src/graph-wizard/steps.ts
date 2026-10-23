@@ -76,6 +76,21 @@ export function recipesYamlFor(nodes: ReadonlyArray<{ nodeId: string; recipe: st
   return out.length ? `${out.join('\n')}\n` : '{}\n';
 }
 
+/**
+ * 템플릿과 같은 디렉터리의 recipes.yaml — 로더(src/self-implement/graph-yaml.ts)가 템플릿에서
+ * 빼는 «명령 카탈로그» 쪽을 읽는다. 그래프의 cmd/approval 노드가 실제로 무엇을 부르는지가 여기 있다.
+ */
+export function recipesSiblingOf(graphFile: string): string | undefined {
+  const slash = graphFile.lastIndexOf('/');
+  const dir = slash < 0 ? '' : `${graphFile.slice(0, slash + 1)}`;
+  for (const name of ['recipes.yaml', 'recipes.yml']) {
+    const path = `${dir}${name}`;
+    if (!existsSync(path)) continue;
+    try { return readFileSync(path, 'utf8'); } catch { return undefined; }
+  }
+  return undefined;
+}
+
 interface GraphContext { graphId?: string; runId?: string; nodeId?: string; input?: unknown; outputs?: Record<string, unknown> }
 
 function readContext(): GraphContext {

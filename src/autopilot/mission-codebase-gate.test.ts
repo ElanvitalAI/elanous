@@ -1,5 +1,5 @@
-import { describe, test, expect, spyOn, afterEach } from 'bun:test';
-import { isImplementationGoal, searchCodebase, searchRepositoryDocuments, groundMissionInSkills, groundMissionInMemory, groundMissionInCodebase, groundMissionInCapsules, extractExportedSymbols, refFactsFromDigest, expandHyphenatedSearchTerms, hasRepositorySpecificIdentifier, type SkillPickFn, isCorpusGrounded, isRepositoryImplementationCandidate, defaultSearchTerms, pickSkillsViaLlm } from './mission-codebase-gate.js';
+import { describe, test, expect, spyOn, afterEach, setDefaultTimeout } from 'bun:test';
+import { setExecFileForTest, setTermGrepConcurrencyForTest, type ExecFileLike, isImplementationGoal, searchCodebase, searchRepositoryDocuments, groundMissionInSkills, groundMissionInMemory, groundMissionInCodebase, groundMissionInCapsules, extractExportedSymbols, refFactsFromDigest, expandHyphenatedSearchTerms, hasRepositorySpecificIdentifier, type SkillPickFn, isCorpusGrounded, isRepositoryImplementationCandidate, defaultSearchTerms, pickSkillsViaLlm } from './mission-codebase-gate.js';
 import type { PersistentGroundingDeps } from '../skills/tools/persistent-grounding.js';
 import type { SkillIndexEntry } from '../skills/index.js';
 import { buildHarnessContextCapsule, type HarnessContextCapsule } from '../self-implement/context-capsule.js';
@@ -13,15 +13,52 @@ import { findCodexModel } from '../codex/models.js';
 import * as modelDefaults from '../llm/model-defaults.js';
 import * as llm from '../llm.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
+import { GOAL_DEVICE_LOAD_SAMPLES, GOAL_DEVICE_SEAM_TERM, driveAbandonedTimeoutCwdSeam, driveTimeoutCwdSeam, goalDeviceExecFile } from '../ux-sim/goal-device.js';
 
 // ⭐ debug.log 바꿔치기 복원 보장(TF #9714 연쇄 수리 · bun 1.4.2 실측) — 타임아웃으로 버려진 본문은
 // pend 상태로 남아 «다음 테스트 도중»에 재개되고, 그 늦은 finally 가 다음 시험이 방금 설치한 override 를
 // 덮어썐다(cwd seam corpus 657행 연쇄의 실제 메커니즘). afterEach 는 타임아웃 직후·다음 테스트 전에
-// 반드시 돌므로 끝나지 않은 본문도 여기서 복원된다. 각 시험의 finally 복원은 정상 경로 즉시 복원으로 남긴다.
+// 반드시 돌므로 끝나지 않은 본문도 여기서 복원된다. 경계를 지날 때마다 epoch 를 올려, 시험 본문의
+// 늦은 finally 가 «다음 시험 도중»에 재개돼도 어떤 상태에서도 복원을 못 하게 한다 — 소유자 일치(CAS)
+// 하나만으로는 경계 통과를 모르므로 다음 시험의 override 를 덮는 경로가 남는다(연쇄의 명시된 원인).
 const pristineDebugLog = debug.log;
+const suiteEntryCwd = process.cwd();
+// Grounding tests execute real repository searches. Under a loaded Pod host the
+// 5s Bun default abandons a body mid-flight and its debug sink can spill into
+// the following test. Give this file the same 30s budget as its slow cases.
+setDefaultTimeout(30_000);
+let debugLogEpoch = 0;
 afterEach(() => {
+  debugLogEpoch += 1;
   (debug as { log: typeof debug.log }).log = pristineDebugLog;
+  // A timed-out async body can skip its own finally until the next test starts.
+  // Restore cwd at the synchronous test boundary, including a deleted cwd.
+  try {
+    if (process.cwd() !== suiteEntryCwd) process.chdir(suiteEntryCwd);
+  } catch {
+    process.chdir(suiteEntryCwd);
+  }
 });
+
+// 시험 본문의 debug.log 교체·복원 경계 — tooCommon 시험과 연쇄 증명 시험이 같은 경로를 쓴다(증명이 실제
+// 수리 코드를 지난다). 복원은 CAS + epoch 일치 가드: 타임아웃으로 버려진 본문이 다음 시험 도중에
+// 재개되면 afterEach 가 이미 epoch 를 올렸으므로 successor 의 override 를 덮지 않는다(연쇄 차단).
+function swapDebugLog(
+  sink: { category: string; event: string; data?: unknown }[],
+  onLog?: (category: string, event: string) => void,
+) {
+  const epoch = debugLogEpoch;
+  const swap = ((category: string, event: string, data?: unknown) => {
+    sink.push({ category, event, data });
+    onLog?.(category, event);
+  }) as typeof debug.log;
+  (debug as { log: typeof debug.log }).log = swap;
+  return () => {
+    if (debugLogEpoch === epoch && (debug as { log: typeof debug.log }).log === swap) {
+      (debug as { log: typeof debug.log }).log = pristineDebugLog;
+    }
+  };
+}
 
 // 이 두 시험은 경계 복원을 직접 반증한다: afterEach 를 제거하면 둘째가 실패한다.
 describe('debug.log 시험 경계 복원', () => {
@@ -400,7 +437,7 @@ describe('하이픈 검색어 확장', () => {
     } finally {
       // afterEach owns restoration, even when a timed-out body resumes late.
     }
-  }, 30_000);
+  });
 });
 
 describe('searchCodebase', () => {
@@ -537,12 +574,8 @@ describe('searchCodebase', () => {
     // 기본 5s 한도의 절반을 쓰고 부하에서 넘쳤다. fixture 는 tooCommon 역치(commonCount > 200·src+docs+scripts
     // 파일 수)와 랭킹을 결정론으로 재현한다. 명시 30s 한도는 부하 변동에 대한 두번째 방어선이다.
     const cwd = mkdtempSync(join(tmpdir(), 'too-common-fixture-'));
-    const original = debug.log.bind(debug) as typeof debug.log;
     const logs: { category: string; event: string; data: unknown }[] = [];
-    const swap = ((category: string, event: string, data?: unknown) => {
-      logs.push({ category, event, data });
-    }) as typeof debug.log;
-    (debug as { log: typeof debug.log }).log = swap;
+    const restoreDebugLog = swapDebugLog(logs);
     try {
       mkdirSync(join(cwd, 'src', 'session'), { recursive: true });
       mkdirSync(join(cwd, 'src', 'gen'), { recursive: true });
@@ -567,14 +600,65 @@ describe('searchCodebase', () => {
         (log.data as { term?: string; file?: string; common?: boolean }).common === true);
       expect(nameSignals).toHaveLength(7);
     } finally {
-      // 복원은 소유자 일치(CAS) 가드 — afterEach 가 이미 복원하고 successor 가 자기 override 로 교체한 뒤
-      // 이 본문이 늦게 재개되더라도 successor 의 override 를 덮지 않는다(연쇄 차단).
-      if ((debug as { log: typeof debug.log }).log === swap) {
-        (debug as { log: typeof debug.log }).log = original;
-      }
+      // 복원은 CAS + epoch 가드(swapDebugLog) — 타임아웃으로 버려진 본문이 다음 시험 도중 재개되면
+      // afterEach 가 이미 epoch 를 올렸으므로 successor 의 override 를 덮지 않는다(연쇄 차단).
+      restoreDebugLog();
       rmSync(cwd, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test('버려진 tooCommon 본문의 늦은 finally가 cwd seam corpus 수집 도중 재개되어도 다음 시험은 corpus 로그를 실제로 받는다', async () => {
+    // 타임아웃이 남기는 «버려진 본문»(교체를 설치한 채 pend → 경계 통과 → 다음 시험 도중 재개)을
+    // 결정론으로 재현한다 — 실 bun 타임아웃을 쓰면 5s 지연 + 시험 실패 오염이 생긴다. 상태만 실측
+    // 메커니즘과 동일하게: 같은 swapDebugLog 경계로 교체 설치 → gate 로 pend → afterEach 복원·epoch 상승 →
+    // cwd seam 관측 중 release.
+    const cwd = mkdtempSync(join(tmpdir(), 'root-seam-'));
+    let releaseAbandoned: () => void = () => {};
+    const abandonedGate = new Promise<void>((resolve) => { releaseAbandoned = resolve; });
+    const abandonedLogs: { category: string; event: string; data: unknown }[] = [];
+    const seq: string[] = [];
+    let abandonedFinallyRan = false;
+    const abandonedBody = (async () => {
+      const restoreDebugLog = swapDebugLog(abandonedLogs);
+      try {
+        await abandonedGate; // 타임아웃이 남기는 pend 상태
+      } finally {
+        restoreDebugLog(); // 늦은 finally — 경계를 이미 지났다
+        abandonedFinallyRan = true;
+        seq.push('abandoned-finally');
+      }
+    })();
+    // afterEach 경계 — 타임아웃 직후·다음 시험 전에 반드시 도는 복원 + epoch 상승.
+    (debug as { log: typeof debug.log }).log = pristineDebugLog;
+    debugLogEpoch += 1;
+    try {
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'src', 'root-seam.ts'), 'export const rootSeamNeedle = true; // root-seam\n');
+      execFileSync('git', ['init', '-q'], { cwd });
+      execFileSync('git', ['add', '.'], { cwd });
+      // 다음 시험: cwd seam — caller cwd 로 corpus 로그를 수집한다.
+      const seamLogs: { category: string; event: string; data: unknown }[] = [];
+      const restoreSeam = swapDebugLog(seamLogs, (category, event) => {
+        if (category === 'mission.grounding' && event === 'corpus') seq.push('seam-corpus');
+      });
+      const seam = groundMissionInCodebase('root seam', {
+        cwd, searchTerms: async () => ['root-seam'], persistent: false,
+        skillIndex: () => [], pickSkills: async () => [], recallMemory: () => [], recallSelf: async () => [], refDigest: () => '',
+      });
+      releaseAbandoned(); // 늦은 재개 — seam 의 corpus 수집(git 자식프로세스 await) 도중에 실행된다.
+      const grounded = await seam;
+      // 늦은 finally 는 seam 수집 «도중»(corpus 수신 이전)에 실행됐고, seam 은 corpus 로그를 실제로 받았다.
+      expect(seq).toEqual(['abandoned-finally', 'seam-corpus']);
+      expect(abandonedFinallyRan).toBe(true);
+      expect(seamLogs.find((log) => log.category === 'mission.grounding' && log.event === 'corpus')?.data)
+        .toMatchObject({ cwd, cwdSource: 'caller' });
+      expect(grounded.files).toContain('src/root-seam.ts');
+      restoreSeam();
+    } finally {
+      (debug as { log: typeof debug.log }).log = pristineDebugLog;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('groundMissionInSkills — skill 인덱스 grounding(P1)', () => {
@@ -857,7 +941,7 @@ describe('groundMissionInCodebase — cwd seam', () => {
     } finally {
       // afterEach owns restoration, even when a timed-out body resumes late.
     }
-  });
+  }, 30_000);
 });
 
 describe('groundMissionInCodebase — 로컬 ref grounding(F1)', () => {
@@ -1068,4 +1152,224 @@ describe('groundMissionInCodebase — 실행 시간 관측', () => {
       // afterEach owns restoration, even when a timed-out body resumes late.
     }
   });
+});
+
+describe('searchCodebase — term grep 동시 실행 상한', () => {
+  const TERMS = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta'];
+  const TRACKED = ['src/core.ts', 'src/alpha-router.ts', 'scripts/alpha-task.ts', 'docs/alpha.md'];
+  const PRIMARY_ROWS: Record<string, string[]> = {
+    alpha: ['src/core.ts:4', 'src/alpha-router.ts:2'],
+    beta: ['src/core.ts:3'],
+    gamma: ['src/core.ts:2', 'src/alpha-router.ts:1'],
+    delta: ['src/core.ts:1'],
+    epsilon: ['src/core.ts:2'],
+    zeta: ['src/core.ts:1'],
+    eta: ['src/core.ts:1'],
+    theta: ['src/core.ts:1'],
+  };
+  const COMMON_ROWS: Record<string, string[]> = {
+    ...PRIMARY_ROWS,
+    alpha: [...PRIMARY_ROWS.alpha!, 'scripts/alpha-task.ts:2', 'docs/alpha.md:3'],
+  };
+
+  afterEach(() => {
+    setExecFileForTest(null);
+    setTermGrepConcurrencyForTest(null);
+  });
+
+  /** primary 경로 목록(src·scripts) 호출인가 — 공통 경로 호출은 docs 를 포함한다. */
+  function primaryShape(args: readonly string[]): boolean {
+    return !args.includes('docs');
+  }
+
+  /** 가짜 execFile — 실제 git 을 띄우지 않고 term 별 git grep 동시 실행 수·호출 인자를 잰다. */
+  function fakeExecFile(delayMs: number) {
+    const state = { active: 0, maxActive: 0, greps: [] as string[][] };
+    const impl: ExecFileLike = async (_file, args) => {
+      if (args[0] === 'ls-files') return { stdout: `${TRACKED.join('\n')}\n` };
+      state.greps.push([...args]);
+      state.active += 1;
+      state.maxActive = Math.max(state.maxActive, state.active);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        const term = args[args.indexOf('-e') + 1] ?? '';
+        const rows = primaryShape(args) ? PRIMARY_ROWS[term] ?? [] : COMMON_ROWS[term] ?? [];
+        return { stdout: rows.join('\n') };
+      } finally {
+        state.active -= 1;
+      }
+    };
+    return { impl, state };
+  }
+
+  test('키워드 8개(중복 1개) → git grep 동시 실행 최대 3 · 중복 키워드는 1회만 실행', async () => {
+    const logs: { category: string; event: string; data: unknown }[] = [];
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+      logs.push({ category, event, data });
+    }) as typeof debug.log;
+    const { impl, state } = fakeExecFile(5);
+    setExecFileForTest(impl);
+
+    const terms = [...TERMS.slice(0, 7), 'alpha'];
+    const files = await searchCodebase(terms, 12, '/tmp/term-grep-pool-fixture');
+
+    expect(files[0]).toBe('src/core.ts');
+    expect(state.maxActive).toBeLessThanOrEqual(3);
+    expect(state.maxActive).toBeGreaterThan(1);
+    expect(state.greps.filter((args) => args.includes('alpha') && primaryShape(args))).toHaveLength(1);
+    expect(state.greps.filter((args) => args.includes('alpha') && !primaryShape(args))).toHaveLength(1);
+
+    const batch = logs.find((log) => log.category === 'grounding.search' && log.event === 'term-grep-batch')?.data as Record<string, unknown> | undefined;
+    expect(batch).toBeDefined();
+    expect(batch?.terms).toBe(7);
+    expect(batch?.concurrency).toBe(3);
+    expect(typeof batch?.ms).toBe('number');
+  });
+
+  test('상한 3 과 상한 없음의 결과 파일·순위는 바이트 동일하다', async () => {
+    const capped = fakeExecFile(3);
+    setExecFileForTest(capped.impl);
+    const withCap = await searchCodebase(TERMS, 12, '/tmp/term-grep-pool-fixture');
+
+    const uncapped = fakeExecFile(3);
+    setExecFileForTest(uncapped.impl);
+    setTermGrepConcurrencyForTest(Number.POSITIVE_INFINITY);
+    const withoutCap = await searchCodebase(TERMS, 12, '/tmp/term-grep-pool-fixture');
+
+    expect(withoutCap).toEqual(withCap);
+    expect(withCap.slice(0, 2)).toEqual(['src/core.ts', 'src/alpha-router.ts']);
+    expect(capped.state.maxActive).toBeLessThanOrEqual(3);
+    expect(uncapped.state.maxActive).toBe(8);
+  });
+});
+
+// ⛔ #29343 r3 리뷰 FAIL 지적 소유 — «타임아웃으로 버려진 본문이 옮긴 cwd» 가 다음 런의 seam 을 오염시킨다.
+// 무대 = src/ux-sim/goal-device(부하≥50 표본 주입 · 타임아웃 시뮬레이션 · cwd seam 관측). 판정은 생산 진입
+// (groundMissionInCodebase)을 그대로 지나는 값으로만 한다 — 소스 문자열을 보지 않는다.
+describe('MISSION-CODEBASE-GATE-FLAKY-FU — cwd seam 소유권', () => {
+  test('MISSION-CODEBASE-GATE-FLAKY-FU: 타임아웃 뒤 cwd-seam 복원', async () => {
+    const logs: { category: string; event: string; data?: unknown }[] = [];
+    const restoreDebugLog = swapDebugLog(logs);
+    const entryCwd = process.cwd();
+    try {
+      const observed = await driveTimeoutCwdSeam({ loadSamples: GOAL_DEVICE_LOAD_SAMPLES, timeoutMs: 20 });
+
+      // 무대가 실제로 돌았다 — 부하 표본이 켜졌고, 타임아웃 의존성이 마감을 넘겼다.
+      expect(observed.timedOutDependencyRan).toBe(true);
+      expect(observed.loadSamples).toBe(50);
+      expect(observed.peakLoadSamples).toBeGreaterThanOrEqual(50);
+      expect(observed.loadSlices).toBeGreaterThan(0);
+      // «시작만 한» 표본이 아니라 생산 런이 진행 중인 구간에 실제로 일한 표본이 50 이다.
+      expect(observed.loadSamplesWorkedDuringWindow).toBeGreaterThanOrEqual(50);
+
+      // ① 타임아웃(throw) 경로에서도 런이 자기 cwd 를 되돌린다 — 이 칸의 판정선.
+      expect(observed.afterTimeoutCwd).toBe(entryCwd);
+      expect(observed.restored).toBe(true);
+
+      // ② 다음 런의 seam 은 오염된 임시 트리가 아니라 시작 자리를 읽는다.
+      expect(observed.successorCwd).toBe(entryCwd);
+      expect(observed.successorFiles).toContain('src/goal-seam.ts');
+
+      // ③ 원장 형식은 그대로다 — 타임아웃 런은 기존 스칼라(reason=error·codeChannel=failed),
+      //    다음 런은 caller 가 아닌 process 출처로 시작 자리를 관측한다.
+      const corpus = logs.filter((log) => log.category === 'mission.grounding' && log.event === 'corpus');
+      expect(corpus).toHaveLength(2);
+      expect(corpus[0]!.data).toMatchObject({ grounded: false, reason: 'error', codeChannel: 'failed' });
+      expect(corpus[1]!.data).toMatchObject({ grounded: true, cwd: entryCwd, cwdSource: 'process' });
+    } finally {
+      restoreDebugLog();
+      if (process.cwd() !== entryCwd) process.chdir(entryCwd);
+    }
+  }, 30_000);
+
+  test('MISSION-CODEBASE-GATE-FLAKY-FU: 마감 뒤 재개된 본문이 옮긴 cwd 를 겹친 다음 런이 seam 으로 읽지 않는다', async () => {
+    const entryCwd = process.cwd();
+    try {
+      const observed = await driveAbandonedTimeoutCwdSeam({ loadSamples: GOAL_DEVICE_LOAD_SAMPLES, timeoutMs: 10 });
+
+      // 무대가 성립했다 — 호출자가 먼저 버렸고, 그 뒤 재개된 본문이 실제로 cwd 를 옮겼다.
+      expect(observed.abandonedAtDeadline).toBe(true);
+      expect(observed.lateMutationRan).toBe(true);
+      expect(observed.cwdWhileAbandonedPending).not.toBe(entryCwd);
+      expect(observed.peakLoadSamples).toBeGreaterThanOrEqual(50);
+      expect(observed.loadSlices).toBeGreaterThan(0);
+      expect(observed.loadSamplesWorkedDuringWindow).toBeGreaterThanOrEqual(50);
+
+      // ① 겹친 다음 런의 seam(생산 검색이 git 에 넘긴 cwd)은 오염된 임시 트리가 아니라 시작 자리다.
+      expect(observed.successorSeamRoots.length).toBeGreaterThan(0);
+      expect(new Set(observed.successorSeamRoots)).toEqual(new Set([entryCwd]));
+      expect(observed.successorFiles).toContain('src/goal-seam.ts');
+      // ② 복원 보장의 «경계» — 버려진 본문이 끝나지 않은 동안 전역 cwd 는 옮겨진 채다(남의 본문 밑을 흔들지 않는다).
+      //    그 사이 보장되는 것은 ① 의 seam 뿐이다.
+      expect(observed.cwdAfterSuccessor).not.toBe(entryCwd);
+      // ③ 버려진 런까지 끝나는 순간 마지막 holder 가 시작 자리로 되돌린다.
+      expect(observed.afterAllSettledCwd).toBe(entryCwd);
+      expect(observed.restored).toBe(true);
+    } finally {
+      if (process.cwd() !== entryCwd) process.chdir(entryCwd);
+    }
+  }, 30_000);
+
+  test('MISSION-CODEBASE-GATE-FLAKY-FU: 지워진 process cwd 에서도 caller cwd 를 받은 런은 예외 없이 진행한다', async () => {
+    const logs: { category: string; event: string; data?: unknown }[] = [];
+    const restoreDebugLog = swapDebugLog(logs);
+    const entryCwd = process.cwd();
+    const gone = mkdtempSync(join(tmpdir(), 'mcg-cwd-gone-'));
+    // caller root 는 빈 임시 트리 — 문서 채널의 실물 git 이 저장소 전체를 훑지 않게 한다(코드 채널은 장치 git 대역).
+    const callerRoot = mkdtempSync(join(tmpdir(), 'mcg-cwd-caller-'));
+    setExecFileForTest(goalDeviceExecFile());
+    try {
+      process.chdir(gone);
+      rmSync(gone, { recursive: true, force: true });
+      const result = await groundMissionInCodebase('deleted cwd caller root fixture', {
+        cwd: callerRoot,
+        searchTerms: async () => [GOAL_DEVICE_SEAM_TERM],
+        persistent: false,
+        skillIndex: () => [], pickSkills: async () => [], recallMemory: () => [], recallSelf: async () => [], refDigest: () => '',
+      });
+      expect(result.files).toContain('src/goal-seam.ts');
+      const corpus = logs.filter((log) => log.category === 'mission.grounding' && log.event === 'corpus');
+      expect(corpus.at(-1)!.data).toMatchObject({ cwd: callerRoot, cwdSource: 'caller' });
+      // 시작 자리를 못 읽은 런은 소유하지 않으므로 되돌리려 들지도, 실패를 남기지도 않는다.
+      expect(logs.some((log) => log.event === 'cwd-restore-failed')).toBe(false);
+    } finally {
+      setExecFileForTest(null);
+      restoreDebugLog();
+      process.chdir(entryCwd);
+      rmSync(gone, { recursive: true, force: true });
+      rmSync(callerRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('MISSION-CODEBASE-GATE-FLAKY-FU: 되돌리기 실패는 결과를 바꾸지 않되 cwd-restore-failed 로 관측된다', async () => {
+    const logs: { category: string; event: string; data?: unknown }[] = [];
+    const restoreDebugLog = swapDebugLog(logs);
+    const entryCwd = process.cwd();
+    const doomed = mkdtempSync(join(tmpdir(), 'mcg-cwd-doomed-'));
+    const away = mkdtempSync(join(tmpdir(), 'mcg-cwd-away-'));
+    try {
+      process.chdir(doomed);
+      const doomedRoot = process.cwd();
+      const result = await groundMissionInCodebase('cwd restore failure fixture', {
+        searchTerms: async () => {
+          process.chdir(away);
+          rmSync(doomed, { recursive: true, force: true });
+          throw new Error('fixture: root removed');
+        },
+        persistent: false,
+        skillIndex: () => [], pickSkills: async () => [], recallMemory: () => [], recallSelf: async () => [], refDigest: () => '',
+      });
+      expect(result.grounded).toBe(false);
+      const failed = logs.filter((log) => log.category === 'mission.grounding' && log.event === 'cwd-restore-failed');
+      expect(failed).toHaveLength(1);
+      expect(failed[0]!.data).toMatchObject({ root: doomedRoot });
+      // 관측(timing)은 복원 실패 뒤에도 빠지지 않는다.
+      expect(logs.some((log) => log.category === 'mission.grounding' && log.event === 'timing')).toBe(true);
+    } finally {
+      restoreDebugLog();
+      process.chdir(entryCwd);
+      rmSync(doomed, { recursive: true, force: true });
+      rmSync(away, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

@@ -34,6 +34,9 @@ export interface FailureSignature {
   readonly cause: string;
   /** 다음 행동 — 한국어 한 줄. */
   readonly next: string;
+  /** 자동 수복 — 있으면 TUI 턴이 사람에게 넘기기 «전에» 스스로 회복을 시도한다(`self-health/autoheal.ts`).
+   *  `new-session-then-provider` = ① 새 백엔드 세션 ⊕ 직전 요약 → ② fallbackChain 다음 공급자(턴당 2회 상한). */
+  readonly autoheal?: 'new-session-then-provider';
 }
 
 /** 이벤트 루프 정지를 «지문»으로 볼 문턱 — 0.25s 표본은 잦아 소음이고, 결함 #1(14s)·#14(최대 2.35s)는 이 위다. */
@@ -48,6 +51,9 @@ export const FAILURE_SIGNATURES: readonly FailureSignature[] = [
     text: [/\b(?:Codex|LLM) API 400\b/],
     cause: '모델 API 가 요청을 400 으로 거절(대화 기록 어긋남 의심)',
     next: '/session new 뒤 짧게 다시 묻기',
+    // TUI-400-AUTOHEAL-FALLBACK(대표 10-22) — 위 처방을 사람이 치기 전에 TUI 가 먼저 스스로 해 본다.
+    //   처방 한 줄은 자동 회복이 «안 걸린» 경우(답이 이미 흐름·배선 없음)에만 보인다.
+    autoheal: 'new-session-then-provider',
   },
   {
     id: 'provider-fallback-exhausted',

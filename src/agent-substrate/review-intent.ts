@@ -13,6 +13,7 @@ import remarkParse from 'remark-parse';
 import { unified } from 'unified';
 
 import { parseGoalType, type GoalType } from '../self-implement/goal-author.js';
+import { DEVICE_FIRST_STEP } from '../self-implement/device-first.js';
 import type { DesignCheckOutcome } from '../design/design-check.js';
 import type { DesignGateResult } from '../design/design-gate.js';
 import type { PriorDraftFinding } from '../self-implement/prior-draft-findings.js';
@@ -525,6 +526,30 @@ function goalFileBlock(goalFile: string | undefined): Block | undefined {
     : undefined;
 }
 
+/** tier-split 이 골 본문에 남긴 조각 표지를 리뷰의 책임 경계로 옮긴다. */
+function sliceReviewScopeBlock(goal: string): Block | undefined {
+  const fencedLines = topLevelCodeLines(goal);
+  const lines = goal.split('\n').filter((_, index) => !fencedLines.has(index));
+  const match = lines.map((line) => /^\s*조각\s+(\d+)\/(\d+)\s*—/.exec(line)).find(Boolean);
+  if (!match) return undefined;
+  const index = Number(match[1]);
+  const total = Number(match[2]);
+  if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index < 1 || total < 2 || index > total) return undefined;
+
+  const deviceStep = `동작: ${DEVICE_FIRST_STEP}`;
+  const device = lines.some((line) => line.split('·').some((part) => {
+    const stage = part.trimStart();
+    return stage === deviceStep || stage.startsWith(`${deviceStep} `);
+  }));
+  const title = '조각 계약 — 리뷰 범위';
+  const scopeLines = [
+    `${title}\n조각 ${index}/${total} — 현재 조각의 동작·변경 파일·자기 완료 경계로 이 PR을 판정한다.`,
+    ...(index < total ? ['다음 조각 몫과 부모 전체 완료 경계의 미완료만으로 이 조각의 must-fix를 만들지 말 것.'] : []),
+    ...(device ? ['장치 조각: 호출부 없는 export의 소비자는 다음 피처 조각이다. 이 조각에서 호출부 부재만으로 must-fix를 만들지 말고 장치 시험과 사용 가능한 인터페이스를 판정한다.'] : []),
+  ];
+  return { title, text: scopeLines.join('\n') };
+}
+
 function isLightweightGoal(goal: string): boolean {
   try {
     const tree = unified().use(remarkParse).use(remarkGfm).parse(goal) as MarkdownNode;
@@ -599,6 +624,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   const boundaries = i.scopeBoundaries ?? mined.scopeBoundaries;
   const unverifiedBoundaryCandidates = mined.unverifiedBoundaryCandidates;
   const goalType = goalTypeBlock(i.goal);
+  const sliceScope = sliceReviewScopeBlock(i.goal);
   // ⚠️ 목표 블록에는 **추출된 절을 뺀 나머지**를 넣는다(리뷰 should-fix) — 골 원문을 통째로 넣고
   //   그 안의 수용기준을 다시 목록으로 붙이면 **같은 내용이 두 번** 들어가 4000자 예산을 먹고,
   //   후순위 블록(스코프 경계)이 불필요하게 잘린다.
@@ -631,7 +657,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
     const context = lightweightGoalContext(i.goal, i.goalFile!.trim());
     const boundaryBlock = listBlock('의도적 스코프 경계', boundaries);
     const liteBlocks = [
-      acceptanceBlock, context, boundaryBlock, shardBoundary, priorFindings, applied,
+      acceptanceBlock, context, boundaryBlock, sliceScope, shardBoundary, priorFindings, applied,
       runFacts, goalType, preexisting, importerTestsNotRun,
       gateEvidence, designCheck, designGate, shardSiblings, coverage, claims,
       listBlock('검증 못 한 경계 후보 (결정 아님 — 이것만으로 must-fix 를 면제하지도, 만들지도 말 것)', unverifiedBoundaryCandidates),
@@ -648,6 +674,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   //   ⚠️ 이것은 «렌더 순서»만 바꾼다 — 예산 배분 순서(`order`)와 보호 블록은 아래에서 따로 정한다.
   const blocks: Block[] = [
     runFacts,
+    sliceScope,
     priorFindings,
     goalFile,
     goalType,
@@ -667,7 +694,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
     listBlock('검증 못 한 경계 후보 (결정 아님 — 이것만으로 must-fix 를 면제하지도, 만들지도 말 것)', unverifiedBoundaryCandidates),
   ].filter((b): b is Block => Boolean(b));
 
-  const protectedBlocks = blocks.filter((block) => block.title === '수용기준' || block.title === '의도적 스코프 경계');
+  const protectedBlocks = blocks.filter((block) => block.title === '수용기준' || block.title === '의도적 스코프 경계' || block === sliceScope);
   // ⛔⭐ **증거가 목표보다 먼저다**(실측 수리). 종전 순서는 `[보호블록, 목표, 나머지]` 였고, 골이
   //   15,383자면 `목표` 가 남은 예산을 통째로 먹어 자식의 `EVIDENCE/RESULT` 가 **제목만 남고
   //   `…[N개 생략됨]`** 이 됐다. 그러면 리뷰는 *"실행하지 않았다 · 증거가 없다"* 를 적고 — 그것이

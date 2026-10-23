@@ -16,3 +16,8 @@ test('POD-LIFECYCLE-STAGES: the pod.lifecycle «stages» line is allowlisted', (
 test('SI-SEED-DEFAULT: the mirror seed skip line is allowlisted', () => {
   expect(KNOWN_LOG_EVENT_NAMES.has('mirror-seed-skipped')).toBe(true);
 });
+
+test('capability tool tier split and task-agent tier split have distinct event names', () => {
+  expect(KNOWN_LOG_EVENT_NAMES.has('tool-tier-split')).toBe(true);
+  expect(KNOWN_LOG_EVENT_NAMES.has('tier-split')).toBe(true);
+});

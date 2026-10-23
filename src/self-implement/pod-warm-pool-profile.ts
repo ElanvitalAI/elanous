@@ -5,6 +5,7 @@ export type WarmPoolTier = 'lite' | 'standard';
 const STANDARD_HOST_MAX: Readonly<Record<string, number>> = {
   node-b: 16,
   node-c: 4,
+  'elangram-wsl': 5,
   'host-e-wsl': 5,
 };
 

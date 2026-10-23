@@ -6,6 +6,7 @@ import { parse as parseYaml } from 'yaml';
 import { runSelfImplement } from './orchestrator.js';
 import { seams } from './test-seams.js';
 import { runLedgerPath } from './run-ledger.js';
+import { GRAPH_SPECS } from './graph-templates.js';
 
 const root = mkdtempSync(join(tmpdir(), 'orchestrator-graph-variant-'));
 const previous = process.env.ELANOUS_STATE_DIR;
@@ -45,6 +46,11 @@ test('orchestrator executes two validated run-local variants and writes distinct
       from: 'decompose', to: 'pool-admit', when: 'substrate == pod',
     }));
     expect(savedVariant.nodes.find((node: { node_id: string }) => node.node_id === 'implement').max_visits).toBe(visits);
+    const sourceRecover = GRAPH_SPECS['self-implement']!.nodes.find(node => node.nodeId === 'recover')!;
+    const savedRecover = savedVariant.nodes.find((node: { node_id: string }) => node.node_id === 'recover');
+    expect(savedRecover.call).toBe(sourceRecover.call);
+    expect(savedRecover.budget.inner_steps).toBe(sourceRecover.budget?.innerSteps);
+    expect(parsed.template!.nodes.find(node => node.nodeId === 'recover')).toEqual(sourceRecover);
     expect(entries.find(entry => entry.event === 'graph-run-contract-resolved')?.data.graphVersion).toBe(graphVersionHash(parsed.template!));
     expect(entries.some(entry => entry.event === 'graph-visit-budget' && entry.data.node === 'implement' && entry.data.maxVisits === visits)).toBe(true);
     const path = `${runLedgerPath(id)}.graph.yaml`;

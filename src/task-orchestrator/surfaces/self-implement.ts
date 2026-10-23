@@ -30,6 +30,7 @@ import { isAbandonedClassification, type AbandonedClassificationResult } from '.
 import { createExecution, type Task, type TaskExecution } from '../types.js';
 import type { DispatchContext, DispatchResult } from '../surface-registry.js';
 import { nestedPodResult } from './pod-failure-reason.js';
+import { SCOPE_EXPANSION_CAP, SCOPE_STOP_REASONS, isProtectedScopePath, type ScopeStopReason } from '../../self-implement/scope-adjacency.js';
 
 /** Result of one self-implement subprocess. */
 export interface SelfImplementJobDone {
@@ -107,6 +108,11 @@ export interface PodChildEvidence {
   classification?: string;
   scopeEscape?: true;
   outOfScopeEdits?: unknown;
+  /** SCOPE-ESCAPE-AS-REFINE — why held out-of-scope edits stop the run (deletion · protected path · cap). Present only with scopeEscape. */
+  scopeStopReasons?: ScopeStopReason[];
+  /** SCOPE-ESCAPE-AS-REFINE — «구현이 알려준 새 범위», not a failure: held names with no stop reason, or (no held names)
+   *  the accepted `scopeExpansion` paths of a child that failed later (e.g. gate). Evidence is built only for failed results. */
+  newScope?: string[];
   abandonedClassification?: Record<string, unknown>;
   supervisorVerdict?: unknown;
   goalCauseObserved?: true;
@@ -120,6 +126,34 @@ export interface PodChildEvidence {
     candidateCardId?: string;
     blockingCardId?: string;
   };
+}
+
+const SCOPE_STOP_REASON_ORDER: readonly ScopeStopReason[] = SCOPE_STOP_REASONS;
+
+/** Stop reasons for held out-of-scope edits: the child's own `scopeStopReasons` (orchestrator decideScopeExpansion) plus
+ *  what the names alone prove (protected path · count over SCOPE_EXPANSION_CAP · incomplete name list). A deletion is
+ *  only known from the child. Deterministic, fixed order. */
+export function scopeStopReasonsFromResult(o: Record<string, unknown>, outOfScopeEdits: unknown = o.outOfScopeEdits): ScopeStopReason[] {
+  const reasons = new Set<ScopeStopReason>();
+  if (Array.isArray(o.scopeStopReasons)) {
+    for (const reason of o.scopeStopReasons) if ((SCOPE_STOP_REASON_ORDER as readonly unknown[]).includes(reason)) reasons.add(reason as ScopeStopReason);
+  }
+  const names = Array.isArray(outOfScopeEdits) ? outOfScopeEdits.filter((name): name is string => typeof name === 'string') : [];
+  if (names.some(isProtectedScopePath)) reasons.add('protected-path');
+  const count = typeof o.outsideCount === 'number' ? Math.max(o.outsideCount, names.length) : names.length;
+  if (count > SCOPE_EXPANSION_CAP) reasons.add('over-cap');
+  if (o.nameCapReached === true) reasons.add('name-cap');
+  return SCOPE_STOP_REASON_ORDER.filter((reason) => reasons.has(reason));
+}
+
+/** «구현이 알려준 새 범위» — held names with no stop reason, else the accepted expansion's paths. */
+function newScopeFromResult(outOfScopeEdits: unknown, scopeExpansion: unknown): string[] | undefined {
+  const names = Array.isArray(outOfScopeEdits) ? outOfScopeEdits.filter((name): name is string => typeof name === 'string' && name.length > 0) : [];
+  if (names.length) return names.slice(0, 40);
+  const files = scopeExpansion && typeof scopeExpansion === 'object' ? (scopeExpansion as { files?: unknown }).files : undefined;
+  const paths = Array.isArray(files) ? files.map((file) => (file && typeof file === 'object' ? (file as { path?: unknown }).path : undefined))
+    .filter((path): path is string => typeof path === 'string' && path.length > 0) : [];
+  return paths.length ? paths.slice(0, 40).map((path) => redactSecretText(path)) : undefined;
 }
 
 /** Preserve only named terminal facts; the full child detail may contain logs or credentials. */
@@ -146,8 +180,13 @@ export function podChildEvidenceFromResult(o: Record<string, unknown>): PodChild
   const failureExitCode = o.ok === false && typeof o.exitCode === 'number'
     && Number.isInteger(o.exitCode) && o.exitCode >= 0 && o.exitCode <= 255 ? o.exitCode : undefined;
   const outOfScopeEdits = scrubValue(o.outOfScopeEdits);
-  const scopeEscape = (Array.isArray(outOfScopeEdits) && outOfScopeEdits.length > 0)
+  const held = (Array.isArray(outOfScopeEdits) && outOfScopeEdits.length > 0)
     || (typeof o.detail === 'string' && /^Out-of-scope edits held in the worktree(?:[.;]|$)/i.test(o.detail.trim()));
+  // SCOPE-ESCAPE-AS-REFINE (대표 10-22 «범위 밖 허용도 로직으로») — held edits stop the run only for a deletion, a protected
+  //   path, or a cap; otherwise they are the new scope the implementation found and the exit is classified as if unheld.
+  const scopeStopReasons = held ? scopeStopReasonsFromResult(o, outOfScopeEdits) : [];
+  const scopeEscape = held && scopeStopReasons.length > 0;
+  const newScope = scopeEscape ? undefined : newScopeFromResult(outOfScopeEdits, o.scopeExpansion);
   const classification = scopeEscape ? 'scope-escape'
     : typeof abandoned?.classification === 'string' ? redactSecretText(abandoned.classification)
       : typeof o.failureClassification === 'string' ? redactSecretText(o.failureClassification) : undefined;
@@ -157,8 +196,9 @@ export function podChildEvidenceFromResult(o: Record<string, unknown>): PodChild
     ...(failedText(o.stderr) ? { stderr: failedText(o.stderr) } : {}),
     ...(failureExitCode !== undefined ? { exitCode: failureExitCode } : {}),
     ...(classification ? { classification } : {}),
-    ...(scopeEscape ? { scopeEscape: true } : {}),
+    ...(scopeEscape ? { scopeEscape: true, scopeStopReasons } : {}),
     ...(outOfScopeEdits !== undefined ? { outOfScopeEdits } : {}),
+    ...(newScope ? { newScope } : {}),
     ...(abandoned ? { abandonedClassification: abandoned } : {}),
     ...(o.supervisorVerdict !== undefined ? { supervisorVerdict: scrubValue(o.supervisorVerdict) } : {}),
     ...(o.goalCauseObserved === true ? { goalCauseObserved: true } : {}),

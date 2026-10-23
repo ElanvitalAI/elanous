@@ -316,6 +316,36 @@ export function parseReworkBudgetDecision(response: string | undefined): ReworkB
   return verdict && reason ? { verdict, reason } : undefined;
 }
 
+/** TDD-SUPERVISOR-IMPOSSIBLE-EVIDENCE — «구조적으로 불가능한 증거 요구» 표지.
+ *  base 에 없는 신규 파일·모듈의 시험은 base 에서 실패할 수 없다(missing-at-base). 그 «적색 증인 없음 · unproved» 지적이
+ *  라운드마다 반복돼도 구현이 고칠 수 있는 결함이 아니다 — 10-22 #30254 가 이 반복으로 UNCONVERGEABLE 에 버려졌다. */
+const IMPOSSIBLE_EVIDENCE_MARKERS: readonly { readonly id: string; readonly re: RegExp }[] = [
+  { id: 'missing-at-base', re: /missing-at-base/i },
+  { id: 'changed-test-unproved', re: /\[changed-test-evidence\][^\n]*verdict=unproved/i },
+  { id: 'base-fail-zero', re: /base-fail=0\/[1-9]/i },
+  { id: 'base-absent-new-module', re: /(베이스|base)\s*에\s*(없는|부재)[^\n]{0,40}(신규|새)[^\n]{0,20}(모듈|파일)|(신규|새)\s*(모듈|파일)[^\n]{0,40}(베이스|base)\s*에\s*(없|부재)/i },
+  { id: 'no-red-witness', re: /적색\s*증인\s*(없|부재)|red witness/i },
+];
+
+export interface ImpossibleEvidenceReclassification {
+  readonly response: string;
+  readonly applied: boolean;
+  readonly markers: readonly string[];
+}
+
+/** 감독이 UNCONVERGEABLE 을 냈는데 현재 지적이 «불가능한 증거 요구» 표지를 담으면 CONTRACT-CONFLICT 로 바꾼다.
+ *  다음 라운드는 그 요구가 불가능하다는 계획 수정(이유)을 들고 계속한다(런을 버리지 않는다). 다른 판정·표지 없는 지적은 그대로. */
+export function reclassifyImpossibleEvidence(response: string, note: string): ImpossibleEvidenceReclassification {
+  const decision = parseReworkBudgetDecision(response);
+  if (decision?.verdict !== 'UNCONVERGEABLE') return { response, applied: false, markers: [] };
+  const markers = IMPOSSIBLE_EVIDENCE_MARKERS.filter(({ re }) => re.test(note)).map(({ id }) => id);
+  if (markers.length === 0) return { response, applied: false, markers };
+  const lines = response.split(/\r?\n/);
+  lines[0] = 'BUDGET: CONTRACT-CONFLICT';
+  lines[1] = `REASON: 구조적으로 불가능한 증거 요구(${markers.join('·')}) — base 에 없는 신규 파일은 base 에서 실패할 수 없으니 같은 지적 반복으로 세지 않는다 · 감독 원판정: ${decision.reason}`;
+  return { response: lines.join('\n'), applied: true, markers };
+}
+
 /** Optional structured contract-conflict payload. Missing or partial fields deliberately remain legacy-compatible. */
 export function parseContractConflictRelaxation(response: string | undefined): ContractConflictRelaxation | undefined {
   const fields = new Map<string, string[]>();

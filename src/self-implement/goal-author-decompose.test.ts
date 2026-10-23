@@ -3,11 +3,13 @@ import { debug } from '../debug/log.js';
 import * as llmDecomposeActual from '../harness/llm-decompose.js';
 import * as adversarialPlanActual from '../harness/adversarial-plan.js';
 import * as llmActual from '../llm.js';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetLiveDetailCacheForTesting, writeLiveDetail } from '../live/detail-switch.js';
 import { setUserConfigOverlay } from '../user-config.js';
+import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
+import { composeSliceHandText } from '../task-agent/tier-split.js';
 
 // ⭐ R-TST23 — mock.module 은 process-wide 레지스트리를 치환하므로, 퇴장길 afterAll 에서
 //    원본 구현으로 되돌린다(아래 세 스냅샷은 namespace import 를 mock 투입 «전» 에 펼친 것).
@@ -72,7 +74,8 @@ mock.module('../llm.js', () => ({
   },
 }));
 
-const { classifyShadowFirstSplit, createGoalAuthorDecomposeSteps, decomposeToTierSizedSlices,
+const { classifyShadowFirstSplit, COMPLETION_BOUNDARY_STEP_PREFIX, createGoalAuthorDecomposeSteps, decomposeGoal,
+  decomposeToTierSizedSlices, parseCompletionBoundaryRows,
   readRecentStepCountsFailOpen, SHADOW_FIRST_SPLIT_MARKER } = await import('./goal-author-decompose.js');
 const { authorGoal, writeAuthoredGoal } = await import('./goal-author.js');
 const { runGoalAuthorCli } = await import('./goal-author-cli.js');
@@ -127,12 +130,12 @@ describe('recent step count reader fail-open semantics', () => {
 
 describe('goal-author production decompose config parity', () => {
   test.each([
-    ['default with a successful empty read', {}, undefined, () => [] as readonly number[], ['recentStepCounts'], undefined],
-    ['forced review with a successful read', { adversarialReview: true }, true, () => [3] as readonly number[], ['adversarialReview', 'recentStepCounts'], 'cli'],
-    ['disabled review with a successful read', { disableAdversarialReview: true }, false, () => [3] as readonly number[], ['adversarialReview', 'recentStepCounts'], 'cli'],
-    ['default with a failed read', {}, undefined, () => { throw new Error('log store unavailable'); }, [], undefined],
-    ['forced review with a failed read', { adversarialReview: true }, true, () => { throw new Error('log store unavailable'); }, ['adversarialReview'], 'cli'],
-    ['disabled review with a failed read', { disableAdversarialReview: true }, false, () => { throw new Error('log store unavailable'); }, ['adversarialReview'], 'cli'],
+    ['default with a successful empty read', {}, undefined, () => [] as readonly number[], ['recentStepCounts', 'repositoryRoot'], undefined],
+    ['forced review with a successful read', { adversarialReview: true }, true, () => [3] as readonly number[], ['adversarialReview', 'recentStepCounts', 'repositoryRoot'], 'cli'],
+    ['disabled review with a successful read', { disableAdversarialReview: true }, false, () => [3] as readonly number[], ['adversarialReview', 'recentStepCounts', 'repositoryRoot'], 'cli'],
+    ['default with a failed read', {}, undefined, () => { throw new Error('log store unavailable'); }, ['repositoryRoot'], undefined],
+    ['forced review with a failed read', { adversarialReview: true }, true, () => { throw new Error('log store unavailable'); }, ['adversarialReview', 'repositoryRoot'], 'cli'],
+    ['disabled review with a failed read', { disableAdversarialReview: true }, false, () => { throw new Error('log store unavailable'); }, ['adversarialReview', 'repositoryRoot'], 'cli'],
   ] as const)('passes identical shared option keys for %s', async (_name, cliOptions, daemonAdversarialReview, readRecentStepCounts, expectedKeys, cliSource) => {
     const cliConfigs: Record<string, unknown>[] = [];
     const daemonConfigs: Record<string, unknown>[] = [];
@@ -226,6 +229,69 @@ describe('TIER-SIZED-DECOMPOSE fake-LLM L2', () => {
   const proposal = (titles: string[]) => JSON.stringify({ rationale: 'Implement each slice independently.',
     tasks: titles.map((title, index) => ({ index, title, surface: { kind: 'llm-direct', prompt: title } })) });
   const sizes = (slices: object[]) => JSON.stringify({ slices });
+
+  test('DEVICE-FIRST-E4-LIVE: real decomposition callsite inserts device stage before a scripted feature slice', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal(['대상 경로: src/feature.ts · 동작: 기능 배선']), sizes([
+      { files: 2, actions: 1, newFiles: 1, tier: 'low' },
+      { files: 1, actions: 1, newFiles: 0, tier: 'low' },
+    ]));
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const result = await decomposeToTierSizedSlices('대상 경로: src/feature.ts · 완료 경계 증거 명령: bun test src/feature.test.ts\n필요한 장치: fault-synthetic', { repositoryRoot: process.cwd() });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.slices.map((slice) => slice.deviceFirst)).toEqual(['device-test', 'feature']);
+        expect(result.slices[0]?.goal).toContain('src/ux-sim/fault-synthetic.ts');
+        expect(result.slices[0]?.goal).toContain('신설: src/ux-sim/fault-synthetic.ts');
+        expect(result.slices[0]?.goal).toContain('완료 경계 증거 명령: bun test src/ux-sim/fault-synthetic.test.ts');
+        expect(result.slices[1]?.goal).toContain('선행: DEVICE-FIRST-STAGE 조각 착지 뒤 발사');
+        expect(result.slices[1]?.goal).toContain('신규 시험(이 조각에서 먼저 신설) src/feature.test.ts');
+        expect(result.slices[1]?.goal).toContain('피처 시험 bun test src/feature.test.ts를 구현 전에 RED로 확인');
+      }
+      expect(log).toHaveBeenCalledWith('self-implement.decompose', 'device-first-slice', expect.objectContaining({ firstSliceKind: 'device-test', deviceSource: 'goal', deviceExists: false, inventoryMeasured: true }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('DEVICE-FIRST-E4-LIVE: device inventory reads the target repository root', async () => {
+    useRealDecompose = true;
+    const repositoryRoot = mkdtempSync(join(tmpdir(), 'device-first-target-'));
+    mkdirSync(join(repositoryRoot, 'src/ux-sim'), { recursive: true });
+    writeFileSync(join(repositoryRoot, 'src/ux-sim/fault-synthetic.ts'), 'export const device = true;\n');
+    scriptedLlmReplies.push(proposal(['대상 경로: src/feature.ts · 동작: 기능 배선']), sizes([
+      { files: 1, actions: 1, newFiles: 1, tier: 'low' },
+      { files: 1, actions: 1, newFiles: 0, tier: 'low' },
+    ]));
+    try {
+      const result = await decomposeToTierSizedSlices('대상 경로: src/feature.ts · 장치 우선\n쓸 장치: fault-synthetic', { repositoryRoot });
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.slices[0]?.goal).toContain('기존 src/ux-sim/fault-synthetic.ts');
+    } finally { rmSync(repositoryRoot, { recursive: true, force: true }); }
+  });
+
+  test('DEVICE-FIRST-E4-LIVE: a generic TDD goal does not invent a missing device path', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal(['대상 경로: src/index.ts · 동작: 기능 배선']), sizes([
+      { files: 1, actions: 1, newFiles: 0, tier: 'low' },
+    ]));
+    const result = await decomposeToTierSizedSlices('대상 경로: src/index.ts · 완료 경계 증거 명령: bun test src/index.test.ts');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.slices).toHaveLength(1);
+      expect(result.slices[0]?.deviceFirst).toBeUndefined();
+      expect(result.slices[0]?.goal).not.toContain('index-device.ts');
+    }
+  });
+
+  test('a slice mentioning DEVICE-FIRST-STAGE without the operation is not a device test', async () => {
+    useRealDecompose = true;
+    scriptedLlmReplies.push(proposal(['대상 경로: src/feature.ts · 동작: 문서에 DEVICE-FIRST-STAGE 표기 보존']), sizes([
+      { files: 1, actions: 1, newFiles: 0, tier: 'low' },
+    ]));
+    const result = await decomposeToTierSizedSlices('대상 경로: src/feature.ts · 동작: 문서 표기를 보존한다');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.slices[0]?.deviceFirst).toBeUndefined();
+  });
 
   test('missing size JSON derives only from explicit paths and action clauses', async () => {
     useRealDecompose = true;
@@ -1172,6 +1238,251 @@ describe('AUTHOR-SHADOW-FIRST-SPLIT ① disk proof (runGoalAuthorCli → default
       const start = lines.indexOf('## STEPS');
       expect(start).toBeGreaterThan(-1);
       expect(lines.slice(start + 1, start + 1 + originalSteps.length).map((line) => line.replace(/^- /, ''))).toEqual(originalSteps);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// ⭐ DECOMPOSE-BOUNDARY-ONE-STEP — 완료 경계 3행(코드 · 실물 · 증거 명령)은 직렬 카드 셋이 아니라
+//   «한 step ⊕ acceptance 3» 이다. 실측 UX 미션 두 건(ta-20261016-ddf426 · ta-20261016-179cbb)의 문면 형태를
+//   입력 예시로 쓴다 — 그 골들이 손으로 닫힌 이유가 «경계 행마다 조각이 생김» 이었고, 이 시험이 그 재발을 잡는다.
+const UX_MISSION_GOAL_DFF426 = `[UX] 대시보드 로그 창이 비어 보인다 — 원인 측정과 표시 보정
+
+관측: 10-17 UX 미션 ta-20261016-ddf426. 로그 창이 «0건» 으로 보이지만 저장소에는 행이 있다.
+요구: 표시 경로가 읽는 창과 실제 기록 창을 맞춘다.
+
+- 완료 경계 코드: src/display/log-window.ts · src/display/log-window.test.ts
+- 완료 경계 실물: 빈 상태 화면이 «0건» 대신 «창 밖 N건» 을 적는다 — 시험 무대 = fake-bin logs 창 고정.
+- 완료 경계 증거 명령: bun test src/display/log-window.test.ts
+
+보존 계약: 다른 화면의 기본 동작과 원장 형식은 지금과 같다.`;
+
+const UX_MISSION_GOAL_179CBB = `[UX] 자동 완성 후보가 두 번 뜬다 — 중복 제거
+
+관측: 10-17 UX 미션 ta-20261016-179cbb. 같은 후보가 두 줄로 뜬다.
+요구: 후보 목록에서 같은 값을 한 번만 보여 준다.
+
+1. 완료 경계 코드: src/ui/autocomplete.ts · src/ui/autocomplete.test.ts
+2. 완료 경계 실물: 두 번 뜨던 후보가 한 줄 — 시험 무대 = ux-sim 스냅샷.
+3. 완료 경계 증거 명령: bun test src/ui/autocomplete.test.ts
+
+보존 계약: 키 바인딩·화면 전환 기본 동작은 그대로 둔다.`;
+
+const UX_MISSION_GOALS: string[] = [UX_MISSION_GOAL_DFF426, UX_MISSION_GOAL_179CBB];
+
+type GoalDecomposeResultOf = ReturnType<typeof decomposeGoal>;
+
+// 판정선 그대로 — 경계 3행이 든 골은 step 1 ⊕ acceptance 3 이다.
+function expectOneStepWithThreeAcceptance(result: GoalDecomposeResultOf): void {
+  expect(result.steps).toHaveLength(1);
+  expect(result.acceptance).toHaveLength(3);
+}
+
+describe('DECOMPOSE-BOUNDARY-ONE-STEP — 완료 경계 3행 = step 1 ⊕ acceptance 3', () => {
+  test.each(UX_MISSION_GOALS)('the three boundary rows are parsed with their kind and verbatim value', (goal) => {
+    const rows = parseCompletionBoundaryRows(goal);
+    expect(rows.map((row) => row.kind)).toEqual(['code', 'live', 'evidence-command']);
+    expect(rows[2]!.command).toBe(rows[2]!.text);
+    expect(rows[0]!.paths).toHaveLength(2);
+    expect(rows[1]!.paths).toEqual([]);
+  });
+
+  test.each(UX_MISSION_GOALS)('a goal with all three boundary rows becomes exactly one step with three acceptance rows', (goal) => {
+    const result = decomposeGoal(goal);
+    expect(result.bundled).toBe(true);
+    expectOneStepWithThreeAcceptance(result);
+    expect(result.steps[0]).toStartWith(COMPLETION_BOUNDARY_STEP_PREFIX);
+    for (const row of result.rows) expect(result.steps[0]).toInclude(row.text);
+    expect(result.acceptance).toEqual(result.rows.map((row) => `${row.label}: ${row.text}`));
+  });
+
+  // 반증 — 묶음을 빼면 같은 문면이 step 3 개가 되어 위 판정선(step 1 단언)이 fail 한다.
+  test.each(UX_MISSION_GOALS)('with the bundling switch off the same goal degrades to three steps and the one-step assertion fails', (goal) => {
+    const unbundled = decomposeGoal(goal, { bundling: false });
+    expect(unbundled.steps).toHaveLength(3);
+    expect(unbundled.acceptance).toEqual([]);
+    expect(() => expectOneStepWithThreeAcceptance(unbundled)).toThrow();
+  });
+
+  test.each(UX_MISSION_GOALS)('code-less live and evidence rows survive as cards, not as steps', (goal) => {
+    const result = decomposeGoal(goal);
+    expect(result.cards.map((card) => card.kind)).toEqual(['step', 'acceptance', 'live', 'evidence']);
+    const live = result.cards.find((card) => card.kind === 'live')!;
+    const evidence = result.cards.find((card) => card.kind === 'evidence')!;
+    expect(live.paths).toBeUndefined();
+    expect(evidence.paths).toBeUndefined();
+    expect(evidence.command).toBe(result.rows[2]!.text);
+    expect(result.cards.find((card) => card.kind === 'acceptance')!.paths).toEqual(result.rows[0]!.paths);
+  });
+
+  test('the evidence card carries the exact evidence command of this run', () => {
+    const evidence = decomposeGoal(`요구: 표시 보정
+- 완료 경계 코드: src/self-implement/goal-author-decompose.ts · src/self-implement/goal-author-decompose.test.ts
+- 완료 경계 실물: 경계 3행이 든 골 → step 1 ⊕ acceptance 3.
+- 완료 경계 증거 명령: bun test src/self-implement/goal-author-decompose.test.ts`).cards
+      .find((card) => card.kind === 'evidence')!;
+    expect(evidence.command).toBe('bun test src/self-implement/goal-author-decompose.test.ts');
+  });
+
+  test('one or two boundary rows keep the unchanged path (no bundling, no steps)', () => {
+    expect(decomposeGoal(`- 완료 경계 코드: src/a/b.ts\n- 완료 경계 실물: 화면에 한 줄`).bundled).toBe(false);
+    expect(decomposeGoal(`- 완료 경계 코드: src/a/b.ts\n- 완료 경계 실물: 화면에 한 줄`).steps).toEqual([]);
+    expect(decomposeGoal('경계 없음').rows).toEqual([]);
+  });
+});
+
+describe('DECOMPOSE-BOUNDARY-ONE-STEP — production seam (createGoalAuthorDecomposeSteps)', () => {
+  test('the folded RED action uses a test declared only by the evidence command', async () => {
+    const goal = '- 완료 경계 코드: src/ui/autocomplete.ts\n- 완료 경계 실물: 후보가 한 줄로 보인다\n- 완료 경계 증거 명령: bun test test/autocomplete.integration.test.ts';
+    const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })(goal);
+    expect(steps).toHaveLength(1);
+    expect(steps[0]).toInclude('완료 경계에 적힌 test/autocomplete.integration.test.ts');
+    expect(steps[0]).not.toInclude('src/ui/autocomplete-device.ts');
+  });
+  test('a boundary with no declared test path leaves RED target unmeasured', async () => {
+    const goal = '- 완료 경계 코드: src/ui/autocomplete.ts\n- 완료 경계 실물: 후보가 한 줄로 보인다\n- 완료 경계 증거 명령: 검사 도구를 정해 실행한다';
+    const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })(goal);
+    expect(steps).toHaveLength(1);
+    expect(steps[0]).toInclude('시험 경로 미확정');
+    expect(steps[0]).not.toInclude('완료 경계에 적힌 시험');
+  });
+  test.each(UX_MISSION_GOALS)('the seam returns one step and never calls the LLM decomposition', async (goal) => {
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })(goal, { runId: 'run-boundary' });
+      expect(steps).toHaveLength(1);
+      expect(steps[0]).toInclude('완료 경계 증거 명령');
+      expect(decompositionOptions).toBeUndefined();
+      expect(critiqueCalls).toBe(0);
+      expect(log.mock.calls.some((call) => call[1] === 'completion-boundary-bundled'
+        && (call[2] as { verdict?: string }).verdict === 'one-step-three-acceptance')).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
+  test('a goal with a partial boundary keeps the LLM decomposition', async () => {
+    const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })(
+      '- 완료 경계 코드: src/a/b.ts\n- 완료 경계 실물: 화면에 한 줄');
+    expect(steps).toEqual(originalSteps);
+    expect(decompositionOptions).toBeDefined();
+  });
+
+  test.each(UX_MISSION_GOALS)('the seam keeps the one-line step invariant without a repository root (folded device stage)', async (goal) => {
+    const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })(goal);
+    expect(steps).toHaveLength(1);
+    // root === undefined → 접힌 첫 동작 문면의 개행은 fold 단계에서 치환된다(«step 한 줄»).
+    expect(steps[0]).not.toInclude('\n');
+    // ⭐ must-fix — 접힌 경계 step 은 «구현 지시» 를 그대로 싣는다(acceptance 3행).
+    expect(steps[0]).toInclude('완료 경계 코드');
+    expect(steps[0]).toInclude('완료 경계 실물');
+    expect(steps[0]).toInclude('완료 경계 증거 명령');
+    // 장치 RED 는 «같은 런의 첫 동작» 으로 다시 쓴다 — 모순 문구는 없다.
+    expect(steps[0]).toInclude('첫 동작(같은 런)');
+    expect(steps[0]).toInclude('mock 무대 시험 RED');
+    const declaredTest = parseCompletionBoundaryRows(goal)[0]!.paths.find((path) => path.endsWith('.test.ts'))!;
+    expect(steps[0]).toInclude(`완료 경계에 적힌 ${declaredTest}`);
+    expect(steps[0]).not.toInclude(declaredTest.replace(/\.test\.ts$/u, '-device.ts'));
+    expect(steps[0]).not.toInclude('운영 코드 변경 0');
+    expect(steps[0]).not.toInclude('선행:');
+    // «동작: DEVICE-FIRST-STAGE» 표지가 남으면 publicSizedSlices 가 이 조각을 device-test 로 분류한다.
+    expect(steps[0]).not.toInclude('동작: DEVICE-FIRST-STAGE');
+  });
+});
+
+// ⭐ 경계 3행 골의 생산 소비자 — `decomposeToTierSizedSlices`(tier-split 기본 seam)는
+//   경계 분기에서도 크기 메타를 받아야 한다. 우회하면 `ok:false · no sized slices` 로
+//   `tasks hand --tier 상|특 --live` 의 tier-split 이 전부 막힌다(0.2.36 회귀).
+describe('DECOMPOSE-BOUNDARY-ONE-STEP — production consumer (decomposeToTierSizedSlices)', () => {
+  test.each(['', '게이트 격리 실패 조각\n'])('folded RED keeps the declared target paths as the handed slice first line', async (heading) => {
+    const targets = 'scripts/release-loop/gate-node.ts · scripts/release-loop/gate-node.test.ts · src/task-orchestrator/surfaces/pod-pool.ts';
+    const goal = `${heading}대상 경로: ${targets}\n남음: 격리 Job 발사를 lease 슬롯으로 제한한다.\n- 완료 경계 코드: ${targets}\n- 완료 경계 실물: mock 무대에서 동시 Job 상한을 관측한다.\n- 완료 경계 증거 명령: bun test scripts/release-loop/gate-node.test.ts`;
+    const result = await decomposeToTierSizedSlices(goal);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.slices).toHaveLength(1);
+    const sliceGoal = result.slices[0]!.goal;
+    expect(sliceGoal.split('\n')[0]).toBe(`대상 경로: ${targets}`);
+    expect(sliceGoal.match(/^대상 경로:/gmu)).toHaveLength(1);
+    expect(parseAskTargetPathHintsResult(sliceGoal).paths).toEqual([
+      'scripts/release-loop/gate-node.ts',
+      'scripts/release-loop/gate-node.test.ts',
+      'src/task-orchestrator/surfaces/pod-pool.ts',
+    ]);
+    expect(sliceGoal).toInclude('첫 동작(같은 런)');
+    expect(sliceGoal).toInclude('완료 경계 코드');
+    const handed = composeSliceHandText(sliceGoal, goal, { index: 1, total: 1, fromTier: '특', cid: 'GATE-ISOLATE-FANOUT-CAP' });
+    expect(handed.split('\n')[0]).toBe(`대상 경로: ${targets}`);
+    expect(parseAskTargetPathHintsResult(handed).paths).toHaveLength(3);
+  });
+  test.each(UX_MISSION_GOALS)('a three-row boundary goal sizes into exactly one slice with tier metadata', async (goal) => {
+    const result = await decomposeToTierSizedSlices(goal);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.slices).toHaveLength(1);
+    expect(result.redecomposed).toBe(0);
+    const slice = result.slices[0]!;
+    expect(['하', '중', '상']).toContain(slice.tier);
+    expect(slice.files).toBeGreaterThanOrEqual(1);
+    expect(slice.behaviours).toBe(1);
+    expect(slice.goal).toInclude('완료 경계 코드');
+    // ⭐ must-fix — 접힌 경계 조각은 «장치 시험 카드» 로 분류되지 않는다(device-first-deferred 회귀).
+    //    deviceFirst 가 'device-test' 로 남으면 handTaskWithTierSplit 이 기능 카드를 0장으로 만든다.
+    expect(slice.deviceFirst).toBeUndefined();
+    expect(slice.goal).toInclude('첫 동작(같은 런)');
+    expect(slice.goal).not.toInclude('운영 코드 변경 0');
+    expect(slice.goal).not.toInclude('선행:');
+    expect(slice.goal).not.toInclude('동작: DEVICE-FIRST-STAGE');
+    expect(decompositionOptions).toBeUndefined();
+    expect(critiqueCalls).toBe(0);
+  });
+});
+
+// ⭐ 생산 호출 경로 실물: runGoalAuthorCli → 기본 seam → writeAuthoredGoal → 디스크의 골 파일.
+describe('DECOMPOSE-BOUNDARY-ONE-STEP — production call path (runGoalAuthorCli → default seam → goal file on disk)', () => {
+  const authorFacts = {
+    grounded: true, context: '', files: ['src/display/log-window.ts'],
+    persistentEvidence: ['src/display/log-window.ts:12 — authorGoal receives this Read-verified call path.'],
+    codeFacts: ['[code:src/display/log-window.ts] logWindowRows'], skillFacts: [], memoryFacts: [],
+    documentFacts: ['docs/example.md'], refFacts: [], ptyFacts: [],
+  };
+  test.each(UX_MISSION_GOALS)('the authored goal file carries exactly one step line holding the three acceptance rows', async (goal) => {
+    const cwd = mkdtempSync(join(tmpdir(), 'goal-author-boundary-disk-'));
+    try {
+      mkdirSync(join(cwd, 'docs', 'goals'), { recursive: true });
+      const written: string[] = [];
+      await runGoalAuthorCli([goal], { cwd, disableAdversarialReview: true }, {
+        recentStepCountReader: () => [],
+        write: async (ask, writeCwd, deps) => {
+          const result = await writeAuthoredGoal(ask, writeCwd, {
+            ...deps,
+            ground: async () => authorFacts,
+            enhance: async (raw) => ({ original: raw, checklist: ['embed the exact ask in the authored document'], verbatimPreserved: true }),
+            slugFn: async () => 'boundary-one-step',
+          });
+          if (result) written.push(result.path);
+          return result;
+        },
+      });
+      expect(written).toHaveLength(1);
+      const lines = readFileSync(written[0]!, 'utf8').split('\n');
+      const start = lines.indexOf('## STEPS');
+      expect(start).toBeGreaterThan(-1);
+      const stepLines: string[] = [];
+      for (const line of lines.slice(start + 1)) {
+        if (!line.startsWith('- ')) break;
+        stepLines.push(line);
+      }
+      expect(stepLines).toHaveLength(1);
+      expect(stepLines[0]).toInclude(COMPLETION_BOUNDARY_STEP_PREFIX);
+      // 장치 RED 는 step 2 가 아니라 «같은 런의 첫 동작» 으로 접힌다(step 1 유지 · 모순 문구 0).
+      expect(stepLines[0]).toInclude('첫 동작(같은 런)');
+      expect(stepLines[0]).not.toInclude('운영 코드 변경 0');
+      expect(stepLines[0]).not.toInclude('선행:');
+      expect(stepLines[0]).not.toInclude('동작: DEVICE-FIRST-STAGE');
+      expect(stepLines[0]).toInclude('완료 경계 코드');
+      expect(stepLines[0]).toInclude('완료 경계 실물');
+      expect(stepLines[0]).toInclude('완료 경계 증거 명령');
+      expect(decompositionOptions).toBeUndefined();
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

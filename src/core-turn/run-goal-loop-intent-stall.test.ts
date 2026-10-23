@@ -7,6 +7,7 @@ import { describe, expect, test } from 'bun:test';
 import type { CoreTurnContext, CoreTurnResult } from './types.js';
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { DELEGATE_HINT } from '../agent/delegate-hint.js';
 import {
   GOAL_CONTINUATION_PROMPT,
   GOAL_INTENT_STALL_MAX_REPROMPTS,
@@ -150,7 +151,7 @@ describe('GOAL-LOOP-INTENT-STALL — 목록 provider 재촉', () => {
     ], { intentStallProvider: 'openrouter' });
     expect(r.calls).toBe(3);
     expect(r.result).toMatchObject({ stopReason: 'goal_complete', goalComplete: true, iterations: 3 });
-    expect(r.lastUserMessages[1]).toBe(GOAL_INTENT_STALL_PROMPT);
+    expect(r.lastUserMessages[1]).toBe(`${GOAL_INTENT_STALL_PROMPT}\n${DELEGATE_HINT}`);
     expect(r.lastUserMessages[2]).toBe(GOAL_CONTINUATION_PROMPT);
     expect(r.count('intent-stall-reprompt')).toBe(1);
     expect(r.count('intent-stall-exhausted')).toBe(0);
@@ -185,7 +186,7 @@ describe('GOAL-LOOP-INTENT-STALL — 목록 provider 재촉', () => {
       { text: '설명만 합니다' },
     ], { intentStallProvider: 'openrouter' });
     expect(r.calls).toBe(3);
-    expect(r.lastUserMessages[1]).toBe(GOAL_CONTINUATION_PROMPT);
+    expect(r.lastUserMessages[1]).toBe(`${GOAL_CONTINUATION_PROMPT}\n${DELEGATE_HINT}`);
     expect(r.lastUserMessages[2]).toBe(GOAL_INTENT_STALL_PROMPT);
     expect(r.count('intent-stall-reprompt')).toBe(0);
     expect(r.count('intent-stall-exhausted')).toBe(0);

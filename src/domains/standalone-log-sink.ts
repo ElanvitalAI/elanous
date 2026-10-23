@@ -10,20 +10,33 @@
 /**
  * 독립 프로세스에서 logs.db 싱크를 등록한다. 반환된 off 는 process 'exit' 에 자동 배선된다.
  * @param surface  이 프로세스가 남기는 로그의 surface 라벨(예: 'scheduler'·'autopilot').
+ * @param opts.wrapSink  logs.db 싱크를 감싼다(예: TUI 는 pid·`--name`·세션을 data 에 찍는다 — debug/tui-log-tag.ts).
  */
-export async function registerStandaloneLogSink(surface: string): Promise<boolean> {
+export async function registerStandaloneLogSink(
+  surface: string,
+  opts: { wrapSink?: (sink: import('../mss/logging/sink.js').LogSink) => import('../mss/logging/sink.js').LogSink } = {},
+): Promise<boolean> {
   try {
     const [storeMod, dbgMod, cfgMod] = await Promise.all([
       import('../mss/logging/log-store.js'),
       import('../debug/log.js'),
       import('../user-config.js'),
     ]);
+    // TUI-LOG-SESSION-TAG — 한 logs.db 를 여러 TUI(클래식·next)가 쓴다: 행마다 pid·`--name`·소유 세션을 data 에 찍는다.
+    if (surface === 'tui' && !opts.wrapSink) {
+      const tagMod = await import('../debug/tui-log-tag.js');
+      const tag = tagMod.processTuiLogTag();
+      opts = { ...opts, wrapSink: (s) => tagMod.withTuiLogTag(s, tag) };
+    }
     const logsCfg = cfgMod.getUserConfig().logs;
     storeMod.setLogInstanceName(logsCfg.instanceName);
+    // TUI-TYPING-LAG — TUI 는 워커 로그 폭주를 덩어리로 나눠 넣는다(키가 drain 전체를 기다리지 않게).
+    const drainChunkSize = storeMod.logStoreDrainChunkForSurface(surface);
     const offStore = storeMod.registerLogStoreSink(
-      (s) => dbgMod.debug.registerSink(s),
+      (s) => dbgMod.debug.registerSink(opts.wrapSink ? opts.wrapSink(s) : s),
       surface,
       logsCfg.retention,
+      drainChunkSize !== undefined ? { drainChunkSize } : {},
     );
     if (!offStore) return false;
     process.on('exit', offStore);

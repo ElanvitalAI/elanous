@@ -30,7 +30,9 @@ export function classifyOutOfScope(outsideFiles: readonly string[], declaredPath
 export type ScopeExpansionKind = 'neighbour' | 'caller-or-registration' | 'paired-test' | 'other';
 export interface ScopeExpansionFile { path: string; kind: ScopeExpansionKind }
 export interface ScopeExpansion { files: ScopeExpansionFile[]; count: number }
-export type ScopeStopReason = 'deletion' | 'protected-path' | 'over-cap' | 'name-cap';
+/** Every stop reason, in report order — the one source; the Pod parent (self-implement.ts) reads held results against it. */
+export const SCOPE_STOP_REASONS = ['deletion', 'protected-path', 'over-cap', 'name-cap'] as const;
+export type ScopeStopReason = (typeof SCOPE_STOP_REASONS)[number];
 
 /** Accepted outside files above this count stop the run: past it the change is no longer «the goal, adapted». */
 export const SCOPE_EXPANSION_CAP = 10;

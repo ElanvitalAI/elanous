@@ -286,6 +286,7 @@ export async function dispatchSelfImplement(
     goalFile = (await authorGoal(goalSourceText, ctx.cwd, {
       goalTitle: feature,
       decomposeSteps: createDecomposeSteps(ctx.signal, {
+        repositoryRoot: ctx.cwd,
         ...(adversarialReview !== undefined ? { adversarialReview } : {}),
         ...(recentStepCounts !== undefined ? { recentStepCounts } : {}),
       }),

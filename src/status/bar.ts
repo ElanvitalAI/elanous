@@ -290,6 +290,25 @@ export function runningBuildSegment(state: RunningBuildState | null | undefined,
   return strongText(`${label} ⟳ 재기동 필요${target}`, 'yellow', opts);
 }
 
+/** 이번 턴 «실제로» 응답한 공급자·모델 (TUI-MODEL-BADGE-ACTUAL · 10-16 · #24·#66).
+ *
+ *  턴 «시작»에 고른 결정(`RouteDecision`)과 실제 응답은 다를 수 있다 — 폴백 체인이
+ *  다른 공급자로 넘기면(예 codex → grok) 배지가 «지금» 으로 보여야 하는 것은 이쪽이다.
+ *  완료 배지(`src/tui/chat/execution-badge.ts`)와 같은 원천(`src/llm/route-decision.ts`)을 쓴다. */
+export interface ModelExecutionActual {
+  provider?: string;
+  /** 실제로 응답한 모델 id — 있으면 배지의 «지금» 은 이 값이다. */
+  model: string;
+  /** 폴백이면 턴이 «고른» 모델 — 배지가 `고른 → 실제` 로 드러낸다(폴백 아니면 없음/null). */
+  fallbackFrom?: string | null;
+}
+
+/** 상태줄 배지 입력 — 설정/런타임 값 ⊕ (있으면) 이번 턴 실제 실행.
+ *  `actual` 이 없는 호출자는 종전과 완전히 같은 배지를 얻는다(추가 필드는 선택). */
+export interface StatusModelInfo extends Pick<ActiveProviderInfo, 'provider' | 'model'> {
+  actual?: ModelExecutionActual | null;
+}
+
 /** Truncate a model id at the first parameter-size marker (e.g.
  *  `qwen3.6-35b-a3b-ud-mlx` → `qwen3.6-35b`). The marker pattern
  *  matches one or more digits followed by `b`/`B` (e.g. `7b`, `35b`,
@@ -319,19 +338,22 @@ function truncateAtParamSize(model: string): string {
  *   - `local:qwen3.6-35b-a3b-ud-mlx` → `local:qwen3.6-35b`
  *   - `node-b:qwen2.5-72b-instruct`    → `node-b:qwen2.5-72b`
  *   - `claude-opus-4-6`              → unchanged (no `\d+b` marker) */
-export function modelSegment(info: Pick<ActiveProviderInfo, 'provider' | 'model'>, opts: StatusBarRenderOptions = {}): string {
-  if (!info.model || info.model === '(none)') {
-    return strongText(info.provider, 'pink', opts);
+export function modelSegment(info: StatusModelInfo, opts: StatusBarRenderOptions = {}): string {
+  // 이번 턴 실제 실행이 있으면 그 값이 «지금» 이다 — 설정/런타임 값은 실행 전 기본값일 뿐.
+  const actual = info.actual?.model && info.actual.model !== '(none)' ? info.actual : null;
+  const provider = actual?.provider?.trim() || info.provider;
+  const model = actual?.model ?? info.model;
+  if (!model || model === '(none)') {
+    return strongText(provider, 'pink', opts);
   }
   // Step 1 — derive the display string with node prefix when local.
   let display: string;
-  let model = info.model;
   if (model.startsWith('local-llm:')) {
     const rest = model.slice('local-llm:'.length);
     display = rest.includes(':') ? rest : `local:${rest}`;
   } else if (model.startsWith('local:')) {
     display = model;
-  } else if (info.provider === 'local') {
+  } else if (provider === 'local') {
     display = `local:${model}`;
   } else {
     display = model;
@@ -348,6 +370,11 @@ export function modelSegment(info: Pick<ActiveProviderInfo, 'provider' | 'model'
     } else {
       display = truncateAtParamSize(display);
     }
+  }
+  // Step 3 — 폴백이면 «처음 → 실제». 고른 값과 실제가 같으면 화살표를 꾸미지 않는다.
+  const from = actual?.fallbackFrom?.trim();
+  if (from && from !== model) {
+    display = `${opts.compact ? truncateAtParamSize(from) : from} → ${display}`;
   }
   return strongText(display, 'pink', opts);
 }
@@ -798,7 +825,8 @@ function dockStripDetail(dockedCount: number, dormantCount: number): string {
 
 export interface StatusBarState {
   cwd: string;
-  providerInfo: ActiveProviderInfo;
+  /** 설정/런타임 공급자·모델 ⊕ (있으면) 이번 턴 실제 실행 — 배지는 실제를 «지금» 으로 쓴다. */
+  providerInfo: StatusModelInfo;
   gitBranch?: string;
   contextUsedTokens?: number;
   tmuxLabel?: string | null;

@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,7 +22,7 @@ function installReleaseRecipes(checkout: string): void {
   for (const name of ['release-loop.yaml', 'recipes.yaml']) copyFileSync(join(releaseGraphDir, name), join(target, name));
 }
 
-function writeFailedRun(root: string, runId = 'r', gateOutput = '{"outcome":"ok"}'): { statePath: string; original: string } {
+function writeFailedRun(root: string, runId = 'r', gateOutput = '{"outcome":"ok"}', cutCommit = SHA): { statePath: string; original: string } {
   const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
   mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
   const state = {
@@ -29,12 +30,16 @@ function writeFailedRun(root: string, runId = 'r', gateOutput = '{"outcome":"ok"
     input: { version: VERSION, branchCut: true },
     path: ['version-release', 'gate', 'tui', 'failed'],
     nodes: [
-      { nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) },
+      { nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutCommit, branch: `release/${VERSION}` }) },
       { nodeId: 'gate', ok: true, exit: 0, executed: true, output: gateOutput },
       { nodeId: 'tui', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' },
       { nodeId: 'failed', ok: true, exit: 0, executed: false },
     ],
     executed: 3, dryRun: false, statePath,
+    graphSnapshot: {
+      graphSha: createHash('sha256').update(readFileSync(join(releaseGraphDir, 'release-loop.yaml'))).digest('hex'),
+      recipesSha: createHash('sha256').update(readFileSync(join(releaseGraphDir, 'recipes.yaml'))).digest('hex'),
+    },
   };
   writeFileSync(statePath, JSON.stringify(state));
   return { statePath, original: readFileSync(statePath, 'utf8') };
@@ -60,7 +65,7 @@ test('resume dry-run checks the saved cut and checkout without running nodes or 
     const plan = await planResumeReleaseRun({ runId: 'r', from: 'tui', partial: false }, {
       root, git: (args) => { gitCalls.push(args[0]!); return gitStub(args); }, graph: async () => { graphCalls++; return { status: 'done' } as never; },
     });
-    expect(plan).toMatchObject({ runId: 'r', version: VERSION, fromNode: 'tui', nextAttempt: 1, attemptLimit: 2, preflight: 'passed', gatePlan: { mode: 'not-run' },
+    expect(plan).toMatchObject({ runId: 'r', version: VERSION, fromNode: 'tui', nextAttempt: 1, priorCountKnown: true, preflight: 'passed', gatePlan: { mode: 'not-run' },
       tip: { changed: false, from: SHA, to: SHA } });
     expect(graphCalls).toBe(0);
     expect(gitCalls).not.toContain('fetch');
@@ -132,7 +137,7 @@ test('resume dry-run surfaces checkout preflight ENOBUFS and leaves retry state 
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test('resume dry-run reports the two-attempt cap without creating a decision', async () => {
+test('resume dry-run previews the third attempt without creating a decision', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-resume-dry-run-cap-'));
   setElanousConfigDir(root);
   const saved = writeFailedRun(root);
@@ -140,10 +145,30 @@ test('resume dry-run reports the two-attempt cap without creating a decision', a
   reserveReleaseResumeAttempt(run, root);
   reserveReleaseResumeAttempt(run, root);
   try {
-    await expect(planResumeReleaseRun({ runId: 'r', from: 'tui' }, { root, git: gitStub }))
-      .rejects.toThrow('release resume limit reached: 2 resumes already recorded');
+    const plan = await planResumeReleaseRun({ runId: 'r', from: 'tui' }, { root, git: gitStub });
+    expect(plan.nextAttempt).toBe(3);
+    expect(plan).not.toHaveProperty('attemptLimit');
     expect(new DecisionLedger({ stateDir: root }).list({ status: 'open' })).toHaveLength(0);
     expect(JSON.parse(readFileSync(join(root, 'release', VERSION, 'resume-attempts', 'r.json'), 'utf8')).attempts).toHaveLength(2);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('third release resume reaches the graph and records attempt three without a decision', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-third-'));
+  setElanousConfigDir(root);
+  const saved = writeFailedRun(root);
+  const run = JSON.parse(saved.original) as Parameters<typeof reserveReleaseResumeAttempt>[0];
+  reserveReleaseResumeAttempt(run, root);
+  reserveReleaseResumeAttempt(run, root);
+  let graphCalls = 0;
+  try {
+    const result = await resumeReleaseRun({ runId: 'r', from: 'tui' }, {
+      root, git: gitStub, graph: async () => { graphCalls++; return { status: 'done' } as never; },
+    });
+    expect(result.state.status).toBe('done');
+    expect(graphCalls).toBe(1);
+    expect(JSON.parse(readFileSync(join(root, 'release', VERSION, 'resume-attempts', 'r.json'), 'utf8')).attempts).toHaveLength(3);
+    expect(new DecisionLedger({ stateDir: root }).list({ status: 'open' })).toHaveLength(0);
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -339,6 +364,88 @@ test('a clean cut checkout with different recipes is rejected before resumed Bas
       .rejects.toThrow('release recipe source differs');
     expect(calls).toBe(before);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a clean real Git cut with different recipes is rejected before an injected graph callback', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-command-injected-graph-'));
+  const checkout = join(root, 'checkout');
+  mkdirSync(checkout);
+  seatGit(checkout, 'init', '-q');
+  installReleaseRecipes(checkout);
+  writeFileSync(join(checkout, 'graphs/release/recipes.yaml'), readFileSync(join(checkout, 'graphs/release/recipes.yaml'), 'utf8') + '\n# drift\n');
+  seatGit(checkout, 'add', '.');
+  seatGit(checkout, 'commit', '-q', '-m', 'cut');
+  const cut = seatGit(checkout, 'rev-parse', 'HEAD');
+  setElanousConfigDir(root);
+  writeFailedRun(root, 'r', '{"outcome":"ok"}', cut);
+  let graphCalls = 0;
+  const git = (args: string[]): string => {
+    if (args[0] === 'ls-remote') return `${cut}\trefs/heads/release/${VERSION}`;
+    if (args[0] === 'fetch') return '';
+    if (args[0] === 'rev-parse' && args[1] === '--verify') return cut;
+    return seatGit(checkout, ...args);
+  };
+  try {
+    await expect(resumeReleaseRun({ runId: 'r', from: 'tui', partial: false, commandRoot: checkout }, { root, git,
+      graph: async () => { graphCalls++; return { status: 'done' } as never; } }))
+      .rejects.toThrow('release recipe source differs');
+    expect(graphCalls).toBe(0);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('simulated failed gate: pin mismatch leaves state unchanged; matching pin resumes at gate', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-pin-preflight-'));
+  const checkout = join(root, 'checkout');
+  mkdirSync(checkout);
+  installReleaseRecipes(checkout);
+  const graphFile = join(checkout, 'graphs/release/release-loop.yaml');
+  writeFileSync(graphFile, readFileSync(graphFile, 'utf8') + '\n# different cut graph\n');
+  const currentGraphSha = createHash('sha256').update(readFileSync(graphFile)).digest('hex');
+  const saved = writeFailedRun(root);
+  const failedGate = JSON.parse(saved.original) as { path: string[]; nodes: Array<{ nodeId: string; ok: boolean; output?: string }>; graphSnapshot: { graphSha: string } };
+  failedGate.path = ['version-release', 'gate', 'failed'];
+  failedGate.nodes = [failedGate.nodes[0]!,
+    { nodeId: 'gate', ok: false, output: JSON.stringify({ outcome: 'fail', introduced: 1, gateVerdict: 'failed' }) },
+    { nodeId: 'failed', ok: true }];
+  writeFileSync(saved.statePath, JSON.stringify(failedGate));
+  const original = readFileSync(saved.statePath, 'utf8');
+  const savedGraphSha = failedGate.graphSnapshot.graphSha;
+  const moved = 'b'.repeat(40);
+  const gitCalls: string[] = [];
+  const git = (args: string[]): string => {
+    gitCalls.push(args[0]!);
+    if (args[0] === 'ls-remote') return `${moved}\trefs/heads/release/${VERSION}`;
+    if (args[0] === 'rev-parse') return moved;
+    return '';
+  };
+  setElanousConfigDir(root);
+  try {
+    for (const resume of [
+      () => planResumeReleaseRun({ runId: 'r', from: 'gate', commandRoot: checkout }, { root, git, isAncestor: () => true }),
+      () => resumeReleaseRun({ runId: 'r', from: 'gate', commandRoot: checkout }, { root, git, isAncestor: () => true }),
+    ]) {
+      let error = '';
+      try { await resume(); } catch (caught) { error = String(caught); }
+      expect(error).toContain('release-loop.yaml');
+      expect(error).toContain(savedGraphSha);
+      expect(error).toContain(currentGraphSha);
+      expect(error).toContain(`eln release run --version ${VERSION}`);
+      expect(readFileSync(saved.statePath, 'utf8')).toBe(original);
+      expect(readdirSync(join(root, 'graph-runs', 'release-loop'))).toEqual(['r.json']);
+      expect(existsSync(join(root, 'release', VERSION, 'resume-attempts', 'r.json'))).toBe(false);
+    }
+    expect(gitCalls).not.toContain('fetch');
+    installReleaseRecipes(checkout);
+    let resumedFrom = '';
+    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: false, commandRoot: checkout }, {
+      root, git, isAncestor: () => true,
+      graph: async (_path, options) => { resumedFrom = options.fromNodeId ?? ''; return { status: 'done' } as never; },
+    });
+    expect(resumedFrom).toBe('gate');
+    expect(resumed.state.status).toBe('done');
+    expect(resumed.tip).toMatchObject({ from: SHA, to: moved, changed: true });
+    expect(gitCalls).toContain('fetch');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('the resumed Bash process reads from the verified command checkout', async () => {

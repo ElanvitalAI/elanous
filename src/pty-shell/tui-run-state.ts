@@ -17,14 +17,14 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { debug } from '../debug/log.js';
-import { createHerdrAgentReporter, type HerdrAgentReporterLike } from './herdr-agent-report.js';
+import { createHerdrAgentReporter, guardHerdrReleaseOnSignal, type HerdrAgentReporterLike, type HerdrSignalTarget } from './herdr-agent-report.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { codeRevision, packageVersion, readInstallMetadataCommit } from '../version/code-revision.js';
 import {
   buildStaleInstallRelaunchCommand,
   formatStaleInstallNotice,
   versionedDashboardInstallDir,
-} from '../dashboard/stale-install-check.js';
+} from './stale-install-check.js';
 import {
   updatePtyManifestBuild, updatePtyManifestTurn,
   type PtyBuildIdentity, type PtyManifestRow, type PtyTurnState,
@@ -321,6 +321,11 @@ export interface TuiRunStateRecorderDeps {
    * `null` 이면 신고하지 않는다.
    */
   readonly herdr?: HerdrAgentReporterLike | null;
+  /**
+   * SIGINT·SIGTERM 기본 죽음에도 herdr 를 반납하는 신호 지킴이의 대상(TUI-HERDR-EXIT-RACE).
+   * 생략 시: 기본 신고기(herdr 미주입)일 때만 실 `process` · 주입 herdr 는 지킴이 0. `null` 이면 안 건다.
+   */
+  readonly signals?: HerdrSignalTarget | null;
 }
 
 interface ActiveRecorder {
@@ -361,7 +366,14 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
   active = recorder;
   writeTurnState(recorder, 'idle');
   if (herdr) { try { herdr.start(); } catch { /* 신고 실패가 녹음기를 깨지 않는다 */ } }
+  // raw 모드 전 ctrl+c(SIGINT 기본 죽음)는 'exit' 훅을 안 돌린다 — 신호에서도 반납한다.
+  const signals = deps.signals !== undefined ? deps.signals : (deps.herdr === undefined ? process : null);
+  let unguard: () => void = () => {};
+  if (herdr && signals) {
+    try { unguard = guardHerdrReleaseOnSignal(() => herdr.release(), signals); } catch { /* 지킴이 실패가 녹음기를 깨지 않는다 */ }
+  }
   return () => {
+    try { unguard(); } catch { /* 종료 경로를 깨지 않는다 */ }
     if (herdr) { try { herdr.release(); } catch { /* 종료 경로를 깨지 않는다 */ } }
     if (active === recorder) active = null;
   };

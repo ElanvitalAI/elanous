@@ -66,6 +66,7 @@ bun -e '
 |---|---|---|
 | [`grill-me`](grill-me/SKILL.md) | 계획·설계를 공감대에 이를 때까지 인터뷰 | ⛔ 아니다(`disable-model-invocation`) — 사람이 부른다 |
 | [`video-builder`](video-builder/SKILL.md) | 영상 파이프라인을 «능력·구현·구간»으로 조립 — 추천 스택·크레딧·구멍 | ⛔ 아니다(`autoTrigger` 미선언) — 슬래시로 «먼저» 연다 |
+| [`floorplan-to-film`](floorplan-to-film/SKILL.md) | 평면도(PDF·이미지·치수) → 2D 수정 도면 → Blender 3D 투시도(Higgsfield Bridge MCP · 미연결 대안 cli-anything-blender) → 워크스루 영상 — 조립·자막·BGM 은 video-builder | O — `autoTrigger` 선언(«평면도로 3D»·«인테리어 영상» 명시 트리거 · 점수 2.0↑ 일 때 자동, 그 전엔 제안) |
 
 ---
 

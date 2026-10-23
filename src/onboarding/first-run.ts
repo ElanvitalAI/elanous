@@ -1,6 +1,7 @@
 import * as readline from 'node:readline/promises';
 import { detectProviders, type DetectedProvider } from '../llm/provider-detect.js';
 import { debug } from '../debug/log.js';
+import { detectLocale, type Locale } from '../expression/locale.js';
 import { unattendedNextStepLine } from './entry-hints.js';
 import { resolveProviderCredential } from '../llm/provider-credentials.js';
 import {
@@ -13,6 +14,8 @@ export interface FirstRunDeps {
   path?: string;
   detectProviders?: () => Promise<DetectedProvider[]>;
   isTTY?: boolean;
+  /** Locale for user-facing wording; defaults to the shared ambient decision (detectLocale). */
+  locale?: Locale;
   chooseProvider?: (detected: readonly LLMProviderName[]) => Promise<LLMProviderName | null>;
   print?: (message: string) => void;
   saveConfig?: (config: UserConfig, path: string) => void;
@@ -44,12 +47,21 @@ export function parseMenuAnswer(answer: string, choices: readonly LLMProviderNam
   return provider !== undefined ? { kind: 'chosen', provider } : { kind: 'miss' };
 }
 
+/**
+ * The fixed choice line of the first-run menu (`1 Codex, 2 Grok, 3 Claude`).
+ * Single source of the wording: the prompt below renders it, and the ux-sim
+ * first-run device asserts against it, so a wording change cannot drift apart.
+ */
+export function formatProviderMenu(choices: readonly LLMProviderName[]): string {
+  return choices.map((name, i) => `${i + 1} ${CHOICE_LABEL[name] ?? name}`).join(', ');
+}
+
 export async function promptProviderMenu(
   ask: (prompt: string) => Promise<string>,
   detected: readonly LLMProviderName[] = [],
 ): Promise<LLMProviderName | null> {
   const choices = orderProviderChoices(detected);
-  const menu = choices.map((name, i) => `${i + 1} ${CHOICE_LABEL[name] ?? name}`).join(', ');
+  const menu = formatProviderMenu(choices);
   for (;;) {
     const parsed = parseMenuAnswer(await ask(`Choose LLM (${menu}; Enter to cancel): `), choices);
     if (parsed.kind === 'chosen') return parsed.provider;
@@ -66,7 +78,23 @@ async function chooseProvider(detected: readonly LLMProviderName[] = []): Promis
   }
 }
 
-const detectionLabel = (provider: string) => `${provider === 'openai-codex' ? 'codex' : provider} 구독`;
+/** User-facing first-run fallback wording, routed by the shared locale decision (detectLocale). */
+const FIRST_RUN_TEXT = {
+  ko: {
+    detectedPrefix: '감지: ',
+    subscription: ' 구독',
+    needsLlm: 'eln setup llm 으로 고르세요',
+    claudeNoPath: 'claude-code 구독은 구독으로 쓸 수 있는 경로가 없어 자동 선택하지 않음',
+    multipleDetected: '둘 이상 감지되어 고르세요',
+  },
+  en: {
+    detectedPrefix: 'detected: ',
+    subscription: ' subscription',
+    needsLlm: 'pick a provider via eln setup llm',
+    claudeNoPath: 'claude-code subscription has no usable path in elanous; not auto-selecting',
+    multipleDetected: 'more than one detected; pick one',
+  },
+} as const;
 
 export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   outcome: 'ready' | 'needs-llm' | 'cancelled'; provider?: string; inputs: number;
@@ -74,6 +102,9 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   const path = deps.path ?? userConfigPath();
   const cfg = deps.config ?? getUserConfig(path);
   const print = deps.print ?? console.log;
+  const text = FIRST_RUN_TEXT[(deps.locale ?? detectLocale()) === 'en' ? 'en' : 'ko'];
+  const detectionLabel = (provider: string) =>
+    `${provider === 'openai-codex' ? 'codex' : provider}${text.subscription}`;
   let detected: DetectedProvider[] = [];
   try { detected = await (deps.detectProviders ?? detectProviders)(); }
   catch { /* Detection is advisory; a TTY can still choose. */ }
@@ -93,9 +124,9 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   // claude-code is detected but has no subscription path in elanous: mapping it to the 'anthropic'
   // API-key provider would save a provider whose first call fails for a subscription-only user.
   const usable = SUBSCRIPTION_PRIORITY.filter((name) => providers.includes(name));
-  const detectionLine = (outcome: string) => `감지: ${providers.map(detectionLabel).join(' · ')} → ${outcome}`;
+  const detectionLine = (outcome: string) => `${text.detectedPrefix}${providers.map(detectionLabel).join(' · ')} → ${outcome}`;
   const needsLlm = (inputs: number, extra: string[] = []) => {
-    print('eln setup llm 으로 고르세요');
+    print(text.needsLlm);
     for (const line of extra) print(line);
     observe('needs-llm', inputs);
     return { outcome: 'needs-llm' as const, inputs };
@@ -106,8 +137,8 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   if (!provider) {
     if (providers.length > 0) {
       print(detectionLine(usable.length === 0
-        ? 'claude-code 구독은 구독으로 쓸 수 있는 경로가 없어 자동 선택하지 않음'
-        : '둘 이상 감지되어 고르세요'));
+        ? text.claudeNoPath
+        : text.multipleDetected));
     }
     if ((deps.isTTY ?? process.stdin.isTTY) !== true) {
       // FIRST-CHAT-NONTTY — bare `elanous` with no TTY gets the same one-line next step as the other entrances.

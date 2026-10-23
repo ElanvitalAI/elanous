@@ -98,7 +98,7 @@ export interface SelfDevJobResult {
   /** Commits this child added against its own `--base`. 0 is not completion progress. */
   commitsAheadOfBase?: number;
   /** A dependency is done but its result is not on main; no child was launched. */
-  blockReason?: 'parent-unlanded' | 'dependency-needs-human';
+  blockReason?: 'parent-unlanded' | 'dependency-needs-human' | 'dependency-deferred';
   parentPrNumber?: number;
   /** The upstream completed in a worktree without opening a PR. */
   parentNoPr?: true;

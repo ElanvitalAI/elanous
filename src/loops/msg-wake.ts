@@ -5,7 +5,8 @@
 //   sse        — 아무것도 안 한다(구독자가 이미 듣는다)
 //   cron       — 다음 틱에 읽는다 · `wake-deferred` 로그만
 //   pty-inject — elanous TUI(pty 별명 = 자리 소문자)가 턴 idle 일 때만 한 줄 주입
-//   herdr      — 자리 폴더 `herdr.pane` 의 pane 이 agent_status=idle 일 때만 한 줄 주입
+//   herdr      — 자리 폴더 `herdr.pane` 의 pane 이 idle(·done) 일 때만 한 줄 주입 — `eln herdr prompt` 와 같은 생산 함수
+//                (`herdrPrompt` · `agent get` 상태 확인 → bracketed `pane run` 한 번). working/blocked 는 넣지 않고 busy.
 //   none       — stderr 경고 한 줄 · 해석 실패는 «모름»으로 남긴다(«없다»로 위장 금지)
 // ⛔ 우편은 입력칸에 넣지 않는다(대표 10-15 01:20) — 기본은 입력칸 주입 0. 10-15 01:10 사고: 대표 가 치던 문장에
 //    깨움 한 줄 ⊕ Enter 가 섞여 제출됐다(«에이전트 idle ≠ 사람이 안 친다»). 자리 폴더에서 푼 대상(pty 별명·
@@ -20,7 +21,6 @@
 //    상한(시도 3 · 2시간) → `gave-up`. 관측 = `loops.msg-wake` deferred | redelivered | gave-up.
 //    재두드림 «전»에 그 주소 미읽음을 잰다 — 0 이면 두드리지 않고 줄을 지운다(`dropped-read` · H4-FOLLOW ③).
 
-import { spawn } from 'node:child_process';
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
@@ -30,6 +30,7 @@ import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { readUnreadCount } from '../msg/msg-store.js';
+import { herdrPrompt, type HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { listPtyManifestRows } from '../pty-shell/pty-manifest.js';
 import { messageRouteFor, type MessageWake } from './msg-address.js';
 
@@ -75,8 +76,8 @@ export interface WakeDeps {
   hasOptIn?: (path: string) => boolean;
   /** Loads the pty writer (the CLI module is heavy, so it is imported only when a pty wake is due). */
   ptyInjector?: () => Promise<(ptyId: string, line: string) => Promise<void>>;
-  herdrStatus?: (paneId: string, signal: AbortSignal) => Promise<string>;
-  herdrInject?: (paneId: string, line: string, signal: AbortSignal) => Promise<void>;
+  /** The herdr CLI runner `herdrPrompt` drives (`agent get` · `pane run`). Default: the real `herdr` (HERDR_BIN_PATH · PATH). */
+  herdrRun?: HerdrCliRunner;
   warn?: (line: string) => void;
   /** Unread count for an address before a deferred re-knock (H4-FOLLOW ③). null = «모름» (never drops). Default: the msg ledger. */
   readUnread?: (address: string) => number | null;
@@ -178,29 +179,6 @@ function releaseClaim(claim: WakeClaim): void {
   } catch { /* a stale claim only delays the next wake by one window */ }
 }
 
-function run(cmd: string, args: string[], timeoutMs: number, signal: AbortSignal): Promise<string> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) { reject(new Error(`${cmd} aborted`)); return; }
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], signal });
-    let out = '';
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`${cmd} timeout`)); }, timeoutMs);
-    child.stdout.on('data', chunk => { out += String(chunk); });
-    child.on('error', error => { clearTimeout(timer); reject(error); });
-    child.on('close', code => { clearTimeout(timer); code === 0 ? resolve(out) : reject(new Error(`${cmd} exit ${code}`)); });
-  });
-}
-
-async function defaultHerdrStatus(paneId: string, signal: AbortSignal): Promise<string> {
-  const parsed = JSON.parse(await run('herdr', ['pane', 'get', paneId], WAKE_TIMEOUT_MS, signal)) as { result?: { pane?: { agent_status?: unknown } } };
-  const status = parsed.result?.pane?.agent_status;
-  return typeof status === 'string' ? status : 'unknown';
-}
-
-async function defaultHerdrInject(paneId: string, line: string, signal: AbortSignal): Promise<void> {
-  // `pane run` = send-text ⊕ Enter 한 번에.
-  await run('herdr', ['pane', 'run', paneId, line], WAKE_TIMEOUT_MS, signal);
-}
-
 async function defaultPtyInjector(): Promise<(ptyId: string, line: string) => Promise<void>> {
   const { runPtyText } = await import('../cli/pty-takeover-cli.js');
   return async (ptyId, line) => {
@@ -261,17 +239,35 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         injecting = true;
         await inject(resolution.target!, line);
       } else {
-        const status = await (deps.herdrStatus ?? defaultHerdrStatus)(resolution.target!, controller.signal);
-        if (status !== 'idle') return done('busy', `agent_status=${status}`);
-        // 조회 사이 자리의 pane 이 바뀌었으면 옛 pane 에 넣지 않는다 — 주소→대상을 다시 푼다.
-        const again = resolveWake(address, deps);
-        // opt-in 은 주입 직전에 «먼저» 다시 본다 — 기다리는 사이 `wake-inject` 를 지웠으면(대상이 바뀌었어도) 주입 0.
-        if (!seatOptedIn(address, deps)) { resolution = { ...resolution, optIn: false }; return done('skipped', 'human-pane-no-opt-in'); }
-        if (again.wake !== 'herdr' || again.target !== resolution.target) return done('busy', `target-moved:${again.target ?? again.wake}`);
-        // ⛔ 마감은 «주입 바로 앞»에서 — 재해석이 늦어 넘겼어도 새 주입 0.
-        if (expired()) return done('timeout');
-        injecting = true;
-        await (deps.herdrInject ?? defaultHerdrInject)(resolution.target!, line, controller.signal);
+        // `eln herdr prompt` 와 같은 생산 함수 — 상태 확인(idle·done 만) → 제출 앞 관문 → bracketed `pane run` 한 번.
+        // 라벨은 묻지 않는다(anyAgent): 자리 폴더가 이미 대상을 정했고, claude/codex pane 도 예전처럼 깨운다.
+        const target = resolution.target!;
+        const prompted = await herdrPrompt({ target, text: line, anyAgent: true, paneFallback: true, timeoutMs: Math.max(1, deadline - Date.now()) }, {
+          ...(deps.herdrRun ? { run: deps.herdrRun } : {}),
+          beforeSubmit: () => {
+            // opt-in 은 주입 직전에 «먼저» 다시 본다 — 기다리는 사이 `wake-inject` 를 지웠으면(대상이 바뀌었어도) 주입 0.
+            if (!seatOptedIn(address, deps)) { resolution = { ...resolution, optIn: false }; return 'human-pane-no-opt-in'; }
+            // 조회 사이 자리의 pane 이 바뀌었으면 옛 pane 에 넣지 않는다 — 주소→대상을 다시 푼다.
+            const again = resolveWake(address, deps);
+            if (again.wake !== 'herdr' || again.target !== target) return `target-moved:${again.target ?? again.wake}`;
+            // ⛔ 마감은 «주입 바로 앞»에서 — 재해석이 늦어 넘겼어도 새 주입 0.
+            if (expired()) return 'timeout';
+            injecting = true;
+            return undefined;
+          },
+        });
+        if (!prompted.accepted) injecting = false;
+        const reason = prompted.reason;
+        const result: WakeResult = reason === 'submitted' ? 'injected'
+          : reason === 'human-pane-no-opt-in' ? 'skipped'
+            : reason === 'timeout' ? 'timeout'
+              : reason.startsWith('target-moved:') || reason === 'agent_working' || reason === 'agent_blocked' || reason === 'agent_unknown' ? 'busy'
+                : 'failed';
+        const outReason = result === 'busy' && !reason.startsWith('target-moved:') ? `agent_status=${prompted.status ?? 'unknown'}`
+          : result === 'injected' || result === 'timeout' ? undefined : reason;
+        logPending('herdr-prompt', { seat: address.trim().toUpperCase(), msgId, target, result, accepted: prompted.accepted, reason,
+          ...(prompted.status ? { status: prompted.status } : {}), ...(prompted.agent ? { agent: prompted.agent } : {}), ms: prompted.ms });
+        if (result !== 'injected') return done(result, outReason);
       }
       return done('injected');
     } catch (error) {
@@ -309,7 +305,7 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
 
 interface PendingWakeRow { address: string; first_msg_id: number; last_msg_id: number; last_from: string; count: number; since: number; attempts: number; reason: string }
 
-export type PendingWakeEvent = 'deferred' | 'redelivered' | 'gave-up' | 'dropped-read' | 'skip';
+export type PendingWakeEvent = 'deferred' | 'redelivered' | 'gave-up' | 'dropped-read' | 'skip' | 'herdr-prompt';
 
 function logPending(event: PendingWakeEvent, data: Record<string, unknown>): void {
   try { debug.log('loops.msg-wake', event, data); } catch { /* observability is fail-open */ }

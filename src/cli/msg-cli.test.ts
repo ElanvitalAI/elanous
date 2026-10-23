@@ -2,10 +2,11 @@ import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
 import { MsgStore, type Message } from '../msg/msg-store.js';
+import { readPostOffice, writePostOffice } from '../msg/msg-post-office.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
 import { formatMessage, registerMsgCommands, type MsgCliDeps } from './msg-cli.js';
 
@@ -950,4 +951,242 @@ test('human line puts a kind emoji right before the unchanged [kind] text; unkno
   expect(formatMessage({ ...base, kind: 'memo' })).toBe('#7 2026-10-15T00:00:00.000Z OP → MK [memo]: hi');
   expect(formatMessage({ ...base, kind: 'toString' })).toBe('#7 2026-10-15T00:00:00.000Z OP → MK [toString]: hi');
   expect(formatMessage(base)).toBe('#7 2026-10-15T00:00:00.000Z OP → MK: hi');
+});
+
+// ── MSG-AGENT-CONVERSE-FU ──────────────────────────────────────────────────────────────────────
+// 무대: 기존 fixture(격리 임시 DB) + mock deps. 자동 답은 «진짜» replyWithAgent 를 지나고(턴만 fake),
+// 우편국 재시작은 launch seam(fake-bin)이 실제 프로세스 대신 argv 를 받는다.
+
+/** One SSE read with a hard deadline — a restarted service replays the ledger on its first pull. */
+function readWithDeadline(reader: ReadableStreamDefaultReader<Uint8Array>, timeoutMs: number, seen: string) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    reader.read(),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no SSE event containing ${seen}`)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+/** Reads an SSE response until `needle` shows up — the restarted service replays the ledger on first read. */
+async function readSseUntil(response: Response, needle: string, timeoutMs = 10_000): Promise<string> {
+  if (!response.body) throw new Error(`no SSE body (${response.status})`);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  try {
+    while (!text.includes(needle)) {
+      const chunk = await readWithDeadline(reader, timeoutMs, `${needle}: ${text.slice(0, 200)}`);
+      if (chunk.done) break;
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+  } finally { await reader.cancel().catch(() => undefined); }
+  if (!text.includes(needle)) throw new Error(`no SSE event containing ${needle}: ${text.slice(0, 200)}`);
+  return text;
+}
+
+test('post --agent-reply produces one durable linked agent reply after the wake path passes; no flag leaves the ledger untouched', async () => {
+  const order: string[] = [];
+  const turns: string[] = [];
+  const wakes: Array<{ address: string; msgId: number; message: { from: string; kind?: string } }> = [];
+  const f = fixture('', () => ({
+    wake: async (address, msgId, message) => {
+      order.push('wake');
+      wakes.push({ address, msgId, message });
+      return { wake: 'cron', source: 'loop-table', address, msgId, result: 'wake-deferred' };
+    },
+    agentReply: {
+      role: { model: 'fake-model' }, pack: 'fake coordinator pack',
+      runAgent: async input => { order.push('turn'); turns.push(`${input.request.id}:${input.request.from}:${input.request.body}`); return '  제안: hold 승인 대기  '; },
+    },
+  }));
+  await f.run('post', 'hold 신호 확인 필요', '--from', 'OP', '--to', 'COORDINATOR', '--agent-reply', 'coordinator', '--json');
+  const posted = JSON.parse(f.stdout[0]!);
+  const store = f.store();
+  try {
+    const replies = store.listReplies(posted.id);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({ from: 'COORDINATOR', to: 'OP', kind: 'reply', body: '제안: hold 승인 대기', replyTo: posted.id });
+  } finally { store.close(); }
+  expect(turns).toEqual(['1:OP:hold 신호 확인 필요']);
+  // 깨움은 저장 «뒤» 그대로 한 번 — 자동 답은 그 뒤에 붙는다.
+  expect(order).toEqual(['wake', 'turn']);
+  expect(wakes).toEqual([{ address: 'COORDINATOR', msgId: posted.id, message: { from: 'OP' } }]);
+  expect(JSON.parse(f.stdout[1]!)).toEqual({ agentReply: { address: 'COORDINATOR', requestId: posted.id, replyId: 2, posted: true } });
+  expect(f.stderr).toEqual([]);
+  expect(f.exits).toEqual([]);
+
+  const plain = fixture('', () => ({
+    agentReply: { role: { model: 'fake-model' }, pack: 'fake coordinator pack', runAgent: async input => { turns.push(`plain:${input.request.id}`); return '답'; } },
+  }));
+  await plain.run('post', 'hold 신호 확인 필요', '--from', 'OP', '--to', 'COORDINATOR', '--json');
+  expect(turns).toEqual(['1:OP:hold 신호 확인 필요']);
+  expect(plain.stdout).toHaveLength(1);
+  const untouched = plain.store();
+  try { expect(untouched.listReplies(1)).toEqual([]); } finally { untouched.close(); }
+});
+
+test('ask --agent-reply answers without a human, so the same wait loop returns the generated reply', async () => {
+  const f = fixture('', () => ({
+    agentReply: { role: { model: 'fake-model' }, pack: 'fake guardian pack',
+      runAgent: async input => `${input.request.from} 질문 #${input.request.id} — 보류, 근거 부족` },
+  }));
+  await f.run('ask', 'coordinator', '지금 hold 풀어도 되나?', '--from', 'TC', '--wait', '5', '--agent-reply', 'COORDINATOR', '--json');
+  expect(f.exits).toEqual([]);
+  expect(f.stderr).toEqual([]);
+  expect(f.sleeps).toBe(0);
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({
+    id: 2, from: 'COORDINATOR', to: 'TC', kind: 'reply', replyTo: 1, body: 'TC 질문 #1 — 보류, 근거 부족',
+  });
+  const store = f.store();
+  try { expect(store.listReplies(1).map(message => message.from)).toEqual(['COORDINATOR']); }
+  finally { store.close(); }
+});
+
+test('post --agent-reply without a resolved role LLM posts once and notices instead of generating', async () => {
+  let turns = 0;
+  const f = fixture('', () => ({
+    agentReply: { resolveRole: () => undefined, pack: 'unused', runAgent: async () => { turns++; return '답'; } },
+  }));
+  await f.run('post', 'hold 신호 확인 필요', '--from', 'OP', '--to', 'COORDINATOR', '--agent-reply', 'coordinator', '--json');
+  expect(turns).toBe(0);
+  expect(f.exits).toEqual([]);
+  expect(f.stderr.at(-1)).toBe('msg: COORDINATOR 역할 LLM 미설정 — 자동 답 없음');
+  const store = f.store();
+  try { expect(store.list('COORDINATOR')).toHaveLength(1); expect(store.listReplies(1)).toEqual([]); }
+  finally { store.close(); }
+});
+
+test('post --agent-reply aimed at a different address exits 2 before saving anything', async () => {
+  let turns = 0;
+  const f = fixture('', () => ({
+    agentReply: { role: { model: 'fake-model' }, pack: 'pack', runAgent: async () => { turns++; return '답'; } },
+  }));
+  await f.run('post', 'body', '--from', 'OP', '--to', 'MK', '--agent-reply', 'COORDINATOR');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: --agent-reply COORDINATOR requires --to COORDINATOR');
+  await f.run('post', 'body', '--from', 'OP', '--to', 'COORDINATOR', '--agent-reply', 'steward');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(f.stderr.at(-1)).toBe('msg: --agent-reply must be COORDINATOR or GUARDIAN');
+  expect(turns).toBe(0);
+  const store = f.store();
+  try { expect(store.list('MK')).toEqual([]); expect(store.list('COORDINATOR')).toEqual([]); }
+  finally { store.close(); }
+});
+
+test('a dead installed post office is restarted from post and the restarted SSE service replays the durable post', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-office-'));
+  dirs.push(dir);
+  const path = join(dir, 'messages.db');
+  const launched: number[] = [];
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const exits: number[] = [];
+  const program = new Command();
+  registerMsgCommands(program, {
+    openStore: () => new MsgStore(path),
+    out: { log: line => stdout.push(line), error: line => stderr.push(line) },
+    readStdin: async () => '',
+    setExitCode: code => exits.push(code),
+    registerLogSink: async () => undefined,
+    wake: async (address, msgId) => ({ wake: 'none', source: 'unresolved', address, msgId, result: 'skipped-test-universe' }),
+    postOfficeStateRoot: dir,
+    postOfficeAlive: () => false,
+    postOfficeProbe: async () => false,
+    postOfficeLaunch: input => { launched.push(input.port); },
+  });
+  writePostOffice(dir, { port: 47821, pid: 999_999 });
+  await program.parseAsync(['msg', 'post', 'durable while the service is down', '--from', 'OP', '--to', 'TC', '--json'], { from: 'user' });
+  expect(exits).toEqual([]);
+  expect(launched).toEqual([47821]);
+  expect(stderr.at(-1)).toBe('msg: post office 재시작 (port 47821) — 원장이 정본이라 저장된 글은 다시 밀린다');
+  expect(JSON.parse(stdout[0]!).body).toBe('durable while the service is down');
+
+  // 다시 띄운 서비스가 같은 원장을 «처음부터» 민다 — 죽어 있던 동안 저장된 글도 도착한다.
+  const store = new MsgStore(path);
+  const service = startMsgSseServer({ store, token: 'same-nexus-token', port: 0, pollMs: 20 });
+  try {
+    const response = await fetch(`http://127.0.0.1:${service.port}/stream?to=TC&since=0`,
+      { headers: { Authorization: 'Bearer same-nexus-token' } });
+    const text = await readSseUntil(response, 'durable while the service is down');
+    expect(text).toContain('"id":1');
+  } finally { service.stop(); store.close(); }
+});
+
+// PR #30660 리뷰 SHOULD-FIX 구별자 — 배선(msg-cli.ts)을 base 로 되돌리면 이 시험은 «이름 붙은 단언 실패»로 뜬다:
+//   git checkout f74e24568d -- src/cli/msg-cli.ts && bun test src/cli/msg-cli.test.ts -t 'restart fires after the durable save'
+//   → fail: expected [] to equal [ 47821 ] (재시작 배선이 없으면 발사가 일어나지 않는다). 복원: git checkout HEAD -- src/cli/msg-cli.ts.
+test('post office restart fires after the durable save, so the launch can already read the new post', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-office-order-'));
+  dirs.push(dir);
+  const path = join(dir, 'messages.db');
+  const launched: number[] = [];
+  const ledgerAtLaunch: number[] = [];
+  const stdout: string[] = [];
+  const exits: number[] = [];
+  const program = new Command();
+  registerMsgCommands(program, {
+    openStore: () => new MsgStore(path),
+    out: { log: line => stdout.push(line), error: () => {} },
+    readStdin: async () => '',
+    setExitCode: code => exits.push(code),
+    registerLogSink: async () => undefined,
+    wake: async (address, msgId) => ({ wake: 'none', source: 'unresolved', address, msgId, result: 'skipped-test-universe' }),
+    postOfficeStateRoot: dir,
+    postOfficeAlive: () => false,
+    postOfficeProbe: async () => false,
+    postOfficeLaunch: input => {
+      launched.push(input.port);
+      const ledger = new MsgStore(path, { readOnly: true });
+      try { ledgerAtLaunch.push(ledger.list('TC').length); } finally { ledger.close(); }
+    },
+  });
+  writePostOffice(dir, { port: 47821, pid: 999_999 });
+  await program.parseAsync(['msg', 'post', 'restart must replay me', '--from', 'OP', '--to', 'TC', '--json'], { from: 'user' });
+  expect(exits).toEqual([]);
+  // 발사는 등록 줄의 포트 그대로, 그리고 저장 «뒤» — 다시 띄운 서비스가 방금 저장한 글을 첫 재생에 민다(원장이 정본).
+  expect(launched).toEqual([47821]);
+  expect(ledgerAtLaunch).toEqual([1]);
+  expect(JSON.parse(stdout[0]!).body).toBe('restart must replay me');
+});
+
+test('post leaves an unregistered or still-listening post office alone', async () => {
+  const quiet = fixture('', ({ path }) => ({
+    postOfficeStateRoot: dirname(path), postOfficeAlive: () => false, postOfficeProbe: async () => false,
+    postOfficeLaunch: () => { throw new Error('must not restart without a registration'); },
+  }));
+  await quiet.run('post', 'no service registered', '--from', 'OP', '--to', 'TC', '--json');
+  expect(quiet.stderr).toEqual([]);
+  expect(quiet.exits).toEqual([]);
+
+  const listening = fixture('', ({ path }) => ({
+    postOfficeStateRoot: dirname(path), postOfficeAlive: () => true, postOfficeProbe: async () => true,
+    postOfficeLaunch: () => { throw new Error('must not restart a listening service'); },
+  }));
+  writePostOffice(dirname(listening.path), { port: 47822, pid: process.pid });
+  await listening.run('post', 'service is up', '--from', 'OP', '--to', 'TC', '--json');
+  expect(listening.stderr).toEqual([]);
+  expect(listening.exits).toEqual([]);
+});
+
+test('msg serve --sse publishes its port for the restart path and clears it when stopped', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-cli-office-serve-'));
+  dirs.push(dir);
+  const path = join(dir, 'messages.db');
+  const stdout: string[] = [];
+  const program = new Command();
+  new MsgStore(path).close(); // the read-only service needs an existing ledger
+  registerMsgCommands(program, {
+    openStore: () => new MsgStore(path), openReadStore: () => new MsgStore(path, { readOnly: true }),
+    out: { log: line => stdout.push(line), error: () => {} },
+    authToken: () => 'same-nexus-token',
+    postOfficeStateRoot: dir,
+  });
+  await program.parseAsync(['msg', 'serve', '--sse', '--port', '0'], { from: 'user' });
+  const info = readPostOffice(dir);
+  expect(info?.pid).toBe(process.pid);
+  expect(info?.port).toBeGreaterThan(0);
+  expect(stdout.at(-1)).toBe(`msg SSE listening on 127.0.0.1:${info!.port}`);
+  process.emit('SIGINT');
+  expect(readPostOffice(dir)).toBeNull();
 });

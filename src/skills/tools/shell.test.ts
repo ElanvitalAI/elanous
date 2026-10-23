@@ -2,9 +2,13 @@
 // queue, exactly once per handle. Inline / omitted-mode responses stay
 // byte-identical and enqueue nothing.
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { existsSync, readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import {
+  SHELL_DISPATCH_ARGS_TEXT_LIMIT,
+  boundedShellArgsText,
   detectLongSleep,
   dispatchRunShell,
   enqueueShellCompletionNotice,
@@ -376,5 +380,163 @@ describe('RunShell long sleep inside a turn → warning ⊕ shell.run long-sleep
     expect(longSleepEvents()).toEqual([]);
     await tick();
     globalTaskNotificationQueue.clear();
+  });
+});
+
+// TUI-OBS-TRACE-PERSIST — persisted RunShell dispatch records retain a bounded,
+// secret-redacted rendering of the arguments that reached the dispatch entry.
+describe('RunShell dispatch trace args', () => {
+  afterEach(() => {
+    resetShellRunnerDeps();
+  });
+
+  type PersistedTrace = {
+    event?: string;
+    argsText?: string;
+    argsTextTruncated?: boolean;
+    argsTextChars?: number;
+    argsTextMarker?: string;
+  };
+
+  const persistedDispatchTraceWith = (sentinel: string): PersistedTrace | undefined => {
+    debug.flush();
+    const path = debug.path();
+    if (!existsSync(path)) return undefined;
+    const records = readFileSync(path, 'utf8')
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as { category?: string; event?: string; data?: PersistedTrace })
+      .filter((record) => record.category === 'shell.dispatch');
+    return records.map((record) => record.data ? { ...record.data, event: record.event } : undefined)
+      .find((data) => typeof data?.argsText === 'string' && data.argsText.includes(sentinel));
+  };
+
+  const argsOfExactLength = (chars: number) => {
+    const overhead = JSON.stringify({ command: ['true', ''] }).length;
+    return { command: ['true', 'p'.repeat(chars - overhead)] };
+  };
+
+  test('records serialized invocation args in the persisted legacy trace', async () => {
+    const sentinel = `trace-sentinel-${randomUUID()}`;
+    const rawArgs = { command: ['true', `persist-args-${randomUUID()}`], description: sentinel };
+    await dispatchRunShell(rawArgs);
+
+    const trace = persistedDispatchTraceWith(sentinel);
+    expect(trace?.argsText).toBe(JSON.stringify(rawArgs));
+    expect(trace?.argsTextTruncated).toBe(false);
+    expect(trace?.argsTextChars).toBe(JSON.stringify(rawArgs).length);
+    expect(trace).not.toHaveProperty('argsTextMarker');
+  });
+
+  test('records serialized invocation args in the persisted runner trace', async () => {
+    setShellRunnerDeps({
+      registry: createShellRegistry(),
+      fileEngine: createFileCaptureEngine({ spawnFn: fakeSpawnExit(0) }),
+    });
+    const sentinel = `runner-trace-${randomUUID()}`;
+    const rawArgs = { command: ['true', `runner-args-${randomUUID()}`], mode: 'inline', description: sentinel };
+    const result = await dispatchRunShell(rawArgs);
+
+    const trace = persistedDispatchTraceWith(sentinel);
+    expect(result.outcome).toBe('exit');
+    expect(trace?.event).toBe('runner.exit');
+    expect(trace?.argsText).toBe(JSON.stringify(rawArgs));
+    expect(trace?.argsTextTruncated).toBe(false);
+    expect(trace?.argsTextChars).toBe(JSON.stringify(rawArgs).length);
+  });
+
+  test('caps persisted text at 2048 chars and records an explicit truncation marker', async () => {
+    const sentinel = `long-args-${randomUUID()}-`;
+    const rawArgs = { command: ['true', sentinel + 'z'.repeat(4096)] };
+    const fullText = JSON.stringify(rawArgs);
+    await dispatchRunShell(rawArgs);
+
+    const trace = persistedDispatchTraceWith(sentinel);
+    const marker = '[truncated]';
+    expect(trace?.argsTextTruncated).toBe(true);
+    expect(trace?.argsTextChars).toBe(fullText.length);
+    expect(trace?.argsTextMarker).toBe(marker);
+    expect(trace?.argsText).toHaveLength(SHELL_DISPATCH_ARGS_TEXT_LIMIT);
+    expect(trace?.argsText).toBe(
+      `${fullText.slice(0, SHELL_DISPATCH_ARGS_TEXT_LIMIT - marker.length - 1)} ${marker}`,
+    );
+  });
+
+  test('redacts recognizable secrets before the args text reaches the log file', async () => {
+    const bearer = `sk-ant-api03-${'q7W2e5R9t3Y6u1I4o8P0'.repeat(2)}`;
+    const sentinel = `secret-redaction-${randomUUID()}`;
+    const rawArgs = {
+      command: ['true', '--header', `Authorization: Bearer ${bearer}`],
+      description: sentinel,
+    };
+    await dispatchRunShell(rawArgs);
+
+    const trace = persistedDispatchTraceWith(sentinel);
+    expect(trace?.argsText).toContain('Bearer ***');
+    expect(trace?.argsText).not.toContain(bearer);
+    expect(rawArgs.command[2]).toBe(`Authorization: Bearer ${bearer}`);
+  });
+
+  test('redacts fallback text when non-JSON values cannot be serialized', () => {
+    const bearer = `sk-ant-api03-${'m4N8b2V6c0X3z7A1s5D9'.repeat(2)}`;
+    const rawArgs = {
+      value: 1n,
+      toString: () => `unserializable Bearer ${bearer}`,
+    };
+
+    const trace = boundedShellArgsText(rawArgs);
+    expect(trace.argsText).toContain('Bearer ***');
+    expect(trace.argsText).not.toContain(bearer);
+  });
+
+  test('persists a redacted fallback string from the actual dispatch path', async () => {
+    const bearer = `sk-ant-api03-${'p8R2m6T0v4X7z1A5'.repeat(2)}`;
+    const sentinel = `dispatch-fallback-${randomUUID()}`;
+    const rawArgs = {
+      command: ['true'],
+      nonJsonValue: 1n,
+      toString: () => `unserializable ${sentinel} Authorization: Bearer ${bearer} ${'x'.repeat(2500)}`,
+    };
+
+    const result = await dispatchRunShell(rawArgs);
+
+    const trace = persistedDispatchTraceWith(sentinel);
+    debug.flush();
+    const persistedLog = readFileSync(debug.path(), 'utf8');
+    expect(result.outcome).toBe('exit');
+    expect(trace?.event).toBe('legacy.exit');
+    expect(trace?.argsText).toContain(sentinel);
+    expect(trace?.argsText).toContain('Bearer ***');
+    expect(trace?.argsText).not.toContain(bearer);
+    expect(persistedLog).not.toContain(bearer);
+    expect(trace?.argsText).toHaveLength(SHELL_DISPATCH_ARGS_TEXT_LIMIT);
+    expect(trace?.argsText?.endsWith('[truncated]')).toBe(true);
+    expect(trace?.argsTextTruncated).toBe(true);
+    expect(trace?.argsTextMarker).toBe('[truncated]');
+    expect(trace?.argsTextChars).toBeGreaterThan(SHELL_DISPATCH_ARGS_TEXT_LIMIT);
+    expect(rawArgs.command).toEqual(['true']);
+  });
+
+  test('the exact limit remains complete and one extra character is marked as truncated', () => {
+    expect(SHELL_DISPATCH_ARGS_TEXT_LIMIT).toBe(2048);
+    const atLimit = argsOfExactLength(SHELL_DISPATCH_ARGS_TEXT_LIMIT);
+    expect(JSON.stringify(atLimit)).toHaveLength(SHELL_DISPATCH_ARGS_TEXT_LIMIT);
+    expect(boundedShellArgsText(atLimit)).toEqual({
+      argsText: JSON.stringify(atLimit),
+      argsTextTruncated: false,
+      argsTextChars: SHELL_DISPATCH_ARGS_TEXT_LIMIT,
+    });
+
+    const overLimit = argsOfExactLength(SHELL_DISPATCH_ARGS_TEXT_LIMIT + 1);
+    const overText = JSON.stringify(overLimit);
+    const result = boundedShellArgsText(overLimit);
+    const marker = '[truncated]';
+    expect(result.argsText).toHaveLength(SHELL_DISPATCH_ARGS_TEXT_LIMIT);
+    expect(result.argsText).toBe(
+      `${overText.slice(0, SHELL_DISPATCH_ARGS_TEXT_LIMIT - marker.length - 1)} ${marker}`,
+    );
+    expect(result.argsTextTruncated).toBe(true);
+    expect(result.argsTextChars).toBe(overText.length);
+    expect(result.argsTextMarker).toBe(marker);
   });
 });

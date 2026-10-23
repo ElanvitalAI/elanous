@@ -7,6 +7,7 @@ import { acquireLockSync } from '../storage/file-lock.js';
 import { subscribeInsideEvent, type InsideLiveEvent } from '../nexus/api/inside-events.js';
 import type { NexusEventBus } from '../nexus/api/event-bus.js';
 import { parseRepairWorkerResult } from '../task-agent/repair-worker.js';
+import { pairMoveId } from '../task-agent/repair-next-move.js';
 import { readTaskCard, taskAgentStatePath } from '../task-agent/task-hand.js';
 
 const SHA40 = /^[0-9a-f]{40}$/i;
@@ -17,6 +18,8 @@ const OUTPUT_LIMIT = 1024 * 1024;
 export interface TaRepairCompleted {
   kind: 'ta.repair.completed'; schema: 1; card: string; pr: number; head: string;
   runId: string; resultPath: string; completedAt: string;
+  /** HARNESS-FULL-GRAPH-NEXTMOVE — worker 가 받은 수 id(옛 worker 는 없다 · 꼴이 틀려도 사건을 버리지 않고 짝짓기에서 «못 짝지음»으로 남긴다). */
+  moveId?: string;
 }
 
 export function parseTaRepairCompleted(value: unknown): TaRepairCompleted | null {
@@ -102,14 +105,22 @@ export async function collectTaRepairCompleted(input: unknown, deps: TaRepairCol
   let card;
   try { card = readTaskCard(event.card, statePath); } catch { emit('deferred', { reason: 'card unreadable' }); return 'deferred'; }
   const repair = Array.isArray(card?.repairs) ? card.repairs.find(entry => entry && typeof entry === 'object' && entry.runId === event.runId) : undefined;
+  // NEXTMOVE-GENERAL-RELAUNCH-MOVEID — 사건의 수 id 를 카드(발사 순간 적은 값)와 짝짓는다. 결과는 관측 칸에만 싣는다(fail-soft · 수거 판단은 그대로).
+  const observedMoveId: unknown = (event as { moveId?: unknown }).moveId;
+  const pairing = pairMoveId(repair?.moveId, observedMoveId);
+  const moveFields: Record<string, unknown> = pairing.kind === 'legacy' ? {}
+    : { moveId: pairing.kind === 'paired' ? pairing.moveId : typeof observedMoveId === 'string' ? observedMoveId : null,
+      moveIdPaired: pairing.kind === 'paired', ...(pairing.kind === 'unpaired' ? { expectedMoveId: pairing.expected } : {}) };
+  const emitPaired = (outcome: string, extra: Record<string, unknown> = {}) => emit(outcome, { ...moveFields, ...extra });
   if (!repair || repair.pr !== event.pr || typeof repair.head !== 'string' || repair.head.toLowerCase() !== event.head.toLowerCase()
     || typeof repair.resultPath !== 'string' || !repair.resultPath.startsWith('/')
+    // 카드 귀속이 안 맞는 사건엔 짝짓기 칸을 싣지 않는다 — 남의 수리와 대조한 값이 관측에 섞이지 않게(r1 should-fix).
     || resolve(repair.resultPath) !== resolve(event.resultPath)) { emit('invalid', { reason: 'event differs from card binding' }); return 'invalid'; }
-  if (repair.status !== 'requested') { emit('duplicate', { reason: `repair ${repair.status}` }); return 'duplicate'; }
+  if (repair.status !== 'requested') { emitPaired('duplicate', { reason: `repair ${repair.status}` }); return 'duplicate'; }
   let result;
   try { result = parseRepairWorkerResult((deps.read ?? ((path) => readFileSync(path, 'utf8')))(repair.resultPath), event.pr, event.head, event.runId); }
   catch { /* periodic tick can recover a missing result */ }
-  if (!result) { emit('deferred', { reason: 'worker result missing or invalid' }); return 'deferred'; }
+  if (!result) { emitPaired('deferred', { reason: 'worker result missing or invalid' }); return 'deferred'; }
 
   // Existing PID-aware lock recovers a dead daemon without making later events wait forever.
   // A live holder keeps the lock through the child process; the card CAS covers periodic-tick races.
@@ -119,25 +130,25 @@ export async function collectTaRepairCompleted(input: unknown, deps: TaRepairCol
     mkdirSync(dirname(lock), { recursive: true });
     release = acquireLockSync(lock, { breakDeadHolder: true, staleMs: TIMEOUT_MS + 60_000, maxTries: 2 });
   }
-  catch { emit('deferred', { reason: 'collector busy; periodic fallback remains' }); return 'deferred'; }
+  catch { emitPaired('deferred', { reason: 'collector busy; periodic fallback remains' }); return 'deferred'; }
   try {
     // Recheck after claiming: another collector or the periodic tick may have consumed the file.
     const current = readTaskCard(event.card, statePath);
     const latest = Array.isArray(current?.repairs) ? current.repairs.find(entry => entry && typeof entry === 'object' && entry.runId === event.runId) : undefined;
     if (!latest || latest.status !== 'requested' || latest.pr !== event.pr || typeof latest.head !== 'string'
       || latest.head.toLowerCase() !== event.head.toLowerCase() || typeof latest.resultPath !== 'string'
-      || !latest.resultPath.startsWith('/') || resolve(latest.resultPath) !== resolve(event.resultPath)) { emit('duplicate'); return 'duplicate'; }
+      || !latest.resultPath.startsWith('/') || resolve(latest.resultPath) !== resolve(event.resultPath)) { emitPaired('duplicate'); return 'duplicate'; }
     const child = await (deps.run ?? ((card) => defaultRun(card, statePath, deps.cliBin)))(event.card);
     const after = readTaskCard(event.card, statePath)?.repairs?.find(entry => entry.runId === event.runId);
     const consumed = child.code === 0 && !child.truncated && after?.status !== 'requested' && after !== undefined
       && childConsumedRepair(child.output, event);
     const outcome = consumed ? 'collected' : child.truncated ? 'deferred' : after && after.status !== 'requested' ? 'duplicate' : 'deferred';
-    emit(outcome, { rc: child.code, repairStatus: after?.status,
+    emitPaired(outcome, { rc: child.code, repairStatus: after?.status,
       ...(child.truncated ? { reason: 'rejudge output exceeded 1 MiB; event attribution unmeasured' } : {}),
       detail: child.output.slice(-300) });
     return consumed ? 'collected' : outcome === 'duplicate' ? 'duplicate' : 'deferred';
   } catch (error) {
-    emit('deferred', { reason: String(error).slice(-300) });
+    emitPaired('deferred', { reason: String(error).slice(-300) });
     return 'deferred';
   } finally { release(); }
 }

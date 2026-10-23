@@ -172,7 +172,13 @@ export function createAgentWake(deps: AgentWakeDeps): AgentWakeController {
             return;
           }
           tryOpen(n, 'input-mounted');
-        } catch { /* fail-soft: 깨움은 입력을 막지 않는다 */ }
+        } catch (error) {
+          // fail-soft: 깨움은 입력을 막지 않는다 — 다만 «조용히 죽은» 이유는 TF 가 봐야 한다(거부는 사유 로그).
+          log('tui.agent-wake', 'rejected', {
+            taskId: n.taskId, agent: n.agentName, state: n.state, trigger: 'input-mounted', reason: 'error',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
       });
     },
   };

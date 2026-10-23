@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, rmdirSync, symlinkSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { worktreeHasChanges, preservationHasChanges, changedFiles, commitTitles, commitWorktree, unstageElanousRuntimeArtifacts, featurePrompt, defaultSeams, changedFileTypecheck, mergeBaseDiagnostics, gateChangedFiles, gateWorktreeBehindMain, resolveBootFailureReason, toReviewIntentInput, worktreeDiff, reviewScopeDiff, REVIEW_SCOPE_UNMEASURABLE, type DefaultSeamsOptions } from './seams.js';
+import { worktreeHasChanges, preservationHasChanges, changedFiles, commitTitles, commitWorktree, unstageElanousRuntimeArtifacts, featurePrompt, defaultSeams, changedFileTypecheck, mergeBaseDiagnostics, gateChangedFiles, gateWorktreeBehindMain, resolveBootFailureReason, toReviewIntentInput, worktreeDiff, reviewScopeDiff, REVIEW_SCOPE_UNMEASURABLE, podChildDependenciesRequired, type DefaultSeamsOptions } from './seams.js';
 import type { PrManager } from '../autopilot/pr-manager.js';
 import type { SelfImplementSeams } from './orchestrator.js';
 import { runSelfImplement } from './orchestrator.js';
@@ -29,6 +29,12 @@ import { getAskUserQuestionResolver, setAskUserQuestionResolver } from '../ask-u
 function git(cwd: string, ...argv: string[]) {
   return spawnSync('git', argv, { cwd, encoding: 'utf8' });
 }
+
+test('Pod child worktree dependency opt-in follows the Job manifest marker', () => {
+  expect(podChildDependenciesRequired({})).toBe(false);
+  expect(podChildDependenciesRequired({ ELANOUS_POD_NAME: '  ' })).toBe(false);
+  expect(podChildDependenciesRequired({ ELANOUS_POD_NAME: 'pod-child-1' })).toBe(true);
+});
 
 describe('launchDevGoalFileDetached', () => {
   type SpawnObservation = {
@@ -1047,6 +1053,30 @@ describe('featurePrompt — 버그B(자식 PR 게이트 우회 차단)', () => {
       expect(events).toEqual([expect.objectContaining({ itemCount: 1, truncated: false, runId: 'run-test' })]);
     } finally {
       log.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('verified PR-source Pod marker reaches the production PTY supervisor seam only for that run', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-pr-source-supervisor-'));
+    const previous = process.env.ELANOUS_POD_VERIFIED_PR_SOURCE;
+    const received: Array<boolean | undefined> = [];
+    try {
+      const seams = defaultSeams({
+        ptyAvailable: () => true,
+        runHeadlessGoalLoopPty: async (opts) => {
+          received.push(opts.verifiedPrSource);
+          return { ok: true, reachedCompletion: true, transcript: '', toolCalls: 0, timedOut: false, exitReason: 'child-exit', exitCode: 0, ptyId: 'pty-test' };
+        },
+      });
+      process.env.ELANOUS_POD_VERIFIED_PR_SOURCE = '1';
+      await seams.implement({ cwd, feature: 'ledger repair', runId: 'run-pr-source' });
+      delete process.env.ELANOUS_POD_VERIFIED_PR_SOURCE;
+      await seams.implement({ cwd, feature: 'normal work', runId: 'run-normal' });
+      expect(received).toEqual([true, undefined]);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_POD_VERIFIED_PR_SOURCE;
+      else process.env.ELANOUS_POD_VERIFIED_PR_SOURCE = previous;
       rmSync(cwd, { recursive: true, force: true });
     }
   });
@@ -2460,6 +2490,8 @@ describe('defaultSeams — platform gates', () => {
       gateSteps: ['test'],
       runAndroidUnitTestGate: (io) => { androidCalls.push(io); return 0; },
       runIosUnitTestGate: () => 0,
+      runVerifyByBreaking: () => ({ baseStatuses: { pass: 0, 'test-fail': 1, unknown: 0 },
+        files: [{ file: 'src/self-implement/seams.test.js', classification: 'missing-at-base', base: { status: 'test-fail', log: 'fixture fails against base' } }] }),
       runIntegrityGate: async (cwd, opts) => {
         integrityInputs.push({ ...opts, testArgs: opts.testArgs ? [...opts.testArgs] : undefined });
         return runIntegrityGate(cwd, {
@@ -2480,7 +2512,9 @@ describe('defaultSeams — platform gates', () => {
     expect(androidCalls[0]!.args).toEqual(['--changed-files', 'apps/android/src/test/FooTest.kt', 'src/self-implement/seams.test.js']);
     expect(bunCalls).toEqual([['test', 'src/self-implement/seams.test.js']]);
     expect(bunCalls.flat()).not.toContain('apps/android/src/test/FooTest.kt');
+    // Mobile base verification is a follow-up; the JS RED witness is sufficient here.
     expect(result.passed).toBe(true);
+    expect(result.log).toContain('base-fail=0/1; red-witness=1/1; verdict=proved; red-missing-at-base=1');
   });
 
   test('Swift-only 변경은 빈 Bun testArgs여도 iOS runner를 한 번 부른다', async () => {
@@ -2746,7 +2780,10 @@ describe('defaultSeams — docs-only gate scope', () => {
       const gateResult = await defaultSeams({
         gateSteps: ['test'],
         runHarnessPolicyGates: () => ({ passed: true, failures: [] }),
-        runVerifyByBreaking: () => ({ files: [], baseStatuses: { pass: 0, 'test-fail': 0, unknown: 0 } }),
+        runVerifyByBreaking: () => ({
+          files: [{ file: testFile, classification: 'missing-at-base', base: { status: 'test-fail', log: 'base lacks new test' } }],
+          baseStatuses: { pass: 0, 'test-fail': 1, unknown: 0 },
+        }),
       }).gate(repo);
       expect(log).toHaveBeenCalledWith('self-implement', 'gate.scope', expect.objectContaining({
         'evaluated-changes': ['release/next.md', testFile],
@@ -3136,15 +3173,23 @@ describe('defaultSeams — changed test declaration observation', () => {
   afterEach(() => { rmSync(repo, { recursive: true, force: true }); });
 
   async function gate(capture?: (opts: { steps?: GateStepName[]; testArgs?: string[] }) => void) {
+    let editedTest = 'src/changed.test.js';
     return defaultSeams({
       runIntegrityGate: (_cwd, opts) => {
         capture?.(opts);
+        editedTest = opts.testArgs?.[0] ?? editedTest;
         return {
           passed: true,
           steps: [{ name: 'test', ok: true, skipped: false, summary: 'test passed' }],
           log: '',
         } satisfies GateResult;
       },
+      // These cases measure declaration counts; a separate test covers the
+      // no-RED-witness refusal. Keep that independent gate condition satisfied.
+      runVerifyByBreaking: () => ({
+        files: [{ file: editedTest, classification: 'distinguishes', base: { status: 'test-fail', log: 'base test failed' } }],
+        baseStatuses: { pass: 0, 'test-fail': 1, unknown: 0 },
+      }),
     }).gate(repo);
   }
 
@@ -4601,6 +4646,133 @@ describe('defaultSeams.gate — reverse verify-by-breaking routing', () => {
     return cwd;
   }
 
+  test('isolated new-files-only gate accepts structural RED with the real base verifier', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-structural-red-live-'));
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      writeFileSync(join(cwd, 'package.json'), '{"type":"module"}\n');
+      git(cwd, 'add', 'package.json');
+      git(cwd, 'commit', '-m', 'base without feature');
+      mkdirSync(join(cwd, 'test'), { recursive: true });
+      writeFileSync(join(cwd, 'feature.js'), 'export const feature = () => true;\n');
+      writeFileSync(join(cwd, 'test/feature.test.js'), "import { expect, test } from 'bun:test'; import { feature } from '../feature.js'; test('new feature', () => expect(feature()).toBe(true));\n");
+      git(cwd, 'add', '-N', 'feature.js', 'test/feature.test.js');
+
+      const gate = await defaultSeams({ gateSteps: ['test'] }).gate(cwd);
+      expect(gate.passed).toBe(true);
+      expect(gate.log).toContain('missing-at-base=1');
+      expect(gate.log).toContain('red-missing-at-base=1');
+      expect(gate.log).toContain('verdict=proved');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('edited test completes only with measured base FAIL and head PASS', async () => {
+    const cwd = changedGateRepo();
+    try {
+      const gate = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [{ name: 'test', ok: true, skipped: false, summary: 'pass', output: '1 pass' }], log: '[test] PASS' }),
+        runVerifyByBreaking: () => ({
+          baseStatuses: { pass: 0, 'test-fail': 1, unknown: 0 },
+          files: [{ file: 'test/edited.test.js', classification: 'distinguishes', base: { status: 'test-fail', log: '1 fail' } }],
+        }),
+        runReverseVerifyByBreaking: () => ({ ran: true, files: [], headStatuses: { pass: 1, 'test-fail': 0, unknown: 0 } }),
+      }).gate(cwd);
+      expect(gate.passed).toBe(true);
+      expect(gate.log).toContain('[changed-test-evidence] head=pass; base-fail=1/1; red-witness=1/1; verdict=proved');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('missing-at-base structural RED completes a new test whose fixed base cannot import a new module', async () => {
+    const cwd = changedGateRepo();
+    writeFileSync(join(cwd, 'test/new.test.js'), "import { test } from 'bun:test'; test('new module', () => {});\n");
+    git(cwd, 'add', '-N', 'test/new.test.js');
+    try {
+      const gate = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [{ name: 'test', ok: true, skipped: false, summary: 'pass', output: '2 pass' }], log: '[test] PASS' }),
+        runVerifyByBreaking: () => ({
+          baseStatuses: { pass: 0, 'test-fail': 0, unknown: 1 },
+          files: [{ file: 'test/new.test.js', classification: 'missing-at-base',
+            base: { status: 'unknown', log: "Cannot find module './new-module.js'" } }],
+        }),
+        runReverseVerifyByBreaking: () => ({ ran: false, files: [], headStatuses: { pass: 0, 'test-fail': 0, unknown: 1 } }),
+      }).gate(cwd);
+      expect(gate.passed).toBe(true);
+      expect(gate.log).toContain('[changed-test-evidence] head=pass; base-fail=0/2; red-witness=1/2; verdict=proved');
+      expect(gate.log).toContain('red-missing-at-base=1');
+      expect(gate.log).toContain('structural-red=the new test file is absent from the fixed base, so a runnable base assertion is not required');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ['base PASS', 'does-not-distinguish', 'pass'],
+    ['base unmeasured', 'unknown', 'unknown'],
+    ['base FAIL absent', 'distinguishes', 'pass'],
+  ] as const)('edited test with %s cannot complete', async (_reason, classification, status) => {
+    const cwd = changedGateRepo();
+    try {
+      const gate = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [{ name: 'test', ok: true, skipped: false, summary: 'pass', output: '1 pass' }], log: '[test] PASS' }),
+        runVerifyByBreaking: () => ({
+          baseStatuses: { pass: status === 'pass' ? 1 : 0, 'test-fail': 0, unknown: status === 'unknown' ? 1 : 0 },
+          files: [{ file: 'test/edited.test.js', classification, base: { status, log: status } }],
+        }),
+        runReverseVerifyByBreaking: () => ({ ran: true, files: [], headStatuses: { pass: 1, 'test-fail': 0, unknown: 0 } }),
+      }).gate(cwd);
+      expect(gate.passed).toBe(false);
+      expect(gate.log).toContain('verdict=unproved');
+      expect(gate.log).toContain('test/edited.test.js');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('one RED witness suffices even when another edited test already passes at base', async () => {
+    const cwd = changedGateRepo();
+    writeFileSync(join(cwd, 'test/new.test.js'), "import { test } from 'bun:test'; test('new', () => {});\n");
+    git(cwd, 'add', '-N', 'test/new.test.js');
+    try {
+      for (const status of ['test-fail', 'pass'] as const) {
+        const gate = await defaultSeams({
+          runIntegrityGate: () => ({ passed: true, steps: [{ name: 'test', ok: true, skipped: false, summary: 'pass', output: '2 pass' }], log: '[test] PASS' }),
+          runVerifyByBreaking: () => ({
+            baseStatuses: { pass: status === 'pass' ? 1 : 0, 'test-fail': 1, unknown: 0 },
+            files: [
+              { file: 'test/edited.test.js', classification: 'distinguishes' as const, base: { status: 'test-fail' as const, log: '1 fail' } },
+              { file: 'test/new.test.js', classification: 'missing-at-base' as const, base: { status, log: status } },
+            ],
+          }),
+          runReverseVerifyByBreaking: () => ({ ran: true, files: [], headStatuses: { pass: 1, 'test-fail': 0, unknown: 0 } }),
+        }).gate(cwd);
+        expect(gate.passed).toBe(true);
+        expect(gate.log).toContain('base-fail=1/2; red-witness=2/2; verdict=proved; red-missing-at-base=1');
+      }
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('missing base measurement cannot complete a passing head gate', async () => {
+    const cwd = changedGateRepo();
+    try {
+      const gate = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [{ name: 'test', ok: true, skipped: false, summary: 'pass', output: '1 pass' }], log: '[test] PASS' }),
+        runVerifyByBreaking: () => ({ baseStatuses: { pass: 0, 'test-fail': 0, unknown: 0 }, files: [] }),
+      }).gate(cwd);
+      expect(gate.passed).toBe(false);
+      expect(gate.log).toContain('no-red-witness=test/edited.test.js');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('gate 통과 시 네 정방향 분류를 기존 역방향 verifier에 한 번 요청한다', async () => {
     const cwd = changedGateRepo();
     const calls: string[][] = [];
@@ -5031,5 +5203,60 @@ describe('openPr — 같은 칸 카드 재결속 사유 분리', () => {
     expect(outcome.number).toBe(NEW_PR);
     expect(outcome.rebind).toMatchObject({ outcome: 'already-rebound', reason: 'already-rebound', newPr: NEW_PR });
     expect(rebindEvents()).toContain('same-cell-card-rebind-already-rebound');
+  });
+});
+
+describe('TDD-SUPERVISOR-IMPOSSIBLE-EVIDENCE — 구조적으로 불가능한 증거 요구는 UNCONVERGEABLE 이 아니다', () => {
+  // 10-22 #30254 사건: base 에 없는 신규 장치 시험 → [changed-test-evidence] verdict=unproved(base-fail 0/1) 가
+  // 라운드마다 «같은 지적 반복» 으로 세져 감독이 UNCONVERGEABLE 을 냈다. 신규 파일은 base 에서 실패할 수 없다.
+  const impossibleNote = '[리뷰 must-fix]\n1. 새 장치 시험이 베이스에 없는 신규 모듈만 의존해 적색 증인 없이 unproved 로 남는다\n\n[changed-test-evidence] head=pass; base-fail=0/1; verdict=unproved\n- src/ux-sim/new-device.test.ts: missing-at-base';
+
+  test('불가능 증거 요구 반복 ⊕ 감독 UNCONVERGEABLE → CONTRACT-CONFLICT 로 바꾸고 관측 한 줄', async () => {
+    const events: Record<string, unknown>[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((_c: string, event: string, data?: Record<string, unknown>) => {
+      if (event === 'supervisor-impossible-evidence') events.push(data ?? {});
+    }) as never);
+    try {
+      const seams = defaultSeams({ llmReview: async () => 'BUDGET: UNCONVERGEABLE\nREASON: 같은 지적 반복\n1) ...' });
+      const out = await seams.diagnose!({
+        runId: 'run-impossible', note: impossibleNote, kind: 'review', round: 2, cwd: '/tmp',
+        goal: 'goal acceptance', history: ['[1] same'], effectiveMax: 3, purpose: 'budget',
+      });
+      expect(out.split('\n')[0]).toBe('BUDGET: CONTRACT-CONFLICT');
+      expect(out.split('\n')[1]).toStartWith('REASON: 구조적으로 불가능한 증거 요구');
+      expect(out).toContain('같은 지적 반복');
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ runId: 'run-impossible', round: 2, from: 'UNCONVERGEABLE', to: 'CONTRACT-CONFLICT' });
+      expect((events[0]!.markers as string[]).length).toBeGreaterThan(0);
+    } finally { log.mockRestore(); }
+  });
+
+  test('불가능 증거 표지가 없으면 UNCONVERGEABLE 그대로(일반 반복 판정은 보존)', async () => {
+    const seams = defaultSeams({ llmReview: async () => 'BUDGET: UNCONVERGEABLE\nREASON: 같은 지적 반복' });
+    const out = await seams.diagnose!({
+      runId: 'run-plain', note: '[리뷰 must-fix]\n1. 오류 처리 누락이 세 라운드째 그대로다', kind: 'review', round: 2, cwd: '/tmp',
+      goal: 'goal acceptance', history: ['[1] same'], effectiveMax: 3, purpose: 'budget',
+    });
+    expect(out.split('\n')[0]).toBe('BUDGET: UNCONVERGEABLE');
+  });
+
+  test('UNCONVERGEABLE 이 아닌 판정은 손대지 않는다', async () => {
+    const seams = defaultSeams({ llmReview: async () => 'BUDGET: EXTEND\nREASON: 좁아짐' });
+    const out = await seams.diagnose!({
+      runId: 'run-extend', note: impossibleNote, kind: 'review', round: 1, cwd: '/tmp',
+      goal: 'goal acceptance', history: [], effectiveMax: 3, purpose: 'budget',
+    });
+    expect(out.split('\n')[0]).toBe('BUDGET: EXTEND');
+  });
+
+  test('감독 프롬프트가 불가능 증거·다음 조각 몫 갈래를 말한다', async () => {
+    let seen = '';
+    const seams = defaultSeams({ llmReview: async (p: string) => { seen = p; return 'BUDGET: EXTEND\nREASON: test'; } });
+    await seams.diagnose!({
+      runId: 'run-prompt', note: 'gate failed', kind: 'gate', round: 1, cwd: '/tmp',
+      goal: 'goal acceptance', history: [], effectiveMax: 3, purpose: 'budget',
+    });
+    expect(seen).toContain('구조적으로 불가능한 증거 요구');
+    expect(seen).toContain('다음 조각 몫');
   });
 });

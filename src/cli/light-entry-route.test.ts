@@ -24,8 +24,10 @@ describe('light CLI entry routing', () => {
     expect(selectLightCliRoute(['config', 'get', 'llm.provider', '--reveal=true'])).toBeUndefined();
     expect(selectLightCliRoute(['release', 'checklist', 'status', '--version', '0.2.33'])).toBe('release');
     expect(selectLightCliRoute(['release', 'checklist', 'list', '--version', '0.2.35', '--json'])).toBe('release');
-    expect(selectLightCliRoute(['tasks', 'show', 'CARD-ID'])).toBe('tasks');
-    expect(selectLightCliRoute(['tasks', 'list', '--status', 'active'])).toBe('tasks');
+    expect(selectLightCliRoute(['tasks', 'show', 'CARD-ID'])).toBe('tasks-read');
+    expect(selectLightCliRoute(['tasks', 'list', '--status', 'active'])).toBe('tasks-read');
+    expect(selectLightCliRoute(['tasks', '--help'])).toBe('tasks');
+    expect(selectLightCliRoute(['tasks', '-h'])).toBe('tasks');
     expect(selectLightCliRoute(['tasks', 'hand', '--help'])).toBe('tasks');
     expect(selectLightCliRoute(['pty', 'list'])).toBe('pty');
     expect(selectLightCliRoute(['pty', 'snapshot', 'tui:1'])).toBe('pty');

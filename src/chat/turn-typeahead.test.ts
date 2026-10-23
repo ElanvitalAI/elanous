@@ -11,6 +11,7 @@ import {
   drainedIntoTurn,
   restoreTurnTypeaheadSubmission,
 } from './turn-typeahead.js';
+import { createPasteFold } from './paste-fold.js';
 import { tuiSourceText } from '../../test/helpers/dashboard-source.js';
 
 const key = (name: string) => ({ name });
@@ -277,5 +278,66 @@ describe('queuedPendingIds 칸 모양', () => {
     expect('queuedPendingIds' in state).toBe(false);
     const drained = drainTurnTypeaheadQueue(attachTurnTypeaheadPendingId({ buffer: '', queuedSubmissions: ['b'] }, 0, 'pending-y'));
     expect('queuedPendingIds' in drained.state).toBe(false);
+  });
+});
+
+describe('TUI-PASTE-WHILE-STREAMING — 턴 중 붙여넣기는 버리지 않는다', () => {
+  const paste = (text: string) => ({ name: 'paste', paste: text });
+  const enter = { name: 'enter' };
+  const long = Array.from({ length: 50 }, (_, i) => `busy-line-${i}`).join('\n');
+
+  test('반례: busy 상태에서 짧은 붙여넣기 → 버퍼에 그대로 보존(소유)', () => {
+    const r = applyTurnTypeaheadKey({ ...createTurnTypeaheadState(), buffer: '앞 ' }, paste('busy-paste-short'));
+    expect(r.consumed).toBe(true);
+    expect(r.state.buffer).toBe('앞 busy-paste-short');
+    expect(r.pasted).toEqual({ folded: false, lines: 1, chars: 16 });
+  });
+
+  test('긴 붙여넣기 → 버퍼는 자리표시 토큰 · Enter 하면 원문 전부가 FIFO 로', () => {
+    const a = applyTurnTypeaheadKey(createTurnTypeaheadState(), paste(`${long}\r\n`));
+    expect(a.state.buffer).toBe('[붙여넣음 #1 · 50줄 · ' + long.length + '자]');
+    expect(a.pasted?.folded).toBe(true);
+    const b = applyTurnTypeaheadKey({ ...a.state, buffer: `${a.state.buffer} 요약해 줘` }, enter);
+    expect(b.submissionDisposition).toBe('fifo');
+    expect(b.state.queuedSubmissions).toEqual([`${long}\n 요약해 줘`]);
+    expect(b.state.buffer).toBe('');
+    expect(b.state.pastes).toBeUndefined();
+  });
+
+  test('r1 반례: 끝 줄바꿈은 보존한다 — 짧은 글은 버퍼에 그대로 · 긴 글은 제출 원문에', () => {
+    expect(applyTurnTypeaheadKey(createTurnTypeaheadState(), paste('hello\r\n')).state.buffer).toBe('hello\n');
+    const a = applyTurnTypeaheadKey(createTurnTypeaheadState(), paste(`${long}\n`));
+    expect(a.state.buffer).toBe('[붙여넣음 #1 · 50줄 · ' + long.length + '자]');
+    expect(applyTurnTypeaheadKey(a.state, enter).state.queuedSubmissions).toEqual([`${long}\n`]);
+  });
+
+  test('토큰 끝에서 Backspace 는 토큰 통째로 지우고 원문도 놓는다', () => {
+    const a = applyTurnTypeaheadKey(createTurnTypeaheadState(), paste(long));
+    const b = applyTurnTypeaheadKey(a.state, { name: 'backspace' });
+    expect(b.state.buffer).toBe('');
+    expect(b.state.pastes).toBeUndefined();
+  });
+
+  test('제출 안 한 붙여넣기는 턴 끝 prefill·중단 복원 때 토큰째 ⊕ 원문 짝을 같이 넘긴다', () => {
+    const a = applyTurnTypeaheadKey(createTurnTypeaheadState(), paste(long));
+    const token = a.state.buffer;
+    expect(dequeueTurnTypeaheadHandoff(a.state).handoff).toEqual({ kind: 'prefill', text: token, pastes: [[token, long]] });
+    const once = drainTurnTypeaheadOnce(a.state, undefined);
+    expect(once.nextInitial).toBe(token);
+    expect(once.initialPastes).toEqual([[token, long]]);
+    const queued = { ...a.state, queuedSubmissions: ['먼저'] };
+    const restored = drainTurnTypeaheadOnce(queued, undefined, { interrupted: true });
+    expect(restored.nextInitial).toBe(`먼저\n${token}`);
+    expect(restored.initialPastes).toEqual([[token, long]]);
+  });
+
+  test('넘겨받은 입력창의 pasteFold 는 짝을 받아 제출 때 원문으로 편다 · 새 붙여넣기 번호는 겹치지 않는다', () => {
+    const a = applyTurnTypeaheadKey(createTurnTypeaheadState(), paste(long));
+    const fold = createPasteFold(() => {});
+    fold.adopt([[a.state.buffer, long]]);
+    const next = fold.fold(`${long}\nmore`);
+    expect(next).not.toBe(a.state.buffer);
+    expect(next.startsWith('[붙여넣음 #2 ')).toBe(true);
+    expect(fold.expand(`${a.state.buffer} 끝`)).toBe(`${long} 끝`);
   });
 });

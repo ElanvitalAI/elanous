@@ -131,7 +131,106 @@ describe('isScopeRevertMustFix — 범위 사유 되돌림/분리 관측 분류'
   });
 });
 
+describe('parseReviewResult — SCOPE-ESCAPE-AS-REFINE 범위-되돌림 must-fix 강등(결정론)', () => {
+  const scopeRevert = 'decomposeShadowGoals 의 소비 변경은 이 목표와 무관하니 되돌리거나 별도 PR 로 분리해야 한다';
+  it('범위-되돌림 must-fix 한 줄 → shouldFix 로 강등 · 남은 블로커가 없으면 FAIL → WARN · debug.log 에 강등 사실', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const r = parseReviewResult(`VERDICT: FAIL\nMUST-FIX:\n- ${scopeRevert}\nSHOULD-FIX:\n- 이름이 길다`);
+      console.log(`[scope-revert-demoted] ${JSON.stringify({ verdict: r.verdict, mustFix: r.mustFix, shouldFix: r.shouldFix, scopeRevertDemoted: r.scopeRevertDemoted })}`);
+      expect(r.mustFix).toEqual([]);
+      expect(r.shouldFix).toEqual(['이름이 길다', scopeRevert]);
+      expect(r.scopeRevertDemoted).toEqual([scopeRevert]);
+      expect(r.verdict).toBe('warn');
+      expect(log.mock.calls.some(([category, event, data]) => category === 'review.parse' && event === 'scope-revert-demoted'
+        && (data as { count?: number; verdictBefore?: string; verdictAfter?: string }).count === 1
+        && (data as { verdictBefore?: string }).verdictBefore === 'fail' && (data as { verdictAfter?: string }).verdictAfter === 'warn')).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
+  it('다른 블로커가 남으면 FAIL 유지 · 그 블로커만 must-fix', () => {
+    const r = parseReviewResult(`VERDICT: FAIL\nMUST-FIX:\n- ${scopeRevert}\n- 테스트가 clean 갈래를 검증하지 않는다`);
+    expect(r).toMatchObject({ verdict: 'fail', mustFix: ['테스트가 clean 갈래를 검증하지 않는다'], scopeRevertDemoted: [scopeRevert] });
+    expect(r.shouldFix[0]).toBe(scopeRevert);
+  });
+
+  it('삭제·보호 경로를 되돌리라는 지적은 강등하지 않는다(자동 정지 사유와 같은 선)', () => {
+    for (const keep of [
+      '범위 밖 파일 src/a.ts 삭제는 목표와 무관하니 되돌려야 한다',
+      '.rules/core.md 수정은 범위 밖이니 되돌려라',
+      'credentials 파일 편집은 out of scope — revert it',
+    ]) {
+      const r = parseReviewResult(`VERDICT: FAIL\nMUST-FIX:\n- ${keep}`);
+      expect(r.mustFix).toEqual([keep]);
+      expect(r.verdict).toBe('fail');
+      expect(r).not.toHaveProperty('scopeRevertDemoted');
+    }
+  });
+
+  it('영어 «remove it» 은 되돌림 동사라 강등 · «deleted file» 은 삭제 지적이라 유지 · 강등분이 원래 should-fix 를 밀어내지 않는다', () => {
+    const revertEn = 'This unrelated change is out of scope — remove it and split into a separate PR';
+    const deleteEn = 'The deleted file src/a.ts is out of scope — revert it';
+    const r = parseReviewResult(`VERDICT: FAIL\nMUST-FIX:\n- ${revertEn}\n- ${deleteEn}\nSHOULD-FIX:\n${['a', 'b', 'c', 'd', 'e', 'f'].map((x) => `- ${x}`).join('\n')}`);
+    expect(r).toMatchObject({ verdict: 'fail', mustFix: [deleteEn], scopeRevertDemoted: [revertEn] });
+    expect(r.shouldFix).toEqual(['a', 'b', 'c', 'd', 'e', 'f']);
+  });
+
+  it('범위-되돌림이 없으면 결과 모양이 그대로다(scopeRevertDemoted 키 없음)', () => {
+    expect(parseReviewResult('VERDICT: FAIL\nMUST-FIX:\n- 테스트 누락')).toEqual({ verdict: 'fail', mustFix: ['테스트 누락'], shouldFix: [] });
+  });
+});
+
 describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
+  it('REVIEW-MUSTFIX-NONE-NORMALIZE — 오늘 ACP #30199/#30188/#30183 무결함 원문만 접고 실제 결함은 보존한다', () => {
+    const noFindings = [
+      '(없음)', '[]', '(없음 — 막는 결함은 찾지 못했다.)',
+      '(없음) #30188(UX)과 #30189(MK)는 서로 다른 파일만 고쳐서 글자 단위로 겹치는 곳이 없습니다. 합친 뒤에 새로 생긴 회귀도 찾지 못했습니다.',
+      '없음. 네 고침 모두 지금 저장소 계약과 맞는다. 하나씩 대조했다.',
+      '`catalog.yaml:24` kinds 끝에 `classify`가 있다.',
+      '`research-loop.yaml`은 노드 26개이고 `entry_node: intake`다.',
+      '`self-implement.ts:247`이 `cwd-repository`를 돌려준다.',
+      '기본 확장 판정(`scope-adjacency.ts:121`)은 삭제를 `deletion` 정지 사유로 본다.',
+      "`tier-split.ts`의 `planTierSplit`은 두 경우를 `kind:'blocked'`로 돌려보냅니다.",
+      'device-test 조각 없이 feature 조각만 있는 경우: `device-first-stage-missing`',
+      'device-test 조각이 2개 이상이거나, 첫 조각이 아니거나, 그 뒤에 feature가 아닌 조각이 섞인 경우: `device-first-order-invalid`',
+      '이 반환은 `tier-split.ts:114`에서 `handTask({ ...hand, tierSplitBlocked: plan.reason })` 한 곳으로만 이어집니다. decomposer의 timeout이나 throw도 같은 blocked 경로를 탑니다.',
+      '`task-hand.ts`는 다음 세 줄에서 이 경우를 처리합니다.',
+      "`:1066`: 카드 status를 `'failed'`로 정하고, history에 `tier-split-failed: <reason>`을 남깁니다.",
+    ];
+    const raw = (items: string[]) => `VERDICT: WARN\nMUST-FIX:\n${items.map(item => `- ${item}`).join('\n')}\nSHOULD-FIX:\n- 문면 보완`;
+    expect(parseReviewResult(raw(noFindings)).mustFix).toEqual([]);
+    const real = ['(없음 — 인증 검사가 없어 권한 없이 배포 가능)', 'README 링크가 깨짐', '테스트가 clean 갈래를 검증하지 않는다'];
+    expect(parseReviewResult(raw([...noFindings, ...real])).mustFix).toEqual(real);
+    expect(parseReviewResult(raw([...noFindings, ...real])).shouldFix).toEqual(['문면 보완']);
+    // The persisted ACP JSONs contain mustFix arrays, not the raw VERDICT response.
+    // Keep each saved array's original item boundaries instead of only merging the lines above.
+    const storedArrays = [
+      noFindings.slice(3, 4), // #30199
+      noFindings.slice(4, 9), // #30188
+      noFindings.slice(9, 15), // #30183
+    ];
+    for (const saved of storedArrays) {
+      expect(parseReviewResult(raw(saved)).mustFix).toEqual([]);
+      expect(parseReviewResult(raw([...saved, '실제 결함: 인증 검사가 누락됨'])).mustFix)
+        .toEqual(['실제 결함: 인증 검사가 누락됨']);
+    }
+    for (const finding of [
+      '(없음) #30188(UX)과 #30189(MK)는 겹치지 않지만 README 링크가 깨짐',
+      '없음. 네 고침 모두 맞지만 인증 검사가 없어 권한 없이 배포 가능',
+      '`catalog.yaml:24` kinds 끝에 `classify`가 없다.',
+      '`tier-split.ts`의 `planTierSplit`은 blocked를 돌려보내지만 launcher가 계속 실행된다.',
+      '[] 인증 검사가 없어 누구나 접근할 수 있다.',
+    ]) {
+      expect(parseReviewResult(raw([finding])).mustFix).toEqual([finding]);
+    }
+    expect(parseReviewResult(raw(['(없음)', '실제 결함: 인증 검사가 누락됨'])).mustFix).toEqual(['실제 결함: 인증 검사가 누락됨']);
+  });
+  it('REVIEW-MUSTFIX-NONE-TEXT — 괄호 없는 없음 대시 무소견 문구는 0건으로 접고 실제 지적은 보존한다', () => {
+    const raw = (item: string) => `VERDICT: WARN\nMUST-FIX:\n- ${item}`;
+    expect(parseReviewResult(raw('없음 — 블로커 결함 없음')).mustFix).toEqual([]);
+    expect(parseReviewResult(raw('없음 — 인증 검사가 없어 권한 없이 배포 가능')).mustFix)
+      .toEqual(['없음 — 인증 검사가 없어 권한 없이 배포 가능']);
+  });
   it('GLM 괄호 무소견·빈 항목은 0건, 실제 지적은 보존한다', () => {
     for (const placeholder of [
       '', '  ', '(없음 …)', '(해당 없음...)', '(none.)', '(n/a)', '(no blocker)',

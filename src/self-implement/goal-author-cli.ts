@@ -277,6 +277,7 @@ export async function runGoalAuthorCli(
   const authorGrade = opts.authorGrade ?? resolveGoalAuthorGrade(undefined, getUserConfig().harness?.authorGrade);
   const recentStepCounts = authorGrade.grade === 'lite' ? undefined : readRecentStepCountsFailOpen(deps.recentStepCountReader);
   const decomposeSteps = authorGrade.grade === 'lite' ? undefined : deps.decomposeSteps ?? (deps.createDecomposeSteps ?? createGoalAuthorDecomposeSteps)(undefined, {
+    repositoryRoot: opts.groundingCwd ?? opts.cwd,
     ...(adversarialReview !== undefined ? { adversarialReview, adversarialReviewSource: 'cli' as const } : {}),
     ...(recentStepCounts !== undefined ? { recentStepCounts } : {}),
   });

@@ -28,6 +28,24 @@ function findGraphFile(graphId: string): string | undefined {
 
 export function registerGraphCommands(program: Command, runsDeps: { root?: string; processStartMs?: (pid: number) => number | null } = {}): void {
   const graph = program.command('graph').description('Run a declared command graph or inspect its latest run');
+  graph.command('wizard-run <request>')
+    .description('Run one request through the smart wizard graph and stop at its approval gate')
+    .option('--json', 'Print run identity and transitions as JSON')
+    .action(async (request: string, opts: { json?: boolean }) => {
+      try {
+        await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
+        const { runWizardRequest } = await import('../smart-wizard/run.js');
+        const result = await runWizardRequest(request);
+        const summary = { graphId: result.state.graphId, runId: result.runId, status: result.status,
+          path: result.path, transitions: result.transitions };
+        if (opts.json) await writeStdoutJson(JSON.stringify(summary) + '\n');
+        else console.log(`${summary.graphId} ${summary.runId}: ${summary.status} (${summary.path.join(' → ')})`);
+        if (result.status !== 'awaiting-approval' && result.status !== 'done') process.exitCode = 1;
+      } catch (error) {
+        console.error(`graph wizard-run: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
   graph.command('run <file>')
     .option('--dry-run', 'Walk the success path without executing commands')
     .option('--json', 'Print run state as JSON')

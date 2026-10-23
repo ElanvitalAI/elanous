@@ -14,7 +14,7 @@
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
-  buildAgentTool, dispatchAgent, AGENT_TOOL_DEFAULT_MAX_TURNS,
+  buildAgentTool, dispatchAgent, AGENT_TOOL_DEFAULT_MAX_TURNS, applySpawnToolFilter, subagentHonorsModelAllow,
 } from '../src/skills/tools/agent';
 import { globalAgentRegistry } from '../src/agent/registry';
 import type { AgentDefinition } from '../src/agent/types';
@@ -101,8 +101,8 @@ describe('buildAgentTool', () => {
     const spec = buildAgentTool();
     const props = spec.parameters.properties as Record<string, any>;
     const description = props.tool_filter.description as string;
-    expect(description).toMatch(/omit.*inherit.*parent/i);
-    expect(description).toMatch(/over-narrowing.*unable to complete/i);
+    expect(description).toMatch(/inherits the parent.*full tool registry/i);
+    expect(description).toMatch(/allow.*ignored unless the user explicitly enabled/i);
   });
 });
 
@@ -230,7 +230,11 @@ describe('dispatchAgent — Agent tool stripped from child', () => {
 
 // ── Wave 5 E1 — per-spawn tool_filter (registry isolation) ──
 
-describe('dispatchAgent — tool_filter (Wave 5 E1)', () => {
+describe('dispatchAgent — tool_filter (Wave 5 E1 · 사람이 좁히기를 켠 경우 · ELANOUS_SUBAGENT_HONOR_ALLOW=1)', () => {
+  // SUBAGENT-NO-NARROWING — 아래 좁히기 계약은 «명시 켬»에서만 산다. 기본(끔)은 다음 describe.
+  let prevHonor: string | undefined;
+  beforeEach(() => { prevHonor = process.env.ELANOUS_SUBAGENT_HONOR_ALLOW; process.env.ELANOUS_SUBAGENT_HONOR_ALLOW = '1'; });
+  afterEach(() => { if (prevHonor === undefined) delete process.env.ELANOUS_SUBAGENT_HONOR_ALLOW; else process.env.ELANOUS_SUBAGENT_HONOR_ALLOW = prevHonor; });
   function captureProvider(): { provider: LLMProvider; names: () => string[] } {
     let toolNames: string[] = [];
     const provider: LLMProvider = {
@@ -304,13 +308,88 @@ describe('dispatchAgent — tool_filter (Wave 5 E1)', () => {
     expect(cap.names().sort()).toEqual(['Edit', 'Read']);
   });
 
-  test('empty allow array = pure-text worker (no tools)', async () => {
+  // SUBAGENT-TOOLS-EMPTY (대표 10-22 «서브에이전트에 제약이 생기지 않게»): 빈 allow 는 «좁히기 없음» = 전부 상속.
+  test('empty allow array = no narrowing — the child inherits every tool', async () => {
     const cap = captureProvider();
     await dispatchAgent(
       { description: 'd', prompt: 'p', tool_filter: { allow: [] } },
       { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
     );
-    expect(cap.names()).toEqual([]);
+    expect(cap.names().sort()).toEqual(['Bash', 'Edit', 'Read', 'WebFetch']);
+  });
+
+  test('allow with only unknown names (name mismatch) is ignored with a warning — not 49→0', async () => {
+    const cap = captureProvider();
+    debug.enable();
+    debug.clear();
+    await dispatchAgent(
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['read_file', 'shell', 'grep'] } },
+      { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
+    );
+    expect(cap.names().sort()).toEqual(['Bash', 'Edit', 'Read', 'WebFetch']);
+    const text = debug.tail(20).join('\n');
+    expect(text).toContain('"allowIgnored":"no-known-names"');
+    expect(text).toContain('"unknownAllow":["read_file","shell","grep"]');
+  });
+
+  test('deny with only unknown names is ignored but logged at warn level (a typo must not pass silently)', async () => {
+    const cap = captureProvider();
+    debug.enable();
+    debug.clear();
+    await dispatchAgent(
+      { description: 'd', prompt: 'p', tool_filter: { deny: ['bash_tool'] } },
+      { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
+    );
+    expect(cap.names().sort()).toEqual(['Bash', 'Edit', 'Read', 'WebFetch']);
+    const row = debug.events().find((e) => e.category === 'agent.spawn' && e.event === 'tool-filter');
+    expect(row?.level).toBe('warn');
+    expect(JSON.stringify(row?.data)).toContain('"unknownDeny":["bash_tool"]');
+  });
+
+  test('allow mixing known and unknown names narrows to the known ones only', async () => {
+    const cap = captureProvider();
+    await dispatchAgent(
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'read_file'] } },
+      { provider: cap.provider, hostTools: tools, resolveAgentDef: () => def },
+    );
+    expect(cap.names()).toEqual(['Read']);
+  });
+
+  test('a filter that would leave 0 tools is refused (NOT SPAWNED · no provider call)', async () => {
+    let called = false;
+    const provider: LLMProvider = {
+      name: 'capture', defaultModel: 'd', available: () => true,
+      async *streamChat() { called = true; yield { type: 'text', delta: 'x' }; },
+      async *chat() {},
+    };
+    const r = await dispatchAgent(
+      { description: 'd', prompt: 'p', tool_filter: { deny: ['Bash', 'Read', 'Edit', 'WebFetch'] } },
+      { provider, hostTools: tools, resolveAgentDef: () => def },
+    );
+    expect(called).toBe(false);
+    expect(r.taskId).toBe('no-tools-refused');
+    expect(r.output).toContain('NOT SPAWNED');
+    expect(r.output).toContain('0 of 4 tools');
+  });
+
+  test('default general-purpose spawn keeps Read and the shell tool (반례)', async () => {
+    const cap = captureProvider();
+    const host: LLMToolSpec[] = [
+      { name: 'Read', description: '', parameters: { type: 'object' } },
+      { name: 'RunShell', description: '', parameters: { type: 'object' } },
+      { name: 'Grep', description: '', parameters: { type: 'object' } },
+      { name: 'Agent', description: '', parameters: { type: 'object' } },
+    ];
+    await dispatchAgent(
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'Bash'] } },
+      { provider: cap.provider, hostTools: host, resolveAgentDef: () => ({ ...stubDef, tools: ['Read', 'RunShell', 'Grep', 'Agent'] }) },
+    );
+    expect(cap.names()).toEqual(['Read']);
+    await dispatchAgent(
+      { description: 'd2', prompt: 'p2' },
+      { provider: cap.provider, hostTools: host, resolveAgentDef: () => ({ ...stubDef, tools: ['Read', 'RunShell', 'Grep', 'Agent'] }) },
+    );
+    expect(cap.names()).toEqual(expect.arrayContaining(['Read', 'RunShell']));
   });
 
   test('omitted tool_filter keeps the pre-filter behaviour (Agent stripped only)', async () => {
@@ -798,5 +877,55 @@ describe('dispatchAgent — consecutive-dedup runtime block', () => {
       );
       expect(r.output).toContain('DUPLICATE CALL');
     }
+  });
+});
+
+describe('SUBAGENT-NO-NARROWING — 기본은 모델이 넘긴 allow 를 무시하고 deny 만 반영', () => {
+  const host: LLMToolSpec[] = ['Bash', 'Read', 'Edit', 'WebFetch', 'Grep', 'Glob', 'Write', 'ListDir', 'RunShell', 'WebSearch', 'Agent']
+    .map((name) => ({ name, description: '', parameters: { type: 'object' } }));
+  const def: AgentDefinition = { ...stubDef, tools: host.map((t) => t.name) };
+  let prevHonor: string | undefined;
+  beforeEach(() => { prevHonor = process.env.ELANOUS_SUBAGENT_HONOR_ALLOW; delete process.env.ELANOUS_SUBAGENT_HONOR_ALLOW; });
+  afterEach(() => { if (prevHonor === undefined) delete process.env.ELANOUS_SUBAGENT_HONOR_ALLOW; else process.env.ELANOUS_SUBAGENT_HONOR_ALLOW = prevHonor; });
+  function capture() {
+    let names: string[] = [];
+    const provider: LLMProvider = {
+      name: 'capture', defaultModel: 'd', available: () => true,
+      async *streamChat(_m, opts) { names = (opts?.tools ?? []).map((t) => t.name); yield { type: 'text', delta: 'done' }; },
+      async *chat() {},
+    };
+    return { provider, names: () => names };
+  }
+
+  test('반례(10-22 n8n 실물 49→9): 아는 이름 allow 를 줘도 자식은 메인 도구 전부를 받는다 · 관측 model-allow-ignored', async () => {
+    const cap = capture();
+    await dispatchAgent(
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read', 'Bash'] } },
+      { provider: cap.provider, hostTools: host, resolveAgentDef: () => def },
+    );
+    expect(cap.names().sort()).toEqual(host.map((t) => t.name).filter((n) => n !== 'Agent').sort());
+    const r = applySpawnToolFilter(host, { allow: ['Read', 'Bash'] });
+    expect(r.allowIgnored).toBe('model-allow-ignored');
+    expect(r.tools.length).toBe(host.length);
+  });
+
+  test('deny 는 그대로 반영된다(allow 와 함께 와도)', async () => {
+    const cap = capture();
+    await dispatchAgent(
+      { description: 'd', prompt: 'p', tool_filter: { allow: ['Read'], deny: ['WebFetch', 'Write'] } },
+      { provider: cap.provider, hostTools: host, resolveAgentDef: () => def },
+    );
+    expect(cap.names()).not.toContain('WebFetch');
+    expect(cap.names()).not.toContain('Write');
+    expect(cap.names()).toContain('Bash');
+    expect(cap.names()).toContain('Grep');
+  });
+
+  test('켬 판정은 명시 값만 — 빈 값·0·false 는 끔', () => {
+    expect(subagentHonorsModelAllow({})).toBe(false);
+    expect(subagentHonorsModelAllow({ ELANOUS_SUBAGENT_HONOR_ALLOW: '0' })).toBe(false);
+    expect(subagentHonorsModelAllow({ ELANOUS_SUBAGENT_HONOR_ALLOW: 'false' })).toBe(false);
+    expect(subagentHonorsModelAllow({ ELANOUS_SUBAGENT_HONOR_ALLOW: '1' })).toBe(true);
+    expect(applySpawnToolFilter(host, { allow: ['Read'] }, { honorAllow: true }).tools.map((t) => t.name)).toEqual(['Read']);
   });
 });

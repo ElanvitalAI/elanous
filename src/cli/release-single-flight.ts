@@ -16,7 +16,7 @@ export class ReleaseRunClaimConflict extends Error {
   constructor() { super('release run claim already exists'); }
 }
 
-function isPidAlive(pid: number): boolean {
+export function isPidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;

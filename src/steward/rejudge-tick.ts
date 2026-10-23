@@ -63,8 +63,16 @@ function defaultStampPath(): string {
 function readStamp(path: string): string | null {
   try {
     const value = (JSON.parse(readFileSync(path, 'utf8')) as { startedAt?: unknown }).startedAt;
-    return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null;
-  } catch { return null; }
+    if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
+      throw new Error(`invalid steward stamp startedAt: ${path}`);
+    }
+    return value;
+  } catch (error) {
+    // A missing stamp is the first tick. A corrupt or unreadable existing stamp is not:
+    // claiming it would overwrite the evidence and could launch an overlapping rejudge.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 /** Same universe as this process (env inherited) · same installed version (entry next to this module). */

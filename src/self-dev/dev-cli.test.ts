@@ -712,6 +712,89 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(executed.supervisorStopReason).toBe('human-stopped');
   });
 
+  it('Pod 첫 child가 멈춘 뒤 PR head가 바뀌어도 다음 Pod를 발사하지 않고, 옛 marker는 새 호출을 막지 않는다', async () => {
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      logs.push({ event, data: data as Record<string, unknown> });
+    });
+    const invocationStartedAtMs = Date.now() - 60_000;
+    const prRepo = mkdtempSync(join(tmpdir(), 'ux-softstop-pr-head-'));
+    const gitFixture = (...args: string[]): string => {
+      const run = spawnSync('git', ['-C', prRepo, '-c', 'user.name=UX test', '-c', 'user.email=ux-test@example.invalid', ...args], { encoding: 'utf8' });
+      if (run.status !== 0) throw new Error(`git fixture failed: ${run.stderr}`);
+      return run.stdout.trim();
+    };
+    gitFixture('init', '-q');
+    gitFixture('commit', '--allow-empty', '-m', 'old PR head');
+    const oldHead = gitFixture('rev-parse', 'HEAD');
+    let newHead = '';
+    let observedBefore: string | undefined;
+    let observedAfter: string | undefined;
+    let launchedPods = 0;
+    let nextPodCount = 0;
+    try {
+      // The real execute callback is the Pod launcher seam. Its first child
+      // observes the old PR head, commits a newer head and accepts soft stop.
+      const stopped = await devCli.executeDevSelfRun('stop after PR head moved', async () => {
+        launchedPods += 1;
+        if (launchedPods === 1) {
+          observedBefore = gitFixture('rev-parse', 'HEAD');
+          gitFixture('commit', '--allow-empty', '-m', 'new PR head during child');
+          newHead = gitFixture('rev-parse', 'HEAD');
+          observedAfter = newHead;
+          return selfResult({ ok: false, stage: 'soft-stopped', runId: 'first-child', worktreePath: '/pod/first-child', checkedHeadCommit: newHead });
+        }
+        nextPodCount += 1;
+        return selfResult({ runId: 'next-pod', checkedHeadCommit: gitFixture('rev-parse', 'HEAD') });
+      }, {
+        rounds: 1,
+        invocationStartedAtMs,
+        readSoftStopRequest: () => null,
+      });
+      expect(observedBefore).toBe(oldHead);
+      expect(observedAfter).toBe(newHead);
+      expect(newHead).not.toBe(oldHead);
+      expect(launchedPods).toBe(1);
+      expect(stopped.result.checkedHeadCommit).toBe(newHead);
+      expect(nextPodCount).toBe(0);
+      expect(stopped.supervisorStopReason).toBe('human-stopped');
+      expect(logs).toContainEqual(expect.objectContaining({
+        event: 'soft-stop-honored',
+        data: expect.objectContaining({ spaceId: 'first-child', runId: 'first-child', source: 'child-stage', skipped: 'relaunch' }),
+      }));
+
+      // The host Pod adapter strips its container path from the disposition.
+      const podStopped = await devCli.executeDevSelfRun('Pod path unavailable after stop', async () => {
+        nextPodCount += 1;
+        return selfResult({ runId: 'forbidden-next-pod' });
+      }, { rounds: 1, readSoftStopRequest: () => null }, selfResult({ ok: false, stage: 'soft-stopped', runId: 'pathless-child' }));
+      expect(podStopped.supervisorStopReason).toBe('human-stopped');
+      expect(nextPodCount).toBe(0);
+      expect(logs).toContainEqual(expect.objectContaining({
+        event: 'soft-stop-honored',
+        data: expect.objectContaining({ spaceId: null, runId: 'pathless-child', source: 'child-stage' }),
+      }));
+
+      let launchedAfterFirst = 0;
+      const secondChildStopped = await devCli.executeDevSelfRun('stop during supervisor child', async () => {
+        launchedAfterFirst += 1;
+        return selfResult({ ok: false, stage: 'soft-stopped', runId: 'second-child' });
+      }, { rounds: 3, readSoftStopRequest: () => null }, selfResult({ worktreePath: '/pod/first-child' }));
+      expect(launchedAfterFirst).toBe(1);
+      expect(secondChildStopped.supervisorStopReason).toBe('human-stopped');
+
+      await devCli.executeDevSelfRun('old stop marker', async () => {
+        nextPodCount += 1;
+        return selfResult({ worktreePath: '/pod/new-child' });
+      }, {
+        rounds: 1,
+        invocationStartedAtMs: Date.now() - 1_000,
+        readSoftStopRequest: () => ({ version: 1, requestedAt: new Date(Date.now() - 60_000).toISOString() }),
+      }, selfResult({ worktreePath: '/pod/new-child' }));
+      expect(nextPodCount).toBe(1);
+    } finally { log.mockRestore(); rmSync(prRepo, { recursive: true, force: true }); }
+  });
+
   it('호출 시작보다 이른 정지는 여전히 옛 요청이다', async () => {
     let executions = 0;
     await devCli.executeDevSelfRun('stale before invocation', async () => {
@@ -2469,6 +2552,29 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     }));
   });
 
+  it('조각 배치 뒤 후속 child의 soft-stop을 마지막 부모 결과로 돌려준다', async () => {
+    let executions = 0;
+    const executed = await devCli.executeDevSelfRun('dependent-pieces stopped', async () => {
+      executions += 1;
+      return executions === 1 ? selfResult() : selfResult({ runId: 'stopped-after-shards', ok: false, stage: 'soft-stopped' });
+    }, {
+      rounds: 3,
+      executePiece: async () => selfResult(),
+      readSoftStopRequest: () => null,
+      readProposals: () => ({
+        proposals: new Map([['run-dev-supervision', { shardId: 'run-dev-supervision', pieces: [
+          { id: 'part-a', feature: 'part a', dependsOn: [] },
+          { id: 'part-b', feature: 'part b', dependsOn: ['part-a'] },
+        ] }]]), goalPlanRevisions: new Map(),
+        scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/ledger',
+      }),
+    });
+    expect(executions).toBe(2);
+    expect(executed.shardResults).toHaveLength(2);
+    expect(executed.result).toMatchObject({ runId: 'stopped-after-shards', stage: 'soft-stopped', ok: false });
+    expect(executed.supervisorStopReason).toBe('human-stopped');
+  });
+
   it('감독이 멈춘 뒤에도 확정 병합 조각의 결과와 완료 줄을 보존한다', async () => {
     const executed = await devCli.executeDevSelfRun('merged then stopped', async () => selfResult(), {
       rounds: 2,
@@ -2654,6 +2760,28 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  it('NEEDS-HUMAN-SELF-HEAL-FIRST: PR 없는 미분류 실패도 실제 dev 조각 실행기에서 한 번 승격한다', async () => {
+    const calls: string[] = [];
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      logs.push({ event, data: data as Record<string, unknown> });
+    });
+    try {
+      await devCli.executeDevSelfRun('unclassified goal', async () => selfResult({ ok: false, stage: 'error', outcome: 'abandoned' as never,
+        detail: 'TypeError: undefined is not a function' }), {
+        rounds: 2,
+        executePiece: async (piece) => { calls.push(piece); return selfResult({ stage: 'merged', merged: true }); },
+        readProposals: () => ({ proposals: new Map([['run-dev-supervision', { shardId: 'run-dev-supervision', pieces: [
+          { id: 'part-a', feature: 'part a', dependsOn: [] },
+          { id: 'part-b', feature: 'part b', dependsOn: [] },
+        ] }]]), goalPlanRevisions: new Map(), scannedFiles: 1, unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/ledger' }),
+      });
+      expect(calls).toEqual(['part a', 'part b']);
+      expect(logs.find(({ event }) => event === 'supervisor-self-heal')?.data).toMatchObject({
+        reason: 'supervisor-unclassified-decompose', attempt: 1, outcome: 'promoted', surface: 'dev' });
+    } finally { log.mockRestore(); }
   });
 
   it.each([

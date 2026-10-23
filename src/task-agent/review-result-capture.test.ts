@@ -11,7 +11,7 @@ import { regateResultPath } from './rejudge-on-head.js';
 import { capturedSelfReview, captureReviewResults, parseReviewResultOutput, rejudgeCompletedTaskReview, REVIEW_RESULT_MISSING_EFFECT, REVIEW_RESULT_UNREADABLE_EFFECT, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { nextMoveFor, readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
-import { repairReviewDigest } from './repair-review.js';
+import { repairReviewDigest, repairMustFixFromReview } from './repair-review.js';
 
 const HEAD = 'b'.repeat(40);
 const job = (over: Partial<SupervisorJobResult> = {}): SupervisorJobResult =>
@@ -279,6 +279,37 @@ describe('TA-REVIEW-RESULT-CAPTURE — 떼어 띄운 self review 결과를 파�
     expect(parseReviewResultOutput('')).toBeNull();
     // must-fix 목록이 아니면 «0» 이 아니라 «모름»(null) · 짧은 머리는 싣지 않는다.
     expect(parseReviewResultOutput(JSON.stringify({ pr: 21, verdict: 'pass', reviewed: true, mustFix: 'x', headCommit: 'abc', error: 'odd' }))).toMatchObject({ mustFix: null, head: null });
+  });
+
+  test('REVIEW-MUSTFIX-NONE-NORMALIZE — 저장 ACP 배열의 실제 경계가 TA capture/repair에서 0, 결함 혼합은 1', () => {
+    // Review artifacts #30199, #30188, #30183 only persist mustFix arrays, not the raw LLM response.
+    // Pin each persisted item boundary, then exercise both consumers of that JSON shape.
+    const saved: string[][] = [
+      ['(없음) #30188(UX)과 #30189(MK)는 서로 다른 파일만 고쳐서 글자 단위로 겹치는 곳이 없습니다. 합친 뒤에 새로 생긴 회귀도 찾지 못했습니다.'],
+      [
+        '없음. 네 고침 모두 지금 저장소 계약과 맞는다. 하나씩 대조했다.',
+        '`catalog.yaml:24` kinds 끝에 `classify`가 있다.',
+        '`research-loop.yaml`은 노드 26개이고 `entry_node: intake`다.',
+        '`self-implement.ts:247`이 `cwd-repository`를 돌려준다.',
+        '기본 확장 판정(`scope-adjacency.ts:121`)은 삭제를 `deletion` 정지 사유로 본다.',
+      ],
+      [
+        "`tier-split.ts`의 `planTierSplit`은 두 경우를 `kind:'blocked'`로 돌려보냅니다.",
+        'device-test 조각 없이 feature 조각만 있는 경우: `device-first-stage-missing`',
+        'device-test 조각이 2개 이상이거나, 첫 조각이 아니거나, 그 뒤에 feature가 아닌 조각이 섞인 경우: `device-first-order-invalid`',
+        '이 반환은 `tier-split.ts:114`에서 `handTask({ ...hand, tierSplitBlocked: plan.reason })` 한 곳으로만 이어집니다. decomposer의 timeout이나 throw도 같은 blocked 경로를 탑니다.',
+        '`task-hand.ts`는 다음 세 줄에서 이 경우를 처리합니다.',
+        "`:1066`: 카드 status를 `'failed'`로 정하고, history에 `tier-split-failed: <reason>`을 남깁니다.",
+      ],
+    ];
+    for (const findings of saved) {
+      const output = reviewJson({ mustFix: findings });
+      expect(parseReviewResultOutput(output)?.mustFix).toBe(0);
+      expect(repairMustFixFromReview(output, 21, HEAD)).toEqual([]);
+      const withBlocker = reviewJson({ mustFix: [...findings, '실제 결함: 인증 검사가 누락됨'] });
+      expect(parseReviewResultOutput(withBlocker)?.mustFix).toBe(1);
+      expect(repairMustFixFromReview(withBlocker, 21, HEAD)).toEqual(['실제 결함: 인증 검사가 누락됨']);
+    }
   });
 
   test('PR-LAND-MUSTFIX-NONE — 검증된 무소견 표지는 0 · 설명과 진짜 지적은 보존 · 빈 배열은 0', () => {

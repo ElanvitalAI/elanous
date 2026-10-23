@@ -1064,7 +1064,23 @@ export async function executeDevSelfRun(
 
     // ⛔ 슈퍼바이저 직전이 아니라 «호출 시작»이다 — 첫 런 도중의 정지도 이 호출의 정지다.
     const invocationStartedAt = supervise.invocationStartedAtMs ?? enteredAtMs;
-    const recordRestart = (kind: 'relaunch' | 'promoted-piece', previousResult: { worktreePath?: string }): boolean => {
+    const honorChildSoftStop = (kind: 'relaunch' | 'promoted-piece', previousResult: { worktreePath?: string; stage?: string; runId?: string }): boolean => {
+      // A Pod stop marker lives inside the child container, while its result intentionally
+      // omits the container worktree path. The child's soft-stopped stage is therefore the
+      // durable evidence available to this host before it decides to launch another Pod.
+      if (previousResult.stage !== 'soft-stopped') return false;
+      const spaceId = getHarnessSpace()?.id || normalizeSpaceId(basename(previousResult.worktreePath ?? ''));
+      supervisorStopReason = 'human-stopped';
+      try {
+        debug.log('self-dev.supervisor', 'soft-stop-honored', {
+          spaceId: spaceId || null, runId: previousResult.runId ?? null,
+          source: 'child-stage', skipped: kind === 'promoted-piece' ? 'piece' : kind, surface: 'dev',
+        });
+      } catch { /* fail-open */ }
+      return true;
+    };
+    const recordRestart = (kind: 'relaunch' | 'promoted-piece', previousResult: { worktreePath?: string; stage?: string; runId?: string }): boolean => {
+      if (honorChildSoftStop(kind, previousResult)) return true;
       const spaceId = getHarnessSpace()?.id || normalizeSpaceId(basename(previousResult.worktreePath ?? ''));
       writeHarnessStageFrame(spaceId, 'supervisor', `${kind} after ${Date.now() - invocationStartedAt}ms`);
       if (!spaceId) {
@@ -1091,6 +1107,10 @@ export async function executeDevSelfRun(
       }
     };
     retainConfirmedMerge(result);
+    if (honorChildSoftStop('relaunch', result)) {
+      triageDrafts();
+      return { result, supervisorStopReason: 'human-stopped' };
+    }
     await superviseRun({
       initial: [initialJob],
       // A review-oscillation repair goal runs through the existing piece executor (fragment re-execution with the
@@ -1169,6 +1189,10 @@ export async function executeDevSelfRun(
             const repairResult = recordResult(await supervise.executePiece(goal));
             retainConfirmedMerge(repairResult);
             if (shardResults === undefined) result = repairResult;
+            if (honorChildSoftStop('relaunch', repairResult)) {
+              result = repairResult;
+              return [];
+            }
             repaired.push({ ...asSupervisorJobResult(job.feature, repairResult), oscillationRepairOf: job.taskId });
           }
           // Jobs without a repair goal are not dropped: their last result stays in the round for the next decision.
@@ -1188,10 +1212,15 @@ export async function executeDevSelfRun(
                 pieceIndex: index, ...(base === undefined ? {} : { base }), surface: 'dev',
               });
             } catch { /* fail-open */ }
-            pieceResults.push(recordResult(await supervise.executePiece!(
+            const pieceResult = recordResult(await supervise.executePiece!(
               piece.feature,
               base === undefined ? undefined : { base },
-            )));
+            ));
+            if (honorChildSoftStop('promoted-piece', pieceResult)) {
+              result = pieceResult;
+              return [];
+            }
+            pieceResults.push(pieceResult);
           }
           shardResults = pieceResults.map((pieceResult, index) => asSupervisorJobResult(pieces[index]!.feature, pieceResult));
           const folded = foldDevShardResults(shardResults);
@@ -1213,9 +1242,14 @@ export async function executeDevSelfRun(
         const rerunResult = recordResult(await execute(relaunch));
         retainConfirmedMerge(rerunResult);
         if (shardResults === undefined) result = rerunResult;
+        if (honorChildSoftStop('relaunch', rerunResult)) {
+          result = rerunResult;
+          return [];
+        }
         return [asSupervisorJobResult(feature, rerunResult)];
       },
     });
+    if (result.stage === 'soft-stopped' && supervisorStopReason !== 'human-stopped') honorChildSoftStop('relaunch', result);
     if (supervisorStopReason === 'converged' && promotedDecomposition && (() => {
       try { return statSync(feature).isFile(); } catch { return false; }
     })()) {

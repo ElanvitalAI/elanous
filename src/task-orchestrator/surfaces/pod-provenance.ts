@@ -17,6 +17,8 @@ export interface PodProvenance {
   commit?: string;
   shard?: string;
   reason?: string;
+  /** Parent runId / lease id — whose child this Pod is. Label keeps the first 8 characters like run/commit. */
+  parent?: string;
   pool?: string;
   cpuReq?: string;
   memReq?: string;
@@ -28,10 +30,14 @@ const required = ['actorKind', 'actor', 'kind', 'run', 'phase', 'requestedAt'] a
 const names: Record<keyof PodProvenance, string> = {
   actorKind: 'actor-kind', actor: 'actor', kind: 'kind', run: 'run', phase: 'phase', requestedAt: 'requested-at',
   character: 'character', launchHost: 'launch-host', entrance: 'entrance', graphNode: 'graph-node', cell: 'cell',
-  version: 'version', commit: 'commit', shard: 'shard', reason: 'reason',
+  version: 'version', commit: 'commit', shard: 'shard', reason: 'reason', parent: 'parent',
   pool: 'pool', cpuReq: 'cpu-req', memReq: 'mem-req',
   warmReused: 'warm-reused', argv: 'argv',
 };
+
+/** Every child env name the set can carry (`ELANOUS_POD_<KEY>`). */
+export const POD_PROVENANCE_ENV_NAMES: readonly string[] = Object.values(names)
+  .map((name) => `ELANOUS_POD_${name.toUpperCase().replaceAll('-', '_')}`);
 
 const labelValue = (value: string): string => {
   const cleaned = value.toLowerCase().replace(/[^a-z0-9._-]/g, '-').replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '');
@@ -67,7 +73,7 @@ export function podProvenanceMetadata(input: Partial<PodProvenance> | undefined,
   const annotations: Record<string, string> = {};
   const env: Array<{ name: string; value: string }> = [];
   for (const [name, value] of Object.entries(values)) {
-    const label = name === 'run' || name === 'commit' ? value.slice(0, 8) : value;
+    const label = name === 'run' || name === 'commit' || name === 'parent' ? value.slice(0, 8) : value;
     if (name !== 'reason' && name !== 'argv') labels[`elanous.ai/${name}`] = labelValue(label);
     annotations[`elanous.ai/${name}`] = value;
     env.push({ name: `ELANOUS_POD_${name.toUpperCase().replaceAll('-', '_')}`, value });

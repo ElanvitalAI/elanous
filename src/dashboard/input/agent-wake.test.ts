@@ -237,12 +237,15 @@ describe('«다음 턴에 결과» — 알림이 결과를 먹지 않고 실제 
 describe('대시보드 배선 — 글자로 문다(showDashboard 지역 배선은 단위 시험이 닿지 않는다 · 라이브는 착지 뒤 TF)', () => {
   const src = readFileSync(resolve(import.meta.dir, '../index.ts'), 'utf8');
   test('task-notification onEnqueue 구독 정확히 1 · 설치 경로로만 · 주입 길 0', () => {
-    expect(src.match(/globalTaskNotificationQueue\.onEnqueue\(/g)).toHaveLength(1);
+    // TUI-SUBAGENT-RESULT-CAP — 구독은 subscribeDashboardAgentResults 한 곳을 지난다(onEnqueue 깨움 ⊕ onDrain 이력).
+    expect(src.match(/\.onEnqueue\(/g)).toHaveLength(1);
+    expect(src).toContain('const offWake = queue.onEnqueue(listener);');
+    expect(src.match(/subscribeDashboardAgentResults\(\s*globalTaskNotificationQueue,/g)).toHaveLength(1);
     expect(src.match(/installAgentWake\(\{/g)).toHaveLength(1);
     expect(src).not.toMatch(/createAgentWake\(/);
     const at = src.indexOf('const agentWake = installAgentWake({');
     const block = src.slice(at, src.indexOf('    });\n', at));
-    expect(block).toContain('subscribe: (listener) => globalTaskNotificationQueue.onEnqueue(listener),');
+    expect(block).toMatch(/subscribe: \(listener\) => subscribeDashboardAgentResults\(\s*globalTaskNotificationQueue, listener,/);
     expect(block).not.toMatch(/injectKey|hostControl|\.submit\(/);
     // 조각 2 — 턴은 H2 문으로만 · 판정 근거는 같은 큐.
     expect(block).toContain('startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts)');
@@ -253,7 +256,7 @@ describe('대시보드 배선 — 글자로 문다(showDashboard 지역 배선�
   });
   test('입력칸 문은 깨움 감싸기를 거친다(«대기» 재시도의 근거) · 감싸기는 정확히 1', () => {
     expect(src.match(/wrapAgentWakePort\(/g)).toHaveLength(1);
-    expect(src).toContain('const internalTurnYieldPort = wrapAgentWakePort(seatAutowake.wrapPort(internalTurnGate.port));');
+    expect(src).toContain('const internalTurnYieldPort = wrapAgentWakePort(goalContinue.wrapPort(seatAutowake.wrapPort(internalTurnGate.port)));');
   });
   test('대시보드 종료(closeDashboardTui)가 «자기» 구독을 푼다', () => {
     const at = src.indexOf('const closeDashboardTui = (): void => {');
@@ -268,7 +271,7 @@ describe('대시보드 배선 — 글자로 문다(showDashboard 지역 배선�
 // ── 조각 2 — 자리 TUI ∧ 유휴면 H2 문으로 다음 턴(TUI-AGENT-IDLE-WAKE-TURN) ─────────────────────
 describe('조각 2 — 자식 완료 ∧ 자리 TUI ∧ 유휴 → H2 문으로 한 턴(origin child-complete)', () => {
   /** 진짜 H2 문 ⊕ 진짜 큐 — 대시보드가 넘기는 것과 같은 모양. */
-  function seatHarness(over: { seat?: string | null; seatThrows?: boolean; queue?: TaskNotificationQueue; open?: boolean } = {}) {
+  function seatHarness(over: { seat?: string | null; seatThrows?: boolean; queue?: TaskNotificationQueue; open?: boolean; isPendingThrows?: string } = {}) {
     const logs: LogRow[] = [];
     const lines: string[] = [];
     const state = { running: false, buffer: '' as string | undefined, yields: 0 };
@@ -290,7 +293,10 @@ describe('조각 2 — 자식 완료 ∧ 자리 TUI ∧ 유휴 → H2 문으로 
     const openTurn: AgentWakeOpenTurnDeps = {
       startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
       getCwd: () => '/home/x/elanous-hq/seats/OPC',
-      isPending: (taskId) => queue.has(taskId),
+      isPending: (taskId) => {
+        if (over.isPendingThrows) throw new Error(over.isPendingThrows);
+        return queue.has(taskId);
+      },
       detectSeat: () => {
         if (over.seatThrows) throw new Error('EACCES');
         const seat = over.seat === undefined ? 'OPC' : over.seat;
@@ -368,6 +374,20 @@ describe('조각 2 — 자식 완료 ∧ 자리 TUI ∧ 유휴 → H2 문으로 
     h.mount(); h.flush();
     expect(h.opened()).toHaveLength(0);
     expect(h.wakeRows('rejected').at(-1)!.data).toMatchObject({ reason: 'already-carried' });
+  });
+
+  test('재시도 판정 중 isPending 이 던져도 깨움은 죽지 않고 사유 로그가 남는다(수복 경로의 관측 · reason error)', () => {
+    const h = seatHarness({ isPendingThrows: 'queue gone' });
+    h.mount();
+    h.state.running = true;
+    h.queue.enqueue(pending('t1')); // NotIdle → «대기»
+    expect(h.wakeRows('deferred')).toHaveLength(1);
+    h.state.running = false;
+    h.mount(); h.flush();
+    expect(h.opened()).toHaveLength(0);
+    expect(h.wakeRows('rejected').at(-1)!.data).toMatchObject({
+      taskId: 't1', trigger: 'input-mounted', reason: 'error', detail: 'queue gone',
+    });
   });
 
   test('사람이 입력칸에 쓰는 중 → H2 거부 사유 HumanTyping 그대로 · 버퍼 무접촉 · 턴 0', () => {

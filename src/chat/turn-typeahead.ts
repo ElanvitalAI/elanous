@@ -8,6 +8,8 @@
 // elanous: 스트리밍 키 사다리에서 printable/backspace/enter 를 이 버퍼로 보존
 // (에코는 호출측이 composer zone 에 직접 페인트), 턴 종료 시 FIFO로 넘긴다.
 
+import { pasteFoldToken, shouldFoldPaste } from './paste-fold.js';
+
 export interface TurnTypeaheadState {
   /** 아직 Enter 하지 않은 현재 작성 중 입력. */
   buffer: string;
@@ -23,6 +25,32 @@ export interface TurnTypeaheadState {
   steerPriority?: boolean;
   /** 이번 턴에 도구 경계로 들어간 수 — 큐가 비었을 때 «✓ 넣음» 줄로 보인다. 턴이 끝나면 지운다. */
   injectedCount?: number;
+  /**
+   * 턴 중 긴 붙여넣기 — 버퍼엔 `[붙여넣음 #k · N줄 · M자]` 토큰, 원문은 여기(TUI-PASTE-WHILE-STREAMING · 10-22).
+   * 제출·넘김 때 토큰을 원문으로 되돌린다. 짝이 없으면 칸을 두지 않는다.
+   */
+  pastes?: Array<[token: string, raw: string]>;
+  /** 토큰 번호 — 한 버퍼 안에서 겹치지 않게. */
+  pasteSeq?: number;
+}
+
+/** 버퍼 속 붙여넣기 토큰을 원문으로 되돌린다(한 번에 훑는다). 순수. */
+export function expandTurnTypeaheadPastes(text: string, pastes: TurnTypeaheadState['pastes']): { text: string; used: number } {
+  const held = (pastes ?? []).filter(([token]) => text.includes(token));
+  if (held.length === 0) return { text, used: 0 };
+  const map = new Map(held);
+  const re = new RegExp(held.map(([t]) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g');
+  return { text: text.replace(re, (m) => map.get(m) ?? m), used: held.length };
+}
+
+/** 버퍼(와 남길 글)에 더는 없는 붙여넣기 짝을 놓는다. 비면 칸을 뗀다. 순수. */
+function prunePastes(state: TurnTypeaheadState): TurnTypeaheadState {
+  if (!state.pastes) return state;
+  const live = state.pastes.filter(([token]) => state.buffer.includes(token));
+  if (live.length === state.pastes.length) return state;
+  if (live.length > 0) return { ...state, pastes: live };
+  const { pastes: _p, pasteSeq: _s, ...rest } = state;
+  return rest;
 }
 
 /** 큐 길이에 맞춘 id 짝(모자라면 null 로 채운다). 순수. */
@@ -95,6 +123,8 @@ export type TurnTypeaheadKeyResult = {
   releasedPendingIds?: string[];
   /** 빈 입력에서 Enter(대기 항목이 있을 때) = «지금 밀어 넣기» 요청. 판정·실행은 호출측의 책임이다. */
   pushNowRequested?: boolean;
+  /** 붙여넣기를 버퍼에 받았다 — 관측(`tui.paste`)은 호출측이 남긴다. */
+  pasted?: { folded: boolean; lines: number; chars: number };
 };
 
 /** 등록소 소유의 관측용 표시 조회. 이름·문법·실행 정책은 이 순수 판정기에 두지 않는다. */
@@ -123,17 +153,41 @@ export function applyTurnTypeaheadKey(
   state: TurnTypeaheadState,
   // ⭐ `shift`·`meta` 도 선언한다 — 상류 대시보드가 실제로 싣는 필드다. 구조적 타이핑이라
   //    선언이 없어도 런타임엔 들어오므로, 빠뜨리면 정확한 조합 판정을 타입으로 못 쓴다.
-  key: { name: string; ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean; mouse?: unknown; kind?: string },
+  key: { name: string; ctrl?: boolean; alt?: boolean; shift?: boolean; meta?: boolean; mouse?: unknown; kind?: string; paste?: string },
   isImmediateSubmission?: TurnTypeaheadImmediateSubmissionLookup,
 ): TurnTypeaheadKeyResult {
   if (key.mouse) return { state, consumed: false, changed: false };
   if (key.kind && key.kind !== 'press') return { state, consumed: false, changed: false };
 
+  // ⭐ 턴 중 붙여넣기 — 종전엔 소유하지 않아 스트리밍 사다리에서 조용히 버려졌다(10-22 설치본 99edcfa 재현).
+  //    짧은 글은 버퍼에 그대로 · 긴 글은 자리표시 토큰(원문은 `pastes`) · 제출하면 원문 전부가 FIFO 로 간다.
+  if (key.name === 'paste') {
+    // 원문(끝 줄바꿈 포함)은 그대로 쥐고 제출한다 — 줄 수·글자 수 표시만 끝 줄바꿈 하나를 빼고 센다(r1 must-fix · paste-fold 와 같은 규칙).
+    const raw = typeof key.paste === 'string' ? key.paste.replace(/\r\n?/g, '\n') : '';
+    const shown = raw.replace(/\n$/, '');
+    if (!raw) return { state, consumed: true, changed: false };
+    const lines = shown.split('\n').length;
+    if (!shouldFoldPaste(shown)) {
+      return { state: { ...state, buffer: state.buffer + raw }, consumed: true, changed: true, pasted: { folded: false, lines, chars: shown.length } };
+    }
+    const seq = (state.pasteSeq ?? 0) + 1;
+    const token = pasteFoldToken(seq, shown);
+    return {
+      state: { ...state, buffer: state.buffer + token, pastes: [...(state.pastes ?? []), [token, raw]], pasteSeq: seq },
+      consumed: true,
+      changed: true,
+      pasted: { folded: true, lines, chars: shown.length },
+    };
+  }
+
   if (key.name === 'backspace' && !key.ctrl && !key.alt) {
     if (!state.buffer) return { state, consumed: false, changed: false };
+    // 토큰 끝에서 지우면 토큰 «통째로»(반쯤 지운 토큰은 원문도 글도 아니다).
+    const tail = state.pastes?.find(([token]) => state.buffer.endsWith(token));
+    if (tail) return { state: prunePastes({ ...state, buffer: state.buffer.slice(0, -tail[0].length) }), consumed: true, changed: true };
     const cps = [...state.buffer];
     cps.pop();
-    return { state: { ...state, buffer: cps.join('') }, consumed: true, changed: true };
+    return { state: prunePastes({ ...state, buffer: cps.join('') }), consumed: true, changed: true };
   }
 
   // ⭐ 턴 중에도 Shift+Enter(⊕ Alt+Enter · Ctrl+J)는 «줄바꿈»이다 — 유휴 입력창과 같은 계약.
@@ -150,13 +204,15 @@ export function applyTurnTypeaheadKey(
       if (state.queuedSubmissions.length === 0) return { state, consumed: false, changed: false };
       return { state, consumed: true, changed: false, pushNowRequested: true };
     }
+    const submitted = expandTurnTypeaheadPastes(state.buffer, state.pastes).text;
+    const cleared = prunePastes({ ...state, buffer: '' });
     try {
       if (state.buffer.startsWith('/') && isImmediateSubmission?.(state.buffer)) {
         return {
-          state: { ...state, buffer: '' },
+          state: cleared,
           consumed: true,
           changed: true,
-          immediateSubmission: state.buffer,
+          immediateSubmission: submitted,
           submissionDisposition: 'immediate',
         };
       }
@@ -166,7 +222,7 @@ export function applyTurnTypeaheadKey(
     return {
       state: {
         buffer: '',
-        queuedSubmissions: [...state.queuedSubmissions, state.buffer],
+        queuedSubmissions: [...state.queuedSubmissions, submitted],
         ...idsField([...turnTypeaheadPendingIds(state), null]),
       },
       consumed: true,
@@ -213,7 +269,7 @@ export function restoreTurnTypeaheadSubmission(
 
 export type TurnTypeaheadHandoff =
   | { kind: 'none' }
-  | { kind: 'prefill'; text: string }
+  | { kind: 'prefill'; text: string; pastes?: Array<[token: string, raw: string]> }
   | { kind: 'submit'; text: string; pendingId?: string };
 
 /** 턴 종료 때 FIFO의 다음 항목 하나를 꺼낸다. 큐가 비면 미제출 buffer는 prefill한다. */
@@ -229,7 +285,9 @@ export function dequeueTurnTypeaheadHandoff(
     };
   }
   if (!state.buffer) return { handoff: { kind: 'none' }, state };
-  return { handoff: { kind: 'prefill', text: state.buffer }, state: createTurnTypeaheadState() };
+  // 토큰째 넘기고 짝도 같이 넘긴다 — 받는 입력창이 짝을 넘겨받아(`initialPastes`) 토큰으로 보이고 제출 때 편다.
+  const pastes = state.pastes?.filter(([token]) => state.buffer.includes(token));
+  return { handoff: { kind: 'prefill', text: state.buffer, ...(pastes?.length ? { pastes } : {}) }, state: createTurnTypeaheadState() };
 }
 
 /** 턴 범위 표시(최우선·넣음 수)를 지운다 — 다음 턴으로 넘기지 않는다. 순수. */
@@ -263,15 +321,19 @@ export function drainTurnTypeaheadOnce(
    *   composer 로 돌아간 글이 고치기 전 문면으로 모델에 들어간다(중단 복원).
    */
   releasedPendingIds: string[];
+  /** `nextInitial` 속 붙여넣기 토큰의 원문 — 받는 입력창에 `initialPastes` 로 넘긴다. */
+  initialPastes?: Array<[token: string, raw: string]>;
 } {
   state = clearTurnScopedMarks(state);
   if (opts?.interrupted && state.queuedSubmissions.length > 0) {
     const restored = [...state.queuedSubmissions, ...(state.buffer ? [state.buffer] : [])].join('\n');
+    const pastes = state.pastes?.filter(([token]) => state.buffer.includes(token));
     return {
       state: createTurnTypeaheadState(),
       nextInitial: carriedInitial ? `${carriedInitial}\n${restored}` : restored,
       injectEnter: false,
       releasedPendingIds: presentIds(turnTypeaheadPendingIds(state)),
+      ...(pastes?.length ? { initialPastes: pastes } : {}),
     };
   }
   const { handoff, state: remaining } = dequeueTurnTypeaheadHandoff(state);
@@ -283,6 +345,7 @@ export function drainTurnTypeaheadOnce(
     nextInitial: carriedInitial ? `${carriedInitial}${handoff.text}` : handoff.text,
     injectEnter: handoff.kind === 'submit',
     releasedPendingIds: handoff.kind === 'submit' && handoff.pendingId ? [handoff.pendingId] : [],
+    ...(handoff.kind === 'prefill' && handoff.pastes ? { initialPastes: handoff.pastes } : {}),
   };
 }
 

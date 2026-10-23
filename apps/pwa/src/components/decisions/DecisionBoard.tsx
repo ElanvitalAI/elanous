@@ -5,7 +5,19 @@ import { useDaemon } from '@/components/providers/DaemonProvider';
 import { decide, listOpenDecisions, listBoardNotices, replyToBoardNotice, type BoardNotice, type OpenDecision } from '@/lib/decisions-api';
 
 type Outcome = { label: string; at?: string };
+
 type BoardState = { items: OpenDecision[]; error: string | null; loading: boolean };
+
+const LEDGER_CELLS = [
+  { key: 'what', label: '무엇' },
+  { key: 'history', label: '지금까지' },
+  { key: 'precedent', label: '이전 같은 갈래 결정' },
+  { key: 'remeasure', label: '지금 상태 재측' },
+  { key: 'options', label: '선택지별 결과' },
+  { key: 'recommendation', label: '권고와 근거' },
+  { key: 'doNothing', label: '그냥 두면' },
+] as const;
+type LedgerCellKey = (typeof LEDGER_CELLS)[number]['key'];
 
 export function sortOpenDecisions(items: OpenDecision[]): OpenDecision[] {
   return [...items].sort((a, b) => (a.dueAt ? Date.parse(a.dueAt) : Infinity) - (b.dueAt ? Date.parse(b.dueAt) : Infinity)
@@ -17,6 +29,52 @@ const kst = (at: string) => new Intl.DateTimeFormat('ko-KR', {
 }).format(new Date(at));
 const field = (value?: string) => value?.trim() || '(비움)';
 const noteText = (value: string) => value.replace(/\s+/g, ' ').trim().slice(0, 300);
+
+const stamp = (at?: string) => (at ? `${kst(at)} KST` : '시각 미상');
+
+const HISTORY_LABELS: Record<string, string> = { raised: '올림', 'options-added': '선택지 추가', decided: '결정', withdrawn: '철회' };
+
+function ledgerCellText(card: OpenDecision, key: LedgerCellKey): string {
+  switch (key) {
+    case 'what': return card.title?.trim() || '미기재';
+    case 'history': {
+      const events = card.history ?? [];
+      if (events.length === 0) return `원장 기록 없음 · 제기 ${stamp(card.raisedAt)}`;
+      return events.map(event => [
+        stamp(event.at),
+        event.by,
+        HISTORY_LABELS[event.type] ?? event.type,
+        ...(event.choice ? [`→ ${event.choice}`] : []),
+        ...(event.reason?.trim() ? [`· ${event.reason.trim()}`] : []),
+      ].join(' ')).join('\n');
+    }
+    case 'precedent': {
+      const precedent = card.precedent;
+      if (!precedent) return '이전 같은 갈래 결정 없음';
+      const who = precedent.decidedBy === 'human' ? '대표 결정'
+        : precedent.decidedBy === 'auto' ? '자율 결정'
+        : '결정 주체 미상';
+      return [`${precedent.title} → ${precedent.choice}`, stamp(precedent.decidedAt), who].join(' · ');
+    }
+    case 'remeasure': {
+      const checks = card.crossCheck ?? [];
+      const latest = checks.length > 0 ? checks[checks.length - 1] : undefined;
+      if (!latest) return `교차 확인 없음 · ${card.crossCheckSkipped?.trim() || '사유 미기재'}`;
+      return [`${latest.seat} 교차 확인`, stamp(latest.at), latest.note?.trim() || '메모 미기재'].join(' · ');
+    }
+    case 'options': return card.options.map(option => `${option.id.toUpperCase()}) ${option.label} — ${field(option.consequence)}`).join('\n');
+    case 'recommendation': {
+      const recommendation = card.recommendation;
+      if ('skipped' in recommendation) return `권고 없음: ${recommendation.reason}`;
+      const label = card.options.find(option => option.id === recommendation.option)?.label ?? recommendation.option;
+      return `${label} — ${recommendation.why}`;
+    }
+    case 'doNothing': {
+      const window = card.dueAt ? `기한 ${stamp(card.dueAt)} 이 지나면 열린 채로 남습니다` : '기한 없음 — 그대로 두면 계속 열린 채로 남습니다';
+      return card.irreversible ? `${window} · 되돌릴 수 없는 결정입니다` : window;
+    }
+  }
+}
 
 export function DecisionBoard() {
   const { client } = useDaemon();
@@ -33,6 +91,8 @@ export function DecisionBoard() {
   const [outcomes, setOutcomes] = useState<Record<string, Outcome>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [opOnly, setOpOnly] = useState(false);
+  const [folded, setFolded] = useState<Record<string, boolean>>({});
+  const [cellFolded, setCellFolded] = useState<Record<string, boolean>>({});
   const [bulkArm, setBulkArm] = useState(false);
   const [bulkStatus, setBulkStatus] = useState('');
   const pending = useRef<string | null>(null);
@@ -78,7 +138,7 @@ export function DecisionBoard() {
     const sequence = ++readSequence.current;
     setBoard({ items: [], error: null, loading: true });
     setNotes({}); setConfirm(null); setBusy(null); setOutcomes({}); setErrors({});
-    setOpOnly(false); setBulkArm(false); setBulkStatus('');
+    setOpOnly(false); setBulkArm(false); setBulkStatus(''); setFolded({}); setCellFolded({});
     setReplyDrafts({}); setReplyBusy(null); setReplyStatus({});
     void listOpenDecisions(client).then(items => {
       if (active && readSequence.current === sequence) setBoard({ items: sortOpenDecisions(items), error: null, loading: false });
@@ -211,6 +271,28 @@ export function DecisionBoard() {
               {item.dissent && <p className="text-sm">이견: {item.dissent}</p>}
               {item.dueAt && <p className="text-sm">기한: <time dateTime={item.dueAt}>{kst(item.dueAt)} KST</time></p>}
               {item.pendingQuestion && <details className="text-sm"><summary className="cursor-pointer">대기 질문 전문</summary><p className="mt-2 whitespace-pre-wrap">{item.pendingQuestion}</p></details>}
+              <div className="rounded-lg border border-border p-2 text-sm">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="font-semibold">판단 칸</h3>
+                  <button type="button" aria-expanded={folded[item.id] !== true} aria-controls={`ledger-${item.id}`}
+                    onClick={() => setFolded(previous => ({ ...previous, [item.id]: previous[item.id] !== true }))}
+                    className="rounded-md border border-border px-3 py-1">{folded[item.id] === true ? '판단 칸 펼치기' : '판단 칸 접기'}</button>
+                </div>
+                {folded[item.id] !== true && <dl id={`ledger-${item.id}`} className="mt-2 space-y-1">
+                  {LEDGER_CELLS.map(cell => {
+                    const closed = cellFolded[`${item.id}:${cell.key}`] === true;
+                    return <div key={cell.key} className="grid gap-1 border-b border-border/60 pb-1 last:border-b-0">
+                      <dt className="flex flex-wrap items-center justify-between gap-2 font-semibold">
+                        <span>{cell.label}:</span>
+                        <button type="button" aria-expanded={!closed} aria-controls={`cell-${item.id}-${cell.key}`}
+                          onClick={() => setCellFolded(previous => ({ ...previous, [`${item.id}:${cell.key}`]: previous[`${item.id}:${cell.key}`] !== true }))}
+                          className="rounded-md border border-border px-2 py-0.5 text-xs font-normal">{`${cell.label} ${closed ? '펼치기' : '접기'}`}</button>
+                      </dt>
+                      <dd id={`cell-${item.id}-${cell.key}`} hidden={closed} className="min-w-0 whitespace-pre-wrap">{ledgerCellText(item, cell.key)}</dd>
+                    </div>;
+                  })}
+                </dl>}
+              </div>
               <label className="block text-sm">한 줄 의견 (최대 300자)
                 <input type="text" maxLength={300} value={notes[item.id] ?? ''} onChange={event => setNotes(previous => ({ ...previous, [item.id]: event.target.value.slice(0, 300) }))}
                   className="mt-1 block w-full rounded-md border border-border bg-background px-3 py-2" />

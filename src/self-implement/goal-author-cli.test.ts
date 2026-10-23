@@ -546,9 +546,9 @@ describe('runGoalAuthorCli goal type', () => {
     await runGoalAuthorCli(['disabled ask'], { cwd: process.cwd(), disableAdversarialReview: true }, { createDecomposeSteps, write, recentStepCountReader: () => [] });
 
     expect(received).toEqual([
-      { recentStepCounts: [] },
-      { adversarialReview: true, adversarialReviewSource: 'cli', recentStepCounts: [] },
-      { adversarialReview: false, adversarialReviewSource: 'cli', recentStepCounts: [] },
+      { repositoryRoot: process.cwd(), recentStepCounts: [] },
+      { repositoryRoot: process.cwd(), adversarialReview: true, adversarialReviewSource: 'cli', recentStepCounts: [] },
+      { repositoryRoot: process.cwd(), adversarialReview: false, adversarialReviewSource: 'cli', recentStepCounts: [] },
     ]);
   });
 
@@ -590,7 +590,7 @@ describe('runGoalAuthorCli goal type', () => {
       write: async () => ({ path: 'docs/goals/GOAL-test.md', authored: { document: '', authorRunId: 'author-test', facts: null, grounded: false } }),
     });
     expect(result.path).toBe('docs/goals/GOAL-test.md');
-    expect(received).toEqual([{}]);
+    expect(received).toEqual([{ repositoryRoot: process.cwd() }]);
     expect(Object.hasOwn(received[0] ?? {}, 'recentStepCounts')).toBeFalse();
     expect(Object.hasOwn(received[0] ?? {}, 'adversarialReview')).toBeFalse();
     expect(Object.hasOwn(received[0] ?? {}, 'adversarialReviewSource')).toBeFalse();

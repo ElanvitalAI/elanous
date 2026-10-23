@@ -5,6 +5,7 @@ import type { ToolRenderModel } from './types.js';
 
 const PERSISTED_REF_PREFIX = '... Full output saved to ';
 const LISTING_TOOL_MAX_LINES = 8;
+const WARNING_LINE_PREFIX = '⚠';
 
 interface ToolBlockLineBudget {
   maxLines: number;
@@ -67,7 +68,38 @@ export function toolBlockGrouping(model: ToolRenderModel, foldMode: FoldMode = '
   return { operationKind: model.operationKind };
 }
 
+/**
+ * ⚠ lines (RunShell long-sleep 등) are pinned: folding them away hides a warning
+ * from the human eye, so they always render above the fold marker.
+ */
+function splitWarningLines(lines: string[]): { warnings: string[]; foldable: string[] } {
+  const warnings: string[] = [];
+  const foldable: string[] = [];
+  for (const line of lines) {
+    if (line.startsWith(WARNING_LINE_PREFIX)) warnings.push(line);
+    else foldable.push(line);
+  }
+  return { warnings, foldable };
+}
+
 function truncateBlockBody(
+  lines: string[],
+  maxLines: number,
+  foldMode: FoldMode = 'line',
+  expandHint?: boolean,
+): string[] {
+  const { warnings, foldable } = splitWarningLines(lines);
+  if (warnings.length === 0) return foldBlockBody(lines, maxLines, foldMode, expandHint);
+  // 본문이 전부 경고면 접을 것이 없다 — 그대로 보여주고 폴드 마커를 내지 않는다.
+  if (foldable.length === 0) return warnings;
+  // 고정된 경고는 접힌 줄 수에 넣지 않는다 — 예산만 경고 줄 수만큼 줄인다.
+  return [
+    ...warnings,
+    ...foldBlockBody(foldable, maxLines - warnings.length, foldMode, expandHint),
+  ];
+}
+
+function foldBlockBody(
   lines: string[],
   maxLines: number,
   foldMode: FoldMode = 'line',

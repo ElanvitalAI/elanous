@@ -16,6 +16,9 @@ const input = (): QueueLandingInput => {
     reviewResult: join(root, 'review-results', `ta-example-123-${head.slice(0, 12)}.json`),
     command: '/ops/land-enqueue.sh', remote: 'node-c', entry: '/ops/bin/elanous.mjs', configDir: root };
 };
+// LAND-REFUSAL-EXEC — these cases pin the refusal contract; the recover@1 run has its own tests
+// (src/cli/pr-land-refusal-edge.test.ts), so they skip the real unit spawn.
+const noRecover = async () => ({ plan: {} as never, executed: false });
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 const review = JSON.stringify({ pr: 123, headCommit: head, verdict: 'warn', reviewed: true, mustFix: [] });
@@ -48,7 +51,7 @@ test('review mismatch or unknown must-fix stops before fetching or enqueuing', a
   for (const bad of [JSON.stringify({ pr: 123, headCommit: base, verdict: 'pass', reviewed: true, mustFix: [] }),
     JSON.stringify({ pr: 123, headCommit: head, verdict: 'pass', reviewed: true, mustFix: ['real blocker'] })]) {
     let calls = 0;
-    const result = await runQueuedLanding(input(), { read: () => bad, run: async () => { calls++; return { status: 0, stdout: '', stderr: '' }; } });
+    const result = await runQueuedLanding(input(), { recover: noRecover, read: () => bad, run: async () => { calls++; return { status: 0, stdout: '', stderr: '' }; } });
     expect(result.status).toBe(1);
     expect(calls).toBe(0);
   }
@@ -59,6 +62,7 @@ test('gate summary mismatch and queue refusal are distinct fail-closed results',
     const source = input();
     let queueCalls = 0;
     const result = await runQueuedLanding(source, {
+      recover: noRecover,
       read: (path) => path === source.reviewResult ? review : JSON.stringify(variant === 'summary' ? { ...summary, head40: base } : summary),
       run: async (command, args) => {
         if (args.includes('origin/main') && args.includes('rev-parse')) return { status: 0, stdout: base, stderr: '' };
@@ -79,6 +83,7 @@ test('head changing after gate or a receipt for another head cannot record queue
     const source = input();
     let queueCalls = 0;
     const result = await runQueuedLanding(source, {
+      recover: noRecover,
       read: (path) => path === source.reviewResult ? review : JSON.stringify(summary),
       run: async (command, args) => {
         if (args.includes('origin/main') && args.includes('rev-parse')) return { status: 0, stdout: base, stderr: '' };

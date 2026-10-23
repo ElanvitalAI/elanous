@@ -115,3 +115,13 @@ test('long input and backspace keep the current edit position visible at 20 colu
   expect(after.line).not.toContain('y');
   expect(after.line).toContain('x');
 });
+
+test('a bracketed paste inserts its body, not the key name «paste» (TUI-HERDR-NAMED-AGENT)', () => {
+  // herdr `pane run` / `agent prompt` and a real terminal paste both arrive as one CSI 200~ … 201~ envelope.
+  const keys = new KeyStreamParser().push('\x1b[200~안녕 herdr\n둘째 줄\x1b[201~');
+  expect(keys.map((k) => k.name)).toEqual(['paste']);
+  const pasted = applyComposerKey(createInlineEditorState('앞 '), keys[0]!);
+  expect(pasted.action).toBe('edit');
+  expect(pasted.state.text).toBe('앞 안녕 herdr\n둘째 줄');
+  expect(applyComposerKey(pasted.state, { name: 'enter', ctrl: false, shift: false })).toMatchObject({ action: 'submit', submitted: '앞 안녕 herdr\n둘째 줄' });
+});

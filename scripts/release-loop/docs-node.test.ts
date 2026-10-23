@@ -1,6 +1,6 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { runDocs } from './docs-node.js';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -68,6 +68,207 @@ test('CLI writes IN-only release notes, flips every public-doc marker, and regis
   expect(readFileSync(join(notesDir, '9.9.9.md'), 'utf8')).toBe('Curated release notes.\n');
 });
 
+test('RELEASE-NOTES-EN-AUTOFIX translates only Hangul public lines through the production docs path', async () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({
+    version: '9.9.9', baseline: { ref: 'v9.9.8', sha: 'base' }, cutoff: { sha: 'cut' },
+    in: [
+      { sha: 'one', title: '비공개 PR 제목', line: '한국어 공개 항목', kind: 'feat', docs: 'present', prNumber: 42 },
+      { sha: 'two', title: 'private title', line: 'English public line', kind: 'fix', docs: 'present', prNumber: 43 },
+    ], deferred: [], escalate: [],
+  }));
+  const pages = join(root, 'website/pages.json');
+  const calls: string[] = [];
+  const result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: state,
+    translateLine: (line) => { calls.push(line); return 'Translated public line'; },
+  });
+  expect(result.outcome).toBe('ok');
+  expect(calls).toEqual(['한국어 공개 항목']);
+  const notes = readFileSync(join(root, 'release/public/docs/releases/9.9.9.md'), 'utf8');
+  expect(notes).toContain('- Translated public line');
+  expect(notes).toContain('- English public line');
+  expect(notes).not.toContain('한국어');
+  expect(notes).not.toContain('비공개 PR 제목');
+  expect(notes).not.toContain('#42');
+  expect(notes).not.toMatch(/[\uac00-\ud7a3]/);
+  expect(JSON.parse(readFileSync(pages, 'utf8')).pages.filter((page: { id: string }) => page.id === 'releases/9.9.9')).toHaveLength(1);
+});
+
+test('RELEASE-NOTES-EN-AUTOFIX translates Hangul already present in a rendered release note on resume', () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  const notes = join(root, 'release/public/docs/releases/9.9.9.md');
+  writeFileSync(notes, '# 9.9.9\n\n## Behavior changes\n\n- 한국어 공개 항목\n');
+  const pages = join(root, 'website/pages.json');
+  const registry = JSON.parse(readFileSync(pages, 'utf8'));
+  registry.pages.unshift({ id: 'releases/9.9.9', title: '9.9.9' });
+  writeFileSync(pages, JSON.stringify(registry));
+  const calls: string[] = [];
+  const result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: state,
+    translateLine: (line) => { calls.push(line); return 'Translated public line'; },
+  });
+  expect(result.outcome).toBe('ok');
+  expect(calls).toEqual(['한국어 공개 항목']);
+  expect(readFileSync(notes, 'utf8')).toContain('- Translated public line');
+});
+
+test('RELEASE-NOTES-EN-AUTOFIX preserves Markdown blockquote markers while translating their text', () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  const notes = join(root, 'release/public/docs/releases/9.9.9.md');
+  writeFileSync(notes, '# 9.9.9\n\n> 한국어 인용 문장\n> > 한국어 중첩 인용\n> - 한국어 대시 목록\n> + 한국어 더하기 목록\n> * 한국어 별표 목록\n> 1. 한국어 번호 목록\n> - > 한국어 목록 안 인용\n');
+  const pages = join(root, 'website/pages.json');
+  const registry = JSON.parse(readFileSync(pages, 'utf8'));
+  registry.pages.unshift({ id: 'releases/9.9.9', title: '9.9.9' });
+  writeFileSync(pages, JSON.stringify(registry));
+  const calls: string[] = [];
+  const result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: state,
+    translateLine: (line) => {
+      calls.push(line);
+      const translations: Record<string, string> = {
+        '한국어 인용 문장': 'Quoted sentence',
+        '한국어 중첩 인용': 'Nested quote',
+        '한국어 대시 목록': 'Dash list item',
+        '한국어 더하기 목록': 'Plus list item',
+        '한국어 별표 목록': 'Star list item',
+        '한국어 번호 목록': 'Numbered list item',
+        '한국어 목록 안 인용': 'Nested quoted list item',
+      };
+      return translations[line]!;
+    },
+  });
+  expect(result.outcome).toBe('ok');
+  expect(calls).toEqual([
+    '한국어 인용 문장', '한국어 중첩 인용', '한국어 대시 목록', '한국어 더하기 목록',
+    '한국어 별표 목록', '한국어 번호 목록', '한국어 목록 안 인용',
+  ]);
+  expect(readFileSync(notes, 'utf8')).toBe(
+    '# 9.9.9\n\n> Quoted sentence\n> > Nested quote\n> - Dash list item\n> + Plus list item\n> * Star list item\n> 1. Numbered list item\n> - > Nested quoted list item\n',
+  );
+});
+
+test('RELEASE-NOTES-EN-AUTOFIX preserves inline comments and CRLF, accepts ASCII digits, and rejects non-Latin digits on resume', () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  const notes = join(root, 'release/public/docs/releases/9.9.9.md');
+  writeFileSync(notes, '# 9.9.9\r\n\r\n## Behavior changes\r\n\r\n- 한국어 공개 항목 <!-- retain this marker -->\r\n- 한국어 계정 항목\r\n- 한국어 숫자 항목\r\n');
+  const pages = join(root, 'website/pages.json');
+  const registry = JSON.parse(readFileSync(pages, 'utf8'));
+  registry.pages.unshift({ id: 'releases/9.9.9', title: '9.9.9' });
+  writeFileSync(pages, JSON.stringify(registry));
+  const calls: string[] = [];
+  const result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: state,
+    translateLine: (line) => {
+      calls.push(line);
+      return line.includes('숫자') ? 'English ٣' : line.includes('계정') ? 'Added 3 accounts' : 'Translated public item';
+    },
+  });
+  expect(result.outcome).toBe('ok');
+  expect(result.translationFallbacks).toBe(1);
+  expect(calls).toEqual(['한국어 공개 항목', '한국어 계정 항목', '한국어 숫자 항목']);
+  expect(readFileSync(notes, 'utf8')).toBe('# 9.9.9\r\n\r\n## Behavior changes\r\n\r\n- Translated public item <!-- retain this marker -->\r\n- Added 3 accounts\r\n- 한국어 숫자 항목\r\n');
+});
+
+test('RELEASE-NOTES-EN-AUTOFIX preserves inline code, comments, and the original line on partial failure', () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  const notes = join(root, 'release/public/docs/releases/9.9.9.md');
+  writeFileSync(notes, '# 9.9.9\n\n<!--\n```\n한국어 주석 문장\n-->\n- 한국어 공개 문장 `foo()`\n- `<!--` 한국어 공개 후속\n- 한국어 먼저 `bar` 한국어 실패\n```\n```text\n한국어 코드 줄\n```\n');
+  const pages = join(root, 'website/pages.json');
+  const registry = JSON.parse(readFileSync(pages, 'utf8'));
+  registry.pages.unshift({ id: 'releases/9.9.9', title: '9.9.9' });
+  writeFileSync(pages, JSON.stringify(registry));
+  const calls: string[] = [];
+  const result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: state,
+    translateLine: (line) => {
+      calls.push(line);
+      if (line === '한국어 실패') throw new Error('simulated translation failure');
+      return line === '한국어 먼저' ? 'First translated part' : 'English public sentence';
+    },
+  });
+  expect(result.outcome).toBe('ok');
+  expect(result.translationFallbacks).toBe(1);
+  expect(calls).toEqual(['한국어 공개 문장', '한국어 공개 후속', '한국어 먼저', '한국어 실패']);
+  expect(readFileSync(notes, 'utf8')).toBe('# 9.9.9\n\n<!--\n```\n한국어 주석 문장\n-->\n- English public sentence `foo()`\n- `<!--` English public sentence\n- 한국어 먼저 `bar` 한국어 실패\n```\n```text\n한국어 코드 줄\n```\n');
+});
+
+test('RELEASE-NOTES-EN-AUTOFIX preserves failed translations for the downstream Korean-text gate', () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({
+    version: '9.9.9', baseline: { ref: 'v9.9.8', sha: 'base' }, cutoff: { sha: 'cut' },
+    in: [{ sha: 'one', title: 'private title', line: 'English public line', kind: 'feat', docs: 'present' }], deferred: [], escalate: [],
+  }));
+  writeFileSync(join(root, 'release/public/docs/releases/9.9.9.md'), '## Also in this release\n\n- 한국어 공개 항목  \n');
+  const result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: state, translateLine: () => '한국어 결과',
+  });
+  expect(result.outcome).toBe('ok');
+  expect(result.translationFallbacks).toBe(1);
+  const notes = join(root, 'release/public/docs/releases/9.9.9.md');
+  expect(readFileSync(notes, 'utf8')).toContain('- 한국어 공개 항목\n');
+  expect(readFileSync(notes, 'utf8')).toMatch(/[\uac00-\ud7a3]/);
+});
+
+test('RELEASE-NOTES-EN-AUTOFIX rejects non-Latin output and leaves fenced code/comments untouched', () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({
+    version: '9.9.9', baseline: { ref: 'v9.9.8', sha: 'base' }, cutoff: { sha: 'cut' },
+    in: [{ sha: 'one', title: 'private title', line: '한국어 공개 항목', kind: 'feat', docs: 'present' }], deferred: [], escalate: [],
+  }));
+  const notes = join(root, 'release/public/docs/releases/9.9.9.md');
+  writeFileSync(notes, '## Also in this release\n\n```text\n> ```\n한국어 인용 표식은 코드 안\n- ```\n한국어 목록 표식은 코드 안\n```\n한국어 root fence 후속\n> ```text\n>     ```\n> 한국어 인용 코드 줄\n> ```\n> 한국어 인용 fence 후속\n> ```text\n> 한국어 인용 코드\n> ```\n> - > ```text\n>   > 한국어 목록 인용 코드\n>   > ```\n> - 한국어 인용 후속 문장\n```text\n    ```\n한국어 들여쓴 코드 줄\n```\n한국어 fence 후속 문장\n\t```\n한국어 탭 표식 뒤 산문\n<!-- 한국어 주석 -->\n- 한국어 이모지 항목\n');
+  const calls: string[] = [];
+  const result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: state,
+    translateLine: (line) => { calls.push(line); return line.includes('이모지') ? 'Fixed 🚀' : line.includes('후속') || line.includes('산문') ? 'Quoted follow-up' : 'Elanous 新機能を追加'; },
+  });
+  expect(result.translationFallbacks).toBe(2);
+  expect(calls).toEqual(['한국어 공개 항목', '한국어 root fence 후속', '한국어 인용 fence 후속', '한국어 인용 후속 문장', '한국어 fence 후속 문장', '한국어 탭 표식 뒤 산문', '한국어 이모지 항목']);
+  expect(readFileSync(notes, 'utf8')).toContain('```text\n> ```\n한국어 인용 표식은 코드 안\n- ```\n한국어 목록 표식은 코드 안\n```\nQuoted follow-up\n> ```text\n>     ```\n> 한국어 인용 코드 줄\n> ```\n> Quoted follow-up\n> ```text\n> 한국어 인용 코드\n> ```\n> - > ```text\n>   > 한국어 목록 인용 코드\n>   > ```\n> - Quoted follow-up\n```text\n    ```\n한국어 들여쓴 코드 줄\n```\nQuoted follow-up\n\t```\nQuoted follow-up\n<!-- 한국어 주석 -->\n- 한국어 이모지 항목\n');
+});
+
+test('RELEASE-NOTES-EN-AUTOFIX pins the approved model at the ask child process boundary', () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({
+    version: '9.9.9', baseline: { ref: 'v9.9.8', sha: 'base' }, cutoff: { sha: 'cut' },
+    in: [{ sha: 'one', title: '비공개 제목', line: '한국어 공개 항목', kind: 'feat', docs: 'present', prNumber: 42 }], deferred: [], escalate: [],
+  }));
+  const calls: Array<{ command: string; args: string[]; cwd?: string | URL; env: NodeJS.ProcessEnv }> = [];
+  const originalCwd = process.cwd();
+  let result: ReturnType<typeof runDocs>;
+  try {
+    // Run from a fixture directory with no bin/elanous.mjs to prove the child path is repo-rooted.
+    process.chdir(root);
+    result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+      stateRoot: state,
+      askSpawn: (command, args, options) => {
+        calls.push({ command, args, cwd: options.cwd, env: options.env ?? {} });
+        return { pid: 1, output: [], stdout: JSON.stringify({ reply: 'English public line' }), stderr: '', status: 0, signal: null, error: undefined };
+      },
+    });
+  } finally {
+    process.chdir(originalCwd);
+  }
+  expect(result.outcome).toBe('ok');
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.args).toContain('ask');
+  expect(calls[0]!.args[0]).toBe(resolve(import.meta.dir, '../../bin/elanous.mjs'));
+  expect(existsSync(calls[0]!.args[0]!)).toBe(true);
+  expect(realpathSync(calls[0]!.cwd!)).toBe(realpathSync(root));
+  expect(calls[0]!.args.join(' ')).not.toContain('비공개 제목');
+  expect(calls[0]!.args.join(' ')).not.toContain('42');
+  expect(calls[0]!.env).toMatchObject({ ELANOUS_LLM_PROVIDER: 'openrouter', ELANOUS_LLM_MODEL: 'z-ai/glm-5.3' });
+});
+
 for (const failedFile of ['9.9.9.md', 'harness.md', 'pages.json']) {
   test(`partial ${failedFile} temp write keeps destination intact and retry finishes`, () => {
     const { root, docsDir, notesDir } = fixture();
@@ -121,23 +322,28 @@ test('pre-existing unrelated release notes without a pages entry are folded in, 
 // Real sample (main, 09-29): #21496 landed its own line into releases/0.2.4.md before the release loop ran,
 // and a headline paragraph is written at the top — the docs node used to throw and stall v0.2.4.
 test('a line a PR landed early and a headline paragraph are both kept around the rendered notes', () => {
-  const { root, run, notesDir } = fixture();
+  const { root, notesDir } = fixture();
   const notes = join(notesDir, '9.9.9.md');
   const landed = '- 크레딧 정책일 때 매시 한도 알림이 세 계정의 크레딧 합계와 합계 소모 속도로 «언제 바닥나는지»를 말합니다.';
   writeFileSync(notes, `Elanous now drives coding agents from inside their own screens.\n\n${landed}\n`);
-  const result = run(['--version', '9.9.9', '--base', root, '--json']);
-  expect(result.status).toBe(0);
+  const result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: join(root, 'state'),
+    translateLine: (line) => line.startsWith('크레딧 정책일 때') ? 'Credit alerts estimate when all three accounts run out.' : line,
+  });
+  expect(result.outcome).toBe('ok');
   const text = readFileSync(notes, 'utf8');
   expect(text).toStartWith('# 9.9.9\n\nElanous now drives coding agents from inside their own screens.\n');
   expect(text).toContain('## Behavior changes\n\n- New behavior');
-  expect(text).toContain(`## Also in this release\n\n${landed}\n`);
-  expect(text.split(landed).length - 1).toBe(1);
+  expect(text).toContain('## Also in this release\n\n- Credit alerts estimate when all three accounts run out.\n');
+  expect(text).not.toContain(landed);
   const pages = JSON.parse(readFileSync(join(root, 'website/pages.json'), 'utf8'));
   expect(pages.pages.filter((page: { id: string }) => page.id === 'releases/9.9.9')).toHaveLength(1);
   // Idempotent through the fold path itself: drop the pages entry the first run added, run again.
   pages.pages = pages.pages.filter((page: { id: string }) => page.id !== 'releases/9.9.9');
   writeFileSync(join(root, 'website/pages.json'), JSON.stringify(pages, null, 2) + '\n');
-  expect(run(['--version', '9.9.9', '--base', root, '--json']).status).toBe(0);
+  expect(runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
+    stateRoot: join(root, 'state'), translateLine: () => 'Credit alerts estimate when all three accounts run out.',
+  }).outcome).toBe('ok');
   expect(readFileSync(notes, 'utf8')).toBe(text);
 });
 
@@ -647,3 +853,70 @@ test('GATE-NODES-PARALLEL: a failed docs stage does not discard the finished tui
   const joined = joinTui(context, env, root, () => { throw new Error('fallback must not run: the finished tui survives the docs failure'); }, state);
   expect(joined).toMatchObject({ outcome: 'ok', verdict: 'pass', commit });
 });
+
+// Fake-bin stage: the real docs-node.ts graph entry runs as its own process under an isolated state root,
+// and only the translation CLI child (the model boundary) is a stand-in — no network, no real provider.
+// Everything asserted here is an artifact of that run: the written release-notes file, the files the
+// translation child was asked for, and the node ledger line emitNodeResult printed last.
+test('RELEASE-NOTES-EN-AUTOFIX: the production graph entry writes English release notes, keeps its ledger line, and translates Korean already on disk on resume', () => {
+  const { root } = fixture();
+  const state = join(root, 'state');
+  writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({
+    version: '9.9.9', baseline: { ref: 'v9.9.8', sha: 'base' }, cutoff: { sha: 'cut' },
+    in: [
+      { sha: 'one', title: '비공개 PR 제목', line: '한국어 공개 항목', kind: 'feat', docs: 'present', prNumber: 42 },
+      { sha: 'two', title: 'private title', line: '한국어 이어지는 항목', kind: 'fix', docs: 'present', prNumber: 43 },
+      { sha: 'three', title: 'private title', line: 'English public line', kind: 'feat', docs: 'present', prNumber: 44 },
+    ], deferred: [], escalate: [],
+  }));
+  const askLog = join(root, 'ask-calls.log');
+  const fakeAskCli = join(root, 'fake-bin/ask-cli.ts');
+  mkdirSync(dirname(fakeAskCli), { recursive: true });
+  writeFileSync(fakeAskCli, [
+    "import { appendFileSync } from 'node:fs';",
+    "const prompt = process.argv.at(-1) ?? '';",
+    "const source = prompt.trim().split('\\n').at(-1) ?? '';",
+    'const translations: Record<string, string> = {',
+    "  '한국어 공개 항목': 'Translated public item',",
+    "  '한국어 이어지는 항목': 'Translated follow-up item',",
+    "  '한국어 늦게 착지한 항목': 'Late-landed item',",
+    '};',
+    `appendFileSync(${JSON.stringify(askLog)}, source + '\\n');`,
+    "console.log(JSON.stringify({ reply: translations[source] ?? 'UNEXPECTED ' + source }));",
+    '',
+  ].join('\n'));
+  const contextPath = join(root, 'docs-node.context.json');
+  writeFileSync(contextPath, JSON.stringify({ input: { version: '9.9.9', base: root } }));
+  // No subcommand: the graph context supplies version/base, exactly as the release graph launches this node.
+  const runNode = () => spawnSync(process.execPath, [resolve(import.meta.dir, 'docs-node.ts')], {
+    cwd: root, encoding: 'utf8', timeout: 100_000,
+    env: {
+      ...process.env, ELANOUS_STATE_DIR: state, ELANOUS_GRAPH_CONTEXT: contextPath,
+      ELANOUS_RELEASE_ASK_BIN: fakeAskCli,
+    },
+  });
+  const readOr = (path: string) => existsSync(path) ? readFileSync(path, 'utf8') : '<absent>';
+  const notes = join(root, 'release/public/docs/releases/9.9.9.md');
+  const first = runNode();
+  const ledger = JSON.parse(first.stdout.trim().split('\n').at(-1)!);
+  // The node ledger keeps its one-line JSON contract (node-verdict.ts emitNodeResult).
+  expect(first.status).toBe(0);
+  expect(ledger).toMatchObject({ outcome: 'ok', verdict: 'pass', version: '9.9.9', summary: 'docs v9.9.9 · 3 pages' });
+  expect(ledger.translationFallbacks).toBeUndefined();
+  // Only public Hangul lines reach the model — never the private PR titles or numbers.
+  expect(readOr(askLog)).toBe('한국어 공개 항목\n한국어 이어지는 항목\n');
+  const rendered = '# 9.9.9\n\n## Behavior changes\n\n- Translated public item\n- Translated follow-up item\n- English public line\n';
+  expect(readOr(notes)).toBe(rendered);
+  expect(readOr(notes)).not.toContain('#42');
+  expect(JSON.parse(readFileSync(join(root, 'website/pages.json'), 'utf8'))
+    .pages.filter((page: { id: string }) => page.id === 'releases/9.9.9')).toHaveLength(1);
+  // A resumed graph run finds Korean already on disk (a line a PR landed before the loop ran): the same
+  // production entry translates it and writes English, so notes-check B11 never sees Hangul.
+  writeFileSync(notes, `${rendered}\n## Also in this release\n\n- 한국어 늦게 착지한 항목\n`);
+  const resumed = runNode();
+  expect(resumed.status).toBe(0);
+  expect(JSON.parse(resumed.stdout.trim().split('\n').at(-1)!)).toMatchObject({ outcome: 'ok', verdict: 'pass', version: '9.9.9' });
+  expect(readOr(askLog).split('\n').filter(Boolean).at(-1)).toBe('한국어 늦게 착지한 항목');
+  expect(readOr(notes)).toContain('## Also in this release\n\n- Late-landed item\n');
+  expect(readOr(notes)).not.toMatch(/[\uac00-\ud7a3]/);
+}, 120_000);

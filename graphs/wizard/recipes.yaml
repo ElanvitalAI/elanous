@@ -1,0 +1,44 @@
+# graphs/wizard/recipes.yaml — wizard-loop 그래프의 노드별 명령 카탈로그
+#
+# 로더(src/self-implement/graph-yaml.ts)는 recipes.yaml 을 «템플릿»이 아니라
+# 명령 카탈로그로 본다 — 그래프 러너(src/graph-runner/runner.ts)가 노드 id 로 찾아 실행한다.
+# 형식은 src/graph-wizard/steps.ts 의 recipesYamlFor 가 내는 것과 같다:
+#   cmd:<id>       → command: "<bin> graph step <step> --arg '<arg>'" · timeout_ms
+#   approval:<id>  → approval: "<사람에게 물을 한 줄>"
+# 커맨드 문자열은 따옴표로 감싼다 — 산문 안의 ':' 가 중첩 매핑으로 읽히지 않게.
+
+intake:
+  command: "eln graph step llm --arg '지시를 한 줄로: 무엇을 만들려는가 — 막연해도 된다'"
+  timeout_ms: 240000
+classify:
+  command: "eln graph step llm --arg '분류: 종류(harness|workflow) · 결과물 · 필요한 도구 · 위험도를 적어라'"
+  timeout_ms: 240000
+ground:
+  command: "eln graph step check --arg '저장소 근거: 이미 있는 부품·경로·시험을 실제로 읽어 적어라. 없으면 없다고 적어라'"
+  timeout_ms: 240000
+gap:
+  command: "eln graph step llm --arg '차이: refs 와 observed 를 견주어 지금 없는 것을 gap 으로 뽑아라. 비었으면 비었다고 적어라'"
+  timeout_ms: 240000
+approve:
+  approval: "분류·근거·gap 을 읽었나요? 이 계획으로 진행할까요 — 승인 또는 거부"
+acquire:
+  command: "eln graph step knowledge-rag --arg 'gap 을 메울 자료: 저장소·문서·설치된 팩에서 인용을 모아라'"
+  timeout_ms: 240000
+generate:
+  command: "eln graph step llm --arg 'gap 을 메우는 그래프 YAML 초안을 써라 — 노드·간선·종료 노드는 스키마 그대로'"
+  timeout_ms: 240000
+compose:
+  command: "eln graph step llm --arg '초안을 하나의 그래프로 합쳐라 — 노드 id 와 recipes 키를 맞추고 간선을 잇는다'"
+  timeout_ms: 240000
+verify:
+  command: "eln graph step check --arg '검증: 로더 불변식(노드 종류·간선 참조·to/map 배타·종료 done|failed)과 드라이런을 확인하라'"
+  timeout_ms: 240000
+store:
+  command: "eln graph step llm --arg '확정된 그래프를 저장 경로 graphs/<id>.yaml 에 적고 recipes 도 같은 디렉터리에 남겨라'"
+  timeout_ms: 240000
+run:
+  command: "eln graph step notify-me --arg '저장된 그래프를 실행하고 결과 상태와 지난 경로를 알려라'"
+  timeout_ms: 240000
+improve:
+  command: "eln graph step summarize --arg '개선: 이번 루프에서 무엇이 아쉬웠고 다음에 무엇을 바꿀지 한 줄씩'"
+  timeout_ms: 240000

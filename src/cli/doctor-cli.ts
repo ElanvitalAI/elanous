@@ -47,6 +47,7 @@ import {
   isDoctorSymptom,
   isDoctorVisitSource,
   readDoctorVisits,
+  recordAutoLongRunVisit,
   recordDoctorVisit,
   type DoctorSymptom,
 } from '../self-implement/doctor-visit.js';
@@ -224,6 +225,8 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   doctorVisitLedgerDir?: string;
   /** `doctor visit` 사고 선례 연결 루트(시험 seam) — 기본 = `doctorVisitIncidentRoot()` · `null` 이면 건너뛴다. */
   doctorVisitIncidentRoot?: string | null;
+  /** Deterministic clock for `doctor auto-long-run` isolated CLI tests. */
+  doctorAutoLongRunNow?: () => string;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1349,6 +1352,25 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       const report = runHostDoctor({ host, role: opts.role, remote: deps.hostDoctorRemote, expected: deps.hostDoctorExpected, membership });
       out.log(json ? JSON.stringify(report, null, 2) : formatHostDoctorLines(report).join('\n'));
       if (!report.ok) setExitCode(1);
+    });
+  doctor.command('auto-long-run')
+    .description('Record one automatic doctor visit when a running Pod crosses 60 minutes')
+    .argument('<runId>', 'run id whose ledger receives the visit')
+    .requiredOption('--started-at <iso>', 'Pod status.startTime as an ISO timestamp')
+    .option('--json', 'structured output')
+    .action((runId: string, opts: { startedAt: string; json?: boolean }, command: Command) => {
+      const json = opts.json === true || command.parent?.opts().json === true;
+      try {
+        const result = recordAutoLongRunVisit({ runId, startedAt: opts.startedAt,
+          ...(deps.doctorAutoLongRunNow ? { now: deps.doctorAutoLongRunNow() } : {}),
+          ...(deps.doctorVisitLedgerDir !== undefined ? { dir: deps.doctorVisitLedgerDir } : {}) });
+        out.log(json ? JSON.stringify(result) : `doctor auto-long-run: runId=${runId} status=${result.status}`);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
+        else err.error(reason);
+        setExitCode(1);
+      }
     });
   doctor.command('visit')
     .description('Record a doctor visit (triage symptom) in the run ledger of that run')

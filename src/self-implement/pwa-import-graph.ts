@@ -29,7 +29,7 @@ function sourceFiles(cwd: string): string[] {
 const IMPORT_SPECIFIER = /\b(?:import|export)\s+(?:[^;'"]*?\s+from\s*)?['"](\.[^'"]+)['"]|\bimport\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g;
 
 /** Repo-relative file candidates a relative import specifier (already joined to its importer's directory) can resolve to. */
-function importCandidates(base: string): string[] {
+export function importCandidates(base: string): string[] {
   return /\.js$/.test(base)
     // A real .js file wins over a same-named .ts source (the actual resolution order).
     ? [base, base.replace(/\.js$/, '.ts'), base.replace(/\.js$/, '.tsx'), `${base.slice(0, -3)}/index.ts`, `${base.slice(0, -3)}/index.tsx`, `${base.slice(0, -3)}/index.js`]

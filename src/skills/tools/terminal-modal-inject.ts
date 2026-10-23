@@ -18,7 +18,6 @@
 //     overflowed.
 
 import type { LLMToolSpec } from '../../llm.js';
-import { getDashboardTerminalSessions } from '../../dashboard/terminal/session.js';
 import type { TerminalSessionRegistry } from '../../terminal/session-registry.js';
 
 const CHUNK_BYTES = 256;
@@ -92,7 +91,7 @@ export async function dispatchTerminalModalInject(
   rawArgs: Record<string, unknown>,
   deps: DispatchInjectDeps = {},
 ): Promise<{ output: string }> {
-  const registry = deps.registry ?? getDashboardTerminalSessions();
+  const registry = deps.registry ?? (await import('../../dashboard/terminal/session.js')).getDashboardTerminalSessions();
   const id = String(rawArgs.id ?? '').trim();
   if (!id) throw new Error(`'id' is required`);
   const session = registry.get(id);

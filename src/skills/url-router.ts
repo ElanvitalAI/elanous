@@ -108,11 +108,50 @@ function containsAny(haystack: string, needles: string[]): string | null {
   return null;
 }
 
+// ── Work-context guard (URL-ROUTE-WORK-CONTEXT-GUARD · 10-22) ──
+// Observed: a long n8n work instruction carrying «RSS URL https://hnrss.org/frontpage
+// · Limit 5 …» (a value to type into a node) was rewritten into an omni-digest run.
+// The config guardKeywords did not stop it, and a user config replaces that list
+// wholesale — so this guard lives in code and always applies.
+
+/** «Put this value into a field» phrasing — the URL is data, not a digest target. */
+const FIELD_INPUT_WORDS = [
+  '입력', '넣어', '넣고', '넣기', '붙여넣', '칸에', '노드에', '필드에', '란에',
+  '로 설정', '으로 설정', '에 설정', '설정해',
+  'paste into', 'type into', 'fill in', 'into the field', 'enter it',
+];
+/** Text outside the URLs longer than this is a work instruction, not «summarize this». */
+export const WORK_INSTRUCTION_MIN_CHARS = 160;
+/** Step separators (`·` `→` `->`, numbered/bulleted lines) that mark a multi-step task. */
+const STEP_MARKER_RE = /·|→|->|^\s*(?:\d+[.)]|[-*•])\s+/gmu;
+
+/** A URL written as a labelled value — «RSS URL https://…», «Webhook URL: https://…», «endpoint=https://…».
+ *  Matched against the text with each URL replaced by a marker, so a label inside a URL
+ *  (`https://a.com/?url=https://b.com`) is never read as one. */
+const URL_MARK = '\u0000';
+/** Words that ask for a digest of the URL — they exempt the labelled-URL check (not the other guards). */
+const DIGEST_REQUEST_WORDS = ['요약', '정리', '분석', 'summar', 'digest', 'tl;dr', 'tldr'];
+const LABELLED_URL_RE = /(?:^|[^\p{L}\p{N}])(?:url|uri|endpoint)\s*[:=]?\s*\u0000/iu;
+
+/** Why this URL-bearing text must stay on the LLM path, or null when it may route. */
+export function workContextGuardReason(text: string): string | null {
+  const rest = text.replace(URL_RE, ' ').replace(/\s+/g, ' ').trim();
+  const field = containsAny(rest.toLowerCase(), FIELD_INPUT_WORDS);
+  if (field) return `field-input("${field}")`;
+  // An explicit digest request («URL https://… 요약해줘») names the URL to summarize, so the label alone does not hold it back.
+  if (LABELLED_URL_RE.test(text.replace(URL_RE, URL_MARK)) && !containsAny(rest.toLowerCase(), DIGEST_REQUEST_WORDS)) return 'labelled-url-value';
+  if (rest.length > WORK_INSTRUCTION_MIN_CHARS) return `long-instruction(${rest.length})`;
+  const steps = text.replace(URL_RE, ' ').match(STEP_MARKER_RE)?.length ?? 0;
+  if (steps >= 2) return `multi-step(${steps})`;
+  return null;
+}
+
 /** Main entry. Returns a routing decision when the text contains a URL
  *  that should be auto-processed, or null when:
  *   - routing disabled,
  *   - no URL present,
- *   - a guard keyword is present (defer to the LLM — R5/R8).
+ *   - a guard keyword is present (defer to the LLM — R5/R8),
+ *   - the URL sits inside a work instruction (`workContextGuardReason`).
  *
  *  Callers (TUI dashboard / Telegram agent) then decide auto-fire vs
  *  suggest, and run the mapped skill (two-stage per P4). */
@@ -132,6 +171,7 @@ export function detectUrlRoute(
   // "반박해봐", "구현해줘") is NOT a digest request — defer to the LLM.
   const guardHit = containsAny(haystack, cfg.guardKeywords);
   if (guardHit) return null;
+  if (workContextGuardReason(text)) return null;
 
   const url = urls[0]!;
   const kind = classifyUrl(url);

@@ -4,11 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CoreTurnContext, CoreTurnResult } from './types.js';
 import { debug } from '../debug/log.js';
+import { DELEGATE_HINT } from '../agent/delegate-hint.js';
 import { boundReadableText } from '../self-implement/orchestrator.js';
 import {
   CHILD_LIVENESS_HEARTBEAT_ENV,
   GOAL_LOOP_FINAL_TEXT_EXCERPT_MAX_CHARS,
   GOAL_CONTINUATION_PROMPT,
+  GOAL_FINAL_ITERATION_NOTE,
   GOAL_EVIDENCE_REQUIRED_PROMPT,
   GOAL_INTERNAL_NOTICE_RULE,
   GOAL_READBACK_PROMPT,
@@ -139,6 +141,77 @@ describe('runGoalLoop iteration observation final-text excerpt', () => {
   });
 });
 
+describe('runGoalLoop delegate hint', () => {
+  test('80% of the first turn tool budget is recorded on the next reinjection exactly once', async () => {
+    const users: string[] = [];
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'agent.delegate') events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      await runGoalLoop({ ...baseCtx(), maxToolTurns: 10 }, {
+        maxIterations: 3,
+        controlSpaceId: null,
+        runTurn: async (ctx) => {
+          const iteration = users.length + 1;
+          users.push(String([...ctx.messages].reverse().find((message) => message.role === 'user')?.content));
+          if (iteration === 1) {
+            for (let i = 0; i < 8; i++) await ctx.dispatchTool('Read', { i });
+          }
+          ctx.callbacks?.onTurnComplete?.([{
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: `budget-${iteration}`, name: 'Read', input: { iteration } }],
+          }]);
+          return { stopReason: 'end_turn', finalText: '남은 작업 진행' } satisfies CoreTurnResult;
+        },
+      });
+      expect(users[1]).toBe(`${GOAL_CONTINUATION_PROMPT}\n${DELEGATE_HINT}`);
+      expect(users[2]).not.toContain(DELEGATE_HINT);
+      expect(events).toEqual([{ category: 'agent.delegate', event: 'hint', data: {
+        sessionId: 'child-liveness', iteration: 2, reason: 'tool-budget-80-percent',
+      } }]);
+    } finally {
+      debug.log = originalLog;
+    }
+  });
+
+  test('a continuing goal puts the hint in the raw second user turn once, not the third, and emits one event', async () => {
+    const users: string[] = [];
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string, data: Record<string, unknown>) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      const result = await runGoalLoop(baseCtx(), {
+        maxIterations: 3,
+        controlSpaceId: null,
+        runTurn: async (ctx) => {
+          const iteration = users.length + 1;
+          const lastUser = [...ctx.messages].reverse().find((message) => message.role === 'user');
+          expect(lastUser?.role).toBe('user');
+          users.push(String(lastUser?.content));
+          ctx.callbacks?.onTurnComplete?.([{
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: `read-${iteration}`, name: 'Read', input: { iteration } }],
+          }]);
+          return { stopReason: 'end_turn', finalText: '다음 파일을 읽겠습니다' } satisfies CoreTurnResult;
+        },
+      });
+      expect(result).toMatchObject({ stopReason: 'max_iterations', iterations: 3 });
+      expect(users[1]).toBe(`${GOAL_CONTINUATION_PROMPT}\n${DELEGATE_HINT}`);
+      expect(users[1]!.split(DELEGATE_HINT)).toHaveLength(2);
+      expect(users[2]).toBe(`${GOAL_CONTINUATION_PROMPT}\n${GOAL_FINAL_ITERATION_NOTE}`);
+      expect(users[2]).not.toContain(DELEGATE_HINT);
+      expect(events.filter(({ category, event }) => category === 'agent.delegate' && event === 'hint'))
+        .toEqual([{ category: 'agent.delegate', event: 'hint', data: { sessionId: 'child-liveness', iteration: 2, reason: 'work-remaining' } }]);
+    } finally {
+      debug.log = originalLog;
+    }
+  });
+});
+
 describe('runGoalLoop completion answer deduplication', () => {
   test('both continuation prompts tell the model not to repeat an answer without new facts', () => {
     for (const prompt of [GOAL_CONTINUATION_PROMPT, GOAL_READBACK_PROMPT]) {
@@ -177,7 +250,8 @@ describe('runGoalLoop completion answer deduplication', () => {
             }]);
             return { stopReason: 'end_turn', finalText: firstText } satisfies CoreTurnResult;
           }
-          expect(ctx.messages.at(-1)?.content).toBe(GOAL_CONTINUATION_PROMPT);
+          // maxIterations 2 — 둘째가 마지막 반복이라 «최종 보고 한 번» 줄이 붙는다(TUI-GOAL-INTERIM-QUIET).
+          expect(ctx.messages.at(-1)?.content).toBe(`${GOAL_CONTINUATION_PROMPT}\n${GOAL_FINAL_ITERATION_NOTE}\n${DELEGATE_HINT}`);
           ctx.callbacks?.onTurnComplete?.([{
             role: 'assistant',
             content: [{ type: 'tool_use', id: 'goal', name: 'update_goal', input: { status: 'complete', evidence: '결정 카드 2건을 현재 상태에서 확인' } }],

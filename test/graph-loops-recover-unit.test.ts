@@ -22,8 +22,8 @@ test('LOOPS: four landing refusal routes resolve the same bounded recover@1 cont
     });
     expect(graph.edges.find(edge => edge.from === 'cleanup')?.to).toBe('landed');
     expect(graph.edges.find(edge => edge.from === 'recover')?.map).toMatchObject({
-      done: name === 'default' ? 'stopped' : 'needs-human',
-      rework: name === 'default' ? 'stopped' : 'needs-human',
+      done: name === 'default' ? 'cleanup' : 'needs-human',
+      rework: name === 'default' ? 'merge' : 'needs-human',
       'needs-human': name === 'default' ? 'stopped' : 'needs-human',
       failed: name === 'default' ? 'stopped' : 'needs-human',
     });

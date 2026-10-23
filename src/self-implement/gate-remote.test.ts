@@ -771,9 +771,10 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     mkdirSync(join(env.ELANOUS_STATE_DIR, 'release', 'gate-host-reservations'), { recursive: true });
     mkdirSync(join(scratch, '.elanous-test', 'release', 'gate-host-reservations'), { recursive: true });
     const tsc = spawnSync('bun', [join(repoRoot, 'scripts/ci-typecheck-changed.ts'), '--remote', 'node-b'], { cwd: scratch, encoding: 'utf8', env });
-    expect(tsc.stderr).toContain('[gate.remote] remote unmeasured on node-b — origin-main-unresolved');
-    expect(tsc.status).toBe(1);
-    expect(`${tsc.stdout}${tsc.stderr}`).not.toContain('[tsc-gate]');
+    expect(tsc.stderr).toContain('[tsc-gate] ⛔ 원격 판정 실패 원인 [base-env]');
+    expect(tsc.stderr).toContain('merge-base(HEAD, origin/main) 을 이 트리에서 풀 수 없다');
+    expect(tsc.stderr).toContain('node-b 를 띄우지 않는다');
+    expect(tsc.status).toBe(2);
     const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b'], { cwd: scratch, encoding: 'utf8', env });
     expect(gate.stderr).toContain('[gate.remote] remote unmeasured on node-b (stage=preflight, rc=unknown) — origin-main-unresolved');
     expect(gate.status).toBe(1);

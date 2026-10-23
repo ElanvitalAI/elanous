@@ -1,11 +1,16 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSession, loadSession } from '../../session/index.js';
 import { CardStore } from '../../task-cards/card-store.js';
-import { getGlobalPersonaRegistry, awaitGlobalPersonaLoad } from '../../persona/global-registry.js';
-import { handleTuiChatPersona, TuiChatPersonaSelection, tuiChatPersonaMessages } from './chat-persona.js';
+import {
+  getGlobalPersonaRegistry,
+  awaitGlobalPersonaLoad,
+  reloadGlobalPersonaRegistry,
+  _resetGlobalPersonaRegistryForTest,
+} from '../../persona/global-registry.js';
+import { handleTuiChatPersona, TuiChatPersonaSelection, tuiChatPersonaMessages, tuiChatPersonaSources } from './chat-persona.js';
 import { SLASH_COMMANDS } from '../../chat/index.js';
 import { buildDashboardSlashRegistry } from './dashboard-handlers.js';
 import type { DashboardSlashContext } from './dashboard-handlers.js';
@@ -141,5 +146,57 @@ describe('TUI conversation persona', () => {
     await handleTuiChatPersona(['-'], session.id, selection);
     expect(loadSession(session.id)?.meta.chatPersonaId).toBeUndefined();
     expect(loadSession(session.id)?.meta.personaId).toBe('resident-identity');
+  });
+
+  test('TUI-SPEECH-STYLE-CHARACTER: 동작 출처 보존이 조각 7/9 범위에서 그대로 구현되었는지 — 원문에', async () => {
+    const originalDir = mkdtempSync(join(tmpdir(), 'tui-persona-preserve-origin-'));
+    const contaminatedDir = mkdtempSync(join(tmpdir(), 'tui-persona-preserve-contam-'));
+    try {
+      writeFileSync(join(originalDir, 'probe.yaml'), [
+        'personaId: persona-preserve-probe',
+        'displayName: 적용 시점 출처 이름',
+        'systemPrompt: 적용 시점 시스템 프롬프트',
+        '',
+      ].join('\n'));
+      await reloadGlobalPersonaRegistry(originalDir);
+      const selection = new TuiChatPersonaSelection();
+      const sessionId = 'tui-persona-source-preservation-probe';
+      expect(tuiChatPersonaSources(sessionId, selection)).toBeUndefined();
+      await handleTuiChatPersona(['persona-preserve-probe'], sessionId, selection);
+      const applied = tuiChatPersonaSources(sessionId, selection);
+      expect(applied?.personaId).toBe('persona-preserve-probe');
+      expect(applied?.displayName).toBe('적용 시점 출처 이름');
+      expect(tuiChatPersonaMessages(sessionId, selection))
+        .toEqual([{ role: 'system', content: '적용 시점 시스템 프롬프트' }]);
+      // 적용 후 registry 교체·오염 — 같은 id, 다른 displayName·systemPrompt
+      writeFileSync(join(contaminatedDir, 'probe.yaml'), [
+        'personaId: persona-preserve-probe',
+        'displayName: 오염된 출처 이름',
+        'systemPrompt: 오염된 시스템 프롬프트',
+        '',
+      ].join('\n'));
+      await reloadGlobalPersonaRegistry(contaminatedDir);
+      const contaminated = getGlobalPersonaRegistry().get('persona-preserve-probe');
+      expect(contaminated?.displayName).toBe('오염된 출처 이름');
+      expect(contaminated?.systemPrompt).not.toBe('적용 시점 시스템 프롬프트');
+      // 보존 관측: 조회는 적용 시점 스냅샷을 반환한다 — registry 현재값이 아니다
+      const preserved = tuiChatPersonaSources(sessionId, selection);
+      expect(preserved?.personaId).toBe('persona-preserve-probe');
+      expect(preserved?.displayName).toBe('적용 시점 출처 이름');
+      const preservedSource = preserved?.sources.find(source => source.kind === 'persona');
+      expect(preservedSource?.id).toBe('persona-preserve-probe');
+      expect(preservedSource?.length).toBe('적용 시점 시스템 프롬프트'.length);
+      expect(preservedSource?.preview).toContain('적용 시점');
+      expect(tuiChatPersonaMessages(sessionId, selection))
+        .toEqual([{ role: 'system', content: '적용 시점 시스템 프롬프트' }]);
+      await handleTuiChatPersona(['-'], sessionId, selection);
+      expect(tuiChatPersonaSources(sessionId, selection)).toBeUndefined();
+      expect(tuiChatPersonaMessages(sessionId, selection)).toEqual([]);
+    } finally {
+      _resetGlobalPersonaRegistryForTest();
+      await awaitGlobalPersonaLoad();
+      rmSync(originalDir, { recursive: true, force: true });
+      rmSync(contaminatedDir, { recursive: true, force: true });
+    }
   });
 });

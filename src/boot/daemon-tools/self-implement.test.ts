@@ -561,7 +561,7 @@ describe('dispatchSelfImplement — recentStepCounts wiring', () => {
     expect(result).toEqual(buildLaunchedToolResult(expected));
     expect(authorCalls).toBe(1);
     expect(configs).toHaveLength(1);
-    expect(configs[0]).toEqual({});
+    expect(configs[0]).toEqual({ repositoryRoot: '/tmp' });
     expect(Object.hasOwn(configs[0] ?? {}, 'recentStepCounts')).toBe(false);
     expect(Object.hasOwn(configs[0] ?? {}, 'adversarialReview')).toBe(false);
     expect(Object.hasOwn(configs[0] ?? {}, 'adversarialReviewSource')).toBe(false);

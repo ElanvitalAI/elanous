@@ -541,7 +541,17 @@ async function captureGateBaselineLog(
     if (event === 'gate.baseline') calls.push({ category, data: data ?? {} });
   }) as never);
   try {
-    const res = await captureGateOpts(files, opts);
+    // This suite measures baseline attribution, not the changed-test RED witness.
+    // Supply a valid witness so the independent gate contract does not mask the
+    // attribution verdict under test.
+    const testFile = files.find((file) => /\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(file));
+    const res = await captureGateOpts(files, {
+      ...opts,
+      ...(!opts.runVerifyByBreaking && testFile ? { runVerifyByBreaking: () => ({
+        files: [{ file: testFile, classification: 'distinguishes' as const, base: { status: 'test-fail' as const } }],
+        baseStatuses: { pass: 0, 'test-fail': 1, unknown: 0 },
+      }) } : {}),
+    });
     return { calls, passed: res.passed, baselineFailures: res.baselineFailures, reflectGateFacts: res.reflectGateFacts, baselineInput: res.baselineInput, cwd: res.cwd };
   } finally {
     spy.mockRestore();
@@ -789,7 +799,7 @@ describe('defaultSeams.gate — gate.baseline 귀속 네 수', () => {
     expect(got.calls[0]?.data.baselineScope).toBe('worktree-bundle');
   });
 
-  it('실패가 있는 게이트의 통과·실패 판정은 이번 변경 전과 같다', async () => {
+  it('실패가 있는 게이트는 귀속 네 수를 보존하고 head PASS 없이는 통과하지 않는다', async () => {
     const worktreeLog = ['src/a.test.js:', '(fail) only a'].join('\n');
     const introduced = await captureGateBaselineLog(['src/a.js', 'src/a.test.js', 'src/b.js', 'src/b.test.js'], {
       testStep: { ok: false, output: worktreeLog },
@@ -800,7 +810,7 @@ describe('defaultSeams.gate — gate.baseline 귀속 네 수', () => {
       runGateBaseline: () => ({ status: 'test-fail', output: worktreeLog, log: 'base reproduced' }),
     });
     expect(introduced.passed).toBe(false);
-    expect(preexisting.passed).toBe(true);
+    expect(preexisting.passed).toBe(false);
     expect(introduced.calls[0]?.data.introduced).toBe(1);
     expect(preexisting.calls[0]?.data.preexisting).toBe(1);
     expect(introduced.calls[0]?.data.baselineScope).toBe('worktree-bundle');

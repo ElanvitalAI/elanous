@@ -6,6 +6,7 @@ import {
   MODEL_CODE_NAMES,
   MODEL_TARGETS,
   humanWordForModel,
+  modelActualNote,
   modelChangeLine,
   modelOverviewLines,
   resolveModelChoice,
@@ -129,5 +130,23 @@ describe('TUI-MODEL-SESSION-SCOPE — /model scope', () => {
     expect(modelScopeLine('global')).toContain('전역');
     expect(modelScopeLine('session', { tier: 'medium', current: 'high' })).toContain('생각 깊이는 그대로 high');
     expect(modelScopeLine('session', { tier: 'high', current: 'high' })).not.toContain('생각 깊이');
+  });
+});
+
+describe('TUI-MODEL-BADGE-ACTUAL — /model «지금:» 의 이번 턴 실제', () => {
+  test('폴백 턴이면 «처음 → 실제» 를 덧붙인다', () => {
+    expect(modelActualNote('gpt-6-sol', { model: 'grok-4.3', provider: 'grok', fallbackFrom: 'gpt-6-sol' }))
+      .toBe(' · 이번 턴 실제: gpt-6-sol → grok-4.3');
+  });
+
+  test('폴백이 아니어도 «지금:» 이 보이는 모델과 다르면 실제를 덧붙인다', () => {
+    expect(modelActualNote('gpt-5.5-config', { model: 'grok-4.3' })).toBe(' · 이번 턴 실제: grok-4.3');
+  });
+
+  test('보존: 실행이 없거나 이미 보이는 모델과 같으면 아무것도 덧붙이지 않는다', () => {
+    expect(modelActualNote('gpt-6-sol', null)).toBe('');
+    expect(modelActualNote('gpt-6-sol', undefined)).toBe('');
+    expect(modelActualNote('gpt-6-sol', { model: 'gpt-6-sol' })).toBe('');
+    expect(modelActualNote(null, { model: '  ' })).toBe('');
   });
 });

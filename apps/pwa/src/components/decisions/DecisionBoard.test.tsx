@@ -223,6 +223,52 @@ test('bulk decision over irreversible cards waits for one explicit re-confirmati
   expect(root.findAllByType('article')).toHaveLength(0);
 });
 
+test('OPS-BOARD-FU: an open card renders all seven judgement cells from the served ledger and folds them away', async () => {
+  const card = { ...item('cells', false, '2026-10-21T00:00:00Z'), raisedAt: '2026-10-19T00:00:00Z',
+    history: [
+      { type: 'raised', at: '2026-10-19T00:00:00Z', by: 'OP' },
+      { type: 'options-added', at: '2026-10-20T00:00:00Z', by: 'MK', choice: '대기' },
+    ],
+    precedent: { id: 'prev-1', title: '결정 prev-1', choice: '진행', decidedAt: '2026-10-18T00:00:00Z', decidedBy: 'human' } };
+  const root = await mount(async () => json({ decisions: [card] }));
+  const first = root.findAllByType('article')[0]!;
+  for (const label of ['무엇', '지금까지', '이전 같은 갈래 결정', '지금 상태 재측', '선택지별 결과', '권고와 근거', '그냥 두면']) {
+    expect(text(first)).toContain(label);
+  }
+  expect(text(first)).toContain('2026. 10. 19. 09:00 KST OP 올림');
+  expect(text(first)).toContain('2026. 10. 20. 09:00 KST MK 선택지 추가 → 대기');
+  expect(text(first)).toContain('결정 prev-1 → 진행 · 2026. 10. 18. 09:00 KST · 대표 결정');
+  expect(text(first)).toContain('TC 교차 확인 · 2026. 10. 4. 09:00 KST · 검토');
+  expect(text(first)).toContain('A) 진행 — 진행 결과');
+  expect(text(first)).toContain('B) 대기 — 대기 결과');
+  expect(text(first)).toContain('진행 — 빠르다');
+  expect(text(first)).not.toContain('확신');
+  expect(text(first)).toContain('기한 2026. 10. 21. 09:00 KST 이 지나면 열린 채로 남습니다');
+  await act(async () => { button(root, '무엇 접기').props.onClick(); });
+  expect(button(root, '무엇 펼치기').props['aria-expanded']).toBe(false);
+  await act(async () => { button(root, '무엇 펼치기').props.onClick(); });
+  expect(button(root, '무엇 접기').props['aria-expanded']).toBe(true);
+  expect(button(root, '판단 칸 접기').props['aria-expanded']).toBe(true);
+  await act(async () => { button(root, '판단 칸 접기').props.onClick(); });
+  expect(text(root)).not.toContain('OP 올림');
+  expect(button(root, '판단 칸 펼치기').props['aria-expanded']).toBe(false);
+  await act(async () => { button(root, '판단 칸 펼치기').props.onClick(); });
+  expect(text(root)).toContain('OP 올림');
+});
+
+test('OPS-BOARD-FU: unrecorded judgement cells stay explicit instead of being invented', async () => {
+  const bare = { ...item('bare'), title: '', recommendation: { skipped: true as const, reason: '판단 보류' },
+    crossCheck: [], crossCheckSkipped: '자료 없음', history: [], precedent: null };
+  const root = await mount(async () => json({ decisions: [bare] }));
+  const first = root.findAllByType('article')[0]!;
+  expect(first.findAllByType('dd').map(node => text(node))).toContain('미기재');
+  expect(text(first)).toContain('원장 기록 없음 · 제기 시각 미상');
+  expect(text(first)).toContain('이전 같은 갈래 결정 없음');
+  expect(text(first)).toContain('교차 확인 없음 · 자료 없음');
+  expect(text(first)).toContain('권고 없음: 판단 보류');
+  expect(text(first)).toContain('기한 없음 — 그대로 두면 계속 열린 채로 남습니다');
+});
+
 test('individual decision clears bulk re-confirmation after changing its target set', async () => {
   const cards = [item('first', true), item('second', true)];
   const posts: string[] = [];
@@ -238,4 +284,18 @@ test('individual decision clears bulk re-confirmation after changing its target 
   await act(async () => { button(root, '권고대로 일괄 결정').props.onClick(); });
   expect(posts).toHaveLength(1);
   expect(text(root.findByProps({ role: 'status' }))).toContain('되돌릴 수 없는 결정 1건 포함');
+});
+
+test('OPS-BOARD-FU: a precedent whose deciding actor is unrecorded shows unknown instead of an autonomous decision', async () => {
+  const unrecorded = { ...item('unknown-cell'),
+    precedent: { id: 'prev-u', title: '결정 prev-u', choice: '진행', decidedAt: '2026-10-18T00:00:00Z' } };
+  const autonomous = { ...item('auto-cell'),
+    precedent: { id: 'prev-a', title: '결정 prev-a', choice: '진행', decidedAt: '2026-10-18T00:00:00Z', decidedBy: 'auto' } };
+  const root = await mount(async () => json({ decisions: [unrecorded, autonomous] }));
+  const articles = root.findAllByType('article');
+  const unknownCard = articles.find(node => text(node).includes('결정 unknown-cell'))!;
+  const autoCard = articles.find(node => text(node).includes('결정 auto-cell'))!;
+  expect(text(unknownCard)).toContain('결정 prev-u → 진행 · 2026. 10. 18. 09:00 KST · 결정 주체 미상');
+  expect(text(unknownCard)).not.toContain('자율 결정');
+  expect(text(autoCard)).toContain('결정 prev-a → 진행 · 2026. 10. 18. 09:00 KST · 자율 결정');
 });

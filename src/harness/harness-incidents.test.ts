@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { hostname, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { Command } from 'commander';
-import { detectBursts, detectCommonCauseBursts, findIncidentPrecedents, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit, type RunExit } from './harness-incidents.js';
+import { classifyIncidentReasonFromLastLines, detectBursts, detectCommonCauseBursts, findIncidentPrecedents, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit, type RunExit } from './harness-incidents.js';
 import { installHarnessCliCommand, recordClassifiedHarnessPodExit, warnRecentIncidentBurst } from './harness-cli-command.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { debug } from '../debug/log.js';
@@ -647,3 +647,71 @@ test('findIncidentPrecedents returns only recorded same-reason exits before the 
   // invalid at — 빈 배열
   expect(findIncidentPrecedents({ reason: 'oom', at: 'not-a-date' }, dir)).toEqual([]);
 });
+
+// ── INCIDENT-REASON-FROM-LASTLINES ──
+test('classifyIncidentReasonFromLastLines: 10-22 운영 unknown 사고의 lastLines 꼴을 사유로 나눈다 · 안 맞으면 null', () => {
+  expect(classifyIncidentReasonFromLastLines(['  ❌ failed · 대상 경로: src/dashboard/index.ts — pod-deadline-exceeded'])).toBe('pod-deadline-exceeded');
+  expect(classifyIncidentReasonFromLastLines(['  ❌ blocked · 대상 경로: src/x.ts — DEPENDENCY_NEEDS_HUMAN'])).toBe('dependency-needs-human');
+  // 앞 조각 실패(근본) ⊕ 뒤 조각 의존 막힘(증상) — 근본을 고른다
+  expect(classifyIncidentReasonFromLastLines(['  ❌ failed · a [needs-human] — GOAL_DONE_BOUNDARY_MISSING', '  ❌ blocked · b — DEPENDENCY_NEEDS_HUMAN'])).toBe('goal-done-boundary-missing');
+  expect(classifyIncidentReasonFromLastLines(['  ❌ failed · c [error] — pod-job-failed: Job si-task-1 failed (BackoffLimitExceeded)'])).toBe('pod-backoff-limit');
+  expect(classifyIncidentReasonFromLastLines(['  ❌ failed · d — pod-job-failed: Job si-task-2 failed — childError=no-result'])).toBe('pod-child-no-result');
+  expect(classifyIncidentReasonFromLastLines(['  ❌ failed · e [aborted] — pod-job-failed: Job si-task-3 failed — '])).toBe('pod-job-failed');
+  expect(classifyIncidentReasonFromLastLines(['[supervisor] 정지(needs-human)'])).toBe('needs-human');
+  expect(classifyIncidentReasonFromLastLines(['goal-elaboration needs-human: goal-elaboration-ungrounded-path (attempts: 2) · ungrounded path: src/nowhere.ts'])).toBe('goal-elaboration-ungrounded-path');
+  expect(classifyIncidentReasonFromLastLines(['quoted goal-elaboration-ungrounded-path in unrelated error'])).toBeNull();
+  expect(classifyIncidentReasonFromLastLines(['그냥 끝났다'])).toBeNull();
+  expect(classifyIncidentReasonFromLastLines(undefined)).toBeNull();
+});
+
+test('readRunExits: reason unknown 만 lastLines 로 다시 분류(원문은 recordedReason) · 기록된 구체 reason 은 그대로 · 장치 조각 표지', () => {
+  const root = mkdtempSync(join(tmpdir(), 'incident-reason-'));
+  try {
+    mkdirSync(join(root, 'incidents'), { recursive: true });
+    const rows = [
+      { runId: 'run-a', reason: 'unknown', status: 1, signal: null, at: '2026-10-22T08:00:00.000Z', lastLines: ['  ❌ failed · 대상 경로: src/ux-sim/hq-seats-device.ts — pod-job-failed: Job si-task-x failed (BackoffLimitExceeded'] },
+      { runId: 'run-b', reason: 'pod-failure', status: 1, signal: null, at: '2026-10-22T08:01:00.000Z', lastLines: ['— DEPENDENCY_NEEDS_HUMAN'] },
+      { runId: 'run-c', reason: 'unknown', status: 1, signal: null, at: '2026-10-22T08:02:00.000Z', lastLines: ['아무 실마리 없음'] },
+      { runId: 'run-d', reason: 'unknown', status: 1, signal: null, at: '2026-10-22T08:03:00.000Z', lastLines: ['goal-elaboration needs-human: goal-elaboration-ungrounded-path (attempts: 2) · ungrounded path: src/nowhere.ts'] },
+    ];
+    writeFileSync(join(root, 'incidents', '2026-10-22.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const exits = readRunExits(root);
+    const a = exits.find((e) => e.runId === 'run-a')!;
+    expect(a.reason).toBe('pod-backoff-limit');
+    expect(a.recordedReason).toBe('unknown');
+    expect(a.reasonSource).toBe('lastLines');
+    expect(a.slice).toBe('device');
+    const b = exits.find((e) => e.runId === 'run-b')!;
+    expect(b.reason).toBe('pod-failure'); // 구체 reason 은 덮지 않는다
+    expect(b.reasonSource).toBeUndefined();
+    const c = exits.find((e) => e.runId === 'run-c')!;
+    expect(c.reason).toBe('unknown'); // 추측 0
+    expect(c.recordedReason).toBeUndefined();
+    const d = exits.find((e) => e.runId === 'run-d')!;
+    expect(d).toMatchObject({ reason: 'goal-elaboration-ungrounded-path', recordedReason: 'unknown', reasonSource: 'lastLines' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('readRunExits: reclassified result equals classifyIncidentReasonFromLastLines and keeps recordedReason unknown · recordRunExit 는 사유 원문만 저장', () => {
+  const dir = root();
+  const at = Date.parse('2026-10-22T08:00:00Z');
+  const runALines = ['  ❌ failed · 대상 경로: src/ux-sim/hq-seats-device.ts — pod-job-failed: Job si-task-x failed (BackoffLimitExceeded)'];
+  recordRunExit({ ...row('run-a', 'unknown', at), lastLines: runALines }, dir);
+  const mixedLines = ['  ❌ blocked · b — DEPENDENCY_NEEDS_HUMAN', '  ❌ failed · c — error code: pod-deadline-exceeded'];
+  recordRunExit({ ...row('run-mixed', 'unknown', at + 1), lastLines: mixedLines }, dir);
+  const exits = readRunExits(dir);
+  const a = exits.find((e) => e.runId === 'run-a')!;
+  // base 분류기와 같은 근본 사유('pod-backoff-limit') — 'ux-sim-device' 같은 쓰기 사유는 없다
+  expect(a.reason).toBe('pod-backoff-limit');
+  expect(a.reason).toBe(classifyIncidentReasonFromLastLines(runALines) ?? 'unmatched');
+  expect(a.recordedReason).toBe('unknown');
+  expect(a.reasonSource).toBe('lastLines');
+  expect(a.slice).toBe('device');
+  const mixed = exits.find((e) => e.runId === 'run-mixed')!;
+  // 앞줄 DEPENDENCY_NEEDS_HUMAN(증상)보다 뒷줄 근본 원인이 이긴다 — 'needs-human' 아님
+  expect(mixed.reason).toBe('pod-deadline-exceeded');
+  expect(mixed.reason).toBe(classifyIncidentReasonFromLastLines(mixedLines) ?? 'unmatched');
+  expect(mixed.reason).not.toBe('needs-human');
+  expect(mixed.recordedReason).toBe('unknown');
+});
+

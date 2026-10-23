@@ -2224,7 +2224,13 @@ describe('elanous pr land', () => {
           }));
         }
         expect(calls).not.toContain('merge');
-        expect(edges).toHaveLength(cases.length);
+        // LAND-REFUSAL-EDGES — each measured direct refusal adds one merge → recover (recover@1) binding row.
+        const refusalEdges = edges.filter((edge) => (edge as { on?: string }).on === 'refusal');
+        const recoveryEdges = edges.filter((edge) => (edge as { on?: string }).on === 'recovery');
+        expect(refusalEdges).toHaveLength(cases.length);
+        expect(recoveryEdges).toHaveLength(cases.length);
+        expect(recoveryEdges[0]).toMatchObject({ to: 'recover', call: 'recover@1', mergeSha: null, evidence: { refusalLabel: 'gate-host-busy' },
+          recover: { action: 'wait-retry', delayMs: 30_000 } });
       } finally { off(); rmSync(dir, { recursive: true, force: true }); }
     });
 
@@ -4289,8 +4295,12 @@ describe('pinned PR landing preview', () => {
       const actual = output();
       const edges: { event: string; data?: unknown }[] = [];
       const recoverShadows: { event: string; data?: unknown }[] = [];
+      const recoveryEdges: { event: string; data?: unknown }[] = [];
       const off = debug.registerSink({ name: 'pinned-refusal-route-test', emit: (row) => {
-        if (row.event === 'graph-edge-taken' && (row.data as { from?: string })?.from === 'merge') edges.push(row);
+        // LAND-REFUSAL-EDGES — a pinned refusal also emits one merge → recover (on: recovery) row; count the refusal edge alone.
+        if (row.event === 'graph-edge-taken' && (row.data as { from?: string })?.from === 'merge') {
+          if ((row.data as { on?: string })?.on === 'recovery') recoveryEdges.push(row); else edges.push(row);
+        }
         if (row.event === 'recover-shadow') recoverShadows.push(row);
       } });
       let actualCode: number;
@@ -4301,6 +4311,9 @@ describe('pinned PR landing preview', () => {
       expect(edges).toHaveLength(1);
       expect(edges[0]).toMatchObject({ data: { on: 'refusal', label: isDraft ? 'draft' : 'other',
         to: isDraft ? 'ready' : 'next-move', reason: 'pr-land-refused; recovery-execution=none' } });
+      expect(recoveryEdges).toHaveLength(1);
+      expect(recoveryEdges[0]).toMatchObject({ data: { to: 'recover', call: 'recover@1', mergeSha: null, execution: 'none',
+        evidence: { pr: Number(pr), head, refusalLabel: isDraft ? 'draft' : 'other' } } });
       expect(recoverShadows).toHaveLength(1);
       expect(recoverShadows[0]).toMatchObject({ data: {
         pr: Number(pr), head, label: isDraft ? 'draft' : 'other',

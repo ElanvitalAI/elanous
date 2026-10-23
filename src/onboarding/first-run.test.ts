@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { orderProviderChoices, parseMenuAnswer, promptProviderMenu, runFirstRun } from './first-run.js';
 import { debug } from '../debug/log.js';
@@ -9,6 +9,21 @@ import { unattendedNextStepLine } from './entry-hints.js';
 import { buildUserConfig, saveUserConfig } from '../user-config.js';
 import { needsFirstRun, needsOnboarding } from '../onboarding.js';
 import type { DetectedProvider } from '../llm/provider-detect.js';
+import {
+  FIRST_RUN_MENU_ANSWERS,
+  FIRST_RUN_MENU_CHOICES,
+  FIRST_RUN_MENU_MARKER,
+  FIRST_RUN_SETUP_HINT,
+  driveFirstRunMenu,
+  firstRunPtySupport,
+} from '../ux-sim/onboarding-first-run-device.js';
+
+// FIRST-RUN-EN-LOCALE / must-fix 3: 기존 한국어 단언은 제품의 ko 문면을 기록한다.
+// 러너 환경 locale 과 무관하게 워딩 결정 입력을 고정한다 — 전역 process.env 를 쓰지
+// 않고 runFirstRun 의 deps.locale 로 주입한다(bun test 가 process.env 를 파일 간
+// 공유하므로 모듈 top-level env 설정은 다른 로케일 민감 테스트로 누수된다). 실물 CLI
+// 를 띄우는 시험은 자식 env 에만 ELANOUS_LANG 을 고정한다. 아래 FIRST-RUN-EN-LOCALE
+// 회귀는 자식 환경에 ELANOUS_LANG 을 지우고 LANG 을 명시해 LANG 자체를 시험한다.
 
 const detected = (provider: string, auth: DetectedProvider['auth'] = 'oauth'): DetectedProvider =>
   ({ provider, auth, source: 'test', available: true, rank: 0 });
@@ -101,7 +116,7 @@ describe('first run', () => {
     try {
       const lines: string[] = [];
       let calls = 0;
-      const result = await runFirstRun({ path: f.path, isTTY: true, detectProviders: async () => [],
+      const result = await runFirstRun({ path: f.path, isTTY: true, locale: 'ko', detectProviders: async () => [],
         chooseProvider: async () => { calls++; return 'grok'; }, print: (line) => lines.push(line),
       });
       expect(result).toEqual({ outcome: 'needs-llm', inputs: 1 });
@@ -155,7 +170,7 @@ describe('first run', () => {
     const f = fixture();
     try {
       const lines: string[] = [];
-      const result = await runFirstRun({ path: f.path, isTTY: false,
+      const result = await runFirstRun({ path: f.path, isTTY: false, locale: 'ko',
         detectProviders: async () => [detected('claude-code', 'agent-cli')],
         chooseProvider: async () => { throw new Error('prompted'); }, print: (line) => lines.push(line),
       });
@@ -203,7 +218,7 @@ describe('first run', () => {
     const f = fixture();
     try {
       const lines: string[] = [];
-      const result = await runFirstRun({ path: f.path, isTTY: false,
+      const result = await runFirstRun({ path: f.path, isTTY: false, locale: 'ko',
         detectProviders: async () => [detected('grok'), detected('openai-codex')],
         chooseProvider: async () => { throw new Error('prompted'); }, print: (line) => lines.push(line),
       });
@@ -217,7 +232,7 @@ describe('first run', () => {
     const f = fixture();
     try {
       const lines: string[] = [];
-      const result = await runFirstRun({ path: f.path, isTTY: false, print: (line) => lines.push(line),
+      const result = await runFirstRun({ path: f.path, isTTY: false, locale: 'ko', print: (line) => lines.push(line),
         detectProviders: async () => [detected('openai-codex'), detected('claude-code', 'agent-cli')],
       });
       expect(result).toEqual({ outcome: 'ready', provider: 'openai-codex', inputs: 0 });
@@ -272,7 +287,7 @@ describe('first run', () => {
     const f = fixture();
     try {
       const lines: string[] = [];
-      const result = await runFirstRun({ path: f.path, isTTY: false, detectProviders: async () => [],
+      const result = await runFirstRun({ path: f.path, isTTY: false, locale: 'ko', detectProviders: async () => [],
         chooseProvider: async () => { throw new Error('prompted'); }, print: (line) => lines.push(line),
       });
       expect(result).toEqual({ outcome: 'needs-llm', inputs: 0 });
@@ -280,6 +295,29 @@ describe('first run', () => {
       expect(lines[1]).toBe('next: unattended: `elanous onboarding --non-interactive --config <answers.json>`');
       expect(buildUserConfig(f.path).onboarding.ready).toBeUndefined();
     } finally { f.cleanup(); }
+  });
+
+  // must-fix 3 red witness: 한국어 문면은 전역 ELANOUS_LANG 없이 deps.locale 만으로
+  // 결정되고, 호출은 공유 process.env 를 건드리지 않는다. deps.locale 을 지원하지
+  // 않는 제품(base)은 ELANOUS_LANG 이 지워진 러너에서 영어 fallback 을 내 이 단언과
+  // 어긋나 실패한다 — deps 주입 수정이 env 우연이 아닌 인과임을 증명한다.
+  test('ko wording comes from deps.locale and the shared process env stays untouched', async () => {
+    const saved = process.env.ELANOUS_LANG;
+    delete process.env.ELANOUS_LANG;
+    try {
+      const f = fixture();
+      try {
+        const lines: string[] = [];
+        const result = await runFirstRun({ path: f.path, isTTY: false, locale: 'ko',
+          detectProviders: async () => [detected('openai-codex')], print: (line) => lines.push(line) });
+        expect(result).toEqual({ outcome: 'ready', provider: 'openai-codex', inputs: 0 });
+        expect(lines).toEqual(['감지: codex 구독 → openai-codex']);
+      } finally { f.cleanup(); }
+      expect(process.env.ELANOUS_LANG).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.ELANOUS_LANG;
+      else process.env.ELANOUS_LANG = saved;
+    }
   });
 
   test('completed stays unchanged, including existing settings', async () => {
@@ -371,8 +409,8 @@ describe('first run', () => {
     await expect(promptProviderMenu(ask, [])).resolves.toBe('grok');
     expect(prompts).toHaveLength(5);
     expect(new Set(prompts).size).toBe(1); // the menu never changes between re-asks
-    expect(prompts[0]).toContain('1 Codex');
-    expect(prompts[0]).toContain('2 Grok');
+    expect(prompts[0]).toContain(FIRST_RUN_MENU_CHOICES);
+    expect(prompts[0]).toContain('Enter to cancel');
   });
 
   // ⚠️ util-linux `script -q -e -c` 문법이다 — 맥(BSD script)은 이 문법도, 파이프 입력으로 PTY 를 세우는 것도 못 한다
@@ -388,7 +426,7 @@ describe('first run', () => {
       writeFileSync(join(codexHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'fake-token' } }));
       const env = { ...process.env, HOME: home, CODEX_HOME: codexHome,
         CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
-        ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '',
+        ELANOUS_LANG: 'ko', ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '',
         ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '', XAI_API_KEY: '', GROK_API_KEY: '',
         GROK_CODE_XAI_API_KEY: '', GEMINI_API_KEY: '', GOOGLE_API_KEY: '',
         OPENROUTER_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '',
@@ -449,7 +487,7 @@ describe('first run', () => {
       mkdirSync(configDir);
       const env = { ...process.env, HOME: home, CODEX_HOME: join(home, '.codex'),
         CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
-        ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '',
+        ELANOUS_LANG: 'ko', ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '',
         ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '', XAI_API_KEY: '', GROK_API_KEY: '',
         GROK_CODE_XAI_API_KEY: '', GEMINI_API_KEY: '', GOOGLE_API_KEY: '',
         OPENROUTER_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '',
@@ -459,7 +497,7 @@ describe('first run', () => {
       // Warm Bun's transpile cache for this HOME once; the budget is elanous's own path, not a cold compile.
       spawnSync(process.execPath, [resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir, '--version'],
         { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 30000 });
-      const processChild = spawn('sh', ['-c', 'script -q -e -c "$1" /dev/null', 'sh', cli],
+      const processChild = spawn('sh', ['-c', 'script -q -e -c "$1" /dev/null', 'sh', 'stty rows 40 cols 120; exec ' + cli],
         { cwd: resolve(import.meta.dir, '../..'), env, stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
@@ -469,7 +507,7 @@ describe('first run', () => {
       let timedOut = false;
       processChild.stdout.setEncoding('utf8').on('data', (chunk: string) => {
         stdout += chunk;
-        const shown = stdout.split('Choose LLM').length - 1;
+        const shown = stdout.split(FIRST_RUN_MENU_MARKER).length - 1;
         if (shown > menus) {
           menus = shown;
           const answer = answers[sent++];
@@ -485,8 +523,8 @@ describe('first run', () => {
       expect(timedOut).toBe(false);
       expect(status).toBe(0);
       // 판정선: 첫 질문 + miss 세 번(4=범위 밖 · 1e0=수식 표기 · １=전각) = 같은 메뉴 네 번
-      expect(stdout.split('Choose LLM').length - 1).toBe(4);
-      expect(stdout).toContain('1 Codex, 2 Grok, 3 Claude');
+      expect(stdout.split(FIRST_RUN_MENU_MARKER).length - 1).toBe(4);
+      expect(stdout).toContain(FIRST_RUN_MENU_CHOICES);
       // needs-llm 착지: 선택은 했지만 쓸 수 있는 자격이 없어 ready 는 기록되지 않는다
       expect(stdout).toContain('eln setup llm 으로 고르세요');
       expect(buildUserConfig(join(configDir, 'config.json')).onboarding.ready).toBeUndefined();
@@ -502,7 +540,7 @@ describe('first run', () => {
       mkdirSync(configDir);
       const env = { ...process.env, HOME: home, CODEX_HOME: join(home, '.codex'),
         CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
-        ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '', LOCAL_LLM_URL: '' };
+        ELANOUS_LANG: 'ko', ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '', LOCAL_LLM_URL: '' };
       const cli = [process.execPath, resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir];
       const cwd = resolve(import.meta.dir, '../..');
       // Warm Bun's transpile cache for this HOME once; the budget is elanous's own path, not a cold compile.
@@ -552,7 +590,7 @@ describe('first run', () => {
       mkdirSync(configDir);
       const env = { ...process.env, HOME: home, CODEX_HOME: join(home, '.codex'),
         CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
-        ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '',
+        ELANOUS_LANG: 'ko', ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '',
         ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '', XAI_API_KEY: '', GROK_API_KEY: '',
         GROK_CODE_XAI_API_KEY: '', GEMINI_API_KEY: '', GOOGLE_API_KEY: '',
         OPENROUTER_API_KEY: '', CLAUDE_CODE_OAUTH_TOKEN: '', ANTHROPIC_AUTH_TOKEN: '',
@@ -596,4 +634,99 @@ describe('first run', () => {
       expect(buildUserConfig(join(configDir, 'config.json')).onboarding).toMatchObject({ ready: true, completed: false });
     } finally { f.cleanup(); }
   }, 65000);
+
+  // 완료 경계 실물: src/ux-sim first-run device — 격리 HOME/config 아래 생산 CLI 를 util-linux PTY 로 띄워
+  // 4 → 1e0 → １ → 1 을 넣고, 동일 메뉴 4회(개수·문면)·invalid 재발문 3회·최종 `eln setup llm 으로 고르세요`·
+  // ready 미기록을 잰다. Darwin skip 이유: BSD `script` 는 util-linux `script -q -e -c` 와 플래그가 달라
+  // 이 PTY 무대를 못 만든다(firstRunPtySupport().reason 이 같은 뜻을 반환한다).
+  test.skipIf(!firstRunPtySupport().available)(
+    'FIRST10-FIX-FU: PTY에 주입하는 입력은 4, 1e0, 전각 １, 1 순서 그대로다',
+    async () => {
+      const observed = await driveFirstRunMenu();
+      // 생산 프롬프트 문면(promptProviderMenu) — 메뉴 문면 동일성은 이 줄 전체로 잰다.
+      const promptLine = `Choose LLM (${FIRST_RUN_MENU_CHOICES}; Enter to cancel): `;
+      const promptPrints = observed.stdout.split(promptLine).length - 1;
+      // 실측 기록(보고서 행): 실행한 정확한 명령과 stdout/stderr 발췌를 남긴다.
+      console.log(JSON.stringify({
+        command: `script -q -e -c '${observed.childCommand.join(' ')}' /dev/null`,
+        menuRenderCount: observed.menuRenderCount,
+        promptPrints,
+        status: observed.status,
+        stdoutExcerpt: observed.stdout.slice(-420),
+        stderrExcerpt: observed.stderr.slice(-240),
+      }));
+      expect(observed.timedOut).toBe(false);
+      expect(observed.status).toBe(0);
+      // 입력 순서: 4(범위 밖) → 1e0(수식 표기) → １(전각) → 1(정상 선택).
+      expect(observed.answersSent).toEqual([...FIRST_RUN_MENU_ANSWERS]);
+      // 동일 메뉴 4회 — 개수(marker 기준)와 문면(전체 프롬프트 줄) 둘 다 4.
+      expect(observed.menuRenderCount).toBe(4);
+      expect(promptPrints).toBe(4);
+      // invalid 진단 3회 — 생산 처방은 별도 문구가 아니라 동일 문면 재발문(miss 루프)이므로
+      // 첫 렌더 이후 재발문 수 = 4 - 1 = 3 이 곧 invalid 진단 횟수다.
+      expect(observed.menuRenderCount - 1).toBe(3);
+      // 최종 needs-llm/next-step 안내.
+      expect(observed.finalPhrase).toBe(FIRST_RUN_SETUP_HINT);
+      // 격리 config 에 onboarding.ready 부재.
+      expect(observed.readyRecorded).toBe(false);
+      // 생산 진입 형태: bin/elanous.mjs --test --config-dir <격리> — 테스트 전용 chooser 흉내가 아니다.
+      expect(observed.childCommand.slice(2)).toEqual(['--test', '--config-dir', dirname(observed.configPath)]);
+      // util-linux `script` 가 실제로 불렸다는 fake-bin 기록.
+      expect(observed.scriptCall).not.toBeNull();
+    },
+    120_000,
+  );
+
+  // FIRST-RUN-EN-LOCALE 완료 경계 실물: 격리 HOME/config 아래 실제 CLI 를 LANG 로 띄우면
+  // 사용자 대면 fallback 문구가 기존 detectLocale 결정을 따른다. ELANOUS_LANG 을 자식
+  // 환경에서 지워 LANG 자체가 실제로 시험되게 한다.
+  const localeEnv = (home: string) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, CODEX_HOME: join(home, '.codex'),
+      CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
+      ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '', LOCAL_LLM_URL: '' };
+    delete env.ELANOUS_LANG;
+    return env;
+  };
+
+  test('FIRST-RUN-EN-LOCALE: LANG=en_US.UTF-8 real CLI (no ELANOUS_LANG) prints English offline + LLM next step', () => {
+    const f = fixture();
+    try {
+      const home = join(f.dir, 'home');
+      const configDir = join(f.dir, 'cfg');
+      mkdirSync(home);
+      mkdirSync(configDir);
+      const env = { ...localeEnv(home), LANG: 'en_US.UTF-8', LC_ALL: '', LC_MESSAGES: '' };
+      const child = spawnSync(process.execPath,
+        [resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir],
+        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60000 });
+      const text = child.stdout + child.stderr;
+      expect(child.error).toBeUndefined();
+      expect(text).toContain('offline mode');
+      expect(text).toContain('pick a provider via eln setup llm');
+      expect(text).not.toContain('오프라인 모드');
+      expect(text).not.toContain('eln setup llm 으로 고르세요');
+      expect(buildUserConfig(join(configDir, 'config.json')).onboarding.ready).toBeUndefined();
+    } finally { f.cleanup(); }
+  }, 120_000);
+
+  test('FIRST-RUN-EN-LOCALE: LANG=ko_KR.UTF-8 control keeps Korean offline + LLM next step', () => {
+    const f = fixture();
+    try {
+      const home = join(f.dir, 'home');
+      const configDir = join(f.dir, 'cfg');
+      mkdirSync(home);
+      mkdirSync(configDir);
+      const env = { ...localeEnv(home), LANG: 'ko_KR.UTF-8', LC_ALL: '', LC_MESSAGES: '' };
+      const child = spawnSync(process.execPath,
+        [resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir],
+        { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60000 });
+      const text = child.stdout + child.stderr;
+      expect(child.error).toBeUndefined();
+      expect(text).toContain('오프라인 모드');
+      expect(text).toContain('eln setup llm 으로 고르세요');
+      expect(text).not.toContain('offline mode');
+      expect(text).not.toContain('pick a provider via eln setup llm');
+      expect(buildUserConfig(join(configDir, 'config.json')).onboarding.ready).toBeUndefined();
+    } finally { f.cleanup(); }
+  }, 120_000);
 });

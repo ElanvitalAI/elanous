@@ -1,7 +1,7 @@
 import type { WizardIO } from '../../onboarding.js';
 import type { SetupCheckResult } from '../setup-status.js';
 import type { TailscaleProbe } from './tailscale-probe.js';
-import { createManagementStarterContract } from '../../persona/presets.js';
+import { clonePreset, createManagementStarterContract, type PersonaPreset, type PersonaWriteOptions, type PersonaWriteResult } from '../../persona/presets.js';
 
 export interface FirstBootWizardDeps {
   io: WizardIO;
@@ -39,9 +39,12 @@ export type FirstBootResult =
 
 /** 직업 질문 답의 정규화 — «1»·«경영»·«management» 는 경영,
  *  나머지(빈 답 포함)는 일반(현재 첫 실행 동작 유지). */
-export function normalizeOccupationChoice(input: string): 'management' | 'general' {
+export type OccupationChoice = 'management' | 'marketing' | 'general';
+
+export function normalizeOccupationChoice(input: string): OccupationChoice {
   const v = input.trim().toLowerCase();
   if (v === '1' || v === '경영' || v === 'management') return 'management';
+  if (v === '3' || v === '마케팅' || v === 'marketing') return 'marketing';
   return 'general';
 }
 
@@ -108,6 +111,45 @@ function printPwaSetupBanner(deps: FirstBootWizardDeps): void {
   deps.io.print('');
 }
 
+/** 0.2.35 PERSONA-STARTER-FU — 첫 실행 «마케팅» 스타터 계약 원본. 경계 계약상
+ *  완료 경계 코드(first-boot-wizard.ts) 안에서 기존 clonePreset 파이프라인으로
+ *  persona store 에 정확히 한 장 쓴다. */
+const MARKETING_STARTER_PRESET: PersonaPreset = {
+  personaId: 'starter-marketing',
+  displayName: '마케팅 스타터',
+  names: ['마케팅 스타터', '마케팅', 'starter-marketing'],
+  role: '마케팅 파트너',
+  title: '첫 실행 스타터',
+  oneLine: '고객·메시지·채널을 같이 세우는 짝.',
+  voice: {
+    rule: '짧고 단정하게 — 고객 말로 먼저, 근거 한 줄.',
+    examples: [
+      '이번 주 메시지는 하나로 좁힙니다 — 첫 화면에서 5초 안에 남는 문장.',
+      '그 채널은 도달 근거가 부족합니다 — 가장 싼 실험부터 하시죠.',
+    ],
+  },
+  tasks: [
+    { when: '아침 루프', what: '채널 반응·미결 발행물을 한 화면에 모아 첫 판단을 준다' },
+    { when: '메시지가 갈릴 때', what: '후보 문장을 셋으로 좁혀 고객·채널·되돌림 수단을 나란히 놓는다' },
+    { when: '주간 정산', what: '지난 발행과 실제 반응을 대조해 다음 메시지 기준을 고친다' },
+  ],
+  tools: [],
+  firstQuestions: [
+    '지금 가장 급한 고객 메시지는 무엇인가요?',
+    '이번 주에 꼭 내보낼 채널이 있나요?',
+  ],
+  doesNot: [
+    '고객 개인정보를 외부에 전송하지 않는다',
+    '합의되지 않은 광고·발행을 대신 실행하지 않는다',
+  ],
+  forWhom: '처음 elanous 를 여는 마케터 — 고객·메시지·채널을 함께 시작하려는 사람.',
+};
+
+/** 첫 실행 «마케팅» 선택이 부르는 유일한 제작 입구 — 스타터 계약 한 장을 persona store 에 쓴다. */
+export function createMarketingStarterContract(opts: PersonaWriteOptions = {}): PersonaWriteResult {
+  return clonePreset(MARKETING_STARTER_PRESET, MARKETING_STARTER_PRESET.displayName, opts);
+}
+
 /** 0.2.29 PERSONA-STARTER — 직업 질문. «경영»이면 경영 스타터 계약 한 장을
  *  만들고, 일반이면 계약 없이 현재 흐름 그대로. 계약 생성이 실패해도
  *  wizard 결과는 completed 로 유지한다(fail-soft). */
@@ -120,20 +162,26 @@ async function askOccupationAndCreateStarter(
   io.print('');
   io.print('  어떤 일을 하세요? 고르면 스타터 계약 한 장을 만듭니다.');
   io.print('    1) 경영 — 방향·판단·운영을 함께 세우는 경영 스타터');
+  io.print('    3) 마케팅 — 고객·메시지·채널을 함께 세우는 마케팅 스타터');
   io.print('    2) 일반 — 지금처럼 계속 (스타터 계약 없이)');
   let answer: string;
   try {
-    answer = await io.ask('  선택 (1/2 · Enter=일반): ');
+    answer = await io.ask('  선택 (1/2/3 · Enter=일반): ');
   } catch (err) {
     out.error(`first-boot wizard: occupation question failed: ${(err as Error).message}`);
     return undefined;
   }
-  if (normalizeOccupationChoice(answer) !== 'management') return undefined;
+  const choice = normalizeOccupationChoice(answer);
+  if (choice === 'general') return undefined;
   try {
-    const written = createManagementStarterContract(
-      deps.starterContractDir ? { dir: deps.starterContractDir } : {},
-    );
-    io.print(`  ✓ 경영 스타터 계약이 만들어졌습니다: ${written.path}`);
+    const written = choice === 'management'
+      ? createManagementStarterContract(
+          deps.starterContractDir ? { dir: deps.starterContractDir } : {},
+        )
+      : createMarketingStarterContract(
+          deps.starterContractDir ? { dir: deps.starterContractDir } : {},
+        );
+    io.print(`  ✓ ${choice === 'management' ? '경영' : '마케팅'} 스타터 계약이 만들어졌습니다: ${written.path}`);
     return { personaId: written.personaId, displayName: written.displayName, path: written.path };
   } catch (err) {
     out.error(`first-boot wizard: starter contract failed: ${(err as Error).message}`);

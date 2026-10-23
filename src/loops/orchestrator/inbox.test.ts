@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { runOrchestratorNode } from './tick.js';
 import { coordinatorReply, handleCoordinatorAgentMessage, runCoordinatorAgentInbox, runCoordinatorInbox } from './inbox.js';
 import { LOOP_MESSAGE_ROUTES } from '../msg-address.js';
+import { KNOWHOW_DOC_RELATIVE_PATH, readOnlyRunner, resolveKnowhowDocPath } from './knowhow-pack.js';
 import type { LLMProvider } from '../../llm.js';
 
 test('agent intake answers an ambiguous request once across SSE replay and tick scan', async () => {
@@ -273,4 +274,109 @@ test('disabled orchestrator leaves coordinator requests unread', async () => {
     expect(store.list('MK')).toHaveLength(0);
     expect(store.getCursor('COORDINATOR')).toBe(0);
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+// ── resident OP knowhow pack (K3) on the production intake path ────────────────────────────
+
+/**
+ * Fake-bin measurement stage. The production read-only allowlist and the placeholder
+ * refusal run for real (`readOnlyRunner` over the repository); only the binary's stdout is
+ * canned. A doc command that production would refuse therefore cannot slip through here on
+ * a canned output that happens to match the item's 기대.
+ */
+function measurementStage(output: string) {
+  const commands: string[] = [];
+  const docPath = resolveKnowhowDocPath()!;
+  const repoRoot = docPath.slice(0, -(KNOWHOW_DOC_RELATIVE_PATH.length + 1));
+  const guarded = readOnlyRunner(repoRoot);
+  return {
+    commands,
+    run: (command: string) => {
+      commands.push(command);
+      const refusal = guarded(command);
+      return refusal.skipped ? refusal : { status: 0, output };
+    },
+  };
+}
+
+async function askOPDesk(question: string, output: string, knowhowOff = false, docPath = resolveKnowhowDocPath()!) {
+  const root = mkdtempSync(join(tmpdir(), 'coord-knowhow-'));
+  const store = new MsgStore(join(root, 'msg', 'messages.db'));
+  const stage = measurementStage(output);
+  try {
+    const request = store.post({ from: 'TC', to: 'COORDINATOR', kind: 'question', body: question });
+    const knowhow = knowhowOff ? false : { docPath, runCommand: stage.run };
+    await runOrchestratorNode('intake', { root, runId: 'coord-knowhow', window: '08', mode: 'shadow',
+      coordinatorKnowhow: knowhow, now: new Date('2026-10-14T00:00:00Z') });
+    const replies = store.listReplies(request.id);
+    expect(replies).toHaveLength(1);
+    return { body: replies[0]!.body, commands: stage.commands };
+  } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+}
+
+// Tonight's question sample 1: the landing train refused a branch because it is behind main.
+const LANDING_QUESTION = 'PR #27423 이 «main 보다 뒤» 라며 착지가 거부됐다. rejudge 해도 fromHead 와 toHead 가 같다. 어떻게 하나?';
+
+test('behind-main landing question is answered from the resident pack with K-OP-083', async () => {
+  const { body, commands } = await askOPDesk(LANDING_QUESTION, '2\n');
+  expect(body).toContain('K-OP-083');
+  expect(body).toContain('기대 일치');
+  expect(body).toContain('재는 명령: `rg -c');
+  expect(commands).toHaveLength(1);
+  expect(commands[0]).toContain('rejudge-on-head.ts');
+});
+
+// Tonight's question sample 2: same question, but the item no longer measures what it claims.
+test('contradicted measurement degrades the same question to 모름 with a staleness flag', async () => {
+  const { body } = await askOPDesk(LANDING_QUESTION, '0\n');
+  expect(body.startsWith('제안: 모름')).toBe(true);
+  expect(body).toContain('낡음 의심 (K-OP-083)');
+  expect(body).not.toContain('제안: K-OP-083');
+});
+
+// Tonight's question sample 3: nothing in the pack matches, so the question is kept as a candidate.
+test('an unmatched question answers 모름 and records the 노하우 후보', async () => {
+  const question = '점심 회의실 예약은 어디서 하나?';
+  const { body, commands } = await askOPDesk(question, '2\n');
+  expect(body).toContain('제안: 모름 — OP/자리 판단 필요');
+  expect(body).toContain(`노하우 후보: ${question}`);
+  expect(commands).toHaveLength(0);
+});
+
+test('the fixed traffic rule still answers alone when the pack is switched off', async () => {
+  const { body, commands } = await askOPDesk(LANDING_QUESTION, '2\n', true);
+  expect(body).toContain('제안: 모름');
+  expect(body).toContain('노하우 후보:');
+  expect(body).not.toContain('K-OP-083');
+  expect(commands).toHaveLength(0);
+});
+
+test('a doc command outside the read-only allowlist never runs on the production path', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'coord-knowhow-doc-'));
+  const docPath = join(root, 'KNOWHOW.md');
+  writeFileSync(docPath, [
+    '## K-OP-902 착지 거부 재게이트',
+    '- 상황: PR 이 «main 보다 뒤» 라며 착지가 거부됐다 · rejudge 해도 fromHead 와 toHead 가 같다',
+    '- 신호: 착지 거부 · fromHead 와 toHead 가 같다',
+    '- 재는 명령: `eln tasks rejudge 27423`',
+    '- 기대: 2 줄',
+    '- 처방(힐링): 같은 가지에 merge 해 새 머리를 만든 뒤 rejudge 한다',
+    '- 출처: test · 상태: active',
+    '',
+    '## K-OP-903 문서 지도',
+    '- 상황: 새 자리가 운영 지침 위치를 못 찾는다',
+    '- 신호: main 이력에도 안 뜬다',
+    '- 재는 명령: `rg -c KNOWHOW docs/_index.md`',
+    '- 기대: ≥1',
+    '- 처방(힐링): 지도에 한 줄 남긴다',
+    '- 출처: test · 상태: active',
+    '',
+  ].join('\n'));
+  try {
+    const { body, commands } = await askOPDesk(LANDING_QUESTION, '2\n', false, docPath);
+    expect(body).toContain('K-OP-902');
+    expect(body).toContain('재지 못함 — eln tasks is not read-only (읽기 전용 허용 목록 밖)');
+    expect(body).toContain('재지 못함 — 사람 확인');
+    expect(commands).toHaveLength(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

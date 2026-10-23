@@ -8,6 +8,7 @@ import { describe, expect, test } from 'bun:test';
 import type { CoreTurnContext, CoreTurnResult } from './types.js';
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { DELEGATE_HINT } from '../agent/delegate-hint.js';
 import {
   GOAL_CONTINUATION_PROMPT,
   GOAL_INTENT_STALL_PROMPT,
@@ -105,7 +106,7 @@ describe('GOAL-LOOP-MIDRUN-STALL — 도구 뒤 말뿐인 턴 재촉(런당 1회
     expect(r.calls).toBe(4);
     expect(r.count('intent-stall-midrun')).toBe(1);
     expect(r.lastUserMessages).toEqual([
-      'implement x', GOAL_CONTINUATION_PROMPT, GOAL_INTENT_STALL_PROMPT, GOAL_CONTINUATION_PROMPT,
+      'implement x', `${GOAL_CONTINUATION_PROMPT}\n${DELEGATE_HINT}`, GOAL_INTENT_STALL_PROMPT, GOAL_CONTINUATION_PROMPT,
     ]);
     expect(r.count('text-only-accept')).toBe(1);
     expect(r.result).toEqual({ finalText: '설명만 합니다', iterations: 4, stopReason: 'end_turn', goalComplete: false });

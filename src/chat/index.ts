@@ -19,6 +19,8 @@ import type { PromptRowOwner } from '../display/prompt-row-owner.js';
 // "history-as-source-of-truth" pattern claude-code-fork uses.
 import type { ContentBlock } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { createPasteFold } from './paste-fold.js';
+import { hasClipboardImage, readClipboardText } from '../clipboard/index.js';
 import { matchTextInputGlobalAction } from './global-actions.js';
 import { CTRL_C_ARM_MS, resolveCtrlCInInput } from './ctrl-c-in-input.js';
 import { isTextInputQuitChord } from './input-quit-chord.js';
@@ -742,6 +744,9 @@ export async function textInput(opts: {
    * abort the input session.
    */
   onPasteImage?: () => Promise<string | null>;
+  /** TUI-PASTE-ECHO — Ctrl+V 클립보드 읽기(시험 주입용 · 기본 = clipboard 모듈). 이미지가 없으면 글을 붙여넣는다. */
+  clipboardHasImage?: () => Promise<boolean>;
+  clipboardText?: () => Promise<string | null>;
   /** Dynamic completer for arg-level suggestions (e.g. plugin names). */
   getArgSuggestions?: GetArgSuggestions;
   /** Dynamic completer for `$` skill invocations. */
@@ -927,7 +932,12 @@ export async function textInput(opts: {
   host?: TextInputHost;
   /** H2 내부 턴 문 — 버퍼가 비었을 때 입력 루프가 물러나 호스트가 내부 턴을 실행하게 한다. */
   internalTurnYield?: TextInputInternalTurnYieldPort;
+  /** TUI-PASTE-WHILE-STREAMING — `initialText` 속 붙여넣기 토큰의 원문(턴 중 typeahead 가 접은 것). */
+  initialPastes?: ReadonlyArray<readonly [token: string, raw: string]>;
 }): Promise<InputResult> {
+  // TUI-PASTE-ECHO — 긴 붙여넣기는 입력창에 «[붙여넣음 #k · N줄 · M자]» 로 보이고, 제출 때 원문 전체로 되돌린다.
+  const pasteFold = createPasteFold();
+  if (opts.initialPastes?.length) pasteFold.adopt(opts.initialPastes.filter(([token]) => opts.initialText?.includes(token)));
   const { row: initialRow, col, width, maxLines = 5, prompt = '\u276f ', placeholder = '' } = opts;
   const getWidth = (): number => opts.getWidth?.() ?? width;
   const getRow = (): number => opts.getRow?.() ?? initialRow;
@@ -1451,10 +1461,12 @@ export async function textInput(opts: {
     return result;
   };
   const submitBufferResult = (text: string): InputResult => {
-    debug.log('chat.input.submit', 'summary', summarizeSubmitText(text.trim()));
+    // 입력칸 글만 다듬고(앞뒤 공백) 그다음 원문을 펼친다 — 붙여넣은 원문의 앞뒤 공백·끝 줄바꿈·CRLF 는 그대로 간다(r2 must-fix).
+    const expanded = pasteFold.expand(text.trim());
+    debug.log('chat.input.submit', 'summary', summarizeSubmitText(expanded));
     lastSubmitAt = Date.now();
     return finalizeInput({
-      text: text.trim(),
+      text: expanded,
       submitted: true,
       ...(pendingExternalSubmitSource ? { externalSubmitSource: pendingExternalSubmitSource } : {}),
     });
@@ -1615,7 +1627,8 @@ export async function textInput(opts: {
     // host routing so embedded newlines cannot reach a submit handler.
     if (key.name === 'paste') {
       const pasted = key.paste ?? '';
-      const inserted = opts.onPaste ? await opts.onPaste(pasted) : pasted;
+      const hosted = opts.onPaste ? await opts.onPaste(pasted) : pasted;
+      const inserted = pasteFold.fold(hosted);
       const beforeNumLines = lines.length;
       applyBufferState(insertMultilineTextAtCursor(bufferState(), inserted));
       if (debug.enabled) {
@@ -1817,7 +1830,11 @@ export async function textInput(opts: {
     // to the app (it's their own paste shortcut). Ctrl+V survives in
     // raw mode, so bind there. Also accept `ㅍ` for 한글 IME.
     if (key.ctrl && (key.name === 'v' || key.name === 'V' || key.name === 'ㅍ')) {
-      if (opts.onPasteImage) {
+      // TUI-PASTE-ECHO — 이미지가 있으면 첨부(기존), 없으면 클립보드 «글»을 붙여넣기와 같은 규칙으로 넣는다
+      //   (짧으면 그대로 · 길면 «[붙여넣음 #k · N줄 · M자]»). 예전엔 글이면 «No image» 만 남고 아무것도 안 들어갔다.
+      let hasImage = false;
+      try { hasImage = opts.onPasteImage ? await (opts.clipboardHasImage ?? hasClipboardImage)() : false; } catch { hasImage = false; }
+      if (opts.onPasteImage && hasImage) {
         let token: string | null = null;
         try { token = await opts.onPasteImage(); }
         catch { /* swallow — leave buffer unchanged */ }
@@ -1828,6 +1845,15 @@ export async function textInput(opts: {
         drawAll();
         continue;
       }
+      let clip: string | null = null;
+      try { clip = await (opts.clipboardText ?? readClipboardText)(); } catch { clip = null; }
+      debug.log('tui.paste', 'clipboard-read', { surface: 'classic', chars: clip?.length ?? 0, image: hasImage });
+      if (clip) {
+        applyBufferState(insertMultilineTextAtCursor(bufferState(), pasteFold.fold(clip)));
+        onUserBufferEdit();
+      }
+      drawAll();
+      continue;
     }
 
     if (!key.ctrl && (key.name === 'pageup' || key.name === 'pagedown') && opts.onScrollKey) {

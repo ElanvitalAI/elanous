@@ -1811,14 +1811,14 @@ describe('defaultSeams gate blocking', () => {
     return cwd;
   }
 
-  test('base에서도 실패한 케이스만 있으면 child를 차단하지 않고 결과를 표면화한다', async () => {
+  test('base에서도 실패한 케이스만 있으면 귀속은 보존하되 head PASS 증거 없이는 차단한다', async () => {
     const cwd = changedRepo();
     const output = failLog('test/a.test.js', 'base red');
     const gate = await defaultSeams({
       runIntegrityGate: () => failedGate(output),
       runGateBaseline: () => ({ status: 'test-fail', output, log: 'base reproduced' }),
     }).gate(cwd);
-    expect(gate.passed).toBe(true);
+    expect(gate.passed).toBe(false);
     expect(gate.baselineFailures?.[0]?.attribution).toBe('preexisting');
     expect(gate.log).toContain('이 PR의 책임이 아니다');
   });
@@ -1830,7 +1830,7 @@ describe('defaultSeams gate blocking', () => {
       runIntegrityGate: () => failedGate(output),
       runGateBaseline: () => ({ status: 'test-fail', output, log: 'base reproduced' }),
     }).gate(cwd);
-    expect(gate.passed).toBe(true);
+    expect(gate.passed).toBe(false);
     const line = 'Verify-by-breaking: skipped; reason=test-step-not-ok; child-responsibility=none';
     expect(gate.log).toContain(line);
     expect(gateEvidenceNote(gate)).toContain(line);
@@ -2207,7 +2207,7 @@ describe('defaultSeams gate blocking', () => {
         }),
       }).gate(cwd);
       const observation = records.find((record) => record.category === 'self-implement' && record.event === 'gate.verify-by-breaking');
-      expect(gate.passed).toBe(true);
+      expect(gate.passed).toBe(false);
       expect(gate.log).toContain('Verify-by-breaking: distinguishes=0, does-not-distinguish=0, unknown=3, missing-at-base=0;');
       expect(observation?.data?.unknownReasons).toEqual({
         'module-load-error': 1,
@@ -2301,8 +2301,8 @@ describe('defaultSeams gate blocking', () => {
     expect(gate.log).toContain('Reverse verify-by-breaking: ran=true; head-pass=0, head-test-fail=1, head-unknown=0');
     // ⭐ 핵심 — 기존 reader 가 그 줄을 집어 간다(= 리뷰어 프롬프트에 도달한다).
     expect(gateEvidenceNote(gate)).toContain('Reverse verify-by-breaking: ran=true; head-pass=0, head-test-fail=1, head-unknown=0');
-    // ⭐ 복원이 성공한 경우엔 게이트를 **막지 않는다**(아래 차단 테스트의 대조군이다).
-    expect(gate.passed).toBe(true);
+    // 역방향 관측은 남지만, edited test 의 base RED 가 없으므로 게이트는 막힌다.
+    expect(gate.passed).toBe(false);
   });
 
   // ⛔⭐ **없어진 시험 하나** — 「복원 실패가 게이트를 막는다」(R1·R2 로 만든 것)는 R4 설계 정정으로
@@ -2317,7 +2317,7 @@ describe('defaultSeams gate blocking', () => {
       runVerifyByBreaking: () => ({
         baseStatuses: { pass: 1, 'test-fail': 1, unknown: 1 },
         files: [
-          { file: 'test/distinguishes.test.js', classification: 'distinguishes', base: { status: 'test-fail', output: '1 fail', log: 'base failed' } },
+          { file: 'test/a.test.js', classification: 'distinguishes', base: { status: 'test-fail', output: '1 fail', log: 'base failed' } },
           { file: 'test/nodiff.test.js', classification: 'does-not-distinguish', base: { status: 'pass', output: '1 pass', log: 'base passed too' } },
           { file: 'test/unknown.test.js', classification: 'unknown', base: { status: 'unknown', output: 'module load failed', log: 'module load failed', unknownReason: 'module-load-error' } },
           { file: 'test/new-file.test.js', classification: 'missing-at-base', base: { status: 'test-fail', output: 'base lacks file', log: 'base lacks file' } },
@@ -2326,7 +2326,7 @@ describe('defaultSeams gate blocking', () => {
       runReverseVerifyByBreaking: (_cwd, files, sources) => {
         reverseCalls += 1;
         expect(files).toEqual([
-          'test/distinguishes.test.js',
+          'test/a.test.js',
           'test/nodiff.test.js',
           'test/unknown.test.js',
           'test/new-file.test.js',
@@ -2436,6 +2436,10 @@ describe('defaultSeams gate blocking', () => {
         baselineCalls += 1;
         return { status: 'pass', output: '1 pass', log: 'unused' };
       },
+      runVerifyByBreaking: () => ({
+        files: [{ file: 'test/a.test.js', classification: 'distinguishes', base: { status: 'test-fail' } }],
+        baseStatuses: { pass: 0, 'test-fail': 1, unknown: 0 },
+      }),
     }).gate(cwd);
     expect(gate.passed).toBe(true);
     expect(baselineCalls).toBe(0);

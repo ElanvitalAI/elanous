@@ -3,6 +3,7 @@ import { applyGraphOverlays, type GraphOverlaySpec, type OverlayPatchOp, type Ov
 import { edgeMapOf, graphVersionHash, type GraphEdgeSpec, type GraphNodeSpec, type GraphTemplateSpec } from './graph-yaml.js';
 import { inspectPipelineGraph } from './pipeline-shape.js';
 import { hasNodeKind } from '../graph-kinds/registry.js';
+import { GOAL_TYPES, type GoalType } from './goal-author.js';
 
 /** A proposed change to one existing outcome of a conditional route. Unconditional and fallback edges are protected. */
 export interface GraphVariantRoute {
@@ -24,6 +25,18 @@ export interface GraphVariantPlan {
   readonly growth?: GraphVariantGrowth;
 }
 
+/** 골 분석 중 최초 변형 선택이 보는 «두» 입력 — 문서 전용·저작 등급 같은 원 칸의 다른 축은 이 조각에 없다. */
+export interface GraphVariantGoalAnalysis {
+  readonly goalType: GoalType;
+  readonly targetPathCount: number;
+}
+
+/** 최초 graph variant 선택 — id·선택 이유가 런 원장 옆 .graph.yaml 에 함께 저장되고 재조회된다. */
+export interface GraphVariantSelection {
+  readonly variantId: string;
+  readonly reason: string;
+}
+
 export type GraphVariantRejection =
   | { readonly kind: 'invalid-goal' }
   | { readonly kind: 'unknown-node'; readonly node: string }
@@ -35,25 +48,46 @@ export type GraphVariantRejection =
   | { readonly kind: 'unreachable-terminal'; readonly node: string }
   | { readonly kind: 'invalid-graph'; readonly defects: ReturnType<typeof inspectPipelineGraph> }
   | { readonly kind: 'overlay-rejected'; readonly rejections: readonly OverlayRejection[] }
-  | { readonly kind: 'invalid-growth'; readonly reason: string };
+  | { readonly kind: 'invalid-growth'; readonly reason: string }
+  | { readonly kind: 'invalid-goal-analysis' };
 
 export type GraphVariantResult =
-  | { readonly ok: true; readonly overlay: GraphOverlaySpec; readonly template: GraphTemplateSpec; readonly patches: readonly OverlayPatchOp[] }
+  | { readonly ok: true; readonly overlay: GraphOverlaySpec; readonly template: GraphTemplateSpec; readonly patches: readonly OverlayPatchOp[]; readonly selection?: GraphVariantSelection }
   | { readonly ok: false; readonly rejections: readonly GraphVariantRejection[] };
+
+/** 최초 변형 선택(id·선택 이유)의 결정론적 유도 — 같은 종류·대상 경로 수면 항상 같은 값을 낸다. */
+export function initialGraphVariantSelection(analysis: GraphVariantGoalAnalysis): GraphVariantSelection {
+  const variantId = `variant-${analysis.goalType}-${createHash('sha256')
+    .update(JSON.stringify({ goalType: analysis.goalType, targetPathCount: analysis.targetPathCount }))
+    .digest('hex').slice(0, 12)}`;
+  return {
+    variantId,
+    reason: `initial graph variant selected from goal type ${analysis.goalType} with ${analysis.targetPathCount} target path${analysis.targetPathCount === 1 ? '' : 's'}`,
+  };
+}
 
 /** Pure, deterministic variant authoring. Never mutates the supplied template and never writes an overlay. */
 export function createGraphVariant(input: {
   readonly template: GraphTemplateSpec;
   readonly goal: string;
   readonly plan: GraphVariantPlan;
+  readonly goalAnalysis?: GraphVariantGoalAnalysis;
 }): GraphVariantResult {
-  const { template, goal, plan } = input;
+  const { template, goal, plan, goalAnalysis } = input;
   const known = new Set(template.nodes.map((node) => node.nodeId));
   const rejections: GraphVariantRejection[] = [];
   if (!/^g_[a-z0-9_-]+$/i.test(goal)) rejections.push({ kind: 'invalid-goal' });
+  let selection: GraphVariantSelection | undefined;
+  if (goalAnalysis !== undefined) {
+    if (!GOAL_TYPES.includes(goalAnalysis.goalType) || !Number.isSafeInteger(goalAnalysis.targetPathCount) || goalAnalysis.targetPathCount < 0) {
+      rejections.push({ kind: 'invalid-goal-analysis' });
+    } else {
+      selection = initialGraphVariantSelection(goalAnalysis);
+    }
+  }
   if (plan.growth) {
     const { node, from, outcome, returnTo } = plan.growth;
-    if (!node || typeof node !== 'object') return { ok: false, rejections: [{ kind: 'invalid-growth', reason: 'growth requires one new contracted node' }] };
+    if (!node || typeof node !== 'object') return { ok: false, rejections: [...rejections, { kind: 'invalid-growth', reason: 'growth requires one new contracted node' }] };
     const edgeIndex = template.edges.findIndex((edge) => edge.from === from);
     const edge = template.edges[edgeIndex];
     if (!known.has(from) || known.has(node.nodeId) || template.terminalNodes.includes(from) ||
@@ -94,7 +128,7 @@ export function createGraphVariant(input: {
     }
     const unreachable = projected.terminalNodes.filter((terminal) => !reached.has(terminal) || (edges[terminal]?.length ?? 0) !== 0);
     if (unreachable.length) return { ok: false, rejections: unreachable.map((terminal) => ({ kind: 'unreachable-terminal', node: terminal })) };
-    return { ok: true, overlay, template: projected, patches };
+    return { ok: true, overlay, template: projected, patches, ...(selection === undefined ? {} : { selection }) };
   }
   const patches: OverlayPatchOp[] = [];
 
@@ -167,5 +201,5 @@ export function createGraphVariant(input: {
   })) };
   const applied = applyGraphOverlays(validationTemplate, [overlay]);
   if (!applied.ok) return { ok: false, rejections: [{ kind: 'overlay-rejected', rejections: applied.rejections }] };
-  return { ok: true, overlay, template: projected, patches };
+  return { ok: true, overlay, template: projected, patches, ...(selection === undefined ? {} : { selection }) };
 }

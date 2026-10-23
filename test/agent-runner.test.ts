@@ -554,3 +554,112 @@ describe('runAgent — definition model fallback', () => {
     expect(seen).toContain('claude-sonnet-5');
   });
 });
+
+// ── SUBAGENT-ENCAPSULATION — «못 했다»형 답은 안에서 잇는다 · 밖으로는 완료·이상만 ──
+import { classifySubagentExit, SUBAGENT_CONTINUE_INSIDE_CAP, SUBAGENT_CONTINUE_INSIDE_PROMPT } from '../src/agent/runner';
+import { createGlobalSubagentCallable } from '../src/agent/subagent-callable';
+
+describe('SUBAGENT-ENCAPSULATION', () => {
+  function capturingProvider(replies: string[]): { provider: LLMProvider; calls: () => number; lastUser: () => string[]; seen: () => string[][] } {
+    let call = 0;
+    const lastUsers: string[] = [];
+    const seenMessages: string[][] = [];
+    const provider: LLMProvider = {
+      name: 'fake', defaultModel: 'fake-model', available: () => true,
+      async *streamChat(messages) {
+        seenMessages.push(messages.map((m) => `${m.role}:${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`));
+        const u = [...messages].reverse().find((m) => m.role === 'user');
+        lastUsers.push(typeof u?.content === 'string' ? u.content : JSON.stringify(u?.content));
+        yield { type: 'text', delta: replies[Math.min(call++, replies.length - 1)]! };
+      },
+      async *chat(messages, opts) { for await (const ev of provider.streamChat!(messages, opts)) if (ev.type === 'text') yield ev.delta; },
+    };
+    return { provider, calls: () => call, lastUser: () => lastUsers, seen: () => seenMessages };
+  }
+  const FIRST = '과제2 녹화는 아직 하지 못했습니다.';
+  const LAST = '과제2 녹화 완료 · lecture/과제2.mp4';
+  const tools: LLMToolSpec[] = [{ name: 'Read', description: '', parameters: { type: 'object' } }];
+
+  test('반례(10-22 n8n 실물): 첫 답이 «…하지 못했습니다» 면 안에서 이어가 완료 답을 밖으로 낸다', async () => {
+    const reg = new AgentRegistry();
+    const cap = capturingProvider(['과제2 녹화는 아직 하지 못했습니다.', '과제2 녹화 완료 · lecture/과제2.mp4']);
+    const h = reg.spawn({ definition: simpleDefinition(), prompt: '과제2 녹화', tools, provider: cap.provider, dispatchTool: async () => 'ok' });
+    const text = await collectAgentText(h.events);
+    expect(text).toContain('완료');
+    expect(cap.calls()).toBe(2);
+    expect(cap.lastUser()[1]).toBe(SUBAGENT_CONTINUE_INSIDE_PROMPT);
+    expect(h.task.result).toBe('과제2 녹화 완료 · lecture/과제2.mp4');
+  });
+
+  test('r1 must-fix: 안에서 이어간 걸음의 답은 부모 스트림에 안 닿는다 — 텍스트 델타 합 === 마지막 답', async () => {
+    const reg = new AgentRegistry();
+    const cap = capturingProvider([FIRST, LAST]);
+    const h = reg.spawn({ definition: simpleDefinition(), prompt: '과제2 녹화', tools, provider: cap.provider, dispatchTool: async () => 'ok' });
+    let streamed = '';
+    let done = '';
+    for await (const ev of h.events) {
+      if (ev.type === 'text') streamed += ev.delta;
+      if (ev.type === 'done') done = ev.text;
+    }
+    expect(streamed).toBe(LAST);
+    expect(streamed).not.toContain('하지 못했습니다');
+    expect(done).toBe(LAST);
+    // should-fix: 둘째 걸음이 앞 걸음의 답을 이력으로 받는다(안에서 이어가며 잊지 않는다).
+    expect(cap.seen()[1]!.some((m) => m.startsWith('assistant:') && m.includes(FIRST))).toBe(true);
+    expect(cap.seen()[1]!.at(-1)).toBe(`user:${SUBAGENT_CONTINUE_INSIDE_PROMPT}`);
+  });
+
+  test('GOODHART: 실제 부모 소비 경로(subagent-callable)의 출력 === 마지막 답 · 첫 미완 답 없음', async () => {
+    const reg = new AgentRegistry();
+    const cap = capturingProvider([FIRST, LAST]);
+    const callable = createGlobalSubagentCallable({
+      registry: reg,
+      resolveDefinition: () => simpleDefinition({ tools: ['Read'] }),
+      hostTools: tools,
+      dispatchTool: async () => 'ok',
+      provider: cap.provider,
+    });
+    const handle = await callable({ definitionName: 'test-agent', prompt: '과제2 녹화' });
+    const result = await handle.done;
+    expect(result.status).toBe('completed');
+    expect(result.output).toBe(LAST);
+    expect(result.output).not.toContain(FIRST);
+    expect(cap.calls()).toBe(2);
+  });
+
+  test('한 걸음에 끝나면 텍스트는 그대로 흐른다(버퍼가 답을 삼키지 않는다)', async () => {
+    const reg = new AgentRegistry();
+    const cap = capturingProvider([LAST]);
+    const h = reg.spawn({ definition: simpleDefinition(), prompt: 'x', tools, provider: cap.provider, dispatchTool: async () => 'ok' });
+    let streamed = '';
+    for await (const ev of h.events) if (ev.type === 'text') streamed += ev.delta;
+    expect(streamed).toBe(LAST);
+    expect(cap.calls()).toBe(1);
+  });
+
+  test('이상 상황(BLOCKED:·권한 없음)은 이어가지 않고 바로 밖으로', async () => {
+    const reg = new AgentRegistry();
+    const cap = capturingProvider(['BLOCKED: n8n 로그인 필요 · 세션 재시도 2회']);
+    const h = reg.spawn({ definition: simpleDefinition(), prompt: 'x', tools, provider: cap.provider, dispatchTool: async () => 'ok' });
+    await collectAgentText(h.events);
+    expect(cap.calls()).toBe(1);
+  });
+
+  test('같은 미완 답이 반복되면(같은 원인) 상한 전에 밖으로 · 계속 미완이면 상한에서 멈춘다', async () => {
+    const reg = new AgentRegistry();
+    const same = capturingProvider(['아직 하지 못했습니다.']);
+    const h1 = reg.spawn({ definition: simpleDefinition(), prompt: 'x', tools, provider: same.provider, dispatchTool: async () => 'ok' });
+    await collectAgentText(h1.events);
+    expect(same.calls()).toBe(2);
+    const diff = capturingProvider(['A 는 하지 못했습니다.', 'B 는 하지 못했습니다.', 'C 는 하지 못했습니다.', 'D']);
+    const h2 = reg.spawn({ definition: simpleDefinition(), prompt: 'y', tools, provider: diff.provider, dispatchTool: async () => 'ok' });
+    await collectAgentText(h2.events);
+    expect(diff.calls()).toBe(1 + SUBAGENT_CONTINUE_INSIDE_CAP);
+  });
+
+  test('판별기: 완료·진행 답은 done · 미완형은 incomplete · 이상 사유가 섞이면 abnormal', () => {
+    expect(classifySubagentExit('과제1 MP4 재생 확인 완료')).toBe('done');
+    expect(classifySubagentExit('보너스 영상은 완료되지 않았습니다')).toBe('incomplete');
+    expect(classifySubagentExit('권한이 없어 완료하지 못했습니다')).toBe('abnormal');
+  });
+});

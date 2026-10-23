@@ -51,6 +51,10 @@ export interface BootstrapMcpProxyRuntimesOpts {
   registerRuntime?: typeof registerToolRuntime;
   logger?: McpBootLogger;
   handshakeTimeoutMs?: number;
+  /** CLASSIC-IDLE-MCP-LAZY — classic TUI 만 켠다. MCP 자식을 «첫 도구 호출»
+   *  때 띄우고, 그 전엔 지난 부팅의 툴 인덱스로 목록만 알린다. */
+  lazy?: boolean;
+  toolIndexStore?: RegisterMcpClientsOpts['toolIndexStore'];
 }
 
 const IDLE: McpProxyBootstrapSnapshot = {
@@ -62,6 +66,8 @@ const IDLE: McpProxyBootstrapSnapshot = {
 
 let testOpts: BootstrapMcpProxyRuntimesOpts | null = null;
 let activeHandle: McpProxyBootstrapHandle | undefined;
+let activeClients: McpClientsHandle | undefined;
+let exitHookInstalled = false;
 let lastSnapshot: McpProxyBootstrapSnapshot = IDLE;
 let bootGeneration = 0;
 
@@ -75,6 +81,7 @@ export function setMcpProxyBootstrapOptsForTest(opts: BootstrapMcpProxyRuntimesO
 export function _resetMcpProxyBootstrapForTest(): void {
   bootGeneration += 1;
   activeHandle = undefined;
+  activeClients = undefined;
   lastSnapshot = IDLE;
 }
 
@@ -84,6 +91,24 @@ export function getMcpProxyBootstrapDiagnostics(): McpProxyBootstrapSnapshot {
 
 export function getMcpProxyBootstrapHandle(): McpProxyBootstrapHandle | undefined {
   return activeHandle;
+}
+
+/** 프로세스가 «그냥» 죽는 경로(exit 훅)에서도 MCP 자식이 고아로 남지 않게 마지막
+ *  SIGTERM 을 건다. `process.on('exit')` 은 await 할 수 없으므로 동기 kill 만 쓴다. */
+function installMcpExitHook(): void {
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.once('exit', () => {
+    const clients = activeClients;
+    activeClients = undefined;
+    if (!clients) return;
+    try {
+      const terminated = clients.terminateChildrenSync?.() ?? 0;
+      if (terminated > 0) log('exit-terminate', { terminated });
+    } catch {
+      /* dying process — never throw from an exit hook */
+    }
+  });
 }
 
 function observabilityBootLogger(): McpBootLogger {
@@ -183,11 +208,15 @@ export function bootstrapMcpProxyRuntimes(
         ...(resolved.handshakeTimeoutMs !== undefined
           ? { handshakeTimeoutMs: resolved.handshakeTimeoutMs }
           : {}),
+        ...(resolved.lazy === true ? { lazy: true } : {}),
+        ...(resolved.toolIndexStore ? { toolIndexStore: resolved.toolIndexStore } : {}),
       });
       if (generation !== bootGeneration) {
         try { await result.shutdown(); } catch { /* abandoned boot */ }
         return current;
       }
+      activeClients = result;
+      installMcpExitHook();
       const snap = freezeSnapshot({
         status: 'ready',
         registered: result.registered,

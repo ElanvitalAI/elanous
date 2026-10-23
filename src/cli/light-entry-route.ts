@@ -1,4 +1,4 @@
-export type LightCliRoute = 'msg' | 'release' | 'tasks' | 'pty' | 'logs' | 'config';
+export type LightCliRoute = 'msg' | 'release' | 'tasks' | 'tasks-read' | 'pty' | 'logs' | 'config';
 
 const VALUE_FLAGS = new Set(['--config-dir', '--test-state-dir']);
 const HOT_ROOTS = new Set(['msg', 'pty', 'logs', 'tasks']);
@@ -67,8 +67,11 @@ export function selectLightCliRoute(args: readonly string[]): LightCliRoute | un
   if (command[0] === 'config' && command[1] === 'get' && !args.some(arg => arg === '--reveal' || arg.startsWith('--reveal='))) return 'config';
   if (command[0] === 'release' && command[1] === 'checklist'
     && (command[2] === 'status' || command[2] === 'list')) return 'release';
-  if (command[0] === 'tasks' && (command[1] === 'list' || command[1] === 'show'
-    || (command[1] === 'hand' && args.includes('--help')))) return 'tasks';
+  // CLI-ENTRY-LAZY — list·show 는 그 둘만 등록한다(tasks-read-cli.ts · board·shadow·mission 클러스터 0).
+  if (command[0] === 'tasks' && (command[1] === 'list' || command[1] === 'show')) return 'tasks-read';
+  // 하위 목록 도움말은 전체 등록부가 그린다 — 무거운 모듈은 그 등록부 안에서 실행 때만 싣는다.
+  if (command[0] === 'tasks' && ((command[1] === 'hand' && args.includes('--help'))
+    || (command.length === 1 && args.length === 2 && (args[1] === '--help' || args[1] === '-h')))) return 'tasks';
   if (command[0] === 'pty' && ['list', 'snapshot', 'text', 'state'].includes(command[1] ?? '')) return 'pty';
   if (command[0] === 'logs' && isSupportedLogsShape(args)) return 'logs';
   return undefined;

@@ -25,6 +25,17 @@ import { readActiveForceReleaseRun } from './release-single-flight.js';
 const originalCwd = process.cwd();
 afterEach(() => { if (process.cwd() !== originalCwd) process.chdir(originalCwd); });
 
+function installPinnedReleaseFiles(checkout: string) {
+  const target = join(checkout, 'graphs', 'release');
+  mkdirSync(target, { recursive: true });
+  for (const file of ['release-loop.yaml', 'recipes.yaml'])
+    copyFileSync(join(import.meta.dir, '../../graphs/release', file), join(target, file));
+  return {
+    graphSha: createHash('sha256').update(readFileSync(join(target, 'release-loop.yaml'))).digest('hex'),
+    recipesSha: createHash('sha256').update(readFileSync(join(target, 'recipes.yaml'))).digest('hex'),
+  };
+}
+
 async function seedFailedReleaseRun(root: string, runId = 'recovery-fixture') {
   const version = '9.9.9', checkout = join(root, 'checkout'), bare = join(root, 'origin.git');
   mkdirSync(checkout, { recursive: true });
@@ -1066,11 +1077,14 @@ describe('release run CLI', () => {
     };
     const lines: string[] = [];
     const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+    const messages: string[] = [];
+    const log = spyOn(console, 'error').mockImplementation((message: string) => { messages.push(message); });
     const beforeExit = process.exitCode, previousCwd = process.cwd();
     try {
       git(repo, 'init', '-q', '-b', 'release/0.2.19');
       writeFileSync(join(repo, 'cut.txt'), 'cut\n');
-      git(repo, 'add', 'cut.txt');
+      const graphSnapshot = installPinnedReleaseFiles(repo);
+      git(repo, 'add', 'cut.txt', 'graphs/release');
       git(repo, 'commit', '-q', '-m', 'release cut');
       const cut = git(repo, 'rev-parse', 'HEAD');
       git(root, 'init', '-q', '--bare', remote);
@@ -1084,7 +1098,7 @@ describe('release run CLI', () => {
         path: ['version-release', 'gate', 'tui', 'failed'],
         nodes: [{ nodeId: 'version-release', ok: true, executed: true, exit: 0,
           output: JSON.stringify({ outcome: 'ok', version: '0.2.19', commit: cut, branch: 'release/0.2.19' }) }],
-        executed: 1, dryRun: false, statePath,
+        executed: 1, dryRun: false, statePath, graphSnapshot,
       };
       writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
       const originalState = readFileSync(statePath, 'utf8');
@@ -1094,15 +1108,27 @@ describe('release run CLI', () => {
       process.exitCode = 0;
       const cli = new Command(); registerReleaseCommands(cli);
       await cli.parseAsync(['release', 'resume', '--run', runId, '--from', 'gate', '--no-partial', '--dry-run', '--command-root', repo, '--json'], { from: 'user' });
-      const result = JSON.parse(lines.at(-1)!) as { ok: boolean; gatePlan: { mode: string }; nextAttempt: number; preflight: string };
-      expect(result).toMatchObject({ ok: true, gatePlan: { mode: 'full' }, nextAttempt: 1, preflight: 'passed' });
+      const result = JSON.parse(lines.at(-1)!) as { ok: boolean; gatePlan: { mode: string }; nextAttempt: number; priorCountKnown: boolean; preflight: string };
+      expect(result).toMatchObject({ ok: true, gatePlan: { mode: 'full' }, nextAttempt: 1, priorCountKnown: true, preflight: 'passed' });
+      expect(messages.join('\n')).toContain('시도 1 · 실행·원장 변경 없음');
       expect(process.exitCode).toBe(0);
       expect(readFileSync(statePath, 'utf8')).toBe(originalState);
       expect(existsSync(join(root, 'release', '0.2.19', 'resume-attempts', `${runId}.json`))).toBe(false);
       expect(git(repo, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin')).toBe(refsBefore);
+      // Older resumed runs have no attempt ledger. Their earlier count remains unknown.
+      writeFileSync(statePath, `${JSON.stringify({ ...state, resume: { from: 'gate', at: new Date().toISOString(), previousStatus: 'failed' } }, null, 2)}\n`);
+      const legacyState = readFileSync(statePath, 'utf8');
+      lines.length = 0;
+      messages.length = 0;
+      await cli.parseAsync(['release', 'resume', '--run', runId, '--from', 'gate', '--no-partial', '--dry-run', '--command-root', repo, '--json'], { from: 'user' });
+      const legacyResult = JSON.parse(lines.at(-1)!) as { nextAttempt: number; priorCountKnown: boolean };
+      expect(legacyResult).toMatchObject({ nextAttempt: 1, priorCountKnown: false });
+      expect(messages.join('\n')).toContain('새 원장 기록 1 (이전 횟수 미측정) · 실행·원장 변경 없음');
+      expect(readFileSync(statePath, 'utf8')).toBe(legacyState);
+      expect(existsSync(join(root, 'release', '0.2.19', 'resume-attempts', `${runId}.json`))).toBe(false);
     } finally {
       process.chdir(previousCwd); process.exitCode = beforeExit ?? 0;
-      output.mockRestore(); resetElanousConfigDir(); rmSync(root, { recursive: true, force: true });
+      output.mockRestore(); log.mockRestore(); resetElanousConfigDir(); rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -1665,7 +1691,8 @@ test('actual release resume --dry-run executable prints JSON without mutating ru
   try {
     git(repo, 'init', '-q', '-b', 'release/0.2.19');
     writeFileSync(join(repo, 'cut.txt'), 'cut\n');
-    git(repo, 'add', 'cut.txt');
+    const graphSnapshot = installPinnedReleaseFiles(repo);
+    git(repo, 'add', 'cut.txt', 'graphs/release');
     git(repo, 'commit', '-q', '-m', 'release cut');
     const cut = git(repo, 'rev-parse', 'HEAD');
     git(root, 'init', '-q', '--bare', remote);
@@ -1678,7 +1705,7 @@ test('actual release resume --dry-run executable prints JSON without mutating ru
       path: ['version-release', 'gate', 'tui', 'failed'],
       nodes: [{ nodeId: 'version-release', ok: true, executed: true, exit: 0,
         output: JSON.stringify({ outcome: 'ok', version: '0.2.19', commit: cut, branch: 'release/0.2.19' }) }],
-      executed: 1, dryRun: false, statePath };
+      executed: 1, dryRun: false, statePath, graphSnapshot };
     writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
     const beforeState = readFileSync(statePath, 'utf8');
     const beforeRefs = git(repo, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin');

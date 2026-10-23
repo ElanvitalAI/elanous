@@ -31,6 +31,14 @@ export interface PersonaProfile {
   readonly systemPrompt?: string;
 
   /**
+   * 🗣️ **말투(speech style)** — 이 페르소나가 «어떻게» 말하는가(TUI-SPEECH-STYLE-CHARACTER).
+   *
+   * ⛔ 안 적으면 «없다» — 기본 말투를 조용히 채우지 않는다(`actionHosts`·`capabilities`
+   *    와 같은 규율: 관측이 「선언이 없다」고 말한다).
+   */
+  readonly speechStyle?: string;
+
+  /**
    * 🚧 **이 봇이 «손을 쓸 수 있는» 호스트들** — 되돌릴 수 없는 브라우저 조작의 «경계».
    *
    * ⛔⭐ 대표 이 「쓴다」를 승인했지만 ***되돌리기 장치가 «없다»***. 그리고 2026-08-28 측정이

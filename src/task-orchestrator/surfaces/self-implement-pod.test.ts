@@ -24,6 +24,8 @@ import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
 import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
 import { stablePodRunGuard } from './pod-manifest-test-normalize.js';
+import { POD_PROVENANCE_ENV_NAMES } from './pod-provenance.js';
+import { makeScriptedKubectlDevice, type PodDeviceEvent } from '../../ux-sim/task-orchestrator-surfaces-self-implement-pod-device.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import { userConfigPath, type UserConfig } from '../../user-config.js';
@@ -41,6 +43,17 @@ import { mintGroundingToken } from '../../grounding/token.js';
 import { handlePodGithubCredential, resetPodCredentialRateForTesting } from '../../nexus/api/pod-credential-api.js';
 
 const CREDS = () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' });
+
+/** POD-LAUNCH-PROVENANCE — drop the launch-specific si-task provenance set so a baseline manifest compares the rest. */
+function stripSiTaskProvenance(job: { metadata: { labels?: Record<string, string> }; spec: { template: { metadata: { labels?: Record<string, string>; annotations?: Record<string, string> }; spec: { containers: Array<{ env?: Array<{ name: string }> }> } } } }): void {
+  for (const labels of [job.metadata.labels, job.spec.template.metadata.labels]) {
+    for (const key of Object.keys(labels ?? {})) if (key.startsWith('elanous.ai/')) delete labels![key];
+  }
+  delete job.spec.template.metadata.annotations;
+  for (const container of job.spec.template.spec.containers) {
+    if (container.env) container.env = container.env.filter((entry) => !POD_PROVENANCE_ENV_NAMES.includes(entry.name));
+  }
+}
 
 function fakeKubectl(conditions: string[], logs: string, containerExitCode?: number) {
   const calls: Array<{ args: string; input?: string }> = [];
@@ -814,6 +827,8 @@ test('the host detail switch reaches only matching Pod runs before expiry withou
     // POD9 execution identity annotations are launch-specific; the rest must match the baseline manifest.
     expect(preserved.metadata.annotations?.['elanous.dev/attempt']).toBe('1');
     delete preserved.metadata.annotations;
+    // POD-LAUNCH-PROVENANCE — the launch-specific provenance set is asserted in pod-launch-history.test.ts; the rest matches.
+    stripSiTaskProvenance(preserved);
     expect(preserved).toEqual(baseline);
     expect(secret.stringData['env-ELANOUS_LIVE_DETAIL_UNTIL']).toBeUndefined();
     return detailEnv;
@@ -936,6 +951,8 @@ test('TA warm reuse decision is observed but missing TA evidence keeps the exist
       for (const container of spec.containers ?? []) {
         const runId = container.env?.find((entry: { name: string }) => entry.name === 'ELANOUS_RUN_ID');
         if (runId) runId.value = '<run-id>';
+        // POD-LAUNCH-PROVENANCE — the provenance run id and request time are launch-specific like ELANOUS_RUN_ID.
+        for (const entry of container.env ?? []) if (entry.name === 'ELANOUS_POD_RUN' || entry.name === 'ELANOUS_POD_REQUESTED_AT') entry.value = '<launch>';
         if (typeof container.args?.[0] === 'string') container.args[0] = stablePodRunGuard(container.args[0]);
       }
       for (const volume of spec.volumes ?? []) {
@@ -1262,7 +1279,8 @@ describe('podSelfImplementSpawn', () => {
     expect(action).toContain('const podBase = { hostSupervised: opts.supervise === true,');
     expect(action).toContain('rotationAccounts = plan.accounts');
     expect(action).toContain('{ accountBroker, rotationAccounts }');
-    expect(action).toContain('podSpawn = podSelfImplementSpawn(podBase)');
+    expect(action).toContain("podSpawn = await (await import('./task-orchestrator/surfaces/pod-si-warm-entry.js'))");
+    expect(action).toContain('.podSpawnWithSiWarm(podBase)');
     expect(action).toContain('podSpawn = benchPodSpawn(benchArms, podBase)');
     expect(action).toContain('...(opts.supervise\n          ? {');
   });
@@ -3252,7 +3270,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     const previousState = process.env.ELANOUS_STATE_DIR;
     const child = { stage: 'soft-stopped', ok: false, exitCode: 128, error: 'gh pr create failed', stderr: 'remote rejected the push',
       detail: 'Out-of-scope edits held in the worktree; gate and publication skipped.',
-      outOfScopeEdits: ['src/unrelated.ts'], abandonedClassification: { classification: 'implementation-deficit' },
+      outOfScopeEdits: ['src/unrelated.ts'], scopeStopReasons: ['deletion'], abandonedClassification: { classification: 'implementation-deficit' },
       supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
       terminationReason: { kind: 'goal-only-rework-exhausted' },
       quotaExhaustionAssessment: { accountAvailability: { reason: 'no-candidate', candidateCount: 0 } } };
@@ -3265,7 +3283,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(result.output).not.toContain('outOfScopeEdits');
       expect(result.output).not.toContain('accountAvailability');
       const exitCode = result.exitCode ?? 1;
-      const childEvidence = { classification: 'scope-escape', scopeEscape: true,
+      const childEvidence = { classification: 'scope-escape', scopeEscape: true, scopeStopReasons: ['deletion'],
         error: child.error, detail: child.detail, stderr: child.stderr, exitCode: 128,
         outOfScopeEdits: child.outOfScopeEdits, terminationReason: child.terminationReason,
           abandonedClassification: child.abandonedClassification, supervisorVerdict: 'UNCONVERGEABLE',
@@ -3282,6 +3300,193 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       else process.env.ELANOUS_STATE_DIR = previousState;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  describe('JOB-FAILURE-TERMINATION-CAPTURE — the failure verdict carries this Job\'s termination facts to the incident row', () => {
+    /** The spawn's own calls (context · apply · reattach probe · logs) here; every Job/Pod state read goes to the fake kubectl device. */
+    function terminationLaunch(o: { spaceId: string; event: Omit<PodDeviceEvent, 'jobName'>; logs: string; markerRc?: number;
+      /** After the verdict poll saw Failed: `gc-after-first` — the first Job read answers, later ones are NotFound (GC);
+       *  `throw-first` — the first Job read throws. */
+      afterVerdict?: 'gc-after-first' | 'throw-first' }) {
+      const jobName = podJobName(o.spaceId);
+      const device = makeScriptedKubectlDevice([{ ...o.event, jobName }]);
+      let childRunId = '';
+      let verdictSeen = false;
+      let jobReadsAfterVerdict = 0;
+      const kubectl: Kubectl = (args, input) => {
+        if (o.afterVerdict && args.includes('get') && args.includes('job')) {
+          if (args.includes('jsonpath={.status.conditions[*].type}')) {
+            const answer = device.kubectl(args, input);
+            if (/Failed/.test(answer.stdout)) verdictSeen = true;
+            return answer;
+          }
+          if (verdictSeen) {
+            jobReadsAfterVerdict++;
+            if (o.afterVerdict === 'throw-first' && jobReadsAfterVerdict === 1) throw new Error('kubectl: connection reset');
+            if (o.afterVerdict === 'gc-after-first' && jobReadsAfterVerdict > 1) return { status: 1, stdout: '', stderr: `Error from server (NotFound): jobs.batch "${jobName}" not found` };
+          }
+        }
+        if (args.includes('current-context')) return { status: 0, stdout: 'test-context', stderr: '' };
+        if (args.includes('apply') && input) {
+          const manifest = JSON.parse(input);
+          if (manifest.kind === 'Job') childRunId = manifest.spec.template.spec.containers[0].env.find((e: { name: string }) => e.name === 'ELANOUS_RUN_ID').value;
+          return { status: 0, stdout: '', stderr: '' };
+        }
+        if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+        if (args.includes('logs')) {
+          const marker = o.markerRc === undefined ? '' : `\n__ELANOUS_POD_DONE__ ${childRunId} rc=${o.markerRc}\n`;
+          return { status: 0, stdout: args.includes('--tail=2') ? marker.slice(1) : `${o.logs}${marker}`, stderr: '' };
+        }
+        return device.kubectl(args, input);
+      };
+      return { kubectl, calls: device.calls, jobName };
+    }
+
+    async function runAndRecord(launch: ReturnType<typeof terminationLaunch>, spaceId: string, parent: string, resultMarker: boolean) {
+      const root = mkdtempSync(join(tmpdir(), 'pod-termination-'));
+      const previousState = process.env.ELANOUS_STATE_DIR;
+      const finished: Array<Record<string, unknown>> = [];
+      const off = debug.registerSink({ name: `pod-termination-${spaceId}`, emit: (record) => {
+        if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+      } });
+      try {
+        process.env.ELANOUS_STATE_DIR = root;
+        const result = await podSelfImplementSpawn({ kubectl: launch.kubectl, credentials: CREDS, sleep: async () => {}, resultMarker,
+          env: { ELANOUS_RUN_ID: parent, ELANOUS_STATE_DIR: root } })({ feature: 'x', spaceId }).done;
+        const evidence = loadRunLedger(parent, runLedgerDir(root))?.filter((entry) => entry.event === 'pod-child-evidence').at(-1)?.data;
+        recordClassifiedHarnessPodExit(parent, 'unknown', result.exitCode ?? 1, { output: result.output });
+        return { result, finished, evidence, exits: readRunExits(root) };
+      } finally {
+        off();
+        if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+        else process.env.ELANOUS_STATE_DIR = previousState;
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+
+    test('Job Failed condition path: one read of reason · exitCode · finishedAt · deadline lands as podTermination', async () => {
+      const uid = '0a1b2c3d-0000-4000-8000-0000000000aa';
+      const launch = terminationLaunch({ spaceId: 'term-failed', logs: 'child crashed without a result line\n',
+        event: { kind: 'job-failed-backoff', jobUid: uid, jobConditionType: 'Failed', jobConditionReason: 'BackoffLimitExceeded',
+          activeDeadlineSeconds: 14400, podPhase: 'Failed', containerReason: 'Error', containerExitCode: 1, containerFinishedAt: '2026-10-22T05:07:41Z' } });
+      const { result, finished, evidence, exits } = await runAndRecord(launch, 'term-failed', 'run-parent-term-failed', false);
+      expect(result.exitCode).toBe(1);
+      const expected = { job: launch.jobName, path: 'job-failed-condition', jobLookup: 'ok', jobUid: uid, jobConditionReason: 'BackoffLimitExceeded',
+        activeDeadlineSeconds: 14400, deadlineExceeded: false, podLookup: 'terminated', containerReason: 'Error', exitCode: 1,
+        finishedAt: '2026-10-22T05:07:41Z', oomKilled: false };
+      expect(finished.at(-1)).toMatchObject({ state: 'failed', childError: 'no-result-line', podTermination: expected });
+      expect(evidence).toMatchObject({ job: launch.jobName, podTermination: expected });
+      expect(exits).toMatchObject([{ runId: 'run-parent-term-failed', reason: 'unknown', podTermination: expected }]);
+      // Observation only: the existing classification read is unchanged and still drives the message.
+      expect(result.error?.code).toBe('pod-job-failed');
+      // One Job read after the verdict serves both the classification reason and the capture.
+      expect(launch.calls.filter((call) => call.args.includes('get') && call.args.includes('job')
+        && call.args.some((arg) => arg.includes('conditions[?(@.type=="Failed")].reason')))).toHaveLength(1);
+    });
+
+    test('result marker early exit: captured at that verdict while the Pod still runs — container facts stay unknown', async () => {
+      const uid = '0a1b2c3d-0000-4000-8000-0000000000bb';
+      const launch = terminationLaunch({ spaceId: 'term-marker', markerRc: 3, logs: '',
+        event: { kind: 'result-marker-running', jobUid: uid, jobConditionType: '', activeDeadlineSeconds: 14400, podPhase: 'Running',
+          containerReason: null, containerExitCode: null, containerFinishedAt: null } });
+      const { result, finished, exits } = await runAndRecord(launch, 'term-marker', 'run-parent-term-marker', true);
+      expect(result.exitCode).toBe(1);
+      const expected = { job: launch.jobName, path: 'result-marker', jobLookup: 'ok', jobUid: uid, jobConditionReason: 'unknown', deadlineExceeded: 'unknown',
+        activeDeadlineSeconds: 14400, podLookup: 'running', containerReason: 'unknown', exitCode: 'unknown', finishedAt: 'unknown', oomKilled: 'unknown' };
+      expect(finished.at(-1)).toMatchObject({ state: 'failed', podTermination: expected });
+      expect(exits).toMatchObject([{ runId: 'run-parent-term-marker', podTermination: expected }]);
+    });
+
+    test('GC right after the verdict: the capture keeps the reason · deadline · uid from the one Job read, not a re-read', async () => {
+      const uid = '0a1b2c3d-0000-4000-8000-0000000000cc';
+      const launch = terminationLaunch({ spaceId: 'term-gc', logs: 'child crashed without a result line\n', afterVerdict: 'gc-after-first',
+        event: { kind: 'job-failed-backoff', jobUid: uid, jobConditionType: 'Failed', jobConditionReason: 'BackoffLimitExceeded',
+          activeDeadlineSeconds: 14400, podPhase: 'Failed', containerReason: 'Error', containerExitCode: 1, containerFinishedAt: '2026-10-22T05:07:41Z' } });
+      const { result, exits } = await runAndRecord(launch, 'term-gc', 'run-parent-term-gc', false);
+      expect(result.error?.code).toBe('pod-job-failed');
+      expect(exits).toMatchObject([{ podTermination: { jobLookup: 'ok', jobUid: uid, jobConditionReason: 'BackoffLimitExceeded', activeDeadlineSeconds: 14400,
+        deadlineExceeded: false, podLookup: 'terminated', containerReason: 'Error', exitCode: 1 } }]);
+    });
+
+    test('a thrown first Job read keeps today\'s outcome (pod-error) and still lands the capture in the incident', async () => {
+      const uid = '0a1b2c3d-0000-4000-8000-0000000000dd';
+      const launch = terminationLaunch({ spaceId: 'term-throw', logs: 'child crashed without a result line\n', afterVerdict: 'throw-first',
+        event: { kind: 'job-failed-backoff', jobUid: uid, jobConditionType: 'Failed', jobConditionReason: 'BackoffLimitExceeded',
+          activeDeadlineSeconds: 14400, podPhase: 'Failed', containerReason: 'Error', containerExitCode: 1, containerFinishedAt: '2026-10-22T05:07:41Z' } });
+      const { result, exits } = await runAndRecord(launch, 'term-throw', 'run-parent-term-throw', false);
+      expect(result.exitCode).toBe(1);
+      expect(result.error?.code).toBe('pod-error');
+      expect(exits).toMatchObject([{ podTermination: { path: 'job-failed-condition', jobLookup: 'unavailable', jobConditionReason: 'unknown',
+        deadlineExceeded: 'unknown', jobUid: uid, podLookup: 'terminated', containerReason: 'Error', exitCode: 1, oomKilled: false } }]);
+    });
+
+    test('a later evidence row of the same attempt without a capture does not drop the capture', () => {
+      const root = mkdtempSync(join(tmpdir(), 'pod-termination-last-row-'));
+      const previousState = process.env.ELANOUS_STATE_DIR;
+      const parent = 'run-parent-term-last-row';
+      const termination = { job: 'si-one', path: 'job-failed-condition', observedAt: '2026-10-22T05:07:41Z', jobLookup: 'ok', jobUid: '0a1b2c3d-0000-4000-8000-0000000000ee',
+        jobConditionReason: 'BackoffLimitExceeded', activeDeadlineSeconds: 14400, deadlineExceeded: false, podLookup: 'unavailable',
+        containerReason: 'unknown', exitCode: 'unknown', finishedAt: 'unknown', oomKilled: 'unknown' };
+      try {
+        process.env.ELANOUS_STATE_DIR = root;
+        const dir = runLedgerDir(root);
+        appendRunLedgerEntry({ runId: parent, event: 'pod-child-run', data: { childRunId: 'c1', job: 'si-one', attempt: 1 } }, dir);
+        appendRunLedgerEntry({ runId: parent, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: 'c1', job: 'si-one', podTermination: termination } }, dir);
+        appendRunLedgerEntry({ runId: parent, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: 'c1', job: 'si-one' } }, dir);
+        recordClassifiedHarnessPodExit(parent, 'unknown', 1, {});
+        expect(readRunExits(root)).toMatchObject([{ runId: parent, podTermination: termination }]);
+      } finally {
+        if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+        else process.env.ELANOUS_STATE_DIR = previousState;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test('a later attempt without its own capture does not inherit the earlier attempt\'s podTermination', () => {
+      const root = mkdtempSync(join(tmpdir(), 'pod-termination-fence-'));
+      const previousState = process.env.ELANOUS_STATE_DIR;
+      const parent = 'run-parent-term-fence';
+      const termination = { job: 'si-old', path: 'job-failed-condition', observedAt: '2026-10-22T05:07:41Z', jobLookup: 'ok', jobUid: '0a1b2c3d-0000-4000-8000-0000000000ee',
+        jobConditionReason: 'BackoffLimitExceeded', activeDeadlineSeconds: 14400, deadlineExceeded: false, podLookup: 'unavailable',
+        containerReason: 'unknown', exitCode: 'unknown', finishedAt: 'unknown', oomKilled: 'unknown' };
+      try {
+        process.env.ELANOUS_STATE_DIR = root;
+        const dir = runLedgerDir(root);
+        appendRunLedgerEntry({ runId: parent, event: 'pod-child-run', data: { childRunId: 'c1', job: 'si-old', attempt: 1 } }, dir);
+        appendRunLedgerEntry({ runId: parent, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: 'c1', job: 'si-old', podTermination: termination } }, dir);
+        appendRunLedgerEntry({ runId: parent, event: 'pod-child-run', data: { childRunId: 'c2', job: 'si-new', attempt: 2 } }, dir);
+        // The new attempt's row names another Job's record — dropped, not carried.
+        appendRunLedgerEntry({ runId: parent, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: 'c2', job: 'si-new', podTermination: termination } }, dir);
+        recordClassifiedHarnessPodExit(parent, 'unknown', 1, {});
+        expect(readRunExits(root)).toHaveLength(1);
+        expect(readRunExits(root)[0]).not.toHaveProperty('podTermination');
+        // A reused job/childRunId pair: the row before the latest start belongs to the earlier attempt.
+        const reused = 'run-parent-term-fence-reused';
+        const own = { ...termination, job: 'si-same' };
+        appendRunLedgerEntry({ runId: reused, event: 'pod-child-run', data: { childRunId: 'c1', job: 'si-same', attempt: 1 } }, dir);
+        appendRunLedgerEntry({ runId: reused, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: 'c1', job: 'si-same', podTermination: own } }, dir);
+        appendRunLedgerEntry({ runId: reused, event: 'pod-child-run', data: { childRunId: 'c1', job: 'si-same', attempt: 2 } }, dir);
+        recordClassifiedHarnessPodExit(reused, 'unknown', 1, {});
+        expect(readRunExits(root).find((row) => row.runId === reused)).not.toHaveProperty('podTermination');
+        // Same fence for childEvidence: the earlier attempt's facts do not classify the reused pair's later attempt.
+        const reusedEvidence = 'run-parent-term-fence-reused-evidence';
+        appendRunLedgerEntry({ runId: reusedEvidence, event: 'pod-child-run', data: { childRunId: 'c9', job: 'si-same-ev', attempt: 1 } }, dir);
+        appendRunLedgerEntry({ runId: reusedEvidence, event: 'pod-child-evidence', data: { childEvidence: { classification: 'implementation-deficit', stderr: 'earlier attempt' }, childRunId: 'c9', job: 'si-same-ev' } }, dir);
+        appendRunLedgerEntry({ runId: reusedEvidence, event: 'pod-child-run', data: { childRunId: 'c9', job: 'si-same-ev', attempt: 2 } }, dir);
+        recordClassifiedHarnessPodExit(reusedEvidence, 'unknown', 1, {});
+        expect(readRunExits(root).find((row) => row.runId === reusedEvidence)).not.toHaveProperty('childEvidence');
+        appendRunLedgerEntry({ runId: reused, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: 'c1', job: 'si-same', podTermination: own } }, dir);
+        const fresh = 'run-parent-term-fence-fresh';
+        appendRunLedgerEntry({ runId: fresh, event: 'pod-child-run', data: { childRunId: 'c3', job: 'si-same', attempt: 1 } }, dir);
+        appendRunLedgerEntry({ runId: fresh, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: 'c3', job: 'si-same', podTermination: own } }, dir);
+        recordClassifiedHarnessPodExit(fresh, 'unknown', 1, {});
+        expect(readRunExits(root).find((row) => row.runId === fresh)).toMatchObject({ podTermination: own });
+      } finally {
+        if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+        else process.env.ELANOUS_STATE_DIR = previousState;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
   });
 
   test('PR blocker IDs found only in an unbound child ledger stay unmeasured in the parent incident', async () => {
@@ -3411,7 +3616,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
   test('Pod result path uses the latest nested child disposition and preserves a later nested success', async () => {
     const old = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'aborted', ok: false, outOfScopeEdits: ['old.ts'] } });
     const failure = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'soft-stopped', ok: false,
-      outOfScopeEdits: ['current.ts'], abandonedClassification: { classification: 'implementation-deficit' } } });
+      outOfScopeEdits: ['current.ts'], scopeStopReasons: ['deletion'], abandonedClassification: { classification: 'implementation-deficit' } } });
     const success = JSON.stringify({ kind: 'external', ok: true, result: { stage: 'merged', ok: true, prUrl: 'https://example.invalid/pr/1', merged: true } });
     const failed = await podSelfImplementSpawn({ kubectl: fakeKubectl(['Failed'], `${old}\n${failure}\n`).k,
       credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'nested-child-failure' }).done;
@@ -3434,7 +3639,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
   test('a later failed Pod without child JSON masks an earlier attempt on the same parent', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-child-evidence-mask-'));
     const parent = 'run-parent-evidence-mask';
-    const first = fakeKubectl(['Failed'], '{"stage":"soft-stopped","ok":false,"outOfScopeEdits":["src/other.ts"]}\n');
+    const first = fakeKubectl(['Failed'], '{"stage":"soft-stopped","ok":false,"outOfScopeEdits":["src/other.ts"],"scopeStopReasons":["deletion"]}\n');
     const second = fakeKubectl(['Failed'], 'child exited before terminal JSON\n');
     try {
       await podSelfImplementSpawn({ kubectl: first.k, credentials: CREDS,
@@ -4895,6 +5100,16 @@ fi
       // The work label and the minimal fallback-chain config are the intentional additions.
       expectedHumanJob.metadata.labels['elanous.work'] = 'harness';
       expectedHumanJob.spec.template.metadata.labels['elanous.work'] = 'harness';
+      // POD-LAUNCH-PROVENANCE slice 2 — the si-task provenance set (labels ⊕ template annotations ⊕ child env) is the intentional addition.
+      const provenanceLabels = Object.fromEntries(Object.entries(job.metadata.labels as Record<string, string>).filter(([key]) => key.startsWith('elanous.ai/')));
+      expect([provenanceLabels['elanous.ai/kind'], provenanceLabels['elanous.ai/phase']]).toEqual(['si-task', 'impl']);
+      expect(Boolean(provenanceLabels['elanous.ai/actor-kind'] && provenanceLabels['elanous.ai/actor'])).toBe(true);
+      Object.assign(expectedHumanJob.metadata.labels, provenanceLabels);
+      Object.assign(expectedHumanJob.spec.template.metadata.labels, provenanceLabels);
+      expectedHumanJob.spec.template.metadata.annotations = job.spec.template.metadata.annotations;
+      const provenanceEnv = child.env.filter((entry: { name: string }) => POD_PROVENANCE_ENV_NAMES.includes(entry.name));
+      const frozenEnv = expectedHumanJob.spec.template.spec.containers[0].env as Array<{ name: string }>;
+      frozenEnv.splice(frozenEnv.findIndex((entry) => entry.name === 'ELANOUS_HOST_ID') + 1, 0, ...provenanceEnv);
       // SI-TASK-ADMIT-RIGHTSIZE: the default request is 3Gi; the 16Gi limit stays byte-identical.
       expectedHumanJob.spec.template.spec.containers[0].resources.requests.memory = '3Gi';
       // POD-CPU-REQUEST-RIGHTSIZE (10-09) lowered the harness CPU request 1 → 250m (limit 4 unchanged).
@@ -5683,4 +5898,79 @@ describe('BUDGET-SNAPSHOT-TO-POD — the host budget snapshot rides the Job env'
     const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((item) => item.kind === 'Job');
     expect(snapshotEnv(job)).toEqual([]);
   }, 20_000);
+});
+
+// ── POD-FAIL-EVIDENCE-CAPTURE-FU (#29346 잔여) ─────────────────────────────────────────────
+// provider-error 우선순위 · duplicate-cap 귀속(canonical prefix·동일 terminal 직전만) · lookalike/연속 실패 부정.
+// 모든 시험은 실 생산 진입점 podSelfImplementSpawn → parseSelfImplementJson/classifyPodTerminal/extractPodFailureReason
+// → appendRunLedgerEntry(pod-child-evidence) ⊕ podUsageReemitPlan(classifyPodExit) 를 지난다.
+describe('POD-FAIL-EVIDENCE-CAPTURE-FU: provider-error 우선순위 ⊕ duplicate-cap 귀속', () => {
+  type PodRecord = { event: string; data: Record<string, unknown> };
+
+  const failedJob = async (logs: string, spaceId: string): Promise<{ message: string; events: PodRecord[] }> => {
+    const { k } = fakeKubectl(['Failed'], logs);
+    const events: PodRecord[] = [];
+    const off = debug.registerSink({ name: `pod-fu-${spaceId}`, emit: (record) => {
+      if (record.category.startsWith('self-implement.pod')) events.push({ event: record.event, data: record.data as Record<string, unknown> });
+    } });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {}, pollMs: 1 })({ feature: 'x', spaceId }).done;
+      return { message: result.error?.message ?? '', events };
+    } finally { off(); }
+  };
+
+  const exitClassOf = (events: PodRecord[]): unknown => events.find((record) => 'podExitClass' in record.data)?.data.podExitClass;
+
+  test('provider error classified before generic failure', async () => {
+    const provider = await failedJob('llm.codex response error: provider overloaded (429)\n', 'fu-provider-priority');
+    expect(exitClassOf(provider.events)).toBe('provider-error');
+    // 대조군 — provider 신호가 없는 실패는 지금처럼 generic(child-error)로 남는다.
+    const generic = await failedJob('Error: dev child exited with code 1\n', 'fu-provider-priority-generic');
+    expect(exitClassOf(generic.events)).toBe('child-error');
+    expect(generic.message).toContain('childError=no-result-line · reason=Error: dev child exited with code 1');
+    // provider error 는 결과행 없음(no-result-line)보다도 먼저다.
+    const credential = await failedJob('llm.claude credential error: upstream 503\n', 'fu-provider-priority-credential');
+    expect(exitClassOf(credential.events)).toBe('provider-error');
+  });
+
+  test('provider error of an earlier terminal is not reused by the last terminal', async () => {
+    const logs = [
+      'llm.codex response error: provider overloaded (429)',
+      JSON.stringify({ kind: 'self', stage: 'aborted', ok: false, error: 'Error: previous attempt failed' }),
+      JSON.stringify({ kind: 'self', stage: 'merged', ok: true }),
+    ].join('\n');
+    const { events } = await failedJob(logs, 'fu-provider-stale');
+    expect(exitClassOf(events)).toBe('unknown');
+  });
+
+  test('duplicate-cap attribution keeps only the canonical child terminal (lookalike 행 배제)', async () => {
+    const lookalike = JSON.stringify({ kind: 'pod-capture', stage: 'shrink', ok: false, error: 'lookalike boom' });
+    const secret = 'OPENROUTER_API_KEY=sk-abcdefghijklmnop';
+    const canonical = JSON.stringify({ kind: 'self', stage: 'dev', ok: false, error: `nested child failed ${secret}` });
+    const kept = await failedJob(`${canonical}\n${lookalike}\n`, 'fu-attribution-canonical');
+    expect(kept.message).toContain('childStage=dev · childError=nested child failed');
+    expect(kept.message).not.toContain(secret);
+    expect(JSON.stringify(kept.events)).not.toContain(secret);
+    expect(kept.message).not.toContain('lookalike boom');
+    // lookalike 만 있으면 실패를 귀속하지 않는다 — 생산 경로는 no-result-line 으로 닫힌다.
+    const onlyLookalike = await failedJob(`${lookalike}\n`, 'fu-attribution-lookalike');
+    expect(onlyLookalike.message).toContain('childError=no-result-line');
+    expect(onlyLookalike.message).not.toContain('lookalike boom');
+  });
+
+  test('a canonical success terminal does not reuse an earlier failure (연속 실패 부정)', async () => {
+    const logs = [
+      JSON.stringify({ kind: 'self', stage: 'dev', ok: false, error: 'previous attempt failed' }),
+      JSON.stringify({ kind: 'self', stage: 'merged', ok: true }),
+    ].join('\n');
+    const { message } = await failedJob(`${logs}\n`, 'fu-attribution-success');
+    expect(message).not.toContain('previous attempt failed');
+  });
+
+  test('a bookkeeping-only error line is not attributed as childEvidence', async () => {
+    const logs = JSON.stringify({ kind: 'self', stage: 'dev', ok: false, error: 'ELANOUS_USAGE_ROLLUP {}' });
+    const { message } = await failedJob(`${logs}\n`, 'fu-attribution-bookkeeping');
+    expect(message).not.toBe('');
+    expect(message).not.toContain('childError=ELANOUS_USAGE_ROLLUP');
+  });
 });

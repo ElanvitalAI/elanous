@@ -22,6 +22,18 @@ test('the shard shell exports the baseline before the part runs, with or without
   }
 });
 
+test('a pinned rules base reaches an isolated Pod test process without inventing origin/main', () => {
+  const sha = 'a'.repeat(40);
+  const shell = gateShardShell({ ...base, parts: [['test/rules-contract.test.ts']], parallelParts: 1, rulesBaseSha: sha });
+  const lines = shell.split('\n');
+  const exportLine = `export ELANOUS_GATE_BASE_SHA='${sha}'`;
+  expect(lines).toContain(exportLine);
+  expect(lines.indexOf(exportLine)).toBeLessThan(lines.findIndex((line) => line.includes('scripts/test-deterministic.ts')));
+  const env = prepareIsolatedTestEnv({ ELANOUS_GATE_BASE_SHA: sha, PATH: '/bin' }, '/tmp/elanous-rules-base-pin');
+  expect(env.ELANOUS_GATE_BASE_SHA).toBe(sha);
+  expect(() => gateShardShell({ ...base, rulesBaseSha: 'HEAD' })).toThrow('invalid rules gate base SHA');
+});
+
 test('the exported line sets exactly those values in bash', () => {
   const ran = spawnSync('bash', ['-c', `${gateEnvBaselineLine()}; printf '%s|%s|%s|%s' "$TZ" "$LANG" "$LC_ALL" "$ELANOUS_TEST_FAKE_LLM"`], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } });
   expect(ran.status).toBe(0);

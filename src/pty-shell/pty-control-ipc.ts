@@ -1,6 +1,6 @@
 import { Database } from 'bun:sqlite';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { ptyManifestDbPath, getPtyManifest, markPtyControlled } from './pty-manifest.js';
 import { getHarnessRunId } from '../harness/harness-space.js';
 import { renamePty, type PtyControlTarget } from './registry.js';
@@ -48,6 +48,11 @@ export interface PtyControlRequestOptions {
   readonly timeoutMs?: number;
   /** 대상 PTY를 발견한 매니페스트 뿌리. 연합 조회는 이 DB에 제어 요청을 남겨 그 행의 owner가 처리하게 한다. */
   readonly manifestDbPath?: string;
+  /** 요청자 poll 루프의 시계(기본 `Date.now`) — deadline·grace 경계를 재는 유일한 시계다.
+   *  ⛔ 원장 시각(`created_at`/`updated_at`)은 여전히 `Date.now()` 다 — 원장 형식은 이 옵션에 안 흔들린다. */
+  readonly now?: () => number;
+  /** 요청자 poll 루프의 대기(기본 `Bun.sleep`) — 기본값에서 25ms cadence 계약은 그대로다. */
+  readonly sleep?: (ms: number) => Promise<void>;
 }
 
 export interface PtyControlResult {
@@ -144,6 +149,116 @@ function cleanupStale(d: Database): void {
   d.run("DELETE FROM pty_control_requests WHERE created_at < ? AND status = 'processing'", [now - PTY_CONTROL_PROCESSING_STALE_MS]);
 }
 
+// ── TUI-IDLE-PTY-DEEP-IDLE-FU (#29694) — owner 큐 재읽기의 깊은 유휴 감속 ⊕ 첫 요청 즉시 깨움 ──
+//
+// owner 프로세스는 `registry.startPtyControlPoller` 가 **25ms 마다** 부르는 `processPtyControlRequests` 로
+// 제어 큐(같은 SQLite 원장)를 다시 읽는다. 사람이 자리를 비운 채 TUI 가 몇 시간 떠 있으면 그 재읽기가
+// 시간당 14만 번씩 DB 를 두드린다 — 제어가 **10분 넘게** 없었으면 재읽기 간격을 1.5s 로 늦춘다.
+// ⛔ 감속만 넣으면 첫 원격 요청이 최대 1.5s 뒤에야 처리돼 25ms 응답 계약이 깨진다. 그래서 요청자는
+//    큐와 «별도»인 깨어움 표식을 남기고(`signalPtyControlWake`), owner 는 tick 마다 그 파일의 존재만
+//    싸게 확인한다(`consumePtyControlWake`). DB 재읽기보다 훨씬 싸고, 그 tick 안에서 즉시 깬다.
+interface ControlCadenceState {
+  /** 마지막 **제어 요청 처리** 시각 — `markPtyControlled` 와 같은 사건을 앵커로 쓴다. */
+  lastControlAt: number | null;
+  /** 마지막으로 큐를 실제로 **다시 읽은** 시각 — 감속 간격의 기준점. */
+  lastDbReadAt: number | null;
+  /** 이 상태를 마지막으로 관측한 시계 값 — 시계가 뒤로 가면 앵커를 버린다(시계 교체 감지). */
+  lastSeenAt: number | null;
+  observed: 'active' | 'deep-idle' | null;
+}
+
+/** 큐 원장 경로마다 따로 센다 — 원장 경로가 바뀌면(시험용 `setPtyManifestDbPathForTesting`) 이전
+ *  경로의 유휴 앵커가 새 원장에 얹히지 않는다. ⛔ 열쇠는 **읽는 원장과 같은 경로**여야 한다
+ *  (`processPtyControlRequestsOnce` 가 여는 `db()` 와 동일: `ptyManifestDbPath()`). */
+const controlCadence = new Map<string, ControlCadenceState>();
+
+function cadenceState(dbPath: string): ControlCadenceState {
+  const known = controlCadence.get(dbPath);
+  if (known) return known;
+  const fresh: ControlCadenceState = { lastControlAt: null, lastDbReadAt: null, lastSeenAt: null, observed: null };
+  controlCadence.set(dbPath, fresh);
+  return fresh;
+}
+
+/** 재읽기를 늦추기 시작하는 유휴 길이. 「10분+ 유휴 뒤 1.5s」의 앞 절반. */
+const PTY_CONTROL_DEEP_IDLE_AFTER_MS = 10 * 60_000;
+/** 깊은 유휴에서의 재읽기 간격. 요청 wake 는 이 간격을 «기다리지 않는다». */
+const PTY_CONTROL_DEEP_IDLE_POLL_MS = 1_500;
+
+/** 깨어움 표식은 큐와 같은 원장 디렉터리에 둔다 — 요청자와 owner 가 같은 원장(`ptyManifestDbPath`)을
+ *  볼 때 owner 의 tick 이 곧바로 그 자리를 본다. 연합 큐(`manifestDbPath`)로 남의 원장에 요청하면
+ *  표식은 그 원장 자리에 남고 그 owner 는 감속 간격만큼만 늦다(요청 timeout 안쪽 · fail-soft).
+ *  ⭐ 표식은 **owner 별** 파일이다(`control-wake-<ownerPid>`) — 요청자는 이미 `ownerPid` 를 알고,
+ *  같은 `ELANOUS_STATE_DIR` 원장을 공유하는 여러 프로세스의 `startPtyControlPoller` 가 각자 돌아도
+ *  비대상 owner 가 대상 owner 의 표식을 가져가 즉시 깨움(25ms)을 훔치지 못하게 한다. */
+function wakeSignalPath(dbPath: string, ownerPid: number): string {
+  return join(dirname(dbPath), `control-wake-${ownerPid}`);
+}
+
+/** 구형 요청자가 남기던 공유 표식 — 읽기 «호환 경로»로만 유지한다(새 경로는 owner 별 파일만 쓴다). */
+function legacyWakeSignalPath(dbPath: string): string {
+  return join(dirname(dbPath), 'control-wake');
+}
+
+/** 요청자가 대상 owner 의 깨움 표식을 남긴다 — owner «별» 파일(`control-wake-<ownerPid>`). */
+export function signalPtyControlWake(dbPath: string, ownerPid: number): void {
+  try {
+    mkdirSync(dirname(dbPath), { recursive: true });
+    writeFileSync(wakeSignalPath(dbPath, ownerPid), '');
+  } catch { /* fail-soft — 표식이 없으면 감속 간격만큼만 늦다(timeout 안쪽) */ }
+}
+
+/** «자기» `ownerPid` 의 표식이 있으면 지우고 `true` — 요청자는 행을 «넣은 뒤» 그 행의 owner
+ *  표식을 남기므로, 그 owner 의 이 tick 재읽기는 그 행을 반드시 본다. 남의 owner 표식과 구형
+ *  공유 표식은 잔존 호환으로 «읽기만» 한다(비대상 owner 가 이 표식을 지울 수는 없다). */
+function consumePtyControlWake(dbPath: string): boolean {
+  const own = wakeSignalPath(dbPath, process.pid);
+  let woke = false;
+  if (existsSync(own)) {
+    woke = true;
+    try { rmSync(own, { force: true }); } catch { /* 다음 tick 이 다시 지운다 */ }
+  }
+  const legacy = legacyWakeSignalPath(dbPath);
+  if (existsSync(legacy)) {
+    woke = true;
+    try { rmSync(legacy, { force: true }); } catch { /* 다음 tick 이 다시 지운다 */ }
+  }
+  return woke;
+}
+
+function observeControlCadence(state: ControlCadenceState, mode: 'active' | 'deep-idle', idleMs: number): void {
+  if (state.observed === mode) return;
+  state.observed = mode;
+  debug.log('pty.control', 'poll-cadence', { mode, idleMs });
+}
+
+/** 깊은 유휴 감속 gate — `false` 면 이번 tick 은 큐를 **다시 읽지 않는다**.
+ *  ⛔ 첫 tick 은 언제나 읽는다(기동 직후 도착한 요청을 감속 뒤에 두지 않는다).
+ *  ⛔ 감속 시계는 `pollClock`(기본 `Date.now`) 뿐이다 — `now`(takeover TTL 시계)를 섞으면 시험이
+ *     주입한 값이 실제 tick 을 감속시키는 회귀가 난다. */
+function shouldReadControlQueue(dbPath: string, nowMs: number): boolean {
+  const state = cadenceState(dbPath);
+  // 시계가 뒤로 갔다 = 이전 관측과 다른 시계다. 그 앵커로는 유휴를 못 재므로 버리고 다시 센다.
+  if (state.lastSeenAt !== null && nowMs < state.lastSeenAt) {
+    state.lastControlAt = null;
+    state.lastDbReadAt = null;
+    state.observed = null;
+  }
+  state.lastSeenAt = nowMs;
+  const woke = consumePtyControlWake(dbPath);
+  if (state.lastControlAt === null || woke) state.lastControlAt = nowMs;
+  const idleMs = nowMs - state.lastControlAt;
+  const deepIdle = idleMs >= PTY_CONTROL_DEEP_IDLE_AFTER_MS;
+  const sinceReadMs = state.lastDbReadAt === null ? Number.POSITIVE_INFINITY : nowMs - state.lastDbReadAt;
+  if (!woke && deepIdle && sinceReadMs < PTY_CONTROL_DEEP_IDLE_POLL_MS) {
+    observeControlCadence(state, 'deep-idle', idleMs);
+    return false;
+  }
+  state.lastDbReadAt = nowMs;
+  observeControlCadence(state, deepIdle ? 'deep-idle' : 'active', idleMs);
+  return true;
+}
+
 export async function requestRemotePtyControlCapabilities(id: string, options: PtyControlRequestOptions = {}): Promise<PtyControlCapabilitiesResult> {
   const result = await requestRemotePtyControl(id, 'capabilities', undefined, options);
   if (result.status === 'success') {
@@ -161,6 +276,10 @@ export async function requestRemotePtyControl(id: string, action: PtyControlActi
   const options = typeof timeoutOrOptions === 'number' ? { timeoutMs: timeoutOrOptions } : timeoutOrOptions;
   const timeoutMs = typeof payloadOrTimeout === 'number' ? payloadOrTimeout : options.timeoutMs ?? 2_000;
   const actor: PtyWriteActor = options.actor ?? 'human';
+  // 요청자 poll 루프의 시계·대기 — 기본값이면 종전 그대로(`Date.now` ⊕ 25ms `Bun.sleep`)이고,
+  // 시험만 가상 시각으로 deadline·grace 경계와 cadence 를 결정론적으로 민다(벽시계 판별 없음).
+  const pollNow = options.now ?? Date.now;
+  const pollWait = options.sleep ?? ((ms: number): Promise<void> => Bun.sleep(ms));
   const opened = dbAt(options.manifestDbPath);
   const d = opened.database;
   try {
@@ -175,21 +294,24 @@ export async function requestRemotePtyControl(id: string, action: PtyControlActi
     // ⭐ 요청자의 run anchor 를 요청에 실어 보낸다 — 인가는 **owner 가** 자기 PTY 의 run 과 대조해 내린다
     //    (요청자 자기 신고를 그대로 믿지 않는다는 뜻이 아니라, 판정 지점이 자원 소유자라는 뜻).
     d.run(`INSERT INTO pty_control_requests (request_id, pty_id, action, payload_json, actor, requester_run_id, owner_pid, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [requestId, id, action, payload ? JSON.stringify(payload) : null, actor, getHarnessRunId(process.env), ownerPid, 'pending', now, now]);
+    // ⭐ 깊은 유휴 감속 중인 owner 를 즉시 깨운다 — 행을 넣은 «뒤» 표식을 남기므로 그 재읽기가 이 행을 본다.
+    //    표식은 그 행의 `ownerPid` «별» 파일이다 — 같은 원장을 공유하는 다른 owner 가 가져가지 못한다.
+    signalPtyControlWake(requestQueuePath(options), ownerPid);
     const readback = (): ControlRow | null => d.query(SELECT_ROW).get(requestId) as ControlRow | null;
     const del = (): void => { d.run('DELETE FROM pty_control_requests WHERE request_id=?', [requestId]); };
-    const deadline = now + timeoutMs;
-    while (Date.now() < deadline) {
+    const deadline = pollNow() + timeoutMs;
+    while (pollNow() < deadline) {
       const row = readback();
       if (row && settled(row.status)) { del(); return resultFrom(row); }
-      await Bun.sleep(25);
+      await pollWait(25);
     }
     if (d.run("DELETE FROM pty_control_requests WHERE request_id=? AND status='pending'", [requestId]).changes > 0) return { status: 'owner-unreachable' };
-    const graceDeadline = Date.now() + 500;
-    while (Date.now() < graceDeadline) {
+    const graceDeadline = pollNow() + 500;
+    while (pollNow() < graceDeadline) {
       const row = readback();
       if (!row) return { status: 'owner-unreachable' };
       if (settled(row.status)) { del(); return resultFrom(row); }
-      await Bun.sleep(25);
+      await pollWait(25);
     }
     const final = readback();
     if (final && settled(final.status)) { del(); return resultFrom(final); }
@@ -245,6 +367,8 @@ let inFlight: Promise<void> | null = null;
 export interface PtyControlProcessOptions {
   readonly now?: () => number;
   readonly takeoverTtlMs?: number;
+  /** 깊은 유휴 감속 계단 **전용** 시계(기본 `Date.now`). `now` 는 takeover TTL 시계라 섞지 않는다. */
+  readonly pollClock?: () => number;
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -281,8 +405,19 @@ function reapExpiredTakeovers(d: Database, getHandle: (id: string) => PtyControl
 
 export function processPtyControlRequests(getHandle: (id: string) => PtyControlTarget | undefined, takeover: (id: string, actor: 'human') => boolean, options: PtyControlProcessOptions = {}): Promise<void> {
   if (inFlight) return inFlight;
+  // 깊은 유휴 감속(#29694) — 이 함수는 `pty-shell/registry.ts:startPtyControlPoller` 가 25ms 마다 부른다.
+  //   감속 구간에서는 여기서 «큐를 다시 읽지 않는» 것으로 끝나고, 첫 원격 요청의 표식이 오면 즉시 통과한다.
+  //   ⛔ 감속 열쇠는 아래 `processPtyControlRequestsOnce` 가 실제로 여는 원장(`db()` = `ptyManifestDbPath()`)과
+  //      같은 경로다 — 상태는 한 큐, 읽기는 다른 큐로 갈라지지 않는다.
+  if (!shouldReadControlQueue(ptyManifestDbPath(), (options.pollClock ?? Date.now)())) return Promise.resolve();
   inFlight = processPtyControlRequestsOnce(getHandle, takeover, options).finally(() => { inFlight = null; });
   return inFlight;
+}
+
+/** 요청이 실제로 들어간 원장 — 깨어움 표식은 «그 원장의 owner» 가 보는 자리에 남겨야 한다.
+ *  연합 요청(`manifestDbPath`)이면 그 원장 디렉터리, 내 요청이면 내 원장. */
+function requestQueuePath(options: { readonly manifestDbPath?: string }): string {
+  return options.manifestDbPath ?? ptyManifestDbPath();
 }
 
 async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyControlTarget | undefined, takeover: (id: string, actor: 'human') => boolean, options: PtyControlProcessOptions): Promise<void> {
@@ -290,6 +425,8 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
   const now = options.now ?? Date.now;
   reapExpiredTakeovers(d, getHandle, now(), resolveTakeoverTtlMs(options));
   const rows = d.query(`SELECT ${ROW_COLUMNS} FROM pty_control_requests WHERE owner_pid=? AND status='pending' ORDER BY created_at ASC`).all(process.pid) as ControlRow[];
+  // 제어를 «처리했다» = 유휴 앵커를 지금으로 되감는다(`markPtyControlled` 와 같은 사건).
+  if (rows.length > 0) cadenceState(ptyManifestDbPath()).lastControlAt = (options.pollClock ?? Date.now)();
   for (const row of rows) {
     if (d.run("UPDATE pty_control_requests SET status='processing', updated_at=? WHERE request_id=? AND status='pending'", [Date.now(), row.request_id]).changes === 0) continue;
     let requested: PtyWriteActor | null = null;
@@ -434,6 +571,12 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
 
 export function resetPtyControlIpcForTesting(): void {
   database?.close(); database = null;
+  // 깊은 유휴 감속 상태(#29694)도 «같이» 비운다 — 남으면 다음 시험/기동이 감속 구간에서 시작한다.
+  controlCadence.clear();
+  try {
+    rmSync(wakeSignalPath(ptyManifestDbPath(), process.pid), { force: true });
+    rmSync(legacyWakeSignalPath(ptyManifestDbPath()), { force: true });
+  } catch { /* 표식이 없으면 그만 */ }
   // ⛔⭐ 쓰기 출처 맵도 «같이» 비운다 — 별도 export 로만 두면 아무도 안 부르고 테스트 사이에 샌다
   //   (오늘 `index.ts:65 readStdinLine` 이 정확히 그 형태로 죽어 있었다).
   resetExternalWriteProvenanceForTesting();

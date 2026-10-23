@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 import { test, expect, describe } from 'bun:test';
-import { classifyFailure, classifyFailures, classifyResumeDisposition, dependencyOnMain, hasDelivered, hasLanded, failureFromDeployFindings, formatShardHandoffInput, goalCauseObservedFromFailureClassification, withOrchestrateGoalKey, orchestrateSelfDev, prMergedOnMain, queryPreflightWarning, resolveOrchestrateConcurrency, resumeKey, summarizeFailureKinds, summarizeResults, triageRun, triageActionFor } from './orchestrate.js';
+import { classifyFailure, classifyFailures, classifyResumeDisposition, dependencyOnMain, hasDelivered, hasLanded, failureFromDeployFindings, formatShardHandoffInput, goalCauseObservedFromFailureClassification, withOrchestrateGoalKey, openPrAwaitingHumanMessage, orchestrateSelfDev, prMergedOnMain, queryPreflightWarning, resolveOrchestrateConcurrency, resumeKey, summarizeFailureKinds, summarizeResults, triageRun, triageActionFor } from './orchestrate.js';
 import type { SelfDevJobResult } from './orchestrate.js';
 import { parseRunShardIdentity } from '../self-implement/run-ledger.js';
 import type { WorkingMemoryEntry } from '../agent-substrate/working-memory-format.js';
@@ -82,19 +82,19 @@ test('TA 경계 누락 조각을 선행으로 기다리는 하위 조각은 bloc
     taskId: 'boundary:ta-20261018-fec86f:needs-human:1', status: 'failed', stage: 'needs-human', stopReason: 'needs-human',
   }));
   expect(results).toContainEqual(expect.objectContaining({
-    taskId: 'boundary:ta-20261018-fec86f:blocked:2', status: 'blocked', blockReason: 'dependency-needs-human',
-    stopReason: 'needs-human', error: { code: 'DEPENDENCY_NEEDS_HUMAN', message: '선행 needs-human: 0' },
+    taskId: 'boundary:ta-20261018-fec86f:blocked:2', status: 'blocked', blockReason: 'dependency-deferred',
+    stopReason: 'rebase-ready', error: { code: 'DEP_BLOCKED_REBASE_READY', message: '선행 조각 0 재수복 뒤 다음 런 이월' },
   }));
   expect(results).toContainEqual(expect.objectContaining({
-    taskId: 'boundary:ta-20261018-fec86f:blocked:3', status: 'blocked', blockReason: 'dependency-needs-human',
-    stopReason: 'needs-human', error: { code: 'DEPENDENCY_NEEDS_HUMAN', message: '선행 needs-human: 1' },
+    taskId: 'boundary:ta-20261018-fec86f:blocked:3', status: 'blocked', blockReason: 'dependency-deferred',
+    stopReason: 'rebase-ready', error: { code: 'DEP_BLOCKED_REBASE_READY', message: '선행 조각 1 재수복 뒤 다음 런 이월' },
   }));
   expect(results).toContainEqual(expect.objectContaining({ feature: expect.stringContaining('docs/independent.md'), status: 'done' }));
-  expect(triageRun(results).needsHuman).toContain('boundary:ta-20261018-fec86f:blocked:2');
-  expect(triageRun(results).needsHuman).toContain('boundary:ta-20261018-fec86f:blocked:3');
+  expect(triageRun(results).needsHuman).not.toContain('boundary:ta-20261018-fec86f:blocked:2');
+  expect(triageRun(results).needsHuman).not.toContain('boundary:ta-20261018-fec86f:blocked:3');
 });
 
-test('경계 누락 후손도 needs-human 대신 선행 needs-human 차단으로 남긴다', async () => {
+test('경계 누락 후손은 선행 조각 수복을 기다리는 rebase-ready로 남긴다', async () => {
   let launches = 0;
   const results = await orchestrateSelfDev({
     taskCardId: 'ta-20261018-fec86f', parentRequest: '',
@@ -111,12 +111,12 @@ test('경계 누락 후손도 needs-human 대신 선행 needs-human 차단으로
     error: expect.objectContaining({ code: 'GOAL_DONE_BOUNDARY_MISSING' }),
   }));
   expect(results).toContainEqual(expect.objectContaining({
-    taskId: 'boundary:ta-20261018-fec86f:blocked:2', blockReason: 'dependency-needs-human',
-    error: expect.objectContaining({ message: '선행 needs-human: A' }),
+    taskId: 'boundary:ta-20261018-fec86f:blocked:2', blockReason: 'dependency-deferred',
+    error: expect.objectContaining({ message: '선행 조각 A 재수복 뒤 다음 런 이월' }),
   }));
   expect(results).toContainEqual(expect.objectContaining({
-    taskId: 'boundary:ta-20261018-fec86f:blocked:3', blockReason: 'dependency-needs-human',
-    error: expect.objectContaining({ message: '선행 needs-human: B' }),
+    taskId: 'boundary:ta-20261018-fec86f:blocked:3', blockReason: 'dependency-deferred',
+    error: expect.objectContaining({ message: '선행 조각 B 재수복 뒤 다음 런 이월' }),
   }));
 });
 
@@ -152,7 +152,7 @@ test('앞의 needs-human 조각을 제거해도 남은 ID 없는 실행 가능 �
   const results = await run;
   expect(started.some((feature) => feature.includes('consumer.ts'))).toBe(true);
   expect(results).toContainEqual(expect.objectContaining({ taskId: 'boundary:ta-20261018-fec86f:needs-human:1', stage: 'needs-human' }));
-  expect(results).toContainEqual(expect.objectContaining({ taskId: 'boundary:ta-20261018-fec86f:blocked:2', blockReason: 'dependency-needs-human' }));
+  expect(results).toContainEqual(expect.objectContaining({ taskId: 'boundary:ta-20261018-fec86f:blocked:2', blockReason: 'dependency-deferred' }));
 });
 
 test('child ok and worktreePath cross the orchestrator boundary for delivery selection', async () => {
@@ -1975,6 +1975,70 @@ describe('orchestrateSelfDev — S3 disposition · cascade · teardown', () => {
     expect(byF.get('C')!.status).toBe('cancelled');
   });
 
+  test('failed slice retries once; independent hot-path successor opens a PR while explicit dependent is deferred', async () => {
+    const started: string[] = [];
+    const results = await orchestrateSelfDev({
+      taskCardId: 'ta-20261022-slice-cascade',
+      parentRequest: '완료 경계 코드: A·B·C 각 조각 코드 변경\n완료 경계 실물: 독립 조각 PR 개설\n완료 경계 증거 명령: bun test src/self-dev/orchestrate.test.ts',
+      goals: [
+        { id: 'a', feature: 'A', hotPaths: ['src/shared.ts'] },
+        { id: 'b', feature: 'B', hotPaths: ['src/shared.ts'], openPr: true, autoMerge: false },
+        { id: 'c', feature: 'C', dependsOn: ['a'] },
+      ],
+      concurrency: 3,
+      spawn: (input) => {
+        const label = input.feature.split('\n')[0]!;
+        started.push(label);
+        return { address: input.spaceId, done: Promise.resolve(label === 'A'
+          ? { exitCode: 1, output: 'A failed' }
+          : { exitCode: 0, output: '', disposition: { stage: 'pr-opened', prUrl: 'https://example.test/pr/1', merged: false } }) };
+      },
+    });
+    expect(started).toEqual(['A', 'A', 'B']);
+    expect(results.find((result) => result.feature.startsWith('B'))).toMatchObject({ status: 'done', prUrl: 'https://example.test/pr/1' });
+    expect(results.find((result) => result.feature.startsWith('C'))).toMatchObject({
+      status: 'cancelled', error: { code: 'DEP_BLOCKED_REBASE_READY', message: expect.stringContaining('rebase-ready') },
+    });
+    expect(results.some((result) => result.feature.startsWith('A') && result.status === 'done')).toBe(false);
+  });
+
+  test('id-less index dependency stays deferred even when both pieces share a hot path', async () => {
+    const started: string[] = [];
+    const results = await orchestrateSelfDev({
+      taskCardId: 'ta-idless-dependency',
+      parentRequest: '완료 경계 코드: src/shared.ts 변경\n완료 경계 실물: 의존 조각 이월\n완료 경계 증거 명령: bun test src/self-dev/orchestrate.test.ts',
+      goals: [
+        { feature: 'A', hotPaths: ['src/shared.ts'] },
+        { feature: 'B', dependsOn: ['0'], hotPaths: ['src/shared.ts'] },
+      ],
+      spawn: (input) => {
+        started.push(input.feature.split('\n')[0]!);
+        return { address: input.spaceId, done: Promise.resolve({ exitCode: 1, output: 'A failed' }) };
+      },
+    });
+    expect(started).toEqual(['A', 'A']);
+    expect(results.find((result) => result.feature.startsWith('B'))).toMatchObject({
+      status: 'cancelled', error: { code: 'DEP_BLOCKED_REBASE_READY' },
+    });
+  });
+
+  test('explicit stop policy prevents automatic TA repair retry', async () => {
+    let launches = 0;
+    const results = await orchestrateSelfDev({
+      taskCardId: 'ta-stop-before-repair',
+      parentRequest: '완료 경계 코드: src/stop.ts 변경\n완료 경계 실물: rate limit 정지\n완료 경계 증거 명령: bun test src/self-dev/orchestrate.test.ts',
+      goals: [{ feature: 'A' }],
+      stopAfterFailure: () => 'rate-limited',
+      spawn: (input) => {
+        launches++;
+        return { address: input.spaceId, done: Promise.resolve({ exitCode: 1, output: 'rate limited' }) };
+      },
+    });
+    expect(launches).toBe(1);
+    expect(results).toHaveLength(1);
+    expect(results[0]?.status).toBe('failed');
+  });
+
   test('teardown (opt-in) removes non-PR worktrees, preserves PR-opened', async () => {
     const removed: string[] = [];
     const spawn: SelfImplementJobSpawn = (input) => ({
@@ -2676,6 +2740,51 @@ describe('triageRun — 실패를 «다음 행동»으로 옮긴다', () => {
     const t = triageRun([result]);
     expect(t.reworkable).toEqual(['review']);
     expect(t.needsHuman).toEqual([]);
+  });
+
+  test('F3 Pod 사고: completed-without-changes + 열린 PR 증거는 재발사 대신 사람 수확으로 보낸다', () => {
+    const incident = {
+      taskId: 'RUN-DOCTOR-LIVE', feature: 'RUN-DOCTOR-LIVE', status: 'failed', stage: 'aborted',
+      failureClassification: 'report-deficit', completionDisposition: 'completed-without-changes',
+      prNumber: 30468, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/30468',
+      error: { code: 'pod-job-failed', message: 'BackoffLimitExceeded' },
+    } as never;
+    const triage = triageRun([incident]);
+    expect(triage.classifications).toMatchObject([{
+      kind: 'awaiting-human', action: 'needs-human', errorCode: 'PR_CHANGE_CONFLICT',
+      errorMessage: expect.stringContaining('#30468'),
+    }]);
+    expect(triage.reworkable).toEqual([]);
+    expect(triage.rerunnable).toEqual([]);
+    expect(triage.actionable).toBe(false);
+    expect(triage.needsHuman).toEqual(['RUN-DOCTOR-LIVE']);
+    expect(classifyFailure({ ...incident, prNumber: undefined, prUrl: undefined })).toBe('unconverged');
+    for (const prNumber of [null, 0, -1, 1.5, Number.NaN]) {
+      expect(classifyFailure({ ...incident, prNumber, prUrl: undefined })).toBe('unconverged');
+    }
+    for (const prUrl of [
+      'https://github.com/owner/repo/issues/30468',
+      'https://github.com:444/owner/repo/pull/30468',
+      'https://user:pass@github.com/owner/repo/pull/30468',
+      'https://github.com/owner/repo/../repo/pull/30468',
+      'https://github.com/owner/repo/%2f/pull/30468',
+      'https://github.com/owner/repo/pull/30468?view=files',
+      'https://github.com/owner/repo/pull/30468#discussion',
+      'https://github.com/owner/repo/pull/30468/',
+      'https://github.com/owner/repo/pull/30468/files',
+      'https://github.com/owner/repo/pull/9007199254740993',
+    ]) expect(classifyFailure({ ...incident, prNumber: null, prUrl })).toBe('unconverged');
+    expect(classifyFailure({ ...incident, prNumber: null, prUrl: 'https://github.com/owner/repo/pull/30468' })).toBe('awaiting-human');
+    expect(classifyFailures([{ ...incident, prNumber: null, prUrl: 'https://github.com/owner/repo/pull/30468' }])[0]?.errorMessage)
+      .toContain('https://github.com/owner/repo/pull/30468');
+    expect(classifyFailure({ ...incident, prNumber: 30468, prUrl: undefined })).toBe('awaiting-human');
+    const opened = { ...incident, status: 'done', stage: 'pr-opened' };
+    expect(classifyFailure({ ...opened, prNumber: null, prUrl: undefined })).not.toBe('awaiting-human');
+    expect(classifyFailure({ ...opened, prNumber: null, prUrl: 'https://github.com/owner/repo/issues/30468' })).not.toBe('awaiting-human');
+    expect(classifyFailure({ ...opened, prNumber: null, prUrl: 'https://github.com/owner/repo/pull/30468' })).toBe('awaiting-human');
+    expect(classifyFailure({ ...opened, prNumber: null, prUrl: 'https://example.test/pull/7' })).toBe('awaiting-human');
+    expect(openPrAwaitingHumanMessage({ prNumber: null, prUrl: 'https://github.com/owner/repo/pull/30468' }))
+      .toContain('https://github.com/owner/repo/pull/30468');
   });
 
   test('모르는 실패는 needs-human 으로 남는다 — 무한 재실행을 만들지 않는다', () => {

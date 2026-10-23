@@ -256,7 +256,7 @@ export async function runCoreTurn(
       mode: deferredEnabled ? 'always' : 'off',
     });
   }
-  debug.log('capability.resolve', 'tier-split', {
+  debug.log('capability.resolve', 'tool-tier-split', {
     sessionId: ctx.sessionId,
     surfaceId: surface.id,
     surfaceSelectionReason: surface.selectionReason,
@@ -285,7 +285,9 @@ export async function runCoreTurn(
         signal: ctx.signal,
         ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
         ...(ctx.maxToolTurns !== undefined ? { maxTurns: ctx.maxToolTurns } : {}),
-        ...(ctx.modelOverride !== undefined ? { model: ctx.modelOverride } : {}),
+        ...(ctx.initialProvider !== undefined
+          ? { initialProvider: ctx.initialProvider, ...(ctx.skipProviders ? { skipProviders: ctx.skipProviders } : {}) }
+          : ctx.modelOverride !== undefined ? { model: ctx.modelOverride } : {}),
         ...(ctx.callbacks?.onResolvedProvider !== undefined ? { onResolvedProvider: ctx.callbacks.onResolvedProvider } : {}),
         ...(ctx.budgetGrant !== undefined ? { budgetGrant: ctx.budgetGrant } : {}),
         ...(ctx.terminalToolNames !== undefined ? { terminalToolNames: ctx.terminalToolNames } : {}),

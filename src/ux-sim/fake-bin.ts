@@ -13,6 +13,7 @@
 // ⛔ This is not a simulator of the real tool: a spec only fixes stdout · stderr ·
 // exit code · lifetime, and records argv. Behaviour of the real tool stays with
 // tests that run where the tool exists.
+import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, isAbsolute, join } from 'node:path';
@@ -37,6 +38,14 @@ export interface FakeBinSpec {
    * a «died without a word» failure (`status` null · `signal` set). `exitCode` is then never reached.
    */
   readonly killSignal?: 'KILL' | 'TERM' | 'INT' | 'HUP' | 'ABRT' | 'SEGV';
+  /**
+   * Be the util-linux `script -q -e -c` PTY allocator itself: record the call, then `exec` the real
+   * util-linux `script` with the same argv. A test that spawns `sh -c 'script -q -e -c "$1" …'`
+   * then gets a real TTY (so `process.stdin.isTTY` is true inside the child) and the recording proves
+   * the PTY came from util-linux, not from a hand-rolled shim. Requires util-linux on PATH
+   * (`utilLinuxScript()`); incompatible with the output-faking fields below.
+   */
+  readonly pty?: boolean;
 }
 
 export interface FakeBinCall {
@@ -67,6 +76,29 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+let utilLinuxScriptCache: string | null | undefined;
+
+/**
+ * Absolute path of the util-linux `script` on PATH, or `null` when this host has none
+ * (macOS ships BSD `script`, whose `-q -e -c` flags differ — see `firstRunPtySupport()`).
+ * Probed once per process: `<path>/script --version` must answer `util-linux`.
+ */
+export function utilLinuxScript(): string | null {
+  if (utilLinuxScriptCache !== undefined) return utilLinuxScriptCache;
+  utilLinuxScriptCache = null;
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, 'script');
+    if (!existsSync(candidate)) continue;
+    const probe = spawnSync(candidate, ['--version'], { encoding: 'utf8', timeout: 5_000 });
+    if (probe.status === 0 && `${probe.stdout ?? ''}${probe.stderr ?? ''}`.includes('util-linux')) {
+      utilLinuxScriptCache = candidate;
+      break;
+    }
+  }
+  return utilLinuxScriptCache;
+}
+
 function script(name: string, spec: FakeBinSpec, dataDir: string, logPath: string): string {
   const lines = ['#!/bin/sh'];
   // One record per call: name and each argv entry NUL-terminated (one printf), then an ASCII record
@@ -76,6 +108,11 @@ function script(name: string, spec: FakeBinSpec, dataDir: string, logPath: strin
   // for recorder and payload reads so a fake of one of those names cannot recursively call itself.
   lines.push(`rec=$(command -p mktemp ${shellQuote(join(dataDir, 'rec.XXXXXX'))})`);
   lines.push(`{ printf '%s\\0' ${shellQuote(name)} "$@"; printf '\\036'; } > "$rec"; command -p cat "$rec" >> ${shellQuote(logPath)}; command -p rm -f "$rec"`);
+  if (spec.pty === true) {
+    // Recorded already: exec the real util-linux script so the caller gets a genuine TTY.
+    lines.push(`exec ${shellQuote(utilLinuxScript()!)} "$@"`);
+    return `${lines.join('\n')}\n`;
+  }
   if (spec.whenArgsStartWith !== undefined && spec.otherwise !== undefined) {
     const words = spec.whenArgsStartWith;
     const tests = [`[ "$#" -ge ${words.length} ]`, ...words.map((word, index) => `[ "$${index + 1}" = ${shellQuote(word)} ]`)];
@@ -117,6 +154,14 @@ export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): Fa
       if (!isAbsolute(spec.otherwise)) throw new Error(`fake-bin: ${name}: otherwise must be an absolute path, got ${JSON.stringify(spec.otherwise)}`);
     } else if (spec.otherwise !== undefined) {
       throw new Error(`fake-bin: ${name}: otherwise is only used with whenArgsStartWith`);
+    }
+    if (spec.pty === true) {
+      if (spec.stdout !== undefined || spec.stderr !== undefined || spec.exitCode !== undefined
+        || spec.sleepSeconds !== undefined || spec.killSignal !== undefined
+        || spec.whenArgsStartWith !== undefined || spec.otherwise !== undefined) {
+        throw new Error(`fake-bin: ${name}: pty is a pass-through PTY allocator and takes no output/fake fields`);
+      }
+      if (utilLinuxScript() === null) throw new Error(`fake-bin: ${name}: pty needs the util-linux \`script\` on PATH (this host has none)`);
     }
   }
   const root = mkdtempSync(join(tmpdir(), 'ux-sim-fake-bin-'));

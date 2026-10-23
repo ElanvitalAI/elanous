@@ -8,6 +8,7 @@ import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config
 import { getUserConfig, reloadUserConfig, saveUserConfig } from '../../user-config.js';
 import { lookupLlmTierSpec } from '../../model-tier/index.js';
 import { setSessionModelPin } from '../../llm/route-decision.js';
+import { recordDashboardTurnExecution, resolveDashboardActiveModel } from '../acp-active-model.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveSurfaceUx } from '../../agent/surface-ux/build.js';
 import { debug } from '../../debug/log.js';
@@ -1573,6 +1574,39 @@ test('/loop stops when the session ends (/session clear)', async () => {
     expect(schedulerRef.current).toBeNull();
   } finally {
     resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// TUI-MODEL-BADGE-ACTUAL (10-16) — `/model` «지금:» 도 상태줄 배지와 «같은» 원천을 본다.
+// 실물 경로: ACP 사용량 핸들러가 부르는 recordDashboardTurnExecution → statusModelActual → 이 핸들러.
+test('model «지금:» 은 이번 턴 실제 모델을 보인다 — 폴백이면 «처음 → 실제»', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-tui-model-actual-'));
+  setElanousConfigDir(root);
+  try {
+    const spec = lookupLlmTierSpec('openai-codex', 'better');
+    const config = getUserConfig();
+    saveUserConfig({
+      ...config,
+      llm: { ...config.llm, provider: 'openai-codex', model: spec.model, reasoningLevel: 'medium', codexReasoning: undefined },
+    });
+    reloadUserConfig();
+    setSessionModelPin('dashboard', null);
+    const lines: string[] = [];
+    const ctx = createContext(lines);
+    ctx.refreshReasoningHudSegment = () => {};
+
+    // 턴 결정(ACP getActiveModel 본체) → 실제 응답 기록(ACP usage 핸들러) — codex 가 grok 으로 폴백.
+    expect(resolveDashboardActiveModel('이 버그를 고쳐줘')).toBe(spec.model);
+    recordDashboardTurnExecution({ model: 'grok-4.3', routeProvider: 'grok' }, { remote: false });
+
+    await buildDashboardSlashRegistry().dispatch('model', [], ctx);
+    expect(lines[0]).toContain(`이번 턴 실제: ${spec.model} → grok-4.3`);
+    expect(lines[0]).toStartWith(`지금: ${spec.model} (보통 · 생각 medium)`);
+  } finally {
+    setSessionModelPin('dashboard', null);
+    resetElanousConfigDir();
+    reloadUserConfig();
     rmSync(root, { recursive: true, force: true });
   }
 });

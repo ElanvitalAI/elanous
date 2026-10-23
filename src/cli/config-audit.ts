@@ -110,6 +110,13 @@ export function recordConfigChange(change: ConfigChange, dbPath?: string): Confi
   }
 }
 
+/** 화면 표시용 값 — 원장과 «같은 가림 자»(비밀 경로 ⊕ 비밀 모양 값 → MASK). set/unset 되읽기 줄이 쓴다. */
+export function maskConfigDisplayValue(key: string, value: unknown): unknown {
+  if (value === undefined) return undefined;
+  if (isSecretPath(key) || isSecretValue(value)) return MASK;
+  return maskDeep(value);
+}
+
 /** 한 키의 감사 이력 — 시간 오름차순. db 파일이 없으면 빈 배열(읽기가 파일을 만들지 않는다). */
 export function readConfigHistory(key: string, dbPath?: string): ConfigChangeRow[] {
   const path = configAuditDbPath(dbPath);
@@ -120,4 +127,116 @@ export function readConfigHistory(key: string, dbPath?: string): ConfigChangeRow
   } finally {
     if (path !== ':memory:') db.close();
   }
+}
+
+// ── CFG-STORE2-HISTORY-REVERT · 조회·되돌림 (0.2.36 · 2026-10-22) ──
+//
+// CFG-STORE2 가 남긴 원장(위)을 «읽어서» 되돌린다. 원장은 append 전용이다 — 되돌림도 UPDATE/DELETE 없이
+// 새 행 하나(prev=지금 값 · next=복원 값 · why='config revert')로만 남는다. 그래서 이력은 «왜 그 값인가» 의
+// 사슬로 남고, 되돌린 되돌림도 다시 한 행이다.
+//
+// ⛔ 불변식
+//   • 되돌릴 «이전 값» 이 MASK 면 복원하지 않는다(원문을 원장에 남기지 않았으므로 복원할 원문이 없다) —
+//     가린 값을 값으로 되쓰는 조용한 오염 대신 «거부» 한다. 그 키는 사람이 다시 set 한다.
+//   • 출력은 언제나 가림을 거친다(maskDeep 재적용) — 화면·JSON 어디에도 비밀 원문이 없다.
+//   • 도메인 합성(아래 configDomainOf)은 «같은 원장 경로» 만 쓴다 — 특수 도메인용 별도 저장소를 만들지 않는다.
+
+/** config 도메인 — 한 키가 어느 특수 도메인의 합성 경계에 속하는가. */
+export type ConfigDomain =
+  | 'llm-policy'
+  | 'account-limits'
+  | 'fallback-chain'
+  | 'pod-pool'
+  | 'author-on-pod'
+  | 'config';
+
+/** 도메인 경계 — 구체 접두가 먼저다(넓은 'llm.' 이 좁은 'llm.limits' 를 삼키지 않게). */
+const CONFIG_DOMAIN_PREFIXES: readonly (readonly [ConfigDomain, readonly string[]])[] = [
+  ['pod-pool', ['podPool', 'harness.podPool']],
+  ['author-on-pod', ['authorOnPod', 'harness.authorOnPod']],
+  ['fallback-chain', ['llm.fallback', 'llm.fallbackChain', 'llm.rotation.fallback', 'llm.providerFallback']],
+  ['account-limits', ['llm.limits', 'llm.accountLimits', 'llm.accountLimit', 'account.']],
+  ['llm-policy', ['llm.']],
+];
+
+/** 한 키의 도메인 — 어느 특수 도메인 접두에도 안 맞으면 'config'(일반 키). */
+export function configDomainOf(key: string): ConfigDomain {
+  const normalized = key.trim();
+  for (const [domain, prefixes] of CONFIG_DOMAIN_PREFIXES) {
+    for (const prefix of prefixes) {
+      if (normalized === prefix) return domain;
+      if (prefix.endsWith('.')) {
+        if (normalized.startsWith(prefix)) return domain;
+      } else if (normalized.startsWith(`${prefix}.`)) {
+        return domain;
+      }
+    }
+  }
+  return 'config';
+}
+
+/** 원장 값 → 실제 값. null = 그 자리에 값이 없었다(undefined) · MASK = 가려서 모른다. */
+export function decodeConfigChangeValue(raw: string | null): unknown {
+  if (raw === null) return undefined;
+  if (raw === MASK) return MASK;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return raw;
+  }
+}
+
+/** 되돌림 계획 — 원장만 보고 정한다(값을 쓰지는 않는다). */
+export type ConfigRevertPlan =
+  | { status: 'no-history' }
+  | { status: 'masked'; last: ConfigChangeRow }
+  | { status: 'already'; last: ConfigChangeRow }
+  | { status: 'restore'; last: ConfigChangeRow; value: unknown };
+
+/**
+ * 값 «전체» 에 가림 자(MASK)가 있는가 — 원시·배열·객체를 깊이 순회한다.
+ * 최상위 문자열 비교만 하면 `["***MASK***"]` 처럼 배열·객체 «속» 에 남은 가림 자를 놓친다.
+ */
+export function containsMaskValue(value: unknown): boolean {
+  if (value === MASK) return true;
+  if (Array.isArray(value)) return value.some((item) => containsMaskValue(item));
+  if (value !== null && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some((item) => containsMaskValue(item));
+  }
+  return false;
+}
+
+/** 그 키의 «마지막 변경» 을 되돌릴 계획. value===undefined 면 그 자리를 지우는 복원이다. */
+export function planConfigRevert(key: string, dbPath?: string): ConfigRevertPlan {
+  const last = readConfigHistory(key, dbPath).at(-1);
+  if (!last) return { status: 'no-history' };
+  // 이전 값이 «어디든» 가려져 있으면 원문 복원 불가 — 가린 값을 값으로 되쓰지 않는다.
+  // 깊이 탐색인 이유: llm.fallbackChain 같은 배열·객체 값은 원장에 ["***MASK***"] 로 남아
+  // 최상위 비교(prev === MASK)로는 안 걸리고, 그대로 되쓰면 MASK 리터럴이 실제 config 값이 된다.
+  if (containsMaskValue(decodeConfigChangeValue(last.prev))) return { status: 'masked', last };
+  if (last.prev === last.next) return { status: 'already', last };
+  return { status: 'restore', last, value: decodeConfigChangeValue(last.prev) };
+}
+
+/** 화면용 값 — 가림을 «한 번 더» 거친다(원장이 이미 가렸어도 표시 자에서 재적용). */
+function renderConfigChangeValue(raw: string | null): string {
+  if (raw === null) return '∅';
+  const decoded = decodeConfigChangeValue(raw);
+  if (decoded === MASK) return MASK;
+  return JSON.stringify(maskDeep(decoded)) ?? 'null';
+}
+
+/** `config history <key>` 출력 — 도메인 ⊕ 행 수 ⊕ (시각 · prev → next · by · why). */
+export function formatConfigHistory(key: string, rows: readonly ConfigChangeRow[]): string {
+  const header = `config history ${key} [${configDomainOf(key)}] — ${rows.length}행`;
+  const lines = rows.map((row) => {
+    const why = row.why ? ` why=${row.why}` : '';
+    return `${row.at}  ${renderConfigChangeValue(row.prev)} → ${renderConfigChangeValue(row.next)}  by=${row.by}${why}`;
+  });
+  return [header, ...lines].join('\n');
+}
+
+/** 되돌림 감사 행 — 같은 원장에 append 만 한다(why 기본값 'config revert'). */
+export function recordConfigRevert(change: ConfigChange, dbPath?: string): ConfigChangeRow {
+  return recordConfigChange({ ...change, why: change.why?.trim() ? change.why.trim() : 'config revert' }, dbPath);
 }

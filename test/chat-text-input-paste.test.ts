@@ -28,6 +28,28 @@ async function waitForStdinReader(): Promise<void> {
 }
 
 describe('textInput bracketed paste integration', () => {
+  test('TUI-PASTE-ECHO: 긴 붙여넣기는 자리표시로 보이고 실제 제출 경로가 원문 바이트(CRLF·끝 줄바꿈·앞 공백) 그대로 낸다', async () => {
+    const raw = '  first\r\nsecond\r\nthird\r\nfourth\n';
+    const nextKey = deferred<Key>();
+    let reads = 0;
+    const lines: number[] = [];
+    const input = textInput({
+      row: 2,
+      col: 1,
+      width: 80,
+      maxLines: 4,
+      readKey: async () => {
+        reads++;
+        return reads === 1 ? ({ name: 'paste', ctrl: false, shift: false, paste: raw } as Key) : nextKey.promise;
+      },
+      onLinesChange: (count) => lines.push(count),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(lines.every((n) => n === 1)).toBe(true); // 자리표시 한 줄 — 입력칸이 4줄로 펼쳐지지 않는다
+    nextKey.resolve({ name: 'enter', ctrl: false, shift: false });
+    await expect(input).resolves.toEqual({ text: raw, submitted: true });
+  });
+
   test('keeps multiline paste in the input until one explicit Enter submits it', async () => {
     const parser = new KeyStreamParser();
     const [paste] = parser.push(`${START}L1\nL2${END}`);

@@ -9,6 +9,9 @@
 //   6. Output truncation above TASK_NOTIFICATION_OUTPUT_CAP
 
 import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../src/debug/log';
 import {
   TaskNotificationQueue,
@@ -87,6 +90,22 @@ describe('TaskNotificationQueue', () => {
   test('drain on empty returns []', () => {
     const q = new TaskNotificationQueue();
     expect(q.drain()).toEqual([]);
+  });
+
+  test('drain listeners see delivered notifications, never pending enqueues', () => {
+    const q = new TaskNotificationQueue();
+    const delivered: string[][] = [];
+    const off = q.onDrain(items => { delivered.push(items.map(item => item.taskId)); });
+    q.enqueue(makePending({ taskId: 'a' }));
+    expect(delivered).toEqual([]);
+    q.drain();
+    expect(delivered).toEqual([['a']]);
+    q.drain();
+    expect(delivered).toEqual([['a']]);
+    off();
+    q.enqueue(makePending({ taskId: 'b' }));
+    q.drain();
+    expect(delivered).toEqual([['a']]);
   });
 
   test('dedup by taskId — second enqueue is noop', () => {
@@ -405,21 +424,53 @@ describe('wireTaskNotifications (manual wiring)', () => {
     }
   });
 
-  test('output truncation above cap', async () => {
-    const longText = 'y'.repeat(TASK_NOTIFICATION_OUTPUT_CAP + 200);
-    const provider = fakeProvider([[{ type: 'text', delta: longText }]]);
-    const handle = reg.spawn({
-      definition: simpleDef('data'),
-      prompt: 'big',
-      provider,
-      background: true,
-    });
-    for await (const _ev of handle.events) { void _ev; }
-    const drained = q.drain();
-    expect(drained.length).toBe(1);
-    expect(drained[0]!.truncated).toBe(true);
-    expect(drained[0]!.output.length).toBeLessThanOrEqual(TASK_NOTIFICATION_OUTPUT_CAP + 20);
-    expect(drained[0]!.output).toContain('…(truncated)');
+  test('50,000-character runner completion is preserved through queue drain and XML', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-result-'));
+    const result = 'y'.repeat(49_990) + 'TAIL-12345';
+    const localQueue = new TaskNotificationQueue(root);
+    const localRegistry = new AgentRegistry();
+    const off = wireTaskNotifications(localQueue, localRegistry);
+    try {
+      const handle = localRegistry.spawn({
+        definition: simpleDef('data'), prompt: 'big',
+        provider: fakeProvider([[{ type: 'text', delta: result }]]), background: true,
+      });
+      for await (const _ev of handle.events) { void _ev; }
+      const [notification] = localQueue.drain();
+      expect(notification?.state).toBe('done');
+      expect(notification?.output.length).toBeLessThanOrEqual(TASK_NOTIFICATION_OUTPUT_CAP);
+      expect(notification?.resultPath).toBeTruthy();
+      const xml = renderTaskNotificationsXml([notification!]);
+      expect(xml).toContain(`<result-path>${notification!.resultPath}</result-path>`);
+      const opened = readFileSync(notification!.resultPath!, 'utf8');
+      expect(opened).toBe(result);
+      expect(opened.slice(-10)).toBe('TAIL-12345');
+      console.log(`AGENT_RESULT queue-drain: summary-length=${notification!.output.length} opened-path=${notification!.resultPath} opened-length=${opened.length} tail=${opened.slice(-10)}`);
+    } finally {
+      off();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('result limit and write failures surface a reason instead of a successful truncated notification', () => {
+    const root = mkdtempSync(join(tmpdir(), 'agent-result-fail-'));
+    try {
+      for (const [queue, reason] of [
+        [new TaskNotificationQueue(root, 500), 'exceeds limit'],
+        [new TaskNotificationQueue(join(root, 'missing', 'file', '\0'), 10_000), 'full result unavailable'],
+      ] as const) {
+        const input = 'x'.repeat(700);
+        queue.enqueue(makePending({ output: input }));
+        const [notification] = queue.drain();
+        expect(notification?.state).toBe('error');
+        expect(notification?.preservationError).toContain(reason);
+        expect(notification?.resultPath).toBeUndefined();
+        expect(notification?.output.length).toBeLessThanOrEqual(TASK_NOTIFICATION_OUTPUT_CAP);
+        expect(renderTaskNotificationsXml([notification!])).toContain('<error>full result unavailable:');
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('label + teamName propagated onto pending notification', async () => {

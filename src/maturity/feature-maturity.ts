@@ -62,7 +62,7 @@ export const FEATURE_MATURITY = {
     preview: 'beta', pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta', image: 'beta', 'agent-env': 'beta',
     where: 'stable', bench: 'beta', shadow: 'beta', llm: 'beta', storage: 'beta', leader: 'beta',
     pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', live: 'beta',
-    research: 'beta', release: 'beta', rfc: 'beta', know: 'beta', freeze: 'beta', flow: 'beta', seat: 'beta', hq: 'beta', steward: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',
+    research: 'beta', release: 'beta', rfc: 'beta', know: 'beta', freeze: 'beta', herdr: 'beta', flow: 'beta', seat: 'beta', hq: 'beta', steward: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',
     control: 'beta', resources: 'beta', hooks: 'beta', setup: 'stable', start: 'stable',
     grounding: 'beta', graph: 'beta', loop: 'stable', resource: 'beta', card: 'stable', 'launch-head': 'beta',
     a2a: 'beta', plugin: 'stable', make: 'beta', skills: 'beta', connect: 'beta', import: 'beta',

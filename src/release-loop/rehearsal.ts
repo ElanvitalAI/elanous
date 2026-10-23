@@ -186,26 +186,23 @@ export function runRehearsalLeakCheck(checkout: string): { status: number | null
   } finally { rmSync(out, { recursive: true, force: true }); }
 }
 
-/** The hard rehearsal uses the release gate itself, pinned to the fetched main SHA and node-b Pod member. */
-async function runHardGate(version: string, checkout: string, sha: string, ledgerRoot: string, runId: string): Promise<HardGateResult> {
-  const configuredPool = releaseLoopConfig().gatePodPool;
-  if (!configuredPool) throw new Error('hard rehearsal requires release.loop.gatePodPool');
-  const members = parsePodPool(configuredPool);
-  const gateMember = members.find(member => member.sshHost === 'node-b');
-  if (!gateMember) throw new Error('hard rehearsal requires a live node-b Pod member');
-  const pool = configuredPool.split(',').map(part => part.trim())
-    .find(part => part.split(/[#:]/, 1)[0] === `${gateMember.context}@${gateMember.sshHost}`);
-  if (!pool) throw new Error('hard rehearsal cannot isolate the node-b Pod member');
-  const previous = latestPublishedPreviousVersion(version, ledgerRoot);
-  const logPath = join(ledgerRoot, 'release', version, 'rehearsal', `${runId}.log`);
-  mkdirSync(dirname(logPath), { recursive: true });
-  const run = (() => {
-    const log = openSync(logPath, 'wx', 0o600);
-    try { return spawnSync('bun', hardRehearsalGateArgs(version, runId, sha, previous, pool), {
-      cwd: checkout, encoding: 'utf8', stdio: ['ignore', log, log], timeout: 4 * 60 * 60_000,
-      env: { ...process.env, ELANOUS_STATE_DIR: ledgerRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(ledgerRoot) },
-    }); } finally { closeSync(log); }
-  })();
+/** Run the exact hard-gate subprocess with an isolated clock budget for timeout replay. */
+export function spawnHardRehearsalGate(opts: {
+  binary: string; args: string[]; checkout: string; ledgerRoot: string; logPath: string; timeoutMs: number; sha: string;
+}): HardGateResult {
+  mkdirSync(dirname(opts.logPath), { recursive: true });
+  const log = openSync(opts.logPath, 'wx', 0o600);
+  let run: ReturnType<typeof spawnSync>;
+  try {
+    run = spawnSync(opts.binary, opts.args, {
+      cwd: opts.checkout, encoding: 'utf8', stdio: ['ignore', log, log], timeout: opts.timeoutMs,
+      env: { ...process.env, ELANOUS_STATE_DIR: opts.ledgerRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(opts.ledgerRoot) },
+    });
+  } finally { closeSync(log); }
+  return parseHardRehearsalGateResult(run, opts.logPath, opts.sha);
+}
+
+function parseHardRehearsalGateResult(run: ReturnType<typeof spawnSync>, logPath: string, sha: string): HardGateResult {
   // stdout and stderr stream to the claim's durable evidence while the child is still running.
   const output = readFileSync(logPath, 'utf8');
   const line = output.split(/\r?\n/).reverse().find(value => value.trim().startsWith('{'));
@@ -223,6 +220,25 @@ async function runHardGate(version: string, checkout: string, sha: string, ledge
   if (run.status === 1 && result.outcome === 'regression') return result;
   if (run.status === 2 && result.outcome === 'error') return result;
   throw new Error(`hard rehearsal gate rc=${run.status ?? 'spawn'} disagrees with outcome=${result.outcome}`);
+}
+
+/** The hard rehearsal uses the release gate itself, pinned to the fetched main SHA and node-b Pod member. */
+async function runHardGate(version: string, checkout: string, sha: string, ledgerRoot: string, runId: string): Promise<HardGateResult> {
+  const configuredPool = releaseLoopConfig().gatePodPool;
+  if (!configuredPool) throw new Error('hard rehearsal requires release.loop.gatePodPool');
+  const members = parsePodPool(configuredPool);
+  const gateMember = members.find(member => member.sshHost === 'node-b');
+  if (!gateMember) throw new Error('hard rehearsal requires a live node-b Pod member');
+  const pool = configuredPool.split(',').map(part => part.trim())
+    .find(part => part.split(/[#:]/, 1)[0] === `${gateMember.context}@${gateMember.sshHost}`);
+  if (!pool) throw new Error('hard rehearsal cannot isolate the node-b Pod member');
+  const previous = latestPublishedPreviousVersion(version, ledgerRoot);
+  const logPath = join(ledgerRoot, 'release', version, 'rehearsal', `${runId}.log`);
+  mkdirSync(dirname(logPath), { recursive: true });
+  return spawnHardRehearsalGate({
+    binary: 'bun', args: hardRehearsalGateArgs(version, runId, sha, previous, pool),
+    checkout, ledgerRoot, logPath, timeoutMs: 4 * 60 * 60_000, sha,
+  });
 }
 
 function oneLine(text: string): string { return text.replace(/\s+/g, ' ').trim(); }

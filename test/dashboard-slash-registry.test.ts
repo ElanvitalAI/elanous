@@ -1,4 +1,5 @@
 import { describe, expect, mock, spyOn, test } from 'bun:test';
+import { resolveDashboardChatMainSlashCommand } from '../src/dashboard/input/chat-main-slash-command.js';
 import * as askLaunchFlow from '../src/self-dev/ask-launch-flow.js';
 import type { AskLaunchFlowDeps, AskLaunchFlowInput, AskLaunchFlowResult } from '../src/self-dev/ask-launch-flow.js';
 import * as goalAuthorCli from '../src/self-implement/goal-author-cli.js';
@@ -28,6 +29,7 @@ import { DisplayCoordinator } from '../src/display/coordinator.js';
 import { clearTelemetryForTest } from '../src/context-display/index.js';
 import { censusRegisteredSlashOutputs } from '../src/command-registry.js';
 import { setGoalAuthorRuntimeDeps } from '../src/tool-runtime/goal-author-runtime.js';
+import { isPauseRequested, requestPause, resetPauseFlag } from '../src/turn-checkpoint/index.js';
 
 const {
   SlashCommandRegistry,
@@ -1191,7 +1193,6 @@ describe('B-1.e · 4 tiny standalone toggles / state-mutation cases', () => {
     // doesn't leak into subsequent test files (e.g.
     // llm-exploration-synthesis-phase) where streamLLMWithTools sees a
     // stale pause request and short-circuits to a checkpoint pause.
-    const { resetPauseFlag } = await import('../src/turn-checkpoint/index.js');
     resetPauseFlag();
   });
 
@@ -1646,6 +1647,20 @@ describe('B-1.h · session/context cluster', () => {
     expect(state.resumePickerOpens).toBe(0);
   });
 
+  // 재현 — TUI-RESUME-PICKER(백로그 #16 · n8n 재기동 때 «/resume·/session list 가 화면에 안 뜸»).
+  // 라이브 격리 classic 에서 맨 `/resume` → «usage: /session load <id-prefix>» 만 뜨고 픽커 없음.
+  // 기전: 채팅 입력 경로가 registry 앞에서 `/resume` 을 `/session load` 로 «무조건» 바꿨다 —
+  // 위 두 시험은 registry 에 'resume' 을 «직접» 넣어 그 바꿈을 지나지 않았다.
+  test('TUI-RESUME-PICKER incident — typed «/resume» goes through the chat-input parse and opens the picker', async () => {
+    const reg = buildDashboardSlashRegistry();
+    const { ctx, state } = makeFakeCtx();
+    const { cmdLower, args } = resolveDashboardChatMainSlashCommand('/resume');
+    const r = await reg.dispatch(cmdLower, args, ctx);
+    expect(r.kind).toBe('continue');
+    expect(state.resumePickerOpens).toBe(1);
+    expect(ctx.chatLines.join('\n')).not.toContain('usage: /session load');
+  });
+
   test('paste happy path: clipboard returns token → setNextInitial', async () => {
     const reg = buildDashboardSlashRegistry();
     const { ctx, state } = makeFakeCtx();
@@ -1959,21 +1974,41 @@ describe('slash wire-up · /compact', () => {
 });
 
 describe('buildDashboardSlashRegistry — output census', () => {
+  // 재현 — 열차 #30519 shard-3(host-e-wsl · 10-23): 이 census 가 `/pause` 도 dispatch 해 모듈 싱글톤
+  // pauseRequested 를 true 로 남겼다. 같은 bun 프로세스에서 뒤에 도는 test/session-chat.test.ts
+  // «applies terminal-capable turn wiring…» 가 «[paused] checkpoint saved…» 를 받아 실패했다(파일 순서가
+  // registry → session-chat 일 때만 — baseline 은 반대 순서라 통과). mac 에선 census 가 5s 기본 시한에 걸려
+  // `/pause` 까지 못 가 안 보였다. census 동안의 pause 표시를 census 전 값으로 되돌리고, 끝까지 돌게 시한을 준다.
   test('dispatches every registered slash command and preserves output classifications', async () => {
     const registry = buildDashboardSlashRegistry();
-    const census = await censusRegisteredSlashOutputs({
-      registry,
-      createContext: () => {
-        const { ctx, state } = makeFakeCtx();
-        return {
-          context: ctx,
-          observe: () => ({
-            visibleOutput: state.chatOutputLines.length > 0,
-            hiddenOutput: state.debugLines.length > 0,
-          }),
-        };
-      },
-    });
+    const pausedBefore = isPauseRequested();
+    let census: Awaited<ReturnType<typeof censusRegisteredSlashOutputs>>;
+    let pausedByCensus = false;
+    // 지운 상태에서 시작해야 census 가 «실제로» /pause 를 실행했는지 잴 수 있다(r2 must-fix · Goodhart).
+    resetPauseFlag();
+    try {
+      census = await censusRegisteredSlashOutputs({
+        registry,
+        createContext: () => {
+          const { ctx, state } = makeFakeCtx();
+          return {
+            context: ctx,
+            observe: () => ({
+              visibleOutput: state.chatOutputLines.length > 0,
+              hiddenOutput: state.debugLines.length > 0,
+            }),
+          };
+        },
+      });
+      pausedByCensus = isPauseRequested();
+    } finally {
+      // Put the pause request back the way it was even if the census throws — `/pause` is one of the dispatched commands (r1 must-fix).
+      resetPauseFlag();
+      if (pausedBefore) requestPause();
+    }
+    expect(pausedByCensus).toBe(true);
+    expect(isPauseRequested()).toBe(pausedBefore);
+    expect(census.commands.map(command => command.name)).toContain('pause');
 
     expect(census.registeredTotal).toBe(registry.names().length);
     expect(census.commands.map(command => command.name)).toEqual([...registry.names()]);
@@ -1983,7 +2018,7 @@ describe('buildDashboardSlashRegistry — output census', () => {
       'indeterminate',
     ]));
     expect(census.visibleOutput + census.hiddenOnly + census.indeterminate).toBe(census.registeredTotal);
-  });
+  }, 30_000);
 });
 
 describe('slash wire-up · /cost', () => {

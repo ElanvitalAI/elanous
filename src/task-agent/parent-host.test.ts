@@ -1317,6 +1317,19 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
         { ...baseDeps, ownerCodexRotation: () => exhausted as unknown as ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation> })).rejects.toThrow('모두 사용 임계');
       expect(calls.some((call) => call.stdin !== undefined || call.script.includes('nohup'))).toBe(false);
 
+      calls.length = 0;
+      writeFileSync(teamAuthPath, teamAuthBefore);
+      const creditCandidates = candidates.map((candidate) => ({ ...candidate, reached: true, usedPercent: 100,
+        hasCredits: true, creditBalance: candidate.name === 'team' ? 3_000 : 1_000 }));
+      const creditLaunch = await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+        { runId: 'run-ownercredit01', launchId: 'tl-ownercredit', substrate: 'pod', podGoal: 'document this behavior',
+          env: { ELANOUS_RUN_ID: 'run-ownercredit01' } },
+        { ...baseDeps, ownerCodexRotation: () => ({ ...rotation, candidates: creditCandidates }) as unknown as ReturnType<typeof import('../oauth/codex-account-store.js').inspectCodexRotation>,
+          ownerCodexRotationConfig: { ...baseDeps.ownerCodexRotationConfig, creditsAllowed: true, creditReserve: 2_000 } });
+      expect(creditLaunch && 'parentHost' in creditLaunch ? creditLaunch.parentHost?.host : undefined).toBe('node-b');
+      expect(JSON.parse(calls.find((call) => call.stdin !== undefined)!.stdin!).map((entry: { account: string }) => entry.account)).toEqual(['team']);
+      expect(calls.some((call) => call.script.includes('nohup'))).toBe(true);
+
       // The receiver rejects a marker above 16 accounts. The sender must
       // bound the installed batch and marker together before remote launch.
       calls.length = 0;

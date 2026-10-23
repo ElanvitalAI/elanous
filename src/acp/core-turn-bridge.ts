@@ -34,7 +34,8 @@
 // headless-core guard test asserts the bridge stays TUI-free so
 // Core really can run headless.
 
-import type { LLMMessage, LLMToolSpec, ContentBlock } from '../llm.js';
+import { nextTurnFallbackProvider, resolveDefaultProvider, type LLMMessage, type LLMProvider, type LLMToolSpec, type ContentBlock } from '../llm.js';
+import { readAutohealProviderFallback } from '../self-health/autoheal.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { CoreTurnAuthRejectedError } from '../core-turn/auth-rejected-notice.js';
 import {
@@ -208,6 +209,9 @@ export function bridgeCoreTurnToAcp(
   deps: CoreTurnBridgeDeps,
 ): NonNullable<AcpServerOptions['runTurn']> {
   const pollMs = deps.abortPollMs ?? DEFAULT_BRIDGE_ABORT_POLL_MS;
+  // TUI-400-AUTOHEAL-FALLBACK ② — 앞 턴이 «실제로» 마지막에 부른 공급자(턴 안 폴백이 넘겼으면 넘어간 쪽).
+  //   ② 의 제외 목록에 기본 공급자와 함께 넣는다 — 방금 400 을 낸 쪽을 다시 고르지 않게(r2 리뷰).
+  let lastResolvedProvider: string | null = null;
   return async (turnCtx: AcpTurnContext): Promise<void> => {
     const ctrl = new AbortController();
     const poll = setInterval(() => {
@@ -262,6 +266,25 @@ export function bridgeCoreTurnToAcp(
         }
       }
       const modelOverride = deps.resolveModel?.({ sessionId: turnCtx.sessionId, userText: turnCtx.userText });
+      // TUI-400-AUTOHEAL-FALLBACK ② — TUI 가 «이 턴은 다음 공급자로» 를 실어 보냈다(같은 턴이 400 을 두 번 받은 뒤).
+      //   ⛔ 고르는 것은 서버다 — 클라이언트는 표지만 싣고, 공급자는 이 프로세스의 `llm.fallbackChain` 해석으로 정한다.
+      //   ⛔ in-process TUI(tuiRouting) 만 — 데몬 ACP 는 종전 그대로.
+      let autohealProvider: { initialProvider: LLMProvider; skipProviders: readonly string[] } | null = null;
+      const autohealStep2 = deps.tuiRouting === true && readAutohealProviderFallback(turnCtx.promptMeta);
+      // ② 표지가 없는 프롬프트(새 턴 · ① 재시도)는 «그 턴» 의 시도다 — 앞 턴이 폴백으로 넘긴 공급자를 들고 오지 않는다(r3 리뷰).
+      if (!autohealStep2) lastResolvedProvider = null;
+      if (autohealStep2) {
+        try {
+          const failed = [...new Set([resolveDefaultProvider(modelOverride).name, ...(lastResolvedProvider ? [lastResolvedProvider] : [])])];
+          const next = nextTurnFallbackProvider(failed);
+          debug.log('self-health.autoheal', next ? 'provider-fallback-applied' : 'provider-fallback-none', {
+            sessionId: turnCtx.sessionId, from: failed[0], skipped: failed, to: next?.name ?? null,
+          }, { level: 'warn' });
+          if (next) autohealProvider = { initialProvider: next, skipProviders: failed };
+        } catch (error) {
+          debug.log('self-health.autoheal', 'provider-fallback-none', { sessionId: turnCtx.sessionId, error: String(error) }, { level: 'warn' });
+        }
+      }
       // Tier 2 arming(config-gated·2026-07-19 goal-exec → 아크4 전-family) — llm.goalLoop.enabled
       // 면 across-turn goal loop(runGoalLoop)로 감싸 목표 완료(update_goal 증거게이트)까지 지속·
       // continuation 재주입. **family 무관**(runGoalLoop 프롬프트·update_goal 툴 전부 provider-generic·
@@ -393,7 +416,7 @@ export function bridgeCoreTurnToAcp(
           { reasoning: true },
         );
       });
-      const dispatchResult = await runTurnDispatch({
+      const buildCoreTurnContext = (): CoreTurnContext => ({
         sessionId: turnCtx.sessionId,
         ...(originSessionId ? { originSessionId } : {}),
         ...(turnCtx.userText ? { userText: turnCtx.userText } : {}),
@@ -402,6 +425,7 @@ export function bridgeCoreTurnToAcp(
         dispatchTool,
         signal: ctrl.signal,
         ...(modelOverride !== undefined ? { modelOverride } : {}),
+        ...(autohealProvider ?? {}),
         ...(maxToolTurns !== undefined ? { maxToolTurns } : {}),
         ...((!factQuestion || explicitMaxToolTurns !== undefined) && deps.budgetGrant !== undefined ? { budgetGrant: deps.budgetGrant } : {}),
         callbacks: {
@@ -438,7 +462,7 @@ export function bridgeCoreTurnToAcp(
           onToolResult: (call) => { void turnCtx.pushToolResult(call); },
           // 실제로 응답한 공급자·모델을 기억한다 — 폴백 체인이 넘기면(예 codex → grok) 턴 모델(turnModel)과 달라진다.
           //   streamLLMWithTools 가 스트림을 (다시) 열 때마다 부른다 → 사용량 직전 값 = 그 사용량을 낸 쪽.
-          onResolvedProvider: (provider, model) => { resolvedRoute = { provider, model }; },
+          onResolvedProvider: (provider, model) => { resolvedRoute = { provider, model }; lastResolvedProvider = provider; },
           // 턴 모델(라우팅 결과)을 실어 보낸다 — 대시보드 턴 지표가 설정 모델로 ctx·단가를 잡지 않게.
           //   ⭐ 폴백이면 «넘어간» 모델·공급자를 싣는다(TUI-MODEL-BADGE-ACTUAL · 완료 배지가 읽는다 · 상태줄·/model 은 후속 TUI-MODEL-BADGE-SOURCE).
           onUsage: (usage) => {
@@ -606,11 +630,29 @@ export function bridgeCoreTurnToAcp(
             }
           },
         },
-      // 오류·취소로 끝나 onTurnComplete 가 안 불려도 마지막 추론 문단을 내보낸다(#28964 리뷰 FU-1 · 빈 버퍼면 무동작).
-      }).finally(() => reasoningThoughts.flush());
+      });
+      // TUI-SPEECH-STYLE-DAEMON — 자동 수복 1회: 하위 단계가 aborted(수렴 실패)로 끝나면 실패 범위만
+      // 좁혀 같은 시드로 «정확히 1회» 다시 돈다. 사용자 중단(isAborted)은 수복 대상이 아니며, 원래
+      // 완료 경계(onTurnComplete 1회 지속 · 최종 답 표면화)는 복구된 시도가 그대로 이어받는다.
+      let attempt = 0;
+      let dispatchResult: unknown;
+      let stopReason: unknown;
+      for (;;) {
+        attempt += 1;
+        // 오류·취소로 끝나 onTurnComplete 가 안 불려도 마지막 추론 문단을 내보낸다(#28964 리뷰 FU-1 · 빈 버퍼면 무동작).
+        dispatchResult = await runTurnDispatch(buildCoreTurnContext()).finally(() => reasoningThoughts.flush());
+        stopReason = (dispatchResult as { stopReason?: unknown } | null | undefined)?.stopReason;
+        const userCancelled = ctrl.signal.aborted || turnCtx.isAborted();
+        if (stopReason !== 'aborted' || userCancelled || attempt >= 2) break;
+        // 첫 시도의 잔류 스트림·보충은 폐기한다 — 복구 시도의 완료 경계가 폐기물로 오염되지 않게.
+        streamedTextSum = '';
+        finalSupplement = null;
+        try {
+          debug.log('acp.turn', 'autoheal-retry', { sessionId: turnCtx.sessionId, attempt: attempt + 1 });
+        } catch { /* observation cannot interrupt a turn */ }
+      }
       // ⭐ 인증 거절은 코어 턴이 «던지지 않고» 돌려준다 — 여기서 안 읽으면 서버는 end_turn 을 내고
       //   TUI 엔 «✔ 완료»만 남는다(TUI 결함 #22). 던져서 실패 경로(prompt-failed · 오류 줄)로 보낸다.
-      const stopReason = (dispatchResult as { stopReason?: unknown } | null | undefined)?.stopReason;
       if (stopReason === 'auth_rejected') {
         const rawError = (dispatchResult as { errorMessage?: unknown }).errorMessage;
         const error = new CoreTurnAuthRejectedError(typeof rawError === 'string' ? rawError : undefined);

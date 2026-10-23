@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { subscribeInsideEvent } from '../nexus/api/inside-events.js';
-import { parseRepairMarker, parseRepairWorkerResult, repairHarnessArgs, runRepairWorker, type RepairWorkerRequest } from './repair-worker.js';
+import { parseRepairMarker, parseRepairWorkerResult, repairHarnessArgs, repairWorkerEnv, runRepairWorker, type RepairWorkerRequest } from './repair-worker.js';
 
 const HEAD = 'a'.repeat(40);
 const COMMIT = 'b'.repeat(40);
@@ -19,6 +19,14 @@ test('repair worker pins the source PR and head, disables queue and merge, and c
     '--no-queue', '--no-auto-merge', '--child-llm-provider', 'openrouter', '--child-llm-model', 'openrouter/z-ai/glm-5.3']));
   expect(args.at(-1)).toBe('fix exact must-fix');
   expect(args).not.toContain('--open-pr');
+});
+
+test('TA-PARENT-ROLE-LLM: repair-run forwards a credit GLM parent policy to its own harness process', () => {
+  const pin = 'audit={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+  const withRole = { ...request, parentRoleLlm: [pin] };
+  expect(repairHarnessArgs(withRole)).not.toContain('--role-llm'); // harness say reads the role env pin
+  expect(JSON.parse(repairWorkerEnv(withRole).ELANOUS_ROLE_LLM_AUDIT!)).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  expect(repairWorkerEnv(request).ELANOUS_ROLE_LLM_AUDIT).toBeUndefined();
 });
 
 test('only exact PR/head artifact marker can become a repair result', () => {

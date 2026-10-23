@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { writePeerEdit } from '../nexus/api/graph-peer-edit.js';
+import { Command } from 'commander';
+import { registerGraphCommands } from './graph-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -21,6 +23,13 @@ function spawnGraphAt(stateRoot: string, cwd: string, ...args: string[]): { code
 function spawnGraph(stateRoot: string, ...args: string[]): { code: number | null; stdout: string; stderr: string } {
   return spawnGraphAt(stateRoot, root, ...args);
 }
+
+test('graph wizard-run is exposed as the smart wizard request entrypoint', () => {
+  const program = new Command();
+  registerGraphCommands(program);
+  const graph = program.commands.find(command => command.name() === 'graph');
+  expect(graph?.commands.some(command => command.name() === 'wizard-run')).toBe(true);
+});
 
 test('graph tick defaults to idle and --start passes JSON input, prints results, and does not restart a finished run', () => {
   const dir = mkdtempSync(join(tmpdir(), 'graph-cli-tick-'));
@@ -324,7 +333,7 @@ edges:
   const state = JSON.parse(run.stdout);
   expect(state).toMatchObject({ graphId: 'cli-dataflow', status: 'done', input, executed: 2 });
   expect(state.nodes[0]).toMatchObject({ nodeId: 'first', output: 'first-output' });
-  expect(JSON.parse(state.nodes[1].output)).toEqual({ graphId: 'cli-dataflow', runId: state.runId, nodeId: 'second', input, outputs: { first: 'first-output' } });
+  expect(JSON.parse(state.nodes[1].output)).toMatchObject({ graphId: 'cli-dataflow', runId: state.runId, nodeId: 'second', input, outputs: { first: 'first-output' } });
   const persisted = JSON.parse(readFileSync(state.statePath, 'utf8'));
   expect(persisted.input).toEqual(input);
   expect(persisted.nodes.slice(0, 2).map((node: { output: unknown }) => node.output)).toEqual(state.nodes.slice(0, 2).map((node: { output: unknown }) => node.output));

@@ -22,6 +22,10 @@ export interface WarmWorkerCommand {
   workerId: string;
   /** Acquired Pod identity and lease timestamp, carried only by the host control path. */
   podUid?: string;
+  /** Trusted provider's selected producer Pod and immutable image reference. */
+  podName?: string;
+  podContext?: string;
+  image?: string;
   requestedAt?: string;
   key: WarmWorkerKey;
   deadlineAt: number;

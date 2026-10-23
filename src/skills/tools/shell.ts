@@ -32,7 +32,7 @@ import {
   getShellRunnerDeps,
 } from '../../shell-runner/dispatch.js';
 import type { ShellHandle, ShellResult as RunnerResult } from '../../shell-runner/types.js';
-import { debug } from '../../debug/log.js';
+import { debug, redactSecretText, redactSecrets } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { getUserConfig } from '../../user-config.js';
 import { SCHEDULE_WAKEUP_TOOL_NAME } from './schedule-wakeup.js';
@@ -515,8 +515,62 @@ function withLongSleepWarning(
   return { ...result, output: `${formatLongSleepWarning(finding, bgAvailable, resumeHint)}\n${result.output}` };
 }
 
-function logShellDispatch(event: string, data: Record<string, unknown>): void {
-  debug.log('shell.dispatch', event, data);
+/** The per-event cap holds for the whole recorded args text, including the
+ *  truncation marker. Source: TUI-OBS-TRACE-PERSIST GOAL STEPS (2048 chars). */
+export const SHELL_DISPATCH_ARGS_TEXT_LIMIT = 2048;
+
+interface BoundedShellArgsText {
+  /** Redacted JSON text of the arguments received by dispatchRunShell. */
+  argsText: string;
+  /** True when argsText was cut to the cap. */
+  argsTextTruncated: boolean;
+  /** Length of the full redacted JSON text before bounding. */
+  argsTextChars: number;
+  /** Short scalar remains readable even if argsText itself is compacted. */
+  argsTextMarker?: string;
+}
+
+function stringifyShellArgs(rawArgs: unknown): string {
+  try {
+    const json = JSON.stringify(redactSecrets(rawArgs));
+    if (json !== undefined) return json;
+  } catch { /* circular / BigInt args — redact fallback text too */ }
+  try {
+    return redactSecretText(String(rawArgs));
+  } catch {
+    return '[unserializable shell args]';
+  }
+}
+
+/** Bounded, secret-redacted serialization for one RunShell dispatch record. */
+export function boundedShellArgsText(
+  rawArgs: unknown,
+): BoundedShellArgsText {
+  const full = stringifyShellArgs(rawArgs);
+  if (full.length <= SHELL_DISPATCH_ARGS_TEXT_LIMIT) {
+    return { argsText: full, argsTextTruncated: false, argsTextChars: full.length };
+  }
+  const argsTextMarker = '[truncated]';
+  const prefixLen = SHELL_DISPATCH_ARGS_TEXT_LIMIT - argsTextMarker.length - 1;
+  return {
+    argsText: `${full.slice(0, prefixLen)} ${argsTextMarker}`,
+    argsTextTruncated: true,
+    argsTextChars: full.length,
+    argsTextMarker,
+  };
+}
+
+function logShellDispatch(
+  event: string,
+  data: Record<string, unknown>,
+  argsTrace?: BoundedShellArgsText,
+): void {
+  debug.log(
+    'shell.dispatch',
+    event,
+    argsTrace ? { ...data, ...argsTrace } : data,
+    { compact: { stringMax: SHELL_DISPATCH_ARGS_TEXT_LIMIT } },
+  );
 }
 
 // ── bg completion → turn notification queue (TUI-BG-SHELL) ───────────
@@ -588,8 +642,9 @@ export async function dispatchRunShell(
   const network = asNetwork(rawArgs.network);
   const mode = asMode(rawArgs.mode);
   const description = typeof rawArgs.description === 'string' ? rawArgs.description : undefined;
+  const argsTrace = boundedShellArgsText(rawArgs);
   if (command[0] === 'cd') {
-    logShellDispatch('cd.rejected', { reason: 'argv-state-does-not-persist' });
+    logShellDispatch('cd.rejected', { reason: 'argv-state-does-not-persist' }, argsTrace);
     return rejectedCdResult();
   }
   const ledgerCliMatch = matchLedgerCli(command, opts.availableToolNames);
@@ -627,7 +682,7 @@ export async function dispatchRunShell(
       signal: opts.signal,
       deps,
     });
-    logShellDispatch(`runner.${result.outcome}`, { cwd: effectiveCwd, cwdSource });
+    logShellDispatch(`runner.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
     return withLongSleepWarning(result, longSleep, bgAvailable, resumeHint);
   }
 
@@ -641,7 +696,7 @@ export async function dispatchRunShell(
     signal: opts.signal,
   });
 
-  logShellDispatch(`legacy.${result.outcome}`, { cwd: effectiveCwd, cwdSource });
+  logShellDispatch(`legacy.${result.outcome}`, { cwd: effectiveCwd, cwdSource }, argsTrace);
   const summary = formatSummary(result);
   return withLongSleepWarning({
     output: summary,

@@ -44,6 +44,7 @@ import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import { remoteLedgerMirrorDir } from './parent-host.js';
 import { appendLandOrderRow, joinLandOrderRow } from './land-order-ledger.js';
 import { recordLiveMoveHistory } from './live-move-history.js';
+import { advanceLandedPieceMission } from './mission.js';
 import { runRepairCycle, type RepairLaunchRequest } from './repair-cycle.js';
 import { repairMustFixFromReview, repairReviewDigest } from './repair-review.js';
 import type { RepairCasOutcome, RepairCasRequest } from './repair-branch-cas.js';
@@ -112,6 +113,8 @@ export interface RejudgeDeps {
   readFile?: (path: string) => string;
   /** Verify a CLOSED component PR against the HQ train ledger and merged integration PR. */
   trainLanding?: (pr: number, cwd: string) => TrainLanding | null;
+  /** Confirmed merged component PR wakes successor pieces. */
+  advanceLandedPiece?: (pieceId: string, statePath: string) => Promise<unknown>;
 }
 
 /** PR binding alone does not mean a remote parent has stopped. Require its child edge and terminal ledger row. */
@@ -509,11 +512,19 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   if (view.state === 'MERGED' || view.state === 'CLOSED') {
     const at = now().toISOString();
     const train = trustedTrain;
+    // TA-CARD-MERGE-RECONCILE — 사람이 손 병합한 실패 카드는 터미널 표시보다 먼저 실제 land 실행기로 정산한다.
+    // 정산이 성공하면 원장(status·hand-move 이력·merge sha 터미널)은 reconcile 이 이미 썼다 — 중복 터미널 쓰기 없이 판정으로 돌아간다.
+    if (view.state === 'MERGED' && card.status === 'failed' && deps.liveMoves.has('propose-land')) {
+      const landed = await executeLiveLand(card, pr, { runId: card.runId ?? null, cwd }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
+      if (landed.ok && landed.executed) return target('landed-by-hand', landed.detail, pr, fromHead, toHead);
+    }
     updateTaskCard(statePath, card.id, (current) => {
       if (!current || cardPrNumber(current) !== pr || typeof current.pr !== 'object' || current.pr.url !== url) return undefined;
       const previous = boundPrTerminal(current);
       const alreadyLanded = train && current.trainLanding?.componentPr === pr
         && current.trainLanding.integrationPr === train.integrationPr && current.trainLanding.mergeSha === train.mergeSha;
+      // 손 병합 정산이 남긴 merge sha 터미널은 다음 틱이 가지 머리로 덮어쓰지 않는다(landed/landed-by-hand 는 이미 종결 상태).
+      if (previous && (current.status === 'landed' || current.status === 'landed-by-hand')) return undefined;
       if (previous?.state === view.state && previous.head === toHead && (!train || alreadyLanded) && (!train || current.status === 'done')) return undefined;
       return {
         ...current,
@@ -524,6 +535,10 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
           : { pr, url, head: toHead, state: view.state as 'MERGED' | 'CLOSED', at },
       };
     });
+    if (view.state === 'MERGED' || train) {
+      try { await (deps.advanceLandedPiece ?? ((pieceId, path) => advanceLandedPieceMission(pieceId, { statePath: path })))(card.id, statePath); }
+      catch (error) { try { log('task-agent', 'mission-auto-advance-error', { card: card.id, pr, error: String(error).slice(0, 250) }); } catch { /* fail-soft */ } }
+    }
     return train ? target('landed-via-train', `PR #${pr} via train #${train.integrationPr} merge ${train.mergeSha}`, pr, fromHead, toHead)
       : target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
   }

@@ -15,14 +15,14 @@ const previousStateDir = process.env.ELANOUS_STATE_DIR;
 const stateDir = mkdtempSync(join(tmpdir(), 'pty-ipc-test-'));
 process.env.ELANOUS_STATE_DIR = stateDir;
 
-const { migratePtyControlSchema, requestRemotePtyControl, requestRemotePtyControlCapabilities, processPtyControlRequests, resetPtyControlIpcForTesting } = await import('./pty-control-ipc.js');
+const { migratePtyControlSchema, requestRemotePtyControl, requestRemotePtyControlCapabilities, processPtyControlRequests, resetPtyControlIpcForTesting, signalPtyControlWake } = await import('./pty-control-ipc.js');
 const { externalWriteProvenance } = await import('./pty-write-provenance.js');
 const { upsertPtyManifest, ptyManifestDbPath, getPtyManifest } = await import('./pty-manifest.js');
 const { resetPtyEventLogForTesting } = await import('./pty-event-log.js');
 const { getPtyControlTarget, registerPtyControlTarget, resetForTesting, setPtyAdapterForTesting, startPty } = await import('./registry.js');
 const { createTuiControlTarget, startTuiSelfReport } = await import('../capture/tui-self-report.js');
 const { stopPtyRecording } = await import('./pty-recording.js');
-const { readFileSync } = await import('node:fs');
+const { readFileSync, writeFileSync } = await import('node:fs');
 const registryIds: string[] = [];
 
 interface FakeHandle {
@@ -237,7 +237,7 @@ describe('pty-control-ipc round-trip', () => {
     const h = fakeHandle({ accessMode: 'auto' });
     const reqP = requestRemotePtyControl(id, 'takeover', 2000);
     await Bun.sleep(60); // owner 폴 시뮬 前 요청이 pending 으로 안착
-    processPtyControlRequests((i) => (i === id ? (h as never) : undefined), (i, a) => { expect(a).toBe('human'); h.setAccessMode('write'); return true; });
+    await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), (i, a) => { expect(a).toBe('human'); h.setAccessMode('write'); return true; });
     const r = await reqP;
     expect(r.status).toBe('success');
     expect(r.to).toBe('write');
@@ -524,7 +524,7 @@ describe('pty-control-ipc round-trip', () => {
     const h = fakeHandle({ transitionPolicy: 'locked', setAccessMode: () => false });
     const reqP = requestRemotePtyControl(id, 'takeover', 2000);
     await Bun.sleep(60);
-    processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false); // takeover 거부
+    await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false); // takeover 거부
     const r = await reqP;
     expect(r.status).toBe('denied');
   });
@@ -543,7 +543,7 @@ describe('pty-control-ipc round-trip', () => {
     // claim/mutation 하지 않는다 — 요청자가 받은 owner-unreachable 과 실제 상태(불변)가 일치한다.
     const r = await requestRemotePtyControl(id, 'takeover', 30);
     expect(r.status).toBe('owner-unreachable');
-    processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => { mutated = true; h.setAccessMode('write'); return true; });
+    await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => { mutated = true; h.setAccessMode('write'); return true; });
     expect(mutated).toBe(false);
     expect(h.accessMode).toBe('auto'); // 모드 불변 — 취소가 실제로 mutation 을 막았다
   });
@@ -552,7 +552,7 @@ describe('pty-control-ipc round-trip', () => {
     const id = freshId(); register(id);
     const reqP = requestRemotePtyControl(id, 'takeover', 2000);
     await Bun.sleep(60);
-    processPtyControlRequests((i) => (i === id ? (fakeHandle({ isAlive: () => false }) as never) : undefined), () => true);
+    await processPtyControlRequests((i) => (i === id ? (fakeHandle({ isAlive: () => false }) as never) : undefined), () => true);
     const r = await reqP;
     expect(r.status).toBe('unknown-pty');
   });
@@ -586,15 +586,15 @@ describe('pty-control-ipc round-trip', () => {
     const writes: string[] = [];
     const h = registryHandle('auto', (chars) => { writes.push(chars); });
     const denied = requestRemotePtyControl(h.id, 'input-text', { chars: 'secret' }, 2000);
-    await Bun.sleep(60); processPtyControlRequests((i) => i === h.id ? h : undefined, () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => i === h.id ? h : undefined, () => false);
     await expect(denied).resolves.toMatchObject({ status: 'denied', reason: 'write-arbiter' });
     expect(writes).toEqual([]);
 
     const takeover = requestRemotePtyControl(h.id, 'takeover', 2000);
-    await Bun.sleep(60); processPtyControlRequests((i) => i === h.id ? h : undefined, (i, actor) => i === h.id && actor === 'human' && h.setAccessMode('write'));
+    await Bun.sleep(60); await processPtyControlRequests((i) => i === h.id ? h : undefined, (i, actor) => i === h.id && actor === 'human' && h.setAccessMode('write'));
     await expect(takeover).resolves.toMatchObject({ status: 'success', to: 'write' });
     const input = requestRemotePtyControl(h.id, 'input-text', { chars: 'ok' }, 2000);
-    await Bun.sleep(60); processPtyControlRequests((i) => i === h.id ? h : undefined, () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => i === h.id ? h : undefined, () => false);
     await expect(input).resolves.toMatchObject({ status: 'success' });
     expect(writes).toEqual(['ok']);
   });
@@ -602,7 +602,7 @@ describe('pty-control-ipc round-trip', () => {
   test('adapter write failures are failed, not arbiter denials', async () => {
     const h = registryHandle('write', () => { throw new Error('closed fd'); });
     const req = requestRemotePtyControl(h.id, 'input-text', { chars: 'secret' }, 2000);
-    await Bun.sleep(60); processPtyControlRequests((i) => i === h.id ? h : undefined, () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => i === h.id ? h : undefined, () => false);
     await expect(req).resolves.toMatchObject({ status: 'write-failed', reason: 'adapter-write' });
   });
 
@@ -627,21 +627,21 @@ describe('pty-control-ipc round-trip', () => {
       // ⓐ 거부(auto 모드) — 자식은 아무것도 «못 봤다»
       const denied = registryHandle('auto', () => { /* 도달 안 함 */ });
       const d = requestRemotePtyControl(denied.id, 'input-text', { chars: 'nope' }, 2000);
-      await Bun.sleep(60); processPtyControlRequests((i) => i === denied.id ? denied : undefined, () => false);
+      await Bun.sleep(60); await processPtyControlRequests((i) => i === denied.id ? denied : undefined, () => false);
       await expect(d).resolves.toMatchObject({ status: 'denied' });
       expect(externalWriteProvenance(denied.id)).toBeUndefined();
 
       // ⓑ 어댑터 실패 — 역시 «못 봤다»
       const failed = registryHandle('write', () => { throw new Error('closed fd'); });
       const f = requestRemotePtyControl(failed.id, 'input-text', { chars: 'nope' }, 2000);
-      await Bun.sleep(60); processPtyControlRequests((i) => i === failed.id ? failed : undefined, () => false);
+      await Bun.sleep(60); await processPtyControlRequests((i) => i === failed.id ? failed : undefined, () => false);
       await expect(f).resolves.toMatchObject({ status: 'write-failed' });
       expect(externalWriteProvenance(failed.id)).toBeUndefined();
 
       // ⓒ 성공 — 이때만 센다
       const ok = registryHandle('write', () => { /* 성공 */ });
       const o = requestRemotePtyControl(ok.id, 'input-text', { chars: 'GOAL-COMPLETE' }, 2000);
-      await Bun.sleep(60); processPtyControlRequests((i) => i === ok.id ? ok : undefined, () => false);
+      await Bun.sleep(60); await processPtyControlRequests((i) => i === ok.id ? ok : undefined, () => false);
       await expect(o).resolves.toMatchObject({ status: 'success' });
       expect(externalWriteProvenance(ok.id)).toMatchObject({ externalWrites: 1 });
     });
@@ -668,7 +668,7 @@ describe('pty-control-ipc round-trip', () => {
       const h = registryHandle('write', () => { /* 성공 */ });
       for (const chars of ['a', 'b', 'c']) {
         const r = requestRemotePtyControl(h.id, 'input-text', { chars }, 2000);
-        await Bun.sleep(60); processPtyControlRequests((i) => i === h.id ? h : undefined, () => false);
+        await Bun.sleep(60); await processPtyControlRequests((i) => i === h.id ? h : undefined, () => false);
         await expect(r).resolves.toMatchObject({ status: 'success' });
       }
       const prov = externalWriteProvenance(h.id, Date.now() + 5_000);
@@ -713,7 +713,7 @@ describe('pty-control-ipc round-trip', () => {
     }));
     const request = requestRemotePtyControl(id, 'input-key', { chars: '\x1b[A' }, 2000);
     await Bun.sleep(60);
-    processPtyControlRequests(getPtyControlTarget, () => false);
+    await processPtyControlRequests(getPtyControlTarget, () => false);
     await expect(request).resolves.toEqual({ status: 'success' });
     expect(injected).toEqual(['up']);
     unregister();
@@ -744,7 +744,7 @@ describe('pty-control-ipc round-trip', () => {
     }));
     const request = requestRemotePtyControl(id, 'input-text', { chars: 'x' }, 2000);
     await Bun.sleep(60);
-    processPtyControlRequests(getPtyControlTarget, () => false);
+    await processPtyControlRequests(getPtyControlTarget, () => false);
     await expect(request).resolves.toMatchObject({ status: 'write-failed', reason: 'adapter-write' });
     unregister();
   });
@@ -758,7 +758,7 @@ describe('pty-control-ipc round-trip', () => {
     }));
     const request = requestRemotePtyControl(id, 'input-text', { chars: 'x' }, 2000);
     await Bun.sleep(60);
-    processPtyControlRequests(getPtyControlTarget, () => false);
+    await processPtyControlRequests(getPtyControlTarget, () => false);
     await expect(request).resolves.toMatchObject({ status: 'write-failed', reason: 'adapter-write' });
     unregister();
   });
@@ -781,7 +781,7 @@ describe('pty-control-ipc round-trip', () => {
     const request = withRunId('run-tui-arbiter', () =>
       requestRemotePtyControl(id, 'input-text', { chars: 'x' }, { actor: 'agent', timeoutMs: 2000 }));
     await Bun.sleep(60);
-    processPtyControlRequests(getPtyControlTarget, () => false);
+    await processPtyControlRequests(getPtyControlTarget, () => false);
     await expect(request).resolves.toMatchObject({ status: 'denied', reason: 'write-arbiter' });
     expect(injections).toBe(0);
     unregister();
@@ -797,7 +797,7 @@ describe('pty-control-ipc round-trip', () => {
     const id = freshId(); register(id); const resized: Array<[number, number]> = [];
     const h = fakeHandle({ accessMode: 'write', resize: (cols, rows) => resized.push([cols, rows]) });
     const req = requestRemotePtyControl(id, 'resize', { cols: 120, rows: 40 }, 2000);
-    await Bun.sleep(60); processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => false);
     await expect(req).resolves.toMatchObject({ status: 'success' });
     expect(resized).toEqual([[120, 40]]);
   });
@@ -806,15 +806,15 @@ describe('pty-control-ipc round-trip', () => {
     const id = freshId(); register(id); const resized: Array<[number, number]> = [];
     const h = fakeHandle({ resize: (cols, rows) => resized.push([cols, rows]) });
     const denied = requestRemotePtyControl(id, 'resize', { cols: 120, rows: 40 }, 2000);
-    await Bun.sleep(60); processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => false);
     await expect(denied).resolves.toEqual({ status: 'denied', reason: 'write-arbiter' });
     expect(resized).toEqual([]);
 
     const takeover = requestRemotePtyControl(id, 'takeover', 2000);
-    await Bun.sleep(60); processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => h.setAccessMode('write'));
+    await Bun.sleep(60); await processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => h.setAccessMode('write'));
     await expect(takeover).resolves.toMatchObject({ status: 'success', to: 'write' });
     const allowed = requestRemotePtyControl(id, 'resize', { cols: 120, rows: 40 }, 2000);
-    await Bun.sleep(60); processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => false);
     await expect(allowed).resolves.toEqual({ status: 'success' });
     expect(resized).toEqual([[120, 40]]);
   });
@@ -824,7 +824,7 @@ describe('pty-control-ipc round-trip', () => {
     const h = fakeHandle({ accessMode: 'write', resize: () => { throw new Error('adapter internals'); } });
     const req = requestRemotePtyControl(id, 'resize', { cols: 120, rows: 40 }, 2000);
     await Bun.sleep(60);
-    processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => false);
+    await processPtyControlRequests((i) => i === id ? (h as never) : undefined, () => false);
     await expect(req).resolves.toEqual({ status: 'failed', reason: 'resize-error' });
   });
 
@@ -1032,12 +1032,12 @@ describe('pty-control-ipc agent 슬라이스', () => {
 
     // ⚠️ 대조군 먼저 — 같은 PTY·같은 페이로드인데 human 이면 막힌다(agent 통과가 arbiter 무력화가 아님을 고정).
     const asHuman = withRunId('run-alpha', () => requestRemotePtyControl(id, 'input-text', { chars: 'nope' }, { timeoutMs: 2000 }));
-    await Bun.sleep(60); owner();
+    await Bun.sleep(60); await owner();
     await expect(asHuman).resolves.toMatchObject({ status: 'denied', reason: 'write-arbiter' });
     expect(writes).toEqual([]);
 
     const asAgent = withRunId('run-alpha', () => requestRemotePtyControl(id, 'input-text', { chars: 'supervise' }, { actor: 'agent', timeoutMs: 2000 }));
-    await Bun.sleep(60); owner();
+    await Bun.sleep(60); await owner();
     await expect(asAgent).resolves.toMatchObject({ status: 'success' });
     expect(writes).toEqual([['supervise', 'agent']]);
   });
@@ -1048,7 +1048,7 @@ describe('pty-control-ipc agent 슬라이스', () => {
     const h = fakeHandle({ accessMode: 'auto', canWrite: () => true, write: (chars) => { writes.push(chars); } });
     const req = withRunId('run-beta', () => requestRemotePtyControl(id, 'input-text', { chars: 'intruder' }, { actor: 'agent', timeoutMs: 2000 }));
     await Bun.sleep(60);
-    processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
+    await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
     await expect(req).resolves.toEqual({ status: 'denied', reason: 'run-mismatch' });
     expect(writes).toEqual([]);   // canWrite 가 전부 허용이어도 인가가 앞에서 끊는다
   });
@@ -1058,13 +1058,13 @@ describe('pty-control-ipc agent 슬라이스', () => {
     const h = fakeHandle({ accessMode: 'auto', canWrite: () => true });
     const noRequesterRun = withRunId(undefined, () => requestRemotePtyControl(anonymousRequester, 'input-text', { chars: 'x' }, { actor: 'agent', timeoutMs: 2000 }));
     await Bun.sleep(60);
-    processPtyControlRequests((i) => (i === anonymousRequester ? (h as never) : undefined), () => false);
+    await processPtyControlRequests((i) => (i === anonymousRequester ? (h as never) : undefined), () => false);
     await expect(noRequesterRun).resolves.toEqual({ status: 'denied', reason: 'agent-run-unidentified' });
 
     const anonymousTarget = freshId(); registerInRun(anonymousTarget, undefined);
     const noTargetRun = withRunId('run-alpha', () => requestRemotePtyControl(anonymousTarget, 'input-text', { chars: 'x' }, { actor: 'agent', timeoutMs: 2000 }));
     await Bun.sleep(60);
-    processPtyControlRequests((i) => (i === anonymousTarget ? (h as never) : undefined), () => false);
+    await processPtyControlRequests((i) => (i === anonymousTarget ? (h as never) : undefined), () => false);
     await expect(noTargetRun).resolves.toEqual({ status: 'denied', reason: 'target-run-unidentified' });
   });
 
@@ -1073,12 +1073,12 @@ describe('pty-control-ipc agent 슬라이스', () => {
     const resized: Array<[number, number]> = [];
     const h = fakeHandle({ accessMode: 'auto', canWrite: () => true, resize: (cols, rows) => resized.push([cols, rows]) });
     const denied = withRunId('run-beta', () => requestRemotePtyControl(id, 'resize', { cols: 120, rows: 40 }, { actor: 'agent', timeoutMs: 2000 }));
-    await Bun.sleep(60); processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
     await expect(denied).resolves.toEqual({ status: 'denied', reason: 'run-mismatch' });
     expect(resized).toEqual([]);
 
     const allowed = withRunId('run-alpha', () => requestRemotePtyControl(id, 'resize', { cols: 120, rows: 40 }, { actor: 'agent', timeoutMs: 2000 }));
-    await Bun.sleep(60); processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
     await expect(allowed).resolves.toEqual({ status: 'success' });
     expect(resized).toEqual([[120, 40]]);
   });
@@ -1090,7 +1090,7 @@ describe('pty-control-ipc agent 슬라이스', () => {
     // ⚠️ 페이로드 없는 액션은 3번째 인자를 비워야 옵션이 4번째로 간다(3번째는 payload|timeout 자리).
     const req = withRunId('run-alpha', () => requestRemotePtyControl(id, 'takeover', undefined, { actor: 'agent', timeoutMs: 2000 }));
     await Bun.sleep(60);
-    processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => { humanTakeoverCalls += 1; return true; });
+    await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => { humanTakeoverCalls += 1; return true; });
     await expect(req).resolves.toEqual({ status: 'denied', reason: 'agent-takeover-unsupported' });
     expect(humanTakeoverCalls).toBe(0);
     expect(h.accessMode).toBe('auto');
@@ -1121,7 +1121,7 @@ describe('pty-control-ipc agent 슬라이스', () => {
     const req = withRunId('run-alpha', () => requestRemotePtyControl(id, 'input-text', { chars: 'x' }, { actor: 'agent', timeoutMs: 2000 }));
     await Bun.sleep(60);
     expect(patchPendingActor(null)).toBe(1);   // 행을 실제로 바꿨는지 먼저 확인(안 바뀌면 이 테스트는 무의미)
-    processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
+    await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
     // human 으로 읽혔으므로 auto 자식에서 arbiter 가 막는다 — agent 로 읽혔다면 통과했을 것이다.
     await expect(req).resolves.toMatchObject({ status: 'denied', reason: 'write-arbiter' });
   });
@@ -1133,7 +1133,7 @@ describe('pty-control-ipc agent 슬라이스', () => {
     const req = withRunId('run-alpha', () => requestRemotePtyControl(id, 'takeover', undefined, { timeoutMs: 2000 }));
     await Bun.sleep(60);
     expect(patchPendingActor('brain')).toBe(1);
-    processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => { humanTakeoverCalls += 1; return true; });
+    await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => { humanTakeoverCalls += 1; return true; });
     await expect(req).resolves.toEqual({ status: 'denied', reason: 'invalid-actor' });
     expect(humanTakeoverCalls).toBe(0);
     expect(h.accessMode).toBe('auto');   // 손상된 값이 auto 자식의 소유권을 못 뺏는다
@@ -1152,7 +1152,171 @@ describe('pty-control-ipc agent 슬라이스', () => {
     const id = freshId(); registerInRun(id, 'run-alpha');
     const h = fakeHandle({ accessMode: 'auto', canWrite: (actor) => actor === 'agent' });
     const req = withRunId('run-alpha', () => requestRemotePtyControl(id, 'input-text', { chars: 'x' }, 2000));
-    await Bun.sleep(60); processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
+    await Bun.sleep(60); await processPtyControlRequests((i) => (i === id ? (h as never) : undefined), () => false);
     await expect(req).resolves.toMatchObject({ status: 'denied', reason: 'write-arbiter' });
+  });
+});
+
+// ── TUI-IDLE-PTY-DEEP-IDLE-FU — #29694 FU: 「PTY 제어 DB poll 깊은 유휴 감속 ⊕ 첫 원격 요청 즉시 깨움」 ──
+// owner 프로세스는 `registry.startPtyControlPoller` 가 25ms 주기로 부르는 `processPtyControlRequests` 로
+// 제어 큐를 다시 읽는다(활성 응답 계약 = 25ms). 제어가 10분 넘게 없으면 그 **DB 읽기**를 1.5s 간격으로
+// 감속하고, 첫 원격 요청은 큐와 별도인 wake 표식으로 그 감속 계단을 즉시 뚫는다 — 요청 응답(25ms cadence)과
+// 2s timeout 계약은 그대로다. 앵커는 제어 요청 처리(= `markPtyControlled` 와 같은 사건) 시각이다.
+describe('TUI-IDLE-PTY-DEEP-IDLE-FU 깊은 유휴 감속 ⊕ 즉시 깨어움', () => {
+  /** 요청자(`requestRemotePtyControl`)를 거치지 않고 pending 행을 직접 심는다 — 실제 요청이 남기는
+   *  wake 표식 «없이» owner 가 DB 를 다시 읽었는지만 관측하기 위해서다. */
+  function insertPendingRow(ptyId: string): string {
+    const requestId = crypto.randomUUID();
+    const stampedAt = Date.now();
+    const d = new Database(ptyManifestDbPath());
+    try {
+      d.run(
+        'INSERT INTO pty_control_requests (request_id, pty_id, action, payload_json, actor, requester_run_id, owner_pid, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [requestId, ptyId, 'capabilities', null, 'human', '', process.pid, 'pending', stampedAt, stampedAt],
+      );
+    } finally { d.close(); }
+    return requestId;
+  }
+
+  function rowStatus(requestId: string): string | null {
+    const d = new Database(ptyManifestDbPath());
+    try {
+      const row = d.query('SELECT status FROM pty_control_requests WHERE request_id=?').get(requestId) as { status: string } | null;
+      return row?.status ?? null;
+    } finally { d.close(); }
+  }
+
+  function pendingCount(ptyId: string): number {
+    const d = new Database(ptyManifestDbPath());
+    try {
+      const row = d.query("SELECT COUNT(*) AS n FROM pty_control_requests WHERE pty_id=? AND status='pending'").get(ptyId) as { n: number } | null;
+      return row?.n ?? 0;
+    } finally { d.close(); }
+  }
+
+  /** 요청자 poll 루프용 가상 시계 — `now`/`sleep` 주입으로 deadline·cadence 를 «실제 경과 0ms» 로 민다.
+   *  `hook` 에 owner tick 을 걸면 요청자의 `sleep(25)` 하나가 곧 «owner 의 25ms 주기 한 번»이 된다.
+   *  ⛔ 벽시계(Date.now·Bun.sleep) 판별은 쓰지 않는다 — 공유 부하에서 거짓 실패한다. */
+  function virtualClock(startMs = 0) {
+    let t = startMs;
+    const slept: number[] = [];
+    let onSleep: (() => Promise<void>) | null = null;
+    return {
+      now: (): number => t,
+      sleep: async (ms: number): Promise<void> => { slept.push(ms); t += ms; await onSleep?.(); },
+      advance: (ms: number): void => { t += ms; },
+      hook: (tick: () => Promise<void>): void => { onSleep = tick; },
+      elapsedFrom: (from: number): number => t - from,
+      slept,
+    };
+  }
+
+  test('제어가 10분 넘게 없으면 owner 의 DB poll 이 1.5s 간격으로 감속된다', async () => {
+    const id = freshId(); register(id);
+    const h = fakeHandle({ accessMode: 'auto' });
+    const handleFor = (i: string) => (i === id ? (h as never) : undefined);
+    let clock = 0;
+    const ownerAt = (nowMs: number) => {
+      clock = nowMs;
+      return processPtyControlRequests(handleFor, () => true, { pollClock: () => clock });
+    };
+
+    // (a) 유휴 101ms = 임계 «아래» — 1ms 전에 읽었어도 25ms cadence 그대로 읽는다.
+    resetPtyControlIpcForTesting();
+    await ownerAt(0);
+    const activeRow = insertPendingRow(id);
+    await ownerAt(101);
+    expect(rowStatus(activeRow)).toBe('success');
+
+    // (b) 유휴 10분 = 임계 도달 — 같은 «1ms 전 읽음» 조건인데 이번엔 다시 읽지 않는다.
+    resetPtyControlIpcForTesting();
+    await ownerAt(0);                            // 앵커 = 0, 마지막 DB 읽기 = 0
+    await ownerAt(600_000);                      // 10분 침묵 뒤 첫 tick — 이것은 읽는다(간격 경과)
+    const deepIdleRow = insertPendingRow(id);
+    await ownerAt(600_000 + 1);                  // 1ms 전 읽음 + 유휴 ≥ 10분 → 감속 계단 안
+    expect(rowStatus(deepIdleRow)).toBe('pending');
+
+    // (c) 감속 간격은 1.5s — 1_499ms 에는 여전히 안 읽고, 1_500ms 에 읽는다.
+    await ownerAt(600_000 + 1_499);
+    expect(rowStatus(deepIdleRow)).toBe('pending');
+    await ownerAt(600_000 + 1_500);
+    expect(rowStatus(deepIdleRow)).toBe('success');
+  });
+
+  test('첫 원격 제어 요청은 감속 중인 poll 을 즉시 깨운다 — 25ms 응답 cadence 보존', async () => {
+    const id = freshId(); register(id);
+    const h = fakeHandle({ accessMode: 'auto' });
+    const handleFor = (i: string) => (i === id ? (h as never) : undefined);
+    const clock = virtualClock();
+    // owner tick 은 요청자와 «같은» 가상 시각을 본다 — 실제로 흐른 시간은 0ms 다.
+    const ownerTick = () => processPtyControlRequests(handleFor, () => h.setAccessMode('write'), { pollClock: clock.now });
+    await ownerTick();                           // 활성 cadence — 유휴 앵커 = 시작 시각
+    clock.advance(11 * 60_000);
+    await ownerTick();                           // 유휴 11분 → 감속 구간의 마지막 DB 읽기
+    expect(pendingCount(id)).toBe(0);            // 아직 큐는 비어 있다 — 아래 행은 요청이 넣는다
+    clock.hook(ownerTick);                       // 이후 요청자의 `sleep(25)` 하나 = owner 주기 한 번
+
+    // ⭐ 첫 원격 요청 — 감속 계단(1.5s) «안쪽» tick 에서도 깨어나 25ms 응답 계약대로 답한다.
+    const startedAt = clock.now();
+    const takeover = requestRemotePtyControl(id, 'takeover', undefined, { timeoutMs: 2_000, now: clock.now, sleep: clock.sleep });
+    await expect(takeover).resolves.toMatchObject({ status: 'success', to: 'write' });
+    // ⭐ 판별(가상 시각) — 첫 25ms tick «하나» 로 답했다. 깨어움이 없으면 그 tick 은 감속 계단
+    //    (sinceRead 25 < 1_500)이라 큐를 안 읽고, 요청자는 1_500ms 를 기다린 뒤에야 답한다.
+    expect(clock.elapsedFrom(startedAt)).toBe(25);
+    expect(clock.slept).toEqual([25]);
+
+    // ⭐ 깨어난 뒤에는 감속이 풀려 다시 25ms cadence 다 — 마지막 읽기 25ms 뒤 tick 이 곧바로 읽는다.
+    const afterWake = insertPendingRow(id);
+    clock.advance(25);
+    await ownerTick();
+    expect(rowStatus(afterWake)).toBe('success');
+  });
+
+  test('같은 원장을 공유하는 여러 owner — 비대상 owner 가 먼저 tick 해도 대상 owner 의 즉시 깨움(25ms)을 훔치지 않는다', async () => {
+    const id = freshId(); register(id);
+    const h = fakeHandle({ accessMode: 'auto' });
+    const handleFor = (i: string) => (i === id ? (h as never) : undefined);
+    const clock = virtualClock();
+    const ownerTick = () => processPtyControlRequests(handleFor, () => h.setAccessMode('write'), { pollClock: clock.now });
+    await ownerTick();                           // 활성 cadence — 유휴 앵커 = 시작 시각
+    clock.advance(11 * 60_000);
+    await ownerTick();                           // 유휴 11분 → 감속 구간의 마지막 DB 읽기
+    clock.advance(25);                           // 감속 계단(1.5s) 안쪽 — 25ms tick 이 읽으려면 깨워야 한다
+
+    // ⭐ 요청자 — 대상 owner(= 이 프로세스, owner_pid=process.pid) 의 행과 그 owner «별» 깨움 표식을 남긴다.
+    const requestId = insertPendingRow(id);
+    signalPtyControlWake(ptyManifestDbPath(), process.pid);
+
+    // ⭐ 비대상 owner — 다른 pid 를 가진 실제 자식 프로세스가 «같은 원장(같은 ELANOUS_STATE_DIR)»에서
+    //    먼저 tick 한다. consumePtyControlWake 는 자기 pid 의 표식만 확인·삭제하므로, 대상 owner 의
+    //    표식(control-wake-<부모 pid>)은 지워지지 않는다. 수리 전 공유 표식(control-wake 하나)이라면
+    //    이 자식 tick 이 표식을 가져가 대상 owner 는 감속(최대 1.5s) 그대로 남는다.
+    const childScript = join(stateDir, 'other-owner-tick.mjs');
+    const ipcModule = join(import.meta.dir, 'pty-control-ipc.js');
+    writeFileSync(childScript, `const m = await import(${JSON.stringify(ipcModule)});\n`
+      + `await m.processPtyControlRequests(() => undefined, () => false);\n`
+      + `await m.processPtyControlRequests(() => undefined, () => false);\n`);
+    const child = Bun.spawnSync([process.execPath, childScript], { env: { ...process.env } });
+    expect(child.exitCode).toBe(0);
+
+    // ⭐ 대상 owner 의 감속 계단 «안쪽» tick — 비대상 owner 가 먼저 tick 했어도 자기 표식이 살아
+    //    깨어나 25ms 가상 tick 안에 행을 success 로 처리한다.
+    await ownerTick();
+    expect(rowStatus(requestId)).toBe('success');
+  });
+
+  test('깨어나지 않은 요청은 2s timeout 계약대로 만료된다 (기본 timeoutMs 2_000 보존)', async () => {
+    const id = freshId(); register(id);
+    const clock = virtualClock();
+    const startedAt = clock.now();
+    // 이 시험은 owner tick 을 한 번도 부르지 않는다(감속 중인 owner). 깨어움 표식이 남아 있어도 처리자가 없으면
+    // 요청자는 종전과 같이 deadline 에서 조건부 DELETE 로 취소하고 owner-unreachable 을 낸다.
+    const result = await requestRemotePtyControl(id, 'takeover', undefined, { now: clock.now, sleep: clock.sleep });
+    expect(result).toEqual({ status: 'owner-unreachable' });
+    // ⭐ 판별(가상 시각) — deadline 은 정확히 기본 timeoutMs(2_000)에서 끝난다: 감속이 deadline 을 늘리지 않았다.
+    expect(clock.elapsedFrom(startedAt)).toBe(2_000);
+    // 25ms cadence 도 그대로 — 2_000ms 를 25ms 씩 80 번 잰다(감속이 요청자 루프에 새지 않았다).
+    expect(clock.slept).toEqual(Array.from({ length: 80 }, () => 25));
+    expect(pendingCount(id)).toBe(0);                        // 조건부 DELETE 로 큐에서 걷어냈다
   });
 });

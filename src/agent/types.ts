@@ -91,6 +91,10 @@ export interface AgentTask {
   /** Full message history as the runner built it — starts with a
    *  system message + user prompt and grows with tool rounds. */
   messages: LLMMessage[];
+  /** Tool calls the child has made so far, counted live as each call starts.
+   *  `messages` only grows when a tool loop completes (and never on abort/error),
+   *  so a roster that counted messages alone showed «0 tools» for a working child. */
+  toolCallCount?: number;
   /** Final assistant text once the run completes. */
   result?: string;
   /** Error message when state === 'error'. */

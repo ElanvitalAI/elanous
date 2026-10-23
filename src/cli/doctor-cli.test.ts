@@ -2514,7 +2514,7 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
     return dir;
   }
 
-  function visitCli(dir: string) {
+  function visitCli(dir: string, now?: () => string) {
     const outputs: string[] = [];
     const errors: string[] = [];
     const exitCodes: number[] = [];
@@ -2524,6 +2524,7 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
       doctorVisitLedgerDir: dir,
       // 사고 선례 연결을 결정론적으로 고정(호스트 원장 의존 금지) — 기본은 빈 원장 루트.
       doctorVisitIncidentRoot: join(dir, 'incidents'),
+      ...(now ? { doctorAutoLongRunNow: now } : {}),
       out: { log: (line: string) => outputs.push(line) },
       err: { error: (line: string) => errors.push(line) },
       setExitCode: (code: number) => exitCodes.push(code),
@@ -2534,7 +2535,7 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
   const ledgerEntries = (dir: string, runId: string) =>
     readFileSync(join(dir, `${runId}.jsonl`), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
 
-  test('visit records one doctor-visit line per closed-list symptom and status shows all 13 symptoms', async () => {
+  test('visit records one doctor-visit line per closed-list symptom and status shows every symptom', async () => {
     const dir = seedDoctorVisitLedger();
     const cli = visitCli(dir);
     for (const symptom of DOCTOR_SYMPTOMS) {
@@ -2542,7 +2543,7 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
     }
     expect(cli.exitCodes).toEqual([]);
     const visits = ledgerEntries(dir, canonicalRunId).filter((entry) => entry.event === 'doctor-visit');
-    expect(visits).toHaveLength(13);
+    expect(visits).toHaveLength(DOCTOR_SYMPTOMS.length);
     expect(new Set(visits.map((entry) => entry.data.symptom))).toEqual(new Set([...DOCTOR_SYMPTOMS]));
     for (const entry of visits) {
       expect(entry.data.from).toBe('supervisor');
@@ -2550,11 +2551,41 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
     }
     await cli.program.parseAsync(['doctor', 'status'], { from: 'user' });
     const status = cli.outputs.at(-1)!;
-    expect(status).toContain('Doctor visits: 13');
+    expect(status).toContain(`Doctor visits: ${DOCTOR_SYMPTOMS.length}`);
     for (const symptom of DOCTOR_SYMPTOMS) {
       expect(status).toContain(`  ${symptom}: 1`);
       expect(status).toContain(`symptom=${symptom}`);
     }
+  });
+
+  test('auto-long-run CLI records at 60 minutes once across two ticks', async () => {
+    const dir = seedDoctorVisitLedger();
+    let now = '2026-10-23T00:59:59.999Z';
+    const cli = visitCli(dir, () => now);
+    const args = ['doctor', 'auto-long-run', canonicalRunId, '--started-at', '2026-10-23T00:00:00.000Z', '--json'];
+    await cli.program.parseAsync(args, { from: 'user' });
+    expect(JSON.parse(cli.outputs.at(-1)!)).toEqual({ status: 'below-threshold' });
+    now = '2026-10-23T01:00:00.000Z';
+    await cli.program.parseAsync(args, { from: 'user' });
+    expect(JSON.parse(cli.outputs.at(-1)!)).toEqual({ status: 'recorded' });
+    now = '2026-10-23T01:10:00.000Z';
+    await cli.program.parseAsync(args, { from: 'user' });
+    expect(JSON.parse(cli.outputs.at(-1)!)).toEqual({ status: 'already-recorded' });
+    expect(ledgerEntries(dir, canonicalRunId).filter((entry) => entry.event === 'doctor-visit')).toHaveLength(1);
+    expect(cli.exitCodes).toEqual([]);
+  });
+
+  test('auto-long-run CLI rejects a missing ledger and malformed start time', async () => {
+    const dir = seedDoctorVisitLedger();
+    const cli = visitCli(dir, () => '2026-10-23T01:01:00.000Z');
+    const missingRunId = 'run-1a2b3c4d-0000-4000-8000-eeeeeeeeeeee';
+    await cli.program.parseAsync(['doctor', 'auto-long-run', missingRunId, '--started-at', '2026-10-23T00:00:00.000Z', '--json'], { from: 'user' });
+    expect(cli.exitCodes).toEqual([1]);
+    expect(JSON.parse(cli.outputs.at(-1)!).status).toBe('rejected');
+    await cli.program.parseAsync(['doctor', 'auto-long-run', canonicalRunId, '--started-at', 'bad-time', '--json'], { from: 'user' });
+    expect(cli.exitCodes).toEqual([1, 1]);
+    expect(JSON.parse(cli.outputs.at(-1)!).status).toBe('rejected');
+    expect(ledgerEntries(dir, canonicalRunId).filter((entry) => entry.event === 'doctor-visit')).toHaveLength(0);
   });
 
   test('each recorded visit emits one debug.log run-doctor/visit event', async () => {

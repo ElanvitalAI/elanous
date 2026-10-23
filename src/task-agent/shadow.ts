@@ -17,6 +17,7 @@ import { extname, join, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-route.js';
+import { mintMoveId } from './repair-next-move.js';
 import { readTaskAgentState, readTaskCard, taskAgentStatePath, TASK_CARD_PREFIX, type CompletionKind, type TaskCard } from './task-hand.js';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction, type ActionDeps, type DeliveryKind, type NextAction } from './actions.js';
@@ -57,6 +58,8 @@ export interface TaskAgentShadowMove {
   liveMove?: LiveMoveResult;
   /** 원격 카드 결선이 미결일 때 런 원장 대기열 보존 결과. */
   cardBinding?: 'pending' | 'queue-failed';
+  /** NEXTMOVE-GENERAL-RELAUNCH-MOVEID — 실제로 발사를 시도한 일반 재발사의 수 id(그림자 수엔 없다). */
+  moveId?: string;
 }
 
 export interface TaskAgentShadowDeps {
@@ -82,6 +85,8 @@ export interface TaskAgentShadowDeps {
   env?: NodeJS.ProcessEnv;
   /** Remote pending-move ledger seam; defaults to the run ledger. */
   queueMove?: typeof appendRunLedgerEntry;
+  /** 시험 seam — 일반 재발사 결정의 수 id 발급기(기본 `mintMoveId` · #30226 과 같은 것). live 재발사로 갈 때 결정 순간 한 번만 불린다. */
+  mintMoveId?: () => string;
 }
 
 const execFileAsync = promisify(execFile);
@@ -103,6 +108,32 @@ export async function defaultPrFiles(pr: number, prUrl: string | undefined,
 }
 
 export const REMOTE_CARD_MOVE_PENDING = 'task-agent-card-move-pending';
+
+/** NEXTMOVE-GENERAL-RELAUNCH-MOVEID — 일반 재발사가 발사 명령을 «성공»으로 받은 뒤 그 카드 history 에 남기는 줄의 이름. */
+export const RELAUNCH_LAUNCHED_EVENT = 'relaunch-launched';
+
+/**
+ * 일반 재발사 한 건을 그 런의 카드 history 에 한 줄로 남긴다 — 결정·간선·발사 argv 와 같은 수 id.
+ * 카드·원장을 모르면 쓰지 않고 관측만 남긴다(fail-soft · 발사는 이미 됐다).
+ */
+function recordRelaunchHistory(card: TaskCard | undefined, ledger: string | undefined,
+  input: { runId: string | null; move: string; moveId: string | undefined; deps: TaskAgentShadowDeps }): void {
+  const log = input.deps.log ?? ((category: string, event: string, data: Record<string, unknown>) => debug.log(category, event, data));
+  if (!input.moveId) return;
+  if (!card || !ledger) {
+    try { log('task-agent', 'relaunch-history-skipped', { runId: input.runId, move: input.move, moveId: input.moveId,
+      reason: !card ? 'card unknown' : 'card ledger unknown' }); } catch { /* fail-soft */ }
+    return;
+  }
+  try {
+    updateTaskCard(ledger, card.id, (current) => current ? { ...current, history: [...(current.history ?? []), {
+      at: new Date().toISOString(), event: RELAUNCH_LAUNCHED_EVENT, ...(input.runId ? { runId: input.runId } : {}),
+      effect: input.move, moveId: input.moveId }] } : undefined);
+  } catch (error) {
+    try { log('task-agent', 'relaunch-history-failed', { card: card.id, runId: input.runId, moveId: input.moveId,
+      reason: (error instanceof Error ? error.message : String(error)).slice(-300) }); } catch { /* fail-soft */ }
+  }
+}
 
 /** 카드 조회 상태 파일 — 조회 경로 전부가 같은 파일을 본다. */
 function cardStatePath(deps: TaskAgentShadowDeps): string {
@@ -317,6 +348,7 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   const retryLaunches = { count: 0 };
   let executorResult: string | null = null;
   let wouldDo: string | null = null;
+  let generalMoveId: string | undefined;
   if (judgement.executorKind) {
     const action: NextAction = {
       kind: judgement.executorKind,
@@ -334,7 +366,10 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       { move: judgement.move, source: judgeInput.pr ? `pr:${judgeInput.pr}` : `run:${input.runId ?? 'unknown'}`, runId: input.runId }) : null;
     const liveRetry = retryMove && route?.source === 'graph' && route.to === 'dispatch'
       && deps.command !== undefined && deps.loadGate !== undefined && liveMoves.has(judgement.move as TaskAgentLiveMove);
-    executorResult = await executeNextAction(action, {
+    // NEXTMOVE-GENERAL-RELAUNCH-MOVEID — live 재발사로 가는 결정 순간 수 id 를 «한 번» 만든다(이미 실린 값이 있으면 그것).
+    //   아래 발사 argv · 결정 노드 출구 · graph-edge-taken · 카드 history 가 이 값만 쓴다(다시 만들지 않는다).
+    if (liveRetry) generalMoveId = action.moveId ?? (deps.mintMoveId ?? mintMoveId)();
+    executorResult = await executeNextAction(generalMoveId ? { ...action, moveId: generalMoveId } : action, {
       mode: delivery ? (deps.mode ?? 'shadow') : liveRetry ? 'live' : 'shadow',
       command: deps.command ?? (async () => { throw new Error('task-agent shadow path must not run commands'); }),
       observe: (event, data) => {
@@ -348,8 +383,10 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     });
     if (liveRetry && executorResult === 'done' && route) {
       passJourneyNode('next-move', { provenance: 'task-agent-terminal', outcome: judgement.move,
-        runId: input.runId ?? undefined, data: { source: judgeInput.pr ? `pr:${judgeInput.pr}` : `run:${input.runId ?? 'unknown'}`, pr: judgeInput.pr ?? null } });
-      recordJourneyEdge(route, 'dispatch');
+        runId: input.runId ?? undefined, data: { source: judgeInput.pr ? `pr:${judgeInput.pr}` : `run:${input.runId ?? 'unknown'}`, pr: judgeInput.pr ?? null,
+          ...(generalMoveId ? { moveId: generalMoveId } : {}) } });
+      recordJourneyEdge(route, 'dispatch', undefined, generalMoveId ? { moveId: generalMoveId } : {});
+      recordRelaunchHistory(card, cardLedgerPath(deps), { runId: input.runId, move: judgement.move, moveId: generalMoveId, deps });
     }
   }
   const move: TaskAgentShadowMove = {
@@ -362,6 +399,7 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
     executorResult,
     wouldDo,
     pr: delivery ? null : typeof judgeInput.pr === 'number' ? judgeInput.pr : null,
+    ...(generalMoveId ? { moveId: generalMoveId } : {}),
   };
   if (delivery && deps.mode !== 'live') {
     move.wouldDo = `${move.wouldDo ?? 'would wait'} → ${join(delivery.projectTarget, 'elanous-out', card!.id)} (${delivery.files.join(', ')})`;

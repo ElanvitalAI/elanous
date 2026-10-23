@@ -7,6 +7,7 @@ import { runBgLaunch, type BgLaunchResult } from '../cli/bg-launch.js';
 import { joinRestHealthUrl, runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import { issueSetupLinkToken } from '../auth/setup-link-tokens.js';
 import { debug } from '../debug/log.js';
+import { detectLocale, type Locale } from '../expression/locale.js';
 import { browserUnavailableReason } from '../oauth/browser-availability.js';
 import type { UserConfig } from '../user-config.js';
 
@@ -18,6 +19,8 @@ export interface WebFirstSetupDeps {
   /** Bare first run never starts or waits for a missing daemon; explicit setup retains web launch. */
   startIfMissing?: boolean;
   startedAt?: number;
+  /** Locale for user-facing wording; defaults to the shared ambient decision (detectLocale). */
+  locale?: Locale;
   showNexus?: () => Promise<NexusShowResult>;
   startDaemon?: () => Promise<BgLaunchResult>;
   probeHealth?: (url: string, timeoutMs: number) => Promise<boolean>;
@@ -37,6 +40,34 @@ export interface WebFirstSetupDeps {
 
 const STARTUP_TIMEOUT_MS = 12_000;
 
+/** User-facing web-first fallback wording, routed by the shared locale decision (detectLocale). */
+const WEB_FIRST_TEXT = {
+  ko: {
+    unavailable: (reason: string) => `웹 셋업을 사용할 수 없습니다 (${reason}). 터미널 설정으로 전환합니다.`,
+    offline: '오프라인 모드',
+    startingDaemon: '웹 셋업을 위해 데몬을 시작합니다.',
+    continueInBrowser: '브라우저에서 셋업을 이어가세요',
+    phoneOnSameWifi: (link: string) => `같은 와이파이의 폰이면: ${link}`,
+    linkSingleUse: '이 링크는 10분 안에 한 번만 열 수 있습니다',
+    sameWifiRestart: '같은 와이파이에서 열려면 `elanous nexus run` 을 루프백 없이 다시 띄우세요',
+    scanTailnet: '같은 와이파이·tailnet 의 폰 카메라로 스캔하세요',
+    scanSameWifi: '같은 와이파이의 폰 카메라로 스캔하세요',
+    terminalInstead: '터미널에서 하려면: `elanous setup --terminal`',
+  },
+  en: {
+    unavailable: (reason: string) => `web setup is unavailable (${reason}); switching to terminal setup.`,
+    offline: 'offline mode',
+    startingDaemon: 'starting the daemon for web setup.',
+    continueInBrowser: 'continue setup in your browser',
+    phoneOnSameWifi: (link: string) => `on a phone on the same wifi: ${link}`,
+    linkSingleUse: 'this link can be opened only once within 10 minutes',
+    sameWifiRestart: 'to open it from the same wifi, restart `elanous nexus run` without a loopback-only bind',
+    scanTailnet: 'scan with a phone camera on the same wifi/tailnet',
+    scanSameWifi: 'scan with a phone camera on the same wifi',
+    terminalInstead: 'to use the terminal instead: `elanous setup --terminal`',
+  },
+} as const;
+
 async function probeHealth(url: string, timeoutMs: number): Promise<boolean> {
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
@@ -53,12 +84,13 @@ function setupUrl(pwa: string, token: string): string {
 export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-shown' | 'fallback'> {
   const startedAt = deps.startedAt ?? Date.now();
   const print = deps.print ?? console.log;
+  const text = WEB_FIRST_TEXT[(deps.locale ?? detectLocale()) === 'en' ? 'en' : 'ko'];
   const observe = (event: 'link-shown' | 'fallback', reason?: string, qr = false, browserOpened = false, remote: 'loopback' | 'tailnet' = 'loopback', ms?: number, lan?: 'shown' | 'loopback-bind' | 'no-address', ssh?: boolean) => {
     try { debug.log('onboarding.web-first', event, { ...(reason ? { reason } : {}), qr, browserOpened, remote, ...(ms !== undefined ? { ms } : {}), ...(lan ? { lan, ssh } : {}) }); }
     catch { /* Observability must not block onboarding. */ }
   };
   const fallback = (reason: string): 'fallback' => {
-    print(`웹 셋업을 사용할 수 없습니다 (${reason}). 터미널 설정으로 전환합니다.`);
+    print(text.unavailable(reason));
     observe('fallback', reason);
     return 'fallback';
   };
@@ -70,7 +102,7 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   try { shown = await show(); } catch { /* A missing daemon may make inspection fail. */ }
   const running = shown?.status === 'unregistered' || (shown?.status === 'registered' && shown.instance?.alive === true);
   if (deps.startIfMissing === false && !running) {
-    print('오프라인 모드');
+    print(text.offline);
     observe('fallback', 'offline');
     return 'fallback';
   }
@@ -85,11 +117,11 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   if (!running || !shown?.urls?.pwa.loopback) {
     if (deps.startIfMissing === false) {
-      print('오프라인 모드');
+      print(text.offline);
       observe('fallback', 'offline');
       return 'fallback';
     }
-    print('웹 셋업을 위해 데몬을 시작합니다.');
+    print(text.startingDaemon);
     let launch: BgLaunchResult;
     try {
       launch = await (deps.startDaemon ?? (() => runBgLaunch({ out: { log: () => {}, error: () => {} } })))();
@@ -115,7 +147,7 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
     if (remaining > 0) await Bun.sleep(Math.min(200, remaining));
   }
   if (!healthy && deps.startIfMissing === false) {
-    print('오프라인 모드');
+    print(text.offline);
     observe('fallback', 'offline');
     return 'fallback';
   }
@@ -154,13 +186,13 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   const lan: 'shown' | 'loopback-bind' | 'no-address' = !confirmedBind ? 'no-address' : !reachable ? 'loopback-bind' : lanAddress ? 'shown' : 'no-address';
   const lanLink = lanAddress ? setupUrl(`http://${lanAddress}:${port}/app/`, token) : undefined;
   const phoneLink = shown.urls.pwa.tailnet ? setupUrl(shown.urls.pwa.tailnet, token) : lanLink;
-  print('브라우저에서 셋업을 이어가세요');
+  print(text.continueInBrowser);
   print(link);
   if (lanLink) {
-    print(`같은 와이파이의 폰이면: ${lanLink}`);
-    print('이 링크는 10분 안에 한 번만 열 수 있습니다');
+    print(text.phoneOnSameWifi(lanLink));
+    print(text.linkSingleUse);
   } else if (lan === 'loopback-bind') {
-    print('같은 와이파이에서 열려면 `elanous nexus run` 을 루프백 없이 다시 띄우세요');
+    print(text.sameWifiRestart);
   }
   const linkShownMs = Date.now() - startedAt;
   let qr = false;
@@ -172,12 +204,12 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
       }))(phoneLink);
       if (rendered) {
         print(rendered);
-        print(shown.urls.pwa.tailnet ? '같은 와이파이·tailnet 의 폰 카메라로 스캔하세요' : '같은 와이파이의 폰 카메라로 스캔하세요');
+        print(shown.urls.pwa.tailnet ? text.scanTailnet : text.scanSameWifi);
         qr = true;
       }
     } catch { /* QR is optional. */ }
   }
-  print('터미널에서 하려면: `elanous setup --terminal`');
+  print(text.terminalInstead);
   let browserOpened = false;
   const env = deps.browserEnv ?? process.env;
   const ssh = !!(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);

@@ -43,6 +43,7 @@ import type { ReviewerContextItem } from '../agent-substrate/pr-reviewer.js';
 import { resolveRunIdentity, type RunIdSource } from '../harness/harness-space.js';
 import { addSelfDevRunParticipant, processBirthId, saveSelfDevRun } from './run-store.js';
 import { getUserConfig, resolveRoleLlm, type RoleLlmSource } from '../user-config.js';
+import { applyGlmCredentialFallback, GlmChildCredentialError } from './glm-credential-guard.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { getProvider, inferProviderFromModel } from '../llm.js';
 import { buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
@@ -587,6 +588,11 @@ export async function defaultDispatchAcp(
 export function toSelfImplementOptions(text: string, plan: ResolvedDevPlan, seams: SelfImplementSeams): SelfImplementOptions {
   const s = plan.self ?? {};
   const goalId = 'file' in plan.input ? parseGoalId(text) : null;
+  // GLM-NO-CREDENTIAL-FALLBACK (OP #28375) — glm 자식인데 Z.ai 자격이 없으면 «발사 전»에 OpenRouter GLM 으로 바꾸거나
+  //   이유 한 줄로 거부한다(구현 0 라운드를 만들지 않는다). glm 이 아니거나 자격이 있으면 그대로다.
+  let childLlm = s.childLlm;
+  try { childLlm = applyGlmCredentialFallback(s.childLlm); }
+  catch (error) { if (error instanceof GlmChildCredentialError) throw new DevPipelineError(error.message); throw error; }
   return {
     feature: text,
     seams,
@@ -611,11 +617,11 @@ export function toSelfImplementOptions(text: string, plan: ResolvedDevPlan, seam
     ...(s.parentSessionId ? { parentSessionId: s.parentSessionId } : {}),
     ...(s.documentReferences ? { documentReferences: s.documentReferences } : {}),
     ...(s.naturalLanguageDispatch ? { naturalLanguageDispatch: true } : {}),
-    ...(s.childLlm ? { childLlm: s.childLlm } : {}),
+    ...(childLlm ? { childLlm } : {}),
     ...(s.correlationId !== undefined ? { correlationId: s.correlationId } : {}),
     // BENCH-ISOLATED-ARMS ② — base 가 `bench/<id>/base` 면 팔 가지 `bench/<id>/<arm>` (명시 branchName 이 이긴다).
     ...(() => {
-      const branchName = s.branchName ?? benchArmBranchForBase(plan.base, s.childLlm?.model, process.env.ELANOUS_RUN_ID?.trim() || randomUUID());
+      const branchName = s.branchName ?? benchArmBranchForBase(plan.base, childLlm?.model, process.env.ELANOUS_RUN_ID?.trim() || randomUUID());
       return branchName ? { branchName } : {};
     })(),
     ...(s.maxReworkRounds !== undefined ? { maxReworkRounds: s.maxReworkRounds } : {}),

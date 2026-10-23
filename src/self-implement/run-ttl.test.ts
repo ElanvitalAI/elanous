@@ -237,4 +237,88 @@ describe('RUN-TTL sweep step', () => {
     expect(events.filter((event) => event.event === 'regate-requested')).toHaveLength(1);
     expect(events.some((event) => event.event === 'would-regate')).toBe(false);
   });
+
+  describe('one action budget shared by memo, marker and re-gate', () => {
+    // Two isolated stale candidates with no live run; #51 is the staler one, so it is picked first.
+    const two = () => fake([
+      { number: 50, createdHoursAgo: 72, commitHoursAgo: 48 },
+      { number: 51, createdHoursAgo: 80, commitHoursAgo: 60 },
+    ]);
+
+    test('shadow, cap 1 → one would-regate, no requestRegate call, no marker', async () => {
+      const f = two();
+      const requested: number[] = [];
+      const { log, events } = quiet();
+      const out = await runRunTtlSweep({
+        adapters: f.adapters, cap: 1, now: () => NOW, log,
+        requestRegate: (pr) => { requested.push(pr.number); },
+      });
+      expect(requested).toEqual([]);
+      expect(out.regate).toEqual([51]);
+      expect(out.label).toEqual([]);
+      expect(f.labels).toEqual([]);
+      expect(events.filter((event) => event.event === 'would-regate')).toHaveLength(1);
+      expect(events.some((event) => event.event === 'would-label')).toBe(false);
+    });
+
+    test('live, cap 1 → exactly one re-gate request, no marker action at all', async () => {
+      const f = two();
+      const requested: number[] = [];
+      const { log, events } = quiet();
+      const out = await runRunTtlSweep({
+        adapters: f.adapters, mode: 'live', cap: 1, now: () => NOW, log,
+        requestRegate: (pr) => { requested.push(pr.number); },
+      });
+      expect(requested).toEqual([51]);
+      expect(out.regate).toEqual([51]);
+      expect(out.label).toEqual([]);
+      expect(f.labels).toEqual([]);
+      expect(out.skippedOverCap).toEqual([50]);
+      expect(events.filter((event) => event.event === 'regate-requested')).toHaveLength(1);
+      // The sweep record still carries the existing summary shape, now with the re-gate number.
+      const summary = events.find((event) => event.event === 'summary')!;
+      expect(summary.data).toMatchObject({ mode: 'live', memo: 0, label: 0, regate: 1, regatePrs: [51] });
+    });
+
+    test('live, cap 1, no re-gate adapter → the marker keeps the only budget slot', async () => {
+      const f = two();
+      const out = await runRunTtlSweep({ adapters: f.adapters, mode: 'live', cap: 1, now: () => NOW, log: quiet().log });
+      expect(out.regate).toEqual([]);
+      expect(out.label).toEqual([51]);
+      expect(f.labels).toEqual([[51, RUN_TTL_MARKER_LABEL]]);
+      expect(out.skippedOverCap).toEqual([50]);
+    });
+
+    test('live, cap 2 → one re-gate plus one marker, never more than the cap', async () => {
+      const f = two();
+      const requested: number[] = [];
+      const out = await runRunTtlSweep({
+        adapters: f.adapters, mode: 'live', cap: 2, now: () => NOW, log: quiet().log,
+        requestRegate: (pr) => { requested.push(pr.number); },
+      });
+      expect(requested).toEqual([51]);
+      expect(out.regate).toEqual([51]);
+      expect(out.label).toEqual([51]);
+      expect(f.labels).toEqual([[51, RUN_TTL_MARKER_LABEL]]);
+      expect(out.skippedOverCap).toEqual([50]);
+      expect(requested.length + out.label.length + out.memo.length).toBe(2);
+    });
+
+    test('a memo spends the slot too — a dead-run PR in the same cap-1 sweep gets nothing', async () => {
+      const f = fake([
+        { number: 60, createdHoursAgo: 90, commitHoursAgo: 60, alive: true },
+        { number: 61, createdHoursAgo: 72, commitHoursAgo: 40 },
+      ]);
+      const requested: number[] = [];
+      const out = await runRunTtlSweep({
+        adapters: f.adapters, mode: 'live', cap: 1, now: () => NOW, log: quiet().log,
+        requestRegate: (pr) => { requested.push(pr.number); },
+      });
+      expect(out.memo).toEqual([60]);
+      expect(out.label).toEqual([]);
+      expect(requested).toEqual([]);
+      expect(f.labels).toEqual([]);
+      expect(out.skippedOverCap).toEqual([61]);
+    });
+  });
 });

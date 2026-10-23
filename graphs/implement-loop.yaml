@@ -459,6 +459,20 @@ nodes:
       tools: none
       outputs: [decision_card]
 
+  # LAND-REFUSAL-EDGES 첫 조각 — 착지 거부 한 건을 recover@1(#29093 read-only 유닛)에 «근거째» 결속한다.
+  #   pr land 가 거부 줄 원문·cardId·PR·head·planner 답을 merge→recover 간선 한 행에 남긴다(src/cli/pr-land-recovery.ts).
+  #   ⛔ 실행은 아직 없다(execution=none) — 다음 동작은 기존 TA·열차 입장이 쥔다(LAND-REFUSAL-EXEC 후속).
+  - node_id: recover
+    group: recover
+    journey_stage: recover
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: recover@1
+    budget: { inner_steps: 4 }
+    terminal_stages: []
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+
   # LAND-REFUSAL-EDGES: destinations only; recovery execution is a later slice.
   - node_id: ready
     group: land
@@ -664,6 +678,16 @@ edges:
       pr-base-unreadable: next-move
       public-export-leak: next-move
       other: next-move
+
+  # 거부 근거의 결속 간선 — 위 refusal map(목적지)과 «함께» 남는다. 목적지 계약은 그대로다.
+  - from: merge
+    on: recovery
+    map:
+      land-refused: recover
+
+  - from: recover
+    on: outcome
+    map: { done: next-move, rework: next-move, needs-human: decision-card, failed: decision-card }
 
   - from: merge
     to: cleanup

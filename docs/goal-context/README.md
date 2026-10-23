@@ -76,7 +76,10 @@ RESULT: 51 pass, 0 fail, 390 expect() calls; Ran 51 tests across 2 files.
 | [`01-goal-authoring-checks.md`](01-goal-authoring-checks.md) | 골을 쓰기 «전»에 답하는 여섯 | [`CONCEPT-self-implement-closed-loop-map`](../CONCEPT-self-implement-closed-loop-map-2026-08-08.md) §8 |
 | [`03-verification-menu.md`](03-verification-menu.md) | 수용선의 주장에 맞춰 검증 방법을 고르는 안내 메뉴 | 해당 방법의 정본 매뉴얼 링크는 메뉴 안에 둔다 |
 | [`04-mock-scenarios.md`](04-mock-scenarios.md) | 표준 검증 무대 템플릿과 MS-01~05 재사용 예시 | initial source: `~/elanous-hq/seat-state/OP/MOCK-SCENARIO-CATALOG.md` |
+| [`05-authoring-lessons.jsonl`](05-authoring-lessons.jsonl) | 부검·런 닥터·초록·OP의 분류별 저작 교훈 원장 스냅샷(사례별 적용 판단; 자동 저작 배선은 별도 작업) | `~/elanous-hq/seat-state/OP/lessons/authoring-lessons.jsonl` |
 | [`refactoring.md`](../refactoring.md) | 리팩터링·seam·큰 파일 쪼개기 골은 냄새 → seam → 패턴 순서를 따르고, 이론상 깔끔함만으로 패턴을 도입하지 않는다 | [`refactoring.md`](../refactoring.md) |
+
+`05-authoring-lessons.jsonl`은 원본의 2026-10-21T13:26:03+0900까지를 보존한 스냅샷입니다. 원본과 행별 JSON 객체를 대조하면 `evidence`의 절대경로를 `~`로 이식한 13개 행 외에는 동일합니다. 후속 원본 행은 자동 동기화되지 않습니다. 이 파일에 링크를 붙인 것과 골 저작기가 JSONL을 읽어 사용하는 것은 별개입니다. 후자의 배선과 입력 비용은 AUTHORING-LESSONS-LOOP에서 검증합니다.
 
 골의 수용선을 쓸 때는 [`03-verification-menu.md`](03-verification-menu.md)에서 주장에 맞는 검증 방법을 고른다. 이는 안내이며 골 발사를 막는 관문이 아니다.
 

@@ -330,6 +330,66 @@ export function filterAgentTools(
   return filtered.length > 0 ? filtered : undefined;
 }
 
+// ── SUBAGENT-ENCAPSULATION (0.2.36 · 대표 10-22 «서브에이전트 안의 행위는 안에서 해결 · 밖으로는 이상 상황에서만») ──
+//
+// 🚨 실물(n8n wS:p1 · 22:4x): 서브에이전트가 1~2분 만에 «…하지 못했습니다» 로 끝나 메인 대화에 끼어들었다.
+// ⭐ 자식 답이 «못 했다»형이고 이상 사유(막힘·권한·사람 필요·예산)가 없으면 «안에서» 잇는다 — 상한 SUBAGENT_CONTINUE_INSIDE_CAP.
+//   같은 답이 다시 나오면(같은 원인 반복) 그때 밖으로 낸다 = 이상 상황.
+// 세 얼굴: 관측 = agent.encapsulation continue-inside / surfaced{reason} · 인지 = 미완형 ∧ 이상 사유 없음 ·
+//   힐링 = 이어가기 지시 한 턴 · 상한·반복이면 그대로 반환(실패를 숨기지 않는다).
+
+export const SUBAGENT_CONTINUE_INSIDE_CAP = 2;
+
+export const SUBAGENT_CONTINUE_INSIDE_PROMPT = [
+  '[continue inside]',
+  '아직 맡은 일이 끝나지 않았다. 부모에게 «못 했다»를 돌려주지 말고 지금 이어서 끝까지 하라 — 막힌 도구는 다른 방법(다른 도구·인자·순서)으로 다시 시도하라.',
+  '정말 더 갈 수 없을 때(권한 없음 · 사람이 정해야 함 · 같은 장애 반복)만 «BLOCKED: <사유> · <시도한 것>» 한 줄로 끝내라. 끝났으면 결과와 증거만 짧게.',
+].join('\n');
+
+const INCOMPLETE_EXIT = /(?:하지 못했|못했습니다|못 했습니다|완료하지 못|완료되지 않|끝내지 못|보고할 수 없|could not (?:complete|finish)|unable to (?:complete|finish)|not (?:yet )?(?:complete|completed|done|finished))/i;
+const ABNORMAL_EXIT = /(?:BLOCKED:|needs-human|사람이 (?:정해|결정)|권한(?:이)? (?:없|부족)|permission denied|예산(?:을)? (?:소진|초과)|budget exhausted|quota)/i;
+
+/** 자식 답을 가른다 — 'done'(밖으로) · 'abnormal'(이상 상황 · 밖으로) · 'incomplete'(안에서 잇는다). 순수. */
+export function classifySubagentExit(text: string): 'done' | 'abnormal' | 'incomplete' {
+  if (ABNORMAL_EXIT.test(text)) return 'abnormal';
+  return INCOMPLETE_EXIT.test(text) ? 'incomplete' : 'done';
+}
+
+/** 걸음의 «답» 텍스트(마지막 도구 라운드 뒤)를 붙들어 두는 칸 — 걸음이 끝나 «밖으로 낼 답»으로 판정된 뒤에만
+ *  부모에게 흘린다(r1 must-fix). 안에서 이어간 걸음의 답(«…하지 못했습니다»)은 부모 소비자에게 닿지 않는다.
+ *  도구 호출 앞 진행 서술은 순서대로 바로 흘린다(이벤트 순서 계약 유지). */
+export interface SubagentStepBuffer {
+  /** 새 걸음을 시작한다 — 앞 걸음에 남은 텍스트는 버리고 그 글자 수를 돌려준다. */
+  reset(): number;
+}
+
+async function runEncapsulated(task: AgentTask, runOnce: () => Promise<string>, step: SubagentStepBuffer): Promise<string> {
+  step.reset();
+  let text = await runOnce();
+  const seen = new Set<string>([text.trim()]);
+  for (let attempt = 1; attempt <= SUBAGENT_CONTINUE_INSIDE_CAP; attempt++) {
+    const kind = classifySubagentExit(text);
+    if (kind !== 'incomplete' || task.controller.signal.aborted) {
+      // 첫 걸음에서 바로 끝나도 남긴다(should-fix) — 종료 건수를 이 이벤트 하나로 셀 수 있게.
+      debug.log('agent.encapsulation', 'surfaced', { taskId: task.id, agent: task.definition.name, reason: kind, attempts: attempt - 1 }, attempt === 1 && kind === 'done' ? { level: 'debug' } : undefined);
+      return text;
+    }
+    const droppedStreamChars = step.reset();
+    debug.log('agent.encapsulation', 'continue-inside', { taskId: task.id, agent: task.definition.name, attempt, chars: text.length, droppedStreamChars });
+    task.messages.push({ role: 'user', content: SUBAGENT_CONTINUE_INSIDE_PROMPT });
+    text = await runOnce();
+    const key = text.trim();
+    if (seen.has(key)) {
+      debug.log('agent.encapsulation', 'surfaced', { taskId: task.id, agent: task.definition.name, reason: 'same-reply', attempts: attempt }, { level: 'warn' });
+      return text;
+    }
+    seen.add(key);
+  }
+  const final = classifySubagentExit(text);
+  debug.log('agent.encapsulation', 'surfaced', { taskId: task.id, agent: task.definition.name, reason: final === 'incomplete' ? 'cap' : final, attempts: SUBAGENT_CONTINUE_INSIDE_CAP }, final === 'incomplete' ? { level: 'warn' } : undefined);
+  return text;
+}
+
 // ── runAgent ──
 
 /** Stream an agent's execution as a sequence of AgentEvent frames.
@@ -390,7 +450,17 @@ export async function* runAgent(
 
   // Kick off the LLM call. Callbacks push events to the queue; the
   // promise's resolution/rejection closes the queue.
-  const runPromise = streamLLMWithTools(
+  // SUBAGENT-ENCAPSULATION — 한 번의 tool loop 를 «한 걸음»으로 두고, 그 답이 «못 했다»형이면 안에서 잇는다(아래 runEncapsulated).
+  // 걸음별 스트림 버퍼 — 판정 전 텍스트는 부모에게 흘리지 않는다(runEncapsulated 가 밖으로 낼 걸음만 flush).
+  let stepDeltas: string[] = [];
+  const stepBuffer: SubagentStepBuffer = {
+    reset: () => { const dropped = stepDeltas.join('').length; stepDeltas = []; return dropped; },
+  };
+  const flushStep = (): void => {
+    for (const delta of stepDeltas) queue.push({ type: 'text', delta });
+    stepDeltas = [];
+  };
+  const runOnce = (): Promise<string> => streamLLMWithTools(
     task.messages,
     {
       // ⛔⭐⭐ 빈 델타는 «에이전트 이벤트»가 아니다 — LLM 층의 «표식»이다.
@@ -406,8 +476,12 @@ export async function* runAgent(
       //     📌 그래서 라이브 소비자는 여전히 «툴 라운드 «전»» 텍스트를 화면에 들고 있고,
       //        최종 `done.text` 는 그것을 «뺀» 값이다(실측: 델타 누적 "checking done" ↔ done.text " done").
       //        ⇒ 그건 «별개 결손»이고 이 줄이 고치지 않는다. AgentEvent 에 지움 의미가 생겨야 닫힌다.
-      onText: (delta) => { if (delta !== '') queue.push({ type: 'text', delta }); },
+      onText: (delta) => { if (delta !== '') stepDeltas.push(delta); },
       onToolCall: (call) => {
+        // 도구 호출 앞 텍스트는 걸음의 «답»이 아니라 진행 서술이다 — 순서를 지켜 바로 흘린다.
+        //   붙들어 두는 것은 마지막 도구 라운드 뒤의 텍스트(= 이 걸음의 답)뿐이다.
+        flushStep();
+        task.toolCallCount = (task.toolCallCount ?? 0) + 1;
         queue.push({ type: 'status', stage: 'tool' });
         queue.push({ type: 'tool_call', id: call.id, name: call.name, args: call.args });
       },
@@ -416,6 +490,8 @@ export async function* runAgent(
         queue.push({ type: 'status', stage: 'thinking' });
       },
       dispatchTool,
+      // 이 걸음의 새 메시지(도구 호출·결과·답)를 이력에 이어 둔다 — 안에서 이어갈 때 앞 걸음을 잊지 않게.
+      onTurnComplete: (newMessages) => { task.messages.push(...newMessages); },
     },
     {
       model: modelResolution.model,
@@ -425,9 +501,11 @@ export async function* runAgent(
       maxTurns: opts.maxTurns,
     },
   );
+  const runPromise = runEncapsulated(task, runOnce, stepBuffer);
 
   runPromise.then(
     (text) => {
+      flushStep();
       task.result = text;
       task.state = 'done';
       task.finishedAt = Date.now();
@@ -440,6 +518,8 @@ export async function* runAgent(
       try { opts.onTerminal?.(task); } catch { /* registry isolates */ }
     },
     (err) => {
+      // 중단·오류 걸음의 부분 텍스트는 예전처럼 흘린다(취소 결과의 output 이 이 누적에 기댄다).
+      flushStep();
       task.finishedAt = Date.now();
       if (task.controller.signal.aborted) {
         task.state = 'aborted';

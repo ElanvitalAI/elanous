@@ -10,7 +10,7 @@ import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 import { routeSupervisorVerdict } from './supervisor-verdict-edges.js';
-import { recordTaskAgentShadowMove, runCardFor, type TaskAgentShadowInput } from '../task-agent/shadow.js';
+import type { TaskAgentShadowInput } from '../task-agent/shadow.js';
 import { cardPrNumber, taskAgentStatePath } from '../task-agent/task-hand.js';
 import {
   classifyMustFixRound, inferMustFixEvidence, judgeMustFixScope, proposeMustFixSplit,
@@ -40,6 +40,8 @@ export interface SupervisorRound {
   mainSyncRelaunchTaskIds?: string[];
   /** Original feature and relaunch goal text of those tasks — a rerun may mint a new taskId, so the piece is also found by goal. */
   mainSyncRelaunchFeatures?: string[];
+  /** PR 없는 미분류 실패에 대해 실제 분해 실행기로 수복한 원래 골. 새 taskId에도 한 번 상한을 지킨다. */
+  selfHealDecomposeFeatures?: string[];
   /**
    * Tasks of this round that ended `status=failed` without a PR. Omitted when there are none — and on older
    * history, which never measured it, so the no-PR streak guard reads it as «not measured» and stays off.
@@ -130,6 +132,7 @@ export interface SupervisorDecision {
   };
   oscillation?: { taskIds: string[]; helper: 'review-oscillation'; signature: string; repairGoals?: Record<string, string>; heldTaskIds?: string[] };
   pendingDecision?: 'attempt-care-escalation';
+  selfHeal?: { reason: 'supervisor-unclassified-decompose'; attempt: 1; taskIds: string[] };
 }
 
 export interface SupervisorLimits {
@@ -352,6 +355,8 @@ export function decideNextRun(input: {
   reviewMustFixTrend?: ReviewRework['trend'];
   /** True: the rerun consumes the authored goal. False: it cannot, so oscillation stops for a human. Undefined: pure decision. */
   repairGoalExecution?: boolean;
+  /** 분해 제안을 실제 조각 실행으로 승격할 수 있는 supervisor 경로에만 true. */
+  decompositionExecution?: boolean;
 }): SupervisorDecision {
   const results = [...input.results];
   const history = [...(input.history ?? [])];
@@ -502,6 +507,29 @@ export function decideNextRun(input: {
   }
 
   if (!t.actionable) {
+    const spent = new Set(history.flatMap((entry) => entry.selfHealDecomposeFeatures ?? []).map(resumeKey));
+    const candidates = input.decompositionExecution === true && round + 1 <= maxRounds
+      ? activeResults.filter((result) => result.status === 'failed' && result.prNumber === undefined && !result.prUrl
+        && !result.providerErrors && !result.blockReason
+        && (result.decomposeProposal?.pieces.length ?? 0) >= 2
+        && t.needsHuman.includes(result.taskId)
+        && t.classifications.some((classification) => classification.taskId === result.taskId && classification.kind === 'unclassified')
+        && !spent.has(resumeKey(result.feature)))
+      : [];
+    // rerun은 라운드 전체를 받는다. 다른 needs-human 조각을 함께 다시 띄우지 않도록 첫 조각은 단독 후보로만 허용한다.
+    const candidate = candidates.length === 1 && t.needsHuman.every((id) => id === candidates[0]!.taskId)
+      ? candidates[0] : undefined;
+    if (candidate) {
+      const taskIds = [candidate.taskId];
+      return { ...base, action: 'relaunch',
+        decomposable: taskIds,
+        needsHuman: t.needsHuman.filter((id) => !taskIds.includes(id)),
+        classifications: t.classifications.map((classification) => taskIds.includes(classification.taskId)
+          ? { ...classification, action: 'decompose-and-retry' as const } : classification),
+        selfHeal: { reason: 'supervisor-unclassified-decompose', attempt: 1, taskIds },
+        why: `supervisor-unclassified-decompose (attempt: 1/1) — PR 없는 미분류 조각 ${taskIds.length}개를 실증된 분해 제안으로 한 번 재걸기`,
+      };
+    }
     if (t.needsHuman.length > 0) {
       return {
         ...base,
@@ -772,6 +800,12 @@ export function appendRound(
         decision.relaunchGoals?.[id],
       ].filter((feature): feature is string => feature !== undefined)),
     } : {}),
+    ...(decision?.action !== 'stop' && decision?.selfHeal ? {
+      selfHealDecomposeFeatures: decision.selfHeal.taskIds.flatMap((id) => {
+        const feature = results.find((result) => result.taskId === id)?.feature;
+        return feature === undefined ? [] : [feature];
+      }),
+    } : {}),
     ...(decision?.action === 'add-repair-task' && decision.oscillation ? (() => {
       // Each repaired task is recorded under its original goal feature and, when a rerun runs the authored goal as
       // the piece's new feature (orchestrate), under that repair text too — so the repair's own oscillation stops.
@@ -1028,6 +1062,7 @@ export async function rejudgeTerminalTaskCard(runId: string | null, deps: {
   external?: Parameters<typeof import('../task-agent/rejudge-on-head.js').rejudgeAsyncResultCard>[2];
 } = {}): Promise<void> {
   const statePath = deps.statePath ?? taskAgentStatePath();
+  const { runCardFor } = await import('../task-agent/shadow.js');
   const card = runCardFor(runId, { statePath, ...(deps.env ? { env: deps.env } : {}) });
   if (!card || card.status !== 'launched' || card.taLand !== true || cardPrNumber(card) === undefined) return;
   const { rejudgeAsyncResultCard } = await import('../task-agent/rejudge-on-head.js');
@@ -1081,9 +1116,10 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
     const allUnreviewedAreNoDiff = unreviewed.length > 0
       && unreviewed.every((result) => result.reviewReason === 'no-diff');
 
-    const decision = decideNextRun({
+    let decision = decideNextRun({
       results,
       history,
+      decompositionExecution: opts.promoteDecomposition !== undefined,
       // Undeclared = cannot run the repair goal: an add-repair-task would otherwise be a same-strategy relaunch.
       repairGoalExecution: opts.repairGoalExecution === true,
       ...(aggregateReviewTrend(results) ? { reviewMustFixTrend: aggregateReviewTrend(results) } : {}),
@@ -1118,6 +1154,20 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
         decomposePromotion = { attempted: true, reason: `shim-failed: ${String(error)}` };
       }
     }
+    if (decision.selfHeal) {
+      const promoted = decomposePromotion.attempted && (decomposePromotion.pieceCount ?? 0) >= 2;
+      try { opts.observe?.('supervisor-self-heal', { runId, reason: decision.selfHeal.reason,
+        attempt: decision.selfHeal.attempt, taskIds: decision.selfHeal.taskIds,
+        outcome: promoted ? 'promoted' : 'needs-human', promotionReason: decomposePromotion.reason }); } catch { /* fail-open */ }
+      if (!promoted) {
+        decision = { ...decision, action: 'stop', stopReason: 'needs-human',
+          decomposable: decision.decomposable.filter((id) => !decision.selfHeal!.taskIds.includes(id)),
+          needsHuman: [...new Set([...decision.needsHuman, ...decision.selfHeal.taskIds])],
+          classifications: decision.classifications.map((classification) => decision.selfHeal!.taskIds.includes(classification.taskId)
+            ? { ...classification, action: 'needs-human' as const } : classification),
+          why: `${decision.selfHeal.reason} (attempt: 1/1) — 분해 승격 실패(${decomposePromotion.reason}); 자동 재실행 없이 사람 확인` };
+      }
+    }
 
     try {
       const walkSummary = results.some((r) => r.walk !== undefined)
@@ -1145,6 +1195,7 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
         kinds: decision.classifications.map((c) => `${c.kind}:${c.action}`),
         decomposePromotionAttempted: decomposePromotion.attempted,
         decomposePromotionReason: decomposePromotion.reason,
+        ...(decision.selfHeal ? { selfHealReason: decision.selfHeal.reason, selfHealAttempt: decision.selfHeal.attempt } : {}),
         ...(decomposePromotion.pieceCount === undefined ? {} : { decomposePieceCount: decomposePromotion.pieceCount }),
         ...(decomposePromotion.dependsOnEdges === undefined ? {} : { decomposeDependsOnEdges: decomposePromotion.dependsOnEdges }),
         ...(decomposePromotion.hotPathEdges === undefined ? {} : { decomposeHotPathEdges: decomposePromotion.hotPathEdges }),
@@ -1188,6 +1239,7 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
             runId,
             reason: decision.stopReason,
             outcome: persistence.outcome,
+            ...(decision.selfHeal ? { selfHealReason: decision.selfHeal.reason, selfHealAttempt: decision.selfHeal.attempt } : {}),
             ...storageObservation,
           });
         } catch { /* fail-open */ }
@@ -1195,6 +1247,7 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
       if (decision.stopReason && opts.taskAgentShadow !== false) {
         // TASK-AGENT-SHADOW — 판단부를 그림자로 부른다(실행 0). 어떤 오류도 런의 결말을 바꾸지 않는다.
         try {
+          const { recordTaskAgentShadowMove } = await import('../task-agent/shadow.js');
           const pr = results.find((result) => typeof result.prNumber === 'number' && result.prNumber > 0)?.prNumber;
           const reviewed = results.filter((result) => result.prNumber === pr && result.selfReview && result.merged !== true);
           const selfReview = pr && reviewed.length === 1 ? reviewed[0]!.selfReview : undefined;

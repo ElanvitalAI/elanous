@@ -356,6 +356,173 @@ describe('pod command job manifest', () => {
 });
 
 describe('runPodCommand', () => {
+  test('a prepared producer Pod hands two commit-pinned files to its consumer Job', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-warm-consumer-'));
+    const commit = 'a'.repeat(40);
+    const image = 'registry.local/elanous-harness:aaaaaaaaaaaa';
+    const producer = 'prepared-source-1';
+    const files = { 'package.json': '{"name":"warm-fixture"}\n', 'src/first.ts': 'export const first = 1;\n' };
+    const applied: Record<string, any>[] = [];
+    const calls: string[][] = [];
+    const linked: Array<Record<string, unknown>> = [];
+    const staged = join(root, 'staged');
+    const consumer = join(root, 'consumer');
+    const producerCwd = join(root, 'producer-cwd');
+    mkdirSync(staged);
+    mkdirSync(consumer);
+    mkdirSync(join(producerCwd, 'repo', 'src'), { recursive: true });
+    for (const [path, content] of Object.entries(files)) writeFileSync(join(producerCwd, 'repo', path), content);
+    const gitStub = join(root, 'git');
+    writeFileSync(gitStub, `#!/bin/sh\necho ${commit}\n`);
+    chmodSync(gitStub, 0o755);
+    // The child image has GNU install -D; keep this shell fixture portable on macOS.
+    const installStub = join(root, 'install');
+    writeFileSync(installStub, '#!/bin/sh\n[ "$1" = -m ] && [ "$2" = 644 ] && [ "$3" = -D ] || exit 2\nmkdir -p "$(dirname "$5")" || exit 2\ncp "$4" "$5" || exit 2\nchmod 644 "$5"\n');
+    chmodSync(installStub, 0o755);
+    const copied = { status: null as number | null, output: '', error: '' };
+    let consumerPods = [{ metadata: { name: 'warm-consumer-1-pod' }, spec: { containers: [{ name: 'child', image }] } }];
+    try {
+      const options: Parameters<typeof runPodCommand>[0] = {
+        command: ['true'], name: 'warm-consumer-1', image, imageCommit: commit,
+        clone: true, source: { kind: 'commit', sha: commit }, ghToken: () => 'test-token',
+        warmProducer: { pod: producer, podUid: 'producer-uid', context: '', image, commit, files: ['package.json', 'src/first.ts'] },
+        log: (_category, event, data) => { if (event === 'warm-source-linked') linked.push(data); },
+        kubectl: (args, input) => {
+          calls.push([...args]);
+          if (input) {
+            const body = JSON.parse(input);
+            applied.push(body);
+            if (body.kind === 'ConfigMap') for (const [key, encoded] of Object.entries(body.binaryData as Record<string, string>)) writeFileSync(join(staged, key), Buffer.from(encoded, 'base64'));
+            if (body.kind === 'Job') {
+              const copyLines = podCommandScript(body).split('\n').filter((line) => line.startsWith('if [ "$(git rev-parse HEAD)"') || line.startsWith('install -m 644 -D /warm-source/') || line.startsWith("printf 'ELANOUS_WARM_SOURCE "));
+              const run = spawnSync('bash', ['-c', copyLines.join('\n').replaceAll('/warm-source/', `${staged}/`)], { cwd: consumer, encoding: 'utf8', env: { ...process.env, PATH: `${root}:${process.env.PATH}` } });
+              copied.status = run.status;
+              copied.output = run.stdout;
+              copied.error = run.stderr;
+            }
+          }
+          if (args.includes('get') && args.includes('pod') && args.includes(producer)) return { status: 0, stdout: JSON.stringify({ metadata: { name: producer, uid: 'producer-uid' }, spec: { containers: [{ name: 'child', image }] } }), stderr: '' };
+          if (args.includes('exec') && args.includes(producer)) {
+            const line = args.at(-1)!;
+            if (line.includes('rev-parse HEAD')) {
+              expect(line).toBe('git -C repo rev-parse HEAD');
+              expect(existsSync(join(producerCwd, 'repo'))).toBe(true);
+              return { status: 0, stdout: `${commit}\n`, stderr: '' };
+            }
+            const match = /^base64 -w0 'repo\/([^']+)'$/u.exec(line);
+            expect(match).not.toBeNull();
+            const source = join(producerCwd, 'repo', match![1]!);
+            expect(existsSync(source)).toBe(true);
+            return { status: 0, stdout: readFileSync(source).toString('base64'), stderr: '' };
+          }
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          if (args.includes('pods') && args.includes('json')) return { status: 0, stdout: JSON.stringify({ items: consumerPods }), stderr: '' };
+          if (args.includes('logs')) {
+            if (copied.status !== 0) throw new Error(`consumer fixture failed ${copied.status}: ${copied.output} ${copied.error}`);
+            return { status: 0, stdout: copied.output + Object.keys(files).map((path) => artifactLine(path, readFileSync(join(consumer, path), 'utf8'))).join('\n'), stderr: copied.error };
+          }
+          return { status: 0, stdout: '0', stderr: '' };
+        },
+        env: {}, configHostMirror: () => undefined, artifactsRoot: root,
+      };
+      const result = await runPodCommand(options);
+      const config = applied.find((body) => body.kind === 'ConfigMap')!;
+      const job = applied.find((body) => body.kind === 'Job')!;
+      expect(config.metadata.name).toBe(`warm-consumer-1-${job.metadata.labels['elanous.launch']}`);
+      expect(config.binaryData).toEqual({ 'file-0': Buffer.from(files['package.json']).toString('base64'), 'file-1': Buffer.from(files['src/first.ts']).toString('base64') });
+      expect(job.spec.template.spec.containers[0].image).toBe(image);
+      expect(job.spec.template.spec.volumes).toContainEqual({ name: 'warm-source', configMap: { name: config.metadata.name } });
+      expect(job.spec.template.spec.containers[0].volumeMounts).toContainEqual({ name: 'warm-source', mountPath: '/warm-source', readOnly: true });
+      const script = podCommandScript(job);
+      expect(script).toContain(`git rev-parse HEAD`);
+      expect(script).toContain(commit);
+      for (const [i, path] of Object.keys(files).entries()) {
+        expect(script).toContain(`/warm-source/file-${i}`);
+        expect(script).toContain(path);
+      }
+      expect(calls.filter((args) => args.includes('exec') && args.includes(producer))).toHaveLength(3);
+      expect(calls.some((args) => args.includes('get') && args.includes('pod') && args.includes(producer))).toBe(true);
+      expect(result.image).toBe(image);
+      expect(linked).toEqual([{ producerPod: producer, consumerPod: 'warm-consumer-1-pod', image, commit, files: ['package.json', 'src/first.ts'] }]);
+      expect(result.artifacts?.names).toEqual(['package.json', 'src/first.ts']);
+      for (const [path, content] of Object.entries(files)) expect(readFileSync(join(result.artifactsDir, path), 'utf8')).toBe(content);
+      expect(copied.status).toBe(0);
+      for (const [path, content] of Object.entries(files)) expect(readFileSync(join(consumer, path), 'utf8')).toBe(content);
+      consumerPods = [...consumerPods, { metadata: { name: 'warm-consumer-retry-pod' }, spec: { containers: [{ name: 'child', image }] } }];
+      await expect(runPodCommand(options)).rejects.toThrow('consumer Pod identity or image mismatch');
+      expect(linked).toHaveLength(1);
+      consumerPods = consumerPods.slice(0, 1);
+      await expect(runPodCommand({ ...options, warmProducer: { ...options.warmProducer!, podUid: 'replaced-uid' } })).rejects.toThrow('producer Pod identity or image mismatch');
+      expect(linked).toHaveLength(1);
+      writeFileSync(gitStub, '#!/bin/sh\necho ' + 'b'.repeat(40) + '\n');
+      const handoff = script.split('\n').filter((line) => line.startsWith('if [ "$(git rev-parse HEAD)"') || line.startsWith('install -m 644 -D /warm-source/') || line.startsWith("printf 'ELANOUS_WARM_SOURCE ")).join('\n').replaceAll('/warm-source/', `${staged}/`);
+      expect(spawnSync('bash', ['-c', handoff], { cwd: consumer, env: { ...process.env, PATH: `${root}:${process.env.PATH}` } }).status).toBe(5);
+      expect(calls.some((args) => args.includes('delete') && args.includes('configmap') && args.includes('elanous.job=warm-consumer-1,elanous.launch=' + job.metadata.labels['elanous.launch']))).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a generated-length Job uses a valid, unique ConfigMap name for its warm files', async () => {
+    const name = 'si-' + 'a'.repeat(55);
+    const launch = '123456789abc';
+    const job = manifest({ name, launch, clone: true, source: { kind: 'commit', sha: 'a'.repeat(40) }, warmFiles: ['package.json', 'src/first.ts'] });
+    const source = (job.spec as { template: { spec: { volumes: Array<{ name: string; configMap?: { name: string } }> } } }).template.spec.volumes.find((volume) => volume.name === 'warm-source')!.configMap!.name;
+    expect(source.length).toBeLessThanOrEqual(63);
+    expect(source).not.toBe(`${name}-source`);
+    expect(source).toContain(launch);
+  });
+
+  test('a consumer with the same image and commit but altered first file is rejected before collection', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-warm-corrupt-'));
+    const commit = 'a'.repeat(40);
+    const image = 'registry.local/elanous-harness:aaaaaaaaaaaa';
+    const producer = 'prepared-source-1';
+    const files = { 'package.json': '{"name":"warm-fixture"}\n', 'src/first.ts': 'export const first = 1;\n' };
+    const calls: string[][] = [];
+    try {
+      await expect(runPodCommand({ command: ['true'], name: 'warm-corrupt', image, imageCommit: commit,
+        clone: true, source: { kind: 'commit', sha: commit }, ghToken: () => 'test-token',
+        warmProducer: { pod: producer, podUid: 'producer-uid', context: '', image, commit, files: ['package.json', 'src/first.ts'] },
+        kubectl: (args) => {
+          calls.push([...args]);
+          if (args.includes('get') && args.includes('pod') && args.includes(producer)) return { status: 0, stdout: JSON.stringify({ metadata: { name: producer, uid: 'producer-uid' }, spec: { containers: [{ name: 'child', image }] } }), stderr: '' };
+          if (args.includes('exec') && args.includes(producer)) {
+            const line = args.at(-1)!;
+            const path = /^base64 -w0 'repo\/([^']+)'$/u.exec(line)?.[1] as keyof typeof files | undefined;
+            return { status: 0, stdout: path ? Buffer.from(files[path]).toString('base64') : `${commit}\n`, stderr: '' };
+          }
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          if (args.includes('pods') && args.includes('json')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'warm-corrupt-pod' }, spec: { containers: [{ name: 'child', image }] } }] }), stderr: '' };
+          if (args.includes('logs')) return { status: 0, stdout: [
+            `ELANOUS_WARM_SOURCE package.json ${createHash('sha256').update('altered').digest('hex')} ${commit}`,
+            `ELANOUS_WARM_SOURCE src/first.ts ${createHash('sha256').update(files['src/first.ts']).digest('hex')} ${commit}`,
+          ].join('\n'), stderr: '' };
+          return { status: 0, stdout: '', stderr: '' };
+        }, env: {}, configHostMirror: () => undefined, artifactsRoot: root,
+      })).rejects.toThrow('consumer file or commit mismatch: package.json');
+      expect(calls.some((args) => args.includes('delete') && args.includes('configmap') && args.includes('-l'))).toBe(true);
+      expect(existsSync(join(root, 'warm-corrupt', 'child.log'))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a producer with a different image or commit cannot hand files to a consumer Job', async () => {
+    const commit = 'a'.repeat(40);
+    const image = 'registry.local/elanous-harness:aaaaaaaaaaaa';
+    const applied: string[] = [];
+    for (const mismatch of ['image', 'commit'] as const) {
+      await expect(runPodCommand({ command: ['true'], name: 'warm-mismatch', image, imageCommit: commit,
+        clone: true, source: { kind: 'commit', sha: commit }, ghToken: () => 'test-token',
+        warmProducer: { pod: 'producer-1', podUid: 'producer-uid', context: '', image, commit, files: ['package.json', 'src/first.ts'] },
+        kubectl: (args, input) => {
+          if (input) applied.push(JSON.parse(input).kind);
+          if (args.includes('get') && args.includes('pod')) return { status: 0, stdout: JSON.stringify({ metadata: { name: 'producer-1', uid: 'producer-uid' }, spec: { containers: [{ name: 'child', image: mismatch === 'image' ? 'wrong-image' : image }] } }), stderr: '' };
+          if (args.includes('exec')) return { status: 0, stdout: `${mismatch === 'commit' ? 'b'.repeat(40) : commit}\n`, stderr: '' };
+          return { status: 0, stdout: '', stderr: '' };
+        }, env: {}, configHostMirror: () => undefined,
+      })).rejects.toThrow(mismatch === 'image' ? 'identity or image mismatch' : 'commit mismatch');
+    }
+    expect(applied).toEqual([]);
+  });
+
   test('shelf Job requires its commit and registry image; fails closed without the tag and keeps ordinary Job bytes', async () => {
     const commit = 'a'.repeat(40);
     const image = 'k3d-elanous-registry:5050/elanous-harness:aaaaaaaaaaaa';
@@ -533,6 +700,41 @@ describe('runPodCommand', () => {
     });
     await expect(pending).rejects.toThrow('pod shadow: host timeout');
     expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('shadow-wall-deadline'))).toHaveLength(1);
+    expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
+  });
+
+  test('PRLAND-SHADOW-HOST-TIMEOUT: a Pending Pod poll that crosses the host deadline ends the loop with exactly one timeout record', async () => {
+    // 격리 45분 교착 재현 입력: the Job status reads fine but never finishes — without the host deadline the loop never ends.
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+    const pool = new PodPoolScheduler([member]);
+    const commands: string[][] = [];
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    let clock = 0;
+    let sleeps = 0;
+    const pending = runPodCommand({ command: ['true'], name: 'shadow-host-loop-timeout', signal: new AbortController().signal,
+      hostDeadlineAtMs: 2_700_000, nowMs: () => clock, poolScheduler: pool,
+      kubectl: (args) => {
+        commands.push([...args]);
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+      sleep: async () => { sleeps++; clock = 3_000_000; },
+      imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-shadow-loop-test',
+      log: (category, event, data) => { events.push({ category, event, data: data as Record<string, unknown> }); },
+    });
+    await expect(pending).rejects.toThrow('pod shadow: host timeout');
+    // 폴링 중단: one Pending poll, one deadline crossing — never a second status read after the deadline.
+    const statusReads = commands.filter((args) => args.some((arg) => arg.includes('.status.conditions')));
+    expect(statusReads).toHaveLength(1);
+    expect(sleeps).toBe(1);
+    // 타임아웃 상태 레코드: 정확히 한 건 — deadline 초과 시각 ⊕ 최종 상태.
+    const timeouts = events.filter((e) => e.event === 'host-timeout');
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0]).toMatchObject({
+      category: 'pod.command', data: { job: 'shadow-host-loop-timeout', hostDeadlineAtMs: 2_700_000, finalState: 'timeout' },
+    });
+    expect((timeouts[0]!.data as { nowMs?: number }).nowMs).toBeGreaterThanOrEqual(2_700_000);
     expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
   });
 

@@ -298,7 +298,7 @@ describe('explicit review attempt selection', () => {
   const evidence = (supersedes?: unknown, followupPr?: unknown) => JSON.stringify({
     pr: PR, head: HEAD, reviewResult: `${dir}/${selected}`, supersedes, followupPr,
   });
-  const runCase = (options: { supersedes?: unknown; followupPr?: unknown; names?: string[]; followupState?: string; selectedHead?: string; failedHead?: string; failedTime?: number; failedVerdict?: unknown; selectedResolvedPrior?: unknown; selectedIntent?: string; failedMustFix?: unknown[] } = {}) => {
+  const runCase = (options: { supersedes?: unknown; followupPr?: unknown; names?: string[]; followupState?: string; selectedHead?: string; failedHead?: string; failedTime?: number; failedVerdict?: unknown; selectedResolvedPrior?: unknown; selectedIntent?: string; selectedStatus?: string; failedMustFix?: unknown[] } = {}) => {
     const names = options.names ?? [selected, failed];
     const run: CmdRunner = (command, args) => command === 'gh' && args[0] === 'pr'
       ? { ok: true, out: JSON.stringify({ state: options.followupState ?? 'OPEN' }), err: '' }
@@ -310,7 +310,7 @@ describe('explicit review attempt selection', () => {
       reviewMtime: (path) => path.endsWith(selected) ? 20 : (options.failedTime ?? 10),
       readFile: (path) => path === '/evidence.json' ? evidence(options.supersedes, options.followupPr)
         : path.endsWith(selected) ? JSON.stringify({ pr: PR, headCommit: options.selectedHead ?? HEAD, reviewed: true,
-          verdict: 'warn', mustFix: [], resolvedPrior: options.selectedResolvedPrior, intent: options.selectedIntent })
+          verdict: 'warn', mustFix: [], status: options.selectedStatus, resolvedPrior: options.selectedResolvedPrior, intent: options.selectedIntent })
           : JSON.stringify({ pr: PR, headCommit: options.failedHead ?? HEAD, reviewed: true,
             verdict: options.failedVerdict === undefined ? 'fail' : options.failedVerdict, mustFix: options.failedMustFix ?? [priorFinding] }),
     });
@@ -400,6 +400,33 @@ describe('explicit review attempt selection', () => {
     })).toMatchObject({ ok: false, reason: expect.stringContaining('review-attempt-not-superseded') });
     expect(runCase({ selectedIntent: intent, failedTime: 30 }))
       .toEqual({ ok: false, reason: 'review-selected-not-later-than-failure' });
+  });
+
+  test('REVIEW-SUPERSEDE-SAME-HEAD: keeps the explicit same-head resolution and refuses the two contradiction axes', () => {
+    const intent = `Resolved prior review findings:\n- ${failed}: ${priorFinding}`;
+    // (a) A same-head FAIL that a later mf0 review explicitly resolves stays landable.
+    expect(runCase({ selectedResolvedPrior: [{ reviewResult: `${dir}/${failed}`, mustFix: [priorFinding] }] }))
+      .toMatchObject({ ok: true, mode: 'already-ancestor' });
+    expect(runCase({ selectedResolvedPrior: true, selectedIntent: intent }))
+      .toMatchObject({ ok: true, mode: 'already-ancestor' });
+    expect(runCase({ selectedResolvedPrior: [{ reviewResult: `${dir}/${failed}`, mustFix: [priorFinding] }], selectedStatus: 'resolved' }))
+      .toMatchObject({ ok: true, mode: 'already-ancestor' });
+    // (b) `resolvedPrior: true` cannot coexist with a separate OPEN/PENDING status on the same record.
+    for (const selectedStatus of ['pending', 'open']) {
+      expect(runCase({ selectedResolvedPrior: true, selectedIntent: intent, selectedStatus }))
+        .toMatchObject({ ok: false, reason: expect.stringContaining('review-attempt-not-superseded') });
+      expect(runCase({ selectedResolvedPrior: [{ reviewResult: `${dir}/${failed}`, mustFix: [priorFinding] }], selectedStatus }))
+        .toMatchObject({ ok: false, reason: expect.stringContaining('review-attempt-not-superseded') });
+    }
+    // (c) A sentence-form `status open/pending` inside the intent refuses the same landing.
+    for (const suffix of ['status pending', 'status open', 'Review status open — awaiting re-run']) {
+      expect(runCase({
+        selectedResolvedPrior: [{ reviewResult: `${dir}/${failed}`, mustFix: [priorFinding] }],
+        selectedIntent: `${intent}\n${suffix}`,
+      })).toMatchObject({ ok: false, reason: expect.stringContaining('review-attempt-not-superseded') });
+      expect(runCase({ selectedResolvedPrior: true, selectedIntent: `${intent}\n${suffix}` }))
+        .toMatchObject({ ok: false, reason: expect.stringContaining('review-attempt-not-superseded') });
+    }
   });
 
   test('rejects unlisted failures and a closed or absent follow-up', () => {

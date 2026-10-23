@@ -447,7 +447,14 @@ function recentToolTrail(task: AgentTask, limit: number, cache: ScanCache): Agen
   return trail;
 }
 
+/** Tool calls the child made: the live counter (bumped as each call starts) or the
+ *  tool_use blocks in its history, whichever is larger — history lags until a tool
+ *  loop completes and stays short when the run is aborted or errors. */
 function countToolUses(task: AgentTask, cache: ScanCache): number {
+  return Math.max(task.toolCallCount ?? 0, countHistoryToolUses(task, cache));
+}
+
+function countHistoryToolUses(task: AgentTask, cache: ScanCache): number {
   const len = task.messages?.length ?? 0;
   if (len === 0) return 0;
   const cached = cache.count.get(task.id);

@@ -46,7 +46,7 @@ import type { ClickRegion, ClickRegistry } from './click-registry.js';
 import type { MouseEvent, MouseEventType } from './mouse-events.js';
 import { DragMachine } from './drag-machine.js';
 import type { ContextKeyService, ContextKeys } from '../input-core/context-keys.js';
-import { getDashboardContextKeyService } from '../dashboard/context/keys.js';
+import { getRuntimeContextKeyService } from '../input-core/context-key-runtime.js';
 import { ansiForPair, resolveWidgetTokens, type ThemeTokens } from '../theme/tokens.js';
 import type { BoxDecoration } from './attributes/box-decoration.js';
 import { resolveColorToken } from './chrome/resolve-color.js';
@@ -706,7 +706,7 @@ export function mountViewAsModalSurface(spec: ViewSurfaceSpec): ViewSurfaceHandl
   // least one modal of that tier exists. Proper stack-counting lands
   // in IDX-2c with the ModalTier enum + registry.
   const ctxSvc = spec.tier
-    ? (spec.contextKeyService ?? getDashboardContextKeyService())
+    ? (spec.contextKeyService ?? getRuntimeContextKeyService())
     : null;
   const ctxKey = spec.tier ? MODAL_TIER_CONTEXT_KEY[spec.tier] : null;
   if (ctxSvc && ctxKey) {

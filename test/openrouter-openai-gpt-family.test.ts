@@ -104,10 +104,13 @@ function toolHintKept(model: string): number {
 type Fp = Awaited<ReturnType<typeof fingerprint>>;
 
 // Shared sha values: origin/main c25df7b58e, with open-weight discipline/turn
-// remeasured on the 0.2.25 cut after the shared prompt changed.
+// remeasured on the 0.2.25 cut after the shared prompt changed, and gpt/codex
+// addon shas remeasured after TUI-OPS-TURN-GUARD gap ② added the ops-turn
+// guard rule to both TOOL_DISCIPLINE addons (all other fields re-verified
+// unchanged by printing fingerprint() on the changed tree).
 const EMPTY = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
-const GPT_ADDON = '9e31146d530121080d0c6e9cdfd40b16721a15803fc86b713a9dd14cca371be2';
-const CODEX_ADDON = 'fb553a1ac45cdf93055abf248bb7ca25442af7f5a3af249b8130363729de8500';
+const GPT_ADDON = '4b5c577102c6930f9eb821218bd7150ec944445a5e0c5069e9f448721f5b8ad4';
+const CODEX_ADDON = 'c02b394d304c5b0c4619651fee8f0cd11f20a4ebc8bd087d29c3a7afab65a2ef';
 const CODEX_DISCIPLINE = 'b8623476f31f08d5e1269d7ad5edb4f922c0d820a9cfaccbe41f9756d7151d97';
 const GROK_DISCIPLINE = '49ada854d200fe9355c03f4726a0bc7efb853f9d30d6454f72a7bd15f891ab20';
 const PLAIN_TURN = '847b7010258182a01a4397318734230e382b2f34e4d11c87a46ccafdf4e1ede2';

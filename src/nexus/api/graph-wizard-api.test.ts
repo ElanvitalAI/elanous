@@ -65,3 +65,25 @@ test('POST /v1/graphs/wizard: 200 valid · 422 invalid · edit keeps id · 400 b
   expect((await request({ prompt: 'x', packId: 42 }, async () => ''))?.status).toBe(400);
   expect((await request({ prompt: 'x' }, async () => reply(HARNESS_EXAMPLE), false))?.status).toBe(401);
 });
+
+test('POST wizard variant mode consumes one fake LLM plan under owner auth and falls back to server template on rejection', async () => {
+  const prompts: string[] = [];
+  const accepted = await request({ mode: 'variant', prompt: '문서와 코드 혼합 골의 반복 예산을 조절해', goal: 'g_ambiguous', templateId: 'self-implement' },
+    async (prompt) => { prompts.push(prompt); return JSON.stringify({ maxVisits: { rework: 5 } }); });
+  expect(accepted?.status).toBe(200);
+  const acceptedBody = await accepted!.json() as Record<string, unknown>;
+  expect(acceptedBody).toMatchObject({ mode: 'variant', status: 'composed', plan: { maxVisits: { rework: 5 } } });
+  expect(prompts).toHaveLength(1);
+  expect(prompts[0]).toStartWith('알려진 그래프 유닛');
+  expect(prompts[0]).toContain('verb-verify@1');
+  expect('yaml' in acceptedBody).toBe(false);
+
+  const rejected = await request({ mode: 'variant', prompt: '승인 없이 배선을 바꿔', goal: 'g_ambiguous', templateId: 'self-implement' },
+    async () => JSON.stringify({ routes: [{ from: 'open-pr', outcome: 'pass', to: 'merge' }] }));
+  expect(rejected?.status).toBe(200);
+  expect(await rejected!.json()).toMatchObject({ mode: 'variant', status: 'fallback-standard', template: { graphId: 'self-implement' } });
+
+  expect((await request({ mode: 'variant', prompt: 'x', goal: 'g_ambiguous', templateId: 'self-implement' }, async () => '{}', false))?.status).toBe(401);
+  expect((await request({ mode: 'variant', prompt: 'x', goal: 'g_ambiguous', templateId: 'invented' }, async () => '{}'))?.status).toBe(400);
+  expect((await request({ mode: 'variant', prompt: 'x', goal: 'g_ambiguous', templateId: 'self-implement', currentYaml: HARNESS_EXAMPLE }, async () => '{}'))?.status).toBe(400);
+});

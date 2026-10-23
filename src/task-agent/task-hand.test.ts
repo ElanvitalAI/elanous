@@ -6,10 +6,13 @@ import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
-import { registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
+import { defaultTaskLauncher, registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
+import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { abandonedDraftReleaseNote, cardsTouchingPaths, closeTaskCard, draftTaskOwner, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, TaskAgentStateError, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { abandonedDraftReleaseNote, cardsTouchingPaths, closeTaskCard, draftTaskOwner, handDraftClaim, handTask, launchArgs, nextMoveFor, parseChildLlm, resolveHandText, readTaskAgentState, readTaskCard, selectTaskComposition, TASK_CARD_LABEL, RUN_TAG_CHANGE_EVENT, runTagChange, taskCardLabelContext, updateTaskCard, writeTaskCards, TaskAgentStateError, TaskDraftClaimRejectedError, type DraftClaimGhPorts, type TaskCard, type TaskLaunchContext } from './task-hand.js';
+import { advanceMission } from './mission.js';
+import { remoteLaunchScript } from './parent-host.js';
 import { addItem, checklistDevVersion } from '../release-loop/checklist.js';
 import { listHarnessQueue, queueHeadBefore, type HarnessQueueDeps } from '../harness/harness-queue.js';
 import { installHarnessCliCommand } from '../harness/harness-cli-command.js';
@@ -39,12 +42,16 @@ function liveGoal(text: string): string {
   return `${text}\n- 완료 경계 코드: src/task-agent/task-hand.ts live hand 조건을 판정한다\n- 완료 경계 실물: 카드가 발사 전 완료 경계를 요구한다\n- 완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts`;
 }
 
-function compositionFixture(kind: string): string {
+function compositionFixture(kind: string, launcher: 'harness-say' | 'graph-run' = 'harness-say'): string {
   const root = mkdtempSync(join(tmpdir(), 'task-composition-'));
   const work = join(root, 'graphs', 'work');
   mkdirSync(work, { recursive: true });
-  writeFileSync(join(work, `${kind}.yaml`), `graph_id: work-${kind}\nversion: 1\nlauncher: harness-say\nentry_node: done\nterminal_nodes: [done]\nnodes:\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges: []\n`);
+  writeFileSync(join(work, `${kind}.yaml`), `graph_id: work-${kind}\nversion: 1\nlauncher: ${launcher}\nentry_node: done\nterminal_nodes: [done]\nnodes:\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges: []\n`);
   return root;
+}
+
+function fakeGraphRunState(status: GraphRunState['status'], runId: string): GraphRunState {
+  return { graphId: 'work-research-report', runId, status, path: [], nodes: [], executed: 0, dryRun: false, statePath: join(mkdtempSync(join(tmpdir(), 'graph-run-state-')), 'run.json') };
 }
 
 test('1판 조합: code-pr의 해석 결과를 기록하고 기존 harness say 인자로 발사한다', async () => {
@@ -88,6 +95,32 @@ test('live hand 완료 경계 누락은 카드 기록과 launcher 호출 전에 
   expect(launches).toBe(0);
   expect(readTaskCard('ta-20261018-boundary', path)).toBeUndefined();
   expect(events).toHaveLength(0);
+});
+
+test('live hand 완료 경계 증거 명령은 명령 원문만 받는다 — 설명 접미·백틱 장식은 이유를 붙여 카드 기록·launcher 호출 전에 거부한다', async () => {
+  const plainPath = statePath();
+  let plainLaunches = 0;
+  const plain = await handTask({ id: 'ta-20261021-evidence-plain', text: liveGoal('ship it'),
+    live: true, preflightGoalDoneBoundary: true, statePath: plainPath,
+    launcher: () => { plainLaunches++; } });
+  expect(plain).toMatchObject({ mode: 'live', launched: true });
+  expect(plainLaunches).toBe(1);
+
+  const boundaryLines = liveGoal('ship it').split('\n').slice(0, -1);
+  const decorated = [
+    { value: 'bun test src/task-agent/task-hand.test.ts → 0 fail', reason: '설명 접미' },
+    { value: '`bun test src/task-agent/task-hand.test.ts`', reason: '백틱 장식' },
+  ];
+  for (const [index, { value, reason }] of decorated.entries()) {
+    const path = statePath();
+    let launches = 0;
+    const text = [...boundaryLines, `- 완료 경계 증거 명령: ${value}`].join('\n');
+    await expect(handTask({ id: `ta-20261021-evidence-${index}`, text, live: true, preflightGoalDoneBoundary: true,
+      statePath: path, launcher: () => { launches++; } }))
+      .rejects.toThrow(`완료 경계 증거 명령은 명령 원문이어야 한다 ${reason}: ${value}`);
+    expect(launches).toBe(0);
+    expect(readTaskCard(`ta-20261021-evidence-${index}`, path)).toBeUndefined();
+  }
 });
 
 test('shadow hand는 완료 경계 없는 문면도 카드로만 기록하고 발사하지 않는다', async () => {
@@ -212,18 +245,91 @@ test('없는 조합은 발사 전 거부하고 카드·관측에 이유를 남�
   }
 });
 
-test('2판 graph-run 조합은 1판에서 잘못 harness say로 발사하지 않고 선택 근거를 남긴다', async () => {
-  const root = compositionFixture('research-report');
+test('2판 graph-run 조합(research-report)은 선택된 조합 경로로 실제 graph run(runGraph)을 발사한다', async () => {
+  const root = compositionFixture('research-report', 'graph-run');
+  const graphPath = join(root, 'graphs', 'work', 'research-report.yaml');
+  const path = statePath();
+  const calls: Array<{ path: string; options: GraphRunOptions }> = [];
+  let sayLaunches = 0;
+  const result = await handTask({ id: 'ta-graph-run-live', text: 'report', completion: 'research-report',
+    compositionRoot: root, statePath: path, live: true,
+    launcher: () => { sayLaunches++; },   // harness say 발사기는 graph-run 조합에 불리지 않는다
+    graphRunner: async (launchedPath, options) => {
+      calls.push({ path: launchedPath, options });
+      return fakeGraphRunState('done', options.runId!);
+    } });
+  expect(sayLaunches).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.path).toBe(graphPath);
+  expect(calls[0]!.options).toMatchObject({ input: { ask: 'report' }, quiet: true });
+  expect(calls[0]!.options.runId).toStartWith('run-');
+  expect(result).toMatchObject({ mode: 'live', launched: true, card: { status: 'launched', runId: calls[0]!.options.runId } });
+  expect(result.move).toEqual({ kind: 'launch', command: ['graph', 'run', graphPath], reason: expect.stringContaining('graph-run') });
+  const stored = readTaskCard('ta-graph-run-live', path)!;
+  expect(stored).toMatchObject({ status: 'launched', completion: 'research-report',
+    composition: { file: 'graphs/work/research-report.yaml', version: 1 }, graphSelectedBy: 'completion',
+    unitsResolved: true, missingUnits: [], runId: calls[0]!.options.runId });
+  expect(stored.history.some((item) => item.event === 'launch' && item.detail === `graph run ${graphPath} (run ${calls[0]!.options.runId})`)).toBe(true);
+  expect(stored.history.some((item) => item.event === 'run-bound')).toBe(true);
+  // 더 이상 '조합 실행기 없음' 거부가 아니다.
+  expect(stored.history.some((item) => item.event === 'composition-launcher-unavailable')).toBe(false);
+});
+
+test('graph-run 조합이 단위를 해석하지 못하면 구체 blocker 실패 카드를 남기고 발사하지 않는다', async () => {
+  const root = compositionFixture('research-report', 'graph-run');
   const file = join(root, 'graphs', 'work', 'research-report.yaml');
-  writeFileSync(file, readFileSync(file, 'utf8').replace('launcher: harness-say', 'launcher: graph-run'));
+  writeFileSync(file, `graph_id: work-research-report\nversion: 1\nlauncher: graph-run\nentry_node: invoke\nterminal_nodes: [done]\nnodes:\n  - { node_id: invoke, kind: subgraph, recipe: none, max_visits: 1, call: worker@1, budget: { inner_steps: 1 }, contract: { inputs: [], outputs: [] } }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: invoke, on: outcome, map: { done: done } }\n`);
   const path = statePath();
   let launched = 0;
-  await expect(handTask({ id: 'ta-graph-run-future', text: 'report', completion: 'research-report',
-    compositionRoot: root, statePath: path, live: true, launcher: () => { launched++; } })).rejects.toThrow('조합 실행기 없음');
+  await expect(handTask({ id: 'ta-graph-run-missing-unit', text: 'report', completion: 'research-report',
+    compositionRoot: root, statePath: path, live: true,
+    graphRunner: async () => { launched++; return fakeGraphRunState('done', 'run-x'); } }))
+    .rejects.toThrow('조합 단위 미해석');
   expect(launched).toBe(0);
-  expect(readTaskCard('ta-graph-run-future', path)).toMatchObject({ status: 'failed',
+  expect(readTaskCard('ta-graph-run-missing-unit', path)).toMatchObject({ status: 'failed',
     composition: { file: 'graphs/work/research-report.yaml', version: 1 }, graphSelectedBy: 'completion',
-    unitsResolved: true, missingUnits: [], history: [{ event: 'composition-launcher-unavailable' }] });
+    unitsResolved: false, missingUnits: ['worker@1'],
+    history: [{ event: 'composition-launcher-unavailable', detail: expect.stringContaining('worker@1') }] });
+});
+
+test('graph run이 실패 상태로 끝나면 구체 blocker를 실패 카드에 기록한다(임의 성공 아님)', async () => {
+  const root = compositionFixture('research-report', 'graph-run');
+  const path = statePath();
+  const result = await handTask({ id: 'ta-graph-run-failed-state', text: 'report', completion: 'research-report',
+    compositionRoot: root, statePath: path, live: true,
+    graphRunner: async (_launchedPath, options) => fakeGraphRunState('failed', options.runId!) });
+  expect(result.launched).toBe(true);
+  const stored = readTaskCard('ta-graph-run-failed-state', path)!;
+  expect(stored.status).toBe('failed');
+  expect(stored.history.at(-1)).toMatchObject({ event: 'graph-run-failed', detail: expect.stringContaining('graph run 종료 상태 failed') });
+});
+
+test('graph run 진입점(runGraph)이 던지면 launch-failed 카드에 구체 사유를 남긴다', async () => {
+  const root = compositionFixture('research-report', 'graph-run');
+  const path = statePath();
+  await expect(handTask({ id: 'ta-graph-run-thrown', text: 'report', completion: 'research-report',
+    compositionRoot: root, statePath: path, live: true,
+    graphRunner: async () => { throw new Error('invalid graph: 대상 research node 없음'); } }))
+    .rejects.toThrow('graph run 실패: invalid graph: 대상 research node 없음');
+  expect(readTaskCard('ta-graph-run-thrown', path)).toMatchObject({ status: 'launch-failed' });
+  expect(readTaskCard('ta-graph-run-thrown', path)!.history.at(-1)).toMatchObject({ event: 'launch-failed', detail: expect.stringContaining('대상 research node 없음') });
+});
+
+test('tasks hand --completion research-report cli 배선은 graph-run 조합을 카드에 싣고 shadow는 발사하지 않는다', async () => {
+  const root = compositionFixture('research-report', 'graph-run');
+  const path = statePath();
+  let launched = 0;
+  const { lines, code } = await cli(['task', 'hand', '보고서', '--completion', 'research-report', '--json'], {
+    taskStatePath: path, taskCompositionRoot: root,
+    taskLauncher: () => { launched++; },
+  });
+  expect(code).toBe(0);
+  expect(launched).toBe(0);
+  const card = JSON.parse(lines[0]!).card as TaskCard;
+  expect(card).toMatchObject({ status: 'handed', completion: 'research-report',
+    composition: { file: 'graphs/work/research-report.yaml', version: 1 }, graphSelectedBy: 'completion', unitsResolved: true, missingUnits: [] });
+  expect(readTaskCard(card.id, path)?.composition?.file).toBe('graphs/work/research-report.yaml');
+  expect(card.history).toEqual([]);
 });
 
 async function cli(args: string[], deps: Parameters<typeof registerTasksCommands>[1]): Promise<{ lines: string[]; code: number | string | undefined }> {
@@ -234,7 +340,7 @@ async function cli(args: string[], deps: Parameters<typeof registerTasksCommands
   process.exitCode = undefined;
   try {
     await program.parseAsync(['node', 'elanous', ...args]);
-    return { lines, code: process.exitCode };
+    return { lines, code: process.exitCode ?? 0 }; // unset exitCode is shell success
   } finally { process.exitCode = previous ?? 0; }
 }
 
@@ -701,6 +807,46 @@ test('TASKS-HAND-CHILD-LLM: --child-llm grok/grok-4.7 passes --child-llm-provide
     expect(readTaskCard(id, path)?.childLlm).toEqual({ provider: 'grok', model: 'grok-4.7', effort: 'high' });
     expect(events.find((e) => e.event === 'child-llm')?.data).toMatchObject({ taskId: id, input: 'grok/grok-4.7', provider: 'grok', model: 'grok-4.7', effort: 'high', mode: 'live' });
   } finally { off(); }
+});
+
+test('TA-PARENT-ROLE-LLM: task hand passes pinned credit GLM parent roles through the live launch and card', async () => {
+  const path = statePath();
+  const text = liveGoal('repair tonight no-candidate');
+  const pin = 'audit={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+  let launch: { args: string[]; env: Record<string, string> } | undefined;
+  const result = await cli(['task', 'hand', text, '--child-llm', 'openrouter/z-ai/glm-5.3', '--role-llm', pin, '--live', '--json'], {
+    taskStatePath: path,
+    taskLauncher: (args, _cwd, context) => { launch = { args, env: context!.env }; return { runId: context!.runId }; },
+  });
+  expect(result.code).toBe(0);
+  expect(launch?.args).toContain('--child-llm-provider');
+  expect(JSON.parse(launch!.env.ELANOUS_ROLE_LLM_AUDIT!)).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  const card = readTaskCard(JSON.parse(result.lines[0]!).card.id, path)!;
+  expect(card.parentRoleLlm).toEqual([pin]);
+});
+
+test('TA-PARENT-ROLE-LLM: default launcher includes the parent pin in the spawned process environment', async () => {
+  const pin = '{"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+  let spawnedEnv: NodeJS.ProcessEnv | undefined;
+  const emitSpawn = fakeSpawn('spawn', 4001);
+  const spawn = ((_command: string, _args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+    spawnedEnv = options.env;
+    return emitSpawn(_command, _args, options as never);
+  }) as DetachedSpawn;
+  await defaultTaskLauncher(['harness', 'say', 'goal'], undefined,
+    { runId: 'run-parent-role-glm', launchId: 'tl-parent-role-glm', env: { ELANOUS_RUN_ID: 'run-parent-role-glm', ELANOUS_ROLE_LLM_AUDIT: pin } },
+    { parentHost: null, spawn, earlyExitWindowMs: 0 });
+  expect(spawnedEnv?.ELANOUS_ROLE_LLM_AUDIT).toBe(pin);
+  expect(spawnedEnv?.ELANOUS_RUN_ID).toBe('run-parent-role-glm');
+});
+
+test('TA-PARENT-ROLE-LLM: remote parent script preserves the role pin without changing host config', () => {
+  const pin = '{"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+  const script = remoteLaunchScript({ host: 'node-b', cwd: '/srv/elanous' }, ['harness', 'say', '--merge-by-host', 'goal'],
+    { ELANOUS_RUN_ID: 'run-parent-role-glm', ELANOUS_ROLE_LLM_AUDIT: pin });
+  expect(script).toContain(`ELANOUS_ROLE_LLM_AUDIT='${pin}'`);
+  expect(script).toContain('ELANOUS_STATE_DIR="$HOME"/.elanous');
+  expect(script).toContain('--no-auto-merge');
 });
 
 test('tasks hand --tier persists dispatch difficulty without changing the launch model', async () => {
@@ -1469,6 +1615,279 @@ test('abandonedDraftReleaseNote — PR 없는 포기 카드는 null', () => {
   }
 });
 
+// DRAFT-CLAIM-AUTO-2-FU — draft 재claim 방지 · 만료 재claim · 손 수확 claim 을 «생산 진입점 handDraftClaim» 로 왕복시킨다:
+// 관측 포트(gh)가 관측한 PR 정보를 돌려주면 배선이 draftClaim 을 «조립해» handTask 에 넘긴다 — 시험은 포트만 몽크한다(draftClaim 직접 주입 금지).
+// 무대: mock 시나리오(격리 임시 상태 파일 = 카드 원장 + 주입 리뷰 러너) — 실 gh 호출은 하지 않는다.
+const DRAFT_NOW = new Date('2026-10-17T03:00:00.000Z');
+const DRAFT_HEAD = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+
+function draftOwnerCard(id: string, overrides: Partial<TaskCard> = {}): TaskCard {
+  return { id, text: 'draft', createdAt: '2026-10-10T00:00:00Z', status: 'launched', history: [],
+    seat: 'UX', runId: `run-${id}`, pr: { number: 19 }, ...overrides };
+}
+
+function draftReview(stdout: Record<string, unknown>, exitCode: number | null = 0): () => Promise<{ stdout: string; exitCode: number | null }> {
+  return async () => ({ stdout: JSON.stringify(stdout), exitCode });
+}
+
+/** 생산 배선이 쓸 gh 포트의 가짜 — 관측(라벨·갱신 시각)을 정해 주고 게시를 posted 에 기록한다. */
+function draftGhPorts(observed: { labels?: string[]; updatedAt?: string }, posted: string[] = []): DraftClaimGhPorts {
+  return {
+    observePr: async () => ({ labels: observed.labels ?? ['elanous:running'], ...(observed.updatedAt !== undefined ? { updatedAt: observed.updatedAt } : {}) }),
+    postComment: async (pr: number, body: string) => {
+      const where = `comment-${pr}-${posted.length + 1}`;
+      posted.push(`${where}: ${body}`);
+      return where;
+    },
+  };
+}
+
+test('DRAFT-CLAIM-AUTO-2-FU — 같은 PR 을 두 카드가 쥐고 있으면 생산 배선이 claim 을 거부하고 카드를 쓰지 않는다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-a'), draftOwnerCard('ta-owner-b')]);
+  const posted: string[] = [];
+  let thrown: unknown;
+  try {
+    await handDraftClaim({ id: 'ta-draft-dup', text: 'draft #19 회수', statePath: path, now: () => DRAFT_NOW,
+      pr: 19, gh: draftGhPorts({ updatedAt: '2026-10-17T02:30:00.000Z' }, posted) });
+  } catch (error) { thrown = error; }
+  expect(thrown).toBeInstanceOf(TaskDraftClaimRejectedError);
+  expect((thrown as Error).message).toContain('duplicate-claim: ta-owner-a, ta-owner-b');
+  expect(readTaskCard('ta-draft-dup', path)).toBeUndefined();
+  expect(posted).toEqual([]);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 살아 있는 claim 을 다른 카드가 쥐고 있으면 생산 배선이 재claim 을 거부한다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-live')]);
+  const posted: string[] = [];
+  const gh = draftGhPorts({ updatedAt: '2026-10-17T02:30:00.000Z' }, posted);
+  await expect(handDraftClaim({ id: 'ta-draft-busy', text: 'draft #19 회수', statePath: path, now: () => DRAFT_NOW,
+    pr: 19, gh })).rejects.toThrow(TaskDraftClaimRejectedError);
+  expect(readTaskCard('ta-draft-busy', path)).toBeUndefined();
+  expect(posted).toEqual([]);
+  // 같은 카드가 «자기» claim 을 다시 잡는 것은 중복이 아니다. shadow 는 외부 댓글을 게시하지 않는다.
+  const same = await handDraftClaim({ id: 'ta-owner-live', text: 'draft #19 회수', statePath: path, seat: 'UX', now: () => DRAFT_NOW,
+    pr: 19, gh });
+  expect(same.card.draftClaim).toMatchObject({ pr: 19, reclaim: false, body: `🔧 처리 중 — owner UX · 2026-10-17T03:00:00.000Z` });
+  expect(posted).toEqual([]);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 만료된 claim 은 재claim 문면을 기록하며 shadow 에서는 댓글을 게시하지 않는다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-old')]);
+  const posted: string[] = [];
+  const { card } = await handDraftClaim({ id: 'ta-draft-reclaim', text: 'draft #19 회수', statePath: path, seat: 'UX', now: () => DRAFT_NOW,
+    pr: 19, gh: draftGhPorts({ updatedAt: '2026-10-16T12:00:00.000Z' }, posted) });
+  expect(card.draftClaim).toEqual({
+    pr: 19, at: '2026-10-17T03:00:00.000Z', reclaim: true, ownerId: 'ta-owner-old', mode: 'shadow',
+    body: '🔧 처리 중 — owner UX · 2026-10-17T03:00:00.000Z · 만료 claim 재claim — 자동',
+  });
+  expect(posted).toEqual([]);
+  expect(readTaskCard('ta-draft-reclaim', path)?.draftClaim?.postedTo).toBeUndefined();
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 손 수확이 머리를 확정하지 못하면 생산 배선은 claim 문면을 만들지 않고 사유만 남긴다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-stale')]);
+  const posted: string[] = [];
+  const { card } = await handDraftClaim({ id: 'ta-draft-stale', text: 'draft #19 회수', statePath: path, now: () => DRAFT_NOW,
+    pr: 19, gh: draftGhPorts({ updatedAt: '2026-10-16T12:00:00.000Z' }, posted),
+    harvest: { expectedHead: DRAFT_HEAD, invokeReview: draftReview({
+      pr: 19, reviewed: true, headCommit: DRAFT_HEAD, currentHeadCommit: 'b1b2c3d4e5f60718293a4b5c6d7e8f9012345678',
+      verdict: 'pass', mustFix: [],
+    }) } });
+  expect(card.draftClaim).toEqual({ pr: 19, at: '2026-10-17T03:00:00.000Z', reclaim: false,
+    harvest: { outcome: 'needs-human', reason: 'review head is stale or differs from expected head' } });
+  expect(card.draftClaim?.body).toBeUndefined();
+  expect(card.draftClaim?.ownerId).toBeUndefined();
+  expect(posted).toEqual([]);
+  expect(readTaskCard('ta-draft-stale', path)?.draftClaim).toEqual(card.draftClaim);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 손 수확이 머리를 확정하면 만료 claim 을 수확 증거와 함께 기록한다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-harvest')]);
+  const invoked: Array<{ pr: string; intent: string }> = [];
+  const posted: string[] = [];
+  const { card } = await handDraftClaim({ id: 'ta-draft-harvest', text: 'draft #19 수확', statePath: path, seat: 'UX', now: () => DRAFT_NOW,
+    pr: 19, gh: draftGhPorts({ updatedAt: '2026-10-16T12:00:00.000Z' }, posted),
+    harvest: { expectedHead: DRAFT_HEAD, reviewIntent: 'draft #19 수확',
+      invokeReview: async (args) => {
+        invoked.push(args);
+        return { stdout: JSON.stringify({ pr: 19, reviewed: true, headCommit: DRAFT_HEAD, currentHeadCommit: DRAFT_HEAD,
+          verdict: 'pass', mustFix: [] }), exitCode: 0 };
+      } } });
+  expect(invoked).toEqual([{ pr: '19', intent: 'draft #19 수확' }]);
+  expect(card.draftClaim).toEqual({
+    pr: 19, at: '2026-10-17T03:00:00.000Z', reclaim: true, ownerId: 'ta-owner-harvest', mode: 'shadow',
+    body: '🔧 처리 중 — owner UX · 2026-10-17T03:00:00.000Z · 만료 claim 재claim — 자동',
+    harvest: { outcome: 'done', headCommit: DRAFT_HEAD },
+  });
+  expect(posted).toEqual([]);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — draftClaim 을 안 주면 손은 종전과 똑같이 claim 없이 카드를 쓴다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-plain')]);
+  const { card } = await handTask({ id: 'ta-draft-plain', text: 'draft 회수 없는 손', statePath: path, now: () => DRAFT_NOW });
+  expect(card.draftClaim).toBeUndefined();
+  expect('draftClaim' in (readTaskCard('ta-draft-plain', path) ?? {})).toBe(false);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 연속된 손 호출이 «같은» draft 를 다시 claim 하지 못한다(카드에 남은 claim 기록 가드)', async () => {
+  const path = statePath();
+  writeTaskCards(path, []);
+  const posted: string[] = [];
+  const gh = draftGhPorts({ labels: ['elanous:harvestable'] }, posted);
+  // 생산 경로: live 손이 claim 을 예약하고 게시한다.
+  const first = await handDraftClaim({ id: 'ta-draft-first', text: 'draft #19 회수', statePath: path, seat: 'UX', now: () => DRAFT_NOW,
+    pr: 19, gh, live: true, launcher: (_args, _cwd, context) => ({ runId: context!.runId }) });
+  expect(first.card.draftClaim).toMatchObject({ pr: 19, reclaim: false, mode: 'live', postedTo: 'comment-19-1' });
+  expect(posted).toHaveLength(1);
+  // 같은 draft 를 «다른» 카드가 다시 claim 하면 살아 있는 claim 기록이 거부한다 — 댓글도 두 번 게시하지 않는다.
+  let thrown: unknown;
+  try {
+    await handDraftClaim({ id: 'ta-draft-second', text: 'draft #19 회수', statePath: path, seat: 'UX', now: () => DRAFT_NOW,
+      pr: 19, gh });
+  } catch (error) { thrown = error; }
+  expect(thrown).toBeInstanceOf(TaskDraftClaimRejectedError);
+  expect((thrown as Error).message).toContain('duplicate-claim: 카드 ta-draft-first 가 PR #19 의 claim 기록을 쥐고 있다');
+  expect(readTaskCard('ta-draft-second', path)).toBeUndefined();
+  expect(posted).toHaveLength(1);
+});
+
+// DRAFT-CLAIM-AUTO-2-FU — 생산 배선 CLI 왕복: `tasks hand --draft-claim <pr>` 인자에서 handDraftClaim → handTask →
+// resolveHandDraftClaim → runHarvestUnit 까지 «생산 호출 경로»로 지나간다. 시험은 gh·리뷰 포트만 몽크한다 —
+// draftClaim·harvest 를 직접 주입하지 않는다(배선이 관측한 PR 정보로 조립한다).
+const STALE_HEAD = 'b1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+
+/** 생산 배선 CLI 왕복이 쓸 gh·리뷰 포트의 가짜 — 관측(머리)·게시·리뷰 러너를 정해 주고 호출을 seen 에 기록한다. */
+function draftCliGhPorts(observed: { head?: string; review?: { headCommit: string; currentHeadCommit: string } }, seen: { invoked: Array<{ pr: string; intent: string }>; posted: string[] }): DraftClaimGhPorts {
+  return {
+    observePr: async () => ({ labels: ['elanous:harvestable'], ...(observed.head !== undefined ? { head: observed.head } : {}) }),
+    postComment: async (pr: number, body: string) => {
+      const where = `comment-${pr}-${seen.posted.length + 1}`;
+      seen.posted.push(`${where}: ${body}`);
+      return where;
+    },
+    ...(observed.review !== undefined ? { runReview: async (args: { pr: string; intent: string }) => {
+      seen.invoked.push(args);
+      return { stdout: JSON.stringify({ pr: 19, reviewed: true, headCommit: observed.review!.headCommit,
+        currentHeadCommit: observed.review!.currentHeadCommit, verdict: 'pass', mustFix: [] }), exitCode: 0 };
+    } } : {}),
+  };
+}
+
+test('DRAFT-CLAIM-AUTO-2-FU — 생산 배선 CLI 왕복: --draft-claim 은 관측한 머리로 손 수확을 조립해 리뷰를 부르고 두 번째 claim 은 거부한다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-cli')]);
+  const seen = { invoked: [] as Array<{ pr: string; intent: string }>, posted: [] as string[] };
+  const gh = draftCliGhPorts({ head: DRAFT_HEAD, review: { headCommit: DRAFT_HEAD, currentHeadCommit: DRAFT_HEAD } }, seen);
+  // ① 첫 손 — CLI 인자 → handDraftClaim → handTask: 관측한 PR 정보로 손 수확(expectedHead ⊕ 리뷰 러너)이 조립된다.
+  const first = await cli(['task', 'hand', 'draft #19 수확', '--seat', 'UX', '--draft-claim', '19', '--live', '--json'], {
+    taskStatePath: path, draftClaimGh: gh,
+    taskLauncher: (_args, _cwd, context) => ({ runId: context!.runId }),
+  });
+  expect(first.code ?? 0).toBe(0);
+  const firstCard = (JSON.parse(first.lines[0]!) as { card: TaskCard }).card;
+  expect(seen.invoked).toEqual([{ pr: '19', intent: 'draft #19 수확' }]);
+  expect(firstCard.draftClaim).toMatchObject({ pr: 19, reclaim: false, ownerId: 'ta-owner-cli',
+    postedTo: 'comment-19-1', harvest: { outcome: 'done', headCommit: DRAFT_HEAD } });
+  expect(firstCard.draftClaim?.body).toContain('🔧 처리 중 — owner UX');
+  expect(seen.posted).toEqual([`comment-19-1: ${firstCard.draftClaim?.body}`]);
+  expect(readTaskCard(firstCard.id, path)?.draftClaim).toEqual(firstCard.draftClaim);
+  // ② 두 번째 손 — 같은 draft 를 다른 카드가 다시 잡으면 카드를 쓰기 «전»에 거부한다(댓글도 두 번 게시하지 않는다).
+  const second = await cli(['task', 'hand', 'draft #19 재수확', '--seat', 'UX', '--draft-claim', '19', '--json'], { taskStatePath: path, draftClaimGh: gh });
+  expect(second.code).toBe(1);
+  expect(second.lines.join('\n')).toContain(`duplicate-claim: 카드 ${firstCard.id} 가 PR #19 의 claim 기록을 쥐고 있다`);
+  expect(seen.invoked.map((entry) => entry.pr)).toEqual(['19', '19']); // 수확(리뷰)은 돌고 claim 판정에서 막힌다
+  expect(seen.posted).toHaveLength(1);
+  expect(Object.keys(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(path).tasks)).toEqual(['ta-owner-cli', firstCard.id]);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 생산 배선 CLI: 관측한 머리와 리뷰 머리가 어긋나면 수확이 성립하지 않아 claim 문면·PR 댓글이 없다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-cli-stale')]);
+  const seen = { invoked: [] as Array<{ pr: string; intent: string }>, posted: [] as string[] };
+  const gh = draftCliGhPorts({ head: DRAFT_HEAD, review: { headCommit: DRAFT_HEAD, currentHeadCommit: STALE_HEAD } }, seen);
+  const hand = await cli(['task', 'hand', 'draft #19 수확', '--seat', 'UX', '--draft-claim', '19', '--json'], { taskStatePath: path, draftClaimGh: gh });
+  expect(hand.code ?? 0).toBe(0);
+  const card = (JSON.parse(hand.lines[0]!) as { card: TaskCard }).card;
+  expect(seen.invoked).toEqual([{ pr: '19', intent: 'draft #19 수확' }]);
+  expect(card.draftClaim).toMatchObject({ pr: 19, reclaim: false,
+    harvest: { outcome: 'needs-human', reason: 'review head is stale or differs from expected head' } });
+  expect(card.draftClaim?.body).toBeUndefined();
+  expect(card.draftClaim?.postedTo).toBeUndefined();
+  expect(seen.posted).toEqual([]);
+  expect(readTaskCard(card.id, path)?.draftClaim).toEqual(card.draftClaim);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 생산 배선 CLI: 리뷰 러너가 없는 포트는 수확 없이 claim 문면만 shadow 카드에 기록한다', async () => {
+  const path = statePath();
+  writeTaskCards(path, [draftOwnerCard('ta-owner-cli-plain')]);
+  const seen = { invoked: [] as Array<{ pr: string; intent: string }>, posted: [] as string[] };
+  const gh = draftCliGhPorts({ head: DRAFT_HEAD }, seen);
+  const hand = await cli(['task', 'hand', 'draft #19 회수', '--seat', 'UX', '--draft-claim', '19', '--json'], { taskStatePath: path, draftClaimGh: gh });
+  expect(hand.code ?? 0).toBe(0);
+  const card = (JSON.parse(hand.lines[0]!) as { card: TaskCard }).card;
+  expect(seen.invoked).toEqual([]);
+  expect(card.draftClaim).toMatchObject({ pr: 19, reclaim: false, ownerId: 'ta-owner-cli-plain' });
+  expect(card.draftClaim?.harvest).toBeUndefined();
+  expect(seen.posted).toEqual([]);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — live 는 카드 기록 뒤에만 PR 댓글을 게시한다', async () => {
+  const path = statePath();
+  const posted: string[] = [];
+  const gh = draftGhPorts({ labels: ['elanous:harvestable'] }, posted);
+  const result = await handDraftClaim({ id: 'ta-draft-live', text: 'draft #19 회수', statePath: path,
+    now: () => DRAFT_NOW, pr: 19, gh, live: true,
+    launcher: (_args, _cwd, context) => ({ runId: context!.runId }) });
+  expect(result.card.draftClaim?.postedTo).toBe('comment-19-1');
+  expect(readTaskCard(result.card.id, path)?.draftClaim?.postedTo).toBe('comment-19-1');
+  expect(posted).toHaveLength(1);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 동시 두 손은 한 PR 을 하나만 claim 한다', async () => {
+  const path = statePath();
+  const gh = draftGhPorts({ labels: ['elanous:harvestable'] });
+  const results = await Promise.allSettled(['ta-draft-race-a', 'ta-draft-race-b'].map((id) =>
+    handDraftClaim({ id, text: 'draft #19 회수', statePath: path, now: () => DRAFT_NOW, pr: 19, gh,
+      live: true, launcher: (_args, _cwd, context) => ({ runId: context!.runId }) })));
+  expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+  expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+  const cards = Object.values(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(path).tasks);
+  expect(cards.filter((card) => card.draftClaim?.body !== undefined)).toHaveLength(1);
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — shadow 기록은 뒤이은 live claim 을 막지 않는다', async () => {
+  const path = statePath();
+  const gh = draftGhPorts({ labels: ['elanous:harvestable'] });
+  const shadow = await handDraftClaim({ id: 'ta-shadow-claim', text: 'draft #19 회수', statePath: path,
+    now: () => DRAFT_NOW, pr: 19, gh, cardFields: { pr: 19, goalId: 'goal-x' } });
+  expect(shadow.card.draftClaim?.mode).toBe('shadow');
+  expect(readTaskCard(shadow.card.id, path)).toMatchObject({ pr: 19, goalId: 'goal-x' });
+  const live = await handDraftClaim({ id: 'ta-live-after-shadow', text: 'draft #19 회수', statePath: path,
+    now: () => DRAFT_NOW, pr: 19, gh, live: true,
+    launcher: (_args, _cwd, context) => ({ runId: context!.runId }) });
+  expect(live.card.draftClaim?.mode).toBe('live');
+  expect(live.card.draftClaim?.postedTo).toBe('comment-19-1');
+});
+
+test('DRAFT-CLAIM-AUTO-2-FU — 댓글 게시 실패는 live 예약을 풀어 다음 손이 다시 잡게 한다', async () => {
+  const path = statePath();
+  const gh = draftGhPorts({ labels: ['elanous:harvestable'] });
+  gh.postComment = async () => { throw new Error('comment unavailable'); };
+  await expect(handDraftClaim({ id: 'ta-post-fail', text: 'draft #19 회수', statePath: path,
+    now: () => DRAFT_NOW, pr: 19, gh, live: true,
+    launcher: (_args, _cwd, context) => ({ runId: context!.runId }) })).rejects.toThrow('comment unavailable');
+  expect(readTaskCard('ta-post-fail', path)?.draftClaim?.body).toBeUndefined();
+  const retry = await handDraftClaim({ id: 'ta-post-retry', text: 'draft #19 회수', statePath: path,
+    now: () => DRAFT_NOW, pr: 19, gh });
+  expect(retry.card.draftClaim?.body).toContain('처리 중');
+});
+
 // ── TIER-SPLIT-BEFORE-LAUNCH (0.2.35 P0) — 상·특 hand 는 분해해 중 이하 조각으로 발사한다 ──
 import { decomposeToTierSizedSlices } from '../self-implement/goal-author-decompose.js';
 import { composeSliceHandText, DEFAULT_TIER_SIZED_DECOMPOSE, handTaskWithTierSplit, planTierSplit, type TierSizedDecompose, type SizedSlice } from './tier-split.js';
@@ -1505,11 +1924,196 @@ test('TIER-SPLIT planTierSplit: 이유 없는 상 조각 · ok:false · 빈 조�
   expect(DEFAULT_TIER_SIZED_DECOMPOSE).toBe(decomposeToTierSizedSlices);
 });
 
+test('TIER-HIGH-UNAVOIDABLE-MIN counts accepted high slices and reasons in the tier-split event', async () => {
+  const h = tierSplitHarness();
+  const base = { text: liveGoal('대상 경로: src/a.ts · src/b.ts\n상 덩어리'), tier: '상' as const,
+    live: true, statePath: h.path, launcher: h.deps.taskLauncher! };
+  try {
+    await handTaskWithTierSplit({ ...base, decompose: async () => ({ ok: true, redecomposed: 0, slices: [
+      slice('a', '중'), slice('b', '상', { unavoidable: '한 트랜잭션 경계' }),
+    ] }) });
+    expect(h.records.at(-1)).toMatchObject({ outcome: 'split', totalSlices: 2, highSlices: 1,
+      unavoidableCount: 1, unavoidableReasons: ['한 트랜잭션 경계'] });
+    await handTaskWithTierSplit({ ...base, decompose: async () => ({ ok: true, redecomposed: 0, slices: [slice('bad', '상')] }) });
+    expect(h.records.at(-1)).toMatchObject({ outcome: 'blocked', totalSlices: 0, highSlices: 0,
+      unavoidableCount: 0, unavoidableReasons: [], countScope: 'accepted-slices' });
+    await handTaskWithTierSplit({ ...base, decompose: undefined });
+    expect(h.records.at(-1)).toMatchObject({ outcome: 'whole', totalSlices: 0, highSlices: 0,
+      unavoidableCount: 0, unavoidableReasons: [], countScope: 'accepted-slices' });
+  } finally { h.off(); }
+});
+
+test('TIER-SPLIT decomposer receives the same absolute project target as handTask', async () => {
+  const h = tierSplitHarness();
+  let decomposedRoot: string | undefined;
+  try {
+    const out = await handTaskWithTierSplit({ text: liveGoal('대상 경로: src/a.ts\n상 덩어리'), tier: '상', live: true,
+      project: { id: 'repo', target: 'src' }, statePath: h.path, launcher: h.deps.taskLauncher!,
+      decompose: async (_goal, opts) => {
+        decomposedRoot = opts?.repositoryRoot;
+        return { ok: false, reason: 'fixture-stop-before-launch' };
+      } });
+    expect(out.kind).toBe('blocked');
+    if (out.kind !== 'blocked') return;
+    expect(decomposedRoot).toBe(resolve('src'));
+    expect(out.result.card.project?.target).toBe(decomposedRoot);
+    expect(h.calls).toHaveLength(0);
+  } finally { h.off(); }
+});
+
+test('TIER-SPLIT without a project leaves target device inventory unmeasured', async () => {
+  const h = tierSplitHarness();
+  let decomposedRoot: string | undefined = 'not-called';
+  try {
+    const out = await handTaskWithTierSplit({ text: liveGoal('대상 경로: src/a.ts\n상 덩어리'), tier: '상', live: true,
+      statePath: h.path, launcher: h.deps.taskLauncher!,
+      decompose: async (_goal, opts) => {
+        decomposedRoot = opts?.repositoryRoot;
+        return { ok: false, reason: 'fixture-stop-before-launch' };
+      } });
+    expect(out.kind).toBe('blocked');
+    expect(decomposedRoot).toBeUndefined();
+    expect(h.calls).toHaveLength(0);
+  } finally { h.off(); }
+});
+
+test('DEVICE-FIRST tier split launches only the device test and records a landing dependency for features', async () => {
+  const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [
+    slice('device', '하', { deviceFirst: 'device-test' }),
+    slice('feature', '하', { deviceFirst: 'feature' }),
+  ] }));
+  try {
+    const { lines, code } = await cli(['task', 'hand', liveGoal('대상 경로: src/device.ts · src/feature.ts\n장치 우선'), '--tier', '상', '--live', '--json'], h.deps);
+    expect(code ?? 0).toBe(0);
+    expect(h.calls).toHaveLength(1);
+    const output = JSON.parse(lines[0]!) as { group: string; slices: Array<{ result: { card: TaskCard; launched: boolean } }> };
+    const first = readTaskCard(output.slices[0]!.result.card.id, h.path)!;
+    const feature = readTaskCard(output.slices[1]!.result.card.id, h.path)!;
+    expect(first.status).toBe('launched');
+    expect(feature).toMatchObject({ status: 'handed', mission: output.group, after: [first.id] });
+    expect(nextMoveFor(feature).kind).toBe('wait');
+    expect(output.slices[1]!.result.launched).toBe(false);
+    expect(readTaskCard(output.group, h.path)?.pieces).toEqual([first.id, feature.id]);
+  } finally { h.off(); }
+});
+
+test('DEVICE-FIRST first launch failure marks the mission failed and leaves features unlaunched', async () => {
+  const h = tierSplitHarness();
+  try {
+    const out = await handTaskWithTierSplit({ text: liveGoal('대상 경로: src/device.ts · src/feature.ts\n장치 우선'), tier: '상', live: true,
+      statePath: h.path, launcher: () => { throw new Error('fixture launch failed'); },
+      decompose: async () => ({ ok: true, redecomposed: 0, slices: [
+        slice('device', '하', { deviceFirst: 'device-test' }),
+        slice('feature', '하', { deviceFirst: 'feature' }),
+      ] }) });
+    expect(out.kind).toBe('split');
+    if (out.kind !== 'split') return;
+    const mission = readTaskCard(out.group, h.path)!;
+    const feature = readTaskCard(mission.pieces![1]!, h.path)!;
+    expect(mission.status).toBe('failed');
+    expect(mission.history.at(-1)?.event).toBe('device-first-launch-failed');
+    expect(feature).toMatchObject({ status: 'handed', after: [mission.pieces![0]!] });
+    expect(out.slices[1]?.result?.launched).toBe(false);
+  } finally { h.off(); }
+});
+
+test('DEVICE-FIRST invalid stage remains blocked with reason even when composition is unavailable', async () => {
+  for (const [name, slices, reason] of [
+    ['missing', [slice('feature', '하', { deviceFirst: 'feature' })], 'device-first-stage-missing'],
+    ['misordered', [slice('feature', '하', { deviceFirst: 'feature' }), slice('device', '하', { deviceFirst: 'device-test' })], 'device-first-order-invalid'],
+  ] as const) {
+    const h = tierSplitHarness();
+    try {
+      const out = await handTaskWithTierSplit({ text: liveGoal(`대상 경로: src/${name}.ts\n장치 우선`), tier: '상', live: true,
+        statePath: h.path, launcher: h.deps.taskLauncher!, compositionRoot: join(mkdtempSync(join(tmpdir(), 'missing-composition-')), 'absent'),
+        decompose: async () => ({ ok: true, redecomposed: 0, slices: [...slices] }) });
+      expect(out).toMatchObject({ kind: 'blocked', reason, result: { launched: false, card: { status: 'failed' } } });
+      if (out.kind === 'blocked') expect(out.result.card.history.at(-1)?.detail).toContain(reason);
+      expect(h.calls).toHaveLength(0);
+    } finally { h.off(); }
+  }
+});
+
+test('DEVICE-FIRST blocked live hand records the tier failure before goal boundary preflight', async () => {
+  const h = tierSplitHarness();
+  try {
+    const out = await handTask({ text: '대상 경로: src/device.ts\n장치 우선', completion: 'code-pr', live: true,
+      statePath: h.path, launcher: h.deps.taskLauncher!, preflightGoalDoneBoundary: true,
+      tierSplitBlocked: 'device-first-stage-missing' });
+    expect(out.launched).toBe(false);
+    expect(out.card.status).toBe('failed');
+    expect(out.card.history.at(-1)?.detail).toContain('device-first-stage-missing');
+    expect(out.card.history[0]?.event).toBe('tier-split-failed');
+    expect(out.card.composition?.file).toBe('graphs/work/code-pr.yaml');
+    expect(out.move.kind).toBe('wait');
+    expect(h.calls).toHaveLength(0);
+  } finally { h.off(); }
+});
+
+test('DEVICE-FIRST feature launch waits for the device PR to merge', async () => {
+  const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [
+    slice('device', '하', { deviceFirst: 'device-test' }),
+    slice('feature', '하', { deviceFirst: 'feature' }),
+  ] }));
+  try {
+    const pin = 'classify={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+    const { lines, code } = await cli(['task', 'hand', liveGoal('대상 경로: src/device.ts · src/feature.ts\n장치 우선'), '--tier', '상', '--role-llm', pin, '--live', '--json'], h.deps);
+    expect(code ?? 0).toBe(0);
+    const output = JSON.parse(lines[0]!) as { group: string; slices: Array<{ result: { card: TaskCard } }> };
+    const firstId = output.slices[0]!.result.card.id;
+    const featureId = output.slices[1]!.result.card.id;
+    expect(readTaskCard(featureId, h.path)?.parentRoleLlm).toEqual([pin]);
+    updateTaskCard(h.path, firstId, (card) => card ? { ...card, pr: 42, refSource: 'manual' } : undefined);
+    const wait = await advanceMission(output.group, { live: true, statePath: h.path, runEvidence: false,
+      readEvidence: async () => 'waiting', launcher: h.deps.taskLauncher });
+    expect(wait.handed).toHaveLength(0);
+    expect(readTaskCard(featureId, h.path)?.status).toBe('handed');
+    const landed = await advanceMission(output.group, { live: true, statePath: h.path, runEvidence: false,
+      readEvidence: async () => 'merged', launcher: h.deps.taskLauncher });
+    expect(landed.handed).toMatchObject([{ pieceId: featureId, launched: true }]);
+    expect(readTaskCard(featureId, h.path)?.status).toBe('launched');
+    expect(readTaskCard(featureId, h.path)?.parentRoleLlm).toEqual([pin]);
+    expect(h.calls).toHaveLength(2);
+  } finally { h.off(); }
+});
+
+test('DEVICE-FIRST mission tick cannot relaunch a first card while its launcher is still running', async () => {
+  const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [
+    slice('device', '하', { deviceFirst: 'device-test' }),
+    slice('feature', '하', { deviceFirst: 'feature' }),
+  ] }));
+  let releaseLaunch!: () => void;
+  let launched!: () => void;
+  const launching = new Promise<void>((resolve) => { launched = resolve; });
+  const release = new Promise<void>((resolve) => { releaseLaunch = resolve; });
+  let calls = 0;
+  h.deps.taskLauncher = async (_args, _cwd, context) => {
+    calls += 1;
+    launched();
+    await release;
+    return { runId: context!.runId };
+  };
+  try {
+    const hand = cli(['task', 'hand', liveGoal('대상 경로: src/device.ts · src/feature.ts\n장치 우선'), '--tier', '상', '--live', '--json'], h.deps);
+    await launching;
+    const tasks = readTaskAgentState<{ tasks: Record<string, TaskCard> }>(h.path).tasks;
+    const mission = Object.values(tasks).find((card) => card.pieces);
+    expect(mission).toBeDefined();
+    const tick = await advanceMission(mission!.id, { live: true, statePath: h.path, runEvidence: false,
+      readEvidence: async () => 'waiting', launcher: h.deps.taskLauncher });
+    expect(tick.handed).toHaveLength(0);
+    expect(calls).toBe(1);
+    releaseLaunch();
+    await hand;
+  } finally { releaseLaunch(); h.off(); }
+});
+
 test('TIER-SPLIT (a) 상 hand → 분해(중 2 · 하 1) → 조각 카드 3장을 각 tier 로 발사 ⊕ tier-split 기록', async () => {
   const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 1, slices: [slice('a', '중', { files: 2, behaviours: 2 }), slice('b', '중'), slice('c', '하')] }));
   try {
     const text = liveGoal('대상 경로: src/a.ts · src/b.ts · src/c.ts\n큰 덩어리');
-    const { lines, code } = await cli(['task', 'hand', text, '--tier', '상', '--live', '--json'], h.deps);
+    const pin = 'audit={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+    const { lines, code } = await cli(['task', 'hand', text, '--tier', '상', '--role-llm', pin, '--live', '--json'], h.deps);
     expect(code).toBe(0);
     expect(h.decomposeCalls).toEqual([text]);
     expect(h.calls).toHaveLength(3);
@@ -1517,13 +2121,16 @@ test('TIER-SPLIT (a) 상 hand → 분해(중 2 · 하 1) → 조각 카드 3장�
     const out = JSON.parse(lines[0]!) as { kind: string; group: string; slices: Array<{ result: { card: TaskCard; launched: boolean } }> };
     expect(out.kind).toBe('split');
     const cards = out.slices.map((s) => readTaskCard(s.result.card.id, h.path)!);
+    expect(cards.map((card) => card.parentRoleLlm)).toEqual([[pin], [pin], [pin]]);
     expect(cards.map((c) => [c.tier, c.status, c.checklistId, c.tierSplit])).toEqual([
       ['중', 'launched', undefined, { group: out.group, fromTier: '상', index: 1, total: 3 }],
       ['중', 'launched', undefined, { group: out.group, fromTier: '상', index: 2, total: 3 }],
       ['하', 'launched', undefined, { group: out.group, fromTier: '상', index: 3, total: 3 }],
     ]);
-    expect(h.records).toEqual([{ cid: null, fromTier: '상', outcome: 'split', group: out.group,
-      slices: [{ tier: '중', files: 2, behaviours: 2 }, { tier: '중', files: 1, behaviours: 1 }, { tier: '하', files: 1, behaviours: 1 }], unavoidable: [] }]);
+    // 계약 칸만 가린다 — substrate·hostId 등 실행 칸 귀속은 환경(enrichDebugRecord)이 덧붙인다.
+    expect(h.records).toMatchObject([{ cid: null, fromTier: '상', outcome: 'split', group: out.group,
+      slices: [{ tier: '중', files: 2, behaviours: 2 }, { tier: '중', files: 1, behaviours: 1 }, { tier: '하', files: 1, behaviours: 1 }], unavoidable: [],
+      countScope: 'accepted-slices', totalSlices: 3, highSlices: 0, unavoidableCount: 0, unavoidableReasons: [] }]);
   } finally { h.off(); }
 });
 
@@ -1542,6 +2149,46 @@ test('TIER-SPLIT (b) 불가피 이유가 붙은 상 조각만 상으로 발사�
   } finally { h.off(); }
 });
 
+// ⭐ 경계 3행 골의 생산 소비자 실증 — 기본 분해기(DEFAULT_TIER_SIZED_DECOMPOSE = decomposeToTierSizedSlices)가
+//   경계 분기에서 크기 메타를 만들지 못하면 ok:false(no sized slices) → 발사 0 · 카드 failed(tier-split-failed).
+//   주입 분해기가 아니라 «실물 기본 seam» 을 태운다(0.2.36 회귀 반증).
+test('TIER-SPLIT 경계 3행 골 → 기본 분해기로 조각 1 발사(발사 1) · 카드 failed 아님', async () => {
+  const h = tierSplitHarness();
+  try {
+    const text = `[UX] 대시보드 로그 창이 비어 보인다 — 원인 측정과 표시 보정
+
+관측: 로그 창이 «0건» 으로 보이지만 저장소에는 행이 있다.
+요구: 표시 경로가 읽는 창과 실제 기록 창을 맞춘다.
+
+- 완료 경계 코드: src/display/log-window.ts · src/display/log-window.test.ts
+- 완료 경계 실물: 빈 상태 화면이 «0건» 대신 «창 밖 N건» 을 적는다 — 시험 무대 = fake-bin logs 창 고정.
+- 완료 경계 증거 명령: bun test src/display/log-window.test.ts
+
+보존 계약: 다른 화면의 기본 동작과 원장 형식은 지금과 같다.`;
+    const out = await handTaskWithTierSplit({ text, tier: '상', live: true,
+      statePath: h.path, launcher: h.deps.taskLauncher! });
+    expect(out.kind).toBe('split');
+    if (out.kind !== 'split') return;
+    expect(out.slices).toHaveLength(1);
+    expect(h.calls).toHaveLength(1); // 발사 1 — 조각 카드 한 장만 쏜다.
+    const first = out.slices[0]!;
+    expect(first.error).toBeUndefined();
+    expect(first.result?.launched).toBe(true);
+    expect(first.result?.card.status).not.toBe('failed');
+    expect(readTaskCard(first.result!.card.id, h.path)?.status).not.toBe('failed');
+    // ⭐ must-fix — 접힌 경계 조각은 device-test 로 분류되지 않는다. 분류가 남으면 «장치 시험 카드»
+    //    미션만 발사되고(outcome: 'device-first-deferred') 기능 카드가 0장이 된다.
+    expect(h.records.at(-1)).toMatchObject({ fromTier: '상', outcome: 'split' });
+    // 발사된 카드 문면 — 구현 지시가 있고 모순 문구(«운영 코드 변경 0»·«선행:»)가 없음을 읽는다.
+    const cardText = readTaskCard(first.result!.card.id, h.path)?.text ?? '';
+    expect(cardText).toInclude('완료 경계 코드');
+    expect(cardText).toInclude('첫 동작(같은 런)');
+    expect(cardText).not.toInclude('운영 코드 변경 0');
+    expect(cardText).not.toInclude('선행:');
+    expect(cardText).not.toInclude('동작: DEVICE-FIRST-STAGE');
+  } finally { h.off(); }
+});
+
 test('TIER-SPLIT (c) 이유 없는 상 조각 → 발사 0 · 카드 failed(tier-split-failed) · 한 덩어리로 쏘지 않는다', async () => {
   const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '상')] }));
   try {
@@ -1553,7 +2200,8 @@ test('TIER-SPLIT (c) 이유 없는 상 조각 → 발사 0 · 카드 failed(tier
     expect(card.tier).toBe('상');
     expect(card.history.at(-1)).toMatchObject({ event: 'tier-split-failed', detail: 'tier-split-failed: unjustified-상-slice: #2' });
     expect(nextMoveFor(card).kind).toBe('wait');
-    expect(h.records).toEqual([{ cid: null, fromTier: '상', outcome: 'blocked', reason: 'unjustified-상-slice: #2', slices: [], unavoidable: [] }]);
+    expect(h.records).toMatchObject([{ cid: null, fromTier: '상', outcome: 'blocked', reason: 'unjustified-상-slice: #2', slices: [], unavoidable: [],
+      countScope: 'accepted-slices', totalSlices: 0, highSlices: 0, unavoidableCount: 0, unavoidableReasons: [] }]);
   } finally { h.off(); }
 });
 
@@ -1570,7 +2218,8 @@ test('TIER-SPLIT (d) 분해 ok:false · throw → 발사 0 · 카드 failed ⊕ 
       expect(lines.join('\n')).toContain(`tier-split-failed — 발사 0 · 카드 failed · ${reason}`);
       const card = readTaskAgentState<{ tasks: Record<string, TaskCard> }>(h.path).tasks;
       expect(Object.values(card).map((c) => [c.status, c.history.at(-1)?.event])).toEqual([['failed', 'tier-split-failed']]);
-      expect(h.records).toEqual([{ cid: null, fromTier: '상', outcome: 'blocked', reason, slices: [], unavoidable: [] }]);
+      expect(h.records).toMatchObject([{ cid: null, fromTier: '상', outcome: 'blocked', reason, slices: [], unavoidable: [],
+        countScope: 'accepted-slices', totalSlices: 0, highSlices: 0, unavoidableCount: 0, unavoidableReasons: [] }]);
     } finally { h.off(); }
   }
 });
@@ -1637,6 +2286,9 @@ test('TIER-SPLIT 조각 문면은 부모 칸의 계약·완료 경계를 물려�
   expect(composed).toContain('- 완료 경계 증거 명령: bun test src/a.test.ts');
   expect(composed).toContain('현재 계약: bun test src/a.test.ts → 0 fail.');
   expect(composed).not.toContain('대상 경로: src/a.ts · src/b.ts');
+  const completeSlice = '대상 경로: src/ux-sim/device.ts · 동작: DEVICE-FIRST-STAGE\n완료 경계 코드: 장치 작성';
+  expect(composeSliceHandText(completeSlice, '완료 경계 코드: 장치 작성',
+    { index: 1, total: 2, fromTier: '상', cid: 'CELL' })).toContain('조각 1/2 — 부모 CELL(상)');
   expect(composeSliceHandText(bare('a').goal, '대상 경로: src/a.ts\n바꿀 것: 셋', { index: 1, total: 1, fromTier: '상', cid: null })).toBe(bare('a').goal);
   const h = tierSplitHarness();
   try {
@@ -1676,7 +2328,8 @@ test('TIER-SPLIT (f) 분해기 미배선(seam undefined 명시) = decomposer-una
       expect(h.calls.map((args) => args.at(-1))).toEqual([text]);
       const card = readTaskCard((JSON.parse(lines[0]!) as { card: TaskCard }).card.id, h.path)!;
       expect([card.status, card.tier, card.tierSplit]).toEqual(['launched', '상', undefined]);
-      expect(h.records).toEqual([{ cid: null, fromTier: '상', outcome: 'whole', reason: 'decomposer-unavailable', slices: [], unavoidable: [] }]);
+      expect(h.records).toMatchObject([{ cid: null, fromTier: '상', outcome: 'whole', reason: 'decomposer-unavailable', slices: [], unavoidable: [],
+        countScope: 'accepted-slices', totalSlices: 0, highSlices: 0, unavoidableCount: 0, unavoidableReasons: [] }]);
     } finally { h.off(); }
   }
 });

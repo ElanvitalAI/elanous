@@ -848,6 +848,39 @@ describe('add-repair-task — rerun seam appends instead of replaces', () => {
 //   대표: 복합 미션이 단일 골로 들어와도 하니스가 스스로 쪼개야 한다.
 //   ⛔ 순수 함수 테스트는 「판정이 옳은가」만 답한다 — 이 절은 «그 답이 실행 경로에 있는가»를 묻는다.
 describe('decompose-and-retry — 단일이 «연합으로 승격»된다', () => {
+  it('supervised split carries the original TA completion boundary into every launched piece', async () => {
+    const original = '완료 경계 코드: src/pod.ts 변경\n완료 경계 실물: bundle 을 clone 해 같은 커밋\n완료 경계 증거 명령: bun test src/pod.test.ts';
+    const launched: string[] = [];
+    let calls = 0;
+    const out = await runSelfOrchestrateCliCommand(
+      { goals: [{ feature: original }], runtime: {}, supervise: { rounds: 1 } },
+      { executeReroute: (async (spec, runtime) => {
+        if (calls++ === 0) return { results: [{ ...jr({ stage: 'pr-opened' }), taskId: 'source-task', feature: original, runId: 'source-run' }], exitCode: 1 };
+        const results = await orchestrateSelfDev({
+          goals: spec.parallel!.goals, parentRequest: runtime.parentRequest, taskCardId: 'ta-split-boundary',
+          spawn: (job) => {
+            launched.push(job.feature);
+            return { address: job.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: { stage: 'worktree-completed', ok: true } }) };
+          },
+        });
+        return { results, exitCode: results.some((result) => result.status === 'failed') ? 1 : 0 };
+      }) as OrchestrateCliDeps['executeReroute'], readProposals: () => ({
+        proposals: new Map([['source-run', { shardId: 'source-run', pieces: [
+          { id: 'red', feature: 'write RED test', dependsOn: [] },
+          { id: 'code', feature: 'implement salvage', dependsOn: [] },
+        ], hotPathOverlaps: [] }]]), goalPlanRevisions: new Map(), scannedFiles: 1,
+        unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/test',
+      }) },
+    );
+    expect(out.ok).toBe(true);
+    expect(launched).toHaveLength(2);
+    for (const feature of launched) {
+      expect(feature).toContain('완료 경계 코드: src/pod.ts 변경');
+      expect(feature).toContain('완료 경계 실물: bundle 을 clone 해 같은 커밋');
+      expect(feature).toContain('완료 경계 증거 명령: bun test src/pod.test.ts');
+    }
+  });
+
   const withProposal = (feature: string) => ({
     taskId: 't1', feature, status: 'done', stage: 'pr-opened',
     decomposeProposal: { pieces: [
@@ -1195,5 +1228,189 @@ describe('resolveOrchestrateStart — 안내와 실행값이 «갈릴 수 없다
     const start = resolveOrchestrateStart({ ...base, explicit: 3 });
     expect(start.concurrency).toBe(3);
     expect(start.announcement).toContain('동시 3');
+  });
+});
+
+describe('SUPERVISOR-SOFTSTOP-HONOR — orchestrate 라운드 경계', () => {
+  // 재현 원장 run-8cf691c5: 첫 Pod si-task-ccaf7244f967-… 가 18:30:25.522Z 에
+  // pr-terminal.stage='soft-stopped' 로 끝났는데 18:30:30.226Z 에 다음 Pod
+  // si-task-fafa2450a530-… 가 발사됐다(cca f→fa fa 순서). 이 가드가 그 «라운드 경계»를 막는다.
+  const soft = { taskId: 'soft', feature: 'soft', status: 'failed', stage: 'soft-stopped',
+    error: { code: 'SELF_IMPL_FAILED', message: 'soft stop honored' } } as SelfDevJobResult;
+  const ordinary = (taskId: string) => ({ taskId, feature: 'f', status: 'failed', stage: 'error',
+    error: { code: 'SELF_IMPL_FAILED', message: "error: cannot lock ref 'refs/remotes/origin/main': is at abc" } } as SelfDevJobResult);
+
+  const tally = (rounds: SelfDevJobResult[][]) => {
+    const calls: { runtime: { resumeFrom?: SelfDevJobResult[]; resumeHold?: string[] } }[] = [];
+    let i = 0;
+    const executeReroute = (async (_spec: unknown, runtime: { resumeFrom?: SelfDevJobResult[]; resumeHold?: string[] }) => {
+      calls.push({ runtime });
+      return { results: rounds[Math.min(i++, rounds.length - 1)]!, exitCode: 1 };
+    }) as OrchestrateCliDeps['executeReroute'];
+    return { calls, executeReroute };
+  };
+
+  const softStopObservations = () => {
+    const seen: { event: string; data: Record<string, unknown> }[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'self-dev.supervisor' && (event === 'human-stopped' || event === 'soft-stop-honored')) seen.push({ event, data });
+    });
+    return { seen, done: () => log.mockRestore() };
+  };
+
+  it('첫 exec 결과의 child stage===soft-stopped — 재발사를 시작하지 않는다 (exec 1 · 다음 Pod 0)', async () => {
+    const cap = tally([[soft]]);
+    const obs = softStopObservations();
+    try {
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'soft' }], runtime: {}, supervise: { rounds: 2 } },
+        { executeReroute: cap.executeReroute },
+      );
+      expect(out.ok).toBe(true);
+      expect(cap.calls.length).toBe(1);                          // ⛔ 두 번째 exec 는 «없다» = 다음 Pod 발사 0
+      expect(cap.calls[0]!.runtime.resumeFrom).toBeUndefined();  // 재개(reuse) 발사도 없다
+      const res = (out as { results?: SelfDevJobResult[] }).results;
+      expect(res).toEqual([soft]);                               // terminal child 결과 보존
+      expect((out as { exitCode?: number }).exitCode).toBe(1);   // 실패 exit semantics 보존
+      expect(obs.seen.map((o) => o.event)).toEqual(['human-stopped', 'soft-stop-honored']);
+      expect(obs.seen.every((o) => o.data.stage === 'soft-stopped')).toBe(true);
+      expect(obs.seen.every((o) => o.data.round === 1)).toBe(true);
+    } finally { obs.done(); }
+  });
+
+  it('후속 라운드 — 첫 exec 정상(재시도), 둘째 exec soft-stopped → 세 번째 호출 0', async () => {
+    const cap = tally([[ordinary('1')], [soft]]);
+    const obs = softStopObservations();
+    try {
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'x' }], runtime: {}, supervise: { rounds: 3, stallRounds: 99 } }, // stall 기본값이 조기 중단하지 않게
+        { executeReroute: cap.executeReroute },
+      );
+      expect(cap.calls.length).toBe(2);                          // 세 번째 exec «없다» (rounds:3 여도)
+      // 두 번째 exec 는 resumeFrom 로 직전 라운드를 이어받는다(goalPlanRevision 보강은 supervisor 몫).
+      const rf = cap.calls[1]!.runtime.resumeFrom;
+      expect(rf?.length).toBe(1);
+      expect(rf![0]!.taskId).toBe('1');
+      expect(rf![0]!.stage).toBe('error');
+      const res = (out as { results?: SelfDevJobResult[] }).results;
+      expect(res?.length).toBe(1);                               // terminal child 결과 보존(soft-stopped)
+      expect(res![0]!.taskId).toBe('soft');
+      expect(res![0]!.stage).toBe('soft-stopped');
+      expect(res![0]!.status).toBe('failed');
+      expect((out as { exitCode?: number }).exitCode).toBe(1);
+      expect(obs.seen.map((o) => o.event)).toEqual(['human-stopped', 'soft-stop-honored']); // 이름 있는 관측 «한 쌍만»(라운드 중복 계상 금지)
+      expect(obs.seen.every((o) => o.data.round === 2)).toBe(true); // «막 끝난» 라운드(2)만 근거
+    } finally { obs.done(); }
+  });
+
+  it('사고 run-8cf691c5 형태 — 한 조각 soft-stopped 뒤 «다른» 조각 재발사도 경계에서 막힌다 (exec 고정 · pair 정확히 1회)', async () => {
+    // 사고 재현: 감독 첫 exec 에 ccaf/fafa 두 조각이 일반 실패하고(fafa 는 여전히 rerunnable),
+    // 두 번째 exec 에 ccaf 가 사람 정지(soft-stopped)로 끝났다. 감독 결정이 fafa 재발사로
+    // rerun 에 재진입해도 — soft-stopped 가 previous 에 있는 이상 이번 invocation 의 추가
+    // exec 는 없다. pair(human-stopped/soft-stop-honored)는 정확히 1회, terminal 결과는 보존.
+    const ccaf = {
+      taskId: 'ccaf',
+      feature: 'cca',
+      status: 'failed',
+      stage: 'error',
+      error: { code: 'SELF_IMPL_FAILED', message: "error: cannot lock ref 'refs/remotes/origin/main': is at abc" },
+    } as unknown as SelfDevJobResult;
+    const fafa = { ...ccaf, taskId: 'fafa', feature: 'faf' };
+    const softCcaf = {
+      ...ccaf,
+      stage: 'soft-stopped',
+      error: { code: 'SELF_IMPL_FAILED', message: 'soft stop honored' },
+    } as unknown as SelfDevJobResult;
+    const cap = tally([[ccaf, fafa], [softCcaf, fafa]]);
+    const obs = softStopObservations();
+    try {
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'cca' }, { feature: 'faf' }], runtime: {}, supervise: { rounds: 4, stallRounds: 2 } },
+        { executeReroute: cap.executeReroute },
+      );
+      expect(out.ok).toBe(true);
+      expect(cap.calls.length).toBe(2); // 세 번째 exec(Pod 발사) 없음 — fafa 재발사 0
+      const res = ((out as { results?: SelfDevJobResult[] }).results ?? []);
+      expect(res.find((r) => r.taskId === 'ccaf')?.stage).toBe('soft-stopped'); // terminal 결과 보존
+      expect(res.find((r) => r.taskId === 'fafa')?.stage).toBe('error');
+      expect(obs.seen.filter((o) => o.event === 'human-stopped')).toHaveLength(1); // named pair 정확히 1회
+      expect(obs.seen.filter((o) => o.event === 'soft-stop-honored')).toHaveLength(1);
+    } finally {
+      obs.done();
+    }
+  });
+
+  it('경계: stage=aborted(marker→terminal stage 손실, run-92ba96a0)는 «사람 정지»가 아니다 — 가드는 soft-stopped 만 존중', async () => {
+    // 재발 E4 정정(2026-10-23): WSL child run-92ba96a0 Pod 7f1b 는 stop-requested marker 가 있었지만
+    // 최종 pr-terminal.stage='aborted'(evidence goal-only-rework-exhausted)였다 — 즉 «soft-stopped 가
+    // 아닌» 신호라서 이 가드의 반례가 아니다(marker→terminal stage 손실은 별건 P0). 그래서 가드는
+    // 의도적으로 stage==='soft-stopped' 에만 반응하고, aborted 는 기존 감독 판정에 그대로 맡긴다.
+    const aborted = { taskId: 'aborted', feature: 'f', status: 'failed', stage: 'aborted',
+      error: { code: 'SELF_IMPL_FAILED', message: 'goal-only-rework-exhausted' } } as SelfDevJobResult;
+    const cap = tally([[ordinary('1')], [aborted], [ordinary('3')]]);
+    const obs = softStopObservations();
+    try {
+      await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'x' }], runtime: {}, supervise: { rounds: 3, stallRounds: 99 } },
+        { executeReroute: cap.executeReroute },
+      );
+      expect(obs.seen).toEqual([]);            // soft-stop 관측 «없음» — aborted 를 사람 정지로 위장하지 않는다
+      expect(cap.calls.length).toBeGreaterThan(1); // aborted 라운드에서 가드로 멈추지 않았다(기존 판정 경로)
+    } finally { obs.done(); }
+  });
+
+  it('일반 실패는 여전히 재시도된다 — soft-stop 관측 없음', async () => {
+    const cap = tally([[ordinary('1')], [ordinary('2')], [ordinary('3')]]);
+    const obs = softStopObservations();
+    try {
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'x' }], runtime: {}, supervise: { rounds: 3, stallRounds: 99 } },
+        { executeReroute: cap.executeReroute },
+      );
+      expect(out.ok).toBe(true);
+      expect(cap.calls.length).toBe(4);                          // 기존 재시도 그대로(첫 런 + 재개 3회 = rounds:3)
+      expect(obs.seen).toEqual([]);                              // 가드가 무관한 실패를 삼키지 않는다
+    } finally { obs.done(); }
+  });
+
+  it('옛 호출의 soft-stopped 는 새 호출을 막지 않는다 — 이번 invocation 결과만 근거', async () => {
+    const stopped = tally([[soft]]);
+    const obs = softStopObservations();
+    try {
+      await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'soft' }], runtime: {}, supervise: { rounds: 2 } },
+        { executeReroute: stopped.executeReroute },
+      );
+      expect(stopped.calls.length).toBe(1);
+      expect(obs.seen.length).toBeGreaterThan(0);
+      // 같은 프로세스에서 «새» invocation — 직전 invocation 의 soft-stopped 가 남아 있어도
+      // 새 작업의 재시도를 막지 않는다(가드는 invocation 로컬, checkpoint 를 읽지 않는다).
+      const fresh = tally([[ordinary('a')], [ordinary('b')]]);
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'x' }], runtime: {}, supervise: { rounds: 2, stallRounds: 99 } },
+        { executeReroute: fresh.executeReroute },
+      );
+      expect(out.ok).toBe(true);
+      expect(fresh.calls.length).toBe(3);                        // 무관한 새 작업이 막히지 않는다(첫 런 + 재개 2회)
+      expect(obs.seen.filter((o) => (o.data.round as number) >= 3)).toEqual([]);
+    } finally { obs.done(); }
+  });
+
+  it('#30482 단일 dev 경로(src/self-dev/dev-cli.ts)와 «다른» 경로다 — orchestrate-cli 라운드 경계만 지킨다', async () => {
+    // 경로 구별: 이 가드는 runSelfOrchestrateCliCommand 의 exec 라운드 경계에서만 작동한다.
+    // dev-cli 의 executeDevSelfRun(honorChildSoftStop, #30482)은 이 모듈을 거치지 않는다 —
+    // 같은 사람-정지 신호를 «다른» supervisor 가 소유한다. 여기선 orchestrate seam 의
+    // 관측 채널(self-dev.supervisor)과 exec 호출 횟수로만 단언한다(dev-cli 은 건드리지 않는다).
+    const cap = tally([[soft]]);
+    const obs = softStopObservations();
+    try {
+      const out = await runSelfOrchestrateCliCommand(
+        { goals: [{ feature: 'soft' }], runtime: {}, supervise: { rounds: 2 } },
+        { executeReroute: cap.executeReroute },
+      );
+      expect(out.ok).toBe(true);
+      expect(cap.calls.length).toBe(1);
+      expect(obs.seen.map((o) => o.event)).toEqual(['human-stopped', 'soft-stop-honored']);
+    } finally { obs.done(); }
   });
 });

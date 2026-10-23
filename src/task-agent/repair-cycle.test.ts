@@ -54,7 +54,7 @@ test('exact review must-fix launches one graph-routed commit-only worker, record
   const first = await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
   expect(first.decision).toBe('repair-requested');
   expect(launches).toHaveLength(1);
-  expect(launches[0]).toMatchObject({ pr: 30, head: A, model: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' } });
+  expect(launches[0]).toMatchObject({ pr: 30, head: A, model: { provider: 'glm', model: 'glm-5.3' } });
   expect(readFileSync(launches[0]!.goalFile, 'utf8')).toContain('fix the broken assertion');
   expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]).toMatchObject({ status: 'requested', fromModel: 'openai-codex/gpt-6-sol' });
   const second = await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
@@ -106,10 +106,15 @@ test('two competing ticks write distinct immutable goal files and only the claim
   expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]?.resultPath).toContain(launched[0]!.runId);
 });
 
-test('worker artifact must match marker before CAS; successful CAS stays on the same PR and awaits new head', async () => {
+test('a receipt arriving after the overdue event still passes artifact checks and CAS on the same PR', async () => {
   const f = fixture();
   const launch: RepairLaunchRequest[] = [];
   await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launch.push(request); } }));
+  const pending = readTaskCard(f.card.id, f.statePath)!;
+  writeTaskCards(f.statePath, [{ ...pending, repairs: pending.repairs!.map((entry) => ({ ...entry,
+    at: new Date(now.getTime() - 4 * 60 * 60_000).toISOString() })) }]);
+  expect((await runRepairCycle(f.input())).decision).toBe('repair-pending');
+  expect(readTaskCard(f.card.id, f.statePath)?.history.some((entry) => entry.event === 'repair-receipt-overdue')).toBe(true);
   const artifactDir = join(f.dir, 'pod-artifacts', 'si-test', 'repair');
   mkdirSync(artifactDir, { recursive: true });
   const result = { pr: 30, baseHead: A, runId: launch[0]!.runId, commit: B, bundleSha256: HASH };
@@ -275,6 +280,79 @@ test('two repair relaunches exhaust the card and notify its owner once', async (
   expect(messages).toHaveLength(1);
 });
 
+test('two applied repairs do not consume the failed-repair convergence budget', async () => {
+  const f = fixture();
+  const repairs: NonNullable<TaskCard['repairs']> = [1, 2].map((n) => ({ pr: 30, head: n === 1 ? A : B,
+    branch: 'feature', at: now.toISOString(), move: 'narrow-relaunch', runId: `run-applied-${n}`,
+    resultPath: join(f.dir, `applied-${n}.json`), fromModel: 'glm/glm-5.3', toModel: 'glm/glm-5.3',
+    status: 'applied' as const, commit: n === 1 ? B : 'd'.repeat(40) }));
+  writeTaskCards(f.statePath, [{ ...f.card, repairs }]);
+  const launches: RepairLaunchRequest[] = [];
+  const result = await runRepairCycle(f.input({ head: 'd'.repeat(40),
+    request: async (item: RepairLaunchRequest) => { launches.push(item); } }));
+  expect(result.decision).toBe('repair-requested');
+  expect(launches).toHaveLength(1);
+  expect(readTaskCard(f.card.id, f.statePath)?.status).toBe('launched');
+});
+
+test('an overdue missing receipt stays requested so a late Pod result can still be collected', async () => {
+  const f = fixture();
+  const runId = 'run-overdue';
+  const repairs: NonNullable<TaskCard['repairs']> = [{ pr: 30, head: A, branch: 'feature',
+    at: new Date(now.getTime() - 4 * 60 * 60_000).toISOString(), move: 'narrow-relaunch', runId,
+    resultPath: join(f.dir, 'late-result.json'), fromModel: 'glm/glm-5.3', toModel: 'glm/glm-5.3', status: 'requested' }];
+  writeTaskCards(f.statePath, [{ ...f.card, repairs }]);
+  const result = await runRepairCycle(f.input());
+  expect(result.decision).toBe('repair-pending');
+  expect(result.reason).toContain('receipt overdue');
+  expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]?.status).toBe('requested');
+  const overdue = readTaskCard(f.card.id, f.statePath)?.history.filter((entry) => entry.event === 'repair-receipt-overdue');
+  expect(overdue).toHaveLength(1);
+  expect(overdue?.[0]).toMatchObject({ runId, resultPath: repairs[0]!.resultPath });
+  await runRepairCycle(f.input());
+  expect(readTaskCard(f.card.id, f.statePath)?.history.filter((entry) => entry.event === 'repair-receipt-overdue')).toHaveLength(1);
+});
+
+test('a six-hour missing receipt alerts its owner once and retries a failed notification', async () => {
+  const f = fixture();
+  const repairs: NonNullable<TaskCard['repairs']> = [{ pr: 30, head: A, branch: 'feature',
+    at: new Date(now.getTime() - 7 * 60 * 60_000).toISOString(), move: 'narrow-relaunch', runId: 'run-alert',
+    resultPath: join(f.dir, 'missing.json'), fromModel: 'glm/glm-5.3', toModel: 'glm/glm-5.3', status: 'requested' }];
+  writeTaskCards(f.statePath, [{ ...f.card, repairs }]);
+  let attempts = 0;
+  const notify = (_seat: string, body: string) => {
+    attempts++;
+    expect(body).toContain(repairs[0]!.resultPath);
+    if (attempts === 1) throw new Error('mail temporarily unavailable');
+  };
+  expect((await runRepairCycle(f.input({ notify }))).decision).toBe('repair-pending');
+  expect(readTaskCard(f.card.id, f.statePath)?.history.at(-1)?.event).toBe('repair-receipt-alert-failed');
+  expect((await runRepairCycle(f.input({ notify }))).decision).toBe('repair-pending');
+  expect(readTaskCard(f.card.id, f.statePath)?.history.at(-1)?.event).toBe('repair-receipt-alert-sent');
+  await runRepairCycle(f.input({ notify }));
+  expect(attempts).toBe(2);
+  expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]?.status).toBe('requested');
+});
+
+test('an interrupted receipt alert claim is retried after ten minutes', async () => {
+  const f = fixture();
+  const runId = 'run-interrupted-alert';
+  const repairs: NonNullable<TaskCard['repairs']> = [{ pr: 30, head: A, branch: 'feature',
+    at: new Date(now.getTime() - 7 * 60 * 60_000).toISOString(), move: 'narrow-relaunch', runId,
+    resultPath: join(f.dir, 'missing.json'), fromModel: 'glm/glm-5.3', toModel: 'glm/glm-5.3', status: 'requested' }];
+  writeTaskCards(f.statePath, [{ ...f.card, repairs, history: [{ at: now.toISOString(), event: 'repair-receipt-alert-claimed',
+    pr: 30, head: A, runId, resultPath: repairs[0]!.resultPath }] }]);
+  let alerts = 0;
+  const notify = () => { alerts++; };
+  await runRepairCycle(f.input({ notify }));
+  expect(alerts).toBe(0);
+  await runRepairCycle(f.input({ now: new Date(now.getTime() + 11 * 60_000), notify }));
+  expect(alerts).toBe(1);
+  expect(readTaskCard(f.card.id, f.statePath)?.history.at(-1)?.event).toBe('repair-receipt-alert-sent');
+  await runRepairCycle(f.input({ now: new Date(now.getTime() + 22 * 60_000), notify }));
+  expect(alerts).toBe(1);
+});
+
 test('exhausted repair notifies the checklist owner when the card seat is absent', async () => {
   const f = fixture();
   const repairs: NonNullable<TaskCard['repairs']> = [1, 2].map((n) => ({ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
@@ -401,22 +479,24 @@ test('repair stays bound to the card source PR when a later tick presents anothe
   expect(readTaskCard(f.card.id, f.statePath)?.repairs).toHaveLength(1);
 });
 
-test('repair model respects tier and measured subscription, without charging Sol for old high cards', () => {
+test('repair model respects tier and measured subscription without reducing GLM capacity on retry', () => {
   const f = fixture();
-  expect(alternateRepairModel(f.card).to.model).toBe('openrouter/z-ai/glm-5.3');
+  expect(alternateRepairModel(f.card).to.model).toBe('glm-5.3');
   expect(alternateRepairModel({ ...f.card, childLlm: undefined })).toEqual({
-    from: 'unknown', to: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' },
+    from: 'unknown', to: { provider: 'glm', model: 'glm-5.3' },
   });
   const afterGlm: TaskCard = { ...f.card, repairs: [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
     move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'openai-codex/gpt-6-sol',
     toModel: 'openrouter/openrouter/z-ai/glm-5.3' }] };
-  expect(alternateRepairModel(afterGlm).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' });
+  expect(alternateRepairModel(afterGlm).to).toEqual({ provider: 'glm', model: 'glm-5.3' });
   expect(alternateRepairModel({ ...afterGlm, tier: '상' }, { codexSubscription: true, grokSubscription: true }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
   expect(alternateRepairModel({ ...afterGlm, tier: '상', pr: 31 }, { codexSubscription: true, grokSubscription: true }).to).toEqual({ provider: 'grok', model: 'grok-4.6' });
   expect(alternateRepairModel({ ...afterGlm, tier: '상' }, { codexSubscription: false, grokSubscription: true }).to).toEqual({ provider: 'grok', model: 'grok-4.6' });
   expect(alternateRepairModel({ ...afterGlm, tier: '특' }, { codexSubscription: false, grokSubscription: false }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
-  expect(alternateRepairModel({ ...afterGlm, tier: '중' }, { codexSubscription: true, grokSubscription: true }).to.model).toBe('openrouter/z-ai/glm-5.3-flash');
-  expect(alternateRepairModel({ ...f.card, tier: '하', childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } }).to.model).toBe('gpt-6-luna');
+  expect(alternateRepairModel({ ...afterGlm, tier: '상', repairs: [{ ...afterGlm.repairs![0]!, toModel: 'openai-codex/gpt-6-sol' }] },
+    { codexSubscription: false, grokSubscription: false }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
+  expect(alternateRepairModel({ ...afterGlm, tier: '중' }, { codexSubscription: true, grokSubscription: true }).to.model).toBe('glm-5.3');
+  expect(alternateRepairModel({ ...f.card, tier: '하', childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } }).to.model).toBe('glm-5.3');
 });
 
 test('live quota inputs gate Sol before repair model selection, including missing and exhausted quota', async () => {
@@ -431,7 +511,7 @@ test('live quota inputs gate Sol before repair model selection, including missin
   const unknown = await repairModelAvailability(async () => ({ ...input,
     codexCandidates: [{ name: 'team' }], grokUsedPercent: undefined }));
   expect(unknown).toEqual({ codexSubscription: false, grokSubscription: false });
-  expect(alternateRepairModel(card, unknown).to.model).toBe('openrouter/z-ai/glm-5.3');
+  expect(alternateRepairModel(card, unknown).to.model).toBe('glm-5.3');
   const unreadable = await repairModelAvailability(async () => { throw new Error('quota source down'); });
   expect(unreadable).toEqual(unknown);
 });
@@ -442,7 +522,7 @@ test('repair cycle reads quota and passes the tier model to the worker request',
   for (const [tier, usedPercent, expected] of [
     ['상', 42, 'gpt-6-sol'],
     ['상', 100, 'grok-4.6'],
-    ['중', 42, 'openrouter/z-ai/glm-5.3-flash'],
+    ['중', 42, 'glm-5.3'],
   ] as const) {
     const f = fixture();
     writeTaskCards(f.statePath, [{ ...f.card, tier, childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' } }]);
@@ -456,27 +536,74 @@ test('repair cycle reads quota and passes the tier model to the worker request',
   }
 });
 
+test('TA-PARENT-ROLE-LLM: card parent policy survives automatic same-PR repair request', async () => {
+  const f = fixture();
+  const pin = 'audit={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+  writeTaskCards(f.statePath, [{ ...f.card, parentRoleLlm: [pin] }]);
+  const launches: RepairLaunchRequest[] = [];
+  const outcome = await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
+  expect(outcome.decision).toBe('repair-requested');
+  expect(launches).toHaveLength(1);
+  expect(launches[0]?.parentRoleLlm).toEqual([pin]);
+  expect(launches[0]?.model).toEqual({ provider: 'glm', model: 'glm-5.3' });
+});
+
 test('tier-less repair cards dispatch as 중 and never charge Sol on even PRs', () => {
   const f = fixture();
   expect(alternateRepairModel(f.card, { codexSubscription: true, grokSubscription: true }).to)
-    .toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+    .toEqual({ provider: 'glm', model: 'glm-5.3' });
   const afterGlm: TaskCard = { ...f.card, repairs: [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
     move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'openai-codex/gpt-6-sol',
     toModel: 'openrouter/openrouter/z-ai/glm-5.3' }] };
   expect(alternateRepairModel(afterGlm, { codexSubscription: true, grokSubscription: true }).to)
-    .toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' });
+    .toEqual({ provider: 'glm', model: 'glm-5.3' });
 });
 
-test('하-tier repairs rotate glm-5.3 → flash → luna, one step up per failure', () => {
+test('하-tier repairs recover old flash attempts with the subscription GLM, never downgrade full GLM', () => {
   const f = fixture();
   const failed = (toModel: string): TaskCard => ({ ...f.card, tier: '하', repairs: [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
     move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'a', toModel }] });
-  expect(alternateRepairModel({ ...f.card, tier: '하' }).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
-  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3')).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' });
-  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3-flash')).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-luna' });
+  expect(alternateRepairModel({ ...f.card, tier: '하' }).to).toEqual({ provider: 'glm', model: 'glm-5.3' });
+  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3')).to).toEqual({ provider: 'glm', model: 'glm-5.3' });
+  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3-flash')).to).toEqual({ provider: 'glm', model: 'glm-5.3' });
   expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3-flash'), { codexSubscription: true, grokSubscription: true }).to)
-    .toEqual({ provider: 'openai-codex', model: 'gpt-6-luna' });
-  expect(alternateRepairModel(failed('openai-codex/gpt-6-luna')).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+    .toEqual({ provider: 'glm', model: 'glm-5.3' });
+  expect(alternateRepairModel(failed('openai-codex/gpt-6-luna')).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-luna' });
+});
+
+test('a failed Sol repair waits for subscription capacity instead of downgrading or consuming an attempt', async () => {
+  const f = fixture();
+  const repairs: NonNullable<TaskCard['repairs']> = [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
+    move: 'narrow-relaunch', runId: 'run-sol', resultPath: join(f.dir, 'sol.json'), status: 'failed',
+    fromModel: 'glm/glm-5.3', toModel: 'openai-codex/gpt-6-sol' }];
+  writeTaskCards(f.statePath, [{ ...f.card, tier: '상', repairs }]);
+  let launches = 0;
+  const result = await runRepairCycle(f.input({ modelAvailability: { codexSubscription: false, grokSubscription: false },
+    liveMoves: new Set(['narrow-relaunch', 'salvage-relaunch', 'alternative']), request: async () => { launches++; } }));
+  expect(result.decision).toBe('would-repair');
+  expect(result.reason).toContain('subscription unavailable');
+  expect(launches).toBe(0);
+  expect(readTaskCard(f.card.id, f.statePath)?.repairs).toHaveLength(1);
+});
+
+test('a subscription deferred repair alerts its owner after six hours and retries a failed alert', async () => {
+  const f = fixture();
+  const repairs: NonNullable<TaskCard['repairs']> = [{ pr: 30, head: A, branch: 'feature',
+    at: new Date(now.getTime() - 7 * 60 * 60_000).toISOString(), move: 'narrow-relaunch', runId: 'run-sol-overdue',
+    resultPath: join(f.dir, 'sol.json'), status: 'failed', fromModel: 'glm/glm-5.3', toModel: 'openai-codex/gpt-6-sol' }];
+  writeTaskCards(f.statePath, [{ ...f.card, tier: '상', repairs }]);
+  let alerts = 0;
+  const notify = () => { if (++alerts === 1) throw new Error('owner inbox unavailable'); };
+  const input = () => f.input({ modelAvailability: { codexSubscription: false, grokSubscription: false },
+    liveMoves: new Set(['narrow-relaunch', 'salvage-relaunch', 'alternative']), notify,
+    request: async () => { throw new Error('must not launch'); } });
+  expect((await runRepairCycle(input())).decision).toBe('would-repair');
+  expect(readTaskCard(f.card.id, f.statePath)?.history.at(-1)?.event).toBe('repair-model-alert-failed');
+  expect((await runRepairCycle(input())).decision).toBe('would-repair');
+  expect(readTaskCard(f.card.id, f.statePath)?.history.at(-1)?.event).toBe('repair-model-alert-sent');
+  await runRepairCycle(input());
+  expect(alerts).toBe(2);
+  expect(readTaskCard(f.card.id, f.statePath)?.repairs).toHaveLength(1);
 });
 
 test('repair launch records the implementation child model as a harness.role-llm event', async () => {

@@ -185,6 +185,17 @@ describe('createSeatAutowake — 배선 판정(H2 호출자)', () => {
     expect(r.calls).toHaveLength(0);
   });
 
+  test('TUI-ORPHAN-AUTO-RESUME-STOP E4: autoheal 을 거친 실패(«자동 회복 1회 실패» 안내 ⊕ «✘ 실패» 꼬리 줄)도 원문 call_id 로 센다', () => {
+    const r = rig();
+    const errorDetail = 'Codex API 400: {"error":{"message":"No tool call found for function call output with call_id call_fake_llm.","type":"invalid_request_error"}}';
+    const footer = '✘ 실패 — 자동 회복 1회 실패  (0s · 🧠 (none))';
+    r.aw.noteTurnEnded({ sessionId: 's1', lastLine: footer, errorDetail });
+    r.aw.noteTurnEnded({ sessionId: 's1', lastLine: footer, errorDetail });
+    expect(r.aw.check()).toMatchObject({ action: 'skip', reason: 'terminal-codex-400' });
+    expect(r.logs.filter(row => row.event === 'terminal')).toHaveLength(1);
+    expect(r.calls).toHaveLength(0);
+  });
+
   test('정상 답변의 동일 API 오류 인용문은 종료로 세지 않는다', () => {
     const r = rig();
     const quoted = 'Codex API 400: No tool call found for function call output with call_id call_same.';

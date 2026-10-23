@@ -178,6 +178,68 @@ describe('decideDraft', () => {
     // Origin labels carry no protection.
     expect(decideDraft({ ...base, draft: { ...base.draft, labels: ['elanous:from-harness'] }, ageHours: 100 }).action).toBe('close');
   });
+  it("DRAFT-ZERO: 명시적 harvest-deferred 표지가 검증된 실패 종료 draft만 {action:'keep', reason:'harvest-deferred'}를 반환하고, 동일 무대의 무표지 harvestable·stale·duplicate·superseded twin은 기존 판정을 유지한다", () => {
+    // 동일 입력 무대 — 같은 칸·같은 실패 종료 run·같은 30h 시계·같은 twin/open 목록; 표지 한 줄만 차이난다.
+    const twin = { number: 90, title: 'marker goal', branch: 'self-impl/markergoal-bbbbbbbb-r90', body: '칸: DRAFT-ZERO' };
+    const newer = { number: 12, title: 'marker goal', branch: 'self-impl/markergoal-cccccccc-r12', createdAt: '2026-10-22T00:00:00Z' };
+    const openDuplicate = { number: 17, title: 'dup goal', branch: 'self-impl/dp-bbbbbbbb-r17', createdAt: '2026-10-22T00:00:00Z' };
+    const decide = (draft: DraftTriagePr, overrides: Partial<DraftTriageInput> = {}) => decideDraft({
+      runStatus: 'failed', mergedTwins: [twin], openDrafts: [newer, openDuplicate],
+      ageHours: 30, liveBranches: new Set(), draft, ...overrides,
+    });
+    const deferred: DraftTriagePr = { number: 11, title: 'marker goal', branch: 'self-impl/markergoal-aaaaaaaa-r11',
+      labels: ['elanous:harvestable'], body: '칸: DRAFT-ZERO\n수확보류: harvest-deferred', createdAt: '2026-10-21T00:00:00Z' };
+    // 검증된 표지 하나 — superseded twin·duplicate·harvestable·24h stale을 모두 이기고, PROTECTED_LABELS 선제 keep보다도 앞선다.
+    expect(decide(deferred)).toEqual({ action: 'keep', reason: 'harvest-deferred' });
+    expect(decide({ ...deferred, labels: ['elanous:harvestable', 'elanous:keep'] })).toEqual({ action: 'keep', reason: 'harvest-deferred' });
+    // 같은 PR/body에서 runStatus만 바꾸면 실패 종료에서만 harvest-deferred 보호가 적용된다.
+    expect(decide(deferred, { runStatus: 'completed' })).toEqual({ action: 'close', reason: 'superseded-by #90' });
+    expect(decide(deferred, { runStatus: 'running' })).toEqual({ action: 'keep', reason: 'live' });
+    expect(decide(deferred, { runStatus: undefined })).toEqual({ action: 'close', reason: 'superseded-by #90' });
+    // 같은 PR에서 표지만 빼면 기존 판정 — superseded twin close.
+    expect(decide({ ...deferred, body: '칸: DRAFT-ZERO' })).toEqual({ action: 'close', reason: 'superseded-by #90' });
+    // 동일 칸의 무표지 harvestable — 기존 stale close (harvestable은 보호 표지가 아니다).
+    expect(decide({ number: 13, title: 'harvest goal', branch: 'self-impl/hv-aaaaaaaa-r13',
+      labels: ['elanous:harvestable'], body: '칸: DRAFT-ZERO', createdAt: '2026-10-21T00:00:00Z' }))
+      .toEqual({ action: 'close', reason: 'stale-ended-run' });
+    // 무표지 stale (run 미관측) — 기존 stale-unobserved close.
+    expect(decide({ number: 15, title: 'stale goal', branch: 'self-impl/st-aaaaaaaa-r15',
+      body: '칸: DRAFT-ZERO', createdAt: '2026-10-21T00:00:00Z' }, { runStatus: undefined }))
+      .toEqual({ action: 'close', reason: 'stale-unobserved' });
+    // 무표지 duplicate — 기존 duplicate-of-open close.
+    expect(decide({ number: 16, title: 'dup goal', branch: 'self-impl/dp-aaaaaaaa-r16',
+      body: '칸: DRAFT-ZERO', createdAt: '2026-10-21T00:00:00Z' }))
+      .toEqual({ action: 'close', reason: 'duplicate-of-open #17' });
+    // 다른 protected label — 기존 keep.
+    expect(decide({ number: 18, title: 'held goal', branch: 'self-impl/hd-aaaaaaaa-r18',
+      labels: ['elanous:keep'], body: '칸: DRAFT-ZERO', createdAt: '2026-10-21T00:00:00Z' }))
+      .toEqual({ action: 'keep', reason: 'label:elanous:keep' });
+  });
+  it('DRAFT-ZERO: 수확보류 표지는 정확한 키·값으로만 검증된다 — 값 불일치·대소문자·충돌·들여쓰기·미기록은 기존 판정을 따른다', () => {
+    // (a)와 같은 무대(표지 PR·twin)에서 표지 바이트만 바꿔 대조한다.
+    const stage = (body: string | undefined): DraftTriageInput => ({
+      draft: { number: 11, title: 'marker goal', branch: 'self-impl/markergoal-aaaaaaaa-r11',
+        labels: ['elanous:harvestable'], body, createdAt: '2026-10-21T00:00:00Z' },
+      runStatus: 'failed', mergedTwins: [{ number: 90, title: 'marker goal',
+        branch: 'self-impl/markergoal-bbbbbbbb-r90', body: '칸: DRAFT-ZERO' }],
+      openDrafts: [], ageHours: 30, liveBranches: new Set(),
+    });
+    for (const body of [
+      '칸: DRAFT-ZERO\n수확보류: harvest-deferred',
+      '칸: DRAFT-ZERO\n수확보류:harvest-deferred',
+      '칸: DRAFT-ZERO\n수확보류:  harvest-deferred  ',
+      '칸: DRAFT-ZERO\n수확보류: harvest-deferred\n수확보류: harvest-deferred',
+    ]) expect(decideDraft(stage(body))).toEqual({ action: 'keep', reason: 'harvest-deferred' });
+    for (const body of [
+      '칸: DRAFT-ZERO',
+      '칸: DRAFT-ZERO\n수확보류: later',
+      '칸: DRAFT-ZERO\n수확보류: HARVEST-DEFERRED',
+      '칸: DRAFT-ZERO\n수확보류: harvest-deferred\n수확보류: later',
+      '칸: DRAFT-ZERO\n  수확보류: harvest-deferred',
+      '칸: DRAFT-ZERO\n수확보류 : harvest-deferred',
+    ]) expect(decideDraft(stage(body))).toEqual({ action: 'close', reason: 'superseded-by #90' });
+    expect(decideDraft(stage(undefined))).toEqual({ action: 'close', reason: 'superseded-by #90' });
+  });
 });
 
 describe('sameGoalPr (TC 10-05 · identifier first, title only with harness stem)', () => {

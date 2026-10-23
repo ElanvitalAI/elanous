@@ -2,11 +2,12 @@
 // The saved version-release output is re-pointed at the new branch tip (fast-forward only, state backed up first), so
 // every later node reads the repaired commit without anyone hand-editing the run state.
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants, copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
-import { lastJsonObject, runGraph, verifyReleaseCommandRoot, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { lastJsonObject, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
@@ -47,7 +48,7 @@ export interface ResumeReleaseOptions {
 export interface ResumeReleasePlan {
   runId: string; version: string; fromNode: string; commandRoot: string; tip: TipRefresh;
   partial: PartialOutcome; gatePlan: { mode: 'not-run' | 'partial' | 'full'; reason?: string };
-  nextAttempt: number; attemptLimit: 2; preflight: 'passed';
+  nextAttempt: number; priorCountKnown: boolean; preflight: 'passed';
 }
 
 /** CLI entry files: a production file that only names one (help text, a goal's command line) does not run it. */
@@ -84,7 +85,7 @@ export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps =
   return refreshReleaseBranchTipInternal(runId, deps, from, waiverCommit, false);
 }
 
-function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps, from: string | undefined, waiverCommit: string | undefined, dryRun: boolean): TipRefresh {
+function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps, from: string | undefined, waiverCommit: string | undefined, dryRun: boolean, expectedTip?: string): TipRefresh {
   const root = deps.root ?? effectiveInstanceRoot();
   const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(runId)}.json`);
   const state = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
@@ -108,6 +109,7 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
   const advertised = git(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0] ?? '';
   if (!/^[0-9a-f]{40}$/i.test(advertised)) throw new Error(`${branch} is not on origin — this run was not cut as a release branch`);
+  if (expectedTip && advertised.toLowerCase() !== expectedTip.toLowerCase()) throw new Error(`${branch} moved during pin preflight (${expectedTip} → ${advertised}) — retry resume`);
   let to: string;
   if (dryRun) {
     // Use the advertised object id directly: a preflight must not create/update local remote-tracking refs.
@@ -150,6 +152,26 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   renameSync(temporary, statePath);
   debug.log('release-loop.resume', 'tip-refreshed', { runId, version, branch, from: recorded, to, backup });
   return { version, branch, from: recorded, to, changed: true, statePath, backup };
+}
+
+/** Check the saved graph and recipes before fetch, backup, or run-ledger writes. */
+function verifyResumeRecipePin(commandRoot: string, snapshot: GraphRunState['graphSnapshot'], version: string): void {
+  try { verifyReleaseRecipeSnapshot(commandRoot, snapshot); }
+  catch (error) {
+    if (!snapshot) throw error;
+    const mismatches: string[] = [];
+    for (const [name, savedSha] of [
+      ['release-loop.yaml', snapshot.graphSha], ['recipes.yaml', snapshot.recipesSha],
+    ] as const) {
+      const file = join(commandRoot, 'graphs', 'release', name);
+      let currentSha: string;
+      try { currentSha = createHash('sha256').update(readFileSync(file)).digest('hex'); }
+      catch { continue; }
+      if (currentSha !== savedSha) mismatches.push(`${file} saved=${savedSha} current=${currentSha}`);
+    }
+    if (!mismatches.length) throw error;
+    throw new Error(`release recipe source differs from saved pin: ${mismatches.join('; ')}\nremedy: start a new pinned run with eln release run --version ${version}`, { cause: error });
+  }
 }
 
 /** GATE-PARTIAL outcome of a resume — applied (plan written) or the reason it fell back to a full gate. `auto` marks the
@@ -318,7 +340,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
   const waiver = original && (opts.waive !== undefined || opts.reason !== undefined) ? releaseResumeWaiver(original, opts) : undefined;
   if (original && opts.acceptedRegressions !== undefined && !waiver)
     releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from);
-  const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true, noDecision: true });
+  const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
   let waiverCommit: string | undefined;
   if (waiver) {
     const output = lastJsonObject(savedRun.nodes.find((node) => node.nodeId === 'version-release')?.output);
@@ -331,6 +353,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
     waiverCommit = recorded;
   }
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
+  verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, tip.version);
   const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), tip.to, deps.git);
   const partial = preparePartial(tip, opts, deps, true);
   const fromIndex = savedRun.path.indexOf(opts.from);
@@ -340,7 +363,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
     : partial.requested && partial.applied ? { mode: 'partial' as const }
       : { mode: 'full' as const, reason: partial.requested ? partial.reason : opts.partial === false ? 'partial recheck disabled' : 'no partial plan applies' };
   return { runId: opts.runId, version: tip.version, fromNode: opts.from, commandRoot, tip, partial,
-    gatePlan, nextAttempt: attempt.attempt, attemptLimit: 2, preflight: 'passed' };
+    gatePlan, nextAttempt: attempt.attempt, priorCountKnown: attempt.priorCountKnown, preflight: 'passed' };
 }
 
 async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeReleaseDeps): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
@@ -368,7 +391,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   const acceptedRegressions = original && opts.acceptedRegressions !== undefined && !waiver
     ? releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from) : undefined;
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
-  // Validate request arguments before the cap, then block the third attempt before tip refresh.
+  // Validate request arguments before the tip refresh; the count is observational.
   reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
   // A waived verdict may reuse its original commit. A moved tip still requires a full re-gate.
   if (waiver) {
@@ -383,13 +406,16 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
     waiverCommit = recorded;
   }
-  // Check the refreshed tip before refresh writes a new version-release record or backup.
-  const tip = refreshReleaseBranchTip(opts.runId, deps, opts.from, waiverCommit);
-  const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), tip.to, deps.git);
+  // The read-only tip and recipe pin preflight must pass before fetch or a saved-run rewrite.
+  const previewTip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
+  verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, previewTip.version);
+  const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), previewTip.to, deps.git);
+  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, false, previewTip.to);
   const partial = preparePartial(tip, opts, deps);
-  // A failed preflight does not consume one of the two release resume attempts.
+  // A failed preflight does not consume an observed release resume attempt.
   const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now });
-  debug.log('release-loop.resume', 'attempt', { runId: opts.runId, attempt: attempt.attempt, limit: 2, ledger: attempt.path });
+  debug.log('release-loop.resume', 'attempt', { runId: opts.runId, attempt: attempt.attempt,
+    priorCountKnown: attempt.priorCountKnown, ledger: attempt.path });
   // Resume the graph at the path it was started from (its snapshot is used); only tests inject another path.
   const graphPath = deps.graphPath ?? savedGraphPath(tip.statePath) ?? GRAPH;
   const savedSource = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;

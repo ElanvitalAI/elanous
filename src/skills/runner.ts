@@ -171,7 +171,6 @@ import {
   buildLlmRequestInstallTool,
   dispatchLlmRequestInstall,
 } from './tools/llm-install.js';
-import { createInjectApprover } from '../dashboard/runtime/approvers.js';
 import {
   buildBrowserOpenTool,
   buildBrowserNavigateTool,
@@ -1526,7 +1525,10 @@ async function executeSkillUnrecorded(
     TerminalModalFocus:   (a) => dispatchTerminalModalFocus(a),
     TerminalModalDetach:  (a) => dispatchTerminalModalDetach(a),
     TerminalModalKill:    (a) => dispatchTerminalModalKill(a),
-    TerminalModalInject:  (a) => dispatchTerminalModalInject(a, { approver: createInjectApprover() }),
+    TerminalModalInject:  async (a) => {
+      const { createInjectApprover } = await import('../dashboard/runtime/approvers.js');
+      return dispatchTerminalModalInject(a, { approver: createInjectApprover() });
+    },
     // H5 P2 · embodied-agent TTY observability.
     SnapshotPtyState:     (a) => dispatchSnapshotPtyState(a),
     ListPtySnapshots:     (a) => dispatchListPtySnapshots(a),

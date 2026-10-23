@@ -261,6 +261,13 @@ export async function collectPieceEvidence(pieces: readonly TaskCard[], read: Pi
   for (const piece of pieces) {
     const ref = pieceRef(piece);
     if (ref === undefined) { out[piece.id] = 'no-ref'; continue; }
+    // A verified component train landing closes the component PR; the integration PR is merged.
+    // rejudge-on-head writes this receipt only after verifiedTrainLanding checks the train ledger.
+    if (typeof ref === 'number' && piece.status === 'done' && piece.trainLanding?.componentPr === ref
+      && Number.isSafeInteger(piece.trainLanding.integrationPr) && /^[a-f0-9]{40}$/i.test(piece.trainLanding.mergeSha)) {
+      out[piece.id] = 'merged';
+      continue;
+    }
     let state: 'merged' | 'waiting' | 'blocked';
     try { state = await read(ref); } catch { state = 'waiting'; }
     out[piece.id] = state === 'merged' ? 'merged' : state === 'blocked' ? 'closed' : 'pending';
@@ -343,6 +350,21 @@ export async function advanceMission(missionId: string, opts: AdvanceMissionOpti
   }
 }
 
+/** A confirmed landed piece wakes its own mission. Evidence is read again before any successor launch. */
+export async function advanceLandedPieceMission(pieceId: string, opts: AdvanceMissionOptions = {}): Promise<AdvanceMissionResult | null> {
+  const path = opts.statePath ?? taskAgentStatePath();
+  const piece = readTaskCard(pieceId, path);
+  const missionId = piece?.mission;
+  if (!missionId) return null;
+  const mission = readTaskCard(missionId, path);
+  if (!mission?.pieces?.includes(pieceId) || mission.greenProposal) return null;
+  const launcher = opts.launcher ?? (await import('../cli/tasks-cli.js')).defaultTaskLauncher;
+  const result = await advanceMission(missionId, { ...opts, statePath: path, live: true, launcher });
+  try { debug.log('task-agent', 'mission-auto-advance', { missionId, pieceId, evidence: result.evidence, ready: result.ready,
+    handed: result.handed.map((item) => ({ pieceId: item.pieceId, launched: item.launched, error: item.error ?? null })), green: result.green }); } catch { /* fail-soft */ }
+  return result;
+}
+
 /** `advanceMission` 이 실패했다 — `mission-advance` 관측은 이미 남겼다. */
 export class MissionAdvanceError extends Error {
   constructor(reason: string) {
@@ -403,6 +425,14 @@ async function advanceMissionOnce(missionId: string, opts: AdvanceMissionOptions
       const out = await handTask({
         text: claimed.text, id: pieceId, mission: missionId, after: claimed.after ?? [], landed,
         ...(claimed.seat ? { seat: claimed.seat } : {}), ...(claimed.checklistId ? { checklistId: claimed.checklistId } : {}),
+        ...(claimed.tier ? { tier: claimed.tier } : {}),
+        ...(claimed.tierSplit ? { tierSplit: claimed.tierSplit } : {}),
+        ...(claimed.childLlm ? { childLlm: `${claimed.childLlm.provider}/${claimed.childLlm.model}`,
+          ...(claimed.childLlm.effort ? { childLlmEffort: claimed.childLlm.effort } : {}) } : {}),
+        ...(claimed.parentRoleLlm?.length ? { parentRoleLlm: claimed.parentRoleLlm } : {}),
+        ...(claimed.project?.id ? { project: { id: claimed.project.id, target: claimed.project.target } } : {}),
+        ...(claimed.completion ? { completion: claimed.completion } : {}),
+        ...(claimed.taLand ? { taLand: true } : {}),
         cardFields: { handed: mark, ...(claimed.pr !== undefined ? { pr: claimed.pr } : {}), ...(claimed.goalId !== undefined ? { goalId: claimed.goalId } : {}) },
         live: mode === 'live', statePath: path, ...(opts.launcher ? { launcher: opts.launcher } : {}), ...(opts.now ? { now: opts.now } : {}),
         // claim 을 가진 동안만 쓴다 — 늦게 끝난 shadow 넘김이 live 표지·발사 기록을 덮지 않게.

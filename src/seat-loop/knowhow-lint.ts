@@ -139,7 +139,7 @@ interface KnowhowCard {
 }
 
 /** 카드 제목 — `## K-<자리>-<번호>` 뒤에는 줄 끝·공백·콜론·em 대시만 온다. */
-const CARD_HEADING = /^[ \t]{0,3}##\s+(K-[A-Za-z]+-\d+)(?=$|\s|:|—)/u;
+const CARD_HEADING = /^[ \t]{0,3}##\s+(K-[A-Za-z]+(?:-[A-Za-z]{1,4})?-\d+)(?=$|\s|:|—)/u;
 /** 카드처럼 보이는 `##` 제목(예: `## K-OP-7a`) — CARD_HEADING 을 벗어나면 인식 실패로 명시 거부한다. */
 const CARD_HEADING_LIKE = /^[ \t]{0,3}##\s*(K-[^\s:]*)/iu;
 

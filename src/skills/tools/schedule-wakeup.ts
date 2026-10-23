@@ -33,6 +33,11 @@ export const WAKEUP_MIN_DELAY_MS = 60_000;
 export const WAKEUP_MAX_ENTRIES = 5;
 export const WAKEUP_REPEAT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 export const WAKEUP_RETRY_DELAY_MS = 60_000;
+/** 바쁨(NotIdle)·사람 입력 중(HumanTyping)으로 못 연 깨움을 «버리지 않고» 미루는 상한 — 첫 예정 시각부터.
+ *  TUI-WAKEUP-DEFER-NOT-DROP(10-22 OPT w7: 02:38·02:39 NotIdle → dropped · codex 는 idle 때 골을 이어가고 바쁘면 미룬다). */
+export const WAKEUP_DEFER_MAX_MS = 30 * 60_000;
+/** 미룸 대상인 거부 이유 — 곧 풀리는 «지금 바쁨» 뿐이다(Disabled·Cap·Superseded 는 미뤄도 안 풀린다). */
+const WAKEUP_DEFERRABLE_REASONS: ReadonlySet<string> = new Set(['NotIdle', 'HumanTyping']);
 /** 일회성 지연의 상한 — 반복 TTL 과 같은 7일(그보다 먼 일은 cron `schedule_manage` 몫). */
 export const WAKEUP_MAX_DELAY_MS = WAKEUP_REPEAT_TTL_MS;
 /** 한 턴 안 schedule·cancel 호출 합계 상한 — 넘으면 «다음 턴에» 로 거부(예약·취소 고리 차단). */
@@ -260,18 +265,32 @@ export function createWakeupScheduler(deps: WakeupSchedulerDeps): WakeupSchedule
     log('tui.wakeup', 'rejected', {
       id, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}), retried: entry.retried,
     });
-    if (!entry.retried) {
-      // 바쁨·사람 입력 중 — 1분 뒤 한 번만 다시 청한다(같은 회차).
+    const deferrable = WAKEUP_DEFERRABLE_REASONS.has(result.reason);
+    if (deferrable) {
+      // 바쁨·사람 입력 중 — 버리지 않고 1분마다 다시 청한다(같은 회차). 상한 = 첫 예정 시각 + WAKEUP_DEFER_MAX_MS,
+      // 반복이면 다음 회차 시각도 상한(그 회차가 이 깨움을 대신한다).
+      const nextTry = t + WAKEUP_RETRY_DELAY_MS;
+      // 상한 시각의 시도까지는 한다(<=) · 반복은 다음 회차 시각과 겹치면 그 회차에 넘긴다(<).
+      const withinDeferCap = nextTry <= entry.dueAt + WAKEUP_DEFER_MAX_MS;
+      const beforeNextTick = !entry.repeatMs || nextTry < entry.dueAt + entry.repeatMs;
+      if (withinDeferCap && beforeNextTick) {
+        entry.retried = true;
+        timers.set(id, setTimer(() => fire(id), WAKEUP_RETRY_DELAY_MS));
+        return;
+      }
+    } else if (!entry.retried) {
+      // 바쁨이 아닌 거부 — 1분 뒤 한 번만 다시 청한다(기존 계약).
       entry.retried = true;
       timers.set(id, setTimer(() => fire(id), WAKEUP_RETRY_DELAY_MS));
       return;
     }
+    const exhausted = deferrable ? 'defer-exhausted' : 'retry-exhausted';
     if (entry.repeatMs) {
-      log('tui.wakeup', 'skipped', { id, reason: 'retry-exhausted', next: 'repeat' });
+      log('tui.wakeup', 'skipped', { id, reason: exhausted, next: 'repeat' });
       advance(entry, t);
       return;
     }
-    log('tui.wakeup', 'skipped', { id, reason: 'retry-exhausted', next: 'dropped' });
+    log('tui.wakeup', 'skipped', { id, reason: exhausted, next: 'dropped' });
     deps.notify?.(`⏰ 예약 깨움 놓침(${id}): ${entry.reason} — ${result.reason}`);
     drop(id);
   };

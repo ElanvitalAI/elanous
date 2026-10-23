@@ -7,13 +7,13 @@
  * - 기본은 SHADOW: 카드와 명령만 남기고 아무것도 띄우지 않는다. `--live` 일 때만 주입된 launcher 로 띄운다.
  * - 관측: `debug.log('task-agent', 'handed', {taskId, seat, checklistId, mode, runPriority})`.
  */
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, statSync, writeFileSync, type Stats } from 'node:fs';
 import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
-import { validateUnitCalls } from '../graph-runner/runner.js';
+import { runGraph, validateUnitCalls, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
 import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harness-space.js';
@@ -25,14 +25,19 @@ import { checkCompletionEvidence, deliverableReceiptEvidence } from './completio
 import { judgeNextMove } from './judge.js';
 import { checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+// Keep doctor-visit recording synchronous: updateTaskCard callers observe it before the transition returns.
+import { recordTaskAgentNeedsOwnerVisit } from '../self-implement/doctor-visit.js';
 import { applyRunIdentityTag, applyRunIdentityTags, deriveBirthIdentity, parseRunIdentityTag, runIdentityFieldText, runIdentityQueuePriority, runPriorityClass, validateRunIdentity, type RunIdentity, type RunIdentityCell, type RunIdentityOrigin } from './run-identity.js';
 import { parseWorkOrder, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type WorkOrder } from './work-order.js';
 import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
-import { draftReleaseComment } from '../self-dev/draft-triage-rules.js';
+import { draftClaimComment, draftClaimRecordLive, draftClaimState, draftReleaseComment } from '../self-dev/draft-triage-rules.js';
 import { parseAskTargetPathHints, parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
-import { inspectGoalDoneBoundary } from '../self-implement/goal-author.js';
+import { inspectGoalDoneBoundary, linesOutsideFencedCode } from '../self-implement/goal-author.js';
 import { INFLIGHT_REGISTRY_FILE, registerInflight } from '../pr-tool/inflight-registry.js';
+import { taskParentRoleEnv } from './task-parent-role-llm.js';
+import { runHarvestUnit, type ReviewInvocation } from './harvest-unit.js';
+import { TASK_CARD_PREFIX } from './task-card-prefix.js';
 
 export interface ResolveHandTextDeps {
   cwd: string;
@@ -88,8 +93,8 @@ export function resolveHandText(text: string, deps: ResolveHandTextDeps = { cwd:
 
 export const TASK_SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
 export type TaskSeat = typeof TASK_SEATS[number];
-/** 과제 카드 id 접두 — `task show <id>` 가 이 접두로 TOX 태스크와 갈린다. */
-export const TASK_CARD_PREFIX = 'ta-';
+/** 과제 카드 id 접두 — `task show <id>` 가 이 접두로 TOX 태스크와 갈린다(정본 = task-card-prefix.ts). */
+export { TASK_CARD_PREFIX };
 /** Pod Job 의 metadata.labels 에 붙일 카드 식별자 — 원장의 카드 id 와 정확히 같아야 한다. */
 export const TASK_CARD_LABEL = 'elanous.task-card';
 /**
@@ -133,8 +138,11 @@ export interface CompositionSelection {
   error?: string;
 }
 
+/** 조합 저장소 루트(기본) — `graphs/work/<completion>.yaml` 는 이 루트에서 읽는다. */
+export const COMPOSITION_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+
 /** 1판은 조합을 고르고 단위 해석 결과를 기록한다. 단위 실행은 2판의 몫이다. */
-export function selectTaskComposition(completion: CompletionKind, root = join(dirname(fileURLToPath(import.meta.url)), '..', '..')): CompositionSelection {
+export function selectTaskComposition(completion: CompletionKind, root = COMPOSITION_ROOT): CompositionSelection {
   const file = `graphs/work/${completion}.yaml`;
   const path = join(root, file);
   let source: string;
@@ -198,6 +206,9 @@ export interface TaskCardEvent {
   verdict?: string | null; reviewed?: boolean | null; mustFix?: number | null; reviewRoute?: string | null;
   /** Exact bytes of the captured review stdout; repair must read the same resultPath and digest. */
   reviewSha256?: string;
+  /** HARNESS-FULL-GRAPH-NEXTMOVE — next-move 결정 순간 만든 수 id(간선·발사와 같은 값). `repair-launched` · `relaunch-launched`(일반 재발사) ·
+   *  `repair-result`(결과 파일의 값이 카드와 짝지어졌을 때만 · NEXTMOVE-GENERAL-RELAUNCH-MOVEID) 줄에 싣는다. */
+  moveId?: string;
 }
 /** 카드 history 의 live-move 줄 이벤트 이름 — 상태 사유(«마지막 칸») 판정에서 뺀다. */
 export const LIVE_MOVE_HISTORY_EVENT = 'live-move';
@@ -262,6 +273,11 @@ export interface TaskCard {
   goalId?: string;
   /** `manual` = pr/goalId 를 사람이 적었다(`recordPieceRef`) — 런 묶기가 건드리지 않는다. */
   refSource?: 'manual';
+  /**
+   * DRAFT-CLAIM-AUTO-2-FU — 이 손이 그 draft 로 남긴 claim 기록. `body` 는 PR 에 달 «🔧 처리 중» 문면이고
+   * claim 이 성립한 손만 갖는다(수확이 머리를 확정하지 못하면 `body` 없이 `harvest` 사유만 남는다).
+   */
+  draftClaim?: TaskCardDraftClaimRecord;
   /** 조각 카드만 — ② 가 선행 착지 뒤 넘겼다(한 번만 · 같은 잠금 안에서 먼저 적는다). */
   handed?: { at: string; mode: 'shadow' | 'live'; claim?: string; error?: string };
   /**
@@ -301,6 +317,8 @@ export interface TaskCard {
   taLand?: true;
   /** TASKS-HAND-CHILD-LLM — `tasks hand --child-llm <provider>/<model> [--child-llm-effort <level>]` → 발사 인자 `--child-llm-provider/-model/-effort`. */
   childLlm?: TaskChildLlm;
+  /** Explicit parent role pins; the implementation child remains controlled by childLlm. */
+  parentRoleLlm?: string[];
   /** Dispatch difficulty, fixed at handoff so repair uses the same judgement. */
   tier?: '하' | '중' | '상' | '특';
   /**
@@ -313,7 +331,9 @@ export interface TaskCard {
   /** Same-PR repair launches; exact source head and worker result are retained for CAS and retry limits. */
   repairs?: Array<{ pr: number; head: string; branch: string; at: string; move: string; runId: string;
     resultPath: string; fromModel: string; toModel: string; status: 'requested' | 'unconfirmed' | 'failed' | 'applied';
-    detail?: string; commit?: string; bundleSha256?: string; bundlePath?: string }>;
+    detail?: string; commit?: string; bundleSha256?: string; bundlePath?: string;
+    /** HARNESS-FULL-GRAPH-NEXTMOVE — next-move 결정 순간 만든 수 id. 이 칸 전 원장 줄엔 없다. */
+    moveId?: string }>;
 }
 
 /** 구현 자식 LLM 선택 — 하니스 `--child-llm-provider/--child-llm-model/--child-llm-effort` 로 그대로 넘긴다(검증 권위는 하니스). */
@@ -362,13 +382,294 @@ export function abandonedDraftReleaseNote(card: Pick<TaskCard, 'id' | 'status' |
 
 /** A uniquely launched code-PR card may own a draft through its PR or its opening run. */
 export function draftTaskOwner(cards: readonly TaskCard[], draft: { number: number; runId?: string | null }): TaskCard | undefined {
-  const owners = cards.filter((card) => card.status === 'launched' && (card.completion ?? 'code-pr') === 'code-pr'
-    && card.seat && (card.runId || card.runChildId) && (cardPrNumber(card) === draft.number
-      || (draft.runId && (card.runId === draft.runId || card.runChildId === draft.runId))));
+  const owners = draftTaskOwners(cards, draft);
   return owners.length === 1 ? owners[0] : undefined;
 }
 
+/**
+ * DRAFT-CLAIM-AUTO-2-FU — 그 draft 를 쥐고 있다고 말하는 카드 «전부». `draftTaskOwner` 는 이 목록이 한 장일 때만
+ * 주인을 돌려주므로, 두 장 이상이면 어느 쪽이 진짜인지 모른다 = 중복 claim.
+ */
+export function draftTaskOwners(cards: readonly TaskCard[], draft: { number: number; runId?: string | null }): TaskCard[] {
+  return cards.filter((card) => card.status === 'launched' && (card.completion ?? 'code-pr') === 'code-pr'
+    && card.seat && (card.runId || card.runChildId) && (cardPrNumber(card) === draft.number
+      || (draft.runId && (card.runId === draft.runId || card.runChildId === draft.runId))));
+}
+
+/** DRAFT-CLAIM-AUTO-2-FU — 손이 draft 하나를 잡을 때의 «지금» 관측값(라벨·갱신 시각은 호출자가 관측해 넘긴다). */
+export interface HandTaskDraftClaim {
+  /** 관측한 draft PR 번호 — 손이 잡으려는 PR. 카드에 묶인 PR 과 같은 번호다. */
+  pr: number;
+  /** 그 PR 의 지금 라벨(claim·harvestable 판정 입력 · `draftClaimState`). */
+  labels: readonly string[];
+  /** 그 PR 의 마지막 갱신 시각 — 없으면 만료인지 아닌지 모르므로 claim 하지 않는다. */
+  updatedAt?: string;
+  /** 그 PR 을 연 런 id(카드 묶기 키 — `draftTaskOwner`). */
+  runId?: string | null;
+  /** 손 수확 — 리뷰 결과로 머리를 확정한 «뒤에만» claim 한다. */
+  harvest?: HandTaskDraftHarvest;
+  /** DRAFT-CLAIM-AUTO-2-FU — claim 문면을 «실제 PR 댓글»로 게시하는 포트. 생산 배선(`tasks hand --draft-claim <pr>`)이 gh 게시자를 준다. 없으면 `body` 를 카드에만 남긴다. */
+  postComment?: (pr: number, body: string) => Promise<string | undefined>;
+}
+
+/**
+ * DRAFT-CLAIM-AUTO-2-FU — 손 수확: 그 머리에서 리뷰를 다시 받아 수확이 성립할 때만 claim 한다.
+ * 생산 배선(`handDraftClaim`)이 관측한 PR 머리(`expectedHead`) ⊕ 포트의 리뷰 러너(`invokeReview`)로 조립한다.
+ */
+export interface HandTaskDraftHarvest {
+  /** 리뷰를 요청한 머리(40-hex) — 없거나 지금 머리와 다르면 수확은 성립하지 않는다(claim 0). */
+  expectedHead?: string;
+  /** 리뷰 의도 문면(없으면 손 문면을 쓴다). */
+  reviewIntent?: string;
+  /** `elanous self review <pr> --json` 를 부르는 자리 — 호출자(관측 포트)가 준다. */
+  invokeReview: (args: { pr: string; intent: string }) => Promise<ReviewInvocation>;
+}
+
+/** DRAFT-CLAIM-AUTO-2-FU — 카드에 남는 claim 기록. */
+export interface TaskCardDraftClaimRecord {
+  pr: number;
+  at: string;
+  /** 만료된 claim 을 다시 잡았나(= 재claim). */
+  reclaim: boolean;
+  /** PR 에 달 «🔧 처리 중» 문면 — claim 이 성립한 손만. */
+  body?: string;
+  /** shadow 는 게시 예약이 아니므로 live claim 을 막지 않는다. 옛 기록은 live 로 취급한다. */
+  mode?: 'shadow' | 'live';
+  /** DRAFT-CLAIM-AUTO-2-FU — 게시한 PR 댓글 위치(댓글 url·id · `postComment` 포트가 있는 생산 경로만). */
+  postedTo?: string;
+  /** 쥐고 있던 카드 id(관측됐을 때). */
+  ownerId?: string;
+  /** 손 수확 증거 — 머리를 확정하지 못했으면 `outcome`·`reason` 만 있고 `body` 는 없다. */
+  harvest?: { outcome: 'done' | 'rework' | 'needs-human' | 'failed'; headCommit?: string; reason?: string };
+}
+
+/** DRAFT-CLAIM-AUTO-2-FU — 이 손이 draft 를 잡아도 되나(중복 claim 거부 · 만료된 claim 만 재claim). */
+export type DraftClaimJudgement =
+  | { ok: true; body: string; reclaim: boolean; ownerId?: string }
+  | { ok: false; reason: string; ownerId?: string };
+
+/**
+ * DRAFT-CLAIM-AUTO-2-FU — 판정선: ⑴ 두 장 이상의 카드가 같은 draft 를 쥐고 있으면 거부(어느 쪽이 진짜인지 모른다),
+ * ⑵ 갱신 시각을 못 읽으면(`unobserved`) 만료인지 알 수 없으니 거부, ⑶ 살아 있는 claim 을 다른 카드가 쥐고 있으면 거부
+ * (중복 claim), ⑷ 다른 카드에 남은 «살아 있는» claim 기록(카드 `draftClaim`)이 같은 PR 을 쥐고 있으면 거부 —
+ * 연속된 손 호출이 «같은» draft 를 다시 claim 하지 못하게(launched 카드의 PR·런 소유권 가드만으는 부족하다),
+ * ⑸ «만료»로 관측된 claim 만 다시 잡는다(재claim 문면).
+ */
+export function judgeDraftClaim(input: {
+  draft: { number: number; labels: readonly string[]; updatedAt?: string; runId?: string | null };
+  cards: readonly TaskCard[];
+  cardId: string;
+  seat?: TaskSeat;
+  now: Date;
+}): DraftClaimJudgement {
+  const owners = draftTaskOwners(input.cards, input.draft);
+  if (owners.length > 1) {
+    return { ok: false, reason: `duplicate-claim: ${owners.map((card) => card.id).join(', ')} 가 같은 PR #${input.draft.number} 를 쥐고 있다` };
+  }
+  const owner = owners[0];
+  const state = draftClaimState(input.draft, input.now);
+  if (state === 'unobserved') {
+    return { ok: false, ...(owner ? { ownerId: owner.id } : {}), reason: `claim-unobserved: PR #${input.draft.number} 의 claim 시각을 못 읽었다` };
+  }
+  if (state === 'claimed' && owner?.id !== input.cardId) {
+    return {
+      ok: false,
+      ...(owner ? { ownerId: owner.id } : {}),
+      reason: `duplicate-claim: ${owner ? owner.id : '카드 원장 밖 주인'} 가 PR #${input.draft.number} 를 처리 중이다`,
+    };
+  }
+  const recordOwner = input.cards.find((card) => {
+    const record = card.draftClaim;
+    return card.id !== input.cardId && record !== undefined && record.pr === input.draft.number
+      && record.body !== undefined && record.mode !== 'shadow' && draftClaimRecordLive(record.at, input.now);
+  });
+  if (recordOwner) {
+    return { ok: false, ownerId: recordOwner.id, reason: `duplicate-claim: 카드 ${recordOwner.id} 가 PR #${input.draft.number} 의 claim 기록을 쥐고 있다` };
+  }
+  const reclaim = state === 'expired';
+  return {
+    ok: true,
+    reclaim,
+    ...(owner ? { ownerId: owner.id } : {}),
+    body: draftClaimComment(input.seat ?? input.cardId, input.now, reclaim ? '만료 claim 재claim — 자동' : undefined),
+  };
+}
+
+/** DRAFT-CLAIM-AUTO-2-FU — 그 draft 를 이미 다른 카드가 쥐고 있다(또는 만료인지 못 정한다). 이때 카드는 «쓰지 않는다». */
+export class TaskDraftClaimRejectedError extends Error {
+  readonly cardId: string;
+  readonly reason: string;
+  constructor(cardId: string, reason: string) {
+    super(`draft claim 거부 (${cardId}): ${reason}`);
+    this.name = 'TaskDraftClaimRejectedError';
+    this.cardId = cardId;
+    this.reason = reason;
+  }
+}
+
+/**
+ * DRAFT-CLAIM-AUTO-2-FU — 손 수확(있으면) → claim 판정을 생산 진입점 안에서 닫는다.
+ *
+ * ⑴ 수확이 머리를 확정하지 못하면(`needs-human`·`failed`) claim 문면(`body`)을 만들지 않고 사유만 남긴다 —
+ * 다른 PR/낡은 머리 리뷰를 이 claim 에 붙이지 않는다. ⑵ 머리를 확정했으면 카드 원장(디스크)의 다른 카드와
+ * 견줘 중복·만료를 판정하고, 거부면 던진다(호출자가 카드를 쓰기 «전»에 멈춘다).
+ */
+async function resolveHandDraftClaim(input: {
+  claim: HandTaskDraftClaim;
+  cards: readonly TaskCard[];
+  cardId: string;
+  seat?: TaskSeat;
+  now: Date;
+  ask: string;
+}): Promise<TaskCardDraftClaimRecord> {
+  const { claim } = input;
+  const harvest = claim.harvest ? await runHarvestUnit({
+    ask: input.ask,
+    context: {
+      pr: claim.pr,
+      ...(claim.harvest.expectedHead !== undefined ? { expectedHead: claim.harvest.expectedHead } : {}),
+      reviewIntent: claim.harvest.reviewIntent ?? input.ask,
+    },
+  }, claim.harvest.invokeReview) : undefined;
+  const reason = harvest
+    ? typeof harvest.result.reason === 'string' ? harvest.result.reason
+      : typeof harvest.result.error === 'string' ? harvest.result.error : undefined
+    : undefined;
+  const harvestRecord: TaskCardDraftClaimRecord['harvest'] | undefined = harvest ? {
+    outcome: harvest.outcome,
+    ...(typeof harvest.result.headCommit === 'string' ? { headCommit: harvest.result.headCommit } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  } : undefined;
+  const at = input.now.toISOString();
+  if (harvest && harvest.outcome !== 'done' && harvest.outcome !== 'rework') {
+    try { debug.log('task-agent.draft-claim', 'harvest-unconfirmed', { card: input.cardId, pr: claim.pr, outcome: harvest.outcome, reason: reason ?? null }); } catch { /* fail-soft */ }
+    return { pr: claim.pr, at, reclaim: false, ...(harvestRecord ? { harvest: harvestRecord } : {}) };
+  }
+  const judgement = judgeDraftClaim({
+    draft: { number: claim.pr, labels: claim.labels,
+      ...(claim.updatedAt !== undefined ? { updatedAt: claim.updatedAt } : {}),
+      ...(claim.runId !== undefined ? { runId: claim.runId } : {}) },
+    cards: input.cards,
+    cardId: input.cardId,
+    ...(input.seat !== undefined ? { seat: input.seat } : {}),
+    now: input.now,
+  });
+  if (!judgement.ok) {
+    try { debug.log('task-agent.draft-claim', 'rejected', { card: input.cardId, pr: claim.pr, reason: judgement.reason }); } catch { /* fail-soft */ }
+    throw new TaskDraftClaimRejectedError(input.cardId, judgement.reason);
+  }
+  try { debug.log('task-agent.draft-claim', judgement.reclaim ? 'reclaimed' : 'claimed', { card: input.cardId, pr: claim.pr, ownerId: judgement.ownerId ?? null }); } catch { /* fail-soft */ }
+  return {
+    pr: claim.pr, at, reclaim: judgement.reclaim, body: judgement.body,
+    ...(judgement.ownerId !== undefined ? { ownerId: judgement.ownerId } : {}),
+    ...(harvestRecord ? { harvest: harvestRecord } : {}),
+  };
+}
+
 interface TaskAgentStateFile { tasks?: Record<string, TaskCard>; [key: string]: unknown }
+
+/**
+ * DRAFT-CLAIM-AUTO-2-FU — 손이 draft 를 잡을 때 필요한 관측·게시·수확 리뷰 포트(생산 기본값은 gh CLI ⊕ `elanous self
+ * review` 러너 · 시험은 가짜 포트로 몽크). `handDraftClaim` 이 이 포트들로 `draftClaim`(⊕ 손 수확)을 조립한다.
+ */
+export interface DraftClaimGhPorts {
+  /** PR 을 관측해 라벨·갱신 시각(·런 id)·머리(headRefOid · 손 수확 `expectedHead` 근거)을 읽는다. */
+  observePr: (pr: number) => Promise<{ labels: readonly string[]; updatedAt?: string; runId?: string | null; head?: string }>;
+  /** PR 댓글을 게시한다 — 게시 위치(댓글 url·id)를 돌려준다. */
+  postComment: (pr: number, body: string) => Promise<string | undefined>;
+  /**
+   * DRAFT-CLAIM-AUTO-2-FU — 손 수확 리뷰 러너: `elanous self review <pr> --json` 관측 원문(stdout·stderr·exitCode)을
+   * 돌려준다(판정은 `runHarvestUnit` 몫). 주면 생산 배선이 관측한 PR 머리와 함께 손 수확을 조립한다 — 없으면 수확 없이 claim 한다.
+   */
+  runReview?: (args: { pr: string; intent: string }) => Promise<ReviewInvocation>;
+}
+
+function ghExec(args: readonly string[]): Promise<string> {
+  return new Promise((done, fail) => {
+    execFile('gh', [...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }, (error, stdout) => {
+      if (error) fail(new Error(`gh ${args.join(' ')} 실패: ${error.message}`));
+      else done(String(stdout));
+    });
+  });
+}
+
+/**
+ * DRAFT-CLAIM-AUTO-2-FU — 손 수확 리뷰 러너(생산 기본값): 지금 도는 진입점으로 같은 우주의
+ * `elanous self review <pr> --json --intent <intent>` 를 «기다려» 관측 원문(stdout·stderr·exitCode)을 돌려준다
+ * (argv 는 `liveReviewArgs` 정본 — `defaultRequestReview` 가 떼어 띄우는 것과 같다). 판정·파싱은 `runHarvestUnit` 몫이다.
+ */
+export async function defaultDraftClaimReviewRunner(args: { pr: string; intent: string }): Promise<ReviewInvocation> {
+  const { ELANOUS_CLI_ENTRY } = await import('../cli/tasks-cli.js');
+  const { getElanousConfigDirOverride } = await import('../elanous-config-dir.js');
+  const { liveReviewArgs } = await import('./live-moves.js');
+  const configDir = getElanousConfigDirOverride() ?? effectiveInstanceRoot();
+  const argv = liveReviewArgs(ELANOUS_CLI_ENTRY, configDir, Number(args.pr), args.intent);
+  return await new Promise<ReviewInvocation>((done) => {
+    execFile(process.execPath, argv, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
+      const exitCode = error ? (typeof (error as { code?: unknown }).code === 'number' ? (error as { code: number }).code : 1) : 0;
+      done({ stdout: String(stdout), stderr: String(stderr), exitCode });
+    });
+  });
+}
+
+/** 생산 기본 포트 — gh CLI 로 PR 을 관측(라벨·갱신 시각·머리)하고 댓글을 게시하며, 손 수확 리뷰는 같은 우주의 `elanous self review` 러너로 돌린다(자격·원격 저장소는 각 설정을 따른다). */
+export function defaultDraftClaimGhPorts(): DraftClaimGhPorts {
+  return {
+    async observePr(pr: number) {
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(await ghExec(['pr', 'view', String(pr), '--json', 'labels,updatedAt,headRefOid'])) as Record<string, unknown>;
+      } catch (error) {
+        throw new Error(`PR #${pr} 관측 실패(gh pr view): ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const labels = Array.isArray(parsed.labels) ? parsed.labels
+        .map((label) => typeof label === 'string' ? label : (label as { name?: unknown } | null)?.name)
+        .filter((name): name is string => typeof name === 'string') : [];
+      const updatedAt = typeof parsed.updatedAt === 'string' ? parsed.updatedAt : undefined;
+      const head = typeof parsed.headRefOid === 'string' && /^[0-9a-f]{40}$/i.test(parsed.headRefOid) ? parsed.headRefOid : undefined;
+      return { labels, ...(updatedAt !== undefined ? { updatedAt } : {}), ...(head !== undefined ? { head } : {}) };
+    },
+    async postComment(pr: number, body: string) {
+      await ghExec(['pr', 'comment', String(pr), '--body', body]);
+      return `PR #${pr} 댓글`;
+    },
+    // DRAFT-CLAIM-AUTO-2-FU — 손 수확 리뷰 러너(생산): handDraftClaim 이 관측한 머리와 함께 조립한다.
+    runReview: defaultDraftClaimReviewRunner,
+  };
+}
+
+/**
+ * DRAFT-CLAIM-AUTO-2-FU — 생산 진입점 배선: 관측 포트로 PR 을 읽어 `draftClaim` 을 «조립해» `handTask` 에 넘긴다
+ * (`tasks hand --draft-claim <pr>` 가 부른다). 손 수확도 여기서 조립한다 — 관측한 PR 머리(`expectedHead`) ⊕ 포트의
+ * 리뷰 러너(`invokeReview` · 생산 기본값 `elanous self review <pr> --json`)로 `runHarvestUnit` 을 거치게 한다.
+ * 시험도 이 경로로 돌며 gh·리뷰 포트만 몽크한다 — `draftClaim` 을 직접 주입하지 않는다. 호출자가 직접 준 `harvest`
+ * 가 우선(시험 주입)이고 리뷰 러너가 없는 포트는 종전대로 수확 없이 claim 한다(기본 동작 보존).
+ */
+export async function handDraftClaim(input: {
+  pr: number;
+  gh: DraftClaimGhPorts;
+  /** DRAFT-CLAIM-AUTO-2-FU — 직접 주는 수확(시험 주입). 안 주면 배선이 관측한 머리 ⊕ 포트의 리뷰 러너로 조립한다. */
+  harvest?: HandTaskDraftHarvest;
+} & Omit<Parameters<typeof handTask>[0], 'draftClaim'>): Promise<Awaited<ReturnType<typeof handTask>>> {
+  const { pr, gh, harvest, ...handOpts } = input;
+  const observed = await gh.observePr(pr);
+  // DRAFT-CLAIM-AUTO-2-FU — 손 수확 조립(생산): 관측한 PR 머리(expectedHead) + 포트의 리뷰 러너(invokeReview).
+  const handHarvest: HandTaskDraftHarvest | undefined = harvest ?? (gh.runReview === undefined ? undefined : {
+    ...(observed.head !== undefined ? { expectedHead: observed.head } : {}),
+    invokeReview: gh.runReview,
+  });
+  return handTask({
+    ...handOpts,
+    draftClaim: {
+      pr,
+      labels: observed.labels,
+      ...(observed.updatedAt !== undefined ? { updatedAt: observed.updatedAt } : {}),
+      ...(observed.runId !== undefined ? { runId: observed.runId } : {}),
+      ...(handHarvest !== undefined ? { harvest: handHarvest } : {}),
+      postComment: gh.postComment,
+    },
+  });
+}
 
 function isGitWorkTree(path: string): boolean {
   try {
@@ -427,16 +728,35 @@ export function writeTaskCards(path: string, cards: readonly TaskCard[]): void {
 }
 
 /** 카드 하나를 잠금 안에서 읽고 고쳐 쓴다 — `update` 가 undefined 를 돌려주면 쓰지 않는다. 쓴(또는 그대로인) 카드를 돌려준다. */
-export function updateTaskCard(path: string, id: string, update: (card: TaskCard | undefined, tasks: Readonly<Record<string, TaskCard>>) => TaskCard | undefined): TaskCard | undefined {
-  return withFileLockSync(`${path}.lock`, () => {
+export function updateTaskCard(path: string, id: string, update: (card: TaskCard | undefined, tasks: Readonly<Record<string, TaskCard>>) => TaskCard | undefined,
+  options: { doctorLedgerDir?: string } = {}): TaskCard | undefined {
+  let needsOwner: { runId: string; at: string; reason: string; transitionIndex: number } | undefined;
+  const result = withFileLockSync(`${path}.lock`, () => {
     const disk = readState(path);
     const current = disk.tasks?.[id];
     const next = update(current, disk.tasks ?? {});
     if (!next) return current;
+    const transitionIndex = next.history.length - 1;
+    const last = next.history[transitionIndex];
+    if (current?.status === 'launched' && next.status === 'failed' && next.runId
+      && next.history.length > (current?.history.length ?? 0) && last?.event === 'failed'
+      && last.detail?.startsWith('failed/needs-owner')) {
+      needsOwner = { runId: next.runId, at: last.at, reason: last.detail, transitionIndex };
+    }
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ ...disk, tasks: { ...(disk.tasks ?? {}), [id]: next } }));
     return next;
   });
+  if (needsOwner) {
+    try {
+      const visit = recordTaskAgentNeedsOwnerVisit({ ...needsOwner, cardId: id, dir: options.doctorLedgerDir });
+      debug.log('task-agent', 'doctor-visit', { card: id, runId: needsOwner.runId, status: visit.status });
+    } catch (error) {
+      debug.log('task-agent', 'doctor-visit-failed', { card: id, runId: needsOwner.runId,
+        reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return result;
 }
 
 export function readTaskCard(id: string, path = taskAgentStatePath()): TaskCard | undefined {
@@ -607,6 +927,7 @@ export interface HandTaskOptions {
   /** TASKS-HAND-CHILD-LLM — `<provider>/<model>`(`parseChildLlm`) ⊕ 선택 추론 노력. effort 만 주면 거부. */
   childLlm?: string;
   childLlmEffort?: string;
+  parentRoleLlm?: string[];
   tier?: TaskCard['tier'];
   /** TIER-SPLIT-BEFORE-LAUNCH — 조각 카드에 싣는 분해 연결(`tier-split.ts` 만 준다). */
   tierSplit?: TaskCard['tierSplit'];
@@ -627,6 +948,11 @@ export interface HandTaskOptions {
   compositionRoot?: string;
   /** `--live` 일 때만 불린다. */
   launcher?: TaskLauncher;
+  /**
+   * 2판 — launcher 'graph-run' 조합을 실제 graph run 으로 발사한다(기본 = src/graph-runner/runner.ts runGraph).
+   * 시험은 이 seam 을 주입해 발사 인자(선택된 조합 경로 ⊕ GraphRunOptions)를 'calls' capture 로 검증한다.
+   */
+  graphRunner?: (path: string, options: GraphRunOptions) => Promise<GraphRunState>;
   /** Deterministic contract seam; production uses the pinned-main verifier. */
   prelaunchInspector?: (text: string, projectTarget?: string) => AlreadyDoneDecision;
   /** Test-only: inject Git calls into the production verifier; no CLI/config surface. */
@@ -640,6 +966,12 @@ export interface HandTaskOptions {
   landed?: ReadonlySet<string>;
   /** 카드에 그대로 싣는 칸(② 의 넘김 표지·착지 근거) — handTask 가 카드를 새로 적을 때 지워지지 않게. */
   cardFields?: Pick<TaskCard, 'pr' | 'goalId' | 'handed'>;
+  /**
+   * DRAFT-CLAIM-AUTO-2-FU — 손이 잡으려는 draft(PR)의 «지금» 관측값(라벨·갱신 시각·리뷰 러너).
+   * 주면 `handTask` 가 손 수확(있으면) → `judgeDraftClaim` 을 거쳐 카드 `draftClaim` 에 기록한다. 거부면
+   * 카드를 쓰기 전에 `TaskDraftClaimRejectedError`. 안 주면 종전과 똑같이 claim 을 하지 않는다(기본 동작 보존).
+   */
+  draftClaim?: HandTaskDraftClaim;
   /**
    * 있으면 카드 쓰기마다 잠금 안에서 디스크 카드를 보고 참일 때만 쓴다(② 의 claim 소유 확인).
    * 거짓이면 쓰지 않고 `TaskCardSupersededError` — 다른 넘김이 그 카드를 가져갔다(발사 전이면 발사하지 않는다).
@@ -688,6 +1020,26 @@ export function dispatchDeliverableCompletion(id: string, input: { ref: string; 
   return closed;
 }
 
+/**
+ * ENTRANCE-EVIDENCE-COMMAND-ONLY — 증거 명령 줄의 «형태» 판정. 기존 TA-HAND-PREFLIGHT 의 계약 줄 «존재» 검사
+ * (`inspectGoalDoneBoundary`)와 구분된다: 세 경계 줄이 이미 갖춰진 골에서 증거 명령 줄의 값이 명령 원문인지만 본다.
+ * 설명 접미(예: `→ 0 fail`)와 백틱 장식은 줄마다 이유를 붙여 거부한다. 빈 값·누락은 존재 검사 몫이다.
+ */
+const GOAL_EVIDENCE_COMMAND_LINE = /^\s*(?:[-*]\s*)?완료 경계 증거 명령\s*:\s*(.*?)\s*$/;
+const GOAL_EVIDENCE_COMMAND_DESCRIPTION_SUFFIX = /->|→/;
+const GOAL_EVIDENCE_COMMAND_BACKTICK_DECORATION = /`/;
+
+function goalEvidenceCommandFormViolations(document: string): string[] {
+  const violations: string[] = [];
+  for (const line of linesOutsideFencedCode(document)) {
+    const value = GOAL_EVIDENCE_COMMAND_LINE.exec(line.text)?.[1];
+    if (value === undefined || !value.trim()) continue;
+    if (GOAL_EVIDENCE_COMMAND_BACKTICK_DECORATION.test(value)) violations.push(`백틱 장식: ${value}`);
+    else if (GOAL_EVIDENCE_COMMAND_DESCRIPTION_SUFFIX.test(value)) violations.push(`설명 접미: ${value}`);
+  }
+  return violations;
+}
+
 export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const text = opts.text.trim();
   if (!text) throw new Error('과제 한 줄이 비어 있다');
@@ -720,11 +1072,19 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
       launcher: 'hand',
     }, birthTags);
   const childLlm = opts.childLlm !== undefined ? parseChildLlm(opts.childLlm, opts.childLlmEffort) : undefined;
+  const parentRoleEnv = taskParentRoleEnv(opts.parentRoleLlm ?? []); // validate before writing the card
   const completion = opts.completion ?? 'code-pr';
   const selected = selectTaskComposition(completion, opts.compositionRoot);
-  const selectionFailure = !selected.composition ? `조합 없음: graphs/work/${completion}.yaml`
-    : selected.error ?? (completion !== 'code-pr' || selected.launcher !== 'harness-say'
-      ? `조합 실행기 없음: ${selected.composition.file} (1판은 code-pr harness-say만 발사)` : undefined);
+  // 2판 — launcher 'graph-run' 조합(단위 해석까지 완료)은 실제 graph run 으로 발사한다. 더 이상 거부하지 않는다.
+  const graphRun = selected.composition && selected.launcher === 'graph-run' && !selected.error && selected.unitsResolved
+    ? selected.composition : undefined;
+  const graphRunPath = graphRun ? join(opts.compositionRoot ?? COMPOSITION_ROOT, graphRun.file) : undefined;
+  const selectionFailure = graphRun ? undefined
+    : !selected.composition ? `조합 없음: graphs/work/${completion}.yaml`
+    : selected.error ?? (selected.launcher === 'graph-run' && !selected.unitsResolved
+      ? `조합 단위 미해석: ${selected.composition.file} — 대상 unit: ${selected.missingUnits.length ? selected.missingUnits.join(', ') : '해석 실패'} (graph-run 발사는 단위 해석이 필요하다)`
+      : completion !== 'code-pr' || selected.launcher !== 'harness-say'
+        ? `조합 실행기 없음: ${selected.composition.file} (발사 가능한 launcher: code-pr harness-say · graph-run)` : undefined);
   let project: TaskCard['project'];
   let targetIsGit: boolean | null = null;
   if (opts.project) {
@@ -743,7 +1103,15 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const now = (opts.now ?? (() => new Date()))();
   const id = opts.id ?? `${TASK_CARD_PREFIX}${now.toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(3).toString('hex')}`;
   const mode = opts.live ? 'live' : 'shadow';
-  const card: TaskCard = {
+  // DRAFT-CLAIM-AUTO-2-FU — claim 은 카드를 쓰기 «전»에 판정한다(거부면 원장에 아무것도 남기지 않는다).
+  // 견줄 상대는 카드 원장(디스크)의 다른 카드다 — 손이 들고 있는 사본이 아니라 정본을 본다.
+  const draftClaim = opts.draftClaim
+    ? await resolveHandDraftClaim({
+      claim: opts.draftClaim, cards: Object.values(readState(path).tasks ?? {}), cardId: id,
+      ...(opts.seat !== undefined ? { seat: opts.seat } : {}), now, ask: text,
+    })
+    : undefined;
+  let card: TaskCard = {
     id, text,
     ...(!targetPathHints.labelMissing ? { targetPaths } : {}),
     ...(opts.seat ? { seat: opts.seat } : {}),
@@ -758,24 +1126,57 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.milestone ? { milestone: opts.milestone } : {}),
     ...(opts.taLand === true ? { taLand: true as const } : {}),
     ...(childLlm ? { childLlm } : {}),
+    ...(opts.parentRoleLlm?.length ? { parentRoleLlm: [...opts.parentRoleLlm] } : {}),
     ...(opts.tier ? { tier: opts.tier } : {}),
     ...(opts.tierSplit ? { tierSplit: opts.tierSplit } : {}),
     ...(identity ? { identity } : {}),
     createdAt: now.toISOString(),
     status: selectionFailure || tierSplitBlocked !== undefined ? 'failed' : 'handed',
-    history: selectionFailure ? [{ at: now.toISOString(), event: !selected.composition ? 'composition-missing'
-      : selected.error ? 'composition-invalid' : 'composition-launcher-unavailable', detail: selectionFailure }]
-      : tierSplitBlocked !== undefined ? [{ at: now.toISOString(), event: 'tier-split-failed', detail: `tier-split-failed: ${tierSplitBlocked}` }] : [],
+    history: [
+      ...(selectionFailure ? [{ at: now.toISOString(), event: !selected.composition ? 'composition-missing'
+        : selected.error ? 'composition-invalid' : 'composition-launcher-unavailable', detail: selectionFailure }] : []),
+      ...(tierSplitBlocked !== undefined ? [{ at: now.toISOString(), event: 'tier-split-failed', detail: `tier-split-failed: ${tierSplitBlocked}` }] : []),
+    ],
     ...(opts.mission ? { mission: opts.mission, after: [...(opts.after ?? [])] } : {}),
     ...(opts.cardFields?.pr !== undefined ? { pr: opts.cardFields.pr } : {}),
     ...(opts.cardFields?.goalId !== undefined ? { goalId: opts.cardFields.goalId } : {}),
     ...(opts.cardFields?.handed !== undefined ? { handed: opts.cardFields.handed } : {}),
+    ...(draftClaim ? { draftClaim } : {}),
   };
-  const move = selectionFailure ? undefined : nextMoveFor(card, opts.landed);
+  // 2판 graph-run 조합의 다음 수는 실제 graph run — harness say 인자를 조립하지 않는다.
+  const move = graphRun && graphRunPath ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } satisfies TaskCardMove
+    : selectionFailure ? undefined : nextMoveFor(card, opts.landed);
   // 분해 실패로 막은 카드는 wait(failed 사유)가 정답이다 — 던지지 않고 카드를 적은 뒤 발사 0 으로 돌아간다.
   if (move && move.kind !== 'launch' && tierSplitBlocked === undefined) throw new Error(`발사할 수 없는 과제다 — ${move.reason}`);
   const guard = opts.writeGuard;
   const writeCard = (target: string, next: TaskCard): void => {
+    if (next.draftClaim?.body !== undefined && opts.draftClaim) {
+      let written = false;
+      const saved = updateTaskCard(target, next.id, (current, tasks) => {
+        if (guard && !guard(current)) return undefined;
+        // 같은 파일 잠금 안에서 판정과 기록을 마친다. 댓글은 잠금 밖에서 기록 성공 후 게시한다.
+        const judgement = judgeDraftClaim({
+          draft: { number: opts.draftClaim!.pr, labels: opts.draftClaim!.labels,
+            ...(opts.draftClaim!.updatedAt !== undefined ? { updatedAt: opts.draftClaim!.updatedAt } : {}),
+            ...(opts.draftClaim!.runId !== undefined ? { runId: opts.draftClaim!.runId } : {}) },
+          cards: Object.values(tasks), cardId: next.id,
+          ...(opts.seat !== undefined ? { seat: opts.seat } : {}), now,
+        });
+        if (!judgement.ok) throw new TaskDraftClaimRejectedError(next.id, judgement.reason);
+        written = true;
+        const claim: TaskCardDraftClaimRecord = { ...next.draftClaim!, body: judgement.body, reclaim: judgement.reclaim, mode,
+          ...(judgement.ownerId !== undefined ? { ownerId: judgement.ownerId } : {}) };
+        const { pr: _stalePr, goalId: _staleGoal, refSource: _staleSource, ...base } = next;
+        const evidence = current ?? next;
+        return { ...base, draftClaim: claim,
+          ...(evidence.pr !== undefined ? { pr: evidence.pr } : {}),
+          ...(evidence.goalId !== undefined ? { goalId: evidence.goalId } : {}),
+          ...(evidence.refSource ? { refSource: evidence.refSource } : {}) };
+      });
+      if (!written) throw new TaskCardSupersededError(next.id);
+      if (saved) card = saved;
+      return;
+    }
     if (!guard) { writeTaskCards(target, [next]); return; }
     const owned = { ok: false };
     // 착지 근거(pr·goalId)는 `recordPieceRef` 소유 — claim 뒤에 적힌 최신 근거를 디스크에서 이어 받는다.
@@ -790,11 +1191,16 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   };
   // Production Pod launches use the remote-parent lint's shared boundary judge.
   // Injected launchers are test seams and opt in explicitly at the contract test.
-  if (opts.live && opts.preflightGoalDoneBoundary && !selectionFailure && move?.kind === 'launch') {
+  if (opts.live && opts.preflightGoalDoneBoundary && !selectionFailure && tierSplitBlocked === undefined && move?.kind === 'launch') {
     readTaskAgentState(path);
     const { missing } = inspectGoalDoneBoundary(text);
     if (missing.length > 0) {
       throw new Error(`goal-revision-required: 완료 경계 누락 ${missing.join(' · ')} — 골 문면에 완료 경계 코드·완료 경계 실물·완료 경계 증거 명령을 적은 뒤 다시 넘기세요`);
+    }
+    // ENTRANCE-EVIDENCE-COMMAND-ONLY — 존재 검사와 구분된 형태 판정: 증거 명령 줄은 명령 원문만 받는다.
+    const formViolations = goalEvidenceCommandFormViolations(text);
+    if (formViolations.length > 0) {
+      throw new Error(`goal-revision-required: 완료 경계 증거 명령은 명령 원문이어야 한다 ${formViolations.join(' · ')} — 증거 명령 줄에 설명 접미(예: → 0 fail)나 백틱 장식을 붙이지 말고 명령만 적은 뒤 다시 넘기세요`);
     }
   }
   writeCard(path, card);
@@ -804,14 +1210,62 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits,
     ...(selected.error ? { error: selected.error } : {}),
   }); } catch { /* fail-soft */ }
+  if (tierSplitBlocked !== undefined) return { card, move: move ?? nextMoveFor(card), mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (selectionFailure) throw new Error(`${selectionFailure} (카드 ${id})`);
-  if (tierSplitBlocked !== undefined && move) return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   if (!move || move.kind !== 'launch') throw new Error('조합 선택 뒤 발사 수가 없다');
+  if (opts.live && opts.draftClaim?.postComment && card.draftClaim?.body !== undefined) {
+    let postedTo: string | undefined;
+    try {
+      postedTo = await opts.draftClaim.postComment(opts.draftClaim.pr, card.draftClaim.body);
+    } catch (error) {
+      // 댓글이 없으면 «살아 있는» 예약도 남기지 않는다. 다음 손이 다시 claim 할 수 있다.
+      card = updateTaskCard(path, card.id, (current) => current?.draftClaim
+        ? { ...current, draftClaim: { ...current.draftClaim, body: undefined } } : undefined) ?? card;
+      throw error;
+    }
+    if (postedTo !== undefined) {
+      card = updateTaskCard(path, card.id, (current) => current?.draftClaim
+        ? { ...current, draftClaim: { ...current.draftClaim, postedTo } } : undefined) ?? card;
+    }
+    try { debug.log('task-agent.draft-claim', 'comment-posted', { card: id, pr: opts.draftClaim.pr,
+      ...(postedTo !== undefined ? { postedTo } : {}) }); } catch { /* fail-soft */ }
+  }
   try { debug.log('task-agent', 'handed', { taskId: id, seat: card.seat ?? null, checklistId: card.checklistId ?? null, mode, projectId: project?.id ?? null, targetIsGit, taLand: card.taLand === true, runPriority: card.identity ? runPriorityClass(card.identity) : null }); } catch { /* fail-soft */ }
   if (childLlm) {
     try { debug.log('task-agent', 'child-llm', { taskId: id, input: opts.childLlm, provider: childLlm.provider, model: childLlm.model, effort: childLlm.effort ?? null, mode }); } catch { /* fail-soft */ }
   }
   if (mode === 'shadow') return { card, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
+  // 2판 — launcher 'graph-run' 조합은 launcher(harness say 발사기) 대신 실제 graph run 진입점(runGraph)으로 발사한다.
+  if (graphRun && graphRunPath) {
+    const runId = mintRunId();
+    const launchId = newLaunchUtteranceId();
+    recordLaunchUtterance({ source: 'hand', utterance: opts.text, launchId });
+    let state: GraphRunState;
+    try {
+      state = await (opts.graphRunner ?? runGraph)(graphRunPath, { runId, input: { ask: text }, quiet: true });
+    } catch (error) {
+      // 조합 파일·대상 node가 없으면 runGraph 가 구체 사유로 던진다 — 임의 성공 처리하지 않는다.
+      const reason = `graph run 실패: ${error instanceof Error ? error.message : String(error)}`;
+      const failed: TaskCard = { ...card, status: 'launch-failed', runId, launchId,
+        history: [...card.history, { at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch-failed', detail: reason, runId }] };
+      writeCard(path, failed);
+      try { debug.log('task-agent', 'launch-failed', { taskId: id, seat: card.seat ?? null, reason }); } catch { /* fail-soft */ }
+      throw new TaskLaunchError(failed, reason);
+    }
+    const at = (opts.now ?? (() => new Date()))().toISOString();
+    const ok = state.status === 'done';
+    // 실패 종료도 구체 blocker(종료 상태·이유·마지막 node)를 기록한다 — 임의 성공 처리하지 않는다.
+    const blocker = ok ? undefined : `graph run 종료 상태 ${state.status}${state.reason ? ` — ${state.reason}` : ''}`
+      + `${state.nodes.length ? ` — 마지막 node ${state.nodes.at(-1)?.nodeId} (ok=${state.nodes.at(-1)?.ok})` : ' — node 없음'}`;
+    const launchedGraph: TaskCard = { ...card, status: ok ? 'launched' : 'failed', runId: state.runId, launchId,
+      history: [...card.history,
+        { at, event: 'launch', detail: `graph run ${graphRunPath} (run ${state.runId})` },
+        { at, event: 'run-bound', detail: state.runId, runId: state.runId },
+        ...(blocker ? [{ at, event: 'graph-run-failed', detail: blocker, runId: state.runId }] : [])] };
+    writeCard(path, launchedGraph);
+    try { debug.log('task-agent', 'launched', { taskId: id, seat: card.seat ?? null, runId: state.runId }); } catch { /* fail-soft */ }
+    return { card: launchedGraph, move, mode, launched: true, ...(project ? { cwd: project.target } : {}) };
+  }
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
   let prelaunch: AlreadyDoneDecision;
   try { prelaunch = completion === 'code-pr'
@@ -832,6 +1286,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const launchId = newLaunchUtteranceId();
   recordLaunchUtterance({ source: 'hand', utterance: opts.text, launchId });
   const context: TaskLaunchContext = { runId, launchId, launchUtterance: opts.text, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id,
+    ...parentRoleEnv,
     ...(cardPrNumber(card) ? { ELANOUS_TASK_BOUND_PR: String(cardPrNumber(card)) } : {}),
     ...(card.checklistId ? { ELANOUS_POD_SLOT_ID: card.checklistId } : {}),
     ...(card.seat ? { ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: card.seat } : {}),

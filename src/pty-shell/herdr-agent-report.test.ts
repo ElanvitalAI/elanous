@@ -4,9 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  createFileSeqStore, createHerdrAgentReporter, defaultHerdrRunner, herdrJsonError,
+  createFileSeqStore, createHerdrAgentReporter, defaultHerdrRunner, guardHerdrReleaseOnSignal, herdrJsonError,
+  type HerdrSignalTarget,
   type HerdrRunOpts, type HerdrRunResult, type HerdrSeqStore,
 } from './herdr-agent-report.js';
+import { createFakeHerdr, type FakeHerdr } from '../ux-sim/fake-herdr.js';
 
 /** 시험마다 새 pane 기록 — 실 tmpdir 파일을 안 건드린다. */
 function memorySeqStore(): HerdrSeqStore & { value: number | undefined } {
@@ -436,8 +438,10 @@ describe('r5 — 신고 순서 ⊕ release 인자 순서', () => {
     r.release(); // 결과 모름 → 바로 동기 반납
     idle.resolve({ ok: true });
     await new Promise((res) => setTimeout(res, 0));
-    // 줄 선 session 은 반납 뒤라 안 나간다 · 등록이 늦게 성공해 재반납이 한 번 더 나간다(r6 완화).
-    expect(bag.calls.map((c) => c.argv[1])).toEqual(['report-agent', 'release-agent', 'release-agent']);
+    // 줄 선 session 은 반납 뒤라 안 나간다 · 반납 직전 동기 재등록(EXIT-RACE) · 등록이 늦게 성공해 재반납이 한 번 더 나간다(r6 완화).
+    expect(bag.calls.map((c) => c.argv[1])).toEqual(['report-agent', 'report-agent', 'release-agent', 'release-agent']);
+    expect(bag.calls[1]!.opts.sync).toBe(true);
+    expect(seqOf(bag.calls[2]!.argv)).toBeGreaterThan(seqOf(bag.calls[1]!.argv));
     expect(bag.calls.some((c) => c.argv[1] === 'report-agent-session')).toBe(false);
   });
 
@@ -557,5 +561,101 @@ describe('#29077 r1 — 비 JSON 출력·바이트 상한', () => {
       expect(await run(['x'], { sync: false, timeoutMs: 2000 })).toEqual({ ok: false, stderr: 'split_utf8: 가나다' });
       expect(await run(['x'], { sync: true, timeoutMs: 300 })).toEqual({ ok: false, stderr: 'split_utf8: 가나다' });
     });
+  });
+});
+
+describe('TUI-HERDR-EXIT-RACE — 기동 직후 종료해도 유령이 안 남는다 (쓸 장치: fake-herdr)', () => {
+  /**
+   * 신고기 러너 ← fake-herdr. 비동기 신고는 herdr 자식 프로세스처럼 `delayMs` 뒤에 서버에 닿는다 —
+   * 부모가 죽어도(exit) 자식은 끝까지 간다. 부모가 죽은 뒤엔 결과를 부모에게 돌려주지 않는다.
+   * 동기 신고(종료 경로)는 그 자리에서 닿는다.
+   */
+  function processRunner(herdr: FakeHerdr, delayMs: number) {
+    const proc = { exited: false };
+    const toResult = (r: { code: number | null; stdout: string }): HerdrRunResult => (r.code === 0 && !herdrJsonError(r.stdout) ? { ok: true } : { ok: false, stderr: r.stdout });
+    const run = (argv: string[], opts: HerdrRunOpts): HerdrRunResult | Promise<HerdrRunResult> => {
+      if (opts.sync) return toResult(herdr.runSync(argv));
+      return new Promise<HerdrRunResult>((resolve) => {
+        setTimeout(() => {
+          const r = herdr.runSync(argv);
+          if (!proc.exited) resolve(toResult(r));
+        }, delayMs);
+      });
+    };
+    return { proc, run };
+  }
+  const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+  const env = { HERDR_ENV: '1', HERDR_PANE_ID: 'w1:p1' };
+
+  test('지연 idle(500ms) ⊕ 즉시 release ⊕ 프로세스 종료 → 늦은 등록이 닿은 뒤에도 유령 0 · 다음 기동도 하나만 · 그 반납 뒤 0', async () => {
+    const herdr = createFakeHerdr({ panes: [] });
+    const store = memorySeqStore();
+    let clock = 1_000;
+    const now = () => clock;
+    const first = processRunner(herdr, 500);
+    const a = createHerdrAgentReporter({ env, run: first.run, log: () => {}, seqStore: store, sessionId: 'a', now })!;
+    a.start();
+    a.release();
+    first.proc.exited = true; // ctrl+c — 부모는 여기서 끝, 비동기 idle 자식은 아직 가는 중
+    await sleep(600);
+    expect(herdr.reportedAgents()).toEqual([]);
+
+    clock = 1_000; // 같은 ms 재기동(최악)
+    const second = processRunner(herdr, 0);
+    const b = createHerdrAgentReporter({ env, run: second.run, log: () => {}, seqStore: store, sessionId: 'b', now })!;
+    b.start();
+    await sleep(20);
+    expect(herdr.reportedAgents()).toHaveLength(1);
+    b.release();
+    second.proc.exited = true;
+    await sleep(20);
+    expect(herdr.reportedAgents()).toEqual([]);
+  });
+});
+
+describe('TUI-HERDR-EXIT-RACE — 기동 창의 ctrl+c(SIGINT 기본 죽음)도 반납한다', () => {
+  // 실측(10-22 격리 세션 tf-exit-race): 대시보드가 raw 모드에 들기 «전»의 ctrl+c 는 SIGINT 기본 동작으로
+  // 프로세스를 죽인다(rc130) — 'exit' 훅이 안 돌아 반납 0 · `agent list` 에 elanous idle 이 남았다.
+  function fakeProc(): HerdrSignalTarget & { emit(sig: NodeJS.Signals): void; kills: Array<[number, string]> } {
+    const ls = new Map<string, Array<(sig: NodeJS.Signals) => void>>();
+    const kills: Array<[number, string]> = [];
+    return {
+      pid: 4242,
+      kills,
+      on(sig, fn) { ls.set(sig, [...(ls.get(sig) ?? []), fn]); return this; },
+      removeListener(sig, fn) { ls.set(sig, (ls.get(sig) ?? []).filter((f) => f !== fn)); return this; },
+      listenerCount: (sig) => (ls.get(sig) ?? []).length,
+      kill(pid, sig) { kills.push([pid, String(sig)]); return true; },
+      emit(sig) { for (const fn of [...(ls.get(sig) ?? [])]) fn(sig); },
+    };
+  }
+
+  test('홀로 듣던 SIGINT 면 반납 → 자기 리스너를 걷고 같은 신호를 다시 올려 기본 죽음을 지킨다', () => {
+    for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+      const proc = fakeProc();
+      let released = 0;
+      guardHerdrReleaseOnSignal(() => { released += 1; }, proc);
+      proc.emit(sig);
+      expect(released).toBe(1);
+      expect(proc.listenerCount('SIGINT') + proc.listenerCount('SIGTERM')).toBe(0);
+      expect(proc.kills).toEqual([[4242, sig]]);
+    }
+  });
+
+  test('다른 SIGINT 리스너가 있으면 반납만 하고 다시 올리지 않는다(그쪽이 정한다) · 해제는 리스너를 걷는다', () => {
+    const proc = fakeProc();
+    let released = 0;
+    let other = 0;
+    proc.on('SIGINT', () => { other += 1; });
+    guardHerdrReleaseOnSignal(() => { released += 1; }, proc);
+    proc.emit('SIGINT');
+    expect([released, other]).toEqual([1, 1]);
+    expect(proc.kills).toEqual([]);
+    const proc2 = fakeProc();
+    const off = guardHerdrReleaseOnSignal(() => { released += 1; }, proc2);
+    off();
+    expect(proc2.listenerCount('SIGINT') + proc2.listenerCount('SIGTERM')).toBe(0);
+    proc2.emit('SIGINT');
+    expect(released).toBe(1);
   });
 });

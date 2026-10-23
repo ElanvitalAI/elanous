@@ -177,6 +177,8 @@ export interface FirstRoundEvidence {
   findings?: string;
   /** 첫 라운드가 실제로 건드린 파일. */
   changedFiles?: readonly string[];
+  /** SCOPE-ESCAPE-AS-REFINE — 대상 경로 밖에서 바뀌었고 수용된 파일(«구현이 알려준 새 범위» · 실패 아님). */
+  newScope?: readonly string[];
 }
 
 /** 내부 — 시험은 refineGoalFromFirstRound 가 LLM 에 넘긴 프롬프트로 본다. */
@@ -195,6 +197,7 @@ function buildRegroundingPrompt(v1: string, evidence: FirstRoundEvidence): strin
     '## 첫 라운드 실전',
     `- 자식 요약: ${(evidence.implSummary ?? '').replace(/\s+/g, ' ').trim().slice(0, 600) || '(없음)'}`,
     `- 건드린 파일: ${evidence.changedFiles?.length ? evidence.changedFiles.slice(0, 40).join(', ') : '(관측 없음)'}`,
+    ...(evidence.newScope?.length ? [`- 구현이 알려준 새 범위(대상 경로 밖 편집 · 실패 아님 · 예상 구역에 넣을지 판단): ${evidence.newScope.slice(0, 40).join(', ')}`] : []),
     '### gate·리뷰 지적',
     (evidence.findings ?? '').trim().slice(0, 4000) || '(없음)',
     '',

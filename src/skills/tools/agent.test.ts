@@ -7,17 +7,20 @@ import {
   AGENT_TOOL_BACKGROUND_FANOUT_CEILING,
   AGENT_TOOL_DEFAULT_MAX_TURNS,
   AGENT_TOOL_TURNS_CEILING,
+  buildAgentTool,
+  classifyBackgroundAdmissionPriority,
   countLiveBackgroundFanout,
   countSessionBackgroundFanout,
   dispatchAgent,
   resolveAgentToolMaxTurns,
+  selectNextAdmissionIndex,
   stripAgentToolForOneLevelNesting,
   type AgentToolResult,
 } from './agent.js';
 import { globalAgentRegistry } from '../../agent/registry.js';
 import { SessionCache } from '../../session/cache.js';
 import type { AgentDefinition } from '../../agent/types.js';
-import type { LLMProvider, LLMStreamEvent, LLMToolSpec } from '../../llm.js';
+import type { LLMMessage, LLMProvider, LLMStreamEvent, LLMToolSpec } from '../../llm.js';
 
 function fakeProvider(turns: LLMStreamEvent[][]): LLMProvider {
   let call = 0;
@@ -40,14 +43,24 @@ function fakeProvider(turns: LLMStreamEvent[][]): LLMProvider {
 
 /** Provider whose every child call parks until the test releases it, so
  *  background workers stay LIVE (state running) instead of finishing between
- *  dispatches. `calls` counts real provider invocations — the spawn ruler. */
-function gatedProvider(calls: { count: number }, releases: Array<() => void>): LLMProvider {
+ *  dispatches. `calls` counts real provider invocations — the spawn ruler.
+ *  `prompts`, when supplied, records the child prompt each call received, in
+ *  arrival order — the ruler for WHICH waiting spawn reached the provider. */
+function gatedProvider(
+  calls: { count: number },
+  releases: Array<() => void>,
+  prompts?: string[],
+): LLMProvider {
   return {
     name: 'gated',
     defaultModel: 'gated-model',
     available: () => true,
-    async *streamChat() {
+    async *streamChat(messages: LLMMessage[]) {
       calls.count += 1;
+      if (prompts) {
+        const last = messages[messages.length - 1];
+        prompts.push(typeof last?.content === 'string' ? last.content : JSON.stringify(last ?? null));
+      }
       await new Promise<void>((resolve) => { releases.push(resolve); });
       yield { type: 'text', delta: 'worker done' };
     },
@@ -112,6 +125,38 @@ describe('Agent-tool cap helpers', () => {
       { background: false, state: 'running' },
       { state: 'running' },
     ])).toBe(2);
+  });
+
+  test('selectNextAdmissionIndex admits subagents first, then FIFO by arrival', () => {
+    const general = (seq: number) => ({ priority: 'general' as const, seq });
+    const subagent = (seq: number) => ({ priority: 'subagent' as const, seq });
+    expect(selectNextAdmissionIndex([])).toBe(-1);
+    expect(selectNextAdmissionIndex([general(0), general(1), subagent(2)])).toBe(2);
+    expect(selectNextAdmissionIndex([subagent(5), subagent(3), general(1)])).toBe(1);
+    expect(selectNextAdmissionIndex([general(7), general(2)])).toBe(1);
+    expect(selectNextAdmissionIndex([subagent(4)])).toBe(0);
+  });
+
+  test('classifyBackgroundAdmissionPriority treats a named definition as a subagent', () => {
+    expect(classifyBackgroundAdmissionPriority('general-purpose')).toBe('general');
+    expect(classifyBackgroundAdmissionPriority('value-investor')).toBe('subagent');
+  });
+
+  test('buildAgentTool guides delegation without changing its execution API', () => {
+    const description = buildAgentTool().description;
+    expect(description).toContain('heavy multistep work that would overflow your context');
+    expect(description).toContain('independent units in parallel');
+    expect(description).toContain('long investigations');
+    expect(description).toContain('run_in_background');
+  });
+
+  test('buildAgentTool advertises wait_for_slot without making it required', () => {
+    const parameters = buildAgentTool().parameters as {
+      properties: Record<string, unknown>;
+      required: string[];
+    };
+    expect(parameters.properties).toHaveProperty('wait_for_slot');
+    expect(parameters.required).not.toContain('wait_for_slot');
   });
 });
 
@@ -360,6 +405,222 @@ describe('dispatchAgent — background fan-out ceiling on the production path', 
     expect(countSessionBackgroundFanout(sessionA)).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
     expect(countSessionBackgroundFanout(sessionB)).toBe(1);
 
+    } finally {
+      for (const release of releases) release();
+      await waitFor(() => countLiveBackgroundFanout(globalAgentRegistry.list()) === 0, 'background workers drained');
+    }
+  });
+});
+
+describe('dispatchAgent — shared admission queue on the production path', () => {
+  test('a freed slot admits the waiting subagent before earlier general waits, then FIFO within a class', async () => {
+    const providerCalls = { count: 0 };
+    const releases: Array<() => void> = [];
+    const prompts: string[] = [];
+    const gated = gatedProvider(providerCalls, releases, prompts);
+    const sessionCache = new SessionCache();
+    const opts = { provider: gated, sessionCache, resolveAgentDef: () => stubDef };
+
+    try {
+      // ── fill every fan-out slot so later launches cannot spawn on arrival ──
+      for (let i = 0; i < AGENT_TOOL_BACKGROUND_FANOUT_CEILING; i++) {
+        await dispatchAgent(
+          { description: `live worker ${i}`, prompt: `live work ${i}`, run_in_background: true },
+          opts,
+        );
+      }
+      await waitFor(
+        () => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING,
+        'all live workers reached the provider',
+      );
+      const promptsAtCeiling = prompts.length;
+
+      // ── three launches wait for a slot: two general, one subagent ──
+      let generalASettled = false;
+      let generalBSettled = false;
+      let subagentSettled = false;
+      const generalA = dispatchAgent(
+        { description: 'queued general A', prompt: 'queued general A work', run_in_background: true, wait_for_slot: true },
+        opts,
+      );
+      void generalA.then(() => { generalASettled = true; });
+      const generalB = dispatchAgent(
+        { description: 'queued general B', prompt: 'queued general B work', run_in_background: true, wait_for_slot: true },
+        opts,
+      );
+      void generalB.then(() => { generalBSettled = true; });
+      const subagent = dispatchAgent(
+        {
+          description: 'queued subagent', prompt: 'queued subagent work',
+          subagent_type: 'value-investor', run_in_background: true, wait_for_slot: true,
+        },
+        opts,
+      );
+      void subagent.then(() => { subagentSettled = true; });
+
+      // Waiting means waiting: no refusal, no spawn, no extra provider call.
+      await new Promise<void>((resolve) => { setTimeout(resolve, 25); });
+      expect(generalASettled).toBe(false);
+      expect(generalBSettled).toBe(false);
+      expect(subagentSettled).toBe(false);
+      expect(providerCalls.count).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
+      expect(prompts.length).toBe(promptsAtCeiling);
+
+      // ── one live worker terminals → ONE waiter enters ──
+      releases[0]!();
+      await waitFor(() => subagentSettled, 'the waiting subagent was admitted first');
+      const subagentResult = await subagent;
+      expect(subagentResult.taskId).not.toBe('background-fanout-limit');
+      expect(subagentResult.taskId).not.toBe('dedup');
+      expect(subagentResult.background).toBe(true);
+      await waitFor(
+        () => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING + 1,
+        'the admitted subagent reached the provider',
+      );
+      expect(prompts[prompts.length - 1]).toContain('queued subagent work');
+      expect(generalASettled).toBe(false);
+      expect(generalBSettled).toBe(false);
+
+      // ── second freed slot → the earlier of the two equal-class waits ──
+      releases[1]!();
+      await waitFor(() => generalASettled, 'the earlier general wait was admitted next');
+      await waitFor(
+        () => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING + 2,
+        'the admitted general A reached the provider',
+      );
+      expect(prompts[prompts.length - 1]).toContain('queued general A work');
+      expect(generalBSettled).toBe(false);
+
+      // ── third freed slot → the remaining wait ──
+      releases[2]!();
+      await waitFor(() => generalBSettled, 'the remaining general wait was admitted');
+      await waitFor(
+        () => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING + 3,
+        'the admitted general B reached the provider',
+      );
+      expect(prompts[prompts.length - 1]).toContain('queued general B work');
+
+      const admittedOrder = prompts
+        .filter(p => p.includes('queued '))
+        .map(p => (p.match(/queued (general [AB]|subagent) work/) ?? [])[1]);
+      expect(admittedOrder).toEqual(['subagent', 'general A', 'general B']);
+      // The ceiling itself never moved: admitting waiters refills the same slots.
+      expect(countSessionBackgroundFanout(sessionCache)).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
+      console.log(
+        `[admission-queue] admitted_order=${admittedOrder.join(',')} ` +
+        `provider_calls=${providerCalls.count} live=${countSessionBackgroundFanout(sessionCache)}`,
+      );
+    } finally {
+      for (const release of releases) release();
+      await waitFor(() => countLiveBackgroundFanout(globalAgentRegistry.list()) === 0, 'background workers drained');
+    }
+  });
+
+  test('an aborted wait leaves the shared queue and is refused without spawning', async () => {
+    const providerCalls = { count: 0 };
+    const releases: Array<() => void> = [];
+    const gated = gatedProvider(providerCalls, releases);
+    const sessionCache = new SessionCache();
+    const opts = { provider: gated, sessionCache, resolveAgentDef: () => stubDef };
+    const abort = new AbortController();
+
+    try {
+      for (let i = 0; i < AGENT_TOOL_BACKGROUND_FANOUT_CEILING; i++) {
+        await dispatchAgent(
+          { description: `live worker ${i}`, prompt: `live work ${i}`, run_in_background: true },
+          opts,
+        );
+      }
+      await waitFor(
+        () => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING,
+        'all live workers reached the provider',
+      );
+
+      let settled = false;
+      const waiting = dispatchAgent(
+        { description: 'aborted waiter', prompt: 'aborted waiter work', run_in_background: true, wait_for_slot: true },
+        { ...opts, signal: abort.signal },
+      );
+      void waiting.then(() => { settled = true; });
+      await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+      expect(settled).toBe(false);
+
+      abort.abort();
+      const refused = await waiting;
+      expect(refused.taskId).toBe('background-fanout-limit');
+      expect(refused.output).toContain('NOT SPAWNED');
+      expect(providerCalls.count).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
+
+      // The abandoned waiter is gone from the queue: the freed slot stays free.
+      releases[0]!();
+      await waitFor(
+        () => countLiveBackgroundFanout(globalAgentRegistry.list()) === AGENT_TOOL_BACKGROUND_FANOUT_CEILING - 1,
+        'a live worker drained',
+      );
+      await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+      expect(providerCalls.count).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
+      expect(countSessionBackgroundFanout(sessionCache)).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING - 1);
+    } finally {
+      for (const release of releases) release();
+      await waitFor(() => countLiveBackgroundFanout(globalAgentRegistry.list()) === 0, 'background workers drained');
+    }
+  });
+
+  test('an admitted waiter that throws before spawn hands the slot to the next waiter', async () => {
+    const providerCalls = { count: 0 };
+    const releases: Array<() => void> = [];
+    const prompts: string[] = [];
+    const gated = gatedProvider(providerCalls, releases, prompts);
+    const sessionCache = new SessionCache();
+    const opts = {
+      provider: gated,
+      sessionCache,
+      resolveAgentDef: (name: string) => {
+        if (name === 'value-investor') throw new Error('resolver failed');
+        return stubDef;
+      },
+    };
+
+    try {
+      for (let i = 0; i < AGENT_TOOL_BACKGROUND_FANOUT_CEILING; i++) {
+        await dispatchAgent(
+          { description: `live worker ${i}`, prompt: `live work ${i}`, run_in_background: true },
+          opts,
+        );
+      }
+      await waitFor(
+        () => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING,
+        'all live workers reached the provider',
+      );
+
+      const throwingSubagent = dispatchAgent(
+        {
+          description: 'throwing subagent', prompt: 'throwing subagent work',
+          subagent_type: 'value-investor', run_in_background: true, wait_for_slot: true,
+        },
+        opts,
+      );
+      let generalSettled = false;
+      const general = dispatchAgent(
+        { description: 'queued general', prompt: 'queued general work', run_in_background: true, wait_for_slot: true },
+        opts,
+      );
+      void general.then(() => { generalSettled = true; });
+
+      // The subagent is admitted first, then throws before registering — its
+      // finally-released slot must feed the general waiter without another
+      // worker finishing.
+      releases[0]!();
+      await expect(throwingSubagent).rejects.toThrow('resolver failed');
+      await waitFor(() => generalSettled, 'the general waiter was admitted by the released slot');
+      const generalResult = await general;
+      expect(generalResult.background).toBe(true);
+      await waitFor(
+        () => providerCalls.count === AGENT_TOOL_BACKGROUND_FANOUT_CEILING + 1,
+        'only the general waiter reached the provider',
+      );
+      expect(prompts[prompts.length - 1]).toContain('queued general work');
+      expect(countSessionBackgroundFanout(sessionCache)).toBe(AGENT_TOOL_BACKGROUND_FANOUT_CEILING);
     } finally {
       for (const release of releases) release();
       await waitFor(() => countLiveBackgroundFanout(globalAgentRegistry.list()) === 0, 'background workers drained');

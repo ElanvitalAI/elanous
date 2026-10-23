@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
 import { explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
 import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -101,6 +101,14 @@ afterEach(() => {
 });
 
 describe('goal author grade', () => {
+  // The ambient shell may carry ELANOUS_AUTHOR_GRADE; the default-grade contract below is the absent-env shape.
+  const ambientAuthorGradeEnv = process.env.ELANOUS_AUTHOR_GRADE;
+  beforeAll(() => { delete process.env.ELANOUS_AUTHOR_GRADE; });
+  afterAll(() => {
+    if (ambientAuthorGradeEnv === undefined) delete process.env.ELANOUS_AUTHOR_GRADE;
+    else process.env.ELANOUS_AUTHOR_GRADE = ambientAuthorGradeEnv;
+  });
+
   test('shell operators make completion evidence commands unsupported', () => {
     const commands = [
       'test -f /tmp/proof && echo ok',
@@ -6519,7 +6527,7 @@ ${report}`);
     expect(childInstruction).toContain(`${requestedEvidence}\n${resultInstruction}\n${preservationEvidence}\n${resultInstruction}`);
 
     expect(GOAL_RULES_POLICY.slice(0, 6)).toEqual([
-      '- Do not run the whole test suite. If tests apply, name the focused file(s) and read only each summary line; a full suite can exhaust the implementer context window.',
+      '- Do not run the whole test suite. If tests apply, name the focused file(s) and read only each summary line; a full suite can exhaust the implementer context window. If the same evidence test times out twice, stop rerunning it and switch to a narrower direct-import test; report the timeout and replacement command.',
       '- Do not infer a code path from a symbol grep. Trace a candidate before naming it as an implementation target.',
       '- Do not create a planner, milestones, steps, task decomposition, worktree, PR, mission, daemon call, or dev-pipeline hand-off; this artifact is authoring only.',
       '- Do not write an acceptance criterion that cannot hold at the same time as another one. Naming a field to add while demanding that same return value stay completely unchanged is a trap, not a contract: name the fields and values that must stay identical.',
@@ -10616,6 +10624,27 @@ describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
   const repoRoot = join(import.meta.dir, '..', '..');
   const docs = readVerificationMenuDocs(repoRoot);
 
+  test('DEVICE-FIRST-AUTHORING records the selected device and a staged first step in the authored goal', async () => {
+    const ask = '대상 경로: src/feature.ts\n완료 경계 증거 명령: bun test src/feature.test.ts\n필요한 장치: fault-synthetic';
+    const authored = await authorGoal(ask, {
+      ...deps, repositoryRoot: repoRoot,
+      decomposeSteps: async () => ['대상 경로: src/feature.ts · 동작: 기능 배선'],
+    });
+    expect(authored.document).toContain('## STEPS\n- 신설: src/ux-sim/fault-synthetic.ts · src/ux-sim/fault-synthetic.test.ts');
+    expect(authored.document).toContain('선행: DEVICE-FIRST-STAGE 조각 착지 뒤 발사');
+    expect(authored.document).toContain('- 쓸 장치: src/ux-sim/fault-synthetic.ts · 필요한 장치 · 없음 — 첫 조각에서 개발');
+  });
+
+  test('DEVICE-FIRST-AUTHORING without target root marks device inventory unmeasured', async () => {
+    const ask = '대상 경로: src/feature.ts\n완료 경계 증거 명령: bun test src/feature.test.ts\n필요한 장치: fault-synthetic';
+    const authored = await authorGoal(ask, {
+      ...deps, repositoryRoot: undefined,
+      decomposeSteps: async () => ['대상 경로: src/feature.ts · 동작: 기능 배선'],
+    });
+    expect(authored.document).toContain('- 장치 재고: 미측정(대상 루트 미상) · 후보: src/ux-sim/fault-synthetic.ts');
+    expect(authored.document).not.toContain('필요한 장치 · 없음 — 첫 조각에서 개발');
+  });
+
   test('catalog stage: an ask naming release resume selects MS-02 with an injection-ladder level and five lines', () => {
     const plan = authorVerificationPlan({
       ask: '대상 경로: src/release-loop/resume.ts\n실패한 발행 런에서 `release resume --dry-run` 이 계획을 내고 런 원장은 불변이다.',
@@ -10711,7 +10740,7 @@ describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
       const headings = lines.filter((line) => /^#{2,3} /u.test(line));
       const planHeading = headings.indexOf(VERIFICATION_PLAN_HEADING);
       expect(headings.slice(planHeading - 2, planHeading + 2)).toEqual(['## 답하지 못하는 것', '### 수용 구별 관측', VERIFICATION_PLAN_HEADING, '## 불변식']);
-      expect(lintGoalFile(authored.document, 'b').filter((finding) => finding.tag === 'required-section-order')).toEqual([]);
+      expect(lintGoalFile(authored.document, 'b').filter((finding) => finding.check === 'required-section-order')).toEqual([]);
     }
   });
 });

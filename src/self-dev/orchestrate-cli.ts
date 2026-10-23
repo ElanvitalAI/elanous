@@ -342,9 +342,15 @@ export async function runSelfOrchestrateCliCommand(
   try {
     // ⭐ goals·spec 이 «라운드마다 바뀔 수 있다» — 분해 제안이 조각을 쪼개면 연합으로 승격된다.
     let currentGoals = input.goals;
+    // A supervised split starts from an ordinary single goal, so the CLI did not
+    // receive --decompose/parentRequest. Preserve that goal as the boundary source
+    // when its children replace it in a later round.
+    let supervisedParentRequest = input.parentRequest;
     let spec = buildSelfOrchestrateDevSpec(currentGoals, input.concurrency);
     /** 이미 쪼갠 goal — ⛔ 같은 것을 두 번 쪼개면 조각이 무한히 불어난다. */
     const decomposedFeatures = new Set<string>();
+    /** 거부된 제안의 feature — ⛔ 다음 라운드가 같은 제안을 다시 쓰고 다시 조용히 거부하는 것을 막는다. */
+    const rejectedFeatures = new Set<string>();
     const repairFingerprints = new Map<string, number>();
     const repairAppend: RepairAppendObservation[] = [];
     let repairFragmentsAdded = 0;
@@ -383,7 +389,7 @@ export async function runSelfOrchestrateCliCommand(
     };
     const runtimeWithParentRequest = (): OrchestrateRuntime => {
       const runtime = runtimeForObservationCycle();
-      return input.parentRequest === undefined ? runtime : { ...runtime, parentRequest: input.parentRequest };
+      return supervisedParentRequest === undefined ? runtime : { ...runtime, parentRequest: supervisedParentRequest };
     };
     const exec = deps.executeReroute ?? executeOrchestrateReroute;
     const pipelineDeps = deps.pipelineDeps ? { pipelineDeps: deps.pipelineDeps } : undefined;
@@ -391,11 +397,35 @@ export async function runSelfOrchestrateCliCommand(
     let baseRuntime = runtimeWithParentRequest();
     let { results, exitCode } = await exec(spec, baseRuntime, pipelineDeps);
 
+    // ⭐⭐⭐ SUPERVISOR-SOFTSTOP-HONOR — 사람이 child 를 멈췄다는 신호(stage 'soft-stopped')는
+    //   «라운드 경계»에서 존중된다(재현 원장 run-8cf691c5: ccaf Pod 가 soft-stopped 로 끝났는데
+    //   5초 뒤 fa fa Pod 가 발사됐다). 근거는 «이번 invocation 에서 막 끝난 결과»뿐이다 —
+    //   과거 checkpoint 의 soft-stopped 항목을 읽지 않으므로 새 호출의 무관한 작업을 막지 않는다.
+    const childSoftStop = (rs: readonly SelfDevJobResult[]): SelfDevJobResult | undefined =>
+      rs.find((r) => r.stage === 'soft-stopped');
+    // ⭐ 원샷 래치 — 이번 invocation 이 «같은 정지된 조각»을 두 번 계상하지 않는다: rerun 재진입
+    //   방어가 pair 를 이미 냈으면 종착 관측(stoppedAfter)이 같은 taskId 로 재발행하지 않는다.
+    //   #30606 리뷰: 방어가 여러 번 재진입돼도(결과 불변 감독 루프) pair 는 정확히 1회.
+    const honoredStops = new Set<string>();
+    const observeSoftStopHonored = (stopped: SelfDevJobResult, round: number): void => {
+      if (honoredStops.has(stopped.taskId)) return;
+      honoredStops.add(stopped.taskId);
+      try {
+        debug.log('self-dev.supervisor', 'human-stopped', { stage: 'soft-stopped', taskId: stopped.taskId, round });
+        debug.log('self-dev.supervisor', 'soft-stop-honored', { stage: 'soft-stopped', taskId: stopped.taskId, round });
+      } catch { /* observation must not interrupt execution */ }
+    };
+
     // ⭐⭐⭐ 런 슈퍼바이저 — 스위치가 켜졌으면 «여기»서 끝까지 돈다.
     //   ⛔ 프로세스를 다시 띄우지 않는다: resumeFrom 심으로 같은 프로세스 안에서 라운드를 돌아야
     //     runId·체크포인트·관측이 한 줄로 이어진다.
     //   ⛔ 판정은 순수 모듈(run-supervisor)이 하고, 이 심은 그 답을 «집행»만 한다.
     if (input.supervise) {
+      const stoppedFirst = childSoftStop(results);
+      // 첫 라운드가 사람 정지로 끝났으면 재발사를 «시작하지 않는다» — 총 exec 1 · 다음 Pod 0.
+      // 라운드 표기는 strategy.launch 와 같은 1-기반(첫 exec = round 1)을 쓴다.
+      if (stoppedFirst) observeSoftStopHonored(stoppedFirst, 1);
+      if (!stoppedFirst) {
       const limits = {
         ...(input.supervise.rounds === undefined ? {} : { maxRounds: input.supervise.rounds }),
         ...(input.supervise.stallRounds === undefined ? {} : { stallRounds: input.supervise.stallRounds }),
@@ -435,6 +465,14 @@ export async function runSelfOrchestrateCliCommand(
         // ⭐ 방금 끝난 결과를 넘긴다 — orchestrateSelfDev 가 classifyResumeDisposition 으로
         //   skip/rerun 을 갈라준다(재발명 0 · 착지한 조각은 다시 안 돈다).
         rerun: async (previous, invocation) => {
+          // ⭐⭐⭐ SUPERVISOR-SOFTSTOP-HONOR — 직전 라운드가 사람 정지(stage 'soft-stopped')로
+          //   끝났으면 다음 exec(spec, resumeFrom…) 직전에 멈춘다. 근거는 «이번 invocation 에서
+          //   막 끝난 previous» 하나뿐 — 과거 checkpoint 를 읽지 않으므로 새 호출을 막지 않는다.
+          const stoppedPrevious = childSoftStop(previous);
+          if (stoppedPrevious) {
+            observeSoftStopHonored(stoppedPrevious, supervisedRound + 1);
+            return previous;
+          }
           let addedRepairIds: string[] = [];
           // A requested repair that cannot be bound to exactly one goal is held (not relaunched with the old strategy).
           const unrepairedHold: string[] = [];
@@ -485,15 +523,37 @@ export async function runSelfOrchestrateCliCommand(
           //   ⛔ 의존성은 조각이 «들고 온 그대로» 물려준다 ⇒ dependsOn 이 없는 조각은
           //     orchestrateSelfDev 의 위상 병렬로 «자동으로 동시에» 돈다(대표 2026-08-19 기본 동작).
           const goalsBeforeDecompose = new Set(currentGoals);
-          const applied = applyDecomposeProposals(currentGoals, previous, { alreadyDecomposed: decomposedFeatures });
+          const applied = applyDecomposeProposals(currentGoals, previous, {
+            // ⛔⭐ 거부된 feature 도 «다시 제안되지 않게» 한다 — 이미 쪼갠 것과 같은 상태로 센다.
+            //   이렇게 하지 않으면 다음 라운드가 같은 제안을 다시 읽고 다시 조용히 거부한다.
+            alreadyDecomposed: new Set([...decomposedFeatures, ...rejectedFeatures]),
+          });
+          // ⛔⭐ 거부된 제안을 «상태로» 남긴다 — applyDecomposeProposals 안의 관측과 함께
+          //   「쪼개지 않았다」는 사실과 그 사유가 로그와 라운드 간 상태에 다 남는다.
+          if (applied.rejected.length > 0) {
+            for (const rejection of applied.rejected) rejectedFeatures.add(rejection.feature);
+            try {
+              debug.log('self-dev.supervisor', 'decompose-rejected.applied', {
+                rejected: applied.rejected.map((rejection) => ({
+                  feature: rejection.feature.slice(0, 120),
+                  reason: rejection.reason,
+                  danglingIds: [...rejection.detail],
+                })),
+              });
+            } catch { /* fail-open */ }
+          }
           if (applied.decomposed.length > 0) {
+            if (supervisedParentRequest === undefined && applied.decomposed.length === 1
+              && currentGoals.length === 1 && currentGoals[0]?.feature === applied.decomposed[0]) {
+              supervisedParentRequest = applied.decomposed[0];
+            }
             for (const f of applied.decomposed) decomposedFeatures.add(f);
             currentGoals = applied.goals;
             spec = buildSelfOrchestrateDevSpec(currentGoals, input.concurrency);
             try {
               // ⛔⭐ 「원본 ↔ 조각」을 «이름»으로 남긴다 — 수만 남기면 그 연결이 «영영» 안 남는다.
               //   📏 2026-08-19 자수: 초판이 decomposed.length 만 실었다. 그러면 나중에
-              //     「이 런이 어느 원본에서 쪼개졌나」를 «아무 데서도» 못 가린다.
+              //     「이 런이 어느 원본에서 쪼개졌나»를 «아무 데서도» 못 가린다.
               //   ⚠️ 그리고 이 값은 «로그»라 보존이 짧다(~2.5시간 실측 · 원장은 15일) —
               //     원장에 싣는 것이 다음 칸이다(🅣 축 · E0).
               debug.log('self-dev.supervisor', 'decompose-and-retry.applied', {
@@ -569,6 +629,11 @@ export async function runSelfOrchestrateCliCommand(
           return next.results;
         },
       });
+      // 감독 루프가 사람 정지 라운드 뒤 rerun 없이 스스로 멈출 수도 있다 — 그 종결도
+      // 이번 invocation 의 «막 끝난» 결과만 근거로 이름 있는 관측으로 남긴다.
+      const stoppedAfter = childSoftStop(results);
+      if (stoppedAfter) observeSoftStopHonored(stoppedAfter, supervisedRound + 1);
+      } // (!stoppedFirst — 사람 정지면 superviseRun 자체를 시작하지 않는다)
     }
 
     return { ok: true, results, exitCode, ...(repairAppend.length ? { repairAppend } : {}) };

@@ -25,7 +25,7 @@ const KNOWHOW_PATH = 'docs/roles/OP/KNOWHOW.md';
  * 카드 제목 문법은 src/seat-loop/knowhow-lint.ts 의 CARD_HEADING 과 같아야 한다.
  * 다르면 린트가 카드로 못 본 제목이 자를 때 조용히 사라지거나, 번호만 잘려 엉뚱한 아이디로 제외 기록에 남는다.
  */
-const CARD_HEADING = /^[ \t]{0,3}##\s+(K-[A-Za-z]+-\d+)(?=$|\s|:|—)(.*)$/u;
+const CARD_HEADING = /^[ \t]{0,3}##\s+(K-[A-Za-z]+(?:-[A-Za-z]{1,4})?-\d+)(?=$|\s|:|—)(.*)$/u;
 const CARD_HEADING_LIKE = /^[ \t]{0,3}##\s*(K-[^\s:]*)/iu;
 const SECTION_HEADING = /^[ \t]{0,3}##\s/u;
 

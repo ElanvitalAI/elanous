@@ -33,12 +33,97 @@ const mystery = (id: string) => ({
   taskId: id, feature: id, status: 'failed', stage: 'error',
   error: { code: 'BOOM', message: 'TypeError: undefined is not a function' },
 }) as never;
+const mysteryWithProposal = (id: string) => ({ ...mystery(id),
+  decomposeProposal: { pieces: [{ id: 'piece-a', feature: 'bounded piece a', dependsOn: [] }, { id: 'piece-b', feature: 'bounded piece b', dependsOn: [] }] },
+}) as never;
 const falseFailure = (id: string) => ({
   taskId: id, feature: id, status: 'failed', stage: 'merged', merged: true,
   error: { code: 'PARENT_SIGNAL_LOST', message: 'parent lost child completion signal' },
 }) as never;
 
 describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
+  test('NEEDS-HUMAN-SELF-HEAL-FIRST: PR 없는 unclassified+실증 조각은 실행기가 있을 때만 한 번 분해한다', () => {
+    const result = mysteryWithProposal('unknown-with-pieces');
+    const first = decideNextRun({ results: [result], decompositionExecution: true });
+    expect(first).toMatchObject({ action: 'relaunch', decomposable: ['unknown-with-pieces'], selfHeal: { reason: 'supervisor-unclassified-decompose', attempt: 1 } });
+    expect(decideNextRun({ results: [result], decompositionExecution: true, limits: { maxRounds: 1 } }))
+      .toMatchObject({ action: 'relaunch', selfHeal: { attempt: 1 } });
+    expect(decideNextRun({ results: [result], decompositionExecution: true, limits: { maxRounds: 0 } }))
+      .toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    expect(decideNextRun({ results: [result] })).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    const history = appendRound([], [result], first.reviewMustFixTrend, first);
+    expect(decideNextRun({ results: [result], history, decompositionExecution: true })).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    expect(decideNextRun({ results: [{ ...result, prNumber: 91 }], decompositionExecution: true })).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    expect(decideNextRun({ results: [{ ...result, prUrl: 'https://example.test/pull/91' }], decompositionExecution: true }))
+      .toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    expect(decideNextRun({ results: [result, mysteryWithProposal('second-candidate')], decompositionExecution: true }))
+      .toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    expect(decideNextRun({ results: [result, { ...result, taskId: 'provider-request', feature: 'provider-request',
+      providerErrors: { category: 'request', provider: 'openrouter', count: 1 } }], decompositionExecution: true }))
+      .toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    for (const unsafe of [
+      { ...result, providerErrors: { category: 'request', provider: 'openrouter', count: 1 } },
+      { ...result, blockReason: 'parent-unlanded' },
+      { ...result, blockReason: 'dependency-needs-human' },
+    ]) {
+      expect(decideNextRun({ results: [unsafe], decompositionExecution: true })).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    }
+  });
+
+  test('NEEDS-HUMAN-SELF-HEAL-FIRST: 승격 성공만 재실행하고 실패는 고정 사유로 HITL', async () => {
+    const result = mysteryWithProposal('unknown-with-pieces');
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let reruns = 0;
+    const operatorDir = mkdtempSync(join(tmpdir(), 'supervisor-self-heal-'));
+    const runId = 'run-supervisor-self-heal';
+    try {
+      saveSelfDevRun({ runId, createdAt: 1, updatedAt: 1, results: [] }, operatorDir);
+      await superviseRun({ initial: [result], promoteDecomposition: () => ({ reason: 'no-piece-executor' }),
+        runStore: { runId, operatorDir },
+        rerun: async () => { reruns++; return [merged('unexpected')]; },
+        observe: (event, data) => events.push({ event, data }), taskAgentShadow: false });
+      expect(reruns).toBe(0);
+      expect(loadSelfDevRun(runId, operatorDir)?.supervisorStopReason).toBe('needs-human');
+      expect(events.find((e) => e.event === 'decision')?.data).toMatchObject({ action: 'stop', stopReason: 'needs-human',
+        selfHealReason: 'supervisor-unclassified-decompose', selfHealAttempt: 1, decomposePromotionReason: 'no-piece-executor',
+        why: expect.stringContaining('supervisor-unclassified-decompose (attempt: 1/1)'),
+        needsHuman: 1, decomposable: 0, kinds: ['unclassified:needs-human'] });
+      expect(events.find((e) => e.event === 'supervisor-stop.persisted')?.data).toMatchObject({ runId,
+        reason: 'needs-human', selfHealReason: 'supervisor-unclassified-decompose', selfHealAttempt: 1 });
+    } finally { rmSync(operatorDir, { recursive: true, force: true }); }
+  });
+
+  test('NEEDS-HUMAN-SELF-HEAL-FIRST: 불완전한 승격 영수증과 실행기 예외는 재실행 없이 HITL', async () => {
+    for (const promotion of [() => ({ reason: 'one-piece', pieceCount: 1 }), () => { throw new Error('promoter failed'); }]) {
+      const decisions: Array<{ action: string; stopReason?: string; needsHuman: string[]; decomposable: string[] }> = [];
+      let reruns = 0;
+      await superviseRun({ initial: [mysteryWithProposal('unknown-with-pieces')], promoteDecomposition: promotion,
+        rerun: async (previous) => { reruns++; return previous; }, onDecision: (decision) => decisions.push(decision),
+        taskAgentShadow: false });
+      expect(reruns).toBe(0);
+      expect(decisions[0]).toMatchObject({ action: 'stop', stopReason: 'needs-human', needsHuman: ['unknown-with-pieces'], decomposable: [] });
+    }
+  });
+
+  test('NEEDS-HUMAN-SELF-HEAL-FIRST: 성공한 분해 시도는 새 taskId여도 같은 feature에 두 번 쓰지 않는다', async () => {
+    const result = mysteryWithProposal('first-id');
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let promotions = 0;
+    let reruns = 0;
+    await superviseRun({ initial: [result], promoteDecomposition: () => {
+      promotions++;
+      return { reason: 'dev-piece-execution', pieceCount: 2 };
+    }, rerun: async () => {
+      reruns++;
+      return [{ ...mysteryWithProposal('second-id'), feature: result.feature }];
+    }, observe: (event, data) => events.push({ event, data }), taskAgentShadow: false });
+    expect(promotions).toBe(1);
+    expect(reruns).toBe(1);
+    expect(events.find((e) => e.event === 'supervisor-self-heal')?.data).toMatchObject({
+      reason: 'supervisor-unclassified-decompose', attempt: 1, outcome: 'promoted', taskIds: ['first-id'] });
+    expect(events.filter((e) => e.event === 'decision').map((e) => [e.data.action, e.data.stopReason]))
+      .toEqual([['relaunch', null], ['stop', 'needs-human']]);
+  });
   test('default terminal helper resolves exactly its launched TA land card and calls real rejudge entry', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ta-terminal-default-'));
     const statePath = join(dir, 'task-agent-actions.json');
@@ -804,7 +889,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     expect(supervisor).toMatch(/const goalPlanRevisionObservation = formatGoalPlanRevisionObservation\(results\)/);
     expect(supervisor).toMatch(/why: withGoalPlanRevisionObservation\(/);
     expect(supervisor).not.toMatch(/export function formatGoalPlanRevisionObservation/);
-    expect(supervisor).toMatch(/const decision = decideNextRun\(/);
+    expect(supervisor).toMatch(/(?:const|let) decision = decideNextRun\(/);
     expect(caller).toMatch(/export async function runSelfOrchestrateCliCommand[\s\S]*?results = await superviseRun\(/);
   });
 });

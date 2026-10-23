@@ -1284,6 +1284,62 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(rejudgeCandidates({ fresh, ready }, { now, currentHeads: new Map([['ready', B]]) })).toEqual(['fresh', 'ready']);
   });
 
+  // GOODHART — 손 병합된 실패 카드의 자동 정산은 실행기(executeLiveLand)를 직접 부르는 시험만으로는 증명되지 않는다.
+  // 실제 디스패처 진입점(rejudgeCardOnHead)을 실패 카드로 실행하고, 실행 뒤 임시 원장의 status·이력·터미널로 증명한다.
+  test('dispatcher settles a hand-merged failed card through the real entry and keeps the merge-sha terminal on the next tick', async () => {
+    const gitEnv: Record<string, string | undefined> = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
+    delete gitEnv.GIT_CONFIG_COUNT;
+    delete gitEnv.GIT_CONFIG_PARAMETERS;
+    delete gitEnv.GIT_TEMPLATE_DIR;
+    const repo = mkdtempSync(join(tmpdir(), 'ta-rejudge-hand-'));
+    const git = (...args: string[]) => {
+      const out = spawnSync('git', args, { cwd: repo, encoding: 'utf8', env: gitEnv });
+      expect(out.status).toBe(0);
+      return String(out.stdout).trim();
+    };
+    const commit = (message: string) => git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'commit', '--allow-empty', '-m', message);
+    git('init', '-b', 'main');
+    commit('base');
+    git('checkout', '-b', 'feature');
+    commit('feature');
+    git('checkout', 'main');
+    git('-c', 'user.name=ta', '-c', 'user.email=ta@example.invalid', 'merge', '--no-ff', '-m', 'hand merge feature', 'feature');
+    const mergeCommit = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', mergeCommit);
+
+    const f = fixture();
+    const reason = 'failed/needs-owner — run died';
+    writeTaskCards(f.statePath, [{ ...f.card(), taLand: true, status: 'failed',
+      landAttempts: [{ pr: 30, head: A, at: '2026-10-11T00:30:00.000Z' }],
+      history: [...(f.card().history ?? []), { at: '2026-10-11T00:25:00.000Z', event: 'judge', detail: reason }] }]);
+    const deps = { ...f.deps(),
+      live: { ...f.deps().live,
+        repoCandidates: () => [{ source: 'host' as const, cwd: repo }],
+        prHead: async () => ({ head: A, state: 'MERGED', url: URL }),
+        landPrHead: async () => ({ head: A, state: 'MERGED', isDraft: false, url: URL }),
+        handMergePr: async () => ({ state: 'MERGED', url: URL, baseRefName: 'main', mergedAt: '2026-10-11T01:10:00.000Z', mergeCommit }) } };
+    const outcomes = await rejudgeCardOnHead(f.card().id, deps);
+    expect(outcomes.at(-1)?.decision).toBe('landed-by-hand');
+    expect(outcomes.at(-1)?.reason).toContain('손 병합 정산');
+    expect(f.decisions()).toContain('target:landed-by-hand');
+    expect(f.lands).toHaveLength(0);
+    const settled = f.card();
+    expect(settled.status).toBe('landed-by-hand');
+    const handMove = settled.history?.at(-1);
+    expect(handMove?.event).toBe('hand-move');
+    expect(handMove?.detail).toContain('이전 status: failed');
+    expect(handMove?.detail).toContain(`이전 사유: ${reason}`);
+    expect(settled.prTerminal).toMatchObject({ pr: 30, url: URL, head: mergeCommit, state: 'MERGED' });
+    expect(settled.landAttempts).toEqual([{ pr: 30, head: A, at: '2026-10-11T00:30:00.000Z' }]);
+    expect(rejudgeCandidates({ [settled.id]: settled })).toEqual([]);
+    // 다음 틱은 정산된 카드의 merge sha 터미널을 가지 머리로 덮어쓰지 않는다.
+    const second = await rejudgeCardOnHead(f.card().id, deps);
+    expect(second.at(-1)?.decision).toBe('pr-not-open');
+    expect(f.card().prTerminal?.head).toBe(mergeCommit);
+    expect(f.card().status).toBe('landed-by-hand');
+    expect((f.card().history ?? []).filter((entry) => entry.event === 'hand-move')).toHaveLength(1);
+  });
+
   test('MERGED/CLOSED bound PR is recorded once and excluded from future ticks', async () => {
     for (const state of ['MERGED', 'CLOSED'] as const) {
       const f = fixture();
@@ -1303,11 +1359,13 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
 
   test('verified train closes a component card once without a new repair or regate', async () => {
     const f = fixture();
+    const wake: string[] = [];
     // A run-bound component can be train-landed even when its older card has no taLand flag.
     const oldTerminal = { pr: 30, url: URL, head: B, state: 'CLOSED' as const, at: '2026-10-11T00:30:00.000Z' };
     writeTaskCards(f.statePath, [{ ...f.card(), prTerminal: oldTerminal }]);
     let observedHead = B;
     const deps = { ...f.deps(), trainLanding: () => ({ componentPr: 30, integrationPr: 91, mergeSha: BASE, train: 'c2' }),
+      advanceLandedPiece: async (pieceId: string) => { wake.push(pieceId); },
       live: { ...f.deps().live, prHead: async () => ({ head: observedHead, state: 'CLOSED', url: URL }) } };
     expect((await rejudgeCardOnHead(f.card().id, deps)).at(-1)?.decision).toBe('landed-via-train');
     expect(f.card()).toMatchObject({ status: 'done', trainLanding: { componentPr: 30, integrationPr: 91, mergeSha: BASE },
@@ -1324,6 +1382,7 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(f.regateRequests).toHaveLength(0);
     expect(f.reviewRequests).toHaveLength(0);
     expect(f.lands).toHaveLength(0);
+    expect(wake).toEqual([f.card().id]);
   });
 
   test('an unreviewed CLOSED PR without train proof keeps the old start guard', async () => {

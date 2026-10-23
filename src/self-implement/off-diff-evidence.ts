@@ -3,6 +3,7 @@
 import { requirePosixShellCommand } from '../platform/default-shell.js';
 import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
+import { narrowerEvidenceCommand } from './evidence-command-budget.js';
 import { resolveRunIdentity } from '../harness/harness-space.js';
 //
 // ⛔ **왜 필요한가** — 리뷰어의 증거 채널은 워크트리 diff 하나다(`seams.ts` 의 `reviewDiff`).
@@ -320,13 +321,20 @@ export function authorLimitationCountFromGoal(goal: string): number {
  *  추론된다. 위 두 타입과 같은 규율이다(죽은 공개 표면은 계약처럼 읽힌다 · 리뷰 must-fix). */
 interface RequiredEvidenceCheckRun {
   readonly tag: string;
+  /** Command required by the authored goal, even if a diagnostic substitute ran. */
   readonly command: string;
+  /** Command actually run; absent when the timeout budget stopped execution. */
+  readonly executedCommand?: string;
   readonly exitCode: number | null;
   readonly stdout: string;
   /** EVIDENCE-WIRING-EXEMPT — `bun test` writes its «N pass / 0 fail» summary to stderr. */
   readonly stderr: string;
   readonly durationMs: number;
+  /** A narrower smoke check diagnoses the timeout but cannot prove the original requirement. */
+  readonly substitutedFor?: string;
 }
+
+type EvidenceCommandRunner = (command: string, cwd: string) => Pick<ReturnType<typeof spawnSync>, 'status' | 'stdout' | 'stderr' | 'error'>;
 
 /**
  * ★ `I-24` / `RUN-T6` — 골에서 **요구된 증거**를 읽는다. **순수**.
@@ -394,7 +402,7 @@ export function goalDeclaresNoWiring(goal: string): boolean {
 
 /** A `bun test` check that ran its tests and failed none: rc 0 ⊕ «N pass» (N ≥ 1) ⊕ «0 fail» in its output. */
 function bunTestCheckPassed(run: RequiredEvidenceCheckRun): boolean {
-  if (run.exitCode !== 0 || !/(?:^|[\s;&|(])bun\s+(?:run\s+)?test\b/.test(run.command)) return false;
+  if (run.substitutedFor || run.exitCode !== 0 || !/(?:^|[\s;&|(])bun\s+(?:run\s+)?test\b/.test(run.executedCommand ?? run.command)) return false;
   const output = `${run.stdout}\n${run.stderr}`;
   return /(?:^|\n)\s*[1-9]\d*\s+pass\b/.test(output) && /(?:^|\n)\s*0\s+fail\b/.test(output);
 }
@@ -418,20 +426,46 @@ export function settleUncoveredEvidence(
 }
 
 /** 골 작성자가 요구 줄에 명시한 셸 체크를 하니스 worktree에서 관측한다. `bun test` 체크의 통과는
- *  settleUncoveredEvidence 가 그 요구의 덮임으로 받는다(EVIDENCE-WIRING-EXEMPT). */
-export function runRequiredEvidenceChecks(goal: string, cwd: string, runId?: string): RequiredEvidenceCheckRun[] {
+ *  settleUncoveredEvidence 가 그 요구의 덮임으로 받는다(EVIDENCE-WIRING-EXEMPT).
+ *  단독 호출에 timeoutCounts/headCommit을 주지 않으면 재시도 예산이 없다. 실제 라운드 호출자는
+ *  run 단위 createRequiredEvidenceBudget을 써야 HEAD 미확인 때도 임시 예산이 적용된다. */
+export function runRequiredEvidenceChecks(goal: string, cwd: string, runId?: string, options: {
+  timeoutCounts?: Map<string, number>;
+  headCommit?: string;
+  run?: EvidenceCommandRunner;
+} = {}): RequiredEvidenceCheckRun[] {
   const identity = resolveRunIdentity({ explicit: runId });
   const checks = requiredEvidenceFromGoal(goal).flatMap(({ tag, verifyCommand }) => verifyCommand ? [{ tag, command: verifyCommand }] : []);
+  // Direct callers without a measured HEAD have no stable revision identity;
+  // the run-owned wrapper supplies a temporary identity when appropriate.
+  const timeoutCounts = options.headCommit ? options.timeoutCounts : undefined;
+  const budgetKey = (command: string) => `${options.headCommit ?? ''}\0${command}`;
   const runs = checks.map(({ tag, command }) => {
     const startedAt = Date.now();
-    const result = spawnSync(requirePosixShellCommand('/bin/sh'), ['-c', command], { cwd, encoding: 'utf8', timeout: 180_000, maxBuffer: 32 * 1024 * 1024 });
+    const priorTimeouts = timeoutCounts?.get(budgetKey(command)) ?? 0;
+    const replacement = priorTimeouts >= 2 ? narrowerEvidenceCommand(command, cwd) : null;
+    const executedCommand = replacement ?? command;
+    const replacementTimeouts = replacement ? (timeoutCounts?.get(budgetKey(replacement)) ?? 0) : 0;
+    if (priorTimeouts >= 2 && (!replacement || replacementTimeouts >= 2)) {
+      try { debug.log('self-implement.evidence', 'command-budget-stop', { runId: identity.runId, command, replacement, timeoutCount: priorTimeouts, replacementTimeoutCount: replacementTimeouts }); } catch { /* observation is fail-soft */ }
+      return { tag, command, exitCode: null, stdout: '', stderr: 'Evidence command timed out twice; no further identical test run was attempted.', durationMs: 0 };
+    }
+    if (replacement) {
+      try { debug.log('self-implement.evidence', 'command-budget-switch', { runId: identity.runId, from: command, to: replacement, timeoutCount: priorTimeouts }); } catch { /* observation is fail-soft */ }
+    }
+    const result = options.run?.(executedCommand, cwd)
+      ?? spawnSync(requirePosixShellCommand('/bin/sh'), ['-c', executedCommand], { cwd, encoding: 'utf8', timeout: 180_000, maxBuffer: 32 * 1024 * 1024 });
+    const timedOut = result.error && 'code' in result.error && result.error.code === 'ETIMEDOUT';
+    if (timedOut && timeoutCounts) timeoutCounts.set(budgetKey(executedCommand), (timeoutCounts.get(budgetKey(executedCommand)) ?? 0) + 1);
     return {
       tag,
       command,
+      executedCommand,
       exitCode: result.status,
-      stdout: tailWithOmissionMarker(result.stdout ?? '', MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS),
-      stderr: tailWithOmissionMarker(result.stderr ?? '', MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS),
+      stdout: tailWithOmissionMarker(typeof result.stdout === 'string' ? result.stdout : result.stdout?.toString('utf8') ?? '', MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS),
+      stderr: tailWithOmissionMarker(typeof result.stderr === 'string' ? result.stderr : result.stderr?.toString('utf8') ?? '', MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS),
       durationMs: Date.now() - startedAt,
+      ...(replacement ? { substitutedFor: command } : {}),
     };
   });
   const observation = { count: runs.length, runs };
@@ -441,6 +475,24 @@ export function runRequiredEvidenceChecks(goal: string, cwd: string, runId?: str
   });
   debug.log('self-implement', 'required-evidence-check-run', observation);
   return runs;
+}
+
+/** One self-implement run owns this state; a changed HEAD starts a fresh budget. */
+export function createRequiredEvidenceBudget(options: { run?: EvidenceCommandRunner } = {}): (
+  goal: string, cwd: string, runId: string | undefined, headCommit: string | undefined,
+) => RequiredEvidenceCheckRun[] {
+  let previousHead: string | undefined;
+  const timeoutCounts = new Map<string, number>();
+  // This closure is created once per self-implement run. Its unresolved key
+  // bounds repeats within that run without pooling with another run or SHA.
+  const unresolvedRunHead = 'unresolved-head-within-this-run';
+  return (goal, cwd, runId, headCommit) => {
+    if (previousHead !== headCommit) {
+      timeoutCounts.clear();
+      previousHead = headCommit;
+    }
+    return runRequiredEvidenceChecks(goal, cwd, runId, { timeoutCounts, headCommit: headCommit ?? unresolvedRunHead, run: options.run });
+  };
 }
 
 /** 자식 프롬프트에 실을 요구 목록. 요구가 없으면 **아무 줄도 안 붙인다**(빈 계약을 만들지 않는다). */

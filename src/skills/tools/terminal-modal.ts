@@ -14,10 +14,12 @@
 import type { LLMToolSpec } from '../../llm.js';
 import { truncateOutput } from '../../output-truncation.js';
 import { getSessionCwd } from '../../session/working-dir.js';
-import {
-  getDashboardTerminalSessions,
-} from '../../dashboard/terminal/session.js';
 import type { TerminalSession, TerminalSessionRegistry } from '../../terminal/session-registry.js';
+
+async function getDashboardTerminalSessions(): Promise<TerminalSessionRegistry> {
+  const { getDashboardTerminalSessions: getSessions } = await import('../../dashboard/terminal/session.js');
+  return getSessions() as TerminalSessionRegistry;
+}
 
 const DEFAULT_MAX_BYTES = 64 * 1024;
 
@@ -43,7 +45,7 @@ export async function dispatchTerminalModalList(
   rawArgs: Record<string, unknown>,
   deps?: { registry?: TerminalSessionRegistry },
 ): Promise<{ output: string }> {
-  const registry = deps?.registry ?? getDashboardTerminalSessions();
+  const registry = deps?.registry ?? await getDashboardTerminalSessions();
   const includeExited = rawArgs.include_exited === true;
   const sessions = registry.list().filter(s => includeExited || s.state !== 'exited');
   if (sessions.length === 0) {
@@ -92,7 +94,7 @@ export async function dispatchTerminalModalObserve(
   rawArgs: Record<string, unknown>,
   deps?: { registry?: TerminalSessionRegistry },
 ): Promise<{ output: string }> {
-  const registry = deps?.registry ?? getDashboardTerminalSessions();
+  const registry = deps?.registry ?? await getDashboardTerminalSessions();
   const id = String(rawArgs.id ?? '').trim();
   if (!id) throw new Error(`'id' is required`);
   const session = registry.get(id);
@@ -155,7 +157,7 @@ export async function dispatchTerminalModalFocus(
     termRows?: number;
   },
 ): Promise<{ output: string }> {
-  const registry = deps?.registry ?? getDashboardTerminalSessions();
+  const registry = deps?.registry ?? await getDashboardTerminalSessions();
   const id = String(rawArgs.id ?? '').trim();
   if (!id) throw new Error(`'id' is required`);
   const prior = registry.foreground()?.id ?? null;
@@ -191,7 +193,7 @@ export async function dispatchTerminalModalDetach(
   rawArgs: Record<string, unknown>,
   deps?: { registry?: TerminalSessionRegistry },
 ): Promise<{ output: string }> {
-  const registry = deps?.registry ?? getDashboardTerminalSessions();
+  const registry = deps?.registry ?? await getDashboardTerminalSessions();
   const id = typeof rawArgs.id === 'string' && rawArgs.id.length > 0
     ? rawArgs.id
     : registry.foreground()?.id;
@@ -227,7 +229,7 @@ export async function dispatchTerminalModalKill(
   rawArgs: Record<string, unknown>,
   deps?: { registry?: TerminalSessionRegistry },
 ): Promise<{ output: string }> {
-  const registry = deps?.registry ?? getDashboardTerminalSessions();
+  const registry = deps?.registry ?? await getDashboardTerminalSessions();
   const id = String(rawArgs.id ?? '').trim();
   if (!id) throw new Error(`'id' is required`);
   const session = registry.kill(id);

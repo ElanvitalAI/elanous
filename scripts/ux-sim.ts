@@ -68,6 +68,59 @@ if (argv[0] === 'emit') {
   process.exit(out.code);
 }
 
+// ── N03 키 순서열 (TUI-NEXT E4) — 진짜 PTY 에 next TUI 를 fake LLM 으로 띄워 단계별 화면 ⊕ 격리 우주 logs ──
+//   bun scripts/ux-sim.ts seat-seq <next-new-session|next-compact|next-queue|next-wakeup|next-paste|next-goal-continue|next-goal-interim|next-proactive-continue|classic-400-heal|classic-400-exhausted|classic-seat-boot|classic-typing-lag|classic-wakeup|classic-paste|classic-goal-continue|classic-goal-interim|classic-orphan-autostop> --root <빈 폴더> [--installed | --executable <bun> --entry <elanous.mjs>] [--expect-sha <sha256>] [--json]
+//   기본 실행 = 이 트리 bin/elanous.mjs ⊕ 이 bun. --installed = ~/.local/share/elanous/current 의 elanous.mjs.
+//   rc: 0 = 모든 checks 참 · 1 = 거짓이 있다 · 2 = 인자 오류
+if (argv[0] === 'seat-seq') {
+  const rest = argv.slice(1);
+  const SEQ_FLAGS = new Set(['--root', '--installed', '--executable', '--entry', '--expect-sha', '--json']);
+  const SEQ_VALUED = new Set(['--root', '--executable', '--entry', '--expect-sha']);
+  const unknown = rest.filter((a) => a.startsWith('--') && !SEQ_FLAGS.has(a));
+  if (unknown.length > 0) { console.error(`⛔ 모르는 인자다: ${unknown.join(' ')} — 아는 것: ${[...SEQ_FLAGS].join(' · ')}`); process.exit(2); }
+  const value = (flag: string): string | undefined => {
+    const i = rest.indexOf(flag);
+    if (i < 0) return undefined;
+    const v = rest[i + 1];
+    if (!v || v.startsWith('--')) { console.error(`⛔ ${flag} 에 값이 필요하다`); process.exit(2); }
+    return v;
+  };
+  const { NEXT_TUI_SCENARIOS, runNextTuiScenario } = await import('../src/ux-sim/next-tui-seat-scenarios.js');
+  const { CLASSIC_TUI_SCENARIOS, runClassicTuiScenario } = await import('../src/ux-sim/classic-tui-seat-scenarios.js');
+  const ALL_SEQ: readonly string[] = [...NEXT_TUI_SCENARIOS, ...CLASSIC_TUI_SCENARIOS];
+  const scenario = rest.find((a, i) => !a.startsWith('--') && !SEQ_VALUED.has(rest[i - 1] ?? ''));
+  if (!scenario || !ALL_SEQ.includes(scenario)) { console.error(`⛔ 시나리오: ${ALL_SEQ.join(' | ')}`); process.exit(2); }
+  const root = value('--root');
+  if (!root) { console.error('⛔ --root <빈 폴더> 가 필요하다(격리 우주 · 남긴다)'); process.exit(2); }
+  const { homedir } = await import('node:os');
+  const { join: pjoin, resolve: presolve } = await import('node:path');
+  const { realpathSync } = await import('node:fs');
+  const installedEntry = pjoin(homedir(), '.local', 'share', 'elanous', 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs');
+  if (rest.includes('--installed') && rest.includes('--entry')) { console.error('⛔ --installed 와 --entry 는 함께 못 준다 — 어느 elanous.mjs 로 낸 원문인지 갈라야 한다'); process.exit(2); }
+  let entry: string;
+  if (rest.includes('--installed')) {
+    try { entry = realpathSync(installedEntry); } catch { console.error(`⛔ 설치본 없음: ${installedEntry}`); process.exit(2); }
+  } else entry = presolve(value('--entry') ?? pjoin(import.meta.dir, '..', 'bin', 'elanous.mjs'));
+  const executable = value('--executable') ?? process.execPath;
+  const expected = value('--expect-sha');
+  const pin = expected ? { expectedBinarySha256: expected } : {};
+  // classic-* = bare `elanous`(대시보드) · next-* = `--tui next`. 결과 모양은 같다(run · store · logs · checks).
+  const result = (CLASSIC_TUI_SCENARIOS as readonly string[]).includes(scenario)
+    ? await runClassicTuiScenario({ scenario: scenario as (typeof CLASSIC_TUI_SCENARIOS)[number], root, executable, entry, ...pin })
+    : await runNextTuiScenario({ scenario: scenario as (typeof NEXT_TUI_SCENARIOS)[number], root, executable, entry, ...pin });
+  if (rest.includes('--json')) console.log(JSON.stringify(result, null, 2));
+  else {
+    console.log(`scenario=${result.scenario} universe=${result.universe}`);
+    console.log(`binary=${result.run.executable} sha256=${result.run.binarySha256} entry=${result.run.args[0]} entrySha256=${result.run.entrySha256}`);
+    for (const f of result.run.frames) console.log(`===== ${f.label} =====\n${f.screen}\n`);
+    console.log(`store=${JSON.stringify(result.store)}`);
+    console.log(`logs: ${result.logs.command} (rc=${result.logs.rc})`);
+    for (const l of result.logs.lines) console.log(l);
+    for (const [k, v] of Object.entries(result.checks)) console.log(`check ${k}=${v}`);
+  }
+  process.exit(Object.values(result.checks).every(Boolean) ? 0 : 1);
+}
+
 // ⛔⭐ 모르는 인자를 «조용히 삼키지» 않는다 — 이름을 대고 거부한다.
 //
 //  🚨 2026-08-27 실측: `--trajectory-list`(오타 · 실제는 `--list-trajectories`)를 쳤더니

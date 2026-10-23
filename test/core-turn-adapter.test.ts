@@ -246,11 +246,11 @@ describe('runCoreTurn — daemon tool observability', () => {
       off?.();
     }
 
-    const catalog = records.find((record) => record.category === 'capability.resolve' && record.event === 'tier-split');
+    const catalog = records.find((record) => record.category === 'capability.resolve' && record.event === 'tool-tier-split');
     const selected = records.find((record) => record.category === 'capability.resolve' && record.event === 'tool-selected');
     expect(catalog).toEqual(expect.objectContaining({
       category: 'capability.resolve',
-      event: 'tier-split',
+      event: 'tool-tier-split',
       data: expect.objectContaining({
         sessionId: 'daemon-session-42',
         surfaceId: 'coding/agent',

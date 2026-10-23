@@ -1,15 +1,19 @@
 /** Keep one REPL child per session so background tasks and their completion queue survive turns. */
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
+import { NEXT_TUI_WAKEUP_IPC_ENV, answerWakeupCall, isWakeupCallMessage, nextTuiWakeupTool } from './next-wakeup.js';
+import { isNextTuiSelfHealthSnapshot, type NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
 
 const STATUS_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
 
 interface TurnResult {
   event?: string | null;
   turnId?: string | null;
+  sessionId?: string;
   text?: string;
   error?: string;
   provider?: string;
   model?: string | null;
+  selfHealth?: NextTuiSelfHealthSnapshot | null;
 }
 interface WaitingTurn {
   turnId: string;
@@ -30,10 +34,25 @@ class LocalChatSession {
   private turnCount = 0;
 
   constructor(private readonly sessionId: string, cli: string) {
+    // TUI-NEXT-QUEUE-AND-WAKE: the child's ScheduleWakeup asks this process over Bun IPC — the scheduler
+    // lives here because the child dies on Esc and /new. No tool registered → no IPC, env unchanged.
+    const wakeupTool = nextTuiWakeupTool();
     this.child = Bun.spawn({
       cmd: [process.execPath, cli, 'repl', '--session', sessionId, '--json', '--stdin-jsonl'],
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
-      env: { ...process.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1' },
+      env: {
+        ...process.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1',
+        ELANOUS_NEXT_TUI_SELF_HEALTH: '1',
+        ...(wakeupTool ? { [NEXT_TUI_WAKEUP_IPC_ENV]: '1' } : {}),
+      },
+      ...(wakeupTool ? {
+        ipc: (message: unknown, child: { send(message: unknown): unknown }) => {
+          if (!isWakeupCallMessage(message)) return;
+          void answerWakeupCall(wakeupTool, message).then((reply) => {
+            try { child.send(reply); } catch { /* the child exited mid-call; its dispatch times out */ }
+          });
+        },
+      } : {}),
     });
     const input = this.child.stdin;
     const output = this.child.stdout;
@@ -46,7 +65,17 @@ class LocalChatSession {
       if (!line.trim()) return;
       let result: TurnResult;
       try { result = JSON.parse(line) as TurnResult; }
-      catch { this.fail(new Error('invalid REPL JSONL response')); return; }
+      catch { this.fail(new Error(`invalid REPL JSONL response: ${line.slice(0, 160)}`)); return; }
+      if (result.event === 'self-health') {
+        const waiting = this.waiting;
+        if (!waiting || result.turnId !== waiting.turnId || result.sessionId !== this.sessionId
+          || !isNextTuiSelfHealthSnapshot(result.selfHealth) || result.selfHealth.sessionId !== this.sessionId) return;
+        const snapshot = Object.freeze(result.selfHealth);
+        for (const listener of selfHealthListeners.get(this.sessionId) ?? []) {
+          try { listener(snapshot); } catch { /* status observers cannot break the turn */ }
+        }
+        return;
+      }
       const waiting = this.waiting;
       if (!waiting) return;
       if ('turnId' in result && result.turnId !== waiting.turnId) return;
@@ -121,6 +150,9 @@ class LocalChatSession {
     for (const listener of statusListeners.get(this.sessionId) ?? []) {
       try { listener(null); } catch { /* status observers cannot break teardown */ }
     }
+    for (const listener of selfHealthListeners.get(this.sessionId) ?? []) {
+      try { listener(null); } catch { /* status observers cannot break teardown */ }
+    }
   }
 
   async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string) => void): Promise<TurnResult> {
@@ -167,6 +199,7 @@ export interface LocalChatTurnCompact {
   readonly onCompact?: (outcome: NextTuiCompactOutcome) => void;
 }
 const statusListeners = new Map<string, Set<(json: string | null) => void>>();
+const selfHealthListeners = new Map<string, Set<(snapshot: NextTuiSelfHealthSnapshot | null) => void>>();
 
 export function onLocalChatBackgroundStatus(sessionId: string, listener: (json: string | null) => void): () => void {
   const listeners = statusListeners.get(sessionId) ?? new Set();
@@ -175,6 +208,16 @@ export function onLocalChatBackgroundStatus(sessionId: string, listener: (json: 
   return () => {
     listeners.delete(listener);
     if (listeners.size === 0) statusListeners.delete(sessionId);
+  };
+}
+
+export function onLocalChatSelfHealthStatus(sessionId: string, listener: (snapshot: NextTuiSelfHealthSnapshot | null) => void): () => void {
+  const listeners = selfHealthListeners.get(sessionId) ?? new Set();
+  listeners.add(listener);
+  selfHealthListeners.set(sessionId, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) selfHealthListeners.delete(sessionId);
   };
 }
 

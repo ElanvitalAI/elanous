@@ -8,6 +8,7 @@
 import type { LLMProviderName, ReasoningLevel } from '../../user-config.js';
 import { lookupLlmTierSpec } from '../../model-tier/index.js';
 import type { ModelTier } from '../../model-tier/types.js';
+import type { ModelExecutionActual } from '../../status/bar.js';
 
 export interface ModelTarget {
   readonly model: string;
@@ -70,6 +71,20 @@ export function resolveModelChoice(rawArg: string, currentProvider: LLMProviderN
   const target = MODEL_TARGETS[arg];
   if (target) return { kind: 'code', name: arg, target };
   return { kind: 'unknown', arg };
+}
+
+/** `/model` «지금:» 에 덧붙는 «이번 턴 실제» (TUI-MODEL-BADGE-ACTUAL · 10-16 · #24·#66).
+ *  상태줄 배지와 «같은» 원천(`statusModelActual`)을 쓰므로 두 화면이 다른 말을 하지 않는다.
+ *  이번 턴 실행이 없거나 이미 보이는 모델과 같으면 '' — 꾸미지 않는다(기본 출력 보존). */
+export function modelActualNote(
+  shownModel: string | null | undefined,
+  actual: ModelExecutionActual | null | undefined,
+): string {
+  const model = actual?.model?.trim();
+  if (!model) return '';
+  const from = actual?.fallbackFrom?.trim();
+  if (!from && model === shownModel?.trim()) return '';
+  return ` · 이번 턴 실제: ${from ? `${from} → ${model}` : model}`;
 }
 
 /**

@@ -117,8 +117,16 @@ export function readJourneyEdge(
   return route;
 }
 
+/** 간선 행에 덧붙이는 조인·근거 칸.
+ *  `moveId` 는 next-move 결정 순간 한 번 만든 값(HARNESS-FULL-GRAPH-NEXTMOVE · 여기서 만들지 않는다).
+ *  그 밖의 칸은 그 간선에 결속할 근거(예: 착지 거부 원문·cardId · LAND-REFUSAL-EDGES) — 간선 칸(from·to·taken…)을 덮지 못한다. */
+export interface JourneyEdgeFields {
+  readonly moveId?: string;
+  readonly [key: string]: unknown;
+}
+
 /** 실제로 탄 간선을 남긴다 — `taken` 은 실제 다음 노드(그래프 답과 다르면 `honored: false` · 그 이유를 `reason` 에). */
-export function recordJourneyEdge(route: JourneyRoute, taken: string, reason?: string): void {
+export function recordJourneyEdge(route: JourneyRoute, taken: string, reason?: string, data: JourneyEdgeFields = {}): void {
   try {
     if (route.ambiguousConditions?.length) debug.log('self-implement', 'edge-ambiguous', {
       graphId: 'self-implement', from: route.from, conditions: route.ambiguousConditions,
@@ -132,8 +140,10 @@ export function recordJourneyEdge(route: JourneyRoute, taken: string, reason?: s
       graphId: 'self-implement', node: skipped.node, reason: 'condition', condition: skipped.condition,
       ...journeyJoinFields(),
     });
+    // Evidence never overrides an edge field: the later spread wins, and `reason`/join keys are reserved.
+    const { reason: _reservedReason, journeyKey: _reservedJourney, queueLaunchId: _reservedLaunch, ...evidence } = data ?? {};
     debug.log('self-implement', 'graph-edge-taken', {
-      graphId: 'self-implement', ...route, taken, honored: route.to === null || route.to === taken,
+      ...evidence, graphId: 'self-implement', ...route, taken, honored: route.to === null || route.to === taken,
       ...(reason === undefined ? {} : { reason }), ...journeyJoinFields(),
     });
   } catch { /* 관측은 fail-soft */ }

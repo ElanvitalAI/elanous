@@ -50,7 +50,7 @@
 
 /// <reference path="./vendor-types.d.ts" />
 
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
 import { basename } from 'node:path';
 import { debug } from './debug/log.js';
 
@@ -136,7 +136,8 @@ export function runPrintenvCapture(): Record<string, string> | null {
   const shellStart = performance.now();
   let res: ReturnType<typeof spawnSync>;
   try {
-    res = spawnSync(shell, ['-l', '-i', '-c', 'printenv'], {
+    // `detached` is honoured by spawnSync (uv_spawn → setsid) but missing from SpawnSyncOptions.
+    const opts: SpawnSyncOptionsWithStringEncoding & { detached: boolean } = {
       env: seedEnv,
       encoding: 'utf8',
       timeout: TIMEOUT_MS,
@@ -144,7 +145,13 @@ export function runPrintenvCapture(): Record<string, string> | null {
       stdio: ['ignore', 'pipe', 'pipe'],
       // Don't inherit our stdio — rc files that run `clear` or issue
       // OSC sequences would corrupt our TUI output otherwise.
-    });
+      // TUI-SIGTTIN-SUSPEND (10-23 n8n): an interactive shell opens /dev/tty even with stdin ignored and
+      // takes the terminal's foreground group for its own job control; it never hands it back (exec'd
+      // printenv · SIGKILL on timeout), so the TUI's next stdin read stops it with SIGTTIN. `detached`
+      // = setsid: no controlling tty, so the capture cannot touch the TUI's terminal at all.
+      detached: true,
+    };
+    res = spawnSync(shell, ['-l', '-i', '-c', 'printenv'], opts);
   } catch {
     logBootPhase('login-env.shell', shellStart, 'error');
     return null;
@@ -169,7 +176,7 @@ export async function warmCapturedEnv(spawn: typeof Bun.spawn = Bun.spawn): Prom
   const start = Date.now();
   const shellStart = performance.now();
   try {
-    const proc = spawn([seed.shell, '-l', '-i', '-c', 'printenv'], { env: seed.seedEnv as Record<string, string>, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' });
+    const proc = spawn([seed.shell, '-l', '-i', '-c', 'printenv'], { env: seed.seedEnv as Record<string, string>, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore', detached: true });
     // A grandchild (e.g. a pyenv rehash) can keep the stdout pipe open after the shell is killed,
     // so the timeout settles the race itself instead of waiting for EOF.
     let timer: ReturnType<typeof setTimeout> | undefined;

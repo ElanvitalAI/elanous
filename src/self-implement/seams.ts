@@ -91,7 +91,7 @@ import { emitDecision } from '../live/detail-switch.js';
 import { gateDecision, reviewDecision, mergeDecision } from './decision-events.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { instanceNameForStateDir } from '../instance-identity.js';
-import { queryStructuredChildProviderErrors } from './orchestrator.js';
+import { queryStructuredChildProviderErrors, readHarvestPrBody, updateHarvestPrBody } from './orchestrator.js';
 import { buildImplementReport } from './off-diff-evidence.js';
 import { countReflectFactConflicts, type MustFixRefutation, type ReflectEvidenceFacts, type ReflectGateFacts } from './reflect-mustfix.js';
 import { isSupervisorDecisionSection, splitGoalSections, supervisorGoalDigest } from './goal-digest.js';
@@ -201,6 +201,11 @@ export function observeGateBaselineLocation(cwd: string): { branch: string | nul
 
 /** self-implement 자식만의 종료 보고 보존 규칙. 범용 control brain 기본 프롬프트에는 넣지 않는다. */
 export const SELF_IMPLEMENT_COMPLETION_REPORT_HINT = '자식이 최종 요약 또는 GOAL-COMPLETE 완료 마커를 출력 중이면 목표가 달성돼 보여도 done이 아니라 wait을 선택하라. 완료 보고가 끝날 때까지 기다려야 한다.';
+
+/** Set by the Kubernetes Job manifest only for the Pod child process. */
+export function podChildDependenciesRequired(env: NodeJS.ProcessEnv): boolean {
+  return Boolean(env.ELANOUS_POD_NAME?.trim());
+}
 
 /** self-implement 실행 경계가 범용 brain에 전용 종료-보고 규칙을 주입한다. */
 export function createSelfImplementControlBrain(opts: Omit<LlmControlBrainOpts, 'systemHint'>) {
@@ -1739,6 +1744,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         worktreeRoot: configuredWorktreeRoot(),
         resetExisting: true,
         reuseOwnedWorktree: true,
+        requireDependencies: podChildDependenciesRequired(process.env),
         ...(base ? { base } : {}),
         ...(runId ? { currentOwner: `dev:${runId}` } : {}),
       });
@@ -1906,6 +1912,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
             ...(onProgress ? { onProgress } : {}), // part2-B — execute judge 로 라이브 델타 전달(PTY 경로만).
             ...(onSurfaceProgress ? { onSurfaceProgress } : {}), // Sparse parent-surface lines; raw execute-judge delta remains onProgress only.
             ...(onSupervisorInput ? { onSupervisorInput } : {}),
+            ...(process.env.ELANOUS_POD_VERIFIED_PR_SOURCE === '1' ? { verifiedPrSource: true } : {}),
             ...(onLifecycleScreenClassification ? { onLifecycleScreenClassification } : {}),
             ...(roundContext ? { roundContext } : {}),
           });
@@ -2309,7 +2316,8 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       //   `tc`(변경파일 tsc) **전에** 실행해서, tsc 가 깨져 **최종 게이트가 실패한 런에도**
       //   base 를 다시 돌리고 `gate.log` 를 바꿨다 ⇒ *"게이트 실패 경로 무변경"* 경계 위반.
       //   ⇒ 조건을 최종 판정과 같은 식으로 묶는다.
-      const gatePassed = !comparisonFailureReason && !unmeasuredPostsync && integrityPassed && tc.passed && policy.passed && expose.passed && (dependencyGate?.passed ?? true);
+      let gatePassed = !comparisonFailureReason && !unmeasuredPostsync && integrityPassed && tc.passed && policy.passed && expose.passed && (dependencyGate?.passed ?? true);
+      let changedTestEvidenceNote = '';
       const verifyIdentity = gateVerifyIdentity(ctx?.runId);
       if (gatePassed && scope.skipTestStep) {
         verifyByBreaking = { ran: false, distinguishes: 0, 'does-not-distinguish': 0, unknown: 0, skippedReason: scope.reason };
@@ -2352,6 +2360,34 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         //     그것을 검사하는 테스트는 아무것도 증명하지 못한다(리뷰 2R 이 그 Goodhart 를 잡았다).
         const editedTests = scope.testArgs!.filter((file) => !scope.pulledInRelatedTests.includes(file));
         const verify = (o.runVerifyByBreaking ?? runVerifyByBreaking)(cwd, editedTests, baselineRefs.get(cwd));
+        // A passing head bundle covers all edited tests. An existing test needs a
+        // measured failing base run. A new test absent from the fixed base is a
+        // structural RED witness even when copying it to base cannot load its new
+        // module/export; that loader failure is not an executable base assertion.
+        // Mobile base measurement is separate and is not a RED witness here.
+        const measured = new Map(verify.files.map((entry) => [entry.file, entry]));
+        const eligible = editedTests.filter((file) => /\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(file));
+        const red = eligible.filter((file) => {
+          const entry = measured.get(file);
+          return entry?.classification === 'missing-at-base'
+            || (entry?.classification === 'distinguishes' && entry.base.status === 'test-fail');
+        });
+        const structuralRed = red.filter((file) => measured.get(file)?.classification === 'missing-at-base');
+        const executedBaseFailures = red.length - structuralRed.length;
+        const complete = eligible.length === 0 || red.length > 0;
+        changedTestEvidenceNote = `\n\n[changed-test-evidence] head=pass; base-fail=${executedBaseFailures}/${eligible.length}; red-witness=${red.length}/${eligible.length}; verdict=${eligible.length === 0 ? 'not-applicable' : complete ? 'proved' : 'unproved'}`
+          + `; red-missing-at-base=${structuralRed.length}`
+          + (structuralRed.length > 0
+            ? '; structural-red=the new test file is absent from the fixed base, so a runnable base assertion is not required'
+            : '')
+          + (!complete ? `; no-red-witness=${eligible.join(', ')}` : '')
+          + (editedTests.length !== eligible.length ? `; mobile-or-other-excluded=${editedTests.length - eligible.length}` : '');
+        debug.log('self-implement', 'gate.changed-test-evidence', {
+          head: 'pass', baseFailed: executedBaseFailures, redWitnesses: red.length, edited: editedTests.length,
+          eligible: eligible.length, verdict: eligible.length === 0 ? 'not-applicable' : complete ? 'proved' : 'unproved', red,
+          redMissingAtBase: structuralRed,
+        }, { level: complete ? 'info' : 'warn' });
+        if (!complete) gatePassed = false;
         // ⛔⭐⭐⭐ **조건은 테스트 전용 변경이나 특정 정방향 분류가 아니라, 편집 테스트의 네 정방향 분류 전체다.**
         //   (리뷰 R3 must-fix — 내가 PR 경계에 *"혼합 변경에서는 조건상 안 돈다"* 고 «틀리게» 적었다).
         //   ⇒ 소스와 테스트가 «함께» 바뀐 PR 에서도 그 분류가 나오면 «돈다». 그리고 그게 맞다:
@@ -2423,6 +2459,14 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           skipped: true, reason: why, testStep: why, ...verifyIdentity, ...emptyVerifyCounts,
         }, { level: 'warn' });
       }
+      if (gatePassed && scope.reason === 'changed-tests' && !changedTestEvidenceNote
+        && scope.testArgs?.some((file) => /\.(?:test|spec)\.[cm]?[jt]sx?$/u.test(file))) {
+        gatePassed = false;
+        changedTestEvidenceNote = '\n\n[changed-test-evidence] verdict=unproved; head/base pair was not measured';
+        debug.log('self-implement', 'gate.changed-test-evidence', {
+          verdict: 'unproved', reason: 'head/base pair was not measured',
+        }, { level: 'warn' });
+      }
       // ⭐ 거짓통과 방지 표기(제1원칙 관측 · 2026-07-26) — test 스텝을 건너뛰면 `passed:true` 가
       //   **"검증됨"으로 오독**될 수 있다. 그건 integrity-gate 의 `ranNothing` 가드가 막으려던
       //   거짓통과를 스코프 축소가 우회로 되살리는 것이다 ⇒ 게이트 로그에 **명시**한다.
@@ -2485,7 +2529,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         : '';
       return {
         passed: gatePassed,
-        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}${callerOverflowNote}${routeLookupNote}${expose.log ? `\n\n${expose.log}` : ''}`,
+        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${changedTestEvidenceNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}${callerOverflowNote}${routeLookupNote}${expose.log ? `\n\n${expose.log}` : ''}`,
         testStepExecuted: !testStepSkipped && testStep !== undefined && !testStep.skipped,
         scopeReason,
         comparisonBaseStatus: observationChanges.comparisonBaseStatus,
@@ -2705,6 +2749,8 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, env: ghAutomationEnv(process.env),
       });
     },
+    readPrBodyForHarvest: readHarvestPrBody,
+    updatePrBodyForHarvest: updateHarvestPrBody,
     readPrFiles: async ({ number, cwd, base }) => readPrFilesWithRateLimitFallback({
       number, cwd, env: ghAutomationEnv(process.env), ...(base ? { base } : {}),
     }),
@@ -2988,6 +3034,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           `첫 줄은 정확히 하나: BUDGET: EXTEND | BUDGET: SUFFICIENT | BUDGET: UNCONVERGEABLE | BUDGET: CONTRACT-CONFLICT`,
           `둘째 줄: REASON: <한 문장>. 이후에만 진단을 쓴다.`,
           `EXTEND는 새 지적이 좁아져 한 라운드 더로 풀릴 때만, SUFFICIENT는 리뷰만 실패했고 gate는 통과했으며 남은 지적이 비블로커·스코프 밖일 때만, UNCONVERGEABLE은 같은 지적 반복·스코프 밖 요구·근거 없는 반복 리뷰일 때다.`,
+          `단 구조적으로 불가능한 증거 요구(예: base 에 없는 신규 파일·모듈의 시험에 base 실패 목격을 요구 · [changed-test-evidence] verdict=unproved 가 missing-at-base 때문인 것)는 반복돼도 UNCONVERGEABLE 이 아니라 CONTRACT-CONFLICT 다(REASON 에 그 요구가 불가능한 이유). 조각 미션에서 다음 조각 몫(호출부·배선·후속 조각이 맡은 일)을 이번 조각에 요구하는 지적만 남았고 gate 가 통과했으면 SUFFICIENT 다.`,
           `CONTRACT-CONFLICT는 현장과 골의 수용·보존 계약 또는 리뷰 지적이 정면으로 충돌하여, 검증된 수용 기준 완화 뒤 다음 라운드가 수정된 골 기준으로 계속해야 할 때 쓴다. 타당한 자식 REFUTE는 이 판단의 근거가 될 수 있지만 제출이 없어도 구현과 계약만으로 동시에 만족시킬 수 없는 충돌이면 이 값을 선택한다. 이 경우 REASON에는 반드시 어떤 계획 줄이 현장과 어긋나는지 쓴다. 골의 ## ACCEPTANCE CRITERIA 안에서 정확히 한 수용 기준 행을 식별할 수 있으면 이어서 반드시 TARGET: <## ACCEPTANCE CRITERIA 안의 전체 원문 한 줄>, EXPECTED: <그 TARGET 행의 현재 한 줄>, REPLACEMENT: <그 TARGET 행에서 완화한 한 줄>을 각각 개행 없는 한 줄로 출력한다. TARGET은 첫 콜론 앞 접두·식별값이나 설명문이 아니라 수용 기준 행 전체와 정확히 일치해야 하며, EXPECTED와 REPLACEMENT도 같은 TARGET 행에서 유래한 단일 수용 기준 행이어야 한다. 셋 중 하나라도 확정할 수 없거나 대상·원문이 다중 일치하면 세 줄을 쓰지 말고 REASON에 적용 불가 사유만 기록한다.`,
           `REFUTE 제출이 있으면 각 항목을 실제로 판정한 경우에만 이후 줄에 정확히 \`REFUTE [findingId]: ACCEPT\` 또는 \`REFUTE [findingId]: REJECT\`로 남겨라. BUDGET verdict는 개별 REFUTE 판정이 아니며, REFUTE 줄이 없으면 개별 수락·기각은 기록되지 않는다.`,
           `너는 자율 구현 rework 진단가다. 현재 라운드 ${round}/${effectiveMax}, 종류는 ${kind}이다.`,
@@ -3004,7 +3051,16 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           `이후 진단은 다음 구현 에이전트가 근본부터 고치도록 각 항목에 1)왜 실패했나 2)어떻게 고칠까를 간결히 5개 이내로 쓴다.`,
         ].join('\n');
         try {
-          const out = await o.llmReview!(prompt);
+          const raw = await o.llmReview!(prompt);
+          const reclass = (await import('./rework-policy.js')).reclassifyImpossibleEvidence(raw, note);
+          const out = reclass.response;
+          if (reclass.applied) {
+            try {
+              debug.log('self-implement', 'supervisor-impossible-evidence', {
+                runId, kind, round, from: 'UNCONVERGEABLE', to: 'CONTRACT-CONFLICT', markers: reclass.markers,
+              });
+            } catch { /* 관측은 fail-soft */ }
+          }
           try {
             debug.log('self-implement', 'diagnose.done', {
               runId,

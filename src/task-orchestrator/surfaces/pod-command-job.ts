@@ -5,7 +5,7 @@
 // codex·elanous 자격 파일은 이 Job 에 없다. 격리 관문(호스트 넥서스에 닿으면 종료)은 기존 Job 과 같다.
 // 명령 인자는 셸 문자열로 이어붙이지 않고 `"$@"` 로 따로 인용한다.
 
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
@@ -229,10 +229,16 @@ export interface PodCommandJobInput {
   /** W5 — emptyDir{medium: Memory} sizeLimit mounted at {@link POD_TMPFS_MOUNT_PATH} ⊕ `TMPDIR` (release gate shards only). Omitted = image `/tmp`. */
   tmpfsSizeLimit?: string;
   source?: PodSource;
+  /** Verified producer files, delivered into this Job's own source tree. */
+  warmFiles?: readonly string[];
   deadlineSeconds: number;
   runId?: string;
   /** GATE-WARM-BOOT-NO-INIT fallback: the node-side hand-over did not run, so a root init container hands the hostPath dirs to uid 1000. */
   hostDirsInit?: boolean;
+}
+
+function warmSourceName(name: string, launch: string): string {
+  return `${name.slice(0, 50).replace(/-+$/, '')}-${launch}`;
 }
 
 function bashSingleQuote(value: string): string {
@@ -282,6 +288,10 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
     ...(o.clone
       ? ['export GH_TOKEN="$(cat /creds/gh-token)" && gh auth setup-git', podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl)]
       : ['mkdir -p ~/work && cd ~/work']),
+    ...(o.warmFiles?.length ? [
+      `if [ "$(git rev-parse HEAD)" != ${bashSingleQuote(o.source?.kind === 'commit' ? o.source.sha : '')} ]; then echo '[warm-source] commit mismatch'; exit 5; fi`,
+      ...o.warmFiles.map((path, i) => `install -m 644 -D /warm-source/file-${i} ${bashSingleQuote(`./${path}`)} || exit 5\nprintf 'ELANOUS_WARM_SOURCE %s %s %s\\n' ${bashSingleQuote(path)} "$(sha256sum ${bashSingleQuote(`./${path}`)} | cut -d ' ' -f1)" "$(git rev-parse HEAD)"`),
+    ] : []),
     ...(hostDirMounts.length ? [podHostDirsCheckScript(hostDirMounts)] : []),
     ...(bunCache ? [bunCache.shellPrefix] : []),
     `set -- ${quotedArgs}`,
@@ -325,14 +335,16 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
               ...(provenance?.env ?? []),
               ...(tmpfs ? [{ name: 'TMPDIR', value: POD_TMPFS_MOUNT_PATH }] : []),
             ],
-            ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs ? { volumeMounts: [
+            ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs || o.warmFiles?.length ? { volumeMounts: [
+              ...(o.warmFiles?.length ? [{ name: 'warm-source', mountPath: '/warm-source', readOnly: true }] : []),
               ...(secretKeys ? [{ name: 'creds', mountPath: '/creds', readOnly: true }] : []),
               ...(o.hostMirror ? [{ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true }] : []),
               ...hostDirMounts,
               ...tmpfsMounts,
             ] } : {}),
           }],
-          ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs ? { volumes: [
+          ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs || o.warmFiles?.length ? { volumes: [
+            ...(o.warmFiles?.length ? [{ name: 'warm-source', configMap: { name: warmSourceName(o.name, o.launch ?? 'source') } }] : []),
             ...(secretKeys ? [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }] : []),
             ...(o.hostMirror ? [{ name: 'host-mirror', hostPath: { path: o.hostMirror, type: 'Directory' } }] : []),
             ...(bunCache ? [bunCache.volume] : []),
@@ -422,6 +434,8 @@ export interface RunPodCommandOptions {
   /** POD7: 호출부가 «네트워크 스킬만 쓰는 명령»이라고 말할 때만 lite 이미지 ⊕ 2Gi. */
   lite?: boolean;
   source?: PodSource;
+  /** Opt-in handoff from an existing producer Pod in the same namespace. */
+  warmProducer?: { pod: string; podUid: string; context: string; image: string; commit: string; files: readonly [string, string] };
   ghToken?: () => string;
   deadlineSeconds?: number;
   namespace?: string;
@@ -553,6 +567,12 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const namespace = options.namespace ?? 'elanous-test';
   const image = options.image ?? podCommandImageFor(skills, options.clone === true, options.lite === true);
+  if (options.warmProducer && (!options.clone || options.source?.kind !== 'commit' || options.source.sha !== options.warmProducer.commit || options.image !== options.warmProducer.image || options.imageCommit !== options.warmProducer.commit)) {
+    throw new Error('pod warm source: consumer image and source commit must match producer');
+  }
+  if (options.warmProducer && (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(options.warmProducer.pod) || !options.warmProducer.podUid || typeof options.warmProducer.context !== 'string' || !/^[0-9a-f]{40}$/.test(options.warmProducer.commit) || options.warmProducer.files.length !== 2 || options.warmProducer.files.some((path) => !path || path.startsWith('/') || path.split('/').some((part) => !part || part === '.' || part === '..' || !/^[\w.-]+$/.test(part))))) {
+    throw new Error('pod warm source: invalid producer identity, commit or file path');
+  }
   if (options.shelfImage && (options.image !== options.shelfImage || !options.imageCommit || !options.clone || options.source?.kind !== 'commit' || options.source.sha !== options.imageCommit)) {
     throw new Error('pod shelf: image and source commit must match');
   }
@@ -615,6 +635,9 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const kubectlRaw: Kubectl = (args, stdin) => baseKubectl(context ? ['--context', context, ...args] : [...args], stdin);
   const kubectl: Kubectl = (args, stdin) => { ensureLive(); const result = kubectlRaw(args, stdin); ensureLive(); return result; };
   const cleanupSecret = () => { kubectlRaw(['-n', namespace, 'delete', 'secret', '-l', own, '--ignore-not-found']); };
+  const cleanupWarmSource = () => {
+    if (options.warmProducer) kubectlRaw(['-n', namespace, 'delete', 'configmap', '-l', own, '--ignore-not-found']);
+  };
   const artifactRoot = options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`;
   const artifactsDir = `${artifactRoot}/${name}`;
   let jobApplied = false;
@@ -648,7 +671,11 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       const localSkillsDigest = options.kubectl ? null : image === POD_LITE_IMAGE
         ? podSkillsDigest(POD_NETWORK_SKILLS, resolve(import.meta.dir, '../../../skills')).digest
         : podSkillsDigest(resolvePodSkills(env).skills).digest;
-      if (options.shelfImage) {
+      if (options.warmProducer) {
+        // The leased producer is already running this immutable image on the selected pool.
+        // Do not replace it with the host's independently synchronized commit tag.
+        member = { ...member, imageRef: options.warmProducer.image };
+      } else if (options.shelfImage) {
         const found = (options.shelfLookup ?? registryImageRef)(member, imageCommit);
         if (found !== options.shelfImage) throw new Error(`pod shelf: selected image unavailable on ${member.context}`);
         member = { ...member, imageRef: found };
@@ -670,6 +697,33 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       const seed = await awaitPodCommandAbort(seedMirror({ host: member.sshHost, commit: options.source.sha, cwd: options.mirrorSeedCwd ?? process.cwd() })
         .catch((error: unknown) => ({ host: member!.sshHost!, ok: false, ms: 0, detail: String(error).slice(0, 300) })), options.signal);
       log('pod.command-job', 'mirror-seed', { host: member.sshHost, commit: options.source.sha, ok: seed?.ok ?? false, ms: seed?.ms ?? 0, ...(seed?.detail ? { detail: seed.detail } : {}) });
+    }
+    // Only a matching, live producer may hand its two source files to this Job; no other Pod's tree is trusted.
+    const warmHashes: Record<string, string> = {};
+    if (options.warmProducer) {
+      const producer = options.warmProducer;
+      if (context !== producer.context || (imageRef && imageRef !== producer.image)) throw new Error('pod warm source: selected pool or image differs from producer');
+      const got = kubectl(['-n', namespace, 'get', 'pod', producer.pod, '-o', 'json']);
+      if (got.status !== 0) throw new Error('pod warm source: producer Pod unavailable');
+      let pod: { metadata?: { name?: string; uid?: string }; spec?: { containers?: Array<{ name?: string; image?: string }> } };
+      try { pod = JSON.parse(got.stdout); } catch { throw new Error('pod warm source: invalid producer Pod'); }
+      if (pod.metadata?.name !== producer.pod || pod.metadata?.uid !== producer.podUid || pod.spec?.containers?.find((container) => container.name === 'child')?.image !== producer.image) {
+        throw new Error('pod warm source: producer Pod identity or image mismatch');
+      }
+      // kubectl exec starts in the image working directory; podSourceScript cloned
+      // `repo` there, then changed directory only in the original Job shell.
+      const head = kubectl(['-n', namespace, 'exec', producer.pod, '-c', 'child', '--', 'bash', '-c', 'git -C repo rev-parse HEAD']);
+      if (head.status !== 0 || head.stdout.trim() !== producer.commit) throw new Error('pod warm source: producer commit mismatch');
+      const binaryData: Record<string, string> = {};
+      for (const [i, path] of producer.files.entries()) {
+        const read = kubectl(['-n', namespace, 'exec', producer.pod, '-c', 'child', '--', 'bash', '-c', `base64 -w0 ${bashSingleQuote(`repo/${path}`)}`]);
+        if (read.status !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(read.stdout.trim())) throw new Error(`pod warm source: producer file unavailable: ${path}`);
+        binaryData[`file-${i}`] = read.stdout.trim();
+        warmHashes[path] = createHash('sha256').update(Buffer.from(binaryData[`file-${i}`]!, 'base64')).digest('hex');
+      }
+      const config = { apiVersion: 'v1', kind: 'ConfigMap', metadata: { name: warmSourceName(name, launch), namespace, labels: { 'elanous.job': name, 'elanous.launch': launch } }, binaryData };
+      const applied = kubectl(['apply', '-f', '-'], JSON.stringify(config));
+      if (applied.status !== 0) throw new Error(applied.stderr.trim() || 'pod warm source: ConfigMap apply failed');
     }
     // GATE-WARM-BOOT-NO-INIT (10-15): the hostPath dirs the uid-1000 child writes are handed over on the node itself, once per
     // member·paths in this process (no init container). Best effort: a failure only logs; the child then falls back.
@@ -701,7 +755,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       provenance: options.provenance, provenanceGate: options.provenanceGate,
       ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(options.returnLogs ? { returnLogs: true } : {}), ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
-      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), ...(options.tmpfsSizeLimit ? { tmpfsSizeLimit: options.tmpfsSizeLimit } : {}), deadlineSeconds,
+      ...(options.source ? { source: options.source } : {}), ...(options.warmProducer ? { warmFiles: options.warmProducer.files } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), ...(options.tmpfsSizeLimit ? { tmpfsSizeLimit: options.tmpfsSizeLimit } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
       ...(hostDirsInit ? { hostDirsInit: true } : {}),
     });
@@ -718,6 +772,12 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     let markerRc: number | null = null;
     const appliedAt = Date.now();
     for (;;) {
+      // PRLAND-SHADOW-HOST-TIMEOUT: a Pending Pod poll never ends by itself — the host wall-clock deadline ends the
+      // loop here (before another status read) and leaves exactly one timeout record (deadline time ⊕ final state).
+      if (options.hostDeadlineAtMs !== undefined && nowMs() >= options.hostDeadlineAtMs) {
+        log('pod.command', 'host-timeout', { job: name, context, hostDeadlineAtMs: options.hostDeadlineAtMs, nowMs: nowMs(), finalState: 'timeout', waitedMs: nowMs() - appliedAt });
+        throw new Error('pod shadow: host timeout');
+      }
       ensureLive();
       const got = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.status.conditions[*].type}']);
       const finished = jobFinished(got.stdout);
@@ -744,6 +804,18 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       await awaitPodCommandAbort(sleep(options.pollMs ?? 15_000), options.signal);
     }
     ensureLive();
+    if (options.warmProducer) {
+      const found = kubectl(['-n', namespace, 'get', 'pods', '-l', `job-name=${name}`, '-o', 'json']);
+      let pods: { items?: Array<{ metadata?: { name?: string }; spec?: { containers?: Array<{ name?: string; image?: string }> } }> };
+      try { pods = JSON.parse(found.stdout); } catch { throw new Error('pod warm source: consumer Pod unavailable'); }
+      // A retried Job can leave an older Pod in the list. Never attribute the
+      // warm-source proof to an arbitrary Pod when the consumer is ambiguous.
+      const consumer = pods.items?.length === 1 ? pods.items[0] : undefined;
+      if (found.status !== 0 || !consumer?.metadata?.name || consumer.metadata.name === options.warmProducer.pod || consumer.spec?.containers?.find((container) => container.name === 'child')?.image !== (imageRef ?? image)) {
+        throw new Error('pod warm source: consumer Pod identity or image mismatch');
+      }
+      log('pod.command-job', 'warm-source-linked', { producerPod: options.warmProducer.pod, consumerPod: consumer.metadata.name, image: imageRef ?? image, commit: options.warmProducer.commit, files: [...options.warmProducer.files] });
+    }
     let logsResult = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
     // Marker path returns before the Job condition — a full-log read can hit the same transient window the tail read
     // already survived (container log rotation · API hiccup). Retry it a little before calling the artifacts lost.
@@ -761,6 +833,13 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     }
     const logsFailed = logsResult.status !== 0;
     const logs = logsFailed ? '' : splitPodResultMarker(logsResult.stdout, launch).logs;
+    if (options.warmProducer) {
+      if (logsFailed) throw new Error(`pod warm source: consumer logs unavailable: ${logsResult.stderr.trim() || logsResult.status}`);
+      for (const path of options.warmProducer.files) {
+        const marker = `ELANOUS_WARM_SOURCE ${path} ${warmHashes[path]} ${options.warmProducer.commit}`;
+        if (logs.split(/\r?\n/).filter((line) => line === marker).length !== 1) throw new Error(`pod warm source: consumer file or commit mismatch: ${path}`);
+      }
+    }
     const artifactDir = artifactRoot;
     let artifacts: PodArtifactCollection;
     if (logsFailed) {
@@ -796,6 +875,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     // Marker path: the rc the child printed (the Pod's terminated state may lag like the condition). Condition path: unchanged.
     const exitCode = markerRc ?? exitCodeFromPod(kubectl, namespace, name, state);
     cleanupSecret();
+    cleanupWarmSource();
     log('pod.command', 'job-finished', {
       job: name,
       exitCode,
@@ -815,6 +895,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       catch { /* preserve the cancellation reason */ }
     }
     cleanupSecret();
+    cleanupWarmSource();
     throw err;
   } finally {
     if (member && pool) pool.release(member);

@@ -2,6 +2,7 @@
 // Unified streaming interface for Grok (xAI), OpenAI, Anthropic, Local (OpenAI-compatible).
 // Auto-routes based on model name prefix, or picks the first available provider.
 
+import { wellFormedLLMMessages } from './llm-wellformed.js';
 import { createHash } from 'node:crypto';
 import { testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
 import { realpathSync } from 'node:fs';
@@ -4460,6 +4461,12 @@ function providerByName(name: string): LLMProvider | undefined {
   return PROVIDERS[name] ?? automaticProviderCandidates().find((candidate) => candidate.name === name);
 }
 
+/** TUI-400-AUTOHEAL-FALLBACK — 같은 턴에서 `failedProviders` 가 실패했을 때 `llm.fallbackChain`(⊕ auto 후보)의
+ *  «다음» 공급자. 턴 안 폴백과 같은 해석(`explainFallbackCandidates`)을 그대로 쓴다 — 체인을 따로 읽지 않는다. */
+export function nextTurnFallbackProvider(failedProviders: readonly string[]): LLMProvider | undefined {
+  return firstAvailableFallbackProvider(new Set(failedProviders), {});
+}
+
 function firstAvailableFallbackProvider(attempted: ReadonlySet<string>, opts: LLMOpts): LLMProvider | undefined {
   // A candidate may lose its credential between chain enumeration and the
   // switch. Keep scanning the ordered chain instead of stopping at that slot.
@@ -4745,6 +4752,11 @@ async function consumeProviderText(
   let full = '';
   let usage: ObservedUsage | undefined;
   try {
+    const wf = wellFormedLLMMessages(messages);
+    if (wf.fixedMessages > 0) {
+      debug.log('llm.request', 'lone-surrogate-fixed', { site: 'streamLLM', provider: provider.name, messages: wf.fixedMessages, strings: wf.fixedStrings }, { level: 'warn' });
+      messages = wf.messages;
+    }
     iterator = (provider.streamChat
       ? provider.streamChat(messages, opts)
       : provider.chat(messages, opts))[Symbol.asyncIterator]();
@@ -5863,7 +5875,7 @@ const TOOL_LOOP_PHASE_DIRECTIVES: Record<ToolLoopFollowupPhase, (autoNarrowedRea
     + 'Stop gathering more files and run the code, tests, or repro command first via RunShell/Bash, or answer in plain text if execution is unnecessary.',
   'repair-action': () =>
     'REPAIR ACTION REQUIRED — execution has already failed or a debugging repair step is armed. '
-    + 'Stop gathering more files and move to Edit/Write/RunShell/Bash or a narrow code-intel followup (Read/Lsp/AstGrep/Grep content/count), '
+    + 'Stop gathering more files and move to Edit/Write/RunShell/Bash or a narrow code-intel followup (Read/ListDir/Lsp/AstGrep/Grep content/count), '
     + 'ops ledger/delegate tools (MsgList/MsgPost/MsgAck/Checklist*/AgentOutput) still run, '
     + 'or answer in plain text if no code change is needed (e.g. a read-only investigation whose finding is the deliverable).',
   'verify-action': () =>
@@ -7800,6 +7812,10 @@ const REPAIR_ACTION_TOOLS = new Set([
   'Plan',
   'MarkStepDone',
   'Read',
+  // ListDir is always one directory, never recursive — as narrow as Read. A failed step
+  // is often «is the output there?»; rejecting it pushed the model to `ls` via shell
+  // (n8n session 10-22: ListDir show_hidden=true ×2 rejected after a benign exit 128).
+  'ListDir',
   'Lsp',
   'AstGrep',
   'ast_grep_search',
@@ -8229,14 +8245,19 @@ export async function streamLLMWithTools(
   messages: LLMMessage[],
   handlers: StreamWithToolsHandlers,
   opts: LLMOpts & { provider?: LLMProvider; missionContext?: { missionId: string; phaseId: string; onOverload?: (info: { turn: number; consecutiveFailures: number; reason: string }) => void; pollSignal?: () => { kind: 'abort' | 'pause'; reason?: string } | undefined }; contextStrategy?: import('./agent-substrate/context-strategy.js').ContextStrategy;
+    /** TUI-400-AUTOHEAL-FALLBACK — 이 턴을 «이 공급자부터» 연다(`provider` 와 달리 폴백은 그대로 허용).
+     *  모델은 그 공급자의 기본 모델(앞 공급자 모델 이름은 안 옮긴다 — 호출부가 `model` 을 비운다). */
+    initialProvider?: LLMProvider;
+    /** 이 턴 폴백 후보에서 뺄 공급자(이미 같은 턴에서 실패한 쪽 — 되돌아가지 않게). */
+    skipProviders?: readonly string[];
   } = {},
 ): Promise<string> {
-  const provider = opts.provider ?? resolveDefaultProvider(opts.model);
+  const provider = opts.provider ?? opts.initialProvider ?? resolveDefaultProvider(opts.model);
   const initial = finalizeStreamingProviderModel(provider, opts.model ?? provider.defaultModel);
   let activeProvider = initial.provider;
   let activeModel = initial.model;
   opts.onResolvedProvider?.(activeProvider.name, activeModel);
-  const attemptedProviders = new Set<string>([activeProvider.name]);
+  const attemptedProviders = new Set<string>([activeProvider.name, ...(opts.skipProviders ?? [])]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   const effectiveModel = activeModel;
   const modelFamily = getModelFamily(effectiveModel);
@@ -8794,6 +8815,12 @@ export async function streamLLMWithTools(
           activeModel = finalized.model;
           opts.onResolvedProvider?.(activeProvider.name, activeModel);
           turnOpts = { ...turnOpts, model: activeModel };
+          // 짝 없는 서로게이트(잘린 이모지)가 섞이면 공급자가 본문 JSON 을 못 읽는다(10-22 n8n 매 턴 400) — 이력 자체를 고친다(다음 요청에 다시 안 실리게).
+          const wf = wellFormedLLMMessages(history);
+          if (wf.fixedMessages > 0) {
+            debug.log('llm.request', 'lone-surrogate-fixed', { site: 'tool-loop', provider: activeProvider.name, messages: wf.fixedMessages, strings: wf.fixedStrings }, { level: 'warn' });
+            history.splice(0, history.length, ...wf.messages);
+          }
           streamIter = activeProvider.streamChat!(history, turnOpts)[Symbol.asyncIterator]();
         }
         step = await Promise.race([
@@ -11985,7 +12012,11 @@ export function anyProviderAvailable(userConfig?: UserConfig): boolean {
       } catch { return false; }
     }
   } catch { /* fall through to env check */ }
-  return Object.values(PROVIDERS).some(p => p.name !== 'bedrock' && p.name !== 'opengateway' && p.available()); // 명시 전용 공급자는 auto 가용성 아님
+  if (Object.values(PROVIDERS).some(p => p.name !== 'bedrock' && p.name !== 'opengateway' && p.available())) return true; // 명시 전용 공급자는 auto 가용성 아님
+  // 시험 fake 를 «공급자 있음» 으로 치는 것은 격리 라이브 TUI 무대가 명시로 켤 때만(ELANOUS_TEST_FAKE_LLM_AS_PROVIDER=1).
+  //   ⛔ gate 시험 env 는 ELANOUS_TEST_FAKE_LLM=1 을 «전역» 으로 켠다(scripts/lib/gate-test-env.ts) — 그 스위치만으로 가용성이
+  //   참이 되면 «아무것도 없으면 false» 계약과 가용성으로 갈리는 기능(dart·dig-engine 등)이 gate 에서 모두 바뀐다(열차 #30208 introduced 2).
+  return process.env.ELANOUS_TEST_FAKE_LLM_AS_PROVIDER === '1' && testFakeLlmEnabled();
 }
 
 /** 직결 배선이 없는 계열 → OpenRouter 에서 그 벤더의 대표 모델(사다리 `openrouter` 에 선 것). */

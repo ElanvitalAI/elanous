@@ -181,6 +181,9 @@ export class WarmWorkerRuntime {
       this.quarantined = true;
       return { reply: null, quarantineWorker: true, reason: 'quarantined' };
     }
+    debug.log('pod.warm', 'resident-checkout-verified', { runId: command.runId,
+      attemptId: command.attemptId, workerId: command.workerId,
+      checkoutPath: repo, verifiedHead: command.cutSha, verifiedLockHash: command.key.lockHash });
     for (const file of command.files) {
       let target: string;
       try { target = realpathSync(join(repo, file)); }

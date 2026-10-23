@@ -67,13 +67,23 @@ describe('dashboard ESC abort gating', () => {
 
     expect(gateCallback).toContain('getRunningCount: () => getEscAbortRunningCount(escAbortToolState)');
     expect(gateCallback).toContain('getWaitingTargetNames: () => getEscAbortWaitingToolNames(escAbortToolState)');
-    expect(gateCallback).toContain('onAbortPending: ({ targets }) => {');
-    expect(gateCallback).toContain('onAbortRepeat: ({ repeat, targets }) => {');
+    const pendingGateBlock = extractCallbackBlock(
+      gateCallback,
+      'const escAbortPendingGate = createEscAbortPendingGate(',
+    );
+    expect(pendingGateBlock).not.toBeNull();
+    expect(pendingGateBlock).toContain('runSoftStop: runEscAbortPendingSoftStop,');
+    expect(pendingGateBlock).toContain('formatWaitingTargets: formatEscAbortWaitingTargets,');
+    expect(pendingGateBlock).toContain('getActiveHarnessSpace: activeHarnessSpace,');
+    expect(pendingGateBlock).toContain('pushChatLine: (line) => pushChatLine(line),');
+    expect(pendingGateBlock).toContain('showHarnessEscHint,');
+    expect(gateCallback).toContain('onAbortPending: escAbortPendingGate.onAbortPending,');
+    expect(gateCallback).toContain('onAbortRepeat: escAbortPendingGate.onAbortRepeat,');
     expect(source).toContain('createTurnStreamRuntime: (initialAssistantStart) => {\n              latestTurnUsage = undefined;\n              createDashboardTurnStreamRuntimeEscBoundary(escAbortToolState);');
     expect(source).toContain('trackEscAbortToolCall(escAbortToolState, toolCall);');
     expect(source).toContain('settleEscAbortToolCall(escAbortToolState, toolCall);');
     expect(finalizeTurnClearsEscAbortToolState(source)).toBe(true);
-    expect(source).toContain('const attachChatStreamingKeys = (abortCtrl: AbortController): () => void => {\n    const chatLinesStartIndex = chatLines.length;');
+    expect(source).toContain('const attachChatStreamingKeys = (abortCtrl: AbortController, phase: { turnEnd?: boolean } = {}): () => void => {\n    const chatLinesStartIndex = chatLines.length;');
     expect(source).toContain('settleEscAbortPendingLines(chatLines, chatLinesStartIndex);');
     expect(source).toContain('escGate.dispose();');
     const plainTurnIndicators = source.match(/startPinnedThinking\(\{[\s\S]*?message: '(?:Routing|Thinking)',[\s\S]*?metrics: \{ startedAt: [^}]+, hint: 'esc 중단' \},/g) ?? [];

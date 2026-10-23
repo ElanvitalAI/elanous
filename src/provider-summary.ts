@@ -17,6 +17,7 @@ import { loadTokens, isExpiringSoon } from './oauth/store.js';
 import { CODEX_REFRESH_BUFFER_MS } from './oauth/codex.js';
 import { findCodexModel } from './codex/models.js';
 import { getLocalLLMUrl } from './config.js';
+import { zaiCodingPlanAvailable } from './llm/zai-coding-plan.js';
 
 export type AuthKind = 'oauth' | 'apikey' | 'local' | 'none';
 
@@ -104,6 +105,13 @@ function authDetailForDecision(
     return auth === 'apikey'
       ? llm.apiKey ? 'API key (config)' : 'API key (~/.cache/openrouter_api_key · env OPENROUTER_API_KEY)'
       : 'not configured — bash scripts/add-api-key.sh OPENROUTER_API_KEY';
+  }
+  // GLM-NO-CREDENTIAL-FALLBACK (OP #28375 · 🩸 run-6c85c69f) — 종전엔 glm 칸이 없어 자격이 «있어도» 아래 일반 문면
+  //   「no provider configured」가 찍혔고(자식 PTY 첫 줄), 부검이 그 줄을 «자격 결손» 원인으로 읽었다. 판정은 glm 직결이 서는 조건 그 함수다.
+  if (provider === 'glm') {
+    return zaiCodingPlanAvailable()
+      ? 'GLM Coding Plan 키 (~/.cache/zai_api_key · env ZAI_API_KEY)'
+      : 'not configured — ZAI_API_KEY 없음 (~/.cache/zai_api_key · env ZAI_API_KEY)';
   }
   if (provider === 'local') {
     const url = llm.baseUrl || getLocalLLMUrl();

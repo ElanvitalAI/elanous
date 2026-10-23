@@ -495,14 +495,17 @@ describe('TA-LIVE-LAND — pinned PR land only on reviewed current head', () => 
 
   test('OPEN non-draft + pass for current SHA → exactly one pinned pr land, history and observation', async () => {
     const t = landFixture();
-    const first = await executeLiveLand(t.card(), 51, t.ctx, t.live);
+    const wake: string[] = [];
+    const live = { ...t.live, advanceLandedPiece: async (pieceId: string) => { wake.push(pieceId); } };
+    const first = await executeLiveLand(t.card(), 51, t.ctx, live);
     expect(first).toMatchObject({ kind: 'land', executed: true, ok: true });
     expect(t.calls).toEqual([{ pr: 51, head: HEAD_A, cwd: '/tmp/land-wt' }]);
     expect(t.f.logs.find(entry => entry.event === 'live-move')?.data).toMatchObject({ kind: 'land', executed: true, ok: true, live: true });
     expect(t.card().landAttempts).toEqual([expect.objectContaining({ pr: 51, head: HEAD_A, ok: true, detail: 'merged' })]);
-    const second = await executeLiveLand(t.card(), 51, t.ctx, t.live);
+    const second = await executeLiveLand(t.card(), 51, t.ctx, live);
     expect(second).toMatchObject({ executed: false, detail: expect.stringContaining('already attempted') });
     expect(t.calls).toHaveLength(1);
+    expect(wake).toEqual(['ta-live-1']);
   });
 
   test('stale review head, missing pass, draft and closed PR all refuse to land', async () => {

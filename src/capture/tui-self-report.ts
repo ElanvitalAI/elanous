@@ -45,6 +45,8 @@ import {
 import { writeHarnessScreen } from '../harness/harness-screen.js';
 import { runningBuild, startTuiRunStateRecorder } from '../pty-shell/tui-run-state.js';
 import { debug } from '../debug/log.js';
+import { setTuiLogName, setTuiLogSession } from '../debug/tui-log-tag.js';
+import { getActiveSessionId } from '../session/index.js';
 import { routeExternalInput, type ExternalInputRoute } from '../input/external-input-queue.js';
 
 export interface TuiFrameObserverCfg {
@@ -151,6 +153,97 @@ export function createTuiControlTarget(surfaceId: string, deps: TuiControlTarget
   };
 }
 
+// ── 재기동 세션 소유(TUI-H9-ACTIVE-SESSION-ID · 0.2.36) ──
+//
+// 재기동은 «지금 이 TUI 가 보여 주던 대화» 로만 이어 간다. 기동 때의 `--resume` 값이나 전역 최신
+// 세션은 이 TUI 의 것이 아닐 수 있으므로, 이 TUI 가 화면을 그리며 «직접 본» 활성 id 만 여기 적는다.
+// 확인이 안 되면 재기동을 막는 쪽이 기본값이다(⛔ 비슷한 id 로 메우지 않는다).
+
+export interface TuiOwnedSession {
+  readonly sessionId: string;
+  /** 이 TUI 가 그 대화를 «화면으로 확인한» 시각(`at`). */
+  readonly at: number;
+}
+
+let ownedSession: TuiOwnedSession | null = null;
+
+function normalizeSessionId(value: string | null | undefined): string | null {
+  const id = typeof value === 'string' ? value.trim() : '';
+  return id || null;
+}
+
+/** 이 TUI 가 지금 보여 주는 대화 id 를 적는다. 빈 값이면 «소유 없음» 으로 되돌린다(추측 금지). */
+export function claimTuiOwnedSession(
+  sessionId: string | null | undefined,
+  at: number = Date.now(),
+): TuiOwnedSession | null {
+  const id = normalizeSessionId(sessionId);
+  ownedSession = id ? { sessionId: id, at } : null;
+  setTuiLogSession(id);
+  return ownedSession;
+}
+
+/** 이 TUI 가 화면으로 확인한 대화 — 모르면 null(전역 최신·기동 resume 으로 메우지 않는다). */
+export function getTuiOwnedSession(): TuiOwnedSession | null {
+  return ownedSession;
+}
+
+// 재기동 «요청» — 사용자가 q 로 끄는 것은 재기동이 아니다(기본 동작 보존). 재기동은 누군가(H9 유휴
+// 재기동 방아쇠 등)가 «다시 뜨려고» TUI 를 닫을 때만 일어난다 — 그 쪽이 닫기 전에 이것을 부른다.
+let restartRequest: { readonly reason: string; readonly at: number } | null = null;
+
+/** TUI 를 «다시 뜨려고» 닫는다고 적는다 — 종료 경계(`exitTuiRun`)가 한 번 읽고 지운다. */
+export function requestTuiSelfRestart(reason: string, at: number = Date.now()): void {
+  const why = reason.trim();
+  restartRequest = { reason: why || 'unspecified', at };
+}
+
+/** 재기동 요청을 꺼낸다(꺼내면 사라진다) — 없으면 null = 사용자 종료. */
+export function takeTuiSelfRestartRequest(): { readonly reason: string; readonly at: number } | null {
+  const request = restartRequest;
+  restartRequest = null;
+  return request;
+}
+
+/** 재기동을 막는 이유 — 전부 «확인 실패» 다(전역 최신·기동 resume 으로 폴백하지 않는다). */
+export type TuiRestartBlockReason =
+  /** 지금 이 TUI 가 보여 주는 활성 대화가 없다(집중 표식 비었음·읽기 실패). */
+  | 'no-active-session'
+  /** 이 TUI 가 화면으로 확인한 대화 기록이 없다(발행된 프레임 0). */
+  | 'no-owned-session'
+  /** 마지막 관측 뒤 활성 대화가 움직였다 — 어느 쪽이 맞는지 확인할 수 없다. */
+  | 'owned-session-mismatch'
+  /** 확인한 id 의 대화가 저장소에 없다. */
+  | 'active-session-missing';
+
+export type TuiRestartSessionDecision =
+  | { readonly ok: true; readonly sessionId: string; readonly claimedAt: number }
+  | { readonly ok: false; readonly reason: TuiRestartBlockReason };
+
+/**
+ * 재기동에 실을 세션 id 를 정한다. `owned`(이 TUI 가 본 것)와 `liveActiveSessionId`(지금 집중된 것)가
+ * «같고 그 대화가 실재할 때만» 통과한다 — 하나라도 어긋나면 막는다.
+ */
+export function decideTuiRestartSession(input: {
+  readonly owned: TuiOwnedSession | null;
+  readonly liveActiveSessionId: string | null | undefined;
+  readonly sessionExists: (sessionId: string) => boolean;
+}): TuiRestartSessionDecision {
+  const live = normalizeSessionId(input.liveActiveSessionId);
+  if (!live) return { ok: false, reason: 'no-active-session' };
+  const owned = input.owned;
+  if (!owned) return { ok: false, reason: 'no-owned-session' };
+  if (owned.sessionId !== live) return { ok: false, reason: 'owned-session-mismatch' };
+  let exists = false;
+  try {
+    exists = input.sessionExists(live);
+  } catch {
+    exists = false;
+  }
+  if (!exists) return { ok: false, reason: 'active-session-missing' };
+  return { ok: true, sessionId: live, claimedAt: owned.at };
+}
+
 export interface TuiSelfReportDeps {
   surfaceId?: string;
   /** `elanous --name <name>` — 자기 manifest 행 별명. `pty list`·`pty snapshot <name>` 이 이것으로 부른다. */
@@ -192,6 +285,9 @@ export interface TuiSelfReportDeps {
   lookupRow?: (surfaceId: string) => TuiOwnRowView | null;
   /** 재등록 뒤 실행 판(build) 칸을 다시 적는다 — 기본 = 기동 때 판(`runningBuild`). */
   restoreBuild?: (surfaceId: string) => void;
+  /** 이 TUI 가 지금 보여 주는 대화 id 를 읽는다 — 프레임을 발행할 때마다 소유 기록을 갱신한다
+   *  (TUI-H9). 기본 = `getActiveSessionId()`. ⛔ 읽기 실패는 «모른다»(소유 없음)로 접는다. */
+  readActiveSessionId?: () => string | null;
   /** 박동 스케줄러 — 기본 setInterval(unref). 시험이 박동을 손으로 돌린다. */
   driveHeartbeat?: (tick: () => void, ms: number) => (() => void);
   /** SIGCONT 수신 훅(행 상실 단서) — 반환 = 해제. 기본 = process.on('SIGCONT'). */
@@ -290,6 +386,7 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     controlInitStage = 'publish-manifest';
     initDisposers.push({ stage: 'rollback-manifest', dispose: () => rollbackRow(surfaceId) });
     const nickname = deps.nickname?.trim() || undefined;
+    setTuiLogName(nickname);
     registerRow(surfaceId, now(), nickname);
     if (nickname) debug.log('pty.rename', 'tui-launch-name', { ptyId: surfaceId, nickname });
   } catch (error) {
@@ -338,6 +435,9 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
   const emitText = (text: string, cols: number, rows: number): void => {
     const at = now();
     lastEmittedText = text;
+    // TUI-H9 — 이 프레임이 «지금 이 TUI 가 보여 주는 대화» 의 소유 기록이다. 재기동은 이 id 로만 잇는다
+    // (읽기 실패 → 소유 없음 → 재기동 막힘 · 다른 세션으로 대체하지 않는다).
+    try { claimTuiOwnedSession(readActiveSessionId(), at); } catch { claimTuiOwnedSession(null, at); }
     const frame: SelfReportFrame = { surfaceId, instance, kind: 'tui', mode: 'self-report', text, cols, rows, at, ...(runId ? { runId } : {}) };
     try { publishFrame(frame); } catch { /* fail-soft */ }
     // `at` is shared with the manifest write → its internal throttle keys
@@ -391,6 +491,8 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     ?? (deps.registerRow ? () => ({ alive: true }) : (id: string) => getPtyManifest(id, { strict: true }));
   const restoreBuild = deps.restoreBuild ?? (deps.registerRow ? () => {} : (id: string) => { updatePtyManifestBuild(id, runningBuild()); });
   const logRowMissing = deps.logRowMissing ?? ((data: TuiRowMissingEvent) => debug.log('tui.self-report', 'row-missing', data));
+  const readActiveSessionId: () => string | null = deps.readActiveSessionId
+    ?? (() => { try { return getActiveSessionId(); } catch { return null; } });
   const rowNickname = deps.nickname?.trim() || undefined;
   let lastSeenAt = now();
   let lastBeatAt = lastSeenAt;

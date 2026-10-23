@@ -8,13 +8,7 @@ import { debug } from '../../debug/log.js';
 import { compactSessionHistory } from '../../session/compact-session.js';
 import type { CompactProvider } from '../../compact/provider.js';
 import type { ChatAutoCompactConfig } from '../../user-config.js';
-
-export const COMPACT_BUSY_STATUS = '응답 중에는 /compact 를 받지 않습니다 · 완료(또는 Esc 취소) 뒤 다시';
-export const COMPACT_NO_SESSION_STATUS = '압축할 대화가 없습니다';
-
-export function isCompactCommand(text: string): boolean {
-  return text.trim() === '/compact';
-}
+export { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS, isCompactCommand } from './compact-command.js';
 
 /** Test/embedding seams. Production passes none of these. */
 export interface NextTuiCompactDeps {

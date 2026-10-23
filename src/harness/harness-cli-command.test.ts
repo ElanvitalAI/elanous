@@ -1019,6 +1019,39 @@ describe('harness CLI command', () => {
     }
   });
 
+  test('draft sweep RUN-TTL: tools.selfImplement.runTtl.cap bounds the whole sweep at one action', async () => {
+    const lines: string[] = [];
+    const now = Date.now();
+    const labels: unknown[] = [];
+    const adapters = {
+      listDrafts: async () => [], listMerged: async () => [],
+      getRunStatus: async () => undefined, listLiveBranches: async () => new Set<string>(),
+      setLabels: async () => {}, closeDraft: async () => {},
+    };
+    const stalePr = (number: number, commitHoursAgo: number) => ({
+      number, branch: `self-impl/${number}`, labels: [],
+      createdAt: new Date(now - 96 * 3_600_000).toISOString(), headSha: `sha${number}`,
+    });
+    const runTtl = {
+      listOpenPrs: async () => [stalePr(11, 48), stalePr(12, 60)],
+      lastCommitAt: async (pr: { number: number }) => new Date(now - (pr.number === 12 ? 60 : 48) * 3_600_000).toISOString(),
+      resolveRun: async () => ({ alive: false as const, reason: 'owner-run-unknown' }),
+      sendMemo: (...args: unknown[]) => { throw new Error(`unexpected memo ${JSON.stringify(args)}`); },
+      addLabel: (...args: unknown[]) => { labels.push(args); },
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, runTtl, repository: () => 'my/repo', write: (line) => lines.push(line) });
+    try {
+      setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
+        selfImplement: { ...config.tools.selfImplement, runTtl: { mode: 'live', cap: 1 } } } }));
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']);
+      expect(JSON.parse(lines.at(-1)!).runTtl).toMatchObject({ mode: 'live', label: [12], skippedOverCap: [11] });
+      expect(labels).toEqual([[12, 'elanous:needs-rebase']]);
+    } finally {
+      setUserConfigOverlay(null);
+    }
+  });
+
   test('draft sweep apply transitions stale running label before close and dry-run leaves both untouched', async () => {
     const labels: unknown[] = [];
     const closed: unknown[] = [];
@@ -2134,7 +2167,18 @@ describe('harness CLI command', () => {
 
   test('real harness ask/say entrances forward the pool to self orchestration; N=2 holds a third kubectl Job apply', async () => {
     const goal = join(tmpdir(), `pod-admission-${crypto.randomUUID()}.md`);
-    writeFileSync(goal, 'First distinct goal');
+    // The orchestrate done-boundary gate withholds goals without the three
+    // «완료 경계» declarations, so each goal text carries them to reach spawn.
+    const withDoneBoundary = (title: string) => [
+      title,
+      '- 완료 경계 코드: kubectl Job 적용이 admission 예산 안에서만 나간다',
+      '- 완료 경계 실물: 셋째 Job 이 대기열에서 풀려 적용된다',
+      '- 완료 경계 증거 명령: bun test src/harness/harness-cli-command.test.ts',
+    ].join('\n');
+    const firstGoal = withDoneBoundary('First distinct goal');
+    const secondGoal = withDoneBoundary('Second distinct goal');
+    const thirdGoal = withDoneBoundary('Third distinct goal');
+    writeFileSync(goal, firstGoal);
     const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({
       recommended: 2, accountSlots: 99, limitedBy: 'capacity', reason: null,
       capacitySlots: 3, memorySlots: 3, placeableSlots: 3, running: 0, pending: 0,
@@ -2185,11 +2229,11 @@ describe('harness CLI command', () => {
     try {
       process.exitCode = 0;
       await program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'fake:3']);
-      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'Second distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', secondGoal, '--substrate', 'pod', '--pod-pool', 'fake:3']);
       expect(forwarded).toEqual(['fake:3', 'fake:3']);
-      expect(receivedGoals).toEqual(['First distinct goal', 'Second distinct goal']);
+      expect(receivedGoals).toEqual([firstGoal, secondGoal]);
       const third = runSelfOrchestrateCliCommand({
-        goals: [{ feature: 'Third distinct goal' }], concurrency: 1, runtime: { spawn: (input) => {
+        goals: [{ feature: thirdGoal }], concurrency: 1, runtime: { spawn: (input) => {
           const job = spawn({ ...input, signal: controllers[2]!.signal });
           jobs.push(job);
           return job;
@@ -2369,12 +2413,19 @@ describe('harness CLI command', () => {
       ['❌ launch gate: blocked-duplicate — active run', 'launch-gate-blocked'],
       ['Error: ENOBUFS, buffer full', 'ENOBUFS'],
       ['Job si-x failed (OOMKilled/137)', 'OOMKilled'],
+      ['❌ blocked · task B — DEP_FAILED', 'dep-blocked'],
+      ['❌ blocked · task C — DEPENDENCY_NEEDS_HUMAN', 'dep-blocked'],
+      ['❌ blocked · task D — DEP_BLOCKED_REBASE_READY', 'dep-blocked'],
     ] as const) {
       const result = classifyHarnessPodExit({ status: 1 }, output, deps);
       expect(result.reason).toBe(reason);
       expect(result.lines[0]).toContain(reason);
     }
     expect(classifyHarnessPodExit({ status: 1 }, 'unrelated output', deps).reason).toBe('unknown');
+    expect(classifyHarnessPodExit({ status: 1 }, '❌ blocked · DEPENDENCY_NEEDS_HUMAN', {
+      ...deps, loadLedger: () => [{ runId: 'run-0f5f7c5f', event: 'human-stop', data: {} }],
+      runId: 'run-0f5f7c5f',
+    }).reason).toBe('human-stop');
   });
 
   test('an unreadable or missing ledger never proves a Pod launch was absent', () => {

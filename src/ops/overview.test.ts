@@ -127,6 +127,14 @@ describe('자원 지도 구속 조건 — 남은 비율 최소 축(RES-FLOOR-BIN
     const text = renderOverview(s, computeVerdict(s), { elapsedMs: 12 });
     expect(text).toContain('✅ 흐름 정상 (flowing)\n   ↳ 구속 자원 node-b 메모리 — 남은 비율 최소 8% (5/64GB)');
   });
+  test('잘못된 축 수치는 후보에서 제외해 유효한 node-b 메모리가 구속 조건이 된다', () => {
+    const s = base();
+    s.machines.hosts = [
+      { name: 'bad', load: okCell({ load1: 1, load5: Number.NaN, load15: 1, cpuCount: 8, freeGb: 1, totalGb: Number.POSITIVE_INFINITY, ageSeconds: 5 }, 't', AT) },
+      host('node-b', 8, 8, 5, 64),
+    ];
+    expect(bindingResource(s)).toMatchObject({ kind: 'memory', label: 'node-b 메모리', remainingRatio: 5 / 64 });
+  });
   test('CPU 남은 비율은 압박선 기준 — 압박선에 닿으면 0%', () => {
     const s = base();
     s.machines.hosts = [host('mbp', 54, 18, 90, 128)];
@@ -505,6 +513,61 @@ describe('collectOverview — 주입 원천으로 끝까지', () => {
     expect(s.machines.pods[0]!.occupied.value).toBeNull();
     expect(s.landings.reason).toBe('no repo');
     expect(computeVerdict(s).verdict).toBe('unobservable');
+  });
+
+  test('10-08 node-b heartbeat가 생산 수집·판정·렌더 경로에서 구속 메모리와 판정 띠로 보인다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ovw-node-b-root-'));
+    const seat = mkdtempSync(join(tmpdir(), 'ovw-node-b-seat-'));
+    try {
+      const now = Date.parse(AT);
+      const snapshot = await collectOverview({ sinceMs: 3_600_000, sinceLabel: '최근 1h', now, root, seatEraDir: seat }, {
+        listSchedules: () => [], listChecklist: () => ({ version: '', released: '', dev: '', history: [], items: [] }),
+        readRuns: () => [], readCards: () => [], poolSpec: () => null, ps: () => '',
+        ledger: () => [{
+          id: 'machine:node-b', kind: 'machine', machine: 'node-b', name: 'node-b', owner: 'test',
+          attrs: { load: { loadAvg: [8, 8, 8], cpuCount: 8, freeMem: 5 * 1024 ** 3, totalMem: 64 * 1024 ** 3, observedAt: now } },
+          observedAt: now, ttlMs: 600_000, ageMs: 0, expired: false,
+        } as ResourceView],
+        gitLog: () => ({ lines: [], observedAt: AT }),
+      });
+      const verdict = computeVerdict(snapshot);
+      expect(bindingResource(snapshot)).toMatchObject({ kind: 'memory', label: 'node-b 메모리' });
+      expect(verdict.reasons).toContain('구속 자원 node-b 메모리 — 남은 비율 최소 8% (5/64GB)');
+      expect(renderOverview(snapshot, verdict, { elapsedMs: 1 }))
+        .toContain('↳ 구속 자원 node-b 메모리 — 남은 비율 최소 8% (5/64GB)');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(seat, { recursive: true, force: true });
+    }
+  });
+
+  test('비유한 heartbeat 측정값은 구속 후보에서 빠지고 유효한 node-b 메모리가 판정 띠를 결정한다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ovw-nonfinite-root-'));
+    const seat = mkdtempSync(join(tmpdir(), 'ovw-nonfinite-seat-'));
+    try {
+      const now = Date.parse(AT);
+      const snapshot = await collectOverview({ sinceMs: 3_600_000, sinceLabel: '최근 1h', now, root, seatEraDir: seat }, {
+        listSchedules: () => [], listChecklist: () => ({ version: '', released: '', dev: '', history: [], items: [] }),
+        readRuns: () => [], readCards: () => [], poolSpec: () => null, ps: () => '',
+        ledger: () => [
+          { id: 'machine:bad', kind: 'machine', machine: 'bad', name: 'bad', owner: 'test',
+            attrs: { load: { loadAvg: [1, Number.NaN, 1], cpuCount: 8, freeMem: 5 * 1024 ** 3, totalMem: 64 * 1024 ** 3, observedAt: now } },
+            observedAt: now, ttlMs: 600_000, ageMs: 0, expired: false } as ResourceView,
+          { id: 'machine:node-b', kind: 'machine', machine: 'node-b', name: 'node-b', owner: 'test',
+            attrs: { load: { loadAvg: [8, 8, 8], cpuCount: 8, freeMem: 5 * 1024 ** 3, totalMem: 64 * 1024 ** 3, observedAt: now } },
+            observedAt: now, ttlMs: 600_000, ageMs: 0, expired: false } as ResourceView,
+        ],
+        gitLog: () => ({ lines: [], observedAt: AT }),
+      });
+      expect(snapshot.machines.hosts.find((host) => host.name === 'bad')?.load).toMatchObject({ value: null, status: 'unmeasured' });
+      const verdict = computeVerdict(snapshot);
+      expect(bindingResource(snapshot)).toMatchObject({ kind: 'memory', label: 'node-b 메모리' });
+      expect(verdict.reasons).toContain('구속 자원 node-b 메모리 — 남은 비율 최소 8% (5/64GB)');
+      expect(renderOverview(snapshot, verdict, { elapsedMs: 1 })).toContain('구속 자원 node-b 메모리 — 남은 비율 최소 8% (5/64GB)');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(seat, { recursive: true, force: true });
+    }
   });
 
   test('하트비트 diskIo.io(PSI)가 스냅샷 → 구속 자원 판정까지 생산 수집 경로로 흐른다', async () => {

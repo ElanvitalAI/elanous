@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test';
 import type { CoreTurnContext, CoreTurnResult } from './types.js';
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { DELEGATE_HINT } from '../agent/delegate-hint.js';
 import { runGoalLoop, type GoalLoopOptions } from './run-goal-loop.js';
 import {
   SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_DEFAULTS, isEmptyMailListResult, isIdleWaitCall, parseSeatTurnCapConfig,
@@ -102,7 +103,7 @@ describe('TUI-SEAT-TURN-CAP — 도구·벽시계 상한', () => {
     const r = await drive([{ calls: shell(121) }, { calls: [], complete: true }], { seatTurnCap: SEAT });
     expect(r.executed[0]).toHaveLength(60);
     expect(r.calls).toBe(2);
-    expect(r.lastUserMessages[1]).toBe(SEAT_TURN_CAP_CONTINUE_PROMPT);
+    expect(r.lastUserMessages[1]).toBe(`${SEAT_TURN_CAP_CONTINUE_PROMPT}\n${DELEGATE_HINT}`);
     expect(r.find('seat-turn-cap')).toMatchObject({ seat: 'OPT', reason: 'tools', tools: 60, iteration: 1 });
     expect(r.result).toMatchObject({ stopReason: 'goal_complete', goalComplete: true, iterations: 2 });
   });
@@ -112,7 +113,7 @@ describe('TUI-SEAT-TURN-CAP — 도구·벽시계 상한', () => {
     // 6·12·18분은 실행, 24분째(4번째) 호출은 거부.
     expect(r.executed[0]).toHaveLength(3);
     expect(r.find('seat-turn-cap')).toMatchObject({ reason: 'wall', tools: 3, iteration: 1 });
-    expect(r.lastUserMessages[1]).toBe(SEAT_TURN_CAP_CONTINUE_PROMPT);
+    expect(r.lastUserMessages[1]).toBe(`${SEAT_TURN_CAP_CONTINUE_PROMPT}\n${DELEGATE_HINT}`);
     expect(r.result.stopReason).toBe('goal_complete');
   });
 
@@ -146,7 +147,7 @@ describe('TUI-SEAT-TURN-CAP — update_goal 과 상한(리뷰 r2)', () => {
     const r = await drive([{ calls: progress(70) }, { calls: [], complete: true }], { seatTurnCap: { ...SEAT, maxTools: 60 } });
     expect(r.find('seat-turn-cap')).toMatchObject({ reason: 'tools', tools: 60, iteration: 1 });
     expect(r.calls).toBe(2);
-    expect(r.lastUserMessages[1]).toBe(SEAT_TURN_CAP_CONTINUE_PROMPT);
+    expect(r.lastUserMessages[1]).toBe(`${SEAT_TURN_CAP_CONTINUE_PROMPT}\n${DELEGATE_HINT}`);
   });
 
   test('상한 뒤의 update_goal(complete) 는 받아들인다(종결 신호 · 도구로 세지 않음) → goal 완료', async () => {

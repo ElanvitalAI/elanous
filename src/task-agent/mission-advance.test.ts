@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
-import { advanceMission, collectPieceEvidence, handMission, landedPieces, openMissionIds, recordPieceRef, type PieceEvidenceReader } from './mission.js';
+import { advanceLandedPieceMission, advanceMission, collectPieceEvidence, handMission, landedPieces, openMissionIds, recordPieceRef, type PieceEvidenceReader } from './mission.js';
 import { handTask, readTaskCard, TaskCardSupersededError, updateTaskCard, type TaskCard } from './task-hand.js';
 
 function statePath(): string {
@@ -67,6 +67,38 @@ test('collectPieceEvidence — PR 번호 우선 · 골 id · 둘 다 없으면 n
   });
   expect(evidence).toEqual({ p1: 'merged', p2: 'pending', p3: 'no-ref', p4: 'pending' });
   expect(seen).toEqual([11, 'abcdef0123456789', 99]);
+});
+
+test('postland auto advance rechecks MERGED evidence and launches successor exactly once', async () => {
+  const path = statePath();
+  const id = await diamond(path);
+  prepareLiveDiamond(path, id);
+  recordPieceRef(`${id}-1`, { pr: 101 }, path);
+  const calls: string[][] = [];
+  const launcher = (args: string[]) => { calls.push(args); };
+  const pending = await advanceLandedPieceMission(`${id}-1`, { statePath: path, launcher, readEvidence: fakePrs({ 101: 'open' }) });
+  expect(pending?.handed).toEqual([]);
+  expect(calls).toHaveLength(0);
+  const landed = await advanceLandedPieceMission(`${id}-1`, { statePath: path, launcher, readEvidence: fakePrs({ 101: 'merged' }) });
+  expect(landed?.handed.map((piece) => piece.pieceId)).toEqual([`${id}-2`, `${id}-3`]);
+  expect(calls).toHaveLength(2);
+  await advanceLandedPieceMission(`${id}-1`, { statePath: path, launcher, readEvidence: fakePrs({ 101: 'merged' }) });
+  expect(calls).toHaveLength(2);
+});
+
+test('verified train receipt advances successors even when component PR is CLOSED', async () => {
+  const path = statePath();
+  const id = await diamond(path);
+  prepareLiveDiamond(path, id);
+  recordPieceRef(`${id}-1`, { pr: 101 }, path);
+  updateTaskCard(path, `${id}-1`, (card) => ({ ...card!, status: 'done', trainLanding: {
+    componentPr: 101, integrationPr: 202, mergeSha: 'a'.repeat(40), train: 'test', at: new Date().toISOString(),
+  } }));
+  const calls: string[][] = [];
+  const result = await advanceLandedPieceMission(`${id}-1`, { statePath: path,
+    launcher: (args) => { calls.push(args); }, readEvidence: fakePrs({ 101: 'closed' }) });
+  expect(result?.evidence[`${id}-1`]).toBe('merged');
+  expect(calls).toHaveLength(2);
 });
 
 test('선행 PR 병합 → 다음 조각을 한 번 넘긴다 · 두 번 불러도 새로 넘기는 것 0', async () => {

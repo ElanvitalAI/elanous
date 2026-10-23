@@ -172,6 +172,33 @@ describe('herdr agent report wiring', () => {
     expect(order).toEqual(['build', 'write:idle', 'start', 'write:busy', 'turn:busy', 'write:idle', 'turn:idle', 'release']);
   });
 
+  test('기동 창 SIGINT 죽음에도 herdr 반납 — 녹음기가 신호 지킴이를 걸고 stop 에서 걷는다 (TUI-HERDR-EXIT-RACE)', () => {
+    const order: string[] = [];
+    const herdr = { start: () => order.push('start'), turn: () => {}, release: () => order.push('release') };
+    const ls = new Map<string, Array<(s: NodeJS.Signals) => void>>();
+    const signals = {
+      pid: 1,
+      on(sig: NodeJS.Signals, fn: (s: NodeJS.Signals) => void) { ls.set(sig, [...(ls.get(sig) ?? []), fn]); return signals; },
+      removeListener(sig: NodeJS.Signals, fn: (s: NodeJS.Signals) => void) { ls.set(sig, (ls.get(sig) ?? []).filter((f) => f !== fn)); return signals; },
+      listenerCount: (sig: NodeJS.Signals) => (ls.get(sig) ?? []).length,
+      kill: (_pid: number, sig?: string | number) => { order.push(`kill:${String(sig)}`); return true; },
+    };
+    const stop = startTuiRunStateRecorder('tui:herdr-sig', {
+      now: () => 1, build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true, writeTurn: () => true, herdr, signals,
+    });
+    expect(signals.listenerCount('SIGINT')).toBe(1);
+    for (const fn of [...(ls.get('SIGINT') ?? [])]) fn('SIGINT');
+    expect(order).toEqual(['start', 'release', 'kill:SIGINT']);
+    const stop2 = startTuiRunStateRecorder('tui:herdr-sig2', {
+      now: () => 1, build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true, writeTurn: () => true, herdr, signals,
+    });
+    stop2();
+    expect(signals.listenerCount('SIGINT') + signals.listenerCount('SIGTERM')).toBe(0);
+    stop();
+  });
+
   test('herdr.turn 이 동기로 던지면 «보낸 상태» 로 적지 않는다 — herdr 기준 값으로 다음 전이를 다시 보낸다 (r4 리뷰 sf)', () => {
     const calls: string[] = [];
     const events: string[] = [];

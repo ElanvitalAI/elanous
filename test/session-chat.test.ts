@@ -14,6 +14,7 @@ import type { LLMProvider, LLMStreamEvent } from '../src/llm';
 import type { UserConfig } from '../src/user-config';
 import { buildTerminalCapableTurn, PTY_BUDGET_GRANT, TERMINAL_MISSION_DISCIPLINE } from '../src/agent/terminal-surface';
 import { _resetUserIntentLogger } from '../src/user-intent/logger';
+import { resetPauseFlag } from '../src/turn-checkpoint/index';
 import type { UserIntentEvent } from '../src/user-intent/types';
 
 let root: string;
@@ -52,6 +53,9 @@ function fakeProvider(replyParts: string[]): LLMProvider {
 }
 
 beforeEach(() => {
+  // runTurn pauses at a checkpoint when the process-wide `/pause` flag is set; a file that ran earlier in
+  // the same bun process may have left it on (train #30519 shard-3: dashboard-slash-registry census).
+  resetPauseFlag();
   root = mkdtempSync(join(tmpdir(), 'session-chat-'));
   process.env.XDG_DATA_HOME = root;
   process.env.XDG_STATE_HOME = join(root, '_state');

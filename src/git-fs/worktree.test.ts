@@ -5,8 +5,9 @@ import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, lstatSync, chmodSync, readFileSync, realpathSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { createWorktree, gateWorktreeReuse, isUnbornHeadError, linkWorktreeDependencies, worktreeParentDir, worktreeDirName, observeGitResidue, gateGitResidue, removeWorktree, syncBaseWithRemote, DEFAULT_BRANCH_WORKTREE_BASE, DEFAULT_WORKTREE_DEPENDENCY_PATHS, type GitRunner, type WorktreeAddDeps, type WorktreeReuseExpectation } from './worktree.js';
+import { createWorktree, gateWorktreeReuse, isUnbornHeadError, linkWorktreeDependencies, worktreeParentDir, worktreeDirName, observeGitResidue, gateGitResidue, removeWorktree, syncBaseWithRemote, DEFAULT_BRANCH_WORKTREE_BASE, DEFAULT_WORKTREE_DEPENDENCY_PATHS, WorktreeDependencyPreparationError, type GitRunner, type WorktreeAddDeps, type WorktreeReuseExpectation } from './worktree.js';
 import { recordHarnessWorktreeProvenance } from '../harness/harness-worktree-add.js';
 import { isTransientGitError } from './retry.js';
 import { setGitCommandRunnerForTesting } from './runner.js';
@@ -428,6 +429,138 @@ describe('createWorktree — node_modules 링크(시스템 보강 2026-07-21·�
     for (const relativePath of DEFAULT_WORKTREE_DEPENDENCY_PATHS) {
       expect(existsSync(join(res.path, relativePath))).toBe(false);
     }
+  });
+
+  const commitDependencyContract = () => {
+    writeFileSync(join(repo, 'package.json'), JSON.stringify({ dependencies: { typescript: '5.0.0' } }));
+    writeFileSync(join(repo, 'bun.lock'), 'test-lock\n');
+    git(repo, 'add', 'package.json', 'bun.lock');
+    git(repo, 'commit', '-qm', 'deps');
+  };
+
+  test('Pod 옵션이 없는 호출부는 의존성이 없어도 설치하지 않는다', () => {
+    commitDependencyContract();
+    const res = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/no-deps-contract', base: 'HEAD' }, {
+      installDependencies: () => { throw new Error('ordinary caller must not install'); },
+    });
+    expect(existsSync(join(res.path, 'node_modules'))).toBe(false);
+  });
+
+  test('source node_modules 부재 시 맞는 이미지 의존성을 연결해 자식에서 typescript 를 실제로 푼다', () => {
+    commitDependencyContract();
+    const baked = join(tmp, 'baked');
+    mkdirSync(join(baked, 'node_modules', 'typescript'), { recursive: true });
+    writeFileSync(join(baked, 'package.json'), JSON.stringify({ dependencies: { typescript: '5.0.0' } }));
+    writeFileSync(join(baked, 'bun.lock'), 'test-lock\n');
+    writeFileSync(join(baked, 'node_modules', 'typescript', 'package.json'), JSON.stringify({ name: 'typescript', main: 'index.js' }));
+    writeFileSync(join(baked, 'node_modules', 'typescript', 'index.js'), 'module.exports = 1;');
+    const install = () => { throw new Error('matched baked tree must not install'); };
+    const log = spyOn(debug, 'log');
+    try {
+      const res = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/baked', base: 'HEAD', requireDependencies: true, dependencyFallbackRoot: baked }, { installDependencies: install });
+      expect(lstatSync(join(res.path, 'node_modules')).isSymbolicLink()).toBe(true);
+      expect(realpathSync(createRequire(join(res.path, 'probe.cjs')).resolve('typescript'))).toBe(realpathSync(join(baked, 'node_modules', 'typescript', 'index.js')));
+      expect(log.mock.calls.some(([category, event, data]) => category === 'git-fs.worktree' && event === 'dependencies.prepared'
+        && (data as { method?: string; ok?: boolean }).method === 'fallback' && (data as { ok?: boolean }).ok === true)).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
+  test('baked tree 가 없으면 frozen install 한 번, 지정 상한을 전달한다', () => {
+    commitDependencyContract();
+    const calls: Array<{ cwd: string; timeoutMs: number }> = [];
+    const log = spyOn(debug, 'log');
+    try {
+      const res = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/install', base: 'HEAD', requireDependencies: true, dependencyFallbackRoot: join(tmp, 'missing'), dependencyInstallTimeoutMs: 42_000 }, {
+        installDependencies: (cwd, timeoutMs) => {
+          calls.push({ cwd, timeoutMs });
+          mkdirSync(join(cwd, 'node_modules', 'typescript'), { recursive: true });
+          writeFileSync(join(cwd, 'node_modules', 'typescript', 'index.js'), 'module.exports=1');
+          return { status: 0 };
+        },
+      });
+      expect(calls).toEqual([{ cwd: res.path, timeoutMs: 42_000 }]);
+      expect(existsSync(join(res.path, 'node_modules', 'typescript', 'index.js'))).toBe(true);
+      expect(log.mock.calls.some(([category, event, data]) => category === 'git-fs.worktree' && event === 'dependencies.prepared'
+        && (data as { method?: string; installed?: boolean; ok?: boolean }).method === 'install'
+        && (data as { installed?: boolean; ok?: boolean }).installed === true
+        && (data as { ok?: boolean }).ok === true)).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
+  test('이미지 일치 판정은 source HEAD가 아닌 자식 worktree lockfile을 읽는다', () => {
+    commitDependencyContract();
+    const baked = join(tmp, 'baked');
+    mkdirSync(join(baked, 'node_modules'), { recursive: true });
+    writeFileSync(join(baked, 'package.json'), JSON.stringify({ dependencies: { typescript: '5.0.0' } }));
+    writeFileSync(join(baked, 'bun.lock'), 'test-lock\n');
+    git(repo, 'checkout', '-qb', 'different-deps');
+    writeFileSync(join(repo, 'bun.lock'), 'different-lock\n');
+    git(repo, 'add', 'bun.lock');
+    git(repo, 'commit', '-qm', 'different deps');
+    git(repo, 'checkout', '-');
+    git(repo, 'rm', 'package.json', 'bun.lock');
+    git(repo, 'commit', '-qm', 'remove source deps contract');
+    let installs = 0;
+    const res = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/different-deps', base: 'different-deps', requireDependencies: true, dependencyFallbackRoot: baked }, {
+      installDependencies: (cwd) => {
+        installs++;
+        mkdirSync(join(cwd, 'node_modules'));
+        return { status: 0 };
+      },
+    });
+    expect(installs).toBe(1);
+    expect(readFileSync(join(res.path, 'bun.lock'), 'utf8')).toBe('different-lock\n');
+  });
+
+  test('설치 실패는 시험 전에 구조화 오류와 dependencies.prepared 실패 관측을 남긴다', () => {
+    commitDependencyContract();
+    const log = spyOn(debug, 'log');
+    try {
+      let error: unknown;
+      try {
+        createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/fail', base: 'HEAD', requireDependencies: true, dependencyFallbackRoot: join(tmp, 'missing') }, {
+          installDependencies: () => ({ status: 1, stderr: 'package unavailable' }),
+        });
+      } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(WorktreeDependencyPreparationError);
+      expect((error as WorktreeDependencyPreparationError).code).toBe('WORKTREE_DEPENDENCIES_UNAVAILABLE');
+      expect((error as WorktreeDependencyPreparationError).dependencyPath).toBe('node_modules');
+      expect(existsSync((error as WorktreeDependencyPreparationError).worktreePath)).toBe(false);
+      expect(log.mock.calls.some(([category, event, data]) => category === 'git-fs.worktree' && event === 'dependencies.prepared'
+        && (data as { ok?: boolean; installed?: boolean; error?: string }).ok === false
+        && (data as { installed?: boolean }).installed === true
+        && (data as { error?: string }).error === 'package unavailable')).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
+  test('설치 시간 초과도 구조화 오류로 구별하고 지정 상한을 기록한다', () => {
+    commitDependencyContract();
+    let timeoutSeen: number | null = null;
+    let error: unknown;
+    try {
+      createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/timeout-deps', base: 'HEAD', requireDependencies: true, dependencyFallbackRoot: join(tmp, 'missing'), dependencyInstallTimeoutMs: 1234 }, {
+        installDependencies: (_cwd, timeoutMs) => {
+          timeoutSeen = timeoutMs;
+          return { status: null, error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) };
+        },
+      });
+    } catch (caught) { error = caught; }
+    expect(timeoutSeen).toBe(1234);
+    expect(error).toBeInstanceOf(WorktreeDependencyPreparationError);
+    expect((error as WorktreeDependencyPreparationError).reason).toBe('install timed out after 1234ms');
+  });
+
+  test('설치 실행기가 던진 오류도 준비 실패로 관측한다', () => {
+    commitDependencyContract();
+    const log = spyOn(debug, 'log');
+    try {
+      expect(() => createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/thrown-deps', base: 'HEAD', requireDependencies: true, dependencyFallbackRoot: join(tmp, 'missing') }, {
+        installDependencies: () => { throw new Error('spawn unavailable'); },
+      })).toThrow(WorktreeDependencyPreparationError);
+      expect(log.mock.calls.some(([category, event, data]) => category === 'git-fs.worktree' && event === 'dependencies.prepared'
+        && (data as { ok?: boolean; error?: string }).ok === false
+        && (data as { error?: string }).error === 'spawn unavailable')).toBe(true);
+    } finally { log.mockRestore(); }
   });
 
   test('재사용 worktree도 중앙 계획의 새 하위 앱 의존성을 idempotent 하게 연결한다', () => {

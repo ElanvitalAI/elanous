@@ -354,11 +354,21 @@ describe('createEscAbortGate', () => {
       'abort-requested-pending',
     ]);
     expect(new Set(events.map((event) => event.event)).size).toBe(5);
-    expect(events[0]?.data).toEqual({ running: 0, repeat: 0 });
-    expect(events[1]?.data).toEqual({ running: 0, repeat: 0, targets: [] });
-    expect(events[2]?.data).toEqual({ running: 1 });
-    expect(events[3]?.data).toEqual({ decision: 'abort', repeat: 1 });
-    expect(events[4]?.data).toEqual({ running: 1, repeat: 1, phase: 'confirming', targets: [] });
-    expect(events[5]?.data).toEqual({ running: 1, repeat: 1, targets: [] });
+    // 관측 enrich(src/debug/log.ts — ELANOUS_SUBSTRATE/ARM_ID/HOST_ID 환경이 data에
+    // substrate/armId/hostId 를 덧붙인다)는 의사결정 표면이 아니므로 비교에서 제외한다.
+    // 제외 없이 toEqual 로 묶으면 pod 환경에서만 빨개지는 취약 단정이 된다.
+    const decisions = events.map((event) => {
+      const data: Record<string, unknown> = { ...(event.data as Record<string, unknown>) };
+      delete data.substrate;
+      delete data.armId;
+      delete data.hostId;
+      return data;
+    });
+    expect(decisions[0]).toEqual({ running: 0, repeat: 0 });
+    expect(decisions[1]).toEqual({ running: 0, repeat: 0, targets: [] });
+    expect(decisions[2]).toEqual({ running: 1 });
+    expect(decisions[3]).toEqual({ decision: 'abort', repeat: 1 });
+    expect(decisions[4]).toEqual({ running: 1, repeat: 1, phase: 'confirming', targets: [] });
+    expect(decisions[5]).toEqual({ running: 1, repeat: 1, targets: [] });
   });
 });

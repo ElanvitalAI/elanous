@@ -264,10 +264,11 @@ export function emitInjectedEvent(options: EmitInjectedEventOptions): EmitInject
     }
     case 'scope-escape-held': {
       const outOfScopeEdits = ['src/index.ts', 'src/cli/tasks-cli.ts', 'docs/_index.md'];
+      // SCOPE-ESCAPE-AS-REFINE — a held edit now always carries its stop reason (orchestrator decideScopeExpansion); without one it is new scope.
       ledger.write('execution-scope-held', { outOfScopeEdits, nameCapReached: false, outsideCount: outOfScopeEdits.length,
-        worktreePath: `/tmp/elanous-sim/${job}`, branch, disposition: 'in-scope-only' });
+        worktreePath: `/tmp/elanous-sim/${job}`, branch, disposition: 'in-scope-only', stopReasons: ['deletion'], deleted: ['docs/_index.md'] });
       podChildRun();
-      childEvidence({ ok: false, exitCode: 1, outOfScopeEdits, detail: 'Out-of-scope edits held in the worktree; gate and publication skipped.' });
+      childEvidence({ ok: false, exitCode: 1, outOfScopeEdits, scopeStopReasons: ['deletion'], detail: 'Out-of-scope edits held in the worktree; gate and publication skipped.' });
       emit('self-implement.pod', 'child-error', { job, stage: 'soft-stopped', error: 'Out-of-scope edits held in the worktree' });
       break;
     }

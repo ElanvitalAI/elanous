@@ -13,6 +13,15 @@ export type ChecklistKind = 'screen' | 'postpub';
 const CHECKLIST_KINDS: readonly ChecklistKind[] = ['screen', 'postpub'];
 export type ChecklistDispatchKind = 'code' | 'ops' | 'measure' | 'decision' | 'umbrella';
 const CHECKLIST_DISPATCH_KINDS: readonly ChecklistDispatchKind[] = ['code', 'ops', 'measure', 'decision', 'umbrella'];
+/** MUST 지정 — 이 칸이 지켜야 하는 조건과 그 효과. 원장에는 `must` 이벤트(전체 값)로만 실린다. */
+export interface ChecklistMust {
+  version: string;
+  reason: string;
+  setBy: string;
+  setAt: string;
+  effect: string;
+}
+const MUST_FIELDS = ['version', 'reason', 'setBy', 'setAt', 'effect'] as const;
 export interface ChecklistItem {
   id: string;
   title: string;
@@ -32,6 +41,8 @@ export interface ChecklistItem {
   kind?: ChecklistKind;
   /** Whether the seat dispatcher should launch a coding task. Missing in old rows means code. */
   dispatchKind?: ChecklistDispatchKind;
+  /** MUST 지정(있으면 이 칸은 MUST 다). 원장 스키마에 must 컬럼이 없어 `must` 이벤트에서 복원한다. */
+  must?: ChecklistMust;
   updatedAt: string;
   updatedBy: string;
 }
@@ -92,13 +103,51 @@ function decodeClaimHistory(data: Checklist): Checklist {
   return { ...data, history: data.history.map(decodeClaimHistoryEntry) };
 }
 
+/** A `must` event carries the whole MUST value in `to`; anything that is not five strings is not a MUST. */
+function mustValue(value: unknown): ChecklistMust | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  if (!MUST_FIELDS.every((field) => typeof record[field] === 'string')) return null;
+  return { version: record.version as string, reason: record.reason as string, setBy: record.setBy as string, setAt: record.setAt as string, effect: record.effect as string };
+}
+
+function decodeMustEntry<T extends ChecklistHistory>(entry: T): T {
+  if (entry.field !== 'must') return entry;
+  const must = mustValue(entry.to);
+  return must ? { ...entry, to: must } as T : entry;
+}
+
+/** The ledger event schema has no must column either; the last `must` event is this cell's MUST. */
+function decodeMustHistory(data: Checklist): Checklist {
+  const latest = new Map<string, ChecklistMust>();
+  for (const entry of data.history) {
+    if (entry.field !== 'must') continue;
+    const must = mustValue(entry.to);
+    if (must) latest.set(entry.id, must);
+  }
+  if (!latest.size) return data;
+  return { ...data, items: data.items.map((item) => {
+    const must = latest.get(item.id);
+    return must ? { ...item, must } : item;
+  }) };
+}
+
+function latestMust(history: readonly ChecklistHistory[], id: string): ChecklistMust | null {
+  for (let index = history.length - 1; index >= 0; index--) {
+    const entry = history[index]!;
+    if (entry.id !== id || entry.field !== 'must') continue;
+    return mustValue(entry.to);
+  }
+  return null;
+}
+
 export function listChecklist(v: string, root?: string): Checklist {
-  return decodeClaimHistory(root === undefined ? store.list(v) : store.list(v, undefined, undefined, root));
+  return decodeMustHistory(decodeClaimHistory(root === undefined ? store.list(v) : store.list(v, undefined, undefined, root)));
 }
 
 /** Events for this id across every release, ordered by event time (then ledger sequence). */
 export function checklistHistory(id: string): Array<ChecklistHistory & { version: string; seq: number }> {
-  return store.history(id).map(decodeClaimHistoryEntry);
+  return store.history(id).map((entry) => decodeMustEntry(decodeClaimHistoryEntry(entry)));
 }
 
 /** Status events in the requested window; other ledger fields never become status changes. */
@@ -116,8 +165,8 @@ function assertPredecessorsExist(predecessors: readonly string[] | undefined, da
 }
 
 function mutate(v: string, apply: (data: Checklist, otherItems: (id: string) => store.ChecklistCollision[]) => boolean): Checklist {
-  // addItem/setItem/claimItem/removeItem/seedFromRoadmap reach the generation-fenced ledger write here.
-  return decodeClaimHistory(store.mutate(v, store.releasedVersion(), devVersion(), apply));
+  // addItem/setItem/claimItem/removeItem/seedFromRoadmap/setMust reach the generation-fenced ledger write here.
+  return decodeMustHistory(decodeClaimHistory(store.mutate(v, store.releasedVersion(), devVersion(), apply)));
 }
 
 function change(data: Checklist, id: string, field: string, from: unknown, to: unknown, by: string, at: string): void {
@@ -358,6 +407,29 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
 
 export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
   return setItemGuarded(v, id, patch, by);
+}
+
+/** 효과 없는 MUST 는 게이트가 판단할 근거가 없다 — 거부한다. */
+function validateMust(must: ChecklistMust): ChecklistMust {
+  if (!must.effect.trim()) throw new CliUserError('MUST 효과가 비었다', "release checklist must <id> --effect '<게이트에 미치는 효과>'");
+  return must;
+}
+
+/** 이 칸의 MUST 를 세운다. 저장은 `must` 이벤트(from = 이전 전체 값, to = 새 전체 값)로만 하고, 다른 칸 행은 건드리지 않는다. */
+export function setMust(v: string, id: string, input: { version: string; reason: string; effect: string }, by: string): Checklist {
+  if (!by.trim()) throw new CliUserError('MUST 기록 주체가 비었다');
+  const at = new Date().toISOString();
+  const must = validateMust({ version: input.version, reason: input.reason, setBy: by, setAt: at, effect: input.effect });
+  return mutate(v, (data) => {
+    const item = data.items.find((entry) => entry.id === id);
+    if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
+    const previous = latestMust(data.history, id);
+    if (previous && JSON.stringify(previous) === JSON.stringify(must)) return false;
+    item.updatedAt = at;
+    item.updatedBy = by;
+    change(data, id, 'must', previous, must, by, at);
+    return true;
+  });
 }
 
 /** Remove only the exact machine-authored line; preserve all other evidence bytes and blank lines. */

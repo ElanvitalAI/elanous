@@ -241,6 +241,10 @@ const registerReleaseCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'release
 const registerFreezeCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'freeze'
   ? (() => undefined)
   : (require('./cli/freeze-cli.js') as typeof import('./cli/freeze-cli.js')).registerFreezeCommands) as typeof import('./cli/freeze-cli.js').registerFreezeCommands;
+// TUI-HERDR-NAMED-AGENT (10-22): `herdr prompt` — herdr agent prompt rejects custom-reported agents.
+const registerHerdrCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== '__full__'
+  ? (() => undefined)
+  : (require('./cli/herdr-cli.js') as typeof import('./cli/herdr-cli.js')).registerHerdrCommands) as typeof import('./cli/herdr-cli.js').registerHerdrCommands;
 const registerFlowCommands = (INDEX_FAST_ROOT && INDEX_FAST_ROOT !== 'flow'
   ? (() => undefined)
   : (require('./cli/flow-cli.js') as typeof import('./cli/flow-cli.js')).registerFlowCommands) as typeof import('./cli/flow-cli.js').registerFlowCommands;
@@ -439,6 +443,7 @@ program.command('preview <target>')
 export { SELF_SEND_RECENT_FRAME_WINDOW_MS, SELF_SEND_STALE_HEARTBEAT_MS, formatSelfSendCandidateDisplay } from './harness/self-send-decide.js';
 export type { SelfSendCandidate, SelfSendCandidateDisplay } from './harness/self-send-decide.js';
 import { decideSelfSend, type SelfSendCandidate } from './harness/self-send-decide.js';
+import { mayLookupRemotePodRun } from './harness/self-send-routing-guard.js';
 type RunDevAskBuildDevCliSpec = typeof import('./self-dev/dev-cli.js')['buildDevCliSpec'];
 type RunDevAskExecuteDevSelfRun = typeof import('./self-dev/dev-cli.js')['executeDevSelfRun'];
 type RunDevAskStartDraftTriage = typeof import('./self-dev/dev-cli.js')['startDraftTriage'];
@@ -1250,6 +1255,7 @@ registerKnowCommand(program);
 registerNotifyCommand(program);
 registerAwayCommand(program);
 registerFreezeCommands(program);
+registerHerdrCommands(program);
 registerFlowCommands(program);
 // HQ-HB · HQ-FENCE (10-04): one writer across mbp · node-b · cloud-vm — lease on the arbiter, 2-of-3 quorum, generation fencing.
 const hqCmd = program.command('hq').description('본부 임대 — 하트비트·중재·단일 작성자 래퍼');
@@ -5205,7 +5211,7 @@ const selfOrchestrateCmd = selfCmd
       let podSpawn: import('./task-orchestrator/surfaces/self-implement.js').SelfImplementJobSpawn | undefined;
       let podTargets: { context: string; namespace: string }[] | undefined;
       if (substrate === 'pod') {
-        const { podSelfImplementSpawn, podSubstrateReady, defaultKubectl } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
+        const { podSubstrateReady, defaultKubectl } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
         const poolMod = await import('./task-orchestrator/surfaces/pod-pool.js');
         const { harnessLaunchPolicyConfig } = await import('./harness/harness-substrate-default.js');
         const launchPolicy = harnessLaunchPolicyConfig();
@@ -5580,7 +5586,8 @@ const selfOrchestrateCmd = selfCmd
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
         } else {
-          podSpawn = podSelfImplementSpawn(podBase);
+          podSpawn = await (await import('./task-orchestrator/surfaces/pod-si-warm-entry.js'))
+            .podSpawnWithSiWarm(podBase);
         }
         podTargets = poolMembers.length > 0
           ? poolMembers.map(({ context }) => ({ context, namespace: 'elanous-test' }))
@@ -5854,6 +5861,34 @@ selfCmd
   .option('--include-stale', '모호한 대상 목록에 오래된 마지막 프레임 후보도 표시')
   .option('--read-wait <seconds>', '--memo·--stop 뒤 자식이 읽을 때까지 기다리는 최대 초(0 = 기다리지 않음)', '10')
   .action(async (space: string | undefined, opts: { stop?: boolean; memo?: string; run?: string; includeStale?: boolean; readWait?: string }) => {
+    let remoteLookupFailure = '';
+    let remoteChildUnconfirmed = false;
+    // A TA parent lives on its recorded host. Its Pod fragment and control inbox are
+    // deliberately absent from HQ state, so a local screen lookup cannot route it.
+    if (opts.run !== undefined && space === undefined && mayLookupRemotePodRun(process.env)) {
+      const { findRemotePodCardForRun, remotePodControlForOptions, RemotePodOwnershipAmbiguousError, sendRemotePodRun } = await import('./harness/self-send-remote.js');
+      let card: ReturnType<typeof findRemotePodCardForRun>['card'] = null;
+      try {
+        ({ card, remoteChildUnconfirmed } = findRemotePodCardForRun(opts.run));
+      } catch (error) {
+        if (error instanceof RemotePodOwnershipAmbiguousError) {
+          process.stderr.write(`${error.message}\n`);
+          process.exit(1);
+        }
+        remoteLookupFailure = error instanceof Error ? error.message : String(error);
+      }
+      if (card) {
+        try {
+          const result = sendRemotePodRun(card, opts.run, remotePodControlForOptions(opts));
+          if (result.stderr) process.stderr.write(result.stderr);
+          process.stdout.write(result.stdout);
+          return;
+        } catch (error) {
+          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+          process.exit(1);
+        }
+      }
+    }
     const { classifyRunScreenMissing, queryRunScreenKey, listRunLedgers } = await import('./self-implement/run-ledger.js');
     const { getPtyManifest, listPtyManifestRows } = await import('./pty-shell/pty-manifest.js');
     const { readPodFragment, podFragmentFinished, listPodFragmentsForRun, dispatchPodSelfSend, resolveSelfSendTarget } = await import('./harness/self-send-target.js');
@@ -5887,6 +5922,8 @@ selfCmd
     });
     if (decision.kind === 'refuse') {
       process.stderr.write(decision.message);
+      if (remoteLookupFailure) process.stderr.write(`원격 TA 카드 조회 실패: ${remoteLookupFailure}\n`);
+      else if (remoteChildUnconfirmed) process.stderr.write(`원격 Pod 자식 소유 미확인: ${opts.run}의 카드 연결은 HQ 미러에서 확인되지 않았습니다. 활성 원격 카드 하나에 자식 ID가 없으므로 그 카드의 부모 runId 또는 미러 동기화를 확인하세요.\n`);
       process.exit(decision.exitCode);
     }
     const target = decision.spaceId;
@@ -5897,9 +5934,18 @@ selfCmd
         if (hasMemo) {
           if (!opts.memo || /[\r\n]/.test(opts.memo)) throw new Error('control inbox memo must be a non-empty single line');
           const urgent = opts.memo.startsWith('[urgent] ');
-          dispatchPodSelfSend(target, { memo: { version: 1, kind: 'supervisor', urgency: urgent ? 'urgent' : 'normal', body: urgent ? opts.memo.slice('[urgent] '.length) : opts.memo } });
-        } else dispatchPodSelfSend(target, { stop: true });
-        ui.info(`Pod 조각에 ${hasMemo ? '감독 메모' : 'soft stop'} 기록: ${target} (${record?.job ?? 'finished'})`);
+          const { parsePodReadWait } = await import('./harness/pod-control-send.js');
+          const boundedWait = parsePodReadWait(opts.readWait ?? '10');
+          const receipt = dispatchPodSelfSend(target, { memo: { version: 1, kind: 'supervisor', urgency: urgent ? 'urgent' : 'normal', body: urgent ? opts.memo.slice('[urgent] '.length) : opts.memo } }, undefined, undefined, boundedWait);
+          if (!receipt) throw new Error(`self send 대상 Pod 조각 기록 없음: ${target}`);
+          ui.info(`Pod 조각에 감독 메모 기록: ${target} (${record?.job ?? 'finished'})`);
+          ui.info(receipt?.memoRecord
+            ? `${receipt.read ? '자식이 메모 기록을 수거함' : boundedWait > 0 ? '대기 중 읽음 미관측' : '읽음 미관측 (대기 0초)'}: ${receipt.memoRecord}`
+            : 'Pod 메모 전송 확인 · 읽음 미관측 (원격 응답에 record id 없음)');
+        } else {
+          if (!dispatchPodSelfSend(target, { stop: true })) throw new Error(`self send 대상 Pod 조각 기록 없음: ${target}`);
+          ui.info(`Pod 조각에 soft stop 기록: ${target} (${record?.job ?? 'finished'})`);
+        }
         return;
       } catch (error) {
         process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
@@ -8402,7 +8448,9 @@ configCmd
     }
     // IMAGE-LEDGER-TAGS: the baseline pin (the rail sets it through this command) goes into the image ledger.
     if (recordImagePinFromConfigSet(path, parsed) === 'recorded') ui.info(`image ledger: baseline ${String(parsed).slice(0, 12)} · keep=pin`);
-    ui.info(`set ${path} = ${JSON.stringify(parsed)}`);
+    // CFG-STORE2-HISTORY-REVERT — set 줄도 «가림 자»를 지난다: 비밀 경로·비밀 모양 값은 MASK(원문 미노출).
+    //   비밀이 아닌 값의 출력은 종전 그대로(JSON.stringify(parsed) == JSON.stringify(maskDeep(parsed))).
+    ui.info(`set ${path} = ${JSON.stringify((await import('./cli/config-audit.js')).maskConfigDisplayValue(path, parsed))}`);
   });
 
 configCmd
@@ -8429,6 +8477,70 @@ configCmd
     // CFG-STORE2 — 삭제 저장 «성공» 뒤 감사 이력 한 줄 · fail-open(기록 실패가 unset 을 막지 않는다).
     try { (await import('./cli/config-audit.js')).recordConfigChange({ key: path, prev, why: 'config unset' }); } catch (err) { ui.warn(`config 감사 이력 기록 실패(무시): ${err instanceof Error ? err.message : String(err)}`); }
     ui.info(`unset ${path}`);
+  });
+
+// ── config audit history / revert (CFG-STORE2-HISTORY-REVERT · 0.2.36 · 2026-10-22) ──
+// CFG-STORE2 가 set/unset 마다 남긴 원장을 «읽어서» 되돌린다. 원장은 append 전용 —
+// 되돌림도 새 행 하나(why='config revert')로만 남고, 이전 행은 절대 고치지 않는다.
+// 계산 = src/cli/config-audit.ts(planConfigRevert · formatConfigHistory · configDomainOf).
+configCmd
+  .command('history <path>')
+  .description('CFG-STORE2 — 한 키의 감사 이력(변경 전후 값·by·why). 비밀은 가려서 보여준다.')
+  .option('--json', 'JSON 출력')
+  .action(async (path: string, opts: { json?: boolean }) => {
+    const { configDomainOf, formatConfigHistory, readConfigHistory } = await import('./cli/config-audit.js');
+    const rows = readConfigHistory(path);
+    if (opts.json) {
+      await writeStdoutJson(`${JSON.stringify({ key: path, domain: configDomainOf(path), rows }, null, 2)}\n`);
+      return;
+    }
+    await writeStdoutJson(`${formatConfigHistory(path, rows)}\n`);
+  });
+
+configCmd
+  .command('revert <path>')
+  .description('CFG-STORE2 — 그 키의 마지막 변경을 되돌린다(원장은 지우지 않고 새 행을 append).')
+  .option('--no-backup', "Don't write config.json.bak before saving")
+  .option('--json', 'JSON 출력')
+  .action(async (path: string, opts: { backup?: boolean; json?: boolean }) => {
+    const { configDomainOf, containsMaskValue, MASK, planConfigRevert, recordConfigRevert } = await import('./cli/config-audit.js');
+    const plan = planConfigRevert(path);
+    if (plan.status === 'no-history') {
+      ui.error(`revert ${path} — 감사 이력 없음(되돌릴 변경이 없다)`);
+      process.exit(1);
+    }
+    if (plan.status === 'masked') {
+      ui.error(`revert ${path} — 이전 값이 ${MASK} 라 원문 복원 불가(원문은 원장에 남기지 않는다). 그 키를 직접 set 하라.`);
+      process.exit(1);
+    }
+    if (plan.status === 'already') {
+      ui.info(`revert ${path} — 마지막 변경이 값 변화 없음 (no-op)`);
+      return;
+    }
+    const cfg = getUserConfig() as unknown as Record<string, unknown>;
+    const prev = getConfigPath(cfg, path); // 되돌림도 한 번의 변경 — 그 «전» 값을 남긴다
+    if (opts.backup !== false) backupUserConfig(userConfigPath());
+    if (plan.value === undefined) unsetConfigPath(cfg, path);
+    else setConfigPath(cfg, path, plan.value);
+    saveUserConfig(cfg as unknown as ReturnType<typeof getUserConfig>);
+    reloadUserConfig();
+    // set/unset 과 대칭 — 저장 후 재읽기로 «실제로 복원됐는지» 검증(조용한 성공 금지).
+    // 가림 자가 값으로 되쓰였는지도 본다: 오염값끼리는 직렬화 비교가 같아 조용히 통과한다.
+    const after = getConfigPath(getUserConfig() as unknown as Record<string, unknown>, path);
+    if (containsMaskValue(after)) {
+      console.error(`⚠️ revert ${path} — 복원 값에 가림 자(${MASK})가 섞였다(원문 복원 불가). 그 키를 직접 set 하라.`);
+      process.exit(1);
+    }
+    if (JSON.stringify(after) !== JSON.stringify(plan.value)) {
+      console.error(`⚠️ revert ${path} — 저장 후 값 미반영(직렬화 드롭). 읽힌값=${JSON.stringify(after)}`);
+      process.exit(1);
+    }
+    const row = recordConfigRevert({ key: path, prev, next: plan.value, why: 'config revert' });
+    if (opts.json) {
+      await writeStdoutJson(`${JSON.stringify({ key: path, domain: configDomainOf(path), row }, null, 2)}\n`);
+      return;
+    }
+    ui.info(`revert ${path} = ${JSON.stringify(plan.value ?? null)} (domain=${configDomainOf(path)})`);
   });
 
 // ── config drift / explain (CFG-STORE1 · 0.2.20 · 2026-10-08) — 읽기 전용 «유효 config ⊕ 출처» ──
@@ -9585,6 +9697,14 @@ program
     }
     const cfg = getUserConfig();
     if ((await import('./onboarding.js')).needsOnboarding(cfg)) {
+      // Machine mode contract: stdout carries JSONL only. An onboarding
+      // banner there corrupts the stream (`invalid REPL JSONL response`
+      // in the TUI parent). Fail fast on stderr instead of launching an
+      // interactive wizard on a pipe.
+      if (opts.json === true || opts.stdinJsonl === true) {
+        process.stderr.write('No config yet — run `elanous` once interactively (onboarding) before using repl --json / --stdin-jsonl.\n');
+        process.exit(2);
+      }
       if (cfg.onboarding.webFirst === false) ui.info('No config yet — launching setup wizard first.');
       if (!await runFirstSetupForCli(cfg, true)) return;
     }
@@ -12059,6 +12179,12 @@ export function filterDashboardArgs(rawArgs: readonly string[], resumeFlagIdx?: 
 }
 
 async function main(): Promise<void> {
+  // TUI-BOOT-TIMING-HOLES — «프로세스→sink» 구간(10:40 실측 9.3s). 그 9.3s 의 대부분은 이 모듈이
+  //   import 되는 동안(모듈 로드) 흐르므로, main() 진입만 재면 구간을 잘라 먹는다. `performance.now()`
+  //   의 기준점은 프로세스 시작(`performance.timeOrigin`)이라 sink 등록 직전의 «절대값» 이 곧
+  //   프로세스→sink 다. main() 진입 시각은 그 안에서 «어느 몫이 엔트리 코드인지» 가르는 두 번째 값.
+  //   발행은 sink 등록 뒤로 미룬다(등록 전 debug.log 는 no-op).
+  const bootMainEnteredAt = performance.now();
   // WD1 — seed the session working directory from the launch cwd.
   // Every later-phase subsystem reads via getSessionCwd() instead of
   // process.cwd(). Subcommand dispatch (program.parseAsync) runs
@@ -12433,7 +12559,20 @@ async function main(): Promise<void> {
   // PR#4622(self utterance CLI)·session-cli 미러. fail-open·비블로킹.
   const bootTimer = (await import('./dashboard/boot-timing.js')).createBootTimer();
   bootTimer.begin();
+  // 창은 sink 등록 «직전» 에 닫는다(등록 전 debug.log 는 no-op 이라 발행은 등록 뒤).
+  const procToLogSinkMs = performance.now();
+  const mainEnterToLogSinkMs = procToLogSinkMs - bootMainEnteredAt;
   try { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('tui'); } catch { /* fail-open */ }
+  debug.log('tui.boot', 'phase', {
+    phase: 'proc-to-log-sink',
+    ms: Math.round(procToLogSinkMs),
+    from: 'process-start',
+  });
+  debug.log('tui.boot', 'phase', {
+    phase: 'main-enter-to-log-sink',
+    ms: Math.round(mainEnterToLogSinkMs),
+    from: 'main-entry',
+  });
   bootTimer.phase('log-sink');
   // P3(대표 2026-07-26) — footgun 관측을 logs.db 에 도달시킨다. 초반(arg 파싱 前) warnProdSpawnFootgun 은
   //   StoreSink 등록 前이라 debug.log 가 logs.db 미도달이었다(순서 갭). sink 등록 직후 관측만 재발행(stderr 중복 X).
@@ -12479,6 +12618,12 @@ async function main(): Promise<void> {
     const { showDashboard } = await import('./dashboard/index.js');
     await showDashboard({
       ...dashboardOpts,
+      // TUI-BOOT-TIMING-HOLES — show 동기 셋업(2.3s)은 종전 첫 프레임 신호 하나에 묶여 안 보였다.
+      //   bootTimer 는 createBootTimer 시점부터 재므로, dashboard 가 잰 «진입~첫 프레임» 값을 그대로
+      //   이벤트로 남긴다(요약 phase 회계는 종전 그대로 보존).
+      onSyncSetupComplete: (ms: number) => {
+        debug.log('tui.boot', 'show-dashboard-setup', { ms: Math.round(ms) });
+      },
       onFirstFrameRendered: () => {
         bootTimer.phase('show-dashboard');
         bootTimer.done();
@@ -12486,12 +12631,182 @@ async function main(): Promise<void> {
     });
     closeTui();
   }
-  // Force exit: the dashboard starts background timers (clipboard
-  // poller, shimmer/blink animations) that keep the Bun event loop
-  // alive even after the TUI tears down. Without this hard exit,
-  // `q` / Ctrl+Q would leave the user staring at a wedged terminal
-  // until they sent SIGINT.
-  process.exit(0);
+  // TUI-H9-ACTIVE-SESSION-ID — 기동 뒤 설치본/체크아웃이 움직였으면 «이 TUI 가 지금 보여 주던 대화»
+  // 로 스스로 다시 뜬다. 확인이 안 되면 다시 뜨지 않고 이유를 남긴다(전역 최신·기동 resume 으로 메우지 않는다).
+  await exitTuiRun();
+}
+
+// ── TUI-H9-ACTIVE-SESSION-ID · 0.2.36 — 재기동은 «이 TUI 의 활성 대화» 로만 ──
+//
+// #30046 의 H9 배선은 재기동 세션을 `resumeSessionId ?? getActiveSessionId() ?? listSessions()[0]?.id`
+// 로 골랐다 — 기동 때의 resume 값이 이후의 활성 세션보다 우선했고, 활성 id 가 없으면 전역 최신(다른
+// 자리의 맥락일 수 있다)을 집어 왔다. 여기서는 ①이 TUI 가 화면으로 확인한 대화(tui-self-report 의
+// 소유 기록)와 ②지금 집중된 활성 id 가 «같고» ③그 대화가 저장소에 실재할 때만 재기동한다. 하나라도
+// 어긋나면 다시 뜨지 않고 이유를 남긴다 — 비슷한 id 로 메우지 않는다.
+
+/**
+ * TUI 종료 경계 — 재기동 «요청»(`requestTuiSelfRestart`)이 있고 판이 낡았으면 «이 TUI 의 활성 대화» 로
+ * 자식을 띄우고, 부모는 그 종료 코드로 끝난다. 요청이 없으면(사용자 `q`/Ctrl+Q) 낡음을 재지도 않고
+ * 지금처럼 0 으로 끝난다 — 종료 의도를 재기동으로 바꾸지 않는다.
+ * 강제 종료는 그대로다: 대시보드의 배경 타이머(clipboard poller·shimmer/blink)가 Bun 이벤트 루프를
+ * 붙잡아 `q`/Ctrl+Q 뒤에도 터미널이 멈춘 채 남는다.
+ */
+export async function exitTuiRun(
+  deps: TuiSelfRestartDeps & {
+    readonly exit?: (code: number) => never;
+    /** 재기동 요청 — 기본 = `takeTuiSelfRestartRequest()`(한 번 읽고 지운다). */
+    readonly takeRestartRequest?: () => { readonly reason: string } | null;
+  } = {},
+): Promise<void> {
+  const exit = deps.exit ?? ((code: number): never => process.exit(code));
+  const take = deps.takeRestartRequest
+    ?? (await import('./capture/tui-self-report.js')).takeTuiSelfRestartRequest;
+  const request = take();
+  if (!request) {
+    try {
+      (deps.log ?? ((event: string, detail: Record<string, unknown>) => debug.log('tui.self-restart', event, detail)))(
+        'skip', { reason: 'no-restart-request' },
+      );
+    } catch { /* 관측 실패가 종료를 막지 않는다 */ }
+    exit(0);
+  }
+  const selfRestart = await runTuiSelfRestartOnStaleBuild(deps);
+  if (selfRestart.outcome === 'relaunch') {
+    // 자식이 화면을 이어받았다 — 부모는 자식 종료 코드로 끝난다.
+    exit(selfRestart.exitCode ?? 0);
+  }
+  exit(0);
+}
+
+export interface TuiSelfRestartResult {
+  readonly outcome: 'skip' | 'blocked' | 'relaunch';
+  readonly reason: string;
+  readonly sessionId?: string;
+  readonly argv?: readonly string[];
+  readonly exitCode?: number;
+}
+
+export interface TuiSelfRestartDeps {
+  /** 재기동 자식의 스크립트 경로 — 기본 = `process.argv[1]`(배포 엔트리). */
+  readonly scriptPath?: string;
+  /** 사용자 인자 — 기본 = `process.argv.slice(2)`. 이전 `--resume`/`--continue` 는 걷어내고 우리 id 만 싣는다. */
+  readonly args?: readonly string[];
+  /** 낡음 판정 — 기본 = `judgeBuildStaleness(runningBuild ⊕ readCurrentInstallRecord ⊕ readCheckoutHead)`. */
+  readonly stale?: () => { readonly stale: boolean | null; readonly reason: string };
+  /** 이 TUI 가 화면으로 확인한 대화 — 기본 = 소유 기록(`getTuiOwnedSession`). */
+  readonly owned?: () => { readonly sessionId: string; readonly at: number } | null;
+  /** 지금 집중된 활성 대화 id — 기본 = `getActiveSessionId()`. */
+  readonly liveActiveSessionId?: () => string | null;
+  /** 그 id 의 대화가 실재하나 — 기본 = `loadSession(id) !== null`. */
+  readonly sessionExists?: (sessionId: string) => boolean;
+  /** 관측 전용 — «전역 최신»이 무엇이든 재기동 id 는 여기서 고르지 않는다(로그·사유 문면에만 적는다). */
+  readonly globalLatestSessionId?: () => string | null;
+  readonly spawnChild?: (command: string, argv: readonly string[], env: Record<string, string>) => Promise<number>;
+  readonly log?: (event: string, detail: Record<string, unknown>) => void;
+}
+
+/** 한 런의 재기동 세대 상한 — 재기동한 자식이 또 낡아도 여기서 멈춘다(무한 재기동 방지). */
+const TUI_SELF_RESTART_MAX_GENERATION = 3;
+
+/** 재기동 자식에게 넘길 argv — 이 TUI 의 활성 대화만 `--resume` 으로 싣는다. */
+export function planTuiRestartArgv(input: {
+  readonly scriptPath: string;
+  readonly args: readonly string[];
+  readonly sessionId: string;
+}): string[] {
+  const kept: string[] = [];
+  for (let i = 0; i < input.args.length; i += 1) {
+    const arg = input.args[i]!;
+    if (arg === '--resume') {
+      // 값 없는 `--resume` 뒤에 오는 플래그는 값이 아니다 — 삼키지 않는다.
+      const next = input.args[i + 1];
+      if (next !== undefined && !next.startsWith('-')) i += 1;
+      continue;
+    }
+    if (arg === '--continue' || arg.startsWith('--resume=') || arg.startsWith('--continue=')) continue;
+    kept.push(arg);
+  }
+  return [input.scriptPath, ...kept, '--resume', input.sessionId];
+}
+
+/**
+ * 낡은 판에서 TUI 를 스스로 다시 띄운다 — 이 TUI 가 보여 주던 대화로만.
+ * 확인 실패는 «재기동 안 함» 이고 그 이유가 로그·stderr 로 남는다.
+ */
+export async function runTuiSelfRestartOnStaleBuild(deps: TuiSelfRestartDeps = {}): Promise<TuiSelfRestartResult> {
+  const report = deps.log ?? ((event: string, detail: Record<string, unknown>) => debug.log('tui.self-restart', event, detail));
+  const { judgeBuildStaleness, readCheckoutHead, readCurrentInstallRecord, runningBuild } = await import('./pty-shell/tui-run-state.js');
+  const staleness = (deps.stale ?? (() => {
+    const build = runningBuild();
+    const checkoutHead = build.source === 'checkout' && build.codeRoot ? readCheckoutHead(build.codeRoot) : undefined;
+    return judgeBuildStaleness({ build, installed: readCurrentInstallRecord(), ...(checkoutHead ? { checkoutHead } : {}) });
+  }))();
+  if (staleness.stale !== true) {
+    report('skip', { reason: staleness.reason });
+    return { outcome: 'skip', reason: staleness.reason };
+  }
+  const generation = Number.parseInt(process.env.ELANOUS_TUI_RESTART_GEN ?? '0', 10) || 0;
+  const tuiReport = await import('./capture/tui-self-report.js');
+  const store = await import('./session/index.js');
+  const owned = (deps.owned ?? tuiReport.getTuiOwnedSession)();
+  const liveActiveSessionId = (deps.liveActiveSessionId ?? store.getActiveSessionId)();
+  const globalLatestSessionId = (deps.globalLatestSessionId
+    ?? (() => { try { return store.listSessions({ limit: 1 })[0]?.id ?? null; } catch { return null; } }))();
+  if (generation >= TUI_SELF_RESTART_MAX_GENERATION) {
+    report('blocked', { reason: 'generation-limit', generation, staleReason: staleness.reason });
+    console.error(`elanous: 설치본이 바뀌었지만 이 런은 이미 ${generation}번 다시 떴다 — 자동 재기동을 멈춘다(수동으로 다시 열어라).`);
+    return { outcome: 'blocked', reason: 'generation-limit' };
+  }
+  const decision = tuiReport.decideTuiRestartSession({
+    owned,
+    liveActiveSessionId,
+    sessionExists: deps.sessionExists ?? ((id: string) => { try { return store.loadSession(id) !== null; } catch { return false; } }),
+  });
+  if (!decision.ok) {
+    report('blocked', {
+      reason: decision.reason,
+      staleReason: staleness.reason,
+      ownedSessionId: owned?.sessionId ?? null,
+      liveActiveSessionId,
+      globalLatestSessionId,
+      generation,
+    });
+    console.error(`elanous: 설치본이 바뀌었지만 이 TUI 의 활성 대화를 확인하지 못해 다시 뜨지 않았다(${decision.reason}) — 다시 열면 지금 화면의 대화로 이어진다.`);
+    return { outcome: 'blocked', reason: decision.reason };
+  }
+  const argv = planTuiRestartArgv({
+    scriptPath: deps.scriptPath ?? process.argv[1] ?? '',
+    args: deps.args ?? process.argv.slice(2),
+    sessionId: decision.sessionId,
+  });
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) if (typeof value === 'string') env[key] = value;
+  env.ELANOUS_TUI_RESTART_GEN = String(generation + 1);
+  report('relaunch', {
+    sessionId: decision.sessionId,
+    claimedAt: decision.claimedAt,
+    staleReason: staleness.reason,
+    generation,
+    argv,
+    globalLatestSessionId,
+  });
+  console.error(`elanous: 설치본이 바뀌어 이 TUI 의 대화(${decision.sessionId})로 다시 뜬다${globalLatestSessionId && globalLatestSessionId !== decision.sessionId ? ` — 전역 최신 ${globalLatestSessionId} 은 싣지 않는다` : ''}.`);
+  const exitCode = await (deps.spawnChild ?? defaultTuiSelfRestartSpawn)(process.execPath, argv, env);
+  return { outcome: 'relaunch', reason: staleness.reason, sessionId: decision.sessionId, argv, exitCode };
+}
+
+/** 재기동 자식 — 같은 터미널(stdio inherit)을 물려받는다. 부모는 자식 종료를 기다린 뒤 그 코드로 끝난다. */
+async function defaultTuiSelfRestartSpawn(command: string, argv: readonly string[], env: Record<string, string>): Promise<number> {
+  const childProcess = await import('node:child_process');
+  const child: import('node:child_process').ChildProcess = childProcess.spawn(
+    command,
+    [...argv],
+    { stdio: 'inherit', env: env as NodeJS.ProcessEnv },
+  );
+  return await new Promise<number>((resolve) => {
+    child.on('error', () => resolve(1));
+    child.on('exit', (code, signal) => resolve(typeof code === 'number' ? code : signal ? 1 : 0));
+  });
 }
 
 /**

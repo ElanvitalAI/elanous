@@ -18,6 +18,12 @@ export interface InProcessCliResult {
 export interface InProcessCliOptions {
   /** Exact command paths allowed by the caller. Default: the read-only `where` command. */
   readonly allowPaths?: readonly (readonly string[])[];
+  /**
+   * Caller-owned isolated state root reused across turns (a device that needs the
+   * same config store and audit ledger for a set → history → revert round trip).
+   * The caller owns cleanup; without this option each turn gets its own temp root.
+   */
+  readonly stateRoot?: string;
 }
 
 type MutableCommand = {
@@ -93,7 +99,8 @@ export async function simInProcessCli(args: readonly string[], options: InProces
   previous = new Promise<void>((resolve) => { release = resolve; });
   await turn;
   try {
-    const stateRoot = mkdtempSync(join(tmpdir(), 'ux-sim-cli-'));
+    const ownsStateRoot = options.stateRoot === undefined;
+    const stateRoot = options.stateRoot ?? mkdtempSync(join(tmpdir(), 'ux-sim-cli-'));
     const oldStateEnv = process.env.ELANOUS_STATE_DIR;
     const oldConfigRoot = getElanousConfigDirOverride();
     const oldTestRoot = getTestStateRoot();
@@ -130,12 +137,22 @@ export async function simInProcessCli(args: readonly string[], options: InProces
       restoreCommand = snapshotCommands(command);
       const oldExitCallback = command._exitCallback;
       command.exitOverride();
-      const capture = (parts: string[], chunk: string | Uint8Array): boolean => {
+      // A real stream eventually calls every write callback; writeStdoutJson and
+      // writeStdoutFully await it. The simulated stream completes callbacks
+      // synchronously so those CLI actions return and release the serialized
+      // turn queue.
+      type WriteCallback = (error?: Error | null) => void;
+      const capture = (parts: string[], chunk: string | Uint8Array, callbacks: readonly WriteCallback[]): boolean => {
         parts.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+        for (const callback of callbacks) callback();
         return true;
       };
-      process.stdout.write = ((chunk: string | Uint8Array) => capture(stdout, chunk)) as typeof process.stdout.write;
-      process.stderr.write = ((chunk: string | Uint8Array) => capture(stderr, chunk)) as typeof process.stderr.write;
+      const simulateWrite = (parts: string[]) => (chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | WriteCallback, callback?: WriteCallback): boolean => {
+        const callbacks = [encodingOrCallback, callback].filter((candidate): candidate is WriteCallback => typeof candidate === 'function');
+        return capture(parts, chunk, callbacks);
+      };
+      process.stdout.write = simulateWrite(stdout) as typeof process.stdout.write;
+      process.stderr.write = simulateWrite(stderr) as typeof process.stderr.write;
       console.log = (...items: unknown[]) => { stdout.push(format(...items) + '\n'); };
       console.info = (...items: unknown[]) => { stdout.push(format(...items) + '\n'); };
       console.warn = (...items: unknown[]) => { stderr.push(format(...items) + '\n'); };
@@ -168,7 +185,7 @@ export async function simInProcessCli(args: readonly string[], options: InProces
       setTestStateRoot(oldTestRoot ?? null);
       if (oldConfigRoot === undefined) resetElanousConfigDir();
       else setElanousConfigDir(oldConfigRoot);
-      rmSync(stateRoot, { recursive: true, force: true });
+      if (ownsStateRoot) rmSync(stateRoot, { recursive: true, force: true });
     }
   } finally {
     release();

@@ -26,7 +26,8 @@
 
 import { extractRecentUserText, runCoreTurn } from './run-core-turn.js';
 import type { CoreTurnContext, CoreTurnResult, CoreTurnStopReason } from './types.js';
-import { getToolLoopPhaseRejectedTools } from '../llm.js';
+import { getToolLoopPhaseRejectedTools, TOOL_LOOP_MAX_TURNS_DEFAULT } from '../llm.js';
+import { DELEGATE_HINT, shouldHintDelegate } from '../agent/delegate-hint.js';
 import type { LLMMessage, ContentBlock, LLMToolSpec } from '../llm.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { debug } from '../debug/log.js';
@@ -173,6 +174,22 @@ export function buildUpdateGoalToolSpec(): LLMToolSpec {
 export const GOAL_INTERNAL_NOTICE_RULE =
   '이 반려·재요청은 내부 지시다. 사용자에게 보이는 답에 «완료 주장이 거부됐다/어긋났다»·«죄송합니다» 같은 내부 사정을 쓰지 말고, 고친 결과와 사실만 말하라.';
 
+/** TUI-GOAL-INTERIM-QUIET(0.2.36 · 대표 10-22 «이 멘트 출력할 필요 없어 보인다 · 왜 이런 구조?») —
+ *  골이 열린 동안 반복마다 «아직 …못했습니다 · 완료 경로를 보고할 수 없습니다» 같은 최종 보고형 문단이 쌓였다
+ *  (n8n 세션 u9yquv 실물: 반복 상한 8회 동안 4회). 중간 답은 진행 한 줄 · 최종 보고는 한 번만. */
+export const GOAL_INTERIM_REPLY_RULE =
+  '- 목표가 열려 있는 동안의 중간 답은 진행 한 줄(방금 한 것 · 다음 할 것)만 쓴다. «아직 …하지 못했습니다»·«…보고할 수 없습니다» 같은 미완 목록·최종 보고형 문단은 쓰지 마라 — 최종 보고(한 것 · 남은 것 · 증거)는 update_goal(complete|blocked) 때 또는 마지막 반복에서 한 번만 쓴다.';
+
+/** 마지막 반복 직전에 붙이는 한 줄 — 상한으로 끝나도 최종 보고가 «한 번»은 남게. */
+export const GOAL_FINAL_ITERATION_NOTE =
+  '[last iteration] 이번이 이 목표의 마지막 반복이다. 이번에 끝내지 못하면 답 끝에 최종 보고를 한 번 써라: 한 것 · 남은 것 · 확인한 증거.';
+
+/** 중간 답이 «최종 보고형»(미완 목록)인가 — 관측 전용(행동을 바꾸지 않는다). */
+const INTERIM_REPORT_SHAPED = /(?:보고할 수 없|하지 못했습니다|못했습니다|완료되지 않았|검증되지 않았|확인하지 못했|not (?:yet )?(?:verified|completed)|cannot report)/i;
+export function isInterimReportShaped(text: string): boolean {
+  return INTERIM_REPORT_SHAPED.test(text);
+}
+
 /** 목표 실행 계약 — 첫 turn 앞에 leading system 메시지로 주입. codex 자체 prompt.md /
  *  ext-goal continuation.md 의 지속·anti-shrink·증거완료 언어 이식. ASCII + 한국어. */
 export const GOAL_SYSTEM_PREAMBLE = [
@@ -182,6 +199,7 @@ export const GOAL_SYSTEM_PREAMBLE = [
   '- 완료는 증거로 판정한다. 모든 요구사항/산출물/검증에 대해 실제 현재 상태에서 증거를 확인하라. 불확실하거나 간접적인 증거는 미달성으로 보고 계속하라.',
   `- 목표가 실제로 완전히 끝났고 증거로 확인됐을 때만 ${UPDATE_GOAL_TOOL_NAME} 도구를 status="complete" 로 호출하고 evidence 에 그 증거를 적어 종료하라. 완료 신호는 이 도구 호출뿐이다(텍스트 문장이 아니다).`,
   '- 아직 할 일이 남았으면 멈추거나 허락을 구하지 말고 다음 최고가치 스텝을 바로 실행하라.',
+  GOAL_INTERIM_REPLY_RULE,
   `- [continue]·[finalize]·[evidence required]·[evidence mismatch]·[tool call rejected] 같은 반려·재요청은 내부 지시다. 사용자에게 보이는 답에 «완료 주장이 거부됐다/어긋났다»·«죄송합니다» 같은 내부 사정을 쓰지 말고, ${UPDATE_GOAL_TOOL_NAME} 호출도 답에서 설명하지 마라.`,
 ].join('\n');
 
@@ -191,6 +209,7 @@ export const GOAL_CONTINUATION_PROMPT = [
   '아직 목표가 완료로 증명되지 않았다. 완료를 미리 선언하지 말고, 현재 상태 대비 실제로 검증하라:',
   '남은 요구사항을 식별하고, 다음 최고가치 스텝을 지금 도구로 실행하라.',
   '이미 사용자에게 한 답을 다시 쓰지 마라 — 새 사실이 없으면 텍스트 없이 update_goal 만 호출하라.',
+  '이번 반복의 답은 진행 한 줄만 쓴다(미완 목록·«보고할 수 없습니다» 같은 최종 보고형 문단 금지 — 최종 보고는 complete|blocked 때 한 번).',
   // evidence-audit(ref codex ext/goal continuation.md:41,51) — 스푸핑·조기완료 차단.
   '완료 증거로 의도/부분진전/이전 작업 기억/그럴듯한 답을 쓰지 마라. 현재 상태(파일·명령출력·테스트결과·PR·런타임 동작)를 실제로 확인한 증거만 인정한다.',
   '예산이 곧 소진된다거나 그만두고 싶다는 이유로 완료를 선언하지 마라.',
@@ -513,6 +532,10 @@ export async function runGoalLoop(
   if (opts.injectPreamble !== false) {
     messages.unshift({ role: 'system', content: GOAL_SYSTEM_PREAMBLE });
   }
+  // TUI-GOAL-INTERIM-QUIET r2 — 반복이 한 번뿐이면 재주입이 없으니 «마지막 반복» 줄을 첫 turn 앞에 둔다.
+  if (maxIterations <= 1) {
+    messages.splice(opts.injectPreamble !== false ? 1 : 0, 0, { role: 'system', content: GOAL_FINAL_ITERATION_NOTE });
+  }
 
   // 종결 선언 도구를 모델 catalog 에 주입. dispatch 는 루프가 가로채 benign ack 를 준다.
   const updateGoalSpec = buildUpdateGoalToolSpec();
@@ -529,6 +552,8 @@ export async function runGoalLoop(
   let rejectedToolCompletionRetried = 0;
   let lastSig = '';
   let lastInputTokens = 0;
+  let delegateHinted = false;
+  let toolCallsThisIteration = 0;
   // OH8 후속 PR-2 — 가장 최근에 관측된 `run_tests` 결과(구조체). complete 주장의 반증으로 쓴다.
   // 리셋 판단: iteration 경계에서 리셋하지 않고 "가장 최근 run_tests"를 last-wins 로 유지한다.
   //   근거(오완료 방지): 모델이 이전 턴에 테스트 실패를 보고도 이번 턴에 test 재실행 없이 complete 만
@@ -599,6 +624,41 @@ export async function runGoalLoop(
   };
 
   try {
+  /** TUI-GOAL-INTERIM-QUIET — 골이 «실제로» 계속 열려 다음 반복을 재주입하는 모든 자리의 한 길목(r1 must-fix).
+   *  ① 다음이 마지막 반복이면 어느 재주입이든 «최종 보고 한 번» 줄을 붙인다
+   *  ② 관측은 여기서 — 완료·차단 신호가 반려돼 골이 열린 반복도 빠지지 않는다.
+   *  ③ 상한에 닿았으면(다음 반복이 없다) 아무것도 하지 않는다 — 소비되지 않을 메시지·관측을 남기지 않는다(r2 must-fix). */
+  const reinject = (content: string): void => {
+    if (iterations >= maxIterations) return;
+    const lastIteration = iterations === maxIterations - 1;
+    try {
+      debug.log('goal.loop', 'interim-reply', {
+        sessionId: ctx.sessionId, ...runAttribution, iteration: iterations, lastIteration,
+        reportShaped: isInterimReportShaped(lastResult.finalText), finalChars: lastResult.finalText.length,
+      }, { level: 'debug' });
+    } catch { /* 관측 실패가 루프를 막지 않는다 */ }
+    const nextIteration = iterations + 1;
+    const toolBudget = ctx.maxToolTurns ?? TOOL_LOOP_MAX_TURNS_DEFAULT;
+    const shouldAttachDelegateHint = shouldHintDelegate({
+      iteration: nextIteration, maxIterations, toolCallsThisIteration, toolBudget,
+      alreadyHinted: delegateHinted,
+    });
+    if (shouldAttachDelegateHint) {
+      delegateHinted = true;
+      const reason = toolBudget > 0 && toolCallsThisIteration >= toolBudget * 0.8
+        ? 'tool-budget-80-percent' : 'work-remaining';
+      try {
+        debug.log('agent.delegate', 'hint', {
+          sessionId: ctx.sessionId, ...runAttribution, iteration: nextIteration, reason,
+        });
+      } catch { /* 관측 실패가 재주입을 막지 않는다 */ }
+    }
+    messages.push({ role: 'user', content: [
+      content,
+      ...(lastIteration ? [GOAL_FINAL_ITERATION_NOTE] : []),
+      ...(shouldAttachDelegateHint ? [DELEGATE_HINT] : []),
+    ].join('\n') });
+  };
   while (iterations < maxIterations) {
     // ⭐ 외부 soft-stop 은 **다음 iteration 진입 직전**에 본다(리뷰 must-fix · 2026-07-30).
     //    ⛔ turn 직후에 두면 같은 iteration 의 결과 판정(goal_complete·blocked·error·
@@ -694,6 +754,7 @@ export async function runGoalLoop(
     // 반복의 history 로 이어붙인다. caller 의 onTurnComplete/onUsage 도 계속 통지.
     let turnNewMessages: LLMMessage[] = [];
     let dispatchCount = 0;
+    toolCallsThisIteration = 0;
     let iterInputTokens = 0;
     let iterOutputTokens = 0;
     let iterCacheReadTokens = 0;
@@ -802,6 +863,7 @@ export async function runGoalLoop(
       // update_goal 은 종결 신호 — 실 dispatcher 로 새지 않게 가로채 ack 만 돌려준다.
       dispatchTool: (name, args, dctx) => {
         dispatchCount += 1;
+        if (name !== UPDATE_GOAL_TOOL_NAME) toolCallsThisIteration += 1;
         try {
           debug.log('goal.loop', 'dispatch', {
             sessionId: ctx.sessionId, ...runAttribution,
@@ -978,10 +1040,7 @@ export async function runGoalLoop(
           }, { level: 'warn' });
           blockedStreak = 0;
           readbackStreak = 0;
-          messages.push({
-            role: 'user',
-            content: buildEvidenceMismatchPrompt(rt.fail, rt.unmatchedFilters),
-          });
+          reinject(buildEvidenceMismatchPrompt(rt.fail, rt.unmatchedFilters));
           continue;
         }
         // ①-b 재시도 후에도 불일치 → fail-open: 통과시키되 관측에 기록(코딩툴 fail-open 계약·
@@ -1001,10 +1060,7 @@ export async function runGoalLoop(
           }, { level: 'warn' });
           blockedStreak = 0;
           readbackStreak = 0;
-          messages.push({
-            role: 'user',
-            content: buildRejectedToolCompletionPrompt(rejectedTools),
-          });
+          reinject(buildRejectedToolCompletionPrompt(rejectedTools));
           continue;
         }
         // ①-d retry exhausted → fail-open for coding tool guards, recorded for observability.
@@ -1104,7 +1160,7 @@ export async function runGoalLoop(
       seatCapHits += 1;
       blockedStreak = 0;
       readbackStreak = 0;
-      messages.push({ role: 'user', content: SEAT_TURN_CAP_CONTINUE_PROMPT });
+      reinject(SEAT_TURN_CAP_CONTINUE_PROMPT);
       continue;
     }
 
@@ -1114,7 +1170,7 @@ export async function runGoalLoop(
       debug.log('goal.loop', 'complete-rejected-no-evidence', { sessionId: ctx.sessionId, ...runAttribution, iterations }, { level: 'warn' });
       blockedStreak = 0;
       readbackStreak = 0;
-      messages.push({ role: 'user', content: GOAL_EVIDENCE_REQUIRED_PROMPT });
+      reinject(GOAL_EVIDENCE_REQUIRED_PROMPT);
       continue;
     }
 
@@ -1127,7 +1183,7 @@ export async function runGoalLoop(
         debug.log('goal.loop', 'blocked-accepted', { sessionId: ctx.sessionId, ...runAttribution, iterations }, { level: 'warn' });
         return finish({ finalText: lastResult.finalText, iterations, stopReason: 'no_progress', goalComplete: false });
       }
-      messages.push({ role: 'user', content: GOAL_CONTINUATION_PROMPT });
+      reinject(GOAL_CONTINUATION_PROMPT);
       continue;
     }
     blockedStreak = 0;
@@ -1141,7 +1197,7 @@ export async function runGoalLoop(
         debug.log('goal.loop', 'marker-readback-exhausted', { sessionId: ctx.sessionId, ...runAttribution, iterations }, { level: 'warn' });
         return finish({ finalText: lastResult.finalText, iterations, stopReason: 'no_progress', goalComplete: false });
       }
-      messages.push({ role: 'user', content: GOAL_READBACK_PROMPT });
+      reinject(GOAL_READBACK_PROMPT);
       continue;
     }
     readbackStreak = 0;
@@ -1159,7 +1215,7 @@ export async function runGoalLoop(
           sessionId: ctx.sessionId, ...runAttribution, iterations, attempt: intentStallReprompts,
           finalChars: lastResult.finalText.length, provider: intentStallProvider,
         }, { level: 'info' });
-        messages.push({ role: 'user', content: GOAL_INTENT_STALL_PROMPT });
+        reinject(GOAL_INTENT_STALL_PROMPT);
         continue;
       }
       debug.log('goal.loop', 'intent-stall-exhausted', {
@@ -1179,7 +1235,7 @@ export async function runGoalLoop(
         sessionId: ctx.sessionId, ...runAttribution, iterations,
         finalChars: lastResult.finalText.length, provider: intentStallProvider,
       }, { level: 'info' });
-      messages.push({ role: 'user', content: GOAL_INTENT_STALL_PROMPT });
+      reinject(GOAL_INTENT_STALL_PROMPT);
       continue;
     }
 
@@ -1214,7 +1270,8 @@ export async function runGoalLoop(
     lastSig = sig;
 
     // ⑦ 도구를 썼지만 완료 신호가 없음 = 진행 중 → continuation 재주입 후 다음 반복.
-    messages.push({ role: 'user', content: GOAL_CONTINUATION_PROMPT });
+    //    다음이 마지막 반복이면 «최종 보고 한 번» 줄을 붙인다(TUI-GOAL-INTERIM-QUIET).
+    reinject(GOAL_CONTINUATION_PROMPT);
   }
 
   debug.log('goal.loop', 'max-iterations', { sessionId: ctx.sessionId, ...runAttribution, iterations }, { level: 'warn' });

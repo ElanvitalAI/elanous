@@ -738,3 +738,48 @@ describe('tool-loop followup phase rejection', () => {
     }
   });
 });
+
+// 재현 — SUBAGENT-NO-NARROWING ④ 사고(10-22 13:49Z · n8n 세션 elanous-session-bif5y7):
+// 앞 턴의 무해한 실패(Bash `git status` exit 128 · ListDir path-not-found)가 repair-action 단계를 켰고,
+// 다음 턴의 ListDir 두 개(show_hidden:true)가 «tool call rejected — repair action required» 로 막혔다.
+// 인자 스키마는 맞았다(show_hidden 은 정식 인자) — 단계 가드가 ListDir 를 허용 목록에 안 뒀다.
+describe('SUBAGENT-NO-NARROWING ④ incident 10-22 — ListDir show_hidden rejected in repair phase', () => {
+  const OBSERVED_ARGS = [
+    { path: '/tmp/n8n-lecture/step-videos/과제3', show_hidden: true, sort: 'name', head_limit: 80 },
+    { path: '/tmp/n8n-lecture/step-videos/과제1', show_hidden: true, sort: 'name', head_limit: 80 },
+  ];
+
+  test('the observed ListDir calls are not rejected in repair-action; Glob still is', () => {
+    const calls = [
+      ...OBSERVED_ARGS.map((args, i) => ({ id: `ls${i}`, name: 'ListDir', args })),
+      { id: 'g', name: 'Glob', args: { pattern: '**/*.mp4' } },
+    ];
+    expect(getToolLoopPhaseRejectedCalls('repair-action', calls).map((c) => c.id)).toEqual(['g']);
+  });
+
+  test('after a failed Bash (exit 128), the next turn’s ListDir runs instead of being rejected', async () => {
+    const dispatched: string[] = [];
+    const { provider, capturedMessagesAt } = scriptedProvider([
+      [{ type: 'tool_call', id: 'fail', name: 'Bash', args: { command: 'git status --short' } }],
+      OBSERVED_ARGS.map((args, i) => ({ type: 'tool_call' as const, id: `ls${i}`, name: 'ListDir', args })),
+      [{ type: 'text', delta: 'listed' }],
+    ]);
+    const result = await streamLLMWithTools(
+      [{ role: 'user', content: 'check the step videos' }],
+      {
+        onText() {},
+        dispatchTool: async (name) => {
+          dispatched.push(name);
+          return name === 'Bash'
+            ? { output: '[exit 128]', stderr: 'fatal: not a git repository', exitCode: 128, outcome: 'exit' }
+            : `${name} ran`;
+        },
+      },
+      { provider, tools: [...TOOLS, { name: 'ListDir', description: 'd', parameters: { type: 'object' } }], maxTurns: 30 },
+    );
+    expect(result).toContain('listed');
+    expect(dispatched).toEqual(['Bash', 'ListDir', 'ListDir']);
+    const results = toolResults(capturedMessagesAt(2)).slice(-2);
+    expect(results.every((block) => !String(block.content).includes('REPAIR ACTION REQUIRED'))).toBe(true);
+  });
+});

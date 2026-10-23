@@ -9,8 +9,8 @@ test('selected full-CLI commands keep their help and read-only actions without d
   const dir = mkdtempSync(join(tmpdir(), 'index-lazy-'));
   const preload = join(dir, 'block-dashboard.ts');
   writeFileSync(preload, `Bun.plugin({ setup(build) {
-    build.onLoad({ filter: /[\\/]src[\\/]dashboard[\\/].*\\.ts$/ }, () => {
-      throw new Error('DASHBOARD_EAGERLY_LOADED');
+    build.onLoad({ filter: /[\\/]src[\\/]dashboard[\\/].*\\.ts$/ }, (a) => {
+      throw new Error('DASHBOARD_EAGERLY_LOADED: ' + a.path);
     });
   } });`);
   try {
@@ -25,7 +25,7 @@ test('selected full-CLI commands keep their help and read-only actions without d
         cwd: root, encoding: 'utf8', timeout: 30_000,
         env: { ...process.env, ELANOUS_CONFIG_DIR: join(dir, 'ignored-env-config') },
       });
-      expect(child.status).toBe(0);
+      expect(child.status, `${args.join(' ')} stderr:\n${child.stderr}`).toBe(0);
       expect(child.stderr).not.toContain('DASHBOARD_EAGERLY_LOADED');
       expect(child.stdout).toContain('Usage:');
     }

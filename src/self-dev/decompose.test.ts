@@ -137,6 +137,239 @@ describe('parseSelfDevDecomposition', () => {
 });
 
 describe('foldRegistrationOnlyGoals', () => {
+  test('splits two pathless implementation children into disjoint target paths with a check for each', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts\nImplement the two units', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: 'Implement the visit unit' },
+        { id: 'repair', feature: 'Implement the repair unit' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts'], ['src/doctor/repair.ts'],
+    ]);
+    expect(result.goals.map((goal) => goal.feature)).toEqual([
+      expect.stringContaining('대상 경로: src/doctor/visit.ts\n완료 기준:'),
+      expect.stringContaining('대상 경로: src/doctor/repair.ts\n완료 기준:'),
+    ]);
+  });
+
+  test('assigns named target paths by child intent even when model order is reversed', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'repair', feature: 'Implement the repair unit' },
+        { id: 'visit', feature: 'Implement the visit unit' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/repair.ts'], ['src/doctor/visit.ts'],
+    ]);
+  });
+
+  test('fills the other child when only the second child names a target', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'repair', feature: 'Implement unit two' },
+        { id: 'visit', feature: 'Implement visit' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/repair.ts'], ['src/doctor/visit.ts'],
+    ]);
+  });
+
+  test('balances four parent targets after respecting one named child', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts · src/doctor/report.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'repair', feature: 'Implement repair' },
+        { id: 'other', feature: 'Implement the remaining unit' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths?.length)).toEqual([2, 2]);
+    expect(result.goals[0]?.hotPaths).toContain('src/doctor/repair.ts');
+    expect(new Set(result.goals.flatMap((goal) => goal.hotPaths ?? [])).size).toBe(4);
+  });
+
+  test('keeps a unique three-to-one name ownership split without overlap', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts · src/doctor/report.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'main', feature: 'Implement visit, repair, and summary' },
+        { id: 'report', feature: 'Implement report' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts', 'src/doctor/repair.ts', 'src/doctor/summary.ts'],
+      ['src/doctor/report.ts'],
+    ]);
+  });
+
+  test('keeps all parent paths once when there are more than two targets', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: 'Implement the visit unit' },
+        { id: 'repair', feature: 'Implement the repair unit' },
+      ] }),
+    });
+    const paths = result.goals.flatMap((goal) => goal.hotPaths ?? []);
+    expect([...paths].sort()).toEqual(['src/doctor/repair.ts', 'src/doctor/summary.ts', 'src/doctor/visit.ts']);
+    expect(result.goals.every((goal) => (goal.hotPaths ?? []).length > 0)).toBe(true);
+  });
+
+  test('preserves both explicit child targets instead of repartitioning them', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts'], ['src/doctor/repair.ts'],
+    ]);
+    expect(result.goals.every((goal) => !goal.feature.includes('완료 기준:'))).toBe(true);
+  });
+
+  test('gives the remaining parent target to the pathless child when its sibling declares one', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair',
+          hotPaths: ['src/doctor/repair.ts'] },
+        { id: 'visit', feature: 'Implement visit' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/repair.ts'], ['src/doctor/visit.ts'],
+    ]);
+    expect(result.goals[0]?.feature).toContain('완료 기준: src/doctor/repair.ts');
+    expect(result.goals[1]?.feature).toContain('대상 경로: src/doctor/visit.ts\n완료 기준:');
+  });
+
+  test('preserves a sibling three-path declaration and assigns the fourth path once', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts · src/doctor/report.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'main', feature: '대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts\nImplement main' },
+        { id: 'report', feature: 'Implement report' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts', 'src/doctor/repair.ts', 'src/doctor/summary.ts'],
+      ['src/doctor/report.ts'],
+    ]);
+    expect(result.goals[1]?.feature).toContain('대상 경로: src/doctor/report.ts\n완료 기준:');
+  });
+
+  test('preserves a unique helper outside the parent targets while splitting the remaining target', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit' },
+        { id: 'repair', feature: 'Implement repair' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts', 'src/doctor/helper.ts'],
+      ['src/doctor/repair.ts'],
+    ]);
+    expect(result.goals[1]?.feature).toContain('대상 경로: src/doctor/repair.ts\n완료 기준:');
+  });
+
+  test('assigns every unclaimed parent path to the child without a target declaration', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
+        { id: 'other', feature: 'Implement the remaining unit' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts'],
+      ['src/doctor/repair.ts', 'src/doctor/summary.ts'],
+    ]);
+  });
+
+  test('does not treat reporting as a filename hint for report.ts', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/report.ts · src/doctor/visit.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'reporting', feature: 'Implement reporting metrics' },
+        { id: 'report', feature: 'Implement report' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts'], ['src/doctor/report.ts'],
+    ]);
+  });
+
+  test('treats a child hot path as ownership when no target line is present', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'repair', feature: 'Implement the first unit', hotPaths: ['src/doctor/repair.ts'] },
+        { id: 'visit', feature: 'Implement the second unit' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/repair.ts'], ['src/doctor/visit.ts'],
+    ]);
+    expect(result.goals[0]?.feature).toContain('대상 경로: src/doctor/repair.ts\n완료 기준:');
+  });
+
+  test('keeps original scope when both child descriptions claim the same file name', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'a', feature: 'Implement visit coordination' },
+        { id: 'b', feature: 'Implement visit repair flow' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts', 'src/doctor/repair.ts'],
+      ['src/doctor/visit.ts', 'src/doctor/repair.ts'],
+    ]);
+    expect(result.goals.every((goal) => !goal.feature.includes('완료 기준:'))).toBe(true);
+  });
+
+  test('does not give a child another file when it names its sibling declared target', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+        { id: 'other', feature: 'Implement repair integration' },
+      ] }),
+    });
+    expect(result.goals[1]?.feature).toContain('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts');
+    expect(result.goals[1]?.feature).not.toContain('완료 기준:');
+  });
+
+  test('does not split when both children also edit the same non-parent path', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'] },
+        { id: 'repair', feature: 'Implement repair', hotPaths: ['src/shared.ts'] },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.feature.includes('완료 기준:'))).toEqual([false, false]);
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/shared.ts', 'src/doctor/visit.ts', 'src/doctor/repair.ts'],
+      ['src/shared.ts', 'src/doctor/visit.ts', 'src/doctor/repair.ts'],
+    ]);
+  });
+
+  test('does not split when a child names a parent path outside its target line', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: 'Implement visit using src/doctor/repair.ts' },
+        { id: 'repair', feature: 'Implement repair' },
+      ] }),
+    });
+    expect(result.goals[0]?.feature).toContain('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts');
+    expect(result.goals[0]?.feature).not.toContain('완료 기준:');
+  });
+
+  test('does not narrow a child whose declared hot paths include its sibling target', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair',
+          hotPaths: ['src/doctor/visit.ts', 'src/doctor/repair.ts'] },
+        { id: 'visit', feature: 'Implement visit' },
+      ] }),
+    });
+    expect(result.goals[0]?.hotPaths).toEqual(['src/doctor/visit.ts', 'src/doctor/repair.ts']);
+    expect(result.goals[0]?.feature).not.toContain('완료 기준:');
+  });
+
   test('a decomposed child without paths inherits the parent card target paths in its ask and hot path fence', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/alpha.ts · src/beta.ts\nImplement both units', {
       llm: async () => JSON.stringify({ subtasks: [{ id: 'a', feature: 'Implement the first unit' },

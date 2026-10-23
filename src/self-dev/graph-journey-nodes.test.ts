@@ -110,6 +110,7 @@ describe('HARNESS-FULL-GRAPH 여정 노드', () => {
     expect(route('intake', 'direct')).toBe('launch-gate');
     expect(route('intake', 'queued')).toBe('queue');
     expect(spec.entryNode).toBe('intake');
-    expect(edgeMapOf(spec).merge).toEqual(['ready', 'pr-head-checkout', 'main-sync', 'review', 'next-move', 'cleanup']);
+    // LAND-REFUSAL-EDGES — merge → recover(recover@1) 결속 간선이 더해졌다.
+    expect(edgeMapOf(spec).merge).toEqual(['ready', 'pr-head-checkout', 'main-sync', 'review', 'next-move', 'recover', 'cleanup']);
   });
 });

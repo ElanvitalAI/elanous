@@ -5,6 +5,7 @@ import { dirname } from 'node:path';
 import type { RepairCommitResult } from './repair-branch-cas.js';
 import type { TaskChildLlm } from './task-hand.js';
 import { publishInsideEvent } from '../nexus/api/inside-events.js';
+import { taskParentRoleEnv } from './task-parent-role-llm.js';
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
@@ -14,10 +15,13 @@ export interface RepairWorkerRequest {
   card: string; pr: number; head: string; repo: string; resultPath: string;
   entry: string; configDir: string; runId: string; seat?: string;
   model: TaskChildLlm; goal: string;
+  parentRoleLlm?: string[];
+  /** HARNESS-FULL-GRAPH-NEXTMOVE — 이 발사를 고른 next-move 결정의 수 id(관측 조인 · 없으면 옛 발사). */
+  moveId?: string;
 }
 
 export interface RepairWorkerResult {
-  pr: number; head: string; runId: string; ok: boolean; reason?: string;
+  pr: number; head: string; runId: string; ok: boolean; reason?: string; moveId?: string;
   job?: string; artifactDir?: string; result?: RepairCommitResult;
 }
 
@@ -29,6 +33,11 @@ export function repairHarnessArgs(request: RepairWorkerRequest): string[] {
     ...(request.seat ? ['--seat', request.seat] : []), '--no-queue', '--no-auto-merge',
     '--child-llm-provider', request.model.provider, '--child-llm-model', request.model.model,
     ...(request.model.effort ? ['--child-llm-effort', request.model.effort] : []), '--', request.goal];
+}
+
+/** The harness-say parent reads role pins from env; its CLI has no --role-llm flag. */
+export function repairWorkerEnv(request: RepairWorkerRequest): Record<string, string> {
+  return { ELANOUS_RUN_ID: request.runId, ...taskParentRoleEnv(request.parentRoleLlm ?? []) };
 }
 
 export function parseRepairMarker(output: string, pr: number, head: string, runId: string): Pick<RepairWorkerResult, 'job' | 'artifactDir' | 'result'> | null {
@@ -46,11 +55,12 @@ export function parseRepairMarker(output: string, pr: number, head: string, runI
 }
 
 export async function runRepairWorker(request: RepairWorkerRequest): Promise<RepairWorkerResult> {
-  const result: RepairWorkerResult = { pr: request.pr, head: request.head, runId: request.runId, ok: false };
+  const result: RepairWorkerResult = { pr: request.pr, head: request.head, runId: request.runId, ok: false,
+    ...(request.moveId ? { moveId: request.moveId } : {}) };
   try {
     const args = repairHarnessArgs(request);
     const child = spawn(process.execPath, args, {
-      cwd: request.repo, env: { ...process.env, ELANOUS_RUN_ID: request.runId }, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: request.repo, env: { ...process.env, ...repairWorkerEnv(request) }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let output = '';
     const append = (data: Buffer) => { output = (output + data.toString('utf8')).slice(-512_000); };
@@ -74,7 +84,7 @@ export async function runRepairWorker(request: RepairWorkerRequest): Promise<Rep
   // The result file, rather than this best-effort notification, is the durable source.
   try {
     publishInsideEvent({ kind: 'ta.repair.completed', schema: 1, card: request.card,
-      pr: request.pr, head: request.head, runId: request.runId,
+      pr: request.pr, head: request.head, runId: request.runId, ...(request.moveId ? { moveId: request.moveId } : {}),
       resultPath: request.resultPath, completedAt: new Date().toISOString() });
   } catch { /* a missing daemon cannot change the worker result */ }
   return result;

@@ -15,6 +15,21 @@ import {
 import { isUnknownCodex400, repairCodexToolPairs, restoreRepairedHistory } from './compact-prepass-recovery.js';
 import type { LLMMessage } from '../../llm.js';
 import { isTuiRouteLine } from '../../core-turn/short-question.js';
+import {
+  AutohealExhaustedError, autohealProviderFallbackMeta, autohealSignatureFor, decideAutohealStep,
+  formatAutohealAttemptLine, formatAutohealExhaustedNotice, type AutohealAttemptRecord,
+} from '../../self-health/autoheal.js';
+
+/** TUI-400-AUTOHEAL-FALLBACK — 400(대화 기록 어긋남)이면 사람에게 넘기기 전에 스스로 회복한다.
+ *  ⛔ 없으면(호출부가 배선 안 함) 옛 동작 그대로 — 처방 한 줄만 보인다. */
+export interface DashboardTurnAutoheal {
+  /** ① 새 백엔드(ACP) 세션 — 새 세션 id. 실패해도 기록은 이미 새로 짰으니 재시도는 한다. */
+  renewBackendSession(): Promise<string>;
+  /** ① 직전 기록의 짧은 요약 — 이미 있는 압축 요약을 쓴다(`summarizeForAutoheal`). 빈 문자열 = 요약 없음. */
+  summarizeHistory(prior: readonly unknown[]): Promise<string>;
+  /** ② `llm.fallbackChain` 의 다음 공급자 이름(지금 쓸 수 있는 것) — 없으면 null(② 를 건너뛰고 멈춘다). */
+  peekFallbackProvider(): string | null;
+}
 
 export interface DashboardChatMainPlainTurnRuntimeDeps {
   userText: string;
@@ -119,6 +134,8 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
       onToolResult: (call: unknown) => void;
       onUsage: (usage: unknown) => void;
       onThought?: (text: string) => void;
+      /** ACP `_meta` — 자동 회복 ② 가 «다음 공급자로» 표지를 싣는다. */
+      meta?: Record<string, unknown>;
     }): Promise<unknown>;
   };
   autoTts: {
@@ -153,6 +170,8 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
   runActionEffects: (outcome: unknown) => Promise<void>;
   warningLine: (message: string) => string;
   pushErrorLine: (message: string) => void;
+  /** TUI-400-AUTOHEAL-FALLBACK — 자동 회복 배선(없으면 옛 동작). */
+  autoheal?: DashboardTurnAutoheal;
   /** 실패 지문이 맞은 오류: 화면엔 한국어 처방 한 줄, 원문은 여기(`/detail`)로. 없으면 원문을 그대로 낸다. */
   pushFailureNotice?: (notice: string, raw: string) => void;
   finalizeTurn: (status: 'completed' | 'interrupted' | 'failed', error?: string) => void;
@@ -178,6 +197,10 @@ export function selectDashboardChatErrorDetail(err: unknown): string {
  * without changing semantics. The orchestration stays dependency-
  * injected so future source flavors can reuse the same turn body.
  */
+function safePeekFallbackProvider(autoheal: DashboardTurnAutoheal): string | null {
+  try { return autoheal.peekFallbackProvider(); } catch { return null; }
+}
+
 export async function runDashboardChatMainPlainTurn(
   deps: DashboardChatMainPlainTurnRuntimeDeps,
 ): Promise<void> {
@@ -187,6 +210,13 @@ export async function runDashboardChatMainPlainTurn(
 
   let cleanupEsc = () => {};
   let stage = 'streaming-keys-attached';
+  // TUI-400-AUTOHEAL-FALLBACK — «자동 회복» 줄은 턴이 끝난 «뒤»에 기록에 남긴다:
+  //   스트림 중에 chatLines 에 넣으면 답 커밋(commitAssistantRenderState)이 답 구역째 덮어 지운다(라이브 실측 08:32).
+  //   도는 동안은 thinking 줄로 보인다.
+  const autohealLines: string[] = [];
+  const flushAutohealLines = (): void => {
+    for (const line of autohealLines.splice(0)) deps.pushChatLine(deps.warningLine(line));
+  };
 
   try {
     const abortCtrl = new AbortController();
@@ -350,6 +380,8 @@ export async function runDashboardChatMainPlainTurn(
           deps.debugLog?.('chat.compact-400-recovery', 'manual-recovery-required', {
             reason, historyMessages: deps.chat.history.length,
           });
+          // 자동 회복(TUI-400-AUTOHEAL-FALLBACK)이 배선돼 있으면 «손으로 /session new» 를 시키지 않는다 — 바깥 회복이 이어 한다.
+          if (deps.autoheal) return;
           deps.pushChatLine(deps.warningLine(
             'Codex 400으로 자동 복구를 멈췄습니다. 대화 이력을 확인한 뒤 /session new 로 새 세션을 시작하세요.',
           ));
@@ -466,10 +498,110 @@ export async function runDashboardChatMainPlainTurn(
         throw lastError;
       },
     };
+    // ⭐ TUI-400-AUTOHEAL-FALLBACK(대표 10-22) — 400(대화 기록 어긋남)으로 멈추지 않는다.
+    //   ① 새 백엔드 세션 ⊕ 직전 요약 → ② fallbackChain 다음 공급자 → 상한(2)에서 이유 한 줄.
+    //   ⛔ 답·도구 호출이 이미 흘렀으면 다시 보내지 않는다. 판정은 순수 `decideAutohealStep`.
+    const autohealSend: typeof deps.acpSession = {
+      send: async (opts) => {
+        const autoheal = deps.autoheal;
+        if (!autoheal) return recoverySend.send(opts);
+        let emitted = false;
+        let attemptIndex = 0;
+        const dispatchBefore = deps.readToolDispatchCount?.() ?? null;
+        const run = (meta?: Record<string, unknown>) => recoverySend.send({
+          ...opts,
+          ...(meta ? { meta: { ...(opts.meta ?? {}), ...meta } } : {}),
+          onText: (chunk) => {
+            if (isTuiRouteLine(chunk)) {
+              // 라우팅 줄은 모델 호출 «전»에 다리가 보낸다 — 재시도마다 또 그리지 않는다.
+              if (attemptIndex === 0) opts.onText(chunk);
+              return;
+            }
+            emitted = true;
+            opts.onText(chunk);
+          },
+          onToolCall: (call) => { emitted = true; opts.onToolCall(call); },
+          onToolResult: (call) => { emitted = true; opts.onToolResult(call); },
+        });
+        const attempts: AutohealAttemptRecord[] = [];
+        let lastError: unknown;
+        try { return await run(); } catch (err) { lastError = err; }
+        for (;;) {
+          const detail = selectDashboardChatErrorDetail(lastError);
+          const dispatchNow = deps.readToolDispatchCount?.() ?? null;
+          const decision = decideAutohealStep({
+            detail,
+            attemptsDone: attempts.length,
+            emitted,
+            toolDispatched: dispatchBefore !== null && dispatchNow !== null && dispatchNow !== dispatchBefore,
+            aborted: abortCtrl.signal.aborted,
+            fallbackProvider: attempts.length === 1 ? safePeekFallbackProvider(autoheal) : null,
+          });
+          if (decision.kind === 'stop') {
+            if (attempts.length === 0) {
+              if (decision.reason !== 'not-autoheal-signature') {
+                deps.debugLog?.('self-health.autoheal', 'skipped', { reason: decision.reason, signature: autohealSignatureFor(detail)?.id });
+              }
+              throw lastError;
+            }
+            deps.debugLog?.('self-health.autoheal', 'exhausted', {
+              attempts: attempts.length, reason: decision.reason, steps: attempts.map((a) => a.step),
+            }, { level: 'warn' });
+            throw new AutohealExhaustedError(lastError, attempts, decision.reason);
+          }
+          attemptIndex = decision.attempt;
+          let payload: Record<string, unknown> = { step: decision.step, attempt: decision.attempt };
+          let meta: Record<string, unknown> | undefined;
+          if (decision.step === 'new-session') {
+            const history = deps.chat.history;
+            const currentIndex = history.lastIndexOf(userMsg);
+            if (currentIndex < 0) {
+              deps.debugLog?.('self-health.autoheal', 'exhausted', { attempts: attempts.length, reason: 'history-changed', steps: [] }, { level: 'warn' });
+              throw lastError;
+            }
+            const prior = history.slice(0, currentIndex);
+            let summary = '';
+            try { summary = (await autoheal.summarizeHistory(prior)).trim(); } catch { /* 요약 없이도 새 세션으로 */ }
+            const system = prior.find((m) => (m as { role?: unknown })?.role === 'system');
+            history.splice(0, history.length,
+              ...(system ? [system] : []),
+              ...(summary ? [{ role: 'assistant', content: `Compacted conversation summary:
+
+${summary}` }] : []),
+              userMsg);
+            let sessionRenewed = false;
+            try { await autoheal.renewBackendSession(); sessionRenewed = true; } catch (error) {
+              deps.debugLog?.('self-health.autoheal', 'renew-failed', { error: redactSecretText(String(error)) }, { level: 'warn' });
+            }
+            payload = { ...payload, summaryChars: summary.length, priorMessages: prior.length, sessionRenewed };
+          } else {
+            payload = { ...payload, provider: decision.provider };
+            meta = autohealProviderFallbackMeta();
+          }
+          attempts.push({ step: decision.step, ...(decision.provider ? { provider: decision.provider } : {}) });
+          const attemptLine = formatAutohealAttemptLine(decision);
+          autohealLines.push(attemptLine);
+          try { deps.thinking.update(attemptLine); } catch { /* 표시가 회복을 막지 않는다 */ }
+          deps.draw();
+          deps.debugLog?.('self-health.autoheal', 'attempt', payload, { level: 'warn' });
+          if (abortCtrl.signal.aborted) throw lastError;
+          try {
+            const result = await run(meta);
+            deps.debugLog?.('self-health.autoheal', 'recovered', { step: decision.step, attempt: decision.attempt, ...(decision.provider ? { provider: decision.provider } : {}) });
+            return result;
+          } catch (err) {
+            lastError = err;
+          } finally {
+            // 시도 줄은 «도는 동안»만 — 끝 꼬리줄(✔/✘)이 그 문면을 물고 남지 않게 되돌린다(라이브 실측 08:36).
+            try { deps.thinking.update('Thinking'); } catch { /* 표시가 회복을 막지 않는다 */ }
+          }
+        }
+      },
+    };
     const streamResult = await runDashboardPlainTurnStream({
       userText,
       abortCtrl,
-      acpSession: recoverySend,
+      acpSession: autohealSend,
       onText: (chunk, accumulated) => {
         logFirstToken(chunk);
         turnStreamRuntime.onText(chunk, accumulated);
@@ -513,6 +645,7 @@ export async function runDashboardChatMainPlainTurn(
     deps.applyAssistantRenderState(
       deps.commitAssistantRenderState(fullResponse, assistantStart, deps.chatLines.length),
     );
+    flushAutohealLines();
     if (debug.enabled) {
       debug.log('dashboard.chat.stream', 'plain-turn.commit-render-state', {
         fullResponseChars: fullResponse.length,
@@ -548,7 +681,10 @@ export async function runDashboardChatMainPlainTurn(
     if (routeFooter) deps.chatFooterLine.current = routeFooter;
   } catch (err: any) {
     finalStatus = 'failed';
-    const detail = selectDashboardChatErrorDetail(err);
+    flushAutohealLines();
+    // TUI-ORPHAN-AUTO-RESUME-STOP E4 (10-23): autoheal wraps the provider error — its own message is the ACP
+    // «Internal error» shell, the real text (`Codex API 400 … call_id …`) lives on the original's RPC details.
+    const detail = selectDashboardChatErrorDetail(err instanceof AutohealExhaustedError ? err.original : err);
     const stackHead = typeof err?.stack === 'string'
       ? err.stack.split('\n').slice(0, 4).join('\n')
       : undefined;
@@ -564,7 +700,14 @@ export async function runDashboardChatMainPlainTurn(
       ? err?.message || String(err)
       : firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine;
     const failure = deps.pushFailureNotice ? matchFailureText(detail) : null;
-    if (failure && deps.pushFailureNotice) {
+    if (err instanceof AutohealExhaustedError) {
+      // 자동 회복이 상한까지 갔다 — «/session new» 처방은 이미 해 봤으니 무엇을 해 봤고 왜 멈췄는지를 한 줄로.
+      const notice = formatAutohealExhaustedNotice(err.attempts, err.reason, { rawHint: '/detail open' });
+      if (failure) recordFailureSignatureMatch(failure, 'turn-error');
+      finalError = `자동 회복 ${err.attempts.length}회 실패`;
+      if (deps.pushFailureNotice) deps.pushFailureNotice(notice, detail);
+      else deps.pushErrorLine(`${notice}\n${detail}`);
+    } else if (failure && deps.pushFailureNotice) {
       recordFailureSignatureMatch(failure, 'turn-error');
       finalError = failure.cause;
       deps.pushFailureNotice(formatFailureNotice(failure, { rawHint: '/detail open' }), detail);

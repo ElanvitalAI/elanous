@@ -27,17 +27,22 @@ import {
 interface CapturedIO {
   io: WizardIO;
   printed: string[];
+  asked: string[];
 }
 
 function makeIO(answers: string[] = []): CapturedIO {
   const printed: string[] = [];
+  const asked: string[] = [];
   const queue = [...answers];
   const io: WizardIO = {
-    ask: async () => (queue.length > 0 ? queue.shift()! : ''),
+    ask: async (prompt) => {
+      asked.push(prompt);
+      return queue.length > 0 ? queue.shift()! : '';
+    },
     print: (s: string) => { printed.push(s); },
     close: () => undefined,
   };
-  return { io, printed };
+  return { io, printed, asked };
 }
 
 function makeStatus(llmPassed: boolean): SetupCheckResult {
@@ -330,7 +335,88 @@ describe('PERSONA-STARTER (0.2.29) — 직업 질문 · 경영 스타터 계약'
     expect(printed.join('\n')).not.toContain('어떤 일');
   });
 
-  test('이미 계약이 있으면 fail-soft — wizard 는 completed 유지, 파일은 여전히 한 개', async () => {
+  test('일반 선택 후에도 경영 선택은 여전히 동작한다(회귀 고정)', async () => {
+    const dir = starterDir();
+    const { io, printed } = makeIO(['경영']);
+    const result = await runFirstBootWizard({
+      io,
+      setupStatus: makeStatus(false),
+      forceTty: true,
+      starterContractDir: dir,
+      runLlmStep: async () => undefined,
+      runTailscaleWizard: async () => undefined,
+    } satisfies FirstBootWizardDeps);
+    if (result.action !== 'completed') throw new Error('expected completed');
+    expect(result.starterContract?.personaId).toBe('starter-management');
+    expect(readdirSync(dir).filter((f) => f.endsWith('.yaml'))).toEqual(['starter-management.yaml']);
+    expect(printed.join('\n')).toContain('경영 스타터 계약이 만들어졌습니다');
+  });
+});
+
+describe('PERSONA-STARTER-FU (0.2.35) — 마케팅 선택 스타터 · 첫 실행 문구', () => {
+  function starterDir(): string {
+    return mkdtempSync(join(tmpdir(), 'starter-marketing-'));
+  }
+
+  test('normalizeOccupationChoice — 3·마케팅·marketing 은 마케팅, 기존 1·경영·management·2·일반·빈값 회귀 없음', () => {
+    expect(normalizeOccupationChoice('3')).toBe('marketing');
+    expect(normalizeOccupationChoice(' 마케팅 ')).toBe('marketing');
+    expect(normalizeOccupationChoice('Marketing')).toBe('marketing');
+    expect(normalizeOccupationChoice('1')).toBe('management');
+    expect(normalizeOccupationChoice('경영')).toBe('management');
+    expect(normalizeOccupationChoice('Management')).toBe('management');
+    expect(normalizeOccupationChoice('2')).toBe('general');
+    expect(normalizeOccupationChoice('일반')).toBe('general');
+    expect(normalizeOccupationChoice('')).toBe('general');
+  });
+
+  test('«마케팅» 선택 → 마케팅 스타터 계약 정확히 한 개가 만들어진다', async () => {
+    const dir = starterDir();
+    const { io, printed } = makeIO(['3']);
+    const result = await runFirstBootWizard({
+      io,
+      setupStatus: makeStatus(false),
+      forceTty: true,
+      starterContractDir: dir,
+      runLlmStep: async () => undefined,
+      runTailscaleWizard: async () => undefined,
+    } satisfies FirstBootWizardDeps);
+    if (result.action !== 'completed') throw new Error('expected completed');
+    const files = readdirSync(dir).filter((f) => f.endsWith('.yaml'));
+    expect(files).toEqual(['starter-marketing.yaml']);
+    const data = parse(readFileSync(join(dir, 'starter-marketing.yaml'), 'utf8')) as Record<string, unknown>;
+    expect(data.personaId).toBe('starter-marketing');
+    expect(String(data.displayName)).toContain('마케팅');
+    expect(String(data.systemPrompt)).toContain('마케팅');
+    const summary: StarterContractSummary | undefined = result.starterContract;
+    expect(summary?.personaId).toBe('starter-marketing');
+    expect(summary?.path).toBe(join(dir, 'starter-marketing.yaml'));
+    const banner = printed.join('\n');
+    expect(banner).toContain('마케팅 스타터 계약이 만들어졌습니다');
+  });
+
+  test('첫 실행 문구 — 직업 질문에 마케팅 선택지가 나오고 기존 경영·일반 문구는 그대로', async () => {
+    const dir = starterDir();
+    const { io, printed, asked } = makeIO(['2']);
+    await runFirstBootWizard({
+      io,
+      setupStatus: makeStatus(false),
+      forceTty: true,
+      starterContractDir: dir,
+      runLlmStep: async () => undefined,
+      runTailscaleWizard: async () => undefined,
+    } satisfies FirstBootWizardDeps);
+    const banner = printed.join('\n');
+    expect(banner).toContain('어떤 일');
+    expect(banner).toContain('1) 경영');
+    expect(banner).toContain('마케팅');
+    expect(banner).toContain('2) 일반');
+    expect(asked).toContain('  선택 (1/2/3 · Enter=일반): ');
+    expect(printed.filter((line) => line.includes('선택 ('))).toHaveLength(0);
+    expect(banner).not.toContain('스타터 계약이 만들어졌습니다');
+  });
+
+  test('마케팅 선택 후 동일 선택 재실행 → fail-soft, 파일은 여전히 한 개', async () => {
     const dir = starterDir();
     const errors: string[] = [];
     const out = { log: () => undefined, error: (s: string) => errors.push(s) };
@@ -343,12 +429,12 @@ describe('PERSONA-STARTER (0.2.29) — 직업 질문 · 경영 스타터 계약'
       runLlmStep: async () => undefined,
       runTailscaleWizard: async () => undefined,
     });
-    const first = await runFirstBootWizard(deps(makeIO(['1']).io));
-    const second = await runFirstBootWizard(deps(makeIO(['1']).io));
+    const first = await runFirstBootWizard(deps(makeIO(['3']).io));
+    const second = await runFirstBootWizard(deps(makeIO(['3']).io));
     if (first.action !== 'completed' || second.action !== 'completed') throw new Error('expected completed');
-    expect(first.starterContract?.personaId).toBe('starter-management');
+    expect(first.starterContract?.personaId).toBe('starter-marketing');
     expect(second.starterContract).toBeUndefined();
     expect(errors[0]).toContain('starter contract failed');
-    expect(readdirSync(dir).filter((f) => f.endsWith('.yaml'))).toEqual(['starter-management.yaml']);
+    expect(readdirSync(dir).filter((f) => f.endsWith('.yaml'))).toEqual(['starter-marketing.yaml']);
   });
 });

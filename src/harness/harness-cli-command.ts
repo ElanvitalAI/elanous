@@ -20,7 +20,7 @@ import { runGitCommand } from '../git-fs/runner.js';
 import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, resolveGoalAuthorGrade, tracedPathReferences, type GoalAuthorGrade, type GoalAuthorGradeSelection, type GoalType } from '../self-implement/goal-author.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { appendRunLedgerEntry, listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerEntry, type RunLedgerMatch, type RunLedgerWriter } from '../self-implement/run-ledger.js';
-import { classifyPodExit, type PodExitClass } from '../task-orchestrator/surfaces/pod-failure-reason.js';
+import { classifyPodExit, parsePodTermination, type PodExitClass, type PodTermination } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
 import { classifyPodExitStop, readRunStopRecord, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
 import { captureStopKnowhowCandidate } from '../self-implement/stop-autoheal.js';
@@ -419,7 +419,7 @@ function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubs
 }
 type PodExit = { status: number | null; signal?: string | null };
 type PodExitReason = 'signal' | 'human-stop' | 'supervisor' | 'no-launch' | 'unknown' | 'preflight-refused'
-  | 'pod-error' | 'launch-gate-blocked' | 'ENOBUFS' | 'OOMKilled';
+  | 'pod-error' | 'launch-gate-blocked' | 'dep-blocked' | 'ENOBUFS' | 'OOMKilled';
 
 function unknownPodExitTailReason(output: string): PodExitReason | undefined {
   const tail = output.slice(-16_000);
@@ -427,6 +427,7 @@ function unknownPodExitTailReason(output: string): PodExitReason | undefined {
   if (/\bENOBUFS\b/i.test(tail)) return 'ENOBUFS';
   if (/launch gate[^\r\n]*blocked|blocked[^\r\n]*launch gate/i.test(tail)) return 'launch-gate-blocked';
   if (/\bpod-error\b/i.test(tail)) return 'pod-error';
+  if (/\b(?:DEP_FAILED|DEPENDENCY_NEEDS_HUMAN|DEP_BLOCKED_REBASE_READY)\b/.test(tail)) return 'dep-blocked';
   return undefined;
 }
 /** GitHub lists at most this many files for one pull request; a list that reaches it is not provably complete. */
@@ -575,7 +576,9 @@ export function recordClassifiedHarnessPodExit(runId: string | undefined, reason
   context: { entrance?: string; seat?: string; output?: string } = {}): void {
   if (!runId) return;
   try {
-    const childEvidence = reason === 'preflight-refused' ? undefined : latestPodChildEvidence(loadRunLedger(runId));
+    const ledger = reason === 'preflight-refused' ? undefined : loadRunLedger(runId);
+    const childEvidence = latestPodChildEvidence(ledger);
+    const podTermination = latestPodTermination(ledger);
     const signal = status > 128
       ? Object.entries(osConstants.signals).find(([, number]) => number === status - 128)?.[0] ?? null : null;
     const cwd = process.cwd();
@@ -586,17 +589,42 @@ export function recordClassifiedHarnessPodExit(runId: string | undefined, reason
       cwd: `${basename(dirname(cwd))}/${basename(cwd)}`, hostname: hostname().split('.')[0]!, pid: process.pid,
       ...(context.output ? { lastLines: incidentLastLines(context.output) } : {}),
       ...(childEvidence ? { childEvidence } : {}),
+      ...(podTermination ? { podTermination } : {}),
     }, effectiveInstanceRoot());
   } catch { /* incident writes cannot change Pod output or exit */ }
 }
 
-function latestPodChildEvidence(entries: readonly RunLedgerEntry[] | null | undefined): PodChildEvidence | undefined {
+/**
+ * The current attempt's `pod-child-evidence` rows (same job · childRunId as the last `pod-child-run`), oldest first.
+ * Also fenced by position: only rows written after that start count, so a reused job/childRunId pair cannot
+ * hand an earlier attempt's row (childEvidence or podTermination) to a later one.
+ */
+function currentPodChildEvidenceRows(entries: readonly RunLedgerEntry[] | null | undefined): { job: string; rows: Record<string, unknown>[] } | undefined {
   // The current attempt's start is the fence. An earlier Pod's terminal facts cannot
   // classify a later attempt when that attempt has no JSON or its ledger write failed.
-  const current = entries?.filter((entry) => entry.event === 'pod-child-run').at(-1)?.data;
+  let startIndex = -1;
+  entries?.forEach((entry, index) => { if (entry.event === 'pod-child-run') startIndex = index; });
+  const current = startIndex >= 0 ? entries![startIndex]!.data : undefined;
   if (typeof current?.job !== 'string' || typeof current.childRunId !== 'string') return undefined;
-  const data = entries?.filter((entry) => entry.event === 'pod-child-evidence'
-    && entry.data?.job === current.job && entry.data?.childRunId === current.childRunId).at(-1)?.data;
+  const rows = (entries ?? []).filter((entry, index) => index > startIndex && entry.event === 'pod-child-evidence'
+    && entry.data?.job === current.job && entry.data?.childRunId === current.childRunId).map((entry) => entry.data);
+  return { job: current.job, rows };
+}
+
+/** JOB-FAILURE-TERMINATION-CAPTURE — the current attempt's latest well-formed capture of its own Job (a later
+ *  evidence row of the same attempt without one does not drop it); another Job's or round's never crosses over. */
+function latestPodTermination(entries: readonly RunLedgerEntry[] | null | undefined): PodTermination | undefined {
+  const current = currentPodChildEvidenceRows(entries);
+  if (!current) return undefined;
+  for (const row of current.rows.slice().reverse()) {
+    const parsed = parsePodTermination(row.podTermination, current.job);
+    if (parsed) return parsed;
+  }
+  return undefined;
+}
+
+function latestPodChildEvidence(entries: readonly RunLedgerEntry[] | null | undefined): PodChildEvidence | undefined {
+  const data = currentPodChildEvidenceRows(entries)?.rows.at(-1);
   const evidence = data?.childEvidence;
   if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return undefined;
   const row = evidence as Record<string, unknown>;
@@ -604,6 +632,8 @@ function latestPodChildEvidence(entries: readonly RunLedgerEntry[] | null | unde
   if (('scopeEscape' in row && row.scopeEscape !== true)
     || ('goalCauseObserved' in row && row.goalCauseObserved !== true)
     || ('classification' in row && typeof row.classification !== 'string')
+    || ('newScope' in row && !Array.isArray(row.newScope))
+    || ('scopeStopReasons' in row && !Array.isArray(row.scopeStopReasons))
     || ('abandonedClassification' in row && !object(row.abandonedClassification))
     || ('accountAvailability' in row && !object(row.accountAvailability))) return undefined;
   return row as PodChildEvidence;
@@ -783,6 +813,14 @@ export function recordHarnessPodStop(
     if (ledger?.some((entry) => entry.event === RUN_STOP_EVENT)) return false;
     const childEvidence = latestPodChildEvidence(ledger);
     const scopeEscape = childEvidence?.scopeEscape === true;
+    // SCOPE-ESCAPE-AS-REFINE — out-of-scope edits without a stop reason are «new scope», not a scope-escape stop.
+    if (childEvidence?.newScope?.length || childEvidence?.scopeStopReasons?.length) {
+      try {
+        debug.log('harness.pod', scopeEscape ? 'scope-escape-stop' : 'scope-new-scope', { runId, scopeEscape,
+          ...(childEvidence.newScope ? { newScope: childEvidence.newScope } : {}),
+          ...(childEvidence.scopeStopReasons ? { scopeStopReasons: childEvidence.scopeStopReasons } : {}) });
+      } catch { /* observation cannot change the stop record */ }
+    }
     if (classified.reason === 'preflight-refused') {
       (deps.record ?? recordRunStop)({
         runId, site: 'preflight', class: 'launch-failed',
@@ -3538,7 +3576,13 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   if (say) {
     registerHarnessAskSayOptions(harnessCmd.command('say <sentence...>').description('문장을 받아 구동한다'))
       .addOption(new Option('--author-grade <grade>', 'say 저작 등급 (full|lite)').choices(['full', 'lite']))
+      .option('--move-id <id>', 'NEXTMOVE-GENERAL-RELAUNCH-MOVEID — 이 발사를 고른 TA next-move 결정의 수 id(관측 조인 칸 · 발사 동작은 바꾸지 않는다)')
       .action(async (sentence: string[], opts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts) => {
+        const moveId = (opts as { moveId?: unknown }).moveId;
+        // 발사 쪽 영수증 — TA 일반 재발사가 실은 수 id 를 받았다는 한 줄(관측만 · fail-soft · 옵션은 아래로 내려가지 않는다).
+        if (typeof moveId === 'string' && moveId) {
+          try { debug.log('harness', 'move-id-received', { entrance: 'cli-harness-say', moveId }); } catch { /* fail-soft */ }
+        }
         const repair = opts as HarnessSubstrateOpts;
         if (repair.repairCommitOnly !== undefined && (repair.substrate !== 'pod' || !/^pr:[1-9]\d*$/.test(repair.source ?? '')
           || !/^[0-9a-f]{40}$/.test(repair.repairCommitOnly) || repair.autoMerge !== false || repair.target !== undefined)) {

@@ -1,9 +1,16 @@
 import type { Command } from 'commander';
 import { ensureAuthToken } from '../auth/acp-token.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { canonicalSeatId, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
+import { clearPostOffice, ensurePostOffice, writePostOffice } from '../msg/msg-post-office.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
+import type { AgentReplyAddress, AgentReplyInput, AgentReplyResult } from '../loops/agent-reply.js';
 import { messageRouteFor, noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
 import { resolveWake, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
+import type { RoleLlmSpec } from '../user-config.js';
+
+/** The loop rows whose reply body is an LLM agent: `--agent-reply` picks one of these. */
+const AGENT_REPLY_ROLES = { COORDINATOR: 'coordinator', GUARDIAN: 'guardian' } as const;
 
 export interface MsgCliDeps {
   openStore?: () => MsgStore;
@@ -21,6 +28,24 @@ export interface MsgCliDeps {
   registerLogSink?: () => Promise<unknown>;
   /** Wake the recipient after a durable post; never changes the post outcome. */
   wake?: (address: string, msgId: number, message: { from: string; kind?: string }, deps: WakeDeps) => Promise<WakeOutcome>;
+  /**
+   * Agent auto-reply producer (`--agent-reply`). The default resolves the selected role LLM, loads its pack,
+   * and calls the real `replyWithAgent`; the seams exist so a test still traverses that producer.
+   */
+  agentReply?: {
+    role?: RoleLlmSpec;
+    pack?: string;
+    /** Test seam: a fake turn still goes through `replyWithAgent` and its ledger transaction. */
+    runAgent?: AgentReplyInput['runAgent'];
+    /** Test seam for the role ladder — `undefined` means «역할 LLM 미설정». */
+    resolveRole?: (address: AgentReplyAddress) => RoleLlmSpec | undefined;
+    observationRoot?: string;
+  };
+  /** `msg serve --sse` discovery file root (default: the state root). `msg post` restarts a dead service found here. */
+  postOfficeStateRoot?: string;
+  postOfficeAlive?: (pid: number) => boolean;
+  postOfficeProbe?: (url: string) => Promise<boolean>;
+  postOfficeLaunch?: (input: { port: number }) => void;
   /** Test seams for the existing self-send transport and the selected task-card ledger. */
   readCard?: typeof import('../task-agent/task-hand.js').readTaskCard;
   podFragmentsForRun?: typeof import('../harness/self-send-target.js').listPodFragmentsForRun;
@@ -160,16 +185,94 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     if (json) out.log(JSON.stringify(value));
     else human();
   };
+  const officeRoot = () => deps.postOfficeStateRoot ?? elanousStateRoot();
+
+  /** `--agent-reply <address>` — only the loop rows that answer with an LLM body. */
+  const agentReplyAddress = (raw: string | undefined): AgentReplyAddress | null => {
+    if (raw === undefined) return null;
+    const name = raw.trim().toUpperCase();
+    if (!Object.hasOwn(AGENT_REPLY_ROLES, name)) throw new Error('--agent-reply must be COORDINATOR or GUARDIAN');
+    return name as AgentReplyAddress;
+  };
+  const requireAgentTarget = (address: AgentReplyAddress, to: string): void => {
+    if (address !== to) throw new Error(`--agent-reply ${address} requires --to ${address}`);
+  };
+
+  /**
+   * Human-free live conversation: the selected address's LLM body answers the message that was just saved.
+   * The durable ledger stays authoritative — `replyWithAgent` owns the one-reply-per-request transaction and
+   * its dedupe, so a retry finds the existing link instead of generating again. A failure never changes the
+   * post's exit code; it is reported as one line on stderr.
+   */
+  const autoReply = async (address: AgentReplyAddress, request: Message, json: boolean | undefined): Promise<void> => {
+    const seam = deps.agentReply;
+    let role = seam?.role;
+    if (role === undefined) {
+      if (seam?.resolveRole) role = seam.resolveRole(address);
+      else {
+        const { resolveConfiguredAgentRoleLlm } = await import('../user-config.js');
+        // Only an explicitly selected provider/tier/model starts an agent body; effort alone is not a selection.
+        role = resolveConfiguredAgentRoleLlm(AGENT_REPLY_ROLES[address]);
+      }
+    }
+    if (role === undefined) {
+      out.error(`msg: ${address} 역할 LLM 미설정 — 자동 답 없음`);
+      return;
+    }
+    let pack = seam?.pack;
+    if (pack === undefined) {
+      try {
+        const { loadAgentRolePack } = await import('../loops/agent-reply.js');
+        pack = loadAgentRolePack(AGENT_REPLY_ROLES[address]);
+      } catch (error) {
+        out.error(`msg: ${address} 역할 팩 없음 — 자동 답 없음: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    }
+    try {
+      const { replyWithAgent } = await import('../loops/agent-reply.js');
+      const store = open();
+      let result: AgentReplyResult;
+      try {
+        result = await replyWithAgent({ address, role, pack, store,
+          request: { id: request.id, from: request.from, body: request.body,
+            ...(request.kind === undefined ? {} : { kind: request.kind }) },
+          ...(seam?.runAgent ? { runAgent: seam.runAgent } : {}),
+          ...(seam?.observationRoot ? { observationRoot: seam.observationRoot } : {}) });
+      } finally { store.close(); }
+      emit({ agentReply: { address, requestId: request.id, ...result } }, json,
+        () => out.log(`자동 답 ${result.replyId === null ? '없음' : `#${result.replyId}`} (${address} → ${request.from})${result.posted ? '' : ' — 이미 있음'}`));
+    } catch (error) {
+      out.error(`msg: 자동 답 실패: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  /**
+   * Installed post-office supervision: a registered `msg serve --sse` that no longer answers is restarted on
+   * its recorded port. Nothing is spawned when no service registered itself, so a plain post is unchanged.
+   */
+  const supervisePostOffice = async (): Promise<void> => {
+    const result = await ensurePostOffice({ stateRoot: officeRoot(),
+      ...(deps.postOfficeAlive ? { alive: deps.postOfficeAlive } : {}),
+      ...(deps.postOfficeProbe ? { probe: deps.postOfficeProbe } : {}),
+      ...(deps.postOfficeLaunch ? { launch: deps.postOfficeLaunch } : {}) });
+    if (result.state === 'restarted')
+      out.error(`msg: post office 재시작 (port ${result.port}) — 원장이 정본이라 저장된 글은 다시 밀린다`);
+  };
 
   msg.command('post [body]').description('Post a message; use - or omit body to read stdin')
     .option('--from <seat>').option('--to <seat>').option('--kind <kind>').option('--body <text>')
     .option('--reply-to <id>', 'point this reply at a question message ID')
+    .option('--agent-reply <address>', 'let this address\'s agent body (COORDINATOR · GUARDIAN) answer the saved message once')
     .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>').option('--json')
-    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; replyTo?: string; originKey?: string }) => run(async () => {
+    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; replyTo?: string; originKey?: string; agentReply?: string }) => run(async () => {
       const from = seat(opts.from, '--from');
       const unsupported = opts.to === undefined ? null : unsupportedLoopAddressNotice(opts.to);
       if (unsupported) out.error(unsupported);
       const to = seat(opts.to, '--to');
+      // Validate the auto-reply target before saving — a mismatched flag must not leave a stored message behind.
+      const agentAddress = agentReplyAddress(opts.agentReply);
+      if (agentAddress !== null) requireAgentTarget(agentAddress, to);
       if (body !== undefined && body !== '-' && opts.body !== undefined) throw new Error('provide body once (argument or --body)');
       const text = opts.body ?? (body !== undefined && body !== '-' ? body : await readStdin());
       const envelope = { from, to, body: text,
@@ -192,10 +295,14 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
           new Promise<void>(resolve => { sinkTimer = setTimeout(resolve, 1000); }),
         ]).finally(() => clearTimeout(sinkTimer));
       } catch { /* observability is fail-open */ }
+      // 설치본을 갈아 끼우면 우편국(SSE)은 조용히 사라진다 — 등록해 둔 서비스가 응답하지 않으면 같은 포트로 다시 띄운다.
+      // 재시작도 관측도 post 의 성패를 바꾸지 않는다.
+      try { await supervisePostOffice(); } catch { /* post office is fail-open */ }
       try {
         await (deps.wake ?? wakeRecipient)(to, posted.id, { from, ...(opts.kind === undefined ? {} : { kind: opts.kind }) },
           { ...deps.wakeDeps, warn: noBody ? () => {} : line => out.error(line) });
       } catch { /* the wake outcome is logged by wakeRecipient; the post is already durable */ }
+      if (agentAddress !== null) await autoReply(agentAddress, posted, opts.json);
     })());
 
   msg.command('route <address>').description('Show how a post to this address is read (replyBody) and woken (wake)')
@@ -344,11 +451,14 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
 
   msg.command('ask <recipient> <question>').description('Post a question and wait for its first reply')
     .option('--from <seat>', 'asking seat (required)').option('--wait <seconds>', 'seconds to wait for a reply (default 60)', '60')
+    .option('--agent-reply <address>', 'let this address\'s agent body (COORDINATOR · GUARDIAN) answer before waiting')
     .option('--json')
-    .action((recipient: string, question: string, opts: CommonOptions & { from?: string; wait?: string }) => run(async () => {
+    .action((recipient: string, question: string, opts: CommonOptions & { from?: string; wait?: string; agentReply?: string }) => run(async () => {
       const from = seat(opts.from, '--from');
       const to = canonicalSeatId(recipient);
       const waitSeconds = integer(opts.wait, '--wait', 60, 0, 86400);
+      const agentAddress = agentReplyAddress(opts.agentReply);
+      if (agentAddress !== null) requireAgentTarget(agentAddress, to);
       const interrupt = deps.signal === undefined ? new AbortController() : undefined;
       const signal = deps.signal ?? interrupt!.signal;
       const onInterrupt = () => interrupt?.abort();
@@ -362,6 +472,8 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         emit(asked, opts.json, () => out.log(`#${asked.id}`));
         // msg ask uses the same saved-message handler before waiting for its linked reply.
         await handleTaMessage(asked);
+        // 사람 없는 live 대화: 답할 몸이 있으면 «기다리기 전»에 답을 원장에 남긴다 — 같은 대기 루프가 그 답을 집는다.
+        if (agentAddress !== null) await autoReply(agentAddress, asked, opts.json);
         const deadline = Date.now() + waitSeconds * 1000;
         let reply: Message | undefined;
         store = open();
@@ -419,8 +531,10 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       try {
         const service = startMsgSseServer({ store, token: (deps.authToken ?? (() => ensureAuthToken().token))(),
           port, hostname: opts.host });
+        // 발견 줄 — 설치본을 갈아 끼운 뒤 `msg post` 가 이 줄을 읽어 죽은 서비스를 같은 포트로 다시 띄운다.
+        writePostOffice(officeRoot(), { port: service.port });
         out.log(`msg SSE listening on ${opts.host}:${service.port}`);
-        const stop = () => { service.stop(); store.close(); };
+        const stop = () => { service.stop(); store.close(); clearPostOffice(officeRoot()); };
         process.once('SIGINT', stop);
         process.once('SIGTERM', stop);
       } catch (error) { store.close(); throw error; }

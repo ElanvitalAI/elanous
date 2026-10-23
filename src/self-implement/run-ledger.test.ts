@@ -1,8 +1,9 @@
-import { afterAll, describe, expect, it } from 'bun:test';
-import { appendRunLedgerEntry, cleanupUnfinishedRunLedgers, classifyFederatedLedgerDirectoryReadFailure, describeFederatedMissingRunLedger, dispositionUnfinishedRunLedger, hasTerminalRunStatus, isTerminatedUnfinishedLifecycle, loadFederatedRunLedger, classifyUnfinishedLifecycle, loadRunLedger, loadRunLedgerWithMetadata, lookupPrGoalAcceptance, parseRunShardIdentity, queryCompletedRunLedgers, queryFederatedCompletedRunLedgers, queryFederatedInterruptedRunLedgers, queryFederatedUnfinishedRunLedgers, queryInterruptedRunLedgers, queryRunChain, queryRunLedgerTimeline, queryRunScreenKey, queryUnfinishedRunLedgers, readNonBlockingRunRecord, recordHumanStoppedRun, recordNonBlockingRunPending, recordNonBlockingRunResult, renderRunLedger, renderUnfinishedRunLedgers, runLedgerDir, summarizeRunLedgerRounds, TERMINATED_UNFINISHED_LIFECYCLES, type RunChainLogStore, type RunLedgerEntry, type RunLedgerReader, type UnfinishedRunLedgerEntry } from './run-ledger.js';
+import { afterAll, describe, expect, it, test } from 'bun:test';
+import { appendRunLedgerEntry, appendRunLedgerEntryChecked, cleanupUnfinishedRunLedgers, classifyFederatedLedgerDirectoryReadFailure, describeFederatedMissingRunLedger, dispositionUnfinishedRunLedger, hasTerminalRunStatus, isTerminatedUnfinishedLifecycle, loadFederatedRunLedger, classifyUnfinishedLifecycle, loadRunLedger, loadRunLedgerWithMetadata, lookupPrGoalAcceptance, parseRunShardIdentity, queryCompletedRunLedgers, queryFederatedCompletedRunLedgers, queryFederatedInterruptedRunLedgers, queryFederatedUnfinishedRunLedgers, queryInterruptedRunLedgers, queryRunChain, queryRunLedgerTimeline, queryRunScreenKey, queryUnfinishedRunLedgers, readNonBlockingRunRecord, recordHumanStoppedRun, recordNonBlockingRunPending, recordNonBlockingRunResult, renderRunLedger, renderUnfinishedRunLedgers, runLedgerDir, runLedgerPath, summarizeRunLedgerRounds, RunLedgerCheckedAppendRunIdMismatchError, TERMINATED_UNFINISHED_LIFECYCLES, type RunChainLogStore, type RunLedgerCheckedAppendDecision, type RunLedgerEntry, type RunLedgerReader, type UnfinishedRunLedgerEntry } from './run-ledger.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setOpsRootsForTesting } from '../instance/test-write-guard.js';
 import { debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
 
@@ -1966,5 +1967,77 @@ describe('unfinished run ledger path axes', () => {
 
   afterAll(() => {
     for (const directory of directories) rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe('RUN-DOCTOR-LIVE #30468 — 잠금 runId와 쓰기 runId 일치 강제 + test-universe 쓰기 잠금 전 거부', () => {
+  const RUN_ID = 'run-0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d';
+  const OTHER_RUN_ID = 'run-00000000-0000-4000-8000-000000000000';
+
+  test('appendRunLedgerEntryChecked — caller가 다른 runId를 반환하면 잠금을 풀고 throw, 대상·교차 원장 모두 바이트 동일', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'run-ledger-checked-mismatch-'));
+    try {
+      appendRunLedgerEntry({ timestamp: '2026-10-22T00:00:00.000Z', runId: RUN_ID, event: 'run-start', data: {} }, dir);
+      const targetBefore = readFileSync(runLedgerPath(RUN_ID, dir), 'utf8');
+      const decide = (): RunLedgerCheckedAppendDecision<null> => ({
+        append: true,
+        entry: { timestamp: '2026-10-22T09:45:00.000Z', runId: OTHER_RUN_ID, event: 'unit-checked-append', data: {} },
+      });
+      // 소비자가 원장 파싱 오류와 새 checked-append 오류를 같은 이유로 분류할 수 있어야 한다.
+      let thrown: unknown;
+      try {
+        appendRunLedgerEntryChecked(RUN_ID, decide, dir);
+      } catch (error) {
+        thrown = error;
+      }
+      // F3 회귀: mismatch 는 문자열 파싱 없이 typed reason 으로 분류된다.
+      expect(thrown).toBeInstanceOf(RunLedgerCheckedAppendRunIdMismatchError);
+      expect((thrown as RunLedgerCheckedAppendRunIdMismatchError).reason).toBe('runId-mismatch');
+      expect(() => { if (thrown instanceof Error) throw thrown; }).toThrow(/runId-mismatch/);
+      // 잠금 디렉터리는 해제됐고, 대상 원장은 바이트 동일, 교차 run 원장은 생기지 않는다.
+      expect(existsSync(join(dir, `.${RUN_ID}.lock`))).toBe(false);
+      expect(readFileSync(runLedgerPath(RUN_ID, dir), 'utf8')).toBe(targetBefore);
+      expect(existsSync(runLedgerPath(OTHER_RUN_ID, dir))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('test-universe 운영 루트 안 쓰기 — 잠금 획득 전에 거부: 잠금 디렉터리·원장 부작용 0', () => {
+    const opsRoot = mkdtempSync(join(tmpdir(), 'run-ledger-checked-ops-root-'));
+    const ledgerDir = join(opsRoot, 'run-ledger');
+    setOpsRootsForTesting([opsRoot]);
+    let decided = 0;
+    try {
+      const decide = (): RunLedgerCheckedAppendDecision<null> => {
+        decided += 1;
+        return { append: true, entry: { timestamp: '2026-10-22T09:46:00.000Z', runId: RUN_ID, event: 'unit-checked-append', data: {} } };
+      };
+      expect(appendRunLedgerEntryChecked(RUN_ID, decide, ledgerDir)).toEqual({ appended: false, result: null, refusal: 'ledger-write-refused' });
+      // 거부는 잠금 획득 전 — decide 자체도 불리지 않고 어떤 디렉터리·파일도 생기지 않는다.
+      expect(decided).toBe(0);
+      expect(existsSync(ledgerDir)).toBe(false);
+      expect(existsSync(join(ledgerDir, `.${RUN_ID}.lock`))).toBe(false);
+      expect(existsSync(runLedgerPath(RUN_ID, ledgerDir))).toBe(false);
+    } finally {
+      setOpsRootsForTesting(null);
+      rmSync(opsRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('동일 run 성공 — 원장에 정확히 한 번 append, 잠금 디렉터리는 해제', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'run-ledger-checked-same-run-'));
+    try {
+      appendRunLedgerEntry({ timestamp: '2026-10-22T00:00:00.000Z', runId: RUN_ID, event: 'run-start', data: {} }, dir);
+      const decide = (): RunLedgerCheckedAppendDecision<null> => ({
+        append: true,
+        entry: { timestamp: '2026-10-22T09:47:00.000Z', runId: RUN_ID, event: 'unit-checked-append', data: {} },
+      });
+      expect(appendRunLedgerEntryChecked(RUN_ID, decide, dir)).toEqual({ appended: true, result: null, refusal: null });
+      expect(loadRunLedger(RUN_ID, dir)!.filter((entry) => entry.event === 'unit-checked-append').length).toBe(1);
+      expect(existsSync(join(dir, `.${RUN_ID}.lock`))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

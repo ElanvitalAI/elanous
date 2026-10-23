@@ -234,6 +234,16 @@ export interface CollectDeps {
   gitLog?: (sinceIso: string) => { lines: string[]; observedAt: string } ;
 }
 
+/** Production schedule.run ledger reader; dbPath is explicit so replays never open the operating ledger. */
+export async function readSchedulerExecutionRows(dbPath: string, sinceMs: number, untilMs: number): Promise<SchedulerExecutionObservation[]> {
+  const { LogStore } = await import('../mss/logging/log-store.js');
+  const store = LogStore.openReadOnly(dbPath);
+  try {
+    return store.queryAll({ exactCategories: ['schedule.run'], sinceMs, untilMs })
+      .map(({ ts_ms, data }) => ({ ts_ms, data }));
+  } finally { store.close(); }
+}
+
 async function defaultDeps(root: string): Promise<Required<CollectDeps>> {
   const [{ listSchedules }, { listChecklist }, { readReleaseRuns }, { readTaskAgentState, taskAgentStatePath }, { ResourceLedger }, { getUserConfig }] = await Promise.all([
     import('../release-loop/release-schedule.js'), import('../release-loop/checklist.js'), import('../nexus/api/ops-api.js'),
@@ -242,12 +252,8 @@ async function defaultDeps(root: string): Promise<Required<CollectDeps>> {
   return {
     listSchedules: () => listSchedules(),
     readSchedulerRuns: async (sinceMs, untilMs) => {
-      const { LogStore, logsDbPath } = await import('../mss/logging/log-store.js');
-      const store = LogStore.openReadOnly(logsDbPath());
-      try {
-        return store.queryAll({ exactCategories: ['schedule.run'], sinceMs, untilMs })
-          .map(({ ts_ms, data }) => ({ ts_ms, data }));
-      } finally { store.close(); }
+      const { logsDbPath } = await import('../mss/logging/log-store.js');
+      return readSchedulerExecutionRows(logsDbPath(), sinceMs, untilMs);
     },
     listChecklist: (v) => listChecklist(v),
     readRuns: (dir) => readReleaseRuns(null, dir),

@@ -15,7 +15,10 @@ import { loopEvent } from '../../src/loops/observe.js';
 import { kindRouteTarget, mainHomeTarget } from '../../src/domains/telegram-kind-route.js';
 import { recordOutbound } from '../../src/domains/outbound-alert.js';
 import { listSelfDevRuns, runSummaryLine, selfDevRunsDir } from '../../src/self-dev/run-store.js';
-import { runDraftSweep } from '../../src/self-dev/draft-sweep.js';
+import { runDraftSweep, sweptReasonLabel } from '../../src/self-dev/draft-sweep.js';
+import { LogStore } from '../../src/mss/logging/log-store.js';
+import { BriefItemsLedger } from '../../src/briefing/brief-items.js';
+import { debug } from '../../src/debug/log.js';
 import { retroBriefingLines } from '../../src/retro/daily.js';
 import { dispatchCooAdmin } from '../../src/domains/coo-admin-tool.js';
 
@@ -74,6 +77,133 @@ export function collectRunSummaries(now: Date, root = effectiveInstanceRoot(), l
       || prNumbers.some(number => landed.has(number)))
     .map(({ run, prNumbers }) => ({ line: runSummaryLine(run), updatedYesterday: run.updatedAt >= from && run.updatedAt < from + 86_400_000,
       prNumbers }));
+}
+
+/**
+ * DRAFT-SWEEP-DAILY-SUMMARY — 닫힌 draft 사유를 «하루 한 번 브리핑 원장 1건» 으로 적는다.
+ * 사유의 정본은 DRAFT-SWEEP-QUIET 이 닫을 때 남기는 `closed` 로그(PR 댓글 0 계약은 그쪽이 지킨다)이고,
+ * 이 경로는 로그 원장 «읽기» ⊕ 브리핑 원장 «쓰기» 만 한다 — GitHub 에 아무것도 쓰지 않는다.
+ */
+export const DRAFT_CLOSE_BRIEF_SOURCE = 'rhythm.daily.draft-close';
+/** DRAFT-SWEEP-QUIET 가 닫힌 draft마다 남기는 로그 — 사유의 정본 좌표. */
+const SWEPT_DRAFT_LOG = { category: 'self-dev.draft-sweep', event: 'closed' } as const;
+const SWEPT_LABEL_PREFIX = 'elanous:swept:';
+
+export type ClosedDraftReason = { reason: string; count: number };
+export type ClosedDraftCount = { closed: number; reasons: ClosedDraftReason[]; unreadable: number };
+export type DraftCloseSummary = {
+  /** 요약이 다루는 날짜(어제, KST). */
+  day: string;
+  closed: number;
+  reasons: ClosedDraftReason[];
+  /** 브리핑 원장에 실린 한 줄 — 표본이 없으면 null. */
+  text: string | null;
+  state: 'recorded' | 'already-recorded' | 'unmeasured' | 'unreadable';
+  /** 미측정·실패 사유(한 줄). */
+  detail?: string;
+  itemId?: number;
+};
+
+/** `closed` 로그 한 줄의 `{ reason }` — Pod 전달 래퍼(`originalData`)도 벗긴다. 못 읽으면 null. */
+function closedLogReason(data: string | null): string | null {
+  if (typeof data !== 'string' || !data.trim()) return null;
+  let payload: unknown;
+  try { payload = JSON.parse(data); } catch { return null; }
+  let body = record(payload);
+  const forwarded = body.originalData;
+  if (forwarded !== undefined) {
+    if (typeof forwarded !== 'string') body = record(forwarded);
+    else { try { body = record(JSON.parse(forwarded)); } catch { return null; } }
+  }
+  const reason = string(body.reason).trim();
+  return reason ? shortReason(reason) : null;
+}
+
+/** 사유를 DRAFT-SWEEP-QUIET 의 사유 종류로 접는다(`superseded-by #24123` → `superseded-by`). */
+export function sweptReasonKind(reason: string): string {
+  const label = sweptReasonLabel(reason);
+  return label.startsWith(SWEPT_LABEL_PREFIX) ? label.slice(SWEPT_LABEL_PREFIX.length) : label;
+}
+
+/**
+ * 어제(KST 00:00–24:00) 닫힌 draft 사유를 로그 원장에서 센다.
+ * ⛔ 원장이 없거나 못 읽으면 null — «0건»이 아니라 «미측정»이다.
+ */
+export function collectClosedDrafts(root: string, now: Date): ClosedDraftCount | null {
+  const path = join(root, 'logs', 'logs.db');
+  if (!existsSync(path)) return null;
+  const from = new Date(`${kstDay(new Date(now.getTime() - 86_400_000))}T00:00:00+09:00`);
+  const store = LogStore.openReadOnly(path);
+  try {
+    const rows = store.queryAll({ exactCategories: [SWEPT_DRAFT_LOG.category], events: [SWEPT_DRAFT_LOG.event],
+      sinceMs: from.getTime(), untilMs: from.getTime() + 86_400_000 - 1 });
+    const counts = new Map<string, number>();
+    let unreadable = 0;
+    for (const row of rows) {
+      const reason = closedLogReason(row.data);
+      if (reason === null) { unreadable += 1; continue; }
+      const kind = sweptReasonKind(reason);
+      counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    }
+    return { closed: [...counts.values()].reduce((sum, count) => sum + count, 0),
+      reasons: [...counts].map(([reason, count]) => ({ reason, count }))
+        .sort((a, b) => b.count - a.count || sortNames(a.reason, b.reason)),
+      unreadable };
+  } finally { store.close(); }
+}
+
+/** 브리핑 한 줄 — 사유 종류별 건수, 상위 5종만 적고 나머지는 «외 N종» 으로 접는다. */
+export function composeDraftCloseSummaryText(reasons: readonly ClosedDraftReason[]): string {
+  const total = reasons.reduce((sum, item) => sum + item.count, 0);
+  const shown = reasons.slice(0, 5).map(item => `${item.reason} ${item.count}`).join(' · ');
+  const omitted = Math.max(0, reasons.length - 5);
+  return `어제 닫힌 draft ${total}건${shown ? ` — ${shown}` : ''}${omitted > 0 ? ` · 외 ${omitted}종` : ''}`;
+}
+
+/**
+ * 어제 닫힌 draft 사유를 브리핑 원장(`<state>/briefing/items.sqlite`, `eln brief`)에 **하루 1건** 으로 적는다.
+ * 표본이 없거나 원장을 못 읽으면 아무것도 쓰지 않고 `unmeasured`/`unreadable` 로 남긴다(«0건»으로 적지 않는다).
+ * 관측은 `deps.log`(루프 tick 전용)가 아니라 로그에 직접 남긴다 — 데일리 tick 의 의미를 바꾸지 않는다.
+ */
+export function recordDraftCloseSummary(root: string, now: Date,
+  log: (category: string, event: string, data?: unknown) => void = (category, event, data) => debug.log(category, event, data),
+): DraftCloseSummary {
+  const observe = (summary: DraftCloseSummary): DraftCloseSummary => {
+    try {
+      log('rhythm.daily', 'draft-close-summary', { day: summary.day, closed: summary.closed, state: summary.state,
+        reasons: summary.reasons.map(item => `${item.reason} ${item.count}`).join(' · '),
+        ...(summary.detail ? { detail: summary.detail } : {}), ...(summary.itemId === undefined ? {} : { itemId: summary.itemId }) });
+    } catch { /* 관측 실패가 브리핑을 막지 않는다 */ }
+    return summary;
+  };
+  const day = kstDay(new Date(now.getTime() - 86_400_000));
+  let counted: ClosedDraftCount | null;
+  try { counted = collectClosedDrafts(root, now); }
+  catch (error) { return observe({ day, closed: 0, reasons: [], text: null, state: 'unreadable',
+    detail: shortReason(`로그 원장 못 읽음 · ${reasonOf(error)}`) }); }
+  if (counted === null) return observe({ day, closed: 0, reasons: [], text: null, state: 'unmeasured', detail: '로그 원장 없음' });
+  if (counted.closed === 0) return observe({ day, closed: 0, reasons: [], text: null, state: 'unmeasured',
+    detail: counted.unreadable > 0 ? `사유 못 읽은 closed 로그 ${counted.unreadable}건` : '닫힌 draft 없음' });
+  // 사유를 못 읽은 closed 로그가 섞이면 읽힌 건수만으로 닫힘 총수를 단정할 수 없다 — 원장에 확정 기록하지 않고 부분 미측정으로 남긴다.
+  if (counted.unreadable > 0) return observe({ day, closed: counted.closed, reasons: counted.reasons, text: null,
+    state: 'unmeasured',
+    detail: `사유 못 읽은 closed 로그 ${counted.unreadable}건 — 읽힌 ${counted.closed}건만 셈(부분 미측정)` });
+  const text = composeDraftCloseSummaryText(counted.reasons);
+  try {
+    const ledger = new BriefItemsLedger({ stateDir: root, now: () => now, log });
+    const today = kstDay(now);
+    const recorded = ledger.list().find(item => item.source === DRAFT_CLOSE_BRIEF_SOURCE
+      && kstDay(new Date(item.created_at)) === today);
+    if (recorded) return observe({ day, closed: counted.closed, reasons: counted.reasons, text,
+      state: 'already-recorded', itemId: recorded.id });
+    const item = ledger.add({ text, domain: '운영', priority: 'P2', source: DRAFT_CLOSE_BRIEF_SOURCE,
+      evidence: `elanous logs --category ${SWEPT_DRAFT_LOG.category} --event ${SWEPT_DRAFT_LOG.event} --since 24h`,
+      createdAt: now.toISOString(), dedupeKey: `${DRAFT_CLOSE_BRIEF_SOURCE}:${today}`, dedupeWithinMs: 86_400_000 });
+    return observe({ day, closed: counted.closed, reasons: counted.reasons, text, state: 'recorded', itemId: item.id });
+  } catch (error) {
+    return observe({ day, closed: counted.closed, reasons: counted.reasons, text, state: 'unreadable',
+      detail: shortReason(`브리핑 원장 못 씀 · ${reasonOf(error)}`) });
+  }
 }
 
 /** 기본은 어제 KST 00:00–24:00, 창을 주면 그 안에 실제 병합된 PR만 센다. */
@@ -495,7 +625,8 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
         else loopEvent('rhythm-daily', 'tick', tick);
       }
     }
-    return { file, markdown, header, risks, sections, sent, ...vault, sendError, recordError, status, deliveryState, deliveryLine };
+    return { file, markdown, header, risks, sections, sent, ...vault, sendError, recordError, status, deliveryState, deliveryLine,
+      draftCloseSummary: undefined };
   }
   const safe = async <T>(fetch: () => Promise<T>): Promise<Section<T>> => {
     try { return { status: 'ok', value: await fetch() }; } catch (e) { return unreadable(reasonOf(e)); }
@@ -589,6 +720,9 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
     writeFileSync(file, review.markdown);
   }
   const { vaultError, vaultFatal } = options.dryRun ? { vaultError: null, vaultFatal: false } : copyToVault(review.markdown, now, deps);
+  // DRAFT-SWEEP-DAILY-SUMMARY — 어제 닫힌 draft 사유를 오늘 브리핑 원장 1건으로 적는다(PR별 댓글 0 유지).
+  // --dry-run 은 원장에 쓰지 않는다(다른 산출물과 같은 규칙).
+  const draftCloseSummary = options.dryRun ? undefined : recordDraftCloseSummary(root, now);
   let enabled = deps.sendEnabled === true;
   let sendError: string | null = null;
   let deliveryState = options.stage === 'collect' ? 'pending' : options.dryRun ? 'dry-run' : 'send-disabled';
@@ -628,7 +762,7 @@ export async function runDaily(options: { dryRun?: boolean; noNews?: boolean; st
       else loopEvent('rhythm-daily', 'tick', tick);
     }
   }
-  return { file, ...review, sent, vaultError, vaultFatal, sendError, recordError, status, deliveryState, deliveryLine };
+  return { file, ...review, sent, vaultError, vaultFatal, sendError, recordError, status, deliveryState, deliveryLine, draftCloseSummary };
 }
 
 export async function main(args: string[] = process.argv.slice(2), deps: DailyDeps = {}): Promise<Awaited<ReturnType<typeof runDaily>>> {

@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
 import * as features from './feature-store.js';
 
 const roots: string[] = [];
@@ -137,6 +137,53 @@ describe('release checklist ledger', () => {
     expect(() => setItem('0.2.18', 'R1', { refs: ['src'] }, 'MK')).toThrow(CliUserError);
     expect(JSON.stringify(listChecklist('0.2.18').items.find((item) => item.id === 'R1'))).toBe(before);
     expect(Object.keys(listChecklist('0.2.18').items.find((item) => item.id === 'R0')!)).not.toContain('refs');
+  });
+
+  test('MUST-TAG-LEDGER: MUST 한 행과 기존 non-MUST 한 행이 함께 왕복하고 빈 effect 를 거부한다', () => {
+    root();
+    const version = '9.9.9';
+    addItem(version, { id: 'MUST', title: 'must cell', owner: 'TC' });
+    addItem(version, { id: 'PLAIN', title: 'plain cell' });
+    const plainBefore = JSON.stringify(listChecklist(version).items.find((item) => item.id === 'PLAIN'));
+    const plainHistoryBefore = checklistHistory('PLAIN');
+    const effects = ['권한 없는 착지 거부', '판당 상한 초과 거부'];
+
+    const written = setMust(version, 'MUST', { version, reason: '권한·상한 판단 기준', effect: effects[0]! }, 'OP');
+    const expected = { version, reason: '권한·상한 판단 기준', setBy: 'OP', setAt: expect.any(String) as unknown as string, effect: effects[0]! };
+    expect(written.items.find((item) => item.id === 'MUST')?.must).toEqual(expected);
+    expect(Object.keys(written.items.find((item) => item.id === 'MUST')!.must!)).toEqual(['version', 'reason', 'setBy', 'setAt', 'effect']);
+
+    // 생산 읽기 경로(listChecklist)가 원장 events 에서 MUST 를 복원한다.
+    const snapshot = listChecklist(version);
+    expect(snapshot.items.find((item) => item.id === 'MUST')?.must).toEqual(expected);
+    // 기존 non-MUST 행: 직렬화·history 변화 0.
+    expect(JSON.stringify(snapshot.items.find((item) => item.id === 'PLAIN'))).toBe(plainBefore);
+    expect(Object.keys(snapshot.items.find((item) => item.id === 'PLAIN')!)).not.toContain('must');
+    expect(checklistHistory('PLAIN')).toEqual(plainHistoryBefore);
+
+    // history 왕복: 재조회해도 MUST 이력의 전체 값이 그대로다.
+    const entries = checklistHistory('MUST').filter((entry) => entry.field === 'must');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ by: 'OP', from: null, to: expected });
+    // 이력과 칸 두 읽기 경로가 같은 MUST 값을 낸다.
+    expect(entries[0]?.to).toEqual(snapshot.items.find((item) => item.id === 'MUST')?.must);
+
+    // 변경은 from(이전 전체 값) → to(새 전체 값)로 남고, 읽기는 마지막 값을 복원한다.
+    setMust(version, 'MUST', { version, reason: '권한·상한 판단 기준', effect: effects[1]! }, 'TC');
+    const changed = checklistHistory('MUST').filter((entry) => entry.field === 'must');
+    expect(changed).toHaveLength(2);
+    expect(changed[1]).toMatchObject({ by: 'TC', from: expected, to: { ...expected, setBy: 'TC', effect: effects[1]! } });
+    expect(listChecklist(version).items.find((item) => item.id === 'MUST')?.must).toEqual({ ...expected, setBy: 'TC', effect: effects[1]! });
+
+    // 빈 effect 는 거부하고 원장을 바꾸지 않는다.
+    const before = JSON.stringify(listChecklist(version));
+    for (const effect of ['', '   ', '\n\t']) {
+      expect(() => setMust(version, 'PLAIN', { version, reason: '이유', effect }, 'OP')).toThrow('MUST 효과가 비었다');
+    }
+    expect(() => setMust(version, 'ABSENT', { version, reason: '이유', effect: '효과' }, 'OP')).toThrow('없는 칸: ABSENT');
+    expect(() => setMust(version, 'PLAIN', { version, reason: '이유', effect: '효과' }, ' ')).toThrow('MUST 기록 주체가 비었다');
+    expect(JSON.stringify(listChecklist(version))).toBe(before);
+    expect(checklistHistory('MUST').filter((entry) => entry.field === 'must')).toEqual(changed);
   });
 
   test('cellsReferencingDoc derives one row per citing cell across versions, matches #section exactly, and never writes', () => {

@@ -448,6 +448,18 @@ function consumeRecord(
     return;
   }
   messages.push(message);
+  // A Pod sender asks for this exact record's acknowledgement before publishing
+  // it. Missing ack is safe: delivery has happened, but the sender must report
+  // read state as unobserved rather than infer it from file disappearance.
+  if (existsSync(`${recordPath}.ack-request`)) {
+    // Rename consumes the request atomically. If the sender already removed it,
+    // this cannot leave a late ack file after the sender's cleanup.
+    try { renameSync(`${recordPath}.ack-request`, `${recordPath}.ack`); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+        logger(opts)('control-inbox', 'memo-ack-failed', { spaceId, path: recordPath, reason: String(error) });
+    }
+  }
 }
 
 /** Inspect existing ready records without claiming, deleting, or creating any inbox entry. */
@@ -541,7 +553,43 @@ export function cleanupStaleControlInbox(spaceId: string, maxAgeMs: number, opts
       restoreClaim(claimPath, recordPath, spaceId, opts);
     }
   }
-  logger(opts)('control-inbox', 'cleanup', { spaceId, path, maxAgeMs, count });
+  // A sender killed without an EXIT trap can leave receipt markers behind.
+  // Its wait is capped at 60s; keep at least two minutes before sweeping only
+  // markers whose exact record no longer exists. Never infer a read from cleanup.
+  let markerCount = 0;
+  let tempCount = 0;
+  let markerNames: string[] = [];
+  try { markerNames = readdirSync(ready); } catch { /* absent ready directory */ }
+  const markerCutoff = Date.now() - Math.max(maxAgeMs, 120_000);
+  for (const name of markerNames) {
+    // Only the Pod publisher's mktemp shape; local enqueue has a different name.
+    if (/^\.write-[A-Za-z0-9]{8}$/.test(name)) {
+      const tempPath = join(ready, name);
+      try {
+        if (statSync(tempPath).mtimeMs > markerCutoff) continue;
+        rmSync(tempPath);
+        tempCount += 1;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+          logger(opts)('control-inbox', 'cleanup-temp-failed', { spaceId, path: tempPath, reason: String(error) });
+      }
+      continue;
+    }
+    const suffix = name.endsWith('.ack-request') ? '.ack-request' : name.endsWith('.ack') ? '.ack' : null;
+    if (!suffix) continue;
+    const recordName = name.slice(0, -suffix.length);
+    if (!isReadyRecord(recordName) || existsSync(join(ready, recordName))) continue;
+    const markerPath = join(ready, name);
+    try {
+      if (statSync(markerPath).mtimeMs > markerCutoff) continue;
+      rmSync(markerPath);
+      markerCount += 1;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+        logger(opts)('control-inbox', 'cleanup-marker-failed', { spaceId, path: markerPath, reason: String(error) });
+    }
+  }
+  logger(opts)('control-inbox', 'cleanup', { spaceId, path, maxAgeMs, count, markerCount, tempCount });
   return count;
 }
 

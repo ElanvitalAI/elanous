@@ -1,6 +1,6 @@
 import type { Key } from '../../tui.js';
 import { applyInlineEditorKey } from '../../input-core/inline-editor-key.js';
-import { createInlineEditorState, type InlineEditorState } from '../../input-core/inline-editor.js';
+import { createInlineEditorState, inlineEditorInsert, type InlineEditorState } from '../../input-core/inline-editor.js';
 import { safeLogText } from '../chat/log-view.js';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
@@ -137,6 +137,13 @@ export function applyComposerKey(state: InlineEditorState, key: Key): ComposerRe
     const submitted = state.text.trim();
     return submitted
       ? { state: emptyComposer(), action: 'submit', submitted }
+      : { state, action: 'none' };
+  }
+  // One bracketed-paste envelope (terminal paste · herdr `pane run`) is one key whose body rides on `paste`.
+  // Without this the shared text rule inserted the key NAME («paste») instead of the pasted text.
+  if (name === 'paste') {
+    return typeof key.paste === 'string' && key.paste.length > 0
+      ? { state: inlineEditorInsert(state, key.paste), action: 'edit' }
       : { state, action: 'none' };
   }
   const edited = applyInlineEditorKey(state, key, { shiftEnter: 'newline', tab: null });

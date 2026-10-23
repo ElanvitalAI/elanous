@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,6 +11,13 @@ import type { NexusShowResult } from '../cli/nexus-show.js';
 import { debug } from '../debug/log.js';
 
 const cli = resolve(import.meta.dir, '../../bin/elanous.mjs');
+
+// FIRST-RUN-EN-LOCALE / must-fix 3: 기존 한국어 단언은 제품의 ko 문면을 기록한다.
+// 러너 환경 locale 과 무관하게 워딩 결정 입력을 고정한다 — 전역 process.env 를 쓰지
+// 않고 runWebFirstSetup 의 deps.locale 로 주입한다(bun test 가 process.env 를 파일
+// 간 공유하므로 모듈 top-level env 설정은 다른 로케일 민감 테스트로 누수된다). 실물
+// CLI 를 띄우는 시험은 자식 env 에만 ELANOUS_LANG 을 고정한다. 아래 FIRST-RUN-EN-LOCALE
+// 회귀는 자식 환경에 ELANOUS_LANG 을 지우고 LANG 을 명시해 LANG 자체를 시험한다.
 
 test('real CLI first run waits for health before printing a claimable setup link', async () => {
   const dir = mkdtempSync(join(resolve(import.meta.dir, '../..'), '.web-first-cli-'));
@@ -120,7 +128,7 @@ test('real CLI setup --terminal selects the terminal wizard without a TTY or web
   try {
     const child = Bun.spawn([process.execPath, cli, `--test=${dir}`, 'setup', '--terminal'], {
       cwd: resolve(import.meta.dir, '../..'),
-      env: { ...process.env, ELANOUS_HOME: dir, HOME: dir, XDG_CONFIG_HOME: dir, ELANOUS_RUN_CONTEXT: 'production' },
+      env: { ...process.env, ELANOUS_LANG: 'ko', ELANOUS_HOME: dir, HOME: dir, XDG_CONFIG_HOME: dir, ELANOUS_RUN_CONTEXT: 'production' },
       stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
     });
     const timer = setTimeout(() => child.kill(), 30_000);
@@ -147,7 +155,7 @@ function fixture(overrides: Partial<WebFirstSetupDeps> = {}) {
   const lines: string[] = [];
   const qrLinks: string[] = [];
   const deps: WebFirstSetupDeps = {
-    config: { onboarding: { completed: false, version: 0, webFirst: true } }, isTty: true,
+    config: { onboarding: { completed: false, version: 0, webFirst: true } }, isTty: true, locale: 'ko',
     showNexus: async () => daemon(), probeHealth: async () => true,
     issueSetupLinkToken: async () => ({ token: 'secret+/=' }),
     renderQr: link => { qrLinks.push(link); return 'QR image'; },
@@ -199,6 +207,25 @@ test('bare first run checks running daemon health only once before offline fallb
   expect(await runWebFirstSetup(deps)).toBe('fallback');
   expect(probes).toBe(1);
   expect(lines).toEqual(['오프라인 모드']);
+});
+
+// must-fix 3 red witness: 한국어 fallback 문면은 전역 ELANOUS_LANG 없이 deps.locale
+// 만으로 결정되고, 호출은 공유 process.env 를 건드리지 않는다. deps.locale 을 지원하지
+// 않는 제품(base)은 ELANOUS_LANG 이 지워진 러너에서 영어 fallback 을 내 이 단언과
+// 어긋나 실패한다 — deps 주입 수정이 env 우연이 아닌 인과임을 증명한다.
+test('ko fallback wording comes from deps.locale and the shared process env stays untouched', async () => {
+  const saved = process.env.ELANOUS_LANG;
+  delete process.env.ELANOUS_LANG;
+  try {
+    const { deps, lines } = fixture({ startIfMissing: false,
+      showNexus: async () => ({ exitCode: 1, status: 'absent' } as NexusShowResult) });
+    expect(await runWebFirstSetup(deps)).toBe('fallback');
+    expect(lines).toEqual(['오프라인 모드']);
+    expect(process.env.ELANOUS_LANG).toBeUndefined();
+  } finally {
+    if (saved === undefined) delete process.env.ELANOUS_LANG;
+    else process.env.ELANOUS_LANG = saved;
+  }
 });
 
 test('daemon absent or registered but dead starts background and waits for health before issuing', async () => {
@@ -565,3 +592,50 @@ test('tailnet gets phone QR; browser opens loopback and failure does not cancel 
   expect(lines).toContain('QR image');
   expect(lines).toContain('같은 와이파이·tailnet 의 폰 카메라로 스캔하세요');
 });
+
+// FIRST-RUN-EN-LOCALE 완료 경계 실물: 격리 HOME/config 아래 실제 CLI 를 LANG 로 띄우면
+// 웹 셋업 fallback 문구가 기존 detectLocale 결정을 따른다. ELANOUS_LANG 을 자식
+// 환경에서 지워 LANG 자체가 실제로 시험되게 한다.
+const localeEnv = (home: string): NodeJS.ProcessEnv => {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, CODEX_HOME: join(home, '.codex'),
+    CLAUDE_CONFIG_DIR: join(home, '.claude'), XDG_CONFIG_HOME: '',
+    ELANOUS_LLM_PROVIDER: '', ELANOUS_ESCALATE_PROVIDER: '', LOCAL_LLM_URL: '' };
+  delete env.ELANOUS_LANG;
+  return env;
+};
+
+test('FIRST-RUN-EN-LOCALE: LANG=en_US.UTF-8 real CLI (no ELANOUS_LANG) prints English web-first offline', () => {
+  const dir = mkdtempSync(join(resolve(import.meta.dir, '../..'), '.web-first-en-'));
+  try {
+    const home = join(dir, 'home');
+    const configDir = join(dir, 'cfg');
+    mkdirSync(home);
+    mkdirSync(configDir);
+    const env = { ...localeEnv(home), LANG: 'en_US.UTF-8', LC_ALL: '', LC_MESSAGES: '' };
+    const child = spawnSync(process.execPath,
+      [cli, '--test', '--config-dir', configDir],
+      { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60_000 });
+    const text = child.stdout + child.stderr;
+    expect(child.error).toBeUndefined();
+    expect(text).toContain('offline mode');
+    expect(text).not.toContain('오프라인 모드');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 120_000);
+
+test('FIRST-RUN-EN-LOCALE: LANG=ko_KR.UTF-8 control keeps Korean web-first offline', () => {
+  const dir = mkdtempSync(join(resolve(import.meta.dir, '../..'), '.web-first-ko-'));
+  try {
+    const home = join(dir, 'home');
+    const configDir = join(dir, 'cfg');
+    mkdirSync(home);
+    mkdirSync(configDir);
+    const env = { ...localeEnv(home), LANG: 'ko_KR.UTF-8', LC_ALL: '', LC_MESSAGES: '' };
+    const child = spawnSync(process.execPath,
+      [cli, '--test', '--config-dir', configDir],
+      { cwd: resolve(import.meta.dir, '../..'), env, input: '', encoding: 'utf8', timeout: 60_000 });
+    const text = child.stdout + child.stderr;
+    expect(child.error).toBeUndefined();
+    expect(text).toContain('오프라인 모드');
+    expect(text).not.toContain('offline mode');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 120_000);

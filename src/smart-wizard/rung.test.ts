@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { classifyRung, type GraphValueSignal, type RungConditions, type WizardRung } from './rung.js';
 
 const base: RungConditions = {
@@ -56,6 +59,55 @@ test('invalid counts and unknown graph signals are rejected instead of silently 
     expect(() => decide({ handoffs: value })).toThrow(RangeError);
   }
   expect(() => decide({ graphSignals: ['unknown' as GraphValueSignal] })).toThrow(TypeError);
+});
+
+test('spawned smart wizard CLI records four same-run transitions and parks at approval', () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), 'smart-wizard-cli-'));
+  const stateRoot = join(tempRoot, 'state');
+  const fakeBin = join(tempRoot, 'bin');
+  const fakeLog = join(tempRoot, 'steps.log');
+  const fakeEln = join(fakeBin, 'eln');
+  const repoRoot = resolve(import.meta.dir, '../..');
+  try {
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(fakeEln, `#!/bin/sh
+case "$*" in
+  *"지시를 한 줄로"*) step=intake ;;
+  *"분류: 종류"*) step=classify ;;
+  *"저장소 근거"*) step=ground ;;
+  *"차이: refs"*) step=gap ;;
+  *) step=unknown ;;
+esac
+printf '%s\\n' "$step" >> "$WIZARD_FAKE_LOG"
+printf '{"outcome":"ok","step":"%s"}\\n' "$step"
+`);
+    chmodSync(fakeEln, 0o755);
+    const proc = Bun.spawnSync([
+      'bun', join(repoRoot, 'bin/elanous.mjs'), `--test=${stateRoot}`,
+      'graph', 'wizard-run', '저장소 근거를 한 줄로 확인해 줘.', '--json',
+    ], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, ELANOUS_STATE_DIR: stateRoot, WIZARD_FAKE_LOG: fakeLog,
+        PATH: `${fakeBin}:${process.env.PATH ?? ''}` },
+    });
+    const stdout = new TextDecoder().decode(proc.stdout);
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect(proc.exitCode, stderr).toBe(0);
+    const result = JSON.parse(stdout);
+    expect(result.status).toBe('awaiting-approval');
+    expect(result.path).toEqual(['intake', 'classify', 'ground', 'gap', 'approve']);
+    expect(result.transitions).toEqual([
+      { from: 'intake', to: 'classify', runId: result.runId },
+      { from: 'classify', to: 'ground', runId: result.runId },
+      { from: 'ground', to: 'gap', runId: result.runId },
+      { from: 'gap', to: 'approve', runId: result.runId },
+    ]);
+    expect(readFileSync(fakeLog, 'utf8').trim().split('\n')).toEqual(['intake', 'classify', 'ground', 'gap']);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
 
 // Each request is accompanied by established conditions; natural-language extraction is not part of this deterministic selector.

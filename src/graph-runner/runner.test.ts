@@ -857,8 +857,8 @@ second:
   } });
   expect(seen).toHaveLength(2);
   expect(seen[0]?.path).not.toBe(seen[1]?.path);
-  expect(seen[0]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', nodeId: 'first', input: { request: 'hello' }, outputs: {} });
-  expect(seen[1]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', nodeId: 'second', input: { request: 'hello' }, outputs: { first: 'first-output' } });
+  expect(seen[0]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, nodeId: 'first', input: { request: 'hello' }, outputs: {} });
+  expect(seen[1]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, nodeId: 'second', input: { request: 'hello' }, outputs: { first: 'first-output' } });
   expect(result.input).toEqual({ request: 'hello' });
   expect(result.nodes.slice(0, 2).map((node) => node.output)).toEqual(['first-output', 'second-output']);
   expect(JSON.parse(readFileSync(result.statePath, 'utf8')).input).toEqual({ request: 'hello' });
@@ -963,7 +963,7 @@ second:
   const result = await runGraph(graph, { input: ['payload'], deps: { root } });
   expect(result.status).toBe('done');
   expect(JSON.parse(result.nodes[1]?.output as string)).toEqual({
-    graphId: result.graphId, runId: result.runId, nodeId: 'second', input: ['payload'], outputs: { first: 'first-output' },
+    graphId: result.graphId, runId: result.runId, startedAt: result.startedAt, nodeId: 'second', input: ['payload'], outputs: { first: 'first-output' },
   });
 });
 
@@ -1341,7 +1341,7 @@ test('approval pauses without running b; undecided resume stays pending; decisio
 
 test('resume keeps persisted input and exposes pre-approval outputs to the next cmd', async () => {
   const { graph, root } = approvalFixture();
-  const contexts: Array<{ graphId: string; runId: string; nodeId: string; input: unknown; outputs: Record<string, unknown> }> = [];
+  const contexts: Array<{ graphId: string; runId: string; startedAt: string; nodeId: string; input: unknown; outputs: Record<string, unknown> }> = [];
   const deps = { root, runBash: async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     contexts.push(JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')));
     return { stdout: `output-${contexts.length}`, stderr: '', exitCode: 0 };
@@ -1353,8 +1353,8 @@ test('resume keeps persisted input and exposes pre-approval outputs to the next 
   const resumed = await runGraph(graph, { resumeRunId: first.runId, input: { original: false }, deps });
   expect(resumed.input).toEqual({ original: true });
   expect(contexts).toEqual([
-    { graphId: first.graphId, runId: first.runId, nodeId: 'a', input: { original: true }, outputs: {} },
-    { graphId: first.graphId, runId: first.runId, nodeId: 'b', input: { original: true }, outputs: { a: 'output-1', gate: expect.objectContaining({ outcome: 'approved', decidedBy: 'reviewer' }) } },
+    { graphId: first.graphId, runId: first.runId, startedAt: first.startedAt!, nodeId: 'a', input: { original: true }, outputs: {} },
+    { graphId: first.graphId, runId: first.runId, startedAt: first.startedAt!, nodeId: 'b', input: { original: true }, outputs: { a: 'output-1', gate: expect.objectContaining({ outcome: 'approved', decidedBy: 'reviewer' }) } },
   ]);
   expect(JSON.parse(readFileSync(resumed.statePath, 'utf8')).input).toEqual({ original: true });
 });

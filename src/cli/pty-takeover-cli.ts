@@ -16,7 +16,7 @@ import { formatPtyWebAddress, ptyWebAddress, type PtyWebAddress } from './pty-we
 import { getHarnessRunId, normalizeRunIdSource, type RunIdSource } from '../harness/harness-space.js';
 import { inspectControlInbox, type ControlInboxSnapshot } from '../harness/control-inbox.js';
 import { requestRemotePtyControl, type PtyControlAction, type PtyControlPayload, type PtyControlRequestOptions, type PtyControlResult } from '../pty-shell/pty-control-ipc.js';
-import { resolvePtySpecialKey } from '../pty-shell/pty-special-keys.js';
+import { resolvePtySpecialKey, type PtyKeyEncoding } from '../pty-shell/pty-special-keys.js';
 import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from '../pty-shell/pty-mouse.js';
 import { resizePtyWithOutcome, writePtyWithOutcome, writePtyWithOutcomeDetail } from '../pty-shell/pty-write-outcome.js';
 import type { PtyControlTarget, PtyHandle } from '../pty-shell/registry.js';
@@ -2217,9 +2217,9 @@ export async function runPtyTextWhenIdle(ref: string, text: string, appendEnter:
   const typed = await runPtyText(ref, text, appendEnter, deps, actor);
   return { ...typed, message: `${waited.message}\n${typed.message}` };
 }
-export function runPtyKey(ref: string, key: string, repeat = 1, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human'): Promise<PtyTakeoverCommandResult> {
+export function runPtyKey(ref: string, key: string, repeat = 1, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human', encoding: PtyKeyEncoding = 'xterm'): Promise<PtyTakeoverCommandResult> {
   if (!Number.isInteger(repeat) || repeat < 1) return Promise.resolve({ exitCode: 1, message: 'pty key: repeat must be a positive integer' });
-  try { const normalized = key.trim().toLowerCase(); return inject(ref, 'input-key', resolvePtySpecialKey(normalized).repeat(repeat), { key: normalized, repeat }, deps, actor); } catch (error) { return Promise.resolve({ exitCode: 1, message: `pty key: ${(error as Error).message}` }); }
+  try { const normalized = key.trim().toLowerCase(); return inject(ref, 'input-key', resolvePtySpecialKey(normalized, { encoding }).repeat(repeat), { key: normalized, repeat, encoding }, deps, actor); } catch (error) { return Promise.resolve({ exitCode: 1, message: `pty key: ${(error as Error).message}` }); }
 }
 export async function runPtyMouse(ref: string, input: PtyMouseInput, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human'): Promise<PtyTakeoverCommandResult> {
   let chars: string;
@@ -2369,14 +2369,15 @@ export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverC
           : runPtyText(id, text, Boolean(opts.enter), deps, actor))
         : runPtyRemoteControl('text', id, remote, { action: 'input-text', chars: text + (opts.enter === true ? '\r' : '') }, deps));
     }));
-  pty.command('key <ref> <key>').option('-n, --repeat <count>', 'repetitions', '1').option('-r', 'inject a key on the default remote bookmark (does not take a value)').option('--remote <name>', 'inject a key on a named remote bookmark').option(...ACTOR_FLAG)
-    .description("Inject a named special key (enter/esc/tab/up/… · see 'pty list' for <ref>)").action((id: string, key: string, opts: { repeat: string; actor?: string; r?: boolean; remote?: string }) => run(() => {
+  pty.command('key <ref> <key>').option('-n, --repeat <count>', 'repetitions', '1').option('--kitty', 'send modifier combos (shift+enter …) as kitty CSI-u instead of xterm modifyOtherKeys').option('-r', 'inject a key on the default remote bookmark (does not take a value)').option('--remote <name>', 'inject a key on a named remote bookmark').option(...ACTOR_FLAG)
+    .description("Inject a named special key (enter/esc/tab/up/… · shift+enter / alt+enter / ctrl+enter combos · see 'pty list' for <ref>)").action((id: string, key: string, opts: { repeat: string; actor?: string; r?: boolean; remote?: string; kitty?: boolean }) => run(() => {
       const remote = opts.remote ?? (opts.r === true ? true : undefined);
+      const encoding: PtyKeyEncoding = opts.kitty === true ? 'kitty' : 'xterm';
       return withActor(opts, (actor) => {
-        if (remote === undefined) return runPtyKey(id, key, Number(opts.repeat), deps, actor);
+        if (remote === undefined) return runPtyKey(id, key, Number(opts.repeat), deps, actor, encoding);
         const repeat = Number(opts.repeat);
         if (!Number.isInteger(repeat) || repeat < 1) return Promise.resolve({ exitCode: 1, message: 'pty key: repeat must be a positive integer' });
-        try { return runPtyRemoteControl('key', id, remote, { action: 'input-key', chars: resolvePtySpecialKey(key.trim().toLowerCase()).repeat(repeat) }, deps); }
+        try { return runPtyRemoteControl('key', id, remote, { action: 'input-key', chars: resolvePtySpecialKey(key.trim().toLowerCase(), { encoding }).repeat(repeat) }, deps); }
         catch (error) { return Promise.resolve({ exitCode: 1, message: `pty key: ${(error as Error).message}` }); }
       });
     }));

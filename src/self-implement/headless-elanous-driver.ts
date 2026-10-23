@@ -72,6 +72,12 @@ import { setEventLoopActivity } from '../debug/event-loop-watchdog.js';
 import { resolveEscalateTarget, resolveExplicitChildEscalateTarget } from './rework-policy.js';
 import { tailWithOmissionMarker } from './off-diff-evidence.js';
 import type { EscalateTier } from './rework-policy.js';
+
+const VERIFIED_PR_SUPERVISOR_INPUT = 'PR source already verified. Implement the requested repair in this worktree now.';
+
+function supervisorInputForSource(input: string, verifiedPrSource: boolean | undefined): string {
+  return verifiedPrSource ? VERIFIED_PR_SUPERVISOR_INPUT : input;
+}
 import { readRunLifecycleFromStateDir } from '../signal/lifecycle-bridge.js';
 import { lifecycleRootReportEnv, lifecycleRootReportPath, readLifecycleRootReport, removeLifecycleRootReport } from '../signal/lifecycle-root-report.js';
 import { compareLifecycleToScreen, type LifecycleScreenComparison } from './lifecycle-screen-scoreboard.js';
@@ -967,6 +973,8 @@ export interface HeadlessGoalLoopPtyOptions {
   sendOutbound?: typeof sendOutbound;
   /** Queues an argv child supervisor input for the orchestrator's next-round prompt; never writes stdin. */
   onSupervisorInput?: (text: string, updateDelivery: (delivery: SupervisorDeliveryState, reason?: string) => void) => void;
+  /** The Pod has already checked out its pinned PR source. Supervisor input must not relaunch it. */
+  verifiedPrSource?: boolean;
   /** ★ 턴 abort 신호(#21) — /cancel 이 이 신호를 abort 하면 호스팅 PTY 를 즉시 kill + 폴 루프 조기 종료
    *  (고아 자식 프로세스 방지). 미주입 시 종전대로 exit/GOAL-COMPLETE/타임아웃까지 폴. */
   signal?: AbortSignal;
@@ -1720,7 +1728,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                   // pipeline with a synthetic wait, whose evidence is honestly `action-wait`; calling
                   // the brain would violate the no-consultation boundary, while weakening brainCalls
                   // would hide that boundary instead of preserving it.
-                  const decision: ControlDecision = blockedWrite
+                  const suggestedDecision: ControlDecision = blockedWrite
                     ? { action: 'wait' }
                     : await Promise.race([
                     Promise.resolve(opts.brain.decide(controlObs, controller.signal)),
@@ -1735,6 +1743,13 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                     }),
                     ...(parentAbort ? [parentAbort] : []),
                   ]);
+                  // The supervisor suggestion is untrusted text. In a PR-source Pod the
+                  // source was verified before this process started, so any proposed
+                  // input is reduced to an implementation instruction before it can
+                  // reach either the child queue or the parent progress surface.
+                  const decision: ControlDecision = opts.verifiedPrSource && suggestedDecision.action === 'input'
+                    ? { action: 'input', text: supervisorInputForSource(suggestedDecision.text, opts.verifiedPrSource) }
+                    : suggestedDecision;
                   const actionDetail = decision.action === 'input'
                     ? decision.text.slice(0, 120)
                     : decision.action === 'done' || decision.action === 'no-progress' ? decision.reason.slice(0, 120) : '';
@@ -2015,11 +2030,12 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
       });
       if (artifactDecision.kind === 'escalate-terminal-success') {
         reachedCompletion = false;
+        const restartPacket = supervisorInputForSource(artifactDecision.restartPacket, opts.verifiedPrSource);
         debug.log('self-implement', 'headless.output-artifact-intervention', {
           ptyId, runId, kind: artifactDecision.kind, missing: artifactDecision.missing,
-          diagnostic: artifactDecision.diagnostic, restartPacket: artifactDecision.restartPacket,
+          diagnostic: artifactDecision.diagnostic, restartPacket,
         }, { level: 'warn' });
-        opts.onSupervisorInput?.(artifactDecision.restartPacket, () => {});
+        opts.onSupervisorInput?.(restartPacket, () => {});
       }
     }
     if (exitReason === 'loop-exhausted-without-completion' && reachedCompletion) {

@@ -119,11 +119,121 @@ export function countSessionBackgroundFanout(session: object): number {
   return backgroundFanoutSlots.get(session) ?? 0;
 }
 
-/** Release one of this session's fan-out slots (floors at zero). */
+/** Release one of this session's fan-out slots (floors at zero) and hand the
+ *  freed slot to the next waiting launch (see `admitNextBackgroundAdmission`). */
 function releaseBackgroundFanoutSlot(session: object): void {
   const live = backgroundFanoutSlots.get(session);
   if (live === undefined || live <= 1) backgroundFanoutSlots.delete(session);
   else backgroundFanoutSlots.set(session, live - 1);
+  admitNextBackgroundAdmission(session);
+}
+
+/** Admission class for a waiting background launch. A launch that names a
+ *  concrete agent definition is a SUBAGENT spawn (the parent asked for a
+ *  specific worker); the default general-purpose fan-out is a GENERAL worker.
+ *  Subagent spawns enter the shared queue first because they carry the
+ *  parent's explicit delegation intent — a general worker can be re-issued
+ *  in the foreground at no cost, a named subagent cannot. */
+export type BackgroundAdmissionPriority = 'subagent' | 'general';
+
+/** A launch waiting for a fan-out slot. `seq` is the process-wide arrival
+ *  ordinal; equal-priority entries are admitted oldest-first (FIFO). */
+export interface BackgroundAdmissionEntry {
+  priority: BackgroundAdmissionPriority;
+  seq: number;
+}
+
+/** Pick the index of the next entry to admit from a waiting queue: subagent
+ *  entries before general ones, oldest (`seq`) first inside a class.
+ *  Returns -1 for an empty queue. Pure — the queue order itself never has to
+ *  be pre-sorted. */
+export function selectNextAdmissionIndex(
+  entries: readonly BackgroundAdmissionEntry[],
+): number {
+  let oldestSubagent = -1;
+  let oldestAny = -1;
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (oldestAny === -1 || entry.seq < entries[oldestAny]!.seq) oldestAny = i;
+    if (
+      entry.priority === 'subagent'
+      && (oldestSubagent === -1 || entry.seq < entries[oldestSubagent]!.seq)
+    ) {
+      oldestSubagent = i;
+    }
+  }
+  return oldestSubagent >= 0 ? oldestSubagent : oldestAny;
+}
+
+/** Classify a dispatch for admission priority (see BackgroundAdmissionPriority). */
+export function classifyBackgroundAdmissionPriority(
+  requestedType: string,
+): BackgroundAdmissionPriority {
+  return requestedType === 'general-purpose' ? 'general' : 'subagent';
+}
+
+interface QueuedBackgroundAdmission extends BackgroundAdmissionEntry {
+  admit: () => void;
+  abandon: () => void;
+}
+
+/** The SHARED waiting queue, per session (same scope as the slot ledger, so
+ *  a busy session's waiters cannot head-of-line block another session).
+ *  Entries live only while the fan-out ceiling is full and their launch
+ *  opted in with `wait_for_slot`; every other launch keeps the immediate
+ *  `background-fanout-limit` refusal. */
+const backgroundAdmissionQueues = new WeakMap<object, QueuedBackgroundAdmission[]>();
+let backgroundAdmissionSeq = 0;
+
+/** Park this launch on the session's shared queue and resolve `true` when it
+ *  is admitted — the admitting release has ALREADY reserved the slot for it,
+ *  so no dispatch can slip in between the handoff and the spawn. Resolves
+ *  `false` when the caller's abort signal fires while it waits. */
+function waitForBackgroundFanoutSlot(
+  session: object,
+  priority: BackgroundAdmissionPriority,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const entry: QueuedBackgroundAdmission = {
+      priority,
+      seq: backgroundAdmissionSeq++,
+      admit: () => finish(true),
+      abandon: () => finish(false),
+    };
+    // Always mutate the CURRENT queue (never a snapshot): entries settle out of
+    // order under priority admission, and writing back a stale array would
+    // resurrect an entry that was already admitted or abandoned.
+    function finish(admitted: boolean): void {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', onAbort);
+      const rest = (backgroundAdmissionQueues.get(session) ?? []).filter(e => e !== entry);
+      if (rest.length > 0) backgroundAdmissionQueues.set(session, rest);
+      else backgroundAdmissionQueues.delete(session);
+      resolve(admitted);
+    }
+    const onAbort = (): void => { entry.abandon(); };
+    const queue = backgroundAdmissionQueues.get(session) ?? [];
+    queue.push(entry);
+    backgroundAdmissionQueues.set(session, queue);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/** Admit exactly one waiter for a slot that just opened, reserving the slot
+ *  in this same synchronous block as the release. Selection is delegated to
+ *  the pure `selectNextAdmissionIndex` (subagent first, FIFO inside a class). */
+function admitNextBackgroundAdmission(session: object): void {
+  const queue = backgroundAdmissionQueues.get(session);
+  if (!queue || queue.length === 0) return;
+  const index = selectNextAdmissionIndex(queue);
+  if (index < 0) return;
+  const entry = queue[index]!;
+  backgroundFanoutSlots.set(session, countSessionBackgroundFanout(session) + 1);
+  entry.admit();
 }
 
 /** Fallback agent when subagent_type is missing or unresolvable. The
@@ -161,6 +271,12 @@ export interface AgentToolArgs {
    *  child keeps running; completion emits a task-notification
    *  (P2) which the parent sees in the next turn's user message. */
   run_in_background?: boolean;
+  /** When true, a background launch that hits the fan-out ceiling WAITS on
+   *  the session's shared admission queue instead of being refused: it spawns
+   *  as soon as a live background agent terminals (subagent waits are
+   *  admitted before general-purpose ones, FIFO inside each class). Omitted
+   *  or false keeps the immediate `background-fanout-limit` refusal. */
+  wait_for_slot?: boolean;
   /** UI label for this spawn — shown on agent-roster so siblings
    *  sharing a definition are distinguishable. Takes precedence
    *  over `description` as task.label. */
@@ -230,6 +346,10 @@ export function buildAgentTool(): LLMToolSpec {
       '  • You want to fan out N independent workers in parallel — call Agent N times in the same turn; each runs independently.\n' +
       '  • A SKILL.md instructs you to "spawn N expert agents" / "use the Agent tool" — that is exactly this tool.\n' +
       '\n' +
+      'Delegate heavy multistep work that would overflow your context, fan out independent units in parallel, ' +
+      'and hand off long investigations; use run_in_background for long-running work so you can keep coordinating ' +
+      'and finish after the results arrive.\n' +
+      '\n' +
       'The sub-agent gets its own tools (Bash/Read/Edit/Grep/WebFetch by default) and its own ' +
       'turn budget (default 20). It returns ONE final message which becomes your tool_result. ' +
       'Pass everything the worker needs (data, persona, framing) inside `prompt` — the worker ' +
@@ -257,6 +377,10 @@ export function buildAgentTool(): LLMToolSpec {
           type: 'boolean',
           description: 'When true, returns the spawn handle immediately instead of waiting for completion. The child keeps running; its final message arrives in your next turn as a <task-notification> user message. Use for long-running explorations (multi-minute research, 10+ tool calls) so you can keep working in parallel.',
         },
+        wait_for_slot: {
+          type: 'boolean',
+          description: 'Only meaningful with run_in_background. When the per-session background fan-out ceiling is already full, this launch waits on the shared admission queue instead of being refused, and spawns as soon as one live background agent finishes. Waiting subagent spawns (ones that name a subagent_type) are admitted before general-purpose ones; launches with the same class keep arrival order. Omit it to get the immediate "NOT SPAWNED" refusal and re-issue later.',
+        },
         name: {
           type: 'string',
           description: 'Optional UI label for this spawn (shown in agent-roster / logs). Useful when fanning out N workers with the same subagent_type — give each a distinct name so the roster can tell them apart.',
@@ -277,12 +401,12 @@ export function buildAgentTool(): LLMToolSpec {
         },
         tool_filter: {
           type: 'object',
-          description: 'Optional per-spawn tool registry isolation (Gemini pattern). Omit this field to inherit the parent\'s full available tool registry. Use it only to narrow a child to a focused subset (for example, read-only deep research or a single-purpose worker): it composes with the agent definition\'s allowlist and cannot widen access. Over-narrowing can leave the child unable to complete its task; retain every tool the delegated work needs.',
+          description: 'Optional per-spawn tool filter. The sub-agent inherits the parent\'s full tool registry by default; usually omit this field. Only `deny` is applied (hide specific tools). `allow` is ignored unless the user explicitly enabled narrowing, so do not try to restrict the child with it.',
           properties: {
             allow: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Whitelist of tool names the sub-agent may call. Empty array = pure text (no tools). Omitted = no allow constraint.',
+              description: 'Ignored by default (the child keeps every tool). Applied only when the user explicitly enabled narrowing; then unknown names are ignored with a warning and a filter that would leave 0 tools is refused (NOT SPAWNED).',
             },
             deny: {
               type: 'array',
@@ -383,6 +507,7 @@ export async function dispatchAgent(
 
   // PFC-S1 P1: new optional fields.
   const runInBackground = args.run_in_background === true;
+  const waitsForSlot = args.wait_for_slot === true;
   const spawnName = typeof args.name === 'string' && args.name.trim() ? args.name.trim() : undefined;
   const teamName = typeof args.team_name === 'string' && args.team_name.trim() ? args.team_name.trim() : undefined;
   const isolation = args.isolation === 'worktree' || args.isolation === 'cwd'
@@ -498,41 +623,82 @@ export async function dispatchAgent(
   // slot re-opens the moment any background agent finishes, which is what
   // lets the next launch through again.
   let fanoutSession: object | undefined;
+  // Set when the shared admission queue handed this dispatch its slot while it
+  // waited (see `admitNextBackgroundAdmission`) — the reservation block below
+  // must then not take a second one.
+  let fanoutSlotReserved = false;
   if (runInBackground) {
     // Per-session scope: slots count against THIS session's cache
     // identity (shared fallback bucket for cache-less callers), so a
     // busy OTHER session cannot starve this one's first launch.
     fanoutSession = opts.sessionCache ?? UNSCOPED_BACKGROUND_FANOUT_SESSION;
-    const liveBackground = countSessionBackgroundFanout(fanoutSession);
-    if (liveBackground >= AGENT_TOOL_BACKGROUND_FANOUT_CEILING) {
-      debug.log('agent.spawn', 'background-fanout-limit', {
+    if (countSessionBackgroundFanout(fanoutSession) >= AGENT_TOOL_BACKGROUND_FANOUT_CEILING) {
+      // Not spawned: no registry task, no provider call, no cache entry.
+      // taskId is a sentinel (like 'dedup' above) so a caller can tell a
+      // refusal from a real spawn without parsing the prose. The live count
+      // is re-read here so an abandoned wait reports the current number.
+      const refuseForCeiling = (): AgentToolResult => {
+        const liveBackground = countSessionBackgroundFanout(fanoutSession!);
+        debug.log('agent.spawn', 'background-fanout-limit', {
+          cid: debugCorrelationId,
+          requestedType,
+          description: description.slice(0, 80),
+          liveBackground,
+          ceiling: AGENT_TOOL_BACKGROUND_FANOUT_CEILING,
+        }, { level: 'warn' });
+        return {
+          output:
+            `NOT SPAWNED — ${liveBackground} background agents are already live and the ` +
+            `fan-out ceiling is ${AGENT_TOOL_BACKGROUND_FANOUT_CEILING}. A slot reopens as ` +
+            `soon as one of them reaches a terminal state (done/error/aborted); its result ` +
+            `then arrives as a task-notification. Either wait for one to finish, fold this ` +
+            `work into an existing background spawn, or re-issue it without ` +
+            `run_in_background so it runs in the foreground.`,
+          agent: requestedType,
+          cid: debugCorrelationId,
+          durationMs: 0,
+          maxTurns: requestedMaxTurns,
+          taskId: 'background-fanout-limit',
+        };
+      };
+
+      // Shared waiting queue — opt-in only. Launches that did not pass
+      // `wait_for_slot` keep the immediate refusal above, byte for byte.
+      if (!waitsForSlot) return refuseForCeiling();
+
+      const admissionPriority = classifyBackgroundAdmissionPriority(requestedType);
+      debug.log('agent.spawn', 'background-queue-wait', {
         cid: debugCorrelationId,
         requestedType,
         description: description.slice(0, 80),
-        liveBackground,
+        priority: admissionPriority,
+        liveBackground: countSessionBackgroundFanout(fanoutSession),
         ceiling: AGENT_TOOL_BACKGROUND_FANOUT_CEILING,
       }, { level: 'warn' });
-      // Not spawned: no registry task, no provider call, no cache entry.
-      // taskId is a sentinel (like 'dedup' above) so a caller can tell a
-      // refusal from a real spawn without parsing the prose.
-      return {
-        output:
-          `NOT SPAWNED — ${liveBackground} background agents are already live and the ` +
-          `fan-out ceiling is ${AGENT_TOOL_BACKGROUND_FANOUT_CEILING}. A slot reopens as ` +
-          `soon as one of them reaches a terminal state (done/error/aborted); its result ` +
-          `then arrives as a task-notification. Either wait for one to finish, fold this ` +
-          `work into an existing background spawn, or re-issue it without ` +
-          `run_in_background so it runs in the foreground.`,
-        agent: requestedType,
+      const admitted = await waitForBackgroundFanoutSlot(fanoutSession, admissionPriority, opts.signal);
+      if (!admitted) {
+        debug.log('agent.spawn', 'background-queue-abandoned', {
+          cid: debugCorrelationId,
+          requestedType,
+          description: description.slice(0, 80),
+          priority: admissionPriority,
+          reason: 'aborted-while-waiting',
+        }, { level: 'warn' });
+        return refuseForCeiling();
+      }
+      // The admitting release already reserved this dispatch's slot.
+      fanoutSlotReserved = true;
+      debug.log('agent.spawn', 'background-queue-admit', {
         cid: debugCorrelationId,
-        durationMs: 0,
-        maxTurns: requestedMaxTurns,
-        taskId: 'background-fanout-limit',
-      };
+        requestedType,
+        description: description.slice(0, 80),
+        priority: admissionPriority,
+        liveBackground: countSessionBackgroundFanout(fanoutSession),
+      });
     }
   }
 
-  if (fanoutSession !== undefined) {
+  if (fanoutSession !== undefined && !fanoutSlotReserved) {
     // Atomic reservation: taken in the SAME synchronous block as the
     // ceiling check above, before any await — concurrent dispatches
     // cannot all pass the check and push this session past the ceiling
@@ -716,32 +882,44 @@ export async function dispatchAgent(
   // Strip the Agent tool itself from the sub-agent's available tools.
   // One level of nesting only — see file header rationale.
   childTools = stripAgentToolForOneLevelNesting(childTools);
-  // Wave 5 E1 — apply per-spawn tool_filter. Narrows the intersection
-  // further (cannot widen the host's allowlist). When `allow` is
-  // explicit-empty `[]`, the worker runs text-only.
-  const toolFilter = (args.tool_filter && typeof args.tool_filter === 'object' && !Array.isArray(args.tool_filter))
-    ? args.tool_filter as { allow?: unknown; deny?: unknown }
-    : undefined;
-  if (toolFilter) {
-    const availableToolCount = childTools.length;
-    const allowList = Array.isArray(toolFilter.allow)
-      ? new Set((toolFilter.allow as unknown[]).filter((n): n is string => typeof n === 'string'))
-      : null;
-    const denyList = Array.isArray(toolFilter.deny)
-      ? new Set((toolFilter.deny as unknown[]).filter((n): n is string => typeof n === 'string'))
-      : null;
-    childTools = childTools.filter((t) => {
-      if (denyList && denyList.has(t.name)) return false;
-      if (allowList && !allowList.has(t.name)) return false;
-      return true;
-    });
+  // Wave 5 E1 — apply per-spawn tool_filter (SUBAGENT-TOOLS-EMPTY · 0.2.36 · 대표 «서브에이전트에 제약이 생기지 않게»).
+  //   기본 = 메인과 같은 도구 전부(필터 없음). allow 는 «좁히기»일 때만 — 모르는 이름은 무시하고 경고,
+  //   아는 이름이 하나도 없으면 allow 전체를 무시(이름 불일치로 49→0 이 되던 10-22 실물). 결과가 0개면
+  //   발사하지 않는다(조용히 빈손 금지 — «0 tools · Blocked» 로 끝나 «✓ done» 처럼 보이던 것).
+  //   SUBAGENT-NO-NARROWING(0.2.36 · 대표 22:5x «서브에이전트에 제약 없게») — 모델이 넘긴 allow 는 기본 «무시», deny 만 반영.
+  //   (10-22 n8n 실물: 49 → 9 로 좁혀진 자식 둘이 1분 만에 «완료 못함».) 좁히기는 사람이 명시할 때만 — ELANOUS_SUBAGENT_HONOR_ALLOW=1
+  //   또는 agent 정의(.md)의 tools 목록(위에서 이미 반영).
+  const filtered = applySpawnToolFilter(childTools, args.tool_filter, { honorAllow: subagentHonorsModelAllow() });
+  childTools = filtered.tools;
+  if (filtered.applied || filtered.unknownAllow.length > 0 || filtered.unknownDeny.length > 0) {
     debug.log('agent.spawn', 'tool-filter', {
-      allowSize: allowList?.size,
-      denySize: denyList?.size,
-      available: availableToolCount,
+      cid: debugCorrelationId,
+      allowSize: filtered.allowSize,
+      denySize: filtered.denySize,
+      available: filtered.available,
       remaining: childTools.length,
-      removed: availableToolCount - childTools.length,
-    });
+      removed: filtered.available - childTools.length,
+      ...(filtered.unknownAllow.length ? { unknownAllow: filtered.unknownAllow.slice(0, 20) } : {}),
+      ...(filtered.unknownDeny.length ? { unknownDeny: filtered.unknownDeny.slice(0, 20) } : {}),
+      ...(filtered.allowIgnored ? { allowIgnored: filtered.allowIgnored } : {}),
+    }, filtered.unknownAllow.length || filtered.unknownDeny.length || filtered.allowIgnored ? { level: 'warn' } : undefined);
+  }
+  if (childTools.length === 0 && filtered.available > 0) {
+    debug.log('agent.spawn', 'no-tools-refused', {
+      cid: debugCorrelationId, requestedType, description: description.slice(0, 80),
+      available: filtered.available, denySize: filtered.denySize,
+    }, { level: 'warn' });
+    return {
+      output:
+        `NOT SPAWNED — the tool_filter would leave this sub-agent with 0 of ${filtered.available} tools, ` +
+        `so it could not read files or run commands. Omit tool_filter to inherit the parent's full tool set, ` +
+        `or narrow with real tool names (for example: ${childToolNamesSample(filtered.availableNames)}).`,
+      agent: requestedType,
+      cid: debugCorrelationId,
+      durationMs: 0,
+      maxTurns: requestedMaxTurns,
+      taskId: 'no-tools-refused',
+    };
   }
 
   const hasNoTools = childTools.length === 0;
@@ -1034,3 +1212,67 @@ export async function dispatchAgent(
     releaseReservedFanoutSlot();
   }
 }
+
+// ── SUBAGENT-TOOLS-EMPTY: per-spawn tool filter (pure) ──────────────────────────────────────
+
+export interface SpawnToolFilterResult<T extends { name: string }> {
+  tools: T[];
+  available: number;
+  availableNames: string[];
+  applied: boolean;
+  allowSize?: number;
+  denySize?: number;
+  unknownAllow: string[];
+  unknownDeny: string[];
+  /** allow 를 통째로 무시했다 — 이유(빈 배열 · 아는 이름 없음 · 모델이 넘긴 allow 는 기본 무시). */
+  allowIgnored?: 'empty' | 'no-known-names' | 'model-allow-ignored';
+}
+
+/** 모델이 넘긴 tool_filter.allow 로 좁히는가 — 사람이 명시할 때만(기본 false). */
+export function subagentHonorsModelAllow(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|on)$/i.test((env.ELANOUS_SUBAGENT_HONOR_ALLOW ?? '').trim());
+}
+
+/** 기본 = 전부 상속 · deny = 아는 이름 빼기 · allow 는 `honorAllow` 일 때만 아는 이름으로 좁히기(없으면 무시). 넓히지는 못한다. */
+export function applySpawnToolFilter<T extends { name: string }>(
+  tools: readonly T[],
+  rawFilter: unknown,
+  opts: { honorAllow?: boolean } = {},
+): SpawnToolFilterResult<T> {
+  const available = tools.length;
+  const availableNames = tools.map((t) => t.name);
+  const known = new Set(availableNames);
+  const filter = rawFilter && typeof rawFilter === 'object' && !Array.isArray(rawFilter)
+    ? rawFilter as { allow?: unknown; deny?: unknown }
+    : undefined;
+  if (!filter) return { tools: [...tools], available, availableNames, applied: false, unknownAllow: [], unknownDeny: [] };
+  const names = (v: unknown): string[] | null => (Array.isArray(v) ? v.filter((n): n is string => typeof n === 'string' && n.trim() !== '') : null);
+  const allowRaw = names(filter.allow);
+  const denyRaw = names(filter.deny);
+  const unknownAllow = (allowRaw ?? []).filter((n) => !known.has(n));
+  const unknownDeny = (denyRaw ?? []).filter((n) => !known.has(n));
+  const allowKnown = (allowRaw ?? []).filter((n) => known.has(n));
+  let allowIgnored: SpawnToolFilterResult<T>['allowIgnored'];
+  let allow: Set<string> | null = null;
+  if (allowRaw) {
+    if (allowRaw.length === 0) allowIgnored = 'empty';
+    else if (!opts.honorAllow) allowIgnored = 'model-allow-ignored';
+    else if (allowKnown.length === 0) allowIgnored = 'no-known-names';
+    else allow = new Set(allowKnown);
+  }
+  const deny = new Set((denyRaw ?? []).filter((n) => known.has(n)));
+  const kept = tools.filter((t) => !deny.has(t.name) && (!allow || allow.has(t.name)));
+  return {
+    tools: kept, available, availableNames, applied: true,
+    ...(allowRaw ? { allowSize: allowRaw.length } : {}),
+    ...(denyRaw ? { denySize: denyRaw.length } : {}),
+    unknownAllow, unknownDeny,
+    ...(allowIgnored ? { allowIgnored } : {}),
+  };
+}
+
+function childToolNamesSample(names: readonly string[]): string {
+  const preferred = ['Read', 'Grep', 'Glob', 'RunShell', 'Write', 'Edit'].filter((n) => names.includes(n));
+  return (preferred.length ? preferred : names.slice(0, 6)).join(', ');
+}
+

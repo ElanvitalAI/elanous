@@ -2,10 +2,11 @@ import { expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { debug } from '../debug/log.js';
+import { recordRunExit } from '../harness/harness-incidents.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { addItem, checklistDevVersion } from '../release-loop/checklist.js';
 import { appendRunLedgerEntry, loadRunLedger, type RunLedgerEntry } from '../self-implement/run-ledger.js';
@@ -17,11 +18,31 @@ import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-
 import { rejudgeCandidates } from '../task-agent/rejudge-on-head.js';
 import { reviewResultPath } from '../task-agent/review-result-capture.js';
 import { repairReviewDigest } from '../task-agent/repair-review.js';
+import { remoteLedgerMirrorDir } from '../task-agent/parent-host.js';
 import { adoptExistingPr, adoptedRunTerminal } from '../task-agent/adopt-pr.js';
 import { cardsBoard, type BoardNode } from '../task-agent/board.js';
-import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
+import { resetUserConfig } from '../user-config.js';
+import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TaskDoctorReport, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
 
 const token = 'secret-acp-token-sentinel';
+test('tasks repair-outcomes reads repair-result in the card ledger, not rejudge decisions', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-repair-outcomes-'));
+  try {
+    const statePath = join(dir, 'cards.json');
+    const card: TaskCard = { id: 'ta-repair-1', text: 'fix', createdAt: '2026-10-20T00:00:00Z', status: 'launched',
+      history: [
+        { at: '2026-10-21T13:10:00Z', event: 'rejudge-on-head', effect: 'repair-applied' },
+        { at: '2026-10-21T13:11:00Z', event: 'repair-result', pr: 30001, head: 'a'.repeat(40), runId: 'repair-run-1', effect: 'applied' },
+      ] };
+    writeTaskCards(statePath, [card]);
+    const result = await run(['tasks', 'repair-outcomes', '--since', '2026-10-21T13:00:00Z', '--until', '2026-10-21T14:00:00Z', '--json'], { taskStatePath: statePath });
+    expect(result.code ?? 0).toBe(0);
+    expect(JSON.parse(result.lines[0]!)).toEqual({ applied: 1, failed: 0, unconfirmed: 0, results: 1, cards: 1, missingRunId: 0, unknownEffect: 0 });
+    const invalid = await run(['tasks', 'repair-outcomes', '--since', '2026-10-21T14:00:00Z', '--until', '2026-10-21T13:00:00Z'], { taskStatePath: statePath });
+    expect(invalid.code).toBe(1);
+    expect(invalid.lines[0]).toContain('순서가 맞는 ISO');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 const withDoneBoundary = (text: string): string => `${text}\n완료 경계 코드: src/cli/tasks-cli.ts 의 카드 발사\n완료 경계 실물: 지정한 체크리스트 칸이 한 번 발사된다\n완료 경계 증거 명령: bun test src/cli/tasks-cli.test.ts`;
 test('tasks rejudge --all launches at most three new repairs and leaves two for the next tick', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ta-repair-tick-cap-'));
@@ -291,6 +312,8 @@ async function run(args: string[], deps: TasksCliDeps, readRealGoalLedgers = fal
   const program = new Command().name('elanous').exitOverride();
   registerTasksCommands(program, {
     ...(args.includes('cover') && !readRealGoalLedgers ? { coverGoalAsks: () => [], coverGoalRuns: () => [] } : {}),
+    handOpenPrRun: () => ({ status: 0, stdout: '[]' }),
+    handOriginRepo: () => 'ElanvitalAI/elanous',
     ...deps, output: (line) => lines.push(line),
   });
   const previous = process.exitCode;
@@ -797,7 +820,7 @@ test('tasks cover default reader marks a bounded authoring ledger unreadable', a
     expect(body.limitReached).toBe(true);
     expect(body.sevenVerbs.verbs[4]).toMatchObject({ liveDone: null, state: 'unreadable' });
   } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
-});
+}, 30000); // 10만 행 goal_ask 삽입이 pod 부하에 따라 5s 기본 상한을 넘는다.
 
 test('tasks cover --by-card reads the injected card ledger inside the window; without the flag it never calls coverCards', async () => {
   const logs = (query: { exactCategories?: string[]; events?: string[] }) => {
@@ -925,6 +948,76 @@ test('task hand --checklist uses the unchanged cell title when text is omitted a
   expect(launcherCalls).toHaveLength(2);
 });
 
+test('tasks hand reuses one OPEN PR for its release cell and fails closed on an incomplete or ambiguous census', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-hand-open-pr-'));
+  const version = checklistDevVersion();
+  const cell = 'LAUNCH-SKIP-OPEN-PR';
+  const title = withDoneBoundary('대상 경로: src/cli/tasks-cli.ts\n기존 PR 수확');
+  const statePath = join(dir, 'cards.json');
+  let launched = 0;
+  const censusArgs: string[][] = [];
+  const row = (number: number) => ({ number, body: `칸: ${cell}` });
+  const base: TasksCliDeps = {
+    taskStatePath: statePath, registerSink: async () => true,
+    releaseBoard: () => [{ id: 'project', level: 'project', title: 'Project', status: 'open', children: [
+      { id: cell, level: 'task', title, status: 'open' },
+    ] }],
+    adoptChecklist: (foundVersion) => ({ version: foundVersion, released: '', dev: '', items: [{ id: cell, title, status: 'yellow', updatedAt: '', updatedBy: '' }], history: [] }),
+    adoptPrView: () => ({ number: 30262, url: 'https://github.com/ElanvitalAI/elanous/pull/30262', state: 'OPEN', baseRefName: 'main', headRefOid: 'a'.repeat(40) }),
+    taskLauncher: () => { launched++; },
+    handOriginRepo: () => 'ElanvitalAI/elanous',
+  };
+  try {
+    for (const result of [
+      { status: 1, stdout: '' },
+      { status: 0, stdout: JSON.stringify([row(30262), row(30263)]) },
+      { status: 0, stdout: JSON.stringify(Array.from({ length: 500 }, (_, n) => row(n + 1))) },
+    ]) {
+      const denied = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live', '--json'],
+        { ...base, handOpenPrRun: (_command, args) => { censusArgs.push(args); return result; } });
+      expect(denied.code).toBe(1);
+      expect(denied.lines.join('\n')).toContain('구현 발사 0');
+      expect(existsSync(statePath)).toBe(false);
+      expect(launched).toBe(0);
+    }
+    const wrongNumber = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live'], {
+      ...base, handOpenPrRun: () => ({ status: 0, stdout: JSON.stringify([row(30262)]) }),
+      adoptPrView: () => ({ number: 30263, url: 'https://github.com/ElanvitalAI/elanous/pull/30263', state: 'OPEN', baseRefName: 'main', headRefOid: 'a'.repeat(40) }),
+    });
+    expect(wrongNumber.code).toBe(1);
+    expect(wrongNumber.lines.join('\n')).toContain('조회 PR 번호가 다르다');
+    expect(existsSync(statePath)).toBe(false);
+    const doneCell = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live'], {
+      ...base, handOpenPrRun: () => ({ status: 0, stdout: JSON.stringify([row(30262)]) }),
+      adoptChecklist: (foundVersion) => ({ version: foundVersion, released: '', dev: '', items: [{ id: cell, title, status: 'green', updatedAt: '', updatedBy: '' }], history: [] }),
+    });
+    expect(doneCell.code).toBe(1);
+    expect(doneCell.lines.join('\n')).toContain('입양할 미완 칸 없음');
+    expect(existsSync(statePath)).toBe(false);
+    expect(launched).toBe(0);
+    const adopted = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live', '--json'],
+      { ...base, handOpenPrRun: (_command, args) => { censusArgs.push(args); return { status: 0, stdout: JSON.stringify([row(30262)]) }; } });
+    expect(adopted.code ?? 0).toBe(0);
+    const response = JSON.parse(adopted.lines[0]!);
+    expect(response).toMatchObject({ pr: 30262, head: 'a'.repeat(40), launched: false });
+    expect(readTaskCard(response.card, statePath)?.pr).toEqual({ number: 30262, url: 'https://github.com/ElanvitalAI/elanous/pull/30262' });
+    expect(censusArgs.every((args) => args.includes('--repo') && args[args.indexOf('--repo') + 1] === 'ElanvitalAI/elanous')).toBe(true);
+    expect(launched).toBe(0);
+    const alreadyBound = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live', '--json'],
+      { ...base, handOpenPrRun: () => ({ status: 0, stdout: JSON.stringify([row(30262)]) }) });
+    expect(alreadyBound.code ?? 0).toBe(0);
+    expect(JSON.parse(alreadyBound.lines[0]!)).toMatchObject({ card: response.card, pr: 30262, launched: false });
+    expect(launched).toBe(0);
+    const noMatch = await run(['tasks', 'hand', '--checklist', cell, '--version', version, '--live', '--json'], {
+      ...base, taskStatePath: join(dir, 'empty-match-cards.json'),
+      handOpenPrRun: () => ({ status: 0, stdout: '[]' }),
+    });
+    expect(noMatch.code ?? 0).toBe(0);
+    expect(JSON.parse(noMatch.lines[0]!).launched).toBe(true);
+    expect(launched).toBe(1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('task hand --checklist reads the current release cell through the default board', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-default-checklist-'));
   const title = withDoneBoundary('대상 경로: src/real.ts\n현재 판 칸 원문');
@@ -960,7 +1053,7 @@ test('task hand default board finds an unreleased later version from the isolate
     expect(JSON.parse(result.lines[0]!).card.text).toBe(title);
     expect(launches).toHaveLength(1);
   } finally { resetElanousConfigDir(); }
-});
+}, 30000); // checklist 원장 조회가 pod 부하에 따라 5s 기본 상한을 넘는다.
 
 test('task hand finds a later open release cell, prefers the nearest duplicate, and allows --version to pin it', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tasks-cli-any-version-'));
@@ -1220,7 +1313,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['work-order', 'green-sweep', 'cover', 'outcomes', 'list', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['work-order', 'green-sweep', 'cover', 'repair-outcomes', 'outcomes', 'doctor', 'list', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
   expect(command?.commands.find((entry) => entry.name() === 'work-order')?.commands.map((entry) => entry.name())).toEqual(['build']);
 });
 
@@ -1573,7 +1666,10 @@ test('tasks rejudge --all applies configured card age limit while explicit card 
   const url = 'https://github.com/o/r/pull/30';
   setElanousConfigDir(root);
   try {
-    writeFileSync(join(root, 'config.json'), JSON.stringify({ taskAgent: { rejudgeMaxAgeHours: 96 } }));
+    const configPath = join(root, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ taskAgent: { rejudgeMaxAgeHours: 96 } }));
+    resetUserConfig();
+    const firstMtimeMs = statSync(configPath).mtimeMs;
     writeTaskCards(taskStatePath, [{ id, text: 'old card', createdAt: new Date(Date.now() - 80 * 3_600_000).toISOString(),
       status: 'launched', pr: { number: 30, url }, reviewRequests: [{ pr: 30, head, at: new Date().toISOString() }], history: [] }]);
     const deps: TasksCliDeps = { taskStatePath, registerSink: async () => true, rejudge: { liveMoves: new Set(),
@@ -1581,12 +1677,16 @@ test('tasks rejudge --all applies configured card age limit while explicit card 
         prHead: async () => ({ head, state: 'OPEN', url }) } } };
     const configured = await run(['tasks', 'rejudge', '--all', '--json'], deps);
     expect(JSON.parse(configured.lines[0]!)?.[0]?.decision).toBe('head-unchanged');
-    writeFileSync(join(root, 'config.json'), JSON.stringify({ taskAgent: { rejudgeMaxAgeHours: 72 } }));
+    writeFileSync(configPath, JSON.stringify({ taskAgent: { rejudgeMaxAgeHours: 72 } }));
+    // 재작성이 첫 쓰기와 같은 mtime 으로 떨어져도(getUserConfig 는 mtime 으로만 캐시를 무효화한다)
+    // 새 나이 제한이 읽혀야 한다는 계약을 고정 시각으로 재현하고, 캐시를 떨궈 결정적으로 만든다.
+    utimesSync(configPath, firstMtimeMs / 1000, firstMtimeMs / 1000);
+    resetUserConfig();
     const capped = await run(['tasks', 'rejudge', '--all', '--json'], deps);
     expect(JSON.parse(capped.lines[0]!)).toEqual([]);
     const explicit = await run(['tasks', 'rejudge', id, '--json'], deps);
     expect(JSON.parse(explicit.lines[0]!)?.[0]?.decision).toBe('head-unchanged');
-  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+  } finally { resetElanousConfigDir(); resetUserConfig(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('tasks rejudge --all requests at most one review across remote cards in one tick', async () => {
@@ -1773,8 +1873,9 @@ test('TA-CARD-OUTCOMES-CLI — tasks outcomes --since 24h --json 은 카드·PR 
     appendRunLedgerEntry({ runId: 'run-out-a', event: 'pod-child-run', data: { childRunId: 'run-out-a-child' } }, ledgerDir);
     appendRunLedgerEntry({ runId: 'run-out-a-child', event: 'pr-opened', data: { number: 123, url } }, ledgerDir);
     appendRunLedgerEntry({ runId: 'run-out-a-child', event: 'run-status', data: { runStatus: 'completed' } }, ledgerDir);
-    appendRunLedgerEntry({ runId: 'run-out-b', event: 'pod-child-run', data: { childRunId: 'run-out-b-child' } }, ledgerDir);
-    appendRunLedgerEntry({ runId: 'run-out-b-child', event: 'child-error', data: { error: 'runs stopped: same-cell 가드 — 카드 ta-other 가 CELL-SAME 을 이미 잡고 있다' } }, ledgerDir);
+    const remoteLedgerDir = remoteLedgerMirrorDir(dir, 'node-b');
+    appendRunLedgerEntry({ runId: 'run-out-b', event: 'pod-child-run', data: { childRunId: 'run-out-b-child' } }, remoteLedgerDir);
+    appendRunLedgerEntry({ runId: 'run-out-b-child', event: 'child-error', data: { error: 'runs stopped: same-cell 가드 — 카드 ta-other 가 CELL-SAME 을 이미 잡고 있다' } }, remoteLedgerDir);
     appendRunLedgerEntry({ runId: 'run-out-c', event: 'pod-child-run', data: { childRunId: 'run-out-c-child' } }, ledgerDir);
     appendRunLedgerEntry({ runId: 'run-out-c-child', event: 'pr-open-failed', data: { error: 'no-progress: 구현 자식이 세 번 연속 같은 파일만 고쳤다' } }, ledgerDir);
     appendRunLedgerEntry({ runId: 'run-out-d', event: 'pod-child-run', data: { childRunId: 'run-out-d-child' } }, ledgerDir);
@@ -1783,29 +1884,29 @@ test('TA-CARD-OUTCOMES-CLI — tasks outcomes --since 24h --json 은 카드·PR 
     const result = await run(['tasks', 'outcomes', '--since', '24h', '--json'], { taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now });
     expect(result.code ?? 0).toBe(0);
     const body = JSON.parse(result.lines[0]!);
-    expect(body.rows).toEqual([
-      { cell: 'CELL-SAME', card: 'ta-out-samecell', runId: 'run-out-b', childRunId: null, host: 'node-b',
+    expect(body.rows).toMatchObject([
+      { cell: 'CELL-SAME', card: 'ta-out-samecell', runId: 'run-out-b', childRunId: 'run-out-b-child', host: 'node-b',
         endedAt: ago(1), cardStatus: 'failed', pr: null,
-        reason: null, reasonFrom: null },
-      { cell: 'CELL-NP', card: 'ta-out-noprogress', runId: 'run-out-c', childRunId: null, host: null,
+        reason: 'runs stopped: same-cell 가드 — 카드 ta-other 가 CELL-SAME 을 이미 잡고 있다', reasonFrom: 'child-ledger:child-error' },
+      { cell: 'CELL-NP', card: 'ta-out-noprogress', runId: 'run-out-c', childRunId: 'run-out-c-child', host: null,
         endedAt: ago(1.5), cardStatus: 'failed', pr: null,
-        reason: null, reasonFrom: null },
-      { cell: 'CELL-PR', card: 'ta-out-pr', runId: 'run-out-a', childRunId: null, host: null,
+        reason: 'no-progress: 구현 자식이 세 번 연속 같은 파일만 고쳤다', reasonFrom: 'child-ledger:pr-open-failed' },
+      { cell: 'CELL-PR', card: 'ta-out-pr', runId: 'run-out-a', childRunId: 'run-out-a-child', host: null,
         endedAt: ago(2), cardStatus: 'launched', pr: { number: 123, state: 'MERGED' },
         reason: null, reasonFrom: null },
-      { cell: 'CELL-REC', card: 'ta-out-recovered', runId: 'run-out-d', childRunId: null, host: null,
+      { cell: 'CELL-REC', card: 'ta-out-recovered', runId: 'run-out-d', childRunId: 'run-out-d-child', host: null,
         endedAt: ago(2.5), cardStatus: 'launched', pr: { number: 456, state: 'MERGED' }, reason: null, reasonFrom: null },
     ]);
-    expect(body.aggregate).toEqual({ cards: 4, missingReason: 4, reasons: [] });
+    expect(body.aggregate).toMatchObject({ cards: 4, cardTerminals: 2, prTerminals: 2, failedCardTerminals: 2, missingReason: 0 });
     expect(body.since).toBe(ago(24));
     expect(body.until).toBe(new Date(now).toISOString());
     expect(body.limitReached).toBe(false);
     expect(body.stopReason).toBeNull();
-    expect(body.childLedgerObserved).toBe(false);
-    expect(body.reasonObserved).toBe(false);
+    expect(body.childLedgerObserved).toBe(true);
+    expect(body.reasonObserved).toBe(true);
     expect(body.undatedCards).toBe(3);
     expect(body.openCards).toBe(0);
-    // board가 아는 카드 원문은 확인하되 이 부분 CLI는 재결속 검증 전까지 사유를 투영하지 않는다.
+    // board 는 원시 카드 이력을, outcomes 는 검증된 자식 런 결속의 오류 꼬리를 각각 읽는다.
     const flat = (nodes: BoardNode[]): BoardNode[] => nodes.flatMap((node) => [node, ...flat(node.children ?? [])]);
     const board = flat(cardsBoard(statePath, { ledger: true }));
     const merged = board.find((node) => node.id === 'ta-out-pr');
@@ -1835,7 +1936,7 @@ test('tasks outcomes 은 «원문 없음» 수를 세고, 페이지 상한에서
     const full = JSON.parse((await run(['tasks', 'outcomes', '--since', '2026-10-21T00:00:00Z', '--json'], deps)).lines[0]!);
     expect(full.rows.map((row: { card: string }) => row.card)).toEqual(['ta-out-quiet-a', 'ta-out-quiet-b']);
     expect(full.rows.every((row: { reason: string | null }) => row.reason === null)).toBe(true);
-    expect(full.aggregate).toEqual({ cards: 2, missingReason: 2, reasons: [] });
+    expect(full.aggregate).toMatchObject({ cards: 2, cardTerminals: 2, prTerminals: 0, missingReason: 2, reasons: [] });
     expect(full.openCards).toBe(1);
     expect(full.undatedCards).toBe(0);
     const bounded = JSON.parse((await run(['tasks', 'outcomes', '--since', '2026-10-21T00:00:00Z', '--json'], { ...deps, outcomesLimit: 1 })).lines[0]!);
@@ -1843,7 +1944,7 @@ test('tasks outcomes 은 «원문 없음» 수를 세고, 페이지 상한에서
     expect(bounded.limitReached).toBe(true);
     expect(bounded.stopReason).toBe('page-limit');
     expect(bounded.warning).toContain('상한 1');
-    expect(bounded.aggregate).toEqual({ cards: 1, missingReason: 1, reasons: [] });
+    expect(bounded.aggregate).toMatchObject({ cards: 1, cardTerminals: 1, prTerminals: 0, missingReason: 1, reasons: [] });
     expect(bounded.childLedgerObserved).toBe(false);
     const inverted = await run(['tasks', 'outcomes', '--since', '2026-10-21T00:00:00Z', '--until', '2026-10-20T00:00:00Z'], deps);
     expect(inverted.code).toBe(1);
@@ -1890,13 +1991,299 @@ test('TA-CARD-OUTCOMES-LIVE — 실물 CLI 프로세스가 --test 우주의 세 
       ['ta-live-merged', ago(1), null],
       ['ta-live-noprogress', ago(2), null],
     ]);
-    expect(report.aggregate).toEqual({ cards: 3, missingReason: 3, reasons: [] });
+    expect(report.aggregate).toMatchObject({ cards: 3, cardTerminals: 2, prTerminals: 1, failedCardTerminals: 2, missingReason: 2, reasons: [] });
     expect(report.childLedgerObserved).toBe(false);
     expect(report.reasonObserved).toBe(false);
     expect(report.undatedCards).toBe(0);
     expect(report.stopReason).toBeNull();
   } finally { rmSync(universe, { recursive: true, force: true }); }
 }, 30_000);
+
+test('PROVE-DRAFT-PR-FAIL-1052: 증거 명령: bun test src/cli/tasks-clitestts', async () => {
+  // 완료 경계 실물 — 격리 --test 우주에 PR 성공·same-cell 거부·no-progress 세 카드 ⊕ 자식 원장을 심고
+  // 실물 CLI 프로세스가 세 행(칸·카드 id·runId·자식 runId·호스트·종료 시각·PR 결속·종결 사유 원문)과
+  // 종결 사유별 집계·«원문 없음» 수를 정확히 내는지 재다.
+  const universe = mkdtempSync(join(tmpdir(), 'ta-outcomes-reason-live-universe-'));
+  try {
+    const statePath = join(universe, 'task-agent-actions.json');
+    const now = Date.now();
+    const ago = (hours: number) => new Date(now - hours * 3_600_000).toISOString();
+    const url = (n: number) => `https://github.com/ElanvitalAI/elanous/pull/${n}`;
+    writeTaskCards(statePath, [
+      // PR 성공 — 자식 원장에 종결 오류 꼬리가 없다: 종결 사유 원문 없음.
+      { id: 'ta-reason-pr', text: 'PR 성공', seat: 'TC', checklistId: 'CELL-REASON-PR', status: 'launched',
+        runId: 'run-reason-pr', runChildId: 'run-reason-pr-child', createdAt: ago(30),
+        pr: { number: 511, url: url(511) },
+        prTerminal: { pr: 511, url: url(511), head: 'a'.repeat(40), state: 'MERGED', at: ago(1) },
+        history: [{ at: ago(1), event: 'postland', detail: 'MERGED #511 · 칸 green' }] },
+      // same-cell 거부 — 자식 원장 child-error 꼬리가 이 행의 종결 사유 원문이다.
+      { id: 'ta-reason-samecell', text: 'same-cell 거부', seat: 'TC', checklistId: 'CELL-REASON-SAME', status: 'failed',
+        runId: 'run-reason-same', runChildId: 'run-reason-same-child', parentHost: { host: 'node-b' }, createdAt: ago(30),
+        history: [{ at: ago(30), event: 'run-bound', runId: 'run-reason-same' }, { at: ago(2), event: 'failed' }] },
+      // no-progress — 자식 원장 pr-open-failed 꼬리가 이 행의 종결 사유 원문이다.
+      { id: 'ta-reason-noprogress', text: 'no-progress', seat: 'TC', checklistId: 'CELL-REASON-NP', status: 'failed',
+        runId: 'run-reason-np', runChildId: 'run-reason-np-child', createdAt: ago(30),
+        history: [{ at: ago(3), event: 'run-bound', runId: 'run-reason-np' }, { at: ago(1.5), event: 'failed' }] },
+    ]);
+    const ledgerDir = join(universe, 'run-ledger');
+    appendRunLedgerEntry({ runId: 'run-reason-pr', event: 'pod-child-run', data: { childRunId: 'run-reason-pr-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-reason-pr-child', event: 'pr-opened', data: { number: 511, url: url(511) } }, ledgerDir);
+    const remoteLedgerDir = remoteLedgerMirrorDir(universe, 'node-b');
+    appendRunLedgerEntry({ runId: 'run-reason-same', event: 'pod-child-run', data: { childRunId: 'run-reason-same-child' } }, remoteLedgerDir);
+    appendRunLedgerEntry({ runId: 'run-reason-same-child', event: 'child-error',
+      data: { error: 'runs stopped: same-cell 가드 — 카드 ta-other 가 CELL-REASON-SAME 을 이미 잡고 있다' } }, remoteLedgerDir);
+    appendRunLedgerEntry({ runId: 'run-reason-np', event: 'pod-child-run', data: { childRunId: 'run-reason-np-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-reason-np-child', event: 'pr-open-failed',
+      data: { error: 'no-progress: 구현 자식이 세 번 연속 같은 파일만 고쳤다' } }, ledgerDir);
+    const env = { ...process.env } as Record<string, string | undefined>;
+    delete env.ELANOUS_CONFIG_DIR;
+    delete env.ELANOUS_STATE_DIR;
+    const proc = Bun.spawn([process.execPath, ELANOUS_CLI_ENTRY, `--test=${universe}`, 'tasks', 'outcomes', '--since', '24h', '--json'], {
+      cwd: universe, stdout: 'pipe', stderr: 'pipe', env,
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    expect(code, stderr).toBe(0);
+    const report = JSON.parse(stdout.trim());
+    expect(report.rows).toMatchObject([
+      { cell: 'CELL-REASON-PR', card: 'ta-reason-pr', runId: 'run-reason-pr', childRunId: 'run-reason-pr-child',
+        host: null, endedAt: ago(1), cardStatus: 'launched', pr: { number: 511, state: 'MERGED' },
+        reason: null, reasonFrom: null },
+      { cell: 'CELL-REASON-NP', card: 'ta-reason-noprogress', runId: 'run-reason-np', childRunId: 'run-reason-np-child',
+        host: null, endedAt: ago(1.5), cardStatus: 'failed', pr: null,
+        reason: 'no-progress: 구현 자식이 세 번 연속 같은 파일만 고쳤다', reasonFrom: 'child-ledger:pr-open-failed' },
+      { cell: 'CELL-REASON-SAME', card: 'ta-reason-samecell', runId: 'run-reason-same', childRunId: 'run-reason-same-child',
+        host: 'node-b', endedAt: ago(2), cardStatus: 'failed', pr: null,
+        reason: 'runs stopped: same-cell 가드 — 카드 ta-other 가 CELL-REASON-SAME 을 이미 잡고 있다', reasonFrom: 'child-ledger:child-error' },
+    ]);
+    expect(report.aggregate).toMatchObject({ cards: 3, cardTerminals: 2, prTerminals: 1, failedCardTerminals: 2, missingReason: 0,
+      reasons: [
+        { reason: 'no-progress: 구현 자식이 세 번 연속 같은 파일만 고쳤다', count: 1 },
+        { reason: 'runs stopped: same-cell 가드 — 카드 ta-other 가 CELL-REASON-SAME 을 이미 잡고 있다', count: 1 },
+      ] });
+    expect(report.childLedgerObserved).toBe(true);
+    expect(report.reasonObserved).toBe(true);
+    expect(report.undatedCards).toBe(0);
+    expect(report.openCards).toBe(0);
+    expect(report.stopReason).toBeNull();
+  } finally { rmSync(universe, { recursive: true, force: true }); }
+}, 30_000);
+
+test('RUN-DOCTOR-RELAUNCH-PREFLIGHT L1 — 환경 실패 세 카드의 diff·hold가 relaunch/harvest/human을 가른다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-doctor-l1-'));
+  try {
+    const statePath = join(dir, 'task-agent-actions.json');
+    const traffic = join(dir, 'traffic.json');
+    writeFileSync(traffic, JSON.stringify({ hold: [] }));
+    const cards: TaskCard[] = [1, 2, 3].map((n) => ({
+      id: `ta-doctor-${n}`, text: '환경 실패', checklistId: `CELL-DOCTOR-${n}`, checklistVersion: '0.2.35',
+      status: 'failed', runId: `run-doctor-${n}`, runChildId: `run-child-${n}`,
+      createdAt: '2026-10-21T00:00:00Z', pr: { number: 900 + n, url: `https://github.com/o/r/pull/${900 + n}` },
+      history: [{ at: '2026-10-21T01:00:00Z', event: 'failed', runId: `run-doctor-${n}` }],
+    }));
+    writeTaskCards(statePath, cards);
+    const deps: TasksCliDeps = {
+      taskStatePath: statePath, doctorVersion: () => '0.2.35',
+      doctorChecklist: (version) => ({ version, released: '', dev: '', history: [],
+        items: cards.map((card) => ({ id: card.checklistId!, title: 'doctor fixture', status: 'yellow', updatedAt: '', updatedBy: '' })) }),
+      doctorRun: (_command, args) => {
+        if (args[1] === 'list') return { status: 0, stdout: '[]' };
+        const number = Number(args[2]);
+        const files = number === 902 ? [{ path: 'src/code.ts', additions: 1, deletions: 0 }] : [];
+        return { status: 0, stdout: JSON.stringify({ number, state: 'OPEN', isDraft: true, headRefOid: 'a'.repeat(40),
+          changedFiles: files.length, files }) };
+      },
+      doctorLedger: (id) => [{ runId: id, event: 'stop', data: { terminationReason: 'worktree add timeout after 30s' } }],
+    };
+    const relaunch = JSON.parse((await run(['tasks', 'doctor', 'run-doctor-1', '--traffic', traffic, '--json'], deps)).lines[0]!) as TaskDoctorReport;
+    const harvest = JSON.parse((await run(['tasks', 'doctor', 'ta-doctor-2', '--traffic', traffic, '--json'], deps)).lines[0]!) as TaskDoctorReport;
+    const human = JSON.parse((await run(['tasks', 'doctor', 'ta-doctor-3', '--traffic', join(dir, 'missing.json'), '--json'], deps)).lines[0]!) as TaskDoctorReport;
+    expect([relaunch.nextAction, harvest.nextAction, human.nextAction]).toEqual(['relaunch', 'harvest', 'human']);
+    expect(Object.values(relaunch.conditions).map((part) => part.value)).toEqual([true, true, true, true]);
+    expect(harvest.conditions.noPreservedImplementation).toMatchObject({ value: false, source: 'gh:pr-902:files' });
+    deps.doctorRun = (_command, args) => args[1] === 'list' ? { status: 0, stdout: '[]' }
+      : { status: 0, stdout: JSON.stringify({ number: Number(args[2]), state: 'OPEN', isDraft: true,
+        headRefOid: 'a'.repeat(40), changedFiles: 1,
+        files: [{ path: 'docs/tools/rebuild.ts', additions: 1, deletions: 0 }] }) };
+    const docsCode = JSON.parse((await run(['tasks', 'doctor', 'ta-doctor-1', '--traffic', traffic, '--json'], deps)).lines[0]!) as TaskDoctorReport;
+    expect(docsCode.conditions.noPreservedImplementation.value).toBe(false);
+    expect(docsCode.nextAction).toBe('harvest');
+    expect(human.unknownSources).toContain(`currentYellowUnheldNoOtherPr:checklist:0.2.35:CELL-DOCTOR-3 + traffic:${join(dir, 'missing.json')} + gh:open-pr-list:cell-marker`);
+    expect(relaunch).toMatchObject({ card: 'ta-doctor-1', cell: 'CELL-DOCTOR-1', childRunId: 'run-child-1',
+      terminalReason: 'worktree add timeout after 30s', pr: { number: 901, draft: true, changedFiles: 0 } });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('RUN-DOCTOR-RELAUNCH-PREFLIGHT L0 — --test CLI가 세 카드 fixture를 한 줄 JSON씩 판정한다', async () => {
+  const universe = mkdtempSync(join(tmpdir(), 'tasks-doctor-live-'));
+  try {
+    setElanousConfigDir(universe);
+    for (let n = 1; n <= 3; n++) addItem(checklistDevVersion(), { id: `CELL-DOCTOR-LIVE-${n}`, title: `doctor fixture ${n}`, owner: 'TC' });
+    resetElanousConfigDir();
+    const statePath = join(universe, 'task-agent-actions.json');
+    writeTaskCards(statePath, [1, 2, 3].map((n): TaskCard => ({
+      id: `ta-doctor-live-${n}`, text: 'doctor fixture', checklistId: `CELL-DOCTOR-LIVE-${n}`,
+      checklistVersion: checklistDevVersion(), createdAt: '2026-10-21T00:00:00Z', status: 'failed',
+      runId: `run-doctor-live-${n}`, runChildId: `run-doctor-live-child-${n}`,
+      pr: { number: 910 + n, url: `https://github.com/o/r/pull/${910 + n}` },
+      history: [{ at: '2026-10-21T01:00:00Z', event: 'failed', runId: `run-doctor-live-${n}` }],
+    })));
+    for (let n = 1; n <= 3; n++) {
+      appendRunLedgerEntry({ runId: `run-doctor-live-child-${n}`, event: 'stop',
+        data: { terminationReason: 'worktree add timeout after 30s' } }, join(universe, 'run-ledger'));
+      appendRunLedgerEntry({ runId: `run-doctor-live-${n}`, event: 'stop',
+        data: { childEvidence: {} } }, join(universe, 'run-ledger'));
+    }
+    const traffic = join(universe, 'traffic.json');
+    writeFileSync(traffic, JSON.stringify({ hold: [] }));
+    const fakeBin = join(universe, 'bin');
+    mkdirSync(fakeBin);
+    const fakeGh = join(fakeBin, 'gh');
+    writeFileSync(fakeGh, [
+      '#!/bin/sh',
+      'if [ "$2" = list ]; then printf "[]\\n"; exit 0; fi',
+      'case "$3" in',
+      '  912) printf \'{"number":912,"state":"OPEN","isDraft":true,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","changedFiles":1,"files":[{"path":"src/doctor.ts","additions":1,"deletions":0}]}\\n\' ;;',
+      '  911|913) printf \'{"number":%s,"state":"OPEN","isDraft":true,"headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","changedFiles":0,"files":[]}\\n\' "$3" ;;',
+      '  *) exit 1 ;;',
+      'esac',
+    ].join('\n'));
+    chmodSync(fakeGh, 0o755);
+    const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` } as Record<string, string | undefined>;
+    delete env.ELANOUS_CONFIG_DIR;
+    delete env.ELANOUS_STATE_DIR;
+    const decisions: string[] = [];
+    for (let n = 1; n <= 3; n++) {
+      const args = [process.execPath, ELANOUS_CLI_ENTRY, `--test=${universe}`, 'tasks', 'doctor', `ta-doctor-live-${n}`,
+        '--traffic', n === 3 ? join(universe, 'unreadable.json') : traffic, '--json'];
+      const child = Bun.spawn(args, { cwd: universe, env, stdout: 'pipe', stderr: 'pipe' });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      expect(code, stderr).toBe(0);
+      const lines = stdout.trim().split(/\r?\n/);
+      expect(lines).toHaveLength(1);
+      decisions.push((JSON.parse(lines[0]!) as TaskDoctorReport).nextAction);
+    }
+    expect(decisions).toEqual(['relaunch', 'harvest', 'human']);
+  } finally { resetElanousConfigDir(); rmSync(universe, { recursive: true, force: true }); }
+}, 30_000);
+
+test('RUN-DOCTOR-RELAUNCH-PREFLIGHT — 카드 문면만으로 환경 원인을 추정하지 않고, 같은 칸 두 실패는 reauthor', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-doctor-fence-'));
+  try {
+    const statePath = join(dir, 'cards.json');
+    const traffic = join(dir, 'traffic.json');
+    writeFileSync(traffic, JSON.stringify({ hold: [] }));
+    const card = (id: string, pr: number): TaskCard => ({ id, text: 'failed', checklistId: 'CELL-FENCE',
+      createdAt: '2026-10-21T00:00:00Z', status: 'failed', runId: `run-${id}`, runChildId: `child-${id}`,
+      pr: { number: pr, url: `https://github.com/o/r/pull/${pr}` },
+      history: [{ at: '2026-10-21T01:00:00Z', event: 'failed', runId: `run-${id}`, detail: 'worktree add timeout' }] });
+    writeTaskCards(statePath, [card('ta-fence-a', 921)]);
+    const deps: TasksCliDeps = { taskStatePath: statePath, doctorVersion: () => '0.2.35',
+      doctorChecklist: (version) => ({ version, released: '', dev: '', history: [],
+        items: [{ id: 'CELL-FENCE', title: 'doctor fixture', status: 'yellow', updatedAt: '', updatedBy: '' }] }),
+      doctorRun: (_command, args) => args[1] === 'list' ? { status: 0, stdout: '[]' }
+        : { status: 0, stdout: JSON.stringify({ number: Number(args[2]), state: 'OPEN', isDraft: true,
+          headRefOid: 'a'.repeat(40), changedFiles: 0, files: [] }) },
+      doctorLedger: () => null };
+    const missing = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(missing.terminalReason).toBe('worktree add timeout');
+    expect(missing.conditions.environmentFailure.value).toBe('unknown');
+    expect(missing.nextAction).toBe('human');
+    deps.doctorLedger = (id) => id === 'child-ta-fence-a'
+      ? [{ runId: id, event: 'stop', data: { terminationReason: 'worktree add timeout' } }] : null;
+    const noParent = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(noParent.conditions.environmentFailure).toMatchObject({ value: 'unknown', source: 'run-ledger:run-ta-fence-a' });
+    expect(noParent.nextAction).toBe('human');
+    deps.doctorLedger = (id) => id.startsWith('child-')
+      ? [{ runId: id, event: 'stop', data: { scopeEscape: true } }] : null;
+    const childSignalNoParent = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(childSignalNoParent.conditions.environmentFailure).toMatchObject({ value: 'unknown', source: 'run-ledger:run-ta-fence-a' });
+    expect(childSignalNoParent.nextAction).toBe('human');
+    deps.doctorLedger = (id) => id.startsWith('child-') ? null
+      : [{ runId: id, event: 'stop', data: { childEvidence: { scopeEscape: true } } }];
+    const parentSignalNoChild = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(parentSignalNoChild.conditions.environmentFailure).toMatchObject({ value: 'unknown', source: 'run-ledger:child-ta-fence-a' });
+    expect(parentSignalNoChild.nextAction).toBe('human');
+    writeTaskCards(statePath, [{ ...card('ta-fence-a', 921), runChildId: undefined }]);
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: { terminationReason: 'worktree add timeout' } }];
+    const noChildId = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(noChildId.conditions.environmentFailure).toMatchObject({ value: 'unknown', source: 'card:child-run-unbound' });
+    expect(noChildId.nextAction).toBe('human');
+    writeTaskCards(statePath, [card('ta-fence-a', 921)]);
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: { terminationReason: 'stale image in unrelated cache' } }];
+    const otherImage = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(otherImage.conditions.environmentFailure.value).toBe(false);
+    expect(otherImage.nextAction).toBe('human');
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop',
+      data: { terminationReason: id.startsWith('child-') ? 'worktree add timeout' : 'unrelated provider refusal' } }];
+    const conflicting = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(conflicting.conditions.environmentFailure).toMatchObject({ value: 'unknown', detail: '부모·자식 종결 사유 불일치' });
+    expect(conflicting.nextAction).toBe('human');
+    deps.doctorLedger = (id) => id.startsWith('child-')
+      ? [{ runId: id, event: 'run-status', data: { runStatus: 'running', error: 'worktree add timeout' } }]
+      : [{ runId: id, event: 'stop', data: {} }];
+    const running = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(running.conditions.environmentFailure.value).toBe('unknown');
+    expect(running.nextAction).toBe('human');
+    deps.doctorLedger = (id) => id.startsWith('child-')
+      ? [{ runId: id, event: 'pr-open-failed', data: { error: 'model catalog unknown' } },
+        { runId: id, event: 'stop', data: {} }]
+      : [{ runId: id, event: 'stop', data: {} }];
+    const childDiagnostic = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(childDiagnostic.conditions.environmentFailure.value).toBe('unknown');
+    expect(childDiagnostic.nextAction).toBe('human');
+    deps.doctorLedger = (id) => id.startsWith('child-')
+      ? [{ runId: id, event: 'gated', data: { passed: true, gateExecuted: true } },
+        { runId: id, event: 'stop', data: { terminationReason: 'model catalog unknown' } }]
+      : [{ runId: id, event: 'stop', data: { terminationReason: 'model catalog unknown' } }];
+    const gateWithoutHead = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(gateWithoutHead.nextAction).toBe('relaunch');
+    expect(gateWithoutHead.head).toBe('a'.repeat(40));
+    expect(gateWithoutHead.lastGate).toMatchObject({ passed: true, head: null, source: 'run-ledger:child-ta-fence-a:gated' });
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: id === 'run-ta-fence-a'
+      ? { childEvidence: { scopeEscape: true } } : { terminationReason: 'worktree add timeout' } }];
+    const scopeEscape = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(scopeEscape.conditions.environmentFailure).toMatchObject({ value: false, detail: '구조화된 재저작 신호' });
+    expect(scopeEscape.conditions.environmentFailure.source).toBe('run-ledger:run-ta-fence-a:stop:childEvidence.scopeEscape');
+    expect(scopeEscape.nextAction).toBe('reauthor');
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: id.startsWith('child-')
+      ? { scopeEscape: true } : {} }];
+    const childScope = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(childScope.conditions.environmentFailure.source).toBe('run-ledger:child-ta-fence-a:stop:scopeEscape');
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: id.startsWith('child-')
+      ? { childEvidence: { scopeEscape: true } } : {} }];
+    const childEvidenceScope = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(childEvidenceScope.conditions.environmentFailure.source).toBe('run-ledger:child-ta-fence-a:stop:childEvidence.scopeEscape');
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: id.startsWith('child-')
+      ? {} : { scopeEscape: true } }];
+    const parentScope = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(parentScope.conditions.environmentFailure.source).toBe('run-ledger:run-ta-fence-a:stop:scopeEscape');
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: id.startsWith('child-')
+      ? {} : { childEvidence: { supervisorVerdict: 'goal-revision-required' } } }];
+    const parentVerdict = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(parentVerdict.conditions.environmentFailure.source).toBe('run-ledger:run-ta-fence-a:stop:childEvidence.supervisorVerdict');
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: id.startsWith('child-')
+      ? { terminationReason: 'worktree add timeout', scopeEscape: false }
+      : { terminationReason: 'worktree add timeout', childEvidence: { scopeEscape: true } } }];
+    const conflictingScope = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(conflictingScope.conditions.environmentFailure).toMatchObject({ value: 'unknown', detail: '부모·자식 scopeEscape 신호 불일치' });
+    expect(conflictingScope.nextAction).toBe('human');
+    deps.doctorLedger = (id) => [{ runId: id, event: 'stop', data: { terminationReason: 'stale Pod image' } }];
+    writeTaskCards(statePath, [{ ...card('ta-fence-a', 921), history: [
+      { at: '2026-10-21T01:00:00Z', event: 'failed', runId: 'run-ta-fence-a' },
+      { at: '2026-10-21T01:01:00Z', event: 'failed', runId: 'run-ta-fence-a' },
+    ] }]);
+    const duplicateFailure = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(duplicateFailure.conditions.failureRoundsBelowTwo).toMatchObject({ value: true, detail: '실패 라운드 1' });
+    expect(duplicateFailure.nextAction).toBe('relaunch');
+    writeTaskCards(statePath, [{ ...card('ta-fence-a', 921), history: [] }, card('ta-fence-b', 922)]);
+    const repeated = JSON.parse((await run(['tasks', 'doctor', 'ta-fence-a', '--traffic', traffic], deps)).lines[0]!) as TaskDoctorReport;
+    expect(repeated.conditions.failureRoundsBelowTwo.value).toBe(false);
+    expect(repeated.nextAction).toBe('reauthor');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 
 /**
  * MODEL-SIZE-OUTCOME-MEASURE — 모델×조각 크기 칸별 성공률을 재는 fixture.
@@ -2080,7 +2467,7 @@ test('TA-CARD-OUTCOMES-MANUAL — closed-by-hand는 landed-by-hand의 명시적 
     })).lines[0]!);
     expect(body.rows).toMatchObject([{ card: 'ta-manual-landed', endedAt: closedAt,
       reason: null, reasonFrom: null }]);
-    expect(body.aggregate).toEqual({ cards: 1, reasons: [], missingReason: 1 });
+    expect(body.aggregate).toMatchObject({ cards: 1, cardTerminals: 1, prTerminals: 0, failedCardTerminals: 0, reasons: [], missingReason: 0 });
     expect(body.undatedCards).toBe(0);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -2106,14 +2493,107 @@ test('TA-CARD-OUTCOMES-PR-CHRONOLOGY — 재결속 전후 사건은 시각만 �
     const body = JSON.parse((await run(['tasks', 'outcomes', '--since', '24h', '--json'], {
       taskStatePath: statePath, registerSink: async () => {}, outcomesNow: () => now,
     })).lines[0]!);
-    expect(body.rows.find((row: TaskOutcomeRow) => row.card === 'ta-old-failure')).toMatchObject({
+    expect(body.rows.find((row: TaskOutcomeRow) => row.card === 'ta-old-failure' && row.terminalKind === 'pr')).toMatchObject({
       endedAt: ago(1), pr: { number: 789, state: 'CLOSED' }, reason: null, reasonFrom: null });
-    expect(body.rows.find((row: TaskOutcomeRow) => row.card === 'ta-new-failure')).toMatchObject({
+    expect(body.rows.find((row: TaskOutcomeRow) => row.card === 'ta-new-failure' && row.terminalKind === 'card')).toMatchObject({
       endedAt: ago(1), pr: { number: 790, state: 'MERGED' }, reason: null, reasonFrom: null });
     expect(body.rows.find((row: TaskOutcomeRow) => row.card === 'ta-space-reason')).toMatchObject({
       endedAt: ago(0.5), reason: null, reasonFrom: null });
-    expect(body.aggregate).toEqual({ cards: 3, reasons: [], missingReason: 3 });
+    expect(body.aggregate).toMatchObject({ cards: 3, cardTerminals: 3, prTerminals: 2, failedCardTerminals: 3, reasons: [], missingReason: 3 });
+    expect(body.overlapCardIds).toEqual(['ta-new-failure', 'ta-old-failure']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('TA-OUTCOMES-TERMINAL-REASON 실물 두 건 — 옛 손종결 카드의 오늘 PR 닫힘과 launched 카드의 오늘 PR 병합은 카드 종단이 아니다', async () => {
+  const universe = mkdtempSync(join(tmpdir(), 'ta-outcomes-terminal-universe-'));
+  try {
+    const statePath = join(universe, 'task-agent-actions.json');
+    const url = (n: number) => `https://github.com/ElanvitalAI/elanous/pull/${n}`;
+    const closedAt = '2026-10-20T06:00:00.000Z';
+    const prClosedAt = '2026-10-22T07:00:00.000Z';
+    const prMergedAt = '2026-10-22T08:00:00.000Z';
+    writeTaskCards(statePath, [
+      { id: 'ta-closed-pr-later', text: '손종결 뒤 PR 닫힘', status: 'landed-by-hand', createdAt: '2026-10-19T00:00:00.000Z',
+        runId: 'run-terminal-old', runChildId: 'run-terminal-old-child', pr: { number: 920, url: url(920) },
+        prTerminal: { pr: 920, url: url(920), head: 'a'.repeat(40), state: 'CLOSED', at: prClosedAt },
+        history: [{ at: closedAt, event: 'closed-by-hand', reason: '손종결' }] },
+      { id: 'ta-launched-pr-merged', text: '발사 뒤 PR 병합', status: 'launched', createdAt: '2026-10-20T00:00:00.000Z',
+        runId: 'run-terminal-merge', runChildId: 'run-terminal-merge-child', pr: { number: 921, url: url(921) },
+        prTerminal: { pr: 921, url: url(921), head: 'b'.repeat(40), state: 'MERGED', at: prMergedAt },
+        history: [{ at: '2026-10-20T01:00:00.000Z', event: 'run-bound' }] },
+    ]);
+    const ledgerDir = join(universe, 'run-ledger');
+    appendRunLedgerEntry({ runId: 'run-terminal-old', event: 'pod-child-run', data: { childRunId: 'run-terminal-old-child' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-terminal-old-child', event: 'child-error', data: { error: '원문 child-error: 오래된 손종결' } }, ledgerDir);
+    recordRunExit({ runId: 'run-terminal-old', reason: 'stopped', status: 1, signal: null, at: closedAt,
+      lastLines: ['원문 lastLines: 작업자가 종결'] }, universe);
+    const env = { ...process.env } as Record<string, string | undefined>;
+    delete env.ELANOUS_CONFIG_DIR;
+    delete env.ELANOUS_STATE_DIR;
+    const command = async (by?: 'card-terminal' | 'pr-terminal') => {
+      const proc = Bun.spawn([process.execPath, ELANOUS_CLI_ENTRY, `--test=${universe}`, 'tasks', 'outcomes',
+        '--since', '2026-10-22T00:00:00.000Z', '--until', '2026-10-22T23:59:59.999Z', ...(by ? ['--by', by] : []), '--json'],
+      { cwd: universe, stdout: 'pipe', stderr: 'pipe', env });
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      expect(await proc.exited, stderr).toBe(0);
+      return JSON.parse(stdout.trim());
+    };
+    const all = await command();
+    expect(all.aggregate).toMatchObject({ cards: 2, cardTerminals: 0, prTerminals: 2, failedCardTerminals: 0, missingReason: 0 });
+    expect(all.rows).toHaveLength(2);
+    expect(all.rows.find((row: TaskOutcomeRow) => row.card === 'ta-closed-pr-later')).toMatchObject({
+      terminalKind: 'pr', endedAt: prClosedAt, cardTerminalAt: closedAt, prTerminalAt: prClosedAt,
+      ghTerminalAt: null, ghTerminalMissing: 'not-stored-in-card',
+      countReason: `pr:CLOSED:#920@${prClosedAt}`, reason: null, reasonFrom: null,
+      evidence: { childLedger: { event: 'child-error', error: '원문 child-error: 오래된 손종결' }, childLedgerMissing: null,
+        lastLines: ['원문 lastLines: 작업자가 종결'], lastLinesMissing: null },
+    });
+    expect(all.rows.find((row: TaskOutcomeRow) => row.card === 'ta-launched-pr-merged')).toMatchObject({
+      terminalKind: 'pr', endedAt: prMergedAt, cardTerminalAt: null, prTerminalAt: prMergedAt,
+      ghTerminalAt: null, ghTerminalMissing: 'not-stored-in-card',
+      countReason: `pr:MERGED:#921@${prMergedAt}`, reason: null,
+      evidence: { childLedger: null, childLedgerMissing: 'parent-ledger-missing',
+        lastLines: null, lastLinesMissing: 'run-exit-missing' },
+    });
+    expect((await command('card-terminal')).aggregate).toMatchObject({ cards: 0, cardTerminals: 0, prTerminals: 0 });
+    expect((await command('pr-terminal')).aggregate).toMatchObject({ cards: 2, cardTerminals: 0, prTerminals: 2 });
+  } finally { rmSync(universe, { recursive: true, force: true }); }
+}, 30_000);
+
+test('TA-OUTCOMES-TERMINAL-REASON 원격 — 호스트 거울의 자식 오류만 귀속하고 거울 부재는 unknown 으로 남긴다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ta-outcomes-remote-reason-'));
+  try {
+    const statePath = join(root, 'task-agent-actions.json');
+    const endedAt = '2026-10-22T09:00:00.000Z';
+    const card = (id: string, runId: string, host: string): TaskCard => ({ id, text: '원격 실패', status: 'failed',
+      runId, runChildId: `${runId}-child`, parentHost: { host }, createdAt: '2026-10-21T00:00:00.000Z',
+      history: [{ at: endedAt, event: 'failed' }] });
+    writeTaskCards(statePath, [card('ta-remote-mirrored', 'run-remote-mirrored', 'node-b'),
+      card('ta-remote-unmirrored', 'run-remote-unmirrored', 'wsl')]);
+    const mirror = remoteLedgerMirrorDir(root, 'node-b');
+    appendRunLedgerEntry({ runId: 'run-remote-mirrored', event: 'pod-child-run',
+      data: { childRunId: 'run-remote-mirrored-child' } }, mirror);
+    appendRunLedgerEntry({ runId: 'run-remote-mirrored-child', event: 'child-error',
+      data: { error: '원격 원문: Pod child failed' } }, mirror);
+    // 로컬의 동명 원장은 원격 카드의 사유로 써서는 안 된다.
+    appendRunLedgerEntry({ runId: 'run-remote-unmirrored', event: 'pod-child-run',
+      data: { childRunId: 'run-remote-unmirrored-child' } }, join(root, 'run-ledger'));
+    appendRunLedgerEntry({ runId: 'run-remote-unmirrored-child', event: 'child-error',
+      data: { error: '잘못된 로컬 원문' } }, join(root, 'run-ledger'));
+    const report = readTaskOutcomes({ sinceMs: Date.parse('2026-10-22T00:00:00.000Z'),
+      untilMs: Date.parse('2026-10-22T23:59:59.999Z') }, { taskStatePath: statePath });
+    expect(report.aggregate).toMatchObject({ cardTerminals: 2, prTerminals: 0, failedCardTerminals: 2,
+      missingReason: 1, reasons: [{ reason: '원격 원문: Pod child failed', count: 1 }] });
+    expect(report.rows.find((row) => row.card === 'ta-remote-mirrored')).toMatchObject({
+      reason: '원격 원문: Pod child failed', reasonFrom: 'child-ledger:child-error',
+      evidence: { childLedger: { event: 'child-error', error: '원격 원문: Pod child failed' }, childLedgerMissing: null },
+    });
+    expect(report.rows.find((row) => row.card === 'ta-remote-unmirrored')).toMatchObject({
+      reason: null, reasonFrom: null,
+      evidence: { childLedger: null, childLedgerMissing: 'remote-ledger-mirror-missing' },
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('MODEL-SIZE-OUTCOME-MEASURE 반례 — 실행·성공이 명시되지 않은 trim-scope 조정은 범위 이탈로 세지 않는다', async () => {

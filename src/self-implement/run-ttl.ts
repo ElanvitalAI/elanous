@@ -5,13 +5,15 @@
  * Past `tools.selfImplement.runTtlHours` (default 24) since its last commit, the sweep makes one pre-emptive move:
  *   · live owning run → one resync memo in its control inbox (same path as SIBLING-RESYNC #24893/#24899),
  *                       at most once per (PR, head sha) — a rebase moves the head and re-arms it
- *   · no live run     → the registered `elanous:needs-rebase` label, once (QUIET-PR-COMMENTS: never a comment);
- *                       when `requestRegate` is supplied, at most one of those stale PRs is also selected
- *                       for a re-gate request (shadow: would-regate observation only; live: one call)
+ *   · no live run     → when `requestRegate` is supplied, at most one of those stale PRs is selected for a
+ *                       re-gate request (shadow: would-regate observation only; live: one call), and the
+ *                       registered `elanous:needs-rebase` label otherwise — once (QUIET-PR-COMMENTS: never a comment)
  *
  * Mode `tools.selfImplement.runTtl.mode`: `shadow` (default) only logs what it would do; `live` writes.
  * Cost bound: a PR opened inside the TTL is still inside its own time-to-landing and is never fetched
- * (`freshByCreation`), already-marked PRs without a live run are skipped before any fetch, at most `maxFetch` last-commit lookups per sweep with `concurrency` in flight, and at most `cap` actions.
+ * (`freshByCreation`), already-marked PRs without a live run are skipped before any fetch, at most `maxFetch`
+ * last-commit lookups per sweep with `concurrency` in flight, and at most `cap` actions — memo, marker and
+ * re-gate request all draw from that one budget, so a sweep never performs more than `cap` side effects.
  *
  * Pure core: every side effect is an injected adapter so tests never touch GitHub or the inbox.
  */
@@ -208,6 +210,12 @@ export async function runRunTtlSweep(input: {
   stalePrs.sort((a, b) => b.ageMs - a.ageMs || a.pr.number - b.pr.number);
   let actions = 0;
   let selectedRegate = false;
+  // One budget for the whole sweep: a memo, a marker and a re-gate request each spend one unit.
+  const spend = (): boolean => {
+    if (actions >= cap) return false;
+    actions += 1;
+    return true;
+  };
   for (const { pr, target, ageMs } of stalePrs) {
     const ageHours = ageMs / 3_600_000;
     const key = `${pr.number}:${pr.headSha}`;
@@ -220,10 +228,10 @@ export async function runRunTtlSweep(input: {
         continue;
       }
       if (already) { alreadyMemoed.push(pr.number); continue; }
-    }
-    if (!target.alive && pr.labels.includes(RUN_TTL_MARKER_LABEL)) { alreadyMarked.push(pr.number); continue; }
-    if (actions >= cap) { skippedOverCap.push(pr.number); continue; }
-    actions += 1;
+    } else if (pr.labels.includes(RUN_TTL_MARKER_LABEL)) { alreadyMarked.push(pr.number); continue; }
+    // The move this PR makes — memo, re-gate, or marker — takes the budget slot up front, so a sweep
+    // never emits more than `cap` side effects no matter how many of them a single PR would attract.
+    if (!spend()) { skippedOverCap.push(pr.number); continue; }
     if (target.alive) {
       if (mode === 'shadow') {
         memo.push(pr.number);
@@ -248,15 +256,31 @@ export async function runRunTtlSweep(input: {
       }
     }
     const reason = target.alive ? 'memo-failed' : target.reason;
-    const canRegate = Boolean(input.requestRegate) && !target.alive && !selectedRegate;
+    // A re-gate request is the stronger move and spends the same budget as the marker, so it goes
+    // first: at `cap` 1 a sweep either re-gates (no marker) or — with no adapter — only marks.
+    if (Boolean(input.requestRegate) && !target.alive && !selectedRegate) {
+      selectedRegate = true;
+      if (mode === 'shadow') {
+        regate.push(pr.number);
+        emit('would-regate', { pr: pr.number, reason, ageHours: Math.floor(ageHours) });
+      } else {
+        try {
+          await input.requestRegate!(pr);
+          regate.push(pr.number);
+          emit('regate-requested', { pr: pr.number, reason, ageHours: Math.floor(ageHours) });
+        } catch (error) {
+          emit('regate-failed', { pr: pr.number, error: String(error) });
+        }
+      }
+      // The marker that used to ride along must buy its own slot — at `cap` 1 there is none left.
+      if (!spend()) {
+        emit('label-deferred-cap', { pr: pr.number, reason, ageHours: Math.floor(ageHours) });
+        continue;
+      }
+    }
     if (mode === 'shadow') {
       label.push(pr.number);
       emit('would-label', { pr: pr.number, label: RUN_TTL_MARKER_LABEL, reason, ageHours: Math.floor(ageHours) });
-      if (canRegate) {
-        selectedRegate = true;
-        regate.push(pr.number);
-        emit('would-regate', { pr: pr.number, reason, ageHours: Math.floor(ageHours) });
-      }
       continue;
     }
     try {
@@ -266,16 +290,6 @@ export async function runRunTtlSweep(input: {
     } catch (error) {
       failed.push(pr.number);
       emit('label-failed', { pr: pr.number, error: String(error) });
-    }
-    if (canRegate) {
-      selectedRegate = true;
-      try {
-        await input.requestRegate!(pr);
-        regate.push(pr.number);
-        emit('regate-requested', { pr: pr.number, reason, ageHours: Math.floor(ageHours) });
-      } catch (error) {
-        emit('regate-failed', { pr: pr.number, error: String(error) });
-      }
     }
   }
   return summary(result());

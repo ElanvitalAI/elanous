@@ -15,7 +15,7 @@
 // folds dashboard onto `runCoreTurn` once the core event set is
 // proven sufficient.
 
-import type { LLMMessage, LLMOpts, LLMToolSpec } from '../llm.js';
+import type { LLMMessage, LLMOpts, LLMProvider, LLMToolSpec } from '../llm.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 
 /** Stop reasons exposed by `runCoreTurn`. Mirrors the ACP
@@ -163,6 +163,11 @@ export interface CoreTurnContext {
   terminalPriorAnswerVisible?: LLMOpts['terminalPriorAnswerVisible'];
   /** Optional model override (forwarded to `streamLLMWithTools`). */
   modelOverride?: string;
+  /** TUI-400-AUTOHEAL-FALLBACK — 이 턴을 이 공급자부터 연다(`streamLLMWithTools` `initialProvider` · 폴백은 허용).
+   *  주면 `modelOverride` 는 보내지 않는다(앞 공급자 모델 이름을 옮기지 않는다). */
+  initialProvider?: LLMProvider;
+  /** 이 턴 폴백 후보에서 뺄 공급자(`streamLLMWithTools` `skipProviders`). */
+  skipProviders?: readonly string[];
 }
 
 export interface CoreTurnResult {

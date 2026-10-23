@@ -1285,6 +1285,98 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(matched.get('pool-node-b')?.action).toBe('shipped');
     expect(saves).toBe(1);
   });
+
+  // ⭐ GATE-REGISTRY-IMAGE-FASTPATH (0.2.36): 레지스트리 manifest·config label(commit ⊕ pod-skills)이 이번 발사 값과
+  //    맞으면 노드 Docker 데몬(`docker image inspect`)을 «한 번도» 부르지 않고 그 커밋 ref 로 끝난다.
+  test('GATE-REGISTRY-IMAGE-FASTPATH: registry commit + skills label match selects the commit ref with zero docker image inspect', async () => {
+    const commit = 'b95a3c071f5c8d7e6a5b4c3d2e1f0a9b8c7d6e5f';
+    const tag = commit.slice(0, 12);
+    const calls: string[] = [];
+    const cfg = `sha256:${'a'.repeat(64)}`;
+    const run: RemoteRun = (_host, cmd) => {
+      calls.push(cmd);
+      if (cmd.includes(`/v2/elanous-harness/manifests/${tag}`)) return { status: 0, stdout: JSON.stringify({ schemaVersion: 2, config: { digest: cfg } }), stderr: '' };
+      if (cmd.includes(`/v2/elanous-harness/blobs/${cfg}`)) return { status: 0, stdout: JSON.stringify({ config: { Labels: { 'elanous.commit': commit, 'elanous.pod-skills': 'sk-fast' } } }), stderr: '' };
+      // Docker 데몬은 «응답하지 않는다» — 이 경로가 판정에 끼면 fresh 가 나올 수 없다.
+      return { status: null, stdout: '', stderr: 'i/o timeout' };
+    };
+    let builds = 0;
+    const remoteBuild = async () => { builds++; return { ok: true, detail: 'built' }; };
+    const events: Array<Record<string, unknown>> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((cat: string, ev: string, data?: unknown) => {
+      if (cat === 'pod.pool' && ev === 'image-fresh-registry-label') events.push(data as Record<string, unknown>);
+    }) as typeof debug.log;
+    try {
+      const r = await syncPoolImages(parsePodPool('pool-node-b@node-b:2'), 'elanous-harness:local', commit, { run, remoteBuild, localSkillsDigest: 'sk-fast' });
+      expect(r.get('pool-node-b')).toMatchObject({ ok: true, action: 'fresh', imageRef: `k3d-elanous-registry:5050/elanous-harness:${tag}` });
+      expect(builds).toBe(0);
+      // 판정 경계: docker inspect 호출 0 · imageRef 선택 1 · registry HTTP 2회(manifest ⊕ config blob).
+      expect(calls.filter((cmd) => cmd.includes('docker image inspect') || cmd.includes('docker inspect '))).toEqual([]);
+      expect(calls.filter((cmd) => cmd.includes('/manifests/'))).toHaveLength(1);
+      expect(calls.filter((cmd) => cmd.includes('/blobs/'))).toHaveLength(1);
+      expect(events).toEqual([expect.objectContaining({ context: 'pool-node-b', host: 'node-b', commit, imageRef: `k3d-elanous-registry:5050/elanous-harness:${tag}` })]);
+    } finally { (debug as { log: typeof debug.log }).log = original; }
+  });
+
+  test('GATE-REGISTRY-IMAGE-FASTPATH: a skills-label mismatch keeps the existing node build once', async () => {
+    const commit = 'b95a3c071f5c8d7e6a5b4c3d2e1f0a9b8c7d6e5f';
+    const tag = commit.slice(0, 12);
+    let nodeLabel = 'old-commit';
+    let tags: string[] = [];
+    let inspects = 0;
+    const cfg = `sha256:${'b'.repeat(64)}`;
+    const run: RemoteRun = (_host, cmd) => {
+      if (cmd.includes(`/manifests/${tag}`)) return { status: 0, stdout: JSON.stringify({ config: { digest: cfg } }), stderr: '' };
+      if (cmd.includes(`/blobs/${cfg}`)) return { status: 0, stdout: JSON.stringify({ config: { Labels: { 'elanous.commit': commit, 'elanous.pod-skills': 'sk-old' } } }), stderr: '' };
+      if (cmd.includes('/tags/list')) return { status: 0, stdout: JSON.stringify({ tags }), stderr: '' };
+      if (cmd.includes('docker inspect k3d-elanous-registry')) return { status: 0, stdout: '', stderr: '' };
+      if (cmd.includes('docker image inspect')) inspects++;
+      if (cmd.includes('elanous.pod-skills')) return { status: 0, stdout: 'sk-new', stderr: '' };
+      return { status: 0, stdout: nodeLabel, stderr: '' };
+    };
+    let builds = 0;
+    const remoteBuild = async () => { builds++; nodeLabel = commit; tags = [tag]; return { ok: true, detail: 'built' }; };
+    const r = await syncPoolImages(parsePodPool('pool-node-b@node-b:2'), 'elanous-harness:local', commit, { run, remoteBuild, localSkillsDigest: 'sk-new' });
+    // 레지스트리 label 의 스킬 해시가 이번 발사 값과 다르다 — 종전대로 노드 쪽 빌드 1회.
+    expect(r.get('pool-node-b')).toMatchObject({ ok: true, action: 'built', imageRef: `k3d-elanous-registry:5050/elanous-harness:${tag}` });
+    expect(builds).toBe(1);
+    expect(inspects).toBeGreaterThan(0);   // 기존 경로는 Docker 데몬으로 노드 판을 확인한다
+  });
+
+  test('GATE-REGISTRY-IMAGE-FASTPATH: an absent tag, an HTTP error or a non-JSON manifest keeps the existing build path once', async () => {
+    const commit = 'b95a3c071f5c8d7e6a5b4c3d2e1f0a9b8c7d6e5f';
+    const tag = commit.slice(0, 12);
+    let fault: 'missing-tag' | 'blob-error' | 'non-json' = 'missing-tag';
+    let nodeLabel = 'old-commit';
+    let tags: string[] = [];
+    const cfg = `sha256:${'c'.repeat(64)}`;
+    const run: RemoteRun = (_host, cmd) => {
+      if (cmd.includes(`/manifests/${tag}`)) {
+        if (fault === 'missing-tag') return { status: 22, stdout: '', stderr: 'curl: (22) HTTP 404' };
+        return { status: 0, stdout: fault === 'non-json' ? '<html>proxy error</html>' : JSON.stringify({ config: { digest: cfg } }), stderr: '' };
+      }
+      if (cmd.includes(`/blobs/${cfg}`)) {
+        if (fault === 'blob-error') return { status: 56, stdout: '', stderr: 'curl: (56) connection reset' };
+        return { status: 0, stdout: JSON.stringify({ config: { Labels: { 'elanous.commit': commit, 'elanous.pod-skills': 'sk' } } }), stderr: '' };
+      }
+      if (cmd.includes('/tags/list')) return { status: 0, stdout: JSON.stringify({ tags }), stderr: '' };
+      if (cmd.includes('docker inspect k3d-elanous-registry')) return { status: 0, stdout: '', stderr: '' };
+      if (cmd.includes('elanous.pod-skills')) return { status: 0, stdout: 'sk', stderr: '' };
+      return { status: 0, stdout: nodeLabel, stderr: '' };
+    };
+    let builds = 0;
+    const remoteBuild = async () => { builds++; nodeLabel = commit; tags = [tag]; return { ok: true, detail: 'built' }; };
+    for (const scenario of ['missing-tag', 'blob-error', 'non-json'] as const) {
+      fault = scenario;
+      nodeLabel = 'old-commit';
+      tags = [];
+      const before = builds;
+      const r = await syncPoolImages(parsePodPool('pool-node-b@node-b:2'), 'elanous-harness:local', commit, { run, remoteBuild, localSkillsDigest: 'sk' });
+      expect(r.get('pool-node-b')).toMatchObject({ ok: true, action: 'built', imageRef: `k3d-elanous-registry:5050/elanous-harness:${tag}` });
+      expect(builds - before).toBe(1);
+    }
+  });
 });
 
 test('generic Pod path keeps pod.pool — harness.podPool does not leak into it', () => {

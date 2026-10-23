@@ -100,6 +100,8 @@ interface ReviewObservation {
   readonly mustFix: number;
   /** 목표 범위를 이유로 되돌리거나 분리하라는 MUST-FIX의 관측용 빈도. */
   readonly scopeRevertMustFix: number;
+  /** SCOPE-ESCAPE-AS-REFINE — must-fix 에서 shouldFix 로 강등된 범위-되돌림 지적 수. */
+  readonly scopeRevertDemoted: number;
   readonly shouldFix: number;
   /** ⭐ 지적 **식별용** 앞부분. 이게 있어야 "같은 지적이 반복되나"를 로그만으로 볼 수 있다. */
   readonly mustFixItems: readonly string[];
@@ -197,6 +199,7 @@ export function buildReviewObservation(input: ReviewObservationInput): ReviewObs
     ...(review?.failureReason ? { failureReason: safeLogText(review.failureReason) } : {}),
     mustFix: mustFix.length,
     scopeRevertMustFix: mustFix.filter(isScopeRevertMustFix).length,
+    scopeRevertDemoted: review?.scopeRevertDemoted?.length ?? 0,
     shouldFix: shouldFix.length,
     mustFixItems: clip(mustFix),
     shouldFixItems: clip(shouldFix),

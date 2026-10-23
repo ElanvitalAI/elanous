@@ -10,7 +10,7 @@
 // because elanous's primary surface runs native git.
 
 import { spawnSync, execFileSync, type SpawnSyncReturns } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, rmSync, symlinkSync, lstatSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, rmSync, symlinkSync, lstatSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { findGitDir } from './locate.js';
@@ -18,6 +18,7 @@ import { isTransientGitError } from './retry.js';
 import { runGitCommand } from './runner.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
+import { GATE_DEPS_DIR, GATE_DEPS_TREES, projectDepsManifest } from '../task-orchestrator/surfaces/pod-gate-deps.js';
 
 const GIT_TIMEOUT_MS = 30_000;
 /** 얕은 클론(Pod `git clone --depth 50` · docker/harness/job.yaml)에서 base 를 가져올 깊이 — 클론과 같은 값.
@@ -30,6 +31,7 @@ const TRACKED_FILE_COUNT_MAX_BUFFER = 16 * 1024 * 1024;
 
 export interface WorktreeAddDeps {
   spawn?: (command: string, args: string[], options: { cwd: string; encoding: 'utf8'; timeout: number; maxBuffer: number }) => SpawnSyncReturns<string>;
+  installDependencies?: (cwd: string, timeoutMs: number) => { status: number | null; stderr?: string | null; error?: Error };
   countTrackedFiles?: (repoRoot: string, ref?: string) => number | null;
 }
 
@@ -324,6 +326,81 @@ export function linkWorktreeDependencies(
   return result;
 }
 
+const WORKTREE_DEPENDENCY_INSTALL_TIMEOUT_MS = 600_000;
+
+/** A lockfile-bearing child must have dependencies before its tests start. */
+export class WorktreeDependencyPreparationError extends Error {
+  readonly code = 'WORKTREE_DEPENDENCIES_UNAVAILABLE';
+  constructor(readonly worktreePath: string, readonly dependencyPath: string, readonly reason: string) {
+    super(`worktree dependencies unavailable (${dependencyPath}) at ${worktreePath}: ${reason}`);
+    this.name = 'WorktreeDependencyPreparationError';
+  }
+}
+
+function bakedDependenciesMatch(repoTree: string, bakedTree: string): boolean {
+  try {
+    if (!existsSync(join(bakedTree, 'node_modules'))) return false;
+    if (!readFileSync(join(repoTree, 'bun.lock')).equals(readFileSync(join(bakedTree, 'bun.lock')))) return false;
+    const source = projectDepsManifest(JSON.parse(readFileSync(join(repoTree, 'package.json'), 'utf8')) as Record<string, unknown>);
+    const baked = projectDepsManifest(JSON.parse(readFileSync(join(bakedTree, 'package.json'), 'utf8')) as Record<string, unknown>);
+    return JSON.stringify(source) === JSON.stringify(baked);
+  } catch { return false; }
+}
+
+function prepareWorktreeDependencies(repoRoot: string, worktreePath: string, opts: CreateWorktreeOpts, deps: WorktreeAddDeps): void {
+  const fallbackRoot = opts.dependencyFallbackRoot?.trim() || GATE_DEPS_DIR;
+  const timeoutMs = opts.dependencyInstallTimeoutMs ?? WORKTREE_DEPENDENCY_INSTALL_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('dependencyInstallTimeoutMs must be a positive integer');
+  for (const tree of GATE_DEPS_TREES) {
+    const targetTree = join(worktreePath, tree);
+    const relativePath = tree === '.' ? 'node_modules' : 'apps/pwa/node_modules';
+    const target = join(worktreePath, relativePath);
+    const source = join(repoRoot, relativePath);
+    const fallbackTree = join(fallbackRoot, tree);
+    const fallback = join(fallbackTree, 'node_modules');
+    const report = (installed: boolean, ok: boolean, error: string | null, method: string): void => {
+      debug.log('git-fs.worktree', 'dependencies.prepared', {
+        worktreePath, path: relativePath, source, fallback, installed, ok, error, method,
+      }, ok ? undefined : { level: 'warn' });
+    };
+    if (existsSync(target)) { report(false, true, null, existsSync(source) ? 'source' : 'existing'); continue; }
+    try { if (lstatSync(target).isSymbolicLink()) unlinkSync(target); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    // Plain git repositories without a Bun lockfile have no dependency contract.
+    if (!existsSync(join(targetTree, 'package.json')) || !existsSync(join(targetTree, 'bun.lock'))) {
+      report(false, true, null, 'not-required');
+      continue;
+    }
+    if (bakedDependenciesMatch(targetTree, fallbackTree)) {
+      try {
+        mkdirSync(dirname(target), { recursive: true });
+        symlinkSync(fallback, target, 'dir');
+        report(false, true, null, 'fallback');
+        continue;
+      } catch (error) {
+        debug.log('git-fs.worktree', 'dependencies.fallback-failed', { worktreePath, path: relativePath, error: String(error) }, { level: 'warn' });
+      }
+    }
+    let result: { status: number | null; stderr?: string | null; error?: Error };
+    try {
+      result = deps.installDependencies
+        ? deps.installDependencies(targetTree, timeoutMs)
+        : spawnSync('bun', ['install', '--frozen-lockfile'], { cwd: targetTree, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      report(true, false, reason, 'install');
+      throw new WorktreeDependencyPreparationError(worktreePath, relativePath, reason);
+    }
+    if (result.status === 0 && existsSync(target)) { report(true, true, null, 'install'); continue; }
+    const reason = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT'
+      ? `install timed out after ${timeoutMs}ms`
+      : (result.stderr ?? result.error?.message ?? `install exited ${result.status}`).trim().slice(-4096) || `install exited ${result.status}`;
+    report(true, false, reason, 'install');
+    throw new WorktreeDependencyPreparationError(worktreePath, relativePath, reason);
+  }
+}
+
 export interface CreateWorktreeOpts {
   /** Absolute repo root (main checkout). */
   repoRoot: string;
@@ -361,6 +438,12 @@ export interface CreateWorktreeOpts {
    *  기록된 owner 와 **정확히 같을 때**만 더티를 재사용 거부 사유로 쓰지 않는다(그 dirt 는 그 런 자신의 산출).
    *  ⛔ 생략·공백이면 종전 동작: 더티는 `worktree-dirty` 로 거부한다. */
   currentOwner?: string;
+  /** Baked dependency root; defaults to the harness image tree. */
+  dependencyFallbackRoot?: string;
+  /** Pod child only: require dependencies before its tests. Other callers remain fail-soft. */
+  requireDependencies?: boolean;
+  /** Maximum install time for each missing dependency tree; default 600 seconds. */
+  dependencyInstallTimeoutMs?: number;
 }
 
 /** base 를 무엇으로 확정했는지 — **모름과 부재를 값으로 가른다.**
@@ -715,6 +798,7 @@ export function createWorktree(opts: CreateWorktreeOpts, deps: WorktreeAddDeps =
       debug.log('git-fs.worktree', 'add.branch-held-reused', { branch, worktreePath: branchHolder, owner: gate.owner }, { level: 'warn' });
       const reusedLinks = linkWorktreeDependencies(repoRoot, branchHolder);
       debug.log('git-fs.worktree', 'dependencies.linked', { branch, worktreePath: branchHolder, dependencyLinks: reusedLinks });
+      if (opts.requireDependencies) prepareWorktreeDependencies(repoRoot, branchHolder, opts, deps);
       const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: branchHolder, encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
       const headSha = (head.stdout ?? '').trim();
       if (head.status !== 0 || headSha.length === 0) {
@@ -809,6 +893,16 @@ export function createWorktree(opts: CreateWorktreeOpts, deps: WorktreeAddDeps =
   //   idempotent). fail-soft — 링크 실패해도 worktree 자체는 유효(caller 가 필요시 install).
   const dependencyLinks = linkWorktreeDependencies(repoRoot, wtPath);
   debug.log('git-fs.worktree', 'dependencies.linked', { branch, worktreePath: wtPath, dependencyLinks });
+  if (opts.requireDependencies) {
+    try { prepareWorktreeDependencies(repoRoot, wtPath, opts, deps); }
+    catch (error) {
+      try { removeWorktree(repoRoot, wtPath, true); }
+      catch (cleanupError) {
+        debug.log('git-fs.worktree', 'dependencies.cleanup-failed', { worktreePath: wtPath, error: String(cleanupError) }, { level: 'warn' });
+      }
+      throw error;
+    }
+  }
   const resolvedBase = spawnSync('git', ['rev-parse', 'HEAD'], {
     cwd: wtPath,
     encoding: 'utf8',

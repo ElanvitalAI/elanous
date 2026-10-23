@@ -2,7 +2,7 @@ import { expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closeLocalChatSession, onLocalChatBackgroundStatus, runLocalChatTurn } from './local-chat-turn.js';
+import { closeLocalChatSession, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, runLocalChatTurn } from './local-chat-turn.js';
 import { debug } from '../debug/log.js';
 import { BackgroundJobStatus } from '../tui/chat/background-job-status.js';
 import { appendMessage, createSession, loadSession, setActiveSessionId } from '../session/index.js';
@@ -112,6 +112,34 @@ test('delta frames reach only their turn before the final JSONL response', async
     expect(order).toEqual(['delta', 'delta', 'final']);
   } finally {
     await closeLocalChatSession('delta-session');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('self health frames require the active turn and session and clear on child exit', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-health-frame-'));
+  const cli = join(dir, 'health-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    for await (const line of createInterface({ input: process.stdin })) {
+      const input = JSON.parse(line);
+      const snapshot = { sessionId: 'health-session', capturedAt: 1, line: '[health]', source: 'checkout', runningSha: 'abcdef0', installedSha: null, errorCount: 0, representativeError: null, creditSource: null, creditKnown: true };
+      console.log(JSON.stringify({ event: 'self-health', turnId: input.id, sessionId: 'wrong-session', selfHealth: snapshot }));
+      console.log(JSON.stringify({ event: 'self-health', turnId: 'stale-turn', sessionId: 'health-session', selfHealth: snapshot }));
+      console.log(JSON.stringify({ event: 'self-health', turnId: input.id, sessionId: 'health-session', selfHealth: snapshot }));
+      console.log(JSON.stringify({ event: 'result', turnId: input.id, reply: 'ok' }));
+      setTimeout(() => process.exit(0), 20);
+    }
+  `);
+  const observed: Array<string | null> = [];
+  const stop = onLocalChatSelfHealthStatus('health-session', (snapshot) => observed.push(snapshot?.line ?? null));
+  try {
+    await runLocalChatTurn('health-session', 'first', new AbortController().signal, cli);
+    for (let i = 0; i < 100 && observed.at(-1) !== null; i++) await Bun.sleep(10);
+    expect(observed).toEqual(['[health]', null]);
+  } finally {
+    stop();
+    await closeLocalChatSession('health-session');
     rmSync(dir, { recursive: true, force: true });
   }
 });

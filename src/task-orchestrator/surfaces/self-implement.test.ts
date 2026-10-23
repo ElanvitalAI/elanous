@@ -63,14 +63,18 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
     expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"branch":"self-impl/finished"}')?.harvestable).toBeUndefined();
     expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"harvestable":true}')?.harvestable).toBeUndefined();
   });
-  test('Pod failure keeps child classification facts and calls held out-of-scope edits scope-escape', () => {
+  test('Pod failure keeps child classification facts and calls held out-of-scope edits with a stop reason scope-escape', () => {
     const abandonedClassification = { classification: 'implementation-deficit', classificationBasis: 'no-clean-worktree', worktreeClean: false };
     const accountAvailability = { reason: 'no-candidate', candidateCount: 0 };
-    const parsed = parseSelfImplementJson(JSON.stringify({ stage: 'soft-stopped', ok: false,
+    const child = { stage: 'soft-stopped', ok: false,
       detail: 'Out-of-scope edits held in the worktree; gate and publication skipped.',
       abandonedClassification, supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
-      terminationReason: 'goal-only-rework-exhausted', quotaExhaustionAssessment: { accountAvailability } }));
-    expect(parsed?.childEvidence).toEqual({ classification: 'scope-escape', scopeEscape: true, abandonedClassification,
+      terminationReason: 'goal-only-rework-exhausted', quotaExhaustionAssessment: { accountAvailability } };
+    // SCOPE-ESCAPE-AS-REFINE — a held detail without a stop reason is not a scope-escape stop.
+    expect(parseSelfImplementJson(JSON.stringify(child))?.childEvidence).toMatchObject({ classification: 'implementation-deficit' });
+    expect(parseSelfImplementJson(JSON.stringify(child))?.childEvidence).not.toHaveProperty('scopeEscape');
+    const parsed = parseSelfImplementJson(JSON.stringify({ ...child, scopeStopReasons: ['deletion'] }));
+    expect(parsed?.childEvidence).toEqual({ classification: 'scope-escape', scopeEscape: true, scopeStopReasons: ['deletion'], abandonedClassification,
       detail: 'Out-of-scope edits held in the worktree; gate and publication skipped.',
       supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
       terminationReason: 'goal-only-rework-exhausted', accountAvailability });
@@ -84,7 +88,8 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
     mkdirSync(join(repo, 'src'), { recursive: true });
     mkdirSync(home);
     writeFileSync(join(repo, 'src/inside.ts'), 'export const inside = 1;\n');
-    writeFileSync(join(repo, 'LICENSE'), 'original\n');
+    // SCOPE-AS-DIRECTION accepts a plain outside edit; a protected path (.env) is what still holds (SCOPE-ESCAPE-AS-REFINE).
+    writeFileSync(join(repo, '.env'), 'A=1\n');
     const git = (...args: string[]) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
     try {
       git('init', '-q');
@@ -105,8 +110,7 @@ mock.module(${JSON.stringify(orchestrator)}, () => ({ ...original, runSelfImplem
   original.runSelfImplement({ ...options, runId: 'run-scope-cli', goalFile: ${JSON.stringify(goalFile)}, memory: false,
     writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
     seams: seams({ createWorktree: async ({ branch, base }) => ({ path: ${JSON.stringify(worktree)}, branch, base, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
-      // A deletion is a critical scope expansion; ordinary outside edits are now accepted by default.
-      implement: async () => { require('node:fs').rmSync(${JSON.stringify(join(worktree, 'LICENSE'))}, { force: true }); return { ok: true, summary: 'impl' }; },
+      implement: async () => { require('node:fs').writeFileSync(${JSON.stringify(join(worktree, '.env'))}, 'edited by child\\n'); return { ok: true, summary: 'impl' }; },
       askExecutionClarification: async () => ({ choice: 'Stay in scope', by: 'owner' }),
       gate: async () => { throw new Error('gate must not run'); },
       openPr: async () => { throw new Error('PR must not open'); } }) }) }));
@@ -118,15 +122,15 @@ mock.module(${JSON.stringify(orchestrator)}, () => ({ ...original, runSelfImplem
       });
       expect(launched.error).toBeUndefined();
       expect(launched.status, `stdout: ${launched.stdout}\nstderr: ${launched.stderr}`).toBe(0);
-      expect(execFileSync('git', ['status', '--porcelain', '--', 'LICENSE'], { cwd: worktree, encoding: 'utf8' }),
-        `stdout: ${launched.stdout}\nstderr: ${launched.stderr}`).toContain('LICENSE');
+      expect(execFileSync('git', ['status', '--porcelain', '--', '.env'], { cwd: worktree, encoding: 'utf8' }),
+        `stdout: ${launched.stdout}\nstderr: ${launched.stderr}`).toContain('.env');
       const output = launched.stdout;
       const terminal = JSON.parse(output.trim().split('\n').at(-1)!) as { result?: Record<string, unknown> } & Record<string, unknown>;
       const child = terminal.result ?? terminal;
-      expect(child).toMatchObject({ stage: 'soft-stopped', outOfScopeEdits: ['LICENSE'], outsideCount: 1,
+      expect(child).toMatchObject({ stage: 'soft-stopped', outOfScopeEdits: ['.env'], scopeStopReasons: ['protected-path'], outsideCount: 1,
         nameCapReached: false, worktreePath: worktree, branch: expect.any(String) });
       expect(parseSelfImplementJson(output)).toMatchObject({ worktreePath: worktree, branch: child.branch,
-        childEvidence: { classification: 'scope-escape', scopeEscape: true, outOfScopeEdits: ['LICENSE'] } });
+        childEvidence: { classification: 'scope-escape', scopeEscape: true, scopeStopReasons: ['protected-path'], outOfScopeEdits: ['.env'] } });
       console.log(`[scope-cli] command=bun --preload ${preload} ${entry} --test self implement --json "implement scoped change" rc=${launched.status} stdout-tail=${output.trim().split('\n').at(-1)}`);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -411,7 +415,7 @@ mock.module(${JSON.stringify(orchestrator)}, () => ({ ...original, runSelfImplem
   test('parseSelfImplementJson — nested child failure supplies the parent disposition without borrowing an earlier result', () => {
     const old = JSON.stringify({ kind: 'self', ok: false, result: { stage: 'aborted', ok: false, outOfScopeEdits: ['old.ts'] } });
     const current = JSON.stringify({ kind: 'external', ok: false, result: { stage: 'soft-stopped', ok: false,
-      outOfScopeEdits: ['current.ts'], abandonedClassification: { classification: 'implementation-deficit' },
+      outOfScopeEdits: ['current.ts'], scopeStopReasons: ['deletion'], abandonedClassification: { classification: 'implementation-deficit' },
       supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
       terminationReason: { kind: 'goal-only-rework-exhausted' },
       quotaExhaustionAssessment: { accountAvailability: { reason: 'no-candidate', candidateCount: 0 } } } });
@@ -438,7 +442,11 @@ mock.module(${JSON.stringify(orchestrator)}, () => ({ ...original, runSelfImplem
 
   test('parseSelfImplementJson — legacy flat stage without ok retains its scope evidence', () => {
     const disposition = parseSelfImplementJson(JSON.stringify({ stage: 'soft-stopped', outOfScopeEdits: ['x.ts'] }));
-    expect(disposition).toMatchObject({ stage: 'soft-stopped', childEvidence: { classification: 'scope-escape', scopeEscape: true, outOfScopeEdits: ['x.ts'] } });
+    // SCOPE-ESCAPE-AS-REFINE — no stop reason: the held name is the new scope, not a scope-escape.
+    expect(disposition).toMatchObject({ stage: 'soft-stopped', childEvidence: { newScope: ['x.ts'], outOfScopeEdits: ['x.ts'] } });
+    expect(disposition?.childEvidence).not.toHaveProperty('scopeEscape');
+    expect(parseSelfImplementJson(JSON.stringify({ stage: 'soft-stopped', outOfScopeEdits: ['.env'] }))).toMatchObject({ stage: 'soft-stopped',
+      childEvidence: { classification: 'scope-escape', scopeEscape: true, scopeStopReasons: ['protected-path'], outOfScopeEdits: ['.env'] } });
   });
 
   test('wrong surface kind → throws (guard)', async () => {

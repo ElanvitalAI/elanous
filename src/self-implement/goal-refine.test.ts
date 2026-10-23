@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, testFakeLlmProvider } from '../ux-sim/fake-llm.js';
 import {
@@ -150,6 +153,17 @@ describe('refineGoalFromFirstRound — 실패는 v1 유지 ⊕ 사유(보수 쪽
     expect(called).toBe(false);
   });
 
+  test('SCOPE-ESCAPE-AS-REFINE — 구현이 알려준 새 범위(newScope)가 재그라운딩 입력에 실린다', async () => {
+    const prompts: string[] = [];
+    const callLLM: RefineCallLLM = async ({ prompt }) => { prompts.push(prompt); return JSON.stringify(note()); };
+    await refineGoalFromFirstRound({ v1: GOAL, evidence: { ...ev, newScope: ['src/cli/index.ts', 'LICENSE'] }, visit: 1 }, { callLLM });
+    console.log(`[goal-refine newScope] ${prompts[0]!.split('\n').find((line) => line.includes('새 범위'))}`);
+    expect(prompts[0]).toContain('- 구현이 알려준 새 범위(대상 경로 밖 편집 · 실패 아님 · 예상 구역에 넣을지 판단): src/cli/index.ts, LICENSE');
+    const none: string[] = [];
+    await refineGoalFromFirstRound({ v1: GOAL, evidence: ev, visit: 1 }, { callLLM: async ({ prompt }) => { none.push(prompt); return JSON.stringify(note()); } });
+    expect(none[0]).not.toContain('새 범위');
+  });
+
   test('프롬프트에 고정 층·첫 라운드 지적·건드린 파일이 실린다', async () => {
     const prompts: string[] = [];
     const callLLM: RefineCallLLM = async ({ prompt }) => { prompts.push(prompt); return `\`\`\`json\n${JSON.stringify(note())}\n\`\`\``; };
@@ -266,6 +280,49 @@ describe('fixture 런 — 첫 라운드 리뷰가 수용선 모호를 지적 →
       console.log(`[fixture goal-refined] ${JSON.stringify(refined[0])}`);
     } finally {
       log.mockRestore();
+    }
+  });
+});
+
+describe('fixture 런 — SCOPE-ESCAPE-AS-REFINE: 첫 라운드 범위 밖 편집 → 수용 ⊕ 재그라운딩 입력 newScope', () => {
+  test('runSelfImplement: 대상 밖 lib/outside.ts 가 실패 없이 수용되고 노트 프롬프트에 새 범위로 실린다', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'goal-refine-new-scope-'));
+    const goalFile = join(directory, 'goal.txt');
+    writeFileSync(goalFile, ['## PROBLEM', 'Original ask (verbatim, unmodified):', '```', '대상 경로: src/inside.ts', 'Implement the change.', '```', ''].join('\n'));
+    const prompts: string[] = [];
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let reviews = 0;
+    let gates = 0;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await runSelfImplement({
+        runId: 'goal-refine-new-scope', feature: GOAL, goalFile, completion: 'worktree-only', memory: false, maxReworkRounds: 1,
+        writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
+        seams: seams({
+          changedFilesForGateRoute: () => ['src/inside.ts', 'lib/outside.ts'],
+          askExecutionClarification: async () => { throw new Error('must not ask — the outside edit is accepted'); },
+          gate: async () => { gates++; return { passed: true, log: 'ok' }; },
+          elaborateCallLLM: async ({ prompt }) => {
+            prompts.push(prompt);
+            if (!prompt.includes('재그라운딩 노트(E3')) throw new Error('not scripted');
+            return JSON.stringify(note({ edits: [note().edits[0]!] }));
+          },
+          writeRunLedger: ((entry: { event: string; data: Record<string, unknown> }) => { ledger.push(entry); }) as never,
+          reviewDiff: async () => (++reviews === 1
+            ? { verdict: 'fail', mustFix: ['수용선 «결과가 적절하다»가 모호하다'], shouldFix: [], summary: 'ambiguous', reviewed: true, diffTruncated: false }
+            : { verdict: 'pass', mustFix: [], shouldFix: [], summary: 'ok', reviewed: true, diffTruncated: false }),
+        }),
+      });
+      expect(result).toMatchObject({ ok: true, scopeExpansion: { count: 1, files: [{ path: 'lib/outside.ts', kind: 'other' }] } });
+      expect(gates).toBe(2);
+      expect(ledger.some((entry) => entry.event === 'execution-scope-held')).toBe(false);
+      const notePrompt = prompts.find((p) => p.includes('재그라운딩 노트(E3'));
+      console.log(`[fixture goal-refine newScope] ${notePrompt?.split('\n').find((line) => line.includes('새 범위'))}`);
+      expect(notePrompt).toContain('- 구현이 알려준 새 범위(대상 경로 밖 편집 · 실패 아님 · 예상 구역에 넣을지 판단): lib/outside.ts');
+      expect(ledger.find((entry) => entry.event === 'goal-refined')?.data).toMatchObject({ outcome: 'refined', round: 1 });
+    } finally {
+      log.mockRestore();
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });

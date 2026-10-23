@@ -126,8 +126,17 @@ export function planPodAccounts(
 export function planOwnerCodexMirrorCandidates(candidates: readonly RotationCandidate[], options: {
   accountOrder: readonly string[];
   thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
+  creditsAllowed?: boolean;
+  creditReserve?: number;
 }): RotationCandidate[] {
   const usable = new Set(planPodAccounts(candidates, { thresholdPercentByAccount: options.thresholdPercentByAccount }).usable);
+  // The parent has to install an access mirror before the remote Pod can use its
+  // credit fallback. Only a measured balance above the reserve admits that mirror.
+  if (usable.size === 0 && options.creditsAllowed) {
+    const reserve = typeof options.creditReserve === 'number' && Number.isFinite(options.creditReserve) && options.creditReserve >= 0
+      ? options.creditReserve : CODEX_CREDIT_RESERVE_DEFAULT;
+    return creditCandidatesByBalance(candidates, reserve);
+  }
   const rank = (name: string): number => {
     const index = options.accountOrder.indexOf(name);
     return index < 0 ? options.accountOrder.length : index;

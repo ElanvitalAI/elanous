@@ -236,6 +236,38 @@ describe('usage outcomes', () => {
     expect(table).toContain('불명');
     expect(table).toContain('no-progress=1');
   });
+
+  it('실패 종단에서만 막힘 사유를 읽고 중간 condition은 버리며 불명은 표시한다', () => {
+    const origin = { runId: 'r', event: 'run-origin', data: { childProvider: 'codex' } };
+    const skipped = { runId: 'r', event: 'node-skipped', data: { reason: 'condition' } };
+    expect(queryUsageOutcomes(2, { list: () => ['r.jsonl'], load: () => [origin, skipped, { runId: 'r', event: 'failed', data: { stopReason: 'gate-failed' } }] })).toMatchObject({
+      rows: [{ blockReasons: { 'gate-failed': 1 } }],
+    });
+    expect(queryUsageOutcomes(2, { list: () => ['r.jsonl'], load: () => [origin, { runId: 'r', event: 'failed', data: {} }, skipped] })).toMatchObject({
+      rows: [{ blockReasons: { unclassified: 1 } }],
+    });
+    expect(queryUsageOutcomes(2, { list: () => ['r.jsonl'], load: () => [origin, skipped] })).toMatchObject({
+      rows: [{ open: 1, blockReasons: {} }],
+    });
+    expect(queryUsageOutcomes(2, { list: () => ['r.jsonl'], load: () => [origin,
+      { runId: 'r', event: 'failed', data: { reason: 'actual-stop' } },
+      { runId: 'r', event: 'run-status', data: { runStatus: 'running', reason: 'heartbeat' } }] })).toMatchObject({
+      rows: [{ blockReasons: { 'actual-stop': 1 } }],
+    });
+    expect(queryUsageOutcomes(2, { list: () => ['r.jsonl'], load: () => [origin,
+      { runId: 'r', event: 'failed', data: { reason: 'older-stop' } },
+      { runId: 'r', event: 'run-status', data: { runStatus: 'failed' } }] })).toMatchObject({
+      rows: [{ failed: 1, blockReasons: { 'older-stop': 1 } }],
+    });
+    expect(queryUsageOutcomes(2, { list: () => ['r.jsonl'], load: () => [origin,
+      { runId: 'r', event: 'run-status', data: { runStatus: 'failed', reason: 'run-status-stop' } }] })).toMatchObject({
+      rows: [{ failed: 1, blockReasons: { 'run-status-stop': 1 } }],
+    });
+    expect(queryUsageOutcomes(2, { list: () => ['r.jsonl'], load: () => [origin,
+      { runId: 'r', event: 'run-status', data: { runStatus: 'stopped', reason: 'explicit-stop' } }] })).toMatchObject({
+      rows: [{ open: 1, blockReasons: {} }],
+    });
+  });
 });
 
 describe('measureAutoLandRatio — 원장 집계와 손 착지 수의 순수 결합', () => {

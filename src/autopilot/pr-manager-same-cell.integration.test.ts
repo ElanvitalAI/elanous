@@ -6,18 +6,22 @@ import { join } from 'node:path';
 import { makePrManager, type CmdRunner } from './pr-manager.js';
 import { cardIdFromBody, guardNewPr, hasCardMarker } from '../pr-tool/census.js';
 import { podGitPushGuardScript } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { debug } from '../debug/log.js';
 
 const head40 = /^[0-9a-f]{40}$/;
 setDefaultTimeout(30_000);
 
 function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = false, moveAtPush = false,
   raceNewBranch = false,
-  existingNewBranch = false, runId?: string) {
+  existingNewBranch = false, runId?: string,
+  falls: { tornUploadReport?: boolean; transientDeleteOnce?: boolean; refusedUpload?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'same-cell-pr-'));
   const bare = join(root, 'origin.git');
   const work = join(root, 'work');
+  // The stage owns its git config: a host-wide core.hooksPath would otherwise decide these pushes.
+  const gitEnv = { ...process.env, HOME: root, XDG_CONFIG_HOME: join(root, '.config'), GIT_CONFIG_NOSYSTEM: '1' };
   const git = (...args: string[]) => {
-    const r = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    const r = spawnSync('git', args, { cwd: root, encoding: 'utf8', env: gitEnv });
     if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
     return r.stdout.trim();
   };
@@ -37,7 +41,7 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
   inWork('checkout', 'main'); inWork('checkout', '-b', 'new-branch');
   if (runId) {
     const install = spawnSync('sh', ['-c', podGitPushGuardScript(runId)],
-      { cwd: work, env: { ...process.env, HOME: root }, encoding: 'utf8' });
+      { cwd: work, env: gitEnv, encoding: 'utf8' });
     if (install.status !== 0) throw new Error(`install Pod push guard: ${install.stderr}`);
     inWork('config', 'core.hooksPath', join(root, '.elanous-git-hooks'));
   }
@@ -48,9 +52,26 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
   const url = 'https://github.com/o/r/pull/7';
   const calls: string[][] = [];
   let remoteReads = 0;
+  let failedDeletes = 0;
+  const isScratchUpload = (args: readonly string[]) => args.includes('push')
+    && args.some(arg => /^HEAD:refs\/heads\/self-impl\/pr-create-r/.test(arg));
+  const isScratchDelete = (args: readonly string[]) => args.includes('push')
+    && args.some(arg => /^:refs\/heads\/self-impl\/pr-create-r/.test(arg));
   const run: CmdRunner = (cmd, args) => {
     calls.push([cmd, ...args]);
     if (cmd === 'git') {
+      // A push can land its ref and still exit non-zero — the remote keeps the ref while the
+      // caller only sees the failure.
+      if (falls.tornUploadReport && isScratchUpload(args)) {
+        spawnSync('git', args, { cwd: work, encoding: 'utf8', env: gitEnv });
+        return { ok: false, out: '', err: 'fatal: the remote end hung up unexpectedly' };
+      }
+      // An upload refused before the remote stored anything — the ref never exists.
+      if (falls.refusedUpload && isScratchUpload(args))
+        return { ok: false, out: '', err: '! [remote rejected] HEAD -> scratch (pre-receive hook declined)' };
+      // A transient delete failure must not strand the scratch ref.
+      if (falls.transientDeleteOnce && isScratchDelete(args) && failedDeletes++ === 0)
+        return { ok: false, out: '', err: "error: cannot lock ref 'refs/heads/self-impl/': Unable to create lock file: File exists." };
       if (args.includes('ls-remote') && args.includes('refs/heads/old-branch')) {
         remoteReads++;
         if (moveRemoteHead && remoteReads === 2)
@@ -58,7 +79,7 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
       }
       if (moveAtPush && args.includes('push') && args.some(arg => arg.startsWith('--force-with-lease=')))
         git('--git-dir', bare, 'update-ref', 'refs/heads/old-branch', mainHead);
-      const r = spawnSync('git', args, { cwd: work, encoding: 'utf8' });
+      const r = spawnSync('git', args, { cwd: work, encoding: 'utf8', env: gitEnv });
       return { ok: r.status === 0, out: r.stdout.trim(), err: r.stderr.trim() };
     }
     if (cmd === 'gh' && args[0] === 'repo' && args[1] === 'view') return { ok: true, out: 'o/r' };
@@ -85,9 +106,13 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
       updatedAt: '2026-10-19T00:00:00Z', headSha: oldHead, labels: [], files: [conflict ? 'shared.txt' : 'old.txt'],
       seat: null, cellId: 'PR-SAME-CELL-REUSE', cardId: cardIdFromBody(oldBody), cardMarkerPresent: hasCardMarker(oldBody) }],
   });
+  // Remote truth, read from the bare origin instead of the push reports.
+  const remoteHeads = () => inWork('ls-remote', '--heads', 'origin')
+    .split('\n').filter(Boolean).map(line => line.split('\t')[1]!).sort();
+  const scratchRefs = () => remoteHeads().filter(ref => ref.startsWith('refs/heads/self-impl/pr-create-r'));
   const deliver = () => makePrManager(run, guard).upsertPr({ branch: 'new-branch', worktreePath: work,
     title: 'new work', body, commitMessage: 'new work', base: 'main', ...(runId ? { runId } : {}) });
-  return { root, work, oldHead, mainHead, calls, deliver, inWork, url };
+  return { root, work, oldHead, mainHead, calls, deliver, inWork, remoteHeads, scratchRefs, url };
 }
 
 test('real git merges the old PR head and advances its branch without force or a second PR', () => {
@@ -179,5 +204,82 @@ test('a branch created after the remote precheck loses the atomic create race wi
     expect(f.deliver()).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('new run branch create refused') });
     expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/new-branch').split('\t')[0]).toBe(f.mainHead);
     expect(f.calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+test('an opened new draft leaves no scratch ref behind and moves no other remote ref', () => {
+  const f = fixture(true, false, false, false, false, false, 'run-a1b2c3d4-1111-2222-3333-444444444444');
+  try {
+    expect(f.remoteHeads()).toEqual(['refs/heads/main', 'refs/heads/old-branch']);
+    expect(f.deliver()).toEqual({ ok: true, url: 'https://github.com/o/r/pull/8', reused: false, supersededPr: 7 });
+    expect(f.scratchRefs()).toEqual([]);
+    expect(f.remoteHeads()).toEqual(['refs/heads/main', 'refs/heads/new-branch', 'refs/heads/old-branch']);
+    expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/old-branch').split('\t')[0]).toBe(f.oldHead);
+    expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/main').split('\t')[0]).toBe(f.mainHead);
+    expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/new-branch').split('\t')[0]).toBe(f.inWork('rev-parse', 'HEAD'));
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+test('a refused new branch still reaps its own scratch ref and leaves every remote ref unchanged', () => {
+  const f = fixture(true, false, false, false, true, false, 'run-a1b2c3d4-1111-2222-3333-444444444444');
+  try {
+    expect(f.deliver()).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('new run branch create refused') });
+    expect(f.scratchRefs()).toEqual([]);
+    expect(f.remoteHeads()).toEqual(['refs/heads/main', 'refs/heads/new-branch', 'refs/heads/old-branch']);
+    expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/new-branch').split('\t')[0]).toBe(f.mainHead);
+    expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/old-branch').split('\t')[0]).toBe(f.oldHead);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+test('an upload that landed its ref but reported failure is still reaped', () => {
+  const f = fixture(true, false, false, false, false, false, 'run-a1b2c3d4-1111-2222-3333-444444444444',
+    { tornUploadReport: true });
+  try {
+    expect(f.deliver()).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('new run object upload failed') });
+    expect(f.scratchRefs()).toEqual([]);
+    expect(f.remoteHeads()).toEqual(['refs/heads/main', 'refs/heads/old-branch']);
+    expect(f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/main').split('\t')[0]).toBe(f.mainHead);
+    expect(f.calls.some(call => call[0] === 'gh' && call[1] === 'api' && call.includes('POST'))).toBe(false);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+
+test('a failed upload always attempts the reap (no read-then-skip window) and a missing ref is not a cleanup failure', () => {
+  const f = fixture(true, false, false, false, false, false, 'run-a1b2c3d4-1111-2222-3333-444444444444',
+    { refusedUpload: true });
+  const warns: unknown[] = [];
+  const rawLog = debug.log;
+  debug.log = ((category: string, event: string, data?: unknown, opts?: unknown) => {
+    if (category === 'autopilot.pr-manager' && event === 'same-cell-scratch-cleanup-failed') warns.push(data);
+    return (rawLog as (...a: unknown[]) => unknown).call(debug, category, event, data, opts);
+  }) as typeof debug.log;
+  try {
+    expect(f.deliver()).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('new run object upload failed') });
+    const deletes = f.calls.filter(call => call[0] === 'git' && call.includes('push')
+      && call.some(arg => arg.startsWith(':refs/heads/self-impl/pr-create-r')));
+    expect(deletes).toHaveLength(1);
+    expect(warns).toEqual([]);
+    expect(f.scratchRefs()).toEqual([]);
+    expect(f.remoteHeads()).toEqual(['refs/heads/main', 'refs/heads/old-branch']);
+  } finally {
+    debug.log = rawLog;
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+
+test('a transient scratch-ref delete failure is retried so the ref does not outlive the attempt', () => {
+  const f = fixture(true, false, false, false, false, false, 'run-a1b2c3d4-1111-2222-3333-444444444444',
+    { transientDeleteOnce: true });
+  try {
+    expect(f.deliver()).toEqual({ ok: true, url: 'https://github.com/o/r/pull/8', reused: false, supersededPr: 7 });
+    expect(f.scratchRefs()).toEqual([]);
+    expect(f.remoteHeads()).toEqual(['refs/heads/main', 'refs/heads/new-branch', 'refs/heads/old-branch']);
+    const deletes = f.calls.filter(call => call[0] === 'git' && call.includes('push')
+      && call.some(arg => arg.startsWith(':refs/heads/self-impl/pr-create-r')));
+    expect(deletes).toHaveLength(2);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

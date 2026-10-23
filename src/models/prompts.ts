@@ -189,7 +189,14 @@ export function getModelTier(
 
 /** Minimal tool-call hygiene for older GPT/o-series models. Kept
  *  short and generic so stronger providers do not get burdened with
- *  Codex-specific anti-loop rules they do not need. */
+ *  Codex-specific anti-loop rules they do not need.
+ *
+ *  TUI-OPS-TURN-GUARD gap ② (2026-10-22): rule 4 states the ops-turn
+ *  guard split — it must live here too, not only in the codex addon,
+ *  because gpt-6 ids stay in the 'gpt' family (usesCodexBehaviorGuards
+ *  widens the behavior predicate, not the family) and gpt-6 models run
+ *  those llm.ts phase guards. The tool names mirror the allow lists in
+ *  src/llm/tool-loop-steered-rejection.ts that llm.ts consumes. */
 const TOOL_DISCIPLINE_GPT = [
   '',
   '## Tool-call hygiene',
@@ -197,6 +204,7 @@ const TOOL_DISCIPLINE_GPT = [
   '1. NEVER call the same tool with identical arguments twice in a row. If you already Read a file, use its previous tool_result from history — do not re-Read.',
   '2. After each tool_result, emit AT LEAST one sentence of reasoning (what you learned, what you will do next) BEFORE issuing the next tool call. Silent tool-spam is a failure mode we actively block.',
   '3. If any tool_result contains "DUPLICATE CALL", "RUNTIME BLOCKED", "TOOL CALL REJECTED", or "SYSTEM BUDGET NOTICE" — STOP. Your next output MUST be plain text (the final answer or a clear "impossible because X"), not another tool call.',
+  '4. Ops turns (TUI-OPS-TURN-GUARD): read-only ops observation tools (`logs_query`, `PtyShellPoll`) stay runnable mid-ops-turn — keep observing the run with them. Write-capable ops tools (`schedule_manage`, `se_build`) are phase-governed: when one returns "TOOL CALL REJECTED" it is out of phase for this turn — do not retry it; rule 3 applies (finish in plain text).',
   '',
 ].join('\n');
 
@@ -204,7 +212,13 @@ const TOOL_DISCIPLINE_GPT = [
  *  Their common failure mode is read-only polling on stable state
  *  (Read / GetDashboardState / similar) instead of acting on the
  *  result they already have. Keep this focused on tool-loop hygiene,
- *  not orchestration prose. */
+ *  not orchestration prose.
+ *
+ *  TUI-OPS-TURN-GUARD gap ② (2026-10-22): rule 5 states the ops-turn
+ *  guard split so the prompt half matches the ACTION_PHASE_OPS_TOOLS /
+ *  REPAIR_PHASE_READ_ONLY_OPS_TOOLS allow lists llm.ts consumes —
+ *  read-only ops observation stays runnable mid-ops-turn, write-capable
+ *  ops tools stay phase-governed. */
 const TOOL_DISCIPLINE_CODEX = [
   '',
   '## Tool-call hygiene',
@@ -213,6 +227,7 @@ const TOOL_DISCIPLINE_CODEX = [
   '2. Treat read-only state tools as stable within the current turn. Do NOT re-call a state-inspection tool unless an intervening action could have changed the state.',
   '3. After each tool_result, emit AT LEAST one sentence of reasoning (what you learned, what you will do next) BEFORE issuing the next tool call.',
   '4. If any tool_result contains "DUPLICATE CALL", "RUNTIME BLOCKED", "TOOL CALL REJECTED", or "SYSTEM BUDGET NOTICE" — STOP. Your next output MUST be plain text, not another tool call.',
+  '5. Ops turns (TUI-OPS-TURN-GUARD): read-only ops observation tools (`logs_query`, `PtyShellPoll`) stay runnable mid-ops-turn — keep observing the run with them. Write-capable ops tools (`schedule_manage`, `se_build`) are phase-governed: when one returns "TOOL CALL REJECTED" it is out of phase for this turn — do not retry it; rule 4 applies (finish in plain text).',
   '',
 ].join('\n');
 

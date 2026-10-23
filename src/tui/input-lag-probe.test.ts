@@ -405,7 +405,9 @@ describe('preambleSyncBlockMs seam', () => {
     const blocked = performance.now() - t1;
     expect(blocked).toBeGreaterThanOrEqual(120);
     expect(blocked - unblocked).toBeGreaterThanOrEqual(100);
-  });
+    // K-OP-035 — 실물 preamble 빌드(gitSnapshot git 서브프로세스)는 부하·콜드 조건에서 bun 기본
+    // 5s 한도를 넘는다(실측 5683ms) — 한도를 명시한다.
+  }, 120_000);
 
   test('등록된 프로브는 preamble 을 turn-start 창으로 잰다', () => {
     const { probe, r } = rig();

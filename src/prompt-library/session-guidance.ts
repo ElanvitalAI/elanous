@@ -33,6 +33,11 @@ function hasTool(enabled: ReadonlySet<string>, ...names: string[]): boolean {
   return false;
 }
 
+/** One working tab per site: each one-shot `aside repl "<js>"` call starts a new REPL
+ *  session, so `page` from the previous call is gone — reattach, don't reopen. */
+export const ASIDE_BROWSER_GUIDANCE =
+  'When you drive a browser with `aside repl "<js>"`: each call is a new REPL session, so reuse ONE working tab instead of opening a new one per step (extra tabs of the same app trigger «open in another tab» locks and lost connections). Start every script by reattaching: `const t1=(await listBrowserTabs()).find(t=>t.url.startsWith(\'<origin+path>\')); if (t1) await attachBrowserTab(t1.targetId); else await openTab(\'<url>\');` then use `page`. Call `openTab()` only when no matching tab exists or the user asks for a new page. Always pass the script as the argument — a bare `aside repl` waits for input until the shell timeout. A REPL call may run up to 120s, so give long browser steps a shell timeout above that (e.g. 150000 ms) and split very long flows into several calls.';
+
 /** Build the session guidance addendum. Returns 0 or 1 system message
  *  containing per-tool one-liner directives, gated on what's active.
  *  When `enabledTools` is undefined or every relevant tool is absent,
@@ -112,6 +117,15 @@ export function buildSessionGuidanceAddendum(
     items.push(
       'For self-driven multi-turn work (refining your own answer, analyzing your own forensic log, delegating a sub-task), you may shell out to the CLI: `elanous chat --new --json "<text>"` returns `{sessionId, ...}`; follow up with `elanous chat --session <id> --json "<text>"`. Provider rotation between turns is fine — same session id keeps the history. Use only when genuinely useful; do not self-spawn for ordinary single-turn answers. Full reference: `docs/manual/MANUAL-llm-pipeline-validation.md` (Part B).',
     );
+  }
+
+  // Browser via Aside (ASIDE-TAB-REUSE · 10-22). Observed in the n8n lecture
+  // session: every step ran `aside repl "var p=await openTab('<same url>')…"`.
+  // A one-shot `aside repl` is a fresh REPL session, so each call opened another
+  // tab → n8n «Editing in another tab» lock → lost connection → the step repeated.
+  // A bare `aside repl` (no script) also hung until the shell timeout.
+  if (hasTool(active, 'Bash', 'bash', 'RunShell', 'run_shell', 'aside.repl', 'aside_repl')) {
+    items.push(ASIDE_BROWSER_GUIDANCE);
   }
 
   if (items.length === 0) return [];

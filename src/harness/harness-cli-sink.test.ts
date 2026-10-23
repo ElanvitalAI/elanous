@@ -375,6 +375,7 @@ describe('harness CLI sink hook', () => {
       '--repair-commit-only',
       '--bench',
       '--author-grade',
+      '--move-id',
     ]);
   });
 

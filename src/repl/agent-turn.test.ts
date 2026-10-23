@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { DaemonSessionHistory } from '../boot/daemon-runtime.js';
 import { abortAgentTurn, createAgentTurnRunner } from './agent-turn.js';
 import { buildReplSystemPrompt } from './index.js';
-import { resetSeatBootCacheForTest } from '../dashboard/seat-boot-preamble.js';
+import { resetSeatBootCacheForTest, SEAT_MEMORY_RECALL_PREFIX } from '../dashboard/seat-boot-preamble.js';
 import { MsgStore } from '../msg/msg-store.js';
 import type { UserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
@@ -242,6 +242,29 @@ describe('새 TUI REPL 시스템 프롬프트 — 자리 부트 카드(TUI-SESSI
         seatBootDeps: seatDeps(f.home, f.msgPath),
       })).toBe(text);
     } finally {
+      f.store.close();
+      rmSync(f.home, { recursive: true, force: true });
+      rmSync(f.cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('자리 REPL(Next) 첫 턴 — 직전 인계 회상 한 줄이 실린다(TUI-SEAT-MEMORY-RECALL)', () => {
+    const f = seatFixture();
+    try {
+      resetSeatBootCacheForTest();
+      writeFileSync(join(f.home, 'elanous-hq', 'seat-state', 'OP', 'HANDOFF-now.md'), '# OP 이어받기 — 10-22\n열차 #30001 등록 확인부터\n');
+      const prompt = buildReplSystemPrompt({
+        cfg: fakeConfig,
+        enabledToolNames: undefined,
+        cwd: f.cwd,
+        sessionId: 'repl-recall-session',
+        seatBootDeps: seatDeps(f.home, f.msgPath),
+      }) ?? '';
+      const lines = prompt.split('\n').filter((line) => line.startsWith(SEAT_MEMORY_RECALL_PREFIX));
+      expect(lines.length).toBe(1);
+      expect(lines[0]).toContain('열차 #30001 등록 확인부터');
+    } finally {
+      resetSeatBootCacheForTest();
       f.store.close();
       rmSync(f.home, { recursive: true, force: true });
       rmSync(f.cwd, { recursive: true, force: true });

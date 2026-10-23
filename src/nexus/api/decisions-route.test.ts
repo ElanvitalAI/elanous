@@ -166,6 +166,43 @@ test('POST decides in the real temporary ledger as human; missing, closed and in
   expect(JSON.stringify(events)).not.toContain('선택 이유');
 });
 
+test('GET serves the trail and same-category precedent that the now and precedent cells read', async () => {
+  const { ledger, first, second } = fixture();
+  ledger.decide(second.id, 'a', { kind: 'human' }, '과거 판단');
+  const open = ledger.raise({ title: '열린 결정', category: 'other', scqa: { s: '상황', c: '결정 필요' },
+    options: [{ key: 'a', label: '진행', consequence: '진행' }, { key: 'b', label: '대기', consequence: '대기' }],
+    recommendation: { option: 'a', why: '빠르다' }, raisedBy: { agent: 'OP' } });
+  const response = await dispatch(ledger, '/v1/decisions?status=open', { headers: auth });
+  const body = await response?.json() as { decisions: Array<{
+    id: string; history: Array<{ type: string; at?: string; by: string; choice?: string }>;
+    precedent: { id: string; title: string; choice: string; decidedAt: string; decidedBy: string } | null }> };
+  const item = body.decisions.find(row => row.id === open.id)!;
+  expect(item.history).toEqual([{ type: 'raised', at: open.raisedAt!, by: 'OP' }]);
+  expect(item.precedent).toMatchObject({ id: second.id, title: '둘째 결정', choice: '예', decidedBy: 'human' });
+  expect(item.precedent!.decidedAt).toBe(ledger.show(second.id).decidedAt!);
+  expect(body.decisions.find(row => row.id === first.id)!.precedent).toBeNull();
+});
+
+test('a precedent decided without a recorded actor stays unknown instead of being reported as autonomous', async () => {
+  const { ledger, second } = fixture();
+  ledger.decide(second.id, 'a', { kind: 'human' }, '과거 판단');
+  const decided = ledger.list({ status: 'decided' })
+    .map(entry => entry.id === second.id ? { ...entry, decidedBy: undefined } : entry);
+  const open = ledger.raise({ title: '열린 결정', category: 'other', scqa: { s: '상황', c: '결정 필요' },
+    options: [{ key: 'a', label: '진행', consequence: '진행' }, { key: 'b', label: '대기', consequence: '대기' }],
+    recommendation: { option: 'a', why: '빠르다' }, raisedBy: { agent: 'OP' } });
+  const stub = {
+    list: (query: { status: 'open' | 'decided' }) => query.status === 'decided' ? decided : ledger.list(query),
+    decide: ledger.decide.bind(ledger),
+  } as unknown as DecisionLedger;
+  const response = await dispatch(stub, '/v1/decisions?status=open', { headers: auth });
+  const body = await response?.json() as { decisions: Array<{ id: string; precedent: Record<string, unknown> | null }> };
+  const item = body.decisions.find(row => row.id === open.id)!;
+  expect(item.precedent).not.toBeNull();
+  expect(item.precedent!.decidedBy).toBeUndefined();
+  expect(JSON.stringify(item.precedent)).not.toContain('auto');
+});
+
 test('route handler fails closed without an injected authorization check, even with a ledger', async () => {
   const { ledger, first } = fixture();
   expect((await handleDecisions(new Request('http://nexus.test/v1/decisions?status=open'), { ledger })).status).toBe(401);

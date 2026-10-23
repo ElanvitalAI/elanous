@@ -10,6 +10,8 @@
 import { describe, expect, test } from 'bun:test';
 import { buildManualReviewIntent, buildReviewIntent, capIntent, extractIntentBlocks, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationObservation, stripExtractedSections, MAX_INTENT_ITEMS, MAX_INTENT_ITEM_CHARS, MAX_REVIEW_INTENT_CHARS, type ExtractedIntentBlocks } from './review-intent.js';
 import { toReviewIntentInput } from '../self-implement/seams.js';
+import { DEVICE_FIRST_STEP, ensureDeviceFirstSteps } from '../self-implement/device-first.js';
+import { composeSliceHandText } from '../task-agent/tier-split.js';
 
 describe('buildManualReviewIntent', () => {
   test('상한 이하는 종전 수동 조립 문자열과 문자 동등하다', () => {
@@ -161,6 +163,48 @@ describe('buildReviewIntent design gate', () => {
 });
 
 describe('buildReviewIntent', () => {
+  test('장치 조각 리뷰에는 다음 피처 조각의 호출부를 must-fix로 요구하지 않는 경계가 닿는다', () => {
+    const parent = [
+      '대상 경로: src/feature.ts',
+      '필요한 장치: new-device',
+      `동작: ${DEVICE_FIRST_STEP} 장치를 먼저 만든다`,
+      '완료 경계 코드: 전체 피처가 장치를 호출한다',
+      '완료 경계 실물: 생산 경로가 장치를 호출한다',
+      '완료 경계 증거 명령: bun test src/feature.test.ts',
+    ].join('\n');
+    const produced = ensureDeviceFirstSteps(parent, ['대상 경로: src/feature.ts · 피처 구현'], process.cwd()).steps[0]!;
+    const goal = composeSliceHandText(produced, parent, { index: 1, total: 2, fromTier: '상', cid: 'UX-DEVICE' });
+    expect(goal).toContain(`· 동작: ${DEVICE_FIRST_STEP}`);
+    const intent = buildReviewIntent({ goal, changedFiles: ['src/ux-sim/new-device.ts'] });
+    expect(intent).toContain('조각 1/2');
+    expect(intent).toContain('호출부 없는 export');
+    expect(intent).toContain('다음 피처 조각');
+    expect(intent).toContain('must-fix');
+  });
+
+  test('긴 부모 골에서도 현재 조각과 다음 조각의 책임 경계를 보존한다', () => {
+    const goal = [
+      '대상 경로: src/feature.ts',
+      '조각 2/3 — 부모 UX(상) 를 중 이하로 나눈 몫. 이 조각 범위만 채운다.',
+      `부모 설명 ${'길다 '.repeat(1200)}`,
+      '완료 경계 실물: 부모 전체 기능을 실물에서 검증',
+    ].join('\n');
+    const intent = buildReviewIntent({ goal });
+    expect(intent.length).toBeLessThanOrEqual(MAX_REVIEW_INTENT_CHARS);
+    expect(intent).toContain('조각 2/3');
+    expect(intent).toContain('다음 조각 몫');
+    expect(intent).toContain('must-fix');
+  });
+
+  test('마지막 조각과 코드 예시 속 표지는 다음 조각 면제를 만들지 않는다', () => {
+    const final = buildReviewIntent({ goal: '대상 경로: src/feature.ts\n조각 2/2 — 마지막 피처 조각' });
+    expect(final).toContain('조각 계약 — 리뷰 범위');
+    expect(final).not.toContain('다음 조각 몫');
+
+    const example = buildReviewIntent({ goal: '## 예시\n```text\n조각 1/2 — 예시\n동작: DEVICE-FIRST-STAGE\n```\n실제 골은 한 조각이다.' });
+    expect(example).not.toContain('조각 계약 — 리뷰 범위');
+  });
+
   test('lite goal leads with acceptance then what/why, boundaries, prior findings and applied items; long ask stays behind a goal-file pointer', () => {
     const goal = [
       'Lite goal', '- GoalType: implement',

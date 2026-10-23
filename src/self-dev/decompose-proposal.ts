@@ -84,6 +84,49 @@ function hotPathOverlapsOf(pieces: readonly DecomposePiece[]): HotPathOverlap[] 
   return pairs;
 }
 
+/** 분해 제안 문서를 «읽은» 결과. ⛔ 혼합 문서를 조각 문서로 «다시 매기지» 않는다. */
+export type DecomposeDocument =
+  | { kind: 'pieces'; pieces: DecomposePiece[] }
+  /** 단계꼴(`step`/문자열)과 조각꼴(`feature`)이 «섞인» 문서. 조용히 다시 매기지 않고 거부한다. */
+  | { kind: 'rejected'; reason: 'mixed-document'; stepEntries: number; pieceEntries: number }
+  /** 읽을 조각이 «하나도» 없다 — 빈 문서와 거부를 같은 값으로 접지 않는다. */
+  | { kind: 'empty' };
+
+/**
+ * 분해 제안 문서(원장 `data.pieces`)를 조각 목록으로 읽는다.
+ *
+ * ⛔⭐ **혼합 문서를 «다시 매기지» 않는다** — 단계꼴 항목(`{ step }`·맨 문자열)은 `feature` 가 없어
+ *   지금까지 «조용히» 버려졌고, 남은 조각 id 가 `String(pieces.length)` 로 **재번호**됐다.
+ *   그 재번호가 `shadow → live` 선행 간선을 «매달린» 것으로 바꿔, shadow 관측 없이 live 가 나갔다.
+ *   ⇒ 단계꼴이 «하나라도» 섞여 있으면 문서 전체를 거부하고 두 수를 값으로 남긴다(처방이 다르다).
+ */
+export function readDecomposeDocument(raw: unknown): DecomposeDocument {
+  if (!Array.isArray(raw) || raw.length === 0) return { kind: 'empty' };
+  const pieces: DecomposePiece[] = [];
+  let stepEntries = 0;
+  for (const entry of raw) {
+    if (typeof entry === 'string') { stepEntries++; continue; }
+    if (!entry || typeof entry !== 'object') continue;
+    const piece = entry as {
+      id?: unknown; feature?: unknown; dependsOn?: unknown; goalType?: unknown; hotPaths?: unknown; step?: unknown;
+    };
+    if (typeof piece.step === 'string' && piece.step.trim()) stepEntries++;
+    if (typeof piece.feature !== 'string' || !piece.feature.trim()) continue;
+    pieces.push({
+      id: typeof piece.id === 'string' && piece.id ? piece.id : String(pieces.length),
+      feature: piece.feature,
+      dependsOn: Array.isArray(piece.dependsOn) ? piece.dependsOn.filter((d): d is string => typeof d === 'string') : [],
+      ...(typeof piece.goalType === 'string' ? { goalType: piece.goalType } : {}),
+      ...(Array.isArray(piece.hotPaths) ? { hotPaths: piece.hotPaths.filter((path): path is string => typeof path === 'string') } : {}),
+    });
+  }
+  if (pieces.length === 0) return { kind: 'empty' };
+  if (stepEntries > 0) {
+    return { kind: 'rejected', reason: 'mixed-document', stepEntries, pieceEntries: pieces.length };
+  }
+  return { kind: 'pieces', pieces };
+}
+
 /** 원장 엔트리들에서 조각별 «가장 늦은» 분해 제안을 뽑는다. 형제 겹침이 있으면 hot-path-overlap 관측을 낸다(fail-open). */
 export function pickDecomposeProposals(entries: readonly Ledgerish[]): Map<string, DecomposeProposal> {
   const out = new Map<string, DecomposeProposal>();
@@ -94,20 +137,20 @@ export function pickDecomposeProposals(entries: readonly Ledgerish[]): Map<strin
       : typeof entry.runId === 'string' && entry.runId.trim() ? entry.runId : null;
     if (!shardId) continue;   // ⛔ 어느 조각인지도 어느 런인지도 모르는 제안은 «쓸 수 없다» — 조용히 아무 데나 붙이지 않는다
     const data = entry.data as { pieces?: unknown; round?: unknown } | undefined;
-    const raw = Array.isArray(data?.pieces) ? data!.pieces : null;
-    if (!raw?.length) continue;
-    const pieces: DecomposePiece[] = [];
-    for (const p of raw) {
-      const piece = p as { id?: unknown; feature?: unknown; dependsOn?: unknown; goalType?: unknown; hotPaths?: unknown };
-      if (typeof piece?.feature !== 'string' || !piece.feature.trim()) continue;
-      pieces.push({
-        id: typeof piece.id === 'string' && piece.id ? piece.id : String(pieces.length),
-        feature: piece.feature,
-        dependsOn: Array.isArray(piece.dependsOn) ? piece.dependsOn.filter((d): d is string => typeof d === 'string') : [],
-        ...(typeof piece.goalType === 'string' ? { goalType: piece.goalType } : {}),
-        ...(Array.isArray(piece.hotPaths) ? { hotPaths: piece.hotPaths.filter((path): path is string => typeof path === 'string') } : {}),
-      });
+    const document = readDecomposeDocument(data?.pieces);
+    if (document.kind === 'empty') continue;
+    // ⛔ 혼합 문서는 «뽑지 않는다» — 다시 매기면 shadow→live 선행 간선이 매달린 것이 된다.
+    if (document.kind === 'rejected') {
+      try {
+        debug.log('self-dev.decompose', 'mixed-decompose-document', {
+          shardId,
+          stepEntries: document.stepEntries,
+          pieceEntries: document.pieceEntries,
+        });
+      } catch { /* fail-open */ }
+      continue;
     }
+    const pieces = document.pieces;
     // ⛔ 조각이 «하나»면 분해가 아니다 — 같은 골을 이름만 바꿔 다시 거는 셈이다.
     if (pieces.length < 2) continue;
     const round = typeof data?.round === 'number' ? data.round : undefined;
@@ -158,8 +201,9 @@ export interface DecomposePieceOrdering {
  *   겹침은 직렬화하지 않고 `DecomposeProposal.hotPathOverlaps` 로 형제 겹침으로 따로 남는다.
  *   덕분에 ⓐ 와 배열 위치가 반대 방향을 가리켜 가짜 순환을 만들던 충돌 자체가 사라졌다.
  *
- * ⛔ 매달린 `dependsOn`(조각 목록에 없는 id)은 «버리고 센다» — 그것 때문에 승격 전체를 막지 않는다
- *   (연합 경로의 `pruneDanglingDependencies` 와 같은 판단).
+ * ⛔ 매달린 `dependsOn`(조각 목록에 없는 id)은 «버리고 센다» — 이 순서 계산기는 승격을 막지 않는다
+ *   (연합 경로의 `pruneDanglingDependencies` 와 같은 판단). 승격 «입구»는 다르다 —
+ *   `planShadowFirstDispatch` 가 매달린 간선을 «거부»한다(shadow 선행 간선이 사라진 채 live 가 나가는 것을 막는다).
  *
  * 순수 함수다 — 시계·파일·프로세스를 안 만진다. 동률은 «원래 순서»로 깬다(같은 입력 → 같은 출력).
  */
@@ -215,6 +259,73 @@ export function orderPiecesTopologically(pieces: readonly DecomposePiece[]): Dec
     };
   }
   return { ordered, dependsOnEdges, hotPathEdges: 0, danglingDependsOn };
+}
+
+/** shadow 조각의 id — 관측만 하는 조각. ⛔ 이름은 하니스 산출이 canonical 이다. */
+export const SHADOW_PIECE_ID = 'shadow';
+
+/** shadow-first 집행 계획의 관측 값 — 무엇이 관측이고 어디에 선행 간선이 걸렸나. */
+export interface ShadowFirstPlan {
+  shadowId: string;
+  /** shadow 뒤에 서는 «live» 조각 id — 제안 순서 그대로다. */
+  liveIds: string[];
+  /** 원 제안이 잃고 있어 «되살린» shadow 선행 간선 수. 0 이면 제안이 이미 shadow-first 였다. */
+  restoredEdges: number;
+}
+
+/** shadow-first 집행 판정. ⛔ 「고칠 수 없음」과 「거부」를 같은 값으로 접지 않는다. */
+export type ShadowFirstDispatch =
+  | { kind: 'ok'; pieces: DecomposePiece[]; shadowFirst?: ShadowFirstPlan }
+  | { kind: 'rejected'; reason: 'dangling-dependsOn'; danglingIds: string[] };
+
+/**
+ * ⭐⭐⭐ shadow 관측이 live 발사보다 «앞선다» — AUTHOR-SHADOW-FIRST-SPLIT ② (#26884 수확).
+ *
+ * 🔑 ***실패 뒤 분해 제안에서 관측이 «사라지고» live 만 나갔다.*** shadow 조각은
+ *   `dependsOn` 없이 제안에 실리고, live 조각이 그 선행 간선을 «잃은» 채 오면 위상 정렬이
+ *   둘을 «동시에» 세운다 ⇒ 관측 없이 live 발사가 먼저 도착한다.
+ *
+ * ⛔ 판정은 «둘»로 가른다 — 접으면 다음 사람이 못 고친다:
+ *   ⓐ 매달린 `dependsOn`(조각 목록에 없는 id) → `kind: 'rejected'`, 사유와 없는 id 를 값으로 남긴다.
+ *     없는 조각을 선행으로 단 제안은 승격하지 않는다(`danglingDependsOn` 을 세는 것만으로는 live 발사를 못 막는다).
+ *   ⓑ shadow 조각이 «둘» 이상 → `kind: 'ok'` 지만 «가드 없음» — 어느 쪽이 관측인지 모르는 제안은 고치지 않는다.
+ *
+ * ⭐ 선행 간선은 «실제 발사 지점»(다른 조각이 의존하지 않는 끝 조각)에만 건다 — 중간 조각은
+ *   자기 선행 순서만 들고 있으면 되고, 그 것까지 shadow 에 매달면 계획이 사슬로 납작해진다.
+ *   shadow 조각은 언제나 맨 앞으로 올라오고, 이미 shadow 를 선행으로 가진 조각은 건드리지 않는다.
+ *
+ * 순수 함수다 — 시계·파일·프로세스를 안 만진다. 입력 조각은 «변형하지 않는다».
+ */
+export function planShadowFirstDispatch(pieces: readonly DecomposePiece[]): ShadowFirstDispatch {
+  const known = new Set(pieces.map((piece) => piece.id));
+  const danglingIds: string[] = [];
+  for (const piece of pieces) {
+    for (const dep of piece.dependsOn) {
+      if (dep === piece.id || known.has(dep) || danglingIds.includes(dep)) continue;
+      danglingIds.push(dep);
+    }
+  }
+  if (danglingIds.length) return { kind: 'rejected', reason: 'dangling-dependsOn', danglingIds };
+
+  const shadowPieces = pieces.filter((piece) => piece.id === SHADOW_PIECE_ID);
+  if (shadowPieces.length !== 1) return { kind: 'ok', pieces: [...pieces] };
+
+  const shadow = shadowPieces[0]!;
+  const rest = pieces.filter((piece) => piece !== shadow);
+  const dependedUpon = new Set<string>();
+  for (const piece of rest) for (const dep of piece.dependsOn) dependedUpon.add(dep);
+
+  let restoredEdges = 0;
+  const reordered = rest.map((piece) => {
+    if (dependedUpon.has(piece.id) || piece.dependsOn.includes(SHADOW_PIECE_ID)) return piece;
+    restoredEdges++;
+    return { ...piece, dependsOn: [...piece.dependsOn, SHADOW_PIECE_ID] };
+  });
+  return {
+    kind: 'ok',
+    pieces: [shadow, ...reordered],
+    shadowFirst: { shadowId: shadow.id, liveIds: rest.map((piece) => piece.id), restoredEdges },
+  };
 }
 
 export interface DecomposeProposalScan {
@@ -343,11 +454,21 @@ export function readDecomposeProposals(input: {
   };
 }
 
+/** 승격하지 «않은» 제안 하나 — ⛔ 조용히 원본만 두면 다음 라운드가 같은 제안을 다시 쓴다. */
+export interface DecomposeRejection {
+  feature: string;
+  reason: 'dangling-dependsOn';
+  /** 무엇이 매달렸나 — 조각 목록에 없는 선행 id 들. */
+  detail: string[];
+}
+
 /** 조각 하나를 «쪼갠» 결과. ⛔ 「무엇을 무엇으로」가 값으로 남아야 다음 라운드가 중복하지 않는다. */
 export interface DecomposeApplication {
   goals: SelfDevGoal[];
   /** 이번에 쪼갠 원래 goal 의 feature 들. 비면 아무것도 안 바뀌었다. */
   decomposed: string[];
+  /** 거부한 제안들 — 사유와 매달린 id 를 «값»으로 남긴다. 거부가 없으면 빈 배열이다. */
+  rejected: DecomposeRejection[];
 }
 
 /**
@@ -358,10 +479,12 @@ export interface DecomposeApplication {
  *     self_orchestrate 는 shouldDefer=true 라 «찾아야» 보인다. 그래서 복합도 단일로 들어온다.
  *   ⇒ 📌 입구를 고치는 대신 ***「들어온 뒤 스스로 쪼개게」*** 한다.
  *
- * ⛔ **안전 장치 셋** — 다시 거는 것은 쉽고 «멈출 줄 아는 것»이 어렵다:
+ * ⛔ **안전 장치 넷** — 다시 거는 것은 쉽고 «멈출 줄 아는 것»이 어렵다:
  *   ⓐ 같은 goal 을 «두 번» 쪼개지 않는다(alreadyDecomposed)
  *   ⓑ 조각이 둘 미만인 제안은 애초에 안 온다(pickDecomposeProposals 가 거른다)
  *   ⓒ 상한을 넘기면 «쪼개지 않는다» — 조각이 무한히 불어나는 것을 막는다
+ *   ⓓ shadow 관측이 live 발사 «앞»에 선다(`planShadowFirstDispatch`) — 매달린 `dependsOn` 은
+ *     승격하지 않고 사유와 id 를 `rejected` 로 남긴다. 관측은 조각을 내보내기 «전»에 남는다.
  *
  * ⭐ **조각은 원 골의 «대상 경로:» 머리줄을 물려받는다** (DECOMPOSE-PIECE-TARGET-LINE · 10-11 부검 run-76941fca):
  *   조각 feature 가 골을 «통째로» 갈아 끼우면 첫 줄 선언이 사라져 Pod 예비 검사가 «대상 경로 0» →
@@ -402,22 +525,51 @@ export function applyDecomposeProposals(
     if (already.has(r.feature)) continue;
     byFeature.set(r.feature, pieces);
   }
-  if (byFeature.size === 0) return { goals: [...goals], decomposed: [] };
+  if (byFeature.size === 0) return { goals: [...goals], decomposed: [], rejected: [] };
 
   const out: SelfDevGoal[] = [];
   const decomposed: string[] = [];
+  const rejected: DecomposeRejection[] = [];
   for (const goal of goals) {
     const pieces = byFeature.get(goal.feature);
     if (!pieces) { out.push(goal); continue; }
+    // ⛔⭐ shadow-first 가드 — 매달린 선행 간선이 있는 제안은 «쪼개지 않는다»(원본을 그대로 둔다).
+    const plan = planShadowFirstDispatch(pieces);
+    if (plan.kind === 'rejected') {
+      rejected.push({ feature: goal.feature, reason: plan.reason, detail: [...plan.danglingIds] });
+      // ⛔⭐ 거부를 «로그와 값에 다» 남긴다 — 조용히 버리면 다음 라운드가 같은 제안을 다시 쓴다.
+      //   혼합 문서 거부(mixed-decompose-document)와 같은 관측 채널·같은 fail-open 규율이다.
+      try {
+        debug.log('self-dev.decompose', 'decompose-rejected', {
+          feature: goal.feature,
+          reason: plan.reason,
+          danglingIds: [...plan.danglingIds],
+        });
+      } catch { /* fail-open */ }
+      out.push(goal);
+      continue;
+    }
+    const planned = plan.pieces;
     // ⛔ 상한을 넘기면 «쪼개지 않는다» — 조용히 자르지 않고 원본을 그대로 둔다.
-    if (out.length + pieces.length + (goals.length - out.length - 1) > maxGoals) { out.push(goal); continue; }
+    if (out.length + planned.length + (goals.length - out.length - 1) > maxGoals) { out.push(goal); continue; }
     decomposed.push(goal.feature);
+    // ⭐ 관측이 live 발사보다 «앞»에 남는다 — 조각을 out 에 넣기 전에 이 자리에서 찍는다.
+    if (plan.shadowFirst) {
+      try {
+        debug.log('self-dev.decompose', 'shadow-first-dispatch', {
+          feature: goal.feature,
+          shadowId: plan.shadowFirst.shadowId,
+          liveIds: [...plan.shadowFirst.liveIds],
+          restoredEdges: plan.shadowFirst.restoredEdges,
+        });
+      } catch { /* fail-open */ }
+    }
     // 원 골의 머리줄 선언 — 첫 줄이 «대상 경로:» 가 아니면 조각은 지금 그대로(바이트 불변)다.
     const goalLines = goal.feature.split('\n');
     const targetLine = TARGET_PATHS_LINE.exec(goalLines[0] ?? '');
     // «신설:» 상속은 머리줄 선언이 «있을 때만» — 첫 줄이 라벨이 아니면 조각은 바이트 불변이어야 한다.
     const newLine = targetLine ? goalLines.map((line) => NEW_PATHS_LINE.exec(line)).find((m) => m !== null) : null;
-    for (const piece of pieces) {
+    for (const piece of planned) {
       const inherited: string[] = [];
       let paths: string[] = [];
       if (targetLine) {
@@ -444,5 +596,5 @@ export function applyDecomposeProposals(
       } as SelfDevGoal);
     }
   }
-  return { goals: out, decomposed };
+  return { goals: out, decomposed, rejected };
 }

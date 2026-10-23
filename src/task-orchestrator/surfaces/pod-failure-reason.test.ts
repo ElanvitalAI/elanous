@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { classifyPodExit, extractPodFailureReason, nestedPodResult, podTerminalRow, POD_EXIT_CLASSES } from './pod-failure-reason.js';
+import { classifyPodExit, extractPodFailureReason, nestedPodResult, podChildFailureAttribution, podTerminalRow, POD_EXIT_CLASSES } from './pod-failure-reason.js';
 
 describe('classifyPodExit', () => {
   test('exports the closed class set and preserves terminal metadata fields', () => {
     expect(POD_EXIT_CLASSES).toEqual([
       'oom-killed', 'deadline-exceeded', 'gh-login-failed', 'pod-secret', 'ask-reprompt',
-      'child-unconverged', 'child-error', 'no-result-line', 'unknown',
+      'provider-error', 'child-unconverged', 'child-error', 'no-result-line', 'unknown',
     ]);
     expect(classifyPodExit({
       errorCode: 'pod-secret', containerReason: 'Error', containerExitCode: 2, jobReason: 'BackoffLimitExceeded', logs: '',
@@ -314,6 +314,62 @@ test('legacy preflight blockers without structured check fields keep name and de
   expect(extractPodFailureReason({ logs: JSON.stringify(row) })).toBe('골 판독 불가 — read denied · traced path 누락 — src/old.ts');
   expect(podTerminalRow({ ...row, blockers: [{ kind: 'goal-unreadable', name: '골 판독 불가', detail: 'read denied' }] })?.error)
     .toBe('골 판독 불가 — read denied');
+});
+
+describe('classifyPodExit — provider-error priority', () => {
+  test('classifies a provider error before the generic failure classes', () => {
+    const providerLine = 'llm.anthropic credential error: invalid x-api-key';
+    expect(classifyPodExit({ logs: providerLine }).class).toBe('provider-error');
+    // generic 실패(child-error)보다 먼저 — 같은 로그에 Error 줄이 있어도 provider-error 가 이긴다.
+    expect(classifyPodExit({ logs: `Error: child failed\n${providerLine}` }).class).toBe('provider-error');
+    // 결과행이 없어도(=unknown/child-error 후보) provider-error 로 먼저 분류된다.
+    expect(classifyPodExit({ containerExitCode: 2, logs: `upstream 503\n${providerLine}` }).class).toBe('provider-error');
+    expect(classifyPodExit({ logs: 'provider overloaded: 529' }).class).toBe('provider-error');
+    expect(classifyPodExit({ logs: 'API rate limit exceeded for org' }).class).toBe('provider-error');
+  });
+
+  test('only the lines attached to the same (last) terminal carry the provider error', () => {
+    const stale = JSON.stringify({ kind: 'self', ok: false, stage: 'aborted', error: 'llm.openai credential error: missing key' });
+    const success = JSON.stringify({ kind: 'self', ok: true, result: { stage: 'merged', ok: true } });
+    expect(classifyPodExit({ logs: `${stale}\n${success}` }).class).toBe('unknown');
+    // 마지막 canonical terminal «직전» 구간의 provider 줄은 그 terminal 에 딸린 근거다.
+    const failed = JSON.stringify({ kind: 'self', ok: false, stage: 'error', error: 'Error: child failed' });
+    expect(classifyPodExit({ logs: `llm.anthropic credential error: 401\n${failed}` }).class).toBe('provider-error');
+  });
+});
+
+describe('podChildFailureAttribution', () => {
+  test('attributes the failure of the last canonical child terminal only', () => {
+    const failed = JSON.stringify({ kind: 'self', ok: false, stage: 'error', error: 'Error: dependency unavailable' });
+    expect(podChildFailureAttribution(`${failed}\n`)).toEqual({ stage: 'error', error: 'Error: dependency unavailable' });
+    const external = JSON.stringify({ kind: 'external', ok: false, result: { stage: 'aborted', ok: false, error: 'Error: external child died' } });
+    expect(podChildFailureAttribution(external)).toEqual({ stage: 'aborted', error: 'Error: external child died' });
+  });
+
+  test('ignores a lookalike kind that is not a canonical child prefix', () => {
+    const lookalike = JSON.stringify({ kind: 'self-implement', ok: false, stage: 'error', error: 'Error: lookalike failure' });
+    expect(podChildFailureAttribution(lookalike)).toBeNull();
+    const graph = JSON.stringify({ kind: 'graph', ok: false, stage: 'error', error: 'Error: graph failure' });
+    expect(podChildFailureAttribution(`${graph}\n`)).toBeNull();
+  });
+
+  test('does not reuse an earlier failure once the last terminal of the same child succeeded', () => {
+    const failed = JSON.stringify({ kind: 'self', ok: false, stage: 'error', error: 'Error: earlier failure' });
+    const success = JSON.stringify({ kind: 'self', ok: true, result: { stage: 'merged', ok: true } });
+    expect(podChildFailureAttribution(`${failed}\n${success}\n`)).toBeNull();
+    // lookalike 행은 terminal 스캔을 멈추지 않는다 — canonical 성공 terminal 이 여전히 마지막이다.
+    const lookalike = JSON.stringify({ kind: 'self-implement', ok: false, stage: 'error', error: 'Error: lookalike failure' });
+    expect(podChildFailureAttribution(`${failed}\n${success}\n${lookalike}\n`)).toBeNull();
+  });
+
+  test('reads the error line of the terminal, not a bookkeeping-only tail', () => {
+    const row = JSON.stringify({ kind: 'self', ok: false, stage: 'error', error: 'Error: dependency unavailable\nELANOUS_RUN_LEDGER chunk\nat worker.ts:42' });
+    const first = podChildFailureAttribution(row);
+    expect(first?.stage).toBe('error');
+    expect(first?.error.split('\n')[0]).toBe('Error: dependency unavailable');
+    const bookkeeping = JSON.stringify({ kind: 'self', ok: false, stage: 'error', error: 'ELANOUS_RUN_LEDGER chunk' });
+    expect(podChildFailureAttribution(bookkeeping)).toBeNull();
+  });
 });
 
 test('a nested child-result preflight rejection keeps reason code, check name, and path on the ledger row', () => {

@@ -30,6 +30,7 @@ import type { LogSink } from './sink.js';
 import { setInstanceName, resolveInstanceName } from '../../instance-identity.js';
 import * as nestDepth from '../../agent/nest-depth.js';
 import { debug } from '../../debug/log.js';
+import { DebugLogBatchQueue, defaultDebugBatchScheduler, type DebugBatchScheduler } from '../../debug/batch-queue.js';
 import { assertNotTestWritingOps } from '../../instance/test-write-guard.js';
 
 /** 스토어 경로 — `ELANOUS_STATE_DIR` 존중(격리 테스트/`nexus run --test` 의
@@ -822,6 +823,21 @@ export interface StoreSinkOpts {
   /** Register beforeExit / SIGINT / SIGTERM flush hooks lazily on first
    *  emit. Default true; tests/isolated fixtures can pass false. */
   installExitHandlers?: boolean;
+  /** TUI-TYPING-LAG — 임계 뒤 detach drain 이 한 틱에 넣는 최대 행 수. 기본 = `Infinity`(옛 동작 ·
+   *  한 틱에 전부 — CLI 는 그대로). TUI 는 `TUI_LOG_STORE_DRAIN_CHUNK_ROWS` 로 켠다: 남은 행은 «다음»
+   *  틱으로 넘겨 그 사이 stdin(키)이 배달된다. */
+  drainChunkSize?: number;
+  /** 시계 seam — 기본 setImmediate/setTimeout(unref). ux-sim 무대가 가짜 시계를 꽂는다. */
+  scheduler?: DebugBatchScheduler;
+}
+
+/** TUI-TYPING-LAG — TUI 프로세스의 StoreSink 가 한 틱에 넣는 최대 행 수(키 하나가 기다리는 상한). */
+export const TUI_LOG_STORE_DRAIN_CHUNK_ROWS = 64;
+
+/** 어느 surface 의 StoreSink 가 덩어리 drain 을 쓰나 — 키 입력을 받는 TUI 만. CLI·데몬은 옛 동작
+ *  (한 틱에 전부 · SQLITE_BUSY 때 막힘이 한 번으로 끝난다)을 그대로 둔다. */
+export function logStoreDrainChunkForSurface(surface: string): number | undefined {
+  return surface === 'tui' ? TUI_LOG_STORE_DRAIN_CHUNK_ROWS : undefined;
 }
 
 /** StoreSink가 버린 레코드의 누적 관측값. 스토어에 쓰지 않아 자기참조하지 않는다. */
@@ -833,8 +849,11 @@ export interface StoreSinkDropCounts {
 
 export class StoreSink implements LogSink {
   readonly name = 'store';
-  private buf: Array<{ rec: LogRecord; surface: string }> = [];
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private readonly queue: DebugLogBatchQueue<{ rec: LogRecord; surface: string }>;
+  private timer: unknown = null;
+  private hasTimer = false;
+  /** 덩어리 insert 가 실패한 뒤 다음 성공까지 — 임계를 넘어도 덩어리 틱을 다시 걸지 않는다(주기 flush 만). */
+  private chunkingPaused = false;
   private exitHandlersInstalled = false;
   private onBeforeExit: (() => void) | null = null;
   private onSigInt: (() => void) | null = null;
@@ -843,6 +862,9 @@ export class StoreSink implements LogSink {
   private readonly flushBatchSize: number;
   private readonly bufferCap: number;
   private readonly installExit: boolean;
+  private readonly scheduler: DebugBatchScheduler;
+  /** 덩어리 drain 한 틱의 최대 행 수(`Infinity` = 옛 동작 · 한 틱에 전부). 등록 배선을 시험이 잠그는 관측 칸. */
+  readonly drainChunkSize: number;
   private readonly dropCounts: StoreSinkDropCounts = { total: 0, flushFailure: 0, bufferCap: 0 };
 
   constructor(
@@ -854,49 +876,79 @@ export class StoreSink implements LogSink {
     this.flushBatchSize = opts.flushBatchSize ?? 64;
     this.bufferCap = opts.bufferCap ?? 2048;
     this.installExit = opts.installExitHandlers ?? true;
+    this.scheduler = opts.scheduler ?? defaultDebugBatchScheduler;
+    this.drainChunkSize = opts.drainChunkSize ?? Number.POSITIVE_INFINITY;
+    this.queue = new DebugLogBatchQueue({
+      batchSize: this.drainChunkSize,
+      flushDelayMs: 0,
+      scheduler: this.scheduler,
+      drain: (batch) => this.insert(batch),
+    });
   }
 
   emit(rec: LogRecord): void {
     // 자기참조 가드 — 로그 평면 자신의 이벤트는 스토어 재진입 금지.
     if (rec.category.startsWith('logs.')) return;
-    this.buf.push({ rec, surface: this.surface });
-    if (this.buf.length > this.bufferCap) {
-      const dropped = this.buf.length - this.bufferCap;
-      this.buf.splice(0, dropped);
-      this.recordDrop('bufferCap', dropped);
+    this.queue.push({ rec, surface: this.surface });
+    if (this.queue.pending > this.bufferCap) {
+      this.recordDrop('bufferCap', this.queue.dropOldest(this.queue.pending - this.bufferCap));
     }
     if (this.installExit) this.installExitHandlersOnce();
-    if (this.buf.length >= this.flushBatchSize) {
-      // 핫 틱 비블록 — insert 는 다음 매크로태스크로(FileSink detach 동형).
-      if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-      setImmediate(() => this.flush());
+    if (this.queue.pending >= this.flushBatchSize && !this.chunkingPaused) {
+      // 핫 틱 비블록 — insert 는 다음 매크로태스크로, 그것도 «덩어리 하나씩»(TUI-TYPING-LAG).
+      this.cancelTimer();
+      this.queue.schedule();
       return;
     }
-    if (this.timer === null) {
-      this.timer = setTimeout(() => this.flush(), this.flushIntervalMs);
-      (this.timer as unknown as { unref?: () => void }).unref?.();
-    }
+    if (!this.queue.scheduled) this.armIntervalFlush();
   }
 
   flush(): void {
-    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-    if (this.buf.length === 0) return;
-    const batch = this.buf;
-    this.buf = [];
+    this.cancelTimer();
+    this.queue.flushAll();
+  }
+
+  private cancelTimer(): void {
+    if (!this.hasTimer) return;
+    this.scheduler.cancel(this.timer);
+    this.timer = null;
+    this.hasTimer = false;
+  }
+
+  private insert(batch: Array<{ rec: LogRecord; surface: string }>): boolean {
     try {
       // insertBatch retries SQLITE_BUSY batches on the next write; this sink remains fail-soft on final failure.
       this.store.insertBatch(batch);
+      this.chunkingPaused = false;
+      return true;
     } catch {
       /* fail-soft — 파일 트레일이 진실원. 배치는 버린다(재시도 루프 금지 —
          디스크 장애 시 무한 적체 방지). */
       this.recordDrop('flushFailure', batch.length);
+      // 덩어리 drain 중 실패(예: SQLITE_BUSY 는 busy_timeout 만큼 막는다)면 남은 덩어리를 틱마다 또
+      // 막게 두지 않는다 — 잘게 쪼개기를 멈추고(다음 성공까지 · 새 emit 도 덩어리 틱을 다시 걸지 않는다)
+      // 나머지는 다음 주기 flush 한 번으로 넘긴다.
+      this.chunkingPaused = true;
+      this.queue.cancelScheduled();
+      this.armIntervalFlush();
+      return false;
     }
+  }
+
+  private armIntervalFlush(): void {
+    if (this.hasTimer) return;
+    this.hasTimer = true;
+    this.timer = this.scheduler.schedule(() => {
+      this.timer = null;
+      this.hasTimer = false;
+      this.flush();
+    }, this.flushIntervalMs);
   }
 
   /** 누적 유실 관측값의 복사본. 로그 스토어에 쓰지 않아 자기참조하지 않는다. */
   get dropped(): StoreSinkDropCounts { return { ...this.dropCounts }; }
 
-  get pending(): number { return this.buf.length; }
+  get pending(): number { return this.queue.pending; }
 
   /** Flush the buffer and drop only this sink's exit/signal listeners. */
   close(): void {
@@ -1313,11 +1365,16 @@ export function registerLogStoreSink(
   registerSink: (sink: LogSink) => () => void,
   surface: string,
   retention: LogStoreRetention = LOG_RETENTION_DEFAULTS,
-  opts: { retentionOwner?: boolean } = {},
+  opts: { retentionOwner?: boolean; drainChunkSize?: number } = {},
 ): (() => void) | null {
   const store = getDefaultLogStore();
   if (!store) return null;
-  const sink = new StoreSink(store, surface, { installExitHandlers: true });
+  // 덩어리 크기 기본값은 surface 로 여기서 정한다 — 어느 등록 경로(standalone·nexus·직접 호출)든 TUI 면 덩어리 drain.
+  const drainChunkSize = opts.drainChunkSize ?? logStoreDrainChunkForSurface(surface);
+  const sink = new StoreSink(store, surface, {
+    installExitHandlers: true,
+    ...(drainChunkSize !== undefined ? { drainChunkSize } : {}),
+  });
   const off = registerSink(sink);
   try { nestDepth.observeNestAtBoot(); } catch { /* fail-soft — 관측 실패가 싱크 등록을 막지 않는다. */ }
   const owner = opts.retentionOwner ?? surface === 'nexus';

@@ -18,17 +18,11 @@
 import type { InputResult, TextInputInternalTurnYieldPort } from '../../chat/index.js';
 import { debug } from '../../debug/log.js';
 import type { SubmitTurnIntent } from '../../input/input-intent.js';
+import type { InternalTurnOrigin } from '../../chat/internal-turn-origin.js';
+export type { InternalTurnOrigin } from '../../chat/internal-turn-origin.js';
 import { lastHumanKeyAt as tuiLastHumanKeyAt, pendingKeyCount as tuiPendingKeyCount } from '../../tui.js';
 
 /** 내부 턴의 출처 — 화면 한 줄·관측·정책이 이 값으로 갈린다. 새 출처는 여기에 더한다. */
-export type InternalTurnOrigin =
-  | 'autowake'
-  | 'msg-wake'
-  | 'scheduled'
-  | 'child-complete'
-  | 'goal-continue'
-  | 'test';
-
 /** 거부 사유 — 에러가 아니라 값이다. 호출자는 이 값을 보고 다음 idle 에 다시 부를지 정한다. */
 export type InternalTurnRejectReason =
   /** 턴이 도는 중이거나, 입력칸이 안 떠 있거나(다른 창·모달), 앞 내부 턴이 아직 안 시작됐다. */

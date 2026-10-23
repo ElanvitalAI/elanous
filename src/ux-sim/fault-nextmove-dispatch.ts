@@ -29,6 +29,10 @@ import { createTempGitRemote, type TempGitRemote } from './temp-git-remote.js';
 import { runRepairCycle, type RepairCycleInput, type RepairLaunchRequest } from '../task-agent/repair-cycle.js';
 import { applyRepairBundle, REPAIR_BUNDLE_REF, type RepairCasDeps } from '../task-agent/repair-branch-cas.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
+import { recordTaskAgentShadowMove, RELAUNCH_LAUNCHED_EVENT } from '../task-agent/shadow.js';
+import { installHarnessCliCommand } from '../harness/harness-cli-command.js';
+import type { SupervisorJobResult } from '../self-dev/run-supervisor.js';
+import { Command } from 'commander';
 
 /** 이 심을 재는 증거 명령 — 매뉴얼 §3 과 영수증의 «명령» 칸이 같은 문자열이다. */
 export const FAULT_NEXTMOVE_DISPATCH_COMMAND = 'bun test src/ux-sim/fault-nextmove-dispatch.test.ts';
@@ -166,6 +170,10 @@ export interface FaultNextmoveDispatchObservation {
   readonly ghCalls: number;
   /** 생산 확인 루프가 요청한 지연(ms) — 확인 지연이 «생산 루프를 다 돈 뒤» unconfirmed 가 됐다는 증거. */
   readonly confirmSleeps: readonly number[];
+  /** HARNESS-FULL-GRAPH-NEXTMOVE — 한 수의 id 를 세 원문에서 읽은 값(결정 = next-move 노드 출구 · 간선 · 실제 발사 요청). */
+  readonly moveId: { readonly decision: string | undefined; readonly edge: string | undefined; readonly dispatch: string | undefined;
+    /** NEXTMOVE-GENERAL-RELAUNCH-MOVEID — 회수 틱이 결과 파일과 짝지어 카드 `repair-result` 줄에 실은 값. */
+    readonly consumed: string | undefined };
   /** 두 틱이 낸 알림(심이 받아 적음 · 운영 우편함 0). */
   readonly notified: readonly { seat: string; body: string }[];
   /** 영수증 = 명령 ⊕ injectionId ⊕ 결과. */
@@ -179,10 +187,13 @@ export async function simFaultNextmoveDispatch(): Promise<FaultNextmoveDispatchO
   const firstTick = new Date('2026-10-21T08:00:00.000Z');
   const secondTick = new Date('2026-10-21T08:01:00.000Z');
   const edges: Record<string, unknown>[] = [];
+  const decisions: Record<string, unknown>[] = [];
   const off = debug.registerSink({
     name: `ux-sim-fault-nextmove-dispatch-${injectionId}`,
     emit: (record) => {
       if (record.category === 'self-implement' && record.event === 'graph-edge-taken') edges.push(record.data as Record<string, unknown>);
+      if (record.category === 'self-implement' && record.event === 'pipeline-node-exit'
+        && (record.data as Record<string, unknown> | undefined)?.node === 'next-move') decisions.push(record.data as Record<string, unknown>);
     },
   });
   // ⛔ 생산 기본 notify(`msg post`)·request(detached elanous spawn)에 «절대» 닿지 않게 두 틱 모두 기록용 심을 준다.
@@ -208,9 +219,10 @@ export async function simFaultNextmoveDispatch(): Promise<FaultNextmoveDispatchO
     // 수리 worker 가 끝 JSON ⊕ artifact 를 남겼다(생산 회수 경로가 읽는 꼴 그대로).
     const result = { pr: PR, baseHead: fixture.head, runId: launch.runId, commit: fixture.commit, bundleSha256: fixture.bundleSha256 };
     writeFileSync(join(fixture.artifactDir, 'result.json'), JSON.stringify(result));
+    // 생산 runRepairWorker 는 받은 --move-id 를 결과 파일에 그대로 싣는다(RepairWorkerResult.moveId).
     writeFileSync(launch.resultPath, JSON.stringify({
       pr: PR, head: fixture.head, runId: launch.runId, ok: true, job: JOB,
-      artifactDir: fixture.artifactDir, result,
+      artifactDir: fixture.artifactDir, result, moveId: launch.moveId,
     }));
     // 틱 ② — 결과 회수. 생산 applyRepairBundle 이 exact-head CAS push 에 성공하고
     // PR 머리 확인이 늙은 가짜 gh 머리를 못 따라잡아 unconfirmed 로 돌아온다.
@@ -228,6 +240,14 @@ export async function simFaultNextmoveDispatch(): Promise<FaultNextmoveDispatchO
       reason: second.reason,
     };
     const edgeCount = edges.filter((edge) => edge.from === 'next-move' && edge.to === 'dispatch').length;
+    const asId = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
+    const moveId = {
+      // 발사 요청과 같은 runId 의 결정만 짝짓는다(결정이 여럿이어도 남의 결정과 대조하지 않게).
+      decision: asId(decisions.find((row) => row.runId === launch.runId)?.moveId),
+      edge: asId(edges.find((edge) => edge.from === 'next-move' && edge.to === 'dispatch')?.moveId),
+      dispatch: launch.moveId,
+      consumed: asId(stored?.history.find((entry) => entry.event === 'repair-result' && entry.runId === launch.runId)?.moveId),
+    };
     const remoteHead = fixture.remote.git(fixture.remote.checkout, ['ls-remote', 'origin', `refs/heads/${BRANCH}`]).split('\t')[0] ?? '';
     const ghCalls = fixture.fakeBins.calls().filter((call) => call.name === 'gh').length;
     const receipt = {
@@ -240,6 +260,7 @@ export async function simFaultNextmoveDispatch(): Promise<FaultNextmoveDispatchO
       edge: { count: edgeCount, record: edges.find((edge) => edge.from === 'next-move' && edge.to === 'dispatch'), decision: first.decision },
       unconfirmed,
       remoteHead,
+      moveId,
       repairCommit: fixture.commit,
       ghCalls,
       confirmSleeps: [...fixture.confirmSleeps],
@@ -258,9 +279,89 @@ export function renderFaultNextmoveDispatch(observation: FaultNextmoveDispatchOb
     'fault-nextmove-dispatch · 층 L2 · 생산 runRepairCycle/repairNextMove/applyRepairBundle 직접 호출(GitHub API·네트워크 0)',
     `  receipt: command=${observation.receipt.command} ⊕ injectionId=${observation.receipt.injectionId} ⊕ result=${observation.receipt.result}`,
     `  ① graph-edge-taken: ${JSON.stringify(observation.edge.record ?? {})}`,
+    `  ⓜ moveId: ${renderMoveIds(observation.moveId)}`,
     `  ② unconfirmed: decision=${observation.unconfirmed.decision} · status=${observation.unconfirmed.status ?? '-'} · reason=${observation.unconfirmed.reason}`,
     `  원격 PR 가지 머리: ${observation.remoteHead.slice(0, 12)} · 수리 commit ${observation.repairCommit.slice(0, 12)} · push ${observation.remoteHead === observation.repairCommit ? '됨' : '안 됨'}`,
     `  확인 지연 루프 요청(ms): ${observation.confirmSleeps.join(',') || '-'} · 알림 ${observation.notified.length}건(심이 받음)`,
     `  가짜 gh 심 호출: ${observation.ghCalls}회 · 발사 틱 판정: ${observation.edge.decision}`,
+  ];
+}
+
+/** 수 id 네 원문 한 줄 — 넷이 다 같아야 «일치». */
+function renderMoveIds(ids: { decision: string | undefined; edge: string | undefined; dispatch: string | undefined; consumed: string | undefined }): string {
+  const same = ids.decision !== undefined && [ids.edge, ids.dispatch, ids.consumed].every((id) => id === ids.decision);
+  return `decision=${ids.decision ?? '-'} · graph-edge-taken=${ids.edge ?? '-'} · dispatch=${ids.dispatch ?? '-'} · consumed=${ids.consumed ?? '-'} · ${same ? '일치' : '불일치'}`;
+}
+
+// ── NEXTMOVE-GENERAL-RELAUNCH-MOVEID — 일반 재발사(TA terminal → `harness say` 문자열 경로) 한 건 ─────────
+//   생산 recordTaskAgentShadowMove(shadow.ts) → executeNextAction(actions.ts) 를 그대로 돌리고, 실행부가 낸 argv 를
+//   생산 `harness say` CLI 파서(installHarnessCliCommand)에 그대로 먹인다. ⛔ 실제 발사·spawn 0 — command 는 argv 를 적기만 하고,
+//   say 처리기는 문장만 받아 적는다. 카드 상태는 임시 디렉터리 하나에만 쓰고 끝에 지운다.
+
+export const FAULT_NEXTMOVE_GENERAL_COMMAND = 'bun test src/self-dev/graph-nextmove-moveid.test.ts -t "general relaunch device"';
+
+export interface FaultNextmoveGeneralObservation {
+  readonly injectionId: string;
+  readonly executorResult: string | null;
+  /** 실행부가 낸 발사 argv(하나). */
+  readonly argv: readonly string[];
+  /** 결정(next-move 노드 출구) · graph-edge-taken · 발사(harness say 가 받은 값) · 카드 history(relaunch-launched). */
+  readonly moveId: { readonly decision: string | undefined; readonly edge: string | undefined; readonly dispatch: string | undefined; readonly consumed: string | undefined };
+  readonly receipt: { readonly command: string; readonly injectionId: string; readonly result: string };
+}
+
+export async function simFaultNextmoveGeneralRelaunch(): Promise<FaultNextmoveGeneralObservation> {
+  const injectionId = `fng-${randomBytes(6).toString('hex')}`;
+  const root = mkdtempSync(join(tmpdir(), 'ux-sim-nextmove-general-'));
+  const runId = `run-sim-general-${injectionId.slice(4)}`;
+  const statePath = join(root, 'task-agent-actions.json');
+  const card: TaskCard = { id: 'ta-sim-general', text: 'feature ask', seat: 'TC', createdAt: '2026-10-22T08:00:00.000Z',
+    status: 'launched', history: [], runId };
+  writeTaskCards(statePath, [card]);
+  const rows: { category: string; event: string; data: Record<string, unknown> }[] = [];
+  const off = debug.registerSink({ name: `ux-sim-fault-nextmove-general-${injectionId}`, emit: (record) => {
+    if (record.category === 'self-implement' || record.category === 'harness') rows.push({ category: record.category, event: record.event, data: record.data as Record<string, unknown> });
+  } });
+  try {
+    const argvs: string[][] = [];
+    const job = { taskId: 't', feature: 'feature ask', status: 'done' } as SupervisorJobResult;
+    const move = await recordTaskAgentShadowMove({ runId, stopReason: 'no-progress', results: [job] }, {
+      // 빈 env — Pod·카드 힌트 없이 HQ 로컬 런으로 판단한다(운영 env 를 읽지 않는다).
+      env: {} as NodeJS.ProcessEnv, statePath, log: () => {}, liveMoves: new Set(['narrow-relaunch']),
+      loadGate: { loadMax: 2, load1: () => 0.5 },
+      command: async (args) => { argvs.push(args); return { status: 0, stdout: '' }; },
+    });
+    if (argvs.length !== 1) throw new Error(`fault-nextmove-general: 발사 argv ${argvs.length}건(기대 1) · executorResult=${move.executorResult}`);
+    // 발사 받는 쪽 — 생산 harness say 파서에 그 argv 를 그대로(처리기는 문장만 적는다 · 발사 0).
+    const program = new Command().exitOverride();
+    const said: string[][] = [];
+    installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness',
+      say: async (words: string[]) => { said.push(words); } } as never);
+    await program.parseAsync(['node', 'elanous', ...argvs[0]!]);
+    if (said.length !== 1) throw new Error(`fault-nextmove-general: harness say 처리기 호출 ${said.length}건(기대 1)`);
+    const asId = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
+    const stored = readTaskCard(card.id, statePath);
+    const moveId = {
+      decision: asId(rows.find((row) => row.event === 'pipeline-node-exit' && row.data.node === 'next-move' && row.data.runId === runId)?.data.moveId),
+      edge: asId(rows.find((row) => row.event === 'graph-edge-taken' && row.data.from === 'next-move' && row.data.to === 'dispatch')?.data.moveId),
+      dispatch: asId(rows.find((row) => row.category === 'harness' && row.event === 'move-id-received')?.data.moveId),
+      consumed: asId(stored?.history.find((entry) => entry.event === RELAUNCH_LAUNCHED_EVENT && entry.runId === runId)?.moveId),
+    };
+    return {
+      injectionId, executorResult: move.executorResult, argv: argvs[0]!, moveId,
+      receipt: { command: FAULT_NEXTMOVE_GENERAL_COMMAND, injectionId, result: renderMoveIds(moveId) },
+    };
+  } finally {
+    off();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+export function renderFaultNextmoveGeneralRelaunch(observation: FaultNextmoveGeneralObservation): string[] {
+  return [
+    'fault-nextmove-dispatch · 일반 재발사 · 층 L2 · 생산 recordTaskAgentShadowMove/executeNextAction/harness say 파서 직접 호출(발사·spawn 0)',
+    `  receipt: command=${observation.receipt.command} ⊕ injectionId=${observation.receipt.injectionId} ⊕ result=${observation.receipt.result}`,
+    `  실행부 결과: ${observation.executorResult ?? '-'} · argv 꼬리: ${JSON.stringify(observation.argv.slice(-2))}`,
+    `  ⓜ moveId: ${renderMoveIds(observation.moveId)}`,
   ];
 }

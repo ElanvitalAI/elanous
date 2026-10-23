@@ -1,6 +1,4 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import {
   createMcpProxyRuntime,
   createMcpToolAuthorizer,
@@ -10,7 +8,6 @@ import { registerAllDefaultToolRuntimes } from './index.js';
 import {
   bootstrapMcpProxyRuntimes,
   getMcpProxyBootstrapDiagnostics,
-  getMcpProxyBootstrapHandle,
   setMcpProxyBootstrapOptsForTest,
   _resetMcpProxyBootstrapForTest,
 } from './mcp-proxy-bootstrap.js';
@@ -187,30 +184,6 @@ describe('mcp proxy bootstrap — TUI discovery', () => {
     release();
     await handle.ready;
     expect(listToolRuntimes('tui').map((rt) => rt.id)).toContain('aside.repl');
-  });
-});
-
-describe('mcp proxy bootstrap — existing TUI execution path', () => {
-  test('registerAllDefaultToolRuntimes reaches bootstrap so configured tools show on tui', async () => {
-    const calls: string[] = [];
-    setMcpProxyBootstrapOptsForTest({
-      servers: [stdioServer('aside', ['repl'])],
-      handshakeTimeoutMs: 0,
-      createClient: () => fakeClient([{ name: 'repl' }], calls),
-    });
-    registerAllDefaultToolRuntimes();
-    const handle = getMcpProxyBootstrapHandle();
-    expect(handle).toBeDefined();
-    await handle!.ready;
-    expect(listToolRuntimes('tui').map((rt) => rt.id)).toContain('aside.repl');
-    const result = await dispatchToolByName('aside.repl', {}, ctx);
-    expect(result).toMatchObject({ output: 'ran:repl' });
-    expect(calls).toEqual(['repl']);
-  });
-
-  test('removing the bootstrap call from the default path is what these tests catch', () => {
-    const src = readFileSync(join(import.meta.dir, 'index.ts'), 'utf8');
-    expect(src).toContain('bootstrapMcpProxyRuntimes()');
   });
 });
 

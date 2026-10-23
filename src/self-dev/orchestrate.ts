@@ -204,7 +204,7 @@ interface SelfDevTerminalOutcome {
   stage: string | null;
   merged: boolean | null;
   prUrl: string | null;
-  blockReason?: 'parent-unlanded' | 'dependency-needs-human';
+  blockReason?: 'parent-unlanded' | 'dependency-needs-human' | 'dependency-deferred';
   parentPrNumber?: number | null;
   parentNoPr?: true;
 }
@@ -270,7 +270,8 @@ export function hasDelivered(result: SelfDevJobResult): boolean {
 
 /** 열린 PR 을 사람에게 보여줄 때 분류 칸에 싣는 문면. 없는 mergeReason 은 「사유 모름」— 값을 짓지 않는다. */
 export function openPrAwaitingHumanMessage(result: Pick<SelfDevJobResult, 'prNumber' | 'prUrl' | 'mergeReason'>): string {
-  const pointer = result.prNumber !== undefined ? `#${result.prNumber}` : (result.prUrl ?? '');
+  const pointer = typeof result.prNumber === 'number' && Number.isSafeInteger(result.prNumber) && result.prNumber > 0
+    ? `#${result.prNumber}` : (result.prUrl ?? '');
   const reason = result.mergeReason && result.mergeReason.length > 0 ? result.mergeReason : '사유 모름';
   return `열린 PR ${pointer} · ${reason}`;
 }
@@ -488,17 +489,42 @@ export function queryPreflightWarning(
   }
 }
 
+function hasConcretePrEvidence(result: Pick<SelfDevJobResult, 'prNumber' | 'prUrl'>): boolean {
+  const number = result.prNumber;
+  if (typeof number === 'number' && Number.isSafeInteger(number) && number > 0) return true;
+  if (typeof result.prUrl !== 'string') return false;
+  // Match the raw URL. WHATWG URL normalizes dot segments before exposing
+  // pathname, which would turn a noncanonical pointer into apparent evidence.
+  const match = /^https:\/\/github\.com\/[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*\/pull\/([1-9]\d*)$/.exec(result.prUrl);
+  return match !== null && Number.isSafeInteger(Number(match[1]));
+}
+
+function hasOpenedPrPointer(result: Pick<SelfDevJobResult, 'prNumber' | 'prUrl'>): boolean {
+  const number = result.prNumber;
+  if (typeof number === 'number' && Number.isSafeInteger(number) && number > 0) return true;
+  if (typeof result.prUrl !== 'string') return false;
+  // `stage=pr-opened` is a separate observation and may come from a non-GitHub
+  // host. Keep its host-neutral pull pointer contract, with no null or issue URL.
+  const match = /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*\/(?:[A-Za-z0-9][A-Za-z0-9_.-]*\/)*pull\/([1-9]\d*)$/.exec(result.prUrl);
+  return match !== null && Number.isSafeInteger(Number(match[1]));
+}
+
 export function classifyFailure(
   result: SelfDevJobResult,
   preflightWarning: PreflightWarningObservation = 'unknown',
 ): FailureKind | null {
   if (result.blockReason === 'parent-unlanded') return 'parent-unlanded';
+  // A child may claim no changes after committing and opening its draft. The
+  // parent must retain the PR for review instead of reworking the same goal.
+  if (result.status === 'failed' && result.completionDisposition === 'completed-without-changes'
+    && hasConcretePrEvidence(result)) return 'awaiting-human';
+  if (result.blockReason === 'dependency-deferred' || result.error?.code === 'DEP_BLOCKED_REBASE_READY') return 'blocked-upstream';
   if (result.blockReason === 'dependency-needs-human' || result.error?.code === 'GOAL_DONE_BOUNDARY_MISSING') return 'awaiting-human';
   const ledgerKind = result.failureClassification === undefined
     ? undefined
     : result.failureClassification === 'run-deadline-exceeded'
       // 기한 사망은 transient 가 아니다. 브랜치/PR 이 있으면 수확(false-failure), 없으면 재분해.
-      ? (result.branch || result.prUrl || result.prNumber !== undefined ? 'false-failure' : 'unconverged-decomposable')
+      ? (result.branch || hasOpenedPrPointer(result) ? 'false-failure' : 'unconverged-decomposable')
       : LEDGER_FAILURE_KIND[result.failureClassification];
 
   // ⭐ 수렴 실패인데 하니스가 «쪼개는 법»을 이미 냈으면 그것은 다른 처방이다.
@@ -518,7 +544,7 @@ export function classifyFailure(
     result.status === 'done'
     && result.stage === 'pr-opened'
     && !hasLanded(result)
-    && (Boolean(result.prUrl) || result.prNumber !== undefined)
+    && hasOpenedPrPointer(result)
   ) {
     return 'awaiting-human';
   }
@@ -616,8 +642,15 @@ export function classifyFailures(
     const kind = classifyFailure(result, queryPreflightWarning(preflightIdentifiers, queryPreflight));
     if (kind === null) return [];
     const error = result.error;
-    const awaitingHuman = kind === 'awaiting-human'
-      ? failureObservationFields('AWAITING_HUMAN', openPrAwaitingHumanMessage(result))
+    const prChangeConflict = kind === 'awaiting-human' && result.status === 'failed'
+      && result.completionDisposition === 'completed-without-changes'
+      && hasConcretePrEvidence(result);
+    const prPointer = typeof result.prNumber === 'number' && Number.isSafeInteger(result.prNumber) && result.prNumber > 0
+      ? `#${result.prNumber}` : result.prUrl;
+    const awaitingHuman = prChangeConflict
+      ? failureObservationFields('PR_CHANGE_CONFLICT', `PR ${prPointer} exists while child reported completed-without-changes`)
+      : kind === 'awaiting-human'
+        ? failureObservationFields('AWAITING_HUMAN', openPrAwaitingHumanMessage(result))
       : kind === 'parent-unlanded'
         ? failureObservationFields('PARENT_UNLANDED', parentUnlandedProgressLine(result.feature.split('\n')[0]!, result.parentPrNumber, result.parentNoPr === true))
         : undefined;
@@ -1009,13 +1042,16 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           taskId: `boundary:${taskCardId}:blocked:${index + 1}`,
           feature: goal.feature,
           status: 'blocked',
-          blockReason: 'dependency-needs-human',
-          stopReason: 'needs-human',
-          error: { code: 'DEPENDENCY_NEEDS_HUMAN', message: `선행 needs-human: ${predecessor}` },
+          blockReason: 'dependency-deferred',
+          stopReason: 'rebase-ready',
+          error: { code: 'DEP_BLOCKED_REBASE_READY', message: `선행 조각 ${predecessor} 재수복 뒤 다음 런 이월` },
         });
+        try { debug.log('self-dev.slice', 'dep-blocked', { slice: goal.id ?? String(index), blockedBy: predecessor,
+          reason: 'GOAL_DONE_BOUNDARY_MISSING', disposition: 'rebase-ready' }); } catch { /* observation is fail-soft */ }
       }
       const withheld = [...blockedGoalIndexes].map((index) => index + 1);
-      try { debug.log('self-dev.orchestrate', 'done-boundary-missing', { taskCardId, boundaryMissing, withheld, action: 'needs-human', eligibleToLaunch: opts.goals.length - blockedGoalIndexes.size }); } catch { /* fail-soft */ }
+      try { debug.log('self-dev.orchestrate', 'done-boundary-missing', { taskCardId, boundaryMissing, withheld,
+        action: 'partial-needs-human', dependentDisposition: 'rebase-ready', eligibleToLaunch: opts.goals.length - blockedGoalIndexes.size }); } catch { /* fail-soft */ }
       opts = { ...opts, goals: opts.goals.flatMap((goal, index) => blockedGoalIndexes.has(index)
         ? []
         : [{ ...goal, id: goal.id ?? String(index) }]) };
@@ -1290,6 +1326,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
   const taskIdByLocal = new Map<string, string>();         // goal-local id → live taskId
   const taskIdByGoal = new Map<SelfDevGoal, string>();      // original shard → current or resumed taskId
   const created: Array<{ task: ReturnType<typeof createTask>; goal: SelfDevGoal }> = [];
+  const repairedGoals = new Set<SelfDevGoal>();
   opts.goals.forEach((g, i) => {
     const prior = resumedByGoal.get(g);
     if (prior) {
@@ -1762,8 +1799,38 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
               dispStage: fDisp?.stage ?? 'none', screenSpace: fScreen.screenSpace,
             });
           }
+          const failedGoal = taskByGoal.get(ev.taskId);
+          const failedTask = graph.getTask(ev.taskId);
           const failedResult = results.get(ev.taskId)!;
           const stopReason = opts.stopAfterFailure?.(failedResult) ?? null;
+          // A child without a PR gets one supervised, narrower attempt. Keep the original
+          // failure in the checkpoint; redirect only its actual dependents to the replacement.
+          if (stopReason === null && taskCardId?.trim() && failedGoal && failedTask?.surface.kind === 'self-implement' && !repairedGoals.has(failedGoal)
+            && !fDisp?.prUrl && fDisp?.merged !== true && fDisp?.harvestable !== true) {
+            repairedGoals.add(failedGoal);
+            const reason = `${ev.errorCode}: ${ev.errorMessage}`.slice(0, FAILURE_MESSAGE_MAX_LENGTH);
+            const repairFeature = `${failedGoal.feature.trimEnd()}\n\n## 자동 수복 1회\n앞선 조각 실패: ${reason}\n실패 범위만 좁혀 재시도하고 원래 완료 경계를 보존한다.`;
+            const replacement = createTask({
+              title: goalTitle(failedGoal),
+              description: repairFeature.slice(0, TASK_DEFAULTS.descriptionMaxLen),
+              surface: failedTask.surface.kind === 'self-implement'
+                ? { ...failedTask.surface, feature: repairFeature }
+                : failedTask.surface,
+              isolation: failedTask.isolation,
+            }, { now: now() });
+            graph.addTask(replacement);
+            graph.updateTask(replacement.id, { dependsOn: [...failedTask.dependsOn] }, { now: now() });
+            taskByGoal.set(replacement.id, failedGoal);
+            spaceIdByTask.set(replacement.id, spaceIdForTask(replacement));
+            taskIdByGoal.set(failedGoal, replacement.id);
+            created.push({ task: replacement, goal: failedGoal });
+            graph.supersede(ev.taskId, [replacement.id], { now: now() });
+            results.set(ev.taskId, { ...results.get(ev.taskId)!, status: 'superseded' });
+            try { debug.log('self-dev.slice', 'repair-retry', { slice: failedGoal.id ?? ev.taskId, failedTaskId: ev.taskId,
+              replacementTaskId: replacement.id, reason, attempt: 1 }); } catch { /* observation is fail-soft */ }
+            scheduleTick();
+            break;
+          }
           if (stopReason !== null) {
             let remainingGoals = 0;
             for (const task of created.map(({ task }) => graph.getTask(task.id)).filter((task): task is NonNullable<typeof task> => task !== undefined)) {
@@ -1781,23 +1848,55 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
             }
             if (remainingGoals > 0) opts.onStopAfterFailure?.({ reason: stopReason, remainingGoals });
           }
-          // S3 cascade — dependents of a failed task can never become
-          // ready (a dep will never be `done`) → cancel them honestly
-          // instead of leaving them `blocked` (which stalls the run onto
-          // the stuck-guard). subtree() = failed task + its downstream.
+          // A hot-file edge only serializes execution. It does not make the later
+          // slice depend on the earlier slice's result. Cancel only the explicit
+          // dependency closure; release hot-only edges so independent PRs proceed.
+          const localGoalId = (goal: SelfDevGoal): string => goal.id ?? String(opts.goals.indexOf(goal));
+          const blockedGoalIds = new Set<string>(failedGoal ? [localGoalId(failedGoal)] : []);
+          let expanded = true;
+          while (expanded) {
+            expanded = false;
+            for (const { goal } of created) {
+              const localId = localGoalId(goal);
+              if (blockedGoalIds.has(localId)) continue;
+              if ((goal.dependsOn ?? []).some((id) => blockedGoalIds.has(id))) {
+                blockedGoalIds.add(localId);
+                expanded = true;
+              }
+            }
+          }
           let cascaded = 0;
-          for (const t of graph.subtree(ev.taskId)) {
-            if (t.id === ev.taskId || isTerminalStatus(t.status)) continue;
+          for (const { task, goal } of created) {
+            const t = graph.getTask(task.id);
+            if (!t || t.id === ev.taskId || isTerminalStatus(t.status)) continue;
+            const localId = localGoalId(goal);
+            if (!blockedGoalIds.has(localId)) continue;
             try {
               graph.updateTask(t.id, { status: 'cancelled' }, { now: now() });
               results.set(t.id, {
                 taskId: t.id,
                 feature: taskByGoal.get(t.id)?.feature ?? '',
                 status: 'cancelled',
-                error: { code: 'DEP_FAILED', message: `dependency ${ev.taskId} failed` },
+                error: taskCardId?.trim()
+                  ? { code: 'DEP_BLOCKED_REBASE_READY', message: `dependency ${ev.taskId} failed; rebase-ready next run` }
+                  : { code: 'DEP_FAILED', message: `dependency ${ev.taskId} failed` },
               });
+              try { debug.log('self-dev.slice', 'dep-blocked', { slice: localId, blockedBy: failedGoal?.id ?? ev.taskId,
+                reason: ev.errorCode, disposition: 'rebase-ready' }); } catch { /* observation is fail-soft */ }
               cascaded++;
             } catch { /* best-effort */ }
+          }
+          for (const { task, goal } of created) {
+            const current = graph.getTask(task.id);
+            if (!current || isTerminalStatus(current.status)) continue;
+            const independent = current.dependsOn.filter((id) => {
+              const parent = graph.getTask(id);
+              return parent && (parent.status === 'failed' || parent.status === 'cancelled' || parent.status === 'superseded')
+                && !(goal.dependsOn ?? []).includes(taskByGoal.has(id) ? localGoalId(taskByGoal.get(id)!) : '');
+            });
+            if (independent.length) graph.updateTask(task.id, {
+              dependsOn: current.dependsOn.filter((id) => !independent.includes(id)),
+            }, { now: now() });
           }
           debug.log('self-dev.orchestrate', 'job.failed', {
             taskId: ev.taskId,

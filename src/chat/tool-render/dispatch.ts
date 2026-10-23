@@ -17,6 +17,8 @@ import type {
 } from './types.js';
 import { renderToolBlock } from './block.js';
 import { renderToolInline } from './inline.js';
+// Shared with the next TUI chat log (TUI-NEXT-TOOL-RESULT-RENDER) — one extractor for both surfaces.
+import { toolResultBodyText as extractBodyText, toolResultErrorText as extractErrorText } from './result-text.js';
 
 /** 접힌 결과 요약 첫 조각은 `MsgPost` 하나뿐이라 이름 확장을 `dispatch.ts` 안에 둔다.
  *  `types.ts:ToolRenderName` 은 나머지 도구의 공용 계약 그대로 두고, 이 파일의 내부
@@ -425,19 +427,6 @@ function extractSyntheticGuardSummary(result: unknown): string | null {
   return null;
 }
 
-function extractBodyText(result: unknown): string | null {
-  if (typeof result === 'string') return result;
-  if (result && typeof result === 'object' && typeof (result as Record<string, unknown>).output === 'string') {
-    return (result as Record<string, string>).output;
-  }
-  if (result === null || result === undefined) return null;
-  try {
-    return JSON.stringify(result, null, 2);
-  } catch {
-    return String(result);
-  }
-}
-
 function maybeHighlightCodePreview(
   kind: ToolRenderName,
   args: Record<string, unknown>,
@@ -513,13 +502,6 @@ function highlightPreviewLine(line: string, ext: string): string {
     return `${gutter}${colorLine(clipped, ext)}`;
   }
   return line;
-}
-
-function extractErrorText(result: unknown): string | null {
-  if (result && typeof result === 'object' && typeof (result as Record<string, unknown>).error === 'string') {
-    return String((result as Record<string, unknown>).error);
-  }
-  return null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

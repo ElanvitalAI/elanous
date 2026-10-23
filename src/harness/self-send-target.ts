@@ -69,14 +69,15 @@ export function finishPodFragment(spaceId: string, env?: NodeJS.ProcessEnv): voi
   }
 }
 
-export function dispatchPodSelfSend(spaceId: string, message: { stop: true } | { memo: ControlMemoPayload }, kubectl?: Kubectl, env?: NodeJS.ProcessEnv): { job: string } | null {
+export function dispatchPodSelfSend(spaceId: string, message: { stop: true } | { memo: ControlMemoPayload }, kubectl?: Kubectl, env?: NodeJS.ProcessEnv,
+  readWaitSeconds = 0): { job: string; memoRecord?: string; read?: boolean } | null {
   const record = readPodFragment(spaceId, env);
   if (!record) {
     if (podFragmentFinished(spaceId, env)) throw new Error(`self send 대상 조각이 이미 끝났다: ${spaceId}`);
     return null;
   }
-  sendPodControl(record, message, kubectl);
-  return { job: record.job };
+  const receipt = sendPodControl(record, message, kubectl, readWaitSeconds);
+  return { job: record.job, ...receipt };
 }
 
 export type SelfSendTargetResolution =

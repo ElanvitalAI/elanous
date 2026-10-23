@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'node:child_process';
 import { isAbsolute, basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import type { ReleaseManifest } from '../../src/release-loop/manifest.js';
@@ -20,6 +21,184 @@ interface DocsResult {
   error?: string;
   branch?: string;
   worktree?: string;
+  translationFallbacks?: number;
+}
+
+type TranslationRunner = (line: string) => string;
+type AskSpawn = (command: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
+
+const HANGUL = /[\uac00-\ud7a3]/;
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+
+function splitMarkdownPrefix(raw: string): { prefix: string; text: string } {
+  let cursor = /^[\t ]*/.exec(raw)![0].length;
+  let sawHeading = false;
+  while (cursor < raw.length) {
+    const rest = raw.slice(cursor);
+    const token = /^>[\t ]*/.exec(rest)
+      ?? /^(?:[-+*]|\d+[.)])[\t ]+/.exec(rest)
+      ?? (!sawHeading ? /^#{1,6}[\t ]+/.exec(rest) : null);
+    if (!token) break;
+    if (token[0][0] === '#') sawHeading = true;
+    cursor += token[0].length;
+  }
+  return { prefix: raw.slice(0, cursor), text: raw.slice(cursor) };
+}
+
+function markdownFenceLine(raw: string, closing = false): { marker: string; quoteDepth: number; listDepth: number } | undefined {
+  let cursor = 0;
+  const columns = (start: number): { end: number; width: number } => {
+    let end = start;
+    let width = 0;
+    while (raw[end] === ' ' || raw[end] === '\t') {
+      width = raw[end] === '\t' ? width + (4 - (width % 4)) : width + 1;
+      end++;
+    }
+    return { end, width };
+  };
+  const initialIndent = columns(cursor);
+  if (initialIndent.width > 3) return undefined;
+  cursor = initialIndent.end;
+  let quoteDepth = 0;
+  let listDepth = 0;
+  while (cursor < raw.length) {
+    const before = columns(cursor);
+    if (before.width > 3) break;
+    const tokenStart = before.end;
+    if (raw[tokenStart] === '>') {
+      cursor = tokenStart + 1;
+      if (raw[cursor] === ' ') cursor++;
+      quoteDepth++;
+      continue;
+    }
+    const list = /^(?:[-+*]|\d+[.)])[\t ]+/.exec(raw.slice(tokenStart));
+    if (list) {
+      cursor = tokenStart + list[0].length;
+      listDepth++;
+      continue;
+    }
+    break;
+  }
+  const contentIndent = columns(cursor);
+  if (contentIndent.width > 3) return undefined;
+  cursor = contentIndent.end;
+  const marker = /^(?:`{3,}|~{3,})/.exec(raw.slice(cursor))?.[0];
+  if (!marker) return undefined;
+  const tail = raw.slice(cursor + marker.length);
+  if (closing && !/^[\t ]*$/.test(tail)) return undefined;
+  return { marker, quoteDepth, listDepth };
+}
+
+/**
+ * The CLI that answers the translation boundary. `ELANOUS_RELEASE_ASK_BIN` lets a fake-bin stand in at
+ * this child-process boundary (offline runs, tests) without touching the model or the operator's config.
+ */
+function askCliPath(env: NodeJS.ProcessEnv): string {
+  return env.ELANOUS_RELEASE_ASK_BIN?.trim() || join(REPO_ROOT, 'bin/elanous.mjs');
+}
+
+/** Translate one public note sentence without sending private manifest fields to the model. */
+function askBareForEnglish(line: string, askSpawn: AskSpawn = spawnSync, env: NodeJS.ProcessEnv = process.env): string {
+  const prompt = [
+    'Translate the following public release-note sentence into concise English.',
+    'Return only the translated sentence. Preserve product names, code, Markdown links, and meaning.',
+    'Do not add facts, headings, quotes, or commentary.',
+    '',
+    line,
+  ].join('\n');
+  const result = askSpawn(process.execPath, [askCliPath(env), 'ask', '--bare', '--json', prompt], {
+    // Pin the approved translation model for this child only; do not mutate the operator's config.
+    cwd: process.cwd(), env: { ...process.env, ELANOUS_LLM_PROVIDER: 'openrouter', ELANOUS_LLM_MODEL: 'z-ai/glm-5.3' },
+    encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) throw new Error(`ask --bare failed: ${result.error?.message ?? result.stderr ?? result.stdout}`);
+  const payload = JSON.parse(result.stdout.trim().split('\n').at(-1) ?? 'null') as { reply?: unknown; error?: unknown };
+  if (typeof payload.reply !== 'string') throw new Error(typeof payload.error === 'string' ? payload.error : 'ask --bare returned no reply');
+  return payload.reply;
+}
+
+function translatePublicText(text: string, runner: TranslationRunner, failures: string[], cache: Map<string, string>): string {
+  let fence: { marker: string; quoteDepth: number; listDepth: number } | undefined;
+  let inHtmlComment = false;
+  const translatePlain = (raw: string): string => {
+    const { prefix, text: untrimmed } = splitMarkdownPrefix(raw);
+    const source = untrimmed.trim();
+    if (!HANGUL.test(source)) return raw;
+    let translated = cache.get(source);
+    if (translated === undefined) {
+      try {
+        const candidate = runner(source).trim();
+        const alphanumeric = [...candidate].filter((character) => /[\p{L}\p{N}]/u.test(character));
+        if (!candidate || HANGUL.test(candidate) || alphanumeric.length === 0 || /[^\x00-\x7f]/.test(candidate)) {
+          throw new Error('translation is empty or contains non-Latin writing');
+        }
+        translated = candidate;
+        cache.set(source, candidate);
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+        translated = source;
+        cache.set(source, source);
+        debug.log('release-loop.docs', 'public-note-translation-fallback', { reason: failures.at(-1) });
+        return raw;
+      }
+    }
+    const trailingWhitespace = /\s*$/.exec(untrimmed)?.[0] ?? '';
+    return `${prefix}${translated}${trailingWhitespace}`;
+  };
+  return text.split(/(\r?\n)/).map((raw, index) => {
+    if (index % 2 === 1) return raw;
+    const failuresBeforeLine = failures.length;
+    const finishLine = (value: string): string => failures.length > failuresBeforeLine ? raw : value;
+    const fenceLine = inHtmlComment ? undefined : markdownFenceLine(raw);
+    if (fence) {
+      const closingFence = !inHtmlComment ? markdownFenceLine(raw, true) : undefined;
+      if (closingFence && closingFence.quoteDepth === fence.quoteDepth && closingFence.listDepth <= fence.listDepth
+        && closingFence.marker[0] === fence.marker[0] && closingFence.marker.length >= fence.marker.length) fence = undefined;
+      return raw;
+    }
+    if (fenceLine) { fence = fenceLine; return raw; }
+    let output = '';
+    let cursor = 0;
+    let plainStart = 0;
+    while (cursor < raw.length) {
+      if (inHtmlComment) {
+        const end = raw.indexOf('-->', cursor);
+        if (end < 0) return finishLine(output + raw.slice(cursor));
+        output += raw.slice(cursor, end + 3);
+        cursor = end + 3;
+        plainStart = cursor;
+        inHtmlComment = false;
+        continue;
+      }
+      if (raw[cursor] === '`') {
+        let delimiterLength = 1;
+        while (raw[cursor + delimiterLength] === '`') delimiterLength++;
+        let end = raw.indexOf('`'.repeat(delimiterLength), cursor + delimiterLength);
+        while (end >= 0) {
+          let endLength = 1;
+          while (raw[end + endLength] === '`') endLength++;
+          if (endLength === delimiterLength) break;
+          end = raw.indexOf('`'.repeat(delimiterLength), end + endLength);
+        }
+        output += translatePlain(raw.slice(plainStart, cursor));
+        if (end < 0) return finishLine(output + raw.slice(cursor));
+        output += raw.slice(cursor, end + delimiterLength);
+        cursor = end + delimiterLength;
+        plainStart = cursor;
+        continue;
+      }
+      if (raw.startsWith('<!--', cursor)) {
+        output += translatePlain(raw.slice(plainStart, cursor)) + '<!--';
+        cursor += 4;
+        plainStart = cursor;
+        inHtmlComment = true;
+        continue;
+      }
+      cursor++;
+    }
+    output += translatePlain(raw.slice(plainStart));
+    return finishLine(output);
+  }).join('');
 }
 
 function* markdownFiles(directory: string): Generator<string> {
@@ -53,7 +232,7 @@ function graphInput(env: NodeJS.ProcessEnv): Record<string, unknown> {
 /** Apply the cutoff manifest to the public documentation checkout. */
 export function runDocs(
   args: string[], base = process.cwd(), env: NodeJS.ProcessEnv = process.env,
-  deps: { stateRoot?: string; writeTemp?: (path: string, text: string) => void } = {},
+  deps: { stateRoot?: string; writeTemp?: (path: string, text: string) => void; translateLine?: TranslationRunner; askSpawn?: AskSpawn } = {},
 ): DocsResult {
   let version: string | null = null;
   try {
@@ -87,17 +266,33 @@ export function runDocs(
     if (!Array.isArray(registry.pages)) throw new Error(`invalid pages registry: ${pages}`);
     const count = registry.pages.filter((page) => page.id === id).length;
     if (count > 1) throw new Error(`duplicate pages entry: ${id}`);
-    const renderedNotes = renderReleaseNotes(manifest, version);
+    const translationFailures: string[] = [];
+    const translateLine = deps.translateLine ?? ((line) => askBareForEnglish(line, deps.askSpawn, env));
+    const translationCache = new Map<string, string>();
+    const publicEntries = new Set(['feat', 'fix', 'security']);
+    const notesManifest: ReleaseManifest = {
+      ...manifest,
+      in: manifest.in.map((entry) => entry.line && publicEntries.has(entry.kind ?? '')
+        ? { ...entry, line: translatePublicText(entry.line, translateLine, translationFailures, translationCache) }
+        : entry),
+    };
+    const renderedNotes = renderReleaseNotes(notesManifest, version);
+    const existingNotes = existsSync(notes) ? readFileSync(notes, 'utf8') : null;
+    const translatedExistingNotes = existingNotes === null
+      ? null
+      : translatePublicText(existingNotes, translateLine, translationFailures, translationCache);
     // A PR may land its own line (or the headline) in this version's notes before the loop runs.
     // Fold it in rather than refusing (which stalled the release) or overwriting (which lost it).
     let notesText: string | null = null;
-    if (count === 0 && existsSync(notes)) {
-      const existing = readFileSync(notes, 'utf8');
-      if (existing !== renderedNotes) {
-        const fold = foldPreLandedNotes(existing, renderedNotes);
+    if (count === 0 && translatedExistingNotes !== null) {
+      if (existingNotes !== renderedNotes) {
+        const fold = foldPreLandedNotes(translatedExistingNotes, renderedNotes);
         notesText = fold.text;
         debug.log('release-loop.docs', 'pre-landed-lines-folded', { version, count: fold.folded });
       }
+    } else if (count > 0 && existingNotes !== null && translatedExistingNotes !== existingNotes) {
+      // A resumed docs node may find its own earlier Korean output already registered.
+      notesText = translatedExistingNotes;
     }
     if (count === 0) {
       const first = registry.pages.findIndex((page) => page.id.startsWith('releases/'));
@@ -120,7 +315,8 @@ export function runDocs(
     else if (!existsSync(notes)) atomicWrite(notes, renderedNotes, writeTemp);
     for (const [path, text] of changed) atomicWrite(path, text, writeTemp);
     if (count === 0) atomicWrite(pages, JSON.stringify(registry, null, 2) + '\n', writeTemp);
-    return { outcome: 'ok', version, notes, flipped: changed.map(([path]) => path), pages };
+    return { outcome: 'ok', version, notes, flipped: changed.map(([path]) => path), pages,
+      ...(translationFailures.length ? { translationFallbacks: translationFailures.length } : {}) };
   } catch (error) {
     return { outcome: 'error', version, error: error instanceof Error ? error.message : String(error) };
   }

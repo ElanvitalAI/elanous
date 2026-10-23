@@ -503,3 +503,61 @@ test('Agent is allowed on the investigation quick route only', () => {
     expect(toolsForTuiRoute(specs, route).map((tool) => tool.name)).not.toContain('Agent');
   }
 });
+
+test('TUI-SPEECH-STYLE-DAEMON: 자동 수복 1회 — aborted(수렴 실패)를 좁혀 정확히 1회만 재시도하고 완료 경계를 보존한다', async () => {
+  const base = config.getUserConfig();
+  spyOn(config, 'getUserConfig').mockReturnValue({
+    ...base, llm: { ...base.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+  });
+  const log = spyOn(debug, 'log');
+  const attempts: CoreTurnContext[] = [];
+  const completed: LLMMessage[][] = [];
+  const pushes: string[] = [];
+  spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
+    attempts.push(ctx);
+    if (attempts.length === 1) return { stopReason: 'aborted', finalText: '' };
+    await ctx.callbacks?.onTurnComplete?.([{ role: 'assistant', content: '복구 후 최종 답' }]);
+    return { stopReason: 'end_turn', finalText: '복구 후 최종 답' };
+  });
+  await bridgeCoreTurnToAcp({
+    getMessages: () => [{ role: 'user', content: '구현 계속해줘' }],
+    getTools: () => [search],
+    dispatchTool: async () => ({}),
+    onTurnComplete: ({ newMessages }) => { completed.push(newMessages); },
+  })({
+    sessionId: 'autoheal-once', cwd: '/tmp', userText: '구현 계속해줘',
+    promptBlocks: [{ type: 'text', text: '구현 계속해줘' }], isAborted: () => false,
+    push: async (delta: string) => { pushes.push(delta); },
+    pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+    pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+  } as unknown as AcpTurnContext);
+  // 정확히 1회 재시도 — 재시도 0회(1 호출)·2회(3 호출) 모두 이 단언에서 실패한다.
+  expect(attempts).toHaveLength(2);
+  // 원래 완료 경계 보존 — 턴 완료(onTurnComplete)는 복구된 시도에서 «한 번»만 지속되고 최종 답이 표면화된다.
+  expect(completed).toEqual([[{ role: 'assistant', content: '복구 후 최종 답' }]]);
+  expect(pushes).toEqual(['', '복구 후 최종 답']);
+  expect(log).toHaveBeenCalledWith('acp.turn', 'autoheal-retry', expect.objectContaining({ sessionId: 'autoheal-once', attempt: 2 }));
+
+  // ⛔ 사용자 중단(isAborted)은 수복 대상이 아니다 — 재시도 없이 그대로 끝난다.
+  mock.restore();
+  const abortBase = config.getUserConfig();
+  spyOn(config, 'getUserConfig').mockReturnValue({
+    ...abortBase, llm: { ...abortBase.llm, model: 'gpt-4o-mini', goalLoop: { enabled: false } },
+  });
+  const cancelledAttempts: CoreTurnContext[] = [];
+  spyOn(core, 'runCoreTurn').mockImplementation(async (ctx) => {
+    cancelledAttempts.push(ctx);
+    return { stopReason: 'aborted', finalText: '' };
+  });
+  await bridgeCoreTurnToAcp({
+    getMessages: () => [{ role: 'user', content: '구현 계속해줘' }],
+    getTools: () => [search],
+    dispatchTool: async () => ({}),
+  })({
+    sessionId: 'autoheal-cancel', cwd: '/tmp', userText: '구현 계속해줘',
+    promptBlocks: [{ type: 'text', text: '구현 계속해줘' }], isAborted: () => true,
+    push: async () => {}, pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+    pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
+  } as unknown as AcpTurnContext);
+  expect(cancelledAttempts).toHaveLength(1);
+}, 10_000);

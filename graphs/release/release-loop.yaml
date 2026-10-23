@@ -19,6 +19,8 @@ nodes:
   - { node_id: export-check, kind: gate, recipe: 'cmd:export-check', max_visits: 1 }
   - { node_id: prefetch, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
   - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: { on: [fail] } }
+  # Deterministic, best-effort traffic transition; it never changes the release verdict.
+  - { node_id: traffic-gate-passed, kind: gate, recipe: 'cmd:traffic-gate-passed', max_visits: 1 }
   # S1 shadow: classify and record only; all exits still terminate through the existing failed node.
   - { node_id: gate-triage, kind: judge, recipe: 'cmd:gate-triage', max_visits: 1 }
   - { node_id: mac-smoke, kind: gate, recipe: 'cmd:mac-smoke', max_visits: 1 }
@@ -29,12 +31,17 @@ nodes:
   - { node_id: docs, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
   - { node_id: known-issues, kind: agent, recipe: 'cmd:known-issues', max_visits: 1 }
   - { node_id: notes-check, kind: gate, recipe: 'cmd:notes-check', max_visits: 1 }
+  # RELEASE-GRAPH-SELFHEAL: a failed notes check re-enters through the docs repair node before one recheck.
+  # Repair is observation-only: it introduces no approval, budget, or loop-cap policy of its own.
+  - { node_id: notes-repair, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
+  - { node_id: notes-recheck, kind: gate, recipe: 'cmd:notes-check', max_visits: 1 }
   - { node_id: auto-approve, kind: gate, recipe: 'cmd:auto-approve', max_visits: 1 }
   - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }
   - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: npm-publish, kind: git, recipe: 'cmd:npm-publish', max_visits: 1 }
   - { node_id: docs-land, kind: git, recipe: 'cmd:docs-land', max_visits: 1 }
   - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1, notify: { on: [ok, fail] } }
+  - { node_id: traffic-verify-complete, kind: gate, recipe: 'cmd:traffic-verify-complete', max_visits: 1 }
   - { node_id: vault-note, kind: gate, recipe: 'cmd:vault-note', max_visits: 1 }
   - { node_id: release-story, kind: gate, recipe: 'cmd:release-story', max_visits: 1 }
   - { node_id: ops-upgrade, kind: agent, recipe: 'cmd:ops-upgrade', max_visits: 1 }
@@ -49,7 +56,9 @@ edges:
   - { from: export-check, on: outcome, map: { ok: prefetch, fail: failed, error: failed } }
   # Prefetch never gates: even a crashed prefetch node is a cache miss — the late nodes take their original paths.
   - { from: prefetch, on: outcome, map: { ok: gate, fail: gate, error: gate } }
-  - { from: gate, on: outcome, map: { ok: mac-smoke, fail: gate-triage, error: gate-triage } }
+  - { from: gate, on: outcome, map: { ok: traffic-gate-passed, fail: gate-triage, error: gate-triage } }
+  # Warning-only: the transition result stays truthful; every outcome continues to the next release node.
+  - { from: traffic-gate-passed, on: outcome, map: { ok: mac-smoke, fail: mac-smoke, error: mac-smoke } }
   - { from: gate-triage, on: outcome, map: { ok: failed, fail: failed, error: failed } }
   # Warning-only: a macOS failure or unmeasured run never blocks publishing — auto-approve shows it as a warning row.
   - { from: mac-smoke, on: outcome, map: { ok: pwa, fail: pwa, error: pwa } }
@@ -59,15 +68,19 @@ edges:
   - { from: tui, on: outcome, map: { ok: docs, fail: failed, error: failed } }
   - { from: docs, on: outcome, map: { ok: known-issues, fail: failed, error: failed } }
   - { from: known-issues, on: outcome, map: { ok: notes-check, fail: failed, error: failed } }
-  - { from: notes-check, on: outcome, map: { ok: auto-approve, fail: failed, error: failed } }
+  # RELEASE-GRAPH-SELFHEAL: fail/error re-enter notes-check through one repair; publish still requires a passing recheck.
+  - { from: notes-check, on: outcome, map: { ok: auto-approve, fail: notes-repair, error: notes-repair } }
+  - { from: notes-repair, on: outcome, map: { ok: notes-recheck, fail: failed, error: failed } }
+  - { from: notes-recheck, on: outcome, map: { ok: auto-approve, fail: failed, error: failed } }
   - { from: auto-approve, on: outcome, map: { ok: publish, fail: approve-publish, error: approve-publish } }
   - { from: approve-publish, on: outcome, map: { ok: publish, fail: failed } }
   - { from: publish, on: outcome, map: { ok: npm-publish, fail: failed, error: failed } }
-  - { from: npm-publish, on: outcome, map: { ok: docs-land, fail: docs-land, error: docs-land } }
+  - { from: npm-publish, on: outcome, map: { ok: docs-land, fail: failed, error: failed } }
   # RELEASE-DEVBUMP-ALWAYS: after a successful publish every fail/error routes through version-dev-bump —
   # a published release always hands main to its own next -dev, then still finishes failed.
   - { from: docs-land, on: outcome, map: { ok: verify, fail: version-dev-bump-after-failure, error: version-dev-bump-after-failure } }
-  - { from: verify, on: outcome, map: { ok: vault-note, fail: version-dev-bump-after-failure, error: version-dev-bump-after-failure } }
+  - { from: verify, on: outcome, map: { ok: traffic-verify-complete, fail: version-dev-bump-after-failure, error: version-dev-bump-after-failure } }
+  - { from: traffic-verify-complete, on: outcome, map: { ok: vault-note, fail: vault-note, error: vault-note } }
   # Warning-only: vault note and release story failures after publication never block operational upgrades.
   - { from: vault-note, on: outcome, map: { ok: release-story, fail: release-story, error: release-story } }
   - { from: release-story, on: outcome, map: { ok: ops-upgrade, fail: ops-upgrade, error: ops-upgrade } }

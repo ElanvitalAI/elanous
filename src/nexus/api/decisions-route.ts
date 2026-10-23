@@ -24,24 +24,44 @@ export async function handleDecisions(req: Request, deps: DecisionsRouteDeps = {
       debug.log('decisions.api', 'rejected', { reason: 'invalid-status' });
       return jsonResponse({ error: 'bad_request' }, 400);
     }
-    const decisions = ledger.list({ status: 'open' }).map(entry => ({
-      id: entry.id,
-      title: entry.title,
-      situation: entry.scqa.s.slice(0, 200),
-      options: entry.options.map(option => ({ id: option.key, label: option.label, consequence: option.consequence })),
-      recommendation: entry.recommendation,
-      raisedAt: entry.raisedAt,
-      dueAt: entry.dueAt,
-      scqa: entry.scqa,
-      category: entry.category,
-      irreversible: isIrreversible(entry),
-      raisedBy: { agent: entry.raisedBy.agent, ...(entry.raisedBy.track ? { track: entry.raisedBy.track } : {}) },
-      alternative: entry.alternative,
-      dissent: entry.dissent,
-      crossCheck: entry.crossCheck,
-      crossCheckSkipped: entry.crossCheckSkipped,
-      pendingQuestion: entry.pendingQuestion,
-    }));
+    const decided = ledger.list({ status: 'decided' });
+    const decisions = ledger.list({ status: 'open' }).map(entry => {
+      const precedent = decided
+        .filter(other => other.id !== entry.id && other.category === entry.category && other.choice)
+        .sort((a, b) => (b.decidedAt ?? '').localeCompare(a.decidedAt ?? ''))[0];
+      return {
+        id: entry.id,
+        title: entry.title,
+        situation: entry.scqa.s.slice(0, 200),
+        options: entry.options.map(option => ({ id: option.key, label: option.label, consequence: option.consequence })),
+        recommendation: entry.recommendation,
+        raisedAt: entry.raisedAt,
+        dueAt: entry.dueAt,
+        scqa: entry.scqa,
+        category: entry.category,
+        irreversible: isIrreversible(entry),
+        raisedBy: { agent: entry.raisedBy.agent, ...(entry.raisedBy.track ? { track: entry.raisedBy.track } : {}) },
+        alternative: entry.alternative,
+        dissent: entry.dissent,
+        crossCheck: entry.crossCheck,
+        crossCheckSkipped: entry.crossCheckSkipped,
+        pendingQuestion: entry.pendingQuestion,
+        history: entry.history.map(event => ({
+          type: event.type,
+          ...(event.at ? { at: event.at } : {}),
+          by: event.by,
+          ...(event.choice ? { choice: event.choice } : {}),
+          ...(event.reason ? { reason: event.reason } : {}),
+        })),
+        precedent: precedent ? {
+          id: precedent.id,
+          title: precedent.title,
+          choice: precedent.options.find(option => option.key === precedent.choice)?.label ?? precedent.choice ?? '',
+          ...(precedent.decidedAt ? { decidedAt: precedent.decidedAt } : {}),
+          ...(precedent.decidedBy ? { decidedBy: precedent.decidedBy.kind } : {}),
+        } : null,
+      };
+    });
     debug.log('decisions.api', 'listed', { count: decisions.length });
     return jsonResponse({ decisions });
   }

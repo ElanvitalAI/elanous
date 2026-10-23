@@ -40,11 +40,52 @@ import { writeGoalDocumentAtomic } from './goal-document-write.js';
 import { hostname, loadavg } from 'node:os';
 import { resolveHostId } from '../platform/host-id.js';
 import { resolveInstanceName } from '../instance-identity.js';
+import { ghAutomationEnv } from '../autopilot/pr-manager.js';
 import { citedReviewSymbols, MAX_CITED_REVIEW_SYMBOL_CHARS, measureReviewFindingKeyOverlap, normalizeReviewFindingKey, REVIEW_FINDING_KEY_VERSION, reviewFindingKey, shortNormalizedReviewFindingHash, type CitedReviewSymbol } from '../agent-substrate/review-finding-key.js';
 export { citedReviewSymbols, MAX_CITED_REVIEW_SYMBOL_CHARS, normalizeReviewFindingKey, REVIEW_FINDING_KEY_VERSION, reviewFindingKey, shortNormalizedReviewFindingHash, type CitedReviewSymbol } from '../agent-substrate/review-finding-key.js';
 
 function displayBranchName(ref: string): string {
   return ref.trim().replace(/^refs\/heads\//, '').replace(/^origin\//, '');
+}
+
+export const HARVEST_DEFERRED_MARKER = '수확보류: harvest-deferred';
+const execFileAsync = promisify(execFileCallback);
+
+export function markHarvestDeferredBody(input: {
+  runStatus: string | undefined;
+  prNumber: number | undefined;
+  body: string | undefined;
+}): string | undefined {
+  if (input.runStatus !== 'failed' || input.prNumber === undefined || !Number.isSafeInteger(input.prNumber) || input.prNumber < 1 || input.body === undefined) return undefined;
+  if (harvestDeferredMarker(input.body)) return input.body;
+  const separator = input.body.endsWith('\n') ? '\n' : '\n\n';
+  return `${input.body}${separator}${HARVEST_DEFERRED_MARKER}`;
+}
+
+export async function readHarvestPrBody(opts: { number: number; cwd: string }): Promise<{ body: string; state: string; isDraft: boolean } | undefined> {
+  const { stdout } = await execFileAsync('gh', ['pr', 'view', String(opts.number), '--json', 'body,state,isDraft'], {
+    cwd: opts.cwd,
+    env: ghAutomationEnv(process.env),
+    encoding: 'utf8',
+    timeout: 120_000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  const parsed: unknown = JSON.parse(stdout);
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const record = parsed as { body?: unknown; state?: unknown; isDraft?: unknown };
+  return typeof record.body === 'string' && typeof record.state === 'string' && typeof record.isDraft === 'boolean'
+    ? { body: record.body, state: record.state, isDraft: record.isDraft }
+    : undefined;
+}
+
+export async function updateHarvestPrBody(opts: { number: number; body: string; cwd: string }): Promise<void> {
+  await execFileAsync('gh', ['pr', 'edit', String(opts.number), '--body', opts.body], {
+    cwd: opts.cwd,
+    env: ghAutomationEnv(process.env),
+    encoding: 'utf8',
+    timeout: 120_000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
 }
 
 export function formatAutoMergeSuccessMessage(input: {
@@ -79,6 +120,7 @@ import { classifyGateEnvDeficit, DEFAULT_GATE_ENV_RETRY, GATE_ENV_DEFICIT_HARVES
 import { recordFailureEvent } from './heal-intake.js';
 import { classifyReworkCapExhaustion, type ReworkCapHealDecision } from './heal-triage.js';
 import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
+import { harvestDeferredMarker } from '../self-dev/draft-triage-rules.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { reworkDecision } from './decision-events.js';
 import type { LogSink } from '../mss/logging/sink.js';
@@ -91,7 +133,7 @@ import { classifyError } from '../session-runtime/retry-policy.js';
 import { decomposeSelfDevGoal, inferHotPaths, type SelfDevDecomposeOptions } from '../self-dev/decompose.js';
 import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
 import { askAtExecution, type ExecutionClarificationResult } from './execution-clarification.js';
-import { decideScopeExpansion, renderScopeExpansionSection, SCOPE_EXPANSION_CAP, type ScopeExpansion } from './scope-adjacency.js';
+import { decideScopeExpansion, renderScopeExpansionSection, SCOPE_EXPANSION_CAP, type ScopeExpansion, type ScopeStopReason } from './scope-adjacency.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
 import { selectKnowhowPack } from './knowhow-pack.js';
 import { declaredNewFilePaths } from './goal-new-paths.js';
@@ -183,7 +225,8 @@ import { formatGateFailedId, type PremiseReviewCard, type PremiseReviewInput } f
 import { runWorkflowToCompletion } from '../workflow-runtime/executor.js';
 import { mapReworkVerdict, supervisionObservationFields } from './supervision-vocabulary.js';
 import { resolveRunOutcome } from './run-outcome.js';
-import { authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, runRequiredEvidenceChecks, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import { authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import { resolveEvidenceHeadCommit } from './evidence-command-budget.js';
 import { pressDecisionSignals, type DecisionSignalPressResult } from './decision-signal-press.js';
 import { inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations } from '../../scripts/ask-marker-check.js';
 
@@ -257,7 +300,8 @@ import type { ClassifyShadowCallLLM } from './classify-shadow.js';
 import { hasModuleLoadFailure, type GateTestFailure } from './gate-baseline.js';
 import { commitWorktree, defaultBranchRef, preservationHasChanges } from './seams.js';
 import { detectUncommittedWork } from './uncommitted-work.js';
-import { spawnSync } from 'node:child_process';
+import { execFile as execFileCallback, spawnSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { blockedDraftDisposition, blockedDraftTargetFor, decideDraftOnStop, nextMoveFor, parseDraftOnStopMode, repairSalvageLinkComment, salvageBranchForRun, syntheticRepairBasePr, type DraftOnStopMode } from './blocked-draft-policy.js';
 import { formatLlmMergeOutcome } from '../autopilot/build/llm-conflict-merge.js';
 import { FOUND_CITED_PATH_REFUTATION_QUOTE, MISSING_CITED_PATH_REFUTATION_QUOTE, MUST_FIX_REFUTATION_ACKNOWLEDGEMENT_WITH_REASON, REFUTATION_QUOTE_GRAMMAR, observeMustFixCitedPaths, parseMustFixRefutationAcknowledgement, parseMustFixRefutations, renderMustFixCitedPathFacts, snapshotMustFixFindings, stableMustFixId, type ReflectEvidenceFacts, type ReflectGateFacts, type MustFixCitedPathFact, type MustFixFinding, type MustFixRecurrenceHistory, type MustFixRefutation, type MustFixRefutationKind } from './reflect-mustfix.js';
@@ -281,6 +325,7 @@ import { appendGateWorktreeFreshnessEvidence, gateEvidenceNote } from '../harnes
 import { diffHeaderPaths } from '../agent-substrate/self-review-cli.js';
 import { format as formatPrComment, type PrCommentRole } from '../agent-substrate/pr-comment-meta.js';
 import { changedFiles, commitTitles, type OpenPrOutcome, type SelfImplementCompletionDisposition } from './seams.js';
+import { findUnwiredExports, gitBaseFileReader } from './wiring-check.js';
 import {
   classifyAbandonedRun,
   isAbandonedClassificationOutcome,
@@ -1159,6 +1204,8 @@ export interface SelfImplementSeams {
   /** Test seam for blocked environment branch persistence; return whether the branch was pushed. */
   /** Test seam — the worktree commit to pin before main sync (default `git rev-parse HEAD`). */
   headCommit?: (cwd: string) => string | undefined;
+  /** Test seam for required evidence command execution; production uses its bounded shell runner. */
+  evidenceCommandRunner?: (command: string, cwd: string) => Pick<ReturnType<typeof spawnSync>, 'status' | 'stdout' | 'stderr' | 'error'>;
   /** `commit` pins the pushed state; without it the worktree HEAD is pushed. */
   preserveBlockedBranch?: (ctx: { cwd: string; branch: string; title: string; commit?: string }) => boolean | Promise<boolean>;
   /** DRAFT-NOT-ARCHIVE — `tools.selfImplement.draftOnStop` 읽기 seam. 생략하면 user-config(실패·부재 = 'always' · 종전). */
@@ -1173,6 +1220,10 @@ export interface SelfImplementSeams {
   openPr: (opts: { title: string; body: string; head: string; base?: string; draft?: boolean; labels?: string[]; cwd: string; runId?: string }) => Promise<OpenPrOutcome>;
   /** PR 생성 뒤 런의 라운드 대화를 게시한다. 실패는 PR 개설을 되돌리지 않는다. */
   postPrComment?: (opts: { number: number; body: string; cwd: string }) => Promise<void>;
+  /** Read-only body/state confirmation for the failed-run draft preservation marker. */
+  readPrBodyForHarvest?: (opts: { number: number; cwd: string }) => Promise<{ body: string; state: string; isDraft: boolean } | undefined>;
+  /** Update only the confirmed existing PR body; never creates a PR. */
+  updatePrBodyForHarvest?: (opts: { number: number; body: string; cwd: string }) => Promise<void>;
   /** Read and edit the single marked status comment; missing seams fall back to individual comments. */
   findPrComment?: (opts: { number: number; marker: string; cwd: string; comments?: unknown }) => Promise<{ id: number; body: string } | undefined>;
   editPrComment?: (opts: { id: number; body: string; cwd: string }) => Promise<void>;
@@ -2333,6 +2384,8 @@ export interface SelfImplementResult {
   scopeExpansion?: ScopeExpansion;
   /** Bounded names measured by the execution-scope guard on a held edit. */
   outOfScopeEdits?: string[];
+  /** SCOPE-ESCAPE-AS-REFINE: why the held edit stops (deletion · protected path · cap) — the parent stops only on these. */
+  scopeStopReasons?: ScopeStopReason[];
   nameCapReached?: boolean;
   outsideCount?: number;
   gate?: SelfImplementGateResult;
@@ -4394,6 +4447,50 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   } finally {
     if (loopRegistered) registerRunLoop('ended');
     const terminalStage = terminalResult?.stage ?? 'crashed';
+    // A blocked draft may be opened on the first failed attempt, before the
+    // normal outcome observer has written its terminal status. Persist the
+    // actual terminal result before exposing harvest-deferred on that PR.
+    const terminalOutcome = terminalResult ? mapStageToRunStatus(terminalStage) : undefined;
+    if (terminalOutcome?.runStatus === 'failed'
+      && loadRunLedger(runId)?.filter((entry) => entry.event === 'run-status').at(-1)?.data.runStatus !== 'failed') {
+      observeOuter('run-status', {
+        stage: terminalStage, node: terminalResult?.node ?? null, ...terminalOutcome,
+        ...(terminalResult?.reviewReflectRejectedCount !== undefined
+          ? { reviewReflectRejectedCount: terminalResult.reviewReflectRejectedCount }
+          : {}),
+      }, { level: 'warn' });
+    }
+    try {
+      const runStatus = terminalOutcome?.runStatus;
+      const prNumber = recordedPrNumber(terminalResult?.prNumber) ?? capturedPrNumber;
+      // openPr is required on every seam (including production); it cannot
+      // distinguish test PRs from real ones. The production adapter explicitly
+      // supplies both body operations. A test replacing openPr without both
+      // body operations must fail closed instead of touching a real PR.
+      const readPrBody = opts.seams.readPrBodyForHarvest;
+      const updatePrBody = opts.seams.updatePrBodyForHarvest;
+      // The terminal observer must have persisted this run's failure before a
+      // draft can advertise harvest deferral. Even an injected writer must
+      // leave a matching record in the canonical ledger before mutation.
+      const lastPersistedStatus = loadRunLedger(runId)?.filter((entry) => entry.event === 'run-status').at(-1)?.data.runStatus;
+      const persistedFailure = runStatus === 'failed' && lastPersistedStatus === 'failed';
+      if (persistedFailure && prNumber !== undefined && readPrBody && updatePrBody) {
+        const existing = await readPrBody({ number: prNumber, cwd: worktreePath ?? process.cwd() });
+        if (existing?.state === 'OPEN' && existing.isDraft === true) {
+          const markedBody = markHarvestDeferredBody({ runStatus, prNumber, body: existing.body });
+          if (markedBody !== undefined && markedBody !== existing.body) {
+            await updatePrBody({ number: prNumber, body: markedBody, cwd: worktreePath ?? process.cwd() });
+            observeOuter('harvest-deferred', { runStatus, prNumber, marker: HARVEST_DEFERRED_MARKER });
+          }
+        } else {
+          observeOuter('harvest-deferred-skipped', { runStatus, prNumber, reason: 'existing-draft-not-confirmed' }, { level: 'warn' });
+        }
+      } else {
+        observeOuter('harvest-deferred-skipped', { runStatus: runStatus ?? null, prNumber: prNumber ?? null, reason: 'status-pr-body-seam-unavailable' }, { level: 'warn' });
+      }
+    } catch (error) {
+      logRunAwareFailSoft(runId, 'harvest-deferred-failed', { error: safeErrorDescription(error) });
+    }
     try {
       const mappedStatus = mapStageToRunStatus(terminalStage)?.runStatus;
       const reworkCapStop = terminalResult?.stage === 'pr-opened' && (
@@ -4741,7 +4838,7 @@ export function observeRunOutcome(
 type RollupPrNumber = number | 'none' | 'unknown';
 
 function recordedPrNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 function rollupPrNumber(
@@ -4869,7 +4966,7 @@ async function runSelfImplementInner(
     const { graphVersionHash } = await import('./graph-yaml.js');
     const { applyGraphOverlays } = await import('./graph-overlay-yaml.js');
     const { createGraphVariant } = await import('./graph-variant.js');
-    const { runLedgerPath } = await import('./run-ledger.js');
+    const { saveRunGraphVariant, loadRunGraphVariant } = await import('./run-ledger.js');
     const { stringify } = await import('yaml');
     const baseSpec = GRAPH_SPECS[graphTemplate.graphId];
     const variantRunId = identity?.runId ?? opts.runId;
@@ -4881,16 +4978,16 @@ async function runSelfImplementInner(
       : undefined;
     if (launch && !launch.ok) throw new Error(`graph variant rejected: ${JSON.stringify(launch.rejections)}`);
     const sourceSpec = launch?.ok ? launch.template : baseSpec;
-    const variant = createGraphVariant({ template: sourceSpec, goal: `g_${variantRunId.replace(/[^a-z0-9_-]/gi, '_')}`, plan: opts.graphVariantPlan });
+    // ⭐ 최초 변형 선택 — 골 종류(graphGoalType)·대상 경로 수(declaredPremiseScopePaths) 두 입력만으로
+    //   결정론적으로 id·선택 이유를 유도해 검증 결과에 싣는다(종류를 못 읽었으면 지어내지 않는다).
+    const variant = createGraphVariant({ template: sourceSpec, goal: `g_${variantRunId.replace(/[^a-z0-9_-]/gi, '_')}`, plan: opts.graphVariantPlan,
+      ...(graphGoalType === undefined ? {} : { goalAnalysis: { goalType: graphGoalType, targetPathCount: declaredPremiseScopePaths(opts.feature).length } }) });
     if (!variant.ok) throw new Error(`graph variant rejected: ${JSON.stringify(variant.rejections)}`);
     variantSpec = variant.template;
     graphTemplate = { ...specToTemplate(variantSpec), version: graphVersionHash(variantSpec) };
-    const { runLedgerDir } = await import('./run-ledger.js');
-    const graphFile = `${runLedgerPath(variantRunId)}.graph.yaml`;
-    mkdirSync(runLedgerDir(), { recursive: true });
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(graphFile, stringify({
+    const graphFile = saveRunGraphVariant(variantRunId, stringify({
       graph_id: variantSpec.graphId, version: variantSpec.version,
+      ...(variant.selection === undefined ? {} : { variant_id: variant.selection.variantId, reason: variant.selection.reason }),
       entry_node: variantSpec.entryNode, terminal_nodes: variantSpec.terminalNodes,
       ...(variantSpec.journeyStages ? { journey_stages: variantSpec.journeyStages } : {}),
       ...(variantSpec.runContract ? { run_contract: variantSpec.runContract } : {}),
@@ -4900,6 +4997,9 @@ async function runSelfImplementInner(
         ...(n.progress ? { progress: n.progress } : {}), ...(n.phases ? { phases: n.phases } : {}),
         ...(n.terminalStages ? { terminal_stages: n.terminalStages } : {}),
         ...(n.fanOut ? { fan_out: n.fanOut } : {}), ...(n.contract ? { contract: n.contract } : {}),
+        ...(n.call ? { call: n.call } : {}),
+        ...(n.callEntry ? { call_entry: n.callEntry } : {}),
+        ...(n.budget ? { budget: { inner_steps: n.budget.innerSteps } } : {}),
         ...(n.skipWhen ? { skip_when: n.skipWhen } : {}),
       })),
       edges: variantSpec.edges.map(e => ({
@@ -4908,9 +5008,17 @@ async function runSelfImplementInner(
         ...(e.observed === undefined ? {} : { observed: e.observed }),
         ...(e.when ? { when: e.when } : {}),
       })),
-    }), { flag: 'wx' });
+    }));
+    // ⭐ 저장·diff — 방금 원장 옆에 쓴 선택(id·이유)을 다시 읽어 «같은지» 확인한다(다르면 이 런의 그래프 신원이 거짓).
+    if (variant.selection !== undefined) {
+      const persisted = loadRunGraphVariant(variantRunId);
+      if (persisted === null || persisted.variantId !== variant.selection.variantId || persisted.reason !== variant.selection.reason) {
+        throw new Error(`graph variant rejected: persisted selection mismatch: ${JSON.stringify(persisted)}`);
+      }
+    }
     observe('graph-variant-applied', { graphId: variant.template.graphId, overlayId: variant.overlay.overlayId,
-      graphFile, patches: variant.patches });
+      graphFile, patches: variant.patches,
+      ...(variant.selection === undefined ? {} : { variantId: variant.selection.variantId, variantReason: variant.selection.reason }) });
   }
   /** 단계 이름 → 그 템플릿의 노드 이름. */
   const node = (stage: PipelineNodeId): PipelineNodeId => nodeNameForStage(stage, graphTemplate) as PipelineNodeId;
@@ -5091,6 +5199,14 @@ async function runSelfImplementInner(
     ...goalContext,
   }), T.worktree, 'worktree');
   onWorktreeCreated(wt.path);
+  // Capture the child worktree's HEAD at creation. `wt.invokedHead` names the
+  // caller checkout and may differ after base selection or PR-source checkout.
+  const terminalLaunchHeadRead = runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 });
+  const terminalLaunchHeadCandidate = terminalLaunchHeadRead.status === 0 ? terminalLaunchHeadRead.stdout.trim() : '';
+  const terminalLaunchHead = /^[0-9a-f]{40,64}$/i.test(terminalLaunchHeadCandidate) ? terminalLaunchHeadCandidate : undefined;
+  const terminalLaunchWork = detectUncommittedWork(wt.path);
+  const terminalLaunchDirtyPaths = terminalLaunchWork.status === 'unavailable' ? undefined
+    : new Set([...terminalLaunchWork.trackedChanges, ...terminalLaunchWork.untrackedFiles]);
   // ⭐ 제1원칙 — **어디서 갈랐나**를 관측에 남긴다. 이것이 없어서 2026-07-29 에 하니스 런 둘이
   //   `main` 위에서 돌았고(호출자가 브랜치 워크트리에서 발사했는데도) 산출 diff 를 눈으로 봐야 알았다.
   //   ⚠️ `branch` 는 **새로 만든 브랜치 이름**이라 그 질문에 답하지 않는다.
@@ -5104,6 +5220,8 @@ async function runSelfImplementInner(
   observe('worktree', {
     path: wt.path,
     branch: wt.branch,
+    terminalLaunchHead: terminalLaunchHead ?? null,
+    terminalLaunchDirtyPaths: terminalLaunchDirtyPaths ? [...terminalLaunchDirtyPaths] : null,
     // ⭐ 우리가 **무엇을 요청했는지는 이미 안다** — 시임 반환에서 되읽지 않는다.
     //    커스텀 시임이 관측 필드를 생략하면 명시/생략이 둘 다 null 이 되어 구분이 사라진다(리뷰 must-fix).
     requestedBase,
@@ -5635,6 +5753,9 @@ async function runSelfImplementInner(
     };
   }
   let round = 0;
+  // A timeout is evidence about this command, not an invitation to spend the
+  // next rework round on the identical oversized check.
+  const runBudgetedEvidenceChecks = createRequiredEvidenceBudget({ run: s.evidenceCommandRunner });
   // A goal-only retry spends its one allowance for this run even if a later
   // gate/review round removes the target diff and reaches the same disposition.
   let goalOnlyReworkUsed = false;
@@ -6172,6 +6293,9 @@ async function runSelfImplementInner(
         : `중단 산출물의 draft PR 생성 실패(worktree·branch 보존 · 판정 본문 보존 실패: ${artifactError ?? 'unknown error'})`);
       return undefined;
     }
+    // The production draft sweep resolves run ownership from pr-opened, not
+    // from the blocked-draft diagnostic event. Bind this PR to the same run.
+    observe('pr-opened', { url: pr.url, number: pr.number, branch: wt.branch, draft: true });
     observe('rework-blocked-draft-pr', {
       ...observation,
       url: pr.url,
@@ -6441,7 +6565,7 @@ async function runSelfImplementInner(
         const predictionAccuracyBefore = supervisorDecisionHistory.length
           ? judgePredictionAccuracy(supervisorDecisionHistory)
           : undefined;
-        diagnosis = await withStepTimeout(s.diagnose({ runId, note: reworkJudgeNote, kind: reworkKind, round, cwd: wt.path, goal: opts.feature, history: priorHistory, supervisorDecisionHistory, ...(predictionAccuracyBefore ? { judgePredictionAccuracy: predictionAccuracyBefore } : {}), effectiveMax, priorRuns, reviewFindingTelemetry: reviewFindingTelemetrySnapshot, ...(diagnosisRefutations ? { refutations: diagnosisRefutations.refutations, refutationRound: diagnosisRefutations.round } : {}), purpose: 'budget' }), T.review, 'review');
+        diagnosis = await withStepTimeout(s.diagnose({ runId, note: reworkJudgeNote, kind: reworkKind, round, cwd: wt.path, goal: roundGoal, history: priorHistory, supervisorDecisionHistory, ...(predictionAccuracyBefore ? { judgePredictionAccuracy: predictionAccuracyBefore } : {}), effectiveMax, priorRuns, reviewFindingTelemetry: reviewFindingTelemetrySnapshot, ...(diagnosisRefutations ? { refutations: diagnosisRefutations.refutations, refutationRound: diagnosisRefutations.round } : {}), purpose: 'budget' }), T.review, 'review');
         const diagnosedDecision = parseReworkBudgetDecision(diagnosis);
         if (diagnosedDecision?.verdict === 'CONTRACT-CONFLICT') lastSupervisorVerdict = diagnosedDecision.verdict;
         let parsedDecision = diagnosedDecision;
@@ -6885,7 +7009,7 @@ async function runSelfImplementInner(
     if (escalationEligible && s.diagnose) {
       try {
         escalationJudgement = await withStepTimeout(s.diagnose({
-          runId, note: reworkNote, kind: reworkKind, round, cwd: wt.path, goal: opts.feature,
+          runId, note: reworkNote, kind: reworkKind, round, cwd: wt.path, goal: roundGoal,
           history: reworkHistory.slice(0, -1), supervisorDecisionHistory, effectiveMax,
           purpose: 'escalation-triage',
         }), T.review, 'review');
@@ -6906,7 +7030,9 @@ async function runSelfImplementInner(
       const firstRound = roundSummaryEntries.at(-1);
       const refined = await (await import('./goal-refine.js')).runFirstRoundRefine({
         goal: opts.feature, round, visit: goalRefineVisits, callLLM: s.elaborateCallLLM, observe,
-        evidence: { implSummary: firstRound?.tried, findings: reworkNote, changedFiles: firstRound?.filesTouched },
+        // SCOPE-ESCAPE-AS-REFINE — accepted out-of-scope edits are the «new scope» the first implementation found.
+        evidence: { implSummary: firstRound?.tried, findings: reworkNote, changedFiles: firstRound?.filesTouched,
+          ...(scopeExpansion?.files.length ? { newScope: scopeExpansion.files.map((file) => file.path) } : {}) },
       });
       roundGoal = refined.goal;
       // PR «골 변경» 절 — 유지(kept · no-provider 포함)여도 «시도 · v1 유지 · 사유» 한 줄을 싣는다(리뷰 r2).
@@ -7136,6 +7262,45 @@ async function runSelfImplementInner(
         }
       }
     }
+    // The child can report changed=false after committing its edits. Compare
+    // against the worktree HEAD captured at creation, not the caller's HEAD or
+    // origin/main: a PR source already had a diff before the child ran.
+    if (!impl.ok && impl.completionDisposition === 'completed-without-changes'
+      && impl.terminalStatus?.reached === true && impl.terminalStatus.timedOut === false
+      && !hasCurrentProviderError() && !hasCurrentCredentialFailure()) {
+      const committed = terminalLaunchHead
+        ? runGitCommand(wt.path, ['diff', '--name-only', '-z', terminalLaunchHead, 'HEAD'], { encoding: 'utf8', timeout: 10_000 })
+        : undefined;
+      const pending = detectUncommittedWork(wt.path);
+      const observedFiles = committed?.status === 0 && pending.status !== 'unavailable'
+        ? [...new Set([
+          ...committed.stdout.split('\0').filter(Boolean),
+          ...pending.trackedChanges, ...pending.untrackedFiles,
+        ])]
+        : [];
+      if (!terminalLaunchHead || terminalLaunchDirtyPaths === undefined || committed?.status !== 0 || pending.status === 'unavailable') {
+        observe('terminal-change-evidence', { round, status: 'unmeasured',
+          reason: !terminalLaunchHead ? 'launch-head-unavailable' : terminalLaunchDirtyPaths === undefined
+            ? 'launch-status-unavailable' : committed?.status !== 0 ? 'git-diff-unavailable' : 'git-status-unavailable' }, { level: 'warn' });
+      }
+      // A PR-source worktree may be dirty before this child starts. A path
+      // already dirty at launch cannot prove this child's edits from names
+      // alone, even if the child later commits it. Leave that path unmeasured.
+      const implementationFiles = terminalLaunchDirtyPaths === undefined ? [] : observedFiles.filter(path =>
+        !terminalLaunchDirtyPaths.has(path) && !harnessSeededPaths.includes(path) && !isHarnessTempArtifact(path));
+      const preexistingDirtyPaths = terminalLaunchDirtyPaths === undefined ? [] : observedFiles.filter(path =>
+        terminalLaunchDirtyPaths.has(path) && !harnessSeededPaths.includes(path) && !isHarnessTempArtifact(path));
+      if (preexistingDirtyPaths.length > 0) observe('terminal-change-evidence', {
+        round, status: 'unmeasured', reason: 'preexisting-dirty-path', paths: preexistingDirtyPaths,
+      }, { level: 'warn' });
+      if (implementationFiles.length > 0) {
+        observe('terminal-change-reconciled', {
+          round, source: 'post-launch-git-diff', launchHead: terminalLaunchHead, childDisposition: impl.completionDisposition,
+          paths: implementationFiles, pathCount: implementationFiles.length,
+        });
+        impl = { ...impl, ok: true, completionDisposition: undefined };
+      }
+    }
     // A finished child can leave edits without a commit. Measure them before any
     // diff/no-changes classification, and commit only paths declared in the goal.
     finishedChildCommitMissing = false;
@@ -7241,7 +7406,13 @@ async function runSelfImplementInner(
     // E3 — refine 뒤 라운드는 «현재 골»(v2)로 증거를 센다(REQUIRED EVIDENCE 절은 고정 칸이라 v1 과 같다).
     const requiredEvidence = requiredEvidenceFromGoal(roundGoal);
     const limitationCount = authorLimitationCountFromGoal(roundGoal);
-    const evidenceChecks = runRequiredEvidenceChecks(roundGoal, wt.path, runId);
+    const evidenceHead = resolveEvidenceHeadCommit(s.headCommit?.(wt.path), () =>
+      runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 }).stdout.trim());
+    if (!evidenceHead) {
+      try { debug.log('self-implement.evidence', 'command-budget-head-unresolved', { runId, round, cwd: wt.path }); }
+      catch { /* observation is fail-soft */ }
+    }
+    const evidenceChecks = runBudgetedEvidenceChecks(roundGoal, wt.path, runId, evidenceHead);
     const tagCoverage = coverRequiredEvidence(requiredEvidence, offDiffEvidence.items);
     // EVIDENCE-WIRING-EXEMPT — a requirement whose own `|| bun test …` check passed is covered by what the harness measured.
     const settledByCheck = settleUncoveredEvidence(tagCoverage.uncovered, { checks: evidenceChecks, required: requiredEvidence });
@@ -7387,7 +7558,7 @@ async function runSelfImplementInner(
             files: decision.expansion.files });
           if ('parked' in result) progress('parked', `critical 질문 ${result.questionId} 미응답 — 이 런만 대기`);
           return { ok: false, stage: 'parked' in result ? 'parked' : 'soft-stopped', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch,
-            outOfScopeEdits, nameCapReached: scope.nameCapReached, outsideCount: scope.outsideCount,
+            outOfScopeEdits, ...(!decision.accept ? { scopeStopReasons: decision.reasons } : {}), nameCapReached: scope.nameCapReached, outsideCount: scope.outsideCount,
             detail: 'parked' in result ? `critical-unanswered: ${result.questionId}` : 'Out-of-scope edits held in the worktree; gate and publication skipped.' };
         }
       }
@@ -7683,6 +7854,33 @@ async function runSelfImplementInner(
         const untracked = runGitCommand(wt.path, ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' });
         if (untracked.status === 0) untrackedFiles = untracked.stdout.split(/\r?\n/).filter(Boolean);
       } catch { /* change discovery must not stop review */ }
+    }
+    // Gate has passed. Measure newly exported runtime values before review, without
+    // turning a static-analysis guess into a rework verdict during the first rollout.
+    const wiringFiles = [...new Set([...(runFacts.changedFiles ?? []), ...(gateRouteFiles ?? []), ...untrackedFiles])];
+    if (wiringFiles.some((file) => /^(?:src|scripts|apps\/pwa\/src)\/.*\.tsx?$/.test(file))) {
+      const wiringBase = wt.resolvedBase;
+      const wiring = wiringBase && /^[0-9a-f]{40}$/i.test(wiringBase)
+        ? findUnwiredExports({
+            cwd: wt.path,
+            changedFiles: wiringFiles,
+            // Timeouts and git errors throw → recorded as `failure`, never as "absent at base".
+            readBaseFile: gitBaseFileReader(
+              (args) => runGitCommand(wt.path, args, { encoding: 'utf8', timeout: 10_000 }),
+              wiringBase,
+            ),
+          })
+        : { checked: 0, unwired: [], failure: 'resolved-base-unavailable' };
+      const wiringObservation = {
+        round,
+        checked: wiring.checked,
+        unwired: wiring.unwired.length,
+        examples: wiring.unwired.slice(0, 10),
+        ...(wiring.failure ? { failure: wiring.failure } : {}),
+        mode: 'warn',
+      };
+      debug.log('self-implement.wiring-check', wiring.failure ? 'unmeasured' : 'measured', wiringObservation);
+      observe('wiring-check', wiringObservation, wiring.failure || wiring.unwired.length ? { level: 'warn' } : {});
     }
     if ([...(runFacts.changedFiles ?? []), ...(gateRouteFiles ?? []), ...untrackedFiles].some((file) => /\.(?:html|css)$/i.test(file))) {
       try {
@@ -8044,10 +8242,13 @@ async function runSelfImplementInner(
   //     (모집단 0인데 distinguishes=1) 틀린 값으로 막으면 새 병목이 된다.
   //   ⛔ `ran === false`(skipped)는 «다른 것»이다 — 자식이 테스트를 안 건드린 경우이고
   //     그건 `skippedReason` 이 이미 가른다. 그래서 여기 조건에 넣지 않는다.
-  const verifyInconclusive = gate.verifyByBreaking?.ran === true && (gate.verifyByBreaking.distinguishes ?? 0) === 0;
-  const verifyNothingAtBase = verifyInconclusive && (gate.verifyByBreaking?.missingAtBase ?? 0) > 0;
+  // A new test absent from the fixed base is a structural RED witness when the
+  // head gate passed. Keep that distinct from an executed test that proved nothing.
+  const verifyStructuralRed = gate.verifyByBreaking?.ran === true && (gate.verifyByBreaking.missingAtBase ?? 0) > 0;
+  const verifyInconclusive = gate.verifyByBreaking?.ran === true
+    && (gate.verifyByBreaking.distinguishes ?? 0) === 0 && !verifyStructuralRed;
   let mergeReason = canAuto && reviewDeferredToHost ? REVIEW_DEFERRED_TO_HOST_MERGE_REASON
-    : canAuto ? (verifyNothingAtBase ? 'review-clean-verify-nothing-at-base' : verifyInconclusive ? 'review-clean-verify-inconclusive' : 'review-clean-armed')
+    : canAuto ? (verifyStructuralRed ? 'review-clean-verify-structural-red' : verifyInconclusive ? 'review-clean-verify-inconclusive' : 'review-clean-armed')
     : gateTimeoutUnmeasured ? GATE_TIMEOUT_UNMEASURED_MERGE_REASON
     : !autoMerge ? 'no-auto-flag'
       : requiredEvidenceMissing ? 'required-evidence-uncovered'

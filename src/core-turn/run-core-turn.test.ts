@@ -63,6 +63,18 @@ async function run(messages: LLMMessage[], userText?: string): Promise<void> {
 }
 
 describe('runCoreTurn surface input isolation', () => {
+  test('emits capability.resolve/tool-tier-split from the real turn entry', async () => {
+    const records: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      records.push({ category, event, data: data as Record<string, unknown> });
+    });
+    await run([{ role: 'user', content: 'read source' }]);
+    expect(records.filter((record) => record.category === 'capability.resolve' && record.event === 'tool-tier-split')).toEqual([
+      expect.objectContaining({ data: expect.objectContaining({ sessionId: 'surface-selection-test', activeCount: 1, immediate: ['Read'] }) }),
+    ]);
+    expect(records.some((record) => record.category === 'capability.resolve' && record.event === 'tier-split')).toBe(false);
+  });
+
   test('reports the model attempted by the tool stream to the hosting callback', async () => {
     const resolved: string[] = [];
     spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, opts) => {

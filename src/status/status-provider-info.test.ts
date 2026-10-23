@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { UserConfig } from '../user-config.js';
-import { createStatusProviderInfoReader } from './status-provider-info.js';
+import { createStatusProviderInfoReader, statusModelActual } from './status-provider-info.js';
 
 function harness() {
   let t = 0;
@@ -83,5 +83,21 @@ describe('createStatusProviderInfoReader', () => {
     h.advance(31_000);
     h.read();
     expect(h.inspected).toHaveLength(2);
+  });
+
+  // TUI-MODEL-BADGE-ACTUAL (10-16) — 이번 턴 실제 실행은 기억 «밖» 에서 덧씌운다(낡은 실행이 굳지 않게).
+  test('이번 턴 실제 실행을 덧씌우되 설정 판정은 기억한 그대로 쓴다', () => {
+    const h = harness();
+    const actual = { model: 'grok-4.3', provider: 'grok', fallbackFrom: 'gpt-cfg' };
+    expect(h.read(undefined, actual)).toEqual({ provider: 'openai-codex', model: 'gpt-cfg', actual });
+    h.advance(10);
+    expect(h.read(undefined, { model: 'grok-4.3' }).actual).toEqual({ model: 'grok-4.3' });
+    expect(h.read(undefined, null)).toEqual({ provider: 'openai-codex', model: 'gpt-cfg' });
+    expect(h.configReads()).toBe(1);
+    expect(h.inspected).toHaveLength(1);
+  });
+
+  test('statusModelActual: 실행 기록이 없으면 null(꾸미지 않는다)', () => {
+    expect(statusModelActual('nobody-recorded-here')).toBeNull();
   });
 });

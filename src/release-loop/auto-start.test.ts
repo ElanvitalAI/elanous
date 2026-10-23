@@ -49,7 +49,7 @@ test('default is read-only; apply launches once and forwards the selected versio
   expect(called).toEqual(['0.2.8']);
 });
 
-test('a live run for the selected version is skipped without launching or changing its lock', async () => {
+test('a live run lock for the selected version is refused as already-running without launching or changing its lock', async () => {
   setup();
   const dir = join(root, 'release', '0.2.8');
   mkdirSync(dir, { recursive: true });
@@ -58,9 +58,32 @@ test('a live run for the selected version is skipped without launching or changi
   writeFileSync(lock, data);
   let launched = false;
   expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date(cut), apply: true,
-    launch: () => { launched = true; } })).toEqual({ status: 'skipped', version: '0.2.8', reason: 'already-running' });
+    launch: () => { launched = true; } })).toEqual({ status: 'already-running', version: '0.2.8', runId: 'pending', pid: process.pid, startedAt: 'unknown' });
   expect(launched).toBe(false);
   expect(readFileSync(lock, 'utf8')).toBe(data);
+});
+
+test('an active same-version run is refused before readiness with its run identity; other versions and preview are untouched', async () => {
+  setup();
+  const active = { runId: 'live-run', pid: 4242, startedAt: '2026-10-04T03:58:00.000Z' };
+  const asked: string[] = [];
+  let launched = false;
+  const activeRun = (version: string, ledgerRoot: string) => { asked.push(`${version}@${ledgerRoot === root}`); return version === '0.2.8' ? active : undefined; };
+  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date(cut), apply: true, activeRun,
+    readiness: () => { throw new Error('readiness read despite an active run'); },
+    launch: () => { launched = true; } })).toEqual({ status: 'already-running', version: '0.2.8', ...active });
+  expect(launched).toBe(false);
+  expect(asked).toEqual(['0.2.8@true']);
+  // Preview never asks for the active run.
+  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date(cut), activeRun, launch: () => { launched = true; } }))
+    .toEqual({ status: 'planned', version: '0.2.8', cutAt: cut });
+  expect(asked).toEqual(['0.2.8@true']);
+  // An active run of another version does not block the selected one.
+  const other = (version: string) => (version === '0.2.7' ? active : undefined);
+  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date(cut), apply: true, activeRun: other,
+    readiness: () => ({ ready: true, reason: 'ready', details: { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] } }),
+    launch: () => { launched = true; } })).toEqual({ status: 'started', version: '0.2.8', cutAt: cut });
+  expect(launched).toBe(true);
 });
 
 test('blocked checklist is skipped and does not launch the release', async () => {

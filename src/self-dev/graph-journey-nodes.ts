@@ -42,6 +42,7 @@ export const JOURNEY_NODE_IDS = [
   'decision-card',
   'ready',
   'pr-head-checkout',
+  'recover',          // LAND-REFUSAL-EDGES — 착지 거부 결속 간선의 목적지(recover@1 subgraph)
   'stopped',
 ] as const;
 export type JourneyNodeId = typeof JOURNEY_NODE_IDS[number];

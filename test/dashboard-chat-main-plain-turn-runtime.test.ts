@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { AutohealExhaustedError } from '../src/self-health/autoheal.js';
 import { bootDashboardAcpSession } from '../src/dashboard/acp-boot.js';
 import { runDashboardAutoCompact } from '../src/dashboard/auto-compact-runtime.js';
 import { runCompactPipeline } from '../src/compact/pipeline.js';
@@ -438,6 +439,20 @@ describe('runDashboardChatMainPlainTurn', () => {
     expect(notices[0]!.notice).toMatch(/^⚠ .+ → \/session new .+ · 원문 \/detail open$/);
     expect(notices[0]!.notice).not.toMatch(/[A-Za-z]+(?:\s+[A-Za-z]+){3,}/);
     expect(ctx.finalizeCalls[0]!.error).not.toContain('Codex API');
+  });
+
+  it('TUI-ORPHAN-AUTO-RESUME-STOP E4: an autoheal-exhausted failure stages the original RPC details, not «Internal error»', async () => {
+    const detail = 'Codex API 400: {"error":{"message":"No tool call found for function call output with call_id call_fake_llm."}}';
+    const rpc = { code: -32603, message: 'Internal error', data: { details: detail } };
+    const notices: Array<{ notice: string; raw: string }> = [];
+    const ctx = buildDeps({
+      acpSession: { send: async () => { throw new AutohealExhaustedError(rpc, [], 'no-fallback-provider'); } },
+      pushFailureNotice: (notice, raw) => { notices.push({ notice, raw }); },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.raw).toBe(detail);
   });
 
   it('keeps the raw error line when no failure-notice sink is wired', async () => {

@@ -214,3 +214,161 @@ describe('지문 1회 주입 — 화면 한 줄 · 영어 덤프 0 · 관측 1',
     expect(logs.filter(([c]) => c === 'tui.failure-signature')).toHaveLength(2);
   });
 });
+
+// ── TUI-400-AUTOHEAL-FALLBACK (대표 10-22) — 400(대화 기록 어긋남)이면 멈추지 않고 스스로 회복한다 ──
+// ① 새 백엔드 세션 ⊕ 직전 요약으로 1회 재시도 → ② 또 400 이면 fallbackChain 다음 공급자로 그 턴 재시도
+// → 둘 다 실패면 턴당 2회 상한에서 사람에게 이유 한 줄. 판정 대상은 생산 plain-turn 런타임 그대로다.
+const HISTORY_400 = 'Codex API 400: {"error":{"message":"No tool call found for function call output with call_id call_autoheal_sim.","type":"invalid_request_error"}}';
+
+async function injectAutoheal(script: ReadonlyArray<Error | string>, opts: {
+  fallbackProvider?: string | null; emitBeforeError?: boolean; withAutoheal?: boolean;
+} = {}) {
+  const chatLines: string[] = [];
+  const errorLines: string[] = [];
+  const notices: Array<{ notice: string; raw: string }> = [];
+  const finals: Array<{ status: string; error?: string }> = [];
+  const debugEvents: Array<{ category: string; event: string; payload: Record<string, unknown> }> = [];
+  const sends: Array<{ history: unknown[]; meta?: Record<string, unknown> }> = [];
+  const renewed: string[] = [];
+  const summarized: unknown[][] = [];
+  const system = { role: 'system', content: 'sys' };
+  const prior = [
+    { role: 'user', content: '앞 질문' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_autoheal_sim', name: 'Read', input: {} }] },
+  ];
+  const history: unknown[] = [system, ...prior];
+  let step = 0;
+  const deps = {
+    debugLog: (category: string, event: string, payload: Record<string, unknown>) => { debugEvents.push({ category, event, payload }); },
+    userText: '다시 해줘', contextText: '', turnStartedAt: 1,
+    thinking: { update() {}, updateAnimated() {}, updateMetrics() {}, reflow() {}, stop() {} },
+    benchmarkMode: false, attachedSessionId: null,
+    chat: { history }, chatLines, contextRegistry: {}, sessionRegistry: {}, sync: {},
+    chatFooterLine: { current: null }, acpTurnRef: {},
+    blockAttach: (line: string) => line,
+    pushChatLine: (line: string) => { chatLines.push(line); },
+    pushDebugLine: () => {}, setChatScrollBottom: () => {}, draw: () => {}, pinChatTail: () => {},
+    termCols: () => 140, getSessionCwd: () => '/tmp',
+    getUserConfig: () => ({ voice: { tts: { drainCooldownMs: 0 } } }),
+    inspectActiveProvider: () => ({ model: 'm' }), getActivePluginName: () => undefined,
+    buildTurnPromptRuntime: () => ({ promptBankContext: '', turnProfile: {} }),
+    loadAttachments: async () => {},
+    buildTurnMessage: () => ({ userMsg: { role: 'user', content: '다시 해줘' } }),
+    beginCodeEditTurn: async () => {},
+    buildTurnPreamble: () => [],
+    runAutoCompact: async () => {},
+    readToolDispatchCount: () => 0,
+    attachChatStreamingKeys: () => () => {},
+    createOptionalSpecs: async () => [],
+    createTurnStreamRuntime: () => ({ onText() {}, onToolCall() {}, onToolResult() {}, getAssistantStart: () => 0 }),
+    runTurnUsageRuntime: () => {},
+    runTurnPrelude: () => ({ searchPlannerState: {} }),
+    armAcpTurnRef: () => {}, resetAcpTurnRef: () => {},
+    acpSession: {
+      send: async (o: { onText: (chunk: string) => void; meta?: Record<string, unknown> }) => {
+        sends.push({ history: [...history], ...(o.meta ? { meta: o.meta } : {}) });
+        const next = script[step++];
+        if (next === undefined) throw new Error('script exhausted');
+        if (opts.emitBeforeError) o.onText('부분 답');
+        if (next instanceof Error) throw next;
+        o.onText(next);
+        return { stopReason: 'end_turn' };
+      },
+    },
+    ...(opts.withAutoheal === false ? {} : {
+      autoheal: {
+        renewBackendSession: async () => { const id = `sess-${renewed.length + 1}`; renewed.push(id); return id; },
+        summarizeHistory: async (p: readonly unknown[]) => { summarized.push([...p]); return '요약: 앞 질문을 읽던 중'; },
+        peekFallbackProvider: () => (opts.fallbackProvider === undefined ? 'grok' : opts.fallbackProvider),
+      },
+    }),
+    autoTts: { pushChunk() {}, commit() {}, cancel() {} },
+    voiceChat: { getPhase: () => 'idle', transitionToSpeaking() {}, notifyResponseDone() {} },
+    finalizeStreamLifecycle: (_c: () => void, _a: boolean, status: 'completed' | 'interrupted' | 'failed') => status,
+    recordTurnMetrics: async () => {},
+    commitAssistantRenderState: () => ({ lastAssistantRaw: null, lastAssistantRange: null, lastAssistantMode: 'rendered' }),
+    applyAssistantRenderState: () => {},
+    runTailAutoCopy: async () => {}, runCodeEditPostTurn: async () => {}, runHandoffMirror: async () => {},
+    parseActionBlock: () => null, isBrowseMode: () => false, enterSyncMode: () => {},
+    applyActionBlock: () => ({}), runActionEffects: async () => {},
+    warningLine: (message: string) => message,
+    pushErrorLine: (message: string) => { errorLines.push(message); },
+    pushFailureNotice: (notice: string, raw: string) => { notices.push({ notice, raw }); chatLines.push(notice); },
+    finalizeTurn: (status: string, error?: string) => { finals.push({ status, ...(error !== undefined ? { error } : {}) }); },
+  } as unknown as DashboardChatMainPlainTurnRuntimeDeps;
+  await runDashboardChatMainPlainTurn(deps);
+  const autoheal = debugEvents.filter((row) => row.category === 'self-health.autoheal');
+  return { chatLines, errorLines, notices, finals, sends, renewed, summarized, history, autoheal, system, prior };
+}
+
+describe('TUI-400-AUTOHEAL-FALLBACK — 400 이면 스스로 회복(턴당 2회 상한)', () => {
+  test('① 400 → 새 백엔드 세션 ⊕ 직전 요약으로 1회 재시도해 그 턴을 끝낸다', async () => {
+    const r = await injectAutoheal([new Error(HISTORY_400), '회복된 답']);
+    expect(r.finals).toEqual([{ status: 'completed' }]);
+    expect(r.sends).toHaveLength(2);
+    expect(r.renewed).toEqual(['sess-1']);
+    // 요약은 «현재 질문을 뺀» 직전 기록으로 — 그리고 재시도 기록은 [system, 요약, 현재 질문] 하나뿐이다.
+    expect(r.summarized).toEqual([[r.system, ...r.prior]]);
+    expect(r.sends[1]!.history).toEqual([
+      r.system,
+      { role: 'assistant', content: 'Compacted conversation summary:\n\n요약: 앞 질문을 읽던 중' },
+      { role: 'user', content: '다시 해줘' },
+    ]);
+    expect(r.chatLines.filter((line) => line.startsWith('자동 회복'))).toEqual(['자동 회복: 새 세션 ⊕ 요약으로 다시 시도 (1/2)']);
+    expect(r.notices).toEqual([]);
+    expect(r.autoheal.map((row) => row.event)).toEqual(['attempt', 'recovered']);
+    expect(r.autoheal[0]!.payload).toMatchObject({ step: 'new-session', attempt: 1, sessionRenewed: true });
+  });
+
+  test('② 또 400 → fallbackChain 다음 공급자로 그 턴을 다시 보낸다', async () => {
+    const r = await injectAutoheal([new Error(HISTORY_400), new Error(HISTORY_400), 'grok 답']);
+    expect(r.finals).toEqual([{ status: 'completed' }]);
+    expect(r.sends).toHaveLength(3);
+    expect(r.sends[2]!.meta).toEqual({ elanousAutoheal: { providerFallback: true } });
+    expect(r.chatLines.filter((line) => line.startsWith('자동 회복'))).toEqual([
+      '자동 회복: 새 세션 ⊕ 요약으로 다시 시도 (1/2)',
+      '자동 회복: 공급자 grok 로 다시 시도 (2/2)',
+    ]);
+    expect(r.autoheal.map((row) => `${row.event}:${String(row.payload.step ?? '')}`))
+      .toEqual(['attempt:new-session', 'attempt:provider-fallback', 'recovered:provider-fallback']);
+  });
+
+  test('③ 둘 다 실패 → 2회에서 멈추고 사람에게 이유 한 줄(무한 반복 0)', async () => {
+    const r = await injectAutoheal([new Error(HISTORY_400), new Error(HISTORY_400), new Error(HISTORY_400), 'never']);
+    expect(r.sends).toHaveLength(3);
+    expect(r.finals.map((f) => f.status)).toEqual(['failed']);
+    expect(r.notices).toHaveLength(1);
+    expect(r.notices[0]!.notice).toBe('⚠ 자동 회복 2회 실패(새 세션 → 공급자 grok) → 잠시 뒤 다시 · eln usage · 원문 /detail open');
+    expect(displayWidth(r.notices[0]!.notice)).toBeLessThanOrEqual(130);
+    expect(r.notices[0]!.raw).toBe(HISTORY_400);
+    expect(r.autoheal.at(-1)).toMatchObject({ event: 'exhausted', payload: { attempts: 2, reason: 'max-attempts' } });
+  });
+
+  test('③-b 대체 공급자가 없으면 1회 뒤 그 이유로 멈춘다', async () => {
+    const r = await injectAutoheal([new Error(HISTORY_400), new Error(HISTORY_400), 'never'], { fallbackProvider: null });
+    expect(r.sends).toHaveLength(2);
+    expect(r.notices[0]!.notice).toBe('⚠ 자동 회복 1회 실패(새 세션 · 대체 공급자 없음) → 잠시 뒤 다시 · eln usage · 원문 /detail open');
+    expect(r.autoheal.at(-1)).toMatchObject({ event: 'exhausted', payload: { attempts: 1, reason: 'no-fallback-provider' } });
+  });
+
+  test('반증: 답이 이미 흘렀으면 다시 보내지 않는다(중복 출력·부작용 0) — 옛 처방 한 줄', async () => {
+    const r = await injectAutoheal([new Error(HISTORY_400), 'never'], { emitBeforeError: true });
+    expect(r.sends).toHaveLength(1);
+    expect(r.renewed).toEqual([]);
+    expect(r.notices[0]!.notice).toBe(formatFailureNotice(findFailureSignature('codex-400-bad-request')!, { rawHint: '/detail open' }));
+    expect(r.autoheal).toEqual([expect.objectContaining({ event: 'skipped', payload: expect.objectContaining({ reason: 'output-emitted' }) })]);
+  });
+
+  test('반증: 400 아닌 오류는 회복하지 않는다', async () => {
+    const r = await injectAutoheal([new Error('LLM API 500: upstream exploded'), 'never']);
+    expect(r.sends).toHaveLength(1);
+    expect(r.errorLines).toEqual(['LLM API 500: upstream exploded']);
+    expect(r.autoheal).toEqual([]);
+  });
+
+  test('반증: autoheal 배선이 없는 호출부는 옛 동작 그대로(한 번 · 처방 한 줄)', async () => {
+    const r = await injectAutoheal([new Error(HISTORY_400), 'never'], { withAutoheal: false });
+    expect(r.sends).toHaveLength(1);
+    expect(r.notices).toHaveLength(1);
+  });
+});

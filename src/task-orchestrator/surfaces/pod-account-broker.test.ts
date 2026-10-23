@@ -24,6 +24,37 @@ describe('pod account broker — 병렬 Pod 가 한 계정에 몰리지 않게',
       accountOrder: [],
     }).map(({ name }) => name)).toEqual(['third', 'team']);
   });
+  test('HQ owner mirror uses confirmed credit capacity when every subscription candidate is exhausted', () => {
+    const candidates = [
+      { ...c('default', 100, true), creditBalance: 3_810, hasCredits: true },
+      { ...c('team', 100, true), creditBalance: 1_500, hasCredits: true },
+      { ...c('third', 100, true), hasCredits: true },
+    ];
+    expect(planOwnerCodexMirrorCandidates(candidates, {
+      accountOrder: ['team', 'default', 'third'], thresholdPercentByAccount: { default: 100 },
+      creditsAllowed: true, creditReserve: 2_000,
+    }).map(({ name }) => name)).toEqual(['default']);
+    const owner = planOwnerCodexMirrorCandidates(candidates, {
+      accountOrder: [], creditsAllowed: true, creditReserve: 2_000,
+    });
+    const remote = selectOwnerCodexMirrorCandidates(owner, [{ account: 'default', usedPercent: 100, thresholdPercent: 95, expiresAt: Date.now() + 4 * 60 * 60 * 1000 }]);
+    expect(planPodProvider({ codexCandidates: remote, grokSubscription: false, grokApiKey: false,
+      grokApiKeyOptIn: false, creditsAllowed: true, creditReserve: 2_000 })).toMatchObject({
+      provider: 'openai-codex', accounts: ['default'], creditAccounts: ['default'],
+    });
+    expect(planOwnerCodexMirrorCandidates(candidates, {
+      accountOrder: [], creditsAllowed: false, creditReserve: 2_000,
+    })).toEqual([]);
+    expect(planOwnerCodexMirrorCandidates(candidates, {
+      accountOrder: [], creditsAllowed: true, creditReserve: 3_810,
+    })).toEqual([]);
+    expect(planOwnerCodexMirrorCandidates([
+      { ...c('team', 90), creditBalance: 1_500, hasCredits: true },
+      ...candidates.filter(({ name }) => name !== 'team'),
+    ], {
+      accountOrder: ['team'], creditsAllowed: true, creditReserve: 2_000,
+    }).map(({ name }) => name)).toEqual(['team']);
+  });
   test('owner mirror carries the exact effective cap used by candidate selection', () => {
     expect(podAccountThresholdPercent('default', { thresholdPercentByAccount: { default: 70 } })).toBe(70);
     expect(podAccountThresholdPercent('third', { thresholdPercentByAccount: { third: 62 } })).toBe(62);

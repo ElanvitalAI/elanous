@@ -42,6 +42,13 @@ describe('buildReviewObservation — 감사에 필요한 최소 집합', () => {
     expect(o.mustFixItems).toEqual(mustFix);
   });
 
+  test('SCOPE-ESCAPE-AS-REFINE — 강등된 범위-되돌림 지적 수를 따로 센다(관측 유지)', () => {
+    const demoted = 'decomposeShadowGoals 의 소비 변경은 이 목표와 무관하니 되돌리거나 별도 PR 로 분리해야 한다';
+    const o = obs(base({ verdict: 'warn', mustFix: [], shouldFix: [demoted], scopeRevertDemoted: [demoted] }));
+    expect(o).toMatchObject({ verdict: 'warn', mustFix: 0, scopeRevertMustFix: 0, scopeRevertDemoted: 1, shouldFix: 1 });
+    expect(obs(base({ verdict: 'pass', mustFix: [] })).scopeRevertDemoted).toBe(0);
+  });
+
   test('⭐ 지적 앞부분을 남긴다 — "같은 지적이 반복되나"를 로그만으로 보려면 필요하다', () => {
     const o = obs(base({ verdict: 'fail', mustFix: ['풀 폴백이 되살아나는 구멍'] }));
     expect(o.mustFixItems).toEqual(['풀 폴백이 되살아나는 구멍']);

@@ -17,6 +17,12 @@ export function draftClaimState(draft: { labels: readonly string[]; updatedAt?: 
   return (now.getTime() - updated) / 3_600_000 < CLAIM_IDLE_HOURS ? 'claimed' : 'expired';
 }
 
+/** DRAFT-CLAIM-AUTO-2-FU — 카드에 남은 claim 기록(`draftClaim.at`)이 아직 살아 있나 — `draftClaimState` 와 «같은 창»(CLAIM_IDLE_HOURS)을 쓴다. */
+export function draftClaimRecordLive(at: string, now: Date): boolean {
+  const updated = Date.parse(at);
+  return Number.isFinite(updated) && (now.getTime() - updated) / 3_600_000 < CLAIM_IDLE_HOURS;
+}
+
 export interface DraftTriagePr {
   number: number;
   title?: string;
@@ -209,7 +215,32 @@ export function laterMergedTwins(draft: DraftTriagePr, mergedTwins: readonly Dra
       || (draftSlot && slot(pr.body) === draftSlot) || (stem && branchStem(pr.branch) === stem)));
 }
 
+/**
+ * DRAFT-ZERO — explicit harvest-deferred marker: the exact PR-metadata key·value a failed run's termination
+ * path records when the draft's changes must survive the sweep for harvest. The marker line is
+ * `수확보류: harvest-deferred` (body key·value, never a label-registry entry); the value byte-matches the keep reason.
+ */
+export const HARVEST_DEFERRED_MARKER_KEY = '수확보류';
+export const HARVEST_DEFERRED_MARKER_VALUE = 'harvest-deferred';
+
+const HARVEST_DEFERRED_ROW_RE = new RegExp(`^${HARVEST_DEFERRED_MARKER_KEY}:\\s*([^\\r\\n]*)$`);
+const HARVEST_DEFERRED_CONFLICT_RE = new RegExp(`^\\s*${HARVEST_DEFERRED_MARKER_KEY}\\s*:`);
+
+/** Verified only when at least one unindented `수확보류:` body line exists and every such line carries exactly the marker value — missing, indented or conflicting lines never verify. */
+export function harvestDeferredMarker(body: string | undefined): boolean {
+  const lines = (body ?? '').split(/\r?\n/);
+  const rows = lines.flatMap((line) => {
+    const match = HARVEST_DEFERRED_ROW_RE.exec(line);
+    return match ? [match[1]!.trim()] : [];
+  });
+  return lines.filter((line) => HARVEST_DEFERRED_CONFLICT_RE.test(line)).length === rows.length
+    && rows.length > 0 && rows.every((value) => value === HARVEST_DEFERRED_MARKER_VALUE);
+}
+
 export function decideDraft({ draft, runStatus, mergedTwins, openDrafts, ageHours, liveBranches, finalRunResult }: DraftTriageInput): DraftDecision {
+  // DRAFT-ZERO — a verified harvest-deferred marker is the strongest hold: it outranks protected labels
+  // and every close rule, so a failed run's harvestable draft survives the sweep for harvest.
+  if (runStatus === 'failed' && harvestDeferredMarker(draft.body)) return { action: 'keep', reason: 'harvest-deferred' };
   const held = draft.labels?.find((label) => PROTECTED_LABELS.has(label));
   if (held) return { action: 'keep', reason: `label:${held}` };
   if (runStatus !== 'self-implement.result final' && draft.branch && liveBranches.has(draft.branch)

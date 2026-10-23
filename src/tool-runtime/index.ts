@@ -73,11 +73,18 @@ import { bootstrapMcpProxyRuntimes } from './mcp-proxy-bootstrap.js';
 import { SELF_COGNITION_RUNTIMES } from './self-cognition-runtimes.js';
 import { ELANOUS_CONTROL_RUNTIMES } from './elanous-control-runtimes.js';
 
+export interface RegisterAllDefaultToolRuntimesOpts {
+  /** CLASSIC-IDLE-MCP-LAZY — classic TUI 만 켠다. 외부 MCP 프록시를 «첫 도구
+   *  호출» 때 띄우고, 그 전엔 지난 부팅의 툴 인덱스로 목록만 알린다.
+   *  데몬·`mcp serve` 는 기본값(즉시 기동) 그대로다. */
+  mcpLazyBoot?: boolean;
+}
+
 /** Register every built-in runtime. Idempotent — safe to call more
  *  than once (registry dedupe). Call from the dashboard boot path;
  *  skills pick up registrations via side-effect when this module
  *  gets imported. */
-export function registerAllDefaultToolRuntimes(): void {
+export function registerAllDefaultToolRuntimes(opts: RegisterAllDefaultToolRuntimesOpts = {}): void {
   for (const rt of PTY_RUNTIMES) registerToolRuntime(rt);
   registerToolRuntime(terminalInjectRuntime);
   registerToolRuntime(bashRuntime);
@@ -170,7 +177,13 @@ export function registerAllDefaultToolRuntimes(): void {
   // External MCP proxies already declare surfaces `['mcp','tui']`, but the
   // TUI process never registered them. Fire-and-forget: handshake must not
   // block TUI startup; failures stay queryable via diagnostics.
-  bootstrapMcpProxyRuntimes();
+  // CLASSIC-IDLE-MCP-LAZY: classic TUI 는 지연 기동 — 자식 둘(약 267MB)을
+  // 기동 때 상주시키지 않고, 첫 도구 호출 때 한 번 띄운다.
+  if (opts.mcpLazyBoot === true) {
+    bootstrapMcpProxyRuntimes({ lazy: true });
+  } else {
+    bootstrapMcpProxyRuntimes();
+  }
 }
 
 export { setTerminalInjectApprover } from './terminal-inject-runtime.js';
