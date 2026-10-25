@@ -1,9 +1,12 @@
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { defaultGraphsDir } from '../self-implement/graph-templates.js';
-import { execPlanPrompt, installedGraphs, latestFieldFolder, planExecRequest } from './planner.js';
+import { STAGE_GIT_IDENTITY, STAGE_LOCALE, codePoints, gitStageIdentity, hasGlobalGitIdentity, initGitWithExplicitIdentity, stageHasCommand,
+  withLinuxEnv } from '../testing/linux-env.js';
+import { compareCodePoints, compareVersionish, execPlanPrompt, installedGraphs, installedPluginGraphs, latestFieldFolder, planExecRequest,
+  seatTitles } from './planner.js';
 import { OUTPUT_KINDS } from './default-outputs.js';
 import { debug } from '../debug/log.js';
 
@@ -154,4 +157,92 @@ test('model output survives on both graph and seat-answer rows; video needs an i
       { kind: 'video', source: 'model' }, { kind: 'post', source: 'model' },
       { kind: 'report', source: 'rule' }, { kind: 'report', source: 'rule' },
     ]);
+});
+
+// LINUX-STAGE ① 이모지·로케일 — 사진 시각이 같은 두 현장 폴더의 승자는 «코드포인트» 최대여야 한다.
+// `localeCompare` 는 ICU 콜레이션을 쓰므로 '🎉party' 와 '2026-10-23' 의 대소가 로케일·플랫폼마다 뒤집힌다.
+test('equal-mtime field folders settle on the code-point winner, not the locale collation', async () => {
+  const root = rootOf();
+  const dated = join(root, 'field', '2026-10-23');
+  const party = join(root, 'field', '🎉party');
+  mkdirSync(dated, { recursive: true });
+  mkdirSync(party);
+  writeFileSync(join(dated, 'a.jpg'), 'dated');
+  writeFileSync(join(party, 'b.png'), 'party');
+  for (const photo of [join(dated, 'a.jpg'), join(party, 'b.png')]) utimesSync(photo, new Date(3000), new Date(3000));
+  // 이모지는 코드포인트로 센다 — '🎉party'.length 는 7(UTF-16)이지만 코드포인트는 6이다.
+  expect(codePoints('🎉party')).toEqual(['🎉', 'p', 'a', 'r', 't', 'y']);
+  expect(compareCodePoints(party, dated)).toBe(1);
+  expect(latestFieldFolder(root)).toBe(party);
+});
+
+// LINUX-STAGE ② 콜레이션 — 플러그인 버전 선택은 «숫자는 수치로, 나머지는 코드포인트로» 여야 한다.
+test('plugin versions order by numbers then code points — the collation never picks the build', () => {
+  const install = (plugins: string, version: string, name: string): void => {
+    const graphs = join(plugins, 'official', 'card-followup', version, 'graphs');
+    mkdirSync(graphs, { recursive: true });
+    writeFileSync(join(graphs, 'recipes.yaml'), '{}');
+    writeFileSync(join(graphs, 'card-followup.yaml'), 'graph_id: card-followup\n');
+    writeFileSync(join(dirname(graphs), 'plugin.json'), JSON.stringify({ name, description: 'Photo follow-up' }));
+  };
+  const root = rootOf();
+  const tagged = join(root, 'tagged');
+  install(tagged, '1.0.0-Zebra', 'Zebra build');
+  install(tagged, '1.0.0-alpha', 'alpha build');
+  expect(compareVersionish('1.0.0-alpha', '1.0.0-Zebra')).toBe(1);
+  expect(installedPluginGraphs(tagged).graphs.find(graph => graph.id === 'card-followup')?.title).toBe('alpha build');
+  // 보존 — 숫자 구간은 수치로 비교한다(1.0.10 이 1.0.9 보다 새 버전).
+  const numeric = join(root, 'numeric');
+  install(numeric, '1.0.9', 'build 1.0.9');
+  install(numeric, '1.0.10', 'build 1.0.10');
+  expect(installedPluginGraphs(numeric).graphs.find(graph => graph.id === 'card-followup')?.title).toBe('build 1.0.10');
+});
+
+// LINUX-STAGE ③ 환경 무대 — 기본 인자(grok · 글로벌 git 신원 · HOME · 로케일에 기대는 자리)를 그대로 지나도 계획이 선다.
+test('planner defaults plan inside the isolated Linux stage: no grok, no global git identity, C.UTF-8', async () => {
+  await withLinuxEnv(async (stage) => {
+    expect(STAGE_LOCALE).toBe('C.UTF-8');
+    expect(stageHasCommand(stage, 'grok')).toBe(false);
+    expect(hasGlobalGitIdentity(stage)).toBe(false);
+    initGitWithExplicitIdentity(stage);
+    expect(gitStageIdentity(stage)).toEqual(STAGE_GIT_IDENTITY);
+    const seats = seatTitles();
+    expect(seats.length).toBeGreaterThan(0);
+    const plans = await planExecRequest('현장 사진으로 피드 정리 🎉', {
+      judge: async (text, graphs, gotSeats, attachments, fieldFolder) => {
+        expect(gotSeats).toEqual(seats);
+        expect(attachments).toEqual([]);
+        // 격리 state 에는 field 폴더가 없다 — 개발 머신의 현장 폴더가 새어 들어오면 안 된다.
+        expect(fieldFolder).toBeNull();
+        expect(graphs.map(graph => graph.id)).toContain('field-feed');
+        expect(text).toContain('🎉');
+        return [{ seat: gotSeats[0]!, title: '현장 피드', graphId: 'field-feed', inputs: {} }];
+      },
+    });
+    expect(plans).toHaveLength(1);
+    expect(plans[0]!.graphId).toBe('field-feed');
+    expect(plans[0]!.output).toBeDefined();
+    expect(plans[0]!.reason).toBeUndefined();
+  });
+});
+
+// LINUX-STAGE ④ 배선 — 고친 규칙이 «생산 기본값» 을 그대로 지나 judge 에 닿는지(직접 호출이 아니라 입구를 지난다).
+test('planExecRequest default fieldFolder hands the code-point winner to the judge', async () => {
+  await withLinuxEnv(async (stage) => {
+    const dated = join(stage.state, 'field', '2026-10-23');
+    const party = join(stage.state, 'field', '🎉party');
+    mkdirSync(dated, { recursive: true });
+    mkdirSync(party);
+    writeFileSync(join(dated, 'a.jpg'), 'dated');
+    writeFileSync(join(party, 'b.png'), 'party');
+    for (const photo of [join(dated, 'a.jpg'), join(party, 'b.png')]) utimesSync(photo, new Date(4000), new Date(4000));
+    let seen: string | null | undefined;
+    await planExecRequest('현장 사진으로 피드 정리', {
+      judge: async (_text, _graphs, gotSeats, _attachments, fieldFolder) => {
+        seen = fieldFolder;
+        return [{ seat: gotSeats[0]!, title: '현장 피드', graphId: 'field-feed', inputs: {} }];
+      },
+    });
+    expect(seen).toBe(party);
+  });
 });

@@ -51,6 +51,16 @@ export interface ShardRunMode {
   fixedDistribution?: boolean;
   /** Measured on the executing host; override only for deterministic planning tests. */
   hostResources?: { cores: number; freeMemoryGiB: number; freeTmpGiB: number };
+  /** Observation after each bundle's first current+baseline attempt; never controls retries or verdict. */
+  onShardComplete?: (progress: ShardRunProgress) => void;
+}
+
+export interface ShardRunProgress {
+  shardId: string;
+  completedShards: number;
+  totalShards: number;
+  completedFiles: number;
+  totalFiles: number;
 }
 
 function hostResources(): ShardRunMode['hostResources'] | undefined {
@@ -162,7 +172,7 @@ export function runShardedGateTests(
     try { fixed = planFixedGateTestShards(files, count); }
     catch (error) { return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: String(error), distribution: 'fixed' }; }
     debug.log('self-dev.shard', 'fixed-distribution', { shards: fixed.length, files: fixed.reduce((sum, shard) => sum + shard.files.length, 0) });
-    return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree), distribution: 'fixed' };
+    return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree, mode.onShardComplete), distribution: 'fixed' };
   }
   const rss = new Map<string, number>();
   const seconds = new Map<string, number>();
@@ -199,7 +209,7 @@ export function runShardedGateTests(
       const fixed = planFixedGateTestShards(files, maxCount);
       debug.log('self-dev.shard', 'host-cap-fixed-fallback', { requested: count, cap: maxCount,
         files: new Set(files).size, reason, measurementFailures: measurementFailures ?? 0 });
-      return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree), distribution: 'fixed-cap-fallback',
+      return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree, mode.onShardComplete), distribution: 'fixed-cap-fallback',
         fallbackReason: reason, ...(measurementFailures ? { measurementFailures } : {}) };
     } catch (error) {
       return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [],
@@ -232,7 +242,7 @@ export function runShardedGateTests(
     requested: count, planned: shards.length, files: new Set(files).size, budgetGiB,
     measurementFailures: measurementFailures ?? 0,
   });
-  return { ...runPlannedShards(cwd, shards, baseRef, run, baselineWorktree), ...(plannedCount > count ? { expandedFrom: count } : {}), ...(measurementFailures ? { measurementFailures } : {}) };
+  return { ...runPlannedShards(cwd, shards, baseRef, run, baselineWorktree, mode.onShardComplete), ...(plannedCount > count ? { expandedFrom: count } : {}), ...(measurementFailures ? { measurementFailures } : {}) };
 }
 
 /** Shared by the measured and the fixed planner: current + baseline per shard, one retry round, one aggregate. */
@@ -242,6 +252,7 @@ function runPlannedShards(
   baseRef: string,
   run: ShardProcess,
   baselineWorktree: typeof withBaselineWorktree,
+  onShardComplete?: ShardRunMode['onShardComplete'],
 ): ShardRunResult {
   const attempts: GateShardAttempt[] = [];
   const failureEvidence: ShardFailureEvidence[] = [];
@@ -256,6 +267,8 @@ function runPlannedShards(
     const treeReadable = (() => { try { return statSync(dir).isDirectory(); } catch { return false; } })();
     const atBase = (shard: GateTestShard) => treeReadable ? shard.files.filter((file) => !absentAtBaseline(join(dir, file))) : [...shard.files];
     let pending = shards;
+    let completedFiles = 0;
+    const totalFiles = new Set(shards.flatMap((shard) => shard.files)).size;
     for (let round = 1; round <= 2 && pending.length; round++) {
       for (const shard of pending) {
         const runSafely = (location: string, selected: readonly string[]): ReturnType<ShardProcess> => {
@@ -279,6 +292,13 @@ function runPlannedShards(
           baselineFiles,
           currentRoot: cwd, baselineRoot: dir,
         });
+        if (round === 1 && onShardComplete) {
+          completedFiles += shard.files.length;
+          try {
+            onShardComplete({ shardId: shard.id, completedShards: attempts.length,
+              totalShards: shards.length, completedFiles, totalFiles });
+          } catch { /* progress is observation only */ }
+        }
       }
       const retry = new Set(aggregateGateTestShards(shards, attempts).retryShardIds);
       pending = shards.filter((shard) => retry.has(shard.id));
@@ -359,4 +379,31 @@ export function runBunShardWithSpawn(cwd: string, files: readonly string[], spaw
     isolated.cleanup();
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** GATE-REMOTE-SHARD-PLAN — identity of one remote shard. files/introducedFiles are optional: a caller that only relays
+ *  identity (CLI wiring) passes none, while a planner-produced shard carries its file-level attribution. */
+export interface RemoteShardSpec {
+  orchestrationId: string;
+  shardId: string;
+  totalShards: number;
+  position: number;
+  files?: readonly string[];
+  introducedFiles?: readonly string[];
+}
+
+/** The identity slice that rides a remote gate command line — validated so a dropped flag fails loudly, not silently. */
+export function remoteShardArgArgs(shard: RemoteShardSpec, options?: { planFile?: string }): string[] {
+  if (!shard.orchestrationId.trim()) throw new Error('orchestration id must be non-empty');
+  if (!shard.shardId.trim()) throw new Error('shard id must be non-empty');
+  if (!Number.isSafeInteger(shard.totalShards) || shard.totalShards < 1) throw new Error('shard total must be a positive integer');
+  if (!Number.isSafeInteger(shard.position) || shard.position < 1) throw new Error('shard position must be a positive integer');
+  const args = ['--orchestration-id', shard.orchestrationId, '--shard-id', shard.shardId, '--shard-position', String(shard.position)];
+  if (options?.planFile !== undefined && options.planFile !== '') args.push('--shard-plan', options.planFile);
+  return args;
+}
+
+/** Full remote command for one shard — the exact argv a remote host (e.g. an node-b pod shard) would run. */
+export function remoteShardArgv(shard: RemoteShardSpec, options?: { planFile?: string }): string[] {
+  return ['bun', 'bin/elanous.mjs', '--test', 'self', 'gate', '--changed', '--shards', String(shard.totalShards), ...remoteShardArgArgs(shard, options)];
 }

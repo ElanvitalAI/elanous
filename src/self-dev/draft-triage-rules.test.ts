@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { assessDraftTriage, branchStem, decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, isAutoTitle, sameGoalPr, sameVerifiedGoal, type DraftTriageInput, type DraftTriagePr } from './draft-triage-rules.js';
+import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 
 it('preserves manual claim bytes and distinguishes missing timestamps from expiry', () => {
   const now = new Date('2026-09-30T00:00:00Z');
@@ -276,6 +277,30 @@ const triageDraft: DraftTriagePr = {
 };
 
 describe('assessDraftTriage', () => {
+  it('separates proven harvest and explicit close-b from ungrounded drafts', () => {
+    const ready = { draft: { ...triageDraft, labels: [...triageDraft.labels!, 'elanous:harvestable'] },
+      now: triageNow, runStatus: 'completed', gate: 'pass' as const, review: 'approved' as const };
+    expect(assessDraftTriage(ready).nextAction).toBe('harvest');
+    expect(assessDraftTriage({ ...ready, gate: 'fail' }).nextAction).toBe('human');
+    expect(assessDraftTriage({ ...ready, review: 'commented' }).nextAction).toBe('human');
+    expect(assessDraftTriage({ ...ready, runStatus: undefined }).nextAction).toBe('human');
+    expect(assessDraftTriage({ ...ready, draft: { ...ready.draft, body: '' } }).nextAction).toBe('human');
+    const close = { draft: triageDraft, now: triageNow, runStatus: 'completed',
+      replacement: { number: 900, evidence: 'Supersedes: #101' } };
+    expect(assessDraftTriage(close)).toMatchObject({ nextAction: 'close-b',
+      checks: { 'replacement-landed': { state: 'yes' } } });
+    expect(assessDraftTriage({ ...close, draft: { ...triageDraft, body: '' } }).nextAction).toBe('human');
+    expect(assessDraftTriage({ ...close, runStatus: 'running' }).nextAction).toBe('human');
+    expect(assessDraftTriage({ ...close, replacement: undefined }).nextAction).toBe('human');
+  });
+  it('does not recommend a replacement close for a release-path hold', () => {
+    const result = assessDraftTriage({ draft: { ...triageDraft, labels: ['elanous:from-ux', RELEASE_PATH_LABEL] },
+      now: triageNow, runStatus: 'completed', replacement: { number: 900, evidence: 'Supersedes: #101' } });
+    expect(result.nextAction).toBe('human');
+    expect(result.checks.protected).toEqual({ state: 'yes', evidence: `보호 표지=${RELEASE_PATH_LABEL}` });
+    expect(result.checks['replacement-landed'].state).toBe('yes');
+  });
+
   it('requires repository-bound cell status before recommending close-a', () => {
     const unbound = assessDraftTriage({ draft: triageDraft, now: triageNow,
       runStatus: 'completed', cellStatus: 'done' });

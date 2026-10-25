@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { debug } from '../debug/log.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { registerAutopilotCommands } from './autopilot-cli.js';
 
 // Literal baseline recorded from src/index.ts before extraction (Commander registration tree).
@@ -283,12 +289,53 @@ describe('autopilot CLI extraction', () => {
   });
 });
 
+test('task-agent-action 배열 후보의 각 gh 명령은 해당 후보 cwd를 사용한다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'autopilot-candidate-cwd-'));
+  const bin = join(root, 'bin');
+  const first = join(root, 'first');
+  const second = join(root, 'second');
+  const output = join(root, 'gh-cwds.jsonl');
+  mkdirSync(bin);
+  mkdirSync(first);
+  mkdirSync(second);
+  const gh = join(bin, 'gh');
+  writeFileSync(gh, `#!/usr/bin/env node\nrequire('node:fs').appendFileSync(${JSON.stringify(output)}, JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }) + '\\n');\nconsole.log(JSON.stringify({ labels: [{ name: 'elanous:release-path' }] }));\n`);
+  chmodSync(gh, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath ?? ''}`;
+  mkdirSync(join(root, 'config'));
+  setElanousConfigDir(join(root, 'config'));
+  setUserConfigOverlay(config => ({ ...config, taskAgent: { ...config.taskAgent, mode: 'live' } }));
+  const off = debug.registerSink({ name: 'candidate-cwd-test', emit: () => {} });
+  const actions = [first, second].map((cwd, index) => ({
+    action: { kind: 'land' as const, taskId: `cwd-${index}`, rationale: 'cwd check', pr: index + 1,
+      runId: `run-${index}`, original: 'goal', checklistId: 'CELL', cwd },
+  }));
+  const previousExitCode = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    const program = new Command().name('elanous').exitOverride();
+    registerAutopilotCommands(program, { registerSink: async () => true });
+    await program.parseAsync(['node', 'elanous', 'autopilot', 'task-agent-action', JSON.stringify(actions)]);
+    const calls = readFileSync(output, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { cwd: string; args: string[] });
+    expect(calls).toEqual([
+      { cwd: realpathSync(first), args: ['pr', 'view', '1', '--json', 'labels'] },
+      { cwd: realpathSync(second), args: ['pr', 'view', '2', '--json', 'labels'] },
+    ]);
+  } finally {
+    off();
+    setUserConfigOverlay(null);
+    resetElanousConfigDir();
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    process.exitCode = previousExitCode ?? 0;
+  }
+});
+
 describe('autopilot task-agent-action — 손상된 상태 파일', () => {
   test('손상된 task-agent-actions.json → 실행 없이 exit 1 · 파일 그대로 (ENOENT 만 빈 상태)', async () => {
     const { mkdtempSync, readFileSync, writeFileSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
-    const { setElanousConfigDir, resetElanousConfigDir } = await import('../elanous-config-dir.js');
     const dir = mkdtempSync(join(tmpdir(), 'ta-action-'));
     const statePath = join(dir, 'task-agent-actions.json');
     const corrupted = '{"failureCounts": {"k": 3}, "landingsToday": 2';

@@ -121,6 +121,29 @@ describe('ZAI-POD-CHILD — glm child Pods on the Z.ai GLM Coding Plan', () => {
     expect(logs).toContainEqual(expect.objectContaining({ ev: 'job-applied', data: expect.objectContaining({ zaiSecret: ZAI_POD_SECRET_NAME, zaiRoute: 'zai' }) }));
   });
 
+  test.each(['openrouter', 'balance'] as const)('admitted ZAI Pod with overage=%s carries the runtime OpenRouter fallback key by run Secret', async (overage) => {
+    const { applied, result, logs } = await spawnGlm([ZAI_POD_SECRET_KEY], { overage });
+    expect(result!.exitCode).toBe(0);
+    const job = applied.find((entry) => entry.kind === 'Job')!;
+    const perRun = applied.find((entry) => entry.kind === 'Secret')!;
+    const container = job.spec.template.spec.containers[0];
+    expect(container.args[0]).toContain("'--child-llm-provider' 'glm'");
+    expect(container.env).toContainEqual({ name: ZAI_POD_SECRET_KEY,
+      valueFrom: { secretKeyRef: { name: ZAI_POD_SECRET_NAME, key: ZAI_POD_SECRET_KEY } } });
+    expect(container.env).toContainEqual({ name: 'OPENROUTER_API_KEY',
+      valueFrom: { secretKeyRef: { name: perRun.metadata.name, key: 'env-OPENROUTER_API_KEY' } } });
+    expect(perRun.stringData['env-OPENROUTER_API_KEY']).toBe('sk-or-test');
+    expect(JSON.parse(perRun.stringData['llm-fallback-config.json']).llm.zaiCodingPlan.overage).toBe(overage);
+    expect(JSON.stringify(job)).not.toContain('sk-or-test');
+    expect(JSON.stringify(logs)).not.toContain('sk-or-test');
+  });
+
+  test('runtime OpenRouter overage without a host key refuses the ZAI Pod before apply', async () => {
+    const noKey = await spawnGlm([ZAI_POD_SECRET_KEY], { overage: 'openrouter', extra: { readKeyCache: () => undefined } });
+    expect(noKey.result!.error?.message).toContain('openrouter 키 없음');
+    expect(noKey.applied).toEqual([]);
+  });
+
   test('fail-closed before launch: no Secret, or a Secret without ZAI_API_KEY → refused, nothing applied', async () => {
     const none = await spawnGlm(null, { extra: { openrouterGhToken: () => { throw new Error('must not request a GitHub token without the ZAI Secret'); } } });
     expect(none.result!.error?.message).toContain('glm(ZAI) 자격 Secret 없음');

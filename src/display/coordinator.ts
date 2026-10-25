@@ -22,6 +22,10 @@ import { TIER_ORDER, tierRank, tiersCompatible } from './types.js';
 import { resolveKeyAlias } from '../input-core/key-alias-table.js';
 import type { DisplayEventBus } from './events.js';
 import { paintCursor, type CursorState } from './cursor-state.js';
+import {
+  openSynchronizedOutputRegion,
+  synchronizedOutputDisabledByEnv,
+} from './synchronized-output-region.js';
 import { deriveCursor, type CursorDecision } from './cursor-owner.js';
 import {
   createVirtualCursorRegistry,
@@ -261,7 +265,6 @@ export class DisplayCoordinator {
    *  even when its bytes are unchanged, because the base rows under it
    *  were just repainted. Replaces the old forceNext follow-up. */
   private overlayRowsInvalidated = false;
-
   private surfaces = new Map<SurfaceId, DisplaySurface>();
   private focusNodes = new Map<SurfaceId, FocusNode>();
   private keyBindings = new Map<string, DisplayKeyBinding>();
@@ -288,6 +291,7 @@ export class DisplayCoordinator {
   private dirty = new Set<SurfaceId | 'all' | 'status' | 'dock'>();
   private forceNext = false;
   private scheduled: Timer | null = null;
+  private scheduleGeneration = 0;
   // P2.2.b — cursor state. Last-writer-wins. cursorVersion bumps on
   // every setCursor; lastEmittedCursorVersion tracks what's been
   // written so flushCursor only emits on change.
@@ -964,6 +968,36 @@ export class DisplayCoordinator {
       region: opts?.region,
       force: opts?.force,
     }, 'dashboard');
+  }
+
+  /** Mark a render dirty and flush it before returning. Used when a host
+   *  already owns a synchronized output batch around the render. */
+  requestRenderNow(opts?: { region?: SurfaceId | 'all'; force?: boolean }): void {
+    this.markDirty(opts?.region ?? 'all');
+    if (opts?.force) this.forceNext = true;
+    this.scheduleGeneration += 1;
+    this.scheduled = null;
+    this.flush();
+  }
+
+  /** Run synchronous terminal writes inside DECSET 2026 when enabled.
+   *  Coordinator flushes, the dashboard draw seam, and host paint batches
+   *  share the same re-entrant region instead of emitting nested markers. */
+  withSynchronizedOutput<T>(paint: () => T): T {
+    const syncRegion = openSynchronizedOutputRegion();
+    const syncOutput = syncRegion.outermost && this.syncOutputEnabled;
+    try {
+      if (syncOutput) {
+        this.writeOverlay?.('\x1b[?2026h');
+      }
+      return paint();
+    } finally {
+      try {
+        if (syncOutput) this.writeOverlay?.('\x1b[?2026l');
+      } finally {
+        syncRegion.close();
+      }
+    }
   }
 
   handle(owner: SurfaceOwner): DisplayHandle {
@@ -2629,10 +2663,16 @@ export class DisplayCoordinator {
 
   private requestFrame(): void {
     if (this.scheduled !== null) return;
-    this.scheduled = this.scheduleFn(() => {
+    const generation = ++this.scheduleGeneration;
+    const marker = {} as Timer;
+    let scheduled: Timer | undefined;
+    this.scheduled = marker;
+    scheduled = this.scheduleFn(() => {
+      if (generation !== this.scheduleGeneration || (this.scheduled !== marker && this.scheduled !== scheduled)) return;
       this.scheduled = null;
       this.flush();
     }, this.frameMs);
+    if (this.scheduled === marker) this.scheduled = scheduled;
   }
 
   private flush(): void {
@@ -2661,9 +2701,7 @@ export class DisplayCoordinator {
     // `ELANOUS_SYNC_OUTPUT=off` for buggy terminals (none observed in
     // practice, 2026-04-21). Pattern matches Textual (synchronized
     // output since v0.47) + Ratatui backend buffer-swap semantics.
-    const syncOutput = this.syncOutputEnabled;
-    if (syncOutput) this.writeOverlay?.('\x1b[?2026h');
-    try {
+    this.withSynchronizedOutput(() => {
       // H1.6 · W2 shadow flush. Fires rc.on('before-flush') +
       // rc.on('after-flush') synchronously. Subscriber paints (if any
       // are wired in Phase γ) land INSIDE the DECSET 2026 atomic-frame
@@ -2696,11 +2734,7 @@ export class DisplayCoordinator {
       // so the prior cursor position may have been overwritten. Always
       // re-assert. The bypass-batch path calls flushCursor(false).
       this.flushCursor(true);
-    } finally {
-      // Always close the sync block — a throw inside render hooks
-      // must not leave the terminal stuck in "buffering" mode.
-      if (syncOutput) this.writeOverlay?.('\x1b[?2026l');
-    }
+    });
     this.eventBus?.emit({ type: 'render:after', request, snapshot });
     this.pendingWidgetPatches = [];
     this.pendingLogLines = [];
@@ -2713,8 +2747,7 @@ export class DisplayCoordinator {
    *  not a TTY (unit-test + CI environment) so overlay assertions
    *  don't have to strip the ?2026h / ?2026l pair. */
   private get syncOutputEnabled(): boolean {
-    const v = (process.env.ELANOUS_SYNC_OUTPUT ?? 'on').toLowerCase();
-    if (v === 'off' || v === '0' || v === 'false') return false;
+    if (synchronizedOutputDisabledByEnv()) return false;
     // Non-TTY environments (tests, piped output) gain nothing from
     // atomic frame wrapping and the sequences would pollute assertions.
     if (typeof process !== 'undefined' && process.stdout && process.stdout.isTTY !== true) {

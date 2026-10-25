@@ -275,6 +275,42 @@ describe('durable message log and cursor', () => {
     } finally { reopened.close(); }
   });
 
+  test('MSG-THREAD: mock request and reply are returned together without changing DM, ALL or ack order', () => {
+    const path = diskPath();
+    const writer = new MsgStore(path);
+    let requestId: number;
+    let replyId: number;
+    try {
+      const request = writer.post({ from: 'OP', to: 'TC', body: 'request' });
+      requestId = request.id;
+      const all = writer.post({ from: 'MK', to: 'ALL', body: 'notice' });
+      const reply = writer.post({ from: 'TC', to: 'OP', body: 'reply', replyTo: request.id });
+      replyId = reply.id;
+      expect(writer.list('TC').map(message => message.id)).toEqual([request.id, all.id]);
+      expect(writer.list('OP').map(message => message.id)).toEqual([all.id, reply.id]);
+      expect(writer.getCursor('TC')).toBe(0);
+      expect(writer.ack('TC', request.id)).toBe(request.id);
+      expect(writer.list('TC', writer.getCursor('TC')).map(message => message.id)).toEqual([all.id]);
+    } finally { writer.close(); }
+    const reader = new MsgStore(path);
+    try {
+      expect(reader.listThread(requestId!).map(message => [message.id, message.replyTo, message.body])).toEqual([
+        [requestId!, undefined, 'request'], [replyId!, requestId!, 'reply'],
+      ]);
+      expect(reader.getCursor('TC')).toBe(requestId!);
+    } finally { reader.close(); }
+  });
+
+  test('MSG-THREAD: a reply ID resolves to the same request and reply across seats', () => {
+    const store = new MsgStore(':memory:');
+    try {
+      const request = store.post({ from: 'OP', to: 'TC', body: 'mock request' });
+      const reply = store.post({ from: 'TC', to: 'OP', body: 'mock reply', replyTo: request.id });
+      expect(store.listThread(reply.id)).toEqual([request, reply]);
+      expect(store.listThread(request.id)).toEqual([request, reply]);
+    } finally { store.close(); }
+  });
+
   test('replyTo threads replies to a question, listing them in insertion order and paging by exclusive reply ID', () => {
     const store = new MsgStore(':memory:');
     try {
@@ -334,6 +370,7 @@ describe('durable message log and cursor', () => {
       expect(readOnly.listByRecipient('OP')).toEqual([oldAnswer]);
       expect(readOnly.listAfter(0)).toEqual([oldQuestion, oldAnswer]);
       expect(readOnly.listReplies(1)).toEqual([]);
+      expect(readOnly.listThread(1)).toEqual([oldQuestion]);
     } finally { readOnly.close(); }
     const store = new MsgStore(path);
     try {
@@ -343,6 +380,7 @@ describe('durable message log and cursor', () => {
       const reply = store.post({ from: 'TC', to: 'OP', body: 'new reply', replyTo: 1 });
       expect(reply).toMatchObject({ id: 3, replyTo: 1 });
       expect(store.listReplies(1).map(message => [message.id, message.body, message.replyTo])).toEqual([[3, 'new reply', 1]]);
+      expect(store.listThread(1)).toEqual([oldQuestion, reply]);
     } finally { store.close(); }
 
     const reopened = new MsgStore(path);

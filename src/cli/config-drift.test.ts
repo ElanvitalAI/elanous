@@ -91,7 +91,7 @@ describe('config drift (CFG-STORE1)', () => {
     const f = fixture();
     const SECRET_A = 'sk-prod-AAAAAAAAAAAAAAAAAAAA';
     const SECRET_B = 'sk-derived-BBBBBBBBBBBBBBBBBB';
-    const BOT = '8799226199:AAE9zA3sqjmurLLFwATRQ-LOEyp4Av1LaYw';
+    const BOT = '123456:TEST_FAKE_TOKEN';
     f.writeCfg(f.prodRoot, { llm: { apiKey: SECRET_A }, notify: { routes: [{ name: 'main', botToken: BOT }] } });
     f.writeCfg(join(f.trees, 'tree-b', '.elanous-test'), { llm: { apiKey: SECRET_B }, notify: { routes: [] } });
 

@@ -1,5 +1,12 @@
 import { describe, expect, mock, spyOn, test } from 'bun:test';
 import { resolveDashboardChatMainSlashCommand } from '../src/dashboard/input/chat-main-slash-command.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { historyFromSession, resolveSessionId } from '../src/session/index.js';
+import { seedLongSession, seedSessionWithId } from '../src/ux-sim/session-id-seed.js';
+import { getSessionMetrics, resetSessionMetrics } from '../src/status/metrics.js';
+import { stripVTControlCharacters } from 'node:util';
 import * as askLaunchFlow from '../src/self-dev/ask-launch-flow.js';
 import type { AskLaunchFlowDeps, AskLaunchFlowInput, AskLaunchFlowResult } from '../src/self-dev/ask-launch-flow.js';
 import * as goalAuthorCli from '../src/self-implement/goal-author-cli.js';
@@ -1659,6 +1666,81 @@ describe('B-1.h · session/context cluster', () => {
     expect(r.kind).toBe('continue');
     expect(state.resumePickerOpens).toBe(1);
     expect(ctx.chatLines.join('\n')).not.toContain('usage: /session load');
+  });
+
+  // 재현 — TUI-RESUME-PICKER(10-23 00:44 대표 보고): «`/session list` 가 세션 id 를 제대로 안 보여 준다 — 잘린다».
+  // 고정 8자 컷이면 앞 8자가 같은 세션은 같은 줄로 보이고 그 앞자리로는 `/session load` 가 «모호»로 실패한다.
+  test('TUI-RESUME-PICKER incident — /session list shows unique prefixes that /session load accepts', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'classic-session-list-'));
+    const saved = process.env.ELANOUS_SESSION_ROOT;
+    const savedState = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_SESSION_ROOT = join(dir, 'sessions');
+    // `/session load` writes the active-session marker under the state dir — keep it in this test's dir.
+    process.env.ELANOUS_STATE_DIR = dir;
+    try {
+      const ids = [
+        seedSessionWithId('feed0123-0001-4000-8000-000000000001', 'n8n 특강'),
+        seedSessionWithId('feed0123-0002-4000-8000-000000000002', 'RSS 재촬영'),
+        seedSessionWithId('0a1b2c3d-0000-4000-8000-000000000003', '혼자'),
+      ];
+      const reg = buildDashboardSlashRegistry();
+      const { ctx } = makeFakeCtx();
+      (ctx as unknown as { sessionSlash: unknown }).sessionSlash = { remoteDaemon: () => null };
+      (ctx as unknown as { getAttachedSessionId: () => string | null }).getAttachedSessionId = () => null;
+      await reg.dispatch('session', ['list'], ctx);
+      const out = ctx.chatLines.join('\n');
+      for (const prefix of ['feed0123-0001', 'feed0123-0002', '0a1b2c3d']) expect(out).toContain(prefix);
+      expect(resolveSessionId('feed0123-0001')).toBe(ids[0]);
+      expect(resolveSessionId('feed0123-0002')).toBe(ids[1]);
+      expect(resolveSessionId('0a1b2c3d')).toBe(ids[2]);
+    } finally {
+      if (saved === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = saved;
+      if (savedState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = savedState;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // 재현 — TUI-RESUME-PICKER ①③④ (OP 10-23 · n8n 379행 세션): `/session load elanous-session-c01bd3` 뒤 화면에
+  // 무엇이 남는지가 불분명했다(결과·오류 줄 없음 · 지난 대화 미표시 · ctx 0). 합성 379행 세션으로 고정한다.
+  test('TUI-RESUME-PICKER incident — /session load of a 379-row session prints one result line, the whole conversation, and a ctx size', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'classic-session-load-'));
+    const saved = process.env.ELANOUS_SESSION_ROOT;
+    const savedState = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_SESSION_ROOT = join(dir, 'sessions');
+    // `/session load` writes the active-session marker under the state dir — keep it in this test's dir.
+    process.env.ELANOUS_STATE_DIR = dir;
+    resetSessionMetrics();
+    try {
+      const seed = seedLongSession('elanous-session-l0ng79');
+      seedSessionWithId('elanous-session-l0nq00', '이웃');
+      const reg = buildDashboardSlashRegistry();
+      const { ctx } = makeFakeCtx();
+      (ctx as unknown as { sessionSlash: unknown }).sessionSlash = { remoteDaemon: () => null };
+      (ctx as unknown as { getAttachedSessionId: () => string | null }).getAttachedSessionId = () => null;
+      (ctx as unknown as { setAttachedSessionId: (id: string | null) => void }).setAttachedSessionId = () => {};
+      const runLoad = async (prefix: string) => {
+        const before = ctx.chatLines.length;
+        await reg.dispatch('session', ['load', prefix], ctx);
+        return stripVTControlCharacters(ctx.chatLines.slice(before).join('\n'));
+      };
+      // ① every outcome leaves a line: no match · ambiguous · loaded.
+      expect(await runLoad('zz-none')).toContain('No session matches prefix "zz-none"');
+      expect(await runLoad('elanous-session-l0n')).toContain('ambiguous');
+      const out = await runLoad('elanous-session-l0ng');
+      expect(out).toContain('✓ loaded session elanous-session-l0ng');
+      expect(out).toContain(`${historyFromSession(seed.id)!.history.length} turns restored`);
+      // ③ the conversation itself, first to last.
+      expect(out).toContain(seed.firstUser);
+      expect(out).toContain(seed.lastAssistant);
+      expect(out).not.toContain('Preview of last 5');
+      // ④ ctx is the restored size, not 0.
+      expect(getSessionMetrics().lastContextUsed).toBeGreaterThan(0);
+    } finally {
+      if (saved === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = saved;
+      if (savedState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = savedState;
+      rmSync(dir, { recursive: true, force: true });
+      resetSessionMetrics();
+    }
   });
 
   test('paste happy path: clipboard returns token → setNextInitial', async () => {

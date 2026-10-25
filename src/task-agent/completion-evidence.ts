@@ -148,7 +148,8 @@ export function checkCompletionEvidence(
     case 'decision-support': {
       if (!deps.ledger) { add('못 쟀다: 결정 원장'); break; }
       try {
-        if (!deps.ledger.list({ status: 'all' }).some((entry) => entry.id === input.ref)) add('결정 기록');
+        // 결정 카드는 그 과제를 `refs` 로 가리킨다 — 기록 id 든 카드 참조든 «그 과제의 기록»이다.
+        if (!deps.ledger.list({ status: 'all' }).some((entry) => entry.id === input.ref || entry.refs?.includes(input.ref))) add('결정 기록');
       } catch { add('못 쟀다: 결정 원장 읽기'); }
       break;
     }

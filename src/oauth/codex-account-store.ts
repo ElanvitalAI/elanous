@@ -32,6 +32,8 @@ import {
   decideFallback, normalizeFallbackChain, grokQuotaFromUsageSnapshot,
   type FallbackDecision, type FallbackInput, type FallbackStep, type RotationOutcome,
 } from './fallback-chain.js';
+import { collectClaudePtyMaturitySample, judgeClaudePtyMaturity, type ClaudePtyMaturity } from './claude-pty-maturity.js';
+import type { UsageOutcomesDeps } from '../budget/usage-outcomes.js';
 import { resolveGrokCredential } from '../grok/credential.js';
 import { getOpenRouterApiKey } from '../config.js';
 import { lookupOpenRouterModelSpec } from '../model-tier/llm-tier-map.js';
@@ -1087,6 +1089,29 @@ function richestCreditCandidate(candidates: readonly RotationCandidate[], reserv
   return creditCandidatesByBalance(candidates, reserve)[0];
 }
 
+/**
+ * CLAUDE-FAILOVER-FU — 체인에 `claude-pty` 칸이 «있을 때만» 런 원장의 최근 표본을 읽어 성숙도를 낸다.
+ *
+ * ⛔ 다른 체인에서는 원장을 «안 읽는다» — 비용도 0 이고, claude 를 안 쓰는 구성의 판정 입력도 안 바뀐다.
+ * ⛔ 읽기 실패·표본 결손을 «전환 가능»으로 접지 않는다 — `judgeClaudePtyMaturity(null)` 이
+ *   `sample-unreadable`(미성숙)을 내고, 판정은 `claude-pty-immature` 로 닫힌다.
+ * ⛔ 예외도 삼켜 미성숙으로 닫는다 — 원장 I/O 때문에 폴백 판정 자체가 죽으면 안 된다.
+ */
+function claudePtyMaturityForChain(
+  chain: readonly FallbackStep[],
+  ledger: UsageOutcomesDeps | undefined,
+): ClaudePtyMaturity | undefined {
+  if (!chain.includes('claude-pty')) return undefined;
+  try {
+    return judgeClaudePtyMaturity(collectClaudePtyMaturitySample(ledger ?? {}));
+  } catch (error) {
+    debug.log('oauth.claude-pty', 'maturity-read-failed', {
+      reason: error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120),
+    }, { level: 'warn' });
+    return judgeClaudePtyMaturity(null);
+  }
+}
+
 export function resolveRunFallback(
   env: NodeJS.ProcessEnv = process.env,
   deps: {
@@ -1098,6 +1123,8 @@ export function resolveRunFallback(
     readonly openrouterAvailable?: boolean;
     /** codex 크레딧 잔액 «확인» seam — 안 주면 회전 후보의 크레딧 신호(잔액 > 0 · 보유 ≠ false)로 잰다. */
     readonly codexCreditsAvailable?: boolean;
+    /** ⛔ 런 원장 «읽기» seam — 체인에 `claude-pty` 가 있을 때만 쓴다. 안 주면 실제 런 원장을 읽는다. */
+    readonly claudePtyLedger?: UsageOutcomesDeps;
   } & Pick<FallbackInput, 'currentStep' | 'currentCredentialRateLimited'> = {},
 ): FallbackDecision {
   try {
@@ -1160,7 +1187,13 @@ export function resolveRunFallback(
       : explicitAccount ? (explicitAccountHasCredits(snapshot, creditReserve) ? [snapshot.current.name] : [])
       : codexCreditAccountNames(snapshot.candidates, creditReserve);
     const codexCreditsAvailable = effectiveChain.includes('codex-credits') && (deps.codexCreditsAvailable ?? creditAccounts.length > 0);
-    const fallbackBase = { rotation, chain: effectiveChain, grokAvailable, grokQuota, openrouterFallbackModel, openrouterAvailable, codexCreditsAvailable };
+    // CLAUDE-FAILOVER-FU — 체인에 `claude-pty` 가 «있을 때만» 원장 성숙도를 재서 판정 입력에 싣는다.
+    //   ⛔ 없으면 `undefined` 이고 판정은 종전 그대로다(수집 0회 · 판정식 무변경).
+    const claudePtyMaturity = claudePtyMaturityForChain(effectiveChain, deps.claudePtyLedger);
+    const fallbackBase = {
+      rotation, chain: effectiveChain, grokAvailable, grokQuota, openrouterFallbackModel, openrouterAvailable, codexCreditsAvailable,
+      ...(claudePtyMaturity ? { claudePtyMaturity } : {}),
+    };
     const fallbackInput: FallbackInput = deps.currentCredentialRateLimited === true && deps.currentStep
       ? { ...fallbackBase, currentStep: deps.currentStep, currentCredentialRateLimited: true }
       : { ...fallbackBase, ...(deps.currentStep ? { currentStep: deps.currentStep } : {}) };

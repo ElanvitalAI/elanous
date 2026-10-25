@@ -26,12 +26,12 @@ import { debug } from '../debug/log.js';
 import { findGitDir } from '../git-fs/locate.js';
 import { getUserConfig, userConfigPath } from '../user-config.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
-import { LIVE_MOVE_HISTORY_EVENT, shellQuote, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { LIVE_MOVE_HISTORY_EVENT, cardPrNumber, shellQuote, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 import { reconcileHandMergedCard } from './postland-card.js';
 import { advanceLandedPieceMission } from './mission.js';
 import { resolveParentHosts, type ParentHostConfig } from './parent-host.js';
 import { LIVE_RETRY_MOVES } from './judge.js';
-import { decisionCardGrounds, decisionRaiseArgs, type DecisionCardEvidence, type NextAction } from './actions.js';
+import { decisionCardGrounds, decisionRaiseArgs, ownerWorktreeHarvestState, type DecisionCardEvidence, type NextAction } from './actions.js';
 import { pendingReviewResults, reviewResultPath, TA_REVIEW_COMPLETION_CARD_ENV, TA_REVIEW_COMPLETION_RESULT_ENV, TA_REVIEW_COMPLETION_STATE_ENV } from './review-result-capture.js';
 import { buildPriorFixContext, PRIOR_FIX_SCOPE_LINE, priorFixBlock, priorFixObservation, type PriorDiffReader, type PriorFixContext } from './review-prior-fix.js';
 import { createLandWorktree, localBranch, localHead, observeLandWorktree, type LandWorktree, type LandWorktreeFailure, type LandWorktreeInput, type LandWorktreeRemoval } from './land-worktree.js';
@@ -88,6 +88,8 @@ export interface LiveMoveDeps {
   requestReview?: (pr: number, intent: string, cwd?: string, capture?: { resultPath: string }) => Promise<void>;
   /** REVIEW-CONVERGE-PRIOR-FIX — 같은 PR 재리뷰의 직전 머리 → 지금 머리 diff(시험 주입 · 기본 = `git diff --numstat`). */
   priorDiff?: PriorDiffReader;
+  /** Read-only owner worktree harvest probe; injected only in tests. */
+  harvestGit?: (cwd: string, args: string[]) => { status: number | null; stdout: string };
   /** Fresh PR head and draft flag for landing; separate from the unchanged review lookup. */
   landPrHead?: (pr: number, cwd: string) => Promise<(PrHeadView & { isDraft: boolean }) | null>;
   /** TA-CARD-MERGE-RECONCILE — MERGED PR 의 merge SHA·base·mergedAt 관측(시험 주입 · 기본 = `gh pr view`). */
@@ -385,7 +387,8 @@ function observe(deps: LiveMoveDeps, result: LiveMoveResult): LiveMoveResult {
 /** `review` — PR 머리마다 한 번. 카드에 먼저 적고(잠금 안) 그다음 띄운다 · 띄우기 실패는 카드에 오류로 남기고 같은 머리는 다시 안 띄운다. */
 export async function executeLiveReview(
   card: TaskCard | undefined, pr: number | undefined,
-  ctx: { runId: string | null; stopReason: string; cwd?: string; forceNewReview?: boolean; produced?: { headCommit?: string; branch?: string; prUrl?: string } },
+  ctx: { runId: string | null; stopReason: string; cwd?: string; forceNewReview?: boolean; ownerHarvestHead?: string;
+    ownerHarvestAncestor?: (cwd: string, owner: string, head: string) => boolean; produced?: { headCommit?: string; branch?: string; prUrl?: string } },
   deps: LiveMoveDeps = {},
 ): Promise<LiveMoveResult> {
   const kind = 'review' as const;
@@ -410,7 +413,49 @@ export async function executeLiveReview(
   const withRepo = (result: LiveMoveResult): LiveMoveResult => reviewRepo ? { ...result, reviewRepo } : result;
   if (!head) return observe(deps, withRepo({ kind, executed: false, card: card.id, ok: false, detail: `PR #${pr} head unknown` }));
   if (head.state !== 'OPEN') return observe(deps, withRepo({ kind, executed: false, card: card.id, ok: false, detail: `PR #${pr} is ${head.state}` }));
+  if (ctx.ownerHarvestHead) {
+    const owner = ctx.ownerHarvestHead;
+    const same = head.head.toLowerCase() === owner.toLowerCase();
+    let descendant = false;
+    if (!same && cwd && /^[a-f0-9]{40}$/i.test(owner)) {
+      try {
+        descendant = (ctx.ownerHarvestAncestor ?? ((dir: string, ancestor: string, newer: string) => {
+          const git = deps.harvestGit ?? ((repo: string, args: string[]) => {
+            const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8', timeout: 10_000 });
+            return { status: result.status, stdout: String(result.stdout ?? '') };
+          });
+          return git(dir, ['merge-base', '--is-ancestor', ancestor, newer]).status === 0;
+        }))(cwd, owner, head.head);
+      } catch { /* Unverified ancestry must not start a review. */ }
+    }
+    if (!/^[a-f0-9]{40}$/i.test(owner) || !head.url || typeof card.pr !== 'object'
+      || card.pr.number !== pr || !card.pr.url || head.url.replace(/\/+$/, '').toLowerCase() !== card.pr.url.replace(/\/+$/, '').toLowerCase()
+      || (!same && !descendant)) {
+      return observe(deps, withRepo({ kind, executed: false, card: card.id, ok: true,
+        detail: `PR #${pr} head ${head.head.slice(0, 12)} awaits owner-worktree-commit ${owner.slice(0, 12)} · next: wait for harvest` }));
+    }
+  }
+  // The PR head still trails this PR branch's registered owner checkout: review that head only after harvest.
+  const harvestState = cwd && head.branch ? ownerWorktreeHarvestState({ pr, cwd, head: head.head, branch: head.branch, state: head.state }, deps.harvestGit) : undefined;
   const path = deps.statePath ?? taskAgentStatePath();
+  const boundUrl = typeof card.pr === 'object' ? card.pr.url : undefined;
+  const samePrUrl = !!boundUrl && !!head.url && boundUrl.replace(/\/+$/, '').toLowerCase() === head.url.replace(/\/+$/, '').toLowerCase();
+  if (harvestState && samePrUrl && !!ctx.runId) {
+    const detail = `review skipped: owner-worktree-commit PR #${pr} ${harvestState.head} · next: wait for harvest and exact-head review`;
+    let bound = false;
+    try {
+      updateTaskCard(path, card.id, current => {
+        if (!current || current.status !== 'launched' || cardPrNumber(current) !== pr || current.runId !== ctx.runId
+          || typeof current.pr !== 'object' || current.pr.url !== boundUrl) return undefined;
+        bound = true;
+        if (current.history.some(item => item.event === 'review-skipped-harvest' && item.pr === pr
+          && item.head === harvestState.head && item.runId === ctx.runId)) return undefined;
+        return { ...current, history: [...current.history, { at: (deps.now ?? (() => new Date()))().toISOString(), event: 'review-skipped-harvest',
+          pr, head: harvestState.head, ...(ctx.runId ? { runId: ctx.runId } : {}), effect: 'wait', detail }] };
+      });
+    } catch { bound = false; }
+    if (bound) return observe(deps, withRepo({ kind, executed: false, card: card.id, ok: true, detail }));
+  }
   const at = (deps.now ?? (() => new Date()))().toISOString();
   // TA-REVIEW-RESULT-CAPTURE — 머리마다 한 번이라 경로도 머리마다 하나다. 요청 칸에 먼저 적는다(회수가 이 칸을 본다).
   const resultPath = ctx.forceNewReview

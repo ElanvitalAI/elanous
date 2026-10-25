@@ -12,6 +12,7 @@ import {
   formatPartialObservationNote,
   formatPrFileOverlapObservation,
   formatPrWorktreeObservation,
+  formatUnlistedSpawnLaneTests,
   formatUnrunImporterTests,
   observePrFileOverlap,
   observePrWorktreeDirtiness,
@@ -66,7 +67,7 @@ function prCommands(metadata: Record<string, unknown>, head = 'head-sha', porcel
 }
 
 function overlapLogCommand(baseOid: string, baseRefName: string, stdout = ''): [string, string[], CommandResult] {
-  return ['git', landingHistoryLogArgs('0', `${baseOid}..${baseRefName}`), ok(stdout)];
+  return ['git', landingHistoryLogArgs(null, `${baseOid}..${baseRefName}`), ok(stdout)];
 }
 
 function prGateCommands(
@@ -172,7 +173,7 @@ describe('runSelfGateCli', () => {
     expect(result.exitCode).toBe(0);
   });
 
-  test('--fixed-shard-distribution is opt-in: only then the runner gets the fixed mode; plain --shards is called as before', () => {
+  test('--fixed-shard-distribution is opt-in while both shard paths receive the progress observer', () => {
     const files = ['test/b.test.ts', 'test/a.test.ts', 'test/c.test.ts'];
     const calls: unknown[][] = [];
     const deps = {
@@ -187,14 +188,52 @@ describe('runSelfGateCli', () => {
       runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
     };
     const plain = runSelfGateCli('/repo', { shards: 4 }, deps);
-    expect(calls[0]).toEqual(['/repo', files, 'HEAD', 4]);
+    expect(calls[0]?.slice(0, 7)).toEqual(['/repo', files, 'HEAD', 4, undefined, undefined, undefined]);
+    expect(calls[0]?.[7]).toEqual({ onShardComplete: expect.any(Function) });
     expect(plain.lines.find((line) => line.startsWith('shards: '))).not.toContain('고정 분배');
     const fixed = runSelfGateCli('/repo', { shards: 4, fixedShardDistribution: true }, deps);
-    expect(calls[1]).toEqual(['/repo', files, 'HEAD', 4, undefined, undefined, undefined, { fixedDistribution: true }]);
+    expect(calls[1]?.slice(0, 7)).toEqual(['/repo', files, 'HEAD', 4, undefined, undefined, undefined]);
+    expect(calls[1]?.[7]).toEqual({ fixedDistribution: true, onShardComplete: expect.any(Function) });
     expect(fixed.lines.find((line) => line.startsWith('shards: '))).toContain('고정 분배');
     expect(fixed.exitCode).toBe(0);
     expect(() => runSelfGateCli('/repo', { fixedShardDistribution: true }, deps)).toThrow('requires --shards');
     expect(calls).toHaveLength(2);
+  });
+
+  test('records each of three completed bundles before the runner returns and atomically replaces progress.json', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gate-progress-'));
+    const files = ['test/a.test.ts', 'test/b.test.ts', 'test/c.test.ts'];
+    const stderr: string[] = [];
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'gate.cli' && event === 'shard-progress') events.push(data);
+    });
+    let clock = 1000;
+    try {
+      const result = runSelfGateCli('/repo', { shards: 3, artifactDir: dir }, {
+        changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+        runShards: (_cwd, _files, _base, _count, _run, _worktree, _budget, mode) => {
+          for (let index = 1; index <= 3; index++) {
+            clock += 1000;
+            mode?.onShardComplete?.({ shardId: `shard-${index}`, completedShards: index,
+              totalShards: 3, completedFiles: index, totalFiles: 3 });
+            expect(JSON.parse(readFileSync(join(dir, 'progress.json'), 'utf8')).completedShards).toBe(index);
+          }
+          return { shards: [], attempts: [], aggregate: { status: 'passed', retryShardIds: [] } };
+        },
+        writeProgressStderr: (line) => { stderr.push(line); }, now: () => clock,
+        resolveRev: () => 'a'.repeat(40), envKey: () => 'test',
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(stderr).toHaveLength(3);
+      expect(stderr[1]).toContain('bundles 2/3 · files 2/3 · elapsed 2s · remaining ~1s');
+      expect(events).toHaveLength(3);
+      expect(events[2]).toMatchObject({ completedShards: 3, totalShards: 3, completedFiles: 3, totalFiles: 3, elapsedMs: 3000, estimatedRemainingMs: 0 });
+      expect(JSON.parse(readFileSync(join(dir, 'progress.json'), 'utf8'))).toMatchObject(events[2] as object);
+    } finally { log.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('automatic host-cap fixed fallback is visible without changing the real shard verdict', () => {
@@ -579,6 +618,41 @@ describe('runSelfGateCli', () => {
       expect(result.lines.join('\n')).toContain('- introduced: test/compute-consumer.test.ts > compute');
       expect(result.exitCode).toBe(1);
     } finally { fixture.dispose(); }
+  });
+
+  test('⛔ 소비자 배선 — 미등재 spawn-lane 드리프트가 gate 출력에 실린다(무인 리뷰 must-fix)', () => {
+    const fixture = fixtureRepository({
+      'src/service.ts': 'export const service = 1;\n',
+      'bin/elanous.mjs': '#!/usr/bin/env bun\n',
+      'test/spawns-cli.test.ts': "import { spawnSync } from 'node:child_process';\nspawnSync('bun', ['bin/elanous.mjs']);\n",
+    });
+    try {
+      const result = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, {
+        changedFiles: () => ({ files: ['src/service.ts'], baseRef: 'HEAD' }),
+        runTests: () => ok(),
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      });
+      // `resolveGateScope` 이 채운 `runtimeEdgeImpact` 를 gate 출력이 실제로 읽는다 — 죽은 필드가 아니다.
+      expect(result.lines).toContain('unlisted spawn-lane tests: 1 (test/spawns-cli.test.ts)  ⚠️ GATE_SPAWN_LANE_FILES 가 빠뜨린 실측 spawn-lane 시험 — 「보고만 한다. 막지 않는다.」');
+      expect(result.exitCode).toBe(0);
+    } finally { fixture.dispose(); }
+  });
+
+  test('⛔ 소비자 배선 — 색인을 못 만든 변경은 미등재 spawn-lane 을 「못 잰다」고 말한다', () => {
+    const deps = {
+      changedFiles: () => ({ files: ['scripts/compute.ts'], baseRef: 'HEAD' }),
+      exists: () => false,
+      runCommand: () => ({ status: 2, stderr: 'grep unavailable' }),
+      runTests: () => ok(),
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+    };
+    const result = runSelfGateCli('/repo', { includeImporterTests: true }, deps);
+    // 임포터 색인이 없으면(`runtimeEdgeImpact: null`) 측정은 «모름» 이다 — 0 이 아니다.
+    expect(result.lines).toContain('unlisted spawn-lane tests: (not measured — no importer index)');
   });
 
   test('the light-rc opt-in still selects src/ importers alongside scripts/ importers', () => {
@@ -1767,7 +1841,7 @@ describe('runSelfGateCli', () => {
       headRefName: 'pr-branch',
       baseRefName: 'main',
     });
-    commands.push(['git', landingHistoryLogArgs('0', 'base-sha..main'), { status: 1, stdout: '', stderr: 'git log unavailable' }]);
+    commands.push(['git', landingHistoryLogArgs(null, 'base-sha..main'), { status: 1, stdout: '', stderr: 'git log unavailable' }]);
     const result = runSelfGateCli('/repo', { pr: '6268' }, {
       runCommand: scriptedCommand(commands),
       exists: (path) => path === 'src/a.test.ts',
@@ -1835,13 +1909,21 @@ describe('runSelfGateCli', () => {
       git(['add', 'src/after.ts']);
       git(['commit', '-m', 'after-base', '--quiet']);
       const afterOid = git(['rev-parse', 'HEAD']).stdout.trim();
-      const overlap = observePrFileOverlap(cwd, ['src/before.ts', 'src/after.ts'], baseOid, 'trunk', undefined);
+      let overlapLogArgs: string[] = [];
+      const overlap = observePrFileOverlap(cwd, ['src/before.ts', 'src/after.ts'], baseOid, 'trunk', (command, args, commandCwd) => {
+        overlapLogArgs = args;
+        // Reproduce a slow shard crossing a wall-clock second before Git reads the history.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1_100);
+        const result = spawnSync(command, args, { cwd: commandCwd, encoding: 'utf8' });
+        return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+      });
       expect(overlap).toEqual({ status: 'overlap', files: ['src/after.ts'] });
       expect(overlap.status === 'overlap' ? overlap.files : []).not.toContain('src/before.ts');
+      expect(overlapLogArgs).toEqual(landingHistoryLogArgs(null, `${baseOid}..trunk`));
       const none = observePrFileOverlap(cwd, ['src/before.ts'], baseOid, 'trunk', undefined);
       expect(none).toEqual({ status: 'none' });
-      // Git interprets --since=0 relative to now, so a slow CI shard can exclude
-      // the commits this test just created. Use a fixed origin for all history.
+      // The production query uses only the base range; this direct fixed-origin
+      // query also verifies that the range excludes pre-base commits.
       const logged = spawnSync('git', landingHistoryLogArgs('1970-01-01T00:00:00Z', `${baseOid}..trunk`), { cwd, encoding: 'utf8' });
       expect(logged.status).toBe(0);
       expect(logged.stdout).toContain(afterOid);
@@ -1883,7 +1965,7 @@ describe('runSelfGateCli', () => {
       'base-sha',
       'main',
       (command, args) => {
-        expect([command, args]).toEqual(['git', landingHistoryLogArgs('0', 'base-sha..main')]);
+        expect([command, args]).toEqual(['git', landingHistoryLogArgs(null, 'base-sha..main')]);
         return ok('commit abcdef1\nsrc/a.ts\n');
       },
     );
@@ -1928,5 +2010,25 @@ describe('self gate: changed=0 이 「통과」인지 「안 쟀다」인지 갈
       });
       expect(result.lines.join('\n')).not.toContain('센 것이 0인데');
     } finally { fixture.dispose(); }
+  });
+});
+
+describe('planRemoteGateShardCommands — GATE-REMOTE-SHARD-PLAN 게이트 노출 결선', () => {
+  test('GATE-REMOTE-SHARD-PLAN: 183파일 가짜 입력이 조각 계획으로 갈라 원격 명령에 조각 인자가 실린다', async () => {
+    // 동적 import: 베이스(export 없음)에서도 이 파일은 로드되고 이 시험만 빨개진다(RED 증인).
+    const { planRemoteGateShardCommands } = await import('./gate-cli.js');
+    const files = Array.from({ length: 183 }, (_, index) => `src/mod-${String(index).padStart(3, '0')}.ts`);
+    const plan = planRemoteGateShardCommands(files, 4, { planFile: '/repo/shard-plan.json' });
+    expect(plan.orchestrationId).toMatch(/^gate-183-[0-9a-f]{8}$/);
+    expect(plan.shards).toHaveLength(4);
+    expect(plan.commands).toHaveLength(4);
+    expect(plan.shards.flatMap((shard) => shard.files)).toEqual(files);
+    plan.commands.forEach((command, index) => {
+      expect(command[command.indexOf('--orchestration-id') + 1]).toBe(plan.orchestrationId);
+      expect(command[command.indexOf('--shard-id') + 1]).toBe(`${plan.orchestrationId}/shard-${index + 1}`);
+      expect(command[command.indexOf('--shard-position') + 1]).toBe(String(index + 1));
+      expect(command[command.indexOf('--shard-plan') + 1]).toBe('/repo/shard-plan.json');
+      expect(command).toContain('--test');
+    });
   });
 });

@@ -1,9 +1,9 @@
 /** Fenced warm-Pod lease bridge. The Job remains authoritative. */
 import { spawn, spawnSync } from 'node:child_process';
 import { isAbsolute, join } from 'node:path';
-import { constants, closeSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { constants, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
-import { dlopen, read } from 'bun:ffi';
+import { dlopen, read, type Pointer } from 'bun:ffi';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { debug } from '../../debug/log.js';
@@ -165,7 +165,8 @@ const prepareLockLib = process.platform === 'linux' || process.platform === 'dar
     [process.platform === 'linux' ? '__errno_location' : '__error']: { args: [], returns: 'ptr' },
   }) : null;
 const prepareFlock = prepareLockLib?.symbols.flock ?? null;
-const prepareErrno = prepareLockLib?.symbols[process.platform === 'linux' ? '__errno_location' : '__error'];
+const prepareErrnoLocation = prepareLockLib?.symbols[process.platform === 'linux' ? '__errno_location' : '__error'];
+const readPrepareErrno = (): number => (prepareErrnoLocation ? read.i32(prepareErrnoLocation() as Pointer) : -1);
 const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
@@ -190,7 +191,7 @@ async function withPrepareLease<T>(candidate: WarmWorkerCandidate, directory: st
     while (!acquired) {
       if (signal?.aborted) throw new Error('warm prepare lock wait cancelled');
       if (prepareFlock(fd, LOCK_EX | LOCK_NB) === 0) { acquired = true; break; }
-      const errno = prepareErrno ? read.i32(prepareErrno()) : -1;
+      const errno = readPrepareErrno();
       // EWOULDBLOCK/EAGAIN: Linux 11, Darwin 35. EINTR is safe to retry.
       if (errno !== 11 && errno !== 35 && errno !== 4)
         throw new Error(`warm prepare flock failed (errno ${errno})`);
@@ -818,11 +819,16 @@ if (import.meta.main) {
     // Read-only: join the cold CLI legs and the warm gate legs both processes wrote to logs.db.
     try {
       const storeMod = await import('../../mss/logging/log-store.js');
-      const store = storeMod.LogStore.openReadOnly(storeMod.logsDbPath());
-      try { process.stdout.write(JSON.stringify({ warmReuseTimePairs: readWarmReuseTimePairs(store) }) + '\n'); }
-      finally { store.close(); }
-    } catch {
-      process.stdout.write(JSON.stringify({ warmReuseTimePairs: null, reason: 'logs-unavailable' }) + '\n');
+      const dbPath = storeMod.logsDbPath();
+      // No logs.db yet means no leg was ever measured: an empty pair list, not a failed query.
+      if (!existsSync(dbPath)) process.stdout.write(JSON.stringify({ warmReuseTimePairs: [] }) + '\n');
+      else {
+        const store = storeMod.LogStore.openReadOnly(dbPath);
+        try { process.stdout.write(JSON.stringify({ warmReuseTimePairs: readWarmReuseTimePairs(store) }) + '\n'); }
+        finally { store.close(); }
+      }
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ warmReuseTimePairs: null, reason: 'logs-unavailable', detail: String(error) }) + '\n');
       process.exitCode = 2;
     }
   }

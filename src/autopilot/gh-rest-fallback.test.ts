@@ -1,7 +1,14 @@
-import { describe, expect, it, spyOn } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, it, spyOn } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { makePrManager, type CmdResult, type CmdRunner } from './pr-manager.js';
 import { withGhRestFallback } from './gh-rest-fallback.js';
+
+const inheritedTaskCardId = process.env.ELANOUS_TASK_CARD_ID;
+beforeAll(() => { delete process.env.ELANOUS_TASK_CARD_ID; });
+afterAll(() => {
+  if (inheritedTaskCardId === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+  else process.env.ELANOUS_TASK_CARD_ID = inheritedTaskCardId;
+});
 
 const limit = { ok: false, out: '', err: 'GraphQL: API rate limit already exceeded for user ID 19355785.' };
 const url = 'https://github.com/o/r/pull/17';
@@ -112,7 +119,7 @@ describe('GraphQL secondary-limit REST fallback', () => {
     expect(withGhRestFallback(nonLimit.run)('gh', ['pr', 'list', '--head', 'x', '--state', 'open', '--json', 'url', '--jq', '.[0].url // ""'])).toBe(forbidden);
     expect(nonLimit.calls).toHaveLength(1);
     const manager = makePrManager(nonLimit.run);
-    expect(manager.findPrForBranchOutcome('x')).toEqual({ status: 'FAILED', url: null, stderrTail: 'GraphQL: not found' });
+    expect(manager.findPrForBranchOutcome('x')).toEqual({ status: 'FAILED', url: null, stderrTail: 'GraphQL: not found', stdoutTail: 'HTTP 404' });
     expect(nonLimit.calls.filter((call) => call[0] === 'gh' && call[1] === 'api')).toHaveLength(0);
   });
 });

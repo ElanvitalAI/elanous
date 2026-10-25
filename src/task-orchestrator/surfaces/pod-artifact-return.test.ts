@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { LogStore } from '../../mss/logging/log-store.js';
 import { debug } from '../../debug/log.js';
@@ -223,6 +224,28 @@ describe('pod artifact return', () => {
     if (Array.isArray(parsed)) throw new Error('expected incomplete');
     expect(parsed.error.map((e) => e.path)).toEqual(['missing', 'dup', 'bad', 'raw', 'noncanonical', 'conflict', 'huge']);
     expect(parsed.artifacts.map((a) => a.path)).toEqual(['ok']);
+  });
+
+  test('salvage bundles bypass the ordinary 5 MB file and 20 MB aggregate artifact limits', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-artifacts-'));
+    const bundlePath = 'pod-salvage/worktree.bundle';
+    const bytes = randomBytes(5 * 1024 * 1024 + 17);
+    try {
+      collectPodArtifacts(transfer(bundlePath, bytes).join('\n'), { dir, job: 'si-job' });
+      expect(readFileSync(join(dir, 'si-job', bundlePath))).toEqual(bytes);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a returned bundle does not consume the ordinary artifact budget', () => {
+    const bundle = transfer('pod-salvage/worktree.bundle', Buffer.alloc(21 * 1024 * 1024));
+    const log = transfer('pod-logs/logs.jsonl', Buffer.from('diagnostic'));
+    const parsed = parsePodArtifactChunks([...bundle, ...log].join('\n'));
+    expect(Array.isArray(parsed)).toBe(true);
+    if (!Array.isArray(parsed)) throw new Error(JSON.stringify(parsed.error));
+    expect(parsed.map(({ path, bytes }) => [path, bytes.length])).toEqual([
+      ['pod-salvage/worktree.bundle', 21 * 1024 * 1024],
+      ['pod-logs/logs.jsonl', 10],
+    ]);
   });
 
   test('host limits decompressed files to 5 MB each and all files to 20 MB', () => {

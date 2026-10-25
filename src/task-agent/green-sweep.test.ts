@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { ChecklistItem } from '../release-loop/checklist.js';
 import type { TaskCard } from './task-hand.js';
-import { ambiguousGreenSweepPrs, appendGreenSweepEvidence, decideGreenSweep, explicitEvidencePrs, greenSweepCandidates, observeGreenSweep } from './green-sweep.js';
+import { ambiguousGreenSweepPrs, appendGreenSweepEvidence, applyGreenSweepDecisions, decideGreenSweep, explicitEvidencePrs, greenSweepCandidates, greenSweepEvidenceTestArgs, observeGreenSweep } from './green-sweep.js';
 
 const sha = 'a'.repeat(40);
 const url = 'https://github.com/example/repo/pull/123';
@@ -92,6 +92,19 @@ describe('GREEN-FROM-LEDGER pure decision', () => {
       candidate: greenSweepCandidates(secondVerification, '0.2.28', [])[0]!,
       candidateCount: 1, pr: merged, ancestor: true, hold: false, repositoryMatches: true }))
       .toMatchObject({ verdict: 'record-only', reason: 'remaining-or-multiple-piece-evidence' });
+  });
+
+  test('one evidence line can land A while explicitly deferring a different PR B', () => {
+    expect(explicitEvidencePrs('PR #31013 착지 merge abc123 · PR #31025 미착지')).toEqual([31013]);
+    expect(explicitEvidencePrs('PR #31013 merged abc123 · C2 아직 미착지')).toEqual([31013]);
+    expect(explicitEvidencePrs('PR #31013 착지 예정 · PR #31025 미착지')).toEqual([]);
+    expect(explicitEvidencePrs('PR #31013 착지 · PR #31013 미착지')).toEqual([]);
+    expect(explicitEvidencePrs('PR #31013 미착지\nPR #31013 착지')).toEqual([]);
+    expect(explicitEvidencePrs('PR #31013 착지, PR #31025 미착지')).toEqual([31013]);
+    expect(explicitEvidencePrs('PR #31013 착지 · S3 업로드 실패')).toEqual([]);
+    expect(explicitEvidencePrs('PR #31013 착지 · 다른 PR 대기')).toEqual([]);
+    expect(greenSweepCandidates(cell({ evidence: 'PR #31013 착지 merge abc123 · PR #31025 미착지' }), '0.2.37', []))
+      .toMatchObject([{ cell: 'CELL', pr: 31013, source: 'evidence' }]);
   });
 
   test('card PR alone can recover a hand landing; unknown version and duplicate binding stay yellow', () => {
@@ -224,5 +237,56 @@ describe('GREEN-FROM-LEDGER pure decision', () => {
     ]) observeGreenSweep(decideGreenSweep({ item, candidate, candidateCount: 1, ...input }), log);
     expect(rows.map((row) => row.event)).toEqual(['green', 'skip', 'skip']);
     expect(rows[0]?.data).toEqual({ cell: 'CELL', pr: 123, mergeSha: sha, reason: 'bound-card-complete' });
+  });
+});
+
+describe('GREEN-SWEEP-LIVE-WRITE', () => {
+  test('extracts only an explicit bun test command without shell interpretation', () => {
+    expect(greenSweepEvidenceTestArgs('대상 경로: src/a.ts\n- 완료 경계 증거 명령: bun test src/a.test.ts src/b.test.ts'))
+      .toEqual(['src/a.test.ts', 'src/b.test.ts']);
+    expect(greenSweepEvidenceTestArgs('완료 경계 증거 명령: bun test src/a.test.ts && rm -rf /tmp/x')).toBeNull();
+    expect(greenSweepEvidenceTestArgs('완료 경계 증거 명령: npm test')).toBeNull();
+    expect(greenSweepEvidenceTestArgs('완료 경계 증거 명령: bun test ../outside.test.ts')).toBeNull();
+  });
+
+  test('writes only green decisions and snapshot-guards while preserving existing evidence', () => {
+    const item = cell({ evidence: 'prior operator note' });
+    const candidate = greenSweepCandidates(item, '0.2.37', [card({ checklistVersion: '0.2.37' })])[0]!;
+    const decision = decideGreenSweep({ item, candidate, candidateCount: 1, pr: merged,
+      ancestor: true, hold: false, repositoryMatches: true });
+    const writes: unknown[] = [];
+
+    const result = applyGreenSweepDecisions('0.2.37', [decision], [item], new Set(['CELL']), (...args) => writes.push(args));
+
+    expect(decision.verdict).toBe('green');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toEqual(['0.2.37', 'CELL', { status: 'green', evidence: decision.plannedEvidence },
+      'tasks-green-sweep', { title: item.title, status: 'yellow', evidence: 'prior operator note' }]);
+    expect(result).toEqual([{ cell: 'CELL', written: true }]);
+    expect(decision.plannedEvidence).toContain('prior operator note');
+  });
+
+  test('HOLD and any non-green decision remain yellow and never write', () => {
+    const item = cell({ evidence: 'prior operator context' });
+    const candidate = greenSweepCandidates(item, '0.2.37', [card({ checklistVersion: '0.2.37' })])[0]!;
+    const hold = decideGreenSweep({ item, candidate, candidateCount: 1, pr: merged,
+      ancestor: true, hold: true, repositoryMatches: true });
+    const incomplete = decideGreenSweep({ item, candidate, candidateCount: 1, pr: merged,
+      ancestor: null, hold: false, repositoryMatches: true });
+    const writes: unknown[] = [];
+
+    const e2Missing = decideGreenSweep({ item, candidate, candidateCount: 1, pr: merged,
+      ancestor: true, hold: false, repositoryMatches: true });
+    const result = applyGreenSweepDecisions('0.2.37', [hold, incomplete, e2Missing], [item], new Set(), (...args) => writes.push(args));
+
+    expect(hold.verdict).toBe('skip');
+    expect(incomplete.verdict).toBe('record-only');
+    expect(e2Missing.verdict).toBe('green');
+    expect(writes).toEqual([]);
+    expect(result).toEqual([{ cell: 'CELL', written: false, reason: 'verdict-skip' },
+      { cell: 'CELL', written: false, reason: 'verdict-record-only' },
+      { cell: 'CELL', written: false, reason: 'main-evidence-not-passed' }]);
+    expect(item.status).toBe('yellow');
+    expect(item.evidence).toBe('prior operator context');
   });
 });

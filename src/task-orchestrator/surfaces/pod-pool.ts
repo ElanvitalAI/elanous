@@ -243,14 +243,27 @@ export function podWorkLabels(identity: PodWorkIdentity): Record<string, string>
   };
 }
 
-/** Minih standard-Job policy, independent of the configured pool member capacity. Not wired into allocation. */
+/**
+ * MINIH-MODE (0.2.37) — where this pool's standard Jobs run: `home` (1 standard Job) or `external` (2).
+ * The location is declared explicitly by the launch (`minihLocationFrom` reads `ELANOUS_MINIH_LOCATION`); when it
+ * is absent the configured member capacities decide, exactly as before.
+ */
 export type MinihLocation = 'home' | 'external';
+
+/** The declared location for a launch: `home` / `external` only. Absent, empty or unknown → null (configured capacity). */
+export function minihLocationFrom(value: string | undefined | null): MinihLocation | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized === 'home' || normalized === 'external' ? normalized : null;
+}
 
 export function minihStandardCapacity(location: MinihLocation): number {
   return location === 'home' ? 1 : 2;
 }
 
-/** A drain withholds new slots until occupancy falls to the target; it never evicts Running Pods. */
+/**
+ * A drain withholds new slots until occupancy falls to the target; it never evicts Running Pods.
+ * `PodPoolScheduler.tryAcquire` applies this to new standard-Job admission when a location is declared.
+ */
 export function decideMinihDrain(location: MinihLocation, runningPods: number, pendingPods = 0): {
   capacity: number;
   runningPods: number;
@@ -583,6 +596,26 @@ export class PodPoolScheduler {
       waiting: snapshots.flatMap((item) => item.waiting) };
   }
   /**
+   * MINIH-MODE — withhold NEW standard-Job admission while the declared location has no free standard slot.
+   * Occupancy = the measured node-c Pods (Running ⊕ Pending; a Pending Pod already holds a slot) ⊕ this process's
+   * node-c inflight slots. Nothing here deletes, evicts or re-schedules a Pod: an excess above the location's capacity
+   * leaves only as those Pods finish, and until then new admissions wait. `lite` Jobs are not the standard
+   * admission this policy gates, and no declared location keeps the configured member capacities.
+   */
+  private minihHold(kind: PodPlacementKind | null, location: MinihLocation | null, reading: Record<string, MemberOccupancy>): { capacity: number; occupied: number; draining: boolean } | null {
+    if (!location || kind === 'lite') return null;
+    // A launch pool can contain node-b and WSL beside node-c. Their Pods do not occupy node-c's physical slots.
+    const minihMembers = this.members.filter((m) => m.capacity > 0 && (m.sshHost === 'node-c' || m.context === 'pool-node-c'));
+    if (minihMembers.length === 0) return null;
+    // Lite Jobs also hold a physical node-c slot while running, even though this policy never blocks their admission.
+    const inflight = minihMembers.reduce((count, m) => count + (this.inflight.get(m.context) ?? 0), 0);
+    // The measurement reports Running and Pending as one occupied count, and decideMinihDrain judges only their sum.
+    const occupied = minihMembers
+      .reduce((count, m) => count + (reading[m.context]?.occupied ?? 0), inflight);
+    const decision = decideMinihDrain(location, occupied);
+    return decision.availableSlots > 0 ? null : { capacity: decision.capacity, occupied, draining: decision.drainNewAdmissions };
+  }
+  /**
    * Pick the member with the largest free share: (capacity − measured cluster occupancy − this process's inflight) / capacity.
    * POOL-SPREAD (10-06): comparing absolute free slots always picked the big member (node-b 25 vs node-c 4), so the small
    * member idled until the big one was full. Comparing the free share fills members in proportion to their capacity.
@@ -593,9 +626,10 @@ export class PodPoolScheduler {
    * member the 0.2.15 gate launched its shards one at a time.
    * Ties keep the configured member order. Returns null when every readable member is full.
    */
-  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean; kind?: PodPlacementKind | null; onPlacement?: (placement: PodPlacement) => void; signal?: AbortSignal } = {}): Promise<PodPoolMember | null> {
+  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean; kind?: PodPlacementKind | null; /** MINIH-MODE: a declared location gates new standard-Job admission (home 1 · external 2). */ minihLocation?: MinihLocation | null; onPlacement?: (placement: PodPlacement) => void; signal?: AbortSignal } = {}): Promise<PodPoolMember | null> {
     const selfCapped = mode.selfCapped === true;
     const kind = mode.kind ?? null;
+    const minihLocation = mode.minihLocation ?? null;
     // POOL-LITE: lite goals try the small member first, implementation goals the big one; full → overflow by free share.
     const preferred = new Set(preferredMembers(this.members, kind));
     let reading: Record<string, MemberOccupancy>;
@@ -608,6 +642,9 @@ export class PodPoolScheduler {
     }
     // A caller may abandon a slow occupancy read. Never acquire its lease after cancellation.
     if (mode.signal?.aborted) throw mode.signal.reason ?? new Error('pod pool acquisition aborted');
+    // MINIH-MODE: only node-c candidates are held. Other pool members retain their own configured capacity.
+    // Running/Pending Pods already in the pool stay exactly as they are.
+    const minihHeld = this.minihHold(kind, minihLocation, reading);
     const free: Record<string, number> = {};
     const measured: Record<string, boolean> = {};
     let best: { member: PodPoolMember; slots: number; measured: boolean; preferred: boolean } | null = null;
@@ -621,6 +658,10 @@ export class PodPoolScheduler {
     for (const m of this.members) {
       // A capacity-0 member is off — never chosen (and no division by zero in the share).
       if (m.capacity <= 0) continue;
+      if (minihHeld && (m.sshHost === 'node-c' || m.context === 'pool-node-c')) {
+        free[m.context] = 0;
+        continue;
+      }
       // LAUNCH-STALL: a member this launch cannot fit is skipped for this call only (other launches may fit it).
       if (skip?.has(m.context)) continue;
       const inflight = this.inflight.get(m.context) ?? 0;
@@ -635,7 +676,12 @@ export class PodPoolScheduler {
       if (better(cand)) best = cand;
     }
     if (!best) {
-      onEmpty?.(`no free slot · free=${JSON.stringify(free)} · measured=${JSON.stringify(measured)}${selfCapped ? ' · selfCapped' : ''}${skip?.size ? ` · skipped=${[...skip].join(',')}` : ''}${kind ? ` · kind=${kind}` : ''}`);
+      if (minihHeld) {
+        const reason = `node-c 드레인: ${minihLocation} 표준 상한 ${minihHeld.capacity} · 점유 ${minihHeld.occupied}${minihHeld.draining
+          ? ' — 초과분이 빠질 때까지 새 입장 보류(기존 Pod 유지)' : ' — 상한이 찼다'}`;
+        debug.log('pod.pool', 'node-c-drain-hold', { location: minihLocation, capacity: minihHeld.capacity, occupied: minihHeld.occupied, draining: minihHeld.draining, kind });
+        onEmpty?.(reason);
+      } else onEmpty?.(`no free slot · free=${JSON.stringify(free)} · measured=${JSON.stringify(measured)}${selfCapped ? ' · selfCapped' : ''}${skip?.size ? ` · skipped=${[...skip].join(',')}` : ''}${kind ? ` · kind=${kind}` : ''}`);
       return null;
     }
     const chosen: { member: PodPoolMember; slots: number; measured: boolean; preferred: boolean } = best;

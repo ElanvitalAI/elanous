@@ -45,7 +45,7 @@ import { addSelfDevRunParticipant, processBirthId, saveSelfDevRun } from './run-
 import { getUserConfig, resolveRoleLlm, type RoleLlmSource } from '../user-config.js';
 import { applyGlmCredentialFallback, GlmChildCredentialError } from './glm-credential-guard.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
-import { getProvider, inferProviderFromModel } from '../llm.js';
+import { getProvider, getProviderForConfig, inferProviderFromModel } from '../llm.js';
 import { buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback, reviewFallbackModelsFromConfig, runSubscriptionReviewer, type SubscriptionReviewerDeps } from './review-provider-fallback.js';
 import { loadLlmPolicy, resolveSubscriptionReviewer } from '../policy/llm-policy.js';
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
@@ -1126,12 +1126,34 @@ export async function buildDefaultSelfImplementSeams(
   //   ⛔ 쿼터 폴백(`DEFAULT_FALLBACK_CHAIN`)과 «다른 축»이다 — 그 자는 「계정이 남았나」를 본다.
   //   ⭐ 첫 시도 성공이면 종전과 «완전히 동일»하다(관측 한 줄만 는다).
   const reviewFallbackModels = reviewFallbackModelsFromConfig();
-  const reviewAttemptForModel = (model: string, label: string) => ({
-    model,
-    provider: inferProviderFromModel(model) ? getProvider(model) : undefined,
-    label,
-  });
-  const primaryReviewAttempt = reviewAttemptForModel(reviewModel, 'primary');
+  const reviewAttemptForModel = (model: string, label: string, configuredProvider?: string) => {
+    // GLM's historical alias and both OpenRouter spellings identify the same model even when
+    // a Pod/default role carries no provider source. Resolve the provider from the canonical ID.
+    const normalizedInput = model.trim().toLowerCase();
+    const isGlm53 = normalizedInput === 'glm-5.3'
+      || normalizedInput === 'z-ai/glm-5.3'
+      || normalizedInput === 'openrouter/z-ai/glm-5.3';
+    const normalizedModel = isGlm53
+      ? 'openrouter/z-ai/glm-5.3'
+      : configuredProvider === 'openrouter' && !model.startsWith('openrouter/') ? `openrouter/${model}` : model;
+    const routeProvider = normalizedModel === 'openrouter/z-ai/glm-5.3' ? 'openrouter' : configuredProvider;
+    let provider: ReturnType<typeof getProvider> | undefined;
+    try {
+      if (routeProvider) {
+        const config = getUserConfig();
+        provider = getProviderForConfig({ ...config, llm: { ...config.llm, provider: routeProvider as typeof config.llm.provider } }, normalizedModel);
+      } else if (inferProviderFromModel(normalizedModel)) {
+        provider = getProvider(normalizedModel);
+      }
+    } catch {
+      // An unavailable or unsupported configured primary must not prevent the existing fallback attempt.
+    }
+    return { model: normalizedModel, provider, label };
+  };
+  const primaryProviderIsPinned = reviewRole.source === 'flag' || reviewRole.source === 'config-role'
+    || reviewRole.source === 'environment';
+  const configuredPrimaryProvider = primaryProviderIsPinned ? reviewRole.provider : undefined;
+  const primaryReviewAttempt = reviewAttemptForModel(reviewModel, 'primary', configuredPrimaryProvider);
   const reviewAttempts = buildReviewProviderAttempts(
     primaryReviewAttempt,
     [...reviewFallbackModels, defaultReviewFallbackModel(primaryReviewAttempt.provider?.name)]

@@ -482,6 +482,14 @@ test('추가된 PR 참조를 기존 known-issue 게이트와 내보내기에서 
   expect(features.exportJson('0.2.9').items[0]?.evidence).toBe('#123\n#321');
 });
 
+test('knownIssue 는 원장·체크리스트 gate·JSON 왕복에서 제목과 별도 보존된다', () => {
+  setup(); fixture('0.2.9');
+  setItem('0.2.9', 'L13e', { disposition: 'known-issue', knownIssue: 'Exports can time out.' }, 'OP');
+  expect(listChecklist('0.2.9').items[0]).toMatchObject({ title: '같은 제목', knownIssue: 'Exports can time out.' });
+  expect(checklistGate('0.2.9').knownIssues).toEqual([{ id: 'L13e', title: '같은 제목', evidence: '#123', knownIssue: 'Exports can time out.' }]);
+  expect(features.exportJson('0.2.9').items[0]).toMatchObject({ title: '같은 제목', knownIssue: 'Exports can time out.' });
+});
+
 test('삭제 후 같은 ID·판 재추가에는 삭제한 수명의 근거 참조가 되살아나지 않는다', () => {
   setup(); fixture('0.2.9');
   features.evidenceAdd('L13e', '0.2.9', '#old', 'OP');

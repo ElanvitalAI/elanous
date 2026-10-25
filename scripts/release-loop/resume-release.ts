@@ -3,8 +3,8 @@
 // every later node reads the repaired commit without anyone hand-editing the run state.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { constants, copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { accessSync, closeSync, constants, copyFileSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { lastJsonObject, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
@@ -15,6 +15,8 @@ import { changedFilesBetween, clearPartialPlan, planPartialRegate, planStalledSh
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
+import { releaseLoopConfig } from './unattended-release.js';
+import { trafficOptionsFromConfig } from './traffic-transition.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
@@ -37,6 +39,8 @@ export interface ResumeReleaseDeps {
   closureTree?: (commit: string) => ClosureTree;
   /** Source observation before the first resumed node. */
   onSource?: (line: string) => void;
+  /** Test seam; production resolves this from ELANOUS_RELEASE_TRAFFIC_FILE / release.loop.trafficFile. */
+  trafficFile?: string;
 }
 
 export interface ResumeReleaseOptions {
@@ -80,7 +84,7 @@ function safeRunId(runId: string): string {
   return runId;
 }
 
-/** Point the saved version-release output at the current release/<v> tip (fast-forward of the recorded commit only). */
+/** Lower-level maintenance primitive; the resume entrypoints run verifyResumePreflight before calling it. */
 export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps = {}, from?: string, waiverCommit?: string): TipRefresh {
   return refreshReleaseBranchTipInternal(runId, deps, from, waiverCommit, false);
 }
@@ -128,7 +132,7 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   }
   // A repair only appends (`cut-branch --append`): anything but a fast-forward is a different release.
   if (!(deps.isAncestor ?? ancestorRunner(deps.repo ?? process.cwd()))(recorded, to)) {
-    throw new Error(`${branch} tip ${to} does not descend from the recorded release commit ${recorded} — refusing to resume`);
+    throw new Error(`${branch} tip ${to} does not descend from the recorded release commit ${recorded} — refusing to resume; remedy: inspect both commits and create a new release run from the intended pinned tip`);
   }
   // A new tip invalidates everything built from the old one (gate verdict, prepared archive, …): restart no later
   // than the first node that consumed the commit, so each of them runs again on the new tip.
@@ -171,6 +175,110 @@ function verifyResumeRecipePin(commandRoot: string, snapshot: GraphRunState['gra
     }
     if (!mismatches.length) throw error;
     throw new Error(`release recipe source differs from saved pin: ${mismatches.join('; ')}\nremedy: start a new pinned run with eln release run --version ${version}`, { cause: error });
+  }
+}
+
+/** Common read-only gate for dry-run and actual resume. Every rejection includes an operator action. */
+function verifyResumePreflight(run: GraphRunState, opts: ResumeReleaseOptions, deps: ResumeReleaseDeps,
+  version: string, recordedCommit: string, currentTip: string, commandRoot: string): void {
+  let trafficFile = deps.trafficFile;
+  if (trafficFile === undefined) {
+    try { trafficFile = trafficOptionsFromConfig(process.env, releaseLoopConfig()).trafficFile; }
+    catch (error) { throw new Error(`cannot read release traffic configuration — remedy: repair release.loop.trafficFile in the active config before resuming`, { cause: error }); }
+  }
+  if (!trafficFile) throw new Error('release.loop.trafficFile is not configured — remedy: set release.loop.trafficFile or ELANOUS_RELEASE_TRAFFIC_FILE before resuming');
+  let fd: number | undefined;
+  try {
+    const path = resolve(trafficFile);
+    const info = statSync(path);
+    if (!info.isFile() || (info.mode & 0o222) === 0) throw new Error('not a writable regular file');
+    fd = openSync(path, constants.O_WRONLY);
+    if (!fstatSync(fd).isFile()) throw new Error('not a regular file');
+    accessSync(path, constants.R_OK | constants.W_OK);
+  } catch (error) {
+    throw new Error(`release traffic file is missing or not writable: ${trafficFile} (${error instanceof Error ? error.message : String(error)}) — remedy: create a regular writable traffic file and set release.loop.trafficFile`, { cause: error });
+  } finally { if (fd !== undefined) closeSync(fd); }
+
+  for (const path of [join(commandRoot, 'node_modules'), join(commandRoot, 'apps', 'pwa', 'node_modules')]) {
+    try { if (!statSync(path).isDirectory()) throw new Error('not a directory'); }
+    catch (error) { throw new Error(`release resume dependencies missing: ${path} — remedy: run bun install --frozen-lockfile at repository root and apps/pwa`, { cause: error }); }
+  }
+
+  const nodeOutput = (nodeId: string): Record<string, unknown> | undefined => {
+    const node = run.nodes.find((entry) => entry.nodeId === nodeId);
+    if (!node?.ok || typeof node.output !== 'string') return undefined;
+    try { return lastJsonObject(node.output) as Record<string, unknown> | undefined; } catch { return undefined; }
+  };
+  const recordedNodeOutput = (nodeId: string): Record<string, unknown> | undefined => {
+    const node = run.nodes.find((entry) => entry.nodeId === nodeId);
+    if (typeof node?.output !== 'string') return undefined;
+    try { return lastJsonObject(node.output) as Record<string, unknown> | undefined; } catch { return undefined; }
+  };
+  const roots = [...new Set([deps.root ?? effectiveInstanceRoot(), deps.ledgerRoot ?? releaseLedgerRoot()])];
+  for (const root of roots) {
+    const prepared = join(root, 'release', version, 'prepared');
+    if (existsSync(prepared)) {
+      const record = nodeOutput('prepare');
+      const output = record && typeof record.out === 'string' ? record : undefined;
+      const manifestPath = join(prepared, 'release.json');
+      let manifest: { version?: unknown; sourceCommit?: unknown } | undefined;
+      try { manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as typeof manifest; } catch { /* fail closed below */ }
+      const ownerPath = join(prepared, '.release-node-owner.json');
+      let owner: { runId?: unknown; commit?: unknown } | undefined;
+      let ownerReadable = !existsSync(ownerPath);
+      try { owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as typeof owner; ownerReadable = true; } catch { /* old artifacts can be owned by the run ledger */ }
+      const ledgerOwns = output?.out === prepared && output.commit === currentTip && output.outcome === 'ok';
+      const receiptOwns = owner ? owner.runId === opts.runId && owner.commit === currentTip : ownerReadable && ledgerOwns;
+      if (!ledgerOwns || manifest?.version !== version || manifest.sourceCommit !== currentTip || !receiptOwns) {
+        throw new Error(`prepared artifact is outside the current release run ledger: ${prepared} — remedy: preserve it, compare release.json and .release-node-owner.json with run ${opts.runId}, then resolve ownership before resume`);
+      }
+    }
+
+    const receiptPath = join(root, 'release', version, 'docs-branch-owner.json');
+    const docsBranch = `release-docs/${version}`;
+    let receipt: { owner?: { runId?: unknown; attempt?: unknown }; branch?: unknown; worktree?: unknown; outcome?: unknown; head?: unknown } | undefined;
+    try { receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) as typeof receipt; } catch { /* no/invalid receipt is rejected if an artifact exists */ }
+    const docsRecord = recordedNodeOutput('docs');
+    const worktree = typeof docsRecord?.worktree === 'string' ? docsRecord.worktree : undefined;
+    let localBranch: string | undefined;
+    try { localBranch = (deps.git ?? gitRunner(deps.repo ?? process.cwd()))(['show-ref', '--verify', '--hash', `refs/heads/${docsBranch}`]).trim(); } catch { /* absent */ }
+    let docsWorktrees: string[] = [];
+    try {
+      const listing = (deps.git ?? gitRunner(deps.repo ?? process.cwd()))(['worktree', 'list', '--porcelain']);
+      docsWorktrees = listing.split(/\n\n+/).filter(Boolean).flatMap((entry) => {
+        const branch = /^branch (.+)$/m.exec(entry)?.[1];
+        const path = /^worktree (.+)$/m.exec(entry)?.[1];
+        return branch === `refs/heads/${docsBranch}` && path ? [path] : [];
+      });
+    } catch (error) {
+      throw new Error(`cannot inspect release worktrees for ${docsBranch} — remedy: restore read-only git access and retry resume`, { cause: error });
+    }
+    let remoteHead: string | undefined;
+    try {
+      const response = (deps.git ?? gitRunner(deps.repo ?? process.cwd()))(['ls-remote', '--heads', 'origin', `refs/heads/${docsBranch}`]);
+      const line = response.split(/\r?\n/).find((candidate) => candidate.trim().endsWith(`refs/heads/${docsBranch}`));
+      remoteHead = line?.trim().split(/\s+/)[0];
+    } catch (error) {
+      throw new Error(`cannot inspect docs branch ${docsBranch} — remedy: restore read-only git access and retry resume`, { cause: error });
+    }
+    const hasDocsArtifact = existsSync(receiptPath) || !!localBranch || !!remoteHead || docsWorktrees.length > 0;
+    const outputOwner = docsRecord?.artifactOwner as { runId?: unknown; attempt?: unknown } | undefined;
+    const receiptMatches = receipt?.branch === docsBranch && receipt.owner?.runId === opts.runId
+      && receipt.owner.attempt === outputOwner?.attempt && outputOwner?.runId === opts.runId
+      && typeof receipt.worktree === 'string' && worktree === receipt.worktree && docsWorktrees.includes(receipt.worktree)
+      && existsSync(receipt.worktree);
+    if (hasDocsArtifact && !receiptMatches) {
+      throw new Error(`docs branch/worktree is outside the current release run ledger: ${docsBranch} — remedy: compare ${receiptPath} with the saved docs node output and resolve ownership before resume`);
+    }
+    if (receipt?.outcome === 'pushed' && (!/^[0-9a-f]{40}$/i.test(String(receipt.head ?? ''))
+      || remoteHead?.toLowerCase() !== String(receipt.head).toLowerCase())) {
+      throw new Error(`docs branch tip differs from the saved ownership receipt: ${docsBranch} — remedy: preserve the branch and worktree, compare the remote tip with ${receiptPath} and the saved docs node output, then resolve ownership before resume`);
+    }
+  }
+
+  const recorded = nodeOutput('version-release');
+  if (recorded?.branch !== `release/${version}` || recorded.commit !== recordedCommit || !/^[0-9a-f]{40}$/i.test(currentTip)) {
+    throw new Error(`release branch tip does not match the saved version-release ledger for ${version} — remedy: inspect the branch and saved run ${opts.runId}, then resume from a node before gate only after resolving the mismatch`);
   }
 }
 
@@ -355,6 +463,7 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
   verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, tip.version);
   const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), tip.to, deps.git);
+  verifyResumePreflight(savedRun, opts, deps, tip.version, tip.from, tip.to, commandRoot);
   const partial = preparePartial(tip, opts, deps, true);
   const fromIndex = savedRun.path.indexOf(opts.from);
   const gateIndex = savedRun.path.indexOf('gate');
@@ -410,6 +519,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   const previewTip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
   verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, previewTip.version);
   const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), previewTip.to, deps.git);
+  verifyResumePreflight(savedRun, opts, deps, previewTip.version, previewTip.from, previewTip.to, commandRoot);
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, false, previewTip.to);
   const partial = preparePartial(tip, opts, deps);
   // A failed preflight does not consume an observed release resume attempt.

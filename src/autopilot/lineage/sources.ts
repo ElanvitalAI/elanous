@@ -30,7 +30,7 @@ export function harnessRunsToLineage(entries: readonly RunLedgerTimelineEntry[])
     store: 'observation' as const,
     at: entry.executedAt,
     seq: entry.pieceIndex,
-    summary: `self-implement run ${entry.runId}${entry.orchestrationId ? ` · orchestration ${entry.orchestrationId}` : ''}${entry.shardId ? ` · shard ${entry.shardId}` : ''}${entry.pieceTotal !== undefined ? ` · ${entry.pieceTotal} pieces` : ''}`,
+    summary: `self-implement run ${entry.runId}${entry.orchestrationId ? ` · orchestration ${entry.orchestrationId}` : ''}${entry.shardId ? ` · shard ${entry.shardId}` : ''}${entry.pieceTotal !== undefined ? ` · ${entry.pieceTotal} pieces` : ''}${entry.unitVisits?.orphanCount ? ` · graph.unit orphan ${entry.unitVisits.orphanCount}` : ''}`,
   }));
 }
 

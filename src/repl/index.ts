@@ -211,6 +211,14 @@ function buildReplTools(): {
         searchPlannerState: planner,
         turnIndex: undefined,
         ptyDashboardOn: false,
+        // Match the CLI agent path: native Agent fallback needs the parent's
+        // catalog and dispatcher so children can actually use inherited tools.
+        agentHostTools: specs,
+        agentDispatchTool: dispatch,
+        buildChildToolCatalog: (childCwd: string) => {
+          const cli = require('../cli/agent-cli.js') as typeof import('../cli/agent-cli.js');
+          return cli.buildCliAgentTools(undefined, undefined, childCwd);
+        },
         getToolRuntime: () => undefined,
         dispatchToolRuntime: async (n) => ({ error: `runtime unavailable in REPL: ${n}` }),
         dispatchPluginTool: async (n) => ({ ok: false as const, error: `plugin unavailable in REPL: ${n}` }),

@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { addItem, setItem, listChecklist } from '../../release-loop/checklist.js';
@@ -13,10 +13,16 @@ import { parse as parseYaml } from 'yaml';
 import { CardStore } from '../../task-cards/card-store.js';
 import { buildUserConfig, resetUserConfig } from '../../user-config.js';
 import { isLaunchEligible, nextOrchestratorWindowAt, readCompletionHeartbeat, reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
+import { AnomalyCluster } from './anomaly-cluster.js';
 import { openMsgStore } from '../../msg/msg-store.js';
 import { checkLoopNeighbors, SEAT_NEIGHBORS } from '../neighbor-runtime.js';
 import { handleSeatRequests } from '../../nexus/api/seat-requests.js';
 import { CliUserError } from '../../cli/cli-user-error.js';
+
+let realHandTask: NonNullable<TickDeps['handTask']>;
+beforeAll(async () => {
+  ({ handTask: realHandTask } = await import('../../task-agent/task-hand.js'));
+}, 30_000);
 
 describe('isLaunchEligible (dispatch-c decision seam)', () => {
   const supply = { id: 'C1', title: '칸', owner: 'MK', status: 'yellow' as const };
@@ -1423,10 +1429,10 @@ const shadowPlaced = async (root: string, runId: string) => {
   await runOrchestratorNode('intake', base);
   await runOrchestratorNode('split', { ...base, split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }] });
   await runOrchestratorNode('place', { ...base, loadAdapter: async () => undefined });
-  return async (handTask: TickDeps['handTask']) => {
+  return async (handTask: TickDeps['handTask'], extra: Partial<TickDeps> = {}) => {
     const statePath = join(root, 'loop', 'orchestrator', `${runId}.json`);
     if (existsSync(statePath)) { const saved = JSON.parse(readFileSync(statePath, 'utf8')); delete saved.nodes.delegate; writeFileSync(statePath, JSON.stringify(saved)); }
-    return runOrchestratorNode('delegate', { ...base, handToTaskAgent: 'shadow', handToTaskAgentCell: 'C1', handTask });
+    return runOrchestratorNode('delegate', { ...base, handToTaskAgent: 'shadow', handToTaskAgentCell: 'C1', handTask, ...extra });
   };
 };
 const agentCards = (root: string) => {
@@ -1437,7 +1443,6 @@ const agentCards = (root: string) => {
 
 test('ORCH-TA-HAND: a shadow hand that fails before its card releases the claim and the next tick writes exactly one real card', async () => fixture(async (root) => {
   const delegate = await shadowPlaced(root, 'rel08');
-  const { handTask: realHandTask } = await import('../../task-agent/task-hand.js');
   let calls = 0;
   const handTask: TickDeps['handTask'] = async (opts) => { calls++; if (calls === 1) throw new Error('card store busy'); return realHandTask(opts); };
   expect((await delegate(handTask)).handed).toBeUndefined();
@@ -1451,7 +1456,6 @@ test('ORCH-TA-HAND: a shadow hand that fails before its card releases the claim 
 
 test('ORCH-TA-HAND: a released shadow claim is retried by the next run (a different runId), and a malformed task store keeps the claim', async () => fixture(async (root) => {
   const delegate = await shadowPlaced(root, 'next08a');
-  const { handTask: realHandTask } = await import('../../task-agent/task-hand.js');
   let calls = 0;
   const handTask: TickDeps['handTask'] = async (opts) => { calls++; if (calls === 1) throw new Error('card store busy'); return realHandTask(opts); };
   await delegate(handTask);
@@ -1478,7 +1482,6 @@ test('ORCH-TA-HAND: a malformed task store never reads as «no card» — the fa
 
 test('ORCH-TA-HAND: a shadow hand that fails after writing its card keeps the claim — no second card', async () => fixture(async (root) => {
   const delegate = await shadowPlaced(root, 'keep08');
-  const { handTask: realHandTask } = await import('../../task-agent/task-hand.js');
   let calls = 0;
   const handTask: TickDeps['handTask'] = async (opts) => { calls++; await realHandTask(opts); throw new Error('after the card'); };
   await delegate(handTask);
@@ -1486,6 +1489,41 @@ test('ORCH-TA-HAND: a shadow hand that fails after writing its card keeps the cl
   expect(calls).toBe(1);
   expect(agentCards(root)).toHaveLength(1);
   expect(ledgerRows(root).map(row => row.status)).toEqual(['claimed']);
+}));
+
+// ANOMALY-CLUSTER: the delegate node is the record point and the hold gate — three runs of one signature hold the
+// goal·host relaunch, and a cause verdict clears it so the same production path hands again.
+test('ANOMALY-CLUSTER: 2 same-signature runs hand, a 3rd arms the hold, the next run is deferred, and a cause verdict resumes the hand', async () => fixture(async (root) => {
+  const cluster = new AnomalyCluster();
+  const events: string[] = [];
+  let hands = 0;
+  const failing: TickDeps['handTask'] = async () => { hands++; throw new Error('card store busy'); };
+  const delegate = await shadowPlaced(root, 'ac08a');
+  const first = await delegate(failing, { anomalyCluster: cluster, observe: (tag: string) => { events.push(tag); } });
+  expect(hands).toBe(1);
+  expect(first.deferredCells ?? []).toHaveLength(0);
+  const placed = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'ac08a.json'), 'utf8'));
+  const goal = placed.cells[0].cardId as string;
+  expect(cluster.hold(goal, 'MK').hold).toBe(false);
+  const delegateAt = async (runId: string, handTask: TickDeps['handTask']) => {
+    writeFileSync(join(root, 'loop', 'orchestrator', `${runId}.json`), JSON.stringify({ ...placed, runId, nodes: { intake: 'ok', split: 'ok', place: 'ok' } }));
+    return runOrchestratorNode('delegate', { root, runId, window: '08', mode: 'shadow', now: new Date('2026-10-04T00:00:00Z'),
+      print: () => {}, observe: (tag: string) => { events.push(tag); },
+      handToTaskAgent: 'shadow', handToTaskAgentCell: 'C1', handTask, anomalyCluster: cluster });
+  };
+  await delegateAt('ac08b', failing);
+  expect(cluster.hold(goal, 'MK').hold).toBe(false);
+  await delegateAt('ac08c', failing);
+  expect(cluster.hold(goal, 'MK')).toMatchObject({ hold: true, runs: 3 });
+  const held = await delegateAt('ac08d', failing);
+  expect(hands).toBe(3);
+  expect(events).toContain('anomaly-cluster-hold');
+  expect(held.deferredCells?.map((cell: { id: string }) => cell.id)).toEqual(['C1']);
+  cluster.release(goal, 'MK', '원인 판정: 카드 저장소 복구');
+  expect(cluster.hold(goal, 'MK').hold).toBe(false);
+  const resumed = await delegateAt('ac08e', async (opts) => (realHandTask(opts)));
+  expect(resumed.handed).toHaveLength(1);
+  expect(agentCards(root)).toHaveLength(1);
 }));
 
 // COORD-HA ② × ORCH-TA-HAND: a live hand is an assignment — it counts toward the per-tick cap, and L2 hands nothing.

@@ -1,13 +1,13 @@
 #!/bin/bash
 # 로컬 플릿 노드 셋업 — 원격 맥 한 대를 «Pod 풀 ⊕ 시험 샤딩» 노드로 (MANUAL-local-fleet-node-setup).
-#   bash scripts/fleet/node-setup.sh <호스트> [--check]
+#   bash scripts/fleet/node-setup.sh <호스트> [--check|--light-worker|--inspection-window active|inactive]
 #   <호스트>  ssh 로 닿는 이름(예: node-b · node-c) — 이 맥에서 `ssh -o BatchMode=yes <호스트> true` 가 돼야 한다.
 #   --check  영구 설정을 바꾸지 않고 상태만 본다(단계마다 ✓ · ✗ · → 할 일). DNS 점검용 Pod 는 잠깐 만들었다 지운다.
 #   원격 `uname -s` = Linux(WSL Ubuntu 등)면 brew·OrbStack·Chrome·~/.zshenv 대신 리눅스 갈래(scripts/fleet/node-setup-linux.sh)를 탄다.
 # ⭐ 단계마다 «이미 돼 있으면 건너뛴다» — 몇 번 돌려도 같은 결과(재현 가능한 셋업).
 # ⛔ 원격의 다른 컨테이너·앱은 건드리지 않는다. 이 맥의 ~/.kube/config 는 바꾸기 전에 백업한다.
 set -u
-HOST="${1:?usage: node-setup.sh <host> [--check]}"; CHECK=0; [ "${2:-}" = "--check" ] && CHECK=1
+HOST="${1:?usage: node-setup.sh <host> [--check|--inspection-window]}"; CHECK=0; [ "${2:-}" = "--check" ] && CHECK=1
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 K3S_IMAGE="${ELANOUS_FLEET_K3S_IMAGE:-rancher/k3s:v1.36.4-k3s1}"   # 풀의 모든 노드가 «같은 판» — 판이 갈리면 같은 Job 이 노드마다 다르게 돈다
 API_PORT="${ELANOUS_FLEET_API_PORT:-6550}"
@@ -15,6 +15,36 @@ CLUSTER=elanous-pool; CTX="pool-$HOST"
 BUN_VER="$(bun --version 2>/dev/null)"                              # 이 맥과 같은 bun
 unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy
 R() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "export PATH=\$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:\$HOME/.orbstack/bin:\$PATH HOMEBREW_NO_AUTO_UPDATE=1; unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; $1"; }
+LOCK_TIMEOUT="${FLEET_INSPECTION_LOCK_TIMEOUT_SECONDS:-300}"
+LOCK_RETRY="${FLEET_INSPECTION_LOCK_RETRY_SECONDS:-2}"
+if ! [[ "$LOCK_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || ! [[ "$LOCK_RETRY" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  echo "invalid inspection-window lock timeout or retry interval" >&2
+  exit 2
+fi
+LOCK_COMMAND="set -eu; mkdir -p \"\$HOME/.elanous\" || { echo 'inspection window lock parent creation failed: ~/.elanous' >&2; exit 1; }; lock=\"\$HOME/.elanous/inspection-window.lock\"; started=\$(date +%s) || { echo 'inspection window lock clock read failed' >&2; exit 1; }; while ! mkdir \"\$lock\" 2>/dev/null; do now=\$(date +%s) || { echo 'inspection window lock clock read failed' >&2; exit 1; }; elapsed=\$((now - started)); if [ \"\$elapsed\" -ge $LOCK_TIMEOUT ]; then echo 'inspection window lock acquisition timed out' >&2; exit 1; fi; sleep $LOCK_RETRY; done; if ! printf '%s\\n' '$HOST' > \"\$lock/owner\"; then if rm -f \"\$lock/owner\" && rmdir \"\$lock\"; then trap - EXIT; echo 'inspection window lock owner write failed' >&2; else echo 'inspection window lock owner write failed; cleanup failed' >&2; fi; exit 1; fi; trap 'rm -f \"\$lock/owner\"; rmdir \"\$lock\"' EXIT"
+if [ "${2:-}" = --inspection-window ]; then
+  WINDOW_STATE="${3:-}"
+  case "$WINDOW_STATE" in
+    active|inactive) ;;
+    *) echo "✗ inspection-window state must be active or inactive" >&2; exit 2 ;;
+  esac
+  R "$LOCK_COMMAND; tmp=\"\$HOME/.elanous/inspection-window.tmp.\$\$\"; printf '%s\\n' '$WINDOW_STATE' > \"\$tmp\"; mv \"\$tmp\" \"\$HOME/.elanous/inspection-window\"; echo 'inspection window state updated: $WINDOW_STATE'"
+  exit $?
+fi
+if [ "${2:-}" = --light-worker ]; then
+  WORKER_COMMAND="${ELANOUS_FLEET_LIGHT_WORKER_COMMAND:-scripts/fleet/run-light-worker.sh}"
+  if [ -z "$WORKER_COMMAND" ] || [[ "$WORKER_COMMAND" = /* ]] || [[ "$WORKER_COMMAND" = *[!a-zA-Z0-9_./-]* ]]; then
+    echo "✗ invalid light-worker command" >&2
+    exit 2
+  fi
+  if [ "$WORKER_COMMAND" != scripts/fleet/run-light-worker.sh ]; then
+    echo "✗ light-worker command must use the installed fleet entrypoint" >&2
+    exit 2
+  fi
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "export PATH=\\$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:\\$HOME/.orbstack/bin:\\$PATH; mkdir -p ~/.elanous && cat > ~/.elanous/run-light-worker.sh && chmod 700 ~/.elanous/run-light-worker.sh" < "$ROOT/scripts/fleet/run-light-worker.sh" || { echo "✗ light-worker entrypoint installation failed" >&2; exit 1; }
+  R "$LOCK_COMMAND; state=\$(cat \"\$HOME/.elanous/inspection-window\") || { echo 'inspection-window status unavailable; light-worker blocked' >&2; exit 1; }; case \"\$state\" in active) echo 'inspection window active; light-worker skipped'; exit 0 ;; inactive) \"\$HOME/.elanous/run-light-worker.sh\" ;; *) echo 'invalid inspection-window status; light-worker blocked' >&2; exit 1 ;; esac"
+  exit $?
+fi
 ok() { printf '  ✓ %s\n' "$1"; }; bad() { printf '  ✗ %s\n' "$1"; FAIL=1; }; todo() { printf '  → %s\n' "$1"; TODO=$((TODO+1)); }
 FAIL=0; TODO=0
 echo "▶ 노드 $HOST$([ $CHECK = 1 ] && echo ' (점검만)')"

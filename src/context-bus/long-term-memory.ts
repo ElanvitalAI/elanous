@@ -302,3 +302,128 @@ export async function condenseContextWindowWithReport(
   catch { /* Observation must not stop condensation. */ }
   return { cards, skipped, folded, droppedHarnessChild, funnel };
 }
+
+// ─── Claude 자동 기억 가져오기 (MEMORY-IMPORT-CLAUDE · 대표 10-12) ──────────────────────────────
+// `~/.claude/projects/<project>/memory/*.md` 의 frontmatter(name·description·type)를 엘라누스
+// 장기 기억 레코드로 옮긴다. 파일 읽기·저장은 호출자 몫 — 여기는 순수 변환만 둔다(에이전트 무관).
+
+/** Claude 기억 파일 frontmatter 의 type 값 — 큐레이션 기억 type 어휘와 같다. */
+export type ClaudeMemoryType = 'user' | 'feedback' | 'project' | 'reference';
+
+/** 가져온 기억이 앉는 신뢰 사다리 맨 아래 칸 — 승격된 카드·결정을 덮지 않는다. */
+export const CLAUDE_MEMORY_TRUST = 'memory';
+
+/** 가져온 기억의 seat 표식 — 어떤 에이전트(codex·elanous TUI)든 같은 자리에서 읽는다. */
+export const CLAUDE_MEMORY_SEAT = 'claude-memory';
+
+/** 디스크에서 읽은 Claude 기억 파일 하나(경로 ⊕ 원문). */
+export interface ClaudeMemoryFile { path: string; text: string }
+
+/** MemoryItem 계약에 파일 자신의 이름 3종(name·description·type)을 그대로 얹은 레코드. */
+export interface ClaudeMemoryItem extends MemoryItem {
+  name: string;
+  description: string;
+  type: ClaudeMemoryType;
+  body: string;
+  trust: typeof CLAUDE_MEMORY_TRUST;
+}
+
+export type ClaudeMemorySkipReason = 'no-frontmatter' | 'no-name' | 'no-description' | 'unknown-type';
+
+export interface ClaudeMemoryImport {
+  items: ClaudeMemoryItem[];
+  /** 같은 name 이 두 번 나오면 뒤 파일이 이긴다(덮어쓰기). */
+  overwritten: number;
+  skipped: Partial<Record<ClaudeMemorySkipReason, number>>;
+}
+
+const CLAUDE_MEMORY_TYPES: readonly ClaudeMemoryType[] = ['user', 'feedback', 'project', 'reference'];
+
+/** 출처 표시 — 원장의 `^(https?://|elanous://)` 링크 계약을 넓히지 않고 그대로 만족한다. */
+export function claudeMemorySource(name: string): string {
+  return `elanous://claude-memory/${encodeURIComponent(name.trim())}`;
+}
+
+/** 낡음 표시 — «10-14 기준» 처럼 기준일의 월-일을 남긴다. */
+export function claudeMemoryStalenessNote(asOf: string): string {
+  return `«${claudeMemoryInstant(asOf).slice(5, 10)} 기준»`;
+}
+
+function claudeMemoryInstant(asOf: string): string {
+  const ms = Date.parse(asOf);
+  if (!Number.isFinite(ms)) throw new Error(`claude memory asOf is not a date: ${asOf}`);
+  return new Date(ms).toISOString();
+}
+
+function claudeFrontmatter(text: string): { fields: Record<string, string>; body: string } | undefined {
+  const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  if (!normalized.startsWith('---\n')) return undefined;
+  const close = normalized.indexOf('\n---', 3);
+  if (close < 0) return undefined;
+  const fields: Record<string, string> = {};
+  for (const line of normalized.slice(4, close).split('\n')) {
+    const match = /^([A-Za-z][\w-]*)\s*:\s*(.*)$/.exec(line);
+    if (match) fields[match[1]] = match[2].replace(/^(['"])([\s\S]*)\1$/, '$2').trim();
+  }
+  return { fields, body: normalized.slice(close + 4).replace(/^\n+/, '').trim() };
+}
+
+function claudeMemoryProject(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  const projectsAt = parts.indexOf('projects');
+  if (projectsAt >= 0 && parts[projectsAt + 2] === 'memory') return parts[projectsAt + 1];
+  const memoryAt = parts.lastIndexOf('memory');
+  return memoryAt > 0 ? parts[memoryAt - 1] : '(unknown)';
+}
+
+/**
+ * Claude 기억 파일 하나 → 장기 기억 레코드. 형식이 안 맞으면 이유와 함께 건너뛴다.
+ * claim 이 없는 레코드지만 source 가 `elanous://claude-memory/<name>` 링크라 원장 계약을 지킨다.
+ */
+export function importClaudeMemory(
+  file: ClaudeMemoryFile,
+  options: { asOf: string },
+): { ok: true; item: ClaudeMemoryItem } | { ok: false; reason: ClaudeMemorySkipReason } {
+  const parsed = claudeFrontmatter(file.text);
+  if (!parsed) return { ok: false, reason: 'no-frontmatter' };
+  const name = (parsed.fields.name ?? '').trim();
+  if (!name) return { ok: false, reason: 'no-name' };
+  const description = (parsed.fields.description ?? '').trim();
+  if (!description) return { ok: false, reason: 'no-description' };
+  const type = (parsed.fields.type ?? '').trim().toLowerCase();
+  if (!CLAUDE_MEMORY_TYPES.includes(type as ClaudeMemoryType)) return { ok: false, reason: 'unknown-type' };
+  return { ok: true, item: {
+    project: claudeMemoryProject(file.path),
+    seat: CLAUDE_MEMORY_SEAT,
+    topic: name,
+    summary: `${claudeMemoryStalenessNote(options.asOf)} ${description}`,
+    source: claudeMemorySource(name),
+    updatedAt: claudeMemoryInstant(options.asOf),
+    status: 'active',
+    name,
+    description,
+    type: type as ClaudeMemoryType,
+    body: parsed.body,
+    trust: CLAUDE_MEMORY_TRUST,
+  } };
+}
+
+/** 여러 파일을 한 번에 — name 이 겹치면 뒤 파일이 이긴다(덮어쓰기). */
+export function importClaudeMemories(
+  files: readonly ClaudeMemoryFile[],
+  options: { asOf: string },
+): ClaudeMemoryImport {
+  const byName = new Map<string, ClaudeMemoryItem>();
+  const skipped: Partial<Record<ClaudeMemorySkipReason, number>> = {};
+  let overwritten = 0;
+  for (const file of files) {
+    const outcome = importClaudeMemory(file, options);
+    if (!outcome.ok) {
+      skipped[outcome.reason] = (skipped[outcome.reason] ?? 0) + 1;
+      continue;
+    }
+    if (byName.has(outcome.item.name)) overwritten += 1;
+    byName.set(outcome.item.name, outcome.item);
+  }
+  return { items: [...byName.values()], overwritten, skipped };
+}

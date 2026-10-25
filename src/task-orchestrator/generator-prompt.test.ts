@@ -140,6 +140,19 @@ describe('TaskGenerator maxTasks — 아크 붕괴 근본수복(B0 축①·2026-
 });
 
 describe('buildDecomposePrompt — DEVICE-FIRST-AUTHORING 장치 우선 분해(장치 확인 두 갈래)', () => {
+  test('measured inventory in authoring context overrides opposite checkout inventory in the device check', () => {
+    // Both paths contradict the checkout catalog: interaction exists; fault-synthetic does not.
+    for (const [status, path] of [['missing', 'src/ux-sim/interaction.ts'], ['existing', 'src/ux-sim/fault-synthetic.ts']] as const) {
+      const p = buildDecomposePrompt({ ...baseInput, context: { activeSummary: `Device inventory (measured at goal-author repository root): ${status}: ${path}` } },
+        { maxTasks: 15, profile: 'goal-author-coarse' });
+      const deviceSection = p.split('## Device-first decomposition (DEVICE-FIRST-AUTHORING — follow strictly)')[1]!
+        .split('## Active goal summary')[0]!;
+      expect(deviceSection).toContain(`Device inventory (measured at goal-author repository root): ${status}: ${path}`);
+      expect(deviceSection).toContain(`- Use the measured ${status} status for ${path} instead of this checkout's inventory when choosing the device branch.`);
+      expect(deviceSection).toContain(status === 'missing' ? 'FIRST slice MUST be a device slice' : 'reuses the device');
+    }
+  });
+
   test('두 갈래 ① — 장치가 있으면 그 이름이 검증 계획에 들어간다', () => {
     const p = buildDecomposePrompt(baseInput, { maxTasks: 15, profile: 'goal-author-coarse' });
     expect(p).toContain('## Device-first decomposition (DEVICE-FIRST-AUTHORING — follow strictly)');

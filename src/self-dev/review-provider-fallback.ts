@@ -18,7 +18,7 @@
 //   📏 실측이 그 분리를 뒷받침한다: 폴백 판정 전수 493 중 `action=grok` ***0건*** —
 //     쿼터 축은 과부하에 «반응하지 않는다».
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
-import type { LLMProvider } from '../llm.js';
+import { getProvider, inferProviderFromModel, resolveReviewModelAlias, type LLMProvider } from '../llm.js';
 import { spawnSync } from 'node:child_process';
 import { claudeBackend, resolveBackendSpawn } from '../agent-mission/driver.js';
 import { checkClaudeSubscription } from '../agent-mission/claude-subscription.js';
@@ -279,19 +279,57 @@ export function buildReviewProviderAttempts(
   primary: ReviewProviderAttempt,
   fallbacks: readonly ReviewProviderAttempt[],
 ): ReviewProviderAttempt[] {
-  const out: ReviewProviderAttempt[] = [primary];
-  const seen = new Set([primary.model]);
+  const model = resolveReviewModelAlias(primary.model);
+  const inferred = inferProviderFromModel(model);
+  const supported = Boolean(inferred && (inferred !== 'local' || model.startsWith('local:') || model.startsWith('local-llm:')));
+  let selectedProvider: LLMProvider | undefined;
+  if (supported) {
+    const provider = getProvider(model);
+    if (!primary.provider || primary.provider.name === provider.name) selectedProvider = primary.provider ?? provider;
+  }
+  if (!selectedProvider) {
+    // A malformed/ambiguous configured primary is diagnostic, not fatal: the configured/default
+    // fallback attempts below still provide the review. Preserve an unresolved attempt so the
+    // runner records its reason, and expose a stable event for operational diagnosis.
+    try {
+      debug.log('review.fallback', 'primary-unresolved', {
+        model: primary.model,
+        configuredProvider: primary.provider?.name ?? null,
+      }, { level: 'warn' });
+    } catch { /* fail-soft */ }
+  }
+  const normalizedPrimary: ReviewProviderAttempt = {
+    ...primary,
+    model,
+    ...(selectedProvider ? { provider: selectedProvider } : { provider: undefined }),
+  };
+  const out: ReviewProviderAttempt[] = [normalizedPrimary];
+  const seen = new Set(selectedProvider ? [model] : []);
   for (const f of fallbacks) {
-    if (!f.model.trim() || seen.has(f.model) || (primary.provider && f.provider?.name === primary.provider.name)) continue;
-    seen.add(f.model);
-    out.push(f);
+    if (!f.model.trim()) continue;
+    const fallbackModel = resolveReviewModelAlias(f.model);
+    if (seen.has(fallbackModel)) continue;
+    const fallbackInference = inferProviderFromModel(fallbackModel);
+    if (!fallbackInference || (fallbackInference === 'local' && !fallbackModel.startsWith('local:') && !fallbackModel.startsWith('local-llm:'))) {
+      throw new Error(`review fallback: ambiguous or unsupported fallback model "${f.model}"`);
+    }
+    const fallbackProvider = getProvider(fallbackModel);
+    if (f.provider && f.provider.name !== fallbackProvider.name) {
+      throw new Error(`review fallback: unsupported provider "${f.provider.name}" for model "${fallbackModel}"`);
+    }
+    if (normalizedPrimary.provider && (f.provider ?? fallbackProvider).name === normalizedPrimary.provider.name) continue;
+    seen.add(fallbackModel);
+    const selectedFallbackProvider = f.provider ?? fallbackProvider;
+    out.push(f.model === fallbackModel && f.provider === selectedFallbackProvider
+      ? f : { ...f, model: fallbackModel, provider: selectedFallbackProvider });
   }
   return out;
 }
 
 /** A distinct provider is available even when the optional config list is empty. */
 export function defaultReviewFallbackModel(primaryProvider?: string): string {
-  return resolveModelAlias(primaryProvider === 'grok' ? 'claude' : 'grok')!;
+  // `claude` is a family label, not a model alias; use the canonical Opus alias for the Claude lane.
+  return resolveModelAlias(primaryProvider === 'grok' ? 'opus' : 'grok')!;
 }
 
 export interface ReviewFallbackObservation {

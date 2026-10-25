@@ -4,7 +4,7 @@ import { isScalar, parseDocument } from 'yaml';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { DEFAULT_FALLBACK_CHAIN, isFallbackStep, type FallbackStep } from '../oauth/fallback-chain.js';
 import { isCodexQuotaPolicy } from '../oauth/codex-quota-policy.js';
-import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, MODEL_ROLES, RUNTIME_LLM_PROVIDER_NAMES, parseRoleLlmEntry, parseSubscriptionReviewerSpec, type RoleLlmConfig, type SubscriptionReviewerSpec } from '../user-config.js';
+import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, MODEL_ROLES, RUNTIME_LLM_PROVIDER_NAMES, parseReviewerMixSpec, parseRoleLlmEntry, parseSubscriptionReviewerSpec, type RoleLlmConfig, type SubscriptionReviewerSpec } from '../user-config.js';
 
 export interface LlmPolicy {
   version: 1;
@@ -106,6 +106,7 @@ export function validateLlmPolicy(input: unknown): LlmPolicyValidation {
     && nonempty(g.account) && positive(g.amount) && date(g.expires) && nonempty(g.source));
   const roles = (v: unknown) => object(v) && Object.entries(v).every(([role, spec]) => role === 'reviewer'
     ? !!parseSubscriptionReviewerSpec(spec)
+    : role === 'reviewerMix' ? !!parseReviewerMixSpec(spec)
     : MODEL_ROLES.some(r => r === role) && object(spec)
       && Object.keys(spec).every(k => ['provider', 'tier', 'model'].includes(k)) && parseRoleLlmEntry(spec).ok);
   check(input, 'policy', {
@@ -209,6 +210,7 @@ export function loadLlmPolicy(opts: LoadLlmPolicyOptions = {}): LoadedLlmPolicy 
     if (Object.keys(base).length) overlay.default = base;
     add('roleLlm', legacy.roleLlm, overlay, 'roles', v => object(v) && Object.entries(v).every(([r, spec]) => r === 'reviewer'
       ? !!parseSubscriptionReviewerSpec(spec)
+      : r === 'reviewerMix' ? !!parseReviewerMixSpec(spec)
       : MODEL_ROLES.some(k => k === r) && parseRoleLlmEntry(spec).ok));
     add('llm.fallbackChain', llm.fallbackChain, overlay, 'fallback', v => Array.isArray(v) && v.length > 0 && v.every(isFallbackStep) && new Set(v).size === v.length);
     const codex: Obj = {};

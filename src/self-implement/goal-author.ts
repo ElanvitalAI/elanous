@@ -119,6 +119,8 @@ export interface GoalAuthorDeps {
   launchPreflight?: LaunchPreflightResult;
   /** Optional in-process notification for each authored-goal phase transition. */
   onProgress?: (phase: GoalAuthorPhase, event: 'start' | 'end') => void;
+  /** AUTHOR-TIMEBOX: budget for the `ground` phase. Omitted means `GOAL_AUTHOR_GROUND_TIMEBOX_MS`. */
+  groundTimeboxMs?: number;
 }
 
 export type GoalAuthorGroundingPath = 'groundMissionInCodebase';
@@ -164,10 +166,12 @@ export interface GoalAuthorPersistentGroundingDecision {
    *  ⛔ 경로 «배열»을 남기지 않는다: 이 저장소의 debug.log 는 배열을 6에서 잘라 `{_more:N}` 을
    *  붙이므로 ***분모가 깨진다***. 히스토그램은 안 잘리고 「무슨 종류를 봤나」에 그대로 답한다. */
   readonly fileKinds?: Readonly<Record<string, number>>;
+  /** AUTHOR-TIMEBOX: 접지가 «던진» 것이 아니라 «예산 초과»로 끊겼다 — `groundingError` 와 다른 축이다. */
+  readonly timeboxExceeded?: boolean;
 }
 
 type GoalAuthorPersistentGroundingMetrics = Pick<GoalAuthorPersistentGroundingDecision,
-  'authorRunId' | 'grounded' | 'groundingError' | 'fileCount' | 'persistentEvidenceCount' | 'contextChars' | 'persistentStopReason' | 'codeChannel' | 'fileKinds'
+  'authorRunId' | 'grounded' | 'groundingError' | 'fileCount' | 'persistentEvidenceCount' | 'contextChars' | 'persistentStopReason' | 'codeChannel' | 'fileKinds' | 'timeboxExceeded'
 >;
 
 type GoalAuthorPersistentGroundingConfigReader = () => boolean | undefined;
@@ -211,11 +215,13 @@ function goalAuthorPersistentGroundingMetrics(
   facts: CodebaseGrounding | null,
   groundingError: boolean,
   authorRunId: string,
+  timeboxExceeded = false,
 ): GoalAuthorPersistentGroundingMetrics {
   return {
     authorRunId,
     grounded: facts?.grounded ?? false,
     groundingError,
+    ...(timeboxExceeded ? { timeboxExceeded: true } : {}),
     fileCount: facts?.files.length ?? 0,
     fileKinds: summarizeGroundingFileKinds(facts?.files ?? []),
     persistentEvidenceCount: facts?.persistentEvidence?.length ?? 0,
@@ -259,6 +265,14 @@ const MAX_COLLISION_RETRIES = 50;
 const SUPERSESSION_LOCK_STALE_MS = 30_000;
 const GOAL_AUTHOR_HELP_PROBE_TIMEOUT_MS = 3_000;
 const GOAL_AUTHOR_HELP_PROBE_STDERR_MAX_CHARS = 4_000;
+/**
+ * ⭐ AUTHOR-TIMEBOX — 접지(`ground`) 단계의 기본 시간 한도.
+ *
+ * 🩸 실측(2026-10-21): 접지 헛돌기(`grounding.search` 1,584행)가 저작 전체를 80분 붙잡았고,
+ *   그렇게 죽은 런은 «결과 줄»을 하나도 안 남겨 상위 디스패처가 성공으로도 실패로도 판정하지 못했다.
+ * ⇒ 한도를 넘기면 접지 결과를 «기다리지 않고» 끊고 NOT-GROUNDED 로 끝낸다 — 문서·관측·결과 줄 셋 다.
+ */
+export const GOAL_AUTHOR_GROUND_TIMEBOX_MS = 15 * 60_000;
 export const EVIDENCE_LOCATION_REQUIREMENT = 'For every acceptance criterion, state where evidence that it was met appears in the diff or which line of the report shows it. Evidence visible only on an execution screen and left in neither the diff nor the report is not evidence.';
 export const REQUIRED_BLOCKS = ['## PROBLEM', '## WHAT TO BUILD', '## ACCEPTANCE CRITERIA', '## REQUIRED EVIDENCE', '## TRACED PATHS', '## SCOPE BOUNDARY', '## 답하지 못하는 것', '## 불변식', '## 판정 신호'] as const;
 export const ERROR_REQUIRED_BLOCKS = new Set<string>(['## PROBLEM', '## ACCEPTANCE CRITERIA', '## REQUIRED EVIDENCE']);
@@ -511,12 +525,51 @@ const GOAL_DONE_UNSUPPORTED_SHELL_OPERATOR = /&&|\|\||[;|><`]|\$\(/;
 // Only the narrow, concrete file predicates are accepted for `test`; the
 // predicate also needs its operand, so `test -f` cannot claim proof.
 const GOAL_DONE_SHELL_TEST_ARGS = /^-(?:f|e)\s+\S+(?:\s|$)/;
+const GOAL_DONE_EVIDENCE_OPERATOR_ERROR = '증거 명령에 셸 연산자 — 명령 한 줄만';
+const GOAL_DONE_EVIDENCE_SYNTAX_ERROR = '증거 명령 형식이 아님 — 실행 파일과 인자 필요';
+
+function firstGoalDoneShellOperator(value: string): { index: number; token: string } | 'unsafe' | undefined {
+  let quote: "'" | '"' | undefined;
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (char === '\\' && quote !== "'") { index++; continue; }
+    if (quote === "'") { if (char === "'") quote = undefined; continue; }
+    if (quote === '"') {
+      if (char === '"') quote = undefined;
+      else if (char === '`' || (char === '$' && value[index + 1] === '(')) return 'unsafe';
+      continue;
+    }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char === '`' || (char === '$' && value[index + 1] === '(')) return 'unsafe';
+    const pair = value.slice(index, index + 2);
+    if (pair === '&&' || pair === '||') return { index, token: pair };
+    if (char === ';' || char === '&' || char === '|' || char === '>' || char === '<') return { index, token: char };
+  }
+  return quote ? 'unsafe' : undefined;
+}
+
+/** Prepare one command for future checklist/hand wiring. This slice does not change their current admission rules. */
+export function validateGoalDoneEvidenceCommand(value: string): { command?: string; error?: string } {
+  const raw = value.trim();
+  // A quote at each end does not necessarily wrap the whole command:
+  // `"bun test" ; "x"` has an operator between two separately quoted words.
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    if (firstGoalDoneShellOperator(raw) !== undefined) return { error: GOAL_DONE_EVIDENCE_OPERATOR_ERROR };
+  }
+  const text = unwrapGoalDoneValue(value);
+  const operator = firstGoalDoneShellOperator(text);
+  if (operator !== undefined || /[\r\n]/u.test(text)) return { error: GOAL_DONE_EVIDENCE_OPERATOR_ERROR };
+  const command = text.trim();
+  const match = GOAL_DONE_EVIDENCE_COMMAND.exec(command);
+  const args = match?.[2]?.trim() ?? '';
+  if (!match || !args || (match[1] === 'test' && !GOAL_DONE_SHELL_TEST_ARGS.test(args)))
+    return { error: GOAL_DONE_EVIDENCE_SYNTAX_ERROR };
+  return { command };
+}
 
 function isGoalDoneEvidenceCommand(value: string): boolean {
   if (GOAL_DONE_UNSUPPORTED_SHELL_OPERATOR.test(value)) return false;
-  const match = GOAL_DONE_EVIDENCE_COMMAND.exec(value);
-  const args = match?.[2]?.trim() ?? '';
-  return !!match && args.length > 0 && (match[1] !== 'test' || GOAL_DONE_SHELL_TEST_ARGS.test(args));
+  return validateGoalDoneEvidenceCommand(value).command !== undefined;
 }
 
 function unwrapGoalDoneValue(value: string): string {
@@ -1438,6 +1491,57 @@ export function classifyGroundingFailure(input: GroundingFailureClassificationIn
   return { root: 'undifferentiated', prescription: legacyPrescription };
 }
 
+/**
+ * ⭐ GROUNDING-PERSISTENT-EMPTY-REPAIR 4/7 — 빈 근거 분류. persistent 채널(Read-검증 근거)이 비어
+ * 있을 때 그 사유를 구조화해 남긴다. 분기 우선순위: 선언된 대상 경로가 저장소 파일도 명시적 신설도
+ * 아니면 `absent-path`, 그렇지 않으면서 접지가 저장소 파일을 Read 했으면 `read-mismatch`
+ * (K-UX-15 — 근거 줄에 Read 하지 않은 경로가 섞이면 줄 전체가 기각된다), 둘 다 아니면 `undifferentiated`.
+ * 채널이 비어 있지 않으면(≥1 항목) 분류가 아예 일어나지 않는다.
+ */
+export type GoalAuthorEmptyEvidenceReason = 'read-mismatch' | 'absent-path' | 'undifferentiated';
+
+export interface GoalAuthorEmptyEvidenceClassificationInput {
+  /** persistent 채널(Read-검증 근거)의 항목 수 — 0일 때만 분류가 일어난다. */
+  readonly persistentEvidenceCount: number;
+  /** 접지가 실제로 Read 한 저장소 파일 수. */
+  readonly readFilesCount: number;
+  /** TRACED PATHS 에서 저장소 파일·명시적 신설로 확인되지 않은 선언 대상 경로 수. */
+  readonly unresolvedTargetCount: number;
+  /** 문서에 조립된 TRACED PATHS 의 최종 추적 항목 수(미해석 행 제외). */
+  readonly finalTracedCount: number;
+}
+
+export interface GoalAuthorEmptyEvidenceClassification {
+  readonly reason: GoalAuthorEmptyEvidenceReason;
+  readonly reasonLabel: string;
+  readonly finalTracedCount: number;
+  /** 채널이 비어 있으므로 최종 추적 항목은 오직 ask 선언 대상 경로에서 왔다; 없으면 'none'. */
+  readonly source: 'ask-declared-targets' | 'none';
+}
+
+const EMPTY_EVIDENCE_REASON_LABELS: Record<GoalAuthorEmptyEvidenceReason, string> = {
+  'read-mismatch': 'empty-evidence:read-mismatch — grounding Read repository files, yet the persistent channel is empty: every evidence line cited at least one path grounding did not Read, so the whole line was rejected (notRead).',
+  'absent-path': 'empty-evidence:absent-path — the ask-declared target path is neither a repository file nor an explicitly declared new file, so the evidence it needs could not be Read at all.',
+  'undifferentiated': 'empty-evidence:undifferentiated — the persistent channel is empty and no distinguishing read or absence signal was observed.',
+};
+
+export function classifyEmptyPersistentEvidence(
+  input: GoalAuthorEmptyEvidenceClassificationInput,
+): GoalAuthorEmptyEvidenceClassification | null {
+  if (input.persistentEvidenceCount > 0) return null;
+  const reason: GoalAuthorEmptyEvidenceReason = input.unresolvedTargetCount > 0
+    ? 'absent-path'
+    : input.readFilesCount > 0
+      ? 'read-mismatch'
+      : 'undifferentiated';
+  return {
+    reason,
+    reasonLabel: EMPTY_EVIDENCE_REASON_LABELS[reason],
+    finalTracedCount: input.finalTracedCount,
+    source: input.finalTracedCount > 0 ? 'ask-declared-targets' : 'none',
+  };
+}
+
 function isTracedPathsEvidenceUnavailable(entry: string): boolean {
   return entry === TRACED_PATHS_EVIDENCE_UNAVAILABLE || TRACED_PATHS_PERSISTENT_CHANNEL_UNAVAILABLE.test(entry);
 }
@@ -2331,6 +2435,67 @@ export interface AuthoredGoal {
   facts: CodebaseGrounding | null;
   grounded: boolean;
   authorRunId: string;
+  /** AUTHOR-TIMEBOX: present only when the `ground` phase was short-circuited for exceeding its budget. */
+  groundingTimebox?: GoalAuthorGroundingTimebox;
+}
+
+/** AUTHOR-TIMEBOX 산출 — 예산과 실제 경과. 둘 다 «잰 값»이고 지어낸 값이 아니다. */
+export interface GoalAuthorGroundingTimebox {
+  readonly budgetMs: number;
+  readonly elapsedMs: number;
+}
+
+type GoalAuthorGroundOutcome =
+  | { readonly facts: CodebaseGrounding }
+  | { readonly timebox: GoalAuthorGroundingTimebox };
+
+/**
+ * ⭐ AUTHOR-TIMEBOX — 주입된 접지 promise 는 «취소»할 수 없다(그것은 호출자의 seam 이다).
+ *   그래서 여기서는 예산이 지나면 그 결과를 «안 쓰고» 끊는다 — 기다리지 않는 것이 요구다.
+ * ⛔ 늦게 끝난 접지의 거절이 unhandled rejection 이 되어 런을 죽이면 안 된다 → 핸들러를 미리 붙인다.
+ * ⛔ 시작 시각은 «이미 잰» 페이즈 시작값을 받는다 — 여기서 `Date.now()` 를 한 번 더 부르면
+ *   고정 시계를 쓰는 기존 페이즈 시험의 호출 순서가 밀려 «보존 계약»이 깨진다(실측 2026-10-21).
+ */
+async function groundWithinTimebox(
+  ground: () => Promise<CodebaseGrounding>,
+  budgetMs: number,
+  startedAt: number,
+): Promise<GoalAuthorGroundOutcome> {
+  const expired = Symbol('goal-author-ground-timebox');
+  const groundPromise = ground();
+  groundPromise.catch(() => undefined);
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const timer = new Promise<typeof expired>((resolve) => {
+    handle = setTimeout(() => resolve(expired), budgetMs);
+  });
+  try {
+    const result = await Promise.race([groundPromise, timer]);
+    return result === expired
+      ? { timebox: { budgetMs, elapsedMs: Date.now() - startedAt } }
+      : { facts: result };
+  } finally {
+    clearTimeout(handle);
+  }
+}
+
+/** 접지 시간 한도가 걸렸다는 것을 골 문서 «안»에 남기는 줄 머리 — 발사 흐름이 이것으로 결과 줄을 쓴다. */
+export const GROUNDING_TIMEBOX_NOTICE_PREFIX = '- Grounding timebox:';
+
+function groundingTimeboxNotice(timebox: GoalAuthorGroundingTimebox): string {
+  return `${GROUNDING_TIMEBOX_NOTICE_PREFIX} the ${timebox.budgetMs}ms budget was exceeded after ${timebox.elapsedMs}ms — grounding was stopped and this goal is NOT-GROUNDED.`;
+}
+
+/** 저작된 골 문서만 보고 «접지가 예산 초과로 끊겼나»를 읽는다 — 없으면 `null`(추정하지 않는다). */
+export function readGoalAuthorGroundingTimebox(document: string): GoalAuthorGroundingTimebox | null {
+  const problem = markdownSection(document, 'PROBLEM');
+  if (problem === null) return null;
+  for (const line of problem.split(/\r?\n/)) {
+    if (!line.startsWith(GROUNDING_TIMEBOX_NOTICE_PREFIX)) continue;
+    const match = /(\d+)ms budget (?:was )?exceeded after (\d+)ms/.exec(line);
+    if (!match) continue;
+    return { budgetMs: Number(match[1]), elapsedMs: Number(match[2]) };
+  }
+  return null;
 }
 
 export interface GoalFileDeps {
@@ -2437,7 +2602,42 @@ function observePersistentEvidenceSourceKinds(facts: CodebaseGrounding | null, a
   observeGoalAuthor('goal-author', 'persistent-grounding-evidence-source-count', { authorRunId, counts });
 }
 
-function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, repositoryRoot: string | undefined, unavailableEvidence: string): string[] {
+type TracedPathLedgerEvent = { event: string; data: Record<string, unknown> };
+
+// ⭐ GROUNDING-PERSISTENT-EMPTY-REPAIR 4/7 — tracedPathsSection 이 내는 «선언 대상 미확인» 미해석 행의
+//   접미어(저장소 파일·명시적 신설 확인 불가) — 파싱 실패·경로 없는 근거 미해석 행과 구분하는 판별자다.
+const UNRESOLVED_DECLARED_TARGET_SUFFIX = ' — 요청에 선언된 대상 경로를 저장소 파일 또는 명시적 신설 파일로 확인하지 못함';
+
+function isUnresolvedDeclaredTargetEntry(line: string): boolean {
+  return line.includes('미해석: ') && line.endsWith(UNRESOLVED_DECLARED_TARGET_SUFFIX);
+}
+
+function isTracedPathEntry(line: string): boolean {
+  return /^\d+\. /.test(line) && !line.includes('미해석: ');
+}
+
+/**
+ * ⭐ GROUNDING-PERSISTENT-EMPTY-REPAIR 4/7 — 최종 TRACED PATHS 행이 확정된 뒤, persistent 채널이
+ * 비어 있으면 구조화 사유·final traced count·출처를 관측 원장에 남긴다(launch-preflight 소비).
+ * facts 가 없으면(lite 골) 기록하지 않고, 관측은 fail-soft 로 저작 자체를 멈추지 않는다.
+ */
+function observeEmptyPersistentEvidence(facts: CodebaseGrounding | null, tracedPathsLines: readonly string[], authorRunId: string): void {
+  if (facts === null) return;
+  const classification = classifyEmptyPersistentEvidence({
+    persistentEvidenceCount: persistentEvidenceItems(facts).length,
+    readFilesCount: facts.files.length,
+    unresolvedTargetCount: tracedPathsLines.filter(isUnresolvedDeclaredTargetEntry).length,
+    finalTracedCount: tracedPathsLines.filter(isTracedPathEntry).length,
+  });
+  if (classification === null) return;
+  try {
+    observeGoalAuthor('goal-author', 'persistent-grounding-empty-evidence', { authorRunId, ...classification });
+  } catch {
+    // 관측 채널 고장이 골 저작을 멈추게 하지 않는다(관측은 fail-soft).
+  }
+}
+
+function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, repositoryRoot: string | undefined, unavailableEvidence: string, authorRunId?: string, record?: (entry: TracedPathLedgerEvent) => void): string[] {
   const evidence = persistentEvidenceItems(facts);
   // Without a repository root we cannot verify paths. Keep the established
   // rendering contract for callers that do not supply one.
@@ -2459,15 +2659,23 @@ function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, reposi
   const targetLabels = linesOutsideFencedCode(ask)
     .map(({ text }) => /^대상 경로:\s*(.*)$/.exec(text.trim())?.[1])
     .filter((value): value is string => value !== undefined);
+  const pathWithSpaces = (piece: string): string | null => {
+    const path = piece.trim().replace(/^`|`$/g, '');
+    if (!path.includes(' ') || !path.includes('/') || !/\.[a-z0-9]+$/i.test(path) || isAbsolute(path)
+      || path.split('/').some((part) => part === '.' || part === '..')) return null;
+    if (path.split(/\s+/).slice(1).some((part) => part.includes('/'))) return null;
+    return path;
+  };
   const unresolvedTargetPieces = targetLabels.flatMap((label) => label.split(/\s+[·,]\s*|[·,]\s+/))
     .flatMap((piece) => {
+      if (pathWithSpaces(piece)) return [];
       const tokens = piece.trim().split(/\s+/).filter(Boolean);
       return tokens.length === 0
         ? ['(빈 대상 경로)']
         : tokens.filter((token) => targetPathsInLabelPiece(token).length === 0
           && classifyTracedPathToken(token, repositoryRoot).kind !== 'repository-root');
     });
-  const labeledTargets = declaredTargetPaths(ask);
+  const labeledTargets = [...declaredTargetPaths(ask), ...targetLabels.flatMap((label) => label.split(/\s+[·,]\s*|[·,]\s+/).flatMap((piece) => pathWithSpaces(piece) ?? []))];
   const labeledRootFiles = targetLabels.flatMap((label) => label.split(/\s+[·,]\s*|[·,]\s+/))
     .flatMap((piece) => piece.trim().split(/\s+/).filter(Boolean))
     .flatMap((token) => {
@@ -2497,10 +2705,75 @@ function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, reposi
       return isSameOrNestedPath(real, root) && lstatSync(real).isFile();
     } catch { return false; }
   };
+  const ambiguousPaths = new Set<string>();
+  const correctedPaths = new Set<string>();
+  const candidateFiles = new Map<string, string[]>();
+  const filesIn = (directory: string): string[] => {
+    const cached = candidateFiles.get(directory);
+    if (cached) return cached;
+    let entries: string[] = [];
+    try {
+      if (root !== null) {
+        const realDirectory = realpathSync(resolve(root, directory));
+        if (isSameOrNestedPath(realDirectory, root)) {
+          entries = readdirSync(realDirectory, { withFileTypes: true })
+            .filter((entry) => entry.isFile())
+            .map((entry) => directory ? `${directory}/${entry.name}` : entry.name)
+            .filter((candidate) => valid(candidate, false));
+        }
+      }
+    } catch { /* Missing or outside-repository directories have no candidates. */ }
+    candidateFiles.set(directory, entries);
+    return entries;
+  };
+  const distance = (left: string, right: string): number => {
+    let row = Array.from({ length: right.length + 1 }, (_, index) => index);
+    for (let i = 1; i <= left.length; i += 1) {
+      const next = [i];
+      for (let j = 1; j <= right.length; j += 1) {
+        next[j] = Math.min(next[j - 1]! + 1, row[j]! + 1, row[j - 1]! + Number(left[i - 1] !== right[j - 1]));
+      }
+      row = next;
+    }
+    return row[right.length]!;
+  };
+  const correct = (path: string): string | null => {
+    if (!path.includes('/') || isAbsolute(path) || path.split('/').some((part) => part === '.' || part === '..')) return null;
+    const directory = dirname(path);
+    const name = path.slice(directory.length + 1);
+    const candidates = [...new Set([...filesIn(directory), ...known.filter((candidate) => dirname(candidate) === directory && valid(candidate, false))])];
+    const prefixName = name.includes('*') ? name.slice(0, name.indexOf('*')) : name;
+    const prefix = prefixName.length >= 3
+      ? candidates.filter((candidate) => candidate.slice(directory.length + 1).startsWith(prefixName))
+      : [];
+    const near = [...new Set([...prefix, ...candidates.filter((candidate) => {
+      const candidateName = candidate.slice(directory.length + 1);
+      const limit = name.length >= 6 ? 2 : 1;
+      return !name.includes('*') && candidateName.slice(candidateName.lastIndexOf('.')) === name.slice(name.lastIndexOf('.'))
+        && distance(name, candidateName) <= limit;
+    })])];
+    if (near.length === 1) return near[0]!;
+    if (near.length > 1 && !ambiguousPaths.has(path)) {
+      ambiguousPaths.add(path);
+      const message = `[goal-author] traced path warning: ambiguous ${path} — ${near.join(', ')}; skipped`;
+      process.stderr.write(`${message}\n`);
+      try { observeGoalAuthor('goal-author', 'traced-path-warning', { authorRunId, path, candidates: near, action: 'skipped' }); } catch { /* observation is fail-soft */ }
+      record?.({ event: 'traced-path-warning', data: { authorRunId, path, candidates: near, action: 'skipped' } });
+    }
+    return null;
+  };
   const resolvePath = (path: string, declaredTarget = false): string | null => {
-    if (declaredTarget) return valid(path, true) ? path : null;
+    if (declaredTarget && valid(path, true)) return path;
     if (path.includes('/') && valid(path, true)) return path;
-    if (path.includes('/')) return null;
+    if (path.includes('/')) {
+      const corrected = correct(path);
+      if (corrected && !correctedPaths.has(path)) {
+        correctedPaths.add(path);
+        try { observeGoalAuthor('goal-author', 'traced-path-correction', { authorRunId, from: path, to: corrected }); } catch { /* observation is fail-soft */ }
+        record?.({ event: 'traced-path-correction', data: { authorRunId, from: path, to: corrected } });
+      }
+      return corrected;
+    }
     const matches = known.filter((candidate) => candidate.endsWith(`/${path}`) && valid(candidate, false));
     return matches.length === 1 ? matches[0]! : null;
   };
@@ -2517,7 +2790,7 @@ function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, reposi
   for (const path of requestedTargets) {
     const resolved = resolvePath(path, true);
     if (resolved) addPath(resolved);
-    else paths.push(`${paths.length + 1}. 미해석: ${path} — 요청에 선언된 대상 경로를 저장소 파일 또는 명시적 신설 파일로 확인하지 못함`);
+    else if (!ambiguousPaths.has(path)) paths.push(`${paths.length + 1}. 미해석: ${path} — 요청에 선언된 대상 경로를 저장소 파일 또는 명시적 신설 파일로 확인하지 못함`);
   }
   for (const piece of unresolvedTargetPieces) {
     paths.push(`${paths.length + 1}. 미해석: ${piece} — 요청에 선언된 대상 경로를 파싱하지 못함`);
@@ -2532,7 +2805,7 @@ function tracedPathsSection(facts: CodebaseGrounding | null, ask: string, reposi
     referenced.forEach((path, index) => {
       const resolved = resolvePath(path);
       if (resolved) addPath(resolved, index === 0 ? renderPersistentEvidence(item) : undefined);
-      else paths.push(`${paths.length + 1}. 미해석: ${path} — ${renderPersistentEvidence(item)}`);
+      else if (!ambiguousPaths.has(path)) paths.push(`${paths.length + 1}. 미해석: ${path} — ${renderPersistentEvidence(item)}`);
     });
   }
   if (evidence.length === 0) paths.push(`- ${unavailableEvidence}`);
@@ -5413,7 +5686,7 @@ export async function authorGoal(ask: string, deps: GoalAuthorDeps): Promise<Aut
 /** Internal-only path: the locked superseded document is the authoritative RootIntent source. */
 async function authorGoalWithSupersededRootIntent(
   ask: string,
-  deps: GoalAuthorDeps & { supersessionRootIntent?: string; mandatoryGoalContextEvidence?: readonly string[] },
+  deps: GoalAuthorDeps & { supersessionRootIntent?: string; mandatoryGoalContextEvidence?: readonly string[]; recordTracedPath?: (entry: TracedPathLedgerEvent) => void },
 ): Promise<AuthoredGoal> {
   try {
     const markerWarnings = formatEarlyMarkerWarnings(ask);
@@ -5453,18 +5726,32 @@ async function authorGoalWithSupersededRootIntent(
   };
   let facts: CodebaseGrounding | null = null;
   let groundingError = false;
+  let groundingTimebox: GoalAuthorGroundingTimebox | undefined;
   if (!lite) {
     const persistentGrounding = resolveGoalAuthorPersistentGrounding('persistentGrounding' in deps ? deps.persistentGrounding : undefined);
     const groundStartedAt = startGoalAuthorPhase('ground', authorRunId, deps.onProgress);
+    const timeboxBudgetMs = deps.groundTimeboxMs ?? GOAL_AUTHOR_GROUND_TIMEBOX_MS;
     try {
-      facts = await deps.ground(ask, persistentGrounding.deps);
+      const groundOutcome = await groundWithinTimebox(() => deps.ground(ask, persistentGrounding.deps), timeboxBudgetMs, groundStartedAt);
+      if ('timebox' in groundOutcome) {
+        // ⛔ `groundingError` 를 «안» 쓴다 — 접지가 던진 것과 예산 초과로 끊긴 것은 다른 사건이고,
+        //   처방도 다르다(앞은 채널 복구, 뒤는 더 좁은 ask/재시도). 두 값을 한 칸에 접으면 못 가른다.
+        groundingTimebox = groundOutcome.timebox;
+        observeGoalAuthor('goal-author', 'ground-timebox-exceeded', {
+          authorRunId,
+          budgetMs: groundOutcome.timebox.budgetMs,
+          elapsedMs: groundOutcome.timebox.elapsedMs,
+        });
+      } else {
+        facts = groundOutcome.facts;
+      }
     } catch {
       groundingError = true;
     } finally {
       endGoalAuthorPhase('ground', groundStartedAt, authorRunId, deps.onProgress);
       observeGoalAuthorPersistentGroundingResult(
         persistentGrounding.decision,
-        goalAuthorPersistentGroundingMetrics(facts, groundingError, authorRunId),
+        goalAuthorPersistentGroundingMetrics(facts, groundingError, authorRunId, groundingTimebox !== undefined),
       );
     }
   }
@@ -5594,7 +5881,12 @@ async function authorGoalWithSupersededRootIntent(
   const goalType = deps.goalType ?? 'implement';
   const evidenceProblem = hasEvidence
     ? groundedProblem(facts!, goalType === 'implement')
-    : [`- Not grounded: grounding ${groundingError ? 'failed' : 'found no repository facts'}; the repository problem is unverified and no file path or symbol is asserted.`];
+    : [
+      groundingTimebox === undefined
+        ? `- Not grounded: grounding ${groundingError ? 'failed' : 'found no repository facts'}; the repository problem is unverified and no file path or symbol is asserted.`
+        : `- Not grounded: grounding was stopped after exceeding its ${groundingTimebox.budgetMs}ms budget (elapsed ${groundingTimebox.elapsedMs}ms); the repository problem is unverified and no file path or symbol is asserted.`,
+      ...(groundingTimebox === undefined ? [] : [groundingTimeboxNotice(groundingTimebox)]),
+    ];
   if (hasEvidence) {
     observeProblemBackgroundEvidence(facts!, authorRunId);
     observePersistentEvidenceSourceKinds(facts!, authorRunId);
@@ -5688,7 +5980,12 @@ async function authorGoalWithSupersededRootIntent(
     const startedAt = Date.now();
     let failed = false;
     try {
-      const decomposed = await deps.decomposeSteps(ask, { context: facts?.context || undefined, runId: process.env.ELANOUS_RUN_ID?.trim() || authorRunId });
+      const device = inspectDeviceFirstGoal(ask, deps.repositoryRoot);
+      const deviceInventory = device.required && device.inventoryMeasured
+        ? [device.exists ? `existing: ${device.device}` : `missing: ${device.device}`] : undefined;
+      const context = [facts?.context, deviceInventory?.length ? `Device inventory (measured at goal-author repository root): ${deviceInventory.join(', ')}` : undefined]
+        .filter(Boolean).join('\n') || undefined;
+      const decomposed = await deps.decomposeSteps(ask, { context, runId: process.env.ELANOUS_RUN_ID?.trim() || authorRunId });
       if (decomposed.length > 0) resolvedSteps = decomposed;
     } catch {
       failed = true;
@@ -5961,6 +6258,14 @@ async function authorGoalWithSupersededRootIntent(
   } catch { /* 관측은 fail-soft */ }
   endAssembleSubphase();
   startAssembleSubphase('assemble-document');
+  // ⭐ GROUNDING-PERSISTENT-EMPTY-REPAIR 4/7 — TRACED PATHS 최종 행을 문서 조립 전에 한 번 확정해,
+  //   persistent 채널이 비어 있으면 구조화 사유·final traced count·출처를 관측 원장에 남긴다(launch-preflight 소비).
+  //   ⊕ `tracedPathsSection` 은 구현 골에서만 존재하므로 관측도 `goalType === 'implement'` 일 때만 한다는
+  //   인과 서술(모든 근거 줄이 Read 안 한 경로 인용으로 기각됐다)을 비구현 골에 기록하지 않는다.
+  const tracedPathsForDocument = goalType === 'implement'
+    ? tracedPathsSection(facts, ask, deps.repositoryRoot, narrative.tracedPathsUnavailableEvidence, authorRunId, deps.recordTracedPath)
+    : [];
+  if (goalType === 'implement') observeEmptyPersistentEvidence(facts, tracedPathsForDocument, authorRunId);
   const document = [
     explicitGoalTitle ?? goalSummary(enhancement.original),
     `- GoalId: ${assignedGoalId}`,
@@ -6013,7 +6318,7 @@ async function authorGoalWithSupersededRootIntent(
     '## REQUIRED EVIDENCE',
     ...requiredEvidence(criteria, facts ? implementationCandidates(facts) : [], authorRunId, deps.repositoryRoot),
     '',
-    ...(goalType === 'implement' ? ['## TRACED PATHS', ...tracedPathsSection(facts, ask, deps.repositoryRoot, narrative.tracedPathsUnavailableEvidence), ''] : []),
+    ...(goalType === 'implement' ? ['## TRACED PATHS', ...tracedPathsForDocument, ''] : []),
     '## SCOPE BOUNDARY',
     ...scopeBoundarySection,
     '',
@@ -6069,7 +6374,7 @@ async function authorGoalWithSupersededRootIntent(
         } catch { /* observation is fail-soft */ }
       }
     }
-    return { document, facts, grounded: !groundingError && hasEvidence, authorRunId };
+    return { document, facts, grounded: !groundingError && hasEvidence, authorRunId, ...(groundingTimebox === undefined ? {} : { groundingTimebox }) };
   } finally {
     endAssembleSubphase();
     if (!assembleCompleted) endGoalAuthorPhase('assemble', assembleStartedAt, authorRunId, deps.onProgress);
@@ -6281,11 +6586,14 @@ export async function writeAuthoredGoal(
       if (backlinkCount > 1) throw new Error('superseded goal file has duplicate Superseded-By');
       if (backlinkCount === 1) throw new Error('superseded goal file already has Superseded-By');
     }
+    const tracedPathEvents: TracedPathLedgerEvent[] = [];
+    const recordTracedPath = (entry: TracedPathLedgerEvent): void => { tracedPathEvents.push(entry); };
     const authored = await authorGoalWithSupersededRootIntent(ask, supersededDocument === undefined
-      ? { ...resolvedDeps, mandatoryGoalContextEvidence }
+      ? { ...resolvedDeps, mandatoryGoalContextEvidence, recordTracedPath }
       : {
         ...resolvedDeps,
         mandatoryGoalContextEvidence,
+        recordTracedPath,
         ...(supersededGoalId && { goalId: supersededGoalId }),
         ...(supersededRootIntent !== null && { supersessionRootIntent: supersededRootIntent }),
       });
@@ -6331,6 +6639,13 @@ export async function writeAuthoredGoal(
     if (!path) throw new Error(`goal author could not find a free filename after ${MAX_COLLISION_RETRIES} attempts for ${base}`);
     observeAuthoredConstraintMarkers(ask, authored.document, authored.authorRunId);
     observeAuthoredGroundingPathSections(authored.document, authored.facts?.files ?? [], authored.authorRunId);
+    if (tracedPathEvents.length > 0) {
+      const { appendRunLedgerEntry, runLedgerDir } = await import('./run-ledger.js');
+      const ledgerDir = runLedgerDir();
+      const goalId = parseGoalId(authored.document) ?? undefined;
+      for (const entry of tracedPathEvents) appendRunLedgerEntry({ runId: authored.authorRunId, goalId, ...entry }, ledgerDir);
+      appendRunLedgerEntry({ runId: authored.authorRunId, goalId, event: 'traced-path-continued', data: { authorRunId: authored.authorRunId, goalFile: path, corrected: tracedPathEvents.filter((entry) => entry.event === 'traced-path-correction').length, skipped: tracedPathEvents.filter((entry) => entry.event === 'traced-path-warning').length } }, ledgerDir);
+    }
     if (!canonicalSupersededPath || !supersededDocument) return { path, authored };
 
     const rewrite = fileDeps.rewrite ?? ((sourcePath: string, document: string) => atomicRewrite(sourcePath, document, fileDeps.rename));

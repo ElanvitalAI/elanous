@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
-import { writeTaskCards, type TaskCard } from './task-hand.js';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { idempotentCreateCardForRun, writeTaskCards, type TaskCard } from './task-hand.js';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,7 +10,8 @@ import type { GraphOverlaySpec } from '../self-implement/graph-overlay-yaml.js';
 import { setJourneyOverlaysForTesting } from '../self-dev/graph-journey-route.js';
 import { superviseRun, type SupervisorJobResult, type SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction } from './actions.js';
-import { defaultPrFiles, prRepositoryFromUrl, recordTaskAgentShadowMove, replayRemoteCardMoves, REMOTE_CARD_MOVE_PENDING, selectDeliveryCandidates, shadowJudgeInput } from './shadow.js';
+import type { Checklist } from '../release-loop/checklist.js';
+import { defaultPrFiles, prRepositoryFromUrl, productionGreenSweep, recordTaskAgentShadowMove, replayRemoteCardMoves, REMOTE_CARD_MOVE_PENDING, selectDeliveryCandidates, shadowJudgeInput } from './shadow.js';
 import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 
 const job = (over: Partial<SupervisorJobResult> = {}): SupervisorJobResult =>
@@ -42,6 +43,83 @@ function deliveryFixture() {
 }
 
 describe('TASK-AGENT-SHADOW — 멈춤 확정 → 판단부 → 실행부(shadow)', () => {
+  test('GREEN-FROM-LEDGER-FU: production shadow entry emits would-green and never writes the checklist', async () => {
+    const mergeSha = 'c'.repeat(40);
+    const mainSha = 'a'.repeat(40);
+    const cell = { id: 'CELL-GREEN', title: 'green cell', status: 'yellow' as const,
+      updatedAt: '2026-10-23T00:00:00.000Z', updatedBy: 'test' };
+    const board: Checklist = { version: '0.2.37', released: '0.2.36', dev: '0.2.37', items: [cell], history: [] };
+    const cards: TaskCard[] = [{ id: 'ta-green', text: 'feature ask', createdAt: '', status: 'done', history: [],
+      checklistId: cell.id, checklistVersion: '0.2.37', pr: 4242 }];
+    const writes: string[][] = [];
+    const root = mkdtempSync(join(tmpdir(), 'green-sweep-shadow-'));
+    const trafficPath = join(root, 'traffic.json');
+    writeFileSync(trafficPath, JSON.stringify({ hold: [] }));
+    const probeCommands: string[][] = [];
+    const evidenceLine = `GREEN-FROM-LEDGER: PR #4242 merged ${mergeSha} · green · bound-card-merged`;
+    try {
+      const runtime = {
+        readChecklist: (version: string) => { expect(version).toBe('0.2.37'); return board; },
+        readCards: () => cards,
+        trafficPath,
+        run: async (command: string, args: string[]) => {
+          probeCommands.push([command, ...args]);
+          if (command === 'git' && args[0] === 'remote') return { stdout: 'git@github.com:ElanvitalAI/elanous.git\n' };
+          if (command === 'git' && args[0] === 'rev-parse') return { stdout: `${mainSha}\n` };
+          if (command === 'git' && args[0] === 'ls-remote') return { stdout: `${mainSha}\trefs/heads/main\n` };
+          if (command === 'git' && args[0] === 'merge-base') return { stdout: '' };
+          if (command === 'gh') return { stdout: JSON.stringify({ number: 4242, state: 'MERGED', mergeCommit: { oid: mergeSha }, url: 'https://github.com/ElanvitalAI/elanous/pull/4242' }) };
+          throw new Error(`unexpected probe ${command} ${args.join(' ')}`);
+        },
+      };
+      const out = await recordTaskAgentShadowMove({ runId: 'run-green', stopReason: 'converged', results: [job({
+        ok: true, worktreePath: '/tmp/green-worktree', prNumber: 4242, merged: true,
+      })] }, {
+        env: {}, liveMoves: new Set(), readCard: () => cards[0], greenSweepRuntime: runtime,
+        prFiles: async () => ['src/task-agent/actions.ts'], log: () => {},
+        command: async (args) => { writes.push(args); return { status: 0, stdout: '' }; },
+      });
+      expect(out).toMatchObject({ move: 'propose-green', executorKind: 'green', executorResult: 'would-green' });
+      expect(out.wouldDo).toContain(`would-green: ${evidenceLine}`);
+      expect(probeCommands.some((args) => args[0] === 'git' && args[1] === 'ls-remote')).toBe(true);
+      expect(probeCommands.some((args) => args[0] === 'gh' && args[1] === 'pr')).toBe(true);
+      expect(writes).toEqual([]);
+
+      const withoutRunCheckout = await recordTaskAgentShadowMove({ runId: 'run-green-no-worktree', stopReason: 'converged', results: [job({
+        ok: true, prNumber: 4242, merged: true,
+      })] }, {
+        env: { ELANOUS_POD_NAME: 'test-pod', ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_PARENT_RUN_ID: 'parent-run' },
+        liveMoves: new Set(), readCard: () => ({ ...cards[0]!, runId: 'parent-run' }), greenSweepRuntime: runtime,
+        prFiles: async () => ['src/task-agent/actions.ts'], log: () => {},
+        command: async (args) => { writes.push(args); return { status: 0, stdout: '' }; },
+      });
+      expect(withoutRunCheckout).toMatchObject({ move: 'propose-green', executorKind: 'green', executorResult: 'refused' });
+      expect(withoutRunCheckout.wouldDo).toContain('repository-unreadable');
+      expect(writes).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('GREEN-FROM-LEDGER-FU production probe treats numeric merge-base exit 1 as non-ancestor', async () => {
+    const mainSha = 'a'.repeat(40);
+    const mergeSha = 'b'.repeat(40);
+    const cell = { id: 'CELL-NON-ANCESTOR', title: 'green cell', status: 'yellow' as const,
+      updatedAt: '2026-10-23T00:00:00.000Z', updatedBy: 'test' };
+    const board: Checklist = { version: '0.2.37', released: '0.2.36', dev: '0.2.37', items: [cell], history: [] };
+    const context = productionGreenSweep(cell.id, undefined, '/unused/state.json', '/repo', {
+      readChecklist: () => board, readCards: () => [], trafficPath: '/missing/traffic.json',
+      run: async (command, args) => {
+        if (command === 'git' && args[0] === 'rev-parse') return { stdout: `${mainSha}\n` };
+        if (command === 'git' && args[0] === 'ls-remote') return { stdout: `${mainSha}\trefs/heads/main\n` };
+        if (command === 'git' && args[0] === 'merge-base') throw Object.assign(new Error('not ancestor'), { code: 1 });
+        return { stdout: '' };
+      },
+    });
+    expect(context).toBeDefined();
+    await expect(context!.probe.ancestor(mergeSha)).resolves.toBe(false);
+    await expect(context!.probe.repositoryMatches?.(42)).resolves.toBeNull();
+    await expect(context!.probe.hold()).resolves.toBeNull();
+  });
+
   test('PR file query repository is bound to the exact PR URL, never the current checkout', async () => {
     expect(prRepositoryFromUrl(77, 'https://github.com/owner/other-repo/pull/77')).toBe('owner/other-repo');
     expect(prRepositoryFromUrl(77, 'https://github.com/owner/other-repo/pull/78')).toBeUndefined();
@@ -548,17 +626,26 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     expect(shadowJudgeInput('converged', [job()], undefined)).toEqual({ stopReason: 'converged' });
   });
 
-  test('파일 전달 밖 종류(ops-action)는 확인 증거를 기다리고 shadow-move 에 completion 을 남긴다 · code-pr 은 종전 문면', async () => {
-    const { worktree, card } = deliveryFixture();
+  test('파일 전달 밖 종류(ops-action)는 기본 손(«실행·조사»)의 확인 증거를 실제로 잰다 · code-pr 은 종전 문면', async () => {
+    const { worktree, target, card } = deliveryFixture();
     const logged: Array<Record<string, unknown>> = [];
     const log = (_c: string, _e: string, data: Record<string, unknown>) => { logged.push(data); };
+    // DEFAULT-HANDS — 실행 종결은 이제 저장소(`execution.jsonl`)의 실행 기록 ⊕ 되읽기를 실제로 잰다.
+    // 근거가 아직 없으면 «기다림»이 아니라 «범위를 좁혀 재발사»다(사람 손 0 으로 다시 만든다).
     const ops = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
       readCard: () => ({ ...card, completion: 'ops-action' }), log, env: {},
     });
-    expect(ops.move).toBe('wait');
-    expect(ops.reason).toBe('확인 증거 대기 — ops-action');
-    expect(ops.executorKind).toBeNull();
+    expect(ops.move).toBe('narrow-relaunch');
+    expect(ops.reason).toContain(`확인 증거 미충족(${card.id})`);
+    expect(ops.executorKind).toBe('retry');
     expect(logged.at(-1)).toMatchObject({ completion: 'ops-action' });
+    // 근거를 남기면 같은 자리에서 종결 제안으로 바뀐다 — 배선이 «재고 있다»는 뜻이다.
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, 'execution.jsonl'), `{"id":"${card.id}","type":"execution"}\n{"id":"${card.id}","type":"readback"}\n`);
+    const closedOps = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
+      readCard: () => ({ ...card, completion: 'ops-action' }), log, env: {},
+    });
+    expect(closedOps).toMatchObject({ move: 'propose-green', executorKind: 'green', executorResult: 'shadow' });
     const pr = await recordTaskAgentShadowMove({ runId: 'run', stopReason: 'converged', results: [job({ ok: true, worktreePath: worktree })] }, {
       readCard: () => ({ ...card, completion: 'code-pr' }), log, env: {},
     });
@@ -625,5 +712,72 @@ describe('종결 종류를 판단부 입력·shadow-move 관측에 싣는다 (RF
     expect(shadow.liveMove).toBeUndefined();
     expect(events.find((entry) => entry.event === 'shadow-move')?.data).toMatchObject({ live: false, liveExecuted: false });
     expect(raised).toHaveLength(0);
+  });
+});
+
+describe('TA-REVIEW-PASS — 카드 없는 runId 의 단일 카드 멱등 결속', () => {
+  const reviewResult = (pr: number) =>
+    [job({ taskId: 'unknown-task', feature: `review feature ${pr}`, ok: true, worktreePath: `/tmp/wt-${pr}`, prNumber: pr })];
+
+  test('TA-REVIEW-PASS: 카드 없는 runId 의 리뷰 판단 2회는 카드 1건을 멱등 생성·재사용하고 card.runId 가 입력 ID 와 정확히 일치한다', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'shadow-review-create-')), 'task-agent-actions.json');
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const deps = { statePath: path, env: {}, log: (_c: string, event: string, data: Record<string, unknown>) => { logs.push({ event, data }); }, prFiles: async () => ['src/x.ts'] };
+    const input = { runId: 'run-shadow-review', stopReason: 'needs-human' as const, results: reviewResult(26901) };
+    const ledger = async () => JSON.parse(await Bun.file(path).text()) as { tasks: Record<string, TaskCard> };
+    const first = await recordTaskAgentShadowMove(input, deps);
+    expect(first.move).toBe('review');
+    const state1 = await ledger();
+    const ids = Object.keys(state1.tasks);
+    expect(ids).toHaveLength(1);
+    const cardId = ids[0]!;
+    expect(cardId.startsWith('ta-')).toBe(true);
+    expect(state1.tasks[cardId]!.runId).toBe('run-shadow-review');
+    expect(state1.tasks[cardId]!.status).toBe('launched');
+    expect(state1.tasks[cardId]!.text).toBe('review feature 26901');
+    expect(logs.filter((entry) => entry.event === 'card-create-for-run-deferred')).toHaveLength(0);
+    // 두 번째 동일 판정 — 카드가 늘지 않고(재사용) runId 결속이 그대로다.
+    const second = await recordTaskAgentShadowMove(input, deps);
+    expect(second.move).toBe('review');
+    const state2 = await ledger();
+    expect(Object.keys(state2.tasks)).toEqual([cardId]);
+    expect(state2.tasks[cardId]!.runId).toBe('run-shadow-review');
+    expect(state2.tasks[cardId]!.history.filter((item) => item.event === 'card-created-for-run')).toHaveLength(1);
+  });
+
+  test('복수 카드가 runId 를 나눠 갖으면 임의 생성하지 않고 사유를 남겨 보류한다(fail-closed)', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'shadow-review-ambiguous-')), 'task-agent-actions.json');
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const deps = { statePath: path, env: {}, log: (_c: string, event: string, data: Record<string, unknown>) => { logs.push({ event, data }); }, prFiles: async () => ['src/x.ts'] };
+    writeTaskCards(path, [
+      { id: 'ta-amb-1', text: 'a', createdAt: '2026-10-23T00:00:00.000Z', status: 'launched', runId: 'run-ambiguous', history: [] },
+      { id: 'ta-amb-2', text: 'b', createdAt: '2026-10-23T00:00:00.000Z', status: 'launched', runId: 'run-ambiguous', history: [] },
+    ]);
+    const out = await recordTaskAgentShadowMove({ runId: 'run-ambiguous', stopReason: 'needs-human', results: reviewResult(26902) }, deps);
+    expect(out.move).toBe('review');
+    const state = JSON.parse(await Bun.file(path).text()) as { tasks: Record<string, TaskCard> };
+    expect(Object.keys(state.tasks).sort()).toEqual(['ta-amb-1', 'ta-amb-2']);
+    // runCardFor 가 모호함을 missed 로 남기고, 원시 함수도 복수 카드를 임의 생성 없이 사유와 함께 보류한다 — fail-closed.
+    const missed = logs.find((entry) => entry.event === 'run-card-fallback-missed');
+    expect(JSON.stringify(missed?.data)).toContain('2 cards share this runId (ambiguous)');
+    const deferred = logs.find((entry) => entry.event === 'card-create-for-run-deferred');
+    expect(JSON.stringify(deferred?.data)).toContain('ambiguous');
+  });
+
+  test('원격 Pod 자식 런·불명 runId 는 원시 함수에서도 임의 생성하지 않고 보류한다', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'shadow-review-primitive-')), 'task-agent-actions.json');
+    const pod = idempotentCreateCardForRun(path, { runId: 'run-prim', text: 't', env: { ELANOUS_POD_NAME: 'pod-a' } });
+    expect(pod).toEqual({ ok: false, reason: expect.stringContaining('pod-a') });
+    const blank = idempotentCreateCardForRun(path, { runId: ' ', text: 't', env: {} });
+    expect(blank.ok).toBe(false);
+    // 재진입에 안정적 id — 한 번 만들고 같은 runId 로 다시 부르면 같은 카드를 재사용한다.
+    const a = idempotentCreateCardForRun(path, { runId: ' run-prim ', text: 't', env: {} });
+    expect(a.ok && a.created).toBe(true);
+    const b = idempotentCreateCardForRun(path, { runId: 'run-prim', text: 't', env: {} });
+    expect(b.ok && b.card.id === (a.ok ? a.card.id : '') && !b.created).toBe(true);
+    expect(b.ok && b.card.runId).toBe('run-prim');
+    const state = JSON.parse(readFileSync(path, 'utf8')) as { tasks: Record<string, TaskCard> };
+    expect(Object.keys(state.tasks)).toHaveLength(1);
+    expect(state.tasks[a.ok ? a.card.id : '']!.runId).toBe('run-prim');
   });
 });

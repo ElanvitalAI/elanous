@@ -10,6 +10,8 @@ import { debug } from '../debug/log.js';
 import { appendMessage, createSession, getActiveSessionId, setActiveSessionId } from '../session/index.js';
 import { RESUME_BUSY_STATUS, parseResumeCommand, requestResumeTuiSession, resumeCandidates, resumeListLines } from './slash/resume.js';
 import { isNewSessionCommand } from './slash/new-session.js';
+import { resumeRowByNumber } from './slash/resume.js';
+import { seedSessionWithId } from '../ux-sim/session-id-seed.js';
 
 let dir = '';
 const saved: Record<string, string | undefined> = {};
@@ -59,7 +61,7 @@ describe('TUI-RESUME-PICKER incident — next TUI sent «/resume» to the model'
     const lines = resumeListLines(resumeCandidates(other), other);
     expect(lines[0]).toContain('최근 대화 2개');
     expect(lines.some((l) => l.includes(n8n.slice(0, 8)) && l.includes('n8n 특강 단계별 영상'))).toBe(true);
-    expect(lines.find((l) => l.includes(other.slice(0, 8)))?.startsWith('▸')).toBe(true);
+    expect(lines.find((l) => l.includes(other.slice(0, 8)))).toContain(`▸ ${other.slice(0, 8)}`);
   });
 
   test('an empty store says so instead of showing nothing', () => {
@@ -77,7 +79,7 @@ describe('requestResumeTuiSession', () => {
       const result = requestResumeTuiSession({ busy: false, from, prefix: target.slice(0, 10) });
       expect(result).toMatchObject({ kind: 'started', id: target });
       expect(getActiveSessionId()).toBe(target);
-      expect(log).toHaveBeenCalledWith('tui.next', 'session-resume', { from, to: target });
+      expect(log).toHaveBeenCalledWith('tui.next', 'session-resume', { from, to: target, by: 'prefix' });
     } finally {
       log.mockRestore();
     }
@@ -92,3 +94,62 @@ describe('requestResumeTuiSession', () => {
     expect(getActiveSessionId()).toBe(from);
   });
 });
+
+describe('TUI-RESUME-PICKER — pick by number · ids that share their first 8 characters', () => {
+  test('rows are numbered; /resume <n> resumes the n-th row the user saw', () => {
+    const a = seed('첫째');
+    const b = seed('둘째');
+    const from = seed('지금 대화');
+    setActiveSessionId(from);
+    const rows = resumeCandidates(from);
+    const lines = resumeListLines(rows, from);
+    expect(lines[0]).toContain('/resume <번호>');
+    rows.forEach((m, i) => expect(lines[i + 1]).toMatch(new RegExp(`^${i + 1}\\. [ ▸] ${m.id.slice(0, 8)}`)));
+    const pick = rows.findIndex((m) => m.id === a) + 1;
+    const log = spyOn(debug, 'log');
+    try {
+      expect(requestResumeTuiSession({ busy: false, from, prefix: String(pick), rows })).toMatchObject({ kind: 'started', id: a });
+      expect(log).toHaveBeenCalledWith('tui.next', 'session-resume', { from, to: a, by: 'number' });
+    } finally {
+      log.mockRestore();
+    }
+    expect(getActiveSessionId()).toBe(a);
+    expect(resumeRowByNumber(String(rows.findIndex((m) => m.id === b) + 1), rows)?.id).toBe(b);
+  });
+
+  test('a number outside the list, 0, or 4+ digits is not a row', () => {
+    // A fixed id with no digit start: `9` falls back to a prefix lookup, which a random UUID would match 1 time in 16.
+    const rows = resumeCandidates(seedSessionWithId('aaaa0000-0000-4000-8000-000000000009', '하나'));
+    for (const arg of ['0', String(rows.length + 1), '1234', '1a']) expect(resumeRowByNumber(arg, rows)).toBeNull();
+    expect(requestResumeTuiSession({ busy: false, from: null, prefix: '9', rows })).toMatchObject({ kind: 'rejected' });
+  });
+
+  test('colliding 8-char prefixes: the list shows longer unique prefixes and each one resumes its own session', () => {
+    const ids = [
+      seedSessionWithId('abcd1234-0001-4000-8000-000000000001', 'n8n 특강'),
+      seedSessionWithId('abcd1234-0002-4000-8000-000000000002', 'RSS 재촬영'),
+      seedSessionWithId('abcd1234-0002-4fff-8000-000000000003', '세 번째'),
+    ];
+    const from = seed('지금 대화');
+    setActiveSessionId(from);
+    const lines = resumeListLines(resumeCandidates(from), from);
+    const expected = { [ids[0]!]: 'abcd1234-0001', [ids[1]!]: 'abcd1234-0002-40', [ids[2]!]: 'abcd1234-0002-4f' };
+    for (const [id, prefix] of Object.entries(expected)) {
+      expect(lines.some((l) => l.includes(` ${prefix} `))).toBe(true);
+      setActiveSessionId(from);
+      expect(requestResumeTuiSession({ busy: false, from, prefix })).toMatchObject({ kind: 'started', id });
+    }
+    // The old fixed 8-character cut is ambiguous — that was the bug.
+    expect(requestResumeTuiSession({ busy: false, from, prefix: 'abcd1234' })).toMatchObject({ kind: 'rejected' });
+  });
+
+  test('the status line names both sessions by their unique prefix — daemon ids are not cut to «elanous-»', () => {
+    const from = seedSessionWithId('elanous-session-c01bd3', '지금 대화');
+    const to = seedSessionWithId('elanous-session-h7k2pq', '이어 갈 대화');
+    setActiveSessionId(from);
+    const r = requestResumeTuiSession({ busy: false, from, prefix: 'elanous-session-h' });
+    expect(r).toMatchObject({ kind: 'started', id: to });
+    expect(r.status).toBe('대화 이어 가기 · elanous-session-h · 이전 = elanous-session-c');
+  });
+});
+

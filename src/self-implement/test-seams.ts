@@ -11,7 +11,8 @@ export function seams(over: Partial<SelfImplementSeams> & { gateResults?: boolea
   const gateResults = over.gateResults ?? [true];
   let gateCall = 0;
   const features = over.features ?? [];
-  return {
+  let openedHead = '';
+  const defaults: SelfImplementSeams = {
     // ⭐ 테스트는 «환경(실제 stdin)»이 아니라 계약을 검사한다 — 기본은 「사람이 있다」로 둔다.
     //    비-TTY 게이트 자체는 아래 전용 테스트가 «명시»로 확인한다.
     stdinIsInteractive: () => true,
@@ -40,5 +41,16 @@ export function seams(over: Partial<SelfImplementSeams> & { gateResults?: boolea
     judgmentCallLLM: async ({ prompt }) => prompt.match(/BUDGET:\s*(EXTEND|SUFFICIENT|UNCONVERGEABLE)/)?.[1] ?? 'EXTEND',
     decomposeShadowGoals: async () => ({ goals: [], decomposition: { recommendedMaxTasks: 6, actualTaskCount: 0, truncatedAtHardMax: false, exceededRecommendedMax: false, outcome: 'single-no-subtasks' } }),
     ...over,
+  };
+  const openPr = defaults.openPr;
+  const defaultPrAttribution = Object.assign(async () => ({
+    headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString(),
+  }), { testDefaultPrAttribution: true });
+  return {
+    ...defaults,
+    openPr: async (input) => { openedHead = input.head; return openPr(input); },
+    // Unit seams represent the PR just opened by this run. Tests of mismatch
+    // and metadata failures override this explicitly, without invoking gh.
+    readPrAttribution: over.readPrAttribution ?? defaultPrAttribution,
   };
 }

@@ -9,7 +9,7 @@ import type { GitRunResult } from '../git-fs/retry.js';
 import { linkWorktreeDependencies, worktreeAddTimeoutForRepo } from '../git-fs/worktree.js';
 import { reapStaleGateWorktrees } from './gate-baseline-reap.js';
 
-export type GateFailureAttribution = 'introduced' | 'preexisting' | 'unknown' | 'precondition-unmet' | 'flaky-timeout' | 'flaky-rerun';
+export type GateFailureAttribution = 'introduced' | 'preexisting' | 'unknown' | 'precondition-unmet' | 'flaky-timeout' | 'flaky-rerun' | 'timeout-recheck-passed';
 export type GateBaselinePresence = 'present' | 'missing' | 'unknown';
 export type TimeoutVariability = 'may-vary' | 'same' | 'unknown';
 
@@ -72,6 +72,16 @@ export interface GateBaselineReport extends GateBaselineSummary {
   files: string[];
   baselineStatus: BaselineProcessStatus;
   log: string;
+  timeoutRechecks?: TimeoutRecheckRecord[];
+  timeoutRecheckPassed?: number;
+}
+
+export interface TimeoutRecheckRecord {
+  name: string;
+  file: string;
+  result: 'pass' | 'timeout' | 'failure' | 'unknown';
+  elapsedMs: number;
+  rawResultLine: string;
 }
 
 interface GateTestCountChange {
@@ -697,6 +707,9 @@ function summarizeGateBaseline(failures: readonly GateTestFailure[]): GateBaseli
       if (failure.attribution === 'flaky-rerun') {
         return { ...withPresence, flakyRerun: withPresence.flakyRerun + 1 };
       }
+      if (failure.attribution === 'timeout-recheck-passed') {
+        return withPresence;
+      }
       const withTimeoutRegression = failure.timeoutRegression === 'passed-at-base'
         ? { ...withPresence, timeoutPassedAtBase: withPresence.timeoutPassedAtBase + 1 }
         : withPresence;
@@ -720,6 +733,51 @@ export function classifyBunSingleTestRerun(result: ProcessResult): TimeoutRerunO
 export function rerunBunSingleTest(cwd: string, file: string, testName: string, timeout: number): TimeoutRerunObservation | undefined {
   const result = runIsolatedBunTest(cwd, ['--test-name-pattern', buildBunSingleTestPattern(testName), file], timeout);
   return classifyBunSingleTestRerun(result);
+}
+
+/** A standalone timeout-only retry is allowed only when every introduced failure is explicitly a Bun timeout. */
+export function recheckTimeoutOnlyIntroducedFailures(
+  cwd: string,
+  report: GateBaselineReport,
+  run: (cwd: string, file: string, name: string, timeoutMs: number) => { observation?: TimeoutRerunObservation; elapsedMs: number; output: string } = runTimeoutRecheck,
+): GateBaselineReport {
+  const eligible = report.failures.length > 0
+    && report.introduced === report.failures.length
+    && report.failures.every((failure) => failure.attribution === 'introduced' && !!failure.file
+      && /\bthis test timed out after \d+ms\b/i.test(failure.diagnostic ?? ''));
+  if (!eligible) return report;
+  const records: TimeoutRecheckRecord[] = [];
+  const failures = report.failures.map((failure) => {
+    if (!failure.file) return failure;
+    const prefix = `${failure.file} > `;
+    const name = failure.name.startsWith(prefix) ? failure.name.slice(prefix.length) : failure.name;
+    const { observation, elapsedMs, output } = run(cwd, failure.file, name, 60_000);
+    const result = observation ?? 'unknown';
+    const record: TimeoutRecheckRecord = {
+      name: failure.name, file: failure.file, result, elapsedMs,
+      rawResultLine: flattenControlChars(redactSecretText(output)).slice(-500),
+    };
+    records.push(record);
+    debug.log('gate.baseline', 'timeout-recheck', record);
+    return result === 'pass' ? { ...failure, attribution: 'timeout-recheck-passed' as const } : failure;
+  });
+  return {
+    ...report,
+    ...summarizeGateBaseline(failures),
+    failures,
+    timeoutRechecks: records,
+    timeoutRecheckPassed: failures.filter((failure) => failure.attribution === 'timeout-recheck-passed').length,
+  };
+}
+
+function runTimeoutRecheck(cwd: string, file: string, name: string, timeoutMs: number): { observation?: TimeoutRerunObservation; elapsedMs: number; output: string } {
+  const started = Date.now();
+  const result = runIsolatedBunTest(cwd, ['--timeout', String(timeoutMs), '--test-name-pattern', buildBunSingleTestPattern(name), file], timeoutMs + 10_000);
+  return {
+    observation: classifyBunSingleTestRerun(result),
+    elapsedMs: Date.now() - started,
+    output: `${String(result.stdout ?? '')}\n${String(result.stderr ?? '')}`,
+  };
 }
 
 /** `introduced` 재실행 상한. 초과분은 돌리지 않고 보고서에 남긴다. 부하로 건너뛰지 않는다. */
@@ -1512,6 +1570,7 @@ export function formatGateBaselineNote(report: GateBaselineReport, unrunImporter
     + `, unknown=${report.unknown}, precondition-unmet=${report.preconditionUnmet}`
     + (report.timedOut > 0 ? `, timed-out=${report.timedOut}` : '')
     + (report.flakyRerun > 0 ? `, flaky-rerun=${report.flakyRerun}` : '')
+    + ((report.timeoutRecheckPassed ?? 0) > 0 ? `, timeout-recheck-passed=${report.timeoutRecheckPassed}` : '')
     + (runId ? `, run=${runId}` : '')
     + (report.missingAtBase > 0 ? `, missing-at-base=${report.missingAtBase}` : '');
   const lines = report.failures.map((failure) => `- ${failure.attribution}: ${failure.name}`
@@ -1532,10 +1591,14 @@ export function formatGateBaselineNote(report: GateBaselineReport, unrunImporter
     : report.rerunNotRun > 0
       ? `\n[gate-baseline] rerun not-run=${report.rerunNotRun}`
       : '';
+  const timeoutRecheckLines = report.timeoutRechecks?.length
+    ? `\n[gate.baseline.timeout-recheck] ${report.timeoutRechecks.map((item) => `${item.name}: ${item.result} elapsed=${item.elapsedMs}ms · ${item.rawResultLine}`).join('\n')}`
+    : '';
   return `${head}\n${lines.join('\n')}\n${report.log}`
     + timedOutLine
     + mayVaryNonTimeoutLine
     + rerunLine
+    + timeoutRecheckLines
     + (report.preexisting > 0 ? '\n⚠️ preexisting 실패는 base에서도 재현됨 — 이 PR의 책임이 아니다.' : '');
 }
 

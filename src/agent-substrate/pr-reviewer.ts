@@ -655,6 +655,7 @@ export function buildReviewPrompt(
     '  - WARN = ships but has non-blocking concerns.',
     '  - PASS = correct and sound (a watch item is still fine).',
     'Then optionally a line "MUST-FIX:" followed by blocker findings (one per line, "- " prefix),',
+    'If there are no blockers, leave MUST-FIX empty; do not put “없음”, “결함 없음”, “none”, or any explanatory no-finding sentence in that list.',
     'then optionally a line "SHOULD-FIX:" followed by non-blocker findings ("- " prefix). Keep each finding one concise line.',
     'Then optionally a line "REQUIREMENTS:" followed by repository context you need to inspect before making a determination ("- " prefix). This is observational only and does not change the verdict.',
   ].join('\n');
@@ -689,14 +690,17 @@ const NO_FINDING_REMARK = new RegExp([
   String.raw`^(?:(?:블로커|차단)\s*)?(?:수준의?\s*)?(?:결함|문제|이슈|지적|블로커)(?:은|는|이|가)?\s*(?:발견되지\s*않(?:음|았(?:다|습니다)?)|없(?:음|다|습니다))[.。]?$`,
   // REVIEW-MUSTFIX-NONE-PARSE — `(없음 — 이 조각 범위에서는 차단 결함 없음)` 꼬리.
   String.raw`^(?:이\s*)?(?:조각\s*)?범위(?:에서는|에서|엔)?\s*(?:블로커|차단)(?:\s*(?:수준의?\s*)?(?:결함|문제|이슈|지적))?\s*없(?:음|다|습니다)[.。]?$`,
-  String.raw`^(?:no|zero)\s+(?:blocking\s+)?(?:blockers?|issues?|problems?|findings?|must-?fix(?:es)?)(?:\s+found)?\.?$`,
+  String.raw`^이\s*조각에서\s*확인된\s*코어\s*결함\s*없음\s*[—–-]\s*명시\s*intent\s*기준\s*mustFix\s*는\s*비움$`,
+  String.raw`^이\s*조각에서\s*검증된\s*(?:차단\s*)?결함은\s*발견되지\s*않음(?:\s*\(mustFix\s*\[\]\))?$`,
+  String.raw`^코드\s*경로\s*자체는\s*결함\s*없음[.。]?$`,
+  String.raw`^(?:no|zero)\s+(?:blocking\s+)?(?:blockers?|defects?|issues?|problems?|findings?|must-?fix(?:es)?)(?:\s+found)?\.?$`,
   String.raw`^nothing\s+(?:blocking|to\s+fix)\.?$`,
   // REVIEW-MUSTFIX-NONE-SENTINEL — `(없음 — 수용기준 충족)` · `(none — acceptance criteria met)` (GLM 실측 6건). «미충족» 은 ^ 앵커로 안 맞는다.
   String.raw`^수용\s*기준(?:을|이)?\s*(?:(?:모두|전부)\s*)?충족(?:함|됨|했다|합니다)?[.。]?$`,
   String.raw`^(?:all\s+)?acceptance\s+criteria\s+(?:are\s+)?(?:all\s+)?met\.?$`,
 ].join('|'), 'i');
-// Unbracketed free text is more ambiguous; fold only explicit blocker-absence statements.
-const UNBRACKETED_NO_FINDING_REMARK = /^(?:(?:블로커|차단)\s*)?(?:수준의?\s*)?(?:결함|문제|이슈|지적|블로커)(?:은|는|이|가)?\s*(?:발견되지\s*않(?:음|았(?:다|습니다)?)|없(?:음|다|습니다))[.。]?$/i;
+// Whole-item no-finding statements are safe to fold. Any additional clause is kept fail-closed.
+const UNBRACKETED_NO_FINDING_REMARK = /^(?:(?:블로커|차단|코어|실제)\s*)?(?:수준의?\s*)?(?:결함|문제|이슈|지적|블로커|findings?|defects?|issues?|problems?|blockers?)(?:은|는|이|가)?\s*(?:발견되지\s*않(?:음|았(?:다|습니다)?)|없(?:음|다|습니다)|not\s+found|none\s+found)[.。]?$/i;
 // OP #3173 — 설명은 의미 추정하지 않는다. 실측으로 무소견임을 확인한 문장만 등록한다.
 // 문법 밖 `없음 — 설명`은 실제 결함일 수 있으므로 mustFix에 남긴다.
 const LONG_BRACKETED_SENTINEL = new RegExp(String.raw`^[([（【]\s*(?:[-—–]+\s*)?${NONE_WORD}\s*[—–\-:·]\s*([\s\S]+?)\s*[)\]）】]$`, 'i');
@@ -752,8 +756,12 @@ export function isNoneSentinelFinding(finding: string): boolean {
   const markerText = text.replace(/^[—–-]+\s*|\s*[—–-]+$/g, '').trim();
   const unbracketedNone = new RegExp(String.raw`^${NONE_WORD}\s*[—–\-:·]\s*(.+)$`, 'i').exec(markerText);
   if (unbracketedNone && UNBRACKETED_NO_FINDING_REMARK.test(unbracketedNone[1]!.trim())) return true;
+  if (UNBRACKETED_NO_FINDING_REMARK.test(markerText)) return true;
   const leadingNone = /^[（(]\s*(?:없음|none)\s*[）)]\s+(.+)$/i.exec(markerText);
   if (leadingNone && KNOWN_NO_FINDING_REMARKS.has(leadingNone[1]!.trim())) return true;
+  if (NO_FINDING_REMARK.test(markerText)) return true;
+  const bracketedRemark = BRACKETED_PLACEHOLDER.exec(markerText);
+  if (bracketedRemark && NO_FINDING_REMARK.test(bracketedRemark[1]!.trim())) return true;
   if (markerText && (BARE_SENTINEL.test(markerText) || DASH_ONLY_SENTINEL.test(markerText) || DASH_WRAPPED_BRACKETED_SENTINEL.test(markerText))) return true;
   const bracketed = BRACKETED_SENTINEL.exec(markerText);
   if (bracketed) {

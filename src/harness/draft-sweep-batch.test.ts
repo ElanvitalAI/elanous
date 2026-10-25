@@ -105,7 +105,7 @@ function fakeGh(graphql: boolean, calls: string[], fixtures: Fixture[] = [...OPE
     if ((match = /\/pulls\/(\d+)$/.exec(endpoint))) return JSON.stringify({ head: { sha: byNumber.get(Number(match[1]))!.head } });
     if ((match = /\/commits\/(\w+)\/status$/.exec(endpoint))) return JSON.stringify({ state: 'success' });
     if ((match = /\/commits\/(\w+)\/check-runs\?per_page=100&page=\d+$/.exec(endpoint)))
-      return JSON.stringify({ check_runs: byHead.get(match[1]!)?.number === 16 ? [{ conclusion: 'failure' }] : [{ conclusion: 'success' }] });
+      return JSON.stringify({ total_count: 1, check_runs: byHead.get(match[1]!)?.number === 16 ? [{ conclusion: 'failure' }] : [{ conclusion: 'success' }] });
     if ((match = /\/commits\/(\w+)\?per_page=100$/.exec(endpoint))) {
       const commit = OPEN.flatMap((pr) => pr.commits ?? []).find((entry) => entry.sha === match![1]);
       return JSON.stringify({ files: (commit?.files ?? []).map((filename) => ({ filename })) });

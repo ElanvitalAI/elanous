@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { writePeerEdit } from '../nexus/api/graph-peer-edit.js';
+import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { Command } from 'commander';
 import { registerGraphCommands } from './graph-cli.js';
 
@@ -23,6 +24,61 @@ function spawnGraphAt(stateRoot: string, cwd: string, ...args: string[]): { code
 function spawnGraph(stateRoot: string, ...args: string[]): { code: number | null; stdout: string; stderr: string } {
   return spawnGraphAt(stateRoot, root, ...args);
 }
+
+test('graph adapt-report measures same-goal A/A/B ledger paths, adaptations, landings and exclusions', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-adapt-report-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const ledgerDir = join(stateRoot, 'run-ledger');
+  mkdirSync(ledgerDir, { recursive: true });
+  const goalId = 'goal-adapt-report';
+  const event = (runId: string, name: string, data: Record<string, unknown>) => ({
+    runId, goalId, timestamp: '2026-10-24T00:00:00Z', event: name, data,
+  });
+  const put = (suffix: number, entries: ReturnType<typeof event>[]) => {
+    const runId = `run-00000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
+    writeFileSync(join(ledgerDir, `${runId}.jsonl`), entries.map(entry => JSON.stringify({ ...entry, runId })).join('\n') + '\n');
+    return runId;
+  };
+  for (const [suffix, path, adapted, landed, calls] of [
+    [1, ['A', 'done'], true, true, 2],
+    [2, ['A', 'done'], false, false, 1],
+    [3, ['B', 'done'], false, true, 0],
+  ] as const) {
+    const runId = `run-00000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
+    put(suffix, [event(runId, 'start', {}),
+      event(runId, 'pipeline-traversal-shadow', { observedNodes: path }),
+      ...(adapted ? [event(runId, 'graph-variant-applied', { graphId: 'self-implement', overlayId: 'variant-A' })] : []),
+      event(runId, 'merged', { merged: landed, number: suffix })]);
+    const graphDir = join(stateRoot, 'graph-runs', 'self-implement');
+    mkdirSync(graphDir, { recursive: true });
+    writeFileSync(join(graphDir, `${runId}.json`), JSON.stringify({ graphId: 'self-implement', runId,
+      unitCalls: Array.from({ length: calls }, (_, index) => ({ node: `call-${index}`, unit: 'worker', version: 1,
+        hash: 'hash', childRunId: `child-${index}`, exit: 'done', steps: 1 })) }));
+  }
+  const invalid = put(4, [event('ignored', 'start', {})]);
+  writeFileSync(join(ledgerDir, `${invalid}.jsonl`), '{bad}\n');
+  const other = `run-00000000-0000-4000-8000-${String(5).padStart(12, '0')}`;
+  put(5, [event(other, 'start', {}), event(other, 'pipeline-traversal-shadow', { observedNodes: ['C'] })]
+    .map(entry => ({ ...entry, goalId: 'other-goal' })));
+
+  const result = spawnGraph(stateRoot, 'adapt-report', '--goal', goalId, '--json');
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    goalId, runCount: 3, uniquePathSignatures: 2, unitCallCount: 3, adaptationCount: 1,
+    adapted: { landed: 1, denominator: 1, rate: 1 },
+    nonAdapted: { landed: 1, denominator: 2, rate: 0.5 },
+    excludedCount: 1, exclusionReasons: { 'invalid-ledger': 1 },
+  });
+  const empty = spawnGraph(stateRoot, 'adapt-report', '--goal', 'absent-goal');
+  expect(empty.code).toBe(0);
+  expect(empty.stdout).toContain('표본 0');
+  expect(empty.stdout).not.toContain('착지율');
+  const emptyJson = spawnGraph(stateRoot, 'adapt-report', '--goal', 'absent-goal', '--json');
+  expect(JSON.parse(emptyJson.stdout)).toMatchObject({ runCount: 0,
+    adapted: { landed: 0, denominator: 0, rate: null },
+    nonAdapted: { landed: 0, denominator: 0, rate: null } });
+}, 120_000);
 
 test('graph wizard-run is exposed as the smart wizard request entrypoint', () => {
   const program = new Command();
@@ -341,6 +397,50 @@ edges:
   expect(status.code).toBe(0);
   expect(JSON.parse(status.stdout)).toEqual(persisted);
 }, 30000);
+
+test('graph runs status exposes failed command exit and masked stderr reason only on failure', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-failure-reason-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const pluginDir = join(stateRoot, 'plugins', 'local', 'sample-plugin', '1.0.0');
+  const graphsDir = join(pluginDir, 'graphs');
+  mkdirSync(graphsDir, { recursive: true });
+  writeFileSync(join(pluginDir, 'plugin.ts'), 'export default {}');
+  writeFileSync(join(pluginDir, 'plugin.json'), JSON.stringify({ id: 'sample-plugin', version: '1.0.0', main: './plugin.ts',
+    contributes: { connectors: [{ id: 'service', fields: [{ name: 'KEY', env: 'SAMPLE_PLUGIN_KEY' }] }] } }));
+  setPluginCredentials('sample-plugin', { KEY: 'cli-node-secret' }, stateRoot);
+  const graph = join(graphsDir, 'graph.yaml');
+  const graphSource = [
+    'graph_id: cli-failure-reason', 'version: 1', 'entry_node: first', 'terminal_nodes: [done, failed]', 'nodes:',
+    "  - { node_id: first, kind: agent, recipe: 'cmd:first', max_visits: 1 }",
+    '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }', 'edges:',
+    '  - from: first', '    on: outcome', '    map: { ok: done, fail: failed }',
+  ].join('\n') + '\n';
+  writeFileSync(graph, graphSource);
+  const recipesPath = join(graphsDir, 'recipes.yaml');
+  writeFileSync(recipesPath, `first:\n  command: 'printf "failed with %s\\n" "$SAMPLE_PLUGIN_KEY" >&2; exit 7'\n`);
+
+  const failed = spawnGraphAt(stateRoot, dir, 'run', graph, '--json');
+  expect(failed.code).toBe(1);
+  const failedState = JSON.parse(failed.stdout);
+  expect(failedState.nodes[0]).toMatchObject({ exit: 7, reason: 'failed with [REDACTED]' });
+  expect(failed.stdout).not.toContain('cli-node-secret');
+  const failedStatus = spawnGraphAt(stateRoot, dir, 'runs', 'status', failedState.runId, '--json');
+  expect(failedStatus.code).toBe(0);
+  expect(JSON.parse(failedStatus.stdout).nodes[0]).toMatchObject({ nodeId: 'first', ok: false, exit: 7, reason: 'failed with [REDACTED]' });
+
+  writeFileSync(recipesPath, `first:\n  command: 'printf "successful with %s\\n" "$SAMPLE_PLUGIN_KEY" >&2; exit 0'\n`);
+  const successful = spawnGraphAt(stateRoot, dir, 'run', graph, '--json');
+  expect(successful.code).toBe(0);
+  const successfulState = JSON.parse(successful.stdout);
+  expect(successfulState.nodes[0]).toMatchObject({ exit: 0, ok: true });
+  expect(successfulState.nodes[0]).not.toHaveProperty('reason');
+  const successfulStatus = spawnGraphAt(stateRoot, dir, 'runs', 'status', successfulState.runId, '--json');
+  expect(successfulStatus.code).toBe(0);
+  expect(JSON.parse(successfulStatus.stdout).nodes[0]).toMatchObject({ nodeId: 'first', ok: true, exit: 0 });
+  expect(JSON.parse(successfulStatus.stdout).nodes[0]).not.toHaveProperty('reason');
+});
 
 test('CLI --resume --from restarts the failed path and writes progress only to stderr', () => {
   const dir = mkdtempSync(join(tmpdir(), 'graph-cli-from-'));

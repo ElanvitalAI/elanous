@@ -16,7 +16,13 @@ import * as podDispatch from './harness-pod-dispatch.js';
 import { runSelfOrchestrateCliCommand } from '../self-dev/orchestrate-cli.js';
 import { formatOrchestrateResultLine } from '../self-dev/orchestrate-summary-line.js';
 import { RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
+import { runDraftSweep } from '../self-dev/draft-sweep.js';
+import { decideDraft } from '../self-dev/draft-triage-rules.js';
+import { runHarnessPlanRfc } from './harness-plan-rfc.js';
 import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
+import { HostPoolLease } from '../pod-lease/host-lease.js';
+import { createFakeKubectl } from '../ux-sim/fake-kubectl.js';
+import { createFakeGh } from '../ux-sim/fake-gh.js';
 import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
 import { assessRunningRuns, buildRunProgressRows, renderRunProgressTable } from '../self-implement/running-runs.js';
@@ -42,6 +48,7 @@ import {
   harnessQueueDirectSay,
   killHarnessProcess,
   githubDraftSweepAdapters,
+  githubDraftSweepPreviewAdapters,
   supersedeMergedGoalDrafts,
   draftSweepRunStatus,
   observeHarnessLaunchdPids,
@@ -837,7 +844,7 @@ describe('harness CLI command', () => {
       { adapters, repository: () => 'default/repo', write: (line) => lines.push(line) });
     const drafts = harness.commands.find((command) => command.name() === 'drafts')!;
     expect(drafts.commands.find((command) => command.name() === 'sweep')?.options.map((option) => option.long))
-      .toEqual(['--apply', '--json', '--repo', '--close-cap']);
+      .toEqual(['--apply', '--json', '--repo', '--close-cap', '--max-pages', '--max-drafts', '--max-merged', '--emit-apply-plan', '--apply-plan-file']);
     await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json', '--repo', 'my/repo']);
     expect(JSON.parse(lines.at(-1)!)).toMatchObject({ repository: 'my/repo', apply: false, complete: true,
       entries: [{ number: 43, action: 'close', applied: false }] });
@@ -852,6 +859,53 @@ describe('harness CLI command', () => {
     expect(labels).toEqual([['default/repo', 43, { add: 'elanous:swept:stale-ended-run', remove: [] }]]);
     expect(lines.at(-2)).toContain('#43 close:');
     expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1 · 처리 중 0 · 표식 만료 0 · 24h 넘음 1 · 정리 대상 0 · 수확 대기 0 · 막힘 0');
+  });
+
+  test('draft sweep JSON waits for the stdout write callback when emitting a large result', async () => {
+    const drafts = Array.from({ length: 80 }, (_, index) => ({
+      number: 10_000 + index, title: `draft ${index}`, branch: `self-impl/draft-${index}`,
+      labels: [], body: '', createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+    }));
+    const adapters = {
+      listDrafts: async (page: number) => page === 1 ? drafts : [],
+      listMerged: async () => [],
+      listLiveBranches: async () => new Set<string>(),
+      getRunStatus: async () => undefined,
+      setLabels: async () => {},
+      closeDraft: async () => {},
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, repository: () => 'owner/repo' });
+    const originalWrite = process.stdout.write;
+    const originalLog = console.log;
+    const previousExitCode = process.exitCode;
+    let output = '';
+    let finishWrite: (() => void) | undefined;
+    process.exitCode = 0;
+    process.stdout.write = ((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+      output += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+      const done = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback;
+      finishWrite = () => done?.();
+      return false;
+    }) as typeof process.stdout.write;
+    console.log = () => { throw new Error('draft sweep JSON must use the awaited stdout helper'); };
+    try {
+      let settled = false;
+      const action = program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json'])
+        .finally(() => { settled = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(Buffer.byteLength(output)).toBeGreaterThan(65_536);
+      expect(output.endsWith('\n')).toBe(true);
+      expect(settled).toBe(false);
+      finishWrite?.();
+      await action;
+      expect(settled).toBe(true);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      process.stdout.write = originalWrite;
+      console.log = originalLog;
+      process.exitCode = previousExitCode ?? 0;
+    }
   });
 
   test('draft sweep --close-cap overrides config tools.selfImplement.draftSweepCloseCap; an invalid config falls back to 10', async () => {
@@ -1186,31 +1240,29 @@ describe('harness CLI command', () => {
   });
 
   test('merge-time GitHub adapter reuses open-draft inventory and liveness without listing closed PRs', async () => {
-    const requests: string[][] = [];
-    const merged = { number: 90, state: 'closed', draft: false, title: 'same goal', head: { ref: 'self-impl/merged-goalid-abcd-new' },
-      labels: [], created_at: '2026-10-01T00:00:00Z', merged_at: '2026-10-02T00:00:00Z' };
-    const gh = (args: string[]) => {
-      requests.push(args);
-      if (args[0] === 'api' && args[1] === 'repos/my/repo/pulls/90') return JSON.stringify(merged);
-      if (args[0] === 'api' && args[1]?.includes('state=closed')) throw new Error('must not list closed PRs');
-      if (args[0] === 'api' && args[1]?.includes('/files?')) return '[]';
-      if (args[0] === 'api' && args[1]?.includes('state=open')) return JSON.stringify([
-        { number: 1, draft: true, title: 'same goal', head: { ref: 'self-impl/old-goalid-abcd-r1' }, labels: [{ name: 'elanous:stalled' }],
-          created_at: '2026-09-01T00:00:00Z', merged_at: null },
-        { number: 2, draft: true, title: 'same goal', head: { ref: 'self-impl/release-goalid-abcd-r2' }, labels: [{ name: 'elanous:stalled' }, { name: RELEASE_PATH_LABEL }],
-          created_at: '2026-09-01T00:00:00Z', merged_at: null },
-        { number: 3, draft: true, title: 'another goal', head: { ref: 'self-impl/other' }, labels: [{ name: 'elanous:stalled' }],
-          created_at: '2026-09-01T00:00:00Z', merged_at: null },
-        { number: 4, draft: true, title: 'same goal', head: { ref: 'self-impl/live-goalid-abcd-r4' }, labels: [{ name: 'elanous:stalled' }],
-          created_at: '2026-09-01T00:00:00Z', merged_at: null },
-      ]);
-      return '';
-    };
+    const ghFake = createFakeGh({ repository: 'my/repo', prs: [
+      { number: 90, title: 'same goal', branch: 'self-impl/merged-goalid-abcd-new', closed: true,
+        createdAt: '2026-10-01T00:00:00Z', updatedAt: '2026-10-02T00:00:00Z', mergedAt: '2026-10-02T00:00:00Z' },
+      { number: 1, title: 'same goal', branch: 'self-impl/old-goalid-abcd-r1', draft: true,
+        labels: ['elanous:stalled'], createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z' },
+      { number: 2, title: 'same goal', branch: 'self-impl/release-goalid-abcd-r2', draft: true,
+        labels: ['elanous:stalled', RELEASE_PATH_LABEL], createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z' },
+      { number: 3, title: 'another goal', branch: 'self-impl/other', draft: true,
+        labels: ['elanous:stalled'], createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z' },
+      { number: 4, title: 'same goal', branch: 'self-impl/live-goalid-abcd-r4', draft: true,
+        labels: ['elanous:stalled'], createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z' },
+    ] });
+    const requests = ghFake.calls;
+    const gh = ghFake.api;
     const git = (_cwd: string, args: string[]) => ({ status: 0, stderr: '', stdout: args[0] === 'config'
       ? 'https://github.com/my/repo.git' : 'worktree /tmp/live\nbranch refs/heads/self-impl/live-goalid-abcd-r4\n' });
     await supersedeMergedGoalDrafts(90, '/tmp/launch-tree', gh, git);
     expect(requests[0]).toEqual(['api', 'repos/my/repo/pulls/90']);
-    expect(requests.filter((args) => args[0] === 'api' && args[1]?.includes('/files?'))).toHaveLength(5);
+    const inventoryQuery = requests.find((args) => args[0] === 'api' && args[1] === 'graphql')?.[3] ?? '';
+    expect(inventoryQuery).toContain('p1: pullRequest');
+    expect(inventoryQuery).toContain('p2: pullRequest');
+    expect(inventoryQuery).toContain('p3: pullRequest');
+    expect(inventoryQuery).toContain('p4: pullRequest');
     expect(requests.filter((args) => args[0] === 'label')).toEqual([
       ['label', 'create', 'elanous:swept:superseded-by', '--repo', 'my/repo', '--color', '6A737D',
         '--description', 'Draft sweep close reason; reopen this PR to restore it', '--force'],
@@ -1360,6 +1412,183 @@ describe('harness CLI command', () => {
     expect(requests.filter((args) => args[0] === 'label' && args[1] === 'create')).toHaveLength(1);
   });
 
+  test('draft sweep completes a 301-row merged inventory across four closed-PR pages', async () => {
+    const requests: string[][] = [];
+    const pr = (number: number, merged: boolean) => ({
+      number, draft: false, title: `merged ${number}`, head: { ref: `self-impl/${number}` }, base: { ref: 'main' },
+      labels: [], created_at: '2026-10-20T00:00:00Z', updated_at: '2026-10-23T00:00:00Z',
+      merged_at: merged ? '2026-10-22T00:00:00Z' : null,
+    });
+    const execute = (args: string[]) => {
+      requests.push(args);
+      const endpoint = args[1] ?? '';
+      if (endpoint.includes('state=open')) return JSON.stringify([{
+        ...pr(1, false), draft: true, head: { ref: 'self-impl/open-draft' }, created_at: '2026-10-21T00:00:00Z', merged_at: null,
+      }]);
+      if (endpoint.includes('state=closed')) {
+        const page = Number(/&page=(\d+)/.exec(endpoint)?.[1]);
+        if (page <= 3) return JSON.stringify(Array.from({ length: 100 }, (_, index) => pr((page - 1) * 100 + index + 1001, true)));
+        return JSON.stringify([pr(1301, true)]);
+      }
+      throw new Error(`unexpected GitHub request: ${endpoint}`);
+    };
+    const executeAsync = async (args: string[]) => {
+      const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+      const repository: Record<string, unknown> = {};
+      for (const [, rawNumber] of query.matchAll(/p(\d+): pullRequest\(number: (\d+)\)/g)) {
+        const number = Number(rawNumber);
+        repository[`p${number}`] = {
+          number,
+          files: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+          comments: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+          reviews: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+          mergeCommit: null,
+        };
+      }
+      return JSON.stringify({ data: { repository } });
+    };
+    const git = (_cwd: string, args: string[]) => ({ status: 0, stderr: '',
+      stdout: args[0] === 'config' ? 'https://github.com/my/repo.git' : '' });
+    const adapters = githubDraftSweepPreviewAdapters({ maxInventoryPages: 100 }, execute, git, process.cwd(), executeAsync);
+
+    const merged = [
+      ...(await adapters.listMerged(1, 100, 'my/repo')),
+      ...(await adapters.listMerged(2, 100, 'my/repo')),
+      ...(await adapters.listMerged(3, 100, 'my/repo')),
+      ...(await adapters.listMerged(4, 100, 'my/repo')),
+    ];
+
+    expect(merged).toHaveLength(301);
+    expect((await adapters.inventoryStatus?.())?.complete).toBe(true);
+    expect(requests.filter((args) => args[1]?.includes('state=closed'))).toHaveLength(4);
+    const stateRoot = mkdtempSync(join(tmpdir(), 'draft-sweep-301-state-'));
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const previousConfig = process.env.ELANOUS_CONFIG_DIR;
+    const sweepRequests: string[][] = [];
+    const sweepAdapters = githubDraftSweepPreviewAdapters({ maxInventoryPages: 100 }, (args) => {
+      sweepRequests.push(args);
+      return execute(args);
+    }, git, process.cwd(), executeAsync);
+    try {
+      process.env.ELANOUS_STATE_DIR = join(stateRoot, 'state');
+      process.env.ELANOUS_CONFIG_DIR = join(stateRoot, 'config');
+      const classified = await runDraftSweep({ repository: 'my/repo', adapters: sweepAdapters, now: new Date('2026-10-24T00:00:00Z') });
+      expect(classified).toMatchObject({ complete: true, apply: false });
+      expect(classified.entries).toHaveLength(1);
+      expect(sweepRequests.filter((args) => args[1]?.includes('state=closed'))).toHaveLength(4);
+
+      const cappedRequests: string[][] = [];
+      const cappedAdapters = githubDraftSweepPreviewAdapters({ maxInventoryPages: 100, maxMerged: 1 }, (args) => {
+        cappedRequests.push(args);
+        return execute(args);
+      }, git, process.cwd(), executeAsync);
+      const capped = await runDraftSweep({ repository: 'my/repo', adapters: cappedAdapters, apply: true,
+        now: new Date('2026-10-24T00:00:00Z') });
+      expect(capped).toMatchObject({ complete: false, apply: true,
+        error: 'merged PR inventory capped at 1 records (301 records listed)' });
+      expect(cappedRequests.some((args) => args[0] === 'pr' || args[1]?.startsWith('repos/my/repo/issues/'))).toBe(false);
+    } finally {
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousState;
+      if (previousConfig === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previousConfig;
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('draft sweep apply honors the configured inventory page cap and fails closed', async () => {
+    const requests: string[][] = [];
+    const draft = {
+      number: 1, draft: true, title: 'kept draft', head: { ref: 'ordinary/kept' }, base: { ref: 'main' },
+      labels: [{ name: 'elanous:keep' }], created_at: '2025-01-01T00:00:00Z', updated_at: '2026-10-24T00:00:00Z', merged_at: null,
+    };
+    const drafts = Array.from({ length: 11 }, (_, index) => ({ ...draft, number: index + 1, title: `kept draft ${index + 1}` }));
+    const closedPage = (page: number) => Array.from({ length: 100 }, (_, index) => ({
+      number: 10_000 + page * 100 + index, draft: false, title: `closed ${page}-${index}`,
+      head: { ref: `ordinary/${page}-${index}` }, base: { ref: 'main' }, labels: [],
+      created_at: '2025-01-01T00:00:00Z', updated_at: '2026-10-23T00:00:00Z', merged_at: null,
+    }));
+    const execute = (args: string[]) => {
+      const endpoint = args[1] ?? '';
+      requests.push(args);
+      if (endpoint.endsWith('/status')) return JSON.stringify({ state: 'success' });
+      if (endpoint.includes('/check-runs')) return JSON.stringify({ total_count: 0, check_runs: [] });
+      if (endpoint === 'graphql') {
+        const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+        const repository: Record<string, unknown> = {};
+        for (const [, alias, rawNumber] of query.matchAll(/(p\d+): pullRequest\(number: (\d+)\)/g)) {
+          repository[alias!] = {
+            number: Number(rawNumber), headRefOid: 'a'.repeat(40), headRef: { target: { committedDate: '2026-10-24T00:00:00Z' } },
+            files: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+            comments: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+            reviews: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } }, mergeCommit: null,
+          };
+        }
+        return JSON.stringify({ data: { repository } });
+      }
+      const state = /state=(open|closed)/.exec(endpoint)?.[1];
+      const page = Number(/&page=(\d+)/.exec(endpoint)?.[1] ?? '1');
+      if (state === 'open') return JSON.stringify(page === 1 ? drafts : []);
+      if (state === 'closed') return JSON.stringify(page <= 3 ? closedPage(page) : page === 4 ? [closedPage(4)[0]] : []);
+      throw new Error(`unexpected GitHub request: ${endpoint}`);
+    };
+    const writes: string[] = [];
+    const previousExitCode = process.exitCode ?? 0;
+    const stateRoot = mkdtempSync(join(tmpdir(), 'draft-sweep-apply-cap-state-'));
+    const previousCwd = process.cwd();
+    const gitRoot = join(stateRoot, 'git-root');
+    mkdirSync(gitRoot, { recursive: true });
+    execFileSync('git', ['init', '-q', gitRoot]);
+    execFileSync('git', ['-C', gitRoot, 'remote', 'add', 'origin', 'https://github.com/ElanvitalAI/elanous.git']);
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const previousConfig = process.env.ELANOUS_CONFIG_DIR;
+    const program = new Command().exitOverride();
+    installHarnessCliCommand(program, {
+      registerSink: async () => {}, resolveSurface: async () => 'harness',
+      draftSweep: {
+        repository: () => 'ElanvitalAI/elanous', execute, write: (line) => writes.push(line),
+        residueReplay: { listLedgers: () => [] },
+      },
+    });
+    try {
+      process.chdir(gitRoot);
+      process.env.ELANOUS_STATE_DIR = join(stateRoot, 'state');
+      process.env.ELANOUS_CONFIG_DIR = join(stateRoot, 'config');
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--apply', '--json',
+        '--repo', 'ElanvitalAI/elanous', '--max-pages', '2', '--max-drafts', '300', '--max-merged', '1000']);
+      const result = JSON.parse(writes[0]!);
+      expect(result).toMatchObject({ complete: false, apply: true, error: 'closed PR inventory capped at 2 pages (200 rows observed)' });
+      expect(process.exitCode).toBe(1);
+      expect(requests.filter((args) => args[1]?.includes('state=closed'))).toHaveLength(2);
+      expect(requests.some((args) => args[1]?.includes('state=closed') && args[1]?.includes('page=3'))).toBe(false);
+      expect(requests.some((args) => args[0] === 'pr' && ['edit', 'close'].includes(args[1] ?? '')
+        || args[0] === 'api' && args.some((arg) => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(arg)))).toBe(false);
+
+      requests.length = 0;
+      writes.length = 0;
+      process.exitCode = previousExitCode ?? 0;
+      const defaultProgram = new Command().exitOverride();
+      installHarnessCliCommand(defaultProgram, {
+        registerSink: async () => {}, resolveSurface: async () => 'harness',
+        draftSweep: {
+          repository: () => 'ElanvitalAI/elanous', execute, write: (line) => writes.push(line),
+          residueReplay: { listLedgers: () => [] },
+        },
+      });
+      await defaultProgram.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--apply', '--json', '--repo', 'ElanvitalAI/elanous']);
+      const defaultResult = JSON.parse(writes[0]!);
+      expect(defaultResult).toMatchObject({ complete: true, apply: true });
+      expect(requests.filter((args) => args[1]?.includes('state=closed'))).toHaveLength(4);
+      expect(defaultResult.entries).toHaveLength(11);
+      expect(requests.some((args) => args[0] === 'pr' && ['edit', 'close'].includes(args[1] ?? '')
+        || args[0] === 'api' && args.some((arg) => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(arg)))).toBe(false);
+    } finally {
+      process.chdir(previousCwd);
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousState;
+      if (previousConfig === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previousConfig;
+      rmSync(stateRoot, { recursive: true, force: true });
+      process.exitCode = previousExitCode ?? 0;
+    }
+  }, 60_000);
+
   test('GitHub sweep adapter supplies file coverage and harvest evidence from the merged PR', async () => {
     const adapters = githubDraftSweepAdapters((args) => {
       const endpoint = args[1]!;
@@ -1391,7 +1620,6 @@ describe('harness CLI command', () => {
       { number: 2, body: '칸: UX 10-03', mergedAt: '2026-09-02T00:00:00Z', changedFiles: ['src/a.ts'],
         mergeCommitMessage: 'Shipped (수확 #1)', landingVerifiedComments: ['landing-verified: superseded #1'] },
     ]);
-    const { decideDraft } = await import('../self-dev/draft-triage-rules.js');
     const [harvested] = await adapters.listDrafts(1, 100, 'my/repo');
     const latestFileChanges = await adapters.getLatestFileChanges?.(harvested!, 'my/repo');
     expect(latestFileChanges).toEqual({ 'src/a.ts': '2026-09-01T12:00:00Z' });
@@ -1422,7 +1650,6 @@ describe('harness CLI command', () => {
     });
     const [draft] = await adapters.listDrafts(1, 100, 'my/repo');
     expect(draft!.changedFiles).toBeUndefined();
-    const { decideDraft } = await import('../self-dev/draft-triage-rules.js');
     const merged = await adapters.listMerged(1, 100, 'my/repo');
     const decision = decideDraft({ draft: { ...draft!, title: 'different title', branch: 'self-impl/other' }, mergedTwins: merged,
       runStatus: 'completed', ageHours: 1, liveBranches: new Set() });
@@ -1466,7 +1693,6 @@ describe('harness CLI command', () => {
       expect(current?.runId).toBe('run-current');
       expect(await rerunAdapters.getRunStatus(current!, 'my/repo')).toBeUndefined();
       expect(await rerunAdapters.hasFinalRunResult?.(current!, 'my/repo')).toBe(false);
-      const { runDraftSweep } = await import('../self-dev/draft-sweep.js');
       const sweepAdapters = githubDraftSweepAdapters((args) => args[1]?.includes('state=open')
         ? JSON.stringify([{ ...open, labels: [{ name: 'elanous:stalled' }] }]) : '[]', (_cwd, args) => ({
         status: 0, stderr: '', stdout: args[0] === 'config'
@@ -1513,7 +1739,7 @@ describe('harness CLI command', () => {
         submitted_at: '2026-10-21T00:00:00Z', commit_id: 'a'.repeat(40) }]);
       if (endpoint.includes('/issues/123/comments?')) return JSON.stringify([{ body: 'VERDICT: PASS' }]);
       if (endpoint.includes(`/commits/${'a'.repeat(40)}/status`)) return JSON.stringify({ state: 'success' });
-      if (endpoint.includes(`/commits/${'a'.repeat(40)}/check-runs`)) return JSON.stringify({ check_runs: [{ conclusion: 'success' }] });
+      if (endpoint.includes(`/commits/${'a'.repeat(40)}/check-runs`)) return JSON.stringify({ total_count: 1, check_runs: [{ conclusion: 'success' }] });
       throw new Error(`unexpected endpoint: ${endpoint}`);
     });
     const posture = await adapters.getReviewGate?.({ number: 123, branch: 'self-impl/draft', title: 'draft',
@@ -1536,7 +1762,7 @@ describe('harness CLI command', () => {
         body: 'current head approved', submitted_at: '2026-10-21T00:00:00Z', commit_id: head }]);
       if (endpoint === 'repos/my/repo/issues/123/comments?per_page=100&page=1') return JSON.stringify([{ body: 'VERDICT: PASS' }]);
       if (endpoint === `repos/my/repo/commits/${head}/status`) return JSON.stringify({ state: 'success' });
-      if (endpoint === `repos/my/repo/commits/${head}/check-runs?per_page=100&page=1`) return JSON.stringify({ check_runs: [{ conclusion: 'success' }] });
+      if (endpoint === `repos/my/repo/commits/${head}/check-runs?per_page=100&page=1`) return JSON.stringify({ total_count: 1, check_runs: [{ conclusion: 'success' }] });
       throw new Error(`unexpected endpoint: ${endpoint}`);
     });
     const posture = await adapters.getReviewGate?.({ number: 123, branch: 'self-impl/draft', title: 'draft',
@@ -1556,15 +1782,61 @@ describe('harness CLI command', () => {
       if (endpoint.includes('/issues/123/comments?')) return JSON.stringify([]);
       if (endpoint === `repos/my/repo/commits/${head}/status`) return JSON.stringify({ state: 'success' });
       if (endpoint === `repos/my/repo/commits/${head}/check-runs?per_page=100&page=1`)
-        return JSON.stringify({ check_runs: Array.from({ length: 100 }, () => ({ conclusion: 'success' })) });
+        return JSON.stringify({ total_count: 101, check_runs: Array.from({ length: 100 }, () => ({ conclusion: 'success' })) });
       if (endpoint === `repos/my/repo/commits/${head}/check-runs?per_page=100&page=2`)
-        return JSON.stringify({ check_runs: [{ conclusion: 'failure' }] });
+        return JSON.stringify({ total_count: 101, check_runs: [{ conclusion: 'failure' }] });
       throw new Error(`unexpected endpoint: ${endpoint}`);
     });
     const posture = await adapters.getReviewGate?.({ number: 123, branch: 'self-impl/draft', title: 'draft', labels: [],
       createdAt: '2026-10-20T00:00:00Z' }, 'my/repo');
     expect(posture?.gate).toBe('fail');
     expect(requests).toContain(`repos/my/repo/commits/${head}/check-runs?per_page=100&page=2`);
+  });
+
+  test('serializes concurrent check-run pagination and retries transient 403 before reading a complete inventory', async () => {
+    const head = 'd'.repeat(40);
+    let active = 0;
+    let maxActive = 0;
+    let checkRunCalls = 0;
+    const delays: number[] = [];
+    const adapters = githubDraftSweepPreviewAdapters({
+      checkRunRetryDelaysMs: [5], checkRunSleep: async (ms) => { delays.push(ms); },
+    }, () => '', () => ({ status: 0, stdout: '', stderr: '' }), process.cwd(), async (args) => {
+      const endpoint = args[1] ?? '';
+      if (/\/pulls\/\d+$/.test(endpoint)) return JSON.stringify({ head: { sha: head } });
+      if (endpoint.includes('/reviews?') || endpoint.includes('/comments?')) return '[]';
+      if (endpoint.endsWith('/status')) return JSON.stringify({ state: 'success' });
+      if (endpoint.includes('/check-runs?')) {
+        active++; maxActive = Math.max(maxActive, active); checkRunCalls++;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active--;
+        if (checkRunCalls === 1) throw new Error('gh api exit=1: HTTP 403 secondary rate limit');
+        return JSON.stringify({ total_count: 1, check_runs: [{ conclusion: 'success' }] });
+      }
+      throw new Error(`unexpected endpoint: ${endpoint}`);
+    });
+    const drafts = [123, 124].map((number) => ({ number, branch: `self-impl/${number}`, title: 'draft', labels: [], createdAt: '2026-10-20T00:00:00Z' }));
+    const postures = await Promise.all(drafts.map((draft) => adapters.getReviewGate?.(draft, 'my/repo')));
+    expect(postures).toHaveLength(2);
+    expect(postures.every((posture) => posture?.gate === 'pass')).toBe(true);
+    expect(maxActive).toBe(1);
+    expect(delays).toEqual([5]);
+  });
+
+  test('fails closed when check-run inventory returns an incomplete page', async () => {
+    const head = 'e'.repeat(40);
+    const adapters = githubDraftSweepPreviewAdapters({ checkRunRetryDelaysMs: [], checkRunSleep: async () => {} }, (args) => {
+      const endpoint = args[1] ?? '';
+      if (endpoint === 'repos/my/repo/pulls/123') return JSON.stringify({ head: { sha: head } });
+      if (endpoint.includes('/reviews?') || endpoint.includes('/comments?')) return '[]';
+      if (endpoint.endsWith('/status')) return JSON.stringify({ state: 'success' });
+      if (endpoint.includes('/check-runs?')) return JSON.stringify({ total_count: 2, check_runs: [{ conclusion: 'success' }] });
+      throw new Error(`unexpected endpoint: ${endpoint}`);
+    });
+    await expect(adapters.getReviewGate?.({ number: 123, branch: 'self-impl/draft', title: 'draft', labels: [],
+      createdAt: '2026-10-20T00:00:00Z' }, 'my/repo')).rejects.toThrow('check-run inventory incomplete');
+    expect(await adapters.inventoryStatus?.()).toMatchObject({ complete: false, reason: expect.stringContaining('check-run inventory incomplete') });
+    expect((await adapters.inventoryStatus?.())?.reason).toContain('may have changed during pagination');
   });
 
   test('keeps exact-head gate unknown when combined status has no state', async () => {
@@ -1610,6 +1882,82 @@ describe('harness CLI command', () => {
     expect(await none.listMerged(1, 100, 'my/repo')).toEqual([]);
   });
 
+  test('bounded draft preview streams page progress and reports a capped partial inventory before enriching more PRs', async () => {
+    const requests: string[] = [];
+    const progress: Array<{ state: 'open' | 'closed'; page: number; rows: number }> = [];
+    const openPage = Array.from({ length: 100 }, (_, index) => ({
+      number: index + 1, draft: true, title: `draft ${index + 1}`, head: { ref: `self-impl/${index + 1}` },
+      labels: [], created_at: '2026-09-01T00:00:00Z', merged_at: null,
+    }));
+    const adapters = githubDraftSweepPreviewAdapters({
+      maxInventoryPages: 1, maxDrafts: 5, maxMerged: 5,
+      onInventoryProgress: (event) => progress.push(event),
+    }, (args) => {
+      const endpoint = args[1] ?? '';
+      requests.push(endpoint);
+      if (args[0] === 'api' && endpoint === 'graphql') {
+        const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+        const data: Record<string, unknown> = {};
+        for (const [, number] of query.matchAll(/p(\d+): pullRequest/g)) data[`p${number}`] = {
+          number: Number(number), headRefOid: `h${number}`,
+          files: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+          comments: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+          reviews: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+        };
+        return JSON.stringify({ data: { repository: data } });
+      }
+      if (endpoint.includes('state=open')) return JSON.stringify(openPage);
+      if (endpoint.includes('state=closed')) throw new Error('bounded preview must stop at its page cap');
+      return '[]';
+    });
+
+    const rows = await adapters.listDrafts(1, 100, 'my/repo');
+    expect(rows.map((row) => row.number)).toEqual([1, 2, 3, 4, 5]);
+    expect(progress).toEqual([{ state: 'open', page: 1, rows: 100 }]);
+    expect(await adapters.inventoryStatus?.()).toEqual({ complete: false,
+      reason: 'open PR inventory capped at 1 pages (100 rows observed)' });
+    expect(requests.filter((endpoint) => endpoint.includes('state=open'))).toHaveLength(1);
+  });
+
+  test('bounded preview retains earlier pages and exposes the timeout reason when a later inventory page fails', async () => {
+    const requests: string[] = [];
+    const progress: Array<{ state: 'open' | 'closed'; page: number; rows: number }> = [];
+    const openPage = Array.from({ length: 100 }, (_, index) => ({
+      number: index + 1, draft: true, title: `draft ${index + 1}`, head: { ref: `self-impl/${index + 1}` },
+      labels: [], created_at: '2026-09-01T00:00:00Z', merged_at: null,
+    }));
+    const adapters = githubDraftSweepPreviewAdapters({
+      maxInventoryPages: 2, maxDrafts: 5, maxMerged: 5,
+      onInventoryProgress: (event) => progress.push(event),
+    }, (args) => {
+      const endpoint = args[1] ?? '';
+      requests.push(endpoint);
+      if (args[0] === 'api' && endpoint === 'graphql') {
+        const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+        const data: Record<string, unknown> = {};
+        for (const [, number] of query.matchAll(/p(\d+): pullRequest/g)) data[`p${number}`] = {
+          number: Number(number), headRefOid: `h${number}`,
+          files: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+          comments: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+          reviews: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+        };
+        return JSON.stringify({ data: { repository: data } });
+      }
+      if (/state=open.*&page=1$/.test(endpoint)) return JSON.stringify(openPage);
+      if (/state=open.*&page=2$/.test(endpoint)) throw new Error('GitHub request timed out');
+      throw new Error(`unexpected endpoint: ${endpoint}`);
+    });
+
+    const rows = await adapters.listDrafts(1, 100, 'my/repo');
+    expect(rows.map((row) => row.number)).toEqual([1, 2, 3, 4, 5]);
+    expect(progress).toEqual([{ state: 'open', page: 1, rows: 100 }]);
+    const status = await adapters.inventoryStatus?.();
+    expect(status?.complete).toBe(false);
+    expect(status?.reason).toContain('stopped after 1 pages (100 rows)');
+    expect(status?.reason).toContain('GitHub request timed out');
+    expect(requests.filter((endpoint) => endpoint.includes('state=open'))).toHaveLength(2);
+  });
+
   test('draft sweep never treats a different or unverified cwd repository as an absent branch', async () => {
     const pr = { number: 9, draft: true, title: 'goal', head: { ref: 'self-impl/live' },
       labels: [{ name: 'elanous:stalled' }], created_at: '2026-09-01T00:00:00Z', merged_at: null };
@@ -1629,7 +1977,6 @@ describe('harness CLI command', () => {
     );
     const closed: number[] = [];
     const sweep = async (repository: string) => {
-      const { runDraftSweep } = await import('../self-dev/draft-sweep.js');
       return runDraftSweep({ repository, apply: true, now: new Date('2026-10-01T00:00:00Z'), adapters: {
         ...adapters,
         getRunStatus: async () => 'failed',
@@ -2179,20 +2526,34 @@ describe('harness CLI command', () => {
     const secondGoal = withDoneBoundary('Second distinct goal');
     const thirdGoal = withDoneBoundary('Third distinct goal');
     writeFileSync(goal, firstGoal);
-    const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({
+    const leaseRoot = mkdtempSync(join(tmpdir(), 'pod-admission-lease-'));
+    const pool = new PodPoolScheduler(parsePodPool('fake:3'), { hostLease: new HostPoolLease('n2-fixture', { dir: leaseRoot, processStart: () => 'fixture' }), status: () => ({
       recommended: 2, accountSlots: 99, limitedBy: 'capacity', reason: null,
       capacitySlots: 3, memorySlots: 3, placeableSlots: 3, running: 0, pending: 0,
     }), pollMs: 2 });
+    const fakeKubectl = createFakeKubectl({ context: 'fake', node: 'fake-node', jobState: 'running' });
     const applied: string[] = [];
+    const appliedWaiters: Array<() => void> = [];
+    const waitForApplied = async (count: number) => {
+      while (applied.length < count) await new Promise<void>((resolve) => appliedWaiters.push(resolve));
+    };
     const completed = new Set<string>();
     const kubectl: Kubectl = (args, input) => {
       if (args.includes('apply') && input) {
         const object = JSON.parse(input) as { kind: string; metadata: { name: string } };
-        if (object.kind === 'Job') applied.push(object.metadata.name);
+        const result = fakeKubectl.kubectl(args, input);
+        if (result.status !== 0) return result;
+        if (object.kind === 'Job') { applied.push(object.metadata.name); appliedWaiters.splice(0).forEach((resolve) => resolve()); }
+        return result;
       }
-      if (args.some((arg) => arg.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
-      if (args.includes('job') && args.includes('jsonpath={.status.conditions[*].type}')) {
-        return { status: 0, stdout: completed.has(args[args.indexOf('job') + 1]!) ? 'Complete' : '', stderr: '' };
+      if (args.includes('get') && args.includes('job')) {
+        const name = args[args.indexOf('job') + 1]!;
+        if (!fakeKubectl.hasJob(name)) return { status: 1, stdout: '', stderr: 'NotFound' };
+        if (args.some((arg) => arg.includes('.status.conditions[*].type'))) {
+          return { status: 0, stdout: completed.has(name) ? 'Complete' : '', stderr: '' };
+        }
+        if (args.some((arg) => arg.includes('.metadata.uid'))) return { status: 0, stdout: name + '-uid ', stderr: '' };
+        return fakeKubectl.kubectl(args, input);
       }
       return { status: 0, stdout: '', stderr: '' };
     };
@@ -2239,7 +2600,8 @@ describe('harness CLI command', () => {
           return job;
         } },
       });
-      await waitUntil(() => applied.length === 2 && pool.admissionSnapshot().queued === 1);
+      await waitForApplied(2);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
       expect(applied[0]).toContain('goal-0');
       expect(applied[1]).toContain('goal-1');
       expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
@@ -2247,7 +2609,7 @@ describe('harness CLI command', () => {
       expect(applied).toHaveLength(2);
       completed.add(applied[0]!);
       await jobs[0]!.done;
-      await waitUntil(() => applied.length === 3);
+      await waitForApplied(3);
       expect(applied[2]).not.toContain('goal-0');
       expect(applied[2]).not.toContain('goal-1');
       completed.add(applied[1]!);
@@ -2262,6 +2624,7 @@ describe('harness CLI command', () => {
       await Promise.all(jobs.map((job) => job.done));
       process.exitCode = previousExit ?? 0;
       rmSync(goal, { force: true });
+      rmSync(leaseRoot, { recursive: true, force: true });
     }
   }, 20_000);
 
@@ -2735,7 +3098,6 @@ describe('harness CLI command', () => {
     const previousCwd = process.cwd();
     process.chdir(repo);
     try {
-      const { runHarnessPlanRfc } = await import('./harness-plan-rfc.js');
       const authored = {
         markdown: '# Authored RFC\n',
         title: 'x',

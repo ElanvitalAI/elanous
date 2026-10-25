@@ -85,6 +85,7 @@ export interface GateArtifactSummary extends GateArtifactCounts {
   verdict: string | null;
   /** 판정 줄(`tests: …` / `[gate-baseline] …` / `shards: unmeasured (…)`) 그대로. */
   verdictLine?: string;
+  timeoutRechecks?: readonly { name: string; file: string; result: 'pass' | 'timeout' | 'failure' | 'unknown'; elapsedMs: number; rawResultLine: string }[];
   exitCode: number;
   /** 정수 칸 중 하나라도 null 일 때만 — 왜 못 셌나(한 줄). */
   countsUnavailableReason?: string;
@@ -129,6 +130,7 @@ export interface GateArtifactInput {
   testFiles: readonly string[];
   verdict: string | null;
   verdictLine?: string;
+  timeoutRechecks?: readonly { name: string; file: string; result: 'pass' | 'timeout' | 'failure' | 'unknown'; elapsedMs: number; rawResultLine: string }[];
   exitCode: number;
   /** 판정 정수(못 센 칸은 null ⊕ countsUnavailableReason). 안 주면 다섯 다 null · 이유 'not recorded' — 칸은 «늘» 쓴다. */
   counts?: GateArtifactCounts;
@@ -219,6 +221,7 @@ export function writeGateArtifacts(input: GateArtifactInput): { summaryPath: str
     shardsDetail,
     verdict: input.verdict,
     ...(input.verdictLine !== undefined ? { verdictLine: input.verdictLine } : {}),
+    ...(input.timeoutRechecks ? { timeoutRechecks: input.timeoutRechecks } : {}),
     exitCode: input.exitCode,
     introduced: counts.introduced,
     preexisting: counts.preexisting,
@@ -388,8 +391,9 @@ export function importRemoteGateArtifacts(dir: string, files: Map<string, Buffer
     writeFileSync(run.resultPath, `${JSON.stringify(result, null, 2)}\n`);
   };
   for (const shard of summary.shardsDetail) { relocate(shard?.current); relocate(shard?.baseline); }
-  // OP FU (MK #8178) — 원격 조각의 실패 증거(`<shardId>.failure.json`)도 그대로 가져온다(관측만 · summary 는 안 고친다).
-  for (const [name, bytes] of files) if (name.endsWith('.failure.json') && artifactNamePattern.test(name)) writeFileSync(join(dir, name), bytes);
+  // Optional observations stay optional for older remote commits. Neither changes the gate verdict.
+  for (const [name, bytes] of files) if ((name === 'progress.json' || name.endsWith('.failure.json'))
+    && artifactNamePattern.test(name)) writeFileSync(join(dir, name), bytes);
   summary.remoteHost = host;
   writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`);
   return { summaryPath, junitFiles };

@@ -205,6 +205,66 @@ test('streamLLMWithTools preserves compatible provider/model pairs before stream
   }
 });
 
+test('streamLLMWithTools sanitizes provider tool names and restores the original dispatch/history names', async () => {
+  const originals = ['xcodebuild.session_show_defaults', 'xcodebuild_session_show_defaults', 'aside:repl'];
+  const requests: Array<{ names: string[]; choice?: unknown; priorToolName?: string }> = [];
+  const dispatched: string[] = [];
+  let calls = 0;
+  const provider: LLMProvider = {
+    name: 'tool-name-contract-test',
+    defaultModel: 'test-model',
+    available: () => true,
+    async *chat() { yield 'unused'; },
+    async *streamChat(messages, opts) {
+      calls++;
+      const tools = opts?.tools ?? [];
+      const previousTool = messages.flatMap((message) => Array.isArray(message.content)
+        ? message.content.filter((block) => block.type === 'tool_use')
+        : []).at(-1);
+      requests.push({
+        names: tools.map((tool) => tool.name),
+        choice: opts?.toolChoice,
+        ...(previousTool?.type === 'tool_use' ? { priorToolName: previousTool.name } : {}),
+      });
+      if (calls === 1) {
+        yield { type: 'tool_call', id: 'call-unsafe-name', name: tools[0]!.name, args: { key: 'value' } };
+        return;
+      }
+      yield { type: 'text', delta: 'done' };
+    },
+  };
+
+  const result = await streamLLMWithTools(
+    [{ role: 'user', content: 'show defaults' }],
+    {
+      onText() {},
+      dispatchTool: async (name, args) => {
+        dispatched.push(name);
+        expect(args).toEqual({ key: 'value' });
+        return 'tool result';
+      },
+    },
+    {
+      provider,
+      model: 'test-model',
+      tools: originals.map((name) => ({ name, description: name, parameters: { type: 'object', properties: {} } })),
+      toolChoice: { name: originals[0]! },
+      maxTurns: 2,
+    },
+  );
+
+  expect(result).toBe('done');
+  expect(dispatched).toEqual([originals[0]]);
+  expect(requests).toHaveLength(2);
+  for (const request of requests) {
+    expect(request.names).toHaveLength(3);
+    expect(request.names.every((name) => /^[a-zA-Z0-9_-]+$/.test(name))).toBe(true);
+    expect(new Set(request.names).size).toBe(3);
+  }
+  expect(requests[0]?.choice).toEqual({ name: requests[0]?.names[0] });
+  expect(requests[1]?.priorToolName).toBe(requests[0]?.names[0]);
+});
+
 test('Anthropic request for Claude 5.5 includes interleaved-thinking beta', async () => {
   const originalKey = process.env.ANTHROPIC_API_KEY;
   process.env.ANTHROPIC_API_KEY = 'test-key';
@@ -467,6 +527,28 @@ const INSPECT_FLAGS = { 'inspect-budget': true, 'followup-hard-stop': true } as 
 function eventNames(events: Array<{ event: string }>): string[] {
   return events.map((e) => e.event);
 }
+
+test('MODEL-FAMILY-GPT6-GUARDS-FU-COUNTERS: streamLLMWithTools connects orchestration id to blocked guard counters and event', async () => {
+  resetGpt6CodexGuardObservations();
+  const spy = spyOn(debug, 'log').mockImplementation((() => {}) as typeof debug.log);
+  try {
+    const { events } = await runGpt6GuardStream({
+      user: 'inspect the module layout', dispatchResult: UNPARSED_AUTO_NARROWED, callsPerStream: 4, flags: INSPECT_FLAGS,
+    });
+    const records = events.filter((record) => record.event === 'streamLLMWithTools' || record.event === 'tool-loop.followup-hard-stop.guard-observed' || record.event === 'tool-loop.inspect-synthesis-phase.codex-immediate-stop');
+    const entry = records.find((record) => record.event === 'streamLLMWithTools');
+    const guard = records.filter((record) => record.event === 'tool-loop.followup-hard-stop.guard-observed').at(-1);
+    const stop = records.find((record) => record.event === 'tool-loop.inspect-synthesis-phase.codex-immediate-stop');
+    expect(entry?.data.orchestrationId).toEqual(expect.any(String));
+    expect(guard?.data.orchestrationId).toBe(entry?.data.orchestrationId);
+    expect(guard?.data).toMatchObject({ guard: 'followup-hard-stop', wouldBlock: 2, blocked: 1 });
+    expect(stop?.data.orchestrationId).toBe(entry?.data.orchestrationId);
+    expect(getGpt6CodexGuardStats()['followup-hard-stop']).toEqual({ wouldBlock: 2, blocked: 1 });
+  } finally {
+    spy.mockRestore();
+    _setGpt6CodexGuardFlagsForTest(undefined);
+  }
+});
 
 test('GPT-6 followup-hard-stop: grace>0 burn records wouldBlock without blocked', async () => {
   resetGpt6CodexGuardObservations();

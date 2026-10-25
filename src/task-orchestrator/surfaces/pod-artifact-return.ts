@@ -7,6 +7,8 @@ import { fromJsonl, type LogRecord } from '../../mss/logging/record.js';
 
 const FILE_LIMIT = 5 * 1024 * 1024;
 const TOTAL_LIMIT = 20 * 1024 * 1024;
+export const POD_SALVAGE_BUNDLE_FILE_LIMIT = 160 * 1024 * 1024;
+export const POD_SALVAGE_BUNDLE_TOTAL_LIMIT = 180 * 1024 * 1024;
 
 type Artifact = { path: string; bytes: Buffer };
 type Incomplete = { path: string; reason: string };
@@ -50,13 +52,16 @@ export function parsePodArtifactChunks(logs: string): ParseResult {
   }
   const artifacts: Artifact[] = [];
   const error: Incomplete[] = [];
-  let bytesSoFar = 0;
+  let artifactBytes = 0;
+  let salvageBundleBytes = 0;
   for (const [token, group] of groups) {
     let path = token;
     let reason = group.reason;
     try {
       path = decodePath(token);
       if (!safeRelativePath(path)) throw new Error('unsafe relative path');
+      const salvageBundle = /^pod-salvage\/[a-zA-Z0-9._-]+\.bundle$/.test(path);
+      const fileLimit = salvageBundle ? POD_SALVAGE_BUNDLE_FILE_LIMIT : FILE_LIMIT;
       if (!reason && group.chunks.size !== group.total) reason = 'missing chunk';
       if (!reason) {
         let encoded = '';
@@ -64,15 +69,20 @@ export function parsePodArtifactChunks(logs: string): ParseResult {
           const chunk = group.chunks.get(i);
           if (!chunk) { reason = 'missing chunk'; break; }
           encoded += chunk;
-          if (encoded.length > 8 * 1024 * 1024) { reason = 'file too large'; break; }
+          if (encoded.length > Math.ceil(fileLimit * 4 / 3) + 1024 * 1024) { reason = 'file too large'; break; }
         }
         if (!reason) {
           const compressed = Buffer.from(encoded, 'base64');
           if (compressed.toString('base64') !== encoded) throw new Error('invalid base64');
-          const bytes = gunzipSync(compressed, { maxOutputLength: FILE_LIMIT + 1 });
-          if (bytes.length > FILE_LIMIT) reason = 'file too large';
-          else if (bytesSoFar + bytes.length > TOTAL_LIMIT) reason = 'total too large';
-          else { artifacts.push({ path, bytes }); bytesSoFar += bytes.length; }
+          const bytes = gunzipSync(compressed, { maxOutputLength: fileLimit + 1 });
+          if (bytes.length > fileLimit) reason = 'file too large';
+          else if ((salvageBundle ? salvageBundleBytes : artifactBytes) + bytes.length >
+            (salvageBundle ? POD_SALVAGE_BUNDLE_TOTAL_LIMIT : TOTAL_LIMIT)) reason = 'total too large';
+          else {
+            artifacts.push({ path, bytes });
+            if (salvageBundle) salvageBundleBytes += bytes.length;
+            else artifactBytes += bytes.length;
+          }
         }
       }
     } catch (e) { reason = e instanceof Error ? e.message : String(e); }

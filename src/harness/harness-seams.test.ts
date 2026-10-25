@@ -379,6 +379,23 @@ describe('buildHarnessSeams — 실 인프라 배선(fake)', () => {
     expect(prompt).toContain('error TS9999: 0 relevant errors');
   });
 
+  test.each(['장치 조각', '피처 조각'])('%s의 신규 모듈 RED 해석이 가짜 리뷰어에게 한 번 전달된다', async (phase) => {
+    const prompts: string[] = [];
+    const s = buildHarnessSeams({
+      seams: fakeSeams({ async gate() { return {
+        passed: true,
+        log: '[changed-test-evidence] head=pass; base-fail=0/1; red-witness=1/1; verdict=proved\n- src/ux-sim/new-device.test.ts: missing-at-base',
+      }; } }),
+      llmReview: async (prompt) => { prompts.push(prompt); return 'VERDICT: PASS'; },
+    });
+    await s.plan({ objective: phase });
+    await s.execute({ objective: phase, steps: [], round: 1 });
+    expect((await s.review({ objective: phase, changes: ['feature.ts'] })).verdict).toBe('pass');
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('[changed-test-evidence] head=pass; base-fail=0/1; red-witness=1/1; verdict=proved');
+    expect(prompts[0]).toContain('base에 없는 신규 모듈의 base RED 목격을 must-fix로 요구하지 말 것');
+  });
+
   test('★ deploy fail-closed — authorizeDeploy 없으면 PR 안 열고 브랜치만(ref=branch)', async () => {
     let prOpened = false;
     const s = buildHarnessSeams({ seams: fakeSeams({ async openPr() { prOpened = true; return { url: 'x', number: 1 }; } }) });

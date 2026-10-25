@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 import { debug } from '../debug/log.js';
-import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, distinctPhysicalLedgerDirectories, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable, renderRunningRuns } from './running-runs.js';
+import { assessLingeringLaunchParents, assessRunningRuns, buildRunProgressRows, collectObservedRunPhases, distinctPhysicalLedgerDirectories, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable, renderRunningRuns, type RunningRunsQueryObservation } from './running-runs.js';
 import { appendRunLedgerEntry, queryFederatedUnfinishedRunLedgers, recordNonBlockingRunPending, recordNonBlockingRunResult, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from './run-ledger.js';
 
 const ledger = (
@@ -968,6 +968,80 @@ test('isolated running-runs CLI scans 8001 ledgers and exits within 15 seconds',
   }
 }, 40_000);
 
+test('isolated running-runs CLI가 위치 인자 runId로 원본 reason·next를 재조회한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-cli-requery-'));
+  const directory = join(root, '.elanous', 'run-ledger');
+  const requestId = 'run-00000000-0000-4000-8000-0000000000c1';
+  try {
+    mkdirSync(directory, { recursive: true });
+    const now = Date.now();
+    recordNonBlockingRunPending(requestId, { timestamp: new Date(now - 60_000).toISOString(), dir: directory });
+    recordNonBlockingRunResult(
+      requestId,
+      { kind: 'launched', next: `eln self run ${requestId}`, ok: true, runId: requestId },
+      { timestamp: new Date(now - 30_000).toISOString(), dir: directory },
+    );
+    const otherRequestId = 'run-00000000-0000-4000-8000-0000000000c2';
+    recordNonBlockingRunPending(otherRequestId, { timestamp: new Date(now - 50_000).toISOString(), dir: directory });
+    recordNonBlockingRunResult(
+      otherRequestId,
+      { kind: 'launched', next: `eln self run ${otherRequestId}`, ok: true, runId: otherRequestId },
+      { timestamp: new Date(now - 20_000).toISOString(), dir: directory },
+    );
+    // 실물 CLI 스폰 = 프로세스 재시작 시뮬레이션: 새 프로세스는 in-memory 상태 없이 on-disk 원장만 읽는다.
+    const child = Bun.spawnSync([process.execPath, 'bin/elanous.mjs', `--test=${join(root, 'test-state')}`, 'self', 'running-runs', requestId, '--json'], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: root, ELANOUS_STATE_DIR: '', ELANOUS_CONFIG_DIR: '' },
+      stdout: 'pipe', stderr: 'pipe', timeout: 15_000,
+    });
+    expect(child.exitCode).toBe(0);
+    const result = JSON.parse(child.stdout.toString()) as { entries: Array<{ runId: string; nonBlocking?: { requestId?: string; kind?: string; reason?: string; next?: string } }> };
+    // runIds 필터링을 증명한다 — 결과는 요청한 ID 1건뿐이고 같은 원장의 타 런(otherRequestId)은 빠진다.
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]?.runId).toBe(requestId);
+    expect(result.entries.map((candidate) => candidate.runId)).not.toContain(otherRequestId);
+    const entry = result.entries[0];
+    expect(entry?.nonBlocking).toMatchObject({ requestId, kind: 'launched', next: `eln self run ${requestId}` });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 40_000);
+
+test('isolated running-runs CLI가 위치 인자 runId로 발사 전 실패의 원본 reason을 재조회한다', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-cli-requery-failure-'));
+  const directory = join(root, '.elanous', 'run-ledger');
+  const requestId = 'run-00000000-0000-4000-8000-0000000000c3';
+  try {
+    mkdirSync(directory, { recursive: true });
+    const now = Date.now();
+    recordNonBlockingRunPending(requestId, { timestamp: new Date(now - 60_000).toISOString(), dir: directory });
+    recordNonBlockingRunResult(
+      requestId,
+      { kind: 'failed', reason: 'runner unavailable', ok: false },
+      { timestamp: new Date(now - 30_000).toISOString(), dir: directory },
+    );
+    const otherRequestId = 'run-00000000-0000-4000-8000-0000000000c4';
+    recordNonBlockingRunPending(otherRequestId, { timestamp: new Date(now - 45_000).toISOString(), dir: directory });
+    // 실물 CLI 스폰 = 프로세스 재시작 시뮬레이션: 새 프로세스는 on-disk 원장만 읽는다.
+    const child = Bun.spawnSync([process.execPath, 'bin/elanous.mjs', `--test=${join(root, 'test-state')}`, 'self', 'running-runs', requestId, '--json'], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: root, ELANOUS_STATE_DIR: '', ELANOUS_CONFIG_DIR: '' },
+      stdout: 'pipe', stderr: 'pipe', timeout: 15_000,
+    });
+    expect(child.exitCode).toBe(0);
+    const result = JSON.parse(child.stdout.toString()) as { entries: Array<{ runId: string; nonBlocking?: { requestId?: string; kind?: string; reason?: string; next?: string } }> };
+    // 발사 전 실패 재조회 — 결과는 요청한 ID 1건, 원본 reason 을 그대로, 지어낸 next 는 없다.
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]?.runId).toBe(requestId);
+    expect(result.entries.map((candidate) => candidate.runId)).not.toContain(otherRequestId);
+    const entry = result.entries[0];
+    expect(entry?.nonBlocking).toMatchObject({ requestId, kind: 'failed', reason: 'runner unavailable' });
+    expect(entry?.nonBlocking).not.toHaveProperty('next');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 40_000);
+
 test('distinguishes unreadable phase observation from no observed phase without changing status assessment', () => {
   const queryLedgers = (): FederatedUnfinishedRunLedgerQuery => ({
     entries: [ledger('run-live', 'live')], ledgerDirectories: [], goalsDirectory: '/goals', unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 0,
@@ -1006,6 +1080,40 @@ const progressDeps = (overrides: Partial<FederatedUnfinishedRunLedgerQuery> = {}
   readRunPhases: () => ({ events: [
     { runId: 'run-a', phase: 'implementing', observedAt: '2026-09-12T07:05:07.000Z' },
   ], targetCount: 1, unreadableTargets: [] }),
+});
+
+test('deps가 runIds를 무시해도 queryRunningRuns는 요청한 ID만 결과에 남긴다', () => {
+  const unscoped = queryRunningRuns({}, progressDeps());
+  const scoped = queryRunningRuns({ runIds: ['run-a'] }, progressDeps());
+
+  expect(unscoped.entries.map((entry) => entry.runId)).toEqual(['run-a', 'run-b']);
+  expect(unscoped.counts.running).toBe(2);
+  expect(scoped.entries).toHaveLength(1);
+  expect(scoped.entries[0]?.runId).toBe('run-a');
+  expect(scoped.counts.running).toBe(1);
+});
+
+test('NONBLOCKING-RESULT-LEDGER: ID 조회 관측이 CLI가 전달한 runIds를 남긴다', () => {
+  const observations: RunningRunsQueryObservation[] = [];
+  const deps = {
+    ...progressDeps(),
+    observeQuery: (observation: RunningRunsQueryObservation) => { observations.push(observation); },
+  };
+
+  queryRunningRuns({ runIds: ['run-a'] }, deps);
+  queryRunningRuns({}, deps);
+
+  expect(observations[0]).toMatchObject({ requestedRunIds: ['run-a'] });
+  expect(observations[1]).not.toHaveProperty('requestedRunIds');
+});
+
+test('NONBLOCKING-RESULT-LEDGER: 요청한 runId와 일치하는 런이 없으면 ID 조회는 entries []를 반환한다', () => {
+  const result = queryRunningRuns({ runIds: ['run-missing'] }, progressDeps());
+
+  expect(result.entries).toEqual([]);
+  expect(result.total).toBe(0);
+  expect(result.counts).toEqual({ running: 0, 'probable-running': 0, 'ended-unclosed': 0, unknown: 0 });
+  expect(result.quantities.entries.value).toBe(0);
 });
 
 test('renderRunProgressTable emits one line per run with phase, entry time, last progress with elapsed, and pty refs', () => {
@@ -1065,6 +1173,8 @@ test('재시작 뒤에도 발사 전 실패 requestId의 원본 reason·next를 
     },
     { timestamp: new Date(now - 30_000).toISOString(), dir: ledgerDirectory },
   );
+  const otherRequestId = 'run-00000000-0000-4000-8000-0000000000b7';
+  recordNonBlockingRunPending(otherRequestId, { timestamp: new Date(now - 45_000).toISOString(), dir: ledgerDirectory });
   try {
     // 프로세스 재시작 시뮬레이션 — in-memory 상태 없이 on-disk 원장만으로 새 조회
     const result = queryRunningRuns({ runIds: [requestId] }, {
@@ -1080,6 +1190,8 @@ test('재시작 뒤에도 발사 전 실패 requestId의 원본 reason·next를 
     });
     // 발사 전 실패엔 런이 산출한 next가 없다 — 재조회도 생략된 채 원본을 반환(지어낸 기본 문구 금지).
     expect(entry?.nonBlocking).not.toHaveProperty('next');
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]?.runId).toBe(requestId);
     expect(renderRunningRuns(result)).toContain('nonBlocking=kind:failed reason:runner unavailable next:none');
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1102,6 +1214,8 @@ test('재시작 뒤에도 완료 requestId의 원본 reason·next를 eln self ru
     },
     { timestamp: new Date(now - 30_000).toISOString(), dir: ledgerDirectory },
   );
+  const otherRequestId = 'run-00000000-0000-4000-8000-0000000000b6';
+  recordNonBlockingRunPending(otherRequestId, { timestamp: new Date(now - 45_000).toISOString(), dir: ledgerDirectory });
   try {
     const result = queryRunningRuns({ runIds: [requestId] }, {
       queryLedgers: (options) => queryFederatedUnfinishedRunLedgers({ ...options, goalsDir: root, ledgerDirectories: [ledgerDirectory], noCache: true }),
@@ -1110,6 +1224,8 @@ test('재시작 뒤에도 완료 requestId의 원본 reason·next를 eln self ru
     });
     const entry = result.entries.find((candidate) => candidate.runId === requestId);
     expect(entry?.nonBlocking).toMatchObject({ requestId, kind: 'launched', next: `eln self run ${requestId}` });
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0]?.runId).toBe(requestId);
     expect(renderRunningRuns(result)).toContain(`nonBlocking=kind:launched reason:none next:eln self run ${requestId}`);
   } finally {
     rmSync(root, { recursive: true, force: true });

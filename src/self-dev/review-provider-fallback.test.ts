@@ -1,11 +1,16 @@
 import { resolveModelAlias } from '../intelligence-map/model-alias.js';
 import { describe, expect, test } from 'bun:test';
-import { getProvider } from '../llm.js';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { getProvider, streamLLM } from '../llm.js';
+import { buildDefaultSelfImplementSeams, planDevPipeline } from './dev-pipeline.js';
+import { clearLaunchRoleLlmOverrides, parseSubscriptionReviewerSpec, setUserConfigOverlay } from '../user-config.js';
 import { parseReviewResult, renderReview } from '../agent-substrate/pr-reviewer.js';
-import { parseSubscriptionReviewerSpec } from '../user-config.js';
 import { defaultLlmPolicy, validateLlmPolicy } from '../policy/llm-policy.js';
 import {
-  classifyReviewProviderFailure, buildReviewProviderAttempts, runReviewWithFallback,
+  classifyReviewProviderFailure, buildReviewProviderAttempts, defaultReviewFallbackModel, runReviewWithFallback,
   type ReviewFallbackObservation, subscriptionReviewerSpawn, runSubscriptionReviewer,
   subscriptionReviewerAvailability, parseTeamclaudeStatusJson, parseTeamclaudeBaseUrl,
 } from './review-provider-fallback.js';
@@ -209,7 +214,151 @@ describe('classifyReviewProviderFailure — 「제공자가 아픈가」만 문�
   });
 });
 
+describe('self review isolated CLI model routing', () => {
+  test('--model glm sends the OpenRouter model and does not call Codex OAuth', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-review-glm-'));
+    const configDir = join(root, '.elanous-test');
+    const binDir = join(root, 'bin');
+    const capture = join(root, 'request.json');
+    try {
+      mkdirSync(configDir);
+      mkdirSync(binDir);
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ llm: { provider: 'openai-codex', model: 'gpt-6-sol', apiKey: 'test-openrouter-key' } }));
+      writeFileSync(join(binDir, 'gh'), `#!/bin/sh\nif [ "$1" = "api" ]; then printf 'diff --git a/x b/x\\n@@\\n+ok\\n'; exit 0; fi\necho '{"title":"review","body":"","headRefOid":"0123456789abcdef0123456789abcdef01234567","baseRefOid":"aaaabbbbccccddddeeeeffff0000111122223333"}'\n`, { mode: 0o755 });
+      const preload = join(root, 'capture.ts');
+      writeFileSync(preload, `const requests = []; globalThis.fetch = async (input, init) => { requests.push({ url: String(input), body: JSON.parse(String(init?.body)) }); await Bun.write(${JSON.stringify(capture)}, JSON.stringify(requests)); if (!String(input).startsWith('https://openrouter.ai/')) throw new Error('Codex OAuth misroute: ' + input); return new Response('data: {"choices":[{"delta":{"content":"VERDICT: PASS"}}]}\\n\\ndata: [DONE]\\n\\n', { status: 200, headers: { 'content-type': 'text/event-stream' } }); };`);
+      const childEnv: Record<string, string | undefined> = { ...process.env, PATH: `${binDir}:${process.env.PATH}`, OPENROUTER_API_KEY: 'test-openrouter-key', OPENAI_API_KEY: 'test-codex-key', CODEX_AUTH_TOKEN: 'test-oauth-token' };
+      delete childEnv.ELANOUS_TEST_FAKE_LLM;
+      const run = spawnSync(process.execPath, ['--preload', preload, join(import.meta.dir, '..', '..', 'bin/elanous.mjs'), `--test=${configDir}`, '--config-dir', configDir, 'self', 'review', '1', '--json', '--model', 'glm'],
+        { cwd: root, env: childEnv, encoding: 'utf8', timeout: 90_000 });
+      expect(run.status, `stdout=${run.stdout}\nstderr=${run.stderr}`).toBe(0);
+      const requests = JSON.parse(readFileSync(capture, 'utf8')) as Array<{ url: string; body: { model: string } }>;
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.url).toContain('openrouter.ai');
+      expect(requests[0]!.body.model).toBe('z-ai/glm-5.3');
+      const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as Record<string, unknown>;
+      expect(result).toMatchObject({ requestedModel: 'glm', model: 'openrouter/z-ai/glm-5.3', respondedProvider: 'openrouter' });
+      const rejected = spawnSync(process.execPath, [join(import.meta.dir, '..', '..', 'bin/elanous.mjs'), `--test=${configDir}`, '--config-dir', configDir, 'self', 'review', '1', '--json', '--model', 'glm-5.3'],
+        { cwd: root, env: childEnv, encoding: 'utf8', timeout: 90_000 });
+      expect(rejected.status).not.toBe(0);
+      expect(rejected.stdout).toContain('openrouter/z-ai/glm-5.3');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+});
+
+describe('self implement reviewDiff fallback route', () => {
+  test('primary overload reaches OpenRouter glm request with the canonical model', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'elanous-review-fallback-seam-'));
+    const originalFetch = globalThis.fetch;
+    const originalOpenRouterKey = process.env.OPENROUTER_API_KEY;
+    const originalOpenAIKey = process.env.OPENAI_API_KEY;
+    const requests: Array<{ url: string; model: string }> = [];
+    try {
+      clearLaunchRoleLlmOverrides();
+      process.env.OPENROUTER_API_KEY = 'test-review-openrouter-key';
+      process.env.OPENAI_API_KEY = 'test-review-openai-key';
+      writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
+      setUserConfigOverlay((config) => ({ ...config,
+        roleLlm: {}, roleModelTiers: {}, roleModels: { review: 'gpt-5.6-sol' },
+        llm: { ...config.llm, provider: 'openai-codex', reviewFallbackModels: ['glm'] },
+      }));
+      globalThis.fetch = (async (input, init) => {
+        const url = String(input);
+        const body = JSON.parse(String(init?.body)) as { model: string };
+        requests.push({ url, model: body.model });
+        if (!url.startsWith('https://openrouter.ai/')) throw new Error('Our servers are currently overloaded.');
+        return new Response('data: {"choices":[{"delta":{"content":"VERDICT: PASS"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        });
+      }) as typeof fetch;
+      const seams = await buildDefaultSelfImplementSeams(planDevPipeline({ input: { text: 'review fallback' } }), {
+        toolReviewerRate: 0,
+        streamLLM,
+        reviewScopeDiff: async () => 'diff --git a/changed.ts b/changed.ts\n+export const changed = true;\n',
+      });
+      const review = await seams.reviewDiff!(repo, { goal: 'review fallback' });
+      expect(review.reviewed, JSON.stringify({ review, requests })).toBe(true);
+      expect(requests.length).toBeGreaterThan(1);
+      expect(requests.slice(0, -1).every(({ url, model }) =>
+        !url.startsWith('https://openrouter.ai/') && model === 'gpt-5.6-sol')).toBe(true);
+      expect(requests.at(-1)).toEqual({
+        url: 'https://openrouter.ai/api/v1/chat/completions', model: 'z-ai/glm-5.3',
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = originalOpenRouterKey;
+      if (originalOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalOpenAIKey;
+      setUserConfigOverlay(null);
+      clearLaunchRoleLlmOverrides();
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('buildReviewProviderAttempts — 순서와 중복 제거', () => {
+  test('기본 provider fallback은 provider inference 가능한 canonical 모델 ID를 쓴다', () => {
+    expect(defaultReviewFallbackModel('grok')).toBe('claude-opus-5-5');
+    expect(defaultReviewFallbackModel('openrouter')).toBe('grok-4.7');
+  });
+
+  test('self review --model glm resolves the OpenRouter model before routing, not Codex OAuth', () => {
+    const attempts = buildReviewProviderAttempts({ model: 'glm', label: 'primary' }, [A]);
+    expect(attempts[0]).toMatchObject({ model: 'openrouter/z-ai/glm-5.3', provider: { name: 'openrouter' }, label: 'primary' });
+    expect(attempts[0]!.provider?.name).not.toBe('openai-codex');
+    expect(attempts[1]).toBe(A);
+    for (const fallbacks of [[], [B]]) {
+      for (const model of ['claude', 'unregistered-review-model']) {
+        const attempts = buildReviewProviderAttempts({ model, label: 'primary' }, fallbacks);
+        expect(attempts[0]).toMatchObject({ model, label: 'primary' });
+        expect(attempts[0]?.provider).toBeUndefined();
+        if (fallbacks.length) expect(attempts[1]).toBe(B);
+      }
+    }
+    const mismatched = buildReviewProviderAttempts({ model: 'grok-4', provider: A.provider, label: 'primary' }, [B]);
+    expect(mismatched[0]?.provider).toBeUndefined();
+    expect(mismatched[1]).toBe(B);
+  });
+
+  test('명시한 primary provider 객체의 사용자 설정을 보존한다', () => {
+    const custom = { ...getProvider('openrouter/z-ai/glm-5.3'), available: () => true };
+    const attempts = buildReviewProviderAttempts({ model: 'glm', provider: custom, label: 'custom' }, [B]);
+    expect(attempts[0]?.model).toBe('openrouter/z-ai/glm-5.3');
+    expect(attempts[0]?.provider).toBe(custom);
+  });
+
+  test('primary 실패 뒤 glm fallback을 OpenRouter의 정식 모델로 실행한다', async () => {
+    const attempts = buildReviewProviderAttempts(A, [{ model: 'glm', label: 'glm' }]);
+    const calls: Array<{ model: string; provider?: string }> = [];
+    const result = await runReviewWithFallback(attempts, async (attempt) => {
+      calls.push({ model: attempt.model, provider: attempt.provider?.name });
+      if (attempt.label === 'codex') throw new Error('Our servers are currently overloaded.');
+      return 'VERDICT: PASS';
+    });
+    expect(result.used).toMatchObject({ model: 'openrouter/z-ai/glm-5.3', provider: { name: 'openrouter' } });
+    expect(calls).toEqual([
+      { model: A.model, provider: A.provider.name },
+      { model: 'openrouter/z-ai/glm-5.3', provider: 'openrouter' },
+    ]);
+  });
+
+  test('fallback의 모호한 모델과 잘못 지정된 provider는 명시 거부한다', () => {
+    expect(() => buildReviewProviderAttempts(A, [{ model: 'unregistered-review-model', label: 'unknown' }]))
+      .toThrow(/ambiguous or unsupported fallback model/);
+    expect(() => buildReviewProviderAttempts(A, [{ model: 'glm', provider: A.provider, label: 'wrong' }]))
+      .toThrow(/unsupported provider/);
+  });
+
+  test('primary glm과 같은 별칭 fallback은 정규화한 모델 기준으로 한 번만 시도한다', () => {
+    const attempts = buildReviewProviderAttempts({ model: 'glm', label: 'primary' }, [
+      { model: 'glm', label: 'duplicate-alias' },
+      { model: 'openrouter/z-ai/glm-5.3', label: 'duplicate-canonical' },
+      B,
+    ]);
+    expect(attempts.map((attempt) => attempt.label)).toEqual(['primary', 'grok']);
+  });
+
   test('기본이 «맨 앞»이고 중복 모델은 빠진다', () => {
     expect(buildReviewProviderAttempts(A, [B, A, C]).map((x) => x.label)).toEqual(['codex', 'grok', 'claude']);
   });
@@ -391,7 +540,7 @@ describe('reviewFallbackModelsFromConfig — config 노브', () => {
     const models = reviewFallbackModelsFromConfig(() => ({ llm: { reviewFallbackModels: ['grok'] } }));
     expect(buildReviewProviderAttempts(A, models.map((model) => ({ model, label: model })))).toEqual([
       A,
-      { model: GROK_LADDER, label: GROK_LADDER },
+      { model: GROK_LADDER, provider: getProvider(GROK_LADDER), label: GROK_LADDER },
     ]);
   });
 

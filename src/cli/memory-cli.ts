@@ -10,6 +10,8 @@ import {
   readIndex, memoryRoot, memoryIndexPath,
   type MemoryType,
 } from '../memory.js';
+import { applyClaudeMemoryImport, claudeMemoryRoot, collectClaudeMemoryFiles } from '../context-bus/claude-memory-import.js';
+import { importClaudeMemories } from '../context-bus/long-term-memory.js';
 
 export function registerMemoryCommands(program: Command): void {
   const memCmd = program.command('memory').description('Persistent memories injected into every chat turn (user / feedback / project / reference)');
@@ -178,5 +180,32 @@ export function registerMemoryCommands(program: Command): void {
   .action(() => {
     console.log(`memory dir   ${memoryRoot()}`);
     console.log(`index file   ${memoryIndexPath()}`);
+  });
+
+  // 대표 10-12 MEMORY-IMPORT-CLAUDE — Claude 자동 기억(~/.claude/projects/*/memory)을 엘라누스
+  // 장기 기억으로 가져온다. 에이전트 무관 — codex·elanous TUI 가 같은 기억을 바로 읽는다.
+  memCmd
+  .command('import-claude')
+  .description('Import Claude auto-memories (~/.claude/projects/*/memory) into elanous memories — same name overwrites')
+  .option('--root <path>', 'projects root or a single memory dir', claudeMemoryRoot())
+  .option('--as-of <date>', 'staleness basis «MM-DD 기준» (default: today)')
+  .option('--dry-run', 'preview without saving')
+  .action((opts: { root: string; asOf?: string; dryRun?: boolean }) => {
+    const asOf = opts.asOf ?? new Date().toISOString().slice(0, 10);
+    const files = collectClaudeMemoryFiles(opts.root);
+    if (opts.dryRun) {
+      const preview = importClaudeMemories(files, { asOf });
+      ui.header(`claude-memory (dry-run) ${files.length} files`);
+      for (const item of preview.items) console.log(`  [${item.type.padEnd(9)}]  ${item.name}  ${item.summary}`);
+      if (preview.overwritten) console.log(`  overwritten ${preview.overwritten}`);
+      for (const [reason, count] of Object.entries(preview.skipped)) console.log(`  skipped ${reason}:${count}`);
+      return;
+    }
+    const result = applyClaudeMemoryImport(files, { asOf }, {
+      list: () => listMemories().map(entry => ({ id: entry.id, name: entry.name })),
+      save: record => { saveMemory(record); },
+    });
+    ui.info(`claude-memory: ${result.saved} new · ${result.updated} overwritten · ${result.items.length} imported (${files.length} files from ${opts.root})`);
+    for (const [reason, count] of Object.entries(result.skipped)) ui.info(`  skipped ${reason}:${count}`);
   });
 }

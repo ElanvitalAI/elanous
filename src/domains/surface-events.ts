@@ -172,10 +172,58 @@ export function recordInboundTurn(
   finally { if (ownDb) db.close(); }
 }
 
+/** 발화 «원천» — 사람이 말한 것과 시험 fixture·외부 CLI agent 가 던진 것을 계측상 구분한다.
+ *  ⛔ 원천 표기가 없는 0건을 «사람 표본 0» 으로 오인하면 안 되고, 반대로 시험 fixture 가
+ *  사람과 같은 서피스(cli·telegram)에 기록됐다는 이유로 사람 표본으로 세어도 안 된다. */
+export type SurfaceUtteranceOrigin = 'human' | 'test-fixture' | 'external-cli-agent' | 'elanous-self' | 'unknown';
+
+const TEST_FIXTURE_ORIGIN = /^(?:test-fixture|test_fixture|fixture|test|test-runner|bun-test)$/i;
+const HUMAN_ORIGIN = /^(?:human|user|tui|pwa|telegram|discord|cli)$/i;
+const EXTERNAL_CLI_AGENT_ORIGIN = /^(?:claude-code|codex|gemini|agent|external|external-cli-agent|external:[\w-]+|ext:[\w-]+)$/i;
+const HUMAN_PROSE_SURFACE = /^(?:cli|tui|pwa|telegram|discord|ipad|watch)$/i;
+
+function refsOf(raw: string | null): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const value: unknown = JSON.parse(raw);
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  } catch { return {}; }
+}
+
+/** 원천 분류기 — provenance(recordInboundTurn opts.origin → refs.origin/tags.origin:<origin>)
+ *  표기를 먼저 읽고, 표기가 없을 때만 서피스로 추정한다. 시험 fixture 는 서피스 추정 «전에» 가른다. */
+export function classifySurfaceUtteranceOrigin(
+  row: Pick<SurfaceEventRow, 'direction' | 'surface' | 'kind' | 'refs' | 'tags'>,
+): SurfaceUtteranceOrigin {
+  if (row.direction !== 'inbound') return 'unknown';
+  const refs = refsOf(row.refs);
+  const explicit = typeof refs.origin === 'string' ? refs.origin : undefined;
+  const utteranceOrigin = typeof refs.utteranceOrigin === 'string' ? refs.utteranceOrigin : undefined;
+  const fixtureTagged = (row.tags ?? '').split(/\s+/).filter(Boolean)
+    .some((tag) => TEST_FIXTURE_ORIGIN.test(tag.split(':').pop() ?? ''));
+  if ((utteranceOrigin && TEST_FIXTURE_ORIGIN.test(utteranceOrigin)) || (explicit && TEST_FIXTURE_ORIGIN.test(explicit)) || fixtureTagged) {
+    return 'test-fixture';
+  }
+  if (utteranceOrigin === 'human') return 'human';
+  if (utteranceOrigin === 'agent') return 'external-cli-agent';
+  if (explicit) {
+    if (HUMAN_ORIGIN.test(explicit)) return 'human';
+    if (EXTERNAL_CLI_AGENT_ORIGIN.test(explicit)) return 'external-cli-agent';
+  }
+  // recordInboundTurn marks its recorder as elanous-self; on chat Q&A the speaker is the human.
+  if (row.kind === 'qna' && /^(?:telegram|discord)$/i.test(row.surface)) return 'human';
+  if (explicit === 'elanous-self') return 'elanous-self';
+  if (/^ext:/i.test(row.surface)) return 'external-cli-agent';
+  if (HUMAN_PROSE_SURFACE.test(row.surface)) return 'human';
+  return 'unknown';
+}
+
 export interface SurfaceUtteranceQuery {
   from: string;
   to: string;
   surface?: string;
+  /** 원천 필터(선택) — 미지정이면 종전과 같이 창 안의 모든 발화를 읽는다(보존 계약). */
+  origin?: SurfaceUtteranceOrigin | readonly SurfaceUtteranceOrigin[];
 }
 
 /** Read every event in a half-open UTC interval without touching recall state. */
@@ -183,9 +231,40 @@ export function querySurfaceUtterances(db: Database, opts: SurfaceUtteranceQuery
   const where = ["julianday(e.ts) >= julianday(?)", "julianday(e.ts) < julianday(?)", "e.direction = 'inbound'", "e.kind IN ('utterance', 'qna')"];
   const params: string[] = [opts.from, opts.to];
   if (opts.surface) { where.push('e.surface = ?'); params.push(opts.surface); }
-  return db.prepare(
+  const rows = db.prepare(
     `SELECT e.* FROM events e WHERE ${where.join(' AND ')} ORDER BY julianday(e.ts) ASC, e.id ASC`,
   ).all(...params) as SurfaceEventRow[];
+  if (opts.origin === undefined) return rows;
+  const wanted = new Set<SurfaceUtteranceOrigin>(typeof opts.origin === 'string' ? [opts.origin] : opts.origin);
+  return rows.filter((row) => wanted.has(classifySurfaceUtteranceOrigin(row)));
+}
+
+/** 원천별 발화 수 — «사람 원천 0» 을 사람 표본으로 읽지 않게 하는 계측 입구(read-only·recall 무접촉). */
+export interface SurfaceUtteranceOriginCounts {
+  human: number;
+  testFixture: number;
+  externalCliAgent: number;
+  elanousSelf: number;
+  unknown: number;
+  total: number;
+}
+
+export function countSurfaceUtterancesByOrigin(
+  db: Database,
+  opts: Omit<SurfaceUtteranceQuery, 'origin'>,
+): SurfaceUtteranceOriginCounts {
+  const counts: SurfaceUtteranceOriginCounts = { human: 0, testFixture: 0, externalCliAgent: 0, elanousSelf: 0, unknown: 0, total: 0 };
+  for (const row of querySurfaceUtterances(db, opts)) {
+    counts.total += 1;
+    switch (classifySurfaceUtteranceOrigin(row)) {
+      case 'human': counts.human += 1; break;
+      case 'test-fixture': counts.testFixture += 1; break;
+      case 'external-cli-agent': counts.externalCliAgent += 1; break;
+      case 'elanous-self': counts.elanousSelf += 1; break;
+      default: counts.unknown += 1;
+    }
+  }
+  return counts;
 }
 
 export interface QueryEventsOpts {

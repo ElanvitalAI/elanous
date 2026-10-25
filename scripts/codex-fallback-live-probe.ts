@@ -18,6 +18,7 @@ import {
   type FallbackDecision,
   type FallbackStep,
   type RotationOutcome,
+  type StayReason,
 } from '../src/oauth/fallback-chain.js';
 import {
   codexStoreKey,
@@ -52,13 +53,12 @@ export type LiveProbeInputs = {
   readonly grokAvailableSource: 'resolveGrokCredential';
 } & GrokQuotaProbeFields;
 
-export type LiveProbeLine = LiveProbeInputs & {
-  readonly action: FallbackDecision['action'];
-  readonly why?: string;
-  readonly backend?: 'grok';
-  readonly to?: string;
-  readonly inputKind: 'live';
-};
+export type LiveProbeLine = LiveProbeInputs & (
+  | { readonly action: 'stay'; readonly why: StayReason; readonly backend?: never; readonly to?: never }
+  | { readonly action: 'switch-backend'; readonly backend: 'grok' | 'claude' | 'openrouter'; readonly model?: string; readonly why?: never; readonly to?: never }
+  | { readonly action: 'codex-rotate'; readonly to: string; readonly why?: never; readonly backend?: never }
+  | { readonly action: 'codex-credits'; readonly to?: string; readonly why?: never; readonly backend?: never }
+) & { readonly inputKind: 'live' };
 
 function isStayRotationReason(value: string): value is StayRotationReason {
   return (STAY_REASONS as readonly string[]).includes(value);
@@ -172,14 +172,16 @@ export function probeLine(
   inputs: LiveProbeInputs,
   decision: FallbackDecision,
 ): LiveProbeLine {
-  return {
-    ...inputs,
-    action: decision.action,
-    inputKind: 'live',
-    ...(decision.action === 'stay' ? { why: decision.why } : {}),
-    ...(decision.action === 'switch-backend' ? { backend: decision.backend } : {}),
-    ...(decision.action === 'codex-rotate' ? { to: decision.to.name } : {}),
-  };
+  switch (decision.action) {
+    case 'stay':
+      return { ...inputs, action: 'stay', why: decision.why, inputKind: 'live' };
+    case 'switch-backend':
+      return { ...inputs, action: 'switch-backend', backend: decision.backend, inputKind: 'live' };
+    case 'codex-rotate':
+      return { ...inputs, action: 'codex-rotate', to: decision.to.name, inputKind: 'live' };
+    case 'codex-credits':
+      return { ...inputs, action: 'codex-credits', ...(decision.to ? { to: decision.to.name } : {}), inputKind: 'live' };
+  }
 }
 
 /** status CLI 출력에서 JSON 객체만 잘라 읽는다. 선행 로그가 있어도 이유를 손으로 박지 않는다. */

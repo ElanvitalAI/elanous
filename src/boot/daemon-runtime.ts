@@ -54,6 +54,7 @@ import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import { elanousSelfAccessPrompt } from '../agent/self-ambient.js';
 import { createToolCwdResolver, type ToolCwdResolver } from './tool-cwd.js';
 import { resolveSessionProjectContext } from '../project/session-context.js';
+import { buildUniversalPreamble, loadProjectAnchorWithMeta } from '../prompt-library/universal-preamble.js';
 import { debug } from '../debug/log.js';
 import { resolvePersonaAddress } from '../intake-plane/persona-answer.js';
 import { awaitGlobalPersonaLoad, getGlobalPersonaRegistry } from '../persona/global-registry.js';
@@ -601,13 +602,34 @@ export function createDaemonRunTurn(
   }
   const killNonDetachedPty = opts.killNonDetachedPty;
 
+  // TUI-CONTINUE-SESSION (0.2.35) — inject the daemon TUI preamble once per
+  // runtime, even when `--continue` reattaches persisted history. Never use
+  // the ACP client's cwd as an anchor path; project/session context is server-owned.
+  const preambleInjectedSessions = new Set<string>();
+
   const deps: CoreTurnBridgeDeps = {
     // Persists the user message AND builds the LLM-facing list. See
     // daemon-history-helper.ts for the per-turn shape. Cleanup C1
     // moved this out of an inline closure to fix the user-message
     // persistence bug uniformly across all daemon paths.
     getMessages: ({ sessionId, userText, promptBlocks, promptMeta }) => {
-      const projectInstructions = resolveSessionProjectContext(sessionId)?.instructions;
+      const isFirstTurn = history.get(sessionId).length === 0;
+      const projectContext = resolveSessionProjectContext(sessionId);
+      const inputSource = readInputSourceMeta(promptMeta as Record<string, unknown> | undefined);
+      // The daemon API is the local CLI/TUI prompt route. Other ACP surfaces
+      // keep their existing system prompt unchanged.
+      const isDaemonTuiTurn = inputSource?.kind === 'daemon-api';
+      const anchorCwd = isDaemonTuiTurn ? projectContext?.cwd : undefined;
+      const firstTurnPreamble = anchorCwd && !preambleInjectedSessions.has(sessionId)
+        ? buildUniversalPreamble({
+            cwd: anchorCwd,
+            ...(surface.specs.length > 0 ? { enabledTools: surface.specs.map((spec) => spec.name) } : {}),
+          })
+        : [];
+      if (firstTurnPreamble.length > 0) preambleInjectedSessions.add(sessionId);
+      // `buildUniversalPreamble` carries the project AGENTS.md on the TUI's
+      // first attached turn. Do not also append `projectInstructions` there.
+      const projectInstructions = firstTurnPreamble.length > 0 ? undefined : projectContext?.instructions;
       const baseSystemPrompt = [composeDaemonSystemPrompt(opts.systemPrompt, promptMeta, sessionId), projectInstructions]
         .filter(Boolean).join('\n\n');
       // Image-pipeline followup #4 (2026-05-05) — append daemon webterm
@@ -631,11 +653,21 @@ export function createDaemonRunTurn(
       const hasNonTextBlock = !!promptBlocks?.some(
         (b) => (b as { type?: string }).type !== 'text',
       );
-      const isFirstTurn = history.get(sessionId).length === 0;
       const messages = hasNonTextBlock
         ? appendUserPromptBlocksAndBuildMessages(history, sessionId, promptBlocks!, systemPrompt)
         : appendUserAndBuildMessages(history, sessionId, userText, systemPrompt);
-      return prependChatPersonaOnLaterTurn(messages, isFirstTurn);
+      const withPersona = prependChatPersonaOnLaterTurn(messages, isFirstTurn);
+      if (firstTurnPreamble.length === 0) return withPersona;
+      const anchor = loadProjectAnchorWithMeta(anchorCwd!);
+      debug.log('boot.daemon-runtime', 'first-turn-universal-preamble', {
+        sessionId,
+        cwd: anchorCwd,
+        source: projectContext ? 'project' : 'daemon',
+        systemMessages: firstTurnPreamble.length,
+        anchorFiles: anchor.files.map((file) => file.filename),
+        localAnchorFiles: anchor.files.filter((file) => file.local).map((file) => file.filename),
+      });
+      return [...firstTurnPreamble, ...withPersona];
     },
     getTools: () => surface.specs,
     dispatchTool: terminalCapableDispatch(surfaceHasPtyShell, async (name, args, ctx) => {

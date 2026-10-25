@@ -304,6 +304,8 @@ export interface SerializedMessage {
   toolArgs?: unknown;
   toolResult?: unknown;
   tokenEstimate?: number;
+  /** Goal-loop iteration reply, not the final assistant answer. */
+  goalInterim?: boolean;
   /** Per-turn stable identifier. Auto-populated by `appendMessage` when the
    *  caller omits it (SAM S0 seed · M1.2 narrow). The wire format stays a
    *  bare 26-char ULID; external inputs should pass through `asTurnUri()`
@@ -1513,6 +1515,8 @@ export function resolveSessionId(
   root: string = sessionRoot(),
 ): string | null {
   const idx = readIndex(root);
+  // A whole id wins even when it is also the start of a longer id — otherwise that session could never be named.
+  if (idx.some(m => m.id === prefix)) return prefix;
   const matches = idx.filter(m => m.id.startsWith(prefix));
   if (matches.length === 0) return null;
   if (matches.length > 1) {

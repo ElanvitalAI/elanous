@@ -64,7 +64,7 @@ export function formatSeatDecisionRow(e: SeatDecisionRecord): string {
 }
 
 export function formatProposalRow(p: ProposalCard): string {
-  return `${p.id} · ${categoryLabel(p.category)} · ${p.title} · 사실 ${p.factId} · 비용 ${p.cost} · 되돌리기 ${p.undo}${p.thresholds.length ? ` · ${CROWN_MARK} 몫 ${p.thresholds.join('|')}` : ''} · 제안 ${representativeLabel(p.proposedBy)} · ${kst(p.proposedAt)} · 왕복 ${p.roundTrips}/${MAX_REVIEW_ROUND_TRIPS} · ${p.status === 'open' ? '검토 중' : p.status === 'agreed' ? '합의·실행·기록' : '불합의'}`;
+  return `${p.id} · ${categoryLabel(p.category)} · ${p.title} · 사실 ${p.factId} · 비용 ${p.cost} · 되돌리기 ${p.undo}${p.thresholds.length ? ` · ${CROWN_MARK} 몫 ${p.thresholds.join('|')}` : ''} · 제안 ${representativeLabel(p.proposedBy)} · ${kst(p.proposedAt)} · 왕복 ${p.roundTrips}/${MAX_REVIEW_ROUND_TRIPS} · ${p.status === 'open' ? '검토 중' : p.status === 'agreed' ? (p.thresholds.length ? '합의·승인 대기' : '합의·실행·기록') : '불합의'}`;
 }
 
 export function formatCrownCardRow(c: CrownCard): string {
@@ -235,14 +235,15 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     .requiredOption('--category <category>', `합의 범주 (${CONSENSUS_CATEGORIES.join('|')})`)
     .requiredOption('--title <text>').requiredOption('--fact-id <id>', '사실 id')
     .requiredOption('--cost <text>', '비용').requiredOption('--undo <text>', '되돌리기')
+    .option('--work-key <orch:card:cell>', 'splitter 교차 영향 작업 키')
     .option('--threshold <category>', `${CROWN_MARK} 몫 임계 범주 (반복: ${CROWN_THRESHOLD_CATEGORIES.join('|')})`, repeat, [])
     .option('--provider <name>', 'LLM 제공자 표식 — 가능하면 상대와 다른 제공자 (메아리 방지)')
     .option('--json').option('--hq-override')
-    .action((o: { by: string; category: string; title: string; factId: string; cost: string; undo: string; threshold: string[]; provider?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
+    .action((o: { by: string; category: string; title: string; factId: string; cost: string; undo: string; workKey?: string; threshold: string[]; provider?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (!mayWrite('consensus propose', o.hqOverride)) return;
       const proposal = consensusEngine().propose({
         by: o.by as ConsensusRepresentative, category: o.category as ConsensusCategory, title: o.title, factId: o.factId, cost: o.cost, undo: o.undo,
-        thresholds: o.threshold.map(threshold => threshold as DecisionCategory), provider: o.provider,
+        workKey: o.workKey, thresholds: o.threshold.map(threshold => threshold as DecisionCategory), provider: o.provider,
       });
       return emit(proposal, o.json, `제안: ${formatProposalRow(proposal)}`);
     }));
@@ -263,7 +264,9 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     .option('--json').option('--hq-override')
     .action((id: string, o: { by: string; claim?: string; provider?: string; json?: boolean; hqOverride?: boolean }) => fail(() => {
       if (!mayWrite('consensus agree', o.hqOverride)) return;
-      const { proposal, crownCard } = consensusEngine().agree(id, { by: o.by as ConsensusRepresentative, claim: o.claim, provider: o.provider });
+      const consensus = consensusEngine();
+      const { proposal, crownCard } = consensus.agree(id, { by: o.by as ConsensusRepresentative, claim: o.claim, provider: o.provider });
+      if (!crownCard && !consensus.canExecute(proposal.id)) throw new Error(`합의 실행 관문 거부: ${proposal.id}`);
       return emit({ proposal, ...(crownCard ? { crownCard } : {}) }, o.json,
         `합의: ${formatProposalRow(proposal)}${crownCard ? `\n${CROWN_MARK} 카드: ${formatCrownCardRow(crownCard)}` : ''}`);
     }));

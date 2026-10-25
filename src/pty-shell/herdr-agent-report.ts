@@ -9,11 +9,10 @@
 // 마지막 턴 상태를 잠시 뒤 다시 신고하고(새 seq · 더 새 턴이 오면 그만) 이후 턴 신고도 그대로 보낸다.
 //
 // herdr 는 같은 pane·source 에서 «직전보다 큰 seq» 만 받는다(작으면 rc0 인데 무시).
-// 같은 pane 에서 TUI 를 다시 띄워도 신고가 살도록 seq 는 max(직전+1 · 시각 · pane 기록+1) 이다.
-// pane 기록 = 그 pane 에서 마지막으로 낸 seq(기본 tmpdir 파일) — 같은 ms 재기동·시계 역행에도 뒤 프로세스가 앞 프로세스보다 크다.
-// ⛔ 턴 경로는 파일을 안 만진다: 기록은 start 때 한 번 읽고, release(원래 동기인 종료 경로)에서만 쓴다.
+// 같은 pane 에서 TUI 를 다시 띄워도 신고가 살도록 seq 는 max(직전+1 · 시각 · 예약 high-watermark+1) 이다.
+// pane 기록 = 예약한 seq 범위의 high-watermark(기본 tmpdir 파일) — 정상·비정상 재기동에서 뒤 범위를 쓴다.
+// ⛔ 턴 경로는 보통 파일을 안 만진다: 범위가 소진되면 next()가 새 범위를 파일에 예약한다.
 // 기록을 못 읽고 못 쓰면(관측 `seq-store-failed` 한 번) 시각·직전+1 로만 간다.
-// 한계: release 없이 죽은 프로세스의 마지막 seq 는 기록되지 않는다 — 그때 뒤 프로세스는 시각에 기댄다.
 //
 // 실패로 꺼지는 것은 «이후 turn» 뿐이다. release(권한 반납)는 start 실패가 «확인»됐을 때만 건너뛴다.
 // start 의 비동기 신고가 아직 안 끝났으면(결과 모름) 반납을 미루지 않고 바로 동기로 시도한다(관측 `release-start-pending`) —
@@ -27,6 +26,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { debug } from '../debug/log.js';
+import { pruneStaleHerdrAgent } from './herdr-prune-stale.js';
+import { HerdrSequenceLease, type HerdrSeqStore } from './herdr-sequence-lease.js';
+export type { HerdrSeqStore } from './herdr-sequence-lease.js';
 
 /** 턴 값 — tui-run-state 의 PtyTurnState 와 같은 낱말이지만 순환 import 를 피하려 여기 둔다. */
 export type HerdrTurn = 'busy' | 'idle';
@@ -55,22 +57,18 @@ export interface HerdrAgentReporterDeps {
   readonly sessionId?: string;
   /** seq 시작값의 시계(ms). 기본 Date.now. */
   readonly now?: () => number;
-  /** pane 별 마지막 seq 기록. 기본 = tmpdir 파일(`createFileSeqStore`). */
+  /** pane 별 예약 범위 끝 기록. 기본 = tmpdir 파일(`createFileSeqStore`). */
   readonly seqStore?: HerdrSeqStore;
   /** 재신고 타이머 — 기본 setTimeout(unref). 시험이 가짜 시계를 준다. */
   readonly schedule?: (fn: () => void, ms: number) => void;
+  /** Injected runners skip production startup cleanup unless explicitly enabled. */
+  readonly pruneStaleOnStart?: boolean;
 }
 
 const defaultSchedule = (fn: () => void, ms: number): void => {
   const t = setTimeout(fn, ms);
   (t as unknown as { unref?: () => void }).unref?.();
 };
-
-/** 같은 pane 에서 마지막으로 낸 seq — 프로세스 사이 단조를 잇는다. 실패는 던져도 된다(신고기가 삼킨다). */
-export interface HerdrSeqStore {
-  read(): number | undefined;
-  write(seq: number): void;
-}
 
 export function defaultHerdrSeqDir(): string {
   return join(tmpdir(), 'elanous-herdr-seq');
@@ -277,13 +275,17 @@ export function createHerdrAgentReporter(deps: HerdrAgentReporterDeps = {}): Her
   }
   const run = deps.run ?? defaultHerdrRunner(env);
   const sessionId = deps.sessionId ?? '';
-  return new Reporter(paneId, sessionId, run, log, deps.now ?? Date.now, deps.seqStore ?? createFileSeqStore(paneId), deps.schedule ?? defaultSchedule);
+  return new Reporter(
+    paneId, sessionId, run, log, deps.now ?? Date.now,
+    deps.seqStore ?? createFileSeqStore(paneId), deps.schedule ?? defaultSchedule,
+    deps.pruneStaleOnStart ?? deps.run === undefined,
+  );
 }
 
 type IssueResult = boolean | Promise<boolean>;
 
 class Reporter implements HerdrAgentReporterLike {
-  private seq = 0;
+  private readonly sequence: HerdrSequenceLease;
   private disabled = false;
   /**
    * idle 신고(에이전트 등록)의 상태: none → (pending →) ok | failed.
@@ -291,8 +293,6 @@ class Reporter implements HerdrAgentReporterLike {
    */
   private startState: 'none' | 'pending' | 'ok' | 'failed' = 'none';
   private released = false;
-  /** start 때 한 번 읽은 pane 기록(턴 경로는 파일을 안 만진다). */
-  private storedSeq: number | undefined;
   /** idle 신고(비동기 포함)가 실패했다 — 등록된 적이 없으니 반납할 것이 없다. */
   private idleFailed = false;
   private seqStoreFailed = false;
@@ -313,9 +313,12 @@ class Reporter implements HerdrAgentReporterLike {
     private readonly run: HerdrRunner,
     private readonly log: (event: string, data: Record<string, unknown>) => void,
     private readonly now: () => number,
-    private readonly seqStore: HerdrSeqStore,
+    seqStore: HerdrSeqStore,
     private readonly schedule: (fn: () => void, ms: number) => void,
-  ) {}
+    private readonly pruneStaleOnStart: boolean,
+  ) {
+    this.sequence = new HerdrSequenceLease(seqStore, now, (error) => this.seqStoreFail(error));
+  }
 
   /** 마지막으로 요청된 턴 상태와 그 세대 — 재신고는 세대가 그대로일 때만(더 새 턴이 오면 그만). */
   private lastTurn: HerdrTurn | null = null;
@@ -324,7 +327,17 @@ class Reporter implements HerdrAgentReporterLike {
 
   start(): void {
     if (this.startState !== 'none') return;
-    try { this.storedSeq = this.seqStore.read(); } catch (error) { this.seqStoreFail(error); }
+    if (this.pruneStaleOnStart) {
+      const pruneSeq = this.nextSeq();
+      try {
+        const pruned = pruneStaleHerdrAgent(this.paneId, pruneSeq, this.run);
+        this.log(pruned.ok ? 'startup-prune-complete' : 'startup-prune-failed', {
+          seq: pruneSeq, ...(pruned.stderr ? { stderrHead: stderrHead(pruned.stderr) } : {}),
+        });
+      } catch (error) {
+        this.log('startup-prune-failed', { seq: pruneSeq, stderrHead: stderrHead(error instanceof Error ? error.message : String(error)) });
+      }
+    }
     const idleOk = this.issue([
       'pane', 'report-agent',
       '--source', HERDR_SOURCE, '--agent', HERDR_AGENT,
@@ -365,8 +378,6 @@ class Reporter implements HerdrAgentReporterLike {
     this.releasedWhilePending = false;
     this.log('release-resend-after-late-start', {});
     const seq = this.nextSeq();
-    // 재반납 seq 도 pane 기록에 남긴다 — 같은 ms 재기동의 첫 seq 가 이 값보다 커야 한다(r7 리뷰 mf).
-    try { this.seqStore.write(this.seq); } catch (error) { this.seqStoreFail(error); }
     void this.runAndJudge([
       'pane', 'release-agent',
       this.paneId,
@@ -418,8 +429,6 @@ class Reporter implements HerdrAgentReporterLike {
       ], true, 'release');
     }
     const seq = this.nextSeq();
-    // pane 기록 쓰기는 여기(동기 종료 경로)뿐이다.
-    try { this.seqStore.write(this.seq); } catch (error) { this.seqStoreFail(error); }
     // ⛔ herdr 0.9.1 `release-agent` 는 PANE_ID 를 옵션 «앞»에 둬야 받는다 — 뒤에 두면
     //   «unknown option: custom:elanous» rc2 로 반납이 영영 안 됐다(10-18 라이브 실측 · report-agent 는 뒤도 받음).
     this.issue([
@@ -457,20 +466,16 @@ class Reporter implements HerdrAgentReporterLike {
     this.log('seq-store-failed', { error: error instanceof Error ? error.message : String(error) });
   }
 
-  /** max(직전+1 · 시각 ms · pane 기록+1) — 같은 ms 재기동에도 뒤 프로세스의 첫 seq 가 앞 프로세스의 마지막보다 크다. */
+  /** Reserved sequence lease advances monotonically across same-millisecond restarts. */
   private nextSeq(): string {
-    const clock = Math.floor(this.now());
-    let next = Number.isFinite(clock) ? Math.max(this.seq + 1, clock) : this.seq + 1;
-    if (this.storedSeq !== undefined) next = Math.max(next, this.storedSeq + 1);
-    this.seq = next;
-    return String(this.seq);
+    return String(this.sequence.next());
   }
 
   /**
    * release 는 꺼진 뒤에도 보낸다(권한 반납 · start 성공 조건은 release() 가 본다).
    * @returns false = 동기 실패(신고기 꺼짐) · true = 동기 성공 · Promise = 비동기 결과(성공이면 true).
    */
-  private issue(argv: string[], sync: boolean, phase: 'start' | 'session' | 'turn' | 'release'): IssueResult {
+  private issue(argv: string[], sync: boolean, phase: 'start' | 'session' | 'turn' | 'release' | 'stale-cleanup'): IssueResult {
     if (this.disabled && phase !== 'release') return false;
     const opts: HerdrRunOpts = { sync, timeoutMs: sync ? SYNC_TIMEOUT_MS : ASYNC_TIMEOUT_MS };
     if (!sync && this.pending) {
@@ -520,7 +525,7 @@ class Reporter implements HerdrAgentReporterLike {
   }
 
   /** 줄 선 비동기 한 건 — 러너 결과(동기·비동기 모두)를 성패로 접는다. */
-  private async runAndJudge(argv: string[], opts: HerdrRunOpts, phase: 'start' | 'session' | 'turn' | 'release'): Promise<boolean> {
+  private async runAndJudge(argv: string[], opts: HerdrRunOpts, phase: 'start' | 'session' | 'turn' | 'release' | 'stale-cleanup'): Promise<boolean> {
     try {
       const r = await this.run(argv, opts);
       if (r.ok) return true;
@@ -532,7 +537,7 @@ class Reporter implements HerdrAgentReporterLike {
     }
   }
 
-  private fail(argv: string[], phase: 'start' | 'session' | 'turn' | 'release', stderr: string | undefined, timedOut = false): void {
+  private fail(argv: string[], phase: 'start' | 'session' | 'turn' | 'release' | 'stale-cleanup', stderr: string | undefined, timedOut = false): void {
     if (phase === 'turn' && timedOut && !this.disabled) {
       this.retryTurnAfterTimeout(argv, stderr);
       return;
@@ -541,6 +546,10 @@ class Reporter implements HerdrAgentReporterLike {
     // 반납 실패는 신고기가 이미 꺼졌어도 늘 남긴다(종료 경로의 유일한 흔적).
     if (phase === 'release') {
       this.log('release-failed', { stderrHead: stderrHead(stderr) });
+      return;
+    }
+    if (phase === 'stale-cleanup') {
+      this.log('stale-agent-cleanup-failed', { stderrHead: stderrHead(stderr) });
       return;
     }
     if (this.disabled) return;

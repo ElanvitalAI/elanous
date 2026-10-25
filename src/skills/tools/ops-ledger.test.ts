@@ -130,14 +130,19 @@ describe('ops-ledger msg tools (우편)', () => {
 
   test('MsgAsk 폴링이 늦어 기한 뒤 도착한 연결 답은 timeout으로 남긴다', async () => {
     const store = msgDeps.openStore!();
+    let elapsed = 0;
+    let polls = 0;
+    const wallBase = Date.now();
     try {
+      spyOn(store, 'listReplies').mockImplementation((questionId) => ++polls === 1 ? [] : [{
+        id: questionId + 1, from: 'TC', to: 'OP', body: '늦은 답', replyTo: questionId,
+        createdAt: new Date(wallBase + 1200).toISOString(),
+      }]);
       const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '기한?', waitSeconds: 1 }, {
-        ...msgDeps,
-        sleep: async () => {
-          await new Promise(resolve => setTimeout(resolve, 1100));
-          const question = store.list('TC')[0]!;
-          store.post({ from: 'TC', to: 'OP', body: '늦은 답', replyTo: question.id });
-        },
+        openStore: () => store,
+        monotonicNow: () => elapsed,
+        wallNow: () => wallBase + elapsed,
+        sleep: async () => { elapsed = 1200; },
       });
       expect(result.ok).toBe(false);
       expect(result.reply).toBeNull();
@@ -148,14 +153,19 @@ describe('ops-ledger msg tools (우편)', () => {
 
   test('MsgAsk 기한 직전 도착한 답은 마지막 조회에서 받는다', async () => {
     const store = msgDeps.openStore!();
+    let elapsed = 0;
+    let polls = 0;
+    const wallBase = Date.now();
     try {
+      spyOn(store, 'listReplies').mockImplementation((questionId) => ++polls === 1 ? [] : [{
+        id: questionId + 1, from: 'TC', to: 'OP', body: '기한 안 답', replyTo: questionId,
+        createdAt: new Date(wallBase + 900).toISOString(),
+      }]);
       const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '직전?', waitSeconds: 1 }, {
-        ...msgDeps,
-        sleep: async () => {
-          const question = store.list('TC')[0]!;
-          await new Promise(resolve => setTimeout(resolve, 900));
-          store.post({ from: 'TC', to: 'OP', body: '기한 안 답', replyTo: question.id });
-        },
+        openStore: () => store,
+        monotonicNow: () => elapsed,
+        wallNow: () => wallBase + elapsed,
+        sleep: async () => { elapsed = 900; },
       });
       expect(result.ok).toBe(true);
       expect(result.reply?.body).toBe('기한 안 답');
@@ -218,10 +228,11 @@ describe('ops-ledger msg tools (우편)', () => {
     } finally { store.close(); }
   });
 
-  test('MsgAsk는 가득 찬 답 페이지가 계속돼도 실제 타이머 취소를 받는다', async () => {
+  test('MsgAsk는 가득 찬 답 페이지를 반복한 뒤 주입된 취소 신호를 받는다', async () => {
     const store = msgDeps.openStore!();
     const abort = new AbortController();
     let pages = 0;
+    let sleeps = 0;
     try {
       spyOn(store, 'listReplies').mockImplementation((_id, _limit, afterId = 0) => {
         pages += 1;
@@ -230,17 +241,13 @@ describe('ops-ledger msg tools (우편)', () => {
           createdAt: new Date().toISOString(),
         }));
       });
-      const started = performance.now();
-      const timer = setTimeout(() => abort.abort(), 20);
-      try {
-        const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '취소?', waitSeconds: 300 }, {
-          openStore: () => store, signal: abort.signal,
-        });
-        expect(result.ok).toBe(false);
-        expect(result.output).toContain('cancelled');
-        expect(pages).toBeGreaterThan(1);
-        expect(performance.now() - started).toBeLessThan(1000);
-      } finally { clearTimeout(timer); }
+      const result = await dispatchMsgAsk({ from: 'OP', to: 'TC', question: '취소?', waitSeconds: 300 }, {
+        openStore: () => store, signal: abort.signal,
+        sleep: async () => { if (++sleeps === 2) abort.abort(); },
+      });
+      expect(result.ok).toBe(false);
+      expect(result.output).toContain('cancelled');
+      expect(pages).toBe(2);
     } finally { store.close(); }
   });
 

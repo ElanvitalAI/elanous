@@ -12,7 +12,8 @@ import { baseVersion, isReleaseVersion, isStableVersion, prereleaseKind } from '
 type Kind = 'release' | 'dev-bump';
 type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string;
   /** RELEASE-BRANCH: the release branch the cut lives on and the main commit it was cut from. */
-  branch?: string; base?: string; existing?: boolean; skipped?: string };
+  branch?: string; base?: string; existing?: boolean; skipped?: string;
+  artifactOwner?: { runId: string; attempt: number } };
 
 export function nextDevVersion(version: string): string {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(isReleaseVersion(version) ? baseVersion(version) : version);
@@ -147,6 +148,57 @@ export interface BranchCutDeps {
   freeze?: () => LandingFreeze | null;
   /** `--force-freeze`: cut while a freeze is on (recorded). */
   forceFreeze?: boolean;
+  /** Identity of the graph run cutting this branch. A direct legacy call may omit it. */
+  runId?: string;
+  /** Release run ledger universe; defaults to the active instance root. */
+  root?: string;
+}
+
+function releaseOwner(version: string, deps: BranchCutDeps): { runId: string; attempt: number } | undefined {
+  if (!deps.runId) return undefined;
+  const runId = deps.runId;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId) || runId === '.' || runId === '..') throw new Error(`invalid release run id: ${runId}`);
+  const path = join(deps.root ?? effectiveInstanceRoot(), 'release', version, 'resume-attempts', `${runId}.json`);
+  if (!existsSync(path)) return { runId, attempt: 0 };
+  const saved = JSON.parse(readFileSync(path, 'utf8')) as { version?: unknown; runId?: unknown; attempts?: unknown };
+  if (saved.version !== version || saved.runId !== runId || !Array.isArray(saved.attempts)
+    || saved.attempts.some((value) => typeof value !== 'string' || !Number.isFinite(Date.parse(value))))
+    throw new Error(`invalid resume attempts: ${path}`);
+  return { runId, attempt: saved.attempts.length };
+}
+
+function recordedBranchOwner(repo: string, tip: string): { runId: string; attempt: number } | undefined {
+  // An owner's trailer inherited from main is not evidence that this release branch belongs to that run.
+  const fork = git(repo, 'merge-base', 'origin/main', tip);
+  const messages = git(repo, 'log', '--first-parent', '--format=%B', '-n', '100', `${fork}..${tip}`);
+  const match = /^Elanous-Release-Run: ([A-Za-z0-9][A-Za-z0-9._-]*)\nElanous-Release-Attempt: (0|[1-9][0-9]*)$/m.exec(messages);
+  return match ? { runId: match[1]!, attempt: Number(match[2]) } : undefined;
+}
+
+function priorRunOwnsTip(version: string, tip: string, owner: { runId: string; attempt: number }, root: string): boolean {
+  const path = join(root, 'graph-runs', 'release-loop', `${owner.runId}.json`);
+  if (!existsSync(path)) return false;
+  const state = JSON.parse(readFileSync(path, 'utf8')) as { graphId?: unknown; runId?: unknown; input?: { version?: unknown; branchCut?: unknown };
+    nodes?: Array<{ nodeId?: unknown; ok?: unknown; output?: unknown }> };
+  if (state.graphId !== 'release-loop' || state.runId !== owner.runId || state.input?.version !== version || state.input?.branchCut !== true) return false;
+  return state.nodes?.some((node) => {
+    if (node.nodeId !== 'version-release' || node.ok !== true || typeof node.output !== 'string') return false;
+    try {
+      const result = JSON.parse(node.output.trim().split('\n').at(-1)!) as { commit?: unknown; branch?: unknown };
+      return result.commit === tip && result.branch === `release/${version}`;
+    } catch { return false; }
+  }) ?? false;
+}
+
+function preserveForeignBranch(repo: string, version: string, tip: string): string {
+  const backupBranch = `release-backup/${version}/${tip}`;
+  const ref = `refs/heads/${backupBranch}`;
+  const existing = git(repo, 'ls-remote', '--heads', 'origin', ref).split(/\s+/)[0] ?? '';
+  if (existing && existing !== tip) throw new Error(`${backupBranch} points to another commit — refusing to replace release branch`);
+  if (!existing) git(repo, 'push', '--porcelain', `--force-with-lease=${ref}:`, 'origin', `${tip}:${ref}`);
+  const preserved = git(repo, 'ls-remote', '--heads', 'origin', ref).split(/\s+/)[0] ?? '';
+  if (preserved !== tip) throw new Error(`${backupBranch} backup verification failed — refusing to replace release branch`);
+  return backupBranch;
 }
 
 function currentFreeze(): LandingFreeze | null {
@@ -189,15 +241,23 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
     if (!deps.forceFreeze) throw new Error(landingFreezeMessage(frozen));
   }
   fetchMain(repo);
+  const owner = releaseOwner(version, deps);
   const branch = `release/${version}`;
   const advertised = git(repo, 'ls-remote', '--heads', 'origin', `refs/heads/${branch}`).split(/\s+/)[0] ?? '';
   if (advertised) {
-    // A prerelease number is used once: an existing rc branch is another run's cut, never this run's.
-    if (prereleaseKind(version) !== null) throw new Error(`${branch} already exists — ${version} was cut by another run; run again for the next free number`);
     if (!/^[0-9a-f]{40}$/i.test(advertised)) throw new Error(`${branch} remote tip is not a commit SHA`);
     git(repo, 'fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`);
     const tip = git(repo, 'rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`);
     if (tip !== advertised) throw new Error(`${branch} moved while it was read (${advertised} → ${tip})`);
+    const recordedOwner = owner ? recordedBranchOwner(repo, tip) : undefined;
+    const ledgerOwned = owner && !recordedOwner
+      ? priorRunOwnsTip(version, tip, owner, deps.root ?? effectiveInstanceRoot()) : false;
+    if (owner && recordedOwner?.runId !== owner.runId && !ledgerOwned) {
+      const backupBranch = preserveForeignBranch(repo, version, tip);
+      throw new Error(`${branch} belongs to ${recordedOwner?.runId ?? 'an unknown run'}; preserved ${tip} at ${backupBranch}; refusing to replace a foreign release branch`);
+    }
+    // Direct legacy calls retain the old prerelease number rule. A graph run may reuse only its own rc branch.
+    if (!owner && prereleaseKind(version) !== null) throw new Error(`${branch} already exists — ${version} was cut by another run; run again for the next free number`);
     const current = versionAt(repo, tip);
     if (current !== version) throw new Error(`${branch} tip ${tip} package.json version ${current} is not ${version}`);
     // The branch must be a cut of this release line: its fork point on main still carries <base>-dev.N (or <v>).
@@ -207,8 +267,10 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
     if (forkVersion !== version && !new RegExp(`^${stableLine.replaceAll('.', '\\.')}-dev\\.(0|[1-9][0-9]*)$`).test(forkVersion)) {
       throw new Error(`${branch} forks from main at ${fork} (version ${forkVersion}) — not a cut of ${stableLine}-dev.N`);
     }
-    debug.log('release-loop.cut', 'chosen', { version, source: 'release-branch', commit: tip, branch, existing: true });
-    return { outcome: 'ok', kind: 'release', version, commit: tip, pr: null, branch, existing: true };
+    // A legacy saved version-release node was the initial cut; later resume counts do not change its owner attempt.
+    const artifactOwner = recordedOwner ?? (ledgerOwned && owner ? { runId: owner.runId, attempt: 0 } : undefined);
+    debug.log('release-loop.cut', 'chosen', { version, source: 'release-branch', commit: tip, branch, existing: true, artifactOwner });
+    return { outcome: 'ok', kind: 'release', version, commit: tip, pr: null, branch, existing: true, ...(artifactOwner ? { artifactOwner } : {}) };
   }
   const base = git(repo, 'rev-parse', 'origin/main');
   const current = versionAt(repo, base);
@@ -229,8 +291,10 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
     if (files.length) {
       (deps.install ?? ((tree: string) => { run('bun', ['install', '--frozen-lockfile'], tree); }))(worktree);
       git(worktree, 'add', '-A');
-      git(worktree, 'commit', '-m', `release: ${version}`, '-m', `Cut from main ${base}.`);
     }
+    // Even a no-op version bump needs a commit that records who owns this cut.
+    if (files.length || owner) git(worktree, 'commit', ...(files.length ? [] : ['--allow-empty']), '-m', `release: ${version}`,
+      '-m', `Cut from main ${base}.${owner ? `\n\nElanous-Release-Run: ${owner.runId}\nElanous-Release-Attempt: ${owner.attempt}` : ''}`);
     const commit = git(worktree, 'rev-parse', 'HEAD');
     // Create-only: an empty lease refuses to overwrite a branch someone else made meanwhile.
     const push = git(repo, 'push', '--porcelain', `--force-with-lease=refs/heads/${branch}:`, 'origin', `${commit}:refs/heads/${branch}`);
@@ -239,16 +303,16 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
       return flag === '*' && !!ref?.endsWith(`:refs/heads/${branch}`) && summary === '[new branch]';
     });
     if (!created) throw new Error(`${branch} was not created (push: ${push.replace(/\s+/g, ' ').trim() || 'no output'})`);
-    debug.log('release-loop.cut', 'chosen', { version, source: 'release-branch', commit, branch, base, existing: false });
-    return { outcome: 'ok', kind: 'release', version, commit, pr: null, branch, base, files };
+    debug.log('release-loop.cut', 'chosen', { version, source: 'release-branch', commit, branch, base, existing: false, artifactOwner: owner });
+    return { outcome: 'ok', kind: 'release', version, commit, pr: null, branch, base, files, ...(owner ? { artifactOwner: owner } : {}) };
   } finally {
     try { if (added) git(repo, 'worktree', 'remove', '--force', worktree); }
     finally { rmSync(temp, { recursive: true, force: true }); }
   }
 }
 
-function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false, devTarget?: string): Output {
-  if (kind === 'release' && branchCut && cutCommit === undefined) return cutReleaseBranchForRun(repo, releaseVersion, { forceFreeze });
+function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false, devTarget?: string, runId?: string): Output {
+  if (kind === 'release' && branchCut && cutCommit === undefined) return cutReleaseBranchForRun(repo, releaseVersion, { forceFreeze, runId });
   if (kind === 'dev-bump' && prereleaseKind(releaseVersion) !== null) {
     // A prerelease (rehearsal) never moves main: the next stable release still owns this -dev line.
     debug.log('release-loop.version-dev-bump', 'skipped', { version: releaseVersion, reason: 'prerelease' });
@@ -375,6 +439,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
   let cutCommit: string | undefined;
   let forceFreeze = false;
   let branchCut = false;
+  let runId: string | undefined;
   try {
     if (args[0] !== 'release' && args[0] !== 'dev-bump') throw new Error('usage: version-node.ts <release|dev-bump> [--version <v>] [--cut <sha>] [--cut-commit <sha>] --json');
     kind = args[0];
@@ -388,7 +453,11 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     if (process.env.ELANOUS_GRAPH_CONTEXT) {
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
-        input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
+        runId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
+      if (context.runId !== undefined) {
+        if (typeof context.runId !== 'string') throw new Error('runId must be a string');
+        runId = context.runId;
+      }
       if (!version && typeof context.input?.version === 'string') version = context.input.version;
       forceFreeze = context.input?.forceFreeze === true;
       branchCut = context.input?.branchCut === true;
@@ -403,7 +472,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
     if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
-    return landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut);
+    return landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut, undefined, runId);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const worktree = /\[worktree: ([^\]]+)\]$/.exec(message)?.[1];

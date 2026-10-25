@@ -19,7 +19,7 @@ import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { spawnElanous } from '../instance/spawn-elanous.js';
 import { getUserConfig } from '../user-config.js';
-import { resyncPendingPath } from './resync-tick.js';
+import { resyncPendingPath, resyncPendingRecoveryPath } from './resync-tick.js';
 
 export const REJUDGE_TICK_EVENT = 'rejudge-tick';
 export const REJUDGE_DEFAULT_MAX_LOAD = 60;
@@ -145,11 +145,18 @@ export async function rejudgeTick(deps: RejudgeTickDeps = {}): Promise<RejudgeTi
   }
 }
 
+/**
+ * The resync marker, or its recovery sibling when the primary record could not be written after a push. Both carry
+ * `{ savedAt }`, so a same-tick rejudge still sees the new head instead of falling back to the cadence alone.
+ */
 function readPending(path: string): string | null {
-  try {
-    const value = (JSON.parse(readFileSync(path, 'utf8')) as { savedAt?: unknown }).savedAt;
-    return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null;
-  } catch { return null; }
+  for (const candidate of [path, resyncPendingRecoveryPath(path)]) {
+    try {
+      const value = (JSON.parse(readFileSync(candidate, 'utf8')) as { savedAt?: unknown }).savedAt;
+      if (typeof value === 'string' && Number.isFinite(Date.parse(value))) return value;
+    } catch { /* missing or unreadable: fall through to the recovery marker */ }
+  }
+  return null;
 }
 
 if (import.meta.main) {

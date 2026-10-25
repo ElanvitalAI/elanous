@@ -255,6 +255,62 @@ import {
   getDashboardContextMenuRegistry,
 } from './context-menu/registry.js';
 import { createTransientOverlayHost } from '../display/transient-overlay-host.js';
+import { beginSynchronizedFrameOutput } from './synchronized-frame-output.js';
+import type { SynchronizedFrameOutputDeps } from './synchronized-frame-output.js';
+export {
+  beginSynchronizedFrameOutput,
+  SYNCHRONIZED_OUTPUT_BEGIN,
+  SYNCHRONIZED_OUTPUT_END,
+} from './synchronized-frame-output.js';
+export type {
+  SynchronizedFrameOutput,
+  SynchronizedFrameOutputDeps,
+} from './synchronized-frame-output.js';
+
+/**
+ * TUI-FLICKER-DRAW-INTEGRATION — the single synchronized-output owner that every
+ * dashboard draw entry goes through: BSU → draw body (frame + coordinator modal
+ * overlay + prompt repaint) → ESU. The finally keeps the region closed when the
+ * body throws, so a failed compose cannot leave a dangling BSU that swallows the
+ * next frame.
+ */
+export function runSynchronizedFrameDraw<T>(
+  drawBody: () => T,
+  deps: SynchronizedFrameOutputDeps,
+): T {
+  const frame = beginSynchronizedFrameOutput(deps);
+  try {
+    return drawBody();
+  } finally {
+    frame.close();
+  }
+}
+
+export interface SynchronizedFrameDrawSink {
+  write: (chunk: string) => void;
+  /** Production passes `process.stdout.isTTY`: only a tty receives DEC 2026. */
+  isTTY?: boolean;
+  /** Environment for the `ELANOUS_SYNC_OUTPUT` escape hatch. Defaults to `process.env`. */
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * TUI-FLICKER-DRAW-INTEGRATION — production entry for a synchronized dashboard
+ * frame. `drawNow` (the single draw function both the force path and the queued
+ * microtask path call) hands its compose body to this function, so the tty gate
+ * and the BSU/ESU ownership live in exactly one place.
+ */
+export function drawDashboardFrameSynchronized<T>(
+  drawBody: () => T,
+  sink: SynchronizedFrameDrawSink = process.stdout,
+): T {
+  return runSynchronizedFrameDraw(drawBody, {
+    write: (chunk) => { sink.write(chunk); },
+    supported: sink.isTTY === true,
+    env: sink.env,
+  });
+}
+
 import { configureThemeIconsGetter } from '../theme/icons.js';
 import { configureModalAdapterTheme } from '../ui/modal-adapter.js';
 import {
@@ -947,7 +1003,7 @@ import { runPtySnapshot, type PtyTakeoverCommandDeps } from '../cli/pty-takeover
 import { requestRemotePtyControl } from '../pty-shell/pty-control-ipc.js';
 import { getHarnessRunId } from '../harness/harness-space.js';
 import { formatPtyCallLine, formatPtyResultLine } from '../pty-activity-log.js';
-import { getSessionMetrics } from '../status/metrics.js';
+import { getSessionMetrics, noteRestoredContext } from '../status/metrics.js';
 import {
   createContextRegistry, tokenizeInput, pruneUnreferenced,
   addAttachmentEx as ctxAddEx,
@@ -1024,7 +1080,7 @@ import {
   deriveDaemonHttpBase,
   fetchDaemonSessionHistory,
 } from './acp-boot.js';
-import { renderReplayPreviewLines } from './replay-preview.js';
+import { renderRestoredTranscriptLines } from './replay-preview.js';
 import {
   buildDashboardTurnPreamble,
 } from './turn-preamble.js';
@@ -1062,6 +1118,7 @@ import { spawnCodingAgent, CodingAgentBinaryMissing } from '../terminal/coding-a
 import type { TerminalSession } from '../terminal/session-registry.js';
 import { createSessionPickerModal } from '../session/picker-modal.js';
 import { listSessions as listChatSessionsForResume, adoptSession as adoptChatSession, setActiveSessionId as markActiveChatSession } from '../session/index.js';
+import { idPrefixCell, sessionIdPrefixes, sessionListTime } from '../session/id-prefix.js';
 // TUI 부활 S-b — 타임트래블 포크 엔진 (codex ForkSnapshot 동형 · 2026-07-09
 // 이식 후 호출처 0 이던 방치 자산 회수). 순수 히스토리 절단 로직만 소비;
 // 영속은 세션 스토어(forkSessionFromHistory)가 담당한다.
@@ -1213,7 +1270,7 @@ import { type ExecutionSurfaceHandle } from '../display/index.js';
 import { AgentSurfaceStore, renderAgentDetail, renderAgentRoster, type AgentSurfaceState } from '../display/agent-surface.js';
 import { globalAgentFlash } from '../display/agent-flash.js';
 import { globalTaskNotificationQueue, type TaskNotificationQueue, type PendingTaskNotification } from '../agent/task-notification.js';
-import { createDashboardAgentWakeNotify, installAgentWake, wrapAgentWakePort } from './input/agent-wake.js';
+import { createDashboardAgentWakeNotify, installSeatedAgentWake, wrapAgentWakePort } from './input/agent-wake.js';
 import { renderDebugEventDetail, renderDebugEventRows, renderDebugStack, renderPromptInjectionDebug } from '../display/debug-surface.js';
 import { buildDebugCallStack } from '../debug/call-stack.js';
 import { buildAstGrepHostTool } from '../skills/tools/ast-grep.js';
@@ -2752,16 +2809,18 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // Pickers share the composer bottom slot.
     const placement = resolveDecisionPickerPlacement({ height: 16 });
     const modalWidth = placement.width;
+    // Unique prefixes, not a fixed 8 — two sessions sharing 8 characters used to look identical (TUI-RESUME-PICKER).
+    const idPrefixes = sessionIdPrefixes(rows.map((m) => m.id));
     const fmtRow = (m: (typeof rows)[number]): string => {
       const marker = m.id === attachedSessionId ? '▸ ' : '  ';
-      const ts = m.updatedAt.slice(5, 16).replace('T', ' ');
+      const ts = sessionListTime(m.updatedAt);
       const binds: string[] = [];
       if (m.bindings?.cli) binds.push('cli');
       if (m.bindings?.telegram) binds.push('tg');
       if (m.bindings?.discord) binds.push('dc');
       const bindStr = binds.length > 0 ? `[${binds.join(',')}]` : '';
       const title = (m.title || '(no title)').slice(0, 42);
-      return `${marker}${m.id.slice(0, 8)}  ${ts}  ${String(m.messageCount).padStart(3)}t ${bindStr.padEnd(9)} ${title}`;
+      return `${marker}${idPrefixCell(idPrefixes, m.id)}  ${ts}  ${String(m.messageCount).padStart(3)}t ${bindStr.padEnd(9)} ${title}`;
     };
     const handle = createSearchModal({
       id: `session-resume:${Date.now().toString(36)}`,
@@ -2788,7 +2847,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           promptCtl.submit(`/session load ${id}`);
         } else {
           // 입력 루프 비활성 등으로 합성 submit 불가 — 수동 안내 폴백.
-          chatLines.push(C.muted(`  /session load ${id.slice(0, 8)} 를 입력해 재개하세요`));
+          chatLines.push(C.muted(`  /session load ${idPrefixes.get(id) ?? id} 를 입력해 재개하세요`));
           chatScrollOffset = -1;
           draw();
         }
@@ -11337,7 +11396,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     try { mouseWiring.toasts().push({ text, kind, ttlMs: 1200 }); } catch { /* ignore */ }
   };
 
-  drawNow = ({ force: forceFromCoordinator = false } = {}) => {
+  const drawFrameNow = ({ force: forceFromCoordinator = false } = {}) => {
     const { rows: termRows, cols } = termSize();
     const totalW = cols - 1;
 
@@ -11780,6 +11839,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       const overlay = transientOverlayHost.paint();
       if (overlay.length > 0) process.stdout.write(overlay);
     } catch { /* overlay must not crash main draw */ }
+  };
+  // TUI-FLICKER-DRAW-INTEGRATION — one synchronized-output owner for the whole
+  // frame compose: BSU → frame (+ coordinator modal overlay) → prompt repaint →
+  // ESU. Both draw entry paths (force and queued microtask) call this same
+  // seam, and the finally keeps the region closed when a compose throws so the
+  // next frame is not swallowed by a dangling BSU. `supported` is the tty gate:
+  // piped/captured output keeps the bytes it had before this seam existed.
+  drawNow = (opts = {}) => {
+    drawDashboardFrameSynchronized(() => { drawFrameNow(opts); }, process.stdout);
   };
   draw = (opts = {}) => {
     if (debug.enabled) {
@@ -12645,7 +12713,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const disposeResizeListener = installResizeListener({
     draw: (opts) => draw(opts),
     promptCtl,
-    requestOverlayFrame: () => display.requestRender({ force: true }),
+    requestOverlayFrame: () => display.requestRenderNow({ force: true }),
+    withSynchronizedOutput: (paint) => display.withSynchronizedOutput(paint),
   });
   process.on('exit', disposeResizeListener);
   // 외부 주입(`pty text`)을 사용자 타이핑과 섞지 않고 별도 대기열로 — 결함 #6(10-14).
@@ -13267,14 +13336,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // ⭐ TUI-AGENT-IDLE-WAKE — 배경 자식(⊕ RunShell bg) 완료 큐의 «유일한» 구독(onEnqueue 구독 0 → 1).
     //   채팅 한 줄 «✓ 위임 끝: <이름> — 다음 턴에 결과» · 결과는 다음 턴 preamble 이 싣는다.
     //   ⛔ 입력칸·injectKey·pty 주입 0(대표 비침투). dedupe·수명은 모듈, 여기선 배선만.
-    const agentWake = installAgentWake({
+    const agentWake = installSeatedAgentWake({
       subscribe: (listener) => subscribeDashboardAgentResults(
         globalTaskNotificationQueue, listener, (line) => { pushChatLine(C.muted(line)); draw(); },
       ),
       // 그리기 실패는 삼키지 않는다 — 모듈이 잡아 notified{shown:false} 로 남긴다.
       notify: createDashboardAgentWakeNotify((line) => { chatLines.push(C.muted(line)); }, () => draw()),
       // 조각 2 — 자리 TUI ∧ 유휴면 H2 문으로 다음 턴(origin child-complete) · 판정은 모듈.
-      openTurn: { startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts), getCwd: () => workingDir.cwd, isPending: (taskId) => globalTaskNotificationQueue.has(taskId) },
+      startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts),
+      getCwd: () => workingDir.cwd,
+      isPending: (taskId) => globalTaskNotificationQueue.has(taskId),
     });
     disposeDashboardAgentWake = () => agentWake.dispose();
 
@@ -15236,14 +15307,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               chat.history.push(m as ChatMessage);
             }
             const turns = past.length;
-            chatLines.push(C.muted(`    ${turns} turn${turns === 1 ? '' : 's'} restored. Preview of last 5:`));
+            chatLines.push(C.muted(`    ${turns} turn${turns === 1 ? '' : 's'} restored:`));
+            noteRestoredContext(chat.history);
             // BACKLOG #1 — markdown-aware preview rendering. Replaces
             // the previous one-line `slice(0, 100)` snippet so tables
             // / bold / lists in replayed turns look the same as when
             // they were originally streamed (`formatResponse` path).
             const previewWidth = Math.max(40, termSize().cols - 8);
             const previewWrap = getUserConfig().chat.rendering.wrap;
-            const previewLines = renderReplayPreviewLines(past, {
+            const previewLines = renderRestoredTranscriptLines(past, {
               maxWidth: previewWidth,
               wrapOpts: previewWrap,
             });
@@ -15285,7 +15357,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         if (resume.repaired) {
           chatLines.push(C.muted(`    깨진 도구 호출·결과 짝을 잘라 이어받았다(호출 ${resume.repaired.removedCalls} · 결과 ${resume.repaired.removedResults})`));
         }
-        chatLines.push(C.muted(`    ${resume.turns} turns restored. Next turn continues this conversation.`));
+        // TUI-RESUME-PICKER ②③④ — `--resume` used to leave the chat log blank and ctx at 0, so the user could
+        // not see that 379 messages had come back. Show the restored conversation and its size now.
+        chatLines.push(C.muted(`    ${resume.turns} turns restored:`));
+        for (const line of renderRestoredTranscriptLines(chat.history, {
+          maxWidth: Math.max(40, termSize().cols - 8),
+          wrapOpts: getUserConfig().chat.rendering.wrap,
+        })) chatLines.push(line);
+        const restoredTokens = noteRestoredContext(chat.history);
+        debug.log('chat.session.resume', 'restored', { sessionId: resume.sessionId, turns: resume.turns, estimatedContextTokens: restoredTokens });
+        chatLines.push(C.muted('    Next turn continues this conversation.'));
       }
     }
     observeSessionStart({
@@ -17866,6 +17947,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               },
             };
             const slashOutcome = await dashboardSlashRegistry.dispatch(cmdLower, args, slashCtx);
+            if (cmdLower === 'mission') {
+              debug.log('tui.legacy-slash-use', 'mission', { surface: 'classic', tuiSession: null });
+            }
             if (debug.enabled) {
               debug.log('dashboard.slash.dispatch', cmdLower, {
                 argsCount: args.length,

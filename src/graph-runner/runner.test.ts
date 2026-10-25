@@ -704,6 +704,52 @@ test('bash recipes pass through an explicit timeout_ms unchanged', async () => {
   expect(timeoutMs).toBe(1234);
 });
 
+test('failed command-spawn nodes persist exit and masked stderr tail on node-end', async () => {
+  const { graph, root } = fixture('exit 0');
+  const previousState = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  const pluginDir = join(root, 'plugins', 'local', 'sample-plugin', '1.0.0');
+  const graphsDir = join(pluginDir, 'graphs');
+  mkdirSync(graphsDir, { recursive: true });
+  writeFileSync(join(pluginDir, 'plugin.ts'), 'export default {}');
+  writeFileSync(join(pluginDir, 'plugin.json'), JSON.stringify({ id: 'sample-plugin', version: '1.0.0', main: './plugin.ts',
+    contributes: { connectors: [{ id: 'service', fields: [{ name: 'KEY', env: 'SAMPLE_PLUGIN_KEY' }] }] } }));
+  setPluginCredentials('sample-plugin', { KEY: 'node-secret' }, root);
+  const pluginGraph = join(graphsDir, 'graph.yaml');
+  writeFileSync(pluginGraph, readFileSync(graph, 'utf8'));
+  writeFileSync(join(graphsDir, 'recipes.yaml'), readFileSync(join(root, 'recipes.yaml'), 'utf8'));
+  const stderrLines = Array.from({ length: 45 }, (_, index) => `stderr line ${index + 1}`);
+  stderrLines[44] = 'failed with node-secret';
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  try {
+    const failed = await runGraph(pluginGraph, { runId: 'failure-reason', deps: { root,
+      runBash: async () => ({ stdout: '', stderr: stderrLines.join('\n'), exitCode: 7 }),
+      log: (event, data) => events.push({ event, data }),
+    } });
+    const expectedReason = [...stderrLines.slice(-40, -1), 'failed with [REDACTED]'].join('\n');
+    expect(failed.nodes[0]).toMatchObject({ exit: 7, reason: expectedReason });
+    expect(failed.nodes[0]?.reason?.split('\n')).toHaveLength(40);
+    expect(JSON.stringify(failed.nodes)).not.toContain('node-secret');
+    expect(events.find(entry => entry.event === 'node-end' && entry.data.nodeId === 'first')?.data)
+      .toMatchObject({ ok: false, exit: 7, reason: expectedReason });
+
+    const successful = await runGraph(pluginGraph, { runId: 'success-no-reason', deps: { root,
+      runBash: async () => ({ stdout: '', stderr: 'node-secret on successful stderr', exitCode: 0 }),
+    } });
+    expect(successful.nodes[0]).toMatchObject({ exit: 0, ok: true });
+    expect(successful.nodes[0]).not.toHaveProperty('reason');
+
+    const emptyFailure = await runGraph(pluginGraph, { runId: 'empty-failure-reason', deps: { root,
+      runBash: async () => ({ stdout: '', stderr: '', exitCode: 9 }),
+    } });
+    expect(emptyFailure.nodes[0]).toMatchObject({ exit: 9, ok: false });
+    expect(emptyFailure.nodes[0]).not.toHaveProperty('reason');
+  } finally {
+    if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousState;
+  }
+});
+
 test('two successful commands reach done and persist both outcomes', async () => {
   const { graph, root } = fixture('exit 0');
   const result = await runGraph(graph, { runId: 'success', deps: { root } });

@@ -92,10 +92,14 @@ export type InterimDisplay =
   | { kind: 'folded'; line: string };
 
 /** 메시지 인덱스 → 그리기 바꿈. 내부 턴 입력은 출처 한 줄, 그 «바로 앞» 중간 보고 답은 한 줄로 접는다. */
-export function planInterimDisplay(messages: ReadonlyArray<{ role: string; content?: unknown }>): Map<number, InterimDisplay> {
+export function planInterimDisplay(messages: ReadonlyArray<{ role: string; content?: unknown; goalInterim?: boolean }>): Map<number, InterimDisplay> {
   const plan = new Map<number, InterimDisplay>();
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i]!;
+    if (m.role === 'assistant' && m.goalInterim === true && typeof m.content === 'string') {
+      const verdict = classifyInterimReply(m.content.split('\n'));
+      if (verdict.interim) plan.set(i, { kind: 'folded', line: formatInterimFoldLine(verdict.summary) });
+    }
     if (m.role !== 'user' || typeof m.content !== 'string') continue;
     const origin = internalTurnOriginOfText(m.content);
     if (!origin) continue;

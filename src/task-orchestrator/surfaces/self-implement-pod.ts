@@ -21,7 +21,8 @@ import { POD_CREDENTIAL_TOKEN_ENV, POD_CREDENTIAL_URL_ENV } from '../../grok/cre
 import { isVerifiedOpenGatewayModel } from '../../llm/opengateway-models.js';
 import { configuredOpenGatewayKeys } from '../../llm/provider-credentials.js';
 import { collectPodLedgers, createPodLedgerFollower } from './pod-ledger-collect.js';
-import { collectPodArtifacts, podNoResultDiagnostic } from './pod-artifact-return.js';
+import { captureFailedPodJobs } from './pod-ledger-events.js';
+import { collectPodArtifacts, podNoResultDiagnostic, POD_SALVAGE_BUNDLE_FILE_LIMIT, POD_SALVAGE_BUNDLE_TOTAL_LIMIT } from './pod-artifact-return.js';
 import { readPodRepairArtifact } from './pod-repair-commit.js';
 import { isValidAccountName, resolveCodexAccount } from '../../oauth/codex-account.js';
 import { createCodexAccessMirror } from '../../oauth/codex-access-mirror.js';
@@ -31,6 +32,7 @@ import { finishPodFragment, writePodFragment } from '../../harness/self-send-tar
 import { mintRunId, normalizeRunId } from '../../harness/harness-space.js';
 import { TA_LAND_ENV } from '../../task-agent/task-hand.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath, type RunLedgerEntry } from '../../self-implement/run-ledger.js';
+import { recordRunStop } from '../../self-implement/run-stop.js';
 import { runSuffixKey } from '../../self-implement/salvage-branches.js';
 import type { GoalExecutionRecord } from '../../self-implement/orchestrator.js';
 import { hostRepositoryUnavailable, runHostRegate, type HostRegateResult } from '../../self-implement/host-regate.js';
@@ -67,14 +69,14 @@ export const POD_JOB_DEADLINE_SECONDS = 10_800;
 import { POD_LAUNCH_FINISHED_EVENT, POD_LAUNCH_STARTED_EVENT, provenanceRowFromAnnotations, siTaskPodProvenance } from './pod-launch-history.js';
 import { podProvenanceMetadata, type PodProvenanceMetadata } from './pod-provenance.js';
 import { packageVersion } from '../../version/code-revision.js';
-import { podWorkLabels, type PodWorkIdentity, type PodPlacement, type PodPlacementKind, type PodPoolMember, type PodPoolScheduler } from './pod-pool.js';
+import { minihLocationFrom, podWorkLabels, type PodWorkIdentity, type PodPlacement, type PodPlacementKind, type PodPoolMember, type PodPoolScheduler } from './pod-pool.js';
 export { POD_CHILD_REQUESTS } from './pod-lease.js';
 import { measurePoolLease, recommendConcurrency, POD_CHILD_REQUESTS, POD_SI_ADMISSION_CAP_BYTES, POD_HOST_LEASE_ANNOTATION, POD_JOB_TTL_AFTER_FINISHED_SECONDS, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
 import { ACTUAL_SUBSTRATE_ENV, RUN_CONTRACT_ENV, carryRunContract, completionFloorFor } from '../../self-implement/graph-run-contract.js';
-import { execFile, spawnSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { findGitDir } from '../../git-fs/locate.js';
 import { hostLeaseBaseDir } from '../../pod-lease/host-lease.js';
@@ -228,6 +230,8 @@ export interface PodSpawnOptions {
   /** LAUNCH-STALL: ms a launch may wait in one stage before `launch-stalled` (test seam; default harness.launchStallMinutes · 15 min). */
   launchStallMs?: number;
   kubectl?: Kubectl;
+  /** Capture SSH transport test seam; host selection and placement validation remain in the production path. */
+  failureCaptureRemote?: (host: string, args: readonly string[]) => ReturnType<Kubectl>;
   /** Host-side regate (injected for Pod tests). */
   hostRegate?: (input: { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; noMerge?: true }) => Promise<HostRegateResult>;
   /** REVIEW-ACP-POD — Pod merge-ready PR 을 호스트 Claude ACP 로 리뷰한 뒤 재게이트(opt-in · 옵션 → env `ELANOUS_POD_HOST_ACP_REVIEW` → config `llm.podHostAcpReview`). */
@@ -804,6 +808,48 @@ export function podGithubWatchdogScript(staleSeconds: number, intervalSeconds = 
   ].join('\n');
 }
 
+export function podSalvageBundleScript(): string {
+  return `if [ "\${rc:-0}" -ne 0 ] && grep -Eq 'draft PR 생성 실패|PR (gh|guard) 실패|same-cell reuse:' "\${ELANOUS_POD_CHILD_OUTPUT:-/tmp/si.out}"; then
+  mkdir -p "$HOME/outbox/pod-salvage"
+  found_commits=0
+  preservation_failed=0
+  bundle_bytes=0
+  worktree_rows=$(git worktree list --porcelain) || preservation_failed=1
+  while IFS= read -r wt; do
+    [ -n "$wt" ] || continue
+    git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { preservation_failed=1; continue; }
+    wt_name=$(basename -- "$wt")
+    case "$wt_name" in ''|.*|*/*|*'..'*) preservation_failed=1; continue ;; esac
+    base=$(git -C "$wt" rev-parse --verify '@{u}' 2>/dev/null || git -C "$wt" rev-parse --verify origin/HEAD 2>/dev/null || git -C "$wt" rev-list --max-parents=0 HEAD | tail -n 1)
+    head=$(git -C "$wt" rev-parse HEAD) || { preservation_failed=1; continue; }
+    [ -n "$base" ] || { preservation_failed=1; continue; }
+    commitCount=$(git -C "$wt" rev-list --count "$base..$head") || { preservation_failed=1; continue; }
+    if [ "$commitCount" -eq 0 ]; then continue; fi
+    found_commits=1
+    diffStats=$(git -C "$wt" diff --numstat "$base..$head") || { preservation_failed=1; continue; }
+    diffLines=$(printf '%s\\n' "$diffStats" | awk '{added += $1; removed += $2} END {print added + removed}')
+    bundle="$HOME/outbox/pod-salvage/$wt_name.bundle"
+    branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD) || { preservation_failed=1; continue; }
+    if git -C "$wt" bundle create "$bundle" "refs/heads/$branch" && [ -s "$bundle" ]; then
+      size=$(( $(wc -c < "$bundle") ))
+      if [ "$size" -gt ${POD_SALVAGE_BUNDLE_FILE_LIMIT} ] || [ $((bundle_bytes + size)) -gt ${POD_SALVAGE_BUNDLE_TOTAL_LIMIT} ]; then
+        preservation_failed=1
+        rm -f -- "$bundle"
+        printf 'ELANOUS_POD_SALVAGE_FAILED size-limit %s %s %s\\n' "$wt_name" "$size" "$head"
+      else
+        bundle_bytes=$((bundle_bytes + size))
+        printf 'ELANOUS_POD_SALVAGE_BUNDLE pod-salvage/%s.bundle %s %s %s\\n' "$wt_name" "$commitCount" "$diffLines" "$head"
+      fi
+    else
+      preservation_failed=1
+      printf 'ELANOUS_POD_SALVAGE_FAILED bundle-create %s\\n' "$wt_name"
+    fi
+  done < <(printf '%s\\n' "$worktree_rows" | awk '/^worktree / {sub(/^worktree /, ""); print}')
+  if [ "$preservation_failed" -ne 0 ]; then printf 'ELANOUS_POD_SALVAGE_FAILED incomplete\\n'
+  elif [ "$found_commits" -eq 0 ]; then printf 'ELANOUS_POD_SALVAGE_NONE no-commits\\n'; fi
+fi`;
+}
+
 export function podSalvageScript(): string {
   return [
     'if [ "${rc:-0}" -ne 0 ]; then',
@@ -1241,6 +1287,9 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
       ? `elanous harness ask ${goalPath} --json${quotedAsk}${quotedChildLlm} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; ${POD_RESULT_FLATTEN}`
       : `export ${OLD_DOOR_STAMP_ENV}=self-implement; elanous self implement "$(cat /creds/feature)" --json ${quoted} > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?; ${RUN_END}; ${POD_RESULT_FLATTEN}`,
     'cat /tmp/si.out',
+    ...(o.appCredential && !o.repairCommitOnly ? ['kill "$gh_watch_pid" 2>/dev/null || true'] : []),
+    ...(o.repairCommitOnly ? [] : [podSalvageScript()]),
+    podSalvageBundleScript(),
     '[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo "ELANOUS_USAGE_ROLLUP {\"measured\":false,\"reason\":\"no rollup script\"}"',
     // A long run's log export can pass the 5MB artifact limit; skipping it whole left no window into why a
     // 2h+ child failed (🅢 09-27). Keep the newest lines under the limit instead, and say so.
@@ -1257,23 +1306,27 @@ else
 fi`,
     `set -o pipefail
 artifact_bytes=0
+salvage_bundle_bytes=0
 if [ -d "$HOME/outbox" ]; then
   while IFS= read -r -d '' file; do
     [ -f "$file" ] && [ ! -L "$file" ] || continue
     relative=\${file#"$HOME/outbox/"}
     size=$(( $(wc -c < "$file") ))
-    if [ "$size" -gt 5242880 ] || [ $((artifact_bytes + size)) -gt 20971520 ]; then
+    salvage_bundle=0
+    case "$relative" in pod-salvage/*.bundle) salvage_bundle=1 ;; esac
+    if { [ "$salvage_bundle" -eq 0 ] && { [ "$size" -gt 5242880 ] || [ $((artifact_bytes + size)) -gt 20971520 ]; }; } || { [ "$salvage_bundle" -eq 1 ] && { [ "$size" -gt ${POD_SALVAGE_BUNDLE_FILE_LIMIT} ] || [ $((salvage_bundle_bytes + size)) -gt ${POD_SALVAGE_BUNDLE_TOTAL_LIMIT} ]; }; }; then
       printf 'ELANOUS_POD_ARTIFACT_SKIPPED %s %s\\n' "$relative" "$size"
       continue
     fi
     path_token=$(printf '%s' "$relative" | base64 | tr -d '\\n' | tr '+/' '-_' | tr -d '=')
     if encoded=$(gzip -c "$file" | base64 | tr -d '\\n'); then
-      artifact_bytes=$((artifact_bytes + size))
+      if [ "$salvage_bundle" -eq 1 ]; then salvage_bundle_bytes=$((salvage_bundle_bytes + size)); else artifact_bytes=$((artifact_bytes + size)); fi
       total=$(( (\${#encoded} + 7999) / 8000 ))
-      for ((n=1; n<=total; n++)); do
-        chunk=\${encoded:$(( (n-1)*8000 )):8000}
+      n=1
+      while IFS= read -r chunk || [ -n "$chunk" ]; do
         printf 'ELANOUS_POD_ARTIFACT %s %s/%s %s\\n' "$path_token" "$n" "$total" "$chunk"
-      done
+        n=$((n + 1))
+      done < <(printf '%s' "$encoded" | fold -w 8000)
     else
       printf 'ELANOUS_POD_ARTIFACT_SKIPPED %s %s\\n' "$relative" "$size"
     fi
@@ -1296,12 +1349,10 @@ for ledger in "\${ELANOUS_STATE_DIR:-$HOME/.elanous}"/run-ledger/*.jsonl; do
 done
 if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
     'kill "$mem_sampler_pid" 2>/dev/null || true',
-    ...(o.appCredential && !o.repairCommitOnly ? ['kill "$gh_watch_pid" 2>/dev/null || true'] : []),
     '[ -n "${usage_partial_pid:-}" ] && kill "$usage_partial_pid" 2>/dev/null || true',
     'wait "$mem_sampler_pid" 2>/dev/null || true',
     '[ -n "${usage_partial_pid:-}" ] && wait "$usage_partial_pid" 2>/dev/null || true',
     'tail -n 1 /tmp/si.out',
-    ...(o.repairCommitOnly ? [] : [podSalvageScript()]),
     // TA-POD-WARMBOOT-PARITY: the last line says «the child is done» so the host need not wait for the Job condition.
     ...(o.resultMarkerLine ? [o.resultMarkerLine] : []),
     'exit $rc',
@@ -1897,13 +1948,16 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       const acquireSlot = async (): Promise<PodPoolMember | null> => {
         if (!options.pool) return null;
         const stop = watchStall('pool-slot');
+        // MINIH-MODE (0.2.37): the location is declared by the launch env — absent/unknown keeps the configured
+        // capacities, so this launch path behaves exactly as before unless the declaration is there.
+        const minihLocation = minihLocationFrom(env.ELANOUS_MINIH_LOCATION);
         try {
           for (;;) {
             if (input.signal?.aborted) return null;
             // The reason comes back inside this call, so a concurrent launch cannot overwrite it.
             const kind = podPlacementKind(oomRetried ? retryTier : memoryTier, selectedGoalType, requestKind);
             const acquired = await options.pool.tryAcquire(unfitContexts, (reason) => { stageReason['pool-slot'] = reason; },
-              { kind, onPlacement: (placement) => { lastPlacement = placement; } });
+              { kind, ...(minihLocation ? { minihLocation } : {}), onPlacement: (placement) => { lastPlacement = placement; } });
             if (acquired) {
               debug.log('self-implement.pod', 'pool-slot', { spaceId: input.spaceId, context: acquired.context, inflight: options.pool.snapshot(), ...(lastPlacement ? { placement: lastPlacement } : {}) });
               if (lastPlacement) console.warn(`[pod] 배치: ${lastPlacement.reason}`);
@@ -1954,6 +2008,21 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       const currentContext = member ? null : baseKubectl(['config', 'current-context']);
       let context = member?.context ?? (currentContext?.status === 0 ? currentContext.stdout.trim() : '');
       const kubectl: Kubectl = (args, stdin) => baseKubectl(['--context', context, ...args], stdin);
+      const captureKubectl = (host: string, args: readonly string[]): ReturnType<Kubectl> => {
+        if (member?.sshHost ? member.sshHost !== host : host !== resolveHostId(env))
+          return { status: 1, stdout: '', stderr: 'ledger host is not the selected pool host' };
+        if (!member?.sshHost) return baseKubectl(args);
+        if (options.failureCaptureRemote) return options.failureCaptureRemote(host, args);
+        const result = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '--', host, 'kubectl', ...args],
+          { encoding: 'utf8', timeout: 30_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER });
+        return { status: result.status, stdout: result.stdout ?? '', stderr: (result.stderr ?? '') + (result.error ? String(result.error) : '') };
+      };
+      const captureFailedJob = (childRunId: string): void => {
+        try {
+          captureFailedPodJobs({ runId: ledgerRunId, job: name, childRunId, ledgerPath: runLedgerPath(ledgerRunId, ledgerDir), artifactDir: join(effectiveInstanceRoot(), 'pod-artifacts'),
+            kubectl: captureKubectl, record: (event, data) => appendRunLedgerEntry({ runId: ledgerRunId, event, data }, ledgerDir), now: options.now });
+        } catch (error) { debug.log('self-implement.pod', 'failure-capture-ledger-unavailable', { job: name, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+      };
       let recorded = false;
       let groundingMinted: string | null = null;
       try {
@@ -1995,6 +2064,44 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           collectPodArtifacts(full.stdout, { dir: join(effectiveInstanceRoot(), 'pod-artifacts'), job: name, log: record });
         }
         catch (error) { record('self-implement.pod', 'artifact-collect-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
+        for (const line of full.stdout.split(/\r?\n/)) {
+          const bundle = /^ELANOUS_POD_SALVAGE_BUNDLE (pod-salvage\/[a-zA-Z0-9._-]+\.bundle) ([0-9]+) ([0-9]+)(?: ([0-9a-f]{40,64}))?$/.exec(line);
+          if (bundle) {
+            const bundlePath = join(effectiveInstanceRoot(), 'pod-artifacts', name, bundle[1]!);
+            if (!existsSync(bundlePath)) {
+              try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-salvage-bundle', data: { job: name, disposition: '보존 실패', reason: 'bundle artifact missing' } }, ledgerDir); }
+              catch (error) { record('self-implement.pod', 'salvage-bundle-ledger-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
+              record('self-implement.pod', 'salvage-bundle-collect-incomplete', { job: name, path: bundlePath, reason: 'bundle artifact missing' });
+              continue;
+            }
+            try {
+              const refs = execFileSync('git', ['bundle', 'list-heads', bundlePath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim().split(/\r?\n/);
+              const [bundleHead, bundleRef] = refs[0]?.trim().split(/\s+/) ?? [];
+              if (!bundleHead || !bundleRef?.startsWith('refs/heads/')) throw new Error('bundle contains no branch ref');
+              const verifyDir = mkdtempSync(join(tmpdir(), 'pod-salvage-verify-'));
+              try {
+                execFileSync('git', ['clone', '--quiet', '--branch', bundleRef.slice('refs/heads/'.length), bundlePath, verifyDir], { stdio: ['ignore', 'pipe', 'pipe'] });
+                const cloneHead = execFileSync('git', ['-C', verifyDir, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+                if (cloneHead !== bundleHead || (bundle[4] && cloneHead !== bundle[4])) throw new Error('bundle clone HEAD mismatch');
+              } finally { rmSync(verifyDir, { recursive: true, force: true }); }
+              appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-salvage-bundle', data: {
+                job: name, path: bundlePath,
+                commitCount: Number(bundle[2]), diffLines: Number(bundle[3]), ...(bundle[4] ? { head: bundle[4] } : {}),
+              } }, ledgerDir);
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error);
+              try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-salvage-bundle', data: { job: name, disposition: '보존 실패', reason: `bundle validation failed: ${reason}` } }, ledgerDir); }
+              catch (ledgerError) { record('self-implement.pod', 'salvage-bundle-ledger-incomplete', { job: name, reason: ledgerError instanceof Error ? ledgerError.message : String(ledgerError) }); }
+              record('self-implement.pod', 'salvage-bundle-collect-incomplete', { job: name, reason });
+            }
+          } else if (line === 'ELANOUS_POD_SALVAGE_NONE no-commits') {
+            try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-salvage-bundle', data: { job: name, disposition: '보존할 것 없음', commitCount: 0, diffLines: 0 } }, ledgerDir); }
+            catch (error) { record('self-implement.pod', 'salvage-bundle-ledger-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
+          } else if (line.startsWith('ELANOUS_POD_SALVAGE_FAILED ')) {
+            try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-salvage-bundle', data: { job: name, disposition: '보존 실패', reason: line.slice('ELANOUS_POD_SALVAGE_FAILED '.length) } }, ledgerDir); }
+            catch (error) { record('self-implement.pod', 'salvage-bundle-ledger-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
+          }
+        }
         if (options.repairCommitOnly) {
           const artifactDir = join(effectiveInstanceRoot(), 'pod-artifacts', name, 'repair');
           try {
@@ -2022,9 +2129,11 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         //   상한 안 → ZAI(이름 있는 Secret · 없으면 거부) · 넘침 → 정책대로(openrouter·balance = 기존 OpenRouter GLM · stop = 거부 · apply 0).
         let zaiRoute: 'zai' | 'openrouter' | undefined;
         let zaiSpec: ZaiPodSpec | undefined;
+        let zaiLaunchOverage: 'stop' | 'balance' | 'openrouter' | undefined;
         zaiPendingApply.delete(name);
         if (options.provider === 'glm') {
           const settings = (options.zaiSettings ?? (() => zaiSettingsFromConfig(getUserConfig().llm)))();
+          zaiLaunchOverage = settings.overage;
           const poolMembers = (options.pool as { members?: readonly PodPoolMember[] } | undefined)?.members;
           const contexts = Array.isArray(poolMembers) && poolMembers.length > 0 ? poolMembers.map((m) => m.context) : [context];
           let active: number | null = 0;
@@ -2056,6 +2165,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const anthropic = options.provider === 'anthropic';
         const bedrockChild = options.provider === 'bedrock';
         const zaiChild = zaiRoute === 'zai';
+        /** ZAI 로 입장한 자식도 플랜 한도 오류 뒤 OpenRouter 로 전환할 수 있다. 실행 중 폴백 자격을 발사 전에 확보한다. */
+        const openrouterCredentialRequired = openrouter || (zaiChild && zaiLaunchOverage !== 'stop');
         /** API 키 자식 — codex 계정·자격 파일을 안 쓴다(키는 작업별 creds Secret 의 `env-<KEY>` · bedrock·glm 은 이름 있는 Secret 으로만). */
         const apiKeyChild = openrouter || openGateway || anthropic || bedrockChild || zaiChild;
         const plannedAccount = retryAccount ?? (grok ? 'grok' : openrouter ? 'openrouter' : openGateway ? 'opengateway' : anthropic ? 'anthropic' : bedrockChild ? 'bedrock' : zaiChild ? 'glm' : options.accountBroker?.() ?? options.account ?? 'team');
@@ -2099,8 +2210,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
           return credential;
         }) : undefined;
-        const openrouterKey = openrouter ? env.OPENROUTER_API_KEY?.trim() || (options.readKeyCache ?? defaultReadKeyCache)('OPENROUTER_API_KEY')?.trim() : undefined;
-        if (openrouter && !openrouterKey) throw new Error('pod: Pod 에 openrouter 키 없음 — 호스트 키 캐시 또는 OPENROUTER_API_KEY 필요');
+        const openrouterKey = openrouterCredentialRequired ? env.OPENROUTER_API_KEY?.trim() || (options.readKeyCache ?? defaultReadKeyCache)('OPENROUTER_API_KEY')?.trim() : undefined;
+        if (openrouterCredentialRequired && !openrouterKey) throw new Error('pod: Pod 에 openrouter 키 없음 — 호스트 키 캐시 또는 OPENROUTER_API_KEY 필요');
         const openGatewayEnvKey = openGateway ? env.OPENGATEWAY_API_KEY?.trim() : undefined;
         const openGatewayCachedKey = openGateway ? (options.readKeyCache ?? defaultReadKeyCache)('OPENGATEWAY_API_KEY')?.trim() : undefined;
         if (openGatewayEnvKey && openGatewayCachedKey && openGatewayEnvKey !== openGatewayCachedKey)
@@ -2182,7 +2293,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
         }
         // Grok 자격은 전용 Secret 키 하나로만 보낸다 — passEnv 의 API 키 중복 전달은 막는다.
-        const passKeys = [...new Set([...(options.passEnv ?? []), ...(openrouter ? ['OPENROUTER_API_KEY'] : []), ...(openGateway ? ['OPENGATEWAY_API_KEY'] : []), ...(anthropic ? ['ANTHROPIC_API_KEY'] : [])])].filter((key) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL'
+        const passKeys = [...new Set([...(options.passEnv ?? []), ...(openrouterCredentialRequired ? ['OPENROUTER_API_KEY'] : []), ...(openGateway ? ['OPENGATEWAY_API_KEY'] : []), ...(anthropic ? ['ANTHROPIC_API_KEY'] : [])])].filter((key) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL'
           && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV
           && (!grok || !['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'].includes(key)));
         const skillEnvs: Record<string, string> = options.skillEnv
@@ -2307,6 +2418,13 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           if (key.startsWith('ELANOUS_PROMPT_ENHANCE_') && key !== 'ELANOUS_PROMPT_ENHANCE_MODEL' && key !== 'ELANOUS_PROMPT_ENHANCE_EFFORT') delete hostAuthorEnv[key];
         }
         let authorChoice = authorOnPod ? selectEnhanceLlm({ config: (options.authorConfig ?? getUserConfig)() }, hostAuthorEnv) : undefined;
+        // A named child model is this launch's model when planning has no explicit choice.
+        // Relay it to authoring too: the Pod's persistent grounding goal loop otherwise
+        // receives the host's default "better" model and silently spends sol for a luna child.
+        const namedChildModel = podDelegatedChildLlm(jobArgs)?.model;
+        if (authorChoice?.modelSource === 'default' && namedChildModel) {
+          authorChoice = { ...authorChoice, model: namedChildModel, modelSource: 'child' };
+        }
         let authorFallbackReason: string | undefined;
         let authorRequestedModel: string | undefined;
         let authorRequestedSource: string | undefined;
@@ -2328,8 +2446,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             authorChoice = { ...authorChoice, model: childModel, modelSource: 'fallback-child' };
           } else debug.log('self-implement.pod', 'role-llm-armed', { job: name, role: 'planning', model: authorChoice.model, source: authorChoice.modelSource, account: roleCodexAccount });
         }
-        const hostKey = (k: string): string | undefined => k === 'OPENROUTER_API_KEY' && openrouter ? openrouterKey : k === 'OPENGATEWAY_API_KEY' && openGateway ? openGatewayKey : k === 'ANTHROPIC_API_KEY' && anthropic ? anthropicKey : env[k] ?? (options.readKeyCache ?? defaultReadKeyCache)(k);
-        const hostFallbackNames = (options.fallbackConfig ?? getUserConfig)().llm.fallbackChain;
+        const hostKey = (k: string): string | undefined => k === 'OPENROUTER_API_KEY' && openrouterCredentialRequired ? openrouterKey : k === 'OPENGATEWAY_API_KEY' && openGateway ? openGatewayKey : k === 'ANTHROPIC_API_KEY' && anthropic ? anthropicKey : env[k] ?? (options.readKeyCache ?? defaultReadKeyCache)(k);
+        const hostConfig = (options.fallbackConfig ?? getUserConfig)();
+        const hostFallbackNames = hostConfig.llm.fallbackChain;
+        const zaiOverage = zaiLaunchOverage ?? zaiSettingsFromConfig(hostConfig.llm).overage;
         const normalizedFallback = normalizeFallbackChain(hostFallbackNames);
         let fallbackSteps = normalizedFallback.chain;
         let zaiFallbackSpec: ZaiPodSpec | undefined;
@@ -2381,7 +2501,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
                 ? Object.fromEntries(codexCredentials.map((candidate, i) => [`codex-${i}.json`, JSON.stringify({ elanousAuth: candidate.elanousAuth, codexAuth: candidate.codexAuth })]))
                 : { 'elanous-auth.json': (creds as ReturnType<typeof hostCredentials>).elanousAuth, 'codex-auth.json': (creds as ReturnType<typeof hostCredentials>).codexAuth }),
             'gh-token': podGhToken, feature: input.feature,
-            'llm-fallback-config.json': JSON.stringify({ llm: { fallbackChain: fallbackChain.steps } }),
+            'llm-fallback-config.json': JSON.stringify({ llm: { fallbackChain: fallbackChain.steps, zaiCodingPlan: { overage: zaiOverage } } }),
             ...(goalDocument !== undefined ? { 'goal-doc': goalDocument } : {}),
             ...Object.fromEntries(Object.entries(skillEnvs).map(([n, text]) => [`skillenv-${n}`, text])),
             ...(grounding ? { [`env-${GROUNDING_TOKEN_ENV}`]: grounding.token } : {}),
@@ -2448,6 +2568,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
         }
         if (failedExisting) {
+          captureFailedJob(liveChildRunId);
           const pods = kubectl(['-n', namespace, 'get', 'pods', '-l', `job-name=${name}`, '-o', 'jsonpath={range .items[*]}{.metadata.creationTimestamp}{"\\t"}{range .status.containerStatuses[?(@.name=="child")]}{.state.terminated.reason}{"\\t"}{.state.terminated.exitCode}{end}{"\\n"}{end}']);
           const latestPod = pods.status === 0 ? pods.stdout.trimEnd().split('\n').map((line) => line.split('\t'))
             .filter(([created]) => created && !Number.isNaN(Date.parse(created)))
@@ -2723,6 +2844,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         try {
           appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-run', data: { childRunId: liveChildRunId, job: name, attempt: oomRetried ? 2 : 1, ...(goalFile ? { goalFile } : {}) } }, ledgerDir);
+          appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-job-applied', data: { job: name, childRunId: liveChildRunId, jobUid: lifecycleJobUid, host: member?.sshHost ?? resolveHostId(env), context, namespace } }, ledgerDir);
           if (lastPlacement) appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-placement', data: { job: name, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1, member: lastPlacement.member, kind: lastPlacement.kind, outcome: lastPlacement.outcome, preferred: lastPlacement.preferred, reason: lastPlacement.reason } }, ledgerDir);
           appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-memory-selected', data: { job: name, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1, limit: memoryLimit, ...(appliedMemoryRequest ? { request: appliedMemoryRequest } : {}), tier: oomRetried ? retryTier : memoryTier, source: oomRetried ? 'oom-retry' : memorySource, reason: oomRetried ? 'OOMKilled' : memoryReason, declaredGoalType: selectedGoalType } }, ledgerDir);
           if (oomRetried && retryFromChildRunId) appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-oom-retry', data: { attempt: 2, from: retryFromMemoryLimit ?? selectedMemoryLimit, to: memoryLimit, tier: retryTier, reason: 'OOMKilled', job: name, childRunId: liveChildRunId, fromChildRunId: retryFromChildRunId } }, ledgerDir);
@@ -2734,7 +2856,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         writePodFragment({ spaceId: input.spaceId, context, namespace, job: name, inboxDir: POD_CONTROL_INBOX_DIR, ...(liveChildRunId === normalizeRunId(liveChildRunId) ? { runId: liveChildRunId } : {}), ...(parentRunId && normalizeRunId(parentRunId) === parentRunId ? { parentRunId } : {}) }, env);
         recorded = true;
-        debug.log('self-implement.pod', 'job-applied', { job: name, namespace, ...(member ? { context: member.context } : {}), image: jobImage, spaceId: input.spaceId, passEnv, ...(openrouter ? { openrouterKeyPresent: passEnv.includes('OPENROUTER_API_KEY') } : {}), ...(openGateway ? { openGatewayKeyPresent: passEnv.includes('OPENGATEWAY_API_KEY') } : {}), ...(anthropic ? { anthropicKeyPresent: passEnv.includes('ANTHROPIC_API_KEY') } : {}), ...(bedrockSpec ? { bedrockSecret: bedrockSpec.secretName, bedrockSecretKeys: bedrockSpec.keys, bedrockRegionFrom: bedrockSpec.region.from } : {}), ...(zaiRoute ? { zaiRoute, ...(zaiSpec ? { zaiSecret: zaiSpec.secretName } : {}) } : {}), extraArgs: options.extraArgs ?? [], ...(options.armEnv?.ELANOUS_ARM_ID ? { armId: options.armEnv.ELANOUS_ARM_ID } : {}) });
+        debug.log('self-implement.pod', 'job-applied', { job: name, namespace, ...(member ? { context: member.context } : {}), image: jobImage, spaceId: input.spaceId, passEnv, ...(openrouterCredentialRequired ? { openrouterKeyPresent: passEnv.includes('OPENROUTER_API_KEY') } : {}), ...(openGateway ? { openGatewayKeyPresent: passEnv.includes('OPENGATEWAY_API_KEY') } : {}), ...(anthropic ? { anthropicKeyPresent: passEnv.includes('ANTHROPIC_API_KEY') } : {}), ...(bedrockSpec ? { bedrockSecret: bedrockSpec.secretName, bedrockSecretKeys: bedrockSpec.keys, bedrockRegionFrom: bedrockSpec.region.from } : {}), ...(zaiRoute ? { zaiRoute, ...(zaiSpec ? { zaiSecret: zaiSpec.secretName } : {}) } : {}), extraArgs: options.extraArgs ?? [], ...(options.armEnv?.ELANOUS_ARM_ID ? { armId: options.armEnv.ELANOUS_ARM_ID } : {}) });
         let state: 'complete' | 'failed' | 'aborted' = 'failed';
         let failedReason = '';
         let containerReason: string | null = null;
@@ -2745,7 +2867,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         // METER-POD-ROLLUP-GAP — abort 때 Job 삭제 «전»에 거둔 로그 사본(삭제 뒤엔 PARTIAL 줄도 못 읽는다).
         let abortLogs = '';
         // ⭐ 런 «도중» 원장 증분 회수 — 호스트 슈퍼바이저가 Pod 걸음을 실시간으로 본다(🅣 요청 · 힐 루프 runtime 성형의 전제).
-        const follower = createPodLedgerFollower({ runId: liveChildRunId, dir: ledgerDir, exec: (script) => kubectl(['-n', namespace, 'exec', `job/${name}`, '-c', 'child', '--', 'sh', '-c', script]) });
+        const follower = createPodLedgerFollower({ runId: liveChildRunId, dir: ledgerDir, now, exec: (script) => kubectl(['-n', namespace, 'exec', `job/${name}`, '-c', 'child', '--', 'sh', '-c', script]) });
         // ⭐ METER-POD-ROLLUP-GAP-3 — 런 «도중» 마지막 PARTIAL 줄을 호스트가 쥔다: Pod 가 지워지면(SIGTERM 등) 종료 로그에서 PARTIAL 이 사라진다.
         let livePartialLine: string | null = null;
         let pollsSinceCapture = 0;
@@ -2774,6 +2896,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const capturePolls = Math.max(1, options.usagePartialCapturePolls ?? Math.round(POD_USAGE_PARTIAL_CAPTURE_MS / Math.max(1, options.pollMs ?? 15_000)));
         const markerWait = markerToken ? await import('./pod-result-marker-wait.js') : null;
         const waitStartedAt = Date.now();
+        let consecutiveJobNotFound = 0;
+        let podVanished = false;
+        let unmeasurableSince: number | null = null;
+        let unmeasurableIncidentRecorded = false;
         for (;;) {
           if (input.signal?.aborted) {
             recordPodImage(true);
@@ -2788,6 +2914,32 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
           if (!imageSnapshotRecorded) recordPodImage(false);
           const g = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'jsonpath={.status.conditions[*].type}']);
+          if (g.status !== 0) {
+            // A transport/5xx error says nothing about Job existence. Only Kubernetes Job NotFound counts.
+            const jobNotFound = /\(NotFound\)/i.test(g.stderr) || /\bjobs?(?:\.batch)?\b[^\n]*\bnot found\b/i.test(g.stderr);
+            consecutiveJobNotFound = jobNotFound ? consecutiveJobNotFound + 1 : 0;
+            unmeasurableSince = null;
+            if (consecutiveJobNotFound >= 3) {
+              state = 'failed';
+              failedReason = 'JobNotFound';
+              podVanished = true;
+              const facts = { job: name, childRunId: liveChildRunId, class: 'pod-vanished', consecutiveNotFound: consecutiveJobNotFound };
+              debug.log('self-implement.pod', 'pod-vanished', facts, { level: 'error' });
+              try {
+                recordRunStop({ runId: ledgerRunId, class: 'pod-vanished', site: 'pod-job-poll',
+                  cause: `Job ${name} NotFound on ${consecutiveJobNotFound} consecutive polls`,
+                  evidenceRef: `run-ledger:${ledgerRunId}:pod-job-applied`,
+                  nextMove: 'Inspect Job deletion and child artifacts before relaunch' },
+                (entry) => appendRunLedgerEntry(entry, ledgerDir));
+              } catch (error) {
+                debug.log('self-implement.pod', 'pod-vanished-ledger-unavailable', { ...facts, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+              }
+              break;
+            }
+            await sleep(options.pollMs ?? 15_000);
+            continue;
+          }
+          consecutiveJobNotFound = 0;
           const types = g.stdout;
           if (/Complete|SuccessCriteriaMet/.test(types)) { releaseAdmission?.observed?.(); state = 'complete'; break; }
           if (/Failed|FailureTarget/.test(types)) {
@@ -2817,6 +2969,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             } catch { /* Pod 가 사라졌거나 조회 불가 — 종료 사유는 미상. */ }
             debug.log('self-implement.pod', 'container-terminated', { job: name, container: 'child', reason: containerReason, exitCode: containerExitCode, jobReason: failedReason || null, memoryLimit });
             podTermination = readPodTermination({ kubectl, namespace, job: name, path: 'job-failed-condition', jobRead, podsRead, jobUid: lifecycleJobUid });
+            // Keep the verdict's single Job read authoritative; collecting files may re-read a Job that GC has removed.
+            captureFailedJob(liveChildRunId);
             if (jobReadError !== undefined) {
               // Today's outcome stays (the throw ends the spawn as pod-error); the capture is in the ledger first.
               try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-evidence', data: { childEvidence: null, childRunId: liveChildRunId, job: name, podTermination } }, ledgerDir); }
@@ -2836,6 +2990,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               // The child's own rc (the Pod's terminated state may lag like the condition) — exit-code paths read it as before.
               if (seen !== 0) containerExitCode = seen;
               if (seen !== 0) podTermination = readPodTermination({ kubectl, namespace, job: name, path: 'result-marker', jobUid: lifecycleJobUid });
+              if (seen !== 0) captureFailedJob(liveChildRunId);
               debug.log('self-implement.pod', 'result-marker-early', { job: name, waitedMs: Date.now() - waitStartedAt, rc: seen });
               break;
             }
@@ -2863,7 +3018,19 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               debug.log('self-implement.pod', 'gh-token-refresh-failed', { job: name, reason: 'mint-verification-or-exec-failed' });
             }
           }
-          try { follower?.poll(); } catch (e) { debug.log('self-implement.pod', 'ledger-live-unavailable', { job: name, reason: e instanceof Error ? e.message : String(e) }); }
+          let measurement = { ledgerRead: false, activityMeasured: false };
+          try { measurement = follower.poll(); } catch (e) { debug.log('self-implement.pod', 'ledger-live-unavailable', { job: name, reason: e instanceof Error ? e.message : String(e) }); }
+          if (!measurement.ledgerRead && !measurement.activityMeasured) {
+            unmeasurableSince ??= now();
+            const unmeasurableMs = Math.max(0, now() - unmeasurableSince);
+            if (!unmeasurableIncidentRecorded && unmeasurableMs >= 120 * 60_000) {
+              unmeasurableIncidentRecorded = true;
+              const incident = { job: name, childRunId: liveChildRunId, unmeasurableMs, jobStatus: 'alive', ledgerRead: false, activityMeasured: false };
+              try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-stall-unmeasurable-incident', data: incident }, ledgerDir); }
+              catch (error) { debug.log('self-implement.pod', 'pod-stall-incident-ledger-unavailable', { job: name, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+              debug.log('self-implement.pod', 'pod-stall-unmeasurable-incident', incident, { level: 'warn' });
+            }
+          } else unmeasurableSince = null;
           if (++pollsSinceCapture >= capturePolls) {
             pollsSinceCapture = 0;
             try {
@@ -3082,25 +3249,35 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         let noResultDiagnostic: string | null = null;
         // POD-NORESULT: a terminal Job without a parsed disposition is incomplete even when the Job condition says Complete.
-        const noResultCandidate = !disposition && !oomKilled && failedReason !== 'DeadlineExceeded' &&
+        const noResultCandidate = !podVanished && !disposition && !oomKilled && failedReason !== 'DeadlineExceeded' &&
           (state === 'complete' || (state === 'failed' && containerExitCode !== 0));
         if (noResultCandidate) {
           try { noResultDiagnostic = podNoResultDiagnostic(readFileSync(runLedgerPath(liveChildRunId, ledgerDir), 'utf8')); }
           catch { /* ledger not returned: do not invent a stage */ }
           noResultDiagnostic ??= 'child terminal result missing; last ledger stage=unknown; round=unknown; mustFix=unknown';
         }
-        // POD-NORESULT-LOG-TAIL: the Job runs with backoffLimit 0, so the failed Pod — and its container log —
-        //   is collected right after this. When the child ledger cannot even name the stage, read the tail here,
-        //   before deletion, so the parent keeps a maskable reason instead of `childEvidence=null`.
+        // POD-FAIL-EVIDENCE-CAPTURE: failed Pods are collected/deleted immediately after terminal handling.
+        //   Preserve a bounded log tail for every non-OOM/non-deadline failure, including known child stages:
+        //   the terminal result line can be followed by the useful stderr that explains the actual exit.
         let noResultLogEvidence: Record<string, unknown> | null = null;
-        if (noResultDiagnostic?.includes('stage=unknown')) {
+        const shouldCaptureFailureLog = state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded';
+        if (shouldCaptureFailureLog || noResultDiagnostic?.includes('stage=unknown')) {
+          const missingStage = noResultDiagnostic?.includes('stage=unknown') ?? false;
           const logRead = readPodNoResultLogTail({ run: kubectl, namespace, job: name, maxLines: POD_NO_RESULT_LOG_TAIL_LINES });
           if ('tail' in logRead) {
-            noResultLogEvidence = { stderr: logRead.tail.join('\n'), logTail: logRead.tail, logTailLines: logRead.tail.length };
-            debug.log('self-implement.pod', 'no-result-log-tail', { job: name, childRunId: liveChildRunId, diagnostic: noResultDiagnostic, lines: logRead.tail.length, logTail: logRead.tail }, { compact: { stringMax: 500 } });
+            noResultLogEvidence = missingStage
+              ? { stderr: logRead.tail.join('\n'), logTail: logRead.tail, logTailLines: logRead.tail.length }
+              : { podLogTail: logRead.tail, podLogTailLines: logRead.tail.length };
+            debug.log('self-implement.pod', missingStage ? 'no-result-log-tail' : 'failed-pod-log-tail', {
+              job: name, childRunId: liveChildRunId, diagnostic: noResultDiagnostic, lines: logRead.tail.length, logTail: logRead.tail,
+            }, { compact: { stringMax: 500 } });
           } else {
-            noResultLogEvidence = { stderr: `log-unavailable: ${logRead.unavailable}` };
-            debug.log('self-implement.pod', 'no-result-log-tail', { job: name, childRunId: liveChildRunId, diagnostic: noResultDiagnostic, logUnavailable: logRead.unavailable }, { level: 'warn' });
+            noResultLogEvidence = missingStage
+              ? { stderr: `log-unavailable: ${logRead.unavailable}` }
+              : { podLogUnavailable: logRead.unavailable };
+            debug.log('self-implement.pod', missingStage ? 'no-result-log-tail' : 'failed-pod-log-tail', {
+              job: name, childRunId: liveChildRunId, diagnostic: noResultDiagnostic, logUnavailable: logRead.unavailable,
+            }, { level: 'warn' });
           }
         }
         if (childFailure) debug.log('self-implement.pod', 'child-error', { job: name, stage: childFailure.stage, error: childFailure.error, ...(childPrFailure ?? {}) }, { compact: { stringMax: 500 } });
@@ -3192,7 +3369,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-oom-retry-finished', data: { job: name, executionKey, fromChildRunId: retryFromChildRunId, childRunId: liveChildRunId, state } }, ledgerDir);
         }
         if (goalFile) {
-          const noResultOutcome = state === 'failed' && containerExitCode !== null && noResultDiagnostic ? 'abandoned' : 'pod-no-result';
+          const noResultOutcome = podVanished || (state === 'failed' && containerExitCode !== null && noResultDiagnostic) ? 'abandoned' : 'pod-no-result';
           const record: GoalExecutionRecord = {
             runId: liveChildRunId,
             stage: (state === 'aborted' || !disposition ? 'aborted' : disposition.stage) as GoalExecutionRecord['stage'],
@@ -3209,7 +3386,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         if (state === 'failed' || state === 'aborted' || noResultLogEvidence || (state === 'complete' && noResultDiagnostic !== null)) {
           // Every terminal attempt writes a marker, including one with no parseable child facts.
           // The next attempt must never inherit an earlier Pod's classification.
-          const childEvidence = noResultLogEvidence ?? disposition?.childEvidence ?? null;
+          const childEvidence = noResultLogEvidence
+            ? { ...(disposition?.childEvidence ?? {}), ...noResultLogEvidence }
+            : disposition?.childEvidence ?? null;
           try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-evidence', data: { childEvidence, childRunId: liveChildRunId, job: name, ...(podTermination ? { podTermination } : {}) } }, ledgerDir); }
           catch (error) { debug.log('self-implement.pod', 'child-evidence-write-failed', { job: name, childRunId: liveChildRunId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
         }
@@ -3218,7 +3397,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         if (disposition && (state === 'failed' || state === 'aborted' || disposition.ok === false)
           && (!Number.isSafeInteger(disposition.prNumber) || (disposition.prNumber ?? 0) <= 0) && terminalBranch) {
           try { prLookup = await (options.lookupOpenPrByBranch ?? defaultLookupOpenPrByBranch)(terminalBranch, repoUrl); }
-          catch { prLookup = { status: 'failed', reason: 'pr-lookup-threw' }; }
+          catch (error) { prLookup = { status: 'failed', reason: `pr-lookup-failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 200) }; }
         }
         const terminalDisposition = prLookup?.status === 'found' && disposition
           ? { ...disposition, prNumber: prLookup.prNumber, prUrl: prLookup.prUrl } : disposition;
@@ -3262,7 +3441,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           : disposition;
         // A gate environment deficit can exit the child with 1 while still yielding a
         // verified repair bundle. The host rejudges the new PR head after CAS apply.
-        const podExitCode = repairPodExitCode({ state, repairCommitOnly: !!options.repairCommitOnly,
+        const podExitCode = podVanished ? 1 : repairPodExitCode({ state, repairCommitOnly: !!options.repairCommitOnly,
           repairArtifactReady, disposition });
         // SCHED-CONTRACT: a failed child must say why outside the Pod, not «no error diagnostic».
         const rawPodReason = podExitCode === 1 ? extractPodFailureReason({ logs, logTailReason, containerReason, jobReason: failedReason || undefined, deadlineSeconds, result: disposition ? { stage: disposition.stage, prUrl: disposition.prUrl ?? null, prNumber: disposition.prNumber ?? null } : null }) : undefined;
@@ -3279,7 +3458,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         return {
           exitCode: podExitCode,
           output: tail,
-          ...(deadlineExceeded
+          ...(podVanished
+            ? { error: { code: 'pod-vanished', message: `Job ${name} disappeared after 3 consecutive NotFound polls` } }
+            : deadlineExceeded
             ? { error: { code: 'pod-deadline-exceeded', message: `Job ${name} 이 수명 상한 ${deadlineSeconds}초에 닿았다` } }
             : state === 'failed'
               ? containerExitCode === 7

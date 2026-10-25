@@ -15,7 +15,7 @@ import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implem
 
 /** 닫힌 목록 — 못 고르면 `unclassified`. */
 export const RUN_STOP_CLASSES = [
-  'env-unrelated', 'main-sync', 'pod-died', 'review-repeat',
+  'env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat',
   'review-out-of-scope', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified',
 ] as const;
 export type RunStopClass = typeof RUN_STOP_CLASSES[number];

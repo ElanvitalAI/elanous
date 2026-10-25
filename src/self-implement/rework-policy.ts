@@ -11,6 +11,20 @@ import { eligibleRefutationGoalLines, MUST_FIX_REFUTATION_ACKNOWLEDGEMENT, REFUT
 import { SUPERVISION_REWORK_SOURCES, type SupervisionReworkSource } from './supervision-vocabulary.js';
 import { lookupLlmTierSpec } from '../model-tier/index.js';
 
+export type ReviewRoundDecision = 'pass' | 'rework' | 'follow-up';
+
+/** Classifies an actual review result against the current retry budget.
+ * A supervisor may extend that budget before the follow-up is finalized. */
+export function decideReviewRound(input: {
+  verdict: 'pass' | 'warn' | 'fail';
+  mustFix: readonly string[];
+  round: number;
+  effectiveMax: number;
+}): ReviewRoundDecision {
+  if (input.verdict !== 'fail' || input.mustFix.length === 0) return 'pass';
+  return input.round < input.effectiveMax ? 'rework' : 'follow-up';
+}
+
 export type ReviewFindingRepeatSignal = 'repeat' | 'no-repeat' | 'unmeasurable' | 'insufficient-history';
 export type AdaptiveReworkReason = 'insufficient-fail-history' | 'zero-failures' | 'fail-count-not-decreased' | 'repeat-blocked-extension' | 'extended-by-fail-count' | 'hard-cap';
 

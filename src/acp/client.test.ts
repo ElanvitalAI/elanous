@@ -18,6 +18,11 @@ process.stdin.on('data', chunk => {
     const message = JSON.parse(line);
     if (message.method === 'initialize') {
       if (process.env.ANTHROPIC_API_KEY) process.stderr.write('billing key was inherited\\n');
+      if (process.env.ACP_TEST_STDERR === '1') {
+        process.stderr.write('ERROR Skipping MCP tool server=elanous tool=higgsfield.bl_a reason=tool name higgsfield.bl_a is invalid TOKEN=' + process.env.ACP_TEST_SECRET + '\\n');
+        process.stderr.write('ERROR Skipping MCP tool server=elanous tool=higgsfield.bl_b reason=tool name higgsfield.bl_b is invalid TOKEN=' + process.env.ACP_TEST_SECRET + '\\n');
+        process.stderr.end();
+      }
       if (message.params.clientCapabilities.auth?.terminal !== true) {
         process.stderr.write('terminal auth was not advertised\\n');
       }
@@ -68,7 +73,7 @@ afterEach(() => {
   logSpy?.mockRestore();
 });
 
-async function startPeer(authRequired: boolean, authStage: 'session' | 'prompt' = 'session') {
+async function startPeer(authRequired: boolean, authStage: 'session' | 'prompt' = 'session', emitStderr = false) {
   claude.command = 'bun';
   claude.args = ['-e', peer];
   const logs: string[] = [];
@@ -78,13 +83,36 @@ async function startPeer(authRequired: boolean, authStage: 'session' | 'prompt' 
   });
   const agent = new AcpAgent({ backendId: 'claude', cwd: process.cwd(),
     env: { ACP_TEST_AUTH_REQUIRED: authRequired ? '1' : '0', ACP_TEST_AUTH_STAGE: authStage,
-      ANTHROPIC_API_KEY: 'billing-key-must-be-scrubbed' },
+      ANTHROPIC_API_KEY: 'billing-key-must-be-scrubbed', ACP_TEST_STDERR: emitStderr ? '1' : '0',
+      ACP_TEST_SECRET: 'stderr-secret-canary-0123456789' },
     log: message => logs.push(message) });
   await agent.start();
   return { agent, logs, events };
 }
 
 describe('Claude ACP subscription authentication', () => {
+  test('child stderr is debug logged and same-kind errors are summarized once for the UI', async () => {
+    const { agent, logs, events } = await startPeer(false, 'session', true);
+    try {
+      await agent.newSession();
+      const deadline = Date.now() + 1_500;
+      while (!logs.some(line => line.startsWith('stderr:')) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(logs.filter(line => line.startsWith('stderr:'))).toEqual([
+        'stderr: ERROR Skipping MCP tool server=* tool=* reason=tool name <name> is invalid TOKEN=*** (2건)',
+      ]);
+      expect(events.filter(event => event.category === 'acp.stderr' && event.event === 'line').map(event => event.data))
+        .toEqual([
+          { backendId: 'claude', line: 'ERROR Skipping MCP tool server=elanous tool=higgsfield.bl_a reason=tool name higgsfield.bl_a is invalid TOKEN=***' },
+          { backendId: 'claude', line: 'ERROR Skipping MCP tool server=elanous tool=higgsfield.bl_b reason=tool name higgsfield.bl_b is invalid TOKEN=***' },
+        ]);
+      expect(JSON.stringify({ logs, events })).not.toContain('stderr-secret-canary-0123456789');
+    } finally {
+      await agent.stop();
+    }
+  });
+
   test('spawn injection receives a key-free Claude environment and one value-free auth-source event', async () => {
     const billingKeys = claudeBackend.scrubEnv!;
     expect(billingKeys).toEqual(['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',

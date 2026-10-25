@@ -1287,7 +1287,7 @@ export interface SameCellCardRebindObservation {
   detail?: string;
 }
 
-export type OpenPrOutcome = { url: string; number: number; rebind?: SameCellCardRebindObservation };
+export type OpenPrOutcome = { url: string; number: number; boundCardReuse?: { headRefName: string }; rebind?: SameCellCardRebindObservation };
 
 type DefaultSeamsResult = Omit<SelfImplementSeams, 'diagnose' | 'openPr'> & {
   diagnose: (ctx: DefaultSeamsDiagnoseInput) => Promise<string>;
@@ -2590,10 +2590,10 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         "if (!testLine) process.exit(1);",
         "const m = testLine.match(/(\\d+)\\s+fail/); if (!m) process.exit(1);",
         "const failFromLog = Number(m[1]); if (failFromLog !== 0) process.exit(1);",
-        "if (log.indexOf('[gate-baseline] introduced=0, preexisting=0, unknown=0, precondition-unmet=0') < 0) process.exit(1);",
+        // PASS는 시험 자체의 0 fail을 잰다. 실패 귀속 baseline이 없으면 'not run'으로만 기록한다.
         // 문서가 적은 관측값이 **로그에서 읽은 값과 같아야** 한다.
         "const sections = [body('## 불변식'), body('## 판정 신호')];",
-        "if (sections.some((p) => p.indexOf('UNVERIFIABLE') >= 0)) process.exit(1);",
+        "if (sections.some((p) => /^- UNVERIFIABLE(?:[ \t]*:|[ \t]*$)/m.test(p))) process.exit(1);",
         "if (sections.some((p) => p.indexOf('filled-by: supervisor@round-' + e.round) < 0)) process.exit(1);",
                 // ⛔ writer 가 넘긴 command 를 믿지 않는다 — **로그에서 직접** 뽑아 문서와 대조한다(리뷰 must-fix).
         "const cm = testLine.match(/^\\[test\\]\\s+PASS\\s+(.+?)\\s*(?:—|$)/); if (!cm) process.exit(1);",
@@ -2602,8 +2602,9 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         // 문서가 baseline 문면도 담고 있어야 한다 — 근거가 문서 안에서 재검증 가능해야 한다.
                 // ⛔ 부분 문자열이 아니라 **로그의 baseline 줄 전체**와 대조한다 — `preexisting=9` 같은
         //   불일치가 통과하면 근거가 근거가 아니다(리뷰 must-fix).
-        "const bl = log.split('\\n').find((l) => l.indexOf('[gate-baseline]') === 0); if (!bl) process.exit(1);",
-        "if (body('## 불변식').indexOf(bl.trim()) < 0) process.exit(1);",
+        "const bl = log.split('\\n').find((l) => l.indexOf('[gate-baseline]') === 0);",
+        "if (bl) { if (!/^\\[gate-baseline\\] introduced=0, preexisting=0, unknown=0, precondition-unmet=0(?:,|$)/.test(bl)) process.exit(1); if (e.baselineLine !== bl.trim()) process.exit(1); if (sections.some((p) => p.indexOf(bl.trim()) < 0)) process.exit(1); }",
+        "else { if (e.baselineLine !== undefined) process.exit(1); if (sections.some((p) => p.indexOf('baseline not run (test PASS)') < 0)) process.exit(1); }",
         // ② 조건 줄의 명령을 **그 필드에서** 파싱해 대조한다 — 절 어딘가에 있으면 통과하던 것을 막는다.
         "const condLine = body('## 불변식').split('\\n').find((l) => l.indexOf('조건 —') >= 0); if (!condLine) process.exit(1);",
         "if (condLine.indexOf(cmdFromLog) < 0) process.exit(1);",
@@ -2686,7 +2687,12 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           taskCardId, storePath: taskAgentStatePath(), oldPr: outcome.supersededPr, newPr: number, url: outcome.url,
         });
       }
-      const opened: OpenPrOutcome = { url: outcome.url, number: Number.isFinite(number) ? number : 0, ...(rebind ? { rebind } : {}) };
+      // `reused` also covers unbound legacy branches. The manager supplies the
+      // proven old head only after exact same-card identity and lease checks.
+      const boundCardReuse = outcome.reused && outcome.boundCardHeadRefName
+        && !!taskCardId && /^[A-Za-z0-9][A-Za-z0-9._:-]{2,}$/.test(taskCardId)
+        ? { headRefName: outcome.boundCardHeadRefName } : undefined;
+      const opened: OpenPrOutcome = { url: outcome.url, number: Number.isFinite(number) ? number : 0, ...(boundCardReuse ? { boundCardReuse } : {}), ...(rebind ? { rebind } : {}) };
       return opened;
     },
 

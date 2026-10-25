@@ -364,13 +364,15 @@ import {
   attachTelegramBinding as sessionAttachTelegram,
   listBoundSessions as sessionListBound,
 } from '../../session/index.js';
+import { idPrefixCell, sessionIdPrefixes, sessionListTime } from '../../session/id-prefix.js';
 import { safeReadLock as telegramSafeReadLock, defaultLockPath as telegramDefaultLockPath } from '../../telegram-lock.js';
 import { userConfigPath as userConfigPathFn } from '../../user-config.js';
 import { dirname as pathDirname, relative, resolve as resolvePath } from 'node:path';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { installPlugin, listInstalledPlugins, type InstalledPlugin } from '../../plugins/install/plugin-install.js';
 import type { SurfaceUx } from '../../agent/surface-ux/types.js';
-import { renderReplayPreviewLines } from '../replay-preview.js';
+import { renderRestoredTranscriptLines } from '../replay-preview.js';
+import { noteRestoredContext } from '../../status/metrics.js';
 import {
   deriveDaemonHttpBase,
   fetchDaemonSessionList,
@@ -2395,6 +2397,8 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
         }
       } else if (result.kind === 'stopped-before-authoring') {
         ctx.chatLines.push(ctx.error('  ⛔ 저작 «전» 예비 검사에서 막혔다 — 위 이름을 확인하라'));
+      } else if (result.kind === 'stopped-by-timebox') {
+        ctx.chatLines.push(ctx.error(`  ⛔ AUTHOR-TIMEBOX 초과로 접지 없이 끝났다 — 골은 남아 있다: ${result.goalFile}`));
       } else {
         ctx.chatLines.push(ctx.error(`  ⛔ 전제 검사에서 막혔다 — 골은 남아 있다: ${result.goalFile}`));
       }
@@ -2602,6 +2606,8 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     if (seSub === 'list' || seSub === 'ls') {
       const limit = args[1] ? Math.max(1, Math.min(50, Number(args[1]) || 10)) : 10;
       const rows = sessionListSessions({ limit });
+      // Unique prefixes, not a fixed 8 — `/session load <shown prefix>` must resolve (TUI-RESUME-PICKER).
+      const idPrefixes = sessionIdPrefixes(rows.map((m) => m.id));
       // Tier 1 daemon merge — when attached to a remote daemon w/ a
       // derivable HTTP base, fetch the daemon's session list too so
       // the user sees web/PWA/other-client sessions alongside their
@@ -2628,9 +2634,9 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
           if (m.bindings?.telegram) binds.push(`tg:${m.bindings.telegram.chatId}`);
           if (m.bindings?.discord) binds.push(`dc:${m.bindings.discord.channelId}`);
           const bindStr = binds.length > 0 ? ctx.subtext(`[${binds.join(' ')}]`) : '';
-          const ts = m.updatedAt.slice(5, 16).replace('T', ' ');
+          const ts = sessionListTime(m.updatedAt);
           const title = (m.title || '(no title)').slice(0, 48);
-          ctx.chatLines.push(`  ${marker} ${ctx.text(m.id.slice(0, 8))}  ${ctx.muted(ts)}  ${ctx.muted(`${m.messageCount}t`.padStart(4))}  ${bindStr.padEnd(10)}  ${title}`);
+          ctx.chatLines.push(`  ${marker} ${ctx.text(idPrefixCell(idPrefixes, m.id))}  ${ctx.muted(ts)}  ${ctx.muted(`${m.messageCount}t`.padStart(4))}  ${bindStr.padEnd(10)}  ${title}`);
         }
       }
       if (daemonRows.length > 0) {
@@ -2734,13 +2740,14 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
               }
               ctx.setAttachedSessionId(match.id);
               try { sessionSetActiveId(match.id); } catch { /* best-effort */ }
+              noteRestoredContext(chatHistory);
               ctx.chatLines.push('');
               ctx.chatLines.push(ctx.success(`  ✓ swapped to daemon session ${match.id}`));
               if (past && past.length > 0) {
-                ctx.chatLines.push(ctx.muted(`    ${past.length} turn${past.length === 1 ? '' : 's'} restored. Preview of last 5:`));
+                ctx.chatLines.push(ctx.muted(`    ${past.length} turn${past.length === 1 ? '' : 's'} restored:`));
                 const swapPreviewWidth = Math.max(40, termSize().cols - 8);
                 const swapPreviewWrap = getUserConfig().chat.rendering.wrap;
-                const swapPreviewLines = renderReplayPreviewLines(past, {
+                const swapPreviewLines = renderRestoredTranscriptLines(past, {
                   maxWidth: swapPreviewWidth,
                   wrapOpts: swapPreviewWrap,
                 });
@@ -2792,11 +2799,13 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       // side /attach (no-arg) picks up the same session automatically.
       try { sessionSetActiveId(resolvedId); } catch { /* best-effort */ }
       ctx.chatLines.push('');
-      ctx.chatLines.push(ctx.success(`  ✓ loaded session ${resolvedId.slice(0, 8)}  (${loaded.meta.title || '(no title)'})`));
-      ctx.chatLines.push(ctx.muted(`    ${loaded.history.length} turns restored. Preview of last 5:`));
+      ctx.chatLines.push(ctx.success(`  ✓ loaded session ${sessionIdPrefixes([resolvedId]).get(resolvedId) ?? resolvedId}  (${loaded.meta.title || '(no title)'})`));
+      ctx.chatLines.push(ctx.muted(`    ${loaded.history.length} turns restored:`));
+      const restoredTokens = noteRestoredContext(chatHistory);
+      debug.log('chat.session.load', 'restored', { sessionId: resolvedId, turns: loaded.history.length, estimatedContextTokens: restoredTokens });
       const loadPreviewWidth = Math.max(40, termSize().cols - 8);
       const loadPreviewWrap = getUserConfig().chat.rendering.wrap;
-      const loadPreviewLines = renderReplayPreviewLines(loaded.history, {
+      const loadPreviewLines = renderRestoredTranscriptLines(loaded.history, {
         maxWidth: loadPreviewWidth,
         wrapOpts: loadPreviewWrap,
       });

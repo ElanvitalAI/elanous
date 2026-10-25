@@ -18,14 +18,19 @@ import { runShellRuntime } from '../tool-runtime/run-shell-runtime.js';
 import { registerAllDefaultToolRuntimes } from '../tool-runtime/index.js';
 import { listToolRuntimes } from '../tool-runtime/registry.js';
 import { globalAgentRegistry } from '../agent/registry.js';
+import { dispatchAgent } from '../skills/tools/agent.js';
+import { SessionCache } from '../session/cache.js';
+import type { AgentDefinition } from '../agent/types.js';
+import * as llm from '../llm.js';
 import type { LLMProvider } from '../llm.js';
 
 /** 중단 신호가 올 때까지 매달리는 공급자. 키 없는 우주(게이트 Pod·빈 HOME)에선
  *  배경 자식이 공급자 해석 실패로 «즉시» error 로 끝나 registry.abort 가 no-op 이
  *  된다 — 그러면 «부모 신호 → 자식 controller» 사슬을 잴 수 없다(0.2.29 gate pod-20).
  *  test/agent-runner.test.ts 의 hangingProvider 와 같은 꼴. */
-function hangingProvider(): LLMProvider {
+function hangingProvider(onStart?: () => void): LLMProvider {
   async function hang(opts: { signal?: AbortSignal } | undefined): Promise<never> {
+    onStart?.();
     return new Promise<never>((_resolve, reject) => {
       const sig = opts?.signal;
       const err = () => Object.assign(new Error('aborted'), { name: 'AbortError' });
@@ -41,6 +46,15 @@ function hangingProvider(): LLMProvider {
     async *streamChat(_msgs, opts) { await hang(opts); },
     async *chat(_msgs, opts) { await hang(opts); },
   };
+}
+
+async function waitForAbortProbe(predicate: () => boolean, label: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise<void>(resolve => setTimeout(resolve, 2));
+  }
+  throw new Error(`timed out waiting for ${label}`);
 }
 
 function exposed(surfaceId: SessionSurfaceId): string[] {
@@ -266,6 +280,61 @@ describe('coding surface — shell 실행 tool 노출', () => {
         if (id) globalAgentRegistry.abort(id);
       }
       spawn.mockRestore();
+    }
+  });
+
+  it('dispatchAgent는 매달린 명시·상속 공급자 자식을 부모 abort로 정리한다', async () => {
+    const definition: AgentDefinition = {
+      name: 'abort-probe-agent',
+      systemPrompt: 'Wait for cancellation.',
+    };
+    await waitForAbortProbe(
+      () => globalAgentRegistry.list().every(task => task.state !== 'pending' && task.state !== 'running'),
+      'previous agent tasks to stop',
+    );
+
+    for (const providerIsExplicit of [true, false]) {
+      let providerCalls = 0;
+      const provider = hangingProvider(() => { providerCalls += 1; });
+      const inheritedProvider = providerIsExplicit
+        ? undefined
+        : spyOn(llm, 'resolveDefaultProvider').mockReturnValue(provider);
+      const realSpawn = globalAgentRegistry.spawn.bind(globalAgentRegistry);
+      const spawn = spyOn(globalAgentRegistry, 'spawn').mockImplementation(spawnOpts => realSpawn(spawnOpts));
+      const parent = new AbortController();
+      const runningBefore = globalAgentRegistry.list().filter(task => task.state === 'pending' || task.state === 'running').length;
+
+      try {
+        const result = await dispatchAgent(
+          { description: `abort ${providerIsExplicit ? 'explicit' : 'inherited'}`, prompt: 'wait', run_in_background: true },
+          {
+            ...(providerIsExplicit ? { provider } : {}),
+            signal: parent.signal,
+            sessionCache: new SessionCache(),
+            resolveAgentDef: () => definition,
+          },
+        );
+        expect(result.background).toBe(true);
+        await waitForAbortProbe(() => providerCalls === 1, 'child to call its selected provider');
+        await waitForAbortProbe(() => globalAgentRegistry.get(result.taskId)?.state === 'running', 'child to be running');
+        expect(spawn).toHaveBeenCalledTimes(1);
+        expect(spawn.mock.calls[0]?.[0]?.provider).toBe(providerIsExplicit ? provider : undefined);
+        if (inheritedProvider) expect(inheritedProvider).toHaveBeenCalled();
+        expect(globalAgentRegistry.get(result.taskId)?.controller.signal.aborted).toBe(false);
+
+        parent.abort();
+        await waitForAbortProbe(() => globalAgentRegistry.get(result.taskId)?.state === 'aborted', 'child to reach aborted state');
+        expect(globalAgentRegistry.get(result.taskId)?.controller.signal.aborted).toBe(true);
+        expect(globalAgentRegistry.list().filter(task => task.state === 'pending' || task.state === 'running')).toHaveLength(runningBefore);
+      } finally {
+        parent.abort();
+        spawn.mockRestore();
+        inheritedProvider?.mockRestore();
+        await waitForAbortProbe(
+          () => globalAgentRegistry.list().every(task => task.state !== 'pending' && task.state !== 'running'),
+          'all agent children to stop',
+        );
+      }
     }
   });
 

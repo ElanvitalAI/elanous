@@ -117,7 +117,7 @@ export function runnableIssues(doc: Record<string, unknown>, allowedRecipes: Rea
   return issues;
 }
 
-export interface GraphRunNodeView { nodeId: string; ok: boolean; executed: boolean; startedAt?: string; endedAt?: string; error?: string }
+export interface GraphRunNodeView { nodeId: string; ok: boolean; exit: number | null; executed: boolean; startedAt?: string; endedAt?: string; error?: string; reason?: string }
 export interface GraphRunView {
   graphId: string; runId: string; status: GraphRunState['status'] | 'starting';
   startedAt?: string; finishedAt?: string; path: string[];
@@ -130,9 +130,10 @@ export function graphRunView(state: GraphRunState): GraphRunView {
     ...(state.startedAt ? { startedAt: state.startedAt } : {}), ...(state.finishedAt ? { finishedAt: state.finishedAt } : {}),
     path: state.path,
     nodes: state.nodes.map((node) => ({
-      nodeId: node.nodeId, ok: node.ok, executed: node.executed,
+      nodeId: node.nodeId, ok: node.ok, exit: node.exit, executed: node.executed,
       ...(node.startedAt ? { startedAt: node.startedAt } : {}), ...(node.endedAt ? { endedAt: node.endedAt } : {}),
       ...(node.error ? { error: node.error.slice(0, 300) } : {}),
+      ...(node.reason === undefined ? {} : { reason: node.reason }),
     })),
     ...(state.currentNode ? { currentNode: state.currentNode } : {}),
   };

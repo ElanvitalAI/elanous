@@ -1523,7 +1523,7 @@ export async function routeRequest(
   if (method === 'POST' && pathname === '/v1/graphs/wizard') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
     if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return handleGraphWizardPost(req, opts.graphWizard);
+    return handleGraphWizardPost(req, opts.graphWizard, opts.eventBus);
   }
 
   if (pathname === '/v1/fabric/decompose' || pathname.startsWith('/v1/fabric/plans/')) {

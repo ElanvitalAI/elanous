@@ -46,3 +46,31 @@ describe('planGateTestShards', () => {
     );
   });
 });
+
+describe('planGateRemoteShards — GATE-REMOTE-SHARD-PLAN', () => {
+  test('183-file fake input splits with shard identity and per-file introduced attribution', async () => {
+    // 신규 export는 동적 import로만 붙인다: 베이스(export 없음)에서도 이 파일은 로드되어야 하고,
+    // 이 시험만 TypeError 로 빨개진다 — 정적 import면 파일 전체가 module-load-error(unknown)가 되어 RED 증인이 사라진다.
+    const { planGateRemoteShards, shardPlanOrchestrationId } = await import('./shard-plan.js');
+    const files = Array.from({ length: 183 }, (_, index) => `src/mod-${String(index).padStart(3, '0')}.ts`);
+    const plan = planGateRemoteShards(files, 4, 'orch-28736');
+    expect(plan).toHaveLength(4);
+    expect(plan.map((shard) => shard.orchestrationId)).toEqual(['orch-28736', 'orch-28736', 'orch-28736', 'orch-28736']);
+    expect(plan.map((shard) => shard.position)).toEqual([1, 2, 3, 4]);
+    expect(plan.map((shard) => shard.totalShards)).toEqual([4, 4, 4, 4]);
+    expect(plan.map((shard) => shard.shardId)).toEqual(['orch-28736/shard-1', 'orch-28736/shard-2', 'orch-28736/shard-3', 'orch-28736/shard-4']);
+    expect(plan.flatMap((shard) => shard.files)).toEqual(files);
+    expect(plan.flatMap((shard) => shard.introducedFiles).sort()).toEqual([...files].sort());
+    expect(plan.every((shard) => shard.introducedFiles.every((file) => shard.files.includes(file)))).toBe(true);
+    expect(plan.every((shard) => shard.introducedFiles.length === shard.files.length)).toBe(true);
+    expect(shardPlanOrchestrationId(files)).toMatch(/^gate-183-[0-9a-f]{8}$/);
+    expect(shardPlanOrchestrationId(files)).toBe(shardPlanOrchestrationId([...files].reverse()));
+  });
+
+  test('invalid shard counts and empty input are rejected', async () => {
+    const { planGateRemoteShards } = await import('./shard-plan.js');
+    expect(() => planGateRemoteShards(['a.ts'], 0, 'orch')).toThrow('invalid shard count');
+    expect(() => planGateRemoteShards(['a.ts'], 2, 'orch')).toThrow('shard count 2 exceeds file count 1');
+    expect(() => planGateRemoteShards([], 2, 'orch')).toThrow('no files to shard');
+  });
+});

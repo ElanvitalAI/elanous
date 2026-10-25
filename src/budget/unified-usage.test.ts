@@ -238,7 +238,7 @@ describe('claude 조회 실패 — 다른 공급자 행은 산다 (CLAUDE-USAGE-
     } finally { off(); }
     expect(r.rows.some((x) => x.provider === 'claude')).toBe(false);
     expect('claude' in r.accountCounts).toBe(false);
-    expect(seen).toContainEqual({ detail: 'credentials.json corrupt' });
+    expect(seen).toContainEqual(expect.objectContaining({ detail: 'credentials.json corrupt' }));
   });
 
   it('claude 가 429 로 실패해도 codex·grok 행은 ok 그대로 · claude 만 error 한 행', async () => {
@@ -636,6 +636,62 @@ describe('openrouter 선불 크레딧 행 (2026-09-23)', () => {
     expect(a.rows.find((x) => x.provider === 'openrouter')!.credits).toEqual({ status: 'unauthorized' });
     const b = await collectUnifiedUsage({ ...noCodexGrok, openRouterKey: () => 'k', fetchOpenRouterImpl: res(200, { credits: 1 }) });
     expect(b.rows.find((x) => x.provider === 'openrouter')!.credits).toEqual({ status: 'error', detail: 'upstream-shape' });
+  });
+
+  it('CREDIT-READOUT: OpenRouter 숫자 키 한도 남은 금액을 기존 credits 행 note에 추가한다', async () => {
+    const calls: string[] = [];
+    const report = await collectUnifiedUsage({
+      ...noCodexGrok,
+      openRouterKey: () => 'k',
+      fetchOpenRouterImpl: (async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.endsWith('/api/v1/credits')) {
+          return new Response(JSON.stringify({ data: { total_credits: 60, total_usage: 1.36 } }));
+        }
+        return new Response(JSON.stringify({ data: { limit: 20, limit_remaining: 7.25 } }));
+      }) as typeof fetch,
+    });
+    const row = report.rows.find((x) => x.provider === 'openrouter')!;
+    expect(calls).toEqual([
+      'https://openrouter.ai/api/v1/credits',
+      'https://openrouter.ai/api/v1/key',
+    ]);
+    expect(row.credits).toMatchObject({ status: 'ok', usedPercent: 2.3, balance: 58.64 });
+    expect(row.note).toContain('키 한도 남은 금액 $7.25');
+  });
+
+  it.each([
+    ['404', async () => new Response('{}', { status: 404 })],
+    ['throw', async () => { throw new Error('/key unavailable'); }],
+  ])('CREDIT-READOUT: /key %s 실패는 격리하고 기존 /credits 잔액을 보존한다', async (_kind, keyResponse) => {
+    const report = await collectUnifiedUsage({
+      ...noCodexGrok,
+      openRouterKey: () => 'k',
+      fetchOpenRouterImpl: (async (input: RequestInfo | URL) => String(input).endsWith('/api/v1/credits')
+        ? new Response(JSON.stringify({ data: { total_credits: 60, total_usage: 1.36 } }))
+        : keyResponse()) as typeof fetch,
+    });
+    const row = report.rows.find((x) => x.provider === 'openrouter')!;
+    expect(row.credits).toMatchObject({ status: 'ok', balance: 58.64, prepaidBalance: 60 });
+    expect(row.note).toBeUndefined();
+    expect(report.accountCounts.openrouter).toBe(1);
+  });
+
+  it.each([
+    ['null limit', { limit: null, limit_remaining: 7.25 }],
+    ['unlimited', { limit: null, limit_remaining: null }],
+  ])('CREDIT-READOUT: /key %s leaves the credits row unchanged', async (_kind, keyData) => {
+    const report = await collectUnifiedUsage({
+      ...noCodexGrok,
+      openRouterKey: () => 'k',
+      fetchOpenRouterImpl: (async (input: RequestInfo | URL) => String(input).endsWith('/api/v1/credits')
+        ? new Response(JSON.stringify({ data: { total_credits: 60, total_usage: 1.36 } }))
+        : new Response(JSON.stringify({ data: keyData }))) as typeof fetch,
+    });
+    const row = report.rows.find((x) => x.provider === 'openrouter')!;
+    expect(row.credits).toMatchObject({ status: 'ok', usedPercent: 2.3, balance: 58.64, prepaidBalance: 60 });
+    expect(row.note).toBeUndefined();
   });
 });
 

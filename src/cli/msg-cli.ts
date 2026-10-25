@@ -57,7 +57,7 @@ export interface MsgCliDeps {
 }
 
 type CommonOptions = { json?: boolean };
-type RecipientOptions = CommonOptions & { to?: string; after?: string; limit?: string };
+type RecipientOptions = CommonOptions & { to?: string; after?: string; limit?: string; thread?: string };
 
 function seat(raw: string | undefined, flag: string): string {
   if (raw === undefined) throw new Error(`${flag} is required`);
@@ -316,14 +316,19 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         + `\t(${wake.source}${wake.reason ? `: ${wake.reason}` : ''})`));
     })());
 
-  msg.command('list').description('List messages for one recipient without acknowledging them')
-    .option('--to <seat>').option('--after <id>', 'exclusive message ID (default: acknowledged cursor)')
+  msg.command('list').description('List messages for one recipient or one thread without acknowledging them')
+    .option('--to <seat>').option('--thread <id>', 'request ID; list it and its replies, regardless of recipient')
+    .option('--after <id>', 'exclusive message ID (default: acknowledged cursor for a recipient, 0 for a thread)')
     .option('--limit <count>', 'maximum messages (1–1000)').option('--json')
     .action((opts: RecipientOptions) => run(() => {
-      const to = seat(opts.to, '--to');
+      if (opts.thread !== undefined && opts.to !== undefined) throw new Error('--thread cannot be used with --to');
+      const to = opts.thread === undefined ? seat(opts.to, '--to') : undefined;
+      const threadId = opts.thread === undefined ? undefined : integer(opts.thread, '--thread', 0, 1, Number.MAX_SAFE_INTEGER);
       const limit = integer(opts.limit, '--limit', 100, 1, 1000);
       const after = opts.after === undefined ? undefined : integer(opts.after, '--after', 0, 0, Number.MAX_SAFE_INTEGER);
-      const messages = withStore(store => store.list(to, after ?? store.getCursor(to), limit));
+      const messages = withStore(store => threadId === undefined
+        ? store.list(to!, after ?? store.getCursor(to!), limit)
+        : store.listThread(threadId, after ?? 0, limit));
       emit(messages, opts.json, () => {
         if (!messages.length) out.log('No messages.');
         for (const message of messages) out.log(formatMessage(message));
@@ -499,18 +504,17 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .action((id: string, opts: CommonOptions) => run(() => {
       const target = integer(id, 'message ID', 0, 1, Number.MAX_SAFE_INTEGER);
       const thread = withStore(store => {
-        const question = store.getMessage(target);
-        if (question === null) throw new Error(`message not found: #${target}`);
         // Keep paging until a short page so a thread longer than one store page is never truncated.
-        const replies: Message[] = [];
+        const messages: Message[] = [];
         let after = 0;
         let page: Message[];
         do {
-          page = store.listReplies(target, 100, after);
-          replies.push(...page);
+          page = store.listThread(target, after, 100);
+          messages.push(...page);
           after = page.at(-1)?.id ?? after;
         } while (page.length === 100);
-        return { question, replies };
+        const [question, ...replies] = messages;
+        return { question: question!, replies };
       });
       emit(thread, opts.json, () => {
         out.log(formatMessage(thread.question));

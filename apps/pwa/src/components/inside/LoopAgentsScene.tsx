@@ -9,6 +9,7 @@ import { loopAgentsView, type LoopAgentsView } from './loop-agents-view';
 import { loadLoopRows, type LoopRow } from '@/components/loops/loop-status';
 import { LoopActivityMap } from './LoopActivityMap';
 import { subscribeLoopEdgeRefresh } from './loop-live-refresh';
+import { loopFocusLabel } from '@/app/inside/loop-focus';
 import { activityEdges, applyLoopOwners, isValidRef, journeyParam, journeyResponseEdges, newlySeenEdges, ACTIVITY_WINDOW_MS, RUNS_NODE, TASK_AGENT_NODE, type ActivityEdge, type LoopOwner, type NodeDetailSource } from './loop-activity-map';
 
 /** `?journey=<id>`(또는 0·1 아닌 `?demo=<id>`) 면 그 여정만 `?ref=<id>&mode=live` 로 — 60분 창·limit 에 앞 단계가 잘리지 않게. */
@@ -56,10 +57,11 @@ export function LoopAgentsViewContent({ view, runsUnreadable, refreshedAt }: {
 }
 
 /** `initialMode="map"` — `/loops?view=interact` 처럼 지도부터 여는 진입(여정 주소가 아니어도). */
-export function LoopAgentsScene({ initialMode = 'activity' }: { initialMode?: 'activity' | 'map' } = {}) {
+export function LoopAgentsScene({ initialMode = 'activity', initialLoopRef = null }: { initialMode?: 'activity' | 'map'; initialLoopRef?: string | null } = {}) {
   const { client, config } = useDaemon();
   const [snapshot, setSnapshot] = useState<{ source: string; seats: OpsSeats | null; runs: HarnessRunsResponse | null; runsUnreadable: boolean; refreshedAt: string | null } | null>(null);
-  const demo = journeyParam(useSearchParams());
+  // `/inside?ref=<loop id>` 로 고정한 루프는 주소의 여정과 같은 자리를 갖는다 — 화면 표시와 원장 `?ref=` 조회가 같은 ID.
+  const demo = journeyParam(useSearchParams()) ?? initialLoopRef;
   // 데모 주소로 들어오면 지도부터 연다.
   const [mode, setMode] = useState<'activity' | 'map'>(demo !== null ? 'map' : initialMode);
   const [map, setMap] = useState<{ source: string; rows: LoopRow[]; edges: ActivityEdge[]; seenAt: Record<string, number>; state: 'ready' | 'error' | 'unauthorized' } | null>(null);
@@ -141,7 +143,10 @@ export function LoopAgentsScene({ initialMode = 'activity' }: { initialMode?: 'a
   }, [client, mode, mapSource, demo]);
 
   const currentMap = map?.source === mapSource ? map : null;
+  // 칩은 원장이 실제로 `?ref=` 로 조회한 ID(isValidRef) 만 그린다 — 화면과 원장이 다른 대상을 보는 갈라짐을 막는다.
+  const fixedLoop = demo !== null && demo === initialLoopRef && isValidRef(demo) ? demo : null;
   return <div className="min-w-0">
+    {fixedLoop !== null && <p aria-label="고정 루프" className="px-4 pt-4 text-base">{loopFocusLabel(fixedLoop)}</p>}
     <div role="group" aria-label="루프 에이전트 보기" className="flex gap-2 px-4 pt-4">
       <button type="button" aria-pressed={mode === 'activity'} onClick={() => setMode('activity')} className="min-h-11 rounded-lg border border-slate-500 px-4 py-2 aria-pressed:bg-sky-800">현황</button>
       <button type="button" aria-pressed={mode === 'map'} onClick={() => setMode('map')} className="min-h-11 rounded-lg border border-slate-500 px-4 py-2 aria-pressed:bg-sky-800">지도</button>

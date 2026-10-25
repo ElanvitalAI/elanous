@@ -39,6 +39,9 @@ function collecting(behavior: (call: Call) => HerdrRunResult | Promise<HerdrRunR
   const logs: Array<[string, Record<string, unknown>]> = [];
   const run = (argv: string[], opts: HerdrRunOpts) => {
     const call = { argv, opts };
+    // This only filters start()'s first unconditional cleanup call; cleanup-failure/restart behavior is covered by FakeHerdr integration tests.
+    const startupCleanup = calls.length === 0 && argv[1] === 'release-agent';
+    if (startupCleanup) return { ok: true };
     calls.push(call);
     return behavior(call);
   };
@@ -74,7 +77,8 @@ describe('createHerdrAgentReporter', () => {
     reporter.turn('busy');
     reporter.turn('idle');
     const seqs = bag.calls.map((c) => c.argv[c.argv.indexOf('--seq') + 1]);
-    expect(seqs).toEqual(['1000', '1001', '1002', '1003']);
+    expect(Number(seqs[0])).toBeGreaterThan(1000);
+    expect(seqs).toEqual([...seqs].sort((a, b) => Number(a) - Number(b)));
     expect(argvHas(bag.calls[2]!.argv, 'pane', 'report-agent', '--state working', 'wM:p1')).toBe(true);
     expect(argvHas(bag.calls[3]!.argv, 'pane', 'report-agent', '--state idle', 'wM:p1')).toBe(true);
   });
@@ -197,7 +201,7 @@ describe('createHerdrAgentReporter', () => {
       a.turn('busy');
       a.release();
       const lastA = Math.max(...first.calls.map((c) => seqOf(c.argv)));
-      expect(Number(readFileSync(join(dir, 'wM_p1.seq'), 'utf8'))).toBe(lastA);
+      expect(Number(readFileSync(join(dir, 'wM_p1.seq'), 'utf8'))).toBeGreaterThan(lastA);
       const second = collecting();
       const b = createHerdrAgentReporter({ env: activeEnv, run: second.run, log: second.log, sessionId: 'b', now, seqStore: createFileSeqStore('wM:p1', dir) })!;
       b.start();
@@ -206,7 +210,7 @@ describe('createHerdrAgentReporter', () => {
       const third = collecting();
       const c = createHerdrAgentReporter({ env: { HERDR_ENV: '1', HERDR_PANE_ID: 'wM:p2' }, run: third.run, log: third.log, sessionId: 'c', now, seqStore: createFileSeqStore('wM:p2', dir) })!;
       c.start();
-      expect(seqOf(third.calls[0]!.argv)).toBe(9_000);
+      expect(seqOf(third.calls[0]!.argv)).toBeGreaterThan(9_000);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -218,7 +222,9 @@ describe('createHerdrAgentReporter', () => {
     const reporter = createHerdrAgentReporter({ env: activeEnv, run: bag.run, log: bag.log, sessionId: 's', now: () => 10, seqStore: broken })!;
     reporter.start();
     reporter.turn('busy');
-    expect(bag.calls.map((c) => seqOf(c.argv))).toEqual([10, 11, 12]);
+    const seqs = bag.calls.map((c) => seqOf(c.argv));
+    expect(seqs[0]).toBeGreaterThan(10);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
     expect(bag.logs.filter(([e]) => e === 'seq-store-failed')).toHaveLength(1);
   });
 
@@ -338,21 +344,25 @@ describe('createHerdrAgentReporter', () => {
     expect(String(failed[0]![1].stderrHead)).toContain('exit 3');
   });
 
-  test('turn never touches the seq store: read once at start, written only on release', () => {
+  test('turns use the startup-reserved sequence range without more seq-store writes', () => {
     const bag = collecting();
     const io = { reads: 0, writes: [] as number[] };
     const store: HerdrSeqStore = { read: () => { io.reads += 1; return 40; }, write: (n) => { io.writes.push(n); } };
     const reporter = createHerdrAgentReporter({ env: activeEnv, run: bag.run, log: bag.log, seqStore: store, sessionId: 's', now: () => 1 })!;
     reporter.start();
-    expect(io).toEqual({ reads: 1, writes: [] });
+    expect(io.reads).toBe(1);
+    expect(io.writes).toHaveLength(1);
     reporter.turn('busy');
     reporter.turn('idle');
     reporter.turn('busy');
-    expect(io).toEqual({ reads: 1, writes: [] });
+    expect(io.writes).toHaveLength(1);
     reporter.release();
     const seqs = bag.calls.map((c) => seqOf(c.argv));
-    expect(seqs).toEqual([41, 42, 43, 44, 45, 46]);
-    expect(io).toEqual({ reads: 1, writes: [46] });
+    expect(seqs[0]).toBeGreaterThan(40);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    expect(io.reads).toBe(1);
+    expect(io.writes).toHaveLength(1);
+    expect(io.writes[0]).toBeGreaterThan(46);
   });
 });
 
@@ -476,7 +486,7 @@ describe('r7 — 등록 결과 모르는 채 반납한 뒤 등록이 늦게 성�
   });
 });
 
-test('재반납 seq 도 pane 기록에 남는다 — 같은 ms 재기동의 첫 seq 가 재반납보다 크다 (r7 리뷰 mf)', async () => {
+test('재반납도 예약 범위 안에 들고 — 같은 ms 재기동 첫 seq 가 재반납보다 크다', async () => {
   const store = memorySeqStore();
   const idle = deferred<HerdrRunResult>();
   const bag = collecting((call) => (bag.calls.length === 1 ? idle.promise : { ok: true }));
@@ -487,7 +497,7 @@ test('재반납 seq 도 pane 기록에 남는다 — 같은 ms 재기동의 첫 
   idle.resolve({ ok: true });
   await new Promise((res) => setTimeout(res, 0));
   const resend = bag.calls.filter((c) => c.argv[1] === 'release-agent')[1]!;
-  expect(store.value).toBe(seqOf(resend.argv));
+  expect(store.value).toBeGreaterThan(seqOf(resend.argv));
   const bag2 = collecting();
   const r2 = createHerdrAgentReporter({ env: activeEnv, run: bag2.run, log: bag2.log, seqStore: store, sessionId: 's2', now })!;
   r2.start();

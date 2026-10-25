@@ -8,12 +8,13 @@
 // 근거 = CLAUDE.md — *"반증 자기검증은 「테스트가 코드를 무는가」만 답하고
 //        「그 코드가 실행 경로에 있는가」는 구조적으로 못 답한다"*.
 
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { AcpAgent, readClientInfo } from '../src/acp/client.js';
 import { ACP_BACKENDS } from '../src/acp/backend-registry.js';
 import type { ElanousCapabilities } from '../src/acp/capabilities.js';
+import { debug } from '../src/debug/log.js';
 
 const STUB_ID = 'test-initialize-stub';
 const stubPath = join(import.meta.dir, 'fixtures', 'acp-initialize-stub.ts');
@@ -50,6 +51,10 @@ describe('AcpAgent — 협상 관측 배선 (실물 initialize 경로)', () => {
   test('협상 «전»에는 안 부르고, 성공 «후»에 정규화된 값으로 «한 번» 부른다', async () => {
     const observed: ElanousCapabilities[] = [];
     const logs: string[] = [];
+    const debugEvents: Array<{ category: string; event: string; data: unknown }> = [];
+    const debugSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      debugEvents.push({ category, event, data });
+    });
     const agent = new AcpAgent({
       backendId: STUB_ID,
       cwd: process.cwd(),
@@ -75,7 +80,14 @@ describe('AcpAgent — 협상 관측 배선 (실물 initialize 경로)', () => {
       await agent.start();
 
       expect(logs).toContain(`initializing — clientInfo name=elanous version=${PACKAGE_VERSION}`);
-      expect(logs).toContain(`stderr: received initialize clientInfo={"name":"elanous","version":"${PACKAGE_VERSION}"}`);
+      const deadline = Date.now() + 1_500;
+      while (!debugEvents.some(event => event.category === 'acp.stderr') && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(debugEvents).toContainEqual({ category: 'acp.stderr', event: 'line', data: {
+        backendId: STUB_ID,
+        line: `received initialize clientInfo={"name":"elanous","version":"${PACKAGE_VERSION}"}`,
+      } });
       expect(observed).toHaveLength(1);
       const snapshot = observed[0]!;
       expect(snapshot.protocolVersion).toBe(1);
@@ -97,6 +109,7 @@ describe('AcpAgent — 협상 관측 배선 (실물 initialize 경로)', () => {
       await agent.start();
       expect(observed).toHaveLength(1);
     } finally {
+      debugSpy.mockRestore();
       await agent.stop().catch(() => { /* noop */ });
     }
   }, 20_000);

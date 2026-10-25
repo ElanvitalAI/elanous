@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mockSeatPtySequence } from './mock-seat-pty-sequence.js';
-import { runNextTuiScenario } from './next-tui-seat-scenarios.js';
+import { parseData, runNextTuiScenario } from './next-tui-seat-scenarios.js';
 
 const PROBE = join(import.meta.dir, 'mock-seat-pty-sequence-child.ts');
 const REPO_CLI = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
@@ -50,6 +50,32 @@ describe('N03 key sequence: one screen per step on a real PTY', () => {
 // the universe back through the same CLI's `logs`. The busy-/new probe is a timing race (the fake
 // LLM answers in milliseconds), so it is reported as a check but not asserted here.
 describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
+  test('next-at-picker: loads on @, lists a local file, and sends its path as an attachment with the prompt', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'n03-next-at-picker-'));
+    try {
+      const r = await runNextTuiScenario({ scenario: 'next-at-picker', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
+      expect(r.checks).toEqual({
+        bootFramePrecedesPicker: true, pickerListsFixture: true, selectedPathRecorded: true,
+        moduleLoadedOnlyOnTypedAt: true, submittedBodyKeepsSelection: true, submittedAttachmentContent: true,
+        onlyFakeProvider: true, exitedClean: true,
+      });
+      expect(parseData<{ value: string }>(['not', 'an', 'object'])).toEqual({});
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 150_000);
+
+  test('next-subagent-e4: Agent dispatch gives the child an inherited tool catalog and completes in the isolated universe', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'n03-next-subagent-e4-'));
+    try {
+      const r = await runNextTuiScenario({ scenario: 'next-subagent-e4', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
+      expect(r.checks).toEqual({
+        parentAndChildProviderCallsObserved: true, childWasNotForcedTextOnly: true,
+        unknownAllowIgnored: true,
+        childDispatchObservedInIsolatedLedger: true, childInheritedTools: true,
+        parentTurnCompletedOnce: true, onlyFakeProvider: true, exitedClean: true,
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 180_000);
+
   test('next-new-session: /new clears the screen, the next turn uses a new session, the old one stays', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-next-new-'));
     try {
@@ -103,7 +129,7 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
     try {
       const r = await runNextTuiScenario({ scenario: 'next-goal-interim', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
       expect(r.checks).toEqual({
-        continuedSeveral: true, everyStepOnScreen: true, notDoneAtMostOnce: true, finalReportShown: true, foldedEachContinued: true,
+        continuedSeveral: true, eachInterimOneLine: true, everyStepOnScreen: true, notDoneAtMostOnce: true, finalReportShown: true, foldedEachContinued: true,
         noUserHeaderForInternal: true, toolLineKept: true, internalTurnsStored: true, onlyFakeProvider: true, exitedClean: true,
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }

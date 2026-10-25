@@ -104,6 +104,10 @@ export interface PodChildEvidence {
   error?: string;
   detail?: string;
   stderr?: string;
+  /** Bounded, redacted complete Pod log tail. Separate from child stderr to avoid replacing stronger child facts. */
+  podLogTail?: string[];
+  podLogTailLines?: number;
+  podLogUnavailable?: string;
   exitCode?: number;
   classification?: string;
   scopeEscape?: true;

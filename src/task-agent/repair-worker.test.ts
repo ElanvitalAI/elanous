@@ -29,6 +29,14 @@ test('TA-PARENT-ROLE-LLM: repair-run forwards a credit GLM parent policy to its 
   expect(repairWorkerEnv(request).ELANOUS_ROLE_LLM_AUDIT).toBeUndefined();
 });
 
+test('PLANNING-FOLLOWS-CHILD-LLM: repair worker reapplies the exact planning model from the card', () => {
+  const planningPin = 'planning={"provider":"openai-codex","model":"gpt-6-luna"}';
+  const withRole = { ...request, parentRoleLlm: [planningPin] };
+  expect(repairHarnessArgs(withRole)).not.toContain('--role-llm');
+  expect(JSON.parse(repairWorkerEnv(withRole).ELANOUS_ROLE_LLM_PLANNING!))
+    .toEqual({ provider: 'openai-codex', model: 'gpt-6-luna' });
+});
+
 test('only exact PR/head artifact marker can become a repair result', () => {
   const marker = { job: 'si-test', artifactDir: '/artifact', pr: 30, baseHead: HEAD, runId: 'run-123', commit: COMMIT, bundleSha256: HASH };
   const text = `log\nELANOUS_POD_REPAIR_RESULT ${JSON.stringify(marker)}\n`;

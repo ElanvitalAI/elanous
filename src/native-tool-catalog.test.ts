@@ -53,7 +53,7 @@ describe('PTY native catalog probes', () => {
     const script = `import { mock } from 'bun:test';
 const value = ${available};
 const ptyAvailable = () => value;
-mock.module('./src/pty-shell/registry.js', () => ({ ptyAvailable }));
+mock.module('./src/pty-shell/availability.js', () => ({ ptyAvailable }));
 const { nativeToolCatalog } = await import('./src/native-tool-catalog.ts');
 const probes = nativeToolCatalog.filter((tool) => tool.probe?.kind === 'custom' && tool.probe.custom === ptyAvailable);
 if (probes.length !== 29 || probes.some((tool) => tool.probe?.custom() !== value)) process.exit(1);`;

@@ -28,7 +28,8 @@
 //    · 필터가 아무 파일도 매치하지 않으면 **의도적으로 FAIL** 한다("0 files ran … 거짓통과 차단")
 //      → 유도 결과는 **반드시 존재하는 파일**이어야 한다.
 
-import { importerTestsNotInRunSet, type ImporterTestIndex } from './importer-test-index.js';
+import { importerTestsNotInRunSet, measureRuntimeEdgeImpact, type ImporterTestIndex, type RuntimeEdgeImpact } from './importer-test-index.js';
+import { GATE_SPAWN_LANE_FILES } from '../self-dev/spawn-lane-files.js';
 import type { RouteConsumerTestIndex } from './route-consumer-test-index.js';
 import { rankGateCallerCandidates } from './gate-candidate-ranking.js';
 import { debug } from '../debug/log.js';
@@ -283,6 +284,11 @@ interface GateScopeDecision {
     readonly truncated: boolean;
     readonly unresolvedRelativeSpecifiers: number;
   } | null;
+  /** ⭐ 실측한 런타임 간선(spawn · git · 파일 상태)의 영향 크기.
+   *  `importerTestsNotRun` 은 «임포트 간선»만 본다 — 실물 프로세스로 그 소스를 지나는 시험은 그 계
+   *  산에 «없다». 그 사각지대의 크기를 **재서** 여기 싣는다(판정 자체는 바꾸지 않는다 — 관측만 더한다).
+   *  색인을 안 실었거나 런타임 간선을 안 가지면 `null` 이다. */
+  readonly runtimeEdgeImpact: RuntimeEdgeImpact | null;
   /** Selected reverse-dependent tests and why they were pulled into the gate. */
   readonly callerTests: readonly { readonly file: string; readonly reasons: readonly GateCallerReason[] }[];
   /** Caller tests exceeding the cap, retained in full for warning and diagnosis. */
@@ -384,6 +390,12 @@ export function resolveGateScope(
     ? PAIRED_REGISTRY_TESTS.tests.filter(exists) : [];
   const runWithCallers = (tests: readonly string[]) => [...new Set([...tests, ...callerTests.map(({ file }) => file), ...pairedRegistryTests])];
   const base = { sourceFiles, documentPaths, ignoredOutsideSrc, missingTestFiles, elanousRuntimeArtifacts, callerTests, callerTestsOverflow,
+    // ⭐ IMPORTER-TEST-INDEX-EDGE · 런타임 spawn/git/파일 상태 간선의 영향 크기를 «여기서» 잰다
+    // (생산 호출자 = 이 함수 · gate-cli 가 부른다). 손 목록은 착지 열차의 GATE_SPAWN_LANE_FILES 다 —
+    // 그 목록이 빠뜨린 실측 시험 수가 착지 열차 소비자의 영향 크기다. 판정 필드는 하나도 안 바뀐다.
+    runtimeEdgeImpact: importerTestIndex
+      ? measureRuntimeEdgeImpact(importerTestIndex, userChanged, { handListed: GATE_SPAWN_LANE_FILES })
+      : null,
     unverified: [] as readonly string[], derived: [] as readonly string[], pulledInRelatedTests: [] as readonly string[] };
   const withDocumentNonContribution = (runSet: readonly string[]) => ({
     documentsWithoutDerivedTests: documentsWithoutDerivedTestsFor(runSet),

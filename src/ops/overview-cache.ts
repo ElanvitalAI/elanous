@@ -1,7 +1,7 @@
 import { debug } from '../debug/log.js';
 import { parentPort, Worker } from 'node:worker_threads';
 import { collectOverview, type CollectOptions } from './overview-collect.js';
-import { computeVerdict, unmeasured, okCell, type OverviewSnapshot, type PodMemberRow } from './overview.js';
+import { computeVerdict, unmeasured, okCell, type Cell, type GateReservation, type OverviewSnapshot, type PodMemberRow } from './overview.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride, setElanousConfigDir } from '../elanous-config-dir.js';
 
@@ -12,7 +12,7 @@ const POD_STALE_MS = 2 * POD_MS;
 const MAX_MEMO = 32;
 const MAX_PENDING = 2;
 
-type PodReading = { context: string; occupied: number | null; reason: string | null; observedAt: number };
+type PodReading = { context: string; occupied: number | null; reason: string | null; observedAt: number; gate?: GateReservation };
 type OverviewData = OverviewSnapshot & ReturnType<typeof computeVerdict> & { cacheAgeMs: number; durationMs: number; sources: string[]; refreshFailed: string | null };
 type WorkerMessage = ({ kind: 'pods' } | { kind: 'snapshot'; options: CollectOptions }) & { configDir?: string };
 
@@ -25,7 +25,7 @@ if (port) {
       if (message.configDir) setElanousConfigDir(message.configDir);
       if (message.kind === 'pods') {
         const { buildGridData } = await import('../nexus/api/grid.js');
-        const rows = buildGridData().members.map((m) => ({ context: m.context, occupied: m.occupied, reason: m.reason, observedAt: Date.now() }));
+        const rows = buildGridData().members.map((m) => ({ context: m.context, occupied: m.occupied, reason: m.reason, observedAt: Date.now(), ...(m.gate ? { gate: m.gate } : {}) }));
         port.postMessage({ rows });
       } else port.postMessage({ snapshot: await collectOverview(message.options) });
     } catch (error) {
@@ -106,6 +106,24 @@ export function createOverviewCache(deps: {
     podTimer = schedule(() => { void refreshPods(); }, POD_MS);
     podTimer.unref();
   };
+  /**
+   * 게이트 예약 축(RES-FLOOR-BINDING 다섯째 축) — 「게이트 안 돎」은 측정된 값('none'), 못 잼은 사유를 남긴다.
+   * 둘 다 구속 조건 후보에서 빠지지만 뜻은 다르다: 하나는 «게이트가 안 돈다», 다른 하나는 «모른다».
+   */
+  const overlayGate = (row: PodReading | undefined, at: number): Cell<GateReservation | 'none'> => {
+    const observedAt = row ? new Date(row.observedAt).toISOString() : null;
+    const stale = row !== undefined && at - row.observedAt >= POD_STALE_MS;
+    if (podFailure || !row || stale) {
+      return unmeasured('pod pool background measure', podFailure ?? (stale ? '낡음(120초)' : '측정 대기'), observedAt);
+    }
+    if (!row.gate) return unmeasured('pod pool background measure', row.reason ?? '게이트 예약 못 잼', observedAt);
+    if (row.gate.jobs === 0) return okCell<GateReservation | 'none'>('none', 'pod pool background measure', observedAt);
+    const gate = row.gate;
+    if (!Number.isFinite(gate.unbound) || !Number.isFinite(gate.reservedMillicores) || !Number.isFinite(gate.schedulableMillicores)) {
+      return unmeasured('pod pool background measure', '게이트 CPU 못 잼', observedAt);
+    }
+    return okCell<GateReservation | 'none'>(gate, 'pod pool background measure', observedAt);
+  };
   /** Response-time Pod occupancy overlay — shared by /v1/ops/overview and /v1/ops/resources. */
   const overlayPods = (snapshot: OverviewSnapshot, at: number): PodMemberRow[] => {
     const byContext = new Map(podRows.map((row) => [row.context, row]));
@@ -115,7 +133,7 @@ export function createOverviewCache(deps: {
       const occupied = !podFailure && row && !stale && row.occupied !== null
         ? okCell(row.occupied, 'pod pool background measure', new Date(row.observedAt).toISOString())
         : unmeasured<number>('pod pool background measure', podFailure ?? (stale ? '낡음(120초)' : row?.reason ?? '측정 대기'), row ? new Date(row.observedAt).toISOString() : null);
-      return { ...pod, occupied };
+      return { ...pod, occupied, gate: overlayGate(row, at) };
     });
   };
   const present = (entry: Entry): OverviewData => {

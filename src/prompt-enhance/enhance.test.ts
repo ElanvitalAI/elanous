@@ -47,6 +47,9 @@ describe('enhance — authoring model and effort selection', () => {
     const defaultRelay = { ELANOUS_PROMPT_ENHANCE_MODEL: 'gpt-6-sol', ELANOUS_PROMPT_ENHANCE_MODEL_RELAY: 'pod', ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE: 'default' };
     expect(selectEnhanceLlm({ config: configFor({}) }, defaultRelay).modelSource).toBe('default');
     expect(selectPlanningLlm(defaultRelay, configFor({}))).toEqual({ model: 'gpt-6-sol', effort: 'high', modelSource: 'default' });
+    const childRelay = { ELANOUS_PROMPT_ENHANCE_MODEL: 'gpt-6-luna', ELANOUS_PROMPT_ENHANCE_MODEL_RELAY: 'pod', ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE: 'child' };
+    expect(selectPlanningLlm(childRelay, configFor({}))).toEqual({ model: 'gpt-6-luna', effort: 'high', modelSource: 'child' });
+    expect(selectEnhanceLlm({ config: configFor({}) }, childRelay).modelSource).toBe('child');
     expect(selectPlanningLlm({ ELANOUS_PROMPT_ENHANCE_MODEL: 'gpt-6-sol', ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE: 'config-role' }, configFor({})).modelSource).toBe('env');
   });
 

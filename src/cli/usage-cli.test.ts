@@ -138,7 +138,7 @@ describe('usage runs', () => {
       exit: (code) => { throw new Error(`exit ${code}`); },
     });
     await expect(command.parseAsync(['usage', 'runs', '--by', 'invalid'], { from: 'user' })).rejects.toThrow('exit 2');
-    expect(lines).toEqual(['⛔ --by 는 run | role | stage | model | account']);
+    expect(lines).toEqual(['⛔ --by 는 run | role | stage | phase | model | account | job']);
   });
 
   it('rejects invalid --since before reading the store', async () => {

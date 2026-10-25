@@ -12,6 +12,8 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { spawnRealCliBytes, type RealCliSpawnBytesResult } from './testing/real-cli-spawn.js';
 import { basename, join, resolve } from 'node:path';
+import { activeSessionIdForContinue, latestSessionIdForContinue, type ContinueSessionLookup } from './index.js';
+import { resolveLatestSessionId } from './session/session-start.js';
 import { assembleAskLaunchPolicy, buildCodexAccountImportGuidance, buildHarnessOrchestratePlan, executeDevPipelineInvocation, filterDashboardArgs, formatReviewStatsPercentage, formatSelfSendCandidateDisplay, runHarnessBrowserAction, runHarnessOrchestrateExecution, runSchedule, scheduleCreatePlan, readSelfOrchestrateGoals, setCodexAccountLogSinkModuleForTesting, type HarnessOrchestrateExecutionDeps, type ScheduleDispatch } from './index.js';
 import { selectFabricDecomposer } from './self-dev/self-orchestrate-runtime.js';
 import { exitTuiRun, planTuiRestartArgv, runTuiSelfRestartOnStaleBuild } from './index.js';
@@ -25,6 +27,27 @@ import { registerMcpClients } from './nexus/boot/register-mcp-clients.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+
+// Warm modules that production-entry tests import dynamically before their test bodies run.
+// Cold imports can outlive Bun's per-test deadline and overlap the next test's env/state cleanup.
+beforeAll(async () => {
+  await Promise.all([
+    import('./agent-mission/driver.js'),
+    import('./harness/harness-space.js'),
+    import('./self-dev/dev-cli.js'),
+    import('./self-dev/launch-preflight.js'),
+    import('./harness/harness-cli-command.js'),
+    import('./self-implement/gate-remote.js'),
+    import('./git-fs/runner.js'),
+    import('./self-implement/gate-cli.js'),
+    import('./ui.js'),
+    import('./self-implement/self-implement-cli.js'),
+    import('./harness/standalone-run-context.js'),
+    import('./decide/jev.js'),
+    import('./decide/ax-screen.js'),
+    import('./decide/recipe.js'),
+  ]);
+});
 
 // ⏱️ GATE-SPEED ③ — 실물 `bin/elanous.mjs` spawn(1회 ~3–4초 콜드 스타트)을 «그대로» 두되,
 //   ⓐ 같은 argv 의 도움말을 describe 마다 «여러 번» 띄우던 것을 한 번으로 접고(산출은 이 빌드 안에서 불변),
@@ -5326,6 +5349,51 @@ describe('decide / ax-screen / decide-recipe JSON stdout completion', () => {
   });
 });
 
+// TUI-CONTINUE-SESSION (0.2.35) — `eln --continue`(= id 없는 `--resume`)는 «지금 이 디렉토리» 의
+// 직전 대화를 이어받는다.  판정: 활성 표지가 다른 프로젝트의 세션을 가리켜도 cwd 프로젝트 최근 세션이
+// 이기고, cwd 프로젝트에 세션이 없으면 종전대로 전역 최신으로 폴백한다.
+describe('TUI-CONTINUE-SESSION — eln --continue picks the cwd project recent session', () => {
+  const PROJECT_ROOT = '/work/alpha';
+
+  const lookup = (overrides: Partial<ContinueSessionLookup> = {}): ContinueSessionLookup => ({
+    projectIdForCwd: (cwd) => (cwd === PROJECT_ROOT || cwd.startsWith(`${PROJECT_ROOT}/`) ? 'p-alpha' : null),
+    latestForProject: (projectId) => (projectId === 'p-alpha' ? 'sess-alpha-2' : null),
+    latestGlobal: () => 'sess-other-9',
+    activeSessionId: () => null,
+    ...overrides,
+  });
+
+  test('cwd 프로젝트의 최신 세션이 전역 최신보다 우선한다', () => {
+    expect(latestSessionIdForContinue(`${PROJECT_ROOT}/pkg`, lookup())).toBe('sess-alpha-2');
+  });
+
+  test('cwd 프로젝트에 세션이 없거나 프로젝트 밖이면 종전대로 전역 최신', () => {
+    expect(latestSessionIdForContinue('/work/beta', lookup())).toBe('sess-other-9');
+    expect(latestSessionIdForContinue(PROJECT_ROOT, lookup({ latestForProject: () => null }))).toBe('sess-other-9');
+  });
+
+  test('cwd 프로젝트에서는 활성 표지를 버리고 프로젝트 최신 선택으로 넘긴다', () => {
+    expect(activeSessionIdForContinue(PROJECT_ROOT, lookup({ activeSessionId: () => 'sess-other-9' }))).toBe(null);
+    expect(activeSessionIdForContinue(PROJECT_ROOT, lookup({ activeSessionId: () => 'sess-alpha-1' }))).toBe(null);
+    // cwd 가 어떤 프로젝트에도 안 속하면 종전대로 활성 표지가 이긴다.
+    expect(activeSessionIdForContinue('/work/beta', lookup({ activeSessionId: () => 'sess-other-9' }))).toBe('sess-other-9');
+  });
+
+  test('resolveLatestSessionId 체인이 --continue 의 실제 선택을 낸다', () => {
+    const continueFrom = (cwd: string, deps: ContinueSessionLookup): string | null => resolveLatestSessionId({
+      activeSessionId: () => activeSessionIdForContinue(cwd, deps),
+      latestSessionId: () => latestSessionIdForContinue(cwd, deps),
+      sessionExists: () => true,
+    });
+
+    // cwd 프로젝트에는 최근 세션이 있고 활성 표지는 다른 프로젝트 → cwd 최근 세션.
+    expect(continueFrom(`${PROJECT_ROOT}/pkg`, lookup({ activeSessionId: () => 'sess-other-9' }))).toBe('sess-alpha-2');
+    // 같은 프로젝트의 오래된 활성 표지보다 cwd 프로젝트의 최신 세션이 우선한다.
+    expect(continueFrom(PROJECT_ROOT, lookup({ activeSessionId: () => 'sess-alpha-1' }))).toBe('sess-alpha-2');
+    // 보존: 프로젝트 밖에서는 전역 최신(= 종전 `--continue` 동작).
+    expect(continueFrom('/work/beta', lookup({ activeSessionId: () => 'sess-other-9' }))).toBe('sess-other-9');
+  });
+});
 // ── TUI-H9-ACTIVE-SESSION-ID · 0.2.36 ──────────────────────────────────────────
 //
 // 무대(mock 시나리오 · 임시 ELANOUS_STATE_DIR 실물 저장소): «진짜» 대화 두 개를 만든다 —
@@ -5609,4 +5677,38 @@ describe('TUI-BOOT-TIMING-HOLES — 생산 진입점의 proc→sink 계측', () 
       await rm(dir, { recursive: true, force: true });
     }
   }, 180_000);
+});
+
+describe('GATE-REMOTE-SHARD-PLAN — self gate 원격 명령에 조각 인자가 실린다', () => {
+  test('183-file fake input reaches the mocked remote executor argv with the shard identity', async () => {
+    // 동적 import: 베이스(export 없음)에서도 이 파일은 로드되고 이 시험만 빨개진다(RED 증인).
+    const { planRemoteGateShardCommands } = await import('./self-implement/gate-cli.js');
+    const files = Array.from({ length: 183 }, (_, index) => `src/mod-${String(index).padStart(3, '0')}.ts`);
+    const plan = planRemoteGateShardCommands(files, 4);
+    const shard = plan.shards[1]!;
+    const remote = await import('./self-implement/gate-remote.js');
+    const captured: string[][] = [];
+    const previousExitCode = process.exitCode;
+    const dispatch = spyOn(remote, 'dispatchHeavyCheck').mockImplementation((opts: import('./self-implement/gate-remote.js').DispatchOptions) => {
+      const argv = typeof opts.remoteArgv === 'function' ? opts.remoteArgv(() => 'a'.repeat(40)) : opts.remoteArgv;
+      captured.push(argv);
+      return Promise.resolve(0);
+    });
+    try {
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'self', 'gate', '--changed', '--shards', '4', '--base', 'HEAD', '--remote', 'node-b',
+        '--orchestration-id', shard.orchestrationId, '--shard-id', shard.shardId, '--shard-position', String(shard.position)]);
+      expect(captured).toHaveLength(1);
+      expect(captured[0]).toEqual(expect.arrayContaining([
+        '--orchestration-id', shard.orchestrationId,
+        '--shard-id', shard.shardId,
+        '--shard-position', String(shard.position),
+      ]));
+      expect(plan.shards.reduce((total, piece) => total + piece.files.length, 0)).toBe(183);
+      expect(plan.shards.map((piece) => piece.position)).toEqual([1, 2, 3, 4]);
+    } finally {
+      dispatch.mockRestore();
+      process.exitCode = previousExitCode ?? 0;
+    }
+  }, 60_000);
 });

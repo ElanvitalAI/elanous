@@ -228,8 +228,15 @@ describe('parseReviewResult — VERDICT + MUST-FIX/SHOULD-FIX 파싱', () => {
   it('REVIEW-MUSTFIX-NONE-TEXT — 괄호 없는 없음 대시 무소견 문구는 0건으로 접고 실제 지적은 보존한다', () => {
     const raw = (item: string) => `VERDICT: WARN\nMUST-FIX:\n- ${item}`;
     expect(parseReviewResult(raw('없음 — 블로커 결함 없음')).mustFix).toEqual([]);
+    for (const none of ['결함 없음', '코어 결함이 발견되지 않았습니다.', 'no defects found', '(none — no defects found)', '(없음 — 코드 경로 자체는 결함 없음)', '(없음 …)']) {
+      expect(parseReviewResult(raw(none)).mustFix).toEqual([]);
+    }
     expect(parseReviewResult(raw('없음 — 인증 검사가 없어 권한 없이 배포 가능')).mustFix)
       .toEqual(['없음 — 인증 검사가 없어 권한 없이 배포 가능']);
+    for (const finding of ['결함 없음 — 인증 검사가 없어 권한 없이 배포 가능', 'no defects found, but authentication is missing']) {
+      expect(parseReviewResult(raw(finding)).mustFix).toEqual([finding]);
+    }
+    expect(parseReviewResult(raw('없음 처리 시 null 역참조')).mustFix).toEqual(['없음 처리 시 null 역참조']);
   });
   it('GLM 괄호 무소견·빈 항목은 0건, 실제 지적은 보존한다', () => {
     for (const placeholder of [
@@ -581,6 +588,8 @@ describe('buildReviewPrompt / renderReview', () => {
     expect(p).toContain('POST-PR review');
     expect(p).toContain('lineage helper');
     expect(p).toContain('VERDICT: PASS | VERDICT: WARN | VERDICT: FAIL');
+    expect(p).toContain('leave MUST-FIX empty');
+    expect(p).toContain('결함 없음');
     expect(p).toContain('"REQUIREMENTS:"');
     expect(p).toContain('This is observational only and does not change the verdict.');
   });

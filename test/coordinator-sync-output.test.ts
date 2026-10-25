@@ -66,6 +66,24 @@ describe('DECSET 2026 — synchronized output wrap', () => {
     }
   });
 
+  test('an outer paint batch and its immediate coordinator frame emit one synchronized block', () => {
+    const h = harnessWithTTY(true);
+    try {
+      h.c.withSynchronizedOutput(() => {
+        h.c.pushModal(modal('m', 'PAYLOAD'));
+        h.c.requestRenderNow({ force: true });
+      });
+      expect(h.overlayWrites.filter(write => write === '\x1b[?2026h' || write === '\x1b[?2026l'))
+        .toEqual(['\x1b[?2026h', '\x1b[?2026l']);
+      expect(h.overlayWrites).toContain('PAYLOAD');
+      h.flush(); // The stale scheduled callback must not emit another frame.
+      expect(h.overlayWrites.filter(write => write === '\x1b[?2026h' || write === '\x1b[?2026l'))
+        .toEqual(['\x1b[?2026h', '\x1b[?2026l']);
+    } finally {
+      h.restore();
+    }
+  });
+
   test('non-TTY — BSU/ESU suppressed so test harnesses see clean overlay', () => {
     const h = harnessWithTTY(false);
     try {

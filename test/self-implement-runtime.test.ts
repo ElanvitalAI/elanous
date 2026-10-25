@@ -30,12 +30,14 @@ import { _setAutoOpenPrConfigReaderForTesting } from '../src/self-implement/auto
 
 // 전 단계 성공하는 fake seam. approvePr 는 options passthrough(defaultSeams 동형).
 function fakeSeamsFactory(o: DefaultSeamsOptions): SelfImplementSeams {
+  let openedHead = '';
   return {
     forkSession: async (parent) => `${parent}-forked`,
     createWorktree: async ({ branch }) => ({ path: `/tmp/wt/${branch}`, branch }),
     implement: async () => ({ ok: true, summary: '구현 완료' }),
     gate: async () => ({ passed: true, log: 'test ok' }),
-    openPr: async ({ head }) => ({ url: `https://example/pr/${head}`, number: 42 }),
+    openPr: async ({ head }) => { openedHead = head; return { url: `https://example/pr/${head}`, number: 42 }; },
+    readPrAttribution: async () => ({ headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString() }),
     ...(o.approvePr ? { approvePr: o.approvePr } : {}),
   };
 }

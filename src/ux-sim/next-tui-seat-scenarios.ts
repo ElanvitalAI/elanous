@@ -3,7 +3,7 @@
 // `bin/elanous.mjs`); this file only types keys, seeds the store through the real session API,
 // and reads the universe back through the same binary's `logs` CLI.
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { appendMessage, createSession, getActiveSessionId, loadSession, setActiveSessionId } from '../session/index.js';
 import { mockSeatPtySequence, type SeatPtySequenceEvidence, type SeatPtyStep } from './mock-seat-pty-sequence.js';
@@ -13,7 +13,7 @@ import {
   TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
 } from './fake-llm.js';
 
-export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-compact', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste'] as const;
+export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-compact', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-subagent-e4'] as const;
 export type NextTuiScenario = (typeof NEXT_TUI_SCENARIOS)[number];
 
 export interface NextTuiScenarioSpec {
@@ -76,6 +76,7 @@ const count = (screen: string, text: string) => screen.split(text).length - 1;
 
 /** A malformed `data` field becomes `{}` so the check reads false instead of the scenario throwing. */
 export function parseData<T>(data: unknown): Partial<T> {
+  if (typeof data === 'object' && data !== null && !Array.isArray(data)) return data as Partial<T>;
   if (typeof data !== 'string') return {};
   try { return JSON.parse(data) as Partial<T>; } catch { return {}; }
 }
@@ -97,6 +98,117 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     ready: { label: 'boot', until: (s: string) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료') },
   };
   const done = (n: number, also?: string) => (s: string) => count(s, reply) === n && s.includes('응답 완료') && (!also || s.includes(also));
+
+  if (spec.scenario === 'next-subagent-e4') {
+    const capture = join(root, 'fake-llm.jsonl');
+    const run = await mockSeatPtySequence({
+      ...base,
+      env: {
+        ...base.env,
+        ELANOUS_TEST_FAKE_LLM_CAPTURE: capture,
+        [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({
+          when: '서브에이전트로',
+          name: 'Agent',
+          args: {
+            description: 'Next TUI child tool inheritance check',
+            prompt: '파일 하나 읽어라',
+            tool_filter: { allow: ['read_file', 'shell', 'grep_search'] },
+          },
+        }),
+      },
+      steps: [
+        { label: 'agent dispatch', text: '서브에이전트로 확인해줘', until: (screen) => screen.includes(reply) && screen.includes('응답 완료'), timeoutMs: 90_000 },
+      ],
+    });
+    const captured = readFileSync(capture, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as {
+      messages: Array<{ role: string; content: unknown }>;
+    });
+    const childRequest = captured.find((request) => request.messages.some((message) =>
+      message.role === 'system' && JSON.stringify(message.content).includes('You are a sub-agent spawned by a parent task.'))
+      && request.messages.some((message) => message.role === 'user' && JSON.stringify(message.content).includes('파일 하나 읽어라')));
+    const childPrompt = JSON.stringify(childRequest?.messages ?? []);
+    // The child Agent writes to the isolated debug trail; its events are not
+    // guaranteed to have a StoreSink in this standalone PTY process.
+    const debugDir = join(root, '.elanous', 'debug');
+    const debugLines = readdirSync(debugDir).filter((name) => (name.startsWith('debug-') || name.startsWith('chat-')) && name.endsWith('.log'))
+      .flatMap((name) => readFileSync(join(debugDir, name), 'utf8').split('\n').filter(Boolean))
+      .filter((line) => {
+        try {
+          const event = JSON.parse(line) as { category?: string };
+          return event.category === 'agent.spawn' || event.category === 'llm.route-decision' || event.category === 'llm.router';
+        } catch { return false; }
+      });
+    const logs = {
+      command: `isolated debug ledger ${debugDir}`,
+      rc: 0,
+      lines: debugLines,
+      eventCount: debugLines.length,
+      limit: 200,
+    };
+    const events = parseEvents(logs);
+    const spawnDispatch = events.filter((event) => event.category === 'agent.spawn' && event.event === 'dispatch');
+    const toolFilter = events.filter((event) => event.category === 'agent.spawn' && event.event === 'tool-filter');
+    const checks = {
+      parentAndChildProviderCallsObserved: captured.length >= 3 && Boolean(childRequest),
+      childWasNotForcedTextOnly: Boolean(childRequest) && !childPrompt.includes('No tools are available'),
+      unknownAllowIgnored: toolFilter.length === 1
+        && parseData<{ allowIgnored: string }>(toolFilter[0]?.data).allowIgnored === 'model-allow-ignored',
+      childDispatchObservedInIsolatedLedger: spawnDispatch.length === 1,
+      childInheritedTools: spawnDispatch.length === 1
+        && parseData<{ noTools: boolean; tools: string[] }>(spawnDispatch[0]?.data).noTools === false
+        && parseData<{ tools: string[] }>(spawnDispatch[0]?.data).tools?.includes('Read') === true
+        && parseData<{ tools: string[] }>(spawnDispatch[0]?.data).tools?.includes('Bash') === true
+        && parseData<{ tools: string[] }>(spawnDispatch[0]?.data).tools?.length === parseData<{ available: number }>(toolFilter[0]?.data).available,
+      parentTurnCompletedOnce: count(run.frames.at(-1)?.screen ?? '', '응답 완료') === 1
+        && (run.frames.at(-1)?.screen ?? '').includes(reply)
+        && run.frames.at(-1)?.screen.includes('응답 완료') === true,
+      onlyFakeProvider: events.filter((event) => event.category === 'llm.router' && event.event === 'streamLLMWithTools')
+        .every((event) => parseData<{ provider: string }>(event.data).provider === 'test-fake-llm')
+        && events.some((event) => event.category === 'llm.router' && event.event === 'streamLLMWithTools'),
+      exitedClean: run.exitCode === 0,
+    };
+    return { scenario: spec.scenario, universe: root, run, store: { capture, capturedRequests: captured.length }, logs, checks };
+  }
+
+  if (spec.scenario === 'next-at-picker') {
+    const fixture = join(root, 'picked.txt');
+    const capture = join(root, 'fake-llm.jsonl');
+    writeFileSync(fixture, 'attachment body from the isolated @ picker fixture');
+    const run = await mockSeatPtySequence({
+      ...base,
+      env: { ...base.env, ELANOUS_TEST_FAKE_LLM_CAPTURE: capture },
+      steps: [
+        { label: 'at candidates', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') },
+        { label: 'selected attachment', keys: '\r', until: (s) => s.includes('[attached 1: picked.txt]') },
+        { label: 'sent with attachment', keys: '\r', until: done(1, 'Read [attached 1: picked.txt]') },
+      ],
+    });
+    const logs = readLogs(spec, 'tui.next,llm.route-decision');
+    const events = parseEvents(logs);
+    const id = withStore(root, () => getActiveSessionId() ?? '');
+    const stored = withStore(root, () => id ? loadSession(id)?.messages ?? [] : []);
+    const user = [...stored].reverse().find((message) => message.role === 'user');
+    const content = JSON.stringify(user?.content ?? null);
+    const captured = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {
+      messages: Array<{ role: string; content: unknown }>;
+    });
+    const capturedUser = captured.flatMap((request) => request.messages).filter((message) => message.role === 'user').at(-1);
+    const modelContent = JSON.stringify(capturedUser?.content ?? null);
+    const selected = events.filter((event) => event.category === 'tui.next' && event.event === 'at-picker-selected');
+    const loaded = events.filter((event) => event.category === 'tui.next' && event.event === 'at-picker-module-loaded');
+    const checks = {
+      bootFramePrecedesPicker: run.frames[0]?.label === 'boot'
+        && !run.frames[0]?.screen.includes('파일 첨부 후보'),
+      pickerListsFixture: run.frames.find((frame) => frame.label === 'at candidates')?.screen.includes('▸ picked.txt') === true,
+      selectedPathRecorded: selected.length === 1 && (parseData<{ path: string }>(selected[0]?.data).path ?? '').endsWith('/picked.txt'),
+      moduleLoadedOnlyOnTypedAt: loaded.length === 1 && parseData<{ onDemand: boolean }>(loaded[0]?.data).onDemand === true,
+      submittedBodyKeepsSelection: content.includes('[attached 1: picked.txt]'),
+      submittedAttachmentContent: modelContent.includes('attachment body from the isolated @ picker fixture'),
+      onlyFakeProvider: onlyFake(events),
+      exitedClean: run.exitCode === 0,
+    };
+    return { scenario: spec.scenario, universe: root, run, store: { sessionId: id, userContent: content, modelContent }, logs, checks };
+  }
 
   if (spec.scenario === 'next-new-session') {
     // Step 1–2: two turns · step 3: /new · step 4: one turn · step 5: a turn with /new typed while it is busy.
@@ -267,7 +379,9 @@ async function runNextProactiveContinueScenario(spec: NextTuiScenarioSpec, root:
     results.push({ name: c.name, run, store: activeUserTexts(caseRoot), logs: readLogs(caseSpec, 'tui.next,tui.proactive,tui.goal-continue,tui.autoturn,llm.route-decision') });
   }
   const events = results.flatMap((r) => parseEvents(r.logs));
-  const proactive = events.filter((e) => e.category === 'tui.proactive').map((e) => ({ event: e.event, ...parseData<Record<string, unknown>>(e.data) }));
+  const proactive: Array<{ event?: string; reason?: string; cap?: number; autoTurn?: number; bufferedChars?: number }> = events
+    .filter((e) => e.category === 'tui.proactive')
+    .map((e) => ({ event: e.event, ...parseData<{ reason: string; cap: number; autoTurn: number; bufferedChars: number }>(e.data) }));
   const humanUsers = results.find((r) => r.name === 'human')?.store.user ?? [];
   const remainingUsers = results.find((r) => r.name === 'remaining')?.store.user ?? [];
   const queuedFrame = results.find((r) => r.name === 'remaining')?.run.frames.find((f) => f.label.includes('queued user turn is next'))?.screen ?? '';
@@ -292,7 +406,7 @@ async function runNextProactiveContinueScenario(spec: NextTuiScenarioSpec, root:
       humanWorkStopped: proactive.some((e) => e.event === 'stop-human' && e.reason === 'human-action') && results.find((r) => r.name === 'human')?.run.frames.at(-1)?.screen.includes('로그인이 필요합니다') === true,
       autoTurnCapStopsInPractice: DEFAULT_GOAL_CONTINUE_CAP === 3 && proactive.some((e) => e.event === 'stop-cap' && e.cap === 3 && e.autoTurn === 3)
         && results.find((r) => r.name === 'cap')?.run.frames.at(-1)?.screen.includes('골 이어가기 상한(3회 연속)') === true,
-      typedBufferWinsAndStaysVisible: bufferEvents.some((e) => e.category === 'tui.proactive' && e.event === 'yield-user-input' && parseData<{ bufferedChars: number }>(e.data).bufferedChars > 0)
+      typedBufferWinsAndStaysVisible: bufferEvents.some((e) => e.category === 'tui.proactive' && e.event === 'yield-user-input' && (parseData<{ bufferedChars: number }>(e.data).bufferedChars ?? 0) > 0)
         && bufferCase?.run.frames.at(-1)?.screen.includes('미전송 초안') === true
         && !bufferEvents.some((e) => e.category === 'tui.proactive' && e.event === 'continue'),
       onlyFakeProvider: events.filter((e) => e.category === 'llm.route-decision' && e.event === 'local-chat-executed').every((e) => parseData<{ provider: string }>(e.data).provider === 'test-fake-llm'),
@@ -613,12 +727,16 @@ async function runNextGoalInterimScenario(spec: NextTuiScenarioSpec, root: strin
   const foldedLogged = events.filter((e) => e.category === 'tui.goal-interim' && e.event === 'folded')
     .map((e) => parseData<{ folded: number }>(e.data).folded ?? 0);
   const store = activeUserTexts(root);
-  const last = goalInterimScreenCounts(run.frames.at(-1)?.screen ?? '');
+  const finalScreen = run.frames.at(-1)?.screen ?? '';
+  const last = goalInterimScreenCounts(finalScreen);
+  const stepLines = finalScreen.split('\n').filter((line) => line.includes(GOAL_INTERIM_STEP_MARK));
   const checks = {
     continuedSeveral: opened >= 2,
+    eachInterimOneLine: stepLines.filter((line) => line.includes('(접힘)')).length === opened
+      && stepLines.every((line) => !line.includes(GOAL_INTERIM_NOT_DONE_MARK)),
     everyStepOnScreen: last.steps === opened + 1,
     notDoneAtMostOnce: last.notDone <= 1,
-    finalReportShown: last.notDone === 1,
+    finalReportShown: last.notDone === 1 && finalScreen.split('\n').some((line) => line.includes(GOAL_INTERIM_NOT_DONE_MARK) && !line.includes('(접힘)')),
     foldedEachContinued: last.folded === opened && Math.max(0, ...foldedLogged) === opened,
     noUserHeaderForInternal: run.frames.every((f) => !INTERNAL_TURN_USER_HEADER.test(f.screen)),
     // The first turn's tool line survives the fold of that turn's reply (only the reply block folds).

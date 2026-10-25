@@ -1,10 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { devVersion, listChecklist, ownerMatches, parseOwner, parityGap, summarizeChecklist } from '../release-loop/checklist.js';
+import { checklistEvidenceChain, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, summarizeChecklist, type ChecklistEvidenceStage } from '../release-loop/checklist.js';
 import { userConfigPath } from '../user-config.js';
 import { CliUserError } from './cli-user-error.js';
 import { writeStdoutJson } from './stdout-json.js';
@@ -55,8 +56,102 @@ export async function checklistOutput(v: string, codenames: Record<string, strin
   }
 }
 
+export type ChecklistEvidenceReader = (item: ReturnType<typeof listChecklist>['items'][number], version: string) => readonly ChecklistEvidenceStage[];
+
+export type ChecklistEvidenceCommandRunner = (command: string, args: string[], timeout?: number) => { status: number | null; stdout: string; stderr: string; error?: string };
+const evidenceCommand: ChecklistEvidenceCommandRunner = (command, args, timeout = 20_000) => {
+  const result = spawnSync(command, args, { cwd: process.cwd(), encoding: 'utf8', timeout, maxBuffer: 4 * 1024 * 1024 });
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', ...(result.error ? { error: result.error.message } : {}) };
+}
+
+function evidenceJson(stdout: string): Record<string, unknown> | null {
+  for (const line of stdout.split(/\r?\n/u).reverse()) {
+    const start = line.indexOf('{');
+    if (start < 0) continue;
+    try { return JSON.parse(line.slice(start)) as Record<string, unknown>; } catch { /* try another complete JSON line */ }
+  }
+  return null;
+}
+
+export function collectChecklistEvidenceStages(item: ReturnType<typeof listChecklist>['items'][number], run: ChecklistEvidenceCommandRunner = evidenceCommand): ChecklistEvidenceStage[] {
+  const measuredAt = new Date().toISOString();
+  const evidence = item.evidence ?? '';
+  const prRefs = [...new Set([...evidence.matchAll(/(?:^|\s)#(\d{1,8})\b/gu)].map((match) => match[1]!))];
+  const pr = prRefs.length === 1 ? prRefs[0] : undefined;
+  const prLine = pr ? evidence.split(/\r?\n/u).find((line) => new RegExp(`(?:^|\\s)#${pr}\\b`).test(line)) : undefined;
+  const e1: ChecklistEvidenceStage = { id: 'E1', state: 'missing', source: 'checklist evidence + eln gh pr view', measuredAt,
+    reason: prRefs.length > 1 ? '근거에서 교차할 PR이 하나로 좁혀지지 않는다' : '근거에 병합 PR 번호가 없다' };
+  let mergeSha: string | null = null;
+  if (pr) {
+    const view = run('eln', ['gh', 'pr', 'view', pr, '--json', 'state,mergeCommit']);
+    const record = view.status === 0 ? evidenceJson(view.stdout) : null;
+    if (!record) { e1.state = 'unmeasurable'; e1.reason = `PR #${pr} 조회 실패${view.error ? `: ${view.error}` : ''}`; }
+    else if (record.state !== 'MERGED') { e1.reason = `PR #${pr} 상태가 MERGED가 아니다`; }
+    else {
+      const commit = record.mergeCommit && typeof record.mergeCommit === 'object' ? (record.mergeCommit as { oid?: unknown }).oid : null;
+      mergeSha = typeof commit === 'string' && /^[a-f0-9]{40}$/i.test(commit) ? commit : null;
+      if (!mergeSha) { e1.state = 'unmeasurable'; e1.reason = `PR #${pr} 조회에 유효한 merge SHA가 없다`; }
+      else if (!prLine || !new RegExp(`\\b${mergeSha}\\b`, 'i').test(prLine)) { e1.reason = `병합 PR #${pr}와 merge SHA가 같은 근거 줄에서 결속되지 않았다`; e1.source = `eln gh pr view #${pr} → ${mergeSha}`; }
+      else { e1.state = 'observed'; e1.reason = `PR #${pr} MERGED 및 merge SHA가 근거와 일치한다`; e1.source = `eln gh pr view #${pr} → ${mergeSha}`; }
+    }
+  }
+
+  const e3: ChecklistEvidenceStage = { id: 'E3', state: 'unmeasurable', source: null, measuredAt, reason: mergeSha ? '설치본 pin을 조회하지 못했다' : 'E1 merge SHA가 없어 조상 관계를 검사할 수 없다' };
+  if (mergeSha) {
+    const pin = run('eln', ['--version']);
+    const pinSha = pin.stdout.match(/\b[a-f0-9]{40}\b/i)?.[0];
+    if (!pinSha) e3.reason = `eln --version에서 설치본 SHA를 읽지 못했다${pin.error ? `: ${pin.error}` : ''}`;
+    else {
+      const repoRoot = run('git', ['rev-parse', '--show-toplevel']);
+      const origin = run('git', ['remote', 'get-url', 'origin']);
+      const pinObject = run('git', ['cat-file', '-e', `${pinSha}^{commit}`]);
+      const repoUrl = origin.stdout.trim().replace(/^git@github\.com:/i, 'https://github.com/').replace(/\.git$/i, '').replace(/\/$/u, '').toLowerCase();
+      const expectedRepo = 'https://github.com/elanvitalai/elanous';
+      if (repoRoot.status !== 0 || !repoRoot.stdout.trim() || origin.status !== 0 || repoUrl !== expectedRepo || pinObject.status !== 0) {
+        e3.reason = '현재 git 저장소가 elanous 원본이 아니거나 설치본 pin 객체가 없어 조상 관계를 판정할 수 없다';
+      } else {
+      const ancestry = run('git', ['merge-base', '--is-ancestor', mergeSha, pinSha]);
+      e3.source = `eln --version ${pinSha}; git -C ${repoRoot.stdout.trim()} merge-base --is-ancestor ${mergeSha} ${pinSha}`;
+      if (ancestry.status === 0) { e3.state = 'observed'; e3.reason = '설치본 pin이 merge SHA의 후손이다'; }
+      else if (ancestry.status === 1) { e3.state = 'missing'; e3.reason = '설치본 pin이 merge SHA의 후손이 아니다'; }
+      else { e3.reason = `설치본 저장소에서 조상 관계를 검사할 수 없다${ancestry.error ? `: ${ancestry.error}` : ''}`; }
+      }
+    }
+  }
+
+  const runId = /\b(run-[a-f0-9]{8}-[a-f0-9-]{27,})\b/i.exec(evidence)?.[1]
+    ?? /\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b/i.exec(evidence)?.[1];
+  const event = /(?:event|이벤트)\s*[:=]\s*([A-Za-z0-9_.:-]+)/iu.exec(evidence)?.[1];
+  const verificationCommand = /(?:완료 경계 증거 명령|증거 명령|verification command)\s*[:=]\s*([^\r\n]+)/iu.exec(`${item.title}\n${evidence}`)?.[1]?.trim() ?? null;
+  const e4: ChecklistEvidenceStage = { id: 'E4', state: 'missing', source: null, measuredAt, verificationCommand, reason: '근거에 runId·event·원문 검증 명령이 모두 필요하다' };
+  if (runId && event && verificationCommand) {
+    const logs = run('eln', ['logs', '--grep', runId, '--since', '365d', '--all', '--include-test', '--limit', '1000', '--json'], 30_000);
+    if (logs.status !== 0) { e4.state = 'unmeasurable'; e4.reason = `runId 로그 조회 실패${logs.error ? `: ${logs.error}` : ''}`; }
+    else {
+      const rows = logs.stdout.split(/\r?\n/u).flatMap((line) => { try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; } });
+      const truncated = rows.length >= 1000 || rows.some((row) => row._meta && typeof row._meta === 'object' && (row._meta as { limitReached?: unknown }).limitReached === true);
+      const observed = rows.some((row) => {
+        if (row.event !== event || typeof row.data !== 'string') return false;
+        try { return (JSON.parse(row.data) as { runId?: unknown }).runId === runId; } catch { return false; }
+      });
+      e4.source = `eln logs --grep ${runId} --since 365d --all --include-test --limit 1000 --json (event=${event})`;
+      if (observed) { e4.state = 'observed'; e4.reason = `같은 runId의 ${event} 실물 이벤트를 찾았다`; }
+      else if (truncated) { e4.state = 'unmeasurable'; e4.reason = '로그 결과가 잘려 사건 부재를 판정할 수 없다'; }
+      else { e4.reason = `같은 runId의 ${event} 이벤트가 없다`; }
+    }
+  }
+
+  const acceptance = /- 완료 경계 실물:([^\r\n]+)/u.exec(item.title)?.[1]?.trim();
+  const e5Observed = Boolean(acceptance && evidence.includes(acceptance));
+  const e5: ChecklistEvidenceStage = { id: 'E5', state: e5Observed ? 'observed' : 'missing', source: 'checklist title/evidence exact acceptance-text comparison', measuredAt,
+    reason: e5Observed ? '완료 경계 실물 문구가 기록된 근거와 일치한다' : '완료 경계 실물 문구와 일치하는 근거가 없다' };
+  return [
+    e1, e3, e4, e5,
+  ];
+}
+
 /** Register the same read commands on the full and lightweight release roots. */
-export function registerChecklistReadCommands(checklist: Command): void {
+export function registerChecklistReadCommands(checklist: Command, evidenceReader: ChecklistEvidenceReader = collectChecklistEvidenceStages): void {
   const withContext = (cmd: Command) => cmd.option('--version <v>', '판 또는 별칭').option('--json', '결과 JSON').option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
   withContext(checklist.command('list').description('모든 칸')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
     const { version, codenames, json } = readChecklistContext(cmd);
@@ -66,14 +161,24 @@ export function registerChecklistReadCommands(checklist: Command): void {
     const { version, codenames, json } = readChecklistContext(cmd);
     await checklistOutput(version, codenames, 'status', json, opts.owner);
   });
+  withContext(checklist.command('evidence [id]').description('칸의 단계별 실물 근거 사슬 조회·PR 참조 추가'))
+    .action(async (id: string | undefined, _opts: unknown, cmd: Command) => {
+      const { version, json } = readChecklistContext(cmd);
+      if (!id) throw new CliUserError('조회할 칸 id를 지정하라');
+      if (!json) throw new CliUserError('evidence 조회는 --json 이 필요하다');
+      const item = listChecklist(version).items.find((row) => row.id === id);
+      if (!item) throw new CliUserError(`없는 칸: ${id}`);
+      const result = checklistEvidenceChain({ item, version, stages: evidenceReader(item, version) });
+      await writeStdoutJson(`${JSON.stringify(result)}\n`);
+    });
 }
 
 /** The light router enters only list/status, so no publishing modules are loaded. */
-export function registerReleaseChecklistReadCommands(program: Command): void {
+export function registerReleaseChecklistReadCommands(program: Command, evidenceReader: ChecklistEvidenceReader = collectChecklistEvidenceStages): void {
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const checklist = release.command('checklist').description('판별 확인표 조회·갱신')
     .option('--version <v>', '판 또는 별칭(기본: package.json 의 개발판에서 -dev.N 제거)')
     .option('--json', '결과 JSON')
     .option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
-  registerChecklistReadCommands(checklist);
+  registerChecklistReadCommands(checklist, evidenceReader);
 }

@@ -11,19 +11,47 @@ import { reportTuiTurn } from '../pty-shell/tui-run-state.js';
 import { createPasteFold } from '../chat/paste-fold.js';
 import { createTurnTypeaheadState, dequeueTurnTypeaheadHandoff, drainTurnTypeaheadOnce, restoreTurnTypeaheadSubmission } from '../chat/turn-typeahead.js';
 import { debug } from '../debug/log.js';
+import { setCliStderrSink } from '../git-fs/cli-stderr.js';
 import { createInputLagProbe } from './input-lag-probe.js';
 import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { countInterimDisplay, internalTurnOriginOfText, planInterimDisplay } from './chat/goal-interim.js';
 import type { NextTuiSelfHealthSnapshot } from './chat/self-health-status.js';
 import { createNextLoopCommand, type NextLoopCommand } from '../tui-client/next-loop-command.js';
+import { handleMissionSlash, type MissionSlashContext } from './slash/mission.js';
+import { handleSignalsSlash } from './slash/signals.js';
 
 /** Status-line count of what waits for the running turn — empty when nothing waits. */
 export function nextTuiQueueSuffix(count: number): string {
   return count > 0 ? ` · 대기 ${count}` : '';
 }
 
+type NextTuiTermSession = {
+  id: string;
+  title: string;
+  kind: string;
+  status: 'running' | 'backgrounded' | 'completed' | 'killed' | 'exited';
+  cwd?: string;
+  exitCode?: number | null;
+};
+
 export interface NextTuiOptions {
   readonly resumeSessionId?: string;
+  /** Read-only terminal session source; injectable so the Next slash stays testable without PTYs. */
+  readonly termSessions?: {
+    list(): readonly NextTuiTermSession[] | Promise<readonly NextTuiTermSession[]>;
+  };
+}
+
+interface AtPickerCandidate {
+  readonly label: string;
+  readonly absPath: string;
+  readonly isDir: false;
+}
+
+interface AtPickerQuery {
+  readonly prefix: string;
+  readonly start: number;
+  readonly end: number;
 }
 
 /** Local chat entry: history and input are TUI-owned; turn execution stays shared. */
@@ -60,6 +88,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let historyIndex = 0;
   let draft = '';
   let activity: string[] = [];
+  /** Rows of the last `/resume` list — `/resume <n>` picks from what the user saw. */
+  let lastResumeRows: ReturnType<typeof resumeCandidates> | null = null;
+  let atPicker: { query: AtPickerQuery; candidates: AtPickerCandidate[]; selected: number } | null = null;
+  let atPickerApi: typeof import('./input/at-picker.js') | null = null;
+  let dismissedAtQuery = '';
+  const atAttachmentTokens = new Map<string, string>();
+  let atAttachmentOrdinal = 0;
   // Tool-output fold state, keyed by message index; long tool output renders
   // collapsed and Enter/Tab/F in the log toggles the foldable block on screen nearest the
   // bottom of the last rendered scroll window.
@@ -94,6 +129,100 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let interimFoldedShown = 0;
   const pushNotice = (line: string): void => {
     notices = [...notices, safeStatusText(line)].slice(-3);
+  };
+  const slashHandlers = new Map<string, (args: string[], context: MissionSlashContext) => Promise<void>>();
+  slashHandlers.set('mission', handleMissionSlash);
+  slashHandlers.set('signals', handleSignalsSlash);
+  const dispatchSlash = async (name: string, args: string[], context: MissionSlashContext): Promise<boolean> => {
+    const handler = slashHandlers.get(name);
+    if (!handler) return false;
+    await handler(args, context);
+    return true;
+  };
+  const missionWatchTimers = new Set<ReturnType<typeof setInterval>>();
+  let missionWatchesClosed = false;
+  const readyWatchIds = new Set<string>();
+  const runWatchIds = new Set<string>();
+  const startMissionReadyWatch = (missionId: string): void => {
+    if (readyWatchIds.has(missionId)) return;
+    readyWatchIds.add(missionId);
+    pushNotice(`미션 준비 관찰 시작: ${missionId}`);
+    void import('../autopilot/mission-tui-watch.js').then((watch) => {
+      if (missionWatchesClosed) { readyWatchIds.delete(missionId); return; }
+      const baseline = watch.takeMissionReadySnapshot(missionId);
+      let state = watch.createMissionWatchState(baseline, Date.now());
+      const timer = setInterval(() => {
+        const current = watch.takeMissionReadySnapshot(missionId);
+        const result = watch.advanceMissionWatch(state, current, Date.now());
+        state = result.state;
+        for (const event of result.events) {
+          if (event.kind === 'phases') activity.push(`미션 분해 진행 — ${event.count} 페이즈 (${missionId})`);
+          else if (event.kind === 'ready') {
+            activity.push(`미션 준비 완료 — ${event.snapshot.goal}`);
+            activity.push(...watch.missionDescriptionDigest(event.snapshot.description));
+            activity.push(...watch.renderMissionPhaseBoardLines(event.snapshot.phases, { goal: event.snapshot.goal }));
+            activity.push(`검토 후 /mission approve|hold ${missionId}`);
+          } else if (event.kind === 'resolved-elsewhere') activity.push(`미션 ${missionId} 은 다른 서피스에서 해소됨 (status=${event.status})`);
+          else if (event.kind === 'gone') activity.push(`미션 ${missionId} 삭제됨 · 준비 관찰 종료`);
+          else if (event.kind === 'timeout') activity.push(`미션 준비 관찰 타임아웃 · /mission trace ${missionId}`);
+        }
+        if (result.events.length > 0) { activity = activity.slice(-80); render(); }
+        if (result.done) { clearInterval(timer); missionWatchTimers.delete(timer); readyWatchIds.delete(missionId); }
+      }, watch.MISSION_WATCH_INTERVAL_MS);
+      missionWatchTimers.add(timer);
+    }).catch((error: unknown) => {
+      readyWatchIds.delete(missionId);
+      pushNotice(`미션 준비 관찰 실패: ${safeStatusText(error instanceof Error ? error.message : String(error))}`);
+      render();
+    });
+    render();
+  };
+  const startMissionRunWatch = (missionId: string): void => {
+    if (runWatchIds.has(missionId)) return;
+    runWatchIds.add(missionId);
+    pushNotice(`미션 실행 관찰 시작: ${missionId}`);
+    void import('../autopilot/mission-tui-watch.js').then((watch) => {
+      if (missionWatchesClosed) { runWatchIds.delete(missionId); return; }
+      const baseline = watch.takeMissionRunSnapshot(missionId);
+      let state = watch.createMissionRunWatchState(baseline, Date.now());
+      const timer = setInterval(() => {
+        const current = watch.takeMissionRunSnapshot(missionId);
+        const result = watch.advanceMissionRunWatch(state, current, Date.now());
+        state = result.state;
+        for (const event of result.events) {
+          if (event.kind === 'phase') activity.push(watch.renderMissionRunPhaseLine(event));
+          else if (event.kind === 'progress') activity.push(`미션 진행 ${event.phase.index + 1}/${event.total}: ${event.note}`);
+          else if (event.kind === 'finished') activity.push('미션 종결', ...watch.renderMissionRunReportLines(event.snapshot));
+          else if (event.kind === 'gone') activity.push(`미션 ${missionId} 삭제됨 · 실행 관찰 종료`);
+          else if (event.kind === 'timeout') activity.push(`미션 실행 관찰 타임아웃 · /mission trace ${missionId}`);
+        }
+        if (result.events.length > 0) { activity = activity.slice(-80); render(); }
+        if (result.done) { clearInterval(timer); missionWatchTimers.delete(timer); runWatchIds.delete(missionId); }
+      }, watch.MISSION_RUN_WATCH_INTERVAL_MS);
+      missionWatchTimers.add(timer);
+      if (baseline) { activity.push(watch.renderMissionRunFooter(baseline)); render(); }
+    }).catch((error: unknown) => {
+      runWatchIds.delete(missionId);
+      pushNotice(`미션 실행 관찰 실패: ${safeStatusText(error instanceof Error ? error.message : String(error))}`);
+      render();
+    });
+    render();
+  };
+  const missionContext: MissionSlashContext = {
+    chatLines: activity,
+    setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
+    muted: (text) => text,
+    accent: (text) => text,
+    text: (text) => text,
+    error: (text) => text,
+    success: (text) => text,
+    warning: (text) => text,
+    info: (text) => text,
+    subtext: (text) => text,
+    missionTui: {
+      startReadyWatch: startMissionReadyWatch,
+      startRunWatch: startMissionRunWatch,
+    },
   };
 
   // TURN-START-BLOCK-REST — 턴 경계 recorder: showNextTui → runLocalChatTurn 위임 턴의
@@ -139,9 +268,41 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const prompt = composerViewport(editor, columns);
     const header = [title, mailLine ? fitLogLine(mailLine, columns) : '─'.repeat(Math.min(columns, 80))];
     if (selfHealthLine) header.push(fitLogLine(selfHealthLine, columns));
+    if (atPicker) {
+      const limit = Math.max(1, Math.min(6, rows - 8));
+      const start = Math.max(0, Math.min(atPicker.selected - limit + 1, atPicker.candidates.length - limit));
+      const visible = atPicker.candidates.slice(start, start + limit);
+      header.push(fitLogLine(visible.length ? '@ 파일 첨부 · ↑↓ 선택 · Enter 추가 · Esc 닫기' : '@ 파일 후보 없음', columns));
+      for (const [offset, candidate] of visible.entries()) {
+        header.push(fitLogLine((start + offset === atPicker.selected ? '▸' : ' ') + ' ' + candidate.label, columns));
+      }
+    }
     const lines = [...header, ...body, ...footer, prompt.line];
     const promptRow = lines.length;
     process.stdout.write(`\x1b[H\x1b[2J${lines.join('\n')}\x1b[${promptRow};${prompt.cursorCol}H\x1b[?25h`);
+  };
+
+  let restoreCliStderrSink: (() => void) | null = null;
+
+  const refreshAtPicker = async (): Promise<void> => {
+    const query = editor.text.slice(0, editor.cursor).match(/(?:^|\s)@([\p{L}\p{N}_./~\\-]*)$/u);
+    if (!query) {
+      atPicker = null;
+      dismissedAtQuery = '';
+      if (status.startsWith('@ 파일')) status = 'Enter 전송 · Esc 취소 · Ctrl+Q 종료';
+      return;
+    }
+    const prefix = query[1] ?? '';
+    const start = editor.cursor - prefix.length - 1;
+    const key = start + ':' + prefix;
+    if (dismissedAtQuery === key) { atPicker = null; return; }
+    if (!atPickerApi) {
+      atPickerApi = await import('./input/at-picker.js');
+      debug.log('tui.next', 'at-picker-module-loaded', { onDemand: true });
+    }
+    const candidates = await atPickerApi.listAtFiles(prefix, process.cwd());
+    atPicker = { query: { prefix, start, end: editor.cursor }, candidates, selected: 0 };
+    status = candidates.length ? '@ 파일 첨부 후보 · ↑↓ 선택 · Enter 추가' : '@ 파일 후보 없음 · 계속 입력';
   };
 
   /** Every busy path ends here: the door learns the turn is over, then the queue moves or returns to the prompt. */
@@ -181,6 +342,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     activity = [];
     streamingReply = '';
     streamRenderAt = 0;
+    const attachments = [...atAttachmentTokens].filter(([token]) => turnText.includes(token)).map(([, path]) => path);
     if (!id) {
       id = createSession({ source: 'tui' }).id;
       setActiveSessionId(id);
@@ -251,7 +413,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             expandedToolBlocks.clear();
             render();
           },
-        });
+        }, attachments);
       })
       .then(() => { status = `${compactNote}응답 완료 · Enter 전송 · Ctrl+Q 종료`; })
       .catch((error: unknown) => {
@@ -295,6 +457,22 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   };
 
   initTui();
+  restoreCliStderrSink = setCliStderrSink(({ source, exitCode, raw }) => {
+    // Keep the exact bytes in the normal debug log while rendering only failures through the
+    // TUI-owned notice area. Writing the CLI stream to process.stderr would overwrite the prompt.
+    debug.log('tui.cli-stderr', 'captured', {
+      source,
+      exitCode,
+      text: raw.toString('utf8'),
+      rawBase64: raw.toString('base64'),
+      byteLength: raw.length,
+    });
+    if (exitCode !== 0) {
+      const text = raw.toString('utf8').trim() || `${source} exited with rc=${exitCode}`;
+      pushNotice(`[${source} stderr · rc=${exitCode}] ${text}`);
+      render();
+    }
+  });
   process.stdout.on('resize', render);
   try {
     {
@@ -427,6 +605,33 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
+      const activeAtPicker = atPicker as { query: AtPickerQuery; candidates: AtPickerCandidate[]; selected: number } | null;
+      if (!busy && focus === 'input' && activeAtPicker) {
+        if (key.name === 'escape') {
+          dismissedAtQuery = activeAtPicker.query.start + ':' + activeAtPicker.query.prefix;
+          atPicker = null;
+          status = '파일 선택 닫힘 · Enter 전송';
+          render();
+          continue;
+        }
+        if ((key.name === 'up' || key.name === 'down') && activeAtPicker.candidates.length > 0) {
+          activeAtPicker.selected = (activeAtPicker.selected + (key.name === 'up' ? -1 : 1) + activeAtPicker.candidates.length) % activeAtPicker.candidates.length;
+          render();
+          continue;
+        }
+        if ((key.name === 'enter' || key.name === 'return') && !key.shift && activeAtPicker.candidates[activeAtPicker.selected]) {
+          const candidate = activeAtPicker.candidates[activeAtPicker.selected]!;
+          const picked = atPickerApi!.acceptAtFile(editor.text, activeAtPicker.query, candidate, ++atAttachmentOrdinal);
+          editor = { text: picked.text, cursor: picked.cursor };
+          atAttachmentTokens.set(picked.token, candidate.absPath);
+          atPicker = null;
+          dismissedAtQuery = '';
+          status = '파일 첨부 추가됨 · Enter 전송';
+          debug.log('tui.next', 'at-picker-selected', { path: candidate.absPath });
+          render();
+          continue;
+        }
+      }
       if (busy) {
         const pending = applyComposerKey(editor, key);
         editor = pending.state;
@@ -478,6 +683,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       focus = 'input';
       const result = applyComposerKey(editor, key);
       editor = result.state;
+      if (result.action === 'edit') await refreshAtPicker();
+      else if (result.action === 'submit' || result.action === 'cancel' || result.action === 'quit') atPicker = null;
       if (restoreDraft !== null) {
         // A queued submission just left through this Enter; what the person was typing comes back.
         if (result.action === 'submit') editor = createInlineEditorState(restoreDraft);
@@ -510,6 +717,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               await closeLocalChatSession(previous);
             }
             id = next.id;
+            lastResumeRows = null;
             session = loadSession(id);
             messages = [];
             expandedToolBlocks.clear();
@@ -556,14 +764,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         const resumeCommand = parseResumeCommand(submitted);
         if (resumeCommand?.kind === 'list') {
-          activity = resumeListLines(resumeCandidates(id), id).map(safeStatusText);
-          status = '/resume <id 앞자리> 로 이어 가기 · Enter 전송';
+          lastResumeRows = resumeCandidates(id);
+          activity = resumeListLines(lastResumeRows, id).map(safeStatusText);
+          status = '/resume <번호|id 앞자리> 로 이어 가기 · Enter 전송';
           debug.log('tui.next', 'session-resume-list', { from: id, rows: activity.length });
           render();
           continue;
         }
         if (resumeCommand?.kind === 'load') {
-          const next = requestResumeTuiSession({ busy, from: id, prefix: resumeCommand.prefix });
+          const next = requestResumeTuiSession({ busy, from: id, prefix: resumeCommand.prefix, rows: lastResumeRows ?? resumeCandidates(id) });
           if (next.kind === 'started') {
             loopCommand?.run('stop');
             const previous = id;
@@ -577,6 +786,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               await closeLocalChatSession(previous);
             }
             id = next.id;
+            lastResumeRows = null;
             session = loadSession(id);
             messages = session?.messages ?? [];
             expandedToolBlocks.clear();
@@ -664,6 +874,43 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
+        if (submitted === '/term' || submitted.startsWith('/term ') || submitted === '/terminal' || submitted.startsWith('/terminal ')) {
+          const { dispatchNextTermSlash } = await import('./slash/term-next.js');
+          const args = submitted.slice('/'.length).trim().split(/\s+/).slice(1);
+          const sessions = options.termSessions ?? {
+            list: async () => {
+              const { listPty } = await import('../pty-shell/registry.js');
+              return listPty().map((handle) => ({
+                id: handle.id,
+                title: handle.nickname ?? handle.cmd,
+                kind: handle.kind,
+                status: handle.isAlive() ? 'running' as const : 'exited' as const,
+                ...(handle.workdir === undefined ? {} : { cwd: handle.workdir }),
+                exitCode: handle.exitCode,
+              }));
+            },
+          };
+          await dispatchNextTermSlash(args, {
+            chatLines: activity,
+            setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
+            sessions,
+          });
+          status = 'Enter 전송';
+          render();
+          continue;
+        }
+        if (
+          submitted === '/mission' || submitted.startsWith('/mission ')
+          || submitted === '/signals' || submitted.startsWith('/signals ')
+        ) {
+          missionContext.chatLines = activity;
+          const [command = '', ...args] = submitted.slice('/'.length).trim().split(/\s+/);
+          const dispatched = await dispatchSlash(command, args, missionContext);
+          if (!dispatched) activity.push('알 수 없는 슬래시 명령');
+          status = 'Enter 전송';
+          render();
+          continue;
+        }
         // A person's turn: an internal turn opened but not yet run gives way, and the door's «last turn» moves.
         wakeup?.gate.port.declined?.('human-turn');
         wakeup?.gate.noteHumanTurn();
@@ -673,8 +920,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       render();
     }
   } finally {
+    restoreCliStderrSink?.();
+    restoreCliStderrSink = null;
     if (residueTimer !== null) clearTimeout(residueTimer);
     loopCommand?.dispose();
+    missionWatchesClosed = true;
+    for (const timer of missionWatchTimers) clearInterval(timer);
+    missionWatchTimers.clear();
+    readyWatchIds.clear();
+    runWatchIds.clear();
     wakeup?.dispose();
     if (wakeup) {
       const { setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');

@@ -33,6 +33,11 @@ import {
   activeDashboardTypeaheadSessionId,
   applyDashboardStreamingTypeaheadKey,
   subscribeDashboardAgentResults,
+  beginSynchronizedFrameOutput,
+  drawDashboardFrameSynchronized,
+  runSynchronizedFrameDraw,
+  SYNCHRONIZED_OUTPUT_BEGIN,
+  SYNCHRONIZED_OUTPUT_END,
   type LogZoneClickWidgetHost,
 } from './index.js';
 import { buildAdRunSetup } from '../ad-pipeline/ad-run-setup.js';
@@ -49,6 +54,10 @@ import { ptyAvailable, startPty, unregisterPty } from '../pty-shell/registry.js'
 import { AgentRegistry } from '../agent/registry.js';
 import { TaskNotificationQueue, renderTaskNotificationsXml } from '../agent/task-notification.js';
 import { wireTaskNotifications } from '../agent/task-notification.js';
+import {
+  isSynchronizedOutputRegionOpen,
+  openSynchronizedOutputRegion,
+} from '../display/synchronized-output-region.js';
 
 // 시험이 process.chdir 로 옮긴 cwd 를 시간 초과에도 되돌린다(비동기 본문의 finally 는 afterEach 보다 늦을 수 있다 · test-interference 래칫).
 const FILE_START_CWD = process.cwd();
@@ -179,7 +188,10 @@ test('isolated dashboard renders the 50,000-character child result only after qu
     return rows.slice(title + 1, end > title ? end : undefined);
   };
   try {
-    const deadline = Date.now() + 45_000;
+    // ⏱️ 예산 정합: 자식은 HOME 이 매번 새 tmpdir 이라 bun transpile 캐시($HOME/.bun)가 차가워
+    //    showDashboard 부팅이 느린 호스트에서 수십 초 걸린다 — 내부 마감은 반드시 시험 타임아웃보다
+    //    작아야 한다(이전: 마감 45s > 타임아웃 35s 라서 느린 자식은 단언 실패 대신 러너 타임아웃으로 죽었다).
+    const deadline = Date.now() + 100_000;
     while (!existsSync(readyPath) && Date.now() < deadline) await Bun.sleep(100);
     expect(existsSync(readyPath)).toBe(true);
     const beforeRows = chatLog(await handle.renderScreen());
@@ -217,7 +229,7 @@ test('isolated dashboard renders the 50,000-character child result only after qu
     rmSync(scriptPath, { force: true });
     rmSync(root, { recursive: true, force: true });
   }
-}, 35_000);
+}, 120_000);
 
 test('dashboard history reports preservation failures without a success path', () => {
   const root = mkdtempSync(join(tmpdir(), 'dashboard-agent-failure-'));
@@ -237,6 +249,100 @@ test('dashboard history reports preservation failures without a success path', (
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test.skipIf(!ptyAvailable())('production showDashboard opens one idle child-complete turn and refuses a second while busy', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-agent-wake-live-'));
+  const state = join(root, 'state');
+  const data = join(root, 'data');
+  const isolatedHome = join(root, 'home');
+  const seatCwd = join(root, 'repo', 'seats', 'OPC');
+  mkdirSync(state);
+  mkdirSync(seatCwd, { recursive: true });
+  mkdirSync(join(isolatedHome, 'elanous-hq', 'seat-state', 'OPC'), { recursive: true });
+  const firstRequest = join(root, 'first-request');
+  const busyQueued = join(root, 'busy-queued');
+  const releaseFirst = join(root, 'release-first');
+  const secondRequest = join(root, 'second-request');
+  const driver = join(root, 'driver.ts');
+  const requests: Array<{ messages?: Array<{ content?: unknown }> }> = [];
+  const server = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    async fetch(request) {
+      if (new URL(request.url).pathname === '/v1/models') return Response.json({ data: [{ id: 'wake-test' }] });
+      if (new URL(request.url).pathname !== '/v1/chat/completions') return new Response('not found', { status: 404 });
+      requests.push(await request.json() as { messages?: Array<{ content?: unknown }> });
+      const index = requests.length;
+      writeFileSync(index === 1 ? firstRequest : secondRequest, String(index));
+      if (index === 1) {
+        const deadline = Date.now() + 30_000;
+        while (!existsSync(releaseFirst) && Date.now() < deadline) await Bun.sleep(20);
+        if (!existsSync(releaseFirst)) return new Response('held request timed out', { status: 504 });
+      }
+      const body = `data: ${JSON.stringify({ choices: [{ delta: { content: `wake-response-${index}` }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`;
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  writeFileSync(join(state, 'config.json'), JSON.stringify({
+    onboarding: { completed: true },
+    llm: { provider: 'local', model: 'wake-test', baseUrl: `http://127.0.0.1:${server.port}/v1` },
+    skillRouter: { llmFallback: false }, mcp: { enabled: false },
+  }));
+  writeFileSync(driver, [
+    "import { existsSync, writeFileSync } from 'node:fs';",
+    `const firstRequest = ${JSON.stringify(firstRequest)};`,
+    `const busyQueued = ${JSON.stringify(busyQueued)};`,
+    `const firstFrame = ${JSON.stringify(join(root, 'first-frame'))};`,
+    `const bootError = ${JSON.stringify(join(root, 'boot-error'))};`,
+    `const { setElanousConfigDir } = await import(${JSON.stringify(join(import.meta.dir, '../elanous-config-dir.ts'))});`,
+    `setElanousConfigDir(${JSON.stringify(state)});`,
+    `const { showDashboard } = await import(${JSON.stringify(join(import.meta.dir, 'index.ts'))});`,
+    `const { globalTaskNotificationQueue } = await import(${JSON.stringify(join(import.meta.dir, '../agent/task-notification.ts'))});`,
+    "const enqueue = (taskId: string) => globalTaskNotificationQueue.enqueue({ taskId, agentName: 'wake-fixture', state: 'done', output: `result-${taskId}`, truncated: false, durationMs: 1, finishedAt: Date.now() });",
+    "process.on('uncaughtException', error => { writeFileSync(bootError, String(error)); process.exit(1); });",
+    "process.on('unhandledRejection', error => { writeFileSync(bootError, String(error)); process.exit(1); });",
+    "setTimeout(() => { writeFileSync(bootError, 'first-frame timeout'); process.exit(1); }, 105_000).unref();",
+    'void showDashboard({ onFirstFrameRendered: () => { writeFileSync(firstFrame, "ready"); } }).catch(error => { writeFileSync(bootError, String(error)); process.exit(1); });',
+    'while (!existsSync(firstFrame) && !existsSync(bootError)) await Bun.sleep(20);',
+    'await Bun.sleep(500); enqueue("idle-completion");',
+    'while (!existsSync(firstRequest)) await Bun.sleep(20);',
+    'enqueue("busy-completion"); writeFileSync(busyQueued, "queued");',
+    'await new Promise(() => {});',
+  ].join('\n'));
+  const env: Record<string, string> = { ...process.env as Record<string, string>, NODE_ENV: 'development',
+    ELANOUS_STATE_DIR: state, ELANOUS_STATE_DIR_SOURCE: 'explicit', ELANOUS_DATA_DIR: data,
+    ELANOUS_SKIP_LOGIN_ENV: '1', HOME: isolatedHome, TERM: 'xterm-256color', COLUMNS: '120', LINES: '30' };
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  const credentialEnv = /(_API_KEY|_TOKEN|_AUTH|_SECRET)$|^(ANTHROPIC|OPENAI|OPENROUTER|XAI|GROK|GEMINI|GOOGLE|CODEX|CLAUDE|AWS|BEDROCK|ELANOUS_CODEX)/i;
+  for (const key of Object.keys(env)) if (credentialEnv.test(key)) delete env[key];
+  const handle = startPty({ cmd: 'bun', args: [driver], workdir: seatCwd, cols: 120, rows: 30, env,
+    unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
+  const deadline = Date.now() + 100_000;
+  const waitFor = async (path: string, label: string) => {
+    while (!existsSync(path) && !existsSync(join(root, 'boot-error')) && Date.now() < deadline) await Bun.sleep(50);
+    if (existsSync(join(root, 'boot-error'))) throw new Error(`agent-wake live boot failed: ${readFileSync(join(root, 'boot-error'), 'utf8')}`);
+    if (!existsSync(path)) throw new Error(`agent-wake live timeout waiting for ${label}; requests=${requests.length}; screen=${(await handle.renderScreen()).slice(-900)}`);
+  };
+  try {
+    await waitFor(join(root, 'first-frame'), 'first frame');
+    expect(readFileSync(join(root, 'first-frame'), 'utf8')).toBe('ready');
+    const before = (await handle.renderScreen()).split('\n').filter(line => line.includes('ChatLog') || line.trim() === '❯').join('\n');
+    await waitFor(firstRequest, 'idle completion turn');
+    await waitFor(busyQueued, 'busy completion');
+    await Bun.sleep(300);
+    expect(requests).toHaveLength(1);
+    expect(JSON.stringify(requests[0]?.messages ?? [])).toContain('Question: [자동 재개] 위임 끝: wake-fixture');
+    const duringBusy = (await handle.renderScreen()).split('\n').filter(line => line.includes('위임 끝') || line.includes('자동 재개')).join('\n');
+    expect(duringBusy.match(/자동 재개/g)).toHaveLength(1);
+    writeFileSync(releaseFirst, 'release');
+    await waitFor(secondRequest, 'deferred completion turn');
+    await Bun.sleep(300);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1]?.messages ?? [])).toContain('Question: [자동 재개] 위임 끝: wake-fixture');
+    console.log(`AGENT_WAKE_LIVE before=${JSON.stringify(before)} busy=${JSON.stringify(duringBusy)} requests=${requests.length} idle=1 busy-refused=1 deferred=1`);
+  } finally {
+    handle.kill(); unregisterPty(handle.id); server.stop(true); rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
 
 test.skipIf(!ptyAvailable())('legacy production log-search modal: same PTY direct-write rows and caret before/after', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dashboard-legacy-modal-'));
@@ -293,7 +399,13 @@ test.skipIf(!ptyAvailable())('legacy production log-search modal: same PTY direc
     expect(beforeRows.slice(1, 3)).toEqual(afterRows.slice(1, 3));
     expect(rawAfter).toContain('\x1b[3;30H');
     expect(rawAfter).toContain('\x1b[4;30H');
-    expect(rawAfter).not.toContain('\n');
+    // 계약 = «모달 열기»가 행 3·4 를 직접 쓰기 한 벌로 그린다 — 첫 \x1b[3;30H 부터 첫 '\n'(전면 다시그리기) 전까지의
+    //    한 자루(stroke) 안에 \x1b[4;30H 가 이어져야 한다. 두 마커는 자식의 동기 write 한 번에 나가므로 이 단언은
+    //    기계 속도와 무관하게 결정론적이다. 모달이 뜬 «뒤»의 다음 그리기(rows.join('\n') 전면 다시그리기 — 느린
+    //    게이트 기계에서 drain 창 안으로 미끄러짐)는 stroke 바깥에 있어 이 계약과 무관하다.
+    const strokeEnd = modalWrite.indexOf('\n');
+    const modalStroke = strokeEnd === -1 ? modalWrite : modalWrite.slice(0, strokeEnd);
+    expect(modalStroke).toContain('\x1b[4;30H');
   } finally {
     handle.kill();
     unregisterPty(handle.id);
@@ -301,6 +413,79 @@ test.skipIf(!ptyAvailable())('legacy production log-search modal: same PTY direc
     rmSync(root, { recursive: true, force: true });
   }
 }, 100_000);
+
+test.skipIf(!ptyAvailable())('classic /mission dispatch records one private-safe usage event under default trail logging', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-legacy-mission-usage-'));
+  mkdirSync(join(root, 'state'), { recursive: true });
+  const slashSecret = 'SENSITIVE_SLASH_ARGUMENT_527';
+  const proseSecret = 'SENSITIVE_PROMPT_BODY_527';
+  const server = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    fetch(request) {
+      if (new URL(request.url).pathname === '/v1/models') return Response.json({ data: [{ id: 'test-model' }] });
+      if (new URL(request.url).pathname !== '/v1/chat/completions') return new Response('not found', { status: 404 });
+      return new Response(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: 'natural reply complete' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } },
+      );
+    },
+  });
+  writeFileSync(join(root, 'config.json'), JSON.stringify({
+    onboarding: { completed: true },
+    llm: { provider: 'local', model: 'test-model', baseUrl: `http://127.0.0.1:${server.port}/v1` },
+    skillRouter: { llmFallback: false },
+    mcp: { enabled: false },
+  }));
+  const env: Record<string, string> = { ...process.env as Record<string, string>, NODE_ENV: 'development', ELANOUS_STATE_DIR: join(root, 'state'), TERM: 'xterm-256color' };
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  const handle = startPty({ cmd: 'bun', args: ['bin/elanous.mjs', `--test=${root}`, '--legacy'], workdir: repoRoot,
+    cols: 120, rows: 30, env, unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
+  const deadline = Date.now() + 85_000;
+  const wait = async (predicate: () => Promise<boolean> | boolean) => {
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await Bun.sleep(100);
+    }
+    throw new Error(`legacy mission usage timeout: ${(await handle.renderScreen()).slice(-1000)}`);
+  };
+  try {
+    await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
+    handle.write(`/mission list ${slashSecret}\r`);
+    await wait(async () => (await handle.renderScreen()).includes(`/mission list ${slashSecret}  (`));
+    handle.write('/zz-usage-probe\r');
+    await wait(async () => (await handle.renderScreen()).includes('Unknown command: /zz-usage-probe'));
+    handle.write(`Please mention /mission in prose ${proseSecret}\r`);
+    await wait(async () => (await handle.renderScreen()).includes('natural reply complete'));
+
+    const dbPath = join(root, 'logs', 'logs.db');
+    await wait(() => existsSync(dbPath));
+    let events: Array<{ event: string; data: string | null; session_id: string | null }> = [];
+    await wait(() => {
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        events = db.query("select event, data, session_id from logs where category = 'tui.legacy-slash-use' order by id")
+          .all() as typeof events;
+      } finally { db.close(); }
+      return events.length >= 1;
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.event).toBe('mission');
+    const payload = JSON.parse(events[0]!.data ?? 'null') as Record<string, unknown>;
+    expect(payload.surface).toBe('classic');
+    expect(payload.tuiSession).toBeNull();
+    expect(typeof payload.tuiPid).toBe('number');
+    expect(Object.keys(payload).sort()).toEqual(['surface', 'tuiPid', 'tuiSession']);
+    expect(events[0]!.session_id).toBeNull();
+    expect(JSON.stringify(events)).not.toContain(slashSecret);
+    expect(JSON.stringify(events)).not.toContain(proseSecret);
+    handle.write('/quit\r');
+  } finally {
+    handle.kill();
+    unregisterPty(handle.id);
+    server.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 95_000);
 
 test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique word once into local model requests', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dashboard-dedup-live-'));
@@ -310,7 +495,7 @@ test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique wo
   writeFileSync(readTarget, 'safe read target\n');
   const word = 'unique-dashboard-live-dedup';
   const requests: Array<{ messages?: Array<{ content?: unknown }> }> = [];
-  let reply: (() => void) | undefined;
+  const sseHeaders = { 'content-type': 'text/event-stream' } as const;
   const server = Bun.serve({
     hostname: '127.0.0.1', port: 0,
     async fetch(request) {
@@ -318,15 +503,30 @@ test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique wo
       if (new URL(request.url).pathname !== '/v1/chat/completions') return new Response('not found', { status: 404 });
       const body = await request.json() as { messages?: Array<{ content?: unknown }> };
       requests.push(body);
-      if (requests.length === 1) await new Promise<void>(resolve => { reply = resolve; });
-      const first = requests.length === 1;
-      const delta = first
-        ? { tool_calls: [{ index: 0, id: 'call-dedup-read', type: 'function',
-          function: { name: 'Read', arguments: JSON.stringify({ file_path: readTarget }) } }] }
-        : { content: 'second done' };
-      const finish = first ? 'tool_calls' : 'stop';
-      return new Response(`data: ${JSON.stringify({ choices: [{ delta, finish_reason: finish }] })}\n\ndata: [DONE]\n\n`,
-        { headers: { 'content-type': 'text/event-stream' } });
+      if (requests.length !== 1) {
+        return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content: 'second done' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`,
+          { headers: sseHeaders });
+      }
+      // 첫 응답은 스트림을 바로 열고 청크 사이에 지연을 둔다 — 무응답 게이트로 붙잡아 두면
+      // 부하 시 클라이언트의 응답 대기 한도가 먼저 터져 루프가 drain 전에 끝난다(제출 경로로 새는 플레이크).
+      // 바이트가 흐르는 동안에는 그 한도가 작동하지 않아 drain 펌프가 결정론적 창을 갖는다.
+      const encoder = new TextEncoder();
+      const toolCall = { tool_calls: [{ index: 0, id: 'call-dedup-read', type: 'function',
+        function: { name: 'Read', arguments: JSON.stringify({ file_path: readTarget }) } }] };
+      return new Response(new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const send = (chunk: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+          await new Promise(resolve => setTimeout(resolve, 300));
+          send({ choices: [{ delta: toolCall, finish_reason: null }] });
+          for (let beat = 0; beat < 12; beat += 1) {
+            await new Promise(resolve => setTimeout(resolve, 150));
+            send({ choices: [{ delta: {}, finish_reason: null }] });
+          }
+          send({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      }), { headers: sseHeaders });
     },
   });
   writeFileSync(join(root, 'config.json'), JSON.stringify({
@@ -338,7 +538,8 @@ test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique wo
   const handle = startPty({ cmd: 'bun', args: ['bin/elanous.mjs', `--test=${root}`, '--chat-only'], workdir: repoRoot,
     cols: 120, rows: 30, env, unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
   try {
-    const deadline = Date.now() + 50_000;
+    // ⏱️ 예산 정합: 콜드 부팅이 느린 호스트에서 CLI 가 프롬프트까지 50s 를 넘긴다 — 마감 < 타임아웃, 부팅 실측 여유 포함.
+    const deadline = Date.now() + 120_000;
     const wait = async (predicate: () => Promise<boolean> | boolean) => {
       while (Date.now() < deadline) {
         if (await predicate()) return;
@@ -348,13 +549,12 @@ test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique wo
     };
     await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
     handle.write('first prompt\r');
-    await wait(() => requests.length === 1 && !!reply);
+    await wait(() => requests.length === 1);
     handle.write(`${word}\r`);
     await wait(async () => {
       const screen = await handle.renderScreen();
       return screen.split('\n').some(line => line.includes(word) && line.includes('다음 도구 경계에 넣음'));
     });
-    reply?.();
     await wait(() => requests.length >= 2);
     await Bun.sleep(400);
     expect(requests).toHaveLength(2);
@@ -378,13 +578,12 @@ test.skipIf(!ptyAvailable())('real dashboard streaming Enter injects a unique wo
       console.log(`DEDUP live-dashboard: id=${id} drained-mid-turn=${drained} submitted-as-prompt=${submitted} model-request-occurrences=${count}`);
     } finally { db.close(); }
   } finally {
-    reply?.();
     handle.kill();
     unregisterPty(handle.id);
     server.stop(true);
     rmSync(root, { recursive: true, force: true });
   }
-}, 60_000);
+}, 150_000);
 
 test('dashboard streaming Enter reaches the real LLM mid-turn boundary exactly once', async () => {
   const sid = 'dashboard-real-llm-dedup';
@@ -1965,4 +2164,150 @@ describe('TUI-BOOT-TIMING-HOLES — show-dashboard 동기 셋업 계측', () => 
       rmSync(root, { recursive: true, force: true });
     }
   }, 180_000);
+});
+
+describe('TUI-FLICKER-DRAW-INTEGRATION — synchronized frame output seam', () => {
+  type FrameSink = { readonly chunks: string[]; write: (chunk: string) => void };
+
+  function createFrameSink(): FrameSink {
+    const chunks: string[] = [];
+    return {
+      get chunks() { return chunks; },
+      write: (chunk: string) => { chunks.push(chunk); },
+    };
+  }
+
+  // Drives the same production wrapper (drawDashboardFrameSynchronized) that
+  // showDashboard's drawNow calls for both the force path and the queued path:
+  // the body writes the three things the real draw writes between the markers —
+  // base frame, coordinator modal overlay, prompt repaint.
+  function drawFrameThroughSeam(sink: FrameSink, force: boolean): void {
+    drawDashboardFrameSynchronized(() => {
+      sink.write(`FRAME-BODY:force=${force}`);
+      sink.write('COORDINATOR-MODAL-OVERLAY');
+      sink.write('PROMPT-REPAINT');
+    }, { write: sink.write, isTTY: true, env: {} });
+  }
+
+  test('일반·force draw 모두 프레임·overlay·프롬프트를 한 BSU/ESU 안에 출력한다', () => {
+    for (const force of [false, true]) {
+      const sink = createFrameSink();
+      drawFrameThroughSeam(sink, force);
+
+      expect(sink.chunks[0]).toBe(SYNCHRONIZED_OUTPUT_BEGIN);
+      expect(sink.chunks[sink.chunks.length - 1]).toBe(SYNCHRONIZED_OUTPUT_END);
+      expect(sink.chunks.filter((chunk) => chunk === SYNCHRONIZED_OUTPUT_BEGIN)).toHaveLength(1);
+      expect(sink.chunks.filter((chunk) => chunk === SYNCHRONIZED_OUTPUT_END)).toHaveLength(1);
+
+      const body = sink.chunks.slice(1, -1).join('');
+      expect(body).toContain(`FRAME-BODY:force=${force}`);
+      expect(body).toContain('COORDINATOR-MODAL-OVERLAY');
+      expect(body).toContain('PROMPT-REPAINT');
+    }
+  });
+
+  test('draw 중 예외에도 ESU 가 닫혀 다음 프레임이 살아 있다', () => {
+    const sink = createFrameSink();
+    expect(() => {
+      runSynchronizedFrameDraw(() => {
+        sink.write('FRAME-BODY');
+        throw new Error('draw blew up mid-frame');
+      }, { write: sink.write, env: {} });
+    }).toThrow('draw blew up mid-frame');
+
+    expect(sink.chunks).toEqual([
+      SYNCHRONIZED_OUTPUT_BEGIN,
+      'FRAME-BODY',
+      SYNCHRONIZED_OUTPUT_END,
+    ]);
+
+    drawFrameThroughSeam(sink, true);
+    expect(sink.chunks.slice(3)).toEqual([
+      SYNCHRONIZED_OUTPUT_BEGIN,
+      'FRAME-BODY:force=true',
+      'COORDINATOR-MODAL-OVERLAY',
+      'PROMPT-REPAINT',
+      SYNCHRONIZED_OUTPUT_END,
+    ]);
+  });
+
+  test('생산 drawNow 래퍼는 tty sink 만 BSU/ESU 로 감싸고 파이프 출력은 바이트를 그대로 둔다', () => {
+    const ttySink = createFrameSink();
+    drawDashboardFrameSynchronized(() => {
+      ttySink.write('FRAME-BODY');
+      ttySink.write('PROMPT-REPAINT');
+    }, { write: ttySink.write, isTTY: true, env: {} });
+
+    expect(ttySink.chunks).toEqual([
+      SYNCHRONIZED_OUTPUT_BEGIN,
+      'FRAME-BODY',
+      'PROMPT-REPAINT',
+      SYNCHRONIZED_OUTPUT_END,
+    ]);
+
+    const pipeSink = createFrameSink();
+    drawDashboardFrameSynchronized(() => {
+      pipeSink.write('FRAME-BODY');
+      pipeSink.write('PROMPT-REPAINT');
+    }, { write: pipeSink.write, isTTY: false, env: {} });
+
+    expect(pipeSink.chunks).toEqual(['FRAME-BODY', 'PROMPT-REPAINT']);
+  });
+
+  test('close 는 멱등이라 중복 finally 가 stray ESU 를 내지 않는다', () => {
+    const sink = createFrameSink();
+    const frame = beginSynchronizedFrameOutput({ write: sink.write, env: {} });
+    frame.close();
+    frame.close();
+
+    expect(sink.chunks).toEqual([SYNCHRONIZED_OUTPUT_BEGIN, SYNCHRONIZED_OUTPUT_END]);
+  });
+
+  test('synchronized output 을 지원하지 않는 sink 는 바이트 그대로 둔다', () => {
+    const sink = createFrameSink();
+    const frame = beginSynchronizedFrameOutput({
+      write: sink.write,
+      supported: false,
+      env: {},
+    });
+    sink.write('FRAME-BODY');
+    frame.close();
+
+    expect(sink.chunks).toEqual(['FRAME-BODY']);
+  });
+
+  test('ELANOUS_SYNC_OUTPUT=off 는 래퍼를 끄고 출력 바이트를 그대로 둔다', () => {
+    const sink = createFrameSink();
+    const frame = beginSynchronizedFrameOutput({
+      write: sink.write,
+      env: { ELANOUS_SYNC_OUTPUT: 'off' },
+    });
+    sink.write('FRAME-BODY');
+    frame.close();
+
+    expect(sink.chunks).toEqual(['FRAME-BODY']);
+  });
+
+  test('coordinator 가 연 region 안에서는 프레임 seam 이 BSU/ESU 를 겹쳐 내지 않는다', () => {
+    const sink = createFrameSink();
+    const coordinatorRegion = openSynchronizedOutputRegion();
+    sink.write(SYNCHRONIZED_OUTPUT_BEGIN);
+
+    drawDashboardFrameSynchronized(() => {
+      sink.write('FRAME-BODY');
+      sink.write('PROMPT-REPAINT');
+    }, { write: sink.write, isTTY: true, env: {} });
+
+    expect(isSynchronizedOutputRegionOpen()).toBe(true);
+    sink.write(SYNCHRONIZED_OUTPUT_END);
+    coordinatorRegion.close();
+    expect(isSynchronizedOutputRegionOpen()).toBe(false);
+
+    expect(sink.chunks).toEqual([
+      SYNCHRONIZED_OUTPUT_BEGIN,
+      'FRAME-BODY',
+      'PROMPT-REPAINT',
+      SYNCHRONIZED_OUTPUT_END,
+    ]);
+  });
 });

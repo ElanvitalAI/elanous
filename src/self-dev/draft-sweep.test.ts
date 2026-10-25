@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
-import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, shouldHoldSeatNewLaunch, DRAFT_SWEEP_CLOSE_CAP, DRAFT_SWEEP_CONCURRENCY, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, newerSameCellDraft, runDraftSweep, supersedeDraftsOnMerge, sweptReasonLabel, sweepFailureReason, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
+import { DRAFT_NEEDS_OWNER_SEAT_CAP, isSeatDraftNeedsOwnerOverCap, shouldHoldSeatNewLaunch, DRAFT_SWEEP_CLOSE_CAP, DRAFT_SWEEP_CONCURRENCY, resolveDraftSweepCloseCap, collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type OverlapMetricAdapters, type OverlapPreflightRow, draftSweepDaily, newerLineageDraft, newerSameCellDraft, runDraftSweep, supersedeDraftsOnMerge, sweptReasonLabel, sweepFailureReason, validateDraftSweepApplyPlan, type DraftSweepAdapters, type DraftSweepApplyPlan, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from './draft-sweep.js';
 import { branchLineageKey } from '../harness/worktree-branch-prefix.js';
 import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { debug } from '../debug/log.js';
@@ -45,6 +45,97 @@ const make = (drafts: SweepDraft[], merged: SweepMergedPr[] = []) => {
   return { calls, sweptLabels, statuses, adapters, setLive: (value: ReadonlySet<string> | undefined) => { live = value; } };
 };
 const sweep = (adapters: DraftSweepAdapters, apply = false) => runDraftSweep({ repository: 'owner/repo', adapters, apply, now });
+
+describe('runDraftSweep — frozen apply plan', () => {
+  const plan: DraftSweepApplyPlan = { version: 1, closeCap: 1, closeCapSource: 'flag', entries: [
+    { number: 1, action: 'close', reason: 'superseded-by #3', statusLabel: superseded, applied: false,
+      headSha: 'a'.repeat(40), branch: 'self-impl/goalid-1-run', updatedAt: '2026-10-24T00:00:00Z', labels: [running] },
+    { number: 2, action: 'keep', reason: 'close-cap', applied: false,
+      headSha: 'b'.repeat(40), branch: 'self-impl/goalid-2-run', updatedAt: '2026-10-24T00:00:00Z', labels: [running] },
+  ] };
+  const fixture = (updatedAt = '2026-10-24T00:00:00Z') => {
+    const writes: string[] = [];
+    let snapshots = 0;
+    const adapters: DraftSweepAdapters = {
+      listDrafts: async () => { throw new Error('apply plan must not relist drafts'); },
+      listMerged: async () => { throw new Error('apply plan must not relist merged PRs'); },
+      getRunStatus: async () => { throw new Error('apply plan must not reclassify runs'); },
+      listLiveBranches: async () => { throw new Error('apply plan must not inspect worktrees'); },
+      getDraftSnapshot: async (_repo, number) => {
+        snapshots++;
+        return { number, state: 'open', draft: true, headSha: 'a'.repeat(40), branch: 'self-impl/goalid-1-run', updatedAt,
+          labels: [running] };
+      },
+      setLabels: async (_repo, number, change) => { writes.push(`label:${number}:${change.add}`); },
+      closeDraft: async (_repo, number) => { writes.push(`close:${number}`); },
+    };
+    return { adapters, writes, snapshotCount: () => snapshots };
+  };
+
+  it('emits a frozen plan only from a complete dry-run classification', async () => {
+    const f = make([draft(77, { headSha: 'd'.repeat(40) })]);
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: f.adapters, includeApplyPlan: true, now });
+    expect(result.complete).toBe(true);
+    expect(result.applyPlan?.entries).toHaveLength(result.entries.length);
+    expect(result.applyPlan?.entries[0]).toMatchObject({ number: 77, headSha: 'd'.repeat(40),
+      updatedAt: '2026-09-28T00:00:00Z', labels: [running] });
+  });
+
+  it('applies only the classified close set after inventory insertion/reordering, without reclassification', async () => {
+    const f = fixture();
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: f.adapters, apply: true, applyPlan: plan });
+    expect(result.complete).toBe(true);
+    expect(f.snapshotCount()).toBe(1);
+    expect(f.writes.filter((write) => write.startsWith('close:'))).toEqual(['close:1']);
+    expect(f.writes.some((write) => write.includes(':2:') || write === 'close:2')).toBe(false);
+  });
+
+  it('fails closed on PR snapshot drift before any label or close write', async () => {
+    const f = fixture('2026-10-24T00:01:00Z');
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: f.adapters, apply: true, applyPlan: plan });
+    expect(result.complete).toBe(false);
+    expect(result.error).toContain('snapshot drift at #1');
+    expect(f.writes).toEqual([]);
+  });
+
+  it('does not report a preflight-only successor as applied', async () => {
+    const livePlan: DraftSweepApplyPlan = { version: 1, closeCap: 1, closeCapSource: 'flag', entries: [
+      { number: 1, action: 'close', reason: 'duplicate-of-open #2 · stop run run-1', statusLabel: superseded,
+        runId: 'run-1', stopRunRequired: true, supersedeNewer: { number: 2, branch: 'self-impl/goalid-2-run', runId: 'run-2' },
+        applied: false, headSha: 'a'.repeat(40), branch: 'self-impl/goalid-1-run', updatedAt: '2026-10-24T00:00:00Z', labels: [running] },
+      { number: 2, action: 'keep', reason: 'live', applied: false, runId: 'run-2',
+        headSha: 'b'.repeat(40), branch: 'self-impl/goalid-2-run', updatedAt: '2026-10-24T00:00:00Z', labels: [running] },
+    ] };
+    const writes: string[] = [];
+    const adapters: DraftSweepAdapters = {
+      listDrafts: async () => { throw new Error('apply plan must not relist drafts'); },
+      listMerged: async () => { throw new Error('apply plan must not relist merged PRs'); },
+      getRunStatus: async () => 'running',
+      listLiveBranches: async () => new Set(['self-impl/goalid-1-run', 'self-impl/goalid-2-run']),
+      getDraftSnapshot: async (_repo, number) => ({ number, state: 'open', draft: true,
+        headSha: number === 1 ? 'a'.repeat(40) : 'b'.repeat(40), branch: `self-impl/goalid-${number}-run`,
+        updatedAt: '2026-10-24T00:00:00Z', labels: [running] }),
+      supersedeRun: async () => { writes.push('stop'); },
+      setLabels: async (_repo, number, change) => { writes.push(`label:${number}:${change.add}`); },
+      closeDraft: async (_repo, number) => { writes.push(`close:${number}`); },
+    };
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters, apply: true, applyPlan: livePlan });
+    expect(result.complete).toBe(true);
+    expect(result.entries).toMatchObject([{ number: 1, applied: true }, { number: 2, applied: false }]);
+    expect(writes).toContain('stop');
+  });
+
+  it('rejects a serialized plan that attempts to write a non-state label', () => {
+    const malformed = { ...plan, entries: plan.entries.map((entry, index) => index === 0 ? { ...entry, statusLabel: 'arbitrary-label' } : entry) };
+    expect(() => validateDraftSweepApplyPlan(malformed)).toThrow('invalid draft sweep apply plan entry');
+    const cellDuplicate = { ...plan, entries: plan.entries.map((entry, index) => index === 0
+      ? { ...entry, reason: 'duplicate-of-open #3 (cell CELL-A0)' } : entry) };
+    expect(validateDraftSweepApplyPlan(cellDuplicate).entries[0]?.reason).toBe('duplicate-of-open #3 (cell CELL-A0)');
+    const unknownReason = { ...plan, entries: plan.entries.map((entry, index) => index === 0
+      ? { ...entry, reason: 'unrecognized close reason' } : entry) };
+    expect(() => validateDraftSweepApplyPlan(unknownReason)).toThrow('invalid draft sweep apply plan entry');
+  });
+});
 
 describe('supersedeDraftsOnMerge', () => {
   const merged = { number: 90, title: '「하니스로 구현」 DRAFT-TRIAGE', branch: 'self-impl/draft-triage-goalid-1-new',
@@ -349,6 +440,44 @@ describe('seat needsOwner cap', () => {
 });
 
 describe('draft metrics', () => {
+  it('folds duplicate draft pages to the latest update and closed rows to the merged snapshot once', async () => {
+    const older = draft(7, { createdAt: '2026-09-27T00:00:00Z', updatedAt: '2026-09-27T01:00:00Z', labels: ['elanous:seat-TC'] });
+    const newer = { ...older, createdAt: '2026-09-28T00:00:00Z', updatedAt: '2026-09-29T23:00:00Z', labels: ['elanous:seat-OP'] };
+    const unmerged: SweepMergedPr = { number: 8, title: 'closed', branch: 'self-impl/eight', labels: [], createdAt: '2026-09-27T00:00:00Z' };
+    const merged = { ...unmerged, mergedAt: '2026-09-28T00:00:00Z' };
+    const filler = Array.from({ length: 99 }, (_, i) => draft(100 + i, { branch: 'human/other', labels: [] }));
+    const fixture = make([]);
+    fixture.adapters.getActiveClaimOwner = async () => undefined;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      for (const [first, second, closed] of [[older, newer, [unmerged, merged]], [newer, older, [merged, unmerged]]] as const) {
+        fixture.adapters.listDrafts = async (page) => page === 1 ? [first, ...filler] : page === 2 ? [second] : [];
+        fixture.adapters.listRecentClosed = async () => closed;
+        expect(await collectDraftMetrics('owner/repo', fixture.adapters, now)).toMatchObject({
+          inventory: 1, oldestAgeHours: 48, needsOwner: 1, needsOwnerBySeat: { OP: 1 },
+          cohort48h: 2, converted48h: 1, conversion48h: 0.5,
+        });
+      }
+      expect(log.mock.calls.filter(([category, event]) => category === 'drafts.metrics' && event === 'duplicate-pr-folded')
+        .map(([, , data]) => data)).toEqual([
+          { repository: 'owner/repo', drafts: 1, closed: 1, folded: 2 },
+          { repository: 'owner/repo', drafts: 1, closed: 1, folded: 2 },
+        ]);
+      const tied = { ...newer, labels: ['elanous:seat-TC'] };
+      for (const rows of [[newer, tied], [tied, newer]]) {
+        fixture.adapters.listDrafts = async () => rows;
+        fixture.adapters.listRecentClosed = async () => [];
+        expect((await collectDraftMetrics('owner/repo', fixture.adapters, now)).needsOwnerBySeat).toEqual({ TC: 1 });
+      }
+      fixture.adapters.listDrafts = async () => [older, newer];
+      fixture.adapters.listRecentClosed = async () => [{ ...merged, number: 7 }];
+      expect(collectDraftMetrics('owner/repo', fixture.adapters, now)).rejects.toThrow('Overlapping draft metric inventory');
+      fixture.adapters.listDrafts = async () => [older, { ...newer, labels: [42 as unknown as string] }];
+      fixture.adapters.listRecentClosed = async () => [merged];
+      expect(collectDraftMetrics('owner/repo', fixture.adapters, now)).rejects.toThrow('Incomplete draft metric inventory');
+    } finally { log.mockRestore(); }
+  });
+
   it('counts open inventory, oldest age and missing claim owner; converts only merged PRs within 48h of creation', async () => {
     const rows = [draft(1, { createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T23:00:00Z' }),
       draft(2, { createdAt: '2026-09-26T00:00:00Z' }),
@@ -857,6 +986,150 @@ describe('overlap metrics — DRAFT-NOT-ARCHIVE salvage siblings', () => {
 });
 
 describe('runDraftSweep', () => {
+  it('reports three evidence-backed actions from an isolated fake gh inventory as JSON rows and action counts', async () => {
+    const body = '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12';
+    const rows = [
+      draft(801, { labels: ['elanous:from-ux', 'elanous:harvestable'], body, latestCommitAt: '2026-09-28T00:00:00Z' }),
+      draft(802, { labels: ['elanous:from-ux'], body, latestCommitAt: '2026-09-28T00:00:00Z' }),
+      draft(803, { labels: [], body: '', latestCommitAt: undefined }),
+    ];
+    const fakeGh = make(rows, [{ number: 900, title: 'replacement', branch: 'replacement/900',
+      body: `${body}\nSupersedes: #802`, mergedAt: '2026-09-29T00:00:00Z' }]);
+    fakeGh.statuses.set(801, 'completed');
+    fakeGh.statuses.set(802, 'completed');
+    fakeGh.adapters.getReviewGate = async (pr) => pr.number === 801
+      ? { gate: 'pass', review: 'pass', triageReview: 'approved' } : undefined;
+    fakeGh.adapters.listPrTerminals = async () => [{ childRunId: 'run-802', prNumber: 802,
+      prUrl: null, repository: 'owner/repo', headSha: null, terminalClass: 'failed-with-pr',
+      stage: 'review-blocked', owner: 'UX', ownerSource: 'seat', card: 'DRAFT-TRIAGE-ANYTIME',
+      at: '2026-09-29T12:00:00Z', hostRegateFailure: null },
+    { childRunId: 'run-802-later', prNumber: 802, prUrl: null, repository: 'owner/repo', headSha: null,
+      terminalClass: 'merge-ready-not-merged', stage: 'gate-passed', owner: 'UX', ownerSource: 'seat',
+      card: 'DRAFT-TRIAGE-ANYTIME', at: '2026-09-29T13:00:00Z', hostRegateFailure: null }];
+    const json = JSON.parse(JSON.stringify(await runDraftSweep({ repository: 'owner/repo', adapters: fakeGh.adapters,
+      now, includeTriage: true, apply: false })));
+    expect(json.complete).toBe(true);
+    expect(json.triage.counts).toEqual({ harvest: 1, 'close-b': 1, human: 1 });
+    const [harvest, close, unknown] = json.triage.entries.map((entry: { assessment: unknown }) => entry.assessment);
+    expect(harvest).toMatchObject({ origin: 'elanous:from-ux', cellId: 'DRAFT-TRIAGE-ANYTIME',
+      gate: 'pass', review: 'approved', nextAction: 'harvest' });
+    expect(harvest.evidence).toEqual(expect.arrayContaining([expect.stringContaining('gate=pass'), expect.stringContaining('latest exact-head review=approved')]));
+    expect(close).toMatchObject({ nextAction: 'close-b', lastFailureTail: 'review-blocked',
+      checks: { 'replacement-landed': { state: 'yes' } } });
+    expect(close.evidence).toEqual(expect.arrayContaining([expect.stringContaining('Supersedes: #802'), 'last failure: review-blocked']));
+    expect(close.evidence).not.toContain('last failure: gate-passed');
+    expect(harvest.lastFailureTail).toBeNull();
+    expect(unknown).toMatchObject({ origin: null, cellStatus: 'unknown', nextAction: 'human' });
+    expect(unknown.missingEvidence).toContain('provenance');
+    expect(fakeGh.calls.filter((call) => /^(close|label):/.test(call))).toEqual([]);
+  });
+  it('keeps the release-path hold across three draft JSON rows, later nonfailure terminal and apply writes', async () => {
+    const body = '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12';
+    const rows = [
+      draft(801, { labels: ['elanous:from-ux', 'elanous:harvestable'], body,
+        updatedAt: '2026-09-29T23:00:00Z', latestCommitAt: '2026-09-28T00:00:00Z' }),
+      draft(802, { labels: ['elanous:from-ux', RELEASE_PATH_LABEL], body,
+        latestCommitAt: '2026-09-28T00:00:00Z' }),
+      draft(803, { labels: [keep], body: '', latestCommitAt: undefined }),
+    ];
+    const fakeGh = make(rows, [{ number: 900, title: 'replacement', branch: 'replacement/900',
+      body: `${body}\nSupersedes: #802`, mergedAt: '2026-09-29T00:00:00Z' }]);
+    fakeGh.statuses.set(801, 'completed');
+    fakeGh.statuses.set(802, 'completed');
+    fakeGh.adapters.listTaskCards = async () => [{ id: 'ta-20261021-abcd12', text: 'draft', seat: 'UX',
+      status: 'launched', completion: 'code-pr', createdAt: now.toISOString(), history: [],
+      runId: 'run-protected', pr: { number: 802 } }];
+    fakeGh.adapters.commentDraft = async (_repo, number) => { fakeGh.calls.push(`comment:${number}`); };
+    fakeGh.adapters.getActiveClaimOwner = async () => undefined;
+    fakeGh.adapters.getActiveClaimRunId = async () => undefined;
+    fakeGh.adapters.getLastClaimReleaseAt = async () => undefined;
+    fakeGh.adapters.getReviewGate = async (pr) => pr.number === 801
+      ? { gate: 'pass', review: 'pass', triageReview: 'approved' } : undefined;
+    fakeGh.adapters.listPrTerminals = async () => [
+      { childRunId: 'run-802', prNumber: 802, prUrl: null, repository: 'owner/repo', headSha: null,
+        terminalClass: 'failed-with-pr', stage: 'review-blocked', owner: 'UX', ownerSource: 'seat',
+        card: 'DRAFT-TRIAGE-ANYTIME', at: '2026-09-29T12:00:00Z', hostRegateFailure: null },
+      { childRunId: 'run-802-later', prNumber: 802, prUrl: null, repository: 'owner/repo', headSha: null,
+        terminalClass: 'merge-ready-not-merged', stage: 'gate-passed', owner: 'UX', ownerSource: 'seat',
+        card: 'DRAFT-TRIAGE-ANYTIME', at: '2026-09-29T13:00:00Z', hostRegateFailure: null },
+    ];
+    const json = JSON.parse(JSON.stringify(await runDraftSweep({ repository: 'owner/repo', adapters: fakeGh.adapters,
+      now, includeTriage: true, apply: true })));
+    const rowsJson = json.triage.entries.map(({ number, assessment }: { number: number; assessment: {
+      origin: string | null; lastFailureTail: string | null; cellStatus: string;
+      nextAction: string; missingEvidence: string[];
+    } }) => ({ number, origin: assessment.origin, lastFailureTail: assessment.lastFailureTail,
+      cellStatus: assessment.cellStatus, nextAction: assessment.nextAction, missingEvidence: assessment.missingEvidence }));
+    expect(rowsJson).toEqual([
+      { number: 801, origin: 'elanous:from-ux', lastFailureTail: null, cellStatus: 'unknown',
+        nextAction: 'harvest', missingEvidence: ['cell-complete', 'cell-status-repository-bound', 'replacement-landed'] },
+      { number: 802, origin: 'elanous:from-ux', lastFailureTail: 'review-blocked', cellStatus: 'unknown',
+        nextAction: 'human', missingEvidence: ['gate', 'review', 'cell-complete', 'cell-status-repository-bound'] },
+      { number: 803, origin: null, lastFailureTail: null, cellStatus: 'unknown',
+        nextAction: 'human', missingEvidence: ['provenance', 'gate', 'review', 'cell-complete', 'cell-status-repository-bound', 'replacement-landed', 'newer-same-card', 'idle-48h', 'recent-commit', 'running'] },
+    ]);
+    expect(json.triage.entries[1].assessment.evidence).toContain('last failure: review-blocked');
+    expect(json.triage.entries[1].assessment.checks['replacement-landed'].state).toBe('yes');
+    expect(json.triage.entries[1].assessment.checks.protected).toEqual({ state: 'yes', evidence: `보호 표지=${RELEASE_PATH_LABEL}` });
+    expect(json.triage.counts).toEqual({ harvest: 1, human: 2 });
+    expect(fakeGh.calls.filter((call) => /^(close|label):/.test(call))).toEqual([`label:801:=>${stalled}`]);
+    expect(fakeGh.calls.filter((call) => call.startsWith('close:') || call.startsWith('comment:'))).toEqual([]);
+    expect(json.entries.find((entry: { number: number }) => entry.number === 802)).toMatchObject({
+      action: 'keep', reason: `label:${RELEASE_PATH_LABEL}`, applied: false,
+    });
+  });
+
+  it('uses the most recent failure for the exact PR, ignoring newer nonfailure and unrelated PR records', async () => {
+    const row = draft(804, { labels: ['elanous:from-ux'], body: '칸: DRAFT-TRIAGE-ANYTIME\n카드: ta-20261021-abcd12' });
+    const fixture = make([row]);
+    const terminal = (prNumber: number, terminalClass: PrTerminalRecord['terminalClass'], stage: string, at: string): PrTerminalRecord => ({
+      childRunId: `run-${prNumber}-${stage}`, prNumber, prUrl: null, repository: 'owner/repo', headSha: null,
+      terminalClass, stage, at, owner: 'UX', ownerSource: 'seat', card: null, hostRegateFailure: null,
+    });
+    fixture.adapters.listPrTerminals = async () => [
+      terminal(804, 'failed-with-pr', 'older-failure', '2026-09-28T09:00:00Z'),
+      terminal(804, 'failed-with-pr', 'latest-failure', '2026-09-29T09:00:00Z'),
+      terminal(805, 'failed-with-pr', 'other-pr-failure', '2026-09-29T11:00:00Z'),
+      terminal(804, 'landed', 'later-success', '2026-09-29T12:00:00Z'),
+    ];
+    const assessment = (await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now,
+      includeTriage: true })).triage?.entries[0]?.assessment;
+    expect(assessment?.lastFailureTail).toBe('latest-failure');
+    expect(assessment?.evidence).toContain('last failure: latest-failure');
+    fixture.adapters.listPrTerminals = async () => [
+      { ...terminal(804, 'failed-with-pr', 'regate', '2026-09-29T10:00:00Z'),
+        hostRegateFailure: { step: 'typecheck', detail: 'typecheck failed', os: 'linux' } },
+      terminal(804, 'merge-ready-not-merged', 'only-success', '2026-09-29T12:00:00Z'),
+    ];
+    const regate = (await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now,
+      includeTriage: true })).triage?.entries[0]?.assessment;
+    expect(regate?.lastFailureTail).toBe('typecheck failed');
+    fixture.adapters.listPrTerminals = async () => [terminal(804, 'merge-ready-not-merged', 'only-success', '2026-09-29T12:00:00Z')];
+    const noFailure = (await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, now,
+      includeTriage: true })).triage?.entries[0]?.assessment;
+    expect(noFailure?.lastFailureTail).toBeNull();
+    expect(noFailure?.evidence.some((item) => item.startsWith('last failure:'))).toBe(false);
+  });
+
+  it('returns partial dry-run decisions with an explicit inventory-cap reason and never applies a capped inventory', async () => {
+    const fixture = make([draft(590), draft(591)]);
+    const boundedAdapters = fixture.adapters as DraftSweepAdapters & {
+      inventoryStatus: () => Promise<{ complete: boolean; reason?: string }>;
+    };
+    boundedAdapters.inventoryStatus = async () => ({ complete: false, reason: 'draft inventory capped at 1 page' });
+
+    const preview = await runDraftSweep({ repository: 'owner/repo', adapters: boundedAdapters, now });
+    expect(preview.complete).toBe(false);
+    expect(preview.error).toBe('draft inventory capped at 1 page');
+    expect(preview.entries.map((entry) => entry.number)).toEqual([590, 591]);
+
+    fixture.calls.length = 0;
+    const applied = await runDraftSweep({ repository: 'owner/repo', adapters: boundedAdapters, now, apply: true });
+    expect(applied.complete).toBe(false);
+    expect(applied.error).toBe('draft inventory capped at 1 page');
+    expect(fixture.calls.some((call) => call.startsWith('label:') || call.startsWith('close:'))).toBe(false);
+  });
+
   it('bounds active-claim owner lookups during explicit triage', async () => {
     const rows = Array.from({ length: DRAFT_SWEEP_CONCURRENCY * 2 }, (_, index) => draft(600 + index));
     const fixture = make(rows);
@@ -1557,6 +1830,17 @@ describe('runDraftSweep — lineage key (forceRequeue duplicates)', () => {
     ]);
   });
 
+  it('freezes the exact successor identity required to stop a live duplicate run', async () => {
+    const fixture = make([older({ headSha: 'a'.repeat(40) }), newer({ headSha: 'b'.repeat(40) })]);
+    fixture.statuses.set(1, 'running');
+    fixture.statuses.set(2, 'running');
+    fixture.setLive(new Set([older().branch, newer().branch]));
+    fixture.adapters.supersedeRun = async () => {};
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, includeApplyPlan: true, now });
+    expect(result.applyPlan?.entries[0]).toMatchObject({ number: 1, runId: 'run-1', stopRunRequired: true,
+      supersedeNewer: { number: 2, branch: newer().branch, runId: 'run-2' } });
+  });
+
   it('never stops a live run when the newer same-lineage run is not live itself — the existing rules decide', async () => {
     const onlyOlderLive = (fixture: ReturnType<typeof make>) => { fixture.statuses.set(1, 'running'); fixture.setLive(new Set([older().branch])); };
     const baseline = await withoutLineage(onlyOlderLive);
@@ -1601,6 +1885,14 @@ describe('runDraftSweep — lineage key (forceRequeue duplicates)', () => {
     const applied = await sweep(fixture.adapters, true);
     expect(applied.entries[0]).toMatchObject({ number: 1, action: 'close', applied: true });
     expect(fixture.calls).not.toContain('stop');
+  });
+
+  it('fails the sweep before any close write when exact-head gate inventory is incomplete', async () => {
+    const fixture = make([older(), newer()]);
+    fixture.adapters.getReviewGate = async () => { throw new Error('check-run inventory incomplete: HTTP 403'); };
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: fixture.adapters, apply: true, includeTriage: true, now });
+    expect(result.error).toContain('check-run inventory incomplete');
+    expect(mutations(fixture.calls)).toEqual([]);
   });
 
   it('leaves held drafts, other goals and branches without a goal id alone', async () => {
@@ -1835,13 +2127,22 @@ describe('runDraftSweep — 칸 duplicate through the production GitHub adapter'
     body: '칸: CELL-A0\n\n대상 경로: src/x.ts', head: { ref: pr.branch, sha: pr.head }, base: { ref: 'main' }, labels: [],
     created_at: pr.created, updated_at: '2026-10-04T23:30:00Z', merged_at: null, merge_commit_sha: null,
   });
-  const fakeGh = (calls: string[]) => (args: string[]): string => {
+  const fakeGh = (calls: string[], threeDrafts = false) => (args: string[]): string => {
     calls.push(args.join(' '));
     if (args[0] === 'pr' || (args[0] === 'label' && args[1] === 'create')) return '';
     if (args[0] !== 'api') throw new Error(`unexpected gh ${args.join(' ')}`);
     if (args[1] === 'graphql') throw new Error('GraphQL unavailable');
+    if (threeDrafts && args[1] === '--paginate' && args[2] === '--slurp'
+      && /\/issues\/\d+\/comments\?per_page=100$/.test(args[3] ?? '')) return '[[]]';
     const endpoint = args[1]!;
-    if (/pulls\?state=open.*&page=1$/.test(endpoint)) return JSON.stringify([pull(OLD), pull(NEW)]);
+    if (/pulls\?state=open.*&page=1$/.test(endpoint)) return JSON.stringify(threeDrafts ? [
+      { ...pull(OLD), body: '칸: CELL-A0\n카드: ta-20261021-abcd12',
+        labels: [{ name: 'elanous:from-ux' }, { name: 'elanous:harvestable' }] },
+      { ...pull(NEW), body: '칸: CELL-B0\n카드: ta-20261021-efgh34',
+        labels: [{ name: 'elanous:from-ux' }, { name: RELEASE_PATH_LABEL }] },
+      { ...pull({ number: 32, branch: 'self-impl/goalid-eee777-last-33333333-rcccccc', created: '2026-10-04T23:00:00Z', head: 'h32' }),
+        body: '', labels: [{ name: keep }] },
+    ] : [pull(OLD), pull(NEW)]);
     if (/pulls\?state=(open|closed).*&page=\d+$/.test(endpoint)) return '[]';
     if (/\/pulls\/\d+\/files\?per_page=100&page=1$/.test(endpoint)) return JSON.stringify([{ filename: 'src/x.ts' }]);
     if (/\/issues\/\d+\/comments\?per_page=100&page=1$/.test(endpoint)) return '[]';
@@ -1850,7 +2151,7 @@ describe('runDraftSweep — 칸 duplicate through the production GitHub adapter'
     const single = /\/pulls\/(\d+)$/.exec(endpoint);
     if (single) return JSON.stringify({ head: { sha: `h${single[1]}` } });
     if (/\/commits\/\w+\/status$/.test(endpoint)) return JSON.stringify({ state: 'success' });
-    if (/\/commits\/\w+\/check-runs\?per_page=100&page=\d+$/.test(endpoint)) return JSON.stringify({ check_runs: [] });
+    if (/\/commits\/\w+\/check-runs\?per_page=100&page=\d+$/.test(endpoint)) return JSON.stringify({ total_count: 0, check_runs: [] });
     throw new Error(`unexpected endpoint ${endpoint}`);
   };
   // No worktree carries either branch (= neither run is live) and the repository matches the sweep target.
@@ -1881,6 +2182,46 @@ describe('runDraftSweep — 칸 duplicate through the production GitHub adapter'
       return { result, writes: calls.filter((call) => call.startsWith('pr ') || call.startsWith('label create ')), logged };
     } finally { log.mockRestore(); }
   };
+
+  it('preserves three fake gh draft JSON rows and terminal failure order through the production adapter', async () => {
+    const calls: string[] = [];
+    const adapters = githubDraftSweepAdapters(fakeGh(calls, true), git, '/tmp/main');
+    adapters.getRunStatus = async () => 'completed';
+    adapters.listPrTerminals = async () => [
+      { childRunId: 'run-31-failed', prNumber: 31, prUrl: null, repository: 'my/repo', headSha: null,
+        terminalClass: 'failed-with-pr', stage: 'review-blocked', owner: 'UX', ownerSource: 'seat', card: null,
+        at: '2026-10-04T21:00:00Z', hostRegateFailure: null },
+      { childRunId: 'run-31-ready', prNumber: 31, prUrl: null, repository: 'my/repo', headSha: null,
+        terminalClass: 'merge-ready-not-merged', stage: 'gate-passed', owner: 'UX', ownerSource: 'seat', card: null,
+        at: '2026-10-04T23:00:00Z', hostRegateFailure: null },
+    ];
+    const json = JSON.parse(JSON.stringify(await runDraftSweep({ repository: 'my/repo', adapters,
+      apply: true, includeTriage: true, now: new Date('2026-10-05T00:00:00Z') })));
+    const rows = json.triage.entries.map(({ number, assessment }: { number: number; assessment: {
+      origin: string | null; lastFailureTail: string | null; cellStatus: string; nextAction: string; missingEvidence: string[];
+    } }) => ({ number, origin: assessment.origin, lastFailureTail: assessment.lastFailureTail,
+      cellStatus: assessment.cellStatus, nextAction: assessment.nextAction, missingEvidence: assessment.missingEvidence }));
+    const missing = ['gate', 'review', 'cell-complete', 'cell-status-repository-bound',
+      'replacement-landed', 'newer-same-card', 'idle-48h', 'recent-commit'];
+    expect(JSON.stringify({ rows, counts: json.triage.counts,
+      closeCalls: calls.filter((call) => call.startsWith('pr close ')) })).toBe(JSON.stringify({
+      rows: [
+        { number: 30, origin: 'elanous:from-ux', lastFailureTail: null, cellStatus: 'unknown',
+          nextAction: 'human', missingEvidence: missing },
+        { number: 31, origin: 'elanous:from-ux', lastFailureTail: 'review-blocked', cellStatus: 'unknown',
+          nextAction: 'human', missingEvidence: missing },
+        { number: 32, origin: null, lastFailureTail: null, cellStatus: 'unknown',
+          nextAction: 'human', missingEvidence: ['provenance', ...missing] },
+      ], counts: { human: 3 }, closeCalls: [],
+    }));
+    expect(json.triage.entries[1].assessment.evidence).toContain('last failure: review-blocked');
+    expect(json.triage.entries[1].assessment.checks.protected).toEqual({ state: 'yes', evidence: `보호 표지=${RELEASE_PATH_LABEL}` });
+    expect(calls.filter((call) => call.startsWith('pr close '))).toEqual([]);
+    expect(calls.filter((call) => call.startsWith('pr edit '))).toEqual(['pr edit 30 --repo my/repo --add-label elanous:stalled']);
+    expect(json.entries.find((entry: { number: number }) => entry.number === 31)).toMatchObject({
+      action: 'keep', reason: `label:${RELEASE_PATH_LABEL}`, applied: false,
+    });
+  }, 60_000);
 
   it('closes a different-goal same-칸 draft through the real adapter', async () => {
     const dry = await run(false);

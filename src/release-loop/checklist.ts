@@ -37,6 +37,8 @@ export interface ChecklistItem {
   /** 이 칸이 근거로 삼는 문서(저장소 상대 경로, 선택적으로 `#절`). 없으면 칸에 실리지 않는다. */
   refs?: string[];
   evidence?: string;
+  /** Public known-issue wording, independent from the internal checklist title. */
+  knownIssue?: string;
   disposition?: ChecklistDisposition;
   kind?: ChecklistKind;
   /** Whether the seat dispatcher should launch a coding task. Missing in old rows means code. */
@@ -65,6 +67,49 @@ export interface Checklist {
   dev: string;
   items: ChecklistItem[];
   history: ChecklistHistory[];
+}
+
+export type ChecklistEvidenceState = 'observed' | 'missing' | 'unmeasurable';
+export type ChecklistEvidenceStageId = 'E1' | 'E3' | 'E4' | 'E5';
+export interface ChecklistEvidenceStage {
+  id: ChecklistEvidenceStageId;
+  state: ChecklistEvidenceState;
+  source: string | null;
+  measuredAt: string | null;
+  reason: string;
+  verificationCommand?: string | null;
+}
+export interface ChecklistEvidenceChain {
+  id: string;
+  version: string;
+  stages: ChecklistEvidenceStage[];
+  greenEligible: boolean;
+  reason: string | null;
+}
+
+/** Build a read-only, fail-closed evidence verdict. Claims are observed only when a source adapter verifies them. */
+export function checklistEvidenceChain(input: {
+  item: ChecklistItem;
+  version: string;
+  stages: readonly ChecklistEvidenceStage[];
+}): ChecklistEvidenceChain {
+  const required: ChecklistEvidenceStageId[] = ['E1', 'E3', 'E4', 'E5'];
+  const byId = new Map(input.stages.map((stage) => [stage.id, stage]));
+  const stages = required.map((id) => {
+    const stage = byId.get(id);
+    if (!stage) return { id, state: 'unmeasurable' as const, source: null, measuredAt: null, reason: '출처 어댑터 결과가 없다' };
+    if (stage.state === 'observed' && (!stage.source?.trim() || !stage.measuredAt || !Number.isFinite(Date.parse(stage.measuredAt))))
+      return { ...stage, state: 'unmeasurable' as const, reason: 'observed 판정에 유효한 출처와 측정 시각이 없다' };
+    return stage;
+  });
+  const unresolved = stages.filter((stage) => stage.state !== 'observed');
+  return {
+    id: input.item.id,
+    version: input.version,
+    stages,
+    greenEligible: unresolved.length === 0,
+    reason: unresolved.length ? `${unresolved.map((stage) => `${stage.id}=${stage.state}: ${stage.reason}`).join('; ')}` : null,
+  };
 }
 
 export function devVersion(): string {
@@ -405,7 +450,7 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; knownIssue?: string | null; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
   return setItemGuarded(v, id, patch, by);
 }
 
@@ -501,13 +546,13 @@ function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>
         throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
       }
     }
-    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind', 'dispatchKind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
+    const fields = (['evidence', 'knownIssue', 'owner', 'status', 'disposition', 'kind', 'dispatchKind', 'priority', 'predecessors', 'deadlineVersion', 'ceoMinutes', 'ceoDate', 'accelerator', 'refs'] as const).filter((field) => patch[field] !== undefined && JSON.stringify(patch[field]) !== JSON.stringify(item[field] ?? null));
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
     for (const field of fields) {
       const from = item[field];
       const to = patch[field]!;
-      if (field === 'accelerator' && to === null) delete item.accelerator;
+      if ((field === 'accelerator' || field === 'knownIssue') && to === null) delete (item as unknown as Record<string, unknown>)[field];
       else (item as unknown as Record<string, unknown>)[field] = to;
       item.updatedAt = at;
       item.updatedBy = by;
@@ -585,7 +630,7 @@ export interface ChecklistGate {
   undecided: string[];
   blocked: string[];
   moved: string[];
-  knownIssues: Array<{ id: string; title: string; evidence: string }>;
+  knownIssues: Array<{ id: string; title: string; evidence: string; knownIssue?: string }>;
   /** Post-publication cells excluded from the pre-publication judgement. */
   postpub?: string[];
   /** Screen cells whose `짝:` line is missing or has an untracked ⏳ — a warning; it never changes `ok`. */
@@ -616,7 +661,7 @@ export function checklistGate(v: string): ChecklistGate {
     if (item.status !== 'yellow') continue;
     if (item.disposition === 'block') result.blocked.push(item.id);
     else if (item.disposition === 'move') result.moved.push(item.id);
-    else if (item.disposition === 'known-issue') result.knownIssues.push({ id: item.id, title: item.title, evidence: item.evidence ?? '' });
+    else if (item.disposition === 'known-issue') result.knownIssues.push({ id: item.id, title: item.title, evidence: item.evidence ?? '', ...(item.knownIssue?.trim() ? { knownIssue: item.knownIssue.trim() } : {}) });
     else result.undecided.push(item.id);
   }
   result.ok = result.red.length === 0 && result.undecided.length === 0 && result.blocked.length === 0;

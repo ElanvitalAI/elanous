@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { buildUserConfig } from '../user-config.js';
-import { checkLoops } from './checker.js';
+import { checkLoops, pruneJudgment } from './checker.js';
 import { debug } from '../debug/log.js';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -718,4 +718,95 @@ test('irregular cron reports the longest gap and marks itself irregular; regular
       expect(steady?.cronIrregular).toBeUndefined();
     }
   } finally { db.close(); }
+});
+
+// ── LOOP-PRUNE-1021-FU 정리 판정 (2026-10-21 · 0.2.36) ────────────────────────
+// 내부 문서 `loop-lineage-1021` 의 측정 대상: 운영 해시 명명·무실행 은퇴·미등록 정리·형제 접기와
+// alive 25 이하 — test 우주에서 판정선을 증명한다. 해시 명명(elanous:* 슬롯)과 미등록 경고는
+// 기존 기판(namedCronIds·unregisteredCronLoops)이 이미 내고, pruneJudgment는 그 위에서
+// 은퇴(14일 무실행 off)·형제 접기·alive ≤ 25·이름 없는 해시를 판정한다.
+
+test('LOOP-PRUNE-1021-FU judgment — hash slots, idle retirement, unregistered disposition, sibling folding, alive ≤ 25', () => {
+  const root = mkdtempSync(join(tmpdir(), 'registry-prune-'));
+  roots.push(root);
+  mkdirSync(join(root, 'graphs'), { recursive: true });
+  for (const id of ['live', 'idle', 'recent', 'norecord']) {
+    writeFileSync(join(root, 'graphs', `${id}.yaml`), `graph_id: ${id}\nloop:\n  trigger:\n    cron: '*/10 * * * *'\n`);
+  }
+  const now = new Date('2026-10-04T12:00:00Z');
+  const writeRun = (id: string, startedAt: string) => {
+    mkdirSync(join(root, 'graph-runs', id), { recursive: true });
+    writeFileSync(join(root, 'graph-runs', id, 'run-1.json'), JSON.stringify({
+      graphId: id, runId: 'run-1', status: 'done', startedAt, finishedAt: startedAt, nodes: [],
+    }));
+  };
+  writeRun('live', '2026-10-04T11:50:00Z');
+  writeRun('idle', '2026-09-19T11:50:00Z');
+  writeRun('recent', '2026-10-04T11:50:00Z');
+  const db = openSchedulesDb(join(root, 'schedules.db'));
+  try {
+    const seatCron = (seat: string, cron: string) => `${cron} hq-fence seat-loop 'cd ${root} && bun bin/elanous.mjs seat loop --seat ${seat} --once >> ${root}/seat-loop-${seat.toLowerCase()}.log 2>&1'`;
+    const graphCron = (name: string) => `*/10 * * * * cd ${root} && bun bin/elanous.mjs graph run graphs/${name}.yaml`;
+    const active = [
+      graphCron('live'),
+      graphCron('idle'),
+      graphCron('recent'),
+      graphCron('norecord'),
+      '*/7 * * * * eln hq heartbeat',
+      '*/17 * * * * eln hq heartbeat --verbose',
+      seatCron('OP', '*/5 * * * *'),
+      seatCron('TC', '*/5 * * * *'),
+      seatCron('MK', '*/5 * * * *'),
+      seatCron('UX', '*/5 * * * *'),
+      '*/8 * * * * zsh scripts/refresh.sh',
+      '*/9 * * * * elanous future-action --json',
+    ];
+    const disable = ['idle', 'recent', 'norecord'];
+    const secondPass = active.map((line) => (disable.some((name) => line.includes(`${name}.yaml`)) ? `# ${line}` : line));
+    inventoryCrontab(db, { crontab: active.join('\n') + '\n' });
+    inventoryCrontab(db, { crontab: secondPass.join('\n') + '\n' });
+    const opts = { root, stateRoot: root, now, schedules: listSchedules(db) };
+    const all = listAllLoops(opts);
+    const results = checkLoops(all, now);
+    const prune = pruneJudgment(results, { now });
+
+    // ① 운영 해시 슬롯 명명 — 무관한 원장 행이 elanous:* 운영 이름·자리 슬롯을 받는다.
+    expect(all.filter((entry) => entry.id.startsWith('elanous:hq-heartbeat')).map((entry) => entry.id).sort())
+      .toEqual(['elanous:hq-heartbeat', 'elanous:hq-heartbeat-2']);
+    expect(all.filter((entry) => entry.id.startsWith('elanous:seat-loop:')).map((entry) => entry.id).sort())
+      .toEqual(['elanous:seat-loop:MK', 'elanous:seat-loop:OP', 'elanous:seat-loop:TC', 'elanous:seat-loop:UX']);
+
+    // ② 무실행 은퇴 판정 — 최근 14일 실행이 0임이 원장으로 증명된 off 항목만 은퇴 후보다.
+    //    기록 자체가 없으면 «무실행 증명 불가»로 남기고 retire 하지 않는다(문서 ⓑ 단서).
+    expect(prune.idleRetire).toEqual(['idle']);
+    expect(prune.idleRetire).not.toContain('recent');
+    expect(prune.idleUnproven).toEqual(['norecord']);
+    expect(prune.idleUnproven).not.toContain('live');
+
+    // ③ 미등록 정리 — 등록되지 않은 elanous 크론을 행마다 남겨 등록/제거 판정에 넘긴다.
+    const future = opts.schedules.find((row) => row.command === 'elanous future-action --json');
+    expect(future).toBeTruthy();
+    expect(prune.unregistered).toEqual([{ id: future!.id, cron: '*/9 * * * *', command: 'elanous future-action --json' }]);
+
+    // ④ 형제 접기 — 같은 일을 하는 형제 슬롯을 가족별로 묶는다(그래프 루프·원장 해시는 접지 않는다).
+    expect(prune.foldGroups).toEqual([
+      { family: 'elanous:hq-heartbeat', ids: ['elanous:hq-heartbeat', 'elanous:hq-heartbeat-2'] },
+      { family: 'elanous:seat-loop', ids: ['elanous:seat-loop:MK', 'elanous:seat-loop:OP', 'elanous:seat-loop:TC', 'elanous:seat-loop:UX'] },
+    ]);
+
+    // ⑤ alive 25 이하 · 이름 없는 항목 — 이 우주에서 alive 1, 이름 없는 해시 id 는 원장 해시 2건뿐.
+    expect(prune.alive).toEqual({ count: 1, limit: 25, within: true });
+    const refresh = opts.schedules.find((row) => row.command === 'zsh scripts/refresh.sh');
+    expect(refresh).toBeTruthy();
+    expect(prune.unnamed.sort()).toEqual([refresh!.id, future!.id].sort());
+    expect(prune.unnamed).not.toContain('live');
+  } finally { db.close(); }
+});
+
+test('LOOP-PRUNE-1021-FU judgment flags alive above the 25 limit', () => {
+  const alive = (count: number) => Array.from({ length: count }, (_, i) => ({
+    id: `loop-${i}`, enabled: true, registered: true, state: 'alive' as const, reason: 'within expected interval',
+  }));
+  expect(pruneJudgment(alive(26)).alive).toEqual({ count: 26, limit: 25, within: false });
+  expect(pruneJudgment(alive(25)).alive).toEqual({ count: 25, limit: 25, within: true });
 });

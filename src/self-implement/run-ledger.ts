@@ -834,6 +834,8 @@ export interface RunLedgerTimelineEntry {
   shardId?: string;
   pieceIndex?: number;
   pieceTotal?: number;
+  /** Producer-recorded `graph.unit` visits of this run, with terminal unmatched enters reported as orphans. */
+  unitVisits?: GraphUnitVisitClassification;
 }
 
 export interface RunLedgerTimelineQueryOptions {
@@ -875,12 +877,82 @@ export function queryRunLedgerTimeline(missionId: string, options: RunLedgerTime
         ...(execution.shardId === undefined ? {} : { shardId: execution.shardId }),
         ...(execution.pieceIndex === undefined ? {} : { pieceIndex: execution.pieceIndex }),
         ...(execution.pieceTotal === undefined ? {} : { pieceTotal: execution.pieceTotal }),
+        unitVisits: classifyGraphUnitVisits(ledger),
       });
     } catch {
       // A corrupt or concurrently replaced ledger must not leak a partial run into another mission timeline.
     }
   }
   return entries.sort((left, right) => Date.parse(left.executedAt) - Date.parse(right.executedAt) || left.runId.localeCompare(right.runId));
+}
+
+export interface GraphAdaptReport {
+  goalId: string;
+  runCount: number;
+  uniquePathSignatures: number;
+  unitCallCount: number;
+  adaptationCount: number;
+  adapted: { landed: number; denominator: number; rate: number | null };
+  nonAdapted: { landed: number; denominator: number; rate: number | null };
+  excludedCount: number;
+  exclusionReasons: Record<string, number>;
+}
+
+/** Measure only producer-observed traversals and variant applications; never activate adaptation. */
+export function queryGraphAdaptReport(goalId: string, stateDir = elanousStateRoot()): GraphAdaptReport {
+  const dir = runLedgerDir(stateDir);
+  const signatures = new Set<string>();
+  const counts = { adapted: { landed: 0, denominator: 0 }, nonAdapted: { landed: 0, denominator: 0 } };
+  const exclusionReasons: Record<string, number> = {};
+  const exclude = (reason: string): void => { exclusionReasons[reason] = (exclusionReasons[reason] ?? 0) + 1; };
+  let unitCallCount = 0;
+  let adaptationCount = 0;
+  let fileNames: string[];
+  try { fileNames = readdirSync(dir); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') fileNames = [];
+    else throw error;
+  }
+  for (const name of fileNames) {
+    const runId = runIdFromCanonicalLedgerFile(name);
+    if (!runId) continue;
+    let ledger: RunLedgerEntry[] | null;
+    try { ledger = loadRunLedger(runId, dir); }
+    catch { exclude('invalid-ledger'); continue; }
+    if (!ledger?.length) { exclude('empty-ledger'); continue; }
+    const goalIds = new Set(ledger.map(entry => entry.goalId).filter((id): id is string => typeof id === 'string' && id.length > 0));
+    if (goalIds.size === 1 && !goalIds.has(goalId)) continue;
+    if (goalIds.size !== 1) { exclude('goal-id-missing-or-conflicting'); continue; }
+    const traversals = ledger.filter(entry => entry.event === 'pipeline-traversal-shadow');
+    const paths = traversals.map(entry => entry.data.observedNodes);
+    if (paths.length === 0 || paths.some(path => !Array.isArray(path) || path.length === 0 || !path.every(node => typeof node === 'string' && node.length > 0))) {
+      exclude('path-missing-or-invalid'); continue;
+    }
+    let graphRun: unknown;
+    try { graphRun = JSON.parse(readFileSync(join(stateDir, 'graph-runs', 'self-implement', `${runId}.json`), 'utf8')); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { exclude('graph-run-unreadable'); continue; }
+    }
+    const recorded = graphRun && typeof graphRun === 'object' && !Array.isArray(graphRun) ? graphRun as Record<string, unknown> : null;
+    if (recorded && (recorded.runId !== runId || recorded.graphId !== 'self-implement' ||
+      (recorded.unitCalls !== undefined && !Array.isArray(recorded.unitCalls)))) {
+      exclude('unit-calls-invalid'); continue;
+    }
+    const merge = [...ledger].reverse().find(entry => entry.event === 'merged');
+    if (merge && typeof merge.data.merged !== 'boolean') { exclude('landing-invalid'); continue; }
+    signatures.add(JSON.stringify(paths.at(-1)));
+    unitCallCount += recorded && Array.isArray(recorded.unitCalls) ? recorded.unitCalls.length : 0;
+    const adaptations = ledger.filter(entry => entry.event === 'graph-variant-applied');
+    adaptationCount += adaptations.length;
+    const group = adaptations.length ? counts.adapted : counts.nonAdapted;
+    group.denominator += 1;
+    if (merge?.data.merged === true) group.landed += 1;
+  }
+  const rate = (group: { landed: number; denominator: number }) => ({ ...group, rate: group.denominator ? group.landed / group.denominator : null });
+  return { goalId, runCount: counts.adapted.denominator + counts.nonAdapted.denominator,
+    uniquePathSignatures: signatures.size, unitCallCount, adaptationCount,
+    adapted: rate(counts.adapted), nonAdapted: rate(counts.nonAdapted),
+    excludedCount: Object.values(exclusionReasons).reduce((total, count) => total + count, 0), exclusionReasons };
 }
 
 export interface GoalSourceDistributionQuery {
@@ -1416,6 +1488,8 @@ export interface UnfinishedRunLedgerEntry {
   lifecycle: UnfinishedRunLifecycle;
   /** Non-blocking request record (kind·reason·next) carried by this runId's ledger; absent for runs without one. */
   nonBlocking?: NonBlockingRunLedgerRecord;
+  /** ⭐ graph.unit enter without its exit on a *terminal* ledger — present only when non-empty. */
+  orphanUnitVisits?: readonly GraphUnitOrphanVisit[];
 }
 
 export interface UnfinishedRunLedgerQuery {
@@ -1435,6 +1509,12 @@ export interface UnfinishedRunLedgerQuery {
   pathFilter?: string;
   matchingPathCount?: number;
   unknownPathCount?: number;
+  /**
+   * ⭐ Total orphan unit visits across **every scanned ledger** — including terminal runs that are not
+   * returned as entries (they are counted, never revived). 같은 원장을 「미완」으로 되살리지 않고도
+   * 엉킨 visit 을 셀 수 있게 하는 값이다.
+   */
+  orphanUnitVisitCount?: number;
   scope: 'self-implement-run-ledger';
   note: string;
 }
@@ -1544,6 +1624,78 @@ function isTerminalOnlyByTrailingRunStatus(ledger: readonly RunLedgerEntry[]): b
   return hasTerminalRunStatus(ledger) && !lastLineIsValidRunStatus(ledger)
     && !hasNonCanonicalTerminalEvent(ledger)
     && !hasHumanStopEvent(ledger);
+}
+
+/** One producer-recorded `graph.unit` enter that the run never closed with a matching exit. */
+export interface GraphUnitOrphanVisit {
+  childRunId: string | null;
+  graphId: string | null;
+  nodeId: string | null;
+  unit: string | null;
+  /** Timestamp of the unmatched enter; null when the producer recorded none. */
+  enteredAt: string | null;
+}
+
+export interface GraphUnitVisitClassification {
+  /** Whether the ledger itself records the run's end (`run-status`, `terminal`, or `human-stop`). */
+  terminal: boolean;
+  enterCount: number;
+  exitCount: number;
+  /** Unmatched enters in a terminal run. An open enter on a non-terminal ledger is in flight, not an orphan. */
+  orphanCount: number;
+  orphanUnitVisits: readonly GraphUnitOrphanVisit[];
+}
+
+function dataString(data: Record<string, unknown>, field: string): string | null {
+  const value = data[field];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function graphUnitVisitOf(entry: RunLedgerEntry): GraphUnitOrphanVisit {
+  return {
+    childRunId: dataString(entry.data, 'childRunId'),
+    graphId: dataString(entry.data, 'graphId'),
+    nodeId: dataString(entry.data, 'nodeId'),
+    unit: dataString(entry.data, 'unit'),
+    enteredAt: entry.timestamp ?? null,
+  };
+}
+
+/** An exit closes the visit with its own childRunId; without one it closes the latest visit on the same node. */
+function closesUnitVisit(exitChildRunId: string | null, exitNodeId: string | null, open: GraphUnitOrphanVisit): boolean {
+  if (open.childRunId !== null || exitChildRunId !== null) return open.childRunId === exitChildRunId;
+  return open.nodeId !== null && open.nodeId === exitNodeId;
+}
+
+/**
+ * Pair each producer-recorded `graph.unit` enter with its exit and report the visits a terminal run left open.
+ * This only reads the already-loaded ledger: it never synthesizes or writes an exit entry.
+ */
+export function classifyGraphUnitVisits(ledger: readonly RunLedgerEntry[]): GraphUnitVisitClassification {
+  const open: GraphUnitOrphanVisit[] = [];
+  let enterCount = 0;
+  let exitCount = 0;
+  for (const entry of ledger) {
+    if (entry.event !== 'graph.unit') continue;
+    if (entry.data.phase === 'enter') {
+      enterCount += 1;
+      open.push(graphUnitVisitOf(entry));
+      continue;
+    }
+    // `budget-exhausted` is a recorded failure the runner still follows with an exit, so it closes nothing.
+    if (entry.data.phase !== 'exit') continue;
+    exitCount += 1;
+    const exitChildRunId = dataString(entry.data, 'childRunId');
+    const exitNodeId = dataString(entry.data, 'nodeId');
+    for (let index = open.length - 1; index >= 0; index -= 1) {
+      if (!closesUnitVisit(exitChildRunId, exitNodeId, open[index]!)) continue;
+      open.splice(index, 1);
+      break;
+    }
+  }
+  const terminal = hasTerminalRunStatus(ledger);
+  const orphanUnitVisits = terminal ? open : [];
+  return { terminal, enterCount, exitCount, orphanCount: orphanUnitVisits.length, orphanUnitVisits };
 }
 
 /** ⛔⭐⭐⭐ 미완 항목의 «상태» — 종전엔 이 조회가 낸 것이 «한 값»(`terminal-status-missing`)뿐이었다.
@@ -1773,6 +1925,8 @@ interface UnfinishedLedgerFacts {
   goalFile: string | null;
   fixedLifecycle: UnfinishedRunLifecycle;
   nonBlocking: NonBlockingRunLedgerRecord | null;
+  /** Held here so a terminal ledger's orphan visits are countable before the terminal `continue`. */
+  unitVisits: GraphUnitVisitClassification;
 }
 
 // A full federated scan can exceed 5,000 files; keep the previous scan resident for stat-checked reuse.
@@ -1797,7 +1951,8 @@ function unfinishedLedgerCacheKey(path: string, read?: RunLedgerReader): string 
 //   원장 옆에 (size, mtimeMs, ctimeMs) 스탬프로 저장하고, 스탬프가 같으면 재사용한다. 원장에 무엇이 «붙으면»
 //   스탬프가 바뀌므로 무효화는 자동이다 (같은 크기로 덮고 mtime 을 되돌려도 ctime 이 바뀐다). 읽기 실패는 전부 fail-soft: 색인이 없으면 그냥 새로 읽는다.
 const RUN_LEDGER_SCAN_INDEX_FILE = '.unfinished-scan-index.json';
-const RUN_LEDGER_SCAN_INDEX_VERSION = 2;
+// v3 added facts.unitVisits; a v2 record would hand back a facts object without it.
+const RUN_LEDGER_SCAN_INDEX_VERSION = 3;
 const RUN_LEDGER_SCAN_INDEX_LIMIT = 32_768;
 
 /** Where the persisted scan index lives: beside its ledgers, never mistaken for one (readdir filters canonical names). */
@@ -1829,7 +1984,9 @@ function isScanIndexFacts(value: unknown): value is UnfinishedLedgerFacts {
     && typeof facts.lastActivityStatus === 'string'
     && (facts.targetRoot === null || typeof facts.targetRoot === 'string')
     && (facts.goalFile === null || typeof facts.goalFile === 'string')
-    && typeof facts.fixedLifecycle === 'string' && UNFINISHED_LIFECYCLE_WORDS.has(facts.fixedLifecycle);
+    && typeof facts.fixedLifecycle === 'string' && UNFINISHED_LIFECYCLE_WORDS.has(facts.fixedLifecycle)
+    && typeof (facts.unitVisits as GraphUnitVisitClassification | undefined)?.orphanCount === 'number'
+    && Array.isArray((facts.unitVisits as GraphUnitVisitClassification | undefined)?.orphanUnitVisits);
 }
 
 function isScanIndexRecord(value: unknown): value is RunLedgerScanIndexRecord {
@@ -1895,6 +2052,7 @@ function unfinishedLedgerFacts(ledger: readonly RunLedgerEntry[]): UnfinishedLed
     goalFile: ledgerGoalDocument(ledger),
     fixedLifecycle: classifyUnfinishedLifecycle(ledger, null, 0),
     nonBlocking: readNonBlockingRunRecord(ledger),
+    unitVisits: classifyGraphUnitVisits(ledger),
   };
 }
 
@@ -2014,6 +2172,8 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
   let cacheMisses = 0;
   let ledgerTargetCount = 0;
   let callerCwdCount = 0;
+  // ⭐ 터미널 원장도 «세기만» 한다 — entries 로 되살리지 않는다(부활 금지).
+  let orphanUnitVisitCount = 0;
   for (const fileName of fileNames) {
     const runId = runIdFromCanonicalLedgerFile(fileName);
     if (!runId) continue;
@@ -2037,6 +2197,9 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
       callerCwdCount += 1;
       continue;
     }
+    const orphanUnitVisits = facts.unitVisits.orphanUnitVisits;
+    orphanUnitVisitCount += facts.unitVisits.orphanCount;
+    const orphanVisitField = orphanUnitVisits.length > 0 ? { orphanUnitVisits } : {};
     if (facts.terminal) {
       terminal += 1;
       if (facts.terminalByTrailingRunStatus) terminalByTrailingRunStatus += 1;
@@ -2070,7 +2233,7 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
           : goalDocument.status === 'directory-unreadable'
             ? 'goal-directory-unreadable'
             : 'goal-document-not-found';
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus, ...unknownDeclaredPaths(), pathMatchReasons: {}, goalDocumentPath: null, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}) });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus, ...unknownDeclaredPaths(), pathMatchReasons: {}, goalDocumentPath: null, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}), ...orphanVisitField });
       continue;
     }
     try {
@@ -2078,9 +2241,9 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
       const text = typeof document === 'string' ? document : document.toString('utf8');
       const paths = [...new Set(tracedPathReferences(text).map((reference) => reference.path))];
       const declared = declaredPathsFromGoalDocument(text);
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: paths, plannedPathStatus: paths.length > 0 ? goalDocument.source === 'ledger' ? 'found-ledger-goal-file' : 'found-branch-fallback' : 'no-traced-paths', ...declared, pathMatchReasons: pathMatchReasons(declared.declaredPaths, paths), goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}) });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: paths, plannedPathStatus: paths.length > 0 ? goalDocument.source === 'ledger' ? 'found-ledger-goal-file' : 'found-branch-fallback' : 'no-traced-paths', ...declared, pathMatchReasons: pathMatchReasons(declared.declaredPaths, paths), goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}), ...orphanVisitField });
     } catch {
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus: 'goal-document-unreadable', declaredPaths: [], declaredPathStatus: 'goal-document-unreadable', pathMatchReasons: {}, goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}) });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus: 'goal-document-unreadable', declaredPaths: [], declaredPathStatus: 'goal-document-unreadable', pathMatchReasons: {}, goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle, ...(facts.nonBlocking ? { nonBlocking: facts.nonBlocking } : {}), ...orphanVisitField });
     }
   }
   entries.sort((left, right) => left.runId.localeCompare(right.runId));
@@ -2098,7 +2261,7 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     ms: Date.now() - startedAt,
   });
   if (options.path === undefined) {
-    return { entries, ledgerDirectory: dir, goalsDirectory: goalsDir, unreadableLedgerCount, ledgerDirectoryMissing: false, terminalByTrailingRunStatus, cacheHits, cacheMisses, indexHits, indexOrigin, scope: 'self-implement-run-ledger', note: UNFINISHED_RUN_LEDGER_NOTE };
+    return { entries, ledgerDirectory: dir, goalsDirectory: goalsDir, unreadableLedgerCount, orphanUnitVisitCount, ledgerDirectoryMissing: false, terminalByTrailingRunStatus, cacheHits, cacheMisses, indexHits, indexOrigin, scope: 'self-implement-run-ledger', note: UNFINISHED_RUN_LEDGER_NOTE };
   }
   const pathFilter = options.path;
   const unknownPathStatus = (entry: UnfinishedRunLedgerEntry): boolean => entry.plannedPathStatus !== 'found-ledger-goal-file'
@@ -2114,6 +2277,7 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     ledgerDirectory: dir,
     goalsDirectory: goalsDir,
     unreadableLedgerCount,
+    orphanUnitVisitCount,
     ledgerDirectoryMissing: false,
     terminalByTrailingRunStatus,
     cacheHits,

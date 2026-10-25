@@ -18,7 +18,8 @@ import { releasePrFilePaths } from '../src/self-dev/release-path-guard.js';
 
 /** 전 단계 통과하는 기본 fake seam. 개별 테스트가 필요한 부분만 override. */
 function okSeams(over: Partial<SelfImplementSeams> = {}): SelfImplementSeams {
-  return {
+  let openedHead = '';
+  const defaults: SelfImplementSeams = {
     // ⛔⭐⭐⭐ 기본을 «무동작»으로 — 안 채우면 실제 계정 스토어를 읽고 codex 자식을 띄우고
     //   ~/.elanous/budget 에 쓴다(= 테스트가 «운영 쿼터를 소모»한다 · 리뷰 must-fix).
     refreshCodexQuotaSignals: async () => ({ accounts: [] }),
@@ -38,6 +39,14 @@ function okSeams(over: Partial<SelfImplementSeams> = {}): SelfImplementSeams {
       decomposition: { recommendedMaxTasks: 6, actualTaskCount: 0, truncatedAtHardMax: false, exceededRecommendedMax: false, outcome: 'single-no-subtasks' },
     }),
     ...over,
+  };
+  const openPr = defaults.openPr;
+  return {
+    ...defaults,
+    openPr: async (input) => { openedHead = input.head; return openPr(input); },
+    readPrAttribution: over.readPrAttribution ?? (async () => ({
+      headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString(),
+    })),
   };
 }
 

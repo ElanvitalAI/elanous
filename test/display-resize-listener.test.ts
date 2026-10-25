@@ -3,40 +3,57 @@
 // (CAPABILITIES-display.md §1.3) that previously had no SIGWINCH /
 // stdout resize handler attached.
 
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, jest, test } from 'bun:test';
 import { installResizeListener } from '../src/display/resize-listener.js';
 
 describe('installResizeListener', () => {
   const disposers: Array<() => void> = [];
 
+  beforeEach(() => jest.useFakeTimers({ now: 0 }));
   afterEach(() => {
     while (disposers.length > 0) {
       const d = disposers.pop();
       if (d) d();
     }
+    jest.useRealTimers();
   });
 
-  test('forwards stdout resize events to draw({force:true}) and promptCtl.repaint', () => {
+  test('debounces a resize burst and paints all outputs inside one synchronous batch', () => {
     let drawCalls = 0;
     let drawForce: boolean | undefined;
     let repaintCalls = 0;
+    let overlayCalls = 0;
+    let synchronizedCalls = 0;
+    let insideSynchronizedOutput = false;
     const dispose = installResizeListener({
       draw: (opts) => {
+        expect(insideSynchronizedOutput).toBe(true);
         drawCalls++;
         drawForce = opts?.force;
       },
-      promptCtl: { repaint: () => { repaintCalls++; } },
+      promptCtl: { repaint: () => { expect(insideSynchronizedOutput).toBe(true); repaintCalls++; } },
+      requestOverlayFrame: () => { expect(insideSynchronizedOutput).toBe(true); overlayCalls++; },
+      withSynchronizedOutput: paint => {
+        synchronizedCalls++;
+        insideSynchronizedOutput = true;
+        try { paint(); } finally { insideSynchronizedOutput = false; }
+      },
     });
     disposers.push(dispose);
 
     process.stdout.emit('resize');
+    jest.advanceTimersByTime(8);
+    process.stdout.emit('resize');
+    jest.advanceTimersByTime(8);
+    process.stdout.emit('resize');
+    jest.advanceTimersByTime(15);
+    expect(drawCalls).toBe(0);
+    jest.advanceTimersByTime(1);
     expect(drawCalls).toBe(1);
     expect(drawForce).toBe(true);
     expect(repaintCalls).toBe(1);
-
-    process.stdout.emit('resize');
-    expect(drawCalls).toBe(2);
-    expect(repaintCalls).toBe(2);
+    expect(overlayCalls).toBe(1);
+    expect(synchronizedCalls).toBe(1);
   });
 
   test('dispose detaches the listener so later resize events are ignored', () => {
@@ -47,11 +64,13 @@ describe('installResizeListener', () => {
     });
 
     process.stdout.emit('resize');
-    expect(drawCalls).toBe(1);
-
+    dispose();
+    jest.advanceTimersByTime(16);
+    expect(drawCalls).toBe(0);
     dispose();
     process.stdout.emit('resize');
-    expect(drawCalls).toBe(1);
+    jest.advanceTimersByTime(16);
+    expect(drawCalls).toBe(0);
   });
 
   test('swallows draw errors so a transient paint failure does not kill the listener', () => {
@@ -63,7 +82,8 @@ describe('installResizeListener', () => {
     });
     disposers.push(dispose);
 
-    expect(() => process.stdout.emit('resize')).not.toThrow();
+    process.stdout.emit('resize');
+    expect(() => jest.advanceTimersByTime(16)).not.toThrow();
     // draw threw but promptCtl.repaint still ran
     expect(drawCalls).toBe(1);
     expect(repaintCalls).toBe(1);
@@ -78,7 +98,8 @@ describe('installResizeListener', () => {
     });
     disposers.push(dispose);
 
-    expect(() => process.stdout.emit('resize')).not.toThrow();
+    process.stdout.emit('resize');
+    expect(() => jest.advanceTimersByTime(16)).not.toThrow();
     expect(drawCalls).toBe(1);
     expect(repaintCalls).toBe(1);
   });
@@ -93,6 +114,7 @@ describe('installResizeListener', () => {
     disposers.push(dispose);
 
     process.stdout.emit('resize');
+    jest.advanceTimersByTime(16);
     expect(order).toEqual(['draw', 'repaint', 'overlay-frame']);
   });
 
@@ -105,8 +127,9 @@ describe('installResizeListener', () => {
     });
     disposers.push(dispose);
 
-    expect(() => process.stdout.emit('resize')).not.toThrow();
-    expect(() => process.stdout.emit('resize')).not.toThrow();
-    expect(overlayCalls).toBe(2);
+    process.stdout.emit('resize');
+    process.stdout.emit('resize');
+    expect(() => jest.advanceTimersByTime(16)).not.toThrow();
+    expect(overlayCalls).toBe(1);
   });
 });

@@ -4,9 +4,11 @@ import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { gateArtifactCounts, runSelfGateCli } from './gate-cli.js';
+import { buildGateBaselineReport } from './gate-baseline.js';
 import {
   fetchRemoteGateArtifacts, newRemoteArtifactDir, parseRemoteArtifactFetch, remoteArtifactCleanupScript, remoteArtifactFetchScript,
   remoteCommitSupportsArtifactDir, writeRemoteUnavailableGateArtifacts, type RemoteSsh,
+  writeGateArtifacts,
 } from './gate-artifacts.js';
 import { runShardedGateTests, type ShardRunResult } from '../self-dev/shard-run.js';
 
@@ -47,6 +49,41 @@ function runSharded(artifactDir?: string) {
 }
 
 describe('self gate --artifact-dir (R2 입력 재료)', () => {
+  test('timeout-only standalone rerun on the gate host clears failed aggregate and is captured', () => {
+    const dir = join(tmp(), 'out');
+    const file = 'src/z.test.ts';
+    const report = buildGateBaselineReport(`${file}:\n(fail) slow\n^ this test timed out after 10000ms\n1 fail`, {
+      status: 'pass', output: `${file}:\n(pass) slow\n1 pass\n0 fail`, log: 'base passed',
+    });
+    let rerunArgs: unknown[] = [];
+    const result = runSelfGateCli('/remote/node-b/repo', { base: 'origin/main', shards: 2, artifactDir: dir }, {
+      changedFiles: () => ({ files, baseRef: 'origin/main' }), exists: () => true,
+      runShards: () => ({ ...sharded, aggregate: { status: 'failed', retryShardIds: [], report } }),
+      runTimeoutRecheck: (cwd, target, name, timeoutMs) => {
+        rerunArgs = [cwd, target, name, timeoutMs];
+        return { observation: 'pass', elapsedMs: 2200, output: 'Ran 1 test across 1 file.' };
+      },
+      ...quietGates, ...artifactDeps,
+    });
+    expect(rerunArgs).toEqual(['/remote/node-b/repo', file, 'slow', 60_000]);
+    expect(result.exitCode).toBe(0);
+    const summary = JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8'));
+    expect(summary).toMatchObject({ verdict: 'passed', timeoutRechecks: [{ result: 'pass', elapsedMs: 2200 }] });
+    expect(result.lines.join('\n')).toContain('timeout-recheck-passed=1');
+  });
+
+  test('timeout-only standalone recheck records elapsed time and raw result in summary.json', () => {
+    const dir = join(tmp(), 'out');
+    writeGateArtifacts({
+      dir, head40: HEAD, base40: BASE, envKey: ENV, testFiles: ['src/a.test.ts'], verdict: 'passed',
+      verdictLine: '[gate-baseline] introduced=0, timeout-recheck-passed=1', exitCode: 0,
+      timeoutRechecks: [{ name: 'src/a.test.ts > slow', file: 'src/a.test.ts', result: 'pass', elapsedMs: 2300, rawResultLine: 'Ran 1 test across 1 file.' }],
+    });
+    expect(JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8')).timeoutRechecks).toEqual([
+      { name: 'src/a.test.ts > slow', file: 'src/a.test.ts', result: 'pass', elapsedMs: 2300, rawResultLine: 'Ran 1 test across 1 file.' },
+    ]);
+  });
+
   test('baseline setup failure with zero attempts preserves the cause for every planned shard', () => {
     const dir = join(tmp(), 'out');
     let measurements = 0;
@@ -571,6 +608,7 @@ describe('self gate --artifact-dir · 원격 산출 회수', () => {
     const remoteDir = newRemoteArtifactDir();
     try {
       runSharded(remoteDir);
+      writeFileSync(join(remoteDir, 'progress.json'), '{"completedShards":2,"totalShards":2}\n');
       const sh: RemoteSsh = (_host, script) => {
         const run = spawnSync('sh', ['-s'], { input: script, timeout: 60_000 });
         return { rc: run.status, stdout: run.stdout, stderr: run.stderr };
@@ -578,6 +616,7 @@ describe('self gate --artifact-dir · 원격 산출 회수', () => {
       const local = join(tmp(), 'out');
       const result = fetchRemoteGateArtifacts({ host: 'localhost', remoteDir, localDir: local, ssh: sh });
       expect(result).toMatchObject({ ok: true, remoteDirKept: false });
+      expect(JSON.parse(readFileSync(join(local, 'progress.json'), 'utf8'))).toEqual({ completedShards: 2, totalShards: 2 });
       expect(readdirSync(local).filter((name) => name.endsWith('.result.json')).sort()).toEqual([
         'shard-1-1-baseline.result.json', 'shard-1-1-current.result.json', 'shard-2-1-baseline.result.json', 'shard-2-1-current.result.json']);
       const run = JSON.parse(readFileSync(join(local, 'shard-1-1-current.result.json'), 'utf8'));

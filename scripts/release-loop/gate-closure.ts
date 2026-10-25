@@ -5,6 +5,7 @@
 //
 // Read from the tip commit's git objects, never from the working tree (the resume can run from any checkout).
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { dirname, join, normalize } from 'node:path/posix';
 import ts from 'typescript';
 import { sourceCandidates } from '../../src/self-implement/importer-test-index.js';
@@ -228,6 +229,53 @@ export function testsReachingChanged(tree: ClosureTree, changed: readonly string
   const selected = tests.filter((test) => reached.has(test) || blind.has(test)).sort();
   return { ok: true, tests: selected, reached: tests.filter((test) => reached.has(test)).length, opaque: tests.filter((test) => blind.has(test) && !reached.has(test)).length,
     opaqueFiles: [...opaque].filter(([file]) => !preloadClosure.has(file)).map(([file, why]) => `${file}: ${why}`).sort() };
+}
+
+// TRAIN-REACH-GROUPING — two PRs whose reach sets share a test ride the same release train (their gates
+// cannot be reused independently); disjoint reach sets stay separate trains. Pure and deterministic: the
+// ledger is derived from content alone — no file, clock, or network effects.
+
+/** One PR's reach set for train grouping — the `tests` of a `testsReachingChanged` verdict (`ok: true`). */
+export interface TrainReach {
+  /** The PR that owns this reach set (number or url). */
+  readonly pr: string;
+  /** 도달 시험 집합 — tests reaching the PR's changed files. */
+  readonly tests: readonly string[];
+}
+
+/** 묶음 원장 — train grouping ledger returned by `defineTrainGrouping`. */
+export interface TrainGrouping {
+  /** Train id per PR — both PRs share one id when their reach sets intersect. */
+  readonly trainIds: ReadonlyMap<string, string>;
+  /** The tests both reach sets share (sorted, deduped) — empty when they stay separate trains. */
+  readonly intersection: readonly string[];
+  /** True when the reach sets intersect and the two PRs ride the same train. */
+  readonly sameTrain: boolean;
+}
+
+/** Train id derived from content — same parts give the same id; a sha256 slice keeps the ledger readable. */
+const trainIdOf = (parts: readonly string[]): string =>
+  `train-${createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 12)}`;
+
+/** Bundle two PRs' reach sets into trains: intersecting reach sets get one shared train id, disjoint reach
+ * sets keep separate per-PR ids. Deterministic and side-effect free — same inputs, same ledger. */
+export function defineTrainGrouping(left: TrainReach, right: TrainReach): TrainGrouping {
+  const reachOf = (reach: TrainReach): string[] => [...new Set(reach.tests)].sort();
+  const leftTests = reachOf(left);
+  const rightTests = reachOf(right);
+  const rightSet = new Set(rightTests);
+  const shared = leftTests.filter((test) => rightSet.has(test));
+  const trainIds = new Map<string, string>();
+  if (shared.length > 0) {
+    const sharedId = trainIdOf(shared);
+    trainIds.set(left.pr, sharedId);
+    trainIds.set(right.pr, sharedId);
+  } else {
+    // Disjoint reach sets: mix the PR key into each id so even two empty reach sets stay separate trains.
+    trainIds.set(left.pr, trainIdOf([left.pr, ...leftTests]));
+    trainIds.set(right.pr, trainIdOf([right.pr, ...rightTests]));
+  }
+  return { trainIds, intersection: shared, sameTrain: shared.length > 0 };
 }
 
 /** `[test].preload` of a bunfig.toml text (repo-relative). Null when the file has a preload we cannot parse. */

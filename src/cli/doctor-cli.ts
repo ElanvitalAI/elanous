@@ -44,9 +44,11 @@ import {
   DOCTOR_SYMPTOMS,
   DOCTOR_VISIT_SOURCES,
   doctorVisitRunExists,
+  doctorReviewVisits,
   isDoctorSymptom,
   isDoctorVisitSource,
   readDoctorVisits,
+  readDoctorReviewBrief,
   recordAutoLongRunVisit,
   recordDoctorVisit,
   type DoctorSymptom,
@@ -55,6 +57,8 @@ import { formatHostDoctorLines, runHostDoctor, type HostDoctorExpected, type Hos
 import { listMachineResources } from './control-cli.js';
 import type { ResourceView } from '../control-plane/ledger.js';
 import { loadMachineLedger } from '../machines/machine-ledger.js';
+import { LogStore, logsDbPath, type LogStoreRow } from '../mss/logging/log-store.js';
+import { reviewBriefEvidence } from '../self-implement/review-round-brief.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
   const c = checkPythonEnv(false);
@@ -223,10 +227,49 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   hostDoctorMachineResources?: () => Promise<ResourceView[]>;
   /** `doctor visit`/`doctor status` 원장 디렉터리(시험 seam) — 기본 = `runLedgerDir()`. */
   doctorVisitLedgerDir?: string;
+  /** Isolated saved-review and PR metadata seams. */
+  reviewResultsDir?: string;
+  readReviewBriefPr?: Parameters<typeof readDoctorReviewBrief>[1];
+  /** Optional isolated observation transport and status reader for CLI tests. */
+  reviewBriefLog?: (event: Record<string, unknown>) => void;
+  readReviewBriefEvents?: (runId?: string) => Array<{ timestamp?: string; sequence?: number; runId?: string; key?: string; evidence?: string }>;
   /** `doctor visit` 사고 선례 연결 루트(시험 seam) — 기본 = `doctorVisitIncidentRoot()` · `null` 이면 건너뛴다. */
   doctorVisitIncidentRoot?: string | null;
   /** Deterministic clock for `doctor auto-long-run` isolated CLI tests. */
   doctorAutoLongRunNow?: () => string;
+  /** Standalone logs.db registration seam for the two run-doctor CLI emitters. */
+  registerDoctorLogSink?: () => Promise<unknown>;
+  /** Flush seam paired with registerDoctorLogSink. */
+  flushDoctorLogs?: () => void;
+}
+
+export function parseReviewBriefLogData(raw: unknown): Record<string, unknown> {
+  let data: unknown;
+  try { data = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+  catch (error) { throw new Error(`malformed doctor.review/brief-issued event: ${error instanceof Error ? error.message : String(error)}`); }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('malformed doctor.review/brief-issued event: expected object data');
+  const value = data as Record<string, unknown>;
+  if (typeof value.pr !== 'number' || typeof value.head !== 'string' || typeof value.round !== 'number') {
+    throw new Error('malformed doctor.review/brief-issued event: required pr/head/round fields are missing');
+  }
+  return value;
+}
+
+function readReviewBriefEventsFromLogs(dbPath = logsDbPath(), runId?: string): Array<{ timestamp?: string; sequence?: number; runId?: string; key?: string; evidence?: string }> {
+  if (!existsSync(dbPath)) return [];
+  let store: LogStore | undefined;
+  try {
+    store = LogStore.openReadOnly(dbPath);
+    return store.queryAll({ exactCategories: ['doctor.review'], events: ['brief-issued'] }).flatMap((row: LogStoreRow) => {
+      const data = parseReviewBriefLogData(row.data);
+      const rowRunId = typeof data.runId === 'string' && data.runId ? data.runId : undefined;
+      if (runId !== undefined && rowRunId !== runId) return [];
+      return [{ timestamp: new Date(row.ts_ms).toISOString(), sequence: row.id, ...(rowRunId ? { runId: rowRunId } : {}), key: String(data.pr), evidence: `PR #${data.pr} head ${data.head.slice(0, 12)} r${data.round} rx=${String(data.rx)}${data.source === 'pr-disposition' ? ' source=pr-disposition' : ''}` }];
+    });
+  } catch (error) {
+    throw new Error(`review event logs could not be read: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  finally { store?.close(); }
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1293,6 +1336,9 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
   const out = deps.out ?? { log: (value: string) => console.log(value) };
   const err = deps.err ?? { error: (value: string) => console.error(value) };
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
+  const registerDoctorLogSink = deps.registerDoctorLogSink ?? (async () =>
+    (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('cli'));
+  const flushDoctorLogs = deps.flushDoctorLogs ?? (() => debug.flush());
   const doctor = program.command('doctor')
     .description('Reports whether credentials resolve and where each resolution comes from')
     .option('--json', 'structured output');
@@ -1358,9 +1404,10 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
     .argument('<runId>', 'run id whose ledger receives the visit')
     .requiredOption('--started-at <iso>', 'Pod status.startTime as an ISO timestamp')
     .option('--json', 'structured output')
-    .action((runId: string, opts: { startedAt: string; json?: boolean }, command: Command) => {
+    .action(async (runId: string, opts: { startedAt: string; json?: boolean }, command: Command) => {
       const json = opts.json === true || command.parent?.opts().json === true;
       try {
+        await registerDoctorLogSink();
         const result = recordAutoLongRunVisit({ runId, startedAt: opts.startedAt,
           ...(deps.doctorAutoLongRunNow ? { now: deps.doctorAutoLongRunNow() } : {}),
           ...(deps.doctorVisitLedgerDir !== undefined ? { dir: deps.doctorVisitLedgerDir } : {}) });
@@ -1370,6 +1417,8 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
         else err.error(reason);
         setExitCode(1);
+      } finally {
+        flushDoctorLogs();
       }
     });
   doctor.command('visit')
@@ -1379,7 +1428,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
     .requiredOption('--from <who>', `closed sender list: ${DOCTOR_VISIT_SOURCES.join(', ')}`)
     .option('--evidence <text>', 'free-text evidence recorded with the visit')
     .option('--json', 'structured output')
-    .action((runId: string, opts: { symptom: string; from: string; evidence?: string; json?: boolean }, command: Command) => {
+    .action(async (runId: string, opts: { symptom: string; from: string; evidence?: string; json?: boolean }, command: Command) => {
       const json = opts.json === true || command.parent?.opts().json === true;
       if (!isDoctorSymptom(opts.symptom)) {
         const reason = `unknown symptom: ${opts.symptom} — closed list: ${DOCTOR_SYMPTOMS.join(', ')}`;
@@ -1396,6 +1445,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         return;
       }
       try {
+        await registerDoctorLogSink();
         const visit = recordDoctorVisit({
           runId,
           from: opts.from,
@@ -1409,6 +1459,54 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         const reason = error instanceof Error ? error.message : String(error);
         if (json) out.log(JSON.stringify({ status: 'rejected', reason }));
         else err.error(reason);
+        setExitCode(1);
+      } finally {
+        flushDoctorLogs();
+      }
+    });
+  doctor.command('review-brief')
+    .description('Build a review-round card from saved reviews for the current PR head')
+    .requiredOption('--pr <number>', 'PR number')
+    .option('--json', 'structured output')
+    .action(async (opts: { pr: string; json?: boolean }, command: Command) => {
+      const json = opts.json === true || command.parent?.opts().json === true;
+      const pr = Number(opts.pr);
+      if (!Number.isSafeInteger(pr) || pr <= 0) {
+        const reason = 'PR number must be a positive integer';
+        if (json) out.log(JSON.stringify({ status: 'rejected', reason })); else err.error(reason);
+        setExitCode(1);
+        return;
+      }
+      try {
+        const brief = readDoctorReviewBrief(pr, deps.readReviewBriefPr, deps.reviewResultsDir);
+        const event = reviewBriefEvidence(brief);
+        const intentBlock = typeof event.intentBlock === 'string' ? event.intentBlock : null;
+        if (deps.reviewBriefLog) deps.reviewBriefLog(event);
+        else {
+          await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('cli');
+          debug.log('doctor.review', 'brief-issued', event);
+          debug.flush();
+        }
+        out.log(json ? JSON.stringify({ ...brief, intentBlock }, null, 2) : [
+          `PR #${pr} · ${brief.status} · rounds=${brief.rounds} · head=${brief.head.slice(0, 12)} · verdict=${brief.reviewedVerdict} · rx=${brief.rx}`,
+          ...(brief.dispositionEvidence ? [`Source: PR author disposition (current head review unmeasured) · ${brief.dispositionEvidence}`] : []),
+          ...(brief.goalQuestion ? [`Original question: ${brief.goalQuestion}`] : []),
+          ...(brief.acceptanceSignal.length ? ['Acceptance signal:', ...brief.acceptanceSignal.map((item) => `  - ${item}`)] : []),
+          `Core items (${brief.coreItems.length}/${brief.totalCoreItems}):`,
+          ...brief.coreItems.map((item) => `  [${item.kind}] ${item.text}`),
+          ...(brief.omittedCoreItems ? [`Core items omitted: ${brief.omittedCoreItems}; source files: ${brief.resultPaths.join(', ')}`] : []),
+          `Prior findings (${brief.priorFindings.length}/${brief.totalPriorFindings}):`, ...brief.priorFindings.map((item) => `  [${item.kind} · ${item.sourceHead.slice(0, 12)}] ${item.text}`),
+          ...(brief.omittedPriorFindings ? [`Prior findings omitted: ${brief.omittedPriorFindings}; source files: ${brief.resultPaths.join(', ')}`] : []),
+          `Scope candidates (${brief.scopeItems.length}/${brief.totalScopeItems}):`, ...brief.scopeItems.map((item) => `  [${item.kind}] ${item.text}`),
+          ...(brief.omittedScopeItems ? [`Scope candidates omitted: ${brief.omittedScopeItems}; source files: ${brief.resultPaths.join(', ')}`] : []),
+          ...(brief.resultPaths.length ? [`Review source files: ${brief.resultPaths.join(', ')}`] : []),
+          `Scope boundary: ${brief.scopeBoundary}`,
+          ...(intentBlock ? ['R3 intent shadow output:', intentBlock] : []),
+          ...(brief.reason ? [`Reason: ${brief.reason}`] : []),
+        ].join('\n'));
+      } catch (error) {
+        const reason = observationError(error);
+        if (json) out.log(JSON.stringify({ status: 'unavailable', pr, reason })); else err.error(reason);
         setExitCode(1);
       }
     });
@@ -1427,18 +1525,29 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         return;
       }
       const visits = readDoctorVisits(opts.run, ledgerScope);
+      let reviewEvents: Array<{ timestamp?: string; sequence?: number; runId?: string; key?: string; evidence?: string }>;
+      try {
+        reviewEvents = (deps.readReviewBriefEvents ?? ((runId?: string) => readReviewBriefEventsFromLogs(logsDbPath(), runId)))(opts.run);
+      } catch (error) {
+        const reason = observationError(error);
+        if (json) out.log(JSON.stringify({ status: 'unavailable', reason, recordedVisits: visits }, null, 2));
+        else out.log(`Doctor status unavailable: ${reason}\nRecorded doctor visits: ${visits.length}`);
+        setExitCode(1);
+        return;
+      }
+      const statusVisits = [...visits, ...doctorReviewVisits(reviewEvents)];
       const counts = Object.fromEntries(DOCTOR_SYMPTOMS.map((symptom: DoctorSymptom) => [symptom, 0])) as Record<DoctorSymptom, number>;
-      for (const visit of visits) counts[visit.symptom] += 1;
+      for (const visit of statusVisits) counts[visit.symptom] += 1;
       if (json) {
-        out.log(JSON.stringify({ total: visits.length, counts, visits }, null, 2));
+        out.log(JSON.stringify({ total: statusVisits.length, counts, visits: statusVisits }, null, 2));
         return;
       }
       out.log([
-        `Doctor visits: ${visits.length}`,
+        `Doctor visits: ${statusVisits.length}`,
         ...DOCTOR_SYMPTOMS.map((symptom: DoctorSymptom) => `  ${symptom}: ${counts[symptom]}`),
         'Recent visits:',
-        ...visits.map((visit) => `  ${visit.timestamp ?? 'unknown-time'} runId=${visit.runId} from=${visit.from} symptom=${visit.symptom}${visit.evidence !== undefined ? ` evidence=${visit.evidence}` : ''}`),
-        ...(visits.length === 0 ? ['  none'] : []),
+        ...statusVisits.map((visit) => `  ${visit.timestamp ?? 'unknown-time'}${visit.runId ? ` runId=${visit.runId}` : ''} from=${visit.from} symptom=${visit.symptom}${visit.evidence !== undefined ? ` evidence=${visit.evidence}` : ''}`),
+        ...(statusVisits.length === 0 ? ['  none'] : []),
       ].join('\n'));
     });
   doctor

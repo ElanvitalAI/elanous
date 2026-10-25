@@ -1,11 +1,11 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
-import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, humanBreaks, registerDoctorCommand, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
+import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, humanBreaks, parseReviewBriefLogData, registerDoctorCommand, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
 import { checkReadiness } from './doctor-readiness.js';
 import { debug } from '../debug/log.js';
 import { applySudoFixes } from './doctor-fix.js';
@@ -2514,7 +2514,7 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
     return dir;
   }
 
-  function visitCli(dir: string, now?: () => string) {
+  function visitCli(dir: string, now?: () => string, logHooks: { register?: () => Promise<unknown>; flush?: () => void } = {}) {
     const outputs: string[] = [];
     const errors: string[] = [];
     const exitCodes: number[] = [];
@@ -2525,6 +2525,8 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
       // 사고 선례 연결을 결정론적으로 고정(호스트 원장 의존 금지) — 기본은 빈 원장 루트.
       doctorVisitIncidentRoot: join(dir, 'incidents'),
       ...(now ? { doctorAutoLongRunNow: now } : {}),
+      ...(logHooks.register ? { registerDoctorLogSink: logHooks.register } : {}),
+      ...(logHooks.flush ? { flushDoctorLogs: logHooks.flush } : {}),
       out: { log: (line: string) => outputs.push(line) },
       err: { error: (line: string) => errors.push(line) },
       setExitCode: (code: number) => exitCodes.push(code),
@@ -2603,6 +2605,26 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
     expect(visitEvents).toEqual([{ category: 'run-doctor', event: 'visit', data: { runId: canonicalRunId, from: 'child', symptom: 'oom', incidentPrecedents: 0 } }]);
   });
 
+  test('visit and auto-long-run register the standalone sink and flush after emitting', async () => {
+    const dir = seedDoctorVisitLedger();
+    const calls: string[] = [];
+    const cli = visitCli(dir, () => '2026-10-23T01:00:00.000Z', {
+      register: async () => { calls.push('register'); return true; },
+      flush: () => calls.push('flush'),
+    });
+    const events: Array<{ category: string; event: string }> = [];
+    const observation = spyOn(debug, 'log').mockImplementation((category, event) => { events.push({ category, event }); });
+    try {
+      await cli.program.parseAsync(['doctor', 'visit', canonicalRunId, '--symptom', 'oom', '--from', 'child'], { from: 'user' });
+      await cli.program.parseAsync(['doctor', 'auto-long-run', canonicalRunId, '--started-at', '2026-10-23T00:00:00.000Z'], { from: 'user' });
+    } finally {
+      observation.mockRestore();
+    }
+    expect(events.filter((event) => event.category === 'run-doctor' && event.event === 'visit')).toHaveLength(2);
+    expect(calls).toEqual(['register', 'flush', 'register', 'flush']);
+    expect(cli.exitCodes).toEqual([]);
+  });
+
   test('status --run refuses a runId with no ledger instead of reporting zero visits (rc!=0)', async () => {
     const dir = seedDoctorVisitLedger();
     const cli = visitCli(dir);
@@ -2661,6 +2683,214 @@ describe('doctor visit (DOCTOR-VISIT)', () => {
     expect(scoped).toContain('Doctor visits: 1');
     expect(scoped).toContain('symptom=no-progress');
     expect(scoped).not.toContain('symptom=oom');
+  });
+
+  test('doctor review-brief --pr --json reads saved reviewed heads and projects one review-loop status row without changing the run ledger', async () => {
+    const dir = seedDoctorVisitLedger();
+    const results = join(seededRoots.at(-1)!, 'review-results');
+    mkdirSync(results);
+    const head = 'a'.repeat(40);
+    for (let i = 0; i < 9; i++) {
+      const reviewedHead = i === 8 ? head : String(i + 1).repeat(40);
+      writeFileSync(join(results, `card-${i}-29322-${reviewedHead.slice(0, 12)}.json`), JSON.stringify({
+        pr: 29322, headCommit: reviewedHead, reviewed: true, verdict: i === 8 ? 'fail' : 'pass',
+        mustFix: i === 8 ? ['prefetchedCut success must remain in verdict after recheck batch fails'] : [],
+      }));
+    }
+    const output: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options(), doctorVisitLedgerDir: dir, reviewResultsDir: results,
+      readReviewBriefPr: (pr) => { expect(pr).toBe(29322); return { headRefOid: head, body: '## Q\nWhat remains?\n\n## A\n- Keep the original signal.', files: [] }; },
+      reviewBriefLog: (event) => events.push(event),
+      readReviewBriefEvents: () => events.map((event) => ({ key: event.key as string, evidence: `PR #${event.pr} r${event.round}` })),
+      out: { log: (value) => output.push(value) }, setExitCode: () => {},
+    });
+    const before = [canonicalRunId, anotherRunId].map((runId) => readFileSync(join(dir, `${runId}.jsonl`), 'utf8'));
+    await program.parseAsync(['doctor', 'review-brief', '--pr', '29322', '--json'], { from: 'user' });
+    expect(JSON.parse(output.at(-1)!)).toMatchObject({ pr: 29322, rounds: 9, currentHeadMeasured: true, status: 'ready', rx: 'continue', totalCoreItems: 1,
+      coreItems: [{ text: 'prefetchedCut success must remain in verdict after recheck batch fails', kind: 'unclassified' }] });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ pr: 29322, round: 9, coreItems: 1, rx: 'continue' });
+    await program.parseAsync(['doctor', 'review-brief', '--pr', '29322', '--json'], { from: 'user' });
+    expect(events).toHaveLength(2);
+    await program.parseAsync(['doctor', 'status'], { from: 'user' });
+    expect(output.at(-1)!.split('\n').filter((line) => /^  review-loop:/.test(line))).toEqual(['  review-loop: 1']);
+    await program.parseAsync(['doctor', 'status', '--json'], { from: 'user' });
+    expect(JSON.parse(output.at(-1)!).counts['review-loop']).toBe(1);
+    expect([canonicalRunId, anotherRunId].map((runId) => readFileSync(join(dir, `${runId}.jsonl`), 'utf8'))).toEqual(before);
+    expect(ledgerEntries(dir, canonicalRunId).filter((entry) => entry.event === 'doctor-visit')).toHaveLength(0);
+  });
+
+  test('status keeps only the latest brief for a PR head when its round changes', async () => {
+    const cli = visitCli(seedDoctorVisitLedger());
+    const events = [
+      { key: '29322:head', timestamp: '2026-10-19T12:00:00.000Z', evidence: 'PR #29322 r0 rx=decision-card' },
+      { key: '29322:head', timestamp: '2026-10-19T13:00:00.000Z', evidence: 'PR #29322 r9 rx=split source=pr-disposition' },
+    ];
+    const program = new Command();
+    const output: string[] = [];
+    registerDoctorCommand(program, { ...options(), doctorVisitLedgerDir: seededRoots.at(-1)!, readReviewBriefEvents: () => events,
+      out: { log: (value) => output.push(value) }, setExitCode: () => {} });
+    await program.parseAsync(['doctor', 'status', '--json'], { from: 'user' });
+    const report = JSON.parse(output.at(-1)!);
+    expect(report.counts['review-loop']).toBe(1);
+    expect(report.visits.filter((item: { symptom: string }) => item.symptom === 'review-loop').map((item: { evidence: string }) => item.evidence))
+      .toEqual(['PR #29322 r9 rx=split source=pr-disposition']);
+  });
+
+  test('status uses the newest logged brief for one PR even when timestamps tie', async () => {
+    const dir = seedDoctorVisitLedger();
+    const before = readFileSync(join(dir, `${canonicalRunId}.jsonl`), 'utf8');
+    const output: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, { ...options(), doctorVisitLedgerDir: dir,
+      readReviewBriefEvents: () => [
+        { key: '29322:old', timestamp: '2026-10-19T12:00:00.000Z', sequence: 10, evidence: 'PR #29322 r8 rx=continue' },
+        { key: '29322:new', timestamp: '2026-10-19T12:00:00.000Z', sequence: 11, evidence: 'PR #29322 r9 rx=split' },
+      ], out: { log: (value) => output.push(value) }, setExitCode: () => {} });
+    await program.parseAsync(['doctor', 'status', '--json'], { from: 'user' });
+    const report = JSON.parse(output.at(-1)!);
+    expect(report.counts['review-loop']).toBe(1);
+    expect(report.visits.filter((visit: { symptom: string }) => visit.symptom === 'review-loop').map((visit: { evidence: string }) => visit.evidence))
+      .toEqual(['PR #29322 r9 rx=split']);
+    expect(readFileSync(join(dir, `${canonicalRunId}.jsonl`), 'utf8')).toBe(before);
+  });
+
+  test('status retains one latest review-loop row when the same PR changes head', async () => {
+    const program = new Command();
+    const output: string[] = [];
+    registerDoctorCommand(program, { ...options(), doctorVisitLedgerDir: seedDoctorVisitLedger(),
+      readReviewBriefEvents: () => [
+        { key: '29322:old-head', timestamp: '2026-10-19T12:00:00.000Z', evidence: 'PR #29322 head old r8 rx=continue' },
+        { key: '29322:new-head', timestamp: '2026-10-19T13:00:00.000Z', evidence: 'PR #29322 head new r9 rx=split' },
+        { key: '29323:other-head', timestamp: '2026-10-19T11:00:00.000Z', evidence: 'PR #29323 r1 rx=continue' },
+      ], out: { log: (value) => output.push(value) }, setExitCode: () => {} });
+    await program.parseAsync(['doctor', 'status', '--json'], { from: 'user' });
+    const report = JSON.parse(output.at(-1)!);
+    expect(report.counts['review-loop']).toBe(2);
+    expect(report.visits.filter((visit: { symptom: string }) => visit.symptom === 'review-loop').map((visit: { evidence: string }) => visit.evidence))
+      .toEqual(['PR #29322 head new r9 rx=split', 'PR #29323 r1 rx=continue']);
+  });
+
+  test('status reports review-log read failures as unavailable instead of an empty review-loop count', async () => {
+    const output: string[] = [];
+    const exitCodes: number[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, { ...options(), doctorVisitLedgerDir: seedDoctorVisitLedger(),
+      readReviewBriefEvents: () => { throw new Error('database locked'); },
+      out: { log: (value) => output.push(value) }, setExitCode: (code) => exitCodes.push(code) });
+    await program.parseAsync(['doctor', 'status', '--json'], { from: 'user' });
+    const report = JSON.parse(output.at(-1)!);
+    expect(report).toMatchObject({ status: 'unavailable', reason: 'database locked' });
+    expect(report.counts).toBeUndefined();
+    expect(exitCodes).toEqual([1]);
+  });
+
+  test('malformed brief-issued JSON is a review-log read failure', () => {
+    expect(() => parseReviewBriefLogData('{broken')).toThrow('malformed doctor.review/brief-issued event');
+    expect(() => parseReviewBriefLogData('{"pr": 8}')).toThrow('required pr/head/round fields are missing');
+  });
+
+  test('review-brief projects the author split disposition without writing a reviewed result or changing the run ledger', async () => {
+    const dir = seedDoctorVisitLedger();
+    const before = readFileSync(join(dir, `${canonicalRunId}.jsonl`), 'utf8');
+    const results = join(seededRoots.at(-1)!, 'empty-review-results');
+    mkdirSync(results);
+    const comment = 'OP: superseded by #29368 · 남은 범위 = WARM-POD-LATE-LEASE-FENCE-FU(0.2.35). r9 상한 초과로 분리.';
+    const outputs: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options(), doctorVisitLedgerDir: dir, reviewResultsDir: results,
+      readReviewBriefPr: () => ({ headRefOid: 'a'.repeat(40), body: '', files: [], comments: [{ author: 'owner', body: comment }] }),
+      reviewBriefLog: () => {}, out: { log: (value) => outputs.push(value) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', 'review-brief', '--pr', '29322', '--json'], { from: 'user' });
+    const brief = JSON.parse(outputs.at(-1)!);
+    expect(brief).toMatchObject({ pr: 29322, source: 'pr-disposition', status: 'disposition-only', rounds: 0, currentHeadMeasured: false, rx: 'split', totalCoreItems: 1, dispositionEvidence: comment });
+    expect(brief.coreItems).toHaveLength(1);
+    expect(brief.resultPaths).toEqual([]);
+    expect(readFileSync(join(dir, `${canonicalRunId}.jsonl`), 'utf8')).toBe(before);
+  });
+
+  test('review-brief observation survives across isolated production CLI processes and status projects one review-loop row', () => {
+    const root = mkdtempSync(join(tmpdir(), 'doctor-review-brief-live-'));
+    seededRoots.push(root);
+    const stateRoot = join(root, 'instance');
+    const fakeBin = join(root, 'bin');
+    const reviews = join(stateRoot, 'review-results');
+    mkdirSync(reviews, { recursive: true });
+    mkdirSync(fakeBin);
+    writeFileSync(join(stateRoot, 'config.json'), '{}');
+    const head = 'b'.repeat(40);
+    writeFileSync(join(reviews, `saved-78-${head.slice(0, 12)}.json`), JSON.stringify({ pr: 78, headCommit: head, reviewed: true, verdict: 'warn', mustFix: [] }));
+    const metadataPath = join(root, 'pr-metadata.json');
+    writeFileSync(metadataPath, JSON.stringify({ headRefOid: head, body: '## A\n- Saved acceptance signal', files: [] }));
+    const ghPath = join(fakeBin, 'gh');
+    writeFileSync(ghPath, `#!/bin/sh\ncat '${metadataPath}'\n`);
+    chmodSync(ghPath, 0o755);
+    const cliPath = join(process.cwd(), 'bin/elanous.mjs');
+    const env = { ...process.env, NODE_ENV: 'production', PATH: `${fakeBin}:${process.env.PATH ?? ''}`, ELANOUS_STATE_DIR: stateRoot };
+    const args = [cliPath, `--test=${stateRoot}`, 'doctor'];
+    const issue = spawnSync(process.execPath, [...args, 'review-brief', '--pr', '78', '--json'], { cwd: process.cwd(), env, encoding: 'utf8', timeout: 60_000 });
+    expect(issue.status).toBe(0);
+    expect(JSON.parse(issue.stdout.slice(issue.stdout.indexOf('{')))).toMatchObject({ status: 'ready', pr: 78, rounds: 1, rx: 'partial-land' });
+    expect(existsSync(join(stateRoot, 'logs', 'logs.db'))).toBe(true);
+    const status = spawnSync(process.execPath, [...args, 'status', '--json'], { cwd: process.cwd(), env, encoding: 'utf8', timeout: 60_000 });
+    expect(status.status).toBe(0);
+    const report = JSON.parse(status.stdout.slice(status.stdout.indexOf('{')));
+    expect(report).toMatchObject({ total: 1, counts: { 'review-loop': 1 }, visits: [{ symptom: 'review-loop', evidence: `PR #78 head ${head.slice(0, 12)} r1 rx=partial-land` }] });
+    const nextHead = 'c'.repeat(40);
+    writeFileSync(metadataPath, JSON.stringify({ headRefOid: nextHead, body: '## A\n- Saved acceptance signal', files: [] }));
+    const nextIssue = spawnSync(process.execPath, [...args, 'review-brief', '--pr', '78', '--json'], { cwd: process.cwd(), env, encoding: 'utf8', timeout: 60_000 });
+    expect(nextIssue.status).toBe(0);
+    expect(JSON.parse(nextIssue.stdout.slice(nextIssue.stdout.indexOf('{')))).toMatchObject({ status: 'stale', pr: 78, rounds: 1, rx: 'decision-card' });
+    const nextStatus = spawnSync(process.execPath, [...args, 'status', '--json'], { cwd: process.cwd(), env, encoding: 'utf8', timeout: 60_000 });
+    expect(nextStatus.status).toBe(0);
+    const latest = JSON.parse(nextStatus.stdout.slice(nextStatus.stdout.indexOf('{')));
+    expect(latest).toMatchObject({ total: 1, counts: { 'review-loop': 1 }, visits: [{ symptom: 'review-loop', evidence: `PR #78 head ${nextHead.slice(0, 12)} r1 rx=decision-card` }] });
+    expect(existsSync(join(stateRoot, 'run-ledger'))).toBe(false);
+  }, 60_000);
+
+  test('production PR lookup does not treat another author’s split comment as the PR owner’s disposition', () => {
+    const root = mkdtempSync(join(tmpdir(), 'doctor-review-brief-author-'));
+    seededRoots.push(root);
+    const stateRoot = join(root, 'instance');
+    const fakeBin = join(root, 'bin');
+    mkdirSync(stateRoot);
+    mkdirSync(fakeBin);
+    writeFileSync(join(stateRoot, 'config.json'), '{}');
+    const metadata = JSON.stringify({ headRefOid: 'c'.repeat(40), body: '', files: [], author: { login: 'owner' },
+      comments: [{ author: { login: 'other' }, body: '남은 범위 = wrong. r9 상한 초과로 분리.' }] });
+    const ghPath = join(fakeBin, 'gh');
+    writeFileSync(ghPath, `#!/bin/sh\nprintf '%s\\n' '${metadata}'\n`);
+    chmodSync(ghPath, 0o755);
+    const cliPath = join(process.cwd(), 'bin/elanous.mjs');
+    const env = { ...process.env, NODE_ENV: 'production', PATH: `${fakeBin}:${process.env.PATH ?? ''}`, ELANOUS_STATE_DIR: stateRoot };
+    const issued = spawnSync(process.execPath, [cliPath, `--test=${stateRoot}`, 'doctor', 'review-brief', '--pr', '79', '--json'],
+      { cwd: process.cwd(), env, encoding: 'utf8', timeout: 60_000 });
+    expect(issued.status).toBe(0);
+    expect(JSON.parse(issued.stdout.slice(issued.stdout.indexOf('{')))).toMatchObject({
+      pr: 79, source: 'none', status: 'unmeasured', rounds: 0, currentHeadMeasured: false, rx: 'decision-card',
+    });
+  }, 60_000);
+
+  test('review-brief rejects an invalid PR number without consulting GitHub or writing a ledger', async () => {
+    const dir = seedDoctorVisitLedger();
+    const before = readFileSync(join(dir, `${canonicalRunId}.jsonl`), 'utf8');
+    const outputs: string[] = [];
+    const exitCodes: number[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options(), doctorVisitLedgerDir: dir,
+      readReviewBriefPr: () => { throw new Error('must not read PR'); },
+      out: { log: (value) => outputs.push(value) }, setExitCode: (code) => exitCodes.push(code),
+    });
+    await program.parseAsync(['doctor', 'review-brief', '--pr', 'invalid', '--json'], { from: 'user' });
+    expect(JSON.parse(outputs.at(-1)!)).toMatchObject({ status: 'rejected', reason: 'PR number must be a positive integer' });
+    expect(exitCodes).toEqual([1]);
+    expect(readFileSync(join(dir, `${canonicalRunId}.jsonl`), 'utf8')).toBe(before);
   });
 
   test('bare doctor output and exit code are unchanged by the visit/status subcommands', async () => {

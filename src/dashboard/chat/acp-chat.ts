@@ -89,6 +89,8 @@ export interface AcpChatHandlers {
   /** Append streamed assistant text. Caller accumulates + redraws.
    *  Receives each chunk exactly as the ACP agent emits it. */
   appendChunk: (delta: string) => void;
+  /** A goal iteration ended; fold only that interim reply in the visible pane. */
+  foldGoalInterim?: (text: string) => void;
   /** Called once per tool_call event with a rendered label like
    *  "→ tool: read_file(/tmp/foo)". Dashboard writes these into the
    *  log pane with a subdued style. */
@@ -430,6 +432,13 @@ export class DashboardAcpChat {
   private dispatchUpdate(update: SessionUpdate, handlers: AcpChatHandlers, sess: AcpChatSession): void {
     switch (update.sessionUpdate) {
       case 'agent_message_chunk': {
+        const interim = (update as typeof update & { _meta?: { goalInterim?: unknown } })._meta?.goalInterim;
+        if (typeof interim === 'string') {
+          this.closeStreamBuffer(sess, 'flush');
+          handlers.foldGoalInterim?.(interim);
+          handlers.redraw?.();
+          return;
+        }
         const c = update.content;
         if (c.type === 'text') {
           this.routeText(sess, c.text, handlers);

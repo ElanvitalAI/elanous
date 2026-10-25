@@ -9,6 +9,9 @@
 // 재는 명령: `bun scripts/land-global-checks.ts` (표) · `bun scripts/land-global-checks.ts <바뀐 파일…>` (끌려오는 시험)
 
 import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 type LandGlobalCheck = {
   /** 바뀐 파일 경로(저장소 루트 기준 · `/` 구분)에 대는 꼴. */
@@ -19,9 +22,16 @@ type LandGlobalCheck = {
   why: string;
 };
 
+/** 착지 게이트가 실물 판정하는 next.md 경로 꼴 — 이번 착지가 이 꼴을 바꿀 때만 next.md 판정(landNextMdGate)이 돈다. */
+const NEXT_MD_PATTERN = /^release\/next\.md$/;
+
 export const LAND_GLOBAL_CHECKS: readonly LandGlobalCheck[] = [
   { pattern: /^apps\/pwa\/.+\.tsx$/, test: 'test/hook-order-sweep.test.ts', why: 'PWA 컴포넌트 훅 순서(#24719)' },
-  { pattern: /^release\/next\.md$/, test: 'scripts/release-story/draft.test.ts', why: '판 노트 초안·브랜드 규칙(#24688)' },
+  { pattern: NEXT_MD_PATTERN, test: 'scripts/release-story/draft.test.ts', why: '판 노트 초안·브랜드 규칙(#24688)' },
+  // 초안 규칙(draft.test)은 노트 줄에 B11 이 «없음»을 단언하는 길이라 발행 판정과 자가 다르다 — 0.2.24 는
+  //   next.md 의 «신설:» 한 줄로 컷 노드 notes-check 가 두 번 ✗ 났는데(10-12 01:28 · 01:51) 착지에서는 그 줄이 통과했다.
+  //   착지 판정이 실제 next.md 를 발행과 같은 check() 로 보게 `landNextMdGate`(runLandGlobalChecksGate 안)가 판정 자를 맞춘다.
+  { pattern: NEXT_MD_PATTERN, test: 'scripts/announce-loop/check-node.test.ts', why: '발행 노트 한국어 B11(0.2.24 notes-check)' },
   { pattern: /^docs\/ops\/machines\.yaml$/, test: 'test/machines-ledger-data.test.ts', why: '기계 원장 데이터 ↔ 생성 Markdown(#24729)' },
   // 새 CLI 하위 명령은 `src/index.ts` 또는 `src/cli/` 의 등록 모듈에서 생긴다 — 입구 목록 시험(#24661).
   { pattern: /^src\/(?:index|cli\/(?:[^/]+\/)*[^/]+)(?<!\.test)\.ts$/, test: 'src/index.test.ts', why: 'CLI 입구·하위 명령 목록(#24661)' },
@@ -41,6 +51,59 @@ export function landGlobalChecks(changedFiles: readonly string[], table: readonl
 
 export type LandGlobalChecksRun = { status: number | null; output: string; error?: string };
 
+const CHECK_NODE_SCRIPT = join(import.meta.dir, 'announce-loop', 'check-node.ts');
+
+type NextMdFinding = { rule: string; file: string; line: number; text: string };
+
+/** 발행 notes-check 와 같은 check()(scripts/announce-loop/check-node.ts)에 «실제 저장소의» release/next.md 를 넣고
+ * «착지» 범위(--landing)로 돈다 — gh·fetch 없이 B11·B8·공유 줄 규칙만(B1·B10 네트워크 검사는 발행 판정에만 있다). */
+function runNextMdCheck(cwd: string): LandGlobalChecksRun {
+  const dir = mkdtempSync(join(tmpdir(), 'land-next-md-'));
+  const prfaq = join(dir, 'prfaq.md');
+  writeFileSync(prfaq, '');
+  try {
+    const r = spawnSync('bun', [CHECK_NODE_SCRIPT, '--landing', '--prfaq', prfaq, '--files', 'release/next.md'], {
+      cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 60_000,
+    });
+    return { status: r.status, output: `${r.stdout ?? ''}\n${r.stderr ?? ''}`, ...(r.error ? { error: r.error.message } : {}) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 착지 게이트가 실제 release/next.md 를 발행 판정과 같은 check() 로 본다 — 0.2.24 어긋남(착지 통과 · 발행 B11 ✗) 수리.
+ * ⚠️ 파일이 없으면 «해당 없음»으로 통과한다(착지 게이트는 무대의 실물만 본다).
+ * 호출부(runLandGlobalChecksGate)는 이번 착지의 바뀐 파일에 release/next.md 가 있을 때만 부른다 —
+ *   next.md 를 건드리지 않은 PR 은 main 의 next.md 상태에 영향을 받지 않는다.
+ * 판정 범위는 «착지»(--landing) — B11·B8·공유 줄 규칙만. B1(PR 참조)·B10(링크) 네트워크 검사는 발행 판정에만 있다.
+ */
+export function landNextMdGate(cwd: string, io: { log: (message: string) => void; error: (message: string) => void }): boolean {
+  const nextMd = join(cwd, 'release', 'next.md');
+  if (!existsSync(nextMd)) return true;
+  const result = runNextMdCheck(cwd);
+  if (result.error !== undefined || result.status === null) {
+    throw new Error(`release/next.md 발행 노트 검사 러너가 못 돌았다 — ${result.error ?? 'status=null'}`);
+  }
+  if (result.status === 0) {
+    io.log('✓ land-global-checks: 실제 release/next.md 발행 노트 검사(check-node) PASS — 위반 0.');
+    return true;
+  }
+  let findings: NextMdFinding[] = [];
+  const jsonLine = result.output.split(/\r?\n/).find((line) => line.trim().startsWith('{'));
+  if (jsonLine !== undefined) {
+    try { findings = (JSON.parse(jsonLine) as { findings?: NextMdFinding[] }).findings ?? []; } catch { findings = []; }
+  }
+  if (findings.length === 0) {
+    io.error(`✗ land-global-checks: 실제 release/next.md 발행 노트 검사(check-node)가 실패했다(종료 ${result.status}) — ${result.output.trim().split(/\r?\n/).at(-1) ?? ''}`);
+  }
+  for (const f of findings) {
+    io.error(`✗ land-global-checks: 실제 release/next.md — 발행 노트 검사(check-node) 위반 ${f.rule} ${f.file}:${f.line} ${f.text.trim()}`);
+  }
+  io.error('✗ land-global-checks: scripts/land-global-checks.ts blocked pr land — 실제 release/next.md 가 발행 notes-check(check-node) 판정에서 위반했다. 발행 판정과 착지 판정의 B11 자를 맞추려면 노트를 고치고 착지하라.');
+  return false;
+}
+
 type LandGlobalChecksGateIo = {
   changedFiles: readonly string[];
   cwd: string;
@@ -59,9 +122,14 @@ function runDeterministic(tests: readonly string[], cwd: string): LandGlobalChec
 
 /**
  * 반환: true = 해당 없음 또는 끌려온 시험 통과 · false = 끌려온 시험이 실패했다(착지를 막는다).
+ * 실물 next.md 판정(landNextMdGate)은 이번 착지가 release/next.md 를 바꿀 때만 돈다 — 머리 주석의
+ * «바뀐 파일 꼴로 끌어온다» 계약을 따른다. next.md 를 건드리지 않은 PR 은 main 의 next.md 상태를 보지 않는다.
  * ⛔ 러너가 «못 돌았다»(spawn 실패·시간 초과)면 던진다 — 호출부(`gateVerdict`)가 「검사 못 함」으로 말한다.
  */
 export function runLandGlobalChecksGate(io: LandGlobalChecksGateIo): boolean {
+  if (io.changedFiles.some((file) => NEXT_MD_PATTERN.test(file.replace(/\\/g, '/')))) {
+    if (!landNextMdGate(io.cwd, io)) return false;
+  }
   const tests = landGlobalChecks(io.changedFiles);
   if (tests.length === 0) {
     io.log(`[land-global-checks] 해당 없음 — 바뀐 파일 ${io.changedFiles.length}개가 전역 검사 표(${LAND_GLOBAL_CHECKS.length}줄)의 꼴에 안 걸린다.`);

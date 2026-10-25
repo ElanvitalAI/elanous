@@ -24,6 +24,21 @@ function captureLaunch(config?: UserConfig, useRealHostConfig = false) {
 }
 
 describe('Pod fallback chain relay', () => {
+  test('carries only the host ZAI overage policy in the child config', async () => {
+    const { applied, done } = captureLaunch({ llm: {
+      fallbackChain: ['codex-rotate', 'grok'],
+      zaiCodingPlan: { overage: 'openrouter', maxConcurrent: 9 },
+    } } as UserConfig);
+    await done;
+    const [secret] = applied as [{ stringData: Record<string, string> }];
+    const childConfig = JSON.parse(secret.stringData['llm-fallback-config.json']!);
+    expect(childConfig).toEqual({ llm: {
+      fallbackChain: ['codex-rotate', 'grok'],
+      zaiCodingPlan: { overage: 'openrouter' },
+    } });
+    expect(Object.keys(childConfig.llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
+  });
+
   test('carries the host chain in order and installs it before the child starts', async () => {
     const { applied, done } = captureLaunch({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'] } } as UserConfig);
     await done;
@@ -31,7 +46,8 @@ describe('Pod fallback chain relay', () => {
       { stringData: Record<string, string> },
       { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
     ];
-    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'] } });
+    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } } });
+    expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
     expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!))).toEqual(['llm']);
     const script = job.spec.template.spec.containers[0]!.args[0]!;
     expect(script).toContain('ELANOUS_POD_FALLBACK_CHAIN source=host steps=codex-rotate,codex-credits,grok');
@@ -45,7 +61,8 @@ describe('Pod fallback chain relay', () => {
       { stringData: Record<string, string> },
       { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
     ];
-    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'grok'] } });
+    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'grok'], zaiCodingPlan: { overage: 'stop' } } });
+    expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
     expect(job.spec.template.spec.containers[0]!.args[0]).toContain('ELANOUS_POD_FALLBACK_CHAIN source=default steps=codex-rotate,grok');
   });
 
@@ -62,7 +79,8 @@ describe('Pod fallback chain relay', () => {
         { stringData: Record<string, string> },
         { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
       ];
-      expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'] } });
+      expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } } });
+      expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
       expect(job.spec.template.spec.containers[0]!.args[0]).toContain('ELANOUS_POD_FALLBACK_CHAIN source=host steps=codex-rotate,codex-credits,grok');
     } finally {
       resetElanousConfigDir();
@@ -79,7 +97,7 @@ describe('Pod fallback chain relay', () => {
       { stringData: Record<string, string> },
       { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
     ];
-    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits'] } });
+    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits'], zaiCodingPlan: { overage: 'stop' } } });
     expect(job.spec.template.spec.containers[0]!.args[0]).not.toContain('unknown-step');
   });
 

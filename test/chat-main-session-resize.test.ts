@@ -19,6 +19,7 @@ const frame: PromptFrame = {
 };
 
 const escapeKey = { name: 'escape', ctrl: false, shift: false } as Key;
+const resizeDebounceWindow = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 20));
 
 /** Ends a pending input turn even when an assertion threw mid-test, so a
  *  failing case cannot leave a live readKey loop behind for later tests. */
@@ -181,11 +182,12 @@ describe('chat main prompt resize', () => {
 
       await Promise.resolve();
       await Promise.resolve();
-      const captureWidth = (cols: number): void => {
+      const captureWidth = async (cols: number): Promise<void> => {
         writes.length = 0;
         sessionDividers.length = 0;
         process.stdout.columns = cols;
         process.stdout.emit('resize');
+        await resizeDebounceWindow();
         const output = writes.join('');
         const rows = output.split(/(?=\x1b\[\d+;1H)/);
         // Session side: the resize repaint must make paintChrome build its
@@ -235,9 +237,9 @@ describe('chat main prompt resize', () => {
         expect(visibleWidth(stripAnsi(continuationWrite ?? ''))).toBe(cols - 1);
       };
 
-      captureWidth(120);
-      captureWidth(80);
-      captureWidth(120);
+      await captureWidth(120);
+      await captureWidth(80);
+      await captureWidth(120);
       releaseRead?.(escapeKey);
       expect((await pending).submitted).toBe(false);
     } finally {
@@ -298,16 +300,17 @@ describe('chat main prompt resize', () => {
       releaseRead?.({ name: 'r', ctrl: true, shift: false } as Key);
       await Promise.resolve();
       await Promise.resolve();
-      const searchRowAt = (cols: number): string | undefined => {
+      const searchRowAt = async (cols: number): Promise<string | undefined> => {
         writes.length = 0;
         process.stdout.columns = cols;
         process.stdout.emit('resize');
+        await resizeDebounceWindow();
         return writes.join('').split(/(?=\x1b\[\d+;1H)/).filter((write) => write.includes('reverse-i-search')).at(-1);
       };
       // The search row is padded to the input width, so its exact width
       // separates a new-width repaint from a stale old-width one.
       for (const cols of [80, 120, 80]) {
-        const searchRow = searchRowAt(cols);
+        const searchRow = await searchRowAt(cols);
         expect(searchRow).toBeDefined();
         expect(visibleWidth(stripAnsi(searchRow ?? ''))).toBe(cols - 1);
       }
@@ -384,7 +387,7 @@ describe('chat main prompt resize', () => {
         process.stdout.columns = cols;
         writes.length = 0;
         process.stdout.emit('resize');
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await resizeDebounceWindow();
         const rendered = writes.join('');
         const pickerWrites = rendered.split(/(?=\u001b\[\d+;1H)/)
           .filter((write) => write.includes('\u001b[2K') && /help|Slash commands/i.test(stripAnsi(write)));

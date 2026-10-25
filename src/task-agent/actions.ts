@@ -1,8 +1,12 @@
 import { copyFileSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { join, relative, resolve, sep } from 'node:path';
+import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
 import { judgeNextMove, retryMoveOf, SAME_MOVE_FAILURE_LIMIT } from './judge.js';
 import { checkCompletionEvidence } from './completion-evidence.js';
+import { appendGreenSweepEvidence, decideGreenSweep, greenSweepCandidates, observeGreenSweep, type GreenSweepPr, type GreenSweepVerdict } from './green-sweep.js';
+import type { TaskCard } from './task-hand.js';
+import type { ChecklistItem } from '../release-loop/checklist.js';
 
 export type DeliveryKind = 'research-report' | 'artifact' | 'content';
 export interface DeliveryEvidence { ok: boolean; files: string[]; reason: string }
@@ -44,6 +48,8 @@ export interface NextAction {
   original: string;
   checklistId: string;
   history?: string[];
+  /** Only a producer bound to this PR may mark its owner worktree commit as harvesting. */
+  harvestState?: { pr: number; source: 'owner-worktree-commit'; head: string };
   mustFix?: string[];
   cwd?: string;
   risk?: 'money' | 'security' | 'irreversible-publication';
@@ -52,7 +58,7 @@ export interface NextAction {
   moveId?: string;
 }
 export interface ActionDeps {
-  command(args: string[]): Promise<{ status: number; stdout: string; stderr?: string }>;
+  command(args: string[], cwd?: string): Promise<{ status: number; stdout: string; stderr?: string }>;
   mode?: string;
   landingsToday?: number;
   landingDay?: string;
@@ -73,6 +79,14 @@ export interface ActionDeps {
   retryLaunches?: { count: number };
   /** mbp 부하 관문(OP 신호 `loadMax`) — 지금 1분 부하가 `loadMax` 이상이거나 못 읽으면 발사하지 않고 shadow. 없으면 관문 없음(종전). */
   loadGate?: { loadMax: number; load1(): number | null };
+  /** GREEN-FROM-LEDGER-FU — green live 쓰기 문맥(관측 probe ⊕ 칸 원문·판본·과제 카드). 실행부 green 경로가 소비자
+   *  `consumeGreenSweepForGreenWrite`를 지나 원문 대조가 모두 일치할 때만 checklist green 쓰기를 1회 한다.
+   *  없으면 종전 그대로 검증 안내 카드(fail-closed) — 문맥 없이 green 은 쓰지 않는다. */
+  greenSweep?: { probe: GreenSweepProbe; item: ChecklistItem; version: string; cards: readonly TaskCard[] };
+  /** Checklist green writes are a separate OP-authorized capability; default is observation only. */
+  greenWriteLive?: boolean;
+  /** Read-only owner checkout probe for review harvest verification. */
+  harvestGit?: (cwd: string, args: string[]) => { status: number | null; stdout: string };
 }
 
 /** 재발사는 한 판단 회차에 한 건만 발사한다. */
@@ -178,6 +192,28 @@ const RETRY_HINT: Record<Exclude<RetryVariant, 'wait'>, (action: NextAction) => 
   alternative: () => 'Alternative approach: the same move already failed twice. Choose a different approach than the previous runs.',
 };
 
+export function ownerWorktreeHarvestState(input: { pr: number; cwd: string; head: string; branch: string; state: string },
+  gitRun?: (cwd: string, args: string[]) => { status: number | null; stdout: string }): NextAction['harvestState'] {
+  if (!Number.isSafeInteger(input.pr) || input.pr < 1 || input.state !== 'OPEN' || !/^[a-f0-9]{40}$/i.test(input.head)) return undefined;
+  const git = gitRun ?? ((cwd: string, args: string[]) => {
+    const result = runGitCommand(cwd, args, { encoding: 'utf-8' });
+    return { status: result.status, stdout: String(result.stdout ?? '') };
+  });
+  try {
+    const cwd = realpathSync(input.cwd);
+    const [branch, local, registry] = [git(cwd, ['branch', '--show-current']), git(cwd, ['rev-parse', 'HEAD']), git(cwd, ['worktree', 'list', '--porcelain'])];
+    const name = branch.stdout.trim();
+    const commit = local.stdout.trim();
+    if (branch.status !== 0 || !name || local.status !== 0 || !/^[a-f0-9]{40}$/i.test(commit) || registry.status !== 0) return undefined;
+    const owners = registry.stdout.trim().split(/\n\s*\n/).filter(entry => entry.split('\n').includes(`branch refs/heads/${name}`));
+    const ownerPath = owners[0]?.split('\n').find(line => line.startsWith('worktree '))?.slice('worktree '.length);
+    if (owners.length !== 1 || !ownerPath || realpathSync(ownerPath) !== cwd) return undefined;
+    if (input.branch !== name || input.head.toLowerCase() === commit.toLowerCase()) return undefined;
+    if (git(cwd, ['merge-base', '--is-ancestor', input.head, commit]).status !== 0) return undefined;
+    return { pr: input.pr, source: 'owner-worktree-commit', head: commit };
+  } catch { return undefined; }
+}
+
 export async function executeNextAction(action: NextAction, deps: ActionDeps): Promise<string> {
   const record = (result: string, reason: string) => {
     if (result === 'failed' && (deps.failureCounts || deps.incrementFailure)) {
@@ -191,10 +227,16 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
   };
   const shadowReason = deps.mode === 'live' ? retryShadowReason(action, deps) : undefined;
   if (deps.mode !== 'live' || shadowReason) {
+    if (action.kind === 'green' && deps.greenSweep) {
+      const outcome = await consumeGreenSweepForGreenWrite({ deps, probe: deps.greenSweep.probe,
+        item: deps.greenSweep.item, version: deps.greenSweep.version, cards: deps.greenSweep.cards, writeLive: false });
+      return record(outcome.verdict === 'green' ? 'would-green' : 'refused', outcome.reason);
+    }
     const destination = action.delivery && action.kind === 'deliver'
       ? ` → ${join(action.delivery.projectTarget, 'elanous-out', action.taskId)}/${action.delivery.files.join(', ')}` : '';
     return record('shadow', `would ${action.kind}${action.variant ? `:${action.variant}` : ''}: ${action.rationale}${destination}${shadowReason ? ` · shadow: ${shadowReason}` : ''}`);
   }
+  const gh = (args: string[]) => deps.command(args, action.cwd);
   const card = async (reason: string) => {
     const evidence = JSON.stringify({ runId: action.runId, pr: action.pr, mustFix: action.mustFix ?? [], history: action.history ?? [], selected: action.kind, reason });
     const result = await deps.command(decisionRaiseArgs({ taskId: action.taskId, reason, ...(action.risk ? { risk: action.risk } : {}), evidence }));
@@ -204,7 +246,7 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
   if (sameMoveFailures(action, deps) >= SAME_MOVE_FAILURE_LIMIT) return card('same task/action failed twice');
   if (action.kind === 'land') {
     if (!action.cwd) return card('landing worktree unknown');
-    const view = await deps.command(['gh', 'pr', 'view', String(action.pr), '--json', 'labels']);
+    const view = await gh(['gh', 'pr', 'view', String(action.pr), '--json', 'labels']);
     if (view.status !== 0) return card('PR labels unavailable');
     let labels: unknown;
     try { labels = (JSON.parse(view.stdout) as { labels?: unknown }).labels; }
@@ -250,12 +292,45 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     const judgement = judgeNextMove({ deliveryEvidence: evidence });
     return record(judgement.move === 'propose-green' ? 'done' : 'waiting', `${judgement.move}: ${judgement.reason}`);
   }
-  if (action.kind === 'green') return card('green requires a verified landing in this execution');
+  if (action.kind === 'green') {
+    // GREEN-FROM-LEDGER-FU 배선(shard 2) — 생산 진입점이 소비자를 지나 dry-run 판정 ⊕ 원문 대조 후 쓰기를 지킨다:
+    // 대조가 모두 일치하면 checklist green 명령 1회, 거부·unknown·mismatch 는 쓰기 0회 + 칸 상태 불변(fail-closed).
+    // 문맥(deps.greenSweep)이 없으면 종전 그대로 검증 안내 카드 — 호출부가 문맥을 안 싣는 동안 green 은 쓰지 않는다.
+    const greenSweep = deps.greenSweep;
+    if (!greenSweep) return card('green requires a verified landing in this execution');
+    const writeLive = deps.greenWriteLive === true;
+    const outcome = await consumeGreenSweepForGreenWrite({ deps, probe: greenSweep.probe, item: greenSweep.item,
+      version: greenSweep.version, cards: greenSweep.cards, writeLive });
+    return record(outcome.written ? 'done' : outcome.verdict === 'green-command-failed' ? 'failed'
+      : outcome.verdict === 'green' ? 'would-green' : 'refused', outcome.reason);
+  }
   // G1 — 기다림은 발사가 아니다: 대기 표지만 남기고 다음 틱이 다시 판단한다(카드로 올리지 않는다).
   if (action.kind === 'retry' && action.variant === 'wait') return record('waiting', `wait marker: ${action.rationale}`);
   // must-fix 없는 재발사가 카드로 가는 것은 갈래 없는(종전) retry 뿐이다 — narrow·salvage·alternative 는 갈래 문면으로 간다.
   if (action.kind === 'retry' && !action.variant && !action.mustFix?.length) return card('must-fix missing; cannot narrow retry');
   if (action.kind === 'review') {
+    let harvestState: NextAction['harvestState'];
+    if (action.harvestState?.source === 'owner-worktree-commit' && action.harvestState.pr === action.pr && action.cwd
+      && /^[a-f0-9]{40}$/i.test(action.harvestState.head)) {
+      try {
+        const response = await gh(['gh', 'pr', 'view', String(action.pr), '--json', 'state,headRefOid,headRefName']);
+        if (response.status === 0) {
+          const pr = JSON.parse(response.stdout) as { state?: unknown; headRefOid?: unknown; headRefName?: unknown };
+          if (typeof pr.headRefOid === 'string' && typeof pr.headRefName === 'string' && typeof pr.state === 'string') {
+            const current = ownerWorktreeHarvestState({ pr: action.pr, cwd: action.cwd, head: pr.headRefOid,
+              branch: pr.headRefName, state: pr.state }, deps.harvestGit);
+            if (current?.head.toLowerCase() === action.harvestState.head.toLowerCase()) harvestState = current;
+          }
+        }
+      } catch { /* Unverified caller signal preserves the review command. */ }
+    }
+    if (harvestState) {
+      action.harvestState = harvestState;
+      const reason = `review skipped: owner-worktree-commit PR #${action.pr} ${harvestState.head}`;
+      (action.history ??= []).push('review skipped: owner-worktree-commit');
+      record('skipped', reason);
+      return record('waiting', `${reason} · next: wait for exact-head review evidence`);
+    }
     const review = await deps.command(['self', 'review', String(action.pr), '--json']);
     if (review.status !== 0) return record('failed', 'review command failed');
     let parsed: { verdict?: string; mustFix?: string[]; reviewed?: boolean };
@@ -284,7 +359,7 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     return record('failed', `${action.kind} command failed: ${outcome.stderr ?? ''}`);
   }
   if (action.kind === 'land') {
-    const merged = await deps.command(['gh', 'pr', 'view', String(action.pr), '--json', 'state,mergeCommit']);
+    const merged = await gh(['gh', 'pr', 'view', String(action.pr), '--json', 'state,mergeCommit']);
     let sha: string | undefined;
     let notMerged = false;
     try {
@@ -307,6 +382,126 @@ export async function executeNextAction(action: NextAction, deps: ActionDeps): P
     return 'done';
   }
   return record('done', action.rationale);
+}
+
+/**
+ * GREEN-FROM-LEDGER-FU — green live 쓰기 소비자: `green-sweep.ts`(순수 판정 · checklist/card 쓰기 0)의
+ * dry-run 결정을 소비해 실제 checklist green 쓰기를 수행하는 유닛. 쓰기 책임은 전부 이 소비자가 진다.
+ * 판정이 green 이고 후보의 OP 원문 대조가 모두 일치할 때만 `release checklist set --status green`
+ * (executeNextAction 의 착지 green 쓰기와 같은 명령면)을 deps.command 로 수행한다.
+ * 판정 거부 · 원문 대조 불일치 · 명령 실패는 전부 쓰기 0 — 거짓 green 을 쓰지 않는다(fail-closed).
+ * 원문 대조는 세 다리다: ① observeGreenSweep 표준 출력이 판정과 정확히 같은가 ② plannedEvidence 가
+ * 판정 원문(existingEvidence + evidence 행)과 정확히 같은가 ③ 쓰기 직전 칸 원문이 판정이 본 것과 같은가.
+ * ③ 은 칸 원문 재독기(cellEvidence)가 실제 일치를 확인했을 때만 'cell ok' 로 남는다 — 미제공·재독 불가는
+ * 자기 자신(item.evidence)과의 공전 대조를 하지 않고 unknown 상태로 보존해 쓰기를 거부한다.
+ * 결과는 deps.observe('task-agent.action', { kind: 'green', … }) 로 관측면에 남긴다.
+ */
+export interface GreenSweepProbe {
+  /** 후보 PR 관측(gh pr view 상당). null = 못 읽었다(pr-unreadable). */
+  pr(pr: number): Promise<GreenSweepPr | null>;
+  /** 후보 merge sha 가 origin/main 조상인가. null = 못 읽었다. */
+  ancestor(sha: string): Promise<boolean | null>;
+  /** 트래픽 hold 여부. null = 못 읽었다. */
+  hold(): Promise<boolean | null>;
+  /** 후보 PR 이 이 칸의 저장소에 속하는가. 주지 않으면 판정이 record-only 로 거부한다. */
+  repositoryMatches?(pr: number): Promise<boolean | null>;
+  /** 다른 칸이 같은 PR 을 주장하나(ambiguousAcrossCells). */
+  ambiguousAcrossCells?(pr: number): boolean | null;
+  /** 칸 원문 재독기 — 판정이 본 증거(evidence)와 쓰기 직전 칸 원문이 같은지 대조한다. 못 읽으면 undefined(대조 불가 → 쓰기 거부).
+   *  필수 멤버다 — 미제공이면 소비자는 자기 자신(item.evidence)과의 공전 대조를 하지 않고 unknown 상태로 쓰기를 거부한다. */
+  cellEvidence(cell: string): Promise<string | undefined>;
+}
+
+export interface GreenSweepWriteOutcome {
+  cell: string;
+  pr: number | null;
+  /** true = `release checklist set --status green` 명령까지 성공했다. 그 외는 전부 쓰기 0. */
+  written: boolean;
+  /** green = 쓰기 성공 · evidence-unknown = 원문 대조를 수행할 수 없었다(칸 원문 미제공·재독 불가) · 그 외 판정·대조·명령 사유. */
+  verdict: GreenSweepVerdict | 'no-candidates' | 'evidence-mismatch' | 'evidence-unknown' | 'green-command-failed';
+  reason: string;
+}
+
+export async function consumeGreenSweepForGreenWrite(input: {
+  deps: Pick<ActionDeps, 'command' | 'observe'>;
+  probe: GreenSweepProbe;
+  item: ChecklistItem;
+  version: string;
+  cards: readonly TaskCard[];
+  writeLive?: boolean;
+}): Promise<GreenSweepWriteOutcome> {
+  const { deps, probe, item, version, cards, writeLive = false } = input;
+  const candidates = greenSweepCandidates(item, version, cards);
+  const record = (outcome: GreenSweepWriteOutcome): GreenSweepWriteOutcome => {
+    deps.observe('task-agent.action', {
+      taskId: item.id, kind: 'green', result: outcome.written ? 'done'
+        : outcome.verdict === 'green-command-failed' ? 'failed'
+          : outcome.verdict === 'green' && !writeLive ? 'would-green' : 'refused', reason: outcome.reason,
+    });
+    return outcome;
+  };
+  if (!candidates.length) {
+    return record({ cell: item.id, pr: null, written: false, verdict: 'no-candidates', reason: 'GREEN-FROM-LEDGER-FU: dry-run 후보 없음' });
+  }
+  let last: GreenSweepWriteOutcome | undefined;
+  for (const candidate of candidates) {
+    const pr = await probe.pr(candidate.pr);
+    const mergeSha = pr?.mergeSha && /^[a-f0-9]{40}$/i.test(pr.mergeSha) ? pr.mergeSha : null;
+    const [ancestor, hold, repositoryMatches] = await Promise.all([
+      probe.ancestor(mergeSha ?? ''),
+      probe.hold(),
+      probe.repositoryMatches ? probe.repositoryMatches(candidate.pr) : Promise.resolve(null),
+    ]);
+    const decision = decideGreenSweep({
+      item, candidate, candidateCount: candidates.length, pr, ancestor, hold,
+      ...(repositoryMatches === null ? {} : { repositoryMatches }),
+      ...(probe.ambiguousAcrossCells ? { ambiguousAcrossCells: probe.ambiguousAcrossCells(candidate.pr) ?? undefined } : {}),
+    });
+    // 원문 대조 ① — observeGreenSweep 표준 출력(«OP 원문» 관측)이 판정과 정확히 같은가.
+    let observed: { category: string; event: string; data?: unknown } | undefined;
+    observeGreenSweep(decision, (category, event, data) => { observed = { category, event, data }; });
+    const emitted = observed?.data as { cell?: unknown; pr?: unknown; mergeSha?: unknown; reason?: unknown } | undefined;
+    const emissionMatches = observed?.category === 'task-agent.green-sweep'
+      && observed.event === decision.verdict
+      && emitted?.cell === decision.cell
+      && emitted?.pr === decision.pr
+      && emitted?.mergeSha === decision.mergeSha
+      && emitted?.reason === decision.reason;
+    // 원문 대조 ② — plannedEvidence 가 판정 원문(existingEvidence + evidence 행)과 정확히 같은가.
+    const plannedMatches = decision.plannedEvidence === appendGreenSweepEvidence(decision.existingEvidence, decision.evidence);
+    if (decision.verdict !== 'green') {
+      last = record({
+        cell: item.id, pr: candidate.pr, written: false, verdict: decision.verdict,
+        reason: `GREEN-FROM-LEDGER-FU: 판정 거부 — ${decision.evidence}`,
+      });
+      continue;
+    }
+    // 원문 대조 ③ — 쓰기 직전 칸 원문이 판정이 본 것과 같은가(판정 중 칸 변경 방지). green 판정에만 재독한다.
+    // cellEvidence 미제공·재독 불가는 자기 자신(item.evidence)과 대조하지 않는다 — 그 대조는 공전이므로
+    // unknown 상태로 보존해 쓰기를 거부한다(fail-closed). 'cell ok' 는 실제 재독 ⊕ 일치 확인에만 나온다.
+    const cellProbe = probe.cellEvidence;
+    const currentEvidence = typeof cellProbe === 'function' ? await cellProbe(item.id) : undefined;
+    const cellState: 'ok' | 'mismatch' | 'unreadable' | 'unprovided'
+      = typeof cellProbe !== 'function' ? 'unprovided'
+      : typeof currentEvidence !== 'string' ? 'unreadable'
+      : currentEvidence === decision.existingEvidence ? 'ok' : 'mismatch';
+    if (!emissionMatches || !plannedMatches || cellState !== 'ok') {
+      const mismatched = !emissionMatches || !plannedMatches || cellState === 'mismatch';
+      return record({
+        cell: item.id, pr: candidate.pr, written: false,
+        verdict: mismatched ? 'evidence-mismatch' : 'evidence-unknown',
+        reason: `GREEN-FROM-LEDGER-FU: ${mismatched ? '원문 대조 불일치' : '원문 대조 불가(칸 원문 unknown)'} — emission ${emissionMatches ? 'ok' : 'mismatch'} · planned ${plannedMatches ? 'ok' : 'mismatch'} · cell ${cellState}`,
+      });
+    }
+    if (!writeLive) return record({ cell: item.id, pr: candidate.pr, written: false, verdict: 'green',
+      reason: `would-green: ${decision.evidence} · live write disabled` });
+    const green = await deps.command(['release', 'checklist', 'set', item.id, '--status', 'green', '--evidence', decision.evidence]);
+    if (green.status !== 0) {
+      return record({ cell: item.id, pr: candidate.pr, written: false, verdict: 'green-command-failed', reason: `green command failed: ${green.stderr ?? ''}` });
+    }
+    return record({ cell: item.id, pr: candidate.pr, written: true, verdict: 'green', reason: decision.evidence });
+  }
+  return last ?? record({ cell: item.id, pr: null, written: false, verdict: 'no-candidates', reason: 'GREEN-FROM-LEDGER-FU: dry-run 후보 없음' });
 }
 
 /** Execute the allowed candidates in a caller-supplied tick and emit one isolated denominator event. */

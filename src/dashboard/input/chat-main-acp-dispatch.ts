@@ -1,6 +1,7 @@
 import type { NormalizedAttachment } from '../../acp/content-blocks.js';
 import { debug } from '../../debug/log.js';
 import type { ControlSignalBus } from '../../input/control-signal.js';
+import { classifyInterimReply, formatInterimFoldLine } from '../../tui/chat/goal-interim.js';
 import {
   createTurnOutputBundle,
   runTurnOutputBundleSettle,
@@ -76,6 +77,8 @@ export function dispatchDashboardChatMainAcpSend(
   let firstChunk = true;
   let assistantTextActive = false;
   let assistantBodyStart = -1;
+  let assistantBodyEnd = -1;
+  const interimBodyRanges: Array<{ start: number; end: number }> = [];
   let assistantBodyText = '';
   let assistantRunUsesPrefix = false;
 
@@ -91,6 +94,7 @@ export function dispatchDashboardChatMainAcpSend(
         if (firstChunk) firstChunk = false;
         assistantBodyText = '';
         assistantBodyStart = -1;
+        assistantBodyEnd = -1;
         assistantTextActive = true;
       }
       assistantBodyText += delta;
@@ -110,7 +114,7 @@ export function dispatchDashboardChatMainAcpSend(
       deps.autoTtsHooks?.pushChunk(delta);
       const rendered = deps.formatAssistantLines(assistantBodyText);
       if (assistantBodyStart < 0) assistantBodyStart = deps.chatLines.length;
-      deps.chatLines.length = assistantBodyStart;
+      deps.chatLines.splice(assistantBodyStart, Math.max(0, assistantBodyEnd - assistantBodyStart));
       rendered.forEach((line, index) => {
         if (index === 0 && assistantRunUsesPrefix) {
           deps.chatLines.push(`${deps.formatAssistantPrefix(display)} ${line}`);
@@ -118,7 +122,23 @@ export function dispatchDashboardChatMainAcpSend(
           deps.chatLines.push(`  ${line}`);
         }
       });
+      assistantBodyEnd = assistantBodyStart + rendered.length;
+      if (interimBodyRanges.at(-1)?.start === assistantBodyStart) interimBodyRanges[interimBodyRanges.length - 1]!.end = assistantBodyEnd;
+      else interimBodyRanges.push({ start: assistantBodyStart, end: assistantBodyEnd });
       deps.setChatScrollToTail();
+    },
+    foldGoalInterim: (text) => {
+      const verdict = classifyInterimReply(text.split('\n'));
+      if (verdict.interim && interimBodyRanges.length > 0) {
+        const first = interimBodyRanges[0]!.start;
+        for (const { start, end } of [...interimBodyRanges].reverse()) deps.chatLines.splice(start, end - start);
+        deps.chatLines.splice(first, 0, `  ${formatInterimFoldLine(verdict.summary)}`);
+        deps.setChatScrollToTail();
+      }
+      interimBodyRanges.length = 0;
+      assistantTextActive = false;
+      assistantBodyStart = -1;
+      assistantBodyEnd = -1;
     },
     pushToolCall: (tool) => {
       deps.chatLines.push(deps.formatToolLine(tool));

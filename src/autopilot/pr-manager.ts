@@ -127,7 +127,7 @@ export interface UpsertPrResult { url: string; reused: boolean }
  *  나머지 reason(add/commit/push/gh)은 진짜 실패로 detail(stderr)과 함께 관측·pr-failed. */
 export type UpsertPrOutcome =
   | { ok: true; url: string; reused: boolean; labelsApplied?: boolean; labelsOmitted?: boolean;
-      supersededPr?: number }
+      supersededPr?: number; boundCardHeadRefName?: string }
   | { ok: false; reason: 'add' | 'commit' | 'base' | 'noop' | 'push' | 'gh' | 'guard'; detail: string;
       incident?: PrCreateFailureIncident };
 
@@ -186,9 +186,9 @@ function readPrMergeState(run: CmdRunner, prNumber: number, cwd?: string): Merge
 
 /** 열린 PR 조회의 판별 가능한 결과. `SKIPPED`는 기본 브랜치 표식이라 gh를 호출하지 않았음을 뜻한다. */
 export type FindPrForBranchOutcome =
-  | { status: 'ok OUTPUT'; url: string }
-  | { status: 'ok EMPTY'; url: null }
-  | { status: 'FAILED'; url: null; rc?: number; stderrTail?: string }
+  | { status: 'ok OUTPUT'; url: string; rc?: number; stderrTail?: string }
+  | { status: 'ok EMPTY'; url: null; rc?: number; stderrTail?: string }
+  | { status: 'FAILED'; url: null; rc?: number; stderrTail?: string; stdoutTail?: string }
   | { status: 'SKIPPED'; url: null };
 
 export interface PrManager {
@@ -264,10 +264,10 @@ export function prBaseFromComparison(comparisonBase: string): string {
  * Feature-branch HEAD-only commits are excluded because the range is the base
  * ref itself, not `HEAD`. Network/`gh` are never used.
  */
-export function landingHistoryGitLogArgs(since: string, baseRef: string): string[] {
+export function landingHistoryGitLogArgs(since: string | null, baseRef: string): string[] {
   return [
     'log',
-    `--since=${since}`,
+    ...(since === null ? [] : [`--since=${since}`]),
     '--pretty=format:commit %H',
     '--name-only',
     '--no-merges',
@@ -338,8 +338,12 @@ export interface PrCreateStageObservation {
   ran: boolean;
   rc?: number;
   stderrTail?: string;
+  stdoutTail?: string;
   /** push 단계 전용 — force-push 최종 성공 여부. */
   ok?: boolean;
+  /** gh 단계 전용 — 재시도 전후의 목록 조회와 생성 명령을 각각 보존한다. */
+  lookup?: PrCreateStageObservation;
+  create?: PrCreateStageObservation;
 }
 /** PR 생성 실패 한 건 — push/gh 두 단계 관측을 하나의 기록에. */
 export interface PrCreateFailureIncident {
@@ -380,8 +384,26 @@ export function recordPrCreateFailureIncident(incident: PrCreateFailureIncident)
     ...(incident.runId ? { runId: sanitizeCredentialText(incident.runId) } : {}),
     branch: sanitizeCredentialText(incident.branch),
     remote: sanitizeCredentialText(incident.remote),
-    push: { ...incident.push, ...(incident.push.stderrTail ? { stderrTail: stderrTailOf(incident.push.stderrTail) } : {}) },
-    gh: { ...incident.gh, ...(incident.gh.stderrTail ? { stderrTail: stderrTailOf(incident.gh.stderrTail) } : {}) },
+    push: {
+      ...incident.push,
+      ...(incident.push.stderrTail ? { stderrTail: stderrTailOf(incident.push.stderrTail) } : {}),
+      ...(incident.push.stdoutTail ? { stdoutTail: stderrTailOf(incident.push.stdoutTail) } : {}),
+    },
+    gh: {
+      ...incident.gh,
+      ...(incident.gh.stderrTail ? { stderrTail: stderrTailOf(incident.gh.stderrTail) } : {}),
+      ...(incident.gh.stdoutTail ? { stdoutTail: stderrTailOf(incident.gh.stdoutTail) } : {}),
+      ...(incident.gh.lookup ? { lookup: {
+        ...incident.gh.lookup,
+        ...(incident.gh.lookup.stderrTail ? { stderrTail: stderrTailOf(incident.gh.lookup.stderrTail) } : {}),
+        ...(incident.gh.lookup.stdoutTail ? { stdoutTail: stderrTailOf(incident.gh.lookup.stdoutTail) } : {}),
+      } } : {}),
+      ...(incident.gh.create ? { create: {
+        ...incident.gh.create,
+        ...(incident.gh.create.stderrTail ? { stderrTail: stderrTailOf(incident.gh.create.stderrTail) } : {}),
+        ...(incident.gh.create.stdoutTail ? { stdoutTail: stderrTailOf(incident.gh.create.stdoutTail) } : {}),
+      } } : {}),
+    },
   };
   debug.log('autopilot.pr-manager', 'pr-create-failure-incident', safe);
   return safe;
@@ -615,7 +637,8 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
   if (!pushed.ok) return fail(`fast-forward push refused: ${(pushed.err || pushed.out).slice(0, 220)}`);
   debug.log('autopilot.pr-manager', 'same-cell-push-decision', { ...pushEvidence, outcome: 'allowed', reason: 'bound-card-pr-head-fast-forward' });
   debug.log('autopilot.pr-manager', 'same-cell-reused', { pr: target.number, cellId: target.cellId, cardId: target.cardId, branch: target.branch });
-  return editExistingPr(run, input, pr.url);
+  const edited = editExistingPr(run, input, pr.url);
+  return edited.ok ? { ...edited, boundCardHeadRefName: target.branch } : edited;
 }
 
 /** ★ PR 매니저 팩토리(대표 2026-07-12) — CmdRunner 주입(테스트 스텁). 실 배선은 기본 러너. */
@@ -642,13 +665,23 @@ export function makePrManager(
     }
     const r = run('gh', ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'url', '--jq', '.[0].url // ""'], cwd ? { cwd } : undefined);
     const url = r.out.trim() || null;
+    const lookupEvidence = {
+      ...(typeof r.rc === 'number' ? { rc: r.rc } : {}),
+      ...(stderrTailOf(r.err) ? { stderrTail: stderrTailOf(r.err) } : {}),
+    };
+    const lookupFailureEvidence = {
+      ...lookupEvidence,
+      ...(stderrTailOf(r.out) ? { stdoutTail: stderrTailOf(r.out) } : {}),
+    };
     const outcome: FindPrForBranchOutcome = !r.ok
-      ? { status: 'FAILED', url: null,
-          ...(typeof r.rc === 'number' ? { rc: r.rc } : {}),
-          ...(stderrTailOf(r.err || r.out) ? { stderrTail: stderrTailOf(r.err || r.out) } : {}) }
+      ? { status: 'FAILED', url: null, ...lookupFailureEvidence }
       : url
         ? { status: 'ok OUTPUT', url }
         : { status: 'ok EMPTY', url: null };
+    if (r.ok) {
+      for (const [key, value] of Object.entries(lookupEvidence))
+        if (value !== undefined) Object.defineProperty(outcome, key, { value, enumerable: false });
+    }
     debug.log('autopilot.pr-manager', 'lookup', {
       branch,
       // ⚠️ 조회는 --jq '.[0].url' 이라 최대 한 줄이다 — "매칭된 PR 수"가 아니라 "돌아온 URL 줄 수"다.
@@ -845,11 +878,22 @@ export function makePrManager(
       const waitForPushRetry = input.waitForPushRetry ?? defaultWaitForPushRetry;
       // ★ 칸 PR-CREATE-FAIL-OBSERVE-FU — push/gh 단계 관측을 쌓아 실패 시 한 incident 로.
       const pushStage: PrCreateStageObservation = { stage: 'push', ran: false };
-      const ghStage: PrCreateStageObservation = { stage: 'gh', ran: false };
+      const ghStage: PrCreateStageObservation = {
+        stage: 'gh', ran: false,
+        lookup: { stage: 'gh', ran: false },
+        create: { stage: 'gh', ran: false },
+      };
+      const observeGhCommand = (r: CmdResult): PrCreateStageObservation => ({
+        stage: 'gh', ran: true, ...(typeof r.rc === 'number' ? { rc: r.rc } : {}),
+        ...(stderrTailOf(r.err) ? { stderrTail: stderrTailOf(r.err) } : {}),
+        ...(stderrTailOf(r.out) ? { stdoutTail: stderrTailOf(r.out) } : {}),
+      });
       const markGhRan = (r: CmdResult): CmdResult => {
         ghStage.ran = true;
         ghStage.rc = r.rc;
         ghStage.stderrTail = stderrTailOf(r.err);
+        ghStage.stdoutTail = stderrTailOf(r.out);
+        ghStage.create = observeGhCommand(r);
         return r;
       };
       const failedCreate = (reason: 'push' | 'gh', detail: string): UpsertPrOutcome =>
@@ -877,9 +921,16 @@ export function makePrManager(
       const existing = findPrForBranchOutcome(input.branch, cwd);
       if (existing.status !== 'SKIPPED') {
         ghStage.ran = true;
+        ghStage.lookup = {
+          stage: 'gh', ran: true,
+          ...(typeof existing.rc === 'number' ? { rc: existing.rc } : {}),
+          ...(existing.stderrTail ? { stderrTail: existing.stderrTail } : {}),
+          ...(existing.status === 'FAILED' && existing.stdoutTail ? { stdoutTail: existing.stdoutTail } : {}),
+        };
         if (existing.status === 'FAILED') {
           ghStage.rc = existing.rc;
           ghStage.stderrTail = existing.stderrTail;
+          ghStage.stdoutTail = existing.stdoutTail;
         }
       }
       if (existing.url) {

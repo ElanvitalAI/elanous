@@ -16,11 +16,12 @@ import {
   formatAgentWakeNotice,
   formatAgentWakePrompt,
   installAgentWake,
+  installSeatedAgentWake,
   resetAgentWakeForTest,
   wrapAgentWakePort,
   type AgentWakeOpenTurnDeps,
 } from './agent-wake.js';
-import { createInternalTurnGate } from './internal-turn.js';
+import { createInternalTurnGate, type StartTurnIfIdleOptions } from './internal-turn.js';
 
 type LogRow = { category: string; event: string; data: Record<string, unknown> };
 
@@ -231,7 +232,7 @@ describe('«다음 턴에 결과» — 알림이 결과를 먹지 않고 실제 
     expect(String(carried[0]!.content)).toContain('<task-notification>');
     expect(globalTaskNotificationQueue.size).toBe(0);
     globalTaskNotificationQueue.clear();
-  });
+  }, 120_000); // 콜드 기동(임시 git·preamble 조립)에서 bun 기본 5s 를 넘긴다 — K-OP-035.
 });
 
 describe('대시보드 배선 — 글자로 문다(showDashboard 지역 배선은 단위 시험이 닿지 않는다 · 라이브는 착지 뒤 TF)', () => {
@@ -241,15 +242,17 @@ describe('대시보드 배선 — 글자로 문다(showDashboard 지역 배선�
     expect(src.match(/\.onEnqueue\(/g)).toHaveLength(1);
     expect(src).toContain('const offWake = queue.onEnqueue(listener);');
     expect(src.match(/subscribeDashboardAgentResults\(\s*globalTaskNotificationQueue,/g)).toHaveLength(1);
-    expect(src.match(/installAgentWake\(\{/g)).toHaveLength(1);
+    expect(src.match(/installSeatedAgentWake\(\{/g)).toHaveLength(1);
     expect(src).not.toMatch(/createAgentWake\(/);
-    const at = src.indexOf('const agentWake = installAgentWake({');
+    const at = src.indexOf('const agentWake = installSeatedAgentWake({');
+    expect(at).toBeGreaterThan(0);
     const block = src.slice(at, src.indexOf('    });\n', at));
     expect(block).toMatch(/subscribe: \(listener\) => subscribeDashboardAgentResults\(\s*globalTaskNotificationQueue, listener,/);
     expect(block).not.toMatch(/injectKey|hostControl|\.submit\(/);
-    // 조각 2 — 턴은 H2 문으로만 · 판정 근거는 같은 큐.
+    // 조각 2 — 턴은 H2 문으로만 · 판정 근거는 같은 큐 · cwd 는 지금 화면.
     expect(block).toContain('startTurnIfIdle: (text, opts) => internalTurnGate.startTurnIfIdle(text, opts)');
     expect(block).toContain('isPending: (taskId) => globalTaskNotificationQueue.has(taskId)');
+    expect(block).toContain('getCwd: () => workingDir.cwd');
     // 그리기 실패를 삼키지 않는 notify 를 쓴다(거짓 shown:true 방지).
     expect(block).toContain('notify: createDashboardAgentWakeNotify(');
     expect(block).not.toMatch(/catch/);
@@ -346,7 +349,7 @@ describe('조각 2 — 자식 완료 ∧ 자리 TUI ∧ 유휴 → H2 문으로 
     expect(turn.filter((m) => m.role === 'user' && String(m.content).includes(unique))).toHaveLength(1);
     expect(globalTaskNotificationQueue.size).toBe(0);
     globalTaskNotificationQueue.clear();
-  });
+  }, 120_000); // 콜드 기동(임시 git·preamble 조립)에서 bun 기본 5s 를 넘긴다 — K-OP-035.
 
   test('턴 중(busy) → 그 순간 0 · «대기»(NotIdle) → 턴 끝나 입력칸이 다시 뜨면 아직 안 실린 결과로 1회', () => {
     const h = seatHarness();
@@ -499,6 +502,99 @@ describe('조각 2 — 자식 완료 ∧ 자리 TUI ∧ 유휴 → H2 문으로 
     queue.enqueue(pending('t1'));
     expect(fresh.opened()).toHaveLength(1);
     expect(old.opened()).toHaveLength(0);
+  });
+});
+
+// ── 생산 조립 경로 — showDashboard 가 부르는 «그 함수»를 그대로 지나는 무대(문자열 확인 아님) ──────────
+// 무대 이름: «agent-wake 생산 조립» (L2 mock 시나리오) — 진짜 `createInternalTurnGate`(H2 문) ⊕ 진짜
+// `TaskNotificationQueue` ⊕ 진짜 `wrapAgentWakePort`(입력칸 문) ⊕ 가짜 자리 판정·가짜 시계(defer 큐).
+// showDashboard 는 `installSeatedAgentWake` 하나만 부르므로, 이 무대는 생산 진입 경로를 그대로 지난다.
+describe('생산 조립 — installSeatedAgentWake 를 지나 enqueue → H2 한 턴 · 중복 거부', () => {
+  function stage(over: { seat?: string | null; queue?: TaskNotificationQueue } = {}) {
+    const calls: Array<{ text: string; opts: StartTurnIfIdleOptions }> = [];
+    const lines: string[] = [];
+    const logs: LogRow[] = [];
+    const clock: Array<() => void> = [];
+    const state = { running: false, buffer: '' as string | undefined, yields: 0 };
+    const queue = over.queue ?? new TaskNotificationQueue();
+    const log = (category: string, event: string, data: Record<string, unknown>) => { logs.push({ category, event, data }); };
+    const gate = createInternalTurnGate({
+      isEnabled: () => true,
+      isTurnRunning: () => state.running,
+      getBufferText: () => state.buffer,
+      getTypeaheadCount: () => 0,
+      pendingKeyCount: () => 0,
+      lastHumanKeyAt: () => 0,
+      log,
+    });
+    // 생산 배선과 같은 모양: 입력칸 문은 깨움 감싸기를 거친다(index.ts `wrapAgentWakePort(...)`).
+    const port = wrapAgentWakePort(gate.port);
+    const mount = () => port.attach(() => { if (state.buffer) return false; state.yields++; return true; });
+    const wake = installSeatedAgentWake({
+      subscribe: (listener) => queue.onEnqueue(listener),
+      notify: createDashboardAgentWakeNotify((line) => { lines.push(line); }, () => { /* draw */ }),
+      startTurnIfIdle: (text, opts) => { calls.push({ text, opts }); return gate.startTurnIfIdle(text, opts); },
+      getCwd: () => '/home/x/elanous-hq/seats/OPC',
+      isPending: (taskId) => queue.has(taskId),
+      detectSeat: () => (over.seat === null ? null : ({ seat: over.seat ?? 'OPC', source: 'cwd' as const })),
+      defer: (fn) => { clock.push(fn); },
+      log,
+    });
+    const flush = () => { while (clock.length) clock.shift()!(); };
+    const opened = () => logs.filter(r => r.category === 'tui.autoturn' && r.event === 'opened');
+    const wakeRows = (event: string) => logs.filter(r => r.category === 'tui.agent-wake' && r.event === event);
+    return { queue, gate, state, mount, wake, lines, calls, logs, flush, opened, wakeRows };
+  }
+
+  test('자리 TUI ∧ 유휴: enqueue 1 → 알림 1줄 ⊕ H2 호출 1회(origin child-complete · 프롬프트 그대로)', () => {
+    const s = stage();
+    s.mount();
+    s.queue.enqueue(pending('t1'));
+    expect(s.lines).toEqual(['✓ 위임 끝: pr-review — 다음 턴에 결과']);
+    expect(s.calls).toHaveLength(1);
+    expect(s.calls[0]!.opts).toMatchObject({ origin: 'child-complete', reason: '위임 끝: pr-review' });
+    expect(s.calls[0]!.text).toBe(formatAgentWakePrompt(pending('t1')));
+    expect(s.opened()).toHaveLength(1);
+    expect(s.gate.takePending()).toMatchObject({ origin: 'child-complete' });
+    expect(s.queue.size).toBe(1);
+  });
+
+  test('같은 완료가 다시 와도(큐 clear 뒤) 생산 경로에서 두 번째 턴을 열지 않는다(duplicate)', () => {
+    const queue = new TaskNotificationQueue();
+    const s = stage({ queue });
+    s.mount();
+    queue.enqueue(pending('t1'));
+    queue.clear();
+    queue.enqueue(pending('t1'));
+    expect(s.calls).toHaveLength(1);
+    expect(s.opened()).toHaveLength(1);
+    expect(s.lines).toHaveLength(1);
+    expect(s.wakeRows('rejected').at(-1)!.data).toMatchObject({ taskId: 't1', reason: 'duplicate' });
+  });
+
+  test('턴 중(busy) 완료 → 즉시 턴 0 · 입력칸이 다시 뜨면 생산 경로의 재시도가 한 번 연다', () => {
+    const s = stage();
+    s.mount();
+    s.state.running = true;
+    s.queue.enqueue(pending('t1'));
+    expect(s.opened()).toHaveLength(0);
+    expect(s.wakeRows('deferred')[0]!.data).toMatchObject({ reason: 'NotIdle', trigger: 'enqueue' });
+    s.state.running = false;
+    s.mount();
+    s.flush();
+    expect(s.opened()).toHaveLength(1);
+    expect(s.wakeRows('opened')[0]!.data).toMatchObject({ trigger: 'input-mounted' });
+    s.gate.takePending(); s.mount(); s.flush();
+    expect(s.opened()).toHaveLength(1);
+  });
+
+  test('사람 대화 TUI(자리 아님) → 알림만 · H2 호출 0(생산 조립에서도 판정은 모듈 몫)', () => {
+    const s = stage({ seat: null });
+    s.mount();
+    s.queue.enqueue(pending('t1'));
+    expect(s.lines).toHaveLength(1);
+    expect(s.calls).toHaveLength(0);
+    expect(s.wakeRows('rejected')[0]!.data).toMatchObject({ reason: 'not-seat' });
   });
 });
 

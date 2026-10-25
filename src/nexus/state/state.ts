@@ -113,7 +113,13 @@ export interface NexusEvent {
     // · tone? · glyph?). PWA's M4 `subscribeHudSegmentEvents`
     // synthesizes a FeedbackEnvelope { kind: 'hud.segment' } and routes
     // it through the M1 `applyHudSegmentEnvelope` accumulator.
-    | 'hud.segment';
+    | 'hud.segment'
+    // GRAPH-WIZARD variant 관측 (ARG-L2-DESIGNER-FU1 · 2026-10-23) — POST /v1/graphs/wizard 의
+    // variant 한 턴이 끝날 때 호출 경계(handleGraphWizardPost)가 한 건 발행한다. `detail` =
+    // { mode: 'variant', status: 'composed'|'fallback-standard', reason, goal, templateId,
+    //   growth?: { from, outcome, nodeId, returnTo? }, overlayId?, patches? }.
+    // SSE 구독자는 `?topics=graph.compose` 로 받는다.
+    | 'graph.compose';
   tabId?: string;
   detail?: Record<string, unknown>;
 }

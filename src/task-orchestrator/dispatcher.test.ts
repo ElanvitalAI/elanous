@@ -5,6 +5,7 @@ import { SurfaceRegistry, type SurfaceAdapter } from './surface-registry.js';
 import { createTask, type Task } from './types.js';
 import { TaskStore } from './store.js';
 import type { OpsEventInput } from '../domains/ops-log.js';
+import { AnomalyCluster } from '../loops/orchestrator/anomaly-cluster.js';
 
 function selfImplementTask(id: string): Task {
   return createTask(
@@ -112,6 +113,27 @@ describe('TaskDispatcher self-implement concurrency observation', () => {
     expect(infinity.dispatched).toHaveLength(5);
     expect(infinity.deferred).toHaveLength(0);
     expect(infinityEvents.filter((event) => event.event === 'blocked')).toHaveLength(0);
+  });
+
+  test('ANOMALY-CLUSTER: holds the relaunch of a goal·host whose signature has three runs, releases after a verdict', () => {
+    const cluster = new AnomalyCluster();
+    for (const runId of ['run-1', 'run-2', 'run-3']) {
+      cluster.record({
+        goal: 'task:0', host: 'self-implement', runId,
+        kind: 'exit', containerExit: 137, stage: 'monitor', lastLines: ['Reason: pod-deadline-exceeded'],
+      });
+    }
+    const graph = readySelfImplementGraph(2);
+    const registry = new SurfaceRegistry();
+    registry.register('self-implement', pendingAdapter());
+    const held = new TaskDispatcher({ graph, registry, recordOpsEvent: () => {}, anomalyCluster: cluster }).tick();
+    expect(held.dispatched.map(entry => entry.taskId)).toEqual(['task:1']);
+    expect(held.deferred).toEqual([{ taskId: 'task:0', reason: 'anomaly-hold' }]);
+
+    expect(cluster.release('task:0', 'self-implement', '원인 판정: 재발사 재개').released).toBe(true);
+    const resumed = new TaskDispatcher({ graph, registry, recordOpsEvent: () => {}, anomalyCluster: cluster }).tick();
+    expect(resumed.dispatched.map(entry => entry.taskId)).toEqual(['task:0']);
+    expect(resumed.deferred).toHaveLength(0);
   });
 
   test('continues dispatch when the injected observation sink throws', () => {

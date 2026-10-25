@@ -81,7 +81,7 @@ export function resolveParentHosts(config: ParentHostSetting | undefined, env: N
 }
 
 /** Capacity sample is read on the host before launch. Unknown or saturated capacity is not a positive weight. */
-export interface ParentHostCapacity { approvalHeadroom: number; load: number }
+export interface ParentHostCapacity { active: number; waiting: number; approvalHeadroom: number; load: number }
 
 export interface ParentHostPodFit {
   state: 'fits' | 'never-fits' | 'unmeasured';
@@ -127,26 +127,35 @@ export function readParentHostPodFit(target: ParentHostConfig, memoryLimit: stri
 }
 
 const CAPACITY_MARKER = '__ELANOUS_PARENT_CAPACITY__';
+const CAPACITY_ERROR_MARKER = '__ELANOUS_PARENT_CAPACITY_ERROR__';
 const APPROVAL_MARKER = '__ELANOUS_PARENT_APPROVALS__';
 const LOAD_MARKER = '__ELANOUS_PARENT_LOAD__';
+/** Best-effort macOS `ps` fallback; Linux/WSL uses argv boundaries below. */
+export const PARENT_HOST_ACTIVE_FILTER = String.raw`/^(([^ ]+\/)?(bun|node|nodejs) )?([^ ]+\/)?elanous(\.mjs)?( --config-dir [^ ]+)? harness (say|ask)( |$)/ && / --no-auto-merge( |$)/ && !/ --substrate local( |$)/ && !/^([^ ]+\/)?[^ ]*sh -c/`;
+/** Count exact Linux argv entries so Pod-local commands and goal text cannot masquerade as host parents. */
+export const PARENT_HOST_PROC_COUNT_SCRIPT = "count=0; proc_root=${1:-/proc}; for file in \"$proc_root\"/[0-9]*/cmdline; do [ -r \"$file\" ] || continue; argv=(); while IFS= read -r -d '' arg; do argv+=(\"$arg\"); done < \"$file\" 2>/dev/null || true; [ ${#argv[@]} -ge 3 ] || continue; program=\"${argv[0]##*/}\"; case \"$program\" in elanous|elanous.mjs) ;; bun|node|nodejs) script_match=0; for ((i=1; i<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == */elanous.mjs ]]; then script_match=1; break; fi; [[ \"${argv[i]}\" == harness ]] && break; done; [ \"$script_match\" -eq 1 ] || continue ;; *) continue ;; esac; harness=0; for ((i=0; i+1<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == harness && ( \"${argv[i+1]}\" == say || \"${argv[i+1]}\" == ask ) ]]; then harness=1; break; fi; done; [ \"$harness\" -eq 1 ] || continue; has_no_auto_merge=0; for arg in \"${argv[@]}\"; do [[ \"$arg\" == --no-auto-merge ]] && has_no_auto_merge=1; done; [ \"$has_no_auto_merge\" -eq 1 ] || continue; local_substrate=0; for ((i=0; i+1<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == --substrate && \"${argv[i+1]}\" == local ]]; then local_substrate=1; break; fi; done; [ \"$local_substrate\" -eq 1 ] || count=$((count+1)); done; printf '__ELANOUS_PARENT_CAPACITY__%s\\n' \"$count\""
 /** Recent admission decisions are the host's measured approval backlog, not an inferred process count. */
 export function readParentHostCapacity(target: ParentHostConfig, ssh: SshRunner = defaultSshRunner): ParentHostCapacity | null {
   const executable = remotePath(target.elanous ?? DEFAULT_REMOTE_ELANOUS);
   const configDir = remotePath(target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR);
-  const script = `parents=$(ps -Ao command) || exit 1; printf '%s\\n' "$parents" | awk '/[e]lanous.*harness (say|ask)/ { n++ } END { print "${CAPACITY_MARKER}" n+0 }'; `
+  const unavailable = (reason: string): null => { try { debug.log('task-agent.parent-host', 'capacity-unavailable', { host: target.host, reason }); } catch { /* fail-soft */ } return null; };
+  const processCount = `if [ -r /proc/self/cmdline ]; then if command -v bash >/dev/null 2>&1; then bash -c ${shellQuote(PARENT_HOST_PROC_COUNT_SCRIPT)} -- /proc; else printf "${CAPACITY_ERROR_MARKER}bash-unavailable\\n"; exit 1; fi; else parents=$(ps -Ao command) || exit 1; printf '%s\\n' "$parents" | awk '${PARENT_HOST_ACTIVE_FILTER} { n++ } END { print "${CAPACITY_MARKER}" n+0 }'; fi`;
+  const script = `${processCount}; `
     + `${executable} --config-dir ${configDir} logs --event admit-by-usage --since 5m --json --limit 1000 || exit 1; `
     + `printf '\\n${APPROVAL_MARKER}\\n'; `
     + `cpu=$(ps -Ao %cpu=) || exit 1; printf '%s\\n' "$cpu" | awk '{ total += $1 } END { printf "${LOAD_MARKER}%.3f\\n", total+0 }'; `
     + `cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || exit 1; printf '${LOAD_MARKER}cores=%s\\n' "$cores"`;
   try {
     const result = ssh(target.host, script, 15_000);
-    if (result.status !== 0) return null;
+    if (result.status !== 0) return unavailable(result.stdout.includes(`${CAPACITY_ERROR_MARKER}bash-unavailable`) ? 'bash-unavailable' : 'remote-command-failed');
     const activeMatch = new RegExp(`^${CAPACITY_MARKER}(\\d+)$`, 'm').exec(result.stdout);
     const boundary = result.stdout.indexOf(`\n${APPROVAL_MARKER}\n`);
     const logsStart = result.stdout.indexOf('\n');
     const cpuMatch = new RegExp(`^${LOAD_MARKER}([0-9]+(?:\\.[0-9]+)?)$`, 'm').exec(result.stdout);
     const coresMatch = new RegExp(`^${LOAD_MARKER}cores=(\\d+)$`, 'm').exec(result.stdout);
-    if (!activeMatch || activeMatch.index !== 0 || logsStart < 0 || boundary < logsStart || !cpuMatch || !coresMatch) return null;
+    if (!activeMatch || activeMatch.index !== 0) return unavailable('active-count-marker-missing');
+    if (logsStart < 0 || boundary < logsStart) return unavailable('approval-boundary-missing');
+    if (!cpuMatch || !coresMatch) return unavailable('load-marker-missing');
     const active = Number(activeMatch[1]);
     const cores = Number(coresMatch[1]);
     const cpu = Number(cpuMatch[1]);
@@ -172,23 +181,24 @@ export function readParentHostCapacity(target: ParentHostConfig, ssh: SshRunner 
       decisions.set(data.runId, data.recommended as number);
     }
     const waiting = [...decisions.values()].filter((n) => n === 0).length;
-    return { approvalHeadroom: Math.max(0, capacity - active - waiting), load: Math.max(0, cpu / (cores * 100)) };
-  } catch { return null; }
+    return { active, waiting, approvalHeadroom: Math.max(0, capacity - active - waiting), load: Math.max(0, cpu / (cores * 100)) };
+  } catch { return unavailable('capacity-parse-failed'); }
 }
 
-/** Weighted rendezvous: stable per run, no shared counter or dependence on dispatch order. */
-export function orderParentHosts(targets: readonly ParentHostConfig[], runId: string, capacities: Readonly<Record<string, ParentHostCapacity | null>>): ParentHostConfig[] {
+/** Weighted rendezvous rank with evidence fields for launch-time observation. */
+export function rankParentHosts(targets: readonly ParentHostConfig[], runId: string, capacities: Readonly<Record<string, ParentHostCapacity | null>>): Array<{ target: ParentHostConfig; weight: number; score: number }> {
   return targets.map((target, index) => {
     const sample = capacities[target.host];
     const weight = sample && Number.isSafeInteger(sample.approvalHeadroom) && sample.approvalHeadroom > 0 && Number.isFinite(sample.load) && sample.load >= 0
       ? sample.approvalHeadroom / (1 + sample.load) : 0;
     const hash = createHash('sha256').update(`${runId}\0${target.host}`).digest();
     const fraction = (hash.readUIntBE(0, 6) + 1) / (2 ** 48 + 1);
-    return { target, index, score: weight > 0 ? -Math.log(fraction) / weight : Infinity };
-  }).sort((a, b) => a.score - b.score || a.index - b.index).map(({ target }) => target);
+    return { target, index, weight, score: weight > 0 ? -Math.log(fraction) / weight : Infinity };
+  }).sort((a, b) => a.score - b.score || a.index - b.index).map(({ target, weight, score }) => ({ target, weight, score }));
 }
 
-/** `$HOME/…` 은 원격 셸이 풀도록 따옴표 밖에 둔다 — 나머지는 shellQuote. */
+
+/** Keep `$HOME/...` outside quotes so the remote shell expands it; quote every other path. */
 function remotePath(path: string): string {
   return path.startsWith('$HOME/') ? `"$HOME"/${shellQuote(path.slice('$HOME/'.length))}` : shellQuote(path);
 }

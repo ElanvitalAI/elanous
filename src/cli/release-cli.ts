@@ -57,7 +57,7 @@ import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../
 import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
 import { applyWatchList, formatGateHistory, gateHistory, ghMergedPrs } from '../../scripts/release-loop/gate-history.js';
 import { registerRfcCommands } from './rfc-cli.js';
-import { checklistCodenames, checklistVersion, isReleaseVersion, readChecklistContext, registerChecklistReadCommands } from './release-checklist-read-cli.js';
+import { checklistCodenames, checklistVersion, isReleaseVersion, readChecklistContext, registerChecklistReadCommands, type ChecklistEvidenceReader } from './release-checklist-read-cli.js';
 
 export { isReleaseVersion } from './release-checklist-read-cli.js';
 
@@ -547,19 +547,35 @@ export interface LandedButYellowDeps {
   evidenceAdd?: typeof features.evidenceAdd;
   schedules?: typeof features.readSchedules;
   released?: typeof features.releasedVersion;
+  /** Isolated cache location for tests; production defaults to the installation release ledger. */
+  mergedPrCacheFile?: () => string;
 }
 
 /** A spawn failure (gh missing from PATH) resolves `status: null` with the error text — the shape the sync runner gave. */
-const defaultMergedPrRunner: MergedPrRunner = (command, args, cwd) => new Promise((resolve) => {
+const defaultMergedPrRunner: MergedPrRunner = (command, args, cwd, timeoutMs) => new Promise((resolve) => {
   const out: Buffer[] = [], err: Buffer[] = [];
   const failed = (error: unknown) => resolve({ status: null, stdout: Buffer.concat(out).toString('utf8'), stderr: String(error) });
   let child: ReturnType<typeof spawn>;
+  let timedOut = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let killTimeout: ReturnType<typeof setTimeout> | undefined;
   try { child = spawn(command, [...args], { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }); }
   catch (error) { failed(error); return; }
+  if (timeoutMs !== undefined) timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill('SIGTERM');
+    // The caller has already reached its explicit limit. Give gh a short cleanup window, then
+    // force-close it so an ignoring child cannot keep the CLI alive for the former 5s grace.
+    killTimeout = setTimeout(() => child.kill('SIGKILL'), 100);
+  }, timeoutMs);
   child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
   child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
   child.on('error', failed);
-  child.on('close', (code) => resolve({ status: code, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }));
+  child.on('close', (code) => {
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (killTimeout !== undefined) clearTimeout(killTimeout);
+    resolve({ status: code, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8'), ...(timedOut ? { timedOut: true } : {}) });
+  });
 });
 
 function printLandedRows(rows: ReturnType<typeof landedButYellow>, items: ReturnType<typeof listChecklist>['items']): void {
@@ -588,7 +604,7 @@ function compareReleaseVersions(a: string, b: string): number {
   return 0;
 }
 
-export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: ResumeReleaseDeps = {}): void {
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: ResumeReleaseDeps = {}, checklistEvidenceReader?: ChecklistEvidenceReader): void {
   registerRfcCommands(program);
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
@@ -780,13 +796,15 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       console.log(renderRefsStatus(rows));
       console.log(`칸 ${rows.length} · 🟢 ${byStatus.green} · 🟡 ${byStatus.yellow} · 🔴 ${byStatus.red} · ✅ ${byStatus.done}`);
     });
-  registerChecklistReadCommands(checklist);
+  registerChecklistReadCommands(checklist, checklistEvidenceReader);
   withContext(checklist.command('landed-but-yellow').description('병합 PR 이 있지만 노랑·빨강인 칸(기본 읽기 전용)'))
     .option('--owner <owner>', '자리 또는 하위 자리로 거르기')
     .option('--open', '미발행 일정 판 중 칸이 있는 판 전부')
     .option('--apply-evidence', '확실한 PR 짝의 근거를 붙인다(상태는 그대로)')
     .option('--dry-run', '근거 추가 없이 계획만 출력')
-    .action(async (opts: { owner?: string; open?: boolean; applyEvidence?: boolean; dryRun?: boolean }, cmd: Command) => {
+    .option('--limit <ms>', '병합 PR 창 조회 시간 상한(밀리초) — 기본 무제한, 명시하면 초과 시 부분 결과와 stopReason·남은 칸 판 목록을 낸다')
+    .option('--time-budget <ms>', 'deprecated alias of --limit')
+    .action(async (opts: { owner?: string; open?: boolean; applyEvidence?: boolean; dryRun?: boolean; limit?: string; timeBudget?: string }, cmd: Command) => {
       // Stage timings (LANDED-YELLOW-FAST): which step ate the time — `elanous logs --category release.landed-yellow`.
       let stageAt = performance.now();
       const stage = (name: string, data: Record<string, unknown>) => {
@@ -835,10 +853,20 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           .map((item) => Date.parse(item.updatedAt)).filter((at) => Number.isFinite(at)));
         const since = updated.length ? new Date(updated.reduce((earliest, at) => Math.min(earliest, at))).toISOString().slice(0, 10)
           : new Date(now.getTime() - 7 * 86_400_000).toISOString().slice(0, 10);
+        if (opts.limit !== undefined && opts.timeBudget !== undefined) throw new CliUserError('--limit 과 --time-budget 중 하나만 지정할 수 있다');
+        const timeBudget = opts.limit ?? opts.timeBudget;
+        const timeBudgetMs = timeBudget === undefined ? undefined : Number(timeBudget);
+        if (timeBudgetMs !== undefined && (!Number.isFinite(timeBudgetMs) || timeBudgetMs <= 0)) {
+          throw new CliUserError(`잘못된 시간 상한: ${timeBudget}`, '--limit <ms> — 양의 밀리초 수치');
+        }
         const syncRun = landedDeps.run;
         const runAsync: MergedPrRunner = landedDeps.runAsync ?? (syncRun ? async (command, args, cwd) => syncRun(command, args, cwd) : defaultMergedPrRunner);
-        const { prs, truncated, calls } = await fetchMergedChecklistPrs(since, now, runAsync, process.cwd());
-        stage('merged-prs', { n: prs.length, calls, since, truncated });
+        const cacheFile = landedDeps.mergedPrCacheFile?.() ?? ((landedDeps.run || landedDeps.runAsync) ? undefined : join(releaseLedgerRoot(), 'release', 'landed-but-yellow-cache.json'));
+        const { prs, truncated, calls, stopReason, remainingWindows } = await fetchMergedChecklistPrs(since, now, runAsync, process.cwd(), {
+          ...(cacheFile ? { cacheFile } : {}),
+          timeBudgetMs,
+        });
+        stage('merged-prs', { n: prs.length, calls, since, truncated, ...(stopReason !== undefined ? { stopReason, remainingWindows: remainingWindows.length } : {}) });
         const results: Array<{ version: string; rows?: ReturnType<typeof landedButYellow>; plan?: ReturnType<typeof evidencePlan> }> = [];
         let totalAdded = 0, totalSkipped = 0;
         for (const snapshot of snapshots) {
@@ -869,9 +897,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         if (opts.open) {
           if (opts.applyEvidence && !opts.dryRun) debug.log('release.checklist', 'evidence-synced', { versions: snapshots.map(({ version }) => version), added: totalAdded, skippedMention: totalSkipped });
           if (!json) console.log(`판 ${snapshots.length} · 붙임 합 ${totalAdded} · 건너뜀(언급만) 합 ${totalSkipped}`);
+          else if (stopReason !== undefined) await writeStdoutJson(`${JSON.stringify({ results, stopReason, remainingVersions: snapshots.map(({ version }) => version), remainingWindows })}\n`);
           else await writeStdoutJson(`${JSON.stringify(results)}\n`);
-        } else if (json) await writeStdoutJson(`${JSON.stringify(opts.applyEvidence || opts.dryRun ? results[0]!.plan : results[0]!.rows)}\n`);
+        } else if (json) {
+          const output = opts.applyEvidence || opts.dryRun ? results[0]!.plan : results[0]!.rows;
+          await writeStdoutJson(`${JSON.stringify(stopReason === undefined ? output : { results, stopReason, remainingVersions: snapshots.map(({ version }) => version), remainingWindows })}\n`);
+        }
         if (truncated) console.error('⚠ 병합 PR 400개 상한: 목록이 잘렸을 수 있다');
+        if (stopReason !== undefined) console.error(`⚠ 병합 PR 조회 시간 상한 도달: 부분 결과 ${prs.length} · 남은 판 ${snapshots.map(({ version }) => version).join(' · ')} · 미조회 UTC 창 ${remainingWindows.length}(${remainingWindows.slice(0, 3).join(' · ')}${remainingWindows.length > 3 ? ' …' : ''})`);
       } catch (error) {
         console.error(`⛔ ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;
@@ -972,7 +1005,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       const data = noteDispatchSkip(version, id, reason, opts.expectedTitle, opts.by);
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 건너뜀 근거 확인`);
     });
-  const evidence = checklist.command('evidence').description('칸의 PR·커밋 근거');
+  const evidence = checklist.commands.find((command) => command.name() === 'evidence')!;
   withContext(evidence.command('add <id> <ref>').description('근거 참조 추가')).action((id: string, ref: string, _opts: unknown, cmd: Command) => {
       const { version, json } = context(cmd);
       if (!mayWrite(cmd)) return;

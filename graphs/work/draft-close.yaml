@@ -1,0 +1,54 @@
+graph_id: work-draft-close
+version: 1
+launcher: graph-run
+entry_node: decide
+terminal_nodes: [done, failed]
+runner_inputs: [mapRunId, snapshotTime, inventoryComplete, inventory, mainSha, item]
+nodes:
+  - node_id: decide
+    kind: observe
+    recipe: 'cmd:draft-close-decide'
+    max_visits: 1
+    contract:
+      inputs: [mapRunId, snapshotTime, inventoryComplete, inventory, mainSha, item]
+      tools: read-only
+      outputs: [outcome, result, evidence]
+  - node_id: harvest
+    kind: observe
+    recipe: 'cmd:draft-close-emit-harvest'
+    max_visits: 1
+    contract:
+      inputs: [result, evidence]
+      tools: none
+      outputs: [outcome, result, evidence]
+  - node_id: close-candidate
+    kind: observe
+    recipe: 'cmd:draft-close-emit-close-candidate'
+    max_visits: 1
+    contract:
+      inputs: [result, evidence]
+      tools: none
+      outputs: [outcome, result, evidence]
+  - node_id: hold
+    kind: observe
+    recipe: 'cmd:draft-close-emit-hold'
+    max_visits: 1
+    contract:
+      inputs: [result, evidence]
+      tools: none
+      outputs: [outcome, result, evidence]
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - from: decide
+    on: outcome
+    map: { harvest: harvest, 'close-candidate': close-candidate, hold: hold, failed: failed }
+  - from: harvest
+    on: outcome
+    map: { done: done, failed: failed }
+  - from: close-candidate
+    on: outcome
+    map: { done: done, failed: failed }
+  - from: hold
+    on: outcome
+    map: { done: done, failed: failed }

@@ -9,6 +9,8 @@ import { writeStdoutJson } from './stdout-json.js';
 export interface AutopilotCliDeps {
   /** logs.db 싱크 등록(시험 주입). 기본 = `registerStandaloneLogSink`. `task-agent-action` 이 부른다. */
   registerSink?: (surface: string) => Promise<unknown>;
+  /** Deterministic action execution ports for isolated dispatcher tests. */
+  actionDeps?: Pick<import('../task-agent/actions.js').ActionDeps, 'mode' | 'command' | 'observe'>;
 }
 
 export function registerAutopilotCommands(program: Command, cliDeps: AutopilotCliDeps = {}): void {
@@ -22,7 +24,7 @@ export function registerAutopilotCommands(program: Command, cliDeps: AutopilotCl
       // 독립 프로세스 — 싱크를 붙이지 않으면 `task-agent`/`action` 관측이 logs.db 에 안 닿는다(fail-open).
       const { registerTaskAgentSink } = await import('./tasks-cli.js');
       await registerTaskAgentSink(cliDeps.registerSink);
-      const { executeNextAction } = await import('../task-agent/actions.js');
+      const { executeEntranceTick, executeNextAction } = await import('../task-agent/actions.js');
       const { getUserConfig } = await import('../user-config.js');
       const { spawnSync } = await import('node:child_process');
       const { writeFileSync, mkdirSync } = await import('node:fs');
@@ -41,15 +43,23 @@ export function registerAutopilotCommands(program: Command, cliDeps: AutopilotCl
         process.exitCode = 1;
         return;
       }
-      const action = JSON.parse(actionJson) as import('../task-agent/actions.js').NextAction;
+      const parsedInput = JSON.parse(actionJson) as import('../task-agent/actions.js').NextAction | import('../task-agent/actions.js').EntranceTickCandidate[];
+      const isEntranceTick = Array.isArray(parsedInput);
+      const action = isEntranceTick ? parsedInput[0]?.action : parsedInput;
+      if (!action) {
+        process.stderr.write('task-agent-action: action or non-empty entrance tick is required\n');
+        process.exitCode = 1;
+        return;
+      }
       const deps: import('../task-agent/actions.js').ActionDeps = {
         ...state,
+        ...cliDeps.actionDeps,
         failureCounts: state.failureCounts ?? {},
         saveState: () => {
           mkdirSync(dirname(statePath), { recursive: true });
           // 실패 횟수는 incrementFailure 가 잠금 안에서 키별로 더한다 — 여기선 덮어쓰지 않는다.
         },
-        mode: config.taskAgent?.mode,
+        mode: cliDeps.actionDeps?.mode ?? config.taskAgent?.mode,
         // 하루 착지 칸은 상태 파일 잠금 안에서 확보·반환한다 — 두 CLI 프로세스가 같은 잔여 칸을 쓰지 않게.
         reserveLanding: (day, limit) => withFileLockSync(`${statePath}.lock`, () => {
           const disk = readTaskAgentState<ActionState>(statePath);
@@ -74,18 +84,23 @@ export function registerAutopilotCommands(program: Command, cliDeps: AutopilotCl
           writeFileSync(statePath, JSON.stringify({ ...disk, landingsToday: disk.landingsToday - 1 }));
           deps.landingsToday = disk.landingsToday - 1;
         }),
-        observe: (_event, data) => debug.log('task-agent', 'action', data),
-        command: async args => {
+        observe: cliDeps.actionDeps?.observe ?? ((_event, data) => debug.log('task-agent', 'action', data)),
+        command: cliDeps.actionDeps?.command ?? (async (args, cwd) => {
           const p = args[0] === 'gh'
-            // PR 조회는 착지할 작업 트리에서 — 다른 저장소에서 불러도 엉뚱한 PR 을 읽지 않게.
-            ? spawnSync('gh', args.slice(1), { encoding: 'utf8', ...(action.cwd ? { cwd: action.cwd } : {}) })
+            // PR 조회는 해당 후보의 작업 트리에서 — 배열 후보 간 저장소가 섞이지 않게.
+            ? spawnSync('gh', args.slice(1), { encoding: 'utf8', ...(cwd ? { cwd } : {}) })
             // 지금 돌고 있는 진입점으로 부른다 — 저장소 밖(설치본)에서 불러도 같은 elanous 를 쓴다.
             : spawnSync(process.execPath, [process.argv[1]!, ...(process.argv.includes('--test') ? ['--test'] : []), ...args], { encoding: 'utf8' });
           return { status: p.status ?? 1, stdout: p.stdout ?? '', stderr: p.stderr ?? '' };
-        },
+        }),
       };
       let result: string;
-      try { result = await executeNextAction(action, deps); } catch (error) {
+      try {
+        if (isEntranceTick) {
+          const results = await executeEntranceTick(parsedInput, deps);
+          result = results.join('\n');
+        } else result = await executeNextAction(action, deps);
+      } catch (error) {
         // 잠금 안 읽기가 손상을 만나면 쓰지 않고 여기로 온다 — 실패로 끝낸다. 그 밖의 오류는 종전대로 올린다.
         if (!(error instanceof TaskAgentStateError)) throw error;
         process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

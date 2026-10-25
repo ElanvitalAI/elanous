@@ -144,7 +144,7 @@ export interface GraphRunState {
   reason?: string;
   path: string[];
   /** startedAt/endedAt (ISO) and seconds are written when the node runs; ledgers before GRAPH-NODE-TIMES (0.2.19) have none. */
-  nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; decidedBy?: string; decidedAt?: string;
+  nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; reason?: string; decidedBy?: string; decidedAt?: string;
     startedAt?: string; endedAt?: string; seconds?: number;
     waiver?: { reason: string; at: string; /** RELEASE-WAIVE-UNMEASURED — why the waived gate had no verdict. */ unmeasured?: string; original: { exit: number | null; output?: unknown; error?: string } } }>;
   /** The node now running and when it started; cleared when its record is written. */
@@ -170,6 +170,11 @@ export interface GraphRunState {
   executed: number;
   dryRun: boolean;
   statePath: string;
+}
+
+function failedCommandStderrTail(exitCode: number, stderr: string): string | undefined {
+  if (exitCode === 0 || !stderr.trim()) return undefined;
+  return stderr.replace(/(?:\r?\n)+$/, '').split(/\r?\n/).slice(-40).join('\n') || undefined;
 }
 
 export interface GraphClassifyInput {
@@ -1071,6 +1076,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     let ok = approval && !state.dryRun ? state.pending?.decision === 'approved' : true;
     let exit: number | null = null;
     let error: string | undefined;
+    let commandFailureReason: string | undefined;
     let output: unknown;
     const waiving = options.releaseWaiver?.nodeId === current && waivedRecord !== undefined;
     if (command && !waiving && (!approval || state.dryRun || ok) && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
@@ -1105,7 +1111,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         try {
           const result = await execute(body, commandRoot ? { ...opts, cwd: commandRoot } : opts);
           code = result.exitCode;
-          return { ...result, stdout: redactCredentials(result.stdout), stderr: redactCredentials(result.stderr) };
+          const stderr = redactCredentials(result.stderr);
+          commandFailureReason = failedCommandStderrTail(result.exitCode, stderr);
+          return { ...result, stdout: redactCredentials(result.stdout), stderr };
         } finally {
           if (state.activeNode?.nodeId === current) {
             delete state.activeNode;
@@ -1296,13 +1304,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       exit = completed.exit;
       output = completed.output;
       error = completed.error;
+      commandFailureReason = completed.reason;
     } else {
       // 승인 노드도 결과를 «값»으로 남긴다 — 뒤 노드가 문맥(outputs)에서 승인 여부를 확인할 수 있게(발행 노드가 승인 없이 돌지 않도록).
       if (approval && !state.dryRun && !command) {
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', graphId, runId, nodeId: current,
           ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
-      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...((waiving || harnessLoopRoute || units.has(current) || ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...((waiving || harnessLoopRoute || units.has(current) || ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}), ...(commandFailureReason ? { reason: commandFailureReason } : {}),
         ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, ...(options.releaseWaiver!.unmeasured === undefined ? {} : { unmeasured: options.releaseWaiver!.unmeasured }), original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
@@ -1318,10 +1327,13 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const reported: unknown = waiving || harnessLoopRoute || units.has(current) || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome: string | undefined = typeof reported === 'string' ? reported : undefined;
     if (!options.quiet) console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
-    debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit });
+    debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit,
+      ...(commandFailureReason ? { reason: commandFailureReason } : {}) });
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds });
     publishInsideEvent({ kind: 'verdict', graphId, runId, nodeId: current, verdict: ok ? 'ok' : 'fail', ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }) });
-    log('node-end', { graphId, runId, nodeId: current, ok, exit, ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }), dryRun: state.dryRun });
+    log('node-end', { graphId, runId, nodeId: current, ok, exit,
+      ...(commandFailureReason ? { reason: commandFailureReason } : {}),
+      ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }), dryRun: state.dryRun });
     if (!resumingCompleted) {
       // Recipe commands expose stdout/exit but no provider usage; never infer zero from success.
       observeModelInputTokens({ scope: 'harness-node', nodeKind: node.kind, runId, nodeId: current });

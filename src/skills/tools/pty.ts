@@ -149,6 +149,11 @@ export async function dispatchPtyShellStart(
   opts: PtyDispatchOpts = {},
 ): Promise<{ output: string }> {
   const args = validateStart(rawArgs);
+  // Keep the self-nest guard at the shared production boundary: the daemon
+  // tool surface and the skills runner both reach this dispatcher.
+  const { decideTuiSelfNest } = await import('../../agent/terminal-surface.js');
+  const selfNest = decideTuiSelfNest([args.cmd, ...(args.args ?? [])]);
+  if (selfNest.reject) return { output: selfNest.output ?? '' };
   const boundaryReject = harnessCommandWriteReject([args.cmd, ...(args.args ?? [])], args.workdir ?? process.cwd(), 'pty-start');
   if (boundaryReject) return { output: boundaryReject };
   if (!ptyAvailable()) {

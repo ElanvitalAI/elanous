@@ -479,7 +479,7 @@ describe('planShadowFirstDispatch — shadow 관측이 live 발사보다 «앞�
     expect(orderPiecesTopologically(plan.pieces).dependsOnEdges).toBe(1);
   });
 
-  test('live 조각의 «다른» 의존은 잃지 않고 shadow 를 뒤에 붙인다', () => {
+  test('중간 live 조각도 shadow 뒤에 서고 기존 의미 의존은 보존한다', () => {
     const plan = planShadowFirstDispatch([
       { id: 'helper', feature: 'helper', dependsOn: [] },
       { id: 'live', feature: '② live 스위치', dependsOn: ['helper'] },
@@ -488,8 +488,10 @@ describe('planShadowFirstDispatch — shadow 관측이 live 발사보다 «앞�
     expect(plan.kind).toBe('ok');
     if (plan.kind !== 'ok') return;
     expect(plan.pieces.map((p) => p.id)).toEqual(['shadow', 'helper', 'live']);
+    expect(plan.pieces[1]!.dependsOn).toEqual(['shadow']);
     expect(plan.pieces[2]!.dependsOn).toEqual(['helper', 'shadow']);
-    expect(plan.shadowFirst).toEqual({ shadowId: 'shadow', liveIds: ['helper', 'live'], restoredEdges: 1 });
+    expect(plan.shadowFirst).toEqual({ shadowId: 'shadow', liveIds: ['helper', 'live'], restoredEdges: 2 });
+    expect(orderPiecesTopologically(plan.pieces).ordered?.map((p) => p.id)).toEqual(['shadow', 'helper', 'live']);
   });
 
   test('⛔ 매달린 dependsOn 은 «거부»다 — 없는 조각을 선행으로 단 제안은 승격하지 않는다', () => {
@@ -497,7 +499,17 @@ describe('planShadowFirstDispatch — shadow 관측이 live 발사보다 «앞�
     expect(plan.kind).toBe('rejected');
     if (plan.kind !== 'rejected') return;
     expect(plan.reason).toBe('dangling-dependsOn');
-    expect(plan.danglingIds).toEqual(['ghost']);
+    expect(plan.detail).toEqual(['ghost']);
+  });
+
+  test('⛔ shadow 가 live 를 선행으로 요구하면 모순을 거부한다', () => {
+    const plan = planShadowFirstDispatch([S(['live']), L([])]);
+    expect(plan).toEqual({ kind: 'rejected', reason: 'shadow-depends-on-live', detail: ['live'] });
+  });
+
+  test('⛔ shadow 의 자기 선행 간선은 순환으로 거부한다', () => {
+    const plan = planShadowFirstDispatch([S(['shadow']), L([])]);
+    expect(plan).toEqual({ kind: 'rejected', reason: 'shadow-depends-on-self', detail: ['shadow'] });
   });
 
   test('shadow-first 가 아닌 제안은 «그대로» — 순서도 간선도 건드리지 않는다', () => {
@@ -589,6 +601,7 @@ describe('applyDecomposeProposals — caller shadow 관측이 live 발사 «앞�
     expect(r.decomposed).toEqual(['big']);
     expect(r.goals.map((g) => g.id)).toEqual(['shadow', 'live']);
     expect(r.goals[1]!.dependsOn).toEqual(['shadow']);
+    expect(r.goals.slice(1).every((goal) => goal.dependsOn?.includes('shadow'))).toBe(true);
   });
 
   test('⭐ live 발사 «전»에 shadow 관측이 caller 로그에 먼저 남는다', () => {
@@ -619,6 +632,7 @@ describe('applyDecomposeProposals — caller shadow 관측이 live 발사 «앞�
     const r = applyDecomposeProposals(
       [G('big')],
       [R('big', [
+        { id: 'shadow', feature: '① shadow observation', dependsOn: [] },
         { id: 'p1', feature: 'part 1', dependsOn: [] },
         { id: 'p2', feature: 'part 2', dependsOn: ['ghost'] },
       ])],
@@ -626,6 +640,25 @@ describe('applyDecomposeProposals — caller shadow 관측이 live 발사 «앞�
     expect(r.decomposed).toEqual([]);
     expect(r.goals.map((g) => g.feature)).toEqual(['big']);
     expect(r.rejected).toEqual([{ feature: 'big', reason: 'dangling-dependsOn', detail: ['ghost'] }]);
+  });
+
+  test('일반 분해 제안의 매달린 간선은 기존처럼 세고 계속 처리한다', () => {
+    const r = applyDecomposeProposals(
+      [G('big')],
+      [R('big', [
+        { id: 'p1', feature: 'part 1', dependsOn: [] },
+        { id: 'p2', feature: 'part 2', dependsOn: ['ghost'] },
+      ])],
+    );
+    expect(r.decomposed).toEqual(['big']);
+    expect(r.rejected).toEqual([]);
+    expect(r.goals.map((goal) => goal.id)).toEqual(['p1', 'p2']);
+    expect(r.goals[1]!.dependsOn).toEqual(['ghost']);
+    expect(orderPiecesTopologically(r.goals.map((goal) => ({
+      id: goal.id ?? goal.feature,
+      feature: goal.feature,
+      dependsOn: goal.dependsOn ?? [],
+    }))).danglingDependsOn).toBe(1);
   });
 
   test('거부 없이 통과한 제안은 rejected 가 [] 이다', () => {

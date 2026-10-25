@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { defaultTaskLauncher, registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
+import { registerAutopilotCommands } from '../cli/autopilot-cli.js';
 import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -20,6 +21,100 @@ import { setUserConfigOverlay } from '../user-config.js';
 import { deriveBirthIdentity, parseRunIdentityTag, runPriorityClass, validateRunIdentity, type RunIdentity } from './run-identity.js';
 import { parseWorkOrder } from './work-order.js';
 import { draftReleaseComment } from '../self-dev/draft-triage-rules.js';
+import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack } from '../self-implement/knowhow-pack.js';
+
+// MS-05 + isolated temporary git: the real tasks hand CLI decides, only the external launcher is captured.
+test('tasks hand --live carries one bounded KNOWHOW pack to the first child goal without changing cards or ledgers', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'task-hand-knowhow-git-'));
+  const state = statePath();
+  const source = join(repo, 'docs/roles/OP/KNOWHOW.md');
+  mkdirSync(join(repo, 'docs/roles/OP'), { recursive: true });
+  execFileSync('git', ['init', '-q', repo]);
+  writeFileSync(source, Array.from({ length: 4 }, (_, i) => `## K-OP-${i + 101} gate-failed\n- 상황: src/task-agent/task-hand.ts gate-failed.\n- 처방: 원문 ${i + 1} 확인.\n- 출처: 격리 시험 · 상태: active`).join('\n'));
+  const hash = (file: string) => createHash('sha256').update(readFileSync(file)).digest('hex');
+  const originalHash = hash(source);
+  const operationalFiles = ['seat-state/OP/know-candidates.md', 'docs/roles/OP/KNOWHOW.md', 'docs/roles/MK/KNOWHOW.md', 'docs/roles/TC/KNOWHOW.md', 'docs/roles/UX/KNOWHOW.md'];
+  const operationalHashes = operationalFiles.map((file) => {
+    try { return [file, hash(resolve(import.meta.dir, '../..', file))]; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [file, null]; throw error; }
+  });
+  const input = liveGoal('대상 경로: src/task-agent/task-hand.ts\n실패 서명: gate-failed');
+  const pack = selectKnowhowPack(repo, input);
+  expect(pack.ids).toEqual(['K-OP-101', 'K-OP-102', 'K-OP-103']);
+  expect(pack.bytes).toBe(Buffer.byteLength(pack.text, 'utf8'));
+  expect(pack.bytes).toBeLessThanOrEqual(KNOWHOW_PACK_MAX_BYTES);
+  const calls: Array<{ args: string[]; context?: TaskLaunchContext }> = [];
+  const observations: Array<{ event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'task-hand-knowhow-pack', emit: (rec) => {
+    if (rec.category === 'task-agent' && rec.event === 'knowhow-pack') observations.push(rec);
+  } });
+  try {
+    const handed = await cli(['tasks', 'hand', input, '--project', 'isolated', '--target', repo, '--live', '--json'], {
+      taskStatePath: state, taskLauncher: (args, _cwd, context) => { calls.push({ args, context }); return { runId: context!.runId }; },
+    });
+    expect(handed.code ?? 0).toBe(0);
+    const result = JSON.parse(handed.lines[0]!) as { card: TaskCard; move: { command: string[] } };
+    expect(Object.keys(readTaskAgentState<{ tasks: Record<string, TaskCard> }>(state).tasks)).toEqual([result.card.id]);
+    expect(readTaskCard(result.card.id, state)?.text).toBe(input);
+    expect(result.card.text).toBe(input);
+    expect(result.move.command.at(-1)).toBe(input);
+    expect(calls).toHaveLength(1);
+    const firstGoal = `${pack.text}\n\n${input}`;
+    expect(calls[0]!.args.at(-1)).toBe(firstGoal);
+    expect(calls[0]!.context!.podGoal).toBe(firstGoal);
+    expect(calls[0]!.args.at(-1)!.split('[KNOWHOW-PACK v1').length - 1).toBe(1);
+    expect(observations).toContainEqual(expect.objectContaining({ data: expect.objectContaining({ ids: pack.ids, bytes: pack.bytes, injected: true }) }));
+    expect(hash(source)).toBe(originalHash);
+    expect(operationalFiles.map((file) => {
+      try { return [file, hash(resolve(import.meta.dir, '../..', file))]; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [file, null]; throw error; }
+    })).toEqual(operationalHashes);
+
+    const repeated = await cli(['tasks', 'hand', firstGoal, '--project', 'isolated', '--target', repo, '--live', '--json'], {
+      taskStatePath: state, taskLauncher: (args, _cwd, context) => { calls.push({ args, context }); return { runId: context!.runId }; },
+    });
+    expect(repeated.code ?? 0).toBe(0);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.args.at(-1)).toBe(firstGoal);
+    expect(calls[1]!.context!.podGoal).toBe(firstGoal);
+    expect(observations.at(-1)?.data).toMatchObject({ ids: [], bytes: 0, injected: false });
+    const evidenceOnly = liveGoal('대상 경로: src/unrelated.ts\n완료 경계 증거 명령: bun test src/task-agent/task-hand.ts');
+    const unrelated = await cli(['tasks', 'hand', evidenceOnly, '--project', 'isolated', '--target', repo, '--live', '--json'], {
+      taskStatePath: state, taskLauncher: (args, _cwd, context) => { calls.push({ args, context }); return { runId: context!.runId }; },
+    });
+    expect(unrelated.code ?? 0).toBe(0);
+    expect(calls[2]!.args.at(-1)).toBe(evidenceOnly);
+    expect(calls[2]!.context!.podGoal).toBe(evidenceOnly);
+    expect(observations.at(-1)?.data).toMatchObject({ ids: [], bytes: 0, injected: false });
+    expect(hash(source)).toBe(originalHash);
+    expect(operationalFiles.map((file) => {
+      try { return [file, hash(resolve(import.meta.dir, '../..', file))]; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [file, null]; throw error; }
+    })).toEqual(operationalHashes);
+
+    const shadow = await cli(['tasks', 'hand', input, '--project', 'isolated', '--target', repo, '--json'], {
+      taskStatePath: state, taskLauncher: (args) => { calls.push({ args }); },
+    });
+    expect(shadow.code ?? 0).toBe(0);
+    expect(calls).toHaveLength(3);
+    expect((JSON.parse(shadow.lines[0]!) as { move: { command: string[] } }).move.command.at(-1)).toBe(input);
+    expect(observations).toHaveLength(3);
+
+    const otherRoot = compositionFixture('artifact');
+    const rejected = await cli(['tasks', 'hand', input, '--project', 'isolated', '--target', repo, '--completion', 'artifact', '--live', '--json'], {
+      taskStatePath: state, taskCompositionRoot: otherRoot, taskLauncher: (args) => { calls.push({ args }); },
+    });
+    expect(rejected.code).toBe(1);
+    expect(rejected.lines.join('\n')).toContain('조합 실행기 없음');
+    expect(calls).toHaveLength(3);
+    expect(observations).toHaveLength(3);
+    expect(hash(source)).toBe(originalHash);
+    expect(operationalFiles.map((file) => {
+      try { return [file, hash(resolve(import.meta.dir, '../..', file))]; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [file, null]; throw error; }
+    })).toEqual(operationalHashes);
+  } finally { off(); rmSync(repo, { recursive: true, force: true }); }
+});
 
 test('only a unique launched code-PR card owns the PR or its opening run', () => {
   const base: TaskCard = { id: 'ta-one', text: 'draft', createdAt: '2026-10-10T00:00:00Z',
@@ -120,6 +215,43 @@ test('live hand 완료 경계 증거 명령은 명령 원문만 받는다 — �
       .rejects.toThrow(`완료 경계 증거 명령은 명령 원문이어야 한다 ${reason}: ${value}`);
     expect(launches).toBe(0);
     expect(readTaskCard(`ta-20261021-evidence-${index}`, path)).toBeUndefined();
+  }
+});
+
+test('live hand 골 첫 줄은 «대상 경로:» 뒤 경로 목록만 받는다 — 괄호·줄번호·덧말은 이유를 붙여 카드 기록·launcher 호출 전에 거부한다', async () => {
+  const plainPath = statePath();
+  let plainLaunches = 0;
+  const plain = await handTask({ id: 'ta-20261024-first-line-plain',
+    text: liveGoal('대상 경로: src/task-agent/task-hand.ts · src/task-agent/task-hand.test.ts'),
+    live: true, preflightGoalDoneBoundary: true, statePath: plainPath,
+    launcher: () => { plainLaunches++; } });
+  expect(plain).toMatchObject({ mode: 'live', launched: true });
+  expect(plainLaunches).toBe(1);
+
+  // 공백이 든 «경로 자체»는 덧말이 아니다 — 이 축이 새로 막지 않는다(지금과 같은 동작).
+  const spacedPath = statePath();
+  let spacedLaunches = 0;
+  const spaced = await handTask({ id: 'ta-20261024-first-line-spaced-path',
+    text: liveGoal('대상 경로: docs/MANUAL session start.md'), live: true, preflightGoalDoneBoundary: true,
+    statePath: spacedPath, launcher: () => { spacedLaunches++; } });
+  expect(spaced).toMatchObject({ mode: 'live', launched: true });
+  expect(spacedLaunches).toBe(1);
+
+  const decorated = [
+    { value: 'src/task-agent/task-hand.ts (핵심) · src/task-agent/task-hand.test.ts', reason: '괄호 장식' },
+    { value: 'src/task-agent/task-hand.ts:1291-1302 · src/task-agent/task-hand.test.ts', reason: '줄번호' },
+    { value: 'src/task-agent/task-hand.ts → 첫 줄만 · src/task-agent/task-hand.test.ts', reason: '덧말' },
+    { value: 'src/task-agent/task-hand.ts 코드만 · src/task-agent/task-hand.test.ts', reason: '덧말(공백 섞임)' },
+  ];
+  for (const [index, { value, reason }] of decorated.entries()) {
+    const path = statePath();
+    let launches = 0;
+    const id = `ta-20261024-first-line-${index}`;
+    await expect(handTask({ id, text: liveGoal(`대상 경로: ${value}`), live: true, preflightGoalDoneBoundary: true,
+      statePath: path, launcher: () => { launches++; } }))
+      .rejects.toThrow(`goal-revision-required: 골 첫 줄은 «대상 경로:» 뒤에 경로 목록만 적어야 한다 ${reason}:`);
+    expect(launches).toBe(0);
+    expect(readTaskCard(id, path)).toBeUndefined();
   }
 });
 
@@ -794,17 +926,21 @@ test('TASKS-HAND-CHILD-LLM: --child-llm grok/grok-4.7 passes --child-llm-provide
   const path = statePath();
   const text = liveGoal('ship it');
   const calls: string[][] = [];
+  let planningEnv: string | undefined;
   const events: Array<{ event: string; data?: unknown }> = [];
   const off = debug.registerSink({ name: 'child-llm-capture', emit: (rec) => { if (rec.category === 'task-agent') events.push(rec); } });
   try {
     const { lines, code } = await cli(['task', 'hand', text, '--child-llm', 'grok/grok-4.7', '--child-llm-effort', 'high', '--live', '--json'], {
       taskStatePath: path,
-      taskLauncher: (args, _cwd, context) => { calls.push(args); return { runId: context!.runId }; },
+      taskLauncher: (args, _cwd, context) => { calls.push(args); planningEnv = context!.env.ELANOUS_ROLE_LLM_PLANNING; return { runId: context!.runId }; },
     });
     expect(code).toBe(0);
+    const planningPin = 'planning={"provider":"grok","model":"grok-4.7"}';
     expect(calls).toEqual([['harness', 'say', '--substrate', 'pod', '--merge-by-host', '--child-llm-provider', 'grok', '--child-llm-model', 'grok-4.7', '--child-llm-effort', 'high', text]]);
+    expect(planningEnv).toBe(JSON.stringify({ provider: 'grok', model: 'grok-4.7' }));
     const id = JSON.parse(lines[0]!).card.id as string;
     expect(readTaskCard(id, path)?.childLlm).toEqual({ provider: 'grok', model: 'grok-4.7', effort: 'high' });
+    expect(readTaskCard(id, path)?.parentRoleLlm).toContain(planningPin);
     expect(events.find((e) => e.event === 'child-llm')?.data).toMatchObject({ taskId: id, input: 'grok/grok-4.7', provider: 'grok', model: 'grok-4.7', effort: 'high', mode: 'live' });
   } finally { off(); }
 });
@@ -822,7 +958,21 @@ test('TA-PARENT-ROLE-LLM: task hand passes pinned credit GLM parent roles throug
   expect(launch?.args).toContain('--child-llm-provider');
   expect(JSON.parse(launch!.env.ELANOUS_ROLE_LLM_AUDIT!)).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
   const card = readTaskCard(JSON.parse(result.lines[0]!).card.id, path)!;
-  expect(card.parentRoleLlm).toEqual([pin]);
+  expect(card.parentRoleLlm).toEqual([pin, 'planning={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}']);
+});
+
+test('PLANNING-FOLLOWS-CHILD-LLM: explicit planning pin overrides child inheritance on first launch', async () => {
+  const path = statePath();
+  const pin = 'planning={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+  let launch: { args: string[]; env: Record<string, string> } | undefined;
+  const { lines, code } = await cli(['task', 'hand', liveGoal('planning override'), '--child-llm', 'openai-codex/gpt-6-luna', '--role-llm', pin, '--live', '--json'], {
+    taskStatePath: path,
+    taskLauncher: (args, _cwd, context) => { launch = { args, env: context!.env }; return { runId: context!.runId }; },
+  });
+  expect(code).toBe(0);
+  expect(launch?.args).not.toContain('--role-llm');
+  expect(JSON.parse(launch!.env.ELANOUS_ROLE_LLM_PLANNING!)).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  expect(readTaskCard(JSON.parse(lines[0]!).card.id, path)?.parentRoleLlm).toEqual([pin]);
 });
 
 test('TA-PARENT-ROLE-LLM: default launcher includes the parent pin in the spawned process environment', async () => {
@@ -1475,6 +1625,40 @@ test('TA-WORK-ORDER parseWorkOrder — 배열·스칼라 JSON 은 칸 id 없음,
   const parsed = parseWorkOrder(JSON.stringify({ cellId: ' C1 ', budget: 2, peers: ['a', 'b'], verdictSignal: '   ' }));
   expect(parsed).toMatchObject({ ok: true, order: { cellId: 'C1', budget: '2', peers: '["a","b"]', verdictSignal: '모름',
     unknownFields: ['lifeId', 'version', 'landBy', 'identityTags', 'priority', 'verdictSignal', 'contract', 'boundary', 'precedents', 'escalation'] } });
+});
+
+test('TA-WORK-ORDER ⑤ 선행 상태 관측 — yellow→green 으로 바뀐 격리 두 조회가 다른 상태·시각 지시서를 만든다', async () => {
+  // 격리 무대: 조회마다 새 임시 디렉토리의 .work-order.json 하나(조회 시점의 상태를 적은 지시서) · 임시 task state.
+  const observed = (state: string, observedAt: string) => ({
+    ...fullWorkOrder,
+    peers: [{ cell: 'CARD-TARGET-PATHS', state, observedAt }, { cell: 'CARD-PAIR' }],
+  });
+  const first = resolveHandText(workOrderFile(JSON.stringify(observed('yellow', '2026-10-20T09:00:00Z'))));
+  const second = resolveHandText(workOrderFile(JSON.stringify(observed('green', '2026-10-20T09:30:00Z'))));
+  expect(first.kind).toBe('work-order');
+  expect(second.kind).toBe('work-order');
+  if (first.kind !== 'work-order' || second.kind !== 'work-order') return;
+  // 조회된 선행은 상태·시각을 보존하고, 조회하지 않은 선행은 «모름»으로 남는다.
+  expect(first.order.dependencies).toEqual([
+    { cell: 'CARD-TARGET-PATHS', state: 'yellow', observedAt: '2026-10-20T09:00:00Z' },
+    { cell: 'CARD-PAIR', state: '모름', observedAt: '모름' },
+  ]);
+  expect(second.order.dependencies).toEqual([
+    { cell: 'CARD-TARGET-PATHS', state: 'green', observedAt: '2026-10-20T09:30:00Z' },
+    { cell: 'CARD-PAIR', state: '모름', observedAt: '모름' },
+  ]);
+  // 지시서 원문이 두 조회에서 서로 다르다 — 상태와 조회 시각이 그대로 실린다.
+  expect(first.text).toContain('선행 상태: CARD-TARGET-PATHS=yellow (관측 2026-10-20T09:00:00Z) · CARD-PAIR=모름 (관측 모름)');
+  expect(second.text).toContain('선행 상태: CARD-TARGET-PATHS=green (관측 2026-10-20T09:30:00Z) · CARD-PAIR=모름 (관측 모름)');
+  expect(second.text).not.toContain('yellow');
+  expect(first.text).not.toBe(second.text);
+  // 생산 진입점: `tasks hand <지시서>` 가 이 원문을 카드 text 로 실어 원장에 남긴다.
+  const path = statePath();
+  const { lines, code } = await cli(['tasks', 'hand', workOrderFile(JSON.stringify(observed('green', '2026-10-20T09:30:00Z'))), '--json'], { taskStatePath: path });
+  expect(code).toBeFalsy();
+  const card = JSON.parse(lines[0]!).card as TaskCard;
+  expect(card.text).toContain('선행 상태: CARD-TARGET-PATHS=green (관측 2026-10-20T09:30:00Z)');
+  expect(readTaskCard(card.id, path)?.text).toBe(card.text);
 });
 
 test('TA-WORK-ORDER — tasks hand 실명령이 지시서를 카드 원장에 싣고 cardId·landBy를 보존한다', async () => {
@@ -2302,6 +2486,48 @@ test('TIER-SPLIT 조각 문면은 부모 칸의 계약·완료 경계를 물려�
   } finally { h.off(); }
 });
 
+// 부모 칸에 상속할 경계 행이 «없는데도» 상속했다는 문구가 붙던 결함 — 경계 유무 두 사례를
+// 직접 합성과 생산 경로(handTaskWithTierSplit → 카드 상태) 양쪽에서 잰다.
+test('TIER-SPLIT 경계 없는 부모의 device-first 조각 문면 — 상속 문구 없음 · 경계 있는 부모는 그대로 상속', async () => {
+  const deviceSlice = `대상 경로: src/ux-sim/device.ts · 동작: DEVICE-FIRST-STAGE\n완료 경계 코드: 장치 시험 1건이 먼저 빨개진다`;
+  const featureSlice = '대상 경로: src/ux-sim/feature.ts · 기능: 표시 보정';
+  const noBoundaryParent = '대상 경로: src/ux-sim/device.ts · src/ux-sim/feature.ts\n바꿀 것: 장치를 먼저 세우고 표시를 고친다.';
+
+  // (경계 없음) 표지는 남고(리뷰 범위) 상속 주장은 빠진다.
+  const deviceText = composeSliceHandText(deviceSlice, noBoundaryParent, { index: 1, total: 2, fromTier: '상', cid: 'CELL' });
+  expect(deviceText).toContain('조각 1/2 — 부모 CELL(상)');
+  expect(deviceText).toContain('완료 경계 코드: 장치 시험 1건이 먼저 빨개진다');
+  expect(deviceText).not.toContain('물려받았다');
+  expect(deviceText).not.toContain('아래 계약·완료 경계');
+  // 기능 조각은 표지 자체가 붙지 않는다(경계 없음 + device-first 아님).
+  expect(composeSliceHandText(featureSlice, noBoundaryParent, { index: 2, total: 2, fromTier: '상', cid: 'CELL' })).toBe(featureSlice);
+
+  // (경계 있음) 상속 문구 ⊕ 부모 경계 행이 그대로 실린다.
+  const boundaryParent = `${noBoundaryParent}\n- 완료 경계 증거 명령: bun test src/ux-sim/device.test.ts`;
+  const inheritedText = composeSliceHandText(deviceSlice, boundaryParent, { index: 1, total: 2, fromTier: '상', cid: 'CELL' });
+  expect(inheritedText).toContain('아래 계약·완료 경계는 부모 칸에서 물려받았다 — 이 조각 범위만 채운다.');
+  expect(inheritedText).toContain('- 완료 경계 증거 명령: bun test src/ux-sim/device.test.ts');
+
+  // 생산 경로 실물 — tasks hand 의 device-first 분해가 쓴 카드 문면을 상태에서 되읽는다.
+  const h = tierSplitHarness();
+  try {
+    const out = await handTaskWithTierSplit({ text: noBoundaryParent, tier: '상', live: true, checklistId: 'CELL',
+      statePath: h.path, launcher: h.deps.taskLauncher!,
+      decompose: async () => ({ ok: true, redecomposed: 0, slices: [
+        { goal: deviceSlice, files: 1, behaviours: 1, newFiles: 0, tier: '하', deviceFirst: 'device-test' },
+        { goal: featureSlice, files: 1, behaviours: 1, newFiles: 0, tier: '중', deviceFirst: 'feature' },
+      ] }) });
+    expect(out.kind).toBe('split');
+    if (out.kind !== 'split') return;
+    expect(out.slices).toHaveLength(2);
+    const cards = [readTaskCard(`${out.group}-1`, h.path)!, readTaskCard(`${out.group}-2`, h.path)!];
+    expect(cards[0]!.text).toContain('조각 1/2 — 부모 CELL(상)');
+    expect(cards[0]!.text).not.toContain('물려받았다');
+    expect(cards[1]!.text).not.toContain('물려받았다');
+    expect(h.records.at(-1)).toMatchObject({ cid: 'CELL', fromTier: '상', outcome: 'device-first-deferred' });
+  } finally { h.off(); }
+});
+
 test('TIER-SPLIT (e) 중·하·tier 없음 hand 는 분해 호출 0 · 한 덩어리 발사 무변경', async () => {
   for (const tier of ['중', '하', undefined]) {
     const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '하')] }));
@@ -2331,6 +2557,46 @@ test('TIER-SPLIT (f) 분해기 미배선(seam undefined 명시) = decomposer-una
       expect(h.records).toMatchObject([{ cid: null, fromTier: '상', outcome: 'whole', reason: 'decomposer-unavailable', slices: [], unavoidable: [],
         countScope: 'accepted-slices', totalSlices: 0, highSlices: 0, unavoidableCount: 0, unavoidableReasons: [] }]);
     } finally { h.off(); }
+  }
+});
+
+test('OP entrance tick records all reviewed candidates separately from dispatched actions', async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { Command } = await import('commander');
+  const dir = mkdtempSync(join(tmpdir(), 'entrance-tick-'));
+  mkdirSync(join(dir, '.elanous-test'), { recursive: true });
+  const config = join(dir, 'config');
+  mkdirSync(config, { recursive: true });
+  setElanousConfigDir(config);
+  const events: Array<{ category: string; data: Record<string, unknown> }> = [];
+  const launches: string[][] = [];
+  const off = debug.registerSink({ name: 'entrance-denominator-integration', emit: record => {
+    if (record.category === 'task-agent') events.push({ category: record.category, data: record.data as Record<string, unknown> });
+  } });
+  try {
+    const candidates = [0, 1, 2].map(index => ({
+      action: { kind: 'retry' as const, variant: 'narrow' as const, taskId: `tick-${index}`, rationale: 'tick fixture', pr: 0, runId: `run-${index}`, original: 'goal', checklistId: '' },
+      ...(index === 2 ? { refusal: 'candidate policy refusal' } : {}),
+    }));
+    const program = new Command().name('elanous').exitOverride();
+    registerAutopilotCommands(program, { registerSink: async () => true, actionDeps: {
+      mode: 'live', command: async args => { launches.push(args); return { status: 0, stdout: 'launched' }; },
+      observe: (event, data) => events.push({ category: event, data: data as unknown as Record<string, unknown> }),
+    } });
+    const originalExit = process.exitCode;
+    process.exitCode = 0;
+    await program.parseAsync(['node', 'elanous', 'autopilot', 'task-agent-action', JSON.stringify(candidates)]);
+    process.exitCode = originalExit ?? 0;
+    const denominator = events.map(event => event.data).find(data => data.kind === 'entrance-tick');
+    expect(denominator).toMatchObject({ reviewed: 3, allowed: 2, refused: 1, reasons: { 'candidate policy refusal': 1 } });
+    expect(events.filter(event => event.data.kind === 'retry')).toHaveLength(2);
+    expect(launches).toHaveLength(2);
+    expect(launches.every(args => args[0] === 'harness' && args[1] === 'say')).toBe(true);
+  } finally {
+    off();
+    resetElanousConfigDir();
   }
 });
 

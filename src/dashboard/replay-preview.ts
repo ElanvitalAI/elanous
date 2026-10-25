@@ -105,3 +105,28 @@ export function renderReplayPreviewLines(
   }
   return lines;
 }
+
+/** Restored transcripts longer than this show their tail plus one «earlier N messages» line. */
+export const RESTORED_TRANSCRIPT_MAX_MESSAGES = 200;
+
+/**
+ * The restored conversation in full (TUI-RESUME-PICKER ③): every user/assistant message, every line —
+ * not the 5-message, 2-line preview. Resuming used to leave the chat log blank but for that preview,
+ * so the user could not see what they were continuing. Very long sessions keep the last
+ * `maxMessages` and say how many were left out.
+ */
+export function renderRestoredTranscriptLines(
+  messages: readonly ReplayPreviewMessage[],
+  opts: Omit<ReplayPreviewOpts, 'tail' | 'perMessageLines'> & { maxMessages?: number },
+): string[] {
+  const visible = messages.filter((m) => m.role !== 'system' && extractReplayText(m.content).length > 0);
+  const max = opts.maxMessages ?? RESTORED_TRANSCRIPT_MAX_MESSAGES;
+  const hidden = Math.max(0, visible.length - max);
+  const lines = hidden > 0 ? [C.muted(`        … 앞 ${hidden}개 메시지 생략 (최근 ${max}개 표시)`)] : [];
+  return lines.concat(renderReplayPreviewLines(visible.slice(-max), {
+    maxWidth: opts.maxWidth,
+    ...(opts.wrapOpts ? { wrapOpts: opts.wrapOpts } : {}),
+    tail: max,
+    perMessageLines: Number.MAX_SAFE_INTEGER,
+  }));
+}

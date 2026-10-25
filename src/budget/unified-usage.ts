@@ -458,6 +458,7 @@ function subscriptionFromCodexSnapshot(snap: UsageSnapshot): SubscriptionAxis {
  *  ⛔ 키가 없으면 행을 «안» 만든다(accounts=0 → 「없음」) — 키 없음은 «0달러»가 아니다.
  *  📏 응답 모양(실측 2026-09-23): `{data:{total_credits, total_usage}}` (USD). */
 export const OPENROUTER_CREDITS_ENDPOINT = 'https://openrouter.ai/api/v1/credits';
+export const OPENROUTER_KEY_ENDPOINT = 'https://openrouter.ai/api/v1/key';
 async function collectOpenRouterRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow[]> {
   // ⛔ 시험 런타임은 seam 이 없으면 «키 없음»으로 본다 — 키 캐시는 «파일»이라 env 스크럽을 통과해
   //   기존 시험들이 실제 네트워크를 치게 된다(seam 을 모르는 옛 시험이 다수).
@@ -483,8 +484,27 @@ async function collectOpenRouterRows(deps: UnifiedUsageDeps): Promise<AccountUsa
     const used = typeof body.data?.total_usage === 'number' ? body.data.total_usage : null;
     if (total === null || used === null) return [{ ...base, credits: { status: 'error', detail: 'upstream-shape' } }];
     const balance = Math.round((total - used) * 100) / 100;
+    let note: string | undefined;
+    try {
+      const keyRes = await (deps.fetchOpenRouterImpl ?? fetch)(OPENROUTER_KEY_ENDPOINT, {
+        headers: { authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (keyRes.ok) {
+        const keyBody = (await keyRes.json()) as { data?: { limit?: unknown; limit_remaining?: unknown } };
+        const limit = keyBody.data?.limit;
+        const limitRemaining = keyBody.data?.limit_remaining;
+        if (typeof limit === 'number' && Number.isFinite(limit)
+          && typeof limitRemaining === 'number' && Number.isFinite(limitRemaining)) {
+          note = `키 한도 남은 금액 $${limitRemaining.toFixed(2)}`;
+        }
+      }
+    } catch {
+      // Key metadata is optional; preserve the successful credits row when unavailable.
+    }
     return [{
       ...base,
+      ...(note ? { note } : {}),
       credits: {
         status: 'ok',
         usedPercent: total > 0 ? Math.round((used / total) * 1000) / 10 : null,

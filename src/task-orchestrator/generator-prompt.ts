@@ -82,6 +82,8 @@ export function buildDecomposePrompt(
 
   const lines: string[] = [];
   const isGoalAuthorCoarse = opts.profile === 'goal-author-coarse';
+  const measuredDeviceInventory = input.context?.activeSummary?.match(/^Device inventory \(measured at goal-author repository root\): .*$/mu)?.[0];
+  const measuredDevice = measuredDeviceInventory?.match(/^Device inventory \(measured at goal-author repository root\): (missing|existing): (src\/ux-sim\/[^\s,]+)$/u);
   lines.push(
     'You are the monad-agent Task Orchestrator decomposition planner.',
     isGoalAuthorCoarse
@@ -205,6 +207,10 @@ export function buildDecomposePrompt(
       '## Device-first decomposition (DEVICE-FIRST-AUTHORING — follow strictly)',
       '### Existing device inventory (read from this checkout; use these names before proposing a new device)',
       ...deviceInventory(),
+      ...(measuredDeviceInventory
+        ? ['### Goal-author device check (measured at the target root; takes precedence over checkout inventory)',
+          measuredDeviceInventory,
+          ...(measuredDevice ? [`- Use the measured ${measuredDevice[1]} status for ${measuredDevice[2]} instead of this checkout's inventory when choosing the device branch.`] : [])] : []),
       '- The objective\'s verification plan (검증 계획/TDD) section picks a stage and ladder tier (무대·층) — e.g. a `src/ux-sim/*` stage at L2 (fake-llm·fake-bin·fake-clock). BEFORE writing slices, CHECK whether the mock device or injected event definition that this verification plan needs ALREADY EXISTS: look in `src/ux-sim/*`, the §1 device table of `docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md`, and the event-monkey event kinds.',
       '- Two branches — exactly one applies per needed device:',
       '  - Device EXISTS: its name MUST go into the verification plan wording — the slice that tests the feature carries the device\'s exact name (device file / §1 table row / event kind) in its acceptance criteria and reuses the device; never re-create it.',

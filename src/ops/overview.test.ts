@@ -15,6 +15,9 @@ import { ResourceLedger, type ResourceView } from '../control-plane/ledger.js';
 import { measureLoad, startMemberHeartbeat } from '../control-plane/member.js';
 import { openSchedulesDb, schedulesDbPath } from '../domains/schedule-registry.js';
 import { runOpsOverview } from '../cli/ops-overview-cli.js';
+import { buildGridData } from '../nexus/api/grid.js';
+import { measurePoolLease } from '../task-orchestrator/surfaces/pod-lease.js';
+import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 
 const AT = '2026-10-08T00:30:00.000Z';
 
@@ -127,6 +130,32 @@ describe('자원 지도 구속 조건 — 남은 비율 최소 축(RES-FLOOR-BIN
     const text = renderOverview(s, computeVerdict(s), { elapsedMs: 12 });
     expect(text).toContain('✅ 흐름 정상 (flowing)\n   ↳ 구속 자원 node-b 메모리 — 남은 비율 최소 8% (5/64GB)');
   });
+  test('10-08 node-b 포화 표본 — Pod 47/46이면 슬롯 0%가 메모리 8/512GB보다 구속적이다', () => {
+    const s = base();
+    s.machines.hosts = [host('node-b', 19, 32, 8, 512)]; // 계획 §S 표본 CPU 19/32코어
+    s.tasks.capacity = okCell({ podUsed: 47, podTarget: 46, localUsed: 0, localMax: 0, free: 0 }, 't', AT);
+    const binding = bindingResource(s);
+    expect(binding).toMatchObject({ kind: 'slots', remainingRatio: 0 });
+    const verdict = computeVerdict(s);
+    expect(verdict.verdict).toBe('saturated');
+    expect(verdict.reasons).toContain('구속 자원 슬롯 — 남은 비율 최소 0% (0/46자리)');
+    expect(renderOverview(s, verdict, { elapsedMs: 12 })).toContain('자원 포화 (saturated)');
+  });
+
+  test('같은 node-b 표본에서 슬롯만 여유가 있으면 메모리 8/512GB가 구속 축이다', () => {
+    const s = base();
+    s.machines.hosts = [host('node-b', 19, 32, 8, 512)];
+    s.tasks.capacity = okCell({ podUsed: 45, podTarget: 46, localUsed: 0, localMax: 0, free: 1 }, 't', AT);
+    const binding = bindingResource(s);
+    expect(binding?.kind).toBe('memory');
+    expect(binding?.label).toBe('node-b 메모리');
+    expect(binding?.remainingRatio).toBeCloseTo(8 / 512, 5);
+    const verdict = computeVerdict(s);
+    expect(verdict.verdict).toBe('flowing');
+    expect(verdict.reasons).toContain('구속 자원 node-b 메모리 — 남은 비율 최소 2% (8/512GB)');
+    expect(renderOverview(s, verdict, { elapsedMs: 12 })).toContain('구속 자원 node-b 메모리');
+  });
+
   test('잘못된 축 수치는 후보에서 제외해 유효한 node-b 메모리가 구속 조건이 된다', () => {
     const s = base();
     s.machines.hosts = [
@@ -725,6 +754,130 @@ describe('collectOverview — 주입 원천으로 끝까지', () => {
       else process.env.ELANOUS_STATE_DIR = previousStateDir;
       rmSync(root, { recursive: true, force: true });
       rmSync(seat, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('게이트 예약 축 — 자원 지도 다섯째 축(RES-FLOOR-BINDING)', () => {
+  // GATE-RESERVE-AUTO 표본: 발행 게이트 샤드 Job(`gate-*`·kind=command)과 그 Pod.
+  const gateJob = (cpu: string) => ({
+    metadata: { name: 'gate-shard', labels: { 'elanous.substrate': 'pod', 'elanous.kind': 'command' } },
+    spec: { template: { spec: { containers: [{ resources: { requests: { cpu, memory: '1Gi' }, limits: { memory: '2Gi' } } }] } } },
+    status: { active: 1 },
+  });
+  const gatePod = (cpu: string, nodeName: string | null = 'node-1') => ({
+    metadata: { namespace: 'elanous-test', name: 'gate-pod', labels: { 'elanous.job': 'gate-shard', 'elanous.kind': 'command' } },
+    status: { phase: nodeName === null ? 'Pending' : 'Running' },
+    spec: { ...(nodeName === null ? {} : { nodeName }),
+      containers: [{ resources: { requests: { cpu, memory: '1Gi' }, limits: { memory: '2Gi' } } }] },
+  });
+  const nodes = (cpus: string[]) => ({ items: cpus.map((cpu, i) => ({ metadata: { name: i === 0 ? 'node-1' : `node-${i + 1}` },
+    status: { allocatable: { memory: '128Gi', cpu }, conditions: [{ type: 'Ready', status: 'True' }] } })) });
+  /** 생산 grid 경로(buildGridData → measurePoolLease)에 mock kubectl 무대만 끼운다 — 축을 고르는 코드는 그대로 돈다. */
+  const gridFor = (jobs: unknown[], pods: unknown[], cpus: string[] = ['4']) => buildGridData({
+    readHq: () => ({ record: null, ageSeconds: null, expired: null }), poolSpec: () => 'node-b:4',
+    measure: () => measurePoolLease(parsePodPool('node-b:4'), { dns: () => 'ready', kubectl: (args) => {
+      if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify(nodes(cpus)), stderr: '' };
+      if (args.includes('jobs')) return { status: 0, stdout: JSON.stringify({ items: jobs }), stderr: '' };
+      return { status: 0, stdout: JSON.stringify({ items: pods }), stderr: '' };
+    } }),
+  });
+  /** 스냅숏 씨앗 — 기계 node-b(메모리 60/64GB · CPU 1/8코어) 과 풀 멤버 node-b 한 자리. */
+  const seed = (): OverviewSnapshot => {
+    const s = base();
+    s.tasks.capacity = okCell({ podUsed: 1, podTarget: 10, localUsed: 0, localMax: 2, free: 11 }, 't', AT);
+    s.machines.hosts = [{ name: 'node-b', load: okCell({ load1: 1, load5: 1, load15: 1, cpuCount: 8, freeGb: 60, totalGb: 64, ageSeconds: 5 }, 't', AT) }];
+    s.machines.pods = [{ context: 'node-b', capacity: 4, occupied: unmeasured('pod pool', '측정 대기') }];
+    return s;
+  };
+  /**
+   * 생산 데몬 경로 그대로 — 캐시의 백그라운드 Pod 측정기(OVW-API · overview-cache 워커가 부르는 grid 읽기)와
+   * 응답 시점 겹치기·판정 계산을 지난다. 측정기 반환 꼴은 워커가 실제로 보내는 행과 같다.
+   */
+  const serveThrough = async (read: () => ReturnType<typeof gridFor>, snapshot: OverviewSnapshot) => {
+    let clock = Date.parse(AT);
+    let tick = (): void => {};
+    const cache = createOverviewCache({ now: () => clock, collect: async () => snapshot,
+      measurePods: async () => {
+        const grid = read();
+        return grid.members.map((m) => ({ context: m.context, occupied: m.occupied, reason: m.reason, observedAt: clock, gate: m.gate }));
+      },
+      schedule: (fn) => { tick = fn; return { unref() {} } as ReturnType<typeof setInterval> } });
+    try {
+      await cache.get();                         // 첫 읽기가 백그라운드 Pod 측정 타이머를 건다
+      tick();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      clock += 10_000;
+      return await cache.get();
+    } finally { cache.stop(); }
+  };
+
+  test('게이트가 쥔 몫이 남은 비율 최소면 구속 자원은 게이트 예약 — 판정 띠까지', async () => {
+    // 게이트 2/4코어 예약(남은 50%) < 슬롯 11/12(92%) < 메모리 60/64(94%) < CPU 23/24(96%).
+    const snap = await serveThrough(() => gridFor([gateJob('2')], [gatePod('2')]), seed());
+    expect(bindingResource(snap)).toMatchObject({ kind: 'gate', label: 'node-b 게이트 예약', remainingRatio: 0.5 });
+    expect(bindingPhrase(bindingResource(snap))).toBe('구속 자원 node-b 게이트 예약 — 남은 비율 최소 50% (2000/4000밀리코어(게이트 샤드 1 · 예약 2000))');
+    const verdict = computeVerdict(snap);
+    expect(verdict.reasons).toContain('구속 자원 node-b 게이트 예약 — 남은 비율 최소 50% (2000/4000밀리코어(게이트 샤드 1 · 예약 2000))');
+    expect(renderOverview(snap, verdict, { elapsedMs: 1 })).toContain('↳ 구속 자원 node-b 게이트 예약 — 남은 비율 최소 50% (2000/4000밀리코어(게이트 샤드 1 · 예약 2000))');
+  });
+
+  test('샤드가 아직 노드에 안 붙었으면 게이트가 CPU 를 먼저 쥔다 — 남은 비율 0%(fail-closed)', async () => {
+    for (const pods of [[], [gatePod('2', null)]]) {
+      const snap = await serveThrough(() => gridFor([gateJob('2')], pods, ['2', '2']), seed());
+      expect(bindingResource(snap)).toMatchObject({ kind: 'gate', label: 'node-b 게이트 예약', remainingRatio: 0 });
+      expect(bindingPhrase(bindingResource(snap)))
+        .toBe('구속 자원 node-b 게이트 예약 — 남은 비율 최소 0% (0/4000밀리코어(게이트 샤드 1 · 예약 2000 · 미배치 1))');
+    }
+  });
+
+  test('게이트가 안 도는 멤버는 «축 아님» — 다른 축이 그대로 이긴다(기존 판정 보존)', async () => {
+    const snap = await serveThrough(() => gridFor([], []), seed());
+    expect(snap.machines.pods[0]!.gate).toMatchObject({ status: 'ok', value: 'none' });
+    expect(bindingResource(snap)?.kind).not.toBe('gate');
+    expect(computeVerdict(snap).reasons.join('\n')).not.toContain('게이트 예약');
+  });
+
+  test('게이트 CPU 를 못 재면 후보에서 뺀다 — «0»도 «넉넉»도 아니고 못 잼으로 이름을 남긴다', async () => {
+    const blind = await serveThrough(() => { throw new Error('kubectl down'); }, seed());
+    expect(blind.machines.pods[0]!.gate).toMatchObject({ value: null, status: 'unmeasured', reason: 'kubectl down' });
+    expect(bindingResource(blind)?.kind).not.toBe('gate');
+    expect(unmeasuredCells(blind)).toContain('pods.node-b.gate: kubectl down');
+  });
+
+  test('fake-bin kubectl → 생산 백그라운드 측정기(워커) → 판정 띠 — 주입 없이 게이트 예약 축이 실물로 흐른다', async () => {
+    const binDir = mkdtempSync(join(tmpdir(), 'ovw-gate-bin-'));
+    const kubectl = join(binDir, 'kubectl');
+    writeFileSync(kubectl, `#!/bin/sh\ncase " $* " in\n  *" nodes "*) printf '%s' '${JSON.stringify(nodes(['4']))}' ;;\n  *" jobs "*) printf '%s' '${JSON.stringify({ items: [gateJob('2')] })}' ;;\n  *) printf '%s' '${JSON.stringify({ items: [gatePod('2')] })}' ;;\nesac\n`, { mode: 0o755 });
+    const previousPath = process.env.PATH;
+    const previousPool = process.env.ELANOUS_POD_POOL;
+    process.env.PATH = `${binDir}:${previousPath ?? ''}`;
+    process.env.ELANOUS_POD_POOL = 'node-b:4';
+    let clock = Date.parse(AT);
+    let tick = (): void => {};
+    // 측정기 주입 없음 — 캐시 기본값이 워커를 띄우고, 워커가 buildGridData() 로 실제 kubectl(=fake-bin)을 부른다.
+    const cache = createOverviewCache({ now: () => clock, collect: async () => seed(),
+      schedule: (fn) => { tick = fn; return { unref() {} } as ReturnType<typeof setInterval> } });
+    try {
+      await cache.get();
+      tick();
+      let snapshot = await cache.get();
+      for (let i = 0; i < 100 && !snapshot.machines.pods[0]!.gate?.value; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        clock += 10_000;
+        snapshot = await cache.get();
+      }
+      expect(snapshot.machines.pods[0]!.gate).toMatchObject({
+        status: 'ok', value: { jobs: 1, unbound: 0, reservedMillicores: 2000, schedulableMillicores: 4000 },
+      });
+      expect(bindingResource(snapshot)).toMatchObject({ kind: 'gate', label: 'node-b 게이트 예약' });
+      expect(computeVerdict(snapshot).reasons)
+        .toContain('구속 자원 node-b 게이트 예약 — 남은 비율 최소 50% (2000/4000밀리코어(게이트 샤드 1 · 예약 2000))');
+    } finally {
+      cache.stop();
+      if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+      if (previousPool === undefined) delete process.env.ELANOUS_POD_POOL; else process.env.ELANOUS_POD_POOL = previousPool;
+      rmSync(binDir, { recursive: true, force: true });
     }
   });
 });

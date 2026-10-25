@@ -11,6 +11,7 @@ import { PtyDecisionScene } from './PtyDecisionScene';
 import { WizardMarketScene } from './WizardMarketScene';
 import { EMPTY_DECISIONS, reduceDecisions } from './pty-decisions';
 import { subscribePtyDecisions } from '@/lib/inside-events';
+import { INSIDE_LOOP_INTERACTION, loopFocusRef, type LoopInteraction } from '@/app/inside/loop-focus';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { toPublicText } from './public-text';
 
@@ -22,13 +23,18 @@ function insideScene(value: string | null): number {
   return value !== null && /^[1-9]$/.test(value) && Number(value) <= LAST_SCENE ? Number(value) : 1;
 }
 
-export function InsidePage() {
+/**
+ * `loopInteraction` — page.tsx 가 children 호출부에 싣는 진입 계약.
+ * 주소의 `?<refParam>=<루프 id>` 조작을 읽어 루프 에이전트 장면과 원장 조회에 같은 루프 ID 를 넘긴다.
+ */
+export function InsidePage({ loopInteraction = INSIDE_LOOP_INTERACTION }: { loopInteraction?: LoopInteraction } = {}) {
   const search = useSearchParams();
-  return <InsidePageContent search={search} />;
+  return <InsidePageContent search={search} loopInteraction={loopInteraction} />;
 }
 
 /** Scenes ②③④⑤⑥ need a daemon / React Flow; tests pass stand-ins. */
-export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, editorScene = <GraphEditorScene />, loopScene = <LoopAgentsScene />, wizardScene = <WizardMarketScene />, ptyScene = <LivePtyDecisionScene /> }: { search: URLSearchParams; liveTrace?: ReactNode; editorScene?: ReactNode; loopScene?: ReactNode; wizardScene?: ReactNode; ptyScene?: ReactNode }) {
+export function InsidePageContent({ search, loopInteraction = INSIDE_LOOP_INTERACTION, liveTrace = <LiveTraceScene />, editorScene = <GraphEditorScene />, loopScene, wizardScene = <WizardMarketScene />, ptyScene = <LivePtyDecisionScene /> }: { search: URLSearchParams; loopInteraction?: LoopInteraction; liveTrace?: ReactNode; editorScene?: ReactNode; loopScene?: ReactNode; wizardScene?: ReactNode; ptyScene?: ReactNode }) {
+  const initialLoopRef = loopFocusRef(search, loopInteraction.refParam);
   const [scene, setScene] = useState(() => insideScene(search.get('scene')));
   const [demo, setDemo] = useState(() => search.get('demo') === '1');
   const stageRef = useRef<HTMLElement>(null);
@@ -122,7 +128,7 @@ export function InsidePageContent({ search, liveTrace = <LiveTraceScene />, edit
       </nav>
       {SCENES.map((name, index) => (
         <section key={name} data-inside-scene={index + 1} hidden={scene !== index + 1} aria-label={toPublicText(`${index + 1} ${name}`)} style={{ minWidth: 0 }}>
-          {index === 0 ? <ArchitectureScene /> : index === 1 ? liveTrace : index === 2 ? loopScene : index === 3 ? editorScene : index === 4 ? wizardScene : ptyScene}
+          {index === 0 ? <ArchitectureScene /> : index === 1 ? liveTrace : index === 2 ? (loopScene ?? <LoopAgentsScene initialLoopRef={initialLoopRef} />) : index === 3 ? editorScene : index === 4 ? wizardScene : ptyScene}
         </section>
       ))}
     </main>

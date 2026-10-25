@@ -76,7 +76,7 @@ export interface OverlapEntry {
 }
 
 /** Restrict `git log` to commits already on the resolved base, excluding HEAD-only feature commits. */
-export function landingHistoryLogArgs(since: string, baseRef: string): string[] {
+export function landingHistoryLogArgs(since: string | null, baseRef: string): string[] {
   return landingHistoryGitLogArgs(since, baseRef).map((arg) =>
     arg === '--pretty=format:commit %H' ? landingHistoryPrettyFormat() : arg,
   );
@@ -381,9 +381,11 @@ export function countRecentLandingsByAuthor(
 export function collectBaseLandingCommits(
   run: CmdRunner,
   cwd: string,
-  opts: { since?: string; baseRef: string },
+  opts: { since?: string | null; baseRef: string },
 ): LandingCommit[] | null {
-  const since = opts.since?.trim() || DEFAULT_GRANULARITY_SINCE;
+  const since = opts.since === null
+    ? null
+    : opts.since?.trim() || DEFAULT_GRANULARITY_SINCE;
   const history = run('git', landingHistoryLogArgs(since, opts.baseRef), { cwd });
   if (!history.ok) return null;
   return parseCommitNameLog(history.out);

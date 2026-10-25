@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'bun:test';
+import { BEDROCK_MODELS } from '../llm/bedrock.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import {
   lookupLlmTierSpec, parseTierArg, TIER_PROVIDERS, LLM_TIER_MAP_BY_PROVIDER, lookupOpenRouterModelSpec,
@@ -38,6 +39,22 @@ describe('lookupLlmTierSpec — SSOT 회귀 (대표 지적)', () => {
   });
   it('anthropic best = opus 5.5 (09-25 최신)', () => {
     expect(lookupLlmTierSpec('anthropic', 'best').model).toBe('claude-opus-5-5');
+  });
+  it('Bedrock 각 tier 는 등록된 비-Anthropic mantle-openai Bedrock id 를 보존한다', () => {
+    const selectedBedrockIds = {
+      budget: 'zai.glm-4.7-flash',
+      balanced: 'openai.gpt-6-luna',
+      better: 'deepseek.v3.2',
+      best: 'zai.glm-5',
+      loaded: 'openai.gpt-6-sol',
+    } as const;
+
+    for (const tier of MODEL_TIERS) {
+      const selected = lookupLlmTierSpec('bedrock', tier);
+      const id = selectedBedrockIds[tier];
+      expect(selected.model).toBe(id);
+      expect(BEDROCK_MODELS.some(entry => entry.id === id && entry.route === 'mantle-openai')).toBe(true);
+    }
   });
   it('명시 provider 다섯 칸은 사다리 표와 같다', () => {
     for (const p of TIER_PROVIDERS) {

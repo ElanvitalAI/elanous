@@ -20,11 +20,13 @@ export interface GateLike {
   log?: string;
 }
 
+const isMissingAtBaseLine = (line: string): boolean => /^- (?!(?:introduced|preexisting|unknown):).+: missing-at-base\b/.test(line);
+
 /** 리뷰어에게 줄 게이트 실행 증빙. 전체 로그 대신 러너/컴파일러가 낸 판정 줄만 원문으로 보존한다. */
 export function gateEvidenceNote(gate: GateLike): string | undefined {
   if (!gate.log?.trim()) return undefined;
   const lines = gate.log.split(/\r?\n/).filter((line) =>
-    /(?:^\[gate-baseline\]|^- (?:introduced|preexisting|unknown):|^⚠️ .*책임이 아니다\.|Ran \d+ tests? across \d+ files?|\b\d+ (?:pass|fail)\b|error TS\d+|Verify-by-breaking|verify-by-breaking|원복 후|뒤집었을 때)/i.test(line),
+    isMissingAtBaseLine(line) || /(?:^\[gate-baseline\]|^\[changed-test-evidence\]|^- (?:introduced|preexisting|unknown):|^⚠️ .*책임이 아니다\.|Ran \d+ tests? across \d+ files?|\b\d+ (?:pass|fail)\b|error TS\d+|Verify-by-breaking|verify-by-breaking|원복 후|뒤집었을 때)/i.test(line),
   );
   if (!lines.length) return undefined;
 
@@ -33,19 +35,36 @@ export function gateEvidenceNote(gate: GateLike): string | undefined {
   const baselineHeads = lines.filter((line) => line.startsWith('[gate-baseline]'));
   const exonerations = lines.filter((line) => /^⚠️ .*책임이 아니다\.$/.test(line));
   const attributions = lines.filter((line) => /^- (?:introduced|preexisting|unknown):/.test(line));
+  const changedHeads = lines.filter((line) => line.startsWith('[changed-test-evidence]'));
+  const missingAtBase = lines.filter(isMissingAtBaseLine);
+  const changedEvidence = [
+    ...changedHeads.slice(0, 1),
+    ...(missingAtBase.length ? ['[changed-test-evidence] base에 없는 신규 모듈의 base RED 목격을 must-fix로 요구하지 말 것. missing-at-base는 RED 증거다.'] : []),
+    ...missingAtBase.slice(0, 4),
+    ...(missingAtBase.length > 4 ? [omission(missingAtBase.length - 4)] : []),
+    ...changedHeads.slice(1, 3),
+    ...(changedHeads.length > 3 ? [omission(changedHeads.length - 3)] : []),
+  ];
+  const prioritizedAttributions = changedEvidence.length
+    ? [...attributions.filter((line) => line.startsWith('- introduced:')),
+      ...attributions.filter((line) => !line.startsWith('- introduced:'))]
+    : attributions;
   const hasBaseline = baselineHeads.length > 0;
-  const limit = 24;
-  const rest = lines.filter((line) => !line.startsWith('[gate-baseline]') && !/^⚠️ .*책임이 아니다\.$/.test(line) && !/^- (?:introduced|preexisting|unknown):/.test(line));
+  const limit = 24; // evidence 줄 상한. 제목 한 줄을 더한 출력은 최대 25줄이다.
+  const rest = lines.filter((line) => !line.startsWith('[gate-baseline]') && !/^⚠️ .*책임이 아니다\.$/.test(line)
+    && !/^- (?:introduced|preexisting|unknown):/.test(line) && !line.startsWith('[changed-test-evidence]')
+    && !isMissingAtBaseLine(line));
   const ordered = hasBaseline
     ? [
       ...baselineHeads.slice(0, 1),
       ...exonerations.slice(0, 1),
-      ...attributions,
+      ...changedEvidence,
+      ...prioritizedAttributions,
       ...baselineHeads.slice(1),
       ...exonerations.slice(1),
       ...rest,
     ]
-    : lines;
+    : changedEvidence.length ? [...changedEvidence, ...exonerations, ...prioritizedAttributions, ...rest] : lines;
   if (!hasBaseline || ordered.length <= limit) {
     const selected = ordered.length <= limit
       ? ordered
@@ -58,7 +77,8 @@ export function gateEvidenceNote(gate: GateLike): string | undefined {
   const budgeted = [
     ...baselineHeads.slice(0, 1),
     ...exonerations.slice(0, 1),
-    ...attributions.slice(0, attributionLimit),
+    ...changedEvidence,
+    ...prioritizedAttributions.slice(0, attributionLimit),
     ...(omittedAttributions ? [omission(omittedAttributions)] : []),
     ...baselineHeads.slice(1),
     ...exonerations.slice(1),

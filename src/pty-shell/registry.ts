@@ -23,6 +23,8 @@ import { getSessionCwd } from '../session/working-dir.js';
 import { buildPtyEnv } from '../agent/identity-env.js';
 import { getCurrentPtyId } from '../agent/pty-identity.js';
 import { bunNativePtyAvailable, bunSpawnPty } from './bun-native-pty.js';
+import { ptyAvailable } from './availability.js';
+export { ptyAvailable } from './availability.js';
 import { resolvePtyRef, canTransitionAccessMode, ptyIdSeparatorIndex, type PtyAccessMode, type PtyTransitionPolicy } from './pty-ref.js';
 import { resolveWriteDecision, resolveTakeover, type PtyWriteActor } from './pty-write-arbiter.js';
 import { addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestNickname, markPtyManifestClosed, removePtyManifest, touchLivePtyManifest } from './pty-manifest.js';
@@ -513,7 +515,7 @@ export function startPty(opts: StartOpts): PtyHandle {
     set nickname(v: string | undefined) { nickname = v; },
     setNickname(name: string): void {
       nickname = name.trim() || undefined;
-      if (PTY_MANIFEST_ENABLED) updatePtyManifestNickname(id, nickname, Date.now());
+      if (ptyManifestEnabled()) updatePtyManifestNickname(id, nickname, Date.now());
     },
     get accessMode() { return accessMode; },
     set accessMode(v: PtyAccessMode) { accessMode = v; },
@@ -718,7 +720,7 @@ export function startPty(opts: StartOpts): PtyHandle {
     catch (error) { debug.log('pty.record', 'tap-error', { ptyId: id, error: String(error) }); }
     emitPtyEvent({ type: 'output', id, chunk });
     // ★ 크로스-프로세스 관측(2026-07-23) — throttled 스냅샷을 공유 매니페스트에(데몬 PWA 유니온). getter 라 throttle 통과 시에만 snapshot().
-    if (PTY_MANIFEST_ENABLED) {
+    if (ptyManifestEnabled()) {
       pendingManifestOutputBytes += Buffer.byteLength(chunk, 'utf8');
       const now = Date.now();
       // ⛔⭐ throttle 이 막은 출력도 «반드시» 실린다 — 안 그러면 마지막 버스트 뒤 조용해진 PTY 의
@@ -741,7 +743,7 @@ export function startPty(opts: StartOpts): PtyHandle {
     try { autoStopPtyRecording(id); }
     catch (error) { debug.log('pty.record', 'auto-stop-error', { ptyId: id, error: String(error) }); }
     emitPtyEvent({ type: 'exit', id, exitCode: code, signal });
-    if (PTY_MANIFEST_ENABLED) {
+    if (ptyManifestEnabled()) {
       const now = Date.now();
       // Manifest closure and output durability are separate: a closed row keeps retrying trailing bytes until committed.
       manifestOutputFlush.close(now);
@@ -754,7 +756,7 @@ export function startPty(opts: StartOpts): PtyHandle {
   // ★ 크로스-프로세스 관측 — startPty 를 공유 매니페스트에 등록(다른 프로세스 데몬이 /v1/terminals 로 봄). fail-soft.
   //   ⚠️ 테스트 런(NODE_ENV=test·bun test)은 skip — 테스트가 띄우는 임시 셸(self-implement gate·CI·수동 bun test)이
   //   운영 매니페스트(~/.elanous/pty)로 새어들어 관측소를 오염시키던 근본 차단(격리). 실 세션(NODE_ENV≠test)만 등록.
-  if (PTY_MANIFEST_ENABLED) {
+  if (ptyManifestEnabled()) {
     const childSpaceId = opts.env?.ELANOUS_HARNESS_SPACE_ID;
     const childParentPtyId = opts.env?.ELANOUS_PARENT_PTY_ID ?? getCurrentPtyId();
     const childController = opts.env?.ELANOUS_CONTROLLER?.trim();
@@ -800,8 +802,24 @@ export function startPty(opts: StartOpts): PtyHandle {
   return handle;
 }
 
-/** 공유 PTY 매니페스트 등록 활성 여부 — 테스트 런(bun test=NODE_ENV=test)은 운영 매니페스트 오염 방지 위해 off. */
-const PTY_MANIFEST_ENABLED = process.env.NODE_ENV !== 'test';
+/** 공유 PTY 매니페스트 등록 활성 여부 — 테스트 런(bun test=NODE_ENV=test)은 운영 매니페스트 오염 방지 위해 off.
+ *
+ *  ⭐ 자리(seat) 수명주기는 이 기록자에서만 원장에 실린다 — spawned/exited 사건의 seat·
+ *  누적 outputBytesTotal·exitCode 를 남기는 곳이 `upsertPtyManifest`/`markPtyManifestClosed` 이기
+ *  때문이다. 그런데 NODE_ENV 판정만 있으면 **격리 test 우주에서는 이 경로를 한 번도 지날 수 없어**
+ *  자리 수명주기가 실행 증거를 가질 수 없다(합성 manifest 직접 호출만 남는다 — 완료 경계가 금지).
+ *  ⇒ 판정을 호출 시점 함수로 두고, 격리 우주(전용 `ELANOUS_STATE_DIR`·전용 manifest db)가 **명시적으로**
+ *  켤 수 있는 seam 을 둔다. override 가 없으면 종전과 같은 NODE_ENV 판정이라 운영 동작은 불변이다. */
+let _ptyManifestEnabledOverride: boolean | null = null;
+
+/** 테스트 전용 seam — 격리 우주에서 생산 기록 경로를 그대로 지나기 위해 켠다. null = NODE_ENV 판정 복귀. */
+export function setPtyManifestEnabledForTesting(enabled: boolean | null): void {
+  _ptyManifestEnabledOverride = enabled;
+}
+
+function ptyManifestEnabled(): boolean {
+  return _ptyManifestEnabledOverride ?? process.env.NODE_ENV !== 'test';
+}
 
 // ★ 라이브 PTY 하트비트(2026-07-23) — 소유 프로세스가 자기 라이브 PTY 의 updated_at 을 주기 갱신해
 //   "살아있음"을 증명한다. 데몬의 stale reap 이 하트비트 끊긴 유령만 제거하도록(pid 재활용 견고). unref 로 프로세스 종료 방해 X.
@@ -904,7 +922,7 @@ export function renamePty(id: string, nickname: string): boolean {
   //    별명은 manifest 행에만 산다. 여기서 받지 않으면 IPC rename 이 그 행에 `unknown-pty` 로 진다.
   const target = controlTargets.get(id);
   if (!target || !target.isAlive()) return false;
-  if (PTY_MANIFEST_ENABLED) updatePtyManifestNickname(id, nickname.trim() || undefined, Date.now());
+  if (ptyManifestEnabled()) updatePtyManifestNickname(id, nickname.trim() || undefined, Date.now());
   debug.log('pty.rename', 'control-target-renamed', { ptyId: id, nickname: nickname.trim() });
   return true;
 }
@@ -1010,14 +1028,6 @@ export function killNonDetached(): number {
     emitPtyEvent({ type: 'unregistered', id });
   }
   return killed;
-}
-
-/** Probe-compatible. Under Bun the native PTY (Bun.spawn terminal) is
- *  used instead of node-pty, so PTY is available even if node-pty can't
- *  resolve. Under node we still require node-pty. */
-export function ptyAvailable(): boolean {
-  if (bunNativePtyAvailable()) return true;
-  try { require.resolve('node-pty'); return true; } catch { return false; }
 }
 
 // ─── Adapter wiring ──────────────────────────────────────────────

@@ -54,6 +54,84 @@ describe('P3 위임 브릿지 — substrate PR 리뷰어 → 하니스 형상(ve
 });
 
 describe('gateEvidenceNote — runner/compiler 판정 줄만 증거 채널로 보존', () => {
+  test('new module missing at base reaches the reviewer with its actual RED interpretation', () => {
+    const note = gateEvidenceNote({
+      passed: true,
+      log: [
+        '[changed-test-evidence] head=pass; base-fail=0/1; red-witness=1/1; verdict=proved',
+        '- src/ux-sim/new-device.test.ts: missing-at-base',
+        'unrelated child stdout',
+      ].join('\n'),
+    });
+    expect(note).toContain('[changed-test-evidence] head=pass; base-fail=0/1; red-witness=1/1; verdict=proved');
+    expect(note).toContain('- src/ux-sim/new-device.test.ts: missing-at-base');
+    expect(note).toContain('base에 없는 신규 모듈의 base RED 목격을 must-fix로 요구하지 말 것');
+    expect(note).not.toContain('unrelated child stdout');
+  });
+
+  test('changed-test evidence survives the review note cap, without missing-at-base advice on ordinary RED', () => {
+    const note = gateEvidenceNote({
+      passed: true,
+      log: [
+        '[gate-baseline] introduced=0, preexisting=0, unknown=0, precondition-unmet=0',
+        ...Array.from({ length: 30 }, (_unused, index) => `- preexisting: test/base-${index}.test.ts > failure`),
+        ...Array.from({ length: 30 }, (_unused, index) => `Ran ${index + 1} tests across 1 file`),
+        '[changed-test-evidence] head=pass; base-fail=1/1; red-witness=1/1; verdict=proved',
+        '- introduced: test/new-feature.test.ts > failure',
+      ].join('\n'),
+    });
+    expect(note).toContain('[changed-test-evidence] head=pass; base-fail=1/1; red-witness=1/1; verdict=proved');
+    expect(note).toContain('- introduced: test/new-feature.test.ts > failure');
+    expect(note).not.toContain('base에 없는 신규 모듈');
+  });
+
+  test('changed-test evidence preserves attribution even without a baseline header', () => {
+    const note = gateEvidenceNote({
+      passed: false,
+      log: '[changed-test-evidence] head=fail; verdict=failed\n- introduced: test/new-feature.test.ts > failure',
+    });
+    expect(note).toContain('[changed-test-evidence] head=fail; verdict=failed');
+    expect(note).toContain('- introduced: test/new-feature.test.ts > failure');
+  });
+
+  test('changed-test evidence reports omitted heads and keeps the cap without baseline', () => {
+    const note = gateEvidenceNote({
+      passed: true,
+      log: [
+        ...Array.from({ length: 5 }, (_unused, index) => `[changed-test-evidence] file=${index}; verdict=proved`),
+        ...Array.from({ length: 30 }, (_unused, index) => `Ran ${index + 1} tests across 1 file`),
+      ].join('\n'),
+    });
+    expect(note).toContain('[changed-test-evidence] file=0; verdict=proved');
+    expect(note).toContain('[changed-test-evidence] file=2; verdict=proved');
+    expect(note).toContain('…[2개 생략됨]');
+    expect(note!.split('\n').length).toBeLessThanOrEqual(25); // 제목 1줄 + evidence 최대 24줄
+  });
+
+  test('baseline and many structural RED witnesses stay within the evidence cap', () => {
+    const note = gateEvidenceNote({
+      passed: true,
+      log: [
+        '[gate-baseline] introduced=0, preexisting=1, unknown=0',
+        '[changed-test-evidence] head=pass; red-witness=6/6; verdict=proved',
+        ...Array.from({ length: 6 }, (_unused, index) => `- test/new-${index}.test.ts: missing-at-base`),
+        ...Array.from({ length: 30 }, (_unused, index) => `- preexisting: test/old-${index}.test.ts > failure`),
+        '- introduced: test/new-feature.test.ts > failure',
+        ...Array.from({ length: 30 }, (_unused, index) => `Ran ${index + 1} tests across 1 file`),
+      ].join('\n'),
+    });
+    expect(note).toContain('[changed-test-evidence] head=pass; red-witness=6/6; verdict=proved');
+    expect(note).toContain('…[2개 생략됨]');
+    expect(note).toContain('- introduced: test/new-feature.test.ts > failure');
+    expect(note!.split('\n').length).toBeLessThanOrEqual(25);
+  });
+
+  test('an attribution containing missing-at-base appears only once', () => {
+    const line = '- introduced: test/new-feature.test.ts: missing-at-base';
+    const note = gateEvidenceNote({ passed: true, log: `[changed-test-evidence] verdict=proved\n${line}` });
+    expect(note!.split('\n').filter((item) => item === line)).toHaveLength(1);
+  });
+
   test('포커스 테스트·타입검사·Verify-by-breaking 원문을 보존하고 잡음은 제외한다', () => {
     const note = gateEvidenceNote({
       passed: true,

@@ -3919,8 +3919,11 @@ selfCmd
   .option('--json', '한 줄에 한 항목으로 재직렬화해 출력한다(원문 공백·빈 줄은 보존되지 않는다)')
   .option('--all', 'logs와 같은 전 인스턴스 연합 원장 조회를 한다')
   .option('--include-test', '--all 연합에 격리 test 인스턴스도 포함한다')
-  .action(async (runId: string, opts: { json?: boolean; all?: boolean; includeTest?: boolean }) => {
-    const { describeFederatedMissingRunLedger, describeMissingRunLedger, lookupRunLedger, renderRunLedger } = await import('./self-implement/run-ledger.js');
+  // ⛔⭐ 합성 exit 를 «쓰지» 않고 enter/exit/orphan 만 대조한다 — 원장을 읽기만 하는 분류다.
+  //    중단된 런이 exit 없이 남긴 graph.unit 방문을 «완료»로 오해하지 않게 CLI 에서 직접 잰다.
+  .option('--unit-visits', 'graph.unit enter/exit/orphan 대조만 출력한다(원장은 읽기만 한다)')
+  .action(async (runId: string, opts: { json?: boolean; all?: boolean; includeTest?: boolean; unitVisits?: boolean }) => {
+    const { classifyGraphUnitVisits, describeFederatedMissingRunLedger, describeMissingRunLedger, lookupRunLedger, renderRunLedger } = await import('./self-implement/run-ledger.js');
     try {
       const lookup = lookupRunLedger(runId, { all: opts.all, ...(opts.includeTest === undefined ? {} : { includeTest: opts.includeTest }) });
       if (lookup.matches.length === 0) {
@@ -3947,6 +3950,18 @@ selfCmd
       const match = lookup.matches[0]!;
       if (opts.json && match.skippedTrailingBytes !== undefined) console.error(`skipped incomplete trailing run ledger line: ${match.skippedTrailingBytes} bytes`);
       if (opts.all && !opts.json) console.log(`run ledger found in universe: ${match.targetName ?? 'current'} (${match.ledgerDirectory})`);
+      if (opts.unitVisits) {
+        const classification = classifyGraphUnitVisits(match.entries);
+        if (opts.json) {
+          await writeStdoutJson(JSON.stringify(classification) + '\n');
+          return;
+        }
+        console.log(`graph.unit enter=${classification.enterCount} exit=${classification.exitCount} orphan=${classification.orphanCount}`);
+        for (const visit of classification.orphanUnitVisits) {
+          console.log(`orphan unit=${visit.unit ?? '-'} node=${visit.nodeId ?? '-'} childRunId=${visit.childRunId ?? '-'} enteredAt=${visit.enteredAt ?? '-'}`);
+        }
+        return;
+      }
       if (opts.json) await writeStdoutJson(match.entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
       else console.log(renderRunLedger(match.entries));
     } catch (error) {
@@ -4201,12 +4216,17 @@ selfCmd
 selfCmd
   .command('running-runs')
   .description('원장과 살아 있는 PTY를 함께 읽어 현재 자율 런 판정을 출력한다')
+  .argument('[runId]', '같은 ID로 단일 런의 원본 완료 결과(kind·reason·next)를 재조회한다 (생략 시 전체)')
   .option('--json', '구조화된 JSON으로 출력한다')
   .option('--include-test', '연합 관측에 격리 test 인스턴스도 포함한다')
-  .action(async (opts: { json?: boolean; includeTest?: boolean }) => {
+  .action(async (runId: string | undefined, opts: { json?: boolean; includeTest?: boolean }) => {
     try {
       const { queryRunningRuns, renderRunningRuns } = await import('./self-implement/running-runs.js');
-      const result = queryRunningRuns({ includeTest: opts.includeTest, caller: 'cli' });
+      const result = queryRunningRuns({
+        includeTest: opts.includeTest,
+        caller: 'cli',
+        ...(runId === undefined ? {} : { runIds: [runId] }),
+      });
       const output = `${opts.json ? JSON.stringify(result) : renderRunningRuns(result)}\n`;
       await writeStdoutJson(output);
     } catch (error) {
@@ -4461,6 +4481,9 @@ selfCmd
     try {
       const { runGoalAuthorCli, formatGoalAuthorSelfInspection, formatGoalInterviewRound } = await import('./self-implement/goal-author-cli.js');
       // 설정 졸업 1-c(2026-09-26): 되묻기 자동 답변은 늘 켠다 — `harness ask/say` 와 같은 동작(옵션 없음).
+      // Production self author → runGoalAuthorCli → writeAuthoredGoal → tracedPathsSection:
+      // missing traced paths are corrected or skipped; a required correction ledger write
+      // failure propagates through this call to the error handler instead of reporting success.
       const result = await runGoalAuthorCli(parts, { ...opts, selfResolveClarifications: true });
       console.log(result.path);
       // ⭐ grounding 상태를 함께 알린다 — 이 장치의 알려진 약점이 여기서 드러나야 한다.
@@ -4718,10 +4741,17 @@ selfCmd
   .option('--remote [host]', 'GATE-REMOTE — 같은 커밋을 원격 호스트(기본 config gateRemote.host=node-b)에서 돌리고 결과만 가져온다(깨끗한 트리 · --pr 은 로컬)')
   .option('--local', '원격 실행을 끄고 명시적으로 로컬에서 돌린다')
   .option('--artifact-dir <dir>', '조각별 지금/기준 JUnit ⊕ summary.json 을 이 디렉토리에 남긴다(판정 불변 · JUnit 은 --shards 경로만 · 원격 실행이면 그 호스트에서 가져온다)')
-  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; fixedShardDistribution?: boolean; includeImporters?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string }) => {
+  .option('--orchestration-id <id>', 'GATE-REMOTE-SHARD-PLAN — 조각 오케스트레이션 id. --shard-id · --shard-position 와 세벌 세트로만 쓰고 원격 명령줄에 그대로 실린다')
+  .option('--shard-id <id>', 'GATE-REMOTE-SHARD-PLAN — 조각 id(예: <orchestration-id>/shard-2). 원격 명령줄에 그대로 실린다')
+  .option('--shard-position <n>', 'GATE-REMOTE-SHARD-PLAN — 조각 위치(1부터 정수). 원격 명령줄에 그대로 실린다')
+  .option('--shard-plan <path>', 'GATE-REMOTE-SHARD-PLAN — 조각 계획 파일 경로. 주면 원격 명령줄에 --shard-plan 으로 실린다')
+  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; fixedShardDistribution?: boolean; includeImporters?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string; orchestrationId?: string; shardId?: string; shardPosition?: string; shardPlan?: string }) => {
     if (!opts.changed && opts.shards === undefined) { ui.error('self gate requires --changed or --shards'); process.exitCode = 2; return; }
     if (opts.fixedShardDistribution && opts.shards === undefined) { ui.error('self gate: --fixed-shard-distribution requires --shards <n>'); process.exitCode = 2; return; }
     if (opts.artifactDir !== undefined && !opts.artifactDir.trim()) { ui.error('self gate: --artifact-dir needs a non-empty directory'); process.exitCode = 2; return; }
+    const shardIdentityFlags = [opts.orchestrationId, opts.shardId, opts.shardPosition].filter((value) => value !== undefined).length;
+    if (shardIdentityFlags !== 0 && shardIdentityFlags !== 3) { ui.error('self gate: --orchestration-id, --shard-id and --shard-position are used as a set'); process.exitCode = 2; return; }
+    if (opts.shardPosition !== undefined && !/^[1-9]\d*$/.test(opts.shardPosition)) { ui.error('self gate: --shard-position needs a positive integer'); process.exitCode = 2; return; }
     // The root strips `--local` from argv anywhere (remote-bookmark attach · src/cli/remote-resolve.ts) before Commander
     // sees it, so this subcommand reads it from the untouched process.argv.
     opts.local = !!opts.local || process.argv.slice(2).includes('--local');
@@ -4766,12 +4796,23 @@ selfCmd
         remoteArtifacts = remoteCommitSupportsArtifactDir(repo) ? { dir: newRemoteArtifactDir() } : { unsupported: true };
       }
       // origin/main is pinned to this machine's origin/main on the host; any other base is passed as its resolved sha.
-      const remoteArgv = (sha: (ref: string) => string) => remoteSelfGateArgv({
-        changed: opts.changed, base: opts.base, shards, fixedShardDistribution: opts.fixedShardDistribution,
-        includeImporters: opts.includeImporters,
-        // A measured commit without this option rejects it (exit ≠ 0) — read as not passed, never as a silent measured run.
-        artifactDir: remoteArtifacts && 'dir' in remoteArtifacts ? remoteArtifacts.dir : undefined,
-      }, sha);
+      const remoteArgv = (sha: (ref: string) => string) => {
+        const argv = remoteSelfGateArgv({
+          changed: opts.changed, base: opts.base, shards, fixedShardDistribution: opts.fixedShardDistribution,
+          includeImporters: opts.includeImporters,
+          // A measured commit without this option rejects it (exit ≠ 0) — read as not passed, never as a silent measured run.
+          artifactDir: remoteArtifacts && 'dir' in remoteArtifacts ? remoteArtifacts.dir : undefined,
+        }, sha);
+        // GATE-REMOTE-SHARD-PLAN — the shard identity rides the remote command line so each host run is attributable to its
+        // shard. A measured commit without these options rejects them (exit ≠ 0): unmeasured, never a silent pass.
+        if (opts.orchestrationId === undefined) return argv;
+        const { remoteShardArgArgs } = require('./self-dev/shard-run.js') as typeof import('./self-dev/shard-run.js');
+        return [...argv, ...remoteShardArgArgs({
+          orchestrationId: opts.orchestrationId, shardId: opts.shardId!,
+          totalShards: typeof shards === 'number' && Number.isSafeInteger(shards) && shards >= 1 ? shards : 1,
+          position: Number(opts.shardPosition),
+        }, { planFile: opts.shardPlan })];
+      };
       const { gateHostReservationRoot } = await import('./release-loop/gate-host-reservation.js');
       process.exitCode = await dispatchHeavyCheck({
         tool: 'self-gate', repo, installPwa: true, remoteArgv, refs: opts.base ? [opts.base] : [], reservationRoot: gateHostReservationRoot(),
@@ -6283,6 +6324,7 @@ selfCmd
         return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
       },
       reviewPullRequest,
+      reviewRepositoryPath: process.cwd(),
       readReferencedFile: createRepositoryReferencedFileReader(process.cwd()),
       renderReview,
       // ⛔⭐ 하드코딩 금지(🩸 2026-09-23 실측: 여기 'medium' 이 박혀 있었다) — 무인 리뷰와 «같은» 규칙.
@@ -7897,6 +7939,16 @@ const selfDevCmd = program
         if (flowResult.kind === 'stopped-before-authoring') {
           // ⭐ 저작 «전»에 끊는다 — 100초를 쓰지 않는다. 우회는 --force-preflight 로 그대로 열려 있다.
           throw new DevPipelineError('저작 전 예비 검사에서 막혔다 — 위 이름을 확인하라 (우회: --force-preflight)');
+        }
+        if (flowResult.kind === 'stopped-by-timebox') {
+          // ⭐⭐ AUTHOR-TIMEBOX NOT-GROUNDED — 저작 결과 줄은 흐름이 이미 썼다. 발사하지 않고 여기서 끝낸다.
+          releaseAuthoringLease();
+          if (opts.json) {
+            const terminalResult = { kind: 'self', ok: false, stage: 'author-timebox-not-grounded', goalFile: flowResult.goalFile };
+            await writeStdoutJson(`${JSON.stringify(terminalResult)}\n`);
+          }
+          completionGuard.conclude();
+          process.exit(1);
         }
         askAuthoredFile = flowResult.goalFile;
         if (flowResult.kind === 'stopped-by-preflight') {
@@ -12159,6 +12211,54 @@ export function rootResumeIdAt(rawArgs: readonly string[], resumeFlagIdx: number
   return next !== undefined && !next.startsWith('-') ? next : undefined;
 }
 
+/** TUI-CONTINUE-SESSION (0.2.35) — `--continue` 가 «어느 세션» 을 이어받나를 정하는 조회 창구. */
+export interface ContinueSessionLookup {
+  /** cwd 가 속한 프로젝트 id — 매칭 없으면 null. */
+  projectIdForCwd: (cwd: string) => string | null;
+  /** 그 프로젝트의 최신 세션 id — 없으면 null. */
+  latestForProject: (projectId: string) => string | null;
+  /** 전역 최신 세션 id — 없으면 null. */
+  latestGlobal: () => string | null;
+  /** 지금 활성 표지가 가리키는 세션 id — 없으면 null. */
+  activeSessionId: () => string | null;
+}
+
+const realContinueSessionLookup: ContinueSessionLookup = {
+  projectIdForCwd: (cwd) => suggestProjectForFolder(cwd)?.id ?? null,
+  latestForProject: (projectId) => listSessions({ limit: 1, projectId })[0]?.id ?? null,
+  latestGlobal: () => listSessions({ limit: 1 })[0]?.id ?? null,
+  activeSessionId: () => getActiveSessionId(),
+};
+
+/**
+ * TUI-CONTINUE-SESSION (0.2.35) — `--continue`(id 없는 `--resume`)의 «최근 세션» 을 cwd 기준으로
+ * 먼저 좁힌다: cwd 가 속한 프로젝트(`primaryFolder` 또는 그 하위 디렉토리)의 최신 세션 id.
+ * 매칭 프로젝트가 없거나 그 프로젝트에 세션이 하나도 없으면 전역 최신으로 폴백한다 —
+ * 프로젝트와 무관한 디렉토리·화면의 이어가기 동작은 종전 그대로다.
+ */
+export function latestSessionIdForContinue(
+  cwd: string = process.cwd(),
+  lookup: ContinueSessionLookup = realContinueSessionLookup,
+): string | null {
+  const projectId = lookup.projectIdForCwd(cwd);
+  const localId = projectId ? lookup.latestForProject(projectId) : null;
+  return localId ?? lookup.latestGlobal();
+}
+
+/**
+ * cwd 가 프로젝트 안이면 활성 표지보다 cwd 프로젝트의 최신 세션 선택을 우선한다.
+ * 프로젝트 밖에서는 종전처럼 활성 표지가 전역 최신보다 우선한다.
+ */
+export function activeSessionIdForContinue(
+  cwd: string = process.cwd(),
+  lookup: ContinueSessionLookup = realContinueSessionLookup,
+): string | null {
+  const active = lookup.activeSessionId();
+  if (!active) return null;
+  const cwdProjectId = lookup.projectIdForCwd(cwd);
+  return cwdProjectId ? null : active;
+}
+
 export function filterDashboardArgs(rawArgs: readonly string[], resumeFlagIdx?: number): string[] {
   const rootResumeFlagIdx = resumeFlagIdx ?? rawArgs.findIndex((arg, index) =>
     // ⛔ `-r` 은 «더 이상» resume 의 별칭이 아니다 — 원격 북마크(`--remote`)의 단축형이다.
@@ -12407,8 +12507,11 @@ async function main(): Promise<void> {
     // 명시 인자가 있으면 env 를 «읽지도» 않는다(폐기 경고가 명시 이어하기에 섞이지 않게).
     readEnvId: () => readDeprecatedEnvForResume('ELANOUS_RESUME_SESSION').value ?? null,
     latest: () => resolveLatestSessionId({
-      activeSessionId: () => getActiveSessionId(),
-      latestSessionId: () => listSessions({ limit: 1 })[0]?.id ?? null,
+      // TUI-CONTINUE-SESSION (0.2.35) — 활성 표지가 «다른 프로젝트» 세션이면 버리고 cwd 기준으로 고른다.
+      activeSessionId: () => activeSessionIdForContinue(),
+      // TUI-CONTINUE-SESSION (0.2.35) — «지금 이 디렉토리» 의 프로젝트 최근 세션을 먼저 본다.
+      //   그 프로젝트에 세션이 없으면 종전대로 전역 최신으로 폴백(다른 화면 동작 보존).
+      latestSessionId: () => latestSessionIdForContinue(),
       // TUI-H8-FOLLOW ① — 활성 표지가 사라진 세션이면 최신 세션으로(#28509 리뷰 should-fix).
       sessionExists: (id) => loadSession(id) !== null,
     }),

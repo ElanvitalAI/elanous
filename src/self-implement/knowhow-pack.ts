@@ -42,8 +42,8 @@ function mentionedPaths(text: string): Set<string> {
   return paths;
 }
 
-function relevance(goal: string, section: string): number {
-  const paths = mentionedPaths(goal);
+function relevance(goal: string, section: string, targetPaths?: readonly string[]): number {
+  const paths = targetPaths === undefined ? mentionedPaths(goal) : new Set(targetPaths);
   const sourcePaths = mentionedPaths(section);
   let score = 0;
   for (const path of paths) {
@@ -58,8 +58,8 @@ function relevance(goal: string, section: string): number {
   return score;
 }
 
-/** Reads only 내부 문서 `KNOWHOW` inside the supplied repository. */
-export function selectKnowhowPack(repo: string, goal: string): KnowhowPack {
+/** Reads only 내부 문서 `KNOWHOW` inside the supplied repository. Verified target paths narrow relevance when supplied. */
+export function selectKnowhowPack(repo: string, goal: string, targetPaths?: readonly string[]): KnowhowPack {
   if (goal.includes(MARKER)) return { text: '', ids: [], bytes: 0 };
   const rolesDir = resolve(repo, 'docs/roles');
   let realRoles: string;
@@ -78,7 +78,7 @@ export function selectKnowhowPack(repo: string, goal: string): KnowhowPack {
       const real = realpathSync(file);
       if (!inside(realRoles, real) || !statSync(real).isFile() || statSync(real).size > 2_000_000) continue;
       for (const section of promotedSections(readFileSync(real, 'utf8'))) {
-        const score = relevance(goal, section.text);
+        const score = relevance(goal, section.text, targetPaths);
         if (score > 0) candidates.push({ ...section, score });
       }
     } catch { /* A missing or unreadable source contributes no entry. */ }

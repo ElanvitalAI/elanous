@@ -10,6 +10,15 @@ import { getUserConfig } from '../user-config.js';
 import { planEdgeRail, type EdgeRailInput, type EdgeRailPlan } from './self-update-canary.js';
 import { loadRunLedger } from '../self-implement/run-ledger.js';
 
+function selfUpdateOutputTail(output: string): string {
+  const lines = output.split(/\r?\n/).filter((line) => line.trim()).slice(-40);
+  return Array.from(lines.join('\n')).slice(-20_000).join('');
+}
+
+function selfUpdateReasonTail(tail: string): string {
+  return Array.from(tail).slice(-4_000).join('');
+}
+
 export interface SelfUpdateOptions {
   from?: string;
   restart?: boolean;
@@ -1241,25 +1250,34 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
       try {
         const build = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 15 * 60_000 });
         ok = build.status === 0;
-        tail = (build.stderr?.trim() || build.stdout?.trim() || '').split(/\r?\n/).filter((line) => line.trim()).at(-1)?.trim().slice(0, 500) ?? '';
+        const output = build.stderr?.trim() || build.stdout?.trim() || '';
+        tail = ok ? output.split(/\r?\n/).filter((line) => line.trim()).at(-1)?.trim().slice(0, 500) ?? '' : selfUpdateOutputTail(output);
       } catch (error) {
-        tail = String(error).split(/\r?\n/).at(-1)?.trim().slice(0, 500) ?? '';
+        tail = selfUpdateOutputTail(String(error));
       }
       const ms = Date.now() - started;
       try {
         debug.log('self-update', 'pwa-build', { ok, commit, ms });
         debug.log('self-update', 'pwa-build-tail', { commit, tail: tail || '출력 없음' });
+        if (!ok) debug.log('self-update', 'build-failed', { stage: 'pwa-build', commit, tail: tail || '출력 없음' });
       } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
-      if (!ok) return emit({ exitCode: 1, installedVersion: null, decision, restarted: false, reason: `PWA 빌드 실패: ${tail || '출력 없음'}` });
+      if (!ok) return emit({ exitCode: 1, installedVersion: null, decision, restarted: false, reason: `PWA 빌드 실패: ${selfUpdateReasonTail(tail) || '출력 없음'}` });
       pwaBuild = { pwaBuiltCommit: commit, pwaBuiltAt: new Date().toISOString() };
     }
     let install: ReturnType<NonNullable<SelfUpdateDeps['run']>>;
+    let installTail = '';
     try {
       install = run('bash', [join(checkout, 'scripts/install.sh'), '--no-modify-path'], checkout);
+      if (install.status !== 0) installTail = selfUpdateOutputTail(install.stderr?.trim() || install.stdout?.trim() || '');
     } catch (error) {
-      return emit({ exitCode: 1, installedVersion: null, decision, restarted: false, reason: `설치 실패: ${String(error)}` });
+      installTail = selfUpdateOutputTail(String(error));
+      try { debug.log('self-update', 'build-failed', { stage: 'install', commit: head.stdout.trim().slice(0, 12), tail: installTail || '출력 없음' }); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+      return emit({ exitCode: 1, installedVersion: null, decision, restarted: false, reason: `설치 실패: ${selfUpdateReasonTail(installTail) || '출력 없음'}` });
     }
-    if (install.status !== 0) return emit({ exitCode: 1, installedVersion: null, decision, restarted: false, reason: `설치 실패: ${install.stderr}` });
+    if (install.status !== 0) {
+      try { debug.log('self-update', 'build-failed', { stage: 'install', commit: head.stdout.trim().slice(0, 12), tail: installTail || '출력 없음' }); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+      return emit({ exitCode: 1, installedVersion: null, decision, restarted: false, reason: `설치 실패: ${selfUpdateReasonTail(installTail) || '출력 없음'}` });
+    }
     let installedVersion: string;
     try {
       installedVersion = (deps.installedVersion ?? (() => basename(readlinkSync(join(homedir(), '.local/share/elanous/current')))))();

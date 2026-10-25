@@ -16,13 +16,29 @@ const SHA = 'a'.repeat(40);
 const VERSION = '0.2.19';
 const releaseGraphDir = join(import.meta.dir, '../../graphs/release');
 
+function configureTraffic(root: string): void {
+  const trafficFile = join(root, 'release-traffic.json');
+  writeFileSync(trafficFile, '{}\n');
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: { trafficFile } } }));
+}
+
 function installReleaseRecipes(checkout: string): void {
   const target = join(checkout, 'graphs/release');
   mkdirSync(target, { recursive: true });
   for (const name of ['release-loop.yaml', 'recipes.yaml']) copyFileSync(join(releaseGraphDir, name), join(target, name));
 }
 
+function createPreflightCommandRoot(root: string): string {
+  const checkout = join(root, 'checkout');
+  mkdirSync(checkout, { recursive: true });
+  mkdirSync(join(checkout, 'node_modules'));
+  mkdirSync(join(checkout, 'apps', 'pwa', 'node_modules'), { recursive: true });
+  installReleaseRecipes(checkout);
+  return checkout;
+}
+
 function writeFailedRun(root: string, runId = 'r', gateOutput = '{"outcome":"ok"}', cutCommit = SHA): { statePath: string; original: string } {
+  configureTraffic(root);
   const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
   mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
   const state = {
@@ -74,6 +90,71 @@ test('resume dry-run checks the saved cut and checkout without running nodes or 
     expect(existsSync(join(root, 'release', VERSION, 'resume-attempts', 'r.json'))).toBe(false);
     expect(readdirSync(join(root, 'graph-runs', 'release-loop'))).toEqual(['r.json']);
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resume preflight rejects each environment/artifact mismatch before graph or attempt/state writes', async () => {
+  const cases: Array<{ name: string; expected: string; prepare: (root: string) => { commandRoot: string; git?: (args: string[]) => string; isAncestor?: () => boolean } }> = [
+    { name: 'traffic file', expected: 'traffic file is missing or not writable', prepare: (root) => ({ commandRoot: createPreflightCommandRoot(root) }) },
+    { name: 'prepared ownership', prepare: (root) => {
+      mkdirSync(join(root, 'release', VERSION, 'prepared'), { recursive: true });
+      writeFileSync(join(root, 'release', VERSION, 'prepared', 'release.json'), JSON.stringify({ version: VERSION, sourceCommit: SHA }));
+      return { commandRoot: createPreflightCommandRoot(root) };
+    }, expected: 'prepared artifact is outside' },
+    { name: 'docs branch ownership', expected: 'docs branch/worktree is outside', prepare: (root) => ({ commandRoot: createPreflightCommandRoot(root), git: (args) => {
+      if (args[0] === 'ls-remote' && args.at(-1) === `refs/heads/release-docs/${VERSION}`) return `${SHA}\trefs/heads/release-docs/${VERSION}`;
+      return gitStub(args);
+    } }) },
+    { name: 'docs remote tip moved after pushed receipt', expected: 'docs branch tip differs', prepare: (root) => {
+      const branch = `release-docs/${VERSION}`;
+      const tree = join(root, 'docs-tree'); mkdirSync(tree);
+      const statePath = join(root, 'graph-runs', 'release-loop', 'r.json');
+      const state = JSON.parse(readFileSync(statePath, 'utf8')) as { nodes: Array<Record<string, unknown>> };
+      state.nodes.push({ nodeId: 'docs', ok: true, output: JSON.stringify({ outcome: 'ok', branch, worktree: tree,
+        artifactOwner: { runId: 'r', attempt: 0 } }) });
+      writeFileSync(statePath, JSON.stringify(state));
+      const releaseDir = join(root, 'release', VERSION);
+      mkdirSync(releaseDir, { recursive: true });
+      writeFileSync(join(releaseDir, 'docs-branch-owner.json'), JSON.stringify({
+        owner: { runId: 'r', attempt: 0 }, branch, worktree: tree, outcome: 'pushed', head: SHA,
+      }));
+      return { commandRoot: createPreflightCommandRoot(root), git: (args) => {
+        if (args[0] === 'show-ref' && args.at(-1) === `refs/heads/${branch}`) return SHA;
+        if (args[0] === 'worktree' && args[1] === 'list') return `worktree ${tree}\nbranch refs/heads/${branch}\n`;
+        if (args[0] === 'ls-remote' && args.at(-1) === `refs/heads/${branch}`) return `${'b'.repeat(40)}\trefs/heads/${branch}`;
+        return gitStub(args);
+      } };
+    } },
+    { name: 'release tip ownership', expected: 'does not descend from the recorded release commit', prepare: (root) => ({ commandRoot: createPreflightCommandRoot(root), git: (args) => args[0] === 'ls-remote'
+      ? `${'b'.repeat(40)}\trefs/heads/release/${VERSION}` : gitStub(args), isAncestor: () => false }) },
+    { name: 'root and PWA dependencies', expected: 'release resume dependencies missing', prepare: (root) => {
+      const commandRoot = join(root, 'checkout'); mkdirSync(commandRoot);
+      installReleaseRecipes(commandRoot);
+      mkdirSync(join(commandRoot, 'node_modules'));
+      return { commandRoot, git: (args) => args[0] === 'rev-parse' ? SHA : args[0] === 'ls-remote' ? gitStub(args) : '' };
+    } },
+  ];
+  for (const item of cases) {
+    const root = mkdtempSync(join(tmpdir(), 'resume-wide-preflight-'));
+    setElanousConfigDir(root);
+    const saved = writeFailedRun(root);
+    let graphCalls = 0;
+    const extra = item.prepare(root);
+    const stateAfterFixtureSetup = readFileSync(saved.statePath, 'utf8');
+    const deps: NonNullable<Parameters<typeof resumeReleaseRun>[1]> = {
+      root, git: gitStub, ...extra, graph: async () => { graphCalls++; return { status: 'done' } as never; },
+    };
+    try {
+      if (item.name === 'traffic file') deps.trafficFile = join(root, 'missing-traffic.json');
+      await expect(planResumeReleaseRun({ runId: 'r', from: 'tui', partial: false,
+        commandRoot: extra.commandRoot }, deps)).rejects.toThrow(item.expected);
+      await expect(resumeReleaseRun({ runId: 'r', from: 'tui', partial: false,
+        commandRoot: extra.commandRoot }, deps).then(() => 'passed', (error) => String(error)))
+        .resolves.toContain(item.expected);
+      expect(graphCalls).toBe(0);
+      expect(readFileSync(saved.statePath, 'utf8')).toBe(stateAfterFixtureSetup);
+      expect(existsSync(join(root, 'release', VERSION, 'resume-attempts', 'r.json'))).toBe(false);
+    } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+  }
 });
 
 test('resume dry-run marks an explicit no-partial gate restart as a full gate', async () => {
@@ -419,6 +500,8 @@ test('simulated failed gate: pin mismatch leaves state unchanged; matching pin r
     return '';
   };
   setElanousConfigDir(root);
+  mkdirSync(join(checkout, 'node_modules'), { recursive: true });
+  mkdirSync(join(checkout, 'apps', 'pwa', 'node_modules'), { recursive: true });
   try {
     for (const resume of [
       () => planResumeReleaseRun({ runId: 'r', from: 'gate', commandRoot: checkout }, { root, git, isAncestor: () => true }),
@@ -439,7 +522,7 @@ test('simulated failed gate: pin mismatch leaves state unchanged; matching pin r
     let resumedFrom = '';
     const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: false, commandRoot: checkout }, {
       root, git, isAncestor: () => true,
-      graph: async (_path, options) => { resumedFrom = options.fromNodeId ?? ''; return { status: 'done' } as never; },
+      graph: async (_path, options) => { resumedFrom = options?.fromNodeId ?? ''; return { status: 'done' } as never; },
     });
     expect(resumedFrom).toBe('gate');
     expect(resumed.state.status).toBe('done');
@@ -575,6 +658,7 @@ test('a resume with an injected ledger root different from the OP-seat root stil
   const seatRoot = mkdtempSync(join(tmpdir(), 'resume-seat-'));
   const ledger = mkdtempSync(join(tmpdir(), 'resume-ledger-'));
   setElanousConfigDir(seatRoot);
+  configureTraffic(seatRoot);
   writeFailedRun(ledger);
   try {
     let resumeEntered = false;

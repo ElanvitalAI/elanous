@@ -1,7 +1,7 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { loadRunLedger as loadRunLedgerSync, loadRunLedgerWithMetadata, runLedgerDir, resolveFederatedRunLedgerDirectories, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { goalRunDbPath, loadGoalRunQuery } from '../self-implement/goal-run-store.js';
 import { loadGoalAskRecords } from '../self-implement/goal-ask-store.js';
@@ -9,7 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { InvalidArgumentError, Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { readRunExits } from '../harness/harness-incidents.js';
-import { checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
+import { checklistDevVersion, listChecklist, setItemIfSnapshot } from '../release-loop/checklist.js';
 import { assignedVersions, releasedVersion, validateVersion } from '../release-loop/feature-store.js';
 import { compareVersions } from '../directives/version-at.js';
 import type { BoardNode } from '../task-agent/board.js';
@@ -18,7 +18,13 @@ import { recordWiringLiveVerified, type CardRunEvidenceDeps } from '../task-agen
 import { remoteLedgerMirrorDir, remoteLedgerMirrorDirs } from '../task-agent/parent-host.js';
 import { buildWorkOrder } from '../task-agent/work-order-build.js';
 import { cellIdFromBody } from '../pr-tool/census.js';
-import { ambiguousGreenSweepPrs, decideGreenSweep, greenSweepCandidates, observeGreenSweep, type GreenSweepPr } from '../task-agent/green-sweep.js';
+import { ambiguousGreenSweepPrs, applyGreenSweepDecisions, decideGreenSweep, greenSweepCandidates, greenSweepEvidenceTestArgs, observeGreenSweep, type GreenSweepPr } from '../task-agent/green-sweep.js';
+import { mapInventory, renderMapReduceTable, type MapInventory, type MapItem, type MapPorts } from '../task-agent/map-reduce.js';
+import type { MapRecipe, MapRunRow } from '../task-agent/map-run-ledger.js';
+import { createMapHostLauncher, type HostMapItem } from '../task-agent/map-host-adapter.js';
+import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
+import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { HAND_MOVE_KINDS, recordHandMove } from '../task-agent/live-move-history.js';
 import type { TierSizedDecompose } from '../task-agent/tier-split.js';
 import type { AdvanceMissionResult, MissionDecompose, PieceEvidenceReader } from '../task-agent/mission.js';
@@ -44,6 +50,14 @@ export interface TasksCliDeps {
   /** green-sweep entrypoint test seam: keep the actual CLI decision chain, replace only process reads. */
   greenSweepChecklist?: typeof listChecklist;
   greenSweepRun?: (command: string, args: string[]) => { status: number | null; stdout: string };
+  greenSweepEvidenceRun?: (args: string[]) => { status: number | null; stdout: string };
+  greenSweepWrite?: typeof setItemIfSnapshot;
+  /** Test inventory seam; production reads current checklist or GitHub draft inventory. */
+  mapInventorySource?: (recipe: MapRecipe, source: 'landed-but-yellow' | 'drafts', limit?: number,
+    mapRunId?: string) => Promise<MapInventory<MapCliItem>>;
+  mapRoot?: string;
+  /** Focused test seam; production uses the real host graph runner. */
+  mapGraphRun?: (path: string, options: GraphRunOptions) => Promise<GraphRunState>;
   /** `task hand --live` 의 발사기(시험 주입). 기본은 운영 config-dir 로 `harness say` 를 떼어 띄운다. */
   taskLauncher?: TaskLauncher;
   /** TA-REVIEW-RESULT-CAPTURE — `tasks show` 의 리뷰 결과 회수 시각(시험 주입 · 기본 지금). */
@@ -343,9 +357,19 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   const capacities = Object.fromEntries(multi ? eligible.map((target) => [target.host, parentHostModule.readParentHostCapacity(target, deps.ssh)]) : []);
   const measured = eligible.filter((target) => fits[target.host]?.state === 'fits');
   const unknown = eligible.filter((target) => fits[target.host]?.state !== 'fits');
-  const ordered = multi
-    ? [...parentHostModule.orderParentHosts(measured, context.runId, capacities), ...parentHostModule.orderParentHosts(unknown, context.runId, capacities)]
-    : eligible;
+  const ranked = multi
+    ? [...parentHostModule.rankParentHosts(measured, context.runId, capacities), ...parentHostModule.rankParentHosts(unknown, context.runId, capacities)]
+    : eligible.map((target) => ({ target, weight: null, score: null }));
+  const ordered = ranked.map(({ target }) => target);
+  let rankingRecorded = false;
+  const recordHostRanking = (selectedHost: string | null): void => {
+    if (rankingRecorded) return;
+    rankingRecorded = true;
+    for (const { target, weight, score } of ranked) {
+      const sample = capacities[target.host];
+      try { debug.log('task-agent.parent-host', 'host-ranked', { host: target.host, runId: context.runId, active: sample?.active ?? null, waiting: sample?.waiting ?? null, headroom: sample?.approvalHeadroom ?? null, capacityState: !sample ? 'unmeasured' : sample.approvalHeadroom > 0 ? 'available' : 'saturated', load: sample?.load ?? null, weight: sample ? weight : null, score: sample && Number.isFinite(score) ? score : null, selected: selectedHost === target.host }); } catch { /* fail-soft */ }
+    }
+  };
   for (const target of ordered) {
     if (multi && (!capacities[target.host] || capacities[target.host]!.approvalHeadroom <= 0)) {
       failed(target, ['capacity-unavailable']);
@@ -398,6 +422,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
         else {
           try { debug.log('task-agent.parent-host', 'codex-access-mirror-unavailable', { host: target.host, runId: context.runId, reason: mirrorReason }); } catch { /* fail-soft */ }
           failed(target, ['codex-access-mirror-unavailable']);
+          recordHostRanking(null);
           return null;
         }
         if (selected?.account) {
@@ -410,15 +435,18 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
       }
       const launched = parentHostModule.launchRemoteParent(target, args, remoteEnv, deps.ssh,
         grokAccessMirror ? () => grokAccessMirror : undefined, effectiveChildProvider, deps.now);
+      recordHostRanking(target.host);
       try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
       return { runId: context.runId, parentHost: { host: target.host, ...(target.configDir ? { configDir: target.configDir } : {}), pid: launched.pid, log: launched.log } };
     } catch (error) {
       if (error instanceof parentHostModule.RemoteParentNotLaunchedError) { failed(target, [error.message]); continue; }
-      if (error instanceof NoEligibleOwnerCodexAccountError) throw error;
+      if (error instanceof NoEligibleOwnerCodexAccountError) { recordHostRanking(null); throw error; }
       try { debug.log('task-agent', 'parent-host-launch-uncertain', { host: target.host, runId: context.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+      recordHostRanking(null);
       throw error;
     }
   }
+  recordHostRanking(null);
   return null;
 }
 
@@ -536,6 +564,132 @@ export function spawnDetachedConfirmed(spawnFn: DetachedSpawn, command: string, 
     child.once('error', onError);
     const timer = setTimeout(() => finish(child.pid ? undefined : new Error(`발사 확인 시간 초과(${timeoutMs}ms) · pid 없음`)), timeoutMs);
   });
+}
+
+function orchestrationId(): string {
+  return randomUUID();
+}
+
+type MapCliItem = MapItem & { text?: string; graphInput?: HostMapItem['graphInput']; inventoryMissing?: boolean };
+
+function selectMapIds(inventory: MapInventory<MapCliItem>, requestedIds: readonly string[] | undefined): MapInventory<MapCliItem> {
+  if (!requestedIds) return inventory;
+  if (!inventory.complete) return inventory;
+  const byId = new Map(inventory.items.map((item) => [item.id, item]));
+  return { ...inventory, items: requestedIds.map((id) => byId.get(id) ?? { id, text: `requested ${id}`, inventoryMissing: true }) };
+}
+
+/** Read a bounded, current inventory. A failed read is a HOLD, never an empty inventory. */
+async function currentMapInventory(recipe: MapRecipe, source: 'landed-but-yellow' | 'drafts', limit: number | undefined,
+  root: string, mapRunId: string, taskStatePath: string, requestedIds?: readonly string[]): Promise<MapInventory<MapCliItem>> {
+  const run = (command: string, args: string[]): string => {
+    const result = spawnSync(command, args, { cwd: process.cwd(), encoding: 'utf8', timeout: 30_000 });
+    if (result.status !== 0) throw new Error(`${command} ${args.slice(0, 2).join(' ')}: ${result.error?.message ?? result.stderr?.trim() ?? 'read failed'}`);
+    return result.stdout.trim();
+  };
+  const recipePath = join(process.cwd(), 'graphs', 'work', `${recipe}.yaml`);
+  if (!existsSync(recipePath)) throw new Error(`recipe-missing: ${recipePath}`);
+  const recipeSha = run('git', ['hash-object', recipePath]);
+  const mainSha = run('git', ['rev-parse', 'origin/main']);
+  if (!/^[a-f0-9]{40}$/.test(recipeSha) || !/^[a-f0-9]{40}$/.test(mainSha)
+    || run('git', ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0] !== mainSha)
+    throw new Error('origin-main-unverified');
+  const originUrl = run('git', ['remote', 'get-url', 'origin']);
+  const repo = /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(originUrl)?.[1]?.toLowerCase();
+  if (!repo) throw new Error('origin-repository-unverified');
+  const snapshotTime = new Date().toISOString();
+  let items: MapCliItem[];
+  let checklistSnapshotPath: string | null = null;
+  let snapshotRef: string;
+  if (source === 'landed-but-yellow') {
+    const version = checklistDevVersion();
+    const snapshot = listChecklist(version);
+    const cards = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(taskStatePath).tasks ?? {});
+    items = [];
+    const selected = requestedIds ? new Set(requestedIds) : null;
+    for (const item of snapshot.items.filter((entry) => entry.status === 'yellow' && (!selected || selected.has(entry.id)))) {
+      const candidates = greenSweepCandidates(item, version, cards);
+      for (const candidate of candidates) {
+        const raw = run('gh', ['pr', 'view', String(candidate.pr), '--repo', repo, '--json', 'number,state,mergeCommit,url']);
+        const pr = JSON.parse(raw) as { number?: number; state?: string; mergeCommit?: { oid?: string }; url?: string };
+        if (pr.number !== candidate.pr) throw new Error(`pr-identity-unverified: ${candidate.pr}`);
+        const prRepo = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+/i.exec(pr.url ?? '')?.[1]?.toLowerCase();
+        if (prRepo !== repo) throw new Error(`pr-repository-unverified: ${candidate.pr}`);
+        let mergeSha = pr.state === 'MERGED' ? pr.mergeCommit?.oid ?? '' : '';
+        if (pr.state === 'MERGED' && !mergeSha) throw new Error(`pr-merge-unverified: ${candidate.pr}`);
+        const train = candidate.card?.trainLanding;
+        if (!mergeSha && pr.state === 'CLOSED' && train?.componentPr === candidate.pr) {
+          const integration = JSON.parse(run('gh', ['pr', 'view', String(train.integrationPr), '--repo', repo, '--json', 'number,state,mergeCommit'])) as
+            { number?: number; state?: string; mergeCommit?: { oid?: string } };
+          if (integration.number === train.integrationPr && integration.state === 'MERGED'
+            && integration.mergeCommit?.oid === train.mergeSha) mergeSha = train.mergeSha;
+        }
+        if (!mergeSha) continue;
+        if (!/^[a-f0-9]{40}$/i.test(mergeSha)) throw new Error(`pr-merge-unverified: ${candidate.pr}`);
+        const ancestor = spawnSync('git', ['merge-base', '--is-ancestor', mergeSha, 'origin/main'], { cwd: process.cwd() });
+        if (ancestor.status !== 0) throw new Error(`pr-main-ancestor-unverified: ${candidate.pr}`);
+        // A card can add scope, but cannot remove the current checklist's declared paths.
+        // Invalid current scope stays HOLD even if an old TA card has valid paths.
+        const paths = greenCloseDeclaredPaths(item.title, candidate.card?.targetPaths);
+        items.push({ id: item.id, text: item.title,
+          graphInput: { cellId: item.id, version, title: item.title, evidence: item.evidence ?? '', paths,
+            candidates: [{ pr: candidate.pr, prUrl: pr.url, mergeSha }], main: { ref: 'origin/main', sha: mainSha } } });
+        break;
+      }
+      if (!requestedIds && limit !== undefined && items.length >= limit) break;
+    }
+    const snapshotBody = `${JSON.stringify({ version, mainSha, checklist: snapshot,
+      selectedIds: items.map((item) => item.id), requestedIds: requestedIds ?? null })}\n`;
+    snapshotRef = `checklist-${version}@${createHash('sha256').update(snapshotBody).digest('hex')}`;
+    checklistSnapshotPath = join(root, 'map-runs', `${mapRunId}-checklist.json`);
+    mkdirSync(dirname(checklistSnapshotPath), { recursive: true });
+    writeFileSync(checklistSnapshotPath, snapshotBody, { flag: 'wx', mode: 0o600 });
+  } else {
+    const cap = 1000;
+    const parsed: unknown = JSON.parse(run('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--draft', '--limit', String(cap),
+      '--json', 'number,title,headRefOid']));
+    if (!Array.isArray(parsed) || parsed.length >= cap || parsed.some((entry) => !entry || typeof entry !== 'object'
+      || !Number.isSafeInteger((entry as { number?: unknown }).number) || typeof (entry as { title?: unknown }).title !== 'string'
+      || typeof (entry as { headRefOid?: unknown }).headRefOid !== 'string'))
+      throw new Error('draft-inventory-incomplete');
+    const selected = requestedIds ? new Set(requestedIds) : null;
+    items = parsed.filter((entry) => !selected || selected.has(`pr-${(entry as { number: number }).number}`))
+      .slice(0, requestedIds ? undefined : limit).map((entry) => ({ id: `pr-${(entry as { number: number }).number}`,
+      text: (entry as { title: string }).title }));
+    if (new Set(items.map((item) => item.id)).size !== items.length) throw new Error('draft-inventory-duplicate');
+    const openDrafts = parsed.map((entry) => ({ number: (entry as { number: number }).number,
+      title: (entry as { title: string }).title }));
+    for (const item of items) {
+      const number = Number(item.id.slice(3));
+      const detail = JSON.parse(run('gh', ['pr', 'view', String(number), '--repo', repo,
+        '--json', 'number,title,body,headRefOid,headRefName,labels,isDraft,state,createdAt,files,changedFiles'])) as {
+        number?: number; title?: string; body?: string; headRefOid?: string; headRefName?: string;
+        labels?: { name: string }[]; isDraft?: boolean; state?: string; createdAt?: string;
+        files?: { path: string }[]; changedFiles?: number;
+      };
+      if (detail.number !== number || detail.headRefOid !== (parsed.find((entry) => (entry as { number: number }).number === number) as { headRefOid: string }).headRefOid
+        || detail.state !== 'OPEN' || detail.isDraft !== true) throw new Error(`draft-head-or-state-changed: ${number}`);
+      const changedFiles = detail.files?.map((file) => file.path) ?? [];
+      const fullFiles = Number.isSafeInteger(detail.changedFiles) && detail.changedFiles === changedFiles.length;
+      const graphItem = { pr: number, headOid: detail.headRefOid, repository: repo, state: 'open', isDraft: true,
+        labels: detail.labels?.map((label) => label.name) ?? [], branch: detail.headRefName,
+        title: detail.title, body: detail.body, createdAt: detail.createdAt,
+        changedFiles, changedFilesComplete: fullFiles, latestFileChanges: {},
+        openDrafts, openDraftsComplete: true, mergedTwins: [], mergedTwinsComplete: false,
+        liveBranches: [], runStatus: 'unmeasured' };
+      item.graphInput = { mapRunId, snapshotTime, inventoryComplete: true, mainSha,
+        inventory: { complete: true, snapshotTime, mainSha, items: openDrafts }, item: graphItem };
+    }
+    snapshotRef = `drafts@${createHash('sha256').update(JSON.stringify(parsed)).digest('hex')}`;
+  }
+  return { items, complete: true, snapshotTime, snapshotRef, recipeSha, mainSha, checklistSnapshotPath,
+    requestedPool: 'cold-job', selectedPool: null, imageCommit: null };
+}
+
+export function greenCloseDeclaredPaths(title: string, cardPaths?: readonly string[]): string[] {
+  const declared = parseAskTargetPathHintsResult(title);
+  if (declared.labelMissing || declared.rejected.length > 0) return [];
+  return [...new Set([...declared.paths, ...(cardPaths ?? [])])];
 }
 
 const COVER_QUERY_LIMIT = STORE_SAFETY_MAX;
@@ -1568,14 +1722,16 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     });
 
   tasks.command('green-sweep')
-    .description('병합된 과제 PR 과 칸 근거를 대조해 green/기록만/건너뜀을 미리 본다 (항상 dry-run)')
+    .description('병합된 과제 PR·칸 근거를 대조한다 (기본 dry-run, --apply 는 검증된 한 칸만 기록)')
     .requiredOption('--version <version>', '조회할 체크리스트 판')
     .option('--cell <id>', '한 칸만 조회')
     .option('--traffic <path>', '실물 green 판정에는 traffic.json 필수 — 빠지거나 못 읽으면 hold 불명으로 보수 판정')
+    .option('--apply', '최신 clean main 에서 완료 경계 시험까지 통과한 한 칸만 green 으로 기록')
     .option('--json', 'JSON 출력')
-    .action((opts: { version: string; cell?: string; traffic?: string; json?: boolean }) => {
+    .action((opts: { version: string; cell?: string; traffic?: string; apply?: boolean; json?: boolean }) => {
       try {
         validateVersion(opts.version);
+        if (opts.apply && !opts.cell) throw new Error('--apply 는 단일 --cell 과 함께 써야 한다');
         const snapshot = (deps.greenSweepChecklist ?? listChecklist)(opts.version);
         const run = deps.greenSweepRun ?? ((command: string, args: string[]) => spawnSync(command, args,
           { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000 }));
@@ -1606,6 +1762,13 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         const localMainSha = localMain.status === 0 ? localMain.stdout.trim() : '';
         const remoteMainSha = remoteMain.status === 0 ? remoteMain.stdout.trim().split(/\s+/)[0] : '';
         const mainFresh = /^[a-f0-9]{40}$/i.test(localMainSha) && localMainSha === remoteMainSha;
+        let currentMainClean = false;
+        if (opts.apply && mainFresh) {
+          const head = run('git', ['rev-parse', 'HEAD']);
+          const status = run('git', ['status', '--porcelain', '--untracked-files=all']);
+          currentMainClean = head.status === 0 && head.stdout.trim() === remoteMainSha
+            && status.status === 0 && status.stdout.trim() === '';
+        }
         if (opts.cell && !snapshot.items.some((item) => item.id === opts.cell)) throw new Error(`없는 칸: ${opts.cell}`);
         const decisions = snapshot.items.filter((item) => !opts.cell || item.id === opts.cell).flatMap((item) => {
           const candidates = greenSweepCandidates(item, opts.version, cards);
@@ -1654,9 +1817,34 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         const counts = { candidate: decisions.length, green: decisions.filter((d) => d.verdict === 'green').length,
           recordOnly: decisions.filter((d) => d.verdict === 'record-only').length,
           skipped: decisions.filter((d) => d.verdict === 'skip').length };
-        if (opts.json) out(JSON.stringify({ dryRun: true, version: opts.version, counts, decisions }));
+        let writes: Array<{ cell: string; written: boolean; reason?: string }> = [];
+        let e2Failure: string | undefined;
+        if (opts.apply) {
+          const passed = new Set<string>();
+          if (currentMainClean) {
+            const evidenceRun = deps.greenSweepEvidenceRun ?? ((args: string[]) => {
+              const result = spawnSync('bun', ['test', ...args], { cwd: process.cwd(), encoding: 'utf8', timeout: 120_000 });
+              return { status: result.status, stdout: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+            });
+            const item = snapshot.items.find((entry) => entry.id === opts.cell);
+            const args = item ? greenSweepEvidenceTestArgs(item.title) : null;
+            const greenDecision = decisions.some((decision) => decision.cell === opts.cell && decision.verdict === 'green');
+            if (args && greenDecision) {
+              const result = evidenceRun(args);
+              if (result.status === 0) passed.add(opts.cell!);
+              else e2Failure = `E2 failed · ${opts.cell} · rc=${result.status ?? 'signal'} · ${result.stdout.slice(-4000)}`;
+            }
+          }
+          writes = applyGreenSweepDecisions(opts.version, decisions, snapshot.items, passed,
+            deps.greenSweepWrite ?? setItemIfSnapshot);
+        }
+        if (opts.json) out(JSON.stringify({ dryRun: !opts.apply, version: opts.version, counts, decisions, writes,
+          e2: opts.apply ? (e2Failure ? 'failed' : currentMainClean ? 'main-clean' : 'main-head-or-tree-mismatch') : 'not-run',
+          ...(e2Failure ? { e2Failure } : {}) }));
         else {
-          out(`dry-run · ${opts.version} · 후보 ${counts.candidate} · green ${counts.green} · 기록만 ${counts.recordOnly} · 건너뜀 ${counts.skipped}`);
+          out(`${opts.apply ? 'apply' : 'dry-run'} · ${opts.version} · 후보 ${counts.candidate} · green ${counts.green} · 기록만 ${counts.recordOnly} · 건너뜀 ${counts.skipped}`);
+          if (e2Failure) out(e2Failure);
+          if (opts.apply) for (const write of writes) out(`${write.written ? 'wrote green' : 'no write'}\t${write.cell}\t${write.reason ?? 'snapshot-guarded'}`);
           for (const d of decisions) out(`${d.verdict}\t${d.cell}\t#${d.pr}\t${d.mergeSha ?? '-'}\t${d.reason}\t${d.evidence}\tbefore=${JSON.stringify(d.existingEvidence)}\tafter=${JSON.stringify(d.plannedEvidence)}\tholdDiagnostic=${d.holdDiagnostic ?? ''}`);
         }
       } catch (error) { out(`green-sweep 조회 실패: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
@@ -1782,6 +1970,116 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     });
 
   registerTaskListCommand(tasks, ctx);
+
+  const mapCommand = tasks.command('map')
+    .description('MAPREDUCE-FANOUT — 현재 재고를 map-run 원장에 기록하고 결과를 읽기 전용으로 집계한다')
+    .option('--recipe <name>', 'green-close 또는 draft-close')
+    .option('--from <source>', 'landed-but-yellow 또는 drafts')
+    .option('--limit <n>', '선택할 최대 항목 수')
+    .option('--ids <csv>', '현재 재고에서 지정 ID만 선택 (최대 10; 재고 밖 ID는 HOLD 행)')
+    .option('--concurrency <n>', '동시 카드 처리 상한 (기본 2)')
+    .option('--dry-run', '기본값: 카드 발사·PR·체크리스트 쓰기 없음')
+    .option('--reduce <map-run>', '기존 map-run의 결과 행 표를 읽기 전용으로 출력')
+    .option('--live', '호스트 graph-run으로 레시피 실행 · 결과 원장만 기록 (C2: 최대 10건/동시 2)')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { recipe?: string; from?: string; limit?: string; ids?: string; concurrency?: string; dryRun?: boolean;
+      reduce?: string; live?: boolean; json?: boolean }) => {
+      try {
+        const root = deps.mapRoot ?? effectiveInstanceRoot();
+        if (opts.reduce) {
+          if (opts.recipe || opts.from || opts.limit || opts.ids || opts.concurrency || opts.live || opts.dryRun) throw new Error('reduce-options-conflict');
+          const table = renderMapReduceTable(opts.reduce, root);
+          out(opts.json ? JSON.stringify(table) : table.markdown);
+          return;
+        }
+        if (!opts.recipe || !opts.from) throw new Error('recipe-and-from-required');
+        if (opts.live && opts.dryRun) throw new Error('live-dry-run-conflict');
+        if (opts.recipe !== 'green-close' && opts.recipe !== 'draft-close') throw new Error('recipe-invalid');
+        if (opts.from !== 'landed-but-yellow' && opts.from !== 'drafts') throw new Error('source-invalid');
+        const requestedIds = opts.ids === undefined ? undefined : opts.ids.split(',').map((id) => id.trim());
+        if (requestedIds && (requestedIds.length < 1 || requestedIds.length > 10
+          || requestedIds.some((id) => !/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(id))
+          || new Set(requestedIds).size !== requestedIds.length)) throw new Error('map-ids-invalid-or-duplicate: max 10');
+        const limit = opts.limit === undefined ? (opts.live || requestedIds ? 10 : 100) : Number(opts.limit);
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit-out-of-range: 1..1000');
+        if (requestedIds && requestedIds.length > limit) throw new Error('map-ids-exceed-limit');
+        const concurrency = opts.concurrency === undefined ? 2 : Number(opts.concurrency);
+        if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 32) throw new Error('concurrency-out-of-range: 1..32');
+        if (opts.live && (limit > 10 || concurrency > 2)) throw new Error('host-map-c2-cap: limit<=10 concurrency<=2');
+        const mapRunId = `map-${randomUUID()}`;
+        const recipe = opts.recipe as MapRecipe;
+        const source = opts.from as 'landed-but-yellow' | 'drafts';
+        const hostLaunch = createMapHostLauncher({ recipeRoot: join(process.cwd(), 'graphs', 'work'),
+          ...(deps.mapGraphRun ? { run: deps.mapGraphRun } : {}) });
+        let attempted = 0;
+        const ports: MapPorts<MapCliItem> = {
+          inventory: async (r, s, selectedLimit) => selectMapIds(deps.mapInventorySource
+            ? await deps.mapInventorySource(r, s, requestedIds ? undefined : selectedLimit, mapRunId)
+            : await currentMapInventory(r, s, selectedLimit, root, mapRunId,
+              deps.taskStatePath ?? taskStatePathDefault(), requestedIds), requestedIds),
+          buildCard: (item, context) => ({ id: `map-card-${createHash('sha256').update(`${context.mapRunId}:${item.id}`).digest('hex').slice(0, 24)}`, itemId: item.id,
+            mapRunId: context.mapRunId, recipe: context.recipe, text: item.text?.trim() || `verify ${item.id}` }),
+          launchCard: async (card, item, context) => {
+            attempted++;
+            if (item.inventoryMissing) return { event: 'row', mapRunId: card.mapRunId, itemId: card.itemId,
+              recipe: card.recipe, kind: 'hold', verdict: 'hold', reason: 'requested-id-not-in-eligible-inventory', evidence: [] };
+            if (!item.graphInput) return { event: 'row', mapRunId: card.mapRunId, itemId: card.itemId,
+              recipe: card.recipe, kind: 'hold', verdict: 'hold', reason: 'recipe-input-missing', evidence: [] };
+            return hostLaunch(card, item as HostMapItem, context);
+          },
+          previewCard: (card, item): MapRunRow => ({ event: 'row', mapRunId: card.mapRunId, itemId: card.itemId,
+            recipe: card.recipe, kind: 'hold', verdict: 'hold',
+            reason: item.inventoryMissing ? 'requested-id-not-in-eligible-inventory' : 'dry-run-no-recipe-execution', evidence: [] }),
+        };
+        const result = await mapInventory({ recipe, source, limit, concurrency, dryRun: !opts.live, root, mapRunId }, ports);
+        const table = renderMapReduceTable(result.mapRunId, root);
+        if (opts.json) out(JSON.stringify({ ...result, ...table, status: opts.live ? 'host-graph-run' : 'preview-only',
+          attempted, launched: opts.live ? undefined : 0, transport: opts.live ? 'host-graph-run' : null, externalWrites: 0 }));
+        else out(table.markdown);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        out(opts.json ? JSON.stringify({ status: 'HOLD', reason, launched: 0, writes: 0 }) : `HOLD\t${reason}\t발사 0 · 쓰기 0`);
+        process.exitCode = 1;
+      }
+    });
+
+  mapCommand.command('dry-run')
+    .requiredOption('--inventory <path>', '세 항목 inventory JSON 파일')
+    .option('--json', '계획 또는 HOLD를 JSON으로 출력')
+    .action((opts: { inventory: string; json?: boolean }) => {
+      const json = opts.json || mapCommand.opts<{ json?: boolean }>().json;
+      try {
+        const parsed: unknown = JSON.parse(readFileSync(opts.inventory, 'utf8'));
+        const entries = Array.isArray(parsed) ? parsed
+          : parsed && typeof parsed === 'object' && Array.isArray((parsed as { items?: unknown }).items)
+            ? (parsed as { items: unknown[] }).items : [];
+        const validEntries = entries.length === 3 && entries.every((entry) => entry && typeof entry === 'object'
+          && !Array.isArray(entry) && typeof (entry as { id?: unknown }).id === 'string'
+          && (entry as { id: string }).id.trim().length > 0);
+        const ids = validEntries ? entries.map((entry) => (entry as { id: string }).id.trim()) : [];
+        const unique = new Set(ids).size === ids.length;
+        if (!validEntries || !unique) {
+          const result = { mode: 'dry-run', status: 'HOLD', reason: !validEntries ? 'incomplete-inventory' : 'duplicate-id', rows: [] };
+          out(json ? JSON.stringify(result) : `HOLD\t${result.reason}\t발사 0`);
+          process.exitCode = 1;
+          return;
+        }
+        const rows = entries.map((entry, index) => ({
+          id: ids[index]!, orchestrationId: orchestrationId(), action: 'planned', source: entry,
+        }));
+        const result = { mode: 'dry-run', status: 'planned', rows, effects: { launched: false, pullRequestWrites: false,
+          checklistWrites: false, autoMerge: false } };
+        if (json) out(JSON.stringify(result));
+        else {
+          out(`dry-run\tplanned\t${rows.length} 계획 행 · PR/체크리스트 쓰기 0 · 자동 병합 0`);
+          for (const row of rows) out(`${row.id}\t${row.orchestrationId}\tplanned`);
+        }
+      } catch (error) {
+        const result = { mode: 'dry-run', status: 'HOLD', reason: 'inventory-unreadable', rows: [] };
+        out(json ? JSON.stringify(result) : `HOLD\tinventory-unreadable\t발사 0`);
+        process.exitCode = 1;
+      }
+    });
 
   tasks.command('hand [text]')
     .description('TASK-AGENT 에 과제 한 줄을 넘긴다 — 카드를 적고 첫 수(harness say --substrate pod --merge-by-host)를 고른다 · 기본 shadow(발사 0) · `--mission` 이면 조각 카드 ⊕ 선후로 쪼개 선행 없는 조각만 넘긴다')

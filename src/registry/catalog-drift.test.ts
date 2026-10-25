@@ -105,11 +105,9 @@ describe('catalog drift — 파생 핀이 catalog SSoT 와 정합(2026-07-15)', 
       kimi: ['kimi-k3'],
       qwen: ['qwen3.8-27b', 'qwen3.8-flash', 'qwen3.8-max'],
       glm: ['glm-5.3', 'glm-5.3-flash'],
-      // 📏 2026-10-11 (BEDROCK-PROVIDER #25966): Bedrock 와이어 id(`anthropic.` 접두)는 카탈로그 레코드가 없다 —
-      //   가격·창은 1st-party `claude-*-5-5` 레코드와 «같은 모델»이지만 Bedrock 단가는 파트너 책정이라 비용 표는 범위 밖.
-      //   사다리 status 는 `wip`(실호출 전). 레코드를 더하면 이 줄을 지운다.
-      // 📏 10-11 BEDROCK-RUNTIME-PATH: 사다리 id 가 전역 추론 프로필(`global.anthropic.…`)로 옮겨 갔다 — 레코드 없음은 같다.
-      bedrock: ['global.anthropic.claude-haiku-5-5', 'global.anthropic.claude-opus-5-5', 'global.anthropic.claude-sonnet-5-5'],
+      // BEDROCK-MODELS-ALL: 명시 사다리는 등록된 비-Anthropic mantle-openai id를 고른다.
+      //   Bedrock 가격·창의 정적 catalog 레코드는 아직 없으므로 이 구멍을 이름으로 드러낸다.
+      bedrock: ['deepseek.v3.2', 'openai.gpt-6-luna', 'openai.gpt-6-sol', 'zai.glm-4.7-flash', 'zai.glm-5'],
       // OpenGateway provider descriptor is present, but the DeepSeek model has no static catalog facts yet.
       // Keep the explicit gap visible until its model record is grounded independently.
       opengateway: ['opengateway/deepseek/deepseek-v4.1-flash-ultrafast'],

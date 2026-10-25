@@ -75,6 +75,23 @@ describe('PtyShellStart sshHost', () => {
     expect(captured[0]!.args).toEqual(['-c', 'echo hi']);
   });
 
+  test('skills runner shared start path rejects a nested TUI launch before spawn', async () => {
+    const previousParent = process.env.ELANOUS_PARENT_PTY_ID;
+    const previousDepth = process.env.ELANOUS_NEST_DEPTH;
+    process.env.ELANOUS_PARENT_PTY_ID = 'pty-skill-parent';
+    process.env.ELANOUS_NEST_DEPTH = '1';
+    try {
+      const r = await dispatchPtyShellStart({ cmd: 'eln', args: ['chat'], yield_time_ms: 1 });
+      expect(r.output).toContain('[TUI 자기중첩 거부]');
+      expect(captured).toHaveLength(0);
+    } finally {
+      if (previousParent === undefined) delete process.env.ELANOUS_PARENT_PTY_ID;
+      else process.env.ELANOUS_PARENT_PTY_ID = previousParent;
+      if (previousDepth === undefined) delete process.env.ELANOUS_NEST_DEPTH;
+      else process.env.ELANOUS_NEST_DEPTH = previousDepth;
+    }
+  });
+
   test('known sshHost starts ssh -t <resolved-target> only', async () => {
     withHosts([{ name: 'node-b', host: 'node-b' }]);
     await dispatchPtyShellStart({ cmd: 'sh', sshHost: 'node-b', yield_time_ms: 1 });

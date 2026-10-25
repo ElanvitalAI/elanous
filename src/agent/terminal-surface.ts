@@ -25,6 +25,7 @@ import type { LLMOpts, LLMToolSpec } from '../llm.js';
 import type { FileSink } from '../channel/file-sink.js';
 import { PTY_SHELL_TOOL_NAMES } from '../boot/daemon-tools/pty-shell.js';
 import { killNonDetached as killNonDetachedPty } from '../pty-shell/registry.js';
+import { getCurrentPtyId } from './pty-identity.js';
 
 /** ① Conditional tool-budget grant for driving a headless terminal /
  *  coding agent. Keeps the tight per-family cap for ordinary turns
@@ -182,5 +183,221 @@ export function buildTerminalCapableTurn(base: TerminalCapableBase): TerminalCap
     systemPromptParts: [...base.systemPromptParts, TERMINAL_MISSION_DISCIPLINE],
     llmOpts, // ①
     [TERMINAL_CAPABLE_TURN_BRAND]: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// ⑤ TUI self-nest guard (TUI-NO-SELF-NEST · #27)
+//
+// A TUI turn already runs INSIDE a PTY owned by the outer TUI (the seat
+// shell). Spawning `eln` / `elanous` again from there nests a second TUI in
+// the same terminal: the two alt-screens and input loops overwrite each other
+// and the operator loses the seat ("screens fighting"). The guard refuses
+// exactly that one command shape and answers with guidance; every other
+// command (bash, `eln pty list`, `eln msg post`, …) keeps its current
+// behaviour, and the existing harness-write-boundary ledger path is
+// untouched — the reject is returned in the same `{ output }` envelope the
+// PtyShell dispatch already uses (precedent: skills/tools/pty.ts
+// dispatchPtyShellSend's reject-with-guidance).
+// ---------------------------------------------------------------------------
+
+/** Stable marker the reject message starts with — tests and the operator
+ *  read this; changing it is a behaviour change, not a wording tweak. */
+export const TUI_SELF_NEST_REJECT_MARKER = '[TUI 자기중첩 거부]';
+
+/** Binaries that ARE the elanous TUI (or its launcher). */
+const ELANOUS_TUI_BINARIES = new Set(['eln', 'elanous']);
+
+/** Subcommands that open an interactive TUI surface. A bare invocation
+ *  (`eln`) is the default TUI. Anything else keeps running as-is. */
+const ELANOUS_TUI_SUBCOMMANDS = new Set(['', 'tui', 'chat', 'dashboard', 'nexus']);
+
+/** Interpreter wrappers that can launch the TUI entry file. */
+const ELANOUS_LAUNCHER_BINARIES = new Set(['bun', 'node', 'bunx']);
+
+const ELANOUS_ENTRY_FILES = new Set(['elanous', 'elanous.mjs', 'elanous.cjs']);
+
+/** Global flags that consume the NEXT token as their value — without this
+ *  list `eln --config-dir /tmp/x dashboard` would read `/tmp/x` as the
+ *  subcommand. */
+const VALUE_TAKING_FLAGS = new Set([
+  '--config-dir',
+  '--state-dir',
+  '--cwd',
+  '--role-llm',
+  '--child-llm-provider',
+  '--child-llm-model',
+  '--model',
+  '--provider',
+  '--seat',
+  '--name',
+  '--session',
+  '--since',
+  '--grep',
+]);
+
+/** Flags that only ask for information (version / help). A call carrying one
+ *  of these never opens an interactive surface, so it is NOT a TUI launch:
+ *  refusing `eln --version` or `eln chat --help` inside a TUI would break a
+ *  non-interactive command — a false positive is an accident, not a guard. */
+const INFORMATIONAL_FLAGS = new Set(['--help', '-h', '--version', '-V']);
+
+function basenameOf(token: string): string {
+  const parts = token.split(/[\\/]/);
+  return (parts[parts.length - 1] ?? '').toLowerCase();
+}
+
+export type TuiCommandKind = 'elanous-tui-launch' | 'other';
+
+export interface TuiLaunchLook {
+  kind: TuiCommandKind;
+  /** Subcommand that opened the TUI ('' for a bare `eln`). */
+  subcommand: string | null;
+}
+
+/** Pure classifier: is this argv an elanous/eln TUI launch?
+ *
+ *  Accepts the direct form (`eln`, `/usr/local/bin/eln chat`) and the
+ *  interpreter form (`bun bin/elanous.mjs dashboard`). Leading flags are
+ *  skipped, but a flag's VALUE is never mistaken for the subcommand — an
+ *  unknown shape simply classifies as `other` (a false negative is safe;
+ *  a false positive would break unrelated commands). A call carrying an
+ *  informational flag (`--version` / `--help` / `-h` / `-V`) is `other` too,
+ *  whether the flag sits alone (`eln --version`) or after a TUI subcommand
+ *  (`eln chat --help`): it prints and exits, it never opens the surface. */
+export function classifyTuiLaunch(argv: readonly string[]): TuiLaunchLook {
+  if (argv.length === 0) return { kind: 'other', subcommand: null };
+  const head = basenameOf(argv[0] ?? '');
+
+  let rest: string[];
+  if (ELANOUS_TUI_BINARIES.has(head)) {
+    rest = argv.slice(1);
+  } else if (ELANOUS_LAUNCHER_BINARIES.has(head)) {
+    const entryIdx = argv.findIndex((tok, i) => i > 0 && ELANOUS_ENTRY_FILES.has(basenameOf(tok)));
+    if (entryIdx === -1) return { kind: 'other', subcommand: null };
+    rest = argv.slice(entryIdx + 1);
+  } else {
+    return { kind: 'other', subcommand: null };
+  }
+
+  const sub = firstPositional(rest);
+  if (!ELANOUS_TUI_SUBCOMMANDS.has(sub)) return { kind: 'other', subcommand: sub };
+  // 정보성 플래그가 붙은 호출(`eln --version`·`eln --help`·`eln chat --help`)은
+  // 기동이 아니라 출력 요청이다 — 대화형 표면을 열지 않으므로 `other` 로 보낸다.
+  if (asksForInformation(rest)) return { kind: 'other', subcommand: sub === '' ? null : sub };
+  return { kind: 'elanous-tui-launch', subcommand: sub };
+}
+
+/** True when the tokens ask for version/help output. The value of a
+ *  value-taking flag is skipped so `--grep --help` stays a value. */
+function asksForInformation(tokens: readonly string[]): boolean {
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i] ?? '';
+    if (VALUE_TAKING_FLAGS.has(token)) {
+      i += 1;
+      continue;
+    }
+    if (INFORMATIONAL_FLAGS.has(token)) return true;
+  }
+  return false;
+}
+
+/** First non-flag token, skipping the value of a value-taking flag. */
+function firstPositional(tokens: readonly string[]): string {
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i] ?? '';
+    if (token.startsWith('-')) {
+      if (VALUE_TAKING_FLAGS.has(token)) i += 1;
+      continue;
+    }
+    return token;
+  }
+  return '';
+}
+
+export interface TuiNestEnv {
+  parentPtyId: string | null;
+  nestDepth: number;
+}
+
+/** Read "am I already a TUI PTY child?" material from the same sources
+ *  src/pty-shell/registry.ts uses for a child's identity:
+ *  `ELANOUS_PARENT_PTY_ID` ?? `getCurrentPtyId()`, and `ELANOUS_NEST_DEPTH`. */
+export function readTuiNestEnv(env: NodeJS.ProcessEnv = process.env): TuiNestEnv {
+  let parentPtyId = env.ELANOUS_PARENT_PTY_ID?.trim() || null;
+  if (!parentPtyId) {
+    try {
+      parentPtyId = getCurrentPtyId() ?? null;
+    } catch {
+      parentPtyId = null;
+    }
+  }
+  const rawDepth = env.ELANOUS_NEST_DEPTH?.trim();
+  const parsedDepth = rawDepth === undefined || rawDepth === '' ? 0 : Number.parseInt(rawDepth, 10);
+  const nestDepth = Number.isFinite(parsedDepth) && parsedDepth > 0 ? parsedDepth : 0;
+  return { parentPtyId, nestDepth };
+}
+
+export type TuiSelfNestReason = 'already-inside-tui';
+
+export interface TuiSelfNestDecision {
+  reject: boolean;
+  reason: TuiSelfNestReason | null;
+  command: TuiCommandKind;
+  subcommand: string | null;
+  parentPtyId: string | null;
+  nestDepth: number;
+  /** Reject + guidance text; null when the command is allowed through. */
+  output: string | null;
+}
+
+function buildTuiSelfNestGuidance(input: {
+  argv: readonly string[];
+  parentPtyId: string | null;
+  nestDepth: number;
+}): string {
+  const shown = input.argv.join(' ');
+  const identity = [
+    input.parentPtyId ? `parent pty ${input.parentPtyId}` : 'parent pty 없음',
+    `nest depth ${input.nestDepth}`,
+  ].join(' · ');
+  return [
+    `${TUI_SELF_NEST_REJECT_MARKER} 이미 TUI PTY 안입니다 (${identity}).`,
+    `여기서 '${shown}' 를 다시 띄우면 두 TUI 화면·입력 루프가 서로를 덮어써 조작이 불가능해집니다.`,
+    '- 이미 열린 TUI 세션에서 계속하세요: elanous pty list → elanous pty snapshot <id> / elanous pty send <id> ...',
+    '- 새 TUI 가 정말 필요하면 이 PTY 밖(운영 터미널)에서 기동하세요.',
+    '- 도구 세션에서 셸이 필요하면 TUI 가 아니라 일반 셸을 여세요: PtyShellStart { cmd: "bash" }.',
+  ].join('\n');
+}
+
+/** Pure decision function: reject `eln`/`elanous` TUI launches when this
+ *  process already lives inside a TUI PTY (parent pty id or nest depth ≥ 1).
+ *  Everything else is allowed through with `reject: false`. */
+export function decideTuiSelfNest(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): TuiSelfNestDecision {
+  const look = classifyTuiLaunch(argv);
+  const nest = readTuiNestEnv(env);
+  const insideTui = Boolean(nest.parentPtyId) || nest.nestDepth >= 1;
+  if (look.kind !== 'elanous-tui-launch' || !insideTui) {
+    return {
+      reject: false,
+      reason: null,
+      command: look.kind,
+      subcommand: look.subcommand,
+      parentPtyId: nest.parentPtyId,
+      nestDepth: nest.nestDepth,
+      output: null,
+    };
+  }
+  return {
+    reject: true,
+    reason: 'already-inside-tui',
+    command: look.kind,
+    subcommand: look.subcommand,
+    parentPtyId: nest.parentPtyId,
+    nestDepth: nest.nestDepth,
+    output: buildTuiSelfNestGuidance({ argv, parentPtyId: nest.parentPtyId, nestDepth: nest.nestDepth }),
   };
 }

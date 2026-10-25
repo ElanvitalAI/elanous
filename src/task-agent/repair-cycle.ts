@@ -11,6 +11,8 @@ import { recordJourneyEdge } from '../self-dev/graph-journey-route.js';
 import { checklistHistory, listChecklist, parseOwner } from '../release-loop/checklist.js';
 import { applyRepairBundle, type RepairCasOutcome, type RepairCasRequest } from './repair-branch-cas.js';
 import { pairMoveId, repairNextMove } from './repair-next-move.js';
+import type { SupervisorGoalDeficit } from '../self-implement/goal-supervisor-fill.js';
+import { loadRunLedger, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { parseRepairWorkerResult } from './repair-worker.js';
 import { TASK_SEATS, readTaskCard, updateTaskCard, type TaskCard, type TaskChildLlm, type TaskSeat } from './task-hand.js';
 
@@ -30,6 +32,9 @@ export interface RepairLaunchRequest {
 export interface RepairCycleInput {
   card: TaskCard; statePath: string; repo: string; pr: number; head: string; branch: string;
   mustFix: readonly string[]; liveMoves: ReadonlySet<string>; now: Date;
+  supervisorDeficit?: SupervisorGoalDeficit;
+  supervisorResult?: import('../self-implement/goal-supervisor-fill.js').SupervisorGoalFillResult;
+  readRunLedger?: (runId: string) => RunLedgerEntry[] | null;
   readFile?: (path: string) => string;
   request?: (input: RepairLaunchRequest) => Promise<void>;
   apply?: (input: RepairCasRequest) => RepairCasOutcome;
@@ -297,10 +302,46 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
   if (latest?.status === 'applied' && latest.head.toLowerCase() === head.toLowerCase())
     return { decision: 'repair-pending', reason: `repair pushed; await PR head ${latest.commit?.slice(0, 12) ?? '?'}` };
   const failedAttempts = attempts.filter((entry) => entry.status === 'failed');
+  let supervisorDeficit = input.supervisorDeficit;
+  let supervisorResult = input.supervisorResult;
+  if (!supervisorDeficit && card.runId) {
+    try {
+      const rows = (input.readRunLedger ?? loadRunLedger)(card.runId);
+      const recent = rows?.slice().reverse();
+      const latest = recent?.find((row) => row.event === 'goal-slot-fill' || row.event === 'supervisor-report-deficit');
+      const lastFill = recent?.find((row) => row.event === 'goal-slot-fill');
+      const lastDeficit = recent?.find((row) => row.event === 'supervisor-report-deficit');
+      const terminalClassification = lastDeficit?.data.classification;
+      const terminalReport = latest === lastDeficit && terminalClassification !== null && typeof terminalClassification === 'object'
+        && (terminalClassification as { classification?: unknown }).classification === 'report-deficit';
+      if (lastDeficit && (terminalReport || lastFill && latest === lastFill
+        && lastFill.data.result !== 'filled' && lastFill.data.result !== 'already-filled'
+        && lastFill.data.round === lastDeficit.data.round)
+        && lastDeficit.runId === card.runId && (terminalReport || lastFill?.runId === card.runId)
+        && typeof lastDeficit.data.evidenceId === 'string' && typeof lastDeficit.data.previousEvidence === 'string'
+        && typeof lastDeficit.data.round === 'number'
+        && (lastDeficit.data.kind === 'unmeasured' || lastDeficit.data.kind === 'unwired')) {
+        supervisorResult = terminalReport ? 'unverifiable' : lastFill?.data.result === 'rejected' ? 'rejected' : 'unverifiable';
+        supervisorDeficit = { evidenceId: lastDeficit.data.evidenceId, previousEvidence: lastDeficit.data.previousEvidence,
+          round: lastDeficit.data.round, kind: lastDeficit.data.kind,
+          ...(typeof lastDeficit.data.gateLog === 'string' ? { gateLog: lastDeficit.data.gateLog } : {}) };
+      }
+    } catch { /* unreadable ledger is not evidence of an unwired goal */ }
+  }
   const judged = repairNextMove({ pr, head, branch, mustFix: input.mustFix,
+    ...(supervisorDeficit ? { supervisorDeficit } : {}),
+    ...(supervisorResult ? { supervisorResult } : {}),
     priorNarrowAttempts: failedAttempts.filter((entry) => entry.move === 'narrow-relaunch' || entry.move === 'salvage-relaunch').length,
     priorAlternativeAttempts: failedAttempts.filter((entry) => entry.move === 'alternative').length },
     input.mintMoveId ? { mintMoveId: input.mintMoveId } : {});
+  if (judged.kind === 'grounding') {
+    const reason = `${judged.action} · evidence ${judged.supervisorDeficit.evidenceId}`;
+    updateTaskCard(statePath, card.id, (current) => current && !current.history?.some((entry) =>
+      entry.event === 'repair-grounding' && entry.runId === card.runId && entry.detail === reason)
+      ? { ...current, history: [...(current.history ?? []), { at: now.toISOString(), event: 'repair-grounding',
+        runId: card.runId, pr, head, detail: reason }] } : undefined);
+    return { decision: 'would-repair', reason };
+  }
   if (judged.kind === 'stop') {
     if (failedAttempts.length >= 2) {
       const detail = `수리 수렴 실패: PR #${pr} head ${head.slice(0, 12)} · 실패 ${failedAttempts.length}회 · ${judged.reason}`;

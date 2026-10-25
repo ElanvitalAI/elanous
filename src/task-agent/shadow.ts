@@ -5,7 +5,8 @@
  * - 기본 판단은 슈퍼바이저 결과에 이미 실린 종료 어휘·PR 번호·병합 여부를 쓴다.
  *   카드가 묶인 코드 PR의 target diff는 저장소가 고정된 gh 조회로 별도 측정한다. 리뷰 판정·must-fix 는 결과에 없으므로 비운다
  *   («통과»로 읽지 않는다 — 판단부가 review 수를 고른다).
- * - 슈퍼바이저의 기본 호출은 shadow: «했을 수»만 기록하고 명령·복사는 하나도 돌리지 않는다.
+ * - 슈퍼바이저의 기본 호출은 shadow: «했을 수»와 green would-green 판정만 기록한다. green 판정은
+ *   checklist·카드·git·gh·traffic을 읽을 수 있으나 checklist 쓰기·파일 복사는 하지 않는다.
  *   전달 과제의 명시적 live 호출만 파일을 복사한다. 설정 `taskAgent.mode=live` 는 기본 호출에 먹지 않는다.
  * - 관측: `debug.log('task-agent', 'shadow-move', …)` → `elanous logs --category task-agent`.
  */
@@ -13,12 +14,16 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { homedir } from 'node:os';
 import { extname, join, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
 import { readJourneyEdge, recordJourneyEdge } from '../self-dev/graph-journey-route.js';
 import { mintMoveId } from './repair-next-move.js';
-import { readTaskAgentState, readTaskCard, taskAgentStatePath, TASK_CARD_PREFIX, type CompletionKind, type TaskCard } from './task-hand.js';
+import { readTaskAgentState, readTaskCard, taskAgentStatePath, TASK_CARD_PREFIX, defaultHandOf, type CompletionKind, type TaskCard } from './task-hand.js';
+import { checkCompletionEvidence, type CompletionEvidenceDeps } from './completion-evidence.js';
+import { openSchedulesDb } from '../domains/schedule-registry.js';
+import { DecisionLedger } from '../decisions/decision-ledger.js';
 import type { SupervisorJobResult, SupervisorStopReason } from '../self-dev/run-supervisor.js';
 import { executeNextAction, type ActionDeps, type DeliveryKind, type NextAction } from './actions.js';
 import { judgeNextMove, LIVE_RETRY_MOVES, type TaskJudgeInput, type TaskJudgement } from './judge.js';
@@ -28,9 +33,12 @@ import { collectWiringEvidence, readCardRunSnapshot, type WiringEvidenceDeps, ty
 import { remoteLedgerMirrorDir } from './parent-host.js';
 import { prodInstanceRoot } from '../instance/resolve.js';
 import { liveMoveHistoryEntry, recordLiveMoveHistory } from './live-move-history.js';
-import { updateTaskCard } from './task-hand.js';
+import { idempotentCreateCardForRun, updateTaskCard } from './task-hand.js';
 import { capturedSelfReview, captureReviewResults, hasCapturedPass } from './review-result-capture.js';
 import { configuredTaskAgentLiveMoves, defaultPrHead, executeLiveDecisionCard, executeLiveGreenProposal, executeLiveLand, executeLiveReview, type LiveMoveDeps, type LiveMoveResult, type TaskAgentLiveMove } from './live-moves.js';
+import { checklistDevVersion, listChecklist, type Checklist } from '../release-loop/checklist.js';
+import { ambiguousGreenSweepPrs, type GreenSweepPr } from './green-sweep.js';
+import type { GreenSweepProbe } from './actions.js';
 
 export interface TaskAgentShadowInput {
   runId: string | null;
@@ -81,12 +89,23 @@ export interface TaskAgentShadowDeps {
   wiring?: Omit<WiringEvidenceDeps, 'card'>;
   /** Complete PR target paths; undefined means unmeasured, never goal-only. */
   prFiles?: (pr: number, prUrl: string | undefined) => Promise<readonly string[] | undefined>;
+  /** GREEN-FROM-LEDGER-FU — 명시적 live green 실행에 필요한 판정 문맥. 기본 shadow 호출은 쓰지 않는다. */
+  greenSweep?: NonNullable<ActionDeps['greenSweep']>;
+  /** Checklist mutation is a separate OP-authorized capability; default false. */
+  greenWriteLive?: boolean;
+  /** Test seam for the production read-only probe builder; production callers use its defaults. */
+  greenSweepRuntime?: ProductionGreenSweepDeps;
   /** Process env for the launched-run id (`ELANOUS_RUN_ID`) — test seam; default process.env. */
   env?: NodeJS.ProcessEnv;
   /** Remote pending-move ledger seam; defaults to the run ledger. */
   queueMove?: typeof appendRunLedgerEntry;
   /** 시험 seam — 일반 재발사 결정의 수 id 발급기(기본 `mintMoveId` · #30226 과 같은 것). live 재발사로 갈 때 결정 순간 한 번만 불린다. */
   mintMoveId?: () => string;
+  /**
+   * DEFAULT-HANDS — «확인 증거» 저장소 의존(시험 주입). 없으면 그때 생산 저장소(스케줄 DB · 결정 원장)를 연다.
+   * 조사·산출물·콘텐츠는 «전달» 경로가 증거를 만들고, 여기 저장소 의존은 실행·감시·결정 지원에만 쓰인다.
+   */
+  evidence?: CompletionEvidenceDeps;
 }
 
 const execFileAsync = promisify(execFile);
@@ -105,6 +124,80 @@ export async function defaultPrFiles(pr: number, prUrl: string | undefined,
   if (!repository) throw new Error('bound PR repository unavailable');
   const stdout = await run(['pr', 'diff', String(pr), '--name-only', '-R', repository]);
   return stdout.split(/\r?\n/).filter(Boolean);
+}
+
+export interface ProductionGreenSweepDeps {
+  readChecklist?: (version: string) => Checklist;
+  readCards?: (statePath: string) => readonly TaskCard[];
+  run?: (command: string, args: string[], cwd: string) => Promise<{ stdout: string }>;
+  trafficPath?: string;
+}
+
+/** Read-only production context for the green shadow. Any unreadable source remains unknown. */
+export function productionGreenSweep(checklistId: string, card: TaskCard | undefined, statePath: string, cwd: string,
+  deps: ProductionGreenSweepDeps = {}) {
+  const version = card?.checklistVersion ?? checklistDevVersion();
+  const readChecklist = deps.readChecklist ?? listChecklist;
+  const snapshot = readChecklist(version);
+  const item = snapshot.items.find((entry) => entry.id === checklistId);
+  if (!item) return undefined;
+  const cards = deps.readCards?.(statePath)
+    ?? Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {});
+  const ambiguous = ambiguousGreenSweepPrs(snapshot.items, version, cards);
+  const prCache = new Map<number, GreenSweepPr | null>();
+  const run = deps.run ?? (async (command, args, workingDirectory) => execFileAsync(command, args,
+    { cwd: workingDirectory, encoding: 'utf8', timeout: 20_000, maxBuffer: 4 * 1024 * 1024 }));
+  // This context is created once per shadow-move evaluation; these caches are turn-scoped.
+  let repoPromise: Promise<string | undefined> | undefined;
+  const repository = () => repoPromise ??= run('git', ['remote', 'get-url', 'origin'], cwd).then(({ stdout }) =>
+    /github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?$/i.exec(stdout.trim())?.[1]?.toLowerCase()).catch(() => undefined);
+  let mainPromise: Promise<boolean> | undefined;
+  const mainFresh = () => mainPromise ??= Promise.all([
+    run('git', ['rev-parse', 'origin/main'], cwd).then(({ stdout }) => stdout.trim()),
+    run('git', ['ls-remote', 'origin', 'refs/heads/main'], cwd).then(({ stdout }) => stdout.trim().split(/\s+/)[0] ?? ''),
+  ]).then(([local, remote]) => /^[a-f0-9]{40}$/i.test(local) && local === remote).catch(() => false);
+  const pr = async (number: number): Promise<GreenSweepPr | null> => {
+    if (prCache.has(number)) return prCache.get(number)!;
+    try {
+      const { stdout } = await run('gh', ['pr', 'view', String(number), '--json', 'number,state,mergeCommit,url'], cwd);
+      const value = JSON.parse(stdout) as { number?: number; state?: string; mergeCommit?: { oid?: string }; url?: string };
+      const result = value.number === number && typeof value.state === 'string'
+        ? { number, state: value.state, ...(value.mergeCommit?.oid ? { mergeSha: value.mergeCommit.oid } : {}), ...(value.url ? { url: value.url } : {}) }
+        : null;
+      prCache.set(number, result); return result;
+    } catch { prCache.set(number, null); return null; }
+  };
+  const probe: GreenSweepProbe = {
+    pr,
+    ancestor: async (sha) => {
+      if (!/^[a-f0-9]{40}$/i.test(sha) || !await mainFresh()) return null;
+      try { await run('git', ['merge-base', '--is-ancestor', sha, 'origin/main'], cwd); return true; }
+      catch (error) {
+        const code = (error as { code?: string | number }).code;
+        return code === 1 || code === '1' ? false : null;
+      }
+    },
+    hold: async () => {
+      try {
+        const trafficPath = deps.trafficPath ?? process.env.ELANOUS_TRAFFIC_SIGNAL ?? join(homedir(), 'elanous-hq', 'seat-state', 'OP', 'traffic.json');
+        const value: unknown = JSON.parse(readFileSync(trafficPath, 'utf8'));
+        return value && typeof value === 'object' && !Array.isArray(value) && Array.isArray((value as { hold?: unknown }).hold)
+          && (value as { hold: unknown[] }).hold.every((entry) => typeof entry === 'string')
+          ? (value as { hold: string[] }).hold.includes(checklistId) : null;
+      } catch { return null; }
+    },
+    repositoryMatches: async (number) => {
+      const [originRepo, candidate] = await Promise.all([repository(), pr(number)]);
+      const prRepo = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+(?:\/|$)/i.exec(candidate?.url ?? '')?.[1]?.toLowerCase();
+      return originRepo && prRepo ? originRepo === prRepo : null;
+    },
+    ambiguousAcrossCells: (number) => ambiguous.has(number),
+    cellEvidence: async (cell) => {
+      try { return readChecklist(version).items.find((entry) => entry.id === cell)?.evidence ?? ''; }
+      catch { return undefined; }
+    },
+  };
+  return { probe, item, version, cards };
 }
 
 export const REMOTE_CARD_MOVE_PENDING = 'task-agent-card-move-pending';
@@ -155,6 +248,39 @@ function liveMoveDeps(deps: TaskAgentShadowDeps): LiveMoveDeps {
 const DELIVERY_KINDS: ReadonlySet<CompletionKind> = new Set<CompletionKind>(['research-report', 'artifact', 'content']);
 function isDeliveryKind(kind: CompletionKind | undefined): kind is DeliveryKind {
   return kind !== undefined && DELIVERY_KINDS.has(kind);
+}
+
+/**
+ * DEFAULT-HANDS — 저장소 기록이 곧 «확인 증거»인 종결 종류(§A4c): 실행(실행 기록 ⊕ 되읽기) ·
+ * 감시·브리핑(일정 ⊕ 도착) · 결정 지원(카드 ⊕ 기록). 조사·산출물·콘텐츠는 «전달» 경로가 증거를 만들고,
+ * 전달(deliverable)은 `dispatchDeliverableCompletion` 이 부르는 손이 ref 를 준다.
+ */
+const STORE_EVIDENCE_KINDS: ReadonlySet<CompletionKind> = new Set<CompletionKind>(['ops-action', 'watch-brief', 'decision-support']);
+
+/** 증거 저장소 — 주입이 없으면 그때 생산 저장소를 열고 스케줄 DB 는 닫는다(판정 밖으로 새지 않게). */
+function withEvidenceStores<T>(kind: CompletionKind, deps: TaskAgentShadowDeps, run: (deps: CompletionEvidenceDeps) => T): T {
+  if (deps.evidence) return run(deps.evidence);
+  if (kind === 'watch-brief') {
+    const db = openSchedulesDb();
+    try { return run({ schedulesDb: db }); } finally { db.close(); }
+  }
+  if (kind === 'decision-support') return run({ ledger: new DecisionLedger() });
+  return run({});
+}
+
+/**
+ * DEFAULT-HANDS — code-pr 밖 종결의 «확인 증거»를 생산 경로에서 잰다(규칙 정본 = `completion-evidence.ts`,
+ * 여기서 다시 짓지 않는다). 기록 id = 카드 id — 그 과제가 남긴 실행 기록·일정·결정 카드가 그 id 로 쌓인다.
+ * 대상을 모르면(카드 없음 · 프로젝트 대상 없음 · PR 이 묶인 카드) 재지 않는다 — «통과»로 읽지 않는다.
+ */
+function storeCompletionEvidence(kind: CompletionKind | undefined, card: TaskCard | undefined,
+  deps: TaskAgentShadowDeps): { ok: boolean; ref: string } | undefined {
+  if (kind === undefined || kind === 'code-pr' || !STORE_EVIDENCE_KINDS.has(kind)) return undefined;
+  if (!card || card.pr !== undefined) return undefined;
+  const dir = card.project?.target;
+  if (!dir) return undefined;
+  const verdict = withEvidenceStores(kind, deps, (evidenceDeps) => checkCompletionEvidence(kind, { dir, ref: card.id }, evidenceDeps));
+  return { ok: verdict.ok, ref: verdict.ref };
 }
 
 /**
@@ -285,6 +411,10 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   }
   const kind = card?.completion;
   const judgeInput = shadowJudgeInput(input.stopReason, input.results, kind);
+  // DEFAULT-HANDS — 저장소가 증거인 종결(실행·감시·결정 지원)은 그 기록을 여기서 읽어 판단부 입력에 싣는다.
+  // 이 배선이 없으면 그 종결들은 영영 «확인 증거 대기»에 머문다(사람 손 1 이 필요해진다).
+  const handEvidence = storeCompletionEvidence(kind, card, deps);
+  if (handEvidence) judgeInput.evidence = handEvidence;
   // 슈퍼바이저가 나른 리뷰가 없으면 그 PR 카드에 회수된 리뷰 결과(pass · 실제로 돈 리뷰 · 머리 sha)를 같은 입력 칸으로 쓴다.
   let selfReview = input.selfReview;
   let reviewFromCapture = false;
@@ -332,6 +462,34 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       ? { move: 'wait', stage: 'observing', reason: '전달 후보 확인 — 산출물 판독 대기', executorKind: 'deliver' }
       : { move: 'wait', stage: 'waiting', reason: '전달 후보 없음' }
     : judgeNextMove(judgeInput);
+  // TA-REVIEW-PASS — 카드 없는 runId 의 «리뷰가 필요한 PR» 판정에서만 고유한 런 소유(그 run 이 성공 결과로 연 PR)를 검증해
+  // 단일 잠금/멱등 원시 함수로 runId 를 카드 1건에 결속한다. 성공 결과 taskId·기존 카드 조회·runId 매칭은 위에서 먼저 존중한다.
+  // 원격 Pod 자식 런·카드 조회 실패·원장 읽기 실패·복수 카드는 임의 생성하지 않고 사유를 남겨 보류한다(fail-closed).
+  if (!card && !cardLookupFailed && !remoteChild && !deps.readCard && input.runId
+    && judgement.move === 'review' && typeof judgeInput.pr === 'number'
+    && input.results.some((result) => result.prNumber === judgeInput.pr && result.ok === true && result.worktreePath)) {
+    const prResult = input.results.find((result) => result.prNumber === judgeInput.pr);
+    // 상속 ELANOUS_RUN_ID(Pod 자식 런의 부모)가 있으면 이 runId 는 이 런의 고유 소유가 아니다 — 임의 결속 없이 보류한다.
+    const inheritedRunId = env.ELANOUS_RUN_ID;
+    if (inheritedRunId && inheritedRunId !== input.runId) {
+      try {
+        (deps.log ?? ((c, e, d) => debug.log(c, e, d, { level: 'warn' })))('task-agent', 'card-create-for-run-deferred',
+          { runId: input.runId, pr: judgeInput.pr, reason: `inherited ELANOUS_RUN_ID ${inheritedRunId} — pod child run은 이 runId를 고유 소유하지 않는다` });
+      } catch { /* fail-closed — 보류 사유 기록 실패는 판정을 막지 않는다 */ }
+    } else {
+    const bound = idempotentCreateCardForRun(cardStatePath(deps), {
+      runId: input.runId, text: prResult?.feature ?? successful?.feature ?? input.runId, env,
+      ...(deps.live?.now ? { now: deps.live.now } : {}),
+    });
+    if (bound.ok) card = bound.card;
+    else {
+      try {
+        (deps.log ?? ((c, e, d) => debug.log(c, e, d, { level: 'warn' })))('task-agent', 'card-create-for-run-deferred',
+          { runId: input.runId, pr: judgeInput.pr, reason: bound.reason });
+      } catch { /* fail-closed — 보류 사유 기록 실패는 판정을 막지 않는다 */ }
+    }
+    }
+  }
   if (judgement.reason.startsWith('goal-only-pr —') && input.runId) {
     try {
       (deps.queueMove ?? appendRunLedgerEntry)({ timestamp: new Date().toISOString(), runId: input.runId,
@@ -358,7 +516,7 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       pr: delivery ? 0 : typeof judgeInput.pr === 'number' ? judgeInput.pr : 0,
       runId: input.runId ?? '',
       original: [...new Set(input.results.map((result) => result.feature))].join(' · '),
-      checklistId: delivery ? card?.checklistId ?? '' : '',
+      checklistId: delivery ? card?.checklistId ?? '' : judgement.executorKind === 'green' ? card?.checklistId ?? '' : '',
       ...(delivery ? { delivery } : {}),
     };
     const retryMove = !delivery && (LIVE_RETRY_MOVES as readonly string[]).includes(judgement.move);
@@ -366,11 +524,32 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
       { move: judgement.move, source: judgeInput.pr ? `pr:${judgeInput.pr}` : `run:${input.runId ?? 'unknown'}`, runId: input.runId }) : null;
     const liveRetry = retryMove && route?.source === 'graph' && route.to === 'dispatch'
       && deps.command !== undefined && deps.loadGate !== undefined && liveMoves.has(judgement.move as TaskAgentLiveMove);
+    let greenSweep = action.kind === 'green' ? deps.greenSweep : undefined;
+    if (action.kind === 'green' && !greenSweep && action.checklistId) {
+      const hasSuccessfulWorktree = Boolean(successful?.worktreePath);
+      if (!successful?.worktreePath) {
+        try { (deps.log ?? ((c, e, d) => debug.log(c, e, d, { level: 'warn' })))('task-agent', 'green-sweep-context-unavailable',
+          { checklistId: action.checklistId, reason: 'successful-worktree-missing; process cwd probe cannot establish repository match' }); } catch { /* fail-soft */ }
+      }
+      try {
+        greenSweep = productionGreenSweep(action.checklistId, card, cardStatePath(deps), successful?.worktreePath ?? process.cwd(), deps.greenSweepRuntime);
+        // Without a run-owned checkout, cwd may point at another repository; never let it establish a match.
+        if (!hasSuccessfulWorktree && greenSweep) greenSweep = { ...greenSweep,
+          probe: { ...greenSweep.probe, repositoryMatches: async () => null } };
+      }
+      catch (error) {
+        try { (deps.log ?? ((c, e, d) => debug.log(c, e, d, { level: 'warn' })))('task-agent', 'green-sweep-context-unavailable',
+          { checklistId: action.checklistId, reason: (error instanceof Error ? error.message : String(error)).slice(-300) }); } catch { /* fail-soft */ }
+      }
+    }
     // NEXTMOVE-GENERAL-RELAUNCH-MOVEID — live 재발사로 가는 결정 순간 수 id 를 «한 번» 만든다(이미 실린 값이 있으면 그것).
     //   아래 발사 argv · 결정 노드 출구 · graph-edge-taken · 카드 history 가 이 값만 쓴다(다시 만들지 않는다).
     if (liveRetry) generalMoveId = action.moveId ?? (deps.mintMoveId ?? mintMoveId)();
     executorResult = await executeNextAction(generalMoveId ? { ...action, moveId: generalMoveId } : action, {
-      mode: delivery ? (deps.mode ?? 'shadow') : liveRetry ? 'live' : 'shadow',
+      // Green is a completion boundary: only an explicit live invocation may reach the verified writer.
+      mode: delivery ? (deps.mode ?? 'shadow')
+        : action.kind === 'green' && deps.mode === 'live' && deps.greenWriteLive === true ? 'live'
+          : liveRetry ? 'live' : 'shadow',
       command: deps.command ?? (async () => { throw new Error('task-agent shadow path must not run commands'); }),
       observe: (event, data) => {
         wouldDo = data.reason;
@@ -380,6 +559,8 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
         catch { /* Observation must not alter the selected move. */ }
       },
       ...(liveRetry ? { liveMoves, retryLaunches, loadGate: deps.loadGate } : {}),
+      ...(greenSweep ? { greenSweep } : {}),
+      ...(action.kind === 'green' ? { greenWriteLive: deps.mode === 'live' && deps.greenWriteLive === true } : {}),
     });
     if (liveRetry && executorResult === 'done' && route) {
       passJourneyNode('next-move', { provenance: 'task-agent-terminal', outcome: judgement.move,
@@ -514,6 +695,8 @@ export async function recordTaskAgentShadowMove(input: TaskAgentShadowInput, dep
   // 판단 관측은 원격 미결 수를 실제 원장에 기록한 결과까지 확정한 뒤 남긴다.
   (deps.log ?? ((category, event, data) => debug.log(category, event, data)))('task-agent', 'shadow-move', {
     ...move, completion: shadowCompletion(card, cardLookupFailed), card: liveCard?.id ?? pendingCardId,
+    // DEFAULT-HANDS — 이 카드가 어느 손으로 나가는지(«개발»/«실행·조사»)를 판단 관측에 싣는다.
+    hand: kind !== undefined ? defaultHandOf(kind) : null,
     live, liveExecuted: liveMove?.executed ?? false, ...(liveMove ? { liveOk: liveMove.ok } : {}),
     ...(cardBinding ? { cardBinding } : {}),
     ...(reviewFromCapture ? { reviewSource: 'captured-review-result' } : {}),

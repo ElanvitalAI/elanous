@@ -6,6 +6,7 @@ import { Command } from 'commander';
 import { inventoryCrontab, listSchedules, openSchedulesDb } from '../domains/schedule-registry.js';
 import { registerLoopCommands } from './loop-cli.js';
 import { listAllLoops, listLoops } from './registry.js';
+import { checkLoops, pruneJudgment, pruneText } from './checker.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -147,4 +148,73 @@ test('list without --all preserves graph-only JSON shape and non-JSON output', a
   expect(JSON.parse(json.writes.join(''))).toEqual(json.legacy);
   const plain = await fixture([]);
   expect(plain.lines).toEqual([JSON.stringify(plain.legacy, null, 2)]);
+});
+
+test('status --all --json carries the prune plan computed by pruneJudgment over the same registry entries', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'loop-cli-status-all-'));
+  roots.push(root);
+  mkdirSync(join(root, 'graphs'));
+  writeFileSync(join(root, 'graphs', 'daily.yaml'), "graph_id: daily\nloop:\n  title: Daily\n  owner: OP\n  mode: watch\n  trigger:\n    cron: '0 9,17 * * *'\n");
+  const db = openSchedulesDb(join(root, 'schedules.db'));
+  try {
+    inventoryCrontab(db, { crontab: [
+      `0 9,17 * * * cd ${root} && bun bin/elanous.mjs graph run graphs/daily.yaml`,
+      '*/15 * * * * bun scripts/seat-loop.ts --seat TC',
+      '*/15 * * * * bun scripts/seat-loop.ts --seat OP',
+      '*/30 * * * * bun scripts/loop-orchestrator.ts',
+      '*/5 * * * * elanous future-loop',
+      '*/5 * * * * flock -o /tmp/lock elanous wrapped-loop',
+    ].join('\n') + '\n' });
+    db.run("UPDATE schedule_registry SET category = 'monitor' WHERE command LIKE '%--seat TC'");
+    const opts = { root, stateRoot: root, now: new Date('2026-10-04T12:00:00Z'), schedules: listSchedules(db) };
+    const entries = listAllLoops(opts);
+    const lines: string[] = [];
+    const writes: string[] = [];
+    const previous = console.log;
+    const stdout = process.stdout.write;
+    console.log = (...values: unknown[]) => { lines.push(values.join(' ')); };
+    process.stdout.write = ((chunk: string | Uint8Array, callback?: ((error?: Error | null) => void) | string) => {
+      writes.push(String(chunk));
+      if (typeof callback === 'function') callback();
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      const program = new Command();
+      registerLoopCommands(program, { registryOptions: opts, now: opts.now });
+      await program.parseAsync(['loop', 'status', '--all', '--json'], { from: 'user' });
+    } finally { console.log = previous; process.stdout.write = stdout; }
+    expect(process.exitCode).toBe(0);
+    const report = JSON.parse(writes.join('')) as { counts: { alive: number; unregistered: number }; prune: ReturnType<typeof pruneJudgment> };
+    const expected = pruneJudgment(checkLoops(entries, opts.now), { now: opts.now });
+    expect(entries.length).toBeGreaterThan(0);
+    expect(report.prune).toEqual(expected);
+    expect(Object.keys(report.prune).sort()).toEqual(['alive', 'foldGroups', 'idleRetire', 'idleUnproven', 'unnamed', 'unregistered']);
+    expect(report.prune.alive.count).toBe(report.counts.alive);
+    expect(report.prune.alive.limit).toBe(25);
+    expect(report.prune.alive.within).toBe(true);
+    expect(report.counts.unregistered).toBe(report.prune.unregistered.length);
+    expect(report.prune.unregistered.length).toBeGreaterThan(0);
+    for (const group of report.prune.foldGroups) expect(group.ids.length).toBeGreaterThanOrEqual(2);
+    expect(report.prune.unnamed.every(id => /^[0-9a-f]{8,}$/.test(id))).toBe(true);
+    expect(report.prune.unnamed).not.toContain('elanous:hq-heartbeat');
+    expect(lines.join('\n')).not.toContain('prune');
+  } finally { db.close(); }
+});
+
+test('pruneText renders the LOOP-PRUNE-1021-FU judgment lines for the human output', () => {
+  const judgment: ReturnType<typeof pruneJudgment> = {
+    idleRetire: ['elanous:foo-1'],
+    idleUnproven: ['norecord'],
+    unregistered: [{ id: 'abc123def4', cron: '*/9 * * * *', command: 'elanous future-action --json' }],
+    foldGroups: [{ family: 'elanous:foo', ids: ['elanous:foo-1', 'elanous:foo-2'] }],
+    alive: { count: 3, limit: 25, within: true },
+    unnamed: ['abc123def4'],
+  };
+  const text = pruneText(judgment);
+  expect(text).toContain('무실행 은퇴 1: elanous:foo-1');
+  expect(text).toContain('무실행 미증명 1: norecord');
+  expect(text).toContain('미등록 1: abc123def4 (elanous future-action --json)');
+  expect(text).toContain('형제 접기 1: elanous:foo[elanous:foo-1+elanous:foo-2]');
+  expect(text).toContain('alive 3/25 한도 이내');
+  expect(text).toContain('이름 없는 해시 1: abc123def4');
 });

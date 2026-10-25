@@ -15,6 +15,7 @@ import { GoalRunStore, goalRunDbPath } from '../self-implement/goal-run-store.js
 import { runHostRegate } from '../self-implement/host-regate.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
+import { readMapRun } from '../task-agent/map-run-ledger.js';
 import { rejudgeCandidates } from '../task-agent/rejudge-on-head.js';
 import { reviewResultPath } from '../task-agent/review-result-capture.js';
 import { repairReviewDigest } from '../task-agent/repair-review.js';
@@ -22,7 +23,13 @@ import { remoteLedgerMirrorDir } from '../task-agent/parent-host.js';
 import { adoptExistingPr, adoptedRunTerminal } from '../task-agent/adopt-pr.js';
 import { cardsBoard, type BoardNode } from '../task-agent/board.js';
 import { resetUserConfig } from '../user-config.js';
-import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TaskDoctorReport, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
+import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, greenCloseDeclaredPaths, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TaskDoctorReport, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
+
+test('green close current checklist scope cannot be narrowed by an old TA card', () => {
+  expect(greenCloseDeclaredPaths('대상 경로: src/one.ts · src/two.ts\n완료 경계 코드: 둘 다', ['src/one.ts']))
+    .toEqual(['src/one.ts', 'src/two.ts']);
+  expect(greenCloseDeclaredPaths('완료 경계 코드: 누락', ['src/one.ts'])).toEqual([]);
+});
 
 const token = 'secret-acp-token-sentinel';
 test('tasks repair-outcomes reads repair-result in the card ledger, not rejudge decisions', async () => {
@@ -323,6 +330,238 @@ async function run(args: string[], deps: TasksCliDeps, readRealGoalLedgers = fal
     return { lines, code: process.exitCode };
   } finally { process.exitCode = previous ?? 0; }
 }
+
+test('MAPREDUCE-FANOUT 첫 조각으로 읽기 전용 tasks map dry-run CLI 뼈대와 집중 시험을 구현한다', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-map-dry-run-'));
+  const inventoryPath = join(dir, 'inventory.json');
+  const statePath = join(dir, 'cards.json');
+  const items = [
+    { id: 'task-a', text: 'first goal' },
+    { id: 'task-b', text: 'second goal' },
+    { id: 'task-c', text: 'third goal' },
+  ];
+  let launches = 0;
+  let checklistWrites = 0;
+  try {
+    writeFileSync(inventoryPath, JSON.stringify(items));
+    const full = await run(['tasks', 'map', 'dry-run', '--inventory', inventoryPath, '--json'], {
+      taskStatePath: statePath, taskLauncher: () => { launches++; },
+      greenSweepWrite: (() => { checklistWrites++; throw new Error('dry-run wrote checklist'); }) as unknown as TasksCliDeps['greenSweepWrite'],
+    });
+    expect(full.code ?? 0).toBe(0);
+    const plan = JSON.parse(full.lines[0]!);
+    expect(plan.mode).toBe('dry-run');
+    expect(plan.status).toBe('planned');
+    expect(plan.rows.map((row: { id: string }) => row.id)).toEqual(['task-a', 'task-b', 'task-c']);
+    expect(plan.effects).toEqual({ launched: false, pullRequestWrites: false, checklistWrites: false, autoMerge: false });
+    expect(new Set(plan.rows.map((row: { orchestrationId: string }) => row.orchestrationId)).size).toBe(3);
+    expect(launches).toBe(0);
+    expect(checklistWrites).toBe(0);
+    expect(existsSync(statePath)).toBe(false);
+
+    for (const invalid of [items.slice(0, 2), [items[0], items[1], { id: 'task-a', text: 'duplicate' }]]) {
+      writeFileSync(inventoryPath, JSON.stringify(invalid));
+      const held = await run(['tasks', 'map', 'dry-run', '--inventory', inventoryPath, '--json'], {
+        taskStatePath: statePath, taskLauncher: () => { launches++; },
+        greenSweepWrite: (() => { checklistWrites++; }) as unknown as TasksCliDeps['greenSweepWrite'],
+      });
+      expect(held.code).toBe(1);
+      expect(JSON.parse(held.lines[0]!).status).toBe('HOLD');
+      expect(JSON.parse(held.lines[0]!).rows).toEqual([]);
+    }
+    expect(launches).toBe(0);
+    expect(checklistWrites).toBe(0);
+    expect(existsSync(statePath)).toBe(false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks map parent command uses the map-run backend and --reduce reads five rows without launching', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-map-adapter-'));
+  const sha = 'a'.repeat(40);
+  let inventoryReads = 0;
+  let launches = 0;
+  let checklistWrites = 0;
+  const deps: TasksCliDeps = { mapRoot: dir,
+    mapInventorySource: async (_recipe, _source, limit) => {
+      inventoryReads++;
+      expect(limit).toBe(5);
+      return { items: Array.from({ length: 5 }, (_, index) => ({ id: `cell-${index + 1}`, text: `verify cell-${index + 1}` })),
+        complete: true, snapshotTime: '2026-10-24T00:00:00Z', snapshotRef: 'fixture-0.2.37',
+        recipeSha: sha, mainSha: sha, checklistSnapshotPath: join(dir, 'checklist.json'),
+        requestedPool: 'cold-job', selectedPool: null, imageCommit: null };
+    },
+    taskLauncher: () => { launches++; },
+    greenSweepWrite: (() => { checklistWrites++; }) as unknown as TasksCliDeps['greenSweepWrite'],
+  };
+  try {
+    const mapped = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'landed-but-yellow',
+      '--limit', '5', '--concurrency', '2', '--dry-run', '--json'], deps);
+    expect(mapped.code ?? 0).toBe(0);
+    const result = JSON.parse(mapped.lines[0]!);
+    expect(result).toMatchObject({ status: 'preview-only', expected: 5, observed: 5, dryRun: true,
+      launched: 0, writes: 0 });
+    expect(result.markdown.match(/^\| cell-\d \|/gm)).toHaveLength(5);
+    expect(inventoryReads).toBe(1);
+    expect(launches).toBe(0);
+    expect(checklistWrites).toBe(0);
+    const reduced = await run(['tasks', 'map', '--reduce', result.mapRunId, '--json'], deps);
+    expect(reduced.code ?? 0).toBe(0);
+    expect(JSON.parse(reduced.lines[0]!).markdown.match(/^\| cell-\d \|/gm)).toHaveLength(5);
+    expect(inventoryReads).toBe(1);
+    const conflictingReduce = await run(['tasks', 'map', '--reduce', result.mapRunId, '--dry-run', '--json'], deps);
+    expect(conflictingReduce.code).toBe(1);
+    expect(JSON.parse(conflictingReduce.lines[0]!)).toMatchObject({ status: 'HOLD', reason: 'reduce-options-conflict' });
+    const conflictingModes = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'landed-but-yellow',
+      '--limit', '5', '--live', '--dry-run', '--json'], deps);
+    expect(conflictingModes.code).toBe(1);
+    expect(JSON.parse(conflictingModes.lines[0]!)).toMatchObject({ status: 'HOLD', reason: 'live-dry-run-conflict' });
+    expect(inventoryReads).toBe(1);
+    const live = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'landed-but-yellow',
+      '--limit', '5', '--live', '--json'], deps);
+    expect(live.code ?? 0).toBe(0);
+    expect(JSON.parse(live.lines[0]!)).toMatchObject({ status: 'host-graph-run', expected: 5, observed: 5,
+      attempted: 5, externalWrites: 0 });
+    expect(JSON.parse(live.lines[0]!).markdown).toContain('recipe-input-missing');
+    expect(inventoryReads).toBe(2);
+    const invalidSource = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'typo', '--json'], deps);
+    expect(invalidSource.code).toBe(1);
+    expect(JSON.parse(invalidSource.lines[0]!)).toMatchObject({ status: 'HOLD', reason: 'source-invalid', launched: 0 });
+    const invalidLimit = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'landed-but-yellow',
+      '--limit', '1001', '--json'], deps);
+    expect(invalidLimit.code).toBe(1);
+    expect(JSON.parse(invalidLimit.lines[0]!)).toMatchObject({ status: 'HOLD', reason: 'limit-out-of-range: 1..1000' });
+    const failedRead = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'landed-but-yellow', '--json'], {
+      ...deps, mapInventorySource: async () => { throw new Error('inventory-read-failed'); },
+    });
+    expect(failedRead.code).toBe(1);
+    expect(JSON.parse(failedRead.lines[0]!)).toMatchObject({ status: 'HOLD', reason: 'inventory-read-failed', launched: 0 });
+    expect(inventoryReads).toBe(2);
+    expect(launches).toBe(0);
+    expect(checklistWrites).toBe(0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks map --live runs one real read-only draft graph in an isolated state root', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-map-host-live-'));
+  setElanousConfigDir(dir);
+  const sha = 'a'.repeat(40);
+  const headOid = 'b'.repeat(40);
+  try {
+    const result = await run(['tasks', 'map', '--recipe', 'draft-close', '--from', 'drafts',
+      '--ids', 'pr-123,pr-999', '--limit', '2', '--concurrency', '2', '--live', '--json'], {
+      mapRoot: dir,
+      mapInventorySource: async (_recipe, _source, _limit, mapRunId) => {
+        const snapshotTime = '2026-10-24T01:00:00Z';
+        const item = { pr: 123, headOid, repository: 'example/repo', state: 'open', isDraft: true,
+          labels: ['elanous:running'], branch: 'fixture', title: 'protected fixture', body: '',
+          createdAt: '2026-10-23T01:00:00Z', changedFiles: [], changedFilesComplete: true,
+          latestFileChanges: {}, openDraftsComplete: true, mergedTwinsComplete: false };
+        return { items: [{ id: 'pr-123', text: item.title,
+          graphInput: { mapRunId, snapshotTime, inventoryComplete: true,
+            inventory: { complete: true, snapshotTime, mainSha: sha, items: [item] }, mainSha: sha, item } }],
+          complete: true, snapshotTime, snapshotRef: 'fixture@protected-draft', recipeSha: sha,
+          mainSha: sha, checklistSnapshotPath: null, requestedPool: 'node-b', selectedPool: 'node-b', imageCommit: null };
+      },
+    });
+    expect(result.code ?? 0).toBe(0);
+    const output = JSON.parse(result.lines[0]!);
+    expect(output).toMatchObject({ status: 'host-graph-run', expected: 2, observed: 2, attempted: 2, externalWrites: 0 });
+    const stored = readMapRun(output.mapRunId, dir);
+    expect(stored.rows).toHaveLength(2);
+    const draftRow = stored.rows.find((row) => row.itemId === 'pr-123');
+    const absentRow = stored.rows.find((row) => row.itemId === 'pr-999');
+    expect(draftRow).toMatchObject({ itemId: 'pr-123', kind: 'hold',
+      result: { transport: 'host-graph-run' } });
+    expect(absentRow).toMatchObject({ itemId: 'pr-999', kind: 'hold', reason: 'requested-id-not-in-eligible-inventory' });
+    expect(draftRow?.result?.cardId).toMatch(/^map-card-/);
+    expect(draftRow?.podJob).toBeUndefined();
+  } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks map --ids selects only requested inventory IDs and records absent IDs as HOLD', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tasks-map-ids-'));
+  const sha = 'a'.repeat(40);
+  let receivedLimit: number | undefined = 0;
+  const deps: TasksCliDeps = { mapRoot: dir, mapInventorySource: async (_recipe, _source, limit) => {
+    receivedLimit = limit;
+    return { items: [{ id: 'OTHER', text: 'other' }, { id: 'TARGET', text: 'target' }],
+      complete: true, snapshotTime: '2026-10-24T00:00:00Z', snapshotRef: 'fixture',
+      recipeSha: sha, mainSha: sha, checklistSnapshotPath: join(dir, 'checklist.json'),
+      requestedPool: 'node-b', selectedPool: null, imageCommit: null };
+  } };
+  try {
+    const mapped = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'landed-but-yellow',
+      '--ids', 'TARGET,MISSING', '--live', '--json'], deps);
+    expect(mapped.code ?? 0).toBe(0);
+    const output = JSON.parse(mapped.lines[0]!);
+    expect(output).toMatchObject({ expected: 2, observed: 2, status: 'host-graph-run' });
+    expect(receivedLimit).toBeUndefined();
+    const stored = readMapRun(output.mapRunId, dir);
+    expect(stored.start.itemIds).toEqual(['TARGET', 'MISSING']);
+    expect(stored.rows.map((row) => [row.itemId, row.reason])).toEqual([
+      ['TARGET', 'recipe-input-missing'], ['MISSING', 'requested-id-not-in-eligible-inventory'],
+    ]);
+    for (const csv of ['TARGET,TARGET', 'TARGET,', Array.from({ length: 11 }, (_, i) => `ID${i}`).join(',')]) {
+      const invalid = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'landed-but-yellow',
+        '--ids', csv, '--live', '--json'], deps);
+      expect(invalid.code).toBe(1);
+      expect(JSON.parse(invalid.lines[0]!)).toMatchObject({ status: 'HOLD', reason: 'map-ids-invalid-or-duplicate: max 10' });
+    }
+    const shortLimit = await run(['tasks', 'map', '--recipe', 'green-close', '--from', 'landed-but-yellow',
+      '--ids', 'TARGET,MISSING', '--limit', '1', '--json'], deps);
+    expect(JSON.parse(shortLimit.lines[0]!)).toMatchObject({ status: 'HOLD', reason: 'map-ids-exceed-limit' });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks green-sweep defaults to dry-run and --apply writes only after main E1/E2 checks', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'green-sweep-live-write-'));
+  const sha = 'a'.repeat(40);
+  const item = { id: 'CELL', title: '대상 경로: src/task-agent/green-sweep.ts\n- 완료 경계 증거 명령: bun test src/task-agent/green-sweep.test.ts',
+    status: 'yellow' as const, evidence: '판정: green\nPR #123 merged', updatedAt: '2026-10-24T00:00:00Z', updatedBy: 'test' };
+  const writes: unknown[][] = [];
+  const evidenceCalls: string[][] = [];
+  const baseDeps: TasksCliDeps = {
+    greenSweepChecklist: () => ({ version: '0.2.37', released: '0.2.36', dev: '0.2.37-dev.0', items: [item], history: [] }),
+    taskStatePath: join(dir, 'empty-task-state.json'),
+    greenSweepRun: (command, args) => {
+      const key = `${command} ${args.join(' ')}`;
+      if (key === 'git remote get-url origin') return { status: 0, stdout: 'https://github.com/example/repo.git' };
+      if (key === 'git rev-parse origin/main' || key === 'git rev-parse HEAD') return { status: 0, stdout: sha };
+      if (key === 'git ls-remote origin refs/heads/main') return { status: 0, stdout: `${sha}\trefs/heads/main` };
+      if (key === 'git status --porcelain --untracked-files=all') return { status: 0, stdout: '' };
+      if (key === 'gh pr view 123 --json number,state,mergeCommit,url')
+        return { status: 0, stdout: JSON.stringify({ number: 123, state: 'MERGED', mergeCommit: { oid: sha }, url: 'https://github.com/example/repo/pull/123' }) };
+      if (key === `git merge-base --is-ancestor ${sha} origin/main`) return { status: 0, stdout: '' };
+      throw new Error(`unexpected command: ${key}`);
+    },
+    greenSweepEvidenceRun: (args) => { evidenceCalls.push(args); return { status: 0, stdout: '13 pass' }; },
+    greenSweepWrite: (...args) => { writes.push(args); return { version: '0.2.37', released: '0.2.36', dev: '0.2.37-dev.0', items: [item], history: [] }; },
+  };
+  try {
+    writeFileSync(join(dir, 'traffic.json'), JSON.stringify({ hold: [] }));
+    const dryRun = await run(['tasks', 'green-sweep', '--version', '0.2.37', '--cell', 'CELL', '--traffic', join(dir, 'traffic.json'), '--json'], baseDeps);
+    expect(dryRun.code ?? 0).toBe(0);
+    expect(JSON.parse(dryRun.lines[0]!).dryRun).toBe(true);
+    expect(evidenceCalls).toEqual([]);
+    expect(writes).toEqual([]);
+
+    const applied = await run(['tasks', 'green-sweep', '--version', '0.2.37', '--cell', 'CELL', '--traffic', join(dir, 'traffic.json'), '--apply', '--json'], baseDeps);
+    expect(applied.code ?? 0).toBe(0);
+    const result = JSON.parse(applied.lines[0]!);
+    expect(result).toMatchObject({ dryRun: false, e2: 'main-clean', writes: [{ cell: 'CELL', written: true }] });
+    expect(evidenceCalls).toEqual([['src/task-agent/green-sweep.test.ts']]);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.[2]).toMatchObject({ status: 'green' });
+    expect((writes[0]?.[2] as { evidence: string }).evidence).toContain('판정: green');
+
+    const e2Failed = await run(['tasks', 'green-sweep', '--version', '0.2.37', '--cell', 'CELL', '--traffic', join(dir, 'traffic.json'), '--apply', '--json'], {
+      ...baseDeps, greenSweepEvidenceRun: () => ({ status: 1, stdout: 'fixture failure' }),
+    });
+    expect(e2Failed.lines).toHaveLength(1);
+    expect(JSON.parse(e2Failed.lines[0]!)).toMatchObject({ e2: 'failed', writes: [{ cell: 'CELL', written: false, reason: 'main-evidence-not-passed' }], e2Failure: 'E2 failed · CELL · rc=1 · fixture failure' });
+    expect(writes).toHaveLength(1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('tasks cover --json reads two filtered log sources and measures land without inventing other denominators', async () => {
   const queries: Array<{ exactCategories?: string[]; events?: string[]; sinceMs?: number; untilMs?: number }> = [];
@@ -1313,7 +1552,8 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['work-order', 'green-sweep', 'cover', 'repair-outcomes', 'outcomes', 'doctor', 'list', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['work-order', 'green-sweep', 'cover', 'repair-outcomes', 'outcomes', 'doctor', 'list', 'map', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
+  expect(command?.commands.find((entry) => entry.name() === 'map')?.commands.map((entry) => entry.name())).toEqual(['dry-run']);
   expect(command?.commands.find((entry) => entry.name() === 'work-order')?.commands.map((entry) => entry.name())).toEqual(['build']);
 });
 

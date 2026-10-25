@@ -1970,6 +1970,113 @@ describe('unfinished run ledger path axes', () => {
   });
 });
 
+describe('graph.unit orphan visits at the terminal completion boundary', () => {
+  const runId = (suffix: string) => `run-00000000-0000-4000-8000-00000000${suffix}`;
+  const unitVisit = (visitRunId: string, childRunId: string, phase: 'enter' | 'exit'): RunLedgerEntry => ({
+    timestamp: phase === 'enter' ? '2026-10-20T01:00:01.000Z' : '2026-10-20T01:00:09.000Z',
+    runId: visitRunId,
+    event: 'graph.unit',
+    data: {
+      graphId: 'self-implement',
+      runId: visitRunId,
+      nodeId: 'decompose',
+      unit: 'fabric-decompose',
+      childRunId,
+      parentRunId: visitRunId,
+      phase,
+      ...(phase === 'exit' ? { exit: 'done', steps: 3 } : {}),
+    },
+  });
+  // The production readers own file layout; this seam hands them an assembled in-memory ledger.
+  const inMemoryLedger = (ledgers: Readonly<Record<string, readonly RunLedgerEntry[]>>) => ({
+    dir: '/nonexistent-run-ledger-directory',
+    list: () => Object.keys(ledgers).map((id) => `${id}.jsonl`),
+    read: (path: string) => {
+      const id = Object.keys(ledgers).find((candidate) => path.endsWith(`/${candidate}.jsonl`));
+      if (id === undefined) throw new Error(`unknown ledger read: ${path}`);
+      return ledgers[id]!.map((entry) => `${JSON.stringify(entry)}\n`).join('');
+    },
+  });
+
+  it('classifies a terminal run graph.unit enter with no matching exit as an orphan visit', () => {
+    const interrupted = runId('0401');
+    const closed = runId('0402');
+    const ledger = inMemoryLedger({
+      [interrupted]: [
+        { timestamp: '2026-10-20T01:00:00.000Z', runId: interrupted, event: 'start', goalId: 'apm-orphan', data: {} },
+        unitVisit(interrupted, 'child-orphan', 'enter'),
+        { timestamp: '2026-10-20T01:00:30.000Z', runId: interrupted, event: 'run-status', goalId: 'apm-orphan', data: { runStatus: 'failed' } },
+      ],
+      [closed]: [
+        { timestamp: '2026-10-20T02:00:00.000Z', runId: closed, event: 'start', goalId: 'apm-closed', data: {} },
+        unitVisit(closed, 'child-closed', 'enter'),
+        unitVisit(closed, 'child-closed', 'exit'),
+        { timestamp: '2026-10-20T02:01:00.000Z', runId: closed, event: 'run-status', goalId: 'apm-closed', data: { runStatus: 'completed' } },
+      ],
+    });
+
+    const orphanTimeline = queryRunLedgerTimeline('apm-orphan', ledger);
+    expect(orphanTimeline).toHaveLength(1);
+    expect(orphanTimeline[0]!.executedAt).toBe('2026-10-20T01:00:00.000Z');
+    expect(orphanTimeline[0]!.unitVisits).toMatchObject({ terminal: true, enterCount: 1, exitCount: 0, orphanCount: 1 });
+    expect(orphanTimeline[0]!.unitVisits!.orphanUnitVisits).toEqual([
+      { childRunId: 'child-orphan', graphId: 'self-implement', nodeId: 'decompose', unit: 'fabric-decompose', enteredAt: '2026-10-20T01:00:01.000Z' },
+    ]);
+
+    const closedTimeline = queryRunLedgerTimeline('apm-closed', ledger);
+    expect(closedTimeline[0]!.unitVisits).toMatchObject({ terminal: true, enterCount: 1, exitCount: 1, orphanCount: 0 });
+    expect(closedTimeline[0]!.unitVisits!.orphanUnitVisits).toEqual([]);
+  });
+
+  it('leaves an open visit on a non-terminal ledger in flight instead of calling it an orphan', () => {
+    const running = runId('0403');
+    const ledger = inMemoryLedger({
+      [running]: [
+        { timestamp: '2026-10-20T03:00:00.000Z', runId: running, event: 'start', goalId: 'apm-running', data: {} },
+        unitVisit(running, 'child-running', 'enter'),
+      ],
+    });
+
+    const timeline = queryRunLedgerTimeline('apm-running', ledger);
+    expect(timeline[0]!.unitVisits).toMatchObject({ terminal: false, enterCount: 1, exitCount: 0, orphanCount: 0 });
+    expect(timeline[0]!.unitVisits!.orphanUnitVisits).toEqual([]);
+  });
+
+  it('reports terminal orphan visits from the unfinished-run scan without reviving the terminal run', () => {
+    const interrupted = runId('0405');
+    const requestScoped = runId('0406');
+    const running = runId('0407');
+    const ledger = inMemoryLedger({
+      [interrupted]: [
+        { timestamp: '2026-10-20T04:00:00.000Z', runId: interrupted, event: 'start', data: {} },
+        unitVisit(interrupted, 'child-interrupted', 'enter'),
+        { timestamp: '2026-10-20T04:00:30.000Z', runId: interrupted, event: 'run-status', data: { runStatus: 'failed' } },
+      ],
+      [requestScoped]: [
+        { timestamp: '2026-10-20T05:00:00.000Z', runId: requestScoped, event: 'start', data: {} },
+        unitVisit(requestScoped, 'child-request', 'enter'),
+        { timestamp: '2026-10-20T05:00:30.000Z', runId: requestScoped, event: 'run-status', data: { runStatus: 'failed' } },
+        { timestamp: '2026-10-20T05:00:31.000Z', runId: requestScoped, event: 'non-blocking-pending', data: { requestId: requestScoped, kind: 'pending', recordedAt: '2026-10-20T05:00:31.000Z' } },
+      ],
+      [running]: [
+        { timestamp: '2026-10-20T06:00:00.000Z', runId: running, event: 'start', data: {} },
+        unitVisit(running, 'child-running', 'enter'),
+      ],
+    });
+
+    const query = queryUnfinishedRunLedgers({ ...ledger, goalsDir: '/nonexistent-goal-document-directory', noCache: true });
+    expect(query.orphanUnitVisitCount).toBe(2);
+    expect(query.entries.map((entry) => entry.runId)).toEqual([requestScoped, running]);
+    expect(query.entries.find((entry) => entry.runId === requestScoped)!.orphanUnitVisits)
+      .toEqual([expect.objectContaining({ childRunId: 'child-request', nodeId: 'decompose', unit: 'fabric-decompose' })]);
+    expect(query.entries.find((entry) => entry.runId === running)!.orphanUnitVisits).toBeUndefined();
+    const rendered = renderUnfinishedRunLedgers(query);
+    expect(rendered).not.toContain('orphan unit visits');
+    expect(rendered).not.toContain('orphan unit=');
+    expect(rendered).not.toContain(`runId=${interrupted}`);
+  });
+});
+
 describe('RUN-DOCTOR-LIVE #30468 — 잠금 runId와 쓰기 runId 일치 강제 + test-universe 쓰기 잠금 전 거부', () => {
   const RUN_ID = 'run-0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d';
   const OTHER_RUN_ID = 'run-00000000-0000-4000-8000-000000000000';

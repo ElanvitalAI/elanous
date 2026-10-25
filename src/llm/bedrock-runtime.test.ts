@@ -118,11 +118,13 @@ describe('route table (bedrock.ts BEDROCK_MODELS «route» column)', () => {
     }
   });
 
-  test('the bedrock tier ladder resolves to runtime ids (no mantle-only 5.5 id left)', () => {
+  test('the bedrock tier ladder resolves to registered mantle-openai ids while 5.5 keeps its runtime route', () => {
     for (const spec of Object.values(LLM_TIER_MAP_BY_PROVIDER.bedrock)) {
       expect(resolveBedrockModelId(spec.model)).toBe(spec.model);
-      expect(bedrockRouteFor(spec.model)).toBe('runtime');
+      expect(BEDROCK_MODELS.find((entry) => entry.id === spec.model)?.route).toBe('mantle-openai');
+      expect(bedrockRouteFor(spec.model)).toBe('mantle-openai');
     }
+    expect(bedrockRouteFor('global.anthropic.claude-sonnet-5-5')).toBe('runtime');
   });
 });
 

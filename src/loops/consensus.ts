@@ -45,6 +45,8 @@ export const CROWN_MARK = String.fromCodePoint(0x1F451);
 export interface ProposalCard {
   id: string;
   category: ConsensusCategory;
+  /** Stable orchestrator work key (orch:<card>:<cell>) for a cross-branch split cell. */
+  workKey?: string;
   title: string;
   /** 사실 id — 제안의 근거 관측. */
   factId: string;
@@ -152,8 +154,14 @@ export class ConsensusEngine {
 
   propose(input: {
     by: ConsensusRepresentative; category: ConsensusCategory; title: string; factId: string; cost: string; undo: string;
-    thresholds?: DecisionCategory[]; provider?: string;
+    thresholds?: DecisionCategory[]; provider?: string; workKey?: string;
   }): ProposalCard {
+    if (input.workKey !== undefined) {
+      if (input.category !== 'cross-branch-change' || !/^orch:[a-zA-Z0-9_-]+:[a-zA-Z0-9_-]+$/.test(input.workKey))
+        throw new Error('invalid cross-branch work key');
+      const existing = this.list().find(proposal => proposal.workKey === input.workKey);
+      if (existing) throw new Error(`cross-branch work already proposed: ${existing.id}`);
+    }
     if (!CONSENSUS_REPRESENTATIVES.includes(input.by)) throw new Error(`invalid representative: ${input.by} (coordinator|guardian)`);
     if (!CONSENSUS_CATEGORIES.includes(input.category)) throw new Error(`invalid consensus category: ${input.category} (${CONSENSUS_CATEGORIES.join('|')})`);
     const thresholds = [...new Set(input.thresholds ?? [])];
@@ -164,6 +172,7 @@ export class ConsensusEngine {
     const proposal: ProposalCard = {
       id: this.nextId('C', at),
       category: input.category,
+      ...(input.workKey ? { workKey: input.workKey } : {}),
       title: oneLine(input.title, 'title'),
       factId: oneLine(input.factId, 'fact id'),
       cost: oneLine(input.cost, 'cost'),
@@ -210,9 +219,22 @@ export class ConsensusEngine {
     return proposal;
   }
 
+  proposalForWork(workKey: string): ProposalCard | undefined {
+    return this.list().find(entry => entry.workKey === workKey);
+  }
+
   crownCards(): CrownCard[] {
     return [...this.state().cards]
       .sort((a, b) => b.raisedAt.localeCompare(a.raisedAt) || a.id.localeCompare(b.id));
+  }
+
+  /** The same durable execution gate is used by CLI replies, hooks and loop consumers. */
+  canExecute(id: string): boolean {
+    const proposal = this.show(id);
+    return proposal.status === 'agreed' && proposal.thresholds.length === 0
+      && proposal.roundTrips >= 1 && proposal.roundTrips <= MAX_REVIEW_ROUND_TRIPS
+      && proposal.reviews.at(-1)?.verdict === 'agree'
+      && proposal.reviews.at(-1)?.by !== proposal.proposedBy;
   }
 
   /** 판정선 — 합의 원장의 agreed 이벤트를 ISO 주 단위로 센다 (한 주 N건의 기전). */
@@ -230,7 +252,9 @@ export class ConsensusEngine {
   private conclude(id: string, verdict: ReviewRecord['verdict'], input: { by: ConsensusRepresentative; claim?: string; provider?: string }): { proposal: ProposalCard; crownCard?: CrownCard } {
     const proposal = this.show(id);
     if (proposal.status !== 'open') throw new Error(`합의가 이미 결론났다: ${id} (${proposal.status === 'agreed' ? '합의' : '불합의'})`);
+    if (!CONSENSUS_REPRESENTATIVES.includes(input.by)) throw new Error(`invalid representative: ${input.by}`);
     if (input.by === proposal.proposedBy) throw new Error('메아리 방지 — 제안한 대표는 자기 제안을 검토하지 않는다');
+    if (proposal.roundTrips >= MAX_REVIEW_ROUND_TRIPS) throw new Error(`상대 검토는 최대 ${MAX_REVIEW_ROUND_TRIPS}왕복이다`);
     if (verdict === 'revise' && proposal.roundTrips + 1 >= MAX_REVIEW_ROUND_TRIPS)
       throw new Error(`상대 검토는 최대 ${MAX_REVIEW_ROUND_TRIPS}왕복이다 — 마지막 왕복에는 합의 또는 불합의로 끝낸다`);
     const claim = oneLine(input.claim ?? (verdict === 'agree' ? '동의 — 제안대로 실행한다' : ''), 'claim');
@@ -249,7 +273,7 @@ export class ConsensusEngine {
     this.appendLens(input.by, { action: 'reviewed', proposalId: proposal.id, at, verdict, ...(provider ? { provider } : {}) });
     debug.log('loops.consensus', 'reviewed', { proposalId: proposal.id, verdict, roundTrip: review.roundTrip, by: input.by });
     const updated = this.show(proposal.id);
-    if (verdict === 'agree') this.executeHook(updated);
+    if (this.canExecute(updated.id)) this.executeHook(updated);
     return { proposal: updated, ...(crownCard ? { crownCard } : {}) };
   }
 

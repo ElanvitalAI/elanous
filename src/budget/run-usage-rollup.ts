@@ -6,6 +6,7 @@ export interface RunUsageInput {
   site?: string | null;
   role?: string | null;
   phase?: string | null;
+  jobKind?: string | null;
   model?: string | null;
   billingProvider?: string | null;
   billing?: BillingRoute | null;
@@ -30,9 +31,11 @@ export interface RunUsageRow {
   runId: string;
   role?: string;
   site?: string;
-  model: string;
-  billingProvider: string;
-  billing: string;
+  jobKind?: string;
+  /** by:'job' 행은 종류별·호스트 합산 표이므로 실지 않는다(첫 행 대표값 오표출 방지). */
+  model?: string;
+  billingProvider?: string;
+  billing?: string;
   hostIds: string[];
   calls: number;
   inputTokens: number;
@@ -47,21 +50,23 @@ export interface RunUsageRow {
 }
 
 /** Aggregate llm-usage observations without turning unavailable prices into a known zero. */
-export function rollupRunUsage(...[rows, opts]: [rows: readonly RunUsageInput[], opts?: { by?: 'run' | 'role' }]): RunUsageRow[] {
+export function rollupRunUsage(...[rows, opts]: [rows: readonly RunUsageInput[], opts?: { by?: 'run' | 'role' | 'job' }]): RunUsageRow[] {
   const groups = new Map<string, RunUsageRow>();
   const byRole = opts?.by === 'role';
+  const byJob = opts?.by === 'job';
   for (const data of rows) {
-    const runId = byRole ? '(all)' : data.runId ?? '(none)';
+    const runId = byRole || byJob ? '(all)' : data.runId ?? '(none)';
     const role = data.role ?? '(none)';
     const site = data.site ?? '(none)';
+    const jobKind = data.jobKind ?? '(none)';
     const model = data.model ?? '(none)';
     const billingProvider = data.billingProvider ?? '(none)';
     const billing = data.billing ?? '(none)';
-    const key = JSON.stringify(byRole ? [role, site, model, billingProvider, billing] : [runId, model, billingProvider, billing]);
+    const key = JSON.stringify(byRole ? [role, site, model, billingProvider, billing] : byJob ? [jobKind] : [runId, model, billingProvider, billing]);
     let row = groups.get(key);
     if (!row) {
       row = {
-        runId, ...(byRole ? { role, site } : {}), model, billingProvider, billing, hostIds: [], calls: 0,
+        runId, ...(byRole ? { role, site } : {}), ...(byJob ? { jobKind } : { model, billingProvider, billing }), hostIds: [], calls: 0,
         inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0,
         cacheCreationInputTokens: 0, reasoningOutputTokens: 0,
         usdKnown: 0, unknownCostCalls: 0, includedCalls: 0, apiEquivalentUsd: 0,

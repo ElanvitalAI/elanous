@@ -3391,8 +3391,22 @@ export function parseSubscriptionReviewerSpec(raw: unknown): SubscriptionReviewe
   return { provider: 'claude-acp', ...(v.executor ? { executor: v.executor as 'cct' | 'cc' } : {}) };
 }
 
+/** Stable PR-number allocation for the three self-review lanes. Zero disables a lane. */
+export interface ReviewerMixSpec { sol: number; claude: number; glm: number }
+
+export function parseReviewerMixSpec(raw: unknown): ReviewerMixSpec | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  if (Object.keys(value).some(key => key !== 'sol' && key !== 'claude' && key !== 'glm')) return undefined;
+  const weights = [value.sol, value.claude, value.glm];
+  if (weights.some(weight => !Number.isSafeInteger(weight) || (weight as number) < 0) ||
+      weights.every(weight => weight === 0) ||
+      !Number.isSafeInteger(weights.reduce<number>((sum, weight) => sum + (weight as number), 0))) return undefined;
+  return { sol: value.sol as number, claude: value.claude as number, glm: value.glm as number };
+}
+
 /** 역할별 LLM 선택(sparse). `reviewer` is the opt-in harness ACP lane. */
-export type RoleLlmConfig = Partial<Record<ModelRole, RoleLlmSpec>> & { reviewer?: SubscriptionReviewerSpec };
+export type RoleLlmConfig = Partial<Record<ModelRole, RoleLlmSpec>> & { reviewer?: SubscriptionReviewerSpec; reviewerMix?: ReviewerMixSpec };
 
 export type ModelResolutionSource = 'config' | 'tier' | 'environment' | 'default';
 
@@ -4353,6 +4367,10 @@ function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
   if (values.reviewer !== undefined) {
     parsed.reviewer = parseSubscriptionReviewerSpec(values.reviewer);
     if (!parsed.reviewer) warnUserConfigDrop('roleLlm.reviewer', 'claude-acp reviewer 설정이 유효하지 않아 무시');
+  }
+  if (values.reviewerMix !== undefined) {
+    parsed.reviewerMix = parseReviewerMixSpec(values.reviewerMix);
+    if (!parsed.reviewerMix) warnUserConfigDrop('roleLlm.reviewerMix', '리뷰 비율 설정이 유효하지 않아 무시');
   }
   // ⛔ config 로딩은 «나머지를 살리려고» 잘못된 칸을 버리는데, 그 사실이 어디에도 안 남으면
   //   사용자는 「왜 내 설정이 안 먹지」를 영영 못 푼다(CLI 는 이름을 대며 거부하는데 여기만 조용했다).

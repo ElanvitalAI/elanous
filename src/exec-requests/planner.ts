@@ -10,6 +10,41 @@ import { debug } from '../debug/log.js';
 import { peerEditRunGate } from '../nexus/api/graph-peer-edit.js';
 import { OUTPUT_KINDS, pickDefaultOutput, type OutputKind } from './default-outputs.js';
 
+/**
+ * 코드포인트 순서 비교 — `localeCompare` 는 «실행 로케일의 ICU 콜레이션» 을 쓰므로 같은 문자열 쌍의 대소가
+ * 플랫폼/로케일마다 뒤집힌다(실측: '🎉party' vs '2026-10-23', 'alpha' vs 'Zebra' 는 콜레이션과 코드포인트가 반대).
+ * 순서가 실행 환경에 따라 달라지면 «가장 새 것» 선택이 재현 불가능해진다 — 그래서 코드포인트로 고정한다.
+ */
+export function compareCodePoints(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** 숫자 구간의 선행 0 을 지운다(01 == 1). */
+const stripLeadingZeros = (digits: string): string => digits.replace(/^0+(?=\d)/, '');
+
+/**
+ * 버전 문자열 비교 — 숫자 구간만 «수치» 로, 나머지는 «코드포인트» 로 비교한다.
+ * `localeCompare(..., { numeric: true })` 의 수치 규칙은 그대로 두고 콜레이션 의존만 걷어낸 등가물이다.
+ */
+export function compareVersionish(a: string, b: string): number {
+  const chunks = (value: string): string[] => value.match(/\d+|\D+/g) ?? [];
+  const left = chunks(a);
+  const right = chunks(b);
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    const [x, y] = [left[index]!, right[index]!];
+    if (/^\d/.test(x) && /^\d/.test(y)) {
+      const [dx, dy] = [stripLeadingZeros(x), stripLeadingZeros(y)];
+      if (dx.length !== dy.length) return dx.length < dy.length ? -1 : 1;
+      const digits = compareCodePoints(dx, dy);
+      if (digits !== 0) return digits;
+      continue;
+    }
+    const text = compareCodePoints(x, y);
+    if (text !== 0) return text;
+  }
+  return left.length === right.length ? 0 : left.length < right.length ? -1 : 1;
+}
+
 export interface InstalledGraph {
   id: string;
   title: string;
@@ -43,7 +78,7 @@ export function installedPluginGraphs(pluginsRoot = join(elanousStateRoot(), 'pl
   };
   for (const market of dirs(pluginsRoot)) {
     for (const name of dirs(join(pluginsRoot, market))) {
-      const versions = dirs(join(pluginsRoot, market, name)).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+      const versions = dirs(join(pluginsRoot, market, name)).sort((a, b) => compareVersionish(b, a));
       const version = versions[0];
       if (!version) continue;
       const root = join(pluginsRoot, market, name, version);
@@ -146,7 +181,7 @@ export function latestFieldFolder(configRoot = getElanousConfigDir()): string | 
         const photos = readdirSync(path, { withFileTypes: true }).filter(file => file.isFile() && /\.(?:png|jpe?g|webp|heic)$/i.test(file.name));
         for (const photo of photos) {
           const time = statSync(join(path, photo.name)).mtimeMs;
-          if (!latest || time > latest.time || (time === latest.time && path.localeCompare(latest.path) > 0)) latest = { path, time };
+          if (!latest || time > latest.time || (time === latest.time && compareCodePoints(path, latest.path) > 0)) latest = { path, time };
         }
       } catch { /* Unreadable event does not supply photos. */ }
     }

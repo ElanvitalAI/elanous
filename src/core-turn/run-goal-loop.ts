@@ -185,7 +185,7 @@ export const GOAL_FINAL_ITERATION_NOTE =
   '[last iteration] 이번이 이 목표의 마지막 반복이다. 이번에 끝내지 못하면 답 끝에 최종 보고를 한 번 써라: 한 것 · 남은 것 · 확인한 증거.';
 
 /** 중간 답이 «최종 보고형»(미완 목록)인가 — 관측 전용(행동을 바꾸지 않는다). */
-const INTERIM_REPORT_SHAPED = /(?:보고할 수 없|하지 못했습니다|못했습니다|완료되지 않았|검증되지 않았|확인하지 못했|not (?:yet )?(?:verified|completed)|cannot report)/i;
+const INTERIM_REPORT_SHAPED = /(?:보고할 수 없|하지\s?못했습니다|못\s?했습니다|완료되지 않았|검증되지 않았|확인하지 못했|not (?:yet )?(?:verified|completed)|cannot report)/i;
 export function isInterimReportShaped(text: string): boolean {
   return INTERIM_REPORT_SHAPED.test(text);
 }
@@ -631,12 +631,15 @@ export async function runGoalLoop(
   const reinject = (content: string): void => {
     if (iterations >= maxIterations) return;
     const lastIteration = iterations === maxIterations - 1;
+    const reportShaped = isInterimReportShaped(lastResult.finalText);
     try {
       debug.log('goal.loop', 'interim-reply', {
         sessionId: ctx.sessionId, ...runAttribution, iteration: iterations, lastIteration,
-        reportShaped: isInterimReportShaped(lastResult.finalText), finalChars: lastResult.finalText.length,
+        reportShaped, finalChars: lastResult.finalText.length,
       }, { level: 'debug' });
     } catch { /* 관측 실패가 루프를 막지 않는다 */ }
+    // Only a real continuation is interim; terminal and last-iteration answers stay visible.
+    if (lastResult.finalText.trim()) ctx.callbacks?.onGoalInterim?.(lastResult.finalText, iterations);
     const nextIteration = iterations + 1;
     const toolBudget = ctx.maxToolTurns ?? TOOL_LOOP_MAX_TURNS_DEFAULT;
     const shouldAttachDelegateHint = shouldHintDelegate({

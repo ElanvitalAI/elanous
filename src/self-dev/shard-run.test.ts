@@ -496,6 +496,24 @@ describe('fixed shard distribution (opt-in · no pre-measurement)', () => {
     expect(result.aggregate).toEqual({ status: 'passed', retryShardIds: [] });
   });
 
+  test('completed bundle callback counts first attempts only and cannot change the verdict', () => {
+    const progress: Array<{ completedShards: number; completedFiles: number; totalShards: number; totalFiles: number }> = [];
+    const run: ShardProcess = (cwd, selected) => ({ exitCode: 0, junit: xml(selected, []) });
+    const result = runShardedGateTests('/head', files, 'HEAD', 3, run, baseline, undefined, {
+      fixedDistribution: true,
+      onShardComplete: (item) => {
+        progress.push(item);
+        if (item.completedShards === 2) throw new Error('observer failure');
+      },
+    });
+    expect(progress).toHaveLength(3);
+    expect(progress.map((item) => [item.completedShards, item.totalShards]))
+      .toEqual([[1, 3], [2, 3], [3, 3]]);
+    expect(progress.map((item) => item.completedFiles)).toEqual([3, 5, 7]);
+    expect(progress.every((item) => item.totalFiles === files.length)).toBe(true);
+    expect(result.aggregate.status).toBe('passed');
+  });
+
   test('a timed-out / OOM-killed or JUnit-less shard is unmeasured, never passed', () => {
     const killed: ShardProcess = (cwd, selected) => selected.includes('test/g1.test.ts') && cwd === '/head'
       ? { exitCode: null, signal: 'SIGKILL' }
@@ -579,5 +597,38 @@ describe('OP FU (MK #8178 shard-9) — a failed shard leaves <shardId>.failure.j
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('remoteShardArgv — GATE-REMOTE-SHARD-PLAN', () => {
+  type RemoteShardSpec = import('./shard-run.js').RemoteShardSpec;
+  const shard: RemoteShardSpec = {
+    orchestrationId: 'orch-28736', shardId: 'orch-28736/shard-2', totalShards: 4, position: 2,
+    files: ['src/a.test.ts'], introducedFiles: ['src/a.test.ts'],
+  };
+
+  test('GATE-REMOTE-SHARD-PLAN: 원격 게이트 명령 argv 에 조각 identity 인자가 실린다', async () => {
+    // 동적 import: 베이스(export 없음)에서도 이 파일은 로드되고 이 시험만 빨개진다(RED 증인).
+    const { remoteShardArgv } = await import('./shard-run.js');
+    expect(remoteShardArgv(shard, { planFile: '/repo/plan.json' })).toEqual([
+      'bun', 'bin/elanous.mjs', '--test', 'self', 'gate', '--changed', '--shards', '4',
+      '--orchestration-id', 'orch-28736', '--shard-id', 'orch-28736/shard-2', '--shard-position', '2',
+      '--shard-plan', '/repo/plan.json',
+    ]);
+    expect(remoteShardArgv(shard)).not.toContain('--shard-plan');
+  });
+
+  test('GATE-REMOTE-SHARD-PLAN: 인자만의 꼴은 index.ts remoteArgv 결선에 그대로 쓰인다', async () => {
+    const { remoteShardArgArgs } = await import('./shard-run.js');
+    expect(remoteShardArgArgs(shard, { planFile: '/repo/plan.json' })).toEqual([
+      '--orchestration-id', 'orch-28736', '--shard-id', 'orch-28736/shard-2', '--shard-position', '2', '--shard-plan', '/repo/plan.json',
+    ]);
+    expect(remoteShardArgArgs(shard)).toEqual(['--orchestration-id', 'orch-28736', '--shard-id', 'orch-28736/shard-2', '--shard-position', '2']);
+  });
+
+  test('GATE-REMOTE-SHARD-PLAN: 조각 identity 검증은 안 되는 세 쌍을 거절한다', async () => {
+    const { remoteShardArgArgs } = await import('./shard-run.js');
+    expect(() => remoteShardArgArgs({ ...shard, position: 0 })).toThrow('positive integer');
+    expect(() => remoteShardArgArgs({ ...shard, shardId: '' })).toThrow('non-empty');
   });
 });

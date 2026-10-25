@@ -1073,8 +1073,6 @@ test('DRAFT-SWEEP-DAILY-SUMMARY · 어제 닫힌 draft 사유가 오늘 브리�
   try {
     seedClosedDraftLog(root, [
       { ts: '2026-10-04T01:00:00Z', event: 'closed', data: { pr: 24001, reason: 'harvest-expired' } },
-      { ts: '2026-10-04T02:00:00Z', event: 'closed', data: { pr: 24002, reason: 'harvest-expired' } },
-      { ts: '2026-10-04T03:00:00Z', event: 'closed', data: { pr: 24003, reason: 'superseded-by #24010' } },
       // 닫힘이 아닌 결정 줄은 세지 않는다.
       { ts: '2026-10-04T04:00:00Z', event: 'decided', data: { number: 24004, action: 'keep', reason: 'recent' } },
     ]);
@@ -1087,24 +1085,44 @@ test('DRAFT-SWEEP-DAILY-SUMMARY · 어제 닫힌 draft 사유가 오늘 브리�
     process.env.PATH = `${bin}:${previousPath ?? ''}`;
     process.env.ELANOUS_GRAPH_DIR = join(root, 'graphs', 'rhythm');
     const deps = draftSummaryDeps(root);
-    const collected = await main(['collect'], deps);
-    expect(collected.draftCloseSummary).toMatchObject({ day: '2026-10-04', closed: 3, state: 'recorded',
-      text: '어제 닫힌 draft 3건 — harvest-expired 2 · superseded-by 1' });
+    const collected = await main(['collect'], deps); // production collect entry
+    expect(collected.draftCloseSummary).toMatchObject({ day: '2026-10-04', closed: 1, state: 'recorded',
+      text: '어제 닫힌 draft 1건 — harvest-expired 1' });
     const items = briefItems(root).list();
     expect(items).toHaveLength(1);
-    expect(items[0]).toMatchObject({ text: '어제 닫힌 draft 3건 — harvest-expired 2 · superseded-by 1',
+    expect(items[0]).toMatchObject({ text: '어제 닫힌 draft 1건 — harvest-expired 1',
       domain: '운영', priority: 'P2', source: DRAFT_CLOSE_BRIEF_SOURCE,
       evidence: 'elanous logs --category self-dev.draft-sweep --event closed --since 24h', created_at: now.toISOString() });
     // 브리핑 화면(`eln brief`)이 그 한 줄을 보여준다.
-    expect(briefItems(root).compose('22:00')).toContain('- [P2] 어제 닫힌 draft 3건 — harvest-expired 2 · superseded-by 1 (근거: elanous logs --category self-dev.draft-sweep --event closed --since 24h · 출처: rhythm.daily.draft-close)');
-    // 같은 날 다시 돌아도 원장 1건 — PR마다 댓글 대신 브리핑 원장 1건이 이 칸의 계약이다.
+    expect(briefItems(root).compose('22:00')).toContain('- [P2] 어제 닫힌 draft 1건 — harvest-expired 1 (근거: elanous logs --category self-dev.draft-sweep --event closed --since 24h · 출처: rhythm.daily.draft-close)');
+    // 같은 날 새 closed 로그가 추가된 뒤 다시 돌아도 브리핑 원장은 하루 1건으로 유지한다.
+    seedClosedDraftLog(root, [
+      { ts: '2026-10-04T04:00:00Z', event: 'closed', data: { pr: 24005, reason: 'claim-expired' } },
+    ]);
     const repeated = await main(['collect'], deps);
     expect(repeated.draftCloseSummary).toMatchObject({ state: 'already-recorded', itemId: items[0]!.id });
     expect(briefItems(root).list()).toHaveLength(1);
+    expect(briefItems(root).compose('22:00')).toContain(items[0]!.text);
     expect(existsSync(spawned)).toBe(false);
     expect(existsSync(join(root, 'rhythm', 'daily', 'delivery.sqlite'))).toBe(false);
   } finally {
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousGraph === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = previousGraph;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('DRAFT-SWEEP-DAILY-SUMMARY · 로그 표본이 없으면 collect 경로는 미측정으로 남기고 브리핑 기록을 만들지 않는다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'rhythm-draft-summary-no-sample-'));
+  const previousGraph = process.env.ELANOUS_GRAPH_DIR;
+  try {
+    process.env.ELANOUS_GRAPH_DIR = join(root, 'graphs', 'rhythm');
+    const collected = await main(['collect'], draftSummaryDeps(root));
+    expect(collected.draftCloseSummary).toMatchObject({ day: '2026-10-04', closed: 0, text: null,
+      state: 'unmeasured', detail: '로그 원장 없음' });
+    expect(existsSync(join(root, 'logs', 'logs.db'))).toBe(false);
+    expect(briefItems(root).list()).toEqual([]);
+  } finally {
     if (previousGraph === undefined) delete process.env.ELANOUS_GRAPH_DIR; else process.env.ELANOUS_GRAPH_DIR = previousGraph;
     rmSync(root, { recursive: true, force: true });
   }

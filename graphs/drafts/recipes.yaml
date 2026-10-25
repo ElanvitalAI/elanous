@@ -1,22 +1,42 @@
+# Inventory reads stop at 100 pages; a capped/incomplete result fails closed before apply.
 classify:
   command: >-
     bun -e 'const ctx=await Bun.file(process.env.ELANOUS_GRAPH_CONTEXT).json();
     const mode=ctx.input?.mode ?? "shadow";
     if (mode !== "shadow" && mode !== "live") throw new Error("draft cleanup mode must be shadow or live");
     const repo=process.env.ELANOUS_GRAPH_DIR+"/../..";
-    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json"], {cwd:process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD || repo,stdout:"pipe",stderr:"pipe"});
-    if (run.exitCode !== 0) { const out=new TextDecoder().decode(run.stdout); let why=""; try { why=JSON.parse(out).error ?? ""; } catch {} throw new Error(new TextDecoder().decode(run.stderr).trim() || why || "draft sweep exit " + run.exitCode); }
-    const result=JSON.parse(new TextDecoder().decode(run.stdout));
-    if (!result.complete || result.apply !== false) throw new Error(result.error ?? "draft sweep classification must be shadow and complete");
-    console.log(JSON.stringify({outcome:mode,counts:result.counts,entries:result.entries}));'
+    const contextPath=process.env.ELANOUS_GRAPH_CONTEXT;
+    const evidence={stdout:contextPath+".draft-cleanup.stdout",stderr:contextPath+".draft-cleanup.stderr",meta:contextPath+".draft-cleanup.evidence.json"};
+    const {writeFile,chmod}=await import("node:fs/promises");
+    const maxOutputBytes=16*1024*1024;
+    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json", "--emit-apply-plan", "--max-pages", "100", "--max-drafts", "300", "--max-merged", "1000"], {cwd:process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD || repo,timeout:540000,maxBuffer:maxOutputBytes,stdout:"pipe",stderr:"pipe"});
+    await writeFile(evidence.stdout, run.stdout, {mode:0o600}); await writeFile(evidence.stderr, run.stderr, {mode:0o600});
+    await writeFile(evidence.meta,JSON.stringify({exitCode:run.exitCode,stdoutBytes:run.stdout.byteLength,stderrBytes:run.stderr.byteLength,maxOutputBytes,truncated:run.exitedDueToMaxBuffer === true,stdoutPath:evidence.stdout,stderrPath:evidence.stderr,recordedAt:new Date().toISOString()}), {mode:0o600});
+    if (run.exitedDueToMaxBuffer) throw new Error("draft cleanup inventory incomplete (truncated: output exceeded "+maxOutputBytes+" bytes); raw evidence="+evidence.meta);
+    if (run.exitCode !== 0) { const out=new TextDecoder().decode(run.stdout).trim().slice(0,4000); const stderr=new TextDecoder().decode(run.stderr).trim().slice(0,4000); throw new Error("draft cleanup inventory incomplete (sweep rc="+run.exitCode+")"+(out ? ": "+out : "")+(stderr ? "\n"+stderr : "")+"; raw evidence="+evidence.meta); }
+    let result; try { result=JSON.parse(new TextDecoder().decode(run.stdout)); } catch (error) { throw new Error("draft cleanup inventory incomplete (invalid sweep JSON): "+String(error)+"; raw evidence="+evidence.meta); }
+    if (!result.complete) throw new Error("draft cleanup inventory incomplete: "+(result.error ?? "complete=false")+"; raw evidence="+evidence.meta);
+    if (result.apply !== false) throw new Error("draft sweep classification must be shadow; raw evidence="+evidence.meta);
+    if (!result.applyPlan || result.applyPlan.entries.length !== result.entries.length) throw new Error("classification apply plan missing or incomplete");
+    console.log(JSON.stringify({outcome:mode,counts:result.counts,entries:result.entries,applyPlan:result.applyPlan}));'
   timeout_ms: 600000
 apply:
   command: >-
     bun -e 'const ctx=await Bun.file(process.env.ELANOUS_GRAPH_CONTEXT).json();
     if (ctx.input?.mode !== "live" || ctx.outputs?.classify?.outcome !== "live") throw new Error("draft cleanup apply requires live mode and completed classification");
+    const plan=ctx.outputs?.classify?.applyPlan;
+    if (!plan || plan.version !== 1 || !Array.isArray(plan.entries)) throw new Error("draft cleanup apply requires the frozen classify plan");
     const repo=process.env.ELANOUS_GRAPH_DIR+"/../..";
-    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json", "--apply"], {cwd:process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD || repo,stdout:"pipe",stderr:"pipe"});
-    if (run.exitCode !== 0) { const out=new TextDecoder().decode(run.stdout); let why=""; try { why=JSON.parse(out).error ?? ""; } catch {} throw new Error(new TextDecoder().decode(run.stderr).trim() || why || "draft sweep exit " + run.exitCode); }
+    const planPath=process.env.ELANOUS_GRAPH_CONTEXT+".draft-apply-plan.json";
+    let run;
+    try {
+      await Bun.write(planPath, JSON.stringify(plan));
+      run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json", "--apply", "--apply-plan-file", planPath], {cwd:process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD || repo,timeout:840000,stdout:"pipe",stderr:"pipe"});
+    } finally {
+      const {unlink}=await import("node:fs/promises");
+      await unlink(planPath).catch(()=>{});
+    }
+    if (run.exitCode !== 0) { const out=new TextDecoder().decode(run.stdout); let why=""; try { why=JSON.parse(out).error ?? ""; } catch {} const stderr=new TextDecoder().decode(run.stderr).trim(); throw new Error([why,stderr].filter(Boolean).join("\n") || "draft sweep exit " + run.exitCode); }
     const result=JSON.parse(new TextDecoder().decode(run.stdout));
     if (!result.complete || result.apply !== true) throw new Error(result.error ?? "draft sweep application must be live and complete");
     console.log(JSON.stringify({outcome:"ok",counts:result.counts,entries:result.entries}));'

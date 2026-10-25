@@ -32,6 +32,7 @@ import {
   type AcceptanceReport,
 } from './acceptance.js';
 import { recordOpsEventSafe, type OpsEventInput } from '../domains/ops-log.js';
+import { defaultAnomalyCluster, extractContainerExit, type AnomalyCluster } from '../loops/orchestrator/anomaly-cluster.js';
 
 // ───────────────────────── Concurrency caps ────────────────────────
 
@@ -82,6 +83,9 @@ export interface DispatcherOptions {
    *  acceptance.checks reference fs or subprocess (file-exists /
    *  file-contains / shell-zero). */
   acceptanceIo?: AcceptanceIo;
+  /** ANOMALY-CLUSTER — grouping state written at the failure record point; while a signature has 3+ runs
+   *  and no cause verdict, relaunches of that goal·host are deferred instead of spawned. */
+  anomalyCluster?: AnomalyCluster;
 }
 
 export interface DispatchTickResult {
@@ -95,7 +99,7 @@ export interface DispatchTickResult {
   }>;
   /** Ready tasks we skipped this tick due to caps. Caller may `tick()`
    *  again after any adapter completes. */
-  deferred: Array<{ taskId: string; reason: 'cap' | 'no-adapter' | 'intake-sequential' }>;
+  deferred: Array<{ taskId: string; reason: 'cap' | 'no-adapter' | 'intake-sequential' | 'anomaly-hold' }>;
 }
 
 export class TaskDispatcher {
@@ -103,10 +107,13 @@ export class TaskDispatcher {
   private readonly activeByKind = new Map<TaskSurfaceKind, number>();
   private readonly abortByTask = new Map<string, AbortController>();
   private readonly now: () => number;
+  /** Production default is the process-wide cluster so tick-recorded failures gate relaunch here. */
+  private readonly anomaly: AnomalyCluster;
 
   constructor(private readonly opts: DispatcherOptions) {
     this.caps = { ...DEFAULT_CONCURRENCY_CAPS, ...(opts.concurrencyCaps ?? {}) };
     this.now = opts.now ?? Date.now;
+    this.anomaly = opts.anomalyCluster ?? defaultAnomalyCluster();
   }
 
   /**
@@ -145,6 +152,12 @@ export class TaskDispatcher {
       const cap = this.caps[kind] ?? 1;
       if (active >= cap) {
         deferred.push({ taskId: task.id, reason: 'cap' });
+        continue;
+      }
+      // ANOMALY-CLUSTER relaunch gate: the task's goal·host relaunch is deferred while its signature has
+      // 3+ runs and no cause verdict has cleared it. Goal = task id, host = surface kind.
+      if (this.anomaly.hold(task.id, kind).hold) {
+        deferred.push({ taskId: task.id, reason: 'anomaly-hold' });
         continue;
       }
       const result = this.spawn(task, adapter);
@@ -217,6 +230,24 @@ export class TaskDispatcher {
         deferred: taskIds.length,
         deferredTaskIds: taskIds,
       });
+    }
+  }
+
+  /** Records one failed attempt into the anomaly cluster (goal·host key, host excluded from signature). */
+  private recordAnomalyFailure(task: Task, observation: { runId: string; kind: string; stage: string; lastLines: string[] }): void {
+    try {
+      this.anomaly.record({
+        goal: task.id,
+        host: task.surface.kind,
+        runId: observation.runId,
+        kind: observation.kind,
+        containerExit: extractContainerExit(observation.lastLines.join('\n')),
+        stage: observation.stage,
+        lastLines: observation.lastLines,
+        at: new Date(this.now()).toISOString(),
+      });
+    } catch {
+      // Observability must not alter dispatch admission or completion.
     }
   }
 
@@ -322,6 +353,8 @@ export class TaskDispatcher {
         this.recordOps(task, 'cycle_end', nextStatus, { execStatus: exec.status, durationMs: exec.durationMs });
 
         if (nextStatus === 'done') {
+          // Cause verdict — the same goal·host produced a clean run, so the relaunch hold is cleared.
+          this.anomaly.release(task.id, kind, '원인 판정: 실행이 정상 완료됨');
           this.opts.bus?.emit({
             kind: 'task-completed',
             taskId: task.id,
@@ -337,6 +370,12 @@ export class TaskDispatcher {
             reason: 'user',
           });
         } else {
+          this.recordAnomalyFailure(task, {
+            runId: exec.id,
+            kind: exec.status === 'timeout' ? 'timeout' : 'exit',
+            stage: 'monitor',
+            lastLines: [exec.error?.message ?? '', `Reason: ${exec.error?.code ?? 'UNKNOWN'}`],
+          });
           this.opts.bus?.emit({
             kind: 'task-failed',
             taskId: task.id,
@@ -368,6 +407,12 @@ export class TaskDispatcher {
         this.opts.store?.saveTask(this.opts.graph.getTask(task.id)!);
       } catch { /* ignore illegal transition */ }
       this.recordOps(task, 'cycle_end', 'failed', { errorCode: 'ADAPTER_ERROR', error: err instanceof Error ? err.message.slice(0, 120) : String(err) });
+      this.recordAnomalyFailure(task, {
+        runId: res.executionId,
+        kind: 'adapter-error',
+        stage: 'monitor',
+        lastLines: [err instanceof Error ? err.message : String(err)],
+      });
       this.opts.bus?.emit({
         kind: 'task-failed',
         taskId: task.id,

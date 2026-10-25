@@ -93,12 +93,34 @@ export function listKnownGraphUnits(dir = defaultGraphsDir()): KnownGraphUnit[] 
   }).sort((a, b) => a.call.localeCompare(b.call));
 }
 
+/** 호출 경계로 올리는 조작 growth 요약 — 어느 from 노드에서 무엇을 끼우려 했나. */
+export interface GraphVariantGrowthTrace {
+  readonly from: string;
+  readonly outcome: string;
+  readonly nodeId: string;
+  readonly returnTo?: string;
+}
+
+/**
+ * 설계자 한 턴의 결말 — mode·reason 은 호출 경계가 관측으로 기록하는 필드다(composed 는 'composed',
+ * fallback-standard 는 그 사유 문자열 그대로). growth 는 설계자가 조작한 from 노드를 그대로 올린다.
+ */
 export type GraphVariantDesignResult =
-  | { readonly status: 'composed'; readonly plan: GraphVariantPlan; readonly variant: Extract<GraphVariantResult, { ok: true }> }
-  | { readonly status: 'fallback-standard'; readonly template: GraphTemplateSpec; readonly reason: string };
+  | { readonly mode: 'variant'; readonly status: 'composed'; readonly reason: 'composed'; readonly plan: GraphVariantPlan; readonly variant: Extract<GraphVariantResult, { ok: true }>; readonly growth?: GraphVariantGrowthTrace }
+  | { readonly mode: 'variant'; readonly status: 'fallback-standard'; readonly template: GraphTemplateSpec; readonly reason: string; readonly growth?: GraphVariantGrowthTrace };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** 설계자 출력에서 조작 growth 의 좌표만 읽는다 — 모양이 틀려도 «어느 from 이었나»는 남긴다. */
+function growthTraceOf(record: Record<string, unknown> | null): GraphVariantGrowthTrace | undefined {
+  const growth = record?.growth;
+  if (!isRecord(growth) || typeof growth.from !== 'string' || typeof growth.outcome !== 'string') return undefined;
+  const node = isRecord(growth.node) ? growth.node : undefined;
+  if (typeof node?.nodeId !== 'string') return undefined;
+  return { from: growth.from, outcome: growth.outcome, nodeId: node.nodeId,
+    ...(typeof growth.returnTo === 'string' ? { returnTo: growth.returnTo } : {}) };
 }
 
 /** One L2 designer proposal. The model returns only a plan; the existing variant authority decides whether it may run. */
@@ -127,9 +149,10 @@ export async function designGraphVariantPlan(input: {
   catch (error) {
     const reason = `designer-output: ${error instanceof Error ? error.message : String(error)}`;
     debug.log('graph.compose', 'fallback-standard', { goal: input.goal, reason });
-    return { status: 'fallback-standard', template: input.template, reason };
+    return { mode: 'variant', status: 'fallback-standard', template: input.template, reason };
   }
   const record = isRecord(raw) ? raw : null;
+  const growthTrace = growthTraceOf(record);
   const allowed = new Set(['maxVisits', 'routes', 'growth']);
   const maxVisits = record?.maxVisits;
   const routes = record?.routes;
@@ -158,17 +181,17 @@ export async function designGraphVariantPlan(input: {
   if (!valid) {
     const reason = 'designer-output: invalid GraphVariantPlan or unknown unit';
     debug.log('graph.compose', 'fallback-standard', { goal: input.goal, reason });
-    return { status: 'fallback-standard', template: input.template, reason };
+    return { mode: 'variant', status: 'fallback-standard', template: input.template, reason, ...(growthTrace ? { growth: growthTrace } : {}) };
   }
   const plan = record as GraphVariantPlan;
   const variant = createGraphVariant({ template: input.template, goal: input.goal, plan });
   if (!variant.ok) {
     const reason = `variant-rejected: ${JSON.stringify(variant.rejections)}`;
     debug.log('graph.compose', 'fallback-standard', { goal: input.goal, reason });
-    return { status: 'fallback-standard', template: input.template, reason };
+    return { mode: 'variant', status: 'fallback-standard', template: input.template, reason, ...(growthTrace ? { growth: growthTrace } : {}) };
   }
   debug.log('graph.compose', 'composed', { goal: input.goal, overlayId: variant.overlay.overlayId, patches: variant.patches.length });
-  return { status: 'composed', plan, variant };
+  return { mode: 'variant', status: 'composed', reason: 'composed', plan, variant, ...(growthTrace ? { growth: growthTrace } : {}) };
 }
 
 /** Inventory used by the editor's pack picker and the wizard's validation. */

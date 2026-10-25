@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test, spyOn } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test, spyOn, setDefaultTimeout } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,6 +8,9 @@ import { commitWorktree } from './seams.js';
 import { runSelfImplement } from './orchestrator.js';
 import { seams } from './test-seams.js';
 import { dropStaleReverts } from './revert-guard.js';
+
+// Every case creates Git history and inspects commits; node-b load can exceed Bun's 5s default.
+setDefaultTimeout(20_000);
 
 let repo: string;
 const git = (...args: string[]) => execFileSync('git', args, { cwd: repo }).toString().trim();

@@ -134,6 +134,7 @@ export async function seatReport(seat: string, deps: SeatReportDeps = {}): Promi
         const [{ resolveRepositoryName }, { githubDraftSweepAdapters }] = await Promise.all([
           import('../harness/repository-name.js'), import('../harness/harness-cli-command.js'),
         ]);
+        // The collector folds repeated PR pages before this report formats the census.
         return collectDraftMetrics(resolveRepositoryName({}), githubDraftSweepAdapters(), clock);
       }))(now);
       draftDetail = ` · draft 재고 ${metrics.inventory} · 최장 나이 ${metrics.oldestAgeHours === null ? '해당 없음' : `${metrics.oldestAgeHours.toFixed(1)}h`} · needs-owner ${metrics.needsOwner} · 48h 전환율 ${metrics.conversion48h === null ? '표본 없음' : `${(metrics.conversion48h * 100).toFixed(1)}% (${metrics.converted48h}/${metrics.cohort48h})`}`;

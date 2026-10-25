@@ -9,6 +9,8 @@
 //   classic-seat-boot      TUI-SESSION-BOOT — COORD_ID seat ⊕ seat-state dir ⊕ one unread mail → first-screen line ⊕ card-injected on the first turn
 //                          ⊕ TUI-SEAT-MEMORY-RECALL: a hand handoff (HANDOFF-now.md) → one `memory-recall` hit (source · chars ≤ cap)
 //   classic-typing-lag     TUI-TYPING-LAG-REST — keys typed right after Enter in a git repo cwd → echo complete ⊕ `tui.input-lag` turn-start/keystroke rows
+//   classic-mcp-calltool   CLASSIC-IDLE-MCP-LAZY — cached tools leave the child absent at boot; first real TUI dispatch starts one
+//                          fake MCP child and completes one tools/call through the production proxy
 //   classic-paste          TUI-PASTE-ECHO — short bracketed paste shows as typed · 50-line paste shows one placeholder ·
 //                          the model receives the whole original text (fake LLM request capture)
 //   classic-goal-continue  TURN-END-BEFORE-GOAL — every reply only promises («…진행하겠습니다.») → one goal-continue
@@ -22,7 +24,7 @@
 //   classic-wakeup         TUI-WAKEUP-DEFER-NOT-DROP — ScheduleWakeup(60s) ⊕ a human turn busy for ~2.5 min over the due time →
 //                          NotIdle three times or more (the old code dropped after the second) · skipped 0 · then one internal turn
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { openMsgStore } from '../msg/msg-store.js';
 import { SEAT_MEMORY_RECALL_MAX_CHARS, SEAT_MEMORY_RECALL_PREFIX } from '../dashboard/seat-boot-preamble.js';
@@ -35,7 +37,7 @@ import {
 import { pasteFoldToken } from '../chat/paste-fold.js';
 import { bracketedPaste, CLIP_TEXT, GOAL_CONTINUE_PLEDGE_REPLY, GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL, goalInterimScreenCounts, INTERNAL_TURN_USER_HEADER, clipboardShimPath, PASTE_LONG, PASTE_LONG_TOKEN, PASTE_SHORT, parseData, readLogs } from './next-tui-seat-scenarios.js';
 
-export const CLASSIC_TUI_SCENARIOS = ['classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop'] as const;
+export const CLASSIC_TUI_SCENARIOS = ['classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop'] as const;
 export type ClassicTuiScenario = (typeof CLASSIC_TUI_SCENARIOS)[number];
 
 export interface ClassicTuiScenarioSpec {
@@ -57,12 +59,61 @@ export interface ClassicTuiScenarioResult {
 }
 
 const REPLY = '[fake-llm] 답했습니다';
+const CLASSIC_MCP_SERVER_ID = 'classic-echo';
+const CLASSIC_MCP_TOOL_NAME = 'echo';
+const CLASSIC_MCP_TOOL = {
+  name: CLASSIC_MCP_TOOL_NAME,
+  description: 'Return the supplied value from the isolated MCP fixture.',
+  inputSchema: {
+    type: 'object',
+    properties: { value: { type: 'string' } },
+    required: ['value'],
+  },
+};
+const CLASSIC_MCP_SERVER_SOURCE = `
+import { appendFileSync } from 'node:fs';
+
+const [eventFile] = process.argv.slice(2);
+const record = (event, data = {}) => appendFileSync(eventFile, JSON.stringify({ event, ...data }) + '\\n');
+const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');
+record('start');
+let buffer = '';
+process.stdin.on('data', (chunk) => {
+  buffer += chunk.toString('utf8');
+  let index = buffer.indexOf('\\n');
+  while (index >= 0) {
+    const line = buffer.slice(0, index).trim();
+    buffer = buffer.slice(index + 1);
+    index = buffer.indexOf('\\n');
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.id === undefined) continue;
+    if (message.method === 'initialize') {
+      record('initialize');
+      reply(message.id, {
+        protocolVersion: message.params?.protocolVersion ?? '2025-06-18',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'classic-calltool-fixture', version: '0.0.0' },
+      });
+    } else if (message.method === 'tools/list') {
+      record('tools/list');
+      reply(message.id, { tools: [${JSON.stringify(CLASSIC_MCP_TOOL)}] });
+    } else if (message.method === 'tools/call') {
+      record('tools/call', { name: message.params?.name, arguments: message.params?.arguments });
+      reply(message.id, { content: [{ type: 'text', text: JSON.stringify(message.params?.arguments ?? {}) }] });
+    } else {
+      reply(message.id, {});
+    }
+  }
+});
+process.stdin.on('end', () => process.exit(0));
+`;
 /** Env name the fake provider needs to count as «a provider» in the live TUI (llm.ts · isolated stages only). */
 const FAKE_AS_PROVIDER_ENV = 'ELANOUS_TEST_FAKE_LLM_AS_PROVIDER';
 /** The per-turn autoheal cap (TUI-400-AUTOHEAL-FALLBACK: «턴당 2회 상한») — the production constant, not a copy. */
 const AUTOHEAL_CAP = AUTOHEAL_MAX_ATTEMPTS;
 
-type Row = { category?: string; event?: string; data?: string };
+type Row = { category?: string; event?: string; data?: unknown };
 
 const classicReady = (s: string) => s.includes('elanous | daemon') && s.includes('실행 ') && s.includes('❯');
 const turnDone = (s: string) => /✔ 완료|✘ 실패/.test(s);
@@ -109,7 +160,7 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     quitKeys: '/exit\r',
     exitTimeoutMs: 20_000,
   };
-  const logCategories = 'llm.router,self-health.autoheal,dashboard.seat-boot,tui.input-lag,tui.wakeup,tui.autoturn,tui.paste,tui.goal-continue,tui.proactive,tui.goal-interim,tui.autowake';
+  const logCategories = 'llm.router,mcp.client,self-health.autoheal,dashboard.seat-boot,tui.input-lag,tui.wakeup,tui.autoturn,tui.paste,tui.goal-continue,tui.proactive,tui.goal-interim,tui.autowake';
   const finish = (run: SeatPtySequenceEvidence, store: Record<string, unknown>, checks: (rows: Row[]) => Record<string, boolean>): ClassicTuiScenarioResult => {
     const logs = readLogs({ root, executable: spec.executable, entry: spec.entry }, logCategories);
     return { scenario: spec.scenario, universe: root, run, store, logs, checks: checks(rowsOf(logs)) };
@@ -202,6 +253,109 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
         exitedClean: run.exitCode === 0,
       };
     });
+  }
+
+  if (spec.scenario === 'classic-mcp-calltool') {
+    const serverScript = join(root, 'fake-classic-mcp-server.mjs');
+    const eventPath = join(root, 'fake-classic-mcp-events.jsonl');
+    const capturePath = join(root, 'fake-llm-requests.jsonl');
+    const logsDirectory = join(root, '.elanous', 'debug');
+    writeFileSync(serverScript, CLASSIC_MCP_SERVER_SOURCE, 'utf8');
+    // A prior boot's index is the production deferred-boot contract: no child starts until callTool.
+    writeFileSync(join(root, 'mcp-tool-index.json'), JSON.stringify({ [CLASSIC_MCP_SERVER_ID]: [CLASSIC_MCP_TOOL] }, null, 2));
+    writeFileSync(join(root, 'config.json'), JSON.stringify({
+      onboarding: { completed: true },
+      errorReports: { enabled: false },
+      mcp: {
+        enabled: true,
+        servers: [{
+          id: CLASSIC_MCP_SERVER_ID,
+          transport: 'stdio',
+          command: [process.execPath, serverScript, eventPath],
+          authorizedTools: [CLASSIC_MCP_TOOL_NAME],
+        }],
+      },
+    }));
+    env[TEST_FAKE_LLM_CAPTURE_ENV] = capturePath;
+    env[TEST_FAKE_LLM_TOOL_CALL_ENV] = JSON.stringify({
+      when: 'MCP 도구를 호출해',
+      name: `${CLASSIC_MCP_SERVER_ID}.${CLASSIC_MCP_TOOL_NAME}`,
+      args: { value: 'first-call-success' },
+    });
+    const readMcpDebugRows = (): Row[] => {
+      if (!existsSync(logsDirectory)) return [];
+      return readdirSync(logsDirectory)
+        .filter((name) => (name.startsWith('debug-') || name.startsWith('chat-')) && name.endsWith('.log'))
+        .flatMap((name) => readFileSync(join(logsDirectory, name), 'utf8').split('\n').filter(Boolean))
+        .flatMap((line) => { try { return [JSON.parse(line) as Row]; } catch { return []; } })
+        .filter((row) => row.category === 'mcp.client');
+    };
+    const deferredBeforeCall = { value: false };
+    const run = await mockSeatPtySequence({
+      ...base,
+      env,
+      steps: [
+        {
+          label: 'deferred with no child',
+          until: (screen) => {
+            if (!classicReady(screen)) return false;
+            const deferred = readMcpDebugRows().some((row) => {
+              const data = parseData<{ server: string; reason: string }>(row.data);
+              return row.event === 'lazy-boot' && data.server === CLASSIC_MCP_SERVER_ID && data.reason === 'deferred';
+            });
+            deferredBeforeCall.value = deferred && !existsSync(eventPath);
+            return deferredBeforeCall.value;
+          },
+          timeoutMs: 60_000,
+        },
+        {
+          label: 'first MCP callTool answered',
+          text: 'MCP 도구를 호출해',
+          until: (screen) => screen.includes(REPLY) && screen.includes(`${CLASSIC_MCP_SERVER_ID}.${CLASSIC_MCP_TOOL_NAME} — result (`) && turnDone(screen),
+          timeoutMs: 90_000,
+        },
+      ],
+    });
+    const fakeServerEvents = existsSync(eventPath)
+      ? readFileSync(eventPath, 'utf8').split('\n').filter(Boolean).flatMap((line) => {
+          try { return [JSON.parse(line) as { event?: string; name?: string; arguments?: Record<string, unknown> }]; }
+          catch { return []; }
+        })
+      : [];
+    const mcpRows = readMcpDebugRows();
+    const lazyBoots = mcpRows.filter((row) => row.event === 'lazy-boot')
+      .map((row) => parseData<{ server: string; reason: string }>(row.data))
+      .filter((row) => row.server === CLASSIC_MCP_SERVER_ID);
+    const callEvents = fakeServerEvents.filter((event) => event.event === 'tools/call');
+    const response = run.frames.at(-1)?.screen ?? '';
+    const debugLines = existsSync(logsDirectory)
+      ? readdirSync(logsDirectory)
+        .filter((name) => (name.startsWith('debug-') || name.startsWith('chat-')) && name.endsWith('.log'))
+        .flatMap((name) => readFileSync(join(logsDirectory, name), 'utf8').split('\n').filter(Boolean))
+        .filter((line) => { try { return (JSON.parse(line) as Row).category === 'mcp.client'; } catch { return false; } })
+      : [];
+    const logs = { command: `isolated debug ledger ${logsDirectory}`, rc: 0, lines: debugLines, eventCount: debugLines.length, limit: 200 };
+    const providerLogs = readLogs({ root, executable: spec.executable, entry: spec.entry }, 'llm.router');
+    return {
+      scenario: spec.scenario,
+      universe: root,
+      run,
+      store: { eventPath, fakeServerEvents, capturePath, providerCalls: readCapturedRequests(capturePath).length },
+      logs,
+      checks: {
+        childWasAbsentAfterDeferredBoot: deferredBeforeCall.value,
+        fakeServerStartedOnce: fakeServerEvents.filter((event) => event.event === 'start').length === 1,
+        actualMcpToolsCallOnce: callEvents.length === 1
+          && callEvents[0]?.name === CLASSIC_MCP_TOOL_NAME
+          && callEvents[0]?.arguments?.value === 'first-call-success',
+        lazyBootDeferredThenFirstCall: lazyBoots.map((event) => event.reason).join(',') === 'deferred,first-call',
+        firstCallResultReachedTui: response.includes(`${CLASSIC_MCP_SERVER_ID}.${CLASSIC_MCP_TOOL_NAME} — result (`)
+          && callEvents.length === 1 && callEvents[0]?.arguments?.value === 'first-call-success'
+          && response.includes(REPLY) && turnDone(response),
+        onlyFakeProvider: onlyFake(rowsOf(providerLogs)),
+        exitedClean: run.exitCode === 0,
+      },
+    };
   }
 
   if (spec.scenario === 'classic-orphan-autostop') {

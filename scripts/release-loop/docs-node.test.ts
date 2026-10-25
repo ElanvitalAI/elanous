@@ -1,7 +1,7 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { runDocs } from './docs-node.js';
+import { commandRunner, graphDocs, runDocs } from './docs-node.js';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -920,3 +920,98 @@ test('RELEASE-NOTES-EN-AUTOFIX: the production graph entry writes English releas
   expect(readOr(notes)).toContain('## Also in this release\n\n- Late-landed item\n');
   expect(readOr(notes)).not.toMatch(/[\uac00-\ud7a3]/);
 }, 120_000);
+
+function ownedDocsFixture() {
+  const root = mkdtempSync(join(tmpdir(), 'release-docs-owned-'));
+  scratch.push(root);
+  const bare = join(root, 'origin.git');
+  const repo = join(root, 'repo');
+  const state = join(root, 'state');
+  const git = (cwd: string, ...args: string[]) => commandRunner('git', args, cwd);
+  git(root, 'init', '--bare', '-b', 'main', bare);
+  git(root, 'clone', bare, repo);
+  git(repo, 'config', 'user.name', 'Docs Fixture');
+  git(repo, 'config', 'user.email', 'docs@example.invalid');
+  mkdirSync(join(repo, 'release/public/docs/releases'), { recursive: true });
+  mkdirSync(join(repo, 'website'), { recursive: true });
+  writeFileSync(join(repo, 'release/public/docs/releases/.gitkeep'), '');
+  writeFileSync(join(repo, 'release/public/docs/intro.md'), '🟡 on main — next release\n');
+  writeFileSync(join(repo, 'website/pages.json'), JSON.stringify({ pages: [] }) + '\n');
+  git(repo, 'add', 'release/public/docs', 'website/pages.json');
+  git(repo, 'commit', '-m', 'seed');
+  git(repo, 'push', '-u', 'origin', 'main');
+  mkdirSync(join(state, 'release/9.9.9'), { recursive: true });
+  writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({
+    version: '9.9.9', baseline: { ref: 'v9.9.8', sha: 'base' }, cutoff: { sha: 'cut' },
+    in: [{ sha: 'one', title: 'Title', line: 'New behavior', kind: 'feat', docs: 'present', prNumber: 42 }],
+    deferred: [], escalate: [],
+  }));
+  const context = (runId = 'run-one') => ({ runId, input: { version: '9.9.9', previousVersion: '9.9.8' },
+    outputs: Object.fromEntries(['gate', 'prepare', 'upgrade', 'tui'].map((id) => [id, { outcome: 'ok' }])) });
+  const runner = (command: string, args: string[], cwd?: string, timeout?: number, env?: NodeJS.ProcessEnv) =>
+    command === 'bun' && args[0] === 'install' ? '' : commandRunner(command, args, cwd, timeout, env);
+  const execute = (runId?: string) => graphDocs(context(runId), {}, repo, runner, state);
+  return { root, bare, repo, state, git, execute };
+}
+
+test('RELEASE-NODE-IDEMPOTENT docs: same run and attempt reuse the verified tree and pushed head', () => {
+  const f = ownedDocsFixture();
+  const first = f.execute();
+  expect(first).toMatchObject({ outcome: 'ok', branch: 'release-docs/9.9.9', artifactOwner: { runId: 'run-one', attempt: 0 } });
+  const head = f.git(f.repo, 'rev-parse', 'release-docs/9.9.9');
+  const second = f.execute();
+  expect(second).toMatchObject({ outcome: 'ok', worktree: first.worktree, artifactOwner: { runId: 'run-one', attempt: 0 } });
+  expect(f.git(f.repo, 'rev-parse', 'release-docs/9.9.9')).toBe(head);
+  expect(f.git(f.bare, 'rev-parse', 'release-docs/9.9.9')).toBe(head);
+});
+
+test('RELEASE-NODE-IDEMPOTENT docs: new attempt backs up local and remote refs, then pushes a descendant without force', () => {
+  const f = ownedDocsFixture();
+  const first = f.execute();
+  expect(first.outcome).toBe('ok');
+  const foreign = join(f.root, 'foreign');
+  f.git(f.root, 'clone', f.bare, foreign);
+  f.git(foreign, 'config', 'user.name', 'Foreign Fixture');
+  f.git(foreign, 'config', 'user.email', 'foreign@example.invalid');
+  f.git(foreign, 'switch', '-c', 'release-docs/9.9.9', '--track', 'origin/release-docs/9.9.9');
+  writeFileSync(join(foreign, 'release/public/docs/foreign.md'), 'Old attempt note.\n');
+  f.git(foreign, 'add', 'release/public/docs/foreign.md');
+  f.git(foreign, 'commit', '-m', 'old attempt changed docs');
+  f.git(foreign, 'push', 'origin', 'release-docs/9.9.9');
+  const oldRemote = f.git(f.bare, 'rev-parse', 'release-docs/9.9.9');
+  mkdirSync(join(f.state, 'release/9.9.9/resume-attempts'), { recursive: true });
+  writeFileSync(join(f.state, 'release/9.9.9/resume-attempts/run-one.json'), JSON.stringify({
+    version: '9.9.9', runId: 'run-one', attempts: ['2026-10-23T00:00:00.000Z'],
+  }));
+  const resumed = f.execute();
+  expect(resumed).toMatchObject({ outcome: 'ok', artifactOwner: { runId: 'run-one', attempt: 1, remoteHead: oldRemote } });
+  const backup = resumed.artifactOwner!.remoteBackup!;
+  expect(f.git(f.bare, 'rev-parse', backup)).toBe(oldRemote);
+  expect(f.git(f.repo, 'rev-parse', resumed.artifactOwner!.localBackup!)).toBe(f.git(first.worktree!, 'rev-parse', 'HEAD'));
+  const newRemote = f.git(f.bare, 'rev-parse', 'release-docs/9.9.9');
+  expect(f.git(f.repo, 'merge-base', oldRemote, newRemote)).toBe(oldRemote);
+  expect(existsSync(join(resumed.worktree!, 'release/public/docs/foreign.md'))).toBe(false);
+  expect(readFileSync(join(resumed.worktree!, 'release/public/docs/releases/9.9.9.md'), 'utf8')).toContain('New behavior');
+  const receipt = JSON.parse(readFileSync(join(f.state, 'release/9.9.9/docs-branch-owner.json'), 'utf8'));
+  expect(receipt).toMatchObject({ outcome: 'pushed', owner: { runId: 'run-one', attempt: 1, remoteBackup: backup }, head: newRemote });
+});
+
+test('RELEASE-NODE-IDEMPOTENT docs: foreign remote code changes fail closed and leave its tip untouched', () => {
+  const f = ownedDocsFixture();
+  expect(f.execute().outcome).toBe('ok');
+  const foreign = join(f.root, 'foreign-code');
+  f.git(f.root, 'clone', f.bare, foreign);
+  f.git(foreign, 'config', 'user.name', 'Foreign Fixture');
+  f.git(foreign, 'config', 'user.email', 'foreign@example.invalid');
+  f.git(foreign, 'switch', '-c', 'release-docs/9.9.9', '--track', 'origin/release-docs/9.9.9');
+  mkdirSync(join(foreign, 'src'));
+  writeFileSync(join(foreign, 'src/foreign.ts'), 'export const foreign = true;\n');
+  f.git(foreign, 'add', 'src/foreign.ts');
+  f.git(foreign, 'commit', '-m', 'foreign code');
+  f.git(foreign, 'push', 'origin', 'release-docs/9.9.9');
+  const before = f.git(f.bare, 'rev-parse', 'release-docs/9.9.9');
+  const result = f.execute('run-two');
+  expect(result).toMatchObject({ outcome: 'error' });
+  expect(result.error).toContain('outside public docs');
+  expect(f.git(f.bare, 'rev-parse', 'release-docs/9.9.9')).toBe(before);
+});

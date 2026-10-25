@@ -18,6 +18,7 @@ import {
   liveFetchRemoteLogs, podObservationGapNotice,
   runLogsLevel,
 } from './logs-cli.js';
+import { GRAPH_TEMPLATES, measureL0Coverage } from '../self-implement/graph-templates.js';
 import { LogStore, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import type { LogInstanceView } from '../mss/logging/instance-registry.js';
 import { RemotesStore } from './remotes.js';
@@ -3751,6 +3752,240 @@ describe('runLogsCli — remote /v1/logs', () => {
       setResolveDaemonEndpointForTest(null);
       globalThis.fetch = original;
       spy.mockRestore();
+    }
+  });
+});
+
+// ── ARG-L0-COVER — 런 종료 «이후» 부모·Pod 조인 L0 재계산 ────────────────
+//
+// 무대 = 격리 임시 HOME 아래 부모·Pod 두 개의 실 logs.db 스토어(생산 쓰기 API `insertBatch`).
+// 조회는 **생산 진입점** `runLogsCli`(CLI action 이 부르는 그 함수)를 그대로 지난다 — 소스 문자열 grep 이 아니다.
+describe('logs --recompute — 부모·Pod 조인 L0 재계산 (ARG-L0-COVER)', () => {
+  const template = GRAPH_TEMPLATES['self-implement']!;
+  const declaredNodeIds = template.nodes.map((node) => node.nodeId);
+  const PARENT_NODES = declaredNodeIds.slice(0, 11);
+  const POD_NODES = declaredNodeIds.slice(11, 26);
+  const FOREIGN_NODES = declaredNodeIds.slice(26, 28);
+  const SKIPPED_NODE = declaredNodeIds[28]!;
+  const JOURNEY = 'jrn-arg-l0-cover';
+
+  // 재계산 코어는 «런타임 모듈 조회»로 얻는다 — 이 시험 파일이 재계산이 아직 없는 조상 트리에서도 «로드»되어
+  // 모듈 적재 오류가 아니라 «단언 실패»로 RED 를 남기게 하기 위해서다(게이트의 red-witness 는 단언 실패만 인정).
+  type LogsCliModule = typeof import('./logs-cli.js');
+  const loadRecomputeCore = async (): Promise<Pick<LogsCliModule, 'recomputeJoinedL0Coverage' | 'renderJoinedL0Coverage'>> => {
+    const mod = await import('./logs-cli.js');
+    expect(typeof (mod as Partial<LogsCliModule>).recomputeJoinedL0Coverage).toBe('function');
+    expect(typeof (mod as Partial<LogsCliModule>).renderJoinedL0Coverage).toBe('function');
+    return mod;
+  };
+
+  const entryRow = (node: string, identity: Record<string, unknown>) => ({
+    event: 'pipeline-node-entry',
+    data: JSON.stringify({
+      node, round: 0, phase: 'journey', graphId: template.graphId, graphVersion: template.version, ...identity,
+    }),
+  });
+
+  it('journeyKey 로 Pod(runId 다름)를 붙이고, 미조인은 스토어·사유별로, 미관측은 미관측대로 남긴다', async () => {
+    const { recomputeJoinedL0Coverage, renderJoinedL0Coverage } = await loadRecomputeCore();
+    const result = recomputeJoinedL0Coverage(template, {
+      runId: 'run-parent',
+      journeyKey: JOURNEY,
+      stores: [
+        { name: 'parent', rows: PARENT_NODES.map((node) => entryRow(node, { runId: 'run-parent', journeyKey: JOURNEY })) },
+        { name: 'pod', rows: POD_NODES.map((node) => entryRow(node, { runId: 'run-pod', journeyKey: JOURNEY })) },
+        { name: 'prod:other', rows: FOREIGN_NODES.map((node) => entryRow(node, { runId: 'run-foreign', journeyKey: 'jrn-other' })) },
+      ],
+      storesNotQueried: ['test:unopened'],
+    }, measureL0Coverage);
+
+    // 부모 11 + Pod 15 = 26 노드가 «한 조인»으로 합쳐진다.
+    expect(result.joinedNodes.map(({ node }) => node)).toEqual([...PARENT_NODES, ...POD_NODES]);
+    expect(result.joinedNodes.find(({ node }) => node === PARENT_NODES[0]!)).toEqual({ node: PARENT_NODES[0]!, hosts: ['parent'] });
+    // ⭐ 이 조각의 요점 — Pod 는 runId 가 다르지만 journeyKey 가 같아 붙는다.
+    expect(result.joinedNodes.find(({ node }) => node === POD_NODES[0]!)).toEqual({ node: POD_NODES[0]!, hosts: ['pod'] });
+
+    // 조인 안 된 노드는 한 덩어리가 아니라 «스토어(우주/호스트)별 + 사유별»로 나온다.
+    expect(result.unjoinedByHost).toEqual([{
+      host: 'prod:other',
+      count: FOREIGN_NODES.length,
+      reasons: [{ reason: 'journey-key-mismatch', nodes: [...FOREIGN_NODES].sort() }],
+    }]);
+
+    // ⛔ 미관측은 skipped 도 0 도 아니다 — 조인·미조인 어디에도 없는 선언 노드로만 남는다.
+    expect(result.unobservedNodes).toEqual(declaredNodeIds.slice(28));
+    expect(result.skippedNodes).toEqual([]);
+    expect(result.accountedNodeCount).toBe(PARENT_NODES.length + POD_NODES.length);
+    expect(result.accountedNodeCount).toBeLessThan(result.declaredNodeCount);
+    expect(result.declaredNodeCount).toBe(declaredNodeIds.length);
+    expect(result.traversalCoverage).toBe(result.accountedNodeCount / result.declaredNodeCount);
+    // 선언 커버리지는 «걸음»과 무관한 축이다(단계 선언만 본다).
+    expect(result.declarationCoverage).toBe(measureL0Coverage(template, [], []).declarationCoverage);
+    expect(result.storesRead).toEqual([
+      { name: 'parent', nodeRows: PARENT_NODES.length, skippedRows: 0 },
+      { name: 'pod', nodeRows: POD_NODES.length, skippedRows: 0 },
+      { name: 'prod:other', nodeRows: FOREIGN_NODES.length, skippedRows: 0 },
+    ]);
+    expect(result.storesNotQueried).toEqual(['test:unopened']);
+
+    const rendered = renderJoinedL0Coverage(result);
+    expect(rendered).toContain('걸음 커버리지');
+    expect(rendered).toContain('건너뜀도 0도 아니다');
+    expect(rendered).toContain('journey-key-mismatch');
+    expect(rendered).toContain('안 읽은 스토어 1개');
+  });
+
+  it('생산 진입점(runLogsCli --recompute)이 두 logs.db 를 그대로 지나 조인 결과를 내고 런 종료 관측 행은 건드리지 않는다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'logs-recompute-'));
+    try {
+      const parentDb = join(dir, 'parent', 'logs', 'logs.db');
+      const podDb = join(dir, 'pod', 'logs', 'logs.db');
+      const runEndObservation = JSON.stringify({
+        graphId: template.graphId, graphVersion: template.version, runId: 'run-parent',
+        traversalCoverage: 11 / declaredNodeIds.length, unjoinedNodes: POD_NODES,
+      });
+      const writeStore = (
+        dbPath: string,
+        instance: string,
+        rows: Array<{ category: string; event: string; data: unknown }>,
+      ): void => {
+        const store = new LogStore(dbPath, { instance });
+        store.insertBatch(rows.map((row) => ({
+          rec: { ts: '2026-10-24T00:00:00.000Z', category: row.category, event: row.event, data: row.data },
+          surface: 'harness:self-implement',
+        })));
+        store.close();
+      };
+      writeStore(parentDb, 'test:parent', [
+        ...PARENT_NODES.map((node) => ({
+          category: 'self-implement', event: 'pipeline-node-entry',
+          data: JSON.parse(entryRow(node, { runId: 'run-parent', journeyKey: JOURNEY }).data),
+        })),
+        // ⭐ «같은 스토어 안의 다른 여정» 걸음 행 — 조회 단계에서 미리 걸러 버리면 이 두 노드가
+        //    journey-key-mismatch(미조인)가 아니라 «아무도 안 봤다(unobserved)» 로 오분류된다.
+        ...FOREIGN_NODES.map((node) => ({
+          category: 'self-implement', event: 'pipeline-node-entry',
+          data: JSON.parse(entryRow(node, { runId: 'run-foreign', journeyKey: 'jrn-other' }).data),
+        })),
+        // 런 종료 시점의 관측(#25957) — 재계산이 «덮어쓰지 않아야» 하는 행.
+        { category: 'graph.path', event: 'l0-coverage', data: JSON.parse(runEndObservation) },
+      ]);
+      writeStore(podDb, 'test:pod', [
+        ...POD_NODES.map((node) => ({
+          category: 'self-implement', event: 'pipeline-node-entry',
+          data: JSON.parse(entryRow(node, { runId: 'run-pod', journeyKey: JOURNEY }).data),
+        })),
+        {
+          category: 'graph.path', event: 'node-skipped',
+          data: { node: SKIPPED_NODE, runId: 'run-pod', journeyKey: JOURNEY, graphId: template.graphId, graphVersion: template.version, reason: 'condition' },
+        },
+      ]);
+
+      const lines: string[] = [];
+      const errors: string[] = [];
+      const logSpy = spyOn(console, 'log').mockImplementation((...args) => { lines.push(args.join(' ')); });
+      const errSpy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
+      let code: number;
+      try {
+        code = await runLogsCli({ recompute: true, run: 'run-parent', journey: JOURNEY, json: true }, {
+          resolveTargets: () => ({
+            targets: [
+              { name: 'parent', dbPath: parentDb },
+              { name: 'pod', dbPath: podDb },
+              { name: 'test:absent', dbPath: join(dir, 'absent', 'logs', 'logs.db') },
+            ],
+          }),
+        });
+      } finally {
+        logSpy.mockRestore();
+        errSpy.mockRestore();
+      }
+
+      expect(code).toBe(0);
+      // 재계산이 없는 트리에서는 --recompute 가 «일반 조회»로 흘러 이 JSON 모양이 아니다 — 파싱 예외로 시험을
+      // 던지지 않고, 기대값 단언으로 떨어뜨려 RED 를 단언 실패로 남긴다.
+      let result: Record<string, any> = {};
+      try {
+        result = JSON.parse(lines.join('\n').trim()) as Record<string, any>;
+      } catch {
+        result = {};
+      }
+      expect(result._meta).toEqual({ type: 'log-query-l0-coverage-recomputed' });
+      expect(result.graphId).toBe(template.graphId);
+      expect(result.runId).toBe('run-parent');
+      expect(result.journeyKey).toBe(JOURNEY);
+      expect(result.joinedNodes.map(({ node }: { node: string }) => node)).toEqual([...PARENT_NODES, ...POD_NODES]);
+      expect(result.joinedNodes.find(({ node }: { node: string }) => node === POD_NODES[0]!))
+        .toEqual({ node: POD_NODES[0]!, hosts: ['pod'] });
+      expect(result.skippedNodes).toEqual([SKIPPED_NODE]);
+      expect(result.accountedNodeCount).toBe(PARENT_NODES.length + POD_NODES.length + 1);
+      // ⭐ 열린 스토어 안의 «다른 여정» 행 — 조회 사전필터에 걸려 사라지지 않고 미조인 사유로 남는다.
+      expect(result.unjoinedByHost).toEqual([{
+        host: 'parent',
+        count: FOREIGN_NODES.length,
+        reasons: [{ reason: 'journey-key-mismatch', nodes: [...FOREIGN_NODES].sort() }],
+      }]);
+      // ⛔ 그 노드들을 «아무도 안 봤다»로 오분류하지 않는다.
+      for (const foreignNode of FOREIGN_NODES) expect(result.unobservedNodes).not.toContain(foreignNode);
+      // 열지 못한 스토어는 «못 봤다»로 남는다 — 0 으로 접지 않는다.
+      expect(result.storesNotQueried).toEqual(['test:absent']);
+      expect(result.unobservedNodes).toContain(declaredNodeIds[29]!);
+      // 미관측은 skipped 로도 0 으로도 접히지 않는다 — 걸음 커버리지는 «센 노드/선언 노드» 그대로다.
+      expect(result.skippedNodes).not.toContain(declaredNodeIds[29]!);
+      expect(result.traversalCoverage).toBe(result.accountedNodeCount / result.declaredNodeCount);
+      expect(errors.join('\n')).toContain('test:absent');
+
+      // ⛔ 보존 계약 — 런 종료 관측 행은 재계산 뒤에도 글자 그대로다.
+      const db = new Database(parentDb, { readonly: true });
+      try {
+        const row = db.query("SELECT data FROM logs WHERE event = 'l0-coverage'").get() as { data: string } | null;
+        expect(row?.data).toBe(runEndObservation);
+        const count = db.query("SELECT COUNT(*) AS n FROM logs WHERE event = 'l0-coverage'").get() as { n: number };
+        expect(count.n).toBe(1);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('조인 키 없이 --recompute 는 조용히 0 을 내지 않고 거절한다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'logs-recompute-nokey-'));
+    try {
+      const dbPath = join(dir, 'logs', 'logs.db');
+      const store = new LogStore(dbPath, { instance: 'test:nokey' });
+      store.close();
+      const errors: string[] = [];
+      const spy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
+      try {
+        expect(await runLogsCli({ recompute: true }, { resolveTargets: () => ({ targets: [{ name: 'only', dbPath }] }) })).toBe(1);
+        expect(errors.join('\n')).toContain('--run');
+        expect(errors.join('\n')).toContain('--journey');
+      } finally {
+        spy.mockRestore();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--recompute 는 --follow 와 결합되지 않는다 — 스토어를 열기 전에 fail-closed 로 거절한다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'logs-recompute-follow-'));
+    try {
+      // 열 수 없는 스토어만 둔다 — 거절이 «스토어를 열기 전»에 일어나는지가 이 시험의 요점이다.
+      const dbPath = join(dir, 'absent', 'logs', 'logs.db');
+      const errors: string[] = [];
+      const spy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
+      try {
+        expect(await runLogsCli({ recompute: true, run: 'run-x', journey: JOURNEY, follow: true },
+          { resolveTargets: () => ({ targets: [{ name: 'only', dbPath }] }) })).toBe(1);
+        expect(errors.join('\n')).toContain('--follow');
+      } finally {
+        spy.mockRestore();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

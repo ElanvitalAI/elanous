@@ -142,8 +142,9 @@ function hostSlotScriptWithSlot(cap: number, dir: string, tools: readonly SlotLo
   return [
     `GS=${quote(dir)}; mkdir -p "$GS" || infra slots`,
     `${pick}else infra lock-tool; fi`,
+    'load1() { if [ -r /proc/loadavg ]; then awk \'NR==1 {print $1}\' /proc/loadavg; elif command -v sysctl >/dev/null 2>&1; then sysctl -n vm.loadavg 2>/dev/null | awk \'{gsub(/[{}]/, ""); print $1}\'; else echo unknown; fi; }',
     `n=1; while [ $n -le ${n} ]; do $GL "$GS/slot$n" ${passSlot ? 'env GATE_REMOTE_SLOT="$n" ' : ''}sh "$W/run.sh"; s=$?; [ -f "$W/started" ] && exit $s; n=$((n+1)); done`,
-    `echo "${BUSY}=$((n-1))" >&2; exit 98`,
+    `echo "${BUSY}=$((n-1));load1=$(load1)" >&2; exit 98`,
   ];
 }
 
@@ -184,7 +185,7 @@ export const PUSH_TIMEOUT_MS = 10 * 60_000;
 
 export type RemoteRunOutcome =
   | { kind: 'ran'; rc: number; stdout: Buffer; stderr: Buffer; commit: string; host: string; ms: number }
-  | { kind: 'busy'; occupied?: number; rc?: number }
+  | { kind: 'busy'; occupied?: number; load1?: number | null; rc?: number }
   | { kind: 'infra'; reason: string; stage?: string; rc?: number | null; stderr?: string };
 
 export interface RemoteRunOptions {
@@ -349,8 +350,10 @@ export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = r
   if (!(run.rc === 0 && marker >= 0)) {
     const last = stderrText.trimEnd().split('\n').at(-1) ?? '';
     if (run.rc === 98) {
-      const busy = /^__GATE_REMOTE_BUSY(?:=(\d+))?$/.exec(last);
-      if (busy) return { kind: 'busy', rc: run.rc, ...(busy[1] !== undefined ? { occupied: Number(busy[1]) } : {}) };
+      const busy = /^__GATE_REMOTE_BUSY(?:=(\d+))?(?:;load1=(unknown|\d+(?:\.\d+)?|))?$/.exec(last);
+      if (busy) return { kind: 'busy', rc: run.rc,
+        ...(busy[1] !== undefined ? { occupied: Number(busy[1]) } : {}),
+        ...(busy[2] !== undefined ? { load1: busy[2] === '' || busy[2] === 'unknown' ? null : Number(busy[2]) } : {}) };
     }
     if (run.rc === 97 && last.startsWith(INFRA)) return { kind: 'infra', stage: last.slice(INFRA.length).trim(), rc: run.rc, stderr: stderrText, reason: `remote-${last.slice(INFRA.length).trim()}` };
   }
@@ -459,6 +462,8 @@ export interface DispatchDeps {
   env?: NodeJS.ProcessEnv;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  /** Test seam for gate.remote events; production defaults to the structured debug log. */
+  log?: (event: string, data: Record<string, unknown>) => void;
   write?: { out: (data: string | Uint8Array) => void; err: (data: string | Uint8Array) => void };
 }
 
@@ -531,6 +536,9 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? Date.now;
   const deadline = now() + settings.slotWaitSeconds * 1000;
+  let waitStartedAt: number | undefined;
+  const logWait = deps.log ?? ((event: string, data: Record<string, unknown>) => debug.log('gate.remote', event, data));
+  let waitedForSlot = false;
   debug.log('gate.remote', 'dispatch', { tool: opts.tool, host, reason: decision.reason });
   let outcome: RemoteRunOutcome;
   for (;;) {
@@ -540,12 +548,28 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
       outcome = { kind: 'infra', reason: `exception: ${error instanceof Error ? error.message : String(error)}` };
     }
     if (outcome.kind !== 'busy') break;
+    waitedForSlot = true;
+    waitStartedAt ??= now();
+    const waitData = {
+      tool: opts.tool, host, reason: 'host-busy', load1: outcome.load1 ?? null, loadThreshold: settings.loadThreshold,
+      occupied: outcome.occupied ?? null, cap: hostCap, elapsedMs: Math.max(0, now() - waitStartedAt),
+    };
+    logWait('wait-reason', waitData);
+    write.err(`[gate.remote] waiting on ${host} — reason=host-busy load=${outcome.load1 ?? 'unknown'}/${settings.loadThreshold} slots=${outcome.occupied ?? 'unknown'}/${hostCap} elapsed=${Math.floor(waitData.elapsedMs / 1000)}s\n`);
     debug.log('gate.remote', 'host-busy', { tool: opts.tool, host, cap: hostCap, occupied: outcome.occupied ?? null });
     // Never start an attempt past the deadline: an expired self gate wait remains unmeasured.
     const left = deadline - now();
     if (left <= 0) break;
     await sleep(Math.min(15_000, left));
     if (now() >= deadline) break;
+  }
+  if (waitedForSlot) {
+    const resolution = outcome.kind === 'ran' ? 'slot-open' : outcome.kind === 'busy' ? 'deadline-slot-still-busy'
+      : `remote-infra: ${outcome.reason}`;
+    const waitData = { tool: opts.tool, host, reason: resolution, elapsedMs: Math.max(0, now() - waitStartedAt!),
+      ...(outcome.kind === 'busy' ? { occupied: outcome.occupied ?? null, cap: hostCap } : {}) };
+    logWait('wait-ended', waitData);
+    write.err(`[gate.remote] wait ended on ${host} — reason=${resolution} elapsed=${Math.floor(waitData.elapsedMs / 1000)}s${outcome.kind === 'busy' ? ` slots=${outcome.occupied ?? 'unknown'}/${hostCap}` : ''}\n`);
   }
   if (opts.onRemoteOutcome) {
     try { opts.onRemoteOutcome(outcome, host, deps.runner ?? realGateRemoteRunner); }

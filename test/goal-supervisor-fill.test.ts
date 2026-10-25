@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fillUnverifiableGoalSlots, type SupervisorGoalFillEvidence } from '../src/self-implement/goal-supervisor-fill.js';
+import { defaultSeams } from '../src/self-implement/seams.js';
 
 const original = `Goal title
 
@@ -59,11 +60,10 @@ describe('supervisor goal slot fill', () => {
   // ⛔⭐ **생산 검사기 자체**를 부른다(주입 콜백이 아니다) — 종전 판은 콜백에 `fail 99` 를 요구해
   //   의도적으로 거부시키는 Goodhart 였다(리뷰 must-fix). 생산 파서를 약화하면 이 검사가 죽어야 한다.
   test('the production checker rejects a document whose numbers disagree with the gate log', async () => {
-    const { defaultSeams } = await import('../src/self-implement/seams.js');
     const check = defaultSeams().independentlyCheckGoalSlots!;
     const evidence = { round: 2, command: 'bun test test/goal-supervisor-fill.test.ts', reviewVerdict: 'pass' as const,
       observedFail: 0, baselineLine: '[gate-baseline] introduced=0, preexisting=0, unknown=0, precondition-unmet=0', gateLog: productionGateLog };
-    const good = `## 불변식\n- filled-by: supervisor@round-2\n  조건 — ${evidence.command} 가 실패 없이 끝난다\n  이 라운드에서 관측됨 — fail 0\n  근거 — ${evidence.baselineLine}\n\n## 판정 신호\n- filled-by: supervisor@round-2\n  관측 — ${evidence.command}\n  이번 라운드 관측값 — fail 0\n`;
+    const good = `## 불변식\n- filled-by: supervisor@round-2\n  조건 — ${evidence.command} 가 실패 없이 끝난다\n  이 라운드에서 관측됨 — fail 0\n  근거 — round-2 gate [test] PASS ${evidence.command} · ${evidence.baselineLine}\n\n## 판정 신호\n- filled-by: supervisor@round-2\n  관측 — \`${evidence.command}\` 요약 줄의 fail 수\n  이번 라운드 관측값 — fail 0\n  근거 — round-2 review pass · ${evidence.baselineLine}\n`;
     expect(await check(good, evidence)).toBe(true);
     // ⛔ 로그는 fail 0 인데 문서가 fail 3 이라 주장한다 ⇒ 생산 검사기가 거부해야 한다.
     expect(await check(good.replace(/fail 0/g, 'fail 3'), evidence)).toBe(false);
@@ -94,16 +94,17 @@ describe('supervisor goal slot fill', () => {
     expect(readFileSync(path, 'utf8')).toBe(before);   // 바이트 동일
   });
 
-  // ⛔⭐ 반증 입력 — baseline 행이 **없으면** "깨끗하다" 가 아니라 **"안 쟀다"** 다.
-  test('refuses to fill when the gate log carries no baseline row at all', async () => {
+  // PASS에서 실패 귀속 baseline은 실행되지 않는다. 안 잰 값을 0으로 만들어 적지 않는다.
+  test('fills from test PASS without inventing an unrun baseline row', async () => {
     const path = goal();
-    const before = readFileSync(path, 'utf8');
     const result = await fillUnverifiableGoalSlots({
-      ...input(path, async () => true),
+      ...input(path, defaultSeams().independentlyCheckGoalSlots!),
       gate: { passed: true, log: '[test] PASS bun test test/goal-supervisor-fill.test.ts — 5 pass | 0 fail' },
     });
-    expect(result).toBe('unverifiable');
-    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect(result).toBe('filled');
+    const filled = readFileSync(path, 'utf8');
+    expect(filled).toContain('baseline not run (test PASS)');
+    expect(filled).not.toContain('[gate-baseline] introduced=0');
   });
 
   test('leaves unverifiable slots byte-identical when actual gate evidence is absent or contradictory', async () => {

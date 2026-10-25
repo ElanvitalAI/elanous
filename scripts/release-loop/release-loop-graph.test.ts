@@ -905,6 +905,9 @@ fs.appendFileSync(path.join(root, 'calls'), tool + ' ' + args.join(' ') + '\\n')
 const sha = 'a'.repeat(40);
 if (tool === 'git') {
   if (args[0] === 'rev-parse') console.log(args.includes('v0.2.3^{commit}') ? 'b'.repeat(40) : fs.existsSync(path.join(root,'dev-bump.done')) ? 'd'.repeat(40) : fs.existsSync(path.join(root,'release.done')) ? sha : 'c'.repeat(40));
+  else if (args[0] === 'show-ref') process.exit(1); // first docs attempt has no local release-docs branch
+  else if (args[0] === 'ls-remote') {} // first docs attempt has no remote release-docs branch
+  else if (args[0] === 'diff') console.log('release/public/docs/releases/0.2.4.md');
   else if (args[0] === 'show') {
     if (args[1] === 'origin/main:package.json') console.log(JSON.stringify({version:fs.existsSync(path.join(root,'dev-bump.done')) ? '0.2.5-dev.0' : fs.existsSync(path.join(root,'release.done')) ? '0.2.4' : '0.2.4-dev.0'}));
     else if (args[1].endsWith(':website/pages.json')) console.log(JSON.stringify({pages:[{id:'using-elanous/tasks-and-intake', source:'release/public/docs/tasks-and-intake.md'}]}));

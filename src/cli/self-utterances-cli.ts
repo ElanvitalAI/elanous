@@ -1,12 +1,12 @@
 import type { Command } from 'commander';
 import { Database } from 'bun:sqlite';
 import { redactSecretText } from '../debug/log.js';
-import { openSurfaceEventsDb, querySurfaceUtterances, surfaceEventsDbPath, type SurfaceEventRow } from '../domains/surface-events.js';
+import { classifySurfaceUtteranceOrigin, countSurfaceUtterancesByOrigin, openSurfaceEventsDb, querySurfaceUtterances, surfaceEventsDbPath, type SurfaceEventRow } from '../domains/surface-events.js';
 import { injectUtterance, type UtteranceInput } from '../domains/self-awareness.js';
 import { writeStdoutJson } from './stdout-json.js';
 
 const PAGE_SIZE = 50;
-type UtteranceOrigin = 'human' | 'agent' | 'unknown';
+type UtteranceOrigin = 'human' | 'agent' | 'test-fixture' | 'unknown';
 
 function refsOf(raw: string | null): Record<string, unknown> {
   if (!raw) return {};
@@ -33,21 +33,15 @@ function isAutomatic(row: SurfaceEventRow): boolean {
   return false;
 }
 
+/** 도메인 원천 분류(사람/시험 fixture/외부 CLI agent/elanous 자기)를 CLI 표기로 접는다.
+ *  시험 fixture 는 사람과 같은 서피스에 기록되지만 사람 표본이 아니다 — 별도 값으로 노출한다. */
 function originOf(row: SurfaceEventRow): UtteranceOrigin {
-  if (row.direction !== 'inbound') return 'unknown';
-  const refs = refsOf(row.refs);
-  if (refs.utteranceOrigin === 'human' || refs.utteranceOrigin === 'agent') return refs.utteranceOrigin;
-  const explicit = refs.origin;
-  if (typeof explicit === 'string') {
-    if (/^(?:human|user|tui|pwa|telegram|discord|cli)$/i.test(explicit)) return 'human';
-    if (/^(?:claude-code|codex|gemini|agent|external:)/i.test(explicit)) return 'agent';
+  switch (classifySurfaceUtteranceOrigin(row)) {
+    case 'human': return 'human';
+    case 'test-fixture': return 'test-fixture';
+    case 'external-cli-agent': case 'elanous-self': return 'agent';
+    default: return 'unknown';
   }
-  // recordInboundTurn marks its recorder as elanous-self; on chat Q&A the speaker is the human.
-  if (row.kind === 'qna' && /^(?:telegram|discord)$/i.test(row.surface)) return 'human';
-  if (explicit === 'elanous-self') return 'agent';
-  if (/^ext:/i.test(row.surface)) return 'agent';
-  if (/^(?:cli|tui|pwa|telegram|discord|ipad|watch)$/i.test(row.surface)) return 'human';
-  return 'unknown';
 }
 
 function utteranceText(row: SurfaceEventRow): { text: string; extract: 'direct' | 'qna' | 'ambiguous' | 'summary'; truncated: boolean; truncationEvidence: 'cap-reached' | 'over-cap' | null; possibleLoss: boolean } {
@@ -101,7 +95,9 @@ export function collectSelfUtterances(opts: SelfUtterancesOptions, db: ReturnTyp
   });
   const total = utterances.length;
   const start = (page - 1) * PAGE_SIZE;
-  return { source: 'surface_events.events (read-only)', filters: { from, to, surface: opts.surface ?? null, origin: opts.origin ?? null, automatic: 'excluded' }, counts: { matched: total, excludedAutomatic, excludedByOrigin, excludedUnextractable, ambiguous, truncated, capReached, possibleLoss }, page: { number: page, size: PAGE_SIZE, total, hasNext: start + PAGE_SIZE < total }, utterances: utterances.slice(start, start + PAGE_SIZE) };
+  // ⭐ 원천별 수를 «명시»한다 — 사람 원천 0 을 사람 표본으로 오인하지 않게(시험 fixture·외부 CLI agent 분리).
+  const originCounts = countSurfaceUtterancesByOrigin(db, { from, to, ...(opts.surface ? { surface: opts.surface } : {}) });
+  return { source: 'surface_events.events (read-only)', filters: { from, to, surface: opts.surface ?? null, origin: opts.origin ?? null, automatic: 'excluded' }, originCounts, humanSample: originCounts.human === 0 ? 'absent' : 'present', counts: { matched: total, excludedAutomatic, excludedByOrigin, excludedUnextractable, ambiguous, truncated, capReached, possibleLoss }, page: { number: page, size: PAGE_SIZE, total, hasNext: start + PAGE_SIZE < total }, utterances: utterances.slice(start, start + PAGE_SIZE) };
 }
 
 export function recordSelfUtterance(input: UtteranceInput & { utteranceOrigin?: 'human' | 'agent' }, db?: Database): { eventId: string } {
@@ -131,6 +127,7 @@ export function registerSelfUtterancesCommand(selfCmd: Command): void {
         if (opts.json) { await writeStdoutJson(JSON.stringify(result, null, 2) + '\n'); return; }
         console.log(`source=${result.source} matched=${result.counts.matched} excludedAutomatic=${result.counts.excludedAutomatic} excludedByOrigin=${result.counts.excludedByOrigin} excludedUnextractable=${result.counts.excludedUnextractable} page=${result.page.number} size=${result.page.size} hasNext=${result.page.hasNext}`);
         console.log(`filters=${JSON.stringify(result.filters)}`);
+        console.log(`origin-counts human=${result.originCounts.human} test-fixture=${result.originCounts.testFixture} external-cli-agent=${result.originCounts.externalCliAgent} elanous-self=${result.originCounts.elanousSelf} unknown=${result.originCounts.unknown} human-sample=${result.humanSample}`);
         for (const item of result.utterances) console.log(JSON.stringify(item));
         console.log(`ambiguous=${result.counts.ambiguous} truncated=${result.counts.truncated} cap-reached=${result.counts.capReached} possibleLoss=${result.counts.possibleLoss}`);
       } finally { db.close(); }

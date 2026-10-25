@@ -8,6 +8,7 @@
 
 import type { LLMProviderName, ReasoningLevel, LlmRoutePolicyConfig } from '../user-config.js';
 import { classifyMissionTier1, type MissionKind } from './mission-router.js';
+import type { SessionSource } from '../session/index.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 
 export type RouteDecisionSource = 'explicit-pin' | 'codex-tier-policy' | 'legacy-default' | 'active-provider-default' | 'execution-backend';
@@ -111,6 +112,8 @@ export interface ResolveRouteDecisionInput {
   provider: LLMProviderName;
   configuredModel?: string;
   text: string;
+  /** Telegram keeps its non-deep coding tier; other surfaces retain the configured quick model. */
+  surface?: SessionSource;
   /** A per-turn/slash/user model choice.  It always wins. */
   explicitModel?: string;
   routePolicy?: LlmRoutePolicyConfig;
@@ -145,6 +148,16 @@ export function resolveRouteDecision(input: ResolveRouteDecisionInput): RouteDec
     };
   }
   const policyMode = input.routePolicy?.mode;
+  // Unspecified callers keep the configured quick model for compatibility; Telegram alone owns the coding-tier exception.
+  if (input.provider === 'openai-codex' && input.surface !== 'telegram' && policyMode === undefined && mission === 'quick' && input.configuredModel) {
+    return {
+      provider: input.provider,
+      model: input.configuredModel,
+      source: 'active-provider-default',
+      rationale: 'configured model preserved for quick mission',
+      mission,
+    };
+  }
   if (input.provider === 'openai-codex' && policyMode !== 'active-provider') {
     const deep = mission === 'plan' || mission === 'review';
     const tier = deep ? 'best' : 'better';

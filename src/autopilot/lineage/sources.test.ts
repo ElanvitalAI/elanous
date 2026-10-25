@@ -59,6 +59,15 @@ describe('harness runs reach the mounted historian through missionId', () => {
     expect(harnessRunsToLineage([{ runId: 'run-00000000-0000-4000-8000-000000000302', executedAt: '2026-08-16T10:00:00.000Z', orchestrationId: 'orch-302', shardId: 'shard-2', pieceIndex: 1, pieceTotal: 2 }]))
       .toEqual([expect.objectContaining({ store: 'observation', at: '2026-08-16T10:00:00.000Z', seq: 1, summary: expect.stringContaining('shard shard-2 · 2 pieces') })]);
   });
+
+  test('shows terminal graph unit orphans in the harness lineage entry', () => {
+    const entries = harnessRunsToLineage([{
+      runId: 'run-00000000-0000-4000-8000-000000000303',
+      executedAt: '2026-10-20T01:00:00.000Z',
+      unitVisits: { terminal: true, enterCount: 1, exitCount: 0, orphanCount: 1, orphanUnitVisits: [{ childRunId: 'child-303', graphId: 'self-implement', nodeId: 'decompose', unit: 'fabric-decompose', enteredAt: '2026-10-20T01:00:01.000Z' }] },
+    }]);
+    expect(entries[0]!.summary).toContain('graph.unit orphan 1');
+  });
 });
 
 describe('observation 은 6번째 store kind + mount 됨', () => {

@@ -722,7 +722,7 @@ describe('LLM 도구', () => {
       expect(wakeupEvents.map((row) => row.event)).toEqual(['rejected', 'scheduled', 'rejected', 'rejected', 'loop-capped']);
       expect(JSON.stringify(mockSession.mock.getRequests())).toContain('at 을 빼고 delaySeconds 사용');
       expect(mockSession.mock.getRequests().length).toBeGreaterThanOrEqual(8);
-      if (process.env.ELANOUS_UX_WAKEUP_EVIDENCE === '1') process.stdout.write(`[tui.wakeup raw logs]\n${raw}`);
+      process.stdout.write(`[tui.wakeup raw logs]\n${raw}`);
     } catch (error) {
       throw new Error(`${error instanceof Error ? error.message : String(error)}\nTUI screen:\n${await pty?.renderScreen()}\nAIMock requests=${JSON.stringify(mockSession.mock.getRequests())}`);
     } finally {

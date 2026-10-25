@@ -69,7 +69,6 @@ const DEFERRED_UNGUARDED: Record<string, { count: number; reason: string }> = {
   'scripts/release-loop/version-node.ts': { count: 3, reason: 'OPEN #28293 touches this file' },
   'src/harness/harness-substrate-default.ts': { count: 1, reason: 'OPEN #28060 touches this file' },
   'src/self-implement/host-regate.ts': { count: 2, reason: 'OPEN #27484 touches this file' },
-  'src/self-implement/orchestrator.ts': { count: 1, reason: 'OPEN #28434 · #28411 · #28252 · #28192 and more touch this file' },
   'src/task-orchestrator/surfaces/pod-command-job.ts': { count: 1, reason: 'OPEN #28370 · #27828 · #27817 · #27810 touch this file' },
   'src/task-orchestrator/surfaces/pod-pool.ts': { count: 5, reason: 'OPEN #27664 touches this file' },
   'src/task-orchestrator/surfaces/self-implement-pod.ts': { count: 3, reason: 'OPEN #28370 · #28277 · #28218 · #28188 and more touch this file' },

@@ -6,6 +6,7 @@ import type { GraphRunState } from '../../src/graph-runner/runner.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { resumeReleaseRun } from './resume-release.js';
+import './resume-test-traffic.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });

@@ -18,6 +18,18 @@ function fixture(legacy: object = {}, yaml?: string): string {
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { force: true, recursive: true }); });
 
 const now = new Date('2026-10-30T12:00:00Z');
+test('reviewerMix accepts explicit weights from policy and rejects malformed weights', () => {
+  const root = fixture({ roleLlm: { reviewerMix: { sol: 2, claude: 1, glm: 1 } } },
+    'version: 1\nroles:\n  reviewerMix:\n    sol: 1\n    claude: 0\n    glm: 2\n');
+  const loaded = loadLlmPolicy({ configDir: root, now });
+  expect(loaded.valid).toBe(true);
+  expect(loaded.policy.roles.reviewerMix).toEqual({ sol: 1, claude: 0, glm: 2 });
+  expect(loaded.sources['roles.reviewerMix.sol']).toBe('file');
+  expect(validateLlmPolicy({ version: 1, roles: { reviewerMix: { sol: 0, claude: 0, glm: 0 } } }).valid).toBe(false);
+  expect(validateLlmPolicy({ version: 1, roles: { reviewerMix: { sol: 1, claude: -1, glm: 1 } } }).valid).toBe(false);
+  expect(validateLlmPolicy({ version: 1, roles: { reviewerMix: { sol: Number.MAX_SAFE_INTEGER, claude: 1, glm: 0 } } }).valid).toBe(false);
+});
+
 test('missing file and empty YAML preserve code defaults without writing a file', () => {
   const root = fixture();
   const missing = loadLlmPolicy({ configDir: root, now });

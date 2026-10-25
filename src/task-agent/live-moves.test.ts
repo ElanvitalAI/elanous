@@ -1472,3 +1472,27 @@ test('보존 — 종전 실행부의 decision 카드 인자와 --ref 만 빼고 
     expect(sent[0]).toEqual(decisionRaiseArgs({ taskId: 'ta-live-1', reason: 'blocked twice on the same screen', evidence: sent[0]![sent[0]!.indexOf('--ref') + 1]! }));
   });
 });
+
+describe('TA-REVIEW-PASS — 카드 없는 runId 의 단일 카드 멱등 결속(생산 진입점)', () => {
+  test('TA-REVIEW-PASS: 카드 없는 runId 의 리뷰 판단 시, 고유한 런 소유(동일 runId 재판정)를 먼저 검증한 뒤 단일 잠금/멱등 쓰기로 새 카드를 생성한다', async () => {
+    const statePath = join(mkdtempSync(join(tmpdir(), 'ta-review-pass-')), 'task-agent-actions.json');
+    const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const deps = { statePath, env: {}, log: (_c: string, event: string, data: Record<string, unknown>) => { logs.push({ event, data }); }, prFiles: async () => ['src/x.ts'] } as const;
+    const input = { runId: 'run-review-create', stopReason: 'needs-human' as const,
+      results: [job({ taskId: 'unknown-task', feature: 'review feature ask', ok: true, worktreePath: '/tmp/wt-review', prNumber: 26801 })] };
+    const first = await recordTaskAgentShadowMove(input, deps);
+    expect(first.move).toBe('review');
+    const state = () => JSON.parse(readFileSync(statePath, 'utf8')) as { tasks: Record<string, TaskCard> };
+    const firstIds = Object.keys(state().tasks);
+    expect(firstIds).toHaveLength(1);
+    const cardId = firstIds[0]!;
+    expect(state().tasks[cardId]!.runId).toBe('run-review-create');
+    expect(state().tasks[cardId]!.status).toBe('launched');
+    // 같은 판정을 두 번째로 넣는다 — 카드는 1건으로 재사용되고 중복 생성이 없다.
+    const second = await recordTaskAgentShadowMove(input, deps);
+    expect(second.move).toBe('review');
+    expect(Object.keys(state().tasks)).toEqual([cardId]);
+    expect(state().tasks[cardId]!.runId).toBe('run-review-create');
+    expect(logs.filter((entry) => entry.event === 'card-create-for-run-deferred')).toHaveLength(0);
+  });
+});

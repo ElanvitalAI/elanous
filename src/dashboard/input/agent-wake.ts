@@ -13,6 +13,8 @@
 //   턴 중(NotIdle)·입력 중(HumanTyping)에 온 완료는 «대기»: 입력칸이 다시 뜰 때(`wrapAgentWakePort`) 그 결과가
 //   아직 큐에 남아 있으면(=어느 턴도 안 실었으면) 한 번만 다시 청한다. 이미 실렸으면(drain) 아무것도 안 한다.
 // ⛔ 같은 알림(taskId)은 한 번만 — 큐 `seen` 이 `clear()` 로 비워져도, 대시보드가 재진입해도 막는다.
+// ⭐ 생산 조립은 `installSeatedAgentWake` «하나» — `src/dashboard/index.ts` 의 `showDashboard` 가 그 함수만
+//   부르고, 이 파일의 무대 시험이 «같은 함수»를 지난다(문자열 배선 확인이 아니라 생산 호출 경로 증거).
 //
 // 세 얼굴:
 //   관측 = debug.log('tui.agent-wake', 'notified' | 'opened' | 'rejected' | 'deferred', { taskId, agent, state, seat, shown, reason })
@@ -238,6 +240,47 @@ export function installAgentWake(deps: Omit<AgentWakeDeps, 'handled'>): AgentWak
   };
   installed = own;
   return own;
+}
+
+/** 대시보드가 넘기는 «생산 포트» — showDashboard 가 실제로 채우는 모양 그대로. */
+export interface DashboardAgentWakePorts {
+  /** 큐 구독 — `subscribeDashboardAgentResults(globalTaskNotificationQueue, …)` 가 여기로 들어온다. */
+  subscribe: AgentWakeDeps['subscribe'];
+  /** 채팅 한 줄 — `createDashboardAgentWakeNotify(pushLine, draw)`. */
+  notify: AgentWakeDeps['notify'];
+  /** H2 문 — `internalTurnGate.startTurnIfIdle`. 자리 TUI ∧ 유휴일 때만 실제로 열린다. */
+  startTurnIfIdle: AgentWakeOpenTurnDeps['startTurnIfIdle'];
+  /** 지금 화면의 cwd(자리 판정 입력) — `() => workingDir.cwd`. */
+  getCwd: () => string;
+  /** 그 완료가 아직 어느 턴에도 안 실렸나 — `globalTaskNotificationQueue.has`. «대기» 재시도의 근거. */
+  isPending: (taskId: string) => boolean;
+  /** 시험·주입 자리(생산은 안 넘긴다 — 기본 `homedir()`·`detectSeatTui`·`setTimeout 0`). */
+  home?: string;
+  detectSeat?: AgentWakeOpenTurnDeps['detectSeat'];
+  defer?: AgentWakeOpenTurnDeps['defer'];
+  log?: AgentWakeDeps['log'];
+}
+
+/**
+ * 대시보드 생산 조립 — `showDashboard` 는 이 함수 «하나»만 부른다.
+ * 알림(조각 1)과 «자리 TUI ∧ 유휴 → H2 한 턴(origin child-complete)»(조각 2)을 같은 큐 구독에서 낸다.
+ * 중복 거부(같은 taskId 한 번)·DEFERRABLE 대기→입력칸 재시도·수명은 `createAgentWake` 몫이다.
+ */
+export function installSeatedAgentWake(ports: DashboardAgentWakePorts): AgentWakeController {
+  const openTurn: AgentWakeOpenTurnDeps = {
+    startTurnIfIdle: ports.startTurnIfIdle,
+    getCwd: ports.getCwd,
+    isPending: ports.isPending,
+    ...(ports.home !== undefined ? { home: ports.home } : {}),
+    ...(ports.detectSeat !== undefined ? { detectSeat: ports.detectSeat } : {}),
+    ...(ports.defer !== undefined ? { defer: ports.defer } : {}),
+  };
+  return installAgentWake({
+    subscribe: ports.subscribe,
+    notify: ports.notify,
+    openTurn,
+    ...(ports.log !== undefined ? { log: ports.log } : {}),
+  });
 }
 
 /** 시험 격리용 — 설치·공유 dedupe 를 비운다. */

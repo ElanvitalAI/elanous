@@ -22,6 +22,7 @@ interface DocsResult {
   branch?: string;
   worktree?: string;
   translationFallbacks?: number;
+  artifactOwner?: { runId: string; attempt: number; localBackup?: string; remoteBackup?: string; remoteHead?: string };
 }
 
 type TranslationRunner = (line: string) => string;
@@ -495,6 +496,11 @@ export function joinTui(context: GraphContext, env: NodeJS.ProcessEnv, repo: str
 export function graphDocs(context: GraphContext, env: NodeJS.ProcessEnv, repo: string, run: Runner = commandRunner,
   stateRoot = effectiveInstanceRoot()): DocsResult {
   const version = context.input.version;
+  if (context.runId) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(context.runId))
+      return { outcome: 'error', version, error: 'invalid release runId' };
+    return graphDocsOwned(context, env, repo, run, stateRoot);
+  }
   let tree: string | undefined;
   // Before ANY check (and so also on every failure path): only the first docs attempt may consume a staged cache,
   // and only when the worker won the claim; otherwise this attempt claims the slot so a late worker cannot publish.
@@ -538,6 +544,137 @@ export function graphDocs(context: GraphContext, env: NodeJS.ProcessEnv, repo: s
     return { ...result, branch, worktree: tree };
   } catch (error) {
     return { outcome: 'error', version, error: error instanceof Error ? error.message : String(error), ...(tree ? { worktree: tree } : {}) };
+  }
+}
+
+type DocsOwner = NonNullable<DocsResult['artifactOwner']>;
+type DocsReceipt = { owner: DocsOwner; branch: string; worktree: string; outcome: 'staged' | 'pushed'; result?: DocsResult; head?: string };
+
+/** The resume count is part of the artifact key; the first run has attempt zero. */
+function docsAttempt(stateRoot: string, version: string, runId: string): number {
+  const path = join(stateRoot, 'release', version, 'resume-attempts', `${runId}.json`);
+  if (!existsSync(path)) return 0;
+  const value = JSON.parse(readFileSync(path, 'utf8')) as { version?: unknown; runId?: unknown; attempts?: unknown };
+  if (value.version !== version || value.runId !== runId || !Array.isArray(value.attempts)
+    || value.attempts.some((at) => typeof at !== 'string' || !Number.isFinite(Date.parse(at))))
+    throw new Error(`invalid release resume attempts ledger: ${path}`);
+  return value.attempts.length;
+}
+
+function docsReceipt(path: string): DocsReceipt | null {
+  if (!existsSync(path)) return null;
+  const value = JSON.parse(readFileSync(path, 'utf8')) as DocsReceipt;
+  if (!value || typeof value !== 'object' || !value.owner || typeof value.owner.runId !== 'string'
+    || !Number.isSafeInteger(value.owner.attempt) || typeof value.worktree !== 'string'
+    || typeof value.branch !== 'string' || !['staged', 'pushed'].includes(value.outcome))
+    throw new Error(`invalid docs ownership receipt: ${path}`);
+  return value;
+}
+
+function remoteBranchHead(run: Runner, repo: string, branch: string): string | null {
+  const line = run('git', ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], repo).trim();
+  if (!line) return null;
+  const match = /^([0-9a-f]{40})\s+refs\/heads\/[^\s]+$/i.exec(line);
+  if (!match) throw new Error(`invalid remote docs branch response: ${line}`);
+  return match[1]!;
+}
+
+function graphDocsOwned(context: GraphContext, env: NodeJS.ProcessEnv, repo: string, run: Runner, stateRoot: string): DocsResult {
+  const version = context.input.version;
+  const runId = context.runId!;
+  let tree: string | undefined;
+  let owner: DocsOwner | undefined;
+  let mayConsume = false;
+  let cacheDir: string | undefined;
+  try {
+    cacheDir = runCacheDir(env);
+    mkdirSync(cacheDir, { recursive: true });
+    const closed = join(cacheDir, 'docs-closed');
+    const firstAttempt = !existsSync(closed);
+    writeFileSync(closed, `${new Date().toISOString()}\n`);
+    const docsWon = claimPrefetch(cacheDir, 'docs');
+    mayConsume = firstAttempt && !docsWon && readFileSync(join(cacheDir, 'claim'), 'utf8') === 'worker';
+  } catch { /* standalone graph: no prefetch slot */ }
+  try {
+    for (const node of ['gate', 'prepare', 'upgrade', 'tui']) if (context.outputs[node]?.outcome !== 'ok') throw new Error(`${node} did not pass`);
+    const attempt = docsAttempt(stateRoot, version, runId);
+    const branch = `release-docs/${version}`;
+    const receiptPath = join(stateRoot, 'release', version, 'docs-branch-owner.json');
+    const previous = docsReceipt(receiptPath);
+    const sameOwner = previous?.owner.runId === runId && previous.owner.attempt === attempt && previous.branch === branch;
+    let cached: DocsCache | null = null;
+    if (mayConsume && cacheDir) { try { cached = loadCache(cacheDir, cutFor(context, stateRoot)); } catch { cached = null; } }
+    run('git', ['fetch', 'origin', 'main'], repo);
+    const main = run('git', ['rev-parse', '--verify', 'origin/main^{commit}'], repo);
+    if (!SHA.test(main)) throw new Error('invalid origin/main commit');
+    let local = '';
+    try { local = run('git', ['show-ref', '--verify', '--hash', `refs/heads/${branch}`], repo).trim(); }
+    catch { /* No local branch is the normal first-run case. */ }
+    const remote = remoteBranchHead(run, repo, branch);
+    owner = { runId, attempt };
+    if (sameOwner && local && existsSync(previous!.worktree)) {
+      tree = previous!.worktree;
+      if (run('git', ['rev-parse', '--abbrev-ref', 'HEAD'], tree) !== branch) throw new Error('docs owner worktree changed branch');
+      if (previous!.outcome === 'pushed' && previous!.head === local && remote === local && previous!.result?.outcome === 'ok')
+        return { ...previous!.result, artifactOwner: previous!.owner };
+      if (remote && run('git', ['merge-base', remote, local], repo) !== remote)
+        throw new Error(`same-run docs remote diverged: ${branch}`);
+    } else {
+      const suffix = `${runId}-${attempt}-${randomUUID()}`;
+      if (local) {
+        const localBackup = `release-docs-backup/${version}/${suffix}`;
+        run('git', ['branch', '-m', branch, localBackup], repo);
+        owner.localBackup = localBackup;
+      }
+      if (remote) {
+        const remoteBackup = `release-docs-backup/${version}/${suffix}`;
+        run('git', ['fetch', 'origin', `refs/heads/${branch}`], repo);
+        if (run('git', ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], repo) !== remote)
+          throw new Error(`remote docs branch changed while backing up: ${branch}`);
+        const changed = run('git', ['diff', '--name-only', `${main}...${remote}`], repo).split('\n').filter(Boolean);
+        if (changed.some((path) => !path.startsWith('release/public/docs/') && path !== 'website/pages.json'))
+          throw new Error(`foreign docs branch changes outside public docs: ${changed.join(', ')}`);
+        run('git', ['push', 'origin', `${remote}:refs/heads/${remoteBackup}`], repo);
+        if (remoteBranchHead(run, repo, remoteBackup) !== remote) throw new Error('remote docs backup not verified');
+        owner.remoteBackup = remoteBackup;
+        owner.remoteHead = remote;
+      }
+      const useCache = !remote && cached?.main === main && SHA.test(main);
+      if (useCache) {
+        tree = cached!.tree;
+        run('git', ['-C', tree, 'switch', '-c', branch], repo);
+        rmSync(cacheFile(cacheDir!, cached!), { force: true });
+      } else {
+        const root = mkdtempSync(join(tmpdir(), 'release-docs-'));
+        tree = join(root, 'tree');
+        run('git', ['worktree', 'add', '-b', branch, tree, main], repo);
+      }
+      // A foreign ref is incorporated by a normal merge, keeping the original branch fast-forwardable.
+      // Restore the docs inputs from main before generating this run's notes: old output is history, not input.
+      if (remote) {
+        run('git', ['merge', '--no-ff', '--no-edit', remote], tree);
+        run('git', ['restore', '--source', main, '--staged', '--worktree', '--', 'release/public/docs', 'website/pages.json'], tree);
+      }
+      const receipt: DocsReceipt = { owner, branch, worktree: tree, outcome: 'staged' };
+      mkdirSync(dirname(receiptPath), { recursive: true });
+      publish(receiptPath, receipt);
+      if (!useCache) run('bun', ['install', '--frozen-lockfile'], tree);
+    }
+    const result = cached?.tree === tree && cached.main === main ? cached.docs
+      : runDocs(['--version', version, '--base', tree, '--json'], repo, env, { stateRoot });
+    if (result.outcome !== 'ok') throw new Error(result.error ?? 'docs generation failed');
+    run('git', ['add', 'release/public/docs', 'website/pages.json'], tree);
+    const changes = run('git', ['diff', '--cached', '--name-only'], tree).trim();
+    if (changes) run('git', ['commit', '-m', `docs: release ${version}`], tree);
+    // No force: a concurrent remote update fails and leaves both branch and backup intact.
+    run('git', ['push', '-u', 'origin', branch], tree);
+    const head = run('git', ['rev-parse', '--verify', 'HEAD'], tree);
+    const output: DocsResult = { ...result, branch, worktree: tree, artifactOwner: owner };
+    publish(receiptPath, { owner, branch, worktree: tree, outcome: 'pushed', head, result: output } satisfies DocsReceipt);
+    return output;
+  } catch (error) {
+    return { outcome: 'error', version, error: error instanceof Error ? error.message : String(error),
+      ...(tree ? { worktree: tree } : {}), ...(owner ? { artifactOwner: owner } : {}) };
   }
 }
 
@@ -597,6 +734,9 @@ if (import.meta.main) {
       result = { ...joinTui(context, process.env, process.cwd()), version: context.input.version } as typeof result;
     } else if (node === 'docs') {
       result = graphDocs(readGraphContext(), process.env, process.cwd(), commandRunner);
+    } else if (node === 'notes-repair') {
+      const { runNotesRepair } = await import('./notes-repair.js');
+      result = await runNotesRepair(readGraphContext()) as typeof result;
     } else if (node === null) result = runDocs(process.argv.slice(2));
     else throw new Error(`unknown release docs node: ${node}`);
   } catch (error) {

@@ -10,9 +10,9 @@ import { hostCredentials } from '../task-orchestrator/surfaces/self-implement-po
 import { _resetGrokRefreshCooldownForTesting, resolveGrokCredential } from '../grok/credential.js';
 import {
   judgeParentHostCredentials, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript, shouldInstallRemoteCodexAccess,
-  installRemoteCodexAccess, installRemoteCodexAccessBatch, installRemoteGrokAccess, resolveOwnerGrokAccessMirror, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, orderParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, type ParentHostConfig, type SshRunner,
+  installRemoteCodexAccess, installRemoteCodexAccessBatch, installRemoteGrokAccess, resolveOwnerGrokAccessMirror, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, rankParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, PARENT_HOST_ACTIVE_FILTER, PARENT_HOST_PROC_COUNT_SCRIPT, type ParentHostConfig, type SshRunner,
 } from './parent-host.js';
-import { handTask } from './task-hand.js';
+import { handTask, shellQuote } from './task-hand.js';
 
 const TARGET: ParentHostConfig = { host: 'node-b', cwd: '/Users/me/source/elanous' };
 const GOOD_FACTS = 'version=0.2.20-dev.0\nconfig=1\npodPool=1\nrepo=1\nkubectl=1\n';
@@ -39,6 +39,8 @@ async function launchWithTestMirror(args: string[], cwd: string | undefined, con
   deps: Parameters<typeof defaultTaskLauncher>[3] = {}): ReturnType<typeof defaultTaskLauncher> {
   return defaultTaskLauncher(args, cwd, context, { codexAccessMirror: async () => TEST_CODEX_MIRROR, ownerCodexLeaseHolder: () => true, ...deps });
 }
+const orderParentHosts = (targets: readonly ParentHostConfig[], runId: string, capacities: Parameters<typeof rankParentHosts>[2]): ParentHostConfig[] =>
+  rankParentHosts(targets, runId, capacities).map(({ target }) => target);
 
 describe('resolveParentHost — 기본 OFF', () => {
   test('설정·env 가 없으면 끔', () => {
@@ -149,11 +151,77 @@ describe('multi-host parent routing', () => {
     expect(resolveParentHost({ ...TARGET, approvalCapacity: 0 }, {})).toMatchObject({ host: 'node-b', approvalCapacity: 0 });
     expect(resolveParentHosts(hosts, { ELANOUS_TA_PARENT_HOST: 'off' })).toEqual([]);
     expect(resolveParentHosts(hosts, { ELANOUS_TA_PARENT_HOST: 'node-c' })).toEqual([minihHost]);
-    expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ approvalHeadroom: 6, load: 0 });
-    expect(readParentHostCapacity({ ...minihHost, approvalCapacity: 2 }, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ approvalHeadroom: 0, load: 0 });
-    expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(0), stderr: '' }))).toEqual({ approvalHeadroom: 1, load: 0 });
-    expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(1), stderr: '' }))).toEqual({ approvalHeadroom: 0, load: 0 });
-    expect(readParentHostCapacity(minihHost, () => ({ status: 255, stdout: '', stderr: 'timeout' }))).toBeNull();
+    expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ active: 2, waiting: 0, approvalHeadroom: 6, load: 0 });
+    expect(readParentHostCapacity({ ...minihHost, approvalCapacity: 2 }, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ active: 2, waiting: 0, approvalHeadroom: 0, load: 0 });
+    expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(0), stderr: '' }))).toEqual({ active: 0, waiting: 0, approvalHeadroom: 1, load: 0 });
+    expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(1), stderr: '' }))).toEqual({ active: 1, waiting: 0, approvalHeadroom: 0, load: 0 });
+    const unavailableReasons: string[] = [];
+    const off = debug.registerSink({ name: 'parent-host-capacity-unavailable-test', emit: (rec) => {
+      if (rec.category === 'task-agent.parent-host' && rec.event === 'capacity-unavailable') {
+        unavailableReasons.push((rec.data as { reason: string }).reason);
+      }
+    } });
+    try {
+      expect(readParentHostCapacity(minihHost, () => ({ status: 1, stdout: '__ELANOUS_PARENT_CAPACITY_ERROR__bash-unavailable\n', stderr: '' }))).toBeNull();
+      expect(readParentHostCapacity(minihHost, () => ({ status: 255, stdout: '', stderr: 'timeout' }))).toBeNull();
+      const missingActive = capacitySample(0).replace('__ELANOUS_PARENT_CAPACITY__0\n', '');
+      const missingBoundary = capacitySample(0).replace('__ELANOUS_PARENT_APPROVALS__\n', '');
+      expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: missingActive, stderr: '' }))).toBeNull();
+      expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: missingBoundary, stderr: '' }))).toBeNull();
+    } finally { off(); }
+    expect(unavailableReasons).toEqual(['bash-unavailable', 'remote-command-failed', 'active-count-marker-missing', 'approval-boundary-missing']);
+  });
+  test('single-host launch records unmeasured ranking fields as null', async () => {
+    const events: unknown[] = [];
+    const off = debug.registerSink({ name: 'parent-host-single-rank-test', emit: (rec) => {
+      if (rec.category === 'task-agent.parent-host' && rec.event === 'host-ranked') events.push(rec.data);
+    } });
+    try {
+      await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(450), {
+        parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+        spawn: () => { throw Error('unexpected local'); },
+      });
+      expect(events).toEqual([expect.objectContaining({
+        host: 'node-b', runId: context(450).runId, active: null, waiting: null,
+        headroom: null, capacityState: 'unmeasured', load: null, weight: null, score: null, selected: true,
+      })]);
+    } finally { off(); }
+  });
+  test('capacity counter uses Linux argv boundaries to exclude Pod-local work and goal text', () => {
+    const root = mkdtempSync(join(tmpdir(), 'parent-host-proc-'));
+    const writeArgs = (pid: number, args: string[]) => {
+      const dir = join(root, String(pid)); mkdirSync(dir);
+      writeFileSync(join(dir, 'cmdline'), Buffer.from([...args, ''].join('\0')));
+    };
+    try {
+      const parent = ['/home/agent/.bun/bin/bun', '/home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs', '--config-dir', '/home/agent/.elanous', 'harness', 'say', '--pod-pool', 'pool', '--no-auto-merge', '--substrate', 'pod', 'goal'];
+      writeArgs(101, parent);
+      writeArgs(102, parent);
+      writeArgs(103, ['/bin/bash', '-c', 'install ELANOUS_POD_FALLBACK_CHAIN elanous.mjs harness say --substrate local']);
+      writeArgs(104, ['/home/agent/.bun/bin/bun', '/home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs', 'harness', 'say', '--pod-pool', 'pool', '--substrate', 'local', '--no-auto-merge', 'goal']);
+      writeArgs(105, ['/home/agent/.bun/bin/bun', '/home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs', 'dev', '--implement', 'goal mentions harness say --substrate local']);
+      writeArgs(106, ['/home/agent/.local/bin/elanous', '--config-dir', '/home/agent/.elanous', 'harness', 'ask', '--pod-pool', 'pool', '--no-auto-merge']);
+      writeArgs(107, ['/home/agent/.bun/bin/bun', '/home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs', 'harness', 'say', '--pod-pool', 'pool', '--no-auto-merge', 'goal mentions harness say --substrate local']);
+      writeArgs(108, ['bun', '/home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs', 'harness', 'say', '--pod-pool', 'pool', '--no-auto-merge']);
+      writeArgs(109, ['node', '/home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs', 'harness', 'say', '--pod-pool', 'pool', '--no-auto-merge']);
+      writeArgs(110, ['bun', '--bun', '/home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs', 'harness', 'say', '--pod-pool', 'pool', '--no-auto-merge']);
+      writeArgs(111, ['bun', '/repo/src/elanous.mjs', 'harness', 'say', '--pod-pool', 'pool']);
+      const counted = spawnSync('bash', ['-c', PARENT_HOST_PROC_COUNT_SCRIPT, '--', root], { encoding: 'utf8' });
+      expect(counted.status).toBe(0);
+      expect(counted.stdout.trim()).toBe('__ELANOUS_PARENT_CAPACITY__7');
+      const quotedCount = spawnSync('bash', ['-c', `bash -c ${shellQuote(PARENT_HOST_PROC_COUNT_SCRIPT)} -- ${shellQuote(root)}`], { encoding: 'utf8' });
+      expect(quotedCount.status).toBe(0);
+      expect(quotedCount.stdout.trim()).toBe('__ELANOUS_PARENT_CAPACITY__7');
+      expect(PARENT_HOST_ACTIVE_FILTER).toContain('!/^([^ ]+\\/)?[^ ]*sh -c/');
+      const commandPattern = PARENT_HOST_ACTIVE_FILTER.split(' && ')[0]!;
+      const commandRegex = new RegExp(commandPattern.slice(1, commandPattern.lastIndexOf('/')));
+      expect(commandRegex.test('bun /home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs harness say --pod-pool pool')).toBe(true);
+      expect(commandRegex.test('dev --implement goal harness say')).toBe(false);
+      expect(commandRegex.test('bun /repo/src/elanous.mjs harness say --pod-pool pool')).toBe(true);
+      expect(commandRegex.test('/home/agent/.bun/bin/bun /home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs harness say --no-auto-merge --pod-pool pool')).toBe(true);
+      expect(PARENT_HOST_ACTIVE_FILTER).toContain('/ --no-auto-merge( |$)/');
+      expect(PARENT_HOST_ACTIVE_FILTER).toContain('!/ --substrate local( |$)/');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
   test('remote admission backlog and CPU load change the selected host, not just parent process counts', async () => {
     const observedScripts: string[] = [];
@@ -166,8 +234,8 @@ describe('multi-host parent routing', () => {
     };
     const pair = [{ ...TARGET, approvalCapacity: 2 }, { ...minihHost, approvalCapacity: 2 }];
     const sample = readParentHostCapacity(pair[0]!, read('node-b'))!;
-    expect(sample).toEqual({ approvalHeadroom: 1, load: 0.75 });
-    expect(readParentHostCapacity(pair[1]!, read('node-b'))).toEqual({ approvalHeadroom: 2, load: 0.05 });
+    expect(sample).toEqual({ active: 0, waiting: 1, approvalHeadroom: 1, load: 0.75 });
+    expect(readParentHostCapacity(pair[1]!, read('node-b'))).toEqual({ active: 0, waiting: 0, approvalHeadroom: 2, load: 0.05 });
     const recovered = capacitySample(0, 1, 0).replace('__ELANOUS_PARENT_CAPACITY__0\n', `__ELANOUS_PARENT_CAPACITY__0\n${JSON.stringify({ category: 'pod-lease', event: 'admit-by-usage', data: { runId: 'run-waiting', recommended: 3 } })}\n`);
     expect(readParentHostCapacity(pair[0]!, () => ({ status: 0, stdout: recovered, stderr: '' }))?.approvalHeadroom).toBe(2);
     const tally = async (congested: string) => {
@@ -185,11 +253,15 @@ describe('multi-host parent routing', () => {
     const second = await tally('node-c');
     expect(first.node-c).toBeGreaterThan(first.node-b);
     expect(second.node-b).toBeGreaterThan(second.node-c);
-    const lowLoad = { node-b: { approvalHeadroom: 2, load: 0.05 }, node-c: { approvalHeadroom: 2, load: 0.75 } };
+    const lowLoad = { node-b: { active: 0, waiting: 0, approvalHeadroom: 2, load: 0.05 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 2, load: 0.75 } };
     const highLoad = { node-b: lowLoad.node-c, node-c: lowLoad.node-b };
     const lowSelected = Array.from({ length: 100 }, (_, n) => orderParentHosts(pair, `run-load-${n}`, lowLoad)[0]!.host);
     const highSelected = Array.from({ length: 100 }, (_, n) => orderParentHosts(pair, `run-load-${n}`, highLoad)[0]!.host);
     expect(lowSelected.filter((host) => host === 'node-b').length).toBeGreaterThan(highSelected.filter((host) => host === 'node-b').length + 10);
+    expect(observedScripts[0]).toContain('!/^([^ ]+\\/)?[^ ]*sh -c/');
+    expect(observedScripts[0]).toContain('bash -c');
+    expect(observedScripts[0]).toContain('if [ -r /proc/self/cmdline ]');
+    expect(observedScripts[0]).toContain(PARENT_HOST_ACTIVE_FILTER);
     expect(observedScripts[0]).toContain('logs --event admit-by-usage --since 5m --json --limit 1000');
     expect(observedScripts[0]).toContain('cpu=$(ps -Ao %cpu=)');
     const unknown = capacitySample(0).replace('__ELANOUS_PARENT_LOAD__cores=4', '__ELANOUS_PARENT_LOAD__cores=bad');
@@ -198,16 +270,16 @@ describe('multi-host parent routing', () => {
     expect(readParentHostCapacity(pair[0]!, () => ({ status: 0, stdout: truncated, stderr: '' }))).toBeNull();
   });
   test('capacity-proportional selection across distinct run ids; zero-headroom is not selected', () => {
-    const capacity = { node-b: { approvalHeadroom: 2, load: 1 }, node-c: { approvalHeadroom: 6, load: 1 } };
+    const capacity = { node-b: { active: 0, waiting: 0, approvalHeadroom: 2, load: 1 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 6, load: 1 } };
     const counts = { node-b: 0, node-c: 0 };
     for (let n = 0; n < 400; n++) counts[orderParentHosts(hosts, `run-distribution-${n}`, capacity)[0]!.host as keyof typeof counts]++;
     expect(counts.node-c).toBeGreaterThan(250);
     expect(counts.node-c).toBeLessThan(350);
-    expect(orderParentHosts(hosts, 'run-1', { ...capacity, node-b: { approvalHeadroom: 0, load: 1 } })[0]!.host).toBe('node-c');
+    expect(orderParentHosts(hosts, 'run-1', { ...capacity, node-b: { active: 0, waiting: 0, approvalHeadroom: 0, load: 1 } })[0]!.host).toBe('node-c');
     const ratioHosts = [{ ...TARGET, approvalCapacity: 32 }, { ...minihHost, approvalCapacity: 14 }];
     const ratio = { node-b: 0, node-c: 0 };
     for (let n = 0; n < 30; n++) ratio[orderParentHosts(ratioHosts, `run-parent-${n}`, {
-      node-b: { approvalHeadroom: 32, load: 0 }, node-c: { approvalHeadroom: 14, load: 0 },
+      node-b: { active: 0, waiting: 0, approvalHeadroom: 32, load: 0 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 14, load: 0 },
     })[0]!.host as keyof typeof ratio]++;
     expect(ratio.node-b).toBeGreaterThan(0);
     expect(ratio.node-c).toBeGreaterThan(0);
@@ -232,6 +304,15 @@ describe('multi-host parent routing', () => {
         receipts.set(runId, (receipt as { parentHost: { host: string } }).parentHost.host);
       }
       sink.flush();
+      const ranked = store.query({ exactCategories: ['task-agent.parent-host'], events: ['host-ranked'], limit: 1000 })
+        .map((row) => JSON.parse(row.data ?? '{}') as { host?: string; runId?: string; active?: number | null; waiting?: number | null; headroom?: number | null; capacityState?: string; load?: number | null; weight?: number; score?: number | null; selected?: boolean })
+        .filter((row) => row.runId?.startsWith(runPrefix));
+      expect(ranked).toHaveLength(receipts.size * targets.length);
+      for (const runId of receipts.keys()) {
+        const evidence = ranked.filter((row) => row.runId === runId);
+        expect(evidence.filter((row) => row.selected && row.host === receipts.get(runId))).toHaveLength(1);
+        expect(evidence.every((row) => row.active === 0 && row.waiting === 0 && (row.headroom === 2 || row.headroom === 8) && row.capacityState === 'available' && row.load === 0 && typeof row.weight === 'number' && (typeof row.score === 'number' || row.score === null))).toBe(true);
+      }
       const recorded = store.query({ exactCategories: ['task-agent'], events: ['parent-host-launched'], limit: 100 })
         .map((row) => JSON.parse(row.data ?? '{}') as { host?: string; runId?: string })
         .filter((row) => row.runId?.startsWith(runPrefix));
@@ -334,16 +415,24 @@ describe('multi-host parent routing', () => {
     expect((await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(105), deps) as { parentHost: { host: string } }).parentHost.host).toBe('node-c');
     expect(reached).toEqual(['node-c', 'node-c']);
     reached.length = 0;
-    const saturated: SshRunner = (host, script, _timeout, stdin) => stdin !== undefined
-      ? { status: 0, stdout: '', stderr: '' }
-      : script.includes('__ELANOUS_PARENT_CAPACITY__')
-      ? { status: 0, stdout: capacitySample(8), stderr: '' }
-      : (reached.push(host), { status: 0, stdout: GOOD_FACTS, stderr: '' });
-    expect(await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(106), { ...deps, ssh: saturated })).toEqual({ runId: context(106).runId });
-    expect(reached).toEqual([]);
+    const ranked: unknown[] = [];
+    const off = debug.registerSink({ name: 'parent-host-saturated-rank-test', emit: (rec) => {
+      if (rec.category === 'task-agent.parent-host' && rec.event === 'host-ranked') ranked.push(rec.data);
+    } });
+    try {
+      const saturated: SshRunner = (host, script, _timeout, stdin) => stdin !== undefined
+        ? { status: 0, stdout: '', stderr: '' }
+        : script.includes('__ELANOUS_PARENT_CAPACITY__')
+        ? { status: 0, stdout: capacitySample(8), stderr: '' }
+        : (reached.push(host), { status: 0, stdout: GOOD_FACTS, stderr: '' });
+      expect(await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(106), { ...deps, ssh: saturated })).toEqual({ runId: context(106).runId });
+      expect(reached).toEqual([]);
+    } finally { off(); }
+    expect(ranked.length).toBeGreaterThan(0);
+    expect(ranked.every((row) => (row as { capacityState?: string }).capacityState === 'saturated')).toBe(true);
   });
   test('preflight rejects the chosen host before trying the other; unavailable capacity never launches there', async () => {
-    const first = orderParentHosts(targets, context(99).runId, { node-b: { approvalHeadroom: 2, load: 0 }, node-c: { approvalHeadroom: 8, load: 0 } })[0]!.host;
+    const first = orderParentHosts(targets, context(99).runId, { node-b: { active: 0, waiting: 0, approvalHeadroom: 2, load: 0 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 8, load: 0 } })[0]!.host;
     const launched: string[] = [];
     const ssh: SshRunner = (host, script, _timeout, stdin) => {
       if (stdin !== undefined) return { status: 0, stdout: '', stderr: '' };
@@ -357,7 +446,7 @@ describe('multi-host parent routing', () => {
     expect((receipt as { parentHost: { host: string } }).parentHost.host).toBe(launched[0]);
   });
   test('definite failed first host tries next; both fail falls back locally; uncertain launch never retries', async () => {
-    const first = orderParentHosts(targets, context(99).runId, { node-b: { approvalHeadroom: 2, load: 0 }, node-c: { approvalHeadroom: 8, load: 0 } })[0]!.host;
+    const first = orderParentHosts(targets, context(99).runId, { node-b: { active: 0, waiting: 0, approvalHeadroom: 2, load: 0 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 8, load: 0 } })[0]!.host;
     const second = targets.find((target) => target.host !== first)!.host;
     const calls: string[] = [];
     const run = (failure: 'first' | 'both' | 'uncertain'): SshRunner => (host, script, _timeout, stdin) => {

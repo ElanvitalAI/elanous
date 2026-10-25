@@ -79,7 +79,7 @@ test('a fresh worker process reuses the persisted scan index, invalidates on led
       expect(observed).toMatchObject({ status: 'terminal-status-missing', lifecycle: 'orphaned', lastActivityTimestamp: '2026-01-01T00:00:00Z', lastActivityStatus: 'available' });
     }
     expect(existsSync(index)).toBe(true);
-    expect(JSON.parse(readFileSync(index, 'utf8')).version).toBe(2);
+    expect(JSON.parse(readFileSync(index, 'utf8')).version).toBe(3);
 
     // ② A fresh worker process (the /now shape) reuses the persisted facts: all hits, zero re-reads, identical rows.
     const second = childQuery(dir);
@@ -105,7 +105,7 @@ test('a fresh worker process reuses the persisted scan index, invalidates on led
     const fifth = childQuery(dir);
     expect(fifth).toMatchObject({ cacheHits: 0, cacheMisses: 5, indexHits: 0, indexOrigin: 'fresh', unreadableLedgerCount: 0 });
     expect(fifth.entries).toEqual(fourth.entries);
-    expect(JSON.parse(readFileSync(index, 'utf8')).version).toBe(2);
+    expect(JSON.parse(readFileSync(index, 'utf8')).version).toBe(3);
 
     // A same-size rewrite with a restored mtime must not reuse either the process cache or disk index.
     const rewrittenPath = join(dir, `${id(4)}.jsonl`);
@@ -134,4 +134,4 @@ test('a fresh worker process reuses the persisted scan index, invalidates on led
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
+}, 30_000);

@@ -1,7 +1,7 @@
 import type { Command } from 'commander';
 import { writeStdoutJson } from '../cli/stdout-json.js';
 import { listAllLoops, listLoops, loopStatus, runLoop, setLoopEnabled, unregisteredCronLoops, type AllLoopEntry, type LoopRegistryOptions } from './registry.js';
-import { checkLoops, countLoopStates, entriesFromRegistry, LOOP_STATES, notifyOwners, observeLoopCheck, type RegistryAdapterDeps } from './checker.js';
+import { checkLoops, countLoopStates, entriesFromRegistry, LOOP_STATES, notifyOwners, observeLoopCheck, pruneJudgment, pruneText, type RegistryAdapterDeps } from './checker.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { verifyLoopPackage } from './package/verify.js';
 import { loopActivity } from './activity.js';
@@ -56,7 +56,8 @@ export function registerLoopCommands(program: Command, checkerDeps: RegistryAdap
     }));
   loop.command('status [id]').option('--all', 'Check all registered loops')
     .option('--json', 'Print JSON').option('--notify', 'Queue late/failing loops for their owners')
-    .action((id: string | undefined, opts: { all?: boolean; json?: boolean; notify?: boolean }) => handle(async () => {
+    .option('--prune', 'Judge idle retire · unregistered cleanup · sibling folding · alive ≤ 25')
+    .action((id: string | undefined, opts: { all?: boolean; json?: boolean; notify?: boolean; prune?: boolean }) => handle(async () => {
       if (!opts.all) {
         if (!id) throw new Error('loop status requires an id or --all');
         await output(loopStatus(id), !!opts.json);
@@ -65,15 +66,19 @@ export function registerLoopCommands(program: Command, checkerDeps: RegistryAdap
       if (id) throw new Error('loop status --all does not take an id');
       const now = checkerDeps.now ?? new Date();
       const root = checkerDeps.root ?? effectiveInstanceRoot();
-      const { entries, scope } = entriesFromRegistry({ ...checkerDeps, now });
+      const registryOpts = checkerDeps.registryOptions;
+      const { entries, scope } = entriesFromRegistry({ ...checkerDeps, now,
+        listAllLoops: checkerDeps.listAllLoops ?? (registryOpts ? () => listAllLoops(registryOpts) : undefined) });
       const results = checkLoops(entries, now);
       const counts = countLoopStates(results);
+      const prune = pruneJudgment(results, { now });
       observeLoopCheck(results, scope, { root, now });
       if (opts.notify) notifyOwners(results, { root, now });
-      if (opts.json) { await output({ results, counts, scope }, true); return; }
+      if (opts.json) { await output({ results, counts, scope, prune }, true); return; }
       console.log('id\tstate\tlast run\texpected interval\towner\treason');
       for (const result of results) console.log(`${result.id}\t${result.state}\t${result.lastRunAt ?? '—'}\t${result.expectEveryMinutes === undefined ? '—' : `${result.expectEveryMinutes}m`}\t${result.owner ?? '—'}\t${result.reason}`);
       console.log(`${LOOP_STATES.map(state => `${state} ${counts[state]}`).join(' · ')} · scope ${scope}`);
+      if (opts.prune) console.log(pruneText(prune));
     }));
   for (const [name, enabled] of [['start', true], ['stop', false]] as const) {
     loop.command(`${name} <id>`).option('--yes', 'Apply the crontab change (otherwise preview only)')

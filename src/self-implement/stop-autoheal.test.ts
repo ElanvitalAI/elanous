@@ -112,6 +112,7 @@ const EXPECTED: Record<RunStopClass, AutohealAction> = {
   'env-unrelated': 'clean-workspace-regate',
   'main-sync': 'rebase-regate',
   'pod-died': 'resume-from-salvage',
+  'pod-vanished': 'needs-owner',
   'evidence-uncovered': 'derive-evidence-rejudge',
   'review-repeat': 'needs-owner',
   'review-out-of-scope': 'needs-owner',

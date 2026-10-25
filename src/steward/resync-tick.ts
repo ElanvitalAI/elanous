@@ -16,6 +16,36 @@ type ResyncTickResult = { decision: 'ran' | 'failed' | 'skipped-release' | 'skip
 
 export function resyncPendingPath(): string { return join(effectiveInstanceRoot(), 'steward', 'resync-pending.json'); }
 
+/**
+ * Fallback marker for the same-tick rejudge node when the primary marker cannot be written after a successful
+ * remote push. It lives next to the primary marker and carries the same `{ savedAt }` shape, so the consumer
+ * contract does not change — only the location the marker is read from.
+ */
+export function resyncPendingRecoveryPath(pendingPath: string = resyncPendingPath()): string {
+  return join(dirname(pendingPath), 'resync-pending-recovery.json');
+}
+
+/** Best-effort marker write: a record failure must not undo the completed push or hide its new head. */
+function recordResyncPending(pendingPath: string): void {
+  const savedAt = new Date().toISOString();
+  try {
+    mkdirSync(dirname(pendingPath), { recursive: true });
+    writeFileSync(pendingPath, JSON.stringify({ savedAt }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`steward resync: pending record write failed — ${message}`);
+    try {
+      const recoveryPath = resyncPendingRecoveryPath(pendingPath);
+      mkdirSync(dirname(recoveryPath), { recursive: true });
+      writeFileSync(recoveryPath, JSON.stringify({ savedAt }));
+      console.error(`steward resync: pending record recovered at ${recoveryPath}`);
+    } catch (fallbackError) {
+      // Nothing left to write: the tick still reports `ran` with the pushed summary, and the failure stays observable.
+      console.error(`steward resync: pending record recovery failed — ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`);
+    }
+  }
+}
+
 /** The same registered, detached OP checkout used by steward launch; the installed package is not a git repository. */
 export function stewardResyncRepoRoot(
   resolveSeat: typeof resolveHqLaunchSeat = resolveHqLaunchSeat,
@@ -185,10 +215,7 @@ export async function resyncTickWithReleaseProbe(
           result = { decision: 'skipped-release-window', reason: window === 'inside' ? 'scheduled release window' : 'release schedule unavailable' };
         } else {
           const summary = await run();
-          if (summary.saved > 0) {
-            mkdirSync(dirname(pendingPath), { recursive: true });
-            writeFileSync(pendingPath, JSON.stringify({ savedAt: new Date().toISOString() }));
-          }
+          if (summary.saved > 0) recordResyncPending(pendingPath);
           result = { decision: 'ran', summary };
         }
       }

@@ -106,9 +106,10 @@ export async function dispatchPtyShellTool(
   ctx?: DaemonToolDispatchCtx,
 ): Promise<unknown> {
   switch (name) {
-    case 'PtyShellStart':
+    case 'PtyShellStart': {
       // Autonomous surface — auto-approve the spawn (no HITL babysitting).
       return dispatchPtyShellStart(args, { requireApproval: false });
+    }
     case 'PtyShellPoll':
       return dispatchPtyShellPoll(args);
     case 'PtyShellSend':

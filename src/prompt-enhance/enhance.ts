@@ -134,7 +134,7 @@ function askMarkerCount(ask: string): number {
   return (ask.match(/(?:^|\s)(?:불변식|경계|판정\s*신호|invariant|boundary|decision\s+signal)\s*:/gi) ?? []).length;
 }
 
-type EnhanceSelectionSource = 'opts' | 'env' | 'config-role' | 'fallback-child' | 'default';
+type EnhanceSelectionSource = 'opts' | 'env' | 'config-role' | 'child' | 'fallback-child' | 'default';
 const PLANNING_FALLBACK_REASONS = new Set(['quota-exhausted', 'quota-unmeasured', 'quota-unavailable', 'no-credential-source', 'expiring', 'credential-shape', 'credential-error', 'credential-unavailable', 'unavailable']);
 export function normalizePlanningFallbackReason(value: unknown): string {
   return typeof value === 'string' && PLANNING_FALLBACK_REASONS.has(value) ? value : 'unavailable';
@@ -153,7 +153,7 @@ export function selectEnhanceLlm(
   const forwardedModelSource = env.ELANOUS_PROMPT_ENHANCE_MODEL_RELAY === 'pod' ? env.ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE : undefined;
   const modelSource: EnhanceSelectionSource = opts.model !== undefined ? 'opts'
     : env.ELANOUS_PROMPT_ENHANCE_MODEL
-      ? forwardedModelSource === 'config-role' || forwardedModelSource === 'fallback-child' || forwardedModelSource === 'default' ? forwardedModelSource : 'env'
+      ? forwardedModelSource === 'config-role' || forwardedModelSource === 'child' || forwardedModelSource === 'fallback-child' || forwardedModelSource === 'default' ? forwardedModelSource : 'env'
     : configuredModel !== undefined ? 'config-role' : 'default';
   const model = opts.model ?? (env.ELANOUS_PROMPT_ENHANCE_MODEL || configuredModel || env.ELANOUS_PR_REVIEW_MODEL || tierModel('better'));
   const envEffort = env.ELANOUS_PROMPT_ENHANCE_EFFORT;
@@ -176,7 +176,7 @@ export function selectEnhanceLlm(
 export function selectPlanningLlm(
   env: NodeJS.ProcessEnv = process.env,
   config: UserConfig = getUserConfig(),
-): { model: string | undefined; effort: 'low' | 'medium' | 'high'; modelSource: 'env' | 'config-role' | 'fallback-child' | 'default'; fallbackReason?: string; requestedModel?: string; requestedSource?: string } {
+): { model: string | undefined; effort: 'low' | 'medium' | 'high'; modelSource: 'env' | 'config-role' | 'child' | 'fallback-child' | 'default'; fallbackReason?: string; requestedModel?: string; requestedSource?: string } {
   const planning = config.roleLlm?.planning;
   const envModel = env.ELANOUS_PROMPT_ENHANCE_MODEL;
   const roleModel = !envModel && planning && (planning.model || planning.tier || planning.provider)
@@ -186,7 +186,7 @@ export function selectPlanningLlm(
   const relayed = env.ELANOUS_PROMPT_ENHANCE_MODEL_RELAY === 'pod';
   const forwardedSource = relayed ? env.ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE : undefined;
   const modelSource = envModel
-    ? forwardedSource === 'config-role' || forwardedSource === 'fallback-child' || forwardedSource === 'default' ? forwardedSource : 'env'
+    ? forwardedSource === 'config-role' || forwardedSource === 'child' || forwardedSource === 'fallback-child' || forwardedSource === 'default' ? forwardedSource : 'env'
     : roleModel ? 'config-role' : 'default';
   const envEffort = env.ELANOUS_PROMPT_ENHANCE_EFFORT;
   const validEnvEffort = envEffort === 'low' || envEffort === 'medium' || envEffort === 'high' ? envEffort : undefined;

@@ -52,6 +52,7 @@ type Captured = {
 };
 
 function wiringSeams(captured: Captured): SelfImplementSeams {
+  let openedHead = '';
   return {
     stdinIsInteractive: () => false,
     refreshCodexQuotaSignals: async () => ({ accounts: [] }),
@@ -68,7 +69,8 @@ function wiringSeams(captured: Captured): SelfImplementSeams {
       verdict: 'pass', mustFix: [], shouldFix: ['거절 이유에 축 제목을 같이 대라'], summary: '배선은 닿았다',
       reviewed: true, diffTruncated: false, diffShownChars: 10, diffTotalChars: 10, diffOmittedFiles: 0,
     }),
-    openPr: async ({ head, body }) => { captured.bodies.push(body); return { url: `https://pr/${head}`, number: 18899 }; },
+    openPr: async ({ head, body }) => { openedHead = head; captured.bodies.push(body); return { url: `https://pr/${head}`, number: 18899 }; },
+    readPrAttribution: async () => ({ headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString() }),
     readPrDiff: async () => '',
     readPrCommitShas: async () => ({ baseCommit: 'base-sha', headCommit: 'head-sha' }),
     approvePr: async () => true,

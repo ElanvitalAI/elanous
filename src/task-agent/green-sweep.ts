@@ -39,22 +39,39 @@ export interface GreenSweepDecision {
 /** PR-body mentions are intentionally absent from this parser. */
 export function explicitEvidencePrs(evidence: string | undefined): number[] {
   const numbers = new Set<number>();
+  const refusedAcrossEvidence = new Set<number>();
+  const negated = /미착지|미병합|예정|계획|아님|않음|안\s*함|보류|대기|실패|불가|아직|미완료|누락|못\s*함|(?:착지|병합)\s*전|\b(?:not\s+(?:yet\s+)?(?:merged|landed)|unmerged|pending|planned)\b/i;
   for (const line of (evidence ?? '').split(/\r?\n/)) {
     // A previous refusal is diagnostic text, never new landing evidence.
     if (/^GREEN-FROM-LEDGER:/i.test(line) && !/· green ·/.test(line)) continue;
-    // A negated landing claim cannot establish this cell's PR ownership.
-    if (/미착지|미병합|예정|계획|아님|않음|안\s*함|보류|대기|실패|불가|아직|미완료|누락|못\s*함|(?:착지|병합)\s*전|\b(?:not\s+(?:yet\s+)?(?:merged|landed)|unmerged|pending|planned)\b/i.test(line)) continue;
-    // A PR number only counts when this cell's own evidence calls it landed.
-    for (const match of line.matchAll(/(?:착지|병합|merged|landed)\s*(?:PR\s*)?#(\d+)\b|(?:PR\s*)?#(\d+)\s*(?:착지|병합|merged|landed)(?=$|[^A-Za-z가-힣])/gi)) {
-      const number = Number(match[1] ?? match[2]);
-      if (Number.isSafeInteger(number) && number > 0) numbers.add(number);
+    // Scope a refusal to its own PR or named phase. An unbound refusal keeps
+    // the whole line ambiguous (for example "PR #123 착지 · 다른 PR 대기").
+    const clauses = line.split(/\s*·\s*|\s*;\s*|,\s*(?=(?:PR\s*)?#\d+\b)/);
+    const refused = new Set<number>();
+    let unboundRefusal = false;
+    for (const clause of clauses) {
+      if (!negated.test(clause)) continue;
+      const ids = [...clause.matchAll(/(?:PR\s*)?#(\d+)\b/gi)].map((match) => Number(match[1]));
+      if (ids.length === 0 && !/\b[CE]\d+\b/.test(clause)) unboundRefusal = true;
+      for (const id of ids) { refused.add(id); refusedAcrossEvidence.add(id); }
     }
-    for (const match of line.matchAll(/https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/(\d+)\b\s*(?:착지|병합|merged|landed)|(?:착지|병합|merged|landed)\s*https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/(\d+)\b/gi)) {
-      const number = Number(match[1] ?? match[2]);
-      if (Number.isSafeInteger(number) && number > 0) numbers.add(number);
+    if (unboundRefusal) continue;
+    // A PR number only counts when this cell's own evidence calls it landed.
+    for (const clause of clauses) {
+      if (negated.test(clause)) continue;
+      for (const match of clause.matchAll(/(?:착지|병합|merged|landed)\s*(?:PR\s*)?#(\d+)\b|(?:PR\s*)?#(\d+)\s*(?:착지|병합|merged|landed)(?=$|[^A-Za-z가-힣])/gi)) {
+        const number = Number(match[1] ?? match[2]);
+        if (Number.isSafeInteger(number) && number > 0 && !refused.has(number)) numbers.add(number);
+      }
+      for (const match of clause.matchAll(/https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/(\d+)\b\s*(?:착지|병합|merged|landed)|(?:착지|병합|merged|landed)\s*https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/(\d+)\b/gi)) {
+        const number = Number(match[1] ?? match[2]);
+        if (Number.isSafeInteger(number) && number > 0 && !refused.has(number)) numbers.add(number);
+      }
     }
   }
-  return [...numbers];
+  // Contradictory lines are not enough to establish ownership without an
+  // ordering proof. Keep them out of the candidate inventory altogether.
+  return [...numbers].filter((number) => !refusedAcrossEvidence.has(number));
 }
 
 export function greenSweepCandidates(item: ChecklistItem, version: string, cards: readonly TaskCard[]): GreenSweepCandidate[] {
@@ -99,6 +116,43 @@ export function appendGreenSweepEvidence(existing: string | undefined, line: str
   const before = existing ?? '';
   if (before.split(/\r?\n/).includes(line)) return before;
   return `${before}${before && !before.endsWith('\n') ? '\n' : ''}${line}`;
+}
+
+/** Accept only the checklist's explicit Bun test command; never pass checklist text through a shell. */
+export function greenSweepEvidenceTestArgs(title: string): string[] | null {
+  const command = /^\s*-?\s*완료 경계 증거 명령:\s*bun test\s+([^\r\n]+)\s*$/m.exec(title)?.[1]?.trim();
+  if (!command) return null;
+  const args = command.split(/\s+/);
+  if (!args.length || args.some((arg) => !/^[A-Za-z0-9_./@-]+$/.test(arg) || arg.startsWith('-') || arg.split('/').includes('..'))) return null;
+  return args;
+}
+
+export type GreenSweepSnapshotWriter = (
+  version: string,
+  id: string,
+  patch: { status: 'green'; evidence: string },
+  by: string,
+  expected: Pick<ChecklistItem, 'title' | 'status' | 'evidence'>,
+) => unknown;
+
+/** Production write entrypoint. Only green decisions with main-tree E2 proof may mutate the ledger. */
+export function applyGreenSweepDecisions(
+  version: string,
+  decisions: readonly GreenSweepDecision[],
+  items: readonly ChecklistItem[],
+  mainEvidencePassed: ReadonlySet<string>,
+  write: GreenSweepSnapshotWriter,
+): Array<{ cell: string; written: boolean; reason?: string }> {
+  return decisions.map((decision) => {
+    if (decision.verdict !== 'green') return { cell: decision.cell, written: false, reason: `verdict-${decision.verdict}` };
+    if (!mainEvidencePassed.has(decision.cell)) return { cell: decision.cell, written: false, reason: 'main-evidence-not-passed' };
+    const item = items.find((entry) => entry.id === decision.cell);
+    if (!item || item.status !== 'yellow')
+      return { cell: decision.cell, written: false, reason: 'cell-snapshot-not-writable' };
+    write(version, item.id, { status: 'green', evidence: decision.plannedEvidence }, 'tasks-green-sweep',
+      { title: item.title, status: item.status, evidence: item.evidence });
+    return { cell: decision.cell, written: true };
+  });
 }
 
 /** A merge establishes ownership of a PR, not completion of a whole cell. */

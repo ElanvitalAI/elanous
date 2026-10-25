@@ -1,0 +1,35 @@
+# DEFAULT-HANDS — «실행·조사» 손의 기본 조합 (RFC-loop-agent-map §A4c · 0.2.37).
+# 종결 종류별 조합(artifact·content·ops-action·watch-brief·decision-support)이 아직 없을 때
+# `tasks hand --completion <종류>` 가 이 판으로 내려간다 — 기본 손은 «개발»(코드 하니스)이 아니라 이쪽이다.
+# 만든다(④) → 확인한다(⑥) 두 동사만 쓴다: 종결은 종류별 «확인 증거»(`completion-evidence.ts`)가 닫는다.
+graph_id: work-run-research
+version: 1
+launcher: graph-run
+entry_node: make-doc
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: make-doc
+    kind: subgraph
+    recipe: none
+    max_visits: 3
+    call: verb-make-doc@1
+    covers: [research, make]
+    budget: { inner_steps: 16 }
+    contract: { inputs: [ask, context, prior], tools: worktree-write, outputs: [result, evidence] }
+  - node_id: verify
+    kind: subgraph
+    recipe: none
+    max_visits: 3
+    call: verb-verify@1
+    covers: [verify, execute]
+    budget: { inner_steps: 16 }
+    contract: { inputs: [ask, context, prior], tools: read-and-run-tests, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: make-doc
+    on: outcome
+    map: { done: verify, rework: make-doc, needs-human: failed, failed: failed }
+  - from: verify
+    on: outcome
+    map: { done: done, rework: make-doc, needs-human: failed, failed: failed }

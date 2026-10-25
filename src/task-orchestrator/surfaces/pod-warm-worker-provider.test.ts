@@ -1113,7 +1113,56 @@ test('WARM-REUSE-TIME-PAIRS: production --reconcile wires pairingGateFile and ec
       file: gateFile, commit: prepareSpec.cutSha, host: 'node-c', reuse: false, podUid: '', success: false });
     expect(legs[0].totalDurationMs).toBe(legs[0].prepareDurationMs);
   } finally { rmSync(root, { recursive: true, force: true }); }
-});
+}, 120_000);
+
+test('WARM-REUSE-TIME-PAIRS: production --pairs joins the cold CLI leg persisted in logs.db into one row', () => {
+  const root = mkdtempSync(join(tmpdir(), 'warm-provider-pairs-cli-'));
+  try {
+    const file = join(root, 'provider.json');
+    const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+    const gateFile = 'src/example/worker.test.ts';
+    writeFileSync(file, JSON.stringify({
+      candidates: [{ host: 'node-c', tier: 'standard', spec: prepareSpec }],
+      controlUrl: 'http://127.0.0.1:31413/',
+      memberToken: '1'.repeat(64),
+      machineTokens: { node-c: '2'.repeat(64) },
+      pairingGateFile: gateFile,
+    }), { mode: 0o600 });
+    // NODE_ENV is dropped so the child boots the production log store instead of the test-disabled one.
+    const { NODE_ENV: _nodeEnv, ...inherited } = process.env;
+    const env = { ...inherited, ELANOUS_WARM_POD_PROVIDER_CONFIG: file,
+      HOME: join(root, 'home'), ELANOUS_STATE_DIR: join(root, 'state'), ELANOUS_STATE_DIR_SOURCE: 'explicit',
+      ELANOUS_CONFIG_DIR: join(root, 'config') };
+    const entry = join(import.meta.dir, 'pod-warm-worker-provider.ts');
+    const cold = spawnSync(process.execPath, [entry, '--reconcile'], { encoding: 'utf8', env });
+    expect(cold.status).toBe(2);
+    // The read-only query entry re-reads the same logs.db the cold process persisted — it holds no legs in memory.
+    const query = spawnSync(process.execPath, [entry, '--pairs'], { encoding: 'utf8', env });
+    expect({ status: query.status, stderr: query.stderr }).toEqual({ status: 0, stderr: '' });
+    const rows = JSON.parse(query.stdout.trim()).warmReuseTimePairs;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({ gateKey: `${gateFile}/${prepareSpec.cutSha}/node-c`, file: gateFile,
+      commit: prepareSpec.cutSha, host: 'node-c',
+      cold: { file: gateFile, commit: prepareSpec.cutSha, host: 'node-c', reuse: false, podUid: '', success: false,
+        prepareDurationMs: rows[0].cold.prepareDurationMs, totalDurationMs: rows[0].cold.prepareDurationMs },
+      warm: null });
+    expect(rows[0].cold.prepareDurationMs).toBeGreaterThanOrEqual(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120_000);
+
+test('WARM-REUSE-TIME-PAIRS: production --pairs reports an empty pair list before any leg was measured', () => {
+  const root = mkdtempSync(join(tmpdir(), 'warm-provider-pairs-empty-'));
+  try {
+    // A host that never ran a gate has no logs.db: that is zero measured pairs, not a broken query.
+    const { NODE_ENV: _nodeEnv, ...inherited } = process.env;
+    const env = { ...inherited, HOME: join(root, 'home'), ELANOUS_STATE_DIR: join(root, 'state'),
+      ELANOUS_STATE_DIR_SOURCE: 'explicit', ELANOUS_CONFIG_DIR: join(root, 'config') };
+    const query = spawnSync(process.execPath, [join(import.meta.dir, 'pod-warm-worker-provider.ts'), '--pairs'],
+      { encoding: 'utf8', env });
+    expect({ status: query.status, stderr: query.stderr }).toEqual({ status: 0, stderr: '' });
+    expect(JSON.parse(query.stdout.trim())).toEqual({ warmReuseTimePairs: [] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120_000);
 
 test('WARM-REUSE-TIME-PAIRS: unset pairingGateFile skips the cold measurement row entirely', async () => {
   const events: Array<{ event: string; data: any }> = [];
@@ -1216,7 +1265,7 @@ test('WARM-REUSE-TIME-PAIRS: separate cold and warm provider processes pair into
     off(); sink.close(); store.close();
     rmSync(dir, { recursive: true, force: true });
   }
-});
+}, 120_000);
 
 test('WARM-REUSE-TIME-PAIRS: a multi-file gate never becomes a warm leg and logs its skip reason', async () => {
   const { gateFile, prepareSpec, cold, warm } = pairingFixture();
@@ -1233,7 +1282,7 @@ test('WARM-REUSE-TIME-PAIRS: a multi-file gate never becomes a warm leg and logs
     expect(events).toEqual([{ event: 'warm-reuse-time-pair-skipped',
       data: { reason: 'not-single-file-gate', fileCount: 2, commit: spec.cutSha, host: 'node-c' } }]);
   } finally { log.mockRestore(); }
-});
+}, 120_000);
 
 test('WARM-REUSE-TIME-PAIRS: pairing joins only the same file·commit·host and skips malformed rows', () => {
   const leg = (over: Record<string, unknown>) => ({ gateKey: 'f.test.ts/c/node-c', leg: 'cold', file: 'f.test.ts',

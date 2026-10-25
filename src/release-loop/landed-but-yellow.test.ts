@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -9,7 +10,7 @@ import { withFakeBins } from '../ux-sim/fake-bin.js';
 import { debug } from '../debug/log.js';
 import type { LandedButYellowDeps } from '../cli/release-cli.js';
 import * as checklist from './checklist.js';
-import type { ChecklistItem } from './checklist.js';
+import type { Checklist, ChecklistItem } from './checklist.js';
 import { registerReleaseCommands, type Runner } from '../cli/release-cli.js';
 
 const item = (id: string, status: ChecklistItem['status'] = 'yellow', extra: Partial<ChecklistItem> = {}): ChecklistItem =>
@@ -529,6 +530,7 @@ describe('LANDED-YELLOW-FAST — merged PR fetch', () => {
     const events: Array<{ category: string; event: string; data: unknown }> = [];
     const debugLog = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
     const written: string[] = [];
+    const cacheDir = mkdtempSync(join(tmpdir(), 'landed-cli-cache-'));
     const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, callback?: unknown) => {
       written.push(String(chunk));
       if (typeof callback === 'function') callback();
@@ -544,11 +546,12 @@ describe('LANDED-YELLOW-FAST — merged PR fetch', () => {
           schedules: () => [],
           released: () => '',
           registerLogSink: async () => {},
+          mergedPrCacheFile: () => join(cacheDir, 'cache.json'),
         });
         await program.parseAsync(['release', 'checklist', 'landed-but-yellow', '--version', '0.2.12', '--json'], { from: 'user' });
         expect(bins.calls()).toEqual([{ name: 'gh', argv: ['pr', 'list', '--state', 'merged', '--search', 'merged:>=2026-10-01', '--limit', '400', '--json', 'number,title,body,mergedAt'] }]);
       });
-    } finally { write.mockRestore(); debugLog.mockRestore(); }
+    } finally { write.mockRestore(); debugLog.mockRestore(); rmSync(cacheDir, { recursive: true, force: true }); }
     expect(performance.now() - started).toBeLessThan(60_000);
     expect(process.exitCode ?? 0).toBe(0);
     expect(written.join('')).toBe(`${JSON.stringify(referenceLandedButYellow(items, page))}\n`);
@@ -582,4 +585,241 @@ describe('LANDED-YELLOW-FAST — merged PR fetch', () => {
     // `rc=undefined` here because Bun's spawnSync leaves status undefined on a spawn error; null is the documented RunResult value.
     expect(stderr[0]).toMatch(/^⛔ 병합 PR 조회\(gh\) 실패 rc=null: Error: (?:Executable not found in \$PATH: "gh"|.*ENOENT)/);
   });
+});
+
+// ── GREEN-SCAN-LANDED-CACHE · 완료 경계: 같은 입력 두 번은 캐시, 시간 상한은 부분 결과 ─────────────
+describe('GREEN-SCAN-LANDED-CACHE — 같은 입력 두 번은 캐시로 끝나고, 시간 상한은 부분 결과를 낸다', () => {
+  const now = new Date('2026-10-21T10:00:00Z');
+  // 21 days × ~170 merges/day: the first page is full, so the windowed walk runs (the 10-21 prod shape).
+  const many = Array.from({ length: 3600 }, (_, i) => pr(20_000 + i, i % 97 === 0 ? 'GREEN-SCAN-LANDED-CACHE fixed' : `work ${i}`, i % 89 === 0 ? '칸: CL-AUTO' : 'body',
+    new Date(Date.parse('2026-10-01T00:00:00Z') + Math.floor(i * (20.9 * 86_400_000) / 3600)).toISOString().replace('.000Z', 'Z')));
+  const board = (version: string, id: string): Checklist =>
+    ({ version, released: '0.2.12', dev: version, items: [item(id, 'yellow', { updatedAt: '2026-10-01T00:00:00Z' })], history: [] });
+  const boards = [board('0.2.13', 'CL-AUTO'), board('0.2.15', 'CL-NEXT')];
+  const merged = [pr(301, 'misc', '칸: CL-AUTO'), pr(302, 'CL-NEXT fixed'), pr(303, 'CL-AUTO 수확'), pr(304, 'noise', 'nothing here')];
+  const depsWith = (runAsync: MergedPrRunner, cacheFile?: string): LandedButYellowDeps => ({
+    runAsync,
+    checklist: (version) => boards.find((entry) => entry.version === version)!,
+    now: () => now,
+    schedules: () => boards.map(({ version }) => ({ version, cutAt: '', landBy: null, updatedAt: '', updatedBy: '' })),
+    released: () => '0.2.12',
+    registerLogSink: async () => {},
+    ...(cacheFile ? { mergedPrCacheFile: () => cacheFile } : {}),
+  });
+  const capture = () => {
+    const written: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, callback?: unknown) => {
+      written.push(String(chunk)); if (typeof callback === 'function') callback(); return true;
+    }) as typeof process.stdout.write);
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const debugLog = spyOn(debug, 'log').mockImplementation(() => {});
+    return { written, restore: () => { write.mockRestore(); log.mockRestore(); error.mockRestore(); debugLog.mockRestore(); } };
+  };
+  const parse = async (deps: LandedButYellowDeps, ...args: string[]) => {
+    const program = new Command();
+    registerReleaseCommands(program, {}, deps);
+    await program.parseAsync(['release', 'checklist', 'landed-but-yellow', ...args], { from: 'user' });
+  };
+
+  test('fetch 재호출(같은 runner·같은 입력)은 gh 호출 0 · 결과 일치', async () => {
+    const gh = windowedGh(many, 1);
+    const cacheDir = mkdtempSync(join(tmpdir(), 'landed-yellow-cache-'));
+    const cacheFile = join(cacheDir, 'cache.json');
+    const first = await fetchMergedChecklistPrs('2026-10-01', now, gh.run, '.', { cacheFile });
+    const callsAfterFirst = gh.argv.length;
+    expect(callsAfterFirst).toBeGreaterThan(0);
+    const second = await fetchMergedChecklistPrs('2026-10-01', now, gh.run, '.', { cacheFile });
+    expect(gh.argv.length).toBe(callsAfterFirst);
+    expect(second).toEqual({ ...first, calls: 0 });
+    expect(second.stopReason).toBeUndefined();
+    expect(second.remainingWindows).toEqual([]);
+    rmSync(cacheDir, { recursive: true, force: true });
+  }, 30_000);
+
+  test('GH_REPO 가 바뀌면 같은 cwd·입력이어도 다른 저장소 캐시를 쓰지 않는다', async () => {
+    const gh = windowedGh(many, 1);
+    const cacheDir = mkdtempSync(join(tmpdir(), 'landed-yellow-repo-cache-'));
+    const cacheFile = join(cacheDir, 'cache.json');
+    const previous = process.env.GH_REPO;
+    try {
+      process.env.GH_REPO = 'owner/first';
+      const first = await fetchMergedChecklistPrs('2026-10-01', now, gh.run, '.', { cacheFile });
+      const firstCalls = gh.argv.length;
+      process.env.GH_REPO = 'owner/second';
+      const second = await fetchMergedChecklistPrs('2026-10-01', now, gh.run, '.', { cacheFile });
+      expect(second.calls).toBeGreaterThan(0);
+      expect(gh.argv.length).toBeGreaterThan(firstCalls);
+      expect(second).toEqual(first);
+    } finally {
+      if (previous === undefined) delete process.env.GH_REPO; else process.env.GH_REPO = previous;
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('별도 CLI 프로세스는 fake gh의 여러 판 조회 뒤 10분 캐시를 재사용한다', () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), 'landed-yellow-process-cache-'));
+    const cacheFile = join(cacheDir, 'cache.json');
+    const counterFile = join(cacheDir, 'calls.txt');
+    const fakeBinDir = join(cacheDir, 'bin');
+    mkdirSync(fakeBinDir);
+    const fakeGh = join(fakeBinDir, 'gh');
+    writeFileSync(fakeGh, '#!/bin/sh\nprintf x >> "$LANDED_YELLOW_CALLS"\nprintf "%s\\n" "$LANDED_YELLOW_PAGE"\n');
+    chmodSync(fakeGh, 0o755);
+    const page = JSON.stringify([
+      { number: 11, title: 'CL-AUTO fixed', body: '', mergedAt: '2026-10-03T00:00:00Z' },
+      { number: 12, title: 'CL-NEXT fixed', body: '', mergedAt: '2026-10-03T00:01:00Z' },
+    ]);
+    const cliUrl = new URL('../cli/release-cli.ts', import.meta.url).href;
+    const script = `
+      import { Command } from 'commander';
+      import { registerReleaseCommands } from ${JSON.stringify(cliUrl)};
+      const deps = { schedules: () => ['0.2.13','0.2.15'].map(version => ({ version, cutAt: '', landBy: null, updatedAt: '', updatedBy: '' })), released: () => '0.2.12', now: () => new Date('2026-10-04T09:00:00Z'), mergedPrCacheFile: () => process.env.LANDED_YELLOW_CACHE, checklist: version => ({ version, released: '0.2.12', dev: version, items: [{ id: version === '0.2.13' ? 'CL-AUTO' : 'CL-NEXT', title: 'test', owner: 'MK', status: 'yellow', updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'MK' }], history: [] }) };
+      const program = new Command();
+      registerReleaseCommands(program, {}, deps);
+      await program.parseAsync(['release','checklist','landed-but-yellow','--open','--json'], { from: 'user' });
+    `;
+    const run = () => spawnSync(process.execPath, ['-e', script], { cwd: process.cwd(), encoding: 'utf8', timeout: 20_000,
+      env: { ...process.env, PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`, LANDED_YELLOW_CACHE: cacheFile, LANDED_YELLOW_CALLS: counterFile, LANDED_YELLOW_PAGE: page } });
+    try {
+      const first = run();
+      expect(first.status).toBe(0);
+      const firstRows = JSON.parse(first.stdout) as Array<{ version: string; rows: Array<{ id: string; prs: Array<{ number: number }> }> }>;
+      expect(firstRows.map(({ version }) => version)).toEqual(['0.2.13', '0.2.15']);
+      expect(firstRows.find(({ version }) => version === '0.2.13')!.rows.find(({ id }) => id === 'CL-AUTO')!.prs.map(({ number }) => number)).toContain(11);
+      expect(firstRows.find(({ version }) => version === '0.2.15')!.rows.find(({ id }) => id === 'CL-NEXT')!.prs.map(({ number }) => number)).toContain(12);
+      const second = run();
+      expect(second.status).toBe(0);
+      expect(JSON.parse(second.stdout)).toEqual(JSON.parse(first.stdout));
+      expect(readFileSync(counterFile, 'utf8')).toBe('x');
+    } finally { rmSync(cacheDir, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test('시간 상한: 창 조회 중 넘으면 부분 결과 ⊕ stopReason ⊕ 남은 판', async () => {
+    const gh = windowedGh(many, 50);
+    const cacheDir = mkdtempSync(join(tmpdir(), 'landed-yellow-partial-cache-'));
+    const cacheFile = join(cacheDir, 'cache.json');
+    try {
+      const result = await fetchMergedChecklistPrs('2026-10-01', now, gh.run, '.', { timeBudgetMs: 120, cacheFile });
+      expect(result.stopReason).toBe('time-budget-exceeded');
+      expect(result.remainingWindows.length).toBeGreaterThan(0);
+      expect(result.remainingWindows).toEqual([...result.remainingWindows].sort());
+      expect(result.prs.length).toBeGreaterThan(0);
+      expect(result.prs.length).toBeLessThan(many.length);
+      expect(result.calls).toBeLessThan(22);
+      const callsAfterPartial = gh.argv.length;
+      const next = await fetchMergedChecklistPrs('2026-10-01', now, gh.run, '.', { timeBudgetMs: 120, cacheFile });
+      expect(next.stopReason).toBe('time-budget-exceeded');
+      expect(gh.argv.length).toBeGreaterThan(callsAfterPartial); // 부분 결과를 완전 결과 캐시에 쓰지 않는다
+    } finally { rmSync(cacheDir, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test('시간 상한은 첫 광역 gh 조회도 끊고 남은 UTC 창을 돌려준다', async () => {
+    let calls = 0;
+    const slowFirstPage: MergedPrRunner = async () => {
+      calls++;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return { status: 0, stdout: JSON.stringify(many), stderr: '' };
+    };
+    const started = performance.now();
+    const result = await fetchMergedChecklistPrs('2026-10-01', now, slowFirstPage, '.', { timeBudgetMs: 30 });
+    expect(performance.now() - started).toBeLessThan(150);
+    expect(calls).toBe(1);
+    expect(result.calls).toBe(1);
+    expect(result.prs).toEqual([]);
+    expect(result.stopReason).toBe('time-budget-exceeded');
+    expect(result.remainingWindows.length).toBeGreaterThan(0);
+  });
+
+  test('광역 조회에서 받은 400건은 뒤 창 조회가 시간초과여도 부분 결과에 보존한다', async () => {
+    let calls = 0;
+    const slowWindows: MergedPrRunner = async (_command, args) => {
+      calls++;
+      if (!args.includes('--search') || args[args.indexOf('--search') + 1] === 'merged:>=2026-10-01') {
+        return { status: 0, stdout: JSON.stringify(many.slice(0, MERGED_PR_LIMIT)), stderr: '' };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return { status: 0, stdout: JSON.stringify(many.slice(0, MERGED_PR_LIMIT)), stderr: '' };
+    };
+    const result = await fetchMergedChecklistPrs('2026-10-01', now, slowWindows, '.', { concurrency: 1, timeBudgetMs: 30 });
+    expect(calls).toBeGreaterThan(1);
+    expect(result.stopReason).toBe('time-budget-exceeded');
+    expect(result.prs.map(({ number }) => number)).toEqual(many.slice(0, MERGED_PR_LIMIT).map(({ number }) => number));
+    expect(result.truncated).toBe(true);
+    expect(result.remainingWindows.length).toBeGreaterThan(0);
+  });
+
+  test('CLI 첫 gh 프로세스가 멈추면 상한 안에 부분 JSON을 내고 gh를 종료한다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'landed-yellow-timeout-cli-'));
+    const fakeBinDir = join(root, 'bin');
+    mkdirSync(fakeBinDir);
+    const fakeGh = join(fakeBinDir, 'gh');
+    writeFileSync(fakeGh, '#!/bin/sh\ntrap "" TERM\nexec sleep 10\n');
+    chmodSync(fakeGh, 0o755);
+    const cliUrl = new URL('../cli/release-cli.ts', import.meta.url).href;
+    const script = `
+      import { Command } from 'commander';
+      import { registerReleaseCommands } from ${JSON.stringify(cliUrl)};
+      const program = new Command();
+      registerReleaseCommands(program, {}, { checklist: version => ({ version, released: '0.2.12', dev: version, items: [{ id: 'CL-AUTO', title: 'test', owner: 'MK', status: 'yellow', updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'MK' }], history: [] }), now: () => new Date('2026-10-04T09:00:00Z'), schedules: () => [], released: () => '0.2.12' });
+      await program.parseAsync(['release','checklist','landed-but-yellow','--version','0.2.13','--limit','30','--json'], { from: 'user' });
+    `;
+    const started = performance.now();
+    try {
+      const result = spawnSync(process.execPath, ['-e', script], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000,
+        env: { ...process.env, PATH: `${fakeBinDir}:${process.env.PATH ?? ''}` } });
+      expect(result.status).toBe(0);
+      expect(performance.now() - started).toBeLessThan(3_000);
+      const partial = JSON.parse(result.stdout) as { results: unknown[]; stopReason: string; remainingVersions: string[]; remainingWindows: string[] };
+      expect(partial.stopReason).toBe('time-budget-exceeded');
+      expect(partial.results).toHaveLength(1);
+      expect(partial.remainingVersions).toEqual(['0.2.13']);
+      expect(partial.remainingWindows.length).toBeGreaterThan(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('CLI --open --json 같은 입력 두 번: 둘째 호출은 gh 호출 0 · JSON 결과 일치', async () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), 'landed-yellow-cli-cache-'));
+    let ghCalls = 0;
+    const runAsync: MergedPrRunner = async () => {
+      ghCalls++;
+      return { status: 0, stdout: JSON.stringify(merged), stderr: '' };
+    };
+    const deps = depsWith(runAsync, join(cacheDir, 'cache.json'));
+    const cap = capture();
+    const previous = process.exitCode;
+    process.exitCode = 0;
+    try {
+      await parse(deps, '--open', '--json');
+      const first = cap.written.join('');
+      expect(ghCalls).toBe(1);
+      cap.written.length = 0;
+      await parse(deps, '--open', '--json');
+      expect(ghCalls).toBe(1);
+      expect(cap.written.join('')).toBe(first);
+      const rows = JSON.parse(first) as Array<{ version: string; rows: Array<{ id: string }> }>;
+      expect(rows.map(({ version }) => version)).toEqual(['0.2.13', '0.2.15']);
+      expect(rows[0]!.rows.map((row) => row.id)).toEqual(['CL-AUTO']);
+      expect(rows[1]!.rows.map((row) => row.id)).toEqual(['CL-NEXT']);
+      expect(process.exitCode).toBe(0);
+    } finally { cap.restore(); process.exitCode = previous ?? 0; rmSync(cacheDir, { recursive: true, force: true }); }
+  }, 30_000);
+
+  test('지연 gh + --time-budget: 부분 결과 · stopReason · 미완료 판과 남은 UTC 창을 JSON 에 실는다', async () => {
+    const gh = windowedGh(many, 50);
+    const deps = depsWith(gh.run);
+    const cap = capture();
+    const previous = process.exitCode;
+    process.exitCode = 0;
+    try {
+      await parse(deps, '--open', '--json', '--time-budget', '120');
+      const parsed = JSON.parse(cap.written.join('')) as { results: Array<{ version: string; rows: Array<{ prs: Array<{ number: number }> }> }>; stopReason?: string; remainingVersions?: string[]; remainingWindows?: string[] };
+      expect(parsed.stopReason).toBe('time-budget-exceeded');
+      expect(parsed.remainingVersions).toEqual(['0.2.13', '0.2.15']);
+      expect(parsed.remainingWindows!.length).toBeGreaterThan(0);
+      expect(parsed.results).toHaveLength(2);
+      expect(parsed.results.flatMap(({ rows }) => rows.flatMap(({ prs }) => prs.map(({ number }) => number)))).toContain(23560);
+      expect(gh.argv.length).toBeLessThan(22);
+    } finally { cap.restore(); process.exitCode = previous ?? 0; }
+  }, 30_000);
 });

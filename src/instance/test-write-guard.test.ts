@@ -496,4 +496,23 @@ console.log(JSON.stringify(process.argv.slice(-4).map(probe)));`;
     expect(() => assertNotTestWritingOps(opsLike, 'probe')).toThrow(TestOpsWriteRefusedError);
     expect(() => assertNotTestWritingOps(`${opsLike}-other/x`, 'probe')).not.toThrow();
   });
+
+  // TEST-PROD-LEAK-2 ledger (shard 3/12): call-through wrappers installed over the ORIGINAL spill and send
+  // functions must not soften the outbound-alert guard. The isolated child fixture wraps spillLongContent
+  // (mock.module call-through wrapper counting operational S3 upload attempts) and the original curl send
+  // primitive (bare pass-through spy counting external sends) before outbound-alert is imported, then drives
+  // sendTelegramDirect with an injected real-transport config. The guard must fire BEFORE spillLongContent
+  // runs inside the transport: refusal with a TestOpsWriteRefusedError reason, 0 s3Uploads, 0 curlCalls.
+  test('TEST-PROD-LEAK-2: call-through wrappers over the original spill and send functions are refused before spillLongContent — 0 s3Uploads, 0 curlCalls, TestOpsWriteRefusedError reason', () => {
+    const r = childProcess.spawnSync(process.execPath, [join(import.meta.dir, 'test-write-guard-real-transport.fixture.ts')], {
+      env: { ...process.env, NODE_ENV: 'test' }, encoding: 'utf8', timeout: 90_000,
+    });
+    expect(r.status).toBe(0);
+    const ledger = JSON.parse(r.stdout.trim().split('\n').at(-1)!) as { refused: boolean; refusalReason: string; curlCalls: number; s3Uploads: number };
+    expect(ledger.refused).toBe(true);
+    expect(ledger.refusalReason).toContain('TestOpsWriteRefusedError');
+    expect(ledger.refusalReason).toContain('[test-guard] refused');
+    expect(ledger.curlCalls).toBe(0);
+    expect(ledger.s3Uploads).toBe(0);
+  }, 120_000);
 });

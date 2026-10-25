@@ -11,12 +11,14 @@ import { getUserConfig, ORCHESTRATOR_DEFAULTS, resolveConfiguredAgentRoleLlm, ty
 import { rubricPriority } from '../../release-loop/rubric.js';
 import { debug } from '../../debug/log.js';
 import { emitLoopHeartbeat } from '../neighbor-runtime.js';
+import { ConsensusEngine } from '../consensus.js';
 import { listSelfDevRuns, runSummaryLine, selfDevRunsDir } from '../../self-dev/run-store.js';
 import { planAction, runSeatLoopOnce, type SeatDeps, type SeatItem } from '../../seat-loop/seat-loop.js';
 import { addHarnessQueue, harnessQueueOutcome, setQueuedPoolHint } from '../../harness/harness-queue.js';
 import { placeOnGrid, type GridHost } from './grid-place.js';
 import { checkPodPool, parsePodPool, resolvePodPoolSpec } from '../../task-orchestrator/surfaces/pod-pool.js';
 import { leaseKubectl } from '../../task-orchestrator/surfaces/pod-lease.js';
+import { defaultAnomalyCluster, extractContainerExit, type AnomalyCluster } from './anomaly-cluster.js';
 import { isLaunchEligible, isTrafficLaunch, recordDispatchCycle, seatOfTree, type TrafficProcess } from './traffic.js';
 import { defaultListHarnessProcesses } from '../../harness/harness-cli-command.js';
 import * as testGuard from '../../instance/test-write-guard.js';
@@ -32,7 +34,7 @@ export type Window = '08' | '12' | '18';
 export type Node = 'intake' | 'split' | 'place' | 'delegate' | 'launch' | 'reconcile' | 'report';
 export type Mode = 'off' | 'shadow' | 'live';
 const SEAT_LOOP_IDS: Readonly<Record<string, string>> = { OP: 'op-seat', MK: 'cmo-seat', TC: 'tc-seat', UX: 'ux-seat' };
-export interface Cell { id: string; title: string; kind?: string; seat?: string; host?: string; gridHost?: boolean; version?: string; cardId: string; origin: 'candidate' | 'flow1a'; priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4'; predecessors?: string[] }
+export interface Cell { id: string; title: string; kind?: string; seat?: string; host?: string; gridHost?: boolean; version?: string; cardId: string; origin: 'candidate' | 'flow1a'; priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4'; predecessors?: string[]; consensusProposalId?: string }
 export interface TickState {
   runId: string; window: Window; mode: Mode; day: string;
   cards: TaskCard[]; skippedCards: Array<{ id: string; reason: string }>; cells: Cell[]; placed: number; unplaced?: number; delegated: number; wouldDelegate: number; rebalanced?: number; rebalanceBlocked?: Array<{ id: string; reason: string }>;
@@ -58,7 +60,7 @@ export interface TickState {
   missing: string[];
 }
 /** FLOW1a contract: with `{ shadow: true }` the splitter only proposes cells and writes nothing (cards, ledgers, LLM side effects excepted). */
-export type SplitAdapter = (card: TaskCard, opts?: { shadow?: boolean }) => Promise<Array<{ id: string; title: string; kind?: string; seat?: string; host?: string }>> | Array<{ id: string; title: string; kind?: string; seat?: string; host?: string }>;
+export type SplitAdapter = (card: TaskCard, opts?: { shadow?: boolean }) => Promise<Array<{ id: string; title: string; kind?: string; seat?: string; host?: string; consensusProposalId?: string }>> | Array<{ id: string; title: string; kind?: string; seat?: string; host?: string; consensusProposalId?: string }>;
 /** RELPLAN1 `placeCell(input: PlacementCell)` — owner·priority·predecessors are required; the result carries no seat. */
 export type PlacementInput = { id: string; title: string; owner: string; priority: 'P0' | 'P1' | 'P2'; predecessors: string[] };
 export type PlaceAdapter = (cell: PlacementInput, deps?: { dryRun?: boolean; now?: Date }) => Promise<{ version?: string } | null> | { version?: string } | null;
@@ -73,6 +75,8 @@ export interface TickDeps {
   gridHosts?: readonly GridHost[];
   seatTurn?: (seat: string, root: string, host?: string, options?: Pick<SeatDeps, 'enqueue'>) => Promise<{ status: string; queueId?: string; runId?: string; item?: { source: string; id: string } }>;
   queueOutcome?: (queueId: string, root: string) => 'pending' | 'unknown' | 'retryable' | 'succeeded';
+  /** ANOMALY-CLUSTER — grouping state shared with the dispatcher relaunch gate; defaults to the process-wide instance. */
+  anomalyCluster?: AnomalyCluster;
   /** Snapshot of running harness processes for launch-cap decisions; an unreadable snapshot blocks launches. */
   launchProcesses?: () => { status: 'ok'; records: readonly TrafficProcess[] } | { status: 'incomplete' };
   /** 발사 전 대기열 항목의 풀 힌트 갱신(주입 안 하면 harness-queue `setQueuedPoolHint`). */
@@ -453,6 +457,22 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   const root = deps.root ?? effectiveInstanceRoot();
   const runId = deps.runId ?? graphRunId() ?? `${kstDay(now)}-${window}`;
   const path = stateFile(root, runId);
+  const consensus = new ConsensusEngine({ stateDir: root });
+  const consensusAllows = (cell: Cell): boolean => {
+    if (cell.kind !== 'cross-branch-change' && !cell.consensusProposalId) return true;
+    const workKey = `orch:${cell.cardId}:${cell.id}`;
+    try {
+      if (cell.kind === 'cross-branch-change') {
+        const proposal = consensus.proposalForWork(workKey);
+        if (!proposal || (cell.consensusProposalId && cell.consensusProposalId !== proposal.id)) return false;
+        cell.consensusProposalId = proposal.id;
+      }
+      return !!cell.consensusProposalId && consensus.canExecute(cell.consensusProposalId);
+    } catch (error) {
+      debug.log('loop.orchestrator', 'consensus-gate-failed', { id: cell.consensusProposalId, workKey, error: String(error) }, { level: 'warn' });
+      return false;
+    }
+  };
   const orchestratorConfig = getUserConfig().loops?.orchestrator;
   const configured = deps.mode ?? orchestratorConfig?.mode;
   const mode: Mode = configured === 'off' || configured === 'live' ? configured : 'shadow';
@@ -529,9 +549,12 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         const cells = ruleOnly ? [{ id: card.id, title: card.title }] : split ? await split(card, { shadow: mode === 'shadow' }) : [{ id: card.id, title: card.title }];
         for (const cell of cells) {
           if (!cell.id?.trim() || !cell.title?.trim()) throw new Error('invalid split cell');
+          const workKey = `orch:${card.id}:${cell.id}`;
+          const proposalId = cell.consensusProposalId ?? (cell.kind === 'cross-branch-change' ? consensus.proposalForWork(workKey)?.id : undefined);
           state.cells.push({ cardId: card.id, id: cell.id, title: cell.title, origin: split ? 'flow1a' : 'candidate',
             ...(ruleOnly ? { priority: rubricPriority(card.sections.map(section => section.content).join('\n')) } : {}),
-            ...(cell.kind !== undefined ? { kind: cell.kind } : {}), ...(cell.seat ? { seat: cell.seat } : {}), ...(cell.host !== undefined ? { host: cell.host } : {}) });
+            ...(cell.kind !== undefined ? { kind: cell.kind } : {}), ...(cell.seat ? { seat: cell.seat } : {}), ...(cell.host !== undefined ? { host: cell.host } : {}),
+            ...(proposalId ? { consensusProposalId: proposalId } : {}) });
         }
         observe('exchange', `split:${card.id}`, cells.length);
         if (split && cells.length && mode === 'live') {
@@ -567,6 +590,7 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         }
         if (available && (mode === 'live' || !deps.placeCell)) for (const cell of state.cells) {
           if (cell.origin !== 'flow1a' || !cell.seat || !SEAT_LOOP_IDS[cell.seat]) continue;
+          if (!consensusAllows(cell)) { observe('consensus-blocked', cell.consensusProposalId, 1); continue; }
           // RELPLAN's dryRun calculates the same release without writing a checklist in shadow.
           try {
             const priority = cell.priority === 'P3' || cell.priority === 'P4' ? 'P2' : cell.priority ?? 'P2';
@@ -645,6 +669,7 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
       };
       for (const cell of state.cells) {
         if (cell.origin !== 'flow1a' || !cell.seat) continue;
+        if (!consensusAllows(cell)) { observe('consensus-blocked', cell.consensusProposalId, 1); continue; }
         const targetLoopId = SEAT_LOOP_IDS[cell.seat];
         if (!targetLoopId) continue;
         const key = `orch:${cell.cardId}:${cell.id}`;
@@ -674,6 +699,17 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
           // shadow 표본은 따로 센다 — 자리 경로로 아직 안 간 칸(shadow 틱·배치 전)이 나중에 live 로 바뀌면 그때 뜬다.
           // ⚠️ 이미 자리 저널에 들어간 칸은 live 로 바꿔도 다시 안 넘긴다(keys.has 에서 끝) — 한 칸의 발사 주체는 하나다(의도).
           const handKey = handLive ? key : `shadow:${key}`;
+          // ANOMALY-CLUSTER: the goal·host pair is the hold key (never part of the failure signature). While a
+          // signature with 3+ runs is un-judged, its relaunch is held and the cell is carried to the next tick.
+          const anomalyGoal = cell.cardId;
+          const anomalyHost = cell.seat;
+          const anomaly = deps.anomalyCluster ?? defaultAnomalyCluster();
+          const hold = anomaly.hold(anomalyGoal, anomalyHost);
+          if (hold.hold) {
+            (state.deferredCells ??= []).push(cell);
+            observe('anomaly-cluster-hold', `${key}:${hold.reason}`, 1, 'task-agent');
+            continue;
+          }
           mkdirSync(dirname(ledger), { recursive: true });
           mkdirSync(dirname(path), { recursive: true });
           // Claim under the seat-journal lock — the same lock the seat append takes, so a live claim and a seat row never both land.
@@ -693,9 +729,18 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
               withFileLockSync(`${path}.lock`, () => appendFileSync(ledger, `${JSON.stringify({ key: handKey, cell: cell.id, cardId: result.card.id, mode: result.mode, launched: result.launched, status: 'handed', runId, at: now.toISOString() })}\n`));
               (state.handed ??= []).push({ key, cell: cell.id, cardId: result.card.id, mode: result.mode, launched: result.launched });
               observe('hand-to-task-agent', `${key}:${result.card.id}:${result.mode}${result.launched ? ':launched' : ''}`, 1, 'task-agent');
+              // A hand that went through is the cause verdict for this goal·host — clear a pending hold.
+              if (anomaly.isHeld(anomalyGoal, anomalyHost)) anomaly.release(anomalyGoal, anomalyHost, '원인 판정: hand-to-task-agent 성공');
               // A live hand is an assignment: it counts toward maxDelegatePerTick like a seat row (COORD-HA ②).
               if (handLive) { keys.add(key); state.delegatedKeys?.push(key); continue; }
             } catch (error) {
+              // ANOMALY-CLUSTER record point: signature from kind·container exit·stage·reason tail of lastLines.
+              const failureLines = [String(error)];
+              anomaly.record({
+                goal: anomalyGoal, host: anomalyHost, runId,
+                kind: 'hand-to-task-agent-failed', containerExit: extractContainerExit(failureLines[0]!),
+                stage: 'delegate', lastLines: failureLines, at: now.toISOString(),
+              });
               observe('hand-to-task-agent-failed', `${key}:${String(error).slice(0, 160)}`, 1, 'task-agent');
               // A failed live hand stays claimed (no relaunch loop) and does not fall back to the seat path — one launcher per cell.
               if (handLive) { keys.add(key); continue; }
@@ -754,7 +799,7 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
       // shadow 는 저널을 읽지 않는다 — 깨진 live 저널이 관측 전용 틱을 넘어뜨리지 않게.
       const latestRequests = new Map(mode === 'live' && state.degradation?.level !== 2 ? readRequests(root).map(row => [row.key, row]) : []);
       const eligible = state.cells.filter(cell => state.degradation?.level !== 2 && cell.origin === 'flow1a' && cell.seat && SEAT_LOOP_IDS[cell.seat]
-        && validVersion(cell.version) && (mode === 'shadow' || latestRequests.get(`orch:${cell.cardId}:${cell.id}`)?.status === 'queued')
+        && consensusAllows(cell) && validVersion(cell.version) && (mode === 'shadow' || latestRequests.get(`orch:${cell.cardId}:${cell.id}`)?.status === 'queued')
         && (orchestratorConfig?.maxDelegatePerTick === undefined || state.delegatedKeys?.includes(`orch:${cell.cardId}:${cell.id}`)
           || (mode === 'live' && latestRequests.has(`orch:${cell.cardId}:${cell.id}`))));
       const seats = [...new Set(eligible.map(cell => cell.seat!))];

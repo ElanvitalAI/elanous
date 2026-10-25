@@ -1702,12 +1702,20 @@ function buildEssentialSessionRuntimeToolSpecs(opts: {
         .map(tool => tool.spec)
       : [];
   });
+  // External MCP proxy runtimes are registered asynchronously by the TUI boot
+  // path and carry both `mcp` and `tui` surfaces. They are intentionally not
+  // part of the fixed built-in family allowlist above; include these explicit
+  // dynamic capabilities so ACP can advertise and dispatch their exact IDs.
+  const mcpProxySpecs = opts.runtimeTools
+    .filter(tool => tool.id.includes('.') && tool.surfaces?.includes('mcp') && tool.surfaces.includes('tui'))
+    .filter(tool => isToolAvailable(tool.spec.name, opts.toolAvailability))
+    .map(tool => tool.spec);
   const optionalByName = new Map(opts.optionalTools.map(tool => [tool.name, tool] as const));
   const optionalSpecs = ESSENTIAL_OPTIONAL_TOOL_NAMES
     .map(name => optionalByName.get(name))
     .filter((tool): tool is LLMToolSpec => !!tool)
     .filter(tool => isToolAvailable(tool.name, opts.toolAvailability));
-  return [...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...optionalSpecs];
+  return [...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...mcpProxySpecs, ...optionalSpecs];
 }
 
 export function buildSessionRuntimeToolSpecs(opts: {

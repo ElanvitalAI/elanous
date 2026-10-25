@@ -253,24 +253,17 @@ describe('explicit OpenRouter Pod child', () => {
       }
     });
 
-    test('default Codex author model still checks quota; both unavailable refuse before apply', async () => {
+    test('an explicit OpenRouter child replaces only the default author model without asking Codex quota', async () => {
       const available = await spawnOr({
         env: { ELANOUS_POD_AUTHOR_ON_POD: '1', ELANOUS_PR_REVIEW_MODEL: 'gpt-6-sol' },
         credentials: codexCreds,
-        planningCodexQuota: () => ({ usable: true }),
+        planningCodexQuota: () => { throw new Error('default planning must not ask Codex quota'); },
       }, 'or-author-default-codex-available');
       expect(available.result.exitCode).toBe(0);
-      expect(containerEnv(available.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL', value: 'gpt-6-sol' });
-      expect(containerEnv(available.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE', value: 'default' });
-      expect(available.secret.stringData['elanous-auth.json']).toBe(codexCreds().elanousAuth);
+      expect(containerEnv(available.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL', value: model });
+      expect(containerEnv(available.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE', value: 'child' });
 
-      const defaultChoice = await spawnOr({
-        env: { ELANOUS_POD_AUTHOR_ON_POD: '1', ELANOUS_PR_REVIEW_MODEL: 'gpt-6-sol' },
-        planningCodexQuota: () => ({ usable: false, reason: 'quota-unmeasured' }),
-      }, 'or-author-default-codex');
-      expect(defaultChoice.result.exitCode).toBe(0);
-      expect(containerEnv(defaultChoice.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_MODEL_SOURCE', value: 'fallback-child' });
-      expect(containerEnv(defaultChoice.job)).toContainEqual({ name: 'ELANOUS_PROMPT_ENHANCE_REQUESTED_SOURCE', value: 'default' });
+      expect(containerEnv(available.job).some((entry: { name: string }) => entry.name === 'ELANOUS_PROMPT_ENHANCE_REQUESTED_SOURCE')).toBe(false);
 
       const noChild = capture();
       expect(() => podSelfImplementSpawn({

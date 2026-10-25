@@ -278,6 +278,23 @@ export class MsgStore {
       : []);
   }
 
+  /** A request and its direct replies, in insertion order, independent of recipient cursors. */
+  listThread(messageId: number, after: number = 0, limit: number = 100): Message[] {
+    if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
+    validCursor(after);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
+    return this.readWithSchema(hasReplyTo => {
+      const target = this.db.query(`SELECT id, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'} FROM msg_messages WHERE id = ?`)
+        .get(messageId) as { id: number; reply_to: number | null } | null;
+      if (target === null) throw new Error(`message not found: #${messageId}`);
+      const rootId = target.reply_to ?? target.id;
+      const rows = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+        WHERE id > ? AND (id = ? ${hasReplyTo ? 'OR reply_to = ?' : ''}) ORDER BY id ASC LIMIT ?`)
+        .all(...(hasReplyTo ? [after, rootId, rootId, limit] : [after, rootId, limit])) as MessageRow[];
+      return rows.map(fromRow);
+    });
+  }
+
   list(recipient: string, after: number = 0, limit: number = 100): Message[] {
     return this.listByRecipient(recipient, after, limit);
   }

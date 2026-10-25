@@ -44,10 +44,29 @@ import {
 } from '../pty-shell/pty-manifest.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';
 import { runningBuild, startTuiRunStateRecorder } from '../pty-shell/tui-run-state.js';
+import type { TuiSelfRestartDeps } from '../pty-shell/tui-run-state.js';
+import { lastHumanKeyAt } from '../tui.js';
 import { debug } from '../debug/log.js';
 import { setTuiLogName, setTuiLogSession } from '../debug/tui-log-tag.js';
 import { getActiveSessionId } from '../session/index.js';
 import { routeExternalInput, type ExternalInputRoute } from '../input/external-input-queue.js';
+
+/**
+ * 사람 손이 «아직 떠난 것으로 안 본» 조용창 — 마지막 사람 키가 이 창 안이면 입력 중으로 친다.
+ * 유휴 임계(H9 기본 90초)보다 길게 잡아 «방금 만지던 사람» 을 절대 끊지 않는다.
+ */
+const SELF_RESTART_HUMAN_QUIET_MS = 10 * 60_000;
+
+/** 실제 TUI 가 쓰는 H9 신호: 낡음=기동 판⊕설치본⊕HEAD · 사람 입력=마지막 사람 키 · 세션=지금 대화. */
+export function productionTuiSelfRestart(readSessionId: () => string | null): TuiSelfRestartDeps {
+  return {
+    humanInputPending: () => {
+      const last = lastHumanKeyAt();
+      return last > 0 && Date.now() - last < SELF_RESTART_HUMAN_QUIET_MS;
+    },
+    readSessionId,
+  };
+}
 
 export interface TuiFrameObserverCfg {
   surfaceId: string;
@@ -279,6 +298,9 @@ export interface TuiSelfReportDeps {
   reportControlCleanupFailure?: (stage: TuiControlCleanupStage, error: unknown) => void;
   /** 행 등록 직후 실행 판 ⊕ 턴(idle) 기록을 연다 — `elanous pty state` 가 읽는다. 반환 = 정리. */
   startRunState?: (surfaceId: string) => (() => void);
+  /** 자기 재기동 신호(TUI-H9)를 갈아 끼운다 — 기본 = 실 신호(`lastHumanKeyAt` ⊕ `getActiveSessionId`).
+   *  시험은 가짜 시계·가짜 restart 로 판정선을 증명한다. */
+  selfRestart?: TuiSelfRestartDeps | null;
   /** 미룬 우편 깨움 폴러(TUI-H4)를 연다 — 반환 = 정리. 기본은 실 행 등록과 짝일 때만 늦게 불러온 `startPendingWakePoller`. */
   startWakePoller?: (surfaceId: string) => (() => void);
   /** 박동마다 자기 행을 본다 — 없으면 null · ⛔ 조회 실패는 «던진다»(없다로 읽지 않는다). 기본 = `getPtyManifest(id, { strict })`. */
@@ -399,9 +421,18 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     return () => {};
   }
   const activeControlTarget = controlTarget;
+  const readActiveSessionId: () => string | null = deps.readActiveSessionId
+    ?? (() => { try { return getActiveSessionId(); } catch { return null; } });
   let stopRunState: () => void = () => {};
   // 행 등록을 갈아 끼운 호출자(시험)는 실 manifest 를 안 건드린다 — 기본 녹음기는 기본 행 등록과 짝일 때만.
-  const startRunState = deps.startRunState ?? (deps.registerRow ? () => () => {} : startTuiRunStateRecorder);
+  // TUI-H9: 그 기본 녹음기에 «사람 입력 없음»(마지막 사람 키 입력) ⊕ «지금 대화» 를 실 신호로 주입한다 —
+  //   judged-stale ∧ idle ∧ 사람 없음 이면 스스로 재기동(새 세션 ⊕ 자리 맥락)한다(자세한 판정선은 startTuiRunStateRecorder).
+  const startRunState = deps.startRunState
+    ?? (deps.registerRow
+      ? () => () => {}
+      : (id: string) => startTuiRunStateRecorder(id, {
+        selfRestart: deps.selfRestart === null ? undefined : (deps.selfRestart ?? productionTuiSelfRestart(readActiveSessionId)),
+      }));
   try { stopRunState = startRunState(surfaceId); } catch { /* fail-soft — recorder logs its own write failures */ }
   // 미룬 우편 깨움(TUI-H4) — 이 TUI 가 턴 중·5분 창이라 못 받은 깨움을 idle 로 «기록»된 뒤 한 번 다시 두드린다.
   // 실 행 등록과 짝일 때만(시험이 행 등록을 갈아 끼우면 0) · 무거운 모듈은 늦게 불러온다.
@@ -491,8 +522,6 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     ?? (deps.registerRow ? () => ({ alive: true }) : (id: string) => getPtyManifest(id, { strict: true }));
   const restoreBuild = deps.restoreBuild ?? (deps.registerRow ? () => {} : (id: string) => { updatePtyManifestBuild(id, runningBuild()); });
   const logRowMissing = deps.logRowMissing ?? ((data: TuiRowMissingEvent) => debug.log('tui.self-report', 'row-missing', data));
-  const readActiveSessionId: () => string | null = deps.readActiveSessionId
-    ?? (() => { try { return getActiveSessionId(); } catch { return null; } });
   const rowNickname = deps.nickname?.trim() || undefined;
   let lastSeenAt = now();
   let lastBeatAt = lastSeenAt;

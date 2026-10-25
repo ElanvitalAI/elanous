@@ -459,8 +459,12 @@ test('loops-map: operator gate, projects cached loops with observedAt, preserves
   const headers = { 'x-elanous-operator': SECRET };
   try {
     // Operator gate: no credential and a forged proxy header are both refused before any collection.
-    expect((await send('/v1/ops/loops-map'))?.status).toBe(403);
-    expect((await send('/v1/ops/loops-map', { 'x-elanous-operator': 'forged-forged-forged-forged' }))?.status).toBe(403);
+    const unauthenticated = await send('/v1/ops/loops-map');
+    expect(unauthenticated?.status).toBe(401);
+    expect(await unauthenticated?.json()).toEqual({ error: 'unauthorized' });
+    const forged = await send('/v1/ops/loops-map', { 'x-elanous-operator': 'forged-forged-forged-forged' });
+    expect(forged?.status).toBe(403);
+    expect(await forged?.json()).toEqual({ error: 'forbidden' });
     expect(collects).toBe(0);
     // The overview read fills the shared memo; loops-map then projects it — collector not called again.
     const expectedGeneratedAt = observedAt();
@@ -472,26 +476,58 @@ test('loops-map: operator gate, projects cached loops with observedAt, preserves
     expect(map?.headers.get('cache-control')).toBe('no-store');
     const body = await map?.json() as {
       generatedAt: string; cacheAgeMs: number;
-      loops: Array<{ name: string; era: string; beat: { value: unknown; source: string; observedAt: string | null; status: string; reason?: string } }>;
+      loops: Array<{ name: string; era: string; staleAfterSeconds: number | null; beat: { value: unknown; source: string; observedAt: string | null; status: string; reason?: string } }>;
     };
     // Cache-response shape: the projected snapshot carries the memo's own generatedAt and age.
     expect(body.generatedAt).toBe(expectedGeneratedAt);
     expect(body.cacheAgeMs).toBe(5_000);
     expect(body.loops.length).toBe(2);
     // Measured loop: name·era·beat observedAt pass through the projection unchanged.
-    expect(body.loops[0]).toMatchObject({ name: 'version-release', era: 'product' });
+    expect(body.loops[0]).toMatchObject({ name: 'version-release', era: 'product', staleAfterSeconds: null });
+    // Loop-edge joining is a later shard: the response names no edges it cannot fill.
+    expect(body).not.toHaveProperty('edges');
     expect(body.loops[0]?.beat.status).toBe('ok');
     expect(body.loops[0]?.beat.observedAt).toBe(expectedGeneratedAt);
     expect(body.loops[0]?.beat.value).toEqual({ lastAt: expectedGeneratedAt, ageSeconds: 60, alive: true });
     // Unmeasured loop: null value, its reason and the null observedAt are preserved verbatim.
     expect(body.loops[1]?.name).toBe('echo-loop');
     expect(body.loops[1]?.era).toBe('seat-era');
+    // 주기 미상(null)과 알려진 주기는 캐시 값 그대로 — 지도가 «죽었다»로 읽지 않도록.
+    expect(body.loops[1]?.staleAfterSeconds).toBe(600);
     expect(body.loops[1]?.beat.value).toBeNull();
     expect(body.loops[1]?.beat.status).toBe('unmeasured');
     expect(body.loops[1]?.beat.reason).toBe('측정 대기');
     expect(body.loops[1]?.beat.observedAt).toBeNull();
     // No additional source call: the loops-map read reused the memo filled by /v1/ops/overview.
     expect(collects).toBe(1);
+    expect(podCalls).toBe(0);
+  } finally {
+    setOverviewCacheForTest(null);
+  }
+});
+
+test('loops-map: cold cache answers empty with null generatedAt·cacheAgeMs and starts no collection', async () => {
+  const { send } = fixture(true);
+  const clock = Date.now();
+  let collects = 0;
+  let podCalls = 0;
+  setOverviewCacheForTest(createOverviewCache({
+    now: () => clock,
+    collect: async () => { collects++; throw new Error('loops-map must not collect'); },
+    measurePods: async () => { podCalls++; return []; },
+    schedule: () => ({ unref() {} }) as ReturnType<typeof setInterval>,
+  }));
+  try {
+    const headers = { 'x-elanous-operator': SECRET };
+    const first = await send('/v1/ops/loops-map', headers);
+    expect(first?.status).toBe(200);
+    expect(first?.headers.get('cache-control')).toBe('no-store');
+    // 원천 호출 0: 캐시가 비면 빈 지도 + null 그대로이고, 수집을 시작하지 않는다.
+    expect(await first?.json()).toEqual({ generatedAt: null, cacheAgeMs: null, loops: [] });
+    // 반복 조회도 같다 — 읽기가 수집을 유발하지 않는다.
+    const again = await send('/v1/ops/loops-map', headers);
+    expect(await again?.json()).toEqual({ generatedAt: null, cacheAgeMs: null, loops: [] });
+    expect(collects).toBe(0);
     expect(podCalls).toBe(0);
   } finally {
     setOverviewCacheForTest(null);

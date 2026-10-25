@@ -109,6 +109,7 @@ import { getUserConfig } from '../user-config.js';
 import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
 import { classifyMergeHoldStop, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
 import { autohealFromStop, parseAutohealMode, type AutohealActions, type AutohealResult } from './stop-autoheal.js';
+import { recordParentNeedsOwnerVisit } from './doctor-visit.js';
 import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSupersedeOpenDraft } from './lineage-supersede.js';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -217,7 +218,7 @@ function onePrChecklistLine(body: string): string {
 }
 import { renderRoundSummaryCard, type RoundSummaryEntry } from './round-summary-card.js';
 import { computeFlexSignals } from './flex-signals.js';
-import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
+import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, decideReviewRound, type ReviewRoundDecision, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
 import { classifyReworkBudgetShadow } from './classify-shadow.js';
 import { createReworkBudgetJudgment, REWORK_BUDGET_JUDGMENT, reworkBudgetEvidenceForObservation, reworkBudgetWorkflow } from './rework-budget-judgment.js';
@@ -301,6 +302,7 @@ import { hasModuleLoadFailure, type GateTestFailure } from './gate-baseline.js';
 import { commitWorktree, defaultBranchRef, preservationHasChanges } from './seams.js';
 import { detectUncommittedWork } from './uncommitted-work.js';
 import { execFile as execFileCallback, spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { promisify } from 'node:util';
 import { blockedDraftDisposition, blockedDraftTargetFor, decideDraftOnStop, nextMoveFor, parseDraftOnStopMode, repairSalvageLinkComment, salvageBranchForRun, syntheticRepairBasePr, type DraftOnStopMode } from './blocked-draft-policy.js';
 import { formatLlmMergeOutcome } from '../autopilot/build/llm-conflict-merge.js';
@@ -336,6 +338,7 @@ import {
 export type { QuotaAccountAvailabilityEvidence };
 import { decideReworkSalvage, type ReworkSalvageEvidence } from './rework-salvage.js';
 import { type SupervisorGoalFillEvidence, fillUnverifiableGoalSlots, type SupervisorGoalFillResult } from './goal-supervisor-fill.js';
+import { repairNextMove } from '../task-agent/repair-next-move.js';
 import { escalateGoalDocumentClarifications, recordSupervisorPlanRevision, type GoalClarificationEscalationResult, type SupervisorPlanRevisionRelaxation, type SupervisorPlanRevisionResult } from './goal-clarification-escalation.js';
 import { parseGoalDocumentClarifications, selfAnswerGoalDocumentClarifications, type GoalClarificationSelfResolver } from './goal-author-clarification.js';
 import {
@@ -1053,6 +1056,7 @@ export type ImplementTerminalStatus = {
 export interface SelfImplementSeams {
   /** Run-observer ledger sink. Tests inject an in-memory sink to avoid touching user state. */
   writeRunLedger?: RunLedgerWriter;
+  checkUnwiredExports?: typeof findUnwiredExports;
   /** STOP-AUTOHEAL — heal action seams (live mode only runs actions given here; missing = needs-owner). */
   stopAutohealActions?: AutohealActions;
   /** STOP-AUTOHEAL — one-attempt guard reader. Default: real run ledger, or none when `writeRunLedger` is injected. */
@@ -1229,6 +1233,8 @@ export interface SelfImplementSeams {
   editPrComment?: (opts: { id: number; body: string; cwd: string }) => Promise<void>;
   addPrLabel?: (opts: { number: number; label: string; cwd: string }) => Promise<void>;
   readPrFiles?: (opts: { number: number; cwd: string; base?: string }) => Promise<string[]>;
+  /** Read the authoritative GitHub head branch and creation timestamp before run attribution. */
+  readPrAttribution?: (opts: { number: number; cwd: string }) => Promise<{ headRefName: string; createdAt: string }>;
   /** PR의 base/head SHA와 관측된 PR base를 한 응답에서 고정한다. 미주입·실패·빈 SHA면 검사 대상을 증명할 수 없어 fail-closed로 PR을 열어 둔다. */
   readPrCommitShas?: (opts: { number: number; cwd: string }) => Promise<{ baseCommit: string; headCommit: string; baseRefName?: string }>;
   /** 고정한 base/head SHA 쌍의 unified diff. 가변 PR 조회를 다시 사용하면 ABA head 변경에 안전하지 않으므로 두 SHA는 필수 입력이다. */
@@ -3560,6 +3566,17 @@ async function autohealRecordedStop(stopEntry: RunLedgerEntry, s: SelfImplementS
       ...(loadLedger ? { loadLedger } : {}),
       ...(s?.writeRunLedger ? { writeLedger: s.writeRunLedger } : {}),
     });
+    if (result.action === 'needs-owner') {
+      try {
+        const stopKey = JSON.stringify([stopEntry.timestamp, record.site ?? '', record.class, record.cause, record.evidenceRef]);
+        const visit = recordParentNeedsOwnerVisit({ runId: stopEntry.runId, stopKey, evidence: result.reason ?? record.cause });
+        if (visit.status === 'missing-ledger') {
+          debug.log('run-doctor', 'visit-failed', { runId: stopEntry.runId, from: 'parent', symptom: 'needs-owner', error: 'run-ledger-missing' });
+        }
+      } catch (error) {
+        try { debug.log('run-doctor', 'visit-failed', { runId: stopEntry.runId, from: 'parent', symptom: 'needs-owner', error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+      }
+    }
     s?.onStopAutoheal?.(result);
   } catch (error) {
     try { debug.log('self-implement.autoheal', 'dispatch-failed', { runId: stopEntry.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
@@ -3813,6 +3830,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   reworkCapProceed = false;
   const progressDelivery = { delivered: 0, unwired: 0, callbackFailed: 0 };
   let capturedPrNumber: number | undefined;
+  let prAttributionMismatch = false;
   let openPrInvoked = false;
   const defaultProviderName = opts.seams.currentProviderName?.() ?? currentProviderName();
   const runProviderName = opts.childLlm?.provider ?? defaultProviderName;
@@ -3831,8 +3849,6 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
         openPrInvoked = true;
         const pr = await opts.seams.openPr(args);
         if (pr.rebind) debug.log('self-implement.same-cell', 'rebind-result', pr.rebind);
-        const number = recordedPrNumber(pr.number);
-        if (number !== undefined) capturedPrNumber = number;
         return pr;
       },
       onProgress: (event) => {
@@ -4266,6 +4282,9 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       hasCurrentCredentialFailure,
       (commit: string | undefined) => { finishedImplementationAtMainSync = true; preSyncCommit = commit; },
       preserveMergeHarvest,
+      startedAtMs,
+      (number) => { capturedPrNumber = number; },
+      () => { prAttributionMismatch = true; },
     );
     terminalNode = result.node;
     await mergeChildProviderErrors();
@@ -4310,6 +4329,22 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       // ⛔ 이 스코프엔 `progress` 헬퍼가 «없다»(3695행 · 다른 스코프) — seam 을 직접 쓴다.
       progress: (stage, message) => { try { opts.seams.onProgress?.({ stage, message }); } catch { /* best-effort */ } },
     });
+    if (addressedResult.abandonedClassification?.classification === 'report-deficit') {
+      const classification = addressedResult.abandonedClassification;
+      const basis = classification.classificationBasis;
+      const kind = basis === 'terminal-state-not-reviewed' || basis === 'review-result-observation-unmeasured'
+        ? 'unmeasured' as const : 'unverified' as const;
+      const previousEvidence = JSON.stringify({ classification, stage: addressedResult.stage,
+        review: addressedResult.review ?? null, gate: addressedResult.gate ?? null });
+      const deficit = { evidenceId: `report:${runId}:${basis}`, kind, previousEvidence, round: roundCount };
+      observeOuter('supervisor-report-deficit', { ...deficit, supervisorResult: 'unverifiable', classification });
+      if (deficit.kind !== 'unverified') {
+        const move = repairNextMove({ supervisorDeficit: deficit, supervisorResult: 'unverifiable' });
+        if (move.kind === 'grounding') observeOuter('repair-next-move-input', {
+          ...move.supervisorDeficit, supervisorResult: 'unverifiable', action: move.action, classification,
+        });
+      }
+    }
     observeRunOutcome(observeOuter, {
       node: addressedResult.node,
       stage: addressedResult.stage,
@@ -4347,7 +4382,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
         ...terminalDetail(addressedResult.sessionId),
       },
     });
-    observeRunRollup(observeOuter, addressedResult, roundClassifications, roundCount, capturedPrNumber, openPrInvoked);
+    observeRunRollup(observeOuter, prAttributionMismatch ? { ...addressedResult, prNumber: undefined } : addressedResult, roundClassifications, roundCount, capturedPrNumber, openPrInvoked);
     observeProgressDelivery();
     return terminalResult;
   } catch (e) {
@@ -4422,7 +4457,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
           ...terminalDetail(addressedResult.sessionId ?? terminalSessionId),
         },
       });
-      observeRunRollup(observeOuter, addressedResult, roundClassifications, roundCount, capturedPrNumber, openPrInvoked);
+      observeRunRollup(observeOuter, prAttributionMismatch ? { ...addressedResult, prNumber: undefined } : addressedResult, roundClassifications, roundCount, capturedPrNumber, openPrInvoked);
       observeProgressDelivery();
       return terminalResult;
     }
@@ -4841,6 +4876,25 @@ function recordedPrNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+/** GitHub's second-precision createdAt cannot distinguish events within that second. */
+export function prCreatedInRunWindow(createdAt: string, startedAtMs: number): boolean {
+  const createdAtMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdAtMs) || !Number.isFinite(startedAtMs)) return false;
+  const secondPrecision = !/\.\d+(?:Z|[+-]\d\d:\d\d)$/.test(createdAt);
+  return createdAtMs >= (secondPrecision ? Math.floor(startedAtMs / 1_000) * 1_000 : startedAtMs);
+}
+
+function prAttributedToRun(
+  attribution: { headRefName: string; createdAt: string }, branch: string, startedAtMs: number,
+  boundCardReuse: { headRefName: string } | undefined,
+): boolean {
+  if (attribution.headRefName !== (boundCardReuse?.headRefName ?? branch)) return false;
+  // A verified same-card PR predates this run. The production seam exposes the
+  // exception only after the manager verifies card, PR identity, and leased push.
+  return prCreatedInRunWindow(attribution.createdAt, startedAtMs)
+    || (!!boundCardReuse && Number.isFinite(Date.parse(attribution.createdAt)));
+}
+
 function rollupPrNumber(
   result: Pick<SelfImplementResult, 'prNumber'>,
   capturedPrNumber: number | undefined,
@@ -4936,6 +4990,9 @@ async function runSelfImplementInner(
   hasCurrentCredentialFailure: () => boolean = hasCredentialFailure,
   onMainSyncStarted: (commit: string | undefined) => void = () => {},
   preserveMergeHarvest: (reason: string, inputChars?: number) => Promise<boolean> = async () => false,
+  startedAtMs = Date.now(),
+  onPrAttributed: (number: number) => void = () => {},
+  onPrAttributionMismatch: () => void = () => {},
 ): Promise<Omit<SelfImplementResult, 'runId'>> {
   const s = opts.seams;
   const pipelineStartedAtMs = Date.now();
@@ -5125,13 +5182,21 @@ async function runSelfImplementInner(
     : opts.goalFile
       ? 'authored-goal-file'
       : 'no-goal-file';
-  let activeProvider: Pick<ActiveProviderInfo, 'provider' | 'model' | 'auth'> | {
-    provider: 'unknown'; model: 'unknown'; auth: 'unknown';
-  };
+  let activeProvider: { provider: string; model: string; auth: string };
   try {
     activeProvider = (s.inspectActiveProvider ?? inspectActiveProvider)();
   } catch {
     activeProvider = { provider: 'unknown', model: 'unknown', auth: 'unknown' };
+  }
+  const configuredProvider = activeProvider;
+  if (opts.childLlm) {
+    // The configured parent model can be sol while this run's implementation child is
+    // explicitly luna. Attribute the run to the model actually passed to implement.
+    activeProvider = {
+      provider: opts.childLlm.provider,
+      model: opts.childLlm.model,
+      auth: configuredProvider.provider?.replace(/^auto:/, '') === opts.childLlm.provider ? configuredProvider.auth : 'unknown',
+    };
   }
   // ⭐ 관측 이벤트와 «같은 값»을 원장으로도 보낸다 — 로그에만 있으면 원장 질의가 못 센다(`F12`).
   try { onActiveProvider(activeProvider); } catch { /* 보조 기록이 런을 죽이지 않는다 */ }
@@ -5146,6 +5211,7 @@ async function runSelfImplementInner(
     nestDepth: nestInfo().depth, goalSource, goalFile: opts.goalFile === undefined ? null : resolve(launchCwd, opts.goalFile),
     targetRoot: gitRootOf(launchCwd) ?? launchCwd, ...originObservationFields(),
     provider: activeProvider.provider ?? null, model: activeProvider.model ?? null, auth: activeProvider.auth ?? null,
+    ...(opts.childLlm ? { configuredProvider: configuredProvider.provider ?? null, configuredModel: configuredProvider.model ?? null, modelSelectionSource: 'child' } : {}),
     ...(opts.correlationId !== undefined ? { correlationId: opts.correlationId } : {}),
   });
   try {
@@ -6242,7 +6308,7 @@ async function runSelfImplementInner(
         return preserveReviewBlockedBranch(`review-blocked 작업 커밋 실패: ${commitError}`, false, `; 미커밋 작업은 worktree 에 남음: ${wt.path}`);
       }
     }
-    let pr: { url: string; number: number };
+    let pr: OpenPrOutcome;
     try {
       pr = await withStepTimeout(s.openPr({
         title: prTitle(opts.feature, opts.goalFile),
@@ -6293,9 +6359,48 @@ async function runSelfImplementInner(
         : `중단 산출물의 draft PR 생성 실패(worktree·branch 보존 · 판정 본문 보존 실패: ${artifactError ?? 'unknown error'})`);
       return undefined;
     }
-    // The production draft sweep resolves run ownership from pr-opened, not
-    // from the blocked-draft diagnostic event. Bind this PR to the same run.
-    observe('pr-opened', { url: pr.url, number: pr.number, branch: wt.branch, draft: true });
+    let draftAttribution: { headRefName: string; createdAt: string } | undefined;
+    let draftAttributionReadError: string | undefined;
+    try {
+      if (s.readPrAttribution) {
+        draftAttribution = await s.readPrAttribution({ number: pr.number, cwd: wt.path });
+      } else {
+        const viewed = spawnSync('gh', ['pr', 'view', String(pr.number), '--json', 'headRefName,createdAt'], { cwd: wt.path, encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+        if (viewed.status !== 0) throw new Error('gh pr view failed');
+        const parsed = JSON.parse(viewed.stdout) as { headRefName?: unknown; createdAt?: unknown };
+        if (typeof parsed.headRefName !== 'string' || typeof parsed.createdAt !== 'string') throw new Error('invalid PR attribution metadata');
+        draftAttribution = { headRefName: parsed.headRefName, createdAt: parsed.createdAt };
+      }
+    } catch (error) { draftAttributionReadError = safeErrorDescription(error); }
+    const expectedPrHead = pr.boundCardReuse?.headRefName ?? wt.branch;
+    const draftAttributed = !draftAttributionReadError && !!draftAttribution
+      && prAttributedToRun(draftAttribution, wt.branch, startedAtMs, pr.boundCardReuse);
+    if (draftAttributionReadError || !draftAttribution) {
+      onPrAttributionMismatch();
+      observe('pr-attribution-unverified', {
+        expectedBranch: expectedPrHead,
+        number: pr.number,
+        url: pr.url,
+        reason: draftAttributionReadError ?? 'metadata-absent',
+      }, { level: 'warn' });
+    } else if (draftAttributed) {
+      onPrAttributed(pr.number);
+      observe('pr-opened', { url: pr.url, number: pr.number, branch: expectedPrHead, draft: true });
+    } else {
+      onPrAttributionMismatch();
+      observe('pr-attribution-mismatch', {
+        expectedBranch: expectedPrHead,
+        actualBranch: draftAttribution?.headRefName ?? null,
+        createdAt: draftAttribution?.createdAt ?? null,
+        number: pr.number,
+        url: pr.url,
+      }, { level: 'warn' });
+    }
+    if (!draftAttributed) {
+      blockedDraftPrFailure = `draft PR 귀속 확인 실패; worktree·branch 보존: ${wt.branch} (${wt.path})`;
+      progress('aborted', blockedDraftPrFailure);
+      return undefined;
+    }
     observe('rework-blocked-draft-pr', {
       ...observation,
       url: pr.url,
@@ -6513,6 +6618,19 @@ async function runSelfImplementInner(
       return 'parked';
     }
   };
+  let pendingReviewTriage: {
+    round: number;
+    verdict: 'fail';
+    rawMustFix: string[];
+    reflectedMustFix: string[];
+    reflectionApplied: boolean;
+    effectiveMax: number;
+  } | undefined;
+  const recordPendingReviewTriage = (decision: ReviewRoundDecision, nextNode: 'open-pr' | 'rework' | 'review-blocked', effectiveMax: number): void => {
+    if (!pendingReviewTriage) return;
+    observe('review-round-triage', { ...pendingReviewTriage, decision, nextNode, effectiveMax });
+    pendingReviewTriage = undefined;
+  };
   for (;;) {
     if (round > 0) {
       const stoppedBeforeRework = honorParentSoftStop('rework');
@@ -6670,6 +6788,17 @@ async function runSelfImplementInner(
           });
         }
         effectiveMax = budgetDecision.effectiveMax;
+        if (pendingReviewTriage && budgetDecision.stop) {
+          recordPendingReviewTriage('follow-up', budgetDecision.exit === 'proceed' ? 'open-pr' : 'review-blocked', effectiveMax);
+        } else if (pendingReviewTriage && round <= effectiveMax) {
+          const extendedDecision = decideReviewRound({
+            verdict: pendingReviewTriage.verdict,
+            mustFix: pendingReviewTriage.reflectedMustFix,
+            round: pendingReviewTriage.round,
+            effectiveMax,
+          });
+          if (extendedDecision === 'rework') recordPendingReviewTriage('rework', 'rework', effectiveMax);
+        }
         if (parsedDecision) {
           if (diagnosisRefutations) {
             const adjudications = parseSupervisorRefutationAdjudications(diagnosis, diagnosisRefutations.refutations);
@@ -6878,6 +7007,7 @@ async function runSelfImplementInner(
               : 'UNCONVERGEABLE' as const;
             const supervisorOutcome = { supervisorVerdict, ...(goalCauseObserved ? { goalCauseObserved: true as const } : {}) };
             if (isReviewRework(reworkKind)) {
+              recordPendingReviewTriage('follow-up', 'review-blocked', effectiveMax);
               if (reflectRejectedAudit.length && review) review.shouldFix = [...review.shouldFix, ...reflectRejectedAudit];
               const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', verdict: parsedDecision.verdict, reason: parsedDecision.reason, gate, decomposition: terminalDecomposition, salvageStatusExpected: false });
               await draftFollowUpAfterBlocked({ runId, prNumber: pr?.number, stage: 'review-blocked', unresolvedMustFix: review?.mustFix, decompositionPieces: terminalDecomposition?.pieces?.map((p) => p.feature), feature: opts.feature, cellId: opts.goalId, goalFile: opts.goalFile }, s.followUp);
@@ -6909,6 +7039,7 @@ async function runSelfImplementInner(
         const terminal = resolveRunOutcome({ termination: 'supervisor-abandoned', verdict: 'UNCONVERGEABLE', applied: true });
         const reason = `rework judged unconvergeable after ${round - 1} rework round(s)`;
         if (isReviewRework(reworkKind)) {
+          recordPendingReviewTriage('follow-up', 'review-blocked', effectiveMax);
           if (reflectRejectedAudit.length && review) review.shouldFix = [...review.shouldFix, ...reflectRejectedAudit];
           const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', verdict: lastReworkVerdict, reason, gate, salvageStatusExpected: false });
           await draftFollowUpAfterBlocked({ runId, prNumber: pr?.number, stage: 'review-blocked', unresolvedMustFix: review?.mustFix, feature: opts.feature, cellId: opts.goalId, goalFile: opts.goalFile }, s.followUp);
@@ -6952,6 +7083,7 @@ async function runSelfImplementInner(
           );
           podDecision(acceptance.decision.action === 'accept');
           if (acceptance.decision.action === 'accept') {
+            recordPendingReviewTriage('follow-up', 'open-pr', effectiveMax);
             if (podReviewBlockedDraft) {
               observe('merge-decision', {
                 autoMerge: autoMergeEnabled(opts), reviewed: review?.reviewed === true, verdict: review?.verdict ?? 'none',
@@ -6990,6 +7122,7 @@ async function runSelfImplementInner(
             };
           }
         } else podDecision(false);
+        recordPendingReviewTriage('follow-up', 'review-blocked', effectiveMax);
         const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', reason, gate, salvageStatusExpected: true });
         const salvage = blockedDraftNoChanges || blockedDraftPrFailure ? 'parked' : await salvageHardCap(canSalvage, pr);
         const disposition = { ...terminal, ...(salvage ? { salvage } : {}) };
@@ -7349,7 +7482,7 @@ async function runSelfImplementInner(
               env.GIT_COMMITTER_NAME = childName;
               env.GIT_COMMITTER_EMAIL = childEmail;
               const git = (args: string[]) => spawnSync('git', ['--no-optional-locks', ...args], {
-                cwd, env, encoding: 'utf8', timeout: 20_000,
+                cwd, env, encoding: 'utf8', timeout: 20_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
               });
               const staged = git(['add', '-A', '--', ...paths]);
               if (staged.status !== 0) return { ok: false, out: staged.stderr || staged.stdout || staged.error?.message || 'git add failed' };
@@ -7858,10 +7991,11 @@ async function runSelfImplementInner(
     // Gate has passed. Measure newly exported runtime values before review, without
     // turning a static-analysis guess into a rework verdict during the first rollout.
     const wiringFiles = [...new Set([...(runFacts.changedFiles ?? []), ...(gateRouteFiles ?? []), ...untrackedFiles])];
+    let goalWiring: 'unwired' | undefined;
     if (wiringFiles.some((file) => /^(?:src|scripts|apps\/pwa\/src)\/.*\.tsx?$/.test(file))) {
       const wiringBase = wt.resolvedBase;
       const wiring = wiringBase && /^[0-9a-f]{40}$/i.test(wiringBase)
-        ? findUnwiredExports({
+        ? (s.checkUnwiredExports ?? findUnwiredExports)({
             cwd: wt.path,
             changedFiles: wiringFiles,
             // Timeouts and git errors throw → recorded as `failure`, never as "absent at base".
@@ -7871,6 +8005,15 @@ async function runSelfImplementInner(
             ),
           })
         : { checked: 0, unwired: [], failure: 'resolved-base-unavailable' };
+      if (!wiring.failure && opts.goalFile && wiring.unwired.length > 0) {
+        try {
+          const declared = declaredPathsFromGoalDocumentText(readFileSync(opts.goalFile, 'utf8'));
+          if (declared.readable && wiring.unwired.some(({ file }) =>
+            declared.paths.some((target) => normalizeDeclaredScopePath(target) === normalizeDeclaredScopePath(file)))) {
+            goalWiring = 'unwired';
+          }
+        } catch { /* unreadable goal text cannot establish a wiring deficit */ }
+      }
       const wiringObservation = {
         round,
         checked: wiring.checked,
@@ -7996,15 +8139,74 @@ async function runSelfImplementInner(
         : `리뷰 미실행${review.failureReason !== undefined ? ` (${review.failureReason})` : ''}`);
       if (opts.goalFile) {
         let goalSlotFill: SupervisorGoalFillResult = 'unverifiable';
+        let goalSlotDeficit: import('./goal-supervisor-fill.js').SupervisorGoalDeficit | undefined;
+        let goalSlotAction: 'remeasure' | 'connect-goal' | undefined;
         try {
           goalSlotFill = await fillUnverifiableGoalSlots({
             path: opts.goalFile, round, gate, review,
+            ...(goalWiring ? { wiring: goalWiring } : {}),
             independentlyCheck: s.independentlyCheckGoalSlots ?? (async () => false),
+            observeDeficit: (deficit) => { goalSlotDeficit = deficit; },
           });
         } catch {
           goalSlotFill = 'rejected';
         }
-        observe('goal-slot-fill', { round, result: goalSlotFill, gatePassed: gate.passed, reviewVerdict: review.verdict });
+        if (goalSlotFill === 'not-applicable') {
+          observe('goal-slot-remeasure-result', { round, result: goalSlotFill, gatePassed: gate.passed,
+            reason: 'test-step-scope-skipped', scopeReason: gate.scopeReason, testStepExecuted: gate.testStepExecuted });
+        }
+        if (goalSlotDeficit) {
+          observe('supervisor-report-deficit', { runId, ...goalSlotDeficit, supervisorResult: goalSlotFill });
+          if (goalSlotDeficit.kind !== 'unverified') {
+            const move = repairNextMove({ supervisorDeficit: goalSlotDeficit,
+              supervisorResult: goalSlotFill === 'rejected' ? 'rejected' : 'unverifiable' });
+            if (move.kind === 'grounding') {
+              goalSlotAction = move.action;
+              observe('repair-next-move-input', { runId, ...move.supervisorDeficit,
+                supervisorResult: goalSlotFill, action: move.action });
+            }
+          }
+        }
+        if (goalSlotFill === 'unverifiable' && gate.passed && goalSlotAction === 'remeasure' && goalSlotDeficit && runsGate) {
+          observe('goal-slot-remeasure', { round, evidenceId: goalSlotDeficit.evidenceId, action: 'remeasure' });
+          const measuredGate = await stepTimeout(s.gate(wt.path, { runId, round }), T.gate, 'gate');
+          gate = measuredGate;
+          let remeasureDeficit: import('./goal-supervisor-fill.js').SupervisorGoalDeficit | undefined;
+          if (gate.passed) {
+            goalSlotFill = await fillUnverifiableGoalSlots({ path: opts.goalFile, round, gate, review,
+              independentlyCheck: s.independentlyCheckGoalSlots ?? (async () => false),
+              observeDeficit: (deficit) => { remeasureDeficit = deficit; } });
+          }
+          observe('goal-slot-remeasure-result', { round, evidenceId: goalSlotDeficit.evidenceId, result: goalSlotFill,
+            gatePassed: measuredGate.passed,
+            ...(remeasureDeficit ? { deficitKind: remeasureDeficit.kind,
+              deficitEvidenceId: remeasureDeficit.evidenceId, gateLog: remeasureDeficit.gateLog,
+              reason: remeasureDeficit.reason, inputSummary: remeasureDeficit.inputSummary, gateLogRef: remeasureDeficit.gateLogRef } : {}) });
+          if (!gate.passed || goalSlotFill === 'unverifiable' || goalSlotFill === 'rejected') {
+            finalizeSupervisorDeliveries('goal-slot-remeasure-gate-failed');
+            const reason = `goal-slot remeasurement ${!gate.passed ? 'failed' : goalSlotFill === 'rejected' ? 'rejected' : 'unmeasured'} · evidence ${goalSlotDeficit.evidenceId}`;
+            const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate, salvageStatusExpected: false });
+            return { ok: false, stage: 'gate-failed', node: 'rework', ...resolveRunOutcome({ termination: 'abandoned' }),
+              sessionId, worktreePath: wt.path, branch: wt.branch, gate,
+              quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(),
+              ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
+          }
+        }
+        observe('goal-slot-fill', { round, result: goalSlotFill, gatePassed: gate.passed, reviewVerdict: review.verdict,
+          ...(goalSlotFill === 'unverifiable' && goalSlotDeficit ? { reason: goalSlotDeficit.reason, inputSummary: goalSlotDeficit.inputSummary, gateLogRef: goalSlotDeficit.gateLogRef } : {}),
+          ...(goalSlotFill === 'not-applicable' ? { reason: 'test-step-scope-skipped', scopeReason: gate.scopeReason,
+            testStepExecuted: gate.testStepExecuted } : {}) });
+        if (goalSlotAction === 'connect-goal' && goalSlotDeficit) {
+          finalizeSupervisorDeliveries('goal-slot-connect-goal');
+          const reason = `goal-slot wiring deficit · evidence ${goalSlotDeficit.evidenceId}`;
+          const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', reason, gate, salvageStatusExpected: false });
+          await draftFollowUpAfterBlocked({ runId, prNumber: pr?.number, stage: 'review-blocked',
+            unresolvedMustFix: [reason], feature: opts.feature, cellId: opts.goalId, goalFile: opts.goalFile }, s.followUp);
+          return { ok: false, stage: 'review-blocked', node: 'rework', ...resolveRunOutcome({ termination: 'abandoned' }),
+            sessionId, worktreePath: wt.path, branch: wt.branch, gate, review,
+            quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(),
+            ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
+        }
       }
       const evidenceFacts: ReflectEvidenceFacts = evidenceCoverage
         ? { requiredEvidence: evidenceCoverage.required, coveredEvidence: evidenceCoverage.covered, missingEvidence: evidenceCoverage.uncovered }
@@ -8066,6 +8268,9 @@ async function runSelfImplementInner(
           });
         } catch { /* fail-safe: REFUTE never changes a finding without supervisor judgment */ }
       }
+      const rawReviewMustFix = [...review.mustFix];
+      let reflectionApplied = false;
+      let reviewTriageRecorded = false;
       if (review.verdict === 'fail' && review.mustFix.length > 0) {
         let effectiveMustFix = review.mustFix;
         if (s.reflectMustFix) {
@@ -8074,6 +8279,7 @@ async function runSelfImplementInner(
           try {
             const recurrenceHistory = recurrenceHistoryFor(review.mustFix);
             const reflected = await withStepTimeout(s.reflectMustFix({ mustFix: review.mustFix, goal: roundGoal, cwd: wt.path, evidenceFacts, gateFacts: gate.reflectGateFacts, citedPathFacts, ...(recurrenceHistory.length ? { recurrenceHistory } : {}), runId, round }), T.review, 'review');
+            reflectionApplied = true;
             const rejectedItems = new Set(reflected.rejected.filter((r) => r.reason && r.reason.trim().length > 0).map((r) => r.item));
             const rejected = reflected.rejected.filter((r) => rejectedItems.has(r.item));
             effectiveMustFix = review.mustFix.filter((m) => !rejectedItems.has(m));
@@ -8110,6 +8316,17 @@ async function runSelfImplementInner(
           }
         }
         if (effectiveMustFix.length === 0) {
+          observe('review-round-triage', {
+            round,
+            verdict: 'fail',
+            rawMustFix: rawReviewMustFix,
+            reflectedMustFix: effectiveMustFix,
+            reflectionApplied,
+            decision: 'pass',
+            nextNode: 'open-pr',
+            effectiveMax,
+          });
+          reviewTriageRecorded = true;
           finalizeSupervisorDeliveries('review-reflect-converged');
           completionStatus = 'review-reflect-converged';
           review.mustFix = [];
@@ -8118,6 +8335,21 @@ async function runSelfImplementInner(
           // ⭐ 「fail 이었는데 왜 병합되나」의 답을 «그 자리»에 적는다 — 다음 줄이 자동 병합이다.
           progress('reviewed', '리뷰: fail → warn (반사가 must-fix 를 «전부» 기각 — 사유는 위 줄과 PR 코멘트에)');
           break;
+        }
+        const reviewDecision = decideReviewRound({ verdict: review.verdict, mustFix: effectiveMustFix, round, effectiveMax });
+        const reviewTriage = {
+          round,
+          verdict: review.verdict,
+          rawMustFix: rawReviewMustFix,
+          reflectedMustFix: [...effectiveMustFix],
+          reflectionApplied,
+          effectiveMax,
+        };
+        if (reviewDecision === 'follow-up') {
+          pendingReviewTriage = { ...reviewTriage, verdict: 'fail' };
+        } else {
+          observe('review-round-triage', { ...reviewTriage, decision: reviewDecision, nextNode: 'rework' });
+          reviewTriageRecorded = true;
         }
         appliedLastRound = [...effectiveMustFix];
         roundSummaryEntries.push({ round, kind: 'review', tried: impl.summary.replace(/\s+/g, ' ').trim().slice(0, 200),
@@ -8170,6 +8402,18 @@ async function runSelfImplementInner(
         bufferPrComment(round, 'reviewer', `Round ${round}: reviewer requested ${effectiveMustFix.length} must-fix change(s).`, effectiveMustFix);
         round++;
         continue;
+      }
+      if (!reviewTriageRecorded && !pendingReviewTriage) {
+        observe('review-round-triage', {
+          round,
+          verdict: review.verdict,
+          rawMustFix: rawReviewMustFix,
+          reflectedMustFix: rawReviewMustFix,
+          reflectionApplied: false,
+          decision: 'pass',
+          nextNode: 'open-pr',
+          effectiveMax,
+        });
       }
     }
     // EVIDENCE-WIRING-EXEMPT — a commandless [preservation] is covered once the changed-file gate passed.
@@ -8517,7 +8761,7 @@ async function runSelfImplementInner(
     s.persistPrBodyArtifact,
     'self-implement-pr',
   );
-  let pr: { url: string; number: number };
+  let pr: OpenPrOutcome;
   try {
     pr = await withStepTimeout(s.openPr({
       title: prTitle(opts.feature, opts.goalFile),
@@ -8548,15 +8792,64 @@ async function runSelfImplementInner(
     const current = runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 });
     if (current.status !== 0 || current.stdout.trim() !== reviewedHeadCommit) delete reviewedHeadResult.reviewedHeadCommit;
   }
-  observe('pr-opened', {
-    url: pr.url,
-    number: pr.number,
-    branch: wt.branch,
-    headCommit: runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 }).stdout.trim(),
-    autoMerge: canAuto,
-    autoReview: !!labels,
-    ...(preparedPrBody.truncated ? { prBodyTruncated: true, prBodyOriginalChars: preparedPrBody.originalChars } : {}),
-  });
+  let prAttribution: { headRefName: string; createdAt: string } | undefined;
+  let prAttributionReadError: string | undefined;
+  try {
+    if (s.readPrAttribution) {
+      prAttribution = await s.readPrAttribution({ number: pr.number, cwd: wt.path });
+    } else {
+      const viewed = spawnSync('gh', ['pr', 'view', String(pr.number), '--json', 'headRefName,createdAt'], {
+        cwd: wt.path, encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+      });
+      if (viewed.status !== 0) throw new Error(viewed.stderr || viewed.stdout || 'gh pr view failed');
+      const parsed = JSON.parse(viewed.stdout) as { headRefName?: unknown; createdAt?: unknown };
+      if (typeof parsed.headRefName !== 'string' || typeof parsed.createdAt !== 'string') throw new Error('invalid PR attribution metadata');
+      prAttribution = { headRefName: parsed.headRefName, createdAt: parsed.createdAt };
+    }
+  } catch (error) {
+    prAttributionReadError = safeErrorDescription(error);
+  }
+  const expectedPrHead = pr.boundCardReuse?.headRefName ?? wt.branch;
+  const prAttributed = !prAttributionReadError && !!prAttribution
+    && prAttributedToRun(prAttribution, wt.branch, startedAtMs, pr.boundCardReuse);
+  if (prAttributionReadError || !prAttribution) {
+    onPrAttributionMismatch();
+    observe('pr-attribution-unverified', {
+      expectedBranch: expectedPrHead,
+      number: pr.number,
+      url: pr.url,
+      reason: prAttributionReadError ?? 'metadata-absent',
+    }, { level: 'warn' });
+  } else if (!prAttributed) {
+    onPrAttributionMismatch();
+    observe('pr-attribution-mismatch', {
+      expectedBranch: expectedPrHead,
+      actualBranch: prAttribution.headRefName,
+      createdAt: prAttribution.createdAt,
+      number: pr.number,
+      url: pr.url,
+    }, { level: 'warn' });
+  } else {
+    const attributedNumber = recordedPrNumber(pr.number);
+    if (attributedNumber !== undefined) onPrAttributed(attributedNumber);
+    observe('pr-opened', {
+      url: pr.url,
+      number: pr.number,
+      branch: expectedPrHead,
+      headCommit: runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 }).stdout.trim(),
+      autoMerge: canAuto,
+      autoReview: !!labels,
+      ...(preparedPrBody.truncated ? { prBodyTruncated: true, prBodyOriginalChars: preparedPrBody.originalChars } : {}),
+    });
+  }
+  if (!prAttributed) {
+    progress('aborted', `PR 귀속 확인 실패 — 외부 PR 후속 처리 중단 (${wt.branch}; worktree: ${wt.path})`);
+    return {
+      ok: false, stage: 'aborted', node: 'open-pr', ...resolveRunOutcome({ termination: 'abandoned' }),
+      ...decisionSignalResult, ...scopeExpansionResult, sessionId, worktreePath: wt.path, branch: wt.branch,
+      gate, ...(review ? { review } : {}), detail: 'PR attribution could not be verified; worktree and branch preserved',
+    };
+  }
   await flushPrComments(pr);
 
   // Inspect the opened PR itself: the goal text and the pre-sync worktree can differ from its final file list.

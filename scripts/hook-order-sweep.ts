@@ -106,9 +106,10 @@ function isFunctionLike(ts: Ts, node: Node): boolean {
   return ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node) || ts.isMethodDeclaration(node);
 }
 
-/** 이 노드와 소유자 사이에 «분기»가 있나 — 있으면 그 훅은 매 렌더에 안 돈다. */
+/** 이 노드와 소유자 사이에 «분기»가 있나 — 단축 평가 연산자의 오른쪽만 조건부다. */
 function branchBetween(ts: Ts, node: Node, owner: Node): boolean {
-  for (let current = node.parent; current && current !== owner; current = current.parent) {
+  let child: Node = node;
+  for (let current = node.parent; current && current !== owner; child = current, current = current.parent) {
     if (
       ts.isIfStatement(current)
       || ts.isConditionalExpression(current)
@@ -116,7 +117,9 @@ function branchBetween(ts: Ts, node: Node, owner: Node): boolean {
       || ts.isWhileStatement(current) || ts.isDoStatement(current)
       || ts.isSwitchStatement(current)
       || ts.isTryStatement(current) || ts.isCatchClause(current)
-      || (ts.isBinaryExpression(current) && (current.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken || current.operatorToken.kind === ts.SyntaxKind.BarBarToken || current.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken))
+      || (ts.isBinaryExpression(current)
+        && child === current.right
+        && (current.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken || current.operatorToken.kind === ts.SyntaxKind.BarBarToken || current.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken))
     ) return true;
   }
   return false;
@@ -270,7 +273,7 @@ export function formatHookOrderReport(report: HookOrderReport): string[] {
   return [
     `[hook-order] denominator: hook calls=${report.hookCallsScanned}; components and custom hooks=${report.ownersScanned}; files=${report.filesScanned}; ruler=identifier call matching /^use[A-Z]/ in TypeScript sources under the scanned scopes; scope=${report.scanRoots.join(', ') || 'none'}; unmeasured scopes=${report.unavailableScopes.join(', ') || 'none'}`,
     `[hook-order] after early return: ${kindCount(report, 'after-early-return')}; ruler=hook call positioned after a return statement in the top-level statement list of its component, so a render that takes the early return calls fewer hooks`,
-    `[hook-order] conditional: ${kindCount(report, 'conditional')}; ruler=hook call nested inside a branch, loop, switch, try, or short-circuit operator within its component`,
+    `[hook-order] conditional: ${kindCount(report, 'conditional')}; ruler=hook call nested inside a branch, loop, switch, try, or the right operand of &&, ||, or ?? within its component`,
     `[hook-order] nested function: ${kindCount(report, 'nested-function')}; ruler=hook call inside a function that is neither a component nor a custom hook, so it does not run on every render of the surrounding component`,
     `[hook-order] imported hook identity: not-measured; ruler=a locally declared function that calls no hook is excluded because a hook is a function that calls hooks, but an imported name and a property access such as React.useState are judged by the naming convention React itself enforces; a hook renamed on import to a name that does not start with use is outside this ruler and outside React's own convention`,
     `[hook-order] elapsed: ${report.elapsedSeconds.toFixed(2)}s`,

@@ -9,6 +9,7 @@ import { registerReleaseCommands } from '../../src/cli/release-cli.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { resumeReleaseRun } from './resume-release.js';
 import { releaseResumeGatePodPool, releaseResumeWaiver } from './resume.js';
+import './resume-test-traffic.js';
 
 const SHA = 'a'.repeat(40);
 const VERSION = '0.2.19';

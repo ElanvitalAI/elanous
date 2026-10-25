@@ -60,7 +60,28 @@ export interface MachineLoad {
   ioPressure?: IoPressure | null;
 }
 export interface MachineRow { name: string; load: Cell<MachineLoad> }
-export interface PodMemberRow { context: string; capacity: number; occupied: Cell<number> }
+/**
+ * GATE-RESERVE-AUTO 가 잰 «게이트 예약 몫» — 발행 게이트 샤드가 쥔 CPU. 자원 지도의 다섯째 축이다.
+ * `harnessCpuSlotsBesideGate` 와 같은 fail-closed 규칙: 샤드가 아직 노드에 안 붙었으면 하니스 Pod 는 들어가지 않는다.
+ */
+export interface GateReservation {
+  /** 종결 전 게이트 샤드 Job 수 — 0 이면 게이트가 안 돈다(축 아님). */
+  jobs: number;
+  /** 그중 아직 노드에 안 붙은 샤드. */
+  unbound: number;
+  /** 샤드가 예약한 CPU(밀리코어). */
+  reservedMillicores: number;
+  /** 스케줄 가능한 노드들의 CPU 합(밀리코어). */
+  schedulableMillicores: number;
+}
+export interface PodMemberRow {
+  context: string; capacity: number; occupied: Cell<number>;
+  /**
+   * 게이트 예약 축 — `'none'` 은 «게이트가 안 돈다»(측정됨), `unmeasured` 는 못 잼(축에서 뺀다), 항목 없음은
+   * 이 칸에 게이트 원천이 없는 스냅숏(로컬 CLI 는 호출 경로 kubectl 0 규율로 늘 여기다).
+   */
+  gate?: Cell<GateReservation | 'none'>;
+}
 export interface ParentsInfo { count: number; staleOver6h: number; oldestHours: number | null }
 export interface SchedulerMetrics {
   scheduleRuns: number | null;
@@ -110,7 +131,7 @@ export interface VerdictResult { verdict: Verdict; reasons: string[]; nextAction
 /** 부하/코어가 이 값을 넘으면 «기계 압박»(흐름 저하의 사유). */
 export const LOAD_PER_CORE_PRESSURE = 3;
 
-/** 자원 지도의 축 어휘(닫힌 집합 · RES-FLOOR-BINDING). 게이트 예약은 이 칸에 원천이 없어 늘 제외다. */
+/** 자원 지도의 축 어휘(닫힌 집합 · RES-FLOOR-BINDING). */
 export type ResourceKind = 'memory' | 'cpu' | 'io' | 'slots' | 'gate';
 
 /** 구속 조건 — 남은 비율이 최소인 축. 남은 비율 = 남은 양/전체 양(CPU 는 압박선 LOAD_PER_CORE_PRESSURE×코어를 전체로 본다). */
@@ -132,9 +153,11 @@ function remainingAmount(n: number): string {
 
 /**
  * 구속 조건 규칙(RES-FLOOR-BINDING) — 메모리·CPU·I/O·슬롯·게이트 예약 중 «남은 비율 최소»인 축이 흐름을 묶는다.
- * 못 잰 축(하트비트 없는 호스트 · 용량 못 잼 · 하트비트에 PSI 가 없는 I/O · 원천이 없는 게이트 예약)은 후보에서 뺀다
+ * 못 잰 축(하트비트 없는 호스트 · 용량 못 잼 · 하트비트에 PSI 가 없는 I/O · 게이트 CPU 못 잼)은 후보에서 뺀다
  * — «넉넉»으로도 «바닥»으로도 읽지 않는다.
- * 측정 축이 하나도 없으면 null. 동율은 정해진 순서(호스트 순 메모리→CPU→I/O, 그 다음 슬롯)의 첫 축이 이긴다.
+ * 게이트 예약의 남은 비율 = (스케줄 가능 CPU − 샤드가 쥔 CPU) / 스케줄 가능 CPU. 샤드가 아직 노드에 안 붙었으면 0
+ * (하니스 Pod 는 들어가지 않는다 · `harnessCpuSlotsBesideGate` 와 같은 규칙).
+ * 측정 축이 하나도 없으면 null. 동율은 정해진 순서(호스트 순 메모리→CPU→I/O, 그 다음 슬롯, 그 다음 게이트 예약)의 첫 축이 이긴다.
  */
 export function bindingResource(s: OverviewSnapshot): ResourceBinding | null {
   const candidates: ResourceBinding[] = [];
@@ -160,6 +183,16 @@ export function bindingResource(s: OverviewSnapshot): ResourceBinding | null {
   if (capacity && capacity.podTarget + capacity.localMax > 0) {
     const total = capacity.podTarget + capacity.localMax;
     candidates.push({ kind: 'slots', label: '슬롯', remainingRatio: ratio01(capacity.free / total), remainingText: `${capacity.free}/${total}자리` });
+  }
+  for (const pod of s.machines.pods) {
+    const gate = pod.gate?.value;
+    if (!gate || gate === 'none') continue;
+    const total = gate.schedulableMillicores;
+    if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(gate.reservedMillicores)) continue;
+    const remaining = gate.unbound > 0 ? 0 : Math.max(0, total - gate.reservedMillicores);
+    const unbound = gate.unbound > 0 ? ` · 미배치 ${gate.unbound}` : '';
+    candidates.push({ kind: 'gate', label: `${pod.context} 게이트 예약`, remainingRatio: ratio01(remaining / total),
+      remainingText: `${remainingAmount(remaining)}/${total.toFixed(0)}밀리코어(게이트 샤드 ${gate.jobs} · 예약 ${remainingAmount(gate.reservedMillicores)}${unbound})` });
   }
   let binding: ResourceBinding | null = null;
   for (const c of candidates) if (binding === null || c.remainingRatio < binding.remainingRatio) binding = c;
@@ -255,7 +288,10 @@ export function unmeasuredCells(s: OverviewSnapshot): string[] {
   visit('tasks.byOwner', s.tasks.byOwner); visit('tasks.done', s.tasks.done);
   visit('tasks.launchable', s.tasks.launchable); visit('tasks.capacity', s.tasks.capacity);
   for (const h of s.machines.hosts) visit(`machines.${h.name}`, h.load);
-  for (const p of s.machines.pods) visit(`pods.${p.context}`, p.occupied);
+  for (const p of s.machines.pods) {
+    visit(`pods.${p.context}`, p.occupied);
+    if (p.gate) visit(`pods.${p.context}.gate`, p.gate);
+  }
   visit('machines.parents', s.machines.parents); visit('landings', s.landings);
   if (s.throughput) visit('throughput', s.throughput);
   if (s.schedulerMetrics) visit('schedulerMetrics', s.schedulerMetrics);

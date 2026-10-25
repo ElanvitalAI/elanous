@@ -1,5 +1,6 @@
 /** Existing TA retry judgement, routed through the declared recover → dispatch graph edge. */
 import { randomBytes } from 'node:crypto';
+import type { SupervisorGoalDeficit, SupervisorGoalFillResult } from '../self-implement/goal-supervisor-fill.js';
 import { judgeNextMove, type TaskJudgement } from './judge.js';
 import { readJourneyEdge, type JourneyRoute } from '../self-dev/graph-journey-route.js';
 
@@ -10,6 +11,8 @@ export interface RepairNextMoveInput {
   mustFix: readonly string[];
   priorNarrowAttempts: number;
   priorAlternativeAttempts: number;
+  supervisorDeficit?: SupervisorGoalDeficit;
+  supervisorResult?: SupervisorGoalFillResult;
 }
 
 /** HARNESS-FULL-GRAPH-NEXTMOVE — 수 한 건의 식별자. 결정 순간 «한 번» 만들고, 그 값을 결정·간선·발사에 그대로 내려보낸다(다시 계산 금지). */
@@ -40,9 +43,16 @@ export interface RepairNextMoveDeps {
 }
 
 export type RepairNextMove = { kind: 'dispatch'; judgement: TaskJudgement; route: JourneyRoute; source: `pr:${number}`; moveId: string }
-  | { kind: 'stop'; judgement: TaskJudgement; route: JourneyRoute; reason: string };
+  | { kind: 'stop'; judgement: TaskJudgement; route: JourneyRoute; reason: string }
+  | { kind: 'grounding'; action: 'remeasure' | 'connect-goal'; supervisorDeficit: SupervisorGoalDeficit };
 
-export function repairNextMove(input: RepairNextMoveInput, deps: RepairNextMoveDeps = {}): RepairNextMove {
+export function repairNextMove(input: RepairNextMoveInput | { supervisorDeficit: SupervisorGoalDeficit; supervisorResult?: 'unverifiable' | 'rejected' }, deps: RepairNextMoveDeps = {}): RepairNextMove {
+  const deficit = input.supervisorDeficit;
+  if (input.supervisorResult !== 'filled' && input.supervisorResult !== 'already-filled'
+    && (deficit?.kind === 'unmeasured' || deficit?.kind === 'unwired')) {
+    return { kind: 'grounding', action: deficit.kind === 'unmeasured' ? 'remeasure' : 'connect-goal', supervisorDeficit: deficit };
+  }
+  if (!('pr' in input)) throw new Error('grounding evidence is not an actionable repair move');
   const judged = judgeNextMove({ stopReason: 'needs-human', pr: input.pr, prState: 'OPEN', review: 'fail', mustFix: input.mustFix,
     failures: { 'narrow-relaunch': input.priorNarrowAttempts, alternative: input.priorAlternativeAttempts } });
   const route = readJourneyEdge('next-move', judged.move, { move: judged.move, source: `pr:${input.pr}`, head: input.head, branch: input.branch });

@@ -3354,6 +3354,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
 
   it('confirmed-merge seam의 관측 PR base가 요청 센티널 대신 완료 줄까지 전달된다', async () => {
     const progressMessages: string[] = [];
+    let openedHead = '';
     const seams: SelfImplementSeams = {
       createWorktree: async ({ branch, base }) => ({ path: `/wt/${branch}`, branch, base, resolvedBase: 'resolved-launch-base', invokedHead: 'head' }),
       refreshCodexQuotaSignals: async () => {},
@@ -3361,7 +3362,8 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       gate: async () => ({ passed: true, log: 'gate' }),
       defaultBranchRef: () => 'origin/main',
       reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'review', reviewed: true, diffTruncated: false, diffShownChars: 1, diffTotalChars: 1, diffOmittedFiles: 0 }),
-      openPr: async () => ({ url: 'https://pr/9', number: 9 }),
+      openPr: async ({ head }) => { openedHead = head; return { url: 'https://pr/9', number: 9 }; },
+      readPrAttribution: async () => ({ headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString() }),
       approvePr: async () => true,
       readPrCommitShas: async () => ({ baseCommit: 'base', headCommit: 'head', baseRefName: 'actual-retargeted-base' }),
       readPrDiff: async () => '',
@@ -3379,6 +3381,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
   });
 
   it('confirmed-merge seam이 PR base를 관측하지 못하면 완료 줄은 unknown을 표시한다', async () => {
+    let openedHead = '';
     const seams: SelfImplementSeams = {
       createWorktree: async ({ branch, base }) => ({ path: `/wt/${branch}`, branch, base, resolvedBase: 'resolved-launch-base', invokedHead: 'head' }),
       refreshCodexQuotaSignals: async () => {},
@@ -3386,7 +3389,8 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       gate: async () => ({ passed: true, log: 'gate' }),
       defaultBranchRef: () => 'origin/main',
       reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'review', reviewed: true, diffTruncated: false, diffShownChars: 1, diffTotalChars: 1, diffOmittedFiles: 0 }),
-      openPr: async () => ({ url: 'https://pr/9', number: 9 }),
+      openPr: async ({ head }) => { openedHead = head; return { url: 'https://pr/9', number: 9 }; },
+      readPrAttribution: async () => ({ headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString() }),
       approvePr: async () => true,
       readPrCommitShas: async () => ({ baseCommit: 'base', headCommit: 'head' }),
       readPrDiff: async () => '',

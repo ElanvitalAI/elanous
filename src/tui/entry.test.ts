@@ -15,6 +15,7 @@
  */
 import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test';
 import { debug } from '../debug/log.js';
+import { writeCliStderr } from '../git-fs/cli-stderr.js';
 import {
   TURN_START_CATEGORY,
   TURN_START_SEGMENTS_EVENT,
@@ -26,12 +27,27 @@ import * as tuiOriginal from '../tui.js';
 import * as localChatTurnOriginal from '../tui-client/local-chat-turn.js';
 import * as composerOriginal from './input/composer.js';
 import * as backgroundJobStatusOriginal from './chat/background-job-status.js';
+import * as missionToolOriginal from '../autopilot/mission-tool.js';
+import * as intentGateOriginal from '../intent-gate/gate.js';
+import * as missionWatchOriginal from '../autopilot/mission-tui-watch.js';
+import {
+  _resetDefaultControlSignalObserverForTesting,
+  defaultControlSignalObserver,
+} from '../input/control-signal-observer.js';
+import {
+  _resetDefaultControlSignalBusForTesting,
+  defaultControlSignalBus,
+  type ControlSignal,
+} from '../input/control-signal.js';
 
 // mock.module 복구용 원본 스냅샷 — 정적 import 가 먼저 실행되므로 mock 치환 전 실물이 담긴다.
 const restoreTui = { ...tuiOriginal };
 const restoreLocalChatTurn = { ...localChatTurnOriginal };
 const restoreComposer = { ...composerOriginal };
 const restoreBackgroundJobStatus = { ...backgroundJobStatusOriginal };
+const restoreMissionTool = { ...missionToolOriginal };
+const restoreIntentGate = { ...intentGateOriginal };
+const restoreMissionWatch = { ...missionWatchOriginal };
 
 // readKey 가 내보낼 키 열 — 제출 한 턴 뒤 Ctrl+Q 로 TUI 를 닫는다.
 const keys: Key[] = [];
@@ -39,10 +55,47 @@ const submittedInputs: string[] = [];
 const readKeyTicks: number[] = [];
 type FakeInterval = { callback: () => void; delayMs: number; active: boolean };
 const fakeIntervals: FakeInterval[] = [];
+const readySnapshots: unknown[] = [];
+const runSnapshots: unknown[] = [];
 const timerSnapshots: boolean[][] = [];
 const loopEvents: Array<{ event: string; data: unknown }> = [];
 // 위임한 턴이 실행된 세션 키 — runLocalChatTurn 목격.
 const turnsSeen: string[] = [];
+const missionCalls: unknown[] = [];
+const transcript: string[] = [];
+let duringTurnHook: (() => void) | null = null;
+const cliStderrEvents: Array<{ data: { source: string; exitCode: number; text: string; rawBase64: string; byteLength: number } }> = [];
+
+mock.module('../intent-gate/gate.js', () => ({
+  submitIntent: async () => ({ route: 'mission', goal: '관찰 테스트', executionModel: 'immediate', tier: 'light', heavy: false, missionId: 'apm_ready' }),
+}));
+
+mock.module('../autopilot/mission-tui-watch.js', () => ({
+  takeMissionReadySnapshot: (id: string) => { readySnapshots.push(id); return { exists: true, goal: '관찰 테스트', status: 'proposed', description: '', phases: [], executionModel: 'immediate', tier: 'light' }; },
+  createMissionWatchState: () => ({}),
+  advanceMissionWatch: (state: unknown) => ({ state, events: [{ kind: 'phases', count: 2 }], done: false }),
+  MISSION_WATCH_INTERVAL_MS: 3_000,
+  takeMissionRunSnapshot: (id: string) => { runSnapshots.push(id); return { exists: true, goal: '관찰 테스트', phases: [], runLockActive: false }; },
+  createMissionRunWatchState: () => ({}),
+  advanceMissionRunWatch: (state: unknown) => ({ state, events: [{ kind: 'progress', phase: { index: 0 }, total: 1, note: '실제 관찰 tick' }], done: false }),
+  MISSION_RUN_WATCH_INTERVAL_MS: 5_000,
+  renderMissionRunPhaseLine: () => 'phase',
+  renderMissionRunReportLines: () => ['report'],
+  renderMissionRunFooter: () => 'footer',
+  missionDescriptionDigest: () => [],
+  renderMissionPhaseBoardLines: () => [],
+}));
+
+mock.module('../autopilot/mission-tool.js', () => ({
+  dispatchAutopilotMissions: async (input: unknown) => {
+    missionCalls.push(input);
+    const request = input as { action?: string };
+    const missions = request.action === 'list'
+      ? Array.from({ length: 16 }, (_, index) => ({ id: `apm_list_${index}`, status: 'proposed', source: 'test', goal: `미션 ${index}` }))
+      : [];
+    return { count: missions.length, missions, note: missions.length ? undefined : '미션 없음' };
+  },
+}));
 
 mock.module('../tui.js', () => ({
   initTui: () => {},
@@ -52,9 +105,10 @@ mock.module('../tui.js', () => ({
     const key = keys.shift();
     // 실물 readKey 처럼 키가 오기 전까지는 기다린다(빈 대기열이면 영원히 — 시간초과가 잡는다).
     if (!key) return new Promise<Key>(() => {});
+    if (key.ctrl && key.name === 'q') return Bun.sleep(10).then(() => key);
     const ticks = readKeyTicks.shift() ?? 0;
     for (let i = 0; i < ticks; i += 1) {
-      for (const timer of fakeIntervals) if (timer.delayMs === 1_000 && timer.active) timer.callback();
+      for (const timer of fakeIntervals) if (timer.active) timer.callback();
     }
     timerSnapshots.push(fakeIntervals.filter((timer) => timer.delayMs === 1_000).map((timer) => timer.active));
     return Promise.resolve(key);
@@ -72,6 +126,7 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
   ) => {
     turnsSeen.push(sessionId);
     onDelta?.('첫 응답 델타');
+    duringTurnHook?.();
   },
   closeLocalChatSession: async () => {},
   // 실물은 구독 정지 함수를 반환한다 — entry 가 backgroundSubscription.stop ??= 로 싣는 값이다.
@@ -96,7 +151,7 @@ mock.module('./input/composer.js', () => ({
     }
     return { state, action: 'edit' };
   },
-  composerViewport: () => ({ line: '', cursorCol: 1 }),
+  composerViewport: () => ({ line: duringTurnHook ? '❯ ' : '', cursorCol: 1 }),
   wheelDirection: () => null,
 }));
 
@@ -132,8 +187,14 @@ afterEach(() => {
   readKeyTicks.length = 0;
   fakeIntervals.length = 0;
   timerSnapshots.length = 0;
+  readySnapshots.length = 0;
+  runSnapshots.length = 0;
   loopEvents.length = 0;
   turnsSeen.length = 0;
+  missionCalls.length = 0;
+  transcript.length = 0;
+  duringTurnHook = null;
+  cliStderrEvents.length = 0;
   Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
   Object.defineProperty(process.stdout, 'columns', { value: undefined, configurable: true });
   Object.defineProperty(process.stdout, 'rows', { value: undefined, configurable: true });
@@ -145,6 +206,9 @@ afterAll(() => {
   mock.module('../tui-client/local-chat-turn.js', () => restoreLocalChatTurn);
   mock.module('./input/composer.js', () => restoreComposer);
   mock.module('./chat/background-job-status.js', () => restoreBackgroundJobStatus);
+  mock.module('../autopilot/mission-tool.js', () => restoreMissionTool);
+  mock.module('../intent-gate/gate.js', () => restoreIntentGate);
+  mock.module('../autopilot/mission-tui-watch.js', () => restoreMissionWatch);
 });
 
 describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
@@ -179,6 +243,170 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     expect(captured.filter((l) => l.data.key !== turnSessionKey).length).toBe(0); // 다른 세션 경계 0건
   }, 10_000);
 
+  test('Next TUI 중 git/gh stderr는 프롬프트를 덮지 않고 화면 오류 경로와 debug.log에 보존된다', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const output = process.stdout.write;
+    const errorOutput = process.stderr.write;
+    const debugWrite = debug.log;
+    const stderrWrites: string[] = [];
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      transcript.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderrWrites.push(Buffer.from(chunk).toString('utf8'));
+      return true;
+    }) as typeof process.stderr.write;
+    debug.log = ((category: string, event: string, data?: unknown) => {
+      if (category === 'tui.cli-stderr' && event === 'captured') {
+        cliStderrEvents.push({ data: data as (typeof cliStderrEvents)[number]['data'] });
+      }
+      return debugWrite.call(debug, category, event, data);
+    }) as typeof debug.log;
+    const raw = Buffer.from('fatal: synthetic git failure\n');
+    duringTurnHook = () => writeCliStderr({ source: 'git', exitCode: 128, raw });
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    );
+    submittedInputs.push('stderr 격리 확인');
+    try {
+      await showNextTui({ resumeSessionId: createSession().id });
+      const rendered = transcript.join('');
+      expect(rendered).toContain('[git stderr · rc=128] fatal: synthetic git failure');
+      expect(transcript.at(-1)).toContain('─'.repeat(20));
+      expect(transcript.at(-1)).toContain('❯ ');
+      expect(stderrWrites).toEqual([]);
+      expect(cliStderrEvents).toHaveLength(1);
+      expect(cliStderrEvents[0]?.data.rawBase64).toBe(raw.toString('base64'));
+      expect(cliStderrEvents[0]?.data.byteLength).toBe(raw.length);
+
+      // The Next TUI releases its temporary sink; ordinary callers still use process.stderr.
+      duringTurnHook = null;
+      writeCliStderr({ source: 'gh', exitCode: 0, raw: Buffer.from('outside TUI') });
+      expect(stderrWrites).toEqual(['outside TUI']);
+    } finally {
+      debug.log = debugWrite;
+      process.stdout.write = output;
+      process.stderr.write = errorOutput;
+    }
+  }, 10_000);
+
+  test('Next 입력 경로가 /mission help·잘못된 하위명령과 read-only list를 dispatcher에 전달한다', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      transcript.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
+      { name: 'pageup', ctrl: false, shift: false, raw: '' },
+      { name: 'escape', ctrl: false, shift: false, raw: '\\x1b' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\\x11' },
+    );
+    submittedInputs.push('/mission', '/mission not-a-command', '/mission list', '/mission list');
+    try {
+      await showNextTui({ resumeSessionId: createSession().id });
+      const rendered = transcript.join('');
+      const finalFrame = transcript.at(-1) ?? '';
+      expect(rendered).toContain('usage: /mission [list [status]]');
+      expect(rendered).toContain('unknown subcommand: not-a-command');
+      expect(finalFrame).toContain('apm_list_15');
+      expect(missionCalls.filter((call) => JSON.stringify(call) === JSON.stringify({ action: 'list' }))).toHaveLength(3);
+      expect(missionCalls.some((call) => JSON.stringify(call) === JSON.stringify({ action: 'list' }))).toBe(true);
+    } finally {
+      process.stdout.write = output;
+    }
+  }, 10_000);
+
+  test('Next /term 입력은 가짜 세션 레지스트리로 help·list·status만 읽고 mutation은 거부한다', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      transcript.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    const sessions = [
+      { id: 'pty_12345678', title: 'shell-a', kind: 'shell', status: 'running' as const },
+      { id: 'pty_87654321', title: 'shell-b', kind: 'shell', status: 'exited' as const },
+    ];
+    let listCalls = 0;
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    );
+    submittedInputs.push('/term help', '/term list', '/terminal status', '/terminal matrix', '/term spawn', '/term kill pty_12345678');
+    try {
+      await showNextTui({
+        resumeSessionId: createSession().id,
+        termSessions: { list: () => { listCalls += 1; return sessions; } },
+      });
+      const rendered = transcript.join('');
+      expect(rendered).toContain('/term help');
+      expect(rendered).toContain('pty_12345678'.slice(-8));
+      expect(rendered).toContain('1 live · 1 exited');
+      expect(rendered).toContain('pty_87654321');
+      expect(rendered).toContain('unknown');
+      expect(rendered).toContain('Unsupported /term command in Next TUI: spawn');
+      expect(rendered).toContain('Unsupported /term command in Next TUI: kill');
+      expect(listCalls).toBe(3);
+      expect(turnsSeen).toEqual([]);
+    } finally {
+      process.stdout.write = output;
+    }
+  }, 10_000);
+
+  test('Next 입력의 new/watch가 ready·run 관찰 snapshot을 실제 폴링한다', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    const timerHost = globalThis as unknown as { setInterval: typeof globalThis.setInterval; clearInterval: typeof globalThis.clearInterval };
+    timerHost.setInterval = ((callback: () => void, delayMs = 0) => {
+      const timer: FakeInterval = { callback, delayMs, active: true };
+      fakeIntervals.push(timer);
+      if (delayMs === 3_000 || delayMs === 5_000) queueMicrotask(callback);
+      return timer as unknown as ReturnType<typeof setInterval>;
+    }) as typeof timerHost.setInterval;
+    timerHost.clearInterval = ((handle: ReturnType<typeof setInterval>) => {
+      (handle as unknown as FakeInterval).active = false;
+    }) as typeof timerHost.clearInterval;
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
+      { name: 'enter', ctrl: false, shift: false, raw: '\\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\\x11' },
+    );
+    submittedInputs.push('/mission new goal', '/mission watch apm_run');
+    readKeyTicks.push(0, 0, 1);
+    try {
+      await showNextTui({ resumeSessionId: createSession().id });
+      await Bun.sleep(10);
+      expect(readySnapshots.filter((id) => id === 'apm_ready').length).toBeGreaterThan(1);
+      expect(runSnapshots.filter((id) => id === 'apm_run').length).toBeGreaterThan(1);
+      expect(fakeIntervals.some((timer) => timer.delayMs === 3_000)).toBe(true);
+      expect(fakeIntervals.some((timer) => timer.delayMs === 5_000)).toBe(true);
+    } finally {
+      timerHost.setInterval = originalSetInterval;
+      timerHost.clearInterval = originalClearInterval;
+    }
+  }, 10_000);
+
   test('실제 입력 경로에서 /new·/resume·종료가 활성 loop 타이머를 해제한다', async () => {
     loopEvents.length = 0;
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
@@ -191,8 +419,8 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     const originalAutoturn = process.env.ELANOUS_TUI_AUTOTURN;
     const savedLog = debug.log;
     const timerHost = globalThis as unknown as {
-      setInterval: (callback: (...args: never[]) => void, delay?: number) => ReturnType<typeof setInterval>;
-      clearInterval: (handle: ReturnType<typeof setInterval>) => void;
+      setInterval: typeof globalThis.setInterval;
+      clearInterval: typeof globalThis.clearInterval;
     };
     timerHost.setInterval = ((callback: () => void, delayMs = 0) => {
       const timer: FakeInterval = { callback, delayMs, active: true };
@@ -241,6 +469,124 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
       timerHost.clearInterval = originalClearInterval;
       if (originalAutoturn === undefined) delete process.env.ELANOUS_TUI_AUTOTURN;
       else process.env.ELANOUS_TUI_AUTOTURN = originalAutoturn;
+    }
+  }, 10_000);
+});
+
+// GOAL d0f18e35870f4714 — /signals(관측 전용). Next 소유 handler가 실제 defaultControlSignalObserver
+// 싱글턴의 읽기 API(list·latest·countsByKind)만 소비한다. 시드 신호는 아래 setup 에서만
+// defaultControlSignalBus.emit 으로 발행한다 — clear·emit·observer mutation 은 생산 코드에 없다.
+describe('src/tui/entry.ts — /signals 관측(읽기 전용) 슬래시', () => {
+  type SeedSignal = { kind: string; urgency: ControlSignal['urgency']; sessionId: string; createdAt: string };
+
+  // 싱글턴이 먼저 버스를 구독한 뒤에 발행해야 관측된다(구독 이전 발행은 잡히지 않는다).
+  function seedSignals(seeds: SeedSignal[]): void {
+    _resetDefaultControlSignalBusForTesting();
+    _resetDefaultControlSignalObserverForTesting();
+    defaultControlSignalObserver();
+    for (const seed of seeds) {
+      defaultControlSignalBus().emit({
+        kind: seed.kind,
+        urgency: seed.urgency,
+        source: 'system',
+        createdAt: seed.createdAt,
+        scope: { sessionId: seed.sessionId },
+      });
+    }
+  }
+
+  function stageNextTuiSession(submits: string[]): () => void {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      transcript.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    for (const submit of submits) {
+      keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+      submittedInputs.push(submit);
+    }
+    keys.push({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
+    return () => {
+      process.stdout.write = output;
+    };
+  }
+
+  afterEach(() => {
+    _resetDefaultControlSignalBusForTesting();
+    _resetDefaultControlSignalObserverForTesting();
+  });
+
+  test('/signals help·status·latest·list transcript가 실제 default observer를 거쳐 뜬다', async () => {
+    seedSignals([
+      { kind: 'user-input-failure', urgency: 'normal', sessionId: 'seed-a', createdAt: '2026-10-23T22:13:20.000Z' },
+      { kind: 'provider-credential', urgency: 'normal', sessionId: 'seed-a', createdAt: '2026-10-23T22:13:21.000Z' },
+    ]);
+    const restore = stageNextTuiSession(['/signals help', '/signals status', '/signals latest', '/signals list']);
+    try {
+      await showNextTui({ resumeSessionId: createSession().id });
+      const rendered = transcript.join('');
+      expect(rendered).toContain('❯ /signals help');
+      expect(rendered).toContain('usage: /signals [help|status|latest|list [kind]]');
+      expect(rendered).toContain('신호 총 2건 · 종류 2종');
+      expect(rendered).toContain('provider-credential ×1');
+      expect(rendered).toContain('user-input-failure ×1');
+      expect(rendered).toContain('❯ /signals latest');
+      expect(rendered).toContain('[normal] provider-credential · 22:13:21 · session seed-a');
+      expect(rendered).toContain('❯ /signals list (2건)');
+      expect(rendered).toContain('[normal] user-input-failure · 22:13:20');
+    } finally {
+      restore();
+    }
+  }, 10_000);
+
+  test('/signals list <kind> 필터는 해당 종류만 보여준다', async () => {
+    seedSignals([
+      { kind: 'user-input-failure', urgency: 'normal', sessionId: 'seed-b', createdAt: '2026-10-23T22:13:20.000Z' },
+      { kind: 'provider-credential', urgency: 'normal', sessionId: 'seed-b', createdAt: '2026-10-23T22:13:21.000Z' },
+    ]);
+    const restore = stageNextTuiSession(['/signals list user-input-failure']);
+    try {
+      await showNextTui({ resumeSessionId: createSession().id });
+      const rendered = transcript.join('');
+      expect(rendered).toContain('❯ /signals list user-input-failure (1건)');
+      expect(rendered).toContain('[normal] user-input-failure · 22:13:20');
+      expect(rendered).not.toContain('provider-credential');
+    } finally {
+      restore();
+    }
+  }, 10_000);
+
+  test('빈 observer 상태의 status·latest·list는 빈 결과를 보여준다', async () => {
+    seedSignals([]);
+    const restore = stageNextTuiSession(['/signals status', '/signals latest', '/signals list']);
+    try {
+      await showNextTui({ resumeSessionId: createSession().id });
+      const rendered = transcript.join('');
+      expect(rendered).toContain('관측된 신호 없음 (총 0건)');
+      expect(rendered).toContain('최신 신호 없음');
+      expect(rendered).toContain('❯ /signals list (0건)');
+    } finally {
+      restore();
+    }
+  }, 10_000);
+
+  test('/signals clear·emit은 out of scope 로 거절되고 관측 기록은 불변이다', async () => {
+    seedSignals([
+      { kind: 'user-input-failure', urgency: 'normal', sessionId: 'seed-c', createdAt: '2026-10-23T22:13:20.000Z' },
+    ]);
+    const restore = stageNextTuiSession(['/signals clear', '/signals emit 안녕', '/signals bogus', '/signals list']);
+    try {
+      await showNextTui({ resumeSessionId: createSession().id });
+      const rendered = transcript.join('');
+      expect(rendered).toContain('out of scope — /signals는 관측 전용입니다');
+      expect(rendered).toContain('unknown subcommand: bogus');
+      expect(rendered).toContain('❯ /signals list (1건)'); // clear·emit 시도 뒤에도 관측 기록은 불변
+      expect(rendered).toContain('[normal] user-input-failure · 22:13:20');
+    } finally {
+      restore();
     }
   }, 10_000);
 });

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,9 @@ import {
 } from './gate-remote.js';
 import { parseGateRemoteConfig } from '../user-config.js';
 import { reserveReleaseGateHosts } from '../release-loop/gate-host-reservation.js';
+
+// Spawned CLI integration checks can exceed Bun's 5 s unit-test default under concurrent gate load.
+setDefaultTimeout(60_000);
 
 const HEAD = 'a'.repeat(40);
 const MAIN = 'b'.repeat(40);
@@ -218,11 +221,49 @@ describe('host lock wiring', () => {
     expect(script).toContain('while [ $n -le 2 ]');
   });
 
-  test('busy marker carries the host-observed occupied slots', () => {
-    const runner = fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY=4\n' } });
+  test('busy marker carries the host-observed occupied slots and load', () => {
+    const runner = fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY=4;load1=31.5\n' } });
     expect(runOnRemote({ repo: '/r', host: 'node-b', mirror: '~/m.git', argv: ['x'], hostCap: 4 }, runner))
-      .toEqual({ kind: 'busy', occupied: 4, rc: 98 });
+      .toEqual({ kind: 'busy', occupied: 4, load1: 31.5, rc: 98 });
     expect(runner.scripts[0]).toContain('while [ $n -le 4 ]');
+    expect(runner.scripts[0]).toContain('load1=$(load1)');
+  });
+
+  test('an empty optional load sample preserves the legacy busy classification', () => {
+    const runner = fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY=4;load1=\n' } });
+    expect(runOnRemote({ repo: '/r', host: 'node-b', mirror: '~/m.git', argv: ['x'], hostCap: 4 }, runner))
+      .toEqual({ kind: 'busy', occupied: 4, load1: null, rc: 98 });
+  });
+
+  test.each([
+    ['load above configured threshold', 41.2, 40],
+    ['slots full while load is below threshold', 18.5, 40],
+  ])('reports %s on every busy poll and names the wait resolution', async (_case, load1, threshold) => {
+    let sshCalls = 0;
+    let clock = 0;
+    const runner = fakeRunner({ ssh: () => {
+      if (++sshCalls === 1) {
+        clock += 7000; // Initial SSH setup is not slot waiting time.
+        return { rc: 98, stdout: '', stderr: `__GATE_REMOTE_BUSY=2;load1=${load1}\n` };
+      }
+      return { rc: 0, stdout: 'remote check\n', stderr: '\n__GATE_REMOTE_RC=0\n' };
+    } });
+    const io = sink();
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' }, explicitRemoteOnly: true,
+      remoteArgv: ['x'], runLocal: () => { throw new Error('must not run locally'); } },
+    { runner, settings: { ...settings, loadThreshold: threshold, slotWaitSeconds: 30 }, env: {}, load1: 1, write: io.write,
+      now: () => clock, sleep: async (ms) => { clock += ms; }, log: (event, data) => events.push({ event, data }) });
+    expect(rc).toBe(0);
+    expect(io.err.slice(0, 2)).toEqual([
+      `[gate.remote] waiting on node-b — reason=host-busy load=${load1}/${threshold} slots=2/2 elapsed=0s\n`,
+      '[gate.remote] wait ended on node-b — reason=slot-open elapsed=15s\n',
+    ]);
+    expect(io.err.slice(2)).toEqual(['']);
+    expect(events).toEqual([
+      { event: 'wait-reason', data: { tool: 'self-gate', host: 'node-b', reason: 'host-busy', load1, loadThreshold: threshold, occupied: 2, cap: 2, elapsedMs: 0 } },
+      { event: 'wait-ended', data: { tool: 'self-gate', host: 'node-b', reason: 'slot-open', elapsedMs: 15000 } },
+    ]);
   });
 
   test('an explicit host uses its own configured cap and reports observed occupancy on busy', async () => {
@@ -397,7 +438,7 @@ describe('self gate explicit remote placement', () => {
   test.each([
     ['SSH/remote infra', { runner: fakeRunner({ ssh: { rc: 255, stdout: '', stderr: 'ssh: timed out\nconnection lost' } }) }, 'stage=ssh, rc=255'],
     ['host-busy', { runner: fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY\n' } }) }, 'stage=host-busy, rc=98'],
-  ])('%s refuses local execution with a single reason line', async (_case, setup, reason) => {
+  ])('%s refuses local execution with a clear reason', async (_case, setup, reason) => {
     const io = sink();
     let local = 0;
     const runner = 'runner' in setup ? setup.runner : fakeRunner();
@@ -407,11 +448,17 @@ describe('self gate explicit remote placement', () => {
     expect(rc).toBe(1);
     expect(local).toBe(0);
     expect(io.out.join('')).toBe('');
-    expect(io.err[0]).toContain(reason);
-    expect(io.err[0]!.trimEnd().split('\n')).toHaveLength(1);
-    expect(io.err[0]).toContain('remote unmeasured on node-b');
-    if (_case === 'SSH/remote infra') expect(io.err[1]).toBe('ssh: timed out\nconnection lost\n');
-    else expect(io.err).toHaveLength(1);
+    if (_case === 'SSH/remote infra') {
+      expect(io.err[0]).toContain(reason);
+      expect(io.err[0]!.trimEnd().split('\n')).toHaveLength(1);
+      expect(io.err[0]).toContain('remote unmeasured on node-b');
+      expect(io.err[1]).toBe('ssh: timed out\nconnection lost\n');
+    } else {
+      expect(io.err[0]).toContain('[gate.remote] waiting on node-b — reason=host-busy');
+      expect(io.err[1]).toContain('[gate.remote] wait ended on node-b — reason=deadline-slot-still-busy');
+      expect(io.err[2]).toContain(reason);
+      expect(io.err[2]).toContain('remote unmeasured on node-b');
+    }
   });
 
   test('self gate runs locally only with an explicit --local request', async () => {
@@ -818,6 +865,40 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     expect(fakeBins.calls().filter((call) => call.name === 'ssh').length).toBe(2);
     expect(fakeBins.calls()[0]?.argv).toContain('isolated-host');
     expect(fakeBins.calls()[1]?.argv).toContain('node-b');
+    });
+  });
+
+  test('spawned self gate rejects --pr --remote before a mismatched PR head can be reported passed', async () => {
+    // PR head and seat checkout intentionally differ. The fake remote would claim a third SHA passed;
+    // the production CLI must reject this unreproducible combination without contacting either gh or SSH.
+    const scratch = slotDir();
+    expect(spawnSync('git', ['init', '-q'], { cwd: scratch }).status).toBe(0);
+    expect(spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'seat tree'], { cwd: scratch }).status).toBe(0);
+    expect(spawnSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: scratch }).status).toBe(0);
+    const treeHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: scratch, encoding: 'utf8' }).stdout.trim();
+    const requestedPrHead = 'c'.repeat(40);
+    const reportedRemoteHead = 'd'.repeat(40);
+    expect(treeHead).not.toBe(requestedPrHead);
+    expect(reportedRemoteHead).not.toBe(requestedPrHead);
+    expect(treeHead).not.toBe(reportedRemoteHead);
+    mkdirSync(join(scratch, '.elanous-test', 'release', 'gate-host-reservations'), { recursive: true });
+    writeFileSync(join(scratch, '.git', 'info', 'exclude'), 'bin/\n.elanous-test/\nlog/\n');
+
+    await withFakeBins({
+      gh: { stdout: JSON.stringify({ headRefOid: requestedPrHead, files: [{ path: 'src/example.ts' }] }) },
+      ssh: { stdout: `gate: passed head=${reportedRemoteHead}\n`, stderr: '__GATE_REMOTE_RC=0\n' },
+    }, async (fakeBins) => {
+      const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = fakeBins.env;
+      // Keep the normal production CLI path; NODE_ENV=test activates test-only routing seams.
+      const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--pr', '123', '--remote', 'isolated-host'], {
+        cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'development' },
+      });
+      expect(gate.status).toBe(1);
+      expect(gate.stdout).toBe('');
+      expect(gate.stderr).toContain('remote unmeasured');
+      expect(gate.stderr).toContain('--pr');
+      expect(`${gate.stdout}${gate.stderr}`).not.toContain('gate: passed');
+      expect(fakeBins.calls()).toEqual([]);
     });
   });
 

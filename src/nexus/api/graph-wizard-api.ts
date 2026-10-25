@@ -2,6 +2,7 @@ import { debug } from '../../debug/log.js';
 import { GraphWizardInputError, designGraphVariantPlan, generateGraphFromPrompt, wizardInstalledPacks, type GraphWizardDeps, type GraphWizardTurn } from '../../graph-wizard/generate.js';
 import { defaultGraphsDir } from '../../self-implement/graph-templates.js';
 import { loadGraphTemplates } from '../../self-implement/graph-yaml.js';
+import type { NexusEventBus } from './event-bus.js';
 import { jsonResponse } from './json-response.js';
 
 export function handleGraphWizardPacksGet(deps: GraphWizardDeps = {}): Response {
@@ -11,6 +12,28 @@ export function handleGraphWizardPacksGet(deps: GraphWizardDeps = {}): Response 
 const MAX_PROMPT = 4000;
 const MAX_YAML = 200_000;
 
+/** 호출 경계에서 variant 한 턴의 결말을 버스에 남긴다 — mode·reason ⊕ 조작 growth 좌표. */
+function publishGraphCompose(eventBus: NexusEventBus | undefined, input: {
+  readonly result: Awaited<ReturnType<typeof designGraphVariantPlan>>;
+  readonly goal: string;
+  readonly templateId: string;
+}): void {
+  const { result, goal, templateId } = input;
+  eventBus?.publish({
+    ts: Date.now(),
+    kind: 'graph.compose',
+    detail: {
+      mode: result.mode,
+      status: result.status,
+      reason: result.reason,
+      goal,
+      templateId,
+      ...(result.growth ? { growth: result.growth } : {}),
+      ...(result.status === 'composed' ? { overlayId: result.variant.overlay.overlayId, patches: result.variant.patches.length } : {}),
+    },
+  });
+}
+
 /**
  * POST /v1/graphs/wizard {prompt, kind?, currentYaml?, history?} or
  * {mode:'variant', prompt, goal, templateId} for one validated L2 plan (no YAML generation).
@@ -18,8 +41,9 @@ const MAX_YAML = 200_000;
  * (labels·steps·recipes·dryRun·baseReason 는 v2 추가 필드 — 기존 필드는 그대로.)
  * currentYaml 이 빈 문자열이면 «빈 캔버스»로 보고 새 그래프를 짓는다(의도) · 내용이 있는데 id 가 없거나 형식 밖이면 400.
  * 저장하지 않는다 — 저장은 POST /v1/graphs(새 그래프) 또는 PUT /v1/graphs/<id>/yaml(내 그래프).
+ * variant 요청은 결말(mode·reason·조작 growth)을 주입된 버스에 `graph.compose` 이벤트로 남긴다.
  */
-export async function handleGraphWizardPost(req: Request, deps: GraphWizardDeps = {}): Promise<Response> {
+export async function handleGraphWizardPost(req: Request, deps: GraphWizardDeps = {}, eventBus?: NexusEventBus): Promise<Response> {
   let body: Record<string, unknown>;
   try {
     const parsed: unknown = await req.json();
@@ -60,7 +84,8 @@ export async function handleGraphWizardPost(req: Request, deps: GraphWizardDeps 
       const template = loadGraphTemplates(deps.graphsDir ?? defaultGraphsDir()).templates[body.templateId];
       if (!template) return jsonResponse({ error: 'bad_request', reason: `unknown templateId: ${body.templateId}` }, 400);
       const result = await designGraphVariantPlan({ goal: body.goal, prompt, template }, deps);
-      return jsonResponse({ mode: 'variant', ...result });
+      publishGraphCompose(eventBus, { result, goal: body.goal, templateId: body.templateId });
+      return jsonResponse(result);
     }
     const result = await generateGraphFromPrompt({
       prompt,

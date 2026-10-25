@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
+import { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,7 +8,9 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistEvidenceChain, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
+import { registerReleaseCommands } from '../cli/release-cli.js';
+import { collectChecklistEvidenceStages, registerReleaseChecklistReadCommands, type ChecklistEvidenceCommandRunner, type ChecklistEvidenceReader } from '../cli/release-checklist-read-cli.js';
 import * as features from './feature-store.js';
 
 const roots: string[] = [];
@@ -15,6 +18,122 @@ function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checkl
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('release checklist ledger', () => {
+  test('CHECKLIST-EVIDENCE-CHAIN: any missing/unmeasurable stage fails closed without mutating the ledger', () => {
+    root();
+    addItem('9.9.9', { id: 'CHAIN', title: '대상 경로: src/a.ts\n- 완료 경계 실물: CLI 결과 확인\n- 완료 경계 증거 명령: bun test src/a.test.ts' });
+    const before = listChecklist('9.9.9');
+    const beforeHistory = checklistHistory('CHAIN');
+    const item = before.items[0]!;
+    const result = checklistEvidenceChain({ item, version: '9.9.9', stages: [
+      { id: 'E1', state: 'missing', source: 'fixture: no merge receipt', measuredAt: '2026-10-25T00:00:00.000Z', reason: 'merge가 없다' },
+      { id: 'E3', state: 'observed', source: 'fixture: installed pin', measuredAt: '2026-10-25T00:00:00.000Z', reason: 'pin is descendant' },
+      { id: 'E4', state: 'missing', source: 'fixture: run ledger', measuredAt: '2026-10-25T00:00:00.000Z', reason: '같은 runId 사건이 없다' },
+      { id: 'E5', state: 'observed', source: 'fixture: acceptance comparison', measuredAt: '2026-10-25T00:00:00.000Z', reason: 'acceptance matched' },
+    ] });
+    expect(result.greenEligible).toBe(false);
+    expect(result.reason).toContain('E1=missing');
+    expect(result.reason).toContain('E4=missing');
+    expect(listChecklist('9.9.9')).toEqual(before);
+    expect(checklistHistory('CHAIN')).toEqual(beforeHistory);
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: an observed claim without source and timestamp cannot make a cell green-eligible', () => {
+    const result = checklistEvidenceChain({ item: { id: 'CHAIN', title: 'x', status: 'yellow', updatedAt: '2026-10-25T00:00:00.000Z', updatedBy: 'test' }, version: '9.9.9', stages: [
+      ...(['E1', 'E3', 'E4', 'E5'] as const).map((id) => ({ id, state: 'observed' as const, source: id === 'E4' ? null : 'fixture', measuredAt: '2026-10-25T00:00:00.000Z', reason: 'fixture observed' })),
+    ] });
+    expect(result.greenEligible).toBe(false);
+    expect(result.stages.find((stage) => stage.id === 'E4')).toMatchObject({ state: 'unmeasurable', reason: 'observed 판정에 유효한 출처와 측정 시각이 없다' });
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: default probes bind PR, installed pin ancestry, and exact NDJSON run event', () => {
+    const mergeSha = 'a'.repeat(40);
+    const pinSha = 'b'.repeat(40);
+    const runId = 'run-12345678-1234-1234-1234-123456789abc';
+    const calls: string[] = [];
+    const runner: ChecklistEvidenceCommandRunner = (command, args) => {
+      calls.push(`${command} ${args.join(' ')}`);
+      if (command === 'eln' && args[0] === 'gh') return { status: 0, stdout: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: mergeSha } }), stderr: '' };
+      if (command === 'eln' && args[0] === '--version') return { status: 0, stdout: `0.2.37-dev.0 ${pinSha}`, stderr: '' };
+      if (command === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: '/repo/elanous\n', stderr: '' };
+      if (command === 'git' && args[0] === 'remote') return { status: 0, stdout: 'git@github.com:ElanvitalAI/elanous.git\n', stderr: '' };
+      if (command === 'git' && args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+      if (command === 'git' && args[0] === 'merge-base') return { status: 0, stdout: '', stderr: '' };
+      if (command === 'eln' && args[0] === 'logs') return { status: 0, stdout: `${JSON.stringify({ _meta: { count: 1 } })}\n${JSON.stringify({ event: 'complete', data: JSON.stringify({ runId }) })}\n`, stderr: '' };
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    };
+    const item = { id: 'CHAIN', title: '완료 경계 실물: CLI 결과\n완료 경계 증거 명령: bun test src/a.test.ts', evidence: `PR #42 merge ${mergeSha}\nrunId ${runId} event=complete` } as ReturnType<typeof listChecklist>['items'][number];
+    const stages = collectChecklistEvidenceStages(item, runner);
+    expect(stages.map(({ id, state }) => [id, state])).toEqual([['E1', 'observed'], ['E3', 'observed'], ['E4', 'observed'], ['E5', 'missing']]);
+    expect(calls.some((call) => call.includes('git merge-base --is-ancestor'))).toBe(true);
+    expect(calls.some((call) => call.includes('git cat-file -e'))).toBe(true);
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: E3 is unmeasurable outside the elanous source repository', () => {
+    const mergeSha = 'a'.repeat(40);
+    const pinSha = 'b'.repeat(40);
+    const runner: ChecklistEvidenceCommandRunner = (command, args) => {
+      if (command === 'eln' && args[0] === 'gh') return { status: 0, stdout: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: mergeSha } }), stderr: '' };
+      if (command === 'eln' && args[0] === '--version') return { status: 0, stdout: pinSha, stderr: '' };
+      if (command === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: '/repo/other\n', stderr: '' };
+      if (command === 'git' && args[0] === 'remote') return { status: 0, stdout: 'git@github.com:someone/other.git\n', stderr: '' };
+      if (command === 'git' && args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    };
+    const item = { id: 'CHAIN', title: 'x', evidence: `PR #42 merge ${mergeSha}` } as ReturnType<typeof listChecklist>['items'][number];
+    expect(collectChecklistEvidenceStages(item, runner).find(({ id }) => id === 'E3')).toMatchObject({ state: 'unmeasurable' });
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: the default full CLI reports absent evidence without writes', async () => {
+    root();
+    addItem('9.9.9', { id: 'EMPTY-CHAIN', title: '운영 fixture' });
+    const before = listChecklist('9.9.9');
+    const beforeHistory = checklistHistory('EMPTY-CHAIN');
+    const chunks: string[] = [];
+    const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { chunks.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    try {
+      const program = new Command(); registerReleaseCommands(program);
+      await program.parseAsync(['release', 'checklist', '--version', '9.9.9', 'evidence', 'EMPTY-CHAIN', '--json'], { from: 'user' });
+      const result = JSON.parse(chunks.join('')) as { greenEligible: boolean; stages: Array<{ id: string; state: string; source: string | null; measuredAt: string | null }> };
+      expect(result.greenEligible).toBe(false);
+      expect(result.stages.map(({ id, state }) => [id, state])).toEqual([['E1', 'missing'], ['E3', 'unmeasurable'], ['E4', 'missing'], ['E5', 'missing']]);
+      expect(result.stages.every((stage) => stage.measuredAt !== null)).toBe(true);
+      expect(listChecklist('9.9.9')).toEqual(before);
+      expect(checklistHistory('EMPTY-CHAIN')).toEqual(beforeHistory);
+    } finally { output.mockRestore(); }
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: full and lightweight production roots emit the same read-only fixture result', async () => {
+    const config = root();
+    addItem('9.9.9', { id: 'CHAIN', title: '대상 경로: src/a.ts\n- 완료 경계 실물: CLI 결과 확인\n- 완료 경계 증거 명령: bun test src/a.test.ts' });
+    const fixtureReader: ChecklistEvidenceReader = () => [
+      { id: 'E1', state: 'missing', source: 'fixture: no merge', measuredAt: '2026-10-25T00:00:00.000Z', reason: 'merge가 없다' },
+      { id: 'E3', state: 'observed', source: 'fixture: installed pin', measuredAt: '2026-10-25T00:00:00.000Z', reason: '후손 확인' },
+      { id: 'E4', state: 'missing', source: 'fixture: run ledger', measuredAt: '2026-10-25T00:00:00.000Z', reason: 'run 이벤트 없음' },
+      { id: 'E5', state: 'observed', source: 'fixture: acceptance comparison', measuredAt: '2026-10-25T00:00:00.000Z', reason: '문구 일치' },
+    ];
+    const original = listChecklist('9.9.9');
+    const originalHistory = checklistHistory('CHAIN');
+    const run = async (light: boolean): Promise<string> => {
+      const chunks: string[] = [];
+      const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { chunks.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+      try {
+        const program = new Command();
+        if (light) registerReleaseChecklistReadCommands(program, fixtureReader);
+        else registerReleaseCommands(program, {}, {}, {}, {}, {}, {}, fixtureReader);
+        await program.parseAsync(['release', 'checklist', '--version', '9.9.9', 'evidence', 'CHAIN', '--json'], { from: 'user' });
+        return chunks.join('').trim();
+      } finally { output.mockRestore(); }
+    };
+    try {
+      const full = await run(false);
+      const light = await run(true);
+      expect(JSON.parse(full)).toEqual(JSON.parse(light));
+      expect(JSON.parse(full)).toMatchObject({ id: 'CHAIN', greenEligible: false, stages: [{ id: 'E1', state: 'missing' }, { id: 'E3', state: 'observed' }, { id: 'E4', state: 'missing' }, { id: 'E5', state: 'observed' }] });
+      expect(listChecklist('9.9.9')).toEqual(original);
+      expect(checklistHistory('CHAIN')).toEqual(originalHistory);
+    } finally { resetElanousConfigDir(); rmSync(config, { recursive: true, force: true }); }
+  });
+
   const boundary = '\n- 완료 경계 코드: src/real.ts 변경\n- 완료 경계 실물: 설치본 호출\n- 완료 경계 증거 명령: bun test src/real.test.ts';
   test('ACCEPTANCE-FROM-VERIFY-MENU: a «완료 경계 실물» made only of merge sha / typecheck wording is warned (so --strict rejects it)', () => {
     const deps = { existsAtMain: (path: string) => path === 'src/real.ts' };

@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { hasCliStderrSink, writeCliStderr } from './cli-stderr.js';
 import { runGitWithRetry, type GitRunner } from './retry.js';
 
 const LF = 0x0a;
@@ -134,7 +135,11 @@ export function runGitCli(args: string[]): void {
   // ⛔ 실행 «전» 스냅샷 — 이 명령이 마커를 남길 수 있는 종류일 때만 잰다(무관한 명령엔 비용 0).
   const probesForRun = SUBCOMMAND_PROBES[subcommand];
   const probesBefore = probesForRun ? probeSnapshot(args, probesForRun, process.env) : undefined;
-  if (HELP_ARGUMENTS.has(args[0] ?? '')) process.stderr.write(HELP_GUIDANCE);
+  const stderrChunks: Buffer[] = [];
+  if (HELP_ARGUMENTS.has(args[0] ?? '')) {
+    if (hasCliStderrSink()) stderrChunks.push(Buffer.from(HELP_GUIDANCE));
+    else process.stderr.write(HELP_GUIDANCE);
+  }
   let attempts = 0;
   let rawStdout: Buffer = Buffer.alloc(0);
   let rawStderr: Buffer = Buffer.alloc(0);
@@ -154,7 +159,7 @@ export function runGitCli(args: string[]): void {
   const result = runGitWithRetry(args, runner);
 
   if (rawStdout.length) process.stdout.write(rawStdout);
-  if (rawStderr.length) process.stderr.write(rawStderr);
+  if (rawStderr.length) stderrChunks.push(rawStderr);
 
   // ⛔⭐⭐⭐⭐⭐ **상태 줄은 `stderr` 로 나간다** — 2026-08-09 정정(라이브에서 «둘이» 밟았다).
   //   초판은 stdout 에 썼다. 그러면 ***산출을 값으로 쓰는 모든 소비자가 깨진다***:
@@ -166,7 +171,7 @@ export function runGitCli(args: string[]): void {
   //     `git`·`gh` 자신의 오류도 똑같이 사라지므로 일관된다.
   //   ⇒ 📌 stdout 은 이제 ***원 바이트 그대로만*** 나간다(separator 도 안 붙인다).
   const endsWithoutLf = (buf: Buffer): boolean => buf.length > 0 && buf[buf.length - 1] !== LF;
-  if (endsWithoutLf(rawStderr)) process.stderr.write('\n');
+  if (endsWithoutLf(rawStderr)) stderrChunks.push(Buffer.from('\n'));
 
   const exitCode = result.status ?? 1;
   const leftKind = exitCode !== 0 && probesForRun
@@ -176,11 +181,12 @@ export function runGitCli(args: string[]): void {
   const leftReason = leftKind
     ? `${leftKind}-${hasUnmergedPaths(args, process.env) ? 'conflict' : 'in-progress'}`
     : undefined;
-  process.stderr.write(
+  stderrChunks.push(Buffer.from(
     `[git] ${subcommand} ${exitCode === 0 ? 'ok' : 'FAILED'} rc=${exitCode}`
     + (leftReason ? ` worktree-changed=yes reason=${leftReason}` : '')
     + '\n',
-  );
+  ));
+  writeCliStderr({ source: 'git', exitCode, raw: Buffer.concat(stderrChunks) });
   process.exitCode = exitCode;
   debug.log('git.cli', 'completed', {
     subcommand,

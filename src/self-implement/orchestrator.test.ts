@@ -15,7 +15,7 @@ import { defaultSeams, preservationHasChanges, parseBehindCount, removeMatchingG
 import { runSelfImplementCliCommand } from './self-implement-cli.js';
 import { runDraftSweep } from '../self-dev/draft-sweep.js';
 import { GoalRunStore } from './goal-run-store.js';
-import { appendRunLedgerEntry, runLedgerPath } from './run-ledger.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerPath } from './run-ledger.js';
 import { compactForLog, debug } from '../debug/log.js';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 import { LogStore } from '../mss/logging/log-store.js';
@@ -24,13 +24,14 @@ import { instanceNameForStateDir } from '../instance-identity.js';
 import { getAskUserQuestionResolver, setAskUserQuestionResolver } from '../ask-user-question/tool.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { createSession, subscribeSession } from '../session/index.js';
-import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, goalChecklistIds, prTitle, routePodMergeToHost, runSelfImplement, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
+import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationObservation, GATE_TIMEOUT_UNMEASURED_MERGE_REASON, mainSyncObservation, postSyncGateObservation, appendGoalExecutionRecord, assembleBlockedDraftPrBody, BLOCKED_DRAFT_UNCLASSIFIED_CLASSIFICATION, blockedDraftClassificationRecord, formatBlockedDraftClassificationSection, assessQuotaExhaustion, attachAbandonedClassification, boundReadableText, buildImplementAbortRecord, buildRefutationGuidance, citedReviewSymbols, clarificationResolverSkipHint, countDocsMarkdownDeletions, DECLARED_SCOPE_OUTSIDE_NAME_CAP, DECOMPOSITION_FALLBACK_PATHS_OBSERVATION_LIMIT, decompositionFallbackObservation, declaredScopeUnmadeLine, detectDeclaredScopeDiff, decideGateFailureDisposition, extractSupervisorReason, formatImplementAbortProgressLine, incrementRunAttemptOrdinal, inferDecompositionShadow, GITHUB_PR_BODY_MAX_CHARS, IMPLEMENT_ABORT_REASON_MAX_CHARS, isShardSiblingLookupEligible, loopTtlMin, makeRunObserver, MAX_TRACKED_RUN_ATTEMPT_ORDINALS, normalizeReviewFindingKey, observeRunOutcome, persistImplementAbortChildSummary, queryStructuredChildProviderErrors, readRunAttemptOrdinal, repeatedBlockingFindingIds, resolveDecisionSignalPress, reworkBudgetRecurrenceDisagreementObservation, reviewFindingKey, reviewerCanSelfReadObservation, goalChecklistIds, prTitle, routePodMergeToHost, runSelfImplement as runSelfImplementProduction, RUN_START_FEATURE_MAX_CHARS, shortNormalizedReviewFindingHash, slugifyFeature, SUPERVISOR_REASON_RECORD_MAX_CHARS, UNMEASURED_ATTEMPT_ORDINAL, withStepTimeout, withRefreshedRunFacts, StepTimeoutError, MAX_CITED_REVIEW_SYMBOL_CHARS, MAX_CITED_REVIEW_SYMBOLS_PER_RUN, MAX_DIFF_EVIDENCE_CHARS, type GoalExecutionRecord, type ReviewDiffContext, type SelfImplementReview, type SelfImplementSeams, quotaSignalAppliesTo } from './orchestrator.js';
 import * as orchestratorModule from './orchestrator.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
 import { decideDraft } from '../self-dev/draft-triage-rules.js';
 import { resetAutohealProcessMemory } from './stop-autoheal.js';
 import { defaultGitMergeSeam, defaultLlmResolve, mergeMainIntoWorktreeWithResolveOptions, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { stableMustFixId } from './reflect-mustfix.js';
+import { decideReviewRound } from './rework-policy.js';
 import { WORKTREE_BRANCH_PREFIX, plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 import { branchGoalId } from '../cli/pr-lineage.js';
 import { parseGoalType } from './goal-author.js';
@@ -39,6 +40,164 @@ import { DEV_PIPELINE_SINK_SURFACE } from './self-cli-sink-surface.js';
 import { PIPELINE_EDGES_BY_NODE, PIPELINE_GRAPH_ID, TERMINAL_STAGES_BY_NODE, pipelineGraphIdentity, pipelineGraphVersion, type PipelineNodeId } from './pipeline-shape.js';
 import { GRAPH_TEMPLATES, measureL0Coverage } from './graph-templates.js';
 
+// Most historical tests inject openPr without a GitHub adapter. Supply a
+// deterministic attribution read for those seams while preserving explicit
+// attribution probes (including mismatch and metadata failures) unchanged.
+const runSelfImplement: typeof runSelfImplementProduction = (opts) => {
+  let openedHead: string | undefined;
+  const originalOpenPr = opts.seams.openPr;
+  const attribution = opts.seams.readPrAttribution as (typeof opts.seams.readPrAttribution & { testDefaultPrAttribution?: boolean }) | undefined;
+  return runSelfImplementProduction({ ...opts, seams: {
+    ...opts.seams,
+    openPr: async (input) => { openedHead = input.head; return originalOpenPr(input); },
+    readPrAttribution: attribution && !attribution.testDefaultPrAttribution ? attribution : (async () => ({
+      headRefName: openedHead ?? '', createdAt: new Date(Date.now() + 1_000).toISOString(),
+    })),
+  } });
+};
+
+
+test('runSelfImplement attributes PRs only when actual head and creation time match the run', async () => {
+  const scenarios = [
+    { mismatchBranch: false, createdAt: () => new Date(Date.now() + 60_000).toISOString(), accepted: true },
+    { mismatchBranch: true, createdAt: () => new Date(Date.now() + 60_000).toISOString(), accepted: false },
+    { mismatchBranch: false, createdAt: () => new Date(0).toISOString(), accepted: false },
+  ] as const;
+  for (const [index, scenario] of scenarios.entries()) {
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let runBranch = '';
+    const s = seams({
+      implement: async () => ({ ok: true, summary: 'implementation complete' }),
+      gate: async () => ({ passed: true, log: 'gate passed' }),
+      reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'review passed', reviewed: true, diffTruncated: false }),
+      openPr: async ({ head }) => { runBranch = head; return { url: `https://pr/${index + 1}`, number: index + 1 }; },
+      readPrAttribution: async () => ({ headRefName: scenario.mismatchBranch ? 'someone-elses-branch' : runBranch, createdAt: scenario.createdAt() }),
+      writeRunLedger: (entry) => { ledger.push({ event: entry.event, data: entry.data }); },
+    });
+    await runSelfImplement({ feature: `PR attribution ${index}`, seams: s });
+    const opened = ledger.filter((entry) => entry.event === 'pr-opened' && entry.data.number === index + 1);
+    const mismatches = ledger.filter((entry) => entry.event === 'pr-attribution-mismatch');
+    if (scenario.accepted) {
+      expect(opened).toHaveLength(1);
+      expect(mismatches).toHaveLength(0);
+      expect(ledger.some((entry) => entry.event === 'run-rollup' && entry.data.prNumber === index + 1)).toBe(true);
+    } else {
+      expect(opened).toHaveLength(0);
+      expect(mismatches).toHaveLength(1);
+      expect(mismatches[0]!.data).toMatchObject({
+        expectedBranch: expect.any(String),
+        actualBranch: scenario.mismatchBranch ? 'someone-elses-branch' : runBranch,
+        createdAt: expect.any(String),
+      });
+      expect(ledger.some((entry) => entry.event === 'run-rollup' && entry.data.prNumber === index + 1)).toBe(false);
+    }
+  }
+});
+
+test('only a verified same-card reuse may attribute an older PR on its proven head branch', async () => {
+  for (const scenario of [
+    { boundCardReuse: true, foreignHead: false, accepted: true },
+    { boundCardReuse: false, foreignHead: false, accepted: false },
+    { boundCardReuse: true, foreignHead: true, accepted: false },
+  ]) {
+    const boundHead = 'older-card-pr-branch';
+    const result = await runSelfImplement({
+      feature: 'old PR card reuse',
+      seams: seams({
+        openPr: async () => {
+          return { url: 'https://pr/41', number: 41, ...(scenario.boundCardReuse ? { boundCardReuse: { headRefName: boundHead } } : {}) };
+        },
+        readPrAttribution: async () => ({
+          headRefName: scenario.foreignHead ? 'foreign-branch' : boundHead,
+          createdAt: '2020-01-01T00:00:00Z',
+        }),
+      }),
+    });
+    expect(result.stage).toBe(scenario.accepted ? 'pr-opened' : 'aborted');
+    expect(result.prNumber).toBe(scenario.accepted ? 41 : undefined);
+  }
+});
+
+test('blocked draft keeps a verified same-card reused PR with an older creation time', async () => {
+  const boundHead = 'older-card-draft-branch';
+  const result = await runSelfImplement({
+    feature: 'same-card blocked draft reuse', maxReworkRounds: 0,
+    seams: seams({
+      gateResults: [false], preservationHasChanges: () => true, draftOnStopMode: () => 'always',
+      openPr: async () => ({ url: 'https://pr/42', number: 42, boundCardReuse: { headRefName: boundHead } }),
+      readPrAttribution: async () => ({ headRefName: boundHead, createdAt: '2020-01-01T00:00:00Z' }),
+    }),
+  });
+  expect(result.prNumber).toBe(42);
+  expect(result.stage).toBe('gate-failed');
+});
+
+test('PR attribution compares timestamps at the precision actually returned by GitHub', () => {
+  const check = (orchestratorModule as { prCreatedInRunWindow?: (createdAt: string, startedAtMs: number) => boolean }).prCreatedInRunWindow;
+  expect(typeof check).toBe('function');
+  if (!check) return;
+  const startedAtMs = Date.parse('2026-10-24T08:00:05.700Z');
+  expect(check('2026-10-24T08:00:05Z', startedAtMs)).toBe(true);
+  expect(check('2026-10-24T08:00:04Z', startedAtMs)).toBe(false);
+  expect(check('2026-10-24T08:00:05.000Z', startedAtMs)).toBe(false);
+  expect(check('invalid', startedAtMs)).toBe(false);
+});
+
+test('foreign PR attribution stops every downstream PR effect and omits its number from the result', async () => {
+  const effects: string[] = [];
+  let runBranch = '';
+  const result = await runSelfImplement({
+    feature: 'foreign PR attribution must stop',
+    seams: seams({
+      openPr: async ({ head }) => { runBranch = head; return { url: 'https://pr/999', number: 999 }; },
+      readPrAttribution: async () => ({ headRefName: `${runBranch}-foreign`, createdAt: new Date(Date.now() + 60_000).toISOString() }),
+      readPrFiles: async () => { effects.push('read-files'); return ['src/ordinary.ts']; },
+      postPrComment: async () => { effects.push('comment'); },
+      readPrBodyForHarvest: async () => { effects.push('read-body'); return undefined; },
+      updatePrBodyForHarvest: async () => { effects.push('update-body'); },
+    }),
+  });
+  expect(result).toMatchObject({ ok: false, stage: 'aborted', node: 'open-pr' });
+  expect(result.prNumber).toBeUndefined();
+  expect(result.prUrl).toBeUndefined();
+  expect(effects).toEqual([]);
+});
+
+test('PR attribution metadata read failure is reported separately and stops PR effects', async () => {
+  const events: string[] = [];
+  const result = await runSelfImplement({
+    feature: 'unverified PR attribution must stop',
+    seams: seams({
+      readPrAttribution: async () => { throw new Error('gh timeout'); },
+      readPrFiles: async () => { events.push('read-files'); return []; },
+      writeRunLedger: (entry) => { events.push(entry.event); },
+    }),
+  });
+  expect(result).toMatchObject({ ok: false, stage: 'aborted', node: 'open-pr' });
+  expect(events).toContain('pr-attribution-unverified');
+  expect(events).not.toContain('pr-attribution-mismatch');
+  expect(events).not.toContain('read-files');
+});
+
+test('blocked draft attribution mismatch preserves the branch without commenting on a foreign PR', async () => {
+  const comments: number[] = [];
+  const result = await runSelfImplement({
+    feature: 'blocked draft attribution mismatch',
+    maxReworkRounds: 0,
+    seams: seams({
+      gateResults: [false],
+      preservationHasChanges: () => true,
+      draftOnStopMode: () => 'always',
+      readPrAttribution: async () => ({ headRefName: 'foreign-branch', createdAt: new Date(Date.now() + 60_000).toISOString() }),
+      postPrComment: async ({ number }) => { comments.push(number); },
+    }),
+  });
+  expect(result.ok).toBe(false);
+  expect(result.prNumber).toBeUndefined();
+  expect(result.prUrl).toBeUndefined();
+  expect(result.branch).toBeTruthy();
+  expect(comments).toEqual([]);
+});
 
 test('harvest marker helper is available on the production module', () => {
   const markHarvestDeferredBody = (orchestratorModule as { markHarvestDeferredBody?: unknown }).markHarvestDeferredBody;
@@ -342,10 +501,12 @@ afterAll(() => {
 });
 
 import { seams as baseSeams } from './test-seams.js';
-const seams = (over: Parameters<typeof baseSeams>[0]): SelfImplementSeams => baseSeams({
-  inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 0 })) as SelfImplementSeams['inspectCodexRotation'],
-  ...over,
-});
+const seams = (over: Parameters<typeof baseSeams>[0]): SelfImplementSeams => {
+  return baseSeams({
+    inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 0 })) as SelfImplementSeams['inspectCodexRotation'],
+    ...over,
+  });
+};
 import type { DecisionSignalPressResult } from './decision-signal-press.js';
 import type { SoftStopRequestRead } from '../harness/control-inbox.js';
 
@@ -581,6 +742,7 @@ describe('goal-only implementation rework', () => {
     }
   });
 
+  // node-b isolated runs take seconds; importer shards under Pod load can exceed Bun's default per-test limit.
   test('exhausts the retry when a declared target changes but RESULT is missing', async () => {
     const root = mkdtempSync(join(tmpdir(), 'goal-only-rework-no-result-'));
     const repo = join(root, 'repo');
@@ -623,7 +785,7 @@ describe('goal-only implementation rework', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('spends the goal-only retry only once across later gate rework rounds', async () => {
     const root = mkdtempSync(join(tmpdir(), 'goal-only-rework-once-'));
@@ -669,7 +831,7 @@ describe('goal-only implementation rework', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('does not retry when the authored rework budget is zero', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'goal-only-no-budget-'));
@@ -865,7 +1027,7 @@ describe('STOP-AUTOHEAL wiring', () => {
     const results: unknown[] = [];
     let called = 0;
     await runSelfImplement({ feature: 'autoheal shadow on merge hold', autoMerge: false, seams: seams({
-      writeRunLedger: (entry) => { entries.push(entry); },
+      writeRunLedger: (entry) => { entries.push(entry); appendRunLedgerEntry(entry); },
       stopAutohealActions: { 'rebase-regate': () => { called += 1; return { ok: true }; } },
       onStopAutoheal: (r) => { results.push(r); },
     }) });
@@ -874,6 +1036,9 @@ describe('STOP-AUTOHEAL wiring', () => {
     expect(heal[0]!.data).toMatchObject({ class: 'unclassified', action: 'needs-owner', mode: 'shadow', outcome: 'needs-owner' });
     expect(results).toHaveLength(1);
     expect(called).toBe(0);
+    const visits = loadRunLedger(heal[0]!.runId)?.filter((entry) => entry.event === 'doctor-visit');
+    expect(visits).toHaveLength(1);
+    expect(visits?.[0]?.data).toMatchObject({ from: 'parent', symptom: 'needs-owner', evidence: expect.stringContaining('merge held') });
   });
 
   test('live mode runs derive-evidence-rejudge once for a required-evidence-uncovered stop', async () => {
@@ -1539,6 +1704,23 @@ describe('runSelfImplement — document reference wiring', () => {
 });
 
 describe('runSelfImplement — child LLM wiring', () => {
+  test('start ledger names the selected child model, not the Pod config default', async () => {
+    const ledger: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    await runSelfImplement({
+      feature: 'luna child start attribution',
+      childLlm: { provider: 'openai-codex', model: 'gpt-6-luna', source: 'flag' },
+      seams: seams({
+        inspectActiveProvider: () => ({ provider: 'auto:openai-codex', model: 'gpt-6-sol', auth: 'oauth' } as ReturnType<NonNullable<SelfImplementSeams['inspectActiveProvider']>>),
+        writeRunLedger: (entry) => { ledger.push(entry); },
+      }),
+    });
+    expect(ledger.find((entry) => entry.event === 'run-origin')!.data).toMatchObject({ childModel: 'gpt-6-luna' });
+    expect(ledger.find((entry) => entry.event === 'start')!.data).toMatchObject({
+      provider: 'openai-codex', model: 'gpt-6-luna', auth: 'oauth',
+      configuredProvider: 'auto:openai-codex', configuredModel: 'gpt-6-sol', modelSelectionSource: 'child',
+    });
+  });
+
   test('forwards one explicit child LLM unchanged across the initial and rework rounds', async () => {
     const received: Array<{ childLlm?: { provider: string; model: string; source: 'flag' | 'config' }; escalateTier?: string }> = [];
     await runSelfImplement({
@@ -4429,6 +4611,7 @@ describe('runSelfImplement — Fix A rework', () => {
   });
 
   // ★ I-24 — 골이 이름으로 요구한 증거의 충족을 **관측이 나른다**. 순수 함수만 재면 배선이 안 잡힌다.
+  // The production-path shell checks are load-sensitive (5.2s isolated on node-b); keep the assertions unchanged.
   test('⭐ 하니스 셸 체크 실행과 0건이 debug 관측에 실린다', async () => {
     const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
     const original = (debug as { log: typeof debug.log }).log;
@@ -4459,7 +4642,7 @@ describe('runSelfImplement — Fix A rework', () => {
       runs: [expect.objectContaining({ tag: 'shell', command: 'echo ok', exitCode: 0, durationMs: expect.any(Number) })],
     });
     expect(checks[1]?.data).toEqual({ count: 0, runs: [] });
-  }, 10_000);
+  }, 30_000);
 
   test('evidence budget follows the orchestrator across two failed gate rounds', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'orchestrator-evidence-budget-'));
@@ -4785,6 +4968,7 @@ describe('runSelfImplement — Fix A rework', () => {
       const r = await runSelfImplement({
         feature: 'F',
         seams: seams({
+          writeRunLedger: (entry) => appendRunLedgerEntry(entry, isolatedStateDir),
           implement: async () => ({ ok: false, completionDisposition: 'completed-without-changes', summary: 'verified existing seam' }),
         }),
       });
@@ -4800,6 +4984,17 @@ describe('runSelfImplement — Fix A rework', () => {
           mustFixReported: false,
         }),
       }));
+      const source = events.find((entry) => entry.event === 'supervisor-report-deficit')?.data;
+      const next = events.find((entry) => entry.event === 'repair-next-move-input')?.data;
+      expect(source).toMatchObject({ kind: 'unmeasured', classification: expect.objectContaining({ classification: 'report-deficit' }) });
+      expect(next).toMatchObject({ runId: source?.runId, evidenceId: source?.evidenceId,
+        previousEvidence: source?.previousEvidence, action: 'remeasure' });
+      const ledger = readFileSync(runLedgerPath(source!.runId as string, isolatedStateDir), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line) as { event: string; runId: string; data: Record<string, unknown> });
+      expect(ledger.find((row) => row.event === 'repair-next-move-input')).toMatchObject({
+        runId: source?.runId, data: { evidenceId: source?.evidenceId, previousEvidence: source?.previousEvidence,
+          classification: expect.objectContaining({ classification: 'report-deficit' }) },
+      });
     } finally {
       (debug as { log: typeof debug.log }).log = original;
     }
@@ -6635,6 +6830,257 @@ describe('판정 입력 배관 — 생산에서 실제로 닿는가', () => {
 });
 
 describe('runSelfImplement — supervisor fills authored UNVERIFIABLE slots', () => {
+  test('docs-only PASS records not-applicable and continues without abandoning the run', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-slot-docs-only-'));
+    const goalFile = join(root, 'GOAL.txt');
+    const original = 'Goal\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n';
+    writeFileSync(goalFile, original);
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.writeRunLedger = (entry) => appendRunLedgerEntry(entry, isolatedStateDir);
+    let gateCalls = 0;
+    s.gate = async () => {
+      gateCalls++;
+      return { passed: true, testStepExecuted: false, scopeReason: 'docs-only',
+        log: '[cli-smoke] PASS bun bin/elanous.mjs --help\n[gate-scope] docs-only — test 스텝을 건너뛰었다(변경파일 tsc 만 검증).' };
+    };
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category.includes('self-implement')) events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({ feature: 'docs-only PASS', goalFile, maxReworkRounds: 0, seams: s });
+      expect(result.ok).toBe(true);
+      expect(result.termination).not.toBe('abandoned');
+      expect(gateCalls).toBe(1);
+      const storedGoal = readFileSync(goalFile, 'utf8');
+      expect(storedGoal.startsWith(original)).toBe(true);
+      expect(storedGoal.match(/- UNVERIFIABLE/g)).toHaveLength(2);
+      expect(storedGoal).not.toContain('filled-by: supervisor');
+      expect(events.find(({ event }) => event === 'goal-slot-remeasure-result')?.data).toMatchObject({
+        result: 'not-applicable', gatePassed: true, reason: 'test-step-scope-skipped',
+        scopeReason: 'docs-only', testStepExecuted: false,
+      });
+      expect(events.find(({ event }) => event === 'goal-slot-fill')?.data).toMatchObject({
+        result: 'not-applicable', reason: 'test-step-scope-skipped', scopeReason: 'docs-only',
+      });
+      const runId = events.find(({ event }) => event === 'goal-slot-fill')?.data.runId as string;
+      const ledger = readFileSync(runLedgerPath(runId, isolatedStateDir), 'utf8');
+      expect(ledger).toContain('"result":"not-applicable"');
+      expect(ledger).toContain('"scopeReason":"docs-only"');
+    } finally { (debug as { log: typeof debug.log }).log = originalLog; rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('report-deficit preserves supervisor evidence in the same-run repair input before green', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'report-deficit-grounding-'));
+    const goalFile = join(root, 'GOAL.txt');
+    const original = 'Goal\n\n## 불변식\n- UNVERIFIABLE\n- prior evidence: prior-run\n\n## 판정 신호\n- UNVERIFIABLE\n';
+    writeFileSync(goalFile, original);
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.writeRunLedger = (entry) => appendRunLedgerEntry(entry, isolatedStateDir);
+    let implementationCalls = 0;
+    const implement = s.implement;
+    s.implement = async (context) => { implementationCalls++; return implement(context); };
+    s.independentlyCheckGoalSlots = async () => true;
+    let gateCalls = 0;
+    s.gate = async () => ({ passed: true, log: ++gateCalls === 1
+      ? '[test] PASS bun test goal — 1 pass'
+      : '[test] PASS bun test goal — 1 pass | 0 fail' });
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category.includes('self-implement')) events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({ feature: 'report-deficit mock', goalFile, maxReworkRounds: 0, seams: s });
+      expect(result.gate?.passed).toBe(true);
+      expect(result.ok).toBe(true);
+      const supervisor = events.find(({ event }) => event === 'supervisor-report-deficit');
+      const repair = events.find(({ event }) => event === 'repair-next-move-input');
+      expect(supervisor?.data).toMatchObject({ kind: 'unmeasured', previousEvidence: original, evidenceId: expect.any(String) });
+      expect(repair?.data).toMatchObject({ runId: supervisor?.data.runId, evidenceId: supervisor?.data.evidenceId,
+        previousEvidence: original, action: 'remeasure' });
+      expect(readFileSync(goalFile, 'utf8')).toContain('prior evidence: prior-run');
+      expect(readFileSync(goalFile, 'utf8')).toContain('filled-by: supervisor@round-0');
+      expect(gateCalls).toBe(2);
+      expect(implementationCalls).toBe(1);
+      expect(events.find(({ event }) => event === 'goal-slot-remeasure-result')?.data).toMatchObject({
+        runId: supervisor?.data.runId, evidenceId: supervisor?.data.evidenceId, result: 'filled', gatePassed: true,
+      });
+      expect(events.find(({ event }) => event === 'goal-slot-fill')?.data).toMatchObject({ runId: supervisor?.data.runId, result: 'filled' });
+      expect(events.find(({ event }) => event === 'run-status')?.data).toMatchObject({
+        runId: supervisor?.data.runId, runStatus: 'completed',
+      });
+      const ledger = readFileSync(runLedgerPath(supervisor!.data.runId as string, isolatedStateDir), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line) as { event: string; runId: string; data: Record<string, unknown> });
+      const recordedSupervisor = ledger.find((row) => row.event === 'supervisor-report-deficit');
+      const recordedRepair = ledger.find((row) => row.event === 'repair-next-move-input');
+      expect(recordedRepair).toMatchObject({ runId: recordedSupervisor?.runId,
+        data: { evidenceId: recordedSupervisor?.data.evidenceId, previousEvidence: original, action: 'remeasure' } });
+      expect(ledger.find((row) => row.event === 'goal-slot-remeasure-result')).toMatchObject({
+        runId: recordedSupervisor?.runId, data: { evidenceId: recordedSupervisor?.data.evidenceId, result: 'filled' },
+      });
+    } finally { (debug as { log: typeof debug.log }).log = originalLog; rmSync(root, { recursive: true, force: true }); }
+  });
+  test('declared unwired export reaches connect-goal without re-launching the implementation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'report-deficit-unwired-'));
+    const goalFile = join(root, 'GOAL.txt');
+    writeFileSync(goalFile, '- GoalId: grounding-target-cell\nOriginal ask (verbatim, unmodified):\n```\n대상 경로: src/grounding-target.ts\n```\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n');
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.writeRunLedger = (entry) => appendRunLedgerEntry(entry, isolatedStateDir);
+    let implementationCalls = 0;
+    const implement = s.implement;
+    s.implement = async (context) => { implementationCalls++; return implement(context); };
+    s.gate = async () => ({ passed: true, log: '[test] PASS bun test goal — 1 pass | 0 fail\n[gate-baseline] introduced=0, preexisting=0, unknown=0, precondition-unmet=0' });
+    const followUpDrafts: import('./follow-up-goals.js').FollowUpDraftRecord[] = [];
+    s.followUp = { mode: 'shadow', readDrafts: () => followUpDrafts, appendDraft: (draft) => { followUpDrafts.push(draft); } };
+    s.changedFilesForGateRoute = () => ['src/grounding-target.ts'];
+    s.checkUnwiredExports = () => ({ checked: 1, unwired: [{ file: 'src/grounding-target.ts', name: 'groundingTarget', reason: 'no-production-importer' }] });
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category.includes('self-implement')) events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({ feature: 'unwired target', goalFile, maxReworkRounds: 0, seams: s });
+      expect(result.ok).toBe(false);
+      const source = events.find(({ event }) => event === 'supervisor-report-deficit')?.data;
+      const move = events.find(({ event }) => event === 'repair-next-move-input')?.data;
+      expect(source).toMatchObject({ kind: 'unwired', previousEvidence: expect.stringContaining('대상 경로: src/grounding-target.ts') });
+      expect(move).toMatchObject({ runId: source?.runId, evidenceId: source?.evidenceId, action: 'connect-goal' });
+      expect(implementationCalls).toBe(1);
+      expect(followUpDrafts).toContainEqual(expect.objectContaining({
+        runId: source?.runId, cellId: 'grounding-target-cell', stage: 'review-blocked', kind: 'draft',
+        remainings: expect.arrayContaining([expect.stringContaining(source?.evidenceId as string)]),
+      }));
+      const ledger = readFileSync(runLedgerPath(source!.runId as string, isolatedStateDir), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line) as { event: string; runId: string; data: Record<string, unknown> });
+      expect(ledger.find((row) => row.event === 'repair-next-move-input')).toMatchObject({
+        runId: source?.runId, data: { evidenceId: source?.evidenceId, previousEvidence: source?.previousEvidence,
+          action: 'connect-goal' },
+      });
+    } finally { (debug as { log: typeof debug.log }).log = originalLog; rmSync(root, { recursive: true, force: true }); }
+  });
+  test('declared unwired export blocks a goal whose evidence slots are already filled', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'report-deficit-filled-unwired-'));
+    const repo = join(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      return result.stdout.trim();
+    };
+    git('init');
+    git('-c', 'user.name=OPC Test', '-c', 'user.email=opc-test@example.invalid', 'commit', '--allow-empty', '-m', 'baseline');
+    const base = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', base);
+    const goalFile = join(root, 'GOAL.txt');
+    const goal = '- GoalId: grounding-target-cell\nOriginal ask (verbatim, unmodified):\n```\n대상 경로: src/grounding-target.ts\n```\n\n## 불변식\n- Every declared runtime export has a production caller.\n\n## 판정 신호\n- A production importer calls the declared export.\n';
+    writeFileSync(goalFile, goal);
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.writeRunLedger = (entry) => appendRunLedgerEntry(entry, isolatedStateDir);
+    s.gate = async () => ({ passed: true, log: '[test] PASS bun test goal — 1 pass | 0 fail\n[gate-baseline] introduced=0, preexisting=0, unknown=0, precondition-unmet=0' });
+    s.createWorktree = async () => ({ path: repo, branch: 'self-impl/filled-unwired', resolvedBase: base, invokedHead: base });
+    s.implement = async () => {
+      mkdirSync(join(repo, 'src'), { recursive: true });
+      writeFileSync(join(repo, 'src/grounding-target.ts'), 'export const groundingTarget = true;\n');
+      return { ok: true, summary: 'implementation complete' };
+    };
+    s.changedFilesForGateRoute = () => ['src/grounding-target.ts'];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category.includes('self-implement')) events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({ feature: 'unwired target with authored evidence', goalFile, maxReworkRounds: 0, seams: s });
+      expect(result).toMatchObject({ ok: false, stage: 'review-blocked', node: 'rework' });
+      const source = events.find(({ event }) => event === 'supervisor-report-deficit')?.data;
+      const move = events.find(({ event }) => event === 'repair-next-move-input')?.data;
+      expect(events.find(({ event }) => event === 'measured')?.data).toMatchObject({ checked: 1, unwired: 1 });
+      expect(source).toMatchObject({ kind: 'unwired', previousEvidence: goal });
+      expect(move).toMatchObject({ runId: source?.runId, evidenceId: source?.evidenceId, action: 'connect-goal' });
+      expect(events.find(({ event }) => event === 'goal-slot-fill')?.data).toMatchObject({ result: 'unverifiable' });
+    } finally { (debug as { log: typeof debug.log }).log = originalLog; rmSync(root, { recursive: true, force: true }); }
+  });
+  test('unrelated unwired export is not a declared-goal wiring deficit', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'report-deficit-unrelated-'));
+    const goalFile = join(root, 'GOAL.txt');
+    writeFileSync(goalFile, 'Original ask (verbatim, unmodified):\n```\n대상 경로: src/declared-target.ts\n```\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n');
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.gate = async () => ({ passed: true, log: '[test] PASS bun test goal — 1 pass | 0 fail\n[gate-baseline] introduced=0, preexisting=0, unknown=0, precondition-unmet=0' });
+    s.changedFilesForGateRoute = () => ['src/unrelated.ts'];
+    s.checkUnwiredExports = () => ({ checked: 1, unwired: [{ file: 'src/unrelated.ts', name: 'unrelated', reason: 'no-production-importer' }] });
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category.includes('self-implement')) events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      await runSelfImplement({ feature: 'unrelated export', goalFile, maxReworkRounds: 0, seams: s });
+      const source = events.find(({ event }) => event === 'supervisor-report-deficit')?.data;
+      expect(source).toMatchObject({ kind: 'unverified', previousEvidence: expect.stringContaining('src/declared-target.ts') });
+      expect(events.filter(({ event }) => event === 'repair-next-move-input')).toHaveLength(0);
+    } finally { (debug as { log: typeof debug.log }).log = originalLog; rmSync(root, { recursive: true, force: true }); }
+  });
+  test('persistently unmeasured gate cannot turn green after one same-run remeasurement', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'report-deficit-still-unmeasured-'));
+    const goalFile = join(root, 'GOAL.txt');
+    writeFileSync(goalFile, 'Goal\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n');
+    let gateCalls = 0;
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    const unmeasuredLog = '[test] PASS bun test goal — 1 pass';
+    s.gate = async () => { gateCalls++; return { passed: true, log: unmeasuredLog }; };
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category.includes('self-implement')) events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({ feature: 'still unmeasured', goalFile, maxReworkRounds: 0, seams: s });
+      expect(gateCalls).toBe(2);
+      expect(result.ok).toBe(false);
+      expect(events.find(({ event }) => event === 'goal-slot-remeasure-result')?.data).toMatchObject({
+        result: 'unverifiable', gatePassed: true, deficitKind: 'unmeasured', gateLog: unmeasuredLog,
+        reason: 'gate-evidence-unverified', inputSummary: { gatePassed: true, hasGateLog: true }, gateLogRef: expect.stringMatching(/^sha256:/),
+      });
+      expect(readFileSync(goalFile, 'utf8')).toContain('- UNVERIFIABLE');
+    } finally { (debug as { log: typeof debug.log }).log = originalLog; rmSync(root, { recursive: true, force: true }); }
+  });
+  test('remeasured gate with rejected independent evidence cannot turn green', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'report-deficit-rejected-remeasure-'));
+    const goalFile = join(root, 'GOAL.txt');
+    writeFileSync(goalFile, 'Goal\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n');
+    let gateCalls = 0;
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.independentlyCheckGoalSlots = async () => false;
+    s.gate = async () => ({ passed: true, log: ++gateCalls === 1
+      ? '[test] PASS bun test goal — 1 pass'
+      : '[test] PASS bun test goal — 1 pass | 0 fail\n[gate-baseline] introduced=0, preexisting=0, unknown=0, precondition-unmet=0' });
+    try {
+      const result = await runSelfImplement({ feature: 'rejected evidence', goalFile, maxReworkRounds: 0, seams: s });
+      expect(gateCalls).toBe(2);
+      expect(result.ok).toBe(false);
+      expect(readFileSync(goalFile, 'utf8')).toContain('- UNVERIFIABLE');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test('a failed same-run remeasurement never replaces a red gate with green', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'report-deficit-failed-remeasure-'));
+    const goalFile = join(root, 'GOAL.txt');
+    writeFileSync(goalFile, 'Goal\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n');
+    let gateCalls = 0;
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.gate = async () => ++gateCalls === 1
+      ? { passed: true, log: '[test] PASS bun test goal — 1 pass' }
+      : { passed: false, log: '[test] FAIL bun test goal — 1 pass | 1 fail' };
+    try {
+      const result = await runSelfImplement({ feature: 'remeasure fails', goalFile, maxReworkRounds: 0, seams: s });
+      expect(gateCalls).toBe(2);
+      expect(result.gate?.passed).toBe(false);
+      expect(result.ok).toBe(false);
+      expect(readFileSync(goalFile, 'utf8')).toContain('- UNVERIFIABLE');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test('production orchestration passes gate, review, and round context to the independent goal-slot checker', async () => {
     const root = mkdtempSync(join(tmpdir(), 'supervisor-goal-wiring-'));
     const goalFile = join(root, 'GOAL.txt');
@@ -7573,6 +8019,62 @@ function revSeams(opts: {
 let openPrCalls: { head: string; draft?: boolean }[] = [];
 
 describe('runSelfImplement — rework-budget repeated blocking findings', () => {
+  test('REVIEW-ROUND-TRIAGE policy separates pass, remaining rework, and exhausted follow-up', () => {
+    expect(decideReviewRound({ verdict: 'pass', mustFix: [], round: 0, effectiveMax: 0 })).toBe('pass');
+    expect(decideReviewRound({ verdict: 'fail', mustFix: [], round: 0, effectiveMax: 0 })).toBe('pass');
+    expect(decideReviewRound({ verdict: 'fail', mustFix: ['finding'], round: 0, effectiveMax: 1 })).toBe('rework');
+    expect(decideReviewRound({ verdict: 'fail', mustFix: ['finding'], round: 1, effectiveMax: 1 })).toBe('follow-up');
+  });
+
+  test('REVIEW-ROUND-TRIAGE run ledger records raw findings, reflection result, and the observed transition', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'review-round-triage-ledger-'));
+    try {
+      const run = async (runId: string, reviews: Rev[], maxReworkRounds: number, extend = false) => {
+        const implementedRounds: number[] = [];
+        const s = revSeams({ reviews });
+        s.implement = async () => { implementedRounds.push(implementedRounds.length); return { ok: true, summary: 'impl' }; };
+        s.writeRunLedger = (entry) => appendRunLedgerEntry(entry, directory);
+        if (extend) s.diagnose = async ({ purpose }) => purpose === 'escalation-triage'
+          ? 'TRIAGE: continue'
+          : 'BUDGET: EXTEND\nREASON: one more attempt';
+        const result = await runSelfImplement({ runId, feature: 'REVIEW-ROUND-TRIAGE ledger', autoMerge: true, maxReworkRounds, seams: s });
+        const records = readFileSync(runLedgerPath(runId, directory), 'utf8').trim().split('\n')
+          .map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+        return { result, implementedRounds, decisions: records.filter((entry) => entry.event === 'review-round-triage').map((entry) => entry.data) };
+      };
+
+      const rework = await run('review-round-triage-rework', [
+        { verdict: 'fail', mustFix: ['raw blocker'] },
+        { verdict: 'pass', mustFix: [] },
+      ], 1);
+      expect(rework.implementedRounds).toEqual([0, 1]);
+      expect(rework.decisions).toEqual([
+        expect.objectContaining({ round: 0, rawMustFix: ['raw blocker'], reflectedMustFix: ['raw blocker'], decision: 'rework', nextNode: 'rework' }),
+        expect.objectContaining({ round: 1, rawMustFix: [], decision: 'pass', nextNode: 'open-pr' }),
+      ]);
+
+      const followUp = await run('review-round-triage-follow-up', [
+        { verdict: 'fail', mustFix: ['raw blocker'] },
+        { verdict: 'fail', mustFix: ['raw blocker'] },
+      ], 1);
+      expect(followUp.result).toMatchObject({ stage: 'pr-opened', mergeReason: 'review-budget-follow-up-required' });
+      expect(followUp.implementedRounds).toEqual([0, 1]);
+      expect(followUp.decisions.at(-1)).toMatchObject({ round: 1, rawMustFix: ['raw blocker'], decision: 'follow-up', nextNode: 'open-pr' });
+
+      const extended = await run('review-round-triage-extension', [
+        { verdict: 'fail', mustFix: ['raw blocker'] },
+        { verdict: 'pass', mustFix: [] },
+      ], 0, true);
+      expect(extended.implementedRounds).toEqual([0, 1]);
+      expect(extended.decisions).toEqual([
+        expect.objectContaining({ round: 0, decision: 'rework', nextNode: 'rework', effectiveMax: 1 }),
+        expect.objectContaining({ round: 1, decision: 'pass', nextNode: 'open-pr' }),
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   test('keeps absent or legacy blocking IDs unknown instead of flattening them to an empty overlap', () => {
     const finding = { id: stableMustFixId('blocker'), item: 'blocker' };
     expect(repeatedBlockingFindingIds([finding], undefined)).toBeUndefined();
@@ -7951,7 +8453,9 @@ describe('runSelfImplement — lineage supersede after auto-merge', () => {
     const closes: Array<{ number: number; comment: string }> = [];
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
     const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }], merged: true });
-    s.openPr = async ({ head }) => ({ url: `https://pr/${head}`, number: 300 });
+    let openedHead = '';
+    s.openPr = async ({ head }) => { openedHead = head; return { url: `https://pr/${head}`, number: 300 }; };
+    s.readPrAttribution = async () => ({ headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString() });
     const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
     s.writeRunLedger = (entry) => { ledger.push({ event: entry.event, data: entry.data }); };
     s.lineageSupersede = {
@@ -14258,17 +14762,22 @@ describe('runSelfImplement — all non-convergence preservation exits', () => {
       events.push({ event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
     try {
-      const capture = (s: SelfImplementSeams): SelfImplementSeams => ({
+      const capture = (s: SelfImplementSeams): SelfImplementSeams => {
+        let openedHead = '';
+        return {
         ...s,
         persistPrBodyArtifact: (input) => {
           persisted.push(input);
           return { path: '/tmp/full-pr-body.md' };
         },
-        openPr: async ({ body, draft }) => {
+        openPr: async ({ body, draft, head }) => {
+          openedHead = head;
           opened.push({ body, draft });
           return { url: 'https://pr/bounded', number: opened.length };
         },
-      });
+        readPrAttribution: async () => ({ headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString() }),
+      };
+      };
       await runSelfImplement({
         feature: 'blocked body',
         maxReworkRounds: 0,

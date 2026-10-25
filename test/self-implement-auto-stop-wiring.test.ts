@@ -220,11 +220,13 @@ describe('S4 P3 자동 종료 — seams→config→driver 전달 경로', () => 
 // 어떻게 확인하나: 아래 seam-only 호출은 worktree·branch 제거 순서, 모든 보존 사유와 실패 관측을 검증한다.
 // 이 착지가 다루지 않는 것: 과거 worktree 소급 정리, terminal 외 사용 신호, 병렬 실행기 knob, worktree 유래 기록.
 function cleanupSeams(over: Partial<SelfImplementSeams['postMergeCleanup']> = {}): SelfImplementSeams {
+  let openedHead = '';
   return {
     createWorktree: async ({ branch }) => ({ path: `/safe/${branch}`, branch }),
     implement: async () => ({ ok: true, summary: 'done' }),
     gate: async () => ({ passed: true, log: 'ok' }),
-    openPr: async () => ({ url: 'https://example.test/pr/1', number: 1 }),
+    openPr: async ({ head }) => { openedHead = head; return { url: 'https://example.test/pr/1', number: 1 }; },
+    readPrAttribution: async () => ({ headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString() }),
     approvePr: async () => true,
     reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'clean', reviewed: true, diffTruncated: false, diffShownChars: 1, diffTotalChars: 1, diffOmittedFiles: 0 }),
     readPrCommitShas: async () => ({ baseCommit: 'base', headCommit: 'head' }),

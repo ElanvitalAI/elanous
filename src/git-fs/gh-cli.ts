@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
+import { writeCliStderr } from './cli-stderr.js';
 
 const LF = 0x0a;
 const MAX_GH_RETRY_ATTEMPTS = 3;
@@ -195,14 +196,16 @@ export function runGhCli(args: string[]): void {
   const auxiliaryFailure = exitCode === 0 ? undefined : auxiliaryFailureSignature(stderr);
 
   if (stdout.length) process.stdout.write(stdout);
-  if (stderr.length) process.stderr.write(stderr);
+  const stderrChunks: Buffer[] = [];
+  if (stderr.length) stderrChunks.push(stderr);
   // ⛔⭐⭐⭐⭐⭐ **상태 줄은 `stderr` 로** — `git-cli.ts` 의 같은 주석이 canonical.
   //   `--json` 산출 뒤에 비-JSON 한 줄이 붙으면 ***모든 JSON 소비자가 죽는다***(`jq: parse error` 실측).
   //   stdout 은 ***원 바이트 그대로만*** 나간다.
   const endsWithoutLf = (buffer: Buffer): boolean => buffer.length > 0 && buffer[buffer.length - 1] !== LF;
-  if (endsWithoutLf(stderr)) process.stderr.write('\n');
+  if (endsWithoutLf(stderr)) stderrChunks.push(Buffer.from('\n'));
 
-  process.stderr.write(`${statusLine(label, result, auxiliaryFailure)}\n`);
+  stderrChunks.push(Buffer.from(`${statusLine(label, result, auxiliaryFailure)}\n`));
+  writeCliStderr({ source: 'gh', exitCode, raw: Buffer.concat(stderrChunks) });
   process.exitCode = exitCode;
   if (auxiliaryFailure) {
     debug.log('gh.cli', 'partial-outcome', {

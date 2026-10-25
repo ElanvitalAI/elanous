@@ -28,6 +28,28 @@ function findGraphFile(graphId: string): string | undefined {
 
 export function registerGraphCommands(program: Command, runsDeps: { root?: string; processStartMs?: (pid: number) => number | null } = {}): void {
   const graph = program.command('graph').description('Run a declared command graph or inspect its latest run');
+  graph.command('adapt-report')
+    .description('Measure recorded graph path diversity, unit calls, adaptations and landings for one goal')
+    .requiredOption('--goal <id>', 'Goal ID to measure')
+    .option('--json', 'Print measurement as JSON')
+    .action(async (opts: { goal: string; json?: boolean }) => {
+      try {
+        const { queryGraphAdaptReport } = await import('../self-implement/run-ledger.js');
+        const report = queryGraphAdaptReport(opts.goal);
+        if (opts.json) await writeStdoutJson(JSON.stringify(report) + '\n');
+        else if (report.runCount === 0) console.log(`graph adapt-report: ${opts.goal} · 표본 0 · 제외 ${report.excludedCount} ${JSON.stringify(report.exclusionReasons)}`);
+        else {
+          const landing = (group: typeof report.adapted) => group.denominator
+            ? `${group.landed}/${group.denominator} (${(group.rate! * 100).toFixed(1)}%)` : '표본 0';
+          console.log(`graph adapt-report: ${opts.goal} · 경로 ${report.uniquePathSignatures} · 유닛 호출 ${report.unitCallCount} · 적응 ${report.adaptationCount}`);
+          console.log(`적응 착지율 ${landing(report.adapted)} · 비적응 착지율 ${landing(report.nonAdapted)}`);
+          console.log(`제외 ${report.excludedCount} ${JSON.stringify(report.exclusionReasons)}`);
+        }
+      } catch (error) {
+        console.error(`graph adapt-report: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
   graph.command('wizard-run <request>')
     .description('Run one request through the smart wizard graph and stop at its approval gate')
     .option('--json', 'Print run identity and transitions as JSON')
@@ -405,12 +427,14 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
         const state = matches[0]!;
         const detail = { ...row(state), nodes: state.nodes.map((node) => {
           const summary = lastJsonObject(node.output)?.summary;
-          return { nodeId: node.nodeId, ok: node.ok, summary: typeof summary === 'string' ? summary.slice(0, 300) : null };
+          return { nodeId: node.nodeId, ok: node.ok, exit: node.exit,
+            ...(node.reason === undefined ? {} : { reason: node.reason }),
+            summary: typeof summary === 'string' ? summary.slice(0, 300) : null };
         }), pending: state.pending ?? null, resume: state.resume ?? null };
         if (opts.json) await writeStdoutJson(JSON.stringify(detail) + '\n');
         else {
           console.log(`${detail.runId} · ${detail.graphId} · ${detail.status} · alive=${detail.alive}`);
-          for (const node of detail.nodes) console.log(`  ${node.nodeId} · ok=${node.ok} · ${node.summary ?? '-'}`);
+          for (const node of detail.nodes) console.log(`  ${node.nodeId} · ok=${node.ok} · exit=${node.exit ?? '-'} · ${node.reason ?? node.summary ?? '-'}`);
           console.log(`pending: ${JSON.stringify(detail.pending)}`);
           console.log(`resume: ${JSON.stringify(detail.resume)}`);
         }

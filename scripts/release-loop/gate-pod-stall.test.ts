@@ -16,6 +16,7 @@ import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { gateUnmeasuredDetail, releaseResumeWaiver } from './resume.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { resumeReleaseRun } from './resume-release.js';
+import './resume-test-traffic.js';
 
 const CUT = 'c'.repeat(40);
 const CHECKOUT = `Cloning into 'repo'...\nELANOUS_POD_SOURCE_VIA mirror\nELANOUS_POD_SOURCE commit ${CUT}\n`;

@@ -103,6 +103,8 @@ export interface CoreTurnCallbacks {
    *  persist this into their history store so the next user turn
    *  sees real tool evidence rather than a string summary. */
   onTurnComplete?(newMessages: LLMMessage[]): void;
+  /** A goal iteration has finished but the goal remains open. Display-only signal; never replaces the turn history. */
+  onGoalInterim?(text: string, iteration: number): void;
   /** Codex Responses API reasoning summary stream (gpt-5 family).
    *  `summary_part_added` marks a paragraph break between successive
    *  parts; `summary_delta` carries the streamed text. Only fires when

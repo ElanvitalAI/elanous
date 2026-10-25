@@ -3,7 +3,7 @@
 // Auto-routes based on model name prefix, or picks the first available provider.
 
 import { wellFormedLLMMessages } from './llm-wellformed.js';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -61,6 +61,8 @@ import { resolveModelAlias } from './intelligence-map/model-alias.js';
 import { BUILTIN_CATALOG, reasoningEffortCeiling as reasoningEffortCeilingOf } from './intelligence-map/model-catalog.js';
 import { inferProviderFromModel as registryInferProviderFromModel } from './registry/normalize.js';
 import { closestMatches } from './tool-name-suggest.js';
+import { createProviderToolNameMap } from './llm-tool-name.js';
+import { isOpenRouterGrokModel, sanitizeToolSchemaForGrok } from './llm-tool-schema.js';
 import { undoTurnRuntime } from './tool-runtime/undo-turn-runtime.js';
 import { listSnapshots } from './undo-turn/index.js';
 // Zero-dep spec module (no tool-runtime registry) — safe for this hot path.
@@ -276,6 +278,61 @@ export interface LLMToolSpec {
   parameters: Record<string, unknown>;   // JSONSchema
 }
 
+function toolUseNames(messages: readonly LLMMessage[]): string[] {
+  return messages.flatMap((message) => Array.isArray(message.content)
+    ? message.content.flatMap((block) => block.type === 'tool_use' ? [block.name] : [])
+    : []);
+}
+
+function mapProviderToolNamesInMessages(
+  messages: readonly LLMMessage[],
+  mapName: (name: string) => string,
+): LLMMessage[] {
+  return messages.map((message) => {
+    if (!Array.isArray(message.content)) return message;
+    let changed = false;
+    const content = message.content.map((block) => {
+      if (block.type !== 'tool_use') return block;
+      const name = mapName(block.name);
+      if (name === block.name) return block;
+      changed = true;
+      return { ...block, name };
+    });
+    return changed ? { ...message, content } : message;
+  });
+}
+
+function restoreProviderToolCallNames(
+  events: AsyncIterable<LLMStreamEvent>,
+  mapName: (name: string) => string,
+): AsyncIterableIterator<LLMStreamEvent> {
+  // Forward cancellation directly to the provider iterator. An async
+  // generator wrapper waits for a pending `next()` before servicing
+  // `return()`, which can strand the idle watchdog on a hanging stream.
+  const iterator = events[Symbol.asyncIterator]();
+  const mapped: AsyncIterableIterator<LLMStreamEvent> = {
+    [Symbol.asyncIterator]() { return mapped; },
+    async next(value?: unknown) {
+      const result = await iterator.next(value);
+      if (result.done) return { done: true, value: result.value };
+      const event = result.value;
+      return {
+        done: false,
+        value: event.type === 'tool_call' ? { ...event, name: mapName(event.name) } : event,
+      };
+    },
+    async return(value?: void) {
+      if (iterator.return) return iterator.return(value);
+      return { done: true, value };
+    },
+    async throw(error?: unknown) {
+      if (iterator.throw) return iterator.throw(error);
+      throw error;
+    },
+  };
+  return mapped;
+}
+
 /** Events produced by a streaming provider call. Text deltas arrive
  *  incrementally; tool_call events are emitted as COMPLETE units once
  *  the provider finishes streaming the tool_use block — callers don't
@@ -359,6 +416,8 @@ export interface LLMOpts {
   usageRole?: ModelRole;
   /** Optional per-call metering phase; absent calls keep the existing ledger shape. */
   usagePhase?: string;
+  /** Optional per-call self-dev job kind; absent calls keep the existing ledger shape. */
+  usageJobKind?: string;
   /** Optional streamLLM usage-ledger site override (defaults to "stream-llm"). */
   usageSite?: string;
   /**
@@ -2556,7 +2615,7 @@ export function sanitizeToolSchemaForKimi(schema: unknown): unknown {
   ]));
 }
 
-export function toOpenAITools(tools: LLMToolSpec[] | undefined, kimi = false): any[] | undefined {
+export function toOpenAITools(tools: LLMToolSpec[] | undefined, kimi = false, grokTupleItems = false): any[] | undefined {
   const unique = dedupeToolsByName(tools);
   if (!unique || unique.length === 0) return undefined;
   return unique.map(t => ({
@@ -2565,7 +2624,9 @@ export function toOpenAITools(tools: LLMToolSpec[] | undefined, kimi = false): a
       name: t.name, description: t.description,
       parameters: kimi
         ? sanitizeToolSchemaForKimi(strictifyToolSchema(t.parameters))
-        : strictifyToolSchema(t.parameters),
+        : grokTupleItems
+          ? sanitizeToolSchemaForGrok(strictifyToolSchema(t.parameters))
+          : strictifyToolSchema(t.parameters),
     },
   }));
 }
@@ -4868,7 +4929,7 @@ export async function streamLLM(
     if (consumed.ok) {
       if (consumed.usage !== 'unmeasured') {
         try {
-          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase });
+          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind });
         } catch { /* best-effort observation */ }
       }
       debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'ok', kind: 'streamLLM', durationMs: Date.now() - started });
@@ -8104,17 +8165,19 @@ export function billingRouteForProvider(provider: string | undefined, model: str
 }
 
 /** Observe usage with optional site/role metadata; a provider-name string remains supported. */
-export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: ModelRole; phase?: string }): void {
+export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: ModelRole; phase?: string; jobKind?: string }): void {
   try {
     const providerName = typeof providerNameOrOptions === 'string' ? providerNameOrOptions : providerNameOrOptions?.providerName;
     const site = (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.site) ?? 'agent-turn';
     const role = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.role;
     const phase = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.phase;
+    const jobKind = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.jobKind;
     const billing = billingRouteForProvider(providerName, model);
     debug.log('llm.usage', 'llm-usage', {
       site,
       ...(role !== undefined ? { role } : {}),
       ...(phase !== undefined ? { phase } : {}),
+      ...(jobKind !== undefined ? { jobKind } : {}),
       model,
       ...(usage.provider !== undefined && { provider: usage.provider }),
       // ⭐ `provider` 는 «선 어댑터»(openai/anthropic)다 — 과금 주체는 별칭 칸으로(BACKLOG B10).
@@ -8241,6 +8304,10 @@ function applyCodexBehaviorGuard(
   return enabled;
 }
 
+function orchestrationId(): string {
+  return randomUUID();
+}
+
 export async function streamLLMWithTools(
   messages: LLMMessage[],
   handlers: StreamWithToolsHandlers,
@@ -8261,10 +8328,13 @@ export async function streamLLMWithTools(
   let blockedProviders: ProviderFallbackAttempt[] = [];
   const effectiveModel = activeModel;
   const modelFamily = getModelFamily(effectiveModel);
+  const orchestration = orchestrationId();
+  const followupHardStopStats = { wouldBlock: 0, blocked: 0 };
   // Preserve pre-existing GPT-6 behavior while observing Codex-only sites.
   const codexBehaviorGuards = usesCodexBehaviorGuards(effectiveModel);
   const codexGuardCandidate = codexBehaviorGuards || isGpt6GenerationModel(effectiveModel);
   debug.log('llm.router', 'streamLLMWithTools', {
+    orchestrationId: orchestration,
     provider: provider.name,
     model: effectiveModel,
     modelFamily,
@@ -8821,7 +8891,28 @@ export async function streamLLMWithTools(
             debug.log('llm.request', 'lone-surrogate-fixed', { site: 'tool-loop', provider: activeProvider.name, messages: wf.fixedMessages, strings: wf.fixedStrings }, { level: 'warn' });
             history.splice(0, history.length, ...wf.messages);
           }
-          streamIter = activeProvider.streamChat!(history, turnOpts)[Symbol.asyncIterator]();
+          // Provider function names have a narrower wire alphabet than MCP
+          // names. Keep catalog/history names canonical inside the tool loop,
+          // and translate only this request plus the corresponding response.
+          const nameMap = createProviderToolNameMap([
+            ...(turnOpts.tools ?? []).map((tool) => tool.name),
+            ...toolUseNames(history),
+            ...(turnOpts.toolChoice && typeof turnOpts.toolChoice === 'object'
+              ? [turnOpts.toolChoice.name]
+              : []),
+          ]);
+          const providerOpts: LLMOpts = {
+            ...turnOpts,
+            tools: turnOpts.tools?.map((tool) => ({ ...tool, name: nameMap.toProviderName(tool.name) })),
+            toolChoice: turnOpts.toolChoice && typeof turnOpts.toolChoice === 'object'
+              ? { name: nameMap.toProviderName(turnOpts.toolChoice.name) }
+              : turnOpts.toolChoice,
+          };
+          const providerMessages = mapProviderToolNamesInMessages(history, nameMap.toProviderName);
+          streamIter = restoreProviderToolCallNames(
+            activeProvider.streamChat!(providerMessages, providerOpts),
+            nameMap.toOriginalName,
+          )[Symbol.asyncIterator]();
         }
         step = await Promise.race([
           streamIter.next().then((r) => ({ idle: false as const, r })),
@@ -8998,7 +9089,7 @@ export async function streamLLMWithTools(
         // ⭐ 주 에이전트 턴의 토큰·비용을 «게이트 없이» 남긴다(2026-09-24 실측: 이 줄이 없어 3시간 `llm.usage`
         //   18행이 전부 곁가지 두 자리였고, 하니스 런 비용의 거의 전부가 관측 밖이었다). 곁가지와 같은 모양 ·
         //   모르는 모델은 금액 대신 `cost.kind='unknown'`. runId 는 debug.log 가 붙인다. 실패해도 턴은 계속.
-        logAgentTurnUsage(activeModel, ev.usage, { providerName: activeProvider.name, role: opts.usageRole, phase: opts.usagePhase });
+        logAgentTurnUsage(activeModel, ev.usage, { providerName: activeProvider.name, role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind });
         // Wave A1 (2026-05-04) — turn-level cache hit rate forensic.
         // Each provider's usage event carries inputTokens / outputTokens
         // / cacheReadInputTokens (when cache hit). Emit the per-turn
@@ -9388,13 +9479,23 @@ export async function streamLLMWithTools(
       // done, just write the answer" UX which we must not preempt.
       const codexImmediateInspectActionStop = followupInspectActionHeld && followupHardStopEnabled;
       if (followupHardStopHeld) {
-        noteGpt6CodexGuard('followup-hard-stop', effectiveModel,
-          (codexImmediateInspectStop && codexInspectSynthesisGrace <= 0)
+        const followupHardStopBlocked = (codexImmediateInspectStop && codexInspectSynthesisGrace <= 0)
           || (codexImmediateRepairStop && codexRepairActionGrace <= 0)
-          || (codexImmediateInspectActionStop && codexInspectActionGrace <= 0));
+          || (codexImmediateInspectActionStop && codexInspectActionGrace <= 0);
+        noteGpt6CodexGuard('followup-hard-stop', effectiveModel, followupHardStopBlocked);
+        if (isGpt6GenerationModel(effectiveModel)) {
+          followupHardStopStats.wouldBlock++;
+          if (followupHardStopBlocked) followupHardStopStats.blocked++;
+          debug.log('llm.router', 'tool-loop.followup-hard-stop.guard-observed', {
+            orchestrationId: orchestration,
+            guard: 'followup-hard-stop',
+            ...followupHardStopStats,
+          });
+        }
       }
       if (codexImmediateInspectStop && codexInspectSynthesisGrace <= 0) {
         debug.log('llm.router', 'tool-loop.inspect-synthesis-phase.codex-immediate-stop', {
+          orchestrationId: orchestration,
           turn,
           maxTurns,
           autoNarrowedReadCount,
@@ -11399,7 +11500,12 @@ function makeOpenAICompatProvider(
         throw new Error(`${name} unavailable: configure apiKey via \`elanous setup\``);
       }
       const activeModel = opts.model || model;
-      const tools = toOpenAITools(opts.tools, name === 'openrouter' && openRouterNeedsKimiToolSchema(openRouterWireModel(activeModel)));
+      const wireModel = name === 'openrouter' ? openRouterWireModel(activeModel) : activeModel;
+      const tools = toOpenAITools(
+        opts.tools,
+        name === 'openrouter' && openRouterNeedsKimiToolSchema(wireModel),
+        name === 'openrouter' && isOpenRouterGrokModel(wireModel),
+      );
       const deepSeek = name === 'openrouter' && isOpenRouterDeepSeekWireModel(openRouterWireModel(activeModel));
       // OR-TOOLCHOICE-PASS (2026-10-10) — OpenRouter 경로만 호출자 toolChoice 를 싣는다.
       //   ⛔ grok/openai 호환 경로는 손대지 않는다(무회귀). toolChoice 가 없거나 tools 가 없으면 키 자체를 안 싣는다.
@@ -12025,6 +12131,12 @@ const OPENROUTER_ROUTE_FOR_WIP_PROVIDER = {
   qwen: 'openrouter/qwen/qwen3.8-max-0902',
   glm: 'openrouter/z-ai/glm-5.3',
 } as const;
+
+/** Resolve a review model shortcut before either provider inference or the wire call. */
+export function resolveReviewModelAlias(model: string): string {
+  const resolved = resolveModelAlias(model.trim())!;
+  return OPENROUTER_ROUTE_FOR_WIP_PROVIDER[resolved.toLowerCase() as keyof typeof OPENROUTER_ROUTE_FOR_WIP_PROVIDER] ?? resolved;
+}
 
 /** Top-level resolver. Honors user-config first; falls through to
  *  env-var / auto-detect when provider is 'auto'. */

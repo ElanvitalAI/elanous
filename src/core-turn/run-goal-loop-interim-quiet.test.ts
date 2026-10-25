@@ -4,7 +4,7 @@
  * ⛔ mock.module 없음 — runTurn 주입 seam 과 debug.log 교체만 쓴다.
  */
 import { describe, expect, test } from 'bun:test';
-import type { CoreTurnContext, CoreTurnResult } from './types.js';
+import type { CoreTurnCallbacks, CoreTurnContext, CoreTurnResult } from './types.js';
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { DELEGATE_HINT } from '../agent/delegate-hint.js';
@@ -26,6 +26,7 @@ async function drive(texts: readonly string[], maxIterations: number) {
   const events: Array<{ event: string; data: Record<string, unknown> }> = [];
   const userMessages: unknown[] = [];
   const turnMessages: LLMMessage[][] = [];
+  const interimSignals: Array<[string, number]> = [];
   let calls = 0;
   const originalLog = debug.log;
   debug.log = ((category: string, event: string, data: Record<string, unknown>) => {
@@ -38,6 +39,7 @@ async function drive(texts: readonly string[], maxIterations: number) {
       tools: [],
       dispatchTool: async () => null,
       signal: new AbortController().signal,
+      callbacks: { onGoalInterim: (text, iteration) => { interimSignals.push([text, iteration]); } } satisfies CoreTurnCallbacks,
     } as CoreTurnContext;
     const result = await runGoalLoop(ctx, {
       maxIterations,
@@ -51,7 +53,7 @@ async function drive(texts: readonly string[], maxIterations: number) {
         return { stopReason: 'end_turn', finalText: texts[Math.min(i, texts.length - 1)]! } satisfies CoreTurnResult;
       },
     });
-    return { result, events, userMessages, turnMessages, calls };
+    return { result, events, userMessages, turnMessages, interimSignals, calls };
   } finally {
     debug.log = originalLog;
   }
@@ -83,6 +85,15 @@ describe('TUI-GOAL-INTERIM-QUIET', () => {
     // r2 must-fix: 셋째(마지막) 반복 뒤엔 다음 반복이 없다 — 재주입도 관측도 없다.
     expect(r.calls).toBe(3);
     expect(interim).toEqual([[true, false], [false, true]]);
+  });
+
+  test('반복 경계: n8n형 복수 미완 답을 각 반복의 공용 접기 판정에 넘기고 마지막 답은 남긴다', async () => {
+    const replies = ['1단계 렌더했습니다.\n아직 못 했습니다.', '2단계 렌더했습니다.\n아직 못 했습니다.', '최종 영상: /tmp/final.mp4'];
+    const r = await drive(replies, 3);
+    expect(r.events.filter((e) => e.event === 'interim-reply').map((e) => e.data.reportShaped)).toEqual([true, true]);
+    expect(r.interimSignals).toEqual([[replies[0]!, 1], [replies[1]!, 2]]);
+    expect(r.result.finalText).toBe(replies[2]);
+    expect(r.interimSignals.some(([text]) => text === replies[2])).toBe(false);
   });
 
   test('r2 반례: 상한에 닿은 뒤엔 소비되지 않을 재주입 메시지를 쌓지 않는다', async () => {

@@ -105,3 +105,51 @@ export function planFixedGateTestShards(files: readonly string[], shardCount: nu
   }
   return groups.map((group, index) => ({ id: `shard-${index + 1}`, files: group, plannedRssMb: 0, plannedSeconds: 0 }));
 }
+
+/** GATE-REMOTE-SHARD-PLAN — one remote shard carrying its orchestration identity; introducedFiles are this shard's own
+ *  files, so introduced attribution stays file-level (a shard never inherits another shard's introduced files). */
+export interface GateRemoteShard {
+  orchestrationId: string;
+  shardId: string;
+  totalShards: number;
+  position: number;
+  files: string[];
+  introducedFiles: string[];
+}
+
+/** Deterministic orchestration id for a changed-file list: same files in any order produce the same id, so re-plans stay joinable. */
+export function shardPlanOrchestrationId(files: readonly string[]): string {
+  const sorted = [...new Set(files)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  let hash = 0x811c9dc5;
+  for (const file of sorted) {
+    for (let index = 0; index < file.length; index += 1) {
+      hash ^= file.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+  }
+  return `gate-${sorted.length}-${hash.toString(16).padStart(8, '0')}`;
+}
+
+/** Split a changed-file list (e.g. 183 files) into identity-carrying shards; every file is introduced by its own shard.
+ *  Contiguous slices keep each shard's files in input order, so concatenating shards reproduces the input list. */
+export function planGateRemoteShards(files: readonly string[], shardCount: number, orchestrationId: string): GateRemoteShard[] {
+  if (!Number.isSafeInteger(shardCount) || shardCount < 1) throw new Error('invalid shard count');
+  const sorted = [...new Set(files)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  if (!sorted.length) throw new Error('no files to shard');
+  if (shardCount > sorted.length) throw new Error(`shard count ${shardCount} exceeds file count ${sorted.length}`);
+  const base = Math.floor(sorted.length / shardCount);
+  const extra = sorted.length % shardCount;
+  return Array.from({ length: shardCount }, (_, index) => {
+    const start = index * base + Math.min(index, extra);
+    const size = base + (index < extra ? 1 : 0);
+    const shardFiles = sorted.slice(start, start + size);
+    return {
+      orchestrationId,
+      shardId: `${orchestrationId}/shard-${index + 1}`,
+      totalShards: shardCount,
+      position: index + 1,
+      files: shardFiles,
+      introducedFiles: [...shardFiles],
+    };
+  });
+}

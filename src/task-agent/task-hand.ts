@@ -32,10 +32,11 @@ import { parseWorkOrder, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type Work
 import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
 import { draftClaimComment, draftClaimRecordLive, draftClaimState, draftReleaseComment } from '../self-dev/draft-triage-rules.js';
-import { parseAskTargetPathHints, parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
+import { parseAskTargetPathHints, parseAskTargetPathHintsResult, type AskTargetPathHintsParseResult } from '../self-dev/launch-preflight-text.js';
 import { inspectGoalDoneBoundary, linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { selectKnowhowPack } from '../self-implement/knowhow-pack.js';
 import { INFLIGHT_REGISTRY_FILE, registerInflight } from '../pr-tool/inflight-registry.js';
-import { taskParentRoleEnv } from './task-parent-role-llm.js';
+import { taskParentRoleEnv, taskParentRolePinsForChild } from './task-parent-role-llm.js';
 import { runHarvestUnit, type ReviewInvocation } from './harvest-unit.js';
 import { TASK_CARD_PREFIX } from './task-card-prefix.js';
 
@@ -124,6 +125,43 @@ export function taskCardLabelContext(card: Pick<TaskCard, 'id'>): TaskCardLabelC
 export const COMPLETION_KINDS = ['code-pr', 'artifact', 'research-report', 'ops-action', 'content', 'watch-brief', 'decision-support', 'deliverable'] as const;
 export type CompletionKind = typeof COMPLETION_KINDS[number];
 
+/** «실행·조사» 손의 조합 — 종결 종류별 조합이 아직 없을 때 그 손이 기본으로 쓰는 판(조사 make-doc ⊕ 확인 verify). */
+export const RUN_RESEARCH_COMPOSITION = 'graphs/work/run-research.yaml';
+
+/** 기본 손 묶음 — «개발»(자식 구현 런·PR 착지 = 코드 하니스) 또는 «실행·조사»(비코드 종결 다섯 ⊕ 콘텐츠·전달). */
+export type DefaultHand = 'develop' | 'run-research';
+
+/**
+ * DEFAULT-HANDS — 종결 종류마다 과제 담당이 기본으로 쥐는 손과 그 «확인 증거»(RFC-loop-agent-map §A4c).
+ * 기본은 «개발»이 아니라 «실행·조사»다: 마케터·산업 현장·선생님·C 레벨이 자기 일을 그대로 맡긴다.
+ * 코드 하니스(`harness-say` 자식 구현 런 · PR 착지)는 개발자 팩(`code-pr`)만 쓴다.
+ */
+export interface DefaultHandSpec {
+  hand: DefaultHand;
+  /** 확인 증거 — 종류별 판정 규칙의 이름(정본 = `completion-evidence.ts` `checkCompletionEvidence`). */
+  evidence: string;
+  /** 종류별 조합 파일이 없을 때 그 손이 기본으로 쓰는 조합. */
+  composition: string;
+  /** 코드 하니스(자식 구현 런·PR 병합)를 쓰나 — 개발자 팩 전용. */
+  codeHarness: boolean;
+}
+
+export const DEFAULT_HANDS: Record<CompletionKind, DefaultHandSpec> = {
+  'code-pr': { hand: 'develop', evidence: '구현 — PR 병합', composition: 'graphs/work/code-pr.yaml', codeHarness: true },
+  'research-report': { hand: 'run-research', evidence: '조사 — 출처 인용 보고(출처 ⊕ 반대 근거)', composition: 'graphs/work/research-report.yaml', codeHarness: false },
+  artifact: { hand: 'run-research', evidence: '산출물 — 파일 ⊕ 미리보기', composition: RUN_RESEARCH_COMPOSITION, codeHarness: false },
+  content: { hand: 'run-research', evidence: '콘텐츠 — 파일 ⊕ 미리보기', composition: RUN_RESEARCH_COMPOSITION, codeHarness: false },
+  'ops-action': { hand: 'run-research', evidence: '실행 — 실행 기록 ⊕ 되읽기', composition: RUN_RESEARCH_COMPOSITION, codeHarness: false },
+  'watch-brief': { hand: 'run-research', evidence: '감시·브리핑 — 일정 ⊕ 도착', composition: RUN_RESEARCH_COMPOSITION, codeHarness: false },
+  'decision-support': { hand: 'run-research', evidence: '결정 지원 — 카드 ⊕ 기록', composition: RUN_RESEARCH_COMPOSITION, codeHarness: false },
+  deliverable: { hand: 'run-research', evidence: '전달 — 산출물 ⊕ 수신 확인', composition: RUN_RESEARCH_COMPOSITION, codeHarness: false },
+};
+
+/** 카드의 종결 종류가 기본으로 받는 손 — 비면 code-pr(=개발)다. */
+export function defaultHandOf(completion: CompletionKind | undefined): DefaultHand {
+  return DEFAULT_HANDS[completion ?? 'code-pr'].hand;
+}
+
 export interface TaskComposition {
   file: string;
   /** null = 파일은 있으나 파싱 실패로 판을 확인하지 못했다. */
@@ -143,13 +181,27 @@ export const COMPOSITION_ROOT = join(dirname(fileURLToPath(import.meta.url)), '.
 
 /** 1판은 조합을 고르고 단위 해석 결과를 기록한다. 단위 실행은 2판의 몫이다. */
 export function selectTaskComposition(completion: CompletionKind, root = COMPOSITION_ROOT): CompositionSelection {
-  const file = `graphs/work/${completion}.yaml`;
-  const path = join(root, file);
+  const requested = `graphs/work/${completion}.yaml`;
+  // DEFAULT-HANDS — 종류별 조합이 없으면 그 손의 기본 조합(«실행·조사»)으로 내려간다.
+  // 비개발 종결이 «조합 없음»으로 막히면 사람별 표본이 과제 담당에 닿지도 못한다.
+  let file = requested;
+  let path = join(root, file);
   let source: string;
   try { source = readFileSync(path, 'utf8'); } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { unitsResolved: false, missingUnits: [] };
-    return { composition: { file, version: null }, unitsResolved: false, missingUnits: [],
-      error: `조합 읽기 오류: ${file}: ${error instanceof Error ? error.message : String(error)}` };
+    const missing = (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+    if (!missing) {
+      return { composition: { file, version: null }, unitsResolved: false, missingUnits: [],
+        error: `조합 읽기 오류: ${file}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    const fallback = DEFAULT_HANDS[completion].composition;
+    if (fallback === requested) return { unitsResolved: false, missingUnits: [] };
+    file = fallback;
+    path = join(root, file);
+    try { source = readFileSync(path, 'utf8'); } catch (fallbackError) {
+      if ((fallbackError as NodeJS.ErrnoException)?.code === 'ENOENT') return { unitsResolved: false, missingUnits: [] };
+      return { composition: { file, version: null }, unitsResolved: false, missingUnits: [],
+        error: `조합 읽기 오류: ${file}: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}` };
+    }
   }
   const parsed = parseGraphTemplateYaml(source, path);
   if (!parsed.template || parsed.errors.length) {
@@ -763,6 +815,46 @@ export function readTaskCard(id: string, path = taskAgentStatePath()): TaskCard 
   return readState(path).tasks?.[id];
 }
 
+/** TA-REVIEW-PASS — runId 기준 단일 카드 멱등 생성 결과. `ok: false` 는 임의 생성 없이 사유만 남긴 보류(fail-closed)다. */
+export type IdempotentRunCardCreate =
+  | { ok: true; card: TaskCard; created: boolean }
+  | { ok: false; reason: string };
+
+/**
+ * TA-REVIEW-PASS — runId 기준 단일 카드 결속(멱등 생성). 단일 파일 잠금 안에서 원장을 읽어
+ * (a) 같은 runId 카드가 정확히 1건이면 그대로 재사용, (b) 0건이면 runId 해시로 재진입에 안정적인 id 를 만들어
+ * `card.runId` 를 검증된 부모 런 ID 와 정확히 일치시켜 원장에 추가한다(종전 칸·다른 카드·원장 기타 필드 보존),
+ * (c) 복수 카드·원격 Pod 자식 런·불명 runId·읽기 실패는 임의 생성하지 않고 사유를 남겨 보류한다.
+ */
+export function idempotentCreateCardForRun(path: string, input: { runId: string; text: string; now?: () => Date; env?: NodeJS.ProcessEnv }): IdempotentRunCardCreate {
+  const runId = input.runId.trim();
+  if (!runId) return { ok: false, reason: 'runId 불명 — 고유한 런 소유를 검증할 수 없어 카드를 만들지 않는다' };
+  const env = input.env ?? process.env;
+  if (env.ELANOUS_POD_NAME) return { ok: false, reason: `원격 Pod 자식 런(${env.ELANOUS_POD_NAME}) — HQ 결속만 허용한다` };
+  const at = (input.now ?? (() => new Date()))().toISOString();
+  return withFileLockSync(`${path}.lock`, (): IdempotentRunCardCreate => {
+    let disk: TaskAgentStateFile;
+    try {
+      disk = readState(path);
+    } catch (error) {
+      return { ok: false, reason: `원장 읽기 실패 — 임의 생성하지 않는다: ${error instanceof Error ? error.message : String(error)}` };
+    }
+    const tasks = { ...(disk.tasks ?? {}) };
+    const bound = Object.values(tasks).filter((candidate) => candidate.runId === runId);
+    if (bound.length === 1) return { ok: true, card: bound[0]!, created: false };
+    if (bound.length > 1) return { ok: false, reason: `runId ${runId} 카드 ${bound.length}건(모호) — 고유한 런 소유가 아니므로 결속하지 않는다` };
+    const id = `${TASK_CARD_PREFIX}run-${createHash('sha256').update(runId).digest('hex').slice(0, 12)}`;
+    if (tasks[id]) return { ok: false, reason: `카드 id ${id} 충돌 — 종전 카드를 덮어쓰지 않는다` };
+    const card: TaskCard = {
+      id, text: input.text, createdAt: at, status: 'launched', runId,
+      history: [{ at, event: 'card-created-for-run', detail: `카드 없는 runId(${runId})의 리뷰 필요 판정 — 단일 카드 멱등 결속`, runId }],
+    };
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ ...disk, tasks: { ...tasks, [id]: card } }));
+    return { ok: true, card, created: true };
+  });
+}
+
 function canonicalTargetPaths(paths: readonly string[]): string[] {
   return [...new Set(paths.filter((path): path is string => typeof path === 'string').map((path) => posix.normalize(path))
     .filter((path) => path !== '.' && path !== '..' && !posix.isAbsolute(path)
@@ -864,6 +956,7 @@ export function launchArgs(card: Pick<TaskCard, 'text' | 'seat' | 'childLlm' | '
     ? ['--child-llm-provider', card.childLlm.provider, '--child-llm-model', card.childLlm.model, ...(card.childLlm.effort ? ['--child-llm-effort', card.childLlm.effort] : [])]
     : [];
   const runPriority = runIdentityQueuePriority(card.identity);
+  // Exact role model pins travel in ELANOUS_ROLE_LLM_*: harness say's argv parser only accepts provider[/tier].
   return ['harness', 'say', ...(card.seat ? ['--seat', card.seat] : []), '--substrate', 'pod', '--merge-by-host', ...(runPriority !== undefined ? ['--run-priority', String(runPriority)] : []), ...child, card.text];
 }
 
@@ -1040,6 +1133,37 @@ function goalEvidenceCommandFormViolations(document: string): string[] {
   return violations;
 }
 
+/**
+ * FIRST-LINE-PATH-LIST-ONLY — 골 «첫 줄»의 형태 판정: `대상 경로:` 뒤의 «경로 조각» 에는 괄호·줄번호·덧말이 붙지 않는다.
+ * 첫 줄만 보는 판정은 `parseAskTargetPathHintsResult` 가 이미 하므로 새 파서를 만들지 않고 그 결과에 얹는다:
+ * 파서가 통과시킨 경로(`paths`)와 버린 조각(`rejected`)을 한 줄씩 보고, «경로 조각»(디렉터리 구분자·확장자가 있는 것)에
+ * 장식이 붙었을 때만 이유를 붙여 거부한다. `· 동작: a 고침` 같은 «산문 조각» 은 경로 조각이 아니다 —
+ * 조각 분해가 합성하는 손 문면(`handTaskWithTierSplit` 경로)이 그 모양으로 첫 줄을 만든다.
+ * 라벨이 없는 문면(첫 줄이 대상 경로 목록이 아닌 손)은 이 축의 몫이 아니다 — 그 모양은 지금과 같다.
+ */
+const FIRST_LINE_PATH_DECORATIONS: readonly { readonly label: string; readonly pattern: RegExp }[] = [
+  { label: '괄호 장식', pattern: /[()[\]{}（）【】]/ },
+  { label: '줄번호', pattern: /:\d/ },
+  { label: '덧말', pattern: /->|→|—|–/ },
+];
+
+function firstLinePathListViolations(hints: AskTargetPathHintsParseResult): string[] {
+  if (hints.labelMissing) return [];
+  const violations: string[] = [];
+  for (const piece of [...hints.paths, ...hints.rejected.map((rejection) => rejection.fragment.trim())]) {
+    if (!/[/.]/.test(piece)) continue;
+    const decoration = FIRST_LINE_PATH_DECORATIONS.find((entry) => entry.pattern.test(piece));
+    if (decoration) violations.push(`${decoration.label}: ${piece}`);
+    // 공백만으로 거부하지 않는다 — «경로 자체에 공백»(`docs/foo bar.md`)은 지금처럼 통과한다.
+    // 덧말은 공백 뒤에 «경로가 아닌 말»이 붙은 경우만이다(마지막 조각에 구분자·확장자가 없다).
+    else {
+      const trailing = piece.split(/\s+/).slice(1).join(' ').trim();
+      if (trailing !== '' && !/[/.]/.test(trailing)) violations.push(`덧말(공백 섞임): ${piece}`);
+    }
+  }
+  return violations;
+}
+
 export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const text = opts.text.trim();
   if (!text) throw new Error('과제 한 줄이 비어 있다');
@@ -1072,7 +1196,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
       launcher: 'hand',
     }, birthTags);
   const childLlm = opts.childLlm !== undefined ? parseChildLlm(opts.childLlm, opts.childLlmEffort) : undefined;
-  const parentRoleEnv = taskParentRoleEnv(opts.parentRoleLlm ?? []); // validate before writing the card
+  const parentRolePins = taskParentRolePinsForChild(opts.parentRoleLlm ?? [], childLlm);
+  const parentRoleEnv = taskParentRoleEnv(parentRolePins); // validate before writing the card
   const completion = opts.completion ?? 'code-pr';
   const selected = selectTaskComposition(completion, opts.compositionRoot);
   // 2판 — launcher 'graph-run' 조합(단위 해석까지 완료)은 실제 graph run 으로 발사한다. 더 이상 거부하지 않는다.
@@ -1083,8 +1208,11 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     : !selected.composition ? `조합 없음: graphs/work/${completion}.yaml`
     : selected.error ?? (selected.launcher === 'graph-run' && !selected.unitsResolved
       ? `조합 단위 미해석: ${selected.composition.file} — 대상 unit: ${selected.missingUnits.length ? selected.missingUnits.join(', ') : '해석 실패'} (graph-run 발사는 단위 해석이 필요하다)`
-      : completion !== 'code-pr' || selected.launcher !== 'harness-say'
-        ? `조합 실행기 없음: ${selected.composition.file} (발사 가능한 launcher: code-pr harness-say · graph-run)` : undefined);
+      // DEFAULT-HANDS — 코드 하니스(harness-say 자식 구현 런)는 개발자 팩(code-pr)만 쓴다.
+      : !DEFAULT_HANDS[completion].codeHarness && selected.launcher === 'harness-say'
+        ? `조합 실행기 없음: ${selected.composition.file} — ${completion} 은 «실행·조사» 손이라 코드 하니스(harness-say)를 쓰지 않는다(개발자 팩 전용)`
+        : selected.launcher === undefined
+          ? `조합 실행기 없음: ${selected.composition.file} (발사 가능한 launcher: harness-say · graph-run)` : undefined);
   let project: TaskCard['project'];
   let targetIsGit: boolean | null = null;
   if (opts.project) {
@@ -1126,7 +1254,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.milestone ? { milestone: opts.milestone } : {}),
     ...(opts.taLand === true ? { taLand: true as const } : {}),
     ...(childLlm ? { childLlm } : {}),
-    ...(opts.parentRoleLlm?.length ? { parentRoleLlm: [...opts.parentRoleLlm] } : {}),
+    ...(parentRolePins.length ? { parentRoleLlm: parentRolePins } : {}),
     ...(opts.tier ? { tier: opts.tier } : {}),
     ...(opts.tierSplit ? { tierSplit: opts.tierSplit } : {}),
     ...(identity ? { identity } : {}),
@@ -1202,11 +1330,20 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     if (formViolations.length > 0) {
       throw new Error(`goal-revision-required: 완료 경계 증거 명령은 명령 원문이어야 한다 ${formViolations.join(' · ')} — 증거 명령 줄에 설명 접미(예: → 0 fail)나 백틱 장식을 붙이지 말고 명령만 적은 뒤 다시 넘기세요`);
     }
+    // FIRST-LINE-PATH-LIST-ONLY — 첫 줄 형태 판정(발사 전 거부): 괄호·줄번호·덧말이 붙은 골은 자식을 띄우지 않는다.
+    // 카드 기록(writeCard)과 launcher 호출 뒤로 밀리면 «발사 전 거부·카드 0» 이 깨지므로 이 자리에서 던진다.
+    const firstLineViolations = firstLinePathListViolations(targetPathHints);
+    if (firstLineViolations.length > 0) {
+      try { debug.log('task-agent.hand', 'first-line-path-list-rejected', { card: id, violations: firstLineViolations }); } catch { /* fail-soft */ }
+      throw new Error(`goal-revision-required: 골 첫 줄은 «대상 경로:» 뒤에 경로 목록만 적어야 한다 ${firstLineViolations.join(' · ')} — 괄호·줄번호·덧말을 떼고 경로만 적은 뒤 다시 넘기세요`);
+    }
   }
   writeCard(path, card);
   try { debug.log('task-agent.hand', 'target-paths', { card: id, count: targetPaths.length, labelMissing: targetPathHints.labelMissing }); } catch { /* fail-soft */ }
   try { debug.log('task-agent.graph-select', !selected.composition ? 'composition-missing' : selected.error ? 'composition-invalid' : 'composition-selected', {
     completion, file: selected.composition?.file ?? `graphs/work/${completion}.yaml`,
+    // DEFAULT-HANDS — 어느 손으로 나가는지(«개발»/«실행·조사»)와 코드 하니스 여부를 선택 관측에 싣는다.
+    hand: DEFAULT_HANDS[completion].hand, codeHarness: DEFAULT_HANDS[completion].codeHarness,
     unitsResolved: selected.unitsResolved, missingUnits: selected.missingUnits,
     ...(selected.error ? { error: selected.error } : {}),
   }); } catch { /* fail-soft */ }
@@ -1282,6 +1419,14 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     writeCard(path, candidate);
     return { card: candidate, move: nextMoveFor(candidate), mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   }
+  // Only the code-PR harness Pod consumes podGoal. Keep the card and other launchers unchanged.
+  const podLaunch = completion === 'code-pr' && selected.launcher === 'harness-say';
+  let childGoal = card.text;
+  if (podLaunch) {
+    const knowhow = selectKnowhowPack(project?.target ?? resolve(import.meta.dir, '../..'), card.text, targetPaths);
+    if (knowhow.text) childGoal = `${knowhow.text}\n\n${card.text}`;
+    try { debug.log('task-agent', 'knowhow-pack', { taskId: id, ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0 }); } catch { /* fail-soft */ }
+  }
   const runId = mintRunId();
   const launchId = newLaunchUtteranceId();
   recordLaunchUtterance({ source: 'hand', utterance: opts.text, launchId });
@@ -1294,10 +1439,10 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     // An omitted card provider uses the established Pod default. Carry the effective value explicitly so
     // remote-parent code never has to infer a provider from the serialized CLI argv.
     effectiveChildProvider: card.childLlm?.provider ?? 'openai-codex',
-    ...(completion === 'code-pr' && selected.launcher === 'harness-say' ? { substrate: 'pod' as const, podGoal: card.text } : {}) };
+    ...(podLaunch ? { substrate: 'pod' as const, podGoal: childGoal } : {}) };
   let receipt: void | TaskLaunchReceipt;
   try {
-    receipt = await opts.launcher(move.command!, project?.target, context);
+    receipt = await opts.launcher(podLaunch ? [...move.command!.slice(0, -1), childGoal] : move.command!, project?.target, context);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const failed: TaskCard = { ...card, status: 'launch-failed', history: [{ at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch-failed', detail: reason }] };

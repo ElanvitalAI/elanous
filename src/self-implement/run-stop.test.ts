@@ -12,7 +12,7 @@ describe('recordRunStop', () => {
     expect(entries).toHaveLength(2);
     expect(entries[0]).toBe(prior);
     expect(entries[1]).toMatchObject({ runId: 'run-test', event: 'stop', data: { class: 'main-sync', cause: 'merge held: main-sync-conflict-unresolved', evidenceRef: 'run-ledger:run-test:merge-decision', nextMove: 'Review merge decision' } });
-    expect(RUN_STOP_CLASSES).toEqual(['env-unrelated', 'main-sync', 'pod-died', 'review-repeat', 'review-out-of-scope', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified']);
+    expect(RUN_STOP_CLASSES).toEqual(['env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat', 'review-out-of-scope', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified']);
   });
 
   test('unknown class is unclassified; cause is one line at most 120 characters without truncation marker', () => {

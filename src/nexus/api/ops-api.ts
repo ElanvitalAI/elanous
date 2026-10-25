@@ -11,6 +11,7 @@ import { createSeatsCache, todayKst } from './ops-seats.js';
 import { liveSeatsSources } from './ops-seats-sources.js';
 import { createOverviewCache } from '../../ops/overview-cache.js';
 import { resourcesFromOverview } from '../../ops/resources.js';
+import { loopsMapFromCache } from '../../ops/loops-map.js';
 import { parseSince } from '../../ops/overview-collect.js';
 import type { MetaApiOpts } from './meta-api.js';
 
@@ -184,6 +185,14 @@ export function readReleaseRuns(version: string | null = null,
   }).sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 20);
 }
 
+/**
+ * 요청이 «자격을 하나라도 실어 왔는가» — operatorSignal 이 판정에 쓰는 축(베어러·프록시 헤더·쿠키)만 본다.
+ * 아무것도 없으면 401(인증 없음), 있는데 운영자가 아니면 403(권한 없음)으로 가른다.
+ */
+function offeredCredential(req: Request): boolean {
+  return Boolean(req.headers.get('authorization') || req.headers.get('x-elanous-operator') || req.headers.get('cookie'));
+}
+
 /** The sole data gate for every read-only /v1/ops endpoint. */
 export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Response | Promise<Response> {
   const url = new URL(req.url);
@@ -195,6 +204,9 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
     debug.log('ops.api', 'refused', { path: pathname, source: signal.operatorSource });
     // RES-FLOOR-API: no credential was offered at all — this endpoint names it 401; every other path keeps 403.
     if (pathname === '/v1/ops/resources') return jsonResponse({ error: 'unauthorized' }, 401);
+    // LOOP-MAP-API: a request that offers no credential at all is 401 in the same body shape;
+    // a credential that is not an operator stays 403, exactly like the neighbouring ops paths.
+    if (pathname === '/v1/ops/loops-map' && !offeredCredential(req)) return jsonResponse({ error: 'unauthorized' }, 401);
     return jsonResponse({ error: 'forbidden' }, 403);
   }
   const served = (response: Response): Response => {
@@ -226,12 +238,8 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
     // (name·era·beat cell observedAt; null/unmeasured value and reason preserved);
     // no new remote fan-out of its own. Loop-edge joining is a later shard.
     overviewCache ??= createOverviewCache();
-    return overviewCache.get()
-      .then((overview) => served(jsonResponse({
-        generatedAt: overview.generatedAt,
-        cacheAgeMs: overview.cacheAgeMs,
-        loops: overview.loops.map((loop) => ({ name: loop.name, era: loop.era, beat: loop.beat })),
-      })), () => jsonResponse({ error: 'overview-unavailable' }, 500));
+    // peek, not get: a cold cache answers «아직 캐시 없음» instead of starting a collection.
+    return Promise.resolve(served(jsonResponse(loopsMapFromCache(overviewCache.peek()))));
   }
   if (pathname === '/v1/ops/seats') {
     const date = url.searchParams.get('date') ?? todayKst();

@@ -215,6 +215,93 @@ describe('usage runs --by role', () => {
     registerUsageCommand(command, { readRunLogs: () => { throw new Error('read logs'); },
       out: { log: (line) => lines.push(line) }, exit: (code) => { throw new Error(`exit ${code}`); } });
     expect(command.parseAsync(['usage', 'runs', '--by', 'nope'], { from: 'user' })).rejects.toThrow('exit 2');
-    expect(lines).toEqual(['⛔ --by 는 run | role | stage | model | account']);
+    expect(lines).toEqual(['⛔ --by 는 run | role | stage | phase | model | account | job']);
+  });
+});
+
+describe('usage runs --by job', () => {
+  it('rolls up tokens per jobKind via rollupRunUsage by job, without first-row model representatives', () => {
+    const rows = rollupRunUsage([
+      { runId: 'A', jobKind: 'dev', model: 'm1', billingProvider: 'p', billing: 'api', hostId: 'h1', inputTokens: 10, outputTokens: 2, cost: { kind: 'known', usd: 1 } },
+      { runId: 'B', jobKind: 'dev', model: 'm2', billingProvider: 'p', billing: 'api', hostId: 'h2', inputTokens: 5, outputTokens: 1, cost: { kind: 'actual', usd: 2 } },
+      { runId: 'C', jobKind: 'search', model: 'm1', billingProvider: 'p', billing: 'api', hostId: 'h1', inputTokens: 7 },
+    ], { by: 'job' });
+    expect(rows).toHaveLength(2);
+    const dev = rows.find((row) => row.jobKind === 'dev')!;
+    expect(dev).toEqual({
+      runId: '(all)', jobKind: 'dev', hostIds: ['h1', 'h2'], calls: 2,
+      inputTokens: 15, outputTokens: 3, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      reasoningOutputTokens: 0, usdKnown: 3, unknownCostCalls: 0, includedCalls: 0, apiEquivalentUsd: 0,
+    });
+    expect(dev).not.toHaveProperty('model');
+    expect(dev).not.toHaveProperty('billingProvider');
+    expect(dev).not.toHaveProperty('billing');
+    expect(rows.find((row) => row.jobKind === 'search')).toMatchObject({ calls: 1, inputTokens: 7, hostIds: ['h1'] });
+    expect(rollupRunUsage([
+      { runId: 'A', jobKind: 'dev', model: 'm1', billingProvider: 'p', billing: 'api', inputTokens: 3 },
+      { runId: 'B', jobKind: 'search', model: 'm1', billingProvider: 'p', billing: 'api', inputTokens: 4 },
+    ], { by: 'job' })).toHaveLength(2);
+  });
+
+  it('aggregates the call-specified jobKind, retaining the token counts and the (none) bucket', async () => {
+    const inputs = [
+      { runId: 'job-run', jobKind: 'dev', model: 'm', hostId: 'h1', inputTokens: 5, outputTokens: 2 },
+      { runId: 'job-run', jobKind: 'dev', model: 'm', hostId: 'h1', inputTokens: 3, outputTokens: 1 },
+      { runId: 'job-run', jobKind: 'search', model: 'm', hostId: 'h2', inputTokens: 7 },
+    ];
+    const read = () => [...inputs, { runId: 'job-run', model: 'm', hostId: 'h1', inputTokens: 9 }].map(logRow);
+    const rows = JSON.parse((await usageRuns(['--by', 'job', '--json'], read))[0]!);
+    expect(rows.find((entry: { job: string }) => entry.job === 'dev')).toMatchObject({ calls: 2, inputTokens: 8, outputTokens: 3, hostIds: ['h1'] });
+    expect(rows.find((entry: { job: string }) => entry.job === 'search')).toMatchObject({ calls: 1, inputTokens: 7, hostIds: ['h2'] });
+    expect(rows.find((entry: { job: string }) => entry.job === '(none)')).toMatchObject({ calls: 1, inputTokens: 9 });
+    const lines = await usageRuns(['--by', 'job'], read);
+    expect(lines.some((line) => line.startsWith('job=dev  hosts=h1  calls=2  input=8  output=3'))).toBe(true);
+    const defaults = JSON.parse((await usageRuns(['--json'], read))[0]!);
+    expect(defaults).toEqual(rollupRunUsage(read().map((entry) => JSON.parse(entry.data!))));
+    expect(defaults[0]).not.toHaveProperty('jobKind');
+    expect(defaults.every((item: object) => !('job' in item))).toBe(true);
+  });
+
+  it('passes a jobKind-specified LLM stream through the usage ledger and the actual CLI aggregation', async () => {
+    const provider: LLMProvider = {
+      name: 'meter-test', defaultModel: 'meter-model', available: () => true,
+      async *chat() { yield 'ok'; },
+      async *streamChat() {
+        yield { type: 'usage', usage: { inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 } };
+        yield { type: 'text', delta: 'ok' };
+      },
+    };
+    const store = new LogStore(':memory:');
+    const observed: Record<string, unknown>[] = [];
+    const original = debug.log.bind(debug);
+    const spy = spyOn(debug, 'log').mockImplementation((category, event, data, options) => {
+      if (category === 'llm.usage' && event === 'llm-usage') {
+        observed.push(data as Record<string, unknown>);
+        store.insertBatch([{ rec: { ts: '2026-10-20T00:00:00Z', category, event, data: data as Record<string, unknown> }, surface: 'tui' }]);
+      } else original(category, event, data, options);
+    });
+    try {
+      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider, usageJobKind: 'dev' })).toBe('ok');
+      expect(await streamLLMWithTools([{ role: 'user', content: 'measure' }], { onText() {}, dispatchTool: async () => 'unused' }, { provider, usageJobKind: 'deploy' })).toBe('ok');
+      expect(await streamLLM([{ role: 'user', content: 'measure' }], () => {}, { provider })).toBe('ok');
+      expect(observed).toHaveLength(3);
+      expect(observed[0]).toMatchObject({ jobKind: 'dev', inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
+      expect(observed[1]).toMatchObject({ jobKind: 'deploy', inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
+      expect(observed[2]).not.toHaveProperty('jobKind');
+      const read = (query: Parameters<LogStore['query']>[0]) => store.query(query);
+      const ledgerTokens = observed
+        .filter((data) => data.jobKind === 'dev')
+        .reduce((sum: number, data) => sum + (Number(data.inputTokens) || 0) + (Number(data.outputTokens) || 0), 0);
+      const rows = JSON.parse((await usageRuns(['--by', 'job', '--json'], read))[0]!);
+      const devRow = rows.find((entry: { job: string }) => entry.job === 'dev');
+      expect(devRow).toMatchObject({ calls: 1, inputTokens: 23, outputTokens: 7, cacheReadInputTokens: 4 });
+      expect(devRow.inputTokens + devRow.outputTokens).toBe(ledgerTokens);
+      expect(rows.find((entry: { job: string }) => entry.job === 'deploy')).toMatchObject({ calls: 1, inputTokens: 23, outputTokens: 7 });
+      expect(rows.find((entry: { job: string }) => entry.job === '(none)')).toMatchObject({ calls: 1, inputTokens: 23, outputTokens: 7 });
+      expect(JSON.parse((await usageRuns(['--json'], read))[0]!)[0]).not.toHaveProperty('jobKind');
+    } finally {
+      spy.mockRestore();
+      store.close();
+    }
   });
 });

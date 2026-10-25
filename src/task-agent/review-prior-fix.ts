@@ -49,7 +49,14 @@ export function priorReviewRequest(requests: readonly ReviewRequest[] | undefine
  * 결과 파일에서 must-fix «문면»을 읽는다 — `self review --json` 의 결과 줄(뒤에서부터 첫 결과 모양)만.
  * 결과 모양 판정은 `parseReviewResultOutput` 과 같다(PR 번호 ⊕ (verdict ⊕ mustFix 배열 | error 문자열)).
  */
-export function readPriorMustFix(path: string | undefined, pr: number, read: (path: string) => string = (p) => readFileSync(p, 'utf8')): PriorMustFix {
+export function readPriorMustFix(
+  path: string | undefined,
+  pr: number,
+  expectedHeadOrRead?: string | ((path: string) => string),
+  readFile: (path: string) => string = (p) => readFileSync(p, 'utf8'),
+): PriorMustFix {
+  const expectedHead = typeof expectedHeadOrRead === 'string' ? expectedHeadOrRead : undefined;
+  const read = typeof expectedHeadOrRead === 'function' ? expectedHeadOrRead : readFile;
   if (!path) return { status: 'not-recovered', reason: 'no result path' };
   let text: string;
   try { text = read(path); } catch (error) {
@@ -68,6 +75,9 @@ export function readPriorMustFix(path: string | undefined, pr: number, read: (pa
     if (!isResult) continue;
     const prRaw = typeof v.pr === 'number' ? v.pr : typeof v.pr === 'string' ? Number(String(v.pr).replace(/^#/, '')) : NaN;
     if (prRaw !== pr) return { status: 'not-recovered', reason: `result PR ${Number.isFinite(prRaw) ? prRaw : 'unknown'} does not match #${pr}` };
+    if (expectedHead && (typeof v.headCommit !== 'string' || !SHA40.test(expectedHead) || v.headCommit.toLowerCase() !== expectedHead.toLowerCase())) {
+      return { status: 'not-recovered', reason: 'result head does not match prior review head' };
+    }
     if (typeof v.error === 'string') return { status: 'not-recovered', reason: `prior review error: ${v.error.slice(0, 200)}` };
     if (v.reviewed === false) return { status: 'not-recovered', reason: 'prior review did not run (reviewed:false)' };
     if (!Array.isArray(v.mustFix) || !v.mustFix.every((fix) => typeof fix === 'string')) return { status: 'not-recovered', reason: 'must-fix list unreadable' };
@@ -109,7 +119,7 @@ export function buildPriorFixContext(
   if (!prior) return null;
   let diff: PriorDiff | null;
   try { diff = (opts.priorDiff ?? defaultPriorDiff)(opts.cwd, prior.head, head); } catch { diff = null; }
-  return { fromHead: prior.head, toHead: head, diff, mustFix: readPriorMustFix(prior.resultPath, pr, opts.readFile) };
+  return { fromHead: prior.head, toHead: head, diff, mustFix: readPriorMustFix(prior.resultPath, pr, prior.head, opts.readFile) };
 }
 
 /** «직전 반영분» 블록 — 종전 런 줄 다음에 붙는다. */

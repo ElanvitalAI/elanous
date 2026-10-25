@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   openSurfaceEventsDb, recordEvent, recordInboundTurn, queryEvents, importanceByKind, ftsQuery, recallEvents, recentSentDigest, categoryOfKind, pruneStaleEvents,
-  stabilityDays, classifyTier, applyMemoryDecay,
+  stabilityDays, classifyTier, applyMemoryDecay, querySurfaceUtterances, countSurfaceUtterancesByOrigin, classifySurfaceUtteranceOrigin,
 } from './surface-events.js';
 
 const db = () => openSurfaceEventsDb(':memory:');
@@ -391,5 +391,63 @@ describe('배선 가드', () => {
     expect(src).toContain('recordInboundTurn({');
     expect(src).toContain('surface, userText: opts.userText'); // surface 파라미터로 일반화(M4a)
     expect(src).toContain('result.text'); // runTurn 결과에서 응답(responseText) 추출
+  });
+});
+
+// ── 발화 원천(origin) 구분 — human 0 을 사람 표본으로 오인하지 않는다 ──
+describe('utterance origin — human / test-fixture / external CLI agent', () => {
+  const interval = { from: '2026-10-12T00:00:00Z', to: '2026-10-13T00:00:00Z' };
+  const at = () => '2026-10-12T01:00:00Z';
+
+  test('origin filter separates 0 human sources from 48 test fixtures and external CLI agent rows', () => {
+    const d = db();
+    try {
+      // 시험 fixture 48건은 사람이 말하는 것과 «같은» cli 서피스에 기록된다 — 원천 구분이 없으면 사람 48로 읽힌다.
+      for (let i = 0; i < 48; i += 1) {
+        recordInboundTurn({ surface: 'cli', userText: `fixture ${i} 동기화 상태 알려 줘`, responseText: 'A', origin: 'test-fixture', now: at, db: d });
+      }
+      recordInboundTurn({ surface: 'ext:claude-code', userText: 'external agent one', origin: 'claude-code', now: at, db: d });
+      recordInboundTurn({ surface: 'ext:codex', userText: 'external agent two', origin: 'codex', now: at, db: d });
+
+      // 기본 조회(origin 미지정)는 종전과 같이 창 안의 모든 발화를 돌려준다 — 보존 계약.
+      expect(querySurfaceUtterances(d, interval)).toHaveLength(50);
+      expect(querySurfaceUtterances(d, { ...interval, surface: 'cli' })).toHaveLength(48);
+
+      // ⭐ 원천 0 — 사람 표본이 아니다. 시험 fixture 48 · 외부 CLI agent 2 로 «명시» 구분된다.
+      expect(querySurfaceUtterances(d, { ...interval, origin: 'human' })).toEqual([]);
+      expect(querySurfaceUtterances(d, { ...interval, origin: 'test-fixture' })).toHaveLength(48);
+      expect(querySurfaceUtterances(d, { ...interval, origin: 'external-cli-agent' })).toHaveLength(2);
+      expect(querySurfaceUtterances(d, { ...interval, origin: ['human', 'external-cli-agent'] })).toHaveLength(2);
+      expect(querySurfaceUtterances(d, { ...interval, origin: 'human' })).not.toContainEqual(
+        expect.objectContaining({ surface: 'cli' }),
+      );
+
+      const counts = countSurfaceUtterancesByOrigin(d, interval);
+      expect(counts).toEqual({ human: 0, testFixture: 48, externalCliAgent: 2, elanousSelf: 0, unknown: 0, total: 50 });
+      expect(countSurfaceUtterancesByOrigin(d, { ...interval, surface: 'ext:codex' })).toEqual(
+        { human: 0, testFixture: 0, externalCliAgent: 1, elanousSelf: 0, unknown: 0, total: 1 },
+      );
+
+      // 운영 DB 행 삭제 0 · 회상 카운터 무접촉(read-only 계측).
+      expect(d.query('SELECT COUNT(*) AS n FROM events').get()).toEqual({ n: 50 });
+      expect(d.query('SELECT COUNT(*) AS n FROM events WHERE recall_count != 0').get()).toEqual({ n: 0 });
+    } finally { d.close(); }
+  });
+
+  test('classifier names every source explicitly instead of defaulting prose surfaces to human', () => {
+    const d = db();
+    try {
+      const fixture = recordInboundTurn({ surface: 'cli', userText: 'fixture prompt', origin: 'test-fixture', now: at, db: d })!;
+      const external = recordInboundTurn({ surface: 'cli', userText: 'claude prompt', origin: 'claude-code', now: at, db: d })!;
+      const selfRun = recordInboundTurn({ surface: 'cli', userText: 'self prompt', now: at, db: d })!;
+      const human = recordInboundTurn({ surface: 'cli', userText: 'human prompt', origin: 'human', now: at, db: d })!;
+      const rows = new Map(querySurfaceUtterances(d, interval).map((row) => [row.id, row]));
+      expect(classifySurfaceUtteranceOrigin(rows.get(fixture)!)).toBe('test-fixture');
+      expect(classifySurfaceUtteranceOrigin(rows.get(external)!)).toBe('external-cli-agent');
+      expect(classifySurfaceUtteranceOrigin(rows.get(selfRun)!)).toBe('elanous-self');
+      expect(classifySurfaceUtteranceOrigin(rows.get(human)!)).toBe('human');
+      // 원천 표기가 하나도 없는 옛 행은 사람으로 단정하지 않는다.
+      expect(classifySurfaceUtteranceOrigin({ ...rows.get(human)!, surface: 'unknown-surface', refs: null, tags: null, kind: 'utterance' })).toBe('unknown');
+    } finally { d.close(); }
   });
 });

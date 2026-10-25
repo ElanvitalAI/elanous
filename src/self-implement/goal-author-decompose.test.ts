@@ -62,6 +62,9 @@ mock.module('../harness/adversarial-plan.js', () => ({
 mock.module('../llm.js', () => ({
   ...llmActual,
   streamLLM: async (...args: Parameters<typeof llmActual.streamLLM>) => {
+    if (captureStreamLlm && !JSON.stringify(args[0]).includes('GOAL_AUTHOR_SLICE_SIZE')) {
+      streamLlmCalls.push({ messages: args[0], opts: args[2] });
+    }
     if (scriptedLlmReplies.length) return scriptedLlmReplies.shift()!;
     if (JSON.stringify(args[0]).includes('GOAL_AUTHOR_SLICE_SIZE')) {
       const content = String((args[0][0] as { content?: unknown })?.content ?? '');
@@ -69,7 +72,6 @@ mock.module('../llm.js', () => ({
       return JSON.stringify({ slices: steps.map(() => ({ files: 1, actions: 1, newFiles: 0, tier: 'low' })) });
     }
     if (!captureStreamLlm) return llmActual.streamLLM(...args);
-    streamLlmCalls.push({ messages: args[0], opts: args[2] });
     return 'MOCK STREAM LLM TEXT';
   },
 }));
@@ -558,6 +560,24 @@ describe('goal-author decomposition Live MAX decisions', () => {
 });
 
 describe('createGoalAuthorDecomposeSteps adversarial red-team', () => {
+  test('passes measured goal-author device context through the production decomposition prompt', async () => {
+    useRealDecompose = true;
+    captureStreamLlm = true;
+    scriptedLlmReplies.push(JSON.stringify({ rationale: 'Use the measured target root.', tasks: [
+      { index: 0, title: 'Reuse the existing interaction device', surface: { kind: 'llm-direct', prompt: 'reuse' } },
+    ] }));
+    const context = 'Device inventory (measured at goal-author repository root): existing: src/ux-sim/interaction.ts';
+    try {
+      const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })(
+        '대상 경로: src/feature.ts · 필요한 장치: interaction', { context });
+      expect(steps).toEqual(['Reuse the existing interaction device']);
+      const prompt = String((streamLlmCalls[0]?.messages[0] as { content?: unknown })?.content ?? '');
+      expect(prompt).toContain('### Goal-author device check (measured at the target root; takes precedence over checkout inventory)');
+      expect(prompt).toContain(context);
+      expect(prompt).toContain('Use the measured existing status for src/ux-sim/interaction.ts');
+    } finally { captureStreamLlm = false; }
+  });
+
   test('selects the coarse profile for the goal-author LLM decomposition seam', async () => {
     await createGoalAuthorDecomposeSteps()('implement a robust goal author seam', { context: 'GOAL_AUTHOR_CONTEXT' });
     expect(decompositionOptions).toEqual(expect.objectContaining({
@@ -1347,16 +1367,45 @@ describe('DECOMPOSE-BOUNDARY-ONE-STEP — production seam (createGoalAuthorDecom
     expect(steps[0]).toInclude('시험 경로 미확정');
     expect(steps[0]).not.toInclude('완료 경계에 적힌 시험');
   });
-  test.each(UX_MISSION_GOALS)('the seam returns one step and never calls the LLM decomposition', async (goal) => {
+  test.each(UX_MISSION_GOALS)('the production seam bundles the three boundary rows into one step with three acceptance rows', async (goal) => {
+    decomposition = parseCompletionBoundaryRows(goal).map((row) => `${row.label}: ${row.text}`);
     const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    let productionSlices: import('./goal-author-decompose.js').SizedSlice[] | undefined;
     try {
-      const steps = await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })(goal, { runId: 'run-boundary' });
-      expect(steps).toHaveLength(1);
-      expect(steps[0]).toInclude('완료 경계 증거 명령');
+      const productionSteps = await createGoalAuthorDecomposeSteps(undefined, {
+        adversarialReview: true,
+        onSizedSlices: (slices) => { productionSlices = slices; },
+      })(goal, { runId: 'run-boundary' });
+      const bundled = decomposeGoal(goal);
+      const withoutBundling = decomposeGoal(goal, { bundling: false });
+
+      expect(productionSteps).toHaveLength(1);
+      expect(productionSlices).toHaveLength(1);
+      expect(productionSlices?.[0]?.goal).toInclude(COMPLETION_BOUNDARY_STEP_PREFIX);
+      expect(productionSlices?.[0]?.behaviours).toBe(1);
+      expect(productionSlices?.[0]?.goal).toInclude('완료 경계 코드');
+      expect(productionSlices?.[0]?.goal).toInclude('완료 경계 실물');
+      expect(productionSlices?.[0]?.goal).toInclude('완료 경계 증거 명령');
+      expect(productionSlices?.[0]?.goal).not.toInclude('step 2');
+      expect(productionSteps[0]).toInclude(COMPLETION_BOUNDARY_STEP_PREFIX);
+      expect(productionSteps[0]).toInclude('완료 경계 코드');
+      expect(productionSteps[0]).toInclude('완료 경계 실물');
+      expect(productionSteps[0]).toInclude('완료 경계 증거 명령');
+      for (const [index, row] of parseCompletionBoundaryRows(goal).entries()) {
+        expect(productionSteps[0]).toInclude(`acceptance ${index + 1}[${row.label}] ${row.text}`);
+      }
+      expect(bundled.steps).toHaveLength(1);
+      expect(bundled.acceptance).toHaveLength(3);
+      expect(withoutBundling.steps).toHaveLength(3);
+      expect(withoutBundling.acceptance).toHaveLength(0);
       expect(decompositionOptions).toBeUndefined();
       expect(critiqueCalls).toBe(0);
-      expect(log.mock.calls.some((call) => call[1] === 'completion-boundary-bundled'
-        && (call[2] as { verdict?: string }).verdict === 'one-step-three-acceptance')).toBe(true);
+      expect(log.mock.calls).toContainEqual([
+        'goal-author', 'completion-boundary-bundled', expect.objectContaining({
+          verdict: 'one-step-three-acceptance', steps: 1, acceptance: 3,
+          rows: ['code', 'live', 'evidence-command'],
+        }),
+      ]);
     } finally { log.mockRestore(); }
   });
 

@@ -1,4 +1,5 @@
-import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path/posix';
@@ -12,7 +13,7 @@ import { runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
 import { runPwaBuildGate } from '../../scripts/ci-pwa-build-gate.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
 import { parseReviewDepthFromFilesJson } from '../agent-mission/review-depth.js';
-import { buildGateBaselineReport, calculateGateTestCountChange, formatGateBaselineNote, formatGateTestCountNote, isGateTestFile, runGateBaseline, type BaselineProcessResult, type BaselineProcessStatus, type GateTestFailure } from './gate-baseline.js';
+import { buildGateBaselineReport, calculateGateTestCountChange, formatGateBaselineNote, formatGateTestCountNote, isGateTestFile, recheckTimeoutOnlyIntroducedFailures, runGateBaseline, type BaselineProcessResult, type BaselineProcessStatus, type GateTestFailure, type TimeoutRecheckRecord, type TimeoutRerunObservation } from './gate-baseline.js';
 import { resolveGateScope } from './gate-scope.js';
 import { publicExposureFiles, runExposeGate } from './expose-gate.js';
 import { getUserConfig } from '../user-config.js';
@@ -26,7 +27,8 @@ import {
   overlapWithCurrentChanges,
 } from '../cli/pr-granularity.js';
 import { listWorktrees } from '../git-fs/worktree.js';
-import { runShardedGateTests, writeShardFailureEvidence } from '../self-dev/shard-run.js';
+import { runShardedGateTests, writeShardFailureEvidence, remoteShardArgv, type ShardRunProgress } from '../self-dev/shard-run.js';
+import { planGateRemoteShards, shardPlanOrchestrationId, type GateRemoteShard } from '../self-dev/shard-plan.js';
 import { parseGateScenario, readGateScenarioFile } from './gate-scenario.js';
 import { isGateSpawnLaneFile } from '../self-dev/spawn-lane-files.js';
 import { defaultGateEnvKey, defaultRevResolver, resolveArtifactDir, writeGateArtifacts, type GateArtifactCounts, type GateArtifactsUnavailable, type RevResolver } from './gate-artifacts.js';
@@ -99,7 +101,11 @@ interface SelfGateCliDeps {
   readFile?: (path: string) => string | undefined;
   runTests?: (cwd: string, files: readonly string[]) => ProcessResult;
   runBaseline?: (cwd: string, files: readonly string[], baseRef: string) => BaselineProcessResult;
+  runTimeoutRecheck?: (cwd: string, file: string, name: string, timeoutMs: number) => { observation?: TimeoutRerunObservation; elapsedMs: number; output: string };
   runShards?: typeof runShardedGateTests;
+  /** Test seam for the live progress line. */
+  writeProgressStderr?: (line: string) => void;
+  now?: () => number;
   runIsolationGate?: (out: GateOutput) => number;
   runMockModuleRestoreGate?: (out: GateOutput) => number;
   /** 모델 이름 하드코딩 래칫(🅕 #20521) — `pr land` 만 물고 하니스 무인 병합은 안 물면 위반이 main 에 들어가 남의 착지를 막는다(🅣 2026-09-25). */
@@ -131,6 +137,7 @@ interface GateArtifactCapture {
   /** `unrun importer tests: N` 의 N — 색인 조회 실패면 null(그 이유가 importerLookupFailed). */
   unrunImporters?: number | null;
   importerLookupFailed?: string;
+  timeoutRechecks?: readonly TimeoutRecheckRecord[];
 }
 
 /** SIDE-VERIFY ③ — summary 정수 칸: 게이트가 이미 낸 `result.baseline` ⊕ `unrunImporterTotal` 을 «옮기기만» 한다.
@@ -388,7 +395,9 @@ export function observePrFileOverlap(
       return { ok: false as const, out: '', err: error instanceof Error ? error.message : String(error) };
     }
   };
-  const commits = collectBaseLandingCommits(run, cwd, { since: '0', baseRef: `${baseOid}..${baseRefName}` });
+  // The resolved base range is the complete scope; a time cutoff can hide a
+  // just-created commit when a gate shard is slow.
+  const commits = collectBaseLandingCommits(run, cwd, { since: null, baseRef: `${baseOid}..${baseRefName}` });
   if (commits === null) return { status: 'unavailable', reason: 'git log failed' };
   const overlaps = overlapWithCurrentChanges(commits, files);
   return overlaps.length > 0
@@ -588,6 +597,24 @@ export function formatUnrunImporterTests(importerTestsNotRun: NonNullable<Return
   return `unrun importer tests: ${importerTestsNotRun.total}${files}; unresolved relative specifiers: ${importerTestsNotRun.unresolvedRelativeSpecifiers}`;
 }
 
+/** gate 출력 한 줄에 실리는 미등재 spawn-lane 시험의 최대 표시 수 — 실측 드리프트(57건)를 전부 나열하면
+ *  «읽히지 않는 소음»이 된다(`formatUnrunImporterTests` 의 잘림 정책과 같은 취지). */
+const UNLISTED_SPAWN_LANE_DISPLAY_LIMIT = 10;
+
+/** ⛔⭐ 소비자 배선(무인 리뷰 must-fix) — `resolveGateScope` 이 채우는 `runtimeEdgeImpact` 를 읽는 곳이
+ *  없으면 그 측정은 어디에도 드러나지 않는다. 정책은 형제들과 같다 — ***「보고한다. 막지 않는다.」***
+ *  손으로 관리하는 `GATE_SPAWN_LANE_FILES` 가 실측에서 빠뜨린 spawn-lane 시험을 알린다. */
+export function formatUnlistedSpawnLaneTests(impact: ReturnType<typeof resolveGateScope>['runtimeEdgeImpact']): string {
+  if (!impact) return 'unlisted spawn-lane tests: (not measured — no importer index)';
+  if (!impact.measured) return 'unlisted spawn-lane tests: (not measured)';
+  const total = impact.unlistedSpawnLaneTests.length;
+  if (total === 0) return 'unlisted spawn-lane tests: 0';
+  const shown = impact.unlistedSpawnLaneTests.slice(0, UNLISTED_SPAWN_LANE_DISPLAY_LIMIT);
+  const truncated = total > shown.length ? `, showing ${shown.length}/${total}` : '';
+  return `unlisted spawn-lane tests: ${total} (${shown.join(', ')}${truncated})`
+    + '  ⚠️ GATE_SPAWN_LANE_FILES 가 빠뜨린 실측 spawn-lane 시험 — 「보고만 한다. 막지 않는다.」';
+}
+
 export function formatPartialObservationNote(unrunImporterTotal: number, note: string): string {
   if (unrunImporterTotal <= 0) return note;
   return `partial observation: ${unrunImporterTotal} unrun importer tests; ${note}`;
@@ -756,6 +783,7 @@ function emitGateArtifacts(cwd: string, artifactDir: string, result: SelfGateCli
       testFiles: capture.testFiles ?? result.testFiles,
       verdict: capture.verdict ?? null,
       ...(capture.verdictLine !== undefined ? { verdictLine: capture.verdictLine } : {}),
+      ...(capture.timeoutRechecks ? { timeoutRechecks: capture.timeoutRechecks } : {}),
       exitCode: result.exitCode,
       counts: counts.counts,
       ...(counts.reason !== undefined ? { countsUnavailableReason: counts.reason } : {}),
@@ -768,6 +796,31 @@ function emitGateArtifacts(cwd: string, artifactDir: string, result: SelfGateCli
   } catch (error) {
     result.lines.push(`⚠ artifacts: ${dir} 에 못 썼다 — ${error instanceof Error ? error.message : String(error)} (판정은 그대로다)`);
   }
+}
+
+/** A completed bundle is observed immediately, before the synchronous runner returns. Each sink is best effort. */
+function shardProgressObserver(cwd: string, options: SelfGateCliOptions, deps: SelfGateCliDeps): (progress: ShardRunProgress) => void {
+  const now = deps.now ?? Date.now;
+  const startedAt = now();
+  return (progress) => {
+    const elapsedMs = Math.max(0, now() - startedAt);
+    const estimatedRemainingMs = progress.completedShards > 0
+      ? Math.round(elapsedMs * (progress.totalShards - progress.completedShards) / progress.completedShards) : null;
+    const snapshot = { ...progress, elapsedMs, estimatedRemainingMs };
+    const line = `gate shard progress: bundles ${progress.completedShards}/${progress.totalShards} · files ${progress.completedFiles}/${progress.totalFiles} · elapsed ${Math.round(elapsedMs / 1000)}s · remaining ~${estimatedRemainingMs === null ? '?' : Math.round(estimatedRemainingMs / 1000) + 's'}\n`;
+    try { (deps.writeProgressStderr ?? ((value) => { process.stderr.write(value); }))(line); } catch { /* observation only */ }
+    try { debug.log('gate.cli', 'shard-progress', snapshot); } catch { /* observation only */ }
+    if (!options.artifactDir?.trim()) return;
+    let temporary: string | undefined;
+    try {
+      const dir = resolveArtifactDir(options.artifactDir, cwd);
+      mkdirSync(dir, { recursive: true });
+      temporary = join(dir, `.progress.${process.pid}.${randomUUID()}.tmp`);
+      writeFileSync(temporary, `${JSON.stringify(snapshot, null, 2)}\n`);
+      renameSync(temporary, join(dir, 'progress.json'));
+    } catch { /* artifact failure must not affect the gate verdict */ }
+    finally { if (temporary) { try { rmSync(temporary, { force: true }); } catch { /* observation only */ } } }
+  };
 }
 
 function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: SelfGateCliDeps, capture: GateArtifactCapture): SelfGateCliResult {
@@ -803,6 +856,9 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     // 🚨 러너 우주 «밖» — 형제들과 같은 정책으로 «말만» 한다(`OBS-T418`).
     formatUnrunnableChangeKinds(selection.files),
     formatUnrunImporterTests(importerTestsNotRun, lookupFailed),
+    // ⛔⭐ 무인 리뷰 must-fix — 죽은 필드 배선: `resolveGateScope` 이 채운 `runtimeEdgeImpact` 을
+    //   실제로 읽어 출력하는 소비자(이 줄이 없으면 그 측정은 어디에도 드러나지 않는다).
+    formatUnlistedSpawnLaneTests(scope.runtimeEdgeImpact),
     `caller tests: ${lookupFailed ? `lookup failed (${lookupFailed})` : scope.callerTests.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ') || (routeIndex?.lookupFailures.length ? 'route lookup incomplete' : '(none)')}`,
     ...(routeIndex?.lookupFailures.length ? [`⚠️ caller route base lookup failed — unmeasured: ${routeIndex.lookupFailures.map(({ source, reason }) => `${source} (${reason})`).join(', ')}`] : []),
     ...(callerTestsOverflow.length ? [`⚠️ caller test cap exceeded — not run: ${callerTestsOverflow.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ')}`] : []),
@@ -854,9 +910,10 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     const spawnFileCount = testFiles.filter(isGateSpawnLaneFile).length;
     const shardCount = options.shards ?? (Math.min(3, spawnFileCount) + Number(testFiles.length > spawnFileCount));
     const runShards = deps.runShards ?? runShardedGateTests;
+    const onShardComplete = shardProgressObserver(cwd, options, deps);
     const sharded = options.fixedShardDistribution
-      ? runShards(cwd, testFiles, selection.baseRef, shardCount, undefined, undefined, undefined, { fixedDistribution: true })
-      : runShards(cwd, testFiles, selection.baseRef, shardCount);
+      ? runShards(cwd, testFiles, selection.baseRef, shardCount, undefined, undefined, undefined, { fixedDistribution: true, onShardComplete })
+      : runShards(cwd, testFiles, selection.baseRef, shardCount, undefined, undefined, undefined, { onShardComplete });
     capture.sharded = sharded;
     capture.verdict = sharded.aggregate.status;
     lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})${sharded.expandedFrom !== undefined ? ` · RSS 예산상 ${sharded.expandedFrom}→${sharded.shards.length} 자동 확장` : ''}${sharded.measurementFailures ? ` · 측정 실패 ${sharded.measurementFailures}` : ''}${options.fixedShardDistribution ? ' · 고정 분배(사전 측정 없음)' : ''}${sharded.distribution === 'fixed-cap-fallback' ? ` · 호스트 상한 자동 고정 분배(${sharded.fallbackReason})` : ''}`);
@@ -897,7 +954,15 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
       capture.unmeasuredReason = unmeasuredReason;
     }
     else if (aggregate.report) {
-      const report = aggregate.report;
+      const report = recheckTimeoutOnlyIntroducedFailures(cwd, aggregate.report, deps.runTimeoutRecheck);
+      capture.timeoutRechecks = report.timeoutRechecks;
+      const timeoutRecheckResolvedFailure = aggregate.status === 'failed'
+        && (report.timeoutRecheckPassed ?? 0) > 0
+        && report.introduced === 0 && report.unknown === 0 && report.preconditionUnmet === 0
+        && report.timedOut === 0 && report.flakyRerun === 0 && report.worktreeFailuresParsed
+        && report.baselineStatus !== 'unknown';
+      const effectiveStatus = timeoutRecheckResolvedFailure ? 'passed' : aggregate.status;
+      capture.verdict = effectiveStatus;
       logGateCliBaseline(cwd, {
         introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown,
         preconditionUnmet: report.preconditionUnmet, timedOut: report.timedOut,
@@ -914,7 +979,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     capture.verdictLine = lines[lines.length - 1];
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     return {
-      exitCode: aggregate.status !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed || !expose.passed ? 1 : 0,
+      exitCode: capture.verdict !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed || !expose.passed ? 1 : 0,
       lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
       documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
       alwaysIncludeMissing, importerTestsAdded, ...(shardBaseline ? { baseline: shardBaseline } : {}),
@@ -935,7 +1000,8 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
 
   if (worktreeLog.includes('deterministic environment setup failed')) lines.push(worktreeLog);
   const baseline = (deps.runBaseline ?? runGateBaseline)(cwd, testFiles, selection.baseRef);
-  const report = buildGateBaselineReport(worktreeLog, baseline);
+  const report = recheckTimeoutOnlyIntroducedFailures(cwd, buildGateBaselineReport(worktreeLog, baseline), deps.runTimeoutRecheck);
+  capture.timeoutRechecks = report.timeoutRechecks;
   logGateCliBaseline(cwd, {
     introduced: report.introduced,
     preexisting: report.preexisting,
@@ -957,4 +1023,22 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
   const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
   const exitCode = !androidPassed || !iosPassed || !pwaPassed || !policyPassed || !expose.passed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
   return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown, preconditionUnmet: report.preconditionUnmet } };
+}
+
+/** GATE-REMOTE-SHARD-PLAN — a shard plan plus the ready-to-run remote command for each shard. */
+export interface RemoteGateShardPlan {
+  orchestrationId: string;
+  shards: GateRemoteShard[];
+  commands: string[][];
+}
+
+/** Turn a changed-file list into identity-carrying shards and their remote gate commands (shard-plan → shard-run wiring). */
+export function planRemoteGateShardCommands(
+  files: readonly string[],
+  shardCount: number,
+  options?: { planFile?: string; orchestrationId?: string },
+): RemoteGateShardPlan {
+  const orchestrationId = options?.orchestrationId ?? shardPlanOrchestrationId(files);
+  const shards = planGateRemoteShards(files, shardCount, orchestrationId);
+  return { orchestrationId, shards, commands: shards.map((shard) => remoteShardArgv(shard, options)) };
 }

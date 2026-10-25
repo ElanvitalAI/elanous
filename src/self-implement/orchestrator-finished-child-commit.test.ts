@@ -21,6 +21,7 @@ describe('finished child uncommitted work recovery', () => {
     });
   }
 
+  // This case creates and inspects a real Git worktree; node-b load can exceed Bun's 5s default.
   test('commits child-created untracked target in a real Git worktree without committing outside paths', async () => {
     const root = mkdtempSync(join(tmpdir(), 'finished-child-'));
     const repo = join(root, 'repo');
@@ -70,7 +71,7 @@ describe('finished child uncommitted work recovery', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test('ignores a target path quoted only as excluded boundary', async () => {
     let committed = false;

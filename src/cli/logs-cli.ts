@@ -49,6 +49,8 @@ import { bookmarkAttachDefaults } from './remote-resolve.js';
 import { RemotesStore } from './remotes.js';
 import { detectRepeatedFailures, explainFailure } from '../domains/repeated-failure.js';
 import { redactSecretText } from '../debug/log.js';
+// 타입 전용 — `graph-templates` 는 typescript 를 무는 모듈이라 «런타임 정적 의존»으로 두지 않는다.
+import type { GraphTemplate } from '../self-implement/graph-templates.js';
 
 export interface LogsCliOpts {
   follow?: boolean;
@@ -99,6 +101,14 @@ export interface LogsCliOpts {
   all?: boolean;
   /** --all 연합에 격리 test 인스턴스도 포함(기본 제외 · Phase A). */
   includeTest?: boolean;
+  /** ⭐ 런 종료 «이후» L0 커버리지를 열린 스토어들(부모·Pod)의 걸음 행으로 다시 조인해 센다(ARG-L0-COVER). */
+  recompute?: boolean;
+  /** --recompute 조인 키 — runId. */
+  run?: string;
+  /** --recompute 조인 키 — journeyKey(Pod 자식이 물려받는 키). */
+  journey?: string;
+  /** --recompute 대상 그래프 id (기본 self-implement). */
+  graph?: string;
 }
 
 // ── 인스턴스 타겟 해석 (LF7-b) ────────────────────────────────────────
@@ -1522,14 +1532,349 @@ export function aggregateListEvents(
   return { events, truncated, unreadable };
 }
 
+// ── L0 커버리지 «런 종료 후» 조인 재계산 (ARG-L0-COVER · 2026-10-24) ──────
+//
+// 🩸 계기: `#25957` 은 런이 **끝나는 순간** logs.db «한 곳»만 읽어 `l0-coverage` 를 낸다.
+//   설치본 10-12 표본 = declarationCoverage 1 · traversalCoverage 11/26(0.423076923) · unjoinedNodes 15.
+//   그 15 는 «다른 프로세스(Pod)가 자기 우주에 남긴 걸음»이라 종료 시점엔 원리상 조인할 수 없다.
+//   ⇒ 조회 시점에 부모·Pod 스토어를 `journeyKey`/`runId` 로 합쳐 다시 세는 경로가 «없어서»
+//     사람이 두 우주를 손으로 오가며 셌고, 그때마다 0.42 를 «미달»로 오독했다.
+//
+// ⛔ 이 재계산은 **조회 시점의 별도 표시**다 — 런 종료 관측(`l0-coverage`)과 원장 형식은 «그대로» 둔다.
+// ⛔ 미관측(unobserved)을 skipped 나 0 으로 접지 않는다. 셋은 서로 다른 값이다:
+//     joined     = 이 런/여정에서 실제로 걸었다(어느 스토어에서 봤는지까지 남긴다)
+//     skipped    = 조건이 거짓이라 안 걸었다 — **관측이 그렇게 판정한 행이 있을 때만**
+//     unobserved = 아무도 안 봤다 — 분자에도 분모의 다른 칸에도 섞지 않는다
+// ⛔ 조인 안 된 노드를 `unjoinedNodes: ['a','b',…]` 하나로 뭉개지 않는다 —
+//   **스토어(우주/호스트)별 + 사유별**로 낸다(사유가 다르면 처방이 다르다).
+
+/** 조인되지 않은 «사유» — 닫힌 어휘. 자유 문자열이면 「왜 안 붙었나」를 셀 수 없다. */
+export type L0UnjoinedReason =
+  /** 같은 그래프 선언이 아니다(다른 graphId/버전) — 노드 id 를 비교할 수 없다. */
+  | 'graph-mismatch'
+  /** 여정 단계(phase) 행이 아니다 — 걸음이 아니라 다른 관측이다. */
+  | 'phase-mismatch'
+  /** journeyKey 가 둘 다 있는데 다르다 — 다른 여정(프로세스)의 걸음이다. */
+  | 'journey-key-mismatch'
+  /** runId 가 둘 다 있는데 다르다 — 조인 키가 이 런이 아니다. */
+  | 'run-id-mismatch'
+  /** 행에 runId 도 journeyKey 도 없다 — «내 것인지» 판정할 근거가 없다(0 으로 접지 않는다). */
+  | 'identity-absent';
+
+export interface JoinedCoverageRow {
+  readonly event: string;
+  readonly data: string | null;
+}
+
+export interface JoinedCoverageStore {
+  readonly name: string;
+  readonly rows: readonly JoinedCoverageRow[];
+}
+
+export interface JoinedCoverageInput {
+  readonly runId?: string;
+  readonly journeyKey?: string;
+  readonly stores: readonly JoinedCoverageStore[];
+  /** 열지 못한 스토어(다른 우주/호스트) — «못 본» 사실을 수 옆에 남긴다. */
+  readonly storesNotQueried?: readonly string[];
+}
+
+export interface JoinedCoverageUnjoined {
+  readonly node: string;
+  readonly host: string;
+  readonly reason: L0UnjoinedReason;
+}
+
+export interface L0CoverageMeasureResult {
+  readonly declarationCoverage: number | null;
+  readonly traversalCoverage: number | null;
+  readonly declaredStageCount: number;
+  readonly listedStageCount: number;
+  readonly accountedNodeCount: number;
+  readonly declaredNodeCount: number;
+}
+
+/** 계량기는 주입받는다 — `graph-templates`(typescript 를 싣는다)를 CLI 정적 의존으로 끌어오지 않기 위해서다. */
+export type L0CoverageMeasure = (
+  template: GraphTemplate,
+  entered: Iterable<string>,
+  skipped: Iterable<string>,
+) => L0CoverageMeasureResult;
+
+export interface JoinedL0Coverage extends L0CoverageMeasureResult {
+  readonly graphId: string;
+  readonly graphVersion: string;
+  readonly runId: string | null;
+  readonly journeyKey: string | null;
+  readonly joinedNodes: ReadonlyArray<{ readonly node: string; readonly hosts: readonly string[] }>;
+  readonly skippedNodes: readonly string[];
+  readonly unobservedNodes: readonly string[];
+  readonly unjoinedNodes: readonly JoinedCoverageUnjoined[];
+  readonly unjoinedByHost: ReadonlyArray<{
+    readonly host: string;
+    readonly count: number;
+    readonly reasons: ReadonlyArray<{ readonly reason: L0UnjoinedReason; readonly nodes: readonly string[] }>;
+  }>;
+  readonly storesRead: ReadonlyArray<{
+    readonly name: string;
+    readonly nodeRows: number;
+    readonly skippedRows: number;
+  }>;
+  readonly storesNotQueried: readonly string[];
+}
+
+interface ParsedPipelineNodeRow {
+  readonly host: string;
+  readonly node: string;
+  readonly runId?: string;
+  readonly journeyKey?: string;
+  readonly graphId?: string;
+  readonly graphVersion?: string;
+  readonly phase?: string;
+}
+
+/** 원장 행(data JSON) → 조인 판정에 필요한 칸. `node` 가 없으면 걸음 행이 아니다. */
+function parsePipelineNodeRow(host: string, data: string | null): ParsedPipelineNodeRow | null {
+  if (data === null) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(data); } catch { return null; }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.node !== 'string' || record.node.length === 0) return null;
+  const text = (key: string): string | undefined => {
+    const value = record[key];
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+  };
+  const runId = text('runId');
+  const journeyKey = text('journeyKey');
+  const graphId = text('graphId');
+  const graphVersion = text('graphVersion');
+  const phase = text('phase');
+  return {
+    host,
+    node: record.node,
+    ...(runId === undefined ? {} : { runId }),
+    ...(journeyKey === undefined ? {} : { journeyKey }),
+    ...(graphId === undefined ? {} : { graphId }),
+    ...(graphVersion === undefined ? {} : { graphVersion }),
+    ...(phase === undefined ? {} : { phase }),
+  };
+}
+
+/** null = 이 런/여정의 걸음이다. 그 밖에는 «왜 아닌지» 하나. */
+function pipelineNodeRowMismatch(
+  template: Pick<GraphTemplate, 'graphId' | 'version'>,
+  key: Pick<JoinedCoverageInput, 'runId' | 'journeyKey'>,
+  row: ParsedPipelineNodeRow,
+): L0UnjoinedReason | null {
+  if (row.graphId !== undefined && row.graphId !== template.graphId) return 'graph-mismatch';
+  if (row.graphVersion !== undefined && row.graphVersion !== template.version) return 'graph-mismatch';
+  if (row.phase !== undefined && row.phase !== 'journey') return 'phase-mismatch';
+  // ⭐ Pod 자식은 runId 가 다르다 — journeyKey 가 같으면 «같은 여정»이라 붙인다(이 조각의 요점).
+  const byJourney = key.journeyKey !== undefined && row.journeyKey === key.journeyKey;
+  const byRun = key.runId !== undefined && row.runId === key.runId;
+  if (byJourney || byRun) return null;
+  if (key.journeyKey !== undefined && row.journeyKey !== undefined) return 'journey-key-mismatch';
+  if (key.runId !== undefined && row.runId !== undefined) return 'run-id-mismatch';
+  return 'identity-absent';
+}
+
+/**
+ * 여러 스토어(부모·Pod)의 `pipeline-node-entry`/`node-skipped` 를 조인 키로 합쳐
+ * 선언·걸음 커버리지를 다시 센다. 런 종료 관측은 건드리지 않는다.
+ */
+export function recomputeJoinedL0Coverage(
+  template: GraphTemplate,
+  input: JoinedCoverageInput,
+  measure: L0CoverageMeasure,
+): JoinedL0Coverage {
+  const nodeRows: ParsedPipelineNodeRow[] = [];
+  const skippedRows: ParsedPipelineNodeRow[] = [];
+  const storesRead: Array<{ name: string; nodeRows: number; skippedRows: number }> = [];
+  for (const store of input.stores) {
+    let nodeRowCount = 0;
+    let skippedRowCount = 0;
+    for (const row of store.rows) {
+      const parsed = parsePipelineNodeRow(store.name, row.data);
+      if (parsed === null) continue;
+      if (row.event === 'pipeline-node-entry') { nodeRows.push(parsed); nodeRowCount += 1; }
+      else if (row.event === 'node-skipped') { skippedRows.push(parsed); skippedRowCount += 1; }
+    }
+    storesRead.push({ name: store.name, nodeRows: nodeRowCount, skippedRows: skippedRowCount });
+  }
+
+  const declaredNodeIds = template.nodes.map((node) => node.nodeId);
+  const enteredHosts = new Map<string, Set<string>>();
+  const unjoined: JoinedCoverageUnjoined[] = [];
+  const unjoinedSeen = new Set<string>();
+
+  for (const nodeId of declaredNodeIds) {
+    const joinedHosts = new Set<string>();
+    for (const row of nodeRows) {
+      if (row.node !== nodeId) continue;
+      const reason = pipelineNodeRowMismatch(template, input, row);
+      if (reason === null) { joinedHosts.add(row.host); continue; }
+      const dedupeKey = `${row.host}\u0000${reason}\u0000${nodeId}`;
+      if (unjoinedSeen.has(dedupeKey)) continue;
+      unjoinedSeen.add(dedupeKey);
+      unjoined.push({ node: nodeId, host: row.host, reason });
+    }
+    if (joinedHosts.size > 0) enteredHosts.set(nodeId, joinedHosts);
+  }
+
+  const unjoinedNodes = new Set(unjoined.map((entry) => entry.node));
+  const joinedNodes = declaredNodeIds
+    .filter((nodeId) => enteredHosts.has(nodeId))
+    .map((nodeId) => ({ node: nodeId, hosts: [...enteredHosts.get(nodeId)!].sort() }));
+
+  const skipped = new Set<string>();
+  for (const row of skippedRows) {
+    if (!declaredNodeIds.includes(row.node)) continue;
+    if (enteredHosts.has(row.node)) continue;
+    if (pipelineNodeRowMismatch(template, input, row) !== null) continue;
+    skipped.add(row.node);
+  }
+  const skippedNodes = [...skipped];
+
+  // ⛔ unobserved 는 «아무도 안 봤다» — joined·skipped·unjoined 중 어디에도 없는 칸에 그대로 남긴다.
+  const unobservedNodes = declaredNodeIds.filter((nodeId) => (
+    !enteredHosts.has(nodeId) && !skipped.has(nodeId) && !unjoinedNodes.has(nodeId)
+  ));
+
+  const byHost = new Map<string, Map<L0UnjoinedReason, Set<string>>>();
+  for (const entry of unjoined) {
+    let reasons = byHost.get(entry.host);
+    if (reasons === undefined) { reasons = new Map(); byHost.set(entry.host, reasons); }
+    let nodes = reasons.get(entry.reason);
+    if (nodes === undefined) { nodes = new Set(); reasons.set(entry.reason, nodes); }
+    nodes.add(entry.node);
+  }
+  const unjoinedByHost = [...byHost.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([host, reasons]) => ({
+      host,
+      count: [...reasons.values()].reduce((sum, nodes) => sum + nodes.size, 0),
+      reasons: [...reasons.entries()]
+        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+        .map(([reason, nodes]) => ({ reason, nodes: [...nodes].sort() })),
+    }));
+
+  const coverage = measure(template, joinedNodes.map(({ node }) => node), skippedNodes);
+  return {
+    ...coverage,
+    graphId: template.graphId,
+    graphVersion: template.version,
+    runId: input.runId ?? null,
+    journeyKey: input.journeyKey ?? null,
+    joinedNodes,
+    skippedNodes,
+    unobservedNodes,
+    unjoinedNodes: [...unjoined].sort((a, b) => (
+      a.host < b.host ? -1 : a.host > b.host ? 1 : a.node < b.node ? -1 : a.node > b.node ? 1 : 0
+    )),
+    unjoinedByHost,
+    storesRead,
+    storesNotQueried: input.storesNotQueried ?? [],
+  };
+}
+
+/** 사람용 렌더 — 각 수 옆에 «무엇을 셌나»를 붙인다(미관측·미조인·안 읽은 스토어를 접지 않는다). */
+export function renderJoinedL0Coverage(result: JoinedL0Coverage): string {
+  const ratio = (value: number | null): string => (value === null ? '미측정' : String(value));
+  const lines = [
+    `L0 커버리지 재계산(조인) — ${result.graphId}@${result.graphVersion} · runId=${result.runId ?? '(없음)'} · journeyKey=${result.journeyKey ?? '(없음)'}`,
+    `  선언 커버리지 ${ratio(result.declarationCoverage)} (단계 ${result.declaredStageCount}/${result.listedStageCount})`,
+    `  걸음 커버리지 ${ratio(result.traversalCoverage)} (노드 ${result.accountedNodeCount}/${result.declaredNodeCount} = 조인 ${result.joinedNodes.length} + 건너뜀 ${result.skippedNodes.length} · 미관측 ${result.unobservedNodes.length} 는 세지 않음)`,
+  ];
+  if (result.storesRead.length > 0) {
+    lines.push(`  읽은 스토어: ${result.storesRead.map((store) => `${store.name}(걸음 ${store.nodeRows}·건너뜀 ${store.skippedRows})`).join(' · ')}`);
+  }
+  if (result.joinedNodes.length > 0) {
+    lines.push(`  조인된 노드 ${result.joinedNodes.length}개: ${result.joinedNodes.map(({ node, hosts }) => `${node}⟨${hosts.join('·')}⟩`).join(' ')}`);
+  }
+  if (result.skippedNodes.length > 0) {
+    lines.push(`  건너뜀(조건 거짓 · 관측 판정) ${result.skippedNodes.length}개: ${result.skippedNodes.join(', ')}`);
+  }
+  if (result.unobservedNodes.length > 0) {
+    lines.push(`  ⛔ 미관측 ${result.unobservedNodes.length}개 — 건너뜀도 0도 아니다(아무도 안 봤다 · 읽은 스토어 원장에 이 런/여정 걸음이 없다): ${result.unobservedNodes.join(', ')}`);
+  }
+  for (const bucket of result.unjoinedByHost) {
+    lines.push(`  미조인 ${bucket.host} ${bucket.count}개: ${bucket.reasons.map(({ reason, nodes }) => `${reason}=${nodes.join(',')}`).join(' · ')}`);
+  }
+  if (result.storesNotQueried.length > 0) {
+    lines.push(`  ⚠ 안 읽은 스토어 ${result.storesNotQueried.length}개: ${result.storesNotQueried.join(', ')} — 위 수는 «읽은 스토어 안에서만» 센 값이다(전체 미조인 수는 더 클 수 있다).`);
+  }
+  return lines.join('\n');
+}
+
+/** `--recompute` 조회 — 열린 스토어들의 걸음 이벤트 행을 «전부» 모아 조인 계층이 이 런/여정인지 판정하게 넘긴다. */
+async function runLogsCoverageRecompute(
+  opts: LogsCliOpts,
+  opened: ReadonlyArray<{ name: string; store: LogStore }>,
+  storesNotQueried: readonly string[],
+): Promise<number> {
+  const runId = opts.run?.trim() || undefined;
+  const journeyKey = opts.journey?.trim() || undefined;
+  const closeAll = (): void => { for (const { store } of opened) store.close(); };
+  if (runId === undefined && journeyKey === undefined) {
+    console.error('elanous logs: --recompute 는 조인 키가 필요하다 — --run <runId> 또는 --journey <journeyKey>');
+    closeAll();
+    return 1;
+  }
+  const graphId = opts.graph?.trim() || 'self-implement';
+  // 동적 import — typescript 를 무는 모듈이라 «재계산 경로에서만» 싣는다(기본 조회 무회귀).
+  const { GRAPH_TEMPLATES, measureL0Coverage } = await import('../self-implement/graph-templates.js');
+  const template = GRAPH_TEMPLATES[graphId];
+  if (template === undefined) {
+    console.error(`elanous logs: --graph '${graphId}' 는 선언된 그래프가 아니다 (선언: ${Object.keys(GRAPH_TEMPLATES).join(', ')})`);
+    closeAll();
+    return 1;
+  }
+  // ⛔ 조회 단계에서 조인 키로 미리 거르지 않는다(`grep: runId|journeyKey` 사전필터 금지).
+  //   미리 거르면 열린 스토어 안의 «다른 여정» 걸음 행이 조인 계층에 도달하지 못해,
+  //   `journey-key-mismatch` 로 잡혀야 할 선언 노드가 «아무도 안 봤다(unobserved)» 로 오분류된다.
+  //   ⇒ 이벤트 필터(`pipeline-node-entry`/`node-skipped`)로만 읽고 «내 것인가» 판정은 조인 계층에 전부 맡긴다.
+  const stores: JoinedCoverageStore[] = [];
+  const unreadable: string[] = [];
+  for (const { name, store } of opened) {
+    const rows: JoinedCoverageRow[] = [];
+    try {
+      for (const row of store.queryAll({ events: ['pipeline-node-entry', 'node-skipped'] })) {
+        rows.push({ event: row.event, data: row.data });
+      }
+    } catch (error) {
+      unreadable.push(name);
+      console.error(`elanous logs: ${name} 조회 실패 — ${error instanceof Error ? error.message : String(error)}`);
+    }
+    stores.push({ name, rows });
+  }
+  const result = recomputeJoinedL0Coverage(template, {
+    ...(runId === undefined ? {} : { runId }),
+    ...(journeyKey === undefined ? {} : { journeyKey }),
+    stores,
+    storesNotQueried: [...storesNotQueried, ...unreadable],
+  }, measureL0Coverage);
+  if (opts.json) {
+    console.log(JSON.stringify({ _meta: { type: 'log-query-l0-coverage-recomputed' }, ...result }));
+  } else {
+    console.log(renderJoinedL0Coverage(result));
+  }
+  closeAll();
+  return unreadable.length > 0 ? 2 : 0;
+}
+
 /** 조회 또는 follow. follow 는 Ctrl-C 까지 블록. 복수 타겟(--all)은 ts 병합. */
 export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): Promise<number> {
   const remoteFlag = resolveLogsRemoteFlag(opts);
   if (remoteFlag !== undefined) {
     if (opts.topFailures) { console.error('elanous logs: --top-failures 는 로컬 스토어 조회에서만 지원'); return 1; }
+    // 조인 재계산은 «여러 스토어의 원장 행»을 합치는 일이다 — 원격 한 번 조회로는 성립하지 않는다.
+    if (opts.recompute) { console.error('elanous logs: --recompute 는 로컬 스토어에서만 지원 — 원격은 로컬 원장을 못 본다'); return 1; }
     return runLogsCliRemote(opts, remoteFlag, deps);
   }
   if (opts.topFailures && opts.follow) { console.error('elanous logs: --top-failures 는 --follow 와 함께 쓸 수 없다'); return 1; }
+  // 한 번의 조인 재계산은 «한 시점의 스냅숏»이다 — follow 와 섞으면 폴마다 다른 답을 낸다.
+  if (opts.recompute && opts.follow) { console.error('elanous logs: --recompute 는 --follow 와 함께 쓸 수 없다'); return 1; }
   const threshold = opts.threshold === undefined ? 20 : Number(opts.threshold);
   if (opts.topFailures && (!Number.isSafeInteger(threshold) || threshold < 1)) {
     console.error('elanous logs: --threshold 는 양의 정수여야 한다'); return 1;
@@ -1548,10 +1893,12 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
   // read-only open — 타겟이 어느 인스턴스든 CLI 조회는 write 0 (연합 불변식).
   const opened: Array<{ name: string; store: LogStore }> = [];
   const missing: string[] = [];
+  /** 열지 못한 타겟 이름 — 조인 재계산이 «못 본 우주»를 0 으로 접지 않게 그대로 넘긴다. */
+  const missingNames: string[] = [];
   for (const t of resolved.targets) {
-    if (!existsSync(t.dbPath)) { missing.push(`${t.name} (${t.dbPath})`); continue; }
+    if (!existsSync(t.dbPath)) { missing.push(`${t.name} (${t.dbPath})`); missingNames.push(t.name); continue; }
     try { opened.push({ name: t.name, store: LogStore.openReadOnly(t.dbPath) }); }
-    catch { missing.push(`${t.name} (${t.dbPath} — open 실패)`); }
+    catch { missing.push(`${t.name} (${t.dbPath} — open 실패)`); missingNames.push(t.name); }
   }
   const openedStores = opened.map(({ name, store }) => ({ name, path: store.path }));
   // 등록된 존재 DB의 고유 경로가 조회 가능 모집단이다. 선택 규칙은 건드리지 않고,
@@ -1589,6 +1936,8 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
     return 1;
   }
   if (missing.length > 0) console.error(`elanous logs: 스킵 — ${missing.join(' · ')}`);
+  // ⭐ 런 종료 «이후» 조인 재계산 — 별도 표시 모드다(기본 조회·런 종료 관측·원장 형식 무변경).
+  if (opts.recompute === true) return runLogsCoverageRecompute(opts, opened, missingNames);
   if (opts.topFailures) {
     const rows: LogStoreRow[] = [];
     const unreadable: string[] = [];
@@ -2041,6 +2390,12 @@ const logsCmd = program.command('logs')
   .option('--instance <name>', '레지스트리 등록 인스턴스 타겟 (prod|test:<repo>|…)')
   .option('--all', '전 인스턴스 연합 조회 — read-only 병합·⟨instance⟩ 태그')
   .option('--include-test', '--all 연합에 격리 test 인스턴스도 포함(기본 제외)')
+  // ⭐ ARG-L0-COVER — 런이 «끝난 뒤» 부모·Pod 스토어의 걸음을 journeyKey/runId 로 합쳐 다시 센다.
+  //   ⛔ 런 종료 관측(`l0-coverage`)을 덮어쓰지 않는다 — 조회 시점의 별도 표시다.
+  .option('--recompute', '열린 스토어들(부모·Pod)의 pipeline-node-entry 로 L0 커버리지를 다시 조인 계산 (--run 또는 --journey 필요)')
+  .option('--run <id>', '--recompute 조인 키: runId')
+  .option('--journey <key>', '--recompute 조인 키: journeyKey (Pod 자식이 물려받은 키)')
+  .option('--graph <id>', '--recompute 대상 그래프 (기본 self-implement)')
   // ⛔ `-r` 은 값을 받지 않는다 — default 북마크만. 이름은 `--remote <name>` 으로만 준다.
   .option('-r', 'query logs on the default remote bookmark (does not take a value)')
   .option('--remote <name>', 'query logs on a named remote bookmark via GET /v1/logs')

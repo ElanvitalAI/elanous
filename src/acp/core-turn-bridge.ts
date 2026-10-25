@@ -429,6 +429,12 @@ export function bridgeCoreTurnToAcp(
         ...(maxToolTurns !== undefined ? { maxToolTurns } : {}),
         ...((!factQuestion || explicitMaxToolTurns !== undefined) && deps.budgetGrant !== undefined ? { budgetGrant: deps.budgetGrant } : {}),
         callbacks: {
+          onGoalInterim: (text) => {
+            void turnCtx.pushSessionUpdate(
+              { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } },
+              { goalInterim: text },
+            );
+          },
           onText: (delta, full) => {
             // ⛔ 검증 보충이 붙은 최종 답의 재방출(`onText('', 답+보충)`)은 흘리지 않는다 — 빈 청크를 TUI 는
             //   «확정(commit)»으로 읽어 이미 그린 답을 굳히고, 아래 onTurnComplete 재표면화가 같은 답을

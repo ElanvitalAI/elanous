@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { taskParentRoleEnv } from './task-parent-role-llm.js';
+import { taskParentRoleEnv, taskParentRolePinsForChild } from './task-parent-role-llm.js';
 import { getUserConfig, resolveRoleLlm } from '../user-config.js';
 
 test('TA-PARENT-ROLE-LLM: exhausted Codex subscription can pin parent audit/classify to credit GLM without changing the child', () => {
@@ -25,4 +25,16 @@ test('TA-PARENT-ROLE-LLM: malformed or non-parent role pins fail before launch',
   expect(() => taskParentRoleEnv(['audit=unknown'])).toThrow('--role-llm');
   expect(() => taskParentRoleEnv(['audit='])).toThrow('--role-llm');
   expect(() => taskParentRoleEnv(['audit=openrouter', 'audit=anthropic'])).toThrow('--role-llm');
+});
+
+test('PLANNING-FOLLOWS-CHILD-LLM: child supplies planning while explicit planning wins', () => {
+  const child = { provider: 'openai-codex', model: 'gpt-6-luna' };
+  const inferred = taskParentRolePinsForChild([], child);
+  expect(inferred).toEqual(['planning={"provider":"openai-codex","model":"gpt-6-luna"}']);
+  const inferredEnv = taskParentRoleEnv(inferred);
+  expect(JSON.parse(inferredEnv.ELANOUS_ROLE_LLM_PLANNING!)).toEqual(child);
+  expect(resolveRoleLlm('planning', { config: getUserConfig(), env: inferredEnv })).toMatchObject({ ...child, source: 'environment' });
+  const explicit = 'planning={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}';
+  expect(taskParentRolePinsForChild([explicit], child)).toEqual([explicit]);
+  expect(taskParentRolePinsForChild([], undefined)).toEqual([]);
 });

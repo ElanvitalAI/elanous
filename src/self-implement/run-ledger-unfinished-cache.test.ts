@@ -102,11 +102,12 @@ test('isolates injected readers and their read failures from one another and fro
     expect(fromA).toMatchObject({ entries: [], cacheHits: 0, cacheMisses: 1 });
     const fromB = query(readerB);
     expect(fromB).toMatchObject({ cacheHits: 0, cacheMisses: 1 });
-    expect(fromB.entries).toEqual(query(readerB, true).entries);
+    const withoutElapsedAge = (entries: typeof fromB.entries) => entries.map(({ lastActivityAgeMs: _age, ...entry }) => entry);
+    expect(withoutElapsedAge(fromB.entries)).toEqual(withoutElapsedAge(query(readerB, true).entries));
     expect(fromB.entries).toEqual([expect.objectContaining({ runId, branch: 'default', status: 'terminal-status-missing' })]);
     const failed = query(failingReader);
     expect(failed).toMatchObject({ unreadableLedgerCount: 1, cacheHits: 0, cacheMisses: 1 });
-    expect(failed.entries).toEqual(query(failingReader, true).entries);
+    expect(withoutElapsedAge(failed.entries)).toEqual(withoutElapsedAge(query(failingReader, true).entries));
     expect(failed.entries).toEqual([expect.objectContaining({ runId, status: 'ledger-unreadable' })]);
     expect(query()).toMatchObject({ entries: [], cacheHits: 1, cacheMisses: 0 });
     expect(query(readerA)).toMatchObject({ entries: [], cacheHits: 1, cacheMisses: 0 });

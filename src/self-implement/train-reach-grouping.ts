@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { isAbsolute } from 'node:path';
 import { selectGateTestFiles } from './gate-cli.js';
+import { defineTrainGrouping } from '../../scripts/release-loop/gate-closure.js';
 
 export interface TrainReachCandidate {
   pr: string;
@@ -126,9 +127,14 @@ export function buildTrainReachDecision(input: TrainReachInput, inspect: Inspect
   const edges: Array<{ left: number; right: number; tests: string[]; paths: string[] }> = [];
   for (let left = 0; left < measured.length; left++) {
     for (let right = left + 1; right < measured.length; right++) {
-      const tests = measured[left].tests.filter((path) => measured[right].tests.includes(path));
+      // 도달 시험 집합의 교집합이 «같은 열차»를 정한다 — TRAIN-REACH-GROUPING 원장(gate-closure.ts).
+      const grouping = defineTrainGrouping(
+        { pr: measured[left].candidate.pr, tests: measured[left].tests },
+        { pr: measured[right].candidate.pr, tests: measured[right].tests },
+      );
+      const tests = [...grouping.intersection];
       const paths = measured[left].files.filter((path) => measured[right].files.includes(path));
-      if (!tests.length && !paths.length) continue;
+      if (!grouping.sameTrain && !paths.length) continue;
       edges.push({ left, right, tests, paths });
       parent[find(right)] = find(left);
     }

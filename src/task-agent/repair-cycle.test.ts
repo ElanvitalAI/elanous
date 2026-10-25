@@ -28,6 +28,71 @@ function fixture() {
   return { dir, statePath, card, input };
 }
 
+test('supervisor report-deficit consumes the same evidence without requesting a PR repair', async () => {
+  const f = fixture();
+  let launched = 0;
+  const deficit = { evidenceId: 'run-evidence-1', previousEvidence: 'previous evidence', round: 0, kind: 'unwired' as const };
+  const outcome = await runRepairCycle(f.input({ supervisorDeficit: deficit, request: async () => { launched++; } }));
+  expect(outcome).toMatchObject({ decision: 'would-repair', reason: 'connect-goal · evidence run-evidence-1' });
+  expect(launched).toBe(0);
+  expect(readTaskCard(f.card.id, f.statePath)?.repairs).toBeUndefined();
+});
+
+test('repair reads the originating run supervisor ledger only while its deficit remains unresolved', async () => {
+  const f = fixture();
+  const card = { ...f.card, runId: 'run-grounded' };
+  writeTaskCards(f.statePath, [card]);
+  const deficit = { runId: card.runId, event: 'supervisor-report-deficit', data: {
+    evidenceId: 'evidence-grounded', kind: 'unwired', round: 0, previousEvidence: 'prior-run evidence', gateLog: 'original gate' } };
+  const fill = { runId: card.runId, event: 'goal-slot-fill', data: { result: 'unverifiable', round: 0 } };
+  const requested: string[] = [];
+  const shadow = await runRepairCycle(f.input({ readRunLedger: (runId: string) => {
+    expect(runId).toBe(card.runId);
+    return [deficit, fill];
+  }, request: async () => { requested.push('launch'); } }));
+  expect(shadow).toMatchObject({ decision: 'would-repair', reason: 'connect-goal · evidence evidence-grounded' });
+  expect(requested).toEqual([]);
+  expect(readTaskCard(f.card.id, f.statePath)?.repairs).toBeUndefined();
+  const resolved = await runRepairCycle(f.input({ readRunLedger: () => [deficit, { ...fill, data: { ...fill.data, result: 'filled' } }],
+    request: async () => { requested.push('launch'); }, observeLaunch: () => {} }));
+  expect(resolved.decision).toBe('repair-requested');
+  expect(requested).toEqual(['launch']);
+  const newerRound = fixture();
+  writeTaskCards(newerRound.statePath, [{ ...newerRound.card, runId: card.runId }]);
+  const stale = await runRepairCycle(newerRound.input({ readRunLedger: () => [deficit, { ...fill, data: { ...fill.data, round: 1 } }],
+    request: async () => { requested.push('new-round-launch'); }, observeLaunch: () => {} }));
+  expect(stale.decision).toBe('repair-requested');
+  expect(requested).toContain('new-round-launch');
+});
+
+test('terminal report-deficit with the same card runId prevents a blind PR relaunch', async () => {
+  const f = fixture();
+  const runId = 'run-terminal-report';
+  writeTaskCards(f.statePath, [{ ...f.card, runId }]);
+  let launches = 0;
+  const result = await runRepairCycle(f.input({ readRunLedger: () => [{ runId, event: 'supervisor-report-deficit',
+    data: { evidenceId: 'report:run-terminal-report:terminal-state-not-reviewed', kind: 'unmeasured', round: 0,
+      previousEvidence: 'classification raw', classification: { classification: 'report-deficit' } } }],
+  request: async () => { launches++; } }));
+  expect(result).toMatchObject({ decision: 'would-repair', reason: 'remeasure · evidence report:run-terminal-report:terminal-state-not-reviewed' });
+  expect(launches).toBe(0);
+  expect(readTaskCard(f.card.id, f.statePath)?.history).toContainEqual(expect.objectContaining({
+    event: 'repair-grounding', runId, detail: result.reason,
+  }));
+  const history = readTaskCard(f.card.id, f.statePath)?.history?.filter((entry) => entry.event === 'repair-grounding');
+  expect(history).toHaveLength(1);
+  const resolved = fixture();
+  writeTaskCards(resolved.statePath, [{ ...resolved.card, runId }]);
+  let resumed = 0;
+  const green = await runRepairCycle(resolved.input({ readRunLedger: () => [
+    { runId, event: 'supervisor-report-deficit', data: { evidenceId: 'report:run-terminal-report:terminal-state-not-reviewed',
+      kind: 'unmeasured', round: 0, previousEvidence: 'classification raw', classification: { classification: 'report-deficit' } } },
+    { runId, event: 'goal-slot-fill', data: { round: 0, result: 'filled' } },
+  ], request: async () => { resumed++; }, observeLaunch: () => {} }));
+  expect(green.decision).toBe('repair-requested');
+  expect(resumed).toBe(1);
+});
+
 test('repair tick cap zero defers eligible launches but preserves missing-owner stop', async () => {
   const eligible = fixture();
   const budget = { max: 0, requested: 0, capped: 0 };
@@ -212,7 +277,7 @@ test('real CAS records a single-use push intent; missing worker result and rever
   execFileSync('git', ['init', '-q', '-b', 'feature', repo]);
   git(repo, 'config', 'user.name', 'repair test'); git(repo, 'config', 'user.email', 'repair@example.test');
   writeFileSync(join(repo, 'file.txt'), 'base\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base');
-  git(repo, 'remote', 'add', 'origin', bare); git(repo, 'push', '-q', 'origin', 'HEAD:refs/heads/feature');
+  git(repo, 'remote', 'add', 'origin', bare); git(repo, '-c', 'core.hooksPath=/dev/null', 'push', '-q', 'origin', 'HEAD:refs/heads/feature');
   const baseHead = git(repo, 'rev-parse', 'HEAD');
   execFileSync('git', ['clone', '-q', '-b', 'feature', bare, child]);
   git(child, 'config', 'user.name', 'repair test'); git(child, 'config', 'user.email', 'repair@example.test');
@@ -237,7 +302,7 @@ test('real CAS records a single-use push intent; missing worker result and rever
         pushes++;
         expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]).toMatchObject({ status: 'unconfirmed', commit });
       }
-      const r = spawnSync('git', args, { cwd, encoding: 'utf8' }); return { status: r.status, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? '') };
+      const r = spawnSync('git', args[0] === 'push' ? ['-c', 'core.hooksPath=/dev/null', ...args] : args, { cwd, encoding: 'utf8' }); return { status: r.status, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? '') };
     },
     prView() { return { state: 'OPEN', head: git(repo, 'ls-remote', 'origin', 'refs/heads/feature').split('\t')[0]!, branch: 'feature', crossRepository: false, headRepo: 'owner/repo' }; },
     originRepo() { return 'owner/repo'; },
@@ -546,6 +611,17 @@ test('TA-PARENT-ROLE-LLM: card parent policy survives automatic same-PR repair r
   expect(launches).toHaveLength(1);
   expect(launches[0]?.parentRoleLlm).toEqual([pin]);
   expect(launches[0]?.model).toEqual({ provider: 'glm', model: 'glm-5.3' });
+});
+
+test('PLANNING-FOLLOWS-CHILD-LLM: inferred planning pin survives a same-PR repair request', async () => {
+  const f = fixture();
+  const planningPin = 'planning={"provider":"openai-codex","model":"gpt-6-luna"}';
+  writeTaskCards(f.statePath, [{ ...f.card, childLlm: { provider: 'openai-codex', model: 'gpt-6-luna' }, parentRoleLlm: [planningPin] }]);
+  const launches: RepairLaunchRequest[] = [];
+  const outcome = await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
+  expect(outcome.decision).toBe('repair-requested');
+  expect(launches).toHaveLength(1);
+  expect(launches[0]?.parentRoleLlm).toEqual([planningPin]);
 });
 
 test('tier-less repair cards dispatch as 중 and never charge Sol on even PRs', () => {

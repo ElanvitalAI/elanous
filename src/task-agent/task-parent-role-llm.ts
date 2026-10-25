@@ -34,3 +34,12 @@ export function taskParentRoleEnv(values: readonly string[]): Record<string, str
   }
   return env;
 }
+
+/** A child model also powers planning unless the caller pinned planning explicitly. */
+export function taskParentRolePinsForChild(
+  values: readonly string[], child?: { provider: string; model: string },
+): string[] {
+  const env = taskParentRoleEnv(values);
+  if (!child || env[roleLlmEnvName('planning')] !== undefined) return [...values];
+  return [...values, `planning=${JSON.stringify({ provider: child.provider, model: child.model })}`];
+}

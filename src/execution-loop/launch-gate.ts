@@ -88,8 +88,6 @@ export function activeRunsForGoal(goalId: string, deps: ActiveRunsForGoalDeps = 
   }
 }
 
-const LAUNCH_BUDGET_PROVIDER: Readonly<Record<string, string>> = { 'codex-rotate': CODEX_PROVIDER, grok: GROK_PROVIDER };
-
 /**
  * L6 발사 관문의 예산 입력 보정 — 발사 우주의 config 에 체인이 없으면(작업 트리 = 시험 우주) 막지 않고
  * 코드 기본 체인으로 판단한다. `--child-llm-provider` 를 명시했으면 그것이 체인이다(예산 판정 밖 provider 는 통과).
@@ -98,6 +96,9 @@ export function harnessLaunchBudgetDecision(
   inputs: BudgetInputs,
   opts: { readonly childLlmProvider?: string; readonly childLlmModel?: string } = {},
 ): { readonly decision: BudgetDecision; readonly warning?: string; readonly unmeasuredProvider?: string } {
+  // Resolve imported provider constants only when the launch gate is called.
+  // This module participates in the CLI/tool catalog import cycle.
+  const launchBudgetProvider: Readonly<Record<string, string>> = { 'codex-rotate': CODEX_PROVIDER, grok: GROK_PROVIDER };
   const explicit = opts.childLlmProvider?.trim();
   const judged = (selected: BudgetInputs) => {
     const { decision, unmeasuredProvider } = decideLaunchBudget(selected);
@@ -114,7 +115,7 @@ export function harnessLaunchBudgetDecision(
     return judged({ ...inputs, preference: { ...inputs.preference, chain } });
   }
   if (inputs.preference.chain.length > 0) return judged(inputs);
-  const chain = DEFAULT_FALLBACK_CHAIN.map((step) => ({ provider: LAUNCH_BUDGET_PROVIDER[step] ?? step }));
+  const chain = DEFAULT_FALLBACK_CHAIN.map((step) => ({ provider: launchBudgetProvider[step] ?? step }));
   const result = judged({ ...inputs, preference: { ...inputs.preference, chain } });
   return {
     ...result,

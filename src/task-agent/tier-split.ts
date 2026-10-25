@@ -43,10 +43,11 @@ export function composeSliceHandText(sliceGoal: string, parentText: string, mark
     const label = INHERITED_PARENT_LABELS.exec(line)?.[1];
     return label !== undefined && !sliceHas.has(label);
   });
-  // The slice marker also carries review scope. Device slices now own their
-  // completion boundary, so inherited can be empty while the marker is needed.
+  // 표지는 리뷰 범위를 나르므로 장치 우선 조각(총 2 이상)은 상속 줄이 없어도 남는다 —
+  // 다만 «물려받았다» 는 물려받은 줄에 대한 주장이므로 그 줄이 있을 때만 붙인다.
   if (inherited.length === 0 && (marker.total < 2 || !sliceGoal.includes(`동작: ${DEVICE_FIRST_STEP}`))) return sliceGoal;
-  const tag = `조각 ${marker.index}/${marker.total} — 부모 ${marker.cid ?? '(칸 없음)'}(${marker.fromTier}) 를 중 이하로 나눈 몫. 아래 계약·완료 경계는 부모 칸에서 물려받았다 — 이 조각 범위만 채운다.`;
+  const inheritanceClaim = inherited.length > 0 ? ' 아래 계약·완료 경계는 부모 칸에서 물려받았다 — 이 조각 범위만 채운다.' : '';
+  const tag = `조각 ${marker.index}/${marker.total} — 부모 ${marker.cid ?? '(칸 없음)'}(${marker.fromTier}) 를 중 이하로 나눈 몫.${inheritanceClaim}`;
   return [...sliceLines, tag, ...inherited].join('\n');
 }
 

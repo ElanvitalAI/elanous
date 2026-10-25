@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { createGateRunner, gateExecutorOf, parseOptions, requestedGateExecutor } from './gate-node.js';
 import { resumeReleaseRun } from './resume-release.js';
+import './resume-test-traffic.js';
 import { releaseResumeGateExecutor, releaseResumeWaiver } from './resume.js';
 import { buildReleaseRunInput } from './unattended-release.js';
 
@@ -203,7 +204,7 @@ test('(d) resume --gate-executor host --gate-host node-b re-runs gate on the hos
     expect(back.input.gateExecutor).toBe('pod');
     expect('gateRemote' in back.input).toBe(false);
     const after = JSON.parse(readFileSync(stateFile, 'utf8')) as GraphRunState;
-    expect(after.inputOverrides!.map((item) => item.set.gateExecutor)).toEqual(['host', 'pod']);
+    expect(after.inputOverrides!.map((item) => 'gateExecutor' in item.set ? item.set.gateExecutor : undefined)).toEqual(['host', 'pod']);
     expect(after.inputOverrides![1]).toMatchObject({ unset: ['gateRemote'], previous: { gateExecutor: 'host', gateRemote: 'node-b' } });
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 120_000);

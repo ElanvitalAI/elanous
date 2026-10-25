@@ -12,6 +12,7 @@ import { labelPrerelease } from './publish-node.js';
 import { parseOptions as gateOptions } from './gate-node.js';
 import { debug } from '../../src/debug/log.js';
 import { TRACEABLE_RELEASE_JSON } from './gate-closure.js';
+import './resume-test-traffic.js';
 
 const releaseSnapshot = {
   graphSha: createHash('sha256').update(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'))).digest('hex'),
@@ -120,6 +121,72 @@ test('RELEASE-BRANCH: the bump lands only on release/<v>; main keeps -dev.N and 
     git(stray, 'commit', '-m', 'stray');
     git(stray, 'push', f.origin, 'HEAD:refs/heads/release/0.2.19');
     expect(() => cutReleaseBranchForRun(f.repo, '0.2.19', { install: () => {}, freeze: () => null })).toThrow();
+  } finally { f.done(); }
+});
+
+test('RELEASE-NODE-IDEMPOTENT: a graph run reuses only its owned release branch across resume attempts', () => {
+  const f = fixture();
+  try {
+    const first = cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => {}, freeze: () => null, runId: 'run-one', root: f.root });
+    expect(first).toMatchObject({ outcome: 'ok', artifactOwner: { runId: 'run-one', attempt: 0 } });
+    expect(git(f.origin, 'log', '-1', '--format=%B', 'release/0.2.18')).toContain('Elanous-Release-Run: run-one');
+    const attempts = join(f.root, 'release', '0.2.18', 'resume-attempts');
+    mkdirSync(attempts, { recursive: true });
+    writeFileSync(join(attempts, 'run-one.json'), JSON.stringify({ version: '0.2.18', runId: 'run-one', attempts: ['2026-10-23T00:00:00.000Z'] }));
+    const again = cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => { throw new Error('duplicate install'); }, freeze: () => null,
+      runId: 'run-one', root: f.root });
+    expect(again).toMatchObject({ existing: true, commit: first.commit, artifactOwner: { runId: 'run-one', attempt: 0 } });
+    expect(git(f.origin, 'rev-parse', 'release/0.2.18')).toBe(first.commit!);
+  } finally { f.done(); }
+});
+
+test('RELEASE-NODE-IDEMPOTENT: a foreign run is backed up and refused without moving any remote release ref', () => {
+  const f = fixture();
+  try {
+    const first = cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => {}, freeze: () => null, runId: 'run-one', root: f.root });
+    const backup = `release-backup/0.2.18/${first.commit}`;
+    const refuse = () => cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => { throw new Error('must not install'); }, freeze: () => null,
+      runId: 'run-two', root: f.root });
+    expect(refuse).toThrow(`preserved ${first.commit} at ${backup}`);
+    expect(git(f.origin, 'rev-parse', 'release/0.2.18')).toBe(first.commit!);
+    expect(git(f.origin, 'rev-parse', backup)).toBe(first.commit!);
+    expect(refuse).toThrow('refusing to replace a foreign release branch');
+    expect(git(f.origin, 'rev-parse', backup)).toBe(first.commit!);
+  } finally { f.done(); }
+});
+
+test('RELEASE-NODE-IDEMPOTENT: a legacy tip belongs to the same run only when its saved successful node records that exact tip', () => {
+  const f = fixture();
+  try {
+    const legacy = cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => {}, freeze: () => null });
+    const runFile = join(f.root, 'graph-runs', 'release-loop', 'legacy-run.json');
+    mkdirSync(join(f.root, 'graph-runs', 'release-loop'), { recursive: true });
+    const legacyOutput = (commit: string) => ({ nodeId: 'version-release', ok: true,
+      output: JSON.stringify({ outcome: 'ok', version: '0.2.18', branch: 'release/0.2.18', commit }) });
+    const oldOutput = legacyOutput('a'.repeat(40));
+    const latestOutput = { ...legacyOutput(legacy.commit!), output: `${oldOutput.output}\n${legacyOutput(legacy.commit!).output}\n` };
+    writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'legacy-run', input: { version: '0.2.18', branchCut: true },
+      nodes: [oldOutput, latestOutput] }));
+    const attempts = join(f.root, 'release', '0.2.18', 'resume-attempts');
+    mkdirSync(attempts, { recursive: true });
+    writeFileSync(join(attempts, 'legacy-run.json'), JSON.stringify({ version: '0.2.18', runId: 'legacy-run', attempts: ['2026-10-23T00:00:00.000Z'] }));
+    const reused = cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => {}, freeze: () => null, runId: 'legacy-run', root: f.root });
+    expect(reused).toMatchObject({ existing: true, commit: legacy.commit, artifactOwner: { runId: 'legacy-run', attempt: 0 } });
+    const priorRoot = process.env.ELANOUS_STATE_DIR;
+    const priorContext = process.env.ELANOUS_GRAPH_CONTEXT;
+    try {
+      process.env.ELANOUS_STATE_DIR = f.root;
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId: 'legacy-run', input: { version: '0.2.18', branchCut: true } });
+      expect(versionNode(['release', '--json'], f.repo)).toMatchObject({ outcome: 'ok', existing: true, commit: legacy.commit,
+        artifactOwner: { runId: 'legacy-run', attempt: 0 } });
+    } finally {
+      if (priorRoot === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = priorRoot;
+      if (priorContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = priorContext;
+    }
+    writeFileSync(runFile, JSON.stringify({ graphId: 'release-loop', runId: 'legacy-run', input: { version: '0.2.18', branchCut: true },
+      nodes: [legacyOutput('a'.repeat(40)), legacyOutput('b'.repeat(40))] }));
+    expect(() => cutReleaseBranchForRun(f.repo, '0.2.18', { install: () => {}, freeze: () => null, runId: 'legacy-run', root: f.root }))
+      .toThrow('refusing to replace a foreign release branch');
   } finally { f.done(); }
 });
 
@@ -358,9 +425,9 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
   try {
     const state = join(f.root, 'state');
     const seen: Array<{ nodeId: string; commit: unknown; context: string; command: string }> = [];
-    let gateFails = true;
+    let failNode = 'gate';
     // Node commands are not executed: version-release runs the real branch cut; every other node records the context
-    // the runner handed it (gate fails once). Nothing is published.
+    // handed to it and selected nodes fail once. Repeated resumes exercise repair at successive release stages.
     const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
       const contextPath = opts.env!.ELANOUS_GRAPH_CONTEXT!;
       const raw = readFileSync(contextPath, 'utf8');
@@ -371,9 +438,10 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
       const copy = join(f.root, `ctx-${seen.length}.json`);
       writeFileSync(copy, raw);
       seen.push({ nodeId: context.nodeId, commit: context.outputs['version-release']?.commit, context: copy, command: body });
-      if (context.nodeId === 'gate' && gateFails) return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}\n' };
+      if (context.nodeId === failNode) return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}\n' };
       return { exitCode: 0, stderr: '', stdout: '{"outcome":"ok","verdict":"pass"}\n' };
     };
+    const resumeDeps = { root: state, ledgerRoot: state, repo: f.repo, runBash };
     const { runGraph } = await import('../../src/graph-runner/runner.js');
     const first = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'),
       { input: { version: '0.2.18', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }, deps: { root: state, runBash } });
@@ -389,15 +457,35 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     git(f.repo, 'fetch', 'origin', 'release/0.2.18');
     const commandRoot = join(f.root, 'cut-command-root');
     git(f.repo, 'worktree', 'add', '--detach', commandRoot, tip);
-    gateFails = false;
-    seen.length = 0;
-    await expect(resumeReleaseRun({ runId: first.runId, from: 'gate', commandRoot }, { root: state, repo: f.repo, runBash }))
+    mkdirSync(join(commandRoot, 'node_modules'), { recursive: true });
+    mkdirSync(join(commandRoot, 'apps', 'pwa', 'node_modules'), { recursive: true });
+    failNode = 'export-check';
+    await expect(resumeReleaseRun({ runId: first.runId, from: 'gate', commandRoot }, resumeDeps))
       .rejects.toThrow('resume at export-check or earlier');
-    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'export-check', commandRoot }, { root: state, repo: f.repo, runBash });
-    expect(resumed.tip).toMatchObject({ changed: true, from: cut, to: tip });
+    seen.length = 0;
+    const exportRepair = await resumeReleaseRun({ runId: first.runId, from: 'export-check', commandRoot }, resumeDeps);
+    expect(exportRepair.state.status).toBe('failed');
+    expect(seen.filter((item) => item.nodeId === 'export-check')).toHaveLength(1);
+    failNode = 'prepare';
+    const prepareRepair = await resumeReleaseRun({ runId: first.runId, from: 'export-check', commandRoot }, resumeDeps);
+    expect(prepareRepair.state.status).toBe('failed');
+    expect(seen.filter((item) => item.nodeId === 'prepare')).toHaveLength(1);
+    failNode = 'known-issues';
+    const knownIssuesRepair = await resumeReleaseRun({ runId: first.runId, from: 'prepare', commandRoot }, resumeDeps);
+    expect(knownIssuesRepair.state.status).toBe('failed');
+    expect(seen.filter((item) => item.nodeId === 'known-issues')).toHaveLength(1);
+    failNode = '';
+    const finalStart = seen.length;
+    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'known-issues', commandRoot }, resumeDeps);
+    // The first post-append resume refreshes the saved tip. Later node-failure resumes must see it unchanged.
+    expect(resumed.tip).toMatchObject({ changed: false, from: tip, to: tip });
     expect(resumed.state.status).toBe('done');
-    expect(seen.map((item) => item.nodeId)).toEqual(['export-check', 'prefetch', 'gate', 'traffic-gate-passed', 'mac-smoke', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues',
-      'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump']);
+    expect(seen.slice(finalStart).map((item) => item.nodeId).slice(0, 2)).toEqual(['known-issues', 'notes-check']);
+    expect(seen.slice(finalStart).at(-1)?.nodeId).toBe('version-dev-bump');
+    expect(seen.map((item) => item.nodeId)).toContain('docs');
+    expect(seen.map((item) => item.nodeId)).toContain('publish');
+    // The final resumed tail includes the graph's publication and verification stages.
+    expect(resumed.state.path.slice(-13)).toEqual(['known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     // Shadow publication on the real resume path: the three post-approval visits must dispatch three
     // distinct commands. The injected runner never publishes anything outside this temporary test universe.
     expect(seen.filter((item) => ['publish', 'npm-publish', 'docs-land'].includes(item.nodeId)).map((item) => [item.nodeId, item.command]))

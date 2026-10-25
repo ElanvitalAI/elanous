@@ -21,13 +21,43 @@ function readRegularManifest(path: string): Buffer {
   } finally { closeSync(fd); }
 }
 
+function releaseAttempt(root: string, version: string, runId: string): number {
+  const path = join(root, 'release', version, 'resume-attempts', `${runId}.json`);
+  if (!existsSync(path)) return 0;
+  let value: { version?: unknown; runId?: unknown; attempts?: unknown };
+  try { value = JSON.parse(readFileSync(path, 'utf8')) as typeof value; }
+  catch { throw new Error(`invalid release resume attempts: ${path}`); }
+  if (value.version !== version || value.runId !== runId || !Array.isArray(value.attempts)
+    || value.attempts.some((at) => typeof at !== 'string' || !Number.isFinite(Date.parse(at))))
+    throw new Error(`invalid release resume attempts: ${path}`);
+  return value.attempts.length;
+}
+
+/** Old releases predate the owner receipt; their own graph ledger can still prove the prepared output. */
+function preparedByRun(root: string, runId: string, out: string, commit: string): boolean {
+  try {
+    const ledger = JSON.parse(readFileSync(join(root, 'graph-runs', 'release-loop', `${runId}.json`), 'utf8')) as
+      { runId?: string; graphId?: string; nodes?: Array<{ nodeId?: string; ok?: boolean; output?: string }> };
+    if (ledger.runId !== runId || ledger.graphId !== 'release-loop') return false;
+    return ledger.nodes?.some((node) => {
+      if (node.nodeId !== 'prepare' || !node.ok || typeof node.output !== 'string') return false;
+      try {
+        const output = JSON.parse(node.output.trim().split('\n').at(-1) ?? '') as { out?: string; commit?: string; outcome?: string };
+        return output.outcome === 'ok' && output.out === out && output.commit === commit;
+      } catch { return false; }
+    }) ?? false;
+  } catch { return false; }
+}
+
 export function runPrepare(run: CommandRunner = runCommand, move: typeof renameSync = renameSync) {
   const context = readGraphContext();
   const { version, previousVersion } = context.input;
   if (!isReleaseVersion(version)) throw new Error(`invalid release version: ${version}`);
+  if (context.runId && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(context.runId)) throw new Error('invalid release runId');
   const commit = nodeOutput(context, 'version-release', 'commit');
   for (const node of ['gate', 'pwa']) if (context.outputs[node]?.outcome !== 'ok') throw new Error(`${node} did not pass`);
   const root = effectiveInstanceRoot();
+  const attempt = context.runId ? releaseAttempt(root, version, context.runId) : undefined;
   const out = join(root, 'release', version, 'prepared');
   if ([join(root, 'release'), join(root, 'release', version)]
     .some((path) => lstatSync(path, { throwIfNoEntry: false })?.isSymbolicLink()))
@@ -41,22 +71,44 @@ export function runPrepare(run: CommandRunner = runCommand, move: typeof renameS
     // archive is left untouched for investigation; never erase it merely because the path is occupied.
     const old = context.outputs['version-release']?.refreshedFrom;
     const manifestPath = join(out, 'release.json');
-    if (typeof old !== 'string' || !/^[0-9a-f]{40}$/i.test(old) || old === commit
-      || !occupied.isDirectory() || !existsSync(manifestPath) || !lstatSync(manifestPath).isFile())
+    if (!occupied.isDirectory() || !existsSync(manifestPath) || !lstatSync(manifestPath).isFile())
       throw new Error(`prepare output already exists with unverified source: ${out}`);
     if (realpathSync(out) !== join(realpathSync(root), 'release', version, 'prepared'))
       throw new Error(`prepare output escapes release root: ${out}`);
     let manifest: { version?: unknown; sourceCommit?: unknown };
     try { staleManifestBytes = readRegularManifest(manifestPath); manifest = JSON.parse(staleManifestBytes.toString('utf8')) as typeof manifest; }
     catch { throw new Error(`prepare output already exists with unreadable manifest: ${out}`); }
-    if (manifest.version !== version || manifest.sourceCommit !== old)
+    const manifestSource = manifest.sourceCommit;
+    if (manifest.version !== version || typeof manifestSource !== 'string' || !/^[0-9a-f]{40}$/i.test(manifestSource)
+      || (manifestSource !== commit && manifestSource !== old))
       throw new Error(`prepare output already exists for another source: ${out}`);
+    const ownerPath = join(out, '.release-node-owner.json');
+    let owner: { runId?: string; commit?: string } | undefined;
+    if (existsSync(ownerPath)) {
+      try { owner = JSON.parse(readRegularManifest(ownerPath).toString('utf8')) as typeof owner; }
+      catch { throw new Error(`prepare output owner unreadable: ${out}`); }
+    }
+    const sameRun = !!context.runId && (owner?.runId === context.runId && owner.commit === manifestSource
+      || !owner && preparedByRun(root, context.runId, out, manifestSource));
+    if (manifestSource === commit && sameRun) {
+      const candidate = join(out, 'dist', 'elanous.tgz');
+      if (!existsSync(candidate)) throw new Error(`prepare output incomplete for same run: ${out}`);
+      return { outcome: 'ok' as const, verdict: 'pass' as const,
+        summary: `prepare ${version} · ${commit.slice(0, 12)} reused`, out, candidate, commit,
+        artifactOwner: { runId: context.runId, attempt, reused: true } };
+    }
+    // A different run's complete archive is never consumed. Without a verified owner, an archive at the
+    // current tip remains untouched; a refreshed old tip can still follow the existing guarded quarantine.
+    if (manifestSource === commit && !owner?.runId)
+      throw new Error(`prepare output already exists with unverified owner: ${out}`);
+    if (manifestSource !== commit && (typeof old !== 'string' || !/^[0-9a-f]{40}$/i.test(old) || old === commit))
+      throw new Error(`prepare output already exists with unverified source: ${out}`);
     staleParents = [join(root, 'release'), join(root, 'release', version)].map((path) => {
       const stat = lstatSync(path);
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`prepare output escapes release root: ${out}`);
       return { path, dev: stat.dev, ino: stat.ino, real: realpathSync(path) };
     });
-    staleSource = old;
+    staleSource = manifestSource;
   }
   const ref = `v${previousVersion}^{commit}`;
   const prev = run('git', ['rev-parse', '--verify', ref]);
@@ -119,7 +171,11 @@ export function runPrepare(run: CommandRunner = runCommand, move: typeof renameS
   if (command.status !== 0 || manifest?.version !== version || manifest.sourceCommit !== commit || manifest.distDir !== join(out, 'dist')) {
     throw new Error(`prepare incomplete (rc=${command.status}): ${lastResult(command)?.error ?? command.stderr.trim()}`);
   }
-  return { outcome: 'ok' as const, verdict: 'pass' as const, summary: `prepare ${version} · ${commit.slice(0, 12)}`, out, candidate: join(out, 'dist', 'elanous.tgz'), commit };
+  const artifactOwner = context.runId ? { runId: context.runId, attempt, commit } : undefined;
+  if (artifactOwner && existsSync(join(out, 'release.json')))
+    writeFileSync(join(out, '.release-node-owner.json'), JSON.stringify(artifactOwner) + '\n', { flag: 'wx', mode: 0o600 });
+  return { outcome: 'ok' as const, verdict: 'pass' as const, summary: `prepare ${version} · ${commit.slice(0, 12)}`, out, candidate: join(out, 'dist', 'elanous.tgz'), commit,
+    ...(artifactOwner ? { artifactOwner } : {}) };
 }
 
 if (import.meta.main) {

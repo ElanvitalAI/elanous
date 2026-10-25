@@ -6,6 +6,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { constants as osConstants, hostname } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { HarnessCliInputError } from '../cli/cli-user-error.js';
+import { writeStdoutFully } from '../cli/stdout-flush.js';
 import { findGitDir } from '../git-fs/locate.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import { loadSelfDevRun } from '../self-dev/run-store.js';
@@ -30,7 +31,7 @@ import { buildRunProgressRows, isPartialRunningRuns, queryRunningRuns, renderRun
 import { launchBindingRunIds, readLaunchBinding } from './launch-registry.js';
 import { psProcessStartMs } from './harness-stop.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
-import { collectDraftMetrics, collectOverlapMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, resolveDraftSweepCloseCap, runDraftSweep, sweepFailureReason, type DraftSweepAdapters, type DraftSweepResult, type OverlapMetricAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
+import { collectDraftMetrics, collectOverlapMetrics, DRAFT_SWEEP_CONCURRENCY, mapBounded, resolveDraftSweepCloseCap, runDraftSweep, sweepFailureReason, validateDraftSweepApplyPlan, type DraftSweepAdapters, type DraftSweepResult, type OverlapMetricAdapters, type SweepDraft, type SweepMergedPr, type SweepReviewGate } from '../self-dev/draft-sweep.js';
 import { readAskPreflightRowsSince, readSalvagedRowsSince } from '../self-dev/ask-launch-io.js';
 import { replayPodTerminals, type DraftResidueReplayOptions, type PrTerminalRecord } from '../self-dev/draft-residue.js';
 import { draftClaimComment, draftReleaseComment } from '../self-dev/draft-triage-rules.js';
@@ -2533,10 +2534,35 @@ const defaultDraftSweepStopRun: DraftSweepStopRun = async (runId) => {
   return stopHarnessRun(runId, defaultHarnessStopDeps());
 };
 
-export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand, cwd = process.cwd(),
+export interface GithubDraftSweepAdapterOptions {
+  /** Read-only preview bounds. Reaching a bound is reported as an incomplete inventory. */
+  maxInventoryPages?: number;
+  maxDrafts?: number;
+  maxMerged?: number;
+  onInventoryProgress?: (event: { state: 'open' | 'closed'; page: number; rows: number }) => void;
+  /** Test seam: provide an isolated run-ledger inventory instead of enumerating the host's stores. */
+  runLedgerMatches?: () => readonly RunLedgerMatch[];
+  /** Test seam: provide isolated running-run observations instead of inspecting host processes and PTY stores. */
+  runningRunStatuses?: () => ReadonlyMap<string, string>;
+  /** Test seam for bounded GitHub check-run backoff. */
+  checkRunRetryDelaysMs?: readonly number[];
+  checkRunSleep?: (milliseconds: number) => Promise<void>;
+}
+
+function createGithubDraftSweepAdapters(execute: GhExecute, git: DraftSweepGitExecute, cwd: string,
   executeAsync: (args: string[]) => Promise<string> = execute === executeGh ? executeGhAsync : async (args) => execute(args),
-  stopRun: DraftSweepStopRun = defaultDraftSweepStopRun): GithubDraftSweepAdapters {
+  stopRun: DraftSweepStopRun = defaultDraftSweepStopRun, options: GithubDraftSweepAdapterOptions = {}): GithubDraftSweepAdapters {
   const ensuredSweepLabels = new Set<string>();
+  const maxInventoryPages = Number.isSafeInteger(options.maxInventoryPages) && options.maxInventoryPages! > 0
+    ? Math.min(options.maxInventoryPages!, 100) : 100;
+  const maxDrafts = Number.isSafeInteger(options.maxDrafts) && options.maxDrafts! > 0 ? options.maxDrafts : undefined;
+  const maxMerged = Number.isSafeInteger(options.maxMerged) && options.maxMerged! > 0 ? options.maxMerged : undefined;
+  let inventoryIncompleteReason: string | undefined;
+  const markInventoryIncomplete = (reason: string) => { inventoryIncompleteReason ??= reason; };
+  const checkRunRetryDelays = options.checkRunRetryDelaysMs ?? [1_000, 2_000, 4_000];
+  const sleepForCheckRunRetry = options.checkRunSleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  let checkRunsQueue: Promise<void> = Promise.resolve();
+  let checkRunsUnavailableReason: string | undefined;
   const inventory = async (repository: string, state: 'open' | 'closed'): Promise<GithubPull[]> => {
     // ⛔ A large repository has tens of thousands of closed PRs (2026-09-28: 21k → «exceeded pagination limit», no sweep at all).
     //    Merged twins only matter after the oldest open draft was opened, so the closed listing stops at that time.
@@ -2548,14 +2574,27 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
       if (!Number.isFinite(cutoff)) throw new Error('Incomplete GitHub PR inventory');
     }
     const all: GithubPull[] = [];
-    for (let page = 1; page <= 100; page++) {
-      const batch = githubPullsPage(repository, state, page, execute);
+    for (let page = 1; page <= maxInventoryPages; page++) {
+      let batch: GithubPull[];
+      try { batch = githubPullsPage(repository, state, page, execute); }
+      catch (error) {
+        if (maxInventoryPages < 100) {
+          markInventoryIncomplete(`${state} PR inventory stopped after ${page - 1} pages (${all.length} rows): ${sweepFailureReason(error)}`);
+          return all;
+        }
+        throw error;
+      }
       if (!Array.isArray(batch) || batch.length > 100) throw new Error('Incomplete GitHub PR inventory');
       all.push(...batch);
+      options.onInventoryProgress?.({ state, page, rows: all.length });
       if (batch.length < 100) return all;
       // An unknown update time cannot prove the rest is older — keep paging.
       const oldest = Date.parse(batch[batch.length - 1]!.updated_at ?? '');
       if (cutoff !== undefined && Number.isFinite(oldest) && oldest < cutoff) return all;
+    }
+    if (maxInventoryPages < 100) {
+      markInventoryIncomplete(`${state} PR inventory capped at ${maxInventoryPages} pages (${all.length} rows observed)`);
+      return all;
     }
     throw new Error('GitHub PR inventory exceeded pagination limit');
   };
@@ -2643,17 +2682,57 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     }
     throw new Error('Review inventory exceeded pagination limit');
   };
-  const checkRunsFor = async (repository: string, sha: string): Promise<Array<{ conclusion?: string | null }> | undefined> => {
+  const readCheckRuns = async (repository: string, sha: string): Promise<Array<{ conclusion?: string | null }>> => {
     const runs: Array<{ conclusion?: string | null }> = [];
     for (let page = 1; page <= 100; page++) {
-      const result = await ghJsonAsync<{ total_count?: number; check_runs?: Array<{ conclusion?: string | null }> }>(
-        ['api', `repos/${repository}/commits/${sha}/check-runs?per_page=100&page=${page}`]);
-      if (!Array.isArray(result?.check_runs) || result.check_runs.length > 100) throw new Error('Incomplete check-run inventory');
+      let result: { total_count?: number; check_runs?: Array<{ conclusion?: string | null }> } | undefined;
+      let attempt = 0;
+      while (true) {
+        try {
+          result = await ghJsonAsync<{ total_count?: number; check_runs?: Array<{ conclusion?: string | null }> }>(
+            ['api', `repos/${repository}/commits/${sha}/check-runs?per_page=100&page=${page}`]);
+          break;
+        } catch (error) {
+          const reason = sweepFailureReason(error);
+          const retryable = /(?:\b403\b|\b429\b|rate.?limit|secondary rate)/i.test(reason);
+          if (!retryable || attempt >= checkRunRetryDelays.length) {
+            const incomplete = `check-run inventory incomplete for ${repository}@${sha}: ${reason}`;
+            checkRunsUnavailableReason ??= incomplete;
+            markInventoryIncomplete(incomplete);
+            throw new Error(incomplete);
+          }
+          await sleepForCheckRunRetry(checkRunRetryDelays[attempt++]!);
+        }
+      }
+      if (!Array.isArray(result?.check_runs) || result.check_runs.length > 100 || !Number.isSafeInteger(result.total_count) || result.total_count! < 0) {
+        const incomplete = `check-run inventory incomplete for ${repository}@${sha}: malformed page ${page}`;
+        checkRunsUnavailableReason ??= incomplete;
+        markInventoryIncomplete(incomplete);
+        throw new Error(incomplete);
+      }
       runs.push(...result.check_runs);
-      if (Number.isSafeInteger(result.total_count) && runs.length >= result.total_count!) return runs;
-      if (result.check_runs.length < 100) return Number.isSafeInteger(result.total_count) && runs.length < result.total_count! ? undefined : runs;
+      if (runs.length >= result.total_count!) return runs;
+      if (result.check_runs.length < 100) {
+        const incomplete = `check-run inventory incomplete for ${repository}@${sha}: expected ${result.total_count}, received ${runs.length} (check-runs may have changed during pagination or the response may be incomplete)`;
+        checkRunsUnavailableReason ??= incomplete;
+        markInventoryIncomplete(incomplete);
+        throw new Error(incomplete);
+      }
     }
-    return undefined;
+    const incomplete = `check-run inventory incomplete for ${repository}@${sha}: pagination limit reached`;
+    checkRunsUnavailableReason ??= incomplete;
+    markInventoryIncomplete(incomplete);
+    throw new Error(incomplete);
+  };
+  const checkRunsFor = async (repository: string, sha: string): Promise<Array<{ conclusion?: string | null }>> => {
+    let release!: () => void;
+    const previous = checkRunsQueue;
+    checkRunsQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      if (checkRunsUnavailableReason) throw new Error(checkRunsUnavailableReason);
+      return await readCheckRuns(repository, sha);
+    } finally { release(); }
   };
   const headCommitTimeFor = async (repository: string, number: number): Promise<string | undefined> => {
     let latest: string | undefined;
@@ -2732,13 +2811,16 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
   const enrichedDrafts = (repository: string): Promise<SweepDraft[]> => {
     if (!draftRows.has(repository)) draftRows.set(repository, (async () => {
       const prs = (await listed(open, repository, 'open')).filter((pr) => pr.draft);
-      await prefetchDetails(repository, prs.map((pr) => pr.number));
-      const matches = ledgerMatches ??= listRunLedgers().matches;
-      return mapBounded(prs, DRAFT_SWEEP_CONCURRENCY, async (pr): Promise<SweepDraft> => {
+      const selected = maxDrafts === undefined ? prs : prs.slice(0, maxDrafts);
+      if (selected.length < prs.length) markInventoryIncomplete(`draft inventory capped at ${maxDrafts} drafts (${prs.length} drafts listed)`);
+      await prefetchDetails(repository, selected.map((pr) => pr.number));
+      const matches = readRunLedgerMatches();
+      return mapBounded(selected, DRAFT_SWEEP_CONCURRENCY, async (pr): Promise<SweepDraft> => {
         return {
           number: pr.number, title: pr.title, branch: pr.head.ref,
           labels: pr.labels.map((item) => item.name), createdAt: pr.created_at, body: pr.body ?? undefined,
           changedFiles: await prFiles(repository, pr.number),
+          ...(pr.head.sha ? { headSha: pr.head.sha } : {}),
           ...(pr.updated_at ? { updatedAt: pr.updated_at } : {}),
           runId: currentDraftSweepRunId(matches, repository, pr.number),
         };
@@ -2749,8 +2831,10 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
   const enrichedMerged = (repository: string): Promise<SweepMergedPr[]> => {
     if (!mergedRows.has(repository)) mergedRows.set(repository, (async () => {
       const prs = (await listed(closed, repository, 'closed')).filter((pr) => pr.merged_at !== null && pr.base?.ref === 'main');
-      await prefetchDetails(repository, prs.map((pr) => pr.number));
-      return mapBounded(prs, DRAFT_SWEEP_CONCURRENCY, async (pr): Promise<SweepMergedPr> => ({
+      const selected = maxMerged === undefined ? prs : prs.slice(0, maxMerged);
+      if (selected.length < prs.length) markInventoryIncomplete(`merged PR inventory capped at ${maxMerged} records (${prs.length} records listed)`);
+      await prefetchDetails(repository, selected.map((pr) => pr.number));
+      return mapBounded(selected, DRAFT_SWEEP_CONCURRENCY, async (pr): Promise<SweepMergedPr> => ({
         number: pr.number, title: pr.title, branch: pr.head.ref, body: pr.body ?? undefined,
         mergedAt: pr.merged_at ?? undefined, changedFiles: await prFiles(repository, pr.number),
         mergeCommitMessage: await mergeCommitMessageFor(repository, pr),
@@ -2760,19 +2844,35 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
   };
   let ledgerMatches: readonly RunLedgerMatch[] | undefined;
   let running: ReadonlyMap<string, string> | undefined;
-  const runStatusFor = (draft: SweepDraft, repository: string): string | undefined => {
-    ledgerMatches ??= listRunLedgers().matches;
-    running ??= new Map(queryRunningRuns().entries.map((entry) => [entry.runId, entry.status]));
+  const readRunLedgerMatches = (): readonly RunLedgerMatch[] => {
+    ledgerMatches ??= options.runLedgerMatches?.() ?? listRunLedgers().matches;
+    return ledgerMatches;
+  };
+  const readRunningRunStatuses = (): ReadonlyMap<string, string> => {
+    running ??= options.runningRunStatuses?.() ?? new Map(queryRunningRuns().entries.map((entry) => [entry.runId, entry.status]));
+    return running;
+  };
+  const runStatusFor = (draft: Pick<SweepDraft, 'number' | 'branch' | 'runId'>, repository: string): string | undefined => {
+    const matches = readRunLedgerMatches();
+    const statuses = readRunningRunStatuses();
     if (draft.runId) {
-      const match = ledgerMatches.find((entry) => entry.runId === draft.runId);
-      return match ? draftSweepRunStatus([match], running, repository, draft.number) : undefined;
+      const match = matches.find((entry) => entry.runId === draft.runId);
+      return match ? draftSweepRunStatus([match], statuses, repository, draft.number) : undefined;
     }
-    return draftSweepRunStatus(ledgerMatches, running, repository, draft.number);
+    return draftSweepRunStatus(matches, statuses, repository, draft.number);
   };
   return {
+    inventoryStatus: async () => ({ complete: inventoryIncompleteReason === undefined, ...(inventoryIncompleteReason ? { reason: inventoryIncompleteReason } : {}) }),
     openPullRequests: (repository) => listed(open, repository, 'open'),
-    runLedgerMatches: () => (ledgerMatches ??= listRunLedgers().matches),
+    runLedgerMatches: readRunLedgerMatches,
     getPrFiles: async (repository, number) => prFiles(repository, number),
+    getDraftSnapshot: async (repository, number) => {
+      const pr = await ghJsonAsync<GithubPull>(['api', `repos/${repository}/pulls/${number}`]);
+      if (!pr || pr.number !== number || !Array.isArray(pr.labels) || !pr.head?.sha || !pr.updated_at
+        || (pr.state !== 'open' && pr.state !== 'closed')) return undefined;
+      return { number: pr.number, state: pr.state, draft: pr.draft, headSha: pr.head.sha,
+        branch: pr.head.ref, updatedAt: pr.updated_at, labels: pr.labels.map((item) => item.name) };
+    },
     getPr: async (repository, number) => {
       const pr = ghJson<GithubPull>(['api', `repos/${repository}/pulls/${number}`], execute);
       if (!pr || pr.number !== number || typeof pr.head?.ref !== 'string' || !Array.isArray(pr.labels)) return undefined;
@@ -2804,8 +2904,8 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     getRunStatus: async (draft, repository) => runStatusFor(draft, repository),
     getLatestFileChanges: async (draft, repository) => latestFileChangesFor(draft, repository),
     hasFinalRunResult: async (draft, repository) => {
-      ledgerMatches ??= listRunLedgers().matches;
-      const ownedRuns = new Set(ledgerMatches.filter((match) => {
+      const matches = readRunLedgerMatches();
+      const ownedRuns = new Set(matches.filter((match) => {
         const prEvents = match.entries.filter((entry) => entry.event === 'pr-opened' && entry.data.number === draft.number);
         return prEvents.length > 0 && prEvents.every((entry) => ledgerPrRepository(entry.data, draft.number) === repository);
       }).map((match) => match.runId));
@@ -2863,7 +2963,7 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
     getActiveClaimRunId: async (repository, number) => activeClaimRunIdFromBodies(await claimCommentsFor(repository, number)),
     getLastClaimReleaseAt: async (repository, number) => lastClaimReleaseAtFromBodies(await claimCommentsFor(repository, number)),
     listTaskCards: async () => Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(taskAgentStatePath()).tasks ?? {}),
-    listPrTerminals: async () => listRunLedgers().matches.flatMap((match) => match.entries.filter((entry) => entry.event === 'pr-terminal')
+    listPrTerminals: async () => readRunLedgerMatches().flatMap((match) => match.entries.filter((entry) => entry.event === 'pr-terminal')
       .map((entry) => entry.data as unknown as PrTerminalRecord)),
     commentDraft: async (repository, number, body) => { execute(['pr', 'comment', String(number), '--repo', repository, '--body', body]); },
     listIssueComments: async (repository, number) => issueCommentsFor(repository, number, 'same-cell'),
@@ -2883,6 +2983,18 @@ export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: Dr
       }
     },
   };
+}
+
+export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand,
+  cwd = process.cwd(), executeAsync?: (args: string[]) => Promise<string>, stopRun?: DraftSweepStopRun,
+  options: GithubDraftSweepAdapterOptions = {}): GithubDraftSweepAdapters {
+  return createGithubDraftSweepAdapters(execute, git, cwd, executeAsync, stopRun, options);
+}
+
+export function githubDraftSweepPreviewAdapters(options: GithubDraftSweepAdapterOptions,
+  execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand, cwd = process.cwd(),
+  executeAsync?: (args: string[]) => Promise<string>, stopRun?: DraftSweepStopRun): GithubDraftSweepAdapters {
+  return createGithubDraftSweepAdapters(execute, git, cwd, executeAsync, stopRun, options);
 }
 
 export interface HarnessDraftSweepDeps {
@@ -3033,7 +3145,12 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
     .option('--json', '판정 결과를 JSON 으로 출력')
     .option('--repo <owner/name>', '조회할 GitHub 저장소')
     .option('--close-cap <n>', '이번 틱 최대 종료 수 (1~100 · config tools.selfImplement.draftSweepCloseCap 보다 우선 · 기본 10)')
-    .action(async (opts: { apply?: boolean; json?: boolean; repo?: string; closeCap?: string }) => {
+    .option('--max-pages <n>', 'inventory 상한 (페이지, dry-run 기본 1 · apply 기본 100 · 1~100)')
+    .option('--max-drafts <n>', 'draft 상한 (dry-run 기본 10 · apply 기본 무제한)')
+    .option('--max-merged <n>', 'merged PR 상한 (dry-run 기본 50 · apply 기본 무제한)')
+    .option('--emit-apply-plan', '완전한 dry-run 분류에서 고정 적용 계획을 JSON에 포함 (모든 PR에 head SHA와 updatedAt 필요)')
+    .option('--apply-plan-file <path>', '고정 적용 계획 JSON 파일 (apply 전용)')
+    .action(async (opts: { apply?: boolean; json?: boolean; repo?: string; closeCap?: string; maxPages?: string; maxDrafts?: string; maxMerged?: string; emitApplyPlan?: boolean; applyPlanFile?: string }) => {
       try {
         const write = deps.write ?? console.log;
         const execute = deps.execute ?? executeGh;
@@ -3044,8 +3161,26 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
         if (!DRAFT_SWEEP_REPOSITORY.test(repository) || repository.includes('..')) {
           throw new HarnessCliInputError(`invalid --repo (expected owner/name): ${repository}`);
         }
+        const readLimit = (value: string | undefined, fallback: number, name: string, max: number): number => {
+          const limit = value === undefined ? fallback : Number(value);
+          if (!Number.isSafeInteger(limit) || limit < 1 || limit > max) throw new HarnessCliInputError(`invalid ${name} (expected 1~${max})`);
+          return limit;
+        };
+        const applying = opts.apply === true;
+        if (opts.emitApplyPlan && (applying || !opts.json)) throw new HarnessCliInputError('--emit-apply-plan requires dry-run --json');
+        if (opts.applyPlanFile && !applying) throw new HarnessCliInputError('--apply-plan-file requires --apply');
+        const applyPlan = opts.applyPlanFile
+          ? validateDraftSweepApplyPlan(JSON.parse(readFileSync(resolve(opts.applyPlanFile), 'utf8')))
+          : undefined;
         // One adapter instance per sweep: its open listing and ledger scan are shared with the RUN-TTL step.
-        const github = deps.adapters ? undefined : githubDraftSweepAdapters(deps.execute, undefined, undefined, undefined, deps.stopRun);
+        const inventoryLimits = {
+          maxInventoryPages: readLimit(opts.maxPages, applying ? 100 : 1, '--max-pages', 100),
+          maxDrafts: opts.maxDrafts === undefined && applying ? undefined : readLimit(opts.maxDrafts, 10, '--max-drafts', 1_000),
+          maxMerged: opts.maxMerged === undefined && applying ? undefined : readLimit(opts.maxMerged, 50, '--max-merged', 1_000),
+          onInventoryProgress: ({ state, page, rows }: { state: 'open' | 'closed'; page: number; rows: number }) =>
+            console.error(`[draft-sweep] inventory state=${state} page=${page} rows=${rows}`),
+        };
+        const github = deps.adapters ? undefined : githubDraftSweepPreviewAdapters(inventoryLimits, deps.execute, undefined, undefined, undefined, deps.stopRun);
         const configCap = deps.closeCapConfig
           ? deps.closeCapConfig()
           : (() => { try { return getUserConfig().tools?.selfImplement?.draftSweepCloseCap; } catch { return undefined; } })();
@@ -3055,7 +3190,7 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
           try { debug.log('self-dev.draft-sweep', 'close-cap-rejected', { warning, closeCap: cap.closeCap, closeCapSource: cap.closeCapSource }); } catch { /* fail-soft */ }
         }
         let replayClosed = 0;
-        if (opts.apply && (!deps.adapters || deps.residueReplay)) {
+        if (opts.apply && !applyPlan && (!deps.adapters || deps.residueReplay)) {
           try {
             replayClosed = (await replayPodTerminals({ ...deps.residueReplay, repository, closeCap: cap.closeCap })).closed;
           } catch (error) {
@@ -3066,12 +3201,23 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
           }
         }
         const result: DraftSweepResult = await runDraftSweep({ repository, apply: opts.apply === true, includeTriage: opts.json === true, adapters: deps.adapters ?? github!,
-          closeCap: cap.closeCap, closeCapSource: cap.closeCapSource, alreadyClosed: replayClosed });
+          closeCap: cap.closeCap, closeCapSource: cap.closeCapSource, alreadyClosed: replayClosed,
+          includeApplyPlan: opts.emitApplyPlan === true, applyPlan });
+        const frozenPlanMaintenance = applyPlan ? { postSweep: {
+          residueReplay: 'skipped: frozen plan does not include terminal-residue PRs',
+          runTtl: 'skipped: frozen plan does not include RUN-TTL PRs',
+        } } : {};
         const reason = result.error ? sweepFailureReason(result.error) : undefined;
         const ttlStarted = Date.now();
-        const runTtl = await draftSweepRunTtl(repository, deps, github);
+        const runTtl = result.complete && !applyPlan ? await draftSweepRunTtl(repository, deps, github) : undefined;
         try { debug.log('self-dev.draft-sweep', 'timing', { phase: 'run-ttl', ms: Date.now() - ttlStarted, count: runTtl && !('error' in runTtl) ? runTtl.considered : 0 }); } catch { /* fail-soft */ }
-        if (opts.json) write(JSON.stringify({ ...(reason ? { ...result, error: reason } : result), ...(runTtl ? { runTtl } : {}) }));
+        if (opts.json) {
+          const output = JSON.stringify({ ...(reason ? { ...result, error: reason } : result), ...frozenPlanMaintenance, ...(runTtl ? { runTtl } : {}) });
+          // `src/index.ts` imports chalk, which makes Bun stdout non-blocking. Await the
+          // write callback so a large JSON result cannot be silently cut at the pipe buffer.
+          if (deps.write) write(output);
+          else await writeStdoutFully(output);
+        }
         else {
           if (runTtl) {
             write('error' in runTtl ? `run-ttl: 실패 (${runTtl.error})`

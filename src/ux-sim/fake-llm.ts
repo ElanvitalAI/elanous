@@ -68,7 +68,12 @@ export const TEST_FAKE_LLM_CAPTURE_ENV = 'ELANOUS_TEST_FAKE_LLM_CAPTURE';
 function captureRequest(messages: LLMMessage[]): void {
   const path = process.env[TEST_FAKE_LLM_CAPTURE_ENV];
   if (!path) return;
-  const rows = messages.map((message) => ({ role: message.role, content: typeof message.content === 'string' ? message.content : null }));
+  const rows = messages.map((message) => ({
+    role: message.role,
+    content: typeof message.content === 'string'
+      ? message.content
+      : message.content.map((block) => block.type === 'text' ? { type: 'text', text: block.text } : { type: block.type }),
+  }));
   appendFileSync(path, `${JSON.stringify({ messages: rows })}\n`);
 }
 

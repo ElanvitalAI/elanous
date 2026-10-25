@@ -1,4 +1,6 @@
-import { expect, test } from 'bun:test';
+import { expect, test, spyOn } from 'bun:test';
+import { debug } from '../debug/log.js';
+import { collectDraftMetrics, type SweepDraft, type SweepMergedPr } from '../self-dev/draft-sweep.js';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -121,6 +123,33 @@ test('hourly OP report reaches draft census and preserves other seat formatting 
     expect(failed.body).toContain('원장 기록 없음 · draft 지표 못 읽음');
     expect(failed.posted).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('OVERLAP-METRIC: 중복 페이지를 접어 draft 지표와 겹침 표시를 유지한다', async () => {
+  const older: SweepDraft = { number: 7, title: 'older', branch: 'self-impl/seven', labels: [],
+    createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T01:00:00Z' };
+  const newer = { ...older, updatedAt: '2026-10-02T22:00:00Z' };
+  const closed: SweepMergedPr = { number: 8, title: 'closed', branch: 'self-impl/eight', labels: [],
+    createdAt: '2026-09-29T00:00:00Z' };
+  const merged = { ...closed, mergedAt: '2026-09-30T00:00:00Z' };
+  const root = mkdtempSync(join(tmpdir(), 'seat-report-fold-'));
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const body = (await seatReport('OP', { root,
+      now: () => now, config: { mode: 'shadow' },
+      draftMetrics: (clock) => collectDraftMetrics('owner/repo', {
+        listDrafts: async (page) => page === 1 ? Array.from({ length: 100 }, (_, i) => i === 0 ? older : { ...older, number: 100 + i, branch: 'human/other', labels: [] })
+          : page === 2 ? [newer] : [],
+        listRecentClosed: async () => [closed, merged],
+        getActiveClaimOwner: async () => undefined,
+      }, clock),
+      overlapMetrics: async () => ({ ...m, launches24h: 4, launched: 10, unmeasured: 0, linked: 3, autoLanded: 2,
+        autoRate: 2 / 3, secondSiblingMedianHours: 3.5 }),
+    })).body;
+    expect(body).toContain('draft 재고 1 · 최장 나이 95.3h · needs-owner 1 · 48h 전환율 50.0% (1/2)');
+    expect(body).toContain('겹침 발사 24h 4 (발사 10) · 겹침 자동 착지 66.7% (2/3) · 둘째 형제 착지 중앙값 3.5h');
+    expect(log.mock.calls.filter(([category, event]) => category === 'drafts.metrics' && event === 'duplicate-pr-folded')).toHaveLength(1);
+  } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('hourly OP report carries the overlap line next to the draft line; unmeasured never prints as 0', async () => {

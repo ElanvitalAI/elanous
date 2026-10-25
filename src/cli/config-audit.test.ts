@@ -64,7 +64,7 @@ describe('config audit (CFG-STORE2)', () => {
 
   it('객체 속 비밀 키(botToken)도 가린다 — maskDeep 재사용', () => {
     const f = fixture();
-    const BOT = '8799226199:AAE9zA3sqjmurLLFwATRQ-LOEyp4Av1LaYw';
+    const BOT = '123456:TEST_FAKE_TOKEN';
     const masked = '[{"name":"main","botToken":"<masked>"}]';
     const row = recordConfigChange({ key: 'notify.routes', prev: [], next: [{ name: 'main', botToken: BOT }], by: 'TC' }, f.dbPath);
     expect(row.next).toBe(masked);

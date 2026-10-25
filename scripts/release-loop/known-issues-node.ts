@@ -22,7 +22,7 @@ const INTRO = 'The following issues are known in this release.';
 const resolved = /\b(?:fixed|resolved|no longer|has been addressed|is addressed|was addressed)\b/i;
 const unsafe = /[^\x20-\x7e]|#\d+|\/Users\/|\.test\.ts\b|\[(?:TC|MK|OP|UX|S|T|F|O)\]|\b(?:TC|MK|OP|UX)\s+track\b|\b(?:PR|pull request)\s*\d+\b|\b(?:scripts|src|test)\/\S+|\bfile:\/\/|(?<![\w:/])\/(?!\/)[\w.-]+(?:\/[\w.-]+)*|\b[A-Z]:\\(?:[^\s\\]+\\)*[^\s\\]+|\b(?:RFC|HANDOFF|MANUAL)-/i;
 
-type Issue = { id: string; title?: string; evidence?: string; note?: string };
+type Issue = { id: string; title?: string; evidence?: string; knownIssue?: string; note?: string };
 
 // Accepted regressions with the same public note describe one issue, even if several gates recorded it.
 function issueGroup(issue: Issue, checklistIssues: ReadonlySet<Issue>): string {
@@ -62,9 +62,9 @@ function generatedBullets(raw: string, sourceIds: string[]): string[] {
 }
 
 function coversIssue(bullet: string, issue: Issue, others: Issue[]): boolean {
-  const source = issue.title ?? issue.note ?? '';
+  const source = issue.knownIssue ?? issue.note ?? '';
   const words = source.toLowerCase().match(/[a-z]{5,}/g) ?? [];
-  const otherWords = new Set(others.flatMap((other) => ((other.title ?? other.note ?? '').toLowerCase().match(/[a-z]{5,}/g) ?? []).map((word) => word.slice(0, 5))));
+  const otherWords = new Set(others.flatMap((other) => ((other.knownIssue ?? other.note ?? '').toLowerCase().match(/[a-z]{5,}/g) ?? []).map((word) => word.slice(0, 5))));
   const publicWords = new Set((bullet.toLowerCase().match(/[a-z]{5,}/g) ?? []).map((word) => word.slice(0, 5)));
   const distinctive = [...new Set(words.map((word) => word.slice(0, 5)))].filter((word) => !otherWords.has(word));
   const negative = /\b(?:not|never|no|cannot|can't|doesn't|don't|won't|fails? to|isn't|aren't)\b/i;
@@ -130,7 +130,9 @@ export function runKnownIssues(context: GraphContext = readGraphContext(), run: 
   if (context.outputs.docs?.branch !== `release-docs/${version}`) throw new Error('docs branch/version mismatch');
   const notes = join(worktree, 'release/public/docs/releases', `${version}.md`);
   if (!existsSync(notes)) throw new Error(`release notes missing: ${notes}`);
-  const checklist = issues(context.outputs['checklist-gate']?.knownIssues, 'checklist');
+  // A checklist title is an internal task label, not public issue copy. Missing dedicated copy
+  // means no public note row is generated for that checklist item.
+  const checklist = issues(context.outputs['checklist-gate']?.knownIssues, 'checklist').filter((issue) => typeof issue.knownIssue === 'string' && issue.knownIssue.trim()).map((issue) => ({ ...issue, title: issue.knownIssue!.trim() }));
   const accepted = issues(context.input.acceptedRegressions, 'accepted');
   const approved0233Batch = version === '0.2.33' && accepted.length === APPROVED_0233_INPUT.length
     && new Set(accepted.map((issue) => issue.id)).size === accepted.length

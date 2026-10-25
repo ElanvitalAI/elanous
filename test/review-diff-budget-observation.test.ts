@@ -176,7 +176,7 @@ describe("review diff-budget transport", () => {
       return reviewPullRequest(input, llm);
     };
 
-    await runSelfReviewCliCommand(["42"], { intent: "test" }, deps);
+    await runSelfReviewCliCommand(["42"], { intent: "test", reviewerMix: null }, deps);
 
     expect(capturedInput?.readReferencedFile).toBe(reader);
     const done = logs.find((entry) => entry.event === "done")?.data;
@@ -194,7 +194,7 @@ describe("review diff-budget transport", () => {
     const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
     await runSelfReviewCliCommand(
       ["42"],
-      { intent: "test" },
+      { intent: "test", reviewerMix: null },
       cliDeps(review, logs),
     );
     expect(logs.find((entry) => entry.event === "done")?.data).toMatchObject({

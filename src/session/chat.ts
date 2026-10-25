@@ -183,7 +183,7 @@ function toLLM(messages: SerializedMessage[], systemPrompt?: string): LLMMessage
   for (const m of messages) {
     // 'tool' = durable tool-telemetry (추적성·audit-only). Excluded from replay
     // so persisted tool rounds don't pollute the next turn's conversation context.
-    if (m.role === 'tool') continue;
+    if (m.role === 'tool' || m.goalInterim === true) continue;
     const role: LLMMessage['role'] =
       m.role === 'user' ? 'user'
       : m.role === 'assistant' ? 'assistant'
@@ -473,6 +473,12 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         signal: opts.signal ?? new AbortController().signal,
         callbacks: {
           onText: (delta) => { opts.onDelta?.(delta); },
+          onGoalInterim: (interimText) => {
+            appendMessage(opts.sessionId, {
+              role: 'assistant', content: interimText, ts: new Date().toISOString(),
+              tokenEstimate: estimateTokens(interimText), goalInterim: true,
+            });
+          },
           onToolCall: (call) => { toolCallArgs.set(call.id, call.args); opts.onToolCall?.(call); },
           onToolResult: (call) => {
             try {

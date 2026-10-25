@@ -32,6 +32,7 @@ import {
   INTRODUCED_RERUN_CAP,
   runGateBaseline,
   rerunBunSingleTest,
+  recheckTimeoutOnlyIntroducedFailures,
   rerunBunTimeoutFailures,
   runReverseVerifyByBreaking,
   runVerifyByBreaking,
@@ -1777,6 +1778,44 @@ describe('gate baseline — 시험 타임아웃은 introduced 회귀가 아니�
   });
 });
 
+describe('gate baseline — introduced timeout-only standalone recheck', () => {
+  const file = 'test/slow.test.ts';
+  const worktree = `${file}:\n(fail) waits for readiness\n^ this test timed out after 10000ms\n\n1 fail`;
+  const basePass = `${file}:\n(pass) waits for readiness\n1 pass\n0 fail`;
+
+  test('timeouts-only introduced test is retried once with 60s and a pass clears introduced with evidence', () => {
+    const initial = buildGateBaselineReport(worktree, { status: 'pass', output: basePass, log: 'baseline clean' });
+    expect(initial.introduced).toBe(1);
+    const calls: unknown[][] = [];
+    const report = recheckTimeoutOnlyIntroducedFailures('/node-b/repo', initial, (cwd, target, name, timeoutMs) => {
+      calls.push([cwd, target, name, timeoutMs]);
+      return { observation: 'pass', elapsedMs: 2340, output: 'Ran 1 test across 1 file.\n1 pass' };
+    });
+    expect(calls).toEqual([['/node-b/repo', file, 'waits for readiness', 60_000]]);
+    expect(report.introduced).toBe(0);
+    expect(report.timeoutRecheckPassed).toBe(1);
+    expect(report.failures[0]?.attribution).toBe('timeout-recheck-passed');
+    expect(report.timeoutRechecks?.[0]).toMatchObject({ result: 'pass', elapsedMs: 2340, rawResultLine: 'Ran 1 test across 1 file. ⏎ 1 pass' });
+    expect(allowsBaselineOnlyFailure(report)).toBe(true);
+    expect(formatGateBaselineNote(report, 0)).toContain('timeout-recheck-passed=1');
+    expect(formatGateBaselineNote(report, 0)).toContain('elapsed=2340ms');
+  });
+
+  test('failed timeout retry keeps introduced; mixed non-timeout failure skips all retries', () => {
+    const initial = buildGateBaselineReport(worktree, { status: 'pass', output: basePass, log: 'baseline clean' });
+    const failed = recheckTimeoutOnlyIntroducedFailures('/node-b/repo', initial, () => ({ observation: 'failure', elapsedMs: 3210, output: '1 fail' }));
+    expect(failed.introduced).toBe(1);
+    expect(failed.failures[0]?.attribution).toBe('introduced');
+
+    const mixed = buildGateBaselineReport(`${worktree}\n${file}:\n(fail) asserts\nerror: expected true`, { status: 'pass', output: basePass, log: 'baseline clean' });
+    let attempts = 0;
+    const unchanged = recheckTimeoutOnlyIntroducedFailures('/node-b/repo', mixed, () => { attempts += 1; return { observation: 'pass', elapsedMs: 1, output: 'pass' }; });
+    expect(attempts).toBe(0);
+    expect(unchanged.introduced).toBe(2);
+    expect(unchanged.timeoutRechecks).toBeUndefined();
+  });
+});
+
 describe('hasModuleLoadFailure — 정합 뒤 실패가 «모듈 로드»인지 값으로 답한다 (OBS-T96 🅐)', () => {
   // ⛔ 이 판정이 있어야 「산출이 상했다」와 「그 순간 트리가 불일치했다」가 갈린다.
   //   실물(106차): 리뷰를 통과한 산출이 `Export named 'tierModel' not found` 로 통째로 버려졌고,
@@ -2437,7 +2476,7 @@ describe('defaultSeams gate blocking', () => {
         return { status: 'pass', output: '1 pass', log: 'unused' };
       },
       runVerifyByBreaking: () => ({
-        files: [{ file: 'test/a.test.js', classification: 'distinguishes', base: { status: 'test-fail' } }],
+        files: [{ file: 'test/a.test.js', classification: 'distinguishes', base: { status: 'test-fail', log: 'baseline test failed' } }],
         baseStatuses: { pass: 0, 'test-fail': 1, unknown: 0 },
       }),
     }).gate(cwd);

@@ -44,7 +44,7 @@ if (process.env.KNOWN_ASK_FAIL === '1') process.exit(3);
 console.log(JSON.stringify({reply:process.env.KNOWN_ASK_REPLY}));
 `);
   chmodSync(fake, 0o755);
-  const invoke = (checklist: Array<{ id: string; title: string; evidence: string }> = [], acceptedRegressions: Array<{ id: string; note: string }> = [], opts: { reply?: string; fail?: boolean; worktree?: string; outputs?: Record<string, Record<string, unknown>>; recordedWaiver?: { note: string } } = {}) => {
+  const invoke = (checklist: Array<{ id: string; title: string; evidence: string; knownIssue?: string }> = [], acceptedRegressions: Array<{ id: string; note: string }> = [], opts: { reply?: string; fail?: boolean; worktree?: string; outputs?: Record<string, Record<string, unknown>>; recordedWaiver?: { note: string } } = {}) => {
     const context = { input: { version: releaseVersion, previousVersion: '0.2.6', acceptedRegressions }, outputs: { 'checklist-gate': { knownIssues: checklist }, docs: { branch: `release-docs/${releaseVersion}`, worktree: opts.worktree ?? tree }, ...(opts.recordedWaiver ? { tui: { verdict: 'waived', reason: opts.recordedWaiver.note } } : {}), ...opts.outputs } };
     let contextValue = JSON.stringify(context);
     if (opts.recordedWaiver) {
@@ -64,7 +64,7 @@ console.log(JSON.stringify({reply:process.env.KNOWN_ASK_REPLY}));
   return { root, tree, remote, notes, calls, invoke, git };
 }
 
-const checklist = [{ id: 'K13', title: 'Export delay', evidence: 'timeout' }];
+const checklist = [{ id: 'K13', title: 'Export delay', evidence: 'timeout', knownIssue: 'Exports may time out.' }];
 const accepted = [{ id: 'R1', note: 'Settings not persisted' }];
 
 test('two sources become public English bullets in one ask and push only to the temporary bare remote', () => {
@@ -84,6 +84,39 @@ test('two sources become public English bullets in one ask and push only to the 
     expect(args[3]).toContain('Settings not persisted');
     expect(args[3]).toContain('using each input ID exactly once');
     expect(f.git(['show', `release-docs/${version}:release/public/docs/releases/${version}.md`], f.remote)).toBe(text.trimEnd());
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('checklist public copy comes from knownIssue and missing knownIssue is omitted', () => {
+  const f = fixture();
+  try {
+    const checklist = [
+      { id: 'K13', title: 'INTERNAL TASK TITLE', evidence: 'private evidence', knownIssue: 'Exports may time out.' },
+      { id: 'K14', title: 'ANOTHER INTERNAL TITLE', evidence: 'private evidence' },
+    ];
+    const reply = response([['K13', 'Exports may time out; retry the export.']]);
+    const { code, result } = f.invoke(checklist, [], { reply });
+    expect(code).toBe(0);
+    expect(result).toMatchObject({ count: 1, sources: { checklist: 1, accepted: 0 } });
+    expect(readFileSync(f.notes, 'utf8')).toContain('- Exports may time out; retry the export.');
+    const prompt = JSON.parse(readFileSync(f.calls, 'utf8').trim()) as string[];
+    expect(prompt[3]).toContain('Exports may time out.');
+    expect(prompt[3]).not.toContain('INTERNAL TASK TITLE');
+    expect(prompt[3]).not.toContain('ANOTHER INTERNAL TITLE');
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('generated notes filter internal PR references before writing the release notes', () => {
+  const f = fixture();
+  try {
+    const before = readFileSync(f.notes, 'utf8');
+    const { code, result } = f.invoke([{ id: 'K13', title: 'Internal label', evidence: '', knownIssue: 'Exports may time out.' }], [], {
+      reply: response([['K13', 'Exports may time out; see PR 12345 for details.']]),
+    });
+    expect(code).toBe(0);
+    expect(result).toMatchObject({ outcome: 'ok', bullets: [fallback], fallbackUsed: true });
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('PR 12345');
+    expect(readFileSync(f.notes, 'utf8')).not.toBe(before);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -545,7 +578,7 @@ test('a bullet that claims the issue is fixed fails and leaves the notes and rem
 test('a Korean checklist title with an accurate English bullet is published', () => {
   const f = fixture();
   try {
-    const korean = [{ id: 'K20', title: '내보내기가 가끔 느리다', evidence: '시간 초과' }];
+    const korean = [{ id: 'K20', title: '내부 작업 라벨', evidence: '시간 초과', knownIssue: 'Exports may take longer than usual.' }];
     const { code, result } = f.invoke(korean, [], { reply: response([['K20', 'An export may take longer than usual.']]) });
     expect(code).toBe(0);
     expect(result.count).toBe(1);

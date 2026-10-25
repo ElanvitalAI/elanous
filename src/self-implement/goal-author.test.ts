@@ -1,11 +1,12 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
-import { explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
+import { explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, validateGoalDoneEvidenceCommand, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
 import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { authorGoal, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
+import { authorGoal, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyEmptyPersistentEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
+import { GOAL_AUTHOR_GROUND_TIMEBOX_MS, readGoalAuthorGroundingTimebox } from './goal-author.js';
 import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR, requiredEvidenceFromGoal } from './off-diff-evidence.js';
 import { setMissionSlugStreamForTest } from '../autopilot/mission-registry.js';
@@ -100,7 +101,107 @@ afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
+describe('production traced-path correction', () => {
+  test('corrects a unique prefix and edit-distance path, skips only ambiguous paths, and records continuation in the isolated JSONL ledger', async () => {
+    const cwd = existingGoalDocumentsRoot('goal-author-traced-correction-');
+    const state = join(cwd, 'state');
+    const previous = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = state;
+    mkdirSync(join(cwd, 'src'), { recursive: true });
+    for (const filename of ['unique-path.ts', 'similar-one.ts', 'similar-two.ts', 'space name.ts', 'parentheses.ts']) {
+      writeFileSync(join(cwd, 'src', filename), 'export const value = 1;\n');
+    }
+    const request = '대상 경로: src/unique-pat.ts · src/paren*.ts · src/similar-*.ts · src/space nane.ts\n(src/parenheses.ts) — 설명: src/uniqe-path.ts';
+    try {
+      const result = await writeAuthoredGoal(request, cwd, {
+        ...deps,
+        ground: async () => ({
+          ...facts, files: ['src/unique-path.ts', 'src/space name.ts', 'src/parentheses.ts'],
+          persistentEvidence: ['src/uniqe-path.ts — Read-verified path description.', '(src/parenheses.ts) — parentheses path.'],
+        }),
+      }, { now: () => new Date('2026-07-29T00:30:00Z') });
+      const traced = markdownSection(readFileSync(result.path, 'utf8'), 'TRACED PATHS')!;
+      expect(traced).toContain('src/unique-path.ts');
+      expect(traced).toContain('src/space name.ts');
+      expect(traced).toContain('src/parentheses.ts');
+      expect(traced).not.toContain('미해석: src/paren*.ts');
+      expect(traced).not.toContain('미해석: src/parenheses.ts');
+      expect(traced).not.toContain('미해석: src/similar-*.ts');
+      expect(traced).not.toContain('similar-one.ts');
+      expect(traced).not.toContain('similar-two.ts');
+      expect(verbatimOriginalAsk(result.authored.document)).toBe(request);
+      const ledger = readFileSync(join(state, 'run-ledger', `${result.authored.authorRunId}.jsonl`), 'utf8');
+      const rows = ledger.trim().split('\n').map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+      for (const [from, to] of [
+        ['src/unique-pat.ts', 'src/unique-path.ts'],
+        ['src/uniqe-path.ts', 'src/unique-path.ts'],
+        ['src/paren*.ts', 'src/parentheses.ts'],
+        ['src/parenheses.ts', 'src/parentheses.ts'],
+        ['src/space nane.ts', 'src/space name.ts'],
+      ]) {
+        expect(rows).toContainEqual(expect.objectContaining({ event: 'traced-path-correction', data: expect.objectContaining({ from, to }) }));
+      }
+      expect(rows).toContainEqual(expect.objectContaining({ event: 'traced-path-warning', data: expect.objectContaining({ path: 'src/similar-*.ts', action: 'skipped' }) }));
+      expect(rows).toContainEqual(expect.objectContaining({ event: 'traced-path-continued', data: expect.objectContaining({ corrected: expect.any(Number), skipped: 1 }) }));
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previous;
+    }
+  });
+
+  test('does not return success when the required traced-path ledger cannot be written', async () => {
+    const cwd = existingGoalDocumentsRoot('goal-author-ledger-failure-');
+    const state = join(cwd, 'blocked-state');
+    const previous = process.env.ELANOUS_STATE_DIR;
+    mkdirSync(join(cwd, 'src'), { recursive: true });
+    writeFileSync(join(cwd, 'src', 'unique-path.ts'), 'export const value = 1;\n');
+    writeFileSync(state, 'not a directory');
+    process.env.ELANOUS_STATE_DIR = state;
+    try {
+      await expect(writeAuthoredGoal('대상 경로: src/unique-pat.ts', cwd, {
+        ...deps,
+        ground: async () => ({ ...facts, files: ['src/unique-path.ts'], persistentEvidence: [] }),
+      }, { now: () => new Date('2026-07-29T00:30:00Z') })).rejects.toMatchObject({ code: 'ENOTDIR' });
+      expect(readdirSync(join(cwd, 'docs', 'goals'))).toHaveLength(1);
+      expect(existsSync(join(state, 'run-ledger'))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previous;
+    }
+  });
+});
+
 describe('goal author grade', () => {
+  test('CELL-DONE first slice: clean single command keeps quoted operators and strips presentation wrappers', () => {
+    expect(validateGoalDoneEvidenceCommand("bun test 'test/a;b|c> d.test.ts'")).toEqual({
+      command: "bun test 'test/a;b|c> d.test.ts'",
+    });
+    expect(validateGoalDoneEvidenceCommand('`bun test src/example.test.ts`')).toEqual({
+      command: 'bun test src/example.test.ts',
+    });
+    expect(validateGoalDoneEvidenceCommand('bun test "test/a;b.test.ts"')).toEqual({ command: 'bun test "test/a;b.test.ts"' });
+    expect(validateGoalDoneEvidenceCommand('bun test test/a\\;b.test.ts')).toEqual({ command: 'bun test test/a\\;b.test.ts' });
+    expect(validateGoalDoneEvidenceCommand('"bun test" ; "x"')).toEqual({ error: '증거 명령에 셸 연산자 — 명령 한 줄만' });
+    expect(validateGoalDoneEvidenceCommand('foo bar')).toEqual({ error: '증거 명령 형식이 아님 — 실행 파일과 인자 필요' });
+    expect(validateGoalDoneEvidenceCommand('test -f')).toEqual({ error: '증거 명령 형식이 아님 — 실행 파일과 인자 필요' });
+    for (const value of ['bun test src/example.test.ts; exit 1', 'bun test src/example.test.ts && echo ok',
+      'bun test src/example.test.ts & echo ok', 'bun test src/example.test.ts &',
+      'bun test src/example.test.ts && 결과 확인', 'bun test src/example.test.ts || 결과 확인',
+      'bun test src/example.test.ts | 결과 확인', 'bun test src/example.test.ts; 결과 확인',
+      'bun test src/example.test.ts; 결과 확인\nexit 1', 'bun test src/example.test.ts\nexit 1',
+      'bun test src/example.test.ts | cat', 'bun test src/example.test.ts > out',
+      'bun test src/example.test.ts < input', 'bun test <(printf ok)',
+      'bun test `printf file`', 'bun test "$(printf file)"', 'bun test "unterminated',
+      'test -f $(printf /tmp/proof)', 'bun test src/example.test.ts;']) {
+      expect(validateGoalDoneEvidenceCommand(value)).toEqual({ error: '증거 명령에 셸 연산자 — 명령 한 줄만' });
+    }
+    // The production parser stays strict until the follow-up wires every duplicate evidence line.
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts\n완료 경계 실물: 시험\n완료 경계 증거 명령: bun test src/example.test.ts; 결과 확인').missing)
+      .toContain('완료 경계 증거 명령');
+    expect(inspectGoalDoneBoundary('완료 경계 코드: src/example.ts\n완료 경계 실물: 시험\n완료 경계 증거 명령: bun test src/example.test.ts &').missing)
+      .toContain('완료 경계 증거 명령');
+  });
+
   // The ambient shell may carry ELANOUS_AUTHOR_GRADE; the default-grade contract below is the absent-env shape.
   const ambientAuthorGradeEnv = process.env.ELANOUS_AUTHOR_GRADE;
   beforeAll(() => { delete process.env.ELANOUS_AUTHOR_GRADE; });
@@ -191,16 +292,18 @@ describe('goal author grade', () => {
   });
 
   test('flag overrides config; absent and malformed configuration preserve full', () => {
+    // ⛔ Pod 는 `ELANOUS_AUTHOR_GRADE=full` 을 ambient 로 싣는다 — env 인자를 «생략»하면 그 값이 끼어들어
+    //    「설정/기본값」 축이 env 축으로 덮인다. 이 시험은 env «없음»을 재므로 빈 문자열로 그 축을 끈다.
     expect(resolveGoalAuthorGrade('lite', 'full')).toEqual({ grade: 'lite', source: 'flag' });
-    expect(resolveGoalAuthorGrade(undefined, 'lite')).toEqual({ grade: 'lite', source: 'config' });
-    expect(resolveGoalAuthorGrade(undefined, 'unknown')).toEqual({ grade: 'full', source: 'default' });
-    expect(resolveGoalAuthorGrade()).toEqual({ grade: 'full', source: 'default' });
+    expect(resolveGoalAuthorGrade(undefined, 'lite', '')).toEqual({ grade: 'lite', source: 'config' });
+    expect(resolveGoalAuthorGrade(undefined, 'unknown', '')).toEqual({ grade: 'full', source: 'default' });
+    expect(resolveGoalAuthorGrade(undefined, undefined, '')).toEqual({ grade: 'full', source: 'default' });
   });
 
   test('AUTHOR-LITE2-POD: env ELANOUS_AUTHOR_GRADE sits between flag and config; invalid env is ignored', () => {
     expect(resolveGoalAuthorGrade(undefined, 'full', 'lite')).toEqual({ grade: 'lite', source: 'env' });
     expect(resolveGoalAuthorGrade('full', 'lite', 'lite')).toEqual({ grade: 'full', source: 'flag' });
-    expect(resolveGoalAuthorGrade(undefined, 'lite', undefined)).toEqual({ grade: 'lite', source: 'config' });
+    expect(resolveGoalAuthorGrade(undefined, 'lite', '')).toEqual({ grade: 'lite', source: 'config' });
     expect(resolveGoalAuthorGrade(undefined, undefined, 'bogus')).toEqual({ grade: 'full', source: 'default' });
   });
 
@@ -226,11 +329,16 @@ describe('goal author grade', () => {
     }) as typeof debug.log;
     let lite: Awaited<ReturnType<typeof run>>;
     let full: Awaited<ReturnType<typeof run>>;
+    // ⛔ Pod 는 `ELANOUS_AUTHOR_GRADE=full` 을 ambient 로 싣는다 — 그러면 「기본값(full)」과 「env 로 full」이
+    //    갈려 `source` 단언이 흔들린다. 이 시험은 «env 없음» 에서의 등급 선택을 재므로 그 축만 잠시 끈다.
+    const ambientAuthorGrade = process.env.ELANOUS_AUTHOR_GRADE;
+    delete process.env.ELANOUS_AUTHOR_GRADE;
     try {
       lite = await run('lite');
       full = await run();
     } finally {
       debug.log = originalLog;
+      if (ambientAuthorGrade !== undefined) process.env.ELANOUS_AUTHOR_GRADE = ambientAuthorGrade;
     }
     expect(gradeEvents).toEqual([
       { category: 'harness.author', event: 'author-grade', data: { authorRunId: lite.authored.authorRunId, grade: 'lite', source: 'flag', skippedPhases: ['adversarial-review', 'goal-steps-decomposed', 'persistent-grounding'] } },
@@ -253,6 +361,61 @@ describe('goal author grade', () => {
     expect(lite.authored.document).toContain(`\`\`\`\n${sentence}\n\`\`\``);
     expect(full.authored.document).toContain('## PROBLEM');
   });
+
+  test('AUTHOR-TIMEBOX: the default ground budget is 15 minutes', () => {
+    expect(GOAL_AUTHOR_GROUND_TIMEBOX_MS).toBe(15 * 60_000);
+  });
+
+  test('AUTHOR-TIMEBOX: ground exceeding its budget short-circuits to NOT-GROUNDED instead of hanging', async () => {
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string, data: unknown) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    const progress: Array<{ phase: string; event: string }> = [];
+    const startedAt = Date.now();
+    let authored: Awaited<ReturnType<typeof authorGoal>> | undefined;
+    try {
+      authored = await authorGoal('대상 경로: src/example.ts\n판정선(반증): 기존 기능을 시험한다.', {
+        ...deps,
+        // 접지가 «영원히» 안 끝난다 — 한도가 없으면 이 골은 여기서 매달린다(반증: 80분).
+        ground: () => new Promise<never>(() => undefined),
+        groundTimeboxMs: 20,
+        onProgress: (phase, event) => progress.push({ phase, event }),
+      });
+    } finally {
+      debug.log = originalLog;
+    }
+    expect(Date.now() - startedAt).toBeLessThan(30_000);
+    const goal = authored!;
+    expect(goal.grounded).toBe(false);
+    expect(goal.facts).toBeNull();
+    expect(goal.groundingTimebox).toEqual({ budgetMs: 20, elapsedMs: expect.any(Number) });
+    expect(goal.groundingTimebox!.elapsedMs).toBeGreaterThanOrEqual(20);
+    // ① 문서 — NOT-GROUNDED ⊕ 시간 한도 줄(발사 흐름이 «문서»에서 이 값을 읽는다)
+    expect(goal.document).toContain('Situation: NOT-GROUNDED');
+    expect(readGoalAuthorGroundingTimebox(goal.document)).toEqual(goal.groundingTimebox!);
+    // ② 관측 — 페이즈 이벤트는 그대로 ⊕ 예산 초과는 «별도 사건»으로 남는다
+    expect(progress.filter(({ phase }) => phase === 'ground').map(({ event }) => event)).toEqual(['start', 'end']);
+    const exceeded = events.find(({ category, event }) => category === 'goal-author' && event === 'ground-timebox-exceeded');
+    expect(exceeded?.data).toMatchObject({ authorRunId: goal.authorRunId, budgetMs: 20, elapsedMs: goal.groundingTimebox!.elapsedMs });
+    // 「결정만」 남기는 첫 줄(enabled/source)과 「결과 지표」를 함께 싣는 줄이 따로 있다 — 마지막 줄을 문다.
+    const decisions = events
+      .filter(({ category, event }) => category === 'goal-author' && event === 'persistent-grounding-decision')
+      .map(({ data }) => data as Record<string, unknown>);
+    expect(decisions.at(-1)).toMatchObject({ enabled: true, grounded: false, groundingError: false, timeboxExceeded: true });
+  }, 60_000);
+
+  test('AUTHOR-TIMEBOX: a ground phase inside its budget keeps the grounded result unchanged', async () => {
+    const authored = await authorGoal('대상 경로: src/example.ts\n판정선(반증): 기존 기능을 시험한다.', {
+      ...deps,
+      groundTimeboxMs: 60_000,
+    });
+    expect(authored.grounded).toBe(true);
+    expect(authored.groundingTimebox).toBeUndefined();
+    expect(authored.document).not.toContain('Grounding timebox:');
+    expect(readGoalAuthorGroundingTimebox(authored.document)).toBeNull();
+  }, 60_000);
 });
 
 describe('goal author grounding failure classifier', () => {
@@ -310,6 +473,96 @@ describe('goal author grounding failure classifier', () => {
     const result = classifyGroundingFailure({ categorizedEvidenceCount: 2, persistentEvidenceCount: 0 });
 
     expect(result.prescription).toBe('Evidence unavailable — grounding found 2 categorized evidence items, but no persistent evidence; only the persistent channel is empty. Strengthening the ask\'s prose may not resolve this channel gap; inspect or restore persistent grounding evidence instead. See docs/manual/MANUAL-goal-authoring-method-2026-08-03.md');
+  });
+});
+
+describe('goal author empty persistent evidence classification', () => {
+  test('GROUNDING-PERSISTENT-EMPTY-REPAIR: 구현 대상은 src/self-implement/goal-aut', async () => {
+    // 표본 ① Read 불일치 — 접지가 저장소 파일을 Read 했는데도 근거 줄이 모두 기각돼 persistent 채널이 비었다.
+    const readMismatchRoot = mkdtempSync(join(tmpdir(), 'goal-author-empty-read-'));
+    temporaryDirectories.push(readMismatchRoot);
+    mkdirSync(join(readMismatchRoot, 'src'), { recursive: true });
+    writeFileSync(join(readMismatchRoot, 'src', 'example.ts'), 'export const exampleExport = 1;\n');
+    // 표본 ② 부재 경로 — 선언된 대상 경로가 저장소 파일도 명시적 신설도 아니어서 Read 자체가 불가능하다.
+    const absentPathRoot = mkdtempSync(join(tmpdir(), 'goal-author-empty-absent-'));
+    temporaryDirectories.push(absentPathRoot);
+    mkdirSync(join(absentPathRoot, 'src'), { recursive: true });
+
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const [readMismatch, absentPath] = await Promise.all([
+        authorGoal('대상 경로: src/example.ts\n판정 신호: 조건 = persistent 채널이 비었다; 관측 = persistent-grounding-empty-evidence 관측의 reason; 기대 = read-mismatch', {
+          ...deps,
+          repositoryRoot: readMismatchRoot,
+          ground: async () => ({ ...facts, persistentEvidence: [] }),
+        }),
+        authorGoal('대상 경로: src/absent.ts\n판정 신호: 조건 = persistent 채널이 비었다; 관측 = persistent-grounding-empty-evidence 관측의 reason; 기대 = absent-path', {
+          ...deps,
+          repositoryRoot: absentPathRoot,
+          ground: async () => ({ ...facts, files: [], persistentEvidence: [] }),
+        }),
+      ]);
+
+      // 두 표본은 서로 다른 구조화 사유·final traced count·출처를 가진다(같은 관측 이벤트, 다른 reason).
+      expect(log).toHaveBeenCalledWith('goal-author', 'persistent-grounding-empty-evidence', {
+        authorRunId: expect.any(String),
+        reason: 'read-mismatch',
+        reasonLabel: expect.stringContaining('empty-evidence:read-mismatch'),
+        finalTracedCount: 1,
+        source: 'ask-declared-targets',
+      });
+      expect(log).toHaveBeenCalledWith('goal-author', 'persistent-grounding-empty-evidence', {
+        authorRunId: expect.any(String),
+        reason: 'absent-path',
+        reasonLabel: expect.stringContaining('empty-evidence:absent-path'),
+        finalTracedCount: 0,
+        source: 'none',
+      });
+
+      // 순수 분류기 — 채널이 비었을 때만 분류하고, 두 사유의 라벨은 구조적으로 다르다.
+      const readMismatchClassification = classifyEmptyPersistentEvidence({
+        persistentEvidenceCount: 0, readFilesCount: 1, unresolvedTargetCount: 0, finalTracedCount: 1,
+      });
+      const absentPathClassification = classifyEmptyPersistentEvidence({
+        persistentEvidenceCount: 0, readFilesCount: 0, unresolvedTargetCount: 1, finalTracedCount: 0,
+      });
+      expect(readMismatchClassification?.reason).toBe('read-mismatch');
+      expect(absentPathClassification?.reason).toBe('absent-path');
+      expect(readMismatchClassification?.reasonLabel).not.toBe(absentPathClassification?.reasonLabel);
+      expect(classifyEmptyPersistentEvidence({ persistentEvidenceCount: 1, readFilesCount: 0, unresolvedTargetCount: 0, finalTracedCount: 0 })).toBe(null);
+
+      // TRACED PATHS 실물 — 성공 표본은 실제 파일 1개, 부재 표본은 미해석 행으로 남는다.
+      expect(readMismatch.document).toContain('1. src/example.ts');
+      expect(absentPath.document).toContain('미해석: src/absent.ts — 요청에 선언된 대상 경로를 저장소 파일 또는 명시적 신설 파일로 확인하지 못함');
+      // #27418 산문 경로 유지 — 빈 채널 산문은 그대로 문서에 남는다.
+      expect(readMismatch.document).toContain('only the persistent channel is empty');
+      expect(absentPath.document).toContain('only the persistent channel is empty');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('GROUNDING-PERSISTENT-EMPTY-REPAIR: 비구현 골에서는 빈 persistent 채널 관측을 기록하지 않는다', async () => {
+    // tracedPathsLines 는 구현 골에서만 존재하므로 관측도 goalType === "implement" 일 때만 기록한다.
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const documentGoal = await authorGoal('대상 경로: src/example.ts\n판정 신호: 조건 = persistent 채널이 비었다; 관측 = none; 기대 = 관측 없음', {
+        ...deps,
+        goalType: 'document',
+        ground: async () => ({ ...facts, persistentEvidence: [] }),
+      });
+      expect(log).not.toHaveBeenCalledWith('goal-author', 'persistent-grounding-empty-evidence', expect.anything());
+      expect(documentGoal.document).not.toContain('## TRACED PATHS');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('GROUNDING-PERSISTENT-EMPTY-REPAIR: lint 게이트 태그 어휘는 required-section-order 게시를 낼 수 없다', () => {
+    // GOAL_FILE_LINT_ORIGINS 은 GoalFileLintTag 전부를 정확히 덮는 원장이므로
+    // 'required-section-order' 라는 태그가 lintGoalFile 결과로 존재할 수 없다(없는 태그는 마스킹 대상이 아니다).
+    expect(Object.keys(GOAL_FILE_LINT_ORIGINS)).toContain('canonical-structure');
+    expect(Object.keys(GOAL_FILE_LINT_ORIGINS)).not.toContain('required-section-order');
   });
 });
 
@@ -10635,6 +10888,22 @@ describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
     expect(authored.document).toContain('- 쓸 장치: src/ux-sim/fault-synthetic.ts · 필요한 장치 · 없음 — 첫 조각에서 개발');
   });
 
+  test('DEVICE-FIRST-AUTHORING sends measured device inventory to the injected decomposition and writes both branches', async () => {
+    const repoRoot = join(import.meta.dir, '..', '..');
+    for (const [device, exists] of [['fault-synthetic', false], ['interaction', true]] as const) {
+      const ask = `대상 경로: src/feature.ts\n완료 경계 증거 명령: bun test src/feature.test.ts\n필요한 장치: ${device}`;
+      const decomposeSteps = mock(async (_objective: string, _opts?: { context?: string }) =>
+        ['대상 경로: src/feature.ts · 동작: 기능 배선']);
+      const authored = await authorGoal(ask, { ...deps, repositoryRoot: repoRoot, decomposeSteps });
+      expect(decomposeSteps).toHaveBeenCalledTimes(1);
+      expect(decomposeSteps.mock.calls[0]![1]?.context).toContain(`${exists ? 'existing' : 'missing'}: src/ux-sim/${device}.ts`);
+      expect(authored.document).toContain(exists
+        ? `기존 src/ux-sim/${device}.ts를 사용해`
+        : `신설: src/ux-sim/${device}.ts · src/ux-sim/${device}.test.ts`);
+      expect(authored.document).toContain('선행: DEVICE-FIRST-STAGE 조각 착지 뒤 발사');
+    }
+  });
+
   test('DEVICE-FIRST-AUTHORING without target root marks device inventory unmeasured', async () => {
     const ask = '대상 경로: src/feature.ts\n완료 경계 증거 명령: bun test src/feature.test.ts\n필요한 장치: fault-synthetic';
     const authored = await authorGoal(ask, {
@@ -10740,6 +11009,7 @@ describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
       const headings = lines.filter((line) => /^#{2,3} /u.test(line));
       const planHeading = headings.indexOf(VERIFICATION_PLAN_HEADING);
       expect(headings.slice(planHeading - 2, planHeading + 2)).toEqual(['## 답하지 못하는 것', '### 수용 구별 관측', VERIFICATION_PLAN_HEADING, '## 불변식']);
+      expect(lintGoalFile(authored.document, 'b').filter((finding) => finding.tag === 'canonical-structure')).toEqual([]);
       expect(lintGoalFile(authored.document, 'b').filter((finding) => finding.check === 'required-section-order')).toEqual([]);
     }
   });

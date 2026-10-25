@@ -40,7 +40,7 @@ export interface DraftTriagePr {
   latestCommitAt?: string;
 }
 
-export type DraftTriageNextAction = 'close-a' | 'close-c' | 'human';
+export type DraftTriageNextAction = 'close-a' | 'close-b' | 'close-c' | 'harvest' | 'human';
 export type DraftTriageReviewState = 'approved' | 'changes-requested' | 'commented' | 'dismissed' | 'pending' | 'unknown';
 export type DraftTriageCheck = { state: 'yes' | 'no' | 'unknown'; evidence: string };
 export interface DraftTriageAssessment {
@@ -51,6 +51,8 @@ export interface DraftTriageAssessment {
   review: DraftTriageReviewState;
   cellStatus: 'green' | 'yellow' | 'red' | 'done' | 'unknown';
   nextAction: DraftTriageNextAction;
+  lastFailureTail: string | null;
+  missingEvidence: readonly string[];
   checks: Readonly<Record<'provenance' | 'gate' | 'review' | 'cell-complete' | 'cell-status-repository-bound' | 'replacement-landed' | 'newer-same-card' | 'idle-48h' | 'protected' | 'recent-commit' | 'running' | 'owner-confirmed', DraftTriageCheck>>;
   evidence: readonly string[];
 }
@@ -68,11 +70,15 @@ export interface DraftTriageAssessmentInput {
   targetRepository?: string;
   newerSameCellSameCard?: boolean;
   ownerConfirmed?: boolean;
+  /** Explicit merged PR naming this draft as its same-cell predecessor. */
+  replacement?: { number: number; evidence: string };
+  /** Exact-PR terminal failure, not a failure inferred from another draft in the cell. */
+  lastFailureTail?: string | null;
 }
 
 const CLOSE_PROTECTED_LABELS = new Set([
   'elanous:running', 'elanous:keep', 'elanous:release-hold', 'elanous:idea-approval',
-  'elanous:harvest-claimed', 'triage:land', 'triage:active',
+  'elanous:harvest-claimed', RELEASE_PATH_LABEL, 'triage:land', 'triage:active',
 ]);
 const TRIAGE_TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled', 'abandoned', 'self-implement.result final']);
 
@@ -124,7 +130,10 @@ export function assessDraftTriage(input: DraftTriageAssessmentInput): DraftTriag
   const idle48h = Number.isFinite(ageHours) && ageHours >= 48;
   let nextAction: DraftTriageNextAction = 'human';
   if (closeEligible && cellComplete && cellStatusRepositoryBound) nextAction = 'close-a';
+  else if (closeEligible && input.replacement) nextAction = 'close-b';
   else if (closeEligible && idle48h && input.ownerConfirmed === true) nextAction = 'close-c';
+  else if (provenance && (draft.labels ?? []).includes('elanous:harvestable') && !protectedState && runNotRunning
+    && input.gate === 'pass' && input.review === 'approved') nextAction = 'harvest';
 
   const checks = {
     provenance: { state: provenance ? 'yes' : 'unknown', evidence: provenance ? `origin=${origin}; cell=${cellId}; card=${cardId}` : '출처·유효 칸·카드 표지가 모두 확인되지 않음' },
@@ -132,7 +141,9 @@ export function assessDraftTriage(input: DraftTriageAssessmentInput): DraftTriag
     review: { state: input.review === undefined || input.review === 'unknown' ? 'unknown' : input.review === 'approved' ? 'yes' : 'no', evidence: `latest exact-head review=${input.review ?? 'unknown'}` },
     'cell-complete': { state: input.cellStatus && cellStatusRepositoryBound ? (cellComplete ? 'yes' : 'no') : 'unknown', evidence: input.cellStatus ? `cell=${cellId ?? 'unknown'} status=${input.cellStatus}${cellStatusRepositoryBound ? '' : ' (저장소 귀속 미확인)'}` : `칸 상태 미관측${cellId ? ` (${cellId})` : ''}` },
     'cell-status-repository-bound': { state: cellStatusRepositoryBound ? 'yes' : hasCellStatusRepositoryIdentity ? 'no' : 'unknown', evidence: cellStatusRepositoryBound ? `칸 상태 저장소=${input.cellStatusRepository}; 대상 저장소=${input.targetRepository}` : hasCellStatusRepositoryIdentity ? `칸 상태 저장소=${input.cellStatusRepository}; 대상 저장소=${input.targetRepository} (불일치)` : '칸 상태의 대상 저장소 귀속 미확인' },
-    'replacement-landed': { state: 'unknown', evidence: '현재 adapter는 같은 칸 병합 PR과 이 초안의 대체 관계를 증명하지 않음; follow-up 필요' },
+    'replacement-landed': input.replacement
+      ? { state: 'yes', evidence: `merged #${input.replacement.number}: ${input.replacement.evidence}` }
+      : { state: 'unknown', evidence: '현재 adapter는 같은 칸 병합 PR과 이 초안의 대체 관계를 증명하지 않음; follow-up 필요' },
     'newer-same-card': { state: input.newerSameCellSameCard === undefined ? 'unknown' : input.newerSameCellSameCard ? 'yes' : 'no', evidence: `${input.newerSameCellSameCard === undefined ? '같은 칸·카드 새 draft 관계 미관측' : `same-cell-same-card-newer=${input.newerSameCellSameCard}`}; 관측 표지이며 대체 증거가 아님` },
     'idle-48h': { state: Number.isFinite(ageHours) ? (idle48h ? 'yes' : 'no') : 'unknown', evidence: Number.isFinite(ageHours) ? `head age=${ageHours.toFixed(1)}h` : 'head commit 시각 미관측' },
     protected: { state: protectedState ? 'yes' : 'no', evidence: protectedLabel ? `보호 표지=${protectedLabel}` : '보호 표지 없음' },
@@ -140,9 +151,12 @@ export function assessDraftTriage(input: DraftTriageAssessmentInput): DraftTriag
     running: { state: running ? 'yes' : runNotRunning ? 'no' : 'unknown', evidence: running ? `run=${input.runStatus ?? 'elanous:running'}` : runNotRunning ? `종결 run=${input.runStatus}` : `run 상태 미관측${input.runStatus ? ` (${input.runStatus})` : ''}` },
     'owner-confirmed': { state: input.ownerConfirmed === undefined ? 'unknown' : input.ownerConfirmed ? 'yes' : 'no', evidence: input.ownerConfirmed === undefined ? '소유자 출처 미관측' : input.ownerConfirmed ? '고유 카드 또는 활성 claim owner 확인' : '고유 소유자 없음' },
   } satisfies DraftTriageAssessment['checks'];
-  const evidence = Object.values(checks).map((check) => check.evidence);
+  const missingEvidence = Object.entries(checks).filter(([, check]) => check.state === 'unknown').map(([name]) => name);
+  const evidence = [...Object.values(checks).map((check) => check.evidence),
+    ...(input.lastFailureTail ? [`last failure: ${input.lastFailureTail}`] : [])];
   return { origin, cellId, cardId, gate: input.gate ?? 'unknown', review: input.review ?? 'unknown',
-    cellStatus: input.cellStatus ?? 'unknown', nextAction, checks, evidence };
+    cellStatus: input.cellStatus ?? 'unknown', nextAction, lastFailureTail: input.lastFailureTail ?? null,
+    missingEvidence, checks, evidence };
 }
 
 export interface DraftTriageInput {

@@ -37,6 +37,21 @@ test('failure marker in a passing test title is not parsed as a failure line', (
   expect(parseFailures(mixed)).toEqual(['src/real.test.ts > actual broken case']);
 });
 
+test('GATE-RECHECK-REMOTE: 대상 경로이자 완료 경계 코드는 scripts/release-loop/gate-diff', () => {
+  const title = `src/self-implement/decision-signal-press.test.ts:\n(pass) moves a signal out of pressedRed when every (fail) name also failed on the baseline [0.61ms]\n 21 pass\n 0 fail\nRan 21 tests across 1 file.\n`;
+  const body = `src/self-implement/decision-signal-press.test.ts:\n(pass) assertion body mentions (fail) without failing [0.20ms]\n  expected: every (fail) name also failed\n  received: (fail) was only in the assertion body\n  (fail) indented reporter-shaped text is still body\nexpected (fail) actual broken case [1.00ms]\n 21 pass\n 0 fail\nRan 21 tests across 1 file.\n`;
+  const mixed = `src/real.test.ts:\n(pass) title contains (fail) as ordinary text\n  body also says (fail) here\n(fail) reports (fail) in the title on purpose [1.00ms]\n(fail) actual broken case [1.00ms]\n 1 pass\n 2 fail\nRan 3 tests across 1 file.\n`;
+  // Pod logs may leave a CR on the last reporter row; that is still a real Bun fail row.
+  const crRow = `src/real.test.ts:\n(pass) title contains (fail) as ordinary text\n  body also says (fail) here\n(fail) actual broken case [1.00ms]\r`;
+  expect(parseFailures(title)).toEqual([]);
+  expect(parseFailures(body)).toEqual([]);
+  expect(parseFailures(mixed)).toEqual([
+    'src/real.test.ts > actual broken case',
+    'src/real.test.ts > reports (fail) in the title on purpose',
+  ]);
+  expect(parseFailures(crRow)).toEqual(['src/real.test.ts > actual broken case']);
+});
+
 test('parser consumes the actual Bun failure reporter, including the file header', () => {
   const probe = spawnSync('bun', ['test', '--dots', import.meta.path, '-t', 'deliberate parser fixture failure'], {
     env: { ...process.env, GATE_PARSER_PROBE: '1' }, encoding: 'utf8', timeout: 15_000,

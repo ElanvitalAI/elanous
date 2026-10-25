@@ -14,6 +14,7 @@ type ParseResult = Ledger[] | { error: Incomplete[]; ledgers: Ledger[] };
 const NON_PROGRESS_EVENTS = new Set(['progress-delivery-outcome']);
 const REEMIT_EXCLUDED_PREFIX = 'progress-delivery';
 type Emit = (category: string, event: string, data: Record<string, unknown>) => void;
+export interface PodLedgerMeasurement { ledgerRead: boolean; activityMeasured: boolean }
 /** Heal-loop starter seam — defaults to the real `startHealLoop` inside `recordFailureEvent`. */
 type StartHealLoop = Parameters<typeof recordFailureEvent>[2];
 
@@ -174,7 +175,7 @@ export function createPodLedgerFollower(opts: {
   stallMinutes?: number;
   now?: () => number;
   onStall?: (message: string) => void;
-}): { poll(): void; readonly owned: boolean } {
+}): { poll(): PodLedgerMeasurement; readonly owned: boolean } {
   const dir = opts.dir ?? runLedgerDir();
   const log = opts.log ?? defaultPodReemit();
   const emit: Emit = opts.emit ?? defaultPodReemit();
@@ -208,17 +209,17 @@ export function createPodLedgerFollower(opts: {
   return {
     get owned() { return owned; },
     poll() {
-      if (disabled) return;
+      if (disabled) return { ledgerRead: true, activityMeasured: false };
       if (!owned && existsSync(path)) {
         disabled = true;
         log('self-implement.pod', 'ledger-live-skipped', { runId: opts.runId, reason: 'host-ledger-exists' });
-        return;
+        return { ledgerRead: true, activityMeasured: false };
       }
       const since = `${Math.floor(lastActivityMeasuredAt / 1000)}.${String(lastActivityMeasuredAt % 1000).padStart(3, '0')}`;
       const measurementStartedAt = now();
       const until = `${Math.floor(measurementStartedAt / 1000)}.${String(measurementStartedAt % 1000).padStart(3, '0')}`;
       const r = opts.exec(`s="\${ELANOUS_STATE_DIR:-$HOME/.elanous}"; f="$s/run-ledger/${opts.runId}.jsonl"; w="$s/worktrees"; if [ -f "$f" ]; then tail -c +${offset + 1} "$f" || exit 1; fi; target=''; matches=0; for tree in "$w"/*/*.worktrees/*; do [ -e "$tree/.git" ] || continue; owner=$(git -C "$tree" config --worktree --get elanous.harness.owner 2>/dev/null) || continue; [ "$owner" = 'dev:${opts.runId}' ] || continue; target="$tree"; matches=$((matches + 1)); done; if [ "$matches" -eq 1 ]; then activity=$(find "$target" -type d \\( -name .git -o -name node_modules \\) -prune -o -type f -newermt '@${since}' ! -newermt '@${until}' -printf . 2>/dev/null) && printf '\\nELANOUS_ACTIVITY %s\\n' "\${#activity}" || printf '\\nELANOUS_ACTIVITY_ERROR\\n'; else printf '\\nELANOUS_ACTIVITY_ERROR\\n'; fi`);
-      if (r.status !== 0) { log('self-implement.pod', 'ledger-live-unavailable', { runId: opts.runId, status: r.status, stderr: r.stderr.trim().slice(0, 200) }); checkStall(false, false); return; }
+      if (r.status !== 0) { log('self-implement.pod', 'ledger-live-unavailable', { runId: opts.runId, status: r.status, stderr: r.stderr.trim().slice(0, 200) }); checkStall(false, false); return { ledgerRead: false, activityMeasured: false }; }
       const marker = r.stdout.lastIndexOf('\nELANOUS_ACTIVITY');
       const activityLine = marker < 0 ? '' : r.stdout.slice(marker + 1);
       const activityMatch = /^ELANOUS_ACTIVITY (0|[1-9]\d*)\n$/.exec(activityLine);
@@ -241,11 +242,11 @@ export function createPodLedgerFollower(opts: {
           }
         }
       }
-      if (!ledgerBytes) { checkStall(true, activityMeasured); return; }
+      if (!ledgerBytes) { checkStall(true, activityMeasured); return { ledgerRead: true, activityMeasured }; }
       offset += Buffer.byteLength(ledgerBytes);
       const text = pending + ledgerBytes;
       const cut = text.lastIndexOf('\n');
-      if (cut < 0) { pending = text; checkStall(true, activityMeasured); return; }
+      if (cut < 0) { pending = text; checkStall(true, activityMeasured); return { ledgerRead: true, activityMeasured }; }
       const complete = text.slice(0, cut + 1);
       pending = text.slice(cut + 1);
       mkdirSync(dir, { recursive: true });
@@ -278,6 +279,7 @@ export function createPodLedgerFollower(opts: {
         nextStallMinute = stallMinutes;
       }
       checkStall(true, activityMeasured);
+      return { ledgerRead: true, activityMeasured };
     },
   };
 }

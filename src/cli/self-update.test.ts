@@ -581,31 +581,79 @@ describe('self-update — injected commands only', () => {
     expect(alerts).toHaveLength(1);
   });
 
-  test('a failed PWA build returns the output tail and alerts once without installing, relinking or restarting', async () => {
+  test('a failed PWA build returns and logs the last 40 output lines without installing, relinking or restarting', async () => {
     const f = fixture();
     const alerts: string[] = [];
     const sideEffects: string[] = [];
-    f.deps.run = (cmd, args, cwd, options) => {
-      if (args[0] === 'install') return { status: 0, stderr: '' };
-      expect([cmd, args, cwd, options]).toEqual(['bun', ['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 900_000 }]);
-      f.calls.push('bun build failed');
-      return { status: 1, stdout: 'first line\n', stderr: 'build error\nfinal diagnostic\n' };
-    };
-    const result = await runSelfUpdate({ restart: true, alert: true }, {
-      ...f.deps,
-      installedVersion: () => { sideEffects.push('installedVersion'); return 'new'; },
-      pruneVersions: () => { sideEffects.push('prune'); return { removed: [], kept: [] }; },
-      relinkCurrent: () => { sideEffects.push('relink'); },
-      verifyRestart: async () => { sideEffects.push('verify'); return { ok: true }; },
-      alert: (text) => alerts.push(text),
-    });
-    expect(result).toMatchObject({ exitCode: 1, installedVersion: null, restarted: false, reason: 'PWA 빌드 실패: final diagnostic' });
-    expect(result.pwaBuiltCommit).toBeUndefined();
-    expect(result.reason.split('\n')).toHaveLength(1);
-    expect(f.calls).toContain('bun build failed');
-    expect(sideEffects).toEqual([]);
-    expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toContain(result.reason);
+    const seen: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+    const originalDebugLog = debug.log.bind(debug);
+    debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      seen.push({ category, event, data });
+      return undefined;
+    }) as typeof debug.log;
+    const output = Array.from({ length: 45 }, (_, i) => `build line ${i + 1}`).join('\n');
+    try {
+      f.deps.run = (cmd, args, cwd, options) => {
+        if (args[0] === 'install') return { status: 0, stderr: '' };
+        expect([cmd, args, cwd, options]).toEqual(['bun', ['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 900_000 }]);
+        f.calls.push('bun build failed');
+        return { status: 1, stdout: 'stdout ignored\n', stderr: output };
+      };
+      const result = await runSelfUpdate({ restart: true, alert: true }, {
+        ...f.deps,
+        installedVersion: () => { sideEffects.push('installedVersion'); return 'new'; },
+        pruneVersions: () => { sideEffects.push('prune'); return { removed: [], kept: [] }; },
+        relinkCurrent: () => { sideEffects.push('relink'); },
+        verifyRestart: async () => { sideEffects.push('verify'); return { ok: true }; },
+        alert: (text) => alerts.push(text),
+      });
+      const expectedTail = Array.from({ length: 40 }, (_, i) => `build line ${i + 6}`).join('\n');
+      expect(result).toMatchObject({ exitCode: 1, installedVersion: null, restarted: false, reason: `PWA 빌드 실패: ${expectedTail}` });
+      expect(result.pwaBuiltCommit).toBeUndefined();
+      expect(f.calls).toContain('bun build failed');
+      expect(sideEffects).toEqual([]);
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]).toContain(result.reason);
+      expect(seen).toContainEqual({ category: 'self-update', event: 'build-failed', data: { stage: 'pwa-build', commit: sha.slice(0, 12), tail: expectedTail } });
+    } finally { debug.log = originalDebugLog; }
+  });
+
+  test.each([false, true])('a failed install retains its last 40 output lines and commit in failure log (throws=%s)', async (throws) => {
+    const f = fixture();
+    const seen: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+    const originalDebugLog = debug.log.bind(debug);
+    debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      seen.push({ category, event, data });
+      return undefined;
+    }) as typeof debug.log;
+    const output = Array.from({ length: 45 }, (_, i) => `install line ${i + 1}`).join('\n');
+    try {
+      f.deps.run = (cmd, args) => {
+        if (cmd === 'bun' && args[0] === 'bin/elanous.mjs') return { status: 0, stderr: '' };
+        if (args[0] === 'install') return { status: 0, stderr: '' };
+        if (throws) throw new Error(output);
+        return { status: 1, stderr: output };
+      };
+      const result = await runSelfUpdate({ restart: true }, f.deps);
+      const expectedTail = Array.from({ length: 40 }, (_, i) => `install line ${i + 6}`).join('\n');
+      expect(result).toMatchObject({ exitCode: 1, installedVersion: null, restarted: false, reason: `설치 실패: ${expectedTail}` });
+      expect(seen).toContainEqual({ category: 'self-update', event: 'build-failed', data: { stage: 'install', commit: sha.slice(0, 12), tail: expectedTail } });
+    } finally { debug.log = originalDebugLog; }
+  });
+
+  test('failure reason is bounded to 4000 Unicode code points while debug event keeps the full tail', async () => {
+    const f = fixture();
+    const seen: Array<{ category: string; event: string; data?: Record<string, unknown> }> = [];
+    const originalDebugLog = debug.log.bind(debug);
+    debug.log = ((category: string, event: string, data?: Record<string, unknown>) => { seen.push({ category, event, data }); return undefined; }) as typeof debug.log;
+    const output = Array.from({ length: 40 }, (_, i) => `${i === 39 ? '🙂' : 'x'.repeat(120)}${i}`).join('\n');
+    try {
+      f.deps.run = (cmd, args) => args[0] === 'install' ? { status: 0, stderr: '' } : { status: 1, stderr: output };
+      const result = await runSelfUpdate({}, f.deps);
+      expect(Array.from(result.reason).length).toBeLessThanOrEqual('PWA 빌드 실패: '.length + 4_000);
+      expect(result.reason).not.toContain('�');
+      expect(seen.find((entry) => entry.event === 'build-failed')?.data?.tail).toBe(output.split(/\r?\n/).filter((line) => line.trim()).slice(-40).join('\n'));
+    } finally { debug.log = originalDebugLog; }
   });
 
   test('a successful build precedes install and carries checkout HEAD and build timestamp through JSON result', async () => {

@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeAvailabilityState, writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
+import type { RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { debug } from '../debug/log.js';
 import { resetLiveDetailCacheForTesting, writeLiveDetail } from '../live/detail-switch.js';
 import { saveTokens } from './store.js';
@@ -636,5 +637,101 @@ describe('OR-FALLBACK-TIER-1 — resolveRunFallback 이 config 의 openrouter �
     expect(run(false).decision).toEqual({ action: 'stay', why: 'openrouter-unavailable' });
     _setRotationConfigReaderForTesting(chainCfg());
     expect(run(true).decision).toEqual({ action: 'stay', why: 'openrouter-unavailable' });
+  });
+});
+
+describe('CLAUDE-FAILOVER-FU — resolveRunFallback 이 원장 성숙도를 판정 입력에 싣는다', () => {
+  const NOW_MS = 1_800_000_000_000;
+
+  /** claude-pty 런 원장 고정 입력 — 앞 index 8개가 landed(merged), 첫 런에 화면 미상 1건. */
+  function claudePtyLedger(count: number, options: { readonly missingFieldAt?: number } = {}): Map<string, RunLedgerEntry[]> {
+    const runs = new Map<string, RunLedgerEntry[]>();
+    for (let index = 0; index < count; index += 1) {
+      const runId = `run-${String(index + 1).padStart(8, '0')}`;
+      const timestamp = new Date(NOW_MS - index * 1_000).toISOString();
+      const entries: RunLedgerEntry[] = [{
+        runId,
+        timestamp,
+        event: 'run-origin',
+        data: {
+          childProvider: 'claude-pty',
+          claudePtyUnknownScreens: index === 0 ? 1 : 0,
+          ...(options.missingFieldAt === index ? {} : { humanInterventions: 0 }),
+        },
+      }];
+      if (index < 8) {
+        entries.push({ runId, timestamp, event: 'merged', data: { merged: true } });
+      }
+      runs.set(`${runId}.jsonl`, entries);
+    }
+    return runs;
+  }
+
+  /** 격리 원장 seam — `calls` 는 «수집이 실제로 돌았나»를 세는 자다. */
+  function ledgerDeps(runs: Map<string, RunLedgerEntry[]>, calls: { count: number }) {
+    return {
+      nowMs: NOW_MS,
+      dir: '/unused-claude-pty-ledger-fixture',
+      list: (): string[] => {
+        calls.count += 1;
+        return [...runs.keys()];
+      },
+      load: (runId: string): RunLedgerEntry[] | null => runs.get(`${runId}.jsonl`) ?? null,
+    };
+  }
+
+  /** 회전 판정이 «갈 곳 없음»에 닿는 격리 우주에서 생산 진입점 `resolveRunFallback` 을 부른다. */
+  function runFallback(
+    steps: readonly string[],
+    ledger: ReturnType<typeof ledgerDeps>,
+    grokAvailable = false,
+  ) {
+    const root = isolatedRoot('claude-failover-fu-');
+    _setRotationConfigReaderForTesting(() => ({ llm: { fallbackChain: steps } }));
+    return resolveRunFallback(
+      { CODEX_HOME: join(root, 'codex-home') } as NodeJS.ProcessEnv,
+      { storePath: join(root, 'auth.json'), grokAvailable, claudePtyLedger: ledger },
+    );
+  }
+
+  test('명시 claude-pty 체인 ⊕ 성숙 표본 10런 → Claude 전환', () => {
+    const calls = { count: 0 };
+    const ledger = ledgerDeps(claudePtyLedger(10), calls);
+    expect(runFallback(['codex-rotate', 'claude-pty'], ledger))
+      .toEqual({ action: 'switch-backend', backend: 'claude' });
+    expect(calls.count).toBe(1);
+  });
+
+  test('표본이 9런뿐이면 성숙도가 모자라 claude-pty-immature 로 닫힌다', () => {
+    const calls = { count: 0 };
+    expect(runFallback(['codex-rotate', 'claude-pty'], ledgerDeps(claudePtyLedger(9), calls)))
+      .toEqual({ action: 'stay', why: 'claude-pty-immature' });
+    expect(calls.count).toBe(1);
+  });
+
+  test('원장 칸이 결손된 표본은 추정하지 않고 claude-pty-immature 로 닫힌다', () => {
+    const calls = { count: 0 };
+    expect(runFallback(['codex-rotate', 'claude-pty'], ledgerDeps(claudePtyLedger(10, { missingFieldAt: 4 }), calls)))
+      .toEqual({ action: 'stay', why: 'claude-pty-immature' });
+  });
+
+  test('원장 읽기가 실패해도 전환하지 않고 claude-pty-immature 로 닫힌다', () => {
+    const calls = { count: 0 };
+    const throwing = {
+      nowMs: NOW_MS,
+      dir: '/unused-claude-pty-ledger-fixture',
+      list: (): string[] => { calls.count += 1; throw new Error('ledger unreadable'); },
+      load: (): RunLedgerEntry[] | null => null,
+    };
+    expect(runFallback(['codex-rotate', 'claude-pty'], throwing))
+      .toEqual({ action: 'stay', why: 'claude-pty-immature' });
+    expect(calls.count).toBe(1);
+  });
+
+  test('claude-pty 가 없는 체인은 성숙도를 수집하지 않는다', () => {
+    const calls = { count: 0 };
+    expect(runFallback(['codex-rotate', 'grok'], ledgerDeps(claudePtyLedger(10), calls), true))
+      .toEqual({ action: 'switch-backend', backend: 'grok' });
+    expect(calls.count).toBe(0);
   });
 });

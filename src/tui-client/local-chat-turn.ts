@@ -155,11 +155,11 @@ class LocalChatSession {
     }
   }
 
-  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string) => void): Promise<TurnResult> {
+  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string) => void, attachments: readonly string[] = []): Promise<TurnResult> {
     if (this.closed) throw new Error('REPL child exited');
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
-    const payload = `${JSON.stringify({ prompt, id: turnId })}\n`;
+    const payload = JSON.stringify({ prompt, id: turnId, ...(attachments.length ? { attachments } : {}) }) + '\n';
     const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, resolve, reject }; });
     try {
       if (writePrompt) await writePrompt(payload);
@@ -237,6 +237,7 @@ export async function runLocalChatTurn(
   writePrompt?: (payload: string) => Promise<void>,
   onDelta?: (text: string) => void,
   compact: LocalChatTurnCompact = {},
+  attachments: readonly string[] = [],
 ): Promise<void> {
   if (signal.aborted) throw new Error('응답을 취소했습니다');
   if (!cli) throw new Error('elanous CLI entry is unavailable');
@@ -258,7 +259,7 @@ export async function runLocalChatTurn(
   try {
     result = await session.turn(text, writePrompt, (delta) => {
       if (!signal.aborted) onDelta?.(delta);
-    });
+    }, attachments);
   } catch (error) {
     if (signal.aborted) throw new Error('응답을 취소했습니다');
     await closeLocalChatSession(sessionId);

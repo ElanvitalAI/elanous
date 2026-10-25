@@ -108,6 +108,8 @@ describe('REVIEW-CONVERGE-PRIOR-FIX — TA 재리뷰가 직전 라운드를 싣�
     expect(readPriorMustFix('/x', PR, at({ pr: 1, verdict: 'pass', mustFix: [] })).status).toBe('not-recovered');
     expect(readPriorMustFix('/x', PR, at({ pr: PR, error: 'boom' })).status).toBe('not-recovered');
     expect(readPriorMustFix('/x', PR, at({ pr: PR, verdict: 'fail', reviewed: false, mustFix: [] })).status).toBe('not-recovered');
+    expect(readPriorMustFix('/x', PR, HEAD_A, at({ pr: PR, verdict: 'fail', headCommit: HEAD_B, mustFix: ['stale'] })))
+      .toEqual({ status: 'not-recovered', reason: 'result head does not match prior review head' });
     expect(readPriorMustFix(undefined, PR).status).toBe('not-recovered');
   });
 });

@@ -1,13 +1,15 @@
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { ptyManifestDbPath, getPtyManifest, markPtyControlled } from './pty-manifest.js';
+import { ptyManifestDbPath, getPtyManifest, markPtyControlled, listPtyManifestRows, listPtyManifestRowsAt } from './pty-manifest.js';
 import { getHarnessRunId } from '../harness/harness-space.js';
 import { renamePty, type PtyControlTarget } from './registry.js';
 import { resizePtyWithOutcome, writePtyWithOutcome, writePtyWithOutcomeDetail } from './pty-write-outcome.js';
 import { resetExternalWriteProvenanceForTesting } from './pty-write-provenance.js';
 import { parsePtyWriteActor, resolveRemoteControlActor, type PtyWriteActor } from './pty-write-arbiter.js';
-import { isPtyAccessMode } from './pty-ref.js';
+import { isPtyAccessMode, resolvePtyRef, type PtyRefReason } from './pty-ref.js';
+import { RemotesStore } from '../cli/remotes.js';
+import { bookmarkToElanousRemote } from '../cli/remote-resolve.js';
 import { debug } from '../debug/log.js';
 import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from './pty-mouse.js';
 import { startPtyRecording, stopPtyRecording } from './pty-recording.js';
@@ -53,6 +55,12 @@ export interface PtyControlRequestOptions {
   readonly now?: () => number;
   /** 요청자 poll 루프의 대기(기본 `Bun.sleep`) — 기본값에서 25ms cadence 계약은 그대로다. */
   readonly sleep?: (ms: number) => Promise<void>;
+  /** 사람 타이핑 세션 — 있으면 재해석·재캡처 없이 이 «고정값»만 쓴다(`beginPtyHumanTypingSession`). */
+  readonly typingSession?: PtyHumanTypingSession;
+  /** 아직 세션이 없을 때 캡처할 북마크 이름(없으면 remotes.json 의 default · 그것도 없으면 로컬). */
+  readonly bookmarkName?: string;
+  /** 호출자가 이미 캡처해 둔 북마크 핀 — 재조회하지 않는다. */
+  readonly typingBookmark?: PtyTypingBookmarkPin;
 }
 
 export interface PtyControlResult {
@@ -185,6 +193,27 @@ const PTY_CONTROL_DEEP_IDLE_AFTER_MS = 10 * 60_000;
 /** 깊은 유휴에서의 재읽기 간격. 요청 wake 는 이 간격을 «기다리지 않는다». */
 const PTY_CONTROL_DEEP_IDLE_POLL_MS = 1_500;
 
+/** 감속 계단의 두 값과 «계측» 훅 — 생산 기본값은 위 상수 ⊕ env override 다. */
+interface ControlCadenceLimits {
+  readonly deepIdleAfterMs: number;
+  readonly deepIdlePollMs: number;
+  /** 큐를 실제로 다시 읽을 때마다 1회 — 감속 계측용(생산 진입점은 넘기지 않는다). */
+  readonly onQueueRead?: () => void;
+}
+
+/** 생산 폴러는 옵션 없이 호출되므로 env override 뒤 상수 기본값만 사용한다. */
+function resolveCadenceMs(envName: string, fallback: number): number {
+  return positiveInteger(Number(process.env[envName])) ?? fallback;
+}
+
+function cadenceLimits(options: PtyControlProcessOptions): ControlCadenceLimits {
+  return {
+    deepIdleAfterMs: resolveCadenceMs('ELANOUS_PTY_CONTROL_DEEP_IDLE_AFTER_MS', PTY_CONTROL_DEEP_IDLE_AFTER_MS),
+    deepIdlePollMs: resolveCadenceMs('ELANOUS_PTY_CONTROL_DEEP_IDLE_POLL_MS', PTY_CONTROL_DEEP_IDLE_POLL_MS),
+    ...(options.onQueueRead ? { onQueueRead: options.onQueueRead } : {}),
+  };
+}
+
 /** 깨어움 표식은 큐와 같은 원장 디렉터리에 둔다 — 요청자와 owner 가 같은 원장(`ptyManifestDbPath`)을
  *  볼 때 owner 의 tick 이 곧바로 그 자리를 본다. 연합 큐(`manifestDbPath`)로 남의 원장에 요청하면
  *  표식은 그 원장 자리에 남고 그 owner 는 감속 간격만큼만 늦다(요청 timeout 안쪽 · fail-soft).
@@ -236,7 +265,7 @@ function observeControlCadence(state: ControlCadenceState, mode: 'active' | 'dee
  *  ⛔ 첫 tick 은 언제나 읽는다(기동 직후 도착한 요청을 감속 뒤에 두지 않는다).
  *  ⛔ 감속 시계는 `pollClock`(기본 `Date.now`) 뿐이다 — `now`(takeover TTL 시계)를 섞으면 시험이
  *     주입한 값이 실제 tick 을 감속시키는 회귀가 난다. */
-function shouldReadControlQueue(dbPath: string, nowMs: number): boolean {
+function shouldReadControlQueue(dbPath: string, nowMs: number, limits: ControlCadenceLimits): boolean {
   const state = cadenceState(dbPath);
   // 시계가 뒤로 갔다 = 이전 관측과 다른 시계다. 그 앵커로는 유휴를 못 재므로 버리고 다시 센다.
   if (state.lastSeenAt !== null && nowMs < state.lastSeenAt) {
@@ -248,14 +277,15 @@ function shouldReadControlQueue(dbPath: string, nowMs: number): boolean {
   const woke = consumePtyControlWake(dbPath);
   if (state.lastControlAt === null || woke) state.lastControlAt = nowMs;
   const idleMs = nowMs - state.lastControlAt;
-  const deepIdle = idleMs >= PTY_CONTROL_DEEP_IDLE_AFTER_MS;
+  const deepIdle = idleMs >= limits.deepIdleAfterMs;
   const sinceReadMs = state.lastDbReadAt === null ? Number.POSITIVE_INFINITY : nowMs - state.lastDbReadAt;
-  if (!woke && deepIdle && sinceReadMs < PTY_CONTROL_DEEP_IDLE_POLL_MS) {
+  if (!woke && deepIdle && sinceReadMs < limits.deepIdlePollMs) {
     observeControlCadence(state, 'deep-idle', idleMs);
     return false;
   }
   state.lastDbReadAt = nowMs;
   observeControlCadence(state, deepIdle ? 'deep-idle' : 'active', idleMs);
+  limits.onQueueRead?.();
   return true;
 }
 
@@ -271,6 +301,124 @@ export async function requestRemotePtyControlCapabilities(id: string, options: P
   return { status: 'owner-result', result };
 }
 
+// ── PTY-HUMAN-TYPING-REMOTE (0.2.36 · UX 칸) — 사람 타이핑의 ref 해석·bookmark 캡처는 «한 번» ──
+//
+// `--remote --human` 타이핑은 호출자가 준 ref(alias·nickname)를 그대로 원장에 흘리면 안 된다:
+// 타이핑 도중 nickname 이 바뀌면 같은 입력이 다른 PTY 로 풀리고, 북마크(host·token·url)가 갈라지면
+// «어느 원격에 쓰는가» 자체가 흔들린다. ⇒ 첫 글자를 넣기 前에 한 번 해석·캡처하고 그 값을 세션 전체에
+// 고정한다. 해석이 확정되기 前에는 원장 행을 «쓰지 않는다»(fail-closed).
+//
+// ⛔ 여기서 해석기를 새로 만들지 않는다 — 목록은 `pty-manifest`(listPtyManifestRows/…At),
+//    해석은 `pty-ref`(resolvePtyRef), 북마크는 `cli/remotes`(RemotesStore) 가 정본이다.
+
+/** 사람 타이핑 세션이 고정하는 원격 북마크 신원 — 캡처는 세션 시작 때 한 번뿐이다. */
+export interface PtyTypingBookmarkPin {
+  readonly name: string;
+  readonly host: string;
+  readonly url: string;
+  readonly token?: string;
+}
+
+/** 타이핑 세션의 고정값 — 이 객체가 사는 동안 재해석·재조회가 없다. */
+export interface PtyHumanTypingSession {
+  /** 호출자가 준 ref(그대로 보존 — 원장·로그 대조용). */
+  readonly ref: string;
+  /** 해석된 canonical pty id — 이후 모든 요청이 쓰는 유일한 주소. */
+  readonly ptyId: string;
+  /** 어느 단계로 확정됐나(`exact-id`·`nickname-exact`·`kind`·`id-prefix`·`nickname-substr`). */
+  readonly resolvedBy: PtyRefReason;
+  /** 캡처된 원격 북마크(로컬이면 null). */
+  readonly bookmark: PtyTypingBookmarkPin | null;
+  /** 해석에 쓴 매니페스트 뿌리 — 연합 요청이면 그 원장이다. */
+  readonly manifestDbPath?: string;
+}
+
+export interface PtyHumanTypingOptions {
+  /** 해석에 쓸 매니페스트 뿌리 — 없으면 이 프로세스의 원장(`ptyManifestDbPath`). */
+  readonly manifestDbPath?: string;
+  /** 이미 읽어 둔 핀(호출자가 캡처를 마친 경우) — 재조회하지 않는다. */
+  readonly bookmark?: PtyTypingBookmarkPin;
+  /** 캡처할 북마크 이름. 없으면 default 북마크, 그것도 없으면 로컬(null). */
+  readonly bookmarkName?: string;
+  /** remotes.json 저장소 재정의(시험·연합). */
+  readonly remotes?: RemotesStore;
+}
+
+export type PtyHumanTypingResolution =
+  | { readonly ok: true; readonly session: PtyHumanTypingSession }
+  | {
+    readonly ok: false;
+    readonly status: 'ambiguous-ref' | 'unresolved-ref' | 'unknown-bookmark';
+    /** ambiguous 면 후보 canonical id 들(사람이 고를 수 있게). */
+    readonly candidates: readonly string[];
+  };
+
+type BookmarkCapture = { readonly ok: true; readonly pin: PtyTypingBookmarkPin | null } | { readonly ok: false };
+
+function captureTypingBookmark(options: PtyHumanTypingOptions): BookmarkCapture {
+  if (options.bookmark) return { ok: true, pin: options.bookmark };
+  const wanted = options.bookmarkName?.trim() ?? '';
+  try {
+    const store = options.remotes ?? new RemotesStore();
+    const listed = wanted ? undefined : store.listRemotes().find((item) => item.isDefault);
+    const entry = wanted ? store.getRemote(wanted) : listed?.entry;
+    if (!entry) return wanted ? { ok: false } : { ok: true, pin: null };
+    const token = store.readToken(entry);
+    return {
+      ok: true,
+      pin: {
+        name: wanted || listed?.name || entry.host,
+        host: entry.host,
+        url: bookmarkToElanousRemote(entry),
+        ...(token ? { token } : {}),
+      },
+    };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * ★ 사람 타이핑 세션 시작 — ref(alias·nickname·id)를 canonical id 로 **한 번** 해석하고
+ *   bookmark host/token/URL 을 **한 번** 캡처한다. 해석이 확정되지 않으면 세션을 만들지 않는다.
+ *
+ * 목록은 «한 번의 스냅숏»이다(살아 있는 행만) — 해석 도중 목록이 바뀌어도 이 세션은 흔들리지 않는다.
+ */
+export function beginPtyHumanTypingSession(ref: string, options: PtyHumanTypingOptions = {}): PtyHumanTypingResolution {
+  const items = (options.manifestDbPath ? listPtyManifestRowsAt(options.manifestDbPath) : listPtyManifestRows())
+    .filter((row) => row.alive)
+    .map((row) => ({ id: row.id, kind: row.kind, ...(row.nickname ? { nickname: row.nickname } : {}) }));
+  const resolution = resolvePtyRef(ref, items);
+  if (!resolution.match) {
+    const candidates = resolution.candidates.map((item) => item.id);
+    debug.log('pty.control', 'typing-ref-unresolved', { ref, reason: resolution.reason, candidates });
+    return { ok: false, status: resolution.reason === 'ambiguous' ? 'ambiguous-ref' : 'unresolved-ref', candidates };
+  }
+  const captured = captureTypingBookmark(options);
+  if (!captured.ok) {
+    // ⛔ 명시적으로 부른 북마크를 못 읽었으면 fail-closed. (부르지 않은 default 캡처 실패는 로컬로 떨어진다 — 아래)
+    if (options.bookmarkName?.trim()) {
+      debug.log('pty.control', 'typing-bookmark-unavailable', { ref, bookmark: options.bookmarkName.trim() });
+      return { ok: false, status: 'unknown-bookmark', candidates: [] };
+    }
+    debug.log('pty.control', 'typing-bookmark-skipped', { ref, reason: 'default-bookmark-unreadable' });
+  }
+  const session: PtyHumanTypingSession = {
+    ref,
+    ptyId: resolution.match.id,
+    resolvedBy: resolution.reason,
+    bookmark: captured.ok ? captured.pin : null,
+    ...(options.manifestDbPath ? { manifestDbPath: options.manifestDbPath } : {}),
+  };
+  debug.log('pty.control', 'typing-session-pinned', {
+    ref: session.ref,
+    ptyId: session.ptyId,
+    resolvedBy: session.resolvedBy,
+    bookmark: session.bookmark?.name ?? 'local',
+  });
+  return { ok: true, session };
+}
+
 export async function requestRemotePtyControl(id: string, action: PtyControlAction, payloadOrTimeout?: PtyControlPayload | number, timeoutOrOptions: PtyControlRequestOptions | number = {}): Promise<PtyControlResult> {
   const payload = typeof payloadOrTimeout === 'number' ? undefined : payloadOrTimeout;
   const options = typeof timeoutOrOptions === 'number' ? { timeoutMs: timeoutOrOptions } : timeoutOrOptions;
@@ -280,23 +428,48 @@ export async function requestRemotePtyControl(id: string, action: PtyControlActi
   // 시험만 가상 시각으로 deadline·grace 경계와 cadence 를 결정론적으로 민다(벽시계 판별 없음).
   const pollNow = options.now ?? Date.now;
   const pollWait = options.sleep ?? ((ms: number): Promise<void> => Bun.sleep(ms));
-  const opened = dbAt(options.manifestDbPath);
+  // ⭐ 사람 타이핑(input-text/input-key)은 원장에 «쓰기 前» ref 를 canonical id 로 확정한다.
+  //    확정 전에는 행을 안 쓴다(fail-closed) — 미해석·모호한 ref 가 남의 PTY 에 닿지 않게.
+  const typingAction = action === 'input-text' || action === 'input-key';
+  let session = options.typingSession;
+  let targetId = id;
+  if (typingAction) {
+    if (!session) {
+      const started = beginPtyHumanTypingSession(id, {
+        ...(options.manifestDbPath ? { manifestDbPath: options.manifestDbPath } : {}),
+        ...(options.bookmarkName ? { bookmarkName: options.bookmarkName } : {}),
+        ...(options.typingBookmark ? { bookmark: options.typingBookmark } : {}),
+      });
+      if (!started.ok) {
+        return started.status === 'ambiguous-ref'
+          ? { status: 'denied', reason: 'pty-ref-ambiguous' }
+          : started.status === 'unknown-bookmark'
+            ? { status: 'denied', reason: 'typing-bookmark-unavailable' }
+            : { status: 'unknown-pty' };
+      }
+      session = started.session;
+    }
+    targetId = session.ptyId;
+  }
+  // 세션 핀이 연합 원장을 정했으면 그 원장을 쓴다(재해석·재조회 없음).
+  const queuePath = options.manifestDbPath ?? session?.manifestDbPath;
+  const opened = dbAt(queuePath);
   const d = opened.database;
   try {
     cleanupStale(d);
-    const target = options.manifestDbPath
-      ? d.query('SELECT owner_pid, alive FROM pty_manifest WHERE id=?').get(id) as { owner_pid: number; alive: number } | null
-      : getPtyManifest(id);
+    const target = queuePath
+      ? d.query('SELECT owner_pid, alive FROM pty_manifest WHERE id=?').get(targetId) as { owner_pid: number; alive: number } | null
+      : getPtyManifest(targetId);
     if (!target || !target.alive) return { status: 'unknown-pty' };
     const ownerPid = 'owner_pid' in target ? target.owner_pid : target.ownerPid;
     const requestId = crypto.randomUUID();
     const now = Date.now();
     // ⭐ 요청자의 run anchor 를 요청에 실어 보낸다 — 인가는 **owner 가** 자기 PTY 의 run 과 대조해 내린다
     //    (요청자 자기 신고를 그대로 믿지 않는다는 뜻이 아니라, 판정 지점이 자원 소유자라는 뜻).
-    d.run(`INSERT INTO pty_control_requests (request_id, pty_id, action, payload_json, actor, requester_run_id, owner_pid, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [requestId, id, action, payload ? JSON.stringify(payload) : null, actor, getHarnessRunId(process.env), ownerPid, 'pending', now, now]);
+    d.run(`INSERT INTO pty_control_requests (request_id, pty_id, action, payload_json, actor, requester_run_id, owner_pid, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [requestId, targetId, action, payload ? JSON.stringify(payload) : null, actor, getHarnessRunId(process.env), ownerPid, 'pending', now, now]);
     // ⭐ 깊은 유휴 감속 중인 owner 를 즉시 깨운다 — 행을 넣은 «뒤» 표식을 남기므로 그 재읽기가 이 행을 본다.
     //    표식은 그 행의 `ownerPid` «별» 파일이다 — 같은 원장을 공유하는 다른 owner 가 가져가지 못한다.
-    signalPtyControlWake(requestQueuePath(options), ownerPid);
+    signalPtyControlWake(queuePath ?? ptyManifestDbPath(), ownerPid);
     const readback = (): ControlRow | null => d.query(SELECT_ROW).get(requestId) as ControlRow | null;
     const del = (): void => { d.run('DELETE FROM pty_control_requests WHERE request_id=?', [requestId]); };
     const deadline = pollNow() + timeoutMs;
@@ -369,6 +542,8 @@ export interface PtyControlProcessOptions {
   readonly takeoverTtlMs?: number;
   /** 깊은 유휴 감속 계단 **전용** 시계(기본 `Date.now`). `now` 는 takeover TTL 시계라 섞지 않는다. */
   readonly pollClock?: () => number;
+  /** 큐를 실제로 다시 읽을 때마다 1회 — 감속 계측용. 생산 진입점은 넘기지 않는다. */
+  readonly onQueueRead?: () => void;
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -409,15 +584,9 @@ export function processPtyControlRequests(getHandle: (id: string) => PtyControlT
   //   감속 구간에서는 여기서 «큐를 다시 읽지 않는» 것으로 끝나고, 첫 원격 요청의 표식이 오면 즉시 통과한다.
   //   ⛔ 감속 열쇠는 아래 `processPtyControlRequestsOnce` 가 실제로 여는 원장(`db()` = `ptyManifestDbPath()`)과
   //      같은 경로다 — 상태는 한 큐, 읽기는 다른 큐로 갈라지지 않는다.
-  if (!shouldReadControlQueue(ptyManifestDbPath(), (options.pollClock ?? Date.now)())) return Promise.resolve();
+  if (!shouldReadControlQueue(ptyManifestDbPath(), (options.pollClock ?? Date.now)(), cadenceLimits(options))) return Promise.resolve();
   inFlight = processPtyControlRequestsOnce(getHandle, takeover, options).finally(() => { inFlight = null; });
   return inFlight;
-}
-
-/** 요청이 실제로 들어간 원장 — 깨어움 표식은 «그 원장의 owner» 가 보는 자리에 남겨야 한다.
- *  연합 요청(`manifestDbPath`)이면 그 원장 디렉터리, 내 요청이면 내 원장. */
-function requestQueuePath(options: { readonly manifestDbPath?: string }): string {
-  return options.manifestDbPath ?? ptyManifestDbPath();
 }
 
 async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyControlTarget | undefined, takeover: (id: string, actor: 'human') => boolean, options: PtyControlProcessOptions): Promise<void> {

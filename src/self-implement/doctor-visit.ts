@@ -1,4 +1,7 @@
+import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { debug } from '../debug/log.js';
+import { loadReviewRoundBrief, type ReviewRoundBrief } from './review-round-brief.js';
 import { findIncidentPrecedents, type IncidentPrecedent } from '../harness/harness-incidents.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import {
@@ -14,6 +17,42 @@ import {
 /** 사고 원장 루트 기본값 — 운영/시험 우주 상태 디렉터리(없으면 빈 선례 · fail-soft). */
 export function doctorVisitIncidentRoot(): string {
   return elanousStateRoot();
+}
+
+export interface DoctorReviewPrMetadata { headRefOid: string; body: string; files: string[]; comments?: Array<{ body: string; author: string }> }
+
+/** Fetch only the metadata needed to anchor a saved review to the current PR head. */
+export function readDoctorReviewPr(pr: number): DoctorReviewPrMetadata {
+  const result = spawnSync('gh', ['pr', 'view', String(pr), '--json', 'headRefOid,body,files,author,comments'], {
+    encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.error || result.status !== 0) throw new Error(`PR #${pr} unavailable: ${result.error?.message ?? result.stderr?.trim() ?? 'gh failed'}`);
+  const data = JSON.parse(result.stdout) as { headRefOid?: unknown; body?: unknown; files?: unknown; author?: { login?: unknown }; comments?: unknown };
+  if (typeof data.headRefOid !== 'string' || !/^[a-f0-9]{40}$/i.test(data.headRefOid)) throw new Error('PR headRefOid is missing or invalid');
+  return {
+    headRefOid: data.headRefOid,
+    body: typeof data.body === 'string' ? data.body : '',
+    files: Array.isArray(data.files) ? data.files.flatMap((file: unknown) => {
+      if (typeof file === 'string') return [file];
+      if (file && typeof file === 'object' && typeof (file as { path?: unknown }).path === 'string') return [(file as { path: string }).path];
+      return [];
+    }) : [],
+    comments: typeof data.author?.login === 'string' && Array.isArray(data.comments) ? data.comments.flatMap((comment: unknown) => {
+      if (!comment || typeof comment !== 'object') return [];
+      const item = comment as { body?: unknown; author?: { login?: unknown } };
+      const login = item.author?.login;
+      return typeof item.body === 'string' && typeof login === 'string' && login === data.author?.login
+        ? [{ body: item.body, author: login }] : [];
+    }) : [],
+  };
+}
+
+/** Doctor's saved-review view; never records a run-ledger visit for a PR. */
+export function readDoctorReviewBrief(pr: number, read: (pr: number) => DoctorReviewPrMetadata = readDoctorReviewPr, reviewResultsDir?: string): ReviewRoundBrief {
+  if (!Number.isSafeInteger(pr) || pr <= 0) throw new Error('PR number must be a positive integer');
+  const metadata = read(pr);
+  return loadReviewRoundBrief({ pr, head: metadata.headRefOid, body: metadata.body, changedFiles: metadata.files, comments: metadata.comments?.map((comment) => comment.body),
+    ...(reviewResultsDir ? { reviewResultsDir } : {}) });
 }
 
 /** DOCTOR-VISIT 증상 닫힌 목록 — 이 밖의 값은 기록·조회 모두 거부한다. */
@@ -180,7 +219,51 @@ export function recordTaskAgentNeedsOwnerVisit(input: {
   return { status: outcome.result ?? 'missing-ledger' };
 }
 
+/** A parent stop that needs an owner records one shadow visit per stop, without running a prescription. */
+export function recordParentNeedsOwnerVisit(input: {
+  runId: string;
+  stopKey: string;
+  evidence: string;
+  dir?: string;
+}): { status: 'missing-ledger' | 'recorded' | 'already-recorded' } {
+  const outcome = appendRunLedgerEntryChecked(input.runId, (entries) => {
+    if (entries === null) return { append: false, result: 'missing-ledger' as const };
+    if (entries.some((entry) => entry.event === 'doctor-visit' && entry.data.from === 'parent'
+      && entry.data.symptom === 'needs-owner' && entry.data.stopKey === input.stopKey)) {
+      return { append: false, result: 'already-recorded' as const };
+    }
+    return { append: true, entry: {
+      runId: input.runId,
+      timestamp: new Date().toISOString(),
+      event: 'doctor-visit',
+      data: { from: 'parent', symptom: 'needs-owner', stopKey: input.stopKey, evidence: input.evidence },
+    } };
+  }, input.dir);
+  if (outcome.appended) {
+    debug.log('run-doctor', 'visit', { runId: input.runId, from: 'parent', symptom: 'needs-owner', stopKey: input.stopKey });
+    return { status: 'recorded' };
+  }
+  if (outcome.result === null) throw new Error(`run-ledger-write-refused: ${input.runId}`);
+  return { status: outcome.result };
+}
+
 export type ReadDoctorVisitsOptions = RunLedgerLookupOptions;
+
+/** Project logged review briefs into status without changing the run-ledger schema. Keep the latest observation per PR. */
+export function doctorReviewVisits(events: readonly { timestamp?: string; sequence?: number; runId?: string; key?: string; evidence?: string }[]): (Omit<DoctorVisit, 'runId'> & { runId?: string })[] {
+  const seenPrs = new Set<string>();
+  return [...events].sort((left, right) => {
+    const leftAt = left.timestamp ? Date.parse(left.timestamp) : 0;
+    const rightAt = right.timestamp ? Date.parse(right.timestamp) : 0;
+    return rightAt - leftAt || (right.sequence ?? 0) - (left.sequence ?? 0) || String(right.key ?? '').localeCompare(String(left.key ?? ''));
+  }).flatMap((event) => {
+    const pr = /^(\d+)(?::|$)/.exec(event.key ?? '')?.[1];
+    if (pr && seenPrs.has(pr)) return [];
+    if (pr) seenPrs.add(pr);
+    return [{ ...(event.runId ? { runId: event.runId } : {}), from: 'seat' as const, symptom: 'review-loop' as const,
+      ...(event.evidence ? { evidence: event.evidence } : {}), ...(event.timestamp ? { timestamp: event.timestamp } : {}) }];
+  });
+}
 
 /** `runId` 원장이 조회 범위 안에 있는가 — `doctor status --run` 이 없는 런을 «0건»으로 삼키지 않게 한다. */
 export function doctorVisitRunExists(runId: string, options: ReadDoctorVisitsOptions = {}): boolean {

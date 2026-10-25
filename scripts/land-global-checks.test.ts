@@ -14,8 +14,11 @@ test('apps/pwa 의 tsx 는 hook-order-sweep 을 끌어오고 ts·다른 앱 tsx 
   expect(landGlobalChecks(['apps/desktop/src/App.tsx'])).toEqual([]);
 });
 
-test('release/next.md 는 release-story draft 시험을 끌어오고 다른 release 문서는 안 끌어온다', () => {
-  expect(landGlobalChecks(['release/next.md'])).toEqual(['scripts/release-story/draft.test.ts']);
+// RELEASE-NOTE-ON-LAND — 노트 줄을 «초안·브랜드 규칙»(draft.test)만 보면 발행 판정(notes-check)의 B11 한국어
+// 자와 어긋난다. 0.2.24 컷 노드가 `신설:` 한 줄로 두 번 ✗ 났는데(10-12 01:28 · 01:51) 착지에서는 그 줄이 그대로 통과했다.
+test('release/next.md 는 release-story draft 시험과 announce-loop 발행 노트 시험을 둘 다 끌어오고 다른 release 문서는 안 끌어온다', () => {
+  expect(landGlobalChecks(['release/next.md']))
+    .toEqual(['scripts/release-story/draft.test.ts', 'scripts/announce-loop/check-node.test.ts']);
   expect(landGlobalChecks(['release/0.2.19.md'])).toEqual([]);
   expect(landGlobalChecks(['docs/release/next.md'])).toEqual([]);
 });

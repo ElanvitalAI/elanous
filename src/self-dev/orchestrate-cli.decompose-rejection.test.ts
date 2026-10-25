@@ -15,6 +15,8 @@ describe('decompose rejection — dangling dependsOn 관측과 라운드 간 중
   const danglingProposal = () => ({
     shardId: 'run-single',
     pieces: [
+      // planShadowFirstDispatch returns early without this canonical id, bypassing the dangling-edge guard.
+      { id: 'shadow', feature: 'observe proposal', dependsOn: [], hotPathOverlaps: [] },
       { id: 'p1', feature: 'part one', dependsOn: ['ghost'], hotPathOverlaps: [] },
       { id: 'p2', feature: 'part two', dependsOn: [], hotPathOverlaps: [] },
     ],

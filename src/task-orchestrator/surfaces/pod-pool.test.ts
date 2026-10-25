@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, vi } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, podWorkLabels, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
 import { podPlacementKind, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
@@ -353,7 +353,7 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       hostLease: new HostPoolLease('work-labels', { dir: join(root, 'lease') }),
     });
     try {
-      const spawn = podSelfImplementSpawn({ kubectl, pool, imageCommit: null, pollMs: 1, sleep: async () => {},
+      const spawn = podSelfImplementSpawn({ kubectl, pool, imageCommit: null, pollMs: 1, sleep: async () => {}, budgetSnapshot: () => undefined,
         env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: 'run-work-labels', ELANOUS_POD_MEMORY_TIER: 'lite', ELANOUS_POD_GOAL_TYPE: 'document', ELANOUS_POD_OWNER_KIND: 'steward', ELANOUS_POD_OWNER_ID: 'default', ELANOUS_POD_TASK_CARD: 'ta-20261008-abc123', ELANOUS_POD_SLOT_ID: 'RES-FLOOR-POD-LABELS' },
         credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }),
       });
@@ -365,7 +365,7 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       expect(manifests[0]!.spec.template.metadata.labels).toMatchObject(expected);
       expect(manifests[0]!.spec.template.spec.containers[0].env).toContainEqual({ name: 'ELANOUS_TASK_CARD_ID', value: 'ta-20261008-abc123' });
       expect(pool.snapshot()).toEqual({ big: 0, small: 0 });
-      const author = podSelfImplementSpawn({ kubectl, pool, imageCommit: null, pollMs: 1, sleep: async () => {},
+      const author = podSelfImplementSpawn({ kubectl, pool, imageCommit: null, pollMs: 1, sleep: async () => {}, budgetSnapshot: () => undefined,
         env: { ELANOUS_STATE_DIR: root, ELANOUS_POD_AUTHOR_ON_POD: '1', ELANOUS_POD_MEMORY_TIER: 'lite' },
         credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }),
       });
@@ -616,7 +616,11 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
   });
 
   test('three pooled Job launches share FIFO admission: N=2 holds the third goal', async () => {
+    const tick = () => Bun.sleep(5);
+    const dir = mkdtempSync(join(tmpdir(), 'pod-fifo-lease-'));
+    const host = new HostPoolLease('fake', { dir, processStart: () => 'test-start' });
     const pool = new PodPoolScheduler(parsePodPool('fake:3'), {
+      hostLease: host, pollMs: 2,
       status: () => ({ recommended: 2, accountSlots: 0, limitedBy: 'capacity', reason: null,
         capacitySlots: 3, memorySlots: 3, placeableSlots: 3, running: 0, pending: 0 }),
     });
@@ -634,11 +638,13 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     const spawn = podSelfImplementSpawn({ pool, kubectl, env: {}, repoUrl: 'not-a-github-repository',
+      budgetSnapshot: () => undefined,
       credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }), pollMs: 2 });
     const controllers = ['ask', 'say', 'self'].map(() => new AbortController());
     const jobs = ['ask', 'say', 'self'].map((spaceId, i) => spawn({ spaceId, feature: spaceId, signal: controllers[i]!.signal } as Parameters<typeof spawn>[0]));
     const waitUntil = async (predicate: () => boolean) => {
-      for (let i = 0; i < 100 && !predicate(); i++) await Bun.sleep(5);
+      const deadline = Date.now() + 10_000;
+      while (!predicate() && Date.now() < deadline) await tick();
       expect(predicate()).toBe(true);
     };
     try {
@@ -646,25 +652,34 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       expect(applied[0]).toContain('ask');
       expect(applied[1]).toContain('say');
       expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1, recommended: 2 });
-      await Bun.sleep(10);
+      expect(host.live()).toHaveLength(2);
+      expect(host.live().map((lease) => lease.stage)).toEqual(['job', 'job']);
+      await tick();
       expect(applied).toHaveLength(2);
+      expect(host.live()).toHaveLength(2);
       completed.add(applied[0]!);
-      await jobs[0]!.done;
       await waitUntil(() => applied.length === 3);
+      await jobs[0]!.done;
       expect(applied[2]).toContain('self');
+      expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job', job: applied[2] }));
       completed.add(applied[1]!);
       completed.add(applied[2]!);
+      await waitUntil(() => pool.admissionSnapshot().active === 0);
       await Promise.all(jobs.slice(1).map((job) => job.done));
       expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 0 });
+      expect(host.live()).toHaveLength(0);
       expect(pool.snapshot()).toEqual({ fake: 0 });
     } finally {
       controllers.forEach((controller) => controller.abort());
       for (const name of applied) completed.add(name);
-      await Promise.all(jobs.map((job) => job.done));
+      await Promise.race([Promise.allSettled(jobs.map((job) => job.done)), Bun.sleep(1_000)]);
+      rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test('a Job remains leased after apply until its Pod phase is observed Running', async () => {
+    vi.useFakeTimers();
+    const tick = async () => { await Promise.resolve(); vi.advanceTimersByTime(5); await Promise.resolve(); };
     const dir = mkdtempSync(join(tmpdir(), 'pod-running-lease-'));
     const host = new HostPoolLease('p', { dir });
     const pool = new PodPoolScheduler(parsePodPool('p:2'), { hostLease: host, pollMs: 2,
@@ -680,21 +695,27 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     const spawn = podSelfImplementSpawn({ pool, kubectl, pollMs: 2, imageCommit: null,
+      budgetSnapshot: () => undefined,
       credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }) });
     const controller = new AbortController();
     try {
       const job = spawn({ spaceId: 'pending-phase', feature: 'f', signal: controller.signal } as Parameters<typeof spawn>[0]);
-      for (let n = 0; n < 100 && !applied; n++) await Bun.sleep(5);
+      for (let n = 0; n < 100 && !applied; n++) await tick();
       expect(applied).toBe(true);
       expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job' }));
+      await tick();
+      expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job' }));
       phase = 'Running';
-      for (let n = 0; n < 100 && host.live().length; n++) await Bun.sleep(5);
+      for (let n = 0; n < 100 && host.live().length; n++) await tick();
       expect(host.live()).toHaveLength(0);
       phase = 'Complete';
+      await tick();
       await job.done;
-    } finally { controller.abort(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { controller.abort(); vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); }
   });
   test('terminal Job without a Running Pod also releases its host lease', async () => {
+    vi.useFakeTimers();
+    const tick = async () => { await Promise.resolve(); vi.advanceTimersByTime(5); await Promise.resolve(); };
     const dir = mkdtempSync(join(tmpdir(), 'pod-terminal-lease-'));
     const host = new HostPoolLease('p', { dir });
     const pool = new PodPoolScheduler(parsePodPool('p:2'), { hostLease: host, pollMs: 2,
@@ -709,16 +730,39 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     const spawn = podSelfImplementSpawn({ pool, kubectl, pollMs: 2, imageCommit: null,
+      budgetSnapshot: () => undefined,
       credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }) });
     const controller = new AbortController();
+    let next: Promise<(() => void) | null> | undefined;
+    let releaseNext: (() => void) | null | undefined;
     try {
       const job = spawn({ spaceId: 'terminal-before-running', feature: 'f', signal: controller.signal } as Parameters<typeof spawn>[0]);
-      for (let n = 0; n < 100 && !applied; n++) await Bun.sleep(5);
+      for (let n = 0; n < 100 && !applied; n++) await tick();
+      expect(applied).toBe(true);
+      expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job' }));
+      let nextAdmitted = false;
+      next = pool.acquireAdmission(controller.signal).then((release) => { nextAdmitted = true; return release; }, () => null);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 1, queued: 1 });
+      await tick();
+      expect(nextAdmitted).toBe(false);
       expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job' }));
       phase = 'Failed';
+      for (let n = 0; n < 100 && !nextAdmitted; n++) await tick();
+      expect(nextAdmitted).toBe(true);
       await job.done;
+      releaseNext = await next;
+      expect(releaseNext).not.toBeNull();
+      expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'authoring' }));
+      releaseNext?.();
+      releaseNext = null;
       expect(host.live()).toHaveLength(0);
-    } finally { controller.abort(); rmSync(dir, { recursive: true, force: true }); }
+    } finally {
+      controller.abort();
+      vi.useRealTimers();
+      if (releaseNext === undefined) releaseNext = await next;
+      releaseNext?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
   test('pool admission forwards after goal ID and PR number to the dependency gate before reserving a free slot', async () => {
     let merged = false;
@@ -765,6 +809,7 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     const spawn = podSelfImplementSpawn({ pool, kubectl, env: {}, repoUrl: 'not-a-github-repository',
+      budgetSnapshot: () => undefined,
       credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }), pollMs: 2 });
     const controller = new AbortController();
     const job = spawn({ spaceId: 'dependent', feature: 'dependent', after: 123, signal: controller.signal });

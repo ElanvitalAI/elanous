@@ -172,6 +172,7 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource,
           provider: cfg.llm.provider,
           configuredModel: cfg.llm.model,
           text: opts.userText,
+          surface,
           explicitModel: llmOpts?.model,
           routePolicy: cfg.llm.routePolicy,
         });

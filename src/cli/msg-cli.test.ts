@@ -262,6 +262,43 @@ test('post --reply-to links a reply to its question through the durable store', 
   try { expect(unchanged.list('MK')).toEqual([]); } finally { unchanged.close(); }
 });
 
+test('list --thread shows the durable request and reply across seats without changing DM, ALL or ack', async () => {
+  const f = fixture();
+  await f.run('post', 'request', '--from', 'OP', '--to', 'TC', '--json');
+  const request = JSON.parse(f.stdout.at(-1)!) as Message;
+  await f.run('post', 'notice', '--from', 'MK', '--to', 'ALL', '--json');
+  const notice = JSON.parse(f.stdout.at(-1)!) as Message;
+  await f.run('post', 'reply', '--from', 'TC', '--to', 'OP', '--reply-to', String(request.id), '--json');
+  const reply = JSON.parse(f.stdout.at(-1)!) as Message;
+  await f.run('list', '--thread', String(request.id), '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([request, reply]);
+  await f.run('list', '--thread', String(request.id), '--after', String(request.id), '--limit', '1', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([reply]);
+  await f.run('list', '--to', 'TC', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([request, notice]);
+  await f.run('list', '--to', 'OP', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([notice, reply]);
+  await f.run('ack', String(request.id), '--to', 'TC');
+  await f.run('list', '--to', 'TC', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([notice]);
+  await f.run('list', '--thread', String(request.id), '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([request, reply]);
+  await f.run('thread', String(reply.id), '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual({ question: request, replies: [reply] });
+  await f.run('list', '--thread', String(reply.id), '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([request, reply]);
+  const store = f.store();
+  try { expect(store.getCursor('TC')).toBe(request.id); expect(store.getCursor('OP')).toBe(0); }
+  finally { store.close(); }
+  expect(f.stderr).toEqual([]);
+  expect(f.exits).toEqual([]);
+  await f.run('list', '--thread', String(request.id), '--to', 'TC');
+  expect(f.stderr.at(-1)).toBe('msg: --thread cannot be used with --to');
+  await f.run('list', '--thread', '999');
+  expect(f.stderr.at(-1)).toBe('msg: message not found: #999');
+  expect(f.exits).toEqual([2, 2]);
+});
+
 test('ask waits for the first reply pointing at its question and exits 0', async () => {
   let postedDuringWait = false;
   const f = fixture('', ({ path }) => ({

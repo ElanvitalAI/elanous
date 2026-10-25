@@ -1,12 +1,19 @@
 import { expect, test } from 'bun:test';
 import { Command } from 'commander';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerAutopilotCommands } from '../cli/autopilot-cli.js';
-import { buildEntranceRefusalDenominator, executeEntranceTick, executeNextAction, failureKey, readDeliveryEvidence, type ActionDeps, type NextAction } from './actions.js';
+import * as actions from './actions.js';
+import { buildEntranceRefusalDenominator, executeEntranceTick, executeNextAction, failureKey, readDeliveryEvidence, type ActionDeps, type GreenSweepProbe, type NextAction } from './actions.js';
+import { readTaskCard, writeTaskCards, type TaskCard } from './task-hand.js';
+import type { ChecklistItem } from '../release-loop/checklist.js';
 import { judgeNextMove, LIVE_RETRY_MOVES, retryMoveOf, SAME_MOVE_FAILURE_LIMIT } from './judge.js';
-import { resolveTaskAgentLiveMoves } from './live-moves.js';
+import { executeLiveReview, resolveTaskAgentLiveMoves } from './live-moves.js';
+import { recordTaskAgentShadowMove } from './shadow.js';
+import { rejudgeCandidates, rejudgeCardOnHead } from './rejudge-on-head.js';
+import type { SupervisorJobResult } from '../self-dev/run-supervisor.js';
 
 test('entrance refusal denominator counts prototype-like reasons as ordinary keys', () => {
   const result = buildEntranceRefusalDenominator([
@@ -96,6 +103,320 @@ test('registered autopilot action entry invokes executor in default shadow mode'
     expect(surfaces).toEqual(['task-agent']);
   } finally { process.stdout.write = original; resetElanousConfigDir(); delete process.env.ELANOUS_STATE_DIR; }
 });
+test('TA-REVIEW-SKIP-HARVEST: absent or mismatched signal preserves review', async () => {
+  for (const harvestState of [
+    undefined,
+    { pr: 43, source: 'owner-worktree-commit' as const, head: INPUT },
+    { pr: 42, source: 'owner-worktree-commit' as const, head: 'not-a-commit' },
+  ]) {
+    const unproven = fake();
+    expect(await executeNextAction({ ...action, harvestState }, unproven.deps)).toBe('done');
+    expect(unproven.calls[0]?.slice(0, 2)).toEqual(['self', 'review']);
+    expect(unproven.events.some(e => (e as { result: string }).result === 'skipped')).toBe(false);
+  }
+});
+
+test('TA-REVIEW-SKIP-HARVEST: producer signal reaches review consumer and card history', async () => {
+  expect(typeof actions.ownerWorktreeHarvestState).toBe('function');
+  const cwd = mkdtempSync(join(tmpdir(), 'ta-harvest-owner-'));
+  const prHead = 'c'.repeat(40);
+  const gitCalls: string[][] = [];
+  const git = (path: string, args: string[]) => (gitCalls.push(args), { status: 0,
+    stdout: args[0] === 'branch' ? 'harvest/one\n' : args[0] === 'rev-parse' ? INPUT + '\n'
+      : args[0] === 'worktree' ? `worktree ${path}\nHEAD ${INPUT}\nbranch refs/heads/harvest/one\n` : '' });
+  const f = fake();
+  const signal = actions.ownerWorktreeHarvestState({ pr: 42, cwd, head: prHead, branch: 'harvest/one', state: 'OPEN' }, git);
+  const candidate = { ...action, cwd, harvestState: signal };
+  f.deps.harvestGit = git;
+  const command = f.deps.command;
+  f.deps.command = async args => args.includes('state,headRefOid,headRefName')
+    ? (f.calls.push(args), { status: 0, stdout: JSON.stringify({ state: 'OPEN', headRefOid: prHead, headRefName: 'harvest/one' }) }) : command(args);
+  expect(await executeNextAction(candidate, f.deps)).toBe('waiting');
+  expect(candidate.history).toContain('review skipped: owner-worktree-commit');
+  expect(gitCalls.map(c => c[0])).toEqual(['branch', 'rev-parse', 'worktree', 'merge-base', 'branch', 'rev-parse', 'worktree', 'merge-base']);
+  expect(candidate.harvestState).toEqual({ pr: 42, source: 'owner-worktree-commit', head: INPUT });
+  expect(f.calls.map(c => c.slice(0, 2))).toEqual([['gh', 'pr']]);
+  expect(f.events.at(-1)).toMatchObject({ kind: 'review', result: 'waiting', reason: expect.stringContaining('next: wait') });
+
+  const stale = fake();
+  stale.deps.harvestGit = git;
+  const staleCommand = stale.deps.command;
+  stale.deps.command = async args => args.includes('state,headRefOid,headRefName')
+    ? (stale.calls.push(args), { status: 0, stdout: JSON.stringify({ state: 'OPEN', headRefOid: INPUT, headRefName: 'harvest/one' }) }) : staleCommand(args);
+  expect(await executeNextAction({ ...action, cwd, harvestState: signal }, stale.deps)).toBe('done');
+  expect(stale.calls.map(c => c.slice(0, 2)).slice(0, 2)).toEqual([['gh', 'pr'], ['self', 'review']]);
+
+  const notAncestor = fake();
+  const refused = actions.ownerWorktreeHarvestState({ pr: 42, cwd, head: prHead, branch: 'harvest/one', state: 'OPEN' },
+    (path, args) => args[0] === 'merge-base' ? { status: 1, stdout: '' } : git(path, args));
+  expect(refused).toBeUndefined();
+  expect(actions.ownerWorktreeHarvestState({ pr: 42, cwd, head: prHead, branch: 'harvest/one', state: 'MERGED' }, git)).toBeUndefined();
+  expect(actions.ownerWorktreeHarvestState({ pr: 42, cwd, head: INPUT, branch: 'harvest/one', state: 'OPEN' }, git)).toBeUndefined();
+  expect(actions.ownerWorktreeHarvestState({ pr: 42, cwd, head: prHead, branch: 'other-branch', state: 'OPEN' }, git)).toBeUndefined();
+  expect(actions.ownerWorktreeHarvestState({ pr: 42, cwd, head: prHead, branch: 'harvest/one', state: 'OPEN' },
+    (path, args) => args[0] === 'worktree' ? { status: 0, stdout: `worktree ${path}\nHEAD ${INPUT}\nbranch refs/heads/other-branch\n` } : git(path, args))).toBeUndefined();
+  expect(await executeNextAction({ ...action, cwd, harvestState: refused }, notAncestor.deps)).toBe('done');
+  expect(notAncestor.calls[0]?.slice(0, 2)).toEqual(['self', 'review']);
+});
+
+test('TA-REVIEW-SKIP-HARVEST: registered owner worktree commit is produced by real git', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ta-harvest-git-'));
+  const git = (...args: string[]) => {
+    const out = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env,
+      GIT_AUTHOR_NAME: 'TA test', GIT_AUTHOR_EMAIL: 'ta@example.invalid',
+      GIT_COMMITTER_NAME: 'TA test', GIT_COMMITTER_EMAIL: 'ta@example.invalid' } });
+    expect(out.status).toBe(0);
+    return out.stdout.trim();
+  };
+  git('init', '-b', 'harvest/one');
+  writeFileSync(join(cwd, 'artifact.txt'), 'first\n');
+  git('add', 'artifact.txt');
+  git('commit', '-m', 'PR head');
+  const prHead = git('rev-parse', 'HEAD');
+  writeFileSync(join(cwd, 'artifact.txt'), 'second\n');
+  git('add', 'artifact.txt');
+  git('commit', '-m', 'owner worktree commit');
+  const owner = git('rev-parse', 'HEAD');
+  expect(actions.ownerWorktreeHarvestState({ pr: 42, cwd, head: prHead, branch: 'harvest/one', state: 'OPEN' })).toEqual({
+    pr: 42, head: owner, source: 'owner-worktree-commit',
+  });
+  expect(actions.ownerWorktreeHarvestState({ pr: 42, cwd, head: owner, branch: 'harvest/one', state: 'OPEN' })).toBeUndefined();
+  const path = join(cwd, 'cards.json');
+  const url = 'https://github.com/example/project/pull/42';
+  const card: TaskCard = { id: 'ta-real-git', text: 'fixture', status: 'launched', createdAt: '2026-10-23T00:00:00Z',
+    history: [], pr: { number: 42, url }, runId: 'run-real-git' };
+  writeTaskCards(path, [card]);
+  let reviews = 0;
+  const outcome = await executeLiveReview(card, 42, { runId: card.runId!, stopReason: 'harvestable-awaiting-human', cwd }, {
+    statePath: path, prHead: async () => ({ head: prHead, branch: 'harvest/one', state: 'OPEN', url }),
+    requestReview: async () => { reviews++; },
+  });
+  expect(outcome).toMatchObject({ executed: false, detail: expect.stringContaining('next: wait for harvest') });
+  expect(reviews).toBe(0);
+  expect(readTaskCard(card.id, path)?.history).toContainEqual(expect.objectContaining({ event: 'review-skipped-harvest',
+    head: owner, effect: 'wait' }));
+});
+
+test('TA-REVIEW-SKIP-HARVEST: live review consumes owner signal, records card history and waits for harvest', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ta-live-harvest-'));
+  const path = join(cwd, 'card.json');
+  const card: TaskCard = { id: 'ta-harvest', text: 'original', createdAt: '2026-10-23T00:00:00Z', status: 'launched', history: [], pr: { number: 42, url: 'https://github.com/example/project/pull/42' }, runId: 'run-1' };
+  writeTaskCards(path, [card]);
+  let requests = 0;
+  const local = INPUT;
+  const remote = 'c'.repeat(40);
+  const deps = {
+    statePath: path,
+    prHead: async () => ({ state: 'OPEN', head: remote, branch: 'harvest/one', url: 'https://github.com/example/project/pull/42' }),
+    harvestGit: (dir: string, args: string[]) => ({ status: 0,
+      stdout: args[0] === 'branch' ? 'harvest/one\n' : args[0] === 'rev-parse' ? `${local}\n`
+        : args[0] === 'worktree' ? `worktree ${dir}\nHEAD ${local}\nbranch refs/heads/harvest/one\n` : '' }),
+    requestReview: async () => { requests++; },
+  };
+  const next = await executeLiveReview(card, 42, { runId: 'run-1', stopReason: 'harvestable-awaiting-human', cwd }, deps);
+  expect(next).toMatchObject({ kind: 'review', executed: false, ok: true, detail: expect.stringContaining('next: wait for harvest') });
+  expect(requests).toBe(0);
+  expect(readTaskCard(card.id, path)?.history).toMatchObject([{ event: 'review-skipped-harvest', pr: 42, head: local, effect: 'wait' }]);
+  expect(readTaskCard(card.id, path)?.reviewRequests).toBeUndefined();
+  expect((await executeLiveReview(card, 42, { runId: 'run-1', stopReason: 'harvestable-awaiting-human', cwd }, deps)).executed).toBe(false);
+  expect(readTaskCard(card.id, path)?.history).toHaveLength(1);
+
+  writeTaskCards(path, [{ ...readTaskCard(card.id, path)!, runId: 'run-2' }]);
+  expect((await executeLiveReview(card, 42, { runId: 'run-2', stopReason: 'harvestable-awaiting-human', cwd }, deps)).executed).toBe(false);
+  expect(readTaskCard(card.id, path)?.history.filter(entry => entry.event === 'review-skipped-harvest' && entry.runId === 'run-2')).toHaveLength(1);
+  expect(rejudgeCandidates({ [card.id]: readTaskCard(card.id, path)! })).toEqual([card.id]);
+  expect(requests).toBe(0);
+
+  deps.prHead = async () => ({ state: 'OPEN', head: local, branch: 'harvest/one', url: 'https://github.com/example/project/pull/42' });
+  expect((await executeLiveReview(card, 42, { runId: 'run-1', stopReason: 'harvestable-awaiting-human', cwd }, deps)).executed).toBe(true);
+  expect(requests).toBe(1);
+  expect(readTaskCard(card.id, path)?.reviewRequests).toContainEqual(expect.objectContaining({ pr: 42, head: local }));
+  deps.prHead = async () => ({ state: 'OPEN', head: remote, branch: 'harvest/one', url: 'https://github.com/example/project/pull/42' });
+
+  deps.harvestGit = (dir, args) => ({ status: args[0] === 'merge-base' ? 1 : 0,
+    stdout: args[0] === 'branch' ? 'harvest/one\n' : args[0] === 'rev-parse' ? `${local}\n`
+      : args[0] === 'worktree' ? `worktree ${dir}\nHEAD ${local}\nbranch refs/heads/harvest/one\n` : '' });
+  expect((await executeLiveReview(card, 42, { runId: 'run-1', stopReason: 'harvestable-awaiting-human', cwd }, deps)).executed).toBe(true);
+  expect(requests).toBe(2);
+
+  const other = { ...card, id: 'ta-other', pr: 43 };
+  writeTaskCards(path, [other]);
+  deps.harvestGit = (dir, args) => ({ status: 0,
+    stdout: args[0] === 'branch' ? 'harvest/one\n' : args[0] === 'rev-parse' ? `${local}\n`
+      : args[0] === 'worktree' ? `worktree ${dir}\nHEAD ${local}\nbranch refs/heads/harvest/one\n` : '' });
+  expect((await executeLiveReview(other, 42, { runId: 'run-1', stopReason: 'harvestable-awaiting-human', cwd }, deps)).executed).toBe(true);
+  expect(requests).toBe(3);
+  expect(readTaskCard(other.id, path)?.history).toHaveLength(0);
+
+  const wrongUrl = { ...card, id: 'ta-wrong-url', pr: { number: 42, url: 'https://github.com/other/project/pull/42' } };
+  writeTaskCards(path, [wrongUrl]);
+  expect((await executeLiveReview(wrongUrl, 42, { runId: 'run-1', stopReason: 'harvestable-awaiting-human', cwd }, deps)).executed).toBe(true);
+  expect(requests).toBe(4);
+  expect(readTaskCard(wrongUrl.id, path)?.history).toHaveLength(0);
+
+  const noUrl = { ...card, id: 'ta-no-url', pr: 42 };
+  writeTaskCards(path, [noUrl]);
+  expect((await executeLiveReview(noUrl, 42, { runId: 'run-1', stopReason: 'harvestable-awaiting-human', cwd }, deps)).executed).toBe(true);
+  expect(requests).toBe(5);
+  expect(readTaskCard(noUrl.id, path)?.history).toHaveLength(0);
+
+  const noRun = { ...card, id: 'ta-no-run', runId: undefined };
+  writeTaskCards(path, [noRun]);
+  expect((await executeLiveReview(noRun, 42, { runId: null, stopReason: 'harvestable-awaiting-human', cwd }, deps)).executed).toBe(true);
+  expect(requests).toBe(6);
+  expect(readTaskCard(noRun.id, path)?.history).toHaveLength(0);
+});
+
+test('TA-REVIEW-SKIP-HARVEST: supervisor live round records skip, history and next wait for bound PR', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ta-supervisor-harvest-'));
+  const statePath = join(cwd, 'cards.json');
+  const card: TaskCard = { id: 'ta-live', text: 'feature ask', createdAt: '2026-10-23T00:00:00Z', status: 'launched',
+    history: [], pr: { number: 42, url: 'https://github.com/example/project/pull/42' }, runId: 'run-live' };
+  writeTaskCards(statePath, [card]);
+  const result = { taskId: card.id, feature: card.text, status: 'done', ok: true,
+    worktreePath: cwd, prNumber: 42 } as SupervisorJobResult;
+  let requests = 0;
+  const move = await recordTaskAgentShadowMove({ runId: 'run-live', stopReason: 'needs-human', results: [result] }, {
+    env: {}, statePath, log: () => {}, liveMoves: new Set(['review']), prFiles: async () => ['src/task-agent/actions.ts'],
+    live: { statePath, prHead: async () => ({ state: 'OPEN', head: 'c'.repeat(40), branch: 'harvest/one', url: 'https://github.com/example/project/pull/42' }),
+      harvestGit: (dir, args) => ({ status: 0,
+        stdout: args[0] === 'branch' ? 'harvest/one\n' : args[0] === 'rev-parse' ? `${INPUT}\n`
+          : args[0] === 'worktree' ? `worktree ${dir}\nHEAD ${INPUT}\nbranch refs/heads/harvest/one\n` : '' }),
+      requestReview: async () => { requests++; } },
+  });
+  const recorded = readTaskCard(card.id, statePath);
+  if (process.env.TA_HARVEST_EVIDENCE === '1') console.info('TA_HARVEST_LIVE_ROUND ' + JSON.stringify({ move, card: recorded, requests }));
+  expect(move).toMatchObject({ move: 'review', liveMove: { kind: 'review', executed: false, ok: true, detail: expect.stringContaining('next: wait for harvest') } });
+  expect(requests).toBe(0);
+  expect(recorded?.history).toContainEqual(expect.objectContaining({ event: 'review-skipped-harvest', pr: 42, head: INPUT, effect: 'wait' }));
+  expect(recorded?.reviewRequests).toBeUndefined();
+});
+
+test('TA-REVIEW-SKIP-HARVEST: rejudge waits for owner commit then reviews exact PR head', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ta-rejudge-harvest-'));
+  const path = join(cwd, 'cards.json');
+  const url = 'https://github.com/example/project/pull/42';
+  const card: TaskCard = { id: 'ta-rejudge', text: 'feature ask', createdAt: '2026-10-23T00:00:00Z', status: 'launched',
+    pr: { number: 42, url }, runId: 'run-1', history: [{ at: '2026-10-23T00:00:00Z', event: 'review-skipped-harvest',
+      pr: 42, head: INPUT, runId: 'run-1', effect: 'wait' }] };
+  writeTaskCards(path, [card]);
+  expect(rejudgeCandidates({ [card.id]: card })).toEqual([card.id]);
+  expect(rejudgeCandidates({ other: { ...card, id: 'other', history: [] } })).toEqual([]);
+  let head = 'c'.repeat(40);
+  let reviews = 0, regates = 0;
+  const deps = { liveMoves: new Set(['review' as const]), prFiles: async () => ['src/task-agent/actions.ts'],
+    ownerHarvestAncestor: () => false,
+    requestRegate: async () => { regates++; },
+    live: { statePath: path, repoCandidates: () => [{ source: 'host' as const, cwd }],
+      prHead: async () => ({ state: 'OPEN', head, branch: 'harvest/one', url }),
+      requestReview: async () => { reviews++; } }, log: () => {} };
+  expect((await rejudgeCardOnHead(card.id, deps)).at(-1)).toMatchObject({ step: 'review', decision: 'awaiting-harvest' });
+  expect((await rejudgeCardOnHead(card.id, deps)).at(-1)).toMatchObject({ step: 'review', decision: 'awaiting-harvest' });
+  expect([reviews, regates]).toEqual([0, 0]);
+  expect(readTaskCard(card.id, path)?.reviewRequests).toBeUndefined();
+  head = INPUT;
+  expect((await rejudgeCardOnHead(card.id, deps)).at(-1)).toMatchObject({ step: 'review', decision: 'review-requested' });
+  expect(reviews).toBe(1);
+  expect(readTaskCard(card.id, path)?.reviewRequests).toContainEqual(expect.objectContaining({ pr: 42, head: INPUT }));
+  expect(readTaskCard(card.id, path)?.history).toContainEqual(expect.objectContaining({ event: 'review-harvest-reached', head: INPUT }));
+  await rejudgeCardOnHead(card.id, deps);
+  expect(reviews).toBe(1);
+  expect(readTaskCard(card.id, path)?.history.filter(item => item.event === 'review-harvest-reached')).toHaveLength(1);
+  expect(rejudgeCandidates({ wrong: { ...card, id: 'wrong', history: [{ ...card.history[0]!, runId: 'another-run' }] } })).toEqual([]);
+
+  const awaitingReview: TaskCard = { ...card, id: 'ta-awaiting-review', history: [...card.history, {
+    at: '2026-10-23T00:00:01Z', event: 'review-harvest-reached', pr: 42, head: INPUT, runId: 'run-1',
+  }] };
+  writeTaskCards(path, [awaitingReview]);
+  expect(rejudgeCandidates({ [awaitingReview.id]: awaitingReview })).toEqual([awaitingReview.id]);
+  const disabled = { ...deps, liveMoves: new Set<'review'>() };
+  expect((await rejudgeCardOnHead(awaitingReview.id, disabled)).at(-1)).toMatchObject({ step: 'review', decision: 'would-review' });
+  expect(reviews).toBe(1);
+  expect(rejudgeCandidates({ [awaitingReview.id]: readTaskCard(awaitingReview.id, path)! })).toEqual([awaitingReview.id]);
+  expect((await rejudgeCardOnHead(awaitingReview.id, deps)).at(-1)).toMatchObject({ step: 'review', decision: 'review-requested' });
+  expect(reviews).toBe(2);
+  expect(rejudgeCandidates({ [awaitingReview.id]: readTaskCard(awaitingReview.id, path)! })).toEqual([awaitingReview.id]);
+
+  const oldReview = { ...card, id: 'ta-old-review', reviewRequests: [{ pr: 42, head: 'd'.repeat(40), at: '2026-10-23T00:00:00Z' }] };
+  writeTaskCards(path, [oldReview]);
+  expect(readTaskCard(oldReview.id, path)).toMatchObject({ history: [{ event: 'review-skipped-harvest', head: INPUT }], reviewRequests: [{ head: 'd'.repeat(40) }] });
+  expect(readTaskCard(oldReview.id, path)?.history.map(item => item.event)).toEqual(['review-skipped-harvest']);
+  head = 'c'.repeat(40);
+  expect((await rejudgeCardOnHead(oldReview.id, deps)).at(-1)).toMatchObject({ step: 'review', decision: 'awaiting-harvest' });
+  expect(reviews).toBe(2);
+  head = 'e'.repeat(40);
+  expect((await rejudgeCardOnHead(oldReview.id, { ...deps, ownerHarvestAncestor: (_cwd: string, owner: string, newer: string) => owner === INPUT && newer === head })).at(-1))
+    .toMatchObject({ step: 'review', decision: 'review-requested' });
+  expect(readTaskCard(oldReview.id, path)?.history).toContainEqual(expect.objectContaining({ event: 'review-harvest-reached', head }));
+  expect(reviews).toBe(3);
+  expect((await rejudgeCardOnHead(oldReview.id, { ...deps, ownerHarvestAncestor: () => false })).at(-1)?.decision).not.toBe('awaiting-harvest');
+  expect(readTaskCard(oldReview.id, path)?.history.filter(item => item.event === 'review-harvest-reached')).toHaveLength(1);
+  expect(reviews).toBe(3);
+});
+
+test('TA-REVIEW-SKIP-HARVEST: review request rechecks owner ancestry after PR head changes', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ta-harvest-race-'));
+  const path = join(cwd, 'cards.json');
+  const url = 'https://github.com/example/project/pull/42';
+  const other = 'f'.repeat(40);
+  const card: TaskCard = { id: 'ta-race', text: 'feature ask', createdAt: '2026-10-23T00:00:00Z', status: 'launched',
+    pr: { number: 42, url }, runId: 'run-1', history: [
+      { at: '2026-10-23T00:00:00Z', event: 'review-skipped-harvest', pr: 42, head: INPUT, runId: 'run-1', effect: 'wait' },
+      { at: '2026-10-23T00:00:01Z', event: 'review-harvest-reached', pr: 42, head: INPUT, runId: 'run-1' },
+    ] };
+  writeTaskCards(path, [card]);
+  let reads = 0, reviews = 0;
+  const deps = { liveMoves: new Set(['review' as const]), prFiles: async () => ['src/task-agent/actions.ts'],
+    ownerHarvestAncestor: () => false,
+    live: { statePath: path, repoCandidates: () => [{ source: 'host' as const, cwd }],
+      prHead: async () => ({ state: 'OPEN', head: ++reads === 1 ? INPUT : other, branch: 'harvest/one', url }),
+      requestReview: async () => { reviews++; } }, log: () => {} };
+  const result = await rejudgeCardOnHead(card.id, deps);
+  expect(result.at(-1)).toMatchObject({ step: 'review', decision: 'awaiting-harvest' });
+  expect(reads).toBeGreaterThan(1);
+  expect(reviews).toBe(0);
+  expect(readTaskCard(card.id, path)?.reviewRequests).toBeUndefined();
+  expect((await rejudgeCardOnHead(card.id, deps)).at(-1)).toMatchObject({ step: 'review', decision: 'awaiting-harvest' });
+  expect(reviews).toBe(0);
+
+  reads = 0;
+  writeTaskCards(path, [{ ...card, id: 'ta-race-at-executor' }]);
+  const executorDeps = { ...deps, live: { ...deps.live,
+    prHead: async () => ({ state: 'OPEN', head: ++reads < 3 ? INPUT : other, branch: 'harvest/one', url }) } };
+  expect((await rejudgeCardOnHead('ta-race-at-executor', executorDeps)).at(-1)).toMatchObject({ step: 'review', decision: 'awaiting-harvest' });
+  expect(reads).toBeGreaterThanOrEqual(3);
+  expect(reviews).toBe(0);
+  expect(readTaskCard('ta-race-at-executor', path)?.reviewRequests).toBeUndefined();
+});
+
+test('TA-REVIEW-SKIP-HARVEST: descendant reach history is idempotent without a successful review', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'ta-harvest-descendant-'));
+  const path = join(cwd, 'cards.json');
+  const url = 'https://github.com/example/project/pull/42';
+  const descendant = 'e'.repeat(40);
+  const card: TaskCard = { id: 'ta-descendant', text: 'feature ask', createdAt: '2026-10-23T00:00:00Z', status: 'launched',
+    pr: { number: 42, url }, runId: 'run-1', history: [{ at: '2026-10-23T00:00:00Z', event: 'review-skipped-harvest',
+      pr: 42, head: INPUT, runId: 'run-1', effect: 'wait' }] };
+  writeTaskCards(path, [card]);
+  let requests = 0;
+  const live = { statePath: path, repoCandidates: () => [{ source: 'host' as const, cwd }],
+    prHead: async () => ({ state: 'OPEN', head: descendant, branch: 'harvest/one', url }),
+    harvestGit: () => ({ status: 0, stdout: '' }),
+    requestReview: async () => { requests++; throw new Error('unavailable'); } };
+  const deps = { liveMoves: new Set<'review'>(), prFiles: async () => ['src/task-agent/actions.ts'],
+    ownerHarvestAncestor: () => true, live, log: () => {} };
+  for (let tick = 0; tick < 3; tick++) {
+    expect((await rejudgeCardOnHead(card.id, deps)).at(-1)).toMatchObject({ step: 'review', decision: 'would-review' });
+    expect(readTaskCard(card.id, path)?.history.filter(item => item.event === 'review-harvest-reached')).toHaveLength(1);
+  }
+  deps.liveMoves.add('review');
+  expect((await rejudgeCardOnHead(card.id, deps)).at(-1)).toMatchObject({ step: 'review', decision: 'review-request-failed' });
+  expect(readTaskCard(card.id, path)?.history.filter(item => item.event === 'review-harvest-reached')).toHaveLength(1);
+  expect((await rejudgeCardOnHead(card.id, deps)).at(-1)?.decision).not.toBe('review-requested');
+  expect(readTaskCard(card.id, path)?.history.filter(item => item.event === 'review-harvest-reached')).toHaveLength(1);
+  expect(requests).toBe(1);
+});
+
 test('pass reviews then lands then greens with actual merged SHA, not input SHA', async () => {
   const f = fake();
   await executeNextAction(action, f.deps);
@@ -409,5 +730,168 @@ test('R4 live: the executor itself refuses the move once it failed SAME_MOVE_FAI
   f.deps.failureCounts = { [failureKey({ taskId: 'TASK', kind: 'retry', variant: 'salvage' })]: SAME_MOVE_FAILURE_LIMIT };
   expect(await executeNextAction(retry('salvage'), f.deps)).toBe('decision');
   expect(harnessCalls(f.calls)).toHaveLength(0);
+});
+
+// GREEN-FROM-LEDGER-FU — green live 쓰기 소비자는 green-sweep 순수 판정(greenSweepCandidates/decideGreenSweep)의
+// dry-run 결정을 소비한다. green-sweep 모듈은 쓰기 0 — `release checklist set --status green` 쓰기는 이 소비자만 한다.
+// 원문 대조 ③(칸 원문 재독)은 cellEvidence 가 실제 일치를 확인했을 때만 'cell ok' 로 남는다 —
+// 미제공·재독 불가는 자기 자신(item.evidence)과의 공전 대조를 하지 않고 unknown 으로 쓰기를 거부한다(거짓 green 방지).
+test('GREEN-FROM-LEDGER-FU: consumer writes green only on positive decideGreenSweep + matching OP 원문; false-green blocked otherwise', async () => {
+  // 소비자 유닛은 «동적 import»로 받는다 — 구현이 없는 base 에서도 이 시험 파일은 모듈 로드 오류가 아니라
+  // export 부재 «단언 실패»로 레드를 목격한다(changed-test-evidence red witness).
+  const actionsModule = await import('./actions.js');
+  expect(typeof actionsModule.consumeGreenSweepForGreenWrite).toBe('function');
+  const { consumeGreenSweepForGreenWrite } = actionsModule;
+  const mergeSha = 'c'.repeat(40);
+  const cell: ChecklistItem = { id: 'CELL-GREEN', title: '셀 제목', status: 'yellow', updatedAt: '2026-10-23T00:00:00.000Z', updatedBy: 'test' };
+  const cards: TaskCard[] = [{ id: 'TASK-20261023-01', text: '과제', checklistId: 'CELL-GREEN', checklistVersion: '0.2.36', createdAt: '2026-10-23T00:00:00.000Z', status: 'done', history: [], pr: 4242 }];
+  const evidenceLine = `GREEN-FROM-LEDGER: PR #4242 merged ${mergeSha} · green · bound-card-merged`;
+  const baseProbe = { pr: async () => ({ number: 4242, state: 'MERGED', mergeSha }), ancestor: async () => true, hold: async () => false, repositoryMatches: async () => true };
+
+  // (a) 판정 green ⊕ 원문 일치(칸 원문 재독도 판정이 본 것과 같다) — fake command runner 가 release checklist green 쓰기를 1회 관측한다.
+  const f = fake();
+  const accepted = await consumeGreenSweepForGreenWrite({
+    deps: f.deps, item: cell, version: '0.2.36', cards,
+    probe: { ...baseProbe, cellEvidence: async () => '' }, writeLive: true,
+  });
+  expect(accepted).toEqual({ cell: 'CELL-GREEN', pr: 4242, written: true, verdict: 'green', reason: evidenceLine });
+  expect(f.calls).toEqual([['release', 'checklist', 'set', 'CELL-GREEN', '--status', 'green', '--evidence', evidenceLine]]);
+  expect(f.events.at(-1)).toMatchObject({ taskId: 'CELL-GREEN', kind: 'green', result: 'done' });
+
+  // (b) decideGreenSweep 거부(pr 관측 불가) — 쓰기 0 · 칸 재독도 일어나지 않는다(재독은 쓰기 직전 green 판정에만 한다).
+  const refused = fake();
+  const rejected = await consumeGreenSweepForGreenWrite({
+    deps: refused.deps, item: cell, version: '0.2.36', cards,
+    probe: { ...baseProbe, pr: async () => null, cellEvidence: async () => { throw new Error('cell re-read must not run for refused verdicts'); } },
+  });
+  expect(rejected).toMatchObject({ cell: 'CELL-GREEN', pr: 4242, written: false, verdict: 'skip' });
+  expect(rejected.reason).toContain('pr-unreadable');
+  expect(refused.calls).toHaveLength(0);
+  expect(refused.events.at(-1)).toMatchObject({ kind: 'green', result: 'refused' });
+
+  // (c) 원문 대조 불일치(칸 원문이 판정 뒤 바뀜) — green 판정이어도 쓰기 0 · 이유는 'cell mismatch' 로만 남는다.
+  const stale = fake();
+  const mismatched = await consumeGreenSweepForGreenWrite({
+    deps: stale.deps, item: cell, version: '0.2.36', cards,
+    probe: { ...baseProbe, cellEvidence: async () => '판정 뒤 바뀐 칸 원문' },
+  });
+  expect(mismatched).toMatchObject({ cell: 'CELL-GREEN', pr: 4242, written: false, verdict: 'evidence-mismatch' });
+  expect(mismatched.reason).toContain('cell mismatch');
+  expect(mismatched.reason).not.toContain('cell ok');
+  expect(stale.calls).toHaveLength(0);
+  expect(stale.events.at(-1)).toMatchObject({ kind: 'green', result: 'refused', reason: expect.stringContaining('원문 대조 불일치') });
+
+  // (d) cellEvidence 미제공(타입은 필수 — JS 호출부가 런타임에 안 싣은 구멍) — 자기 자신(item.evidence)과
+  //     대조하는 공전 경로를 만들지 않는다: ③ 칸은 unknown(unprovided) 상태로 남고 'cell ok' 를 주장하지 않으며 쓰기는 0.
+  const unprovided = fake();
+  const unprobed = await consumeGreenSweepForGreenWrite({
+    deps: unprovided.deps, item: cell, version: '0.2.36', cards,
+    probe: baseProbe as unknown as GreenSweepProbe,
+  });
+  expect(unprobed).toMatchObject({ cell: 'CELL-GREEN', pr: 4242, written: false, verdict: 'evidence-unknown' });
+  expect(unprobed.reason).toContain('cell unprovided');
+  expect(unprobed.reason).not.toContain('cell ok');
+  expect(unprovided.calls).toHaveLength(0);
+  expect(unprovided.events.at(-1)).toMatchObject({ kind: 'green', result: 'refused' });
+
+  // (e) 칸 원문 재독 불가(cellEvidence 가 undefined 를 돌려줌) — 'cell unreadable' 로 unknown 상태를
+  //     명시적으로 보존해 쓰기를 거부한다(모름을 일치로 꾸미지 않는다).
+  const unreadable = fake();
+  const reread = await consumeGreenSweepForGreenWrite({
+    deps: unreadable.deps, item: cell, version: '0.2.36', cards,
+    probe: { ...baseProbe, cellEvidence: async () => undefined },
+  });
+  expect(reread).toMatchObject({ cell: 'CELL-GREEN', pr: 4242, written: false, verdict: 'evidence-unknown' });
+  expect(reread.reason).toContain('cell unreadable');
+  expect(reread.reason).not.toContain('cell ok');
+  expect(unreadable.calls).toHaveLength(0);
+});
+
+// GREEN-FROM-LEDGER-FU 배선(shard 2 · #30534 shard 1 이후) — 생산 진입점 executeNextAction 의 kind=green 경로가
+// 소비자를 지나 OP 원문 대조 후 checklist green 쓰기를 «1회»만 하고, 거부·mismatch·unknown 입력에는 쓰기 «0회»
+// ⊕ 칸 상태 불변을 fake command runner 로 관측한다. 문맥(deps.greenSweep)이 없으면 종전 그대로 검증 안내 카드.
+test('GREEN-FROM-LEDGER-FU wiring: executeNextAction green — 원문 대조 일치 시 쓰기 1회, 거부·mismatch·unknown 시 0회', async () => {
+  const mergeSha = 'c'.repeat(40);
+  const cell: ChecklistItem = { id: 'CELL-GREEN', title: '셀 제목', status: 'yellow', updatedAt: '2026-10-23T00:00:00.000Z', updatedBy: 'test' };
+  const cards: TaskCard[] = [{ id: 'TASK-20261023-01', text: '과제', checklistId: 'CELL-GREEN', checklistVersion: '0.2.36', createdAt: '2026-10-23T00:00:00.000Z', status: 'done', history: [], pr: 4242 }];
+  const evidenceLine = `GREEN-FROM-LEDGER: PR #4242 merged ${mergeSha} · green · bound-card-merged`;
+  const greenAction: NextAction = { ...action, kind: 'green', pr: 4242, checklistId: 'CELL-GREEN' };
+  const probe = (cellEvidence: (cell: string) => Promise<string | undefined>) => ({
+    pr: async () => ({ number: 4242, state: 'MERGED', mergeSha }),
+    ancestor: async () => true,
+    hold: async () => false,
+    repositoryMatches: async () => true,
+    cellEvidence,
+  });
+  const writeCalls = (f: ReturnType<typeof fake>) => f.calls.filter(c => c[0] === 'release' && c[1] === 'checklist');
+
+  // (a) 판정 green ⊕ 원문 대조 일치 — 생산 진입점을 지나 checklist green 쓰기를 «1회»(카드 없음).
+  const f = fake();
+  f.deps.greenSweep = { probe: probe(async () => ''), item: cell, version: '0.2.36', cards };
+  f.deps.greenWriteLive = true;
+  expect(await executeNextAction(greenAction, f.deps)).toBe('done');
+  expect(writeCalls(f)).toEqual([['release', 'checklist', 'set', 'CELL-GREEN', '--status', 'green', '--evidence', evidenceLine]]);
+  expect(f.calls.some(c => c[0] === 'decisions')).toBe(false);
+  expect(f.events).toEqual([
+    { taskId: 'CELL-GREEN', kind: 'green', result: 'done', reason: evidenceLine },
+    { taskId: 'TASK', kind: 'green', result: 'done', reason: evidenceLine },
+  ]);
+
+  // (b) 판정 거부(pr 관측 불가) — 쓰기 0회 · 명령 0회 · 칸 상태 불변(fail-closed).
+  const refused = fake();
+  refused.deps.greenSweep = { probe: { ...probe(async () => ''), pr: async () => null }, item: cell, version: '0.2.36', cards };
+  refused.deps.greenWriteLive = true;
+  expect(await executeNextAction(greenAction, refused.deps)).toBe('refused');
+  expect(refused.calls).toHaveLength(0);
+  expect(refused.events.at(-1)).toMatchObject({ taskId: 'TASK', kind: 'green', result: 'refused', reason: expect.stringContaining('pr-unreadable') });
+  // The object assertion checks the fixture only; the zero command count above is the write-prevention evidence.
+  expect(cell.status).toBe('yellow');
+
+  // (c) 원문 대조 불일치(칸 원문이 판정 뒤 바뀜) — green 판정이어도 쓰기 0회 · 칸 상태 불변.
+  const stale = fake();
+  stale.deps.greenSweep = { probe: probe(async () => '판정 뒤 바뀐 칸 원문'), item: cell, version: '0.2.36', cards };
+  stale.deps.greenWriteLive = true;
+  expect(await executeNextAction(greenAction, stale.deps)).toBe('refused');
+  expect(stale.calls).toHaveLength(0);
+  expect(stale.events.at(-1)).toMatchObject({ taskId: 'TASK', kind: 'green', result: 'refused', reason: expect.stringContaining('원문 대조 불일치') });
+  expect(cell.status).toBe('yellow');
+
+  // (d) 칸 원문 unknown(재독 불가) — 모름을 일치로 꾸미지 않고 쓰기 0회.
+  const unreadable = fake();
+  unreadable.deps.greenSweep = { probe: probe(async () => undefined), item: cell, version: '0.2.36', cards };
+  unreadable.deps.greenWriteLive = true;
+  expect(await executeNextAction(greenAction, unreadable.deps)).toBe('refused');
+  expect(unreadable.calls).toHaveLength(0);
+  expect(unreadable.events.at(-1)).toMatchObject({ result: 'refused', reason: expect.stringContaining('원문 대조 불가') });
+
+  // (e) 쓰기 명령 실패 — 명령 1회 시도 후 written false → 과제·green 실패로 센다(두 번이면 다음엔 카드).
+  const broken = fake();
+  broken.deps.failureCounts = {};
+  broken.deps.greenSweep = { probe: probe(async () => ''), item: cell, version: '0.2.36', cards };
+  broken.deps.greenWriteLive = true;
+  const base = broken.deps.command;
+  broken.deps.command = async args => {
+    if (args[0] !== 'release') return base(args);
+    broken.calls.push(args);
+    return { status: 1, stdout: '', stderr: 'locked' };
+  };
+  expect(await executeNextAction(greenAction, broken.deps)).toBe('failed');
+  expect(writeCalls(broken)).toHaveLength(1);
+  expect(broken.deps.failureCounts[JSON.stringify(['TASK', 'green'])]).toBe(1);
+  expect(broken.events.map((event) => (event as { result?: string }).result)).toEqual(['failed', 'failed']);
+
+  // (f) 문맥 없는 green — 종전 그대로 검증 안내 카드(기존 검증 동작 유지 · 쓰기 0회).
+  const unbound = fake();
+  expect(await executeNextAction(greenAction, unbound.deps)).toBe('decision');
+  expect(unbound.calls.map(c => c[0])).toEqual(['decisions']);
+  expect(writeCalls(unbound)).toHaveLength(0);
+
+  // (g) shadow도 green 판정을 관측하되 실제 checklist 쓰기는 하지 않는다.
+  const shadow = fake();
+  shadow.deps.mode = 'shadow';
+  shadow.deps.greenSweep = { probe: probe(async () => ''), item: cell, version: '0.2.36', cards };
+  expect(await executeNextAction(greenAction, shadow.deps)).toBe('would-green');
+  expect(shadow.calls).toHaveLength(0);
+  expect(shadow.events.at(-1)).toMatchObject({ taskId: 'TASK', kind: 'green', result: 'would-green', reason: expect.stringContaining('live write disabled') });
 });
 

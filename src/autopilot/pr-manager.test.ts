@@ -1,4 +1,4 @@
-import { describe, it, expect, spyOn } from 'bun:test';
+import { afterAll, beforeAll, describe, it, expect, spyOn } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,17 @@ import { debug } from '../debug/log.js';
 import { cardIdFromBody, guardNewPr } from '../pr-tool/census.js';
 import { composeSliceHandText } from '../task-agent/tier-split.js';
 import { prBody } from '../self-implement/orchestrator.js';
+
+const originalHarnessEnv = Object.fromEntries(Object.entries(process.env)
+  .filter(([key]) => key === 'ELANOUS_TASK_CARD_ID' || key === 'ELANOUS_SUBSTRATE' || key.startsWith('ELANOUS_POD_')));
+beforeAll(() => {
+  for (const key of Object.keys(originalHarnessEnv)) delete process.env[key];
+});
+afterAll(() => {
+  for (const key of ['ELANOUS_TASK_CARD_ID', 'ELANOUS_SUBSTRATE', ...Object.keys(process.env).filter(key => key.startsWith('ELANOUS_POD_'))])
+    delete process.env[key];
+  Object.assign(process.env, originalHarnessEnv);
+});
 
 /** 호출 기록 + 프로그램된 응답을 주는 스텁 러너. */
 function stubRunner(responses: Record<string, CmdResult> = {}): { run: CmdRunner; calls: string[][] } {
@@ -259,7 +270,7 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
       cellId: 'PR-SAME-CELL-SLICE', cardId: 'ta-slice-2', slice: { slice: 2, total: 6 } }] };
     const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-SLICE', cardId: 'ta-slice-2',
       slice: { slice: 2, total: 6 } }, inventory);
-    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toEqual({ ok: true, url, reused: true });
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toEqual({ ok: true, url, reused: true, boundCardHeadRefName: 'old-branch' });
     expect(calls).toContainEqual(['git', '-C', '/wt', 'push', `--force-with-lease=refs/heads/old-branch:${head}`, 'origin', 'HEAD:refs/heads/old-branch']);
     expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
   });
@@ -291,7 +302,7 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
       updatedAt: '2026-10-19T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
       cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }] };
     const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, inventory);
-    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toEqual({ ok: true, url, reused: true });
+    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toEqual({ ok: true, url, reused: true, boundCardHeadRefName: 'old-branch' });
     expect(calls).toContainEqual(['git', '-C', '/wt', 'push', `--force-with-lease=refs/heads/old-branch:${head}`, 'origin', 'HEAD:refs/heads/old-branch']);
     expect(calls.some(call => call[0] === 'git' && call[1] === '-C' && call[2] === '/wt' && call[3] === 'push' && call.includes('--force'))).toBe(false);
     expect(calls.some(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toBe(false);
@@ -597,7 +608,7 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
       expect(manager.upsertPr({ ...input, seat: 'UX' })).toMatchObject({ ok: true });
     }
     const create = calls.find(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create');
-    expect(create).toContain('pr-guard:unmeasured');
+      expect(create).toContain('pr-guard:unmeasured');
     expect(manager.upsertPr({ ...input, seat: 'UX' })).toMatchObject({ ok: false, reason: 'guard', detail: expect.stringContaining('차단') });
     expect(calls.filter(call => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create')).toHaveLength(3);
     expect(calls.some(call => call[0] === 'eln' && call[1] === 'msg' && call[2] === 'post')).toBe(true);
@@ -1638,14 +1649,14 @@ describe('upsertPr — 실패 incident 실물(bare origin + 가짜 gh)', () => {
     return { root, work };
   };
 
-  const writeFakeGh = (dir: string, createStderr: string, failList = false): void => {
+  const writeFakeGh = (dir: string, createFailure: string, failList = false, listToStdout = false, createToStdout = false): void => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'gh'), [
       '#!/bin/sh',
       failList
-        ? 'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf "%s\\n" "Authorization: Bearer secret123 lookup failed" >&2; exit 9; fi'
+        ? `if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf "%s\\n" "Authorization: Bearer secret123 lookup failed" ${listToStdout ? '' : '>&2'}; exit 9; fi`
         : 'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then printf ""; exit 0; fi',
-      `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then printf '%s\\n' '${createStderr}' >&2; exit 7; fi`,
+      `if [ "$1" = "pr" ] && [ "$2" = "create" ]; then printf '%s\\n' '${createFailure}' ${createToStdout ? '' : '>&2'}; exit 7; fi`,
       'exit 0',
       '',
     ].join('\n'));
@@ -1680,11 +1691,49 @@ describe('upsertPr — 실패 incident 실물(bare origin + 가짜 gh)', () => {
       expect(incident.branch).toBe('se/incident-x');
       expect(incident.remote).toBe('origin');
       expect(incident.push).toMatchObject({ stage: 'push', ran: true, ok: true, rc: 0 });
-      expect(incident.gh).toMatchObject({ stage: 'gh', ran: true, rc: 7 });
+      expect(incident.gh).toMatchObject({
+        stage: 'gh', ran: true, rc: 7,
+        lookup: { stage: 'gh', ran: true, rc: 0 },
+        create: { stage: 'gh', ran: true, rc: 7 },
+      });
+      expect(incident.gh.lookup?.stderrTail).toBeUndefined();
+      expect(incident.gh.create?.stderrTail).toContain('gh create failed');
       expect(incident.gh.stderrTail).toContain('gh create failed');
       expect(incident.gh.stderrTail).not.toContain('ghp_supersecret1234567890abcdef');
       expect(incident.gh.stderrTail).not.toContain('hunter2');
       expect(incident.gh.stderrTail).toContain('[REDACTED]');
+    } finally {
+      log.mockRestore();
+      if (saved.path === undefined) delete process.env.PATH; else process.env.PATH = saved.path;
+      if (saved.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved.token;
+      if (saved.gitcfg === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = saved.gitcfg;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('gh create 실패 stdout-only 진단은 stdoutTail 필드로 보존하고 stderrTail을 비워 둔다', () => {
+    const { root, work } = makeScene();
+    const ghDir = join(root, 'ghbin');
+    writeFakeGh(ghDir, 'create failed ghp_supersecret1234567890abcdef https://bot:hunter2@github.com/o/r', false, false, true);
+    const saved = { path: process.env.PATH, token: process.env.GH_TOKEN, gitcfg: process.env.GIT_CONFIG_GLOBAL };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    process.env.GH_TOKEN = 'test-token';
+    process.env.PATH = `${ghDir}:${saved.path ?? ''}`;
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+    try {
+      const manager = makePrManager(defaultCmdRunner, () => ({ status: 'allow' as const, reasons: [], warnings: [] }));
+      const r = manager.upsertPr({ branch: 'se/incident-x', worktreePath: work, title: '[SE] incident', body: 'b',
+        base: 'main', commitMessage: 'm', runId: 'run-incident-create-stdout' });
+      expect(r).toMatchObject({ ok: false, reason: 'gh' });
+      if (r.ok) throw new Error('expected gh create failure');
+      expect(r.incident).toMatchObject({
+        runId: 'run-incident-create-stdout', push: { ran: true, ok: true, rc: 0 },
+        gh: { ran: true, rc: 7, create: { ran: true, rc: 7,
+          stdoutTail: 'create failed [REDACTED] https://[REDACTED]@github.com/o/r' } },
+      });
+      expect(r.incident?.gh.stderrTail).toBeUndefined();
+      expect(r.incident?.gh.create?.stderrTail).toBeUndefined();
+      expect(log.mock.calls.find(([, event]) => event === 'pr-create-failure-incident')?.[2]).toMatchObject(r.incident!);
     } finally {
       log.mockRestore();
       if (saved.path === undefined) delete process.env.PATH; else process.env.PATH = saved.path;
@@ -1717,6 +1766,7 @@ describe('upsertPr — 실패 incident 실물(bare origin + 가짜 gh)', () => {
       expect(incident).toBeDefined();
       expect(incident.branch).toBe('se/incident-x');
       expect(incident.push).toMatchObject({ stage: 'push', ran: true, ok: false });
+      expect(incident.gh).toMatchObject({ stage: 'gh', ran: false });
       expect(typeof incident.push.rc).toBe('number');
       expect(incident.push.stderrTail).toContain('push refused by policy');
       expect(incident.push.stderrTail).not.toContain('ghp_leak1234567890abcdef');
@@ -1731,10 +1781,10 @@ describe('upsertPr — 실패 incident 실물(bare origin + 가짜 gh)', () => {
     }
   }, 120_000);
 
-  it('gh branch 조회 실패 — 실제 gh rc·가린 stderr 를 자식 실패 detail 에 전달한다', () => {
+  it('gh branch 조회 실패가 stdout-only 진단이면 stdoutTail 필드에 원문과 rc를 보존한다', () => {
     const { root, work } = makeScene();
     const ghDir = join(root, 'ghbin');
-    writeFakeGh(ghDir, 'create must not run', true);
+    writeFakeGh(ghDir, 'create must not run', true, true);
     const saved = { path: process.env.PATH, token: process.env.GH_TOKEN, gitcfg: process.env.GIT_CONFIG_GLOBAL };
     process.env.GH_TOKEN = 'test-token';
     process.env.PATH = `${ghDir}:${saved.path ?? ''}`;
@@ -1749,10 +1799,20 @@ describe('upsertPr — 실패 incident 실물(bare origin + 가짜 gh)', () => {
       if (r.ok) throw new Error('expected gh lookup failure');
       expect(r.incident).toMatchObject({
         runId: 'run-incident-lookup', push: { ran: true, ok: true, rc: 0 },
-        gh: { ran: true, rc: 9, stderrTail: 'Authorization: Bearer *** lookup failed' },
+        gh: {
+          ran: true, rc: 9, stdoutTail: 'Authorization: Bearer *** lookup failed',
+          lookup: { stage: 'gh', ran: true, rc: 9, stdoutTail: 'Authorization: Bearer *** lookup failed' },
+          create: { stage: 'gh', ran: false },
+        },
       });
       expect(r.detail).toContain('pr-create-incident=');
       expect(r.detail).not.toContain('secret123');
+      expect(r.detail).not.toContain('ghp_');
+      const incident = r.incident!;
+      expect(incident.gh.stderrTail).toBeUndefined();
+      expect(incident.gh.stdoutTail).toBe('Authorization: Bearer *** lookup failed');
+      expect(incident.gh.lookup?.stderrTail).toBeUndefined();
+      expect(incident.gh.lookup?.stdoutTail).toBe('Authorization: Bearer *** lookup failed');
     } finally {
       if (saved.path === undefined) delete process.env.PATH; else process.env.PATH = saved.path;
       if (saved.token === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved.token;

@@ -18,6 +18,7 @@ function fixture(): { dir: string; repo: string; out: string; base: string; remo
   git(dir, 'init', '--initial-branch=main', seed);
   git(seed, 'config', 'user.name', 'Test');
   git(seed, 'config', 'user.email', 'test@example.org');
+  git(seed, 'config', 'core.hooksPath', '/dev/null');
   writeFileSync(join(seed, 'a.txt'), 'original a\n');
   writeFileSync(join(seed, 'b.txt'), 'original b\n');
   writeFileSync(join(seed, '.gitignore'), 'ignored.txt\n');
@@ -29,6 +30,7 @@ function fixture(): { dir: string; repo: string; out: string; base: string; remo
   git(dir, 'clone', remote, repo);
   git(repo, 'config', 'user.name', 'Test');
   git(repo, 'config', 'user.email', 'test@example.org');
+  git(repo, 'config', 'core.hooksPath', '/dev/null');
   return { dir, repo, out: join(dir, 'output'), base: git(repo, 'rev-parse', 'HEAD'), remote };
 }
 
@@ -239,6 +241,7 @@ describe('packSourceBundle', () => {
       git(f.dir, 'init', '--initial-branch=main', replacement);
       git(replacement, 'config', 'user.name', 'Test');
       git(replacement, 'config', 'user.email', 'test@example.org');
+      git(replacement, 'config', 'core.hooksPath', '/dev/null');
       writeFileSync(join(replacement, 'a.txt'), 'replacement\n');
       git(replacement, 'add', '-A');
       git(replacement, 'commit', '-m', 'unrelated root');

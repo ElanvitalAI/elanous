@@ -20,18 +20,40 @@ import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, safeLogText } from './review-observation.js';
+import { checkCitedReviewPathsAtHead } from './review-finding-key.js';
 import { DEFAULT_REVIEW_BACKEND, defaultAcpReviewTimeoutSec } from './acp-reviewer.js';
 import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
 import { debug } from '../debug/log.js';
 import { ACP_BACKENDS, canonicalizeBackendId } from '../acp/backend-registry.js';
 import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationFromPr, reviewIntentTruncationObservation } from './review-intent.js';
-import { budgetReviewerContext, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
+import { budgetReviewerContext, isNoneSentinelFinding, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
-import { getUserConfig, type LLMProviderName, type RoleLlmSpec, type SubscriptionReviewerSpec } from '../user-config.js';
+import { getUserConfig, type LLMProviderName, type ReviewerMixSpec, type RoleLlmSpec, type SubscriptionReviewerSpec } from '../user-config.js';
+import { loadLlmPolicy } from '../policy/llm-policy.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
 
 /** SUBSCRIPTION-EXHAUST-REROUTE — API reviewer when the configured `roleLlm.reviewer` lane is unavailable (off codex). */
 export const ROLE_REVIEWER_FALLBACK_MODEL = 'openrouter/z-ai/glm-5.3';
+export const DEFAULT_REVIEWER_MIX: ReviewerMixSpec = { sol: 1, claude: 1, glm: 1 };
+type ReviewLane = keyof ReviewerMixSpec;
+const REVIEW_LANES: readonly ReviewLane[] = ['sol', 'claude', 'glm'];
+
+/** A PR keeps the same primary lane through every review round, regardless of head SHA. */
+export function reviewLaneOrder(pr: string, mix: ReviewerMixSpec): ReviewLane[] {
+  if (!/^\d+$/.test(pr)) return [];
+  const total = REVIEW_LANES.reduce((sum, lane) => sum + mix[lane], 0);
+  if (!Number.isSafeInteger(total) || total <= 0) return [];
+  const slot = Number(BigInt(pr) % BigInt(total));
+  let offset = 0;
+  let primary: ReviewLane | undefined;
+  for (const lane of REVIEW_LANES) {
+    offset += mix[lane];
+    if (slot < offset) { primary = lane; break; }
+  }
+  if (!primary) return [];
+  const start = REVIEW_LANES.indexOf(primary);
+  return [...REVIEW_LANES.slice(start), ...REVIEW_LANES.slice(0, start)].filter(lane => mix[lane] > 0);
+}
 
 /** Only an explicit provider+model role setting selects the API review model. */
 export function apiReviewModelFromRoleSpec(spec: RoleLlmSpec | undefined): string | undefined {
@@ -54,6 +76,15 @@ export interface SelfReviewCliOpts {
   reviewDenyBackends?: string[] | undefined;
   /** `roleLlm.reviewer` (same resolution as the harness). Used only when no explicit reviewer flag is given. */
   roleReviewer?: SubscriptionReviewerSpec | undefined;
+  /** Default resolves from policy/config; null keeps the legacy single reviewer for isolated callers. */
+  reviewerMix?: ReviewerMixSpec | null | undefined;
+  /** Internal route metadata; the user-facing mix is selected once per PR. */
+  reviewerMixPrimaryLane?: ReviewLane | undefined;
+  reviewerMixAttemptLane?: ReviewLane | undefined;
+  reviewerMixExpectedHead?: string | undefined;
+  /** Internal: the same command already claimed its single over-cap exception for this pinned head. */
+  reviewerMixCapClaimed?: boolean | undefined;
+  disableClaudeGlmFallback?: boolean | undefined;
   acpTimeout?: string | undefined;
   context?: string[] | undefined;
   contextText?: string[] | undefined;
@@ -67,6 +98,8 @@ export interface SelfReviewCliOpts {
 
 /** 셸/네트워크/로그 경계 — 테스트는 전부 대역으로 채운다. */
 export interface SelfReviewCliDeps {
+  /** Explicit repository root for exact-head cited-path checks; absent means unmeasured. */
+  reviewRepositoryPath?: string;
   /** `gh` 호출. 실패도 예외 없이 `{status, stdout, stderr}` 로 돌려준다(spawnSync 동형). */
   gh(args: string[], timeoutMs: number): { status: number | null; stdout: string; stderr: string };
   /** ⭐ `git` 호출(선택). 주입되면 리뷰 증거를 **이 PR 이 저작한 변경**으로 좁힌다(아래 참조).
@@ -1371,6 +1404,105 @@ function createDetachedReviewWorktree(commit: string, deps: SelfReviewCliDeps): 
   return { cwd, commit, remove };
 }
 
+// ── 착지 관문(landing gate) — requested/actual ────────────────────────────────────────────
+//
+// ⚠️ 왜 생산자(여기)에 있나: 착지 관문(`src/cli/pr-land-overlap-evidence.ts`)도 결과 JSON 을 읽어
+//    같은 대조를 하지만, 그 파일을 **만드는 자리**가 틀린 requested/actual 을 적으면 관문은 그
+//    거짓을 근거로 판정한다. 그리고 `acp.reviewDenyBackends` 가 금지한 백엔드가 낸 판정은 파일이
+//    되기 **전에** 거부돼야 `--save` 로도 착지 근거가 될 수 없다(fail-closed).
+//
+// ⛔ 못 잰 값(`unmeasured`)을 «일치»로 적지 않는다 — 부재와 미지를 같은 값으로 두지 않는다.
+
+/** 사람이 요청한 리뷰어. `value` 는 화면·로그에 그대로 나가는 **요청 원문**이다. */
+interface LandingGateRequest {
+  kind: 'api-model' | 'acp-backend' | 'role-lane';
+  value: string;
+  /** api-model 요청의 정규화된 기대 모델(짧은 별칭 → 정본 ID). */
+  model?: string;
+  /** acp-backend 요청의 기대 백엔드. */
+  backend?: string;
+}
+
+/** 실제로 판정을 낸 리뷰어. `value` 는 실측 원문(`api:<model>` · `acp:<backend>` · `unmeasured`). */
+interface LandingGateActual {
+  kind: 'api' | 'acp' | 'unknown';
+  value: string;
+  model?: string;
+  backend?: string;
+  respondedProvider?: string;
+  respondedModel?: string;
+}
+
+type LandingGateOutcome =
+  | { state: 'consistent'; requested: string; actual: string }
+  | { state: 'mismatch'; requested: string; actual: string; warning: string }
+  | { state: 'denied'; requested: string; actual: string; warning: string; refusal: 'review-forbidden-acp-backend'; deniedBackend: string };
+
+function normalizedReviewBackend(value: string | undefined): string {
+  return canonicalizeBackendId((value ?? '').trim()).trim().toLowerCase();
+}
+
+/** 금지 목록 대조. 문자열 엔트리와 구조형(`{backend, expiresAt}`) 엔트리가 같은 값으로 접힌다. */
+function deniedReviewBackend(backend: string | undefined, denyBackends: readonly string[]): boolean {
+  const target = normalizedReviewBackend(backend);
+  if (!target) return false;
+  return denyBackends.some((denied) => normalizedReviewBackend(denied) === target);
+}
+
+function landingGateAgrees(request: LandingGateRequest, actual: LandingGateActual): boolean {
+  // ⛔ 실측을 못 잰 것을 «일치»로 적지 않는다(요청이 있으면 불일치로 남긴다).
+  if (actual.kind === 'unknown') return false;
+  if (request.kind === 'api-model') {
+    if (actual.kind !== 'api') return false;
+    const requested = (request.model ?? request.value).trim().toLowerCase();
+    const selected = (actual.model ?? '').trim().toLowerCase();
+    if (selected && selected === requested) return true;
+    const respondedProvider = (actual.respondedProvider ?? '').trim().toLowerCase();
+    const respondedModel = (actual.respondedModel ?? '').trim().toLowerCase();
+    // 요청이 공급자 한정 형태(`openrouter/<model>`)일 때만 공급자·응답 모델을 대조한다 —
+    // 맨 모델 ID(`gpt-6-sol`·`claude-sonnet-4`)는 공급자와 비교할 수 없다.
+    const slash = requested.indexOf('/');
+    if (slash <= 0) return false;
+    const requestedProvider = requested.slice(0, slash);
+    const requestedTail = requested.slice(slash + 1);
+    return Boolean(respondedProvider) && respondedProvider === requestedProvider
+      && Boolean(respondedModel) && (respondedModel === requestedTail || respondedModel === requested);
+  }
+  if (request.kind === 'acp-backend') {
+    return actual.kind === 'acp' && normalizedReviewBackend(actual.backend) === normalizedReviewBackend(request.backend);
+  }
+  // role-lane: 설정이 고른 레인은 provider 표기(`claude-acp`)와 백엔드 표기(`claude`)가 달라
+  // 백엔드 이름으로 비교하지 않는다 — 「ACP 레인으로 판정했나」만 본다.
+  return actual.kind === 'acp';
+}
+
+function landingGateOutcome(input: {
+  pr: string;
+  reviewRoute: 'api' | 'acp' | 'acp-fallback';
+  request?: LandingGateRequest | undefined;
+  actual: LandingGateActual;
+  deniedBackends: readonly string[];
+}): LandingGateOutcome {
+  const requested = input.request?.value ?? '(none)';
+  const actual = input.actual.value;
+  if (input.actual.kind === 'acp' && deniedReviewBackend(input.actual.backend, input.deniedBackends)) {
+    const deniedBackend = normalizedReviewBackend(input.actual.backend);
+    return {
+      state: 'denied', requested, actual, refusal: 'review-forbidden-acp-backend', deniedBackend,
+      warning: `⛔ LANDING GATE DENY (fail-closed): requested=${requested} actual=${actual} denied=${deniedBackend} reviewRoute=${input.reviewRoute} — acp.reviewDenyBackends 가 금지한 백엔드가 판정을 냈습니다. PR ${input.pr} 의 이 리뷰는 착지 근거가 아니며 self review 는 실패(rc≠0)로 끝납니다.`,
+    };
+  }
+  if (!input.request || landingGateAgrees(input.request, input.actual)) return { state: 'consistent', requested, actual };
+  const responded = [
+    input.actual.respondedProvider ? `respondedProvider=${input.actual.respondedProvider}` : '',
+    input.actual.respondedModel ? `respondedModel=${input.actual.respondedModel}` : '',
+  ].filter(Boolean).join(' ');
+  return {
+    state: 'mismatch', requested, actual,
+    warning: `⚠️ LANDING GATE REQUESTED/ACTUAL MISMATCH: requested=${requested} actual=${actual} reviewRoute=${input.reviewRoute}${responded ? ` ${responded}` : ''} — 요청한 리뷰어와 실제로 판정을 낸 리뷰어가 다릅니다(PR ${input.pr}). 이 리뷰를 착지 근거로 쓰기 전에 확인하세요.`,
+  };
+}
+
 /** `elanous self review <pr...>` 본문. read-only — 머지하지 않는다. */
 /**
  * `self review --json` stdout 한 줄 — 결과가 하나면 객체, 여럿이면 배열. index.ts 액션이 이것을 그대로 쓴다.
@@ -1380,27 +1512,13 @@ export function selfReviewJsonLine(results: readonly unknown[]): string {
   return JSON.stringify(results.length === 1 ? results[0] : results) + '\n';
 }
 
-// Normalize only whole-item forms whose complete text is an explicit no-finding
-// sentinel. Any extra clause stays in mustFix (fail-closed).
-const NO_FINDING_REVIEW_NOTE_ALLOWLIST: readonly RegExp[] = [
-  /^(?:없음|해당\s*없음|none|nothing|n\/a)[.!。]?$/i,
-  /^\((?:없음|해당\s*없음|none|nothing|n\/a)\)[.!。]?$/i,
-  /^\(이 조각에서 확인된 코어 결함 없음\s*[—–-]\s*명시 intent 기준 mustFix 는 비움\)$/i,
-  /^\(이 조각에서 검증된 (?:차단 )?결함은 발견되지 않음(?:\s*\(mustFix \[\]\))?\)$/i,
-];
-
-function isNoFindingReviewNote(finding: string): boolean {
-  const wholeItem = finding.trim();
-  return NO_FINDING_REVIEW_NOTE_ALLOWLIST.some((form) => form.test(wholeItem));
-}
-
 function normalizeSavedReviewMustFix(result: Record<string, unknown>): { result: Record<string, unknown>; count: number } {
   if (!Array.isArray(result.mustFix)) return { result, count: 0 };
   const noFindingNotes = result.mustFix.filter((finding): finding is string =>
-    typeof finding === 'string' && isNoFindingReviewNote(finding));
+    typeof finding === 'string' && isNoneSentinelFinding(finding));
   if (noFindingNotes.length === 0) return { result, count: 0 };
   const retained = result.mustFix.filter((finding) =>
-    typeof finding !== 'string' || !isNoFindingReviewNote(finding));
+    typeof finding !== 'string' || !isNoneSentinelFinding(finding));
   const existingNotes = Array.isArray(result.noFindingNotes) ? result.noFindingNotes : [];
   return {
     result: { ...result, mustFix: retained, noFindingNotes: [...existingNotes, ...noFindingNotes] },
@@ -1415,6 +1533,103 @@ export async function runSelfReviewCliCommand(
 ): Promise<SelfReviewCliOutcome> {
   const pins: ReviewWorktree[] = [];
   try {
+    // Resolve inside the leaf CLI seam so src/index.ts needs no mix-specific registration.
+    const reviewerMix = opts.reviewerMix === undefined
+      ? loadLlmPolicy().policy.roles.reviewerMix ?? getUserConfig().roleLlm?.reviewerMix ?? DEFAULT_REVIEWER_MIX
+      : opts.reviewerMix;
+    // The route is chosen outside the existing single-review pipeline so explicit CLI flags retain
+    // their exact behavior. A failed reviewer is retried on the same pinned PR diff by the next lane.
+    if (reviewerMix && (opts.save === undefined || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(opts.save)) &&
+        !opts.model?.trim() && !opts.acp && !opts.acpBackend && !opts.acpModel && !deps.envModel()) {
+      const results: Array<Record<string, unknown>> = [];
+      let failed = 0;
+      for (const arg of prArgs) {
+        const pr = normalizeReviewPrArg(arg, deps);
+        const lanes = pr ? reviewLaneOrder(pr, reviewerMix) : [];
+        if (!pr || lanes.length === 0) {
+          const outcome = await runSelfReviewCliCommandPinned([arg], { ...opts, reviewerMix: undefined }, deps, pins);
+          results.push(...outcome.results);
+          failed += outcome.failed;
+          continue;
+        }
+        const initialHead = prHeadCommit(pr, deps);
+        if (initialHead.state !== 'known') {
+          deps.log('review.lane-head-unknown', { pr, headState: initialHead.state }, { level: 'warn' });
+          results.push({ pr, reviewed: false, refusal: 'reviewer-mix-head-unknown',
+            failureReason: 'PR head could not be pinned before review', reviewerMixPrimaryLane: lanes[0] });
+          failed += 1;
+          continue;
+        }
+        let completed: Record<string, unknown> | undefined;
+        let last: Record<string, unknown> | undefined;
+        let completedLane: ReviewLane | undefined;
+        let attemptedLane: ReviewLane | undefined;
+        let completedWithError = false;
+        const pinnedHead = initialHead.value;
+        let capClaimed = false;
+        let pendingFallback: { from: ReviewLane; reason: string } | undefined;
+        for (const [index, lane] of lanes.entries()) {
+          const observedHead = prHeadCommit(pr, deps);
+          if (observedHead.state !== 'known' || observedHead.value !== pinnedHead) {
+            last = { pr, reviewed: false, refusal: 'reviewer-mix-head-changed', stale: true,
+              expectedHeadCommit: pinnedHead, headCommit: observedHead.value };
+            deps.log('review.lane-head-changed', { pr, expectedHead: pinnedHead,
+              observedHead: observedHead.value }, { level: 'warn' });
+            break;
+          }
+          const laneOpts: SelfReviewCliOpts = {
+            ...opts, reviewerMix: undefined, reviewerMixPrimaryLane: lanes[0], reviewerMixAttemptLane: lane,
+            reviewerMixExpectedHead: pinnedHead, reviewerMixCapClaimed: capClaimed,
+            disableClaudeGlmFallback: true, json: true,
+            ...(lane === 'claude' ? { acp: true, acpBackend: 'claude', model: undefined } :
+              { acp: false, acpBackend: undefined, model: lane === 'sol' ? 'gpt-6-sol' : ROLE_REVIEWER_FALLBACK_MODEL }),
+          };
+          let reviewerStarted = false;
+          const laneDeps: SelfReviewCliDeps = { ...deps,
+            reviewPullRequest: (input, llm) => { reviewerStarted = true; return deps.reviewPullRequest(input, llm); },
+            observeDoctorReview: (event, data, options) => {
+              if (event === 'cap-override') capClaimed = true;
+              deps.observeDoctorReview?.(event, data, options);
+            },
+          };
+          try {
+            const outcome = await runSelfReviewCliCommandPinned([arg], laneOpts, laneDeps, pins);
+            last = outcome.results[0];
+            completedWithError = last?.reviewed === true && outcome.failed > 0;
+          } catch (error) {
+            last = { pr, reviewed: false, failureReason: safeLogText(error instanceof Error ? error.message : String(error), 400) };
+          }
+          if (last?.refusal === 'reviewer-mix-head-changed' || last?.refusal === 'cap-refused' || last?.stale === true) break;
+          if (reviewerStarted) {
+            attemptedLane = lane;
+            deps.log('review.lane-chosen', { pr, lane, primaryLane: lanes[0], attempt: index + 1, weights: reviewerMix });
+          }
+          if (pendingFallback && reviewerStarted) {
+            deps.log('review.lane-fallback', { pr, from: pendingFallback.from, to: lane,
+              reason: pendingFallback.reason }, { level: 'warn' });
+            pendingFallback = undefined;
+          }
+          if (last?.reviewed === true) {
+            completed = last;
+            completedLane = lane;
+            break;
+          }
+          if (last?.refusal || last?.stale === true || index === lanes.length - 1) break;
+          pendingFallback = { from: lane,
+            reason: safeLogText(String(last?.failureReason ?? last?.error ?? 'reviewed=false'), 400) };
+        }
+        const result = completed ?? last;
+        if (result) {
+          const selectedLane = completedLane ?? attemptedLane;
+          const enriched: Record<string, unknown> = { ...result, reviewerMixPrimaryLane: lanes[0],
+            ...(selectedLane ? { reviewerMixSelectedLane: selectedLane } : {}) };
+          results.push(enriched);
+          if (!opts.json) deps.print(`\n━━ PR ${pr} (${String(enriched.model ?? 'review failed')}) ━━\n${deps.renderReview(enriched as unknown as ReviewResult)}`);
+        }
+        if (!completed || completedWithError) failed += 1;
+      }
+      return { results, failed };
+    }
     return await runSelfReviewCliCommandPinned(prArgs, opts, deps, pins);
   } finally {
     for (const pin of pins) pin.remove();
@@ -1468,8 +1683,10 @@ async function runSelfReviewCliCommandPinned(
     deps.error(message);
     return { results: opts.json ? [{ error: message }] : [], failed: 1 };
   }
-  const automaticFallbacks = orderedAcpReviewFallbackBackends(opts.configuredAcpBackend,
-    opts.reviewDenyBackends === undefined ? configuredReviewDenyBackends : reviewDenyBackends);
+  // 이 명령이 실제로 적용하는 금지 목록 — 자동 폴백 후보에서 빼는 데 쓰이고(종전과 같은 값),
+  // 이제 착지 관문이 «실제로 판정을 낸 백엔드»를 대조하는 데에도 같은 값으로 쓰인다.
+  const effectiveReviewDenyBackends: string[] = opts.reviewDenyBackends === undefined ? configuredReviewDenyBackends : reviewDenyBackends;
+  const automaticFallbacks = orderedAcpReviewFallbackBackends(opts.configuredAcpBackend, effectiveReviewDenyBackends);
   const fallbackAcpBackends = opts.acpBackend
     ? [canonicalizeBackendId(opts.acpBackend)]
     : automaticFallbacks.backends;
@@ -1520,7 +1737,13 @@ async function runSelfReviewCliCommandPinned(
       const made = deps.makeRoleReviewerLlm
         ? deps.makeRoleReviewerLlm(opts.roleReviewer, { timeoutMs: acpTimeoutSec * 1000 })
         : { reason: 'role-reviewer-seam-missing' };
-      if ('llm' in made) roleReviewer = { llm: made.llm, model: `acp:${made.backend}` };
+      // ⛔ 금지 목록(acp.reviewDenyBackends)은 «자동 폴백 후보»만이 아니라 **자동 선택 전부**를 막는다.
+      //    역할 레인은 사람이 친 플래그가 아니라 설정이 고른 자동 선택이므로, 금지된 백엔드가 레인을
+      //    잡으면 그 리뷰가 그대로 착지 근거가 됐다(fail-open). ⇒ 레인을 쓰지 않고 같은 사유 코드로
+      //    API 로 내려간다(`role-reviewer-fallback · stage=availability` 가 관측에 남는다).
+      if ('llm' in made && deniedReviewBackend(made.backend, effectiveReviewDenyBackends)) {
+        roleReviewerUnavailableReason = 'denied-by-acp.reviewDenyBackends';
+      } else if ('llm' in made) roleReviewer = { llm: made.llm, model: `acp:${made.backend}` };
       else roleReviewerUnavailableReason = safeLogText(made.reason, 400);
     } catch (error) {
       roleReviewerUnavailableReason = roleAcpErrorReason(error);
@@ -1555,7 +1778,7 @@ async function runSelfReviewCliCommandPinned(
     if (previousRoundCount >= 5) {
       deps.observeDoctorReview?.('cap-attempt', { pr, previousRoundCount, round: previousRoundCount + 1, reasonProvided: Boolean(reason), opAllowed }, { level: 'warn' });
     }
-    if (previousRoundCount >= 5 && (!opAllowed || (!authorization && !reason))) {
+    if (previousRoundCount >= 5 && (!opAllowed || (!authorization && !reason && !opts.reviewerMixCapClaimed))) {
       const refusalHead = prHeadCommit(pr, deps).value;
       const message = !opAllowed
         ? `PR ${pr}: r5 상한 초과 리뷰는 OP traffic.json reviewOverCapAllow 허용 목록에 있어야 합니다.`
@@ -1567,7 +1790,17 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     const diffRead = readDiffAtHead(pr, deps);
-    if (previousRoundCount >= 5 && authorization && diffRead.headCommit.toLowerCase() === authorization.head) {
+    if (opts.reviewerMixExpectedHead && diffRead.headCommit !== opts.reviewerMixExpectedHead) {
+      const refusal = { pr, reviewed: false, verdict: null, mustFix: [], shouldFix: [],
+        refusal: 'reviewer-mix-head-changed', stale: true, headCommit: diffRead.headCommit,
+        expectedHeadCommit: opts.reviewerMixExpectedHead };
+      deps.log('review.lane-head-changed', { pr, expectedHead: opts.reviewerMixExpectedHead,
+        observedHead: diffRead.headCommit }, { level: 'warn' });
+      if (opts.json || opts.save !== undefined) results.push(refusal);
+      failed += 1;
+      continue;
+    }
+    if (previousRoundCount >= 5 && authorization && diffRead.headCommit.toLowerCase() === authorization.head && !opts.reviewerMixCapClaimed) {
       const message = `PR ${pr}: 동일 head는 이미 승인 소모 기록이 있습니다.`;
       deps.observeDoctorReview?.('cap-refused', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: 'same-head-already-used' }, { level: 'warn' });
       deps.error(message);
@@ -1584,7 +1817,7 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     let mergeOnlyDeltaRange: { base: string; head: string } | undefined;
-    if (previousRoundCount >= 5 && authorization) {
+    if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed) {
       const git = deps.git;
       if (!git || diffRead.source !== 'sha-pinned' || diffRead.headCommitState !== 'known'
         || diffRead.currentHeadCommitState !== 'known' || diffRead.stale || diffRead.diff.status !== 0) {
@@ -1629,7 +1862,9 @@ async function runSelfReviewCliCommandPinned(
         }
         if (commits.stdout.trim() === '') mergeOnlyDeltaRange = { base: classificationBase, head: diffRead.headCommit.toLowerCase() };
       }
-    } else if (previousRoundCount >= 5 && reason) {
+    } else if (previousRoundCount >= 5 && reason && !opts.reviewerMixCapClaimed) {
+      // Claim only the exact SHA-pinned diff that the reviewer will see; never spend an OP
+      // authorization on a separately read head that may move before readDiffAtHead.
       const claimable = diffRead.source === 'sha-pinned' && diffRead.headCommitState === 'known'
         && diffRead.currentHeadCommitState === 'known' && !diffRead.stale && diffRead.diff.status === 0;
       if (!claimable || !claimCapOverride(pr, diffRead.headCommit, reason, deps.now())) {
@@ -1654,12 +1889,15 @@ async function runSelfReviewCliCommandPinned(
       diffRead.diff = delta;
       diffRead.baseCommit = mergeOnlyDeltaRange.base;
     }
-    if (previousRoundCount >= 5 && authorization && !claimCapOverride(pr, diffRead.headCommit, authorization.reason, deps.now())) {
+    if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed && !claimCapOverride(pr, diffRead.headCommit, authorization.reason, deps.now())) {
       const message = `PR ${pr}: 후속 head 승인 사용 기록을 남기지 못했습니다.`;
       deps.error(message);
       if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: diffRead.headCommit });
       failed += 1;
       continue;
+    }
+    if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed) {
+      deps.observeDoctorReview?.('cap-override', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: authorization.reason }, { level: 'warn' });
     }
     const localHeadComparison = compareLocalHead(pr, { value: diffRead.headCommit, state: diffRead.headCommitState }, deps);
     const { diff } = diffRead;
@@ -1936,7 +2174,7 @@ async function runSelfReviewCliCommandPinned(
     //   An explicit `--acp-model` is the operator's model choice: it is not silently swapped for GLM.
     //   GLM that throws or also ends without a verdict keeps the claude result, and says so (`glmReviewed`).
     let claudeFallbackGlm: { reason: string; model: string; glmReviewed: boolean; glmFailureReason?: string } | undefined;
-    if (useAcp && !roleReview && !acpModel && canonicalizeBackendId(acpBackend) === 'claude' && review.reviewed !== true) {
+    if (useAcp && !roleReview && !acpModel && !opts.disableClaudeGlmFallback && canonicalizeBackendId(acpBackend) === 'claude' && review.reviewed !== true) {
       const reason = safeLogText(review.failureReason || 'reviewed=false', 400);
       debug.log('review.acp', 'claude-fallback-glm', { reason }, { level: 'warn' });
       fallbackAttempted = true;
@@ -1967,6 +2205,50 @@ async function runSelfReviewCliCommandPinned(
       ...(reviewPin && reviewedOnPin ? { reviewCwdCommit: reviewPin.commit } : {}),
       ...(reviewCwdPinFallbackReason ? { reviewCwdPinFallbackReason } : {}),
     };
+    // ⭐ 착지 관문 — 요청한 리뷰어와 실제로 판정을 낸 리뷰어를 대조한다. 판정이 나온 리뷰에만
+    //    의미가 있다(리뷰가 없으면 근거도 없고, 실패는 기존 회계가 이미 센다).
+    const acpActual = (backendText: string | undefined): LandingGateActual => {
+      const backend = normalizedReviewBackend(backendText);
+      return backend ? { kind: 'acp', value: `acp:${backend}`, backend } : { kind: 'unknown', value: 'unmeasured' };
+    };
+    const landingGateRequest: LandingGateRequest | undefined = requestedModel
+      ? { kind: 'api-model', value: opts.model?.trim() || requestedModel, model: explicitApiModel ?? requestedModel }
+      : useAcp
+        ? { kind: 'acp-backend', value: `acp:${canonicalizeBackendId(acpBackend)}`, backend: acpBackend }
+        : reviewerSource === 'role-config' && opts.roleReviewer
+          ? { kind: 'role-lane', value: `acp:${opts.roleReviewer.provider}` }
+          : undefined;
+    const landingGateActual: LandingGateActual = reviewRoute === 'acp-fallback'
+      ? acpActual(fallbackBackend)
+      : reviewRoute === 'acp'
+        ? acpActual(roleReview && prRoleReviewer ? prRoleReviewer.model.replace(/^acp:/, '') : acpBackend)
+        : ((): LandingGateActual => {
+            const apiModel = (selectedModel ?? '').trim();
+            if (!apiModel) return { kind: 'unknown', value: 'unmeasured' };
+            return {
+              kind: 'api', value: `api:${apiModel}`, model: apiModel,
+              ...(responded.provider ? { respondedProvider: responded.provider } : {}),
+              ...(responded.model ? { respondedModel: responded.model } : {}),
+            };
+          })();
+    const landingGate = review.reviewed === true
+      ? landingGateOutcome({ pr, reviewRoute, request: landingGateRequest, actual: landingGateActual, deniedBackends: effectiveReviewDenyBackends })
+      : undefined;
+    if (landingGate && landingGate.state !== 'consistent') {
+      deps.error(landingGate.warning);
+      deps.log('landing-gate', {
+        pr: safeLogText(pr), decision: landingGate.state, reviewRoute,
+        requested: safeLogText(landingGate.requested), actual: safeLogText(landingGate.actual),
+        ...(landingGate.state === 'denied' ? { deniedBackend: landingGate.deniedBackend } : {}),
+      }, { level: 'warn' });
+    }
+    const landingGateAdmitted = landingGate?.state !== 'denied';
+    const landingGateDeniedBackend = landingGate?.state === 'denied' ? landingGate.deniedBackend : undefined;
+    const landingGateFields: Record<string, unknown> = landingGate?.state === 'mismatch'
+      ? { landingGateDecision: 'mismatch', landingGateRequested: landingGate.requested, landingGateActual: landingGate.actual }
+      : landingGate?.state === 'denied'
+        ? { landingGateDecision: 'denied', landingGateRequested: landingGate.requested, landingGateActual: landingGate.actual, landingGateDeniedBackend: landingGate.deniedBackend }
+        : {};
     if (!fallbackAttempted) {
       fallbackNotAttemptedReason = useAcp ? 'explicit-acp' : requestedModel && review.reviewed !== true ? 'explicit-model' : 'primary-review-succeeded';
     }
@@ -1991,7 +2273,27 @@ async function runSelfReviewCliCommandPinned(
     const reviewerSelection = {
       ...reviewerSourceObservation(),
       ...(roleReviewerFallbackReason !== undefined ? { roleReviewerFallbackReason } : {}),
+      ...(opts.reviewerMixPrimaryLane ? { reviewerMixPrimaryLane: opts.reviewerMixPrimaryLane,
+        reviewerMixSelectedLane: opts.reviewerMixAttemptLane } : {}),
     };
+    // The reviewer owns its finding severity. A missing citation is separate evidence,
+    // never a new must-fix or a verified defect. Keep unreadable heads distinct too.
+    const reviewRepositoryPath = deps.reviewRepositoryPath;
+    const findingPathHeadChecks = review.reviewed === true && landingGateAdmitted
+      && diffRead.headCommitState === 'known' && reviewRepositoryPath
+      ? ([...review.mustFix.map(finding => ({ severity: 'mustFix' as const, finding })),
+          ...review.shouldFix.map(finding => ({ severity: 'shouldFix' as const, finding }))]
+          .map(({ severity, finding }) => ({ severity, finding,
+            ...checkCitedReviewPathsAtHead(finding, reviewRepositoryPath, diffRead.headCommit) }))
+          .filter(check => check.paths.length > 0))
+      : [];
+    const pathWarnings = findingPathHeadChecks.flatMap(check => check.paths
+      .filter(path => path.status !== 'present')
+      .map(path => `${path.status === 'missing' ? '경로 미확인' : '경로 검증 불가'}: ${path.path} (PR head ${check.head})`));
+    if (pathWarnings.length) deps.log('finding-path-head-check', {
+      pr, headCommit: diffRead.headCommit, missing: findingPathHeadChecks.flatMap(check => check.paths).filter(path => path.status === 'missing').length,
+      unreadable: findingPathHeadChecks.flatMap(check => check.paths).filter(path => path.status === 'unreadable').length,
+    }, { level: 'warn' });
     // ⚠️ verdict=fail 은 **정상 동작**(리뷰가 일한 것)이라 warn 으로 올리지 않는다. 대신 `reviewed:false`
     //    (fail-soft pass·리뷰 미실행)는 조용히 통과로 읽히면 위험하므로 warn 이다.
     deps.log('done',
@@ -2011,6 +2313,7 @@ async function runSelfReviewCliCommandPinned(
         acceptanceChars: goalAcceptance.acceptanceChars,
         ...reviewerSelection,
         ...reviewCwdOutput,
+        ...landingGateFields,
       },
       { level: review.reviewed === false ? 'warn' : 'info' });
     // --acp 는 대표가 명시 요청한 리뷰 — fail-soft(reviewed=false)면 조용히 pass 하지 말고 표면화(관측=acp-review).
@@ -2024,12 +2327,21 @@ async function runSelfReviewCliCommandPinned(
     }
     const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
     const jsonReview = review.reviewed === true ? review : { ...review, verdict: null };
-    if (opts.json || opts.save !== undefined) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
-    if (!opts.json) deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}`);
+    // ⛔ 금지 백엔드가 낸 판정은 «근거 거부»다 — verdict·mustFix 를 그대로 실어 보내면 읽는 쪽이
+    //    그것을 착지 판정으로 쓴다(관문도 reviewed===true 를 근거 조건으로 본다).
+    const refusalOverride = landingGateAdmitted ? {} : { reviewed: false, verdict: null, refusal: 'review-forbidden-acp-backend' as const };
+    if (opts.json || opts.save !== undefined) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields, findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
+    if (!opts.json) {
+      if (!landingGateAdmitted) deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n⛔ LANDING GATE: review-forbidden-acp-backend (${landingGateDeniedBackend ?? 'unknown'}) — 이 리뷰는 착지 근거가 아닙니다.\n${reviewerContextStatus}`);
+      else deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}${pathWarnings.length ? `\n${pathWarnings.join('\n')}` : ''}`);
+    }
     // REVIEW-ERROR-RC — 기본(API)·role 경로가 1차·폴백 모두 실패해 reviewed≠true 로 끝나도 «못 리뷰한 PR» 이다(verdict:null).
-    if (review.reviewed !== true) failed += 1;
+    // ⛔ 착지 관문 거부도 같은 회계다 — 금지 백엔드가 판정을 냈으면 리뷰가 «성공»해도 근거가 아니다(rc≠0).
+    if (review.reviewed !== true || !landingGateAdmitted) failed += 1;
     if (opts.save !== undefined) {
-      if (review.reviewed !== true || diffRead.headCommitState !== 'known' || diffRead.currentHeadCommitState !== 'known' || diffRead.currentHeadCommit !== diffRead.headCommit || diffRead.headCommit.length !== 40) {
+      if (!landingGateAdmitted) {
+        deps.error(`PR ${pr}: --save 거부 — acp.reviewDenyBackends 가 금지한 백엔드(${landingGateDeniedBackend ?? 'unknown'})의 결과는 착지 근거로 저장하지 않습니다.`);
+      } else if (review.reviewed !== true || diffRead.headCommitState !== 'known' || diffRead.currentHeadCommitState !== 'known' || diffRead.currentHeadCommit !== diffRead.headCommit || diffRead.headCommit.length !== 40) {
         deps.error(`PR ${pr}: --save 불가 — 완료된 리뷰와 확인된 40자 PR head가 필요합니다.`);
         if (review.reviewed === true) failed += 1;
       } else {

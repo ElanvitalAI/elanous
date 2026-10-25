@@ -16,7 +16,7 @@
 
 import { costForUsageDetailed, type TokenUsage } from '../models/costs.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
-import { DEFAULT_TOKEN_BUDGET, estimateTokens } from '../tokens.js';
+import { DEFAULT_TOKEN_BUDGET, estimateMessagesTokens, estimateTokens } from '../tokens.js';
 
 export interface SessionMetrics {
   /** Cumulative input tokens sent this session. */
@@ -117,6 +117,17 @@ export function recordTurn(input: RecordTurnInput): SessionMetrics {
     : null;
 
   return singleton;
+}
+
+/**
+ * A conversation was just restored (`/session load` · `--resume`): the next turn will send all of it,
+ * so the ctx readout shows that size now instead of 0 until the first turn reports real usage
+ * (TUI-RESUME-PICKER ④). The first `recordTurn` replaces it with the provider's number.
+ */
+export function noteRestoredContext(history: readonly { role: string; content: unknown }[]): number {
+  const used = estimateMessagesTokens(history.map((m) => ({ role: m.role, content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '') })));
+  singleton.lastContextUsed = used;
+  return used;
 }
 
 /** Elapsed time since session start, in seconds. Updated on every

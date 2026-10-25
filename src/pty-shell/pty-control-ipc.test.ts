@@ -15,7 +15,8 @@ const previousStateDir = process.env.ELANOUS_STATE_DIR;
 const stateDir = mkdtempSync(join(tmpdir(), 'pty-ipc-test-'));
 process.env.ELANOUS_STATE_DIR = stateDir;
 
-const { migratePtyControlSchema, requestRemotePtyControl, requestRemotePtyControlCapabilities, processPtyControlRequests, resetPtyControlIpcForTesting, signalPtyControlWake } = await import('./pty-control-ipc.js');
+const { migratePtyControlSchema, requestRemotePtyControl, requestRemotePtyControlCapabilities, processPtyControlRequests, resetPtyControlIpcForTesting, signalPtyControlWake, beginPtyHumanTypingSession } = await import('./pty-control-ipc.js');
+const { RemotesStore } = await import('../cli/remotes.js');
 const { externalWriteProvenance } = await import('./pty-write-provenance.js');
 const { upsertPtyManifest, ptyManifestDbPath, getPtyManifest } = await import('./pty-manifest.js');
 const { resetPtyEventLogForTesting } = await import('./pty-event-log.js');
@@ -1165,14 +1166,14 @@ describe('pty-control-ipc agent 슬라이스', () => {
 describe('TUI-IDLE-PTY-DEEP-IDLE-FU 깊은 유휴 감속 ⊕ 즉시 깨어움', () => {
   /** 요청자(`requestRemotePtyControl`)를 거치지 않고 pending 행을 직접 심는다 — 실제 요청이 남기는
    *  wake 표식 «없이» owner 가 DB 를 다시 읽었는지만 관측하기 위해서다. */
-  function insertPendingRow(ptyId: string): string {
+  function insertPendingRow(ptyId: string, ownerPid: number = process.pid): string {
     const requestId = crypto.randomUUID();
     const stampedAt = Date.now();
     const d = new Database(ptyManifestDbPath());
     try {
       d.run(
         'INSERT INTO pty_control_requests (request_id, pty_id, action, payload_json, actor, requester_run_id, owner_pid, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [requestId, ptyId, 'capabilities', null, 'human', '', process.pid, 'pending', stampedAt, stampedAt],
+        [requestId, ptyId, 'capabilities', null, 'human', '', ownerPid, 'pending', stampedAt, stampedAt],
       );
     } finally { d.close(); }
     return requestId;
@@ -1305,6 +1306,57 @@ describe('TUI-IDLE-PTY-DEEP-IDLE-FU 깊은 유휴 감속 ⊕ 즉시 깨어움', 
     expect(rowStatus(requestId)).toBe('success');
   });
 
+  test('20분 · 1h 깊은 유휴 계측 — DB 재읽기가 1.5s 로 줄고 활동이 오면 25ms 로 원복한다', async () => {
+    const id = freshId(); register(id);
+    const h = fakeHandle({ accessMode: 'auto' });
+    const handleFor = (i: string) => (i === id ? (h as never) : undefined);
+    let clock = 0;
+    let reads = 0;
+    // ⭐ 재읽기 «횟수» 를 센다 — 25ms tick 이 몇 번 돌았든 큐를 실제로 다시 읽은 횟수가 계측값이다.
+    const tick = () => processPtyControlRequests(handleFor, () => h.setAccessMode('write'), {
+      pollClock: () => clock,
+      onQueueRead: () => { reads += 1; },
+    });
+    const runTicks = async (spanMs: number): Promise<void> => {
+      for (let at = 25; at <= spanMs; at += 25) { clock += 25; await tick(); }
+    };
+
+    // (1) 활성 구간 10초 = 25ms tick 400번 → 재읽기 400번(감속 前 계약 그대로).
+    resetPtyControlIpcForTesting();
+    await tick();                                    // 앵커 = 0
+    reads = 0;
+    await runTicks(10_000);
+    expect(reads).toBe(400);
+
+    // (2) 20분 유휴 — 같은 25ms tick 48,000번 중 재읽기는 1.5s 간격인 800번뿐(20분/1.5s = 800).
+    clock = 20 * 60_000;
+    await tick();                                    // 유휴 ≥ 10분 · 간격 경과 → 이 tick 은 읽는다
+    reads = 0;
+    await runTicks(20 * 60_000);
+    expect(reads).toBe(800);
+
+    // (3) 1h 유휴 — 144,000 tick 중 재읽기 2,400번(1h/1.5s). 감속이 «더» 깊어지지도 풀리지도 않는다.
+    resetPtyControlIpcForTesting();
+    clock = 0;
+    await tick();
+    clock = 61 * 60_000;
+    await tick();                                    // 1h 유휴로 진입하는 첫 읽기
+    reads = 0;
+    await runTicks(60 * 60_000);
+    expect(reads).toBe(2_400);
+    // 1h 유휴 뒤에도 «첫 원격 요청 즉시 깨움» 은 25ms tick 하나다 — 감속이 깊어져도 응답 계약은 그대로.
+    const lateRow = insertPendingRow(id);
+    signalPtyControlWake(ptyManifestDbPath(), process.pid);
+    clock += 25;
+    await tick();
+    expect(rowStatus(lateRow)).toBe('success');
+
+    // (4) 활동이 왔으므로 25ms cadence 로 원복 — 다시 10초에 400번 읽는다.
+    reads = 0;
+    await runTicks(10_000);
+    expect(reads).toBe(400);
+  }, 120_000);
+
   test('깨어나지 않은 요청은 2s timeout 계약대로 만료된다 (기본 timeoutMs 2_000 보존)', async () => {
     const id = freshId(); register(id);
     const clock = virtualClock();
@@ -1318,5 +1370,216 @@ describe('TUI-IDLE-PTY-DEEP-IDLE-FU 깊은 유휴 감속 ⊕ 즉시 깨어움', 
     // 25ms cadence 도 그대로 — 2_000ms 를 25ms 씩 80 번 잰다(감속이 요청자 루프에 새지 않았다).
     expect(clock.slept).toEqual(Array.from({ length: 80 }, () => 25));
     expect(pendingCount(id)).toBe(0);                        // 조건부 DELETE 로 큐에서 걷어냈다
+  });
+
+  // ⭐ 생산 호출 경로 그대로 — `registry.startPtyControlPoller`(실제 setInterval 25ms 폴러)를 도는
+  //    **별도 owner 프로세스**가 진짜 감속·깨움·원복을 하는지 실시간으로 잰다. 감속 문턱만 env 로
+  //    줄여(생산 기본값은 10분/1.5s) 시험 시간을 초 단위로 줄인다 — 폴러의 tick 자체는 손대지 않는다.
+  test('생산 진입점(startPtyControlPoller) 그대로 — 자식 owner 가 감속하고 첫 요청에 깨어나 원복한다', async () => {
+    const id = freshId(); register(id);
+    const childScript = join(stateDir, 'poller-stage-owner.mjs');
+    const registryModule = join(import.meta.dir, 'registry.js');
+    writeFileSync(childScript, `const registry = await import(${JSON.stringify(registryModule)});\n`
+      + `const id = process.env.STAGE_PTY_ID;\n`
+      + `registry.registerPtyControlTarget({\n`
+      + `  id, accessMode: 'auto', transitionPolicy: 'open',\n`
+      + `  setAccessMode: () => true, isAlive: () => true, canWrite: () => true,\n`
+      + `  write() {}, resize() {},\n`
+      + `});\n`
+      + `registry.startPtyControlPoller();\n`
+      + `process.stdout.write(JSON.stringify({ ready: true, pid: process.pid }) + '\\n');\n`
+      + `setInterval(() => {}, 1_000);\n`);
+    const child = Bun.spawn([process.execPath, childScript], {
+      env: {
+        ...process.env,
+        ELANOUS_STATE_DIR: stateDir,
+        STAGE_PTY_ID: id,
+        ELANOUS_PTY_CONTROL_DEEP_IDLE_AFTER_MS: '300',
+        ELANOUS_PTY_CONTROL_DEEP_IDLE_POLL_MS: '2000',
+      },
+      stdout: 'pipe',
+      stderr: 'ignore',
+    });
+    try {
+      const reader = child.stdout.getReader();
+      const decoder = new TextDecoder();
+      let buffered = '';
+      let handshake: { ready?: boolean; pid?: number } | null = null;
+      while (handshake === null) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffered += decoder.decode(chunk.value, { stream: true });
+        const newline = buffered.indexOf('\n');
+        if (newline >= 0) handshake = JSON.parse(buffered.slice(0, newline)) as { ready?: boolean; pid?: number };
+      }
+      expect(handshake?.ready).toBe(true);
+      const ownerPid = handshake?.pid;
+      if (typeof ownerPid !== 'number') throw new Error(`poller stage owner never reported a pid: ${buffered}`);
+      expect(ownerPid).not.toBe(process.pid);
+
+      /** 행이 success 가 되기까지의 실경과(ms). 예산 안에 안 끝나면 null. */
+      const settleWithin = async (requestId: string, budgetMs: number): Promise<number | null> => {
+        const startedAt = Date.now();
+        while (Date.now() - startedAt <= budgetMs) {
+          if (rowStatus(requestId) === 'success') return Date.now() - startedAt;
+          await Bun.sleep(5);
+        }
+        return null;
+      };
+
+      // (a) 감속 — 유휴 문턱(300ms)을 넘긴 owner 는 2s 간격으로만 큐를 다시 읽는다.
+      await Bun.sleep(500);
+      const deceleratedRow = insertPendingRow(id, ownerPid);
+      expect(await settleWithin(deceleratedRow, 700)).toBeNull();        // 25ms cadence 라면 여기서 이미 끝난다
+      expect(await settleWithin(deceleratedRow, 3_000)).not.toBeNull();  // 감속 계단 안에서 처리된다
+
+      // (b) 활동 직후 원복 — 다음 요청은 25ms tick 하나로 끝난다.
+      const activeRow = insertPendingRow(id, ownerPid);
+      const activeLatency = await settleWithin(activeRow, 500);
+      expect(activeLatency).not.toBeNull();
+      expect(activeLatency!).toBeLessThan(300);
+
+      // (c) 다시 유휴로 들어간 감속 계단 «안쪽» 에서 첫 원격 요청은 wake 표식으로 즉시 깨어난다.
+      await Bun.sleep(700);
+      const wokenRow = insertPendingRow(id, ownerPid);
+      signalPtyControlWake(ptyManifestDbPath(), ownerPid);
+      const wokenLatency = await settleWithin(wokenRow, 600);
+      expect(wokenLatency).not.toBeNull();
+      expect(wokenLatency!).toBeLessThan(500);
+    } finally {
+      child.kill();
+      rmSync(childScript, { force: true });
+    }
+  }, 30_000);
+});
+
+// ── PTY-HUMAN-TYPING-REMOTE (0.2.36 · UX 칸) ──
+// 사람 타이핑(--remote --human)은 첫 글자 前에 ref(alias·nickname)를 canonical id 로 «한 번» 해석하고
+// bookmark host/token/URL 을 «한 번» 캡처해 세션 전체에 고정한다. 확정 前에는 원장 행을 «쓰지 않는다»(fail-closed).
+// 무대 이름: pty-control-ipc 격리 --test mock — mkdtemp 원장(ELANOUS_STATE_DIR) · 실제 SQLite 큐 · 가짜 handle.
+describe('PTY-HUMAN-TYPING-REMOTE: ref 해석·bookmark 캡처는 타이핑 前 한 번, 그 前에는 fail-closed', () => {
+  const tmpDirs: string[] = [];
+  afterAll(() => {
+    for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });
+    tmpDirs.length = 0;
+  });
+
+  function registerNamed(id: string, nickname: string): void {
+    upsertPtyManifest({ id, kind: 'test', nickname, cmd: 'test', startedAt: Date.now(), now: Date.now() });
+  }
+  function ledgerRows(): Array<{ pty_id: string; action: string; status: string }> {
+    const d = new Database(ptyManifestDbPath());
+    try {
+      return d.query('SELECT pty_id, action, status FROM pty_control_requests').all() as Array<{ pty_id: string; action: string; status: string }>;
+    } finally { d.close(); }
+  }
+  function pendingPtyIds(action: string): string[] {
+    return ledgerRows().filter((row) => row.action === action && row.status === 'pending').map((row) => row.pty_id);
+  }
+  function remoteStore(): InstanceType<typeof RemotesStore> {
+    const dir = mkdtempSync(join(tmpdir(), 'pty-ipc-remotes-'));
+    tmpDirs.push(dir);
+    const store = new RemotesStore({ remotesFilePath: join(dir, 'remotes.json'), tokensDir: join(dir, 'remotes') });
+    store.addRemote('mbp', {
+      host: 'mbp.tailnet',
+      acp_url: 'ws://mbp.tailnet:31415',
+      token_file: store.saveToken('mbp', 'token-1'),
+      addedAt: new Date().toISOString(),
+    }, { setDefault: true });
+    return store;
+  }
+
+  test('생산 진입점은 nickname ref 를 canonical id 로 «해석한 뒤» 원장에 쓴다', async () => {
+    const id = freshId(); registerNamed(id, 'human-seat-a');
+    const writes: string[] = [];
+    const handle = fakeHandle({ accessMode: 'write', write: (chars) => { writes.push(chars); } });
+    const owner = () => processPtyControlRequests((i) => (i === id ? (handle as never) : undefined), () => false);
+
+    const request = requestRemotePtyControl('human-seat-a', 'input-text', { chars: 'a' }, { actor: 'human', timeoutMs: 2000 });
+    // 행이 들어간 «직후» 읽는다 — 원장에는 ref 가 아니라 canonical id 가 남아야 한다.
+    const pending = pendingPtyIds('input-text');
+    expect(pending).toContain(id);
+    expect(pending).not.toContain('human-seat-a');
+    await Bun.sleep(60); await owner();
+    await expect(request).resolves.toEqual({ status: 'success' });
+    expect(writes).toEqual(['a']);
+  });
+
+  test('세션은 canonical id 와 bookmark host/token/URL 을 타이핑 전 구간 고정한다', async () => {
+    const id = freshId(); registerNamed(id, 'human-seat-b');
+    const writes: string[] = [];
+    const handle = fakeHandle({ accessMode: 'write', write: (chars) => { writes.push(chars); } });
+    const owner = () => processPtyControlRequests((i) => (i === id ? (handle as never) : undefined), () => false);
+    const store = remoteStore();
+
+    const started = beginPtyHumanTypingSession('human-seat-b', { remotes: store, bookmarkName: 'mbp' });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(`typing session did not start: ${started.status}`);
+    const pinned = started.session;
+    const pinnedBookmark = { name: 'mbp', host: 'mbp.tailnet', url: 'ws://mbp.tailnet:31415', token: 'token-1' };
+    expect(pinned.ptyId).toBe(id);
+    expect(pinned.resolvedBy).toBe('nickname-exact');
+    expect(pinned.bookmark).toEqual(pinnedBookmark);
+
+    // 세션 도중 사람이 북마크를 갈아 끼운다 — 핀은 재캡처되지 않아야 한다.
+    store.addRemote('mbp', {
+      host: 'other.tailnet',
+      acp_url: 'ws://other.tailnet:5555',
+      token_file: store.saveToken('mbp', 'token-2'),
+      addedAt: new Date().toISOString(),
+    }, { setDefault: true });
+
+    const first = requestRemotePtyControl('human-seat-b', 'input-text', { chars: 'h' }, { actor: 'human', timeoutMs: 2000, typingSession: pinned });
+    const firstPending = pendingPtyIds('input-text');
+    expect(firstPending).toContain(id);
+    await Bun.sleep(60); await owner();
+    await expect(first).resolves.toEqual({ status: 'success' });
+    expect(pinned.bookmark).toEqual(pinnedBookmark);
+
+    // nickname 이 바뀌면 «재해석»은 이제 실패한다 — 그래도 고정 세션은 같은 PTY 로 계속 쓴다(핀의 증거).
+    registerNamed(id, 'renamed-seat-b');
+    expect(beginPtyHumanTypingSession('human-seat-b', { remotes: store, bookmarkName: 'mbp' }))
+      .toEqual({ ok: false, status: 'unresolved-ref', candidates: [] });
+
+    const second = requestRemotePtyControl('human-seat-b', 'input-key', { chars: '\r' }, { actor: 'human', timeoutMs: 2000, typingSession: pinned });
+    const secondPending = pendingPtyIds('input-key');
+    expect(secondPending).toContain(id);
+    await Bun.sleep(60); await owner();
+    await expect(second).resolves.toEqual({ status: 'success' });
+    expect(writes).toEqual(['h', '\r']);
+    expect(pinned.bookmark).toEqual(pinnedBookmark);
+  });
+
+  test('ambiguous ref 는 원장 행을 «하나도» 쓰지 않고 fail-closed 한다', async () => {
+    const first = freshId(); const second = freshId();
+    registerNamed(first, 'twin-seat'); registerNamed(second, 'twin-seat');
+    const before = ledgerRows().length;
+
+    const resolved = beginPtyHumanTypingSession('twin-seat', {});
+    expect(resolved).toEqual({ ok: false, status: 'ambiguous-ref', candidates: [first, second] });
+
+    await expect(requestRemotePtyControl('twin-seat', 'input-text', { chars: 'x' }, { timeoutMs: 80 }))
+      .resolves.toEqual({ status: 'denied', reason: 'pty-ref-ambiguous' });
+    expect(ledgerRows().length).toBe(before);
+  });
+
+  test('해석 안 되는 ref 는 원장 행 없이 unknown-pty 로 끝난다', async () => {
+    const before = ledgerRows().length;
+    await expect(requestRemotePtyControl('no-such-seat-xyz', 'input-text', { chars: 'x' }, { timeoutMs: 80 }))
+      .resolves.toEqual({ status: 'unknown-pty' });
+    expect(ledgerRows().length).toBe(before);
+    expect(beginPtyHumanTypingSession('no-such-seat-xyz', {})).toEqual({ ok: false, status: 'unresolved-ref', candidates: [] });
+  });
+
+  test('명시한 bookmark 를 캡처할 수 없으면 타이핑 前에 fail-closed 한다', async () => {
+    const id = freshId(); registerNamed(id, 'human-seat-c');
+    const store = remoteStore();
+    expect(beginPtyHumanTypingSession('human-seat-c', { remotes: store, bookmarkName: 'absent' }))
+      .toEqual({ ok: false, status: 'unknown-bookmark', candidates: [] });
+
+    const before = ledgerRows().length;
+    await expect(requestRemotePtyControl('human-seat-c', 'input-text', { chars: 'x' }, { timeoutMs: 80, bookmarkName: 'absent' }))
+      .resolves.toEqual({ status: 'denied', reason: 'typing-bookmark-unavailable' });
+    expect(ledgerRows().length).toBe(before);
   });
 });

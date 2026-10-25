@@ -5,19 +5,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildUserConfig, saveUserConfig } from './user-config.js';
 import { getProviderForConfig, sanitizeToolSchemaForKimi, type LLMToolSpec } from './llm.js';
+import { isOpenRouterGrokModel, sanitizeToolSchemaForGrok } from './llm-tool-schema.js';
 import type { UserConfig } from './user-config.js';
 
 const schema = {
   type: 'object',
   properties: {
     a: { $ref: '#/x', description: 'd' },
-    b: { type: 'array', items: [{ type: 'string' }, { type: 'number' }] },
+    b: { type: 'array', items: [{ type: 'string' }, { type: 'number' }], minItems: 2, maxItems: 2 },
   },
 };
 const tools: LLMToolSpec[] = [{ name: 'demo', description: 'demo', parameters: schema }];
 const messages = [{ role: 'user' as const, content: 'hello' }];
 
-async function captureRequest(provider: string, model: string, preferences?: Record<string, unknown>) {
+async function captureRequest(provider: string, model: string, preferences?: Record<string, unknown>, requestTools = tools) {
   const bodies: Record<string, any>[] = [];
   const urls: string[] = [];
   const mock = spyOn(globalThis, 'fetch').mockImplementation((async (url, init) => {
@@ -27,7 +28,7 @@ async function captureRequest(provider: string, model: string, preferences?: Rec
   }) as typeof fetch);
   try {
     const config = { llm: { provider, model, apiKey: 'test-key', ...(provider === 'local' ? { baseUrl: 'http://localhost:1234/v1' } : {}), ...(preferences ? { openrouter: { providerPreferences: preferences } } : {}) } } as UserConfig;
-    for await (const _ of getProviderForConfig(config).streamChat!(messages, { tools })) { /* consume */ }
+    for await (const _ of getProviderForConfig(config).streamChat!(messages, { tools: requestTools })) { /* consume */ }
     return { body: bodies[0]!, url: urls[0] };
   } finally {
     mock.mockRestore();
@@ -75,10 +76,83 @@ test('Kimi schema sanitizer is pure, recursively removes $ref siblings and tuple
   expect(sanitizeToolSchemaForKimi(schema)).toEqual({
     type: 'object', properties: {
       a: { $ref: '#/x' },
-      b: { type: 'array', items: { type: 'string' } },
+      b: { type: 'array', items: { type: 'string' }, minItems: 2, maxItems: 2 },
     },
   });
   expect(schema).toEqual(original);
+});
+
+test('Grok schema sanitizer converts tuple items recursively and preserves tuple constraints', () => {
+  const tuple = {
+    type: 'object',
+    properties: {
+      position: {
+        type: 'array',
+        items: [{ type: 'number', minimum: -1000 }, { type: 'number', maximum: 1000 }],
+        minItems: 2,
+        maxItems: 2,
+        additionalItems: false,
+      },
+      label: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['position'],
+  };
+  const original = structuredClone(tuple);
+  expect(sanitizeToolSchemaForGrok(tuple)).toEqual({
+    type: 'object',
+    properties: {
+      position: {
+        type: 'array',
+        prefixItems: [{ type: 'number', minimum: -1000 }, { type: 'number', maximum: 1000 }],
+        minItems: 2,
+        maxItems: 2,
+        items: false,
+      },
+      label: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['position'],
+  });
+  expect(tuple).toEqual(original);
+  expect(isOpenRouterGrokModel('openrouter/x-ai/grok-4.1-fast')).toBe(true);
+  expect(isOpenRouterGrokModel('x-ai/grok-4.1-fast')).toBe(true);
+  expect(isOpenRouterGrokModel('z-ai/glm-5.3')).toBe(false);
+});
+
+test('OpenRouter Grok wire tools convert all five Higgsfield tuple definitions only on that route', async () => {
+  const toolsWithPositions: LLMToolSpec[] = [
+    'ae_add_text_layer', 'ae_add_shape_layer', 'ae_modify_layer', 'ae_import_image', 'ae_add_mask',
+  ].map((name) => ({
+    name,
+    description: name,
+    parameters: {
+      type: 'object',
+      properties: {
+        position: {
+          type: 'array',
+          items: [{ type: 'number', minimum: -8192 }, { type: 'number', minimum: -8192 }],
+          minItems: 2,
+          maxItems: 2,
+        },
+        opacity: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: ['position'],
+    },
+  }));
+  const grok = (await captureRequest('openrouter', 'openrouter/x-ai/grok-4.1-fast', undefined, toolsWithPositions)).body;
+  expect(grok.tools).toHaveLength(5);
+  for (const tool of grok.tools) {
+    const parameters = tool.function.parameters;
+    expect(parameters.properties.position.prefixItems).toEqual([
+      { type: 'number', minimum: -8192 }, { type: 'number', minimum: -8192 },
+    ]);
+    expect(parameters.properties.position.minItems).toBe(2);
+    expect(parameters.properties.position.maxItems).toBe(2);
+    expect(parameters.properties.opacity).toEqual({ type: 'number', minimum: 0, maximum: 1 });
+    expect(parameters.required).toEqual(['position']);
+  }
+  const glm = (await captureRequest('openrouter', 'openrouter/z-ai/glm-5.3', undefined, toolsWithPositions)).body;
+  expect(glm.tools[0].function.parameters.properties.position.items).toHaveLength(2);
+  expect(glm.tools[0].function.parameters.properties.position.prefixItems).toBeUndefined();
 });
 
 test('only OpenRouter moonshotai tools are sanitized in the serialized request', async () => {

@@ -431,23 +431,17 @@ const OPENGATEWAY: TierMap = {
 };
 
 // ── AWS Bedrock (BEDROCK-PROVIDER · 2026-10-11) ───────────────────
-//   ⭐ 판단: ANTHROPIC 사다리의 «추론 수준·역할 배치»를 그대로 두고, 모델은 Bedrock 메시지 엔드포인트에서
-//   확인한 5.5 계열 id(`src/llm/bedrock.ts` BEDROCK_MODELS · 출처 platform.claude.com «Claude in Amazon Bedrock»
-//   Supported models)로만 채운다. 아래 칸(budget·balanced)은 ANTHROPIC 이 haiku-4-5·sonnet-5 를 쓰지만, 이 PR 이
-//   카탈로그에 올린 Bedrock id 는 5.5 셋뿐이라 같은 등급의 5.5(haiku-5-5·sonnet-5-5)로 올렸다.
 //   ⛔ bedrock 은 명시 선택 전용 — 이 표는 `--role-llm <role>=bedrock/<tier>` 같은 «명시» 해석에만 쓰인다.
-//   ⚠️ status = `wip`: 실 AWS 호출(계정별 5.5 접근 조건)을 아직 안 쟀고, 셋업 키 감지 표(PROVIDER_ENV_SPEC)에도
-//      없다(자격이 API 키가 아니라 AWS 체인이라). 첫 실호출 스모크 뒤 `shipping` 으로 올린다.
-//   ⭐ BEDROCK-RUNTIME-PATH(10-11): 메시지 엔드포인트(mantle)에 5.5 가 없어(📏 `GET /v1/models`) 사다리 id 를 전역 추론 프로필
-//      `global.anthropic.…`(runtime 경로 · bedrock.ts BEDROCK_MODELS 의 `route` 칸)로 옮겼다. 공급자 이름은 그대로 `bedrock`.
-//      📏 budget·balanced(haiku/sonnet 5.5)는 runtime 실호출 200 실측(ap-northeast-2) · opus 5.5 는 «추론 프로필 목록에 있음»까지만(호출 0).
-//      status 는 그대로 `wip` — `shipping` 은 셋업 키 감지 표(PROVIDER_ENV_SPEC) 칸을 요구한다(provider-wiring-contract 시험 · 범위 밖).
+//   ⚠️ status = `wip`: mantle-openai 모델의 실제 호출 가능성은 계정별 IAM 접근 조건을 따르며,
+//      셋업 키 감지 표(PROVIDER_ENV_SPEC)에도 없다(자격이 API 키가 아니라 AWS 체인이라).
+//   runtime Converse 모델(GLM 5.3·Kimi K3·Grok 4.7)은 OP/IAM 확인 뒤 별도 추가한다.
+//   ⛔ 아래 비-Anthropic id 들은 `src/llm/bedrock.ts` BEDROCK_MODELS 에 등록된 mantle-openai 행만 사용한다.
 const BEDROCK: TierMap = {
-  budget:   { model: 'global.anthropic.claude-haiku-5-5',  reasoningLevel: 'off',    label: 'Claude Haiku 5.5 (Bedrock)',  rationale: 'Fast · cheap · bulk/classification', status: 'wip' },
-  balanced: { model: 'global.anthropic.claude-sonnet-5-5', reasoningLevel: 'off',    label: 'Claude Sonnet 5.5 (Bedrock)', rationale: 'Default · everyday coding (BEDROCK_DEFAULT_MODEL)', status: 'wip' },
-  better:   { model: 'global.anthropic.claude-opus-5-5',   reasoningLevel: 'medium', label: 'Claude Opus 5.5 · thinking medium (Bedrock)', rationale: 'ANTHROPIC better 와 같은 배치(구현 = Opus 5.5)', status: 'wip' },
-  best:     { model: 'global.anthropic.claude-opus-5-5',   reasoningLevel: 'medium', label: 'Claude Opus 5.5 · thinking medium (Bedrock)', rationale: 'Best reasoning · architecture', status: 'wip' },
-  loaded:   { model: 'global.anthropic.claude-opus-5-5',   reasoningLevel: 'high',   label: 'Claude Opus 5.5 · extended thinking (Bedrock)', rationale: 'Loaded · deep multi-step', status: 'wip' },
+  budget:   { model: 'zai.glm-4.7-flash',         reasoningLevel: 'off',    label: 'GLM 4.7 Flash (Bedrock)', rationale: 'Fast · cheap · bulk/classification', status: 'wip' },
+  balanced: { model: 'openai.gpt-6-luna',         reasoningLevel: 'off',    label: 'GPT-6 Luna (Bedrock)', rationale: 'Default · balanced Bedrock mantle-openai model', status: 'wip' },
+  better:   { model: 'deepseek.v3.2',             reasoningLevel: 'medium', label: 'DeepSeek V3.2 (Bedrock)', rationale: 'Higher quality · mantle-openai', status: 'wip' },
+  best:     { model: 'zai.glm-5',                 reasoningLevel: 'medium', label: 'GLM 5 (Bedrock)', rationale: 'Best reasoning · mantle-openai', status: 'wip' },
+  loaded:   { model: 'openai.gpt-6-sol',          reasoningLevel: 'high',   label: 'GPT-6 Sol (Bedrock)', rationale: 'Loaded · deep multi-step · mantle-openai', status: 'wip' },
 };
 
 /** 가격·창 미측정이라 기존 tier 배치를 바꾸지 않고 명시 모델로만 고르는 칸.
@@ -523,8 +517,9 @@ export function lookupOpenRouterModelSpec(model: string): LlmTierSpec | undefine
  *  `auto` and unknown providers have no concrete provider ladder, so both use
  *  Anthropic's balanced default instead of crossing into the Codex family.
  *  Existing execution path: src/llm/model-defaults.ts tierModel() calls this
- *  function to fill the active provider's model at runtime. Explicit providers
- *  keep their own ladders; CLI catalog commands reject unknown/'auto' directly. */
+ *  function (`lookupLlmTierSpec(activeProviderForDefaults(provider), tier)`) to
+ *  fill the active provider's model at runtime. Explicit providers keep their
+ *  own ladders; CLI catalog commands reject unknown/'auto' directly. */
 export function lookupLlmTierSpec(
   provider: LLMProviderName,
   tier: ModelTier,

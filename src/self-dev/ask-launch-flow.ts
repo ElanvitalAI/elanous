@@ -10,7 +10,7 @@
 //   (바꾸면 이 추출이 회귀인지 개선인지 사후에 못 가른다.)
 // ⛔ 종료(`process.exit`)는 여기가 «안» 한다 — 호출자가 자기 표면에 맞게 끝낸다.
 //   그래서 결과를 «세 값»으로 낸다: 발사 / 저작 전 중단 / 전제 검사 중단.
-import { linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { linesOutsideFencedCode, readGoalAuthorGroundingTimebox, type GoalAuthorGroundingTimebox } from '../self-implement/goal-author.js';
 import { existsSync } from 'node:fs';
 import { debug } from '../debug/log.js';
 import { appendRunLedgerEntry, runLedgerDir } from '../self-implement/run-ledger.js';
@@ -67,6 +67,23 @@ function resolveSelfResolveClarifications(explicit: boolean | undefined): Resolv
 export interface AskAuthoredGoal {
   readonly path: string;
   readonly authored?: { readonly document?: string; readonly grounded?: boolean | null; readonly authorRunId?: string } | null;
+}
+
+/**
+ * ⭐ AUTHOR-TIMEBOX 결과 줄 — `formatOrchestrateResultLine`
+ * (`  ${icon} ${status} · ${feature}${disp}${error}`)과 **같은 모양**을 쓴다.
+ *
+ * ⛔ `src/self-dev/orchestrate-summary-line.ts` 는 «안 고친다» — 다른 명령·화면의 기본 동작과
+ *   원장 형식은 보존 계약이다. 그래서 같은 모양을 이 자리에서 «쓴다».
+ * ⛔ 접지가 예산 초과로 끊긴 저작이 «조용히» 지나가면 상위 디스패처는 그 런을 성공으로도
+ *   실패로도 판정하지 못한다(80분 런 사망의 실제 모양).
+ */
+export function formatGoalAuthorTimeboxResultLine(
+  goalFile: string,
+  timebox: GoalAuthorGroundingTimebox,
+): string {
+  const feature = (goalFile.split('/').at(-1) ?? goalFile).slice(0, 56);
+  return `  ❌ NOT-GROUNDED · ${feature} [author-timebox] — grounding-timebox: exceeded ${timebox.budgetMs}ms budget after ${timebox.elapsedMs}ms; authoring stopped before launch`;
 }
 
 export type LaunchingTreeProbe =
@@ -240,7 +257,12 @@ export type AskLaunchFlowResult =
   /** ⓪ 저작 «전»에 막혔다 — 100초를 안 썼다. */
   | { readonly kind: 'stopped-before-authoring'; readonly goalFile?: undefined }
   /** ⑵⑶⑷ 에서 막혔다 — 골은 «있다»(사람이 열어볼 수 있게 돌려준다). */
-  | { readonly kind: 'stopped-by-preflight'; readonly goalFile: string; readonly blockers: LaunchPreflightResult['blockers'] };
+  | { readonly kind: 'stopped-by-preflight'; readonly goalFile: string; readonly blockers: LaunchPreflightResult['blockers'] }
+  /** ⑴ 저작에서 접지 예산(AUTHOR-TIMEBOX)을 넘겨 NOT-GROUNDED 로 끝났다 — 발사하지 «않는다». */
+  | { readonly kind: 'stopped-by-timebox'; readonly goalFile: string };
+
+/** ⑴ AUTHOR-TIMEBOX NOT-GROUNDED — 결과 줄을 쓰고 흐름을 끊는 값. */
+export type AskLaunchFlowTimeboxStop = Extract<AskLaunchFlowResult, { kind: 'stopped-by-timebox' }>;
 
 /** 런 식별자가 흐름 뒤에 확정된 호출자는 이 관측으로 입구와 런을 조인한다. */
 export function observeAskLaunchRunIdentity(
@@ -738,7 +760,7 @@ async function intakeClarifications(
   input: AskLaunchFlowInput,
   deps: AskLaunchFlowDeps,
   selfResolveClarifications: ResolvedSelfResolveClarifications,
-): Promise<string> {
+): Promise<string | AskLaunchFlowTimeboxStop> {
   let effectiveGoalFile = authored.path;
   let document = deps.readFile(effectiveGoalFile);
   const { pending, mode } = planClarificationIntake(document, deps.isInteractive());
@@ -824,6 +846,28 @@ async function intakeClarifications(
   const parentDocument = document;
   effectiveGoalFile = isAbsolutePath(reauthored.path) ? reauthored.path : resolvePath(deps.cwd(), reauthored.path);
   deps.print(`[ask] ⑴b 재저작됨: ${reauthored.path}`);
+  // 재저작도 «같은 저작 진입점»이다 — 접지가 예산 초과로 끊기면 같은 결과 줄을 쓴다(조용히 넘기지 않는다).
+  const reauthoredTimebox = reauthored.authored?.document === undefined
+    ? null
+    : readGoalAuthorGroundingTimebox(reauthored.authored.document);
+  if (reauthoredTimebox !== null) {
+    deps.print(formatGoalAuthorTimeboxResultLine(reauthored.path, reauthoredTimebox));
+    deps.log('ask-author-timebox', {
+      goalFile: reauthored.path,
+      provenance: 'reauthor',
+      outcome: 'NOT-GROUNDED',
+      budgetMs: reauthoredTimebox.budgetMs,
+      elapsedMs: reauthoredTimebox.elapsedMs,
+      grounded: reauthored.authored?.grounded ?? null,
+    }, 'warn');
+    // ⛔⭐⭐ 재저작 NOT-GROUNDED 도 «끝»이다 — 결과 줄을 쓰고 되묻기 이후 단계로 지나가지 않는다.
+    observeFrontNodeExit({ node: 'author', outcome: 'not-grounded' }, {
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      attempt: 1, goalFile: effectiveGoalFile,
+      reason: `grounding-timebox-exhausted (budget ${reauthoredTimebox.budgetMs}ms, elapsed ${reauthoredTimebox.elapsedMs}ms)`,
+    });
+    return { kind: 'stopped-by-timebox', goalFile: effectiveGoalFile };
+  }
   // ⛔ 「재저작이 «났다»」와 「재저작이 «옳았다»」는 다른 물음이다(JDG-T35 3단 ⑶).
   const childDocument = reauthored.authored?.document ?? deps.readFile(effectiveGoalFile);
   const askFidelity = classifyReauthoredAsk(parentDocument, childDocument);
@@ -886,10 +930,10 @@ export async function runAskLaunchFlow(
   if (launchPreflight === false) return { kind: 'stopped-before-authoring' };
 
   await deps.beforeAuthoring?.();
-  const authorAndPreflight = async (authorAskText: string = input.askText, machineSuggestedTargetPaths: readonly string[] = [], attempt = 1): Promise<{
-    readonly goalFile: string;
-    readonly decision: ReturnType<typeof decideAskPreflight>;
-  }> => {
+  const authorAndPreflight = async (authorAskText: string = input.askText, machineSuggestedTargetPaths: readonly string[] = [], attempt = 1): Promise<
+    | { readonly goalFile: string; readonly decision: ReturnType<typeof decideAskPreflight> }
+    | AskLaunchFlowTimeboxStop
+  > => {
     // ⛔ 수를 박지 않는다 — 「100~110초」가 박혀 있었고 2026-08-23 prod 실측은 «206초»(2배)였다.
     //    재는 명령: elanous logs --category goal-author --event phase-end --json --json-data
     deps.print('[ask] ⑴ 저작 — self author (수 분 걸린다 · 페이즈별 실측은 goal-author/phase-end)');
@@ -926,6 +970,29 @@ export async function runAskLaunchFlow(
       throw error;
     });
     deps.print(`[ask] 저작됨: ${authored.path}`);
+    // ⛔⭐⭐ AUTHOR-TIMEBOX — 접지가 예산을 넘겨 끊긴 저작은 «결과 줄» 없이 지나가면 안 된다.
+    //   이 자리가 ask → Pod 발사를 쥔 곳이므로(이 흐름이 발사 여부를 정한다), 여기서 한 줄을 쓴다.
+    const groundingTimebox = authored.authored?.document === undefined
+      ? null
+      : readGoalAuthorGroundingTimebox(authored.authored.document);
+    if (groundingTimebox !== null) {
+      deps.print(formatGoalAuthorTimeboxResultLine(authored.path, groundingTimebox));
+      deps.log('ask-author-timebox', {
+        goalFile: authored.path,
+        provenance: 'author',
+        outcome: 'NOT-GROUNDED',
+        budgetMs: groundingTimebox.budgetMs,
+        elapsedMs: groundingTimebox.elapsedMs,
+        grounded: authored.authored?.grounded ?? null,
+      }, 'warn');
+      // ⛔⭐⭐ NOT-GROUNDED 는 «끝»이다 — 이 흐름이 발사 여부를 정하므로, 결과 줄을 쓰고 나서
+      //   되묻기·전제 검사·발사로 «지나가지 않는다». 저작 종료 출구를 그래프에 남기고 흐름을 끊는다.
+      observeFrontNodeExit({ node: 'author', outcome: 'not-grounded' }, {
+        ...frontObservation, attempt, goalFile: authored.path,
+        reason: `grounding-timebox-exhausted (budget ${groundingTimebox.budgetMs}ms, elapsed ${groundingTimebox.elapsedMs}ms)`,
+      });
+      return { kind: 'stopped-by-timebox', goalFile: authored.path };
+    }
     // AUTHOR-TRACE: the authored goal file can be cleaned up later — keep path ⊕ sha256 ⊕ size in the run ledger and
     // archive the body, so authoring length is measurable after the fact (GOAL-BENCH · AUTHOR-LITE).
     const traceIds = {
@@ -979,10 +1046,13 @@ export async function runAskLaunchFlow(
     }, markerCounts !== null && markerCounts.missingMarkers > 0 ? 'warn' : 'info');
 
     // ⛔ 되묻기에 답하면 «새 골»이 나온다 — 아래 전제 검사·발사는 그 «최종» 골을 써야 한다.
-    const goalFile = await intakeClarifications({
+    const clarifiedGoalFile = await intakeClarifications({
       ...authored,
       path: isAbsolutePath(authored.path) ? authored.path : resolvePath(deps.cwd(), authored.path),
     }, input, deps, selfResolveClarifications);
+    // 재저작이 AUTHOR-TIMEBOX 로 끊겼으면 이 흐름도 그대로 끊는다 — 전제 검사·발사로 지나가지 않는다.
+    if (typeof clarifiedGoalFile !== 'string') return clarifiedGoalFile;
+    const goalFile = clarifiedGoalFile;
     // The child reads this file again. Filtering only preflight.paths would leave the same bogus
     // TRACED PATHS prose in the child and repeat its missing-file failure.
     let sanitizeFailed = false;
@@ -1090,7 +1160,10 @@ export async function runAskLaunchFlow(
     });
   };
 
-  let authored = await authorAndPreflight();
+  let firstAuthored = await authorAndPreflight();
+  // 저작 단계가 AUTHOR-TIMEBOX NOT-GROUNDED 로 끝났으면 이 흐름도 그대로 끊는다.
+  if ('kind' in firstAuthored) return firstAuthored;
+  let authored = firstAuthored;
   let reauthored = false;
   const retryableNoTargetPaths = !input.forceRequested
     && !authored.decision.shouldLaunch
@@ -1142,9 +1215,12 @@ export async function runAskLaunchFlow(
       deps.print('[ask] ⑴ ⚠️ 자동 재저작에 넣을 대상 경로 후보가 없다. 대상 경로를 확인해야 한다');
     }
     recordPodAuthoring('ask-auto-reauthor', { candidatePathCount: candidates.paths.length, firstPathCount: first.decision.result.paths.length, outcome: 'started' });
-    authored = await authorAndPreflight(selectedPaths.length > 0
+    const secondAuthored = await authorAndPreflight(selectedPaths.length > 0
       ? `대상 경로: ${selectedPaths.join(' · ')}\n${input.askText}`
       : input.askText, selectedPaths, 2);
+    // 재시도 저작도 AUTHOR-TIMEBOX 로 끊길 수 있다 — 그러면 발사하지 않는다.
+    if ('kind' in secondAuthored) return secondAuthored;
+    authored = secondAuthored;
     // 두 번째 not-grounded 는 re-ground 예산(max_visits 1)을 넘어 needs-human(근거 카드)으로 — 판정은 observeFrontNodeExit 가 선언에서 읽는다.
     observeAuthorExit(2, authored, !authored.decision.shouldLaunch && authorNotGrounded(authored.decision) ? 'not-grounded' : 're-authored');
     deps.log('ask-auto-reauthor', {

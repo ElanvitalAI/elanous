@@ -12,7 +12,8 @@ export function parseFailures(output: string): string[] {
     const line = raw.trim();
     const header = /^(?:\.\/)?((?:[\w.-]+\/)+[\w.-]+\.test\.tsx?):(?:\s|$)/.exec(line);
     if (header) { file = header[1]; continue; }
-    const failed = /^\(fail\)[ \t]+(.+?)(?:[ \t]+\[[\d.]+(?:ms|s)\])?[ \t]*$/.exec(raw);
+    // Line-start only: a title/body `(fail)` is not a reporter row. Trailing CR is still a real Bun fail row.
+    const failed = /^\(fail\)[ \t]+(.+?)(?:[ \t]+\[[\d.]+(?:ms|s)\])?[ \t]*\r?$/.exec(raw);
     if (failed && file) failures.add(`${file} > ${failed[1]!.trim()}`);
   }
   return [...failures].sort();

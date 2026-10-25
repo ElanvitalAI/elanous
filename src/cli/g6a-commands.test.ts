@@ -6,15 +6,16 @@ import { spawnSync } from 'node:child_process';
 setDefaultTimeout(60_000);
 
 // Captured from the pre-move src/index.ts Commander tree (flags preserve declaration order).
-// #21723 added logs --top-failures/--threshold after the extraction snapshot; keep the exact flag-order guard.
-const beforeMove = [
+// #21723 added --top-failures/--threshold; #31149 added --recompute/--run/--journey/--graph after extraction.
+// Keep both post-move additions in the ordered snapshot so it guards the current registration too.
+const expectedCommandTree = [
   {
     name: 'logs', flags: [
       '-f, --follow', '--level <lvl>', '--surface <s>', '--space <v>', '--category <c>', '--exact-category <c>',
       '--list-categories', '--list-events', '--axis <name>', '--explain', '--event <e>', '--grep <q>',
       '--rework-recurrence-disagreement <true|false>', '--since <t>', '--until <t>', '--before <cursor>',
       '--session <id>', '--limit <n>', '--top-failures', '--threshold <n>', '--json', '--json-data', '--test', '--instance <name>', '--all',
-      '--include-test', '-r', '--remote <name>',
+      '--include-test', '--recompute', '--run <id>', '--journey <key>', '--graph <id>', '-r', '--remote <name>',
     ],
     children: [
       { name: 'instances', flags: ['--json'] },
@@ -68,7 +69,7 @@ describe('G6a extracted command registrations', () => {
       encoding: 'utf8',
     });
     expect(probe.status).toBe(0);
-    expect(JSON.parse(probe.stdout)).toEqual(beforeMove);
+    expect(JSON.parse(probe.stdout)).toEqual(expectedCommandTree);
   });
 
   test('index invokes each extracted registration once in its original order, with ad still between logs and docs', () => {

@@ -102,6 +102,8 @@ export interface RejudgeDeps {
   notifyRepair?: (seat: string, body: string) => void;
   /** Shared new-launch budget for this `tasks rejudge --all` call. */
   repairBudget?: import('./repair-cycle.js').RepairTickBudget;
+  /** Verify a later PR head contains the harvested owner commit (read-only). */
+  ownerHarvestAncestor?: (cwd: string, owner: string, head: string) => boolean;
   /** One review request across all candidates in one --all tick; standalone card rejudge is uncapped. */
   reviewBudget?: { max: number; requested: number };
   /** One land or queue attempt across all candidates in one --all tick. */
@@ -346,10 +348,11 @@ const catchUpFail = (reason: string, extra: Partial<CatchUpResult> = {}): CatchU
 /**
  * origin/main 을 PR 머리에 3-way merge(rerere 켬) 하고 일반 push 한다.
  * ⛔ rebase · force-push · reset · 남의 가지 파일째 checkout — 충돌이면 merge --abort.
+ * 이전 시도의 worktree 경로가 남았으면 새 경로로 한 번 더 시도한다. 남은 트리를 강제 제거하지 않는다.
  */
 export async function defaultCatchUpMain(request: CatchUpRequest, git: CatchUpGit = defaultCatchUpGit): Promise<CatchUpResult> {
   const repo = request.cwd;
-  const work = request.worktreePath ?? join(tmpdir(), `ta-catch-up-${request.pr}-${safe(request.head.slice(0, 12))}-${process.pid}`);
+  let work = request.worktreePath ?? join(tmpdir(), `ta-catch-up-${request.pr}-${safe(request.head.slice(0, 12))}-${process.pid}`);
   const gitRepo = (args: string[]) => git(repo, args);
   const gitWork = (args: string[]) => git(work, args);
   const fromBase = request.fromBase;
@@ -367,7 +370,12 @@ export async function defaultCatchUpMain(request: CatchUpRequest, git: CatchUpGi
     return catchUpFail(`fetched PR head ${(fetchedHead ?? '?').slice(0, 12)} ≠ ${request.head.slice(0, 12)}`, { fromBase, toBase });
   }
 
-  const added = gitRepo(['worktree', 'add', '--detach', work, request.head]);
+  let added = gitRepo(['worktree', 'add', '--detach', work, request.head]);
+  if (added.status !== 0 && /already exists|already registered|already used by worktree/i.test(added.stderr || added.stdout)) {
+    // 남은 경로가 살아 있는 다른 시도의 것일 수 있으므로 건드리지 않는다.
+    work = `${work}-retry-${randomUUID()}`;
+    added = gitRepo(['worktree', 'add', '--detach', work, request.head]);
+  }
   if (added.status !== 0) return catchUpFail(`worktree add failed: ${(added.stderr || added.stdout).trim().slice(-200)}`, { fromBase, toBase });
   const cleanup = () => { gitRepo(['worktree', 'remove', '--force', work]); };
 
@@ -495,7 +503,8 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   if ('reason' in found) return target('pr-unreadable', found.reason, pr, fromHead);
   const { cwd, view } = found;
   const toHead = view.head;
-  const eligible = !!reviews.length || adopted || (!!card.parentHost && (deps.remoteRunTerminal ?? remoteBoundRunTerminal)(card));
+  const harvest = pendingOwnerHarvest(card, pr);
+  const eligible = !!reviews.length || adopted || !!harvestReviewPending(card, pr) || (!!card.parentHost && (deps.remoteRunTerminal ?? remoteBoundRunTerminal)(card));
   const trustedTrain = view.state === 'CLOSED' && card.status === 'launched'
     ? (() => { try { return (deps.trainLanding ?? verifiedTrainLanding)(pr, cwd); } catch { return null; } })() : null;
   // An unreviewed or unproven remote card retains the old guard. Only verified train
@@ -543,6 +552,25 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
       : target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
   }
   if (view.state !== 'OPEN') return target('pr-not-open', `PR #${pr} is ${view.state}`, pr, fromHead, toHead);
+  if (harvest) {
+    const ancestor = deps.ownerHarvestAncestor ?? ((repo: string, owner: string, head: string) => {
+      const result = spawnSync('git', ['merge-base', '--is-ancestor', owner, head], { cwd: repo, encoding: 'utf8', timeout: 10_000 });
+      return result.status === 0;
+    });
+    let reached = sameHead(toHead, harvest.head);
+    if (!reached) { try { reached = ancestor(cwd, harvest.head, toHead); } catch { reached = false; } }
+    if (!reached) {
+      emit({ card: card.id, pr, fromHead, toHead, step: 'review', decision: 'awaiting-harvest',
+        reason: `PR #${pr} head ${toHead.slice(0, 12)} awaits owner-worktree-commit ${harvest.head.slice(0, 12)} · next: wait for harvest` }, false);
+      return outcomes;
+    }
+    updateTaskCard(statePath, card.id, current => current && cardPrNumber(current) === pr
+      && typeof current.pr === 'object' && current.pr.url === url && pendingOwnerHarvest(current, pr)?.head === harvest.head
+      && !current.history.some(entry => entry.event === 'review-harvest-reached' && entry.pr === pr
+        && entry.runId === current.runId && entry.head && sameHead(entry.head, toHead))
+      ? { ...current, history: [...current.history, { at: now().toISOString(), event: 'review-harvest-reached',
+        pr, head: toHead, ...(current.runId ? { runId: current.runId } : {}), detail: `PR #${pr} head reached owner-worktree-commit · next: review` }] } : undefined);
+  }
   // An explicitly rejudged PR can be reopened. Clear the old marker before normal head judgement.
   if (boundPrTerminal(card)) {
     updateTaskCard(statePath, card.id, (current) => current && cardPrNumber(current) === pr && typeof current.pr === 'object' && current.pr.url === url
@@ -552,6 +580,26 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
   const step = (s: RejudgeStep, decision: string, reason: string, record: boolean, extra: Partial<RejudgeOutcome> = {}) =>
     emit({ card: card!.id, pr, fromHead, toHead, step: s, decision, reason, ...extra }, record);
   const requestReview = async (candidate: TaskCard, reason: string, forceNewReview = false): Promise<void> => {
+    // The head used for this decision may have moved while the card was being updated.
+    // Never request a review of a new head until it is verified against the owner commit.
+    if (harvest) {
+      let fresh: PrHeadView | null;
+      try { fresh = await (live.prHead ?? defaultPrHead)(pr, cwd); } catch { fresh = null; }
+      if (!fresh || fresh.state !== 'OPEN' || !fresh.url || !sameUrl(fresh.url, url)) {
+        step('review', 'awaiting-harvest', `PR #${pr} fresh head unavailable · next: wait for harvest`, false);
+        return;
+      }
+      let reached = sameHead(fresh.head, harvest.head);
+      if (!reached) {
+        try { reached = (deps.ownerHarvestAncestor ?? ((repo: string, owner: string, head: string) =>
+          spawnSync('git', ['merge-base', '--is-ancestor', owner, head], { cwd: repo, encoding: 'utf8', timeout: 10_000 }).status === 0))(cwd, harvest.head, fresh.head); }
+        catch { reached = false; }
+      }
+      if (!reached) {
+        step('review', 'awaiting-harvest', `PR #${pr} head ${fresh.head.slice(0, 12)} awaits owner-worktree-commit ${harvest.head.slice(0, 12)} · next: wait for harvest`, false);
+        return;
+      }
+    }
     const budget = deps.reviewBudget;
     if (budget && budget.requested >= budget.max) {
       step('review', 'tick-cap', `review request cap ${budget.max} reached — next tick`, false);
@@ -560,9 +608,12 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     // Reserve before awaiting the worker so another candidate cannot launch a second request.
     if (budget) budget.requested++;
     const before = { reviewRequests: candidate.reviewRequests, landAttempts: candidate.landAttempts };
-    const result = await executeLiveReview(candidate, pr, { runId: candidate.runId ?? null, stopReason: reason, cwd, forceNewReview }, { ...live, ...(deps.log ? { log: deps.log } : {}) });
+    const result = await executeLiveReview(candidate, pr, { runId: candidate.runId ?? null, stopReason: reason, cwd, forceNewReview,
+      ...(harvest ? { ownerHarvestHead: harvest.head, ...(deps.ownerHarvestAncestor ? { ownerHarvestAncestor: deps.ownerHarvestAncestor } : {}) } : {}) },
+      { ...live, ...(deps.log ? { log: deps.log } : {}) });
     recordMove(statePath, candidate.id, candidate.runId, 'review', result, pr, before, now, deps.log);
-    step('review', result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
+    step('review', harvest && !result.executed && result.detail.includes('awaits owner-worktree-commit') ? 'awaiting-harvest'
+      : result.executed ? 'review-requested' : 'review-request-failed', result.detail, true);
   };
 
   // Adoption is a first judgement for the current head, even when the implementation run
@@ -938,6 +989,21 @@ function recordMove(statePath: string, cardId: string, runId: string | undefined
   } catch { /* recordLiveMoveHistory 는 스스로 관측한다 */ }
 }
 
+function harvestReviewPending(card: TaskCard, pr: number): boolean {
+  if (card.status !== 'launched' || typeof card.pr !== 'object' || card.pr.number !== pr || !card.pr.url || !card.runId) return false;
+  const latest = card.history.filter(entry => (entry.event === 'review-skipped-harvest' || entry.event === 'review-harvest-reached')
+    && entry.pr === pr && typeof entry.head === 'string' && /^[a-f0-9]{40}$/i.test(entry.head)
+    && entry.runId === card.runId).at(-1);
+  return !!latest && !(card.reviewRequests ?? []).some(entry => entry.pr === pr && sameHead(entry.head, latest.head!));
+}
+
+function pendingOwnerHarvest(card: TaskCard, pr: number): { head: string } | undefined {
+  if (!harvestReviewPending(card, pr)) return undefined;
+  const latest = card.history.filter(entry => entry.event === 'review-skipped-harvest' && entry.pr === pr
+    && entry.runId === card.runId && typeof entry.head === 'string' && /^[a-f0-9]{40}$/i.test(entry.head)).at(-1);
+  return latest?.effect === 'wait' ? { head: latest.head! } : undefined;
+}
+
 /** 재판정 대상 카드 — 기존 리뷰 또는 HQ 가 종결 원장을 검증할 원격 부모 카드. */
 export function rejudgeCandidates(tasks: Readonly<Record<string, TaskCard>>, opts: {
   now?: Date; maxAgeHours?: number; onAgeSkip?: (card: TaskCard, ageHours: number | null) => void;
@@ -949,6 +1015,7 @@ export function rejudgeCandidates(tasks: Readonly<Record<string, TaskCard>>, opt
   return Object.values(tasks).filter((card) => {
     const pr = cardPrNumber(card);
     const eligible = pr !== undefined && !boundPrTerminal(card) && ((card.reviewRequests ?? []).some((entry) => entry.pr === pr)
+      || (pr !== undefined && harvestReviewPending(card, pr))
       || (card.status === 'launched' && card.taLand === true && ((!!card.parentHost && !!card.runId && !!card.runChildId)
         || (card.adoptedPr?.pr === pr && typeof card.pr === 'object' && !!card.pr.url && sameUrl(card.adoptedPr.url, card.pr.url)))));
     if (!eligible) return false;

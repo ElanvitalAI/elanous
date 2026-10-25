@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { acquireOpSeatFlock, defaultResyncRun, opSeatFlockPath, opSeatLockRoot, probeReleaseRun, releaseWindowState, resyncTickWithReleaseProbe, stewardResyncRepoRoot } from './resync-tick.js';
+import { rejudgeTick } from './rejudge-tick.js';
 import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -49,6 +50,54 @@ test('logging failure reports a failed tick after resync instead of a success re
 });
 
 function resyncPendingPathForTest(): string { return join(tmpdir(), 'resync-tick-test-pending-unused.json'); }
+
+test('SMART-MERGE-REJUDGE-RECOVERY: 판정: pending 기록 실패 시험에서 실제 새 head로 same-tick rejudge 요청 1회, 누락 0', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resync-pending-fail-'));
+  try {
+    // The primary marker cannot be written: a directory sits where the JSON file belongs (writeFileSync → EISDIR).
+    const pendingPath = join(dir, 'steward', 'resync-pending.json');
+    mkdirSync(pendingPath, { recursive: true });
+    const summary = { candidates: 2, tried: 1, saved: 1, savedRatio: 0.5 };
+    const rows: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const errors: string[] = [];
+    const oldError = console.error;
+    console.error = text => { errors.push(String(text)); };
+    let result: Awaited<ReturnType<typeof resyncTickWithReleaseProbe>>;
+    try {
+      result = await resyncTickWithReleaseProbe(async () => summary, (event, data) => rows.push({ event, data }), pendingPath, () => 'idle', () => 'outside');
+    } finally { console.error = oldError; }
+    // The completed push survives the record failure: the tick still reports the real new head.
+    expect(result).toEqual({ decision: 'ran', summary });
+    // The resync-tick ledger row shape is unchanged — the failure is not folded into the row.
+    expect(rows).toEqual([{ event: 'resync-tick', data: { decision: 'ran', summary } }]);
+    // The record failure is its own observable line, and the recovery marker carries the same { savedAt } shape.
+    expect(errors.some(line => line.startsWith('steward resync: pending record write failed — '))).toBe(true);
+    const { resyncPendingRecoveryPath } = await import('./resync-tick.js');
+    const recoveryPath = resyncPendingRecoveryPath(pendingPath);
+    expect(errors).toContain(`steward resync: pending record recovered at ${recoveryPath}`);
+    const savedAt = (JSON.parse(readFileSync(recoveryPath, 'utf8')) as { savedAt: string }).savedAt;
+    expect(Date.parse(savedAt)).toBeGreaterThan(0);
+
+    // Same-tick rejudge consumer: the stamp is one minute old (inside the 15-minute cadence), so only a fresh
+    // pending marker can make this tick due — running at all proves the new head was read, request 1 · missing 0.
+    const startedAt = new Date(Date.now() - 60_000).toISOString();
+    const stampPath = join(dir, 'steward', 'rejudge-tick.json');
+    writeFileSync(stampPath, JSON.stringify({ startedAt }));
+    expect(Date.parse(savedAt)).toBeGreaterThan(Date.parse(startedAt));
+    let requests = 0;
+    const rejudge = await rejudgeTick({
+      now: () => new Date(),
+      config: () => ({ rejudgeEveryMinutes: 15 }),
+      load: () => 0,
+      stampPath,
+      pendingPath,
+      run: async () => { requests += 1; return { code: 0, stdout: '[{"card":"PR-1","decision":"keep"}]', stderr: '', timedOut: false }; },
+      log: () => {},
+    });
+    expect(rejudge.decision).toBe('ran');
+    expect(requests).toBe(1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('installed-style non-git cwd still passes the registered OP seat to live resync', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'resync-non-git-cwd-'));

@@ -2,6 +2,7 @@ import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-l
 import { debug } from '../debug/log.js';
 import { assessDraftTriage, decideDraft, draftClaimComment, draftClaimState, draftReleaseComment, laterMergedTwins, sameGoalPr, PROTECTED_LABELS, type DraftTriageAssessment, type DraftTriagePr, type DraftTriageReviewState } from './draft-triage-rules.js';
 import { cellIdFromBody } from '../pr-tool/census.js';
+import { RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { cardPrNumber, draftTaskOwner, type TaskCard } from '../task-agent/task-hand.js';
 import type { PrTerminalRecord } from './draft-residue.js';
 import { branchLineageSlug } from '../cli/pr-lineage.js';
@@ -13,6 +14,7 @@ export interface SweepDraft extends DraftTriagePr {
   readonly createdAt: string;
   /** Last PR update (push, label, comment). Missing ⇒ no idle-based close; merged twins can still close. */
   readonly updatedAt?: string;
+  readonly headSha?: string;
   readonly runId?: string | null;
 }
 
@@ -26,17 +28,22 @@ export interface SweepMergedPr extends DraftTriagePr {
 export interface DraftSweepAdapters {
   /** Each call returns one complete page; a rejection must not be mistaken for an empty page. */
   listDrafts(page: number, perPage: number, repository: string): Promise<readonly SweepDraft[]>;
+  /** Optional completeness of a bounded inventory; a partial inventory can inform dry-run only. */
+  inventoryStatus?(): Promise<{ complete: boolean; reason?: string }>;
   /** Head commit time is fetched only for explicit triage, where it gates idle/close recommendations. */
   getHeadCommitTime?(repository: string, number: number): Promise<string | undefined>;
   listMerged(page: number, perPage: number, repository: string): Promise<readonly SweepMergedPr[]>;
   /** Complete closed PR inventory for the creation cohort (including closed without merge). */
   listRecentClosed?(repository: string, createdSince: Date): Promise<readonly SweepMergedPr[]>;
   /** Undefined means no run assessment; a merged twin or 24h idle draft can still authorize a close. */
-  getRunStatus(draft: SweepDraft, repository: string): Promise<string | undefined>;
+  /** Intentionally needs identity only: adapters must not couple sweep status lookup to presentation fields. */
+  getRunStatus(draft: Pick<SweepDraft, 'number' | 'branch' | 'runId'>, repository: string): Promise<string | undefined>;
   /** Undefined means liveness could not be established. */
   listLiveBranches(repository: string): Promise<ReadonlySet<string> | undefined>;
   setLabels(repository: string, number: number, change: { add: string; remove: readonly string[] }): Promise<void>;
   closeDraft(repository: string, number: number): Promise<void>;
+  /** Minimal live identity check used by snapshot apply; no repository-wide inventory is read. */
+  getDraftSnapshot?(repository: string, number: number): Promise<DraftSweepSnapshot | undefined>;
   /** Resolve the latest claim comment owner; a failed lookup must not authorize a close. */
   getClaimOwner?(repository: string, number: number): Promise<string | undefined>;
   /** Current owner, accounting for a later claim release; only draft metrics need this distinction. */
@@ -71,7 +78,28 @@ export interface DraftSweepAdapters {
    * Must reject when the run could not be stopped — the draft is then neither labelled nor closed.
    * Absent ⇒ a live duplicate is kept, never closed.
    */
-  supersedeRun?(draft: SweepDraft, repository: string, newer: SweepDraft): Promise<void>;
+  /** Same minimal identity contract as getRunStatus; stopping authority is scoped to the selected run pair. */
+  supersedeRun?(draft: Pick<SweepDraft, 'number' | 'branch' | 'runId'>, repository: string,
+    newer: Pick<SweepDraft, 'number' | 'branch' | 'runId'>): Promise<void>;
+}
+
+export interface DraftSweepSnapshot {
+  readonly number: number;
+  readonly state: 'open' | 'closed';
+  readonly draft: boolean;
+  readonly headSha: string;
+  readonly branch: string;
+  readonly updatedAt: string;
+  readonly labels: readonly string[];
+}
+
+export interface DraftSweepApplyPlan {
+  readonly version: 1;
+  readonly closeCap: number;
+  readonly closeCapSource: DraftSweepCloseCapSource;
+  readonly entries: readonly (DraftSweepEntry & { readonly headSha: string; readonly branch: string; readonly runId?: string;
+    readonly stopRunRequired?: boolean; readonly supersedeNewer?: { readonly number: number; readonly branch: string; readonly runId?: string };
+    readonly updatedAt: string; readonly labels: readonly string[] })[];
 }
 
 /** Review PASS and gate posture used only by the daily old-draft count. */
@@ -95,6 +123,10 @@ export interface DraftSweepOptions {
   alreadyClosed?: number;
   /** Include evidence-backed next-action recommendations in JSON output; never authorizes writes. */
   includeTriage?: boolean;
+  /** Build a frozen apply plan from a complete dry-run classification. */
+  includeApplyPlan?: boolean;
+  /** Apply exactly this plan after live identity preflight. */
+  applyPlan?: DraftSweepApplyPlan;
 }
 
 export interface DraftSweepEntry {
@@ -113,6 +145,7 @@ export interface DraftSweepResult {
   apply: boolean;
   complete: boolean;
   entries: DraftSweepEntry[];
+  applyPlan?: DraftSweepApplyPlan;
   triage?: { entries: Array<{ number: number; assessment: DraftTriageAssessment }>; counts: Record<string, number> };
   counts: Record<string, number>;
   /** Drafts whose run could not be observed from here (kept, or closed by the idle rule). */
@@ -260,9 +293,26 @@ export async function collectDraftMetrics(repository: string, adapters: Pick<Dra
       || (pr.mergedAt !== undefined && !Number.isFinite(Date.parse(pr.mergedAt)))
       || !Array.isArray(pr.labels) || pr.labels.some((name) => typeof name !== 'string')))
     throw new Error('Incomplete draft metric inventory');
-  if (new Set(drafts.map((pr) => pr.number)).size !== drafts.length
-    || new Set(closed.map((pr) => pr.number)).size !== closed.length) throw new Error('Duplicate draft metric PR');
-  const open = drafts.filter(harnessDraft);
+  // Fold each source independently; a merged closed row outranks an unmerged snapshot.
+  // The serialized row is a stable tie-breaker when timestamps match, regardless of page order.
+  const fold = <T extends { number: number }>(rows: readonly T[], rank: (pr: T) => readonly number[]): T[] => {
+    const byNumber = new Map<number, T>();
+    for (const row of rows) {
+      const prior = byNumber.get(row.number);
+      if (prior) {
+        const a = rank(row), b = rank(prior);
+        const order = a.reduce((result, value, index) => result || value - b[index]!, 0);
+        if (order < 0 || (order === 0 && JSON.stringify(row) <= JSON.stringify(prior))) continue;
+      }
+      byNumber.set(row.number, row);
+    }
+    return [...byNumber.values()];
+  };
+  const uniqueDrafts = fold(drafts, (pr) => [Number.isFinite(Date.parse(pr.updatedAt ?? ''))
+    ? Date.parse(pr.updatedAt!) : Date.parse(pr.createdAt), Date.parse(pr.createdAt)]);
+  const uniqueClosed = fold(closed, (pr) => [pr.mergedAt ? 1 : 0,
+    pr.mergedAt ? Date.parse(pr.mergedAt) : Date.parse(pr.createdAt!), Date.parse(pr.createdAt!)]);
+  const open = uniqueDrafts.filter(harnessDraft);
   const owners = await Promise.all(open.map(async (draft) => {
     if (!adapters.getActiveClaimOwner) throw new Error('Draft owner lookup unavailable');
     const owner = await adapters.getActiveClaimOwner(repository, draft.number);
@@ -270,9 +320,12 @@ export async function collectDraftMetrics(repository: string, adapters: Pick<Dra
     return owner;
   }));
   const cohort = [...open.filter((pr) => Date.parse(pr.createdAt) >= cutoff && Date.parse(pr.createdAt) <= matured),
-    ...closed.filter((pr) => (pr.branch.startsWith('self-impl/') || pr.labels!.some((name) => name.startsWith('elanous:')))
+    ...uniqueClosed.filter((pr) => (pr.branch.startsWith('self-impl/') || pr.labels!.some((name) => name.startsWith('elanous:')))
       && pr.createdAt && Date.parse(pr.createdAt) >= cutoff && Date.parse(pr.createdAt) <= matured)];
   if (new Set(cohort.map((pr) => pr.number)).size !== cohort.length) throw new Error('Overlapping draft metric inventory');
+  const folded = drafts.length - uniqueDrafts.length + closed.length - uniqueClosed.length;
+  if (folded) try { debug.log('drafts.metrics', 'duplicate-pr-folded', { repository, drafts: drafts.length - uniqueDrafts.length,
+    closed: closed.length - uniqueClosed.length, folded }); } catch { /* fail-soft */ }
   const converted48h = cohort.filter((pr) => 'mergedAt' in pr && typeof pr.mergedAt === 'string'
     && Date.parse(pr.mergedAt) >= Date.parse(pr.createdAt!) && Date.parse(pr.mergedAt) <= clock
     && Date.parse(pr.mergedAt) - Date.parse(pr.createdAt!) <= 48 * 3_600_000).length;
@@ -770,6 +823,17 @@ function harnessDraft(draft: SweepDraft): boolean {
   return draft.branch.startsWith('self-impl/') || draft.labels.some((name) => name.startsWith('elanous:'));
 }
 
+/** A prior final event is authoritative only when the branch is not observably live. */
+function isLiveDraftRun(status: string | undefined, branch: string, liveBranches: ReadonlySet<string>): boolean {
+  return status === 'running' || status === 'probable-running'
+    || (status !== 'self-implement.result final' && liveBranches.has(branch));
+}
+
+function isKnownSweepCloseReason(reason: string): boolean {
+  return ['superseded-by #', 'duplicate-of-open #', 'claim-expired', 'stale-unobserved', 'harvest-expired', 'stale-ended-run']
+    .some((prefix) => reason === prefix || reason.startsWith(prefix));
+}
+
 /**
  * The newest open draft of the same goal lineage that was created strictly after `draft` — a rerun
  * (e.g. a forced requeue) of the same goal. Reads only the branch, so a draft with no task card still has a lineage.
@@ -835,8 +899,130 @@ export function draftSweepDaily(
   return { date: now.toISOString().slice(0, 10), over24h, closable, harvestable, blocked };
 }
 
+/** Validate serialized plans at the CLI boundary; malformed or ambiguous plans must never reach a writer. */
+export function validateDraftSweepApplyPlan(value: unknown): DraftSweepApplyPlan {
+  if (!value || typeof value !== 'object') throw new Error('invalid draft sweep apply plan');
+  const plan = value as Partial<DraftSweepApplyPlan>;
+  if (plan.version !== 1 || !validCloseCap(plan.closeCap)
+    || !['flag', 'config', 'default'].includes(String(plan.closeCapSource)) || !Array.isArray(plan.entries)) {
+    throw new Error('invalid draft sweep apply plan header');
+  }
+  const seen = new Set<number>();
+  for (const entry of plan.entries) {
+    if (!entry || !Number.isSafeInteger(entry.number) || entry.number! < 1 || seen.has(entry.number!)
+      || !['keep', 'close', 'report'].includes(entry.action) || typeof entry.reason !== 'string'
+      || (entry.action === 'close' && !isKnownSweepCloseReason(entry.reason))
+      || typeof entry.headSha !== 'string' || !/^[a-f0-9]{40}$/i.test(entry.headSha)
+      || typeof entry.branch !== 'string' || !entry.branch
+      || (entry.statusLabel !== undefined && !stateLabels.some((state) => state.name === entry.statusLabel))
+      || (entry.supersedeNewer !== undefined && (!Number.isSafeInteger(entry.supersedeNewer.number)
+        || entry.supersedeNewer.number < 1 || entry.supersedeNewer.number === entry.number
+        || typeof entry.supersedeNewer.branch !== 'string' || !entry.supersedeNewer.branch
+        || (entry.supersedeNewer.runId !== undefined && typeof entry.supersedeNewer.runId !== 'string')))
+      || typeof entry.updatedAt !== 'string' || !Number.isFinite(Date.parse(entry.updatedAt))
+      || !Array.isArray(entry.labels) || entry.labels.some((name: unknown) => typeof name !== 'string')
+      || (entry.stopRunRequired === true && (!entry.runId || !entry.supersedeNewer?.runId))
+      || (entry.supersedeNewer !== undefined && entry.stopRunRequired !== true)) {
+      throw new Error('invalid draft sweep apply plan entry');
+    }
+    seen.add(entry.number!);
+  }
+  const closes = plan.entries.filter((entry) => entry.action === 'close').length;
+  if (closes > plan.closeCap!) throw new Error('draft sweep apply plan exceeds close cap');
+  return value as DraftSweepApplyPlan;
+}
+
+async function applyDraftSweepPlan(repository: string, adapters: DraftSweepAdapters, planInput: DraftSweepApplyPlan): Promise<DraftSweepResult> {
+  const plan = validateDraftSweepApplyPlan(planInput);
+  const result: DraftSweepResult = { repository, apply: true, complete: false, entries: plan.entries.map(({ number, action, reason, statusLabel }) => ({
+    number, action, reason, ...(statusLabel ? { statusLabel } : {}), applied: false,
+  })), counts: {}, closeCap: plan.closeCap, closeCapSource: plan.closeCapSource };
+  const writable = plan.entries.filter((entry) => entry.action !== 'report' && (entry.action === 'close' || Boolean(entry.statusLabel)));
+  const preflightEntries = new Map(writable.map((entry) => [entry.number, entry]));
+  for (const entry of writable) if (entry.supersedeNewer) {
+    const newer = plan.entries.find((candidate) => candidate.number === entry.supersedeNewer!.number);
+    if (!newer) { result.error = `snapshot apply plan missing newer PR #${entry.supersedeNewer.number}`; return result; }
+    preflightEntries.set(newer.number, newer);
+  }
+  if (!adapters.getDraftSnapshot) { result.error = 'draft snapshot preflight unavailable'; return result; }
+  // Read and validate every target before the first mutation: one stale item blocks the whole write batch.
+  const snapshots = await mapBounded([...preflightEntries.values()], DRAFT_SWEEP_CONCURRENCY, async (entry) => ({ entry,
+    current: await adapters.getDraftSnapshot!(repository, entry.number) }));
+  const drift = snapshots.find(({ entry, current }) => !current || current.number !== entry.number || current.state !== 'open'
+    || current.draft !== true || current.headSha !== entry.headSha || current.branch !== entry.branch || current.updatedAt !== entry.updatedAt
+    || current.labels.length !== entry.labels.length || [...current.labels].sort().join('\0') !== [...entry.labels].sort().join('\0'));
+  if (drift) {
+    const number = drift.entry.number;
+    result.error = `draft snapshot drift at #${number}; no writes performed`;
+    for (const entry of result.entries) if (writable.some((item) => item.number === entry.number)) entry.error = result.error;
+    return result;
+  }
+  const stopPlans = writable.filter((entry) => entry.stopRunRequired === true);
+  const stoppedRuns = new Set<number>();
+  if (stopPlans.length) {
+    if (!adapters.supersedeRun || !adapters.getRunStatus || !adapters.listLiveBranches
+      || stopPlans.some((entry) => !entry.runId || !entry.supersedeNewer?.runId)) {
+      result.error = 'snapshot apply cannot verify live duplicate run ownership';
+      return result;
+    }
+    const branches = await adapters.listLiveBranches(repository);
+    if (!branches) { result.error = 'snapshot apply cannot verify branch liveness'; return result; }
+    const liveChecks = await Promise.all(stopPlans.map(async (entry) => {
+      const newer = entry.supersedeNewer!;
+      const [oldStatus, newerStatus] = await Promise.all([
+        adapters.getRunStatus!({ number: entry.number, branch: entry.branch, runId: entry.runId }, repository),
+        adapters.getRunStatus!({ number: newer.number, branch: newer.branch, runId: newer.runId }, repository),
+      ]);
+      return { entry, newer, oldStatus, newerStatus, ok: isLiveDraftRun(oldStatus, entry.branch, branches)
+        && isLiveDraftRun(newerStatus, newer.branch, branches) };
+    }));
+    const invalid = liveChecks.find((check) => !check.ok);
+    if (invalid) { result.error = `live duplicate run state drift at #${invalid.entry.number}; no PR writes performed`; return result; }
+    for (const check of liveChecks) {
+      try {
+        await adapters.supersedeRun!({ number: check.entry.number, branch: check.entry.branch, runId: check.entry.runId }, repository,
+          { number: check.newer.number, branch: check.newer.branch, runId: check.newer.runId });
+        stoppedRuns.add(check.entry.number);
+      } catch (error) { result.error = `could not stop planned run at #${check.entry.number}: ${sweepFailureReason(error)}`; return result; }
+    }
+  }
+  for (const { entry } of snapshots) {
+    const output = result.entries.find((item) => item.number === entry.number)!;
+    let mutated = false;
+    try {
+      if (entry.action === 'close' && entry.reason.startsWith('claim-expired')) {
+        // A complete comment inventory with no owner marker is valid; incomplete/unreadable inventories throw.
+        // The owner value itself is not a close criterion; classification and updatedAt preflight own that decision.
+        if (!adapters.getClaimOwner) throw new Error('claim owner lookup unavailable');
+        await adapters.getClaimOwner(repository, entry.number);
+      }
+      if (entry.statusLabel) {
+        const remove = stateLabels.filter((item) => entry.labels.includes(item.name) && item.name !== entry.statusLabel).map((item) => item.name);
+        if (!entry.labels.includes(entry.statusLabel) || remove.length) {
+          await adapters.setLabels(repository, entry.number, { add: entry.statusLabel, remove });
+          mutated = true;
+        }
+      }
+      if (entry.action === 'close') {
+        await closeSweptDraft(adapters, repository, entry.number, entry.reason, () => { mutated = true; });
+      }
+      output.applied = mutated;
+    } catch (error) {
+      if ((mutated && entry.action === 'close') || stoppedRuns.has(entry.number)) output.partialApplied = true;
+      output.error = sweepFailureReason(error);
+      result.error = `snapshot apply failed at #${entry.number}: ${output.error}`;
+      return result;
+    }
+  }
+  result.complete = true;
+  result.closed = plan.entries.filter((entry) => entry.action === 'close').length;
+  for (const entry of result.entries) result.counts[entry.reason] = (result.counts[entry.reason] ?? 0) + 1;
+  return result;
+}
+
 /** A failed inventory or liveness lookup is never treated as proof that a draft can be closed. */
-export async function runDraftSweep({ repository, adapters, apply = false, now = new Date(), closeCap: requestedCap, closeCapSource: requestedSource, alreadyClosed = 0, includeTriage = false }: DraftSweepOptions): Promise<DraftSweepResult> {
+export async function runDraftSweep({ repository, adapters, apply = false, now = new Date(), closeCap: requestedCap, closeCapSource: requestedSource, alreadyClosed = 0, includeTriage = false, includeApplyPlan = false, applyPlan }: DraftSweepOptions): Promise<DraftSweepResult> {
+  if (applyPlan) return applyDraftSweepPlan(repository, adapters, applyPlan);
   const validCap = validCloseCap(requestedCap);
   const closeCap = validCap ?? DRAFT_SWEEP_CLOSE_CAP;
   const closeCapSource: DraftSweepCloseCapSource = validCap === undefined ? 'default' : requestedSource ?? 'flag';
@@ -871,6 +1057,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   let drafts: SweepDraft[] = [];
   let merged: SweepMergedPr[] = [];
   let liveBranches: ReadonlySet<string> | undefined;
+  let inventoryStatus: { complete: boolean; reason?: string } = { complete: true };
   try {
     [drafts, merged, liveBranches] = await Promise.all([
       collectPages((page, size) => adapters.listDrafts(page, size, repository)),
@@ -880,6 +1067,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     if (!liveBranches) throw new Error('Branch liveness unavailable');
     if (drafts.some((pr) => !Number.isInteger(pr.number) || !pr.branch || !Array.isArray(pr.labels) || !Number.isFinite(Date.parse(pr.createdAt)))
       || merged.some((pr) => !Number.isInteger(pr.number) || !pr.branch)) throw new Error('Invalid PR inventory');
+    inventoryStatus = await adapters.inventoryStatus?.() ?? inventoryStatus;
   } catch (error) {
     timing('inventory', drafts.length + merged.length, 'failed');
     result.error = sweepFailureReason(error);
@@ -887,6 +1075,10 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     return finish();
   }
   timing('inventory', drafts.length + merged.length);
+  if (!inventoryStatus.complete && apply) {
+    result.error = inventoryStatus.reason ?? 'PR inventory incomplete';
+    return finish();
+  }
   for (const pr of drafts) if (pr.runId) runIdByNumber.set(pr.number, pr.runId);
   const statuses = new Map<number, string | undefined>();
   const finality = new Map<number, boolean | undefined>();
@@ -926,7 +1118,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
     timing('review-gate', censused.length);
   }
-  result.daily = draftSweepDaily(drafts, merged, now, reviewGate);
+  if (inventoryStatus.complete) result.daily = draftSweepDaily(drafts, merged, now, reviewGate);
   // Card and terminal inventories are observations, not closing authority. An unreadable source cannot mint a claim.
   let cards: readonly TaskCard[] | undefined;
   let terminals: readonly PrTerminalRecord[] | undefined;
@@ -999,7 +1191,17 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       const cellTerminals = terminals?.filter((terminal) => terminal.repository === repository && terminal.prNumber === draft.number);
       const activeOwnerObservation = ownerCard ? undefined : activeOwnerObservations.get(draft.number);
       const posture = reviewGate.get(draft.number);
+      const replacement = identity.cellId && identity.checks.provenance.state === 'yes'
+        ? merged.find((pr) => pr.number !== draft.number && cellIdFromBody(pr.body ?? '') === identity.cellId
+          && Number.isFinite(Date.parse(pr.mergedAt ?? '')) && Date.parse(pr.mergedAt!) > Date.parse(draft.createdAt)
+          && (pr.body ?? '').split(/\r?\n/).some((line) => line.trim() === `Supersedes: #${draft.number}`)) : undefined;
+      const lastFailure = cellTerminals?.filter((terminal) => terminal.terminalClass.startsWith('failed-')
+        && Number.isFinite(Date.parse(terminal.at)))
+        .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
+      const lastFailureTail = lastFailure?.hostRegateFailure?.detail ?? lastFailure?.stage ?? null;
       const assessment = assessDraftTriage({ draft, now, runStatus: statuses.get(draft.number),
+        ...(replacement ? { replacement: { number: replacement.number, evidence: `Supersedes: #${draft.number}` } } : {}),
+        lastFailureTail,
         ...(posture?.gate ? { gate: posture.gate } : {}),
         ...(posture?.triageReview ? { review: posture.triageReview } : {}),
         newerSameCellSameCard,
@@ -1013,12 +1215,14 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     for (const row of triageRows) triageCounts[row.assessment.nextAction] = (triageCounts[row.assessment.nextAction] ?? 0) + 1;
     result.triage = { entries: triageRows, counts: triageCounts };
   }
-  result.complete = true;
+  result.complete = inventoryStatus.complete;
+  if (!inventoryStatus.complete) result.error = inventoryStatus.reason ?? 'PR inventory incomplete';
   let closes = Number.isSafeInteger(alreadyClosed) && alreadyClosed > 0 ? alreadyClosed : 0;
   let unobserved = 0;
   let claimed = 0;
   let claimExpired = 0;
   const lineageCounts: DraftSweepLineageCounts = { closed: 0, harvestableClosed: 0, fallThrough: {} };
+  const stopRunPlans = new Map<number, { runId?: string; newer: { number: number; branch: string; runId?: string } }>();
   result.lineage = lineageCounts;
   // 칸-keyed closes this tick; published on `lineageCounts` only when the 칸 rule fires (existing shapes stay byte-identical).
   let cellClosed = 0;
@@ -1035,7 +1239,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     let claimPartialApplied = false;
     let partialClaimUnowned = false;
     let releasePending = false;
-    if (apply && harnessDraft(draft) && !draft.labels.some((name) => name === approvalLabel || name === keepLabel || name === releaseHoldLabel)
+    if (apply && harnessDraft(draft) && !draft.labels.some((name) => name === approvalLabel || name === keepLabel || name === releaseHoldLabel || name === RELEASE_PATH_LABEL)
       && stateLabels.filter((state) => draft.labels.includes(state.name)).length <= 1
       && !draft.labels.includes(supersededLabel)) {
       const logClaim = (event: 'claim-marked' | 'claim-released' | 'claim-skipped', owner: string | null, runId: string | null, reason: string) =>
@@ -1128,8 +1332,10 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       ...(claimWriteFailed ? { error: claimWriteError, ...(claimPartialApplied ? { partialApplied: true } : {}) } : {}) });
       continue;
     }
-    if (draft.labels.includes(releaseHoldLabel ?? '') || (!contradiction && draft.labels.includes(keepLabel ?? ''))) {
-      const held = draft.labels.includes(keepLabel ?? '') ? keepLabel : releaseHoldLabel;
+    if (draft.labels.includes(releaseHoldLabel ?? '') || draft.labels.includes(RELEASE_PATH_LABEL)
+      || (!contradiction && draft.labels.includes(keepLabel ?? ''))) {
+      const held = draft.labels.includes(keepLabel ?? '') ? keepLabel
+        : draft.labels.includes(RELEASE_PATH_LABEL) ? RELEASE_PATH_LABEL : releaseHoldLabel;
       record({ number: draft.number, action: 'keep', reason: `label:${held}`, applied: false });
       continue;
     }
@@ -1152,9 +1358,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       const base = decideDraft({ draft, runStatus, mergedTwins: merged, openDrafts: drafts, liveBranches,
         finalRunResult, ageHours: runStatus ? ageHours : idleHours });
       if (!base.reason.startsWith('label:') && !base.reason.startsWith('superseded-by #') && !base.reason.startsWith('duplicate-of-open #')) {
-        const live = (status: string | undefined, branch: string) => status === 'running' || status === 'probable-running'
-          || (status !== 'self-implement.result final' && liveBranches.has(branch));
-        const runLive = live(runStatus, draft.branch);
+        const runLive = isLiveDraftRun(runStatus, draft.branch, liveBranches);
         const lineageKey = branchLineageKey(draft.branch);
         const cellId = cellNewer ? cellIdFromBody(draft.body ?? '') : null;
         const duplicateOf = cellNewer ? `cell ${cellId}` : `lineage ${lineageKey}`;
@@ -1184,7 +1388,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
         else if (runLive && !adapters.supersedeRun) fallThrough('lineage-duplicate-run-live');
         // Safety (OP 10-11): a live run is stopped only when the newer run of the same lineage is itself live —
         // never trade a running attempt for one that already ended or was never observed running.
-        else if (runLive && !live(statuses.get(duplicateNewer.number), duplicateNewer.branch)) fallThrough('lineage-newer-run-not-live');
+        else if (runLive && !isLiveDraftRun(statuses.get(duplicateNewer.number), duplicateNewer.branch, liveBranches)) fallThrough('lineage-newer-run-not-live');
         else if (closes >= closeCap) {
           record({ number: draft.number, action: 'keep', reason: 'close-cap', applied: false });
           continue;
@@ -1208,6 +1412,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
             lineageCounts.closed += 1;
             if (harvestable) lineageCounts.harvestableClosed += 1;
             if (cellNewer) cellClosed += 1;
+            if (runLive) stopRunPlans.set(draft.number, { runId: draft.runId ?? undefined, newer: { number: duplicateNewer.number,
+              branch: duplicateNewer.branch, runId: duplicateNewer.runId ?? undefined } });
             const entry: DraftSweepEntry = { number: draft.number, action: 'close', reason, statusLabel: supersededLabel, applied: false };
             record(entry);
             if (!apply) continue;
@@ -1345,5 +1551,24 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   result.closed = closes - (Number.isSafeInteger(alreadyClosed) && alreadyClosed > 0 ? alreadyClosed : 0);
   result.claimed = claimed;
   result.claimExpired = claimExpired;
+  if (includeApplyPlan && !apply && result.complete) {
+    const byNumber = new Map(drafts.map((draft) => [draft.number, draft]));
+    const planEntries = result.entries.map((entry) => {
+      const draft = byNumber.get(entry.number);
+      if (!draft?.headSha || !draft.updatedAt || !Number.isFinite(Date.parse(draft.updatedAt))) {
+        throw new Error(`cannot freeze apply plan: missing head SHA or updatedAt for #${entry.number}`);
+      }
+      const stopRun = stopRunPlans.get(entry.number);
+      const newer = stopRun ? byNumber.get(stopRun.newer.number) : undefined;
+      if (stopRun && (!draft.runId || !newer?.runId || stopRun.runId !== draft.runId
+        || stopRun.newer.branch !== newer.branch || stopRun.newer.runId !== newer.runId)) {
+        throw new Error(`cannot freeze apply plan: live duplicate run identity incomplete for #${entry.number}`);
+      }
+      return { ...entry, headSha: draft.headSha, branch: draft.branch, ...(draft.runId ? { runId: draft.runId } : {}),
+        ...(stopRun ? { stopRunRequired: true, supersedeNewer: stopRun.newer } : {}),
+        updatedAt: draft.updatedAt, labels: [...draft.labels].sort() };
+    });
+    result.applyPlan = validateDraftSweepApplyPlan({ version: 1, closeCap, closeCapSource, entries: planEntries });
+  }
   return finish();
 }

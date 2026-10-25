@@ -191,6 +191,7 @@ async function openPickerHarness(opts: { overlayFrame: boolean }): Promise<Harne
       process.stdout.columns = c;
       process.stdout.rows = r;
       process.stdout.emit('resize');
+      await new Promise((resolve) => setTimeout(resolve, 20));
       await drain();
     },
     screen: async () => {

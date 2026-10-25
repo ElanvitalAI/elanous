@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { HqDeps } from '../hq/hq.js';
@@ -8,6 +8,7 @@ import { fileLeaseStore } from '../hq/lease.js';
 import { debug } from '../debug/log.js';
 import type { Checklist } from '../release-loop/checklist.js';
 import { registerReleaseCommands, type LandedButYellowDeps, type Runner } from './release-cli.js';
+import type { MergedPrRunner } from '../release-loop/landed-but-yellow.js';
 
 const mergedAt = '2026-10-04T00:00:00Z';
 const prs = [
@@ -21,7 +22,7 @@ function snapshot(version: string): Checklist {
 }
 
 type GhResult = { status: number; stdout: string; stderr: string };
-function harness(versions: string[], released = '0.2.12', runImpl?: (command: string, args: readonly string[]) => GhResult) {
+function harness(versions: string[], released = '0.2.12', runImpl?: (command: string, args: readonly string[]) => GhResult, runAsync?: MergedPrRunner, cacheFile?: string) {
   const logs: string[] = [], errors: string[] = [], stdout: string[] = [];
   const gh: string[] = [], checks: string[] = [];
   const added: Array<{ id: string; version: string; ref: string }> = [];
@@ -44,6 +45,8 @@ function harness(versions: string[], released = '0.2.12', runImpl?: (command: st
     checklist,
     now: () => new Date('2026-10-04T09:00:00Z'),
     run: ((command, args) => { gh.push(`${command} ${args.join(' ')}`); return runImpl ? runImpl(command, args) : { status: 0, stdout: JSON.stringify(prs), stderr: '' }; }) as Runner,
+    ...(runAsync ? { runAsync } : {}),
+    ...(cacheFile ? { mergedPrCacheFile: () => cacheFile } : {}),
     evidenceAdd: ((id, version, ref) => { added.push({ id, version, ref }); }) as NonNullable<LandedButYellowDeps['evidenceAdd']>,
   };
   // 본부 임대 없음(no-lease) = 쓰기 허용 — 시험이 실제 판정자(ssh)에 닿지 않게 빈 파일 원장을 준다(FENCE-CLI #23632).
@@ -183,6 +186,28 @@ describe('landed-but-yellow --open', () => {
       expect(JSON.parse(h.stdout.at(-1)!)).toEqual([{ id: 'CL-AUTO', ref: '#123' }]);
       expect(h.added).toEqual([]);
     } finally { h.restore(); }
+  });
+
+  test('GREEN-SCAN-LANDED-CACHE: 같은 --open --json 두 번째 호출은 gh 호출 0 · 결과 일치', async () => {
+    // One runner shared by both CLI calls, so the second call answers from the full-result cache.
+    let ghCalls = 0;
+    const runAsync: MergedPrRunner = async () => {
+      ghCalls++;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return { status: 0, stdout: JSON.stringify(prs), stderr: '' };
+    };
+    const cacheDir = mkdtempSync(join(tmpdir(), 'landed-open-cache-'));
+    const h = harness(['0.2.13', '0.2.15'], '0.2.12', undefined, runAsync, join(cacheDir, 'cache.json'));
+    try {
+      await h.run('--open', '--json');
+      const first = h.stdout.at(-1)!;
+      expect(ghCalls).toBe(1);
+      await h.run('--open', '--json');
+      expect(ghCalls).toBe(1); // 두 번째 호출의 gh 호출 수 0
+      expect(h.stdout.at(-1)!).toBe(first); // 두 결과 일치
+      const rows = JSON.parse(first) as Array<{ version: string; rows: unknown[] }>;
+      expect(rows.map((entry) => entry.version)).toEqual(['0.2.13', '0.2.15']);
+    } finally { h.restore(); rmSync(cacheDir, { recursive: true, force: true }); }
   });
 
   test('같은 판·같은 owner 에서 --version 과 --open 이 같은 병합 PR 창과 같은 결과 집합을 낸다(칸 updatedAt 보다 오래 병합된 PR 포함)', async () => {

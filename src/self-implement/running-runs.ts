@@ -246,6 +246,8 @@ export interface RunningRunsLedgerObservation {
 
 export interface RunningRunsQueryObservation {
   readonly caller?: string | null;
+  /** ID 조회(src/index.ts `self running-runs [runId]`가 넘겨준 runIds)가 요청한 runId 들 — 전체 관측 질의에는 이 키가 없다. */
+  readonly requestedRunIds?: readonly string[];
   readonly cacheHits?: number;
   readonly cacheMisses?: number;
   readonly elapsedMs: number;
@@ -478,6 +480,9 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
   const processStartTime = deps.processStartedAt ?? processStartedAt;
   const observeQuery = deps.observeQuery ?? ((observation: RunningRunsQueryObservation) => debug.log('self-implement.running-runs', 'query', observation));
   const startedAt = Date.now();
+  // ID 조회 배선 — src/index.ts의 `self running-runs [runId]` 액션이 넘겨준 options.runIds 를 이 조회가 소비한다:
+  // 정의된 runIds 는 연합 원장 질의 전달·엔트리·pty 관측을 모두 그 runId 들로 한정한다.
+  const requestedRunIdSet = options.runIds === undefined ? undefined : new Set(options.runIds);
   let ledgerDirectoryCollectionElapsedMs = 0;
   let ledgerReadElapsedMs = 0;
   let screenProcessReadElapsedMs = 0;
@@ -521,7 +526,15 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     } finally {
       screenProcessReadElapsedMs = Date.now() - screenProcessReadStartedAt;
     }
-    const runIds = [...new Set([...ledger.entries.map((entry) => entry.runId), ...pty.refs.flatMap((ref) => ref.runId ? [ref.runId] : [])])];
+    // ID 조회 소비 지점 — deps·원장 질의가 runIds를 무시하고 넓게 관측해도 결과를 요청한 runId들로 한정하고,
+    // 일치하는 런이 없으면 entries는 []다(부분 관측 계수는 원장·pty 판독성 관측을 그대로 보존한다).
+    const scopedLedgerEntries = requestedRunIdSet === undefined
+      ? ledger.entries
+      : ledger.entries.filter((entry) => requestedRunIdSet.has(entry.runId));
+    const scopedPty = requestedRunIdSet === undefined
+      ? pty
+      : { ...pty, refs: pty.refs.filter((ref) => typeof ref.runId === 'string' && requestedRunIdSet.has(ref.runId)) };
+    const runIds = [...new Set([...scopedLedgerEntries.map((entry) => entry.runId), ...scopedPty.refs.flatMap((ref) => ref.runId ? [ref.runId] : [])])];
     let observedPhases: ObservedRunPhases = { events: [], targetCount: 0, unreadableTargets: [] };
     const stageStoreReadStartedAt = Date.now();
     try {
@@ -534,7 +547,7 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
       discardedNonStageEventCount = observedPhases.discardedNonStageEventCount ?? 0;
     }
     const phaseObservation = phaseObservationFor(observedPhases);
-    const result = assessRunningRuns(ledger.entries, pty, ledger, observedPhases.events, phaseObservation);
+    const result = assessRunningRuns(scopedLedgerEntries, scopedPty, ledger, observedPhases.events, phaseObservation);
     const unreadable: UnreadableRunningRunsLedger[] = [...(result.unreadable ?? [])].filter((entry) => entry.reason === 'unreadable-ledger');
     const failedDirectories = hasUnreadableLedgerObservation(ledger)
       ? collectedLedgerDirectories.filter((dir) => !ledger.ledgerDirectories.includes(dir))
@@ -571,7 +584,7 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     let lingeringLaunchParents: LingeringLaunchParentAssessment;
     try {
       lingeringLaunchParents = assessLingeringLaunchParents(
-        ledger.entries, loadRun, isProcessAlive, processStartTime, ledger,
+        scopedLedgerEntries, loadRun, isProcessAlive, processStartTime, ledger,
       );
     } finally {
       launchParentClassificationElapsedMs = Date.now() - launchParentClassificationStartedAt;
@@ -581,6 +594,7 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     try {
       observeQuery({
         caller: options.caller ?? null,
+        ...(options.runIds === undefined ? {} : { requestedRunIds: options.runIds }),
         cacheHits,
         cacheMisses,
         elapsedMs: Date.now() - startedAt,

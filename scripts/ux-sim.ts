@@ -69,7 +69,7 @@ if (argv[0] === 'emit') {
 }
 
 // ── N03 키 순서열 (TUI-NEXT E4) — 진짜 PTY 에 next TUI 를 fake LLM 으로 띄워 단계별 화면 ⊕ 격리 우주 logs ──
-//   bun scripts/ux-sim.ts seat-seq <next-new-session|next-compact|next-queue|next-wakeup|next-paste|next-goal-continue|next-goal-interim|next-proactive-continue|classic-400-heal|classic-400-exhausted|classic-seat-boot|classic-typing-lag|classic-wakeup|classic-paste|classic-goal-continue|classic-goal-interim|classic-orphan-autostop> --root <빈 폴더> [--installed | --executable <bun> --entry <elanous.mjs>] [--expect-sha <sha256>] [--json]
+//   bun scripts/ux-sim.ts seat-seq <next-new-session|next-compact|next-queue|next-wakeup|next-paste|next-at-picker|next-goal-continue|next-goal-interim|next-proactive-continue|classic-400-heal|classic-400-exhausted|classic-seat-boot|classic-typing-lag|classic-wakeup|classic-paste|classic-goal-continue|classic-goal-interim|classic-orphan-autostop> --root <빈 폴더> [--installed | --executable <bun> --entry <elanous.mjs>] [--expect-sha <sha256>] [--json]
 //   기본 실행 = 이 트리 bin/elanous.mjs ⊕ 이 bun. --installed = ~/.local/share/elanous/current 의 elanous.mjs.
 //   rc: 0 = 모든 checks 참 · 1 = 거짓이 있다 · 2 = 인자 오류
 if (argv[0] === 'seat-seq') {

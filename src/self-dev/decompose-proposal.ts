@@ -276,7 +276,7 @@ export interface ShadowFirstPlan {
 /** shadow-first 집행 판정. ⛔ 「고칠 수 없음」과 「거부」를 같은 값으로 접지 않는다. */
 export type ShadowFirstDispatch =
   | { kind: 'ok'; pieces: DecomposePiece[]; shadowFirst?: ShadowFirstPlan }
-  | { kind: 'rejected'; reason: 'dangling-dependsOn'; danglingIds: string[] };
+  | { kind: 'rejected'; reason: 'dangling-dependsOn' | 'shadow-depends-on-live' | 'shadow-depends-on-self'; detail: string[] };
 
 /**
  * ⭐⭐⭐ shadow 관측이 live 발사보다 «앞선다» — AUTHOR-SHADOW-FIRST-SPLIT ② (#26884 수확).
@@ -290,13 +290,21 @@ export type ShadowFirstDispatch =
  *     없는 조각을 선행으로 단 제안은 승격하지 않는다(`danglingDependsOn` 을 세는 것만으로는 live 발사를 못 막는다).
  *   ⓑ shadow 조각이 «둘» 이상 → `kind: 'ok'` 지만 «가드 없음» — 어느 쪽이 관측인지 모르는 제안은 고치지 않는다.
  *
- * ⭐ 선행 간선은 «실제 발사 지점»(다른 조각이 의존하지 않는 끝 조각)에만 건다 — 중간 조각은
- *   자기 선행 순서만 들고 있으면 되고, 그 것까지 shadow 에 매달면 계획이 사슬로 납작해진다.
- *   shadow 조각은 언제나 맨 앞으로 올라오고, 이미 shadow 를 선행으로 가진 조각은 건드리지 않는다.
+ * ⭐ 모든 live 조각이 shadow 를 선행으로 가져야 관측이 어떤 실행 순서보다 먼저다.
+ *   live 조각 사이의 기존 의미 의존성은 그대로 둔다. shadow 가 live 조각에 의존하는 경우는
+ *   이 순서와 모순이므로 거부한다.
  *
  * 순수 함수다 — 시계·파일·프로세스를 안 만진다. 입력 조각은 «변형하지 않는다».
  */
 export function planShadowFirstDispatch(pieces: readonly DecomposePiece[]): ShadowFirstDispatch {
+  const shadowPieces = pieces.filter((piece) => piece.id === SHADOW_PIECE_ID);
+  if (shadowPieces.length !== 1) return { kind: 'ok', pieces: [...pieces] };
+
+  const shadow = shadowPieces[0]!;
+  const rest = pieces.filter((piece) => piece !== shadow);
+  if (shadow.dependsOn.includes(SHADOW_PIECE_ID)) {
+    return { kind: 'rejected', reason: 'shadow-depends-on-self', detail: [SHADOW_PIECE_ID] };
+  }
   const known = new Set(pieces.map((piece) => piece.id));
   const danglingIds: string[] = [];
   for (const piece of pieces) {
@@ -305,19 +313,20 @@ export function planShadowFirstDispatch(pieces: readonly DecomposePiece[]): Shad
       danglingIds.push(dep);
     }
   }
-  if (danglingIds.length) return { kind: 'rejected', reason: 'dangling-dependsOn', danglingIds };
+  if (danglingIds.length) return { kind: 'rejected', reason: 'dangling-dependsOn', detail: danglingIds };
 
-  const shadowPieces = pieces.filter((piece) => piece.id === SHADOW_PIECE_ID);
-  if (shadowPieces.length !== 1) return { kind: 'ok', pieces: [...pieces] };
-
-  const shadow = shadowPieces[0]!;
-  const rest = pieces.filter((piece) => piece !== shadow);
-  const dependedUpon = new Set<string>();
-  for (const piece of rest) for (const dep of piece.dependsOn) dependedUpon.add(dep);
+  // A shadow observation cannot be ordered before a live piece if it itself
+  // depends on that piece. Reject this cyclic ordering instead of returning a
+  // plan that appears shadow-first but cannot be dispatched in that order.
+  const liveIds = new Set(rest.map((piece) => piece.id));
+  const shadowLiveDependencies = shadow.dependsOn.filter((dep) => liveIds.has(dep));
+  if (shadowLiveDependencies.length) {
+    return { kind: 'rejected', reason: 'shadow-depends-on-live', detail: [...new Set(shadowLiveDependencies)] };
+  }
 
   let restoredEdges = 0;
   const reordered = rest.map((piece) => {
-    if (dependedUpon.has(piece.id) || piece.dependsOn.includes(SHADOW_PIECE_ID)) return piece;
+    if (piece.dependsOn.includes(SHADOW_PIECE_ID)) return piece;
     restoredEdges++;
     return { ...piece, dependsOn: [...piece.dependsOn, SHADOW_PIECE_ID] };
   });
@@ -457,7 +466,7 @@ export function readDecomposeProposals(input: {
 /** 승격하지 «않은» 제안 하나 — ⛔ 조용히 원본만 두면 다음 라운드가 같은 제안을 다시 쓴다. */
 export interface DecomposeRejection {
   feature: string;
-  reason: 'dangling-dependsOn';
+  reason: 'dangling-dependsOn' | 'shadow-depends-on-live' | 'shadow-depends-on-self';
   /** 무엇이 매달렸나 — 조각 목록에 없는 선행 id 들. */
   detail: string[];
 }
@@ -533,17 +542,19 @@ export function applyDecomposeProposals(
   for (const goal of goals) {
     const pieces = byFeature.get(goal.feature);
     if (!pieces) { out.push(goal); continue; }
-    // ⛔⭐ shadow-first 가드 — 매달린 선행 간선이 있는 제안은 «쪼개지 않는다»(원본을 그대로 둔다).
+    // ⛔⭐ shadow-first 가드 — shadow proposal의 매달린 간선은 «쪼개지 않는다»(원본 유지).
+    // 일반 proposal은 기존 orderPiecesTopologically 계약대로 dangling 간선을 세고 계속 처리한다.
     const plan = planShadowFirstDispatch(pieces);
     if (plan.kind === 'rejected') {
-      rejected.push({ feature: goal.feature, reason: plan.reason, detail: [...plan.danglingIds] });
+      rejected.push({ feature: goal.feature, reason: plan.reason, detail: [...plan.detail] });
       // ⛔⭐ 거부를 «로그와 값에 다» 남긴다 — 조용히 버리면 다음 라운드가 같은 제안을 다시 쓴다.
       //   혼합 문서 거부(mixed-decompose-document)와 같은 관측 채널·같은 fail-open 규율이다.
       try {
         debug.log('self-dev.decompose', 'decompose-rejected', {
           feature: goal.feature,
           reason: plan.reason,
-          danglingIds: [...plan.danglingIds],
+          detail: [...plan.detail],
+          ...(plan.reason === 'dangling-dependsOn' ? { danglingIds: [...plan.detail] } : {}),
         });
       } catch { /* fail-open */ }
       out.push(goal);

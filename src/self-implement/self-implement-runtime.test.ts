@@ -46,7 +46,19 @@ import type { FeedbackEnvelope } from '../feedback/envelope.js';
 //   운영 쿼터를 건드린다. 공용 `test-seams.ts` 의 기본과 «같은» 무동작을 여기서도 깐다.
 //   ⭐ factory 가 스스로 `refreshCodexQuotaSignals` 를 주면 그것이 이긴다(스프레드 뒤).
 function _setSelfImplementSeamsFactoryForTesting(f: ((o: DefaultSeamsOptions) => SelfImplementSeams) | null): void {
-  setRuntimeSeamsFactory(f && ((o) => ({ refreshCodexQuotaSignals: async () => ({ accounts: [] }), ...f(o) })));
+  setRuntimeSeamsFactory(f && ((o) => {
+    const supplied = f(o);
+    const openPr = supplied.openPr;
+    let openedHead = '';
+    return {
+      refreshCodexQuotaSignals: async () => ({ accounts: [] }),
+      ...supplied,
+      openPr: async (input) => { openedHead = input.head; return openPr(input); },
+      readPrAttribution: supplied.readPrAttribution ?? (async () => ({
+        headRefName: openedHead, createdAt: new Date(Date.now() + 60_000).toISOString(),
+      })),
+    };
+  }));
 }
 
 const ctx = { surface: 'chat', sessionId: 's-1', signal: new AbortController().signal } as unknown as ToolRuntimeContext;

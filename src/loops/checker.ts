@@ -33,6 +33,9 @@ export interface CheckEntry {
   expectedVersion?: string;
   /** Registry graph path, supplied only by graph inventory. */
   file?: string;
+  /** LOOP-PRUNE-1021-FU 판정 재료 — cron-shell·미등록 행이 실은 crontab 명세(그래프 루프에는 없다). */
+  cron?: string;
+  command?: string;
   enabled: boolean;
   registered: boolean;
 }
@@ -316,4 +319,101 @@ export function observeLoopCheck(results: CheckResult[], scope: LoopScope, deps:
   try { writeFileSync(tmp, JSON.stringify(current)); renameSync(tmp, path); }
   catch (error) { if (existsSync(tmp)) unlinkSync(tmp); throw error; }
   return counts;
+}
+
+// ── LOOP-PRUNE-1021-FU 정리 판정 (내부 문서 `loop-lineage-1021` · 0.2.36) ─────
+/** 무실행 은퇴 한계 — off 상태가 원장으로 최근 14일 실행이 증명될 때만 은퇴 후보가 된다. */
+export const PRUNE_IDLE_DAYS = 14;
+/** 활성 루프 상한 — alive 가 25 를 넘으면 접기·은퇴 판정을 먼저 치른다. */
+export const PRUNE_ALIVE_LIMIT = 25;
+
+export interface PruneFoldGroup { family: string; ids: string[]; }
+export interface PruneUnregisteredRow { id: string; cron?: string; command?: string; }
+export interface PruneJudgment {
+  /** 14일 무실행이 원장으로 증명된 은퇴 후보(off). */
+  idleRetire: string[];
+  /** 실행 기록이 없어 무실행을 증명할 수 없는 항목 — 은퇴 후보에서 제외한다. */
+  idleUnproven: string[];
+  /** 등록되지 않은 elanous 크론 행 — 등록/제거 판정에 넘긴다. */
+  unregistered: PruneUnregisteredRow[];
+  /** 같은 일을 하는 elanous:* 형제 슬롯 가족 — 그래프 루프·원장 해시는 접지 않는다. */
+  foldGroups: PruneFoldGroup[];
+  /** 활성 루프 수와 25 한도 판정. */
+  alive: { count: number; limit: number; within: boolean };
+  /** 운영 이름이 없는 원장 해시 id — 명명 대상. */
+  unnamed: string[];
+}
+
+/** elanous:* 슬롯의 가족 이름 — namedCronIds 의 -N 접미와 자리 슬롯(:SEAT)을 원래 가족으로 되돌린다. */
+function pruneFoldFamily(id: string): string | undefined {
+  if (!id.startsWith('elanous:')) return undefined;
+  const seat = /^elanous:([^:]+):[^:]+$/.exec(id);
+  if (seat) return `elanous:${seat[1]}`;
+  const sibling = /^elanous:(.+)-\d+$/.exec(id);
+  return `elanous:${sibling ? sibling[1] : id.slice('elanous:'.length)}`;
+}
+
+/** LOOP-PRUNE-1021-FU — CheckResult 원장 위에서 무실행 은퇴·미등록 정리·형제 접기·alive ≤ 25·이름 없는 해시를 판정한다. */
+export function pruneJudgment(results: readonly CheckResult[], opts: { now?: Date } = {}): PruneJudgment {
+  const now = opts.now ?? new Date();
+  const idleMs = PRUNE_IDLE_DAYS * 24 * 60 * 60_000;
+  const idleRetire: string[] = [];
+  const idleUnproven: string[] = [];
+  const unregistered: PruneUnregisteredRow[] = [];
+  const unnamed: string[] = [];
+  const families = new Map<string, string[]>();
+  let aliveCount = 0;
+  for (const result of results) {
+    if (result.state === 'alive') aliveCount++;
+    if (result.state === 'unregistered') {
+      unregistered.push({
+        id: result.id,
+        ...(result.cron ? { cron: result.cron } : {}),
+        ...(result.command ? { command: result.command } : {}),
+      });
+    }
+    if (result.state === 'off') {
+      const ran = result.lastRunAt && Number.isFinite(Date.parse(result.lastRunAt)) ? Date.parse(result.lastRunAt) : undefined;
+      if (ran === undefined) idleUnproven.push(result.id);
+      else if (now.getTime() - ran > idleMs) idleRetire.push(result.id);
+    }
+    if (/^[0-9a-f]{8,}$/.test(result.id)) unnamed.push(result.id);
+    const family = pruneFoldFamily(result.id);
+    if (family) {
+      const group = families.get(family) ?? [];
+      group.push(result.id);
+      families.set(family, group);
+    }
+  }
+  const foldGroups: PruneFoldGroup[] = [];
+  for (const [family, ids] of families) {
+    if (ids.length < 2) continue;
+    foldGroups.push({ family, ids: [...ids].sort() });
+  }
+  const judgment: PruneJudgment = {
+    idleRetire,
+    idleUnproven,
+    unregistered,
+    foldGroups,
+    alive: { count: aliveCount, limit: PRUNE_ALIVE_LIMIT, within: aliveCount <= PRUNE_ALIVE_LIMIT },
+    unnamed,
+  };
+  debug.log('loop.checker', 'prune', {
+    idleRetire: idleRetire.length, idleUnproven: idleUnproven.length, unregistered: unregistered.length,
+    folds: foldGroups.length, alive: aliveCount, unnamed: unnamed.length,
+  });
+  return judgment;
+}
+
+/** LOOP-PRUNE-1021-FU — PruneJudgment 을 사람용 정리 판정 줄로 렌더한다(loop status --all 인간 출력 꼬리). */
+export function pruneText(judgment: PruneJudgment): string {
+  const lines = [
+    `무실행 은퇴 ${judgment.idleRetire.length}: ${judgment.idleRetire.join(', ') || '없음'}`,
+    `무실행 미증명 ${judgment.idleUnproven.length}: ${judgment.idleUnproven.join(', ') || '없음'}`,
+    `미등록 ${judgment.unregistered.length}: ${judgment.unregistered.map(row => row.command ? `${row.id} (${row.command})` : row.id).join(', ') || '없음'}`,
+    `형제 접기 ${judgment.foldGroups.length}: ${judgment.foldGroups.map(group => `${group.family}[${group.ids.join('+')}]`).join(', ') || '없음'}`,
+    `alive ${judgment.alive.count}/${judgment.alive.limit} ${judgment.alive.within ? '한도 이내' : '한도 초과'}`,
+    `이름 없는 해시 ${judgment.unnamed.length}: ${judgment.unnamed.join(', ') || '없음'}`,
+  ];
+  return lines.join('\n');
 }

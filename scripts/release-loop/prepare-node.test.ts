@@ -48,6 +48,64 @@ test('first prepare reaches the command when the release output directory does n
   expect(commands).toEqual(['git', 'bun']);
 });
 
+test('0.2.36 resume reuses current-tip prepared output proven by this run ledger, even with old refreshedFrom', () => {
+  const { root, out } = fixture();
+  const runId = '226ca1fa-b383-4b9b-b667-bec6b625e7d4';
+  const context = JSON.parse(process.env.ELANOUS_GRAPH_CONTEXT!) as Record<string, unknown>;
+  context.runId = runId;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+  mkdirSync(join(out, 'dist'), { recursive: true });
+  writeFileSync(join(out, 'dist', 'elanous.tgz'), 'candidate');
+  writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') }));
+  const ledgerDir = join(root, 'graph-runs', 'release-loop');
+  mkdirSync(ledgerDir, { recursive: true });
+  writeFileSync(join(ledgerDir, `${runId}.json`), JSON.stringify({ graphId: 'release-loop', runId, nodes: [
+    { nodeId: 'prepare', ok: true, output: JSON.stringify({ outcome: 'ok', out, commit: tip }) },
+  ] }));
+  const result = runPrepare(() => { throw new Error('same run must not rebuild'); });
+  expect(result).toMatchObject({ outcome: 'ok', commit: tip, artifactOwner: { runId, reused: true } });
+  expect(readFileSync(join(out, 'dist', 'elanous.tgz'), 'utf8')).toBe('candidate');
+  expect(readdirSync(root).filter((name) => name.startsWith('.prepared-cleanup-'))).toHaveLength(0);
+});
+
+test('prepare refuses a damaged resume-attempt ledger before reusing or rebuilding artifacts', () => {
+  const { root, out } = fixture();
+  const runId = 'run-with-damaged-ledger';
+  const context = JSON.parse(process.env.ELANOUS_GRAPH_CONTEXT!) as Record<string, unknown>;
+  context.runId = runId;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+  mkdirSync(join(out, 'dist'), { recursive: true });
+  writeFileSync(join(out, 'dist', 'elanous.tgz'), 'candidate');
+  writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: tip }));
+  writeFileSync(join(out, '.release-node-owner.json'), JSON.stringify({ runId, commit: tip }));
+  const attemptsDir = join(root, 'release/0.2.31/resume-attempts');
+  mkdirSync(attemptsDir, { recursive: true });
+  writeFileSync(join(attemptsDir, `${runId}.json`), JSON.stringify({ version: '0.2.31', runId, attempts: ['invalid-date'] }));
+  expect(() => runPrepare(() => { throw new Error('must not launch a command'); })).toThrow('invalid release resume attempts');
+  expect(readFileSync(join(out, 'dist', 'elanous.tgz'), 'utf8')).toBe('candidate');
+});
+
+test('another run current-tip prepared output is preserved beside a fresh build with owner receipt', () => {
+  const { root, out } = fixture();
+  const runId = 'new-release-run';
+  const context = JSON.parse(process.env.ELANOUS_GRAPH_CONTEXT!) as Record<string, unknown>;
+  context.runId = runId;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+  writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: tip }));
+  writeFileSync(join(out, '.release-node-owner.json'), JSON.stringify({ runId: 'other-run', commit: tip }));
+  const result = runPrepare((command) => {
+    if (command === 'git') return { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' };
+    mkdirSync(join(out, 'dist'), { recursive: true });
+    writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') }));
+    return { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') } }), stderr: '' };
+  });
+  expect(result).toMatchObject({ outcome: 'ok', artifactOwner: { runId, attempt: 0 } });
+  expect(JSON.parse(readFileSync(join(out, '.release-node-owner.json'), 'utf8')).runId).toBe(runId);
+  const quarantine = join(root, readdirSync(root).find((name) => name.startsWith('.prepared-cleanup-'))!);
+  expect(readFileSync(join(quarantine, 'prepared/archive.txt'), 'utf8')).toBe('old archive');
+  expect(JSON.parse(readFileSync(join(quarantine, 'receipt.json'), 'utf8'))).toMatchObject({ old: tip, commit: tip });
+});
+
 test('prepare quarantines a manifest-proven archive without deleting its bytes before building the new tip', () => {
   const { root, out } = fixture();
   writeFileSync(join(out, 'release.json'), JSON.stringify({ version: '0.2.31', sourceCommit: old }));
@@ -191,9 +249,9 @@ test('prepare preserves quarantine and never follows a manifest symlink swapped 
     return { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' };
   }, (from, to) => {
     renameSync(from, to);
-    moved = to;
-    rmSync(join(to, 'release.json'));
-    symlinkSync(outside, join(to, 'release.json'));
+    moved = String(to);
+    rmSync(join(moved, 'release.json'));
+    symlinkSync(outside, join(moved, 'release.json'));
   })).toThrow('prepared output changed during cleanup');
   expect(readFileSync(join(moved, 'archive.txt'), 'utf8')).toBe('old archive');
   expect(lstatSync(join(moved, 'release.json')).isSymbolicLink()).toBe(true);
@@ -212,7 +270,7 @@ test('prepare records quarantine but refuses a release parent replaced after the
     return { status: 0, stdout: `${'c'.repeat(40)}\n`, stderr: '' };
   }, (from, to) => {
     renameSync(from, to);
-    moved = to;
+    moved = String(to);
     renameSync(versionDir, `${versionDir}.held`);
     symlinkSync(outside, versionDir);
   })).toThrow('prepare parent changed after quarantine');
@@ -232,8 +290,8 @@ test('prepare keeps an initial receipt if archive size cannot be read', () => {
     : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.31', sourceCommit: tip, distDir: join(out, 'dist') } }), stderr: '' },
   (from, to) => {
     renameSync(from, to);
-    moved = to;
-    chmodSync(join(to, 'unreadable'), 0o000);
+    moved = String(to);
+    chmodSync(join(moved, 'unreadable'), 0o000);
   });
   chmodSync(join(moved, 'unreadable'), 0o700);
   expect(result.outcome).toBe('ok');

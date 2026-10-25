@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
+import { oneScreenAnswer } from './one-screen';
 import { loopRows, LOOP_SCHEDULES_PATH, LOOPS_PATH, type LoopSchedule } from '@/components/loops/loop-status';
 import { LOOPS_INTERACT_HREF } from '@/components/loops/loops-view';
 import { listOpenDecisions } from '@/lib/decisions-api';
@@ -239,6 +240,14 @@ export default function CeoPage() {
     : `${snapshot.flow.label} · ${snapshot.flow.reason ?? '사유 없음'}${snapshot.flow.stale ? ' · 낡음' : ''}`;
   const flowHref = snapshot.flow?.verdict === 'loop-down' || snapshot.flow?.verdict === 'blocked'
     ? '/loops?view=map' : '/ops/resources';
+  const oneScreen = oneScreenAnswer({
+    flow: snapshot.flow,
+    release: snapshot.release,
+    decisions: snapshot.decisions,
+    merged: snapshot.merged,
+    risks: snapshot.risks,
+    grid: snapshot.grid,
+  });
 
   return <main className="mx-auto w-full min-w-0 max-w-3xl px-3 py-4 text-foreground sm:px-6">
     <header className="mb-4"><p className="text-xs text-muted-foreground">운영 · 오늘</p><h1 className="text-xl font-semibold">대표 조망판</h1></header>
@@ -247,7 +256,31 @@ export default function CeoPage() {
         ? flowText
         : <Link href={flowHref} className="rounded underline-offset-4 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">{flowText}</Link>}
     </p>
-    <div className="grid grid-cols-2 gap-2 sm:gap-4" aria-label="대표 조망 카드">
+      <div role="region" aria-label="한 화면 답" className="mb-3 grid min-w-0 grid-cols-2 gap-2 text-xs sm:grid-cols-3 sm:gap-3">
+        <p className="min-w-0 rounded-xl border border-border bg-card px-3 py-2">
+          <span className="block text-muted-foreground">지금 막힘</span>
+          <span className="block min-w-0 break-words font-semibold">{oneScreen.blocked}</span>
+        </p>
+        <p className="min-w-0 rounded-xl border border-border bg-card px-3 py-2">
+          <span className="block text-muted-foreground">결정해야 함</span>
+          <span className="block font-semibold tabular-nums">{oneScreen.decide}</span>
+          <Link href="/decisions" className="mt-1 block min-w-0 break-words rounded text-[11px] text-muted-foreground underline underline-offset-4 hover:text-foreground">결정 카드 열기 →</Link>
+        </p>
+        <p className="min-w-0 rounded-xl border border-border bg-card px-3 py-2">
+          <span className="block text-muted-foreground">오늘 착지</span>
+          <span className="block font-semibold tabular-nums">{oneScreen.landed}</span>
+        </p>
+        <p className="min-w-0 rounded-xl border border-border bg-card px-3 py-2">
+          <span className="block text-muted-foreground">예비·하트비트</span>
+          <span className="block min-w-0 break-words font-semibold tabular-nums">예비 {oneScreen.spare} · 하트비트 {oneScreen.heartbeat}</span>
+        </p>
+        <p className="min-w-0 rounded-xl border border-border bg-card px-3 py-2">
+          <span className="block text-muted-foreground">판</span>
+          <span className="block font-semibold tabular-nums">{oneScreen.release}</span>
+          <Link href="/ops/release" className="mt-1 block rounded text-[11px] text-muted-foreground underline underline-offset-4 hover:text-foreground">컷·발행 현황 →</Link>
+        </p>
+      </div>
+      <div className="grid grid-cols-2 gap-2 sm:gap-4" aria-label="대표 조망 카드">
       <Card title="릴리스 판 진행">{snapshot.release === undefined ? '불러오는 중…' : snapshot.release
         ? <><span className="text-emerald-600">green {snapshot.release.green}</span><span className="block text-amber-600">노랑 {snapshot.release.yellow}</span></>
         : '못 읽음'}

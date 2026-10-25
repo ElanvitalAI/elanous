@@ -245,6 +245,84 @@ test('non-NexusApiError map failure keeps the existing error', async () => {
   } finally { act(() => { root!.unmount(); }); }
 });
 
+test('fixed loop from the address bar shows itself on screen and asks the ledger with the same loop id', async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  globalThis.document = { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Document;
+  globalThis.window = { setInterval: () => 1, clearInterval: () => {}, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Window & typeof globalThis;
+  const requested: string[] = [];
+  let root: ReturnType<typeof create>;
+  const value = {
+    client: {
+      fetchResponse: async () => new Response(JSON.stringify({ entries: [] })),
+      fetchJson: async (path: string) => {
+        requested.push(path);
+        if (path.startsWith('/v1/ops/seats')) return { date: '2026-10-08', seats: [] };
+        if (path.startsWith('/v1/harness/runs')) return { entries: [] };
+        if (path.startsWith('/v1/schedules')) return { schedules: [], owners: [] };
+        return { loops: { loops: [] } };
+      },
+      logsStreamUrl: () => null,
+    },
+    config: { baseUrl: '', token: '', provider: '' },
+  } as unknown as ComponentProps<typeof DaemonContext.Provider>['value'];
+  await act(async () => { root = create(<SearchParamsContext.Provider value={new URLSearchParams()}> <DaemonContext.Provider value={value}><LoopAgentsScene initialLoopRef="card-1" /></DaemonContext.Provider></SearchParamsContext.Provider>); });
+  try {
+    const nodes = root!.root.findAllByProps({ 'aria-label': '고정 루프' });
+    expect(nodes).toHaveLength(1);
+    const shown = nodes[0].children.join('');
+    expect(shown).toBe('루프 card-1');
+    expect(shown).toContain('card-1');
+    expect(requested.some(path => path.startsWith('/v1/loops/edges?ref=card-1'))).toBe(true);
+    expect(requested.some(path => path.startsWith('/v1/loops/edges?since='))).toBe(false);
+  } finally { act(() => { root!.unmount(); }); }
+});
+
+test('fixed-loop chip is drawn only for the loop id the ledger actually queried', async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  globalThis.document = { hidden: false, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Document;
+  globalThis.window = { setInterval: () => 1, clearInterval: () => {}, addEventListener: () => {}, removeEventListener: () => {} } as unknown as Window & typeof globalThis;
+
+  const render = async (search: URLSearchParams, initialLoopRef: string | null) => {
+    const requested: string[] = [];
+    const value = {
+      client: {
+        fetchResponse: async () => new Response(JSON.stringify({ entries: [] })),
+        fetchJson: async (path: string) => {
+          requested.push(path);
+          if (path.startsWith('/v1/ops/seats')) return { date: '2026-10-08', seats: [] };
+          if (path.startsWith('/v1/harness/runs')) return { entries: [] };
+          if (path.startsWith('/v1/schedules')) return { schedules: [], owners: [] };
+          return { loops: { loops: [] } };
+        },
+        logsStreamUrl: () => null,
+      },
+      config: { baseUrl: '', token: '', provider: '' },
+    } as unknown as ComponentProps<typeof DaemonContext.Provider>['value'];
+    let root: ReturnType<typeof create>;
+    await act(async () => { root = create(<SearchParamsContext.Provider value={search}><DaemonContext.Provider value={value}><LoopAgentsScene initialLoopRef={initialLoopRef} /></DaemonContext.Provider></SearchParamsContext.Provider>); });
+    return {
+      requested,
+      fixedLoopNodes: () => root!.root.findAllByProps({ 'aria-label': '고정 루프' }),
+      root: root!,
+    };
+  };
+
+  // 주소 여정(?journey=card-9)과 다른 고정 ref(card-1) — 원장은 card-9 를 조회하는데 화면이 card-1 을 고정 표시하면 갈라짐이다.
+  const split = await render(new URLSearchParams('journey=card-9'), 'card-1');
+  try {
+    expect(split.fixedLoopNodes()).toHaveLength(0);
+    expect(split.requested.some(path => path.startsWith('/v1/loops/edges?ref=card-9'))).toBe(true);
+  } finally { await act(async () => split.root.unmount()); }
+
+  // 원장 규칙(isValidRef)이 거부하는 ID — 60분 창(since)으로 떨어지므로 고정 루프 문구도 그려지지 않는다.
+  const rejected = await render(new URLSearchParams(), 'card.1');
+  try {
+    expect(rejected.fixedLoopNodes()).toHaveLength(0);
+    expect(rejected.requested.some(path => path.startsWith('/v1/loops/edges?ref='))).toBe(false);
+    expect(rejected.requested.some(path => path.startsWith('/v1/loops/edges?since='))).toBe(true);
+  } finally { await act(async () => rejected.root.unmount()); }
+});
+
 test('demo address asks one journey with ?ref=&mode=live instead of the 60-minute window; bad ids fall back', () => {
   const at = Date.parse('2026-10-05T10:00:00Z');
   expect(loopEdgesPath(at, 'card-1')).toBe('/v1/loops/edges?ref=card-1&mode=live&limit=500');

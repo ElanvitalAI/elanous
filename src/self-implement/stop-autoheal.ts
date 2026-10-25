@@ -51,6 +51,7 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
   'env-unrelated': 'clean-workspace-regate',
   'main-sync': 'rebase-regate',
   'pod-died': 'resume-from-salvage',
+  'pod-vanished': 'needs-owner',
   'evidence-uncovered': 'derive-evidence-rejudge',
   'review-repeat': 'needs-owner',
   'review-out-of-scope': 'needs-owner',

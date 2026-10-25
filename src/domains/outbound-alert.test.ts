@@ -961,3 +961,22 @@ describe('OB8b — when nothing can deliver, say why instead of a silent false',
   });
 });
 
+// TEST-PROD-LEAK-2 companion ledger (shard 3/12): a real (non-faked) send transport injected into the
+// outbound-alert delivery path must still be refused inside a test process. The isolated child fixture
+// injects a plain curl-invoking sendRaw (no test double anywhere) into the delivery deps, so the refusal
+// has to come from the guard firing before the transport runs — leaving the reason behind, 0 sends.
+describe('TEST-PROD-LEAK-2: real-transport injection', () => {
+  it('an injected real (non-faked) send transport is refused in a test process with a [test-guard] reason', () => {
+    const r = childProcess.spawnSync(process.execPath, [join(import.meta.dir, '..', 'instance', 'test-write-guard-real-transport.fixture.ts')], {
+      env: { ...process.env, NODE_ENV: 'test', LEAK2_INJECT_SENDRAW: '1' }, encoding: 'utf8', timeout: 90_000,
+    });
+    expect(r.status).toBe(0);
+    const ledger = JSON.parse(r.stdout.trim().split('\n').at(-1)!) as { refused: boolean; refusalReason: string; curlCalls: number; s3Uploads: number };
+    expect(ledger.refused).toBe(true);
+    expect(ledger.refusalReason).toContain('TestOpsWriteRefusedError');
+    expect(ledger.refusalReason).toContain('[test-guard] refused');
+    expect(ledger.curlCalls).toBe(0);
+    expect(ledger.s3Uploads).toBe(0);
+  }, 120_000);
+});
+

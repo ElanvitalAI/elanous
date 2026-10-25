@@ -40,7 +40,7 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
   let clock = new Date('2026-10-11T01:00:00.000Z');
   const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
   const regateRequests: RegateRequest[] = [];
-  const reviewRequests: Array<{ pr: number; resultPath?: string }> = [];
+  const reviewRequests: Array<{ pr: number; intent: string; resultPath?: string }> = [];
   const lands: Array<{ pr: number; head: string; overlapEvidence?: string }> = [];
   const catchUpRequests: CatchUpRequest[] = [];
   let regateOutcome: ((request: RegateRequest) => void) | undefined;
@@ -63,8 +63,8 @@ function fixture(opts: { regates?: TaskCard['regates']; landAttempts?: TaskCard[
       now: () => clock,
       repoCandidates: () => [{ source: 'host' as const, cwd: '/repo' }],
       prHead: async () => ({ head, state: 'OPEN', url: URL, branch: 'feature' }),
-      requestReview: async (pr: number, _intent: string, _cwd?: string, capture?: { resultPath: string }) => {
-        reviewRequests.push({ pr, ...(capture ? { resultPath: capture.resultPath } : {}) });
+      requestReview: async (pr: number, intent: string, _cwd?: string, capture?: { resultPath: string }) => {
+        reviewRequests.push({ pr, intent, ...(capture ? { resultPath: capture.resultPath } : {}) });
         if (capture && reviewOutcome) { mkdirSync(dirname(capture.resultPath), { recursive: true }); reviewOutcome(capture.resultPath); }
       },
       landPrHead: async () => ({ head, state: 'OPEN', isDraft: false, url: URL, branch: 'feature' }),
@@ -109,6 +109,21 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(queried).toEqual([[30, URL], [30, URL]]);
     expect(f.card().history.filter((row) => row.event === 'rejudge-on-head' && row.effect === 'goal-only-pr')).toHaveLength(1);
   });
+  test('same-PR rejudge sends prior captured must-fix through the production review-request path', async () => {
+    const f = fixture();
+    const priorPath = f.card().reviewRequests![0]!.resultPath!;
+    mkdirSync(dirname(priorPath), { recursive: true });
+    writeFileSync(priorPath, reviewJson(A, { verdict: 'fail', mustFix: ['repair the prior head assertion'] }));
+    f.setHead(B);
+    await rejudgeCardOnHead(f.card().id, f.deps());
+    expect(f.decisions()).toContain('review:review-requested');
+    expect(f.reviewRequests).toHaveLength(1);
+    expect(f.reviewRequests[0]!.intent).toContain('직전 리뷰 must-fix 1건:');
+    expect(f.reviewRequests[0]!.intent).toContain('1. repair the prior head assertion');
+    expect(f.reviewRequests[0]!.intent).toContain('이번 리뷰는 직전 must-fix 가 해결됐는지');
+    expect(f.card().reviewRequests?.at(-1)?.head).toBe(B);
+  });
+
   test('adopted unchanged head gets its first review request, then only one pending request', async () => {
     const f = fixture();
     writeTaskCards(f.statePath, [{ ...f.card(), taLand: true,
@@ -720,12 +735,82 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(f.decisions()).toEqual(['target:head-unchanged', 'target:head-unchanged']);
   });
 
+  test('rejudge production entry carries only the immediately prior same-PR review and head diff into two consecutive review intents', async () => {
+    const f = fixture();
+    const intents: string[] = [];
+    const secondFix = 'second-round repaired item';
+    const firstFix = 'first-round repaired item';
+    const priorResultPath = f.card().reviewRequests![0]!.resultPath!;
+    mkdirSync(dirname(priorResultPath), { recursive: true });
+    writeFileSync(priorResultPath, reviewJson(A, { verdict: 'fail', mustFix: [firstFix] }));
+    const deps = {
+      ...f.deps(),
+      live: {
+        ...f.deps().live,
+        priorDiff: (_cwd: string | undefined, fromHead: string, toHead: string) => ({
+          files: [{ path: `${fromHead.slice(0, 1)}-to-${toHead.slice(0, 1)}.ts`, added: 1, deleted: 0 }], added: 1, deleted: 0,
+        }),
+        requestReview: async (_pr: number, intent: string, _cwd?: string, capture?: { resultPath: string }) => {
+          intents.push(intent);
+          if (capture?.resultPath) {
+            mkdirSync(dirname(capture.resultPath), { recursive: true });
+            writeFileSync(capture.resultPath, reviewJson(intents.length === 1 ? B : D, {
+              verdict: 'fail', mustFix: [intents.length === 1 ? secondFix : firstFix],
+            }));
+          }
+        },
+      },
+    };
+
+    f.setHead(B);
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toContain(`직전 리뷰 머리 → 지금 머리: ${A.slice(0, 12)} → ${B.slice(0, 12)}`);
+    expect(intents[0]).toContain(`  - a-to-b.ts (+1 −0)`);
+    expect(intents[0]).toContain(firstFix);
+
+    f.setHead(D);
+    f.setClock('2026-10-11T01:10:00.000Z');
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(intents).toHaveLength(2);
+    expect(intents[1]).toContain(`직전 리뷰 머리 → 지금 머리: ${B.slice(0, 12)} → ${D.slice(0, 12)}`);
+    expect(intents[1]).toContain(`  - b-to-d.ts (+1 −0)`);
+    expect(intents[1]).toContain(secondFix);
+    expect(intents[1]).not.toContain(firstFix);
+    expect(intents[1]).not.toContain(`직전 리뷰 머리 → 지금 머리: ${A.slice(0, 12)}`);
+    expect(f.card().reviewRequests?.map((entry) => entry.head)).toEqual([A, B, D]);
+  });
+
+  test('rejudge production entry rejects a prior review result whose head does not match the immediately prior request', async () => {
+    const f = fixture();
+    const priorPath = f.card().reviewRequests![0]!.resultPath!;
+    const unrelatedFix = 'finding from an unrelated head';
+    mkdirSync(dirname(priorPath), { recursive: true });
+    writeFileSync(priorPath, reviewJson(D, { verdict: 'fail', mustFix: [unrelatedFix] }));
+    const intents: string[] = [];
+    const deps = {
+      ...f.deps(),
+      live: {
+        ...f.deps().live,
+        priorDiff: () => ({ files: [{ path: 'fixed.ts', added: 1, deleted: 0 }], added: 1, deleted: 0 }),
+        requestReview: async (_pr: number, intent: string) => { intents.push(intent); },
+      },
+    };
+    f.setHead(B);
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toContain(`직전 리뷰 머리 → 지금 머리: ${A.slice(0, 12)} → ${B.slice(0, 12)}`);
+    expect(intents[0]).toContain('직전 결과 미회수 (result head does not match prior review head)');
+    expect(intents[0]).not.toContain(unrelatedFix);
+    expect(intents[0]).toContain('fixed.ts (+1 −0)');
+  });
+
   test('머리 A→B → 재게이트 1회 ⊕ 리뷰 재요청 1회 · 같은 머리 다음 틱은 0회', async () => {
     const f = fixture();
     f.setHead(B);
     await rejudgeCardOnHead('ta-rj-1', f.deps());
     expect(f.regateRequests).toEqual([{ card: 'ta-rj-1', pr: 30, head: B, repoRoot: '/repo', resultPath: regateResultPath(f.statePath, 'ta-rj-1', 30, B) }]);
-    expect(f.reviewRequests).toEqual([{ pr: 30, resultPath: reviewResultPath(f.statePath, 'ta-rj-1', 30, B) }]);
+    expect(f.reviewRequests).toEqual([{ pr: 30, intent: expect.any(String), resultPath: reviewResultPath(f.statePath, 'ta-rj-1', 30, B) }]);
     expect(f.decisions()).toEqual(['regate:regate-requested', 'review:review-requested']);
     expect(f.card().regates).toEqual([{ pr: 30, head: B, at: '2026-10-11T01:00:00.000Z', resultPath: regateResultPath(f.statePath, 'ta-rj-1', 30, B) }]);
     expect(f.card().history.filter((item) => item.event === 'rejudge-on-head').map((item) => `${item.kind}:${item.effect}`)).toEqual(['regate:regate-requested', 'review:review-requested']);
@@ -1601,6 +1686,39 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(result.reason).toBe('main 따라잡기 충돌 · 파일 src/x.ts, src/y.ts');
     expect(calls.some((entry) => entry[0] === 'merge' && entry[1] === '--abort')).toBe(true);
     expect(calls.some((entry) => entry[0] === 'push')).toBe(false);
+  });
+
+  test('catch-up — 이전 worktree 경로가 남으면 다른 경로에서 재시도하고 기존 경로를 보존한다', async () => {
+    const calls: string[][] = [];
+    const work = '/tmp/ta-catch-up-stale';
+    const git: CatchUpGit = (_cwd, args) => {
+      calls.push(args);
+      if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'FETCH_HEAD') {
+        const prev = calls.at(-2)?.join(' ') ?? '';
+        return { status: 0, stdout: prev.includes('refs/heads/main') ? BASE2 : B, stderr: '' };
+      }
+      if (args[0] === 'worktree' && args[1] === 'add') {
+        return args[3] !== work
+          ? { status: 0, stdout: '', stderr: '' }
+          : { status: 1, stdout: '', stderr: `fatal: '${work}' is already used by worktree '${work}'` };
+      }
+      if (args[0] === 'worktree' && args[1] === 'remove') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'config') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'merge' && args[1] === '--no-ff') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { status: 0, stdout: NEW_HEAD, stderr: '' };
+      if (args[0] === 'push') return { status: 0, stdout: 'ok', stderr: '' };
+      return { status: 1, stdout: '', stderr: `unexpected ${args.join(' ')}` };
+    };
+    const result = await defaultCatchUpMain({ cwd: '/repo', pr: 30, head: B, branch: 'feature', fromBase: BASE, worktreePath: work }, git);
+    expect(result).toMatchObject({ decision: 'pushed', fromBase: BASE, toBase: BASE2, newHead: NEW_HEAD });
+    expect(result.pushArgs).toEqual(['push', 'origin', 'HEAD:feature']);
+    expect(result.pushArgs?.includes('--force')).toBe(false);
+    const addCalls = calls.filter((entry) => entry[0] === 'worktree' && entry[1] === 'add');
+    expect(addCalls).toHaveLength(2);
+    expect(addCalls[0]?.[3]).toBe(work);
+    expect(addCalls[1]?.[3]?.startsWith(`${work}-retry-`)).toBe(true);
+    expect(calls.filter((entry) => entry[0] === 'worktree' && entry[1] === 'remove').map((entry) => entry[3])).toEqual([addCalls[1]?.[3]]);
   });
 
   test('defaultRequestRegate — 같은 우주·진입점의 `tasks regate-run` 을 PR 저장소에서 떼어 띄운다(stdio ignore)', async () => {

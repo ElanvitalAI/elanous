@@ -6,7 +6,10 @@ import { debug } from '../debug/log.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
 import { runContextCondense } from './condense.js';
 import type { CoordEvent } from './coord-events.js';
-import { condenseContextDay, condenseContextWindowWithReport, type MemorySource } from './long-term-memory.js';
+import {
+  condenseContextDay, condenseContextWindowWithReport, importClaudeMemories, importClaudeMemory,
+  type MemorySource,
+} from './long-term-memory.js';
 
 const day = '2026-10-02';
 const now = new Date('2026-10-03T00:00:00.000Z');
@@ -591,4 +594,54 @@ test('real harness-child endings are dropped before sources while reports and an
     expect(logs.find(entry => entry.event === 'folded')).toEqual({ event: 'folded',
       data: { harnessEvents: 2, kept: 1, droppedHarnessChild: 3 } });
   } finally { log.mockRestore(); }
+});
+
+function claudeMemoryText(fields: Record<string, string>, body: string): string {
+  return ['---', ...Object.entries(fields).map(([k, v]) => `${k}: ${v}`), '---', '', body].join('\n');
+}
+
+test('a claude memory file imports with its name, type and source', () => {
+  const result = importClaudeMemory({
+    path: '/home/op/.claude/projects/-home-ubuntu-elanous/memory/landing-train.md',
+    text: claudeMemoryText(
+      { name: 'landing-train', description: '착지 열차는 OP 만 발사한다', type: 'feedback' },
+      '착지 열차 발사 권한은 OP 에 있다.',
+    ),
+  }, { asOf: '2026-10-14T09:00:00.000Z' });
+
+  expect(result.ok).toBe(true);
+  if (!result.ok) return;
+  expect(result.item).toMatchObject({
+    name: 'landing-train',
+    type: 'feedback',
+    description: '착지 열차는 OP 만 발사한다',
+    project: '-home-ubuntu-elanous',
+    seat: 'claude-memory',
+    topic: 'landing-train',
+    source: 'elanous://claude-memory/landing-train',
+    updatedAt: '2026-10-14T09:00:00.000Z',
+    status: 'active',
+    trust: 'memory',
+    body: '착지 열차 발사 권한은 OP 에 있다.',
+  });
+  // 기존 원장의 source 링크 계약 ^(https?://|elanous://) 을 그대로 만족한다.
+  expect(result.item.source).toMatch(/^(https?:\/\/|elanous:\/\/)/);
+  // 낡음 표시 — «10-xx 기준» 이 summary 안에 남는다.
+  expect(result.item.summary).toBe('«10-14 기준» 착지 열차는 OP 만 발사한다');
+});
+
+test('claude memory re-import overwrites by name and skips malformed files', () => {
+  const file = (name: string, text: string) => ({ path: `/h/.claude/projects/p1/memory/${name}.md`, text });
+  const result = importClaudeMemories([
+    file('a', claudeMemoryText({ name: 'landing-train', description: '옛 설명', type: 'project' }, '옛 본문')),
+    file('a-copy', claudeMemoryText({ name: 'landing-train', description: '새 설명', type: 'project' }, '새 본문')),
+    file('bad', 'frontmatter 없음'),
+    file('nameless', claudeMemoryText({ description: '이름 없음', type: 'project' }, '본문')),
+  ], { asOf: '2026-10-14' });
+
+  expect(result.items.map(item => item.name)).toEqual(['landing-train']);
+  expect(result.items[0]?.description).toBe('새 설명');
+  expect(result.items[0]?.body).toBe('새 본문');
+  expect(result.overwritten).toBe(1);
+  expect(result.skipped).toEqual({ 'no-frontmatter': 1, 'no-name': 1 });
 });

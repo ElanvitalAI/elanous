@@ -6,6 +6,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpat
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { checklistHistory, listChecklist, devVersion, refRoots, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { CliUserError } from './cli-user-error.js';
+import '../../scripts/release-loop/resume-test-traffic.js';
 import { getSchedule, setSchedule } from '../release-loop/release-schedule.js';
 import type { RehearsalDeps } from '../release-loop/rehearsal.js';
 import type { LightRcResult } from '../release-loop/light-rc.js';
@@ -39,6 +40,8 @@ function installPinnedReleaseFiles(checkout: string) {
 async function seedFailedReleaseRun(root: string, runId = 'recovery-fixture') {
   const version = '9.9.9', checkout = join(root, 'checkout'), bare = join(root, 'origin.git');
   mkdirSync(checkout, { recursive: true });
+  mkdirSync(join(checkout, 'node_modules'), { recursive: true });
+  mkdirSync(join(checkout, 'apps', 'pwa', 'node_modules'), { recursive: true });
   const git = (cwd: string, ...args: string[]) => {
     const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
     if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
@@ -56,7 +59,8 @@ async function seedFailedReleaseRun(root: string, runId = 'recovery-fixture') {
   git(checkout, 'commit', '-q', '-m', 'seed local recovery fixture');
   git(checkout, 'branch', '-M', `release/${version}`);
   git(checkout, 'remote', 'add', 'origin', bare);
-  git(checkout, 'push', '-q', '-u', 'origin', `release/${version}`);
+  // pod 전역 core.hooksPath pre-push guard(only this run's branches)는 시험 /tmp bare 저장소의 release/* push를 거부한다.
+  git(checkout, 'push', '--no-verify', '-q', '-u', 'origin', `release/${version}`);
   const sha = git(checkout, 'rev-parse', 'HEAD');
   const graphPath = join(checkout, 'graphs', 'release', 'release-loop.yaml');
   const state = await runGraph(graphPath, { runId, input: { version, branchCut: true }, deps: { root,
@@ -151,7 +155,8 @@ test('valid recovery ID preflights the saved failed run without reading schedule
     expect(readFileSync(fixture.statePath, 'utf8')).toBe(before);
     expect(existsSync(join(root, 'release', fixture.version, 'resume-attempts', `${fixture.runId}.json`))).toBe(false);
   } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
-});
+  // 실제 git seed ⊕ 실제 release 그래프 실행 ⊕ 실제 CLI 프리플라이트 spawn — 기본 5초로는 로드 상황에서 잘린다.
+}, 60_000);
 
 test('recovery apply executes the real release graph from gate through gate-triage and stops before mac-smoke', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-recovery-apply-'));
@@ -190,7 +195,8 @@ test('recovery apply executes the real release graph from gate through gate-tria
     expect(rcCalls).toBe(0);
     expect(readFileSync(join(root, 'release', fixture.version, 'resume-attempts', `${fixture.runId}.json`), 'utf8')).toContain(fixture.runId);
   } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
-});
+  // 실제 git seed ⊕ 실제 release 그래프 실행(게이트→게이트 분류) — 기본 5초로는 로드 상황에서 잘린다.
+}, 60_000);
 
 test('recovery apply write-fence denial does not invoke the resume graph', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-recovery-fence-'));
@@ -221,7 +227,8 @@ test('recovery apply write-fence denial does not invoke the resume graph', async
     if (track === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = track;
     rmSync(root, { recursive: true, force: true });
   }
-});
+  // 실제 git seed ⊕ 실제 CLI 프리플라이트 spawn — 기본 5초로는 로드 상황에서 잘린다.
+}, 60_000);
 
 test('rehearsal CLI no-option tick forwards planned shards and records a measured gate failure as error', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-cli-gate-'));
@@ -1068,6 +1075,8 @@ describe('release run CLI', () => {
     const root = mkdtempSync(join(tmpdir(), 'release-resume-dry-cli-'));
     const repo = join(root, 'repo'), remote = join(root, 'remote.git');
     mkdirSync(repo);
+    mkdirSync(join(repo, 'node_modules'), { recursive: true });
+    mkdirSync(join(repo, 'apps', 'pwa', 'node_modules'), { recursive: true });
     const git = (cwd: string, ...args: string[]) => {
       const result = spawnSync('git', ['-c', 'user.name=cli-test', '-c', 'user.email=cli-test@example.invalid', '-c', 'commit.gpgsign=false', ...args], {
         cwd, encoding: 'utf8', env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
@@ -1677,6 +1686,8 @@ test('actual release resume --dry-run executable prints JSON without mutating ru
   const root = mkdtempSync(join(tmpdir(), 'release-resume-dry-child-'));
   const repo = join(root, 'repo'), remote = join(root, 'remote.git');
   mkdirSync(repo);
+  mkdirSync(join(repo, 'node_modules'), { recursive: true });
+  mkdirSync(join(repo, 'apps', 'pwa', 'node_modules'), { recursive: true });
   const git = (cwd: string, ...args: string[]) => {
     const result = spawnSync('git', ['-c', 'user.name=cli-test', '-c', 'user.email=cli-test@example.invalid', '-c', 'commit.gpgsign=false', ...args], {
       cwd, encoding: 'utf8', env: { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },

@@ -22,6 +22,7 @@ import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 import { createLlmControlBrain } from '../autopilot/llm-control-brain.js';
 import { HARNESS_BOUNDARY_REQUESTS_ENV, HARNESS_BOUNDARY_RESPONSES_ENV } from '../harness/harness-space.js';
 import { supervisorGoalDigest } from './goal-digest.js';
+import { fillUnverifiableGoalSlots } from './goal-supervisor-fill.js';
 import { stableMustFixId } from './reflect-mustfix.js';
 import { SUPERVISION_REWORK_SOURCES } from './supervision-vocabulary.js';
 import { getAskUserQuestionResolver, setAskUserQuestionResolver } from '../ask-user-question/tool.js';
@@ -2967,9 +2968,10 @@ describe('defaultSeams.gate — gate baseline 변동성 및 재실행 facts 전�
 
       log.mockClear();
       const zeroGate = await defaultSeams({
-        runIntegrityGate: () => ({ passed: true, steps: [{ name: 'test', ok: true, skipped: false, summary: 'passed' }], log: '[test] PASS' }),
+        runIntegrityGate: () => ({ passed: true, steps: [{ name: 'test', ok: true, skipped: false, summary: 'passed' }], log: '[test] PASS bun test test/a.test.js — 0 fail | Ran 1 test across 1 file.' }),
       }).gate(repo);
       expect(zeroGate.reflectGateFacts).not.toHaveProperty('timeoutPassedAtBase');
+      expect(zeroGate.log).not.toContain('[gate-baseline] introduced=0');
       const zero = log.mock.calls.find((call) => call[0] === 'self-implement' && call[1] === 'gate.baseline')?.[2] as Record<string, unknown>;
       expect(zero).toMatchObject({ timeoutPassedAtBase: 0 });
     } finally {
@@ -2977,6 +2979,30 @@ describe('defaultSeams.gate — gate baseline 변동성 및 재실행 facts 전�
       rmSync(repo, { recursive: true, force: true });
     }
   }, 15_000);
+
+  test('GOAL-SLOT · 실제 PASS gate 반환 로그를 독립 골 슬롯 검사기에 그대로 전달한다', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'seam-gate-goal-slot-pass-'));
+    try {
+      git(repo, 'init', '-b', 'main');
+      git(repo, 'config', 'user.email', 't@t.co');
+      git(repo, 'config', 'user.name', 'T');
+      mkdirSync(join(repo, 'src'), { recursive: true });
+      writeFileSync(join(repo, 'src', 'a.js'), 'export const a = 1;\n');
+      writeFileSync(join(repo, 'src', 'a.test.js'), "import { test, expect } from 'bun:test'; test('a', () => expect(1).toBe(1));\n");
+      git(repo, 'add', '-A');
+      git(repo, 'commit', '-m', 'base');
+      writeFileSync(join(repo, 'src', 'a.js'), 'export const a = 2;\n');
+      const gate = await defaultSeams({ runIntegrityGate: () => ({ passed: true,
+        steps: [{ name: 'test', ok: true, skipped: false, summary: 'passed' }],
+        log: '[test] PASS bun test src/a.test.js — 0 fail | Ran 1 test across 1 file.' }) }).gate(repo);
+      expect(gate.passed).toBe(true);
+      expect(gate.log).not.toContain('[gate-baseline] introduced=0');
+      const goalFile = join(repo, 'GOAL.md');
+      writeFileSync(goalFile, '## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n');
+      expect(await fillUnverifiableGoalSlots({ path: goalFile, round: 0, gate,
+        review: { verdict: 'pass' }, independentlyCheck: defaultSeams().independentlyCheckGoalSlots! })).toBe('filled');
+    } finally { rmSync(repo, { recursive: true, force: true }); }
+  }, 30_000);
 
   test('실행 경로에서 0이 아닌 변동성 및 재실행 facts만 reflectGateFacts에 싣는다', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'seam-gate-baseline-facts-'));
@@ -5155,6 +5181,18 @@ describe('openPr — 같은 칸 카드 재결속 사유 분리', () => {
     expect(rebindEvents()).toContain('same-cell-card-rebind-card-store-absent');
     expect(rebindEvents()).toContain('same-cell-card-rebind-deferred');
     expect(existsSync(storePath)).toBe(false);
+  });
+
+  test('기존 PR의 생성시각 예외는 카드 결속 재사용에만 부여한다', async () => {
+    const reusedManager = {
+      upsertPr: () => ({ ok: true, url: NEW_URL, reused: true, boundCardHeadRefName: 'older-card-branch' }),
+    } as unknown as PrManager;
+    const open = () => defaultSeams({ prManager: reusedManager }).openPr({
+      title: 'same-cell', body: '본문', head: 'feat/same-cell', cwd: root,
+    });
+    expect((await open()).boundCardReuse).toEqual({ headRefName: 'older-card-branch' });
+    delete process.env.ELANOUS_TASK_CARD_ID;
+    expect((await open()).boundCardReuse).toBeUndefined();
   });
 
   test('다른 PR 에 결속된 카드는 bound-other-pr(번호) 로 실패한다', async () => {

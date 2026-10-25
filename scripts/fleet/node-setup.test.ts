@@ -15,21 +15,21 @@ test('node setup check requires both coredns Ready and one successful Pod DNS an
     ['1/1', 'Name: another.service\nAddress: 10.43.0.1', false],
   ] as const) {
     const wrapper = `CTX=pool-node-c; FAIL=0
-ok() { printf 'ok %s\\n' "$1"; }
-bad() { printf 'bad %s\\n' "$1"; FAIL=1; }
+ok() { printf 'ok %s\n' "$1"; }
+bad() { printf 'bad %s\n' "$1"; FAIL=1; }
 kubectl() {
   case " $* " in
-    *' get deployment coredns '*) printf '%s\\n' "$READY" ;;
+    *' get deployment coredns '*) printf '%s\n' "$READY" ;;
     *' create -f - '*) cat >/dev/null ;;
     *' wait --for=jsonpath='*) : ;;
-    *' get pod/'*) printf '%s\\n' "Succeeded:" ;;
-    *' logs pod/'*) printf '%s\\n' "$ANSWER" ;;
+    *' get pod/'*) printf '%s\n' "Succeeded:" ;;
+    *' logs pod/'*) printf '%s\n' "$ANSWER" ;;
     *' delete pod/'*) : ;;
     *) return 1 ;;
   esac
 }
 ${dns}
-printf 'dns-check-rc=%s\\n' "$FAIL"`;
+printf 'dns-check-rc=%s\n' "$FAIL"`;
     const result = spawnSync('bash', ['-c', wrapper], { encoding: 'utf8', env: { ...process.env, READY: ready, ANSWER: answer } });
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(`dns-check-rc=${ok ? 0 : 1}`);
@@ -39,21 +39,21 @@ printf 'dns-check-rc=%s\\n' "$FAIL"`;
 
 test('node setup distinguishes image pull failure from DNS lookup failure', () => {
   const wrapper = `CTX=pool-node-c; FAIL=0
-ok() { printf 'ok %s\\n' "$1"; }
-bad() { printf 'bad %s\\n' "$1"; FAIL=1; }
+ok() { printf 'ok %s\n' "$1"; }
+bad() { printf 'bad %s\n' "$1"; FAIL=1; }
 kubectl() {
   case " $* " in
-    *' get deployment coredns '*) printf '1/1\\n' ;;
+    *' get deployment coredns '*) printf '1/1\n' ;;
     *' create -f - '*) cat >/dev/null ;;
     *' wait --for=jsonpath='*) return 1 ;;
-    *' get pod/'*) printf 'Pending:ImagePullBackOff\\n' ;;
+    *' get pod/'*) printf 'Pending:ImagePullBackOff\n' ;;
     *' logs pod/'*) return 1 ;;
     *' delete pod/'*) : ;;
     *) return 1 ;;
   esac
 }
 ${dns}
-printf 'dns-check-rc=%s\\n' "$FAIL"`;
+printf 'dns-check-rc=%s\n' "$FAIL"`;
   const result = spawnSync('bash', ['-c', wrapper], { encoding: 'utf8' });
   expect(result.status).toBe(0);
   expect(result.stdout).toContain('bad dns 점검 이미지 확보 실패 (DNS 미측정)');
@@ -76,10 +76,10 @@ function runNodeSetup(opts: { os: 'Linux' | 'Darwin'; check: boolean; defaultRc:
   writeFileSync(join(dir, 'rules'), rules.map(([p, rc, out = '']) => `${p}\t${rc}\t${out}`).join('\n') + '\n');
   writeFileSync(join(bin, 'ssh'), `#!/bin/bash
 cmd="\${@: -1}"
-printf '%s\\n' "$cmd" >> "$FAKE_CALLS"
-while IFS=$'\\t' read -r pat rc out; do
+printf '%s\n' "$cmd" >> "$FAKE_CALLS"
+while IFS=$'\t' read -r pat rc out; do
   [ -n "$pat" ] || continue
-  case "$cmd" in *"$pat"*) [ -z "$out" ] || printf '%s\\n' "$out"; exit "$rc";; esac
+  case "$cmd" in *"$pat"*) [ -z "$out" ] || printf '%s\n' "$out"; exit "$rc";; esac
 done < "$FAKE_RULES"
 exit "$FAKE_DEFAULT_RC"
 `, { mode: 0o755 });
@@ -108,6 +108,83 @@ exit "$FAKE_DEFAULT_RC"
 }
 
 const anyCall = (invocations: string[], needle: string) => invocations.some((c) => c.includes(needle));
+
+function runLightWorker(opts: { signal: 'inactive' | 'active' | 'invalid'; statusFile?: boolean; activateDuringInstall?: boolean; lockHeld?: boolean; lockTimeoutSeconds?: number }) {
+  const dir = mkdtempSync(join(tmpdir(), 'fleet-light-worker-'));
+  const bin = join(dir, 'bin');
+  const home = join(dir, 'home');
+  const remoteState = join(home, '.elanous');
+  mkdirSync(bin);
+  mkdirSync(remoteState, { recursive: true });
+  mkdirSync(join(home, 'login-directory'));
+  const calls = join(dir, 'calls');
+  const runs = join(dir, 'worker-runs');
+  if (opts.statusFile !== false) writeFileSync(join(home, '.elanous/inspection-window'), `${opts.signal}\n`);
+  if (opts.lockHeld) mkdirSync(join(home, '.elanous/inspection-window.lock'));
+  writeFileSync(join(bin, 'elanous'), '#!/bin/bash\nprintf "%s\n" "$*" >> "$WORKER_RUNS"\nprintf "usage-rollup-result\n"\n', { mode: 0o755 });
+  writeFileSync(join(bin, 'ssh'), `#!/bin/bash
+set -eu
+cmd="\${@: -1}"
+printf '%s\n' "$cmd" >> "$FAKE_CALLS"
+cd "$SSH_LOGIN_DIR"
+if [[ "$cmd" == *'cat > ~/.elanous/run-light-worker.sh'* ]]; then
+  cat > "$HOME/.elanous/run-light-worker.sh"
+  chmod 700 "$HOME/.elanous/run-light-worker.sh"
+  if [ "$ACTIVATE_DURING_INSTALL" = 1 ]; then printf 'active\\n' > "$HOME/.elanous/inspection-window"; fi
+  exit 0
+fi
+exec bash -c "$cmd"
+`, { mode: 0o755 });
+  try {
+    const result = spawnSync('bash', [resolve(import.meta.dir, 'node-setup.sh'), 'fixture-node', '--light-worker'], {
+      encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ''}`, FAKE_CALLS: calls, SSH_LOGIN_DIR: join(home, 'login-directory'), WORKER_RUNS: runs, ACTIVATE_DURING_INSTALL: opts.activateDuringInstall ? '1' : '0', ELANOUS_FLEET_LIGHT_WORKER_COMMAND: 'scripts/fleet/run-light-worker.sh', FLEET_INSPECTION_LOCK_TIMEOUT_SECONDS: String(opts.lockTimeoutSeconds ?? 300), FLEET_INSPECTION_LOCK_RETRY_SECONDS: '0.05' },
+    });
+    const invocations = existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n') : [];
+    const workerRuns = existsSync(runs) ? readFileSync(runs, 'utf8').trim().split('\n') : [];
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr, invocations, workerRuns, lockExists: existsSync(join(home, '.elanous', 'inspection-window.lock')) };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('minio light-worker executes its installed entrypoint only outside inspection windows', () => {
+  const before = runLightWorker({ signal: 'inactive' });
+  const during = runLightWorker({ signal: 'active' });
+  const after = runLightWorker({ signal: 'inactive' });
+  const transition = runLightWorker({ signal: 'inactive', activateDuringInstall: true });
+  expect(before.status).toBe(0);
+  expect(before.lockExists).toBe(false);
+  expect(before.workerRuns).toEqual(['logs --all --include-test --event llm-usage --since 24h --limit 50000 --json --json-data']);
+  expect(during.status).toBe(0);
+  expect(during.lockExists).toBe(false);
+  expect(during.workerRuns).toEqual([]);
+  expect(during.stdout).toContain('inspection window active');
+  expect(after.status).toBe(0);
+  expect(after.lockExists).toBe(false);
+  expect(after.workerRuns).toEqual(['logs --all --include-test --event llm-usage --since 24h --limit 50000 --json --json-data']);
+  expect(transition.status).toBe(0);
+  expect(transition.lockExists).toBe(false);
+  expect(transition.workerRuns).toEqual([]);
+  expect(transition.stdout).toContain('inspection window active');
+  expect(transition.invocations.some((call) => call.includes('lock=') && call.includes('inspection-window.lock'))).toBe(true);
+  expect(before.invocations.some((call) => call.includes('~/.elanous/run-light-worker.sh'))).toBe(true);
+});
+
+test('minio light-worker fails closed when inspection-window status is unavailable', () => {
+  const result = runLightWorker({ signal: 'invalid', statusFile: false });
+  expect(result.status).toBe(1);
+  expect(result.workerRuns).toEqual([]);
+  expect(result.stderr).toContain('inspection-window status unavailable');
+});
+
+test('minio light-worker times out instead of waiting forever for an occupied lock', () => {
+  const result = runLightWorker({ signal: 'inactive', lockHeld: true, lockTimeoutSeconds: 1 });
+  expect(result.status).toBe(1);
+  expect(result.workerRuns).toEqual([]);
+  expect(result.stderr).toContain('inspection window lock acquisition timed out');
+  expect(result.lockExists).toBe(true);
+});
 
 describe('fleet node setup — 원격 OS 갈래', () => {
   test('Linux --check: 리눅스 단계를 «할 일»로만 내고 brew·Chrome·zshenv·sudo 는 안 부른다', () => {

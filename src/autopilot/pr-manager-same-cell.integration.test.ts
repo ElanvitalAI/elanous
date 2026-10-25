@@ -118,7 +118,7 @@ function fixture(conflict: boolean, ambiguousExisting = false, moveRemoteHead = 
 test('real git merges the old PR head and advances its branch without force or a second PR', () => {
   const f = fixture(false);
   try {
-    expect(f.deliver()).toEqual({ ok: true, url: f.url, reused: true });
+    expect(f.deliver()).toEqual({ ok: true, url: f.url, reused: true, boundCardHeadRefName: 'old-branch' });
     const newHead = f.inWork('ls-remote', '--exit-code', 'origin', 'refs/heads/old-branch').split('\t')[0]!;
     expect(newHead).not.toBe(f.oldHead);
     expect(f.inWork('merge-base', '--is-ancestor', f.oldHead, newHead)).toBe('');

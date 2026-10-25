@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CLASSIC_TUI_SCENARIOS, runClassicTuiScenario, type ClassicTuiScenario } from './classic-tui-seat-scenarios.js';
+import { dispatchDashboardChatMainAcpSend } from '../dashboard/input/chat-main-acp-dispatch.js';
+import { DashboardAcpChat } from '../dashboard/chat/acp-chat.js';
 
 const REPO_CLI = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
 
@@ -17,8 +19,54 @@ async function run(scenario: ClassicTuiScenario) {
 }
 
 describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
+  test('ACP production renderer folds two goal iterations, preserving tool and final reply', async () => {
+    const lines: string[] = [];
+    const interim = ['1단계 렌더했습니다.\n아직 못 했습니다.', '2단계 렌더했습니다.\n아직 못 했습니다.'];
+    const chat = new DashboardAcpChat({
+      cwd: process.cwd(), disableStreamSmoothing: true,
+      sessionStore: { get: () => null, set: () => {}, delete: () => true },
+      agentManager: { getAgent: async () => ({
+        newSession: async () => 'goal-iteration-mock',
+        prompt: async (_sessionId, _blocks, onUpdate) => {
+          const chunk = (text: string) => onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+          const tool = (label: string) => onUpdate({ sessionUpdate: 'tool_call', toolCallId: label, title: label, kind: 'other', status: 'completed' });
+          tool('ScheduleWakeup');
+          for (const reply of interim) {
+            chunk(reply.split('\n')[0]!);
+            tool('ScheduleWakeup progress');
+            chunk(reply.split('\n')[1]!);
+            onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' }, _meta: { goalInterim: reply } });
+          }
+          chunk('완료 영상: /tmp/final.mp4');
+          return { stopReason: 'end_turn' };
+        },
+        cancel: async () => {},
+      }) },
+    });
+    const done = Promise.withResolvers<void>();
+    dispatchDashboardChatMainAcpSend({
+      dashboardAcpChat: chat,
+      backend: 'claude', message: 'n8n 영상 제작', attachments: [], debugEnabled: false,
+      chatLines: lines, setChatScrollToTail: () => {}, redraw: () => {},
+      formatAssistantLines: (text) => text.split('\n'), formatUserLine: (_display, text) => text,
+      formatMutedLine: (line) => line, formatToolLine: (line) => line,
+      formatDebugLine: () => '', formatErrorLine: (_display, text) => text,
+      formatAssistantPrefix: () => '엘라누스:',
+      onTurnDone: () => done.resolve(),
+    });
+    await done.promise;
+    const screen = lines.join('\n');
+    expect(screen).toContain('· 진행 —');
+    expect(screen.match(/· 진행 —/g)).toHaveLength(2);
+    expect(screen).not.toContain('아직 못 했습니다.');
+    expect(screen).not.toContain('  1단계 렌더했습니다.');
+    expect(screen).not.toContain('  2단계 렌더했습니다.');
+    expect(screen.match(/ScheduleWakeup progress/g)).toHaveLength(2);
+    expect(screen).toContain('ScheduleWakeup');
+    expect(screen).toContain('완료 영상: /tmp/final.mp4');
+  });
   test('scenario list is the CLI contract', () => {
-    expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
+    expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
   });
 
   test('classic-400-heal: a 400 (history mismatch) turn heals with a new session and answers', async () => {
@@ -53,6 +101,19 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
       turnAnswered: true, onlyFakeProvider: true, exitedClean: true,
     });
     expect(typeof r.store.keyToPaintMaxMs).toBe('number');
+  }, 150_000);
+
+  test('classic-mcp-calltool: deferred MCP child is absent at boot and the first TUI tool dispatch succeeds once', async () => {
+    const r = await run('classic-mcp-calltool');
+    expect(r.checks).toEqual({
+      childWasAbsentAfterDeferredBoot: true,
+      fakeServerStartedOnce: true,
+      actualMcpToolsCallOnce: true,
+      lazyBootDeferredThenFirstCall: true,
+      firstCallResultReachedTui: true,
+      onlyFakeProvider: true,
+      exitedClean: true,
+    });
   }, 150_000);
 
   // ~6 min on a real PTY (the minute retry is the production interval, not a fake clock) — opt-in so the changed-file

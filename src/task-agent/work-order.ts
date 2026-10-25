@@ -11,7 +11,8 @@
  *   4. 판정 신호(`verdictSignal` — 조건·관측·기대) ⊕ 현재 계약 한 줄(`contract`)
  *   5. 경계(`boundary` — 대상 경로 · 건드리지 말 곳)
  *   6. 예산(`budget` — 시간 · 모델 티어 · Pod 자리 · 재작업 상한)
- *   7. 선행·짝 칸(`peers`)
+ *   7. 선행·짝 칸(`peers`) — 항목마다 조회된 상태(`state`)와 조회 시각(`observedAt`)을 보존한다
+ *      (칸 이름만으로는 발사 시점의 상태를 알 수 없다 · 조회하지 않은 항목은 «모름»).
  *   8. 선례 묶음(`precedents` — 같은 칸 앞 생애 결말·must-fix 서명)
  *   9. 올림 규칙(`escalation` — 무엇이면 누구에게 · 돈·보안은 대표)
  *
@@ -50,6 +51,21 @@ export interface WorkOrder {
   escalation: string;
   /** 입력에 없어 «모름»으로 채운 키. */
   unknownFields: string[];
+  /**
+   * 선행 항목별 관측 — 지시서가 선행을 배열로 적었을 때만 있다(문자열 한 줄이면 종전 그대로 없다).
+   * 항목마다 조회된 상태와 그 상태를 조회한 시각을 보존하고, 조회하지 않은 값은 «모름»이다.
+   */
+  dependencies?: WorkOrderDependency[];
+}
+
+/** 선행 칸 하나의 관측 — 칸 이름 ⊕ 조회된 상태 ⊕ 그 상태를 본 시각. */
+export interface WorkOrderDependency {
+  /** 선행 칸 id(또는 칸 이름). */
+  cell: string;
+  /** 조회된 상태(yellow·green·red …) — 조회하지 않았으면 «모름». */
+  state: string;
+  /** 상태를 조회한 시각(ISO 8601) — 조회하지 않았으면 «모름». */
+  observedAt: string;
 }
 
 export type ParseWorkOrderResult = { ok: true; order: WorkOrder } | { ok: false; reason: string };
@@ -61,6 +77,26 @@ function cellText(value: unknown): string {
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   try { const carried = JSON.stringify(value); return carried === 'null' || carried === undefined ? WORK_ORDER_UNKNOWN : carried; }
   catch { return WORK_ORDER_UNKNOWN; }
+}
+
+/**
+ * 선행 칸을 항목별 관측으로 읽는다 — 배열 원소가 객체면 `state`·`observedAt` 을 보존하고,
+ * 이름만 적힌 항목(문자열 등)은 조회하지 않은 것이므로 상태·시각 모두 «모름»으로 둔다.
+ * 선행 칸이 배열이 아니면(문자열 한 줄·없음) 항목 목록은 비어 있다 — 종전 문면 그대로다.
+ */
+function parseDependencies(value: unknown): WorkOrderDependency[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => {
+    if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const record = item as Record<string, unknown>;
+      return {
+        cell: cellText(record['cell'] ?? record['cellId']),
+        state: cellText(record['state']),
+        observedAt: cellText(record['observedAt']),
+      };
+    }
+    return { cell: cellText(item), state: WORK_ORDER_UNKNOWN, observedAt: WORK_ORDER_UNKNOWN };
+  });
 }
 
 /**
@@ -84,7 +120,21 @@ export function parseWorkOrder(source: string): ParseWorkOrderResult {
     if (value == null || (typeof value === 'string' && !value.trim())) unknownFields.push(field);
     cells[field] = text;
   }
-  return { ok: true, order: { cellId: rawCellId.trim(), ...cells, unknownFields } };
+  const dependencies = parseDependencies(record['peers']);
+  return {
+    ok: true,
+    order: {
+      cellId: rawCellId.trim(), ...cells,
+      ...(dependencies.length ? { dependencies } : {}),
+      unknownFields,
+    },
+  };
+}
+
+/** 선행 항목별 «상태 ⊕ 조회 시각» 한 줄 — 이름만 있는 항목은 «모름 (관측 모름)»으로 드러난다. */
+function renderDependencies(dependencies: WorkOrderDependency[]): string {
+  const items = dependencies.map((dep) => `${dep.cell}=${dep.state} (관측 ${dep.observedAt})`);
+  return `선행 상태: ${items.join(' · ')}`;
 }
 
 /** 검증된 지시서를 사람이 읽는 골 문면으로 펼친다 — 첫 줄 «대상 경로:»(경계), 둘째 줄 «현재 계약:». */
@@ -99,6 +149,7 @@ export function renderWorkOrderGoal(order: WorkOrder): string {
     `판정 신호: ${order.verdictSignal}`,
     `예산: ${order.budget}`,
     `선행·짝 칸: ${order.peers}`,
+    ...(order.dependencies?.length ? [renderDependencies(order.dependencies)] : []),
     `선례: ${order.precedents}`,
     `올림 규칙: ${order.escalation}`,
   ].join('\n');

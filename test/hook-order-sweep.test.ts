@@ -88,6 +88,27 @@ describe('hook order sweep', () => {
       .toEqual([['useEffect', 'conditional'], ['useMemo', 'nested-function']]);
   }, 60_000);
 
+  it('treats short-circuit left operands as eager and right operands as conditional', async () => {
+    const report = await sweepHookOrder(fixture({
+      'apps/pwa/src/ShortCircuit.tsx': [
+        'export function AndLeft() { return useAndLeft() && true; }',
+        'export function AndRight() { return true && useAndRight(); }',
+        'export function OrLeft() { return useOrLeft() || true; }',
+        'export function OrRight() { return true || useOrRight(); }',
+        'export function NullishLeft() { return useNullishLeft() ?? true; }',
+        'export function NullishRight() { return undefined ?? useNullishRight(); }',
+      ].join('\n'),
+    }));
+
+    expect(report.violations.map((violation) => [violation.hook, violation.kind]))
+      .toEqual([
+        ['useAndRight', 'conditional'],
+        ['useOrRight', 'conditional'],
+        ['useNullishRight', 'conditional'],
+      ]);
+    expect(report.hookCallsScanned).toBe(6);
+  }, 60_000);
+
   it('allows a shared query-options factory when each hook is called at the top level', async () => {
     const report = await sweepHookOrder(fixture({
       'apps/pwa/src/use-logs.ts': [

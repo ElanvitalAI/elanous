@@ -43,6 +43,7 @@ import { grokApiKeyEnvName } from './grok-auth-probe.js';
 import { grokAuthHint, isGrokAuthError } from './grok-auth.js';
 import { providerEnvKey } from '../llm/provider-credentials.js';
 import { getUserConfig } from '../user-config.js';
+import { createAcpStderrSummarizer } from './stderr-summary.js';
 import {
   AcpForkSessionUnsupportedError,
   AcpListSessionsUnsupportedError,
@@ -548,16 +549,41 @@ export class AcpAgent {
     });
     await spawned;
 
-    // Stderr from the agent is opaque text — log it so the operator
-    // sees errors from the subprocess (auth, network, etc.) without
-    // having to attach a debugger.
+    // Keep raw diagnostics in the debug log and coalesce the UI warning.
+    const stderrSummary = createAcpStderrSummarizer(({ kind, count }) => {
+      this.log(`stderr: ${kind} (${count}건)`);
+    });
+    const maxPendingStderrChars = 8 * 1024;
+    let pendingStderr = '';
+    const recordStderrLine = (line: string): void => {
+      const clean = line.trim();
+      if (!clean) return;
+      const redacted = redactSecretText(clean);
+      debug.log('acp.stderr', 'line', { backendId: this.spec.id, line: redacted });
+      stderrSummary.push(redacted);
+    };
     child.stderr.setEncoding('utf-8');
     child.stderr.on('data', (chunk: string) => {
-      for (const line of chunk.split('\n')) {
-        if (line.trim()) this.log(`stderr: ${line}`);
+      const lines = `${pendingStderr}${chunk}`.split('\n');
+      pendingStderr = lines.pop() ?? '';
+      for (const line of lines) recordStderrLine(line);
+      while (pendingStderr.length > maxPendingStderrChars) {
+        recordStderrLine(`${pendingStderr.slice(0, maxPendingStderrChars)} [continued]`);
+        pendingStderr = pendingStderr.slice(maxPendingStderrChars);
       }
     });
+    child.stderr.once('end', () => {
+      recordStderrLine(pendingStderr);
+      pendingStderr = '';
+      stderrSummary.flush();
+    });
+    child.stderr.once('error', () => {
+      recordStderrLine(pendingStderr);
+      pendingStderr = '';
+      stderrSummary.flush();
+    });
     child.on('exit', (code, signal) => {
+      stderrSummary.flush();
       this.log(`subprocess exited (code=${code}, signal=${signal})`);
       this.proc = null;
       this.connection = null;

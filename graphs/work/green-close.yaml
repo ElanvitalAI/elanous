@@ -1,0 +1,37 @@
+# GREEN-CLOSE-RECIPE: deterministic evidence walk; no checklist writes.
+graph_id: green-close
+version: 1
+entry_node: e1
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: e1, kind: observe, recipe: 'cmd:e1', max_visits: 1 }
+  - { node_id: e2, kind: gate, recipe: 'cmd:e2', max_visits: 1 }
+  - { node_id: e3, kind: judge, recipe: 'cmd:e3', max_visits: 1 }
+  - { node_id: produce, kind: observe, recipe: 'cmd:produce', max_visits: 1 }
+  - { node_id: boundary, kind: gate, recipe: 'cmd:boundary', max_visits: 1 }
+  - { node_id: make-test, kind: agent, recipe: 'cmd:make-test', max_visits: 1 }
+  - { node_id: result, kind: observe, recipe: 'cmd:result', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: e1
+    on: outcome
+    map: { pass: e2, fail: result, hold: result }
+  - from: e2
+    on: outcome
+    map: { pass: e3, fail: result, hold: result }
+  - from: e3
+    on: outcome
+    map: { pass: produce, missing: make-test, hold: result }
+  - from: produce
+    on: outcome
+    map: { pass: boundary, hold: result }
+  - from: boundary
+    on: outcome
+    map: { pass: result, hold: result }
+  - from: make-test
+    on: outcome
+    map: { 'mock-pr': result, hold: result }
+  - from: result
+    on: outcome
+    map: { ok: done, fail: failed }

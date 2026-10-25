@@ -3101,7 +3101,7 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
     const calls: Array<{ model?: string; provider?: { name: string } }> = [];
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
     const log = spyOn(debug, 'log').mockImplementation((category: string, event: string, data?: Record<string, unknown>) => {
-      if (category === 'self-dev.review-fallback') events.push({ event, data: data ?? {} });
+      if (category === 'self-dev.review-fallback' || category === 'review.fallback') events.push({ event, data: data ?? {} });
     });
     try {
       writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
@@ -3132,12 +3132,62 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
         }),
       }));
       expect(events).toContainEqual(expect.objectContaining({
+        event: 'primary-unresolved',
+        data: expect.objectContaining({ model: 'unregistered-review-model' }),
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
         event: 'resolved',
         data: expect.objectContaining({ provider: 'grok', resolvedProvider: 'openai-codex' }),
       }));
     } finally {
       setUserConfigOverlay(null);
       log.mockRestore();
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('GLM alias를 role source와 무관하게 canonical OpenRouter ID로 review에 전달한다', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'dev-pipeline-review-provider-pin-'));
+    const originalFetch = globalThis.fetch;
+    const originalOpenRouterKey = process.env.OPENROUTER_API_KEY;
+    const requests: Array<{ url: string; model: string }> = [];
+    try {
+      process.env.OPENROUTER_API_KEY = 'test-review-openrouter-key';
+      globalThis.fetch = (async (input, init) => {
+        const url = String(input);
+        const body = JSON.parse(String(init?.body)) as { model: string };
+        requests.push({ url, model: body.model });
+        return new Response('data: {"choices":[{"delta":{"content":"VERDICT: PASS"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200, headers: { 'content-type': 'text/event-stream' },
+        });
+      }) as typeof fetch;
+      writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
+      for (const variant of [
+        { provider: 'glm', model: 'glm-5.3' },
+        { provider: 'openrouter', model: 'z-ai/glm-5.3' },
+        { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' },
+        { provider: undefined, model: 'glm-5.3' },
+      ] as const) {
+        requests.length = 0;
+        setUserConfigOverlay((config) => ({
+          ...config,
+          roleLlm: variant.provider ? { review: { provider: variant.provider, model: variant.model } } : {},
+          roleModels: variant.provider ? {} : { review: variant.model }, roleModelTiers: {},
+          llm: { ...config.llm, provider: 'openai-codex' },
+        }));
+        const seams = await buildDefaultSelfImplementSeams(planDevPipeline(T()), {
+          toolReviewerRate: 0,
+          reviewScopeDiff: async () => 'diff --git a/changed.ts b/changed.ts\n+export const changed = true;\n',
+        });
+        const review = await seams.reviewDiff!(repo, { goal: 'review provider pin' });
+        expect(review.reviewed).toBe(true);
+        expect(requests).toEqual([{ url: 'https://openrouter.ai/api/v1/chat/completions', model: 'z-ai/glm-5.3' }]);
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = originalOpenRouterKey;
+      setUserConfigOverlay(null);
       rmSync(repo, { recursive: true, force: true });
     }
   });

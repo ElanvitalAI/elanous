@@ -11,6 +11,7 @@
 //   `reportTuiTurn` 을 부른다. 기록 실패는 `debug.log('pty.tui-state', …)` — 조용히 삼키지 않는다.
 // 판독(CLI 쪽): `describePtyRunState` 가 행 ⊕ 설치본 기록 ⊕ (체크아웃이면) 그 뿌리의 HEAD 로 판정한다.
 
+import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -307,6 +308,144 @@ export function formatTurnCell(cell: PtyTurnCell): string {
   return `${cell.state},${cell.sinceSec === null ? '?' : cell.sinceSec}s`;
 }
 
+// ── H9 자기 재기동 — «재기동 필요» ∧ 유휴 ∧ 사람 입력 없음 ⇒ 스스로 재기동 ──
+//
+// 정본: seat-state/OPC/TUI-HOMEOSTASIS-SLICES-2026-10-16.md (TUI-H9-IDLE-SELF-RESTART).
+// 판정(`decideSelfRestart`)은 순수 함수 — 실제 «새 세션 ⊕ 자리 맥락 재주입» 은 주입된 수행자(`restart`)가 한다.
+// 낡음 판정은 기존 `BuildStaleness` 를 그대로 재사용한다(판정·문면을 두벌로 만들지 않는다).
+// 사람 입력 대기 신호는 입력 축(대시보드)이 준다 — 이 모듈은 입력 큐를 소유하지 않는다.
+
+/** 유휴 유예: 이만큼 조용했을 때만 재기동한다 — 턴 사이 «쉼»에서 세션을 새로 띄우지 않는다. */
+export const DEFAULT_SELF_RESTART_IDLE_MS = 90_000;
+
+export type SelfRestartReason =
+  | 'stale-idle-no-input'
+  | 'not-stale'
+  | 'staleness-unknown'
+  | 'turn-busy'
+  | 'turn-unknown'
+  | 'still-warm'
+  | 'human-input-pending';
+
+export interface SelfRestartDecisionDeps {
+  /** 재기동 필요인가 — 미지(null)면 재기동하지 않는다. */
+  readonly stale: boolean | null;
+  readonly staleReason?: BuildStaleReason;
+  readonly turn: PtyTurnView;
+  /** 지금 턴 상태에 머문 시간(ms) — 모르면 null. */
+  readonly idleMs: number | null;
+  readonly humanInputPending: boolean;
+  readonly minIdleMs?: number;
+}
+
+export interface SelfRestartDecision {
+  readonly restart: boolean;
+  readonly reason: SelfRestartReason;
+}
+
+/** 판정선: 세 조건(재기동 필요 · 유휴 · 사람 입력 없음)이 모두 참일 때만 참. 거짓인 첫 조건을 이유로 낸다. */
+export function decideSelfRestart(deps: SelfRestartDecisionDeps): SelfRestartDecision {
+  if (deps.stale === null) return { restart: false, reason: 'staleness-unknown' };
+  if (!deps.stale) return { restart: false, reason: 'not-stale' };
+  if (deps.turn === 'busy') return { restart: false, reason: 'turn-busy' };
+  if (deps.turn === 'unknown') return { restart: false, reason: 'turn-unknown' };
+  const minIdleMs = deps.minIdleMs ?? DEFAULT_SELF_RESTART_IDLE_MS;
+  if (deps.idleMs === null || deps.idleMs < minIdleMs) return { restart: false, reason: 'still-warm' };
+  if (deps.humanInputPending) return { restart: false, reason: 'human-input-pending' };
+  return { restart: true, reason: 'stale-idle-no-input' };
+}
+
+/** 재기동 계획 — 새 세션 ⊕ 자리 맥락 재주입 명령까지. 세션 id 를 모르면 명령은 null(판정 근거는 남긴다). */
+export interface TuiSelfRestartPlan {
+  readonly surfaceId: string;
+  readonly staleReason: BuildStaleReason;
+  readonly idleMs: number;
+  readonly relaunchCommand: string | null;
+}
+
+export interface TuiSelfRestartDeps {
+  /** 낡음 판정 재료 — 생략하면 이 프로세스의 기동 판 ⊕ 설치본 ⊕ 체크아웃 HEAD 로 잰다. */
+  readonly staleness?: () => BuildStaleness;
+  /** 사람이 지금 입력 중인가 — 생략하면 «모름» 으로 보고 재기동하지 않는다(조용한 세션을 뺏지 않는다). */
+  readonly humanInputPending?: () => boolean;
+  readonly sessionId?: string;
+  /**
+   * 지금 이 TUI 가 «소유한» 세션 — 틱마다 다시 읽어 `sessionId` 보다 우선한다.
+   * 대화가 갈아 끼워지는 TUI 는 기동 시점 값을 고정할 수 없어 이 칸을 쓴다(읽기 실패 → null → 재기동 안 함).
+   */
+  readonly readSessionId?: () => string | null;
+  readonly minIdleMs?: number;
+  readonly intervalMs?: number;
+  /** 실제 재기동 수행자(새 세션 ⊕ 자리 맥락 재주입). 생략 시 설치본 `elanous --resume <세션>`. */
+  readonly restart?: (plan: TuiSelfRestartPlan) => void;
+  /**
+   * 낡은 TUI 가 좌석을 «놓는» 동작 — 새 세션을 띄우기 직전에 부른다.
+   * 생략해도 이 녹음기는 그 좌석 행 쓰기를 스스로 놓는다(두 TUI 가 한 좌석을 겹쳐 쓰지 않게).
+   */
+  readonly yieldSeat?: (plan: TuiSelfRestartPlan) => void;
+  /** 유휴 감시 등록 — 틱을 받아 해제 함수를 준다. 생략 시 unref 된 setInterval. */
+  readonly watch?: (tick: () => void) => () => void;
+}
+
+const stalenessFromRunningBuild = (): BuildStaleness => {
+  const build = runningBuild();
+  const installed = readCurrentInstallRecord();
+  let checkoutHead: string | undefined;
+  if (build.source === 'checkout' && build.codeRoot) checkoutHead = readCheckoutHead(build.codeRoot);
+  return judgeBuildStaleness({ build, installed, ...(checkoutHead ? { checkoutHead } : {}) });
+};
+
+const defaultWatch = (tick: () => void, intervalMs: number): (() => void) => {
+  const timer = setInterval(tick, intervalMs);
+  (timer as unknown as { unref?: () => void }).unref?.();
+  return () => { clearInterval(timer); };
+};
+
+/** 재기동 인자: 새 세션은 `--resume <세션>` 으로 그 좌석의 자리 맥락을 다시 받는다. */
+export const TUI_RELAUNCH_FLAG = '--resume';
+
+export interface TuiRelaunchChild {
+  on(event: 'error', listener: (error: Error) => void): unknown;
+  on(event: 'spawn', listener: () => void): unknown;
+  unref(): void;
+}
+
+/** 프로세스 띄우기 seam — 무대는 여기만 가짜로 바꿔 «생산 argv·옵션» 을 그대로 지난다. */
+export type TuiRelaunchSpawn = (
+  command: string,
+  args: readonly string[],
+  options: { detached: boolean; stdio: 'ignore' },
+) => TuiRelaunchChild;
+
+const defaultRelaunchSpawn: TuiRelaunchSpawn = (command, args, options) =>
+  spawn(command, args, options) as unknown as TuiRelaunchChild;
+
+let relaunchSpawn: TuiRelaunchSpawn = defaultRelaunchSpawn;
+
+/** 무대용 spawn 교체 — 인자 없이 부르면 생산 기본값(spawn)으로 되돌린다. */
+export function setTuiRelaunchSpawnForTesting(next?: TuiRelaunchSpawn): void {
+  relaunchSpawn = next ?? defaultRelaunchSpawn;
+}
+
+/** 기본 재기동 수행자: 설치본 `elanous --resume <세션>` — 새 세션이 그 좌석의 자리 맥락으로 다시 뜬다. */
+export const spawnTuiRelaunch = (sessionId: string): Promise<void> => {
+  return new Promise<void>((resolve, reject) => {
+    const child = relaunchSpawn(process.env.ELANOUS_BIN || 'elanous', [TUI_RELAUNCH_FLAG, sessionId], { detached: true, stdio: 'ignore' });
+    let settled = false;
+    child.on('error', (error: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.on('spawn', () => {
+      if (settled) return;
+      settled = true;
+      child.unref();
+      resolve();
+    });
+  });
+};
+
 // ── 기록(TUI) ──
 
 export interface TuiRunStateRecorderDeps {
@@ -326,6 +465,11 @@ export interface TuiRunStateRecorderDeps {
    * 생략 시: 기본 신고기(herdr 미주입)일 때만 실 `process` · 주입 herdr 는 지킴이 0. `null` 이면 안 건다.
    */
   readonly signals?: HerdrSignalTarget | null;
+  /**
+   * H9 자기 재기동(낡은 판 ∧ 유휴 ∧ 사람 입력 없음 ⇒ 새 세션 ⊕ 자리 맥락 재주입).
+   * 생략하면 감시를 안 건다 — 이 축을 켜는 것은 호출자(생산 진입점)의 결정이다.
+   */
+  readonly selfRestart?: TuiSelfRestartDeps;
 }
 
 interface ActiveRecorder {
@@ -336,6 +480,8 @@ interface ActiveRecorder {
   readonly herdr: HerdrAgentReporterLike | null;
   /** manifest 에 실제로 적힌 마지막 턴. 실패면 안 바뀐다(재시도). */
   last?: PtyTurnState;
+  /** idle 로 «바뀐» 시각 — 유휴 경과의 0초. busy 로 가면 다시 모른다. */
+  idleSince?: number;
   /** herdr 에 마지막으로 알린 턴. manifest 성패와 따로 둔다. */
   herdrLast?: PtyTurnState;
 }
@@ -366,6 +512,88 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
   active = recorder;
   writeTurnState(recorder, 'idle');
   if (herdr) { try { herdr.start(); } catch { /* 신고 실패가 녹음기를 깨지 않는다 */ } }
+  // H9 유휴 감시: 판·턴·사람 입력을 매 틱 다시 재고, 재기동 성공 뒤에만 좌석을 양도한다.
+  const selfRestart = deps.selfRestart;
+  let unwatch: () => void = () => {};
+  if (selfRestart) {
+    const minIdleMs = selfRestart.minIdleMs ?? DEFAULT_SELF_RESTART_IDLE_MS;
+    const restartedFor = new Set<BuildStaleReason>();
+    let restartInFlight = false;
+    const tick = (): void => {
+      if (active !== recorder) return;
+      let staleness: BuildStaleness;
+      try { staleness = (selfRestart.staleness ?? stalenessFromRunningBuild)(); } catch (error) {
+        log('self-restart-staleness-failed', { ptyId: surfaceId, error: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+      // 사람 입력 신호가 없거나 읽을 수 없으면 모름으로 닫는다 — 명시적 false만 «사람 입력 없음»이다.
+      let humanInputPending = true;
+      if (selfRestart.humanInputPending) {
+        try { humanInputPending = selfRestart.humanInputPending() !== false; } catch { humanInputPending = true; }
+      }
+      // 재기동은 «지금 이 TUI 가 보여 주는 대화» 로만 잇는다 — 읽기 실패는 null(대체 세션을 지어내지 않는다).
+      let sessionId: string | null = selfRestart.sessionId ?? null;
+      if (selfRestart.readSessionId) {
+        try { sessionId = selfRestart.readSessionId(); } catch { sessionId = null; }
+      }
+      const idleMs = recorder.idleSince === undefined ? null : Math.max(0, now() - recorder.idleSince);
+      const decision = decideSelfRestart({
+        stale: staleness.stale,
+        staleReason: staleness.reason,
+        turn: recorder.last ?? 'unknown',
+        idleMs,
+        humanInputPending,
+        minIdleMs,
+      });
+      if (!decision.restart || restartedFor.has(staleness.reason) || restartInFlight) return;
+      if (!sessionId) {
+        log('self-restart-no-session', { ptyId: surfaceId, staleReason: staleness.reason });
+        return;
+      }
+      const plan: TuiSelfRestartPlan = {
+        surfaceId,
+        staleReason: staleness.reason,
+        idleMs: idleMs ?? 0,
+        relaunchCommand: sessionId ? buildStaleInstallRelaunchCommand(sessionId) : null,
+      };
+      log('self-restart', { ptyId: surfaceId, reason: decision.reason, staleReason: plan.staleReason, idleMs: plan.idleMs, relaunchCommand: plan.relaunchCommand });
+      restartInFlight = true;
+      const handoff = (): void => {
+        // 새 세션이 실제로 생성된 뒤에만 낡은 TUI 가 좌석 행 쓰기를 놓는다.
+        if (selfRestart.yieldSeat) {
+          try {
+            selfRestart.yieldSeat(plan);
+          } catch (error) {
+            log('self-restart-yield-failed', { ptyId: surfaceId, error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+        if (active === recorder) active = null;
+        restartedFor.add(staleness.reason);
+        restartInFlight = false;
+        log('self-restart-handover', { ptyId: surfaceId, staleReason: plan.staleReason, relaunchCommand: plan.relaunchCommand });
+      };
+      const failed = (error: unknown): void => {
+        restartInFlight = false;
+        log('self-restart-failed', { ptyId: surfaceId, error: error instanceof Error ? error.message : String(error) });
+      };
+      try {
+        if (selfRestart.restart) {
+          selfRestart.restart(plan);
+          handoff();
+        } else {
+          void spawnTuiRelaunch(sessionId).then(handoff, failed);
+        }
+      } catch (error) {
+        failed(error);
+      }
+    };
+    try {
+      const watch = selfRestart.watch ?? ((fn: () => void) => defaultWatch(fn, selfRestart.intervalMs ?? Math.max(5_000, Math.round(minIdleMs / 3))));
+      unwatch = watch(tick);
+    } catch (error) {
+      log('self-restart-watch-failed', { ptyId: surfaceId, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
   // raw 모드 전 ctrl+c(SIGINT 기본 죽음)는 'exit' 훅을 안 돌린다 — 신호에서도 반납한다.
   const signals = deps.signals !== undefined ? deps.signals : (deps.herdr === undefined ? process : null);
   let unguard: () => void = () => {};
@@ -373,6 +601,7 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
     try { unguard = guardHerdrReleaseOnSignal(() => herdr.release(), signals); } catch { /* 지킴이 실패가 녹음기를 깨지 않는다 */ }
   }
   return () => {
+    try { unwatch(); } catch { /* 종료 경로를 깨지 않는다 */ }
     try { unguard(); } catch { /* 종료 경로를 깨지 않는다 */ }
     if (herdr) { try { herdr.release(); } catch { /* 종료 경로를 깨지 않는다 */ } }
     if (active === recorder) active = null;
@@ -389,7 +618,12 @@ function writeTurnState(recorder: ActiveRecorder, turn: PtyTurnState): void {
   const at = recorder.now();
   let ok = false;
   try { ok = recorder.writeTurn(recorder.surfaceId, turn, at); } catch { ok = false; }
-  if (ok) recorder.last = turn;
+  if (ok) {
+    recorder.last = turn;
+    // 유휴 경과의 0초는 «idle 로 바뀐 시각» — busy 로 가면 다시 모른다.
+    if (turn === 'idle') recorder.idleSince = at;
+    else recorder.idleSince = undefined;
+  }
   // 실패는 관측으로 남긴다 — 바깥 제어자는 그 사이 «unknown/낡은 값»을 본다. 성공은 남기지 않는다(턴마다 두 줄은 소음).
   else recorder.log('turn-write-failed', { ptyId: recorder.surfaceId, turn, at });
   // herdr 는 manifest 쓰기 성패와 무관하게, 값이 바뀔 때 알린다(같은 값 재시도는 한 번만).

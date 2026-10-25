@@ -1,6 +1,13 @@
-import { describe, expect, it, spyOn } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, it, spyOn } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { makePrManager, resolveDeliverableBase, type CmdRunner } from './pr-manager.js';
+
+const inheritedTaskCardId = process.env.ELANOUS_TASK_CARD_ID;
+beforeAll(() => { delete process.env.ELANOUS_TASK_CARD_ID; });
+afterAll(() => {
+  if (inheritedTaskCardId === undefined) delete process.env.ELANOUS_TASK_CARD_ID;
+  else process.env.ELANOUS_TASK_CARD_ID = inheritedTaskCardId;
+});
 
 const cwd = '/wt';
 const local = 'bench/x';
@@ -98,7 +105,7 @@ describe('explicit PR base in a Pod clone', () => {
     }
   });
 
-  it('opens a PR with origin/bench/x for both git comparisons but bench/x for gh', () => {
+  it('opens a PR with origin/bench/x for both git comparisons but bench/x for gh without a failure incident', () => {
     const { run, calls } = fakeRunner([remote], true);
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
@@ -109,6 +116,7 @@ describe('explicit PR base in a Pod clone', () => {
       expect(calls).toContainEqual(['git', '-C', cwd, 'diff', '--name-only', `${remote}..HEAD`]);
       expect(calls).toContainEqual(['git', '-C', cwd, 'push', '--force', '-u', 'origin', 'feature/pr']);
       expect(calls).toContainEqual(['gh', 'pr', 'create', '--head', 'feature/pr', '--title', 'Title', '--body', 'Body', '--base', local]);
+      expect(log.mock.calls.some(([, event]) => event === 'pr-create-failure-incident')).toBe(false);
       expect(log.mock.calls.filter(([category, event]) => category === 'autopilot.pr-manager' && event === 'base-resolved-remote'))
         .toEqual([['autopilot.pr-manager', 'base-resolved-remote', { explicit: local, resolved: remote }]]);
     } finally {
