@@ -12,6 +12,7 @@ dry_run_await_approval: true
 terminal_nodes: [done, failed]
 nodes:
   - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
+  - { node_id: traffic-cut-start, kind: gate, recipe: 'cmd:traffic-cut-start', max_visits: 1 }
   - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
   - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1 }
   # cmd:docs dispatches by graph node ID: bounded prefetch before gate, TUI join after upgrade, docs write after both.
@@ -39,6 +40,7 @@ nodes:
   - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }
   - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: npm-publish, kind: git, recipe: 'cmd:npm-publish', max_visits: 1 }
+  - { node_id: traffic-npm-published, kind: gate, recipe: 'cmd:traffic-npm-published', max_visits: 1 }
   - { node_id: docs-land, kind: git, recipe: 'cmd:docs-land', max_visits: 1 }
   - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: traffic-verify-complete, kind: gate, recipe: 'cmd:traffic-verify-complete', max_visits: 1 }
@@ -47,35 +49,40 @@ nodes:
   - { node_id: ops-upgrade, kind: agent, recipe: 'cmd:ops-upgrade', max_visits: 1 }
   - { node_id: version-dev-bump, kind: git, recipe: 'cmd:version-dev-bump', max_visits: 1 }
   - { node_id: version-dev-bump-after-failure, kind: git, recipe: 'cmd:version-dev-bump', max_visits: 1 }
+  - { node_id: traffic-failed-restore, kind: gate, recipe: 'cmd:traffic-failed-restore', max_visits: 1 }
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
-  - { from: version-release, on: outcome, map: { ok: cutoff, fail: failed, error: failed } }
-  - { from: cutoff, on: outcome, map: { ok: checklist-gate, fail: failed, error: failed } }
-  - { from: checklist-gate, on: outcome, map: { ok: export-check, fail: failed, error: failed } }
-  - { from: export-check, on: outcome, map: { ok: prefetch, fail: failed, error: failed } }
+  - { from: version-release, on: outcome, map: { ok: traffic-cut-start, fail: failed, error: failed } }
+  # Advisory traffic writes report failure to OP; release steps still proceed on fail/error.
+  - { from: traffic-cut-start, on: outcome, map: { ok: cutoff, fail: cutoff, error: cutoff } }
+  - { from: cutoff, on: outcome, map: { ok: checklist-gate, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: checklist-gate, on: outcome, map: { ok: export-check, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: export-check, on: outcome, map: { ok: prefetch, fail: traffic-failed-restore, error: traffic-failed-restore } }
   # Prefetch never gates: even a crashed prefetch node is a cache miss — the late nodes take their original paths.
   - { from: prefetch, on: outcome, map: { ok: gate, fail: gate, error: gate } }
   - { from: gate, on: outcome, map: { ok: traffic-gate-passed, fail: gate-triage, error: gate-triage } }
   # Warning-only: the transition result stays truthful; every outcome continues to the next release node.
   - { from: traffic-gate-passed, on: outcome, map: { ok: mac-smoke, fail: mac-smoke, error: mac-smoke } }
-  - { from: gate-triage, on: outcome, map: { ok: failed, fail: failed, error: failed } }
+  - { from: gate-triage, on: outcome, map: { ok: traffic-failed-restore, fail: traffic-failed-restore, error: traffic-failed-restore } }
   # Warning-only: a macOS failure or unmeasured run never blocks publishing — auto-approve shows it as a warning row.
   - { from: mac-smoke, on: outcome, map: { ok: pwa, fail: pwa, error: pwa } }
-  - { from: pwa, on: outcome, map: { ok: prepare, fail: failed, error: failed } }
-  - { from: prepare, on: outcome, map: { ok: upgrade, fail: failed, error: failed } }
-  - { from: upgrade, on: outcome, map: { ok: tui, fail: failed, error: failed } }
-  - { from: tui, on: outcome, map: { ok: docs, fail: failed, error: failed } }
-  - { from: docs, on: outcome, map: { ok: known-issues, fail: failed, error: failed } }
-  - { from: known-issues, on: outcome, map: { ok: notes-check, fail: failed, error: failed } }
+  - { from: pwa, on: outcome, map: { ok: prepare, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: prepare, on: outcome, map: { ok: upgrade, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: upgrade, on: outcome, map: { ok: tui, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: tui, on: outcome, map: { ok: docs, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: docs, on: outcome, map: { ok: known-issues, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: known-issues, on: outcome, map: { ok: notes-check, fail: traffic-failed-restore, error: traffic-failed-restore } }
   # RELEASE-GRAPH-SELFHEAL: fail/error re-enter notes-check through one repair; publish still requires a passing recheck.
   - { from: notes-check, on: outcome, map: { ok: auto-approve, fail: notes-repair, error: notes-repair } }
-  - { from: notes-repair, on: outcome, map: { ok: notes-recheck, fail: failed, error: failed } }
-  - { from: notes-recheck, on: outcome, map: { ok: auto-approve, fail: failed, error: failed } }
+  - { from: notes-repair, on: outcome, map: { ok: notes-recheck, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: notes-recheck, on: outcome, map: { ok: auto-approve, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: auto-approve, on: outcome, map: { ok: publish, fail: approve-publish, error: approve-publish } }
-  - { from: approve-publish, on: outcome, map: { ok: publish, fail: failed } }
-  - { from: publish, on: outcome, map: { ok: npm-publish, fail: failed, error: failed } }
-  - { from: npm-publish, on: outcome, map: { ok: docs-land, fail: failed, error: failed } }
+  - { from: approve-publish, on: outcome, map: { ok: publish, fail: traffic-failed-restore } }
+  - { from: publish, on: outcome, map: { ok: npm-publish, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: npm-publish, on: outcome, map: { ok: traffic-npm-published, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  # Publication already happened; a traffic write failure must not skip docs-land.
+  - { from: traffic-npm-published, on: outcome, map: { ok: docs-land, fail: docs-land, error: docs-land } }
   # RELEASE-DEVBUMP-ALWAYS: after a successful publish every fail/error routes through version-dev-bump —
   # a published release always hands main to its own next -dev, then still finishes failed.
   - { from: docs-land, on: outcome, map: { ok: verify, fail: version-dev-bump-after-failure, error: version-dev-bump-after-failure } }
@@ -85,5 +92,6 @@ edges:
   - { from: vault-note, on: outcome, map: { ok: release-story, fail: release-story, error: release-story } }
   - { from: release-story, on: outcome, map: { ok: ops-upgrade, fail: ops-upgrade, error: ops-upgrade } }
   - { from: ops-upgrade, on: outcome, map: { ok: version-dev-bump, fail: version-dev-bump, error: version-dev-bump } }
-  - { from: version-dev-bump, on: outcome, map: { ok: done, fail: failed, error: failed } }
-  - { from: version-dev-bump-after-failure, on: outcome, map: { ok: failed, fail: failed, error: failed } }
+  - { from: version-dev-bump, on: outcome, map: { ok: done, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: version-dev-bump-after-failure, on: outcome, map: { ok: traffic-failed-restore, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: traffic-failed-restore, on: outcome, map: { ok: failed, fail: failed, error: failed } }

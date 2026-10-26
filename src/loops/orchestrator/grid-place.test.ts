@@ -297,7 +297,7 @@ test('a request already in the harness queue gets its pool hint moved when the n
     expect(moved.map(item => item.id)).toEqual(first.map(item => item.id));
     expect(moved[0]?.poolHint).toBe('pool-node-c@node-c:2,pool-node-b@node-b:8');
     expect(queueLaunchArgs(moved[0]!).at(-1)).toBe('pool-node-c@node-c:2,pool-node-b@node-b:8');
-    expect(reasons.some(reason => reason.startsWith(`rehost-queue:orch:${card.id}:C1:pool-node-c`))).toBe(true);
+    expect(reasons.some(reason => reason.startsWith('rehost-queue:orch:' + card.id + ':C1:pool-node-c'))).toBe(true);
   } finally {
     if (previous.pool === undefined) delete process.env.ELANOUS_POD_POOL; else process.env.ELANOUS_POD_POOL = previous.pool;
     if (previous.config === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previous.config;
@@ -321,7 +321,7 @@ test('a chosen host that is not in the configured pod pool is reported, never tu
       seatTurn: async (_seat, _root, _host, options) => { expect(options).toBeUndefined(); return { status: 'skipped-empty' }; },
       observe: (_event, data) => { reasons.push(data.reason); } };
     for (const node of ['intake', 'split', 'place', 'delegate', 'launch'] as const) await runOrchestratorNode(node, deps);
-    expect(reasons).toContain(`grid-host-unmapped:orch:${card.id}:C1:node-c`);
+    expect(reasons).toContain('grid-host-unmapped:orch:' + card.id + ':C1:node-c');
   } finally {
     if (previous.pool === undefined) delete process.env.ELANOUS_POD_POOL; else process.env.ELANOUS_POD_POOL = previous.pool;
     if (previous.config === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previous.config;
@@ -658,7 +658,7 @@ test('real pool readiness feeds the place node without an injected inventory', a
     }
     const state = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', 'grid-pool.json'), 'utf8')) as { cells: Array<{ id: string; kind?: string }>; steps: Array<{ reason: string }> };
     expect(state.cells).toMatchObject([{ id: `${card.id}-1`, kind: 'pod' }]);
-    expect(state.steps.map(step => step.reason)).toContain(`would-host:${card.id}-1:node-c`);
+    expect(state.steps.map(step => step.reason)).toContain('would-host:' + card.id + '-1:node-c');
   } finally {
     if (previous.path === undefined) delete process.env.PATH; else process.env.PATH = previous.path;
     if (previous.pool === undefined) delete process.env.ELANOUS_POD_POOL; else process.env.ELANOUS_POD_POOL = previous.pool;

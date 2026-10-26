@@ -70,13 +70,26 @@ export function acquireLockSync(lockPath: string, opts: LockOpts = {}): ReleaseL
   for (let attempt = 0; attempt < maxTries; attempt += 1) {
     try {
       const fd = openSync(lockPath, 'wx');
-      try { writeSync(fd, `${process.pid}\n`); }
-      catch { /* metadata only · not fatal */ }
-      const acquired = fstatSync(fd);
+      try {
+        writeSync(fd, `${process.pid}\n`);
+      } catch (writeErr) {
+        // 보유자 PID 를 못 쓰면 holderIsDead·onWait 독자 계약이 깨진다 — 방금 'wx' 로 만든 파일을 정리하고 올린다.
+        try { closeSync(fd); } catch { /* ignore */ }
+        try { unlinkSync(lockPath); } catch { /* ignore */ }
+        throw writeErr;
+      }
+      // ⭐ 소유 증명은 파일 «내용»이 아니라 «정체»다 — 내용은 보유자 PID 한 줄 계약(test/storage-file-lock ·
+      //   goal-author supersession 잠금)이라 구분 토큰을 심을 수 없고, rm+즉시 재생성은 inode 번호를
+      //   재사용하므로 inode 만으로는 교체를 못 가린다(실측). dev·ino·mtimeNs 셋이 같을 때만 우리가 만든
+      //   그 파일로 본다 — 재사용된 inode 도 새 mtime 을 가지므로 교체 자물쇠는 mtimeNs 에서 갈린다.
+      const acquired = fstatSync(fd, { bigint: true });
       closeSync(fd);
       return () => {
         try {
-          if (statSync(lockPath).ino === acquired.ino) unlinkSync(lockPath);
+          const current = statSync(lockPath, { bigint: true });
+          if (current.dev === acquired.dev && current.ino === acquired.ino && current.mtimeNs === acquired.mtimeNs) {
+            unlinkSync(lockPath);
+          }
         } catch { /* stale recovery or replacement won the path */ }
       };
     } catch (err) {

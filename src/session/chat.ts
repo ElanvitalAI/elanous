@@ -58,6 +58,8 @@ export interface RunTurnOpts {
   /** Optional callback for each streamed text delta — telegram uses this to
    *  accumulate; CLI uses it to render live. */
   onDelta?: (delta: string) => void;
+  /** Optional transient stream recovery status for the originating UI. */
+  onStatusLine?: (line: string) => void;
   /** Optional provider override — for tests. */
   provider?: LLMProvider;
   /** Originating utterance surface. Omit only when the caller cannot
@@ -500,6 +502,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         onText: (delta /*, full */) => {
           opts.onDelta?.(delta);
         },
+        onStatus: (line) => { opts.onStatusLine?.(line); },
         dispatchTool: async (name, args, ctx) => dispatchTool(name, args, ctx),
         onToolCall: (call) => { toolCallArgs.set(call.id, call.args); opts.onToolCall?.(call); },
         onToolResult: (call) => {

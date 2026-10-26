@@ -191,10 +191,10 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
   expect(gate.elapsedMs!).toBeLessThan(15_000);
   expect(gate.code).toBe(2);
   expect(first.status).toBe('failed');
-  expect(first.path.slice(-3)).toEqual(['gate', 'gate-triage', 'failed']);
+  expect(first.path.slice(-4)).toEqual(['gate', 'gate-triage', 'traffic-failed-restore', 'failed']);
   // What `release resume` reads: the state file the runner saved, not the in-memory result.
   const saved = JSON.parse(readFileSync(join(ledger, 'graph-runs', 'release-loop', `${first.runId}.json`), 'utf8')) as GraphRunState;
-  expect(saved.path.slice(-3)).toEqual(['gate', 'gate-triage', 'failed']);
+  expect(saved.path.slice(-4)).toEqual(['gate', 'gate-triage', 'traffic-failed-restore', 'failed']);
   expect(saved.nodes.find((node) => node.nodeId === 'gate-triage')).toMatchObject({ executed: true, ok: true });
   const record = saved.nodes.find((node) => node.nodeId === 'gate')!;
   // An executed failure (exit 2 with the verdict line on the ledger) — not a stopped/no-verdict node.
@@ -254,7 +254,7 @@ test('a shard that prints test output is unaffected: no stop, no retry, same res
   expect({ ...withWatch, podSweep: { ...withWatch.podSweep, id: undefined } })
     .toEqual({ ...without, podSweep: { ...without.podSweep, id: undefined } });
   // stallWatch is observation only (GATE-WARM-BOOT-SCAN) — it differs by design and is checked on its own.
-  const strip = (meta: Record<string, unknown>) => { const { durationMs: _d, attemptId: _a, phaseTimes: _t, stallWatch: _w, sweepId: _s, ...rest } = meta; return rest; };
+  const strip = (meta: Record<string, unknown>) => { const { durationMs: _d, attemptId: _a, jobName: _j, phaseTimes: _t, stallWatch: _w, sweepId: _s, ...rest } = meta; return rest; };
   const metaWith = JSON.parse(readFileSync(join(watched.root, 'logs', 'pod-0.json'), 'utf8'));
   const metaWithout = JSON.parse(readFileSync(join(plain.root, 'logs', 'pod-0.json'), 'utf8'));
   expect(metaWith.stallWatch).toEqual({ armed: true, disarmedBy: 'test-output', firstTestAtSec: 0, stallSeconds: 0.3 });

@@ -74,30 +74,26 @@ async function mountPage() {
 
 describe('/live 배선', () => {
   const g = globalThis as Record<string, unknown>;
-  let hadWindow = false;
-  let hadResize = false;
-  let hadRaf = false;
-  let hadSvg = false;
+  const keys = ['IS_REACT_ACT_ENVIRONMENT', 'window', 'ResizeObserver', 'requestAnimationFrame', 'SVGElement'] as const;
+  let originals: Map<string, PropertyDescriptor | undefined>;
   let root: ReturnType<typeof create> | null = null;
   beforeEach(() => {
+    originals = new Map(keys.map((key) => [key, Object.getOwnPropertyDescriptor(g, key)]));
     g.IS_REACT_ACT_ENVIRONMENT = true;
-    hadRaf = 'requestAnimationFrame' in g;
-    if (!hadRaf) g.requestAnimationFrame = (fn: () => void) => setTimeout(fn, 0);
-    hadResize = 'ResizeObserver' in g;
-    if (!hadResize) g.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+    if (typeof g.requestAnimationFrame !== 'function') g.requestAnimationFrame = (fn: () => void) => setTimeout(fn, 0);
+    if (typeof g.ResizeObserver !== 'function') g.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
     // d3-zoom 의 extent 계산이 SVGElement 글로벌을 본다 — 창 없는 런타임에선 스텁으로 지나가게 한다.
-    hadSvg = 'SVGElement' in g;
-    if (!hadSvg) g.SVGElement = class SVGElementStub {};
-    hadWindow = 'window' in g;
-    if (!hadWindow) g.window = { innerWidth: 390, setTimeout, clearTimeout, requestAnimationFrame: (fn: () => void) => setTimeout(fn, 0), cancelAnimationFrame: (id: number) => clearTimeout(id), addEventListener: noop, removeEventListener: noop, devicePixelRatio: 1, matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }) };
+    if (typeof g.SVGElement !== 'function') g.SVGElement = class SVGElementStub {};
+    g.window = { innerWidth: 390, setTimeout, clearTimeout, requestAnimationFrame: (fn: () => void) => setTimeout(fn, 0), cancelAnimationFrame: (id: number) => clearTimeout(id), addEventListener: noop, removeEventListener: noop, devicePixelRatio: 1, matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }) };
   });
-  afterEach(() => {
+  afterEach(async () => {
     if (root) { const done = root; root = null; act(() => { done.unmount(); }); }
-    delete g.IS_REACT_ACT_ENVIRONMENT;
-    if (!hadWindow) delete g.window;
-    if (!hadResize) delete g.ResizeObserver;
-    if (!hadSvg) delete g.SVGElement;
-    if (!hadRaf) delete g.requestAnimationFrame;
+    await Bun.sleep(850);
+    for (const key of keys) {
+      const previous = originals.get(key);
+      if (previous && !('value' in previous && previous.value === undefined)) Object.defineProperty(g, key, previous);
+      else delete g[key];
+    }
   });
 
   test('기본(/live)은 LivePanel 을 그대로 렌더한다 — 보존 계약', async () => {

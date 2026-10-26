@@ -26,7 +26,7 @@ test('private shared inventory keeps standard SI candidates and rejects a symlin
   try {
     const file = join(dir, 'inventory.json');
     writeFileSync(file, JSON.stringify({ controlUrl: 'http://127.0.0.1:31413/',
-      memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+      memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
       candidates: [candidate, { ...candidate, tier: 'lite' }] }), { mode: 0o600 });
     expect(loadSiWarmPodProvider(file)).toBeInstanceOf(SiWarmPodProvider);
     const alias = join(dir, 'alias.json');
@@ -63,7 +63,7 @@ function fixture(stopRemaining = 0) {
       : { attrs: { state: 'idle' } });
   };
   const provider = new SiWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl, fetch: fetcher as typeof fetch, now: () => 0,
     siRunnerReady: () => true,
     exec: async argv => ({ status: 0, stdout: new TextEncoder().encode(JSON.stringify(
@@ -82,7 +82,7 @@ test('an invalid successful lease receipt leaves a reconciliation event', async 
   const observed: Array<{ event: string; data: Record<string, unknown> }> = [];
   const provider = new SiWarmPodProvider({ candidates: [candidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) }, now: () => 0,
+    machineTokens: { 'node-c': '2'.repeat(64) }, now: () => 0,
     kubectl: () => ({ status: 0, stdout: 'node-c\n', stderr: '' }),
     siRunnerReady: () => true,
     fetch: async () => Response.json({ name: spec.workerId, attrs: { leaseId: '', generation: 1, podUid: 'uid-1' } }),
@@ -98,7 +98,7 @@ test('an invalid successful lease receipt leaves a reconciliation event', async 
 test('a configured gate-v1 Pod without an si runner never acquires a lease', async () => {
   const calls: string[] = [];
   const provider = new SiWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, now: () => 0,
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, now: () => 0,
     fetch: async url => { calls.push(String(url)); throw new Error('unexpected Nexus request'); },
     kubectl: args => { expect(args.slice(-3)).toEqual(['bun',
       '/workspace/repo/src/task-orchestrator/surfaces/pod-si-warm-runner.ts', '--probe']);
@@ -141,7 +141,7 @@ test('source SHA mismatch is safe no-entry before lease request', async () => {
 test('lost lease response emits the exact reconciliation identity', async () => {
   const events: Array<{ event: string; data: Record<string, unknown> }> = [];
   const provider = new SiWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, now: () => 0,
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, now: () => 0,
     siRunnerReady: () => true, observe: (event, data) => events.push({ event, data }),
     fetch: async () => { throw new Error('response lost after lease assignment'); },
     kubectl: () => { throw new Error('must not enter Pod'); } });
@@ -154,7 +154,7 @@ test('lost lease response emits the exact reconciliation identity', async () => 
 test('failed quarantine is reported as unconfirmed with the fenced lease identity', async () => {
   const events: Array<{ event: string; data: Record<string, unknown> }> = [];
   const provider = new SiWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, now: () => 0,
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, now: () => 0,
     siRunnerReady: () => true, observe: (event, data) => events.push({ event, data }),
     fetch: async url => new URL(String(url)).pathname === '/v1/leases/pod-worker'
       ? Response.json({ name: 'other-source-worker', attrs: { leaseId: 'lease-other', generation: 1,
@@ -203,7 +203,7 @@ test('observed child process residue quarantines the lease and prevents reuse', 
 test('control-plane selection of another source worker is quarantined before any exec', async () => {
   const paths: string[] = [];
   const provider = new SiWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, now: () => 0,
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, now: () => 0,
     siRunnerReady: () => true,
     fetch: (async url => {
       const path = new URL(String(url)).pathname;

@@ -1793,12 +1793,13 @@ describe('gate baseline — introduced timeout-only standalone recheck', () => {
     });
     expect(calls).toEqual([['/node-b/repo', file, 'waits for readiness', 60_000]]);
     expect(report.introduced).toBe(0);
-    expect(report.timeoutRecheckPassed).toBe(1);
-    expect(report.failures[0]?.attribution).toBe('timeout-recheck-passed');
-    expect(report.timeoutRechecks?.[0]).toMatchObject({ result: 'pass', elapsedMs: 2340, rawResultLine: 'Ran 1 test across 1 file. ⏎ 1 pass' });
+    expect(report.loadTimeout).toBe(1);
+    expect(report.failures[0]?.attribution).toBe('load-timeout');
+    expect(report.timeoutRechecks?.[0]).toMatchObject({ originalDiagnostic: '^ this test timed out after 10000ms', result: 'pass', elapsedMs: 2340, rawResultLine: 'Ran 1 test across 1 file. ⏎ 1 pass' });
     expect(allowsBaselineOnlyFailure(report)).toBe(true);
-    expect(formatGateBaselineNote(report, 0)).toContain('timeout-recheck-passed=1');
+    expect(formatGateBaselineNote(report, 0)).toContain('load-timeout=1');
     expect(formatGateBaselineNote(report, 0)).toContain('elapsed=2340ms');
+    expect(formatGateBaselineNote(report, 0)).toContain('original=^ this test timed out after 10000ms');
   });
 
   test('failed timeout retry keeps introduced; mixed non-timeout failure skips all retries', () => {
@@ -1812,6 +1813,26 @@ describe('gate baseline — introduced timeout-only standalone recheck', () => {
     const unchanged = recheckTimeoutOnlyIntroducedFailures('/node-b/repo', mixed, () => { attempts += 1; return { observation: 'pass', elapsedMs: 1, output: 'pass' }; });
     expect(attempts).toBe(0);
     expect(unchanged.introduced).toBe(2);
+    expect(unchanged.timeoutRechecks).toBeUndefined();
+  });
+
+  test('assertion diagnostic next to timeout marker is not timeout-only and is never exempted', () => {
+    const initial = buildGateBaselineReport(worktree, { status: 'pass', output: basePass, log: 'baseline clean' });
+    const mixed = {
+      ...initial,
+      failures: initial.failures.map((failure) => ({
+        ...failure,
+        diagnostic: 'error: expected true but received false\n^ this test timed out after 10000ms',
+      })),
+    };
+    let attempts = 0;
+    const unchanged = recheckTimeoutOnlyIntroducedFailures('/node-b/repo', mixed, () => {
+      attempts += 1;
+      return { observation: 'pass', elapsedMs: 1, output: 'pass' };
+    });
+    expect(attempts).toBe(0);
+    expect(unchanged.introduced).toBe(1);
+    expect(unchanged.failures[0]?.attribution).toBe('introduced');
     expect(unchanged.timeoutRechecks).toBeUndefined();
   });
 });

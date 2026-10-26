@@ -17,7 +17,7 @@ process.env.ELANOUS_STATE_DIR = stateDir;
 let manifestDbPath = '';
 
 const {
-  addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestFrame, readPtyManifestFrame, markPtyManifestClosed, updatePtyManifestTurn,
+  addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestFrame, readPtyManifestFrame, markPtyManifestClosed, updatePtyManifestTurn, updatePtyManifestSession,
   removePtyManifest, listPtyManifest, listPtyManifestRows, getPtyManifest, ptyManifestDbPath, setPtyManifestDbPathForTesting,
   purgeClosedPtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, reapOrphanedOwnedPtyManifest,
   reapStalePtyManifest, touchLivePtyManifest, PTY_MANIFEST_STALE_MS, migratePtyManifestSchema,
@@ -149,6 +149,16 @@ describe('pty-manifest store (크로스-프로세스 관측)', () => {
     expect(getPtyManifest('pty-pid-mapped')?.ptyPid).toBe(process.pid);
     expect(listPtyManifestRows().find((row) => row.id === 'pty-pid-mapped')?.ptyPid).toBe(process.pid);
     expect(listPtyManifest().find((row) => row.id === 'pty-pid-mapped')?.ptyPid).toBe(process.pid);
+  });
+
+  test('updates only the TUI manifest session identity', () => {
+    upsertPtyManifest({ id: 'tui-session', kind: 'tui', cmd: 'elanous', startedAt: 1, now: 1 });
+    upsertPtyManifest({ id: 'shell-session', kind: 'shell', cmd: 'zsh', startedAt: 1, now: 1 });
+    expect(updatePtyManifestSession('tui-session', 'session-a', 20)).toBe(true);
+    expect(getPtyManifest('tui-session')?.sessionId).toBe('session-a');
+    expect(getPtyManifest('tui-session')?.updatedAt).toBe(20);
+    expect(updatePtyManifestSession('shell-session', 'session-b', 21)).toBe(false);
+    expect(getPtyManifest('shell-session')?.sessionId).toBe('');
   });
 
   test('TUI shell purpose and explicit origin survive the manifest boundary; legacy rows remain readable', () => {

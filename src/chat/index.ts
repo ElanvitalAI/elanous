@@ -514,6 +514,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'tablet',    aliases: [],        description: 'Tablet mode — collapse layout to log + input', subcommands: ['on', 'off', 'toggle', 'auto', 'status', 'browser-preview', 'bp'] },
   { name: 'surface',   aliases: [], description: 'Surface control — open a pane/catalog launcher (/surface catalog · browser · preview · log · scratch · obsidian · skill) OR set a preferred LLM surface (/surface coding-agent · research-agent · control-agent · ops-agent · … · clear · status)', subcommands: ['catalog', 'browser', 'preview', 'browser-preview', 'log', 'scratch', 'obsidian', 'skill', 'skill-file', 'agents', 'coding-agent', 'coding-chat', 'research-agent', 'research-chat', 'control-agent', 'ops-ui-agent', 'ops-fleet-agent', 'ops-agent', 'clear', 'status'] },
   { name: 'term',  aliases: ['terminal'], description: 'Interactive terminal modal — new / list / attach / detach / switch / kill / snapshot / resume', subcommands: ['new', 'list', 'attach', 'detach', 'switch', 'kill', 'snapshot', 'resume'] },
+  { name: 'side', aliases: [], description: '사이드탭 기초 — 목록 · 셸 생성 · 번호로 PTY 보기/attach', subcommands: ['list', 'new', 'attach'] },
   { name: 'claude', aliases: [], description: 'Spawn claude-code CLI in a terminal modal' },
   { name: 'codex',  aliases: [], description: 'Spawn codex CLI in a terminal modal' },
   { name: 'gemini', aliases: [], description: 'Spawn gemini CLI in a terminal modal' },

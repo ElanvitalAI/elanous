@@ -37,6 +37,12 @@ import { createTelegramStreamSink } from '../../session/streaming/telegram-strea
 import { splitMarkdownForTelegram } from '../../telegram-format.js';
 import { formatTablesAndRules } from '../../discord-markdown.js';
 import { receiveChannelEvent } from '../outbound/router.js';
+import { openMsgStore } from '../../msg/msg-store.js';
+import { createAskOpTelegramSlashCommand } from './channel-ask-op.js';
+import { createTelegramChannelOpReplyTransport, startChannelOpReplyRoute } from '../../session/channel-op-reply-route.js';
+import { resolveInstanceName } from '../../instance-identity.js';
+import { elanousStateRoot } from '../../autopilot/state-paths.js';
+import { join } from 'node:path';
 
 export interface NexusTelegramTriggerBotOpts {
   /** Bot token (without `Bot ` prefix). Production reads
@@ -167,6 +173,14 @@ export function createNexusTelegramTriggerBot(
   const onTriggerTap = buildTelegramTriggerTap(opts.dispatch, log);
 
   const botWasInjected = opts.bot !== undefined;
+  const askOpCommand = createAskOpTelegramSlashCommand({
+    allowedUserIds: opts.allowedUsers,
+    append: (message, provenanceKey) => {
+      const store = openMsgStore();
+      try { return store.appendWithProvenance(message, provenanceKey); }
+      finally { store.close(); }
+    },
+  });
   const bot = opts.bot ?? (opts.userConfig
     // Unified inbound: botFromConfig gives the full Q&A handler
     // (onMessage → runTurn, sessions, attachments, slash) and we graft
@@ -174,6 +188,7 @@ export function createNexusTelegramTriggerBot(
     ? botFromConfig({
         userConfig: opts.userConfig,
         log,
+        extraSlashCommands: [askOpCommand],
         ...(opts.runTurnImpl ? { runTurnImpl: opts.runTurnImpl } : {}),
         telegramBotOpts: {
           token: opts.token,
@@ -286,6 +301,14 @@ export function createNexusTelegramTriggerBot(
     });
   }
 
+  const opReplyInstance = resolveInstanceName();
+  const opReplyRoute = !botWasInjected ? startChannelOpReplyRoute({
+    transport: createTelegramChannelOpReplyTransport({ bot, botId: thisBotId, instance: opReplyInstance }),
+    botId: thisBotId,
+    instance: opReplyInstance,
+    cursorPath: join(elanousStateRoot(), 'msg', 'sse-cursor', `TELEGRAM-channel-op-replies-${thisBotId}.json`),
+  }) : undefined;
+
   // One drain promise for every caller. A second stop (SIGINT then
   // SIGTERM, or a duplicate SIGTERM) must wait for the same bound —
   // returning immediately would let the process exit before the turn
@@ -297,6 +320,7 @@ export function createNexusTelegramTriggerBot(
       if (drainPromise) return drainPromise;
       const timeoutMs = stopOpts?.timeoutMs ?? TELEGRAM_TRIGGER_DRAIN_TIMEOUT_MS;
       drainPromise = (async (): Promise<void> => {
+        try { await opReplyRoute?.stop(); } catch { /* swallow */ }
         try { offTelegramSink?.(); } catch { /* swallow */ }
         try { offTelegramStream?.(); } catch { /* swallow */ }
         try { bot.stop(); } catch { /* swallow */ }

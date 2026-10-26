@@ -66,6 +66,40 @@ describe('buildPremiseCard — 전제 되짚기(FLEX-RFC §A-③)', () => {
     expect(p3.verdict).toBe('unknown');
   });
 
+  test('P2 evidence follows verified attribution on reversed latest IDs, never baseline array indices', () => {
+    const preexistingId = id('baseline failure A', 'src/current/a.test.ts', 'preexisting');
+    const introducedId = id('baseline failure B', 'src/current/b.test.ts', 'introduced');
+    const card = buildPremiseCard({
+      runId: 'run-mismatched-attribution-order',
+      gateFailedIdsByRound: [[introducedId, preexistingId]],
+      failureAttributions: ['preexisting', 'introduced'],
+      round: 3,
+      plannedRounds: 5,
+      targetPaths: TARGETS,
+    });
+    expect(card.findings.find((finding) => finding.premise === 'P2')).toEqual({
+      premise: 'P2', verdict: 'wrong', evidence: preexistingId,
+    });
+  });
+
+  test('P2 does not infer a latest file when no latest ID confirms preexisting', () => {
+    const latestIds = [
+      id('current failure A', 'src/current/a.test.ts', 'introduced'),
+      id('current failure B', 'src/current/b.test.ts', 'introduced'),
+    ];
+    const card = buildPremiseCard({
+      runId: 'run-unconfirmed-preexisting',
+      gateFailedIdsByRound: [latestIds],
+      failureAttributions: ['preexisting', 'introduced'],
+      round: 3,
+      plannedRounds: 5,
+      targetPaths: TARGETS,
+    });
+    expect(card.findings.find((finding) => finding.premise === 'P2')).toEqual({
+      premise: 'P2', verdict: 'wrong', evidence: 'preexisting',
+    });
+  });
+
   test('preexisting 실패면 P2 wrong — 그 실패 id 를 근거로', () => {
     const failed = id('flex works', 'src/self-implement/flex-signals.test.ts', 'preexisting');
     const card = buildPremiseCard({

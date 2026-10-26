@@ -146,7 +146,7 @@ test('(d) resume --gate-executor host --gate-host node-b re-runs gate on the hos
   try {
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18', gatePodPool: 'x' }, deps: { root, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(-3)).toEqual(['gate', 'gate-triage', 'failed']);
+    expect(first.path.slice(-4)).toEqual(['gate', 'gate-triage', 'traffic-failed-restore', 'failed']);
     const deps = { root, graphPath, git, runBash };
     // The safety policy is unchanged: gate is never waived.
     expect(() => releaseResumeWaiver(first, { from: 'gate', waive: 'gate', reason: 'Pod infrastructure stalled' })).toThrow('cannot waive a safety');

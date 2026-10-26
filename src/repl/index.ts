@@ -198,6 +198,7 @@ function buildReplTools(): {
     specs.push(wakeup.spec);
     dispatchByName.set(wakeup.spec.name, wakeup.dispatch);
   }
+  (require('../tui/sidetab/nl-tool.js') as typeof import('../tui/sidetab/nl-tool.js')).registerNextSidetabReplTool(specs, dispatchByName, process as unknown as import('../tui/sidetab/nl-tool.js').NextSidetabIpcProcess);
   const planner = sr.createSearchPlannerState({ maxAutoNarrowCandidates: 2 });
   const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
     try {
@@ -342,6 +343,7 @@ async function runOneTurn(
   jsonOutput: boolean,
   nextTuiDelivery?: { pending: PendingTaskNotification[] },
   onJsonDelta?: (delta: string) => void,
+  onJsonStatus?: (line: string) => void,
 ): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null }> {
   const startedAt = Date.now();
   const replyChunks: string[] = [];
@@ -374,6 +376,10 @@ async function runOneTurn(
     userText,
     systemPrompt,
     userImages: userImages.length > 0 ? userImages : undefined,
+    ...(process.env.ELANOUS_TEST_FAKE_LLM === '1' && Number.isFinite(Number(process.env.ELANOUS_TEST_FAKE_LLM_IDLE_TIMEOUT_MS))
+      && Number(process.env.ELANOUS_TEST_FAKE_LLM_IDLE_TIMEOUT_MS) > 0
+      ? { llmOpts: { streamIdleTimeoutMs: Number(process.env.ELANOUS_TEST_FAKE_LLM_IDLE_TIMEOUT_MS) } }
+      : {}),
     onDelta: (d) => {
       if (jsonOutput) {
         replyChunks.push(d);
@@ -381,6 +387,7 @@ async function runOneTurn(
       }
       else process.stdout.write(d);
     },
+    onStatusLine: (line) => { onJsonStatus?.(line); },
     tools: replToolSpecs,
     dispatchTool: tools?.dispatch,
     onToolCall: (call) => {
@@ -784,6 +791,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
           nextTuiDelivery,
           process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
             ? (delta) => { process.stdout.write(`${JSON.stringify({ event: 'delta', turnId: turn.id, text: delta })}\n`); }
+            : undefined,
+          process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
+            ? (text) => { process.stdout.write(`${JSON.stringify({ event: 'status', turnId: turn.id, text })}\n`); }
             : undefined,
         );
       } catch (error) {

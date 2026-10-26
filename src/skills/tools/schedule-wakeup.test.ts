@@ -441,6 +441,9 @@ describe('LLM 도구', () => {
     const r = rig();
     const tool = buildScheduleWakeupHostTool(r.s);
     expect(tool.name).toBe('ScheduleWakeup');
+    expect(tool.parameters).not.toHaveProperty('oneOf');
+    expect(tool.parameters).not.toHaveProperty('anyOf');
+    expect(tool.parameters).not.toHaveProperty('allOf');
     expect(tool.description).toContain('schedule_manage');
     const ctx = {} as never;
     const ok = await tool.handler({ delaySeconds: 90, reason: '점검' }, ctx) as { scheduled: { id: string; at: string } };
@@ -479,7 +482,7 @@ describe('LLM 도구', () => {
     } as Parameters<typeof buildSessionRuntimeToolSpecs>[0]);
     const wakeupSpecs = specs.filter(spec => spec.name === 'ScheduleWakeup');
     expect(wakeupSpecs).toHaveLength(1);
-    expect(JSON.stringify(wakeupSpecs)).toContain('"oneOf"');
+    expect(JSON.stringify(wakeupSpecs)).not.toMatch(/"(?:anyOf|oneOf|allOf)"\s*:/);
 
     const res = await host.dispatchTool('ScheduleWakeup', { delaySeconds: 60, reason: '큐 점검' });
     expect(res).toMatchObject({ ok: true, result: { scheduled: { id: 'w1' } } });
@@ -517,11 +520,9 @@ describe('LLM 도구', () => {
     const host = new PluginHost({ log: () => {}, hudSet: () => {}, requestRender: () => {}, focusPane: () => {} });
     expect(registerScheduleWakeupHostTool(host, scheduler, {})).toBe(true);
     const parameters = host.hostLLMTools().find(tool => tool.name === 'ScheduleWakeup')?.parameters as Record<string, unknown>;
-    expect(parameters.oneOf).toEqual([
-      { not: { anyOf: [{ required: ['at'] }, { required: ['delaySeconds'] }] } },
-      { required: ['at'], not: { required: ['delaySeconds'] } },
-      { required: ['delaySeconds'], not: { required: ['at'] } },
-    ]);
+    expect(parameters).not.toHaveProperty('oneOf');
+    expect(parameters).not.toHaveProperty('anyOf');
+    expect(parameters).not.toHaveProperty('allOf');
 
     const conflicting = { at: '09:30', delaySeconds: 60, reason: '교정 예약' };
     gate.noteHumanTurn();
@@ -563,6 +564,17 @@ describe('LLM 도구', () => {
     expect(r.logs).toHaveLength(1);
     expect(r.logs[0]).toMatchObject({ event: 'rejected', data: { reason: 'invalid' } });
     expect(r.s.list()).toHaveLength(0);
+  });
+
+  test('스케줄 handler 는 at·delaySeconds·repeatMinutes 모두 빠진 요청을 실행하지 않는다', async () => {
+    const r = rig({ currentTurnId: () => 'turn-missing-time' });
+    const host = new PluginHost({ log: () => {}, hudSet: () => {}, requestRender: () => {}, focusPane: () => {} });
+    host.registerHostTool(buildScheduleWakeupHostTool(r.s));
+
+    const result = await host.dispatchTool('ScheduleWakeup', { reason: '누락 경계' });
+    expect(result).toMatchObject({ ok: true, result: { error: expect.stringContaining('중 하나는 있어야 한다') } });
+    expect(r.s.list()).toHaveLength(0);
+    expect(r.logs).toContainEqual(expect.objectContaining({ event: 'rejected', data: expect.objectContaining({ reason: 'invalid' }) }));
   });
 
   test('타입이 틀린 at 존재를 보존하고 같은 인자도 턴 cap 예산을 소비한다', async () => {

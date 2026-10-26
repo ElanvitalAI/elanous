@@ -540,7 +540,7 @@ const TUI_SLASH_NAMES = new Set([
   'delta', 'diffs', 'theme', 'debug', 'rebind', 'api-allow', 'api',
   'prompt', 'prompts', 'history', 'hist', 'inputs', 'research', 'rsh',
   'harness', 'plan', 'chat', 'dashboard', 'dash', 'telegram', 'tg',
-  'tablet', 'surface', 'term', 'terminal', 'claude', 'codex', 'gemini',
+  'tablet', 'surface', 'term', 'terminal', 'side', 'claude', 'codex', 'gemini',
   'acp', 'conv', 'handoff', 'agent-room', 'showroom', 'sr', 'reply',
   'capture', 'inject', 'relay', 'lane', 'control', 'default', 'qc',
   'voice-chat', 'vc', 'auto-tts', 'tts', 'autotts', 'directive',

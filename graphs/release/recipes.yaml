@@ -1,6 +1,9 @@
 version-release:
   command: 'bun scripts/release-loop/version-node.ts release --json'
   timeout_ms: 1800000
+traffic-cut-start:
+  command: 'bun scripts/release-loop/traffic-node.ts traffic-cut-start'
+  timeout_ms: 30000
 cutoff:
   command: 'bun scripts/release-loop/node-verdict.ts cutoff'
   timeout_ms: 600000
@@ -13,6 +16,12 @@ gate:
   timeout_ms: 14400000
 traffic-gate-passed:
   command: 'bun scripts/release-loop/traffic-node.ts traffic-gate-passed'
+  timeout_ms: 30000
+traffic-npm-published:
+  command: 'bun scripts/release-loop/traffic-node.ts traffic-npm-published'
+  timeout_ms: 30000
+traffic-failed-restore:
+  command: 'bun scripts/release-loop/traffic-node.ts traffic-failed-restore'
   timeout_ms: 30000
 gate-triage:
   command: 'bun scripts/release-loop/gate-triage-node.ts'

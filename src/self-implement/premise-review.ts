@@ -42,6 +42,11 @@ function latestFailingIds(input: FlexSignalsInput): readonly string[] | undefine
   return latest !== undefined && latest.length > 0 ? latest : undefined;
 }
 
+/** P2 evidence may name a file only when the latest failure ID itself confirms that attribution. */
+function latestPreexistingFailureId(input: FlexSignalsInput): string | undefined {
+  return latestFailingIds(input)?.find((id) => /\(preexisting\)\s*$/.test(id));
+}
+
 /**
  * 게이트 실패 id — 생산자(orchestrator 의 roundSummaryEntries.failedIds)와 P3 파서가 «같은 꼴»을 쓰도록
  * 둘 다 이 함수 짝을 거친다. 꼴: `${name}@${file ?? '?'} (${attribution})`.
@@ -96,11 +101,8 @@ function judgeP2(input: PremiseReviewInput): PremiseFinding {
   }
   const preexistingIndex = attributions.indexOf('preexisting');
   if (preexistingIndex >= 0) {
-    const latest = latestFailingIds(input);
-    const evidence = latest !== undefined && preexistingIndex < latest.length
-      ? latest[preexistingIndex]!
-      : 'preexisting';
-    return { premise: 'P2', verdict: 'wrong', evidence };
+    const latestPreexistingId = latestPreexistingFailureId(input);
+    return { premise: 'P2', verdict: 'wrong', evidence: latestPreexistingId ?? 'preexisting' };
   }
   if (attributions.includes('unknown')) {
     return { premise: 'P2', verdict: 'unknown', evidence: UNMEASURED };

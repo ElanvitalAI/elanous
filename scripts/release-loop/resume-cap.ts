@@ -27,7 +27,8 @@ export function reserveReleaseResumeAttempt(state: GraphRunState, root: string, 
   const priorCountKnown = hadLedger ? saved.priorCountKnown !== false : !state.resume;
   if (options.checkOnly) return { attempt: saved.attempts.length + 1, path, priorCountKnown };
   const at = (options.now ?? (() => new Date()))().toISOString();
-  const next = { version, runId: state.runId, priorCountKnown, attempts: [...saved.attempts, at] };
+  // `...saved` keeps fields this function does not own (RELEASE-RECOVER-ONE-CMD stage results) across a resume.
+  const next = { ...saved, version, runId: state.runId, priorCountKnown, attempts: [...saved.attempts, at] };
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try { writeFileSync(temp, `${JSON.stringify(next)}\n`, { mode: 0o600 }); renameSync(temp, path); }

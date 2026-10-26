@@ -12,7 +12,7 @@ export function classifyPrLandRefusal(message: string, context: { isDraft?: bool
   if (message.startsWith('✗ ancestor-auto: ancestor-auto-not-ancestor:')) return 'not-ancestor';
   if (/^✗ (?:ancestor-auto|overlap-evidence): (?:review-missing|review-not-reviewed|review-error|review-no-result|review-unreadable|review-pr-mismatch|review-head-mismatch|review-path-not-for-this-pr-head|review-verdict-null|review-must-fix-unknown)(?:\b|$)/.test(message)) return 'review-missing';
   if (message.startsWith('✗ heavy-remote: PR base=unreadable ≠ main')) return 'pr-base-unreadable';
-  if (/^✗ heavy-remote: (?:원격|병합 직전 원격|node-b) 게이트 gate-host-busy(?:\b|\s|$)/.test(message)) return 'gate-host-busy';
+  if (/^✗ heavy-remote: (?:원격|병합 직전 원격|[a-z][a-z0-9-]*) 게이트 gate-host-busy(?:\b|\s|$)/.test(message)) return 'gate-host-busy';
   if (message.startsWith('✗ heavy-remote: 원격 게이트 gate-rc-1 · remote: stdout: CONFLICT (content): Merge conflict')) return 'gate-merge-conflict';
   if (message.startsWith('✗ heavy-remote: 원격 게이트 gate-rc-1 · remote: stderr: 건드린 src/scripts 파일과 baseline 밖 test 파일은 tsc 클린이어야 합니다(touch-clean).')) return 'gate-touch-clean';
   if (message.startsWith('✗ public-export-leak: 바뀐 파일')) return 'public-export-leak';

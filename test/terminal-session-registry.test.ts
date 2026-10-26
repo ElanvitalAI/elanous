@@ -31,6 +31,7 @@ function fakePreviewFactory(opts: PreviewTerminalOpts): PreviewTerminal {
     get isScrolledBack(): boolean { return false; },
     get scrollbackOffset(): number { return 0; },
     get wantsMouse(): boolean { return false; },
+    writes,
     scrollUp: () => 0,
     scrollDown: () => 0,
     scrollToTop: () => {},
@@ -64,6 +65,15 @@ describe('TerminalSessionRegistry', () => {
     expect(coord.modalStack()).toContain(session.id);
     expect(session.preview.isAlive).toBe(true);
     expect(events[0]?.type).toBe('spawned');
+  });
+
+  test('spawn types an explicit command into the registered PTY', () => {
+    const { registry } = makeRegistry();
+    const session = registry.spawn(
+      { title: 'elanous', cwd: '/tmp', command: 'elanous --tui next' },
+      { termCols: 100, termRows: 30 },
+    );
+    expect((session.preview as unknown as { writes: string[] }).writes).toEqual(['elanous --tui next\r']);
   });
 
   test('spawning a second session auto-detaches the first', () => {

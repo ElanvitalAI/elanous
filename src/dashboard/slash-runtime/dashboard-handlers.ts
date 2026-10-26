@@ -387,6 +387,7 @@ import { readDashboardAskClarification } from './ask-clarification.js';
 export { readDashboardAskClarification };
 import { createLoopScheduler, type LoopScheduler } from '../loop-scheduler.js';
 import { registerShellSlash } from './shell-slash.js';
+import { registerClassicSideSlash } from '../side-basic-runtime.js';
 export { registerShellSlash } from './shell-slash.js';
 import { registerMissionSlash } from '../../tui/slash/mission.js';
 // TUI-SLASH-SPLIT-MISSION(D4b) — /mission 은 src/tui/slash/mission.ts 로 이사. 옛 입구 re-export shim 은 slash-runtime/index.ts 한 곳뿐(RFC A5).
@@ -2577,6 +2578,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
 
 
   registerShellSlash(registry);
+  registerClassicSideSlash(registry);
 
   // ── B-3.b ─────────────────────────────────────────────────────────
 

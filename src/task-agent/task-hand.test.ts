@@ -22,6 +22,7 @@ import { deriveBirthIdentity, parseRunIdentityTag, runPriorityClass, validateRun
 import { parseWorkOrder } from './work-order.js';
 import { draftReleaseComment } from '../self-dev/draft-triage-rules.js';
 import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack } from '../self-implement/knowhow-pack.js';
+import { authorGoal, inspectGoalDoneBoundary, type GoalAuthorDeps } from '../self-implement/goal-author.js';
 
 // MS-05 + isolated temporary git: the real tasks hand CLI decides, only the external launcher is captured.
 test('tasks hand --live carries one bounded KNOWHOW pack to the first child goal without changing cards or ledgers', async () => {
@@ -63,7 +64,8 @@ test('tasks hand --live carries one bounded KNOWHOW pack to the first child goal
     expect(calls[0]!.args.at(-1)).toBe(firstGoal);
     expect(calls[0]!.context!.podGoal).toBe(firstGoal);
     expect(calls[0]!.args.at(-1)!.split('[KNOWHOW-PACK v1').length - 1).toBe(1);
-    expect(observations).toContainEqual(expect.objectContaining({ data: expect.objectContaining({ ids: pack.ids, bytes: pack.bytes, injected: true }) }));
+    expect(observations).toContainEqual(expect.objectContaining({ data: expect.objectContaining({ ids: pack.ids, bytes: pack.bytes, injected: true,
+      reason: 'selected', repoPath: repo, repoRevision: null }) }));
     expect(hash(source)).toBe(originalHash);
     expect(operationalFiles.map((file) => {
       try { return [file, hash(resolve(import.meta.dir, '../..', file))]; }
@@ -114,6 +116,33 @@ test('tasks hand --live carries one bounded KNOWHOW pack to the first child goal
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [file, null]; throw error; }
     })).toEqual(operationalHashes);
   } finally { off(); rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('projectless live hand selects knowhow from harness.defaultRepo', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'task-hand-default-knowhow-'));
+  const state = statePath();
+  mkdirSync(join(repo, 'docs/roles/TC'), { recursive: true });
+  execFileSync('git', ['init', '-q', repo]);
+  writeFileSync(join(repo, 'docs/roles/TC/KNOWHOW.md'),
+    '## K-TC-919 default repo\n- 상황: src/task-agent/task-hand.ts no-progress.\n- 출처: 격리 시험 · 상태: active\n');
+  execFileSync('git', ['-C', repo, 'add', '--', 'docs/roles/TC/KNOWHOW.md']);
+  execFileSync('git', ['-C', repo, '-c', 'user.name=test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'knowhow fixture']);
+  const repoRevision = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const goal = liveGoal('대상 경로: src/task-agent/task-hand.ts\n실패 서명: no-progress');
+  const goals: string[] = [];
+  const observations: Array<{ data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'task-hand-default-knowhow', emit: (record) => {
+    if (record.category === 'task-agent' && record.event === 'knowhow-pack') observations.push(record);
+  } });
+  setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, defaultRepo: repo } }));
+  try {
+    const handed = await cli(['tasks', 'hand', goal, '--live', '--json'], {
+      taskStatePath: state, taskLauncher: (args, _cwd, context) => { goals.push(args.at(-1)!); return { runId: context!.runId }; },
+    });
+    expect(handed.code ?? 0).toBe(0);
+    expect(goals[0]).toContain('[KNOWHOW-PACK v1 ids=K-TC-919]');
+    expect(observations.at(-1)?.data).toMatchObject({ ids: ['K-TC-919'], injected: true, reason: 'selected', repoPath: repo, repoRevision });
+  } finally { setUserConfigOverlay(null); off(); rmSync(repo, { recursive: true, force: true }); }
 });
 
 test('only a unique launched code-PR card owns the PR or its opening run', () => {
@@ -177,22 +206,30 @@ test('1판 조합: code-pr의 해석 결과를 기록하고 기존 harness say �
   } finally { resetElanousConfigDir(); }
 });
 
-test('live hand 완료 경계 누락은 카드 기록과 launcher 호출 전에 거부한다', async () => {
+test('live hand 완료 경계 누락은 범위 기반 초안을 카드와 발사 목표에 기록한다', async () => {
   const path = statePath();
   let launches = 0;
+  let launchedGoal = '';
   const events: Array<{ category: string; event: string; data?: unknown }> = [];
   const off = debug.registerSink({ name: 'task-done-boundary-test', emit: (record) => events.push(record) });
+  let result: Awaited<ReturnType<typeof handTask>>;
   try {
-    await expect(handTask({ id: 'ta-20261018-boundary', text: '대상 경로: src/task-agent/task-hand.ts',
+    result = await handTask({ id: 'ta-20261018-boundary', text: '대상 경로: src/task-agent/task-hand.ts',
       checklistId: 'AUT-AC-BOUNDARY-MISSING', live: true, statePath: path,
-      preflightGoalDoneBoundary: true, launcher: () => { launches++; } })).rejects.toThrow('goal-revision-required: 완료 경계 누락 완료 경계 코드 · 완료 경계 실물 · 완료 경계 증거 명령');
+      preflightGoalDoneBoundary: true, launcher: (args) => { launches++; launchedGoal = args.at(-1) ?? ''; } });
   } finally { off(); }
-  expect(launches).toBe(0);
-  expect(readTaskCard('ta-20261018-boundary', path)).toBeUndefined();
-  expect(events).toHaveLength(0);
+  expect(launches).toBe(1);
+  expect(result!.launched).toBe(true);
+  expect(result!.card.text).toContain('- 완료 경계 코드:');
+  expect(result!.card.text).toContain('- 완료 경계 실물:');
+  expect(result!.card.text).toContain('- 완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts');
+  expect(launchedGoal).toBe(result!.card.text);
+  expect(readTaskCard(result!.card.id, path)?.text).toBe(result!.card.text);
+  expect(events).toContainEqual(expect.objectContaining({ category: 'task-agent.hand', event: 'boundary-autodrafted',
+    data: expect.objectContaining({ taskId: result!.card.id, labels: ['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령'] }) }));
 });
 
-test('live hand 완료 경계 증거 명령은 명령 원문만 받는다 — 설명 접미·백틱 장식은 이유를 붙여 카드 기록·launcher 호출 전에 거부한다', async () => {
+test('live hand 완료 경계 증거 명령의 결과 장식을 지우고 정규 명령으로 발사한다', async () => {
   const plainPath = statePath();
   let plainLaunches = 0;
   const plain = await handTask({ id: 'ta-20261021-evidence-plain', text: liveGoal('ship it'),
@@ -203,19 +240,31 @@ test('live hand 완료 경계 증거 명령은 명령 원문만 받는다 — �
 
   const boundaryLines = liveGoal('ship it').split('\n').slice(0, -1);
   const decorated = [
-    { value: 'bun test src/task-agent/task-hand.test.ts → 0 fail', reason: '설명 접미' },
-    { value: '`bun test src/task-agent/task-hand.test.ts`', reason: '백틱 장식' },
+    'bun test src/task-agent/task-hand.test.ts → 0 fail',
+    'bun test src/task-agent/task-hand.test.ts · typecheck PASS',
+    '`bun test src/task-agent/task-hand.test.ts` → 0 fail · typecheck PASS',
   ];
-  for (const [index, { value, reason }] of decorated.entries()) {
+  for (const [index, value] of decorated.entries()) {
     const path = statePath();
     let launches = 0;
     const text = [...boundaryLines, `- 완료 경계 증거 명령: ${value}`].join('\n');
-    await expect(handTask({ id: `ta-20261021-evidence-${index}`, text, live: true, preflightGoalDoneBoundary: true,
-      statePath: path, launcher: () => { launches++; } }))
-      .rejects.toThrow(`완료 경계 증거 명령은 명령 원문이어야 한다 ${reason}: ${value}`);
-    expect(launches).toBe(0);
-    expect(readTaskCard(`ta-20261021-evidence-${index}`, path)).toBeUndefined();
+    const result = await handTask({ id: `ta-20261021-evidence-${index}`, text, live: true, preflightGoalDoneBoundary: true,
+      statePath: path, launcher: () => { launches++; } });
+    expect(result.launched).toBe(true);
+    expect(launches).toBe(1);
+    expect(readTaskCard(`ta-20261021-evidence-${index}`, path)?.text).toContain('완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts');
   }
+});
+
+test('알 수 없는 증거 명령 접미는 정규 명령으로 추측하지 않고 hand 전에 거부한다', async () => {
+  const path = statePath();
+  let launches = 0;
+  const text = `${liveGoal('ship it')} → arbitrary result`;
+  await expect(handTask({ id: 'ta-20261025-evidence-unknown', text, live: true,
+    preflightGoalDoneBoundary: true, statePath: path, launcher: () => { launches++; } }))
+    .rejects.toThrow('goal-revision-required');
+  expect(launches).toBe(0);
+  expect(readTaskCard('ta-20261025-evidence-unknown', path)).toBeUndefined();
 });
 
 test('live hand 골 첫 줄은 «대상 경로:» 뒤 경로 목록만 받는다 — 괄호·줄번호·덧말은 이유를 붙여 카드 기록·launcher 호출 전에 거부한다', async () => {
@@ -654,24 +703,32 @@ test('--live 는 주입한 launcher 를 한 번 부르고 카드를 launched 로
   expect(readTaskCard(out.card.id, path)?.status).toBe('launched');
 });
 
-test('tasks hand --live 완료 경계 누락은 설명과 exit 1을 내고 카드·launcher를 만들지 않는다', async () => {
+test('tasks hand --live 완료 경계 누락은 경계를 초안하고 시험 우주 발사 거부를 카드에 남긴다', async () => {
   const path = statePath();
   const { lines, code } = await cli(['task', 'hand', 'ship it', '--live'], { taskStatePath: path });
   expect(code).toBe(1);
-  expect(lines.join('\n')).toContain('완료 경계 코드 · 완료 경계 실물 · 완료 경계 증거 명령');
-  expect(readTaskAgentState<{ tasks?: Record<string, unknown> }>(path).tasks ?? {}).toEqual({});
+  expect(lines.join('\n')).toContain('실물 발사를 거부했다');
+  const cards = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(path).tasks ?? {});
+  expect(cards).toHaveLength(1);
+  expect(cards[0]).toMatchObject({ status: 'launch-failed' });
+  expect(cards[0]!.text).toContain('- 완료 경계 코드:');
+  expect(cards[0]!.text).toContain('- 완료 경계 실물:');
+  expect(cards[0]!.text).toContain('- 완료 경계 증거 명령: bun test');
 });
 
-test('live hand은 빠진 경계 한 줄을 거부하고 비-code-pr 비발사 조합의 기존 실패를 보존한다', async () => {
+test('live hand은 빠진 경계 행만 초안하고 명시 행을 보존하며 비-code-pr 실패를 유지한다', async () => {
   const boundaryLines = liveGoal('work').split('\n').slice(1);
   for (const [index, missingLabel] of ['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령'].entries()) {
     const path = statePath();
     let launches = 0;
     const text = ['work', ...boundaryLines.filter((_, line) => line !== index)].join('\n');
-    await expect(handTask({ id: `ta-live-partial-boundary-${index}`, text, live: true, preflightGoalDoneBoundary: true, statePath: path,
-      launcher: () => { launches++; } })).rejects.toThrow(missingLabel);
-    expect(launches).toBe(0);
-    expect(readTaskCard(`ta-live-partial-boundary-${index}`, path)).toBeUndefined();
+    const result = await handTask({ id: `ta-live-partial-boundary-${index}`, text, live: true, preflightGoalDoneBoundary: true, statePath: path,
+      launcher: () => { launches++; } });
+    expect(launches).toBe(1);
+    expect(result.card.text).toContain(`${missingLabel}:`);
+    expect(inspectGoalDoneBoundary(result.card.text).missing).toEqual([]);
+    for (const line of boundaryLines.filter((_, line) => line !== index)) expect(result.card.text).toContain(line);
+    expect(readTaskCard(result.card.id, path)?.text).toBe(result.card.text);
   }
 
   const path = statePath();
@@ -943,6 +1000,49 @@ test('TASKS-HAND-CHILD-LLM: --child-llm grok/grok-4.7 passes --child-llm-provide
     expect(readTaskCard(id, path)?.parentRoleLlm).toContain(planningPin);
     expect(events.find((e) => e.event === 'child-llm')?.data).toMatchObject({ taskId: id, input: 'grok/grok-4.7', provider: 'grok', model: 'grok-4.7', effort: 'high', mode: 'live' });
   } finally { off(); }
+});
+
+test('PARENT-CHILD-MODEL-RESELECT: a later mission child leaves stopped grok for the next usable policy provider', async () => {
+  const path = statePath();
+  const calls: Array<{ args: string[]; provider?: string }> = [];
+  const { card } = await handTask({ id: 'ta-child-model-reselect', text: liveGoal('ship the next piece'),
+    mission: 'mission-budget', childLlm: 'grok/grok-4.7', live: true, statePath: path,
+    prelaunchInspector: () => ({ reason: 'test' }),
+    childBudgetInputs: () => ({
+      preference: { mode: 'auto', chain: [{ provider: 'grok' }, { provider: 'openai-codex', model: 'gpt-6-sol' }],
+        budgetGate: { minHeadroomPercent: 15, onShortfall: 'next-provider' }, source: { mode: 'explicit', chain: 'config' } },
+      codexCandidates: [{ name: 'team', usedPercent: 30 }], grokUsedPercent: 84,
+      maxUsedPercent: { grok: 48, 'openai-codex': 95 },
+    }),
+    launcher: (args, _cwd, context) => { calls.push({ args, provider: context?.effectiveChildProvider }); return { runId: context!.runId }; },
+  });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.args).toContain('openai-codex');
+  expect(calls[0]?.args).toContain('gpt-6-sol');
+  expect(calls[0]?.provider).toBe('openai-codex');
+  expect(card.childLlm).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
+  expect(card.history.some((event) => event.event === 'child-model-reselected')).toBe(true);
+});
+
+test('PARENT-CHILD-MODEL-RESELECT: a configured GLM alternative launches when Codex is also exhausted', async () => {
+  const path = statePath();
+  const calls: string[][] = [];
+  const { card } = await handTask({ id: 'ta-child-model-glm', text: liveGoal('ship with GLM'),
+    mission: 'mission-budget', childLlm: 'grok/grok-4.7', live: true, statePath: path,
+    prelaunchInspector: () => ({ reason: 'test' }),
+    childBudgetInputs: () => ({
+      preference: { mode: 'auto', chain: [{ provider: 'grok' }, { provider: 'openai-codex' },
+        { provider: 'glm', model: 'glm-5.3' }], budgetGate: { minHeadroomPercent: 15, onShortfall: 'next-provider' },
+        source: { mode: 'explicit', chain: 'config' } },
+      codexCandidates: [{ name: 'team', usedPercent: 100 }], grokUsedPercent: 84,
+      maxUsedPercent: { grok: 48, 'openai-codex': 95 },
+    }),
+    launcher: (args, _cwd, context) => { calls.push(args); return { runId: context!.runId }; },
+  });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toContain('glm');
+  expect(calls[0]).toContain('glm-5.3');
+  expect(card.childLlm).toEqual({ provider: 'glm', model: 'glm-5.3' });
 });
 
 test('TA-PARENT-ROLE-LLM: task hand passes pinned credit GLM parent roles through the live launch and card', async () => {
@@ -2181,6 +2281,26 @@ test('DEVICE-FIRST tier split launches only the device test and records a landin
   } finally { h.off(); }
 });
 
+test('TIER-HIGH-UNAVOIDABLE-MIN: device-first-deferred tier-split 레코드가 조각 계수와 상 사유 원문을 싣는다', async () => {
+  const h = tierSplitHarness();
+  try {
+    const out = await handTaskWithTierSplit({ text: liveGoal('대상 경로: src/device.ts · src/feature.ts\n장치 우선'), tier: '상', live: true,
+      statePath: h.path, launcher: h.deps.taskLauncher!,
+      decompose: async () => ({ ok: true, redecomposed: 0, slices: [
+        slice('device', '하', { deviceFirst: 'device-test' }),
+        slice('feature', '상', { deviceFirst: 'feature', unavoidable: '한 트랜잭션 경계' }),
+        slice('feature2', '중', { deviceFirst: 'feature' }),
+      ] }) });
+    expect(out.kind).toBe('split');
+    const deferred = h.records.at(-1)!;
+    expect(deferred).toMatchObject({ outcome: 'device-first-deferred', fromTier: '상',
+      countScope: 'accepted-slices', totalSlices: 3, highSlices: 1, unavoidableCount: 1,
+      unavoidableReasons: ['한 트랜잭션 경계'] });
+    // high 비율 = highSlices/totalSlices — 이 한 행만으로 재현된다.
+    expect((deferred.highSlices as number) / (deferred.totalSlices as number)).toBeCloseTo(1 / 3, 10);
+  } finally { h.off(); }
+});
+
 test('DEVICE-FIRST first launch failure marks the mission failed and leaves features unlaunched', async () => {
   const h = tierSplitHarness();
   try {
@@ -2484,6 +2604,54 @@ test('TIER-SPLIT 조각 문면은 부모 칸의 계약·완료 경계를 물려�
     expect(out.slices.map((s) => [s.error ?? null, s.result?.launched])).toEqual([[null, true], [null, true], [null, true]]);
     expect(h.calls).toHaveLength(3);
   } finally { h.off(); }
+});
+
+test('TIER-SPLIT 자식 골 본문은 부모의 TDD 검증 계획 다섯 줄과 관측된 무대 필드를 보존한다', async () => {
+  const root = resolve(import.meta.dir, '../..');
+  const ask = [
+    '대상 경로: src/release-loop/resume.ts',
+    '실패한 발행 런에서 `release resume --dry-run` 이 계획을 낸다.',
+    '완료 경계 코드: child hand 본문에 TDD 계획이 있다',
+    '완료 경계 실물: 격리 fake decomposition 으로 만든 child card',
+    "완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts -t 'TIER-SPLIT 자식 골 본문은 부모의 TDD'",
+  ].join('\n');
+  const facts = { grounded: true, context: '', files: ['src/release-loop/resume.ts'], persistentEvidence: [], codeFacts: [],
+    skillFacts: [], memoryFacts: [], documentFacts: [], documentMatches: [], searchTerms: ['resume'], genericSearchScope: false, refFacts: [], ptyFacts: [] };
+  const deps: GoalAuthorDeps = { repositoryRoot: root, ground: async () => facts,
+    enhance: async (original) => ({ original, checklist: ['실패 런에서 계획을 낸다.'], verbatimPreserved: true }),
+    slugFn: async () => 'goal-tdd-plan-reaches-child' };
+  const observed: Array<Record<string, unknown>> = [];
+  const offEvents = debug.registerSink({ name: 'goal-tdd-child-plan', emit: (rec) => {
+    if (rec.category === 'goal-author' && rec.event === 'verification-plan') observed.push(rec.data as Record<string, unknown>);
+  } });
+  const h = tierSplitHarness();
+  try {
+    const authored = await authorGoal(ask, deps);
+    const parent = authored.document;
+    expect(parent).toContain('### 검증 계획(TDD)');
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({ source: 'catalog', stageId: 'MS-02', menuPresent: true, catalogPresent: true });
+    const child = '대상 경로: src/release-loop/resume.ts · 동작: 실패 런을 재개한다';
+    const composed = composeSliceHandText(child, parent, { index: 1, total: 1, fromTier: '상', cid: 'GOAL-TDD-PLAN-REACHES-CHILD' });
+    expect(composed).toContain('### 검증 계획(TDD)');
+
+    const fencedAskOnly = `${child}\n\`\`\`text\n### 검증 계획(TDD)\n- ① 원문 안의 표제다\n\`\`\``;
+    expect(composeSliceHandText(child, fencedAskOnly, { index: 1, total: 1, fromTier: '상', cid: 'CELL' })).toBe(child);
+
+    const out = await handTaskWithTierSplit({ text: parent, tier: '상', live: true, checklistId: 'GOAL-TDD-PLAN-REACHES-CHILD',
+      preflightGoalDoneBoundary: true, statePath: h.path, launcher: h.deps.taskLauncher!,
+      decompose: async () => ({ ok: true, redecomposed: 0, slices: [{ goal: child, files: 1, behaviours: 1, newFiles: 0, tier: '하' }] }) });
+    expect(out.kind).toBe('split');
+    if (out.kind !== 'split') return;
+    expect(out.slices).toHaveLength(1);
+    expect(out.slices[0]?.error).toBeUndefined();
+    const launchedText = out.slices[0]?.result?.card.text ?? '';
+    expect(launchedText).toContain('### 검증 계획(TDD)');
+    expect(launchedText.match(/^- [①②③④⑤]/gmu)).toHaveLength(5);
+    expect(launchedText).toContain('완료 경계 코드: child hand 본문에 TDD 계획이 있다');
+    expect(launchedText).toContain('완료 경계 실물: 격리 fake decomposition 으로 만든 child card');
+    expect(launchedText).toContain("완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts -t 'TIER-SPLIT 자식 골 본문은 부모의 TDD'");
+  } finally { h.off(); offEvents(); }
 });
 
 // 부모 칸에 상속할 경계 행이 «없는데도» 상속했다는 문구가 붙던 결함 — 경계 유무 두 사례를

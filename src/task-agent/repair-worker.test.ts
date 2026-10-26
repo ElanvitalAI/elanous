@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { subscribeInsideEvent } from '../nexus/api/inside-events.js';
-import { parseRepairMarker, parseRepairWorkerResult, repairHarnessArgs, repairWorkerEnv, runRepairWorker, type RepairWorkerRequest } from './repair-worker.js';
+import { parseRepairMarker, parseRepairWorkerResult, repairFailureSignature, repairGateFailureTests, repairHarnessArgs, repairWorkerEnv, runRepairWorker, type RepairWorkerRequest } from './repair-worker.js';
 
 const HEAD = 'a'.repeat(40);
 const COMMIT = 'b'.repeat(40);
@@ -19,6 +19,33 @@ test('repair worker pins the source PR and head, disables queue and merge, and c
     '--no-queue', '--no-auto-merge', '--child-llm-provider', 'openrouter', '--child-llm-model', 'openrouter/z-ai/glm-5.3']));
   expect(args.at(-1)).toBe('fix exact must-fix');
   expect(args).not.toContain('--open-pr');
+});
+
+test('only an explicit gate fingerprint or named provider mismatch becomes a repeat signature', () => {
+  const fingerprint = 'a'.repeat(64);
+  expect(repairFailureSignature(`childStage=gate-failed\nGATE_FAILURE_SIGNATURE=sha256:${fingerprint}\n`))
+    .toBe(`gate:sha256:${fingerprint}`);
+  expect(repairFailureSignature('childStage=gate-failed · reason=convergence failed')).toBeNull();
+  expect(repairFailureSignature('review fallback: ambiguous or unsupported primary model "glm-5.3"'))
+    .toBe('provider:ambiguous-primary:glm-5.3');
+  expect(repairFailureSignature('review fallback: ambiguous or unsupported primary model "glm 5.3"')).toBeNull();
+  expect(repairFailureSignature('review fallback: provider overloaded')).toBeNull();
+});
+
+test('signed gate failure carries readable test identities through the durable worker result', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'repair-worker-gate-receipt-'));
+  const resultPath = join(dir, 'repair.json');
+  const entry = join(dir, 'child.ts');
+  const tests = ['src/a.test.ts > A (assertion)', 'src/b.test.ts > B (runtime-error)'];
+  const signature = `sha256:${'d'.repeat(64)}`;
+  writeFileSync(entry, `console.log('GATE_FAILURE_SIGNATURE=${signature}'); console.log('GATE_FAILURE_TESTS=${JSON.stringify(tests)}'); process.exit(8);`);
+  try {
+    expect(repairGateFailureTests(`GATE_FAILURE_TESTS=${JSON.stringify(tests)}\n`)).toEqual(tests);
+    const result = await runRepairWorker({ ...request, entry, repo: dir, resultPath });
+    expect(result).toMatchObject({ ok: false, failureSignature: `gate:${signature}`, gateFailureTests: tests });
+    expect(parseRepairWorkerResult(readFileSync(resultPath, 'utf8'), 30, HEAD, 'run-123'))
+      .toMatchObject({ failureSignature: `gate:${signature}`, gateFailureTests: tests });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('TA-PARENT-ROLE-LLM: repair-run forwards a credit GLM parent policy to its own harness process', () => {

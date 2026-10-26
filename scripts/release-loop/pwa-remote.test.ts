@@ -30,7 +30,7 @@ test('remote run: ssh → push → one ssh run; the host JSON is the node output
     expect(calls.map((c) => `${c.name} ${c.argv[0]}`)).toEqual(['ssh --', 'git push', 'ssh --']);
     expect(calls[0]!.argv[1]).toBe('node-b');
     expect(calls[1]!.argv.slice(3, 5)).toEqual(['--', 'node-b:mirror/elanous-agent.git']);
-    expect(calls[1]!.argv).toContain(`node-b:mirror/elanous-agent.git`);
+    expect(calls[1]!.argv).toContain('node-b:mirror/elanous-agent.git');
     expect(calls[1]!.argv).toContain(`${SHA}:refs/elanous/pwa/${SHA}`);
     const script = calls[2]!.argv[2]!;
     expect(script).toContain('pwa-scenarios-node.ts');

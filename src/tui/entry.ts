@@ -1,12 +1,12 @@
 import { initTui, closeTui, injectKey, readKey, type Key } from '../tui.js';
-import { createSession, getActiveSessionId, loadSession, resolveSessionId, setActiveSessionId } from '../session/index.js';
+import { createSession, getActiveSessionId, loadSession, resolveSessionId, setActiveSessionId, updateSessionMeta } from '../session/index.js';
 import { fitLogLine, isToolFoldToggleKey, logViewLines, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockStarts, wheelScroll } from './chat/log-view.js';
 import { BackgroundJobStatus } from './chat/background-job-status.js';
 import { MOUSE_RESIDUE_WINDOW_MS, MouseResidueGuard, applyComposerKey, composerViewport, emptyComposer, wheelDirection } from './input/composer.js';
 import { createInlineEditorState, type InlineEditorState } from '../input-core/inline-editor.js';
 import { isNewSessionCommand, nextTuiTitle, requestNewTuiSession } from './slash/new-session.js';
 import { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS, isCompactCommand } from './slash/compact-command.js';
-import { RESUME_BUSY_STATUS, parseResumeCommand, requestResumeTuiSession, resumeCandidates, resumeListLines } from './slash/resume.js';
+import { RESUME_BUSY_STATUS, parseResumeCommand } from './slash/resume-command.js';
 import { reportTuiTurn } from '../pty-shell/tui-run-state.js';
 import { createPasteFold } from '../chat/paste-fold.js';
 import { createTurnTypeaheadState, dequeueTurnTypeaheadHandoff, drainTurnTypeaheadOnce, restoreTurnTypeaheadSubmission } from '../chat/turn-typeahead.js';
@@ -15,10 +15,10 @@ import { setCliStderrSink } from '../git-fs/cli-stderr.js';
 import { createInputLagProbe } from './input-lag-probe.js';
 import type { NextTuiWakeup } from '../tui-client/next-wakeup.js';
 import { countInterimDisplay, internalTurnOriginOfText, planInterimDisplay } from './chat/goal-interim.js';
-import type { NextTuiSelfHealthSnapshot } from './chat/self-health-status.js';
 import { createNextLoopCommand, type NextLoopCommand } from '../tui-client/next-loop-command.js';
 import { handleMissionSlash, type MissionSlashContext } from './slash/mission.js';
 import { handleSignalsSlash } from './slash/signals.js';
+import { updatePtyManifestSession } from '../pty-shell/pty-manifest.js';
 
 /** Status-line count of what waits for the running turn — empty when nothing waits. */
 export function nextTuiQueueSuffix(count: number): string {
@@ -36,11 +36,14 @@ type NextTuiTermSession = {
 
 export interface NextTuiOptions {
   readonly resumeSessionId?: string;
+  readonly sidetabMode?: 'off' | 'collapsed' | 'open';
   /** Read-only terminal session source; injectable so the Next slash stays testable without PTYs. */
   readonly termSessions?: {
     list(): readonly NextTuiTermSession[] | Promise<readonly NextTuiTermSession[]>;
   };
 }
+
+const sidetabOpenBySession = new Map<string, boolean>();
 
 interface AtPickerCandidate {
   readonly label: string;
@@ -61,9 +64,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     throw new Error('elanous --tui next requires at least 20 columns and 6 rows');
   }
   const dashboardRuntime = await (await import('../tui-client/next-dashboard-runtime.js')).loadNextTuiDashboardRuntime();
-  const requested = options.resumeSessionId ?? getActiveSessionId();
+  // A bare launch is a fresh human conversation. Automation CLIs share the
+  // active-session pointer, so only an explicit root --continue/--resume may
+  // attach an existing session here.
+  const requested = options.resumeSessionId;
   let id = requested ? resolveSessionId(requested) : null;
   if (requested && !id) throw new Error(`session not found: ${requested}`);
+  if (!id) {
+    id = createSession({ source: 'tui' }).id;
+    setActiveSessionId(id);
+  }
   let session = id ? loadSession(id) : null;
   let messages = session?.messages ?? [];
   // The seat ledger is touched only on next-TUI boot, and only when the
@@ -79,6 +89,21 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let scroll = 0;
   let maxScroll = 0;
   let focus: 'input' | 'log' = 'input';
+  let sidetabEnabled = options.sidetabMode !== 'off';
+  let sidetabAll = false;
+  let sidetabOpen = sidetabEnabled && (session?.meta.uiState?.sidetabOpen ?? sidetabOpenBySession.get(id!) ?? options.sidetabMode === 'open');
+  let sidetabSelected = 0;
+  let sidetabMode: 'list' | 'new' = 'list';
+  let sidetabFocused = false;
+  let sidetabChordPending = false;
+  let sidetabChordTimer: ReturnType<typeof setTimeout> | null = null;
+  let sidetabRemoteFrame: string | null = null;
+  let sidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
+  let sidetabApi: typeof import('./sidetab/list.js') | null = null;
+  let sidetabAttachments: import('./sidetab/attach.js').SidetabAttachmentController | null = null;
+  let pendingSidetabSwitch: string | null = null;
+  let sidetabRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  let paintingCoordinatorFrame = false;
   const mouseResidue = new MouseResidueGuard();
   const replay: Key[] = [];
   let escapeSnapshot: { editor: InlineEditorState; status: string; focus: 'input' | 'log'; busy: boolean } | null = null;
@@ -89,7 +114,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let draft = '';
   let activity: string[] = [];
   /** Rows of the last `/resume` list — `/resume <n>` picks from what the user saw. */
-  let lastResumeRows: ReturnType<typeof resumeCandidates> | null = null;
+  let lastResumeRows: import('../session/index.js').SessionMeta[] | null = null;
   let atPicker: { query: AtPickerQuery; candidates: AtPickerCandidate[]; selected: number } | null = null;
   let atPickerApi: typeof import('./input/at-picker.js') | null = null;
   let dismissedAtQuery = '';
@@ -106,6 +131,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const backgroundJobs = new BackgroundJobStatus(id);
   const backgroundSubscription: { stop?: () => void } = {};
   const selfHealthSubscription: { stop?: () => void } = {};
+  let observedSessionId: string | null = null;
   let selfHealthLine: string | null = null;
   // TUI-NEXT-QUEUE-AND-WAKE — what is submitted while busy waits here (the classic FIFO state) and
   // leaves one item per settle; Esc returns it all to the prompt (classic «interrupted» drain).
@@ -129,6 +155,25 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let interimFoldedShown = 0;
   const pushNotice = (line: string): void => {
     notices = [...notices, safeStatusText(line)].slice(-3);
+  };
+  const observeSession = (
+    sessionId: string,
+    onBackground: typeof import('../tui-client/local-chat-turn.js').onLocalChatBackgroundStatus,
+    onSelfHealth: typeof import('../tui-client/local-chat-turn.js').onLocalChatSelfHealthStatus,
+  ): void => {
+    if (observedSessionId === sessionId) return;
+    backgroundSubscription.stop?.();
+    selfHealthSubscription.stop?.();
+    backgroundSubscription.stop = onBackground(sessionId, (frame) => {
+      if (frame === null) backgroundJobs.clear();
+      else backgroundJobs.accept(frame);
+      render();
+    });
+    selfHealthSubscription.stop = onSelfHealth(sessionId, (snapshot) => {
+      selfHealthLine = snapshot?.line ?? null;
+      render();
+    });
+    observedSessionId = sessionId;
   };
   const slashHandlers = new Map<string, (args: string[], context: MissionSlashContext) => Promise<void>>();
   slashHandlers.set('mission', handleMissionSlash);
@@ -239,47 +284,198 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   }));
 
   const render = (): void => {
+    if (sidetabRemoteFrame !== null) {
+      const columns = process.stdout.columns || 80;
+      const rows = process.stdout.rows || 24;
+      const footer = fitLogLine(` ${status} `, Math.max(1, columns));
+      process.stdout.write(`\x1b[H\x1b[2J${sidetabRemoteFrame}\x1b[${rows};1H\x1b[7m${footer}\x1b[0m`);
+      return;
+    }
     const columns = process.stdout.columns || 0;
     const rows = process.stdout.rows || 0;
     if (columns < 20 || rows < 6) {
       process.stdout.write(`\x1b[H\x1b[2J${fitLogLine('터미널이 너무 작습니다 · q 종료', Math.max(1, columns))}`);
       return;
     }
+    if (sidetabOpen && columns < 34) {
+      sidetabOpen = false;
+      sidetabMode = 'list';
+      status = '터미널 폭이 줄어 사이드탭을 닫았습니다';
+      if (sidetabRefreshTimer !== null) {
+        clearInterval(sidetabRefreshTimer);
+        sidetabRefreshTimer = null;
+      }
+    }
+    const sidetabWidth = sidetabOpen ? sidetabApi!.sidetabWidthForTerminal(columns) : 0;
+    const chatColumns = columns - sidetabWidth - (sidetabOpen ? 1 : 0);
     const backgroundLine = backgroundJobs.line();
     const footerRows = backgroundLine ? 2 : 1;
     const history = [
-      ...logViewLines(messages, columns, expandedToolBlocks),
-      ...notices.map((line) => fitLogLine(line, columns)),
-      ...activity.map((line) => fitLogLine(line, columns)),
+      ...logViewLines(messages, chatColumns, expandedToolBlocks),
+      ...notices.map((line) => fitLogLine(line, chatColumns)),
+      ...activity.map((line) => fitLogLine(line, chatColumns)),
     ];
     const bodyRows = rows - 3 - footerRows;
     maxScroll = Math.max(0, history.length - bodyRows);
     scroll = Math.min(scroll, maxScroll);
     const start = Math.max(0, history.length - bodyRows - scroll);
     const body = history.slice(start, start + bodyRows);
-    logWindow = { start, rows: bodyRows, columns };
-    const title = fitLogLine(`elanous next · ${safeLogText(nextTuiTitle(session?.meta)).split('\n')[0]}`, columns);
+    logWindow = { start, rows: bodyRows, columns: chatColumns };
+    const title = fitLogLine(`elanous next · ${safeLogText(nextTuiTitle(session?.meta)).split('\n')[0]}`, chatColumns);
     const turnStatus = (!busy && focus === 'log'
-      ? `로그 탐색 · ↑↓ 스크롤${toolFoldBlockStarts(messages, columns).length > 0 ? ' · Enter 접기/펼치기' : ''} · Esc 입력`
+      ? `로그 탐색 · ↑↓ 스크롤${toolFoldBlockStarts(messages, chatColumns).length > 0 ? ' · Enter 접기/펼치기' : ''} · Esc 입력`
       : status) + nextTuiQueueSuffix(queue.queuedSubmissions.length);
     const footer = backgroundLine
-      ? [fitLogLine(backgroundLine, columns), fitLogLine(turnStatus, columns)]
-      : [fitLogLine(turnStatus, columns)];
-    const prompt = composerViewport(editor, columns);
-    const header = [title, mailLine ? fitLogLine(mailLine, columns) : '─'.repeat(Math.min(columns, 80))];
-    if (selfHealthLine) header.push(fitLogLine(selfHealthLine, columns));
+      ? [fitLogLine(backgroundLine, chatColumns), fitLogLine(turnStatus, chatColumns)]
+      : [fitLogLine(turnStatus, chatColumns)];
+    const prompt = composerViewport(editor, chatColumns);
+    const header = [title, mailLine ? fitLogLine(mailLine, chatColumns) : '─'.repeat(Math.min(chatColumns, 80))];
+    if (selfHealthLine) header.push(fitLogLine(selfHealthLine, chatColumns));
     if (atPicker) {
       const limit = Math.max(1, Math.min(6, rows - 8));
       const start = Math.max(0, Math.min(atPicker.selected - limit + 1, atPicker.candidates.length - limit));
       const visible = atPicker.candidates.slice(start, start + limit);
-      header.push(fitLogLine(visible.length ? '@ 파일 첨부 · ↑↓ 선택 · Enter 추가 · Esc 닫기' : '@ 파일 후보 없음', columns));
+      header.push(fitLogLine(visible.length ? '@ 파일 첨부 · ↑↓ 선택 · Enter 추가 · Esc 닫기' : '@ 파일 후보 없음', chatColumns));
       for (const [offset, candidate] of visible.entries()) {
-        header.push(fitLogLine((start + offset === atPicker.selected ? '▸' : ' ') + ' ' + candidate.label, columns));
+        header.push(fitLogLine((start + offset === atPicker.selected ? '▸' : ' ') + ' ' + candidate.label, chatColumns));
       }
     }
     const lines = [...header, ...body, ...footer, prompt.line];
     const promptRow = lines.length;
-    process.stdout.write(`\x1b[H\x1b[2J${lines.join('\n')}\x1b[${promptRow};${prompt.cursorCol}H\x1b[?25h`);
+    const sidetabLines = sidetabOpen
+      ? sidetabApi!.formatSidetabLines(sidetabRows, sidetabSelected, sidetabWidth, Math.max(1, rows - 1), sidetabMode)
+      : [];
+    const screenLines = sidetabOpen
+      ? lines.map((line, index) => `${sidetabLines[index] ?? ' '.repeat(sidetabWidth)}│${line}`)
+      : lines;
+    process.stdout.write(`\x1b[H\x1b[2J${screenLines.join('\n')}\x1b[${promptRow};${prompt.cursorCol + (sidetabOpen ? sidetabWidth + 1 : 0)}H\x1b[?25h`);
+    if (sidetabAttachments?.hasModal() && !paintingCoordinatorFrame) sidetabAttachments.refresh();
+  };
+
+  const ensureSidetabAttachments = async (): Promise<void> => {
+    if (sidetabAttachments) return;
+    sidetabAttachments = (await import('./sidetab/attach.js')).createSidetabAttachmentController({
+      drawBase: () => {
+        paintingCoordinatorFrame = true;
+        try { render(); } finally { paintingCoordinatorFrame = false; }
+      },
+      termSize: () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }),
+      setStatus: (message) => { status = safeStatusText(message); },
+      drawRemoteFrame: (frame) => {
+        sidetabRemoteFrame = frame || null;
+        if (sidetabRemoteFrame !== null) {
+          const columns = process.stdout.columns || 80;
+          const rows = process.stdout.rows || 24;
+          const footer = fitLogLine(` ${status} `, Math.max(1, columns));
+          process.stdout.write(`\x1b[H\x1b[2J${sidetabRemoteFrame}\x1b[${rows};1H\x1b[7m${footer}\x1b[0m`);
+        }
+        else render();
+      },
+    });
+  };
+
+  const toggleSidetab = async (): Promise<void> => {
+    if (!sidetabEnabled) {
+      status = '사이드탭 off · /side on 으로 이 세션에서 켜기';
+      return;
+    }
+    if (!sidetabOpen && (process.stdout.columns || 0) < 34) {
+      status = '사이드탭은 터미널 폭 34칸 이상에서 열 수 있습니다';
+      return;
+    }
+    if (!sidetabApi) sidetabApi = await import('./sidetab/list.js');
+    sidetabRows = sidetabApi.loadSidetabRows(sidetabAll);
+    const current = sidetabRows.findIndex((row) => row.sessionId === id);
+    const next = sidetabApi.applySidetabKey({ open: sidetabOpen, selected: current >= 0 ? current : sidetabSelected }, 'toggle', sidetabRows.length);
+    sidetabOpen = next.open;
+    sidetabOpenBySession.set(id!, sidetabOpen);
+    updateSessionMeta(id!, (meta) => { meta.uiState = { ...meta.uiState, sidetabOpen }; });
+    sidetabSelected = next.selected;
+    sidetabMode = 'list';
+    if (sidetabOpen && sidetabRefreshTimer === null) {
+      sidetabRefreshTimer = setInterval(() => {
+        if (!sidetabOpen || !sidetabApi) return;
+        refreshSidetabRows();
+        render();
+      }, 1000);
+    } else if (!sidetabOpen && sidetabRefreshTimer !== null) {
+      clearInterval(sidetabRefreshTimer);
+      sidetabRefreshTimer = null;
+    }
+  };
+
+  const refreshSidetabRows = (): void => {
+    if (!sidetabApi) return;
+    const selectedId = sidetabRows[sidetabSelected]?.id;
+    sidetabRows = sidetabApi.loadSidetabRows(sidetabAll);
+    const preservedIndex = selectedId ? sidetabRows.findIndex((row) => row.id === selectedId) : -1;
+    sidetabSelected = preservedIndex >= 0
+      ? preservedIndex
+      : Math.min(sidetabSelected, Math.max(0, sidetabRows.length - 1));
+  };
+  const switchSidetabSession = async (requestedSessionId?: string): Promise<void> => {
+    const selected = sidetabRows[sidetabSelected];
+    const targetId = requestedSessionId ?? (selected?.kind === 'tui' ? selected.sessionId : undefined);
+    if (!targetId || targetId === id) return;
+    if (busy) {
+      status = '응답 중에는 세션을 전환할 수 없습니다';
+      return;
+    }
+    const target = loadSession(targetId);
+    if (!target) {
+      status = '세션을 읽을 수 없습니다 · 목록을 다시 열어 주세요';
+      return;
+    }
+    id = targetId;
+    session = target;
+    messages = target.messages;
+    setActiveSessionId(targetId);
+    updatePtyManifestSession(`tui:${process.pid}`, targetId);
+    backgroundJobs.setSessionId(targetId);
+    selfHealthLine = null;
+    const statusSources = await import('../tui-client/local-chat-turn.js');
+    observeSession(targetId, statusSources.onLocalChatBackgroundStatus, statusSources.onLocalChatSelfHealthStatus);
+    goalContinue?.noteHumanTurn();
+    lastResumeRows = null;
+    expandedToolBlocks.clear();
+    activity = [];
+    streamingReply = '';
+    scroll = 0;
+    maxScroll = 0;
+    status = '세션 전환됨 · Enter 전송 · Ctrl+Q 종료';
+  };
+  const focusSidetab = async (): Promise<void> => {
+    sidetabEnabled = true;
+    if (sidetabAttachments?.hasRemoteView()) sidetabAttachments.showMain();
+    if (!sidetabOpen) await toggleSidetab();
+    sidetabMode = 'list';
+    sidetabFocused = true;
+    status = '사이드탭 포커스 · 1–9 선택 · Esc 입력';
+  };
+  const returnToParent = (): void => {
+    sidetabAttachments?.showMain();
+    sidetabFocused = false;
+    focus = 'input';
+    status = '부모 채팅 · 입력 포커스';
+  };
+  const returnToInput = (): void => {
+    sidetabFocused = false;
+    focus = 'input';
+    status = '입력 포커스';
+  };
+  const selectSidetabIndex = async (index: number): Promise<void> => {
+    refreshSidetabRows();
+    if (index < 0 || index >= sidetabRows.length) {
+      status = `사이드탭 ${index + 1}번 항목 없음`;
+      return;
+    }
+    sidetabSelected = index;
+    const selected = sidetabRows[index]!;
+    if (selected.kind === 'tui') await switchSidetabSession();
+    else {
+      await ensureSidetabAttachments();
+      sidetabAttachments?.select(selected);
+    }
   };
 
   let restoreCliStderrSink: (() => void) | null = null;
@@ -371,16 +567,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     turnAbort = abort;
     turnDone = import('../tui-client/local-chat-turn.js')
       .then(({ runLocalChatTurn, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus }) => {
-        backgroundSubscription.stop ??= onLocalChatBackgroundStatus(turnSessionId, (frame) => {
-          if (frame === null) {
-            backgroundJobs.clear();
-            render();
-          } else if (backgroundJobs.accept(frame)) render();
-        });
-        selfHealthSubscription.stop ??= onLocalChatSelfHealthStatus(turnSessionId, (snapshot: NextTuiSelfHealthSnapshot | null) => {
-          selfHealthLine = snapshot?.line ?? null;
-          render();
-        });
+        observeSession(turnSessionId, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus);
         let firstResponseSeen = false;
         return runLocalChatTurn(turnSessionId, turnText, abort.signal, undefined, undefined, (delta) => {
           // 첫 응답 경계: 첫 스트림 델타에서 턴 시작 트레이스를 닫는다(endedBy=stream-open).
@@ -413,7 +600,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             expandedToolBlocks.clear();
             render();
           },
-        }, attachments);
+        }, attachments, (line) => {
+          pushNotice(line);
+          render();
+        });
       })
       .then(() => { status = `${compactNote}응답 완료 · Enter 전송 · Ctrl+Q 종료`; })
       .catch((error: unknown) => {
@@ -423,7 +613,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           ? '응답 취소됨 · Enter 전송'
           : `응답 실패: ${safeStatusText(message)}`);
       })
-      .finally(() => {
+      .finally(async () => {
         if (streamRenderTimer !== null) clearTimeout(streamRenderTimer);
         streamRenderTimer = null;
         session = loadSession(turnSessionId);
@@ -452,10 +642,22 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         } else if (goalContinue && (queue.queuedSubmissions.length > 0 || editor.text.length > 0)) {
           debug.log('tui.proactive', 'yield-user-input', { queued: queue.queuedSubmissions.length, bufferedChars: editor.text.length });
         }
+        const switchAfterTurn = pendingSidetabSwitch;
+        pendingSidetabSwitch = null;
+        if (switchAfterTurn) await switchSidetabSession(switchAfterTurn);
         render();
       });
   };
 
+  if (sidetabOpen) {
+    sidetabApi = await import('./sidetab/list.js');
+    sidetabRows = sidetabApi.loadSidetabRows(sidetabAll);
+    sidetabRefreshTimer = setInterval(() => {
+      if (!sidetabApi || !sidetabOpen) return;
+      refreshSidetabRows();
+      render();
+    }, 1_000);
+  }
   initTui();
   restoreCliStderrSink = setCliStderrSink(({ source, exitCode, raw }) => {
     // Keep the exact bytes in the normal debug log while rendering only failures through the
@@ -477,6 +679,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   try {
     {
       const { createNextTuiWakeup, setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');
+      const { setNextSidetabHandler } = await import('../tui-client/local-chat-turn.js');
+      const { createNextSidetabHostHandler } = await import('./sidetab/nl-tool.js');
       wakeup = createNextTuiWakeup({
         isTurnRunning: () => busy,
         getBufferText: () => editor.text,
@@ -485,6 +689,28 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         notify: (line) => { pushNotice(line); render(); },
       });
       setNextTuiWakeupTool(wakeup.tool);
+      setNextSidetabHandler(createNextSidetabHostHandler({
+        rows: async () => { if (!sidetabApi) sidetabApi = await import('./sidetab/list.js'); refreshSidetabRows(); return sidetabRows; },
+        selected: () => sidetabSelected,
+        switchSession: async (row) => {
+          if (!row.sessionId) return { error: '전환할 TUI 세션 id가 없습니다' };
+          const index = sidetabRows.findIndex((item) => item.id === row.id);
+          if (index < 0) return { error: '세션 목록이 갱신되어 전환을 취소했습니다' };
+          if (busy) {
+            sidetabSelected = index;
+            pendingSidetabSwitch = row.sessionId;
+            return { ok: true, action: 'switch', target: row.id, scheduled: 'after-turn' };
+          }
+          sidetabSelected = index;
+          await switchSidetabSession(row.sessionId);
+          render();
+          return { ok: true, action: 'switch', target: row.id };
+        },
+        attach: async (row) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.select(row); render(); return { ok, action: 'attach', target: row.id }; },
+        detach: () => { if (sidetabAttachments?.hasRemoteView()) sidetabAttachments.showMain(); else if (sidetabAttachments?.hasModal()) { sidetabAttachments.handleKey({ name: '\\', ctrl: true, shift: false, raw: '' }); sidetabAttachments.handleKey({ name: 'd', ctrl: false, shift: false, raw: 'd' }); } render(); return { ok: true, action: 'detach' }; },
+        spawn: async (character) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.spawn(character); refreshSidetabRows(); render(); return { ok, action: 'new', character }; },
+        kill: async (row) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.kill(row); refreshSidetabRows(); render(); return { ok, action: 'kill', target: row.id }; },
+      }));
       const gate = wakeup.gate;
       loopCommand = createNextLoopCommand(gate, (event, data) => debug.log('dashboard.loop', event, data));
       goalContinue = dashboardRuntime.createGoalContinue({
@@ -559,6 +785,99 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           escapeSnapshot = null;
         }
       }
+      if (sidetabChordPending) {
+        sidetabChordPending = false;
+        if (sidetabChordTimer !== null) clearTimeout(sidetabChordTimer);
+        sidetabChordTimer = null;
+        if (key.name === 'up' || key.name === 'down') {
+          if (!sidetabApi) sidetabApi = await import('./sidetab/list.js');
+          refreshSidetabRows();
+          if (sidetabRows.length > 0) {
+            const delta = key.name === 'up' ? -1 : 1;
+            sidetabSelected = (sidetabSelected + delta + sidetabRows.length) % sidetabRows.length;
+            if (sidetabRows[sidetabSelected]!.kind === 'tui') await switchSidetabSession();
+            else {
+              await ensureSidetabAttachments();
+              sidetabAttachments?.select(sidetabRows[sidetabSelected]!);
+            }
+          }
+          render();
+          continue;
+        }
+        if (key.name.toLowerCase() === 's') {
+          await focusSidetab();
+          render();
+          continue;
+        }
+        if (key.name.toLowerCase() === 'p') {
+          returnToParent();
+          render();
+          continue;
+        }
+        if (/^[1-9]$/.test(key.name)) {
+          sidetabEnabled = true;
+          if (!sidetabOpen) await toggleSidetab();
+          await selectSidetabIndex(Number(key.name) - 1);
+          render();
+          continue;
+        }
+        if (key.name === 'escape') {
+          returnToInput();
+          render();
+          continue;
+        }
+        if (key.name.toLowerCase() === 'd' && sidetabAttachments?.hasModal()) {
+          sidetabAttachments.handleKey({ name: '\\', ctrl: true, shift: false });
+          sidetabAttachments.handleKey(key);
+          render();
+          continue;
+        }
+        if (sidetabAttachments?.hasRemoteView()) sidetabAttachments.showMain();
+        await toggleSidetab();
+      }
+      if (key.ctrl && key.name === '\\') {
+        if (!sidetabEnabled) {
+          status = '사이드탭 off · /side on 으로 이 세션에서 켜기';
+          render();
+          continue;
+        }
+        sidetabChordPending = true;
+        sidetabChordTimer = setTimeout(() => {
+          if (!sidetabChordPending) return;
+          sidetabChordPending = false;
+          sidetabChordTimer = null;
+          if (sidetabAttachments?.hasRemoteView()) sidetabAttachments.showMain();
+          void toggleSidetab().then(render);
+        }, 300);
+        continue;
+      }
+      if (sidetabFocused && key.name === 'escape') {
+        returnToInput();
+        render();
+        continue;
+      }
+      if (key.name === 'mouse' && key.mouse?.type === 'click') {
+        if (sidetabOpen && sidetabMode === 'list' && !sidetabAttachments?.hasRemoteView() && !sidetabAttachments?.hasModal()) {
+          const panelWidth = sidetabApi!.sidetabWidthForTerminal(process.stdout.columns || 0);
+          if (key.mouse.col <= panelWidth) {
+            const index = sidetabApi!.sidetabRowIndexAtTerminalRow(
+              sidetabRows.length,
+              sidetabSelected,
+              Math.max(1, (process.stdout.rows || 0) - 1),
+              key.mouse.row,
+            );
+            if (index !== null) {
+              await selectSidetabIndex(index);
+            }
+          }
+        }
+        render();
+        continue;
+      }
+      if (sidetabAttachments?.handleKey(key)) {
+        render();
+        continue;
+      }
       const wheel = wheelDirection(key);
       if (wheel) {
         // Wheel over the chat moves the log only; the prompt and focus stay as they were.
@@ -570,6 +889,56 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         turnAbort?.abort();
         await turnDone;
         break;
+      }
+      if (sidetabFocused && /^[1-9]$/.test(key.name)) {
+        await selectSidetabIndex(Number(key.name) - 1);
+        render();
+        continue;
+      }
+      if (sidetabFocused && key.name !== 'up' && key.name !== 'down') {
+        render();
+        continue;
+      }
+      if (sidetabOpen && sidetabMode === 'new') {
+        if (key.name === 'escape') {
+          sidetabMode = 'list';
+        } else {
+          const character = ({ s: 'shell', e: 'elanous', c: 'codex', l: 'claude' } as const)[key.name.toLowerCase() as 's' | 'e' | 'c' | 'l'];
+          if (character) {
+            await ensureSidetabAttachments();
+            sidetabAttachments?.spawn(character);
+            sidetabMode = 'list';
+            refreshSidetabRows();
+          }
+        }
+        render();
+        continue;
+      }
+      if (sidetabOpen && (key.name === 'up' || key.name === 'down')) {
+        const next = sidetabApi!.applySidetabKey({ open: sidetabOpen, selected: sidetabSelected }, key.name, sidetabRows.length);
+        sidetabSelected = next.selected;
+        if (sidetabRows[sidetabSelected]) {
+          if (sidetabRows[sidetabSelected]!.kind === 'tui') await switchSidetabSession();
+          else {
+            await ensureSidetabAttachments();
+            sidetabAttachments?.select(sidetabRows[sidetabSelected]!);
+          }
+        }
+        render();
+        continue;
+      }
+      if (sidetabOpen && editor.text.length === 0 && key.name === 'enter') {
+        const selected = sidetabRows[sidetabSelected];
+        if (selected) {
+          if (selected.kind === 'tui') await switchSidetabSession();
+          else {
+            await ensureSidetabAttachments();
+            sidetabAttachments?.select(selected);
+          }
+          refreshSidetabRows();
+        }
+        render();
+        continue;
       }
       if (busy && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {
         turnAbort?.abort();
@@ -764,6 +1133,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         const resumeCommand = parseResumeCommand(submitted);
         if (resumeCommand?.kind === 'list') {
+          const { resumeCandidates, resumeListLines } = await import('./slash/resume.js');
           lastResumeRows = resumeCandidates(id);
           activity = resumeListLines(lastResumeRows, id).map(safeStatusText);
           status = '/resume <번호|id 앞자리> 로 이어 가기 · Enter 전송';
@@ -772,6 +1142,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           continue;
         }
         if (resumeCommand?.kind === 'load') {
+          const { requestResumeTuiSession, resumeCandidates } = await import('./slash/resume.js');
           const next = requestResumeTuiSession({ busy, from: id, prefix: resumeCommand.prefix, rows: lastResumeRows ?? resumeCandidates(id) });
           if (next.kind === 'started') {
             loopCommand?.run('stop');
@@ -874,6 +1245,68 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
+        if (submitted === '/help' || submitted === '/help next') {
+          activity.push(
+            'Next TUI: /side · /sidetab — 세션/PTY 목록',
+            '사이드탭: Ctrl+\\ 토글 · ↑↓ 선택 · 빈 prompt Enter=attach · /side new · /side kill',
+            '새 PTY: s shell · e elanous · c codex 구독 · l claude code 구독',
+            'PTY 분리: Ctrl+\\ 후 d · /term help 는 읽기 전용 목록 명령',
+          );
+          status = 'Enter 전송';
+          render();
+          continue;
+        }
+        if (submitted === '/side' || submitted === '/sidetab' || submitted.startsWith('/side ') || submitted.startsWith('/sidetab ')) {
+          const args = submitted.slice(1).trim().split(/\s+/);
+          const action = args[1]?.toLowerCase();
+          if (action === 'help') {
+            activity.push('/side [open|close|off|on|all|new|kill|help] · /sidetab 별칭', 'Ctrl+\\ 후 s=사이드탭 · p=부모 · 1–9=선택 · Esc=입력 · 목록 클릭=전환');
+            status = 'Enter 전송';
+          } else if (action === 'off') {
+            const restoreOpen = sidetabOpen;
+            if (sidetabOpen) await toggleSidetab();
+            sidetabEnabled = false;
+            if (restoreOpen) {
+              sidetabOpenBySession.set(id!, true);
+              updateSessionMeta(id!, (meta) => { meta.uiState = { ...meta.uiState, sidetabOpen: true }; });
+            }
+            status = '사이드탭 off · /side on 으로 이 세션에서 켜기';
+          } else if (action === 'on') {
+            sidetabEnabled = true;
+            if (sidetabOpenBySession.get(id!) === true && !sidetabOpen) await toggleSidetab();
+            status = sidetabOpen ? '사이드탭 on · 열림' : '사이드탭 on · /side open 으로 열기';
+          } else if (action === 'open') {
+            sidetabEnabled = true;
+            if (!sidetabOpen) await toggleSidetab();
+          } else if (action === 'close') {
+            if (sidetabOpen) await toggleSidetab();
+          } else if (action === 'all') {
+            sidetabAll = !sidetabAll;
+            sidetabEnabled = true;
+            if (!sidetabOpen) await toggleSidetab();
+            else refreshSidetabRows();
+            status = sidetabAll ? '사이드탭 전체 목록' : '사이드탭 현재 세션 목록';
+          } else if (action === 'kill') {
+            if (!sidetabApi) sidetabApi = await import('./sidetab/list.js');
+            refreshSidetabRows();
+            const selected = sidetabRows[sidetabSelected];
+            if (selected) {
+              await ensureSidetabAttachments();
+              sidetabAttachments?.kill(selected);
+              refreshSidetabRows();
+            } else {
+              status = '종료할 PTY가 없습니다';
+            }
+          } else if (action === 'new') {
+            sidetabEnabled = true;
+            if (!sidetabOpen) await toggleSidetab();
+            if (sidetabOpen) sidetabMode = 'new';
+          } else {
+            await toggleSidetab();
+          }
+          render();
+          continue;
+        }
         if (submitted === '/term' || submitted.startsWith('/term ') || submitted === '/terminal' || submitted.startsWith('/terminal ')) {
           const { dispatchNextTermSlash } = await import('./slash/term-next.js');
           const args = submitted.slice('/'.length).trim().split(/\s+/).slice(1);
@@ -920,6 +1353,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       render();
     }
   } finally {
+    if (sidetabRefreshTimer !== null) clearInterval(sidetabRefreshTimer);
+    if (sidetabChordTimer !== null) clearTimeout(sidetabChordTimer);
+    sidetabAttachments?.close();
     restoreCliStderrSink?.();
     restoreCliStderrSink = null;
     if (residueTimer !== null) clearTimeout(residueTimer);
@@ -934,6 +1370,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       const { setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');
       setNextTuiWakeupTool(null);
     }
+    const { setNextSidetabHandler } = await import('../tui-client/local-chat-turn.js');
+    setNextSidetabHandler(null);
     turnAbort?.abort();
     await turnDone;
     backgroundSubscription.stop?.();

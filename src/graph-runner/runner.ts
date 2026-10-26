@@ -17,6 +17,7 @@ import { recordFailureEvent } from '../self-implement/heal-intake.js';
 import { growthApprovalRef, proposeGrowth, type GraphGrowth, type GrowthProposer, type GrowthRecipeEffect, type GrowthDecisionDeps, type GrowthCommand } from './graph-grow.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { createLLMGrowthProposer } from './graph-grow-llm.js';
+import type { ResearchEdgeDecisionRegistry } from '../research/edge-decision.js';
 import { graphVersionHash, parseGraphTemplateYaml, type GraphEdgeSpec, type GraphNodeSpec, type GraphTemplateSpec } from '../self-implement/graph-yaml.js';
 import { createGraphUnitResolver, resolveGraphUnit, UnitNotFoundError, type ResolvedGraphUnit } from '../self-implement/graph-unit-resolver.js';
 import { flattenGraphUnits } from '../self-implement/graph-unit-flatten.js';
@@ -34,6 +35,7 @@ const DEFAULT_BASH_TIMEOUT_MS = 5 * 60 * 1_000;
 // Independent of graph YAML and recipe snapshots: an already-wrong saved binding must fail closed.
 const RELEASE_NODE_COMMANDS: Readonly<Record<string, { recipe: string; command?: string }>> = {
   'version-release': { recipe: 'cmd:version-release', command: 'bun scripts/release-loop/version-node.ts release --json' },
+  'traffic-cut-start': { recipe: 'cmd:traffic-cut-start', command: 'bun scripts/release-loop/traffic-node.ts traffic-cut-start' },
   cutoff: { recipe: 'cmd:cutoff', command: 'bun scripts/release-loop/node-verdict.ts cutoff' },
   'checklist-gate': { recipe: 'cmd:checklist-gate', command: 'bun scripts/release-loop/checklist-gate-node.ts' },
   prefetch: { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
@@ -55,9 +57,11 @@ const RELEASE_NODE_COMMANDS: Readonly<Record<string, { recipe: string; command?:
   'approve-publish': { recipe: 'approval:publish' },
   publish: { recipe: 'cmd:publish-command', command: 'bun scripts/release-loop/publish-node.ts' },
   'npm-publish': { recipe: 'cmd:npm-publish', command: 'bun scripts/release-loop/npm-publish-node.ts' },
+  'traffic-npm-published': { recipe: 'cmd:traffic-npm-published', command: 'bun scripts/release-loop/traffic-node.ts traffic-npm-published' },
   'docs-land': { recipe: 'cmd:docs-land', command: 'bun scripts/release-loop/docs-land-node.ts' },
   verify: { recipe: 'cmd:verify', command: 'bun scripts/release-loop/verify-node.ts' },
   'traffic-verify-complete': { recipe: 'cmd:traffic-verify-complete', command: 'bun scripts/release-loop/traffic-node.ts traffic-verify-complete' },
+  'traffic-failed-restore': { recipe: 'cmd:traffic-failed-restore', command: 'bun scripts/release-loop/traffic-node.ts traffic-failed-restore' },
   'vault-note': { recipe: 'cmd:vault-note', command: 'bun scripts/release-loop/vault-note-node.ts' },
   'release-story': { recipe: 'cmd:release-story', command: 'bun scripts/release-story/draft.ts --graph' },
   'ops-upgrade': { recipe: 'cmd:ops-upgrade', command: 'bun scripts/release-loop/ops-upgrade-node.ts' },
@@ -248,6 +252,8 @@ export interface GraphRunOptions {
   pinChildUniverse?: boolean;
   /** Release resume: command checkout and cut tip, checked before every Bash dispatch. */
   releaseCommandSource?: { root: string; cutTip: string; git?: (args: string[]) => string };
+  /** Optional per-run Bloom edge policy hook. */
+  researchEdgeDecisionRegistry?: ResearchEdgeDecisionRegistry;
   deps?: { root?: string; runBash?: BashRun; callLLM?: (prompt: string) => Promise<string>; log?: (event: string, data: Record<string, unknown>) => void; beforeNode?: () => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] } };
 }
 
@@ -839,7 +845,16 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         const next = nextNode(graph.edges, prior.nodeId, prior.ok ? 'ok' : 'fail', typeof reported === 'string' ? reported : undefined);
         if (next !== recorded.nodeId) throw new Error('saved run path does not follow graph edges');
       } else if (recorded.nodeId !== unitEntryNode) throw new Error('saved run path does not start at entry node');
-      if (i < from && !recorded.ok) throw new Error('cannot preserve a failed predecessor when resuming');
+      if (i < from && !recorded.ok) {
+        // A warning-only node explicitly sends every outcome to the same next
+        // node. Its truthful failed record is safe to preserve when retrying a
+        // later release step; a branching failure is still a hard stop.
+        const edge = graph.edges.find((candidate) => candidate.from === recorded.nodeId);
+        const next = state.path[i + 1];
+        if (edge?.on !== 'outcome' || !next || !(['ok', 'fail', 'error'] as const).every((outcome) => edge.map?.[outcome] === next)) {
+          throw new Error('cannot preserve a failed predecessor when resuming');
+        }
+      }
       const approved = resolveNodeRecipe(spec, recipes, catalogRoles).approval;
       if (approved && i >= from) throw new Error('cannot restart across an approval decision');
       if (approved && i < from) {
@@ -1363,7 +1378,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
             if (!resolved.command && !resolved.approval && candidate.recipe !== 'none') return 'unknown';
             return { effect: resolved.approval ? 'unknown' : options.deps?.classifyGrowthRecipe?.(candidate, { command: resolved.command?.command }) ?? 'unknown',
               command: resolved.command, approval: resolved.approval?.approval };
-          }, { ...options.deps?.growthDecision, root });
+          }, { ...options.deps?.growthDecision, root }, options.researchEdgeDecisionRegistry);
       if (result.ok) {
         graph = result.graph;
         state.growth ??= [];

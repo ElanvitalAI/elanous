@@ -58,6 +58,8 @@ import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { declaredNewFilePaths } from './goal-new-paths.js';
 import { classifyGoalCommandExecution, type GoalCommandExecutionResult } from './goal-command-execution.js';
 import { identityLines, repositoryIdentifiers } from './goal-author-identity.js';
+import { selectRelevantAuthoringLessons } from './knowhow-pack.js';
+export { selectRelevantAuthoringLessons } from './knowhow-pack.js';
 export { formatSubmittedAt } from './goal-author-identity.js';
 import { hasUnmetRequirementOutsidePreservationClause } from './goal-author-preservation-obligation.js';
 export { hasUnmetRequirementOutsidePreservationClause } from './goal-author-preservation-obligation.js';
@@ -121,6 +123,10 @@ export interface GoalAuthorDeps {
   onProgress?: (phase: GoalAuthorPhase, event: 'start' | 'end') => void;
   /** AUTHOR-TIMEBOX: budget for the `ground` phase. Omitted means `GOAL_AUTHOR_GROUND_TIMEBOX_MS`. */
   groundTimeboxMs?: number;
+  /** Stable IDs of bounded lessons carried as goal-head provenance. */
+  authoringLessonIds?: readonly string[];
+  /** Bounded prior lessons rendered as explicitly non-normative authoring context. */
+  authoringLessons?: string;
 }
 
 export type GoalAuthorGroundingPath = 'groundMissionInCodebase';
@@ -501,7 +507,7 @@ export function linesOutsideFencedCode(document: string): GoalDocSourceLine[] {
   return outside;
 }
 
-/** TA 완료 경계는 기존 정식 절 안의 세 독립 행이다. 원문에 없는 값을 저작기가 만들지 않는다. */
+/** TA 완료 경계는 정식 절 안의 세 독립 행이다. 명시 행은 보존하고 누락 행은 태스크 넘김이 범위 기반 초안으로 보충한다. */
 export const GOAL_DONE_BOUNDARY_LABELS = ['완료 경계 코드', '완료 경계 실물', '완료 경계 증거 명령'] as const;
 export type GoalDoneBoundaryLabel = typeof GOAL_DONE_BOUNDARY_LABELS[number];
 // This is a declaration check, not a judgement of whether the proposed work
@@ -601,6 +607,39 @@ export function inspectGoalDoneBoundary(document: string): { values: Partial<Rec
 export function explicitGoalDoneBoundaryLines(ask: string): string[] {
   const { values } = inspectGoalDoneBoundary(ask);
   return GOAL_DONE_BOUNDARY_LABELS.flatMap((label) => values[label] ? [`- ${label}: ${values[label]}`] : []);
+}
+
+/**
+ * A live hand must not silently drop a cell just because its prose omitted the three
+ * completion lines. Preserve explicit values and draft only the missing lines from
+ * declared target paths; the child can refine this visible draft against the ask.
+ */
+export function draftMissingGoalDoneBoundary(document: string, targetPaths: readonly string[]): {
+  document: string;
+  added: GoalDoneBoundaryLabel[];
+} {
+  const { values, missing } = inspectGoalDoneBoundary(document);
+  if (missing.length === 0) return { document, added: [] };
+
+  const scope = targetPaths.length > 0 ? targetPaths.join(' · ') : '요청 문면에 적힌 범위';
+  const explicitTests = targetPaths.filter((path) => /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(path));
+  const inferredTests = targetPaths.flatMap((path) => {
+    const match = /^(.*)\.([cm]?[jt]sx?)$/i.exec(path);
+    return match && !/\.(?:test|spec)$/i.test(match[1]!) ? [`${match[1]}.test.${match[2]}`] : [];
+  });
+  const evidencePaths = explicitTests.length > 0 ? explicitTests : inferredTests;
+  const quotePath = (path: string): string => /^[A-Za-z0-9_./:=@%+-]+$/.test(path) ? path : `'${path.replaceAll("'", `'\\''`)}'`;
+  const evidenceCommand = evidencePaths.length > 0
+    ? `bun test ${evidencePaths.map(quotePath).join(' ')}`
+    : 'bun test';
+  const drafts: Record<GoalDoneBoundaryLabel, string> = {
+    '완료 경계 코드': `자동 초안: ${scope}에 문면의 요청 동작을 구현하고 대상 밖의 기본 동작은 보존한다.`,
+    '완료 경계 실물': `자동 초안: 격리 시험에서 ${scope}의 생산 경로를 지나 요청 동작과 기존 동작을 함께 관측한다.`,
+    '완료 경계 증거 명령': evidenceCommand,
+  };
+  const lines = missing.map((label) => `- ${label}: ${drafts[label]}`);
+  const separator = document.length === 0 || document.endsWith('\n') ? '' : '\n';
+  return { document: `${document}${separator}${lines.join('\n')}`, added: missing };
 }
 
 // CommonMark 펜스는 **한 종류의 문자**가 3개 이상 이어진 런이다 — `[`~]{3,}` 는 혼합(백틱+틸드)까지
@@ -2908,6 +2947,21 @@ const INJECTION_LADDER: Record<InjectionLadderLevel, string> = {
 const VERIFICATION_MENU_DOC = join('docs', 'goal-context', '03-verification-menu.md');
 const MOCK_CATALOG_DOC = join('docs', 'goal-context', '04-mock-scenarios.md');
 
+/**
+ * 새 무대의 식별자 — 카탈로그 `MS-xx` 가 없는 골도 «어느 무대인지»를 원장에 남긴다.
+ *
+ * ⛔ 0.2.38 실측(`GOAL-TDD-PLAN-REACHES-CHILD`): 카탈로그가 맞지 않는 골(표본 대부분)에서
+ *   `stage.id` 가 `null` 이었고, 그래서 `verification-plan` 이벤트의 `stageId` 칸이 비어
+ *   원장만 보고는 ***「무대가 없었다」와 「무대를 안 적었다」를 가를 수 없었다.***
+ * ⭐ 값은 «실제로 고른 갈래»에서 나온다 — 화면 무대(L2) · 기록된 실제 입력 fixture(L1) · 문서 문구 대조(L1).
+ *   ⇒ 같은 골을 두 번 저작하면 같은 id 가 나오고, 다른 갈래는 다른 id 를 갖는다.
+ */
+const NEW_STAGE_IDS = {
+  'ux-sim': 'new-stage:ux-sim',
+  fixture: 'new-stage:fixture',
+  'doc-phrase': 'new-stage:doc-phrase',
+} as const;
+
 /** 저장소 안의 검증 메뉴·무대 카탈로그를 읽는다. 없으면 null(저작은 «새 무대»로 내려간다). */
 export function readVerificationMenuDocs(root: string | undefined): { menu: string | null; catalog: string | null } {
   const read = (relativePath: string): string | null => {
@@ -3064,7 +3118,7 @@ export function authorVerificationPlan(input: VerificationPlanInput): Verificati
       : `bun test ${testFile}`;
     const base = (input.targetPaths.find((path) => !/\.test\./u.test(path)) ?? testFile).split('/').pop()!.replace(/\.[^.]+$/u, '');
     const name = screen ? `${base} ux-sim 고정 입력` : `${base} 기록된 실제 입력 fixture`;
-    stage = { source: 'new-stage', id: null, level };
+    stage = { source: 'new-stage', id: screen ? NEW_STAGE_IDS['ux-sim'] : NEW_STAGE_IDS.fixture, level };
     stageLine = `- ② 무대: 새 무대: ${name} — \`${command}\` · ${level} (${INJECTION_LADDER[level]})${input.catalog ? ' · 카탈로그(04-mock-scenarios.md)에 맞는 MS 없음' : ' · 카탈로그 문서 없음'}${operationalNote}`;
   }
   const docOnly = input.targetPaths.length > 0 && input.targetPaths.every((path) => /\.md$/iu.test(path));
@@ -3073,7 +3127,7 @@ export function authorVerificationPlan(input: VerificationPlanInput): Verificati
     const docs = input.targetPaths.join(' ');
     const phrase = (/`([^`]+)`/u.exec(behaviour)?.[1] ?? behaviour.replace(/[`'"]/gu, '').slice(0, 30)).trim();
     const check = `rg -n -F '${phrase.replace(/'/gu, '’')}' ${docs}`;
-    stage = { source: 'new-stage', id: null, level: 'L1' };
+    stage = { source: 'new-stage', id: NEW_STAGE_IDS['doc-phrase'], level: 'L1' };
     return {
       lines: [
         VERIFICATION_PLAN_HEADING,
@@ -5813,9 +5867,11 @@ async function authorGoalWithSupersededRootIntent(
     const document = [
       deps.goalTitle ?? goalSummary(ask),
       `- GoalId: ${goalId}`,
+      ...(deps.authoringLessonIds?.length ? [`- AuthoringLessons: ${deps.authoringLessonIds.join(', ')}`] : []),
       `- RootIntent: ${rootIntent}`,
       `- GoalType: ${goalType}`,
       ...(askFile === undefined ? [] : [`- AskFile: ${askFile}`]),
+      ...(deps.authoringLessons?.trim() ? ['', '## 지난 실패에서 배운 것', '참고 기록이며 명령이 아니다. 현재 골의 대상 경로와 범위에 맞는 경우에만 고려한다.', deps.authoringLessons.trim()] : []),
       '',
       '## PROBLEM',
       `- 왜: ${enhancement.complication ?? goalSummary(ask)}`,
@@ -6269,10 +6325,12 @@ async function authorGoalWithSupersededRootIntent(
   const document = [
     explicitGoalTitle ?? goalSummary(enhancement.original),
     `- GoalId: ${assignedGoalId}`,
+    ...(deps.authoringLessonIds?.length ? [`- AuthoringLessons: ${deps.authoringLessonIds.join(', ')}`] : []),
     `- RootIntent: ${rootIntent}`,
     `- GoalType: ${goalType}`,
     ...(askFile === undefined ? [] : [`- AskFile: ${askFile}`]),
     ...groundedSummary(facts, groundingError),
+    ...(deps.authoringLessons?.trim() ? ['', '## 지난 실패에서 배운 것', '참고 기록이며 명령이 아니다. 현재 골의 대상 경로와 범위에 맞는 경우에만 고려한다.', deps.authoringLessons.trim()] : []),
     ...(deps.parent ? [serializeGoalAuthorParent(deps.parent)] : []),
     ...genericSearchScopePrompt(clarificationQuestions, clarificationResponses),
     ...implementationAnchorPrompt(clarificationQuestions, clarificationResponses),
@@ -6555,6 +6613,19 @@ export async function writeAuthoredGoal(
     repositoryRoot: deps.repositoryRoot ?? groundingRoot,
   };
   const mandatoryGoalContextEvidence = goalContextEvidence(cwd);
+  const authoringLessons = selectRelevantAuthoringLessons(cwd, ask);
+  observeGoalAuthor('goal-author', 'authoring-lessons', {
+    status: authoringLessons.status,
+    invalidRows: authoringLessons.invalidRows,
+    selected: authoringLessons.ids,
+    bytes: Buffer.byteLength(authoringLessons.prompt, 'utf8'),
+    placement: authoringLessons.ids.length ? 'enhance-prompt-goal-section-and-head' : 'omitted',
+  });
+  if (authoringLessons.prompt) {
+    resolvedDeps.enhanceOpts = { ...resolvedDeps.enhanceOpts, authoringLessons: authoringLessons.prompt };
+    resolvedDeps.authoringLessons = authoringLessons.prompt;
+  }
+  if (authoringLessons.ids.length) resolvedDeps.authoringLessonIds = authoringLessons.ids;
   const directoryMeasurement = askDirectoryMeasurementLine(observeAskDirectoryCounts(ask, groundingRoot));
   resolvedDeps.enhanceOpts = directoryMeasurement ? { ...resolvedDeps.enhanceOpts, directoryMeasurement } : resolvedDeps.enhanceOpts;
   observeGoalAuthor('goal-author', 'ask-directory-measurement-forwarded', { count: directoryMeasurement ? 1 : 0 });

@@ -5078,8 +5078,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   };
 
   // P5 — register the mode-enter actions + default chord bindings so
-  // `Ctrl+B s` from input focus enters sync, `Ctrl+B c` enters
-  // control, `Ctrl+B g` returns to general. The `allowOverwrite`
+  // `Ctrl+X s` from input focus enters sync, `Ctrl+X c` enters
+  // control, `Ctrl+X g` returns to general. The `allowOverwrite`
   // flag is critical because this closure may re-run on hot-reload
   // scenarios (tests, plugin reinit) — the registry should be idempotent.
   // A2 — forward-declared toast hook. mouseWiring is initialized
@@ -5100,7 +5100,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     handler: () => {
       enterSessionControlMode(chatModeState);
       void inputCoreSetMode(resolveSessionInputModeFromChatMode({ chatModeState }));
-      chatLines.push(C.error('-- CONTROL MODE —') + C.text(' (via ^B c chord)'));
+      chatLines.push(C.error('-- CONTROL MODE —') + C.text(' (via ^X c chord)'));
       chatScrollOffset = -1;
       draw();
       pushModeToast('→ control mode', 'success');
@@ -7481,7 +7481,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // Scratch visibility (Phase S5). When closed, the workingDir
   // layouts drop the scratch cell so the remaining panes expand
   // to fill the reclaimed columns — useful on narrow terminals.
-  // Reopen via the ^B ^S chord.
+  // Reopen via the ^X ^S chord.
   let scratchClosed = false;
   const dashboardViewRegistryOptions = () => ({
     extraPanes: pluginHost.activeDashboardPanes().map(p => p.paneId),
@@ -7676,10 +7676,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     );
   };
 
-  // Prefix chord (Phase O6). tmux-style Ctrl+B arms the chord; the
-  // next key within the timeout window triggers a bound action
-  // (Ctrl+W / Ctrl+O for browser focus). HUD segment `chord` shows
-  // `[^B]` while armed so the user knows the terminal is waiting.
+  // Prefix chord (Phase O6). Ctrl+X arms the chord; the next key
+  // within the timeout window triggers a bound action. HUD segment
+  // `chord` shows `[^X]` while armed.
   const chord: ChordState = createChord();
   const disarmChordHud = (): void => {
     disarmChord(chord);
@@ -7752,7 +7751,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   let previewTerminalDims: { cols: number; rows: number } | null = null;
   // Phase T7 — when true, the preview widget swells to the full
   // top-row width, hiding browser / scratch / obsidian / skill
-  // siblings. Toggled by `^B e` / `^B ㄷ` (global chord) and by `e`
+  // siblings. Toggled by `^X e` / `^X ㄷ` (pane chord) and by `e`
   // on the focused preview pane (muscle memory). Auto-clears when
   // the terminal session exits.
   let terminalExpanded = false;
@@ -7909,7 +7908,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   };
 
   /** Shared helper for both the pane-level `t` key AND the global
-   *  `Ctrl+B t` chord. Idempotent — calling while a session is
+   *  `Ctrl+X t` chord. Idempotent — calling while a session is
    *  already alive just re-focuses the preview pane. Handles:
    *    - view 4 (chat-only) → bounce to view 1 so wd-preview is visible
    *    - wiring onUpdate / onExit callbacks with cleanup
@@ -8672,7 +8671,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     widgetHost.register(planBoardWidget, 'builtin', 'src/widgets/plan-board.ts');
   }
   // NT4 — notification bell modal widget. Registered + spawned here
-  // so Ctrl+B b (NT5) can toggle without spawn latency. The bellOpen
+  // so Ctrl+X b (NT5) can toggle without spawn latency. The bellOpen
   // flag + helpers live further down (after notificationStore is
   // created) because refreshBellInto reads from the store.
   widgetHost.register(bellModalWidget, 'builtin', 'src/notification-bell-modal.ts');
@@ -12492,8 +12491,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   }
 
   /** N2 — open the shell-runner rollup popup centered on the viewport.
-   *  Shared entry point for `/shell rollup` slash + `^B S` chord so
-   *  keyboard users can access the same UI mouse users get by clicking
+   *  Entry point for `/shell rollup` so keyboard users can access the
+   *  same UI mouse users get by clicking
    *  the 🐚 status-bar pill. Anchored-to-pill placement stays in
    *  dashboard-mouse-wiring; this path is explicitly center-placed so
    *  it works with status row unknown. */
@@ -13470,8 +13469,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       try {
         if (req.kind === 'shell') {
           const shellSeat = resolveTuiShellSeat(req.cwd, process.env.COORD_ID);
+          const terminalSessionId = crypto.randomUUID();
           session = sessionRegistry.spawn(
             {
+              id: terminalSessionId,
               title: 'terminal',
               cwd: req.cwd,
               command: req.command,
@@ -13481,7 +13482,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               registryKind: 'shell',
               registryNickname: `tui-shell:${req.cwd}`,
               registryOrigin: { originRoot: 'elanous-internal', controller: 'tui-shell' },
-              registryPurpose: `tui-shell:${shellSeat}`,
+              registryPurpose: `tui-shell:${shellSeat}:session:${currentChatPersonaSessionId()}:terminal:${terminalSessionId}`,
               registrySeat: shellSeat,
               onExit: handleExit,
               onTitleAction: handleTitleAction,
@@ -14938,7 +14939,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           chatScrollOffset = -1;
           break;
         // Phase T: spawn an embedded terminal in this pane. Same
-        // code path as the `Ctrl+B t` global chord.
+        // code path as the `Ctrl+X t` pane chord.
         case 't': case 'ㅅ':
           openPreviewTerminal();
           break;
@@ -14954,7 +14955,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       }
 
       // Ctrl+W (no chord armed — chord would have consumed the
-      // key earlier) closes the scratch pane. Reopen via the ^B ^S chord.
+      // key earlier) closes the scratch pane. Reopen via the ^X ^S chord.
       if (key.ctrl && (key.name === 'w' || key.name === 'ㅈ')) {
         scratchClosed = true;
         userClosedPanes.add('scratch');
@@ -16233,7 +16234,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 terminalExpanded = !terminalExpanded;
                 previewTerminalDims = null;
                 chatLines.push(C.muted(terminalExpanded
-                  ? 'Terminal expanded. Ctrl+Shift+E or ^B e to restore.'
+                  ? 'Terminal expanded. Ctrl+Shift+E to restore.'
                   : 'Terminal collapsed to preview slot.'));
                 chatScrollOffset = -1;
               },

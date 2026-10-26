@@ -287,9 +287,11 @@ function formatDuration(ms: number): string {
  *  can `if (rendered) messages.unshift(...)` without branching on length. */
 export function renderTaskNotificationsXml(
   items: readonly PendingTaskNotification[],
+  options: { statusReceipt?: boolean } = {},
 ): string {
   if (items.length === 0) return '';
-  const lines: string[] = ['<task-notification>'];
+  const receiptAttrs = options.statusReceipt ? ' kind="status-receipt" request="none"' : '';
+  const lines: string[] = [`<task-notification${receiptAttrs}>`];
   for (const p of items) {
     const attrs = [
       `id="${escapeXml(p.taskId)}"`,

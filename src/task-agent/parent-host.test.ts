@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -9,13 +9,13 @@ import { LogStore, StoreSink } from '../mss/logging/log-store.js';
 import { hostCredentials } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { _resetGrokRefreshCooldownForTesting, resolveGrokCredential } from '../grok/credential.js';
 import {
-  judgeParentHostCredentials, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript, shouldInstallRemoteCodexAccess,
+  judgeParentHostCredentials, PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript, shouldInstallRemoteCodexAccess,
   installRemoteCodexAccess, installRemoteCodexAccessBatch, installRemoteGrokAccess, resolveOwnerGrokAccessMirror, remoteLedgerMirrorDir, remoteLedgerMirrorDirs, remoteParentArgs, resolveParentHost, resolveParentHosts, rankParentHosts, readParentHostCapacity, readParentHostPodFit, staleHarnessParents, PARENT_HOST_ACTIVE_FILTER, PARENT_HOST_PROC_COUNT_SCRIPT, type ParentHostConfig, type SshRunner,
 } from './parent-host.js';
 import { handTask, shellQuote } from './task-hand.js';
 
 const TARGET: ParentHostConfig = { host: 'node-b', cwd: '/Users/me/source/elanous' };
-const GOOD_FACTS = 'version=0.2.20-dev.0\nconfig=1\npodPool=1\nrepo=1\nkubectl=1\n';
+const GOOD_FACTS = 'version=0.2.20-dev.0\nconfig=1\npodPool=1\nrepo=1\nkubectl=1\ngrokCli=1\ncodexCli=1\n';
 const ACCESS_TOKEN = `header.${Buffer.from(JSON.stringify({ exp: 1_900_000_000 })).toString('base64url')}.signature`;
 const TEST_CODEX_MIRROR = {
   elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: ACCESS_TOKEN, refreshToken: '', refresh_token: '' } } } }),
@@ -151,10 +151,10 @@ describe('multi-host parent routing', () => {
     expect(resolveParentHost({ ...TARGET, approvalCapacity: 0 }, {})).toMatchObject({ host: 'node-b', approvalCapacity: 0 });
     expect(resolveParentHosts(hosts, { ELANOUS_TA_PARENT_HOST: 'off' })).toEqual([]);
     expect(resolveParentHosts(hosts, { ELANOUS_TA_PARENT_HOST: 'node-c' })).toEqual([minihHost]);
-    expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ active: 2, waiting: 0, approvalHeadroom: 6, load: 0 });
-    expect(readParentHostCapacity({ ...minihHost, approvalCapacity: 2 }, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ active: 2, waiting: 0, approvalHeadroom: 0, load: 0 });
-    expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(0), stderr: '' }))).toEqual({ active: 0, waiting: 0, approvalHeadroom: 1, load: 0 });
-    expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(1), stderr: '' }))).toEqual({ active: 1, waiting: 0, approvalHeadroom: 0, load: 0 });
+    expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ active: 2, waiting: 0, limit: 8, headroom: 6, approvalHeadroom: 6, load: 0 });
+    expect(readParentHostCapacity({ ...minihHost, approvalCapacity: 2 }, () => ({ status: 0, stdout: capacitySample(2), stderr: '' }))).toEqual({ active: 2, waiting: 0, limit: 2, headroom: 0, approvalHeadroom: 0, load: 0 });
+    expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(0), stderr: '' }))).toEqual({ active: 0, waiting: 0, limit: 1, headroom: 1, approvalHeadroom: 1, load: 0 });
+    expect(readParentHostCapacity(TARGET, () => ({ status: 0, stdout: capacitySample(1), stderr: '' }))).toEqual({ active: 1, waiting: 0, limit: 1, headroom: 0, approvalHeadroom: 0, load: 0 });
     const unavailableReasons: string[] = [];
     const off = debug.registerSink({ name: 'parent-host-capacity-unavailable-test', emit: (rec) => {
       if (rec.category === 'task-agent.parent-host' && rec.event === 'capacity-unavailable') {
@@ -163,13 +163,14 @@ describe('multi-host parent routing', () => {
     } });
     try {
       expect(readParentHostCapacity(minihHost, () => ({ status: 1, stdout: '__ELANOUS_PARENT_CAPACITY_ERROR__bash-unavailable\n', stderr: '' }))).toBeNull();
+      expect(readParentHostCapacity(minihHost, () => ({ status: 1, stdout: '__ELANOUS_PARENT_CAPACITY_ERROR__cgroup-unreadable\n', stderr: '' }))).toBeNull();
       expect(readParentHostCapacity(minihHost, () => ({ status: 255, stdout: '', stderr: 'timeout' }))).toBeNull();
       const missingActive = capacitySample(0).replace('__ELANOUS_PARENT_CAPACITY__0\n', '');
       const missingBoundary = capacitySample(0).replace('__ELANOUS_PARENT_APPROVALS__\n', '');
       expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: missingActive, stderr: '' }))).toBeNull();
       expect(readParentHostCapacity(minihHost, () => ({ status: 0, stdout: missingBoundary, stderr: '' }))).toBeNull();
     } finally { off(); }
-    expect(unavailableReasons).toEqual(['bash-unavailable', 'remote-command-failed', 'active-count-marker-missing', 'approval-boundary-missing']);
+    expect(unavailableReasons).toEqual(['bash-unavailable', 'cgroup-unreadable', 'remote-command-failed', 'active-count-marker-missing', 'approval-boundary-missing']);
   });
   test('single-host launch records unmeasured ranking fields as null', async () => {
     const events: unknown[] = [];
@@ -192,6 +193,7 @@ describe('multi-host parent routing', () => {
     const writeArgs = (pid: number, args: string[]) => {
       const dir = join(root, String(pid)); mkdirSync(dir);
       writeFileSync(join(dir, 'cmdline'), Buffer.from([...args, ''].join('\0')));
+      writeFileSync(join(dir, 'cgroup'), '0::/user.slice\n');
     };
     try {
       const parent = ['/home/agent/.bun/bin/bun', '/home/agent/.local/share/elanous/current/node_modules/elanous/bin/elanous.mjs', '--config-dir', '/home/agent/.elanous', 'harness', 'say', '--pod-pool', 'pool', '--no-auto-merge', '--substrate', 'pod', 'goal'];
@@ -223,6 +225,24 @@ describe('multi-host parent routing', () => {
       expect(PARENT_HOST_ACTIVE_FILTER).toContain('!/ --substrate local( |$)/');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  test('host capacity excludes eleven container cgroups even when argv matches four parents', () => {
+    const root = mkdtempSync(join(tmpdir(), 'parent-host-cgroup-'));
+    const parent = ['bun', '/opt/elanous/bin/elanous.mjs', 'harness', 'say', '--no-auto-merge', '--substrate', 'pod'];
+    try {
+      for (let pid = 100; pid < 115; pid++) {
+        const dir = join(root, String(pid)); mkdirSync(dir);
+        writeFileSync(join(dir, 'cmdline'), Buffer.from([...parent, ''].join('\0')));
+        writeFileSync(join(dir, 'cgroup'), pid < 104 ? '0::/user.slice\n' : '0::/kubepods.slice/docker-123.scope\n');
+      }
+      const counted = spawnSync('bash', ['-c', PARENT_HOST_PROC_COUNT_SCRIPT, '--', root], { encoding: 'utf8' });
+      expect(counted.status).toBe(0);
+      expect(counted.stdout.trim()).toBe('__ELANOUS_PARENT_CAPACITY__4');
+      rmSync(join(root, '100', 'cgroup'));
+      const unknown = spawnSync('bash', ['-c', PARENT_HOST_PROC_COUNT_SCRIPT, '--', root], { encoding: 'utf8' });
+      expect(unknown.status).not.toBe(0);
+      expect(unknown.stdout).toContain('__ELANOUS_PARENT_CAPACITY_ERROR__cgroup-unreadable');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   test('remote admission backlog and CPU load change the selected host, not just parent process counts', async () => {
     const observedScripts: string[] = [];
     const read = (congested: string): SshRunner => (host, script) => {
@@ -234,12 +254,12 @@ describe('multi-host parent routing', () => {
     };
     const pair = [{ ...TARGET, approvalCapacity: 2 }, { ...minihHost, approvalCapacity: 2 }];
     const sample = readParentHostCapacity(pair[0]!, read('node-b'))!;
-    expect(sample).toEqual({ active: 0, waiting: 1, approvalHeadroom: 1, load: 0.75 });
-    expect(readParentHostCapacity(pair[1]!, read('node-b'))).toEqual({ active: 0, waiting: 0, approvalHeadroom: 2, load: 0.05 });
+    expect(sample).toEqual({ active: 0, waiting: 1, limit: 2, headroom: 1, approvalHeadroom: 1, load: 0.75 });
+    expect(readParentHostCapacity(pair[1]!, read('node-b'))).toEqual({ active: 0, waiting: 0, limit: 2, headroom: 2, approvalHeadroom: 2, load: 0.05 });
     const recovered = capacitySample(0, 1, 0).replace('__ELANOUS_PARENT_CAPACITY__0\n', `__ELANOUS_PARENT_CAPACITY__0\n${JSON.stringify({ category: 'pod-lease', event: 'admit-by-usage', data: { runId: 'run-waiting', recommended: 3 } })}\n`);
     expect(readParentHostCapacity(pair[0]!, () => ({ status: 0, stdout: recovered, stderr: '' }))?.approvalHeadroom).toBe(2);
     const tally = async (congested: string) => {
-      const counts = { node-b: 0, node-c: 0 };
+      const counts = { 'node-b': 0, 'node-c': 0 };
       for (let n = 0; n < 100; n++) {
         const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(n + 500), {
           parentHost: pair, ssh: read(congested), launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
@@ -251,10 +271,10 @@ describe('multi-host parent routing', () => {
     };
     const first = await tally('node-b');
     const second = await tally('node-c');
-    expect(first.node-c).toBeGreaterThan(first.node-b);
-    expect(second.node-b).toBeGreaterThan(second.node-c);
-    const lowLoad = { node-b: { active: 0, waiting: 0, approvalHeadroom: 2, load: 0.05 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 2, load: 0.75 } };
-    const highLoad = { node-b: lowLoad.node-c, node-c: lowLoad.node-b };
+    expect(first['node-c']).toBeGreaterThan(first['node-b']);
+    expect(second['node-b']).toBeGreaterThan(second['node-c']);
+    const lowLoad = { 'node-b': { approvalHeadroom: 2, load: 0.05 }, 'node-c': { approvalHeadroom: 2, load: 0.75 } };
+    const highLoad = { 'node-b': lowLoad['node-c'], 'node-c': lowLoad['node-b'] };
     const lowSelected = Array.from({ length: 100 }, (_, n) => orderParentHosts(pair, `run-load-${n}`, lowLoad)[0]!.host);
     const highSelected = Array.from({ length: 100 }, (_, n) => orderParentHosts(pair, `run-load-${n}`, highLoad)[0]!.host);
     expect(lowSelected.filter((host) => host === 'node-b').length).toBeGreaterThan(highSelected.filter((host) => host === 'node-b').length + 10);
@@ -270,20 +290,20 @@ describe('multi-host parent routing', () => {
     expect(readParentHostCapacity(pair[0]!, () => ({ status: 0, stdout: truncated, stderr: '' }))).toBeNull();
   });
   test('capacity-proportional selection across distinct run ids; zero-headroom is not selected', () => {
-    const capacity = { node-b: { active: 0, waiting: 0, approvalHeadroom: 2, load: 1 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 6, load: 1 } };
-    const counts = { node-b: 0, node-c: 0 };
+    const capacity = { 'node-b': { approvalHeadroom: 2, load: 1 }, 'node-c': { approvalHeadroom: 6, load: 1 } };
+    const counts = { 'node-b': 0, 'node-c': 0 };
     for (let n = 0; n < 400; n++) counts[orderParentHosts(hosts, `run-distribution-${n}`, capacity)[0]!.host as keyof typeof counts]++;
-    expect(counts.node-c).toBeGreaterThan(250);
-    expect(counts.node-c).toBeLessThan(350);
-    expect(orderParentHosts(hosts, 'run-1', { ...capacity, node-b: { active: 0, waiting: 0, approvalHeadroom: 0, load: 1 } })[0]!.host).toBe('node-c');
+    expect(counts['node-c']).toBeGreaterThan(250);
+    expect(counts['node-c']).toBeLessThan(350);
+    expect(orderParentHosts(hosts, 'run-1', { ...capacity, 'node-b': { approvalHeadroom: 0, load: 1 } })[0]!.host).toBe('node-c');
     const ratioHosts = [{ ...TARGET, approvalCapacity: 32 }, { ...minihHost, approvalCapacity: 14 }];
-    const ratio = { node-b: 0, node-c: 0 };
+    const ratio = { 'node-b': 0, 'node-c': 0 };
     for (let n = 0; n < 30; n++) ratio[orderParentHosts(ratioHosts, `run-parent-${n}`, {
-      node-b: { active: 0, waiting: 0, approvalHeadroom: 32, load: 0 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 14, load: 0 },
+      'node-b': { approvalHeadroom: 32, load: 0 }, 'node-c': { approvalHeadroom: 14, load: 0 },
     })[0]!.host as keyof typeof ratio]++;
-    expect(ratio.node-b).toBeGreaterThan(0);
-    expect(ratio.node-c).toBeGreaterThan(0);
-    expect(Math.abs(ratio.node-b / 30 - 32 / 46)).toBeLessThanOrEqual(0.2);
+    expect(ratio['node-b']).toBeGreaterThan(0);
+    expect(ratio['node-c']).toBeGreaterThan(0);
+    expect(Math.abs(ratio['node-b'] / 30 - 32 / 46)).toBeLessThanOrEqual(0.2);
   });
   const context = (n: number) => ({ runId: `run-multi-${n}`, launchId: `tl-${n}`, env: { ELANOUS_RUN_ID: `run-multi-${n}` } });
   const ssh: SshRunner = (host, script) => ({ status: 0, stderr: '', stdout: script.includes('__ELANOUS_PARENT_CAPACITY__') ? capacitySample(0) : script.includes('--version') ? GOOD_FACTS : `pid=${host === 'node-b' ? 111 : 222}\n` });
@@ -330,7 +350,7 @@ describe('multi-host parent routing', () => {
   });
   test('actual launcher selects 30 parents in 32:14 capacity proportion', async () => {
     const weighted = [{ ...TARGET, approvalCapacity: 32 }, { ...minihHost, approvalCapacity: 14 }];
-    const counts = { node-b: 0, node-c: 0 };
+    const counts = { 'node-b': 0, 'node-c': 0 };
     for (let n = 0; n < 30; n++) {
       const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(n + 200), {
         parentHost: weighted, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
@@ -338,9 +358,9 @@ describe('multi-host parent routing', () => {
       });
       counts[(receipt as { parentHost: { host: keyof typeof counts } }).parentHost.host]++;
     }
-    expect(counts.node-b).toBeGreaterThan(0);
-    expect(counts.node-c).toBeGreaterThan(0);
-    expect(Math.abs(counts.node-b / 30 - 32 / 46)).toBeLessThanOrEqual(0.2);
+    expect(counts['node-b']).toBeGreaterThan(0);
+    expect(counts['node-c']).toBeGreaterThan(0);
+    expect(Math.abs(counts['node-b'] / 30 - 32 / 46)).toBeLessThanOrEqual(0.2);
   });
   test('a valid list without approvalCapacity launches instead of falling back locally', async () => {
     const receipt = await launchWithTestMirror(['harness', 'say', 'g'], undefined, context(101), {
@@ -350,7 +370,7 @@ describe('multi-host parent routing', () => {
     });
     expect(['node-b', 'node-c']).toContain((receipt as { parentHost: { host: string } }).parentHost.host);
   });
-  test('missing local Codex credentials fail closed on remote, then preserve local launch', async () => {
+  test('missing local Codex credentials leave the host awaiting provision without a local launch', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'parent-no-codex-'));
     const beforeXdg = process.env.XDG_CONFIG_HOME;
     const scripts: string[] = [];
@@ -366,13 +386,12 @@ describe('multi-host parent routing', () => {
       return { status: 0, stdout: script.includes('nohup') ? 'pid=4242\n' : GOOD_FACTS, stderr: '' };
     };
     try {
-      const receipt = await defaultTaskLauncher(['harness', 'say', 'g'], undefined,
+      await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined,
         { runId: 'run-no-codex-0001', launchId: 'tl-no-codex', env: { ELANOUS_RUN_ID: 'run-no-codex-0001' } },
       { parentHost: { host: 'node-c', cwd: '/srv/elanous' }, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', earlyExitWindowMs: 0,
-        spawn: (() => { localLaunches++; return { pid: 4242, once(event: string, listener: () => void) { if (event === 'spawn') queueMicrotask(listener); return this; }, removeListener() { return this; }, unref() {} }; }) as unknown as DetachedSpawn });
-      expect(receipt).toEqual({ runId: 'run-no-codex-0001' });
+        spawn: (() => { localLaunches++; return { pid: 4242, once(event: string, listener: () => void) { if (event === 'spawn') queueMicrotask(listener); return this; }, removeListener() { return this; }, unref() {} }; }) as unknown as DetachedSpawn })).rejects.toThrow('parent-host-provision-pending');
       expect(scripts.some((script) => script.includes('nohup'))).toBe(false);
-      expect(localLaunches).toBe(1);
+      expect(localLaunches).toBe(0);
       expect(scripts.some((script) => script.includes('umask 077'))).toBe(false);
       expect(fitEvents).toContainEqual(expect.objectContaining({ state: 'unmeasured', reason: 'pod-context-unmeasured' }));
     } finally {
@@ -432,7 +451,7 @@ describe('multi-host parent routing', () => {
     expect(ranked.every((row) => (row as { capacityState?: string }).capacityState === 'saturated')).toBe(true);
   });
   test('preflight rejects the chosen host before trying the other; unavailable capacity never launches there', async () => {
-    const first = orderParentHosts(targets, context(99).runId, { node-b: { active: 0, waiting: 0, approvalHeadroom: 2, load: 0 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 8, load: 0 } })[0]!.host;
+    const first = orderParentHosts(targets, context(99).runId, { 'node-b': { approvalHeadroom: 2, load: 0 }, 'node-c': { approvalHeadroom: 8, load: 0 } })[0]!.host;
     const launched: string[] = [];
     const ssh: SshRunner = (host, script, _timeout, stdin) => {
       if (stdin !== undefined) return { status: 0, stdout: '', stderr: '' };
@@ -446,7 +465,7 @@ describe('multi-host parent routing', () => {
     expect((receipt as { parentHost: { host: string } }).parentHost.host).toBe(launched[0]);
   });
   test('definite failed first host tries next; both fail falls back locally; uncertain launch never retries', async () => {
-    const first = orderParentHosts(targets, context(99).runId, { node-b: { active: 0, waiting: 0, approvalHeadroom: 2, load: 0 }, node-c: { active: 0, waiting: 0, approvalHeadroom: 8, load: 0 } })[0]!.host;
+    const first = orderParentHosts(targets, context(99).runId, { 'node-b': { approvalHeadroom: 2, load: 0 }, 'node-c': { approvalHeadroom: 8, load: 0 } })[0]!.host;
     const second = targets.find((target) => target.host !== first)!.host;
     const calls: string[] = [];
     const run = (failure: 'first' | 'both' | 'uncertain'): SshRunner => (host, script, _timeout, stdin) => {
@@ -559,16 +578,7 @@ describe('defaultTaskLauncher — 원격 부모', () => {
     }
   });
 
-  test('actual remote-parent launch sends only selected Grok access through SSH stdin before launch', () => {
-    const home = mkdtempSync(join(tmpdir(), 'parent-grok-launch-'));
-    const expiry = '2030-01-01T00:00:00.000Z';
-    const selected = 'selected-grok-access-test-value';
-    const unselected = 'other-grok-access-test-value';
-    mkdirSync(join(home, '.grok'), { recursive: true });
-    writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
-      'https://auth.x.ai::hq-selected': { key: selected, expires_at: expiry },
-      'https://auth.x.ai::other': { key: unselected, expires_at: '2035-01-01T00:00:00.000Z', refresh_token: 'preserved-refresh-fixture' },
-    }));
+  test('Grok child launch installs no HQ mirror — the remote host keeps its own device-auth session', () => {
     const calls: Array<{ script: string; stdin?: string }> = [];
     const ssh: SshRunner = (_host, script, _timeout, stdin) => {
       calls.push({ script, ...(stdin !== undefined ? { stdin } : {}) });
@@ -576,19 +586,33 @@ describe('defaultTaskLauncher — 원격 부모', () => {
         ? { status: 0, stdout: 'pid=4242\n', stderr: '' }
         : { status: 0, stdout: '', stderr: '' };
     };
+    const hostCredentialEvents: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'grok-host-credential-launch-test', emit: (rec) => {
+      if (rec.category === 'task-agent.parent-host' && rec.event === 'grok-host-credential') hostCredentialEvents.push(rec.data as Record<string, unknown>);
+    } });
     try {
       const receipt = launchRemoteParent(TARGET, ['harness', 'say', '--child-llm-provider', 'grok', 'goal'],
-        { ELANOUS_RUN_ID: context.runId }, ssh, () => ({ key: selected, expiresAt: expiry }));
+        { ELANOUS_RUN_ID: context.runId }, ssh);
       expect(receipt).toMatchObject({ pid: 4242, log: expect.any(String) });
-      const install = calls.find((call) => call.stdin !== undefined);
-      const launch = calls.find((call) => call.script.includes('nohup'));
-      expect(install).toBeDefined();
-      expect(launch).toBeDefined();
-      expect(calls.indexOf(install!)).toBeLessThan(calls.indexOf(launch!));
-      expect(JSON.parse(install!.stdin!)).toEqual({ key: selected, expires_at: expiry });
-      expect(calls.every((call) => !call.script.includes(selected) && !call.script.includes(unselected))).toBe(true);
-      expect(launch!.script).toContain('--child-llm-provider grok');
-      expect(calls).toHaveLength(2);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.stdin).toBeUndefined();
+      expect(calls[0]!.script).not.toContain('umask 077');
+      expect(calls[0]!.script).toContain('--child-llm-provider grok');
+      expect(hostCredentialEvents).toEqual([expect.objectContaining({ host: 'node-b', runId: context.runId, source: 'host-device-auth' })]);
+    } finally { off(); }
+  });
+
+  test('installRemoteGrokAccess keeps its access-only mirror scope when called directly', () => {
+    const home = mkdtempSync(join(tmpdir(), 'parent-grok-install-'));
+    const expiry = '2030-01-01T00:00:00.000Z';
+    const selected = 'selected-grok-access-test-value';
+    const unselected = 'other-grok-access-test-value';
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+      'https://auth.x.ai::hq-selected': { key: selected, expires_at: expiry },
+      'https://auth.x.ai::other': { key: unselected, expires_at: '2029-01-01T00:00:00.000Z', refresh_token: 'preserved-refresh-fixture' },
+    }));
+    try {
       const installedMirrorToken = 'installed-hq-mirror-access-test-value';
       installRemoteGrokAccess(TARGET, { key: installedMirrorToken, expiresAt: expiry }, localShell(home));
       const installed = JSON.parse(readFileSync(join(home, '.grok', 'auth.json'), 'utf8')) as Record<string, Record<string, unknown>>;
@@ -626,35 +650,26 @@ describe('defaultTaskLauncher — 원격 부모', () => {
     expect(sshCalls).toBe(1);
   });
 
-  test('defaultTaskLauncher blocks Grok install when preflight consumes the safety margin', async () => {
-    const start = Date.parse('2026-10-20T00:00:00.000Z');
-    let clock = start;
+  test('defaultTaskLauncher refuses the launch when the host reports its Grok credential is expiring', async () => {
     const calls: Array<{ script: string; stdin?: string }> = [];
     const { defaultTaskLauncher } = await import('../cli/tasks-cli.js');
     const ssh: SshRunner = (_host, script, _timeout, stdin) => {
       calls.push({ script, ...(stdin !== undefined ? { stdin } : {}) });
-      if (script.includes('--version')) {
-        clock += 2_000;
-        return { status: 0, stdout: GOOD_FACTS, stderr: '' };
-      }
-      return { status: 0, stdout: '', stderr: '' };
+      return { status: 0, stdout: script.includes('--version') ? `${GOOD_FACTS}grok=1\ngrokHost=expiring\ncodexAccounts=3\nopenrouter=1\n` : '', stderr: '' };
     };
     await expect(defaultTaskLauncher(['harness', 'say', 'goal'], undefined, {
       runId: context.runId, launchId: 'grok-expiry-preflight', effectiveChildProvider: 'grok',
       env: { ELANOUS_RUN_ID: context.runId },
     }, {
-      parentHost: TARGET, ssh, localVersion: '0.2.20-dev.0', now: () => clock,
-      grokAccessMirror: () => ({ key: 'selected-grok-access-test-value', expiresAt: new Date(start + 121_000).toISOString() }),
+      parentHost: TARGET, ssh, localVersion: '0.2.20-dev.0',
       launchHoldActive: () => false,
-      spawn: () => { throw new Error('local launch after stale remote credential'); },
-    })).rejects.toThrow('invalid Grok access mirror');
-    expect(clock).toBe(start + 2_000);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.stdin).toBeUndefined();
+      spawn: () => { throw new Error('local launch after invalid host credential'); },
+    })).rejects.toThrow('parent-host-provision-pending');
     expect(calls.every((call) => !call.script.includes('nohup'))).toBe(true);
+    expect(calls.some((call) => call.stdin !== undefined)).toBe(false);
   });
 
-  test('defaultTaskLauncher resolves Grok from isolated HOME before remote launch', () => {
+  test('defaultTaskLauncher launches with the host credential and installs no mirror although HQ holds a Grok subscription', () => {
     const home = mkdtempSync(join(tmpdir(), 'parent-grok-launcher-isolated-'));
     const selected = 'isolated-grok-access-fixture';
     const expiry = '2030-01-01T00:00:00.000Z';
@@ -663,13 +678,14 @@ describe('defaultTaskLauncher — 원격 부모', () => {
       'https://auth.x.ai::isolated': { key: selected, expires_at: expiry },
       'https://auth.x.ai::other': { key: 'unselected-grok-access-fixture', expires_at: '2029-01-01T00:00:00.000Z' },
     }));
+    const hostFacts = `${GOOD_FACTS}grok=1\ngrokHost=valid\ncodexAccounts=3\nopenrouter=1\n`;
     const child = `
       const { defaultTaskLauncher } = await import('./src/cli/tasks-cli.ts');
       const { handTask } = await import('./src/task-agent/task-hand.ts');
       const calls = [];
       const ssh = (_host, script, _timeout, stdin) => {
         calls.push({ script, stdin });
-        if (script.includes('--version')) return { status: 0, stdout: ${JSON.stringify(GOOD_FACTS)}, stderr: '' };
+        if (script.includes('--version')) return { status: 0, stdout: ${JSON.stringify(hostFacts)}, stderr: '' };
         if (script.includes('nohup')) return { status: 0, stdout: 'pid=4242\\n', stderr: '' };
         return { status: 0, stdout: '', stderr: '' };
       };
@@ -679,13 +695,12 @@ describe('defaultTaskLauncher — 원격 부모', () => {
         launcher: (taskArgs, cwd, context) => defaultTaskLauncher(taskArgs, cwd, context,
           { parentHost: ${JSON.stringify(TARGET)}, ssh, launchHoldActive: () => false,
             localVersion: '0.2.20-dev.0', spawn: () => { throw new Error('local launch forbidden'); } }) });
-      const install = calls.find((call) => call.stdin !== undefined);
+      const installs = calls.filter((call) => call.stdin !== undefined);
       const launch = calls.find((call) => call.script.includes('nohup'));
-      const payload = install ? JSON.parse(install.stdin) : null;
       console.log(JSON.stringify({ cardProvider: handed.card.childLlm?.provider, receipt: handed.card.parentHost,
-        count: calls.length, installBeforeLaunch: calls.indexOf(install) < calls.indexOf(launch),
-        payloadKeys: payload ? Object.keys(payload).sort() : [], payloadIsFixture: payload?.key === ${JSON.stringify(selected)},
-        scriptHasFixture: calls.some((call) => call.script.includes(${JSON.stringify(selected)})),
+        count: calls.length, installs: installs.length,
+        mirrorWrite: calls.some((call) => call.script.includes('umask 077')),
+        fixtureOnWire: calls.some((call) => call.script.includes(${JSON.stringify(selected)}) || String(call.stdin || '').includes(${JSON.stringify(selected)})),
         launchHasGrok: launch?.script.includes('--child-llm-provider grok') }));
       process.exit(0);
     `;
@@ -697,39 +712,42 @@ describe('defaultTaskLauncher — 원격 부모', () => {
       expect(result.status).toBe(0);
       const evidence = JSON.parse(result.stdout.trim()) as {
         cardProvider: string; receipt?: { host: string; pid: number };
-        count: number; installBeforeLaunch: boolean; payloadKeys: string[];
-        payloadIsFixture: boolean; scriptHasFixture: boolean; launchHasGrok: boolean;
+        count: number; installs: number; mirrorWrite: boolean; fixtureOnWire: boolean; launchHasGrok: boolean;
       };
       expect(evidence.cardProvider).toBe('grok');
       expect(evidence.receipt).toMatchObject({ host: 'node-b', pid: 4242 });
-      expect(evidence.count).toBe(3); // version check, access install, and parent launch
-      expect(evidence.installBeforeLaunch).toBe(true);
-      expect(evidence.payloadKeys).toEqual(['expires_at', 'key']);
-      expect(evidence.payloadIsFixture).toBe(true);
-      expect(evidence.scriptHasFixture).toBe(false);
+      expect(evidence.count).toBe(2); // preflight 사실 한 번 ⊕ 부모 발사 한 번 — 미러 설치 없음
+      expect(evidence.installs).toBe(0);
+      expect(evidence.mirrorWrite).toBe(false);
+      expect(evidence.fixtureOnWire).toBe(false);
       expect(evidence.launchHasGrok).toBe(true);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   }, { timeout: 35_000 });
 
-  test('defaultTaskLauncher refuses a Grok launch before any SSH call when owner access is missing', () => {
+  test('defaultTaskLauncher blocks the Grok child before launch when the host reports no credential, with an OP re-login request', () => {
     const home = mkdtempSync(join(tmpdir(), 'parent-grok-launcher-empty-'));
     mkdirSync(join(home, '.grok'), { recursive: true });
     writeFileSync(join(home, '.grok', 'auth.json'), '{}');
+    const hostFacts = `${GOOD_FACTS}grokHost=missing\ncodexAccounts=3\nopenrouter=1\n`;
     const child = `
       const { defaultTaskLauncher } = await import('./src/cli/tasks-cli.ts');
       const calls = [];
+      const notices = [];
       let error = '';
       try {
         await defaultTaskLauncher(['harness', 'say', 'goal'], undefined,
           { runId: 'run-11112222-3333-4444-5555-666677778888', launchId: 'isolated-missing',
             effectiveChildProvider: 'grok', env: { ELANOUS_RUN_ID: 'run-11112222-3333-4444-5555-666677778888' } },
-          { parentHost: ${JSON.stringify(TARGET)}, ssh: (_host, script) => { calls.push(script); return { status: 0, stdout: '', stderr: '' }; },
+          { parentHost: ${JSON.stringify(TARGET)},
+            ssh: (_host, script) => { calls.push(script); return { status: 0, stdout: script.includes('--version') ? ${JSON.stringify(hostFacts)} : '', stderr: '' }; },
             launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
-            spawn: () => { throw new Error('local launch forbidden'); } });
+            spawn: () => { throw new Error('local launch forbidden'); },
+            notice: (line) => notices.push(line) });
       } catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
-      console.log(JSON.stringify({ calls: calls.length, error }));
+      console.log(JSON.stringify({ launches: calls.filter((script) => script.includes('nohup')).length,
+        preflights: calls.length, notices, error }));
       process.exit(0);
     `;
     try {
@@ -738,26 +756,37 @@ describe('defaultTaskLauncher — 원격 부모', () => {
         env: { ...process.env, HOME: home },
       });
       expect(result.status).toBe(0);
-      const evidence = JSON.parse(result.stdout.trim()) as { calls: number; error: string };
-      expect(evidence.error).toContain('Grok subscription mirror unavailable');
-      expect(evidence.calls).toBe(0);
+      const evidence = JSON.parse(result.stdout.trim()) as { launches: number; preflights: number; notices: string[]; error: string };
+      expect(evidence.error).toContain('parent-host-provision-pending');
+      expect(evidence.error).toContain('grok-credential-missing');
+      expect(evidence.launches).toBe(0);
+      expect(evidence.preflights).toBe(1);
+      expect(evidence.notices.filter((line) => line.includes('provision 요청')))
+        .toEqual(['[parent-host] node-b provision 요청 — grok-credential-missing; 준비 완료 전 배정 대기']);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   }, { timeout: 35_000 });
 
-  test('expired, unrefreshable Grok subscription refuses SSH install and parent launch', () => {
+  test('an expired HQ subscription neither installs a mirror nor blocks the host-credential launch', () => {
     const home = mkdtempSync(join(tmpdir(), 'parent-grok-expired-'));
     mkdirSync(join(home, '.grok'), { recursive: true });
     writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({ 'https://auth.x.ai::hq': { key: 'expired-access-test-value', expires_at: '2020-01-01T00:00:00.000Z' } }));
-    const calls: string[] = [];
-    const ssh: SshRunner = (_host, script) => { calls.push(script); return { status: 0, stdout: '', stderr: '' }; };
+    const calls: Array<{ script: string; stdin?: string }> = [];
+    const ssh: SshRunner = (_host, script, _timeout, stdin) => {
+      calls.push({ script, ...(stdin !== undefined ? { stdin } : {}) });
+      return { status: 0, stdout: script.includes('nohup') ? 'pid=4242\n' : '', stderr: '' };
+    };
     try {
-      expect(() => launchRemoteParent(TARGET, ['harness', 'say', '--child-llm-provider=grok', 'goal'],
-        { ELANOUS_RUN_ID: context.runId }, ssh, () => resolveOwnerGrokAccessMirror({
-          home, now: () => Date.parse('2026-10-20T00:00:00Z'), execImpl: () => { throw new Error('refresh unavailable'); },
-        }))).toThrow('expired-or-refresh-did-not-produce-fresh-access');
-      expect(calls).toEqual([]);
+      // HQ-side resolution still fails closed for its own callers.
+      expect(() => resolveOwnerGrokAccessMirror({
+        home, now: () => Date.parse('2026-10-20T00:00:00Z'), execImpl: () => { throw new Error('refresh unavailable'); },
+      })).toThrow('expired-or-refresh-did-not-produce-fresh-access');
+      // The remote launch path never consults it: the host owns its own session.
+      expect(launchRemoteParent(TARGET, ['harness', 'say', '--child-llm-provider=grok', 'goal'],
+        { ELANOUS_RUN_ID: context.runId }, ssh)).toMatchObject({ pid: 4242 });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.stdin).toBeUndefined();
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -1499,6 +1528,67 @@ describe('LLM 자격 사실 — 막지 않고 경고', () => {
   });
 });
 
+describe('HOST-TOOL-SELF-PROVISION — provider-ready parent admission', () => {
+  const context = { runId: 'run-provider-ready-01', launchId: 'tl-provider-ready', effectiveChildProvider: 'grok',
+    env: { ELANOUS_RUN_ID: 'run-provider-ready-01' } };
+
+  test('missing Grok CLI requests provision once and excludes host; after install the same host launches', async () => {
+    let installed = false;
+    const calls: string[] = [];
+    const notices: string[] = [];
+    const provisionEvents: Array<{ host?: string; runId?: string; provider?: string; reason?: string }> = [];
+    const logSpy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: { host?: string; runId?: string; provider?: string; reason?: string }) => {
+      if (category === 'task-agent.parent-host' && event === 'provision-requested') provisionEvents.push(data ?? {});
+    }) as typeof debug.log);
+    const ssh: SshRunner = (_host, script) => {
+      calls.push(script);
+      return { status: 0, stdout: script.includes('--version')
+        ? GOOD_FACTS.replace('grokCli=1\n', installed ? 'grokCli=1\n' : '')
+        : script.includes('nohup') ? 'pid=4242\n' : '', stderr: '' };
+    };
+    const deps = { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+      spawn: () => { throw Error('local launch forbidden'); }, notice: (line: string) => notices.push(line) };
+    try {
+      await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, deps)).rejects.toThrow('parent-host-provision-pending');
+      expect(calls.filter((script) => script.includes('nohup'))).toHaveLength(0);
+      expect(notices.filter((line) => line.includes('provision 요청'))).toHaveLength(1);
+      expect(provisionEvents).toEqual([{ host: 'node-b', runId: context.runId, provider: 'grok', reason: 'grok-cli-missing' }]);
+      installed = true;
+      const launched = await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, deps);
+      expect(launched).toMatchObject({ parentHost: { host: 'node-b', pid: 4242 } });
+    } finally { logSpy.mockRestore(); }
+  });
+
+  test('host-reported expiring and expired Grok credentials fail before launch; valid permits selection', async () => {
+    const testTarget = { ...TARGET, host: 'remote-a' };
+    const hostFacts = (state: string) => `${GOOD_FACTS}grok=1\ngrokHost=${state}\ncodexAccounts=3\nopenrouter=1\n`;
+    for (const state of ['expiring', 'expired']) {
+      const calls: string[] = [];
+      const notices: string[] = [];
+      await expect(defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, {
+        parentHost: testTarget, ssh: (_host, script) => { calls.push(script); return { status: 0, stdout: script.includes('--version') ? hostFacts(state) : '', stderr: '' }; },
+        launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+        spawn: () => { throw Error('local launch forbidden'); }, notice: (line) => notices.push(line),
+      })).rejects.toThrow(`parent-host-provision-pending`);
+      expect(calls.filter((script) => script.includes('nohup'))).toHaveLength(0);
+      expect(notices.filter((line) => line.includes('provision 요청')))
+        .toEqual([`[parent-host] remote-a provision 요청 — grok-credential-${state}; 준비 완료 전 배정 대기`]);
+    }
+    const launched = await defaultTaskLauncher(['harness', 'say', 'g'], undefined, context, {
+      parentHost: testTarget, ssh: (_host, script) => ({ status: 0, stdout: script.includes('--version') ? hostFacts('valid') : script.includes('nohup') ? 'pid=4242\n' : '', stderr: '' }),
+      launchHoldActive: () => false, localVersion: '0.2.20-dev.0',
+      spawn: () => { throw Error('local launch forbidden'); },
+    });
+    expect(launched).toMatchObject({ parentHost: { host: 'remote-a', pid: 4242 } });
+  });
+
+  test('missing Codex CLI is a gap only for Codex child selection', () => {
+    const facts = { version: '0.2.20-dev.0', config: '1', podPool: '1', repo: '1', kubectl: '1', grokCli: '1' };
+    expect(judgeParentHostFacts(facts, { localVersion: '0.2.20-dev.0', launchHoldActive: false, childProvider: 'openai-codex' })).toContain('codex-cli-missing');
+    expect(judgeParentHostFacts(facts, { localVersion: '0.2.20-dev.0', launchHoldActive: false, childProvider: 'grok' })).toEqual([]);
+  });
+});
+
 describe('TA-LAND-REMOTE-PARENT — a ta-land run may use a remote parent', () => {
   const runId = 'run-aaaa2222-3333-4444-5555-666677778888';
   const localSpawn = (counter: { n: number }): DetachedSpawn => () => {
@@ -1541,5 +1631,82 @@ describe('TA-LAND-REMOTE-PARENT — a ta-land run may use a remote parent', () =
       { parentHost: TARGET, ssh, launchHoldActive: () => false, localVersion: '0.2.20-dev.0', spawn: () => { throw new Error('로컬 발사가 불리면 안 된다'); } });
     expect(receipt).toMatchObject({ runId, parentHost: { host: 'node-b', pid: 4343 } });
     expect(ssh.calls.some((call) => call.includes('nohup'))).toBe(true);
+  });
+});
+
+describe('GROK-MIRROR-REAL-SCOPE — 원격 부모는 호스트 자체 grok 자격을 쓴다', () => {
+  const testTarget = { ...TARGET, host: 'remote-a' };
+  const hostFacts = (state: string) => `${GOOD_FACTS}grok=1\ngrokHost=${state}\ncodexAccounts=3\nopenrouter=1\n`;
+
+  test('preflight blocks a Grok child when the host reports no credential and asks OP to re-login', () => {
+    const reloginEvents: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'grok-relogin-required-test', emit: (rec) => {
+      if (rec.category === 'task-agent.parent-host' && rec.event === 'grok-relogin-required') reloginEvents.push(rec.data as Record<string, unknown>);
+    } });
+    try {
+      const blocked = preflightParentHost({ target: testTarget, localVersion: '0.2.20-dev.0', launchHoldActive: false, childProvider: 'grok',
+        ssh: stubSsh([{ match: /--version/, stdout: `${GOOD_FACTS}grokHost=missing\ncodexAccounts=3\nopenrouter=1\n` }]) });
+      expect(blocked.ok).toBe(false);
+      expect(blocked.gaps).toEqual(['grok-credential-missing']);
+      expect(reloginEvents).toEqual([expect.objectContaining({ host: 'remote-a', state: 'missing', gaps: ['grok-credential-missing'] })]);
+
+      const valid = preflightParentHost({ target: testTarget, localVersion: '0.2.20-dev.0', launchHoldActive: false, childProvider: 'grok',
+        ssh: stubSsh([{ match: /--version/, stdout: hostFacts('valid') }]) });
+      expect(valid).toMatchObject({ ok: true, gaps: [] });
+      expect(reloginEvents).toHaveLength(1);
+    } finally { off(); }
+  });
+
+  test('judgeParentHostGrokCredential blocks missing/expiring/expired and passes valid, unknown, or a non-Grok child', async () => {
+    const { judgeParentHostGrokCredential: judgeGrok } = await import('./parent-host.js');
+    expect(typeof judgeGrok).toBe('function');
+    const judge = (facts: Record<string, string>, childProvider?: string) =>
+      judgeGrok(facts, { ...(childProvider ? { childProvider } : {}) });
+    expect(judge({ grokHost: 'missing' }, 'grok')).toEqual(['grok-credential-missing']);
+    expect(judge({ grokHost: 'expiring', grok: '1' }, 'grok')).toEqual(['grok-credential-expiring']);
+    expect(judge({ grokHost: 'expired', grok: '1' }, 'grok')).toEqual(['grok-credential-expired']);
+    expect(judge({ grokHost: 'valid', grok: '1' }, 'grok')).toEqual([]);
+    expect(judge({ grokHost: 'unknown', grok: '1' }, 'grok')).toEqual([]);
+    expect(judge({ grokHost: 'missing' }, 'openai-codex')).toEqual([]);
+    expect(judge({}, 'grok')).toEqual([]); // 호스트가 상태를 안 보고하면 막지 않는다(구 호스트)
+    expect(judge({ unreachable: 'rc=255' }, 'grok')).toEqual([]);
+  });
+
+  test('real shell: the preflight probe measures the host credential against the 60m floor', () => {
+    const home = mkdtempSync(join(tmpdir(), 'grok-host-cred-'));
+    const cwd = mkdtempSync(join(tmpdir(), 'grok-host-cwd-'));
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    const auth = join(home, '.grok', 'auth.json');
+    const facts = () => {
+      const parsed: Record<string, string> = {};
+      for (const line of localShell(home)('h', preflightScript({ host: 'h', cwd }), 20_000).stdout.split('\n')) {
+        const at = line.indexOf('=');
+        if (at > 0) parsed[line.slice(0, at)] = line.slice(at + 1);
+      }
+      return parsed;
+    };
+    const deviceAuth = (expiresAt: string, mirrorExpiresAt?: string) => JSON.stringify({
+      'https://auth.x.ai::device': { key: 'host-device-auth-fixture', expires_at: expiresAt },
+      ...(mirrorExpiresAt ? { 'https://auth.x.ai::hq-mirror': { key: 'stale-hq-mirror-fixture', expires_at: mirrorExpiresAt } } : {}),
+    });
+    try {
+      expect(PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS).toBe(60 * 60_000);
+      expect(facts().grokHost).toBe('missing');
+      writeFileSync(auth, JSON.stringify({
+        'https://auth.x.ai::hq-mirror': { key: 'mirror-only-fixture', expires_at: new Date(Date.now() + 6 * 3_600_000).toISOString() },
+      }));
+      expect(facts().grokHost).toBe('missing');
+      writeFileSync(auth, deviceAuth(new Date(Date.now() + 30 * 60_000).toISOString(), new Date(Date.now() + 6 * 3_600_000).toISOString()));
+      expect(facts().grokHost).toBe('expiring');
+      writeFileSync(auth, deviceAuth(new Date(Date.now() + 30 * 60_000).toISOString()));
+      expect(facts().grokHost).toBe('expiring');
+      writeFileSync(auth, deviceAuth(new Date(Date.now() - 60_000).toISOString()));
+      expect(facts().grokHost).toBe('expired');
+      writeFileSync(auth, deviceAuth(new Date(Date.now() + 6 * 3_600_000).toISOString()));
+      expect(facts()).toMatchObject({ grok: '1', grokHost: 'valid' });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });

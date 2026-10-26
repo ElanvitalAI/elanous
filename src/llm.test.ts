@@ -265,6 +265,91 @@ test('streamLLMWithTools sanitizes provider tool names and restores the original
   expect(requests[1]?.priorToolName).toBe(requests[0]?.names[0]);
 });
 
+test('skill_exec tool_result carries the complete output string to the parent model', async () => {
+  const finalResponse = Array.from({ length: 320 }, (_, index) => `Section ${index + 1}: ${'full finding '.repeat(12)}`).join('\n');
+  let calls = 0;
+  let followupMessages: LLMMessage[] = [];
+  const provider: LLMProvider = {
+    name: 'skill-exec-result-contract-test',
+    defaultModel: 'test-model',
+    available: () => true,
+    async *chat() { yield 'unused'; },
+    async *streamChat(messages, opts) {
+      calls++;
+      if (calls === 1) {
+        yield { type: 'tool_call', id: 'skill-exec-full-result', name: opts?.tools?.[0]?.name ?? 'skill_exec', args: { skill: 'omni-digest', task: 'run' } };
+        return;
+      }
+      followupMessages = messages;
+      yield { type: 'text', delta: 'synthesized' };
+    },
+  };
+
+  await streamLLMWithTools(
+    [{ role: 'user', content: 'Use the subrun report.' }],
+    {
+      onText() {},
+      dispatchTool: async () => ({ skill: 'omni-digest', ok: true, output: finalResponse }),
+    },
+    {
+      provider,
+      model: 'test-model',
+      tools: [{ name: 'skill_exec', description: 'run skill', parameters: { type: 'object', properties: {} } }],
+      maxTurns: 2,
+    },
+  );
+
+  const toolResult = followupMessages
+    .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+    .find((block) => block.type === 'tool_result');
+  expect(toolResult?.type === 'tool_result' ? toolResult.content : undefined).toBe(finalResponse);
+});
+
+test('skill_exec failure tool_result preserves its error for the parent model', async () => {
+  let calls = 0;
+  let followupMessages: LLMMessage[] = [];
+  const failure = {
+    skill: 'omni-digest',
+    ok: false,
+    output: '',
+    error: 'skill run finished without a final assistant response',
+  };
+  const provider: LLMProvider = {
+    name: 'skill-exec-failure-contract-test',
+    defaultModel: 'test-model',
+    available: () => true,
+    async *chat() { yield 'unused'; },
+    async *streamChat(messages, opts) {
+      calls++;
+      if (calls === 1) {
+        yield { type: 'tool_call', id: 'skill-exec-failure', name: opts?.tools?.[0]?.name ?? 'skill_exec', args: { skill: 'omni-digest', task: 'run' } };
+        return;
+      }
+      followupMessages = messages;
+      yield { type: 'text', delta: 'explained failure' };
+    },
+  };
+
+  await streamLLMWithTools(
+    [{ role: 'user', content: 'Use the subrun report.' }],
+    {
+      onText() {},
+      dispatchTool: async () => failure,
+    },
+    {
+      provider,
+      model: 'test-model',
+      tools: [{ name: 'skill_exec', description: 'run skill', parameters: { type: 'object', properties: {} } }],
+      maxTurns: 2,
+    },
+  );
+
+  const toolResult = followupMessages
+    .flatMap((message) => Array.isArray(message.content) ? message.content : [])
+    .find((block) => block.type === 'tool_result');
+  expect(toolResult?.type === 'tool_result' ? toolResult.content : undefined).toBe(JSON.stringify(failure));
+});
+
 test('Anthropic request for Claude 5.5 includes interleaved-thinking beta', async () => {
   const originalKey = process.env.ANTHROPIC_API_KEY;
   process.env.ANTHROPIC_API_KEY = 'test-key';
@@ -327,7 +412,7 @@ test('ANTHROPIC_MODEL defaults to the anthropic ladder best model (latest Opus),
 
 async function runGpt6ToolCall(
   call: { name: string; args: Record<string, unknown> },
-  options: { model?: string; maxTurns?: number; callsPerStream?: number; flags?: Partial<Record<Gpt6CodexGuardId, boolean>> } = {},
+  options: { model?: string; maxTurns?: number; callsPerStream?: number; researchTurn?: boolean; flags?: Partial<Record<Gpt6CodexGuardId, boolean>> } = {},
 ): Promise<{ result: string; toolResults: string[]; dispatches: number }> {
   let turn = 0;
   let dispatches = 0;
@@ -366,6 +451,7 @@ async function runGpt6ToolCall(
         model: options.model ?? 'gpt-6-sol',
         tools: [{ name: call.name, description: 'test tool', parameters: { type: 'object', properties: {} } }],
         maxTurns: options.maxTurns ?? 3,
+        researchTurn: options.researchTurn,
         slowToolTickMs: 60_000,
       },
     );
@@ -425,6 +511,15 @@ test('GPT-6 exploration budget retains existing rejection through streamLLMWithT
   expect(enabled.dispatches).toBe(2);
   expect(enabled.toolResults.some((result) => result.includes('EXPLORATION BUDGET EXHAUSTED'))).toBe(true);
   expect(getGpt6CodexGuardStats()['exploration-budget']).toEqual({ wouldBlock: 1, blocked: 1 });
+});
+
+test('research turn completes multiple discovery rounds without the early GPT-6 exploration block', async () => {
+  const call = { name: 'Grep', args: { pattern: 'candidate', path: 'src', output_mode: 'content' } };
+  const ordinary = await runGpt6ToolCall(call, { maxTurns: 8, callsPerStream: 4, flags: { 'exploration-budget': true, 'search-only-streak': false } });
+  const research = await runGpt6ToolCall(call, { maxTurns: 8, callsPerStream: 4, researchTurn: true, flags: { 'exploration-budget': true, 'search-only-streak': false } });
+  expect(ordinary.toolResults.some((result) => result.includes('EXPLORATION BUDGET EXHAUSTED'))).toBe(true);
+  expect(research.toolResults.some((result) => result.includes('EXPLORATION BUDGET EXHAUSTED'))).toBe(false);
+  expect(research.dispatches).toBeGreaterThan(ordinary.dispatches);
 });
 
 test('GPT-6 max-turn synthesis retains existing budget boundary', async () => {

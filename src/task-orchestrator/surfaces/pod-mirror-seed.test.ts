@@ -8,9 +8,11 @@ describe('GATE-WARM-BOOT seedPoolMirrors', () => {
     const calls: Array<{ args: string[]; cwd: string }> = [];
     const results = await seedPoolMirrors({ hosts: ['node-b', 'node-c', 'node-b', undefined], commit: sha, tree: '/tmp/cut',
       push: async (args, cwd) => { calls.push({ args, cwd }); return { rc: 0, output: '' }; } });
+    const firstHost = 'node-b';
+    const secondHost = 'node-c';
     expect(calls.map((call) => call.args)).toEqual([
-      ['push', '--quiet', '--no-verify', `node-b:${GATE_POOL_MIRROR_PATH}`, `${sha}:refs/elanous/gate/${sha}`],
-      ['push', '--quiet', '--no-verify', `node-c:${GATE_POOL_MIRROR_PATH}`, `${sha}:refs/elanous/gate/${sha}`],
+      ['push', '--quiet', '--no-verify', `${firstHost}:${GATE_POOL_MIRROR_PATH}`, `${sha}:refs/elanous/gate/${sha}`],
+      ['push', '--quiet', '--no-verify', `${secondHost}:${GATE_POOL_MIRROR_PATH}`, `${sha}:refs/elanous/gate/${sha}`],
     ]);
     expect(calls.every((call) => call.cwd === '/tmp/cut')).toBe(true);
     expect(results.map((result) => [result.host, result.ok])).toEqual([['node-b', true], ['node-c', true]]);

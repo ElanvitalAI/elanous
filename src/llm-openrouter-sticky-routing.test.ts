@@ -64,6 +64,15 @@ test('OpenRouter: harness run id is the fallback key', async () => {
   expect(r.headers['x-session-id']).toBe('run-20261010-x1');
 });
 
+test('OpenRouter Claude: rejects any top-level composed tool schema before sending the request', async () => {
+  await expect(capture('openrouter', 'openrouter/anthropic/claude-opus-5.5', {
+    tools: [
+      ...tools,
+      { name: 'ScheduleWakeup', description: 'd', parameters: { type: 'object', oneOf: [{ required: ['at'] }] } },
+    ],
+  })).rejects.toThrow('Claude tool schema has unsupported top-level composition: ScheduleWakeup (oneOf)');
+});
+
 test('quantizations / order stay optional config passthrough (no default injected)', async () => {
   const plain = await capture('openrouter', 'openrouter/z-ai/glm-5.3');
   expect(plain.body.provider).toEqual({ require_parameters: true, allow_fallbacks: true });

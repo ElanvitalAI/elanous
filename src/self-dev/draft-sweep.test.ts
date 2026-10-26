@@ -63,8 +63,8 @@ describe('runDraftSweep — frozen apply plan', () => {
       listLiveBranches: async () => { throw new Error('apply plan must not inspect worktrees'); },
       getDraftSnapshot: async (_repo, number) => {
         snapshots++;
-        return { number, state: 'open', draft: true, headSha: 'a'.repeat(40), branch: 'self-impl/goalid-1-run', updatedAt,
-          labels: [running] };
+        return { number, state: 'open', draft: true, headSha: number === 1 ? 'a'.repeat(40) : 'b'.repeat(40),
+          branch: `self-impl/goalid-${number}-run`, updatedAt, labels: [running] };
       },
       setLabels: async (_repo, number, change) => { writes.push(`label:${number}:${change.add}`); },
       closeDraft: async (_repo, number) => { writes.push(`close:${number}`); },
@@ -85,9 +85,29 @@ describe('runDraftSweep — frozen apply plan', () => {
     const f = fixture();
     const result = await runDraftSweep({ repository: 'owner/repo', adapters: f.adapters, apply: true, applyPlan: plan });
     expect(result.complete).toBe(true);
-    expect(f.snapshotCount()).toBe(1);
+    expect(f.snapshotCount()).toBe(2);
     expect(f.writes.filter((write) => write.startsWith('close:'))).toEqual(['close:1']);
     expect(f.writes.some((write) => write.includes(':2:') || write === 'close:2')).toBe(false);
+  });
+
+  it('fails closed when a keep-only row drifts, records the drift, and performs no close writes', async () => {
+    const f = fixture();
+    const getSnapshot = f.adapters.getDraftSnapshot!;
+    f.adapters.getDraftSnapshot = async (_repo, number) => {
+      if (number === 2) {
+        const current = await getSnapshot(_repo, number);
+        return { ...current!, headSha: 'c'.repeat(40) };
+      }
+      return getSnapshot(_repo, number);
+    };
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: f.adapters, apply: true, applyPlan: plan });
+    expect(result.complete).toBe(false);
+    expect(result.error).toContain('snapshot drift at #2');
+    expect(result.entries.find((entry) => entry.number === 2)).toMatchObject({
+      action: 'keep', reason: 'close-cap', error: 'head SHA drift', applied: false,
+    });
+    expect(f.snapshotCount()).toBe(2);
+    expect(f.writes).toEqual([]);
   });
 
   it('fails closed on PR snapshot drift before any label or close write', async () => {
@@ -95,6 +115,19 @@ describe('runDraftSweep — frozen apply plan', () => {
     const result = await runDraftSweep({ repository: 'owner/repo', adapters: f.adapters, apply: true, applyPlan: plan });
     expect(result.complete).toBe(false);
     expect(result.error).toContain('snapshot drift at #1');
+    expect(f.writes).toEqual([]);
+  });
+
+  it('records snapshot lookup failures as drift and performs no writes', async () => {
+    const f = fixture();
+    f.adapters.getDraftSnapshot = async (_repo, number) => {
+      if (number === 2) throw new Error('snapshot unavailable');
+      return { number, state: 'open', draft: true, headSha: 'a'.repeat(40), branch: 'self-impl/goalid-1-run',
+        updatedAt: '2026-10-24T00:00:00Z', labels: [running] };
+    };
+    const result = await runDraftSweep({ repository: 'owner/repo', adapters: f.adapters, apply: true, applyPlan: plan });
+    expect(result.complete).toBe(false);
+    expect(result.entries.find((entry) => entry.number === 2)?.error).toContain('snapshot lookup failed');
     expect(f.writes).toEqual([]);
   });
 

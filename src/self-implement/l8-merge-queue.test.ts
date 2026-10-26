@@ -3,7 +3,8 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireL8MergeQueue, enqueueL8ShadowQueue, evaluateL8Integration, runL8MergeQueue, runL8ShadowQueue, statusL8ShadowQueue, type L8MergeQueueDeps } from './l8-merge-queue.js';
+import { acquireL8MergeQueue, enqueueL8ShadowQueue, evaluateL8Integration, runL8MergeQueue, runL8ShadowQueue, statusL8ShadowQueue, type L8MergeQueueDeps, type L8ShadowQueueDeps } from './l8-merge-queue.js';
+import type { TrainReachObservation } from './train-reach-grouping.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -42,6 +43,12 @@ function fixture(otherConflict = false, changeTest = true) {
   if (otherConflict) writeFileSync(join(remote, 'other.ts'), 'export const x = 1;\n');
   git(remote, 'add', '.'); git(remote, 'commit', '-qm', 'main advanced');
   git(root, 'clone', '-q', remote, cwd);
+  // The pod installs a global pre-push guard (core.hooksPath) that refuses pushes to refs outside
+  // this run's self-impl branches. Point the fixture clone at an empty hooks dir so the merge
+  // queue's atomic pushes reach the test remote instead of the pod guard.
+  const noHooks = join(root, 'no-hooks');
+  mkdirSync(noHooks);
+  git(cwd, 'config', 'core.hooksPath', noHooks);
   mkdirSync(join(cwd, 'node_modules'));
   mkdirSync(join(cwd, 'node_modules', 'typescript'));
   writeFileSync(join(cwd, 'node_modules', 'typescript', 'package.json'), '{}');
@@ -419,3 +426,96 @@ test('main advancing during changed tests prevents the stale candidate from bein
   expect(pushes).toEqual([]);
   expect(git(remote, 'rev-parse', 'feature')).toBe(head);
 });
+
+function reachObservation(changedFiles: string[], testFiles: string[]): TrainReachObservation {
+  return { changedFiles, testFiles, unverified: [], unrunImporterTotal: 0,
+    routeLookupFailures: [], callerTestsOverflow: [], alwaysIncludeMissing: [] };
+}
+
+test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host gate, and writes per-PR manifests without touching remotes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'l8-reach-batch-'));
+  roots.push(root);
+  const remote = join(root, 'remote');
+  const cwd = join(root, 'checkout');
+  mkdirSync(remote);
+  git(remote, 'init', '-q', '-b', 'main');
+  git(remote, 'config', 'user.name', 'test');
+  git(remote, 'config', 'user.email', 'test@localhost');
+  git(remote, 'config', 'receive.denyCurrentBranch', 'ignore');
+  mkdirSync(join(remote, 'scripts'));
+  mkdirSync(join(remote, 'test'));
+  writeFileSync(join(remote, 'scripts/a.ts'), 'export const a = 1;\n');
+  writeFileSync(join(remote, 'scripts/b.ts'), 'export const b = 1;\n');
+  writeFileSync(join(remote, 'scripts/c.ts'), 'export const c = 1;\n');
+  writeFileSync(join(remote, 'scripts/d.ts'), 'export const d = 1;\n');
+  writeFileSync(join(remote, 'test/shared.test.ts'), "import '../scripts/a.js';\nimport '../scripts/b.js';\nimport '../scripts/c.js';\n");
+  writeFileSync(join(remote, 'test/other.test.ts'), "import '../scripts/d.js';\n");
+  git(remote, 'add', '.'); git(remote, 'commit', '-qm', 'base');
+  const heads: Record<number, string> = {};
+  const files: Record<number, string> = { 7: 'scripts/a.ts', 8: 'scripts/b.ts', 9: 'scripts/c.ts', 10: 'scripts/d.ts' };
+  for (const [number, file] of Object.entries(files)) {
+    git(remote, 'checkout', '-qb', `pr${number}`, 'main');
+    writeFileSync(join(remote, file), `export const v = ${number};\n`);
+    git(remote, 'add', '.'); git(remote, 'commit', '-qm', `pr${number}`);
+    heads[Number(number)] = git(remote, 'rev-parse', 'HEAD');
+    git(remote, 'update-ref', `refs/pull/${number}/head`, heads[Number(number)]);
+    git(remote, 'checkout', '-q', 'main');
+  }
+  git(root, 'clone', '-q', remote, cwd);
+  const mainBefore = git(remote, 'rev-parse', 'main');
+  const pullBefore = Object.fromEntries(Object.keys(files).map((number) => [number, git(remote, 'rev-parse', `refs/pull/${number}/head`)]));
+  const checkoutBefore = git(cwd, 'rev-parse', 'HEAD');
+  const calls: string[] = [];
+  let hostCalls = 0;
+  const execute: NonNullable<L8ShadowQueueDeps['command']> = (bin, args, dir) => {
+    calls.push([bin, ...args].join(' '));
+    if (bin === 'ssh' || bin === 'kubectl' || args.includes('node-b')) hostCalls++;
+    if (bin === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      const number = Number(args[2]);
+      return { status: 0, stdout: JSON.stringify({
+        headRefOid: heads[number], baseRefName: 'main', state: 'OPEN', isDraft: false, isCrossRepository: false,
+        files: [{ path: files[number] }],
+      }), stderr: '' };
+    }
+    const r = spawnSync(bin, [...args], { cwd: dir, encoding: 'utf8' });
+    return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  };
+  const queueDeps: L8ShadowQueueDeps = {
+    acquire: async () => () => {},
+    command: execute,
+    observeEnqueue: () => {},
+    trainReachInspect: (candidate) => reachObservation(candidate.changedFiles, candidate.pr === '10' ? ['test/other.test.ts'] : ['test/shared.test.ts']),
+  };
+  for (const number of [7, 8, 9, 10]) await enqueueL8ShadowQueue(cwd, number, queueDeps);
+  const gateBatches: number[][] = [];
+  const verdict = await runL8ShadowQueue(cwd, {
+    ...queueDeps,
+    trainGate: (_repo, baseSha) => async (commitSha, prNumbers) => {
+      gateBatches.push([...prNumbers]);
+      expect(baseSha).toBe(mainBefore);
+      expect(commitSha).toMatch(/^[0-9a-f]{40}$/);
+      return prNumbers.includes(8) ? 'fail' : 'pass';
+    },
+  });
+  expect(verdict).toMatchObject({ number: 7, verdict: 'pass', base: mainBefore, tests: ['test/shared.test.ts'] });
+  expect(verdict?.detail).toContain('reach [7,8,9]');
+  expect(verdict?.manifest).toMatchObject({ number: 7, group: [7, 8, 9], reachTests: ['test/shared.test.ts'], interactionTests: ['test/shared.test.ts'], gatesRun: 5, verdict: 'pass' });
+  expect(verdict?.manifest?.queueSig).toMatch(/^[0-9a-f]{64}$/);
+  expect(gateBatches).toEqual([[7, 8, 9], [7], [8, 9], [8], [9]]);
+  const state = await statusL8ShadowQueue(cwd, queueDeps);
+  expect(state.pending).toEqual([{ number: 10, head: heads[10] }]);
+  expect(state.verdicts.map(({ number, verdict: value, manifest }) => ({ number, verdict: value, group: manifest?.group, verdictOnManifest: manifest?.verdict }))).toEqual([
+    { number: 7, verdict: 'pass', group: [7, 8, 9], verdictOnManifest: 'pass' },
+    { number: 8, verdict: 'fail', group: [7, 8, 9], verdictOnManifest: 'fail' },
+    { number: 9, verdict: 'pass', group: [7, 8, 9], verdictOnManifest: 'pass' },
+  ]);
+  expect(new Set(state.verdicts.map((entry) => entry.manifest?.queueSig))).toEqual(new Set([verdict?.manifest?.queueSig]));
+  expect(hostCalls).toBe(0);
+  expect(calls.some((line) => line.includes('merge-tree') && line.includes('--write-tree'))).toBe(true);
+  expect(calls.some((line) => line.includes('commit-tree'))).toBe(true);
+  expect(calls.some((line) => /\bgit push\b|\bgh pr merge\b|\bgit update-ref\b/.test(line))).toBe(false);
+  expect(calls.some((line) => line.startsWith('ssh ') || line.startsWith('kubectl '))).toBe(false);
+  expect(git(remote, 'rev-parse', 'main')).toBe(mainBefore);
+  expect(git(cwd, 'rev-parse', 'HEAD')).toBe(checkoutBefore);
+  for (const number of Object.keys(files)) expect(git(remote, 'rev-parse', `refs/pull/${number}/head`)).toBe(pullBefore[number]);
+}, 30_000);

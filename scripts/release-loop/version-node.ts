@@ -8,6 +8,7 @@ import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { landingFreezeMessage, readLandingFreeze, type LandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { baseVersion, isReleaseVersion, isStableVersion, prereleaseKind } from './release-version.js';
+import { cutReleaseBranch } from './cut-branch.js';
 
 type Kind = 'release' | 'dev-bump';
 type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string;
@@ -441,19 +442,30 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
   let branchCut = false;
   let runId: string | undefined;
   try {
-    if (args[0] !== 'release' && args[0] !== 'dev-bump') throw new Error('usage: version-node.ts <release|dev-bump> [--version <v>] [--cut <sha>] [--cut-commit <sha>] --json');
-    kind = args[0];
+    if (args[0] !== 'release' && args[0] !== 'dev-bump' && args[0] !== 'cut-branch')
+      throw new Error('usage: version-node.ts <release|dev-bump|cut-branch> [--version <v>] [--cut <sha>] [--cut-commit <sha>] [--pick <sha>] [--base <sha>] [--append] [--dry-run] --json');
+    kind = args[0] === 'cut-branch' ? 'release' : args[0];
+    const picks: string[] = [];
+    let base: string | undefined;
+    let append = false;
+    let dryRun = false;
+    let versionRelease: { commit?: unknown; base?: unknown; branch?: unknown } | undefined;
     for (let i = 1; i < args.length; i++) {
       if (args[i] === '--json') continue;
       if (args[i] === '--version' && args[i + 1]) { version = args[++i]!; continue; }
       if (args[i] === '--cut' && args[i + 1]) { cut = args[++i]!; continue; }
       if (args[i] === '--cut-commit' && args[i + 1]) { cutCommit = args[++i]!; continue; }
+      if (args[i] === '--pick' && args[i + 1]) { picks.push(args[++i]!); continue; }
+      if (args[i] === '--base' && args[i + 1]) { base = args[++i]!; continue; }
+      if (args[i] === '--append') { append = true; continue; }
+      if (args[i] === '--dry-run') { dryRun = true; continue; }
       throw new Error(`unknown or incomplete argument: ${args[i]}`);
     }
     if (process.env.ELANOUS_GRAPH_CONTEXT) {
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
-        runId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
+        runId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown };
+        outputs?: Record<string, { commit?: unknown; base?: unknown; branch?: unknown } | undefined> };
       if (context.runId !== undefined) {
         if (typeof context.runId !== 'string') throw new Error('runId must be a string');
         runId = context.runId;
@@ -466,11 +478,24 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
         cutCommit = context.input.cutCommit;
       }
       // The cut = the commit version-release landed (what cutoff and the gate measured).
+      // RELEASE-APPEND-BASE-AUTO: cut-branch consumes that same record as its ledger seam
+      // (ledger: () => versionRelease), so it must not also see it injected as --cut.
       const releasedCommit = context.outputs?.['version-release']?.commit;
-      if (!cut && typeof releasedCommit === 'string' && releasedCommit) cut = releasedCommit;
+      if (args[0] !== 'cut-branch' && !cut && typeof releasedCommit === 'string' && releasedCommit) cut = releasedCommit;
+      // RELEASE-APPEND-BASE-AUTO: the version-release node's record is the ledger seam cut-branch consults.
+      versionRelease = context.outputs?.['version-release'];
     }
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
+    if (args[0] === 'cut-branch') {
+      if (cut !== undefined || cutCommit !== undefined) throw new Error('--cut/--cut-commit are not valid for cut-branch');
+      if (!picks.length) throw new Error('at least one --pick commit is required');
+      const result = cutReleaseBranch({
+        version, pick: picks, ...(base !== undefined ? { base } : {}), append, dryRun,
+        repoRoot: resolve(repo), ledger: () => versionRelease,
+      });
+      return { outcome: 'ok', kind: 'release', version, commit: result.commit, pr: null, branch: result.branch, ...(dryRun ? { skipped: 'dry-run' } : {}) };
+    }
     if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
     return landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut, undefined, runId);
   } catch (error) {

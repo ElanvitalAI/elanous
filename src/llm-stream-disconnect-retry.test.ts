@@ -346,6 +346,23 @@ describe('retry budget is per provider', () => {
     } finally { globalThis.fetch = originalFetch; }
   });
 
+  it('rejects deterministic Claude schema incompatibility before provider fallback can catch it', async () => {
+    let providerCalls = 0;
+    const claude: LLMProvider = {
+      name: 'openrouter', defaultModel: 'anthropic/claude-opus-5.5', available: () => true,
+      async *chat() {},
+      async *streamChat() { providerCalls++; },
+    };
+    await expect(streamLLMWithTools([{ role: 'user', content: 'go' }],
+      { onText: () => {}, dispatchTool: async () => ({ ok: true }) },
+      { initialProvider: claude, tools: [{ name: 'ScheduleWakeup', description: 'wake', parameters: {
+        type: 'object', oneOf: [{ required: ['at'] }, { required: ['delaySeconds'] }],
+      } }], maxTurns: 1 },
+    )).rejects.toThrow('Claude tool schema has unsupported top-level composition: ScheduleWakeup (oneOf)');
+    expect(providerCalls).toBe(0);
+    expect(logs.some((entry) => entry.category === 'llm.router' && entry.event === 'provider-fallback')).toBe(false);
+  });
+
   it('falls back only after the first provider spends its retries, then gives the next provider a fresh budget', async () => {
     const first = scriptedProvider([[{ type: 'text', delta: 'x' }, 'throw']], 'grok');
     const second = scriptedProvider([
@@ -358,9 +375,10 @@ describe('retry budget is per provider', () => {
     PROVIDERS.gemini = scriptedProvider([[]], 'gemini').provider;
     PROVIDERS.local = scriptedProvider([[]], 'local').provider;
 
+    const status: string[] = [];
     const text = await streamLLMWithTools(
       [{ role: 'user', content: 'go' }],
-      { onText: () => {}, dispatchTool: async () => ({ ok: true }) },
+      { onText: () => {}, onStatus: (line) => status.push(line), dispatchTool: async () => ({ ok: true }) },
       { provider: undefined, tools: [{ name: 'probe', description: 'side-effecting probe', parameters: {} }], maxTurns: 2 },
     );
 
@@ -372,6 +390,7 @@ describe('retry budget is per provider', () => {
     expect(retries.filter((l) => l.data.provider === 'anthropic').map((l) => l.data.attempt)).toEqual([1]);
     const fallback = logs.find((l) => l.category === 'llm.router' && l.event === 'provider-fallback');
     expect(fallback?.data).toMatchObject({ blockedProvider: 'grok', fallbackProvider: 'anthropic' });
+    expect(status).toContain('⚠ 공급자 전환: grok → anthropic (network-transient)');
     expect(logs.some((l) => l.category === 'llm.router' && l.event === 'fallback-candidates')).toBe(true);
   });
 });

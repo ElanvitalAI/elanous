@@ -13,13 +13,15 @@ function nonnegativeCount(value: unknown): value is number {
 export class BackgroundJobStatus {
   private sessionId: string | null;
   private current: BackgroundJobSnapshot | null = null;
+  private readonly bySession = new Map<string, BackgroundJobSnapshot>();
 
   constructor(sessionId: string | null) { this.sessionId = sessionId; }
 
   setSessionId(sessionId: string): void {
     if (this.sessionId === sessionId) return;
+    if (this.sessionId && this.current) this.bySession.set(this.sessionId, this.current);
     this.sessionId = sessionId;
-    this.current = null;
+    this.current = this.bySession.get(sessionId) ?? null;
   }
 
   accept(json: string): boolean {
@@ -35,12 +37,16 @@ export class BackgroundJobStatus {
       running: frame.running,
       pending: frame.pending,
     }) as BackgroundJobSnapshot;
+    this.bySession.set(frame.sessionId as string, this.current);
     return true;
   }
 
   snapshot(): BackgroundJobSnapshot | null { return this.current; }
 
-  clear(): void { this.current = null; }
+  clear(): void {
+    this.current = null;
+    if (this.sessionId) this.bySession.delete(this.sessionId);
+  }
 
   line(): string {
     const state = this.current;

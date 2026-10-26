@@ -66,7 +66,7 @@ import { ptyManifestDbPath, setPtyManifestDbPathForTesting, upsertPtyManifest, u
 import { runPtyList } from '../src/cli/pty-takeover-cli.js';
 import { requestRemotePtyControl, resetPtyControlIpcForTesting } from '../src/pty-shell/pty-control-ipc.js';
 import { debug } from '../src/debug/log.js';
-import { appendPtyEvent, resetPtyEventLogForTesting } from '../src/pty-shell/pty-event-log.js';
+import { appendPtyEvent, ptyEventLogDbPath, readPtyEventsAfter, resetPtyEventLogForTesting } from '../src/pty-shell/pty-event-log.js';
 import { saveSelfDevRun, selfDevRunsDir } from '../src/self-dev/run-store.js';
 import { appendRunLedgerEntry, runLedgerDir } from '../src/self-implement/run-ledger.js';
 import type { RunningRunsResult } from '../src/self-implement/running-runs.js';
@@ -82,9 +82,11 @@ import { _resetForTest as resetAuthTraceForTest, snapshot as authTraceSnapshot }
 import {
   resetForTesting as resetPtyForTest,
   setPtyAdapterForTesting,
+  setPtyManifestEnabledForTesting,
   startPty,
   startPtyControlPoller,
   type PtyHandle,
+  type StartOpts,
 } from '../src/pty-shell/registry.js';
 
 interface MockState {
@@ -2670,6 +2672,155 @@ describe('handleTerminalLineage', () => {
     const body = (await handleTerminalLineage(lineageReq('anything-at-all'), opts).json()) as { unreadablePayloads: number };
     expect(body.unreadablePayloads).toBeGreaterThan(0);
   });
+});
+
+describe('TUI-SEAT-PILOT-LIFECYCLE-READER', () => {
+  beforeEach(() => {
+    resetPtyEventLogForTesting();
+    rmSync(ptyEventLogDbPath(), { force: true });
+    resetPtyEventLogForTesting();
+  });
+
+  function lineageReq(key?: string): Request {
+    const suffix = key === undefined ? '' : `?key=${encodeURIComponent(key)}`;
+    return new Request(`http://localhost/v1/terminals/lineage${suffix}`);
+  }
+
+  function lifecyclePayloads(surfaceId: string): Map<string, Record<string, unknown>> {
+    const byEvent = new Map<string, Record<string, unknown>>();
+    for (const row of readPtyEventsAfter(0, { surfaceId, kind: 'lifecycle' })) {
+      if (!row.payload) continue;
+      try {
+        const parsed: unknown = JSON.parse(row.payload);
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) && typeof (parsed as { event?: unknown }).event === 'string') {
+          byEvent.set((parsed as { event: string }).event, parsed as Record<string, unknown>);
+        }
+      } catch { /* unreadable payloads are asserted separately */ }
+    }
+    return byEvent;
+  }
+
+  test(
+    'TUI-SEAT-PILOT-LIFECYCLE-READER: 대상 경로·완료 경계 코드: src/nexus/api/terminals.ts — start/output/normal-exit and error-exit API matches ledger; missing seat and record failure are not success',
+    async () => {
+      setPtyManifestEnabledForTesting(true);
+      const previousRunId = process.env.ELANOUS_RUN_ID;
+      const previousParent = process.env.ELANOUS_PARENT_PTY_ID;
+      process.env.ELANOUS_RUN_ID = 'run-seat-pilot-reader';
+      delete process.env.ELANOUS_PARENT_PTY_ID;
+      const seat = 'seat-pilot-reader-1';
+      const output = 'seat-pilot lifecycle\n';
+      const expectedBytes = Buffer.byteLength(output, 'utf8');
+      const runs: ReadonlyArray<{ id: string; exitCode: number }> = [
+        { id: 'seatread_a1b2c3d4', exitCode: 0 },
+        { id: 'seatread_5e6f7a8b', exitCode: 7 },
+      ];
+      type LineageRow = { ptyId: string; seat?: string; outputBytesTotal?: number; alive: boolean };
+      type LineageBody = { key: string; groups: Array<{ rows: LineageRow[] }>; unreadablePayloads: number };
+      type ListRow = { id: string; seat?: string; outputBytes: number; outputBytesTotal?: number };
+
+      try {
+        for (const run of runs) {
+          const handle = startPty({
+            id: run.id,
+            kind: 'seatread',
+            cmd: 'seat-pilot-placeholder',
+            seat,
+            detach: true,
+          } as StartOpts);
+          expect(handle.id).toBe(run.id);
+          const stage = mock.states[mock.states.length - 1]!;
+          stage.outputCb?.(output);
+
+          const liveList = await handleTerminalsList(bareReq(), opts, {
+            ptyManifestTargets: () => [],
+            listPtyManifestRowsAt: () => [],
+            isProcessAlive: () => true,
+            reapDeadPtyManifest: () => 0,
+            purgeClosedPtyManifest: () => 0,
+            reapStalePtyManifest: () => 0,
+            reapOrphanedOwnedPtyManifest: () => 0,
+            queryRunningRuns: () => { throw new Error('not part of seat lifecycle'); },
+          }).json() as { terminals: ListRow[] };
+          const listed = liveList.terminals.find((terminal) => terminal.id === run.id);
+          expect(listed).toBeDefined();
+          expect(listed!.outputBytes).toBe(handle.snapshot().length);
+          expect(listed!.seat).toBe(seat);
+          expect(listed).not.toHaveProperty('seat', '');
+          expect(listed).toHaveProperty('outputBytesTotal');
+          expect(typeof listed!.outputBytesTotal).toBe('number');
+
+          stage.exitCb?.({ exitCode: run.exitCode });
+
+          const events = lifecyclePayloads(run.id);
+          expect([...events.keys()].sort()).toEqual(['exited', 'spawned']);
+          const spawned = events.get('spawned')!;
+          const exited = events.get('exited')!;
+          expect(spawned.seat).toBe(seat);
+          expect(spawned.outputBytesTotal).toBe(0);
+          expect(exited.seat).toBe(seat);
+          expect(exited.outputBytesTotal).toBe(expectedBytes);
+
+          const lineage = await handleTerminalLineage(lineageReq(run.id), opts).json() as LineageBody;
+          expect(lineage.unreadablePayloads).toBe(0);
+          const joined = lineage.groups.flatMap((group) => group.rows).find((row) => row.ptyId === run.id);
+          expect(joined).toBeDefined();
+          expect(joined!.seat).toBe(String(exited.seat));
+          expect(joined!.outputBytesTotal).toBe(Number(exited.outputBytesTotal));
+          expect(joined!.seat).toBe(String(spawned.seat));
+          expect(joined!.alive).toBe(false);
+        }
+
+        const now = Date.now();
+        appendPtyEvent({
+          instance: 'test', surfaceId: 'ledger-only-seat', kind: 'lifecycle', now,
+          payload: { event: 'spawned', ptyId: 'ledger-only-seat', kind: 'harness', runId: 'run-ledger-only', seat, startedAt: now, outputBytesTotal: 0 },
+        });
+        appendPtyEvent({
+          instance: 'test', surfaceId: 'ledger-only-seat', kind: 'lifecycle', now: now + 1,
+          payload: { event: 'exited', ptyId: 'ledger-only-seat', kind: 'harness', runId: 'run-ledger-only', seat, closedAt: now + 1, outputBytesTotal: 42 },
+        });
+        const ledgerOnly = await handleTerminalLineage(lineageReq('ledger-only-seat'), opts).json() as LineageBody;
+        const ledgerRow = ledgerOnly.groups.flatMap((group) => group.rows).find((row) => row.ptyId === 'ledger-only-seat');
+        const ledgerEvents = lifecyclePayloads('ledger-only-seat');
+        expect(ledgerOnly.unreadablePayloads).toBe(0);
+        expect(ledgerRow).toMatchObject({
+          ptyId: 'ledger-only-seat',
+          seat: ledgerEvents.get('exited')!.seat,
+          outputBytesTotal: ledgerEvents.get('exited')!.outputBytesTotal,
+          alive: false,
+        });
+
+        appendPtyEvent({
+          instance: 'test', surfaceId: 'legacy-no-seat', kind: 'lifecycle', now: now + 2,
+          payload: { event: 'spawned', ptyId: 'legacy-no-seat', kind: 'harness', runId: 'run-legacy-no-seat', startedAt: now + 2 },
+        });
+        const missingSeat = await handleTerminalLineage(lineageReq('legacy-no-seat'), opts).json() as LineageBody;
+        const missingRow = missingSeat.groups.flatMap((group) => group.rows).find((row) => row.ptyId === 'legacy-no-seat');
+        expect(missingSeat.unreadablePayloads).toBe(0);
+        expect(missingRow).toBeDefined();
+        expect(missingRow).not.toHaveProperty('seat');
+        expect(missingRow).not.toHaveProperty('outputBytesTotal');
+        expect(missingRow!.seat).toBeUndefined();
+        expect(missingRow!.outputBytesTotal).toBeUndefined();
+
+        appendPtyEvent({ instance: 'test', surfaceId: 'legacy-no-seat', kind: 'lifecycle', now: now + 3, payload: 'not-an-object' });
+        const recordFailure = await handleTerminalLineage(lineageReq('legacy-no-seat'), opts).json() as LineageBody;
+        expect(recordFailure.unreadablePayloads).toBeGreaterThan(0);
+        const failedRow = recordFailure.groups.flatMap((group) => group.rows).find((row) => row.ptyId === 'legacy-no-seat');
+        expect(failedRow).not.toHaveProperty('seat');
+        expect(failedRow).not.toHaveProperty('outputBytesTotal');
+        expect(JSON.stringify(recordFailure)).not.toContain('not-an-object');
+      } finally {
+        setPtyManifestEnabledForTesting(null);
+        if (previousRunId === undefined) delete process.env.ELANOUS_RUN_ID;
+        else process.env.ELANOUS_RUN_ID = previousRunId;
+        if (previousParent === undefined) delete process.env.ELANOUS_PARENT_PTY_ID;
+        else process.env.ELANOUS_PARENT_PTY_ID = previousParent;
+      }
+    },
+    120_000,
+  );
 });
 
 class ViewElement {

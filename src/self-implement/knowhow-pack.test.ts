@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack } from './knowhow-pack.js';
+import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack, selectRelevantAuthoringLessons } from './knowhow-pack.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -35,12 +35,24 @@ test('selects only matching promoted repository knowhow, bounded and without cha
   const goal = '대상 경로: src/self-implement/orchestrator.ts\n실패 서명: scope-escape';
   const pack = selectKnowhowPack(root, goal);
   expect(pack.ids).toEqual(['K-TC-1']);
+  expect(pack.reason).toBe('selected');
   expect(pack.text).toContain('대상 경로 밖 편집 여부');
   expect(pack.text).not.toContain('K-TC-3');
   expect(pack.bytes).toBe(Buffer.byteLength(pack.text));
   expect(pack.bytes).toBeLessThanOrEqual(KNOWHOW_PACK_MAX_BYTES);
   expect(createHash('sha256').update(readFileSync(file)).digest('hex')).toBe(before);
-  expect(selectKnowhowPack(root, `${pack.text}\n\n${goal}`).ids).toEqual([]);
+  expect(selectKnowhowPack(root, `${pack.text}\n\n${goal}`)).toMatchObject({ ids: [], reason: 'marker-present' });
+});
+
+test('empty selections say which source or relevance boundary stopped injection', () => {
+  const { root, file } = fixture();
+  expect(selectKnowhowPack(join(root, 'missing'), '대상 경로: src/self-implement/orchestrator.ts')).toMatchObject({ ids: [], reason: 'source-unreadable' });
+  writeFileSync(file, '## K-TC-9 retired\n- 상황: src/self-implement/orchestrator.ts.\n- 출처: 사례 · 상태: stale\n');
+  expect(selectKnowhowPack(root, '대상 경로: src/self-implement/orchestrator.ts')).toMatchObject({ ids: [], reason: 'no-promoted-section' });
+  writeFileSync(file, '## K-TC-9 active\n- 상황: src/self-implement/orchestrator.ts.\n- 출처: 사례 · 상태: active\n');
+  expect(selectKnowhowPack(root, '대상 경로: src/unrelated/file.ts')).toMatchObject({ ids: [], reason: 'no-path-overlap' });
+  writeFileSync(file, `## K-TC-9 active\n- 상황: src/self-implement/orchestrator.ts.\n- 처방: ${'가'.repeat(KNOWHOW_PACK_MAX_BYTES)}\n- 출처: 사례 · 상태: active\n`);
+  expect(selectKnowhowPack(root, '대상 경로: src/self-implement/orchestrator.ts')).toMatchObject({ ids: [], reason: 'over-budget' });
 });
 
 test('returns an empty pack for unrelated goals and excludes a source symlink outside roles', () => {
@@ -76,6 +88,62 @@ test('three-entry limit applies when all four small entries fit the byte budget'
   const pack = selectKnowhowPack(root, '대상 경로: src/self-implement/orchestrator.ts');
   expect(pack.ids).toEqual(['K-TC-10', 'K-TC-11', 'K-TC-12']);
   expect(pack.bytes).toBeLessThan(KNOWHOW_PACK_MAX_BYTES);
+});
+
+test('authoring lessons select only relevant path or class entries, with stable IDs and a two-entry cap', () => {
+  const { root } = fixture();
+  const directory = join(root, 'docs/goal-context');
+  mkdirSync(directory, { recursive: true });
+  const rows = [
+    { cell: 'old path', class: 'b-stale-path', lesson: '대상 경로가 현재 진입점인지 확인한다', paths: 'src/self-implement/orchestrator.ts' },
+    { cell: 'umbrella', class: 'g-umbrella-scope', lesson: '포괄 골을 작은 경계로 나눈다', paths: '' },
+    { cell: 'unrelated', class: 'e-format-trap', lesson: 'Use exact JSON formatting', paths: 'docs/unrelated.md' },
+  ];
+  writeFileSync(join(directory, '05-authoring-lessons.jsonl'), `${rows.map(row => JSON.stringify(row)).join('\n')}\n`);
+  const ask = 'Umbrella request: unsupported path src/self-implement/orchestrator.ts; split this broad goal.';
+  const selected = selectRelevantAuthoringLessons(root, ask);
+  expect(selected.status).toBe('loaded');
+  expect(selected.ids).toHaveLength(2);
+  expect(selected.ids[0]).toMatch(/^AL-[a-f0-9]{10}$/u);
+  expect(selected.prompt).toContain('대상 경로가 현재 진입점인지 확인한다');
+  expect(selected.prompt).toContain('포괄 골을 작은 경계로 나눈다');
+  expect(selected.prompt).not.toContain('exact JSON formatting');
+  expect(Buffer.byteLength(selected.prompt, 'utf8')).toBeLessThanOrEqual(2_000);
+  expect(selectRelevantAuthoringLessons(root, ask).ids).toEqual(selected.ids);
+});
+
+test('authoring lesson selector fails open for absent or malformed optional ledger', () => {
+  const { root } = fixture();
+  expect(selectRelevantAuthoringLessons(root, 'Ordinary goal').status).toBe('missing');
+  const directory = join(root, 'docs/goal-context');
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, '05-authoring-lessons.jsonl'), '{bad json\n');
+  expect(selectRelevantAuthoringLessons(root, 'Ordinary goal')).toMatchObject({ status: 'malformed', ids: [], prompt: '', invalidRows: 1 });
+});
+
+test('canonical authoring ledger keeps valid closed-world lessons available while ignoring legacy other rows', () => {
+  const repo = join(import.meta.dir, '..', '..');
+  const selected = selectRelevantAuthoringLessons(repo, 'Umbrella goal touches src/self-implement/goal-author.ts and should be split by scope.');
+  expect(selected.status).toBe('loaded');
+  expect(selected.invalidRows).toBe(3);
+  expect(selected.ids.length).toBeGreaterThan(0);
+  expect(selected.ids.length).toBeLessThanOrEqual(2);
+  expect(selected.prompt).toContain('g-umbrella-scope');
+});
+
+test('authoring lesson budget counts UTF-8 bytes, not JavaScript characters', () => {
+  const { root } = fixture();
+  const directory = join(root, 'docs/goal-context');
+  mkdirSync(directory, { recursive: true });
+  const rows = [
+    { cell: 'large', class: 'b-stale-path', lesson: '가'.repeat(900), paths: 'src/self-implement/orchestrator.ts' },
+    { cell: 'small', class: 'b-stale-path', lesson: '경로를 확인한다', paths: 'src/self-implement/orchestrator.ts' },
+  ];
+  writeFileSync(join(directory, '05-authoring-lessons.jsonl'), `${rows.map(row => JSON.stringify(row)).join('\n')}\n`);
+  const selected = selectRelevantAuthoringLessons(root, 'unsupported path src/self-implement/orchestrator.ts');
+  expect(selected.prompt).not.toContain('가가가');
+  expect(Buffer.byteLength(selected.prompt, 'utf8')).toBeLessThanOrEqual(2_000);
+  expect(selected.prompt).toContain('경로를 확인한다');
 });
 
 test('preserves package prefixes and treats docs paths as explicit goal paths', () => {

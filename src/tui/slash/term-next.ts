@@ -48,8 +48,9 @@ export async function handleNextTuiTermSlash(args: string[], context: NextTuiTer
       '  /term list    List terminal sessions.',
       '  /term status  Show live/exited session counts.',
       '  /term matrix  Show terminal transport and liveness.',
+      '  /side         Open the Next TUI session/PTY sidetab.',
       '  Unknown cwd or exit codes are shown as unknown.',
-      '  Mutating terminal commands remain on the classic terminal surface.',
+      '  Next TUI mutations use explicit /side new and /side kill commands.',
     );
   } else if (command === 'status') {
     const sessions = await context.sessions.list();

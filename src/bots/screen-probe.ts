@@ -343,7 +343,7 @@ export function interpretCrontab(out: { readonly code: number; readonly said: st
   //    ⇒ 이제 «화이트리스트»다: 이 문면이 아니면 rc≠0 은 전부 「못 물었다」.
   // ⛔⭐ ***부분문자열로 보지 않는다***(3차 리뷰) — ssh 배너·MOTD 에 그 낱말이 섞이면
   //    rc≠0 «실패»가 「빈 크론탭」으로 둔갑한다. ⇒ 다듬은 산출이 ***그 한 줄 «전체»***여야 한다.
-  //    📏 실측(2026-09-01 · gcpvm): 정확히 `no crontab for user\n` ⊕ rc=1.
+  //    📏 실측(2026-09-01 · 원격 노드): 정확히 `no crontab for <user>\n` ⊕ rc=1.
   //       (macOS 는 `crontab: ` 접두를 붙이는 판이 있어 그것만 허용한다)
   if (/^(crontab: )?no crontab for \S+$/i.test(out.said.trim())) return '';
   return null;

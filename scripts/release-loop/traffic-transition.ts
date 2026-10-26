@@ -4,12 +4,17 @@ import { debug } from '../../src/debug/log.js';
 import type { GraphContext } from './node-verdict.js';
 import type { ReleaseLoopConfig } from './unattended-release.js';
 
-export type ReleaseTrafficEvent = 'gate-passed' | 'verify-complete';
+export type ReleaseTrafficEvent = 'cut-start' | 'gate-passed' | 'npm-published' | 'verify-complete' | 'failed';
+
+export interface TrafficBeforeCut {
+  global?: string;
+  perCycle: Record<string, unknown>;
+}
 
 export interface TrafficFile {
   global?: string;
   seats: Record<string, Record<string, unknown>>;
-  releaseLifecycle?: { runId: string; version: string; stage: 1 | 2; event: ReleaseTrafficEvent; startedAt?: string; updatedAt: string };
+  releaseLifecycle?: { runId: string; version: string; stage: 0 | 1 | 2 | 3; event: ReleaseTrafficEvent; startedAt?: string; updatedAt: string; beforeCut?: TrafficBeforeCut };
   [key: string]: unknown;
 }
 
@@ -18,7 +23,7 @@ type ReleaseTrafficConfig = ReleaseLoopConfig & {
 };
 
 const SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
-const STAGE: Record<ReleaseTrafficEvent, 1 | 2> = { 'gate-passed': 1, 'verify-complete': 2 };
+const STAGE: Record<ReleaseTrafficEvent, 0 | 1 | 2 | 3> = { 'cut-start': 0, 'gate-passed': 1, 'npm-published': 2, 'verify-complete': 2, failed: 3 };
 const TRAFFIC_PER_CYCLE = { half: 3, full: 6 } as const;
 
 export interface TrafficTransitionOptions {
@@ -112,32 +117,65 @@ export async function applyReleaseTrafficEvent(
   const log = options.log ?? ((name, fields) => debug.log('release-loop.traffic', name, fields));
   const stage = STAGE[event];
   const stamp = (options.now ?? (() => new Date()))().toISOString();
-  const rate = event === 'gate-passed' ? TRAFFIC_PER_CYCLE.half : TRAFFIC_PER_CYCLE.full;
-  const releaseLifecycle = { runId, version, stage, event, ...(context.startedAt ? { startedAt: context.startedAt } : {}), updatedAt: stamp };
+  const rate = event === 'gate-passed' ? TRAFFIC_PER_CYCLE.half
+    : event === 'npm-published' || event === 'verify-complete' ? TRAFFIC_PER_CYCLE.full : undefined;
   const release = () => {
     const unlock = acquireTrafficLock(path, options.lockTimeoutMs);
     try {
       const before = readTrafficFile(path);
       const prior = before.releaseLifecycle;
+      if ((event === 'npm-published' || event === 'verify-complete') && context.outputs['npm-publish']?.outcome !== 'ok') {
+        return { file: before, applied: false, idempotent: false, reason: 'npm-publish-unconfirmed' };
+      }
       const sameRun = prior?.runId === runId;
       const newerVersion = !prior?.runId || compareReleaseVersions(version, prior.version) > 0;
       const sameVersionLaterRun = prior?.version === version && isLaterRun(context.startedAt, prior.startedAt);
-      if (sameRun && prior.stage >= stage) return { file: before, applied: true, idempotent: true };
-      const permitted = sameRun
-        ? prior.stage === stage - 1
-        : newerVersion || (event === 'gate-passed' && prior?.version === version && (prior.stage ?? 0) < 2 && sameVersionLaterRun)
-          || (event === 'verify-complete' && prior?.version === version && sameVersionLaterRun);
+      const resumedTrafficNode = sameRun && prior.stage === 3
+        && (event === 'cut-start' && context.nodeId === 'traffic-cut-start'
+          || event === 'gate-passed' && context.nodeId === 'traffic-gate-passed'
+          || event === 'npm-published' && context.nodeId === 'traffic-npm-published'
+          || event === 'verify-complete' && context.nodeId === 'traffic-verify-complete' && context.outputs['npm-publish']?.outcome === 'ok');
+      if (sameRun && prior.stage === 3 && event !== 'failed' && !resumedTrafficNode) {
+        return { file: before, applied: false, idempotent: false, reason: 'run-already-failed' };
+      }
+      if (sameRun && prior.stage >= stage && event !== 'failed' && !resumedTrafficNode) return { file: before, applied: true, idempotent: true };
+      if (event === 'failed' && (!sameRun || prior?.stage === 2 || prior?.stage === 3 || !prior?.beforeCut)) {
+        return { file: before, applied: false, idempotent: false,
+          reason: !sameRun ? prior?.runId ? 'different-run-is-current' : 'before-cut-unmeasured'
+            : prior?.stage === 2 ? 'published-keeps-full' : prior?.stage === 3 ? 'already-restored' : 'before-cut-unmeasured' };
+      }
+      const permitted = event === 'failed' ? sameRun
+        : sameRun ? resumedTrafficNode || (stage === 0 ? prior.stage === 0 : stage > prior.stage)
+        : newerVersion || (prior?.version === version && sameVersionLaterRun && (prior.stage < 2 || prior.stage === 3 || event === 'verify-complete'));
       if (!permitted) {
         return { file: before, applied: false, idempotent: false, reason: prior?.runId && prior.runId !== runId ? 'different-run-is-current' : 'event-out-of-order' };
       }
+      if (event === 'cut-start' && prior && prior.stage < 2 && !prior.beforeCut) {
+        return { file: before, applied: false, idempotent: false, reason: 'before-cut-unmeasured' };
+      }
+      const beforeCut = event === 'cut-start' ? {
+        ...(prior?.stage !== undefined && prior.stage < 2 && prior.beforeCut
+          ? prior.beforeCut
+          : { ...(before.global === undefined ? {} : { global: before.global }),
+            perCycle: Object.fromEntries(SEATS.map((seat) => [seat, before.seats[seat]?.perCycle])) }),
+      } : prior?.beforeCut;
+      const releaseLifecycle = { runId, version, stage, event, ...(context.startedAt ? { startedAt: context.startedAt } : {}),
+        updatedAt: stamp, ...(beforeCut ? { beforeCut } : {}) };
       const after: TrafficFile = {
         ...before,
-        ...(event === 'verify-complete' ? { global: 'green' } : {}),
+        ...(event === 'cut-start' ? { global: 'gate' }
+          : event === 'gate-passed' ? { global: 'yellow' }
+          : event === 'npm-published' || event === 'verify-complete' ? { global: 'green' }
+          : beforeCut?.global === undefined ? {} : { global: beforeCut.global }),
         seats: Object.fromEntries(Object.entries(before.seats).map(([seat, value]) => [
-          seat, SEATS.includes(seat as typeof SEATS[number]) ? { ...value, perCycle: rate } : value,
+          seat, SEATS.includes(seat as typeof SEATS[number])
+            ? { ...value, ...(event === 'failed' ? { perCycle: beforeCut?.perCycle[seat] } : rate === undefined ? {} : { perCycle: rate }) }
+            : value,
         ])),
         releaseLifecycle,
       };
+      if (event === 'failed' && beforeCut?.global === undefined) delete after.global;
+      if (event === 'failed') for (const seat of SEATS) if (beforeCut?.perCycle[seat] === undefined) delete after.seats[seat]?.perCycle;
       atomicWriteTrafficFile(path, after);
       return { file: after, applied: true, idempotent: false };
     } finally { unlock(); }
@@ -145,7 +183,9 @@ export async function applyReleaseTrafficEvent(
   const result = release();
   const reason = result.applied && result.idempotent ? 'already-applied' : result.reason;
   log(result.idempotent ? 'already-applied' : result.applied ? 'applied' : 'ignored', {
-    runId, version, event, stage, reason, perCycle: rate, ...(event === 'verify-complete' ? { global: 'green' } : {}),
+    runId, version, event, stage, reason, ...(rate === undefined ? {} : { perCycle: rate }),
+    ...(event === 'cut-start' ? { global: 'gate' } : event === 'gate-passed' ? { global: 'yellow' }
+      : event === 'npm-published' || event === 'verify-complete' ? { global: 'green' } : {}),
   });
   return { applied: result.applied, stage: result.file.releaseLifecycle?.stage ?? 0, ...(reason ? { reason } : {}) };
 }

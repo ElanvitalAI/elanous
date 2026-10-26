@@ -86,6 +86,8 @@ test('delta frames reach only their turn before the final JSONL response', async
     for await (const line of createInterface({ input: process.stdin })) {
       const input = JSON.parse(line);
       if (previous) console.log(JSON.stringify({ event: 'delta', turnId: previous, text: 'stale' }));
+      console.log(JSON.stringify({ event: 'status', turnId: 'stale-turn', text: 'stale status' }));
+      console.log(JSON.stringify({ event: 'status', turnId: input.id, text: '스트림 무응답 · 재시도 1/1' }));
       console.log(JSON.stringify({ event: 'delta', turnId: input.id, text: '첫' }));
       console.log(JSON.stringify({ event: 'heartbeat', turnId: input.id }));
       console.log(JSON.stringify({ event: '', turnId: input.id }));
@@ -99,17 +101,19 @@ test('delta frames reach only their turn before the final JSONL response', async
   `);
   const first: string[] = [];
   const second: string[] = [];
+  const statuses: string[] = [];
   const order: string[] = [];
   try {
     await runLocalChatTurn('delta-session', 'one', new AbortController().signal, cli, undefined, (delta) => {
       first.push(delta);
       order.push('delta');
-    });
+    }, undefined, [], (line) => { statuses.push(line); order.push('status'); });
     order.push('final');
     await runLocalChatTurn('delta-session', 'two', new AbortController().signal, cli, undefined, (delta) => second.push(delta));
     expect(first).toEqual(['첫', ' 토큰']);
     expect(second).toEqual(['첫', ' 토큰']);
-    expect(order).toEqual(['delta', 'delta', 'final']);
+    expect(statuses).toEqual(['스트림 무응답 · 재시도 1/1']);
+    expect(order).toEqual(['status', 'delta', 'delta', 'final']);
   } finally {
     await closeLocalChatSession('delta-session');
     rmSync(dir, { recursive: true, force: true });
@@ -473,7 +477,8 @@ test('next TUI in a real PTY (L3): a long session compacts before the turn, then
   const reply = '[fake-llm] 답했습니다';
   const pty = startPty({
     cmd: process.execPath,
-    args: [join(repo, 'bin', 'elanous.mjs'), '--config-dir', iso, '--test-state-dir', iso, '--tui', 'next'],
+    // Bare Next is deliberately a fresh session; this test seeds an existing session.
+    args: [join(repo, 'bin', 'elanous.mjs'), '--config-dir', iso, '--test-state-dir', iso, '--resume', id, '--tui', 'next'],
     cols: 80,
     rows: 24,
     workdir: iso,

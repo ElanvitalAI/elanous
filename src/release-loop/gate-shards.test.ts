@@ -2,10 +2,35 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gateShardsPath, readGateShards, recordGateShardsVerdict, shardsLine, summarizeShards, writeGateShards, type GateShardsFile } from './gate-shards.js';
+import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, readGateShards, recordGateShardsVerdict, shardsLine, summarizeShards, writeGateShards, type GateShardsFile } from './gate-shards.js';
 
 const NOW = Date.parse('2026-10-07T12:00:00.000Z');
 const ago = (min: number) => new Date(NOW - min * 60_000).toISOString();
+
+test('stale running shard closes from either its result marker or terminal Job status, but not before watchdog age', () => {
+  const source: GateShardsFile = { v: 1, version: '0.2.39', updatedAt: ago(4), shards: [
+    { id: 'pod-0', state: 'running', job: 'job-0', attemptId: 'attempt-0', startedAt: ago(4), host: 'node-b' },
+    { id: 'pod-1', state: 'running', job: 'job-1', startedAt: ago(4), host: 'node-b' },
+    { id: 'pod-2', state: 'running', job: 'job-2', startedAt: ago(0.5), host: 'node-b' },
+  ] };
+  const reconciled = finalizeTerminalGateShards(source,
+    new Map([['job-1', 'failed']]),
+    new Map([['pod-0', { completed: true, jobName: 'job-0', attemptId: 'attempt-0', rc: 2 }]]), new Date(NOW));
+  expect(reconciled.shards.map(({ state, endedAt, rc }) => ({ state, endedAt: !!endedAt, rc }))).toEqual([
+    { state: 'done', endedAt: true, rc: 2 },
+    { state: 'failed', endedAt: true, rc: undefined },
+    { state: 'running', endedAt: false, rc: undefined },
+  ]);
+  expect(source.shards.every((shard) => shard.state === 'running')).toBe(true);
+});
+
+test('beginGateShardAttempt forgets old Job/result pointers and endedAt before retry placement', () => {
+  const prior = { id: 'pod-0', state: 'running' as const, job: 'old-job', attemptId: 'old-attempt', host: 'node-b',
+    resultFile: 'pod-0-retry.json', startedAt: ago(10), endedAt: ago(1) };
+  const retry = beginGateShardAttempt(prior, new Date(NOW));
+  expect(retry).toMatchObject({ id: 'pod-0', state: 'retry', startedAt: new Date(NOW).toISOString() });
+  expect([retry.job, retry.attemptId, retry.host, retry.resultFile, retry.endedAt]).toEqual([undefined, undefined, undefined, undefined, undefined]);
+});
 
 /** 0.2.19 실측 모양: 24 조각 · 대기 8(CPU 부족) · 잘림 2 · 돌기 5 · 통과 9. */
 function file(): GateShardsFile {

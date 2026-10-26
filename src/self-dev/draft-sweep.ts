@@ -938,25 +938,38 @@ async function applyDraftSweepPlan(repository: string, adapters: DraftSweepAdapt
     number, action, reason, ...(statusLabel ? { statusLabel } : {}), applied: false,
   })), counts: {}, closeCap: plan.closeCap, closeCapSource: plan.closeCapSource };
   const writable = plan.entries.filter((entry) => entry.action !== 'report' && (entry.action === 'close' || Boolean(entry.statusLabel)));
-  const preflightEntries = new Map(writable.map((entry) => [entry.number, entry]));
-  for (const entry of writable) if (entry.supersedeNewer) {
-    const newer = plan.entries.find((candidate) => candidate.number === entry.supersedeNewer!.number);
-    if (!newer) { result.error = `snapshot apply plan missing newer PR #${entry.supersedeNewer.number}`; return result; }
-    preflightEntries.set(newer.number, newer);
-  }
-  if (!adapters.getDraftSnapshot) { result.error = 'draft snapshot preflight unavailable'; return result; }
-  // Read and validate every target before the first mutation: one stale item blocks the whole write batch.
-  const snapshots = await mapBounded([...preflightEntries.values()], DRAFT_SWEEP_CONCURRENCY, async (entry) => ({ entry,
-    current: await adapters.getDraftSnapshot!(repository, entry.number) }));
-  const drift = snapshots.find(({ entry, current }) => !current || current.number !== entry.number || current.state !== 'open'
-    || current.draft !== true || current.headSha !== entry.headSha || current.branch !== entry.branch || current.updatedAt !== entry.updatedAt
-    || current.labels.length !== entry.labels.length || [...current.labels].sort().join('\0') !== [...entry.labels].sort().join('\0'));
-  if (drift) {
-    const number = drift.entry.number;
-    result.error = `draft snapshot drift at #${number}; no writes performed`;
-    for (const entry of result.entries) if (writable.some((item) => item.number === entry.number)) entry.error = result.error;
+  for (const entry of writable) if (entry.supersedeNewer && !plan.entries.some((candidate) => candidate.number === entry.supersedeNewer!.number)) {
+    result.error = `snapshot apply plan missing newer PR #${entry.supersedeNewer.number}`;
     return result;
   }
+  if (!adapters.getDraftSnapshot) { result.error = 'draft snapshot preflight unavailable'; return result; }
+  // The frozen classification is one transaction boundary: every plan row must still match before any write.
+  const snapshots = await mapBounded(plan.entries, DRAFT_SWEEP_CONCURRENCY, async (entry) => {
+    try { return { entry, current: await adapters.getDraftSnapshot!(repository, entry.number), lookupError: undefined as string | undefined }; }
+    catch (error) { return { entry, current: undefined, lookupError: sweepFailureReason(error) }; }
+  });
+  const drift = snapshots.flatMap(({ entry, current, lookupError }) => {
+    if (lookupError) return [{ number: entry.number, reason: `snapshot lookup failed: ${lookupError}` }];
+    if (!current) return [{ number: entry.number, reason: 'snapshot unavailable' }];
+    const reasons: string[] = [];
+    if (current.number !== entry.number) reasons.push('number drift');
+    if (current.state !== 'open' && current.state !== 'closed') reasons.push('invalid state');
+    else if (current.state !== 'open') reasons.push(`state drift: expected open, got ${current.state}`);
+    if (current.draft !== true) reasons.push('draft state drift');
+    if (typeof current.headSha !== 'string' || current.headSha !== entry.headSha) reasons.push('head SHA drift');
+    if (typeof current.branch !== 'string' || current.branch !== entry.branch) reasons.push('branch drift');
+    if (typeof current.updatedAt !== 'string' || current.updatedAt !== entry.updatedAt) reasons.push('updatedAt drift');
+    if (!Array.isArray(current.labels) || current.labels.some((name) => typeof name !== 'string')
+      || current.labels.length !== entry.labels.length || [...current.labels].sort().join('\0') !== [...entry.labels].sort().join('\0')) reasons.push('labels drift');
+    return reasons.map((reason) => ({ number: entry.number, reason }));
+  });
+  if (drift.length) {
+    result.error = `draft snapshot drift at ${drift.map(({ number, reason }) => `#${number} (${reason})`).join(', ')}; no writes performed`;
+    for (const item of drift) result.entries.find((entry) => entry.number === item.number)!.error = item.reason;
+    return result;
+  }
+  const writableNumbers = new Set(writable.map((entry) => entry.number));
+  const snapshotsForApply = snapshots.filter(({ entry }) => writableNumbers.has(entry.number));
   const stopPlans = writable.filter((entry) => entry.stopRunRequired === true);
   const stoppedRuns = new Set<number>();
   if (stopPlans.length) {
@@ -986,7 +999,7 @@ async function applyDraftSweepPlan(repository: string, adapters: DraftSweepAdapt
       } catch (error) { result.error = `could not stop planned run at #${check.entry.number}: ${sweepFailureReason(error)}`; return result; }
     }
   }
-  for (const { entry } of snapshots) {
+  for (const { entry } of snapshotsForApply) {
     const output = result.entries.find((item) => item.number === entry.number)!;
     let mutated = false;
     try {

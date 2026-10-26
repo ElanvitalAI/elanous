@@ -89,6 +89,19 @@ test('fact question adds one-turn instruction, six-turn cap and search evidence 
   expect(buildWebSearchTool().description).toContain('answer directly from the snippets and URLs');
 });
 
+test('explanatory research bypasses the fact-question cap while a simple price lookup keeps it', async () => {
+  const research = fixture('현재 채권 금리가 왜 올라가나요?');
+  await research.runTurn();
+  expect(research.calls[0]!.surfaceProfile?.domain).toBe('research');
+  expect(research.calls[0]!.maxToolTurns).toBeUndefined();
+  expect(research.calls[0]!.messages[0]).toEqual({ role: 'system', content: 'base' });
+  mock.restore();
+  const fact = fixture('현재 채권 금리 얼마야?');
+  await fact.runTurn();
+  expect(fact.calls[0]!.surfaceProfile?.domain).toBe('coding');
+  expect(fact.calls[0]!.maxToolTurns).toBe(6);
+});
+
 test('a configured budget is read, explicit resolver wins even with zero', async () => {
   const configured = fixture(question, { configMax: 3 });
   await configured.runTurn();

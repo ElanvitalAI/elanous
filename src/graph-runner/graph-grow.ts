@@ -3,13 +3,10 @@ import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { createGraphVariant } from '../self-implement/graph-variant.js';
 import type { GraphEdgeSpec, GraphNodeSpec, GraphTemplateSpec } from '../self-implement/graph-yaml.js';
+import type { ResearchEdgeDecisionRegistry, ResearchEdgeProposal, ResolvedResearchEdgeDecision } from '../research/edge-decision.js';
 import { createLLMGrowthProposer } from './graph-grow-llm.js';
 
-export interface GrowthProposal {
-  node: GraphNodeSpec;
-  returnTo?: string;
-  reason: string;
-}
+export type GrowthProposal = ResearchEdgeProposal;
 
 export type GrowthProposer = (input: { graph: GraphTemplateSpec; nodeId: string; outcome: string; runId: string; output?: unknown }) => GrowthProposal | undefined | Promise<GrowthProposal | undefined>;
 export type GrowthRecipeEffect = 'read-only' | 'external-effect' | 'unknown';
@@ -68,10 +65,41 @@ export function growthDecision(input: Parameters<GrowthProposer>[0], proposal: G
 
 export async function proposeGrowth(input: Parameters<GrowthProposer>[0],
   proposer: GrowthProposer = createLLMGrowthProposer(), classifyRecipe?: (node: GraphNodeSpec) => GrowthRecipeEffect | GrowthRecipeClassification,
-  decisionDeps: GrowthDecisionDeps = {}): Promise<{ ok: true; graph: GraphTemplateSpec; growth: GraphGrowth } | { ok: false; reason: string; park?: boolean; growth?: GraphGrowth; decisionId?: string; decisionRef?: string; command?: GrowthCommand; approval?: string }> {
+  decisionDeps: GrowthDecisionDeps = {}, edgeDecisionRegistry?: ResearchEdgeDecisionRegistry): Promise<
+    | { ok: true; graph: GraphTemplateSpec; growth: GraphGrowth; edgeDecision?: ResolvedResearchEdgeDecision }
+    | { ok: false; reason: string; park?: boolean; growth?: GraphGrowth; decisionId?: string; decisionRef?: string; command?: GrowthCommand; approval?: string; edgeDecision?: ResolvedResearchEdgeDecision }
+  > {
   let proposal: GrowthProposal | undefined;
-  try { proposal = await proposer(input); }
-  catch (error) { return { ok: false, reason: `proposer failed: ${String(error)}` }; }
+  const value = input.output;
+  const assessment = value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Array.isArray((value as Record<string, unknown>).gaps)
+    && Array.isArray((value as Record<string, unknown>).contradictions)
+    && Array.isArray((value as Record<string, unknown>).verdicts)
+    ? { gaps: (value as Record<string, unknown>).gaps as unknown[],
+      contradictions: (value as Record<string, unknown>).contradictions as unknown[],
+      verdicts: (value as Record<string, unknown>).verdicts as unknown[] }
+    : undefined;
+  let edgeDecision: ResolvedResearchEdgeDecision | undefined;
+  if (assessment) {
+    const [{ createResearchEdgeDecisionRegistry }, { debug }] = await Promise.all([
+      import('../research/edge-decision.js'), import('../debug/log.js'),
+    ]);
+    edgeDecision = await (edgeDecisionRegistry ?? createResearchEdgeDecisionRegistry()).decide(assessment);
+    try {
+      debug.log('research.edge', 'decision', {
+        provider: edgeDecision.provider,
+        decision: edgeDecision.action,
+        reason: edgeDecision.reason,
+      });
+    } catch { /* observation must not change graph growth */ }
+    if (edgeDecision.action !== 'add') {
+      return { ok: false, reason: `edge decision ${edgeDecision.action}: ${edgeDecision.reason}`, edgeDecision };
+    }
+    proposal = edgeDecision.proposal;
+  } else {
+    try { proposal = await proposer(input); }
+    catch (error) { return { ok: false, reason: `proposer failed: ${String(error)}` }; }
+  }
   if (!proposal) return { ok: false, reason: 'no proposal' };
   if (!proposal.node || typeof proposal.reason !== 'string' || !proposal.reason.trim()) return { ok: false, reason: 'proposal requires a node and reason' };
   let result: ReturnType<typeof createGraphVariant>;
@@ -99,5 +127,5 @@ export async function proposeGrowth(input: Parameters<GrowthProposer>[0],
         growth: proposalGrowth(input, proposal) };
     }
   }
-  return { ok: true, graph: result.template, growth: proposalGrowth(input, proposal) };
+  return { ok: true, graph: result.template, growth: proposalGrowth(input, proposal), ...(edgeDecision ? { edgeDecision } : {}) };
 }

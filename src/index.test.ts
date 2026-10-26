@@ -12,7 +12,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { spawnRealCliBytes, type RealCliSpawnBytesResult } from './testing/real-cli-spawn.js';
 import { basename, join, resolve } from 'node:path';
-import { activeSessionIdForContinue, latestSessionIdForContinue, type ContinueSessionLookup } from './index.js';
+import { activeSessionIdForContinue, latestNextTuiSessionIdForContinue, latestRootSessionIdForContinue, latestSessionIdForContinue, type ContinueSessionLookup } from './index.js';
 import { resolveLatestSessionId } from './session/session-start.js';
 import { assembleAskLaunchPolicy, buildCodexAccountImportGuidance, buildHarnessOrchestratePlan, executeDevPipelineInvocation, filterDashboardArgs, formatReviewStatsPercentage, formatSelfSendCandidateDisplay, runHarnessBrowserAction, runHarnessOrchestrateExecution, runSchedule, scheduleCreatePlan, readSelfOrchestrateGoals, setCodexAccountLogSinkModuleForTesting, type HarnessOrchestrateExecutionDeps, type ScheduleDispatch } from './index.js';
 import { selectFabricDecomposer } from './self-dev/self-orchestrate-runtime.js';
@@ -5349,9 +5349,7 @@ describe('decide / ax-screen / decide-recipe JSON stdout completion', () => {
   });
 });
 
-// TUI-CONTINUE-SESSION (0.2.35) — `eln --continue`(= id 없는 `--resume`)는 «지금 이 디렉토리» 의
-// 직전 대화를 이어받는다.  판정: 활성 표지가 다른 프로젝트의 세션을 가리켜도 cwd 프로젝트 최근 세션이
-// 이기고, cwd 프로젝트에 세션이 없으면 종전대로 전역 최신으로 폴백한다.
+// TUI-CONTINUE-SESSION (0.2.35) — classic root continue keeps its existing project-first/global-fallback contract.
 describe('TUI-CONTINUE-SESSION — eln --continue picks the cwd project recent session', () => {
   const PROJECT_ROOT = '/work/alpha';
 
@@ -5390,8 +5388,34 @@ describe('TUI-CONTINUE-SESSION — eln --continue picks the cwd project recent s
     expect(continueFrom(`${PROJECT_ROOT}/pkg`, lookup({ activeSessionId: () => 'sess-other-9' }))).toBe('sess-alpha-2');
     // 같은 프로젝트의 오래된 활성 표지보다 cwd 프로젝트의 최신 세션이 우선한다.
     expect(continueFrom(PROJECT_ROOT, lookup({ activeSessionId: () => 'sess-alpha-1' }))).toBe('sess-alpha-2');
-    // 보존: 프로젝트 밖에서는 전역 최신(= 종전 `--continue` 동작).
+    // cwd 가 어떤 프로젝트에도 안 속하면 종전처럼 활성 표지가 이긴다.
     expect(continueFrom('/work/beta', lookup({ activeSessionId: () => 'sess-other-9' }))).toBe('sess-other-9');
+  });
+});
+
+describe('NEXT-TUI-CONTINUE-SESSION — only human TUI sessions in the cwd project', () => {
+  const PROJECT_ROOT = '/work/alpha';
+  const lookup = (overrides: Partial<ContinueSessionLookup> = {}): ContinueSessionLookup => ({
+    projectIdForCwd: (cwd) => (cwd === PROJECT_ROOT || cwd.startsWith(`${PROJECT_ROOT}/`) ? 'p-alpha' : null),
+    latestForProject: (projectId) => (projectId === 'p-alpha' ? 'tui-alpha-2' : null),
+    latestGlobal: () => 'tui-other-9',
+    activeSessionId: () => 'automation-session',
+    ...overrides,
+  });
+
+  test('project TUI session wins and no project candidate does not fall back globally', () => {
+    expect(latestNextTuiSessionIdForContinue(`${PROJECT_ROOT}/pkg`, lookup())).toBe('tui-alpha-2');
+    expect(latestNextTuiSessionIdForContinue(PROJECT_ROOT, lookup({ latestForProject: () => null }))).toBe(null);
+  });
+
+  test('outside a project it selects the filtered global TUI candidate', () => {
+    expect(latestNextTuiSessionIdForContinue('/work/beta', lookup())).toBe('tui-other-9');
+  });
+
+  test('classic root --continue preserves global fallback while Next TUI refuses it', () => {
+    const noProjectSession = lookup({ latestForProject: () => null, latestGlobal: () => 'automation-session' });
+    expect(latestRootSessionIdForContinue('classic', PROJECT_ROOT, noProjectSession)).toBe('automation-session');
+    expect(latestRootSessionIdForContinue('next', PROJECT_ROOT, noProjectSession)).toBe(null);
   });
 });
 // ── TUI-H9-ACTIVE-SESSION-ID · 0.2.36 ──────────────────────────────────────────

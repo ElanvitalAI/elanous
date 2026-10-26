@@ -13,7 +13,7 @@ import {
   TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
 } from './fake-llm.js';
 
-export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-compact', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-subagent-e4'] as const;
+export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-subagent-e4'] as const;
 export type NextTuiScenario = (typeof NEXT_TUI_SCENARIOS)[number];
 
 export interface NextTuiScenarioSpec {
@@ -248,6 +248,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     return { scenario: spec.scenario, universe: root, run, store, logs, checks };
   }
 
+  if (spec.scenario === 'next-resume') return runNextResumeScenario(spec, root, base, reply, done);
+
   if (spec.scenario === 'next-tool-fold') return runNextToolFoldScenario(spec, root, base, reply, done);
   if (spec.scenario === 'next-tool-fold-read') return runNextToolFoldReadScenario(spec, root, base, done);
   if (spec.scenario === 'next-queue') return runNextQueueScenario(spec, root, base, reply, done);
@@ -273,6 +275,9 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   ];
   const run = await mockSeatPtySequence({
     ...base,
+    // A bare Next launch intentionally starts a fresh conversation. This scenario
+    // exercises compaction of the seeded one, so attach to it explicitly.
+    args: [spec.entry, '--config-dir', '{root}', '--test-state-dir', '{root}', '--resume', id, '--tui', 'next'],
     ready: { label: 'before (12 seeded messages)', until: (s) => base.ready.until(s) && s.includes('xxxx') },
     steps,
   });
@@ -294,6 +299,53 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     exitedClean: run.exitCode === 0,
   };
   return { scenario: spec.scenario, universe: root, run, store: { sessionId: id, messages: stored.length, summaryHead: summary?.content.slice(0, 80) ?? null }, logs, checks };
+}
+
+async function runNextResumeScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
+  const seeded = withStore(root, () => {
+    const from = createSession({ source: 'tui', title: '현재 대화' }).id;
+    appendMessage(from, { role: 'user', content: '현재 대화 기록', ts: new Date().toISOString() });
+    appendMessage(from, { role: 'assistant', content: '현재 답변', ts: new Date().toISOString() });
+    const target = createSession({ source: 'tui', title: '저장된 n8n 설명' }).id;
+    appendMessage(target, { role: 'user', content: '저장된 n8n 맥락', ts: new Date().toISOString() });
+    appendMessage(target, { role: 'assistant', content: '저장된 답변', ts: new Date().toISOString() });
+    setActiveSessionId(from);
+    return { from, target };
+  });
+  const steps: SeatPtyStep[] = [
+    { label: 'after /resume list', text: '/resume', until: (s) => s.includes(seeded.target.slice(0, 8)) && s.includes('저장된 n8n 설명') },
+    { label: 'after /resume load', text: `/resume ${seeded.target.slice(0, 8)}`, until: (s) => s.includes(`대화 이어 가기 · ${seeded.target.slice(0, 8)}`) && s.includes('저장된 n8n 맥락') },
+    { label: 'after resumed turn', text: '이어진 대화 확인', until: done(1, '이어진 대화 확인') },
+  ];
+  const run = await mockSeatPtySequence({ ...base, steps });
+  const current = withStore(root, () => getActiveSessionId() ?? '');
+  const logs = readLogs(spec, 'tui.next,llm.route-decision');
+  const events = parseEvents(logs);
+  const listEvents = events.filter((e) => e.category === 'tui.next' && e.event === 'session-resume-list');
+  const resumeEvents = events.filter((e) => e.category === 'tui.next' && e.event === 'session-resume');
+  const listed = parseData<{ from: string }>(listEvents[0]?.data);
+  const resume = parseData<{ from: string; to: string }>(resumeEvents[0]?.data);
+  const routes = events.filter((e) => e.category === 'llm.route-decision' && e.event === 'local-chat-executed').map((e) => parseData<{ provider: string; sessionId: string }>(e.data));
+  const listScreen = run.frames.find((f) => f.label === 'after /resume list')?.screen ?? '';
+  const loadScreen = run.frames.find((f) => f.label === 'after /resume load')?.screen ?? '';
+  const store = {
+    from: seeded.from,
+    target: seeded.target,
+    active: current,
+    oldUser: userTexts(root, seeded.from),
+    targetUser: userTexts(root, seeded.target),
+  };
+  const checks = {
+    listDisplaysSavedSession: listEvents.length === 1 && listScreen.includes(seeded.target.slice(0, 8)) && listScreen.includes('저장된 n8n 설명'),
+    selectedSessionBecomesActive: current === seeded.target && resumeEvents.length === 1
+      && Boolean(listed.from) && resume.from === listed.from && resume.to === seeded.target,
+    resumedHistoryRenders: loadScreen.includes('저장된 n8n 맥락') && loadScreen.includes('저장된 답변'),
+    oldSessionPreserved: JSON.stringify(store.oldUser) === JSON.stringify(['현재 대화 기록']),
+    newTurnUsesResumedSession: routes.length === 1 && routes[0]?.sessionId === seeded.target && store.targetUser.includes('이어진 대화 확인'),
+    onlyFakeProvider: routes.length === 1 && routes.every((r) => r.provider === 'test-fake-llm'),
+    exitedClean: run.exitCode === 0,
+  };
+  return { scenario: spec.scenario, universe: root, run, store, logs, checks };
 }
 
 type ScenarioBase = Omit<Parameters<typeof mockSeatPtySequence>[0], 'steps'> & { env: Record<string, string> };

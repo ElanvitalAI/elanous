@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { goalDeclaresNoWiring, settleUncoveredEvidence, MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS, MAX_HARVESTED_EVIDENCE_CHARS, authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, buildImplementReport, requiredEvidenceFromGoal, renderRequiredEvidencePrompt, runRequiredEvidenceChecks, coverRequiredEvidence, parseOffDiffEvidence, OFF_DIFF_EVIDENCE_PROMPT, tailWithOmissionMarker } from './off-diff-evidence.js';
+import { authoredSignalExecution, goalDeclaresNoWiring, settleUncoveredEvidence, MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS, MAX_HARVESTED_EVIDENCE_CHARS, authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, buildImplementReport, requiredEvidenceFromGoal, renderRequiredEvidencePrompt, runRequiredEvidenceChecks, coverRequiredEvidence, parseOffDiffEvidence, OFF_DIFF_EVIDENCE_PROMPT, tailWithOmissionMarker } from './off-diff-evidence.js';
 import { buildReviewIntent } from '../agent-substrate/review-intent.js';
 import { featurePrompt } from './seams.js';
 
@@ -469,6 +469,44 @@ describe('requiredEvidenceFromGoal — 골이 이름으로 요구한다', () => 
     const [run] = runRequiredEvidenceChecks(withCommand, process.cwd());
     expect(run).toMatchObject({ tag: 'shell', command: 'echo ok', exitCode: 0, stdout: 'ok\n' });
     expect(run?.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  test('저작 판정 신호 rg와 bun test를 실제 실행하고 같은 원문 결과를 돌려준다', () => {
+    for (const command of [
+      'rg -n 미측정 docs/plans/plan.md',
+      'bun test src/example.test.ts',
+    ]) {
+      const calls: string[] = [];
+      const goal = `## 판정 신호\n- Candidate decision signal:\n  - Condition: ${command}\n`;
+      const checks = runRequiredEvidenceChecks(goal, process.cwd(), 'run-signal-test', {
+        run: (actual) => { calls.push(actual); return { status: 0, stdout: 'observed\\n', stderr: '', error: undefined }; },
+      });
+      expect(calls).toEqual([command]);
+      expect(authoredSignalExecution(goal, checks)).toEqual({ command, exitCode: 0, stdout: 'observed\\n', stderr: '' });
+    }
+  });
+
+  test('저작 판정 신호의 셸 조합은 실행하지 않는다', () => {
+    const command = 'rg foo file && touch /tmp/nope';
+    const goal = `## 판정 신호\n- Candidate decision signal:\n  - Condition: ${command}\n`;
+    const calls: string[] = [];
+    const checks = runRequiredEvidenceChecks(goal, process.cwd(), 'run-signal-unsafe', {
+      run: (actual) => { calls.push(actual); return { status: 0, stdout: '', stderr: '', error: undefined }; },
+    });
+    expect(calls).toEqual([]);
+    expect(authoredSignalExecution(goal, checks)).toBeUndefined();
+  });
+
+  test('저작 판정 신호에서 셸 래퍼와 원격 셸은 실행하지 않는다', () => {
+    for (const command of ["bash -c 'rg foo file'", "sh -c 'rg foo file'", 'ssh host rg foo file']) {
+      const goal = `## 판정 신호\n- Candidate decision signal:\n  - Condition: ${command}\n`;
+      const calls: string[] = [];
+      const checks = runRequiredEvidenceChecks(goal, process.cwd(), 'run-signal-wrapper', {
+        run: (actual) => { calls.push(actual); return { status: 0, stdout: '', stderr: '', error: undefined }; },
+      });
+      expect(calls).toEqual([]);
+      expect(authoredSignalExecution(goal, checks)).toBeUndefined();
+    }
   });
 
   test('|| 없는 기존 요구는 verifyCommand 없이 실행 0건이다', () => {

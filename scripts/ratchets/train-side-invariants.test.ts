@@ -8,6 +8,7 @@ import { rmSync } from 'node:fs';
 const script = resolve(import.meta.dir, 'train-side-invariants.sh');
 const expected = [
   'scripts/ratchets/test-interference-patterns.test.ts',
+  'scripts/ratchets/next-tui-entry-budget.test.ts',
   'src/domains/finance-cli.test.ts',
   'src/instance/state-dir-provenance-ratchet.test.ts',
   'src/self-implement/graph-yaml.test.ts',
@@ -15,6 +16,11 @@ const expected = [
   'test/identity-env.test.ts',
   'test/no-absolute-path-imports.test.ts',
   'test/scenarios/integration.test.ts',
+  'test/rules-contract.test.ts',
+  'test/hook-order-sweep.test.ts',
+  'src/cli/g6a-commands.test.ts',
+  'test/spawn-sync-max-buffer.test.ts',
+  'test/telegram-coding-model-terra.test.ts',
 ];
 
 function fixture(run: (root: string, env: NodeJS.ProcessEnv, calls: string) => void): void {
@@ -36,7 +42,7 @@ function fixture(run: (root: string, env: NodeJS.ProcessEnv, calls: string) => v
 }
 
 describe('train-side invariant sentinel', () => {
-  test('the fixed list contains all eight HARD regressions', () => {
+  test('the fixed list contains the HARD regressions and release-critical invariants', () => {
     const listed = execFileSync('bash', [script, '--list'], { encoding: 'utf8' }).trim().split('\n');
     expect(listed).toEqual(expected);
   });
@@ -44,7 +50,7 @@ describe('train-side invariant sentinel', () => {
   test('runs every file and emits a complete pass marker', () => fixture((root, env, calls) => {
     const result = spawnSync('bash', [script, root], { env, encoding: 'utf8' });
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain('TRAIN_INVARIANTS_PASS files=8');
+    expect(result.stdout).toContain(`TRAIN_INVARIANTS_PASS files=${expected.length}`);
     expect(readFileSync(calls, 'utf8').trim().split('\n')).toEqual(expected);
   }));
 

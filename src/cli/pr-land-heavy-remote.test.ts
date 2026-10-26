@@ -529,7 +529,7 @@ test('busy node-b selects node-c and caches only its exact head/main evidence', 
   const input = { pr: 52, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
   const hosts: Array<[string, number | undefined]> = [];
   const deps = {
-    settings: { ...GATE_REMOTE_DEFAULTS, hostCaps: { node-b: 6, node-c: 3 } }, observe: () => {},
+    settings: { ...GATE_REMOTE_DEFAULTS, hostCaps: { 'node-b': 6, 'node-c': 3 } }, observe: () => {},
     runRemote: (options: RemoteRunOptions) => {
       hosts.push([options.host, options.hostCap]);
       return options.host === 'node-b' ? { kind: 'busy' as const } : {

@@ -6,7 +6,10 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { acquireOpSeatFlock, opSeatFlockPath, resyncTickWithReleaseProbe } from '../../src/steward/resync-tick.js';
-import { planResumeReleaseRun, resumeReleaseRun } from './resume-release.js';
+import { planResumeReleaseRun, resumeReleaseRun, type RecoverReleaseDeps } from './resume-release.js';
+import { type CutBranchOptions } from './cut-branch.js';
+import { Command } from 'commander';
+import { registerReleaseCommands } from '../../src/cli/release-cli.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { partialPlanPath } from './gate-partial.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
@@ -90,6 +93,47 @@ test('resume dry-run checks the saved cut and checkout without running nodes or 
     expect(existsSync(join(root, 'release', VERSION, 'resume-attempts', 'r.json'))).toBe(false);
     expect(readdirSync(join(root, 'graph-runs', 'release-loop'))).toEqual(['r.json']);
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resume preflight matches owned docs and prepared paths by realpath while rejecting another worktree', async () => {
+  const run = async (wrongListedWorktree = false) => {
+    const root = mkdtempSync(join(tmpdir(), 'release-resume-realpath-'));
+    setElanousConfigDir(root);
+    const saved = writeFailedRun(root);
+    const commandRoot = createPreflightCommandRoot(root);
+    const branch = `release-docs/${VERSION}`;
+    const tree = join(root, 'docs-tree'); mkdirSync(tree);
+    const receiptTree = join(root, 'docs-tree-alias'); symlinkSync(tree, receiptTree, 'dir');
+    const listedPath = realpathSync(tree);
+    const listed = wrongListedWorktree ? join(root, 'other-tree') : listedPath;
+    if (wrongListedWorktree) mkdirSync(listed);
+    const prepared = join(root, 'release', VERSION, 'prepared');
+    mkdirSync(prepared, { recursive: true });
+    writeFileSync(join(prepared, 'release.json'), JSON.stringify({ version: VERSION, sourceCommit: SHA }));
+    const preparedAlias = join(root, 'prepared-alias'); symlinkSync(prepared, preparedAlias, 'dir');
+    const state = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { nodes: Array<Record<string, unknown>> };
+    state.nodes.push(
+      { nodeId: 'prepare', ok: true, output: JSON.stringify({ outcome: 'ok', out: preparedAlias, commit: SHA }) },
+      { nodeId: 'docs', ok: true, output: JSON.stringify({ outcome: 'ok', branch, worktree: receiptTree, artifactOwner: { runId: 'r', attempt: 0 } }) },
+    );
+    writeFileSync(saved.statePath, JSON.stringify(state));
+    writeFileSync(join(root, 'release', VERSION, 'docs-branch-owner.json'), JSON.stringify({
+      owner: { runId: 'r', attempt: 0 }, branch, worktree: receiptTree, outcome: 'built',
+    }));
+    const git = (args: string[]) => {
+      if (args[0] === 'show-ref' && args.at(-1) === `refs/heads/${branch}`) return SHA;
+      if (args[0] === 'worktree' && args[1] === 'list') return `worktree ${listed}\nbranch refs/heads/${branch}\n`;
+      if (args[0] === 'ls-remote' && args.at(-1) === `refs/heads/${branch}`) return `${SHA}\trefs/heads/${branch}`;
+      return gitStub(args);
+    };
+    try {
+      return await planResumeReleaseRun({ runId: 'r', from: 'tui', commandRoot }, { root, git });
+    } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+  };
+
+  const plan = await run();
+  expect(plan.preflight).toBe('passed');
+  await expect(run(true)).rejects.toThrow('docs branch/worktree is outside');
 });
 
 test('resume preflight rejects each environment/artifact mismatch before graph or attempt/state writes', async () => {
@@ -186,6 +230,36 @@ test('resume dry-run on a moved cut reports the fail-closed full-gate fallback w
     expect(readFileSync(saved.statePath, 'utf8')).toBe(saved.original);
     expect(readdirSync(join(root, 'graph-runs', 'release-loop'))).toEqual(['r.json']);
     expect(gitCalls).not.toContain('fetch');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-GATE-RADIUS-POD-IMAGE: a Pod resume without prior shard receipts falls back to a full gate', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-pod-image-missing-'));
+  setElanousConfigDir(root);
+  const saved = writeFailedRun(root);
+  const state = JSON.parse(saved.original) as { input: { gatePodPool?: string } };
+  state.input.gatePodPool = 'pool-node-b';
+  writeFileSync(saved.statePath, JSON.stringify(state));
+  const moved = 'b'.repeat(40);
+  const git = (args: string[]) => args[0] === 'ls-remote' ? `${moved}\trefs/heads/release/${VERSION}`
+    : args[0] === 'rev-parse' ? moved : args[0] === 'diff' ? 'src/x.test.ts\n' : '';
+  const releaseDir = join(root, 'release', VERSION);
+  mkdirSync(releaseDir, { recursive: true });
+  writeFileSync(join(releaseDir, 'gate-failures.json'), JSON.stringify({ commit: SHA, failures: [], errors: [] }));
+  try {
+    const commandRoot = createPreflightCommandRoot(root);
+    const deps = { root, git, isAncestor: () => true,
+      closureTree: () => ({ files: ['src/x.test.ts', 'src/y.test.ts'] }) as never };
+    const plan = await planResumeReleaseRun({ runId: 'r', from: 'gate', commandRoot }, deps);
+    expect(plan.gatePlan).toEqual({ mode: 'full', reason: 'executed-pod-image-digest-missing' });
+    expect(existsSync(partialPlanPath(root, VERSION))).toBe(false);
+    delete state.input.gatePodPool;
+    writeFileSync(saved.statePath, JSON.stringify(state));
+    const cut = join(releaseDir, 'gate-logs', 'cut');
+    mkdirSync(cut, { recursive: true });
+    writeFileSync(join(cut, 'pod-0.json'), JSON.stringify({ commit: SHA }));
+    const hostPlan = await planResumeReleaseRun({ runId: 'r', from: 'gate', commandRoot }, deps);
+    expect(hostPlan.gatePlan).toEqual({ mode: 'partial' });
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -306,6 +380,26 @@ test('GATE-RESUME-STALLED-ONLY: same-commit resume plans stalled files and prese
     expect(readFileSync(state.statePath, 'utf8')).toContain('partialFailures');
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
+
+for (const reason of ['admission-timeout', 'admission-error'] as const) {
+  test(`GATE-MEM-ADMIT: same-commit resume rechecks ${reason} files without a full sweep`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'resume-admission-'));
+    setElanousConfigDir(root);
+    writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: SHA,
+      stalledShards: [{ shard: 4, files: ['src/stalled.test.ts'], reason }],
+      partialSummary: { pass: 10, fail: 0, errors: 0, ran: 10, files: 10 }, preservedShardCount: 5,
+      partialFailures: { failures: [], errors: [] } }));
+    try {
+      const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git: gitStub, isAncestor: () => true,
+        closureTree: () => ({ files: ['src/stalled.test.ts'] }) as never,
+        graph: async () => ({ status: 'done', runId: 'r' }) as never });
+      expect(resumed.partial).toMatchObject({ requested: true, applied: true, files: 1, priorCommit: SHA });
+      expect(JSON.parse(readFileSync(join(root, 'release', VERSION, 'gate-partial.json'), 'utf8'))).toMatchObject({
+        kind: 'recheck', stalledFiles: ['src/stalled.test.ts'], files: ['src/stalled.test.ts'], preservedShardCount: 5,
+      });
+    } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+  });
+}
 
 test('GATE-RESUME-STALLED-ONLY: an incomplete saved gate record falls back to a full sweep plan', async () => {
   const root = mkdtempSync(join(tmpdir(), 'resume-stalled-fallback-'));
@@ -690,3 +784,364 @@ test('a resume with an injected ledger root different from the OP-seat root stil
     rmSync(ledger, { recursive: true, force: true });
   }
 });
+
+/** MS-02 stage: one release 9.9.9 run whose gate failed, saved in the isolated test universe. */
+const RECOVER_VERSION = '9.9.9';
+
+function writeRecoverRun(root: string, runId: string, cut: string): { statePath: string; original: string } {
+  const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
+  mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+  configureTraffic(root);
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const recipesPath = join(import.meta.dir, '../../graphs/release/recipes.yaml');
+  const state = {
+    graphId: 'release-loop', runId, status: 'failed',
+    graphSnapshot: {
+      graphSha: createHash('sha256').update(readFileSync(graphPath)).digest('hex'),
+      recipesSha: createHash('sha256').update(readFileSync(recipesPath)).digest('hex'),
+    },
+    input: { version: RECOVER_VERSION, branchCut: true },
+    path: ['version-release', 'export-check', 'gate', 'failed'],
+    nodes: [
+      { nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: RECOVER_VERSION, commit: cut, branch: `release/${RECOVER_VERSION}` }) },
+      { nodeId: 'export-check', ok: true, exit: 0, executed: true, output: '{"outcome":"ok"}' },
+      { nodeId: 'gate', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' },
+      { nodeId: 'failed', ok: true, exit: 0, executed: false },
+    ],
+    executed: 3, dryRun: false, statePath,
+  };
+  writeFileSync(statePath, JSON.stringify(state));
+  return { statePath, original: readFileSync(statePath, 'utf8') };
+}
+
+/** The repair seat: a bare origin carrying main ⊕ release/9.9.9, and one fix commit on main to pick. */
+function buildRecoverSeat(root: string): { work: string; origin: string; cut: string; pick: string } {
+  const origin = join(root, 'origin.git');
+  mkdirSync(origin, { recursive: true });
+  seatGit(origin, 'init', '--bare', '-q');
+  const work = join(root, 'work');
+  mkdirSync(work, { recursive: true });
+  seatGit(work, 'init', '-q');
+  seatGit(work, 'checkout', '-q', '-b', 'main');
+  seatGit(work, 'remote', 'add', 'origin', origin);
+  // The real `cutReleaseBranch` append cherry-picks in a temporary worktree with a plain env: the identity has
+  // to live in the repo config (seatGit's inline -c never reaches it) for the real push path to commit.
+  seatGit(work, 'config', 'user.name', 'release-loop test');
+  seatGit(work, 'config', 'user.email', 'release-loop@test.invalid');
+  seatGit(work, 'config', 'commit.gpgsign', 'false');
+  // The pod's global git config points core.hooksPath at a push guard that refuses refs/heads/release/<v>,
+  // and the real `cutReleaseBranch` push runs with the process env — the global config reaches it. The seat
+  // pushes only to its own throwaway bare origin, so the repo config points hooks at an empty directory;
+  // the guard stays in force for the real checkout, which never routes through this fixture.
+  const noHooks = join(root, 'no-hooks');
+  mkdirSync(noHooks, { recursive: true });
+  seatGit(work, 'config', 'core.hooksPath', noHooks);
+  seatGit(origin, 'config', 'core.hooksPath', noHooks);
+  mkdirSync(join(work, 'graphs', 'release'), { recursive: true });
+  for (const file of ['release-loop.yaml', 'recipes.yaml'])
+    copyFileSync(join(import.meta.dir, '../../graphs/release', file), join(work, 'graphs', 'release', file));
+  mkdirSync(join(work, 'node_modules'), { recursive: true });
+  mkdirSync(join(work, 'apps', 'pwa', 'node_modules'), { recursive: true });
+  writeFileSync(join(work, 'node_modules', '.fixture'), 'test fixture\n');
+  writeFileSync(join(work, 'apps', 'pwa', 'node_modules', '.fixture'), 'test fixture\n');
+  writeFileSync(join(work, 'package.json'), `{"version":"${RECOVER_VERSION}"}\n`);
+  seatGit(work, 'add', 'package.json', 'graphs/release/release-loop.yaml', 'graphs/release/recipes.yaml');
+  seatGit(work, 'add', '-f', 'node_modules/.fixture', 'apps/pwa/node_modules/.fixture');
+  seatGit(work, 'commit', '-q', '-m', `cut ${RECOVER_VERSION}`);
+  const cut = seatGit(work, 'rev-parse', 'HEAD');
+  seatGit(work, 'push', '-q', 'origin', 'main');
+  seatGit(work, 'push', '-q', 'origin', `main:refs/heads/release/${RECOVER_VERSION}`);
+  writeFileSync(join(work, 'fix.txt'), 'fix\n');
+  seatGit(work, 'add', 'fix.txt');
+  seatGit(work, 'commit', '-q', '-m', `fix for ${RECOVER_VERSION}`);
+  const pick = seatGit(work, 'rev-parse', 'HEAD');
+  seatGit(work, 'push', '-q', 'origin', 'main');
+  return { work, origin, cut, pick };
+}
+
+/** The production dispatch: `release recover` as registerReleaseCommands wires it, JSON read back from stdout. */
+async function invokeRecover(args: string[], deps: RecoverReleaseDeps): Promise<{
+  ok: boolean; error?: string;
+  stages: Array<{ stage: string; outcome: string; commit?: string | null; from?: string; gatePlan?: string; reason?: string }>;
+}> {
+  const lines: string[] = [];
+  const write = process.stdout.write;
+  process.stdout.write = ((value: string | Uint8Array) => { lines.push(String(value).trim()); return true; }) as typeof process.stdout.write;
+  try {
+    process.exitCode = 0;
+    const cmd = new Command();
+    registerReleaseCommands(cmd, {}, {}, {}, {}, {}, deps);
+    await cmd.parseAsync(['release', 'recover', ...args, '--json'], { from: 'user' });
+    return JSON.parse(lines.at(-1)!) as never;
+  } finally { process.stdout.write = write; }
+}
+
+test('RELEASE-RECOVER-ONE-CMD: one recover appends the repair with the real cutReleaseBranch push and reaches the resume plan from its own tip checkout', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-recover-one-cmd-'));
+  setElanousConfigDir(root);
+  const previousExit = process.exitCode;
+  const seat = buildRecoverSeat(root);
+  const saved = writeRecoverRun(root, 'r', seat.cut);
+  const graphCalls: Array<{ fromNodeId?: string; cutTip?: string }> = [];
+  try {
+    // No fake cutBranch and no --command-root (GOODHART): stages 1-2 are the real `release cut-branch --append`
+    // — the dry-run plans the fast-forward, the append cherry-picks in a temporary worktree and pushes the
+    // bare origin for real (a local push to refs/heads/release/* works here). Stage 3 then needs a checkout
+    // whose HEAD is the appended tip, and the operator checkout never moves: recover must prepare its own
+    // temporary checkout, or production would stop with «differs from cut tip».
+    const result = await invokeRecover(['--run', 'r', '--pick', seat.pick, '--repo-root', seat.work, '--no-partial'],
+      { root, repo: seat.work, graph: async (_path, options) => {
+        graphCalls.push({ ...(options?.fromNodeId === undefined ? {} : { fromNodeId: options.fromNodeId }),
+          ...(options?.releaseCommandSource?.cutTip === undefined ? {} : { cutTip: options.releaseCommandSource.cutTip }) });
+        return { status: 'done', runId: 'r' } as never;
+      } });
+    expect(result.ok).toBe(true);
+    expect(process.exitCode).toBe(0);
+    // The three stages ran in this order, and the first only planned the append.
+    expect(result.stages.map((stage) => stage.stage)).toEqual(['append-dry-run', 'append', 'resume']);
+    expect(result.stages.map((stage) => stage.outcome)).toEqual(['ok', 'ok', 'ok']);
+    // The repair reached origin through the real push: release/9.9.9 moved to a tip that carries the picked fix.
+    const tip = seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`);
+    expect(tip).not.toBe(seat.cut);
+    expect(seatGit(seat.origin, 'show', `${tip}:fix.txt`)).toBe('fix');
+    expect((JSON.parse(seatGit(seat.origin, 'show', `${tip}:package.json`)) as { version: string }).version).toBe(RECOVER_VERSION);
+    expect(result.stages[1]!.commit).toBe(tip);
+    // The resume stage is ok without any fake checkout, and the graph ran from the origin tip (GOODHART evidence).
+    expect(result.stages[2]).toMatchObject({ from: 'export-check', gatePlan: 'full', commit: tip });
+    expect(graphCalls).toEqual([{ fromNodeId: 'export-check', cutTip: tip }]);
+    // The saved run names the repaired commit and keeps the previous one as refreshedFrom.
+    const run = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { nodes: Array<{ nodeId: string; output: string }> };
+    expect(JSON.parse(run.nodes.find((node) => node.nodeId === 'version-release')!.output.trim().split('\n').at(-1)!))
+      .toMatchObject({ commit: tip, refreshedFrom: seat.cut });
+    // The attempt ledger keeps its format (attempts of timestamps) and gains the per-stage results.
+    const ledger = JSON.parse(readFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'), 'utf8')) as
+      { version: string; runId: string; priorCountKnown: boolean; attempts: string[]; recoveries: Array<{ stage: string; outcome: string }> };
+    expect(ledger).toMatchObject({ version: RECOVER_VERSION, runId: 'r', priorCountKnown: true });
+    expect(ledger.attempts).toHaveLength(1);
+    expect(ledger.attempts.every((at) => Number.isFinite(Date.parse(at)))).toBe(true);
+    expect(ledger.recoveries.map((stage) => [stage.stage, stage.outcome]))
+      .toEqual([['append-dry-run', 'ok'], ['append', 'ok'], ['resume', 'ok']]);
+  } finally {
+    process.exitCode = previousExit ?? 0;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test('RELEASE-RECOVER-ONE-CMD: a failing stage stops the command — the later stages never run and the ledger keeps the failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-recover-stop-'));
+  setElanousConfigDir(root);
+  const previousExit = process.exitCode;
+  const cut = 'a'.repeat(40);
+  const pick = 'b'.repeat(40);
+  const saved = writeRecoverRun(root, 'r', cut);
+  const cutCalls: Array<{ append?: boolean; dryRun?: boolean }> = [];
+  let graphCalls = 0;
+  const cutBranch = (options: CutBranchOptions) => {
+    cutCalls.push({ ...(options.append === undefined ? {} : { append: options.append }), ...(options.dryRun === undefined ? {} : { dryRun: options.dryRun }) });
+    if (options.dryRun !== true) throw new Error(`release/${RECOVER_VERSION} remote tip moved — fast-forward refused (no force push)`);
+    return { branch: `release/${RECOVER_VERSION}`, commit: null, dryRun: true };
+  };
+  try {
+    const result = await invokeRecover(['--run', 'r', '--pick', pick, '--repo-root', root],
+      { root, cutBranch, graph: async () => { graphCalls++; return { status: 'done', runId: 'r' } as never; } });
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('append 단계에서 멈췄다');
+    expect(result.error).toContain('resume 단계는 실행하지 않았다');
+    expect(process.exitCode).toBe(1);
+    // The dry-run ran, the append failed, and the resume was never reached.
+    expect(cutCalls).toEqual([{ append: true, dryRun: true }, { append: true }]);
+    expect(graphCalls).toBe(0);
+    const ledger = JSON.parse(readFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'), 'utf8')) as
+      { attempts: string[]; recoveries: Array<{ stage: string; outcome: string; reason?: string }> };
+    expect(ledger.recoveries.map((stage) => [stage.stage, stage.outcome])).toEqual([['append-dry-run', 'ok'], ['append', 'failed']]);
+    expect(ledger.recoveries[1]!.reason).toContain('fast-forward refused');
+    // A stopped recovery consumes no resume attempt and leaves the saved run untouched.
+    expect(ledger.attempts).toEqual([]);
+    expect(readFileSync(saved.statePath, 'utf8')).toBe(saved.original);
+  } finally {
+    process.exitCode = previousExit ?? 0;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test('RELEASE-RECOVER-PREFLIGHT: a run the resume would refuse never moves release/<v> — the refusals are read-only before the append', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-recover-preflight-'));
+  setElanousConfigDir(root);
+  const previousExit = process.exitCode;
+  const seat = buildRecoverSeat(root);
+  writeRecoverRun(root, 'r', seat.cut);
+  const cutCalls: Array<{ append?: boolean; dryRun?: boolean }> = [];
+  const cutBranch = (options: CutBranchOptions) => {
+    cutCalls.push({ ...(options.append === undefined ? {} : { append: options.append }), ...(options.dryRun === undefined ? {} : { dryRun: options.dryRun }) });
+    throw new Error('append must not run for a refused run');
+  };
+  const refuse = async (args: string[]) => invokeRecover(args,
+    { root, repo: seat.work, cutBranch, graph: async () => ({ status: 'done', runId: 'r' }) as never });
+  const statePath = join(root, 'graph-runs', 'release-loop', 'r.json');
+  const branchAt = (): string => seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`);
+  try {
+    // A finished run is refused before any append — the branch stays on the cut.
+    writeFileSync(statePath, JSON.stringify({ ...(JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>), status: 'done' }));
+    let refused = await refuse(['--run', 'r', '--pick', seat.pick, '--repo-root', seat.work, '--no-partial']);
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toContain('is done — only a failed run is recovered; release/9.9.9 was not moved');
+    expect(branchAt()).toBe(seat.cut);
+    // A --from later than export-check is refused the same read-only way.
+    writeFileSync(statePath, JSON.stringify({ ...(JSON.parse(readFileSync(statePath, 'utf8')) as Record<string, unknown>), status: 'failed' }));
+    refused = await refuse(['--run', 'r', '--pick', seat.pick, '--from', 'gate', '--repo-root', seat.work, '--no-partial']);
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toContain('--from gate is later than export-check');
+    expect(refused.error).toContain('was not moved');
+    // A --from that is not on the saved path is refused too.
+    refused = await refuse(['--run', 'r', '--pick', seat.pick, '--from', 'tui', '--repo-root', seat.work, '--no-partial']);
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toContain('--from tui is not a node on the saved path of r');
+    // Every refusal happened before the append: no stage ran, no ledger was written, the branch never moved.
+    expect(cutCalls).toEqual([]);
+    expect(branchAt()).toBe(seat.cut);
+    expect(existsSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'))).toBe(false);
+  } finally {
+    process.exitCode = previousExit ?? 0;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test('RELEASE-RECOVER-REENTRY: a second recover with the same --pick reads the ledger append-ok and resumes without appending again', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-recover-reentry-'));
+  setElanousConfigDir(root);
+  const previousExit = process.exitCode;
+  const seat = buildRecoverSeat(root);
+  writeRecoverRun(root, 'r', seat.cut);
+  const args = ['--run', 'r', '--pick', seat.pick, '--repo-root', seat.work, '--no-partial'];
+  const graphCalls: Array<{ fromNodeId?: string; cutTip?: string }> = [];
+  try {
+    // First recover: the append lands on origin for real, then the resume stage fails (the graph explodes) and stops.
+    const first = await invokeRecover(args, { root, repo: seat.work, graph: async () => { throw new Error('gate exploded'); } });
+    expect(first.ok).toBe(false);
+    expect(first.error).toContain('resume 단계에서 멈췄다');
+    expect(first.stages.map((stage) => [stage.stage, stage.outcome]))
+      .toEqual([['append-dry-run', 'ok'], ['append', 'ok'], ['resume', 'failed']]);
+    const tip = seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`);
+    expect(tip).not.toBe(seat.cut);
+    // Second recover with the same --pick: the ledger already carries the append-ok at the branch tip, so
+    // cut-branch's «pick … is already in release/9.9.9» refusal is never reached — only the resume runs again.
+    const second = await invokeRecover(args, { root, repo: seat.work, graph: async (_path, options) => {
+      graphCalls.push({ ...(options?.fromNodeId === undefined ? {} : { fromNodeId: options.fromNodeId }),
+        ...(options?.releaseCommandSource?.cutTip === undefined ? {} : { cutTip: options.releaseCommandSource.cutTip }) });
+      return { status: 'done', runId: 'r' } as never;
+    } });
+    expect(second.ok).toBe(true);
+    expect(second.stages.map((stage) => stage.stage)).toEqual(['resume']);
+    expect(second.stages.map((stage) => stage.outcome)).toEqual(['ok']);
+    expect(second.stages[0]).toMatchObject({ from: 'export-check', commit: tip });
+    // The branch was not appended twice: origin still ends at the first recover's tip, and the graph ran from it.
+    expect(seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`)).toBe(tip);
+    expect(graphCalls).toEqual([{ fromNodeId: 'export-check', cutTip: tip }]);
+    // The ledger keeps the first recover's stages and gains only the second resume.
+    const ledger = JSON.parse(readFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'), 'utf8')) as
+      { attempts: string[]; recoveries: Array<{ stage: string; outcome: string; commit?: string }> };
+    expect(ledger.recoveries.map((stage) => [stage.stage, stage.outcome]))
+      .toEqual([['append-dry-run', 'ok'], ['append', 'ok'], ['resume', 'failed'], ['resume', 'ok']]);
+    expect(ledger.recoveries[1]!.commit).toBe(tip);
+    expect(ledger.attempts).toHaveLength(2);
+  } finally {
+    process.exitCode = previousExit ?? 0;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test('RELEASE-RECOVER-REENTRY: a second recover with a different --pick appends the new repair — the old append-ok never skips it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-recover-reentry-diff-pick-'));
+  setElanousConfigDir(root);
+  const previousExit = process.exitCode;
+  const seat = buildRecoverSeat(root);
+  // A second, different repair on main: the operator re-picks this one after the first resume failed.
+  writeFileSync(join(seat.work, 'fix2.txt'), 'fix2\n');
+  seatGit(seat.work, 'add', 'fix2.txt');
+  seatGit(seat.work, 'commit', '-q', '-m', `fix2 for ${RECOVER_VERSION}`);
+  const pick2 = seatGit(seat.work, 'rev-parse', 'HEAD');
+  seatGit(seat.work, 'push', '-q', 'origin', 'main');
+  writeRecoverRun(root, 'r', seat.cut);
+  const graphCalls: Array<{ fromNodeId?: string; cutTip?: string }> = [];
+  try {
+    // First recover with --pick A: the append lands on origin for real, then the resume stage fails and stops.
+    const first = await invokeRecover(['--run', 'r', '--pick', seat.pick, '--repo-root', seat.work, '--no-partial'],
+      { root, repo: seat.work, graph: async () => { throw new Error('gate exploded'); } });
+    expect(first.ok).toBe(false);
+    expect(first.stages.map((stage) => [stage.stage, stage.outcome]))
+      .toEqual([['append-dry-run', 'ok'], ['append', 'ok'], ['resume', 'failed']]);
+    const tipA = seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`);
+    // The ledger's append-ok names the pick list it appended.
+    const ledgerAfter = JSON.parse(readFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'), 'utf8')) as
+      { recoveries: Array<{ stage: string; outcome: string; pick?: string[] }> };
+    expect(ledgerAfter.recoveries[1]).toMatchObject({ stage: 'append', outcome: 'ok', pick: [seat.pick] });
+    // Second recover with --pick B: the ledger append-ok is for A, not B — B must be appended onto A's tip
+    // and pushed, not skipped as a re-entry.
+    const second = await invokeRecover(['--run', 'r', '--pick', pick2, '--repo-root', seat.work, '--no-partial'],
+      { root, repo: seat.work, graph: async (_path, options) => {
+        graphCalls.push({ ...(options?.fromNodeId === undefined ? {} : { fromNodeId: options.fromNodeId }),
+          ...(options?.releaseCommandSource?.cutTip === undefined ? {} : { cutTip: options.releaseCommandSource.cutTip }) });
+        return { status: 'done', runId: 'r' } as never;
+      } });
+    expect(second.ok).toBe(true);
+    expect(second.stages.map((stage) => stage.stage)).toEqual(['append-dry-run', 'append', 'resume']);
+    expect(second.stages.map((stage) => stage.outcome)).toEqual(['ok', 'ok', 'ok']);
+    const tipB = seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`);
+    expect(tipB).not.toBe(tipA);
+    // The new repair reached origin through the real push, on top of the first one.
+    expect(seatGit(seat.origin, 'show', `${tipB}:fix.txt`)).toBe('fix');
+    expect(seatGit(seat.origin, 'show', `${tipB}:fix2.txt`)).toBe('fix2');
+    expect(second.stages[1]!.commit).toBe(tipB);
+    // The graph resumed from the new tip, and the run names it.
+    expect(graphCalls).toEqual([{ fromNodeId: 'export-check', cutTip: tipB }]);
+    const ledger = JSON.parse(readFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'), 'utf8')) as
+      { attempts: string[]; recoveries: Array<{ stage: string; outcome: string; commit?: string; pick?: string[] }> };
+    expect(ledger.recoveries.map((stage) => [stage.stage, stage.outcome]))
+      .toEqual([['append-dry-run', 'ok'], ['append', 'ok'], ['resume', 'failed'], ['append-dry-run', 'ok'], ['append', 'ok'], ['resume', 'ok']]);
+    expect(ledger.recoveries[4]).toMatchObject({ stage: 'append', outcome: 'ok', commit: tipB, pick: [pick2] });
+    expect(ledger.attempts).toHaveLength(2);
+  } finally {
+    process.exitCode = previousExit ?? 0;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test('RELEASE-RECOVER-REENTRY: a repair the branch already carries stops with the direct-resume guidance in the error and the ledger', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-recover-already-in-'));
+  setElanousConfigDir(root);
+  const previousExit = process.exitCode;
+  const seat = buildRecoverSeat(root);
+  writeRecoverRun(root, 'r', seat.cut);
+  // A hand-run append already fast-forwarded release/9.9.9 to the pick — no recover ledger exists for it.
+  seatGit(seat.work, 'push', '-q', 'origin', `${seat.pick}:refs/heads/release/${RECOVER_VERSION}`);
+  const cutCalls: Array<{ append?: boolean; dryRun?: boolean }> = [];
+  const cutBranch = (options: CutBranchOptions) => {
+    cutCalls.push({ ...(options.append === undefined ? {} : { append: options.append }), ...(options.dryRun === undefined ? {} : { dryRun: options.dryRun }) });
+    return { branch: `release/${RECOVER_VERSION}`, commit: null, dryRun: true };
+  };
+  try {
+    const result = await invokeRecover(['--run', 'r', '--pick', seat.pick, '--repo-root', seat.work, '--no-partial'],
+      { root, repo: seat.work, cutBranch, graph: async () => ({ status: 'done', runId: 'r' }) as never });
+    expect(result.ok).toBe(false);
+    // The human's next step is named in the stop error and in the ledger: resume directly, nothing was appended.
+    expect(result.error).toContain('is already in release/9.9.9');
+    expect(result.error).toContain('release resume --run r --from export-check');
+    expect(result.error).toContain('append · resume 단계는 실행하지 않았다');
+    expect(cutCalls).toEqual([]);
+    expect(seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`)).toBe(seat.pick);
+    const ledger = JSON.parse(readFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'), 'utf8')) as
+      { attempts: string[]; recoveries: Array<{ stage: string; outcome: string; reason?: string }> };
+    expect(ledger.recoveries.map((stage) => [stage.stage, stage.outcome])).toEqual([['append-dry-run', 'failed']]);
+    expect(ledger.recoveries[0]!.reason).toContain('release resume --run r --from export-check');
+    expect(ledger.attempts).toEqual([]);
+  } finally {
+    process.exitCode = previousExit ?? 0;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);

@@ -21,19 +21,25 @@ describe('CHILD-LLM-PIN-POD — delegated Pod commands carry the child LLM', () 
     expect(script).toContain(`elanous harness ask 'docs/goals/X.md' --json '--base' 'main' --no-auto-merge${CARRIED} > /tmp/si.out`);
   });
 
-  test('(c) no child-llm args: delegated lines are unchanged and carry no child-llm flag', () => {
+  test('(c) no child-llm args: delegated lines carry no child-llm flag alongside the deadline marker', () => {
     const say = scriptOf(['--open-pr', '--base', 'main'], { authorSentence: true });
-    expect(lineOf(say, 'elanous harness say')).toContain(`elanous harness say --substrate local --json '--base' 'main' --no-auto-merge -- "$(cat /creds/feature)" > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?;`);
-    expect(say).not.toContain('--child-llm');
+    const sayLine = lineOf(say, 'elanous harness say')!;
+    expect(sayLine).toContain(`elanous harness say --substrate local --json '--base' 'main' --no-auto-merge -- "$(cat /creds/feature)"`);
+    expect(sayLine).not.toContain('--child-llm');
+    expect(say).toContain('/tmp/si.deadline-marker');
     const ask = scriptOf(['--open-pr', '--base', 'main'], { goalDoc: 'docs/goals/X.md' });
-    expect(lineOf(ask, 'elanous harness ask')).toStartWith(`elanous harness ask 'docs/goals/X.md' --json '--base' 'main' --no-auto-merge > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?;`);
-    expect(ask).not.toContain('--child-llm');
+    const askLine = lineOf(ask, 'elanous harness ask')!;
+    expect(askLine).toContain(`elanous harness ask 'docs/goals/X.md' --json '--base' 'main' --no-auto-merge`);
+    expect(askLine).not.toContain('--child-llm');
+    expect(ask).toContain('/tmp/si.deadline-marker');
   });
 
-  test('(d) legacy self implement line is unchanged — args pass through once, never doubled', () => {
+  test('(d) legacy self implement args pass through once beside the deadline marker', () => {
     const script = scriptOf(['--open-pr', '--base', 'main', ...CHILD], {});
-    expect(script).toContain(`elanous self implement "$(cat /creds/feature)" --json '--open-pr' '--base' 'main' '--child-llm-provider' 'openrouter' '--child-llm-model' 'openrouter/openai/gpt-6-luna' > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?`);
-    expect(script.split('--child-llm-provider').length - 1).toBe(1);
+    const legacyLine = lineOf(script, 'elanous self implement')!;
+    expect(legacyLine).toContain(`elanous self implement "$(cat /creds/feature)" --json '--open-pr' '--base' 'main' '--child-llm-provider' 'openrouter' '--child-llm-model' 'openrouter/openai/gpt-6-luna'`);
+    expect(legacyLine.split('--child-llm-provider').length - 1).toBe(1);
+    expect(script).toContain('/tmp/si.deadline-marker');
     expect(script).not.toContain('elanous harness say');
     expect(script).not.toContain('elanous harness ask');
   });

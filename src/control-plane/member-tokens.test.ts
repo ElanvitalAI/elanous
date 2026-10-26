@@ -19,9 +19,9 @@ test('issuance persists only a hash and timestamp; replacement and revocation in
   expect(contents).not.toContain(first);
   expect(contents).not.toContain(second);
   const parsed = JSON.parse(contents) as Record<string, { sha256: string; issuedAt: string }>;
-  expect(parsed.node-b.sha256).toBe(createHash('sha256').update(second).digest('hex'));
-  expect(parsed.node-b.issuedAt).toBe(listMemberTokens(dir)[0]?.issuedAt);
-  expect(listMemberTokens(dir)).toEqual([{ machine: 'node-b', issuedAt: parsed.node-b.issuedAt }]);
+  expect(parsed['node-b'].sha256).toBe(createHash('sha256').update(second).digest('hex'));
+  expect(parsed['node-b'].issuedAt).toBe(listMemberTokens(dir)[0]?.issuedAt);
+  expect(listMemberTokens(dir)).toEqual([{ machine: 'node-b', issuedAt: parsed['node-b'].issuedAt }]);
   expect(machineForToken(first, dir)).toBeUndefined();
   expect(machineForToken('random', dir)).toBeUndefined();
   expect(machineForToken(second, dir)).toBe('node-b');

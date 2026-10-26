@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseTsv, repairCardFor } from './gate-0226-failure-census';
@@ -8,6 +9,7 @@ const ROOT = join(import.meta.dir, '..');
 const ENTRY = join(ROOT, 'scripts/gate-0226-failure-census.ts');
 const TSV_REL = 'docs/reports/gate-0226-failure-census.tsv';
 const REPORT_REL = 'docs/reports/REPORT-gate-0226-failure-census.md';
+const BASELINE_REL = 'scripts/gate-0226-accepted-remaining-90.txt';
 const INTAKE = 'provider-intake';
 
 const scratch = mkdtempSync(join(tmpdir(), 'gate-0226-census-'));
@@ -17,8 +19,8 @@ afterAll(() => {
 
 type Ran = { rc: number; stdout: string; stderr: string };
 
-function runEntry(args: string[]): Ran {
-  const proc = Bun.spawnSync(['bun', 'run', ENTRY, ...args], { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+function runEntry(args: string[], cwd: string = ROOT): Ran {
+  const proc = Bun.spawnSync(['bun', 'run', ENTRY, ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
   return { rc: proc.exitCode ?? -1, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
 }
 
@@ -37,6 +39,7 @@ type AuditJson = {
   remainingIds: string[];
   acpLogEvents: number;
   ledger: { path: string; status: string; ids: number };
+  remainingBaseline: { path: string; status: string; ids: number };
 };
 
 function auditJson(args: string[] = []): { ran: Ran; audit: AuditJson } {
@@ -68,8 +71,84 @@ describe('gate-0226 실패 ID 전수표 검증 진입점', () => {
     const { rc, stdout } = runEntry([]);
     expect(stdout).toContain('rows: 96 (provider-intake 6 excluded → 90)');
     expect(stdout).toContain('no-acp: 0');
+    expect(stdout).toContain('remaining-baseline: compared scripts/gate-0226-accepted-remaining-90.txt (90)');
     expect(stdout.trimEnd().endsWith('census: PASS')).toBe(true);
     expect(rc).toBe(0);
+  });
+
+  test('GATE-0226-REMAINING-90 report retains status/owner follow-up evidence through the production entrypoint', () => {
+    const staged = stage('remaining-follow-up');
+    rewrite(staged.report, (text) => text.replace('## 90건 후속 조사와 남은 수리 칸', '## 후속 조사 누락'));
+    const { rc, stdout } = runStaged(staged);
+    expect(stdout).toContain('FAIL report-follow-up: 90건 후속 조사·상태·주인 근거 절이 없다');
+    expect(rc).toBe(1);
+  });
+
+  test('90건 보고서의 상태·주인 집계가 TSV 후속 대상과 일치한다', () => {
+    const rows = parseTsv(readFileSync(join(ROOT, TSV_REL), 'utf8'));
+    const header = rows[0]!;
+    const groupAt = header.indexOf('group');
+    const statusAt = header.indexOf('status');
+    const ownerAt = header.indexOf('owner');
+    const remaining = rows.slice(1).filter((row) => row[groupAt] !== INTAKE);
+    const tally = (at: number) => Object.fromEntries([...new Set(remaining.map((row) => row[at]!))]
+      .map((value) => [value, remaining.filter((row) => row[at] === value).length]));
+    expect(remaining).toHaveLength(90);
+    const baselineIds = readFileSync(join(ROOT, BASELINE_REL), 'utf8').split(/\r?\n/).filter((line) => line.length > 0 && !line.startsWith('#')).sort();
+    const remainingIds = remaining.map((row) => row[header.indexOf('test_id')]!).sort();
+    expect(baselineIds).toHaveLength(90);
+    expect(new Set(baselineIds).size).toBe(90);
+    expect(remainingIds).toEqual(baselineIds);
+    const evidenceAt = header.indexOf('evidence');
+    const trace = '조사 추적: REPORT-gate-0226-failure-census.md §90건 후속 조사와 남은 수리 칸 · §완료 경계 증거 대응';
+    expect(remaining.every((row) => row[evidenceAt]!.includes(trace))).toBe(true);
+    expect(tally(statusAt)).toEqual({
+      'hypothesis-unverified': 68,
+      'paired-reproduced-root-cause-candidate': 7,
+      untriaged: 15,
+    });
+    expect(tally(ownerAt)).toEqual({
+      MK: 31,
+      OP: 1,
+      'OP/TC': 1,
+      TC: 42,
+      'TC/OP gate': 1,
+      UX: 11,
+      'UX/Android·OP gate': 3,
+    });
+    const report = readFileSync(join(ROOT, REPORT_REL), 'utf8');
+    expect(report).toContain('`hypothesis-unverified` 68 · `paired-reproduced-root-cause-candidate` 7 · `untriaged` 15');
+  });
+
+  test('고정 accepted 기준 밖으로 비-intake ID를 바꾸면 production entrypoint가 누락·추가를 보고 실패한다', () => {
+    const staged = stage('remaining-id-drift');
+    const rows = parseTsv(readFileSync(staged.tsv, 'utf8'));
+    const header = rows[0]!;
+    const firstRemaining = rows.slice(1).find((row) => row[header.indexOf('group')] !== INTAKE)!;
+    const oldId = firstRemaining[header.indexOf('test_id')]!;
+    const newId = `${oldId} [mutated]`;
+    rewrite(staged.tsv, (text) => text.replace(oldId, newId));
+    rewrite(staged.report, (text) => text.replace(oldId, newId));
+
+    const repo = join(staged.dir, 'candidate-repo');
+    mkdirSync(join(repo, 'docs/reports'), { recursive: true });
+    mkdirSync(join(repo, 'scripts'), { recursive: true });
+    writeFileSync(join(repo, TSV_REL), readFileSync(staged.tsv, 'utf8'));
+    writeFileSync(join(repo, REPORT_REL), readFileSync(staged.report, 'utf8'));
+    writeFileSync(join(repo, BASELINE_REL), readFileSync(join(ROOT, BASELINE_REL), 'utf8'));
+    const git = (args: string[]) => {
+      const proc = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+      if (proc.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${proc.stderr}`);
+    };
+    git(['init', '-q']);
+    git(['config', 'user.email', 'census-test@example.invalid']);
+    git(['config', 'user.name', 'Census test']);
+    git(['add', TSV_REL, REPORT_REL, BASELINE_REL]);
+    git(['commit', '-qm', 'mutated census candidate']);
+    const committed = runEntry(['--tsv', join(repo, TSV_REL), '--report', join(repo, REPORT_REL), '--accepted', 'none'], repo);
+    expect(committed.stdout).toContain('FAIL remaining-baseline: 기준 90건 / TSV 90건 · 누락 1');
+    expect(committed.stdout).toContain('추가 1');
+    expect(committed.rc).toBe(1);
   });
 
   test('accepted 실패 ID 96건과 intake 6건을 뺀 90건이 중복 없이 보존된다', () => {

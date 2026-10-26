@@ -37,7 +37,50 @@ function writeSavedCursor(root: string, lastId: number): void {
   writeFileSync(cursorFile(root), JSON.stringify({ lastId, at: new Date().toISOString() }) + '\n');
 }
 
-export interface CollectSavedResult { cursorBefore: number; cursorAfter: number; messages: number; raws: number; dryRun: boolean; ingest?: IngestResult }
+export interface CollectSavedResult {
+  cursorBefore: number;
+  cursorAfter: number;
+  /** fetch 가 돌려준 «저장된 메시지» 수 — 커서 이후 읽은 것. */
+  messages: number;
+  /** 그중 savedMessageToRaws 가 0줄로 버린 메시지 수(빈 몸통) — «필터» 축. */
+  droppedByFilter: number;
+  /** 원장에 넣으려고 만든 입력 줄 수 — «원장 입력» 축. messages 와 다른 값이다. */
+  raws: number;
+  dryRun: boolean;
+  ingest?: IngestResult;
+}
+
+/** «메시지 0»·«원장 입력 0» 의 까닭 — 필터로 비었는지 다른 주체가 이미 가져갔는지 갈라 읽는다. */
+export type SavedCollectDiagnosis = 'new-items' | 'no-new-messages' | 'filtered-out' | 'already-consumed';
+
+export function diagnoseSavedCollect(res: CollectSavedResult): SavedCollectDiagnosis {
+  // 원장 입력이 있고 새로/합쳐 들어간 것이 있으면 정상 흡수다(dry-run 은 넣을 예정).
+  if (res.raws > 0 && (!res.ingest || res.ingest.added + res.ingest.merged > 0)) return 'new-items';
+  if (res.messages === 0) return 'no-new-messages';
+  if (res.droppedByFilter === res.messages) return 'filtered-out';
+  return 'already-consumed';
+}
+
+/** 사람이 읽는 한 덩이 — «메시지 0» 과 «원장 입력 0» 을 다른 줄로 갈라 보여준다. */
+export function renderCollectTelegramSavedResult(res: CollectSavedResult): string {
+  const lines = [
+    `텔레그램 저장된 메시지: 읽음 ${res.messages} · 필터로 버림 ${res.droppedByFilter} · 원장 입력 ${res.raws} · 커서 ${res.cursorBefore} → ${res.cursorAfter}${res.dryRun ? ' (dry-run · 안 씀)' : ''}`,
+  ];
+  if (res.ingest) lines.push(`원장: 새 ${res.ingest.added} · 합침 ${res.ingest.merged} · 이미 끝난 것 ${res.ingest.seen} · 버림 ${res.ingest.skipped}`);
+  const diagnosis = diagnoseSavedCollect(res);
+  if (diagnosis === 'no-new-messages') {
+    lines.push(`메시지 0 — 커서 ${res.cursorBefore} 이후 새 저장 메시지가 없다${res.cursorBefore > 0 ? ' (커서는 이미 다른 주체가 넘겼을 수 있다)' : ''}`);
+  } else if (diagnosis === 'filtered-out') {
+    lines.push(`원장 입력 0 은 필터 때문이다 — 링크·메모 문장이 없는 빈 메시지 ${res.droppedByFilter}건`);
+  } else if (diagnosis === 'already-consumed') {
+    lines.push(`원장 입력 ${res.raws} · 새 0 — 같은 항목을 다른 주체(queue)가 이미 가져갔다 (이미 끝난 것 ${res.ingest?.seen ?? 0})`);
+  } else if (res.dryRun) {
+    lines.push(`원장에 들어갈 것 ${res.raws}건 (dry-run — 쓰지 않았다)`);
+  } else {
+    lines.push(`원장에 새 것 ${res.ingest?.added ?? 0}건이 들어갔다`);
+  }
+  return lines.join('\n');
+}
 
 /**
  * 커서 이후 메시지를 한 번에 최대 max 개 읽어 원장에 넣고 커서를 옮긴다.
@@ -47,15 +90,21 @@ export interface CollectSavedResult { cursorBefore: number; cursorAfter: number;
 export async function collectTelegramSaved(root: string, fetch: FetchSavedMessages, opts: { max: number; dryRun?: boolean }): Promise<CollectSavedResult> {
   const cursorBefore = readSavedCursor(root);
   const messages = await fetch(cursorBefore, opts.max);
-  const raws = messages.flatMap(savedMessageToRaws);
+  const rowsPerMessage = messages.map(savedMessageToRaws);
+  const raws = rowsPerMessage.flat();
+  const droppedByFilter = rowsPerMessage.filter((rows) => rows.length === 0).length;
   const cursorAfter = messages.reduce((mx, m) => Math.max(mx, m.id), cursorBefore);
-  const result: CollectSavedResult = { cursorBefore, cursorAfter, messages: messages.length, raws: raws.length, dryRun: !!opts.dryRun };
+  const result: CollectSavedResult = { cursorBefore, cursorAfter, messages: messages.length, droppedByFilter, raws: raws.length, dryRun: !!opts.dryRun };
   if (!opts.dryRun) {
     result.ingest = ingestIntakeItems(root, 'telegram-saved', raws);
     if (cursorAfter > cursorBefore) writeSavedCursor(root, cursorAfter);
   }
-  // ⛔ 본문·링크는 싣지 않는다 — 커서와 건수만.
-  debug.log('intake.collect', 'telegram-saved', { cursorBefore, cursorAfter, messages: messages.length, raws: raws.length, dryRun: !!opts.dryRun });
+  // ⛔ 본문·링크는 싣지 않는다 — 커서와 건수만. 두 축(메시지·원장 입력)을 따로 남겨 사흘 0 을 갈라 읽게.
+  debug.log('intake.collect', 'telegram-saved', {
+    cursorBefore, cursorAfter, messages: messages.length, droppedByFilter, raws: raws.length,
+    ...(result.ingest ? { added: result.ingest.added, merged: result.ingest.merged, seen: result.ingest.seen, skipped: result.ingest.skipped } : {}),
+    diagnosis: diagnoseSavedCollect(result), dryRun: !!opts.dryRun,
+  });
   return result;
 }
 

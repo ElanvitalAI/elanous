@@ -63,6 +63,24 @@ async function run(messages: LLMMessage[], userText?: string): Promise<void> {
 }
 
 describe('runCoreTurn surface input isolation', () => {
+  test('passes the selected research surface to the tool-loop guard once', async () => {
+    spyOn(surfaceModule, 'resolveSessionSurfaceProfile').mockReturnValue({
+      id: 'research/agent', domain: 'research', selectionReason: 'test',
+      baselineContexts: [], defaultFamilies: [], conditionalFamilies: [],
+    } as unknown as ReturnType<typeof surfaceModule.resolveSessionSurfaceProfile>);
+    let researchTurn: boolean | undefined;
+    let dateLines = 0;
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, _handlers, opts) => {
+      researchTurn = opts?.researchTurn;
+      dateLines = messages.filter((message) => message.role === 'system'
+        && typeof message.content === 'string' && message.content.startsWith('Current local date:')).length;
+      return 'done';
+    });
+    await run([{ role: 'user', content: '최신 채권 금리 조사' }], '최신 채권 금리 조사');
+    expect(researchTurn).toBe(true);
+    expect(dateLines).toBe(1);
+  });
+
   test('emits capability.resolve/tool-tier-split from the real turn entry', async () => {
     const records: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
     spyOn(debug, 'log').mockImplementation((category, event, data) => {

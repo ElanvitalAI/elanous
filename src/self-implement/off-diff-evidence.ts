@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { narrowerEvidenceCommand } from './evidence-command-budget.js';
 import { resolveRunIdentity } from '../harness/harness-space.js';
+import { authoredSignalCommandFromGoal } from './goal-doc/section.js';
 //
 // ⛔ **왜 필요한가** — 리뷰어의 증거 채널은 워크트리 diff 하나다(`seams.ts` 의 `reviewDiff`).
 // 그래서 자식이 **diff 로 드러나지 않는 이행**(명령을 돌려 확인한 결과·라이브 관측)을 했을 때
@@ -334,6 +335,26 @@ interface RequiredEvidenceCheckRun {
   readonly substitutedFor?: string;
 }
 
+function authoredSignalCommand(goal: string): string | undefined {
+  const command = authoredSignalCommandFromGoal(goal);
+  if (!command) return undefined;
+  // Goal-authored signals run as one explicit command. Reject shell composition and
+  // substitutions; keep the accepted executable set aligned with goal-author's contract.
+  if (/[\r\n;|&<>`$()]/u.test(command) || /\b(?:sudo|eval|exec)\b/u.test(command)) return undefined;
+  const match = command.match(/^([A-Za-z0-9_./~-]+)\s+(.+)$/u);
+  if (!match) return undefined;
+  const executable = match[1]!.split('/').at(-1);
+  if (!new Set(['eln','bun','git','gh','rg','test','npm','pnpm','yarn','node','python','python3','pytest','make','cargo','go','curl','jq','sqlite3','grep','sed','awk','cat','find','docker','kubectl']).has(executable!)) return undefined;
+  if (executable === 'test' && !/^(?:-f|-e)\s+[^\s]+$/u.test(match[2]!)) return undefined;
+  return command;
+}
+
+export function authoredSignalExecution(goal: string, checks: readonly RequiredEvidenceCheckRun[]): { command: string; exitCode: number | null; stdout: string; stderr: string } | undefined {
+  const command = authoredSignalCommand(goal);
+  const run = command ? checks.find((check) => check.command === command) : undefined;
+  return run ? { command: run.command, exitCode: run.exitCode, stdout: run.stdout, stderr: run.stderr } : undefined;
+}
+
 type EvidenceCommandRunner = (command: string, cwd: string) => Pick<ReturnType<typeof spawnSync>, 'status' | 'stdout' | 'stderr' | 'error'>;
 
 /**
@@ -436,6 +457,8 @@ export function runRequiredEvidenceChecks(goal: string, cwd: string, runId?: str
 } = {}): RequiredEvidenceCheckRun[] {
   const identity = resolveRunIdentity({ explicit: runId });
   const checks = requiredEvidenceFromGoal(goal).flatMap(({ tag, verifyCommand }) => verifyCommand ? [{ tag, command: verifyCommand }] : []);
+  const signalCommand = authoredSignalCommand(goal);
+  if (signalCommand && !checks.some(({ command }) => command === signalCommand)) checks.push({ tag: 'authored-signal', command: signalCommand });
   // Direct callers without a measured HEAD have no stable revision identity;
   // the run-owned wrapper supplies a temporary identity when appropriate.
   const timeoutCounts = options.headCommit ? options.timeoutCounts : undefined;

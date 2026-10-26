@@ -9,7 +9,7 @@ import type { GitRunResult } from '../git-fs/retry.js';
 import { linkWorktreeDependencies, worktreeAddTimeoutForRepo } from '../git-fs/worktree.js';
 import { reapStaleGateWorktrees } from './gate-baseline-reap.js';
 
-export type GateFailureAttribution = 'introduced' | 'preexisting' | 'unknown' | 'precondition-unmet' | 'flaky-timeout' | 'flaky-rerun' | 'timeout-recheck-passed';
+export type GateFailureAttribution = 'introduced' | 'preexisting' | 'unknown' | 'precondition-unmet' | 'flaky-timeout' | 'flaky-rerun' | 'load-timeout';
 export type GateBaselinePresence = 'present' | 'missing' | 'unknown';
 export type TimeoutVariability = 'may-vary' | 'same' | 'unknown';
 
@@ -73,12 +73,13 @@ export interface GateBaselineReport extends GateBaselineSummary {
   baselineStatus: BaselineProcessStatus;
   log: string;
   timeoutRechecks?: TimeoutRecheckRecord[];
-  timeoutRecheckPassed?: number;
+  loadTimeout?: number;
 }
 
 export interface TimeoutRecheckRecord {
   name: string;
   file: string;
+  originalDiagnostic: string;
   result: 'pass' | 'timeout' | 'failure' | 'unknown';
   elapsedMs: number;
   rawResultLine: string;
@@ -707,7 +708,7 @@ function summarizeGateBaseline(failures: readonly GateTestFailure[]): GateBaseli
       if (failure.attribution === 'flaky-rerun') {
         return { ...withPresence, flakyRerun: withPresence.flakyRerun + 1 };
       }
-      if (failure.attribution === 'timeout-recheck-passed') {
+      if (failure.attribution === 'load-timeout') {
         return withPresence;
       }
       const withTimeoutRegression = failure.timeoutRegression === 'passed-at-base'
@@ -741,10 +742,15 @@ export function recheckTimeoutOnlyIntroducedFailures(
   report: GateBaselineReport,
   run: (cwd: string, file: string, name: string, timeoutMs: number) => { observation?: TimeoutRerunObservation; elapsedMs: number; output: string } = runTimeoutRecheck,
 ): GateBaselineReport {
+  const timeoutOnlyDiagnostic = (diagnostic: string | undefined): boolean => {
+    if (!diagnostic) return false;
+    const lines = diagnostic.split('\n').map((line) => line.trim()).filter(Boolean);
+    return lines.length === 1 && /^\^ this test timed out after \d+ms\.?$/i.test(lines[0]!);
+  };
   const eligible = report.failures.length > 0
     && report.introduced === report.failures.length
     && report.failures.every((failure) => failure.attribution === 'introduced' && !!failure.file
-      && /\bthis test timed out after \d+ms\b/i.test(failure.diagnostic ?? ''));
+      && timeoutOnlyDiagnostic(failure.diagnostic));
   if (!eligible) return report;
   const records: TimeoutRecheckRecord[] = [];
   const failures = report.failures.map((failure) => {
@@ -754,19 +760,19 @@ export function recheckTimeoutOnlyIntroducedFailures(
     const { observation, elapsedMs, output } = run(cwd, failure.file, name, 60_000);
     const result = observation ?? 'unknown';
     const record: TimeoutRecheckRecord = {
-      name: failure.name, file: failure.file, result, elapsedMs,
+      name: failure.name, file: failure.file, originalDiagnostic: failure.diagnostic ?? '', result, elapsedMs,
       rawResultLine: flattenControlChars(redactSecretText(output)).slice(-500),
     };
     records.push(record);
     debug.log('gate.baseline', 'timeout-recheck', record);
-    return result === 'pass' ? { ...failure, attribution: 'timeout-recheck-passed' as const } : failure;
+    return result === 'pass' ? { ...failure, attribution: 'load-timeout' as const } : failure;
   });
   return {
     ...report,
     ...summarizeGateBaseline(failures),
     failures,
     timeoutRechecks: records,
-    timeoutRecheckPassed: failures.filter((failure) => failure.attribution === 'timeout-recheck-passed').length,
+    loadTimeout: failures.filter((failure) => failure.attribution === 'load-timeout').length,
   };
 }
 
@@ -1074,6 +1080,35 @@ export function withBaselineWorktree<T>(cwd: string, baseRef: string, run: (base
     } catch (error) {
       debug.log('self-implement', 'gate.baseline.cleanup', { stage: 'exception', dir: baselineDir, error: String(error) });
     }
+  }
+}
+
+/** Keep the baseline checkout attached until every asynchronous shard has settled. */
+export async function withBaselineWorktreeAsync<T>(cwd: string, baseRef: string, run: (baselineDir: string) => Promise<T>): Promise<T | BaselineProcessResult> {
+  reapBeforeGateAdd(cwd);
+  const baselineDir = mkdtempSync(join(tmpdir(), 'elanous-gate-baseline-'));
+  let attached = false;
+  try {
+    const started = Date.now();
+    const addTimeout = worktreeAddTimeoutForRepo(cwd, undefined, baseRef);
+    const add = runGitCommand(cwd, gateWorktreeAddArgs(baselineDir, baseRef), { encoding: 'utf8', timeout: addTimeout.ms, killSignal: 'SIGKILL' });
+    const elapsedMs = Date.now() - started;
+    debug.log('self-implement.gate-baseline', 'worktree-add-result', {
+      phase: 'baseline', status: add.status, signal: add.signal ?? null, errorCode: add.errorCode ?? null,
+      elapsedMs, timeoutMs: addTimeout.ms, trackedFileCount: addTimeout.trackedFileCount,
+      timeoutSource: addTimeout.source, parentRssBytes: process.memoryUsage().rss,
+      cgroupMemoryCurrentBytes: cgroupMemoryBytes('memory.current'), cgroupMemoryLimitBytes: cgroupMemoryBytes('memory.max'),
+    });
+    if (add.status !== 0) return classifyBaselineWorktreeAddFailure(add, elapsedMs, addTimeout.ms, worktreeAddFailureContext(cwd, baselineDir, baseRef));
+    attached = true;
+    linkDependencies(cwd, baselineDir);
+    return await run(baselineDir);
+  } catch (error) {
+    return { status: 'unknown', unknownReason: 'infrastructure-failure', childResponsibility: 'none', log: `baseline setup failed: ${String(error)}` };
+  } finally {
+    removeGateWorktree(cwd, baselineDir, !attached);
+    try { rmSync(baselineDir, { recursive: true, force: true }); }
+    catch (error) { debug.log('self-implement', 'gate.baseline.cleanup', { stage: 'exception', dir: baselineDir, error: String(error) }); }
   }
 }
 
@@ -1570,7 +1605,7 @@ export function formatGateBaselineNote(report: GateBaselineReport, unrunImporter
     + `, unknown=${report.unknown}, precondition-unmet=${report.preconditionUnmet}`
     + (report.timedOut > 0 ? `, timed-out=${report.timedOut}` : '')
     + (report.flakyRerun > 0 ? `, flaky-rerun=${report.flakyRerun}` : '')
-    + ((report.timeoutRecheckPassed ?? 0) > 0 ? `, timeout-recheck-passed=${report.timeoutRecheckPassed}` : '')
+    + ((report.loadTimeout ?? 0) > 0 ? `, load-timeout=${report.loadTimeout}` : '')
     + (runId ? `, run=${runId}` : '')
     + (report.missingAtBase > 0 ? `, missing-at-base=${report.missingAtBase}` : '');
   const lines = report.failures.map((failure) => `- ${failure.attribution}: ${failure.name}`
@@ -1592,7 +1627,7 @@ export function formatGateBaselineNote(report: GateBaselineReport, unrunImporter
       ? `\n[gate-baseline] rerun not-run=${report.rerunNotRun}`
       : '';
   const timeoutRecheckLines = report.timeoutRechecks?.length
-    ? `\n[gate.baseline.timeout-recheck] ${report.timeoutRechecks.map((item) => `${item.name}: ${item.result} elapsed=${item.elapsedMs}ms · ${item.rawResultLine}`).join('\n')}`
+    ? `\n[gate.baseline.timeout-recheck] ${report.timeoutRechecks.map((item) => `${item.name}: ${item.result} elapsed=${item.elapsedMs}ms · original=${flattenControlChars(item.originalDiagnostic).slice(-500)} · ${item.rawResultLine}`).join('\n')}`
     : '';
   return `${head}\n${lines.join('\n')}\n${report.log}`
     + timedOutLine

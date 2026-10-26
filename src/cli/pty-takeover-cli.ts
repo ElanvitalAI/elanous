@@ -4,7 +4,7 @@ import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
-import { getPty, listPty, renamePty, requestPtyTakeover } from '../pty-shell/registry.js';
+import { getPty, listPty, renamePty, requestPtyTakeover, startPty, type StartOpts } from '../pty-shell/registry.js';
 import { describePtyRunState, describeTurnCell, formatTurnCell, ptyTurnViewOfRow, readCheckoutHead, readCurrentInstallRecord, shortSha, UNKNOWN_TURN_CELL, type InstalledRecord, type PtyRunStateView, type PtyTurnCell } from '../pty-shell/tui-run-state.js';
 import { getPtyManifest, isProcessAlive, listPtyManifest, listPtyManifestRows, listPtyManifestRowsAt, ptyManifestDbPath, readPtyManifestFrame, reapDeadPtyManifest, reapDeadPtyManifestAt, reapStalePtyManifest, removePtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, PTY_MANIFEST_STALE_MS, type PtyManifestExternalReapResult, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { readPtyEventsAfter, readPtyEventsAfterAt, type PtyEventLogReadResult, type PtyEventRow } from '../pty-shell/pty-event-log.js';
@@ -131,6 +131,10 @@ interface PtyLineageRow {
   readonly nestDepth?: number;
   readonly originRoot?: string;
   readonly controller?: string;
+  /** Copied from spawned/exited ledger payloads; omitted when the old event never recorded a seat. */
+  readonly seat?: string;
+  /** Cumulative bytes from the lifecycle payload; omitted when the old event never recorded a total. */
+  readonly outputBytesTotal?: number;
 }
 
 interface PtyLineageGroup {
@@ -164,6 +168,7 @@ function ptyLineageResult(groups: readonly PtyLineageGroup[], unreadablePayloads
 type PtyLifecyclePayload = {
   event?: unknown; ptyId?: unknown; kind?: unknown; instance?: unknown; runId?: unknown; runIdSource?: unknown; workdir?: unknown; codeSha?: unknown;
   parentPtyId?: unknown; parentPid?: unknown; parentKind?: unknown; startedAt?: unknown; closedAt?: unknown;
+  seat?: unknown; outputBytesTotal?: unknown;
 };
 
 function stringField(value: unknown): string { return typeof value === 'string' ? value : ''; }
@@ -182,6 +187,10 @@ function lineageRowFromManifest(row: PtyManifestRow & { readonly sourceRoot?: st
     ...(row.nestDepth !== undefined ? { nestDepth: row.nestDepth } : {}),
     ...(row.originRoot !== undefined ? { originRoot: row.originRoot } : {}),
     ...(row.controller !== undefined ? { controller: row.controller } : {}),
+    ...(row.seat ? { seat: row.seat } : {}),
+    ...(typeof row.outputBytesTotal === 'number' && Number.isFinite(row.outputBytesTotal) && row.outputBytesTotal > 0
+      ? { outputBytesTotal: row.outputBytesTotal }
+      : {}),
   };
 }
 
@@ -200,16 +209,17 @@ function lifecyclePatchFromEvent(row: PtyEventRow, payload: PtyLifecyclePayload)
   const assignRunIdSource = (): void => {
     if (typeof payload.runIdSource === 'string') patch.runIdSource = normalizeRunIdSource(payload.runIdSource);
   };
-  const assignNumber = <K extends 'startedAt' | 'closedAt' | 'parentPid'>(key: K): void => {
+  const assignNumber = <K extends 'startedAt' | 'closedAt' | 'parentPid' | 'outputBytesTotal'>(key: K): void => {
     if (typeof payload[key] === 'number' && Number.isFinite(payload[key])) patch[key] = payload[key] as PtyLineageRow[K];
   };
   for (const key of ['kind', 'parentPtyId', 'parentKind', 'runId', 'workdir', 'codeSha'] as const) assignString(key);
+  if (typeof payload.seat === 'string' && payload.seat) patch.seat = payload.seat;
   assignRunIdSource();
   if (typeof payload.instance === 'string') patch.instance = payload.instance;
   else if (event === 'spawned') patch.instance = row.instance;
   const sourceRoot = (row as PtyEventRow & { readonly sourceRoot?: string }).sourceRoot;
   if (sourceRoot) patch.sourceRoot = sourceRoot;
-  for (const key of ['startedAt', 'parentPid'] as const) assignNumber(key);
+  for (const key of ['startedAt', 'parentPid', 'outputBytesTotal'] as const) assignNumber(key);
   if (event === 'spawned' || event === 'seen-alive') {
     patch.alive = true;
     if (event === 'spawned') patch.closedAt = 0;
@@ -230,6 +240,10 @@ function mergeLifecyclePatch(previous: PtyLineageRow | undefined, patch: PtyLife
     ...patch,
     startedAt: base.startedAt || patch.startedAt || 0,
     ...(patch.workdir === undefined ? (base.workdir ? { workdir: base.workdir } : {}) : patch.workdir ? { workdir: patch.workdir } : {}),
+    ...(patch.seat === undefined ? (base.seat ? { seat: base.seat } : {}) : { seat: patch.seat }),
+    ...(patch.outputBytesTotal === undefined
+      ? (base.outputBytesTotal === undefined ? {} : { outputBytesTotal: base.outputBytesTotal })
+      : { outputBytesTotal: patch.outputBytesTotal }),
   };
 }
 
@@ -272,7 +286,15 @@ export function joinPtyLineage(
   for (const row of manifestRows) {
     if (manifestIds.has(row.id)) continue;
     manifestIds.add(row.id);
-    rows.set(row.id, lineageRowFromManifest(row));
+    const previous = rows.get(row.id);
+    const fromManifest = lineageRowFromManifest(row);
+    rows.set(row.id, {
+      ...fromManifest,
+      ...(fromManifest.seat === undefined && previous?.seat ? { seat: previous.seat } : {}),
+      ...(fromManifest.outputBytesTotal === undefined && previous?.outputBytesTotal !== undefined
+        ? { outputBytesTotal: previous.outputBytesTotal }
+        : {}),
+    });
   }
   const allRows = [...rows.values()];
   const byId = allRows.filter((row) => row.ptyId === query);
@@ -380,6 +402,8 @@ export function joinPtyLineage(
 
 export interface PtyTakeoverCommandDeps {
   getPty(id: string): PtyControlTarget | undefined;
+  /** Spawn a locally-owned PTY; default = registry startPty. */
+  startPty?(opts: StartOpts): PtyHandle;
   requestPtyTakeover(id: string, actor: 'human'): boolean;
   requestRemote(id: string, action: PtyControlAction, payload?: PtyControlPayload, options?: PtyControlRequestOptions): Promise<PtyControlResult>;
   /** Local (same-process) rename; default = registry renamePty. */
@@ -1492,7 +1516,9 @@ function ptyListJsonRow(row: PtyManifestRow, instance: string, sourceRoot: PtyMa
     ...provenanceFields(provenance),
     ownerProcessAlive: proof.liveness.alive,
     updatedAgeMs: proof.inactivity.ageMs,
-    outputBytesTotal: row.outputBytesTotal ?? 0,
+    // ⛔⭐ «미상 ≠ 0»: `outputBytesTotal` 가 optional 가 된 뒤로, 옛 스키마/NULL 행을 `0` 으로
+    //   채우면 «0바이트»라는 사실처럼 나온다. 미상은 'unknown' 으로 «보존»한다.
+    outputBytesTotal: row.outputBytesTotal ?? 'unknown',
     ...(row.lastControlAt === undefined ? {} : { lastControlAt: row.lastControlAt }),
     ...ptyAgeField(row.startedAt, observedAt),
     runTerminated,
@@ -2280,6 +2306,33 @@ export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverC
     await deps.registerObservationSink?.();
     const result = await start(); (result.exitCode === 0 ? process.stdout : process.stderr).write(`${result.message}\n`); if (result.notice) process.stderr.write(`${result.notice}\n`); process.exitCode = result.exitCode;
   };
+  pty.command('new')
+    .description('Spawn a named PTY and register it for later access')
+    .requiredOption('--name <name>', 'human-readable PTY name')
+    .option('--purpose <purpose>', 'what this PTY is for')
+    .option('--kind <kind>', 'PTY kind (default: shell)', 'shell')
+    .option('--cwd <path>', 'working directory for the command')
+    .argument('[command...]', 'command and arguments to run after --')
+    .action(async (command: string[] = [], options: { name: string; purpose?: string; kind: string; cwd?: string }) => {
+      await deps.registerObservationSink?.();
+      if (command.length === 0) {
+        process.stderr.write('pty new requires a command after --\n');
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const handle = (deps.startPty ?? startPty)({
+          cmd: command[0]!, args: command.slice(1), kind: options.kind, nickname: options.name,
+          ...(options.purpose ? { purpose: options.purpose } : {}),
+          ...(options.cwd ? { workdir: options.cwd } : {}),
+        });
+        process.stdout.write(`${handle.id}\t${options.name}\t${options.purpose ?? ''}\n`);
+        process.exitCode = 0;
+      } catch (error) {
+        process.stderr.write(`failed to spawn PTY: ${error instanceof Error ? error.message : String(error)}\n`);
+        process.exitCode = 1;
+      }
+    });
   pty.command('list')
     .description('List PTY ids available to other PTY commands')
     // ⭐ 하니스 자식은 **자기 워크트리 인스턴스**에 등록된다 — 부모 뿌리만 보면 안 보인다(실측).

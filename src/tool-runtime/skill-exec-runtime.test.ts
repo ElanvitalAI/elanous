@@ -94,6 +94,16 @@ describe('skill_exec runtime', () => {
     expect(result).toMatchObject({ skill: 'omni-digest', ok: true, output: 'skill output' });
   });
 
+  test('returns a large skill result verbatim to the parent tool boundary', async () => {
+    const report = Array.from({ length: 500 }, (_, index) => `# Section ${index + 1}\n${'research finding '.repeat(12)}`).join('\n');
+    setResearchInvoker(async () => ({ ok: true, output: report }));
+
+    const result = await dispatchSkillExec({ skill: 'omni-digest', task: 'return the full report' });
+
+    expect(result.output).toBe(report);
+    expect(result.output.length).toBeGreaterThan(50_000);
+  });
+
   test('rejects a whitespace-padded skill name rather than normalizing it', async () => {
     const result = await dispatchSkillExec({ skill: ' omni-digest ', task: 'do work' });
 

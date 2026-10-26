@@ -17,7 +17,7 @@ export function renderHqFenceWrapper({ entry, configDir, bun, logFile }: { entry
   if (!isAbsolute(bun)) throw new Error(`hq-fence: bun must be an absolute path: ${bun}`);
   const log = logFile ?? join(configDir, 'logs', 'hq-fence.log');
   return `#!/bin/sh
-# Arbiter (cloud-vm) outage: retain the lease, do not promote; hq fence owns that decision.
+# Arbiter outage: retain the lease, do not promote; hq fence owns that decision.
 ENTRY=${quote(entry)}
 CONFIG_DIR=${quote(configDir)}
 # cron has no PATH for bun — the absolute path was resolved when this wrapper was installed.

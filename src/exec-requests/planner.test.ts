@@ -111,9 +111,11 @@ test('missing and unknown model outputs are filled for graph and seat-answer row
     { seat: 'CMO', title: '10-08 데모 발표 자료 만들어 줘', graphId: 'demo', inputs: {}, after: [], output: 'weird' },
     { seat: 'CMO', title: '경쟁사 세 곳 비교 조사', graphId: '', inputs: {}, after: [0] },
   ];
-  const before = debug.events(500).length;
   const weird = await planExecRequest('자료와 조사', { ...base, judge: async () => rows });
-  expect(debug.events(500).slice(before).filter(ev => ev.category === 'exec.plan' && ev.event === 'default-output').map(ev => {
+  // The shared debug ring is capped at 500 events. A full ring stays at
+  // length 500 after this call, so slicing at its prior length loses the
+  // events emitted by the plan under a combined gate shard.
+  expect(debug.events(500).filter(ev => ev.category === 'exec.plan' && ev.event === 'default-output').slice(-2).map(ev => {
     const data = ev.data as { kind: string; source: string };
     return { kind: data.kind, source: data.source };
   }))
@@ -139,7 +141,6 @@ test('missing and unknown model outputs are filled for graph and seat-answer row
 test('model output survives on both graph and seat-answer rows; video needs an installed graph', async () => {
   const graphs = [{ id: 'video-graph', title: 'Video', description: '', path: '/video.yaml' }];
   expect(execPlanPrompt('발표', graphs, ['CMO'], [], null)).toContain('"output":"report|slides|research|post|video|answer"');
-  const before = debug.events(500).length;
   const plans = await planExecRequest('영상과 게시글', { graphs: async () => graphs, seats: () => ['CMO'], fieldFolder: () => null,
     judge: async () => [
       { seat: 'CMO', title: '영상', graphId: 'video-graph', inputs: {}, output: 'video' },
@@ -149,7 +150,7 @@ test('model output survives on both graph and seat-answer rows; video needs an i
     ],
   });
   expect(plans.map(({ output }) => output)).toEqual(['video', 'post', 'report', 'report']);
-  expect(debug.events(500).slice(before).filter(ev => ev.category === 'exec.plan' && ev.event === 'default-output').map(ev => {
+  expect(debug.events(500).filter(ev => ev.category === 'exec.plan' && ev.event === 'default-output').slice(-4).map(ev => {
     const data = ev.data as { kind: string; source: string };
     return { kind: data.kind, source: data.source };
   }))

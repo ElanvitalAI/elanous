@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { extractGoalDocSections } from './goal-doc/section.js';
+import { authoredSignalCommandFromBody, extractGoalDocSections } from './goal-doc/section.js';
 
 export interface SupervisorGoalFillEvidence {
   round: number;
@@ -13,6 +13,7 @@ export interface SupervisorGoalFillEvidence {
   baselineLine?: string;
   /** ⭐ **원천 그대로** — 독립 검사기가 writer 의 파싱 결과가 아니라 **로그를 직접** 다시 읽는다. */
   gateLog: string;
+  authoredSignal?: { command: string; exitCode: number | null; stdout: string; stderr: string };
 }
 
 export interface SupervisorGoalFillInput {
@@ -20,6 +21,7 @@ export interface SupervisorGoalFillInput {
   round: number;
   gate: { passed: boolean; log?: string; testStepExecuted?: boolean; scopeReason?: string };
   review?: { verdict: 'pass' | 'warn' | 'fail' };
+  authoredSignal?: SupervisorGoalFillEvidence['authoredSignal'];
   /** An external checker, deliberately separate from this writer/parser. */
   independentlyCheck: (document: string, evidence: SupervisorGoalFillEvidence) => Promise<boolean>;
   wiring?: 'wired' | 'unwired';
@@ -34,6 +36,8 @@ export interface SupervisorGoalDeficit {
   gateLog?: string;
   /** Decision branch, without gate log or goal text. */
   reason?: 'missing-section' | 'missing-invariant-slot' | 'missing-signal-slot' | 'gate-evidence-unverified' | 'review-unavailable' | 'goal-unwired' | 'slot-format' | 'authored-signal-command-mismatch' | 'independent-check-failed';
+  /** Safe, bounded detail for a decision branch (for example, the authored test files absent from the measured command). */
+  reasonDetail?: string;
   inputSummary?: { gatePassed: boolean; hasGateLog: boolean; hasReview: boolean; invariantSlot: boolean; signalSlot: boolean };
   gateLogRef?: string;
 }
@@ -85,6 +89,15 @@ function section(document: string, heading: string): { start: number; end: numbe
   })[0];
 }
 
+/** Accept only explicit Bun test-file lists; never interpret shell syntax or options as file coverage. */
+function testFiles(command: string): string[] | undefined {
+  const match = command.trim().match(/^bun\s+test\s+(.+)$/);
+  if (!match) return undefined;
+  const files = match[1].trim().split(/\s+/);
+  if (!files.length || files.some((file) => !/^[A-Za-z0-9_./-]+\.test\.(?:ts|tsx|js|jsx|mjs|cjs)$/.test(file))) return undefined;
+  return [...new Set(files)];
+}
+
 /**
  * ⛔ **두 절은 서로 다른 것을 말한다** — 같은 문자열을 양쪽에 넣으면 무엇도 검증하지 않는다(리뷰 must-fix).
  *   `불변식` = 이 골이 **지켜야 할 조건** · `판정 신호` = 그것을 **어떻게 관측하나**.
@@ -95,6 +108,10 @@ function invariantReplacement(evidence: SupervisorGoalFillEvidence): string {
 }
 
 function signalReplacement(evidence: SupervisorGoalFillEvidence): string {
+  if (evidence.authoredSignal) {
+    const output = `${evidence.authoredSignal.stdout}\n${evidence.authoredSignal.stderr}`.trim().slice(-1200) || '(출력 없음)';
+    return `- filled-by: supervisor@round-${evidence.round}\n  관측 — \`${evidence.authoredSignal.command}\` 실행 결과\n  이번 라운드 관측값 — exit ${evidence.authoredSignal.exitCode}\n  원문 출력 — ${output.replace(/\r?\n/g, ' ⏎ ')}\n  gate 검증 — ${evidence.command} · fail ${evidence.observedFail} · ${evidence.baselineLine ?? 'baseline not run (test PASS)'}\n  근거 — authored signal command executed in this run · review ${evidence.reviewVerdict}`;
+  }
   return `- filled-by: supervisor@round-${evidence.round}\n  관측 — \`${evidence.command}\` 요약 줄의 fail 수\n  이번 라운드 관측값 — fail ${evidence.observedFail}\n  근거 — round-${evidence.round} review ${evidence.reviewVerdict} · ${evidence.baselineLine ?? 'baseline not run (test PASS)'}`;
 }
 
@@ -146,9 +163,25 @@ export async function fillUnverifiableGoalSlots(input: SupervisorGoalFillInput):
   if (input.wiring === 'unwired') { deficit('goal-unwired'); return 'unverifiable'; }
   // The authored completion signal must name the test we actually measured.
   if (!signalSlot) {
-    const authoredCommand = signals.body.match(/^\s*- Condition:\s*(bun test\s+[^\r\n]+?)(?:\s+를 실행한다)?\s*$/m)?.[1]?.trim();
-    if (!authoredCommand || authoredCommand !== gateEvidence.command) {
-      deficit('authored-signal-command-mismatch'); return 'unverifiable';
+    const authoredCommand = authoredSignalCommandFromBody(signals.body);
+    const authoredFiles = authoredCommand ? testFiles(authoredCommand) : undefined;
+    const measuredFiles = testFiles(gateEvidence.command);
+    const missingFiles = authoredFiles && measuredFiles ? authoredFiles.filter((file) => !measuredFiles.includes(file)) : [];
+    const signalRun = input.authoredSignal;
+    const signalMeasured = authoredCommand && signalRun?.command === authoredCommand && signalRun.exitCode === 0;
+    if (!signalMeasured) {
+      const observation: SupervisorGoalDeficit = {
+        evidenceId: createHash('sha256').update(JSON.stringify([input.path, input.round, original])).digest('hex').slice(0, 16),
+        kind: 'unverified', previousEvidence: original, round: input.round,
+        ...(input.gate.log !== undefined ? { gateLog: input.gate.log } : {}),
+        reason: 'authored-signal-command-mismatch',
+        reasonDetail: missingFiles.length ? `authored test file(s) absent from passing gate command: ${missingFiles.join(', ')}`
+          : 'authored command has no matching successful execution evidence',
+        inputSummary: { gatePassed: input.gate.passed, hasGateLog: Boolean(input.gate.log), hasReview: Boolean(input.review), invariantSlot, signalSlot },
+        ...(input.gate.log ? { gateLogRef: `sha256:${createHash('sha256').update(input.gate.log).digest('hex').slice(0, 16)}` } : {}),
+      };
+      input.observeDeficit?.(observation);
+      return 'unverifiable';
     }
   }
 
@@ -159,6 +192,7 @@ export async function fillUnverifiableGoalSlots(input: SupervisorGoalFillInput):
     observedFail: gateEvidence.observedFail,
     ...(gateEvidence.baselineLine ? { baselineLine: gateEvidence.baselineLine } : {}),
     gateLog: input.gate.log ?? '',
+    ...(input.authoredSignal ? { authoredSignal: input.authoredSignal } : {}),
   };
   const invariantBody = replaceUnverifiableSlot(invariant.body, invariantReplacement(evidence));
   const signalBody = signalSlot ? replaceUnverifiableSlot(signals.body, signalReplacement(evidence))

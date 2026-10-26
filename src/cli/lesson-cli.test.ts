@@ -47,6 +47,50 @@ test('Commander add/recur/candidates --json round-trip, find/show and actor iden
   }
 });
 
+test('lesson add --authoring appends the canonical JSONL schema and resolves matching pending rows', () => {
+  const repo = root();
+  const stateDir = root();
+  const lines: string[] = [];
+  const program = new Command();
+  registerLessonCommands(program, { stateDir }, { log: line => lines.push(line) });
+  const beforeCwd = process.cwd();
+  const beforeActor = process.env.AI_AGENT;
+  const exitCode = process.exitCode;
+  const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
+  const run = (...args: string[]) => { lines.length = 0; program.parse(['lesson', ...args], { from: 'user' }); return lines[0]; };
+  try {
+    mkdirSync(join(repo, 'docs/goal-context'), { recursive: true });
+    const file = join(repo, 'docs/goal-context/05-authoring-lessons.jsonl');
+    writeFileSync(file, `${JSON.stringify({ ts: '2026-10-20T00:00:00Z', by: 'TC', source: 'run-1', cell: 'G1', class: 'b-stale-path', diag: 'old target', action: 'revise', lesson: 'verify paths', run: '', card: '', launch: '', goalSha: '', paths: 'src/old.ts', model: '', host: '', evidence: '', rule: '', ms: '', outcome: 'pending' })}\n`);
+    process.chdir(repo);
+    process.env.AI_AGENT = 'MK';
+    const common = ['--authoring', '--source', 'run-2', '--cell', 'G1', '--class', 'b-stale-path', '--diag', 'same failure', '--action', 'update target', '--lesson', 'Check current path', '--paths', 'src/new.ts', '--by', 'MK'];
+    expect(run('add', ...common, '--resolve-pending', 'fixed')).toContain('저작 교훈 추가');
+    const rows = readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ cell: 'G1', class: 'b-stale-path', outcome: 'fixed' });
+    expect(rows[1]).toMatchObject({ source: 'run-2', by: 'MK', cell: 'G1', class: 'b-stale-path', outcome: 'pending' });
+    expect(Object.keys(rows[1])).toEqual(['ts', 'by', 'source', 'cell', 'class', 'diag', 'action', 'lesson', 'run', 'card', 'launch', 'goalSha', 'paths', 'model', 'host', 'evidence', 'rule', 'ms', 'outcome']);
+    expect(run('add', '--authoring', '--source', 'run-3')).toBeUndefined();
+    expect(stderr).toHaveBeenLastCalledWith(expect.stringContaining('authoring fields required'));
+    expect(process.exitCode).toBe(1);
+    process.exitCode = 0;
+    expect(run('add', '--authoring', '--source', 'run-3', '--cell', 'G2', '--class', 'env-custom-signal', '--diag', 'environment signal', '--action', 'observe', '--lesson', 'Keep the environment signal explicit', '--by', 'MK')).toContain('저작 교훈 추가');
+    expect(readFileSync(file, 'utf8')).toContain('"class":"env-custom-signal"');
+    const invalidClass = ['add', '--authoring', '--source', 'run-4', '--cell', 'G3', '--class', 'other', '--diag', 'diag', '--action', 'act', '--lesson', 'lesson', '--by', 'MK'];
+    expect(run(...invalidClass)).toBeUndefined();
+    expect(stderr).toHaveBeenLastCalledWith('lesson add: --class is not in the authoring lesson class set\n');
+    expect(process.exitCode).toBe(1);
+  } finally {
+    stderr.mockRestore();
+    process.exitCode = exitCode ?? 0;
+    process.chdir(beforeCwd);
+    if (beforeActor === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = beforeActor;
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('import --json previews an isolated repository without writing; --apply uses actor and stays idempotent', () => {
   const repo = root();
   const stateDir = root();

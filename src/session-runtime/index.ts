@@ -1,5 +1,6 @@
 import { buildGitSnapshot } from '../git-fs/index.js';
 import { debug } from '../debug/log.js';
+import { isResearchAgentIntent } from '../tool-hints/signals.js';
 import { resolve } from 'node:path';
 import type { ModelFamily } from '../models/prompts.js';
 import type { InputSourceKind, InputSourceRef } from '../input/input-source-kind.js';
@@ -125,6 +126,13 @@ export interface SessionTurnProfile {
   inputMode: 'general' | 'control';
   inputSource: InputSourceRef | null;
   inputSourceKind: InputSourceKind | null;
+}
+
+/** A date anchor for research answers. Keep this local to the turn so a
+ *  long-lived session never presents yesterday as today's date. */
+export function buildResearchDateSystemMessage(now = new Date()): LLMMessage {
+  const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  return { role: 'system', content: `Current local date: ${localDate}. Verify dates in sources; do not infer freshness from an undated result.` };
 }
 
 export interface SessionModeSnapshot {
@@ -2412,27 +2420,6 @@ const WEB_SEARCH_PROVIDER_TERMS = [
   'claude',
 ] as const;
 
-const DEEP_RESEARCH_INTENT_TERMS = [
-  'research',
-  'deep research',
-  'triangulate',
-  'compare sources',
-  'multiple sources',
-  'community reaction',
-  'reddit reaction',
-  'x reaction',
-  'trend',
-  'sentiment',
-  '여러 소스',
-  '깊게 조사',
-  '리서치',
-  '반응',
-  '트렌드',
-  '여론',
-  '비교 조사',
-  '교차검증',
-] as const;
-
 const WEB_FETCH_INTENT_TERMS = [
   'http://',
   'https://',
@@ -2647,7 +2634,7 @@ function hasWebSearchExposureIntent(text: string): boolean {
 }
 
 function hasResearchSearchIntent(text: string): boolean {
-  return matchesIntentLexicon(text, DEEP_RESEARCH_INTENT_TERMS);
+  return isResearchAgentIntent(text);
 }
 
 function hasWebFetchIntent(text: string): boolean {

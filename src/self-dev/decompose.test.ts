@@ -137,6 +137,77 @@ describe('parseSelfDevDecomposition', () => {
 });
 
 describe('foldRegistrationOnlyGoals', () => {
+  test('DOCTOR-RX-SLICE: partitions explicit parent targets and gives both children one-line completion criteria', async () => {
+    const parentTargets = ['src/doctor/visit.ts', 'src/doctor/repair.ts'];
+    const result = await decomposeSelfDevGoal(`too-big goal\n대상 경로: ${parentTargets.join(' · ')}`, {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+      ] }),
+    });
+
+    expect(result.goals).toHaveLength(2);
+    const childTargets = result.goals.map((goal) => goal.hotPaths ?? []);
+    expect(childTargets[0]!.filter((path) => childTargets[1]!.includes(path))).toEqual([]);
+    expect([...new Set(childTargets.flat())].sort()).toEqual([...parentTargets].sort());
+    for (const goal of result.goals) {
+      const criteria = goal.feature.match(/^완료 기준: .+$/gm) ?? [];
+      expect(criteria).toHaveLength(1);
+    }
+  });
+
+  test('partitions parent targets while preserving a helper explicitly declared in one child target line', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit' },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts', 'src/doctor/helper.ts'], ['src/doctor/repair.ts'],
+    ]);
+    expect(result.goals.every((goal) => goal.feature.match(/^완료 기준: .+$/gm)?.length === 1)).toBe(true);
+  });
+
+  test('partitions parent targets while preserving distinct helpers explicitly declared by each child', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/visit-helper.ts\nImplement visit' },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts · src/doctor/repair-helper.ts\nImplement repair' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts', 'src/doctor/visit-helper.ts'],
+      ['src/doctor/repair.ts', 'src/doctor/repair-helper.ts'],
+    ]);
+    expect(result.goals.every((goal) => goal.feature.match(/^완료 기준: .+$/gm)?.length === 1)).toBe(true);
+  });
+
+  test('keeps the original decomposition when both children explicitly target the same external helper', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit' },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts · src/doctor/helper.ts\nImplement repair' },
+      ] }),
+    });
+    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
+      ['src/doctor/visit.ts', 'src/doctor/helper.ts'],
+      ['src/doctor/repair.ts', 'src/doctor/helper.ts'],
+    ]);
+    expect(result.goals.every((goal) => !goal.feature.includes('완료 기준:'))).toBe(true);
+  });
+
+  test('keeps one completion criterion in the inferred partition branch', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\n완료 기준: visit check\n완료 기준: second visit check' },
+        { id: 'repair', feature: 'Implement repair' },
+      ] }),
+    });
+    expect(result.goals.every((goal) => goal.feature.match(/^완료 기준: .+$/gm)?.length === 1)).toBe(true);
+    expect(result.goals[0]?.feature).toContain('완료 기준: visit check · second visit check');
+  });
+
   test('splits two pathless implementation children into disjoint target paths with a check for each', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts\nImplement the two units', {
       llm: async () => JSON.stringify({ subtasks: [
@@ -214,7 +285,19 @@ describe('foldRegistrationOnlyGoals', () => {
     expect(result.goals.every((goal) => (goal.hotPaths ?? []).length > 0)).toBe(true);
   });
 
-  test('preserves both explicit child targets instead of repartitioning them', async () => {
+  test('normalizes repeated completion criteria to exactly one line', async () => {
+    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
+      llm: async () => JSON.stringify({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\n완료 기준: first check\n완료 기준: second check' },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\n완료 기준: repair check' },
+      ] }),
+    });
+
+    expect(result.goals[0]?.feature.match(/^완료 기준: .+$/gm)).toEqual(['완료 기준: first check · second check']);
+    expect(result.goals[1]?.feature.match(/^완료 기준: .+$/gm)).toEqual(['완료 기준: repair check']);
+  });
+
+  test('keeps disjoint explicit child targets and adds one completion criterion to each', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
       llm: async () => JSON.stringify({ subtasks: [
         { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
@@ -224,7 +307,10 @@ describe('foldRegistrationOnlyGoals', () => {
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
       ['src/doctor/visit.ts'], ['src/doctor/repair.ts'],
     ]);
-    expect(result.goals.every((goal) => !goal.feature.includes('완료 기준:'))).toBe(true);
+    expect(result.goals.map((goal) => goal.feature.match(/^완료 기준: .+$/gm))).toEqual([
+      ['완료 기준: src/doctor/visit.ts의 변경을 확인하고 관련 시험을 통과한다.'],
+      ['완료 기준: src/doctor/repair.ts의 변경을 확인하고 관련 시험을 통과한다.'],
+    ]);
   });
 
   test('gives the remaining parent target to the pathless child when its sibling declares one', async () => {
@@ -333,18 +419,47 @@ describe('foldRegistrationOnlyGoals', () => {
     expect(result.goals[1]?.feature).not.toContain('완료 기준:');
   });
 
-  test('does not split when both children also edit the same non-parent path', async () => {
-    const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'] },
-        { id: 'repair', feature: 'Implement repair', hotPaths: ['src/shared.ts'] },
-      ] }),
+  test.each([
+    ['children only declare distinct parent targets', [
+      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
+      { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+    ]],
+    ['children declare distinct targets and share a parent-external reference', [
+      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'] },
+      { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair', hotPaths: ['src/shared.ts'] },
+    ]],
+    ['one child declares its target and only that child has an external reference', [
+      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'] },
+      { id: 'repair', feature: 'Implement repair flow' },
+    ]],
+    ['one child declares its target and both children have different external references', [
+      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'] },
+      { id: 'repair', feature: 'Implement repair flow', hotPaths: ['docs/doctor/guide.md'] },
+    ]],
+    ['pathless children have one-sided external reference', [
+      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'] },
+      { id: 'repair', feature: 'Implement repair flow' },
+    ]],
+    ['pathless children have different external references', [
+      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'] },
+      { id: 'repair', feature: 'Implement repair flow', hotPaths: ['docs/doctor/guide.md'] },
+    ]],
+    ['pathless children share only a parent-external reference', [
+      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'] },
+      { id: 'repair', feature: 'Implement repair', hotPaths: ['src/shared.ts'] },
+    ]],
+  ])('separates targets from shared parent-external references (%s)', async (_case, subtasks) => {
+    const parentTargets = ['src/doctor/visit.ts', 'src/doctor/repair.ts'];
+    const result = await decomposeSelfDevGoal(`대상 경로: ${parentTargets.join(' · ')}`, {
+      llm: async () => JSON.stringify({ subtasks }),
     });
-    expect(result.goals.map((goal) => goal.feature.includes('완료 기준:'))).toEqual([false, false]);
-    expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
-      ['src/shared.ts', 'src/doctor/visit.ts', 'src/doctor/repair.ts'],
-      ['src/shared.ts', 'src/doctor/visit.ts', 'src/doctor/repair.ts'],
-    ]);
+    const childTargets = result.goals.map((goal) => goal.hotPaths ?? []);
+    expect(result.goals).toHaveLength(2);
+    expect(childTargets[0]!.filter((path) => childTargets[1]!.includes(path))).toEqual([]);
+    expect([...new Set(childTargets.flat())].sort()).toEqual([...parentTargets].sort());
+    for (const goal of result.goals) {
+      expect(goal.feature.match(/^완료 기준: .+$/gm)).toHaveLength(1);
+    }
   });
 
   test('does not split when a child names a parent path outside its target line', async () => {

@@ -334,10 +334,31 @@ export interface PodTermination {
   finishedAt: string | PodTerminationUnknown;
   /** From `state.terminated.reason === 'OOMKilled'` only (never from exit code 137). */
   oomKilled: boolean | PodTerminationUnknown;
+  /** A terminal verdict can race Kubernetes container status; one bounded Pod re-read records the outcome. */
+  collectionAttempts?: 2;
+  collectionFailureReason?: 'pod-still-running-after-retry' | 'pod-absent-after-retry' |
+    'pod-read-unavailable-after-retry' | 'terminated-fields-missing-after-retry' | 'pod-state-unknown-after-retry';
 }
 
-/** Job Failed condition reason first: the classification takes column one, the capture all three, from one read. */
-export const POD_TERMINATION_JOB_JSONPATH = '{.status.conditions[?(@.type=="Failed")].reason}{"\\t"}{.spec.activeDeadlineSeconds}{"\\t"}{.metadata.uid}';
+/** FailureTarget can precede Failed at the deadline. Read both in the same Job snapshot. */
+export const POD_TERMINATION_JOB_JSONPATH = '{.status.conditions[?(@.type=="Failed")].reason}{"|"}{.status.conditions[?(@.type=="FailureTarget")].reason}{"\\t"}{.spec.activeDeadlineSeconds}{"\\t"}{.metadata.uid}';
+
+export function podJobConditionReason(value: string | undefined): string {
+  const [failed, target] = (value ?? '').split('|');
+  return terminationWord(failed || target);
+}
+
+/** Emitted by the Pod wrapper before the Job's hard deadline, scoped to this Job and child run. */
+export function podDeadlineResultMarker(logs: string, job: string, runId: string): { stage: string; pr: number | null; branch: string | null } | null {
+  if (!/^[A-Za-z0-9_.:-]+$/.test(job) || !/^[A-Za-z0-9_.:-]+$/.test(runId)) return null;
+  const prefix = `ELANOUS_POD_DEADLINE_RESULT ${job} ${runId} stop-cause=deadline `;
+  for (const line of logs.split('\n').reverse()) {
+    if (!line.startsWith(prefix)) continue;
+    const match = /^stage=(clone|setup|run|unknown) pr=(unknown|[1-9]\d*) branch=(unknown|[A-Za-z0-9_./-]+)$/.exec(line.slice(prefix.length).trim());
+    if (match) return { stage: match[1]!, pr: match[2] === 'unknown' ? null : Number(match[2]), branch: match[3] === 'unknown' ? null : match[3]! };
+  }
+  return null;
+}
 /**
  * One row per Pod of this Job name. The first three columns keep the classification read's layout
  * (`creation · terminated.reason · terminated.exitCode`, empty when the child has no status yet), so the
@@ -384,7 +405,7 @@ export function readPodTermination(input: { kubectl: PodTerminationKubectl; name
   const jobUid = input.jobUid && JOB_UID.test(input.jobUid) ? input.jobUid : undefined;
   // A read without a uid, or with another uid, is not this launch's Job.
   const jobOk = jobRead?.status === 0 && jobUid !== undefined && readUid === jobUid;
-  const jobConditionReason = jobOk ? terminationWord(reasonText) : 'unknown';
+  const jobConditionReason = jobOk ? podJobConditionReason(reasonText) : 'unknown';
   const podsRead = 'podsRead' in input ? input.podsRead ?? null
     : read(['-n', namespace, 'get', 'pods', '-l', `job-name=${job}`, '-o', `jsonpath=${POD_TERMINATION_PODS_JSONPATH}`]);
   let podLookup: PodTermination['podLookup'] = 'unavailable';
@@ -444,7 +465,11 @@ export function parsePodTermination(value: unknown, job: string): PodTermination
     || !oneOf(row.podLookup, ['terminated', 'running', 'pending', 'unknown', 'absent', 'unavailable'])
     || !wordOrUnknown(row.containerReason) || !numberOrUnknown(row.exitCode)
     || !(row.finishedAt === 'unknown' || (typeof row.finishedAt === 'string' && terminationInstant(row.finishedAt) !== 'unknown'))
-    || !boolOrUnknown(row.oomKilled)) return undefined;
+    || !boolOrUnknown(row.oomKilled)
+    || (row.collectionAttempts !== undefined && row.collectionAttempts !== 2)
+    || (row.collectionFailureReason !== undefined && !oneOf(row.collectionFailureReason, [
+      'pod-still-running-after-retry', 'pod-absent-after-retry', 'pod-read-unavailable-after-retry',
+      'terminated-fields-missing-after-retry', 'pod-state-unknown-after-retry']))) return undefined;
   // Facts are attributed through the uid only: a record claiming Job or Pod facts without one is contradictory.
   if (row.jobUid === 'unknown' && (row.jobLookup !== 'unavailable' || row.podLookup !== 'unavailable')) return undefined;
   return {
@@ -455,5 +480,7 @@ export function parsePodTermination(value: unknown, job: string): PodTermination
     podLookup: row.podLookup as PodTermination['podLookup'], containerReason: row.containerReason as string,
     exitCode: row.exitCode as PodTermination['exitCode'], finishedAt: row.finishedAt as string,
     oomKilled: row.oomKilled as PodTermination['oomKilled'],
+    ...(row.collectionAttempts === 2 ? { collectionAttempts: 2 as const } : {}),
+    ...(row.collectionFailureReason ? { collectionFailureReason: row.collectionFailureReason as PodTermination['collectionFailureReason'] } : {}),
   };
 }

@@ -10,6 +10,7 @@ import { GraphEditor, GraphEditorPalette, GraphShareControl } from './GraphEdito
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
 import { createNexusClient, NexusApiError } from '@/nexus/client';
 import { QueryClient } from '@tanstack/react-query';
+import { nexusKeys } from '@/nexus/hooks/query-keys';
 import { parse as parseYaml } from 'yaml';
 import { graphEditorNodeGroups } from './graph-editor-mode';
 import { grantCanvasGraphAccess, saveCanvasGraph, shareableCanvasGraphId } from './graph-canvas-save';
@@ -211,14 +212,21 @@ describe('GraphEditorPalette', () => {
     const client = createNexusClient({ baseUrl: 'http://localhost', fetchImpl: (async (input) => {
       const path = new URL(String(input)).pathname;
       if (path === '/v1/graph/kinds') return Response.json({ kinds: palette.filter((entry) => new URL(String(input)).searchParams.get('graph') === entry.graph) });
+      if (path === '/v1/workflows/runs/pending') return Response.json({ pending: [] });
+      if (path === '/v1/workflows/runs') return Response.json({ runs: [] });
       return Response.json({ graphs: [], workflows: [] });
     }) as typeof fetch });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Seed the approval query before the first render so this test observes
+    // the real response shape even when a fast runner would otherwise finish
+    // before the background fetch resolves.
+    await queryClient.prefetchQuery({ queryKey: nexusKeys.pendingApprovals(), queryFn: () => client.getPendingApprovals() });
     let root: ReturnType<typeof create> | undefined;
     const hadWindow = 'window' in globalThis;
     const priorWindow = (globalThis as { window?: unknown }).window;
     (globalThis as { window?: unknown }).window = { addEventListener() {}, removeEventListener() {}, history: { replaceState() {} } };
     try {
-      await act(async () => { root = create(<NexusProvider client={client} queryClient={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><GraphEditor /></NexusProvider>); });
+      await act(async () => { root = create(<NexusProvider client={client} queryClient={queryClient}><GraphEditor /></NexusProvider>); });
       expect(root!.root.findAllByType(ReactFlow)).toHaveLength(1);
       const buttons = root!.root.findAllByType('button');
       await act(async () => { buttons.find((button) => button.children.includes('워크플로 목록'))!.props.onClick(); });

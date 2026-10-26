@@ -8,7 +8,8 @@ import { join } from 'node:path';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 import { RemotesStore } from './remotes.js';
 import { federatedPtyRefs, findPtyManifestRows, joinPtyLineage, ptyGitDiscoveryEnv, registerPtyTakeoverCommands, resolvePtyWorktreeProvenance, runPtyFind, runPtyLineage, runPtyList, runPtyReap, runPtyRelease, runPtyRetire, runPtySnapshot, runPtyText, runPtyMouse, type PtyTakeoverCommandDeps } from './pty-takeover-cli.js';
-import { PTY_MANIFEST_CLOSED_TTL_MS, reapDeadPtyManifestAt, setPtyManifestDbPathForTesting, upsertPtyManifest, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
+import { PTY_MANIFEST_CLOSED_TTL_MS, getPtyManifest, listPtyManifestRows, reapDeadPtyManifestAt, setPtyManifestDbPathForTesting, upsertPtyManifest, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
+import { getPty as getRegisteredPty, setPtyManifestEnabledForTesting, startPty as startRegisteredPty, unregisterPty } from '../pty-shell/registry.js';
 import { enqueueControlMemo } from '../harness/control-inbox.js';
 import type { PtyEventRow } from '../pty-shell/pty-event-log.js';
 import type { PtyControlResult } from '../pty-shell/pty-control-ipc.js';
@@ -40,6 +41,118 @@ function lineageDeps(manifestRows: readonly PtyManifestRow[], lifecycleRows: rea
     log: () => {},
   };
 }
+
+describe('pty new CLI registration', () => {
+  test('spawns a named PTY with command, purpose, and cwd and prints its id', async () => {
+    const stdout: string[] = [];
+    const originalOut = process.stdout.write;
+    const originalErr = process.stderr.write;
+    const originalExitCode = process.exitCode;
+    let received: unknown;
+    process.stdout.write = ((chunk: string) => { stdout.push(chunk); return true; }) as typeof process.stdout.write;
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+    process.exitCode = undefined;
+    try {
+      const program = new Command();
+      registerPtyTakeoverCommands(program, {
+        ...lineageDeps([], []),
+        startPty: (opts) => { received = opts; return { id: 'shell_deadbeef' } as never; },
+      });
+      await program.parseAsync(['node', 'elanous', 'pty', 'new', '--name', 't1', '--purpose', 'review', '--cwd', '/tmp', '--', 'bun', 'run', 'dev']);
+      expect(received).toEqual({ cmd: 'bun', args: ['run', 'dev'], kind: 'shell', nickname: 't1', purpose: 'review', workdir: '/tmp' });
+      expect(stdout.join('')).toContain('shell_deadbeef\tt1\treview');
+      expect(process.exitCode).toBe(0);
+    } finally {
+      process.stdout.write = originalOut;
+      process.stderr.write = originalErr;
+      process.exitCode = originalExitCode ?? 0;
+    }
+  });
+
+  test('rejects a missing command before spawning and reports spawn errors', async () => {
+    const stderr: string[] = [];
+    const originalErr = process.stderr.write;
+    const originalExitCode = process.exitCode;
+    let starts = 0;
+    process.stderr.write = ((chunk: string) => { stderr.push(chunk); return true; }) as typeof process.stderr.write;
+    process.exitCode = 0;
+    try {
+      const program = new Command();
+      registerPtyTakeoverCommands(program, {
+        ...lineageDeps([], []),
+        startPty: () => { starts++; throw new Error('isolated spawn failure'); },
+      });
+      process.exitCode = undefined;
+      await program.parseAsync(['node', 'elanous', 'pty', 'new', '--name', 't1']);
+      expect(starts).toBe(0);
+      expect(process.exitCode).toBe(2);
+      expect(stderr.join('')).toContain('requires a command after --');
+
+      stderr.length = 0;
+      process.exitCode = undefined;
+      await program.parseAsync(['node', 'elanous', 'pty', 'new', '--name', 't1', '--', 'sh']);
+      expect(starts).toBe(1);
+      expect(process.exitCode).toBe(1);
+      expect(stderr.join('')).toContain('failed to spawn PTY: isolated spawn failure');
+    } finally {
+      process.stderr.write = originalErr;
+      process.exitCode = originalExitCode ?? 0;
+    }
+  });
+});
+
+describe('pty new real registration', () => {
+  test('lists the real PTY created by pty new with its name, kind, and purpose', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pty-new-list-'));
+    const dbPath = join(root, 'manifest.db');
+    setPtyManifestDbPathForTesting(dbPath);
+    setPtyManifestEnabledForTesting(true);
+    const stdout: string[] = [];
+    const originalOut = process.stdout.write;
+    const originalErr = process.stderr.write;
+    const originalExitCode = process.exitCode;
+    let id: string | undefined;
+    process.stdout.write = ((chunk: string) => { stdout.push(chunk); return true; }) as typeof process.stdout.write;
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+    process.exitCode = 0;
+    try {
+      const program = new Command();
+      const deps: PtyTakeoverCommandDeps = {
+        ...lineageDeps([], []),
+        getPty: getRegisteredPty,
+        startPty: startRegisteredPty,
+        currentManifestDbPath: () => dbPath,
+        listManifestRows: () => listPtyManifestRows(),
+        listManifestRowsAt: (path) => path === dbPath ? listPtyManifestRows() : [],
+        manifestTargets: () => [{ name: 'test', dbPath, tracked: true }],
+        isProcessAlive: () => true,
+      };
+      registerPtyTakeoverCommands(program, deps);
+      await program.parseAsync(['node', 'elanous', 'pty', 'new', '--name', 'listed-t1', '--purpose', 'review', '--kind', 'shell', '--', 'sh', '-c', 'sleep 30']);
+      const printedLine = stdout.join('').trimEnd();
+      const [printedId, printedName, printedPurpose] = printedLine.split(String.fromCharCode(9));
+      expect(printedId).toMatch(/^shell_[a-f0-9]{8}$/);
+      expect(printedName).toBe('listed-t1');
+      expect(printedPurpose).toBe('review');
+      id = printedId;
+      expect(getPtyManifest(id)).toMatchObject({ id, nickname: 'listed-t1', kind: 'shell', purpose: 'review' });
+      const listed = runPtyList(deps, { json: true });
+      expect(listed.exitCode).toBe(0);
+      expect(JSON.parse(listed.message)).toContainEqual(expect.objectContaining({ id, nickname: 'listed-t1', kind: 'shell', purpose: 'review' }));
+    } finally {
+      if (id) {
+        getRegisteredPty(id)?.kill?.('SIGTERM');
+        unregisterPty(id);
+      }
+      setPtyManifestEnabledForTesting(null);
+      setPtyManifestDbPathForTesting(null);
+      process.stdout.write = originalOut;
+      process.stderr.write = originalErr;
+      process.exitCode = originalExitCode ?? 0;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('pty install-tool wiring', () => {
   test('real CLI entrypoint rejects an absent PTY ref instead of reporting already', () => {
@@ -338,6 +451,37 @@ describe('joinPtyLineage', () => {
   test('counts null lifecycle payloads as unreadable without throwing', () => {
     const result = joinPtyLineage([], [{ ...event(1, 10, null), payload: 'null' }], 'anything');
     expect(result).toMatchObject({ scope: 'process-lineage', note: '이 런에 누가 참가했는지는 elanous self participants가 답합니다.', groups: [], unreadablePayloads: 1 });
+  });
+
+  test('copies seat and outputBytesTotal from spawned/exited payloads and leaves missing or unreadable fields unknown', () => {
+    const seat = 'seat-pilot-join';
+    const normal = joinPtyLineage([], [
+      event(1, 10, { event: 'spawned', ptyId: 'normal-exit', kind: 'pty', runId: 'run-join-seat', seat, startedAt: 10, outputBytesTotal: 0 }),
+      event(2, 20, { event: 'exited', ptyId: 'normal-exit', kind: 'pty', runId: 'run-join-seat', seat, closedAt: 20, outputBytesTotal: 21 }),
+    ], 'normal-exit');
+    expect(normal.unreadablePayloads).toBe(0);
+    expect(normal.groups[0]!.rows[0]).toMatchObject({ ptyId: 'normal-exit', seat, outputBytesTotal: 21, alive: false });
+
+    const errorExit = joinPtyLineage([], [
+      event(1, 10, { event: 'spawned', ptyId: 'error-exit', kind: 'pty', runId: 'run-join-error', seat, startedAt: 10, outputBytesTotal: 0 }),
+      event(2, 20, { event: 'exited', ptyId: 'error-exit', kind: 'pty', runId: 'run-join-error', seat, closedAt: 20, outputBytesTotal: 21 }),
+    ], 'error-exit');
+    expect(errorExit.groups[0]!.rows[0]).toMatchObject({ ptyId: 'error-exit', seat, outputBytesTotal: 21, alive: false });
+
+    const missing = joinPtyLineage([], [
+      event(1, 10, { event: 'spawned', ptyId: 'legacy-no-seat', kind: 'pty', runId: 'run-legacy', startedAt: 10 }),
+    ], 'legacy-no-seat');
+    expect(missing.unreadablePayloads).toBe(0);
+    expect(missing.groups[0]!.rows[0]).not.toHaveProperty('seat');
+    expect(missing.groups[0]!.rows[0]).not.toHaveProperty('outputBytesTotal');
+
+    const failed = joinPtyLineage([], [
+      event(1, 10, { event: 'spawned', ptyId: 'legacy-no-seat', kind: 'pty', runId: 'run-legacy', startedAt: 10 }),
+      { ...event(2, 20, null), payload: 'not-an-object' },
+    ], 'legacy-no-seat');
+    expect(failed.unreadablePayloads).toBe(1);
+    expect(failed.groups[0]!.rows[0]).not.toHaveProperty('seat');
+    expect(failed.groups[0]!.rows[0]).not.toHaveProperty('outputBytesTotal');
   });
 });
 
@@ -1106,6 +1250,23 @@ describe('runPtyList web addresses', () => {
     const human = runPtyList({ ...base, listRefs: () => [{ id: 'pty /?&', kind: 'shell', source: 'local' as const, alive: true }], resolveNexusPwa }).message;
     expect(human).toContain('https://host.ts.net:31415/app/term?pty=pty+%2F%3F%26');
     expect(human).toContain('(tailnet)');
+  });
+
+  test('maps a legacy row with missing outputBytesTotal to unknown instead of 0 and passes numeric rows through', () => {
+    const legacy = row({ id: 'pty_legacy_output', ownerPid: 1, ptyPid: 1, outputBytesTotal: undefined });
+    const numeric = row({ id: 'pty_numeric_output', ownerPid: 1, ptyPid: 1, outputBytesTotal: 4096 });
+    const json = JSON.parse(runPtyList({
+      ...base,
+      ...jsonManifestDeps,
+      listManifestRows: () => [legacy, numeric],
+      listManifestRowsAt: () => [legacy, numeric],
+      isProcessAlive: () => true,
+      now: () => 1,
+    }, { json: true }).message);
+    expect(json).toEqual([
+      expect.objectContaining({ id: 'pty_legacy_output', outputBytesTotal: 'unknown' }),
+      expect.objectContaining({ id: 'pty_numeric_output', outputBytesTotal: 4096 }),
+    ]);
   });
 
   test('distinguishes daemon absence from an unknown PWA URL in JSON and federated human rows', () => {

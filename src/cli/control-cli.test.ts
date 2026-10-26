@@ -121,15 +121,15 @@ test('control member --once registers a failed probe and resources where reports
   const dir = root();
   const { port } = await serve(dir);
   const tokenFile = join(dir, 'member-credential');
-  const issued = await command(dir, 'control', 'token', 'issue', 'node-b');
+  const issued = await command(dir, 'control', 'token', 'issue', 'fixture-node');
   expect(issued.code).toBe(0);
   writeFileSync(tokenFile, issued.stdout.trim());
-  const joined = await command(dir, 'control', 'join', '--url', `http://127.0.0.1:${port}`, '--machine', 'node-b', '--token-file', tokenFile);
+  const joined = await command(dir, 'control', 'join', '--url', `http://127.0.0.1:${port}`, '--machine', 'fixture-node', '--token-file', tokenFile);
   expect(joined.code).toBe(0);
   const result = await command(dir, 'control', 'member', '--once', '--resource', 'image:registry=http://127.0.0.1:1',
     '--resource', 'image:mirror=http://127.0.0.1:2', '--resource', 'image:tail6=http://[fd7a:115c:a1e0::42]:1', '--json');
   expect(result.code).toBe(0);
-  expect(JSON.parse(result.stdout)).toMatchObject({ machine: 'node-b', resources: [
+  expect(JSON.parse(result.stdout)).toMatchObject({ machine: 'fixture-node', resources: [
     { kind: 'image', name: 'registry', reachable: false, bind: 'loopback' },
     { kind: 'image', name: 'mirror', reachable: false, bind: 'loopback' },
     { kind: 'image', name: 'tail6', reachable: false, bind: 'tailnet' },
@@ -139,23 +139,23 @@ test('control member --once registers a failed probe and resources where reports
   expect(onceTable.stdout).toContain('image · registry · http://127.0.0.1:1/ · loopback · false');
   const found = await command(dir, 'resources', 'where', 'registry', '--json');
   expect(found.code).toBe(0);
-  expect(JSON.parse(found.stdout).resources).toMatchObject([{ machine: 'node-b', kind: 'image', name: 'registry', attrs: { reachable: false, bind: 'loopback' } }]);
+  expect(JSON.parse(found.stdout).resources).toMatchObject([{ machine: 'fixture-node', kind: 'image', name: 'registry', attrs: { reachable: false, bind: 'loopback' } }]);
   const table = await command(dir, 'resources', 'where', 'registry');
-  expect(table.stdout).toContain('image · registry · node-b · http://127.0.0.1:1/');
+  expect(table.stdout).toContain('image · registry · fixture-node · http://127.0.0.1:1/');
   expect(table.stdout).toContain(' · loopback');
   const tail6 = await command(dir, 'resources', 'where', 'tail6', '--json');
   expect(tail6.code).toBe(0);
-  expect(JSON.parse(tail6.stdout).resources).toMatchObject([{ machine: 'node-b', kind: 'image', name: 'tail6', attrs: { reachable: false, bind: 'tailnet' } }]);
+  expect(JSON.parse(tail6.stdout).resources).toMatchObject([{ machine: 'fixture-node', kind: 'image', name: 'tail6', attrs: { reachable: false, bind: 'tailnet' } }]);
   expect(result.stdout + result.stderr + onceTable.stdout + onceTable.stderr + found.stdout + found.stderr + table.stdout + table.stderr).not.toContain(issued.stdout.trim());
 }, 20_000);
 
 test('control member stays foreground and heartbeats until SIGTERM', async () => {
   const dir = root();
   const { port } = await serve(dir);
-  const issued = await command(dir, 'control', 'token', 'issue', 'node-b');
+  const issued = await command(dir, 'control', 'token', 'issue', 'fixture-node');
   const tokenFile = join(dir, 'credential');
   writeFileSync(tokenFile, issued.stdout.trim());
-  expect((await command(dir, 'control', 'join', '--url', `http://127.0.0.1:${port}`, '--machine', 'node-b', '--token-file', tokenFile)).code).toBe(0);
+  expect((await command(dir, 'control', 'join', '--url', `http://127.0.0.1:${port}`, '--machine', 'fixture-node', '--token-file', tokenFile)).code).toBe(0);
   const child = launch(dir, 'control', 'member', '--interval', '0.05', '--resource', 'image:registry=http://127.0.0.1:1');
   try {
     let found = false;
@@ -166,7 +166,7 @@ test('control member stays foreground and heartbeats until SIGTERM', async () =>
       await Bun.sleep(50);
     }
     expect(found).toBe(true);
-    const resourceUrl = `http://127.0.0.1:${port}/v1/resources?machine=node-b&name=registry`;
+    const resourceUrl = `http://127.0.0.1:${port}/v1/resources?machine=fixture-node&name=registry`;
     const headers = { authorization: `Bearer ${issued.stdout.trim()}` };
     const initial = await (await fetch(resourceUrl, { headers })).json() as { resources: Array<{ observedAt: number }> };
     const firstObservedAt = initial.resources[0]!.observedAt;
@@ -226,17 +226,17 @@ test('control serve --host forwards a permitted host and rejects a public bind b
 
 test('control token issue outputs the secret once; replacement, list and revoke never reveal it', async () => {
   const dir = root();
-  const issued = await command(dir, 'control', 'token', 'issue', 'node-b');
+  const issued = await command(dir, 'control', 'token', 'issue', 'fixture-node');
   expect(issued.code).toBe(0);
   expect(issued.stdout).toMatch(/^[a-f0-9]{64}\n$/);
   const first = issued.stdout.trim();
   const listed = await command(dir, 'control', 'token', 'list');
   expect(listed.code).toBe(0);
-  expect(listed.stdout).toMatch(/^node-b · \d{4}-\d\d-\d\dT.*Z\n$/);
-  const replaced = await command(dir, 'control', 'token', 'issue', 'node-b');
+  expect(listed.stdout).toMatch(/^fixture-node · \d{4}-\d\d-\d\dT.*Z\n$/);
+  const replaced = await command(dir, 'control', 'token', 'issue', 'fixture-node');
   expect(replaced.stdout).toMatch(/^[a-f0-9]{64}\n$/);
   expect(replaced.stdout).not.toBe(issued.stdout);
-  const revoked = await command(dir, 'control', 'token', 'revoke', 'node-b');
+  const revoked = await command(dir, 'control', 'token', 'revoke', 'fixture-node');
   expect(revoked.code).toBe(0);
   expect(revoked.stdout).toBe('');
   const empty = await command(dir, 'control', 'token', 'list');
@@ -297,7 +297,7 @@ test('control serve follows the lease only when opted in', async () => {
   const logs: string[] = [];
   const log = spyOn(console, 'log').mockImplementation(line => { logs.push(String(line)); });
   let readCount = 0;
-  let holder = 'node-b';
+  let holder = 'fixture-node';
   const read = async () => { readCount++; return { kind: 'present' as const, doc: { holder, generation: holder === 'mbp' ? 8 : 7, state: 'held' as const, renewedAt: 123 } }; };
   const register = (port: string) => fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
     method: 'POST', headers: { Authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
@@ -320,12 +320,12 @@ test('control serve follows the lease only when opted in', async () => {
     try {
       expect(followed.line).toContain('임대 따름 · gs://example-bucket · 나=mbp');
       const primary = await fetch(`http://127.0.0.1:${followed.port}/v1/primary`);
-      expect(await primary.json()).toEqual({ holder: 'node-b', generation: 7, known: true });
+      expect(await primary.json()).toEqual({ holder: 'fixture-node', generation: 7, known: true });
       expect(primary.headers.get('x-primary-generation')).toBe('7');
       const denied = await register(followed.port);
       expect(denied.status).toBe(409);
       expect(denied.headers.get('x-primary-generation')).toBe('7');
-      expect(await denied.json()).toEqual({ error: 'not-primary', holder: 'node-b', generation: 7 });
+      expect(await denied.json()).toEqual({ error: 'not-primary', holder: 'fixture-node', generation: 7 });
       expect(readCount).toBeGreaterThan(0);
       holder = 'mbp';
       await Bun.sleep(10_050);
@@ -397,7 +397,7 @@ test('control serve HQ lease unreadable rejects warm worker registration', async
 });
 
 test('control serve HQ lease held by another host rejects warm worker registration', async () => {
-  await withHqControl(() => ({ record: { holder: 'node-b', generation: 5, acquiredAt: 1, renewedAt: 2, ttlSeconds: 60 }, ageSeconds: 0, expired: false }),
+  await withHqControl(() => ({ record: { holder: 'fixture-node', generation: 5, acquiredAt: 1, renewedAt: 2, ttlSeconds: 60 }, ageSeconds: 0, expired: false }),
     async (port, dir) => {
       const response = await registerWarm(port, dir);
       expect(response.status).toBe(409);
@@ -456,16 +456,16 @@ test('joined Primary CLI queries use its member token without creating local cre
   });
   try {
     for (const flag of ['--admin-token', '--member-token', '--query-token']) {
-      const rejected = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'node-b', flag, credential);
+      const rejected = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'fixture-node', flag, credential);
       expect(rejected).toEqual({ code: 2, stdout: '', stderr: '토큰은 인자로 받지 않습니다 — `--token-file` 또는 `--token-stdin`\n' });
       expect(rejected.stderr).not.toContain(credential);
       expect(existsSync(join(dir, 'control', 'join.json'))).toBe(false);
     }
-    const joined = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'node-b', '--token-file', tokenFile);
+    const joined = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'fixture-node', '--token-file', tokenFile);
     expect(joined.code).toBe(0);
-    expect(joined.stdout).toBe(`Joined ${peer.url.origin} as node-b\n`);
+    expect(joined.stdout).toBe(`Joined ${peer.url.origin} as fixture-node\n`);
     expect(joined.stdout + joined.stderr).not.toContain(credential);
-    expect(JSON.parse(readFileSync(join(dir, 'control', 'join.json'), 'utf8'))).toEqual({ url: peer.url.href, machine: 'node-b', token: credential });
+    expect(JSON.parse(readFileSync(join(dir, 'control', 'join.json'), 'utf8'))).toEqual({ url: peer.url.href, machine: 'fixture-node', token: credential });
     expect(statSync(join(dir, 'control', 'join.json')).mode & 0o777).toBe(0o600);
     const found = await command(dir, 'resources', 'where', 'remote-demo', '--json');
     expect(found.code).toBe(0);
@@ -492,7 +492,7 @@ test('explicit Primary URL does not send a joined token to another address', asy
   try {
     const credential = join(dir, 'credential');
     writeFileSync(credential, 'c'.repeat(64));
-    expect((await command(dir, 'control', 'join', '--url', joinedPeer.url.href, '--machine', 'node-b', '--token-file', credential)).code).toBe(0);
+    expect((await command(dir, 'control', 'join', '--url', joinedPeer.url.href, '--machine', 'fixture-node', '--token-file', credential)).code).toBe(0);
     const denied = await command(dir, 'resources', 'list', '--primary-url', targetPeer.url.href, '--json');
     expect(denied.code).toBe(2);
     expect(denied.stderr).toContain('관제부 query 토큰 없음');
@@ -511,12 +511,12 @@ test('real join accepts a member token on stdin', async () => {
   const dir = root();
   const credential = 'f'.repeat(64);
   const peer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
-    expect(req.url).toBe(`${peer.url.href}v1/resources?machine=node-b`);
+    expect(req.url).toBe(`${peer.url.href}v1/resources?machine=fixture-node`);
     expect(req.headers.get('authorization')).toBe(`Bearer ${credential}`);
     return Response.json({ resources: [] });
   } });
   try {
-    const child = Bun.spawn(['bun', entry, `--test=${dir}`, 'control', 'join', '--url', peer.url.href, '--machine', 'node-b', '--token-stdin'], {
+    const child = Bun.spawn(['bun', entry, `--test=${dir}`, 'control', 'join', '--url', peer.url.href, '--machine', 'fixture-node', '--token-stdin'], {
       cwd, env: { ...process.env, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
     });
     children.push(child);
@@ -524,9 +524,9 @@ test('real join accepts a member token on stdin', async () => {
     child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(code).toBe(0);
-    expect(stdout).toBe(`Joined ${peer.url.origin} as node-b\n`);
+    expect(stdout).toBe(`Joined ${peer.url.origin} as fixture-node\n`);
     expect(stdout + stderr).not.toContain(credential);
-    expect(JSON.parse(readFileSync(join(dir, 'control', 'join.json'), 'utf8'))).toEqual({ url: peer.url.href, machine: 'node-b', token: credential });
+    expect(JSON.parse(readFileSync(join(dir, 'control', 'join.json'), 'utf8'))).toEqual({ url: peer.url.href, machine: 'fixture-node', token: credential });
   } finally { peer.stop(true); }
 });
 
@@ -537,7 +537,7 @@ test('real join refuses argv tokens and failed validation writes no file or stac
   writeFileSync(tokenFile, credential);
   const peer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response(credential, { status: 401, statusText: credential }) });
   try {
-    const failed = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'node-b', '--token-file', tokenFile);
+    const failed = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'fixture-node', '--token-file', tokenFile);
     expect(failed.code).toBe(1);
     expect(failed.stdout).toBe('');
     expect(failed.stderr).toMatch(/^합류 실패: [^\n]+\n$/);

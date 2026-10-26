@@ -44,6 +44,8 @@ export const PARENT_HOST_ENV = 'ELANOUS_TA_PARENT_HOST';
 const DEFAULT_REMOTE_ELANOUS = '$HOME/.local/share/elanous/bin/elanous';
 const DEFAULT_REMOTE_CONFIG_DIR = '$HOME/.elanous';
 const HOST_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/;
+/** A parent can wait for a child for tens of minutes; the two-minute HTTP refresh floor is too short here. */
+export const PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS = 60 * 60_000;
 
 /** Missing child-provider metadata keeps the established Pod default: the HQ Codex mirror is needed. */
 export function shouldInstallRemoteCodexAccess(effectiveChildProvider: string | undefined): boolean {
@@ -81,7 +83,7 @@ export function resolveParentHosts(config: ParentHostSetting | undefined, env: N
 }
 
 /** Capacity sample is read on the host before launch. Unknown or saturated capacity is not a positive weight. */
-export interface ParentHostCapacity { active: number; waiting: number; approvalHeadroom: number; load: number }
+export interface ParentHostCapacity { active: number; waiting: number; limit: number; headroom: number; approvalHeadroom: number; load: number }
 
 export interface ParentHostPodFit {
   state: 'fits' | 'never-fits' | 'unmeasured';
@@ -133,13 +135,13 @@ const LOAD_MARKER = '__ELANOUS_PARENT_LOAD__';
 /** Best-effort macOS `ps` fallback; Linux/WSL uses argv boundaries below. */
 export const PARENT_HOST_ACTIVE_FILTER = String.raw`/^(([^ ]+\/)?(bun|node|nodejs) )?([^ ]+\/)?elanous(\.mjs)?( --config-dir [^ ]+)? harness (say|ask)( |$)/ && / --no-auto-merge( |$)/ && !/ --substrate local( |$)/ && !/^([^ ]+\/)?[^ ]*sh -c/`;
 /** Count exact Linux argv entries so Pod-local commands and goal text cannot masquerade as host parents. */
-export const PARENT_HOST_PROC_COUNT_SCRIPT = "count=0; proc_root=${1:-/proc}; for file in \"$proc_root\"/[0-9]*/cmdline; do [ -r \"$file\" ] || continue; argv=(); while IFS= read -r -d '' arg; do argv+=(\"$arg\"); done < \"$file\" 2>/dev/null || true; [ ${#argv[@]} -ge 3 ] || continue; program=\"${argv[0]##*/}\"; case \"$program\" in elanous|elanous.mjs) ;; bun|node|nodejs) script_match=0; for ((i=1; i<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == */elanous.mjs ]]; then script_match=1; break; fi; [[ \"${argv[i]}\" == harness ]] && break; done; [ \"$script_match\" -eq 1 ] || continue ;; *) continue ;; esac; harness=0; for ((i=0; i+1<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == harness && ( \"${argv[i+1]}\" == say || \"${argv[i+1]}\" == ask ) ]]; then harness=1; break; fi; done; [ \"$harness\" -eq 1 ] || continue; has_no_auto_merge=0; for arg in \"${argv[@]}\"; do [[ \"$arg\" == --no-auto-merge ]] && has_no_auto_merge=1; done; [ \"$has_no_auto_merge\" -eq 1 ] || continue; local_substrate=0; for ((i=0; i+1<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == --substrate && \"${argv[i+1]}\" == local ]]; then local_substrate=1; break; fi; done; [ \"$local_substrate\" -eq 1 ] || count=$((count+1)); done; printf '__ELANOUS_PARENT_CAPACITY__%s\\n' \"$count\""
+export const PARENT_HOST_PROC_COUNT_SCRIPT = "count=0; proc_root=${1:-/proc}; for file in \"$proc_root\"/[0-9]*/cmdline; do [ -r \"$file\" ] || continue; argv=(); while IFS= read -r -d '' arg; do argv+=(\"$arg\"); done < \"$file\" 2>/dev/null || true; [ ${#argv[@]} -ge 3 ] || continue; program=\"${argv[0]##*/}\"; case \"$program\" in elanous|elanous.mjs) ;; bun|node|nodejs) script_match=0; for ((i=1; i<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == */elanous.mjs ]]; then script_match=1; break; fi; [[ \"${argv[i]}\" == harness ]] && break; done; [ \"$script_match\" -eq 1 ] || continue ;; *) continue ;; esac; harness=0; for ((i=0; i+1<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == harness && ( \"${argv[i+1]}\" == say || \"${argv[i+1]}\" == ask ) ]]; then harness=1; break; fi; done; [ \"$harness\" -eq 1 ] || continue; has_no_auto_merge=0; for arg in \"${argv[@]}\"; do [[ \"$arg\" == --no-auto-merge ]] && has_no_auto_merge=1; done; [ \"$has_no_auto_merge\" -eq 1 ] || continue; local_substrate=0; for ((i=0; i+1<${#argv[@]}; i++)); do if [[ \"${argv[i]}\" == --substrate && \"${argv[i+1]}\" == local ]]; then local_substrate=1; break; fi; done; [ \"$local_substrate\" -eq 1 ] && continue; cgroup_file=${file%cmdline}cgroup; if [ ! -r $cgroup_file ]; then [ ! -d ${file%/cmdline} ] && continue; printf '__ELANOUS_PARENT_CAPACITY_ERROR__cgroup-unreadable\\n'; exit 1; fi; cgroup=$(cat $cgroup_file 2>/dev/null) || { [ ! -d ${file%/cmdline} ] && continue; printf '__ELANOUS_PARENT_CAPACITY_ERROR__cgroup-unreadable\\n'; exit 1; }; case $cgroup in *docker*|*kubepods*|*containerd*|*libpod*|*lxc*) continue;; esac; count=$((count+1)); done; printf '__ELANOUS_PARENT_CAPACITY__%s\\n' \"$count\""
 /** Recent admission decisions are the host's measured approval backlog, not an inferred process count. */
 export function readParentHostCapacity(target: ParentHostConfig, ssh: SshRunner = defaultSshRunner): ParentHostCapacity | null {
   const executable = remotePath(target.elanous ?? DEFAULT_REMOTE_ELANOUS);
   const configDir = remotePath(target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR);
   const unavailable = (reason: string): null => { try { debug.log('task-agent.parent-host', 'capacity-unavailable', { host: target.host, reason }); } catch { /* fail-soft */ } return null; };
-  const processCount = `if [ -r /proc/self/cmdline ]; then if command -v bash >/dev/null 2>&1; then bash -c ${shellQuote(PARENT_HOST_PROC_COUNT_SCRIPT)} -- /proc; else printf "${CAPACITY_ERROR_MARKER}bash-unavailable\\n"; exit 1; fi; else parents=$(ps -Ao command) || exit 1; printf '%s\\n' "$parents" | awk '${PARENT_HOST_ACTIVE_FILTER} { n++ } END { print "${CAPACITY_MARKER}" n+0 }'; fi`;
+  const processCount = `if [ -r /proc/self/cmdline ]; then if command -v bash >/dev/null 2>&1; then bash -c ${shellQuote(PARENT_HOST_PROC_COUNT_SCRIPT)} -- /proc || exit 1; else printf "${CAPACITY_ERROR_MARKER}bash-unavailable\\n"; exit 1; fi; else parents=$(ps -Ao command) || exit 1; printf '%s\\n' "$parents" | awk '${PARENT_HOST_ACTIVE_FILTER} { n++ } END { print "${CAPACITY_MARKER}" n+0 }'; fi`;
   const script = `${processCount}; `
     + `${executable} --config-dir ${configDir} logs --event admit-by-usage --since 5m --json --limit 1000 || exit 1; `
     + `printf '\\n${APPROVAL_MARKER}\\n'; `
@@ -147,7 +149,8 @@ export function readParentHostCapacity(target: ParentHostConfig, ssh: SshRunner 
     + `cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null) || exit 1; printf '${LOAD_MARKER}cores=%s\\n' "$cores"`;
   try {
     const result = ssh(target.host, script, 15_000);
-    if (result.status !== 0) return unavailable(result.stdout.includes(`${CAPACITY_ERROR_MARKER}bash-unavailable`) ? 'bash-unavailable' : 'remote-command-failed');
+    if (result.status !== 0) return unavailable(result.stdout.includes(`${CAPACITY_ERROR_MARKER}bash-unavailable`) ? 'bash-unavailable'
+      : result.stdout.includes(`${CAPACITY_ERROR_MARKER}cgroup-unreadable`) ? 'cgroup-unreadable' : 'remote-command-failed');
     const activeMatch = new RegExp(`^${CAPACITY_MARKER}(\\d+)$`, 'm').exec(result.stdout);
     const boundary = result.stdout.indexOf(`\n${APPROVAL_MARKER}\n`);
     const logsStart = result.stdout.indexOf('\n');
@@ -181,12 +184,13 @@ export function readParentHostCapacity(target: ParentHostConfig, ssh: SshRunner 
       decisions.set(data.runId, data.recommended as number);
     }
     const waiting = [...decisions.values()].filter((n) => n === 0).length;
-    return { active, waiting, approvalHeadroom: Math.max(0, capacity - active - waiting), load: Math.max(0, cpu / (cores * 100)) };
+    const headroom = Math.max(0, capacity - active - waiting);
+    return { active, waiting, limit: capacity, headroom, approvalHeadroom: headroom, load: Math.max(0, cpu / (cores * 100)) };
   } catch { return unavailable('capacity-parse-failed'); }
 }
 
 /** Weighted rendezvous rank with evidence fields for launch-time observation. */
-export function rankParentHosts(targets: readonly ParentHostConfig[], runId: string, capacities: Readonly<Record<string, ParentHostCapacity | null>>): Array<{ target: ParentHostConfig; weight: number; score: number }> {
+export function rankParentHosts(targets: readonly ParentHostConfig[], runId: string, capacities: Readonly<Record<string, Pick<ParentHostCapacity, 'approvalHeadroom' | 'load'> | null>>): Array<{ target: ParentHostConfig; weight: number; score: number }> {
   return targets.map((target, index) => {
     const sample = capacities[target.host];
     const weight = sample && Number.isSafeInteger(sample.approvalHeadroom) && sample.approvalHeadroom > 0 && Number.isFinite(sample.load) && sample.load >= 0
@@ -264,14 +268,22 @@ export interface ParentHostPreflight { ok: boolean; gaps: string[]; warnings: st
 export function preflightScript(target: ParentHostConfig): string {
   const elanous = remotePath(target.elanous ?? DEFAULT_REMOTE_ELANOUS);
   const configDir = remotePath(target.configDir ?? DEFAULT_REMOTE_CONFIG_DIR);
+  const grokCredentialFloorSeconds = Math.ceil(PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS / 1_000);
   return [
     `echo "version=$(${elanous} --version 2>/dev/null | tail -1 | cut -d' ' -f1)"`,
     `test -f ${configDir}/config.json && echo config=1`,
     `grep -Eq '"podPool"[[:space:]]*:[[:space:]]*"[^"[:space:]]+' ${configDir}/config.json 2>/dev/null && echo podPool=1`,
     `(cd ${shellQuote(target.cwd)} 2>/dev/null && git rev-parse --is-inside-work-tree >/dev/null 2>&1) && echo repo=1`,
     `command -v kubectl >/dev/null 2>&1 && echo kubectl=1`,
+    `{ command -v grok >/dev/null 2>&1 || [ -x "$HOME/.grok/bin/grok" ]; } && echo grokCli=1`,
+    `{ command -v codex >/dev/null 2>&1 || [ -x "$HOME/.local/bin/codex" ]; } && echo codexCli=1`,
     `n=$(grep -Ec '^[[:space:]]*"openai-codex(:[^"]*)?"[[:space:]]*:[[:space:]]*\\{' ${configDir}/auth.json 2>/dev/null); echo "codexAccounts=\${n:-0}"`,
     `{ grep -Eq '"key"[[:space:]]*:[[:space:]]*"[^"]+"' "$HOME/.grok/auth.json" 2>/dev/null || [ -n "\${XAI_API_KEY:-}\${GROK_API_KEY:-}\${GROK_CODE_XAI_API_KEY:-}" ]; } && echo grok=1`,
+    // The remote host owns its device-auth session. Ignore the legacy HQ mirror entry; it can outlive and mask the host credential.
+    // Read only expiry metadata, never credential values, and compare against the shared minimum lifetime.
+    `grokProbe=$(if [ ! -f "$HOME/.grok/auth.json" ]; then printf '0|'; else bun -e 'const fs=require("node:fs");try{const auth=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const entries=Object.entries(auth).filter(([id])=>id!=="https://auth.x.ai::hq-mirror");const hasKey=entries.some(([,entry])=>typeof entry?.key==="string"&&entry.key.length>0);const expiries=entries.filter(([,entry])=>typeof entry?.expires_at==="string").map(([,entry])=>entry.expires_at).sort();process.stdout.write((hasKey?"1":"0")+"|"+(expiries.length?expiries[expiries.length-1]:""))}catch{}' "$HOME/.grok/auth.json" 2>/dev/null; fi); grokOtherKey=\${grokProbe%%|*}; grokExp=\${grokProbe#*|}`,
+    `grokFloor=$(date -u -d "@$(( $(date +%s) + ${grokCredentialFloorSeconds} ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$(( $(date +%s) + ${grokCredentialFloorSeconds} ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true); grokNow=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)`,
+    `grokHost=$(if [ -n "$XAI_API_KEY$GROK_API_KEY$GROK_CODE_XAI_API_KEY" ]; then echo valid; elif [ -z "$grokProbe" ]; then echo unknown; elif [ -z "$grokExp" ]; then [ "$grokOtherKey" = 1 ] && echo unknown || echo missing; elif [ -z "$grokFloor" ] || [ -z "$grokNow" ]; then echo unknown; else printf '%s\n%s\n%s\n' "$grokExp" "$grokFloor" "$grokNow" | awk 'NR==1{e=$0} NR==2{f=$0} NR==3{n=$0} END{if (e >= f) print "valid"; else if (e >= n) print "expiring"; else print "expired"}'; fi); echo "grokHost=$grokHost"`,
     `{ [ -s "\${ELANOUS_KEY_CACHE_DIR:-$HOME/.cache}/openrouter_api_key" ] || [ -n "\${OPENROUTER_API_KEY:-}" ]; } && echo openrouter=1`,
     `true`,
   ].join('; ');
@@ -283,6 +295,8 @@ export interface PreflightInput {
   localVersion: string;
   /** HQ 착지 동결이 «발사도 막는» 상태인가 — 원격 부모는 그 동결을 못 본다. */
   launchHoldActive: boolean;
+  /** Provider that the detached parent will use for its child. */
+  childProvider?: string;
   ssh?: SshRunner;
 }
 
@@ -306,9 +320,32 @@ export function judgeParentHostFacts(facts: Record<string, string>, input: Omit<
     if (facts.podPool !== '1' && !input.podPoolOverride) gaps.push('remote-pod-pool-unset');
     if (facts.repo !== '1') gaps.push('remote-repo-missing');
     if (facts.kubectl !== '1') gaps.push('remote-kubectl-missing');
+    if (input.childProvider === 'grok' && facts.grokCli !== '1') gaps.push('grok-cli-missing');
+    if ((input.childProvider === 'openai-codex' || input.childProvider === 'codex') && facts.codexCli !== '1') gaps.push('codex-cli-missing');
   }
   if (input.launchHoldActive) gaps.push('hq-launch-freeze-active');
   return gaps;
+}
+
+/** Host-side Grok credential states the preflight probe reports; HQ never sees the token itself. */
+export type ParentHostGrokCredentialState = 'valid' | 'expiring' | 'expired' | 'missing' | 'unknown';
+
+/**
+ * 순수 판정 — 원격 호스트가 스스로 보고한 grok 자격 상태 → **막는** gap 목록(GROK-MIRROR-REAL-SCOPE · 10-20 방향 전환).
+ *
+ * 왜 경고가 아니라 gap 인가: access-only 미러(4필드)는 원격 grok CLI 1.0.41 에서 `session/new` -32000 으로
+ * 거부됐고, HQ refresh_token 복사는 단일 주인 원칙 위반이다. ⇒ 호스트가 각자 device-auth 세션을 스스로
+ * 갱신하고, HQ 는 「쓸 수 있나」만 재서 **무효면 Grok 자식 발사 전에** 막는다(발사 뒤 -32000 반복 금지).
+ *
+ * ⛔ 상태를 «안 보고한» 호스트(구 판)는 막지 않는다 — 모름을 「죽었다」로 읽으면 멀쩡한 호스트가 조용히 빠진다.
+ */
+export function judgeParentHostGrokCredential(facts: Record<string, string>, opts: { childProvider?: string } = {}): string[] {
+  if (opts.childProvider !== 'grok' || facts.unreachable) return [];
+  const state = facts.grokHost as ParentHostGrokCredentialState | undefined;
+  if (state === 'missing') return ['grok-credential-missing'];
+  if (state === 'expiring') return ['grok-credential-expiring'];
+  if (state === 'expired') return ['grok-credential-expired'];
+  return [];
 }
 
 /** 순수 판정 — 원격 LLM 자격 사실 → 경고 목록(막지 않는다 · gaps 와 별개). 못 닿은 호스트는 사실이 없으므로 경고도 없다. */
@@ -330,7 +367,16 @@ export function preflightParentHost(input: PreflightInput): ParentHostPreflight 
     const at = line.indexOf('=');
     if (at > 0) facts[line.slice(0, at).trim()] = line.slice(at + 1).trim();
   }
-  const gaps = judgeParentHostFacts(facts, { localVersion: input.localVersion, launchHoldActive: input.launchHoldActive, podPoolOverride: Boolean(input.target.podPool) });
+  const gaps = judgeParentHostFacts(facts, { localVersion: input.localVersion, launchHoldActive: input.launchHoldActive, podPoolOverride: Boolean(input.target.podPool), ...(input.childProvider ? { childProvider: input.childProvider } : {}) });
+  // 호스트 자체 grok 자격은 «경고»가 아니라 발사 전 «차단» 축이다 — 무효면 OP 재로그인 요청 신호를 남긴다.
+  const credentialGaps = judgeParentHostGrokCredential(facts, { ...(input.childProvider ? { childProvider: input.childProvider } : {}) });
+  if (credentialGaps.length) {
+    try {
+      debug.log('task-agent.parent-host', 'grok-relogin-required', {
+        host: input.target.host, state: facts.grokHost ?? 'unknown', gaps: credentialGaps,
+      });
+    } catch { /* fail-soft */ }
+  }
   const warnings = judgeParentHostCredentials(facts);
   if (warnings.length) {
     try {
@@ -342,7 +388,8 @@ export function preflightParentHost(input: PreflightInput): ParentHostPreflight 
       });
     } catch { /* fail-soft */ }
   }
-  return { ok: gaps.length === 0, gaps, warnings, facts };
+  const blocking = [...gaps, ...credentialGaps];
+  return { ok: blocking.length === 0, gaps: blocking, warnings, facts };
 }
 
 /** 원격이 «확실히 안 띄웠다»고 답했다 — 호출부가 로컬로 돌아가도 중복 발사가 아니다. */
@@ -360,9 +407,7 @@ export function launchRemoteParent(
   args: readonly string[],
   env: Record<string, string>,
   ssh: SshRunner = defaultSshRunner,
-  grokMirrorResolver: () => OwnerGrokAccessMirror = resolveOwnerGrokAccessMirror,
   effectiveChildProvider?: string,
-  now: () => number = Date.now,
 ): { pid: number; log: string } {
   const argvProvider = childProviderFromArgs(args);
   if (effectiveChildProvider && argvProvider && argvProvider !== effectiveChildProvider) {
@@ -371,9 +416,11 @@ export function launchRemoteParent(
   const launchArgs = effectiveChildProvider && !argvProvider
     ? [...args.slice(0, 2), '--child-llm-provider', effectiveChildProvider, ...args.slice(2)]
     : args;
+  // GROK-MIRROR-REAL-SCOPE: 원격 부모는 HQ access 미러를 «설치하지 않는다»(4필드 미러는 grok 1.0.41 에서
+  // `session/new` -32000 · HQ refresh_token 복사는 단일 주인 원칙 위반). 호스트가 각자 device-auth 로
+  // 자체 갱신 세션을 쓰고, HQ 는 preflight 에서 «유효성»만 재서 무효면 발사 전에 막는다.
   if ((effectiveChildProvider ?? argvProvider) === 'grok') {
-    const mirror = grokMirrorResolver();
-    installRemoteGrokAccess(target, mirror, ssh, now);
+    try { debug.log('task-agent.parent-host', 'grok-host-credential', { host: target.host, runId: env.ELANOUS_RUN_ID ?? 'unknown', source: 'host-device-auth' }); } catch { /* fail-soft */ }
   }
   const result = ssh(target.host, remoteLaunchScript(target, launchArgs, env), 30_000);
   const log = remoteParentLogPath(target, env.ELANOUS_RUN_ID ?? 'unknown');

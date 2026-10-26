@@ -53,6 +53,15 @@ describe('formatResearchPrefill', () => {
     expect(seed).toContain('<ok>true</ok>');
   });
 
+  test('keeps the pre-router call path free of routing metadata', () => {
+    const seed = formatResearchPrefill(makeResult());
+    expect(seed).not.toContain('<output_format>');
+    expect(seed).not.toContain('<question_weight');
+    expect(seed).not.toContain('<output_route_observation>');
+    expect(seed).toContain('<topic>cursor pause patterns</topic>');
+    expect(seed).toContain('pause is implicit');
+  });
+
   test('includes the full output verbatim when under cap', () => {
     const seed = formatResearchPrefill(makeResult());
     expect(seed).toContain('pause is implicit');

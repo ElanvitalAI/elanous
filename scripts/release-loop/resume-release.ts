@@ -3,22 +3,31 @@
 // every later node reads the repaired commit without anyone hand-editing the run state.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { accessSync, closeSync, constants, copyFileSync, existsSync, fstatSync, openSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { accessSync, closeSync, constants, copyFileSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { lastJsonObject, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
-import { changedFilesBetween, clearPartialPlan, planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
+import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
+import { cutReleaseBranch } from './cut-branch.js';
 import { releaseLoopConfig } from './unattended-release.js';
 import { trafficOptionsFromConfig } from './traffic-transition.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+
+/** Compare existing artifact paths by filesystem identity so macOS /var and /private/var aliases agree. */
+function sameRealPath(left: unknown, right: unknown): boolean {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  try { return realpathSync(left) === realpathSync(right); }
+  catch { return false; }
+}
 
 export interface ResumeReleaseDeps {
   root?: string;
@@ -227,7 +236,8 @@ function verifyResumePreflight(run: GraphRunState, opts: ResumeReleaseOptions, d
       let owner: { runId?: unknown; commit?: unknown } | undefined;
       let ownerReadable = !existsSync(ownerPath);
       try { owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as typeof owner; ownerReadable = true; } catch { /* old artifacts can be owned by the run ledger */ }
-      const ledgerOwns = output?.out === prepared && output.commit === currentTip && output.outcome === 'ok';
+      const ledgerOwns = output !== undefined && sameRealPath(output.out, prepared)
+        && output.commit === currentTip && output.outcome === 'ok';
       const receiptOwns = owner ? owner.runId === opts.runId && owner.commit === currentTip : ownerReadable && ledgerOwns;
       if (!ledgerOwns || manifest?.version !== version || manifest.sourceCommit !== currentTip || !receiptOwns) {
         throw new Error(`prepared artifact is outside the current release run ledger: ${prepared} — remedy: preserve it, compare release.json and .release-node-owner.json with run ${opts.runId}, then resolve ownership before resume`);
@@ -265,8 +275,8 @@ function verifyResumePreflight(run: GraphRunState, opts: ResumeReleaseOptions, d
     const outputOwner = docsRecord?.artifactOwner as { runId?: unknown; attempt?: unknown } | undefined;
     const receiptMatches = receipt?.branch === docsBranch && receipt.owner?.runId === opts.runId
       && receipt.owner.attempt === outputOwner?.attempt && outputOwner?.runId === opts.runId
-      && typeof receipt.worktree === 'string' && worktree === receipt.worktree && docsWorktrees.includes(receipt.worktree)
-      && existsSync(receipt.worktree);
+      && typeof receipt.worktree === 'string' && sameRealPath(worktree, receipt.worktree)
+      && docsWorktrees.some((listedWorktree) => sameRealPath(listedWorktree, receipt.worktree));
     if (hasDocsArtifact && !receiptMatches) {
       throw new Error(`docs branch/worktree is outside the current release run ledger: ${docsBranch} — remedy: compare ${receiptPath} with the saved docs node output and resolve ownership before resume`);
     }
@@ -290,7 +300,7 @@ export type PartialOutcome = { requested: false }
 
 /** Build (or clear) the partial re-gate plan for the new tip. Fail-closed: any doubt leaves a full gate.
  *  GATE-REUSE-BY-DIFF: `--from gate` on a moved tip plans by default (`partial: undefined`); `partial: false` opts out. */
-function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean }, deps: ResumeReleaseDeps, dryRun = false): PartialOutcome {
+function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean; gateExecutor?: string }, deps: ResumeReleaseDeps, dryRun = false): PartialOutcome {
   const root = deps.root ?? effectiveInstanceRoot();
   // Any resume starts from no plan: one without a partial plan (from whatever node) never inherits an older plan.
   if (!dryRun) clearPartialPlan(root, tip.version);
@@ -328,7 +338,7 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     for (const item of stalled) {
       if (!item || typeof item !== 'object' || !Array.isArray((item as { files?: unknown }).files)
         || !(item as { files: unknown[] }).files.every((file) => typeof file === 'string')
-        || !['incomplete', 'no-output', 'job-failed', 'exit-code', 'unattributed', 'timeout'].includes(String((item as { reason?: unknown }).reason)))
+        || !['incomplete', 'no-output', 'job-failed', 'exit-code', 'unattributed', 'timeout', 'admission-timeout', 'admission-error'].includes(String((item as { reason?: unknown }).reason)))
         return fallback('stalled-shard record is malformed');
       stalledFiles.push(...(item as { files: string[] }).files);
     }
@@ -387,9 +397,16 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     const jsonClosure = testsReachingChanged(tree, [TRACEABLE_RELEASE_JSON], tests, { cliEntries: CLI_ENTRIES });
     if (!jsonClosure.ok || jsonClosure.reached === 0) return fallback('known-issues JSON reaches no verified test — full gate');
   }
+  const priorCutLogs = [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])]
+    .map((location) => join(location, 'release', tip.version, 'gate-logs', 'cut'))
+    .find((dir) => existsSync(dir));
+  const savedInput = saved.input as { gateExecutor?: unknown; gatePodPool?: unknown };
+  const podGate = (opts.gateExecutor ?? savedInput.gateExecutor ?? (savedInput.gatePodPool ? 'pod' : undefined)) === 'pod';
+  const priorShards = priorCutLogs ? collectExecutedPodShardImages(priorCutLogs, tip.from) : undefined;
   const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: changed,
     priorFailures: prior.failures as string[], priorErrors: (prior.errors ?? []) as string[],
     existsAtTip: (file) => tracked.has(file),
+    ...(podGate ? { priorShards: priorShards ?? [] } : {}),
     closure: (changedCode) => testsReachingChanged(tree, changedCode, tests, { cliEntries: CLI_ENTRIES }) });
   if (!planned.ok) return fallback(planned.reason);
   if (planned.plan.files.length >= tests.length) return fallback(`every test is re-run (${tests.length}) — full gate`);
@@ -538,4 +555,276 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     ...(gatePodPool ? { releaseGatePodPool: gatePodPool.set.gatePodPool } : {}),
     deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } });
   return { tip, partial, state };
+}
+
+// RELEASE-RECOVER-ONE-CMD (0.2.36): a failed release run is repaired by three commands that used to be chained by
+// hand (append dry-run → append → resume --from export-check). `release recover` runs them in that order, stops the
+// moment one fails, and leaves every stage's result in the resume-attempts ledger.
+export type RecoverStageName = 'append-dry-run' | 'append' | 'resume';
+const RECOVER_STAGES: readonly RecoverStageName[] = ['append-dry-run', 'append', 'resume'];
+/** The first node that consumes the cut — a moved tip must restart no later than here, so it is the default. */
+const RECOVER_FIRST_NODE = 'export-check';
+
+export interface RecoverReleaseOptions {
+  runId: string;
+  /** main commits that repair the cut — appended to release/<v> as a fast-forward only. */
+  pick: string[];
+  /** Node the resume restarts at — default `export-check`. */
+  from?: string;
+  commandRoot?: string;
+  partial?: boolean;
+  /** The checkout the append runs in (its `origin` remote); default the process cwd. */
+  repoRoot?: string;
+}
+
+export interface RecoverStageRecord {
+  stage: RecoverStageName; outcome: 'ok' | 'failed'; at: string; branch?: string; commit?: string | null;
+  from?: string; gatePlan?: 'not-run' | 'partial' | 'full'; status?: string; reason?: string;
+  /** The `--pick` list this recovery appended — a re-entry skips the append only for the same list. */
+  pick?: string[];
+}
+
+export interface RecoverReleaseResult {
+  runId: string; version: string; branch: string; fromNode: string; stages: RecoverStageRecord[];
+  resume?: { status: string; tip: TipRefresh; partial: PartialOutcome };
+}
+
+export interface RecoverReleaseDeps extends ResumeReleaseDeps {
+  /** `release cut-branch --append` — tests record the plan instead of pushing the branch. */
+  cutBranch?: typeof cutReleaseBranch;
+}
+
+/** A recovery that stopped at a stage: the stages after it never ran, and a human decides the next move. */
+export class ReleaseRecoverStopped extends Error {
+  constructor(readonly stage: RecoverStageName, readonly stages: readonly RecoverStageRecord[],
+    readonly notRun: readonly RecoverStageName[], reason: string) {
+    super(`release recover ${stage} 단계에서 멈췄다: ${reason} — ${notRun.length
+      ? `${notRun.join(' · ')} 단계는 실행하지 않았다` : '뒤에 실행할 단계가 없다'} · 사람이 판단한다(단계 원장: release/<v>/resume-attempts/<runId>.json)`);
+    this.name = 'ReleaseRecoverStopped';
+  }
+}
+
+/** Append one stage result to the resume-attempts ledger. `attempts[]` keeps its shape — the stage results are added. */
+function recordRecoverStage(entry: { root: string; runId: string; version: string; priorCountKnown: boolean; stage: RecoverStageRecord }): void {
+  const path = join(entry.root, 'release', entry.version, 'resume-attempts', `${entry.runId}.json`);
+  const saved = existsSync(path)
+    ? JSON.parse(readFileSync(path, 'utf8')) as { attempts?: unknown; recoveries?: unknown; priorCountKnown?: unknown }
+    : undefined;
+  if (saved !== undefined && (!saved || typeof saved !== 'object' || Array.isArray(saved) || !Array.isArray(saved.attempts)
+    || (saved.recoveries !== undefined && !Array.isArray(saved.recoveries)))) throw new Error('release resume attempts ledger invalid');
+  const next = { ...(saved ?? {}), version: entry.version, runId: entry.runId,
+    priorCountKnown: saved?.priorCountKnown ?? entry.priorCountKnown,
+    attempts: (saved?.attempts ?? []) as string[],
+    recoveries: [...((saved?.recoveries ?? []) as RecoverStageRecord[]), entry.stage] };
+  mkdirSync(dirname(path), { recursive: true });
+  const temporary = `${path}.${process.pid}.recover.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(next)}\n`, { mode: 0o600 });
+  renameSync(temporary, path);
+}
+
+/**
+ * Repair a failed release run in one command: append dry-run (plan only) → append (fast-forward release/<v> onto the
+ * picked repairs) → resume --from export-check (preflight plan, then the graph). A failing stage stops the command:
+ * the later stages never run, and the stage results are already in the ledger for the human to read.
+ */
+export async function recoverReleaseRun(opts: RecoverReleaseOptions, deps: RecoverReleaseDeps = {}): Promise<RecoverReleaseResult> {
+  if (!Array.isArray(opts.pick) || !opts.pick.length) throw new Error('release recover requires at least one --pick commit');
+  const root = releaseRunUniverse({ root: deps.root });
+  const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
+  const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
+  if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
+  // The saved version-release record names what to repair: the release branch and the commit the run cut.
+  const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
+  const recorded = lastJsonObject(versionRecord?.output);
+  const version = typeof recorded?.version === 'string' ? recorded.version : '';
+  // RELEASE-RECOVER-BASE: a first recover that reached the resume left refreshed-tip lines in the
+  // version-release output, and `lastJsonObject` names the CURRENT branch tip. The append builds on the
+  // commit the run CUT — an ancestor of the picked repairs on origin/main — so walk to the FIRST JSON
+  // object of the output for that original cut. Without this, a second recover with a different --pick
+  // fails append-dry-run with «base … is not an ancestor of origin/main» and strands the new repair
+  // unpushed while the run looks recovered.
+  const firstCutObject = (text: unknown): { version?: unknown; commit?: unknown } | undefined => {
+    if (typeof text !== 'string') return undefined;
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('{')) continue;
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && typeof (parsed as { version?: unknown }).version === 'string') {
+          return parsed as { version?: unknown; commit?: unknown };
+        }
+      } catch { /* not a JSON line — keep walking */ }
+    }
+    return undefined;
+  };
+  const originalCut = firstCutObject(versionRecord?.output) ?? recorded;
+  const base = typeof originalCut?.commit === 'string' ? originalCut.commit : '';
+  if (!versionRecord?.ok || !isReleaseVersion(version) || !/^[0-9a-f]{40}$/i.test(base)) {
+    throw new Error(`release run ${opts.runId} has no successful version-release record — nothing to repair`);
+  }
+  const branch = `release/${version}`;
+  const fromNode = opts.from ?? RECOVER_FIRST_NODE;
+  // RELEASE-RECOVER-PREFLIGHT (MS-02 review): the append pushes release/<v> on origin, and the resume refuses a
+  // bad run only after that push. Every read-only resume rejection is checked here FIRST — a run the resume
+  // would refuse never moves the branch. command-root mismatch is gone by construction: recover prepares the
+  // tip checkout itself below, and a human-provided --command-root is verified by the plan before the graph.
+  if (savedRun.status !== 'failed') {
+    throw new Error(`release run ${opts.runId} is ${savedRun.status} — only a failed run is recovered; ${branch} was not moved`);
+  }
+  if (fromNode === 'version-release') {
+    throw new Error(`--from version-release would cut again — recover at a later node; ${branch} was not moved`);
+  }
+  const restartAt = savedRun.path.indexOf(fromNode);
+  if (restartAt < 0 || savedRun.path.lastIndexOf(fromNode) !== restartAt) {
+    throw new Error(`--from ${fromNode} is not a node on the saved path of ${opts.runId}; ${branch} was not moved`);
+  }
+  const consumers = ['export-check', 'gate'].map((node) => savedRun.path.indexOf(node)).filter((index) => index >= 0);
+  const firstConsumer = consumers.length ? Math.min(...consumers) : -1;
+  if (firstConsumer >= 0 && restartAt > firstConsumer) {
+    throw new Error(`--from ${fromNode} is later than ${savedRun.path[firstConsumer]!} — later nodes were built from the old tip; ${branch} was not moved`);
+  }
+  const savedInput = (savedRun.input ?? {}) as { branchCut?: unknown; version?: unknown };
+  if (savedInput.branchCut !== true || savedInput.version !== version || recorded?.branch !== branch) {
+    throw new Error(`release run ${opts.runId} was not cut as ${branch} (input.branchCut/version or version-release branch differ); ${branch} was not moved`);
+  }
+  // The attempt ledger is the resume's own read-only gate — a refused recover consumes no attempt.
+  reserveReleaseResumeAttempt(savedRun, root, { now: deps.now, checkOnly: true });
+  const now = (): string => (deps.now?.() ?? new Date()).toISOString();
+  const stages: RecoverStageRecord[] = [];
+  const record = (stage: RecoverStageRecord): void => {
+    stages.push(stage);
+    recordRecoverStage({ root, runId: opts.runId, version, priorCountKnown: !savedRun.resume, stage });
+  };
+  const stop = (stage: RecoverStageName, error: unknown): never => {
+    throw new ReleaseRecoverStopped(stage, stages, RECOVER_STAGES.slice(RECOVER_STAGES.indexOf(stage) + 1),
+      error instanceof Error ? error.message : String(error));
+  };
+  const reason = (error: unknown): string => error instanceof Error ? error.message : String(error);
+  const cutBranch = deps.cutBranch ?? cutReleaseBranch;
+  const cut = { version, base, pick: opts.pick, append: true, repoRoot: opts.repoRoot, log: deps.onSource };
+  const repoRoot = resolve(opts.repoRoot ?? deps.repo ?? process.cwd());
+  // RELEASE-RECOVER-REENTRY (MS-02 review): once the append pushed and the resume did not finish, re-running
+  // recover with the same --pick is refused by cut-branch with «pick … is already in release/<v>» and dies at
+  // stage 1 with no guidance. The ledger recoveries decide: when their append-ok commit is still inside the
+  // advertised branch tip AND its recorded pick list is this --pick (an entry with no pick record is «기록 없음»,
+  // not an empty list — it falls back to the safe side and appends again), the repair already landed and this
+  // recover continues from the resume — the append stages never re-run.
+  /** Same pick list, order-insensitive, full 40-hex object ids only — anything else is «no record». */
+  const samePickList = (recorded: unknown): boolean => {
+    if (!Array.isArray(recorded) || recorded.length !== opts.pick.length) return false;
+    const left = recorded.map((sha) => (typeof sha === 'string' ? sha.toLowerCase() : '')).sort();
+    const right = [...opts.pick].map((sha) => sha.toLowerCase()).sort();
+    return left.every((sha, index) => /^[0-9a-f]{40}$/.test(sha) && sha === right[index]);
+  };
+  const ledgerPath = join(root, 'release', version, 'resume-attempts', `${opts.runId}.json`);
+  const recoveries: RecoverStageRecord[] = existsSync(ledgerPath)
+    ? ((JSON.parse(readFileSync(ledgerPath, 'utf8')) as { recoveries?: unknown[] }).recoveries ?? []) as RecoverStageRecord[]
+    : [];
+  let appendedCommit: string | undefined;
+  for (let index = recoveries.length - 1; index >= 0; index -= 1) {
+    const entry = recoveries[index]!;
+    if (entry.stage === 'append' && entry.outcome === 'ok' && typeof entry.commit === 'string' && samePickList(entry.pick)) {
+      appendedCommit = entry.commit;
+      break;
+    }
+  }
+  let advertised = '';
+  try {
+    advertised = (deps.git ?? gitRunner(repoRoot))(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]).split(/\s+/)[0] ?? '';
+  } catch {
+    advertised = '';
+  }
+  const isAncestor = deps.isAncestor ?? ancestorRunner(repoRoot);
+  const humanResume = `release resume --run ${opts.runId} --from ${fromNode}`;
+  const alreadyInGuidance = (cause: string): string =>
+    `${cause} — ${branch}가 이미 고른 수선을 담고 있다: 이 recover는 append하지 않았다. 사람이 직접 이어 간다: ${humanResume}`;
+  let tip = '';
+  if (appendedCommit !== undefined && /^[0-9a-f]{40}$/i.test(advertised) && isAncestor(appendedCommit, advertised)) {
+    tip = advertised;
+    deps.onSource?.(`· recover 재진입 · 원장의 append-ok(${appendedCommit.slice(0, 12)})이 가지 끝에 그대로 있다 — append를 다시 하지 않고 ${fromNode} resume부터 이어 간다`);
+  } else {
+    if (/^[0-9a-f]{40}$/i.test(advertised) && opts.pick.every((sha) => isAncestor(sha, advertised))) {
+      // The repair is on the branch already (a hand-run append) and the ledger has no append-ok for it: there is
+      // nothing to append — the stop error and the ledger record both name the human's next step.
+      const guidance = alreadyInGuidance(`pick ${opts.pick.join(' + ')} is already in ${branch}`);
+      record({ stage: 'append-dry-run', outcome: 'failed', at: now(), branch, reason: guidance });
+      return stop('append-dry-run', new Error(guidance));
+    }
+    // 1/3 append dry-run — the fast-forward plan only: no worktree, no push, no run-state write.
+    try {
+      const planned = cutBranch({ ...cut, dryRun: true });
+      record({ stage: 'append-dry-run', outcome: 'ok', at: now(), branch: planned.branch, commit: planned.commit });
+      deps.onSource?.(`· recover 1/3 append dry-run · ${planned.branch} ← ${opts.pick.join(' + ')} · 가지·push·런 상태 변경 없음`);
+    } catch (error) {
+      const raw = reason(error);
+      if (!/is already in /.test(raw)) {
+        record({ stage: 'append-dry-run', outcome: 'failed', at: now(), branch, reason: raw });
+        return stop('append-dry-run', error);
+      }
+      const guided = alreadyInGuidance(raw);
+      record({ stage: 'append-dry-run', outcome: 'failed', at: now(), branch, reason: guided });
+      return stop('append-dry-run', new Error(guided));
+    }
+    // 2/3 append — cherry-pick the repairs onto release/<v> and push the fast-forward (never a force push).
+    try {
+      const appended = cutBranch(cut);
+      if (!appended.commit) throw new Error(`${appended.branch} append produced no commit`);
+      tip = appended.commit;
+      record({ stage: 'append', outcome: 'ok', at: now(), branch: appended.branch, commit: tip, pick: opts.pick });
+      deps.onSource?.(`↻ recover 2/3 append · ${appended.branch} ${base.slice(0, 12)} → ${tip.slice(0, 12)} (fast-forward)`);
+    } catch (error) {
+      const raw = reason(error);
+      if (!/is already in /.test(raw)) {
+        record({ stage: 'append', outcome: 'failed', at: now(), branch, reason: raw });
+        return stop('append', error);
+      }
+      const guided = alreadyInGuidance(raw);
+      record({ stage: 'append', outcome: 'failed', at: now(), branch, reason: guided });
+      return stop('append', new Error(guided));
+    }
+  }
+
+  // 3/3 resume --from export-check — the read-only preflight first (its plan is the record), then the graph run.
+  // The append moved only the origin branch tip: the operator checkout is still wherever it was, and the resume
+  // preflight (verifyReleaseCommandRoot) demands a checkout whose HEAD is the new tip. So recover prepares that
+  // checkout itself — a temporary worktree at the tip. A human-provided --command-root stays a judgment
+  // boundary: the plan verifies it against the tip and stops there on a mismatch.
+  const resumeOptions: ResumeReleaseOptions = { runId: opts.runId, from: fromNode,
+    ...(opts.partial === undefined ? {} : { partial: opts.partial }) };
+  let preparedRoot: { dir: string; git: (args: string[]) => string } | undefined;
+  if (opts.commandRoot !== undefined) resumeOptions.commandRoot = opts.commandRoot;
+  else {
+    const temp = mkdtempSync(join(tmpdir(), 'release-recover-'));
+    const dir = join(temp, 'command-root');
+    const worktreeGit = gitRunner(repoRoot);
+    try {
+      worktreeGit(['worktree', 'add', '--detach', dir, tip]);
+    } catch (error) {
+      rmSync(temp, { recursive: true, force: true });
+      throw error;
+    }
+    preparedRoot = { dir, git: worktreeGit };
+    resumeOptions.commandRoot = dir;
+  }
+  try {
+    const plan = await planResumeReleaseRun(resumeOptions, deps);
+    const resumed = await resumeReleaseRun(resumeOptions, deps);
+    record({ stage: 'resume', outcome: 'ok', at: now(), from: fromNode, branch: resumed.tip.branch,
+      commit: resumed.tip.to, gatePlan: plan.gatePlan.mode, status: resumed.state.status });
+    deps.onSource?.(`▶ recover 3/3 resume ${fromNode}부터 · tip ${resumed.tip.to.slice(0, 12)} · gate ${plan.gatePlan.mode} → ${resumed.state.status}`);
+    return { runId: opts.runId, version, branch: resumed.tip.branch, fromNode, stages,
+      resume: { status: resumed.state.status, tip: resumed.tip, partial: resumed.partial } };
+  } catch (error) {
+    record({ stage: 'resume', outcome: 'failed', at: now(), from: fromNode, branch, reason: reason(error) });
+    return stop('resume', error);
+  } finally {
+    if (preparedRoot) {
+      try {
+        preparedRoot.git(['worktree', 'remove', '--force', preparedRoot.dir]);
+      } catch {
+        try { preparedRoot.git(['worktree', 'prune']); } catch { /* the temp dir below is still removed */ }
+      }
+      rmSync(dirname(preparedRoot.dir), { recursive: true, force: true });
+    }
+  }
 }

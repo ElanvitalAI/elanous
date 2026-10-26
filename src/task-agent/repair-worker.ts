@@ -22,7 +22,30 @@ export interface RepairWorkerRequest {
 
 export interface RepairWorkerResult {
   pr: number; head: string; runId: string; ok: boolean; reason?: string; moveId?: string;
+  /** A classified, stable failure only. Generic gate-failed is deliberately unsigned. */
+  failureSignature?: string;
+  /** Exact introduced test identities from the same signed gate receipt. */
+  gateFailureTests?: string[];
   job?: string; artifactDir?: string; result?: RepairCommitResult;
+}
+
+export function repairFailureSignature(output: string): string | null {
+  const gate = output.match(/^GATE_FAILURE_SIGNATURE=sha256:([a-f0-9]{64})\s*$/m);
+  if (gate) return `gate:sha256:${gate[1]}`;
+  const model = output.match(/review fallback: ambiguous or unsupported primary model ["“]([^"”\n]+)["”]/i);
+  const name = model?.[1]?.trim().toLowerCase();
+  return name && /^[a-z0-9._/-]{1,120}$/.test(name) ? `provider:ambiguous-primary:${name}` : null;
+}
+
+export function repairGateFailureTests(output: string): string[] | null {
+  const line = /^GATE_FAILURE_TESTS=(\[[^\r\n]*\])\s*$/m.exec(output)?.[1];
+  if (!line) return null;
+  try {
+    const tests: unknown = JSON.parse(line);
+    return Array.isArray(tests) && tests.length > 0 && tests.length <= 32
+      && tests.every((test) => typeof test === 'string' && test.length > 0 && test.length <= 512)
+      ? tests as string[] : null;
+  } catch { return null; }
 }
 
 export function repairHarnessArgs(request: RepairWorkerRequest): string[] {
@@ -71,7 +94,15 @@ export async function runRepairWorker(request: RepairWorkerRequest): Promise<Rep
       child.once('close', resolve);
     });
     const marker = parseRepairMarker(output, request.pr, request.head, request.runId);
-    if (code !== 0) result.reason = `harness exited ${code}: ${output.slice(-600)}`;
+    if (code !== 0) {
+      result.reason = `harness exited ${code}: ${output.slice(-600)}`;
+      const failureSignature = repairFailureSignature(output);
+      if (failureSignature) {
+        result.failureSignature = failureSignature;
+        const tests = failureSignature.startsWith('gate:') ? repairGateFailureTests(output) : null;
+        if (tests) result.gateFailureTests = tests;
+      }
+    }
     else if (!marker) result.reason = `repair artifact marker missing or invalid: ${output.slice(-600)}`;
     else Object.assign(result, { ok: true, ...marker });
   } catch (error) {
@@ -96,6 +127,11 @@ export function parseRepairWorkerResult(text: string, pr: number, head: string, 
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const v = value as RepairWorkerResult;
   if (v.pr !== pr || typeof v.head !== 'string' || v.head.toLowerCase() !== head.toLowerCase() || v.runId !== runId || typeof v.ok !== 'boolean') return null;
+  if (v.failureSignature !== undefined && (typeof v.failureSignature !== 'string'
+    || !/^(?:gate:sha256:[a-f0-9]{64}|provider:ambiguous-primary:[a-z0-9._/-]{1,120})$/.test(v.failureSignature))) delete v.failureSignature;
+  if (v.gateFailureTests !== undefined && (!v.failureSignature?.startsWith('gate:')
+    || !Array.isArray(v.gateFailureTests) || v.gateFailureTests.length < 1 || v.gateFailureTests.length > 32
+    || !v.gateFailureTests.every((test) => typeof test === 'string' && test.length > 0 && test.length <= 512))) delete v.gateFailureTests;
   if (v.ok && (typeof v.artifactDir !== 'string' || !v.artifactDir.startsWith('/') || typeof v.job !== 'string' || !v.job
     || !v.result || v.result.pr !== pr || typeof v.result.baseHead !== 'string'
     || v.result.baseHead.toLowerCase() !== head.toLowerCase() || v.result.runId !== runId || !SHA40.test(v.result.commit)

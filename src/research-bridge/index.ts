@@ -7,6 +7,7 @@ export type {
 
 export {
   invokeResearch,
+  invokeResearchAxes,
   setResearchInvoker,
   type ResearchInvoker,
   type ResearchInvocationOutcome,

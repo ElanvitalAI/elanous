@@ -27,6 +27,26 @@ export function sanitizeToolSchemaForGrok(schema: unknown): unknown {
   return output;
 }
 
+/** Anthropic-backed Claude APIs reject top-level JSON Schema composition on tool inputs.
+ * Check every tool before serialization so a newly introduced tool cannot turn a whole
+ * Claude request into a 400 and trigger an unnoticed provider fallback. Nested schemas
+ * remain valid and are deliberately not inspected here. */
+export function assertNoTopLevelToolSchemaCombinators(
+  tools: readonly { name: string; parameters: unknown }[] | undefined,
+): void {
+  if (!tools?.length) return;
+  const combinators = ['anyOf', 'oneOf', 'allOf'] as const;
+  const invalid = tools.flatMap((tool) => {
+    if (!tool.parameters || typeof tool.parameters !== 'object' || Array.isArray(tool.parameters)) return [];
+    const schema = tool.parameters as Record<string, unknown>;
+    const found = combinators.filter((key) => Object.prototype.hasOwnProperty.call(schema, key));
+    return found.length ? [`${tool.name} (${found.join(', ')})`] : [];
+  });
+  if (invalid.length) {
+    throw new Error(`Claude tool schema has unsupported top-level composition: ${invalid.join('; ')}`);
+  }
+}
+
 /** OpenRouter model ids may include the provider prefix; callers can pass
  * either the catalog id or the already-normalized wire id. */
 export function isOpenRouterGrokModel(model: string): boolean {

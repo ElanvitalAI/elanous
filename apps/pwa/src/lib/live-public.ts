@@ -36,7 +36,7 @@ function escapeRe(s: string): string {
 export function makePublicMasker(names: readonly string[]): (text: string, accountScope: boolean) => string {
   const alias = new Map(names.map((n, i) => [n, `account-${i + 1}`]));
   const accountRe = names.length ? new RegExp(`(^|[^\\w-])(${names.map(escapeRe).sort((a, b) => b.length - a.length).join('|')})(?![\\w-])`, 'g') : null;
-  // 호스트 이름(Pod 풀 기계 `node-b` · tailnet 주소 `*.ts.net`)도 공개 사진에 싣지 않는다 — 처음 본 순서로 `remote-N`.
+  // 호스트 이름(Pod 풀 기계 이름 · tailnet 주소 `*.ts.net`)도 공개 사진에 싣지 않는다 — 처음 본 순서로 `remote-N`.
   const hosts = new Map<string, string>();
   const hostAlias = (name: string) => {
     const key = name.toLowerCase();

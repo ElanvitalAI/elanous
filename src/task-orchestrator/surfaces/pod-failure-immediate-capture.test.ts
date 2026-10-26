@@ -236,7 +236,7 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
       expect(captures.map(row => row.data.job)).toEqual(jobNames);
       for (const row of captures) {
         expect(row.data).toMatchObject({ outcome: 'collected', reason: 'job-failed', runId, childRunId: 'run-child', jobUid: '12345678-1234-1234-1234-123456789abc', ...placement, capturedAt: new Date(1000).toISOString() });
-        expect(readFileSync(String(row.data.logEvidence), 'utf8')).toBe(`node-b:${row.data.job} log`);
+        expect(readFileSync(String(row.data.logEvidence), 'utf8')).toBe(`${placement.host}:${row.data.job} log`);
       }
       expect(reads).toHaveLength(6);
       expect(reads.every(read => read.host === 'node-b' && read.args[1] === placement.context && read.args[3] === placement.namespace)).toBe(true);

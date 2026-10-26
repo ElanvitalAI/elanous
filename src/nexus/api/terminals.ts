@@ -102,6 +102,11 @@ export interface TerminalSummary {
   startedAt: number;
   /** Total bytes currently held in the head/tail buffer (after trim). */
   outputBytes: number;
+  /** Seat copied from the joined lifecycle row for this PTY id; omitted when unknown. */
+  seat?: string;
+  /** Cumulative output from the joined lifecycle row; omitted when unknown (NULL/missing/0 legacy row).
+   *  Only a recorded positive total is a fact — same rule as the lineage endpoint. Distinct from outputBytes (buffer length). */
+  outputBytesTotal?: number;
   /** The owner-process access mode, or null when this row is manifest-only. */
   accessMode: 'read' | 'write' | 'auto' | null;
   /** Why accessMode is unavailable; null when an access mode is present. */
@@ -266,6 +271,18 @@ function terminalOriginFields(row: Pick<PtyManifestRow, 'terminalOriginCategory'
   return { terminalOriginCategory: 'unknown', terminalOriginReason: 'legacy-or-malformed-origin-decision' };
 }
 
+/** `> 0` 만 사실이다 — legacy 행의 NULL/누락(그리고 매니페스트가 0을 «기록값»으로 구분 못 하는 한 0 전부)은
+ *  미상으로 칸을 비운다. 계보 쪽 `lineageRowFromManifest`(`src/cli/pty-takeover-cli.ts`)와 같은 규칙이라
+ *  두 엔드포인트가 같은 행을 같게 판정한다. */
+function lifecycleFieldsFromJoinedRow(row: { seat?: string; outputBytesTotal?: number } | undefined): Pick<TerminalSummary, 'seat' | 'outputBytesTotal'> {
+  return {
+    ...(row?.seat ? { seat: row.seat } : {}),
+    ...(typeof row?.outputBytesTotal === 'number' && Number.isFinite(row.outputBytesTotal) && row.outputBytesTotal > 0
+      ? { outputBytesTotal: row.outputBytesTotal }
+      : {}),
+  };
+}
+
 function summarize(
   handle: PtyHandle,
   manifest: PtyManifestRow | null,
@@ -300,6 +317,7 @@ function summarize(
     exitCode: handle.exitCode,
     startedAt: handle.startedAt,
     outputBytes: snapshot.length,
+    ...lifecycleFieldsFromJoinedRow(manifest ? { seat: manifest.seat, outputBytesTotal: manifest.outputBytesTotal } : undefined),
     accessMode: handle.accessMode,
     accessModeUnavailableReason: accessModeUnavailableReason('process', handle.accessMode),
     ownerRunUsage: ownerRunUsage(manifest?.ownerPid !== undefined ? isOwnerProcessAlive(manifest.ownerPid) : undefined, manifest?.runId ?? '', resolveRunTerminationForRow),
@@ -337,6 +355,7 @@ function summarizeManifest(
     producer: 'process',
     alive: row.alive, exitCode: row.exitCode, startedAt: row.startedAt,
     outputBytes: Buffer.byteLength(row.snapshot, 'utf8'),
+    ...lifecycleFieldsFromJoinedRow({ seat: row.seat, outputBytesTotal: row.outputBytesTotal }),
     // Access mode lives in the owner process, so manifest-only rows cannot know it without IPC.
     accessMode: null,
     accessModeUnavailableReason: accessModeUnavailableReason('process', null),
@@ -1102,12 +1121,15 @@ export function handleTerminalsList(req: Request, opts: MetaApiOpts, deps: Termi
   try { cleanupStale(Date.now()); } catch { /* fail-soft */ }
   const manifestAfterInitialCleanup = readLocalManifest();
   const manifestById = new Map(manifestAfterInitialCleanup.map((row) => [row.id, row]));
-  const local = (deps.listPty ?? listPty)().map((handle) => summarize(
-    handle,
-    manifestById.get(handle.id) ?? null,
-    resolveRunTerminationForRow,
-    deps.isProcessAlive,
-  ));
+  const local = (deps.listPty ?? listPty)().map((handle) => {
+    const manifest = manifestById.get(handle.id) ?? null;
+    return summarize(
+      handle,
+      manifest,
+      resolveRunTerminationForRow,
+      deps.isProcessAlive,
+    );
+  });
   const localIds = new Set(local.map((t) => t.id));
   try { cleanupOrphans(localIds); } catch { /* fail-soft */ }
   const isVisible = (row: PtyManifestRow): boolean => isVisibleManifestRow(row, deps.isProcessAlive);

@@ -50,7 +50,7 @@ function fixture() {
   write(sqlite3, `#!/usr/bin/env python3\nimport sqlite3, sys\nsrc = sqlite3.connect(sys.argv[1])\nif sys.argv[2].startswith(".backup '"):\n    dest = sqlite3.connect(sys.argv[2][9:-1].replace("''", "'"))\n    src.backup(dest)\n    dest.close()\nelse:\n    src.executescript(sys.argv[2])\nsrc.close()\n`);
   chmodSync(sqlite3, 0o700);
   write(join(source, 'decisions', 'entry.jsonl'), 'one');
-  write(join(host, 'config.json'), JSON.stringify({ hq: { hostName: 'node-b', arbiter: 'cloud-vm' } }));
+  write(join(host, 'config.json'), JSON.stringify({ hq: { hostName: 'fixture-hq-node', arbiter: 'cloud-vm' } }));
   const core = buildGeneration({ root: source, out: join(standby, 'core', '20261004T000000Z'), tier: 'core', now: new Date('2026-10-04T00:00:00Z'), sqlite3 });
   symlinkSync(core.generation, join(standby, 'core', 'latest'));
   // A valid large SQLite ledger exercises the big tier's size rule and .backup path.
@@ -73,12 +73,12 @@ test('promotes verified core then big; backs up config, switches pollers off and
   const f = fixture();
   const r = run(f, '--hq-config', f.host);
   expect(r.status).toBe(0);
-  expect(r.stdout).toMatch(new RegExp(`^promoted .* core=${f.core.generation} big=${f.big.generation} files=${f.core.entries.length + f.big.entries.length} features=yes pollers=off hq=node-b [0-9]+s$`));
+  expect(r.stdout).toMatch(new RegExp(`^promoted .* core=${f.core.generation} big=${f.big.generation} files=${f.core.entries.length + f.big.entries.length} features=yes pollers=off hq=fixture-hq-node [0-9]+s$`));
   expect(lstatSync(f.to).mode & 0o777).toBe(0o700);
   const config = JSON.parse(readFileSync(join(f.to, 'config.json'), 'utf8'));
   expect(config.telegram).toEqual({ enabled: false, token: 'x' });
   expect(config.discord).toEqual({ enabled: false, token: 'y' });
-  expect(config.hq).toEqual({ hostName: 'node-b', arbiter: 'cloud-vm' });
+  expect(config.hq).toEqual({ hostName: 'fixture-hq-node', arbiter: 'cloud-vm' });
   expect(JSON.parse(readFileSync(join(f.to, 'config.json.pre-promote'), 'utf8')).hq).toBeUndefined();
   const promotedDb = new Database(join(f.to, 'release', 'features.sqlite'), { readonly: true });
   expect(promotedDb.query('SELECT enabled FROM features').get()).toEqual({ enabled: 1 });
@@ -90,7 +90,7 @@ test('promotes verified core then big; backs up config, switches pollers off and
   expect(promoted.filter(name => name !== 'config.json.pre-promote')).toHaveLength(f.core.entries.length + f.big.entries.length);
   for (const entry of [...f.core.entries, ...f.big.entries]) expect(promoted).toContain(entry.path);
   expect(files(f.standby)).toEqual(f.before);
-  expect(JSON.parse(readFileSync(join(f.host, 'config.json'), 'utf8')).hq.hostName).toBe('node-b');
+  expect(JSON.parse(readFileSync(join(f.host, 'config.json'), 'utf8')).hq.hostName).toBe('fixture-hq-node');
 }, SPAWN_TEST_TIMEOUT_MS);
 
 test('existing target is refused without changing target or standby, including on a second invocation', () => {

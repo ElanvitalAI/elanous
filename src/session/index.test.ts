@@ -18,6 +18,7 @@ import {
   getActiveSessionId,
   setActiveSessionId,
   clearActiveSessionId,
+  updateSessionMeta,
   toolTraceFieldsFromContent,
 } from './index.js';
 
@@ -39,6 +40,14 @@ beforeEach(() => {
   priorHarness = process.env[HARNESS_SPACE_ENV];
   delete process.env[HARNESS_SPACE_ENV];
 });
+
+test('per-session TUI presentation state survives session reload', () => withStateDir(root, () => {
+  const session = createSession({ source: 'tui' });
+  updateSessionMeta(session.id, (meta) => { meta.uiState = { sidetabOpen: true }; });
+  expect(loadSession(session.id)?.meta.uiState?.sidetabOpen).toBe(true);
+  updateSessionMeta(session.id, (meta) => { meta.uiState = { ...meta.uiState, sidetabOpen: false }; });
+  expect(loadSession(session.id)?.meta.uiState?.sidetabOpen).toBe(false);
+}));
 
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });

@@ -864,7 +864,7 @@ function normalizeReportChannel(raw: unknown): TelegramReportChannel | undefined
 export interface TelegramTestChannel {
   botToken: string;
   allowedUsers?: number[];
-  /** 무인 주입(scripts/telegram-inject.ts·#24)의 대상 봇 username(예: `@example_temp_bot`). 봇이 여럿일
+  /** 무인 주입(scripts/telegram-inject.ts·#24)의 대상 봇 username(예: `@test_helper_bot`). 봇이 여럿일
    *  때 어느 봇(테스트 채널용)에 objective 를 주입할지 명시. env `TELEGRAM_TEST_BOT`/`--to` 로도 지정 가능. */
   botUsername?: string;
 }
@@ -901,7 +901,7 @@ export interface TelegramChannel {
   chatId: number;
   interactive: boolean;
   roles: string[];
-  /** 봇 username(예: `example_monad_bot`). 무인 유틸(scripts/telegram-inject.ts)이
+  /** 봇 username(예: `primary_bot`). 무인 유틸(scripts/telegram-inject.ts)이
    *  role/name 으로 대상 봇을 config 한 곳에서 찾도록 하는 조회용 필드. 선택. */
   botUsername?: string;
 }
@@ -3901,6 +3901,8 @@ function parseProjectsConfig(raw: unknown): Record<string, ProjectConfig> | unde
 }
 
 export interface UserConfig {
+  /** Next TUI sidetab visibility: off disables it, collapsed starts folded, open starts visible. */
+  tui?: { sidetab?: 'off' | 'collapsed' | 'open' };
   projects?: Record<string, ProjectConfig>;
   /** Default personal topic watch; absent = enabled when user sources exist. */
   watch?: { enabled?: boolean };
@@ -4392,6 +4394,7 @@ function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
 
 function defaultConfig(): UserConfig {
   return {
+    tui: { sidetab: 'collapsed' },
     cli: { helpRole: 'owner' },
     coo: { linearProject: '외부 행정·큰 일 (COO)' },
     decisions: { linearProjection: { enabled: false }, requireCrossCheck: false,
@@ -5128,9 +5131,11 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
 
   const nexus = rawObj.nexus && typeof rawObj.nexus === 'object' && !Array.isArray(rawObj.nexus)
     ? rawObj.nexus as Record<string, unknown> : {};
+  const tuiRaw = rawObj.tui && typeof rawObj.tui === 'object' && !Array.isArray(rawObj.tui) ? rawObj.tui as Record<string, unknown> : {};
   const gateRemoteConfig = parseGateRemoteConfig(rawObj.gateRemote);
   const projects = parseProjectsConfig(rawObj.projects);
   return {
+    tui: { sidetab: tuiRaw.sidetab === 'off' || tuiRaw.sidetab === 'open' ? tuiRaw.sidetab : 'collapsed' },
     ...(projects ? { projects } : {}),
     ...(rawObj.starter && typeof rawObj.starter === 'object' && !Array.isArray(rawObj.starter)
       && Array.isArray((rawObj.starter as Record<string, unknown>).topics)
@@ -6487,6 +6492,8 @@ export function saveUserConfig(
     },
   };
   const rawRest = { ...(cfg.raw ?? {}) };
+  const rawTui = rawRest.tui && typeof rawRest.tui === 'object' && !Array.isArray(rawRest.tui)
+    ? rawRest.tui as Record<string, unknown> : {};
   // projects: raw entries are kept verbatim — an invalid entry loaded from disk is preserved, not blocked (its error
   // surfaces in resolveRubricAxes) — and typed axes handed to save are validated (invalid ones refuse the save).
   const rawProjectsValue = rawRest.projects;
@@ -6769,6 +6776,8 @@ export function saveUserConfig(
     debug: cfg.debug,
     logs: cfg.logs,
     shell: cfg.shell,
+    // Preserve newer/unknown TUI settings while the typed config only knows sidetab.
+    tui: { ...rawTui, ...cfg.tui },
     errorReports: cfg.errorReports ? stripUndef({ ...cfg.errorReports }) : undefined,
     chat: stripUndef({
       fastPath: cfg.chat.fastPath,

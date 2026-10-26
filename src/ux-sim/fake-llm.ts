@@ -47,18 +47,19 @@ export function resetTestFakeLlmScript(): void {
  *  («결함이 계속되는 세션에서도 사람 턴은 답을 받는다» 무대 · 칸 수를 호출 수에 맞춰 세지 않게). */
 export const TEST_FAKE_LLM_SCRIPT_SKIP_WHEN_ENV = 'ELANOUS_TEST_FAKE_LLM_SCRIPT_SKIP_WHEN';
 
-/** 다음 호출의 스크립트 칸을 소비한다. 400 칸이면 던진다. */
-function consumeScriptStep(messages: LLMMessage[]): void {
+/** 다음 호출의 스크립트 칸을 소비한다. 400 칸이면 던지고 `stall:<text>` 는 스트림에서 첫 조각 뒤 멈춘다. */
+function consumeScriptStep(messages: LLMMessage[]): string | undefined {
   const raw = process.env[TEST_FAKE_LLM_SCRIPT_ENV];
-  if (!raw) return;
+  if (!raw) return undefined;
   const skipWhen = process.env[TEST_FAKE_LLM_SCRIPT_SKIP_WHEN_ENV];
-  if (skipWhen && (lastHumanText(messages) ?? '').includes(skipWhen)) return;
+  if (skipWhen && (lastHumanText(messages) ?? '').includes(skipWhen)) return undefined;
   if (raw !== scriptCursorFor) { scriptCursorFor = raw; scriptCursor = 0; }
   const steps = raw.split(',').map((step) => step.trim()).filter(Boolean);
   const step = steps[scriptCursor];
   scriptCursor += 1;
   if (step === '400') throw new Error(TEST_FAKE_LLM_400_MESSAGE);
   if (step === '400codex') throw new Error(TEST_FAKE_LLM_CODEX_400_MESSAGE);
+  return step;
 }
 
 /** TUI-SEAT-MEMORY-RECALL — 요청 기록(격리 무대 전용). 경로를 주면 호출마다 받은 메시지(role·문자열 content)를
@@ -130,8 +131,13 @@ export const testFakeLlmProvider: LLMProvider = {
   },
   async *streamChat(messages: LLMMessage[], _opts?: LLMOpts): AsyncGenerator<LLMStreamEvent, void, unknown> {
     captureRequest(messages);
-    consumeScriptStep(messages);
+    const step = consumeScriptStep(messages);
     await scriptedDelay(messages);
+    if (step?.startsWith('stall:')) {
+      yield { type: 'text', delta: step.slice('stall:'.length) };
+      await new Promise<void>(() => {});
+      return;
+    }
     const call = scriptedToolCall(messages);
     if (call) { yield call; return; }
     yield { type: 'text', delta: testFakeLlmResponse(messages) };

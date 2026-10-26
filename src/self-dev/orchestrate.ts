@@ -1520,6 +1520,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(disp?.ok !== undefined ? { ok: disp.ok } : {}),
           ...(disp?.prUrl ? { prUrl: disp.prUrl } : {}),
           ...(disp?.prNumber !== undefined ? { prNumber: disp.prNumber } : {}),
+          ...(disp?.goalPlanRevision ? { goalPlanRevision: disp.goalPlanRevision } : {}),
           ...(disp?.merged !== undefined ? { merged: disp.merged } : {}),
           ...(disp?.checkedHeadCommit ? { checkedHeadCommit: disp.checkedHeadCommit } : {}),
           ...(disp?.selfReview ? { selfReview: disp.selfReview } : {}),

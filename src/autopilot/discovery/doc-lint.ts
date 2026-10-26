@@ -402,7 +402,7 @@ export async function lintGitHubIssueCommentPointers(
       // ⛔⭐ **파싱 실패는 `valid` 로 둔다**(리뷰 3R must-fix) — `issue_url` 형태를 못 읽은 것은
       //    *"다른 데를 가리킨다"* 는 **증거가 아니다**. 대조가 가능할 때만 대조한다.
       // ⭐ GitHub 의 owner/repo 는 **대소문자를 구분하지 않는다**(리뷰 4R must-fix) — 양쪽을 같은
-      //    규칙으로 정규화하지 않으면 `JOOSUNG80` vs `ElanvitalAI` 이 `mismatched` 로 오진된다.
+      //    규칙으로 정규화하지 않으면 대문자 owner 와 소문자 owner 를 `mismatched` 로 오진한다.
       const sameRepo = actual
         && actual.owner.toLowerCase() === owner.toLowerCase()
         && actual.repo.toLowerCase() === repo.toLowerCase();

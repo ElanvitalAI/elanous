@@ -327,6 +327,8 @@ test.skipIf(!ptyAvailable())('production showDashboard opens one idle child-comp
     expect(readFileSync(join(root, 'first-frame'), 'utf8')).toBe('ready');
     const before = (await handle.renderScreen()).split('\n').filter(line => line.includes('ChatLog') || line.trim() === '❯').join('\n');
     await waitFor(firstRequest, 'idle completion turn');
+    const firstPrompt = JSON.stringify(requests[0]?.messages ?? []);
+    expect(firstPrompt).toContain('[알림 전용 턴]');
     await waitFor(busyQueued, 'busy completion');
     await Bun.sleep(300);
     expect(requests).toHaveLength(1);
@@ -337,12 +339,128 @@ test.skipIf(!ptyAvailable())('production showDashboard opens one idle child-comp
     await waitFor(secondRequest, 'deferred completion turn');
     await Bun.sleep(300);
     expect(requests).toHaveLength(2);
-    expect(JSON.stringify(requests[1]?.messages ?? [])).toContain('Question: [자동 재개] 위임 끝: wake-fixture');
+    const secondPrompt = JSON.stringify(requests[1]?.messages ?? []);
+    expect(secondPrompt).toContain('Question: [자동 재개] 위임 끝: wake-fixture');
+    expect(secondPrompt).toContain('[알림 전용 턴]');
+    const after = await handle.renderScreen();
+    expect(after.match(/wake-response-2/g)).toHaveLength(1);
     console.log(`AGENT_WAKE_LIVE before=${JSON.stringify(before)} busy=${JSON.stringify(duringBusy)} requests=${requests.length} idle=1 busy-refused=1 deferred=1`);
   } finally {
     handle.kill(); unregisterPty(handle.id); server.stop(true); rmSync(root, { recursive: true, force: true });
   }
 }, 120_000);
+
+test.skipIf(!ptyAvailable())('classic PTY Ctrl+B backgrounds a child without eating the next draft character', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-prefix-live-'));
+  const state = join(root, 'state');
+  mkdirSync(state);
+  const firstFrame = join(root, 'first-frame');
+  const childReady = join(root, 'child-ready');
+  const childBackgrounded = join(root, 'child-backgrounded');
+  const driver = join(root, 'driver.ts');
+  let requests = 0;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+    if (new URL(request.url).pathname === '/v1/models') return Response.json({ data: [{ id: 'prefix-test' }] });
+    if (new URL(request.url).pathname !== '/v1/chat/completions') return new Response('not found', { status: 404 });
+    requests++;
+    return new Response(new ReadableStream<Uint8Array>({ async start(controller) {
+      const encoder = new TextEncoder();
+      for (let i = 0; i < 400; i++) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: ' ' }, finish_reason: null }] })}\n\n`));
+        await Bun.sleep(100);
+      }
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    } }), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  writeFileSync(join(state, 'config.json'), JSON.stringify({ onboarding: { completed: true },
+    llm: { provider: 'local', model: 'prefix-test', baseUrl: `http://127.0.0.1:${server.port}/v1` },
+    skillRouter: { llmFallback: false }, mcp: { enabled: false } }));
+  writeFileSync(driver, [
+    "import { writeFileSync } from 'node:fs';",
+    `const { setElanousConfigDir } = await import(${JSON.stringify(join(import.meta.dir, '../elanous-config-dir.ts'))});`,
+    `setElanousConfigDir(${JSON.stringify(state)});`,
+    `const { showDashboard } = await import(${JSON.stringify(join(import.meta.dir, 'index.ts'))});`,
+    `const { globalAgentRegistry } = await import(${JSON.stringify(join(import.meta.dir, '../agent/registry.ts'))});`,
+    `void showDashboard({ onFirstFrameRendered: () => writeFileSync(${JSON.stringify(firstFrame)}, 'ready') });`,
+    `while (!require('node:fs').existsSync(${JSON.stringify(firstFrame)})) await Bun.sleep(50);`,
+    `const child = globalAgentRegistry.spawn({ definition: { name: 'prefix-child', systemPrompt: 'test' }, prompt: 'wait', background: false, provider: { name: 'prefix-fake', defaultModel: 'test', available: () => true, async *chat() { await new Promise(() => {}); }, async *streamChat() { await new Promise(() => {}); } } });`,
+    `void (async () => { for await (const event of child.events) { if (event.type === 'done') break; } })();`,
+    `const probe = setInterval(() => { if (child.task.background) { writeFileSync(${JSON.stringify(childBackgrounded)}, JSON.stringify({ state: child.task.state, background: child.task.background })); clearInterval(probe); } }, 20);`,
+    `writeFileSync(${JSON.stringify(childReady)}, 'running');`,
+  ].join('\n'));
+  const env: Record<string, string> = { ...process.env as Record<string, string>, NODE_ENV: 'development',
+    HOME: root, ELANOUS_STATE_DIR: state, ELANOUS_STATE_DIR_SOURCE: 'explicit', ELANOUS_DATA_DIR: join(root, 'data'),
+    ELANOUS_SKIP_LOGIN_ENV: '1', TERM: 'xterm-256color', COLUMNS: '120', LINES: '30' };
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  const credentialEnv = /(_API_KEY|_TOKEN|_AUTH|_SECRET)$|^(ANTHROPIC|OPENAI|OPENROUTER|XAI|GROK|GEMINI|GOOGLE|CODEX|CLAUDE|AWS|BEDROCK|ELANOUS_CODEX)/i;
+  for (const key of Object.keys(env)) if (credentialEnv.test(key)) delete env[key];
+  const handle = startPty({ cmd: 'bun', args: [driver], workdir: repoRoot, cols: 120, rows: 30, env,
+    unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
+  const deadline = Date.now() + 100_000;
+  const wait = async (predicate: () => Promise<boolean> | boolean) => {
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await Bun.sleep(100);
+    }
+    throw new Error(`prefix PTY timeout; requests=${requests}; screen=${(await handle.renderScreen()).slice(-1000)}`);
+  };
+  try {
+    await wait(() => existsSync(childReady));
+    await wait(async () => (await handle.renderScreen()).includes('prefix-child'));
+    await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
+    handle.write('start prefix probe');
+    await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.includes('❯ start prefix probe')));
+    handle.write('\r');
+    await wait(() => requests > 0);
+    handle.write('\x02Z');
+    await wait(() => existsSync(childBackgrounded));
+    const promoted = JSON.parse(readFileSync(childBackgrounded, 'utf8')) as { state: string; background: boolean };
+    expect(promoted.background).toBe(true);
+    expect(promoted.state).toBe('running');
+    await wait(async () => (await handle.renderScreen()).split('\n').some(line => /❯\s*Z\s*$/.test(line)));
+    const draft = (await handle.renderScreen()).split('\n').find(line => /❯\s*Z\s*$/.test(line));
+    expect(draft?.trim()).toBe('❯ Z');
+    console.log('PREFIX_PTY child=' + promoted.state + ' backgrounded=1 draft=Z exactly-once');
+  } finally {
+    handle.kill(); unregisterPty(handle.id); server.stop(true); rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test.skipIf(!ptyAvailable())('classic PTY Ctrl+X c enters control mode from idle chat input', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-control-chord-'));
+  mkdirSync(join(root, 'state'));
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    if (new URL(request.url).pathname === '/v1/models') return Response.json({ data: [{ id: 'control-test' }] });
+    return new Response('not found', { status: 404 });
+  } });
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true },
+    llm: { provider: 'local', model: 'control-test', baseUrl: `http://127.0.0.1:${server.port}/v1` },
+    mcp: { enabled: false }, skillRouter: { llmFallback: false } }));
+  const env: Record<string, string> = { ...process.env as Record<string, string>, NODE_ENV: 'development',
+    ELANOUS_STATE_DIR: join(root, 'state'), TERM: 'xterm-256color' };
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  const handle = startPty({ cmd: 'bun', args: ['bin/elanous.mjs', `--test=${root}`, '--legacy'],
+    workdir: repoRoot, cols: 120, rows: 30, env,
+    unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
+  try {
+    const deadline = Date.now() + 80_000;
+    const wait = async (predicate: () => Promise<boolean>) => {
+      while (Date.now() < deadline) {
+        if (await predicate()) return;
+        await Bun.sleep(100);
+      }
+      throw new Error(`control chord timeout: ${(await handle.renderScreen()).slice(-1000)}`);
+    };
+    await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
+    handle.write('\x18c');
+    await wait(async () => (await handle.renderScreen()).includes('-- CONTROL MODE — (via ^X c chord)'));
+    expect(await handle.renderScreen()).toContain('-- CONTROL MODE — (via ^X c chord)');
+    console.log('CONTROL_PTY Ctrl+X c control-mode=entered');
+  } finally {
+    handle.kill(); unregisterPty(handle.id); server.stop(true); rmSync(root, { recursive: true, force: true });
+  }
+}, 100_000);
 
 test.skipIf(!ptyAvailable())('legacy production log-search modal: same PTY direct-write rows and caret before/after', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dashboard-legacy-modal-'));
@@ -379,7 +497,10 @@ test.skipIf(!ptyAvailable())('legacy production log-search modal: same PTY direc
       }
       throw new Error(`legacy modal timeout: ${JSON.stringify((await handle.renderScreen()).slice(-1200))}`);
     };
-    await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
+    await wait(async () => {
+      const rows = (await handle.renderScreen()).split('\n');
+      return rows.some(line => line.trim() === '❯') && rows[2]?.includes('elanous | daemon:');
+    });
     const before = await handle.renderScreen();
     const rawBefore = handle.snapshot();
     handle.drainDelta();
@@ -437,9 +558,9 @@ test.skipIf(!ptyAvailable())('classic /mission dispatch records one private-safe
     mcp: { enabled: false },
   }));
   const env: Record<string, string> = { ...process.env as Record<string, string>, NODE_ENV: 'development', ELANOUS_STATE_DIR: join(root, 'state'), TERM: 'xterm-256color' };
-  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR', 'ELANOUS_SUBSTRATE', 'ELANOUS_ARM_ID', 'ELANOUS_HOST_ID']) delete env[key];
   const handle = startPty({ cmd: 'bun', args: ['bin/elanous.mjs', `--test=${root}`, '--legacy'], workdir: repoRoot,
-    cols: 120, rows: 30, env, unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
+    cols: 120, rows: 30, env, unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR', 'ELANOUS_SUBSTRATE', 'ELANOUS_ARM_ID', 'ELANOUS_HOST_ID'] });
   const deadline = Date.now() + 85_000;
   const wait = async (predicate: () => Promise<boolean> | boolean) => {
     while (Date.now() < deadline) {

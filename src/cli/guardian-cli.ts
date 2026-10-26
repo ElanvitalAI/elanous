@@ -72,7 +72,9 @@ export function registerGuardianCommands(program: Command): void {
             debug.log('ops.orphan-cli', 'observation-failed', { error: String(error) });
           } catch { /* guardian shadow still runs */ }
         }
-        const result = await guardianTick(tickAt, plan, { config: cfg });
+        const result = await guardianTick(tickAt, plan, { config: cfg,
+          doctorShadow: async () => { (await import('../self-implement/doctor-visit.js')).recordPendingShadowDoctorReevaluations(); },
+        });
         await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
       } finally { db.close(); }
     });

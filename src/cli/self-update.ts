@@ -496,7 +496,7 @@ export function assessRailSafe(input: AssessRailSafeInput): {
   const heldVersions = plan.removed.filter((name) => {
     const path = join(input.versionsDir, name);
     try {
-      return listedProcessCommands(listProcesses(pgrepPathPattern(path)), readCommand).some((argv) => argv.includes(path));
+      return listedProcessCommands(listProcesses(pgrepPathPattern(path)), readCommand).some((argv) => argvReferencesVersion(argv, path));
     } catch { return false; }
   });
   let releaseRunActive = false;

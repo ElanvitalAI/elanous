@@ -29,6 +29,8 @@ export interface SignalSnapshot {
 
   // Recent conversation
   intentResearch: boolean;
+  /** Deep multi-source research route; quick fact lookups remain capped. */
+  researchAgent?: boolean;
   intentDiagram: boolean;
   recentNetworkError: boolean;
 
@@ -116,6 +118,34 @@ const NETWORK_ERROR_RE = /\b(ETIMEDOUT|ENOTFOUND|ECONNREFUSED|ECONNRESET|EHOSTUN
 // positive rate is fine because these signals only nudge a boost.
 const RESEARCH_ASCII_RE = /\b(research|find out|look up|investigate|latest (on|news)|what (are|is|does))\b/i;
 const RESEARCH_KO_RE = /(최신|뉴스|찾아(?:줘|봐)|알아봐|조사|리서치)/;
+const RESEARCH_SKILL_RE = /\b(?:omni[ -]market|omni[ -]crawl|social[ -]pulse)\b/i;
+const RESEARCH_EXPLANATION_RE = /(?:왜|이유|원인|전망|분석|비교|조사|\bwhy\b|\bcause\b|\boutlook\b|\banalysis\b|\bcompare\b)/i;
+const RESEARCH_TOPIC_RE = /(?:금리|채권|시장|경제|물가|환율|주가|기업|산업|정책|선거|역사|기후|질병|의학|과학|\bbond\b|\byield\b|\bmarket\b|\beconomy\b|\binflation\b|\bstock\b|\bpolicy\b|\belection\b|\bhistory\b|\bclimate\b|\bhealth\b|\bscience\b)/i;
+const RESEARCH_CODING_RE = /(?:코드|함수|버그|테스트|빌드|커밋|하니스|설정|오류|구현|수리|고쳐|수정|저장소|\brepo\b|\bcode\b|\bfunction\b|\bbug\b|\btest\b|\bbuild\b|\bcommit\b|\bconfig\b|\bimplement\b|\bfix\b)/i;
+const DEEP_RESEARCH_INTENT_TERMS = [
+  'research', 'deep research', 'triangulate', 'compare sources',
+  'multiple sources', 'community reaction', 'reddit reaction',
+  'x reaction', 'trend', 'sentiment', '여러 소스', '깊게 조사',
+  '리서치', '반응', '트렌드', '여론', '비교 조사', '교차검증',
+] as const;
+
+function hasResearchTurnIntent(text: string | undefined): boolean {
+  if (!text) return false;
+  if (matchesIntent(text, RESEARCH_ASCII_RE, RESEARCH_KO_RE)) return true;
+  return isResearchAgentIntent(text);
+}
+
+/** Shared research/agent verdict for surface routing and the tool catalog.
+ *  Keep the historical deep-research words before the new coding veto so
+ *  existing explicit surface choices retain their meaning. */
+export function isResearchAgentIntent(text: string | undefined): boolean {
+  if (!text) return false;
+  const lower = text.toLowerCase();
+  if (DEEP_RESEARCH_INTENT_TERMS.some((term) => lower.includes(term))) return true;
+  if (RESEARCH_CODING_RE.test(text)) return false;
+  return RESEARCH_SKILL_RE.test(text)
+    || (RESEARCH_EXPLANATION_RE.test(text) && RESEARCH_TOPIC_RE.test(text));
+}
 const DIAGRAM_ASCII_RE = /\b(diagrams?|flowcharts?|sequence|mermaid|graphs?|charts?|visuali[sz]e|architecture)\b/i;
 const DIAGRAM_KO_RE = /(시퀀스|플로우|다이어그램|도식|그래프|시각화|아키텍처|구조도)/;
 
@@ -213,7 +243,8 @@ export function collectSignals(ctx: SignalContext = {}): SignalSnapshot {
     hasNodeProject: existsSync(joinPath(cwd, 'package.json')),
     hasGitRemote: detectGitRemote(cwd),
 
-    intentResearch: matchesIntent(ctx.recentUserText, RESEARCH_ASCII_RE, RESEARCH_KO_RE),
+    intentResearch: hasResearchTurnIntent(ctx.recentUserText),
+    researchAgent: isResearchAgentIntent(ctx.recentUserText),
     intentDiagram: matchesIntent(ctx.recentUserText, DIAGRAM_ASCII_RE, DIAGRAM_KO_RE),
     recentNetworkError: hasRecentNetworkError(ctx.recentToolResults),
 
@@ -284,6 +315,7 @@ function fingerprintOf(s: SignalSnapshot): string {
     s.hasNodeProject ? 'node' : '-',
     s.hasGitRemote ? 'git' : '-',
     s.intentResearch ? 'research' : '-',
+    s.researchAgent ? 'research-agent' : '-',
     s.intentDiagram ? 'diagram' : '-',
     s.recentNetworkError ? 'neterr' : '-',
     s.modelFamily ?? '-',

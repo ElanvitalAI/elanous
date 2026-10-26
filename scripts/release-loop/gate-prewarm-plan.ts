@@ -32,6 +32,41 @@ export type GatePrewarmPlan =
   | { action: 'prepare-mirror'; cutSha: string; lockHash: string }
   | { action: 'start-worker'; cutSha: string; lockHash: string; slotAfter: number };
 
+/** A cut observation names the intended gate profile without granting a Pod slot. */
+export function planGatePrewarmCutShadow(input: GatePrewarmInput | { cutSha: string }, warmMemberCount: number | null):
+  { profile: 'gate'; transition: 'shadow'; plan: GatePrewarmPlan; reason?: 'warm-members-exceed-occupied' } {
+  const shadow = { profile: 'gate' as const, transition: 'shadow' as const };
+  if (!('nowMs' in input) || warmMemberCount === null) {
+    return { ...shadow, plan: { action: 'defer', reason: 'unmeasured' } };
+  }
+  if (input.occupiedPods !== null && warmMemberCount > input.occupiedPods) {
+    return { ...shadow, plan: { action: 'defer', reason: 'unmeasured' }, reason: 'warm-members-exceed-occupied' };
+  }
+  return { ...shadow, plan: planGatePrewarm(input) };
+}
+
+type WarmMemberSnapshot = Record<string, readonly unknown[]>;
+
+/** Compare the same observed cut on both sides of a read-only profile decision. */
+export function observeGatePrewarmCutShadow(input: GatePrewarmInput | { cutSha: string },
+  readWarmMembers: () => WarmMemberSnapshot | null, readPlacement: () => Record<string, number>) {
+  const placementBefore = readPlacement();
+  const membersBefore = readWarmMembers();
+  const memberCountBefore = membersBefore ? Object.values(membersBefore).reduce((n, rows) => n + rows.length, 0) : null;
+  const shadow = planGatePrewarmCutShadow(input, memberCountBefore);
+  const membersAfter = readWarmMembers();
+  const placementAfter = readPlacement();
+  const memberCountAfter = membersAfter ? Object.values(membersAfter).reduce((n, rows) => n + rows.length, 0) : null;
+  const stable = membersBefore !== null && membersAfter !== null
+    && JSON.stringify(membersBefore) === JSON.stringify(membersAfter)
+    && JSON.stringify(placementBefore) === JSON.stringify(placementAfter);
+  if (!stable) return { profile: 'gate' as const, transition: 'shadow' as const, status: 'unmeasured' as const,
+    plan: { action: 'defer' as const, reason: 'unmeasured' as const }, reason: 'warm-members-unmeasured-or-changed' as const,
+    memberCountBefore, memberCountAfter, membersBefore, membersAfter, placementBefore, placementAfter };
+  return { ...shadow, status: shadow.plan.action === 'defer' && shadow.plan.reason === 'unmeasured' ? 'unmeasured' as const : 'observed' as const,
+    memberCountBefore, memberCountAfter, membersBefore, membersAfter, placementBefore, placementAfter };
+}
+
 const count = (value: number | null): value is number =>
   value !== null && Number.isSafeInteger(value) && value >= 0;
 

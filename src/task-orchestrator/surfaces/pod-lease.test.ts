@@ -152,8 +152,9 @@ test('pod lease status opt-in executes the GitHub Pod probe and exposes its exac
     for (const key of ['recommended', 'limitedBy', 'capacitySlots', 'memorySlots', 'placeableSlots', 'running', 'pending', 'reserved', 'waitingJobs'])
       expect(observed[key]).toEqual(plain[key]);
     const table = (await run(['--github-egress'])).join('\n');
-    expect(table).toContain(`GitHub 외부망 node-b: DNS=true HTTPS=false 측정=${observed.externalGitHub.node-b.measuredAt} · GitHub HTTPS failed · Pod=${podName}`);
-    expect(table).toContain(`GitHub 탐침 로그 ${podName}: ${JSON.stringify(observed.externalGitHub.node-b.podLog)}`);
+    const probeHost = 'node-b';
+    expect(table).toContain(`GitHub 외부망 ${probeHost}: DNS=true HTTPS=false 측정=${observed.externalGitHub[probeHost].measuredAt} · GitHub HTTPS failed · Pod=${podName}`);
+    expect(table).toContain(`GitHub 탐침 로그 ${podName}: ${JSON.stringify(observed.externalGitHub[probeHost].podLog)}`);
     expect(table).toContain(`권장 지금 ${plain.recommended} 개 더 (limitedBy=${plain.limitedBy})`);
     expect(calls.filter((args) => args.includes('create'))).toHaveLength(1); // same cached Pod run, not a second probe
   } finally {

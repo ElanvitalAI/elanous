@@ -75,7 +75,10 @@ export interface PtyManifestRow {
   exitCode: number | null;
   snapshot: string;
   snapshotAt: number;
-  outputBytesTotal: number;
+  /** Cumulative output bytes recorded for this PTY. `undefined` = the row never recorded a total
+   *  (legacy schema before `output_bytes_total`, or NULL) — that is *unknown*, not 0. A genuinely
+   *  recorded zero from a fresh spawn stays 0. */
+  outputBytesTotal?: number;
   lastControlAt?: number;
   updatedAt: number;
   frame: string;
@@ -418,6 +421,17 @@ export function updatePtyManifestNickname(id: string, nickname: string | undefin
     const d = db(); if (!d) return;
     d.run('UPDATE pty_manifest SET nickname=?, updated_at=? WHERE id=?', [nickname ?? null, now, id]);
   } catch { /* fail-soft */ }
+}
+
+/** Update the conversation currently shown by a TUI surface without replacing its manifest row. */
+export function updatePtyManifestSession(id: string, sessionId: string, now: number = Date.now()): boolean {
+  try {
+    const d = db(); if (!d) return false;
+    const result = d.run('UPDATE pty_manifest SET session_id=?, updated_at=? WHERE id=? AND kind=\'tui\' AND session_id<>?', [sessionId, now, id, sessionId]);
+    return (result.changes ?? 0) > 0;
+  } catch {
+    return false;
+  }
 }
 
 /** 턴 상태 기록 — 행이 없거나 db 를 못 열면 false(호출자가 관측을 남긴다). */
@@ -866,7 +880,7 @@ function mapRow(r: Record<string, unknown>): PtyManifestRow {
     exitCode: r.exit_code === null || r.exit_code === undefined ? null : Number(r.exit_code),
     snapshot: String(r.snapshot ?? ''),
     snapshotAt: Number(r.snapshot_at ?? 0),
-    outputBytesTotal: Number(r.output_bytes_total ?? 0),
+    ...(r.output_bytes_total === null || r.output_bytes_total === undefined ? {} : { outputBytesTotal: Number(r.output_bytes_total) }),
     ...(r.last_control_at === null || r.last_control_at === undefined ? {} : { lastControlAt: Number(r.last_control_at) }),
     frame: String(r.frame ?? ''),
     frameAt: Number(r.frame_at ?? 0),

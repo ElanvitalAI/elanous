@@ -177,8 +177,9 @@ test('CEO-VIEW: 한 화면 답 — 막힘·결정·착지·예비·하트비트�
     expect(answer).toContain('지금 막힘');
     expect(answer).toContain('공급 부족');
     expect(answer).toContain('멈춘 하니스 런');
-    // 무엇을 결정해야 하나
+    // 무엇을 결정해야 하나 — 건수만이 아니라 대기 결정 제목까지
     expect(answer).toContain('결정 대기 2건');
+    expect(answer).toContain('발행 컷 승인');
     // 오늘 착지 수 · 예비 · 하트비트
     expect(answer).toContain('오늘 착지2건');
     expect(answer).toContain('예비 5칸');
@@ -190,12 +191,16 @@ test('CEO-VIEW: 한 화면 답 — 막힘·결정·착지·예비·하트비트�
     // 한 화면 구성은 기존 카드가 그대로 진다 — 텍스트 보고를 대체한다.
     expect(card(root, '릴리스 판 진행')).toContain('green 7');
     expect(card(root, '릴리스 판 진행')).toContain('노랑 2');
-    expect(card(root, '루프 판정')).toContain('루프');
+    expect(card(root, '루프 판정')).toContain('실패 1');
     expect(card(root, '결정 대기 카드')).toContain('2');
+    expect(card(root, '결정 대기 카드')).toContain('발행 컷 승인');
+    expect(card(root, '결정 대기 카드')).toContain('칸 재배치');
+    expect(card(root, '결정 대기 카드')).not.toContain('원장 기록');
     expect(card(root, '오늘 병합 PR')).toContain('2');
     expect(card(root, '위험·막힘 톱 5')).toContain('멈춘 하니스 런');
     expect(card(root, '그리드')).toContain('칸 사용 3/8');
     expect(card(root, '그리드')).toContain('본부');
+    expect(card(root, '그리드')).toContain('OP');
 
     // 폰·태블릿 폭: 2열 → sm 이상에서 넓어지는 반응형 그리드
     const answerRegion = root.root.findByProps({ 'aria-label': '한 화면 답' });
@@ -204,9 +209,47 @@ test('CEO-VIEW: 한 화면 답 — 막힘·결정·착지·예비·하트비트�
     const cards = root.root.findByProps({ 'aria-label': '대표 조망 카드' });
     expect(String(cards.props.className)).toContain('grid-cols-2');
     expect(String(cards.props.className)).toContain('sm:gap-4');
+    const riskGrid = root.root.findByProps({ 'aria-label': '위험과 그리드 카드' });
+    expect(String(riskGrid.props.className)).toContain('grid-cols-2');
+    expect(String(riskGrid.props.className)).toContain('sm:gap-4');
 
     // 텍스트 보고 대체 — 보고용 입력 필드를 두지 않는다.
     expect(root.root.findAllByType('textarea')).toHaveLength(0);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test('CEO-VIEW onescreen: mounted CeoPage states what is blocked now and what must be decided', async () => {
+  const realNow = Date.now;
+  Date.now = () => NOW;
+  try {
+    const { root } = await mountPage();
+    mounted = root;
+
+    const answer = card(root, '한 화면 답');
+    expect(answer).toContain('지금 막힘');
+    expect(answer).toContain('공급 부족');
+    expect(answer).toContain('멈춘 하니스 런');
+    expect(answer).toContain('결정해야 함');
+    expect(answer).toContain('결정 대기 2건');
+    expect(answer).toContain('발행 컷 승인');
+
+    expect(card(root, '릴리스 판 진행')).toContain('green 7');
+    expect(card(root, '릴리스 판 진행')).toContain('노랑 2');
+    expect(card(root, '루프 판정')).toContain('실패 1');
+    expect(card(root, '결정 대기 카드')).toContain('발행 컷 승인');
+    expect(card(root, '결정 대기 카드')).toContain('칸 재배치');
+    expect(card(root, '위험·막힘 톱 5')).toContain('멈춘 하니스 런');
+    expect(card(root, '오늘 병합 PR')).toContain('2');
+    expect(card(root, '그리드')).toContain('본부');
+    expect(card(root, '그리드')).toContain('칸 사용 3/8');
+    expect(answer).toContain('예비 5칸');
+    expect(answer).toContain('하트비트 2분 전');
+
+    const answerRegion = root.root.findByProps({ 'aria-label': '한 화면 답' });
+    expect(String(answerRegion.props.className)).toContain('grid-cols-2');
+    expect(String(answerRegion.props.className)).toContain('sm:grid-cols-3');
   } finally {
     Date.now = realNow;
   }

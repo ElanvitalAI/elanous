@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { debug } from '../debug/log.js';
 import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-gate.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
+import { audit as auditEntryBudget, INDEX_MODULE_LIMIT } from '../../scripts/ratchets/next-tui-entry-budget.js';
 import { landingHistoryLogArgs } from '../cli/pr-granularity.js';
 import {
   classifyDirtyWorktreePaths,
@@ -17,10 +18,12 @@ import {
   observePrFileOverlap,
   observePrWorktreeDirtiness,
   parseDirtyWorktreePaths,
-  runSelfGateCli, selectGateTestFiles, formatUnrunnableChangeKinds,
+  runSelfGateCli as runSelfGateCliProduction,
+  runSelfGateCliAsync as runSelfGateCliAsyncProduction,
+  selectGateTestFiles, formatUnrunnableChangeKinds,
 } from './gate-cli.js';
 import { GATE_CALLER_TEST_LIMIT } from './gate-scope.js';
-import type { BaselineProcessResult } from './gate-baseline.js';
+import { buildGateBaselineReport, type BaselineProcessResult } from './gate-baseline.js';
 import type { ShardRunResult } from '../self-dev/shard-run.js';
 import { aggregateGateTestShards } from '../self-dev/shard-aggregate.js';
 import { GATE_SPAWN_LANE_FILES } from '../self-dev/spawn-lane-files.js';
@@ -32,8 +35,14 @@ const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
 type CommandResult = ReturnType<typeof ok>;
 const importerLookup = (stdout = ''): [string, string[], CommandResult] => ['git', ['grep', '-l', '-e', '', '--', '*.test.ts', '*.test.tsx', '*.test.mts', '*.test.mtsx', '*.test.cts', '*.test.ctsx', '*.test.js', '*.test.jsx', '*.test.mjs', '*.test.mjsx', '*.test.cjs', '*.test.cjsx'], ok(stdout)];
 const lsFiles = (stdout = ''): [string, string[], CommandResult] => ['git', ['ls-files'], ok(stdout)];
+const fixtureRoots: string[] = [];
+const skipEntryBudgetGateForFixture = (_cwd: string, _files: readonly string[]) => ({ affected: false, errors: [] });
+const runSelfGateCli = (cwd: string, options: Parameters<typeof runSelfGateCliProduction>[1] = {}, deps: Parameters<typeof runSelfGateCliProduction>[2] = {}) =>
+  runSelfGateCliProduction(cwd, options, { runEntryBudgetGate: skipEntryBudgetGateForFixture, ...deps });
+const runSelfGateCliAsync = (cwd: string, options: Parameters<typeof runSelfGateCliAsyncProduction>[1] = {}, deps: Parameters<typeof runSelfGateCliAsyncProduction>[2] = {}) =>
+  runSelfGateCliAsyncProduction(cwd, options, { runEntryBudgetGate: skipEntryBudgetGateForFixture, ...deps });
 
-function fixtureRepository(files: Record<string, string>): { cwd: string; dispose: () => void } {
+function fixtureRepository(files: Record<string, string>, linkNodeModules = false): { cwd: string; dispose: () => void } {
   const cwd = mkdtempSync(join(tmpdir(), 'elanous-gate-cli-'));
   for (const [path, content] of Object.entries(files)) {
     const file = join(cwd, path);
@@ -42,10 +51,13 @@ function fixtureRepository(files: Record<string, string>): { cwd: string; dispos
   }
   spawnSync('git', ['init', '--quiet'], { cwd });
   spawnSync('git', ['add', '.'], { cwd });
+  if (linkNodeModules) symlinkSync(join(import.meta.dir, '../../node_modules'), join(cwd, 'node_modules'), 'dir');
+  fixtureRoots.push(cwd);
   return { cwd, dispose: () => rmSync(cwd, { recursive: true, force: true }) };
 }
 
 afterEach(() => {
+  for (const root of fixtureRoots.splice(0)) rmSync(root, { recursive: true, force: true });
   for (const key of Object.keys(process.env)) {
     if (!(key in originalEnv)) delete process.env[key];
   }
@@ -109,6 +121,51 @@ test('read-only gate preflight selects files without running exposure, tests, ba
 });
 
 describe('runSelfGateCli', () => {
+  test('real 1,265-module overflow fails changed gate before skipped test step', () => {
+    const fixture = fixtureRepository({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { moduleResolution: 'bundler', module: 'esnext' } }),
+      'src/index.ts': "import './budget-0000';\n",
+      'src/tui/entry.ts': 'export {};\n',
+      'src/tui/local.ts': 'export {};\n',
+      'src/tui.ts': 'export {};\n',
+      'src/dashboard/loop-scheduler.ts': 'export {};\n',
+      'bin/elanous.mjs': "await import('../src/index.ts');\n",
+    }, true);
+    for (let i = 0; i < INDEX_MODULE_LIMIT; i += 1) {
+      writeFileSync(join(fixture.cwd, `src/budget-${String(i).padStart(4, '0')}.ts`),
+        i + 1 < INDEX_MODULE_LIMIT ? `import './budget-${String(i + 1).padStart(4, '0')}';\n` : 'export const last = true;\n');
+    }
+    const result = runSelfGateCliProduction(fixture.cwd, {}, {
+      changedFiles: () => ({ files: ['src/budget-0000.ts'], baseRef: 'HEAD' }),
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.lines.join('\n')).toContain('index static module count 1265 exceeds 1264');
+  });
+
+  test('entry budget blocks affected changes before skipTestStep and retains unrelated rc', () => {
+    const calls: string[][] = [];
+    const deps = {
+      changedFiles: () => ({ files: ['src/tui/entry.ts'], baseRef: 'HEAD' }),
+      exists: () => false,
+      runTests: () => { throw new Error('no test selected'); },
+      runEntryBudgetGate: (_cwd: string, files: readonly string[]) => {
+        calls.push([...files]);
+        return { affected: true, errors: ['index static module count 1265 exceeds 1264'] };
+      },
+    };
+    const blocked = runSelfGateCliProduction('/repo', {}, deps);
+    expect(blocked.exitCode).toBe(1);
+    expect(blocked.lines.join('\n')).toContain('next-tui-entry-budget: FAIL index static module count 1265 exceeds 1264');
+    expect(calls).toEqual([['src/tui/entry.ts']]);
+    const skipped = runSelfGateCliProduction('/repo', {}, { ...deps, changedFiles: () => ({ files: ['docs/note.md'], baseRef: 'HEAD' }),
+      runEntryBudgetGate: () => ({ affected: false, errors: [] }) });
+    expect(skipped.exitCode).toBe(0);
+    expect(skipped.lines).toContain('next-tui-entry-budget: skip (unrelated changes)');
+    const unmeasured = runSelfGateCliProduction('/repo', {}, { ...deps, runEntryBudgetGate: () => { throw new Error('closure unavailable'); } });
+    expect(unmeasured.exitCode).toBe(1);
+    expect(unmeasured.lines.join('\n')).toContain('next-tui-entry-budget: UNMEASURED closure unavailable');
+  });
+
   test('scenario adds an importer test to the programmatic self gate and rejects a stale head', () => {
     const baseSha = 'a'.repeat(40);
     const headSha = 'b'.repeat(40);
@@ -198,6 +255,36 @@ describe('runSelfGateCli', () => {
     expect(fixed.exitCode).toBe(0);
     expect(() => runSelfGateCli('/repo', { fixedShardDistribution: true }, deps)).toThrow('requires --shards');
     expect(calls).toHaveLength(2);
+  });
+
+  test('async production gate awaits shards and preserves the serial output/verdict contract', async () => {
+    const files = ['test/a.test.ts', 'test/b.test.ts'];
+    const sharded: ShardRunResult = {
+      shards: [{ id: 'shard-1', files, plannedRssMb: 0, plannedSeconds: 0 }],
+      attempts: [], aggregate: { status: 'passed', retryShardIds: [] },
+    };
+    let concurrency: number | undefined;
+    const deps = {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runTests: () => { throw new Error('direct runner must not run'); },
+      runShards: () => sharded,
+      runShardsAsync: async (_cwd: string, _files: readonly string[], _base: string, _count: number,
+        _run: unknown, _worktree: unknown, _budget: unknown, mode: { concurrency?: number }) => {
+        concurrency = mode.concurrency;
+        await Promise.resolve();
+        return sharded;
+      },
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    };
+    const serial = runSelfGateCli('/repo', { shards: 2 }, deps as never);
+    const asyncResult = await runSelfGateCliAsync('/repo', { shards: 2, shardConcurrency: 4 }, deps as never);
+    expect(concurrency).toBe(4);
+    expect(asyncResult.exitCode).toBe(serial.exitCode);
+    expect(asyncResult.lines).toEqual(serial.lines);
+    await expect(runSelfGateCliAsync('/repo', { shards: 2, shardConcurrency: 5 }, deps as never))
+      .rejects.toThrow('invalid shard concurrency');
   });
 
   test('records each of three completed bundles before the runner returns and atomically replaces progress.json', () => {
@@ -682,6 +769,47 @@ describe('runSelfGateCli', () => {
       expect(preflight.unrunImporterTotal).toBe(0);
       expect(result.lines).toContain('unrun importer tests: 0; unresolved relative specifiers: 0');
       expect(result.exitCode).toBe(0);
+    } finally { fixture.dispose(); }
+  });
+
+  test('the production gate excludes comment-only source importers but still runs them for code edits', () => {
+    const source = 'src/user-config.ts';
+    const before = '/** bot: `@private_bot` */\nexport const config = 1;\n';
+    const importers = Object.fromEntries(Array.from({ length: GATE_CALLER_TEST_LIMIT + 1 }, (_, index) =>
+      [`test/config-${index}.test.ts`, "import '../src/user-config.js';\ntest('config', () => {});\n"]));
+    const fixture = fixtureRepository({ [source]: before, ...importers });
+    try {
+      const committed = spawnSync('git', ['-c', 'user.name=TC', '-c', 'user.email=tc@test.local', 'commit', '-m', 'base', '--quiet'], { cwd: fixture.cwd, encoding: 'utf8' });
+      expect(committed.status).toBe(0);
+      const baseSha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: fixture.cwd, encoding: 'utf8' }).stdout.trim();
+      const ran: string[][] = [];
+      const deps = {
+        changedFiles: () => ({ files: [source], baseRef: 'HEAD' }),
+        runTests: (_cwd: string, files: readonly string[]) => { ran.push([...files]); return ok(); },
+        runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      };
+      writeFileSync(join(fixture.cwd, source), before.replace('@private_bot', '@example_bot'));
+      const comment = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, deps);
+      expect(comment.testFiles).toEqual([]);
+      expect(comment.lines).toContain(`comment-only importer expansion excluded: ${source}`);
+      expect(comment.lines).toContain('unrun importer tests: 0; unresolved relative specifiers: 0');
+      expect(ran).toEqual([]);
+
+      expect(spawnSync('git', ['add', source], { cwd: fixture.cwd }).status).toBe(0);
+      expect(spawnSync('git', ['-c', 'user.name=TC', '-c', 'user.email=tc@test.local', 'commit', '-m', 'comment only', '--quiet'], { cwd: fixture.cwd }).status).toBe(0);
+      const committedComment = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, {
+        ...deps, changedFiles: () => ({ files: [source], baseRef: baseSha }),
+      });
+      expect(committedComment.testFiles).toEqual([]);
+      expect(committedComment.lines).toContain(`comment-only importer expansion excluded: ${source}`);
+
+      writeFileSync(join(fixture.cwd, source), '/** bot: `@example_bot` */\nexport const config = 2;\n');
+      const code = runSelfGateCli(fixture.cwd, { includeImporterTests: true }, deps);
+      expect(code.testFiles).toHaveLength(GATE_CALLER_TEST_LIMIT + 1);
+      expect(code.lines.some((line) => line.startsWith('comment-only importer expansion excluded:'))).toBe(false);
+      expect(ran).toHaveLength(1);
     } finally { fixture.dispose(); }
   });
 
@@ -1182,6 +1310,56 @@ describe('runSelfGateCli', () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  test('sharded gate retries only timeout-only introduced failure and reports load-timeout with original diagnostic', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const file = 'src/a.test.ts';
+    const rawTimeout = '^ this test timed out after 5000ms.';
+    const report = buildGateBaselineReport(`${file}:\n(fail) slow startup\n${rawTimeout}\n1 fail`,
+      { status: 'pass', output: `${file}:\n(pass) slow startup\n1 pass\n0 fail`, log: 'baseline clean' });
+    const calls: unknown[][] = [];
+    try {
+      const result = runSelfGateCli('/repo', { shards: 1 }, {
+        changedFiles: () => ({ files: [file], baseRef: 'HEAD' }), exists: () => true,
+        runShards: () => ({ shards: [{ id: 'shard-1', files: [file], plannedRssMb: 10, plannedSeconds: 1 }],
+          attempts: [], aggregate: { status: 'failed', retryShardIds: [], report } }),
+        runTimeoutRecheck: (cwd, target, name, timeoutMs) => {
+          calls.push([cwd, target, name, timeoutMs]);
+          return { observation: 'pass', elapsedMs: 1234, output: 'Ran 1 test across 1 file.\n1 pass' };
+        },
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0, runModelHardcodeGate: () => 0,
+        runDaemonPortGate: () => 0, runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      });
+      const baselinePayload = log.mock.calls.find((call) => call[0] === 'self-implement' && call[1] === 'gate.baseline')?.[2] as Record<string, unknown> | undefined;
+      const recheckPayload = log.mock.calls.find((call) => call[0] === 'gate.baseline' && call[1] === 'timeout-recheck')?.[2] as Record<string, unknown> | undefined;
+      expect(calls).toEqual([['/repo', file, 'slow startup', 60_000]]);
+      expect(result.exitCode).toBe(0);
+      expect(result.lines.join('\n')).toContain('load-timeout=1');
+      expect(baselinePayload?.introduced).toBe(0);
+      expect(JSON.stringify(baselinePayload?.failures)).toContain(rawTimeout);
+      expect(recheckPayload).toMatchObject({ result: 'pass', elapsedMs: 1234 });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('sharded gate does not retry or pass an introduced assertion that also prints a timeout marker', () => {
+    const file = 'src/a.test.ts';
+    const report = buildGateBaselineReport(`${file}:\nerror: expected true but received false\n(fail) assertion under load\n^ this test timed out after 5000ms.\n1 fail`,
+      { status: 'pass', output: `${file}:\n(pass) assertion under load\n1 pass\n0 fail`, log: 'baseline clean' });
+    let attempts = 0;
+    const result = runSelfGateCli('/repo', { shards: 1 }, {
+      changedFiles: () => ({ files: [file], baseRef: 'HEAD' }), exists: () => true,
+      runShards: () => ({ shards: [{ id: 'shard-1', files: [file], plannedRssMb: 10, plannedSeconds: 1 }],
+        attempts: [], aggregate: { status: 'failed', retryShardIds: [], report } }),
+      runTimeoutRecheck: () => { attempts += 1; return { observation: 'pass', elapsedMs: 1, output: 'pass' }; },
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0, runModelHardcodeGate: () => 0,
+      runDaemonPortGate: () => 0, runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    expect(attempts).toBe(0);
+    expect(result.exitCode).toBe(1);
+    expect(result.lines.join('\n')).toContain('introduced=1');
   });
 
   test('logs timeoutPassedAtBase=0 when the baseline also timed out', () => {

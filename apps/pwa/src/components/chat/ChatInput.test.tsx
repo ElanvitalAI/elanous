@@ -414,7 +414,12 @@ describe('ChatInput · PCH-12 skill confirmation', () => {
     const urls: string[] = [];
     const id = '123e4567-e89b-12d3-a456-426614174000';
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      urls.push(String(input));
+      const url = String(input);
+      // This test asserts the skill-execution contract. Background PWA
+      // telemetry shares global fetch in the browser, so accept its batch
+      // posts without mixing them into the skill request expectations.
+      if (url === '/v1/debug-logs/batch') return new Response(null, { status: 204 });
+      urls.push(url);
       expect((init?.headers as Record<string, string>).authorization).toBe('Bearer secret');
       if (init?.body) requests.push(JSON.parse(String(init.body)));
       return Response.json(init?.body ? { id } : { status: 'done', ok: true, output: '수집 완료' }, { status: init?.body ? 202 : 200 });

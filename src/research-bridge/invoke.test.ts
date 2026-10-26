@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'bun:test';
 import type { SkillManifest } from '../skills/runner.js';
-import { withResearchIsolation, RESEARCH_DENIED_TOOLS } from './invoke.js';
+import {
+  withResearchIsolation,
+  RESEARCH_DENIED_TOOLS,
+  researchOutputFromSkillRun,
+  researchOutcomeFromSkillRun,
+} from './invoke.js';
 
 const mf = (over: Partial<SkillManifest> = {}): SkillManifest =>
   ({ name: 'omni-crawl', description: 'search skill', ...over }) as SkillManifest;
@@ -32,4 +37,21 @@ describe('withResearchIsolation (research 격리·main 트리 오염 차단·대
   it('Bash 는 deny 하지 않음 — omni-crawl 검색 CLI(npx tsx)에 필수·skillDir cwd 라 main 트리 밖', () => {
     expect([...RESEARCH_DENIED_TOOLS]).not.toContain('Bash');
   });
+});
+
+describe('researchOutputFromSkillRun', () => {
+  it('prefers the final assistant answer and removes terminal control sequences', () => {
+    expect(researchOutputFromSkillRun({
+      finalResponse: '\u001b[32mFinal report\u001b[0m',
+    })).toBe('Final report');
+  });
+
+  it('marks an aborted run with no final answer as incomplete', () => {
+    expect(researchOutcomeFromSkillRun({ finalResponse: '' })).toEqual({
+      output: '',
+      ok: false,
+      error: 'skill run finished without a final assistant response',
+    });
+  });
+
 });

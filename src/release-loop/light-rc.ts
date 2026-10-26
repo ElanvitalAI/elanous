@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
-import { runSelfGateCli, type SelfGateCliOptions, type SelfGateCliResult } from '../self-implement/gate-cli.js';
+import { runSelfGateCliAsync, type SelfGateCliOptions, type SelfGateCliResult } from '../self-implement/gate-cli.js';
 import { dispatchHeavyCheck, isValidGateHost, type DispatchDeps, type DispatchOptions } from '../self-implement/gate-remote.js';
 import { latestPublishedPreviousVersion } from '../../scripts/release-loop/unattended-release.js';
 import { baseVersion, isReleaseVersion } from '../../scripts/release-loop/release-version.js';
@@ -29,6 +29,8 @@ export interface LightRcOptions {
   /** Run on this machine (the remote child is re-invoked with it). */
   local?: boolean;
   shards?: number;
+  /** Maximum simultaneously active gate bundles, including per-file RSS samples (default three). */
+  shardConcurrency?: number;
   /** OP FU — pass `--fixed-shard-distribution` to self gate (sorted round-robin into `shards`, no RSS pre-measurement).
    *  Opt-in; absent = the measured planner, unchanged. Also carried to the remote child. */
   fixedShardDistribution?: boolean;
@@ -71,7 +73,7 @@ export interface LightRcDeps {
   git?: (args: string[], cwd: string) => { rc: number | null; stdout: string };
   previousVersion?: (version: string, ledgerRoot?: string) => string;
   readFile?: (path: string) => string | undefined;
-  runGate?: (cwd: string, options: SelfGateCliOptions) => SelfGateCliResult;
+  runGate?: (cwd: string, options: SelfGateCliOptions) => SelfGateCliResult | Promise<SelfGateCliResult>;
   dispatch?: (opts: DispatchOptions, deps?: DispatchDeps) => Promise<number>;
   /** Extra dispatch deps (runner · settings) — tests drive the real dispatch with a fake host. */
   dispatchDeps?: Omit<DispatchDeps, 'write'>;
@@ -175,6 +177,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
   if (!isReleaseVersion(version)) throw new Error(`release version must be x.y.z: ${version}`);
   const shards = opts.shards ?? LIGHT_RC_DEFAULT_SHARDS;
   if (!Number.isSafeInteger(shards) || shards < 1) throw new Error(`invalid --shards count: ${opts.shards}`);
+  if (opts.shardConcurrency !== undefined && (!Number.isSafeInteger(opts.shardConcurrency) || opts.shardConcurrency < 1 || opts.shardConcurrency > 4)) throw new Error(`invalid --shard-concurrency: ${opts.shardConcurrency}`);
   if (opts.remote !== undefined && !isValidGateHost(opts.remote)) throw new Error(`invalid --remote host: ${opts.remote}`);
   const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   const cwd = repoRoot(deps);
@@ -195,7 +198,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
     try {
       const dir = checkout?.dir ?? cwd;
       if (checkout) alwaysInclude = readList(dir);
-      local = (deps.runGate ?? runSelfGateCli)(dir, { base, shards, ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), alwaysInclude, includeImporterTests: true });
+      local = await (deps.runGate ?? runSelfGateCliAsync)(dir, { base, shards, ...(opts.shardConcurrency !== undefined ? { shardConcurrency: opts.shardConcurrency } : {}), ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), alwaysInclude, includeImporterTests: true });
       if (opts.rehearsalTui) {
         const command = async (cmd: string, args: string[], tree: string, limitMs?: number) => {
           const run = spawnSync(cmd, args, { cwd: tree, encoding: 'utf8', timeout: limitMs });
@@ -212,7 +215,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
     // Keep the self-gate contract: an unavailable remote leaves this release check unmeasured; do not start a heavy gate locally.
     tool: 'self-gate', repo: cwd, installPwa: true, refs: [base], json: true, commit: measuredCommit,
     // The host re-runs this command with --local (and ELANOUS_GATE_REMOTE_CHILD=1), so it never recurses.
-    remoteArgv: (sha) => ['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', version, '--base', sha(base), '--head', measuredCommit, '--shards', String(shards), ...(opts.fixedShardDistribution ? ['--fixed-shard-distribution'] : []), '--local', '--json', ...(opts.rehearsalTui ? ['--rehearsal-tui'] : [])],
+    remoteArgv: (sha) => ['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', version, '--base', sha(base), '--head', measuredCommit, '--shards', String(shards), ...(opts.shardConcurrency !== undefined ? ['--shard-concurrency', String(opts.shardConcurrency)] : []), ...(opts.fixedShardDistribution ? ['--fixed-shard-distribution'] : []), '--local', '--json', ...(opts.rehearsalTui ? ['--rehearsal-tui'] : [])],
     flags: { remote: opts.local ? undefined : opts.remote ?? true, local: !!opts.local },
     runLocal,
   }, {

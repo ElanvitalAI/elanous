@@ -374,6 +374,21 @@ export function decideNextRun(input: {
   const deployFindings = input.deployFindings === undefined ? undefined
     : new Map([...input.deployFindings].filter(([taskId]) => !handedOffIds.has(taskId)));
   const t = triageRun(activeResults, deployFindings, observation === 'failed', undefined, mainSyncRelaunchSpent(history));
+  const revisionUnobserved = activeResults.filter((result) => result.harvestable === true && !!result.branch
+    && result.goalPlanRevision?.status !== 'read');
+  const revisionUnobservedIds = new Set(revisionUnobserved.map((result) => result.taskId));
+  for (const classification of t.classifications) {
+    if (classification.kind !== 'main-sync-blocked' || classification.action !== 'relaunch-on-main'
+      || !revisionUnobservedIds.has(classification.taskId)) continue;
+    // Keep history's «already spent» predicate separate from this independent safety block.
+    classification.action = 'needs-human';
+    t.relaunchOnMain = t.relaunchOnMain.filter((taskId) => taskId !== classification.taskId);
+    if (!t.needsHuman.includes(classification.taskId)) t.needsHuman.push(classification.taskId);
+  }
+  t.actionable = countActionable(t) > 0;
+  const revisionHoldNote = revisionUnobserved.length > 0
+    ? ` · 골 개정 관측 미확인 — 같은 골 재발사 보류(${revisionUnobserved.map((result) => result.taskId).join(', ')})`
+    : '';
   const relaunchGoals: Record<string, string> = Object.fromEntries(activeResults.flatMap((result) =>
     t.relaunchOnMain.includes(result.taskId) && result.branch
       ? [[result.taskId, mainSyncRelaunchGoal(result.feature, result.branch)]] : []));
@@ -438,7 +453,7 @@ export function decideNextRun(input: {
       ...base,
       action: 'stop',
       stopReason: 'harvestable-awaiting-human',
-      why: withGoalPlanRevisionObservation(`구현 완료 · 수확 대기 — ${harvestable.map((result) => result.branch).join(' · ')}`),
+      why: `${withGoalPlanRevisionObservation(`구현 완료 · 수확 대기 — ${harvestable.map((result) => result.branch).join(' · ')}`)}${revisionHoldNote}`,
     };
   }
 
@@ -604,7 +619,7 @@ export function decideNextRun(input: {
         ...base,
         action: 'stop',
         stopReason: 'no-progress',
-        why: withNoProgressGoalPlanRevisionObservation(`${stallRounds}라운드 연속 제자리 — base=${completionBase ?? 'main'} 기준 완료 ${baseCompleted} · 착지 ${landed} · 남은 조각도 안 줄었다(${actionable}). 골·불변식을 의심할 자리`),
+        why: `${withNoProgressGoalPlanRevisionObservation(`${stallRounds}라운드 연속 제자리 — base=${completionBase ?? 'main'} 기준 완료 ${baseCompleted} · 착지 ${landed} · 남은 조각도 안 줄었다(${actionable}). 골·불변식을 의심할 자리`)}${revisionHoldNote}`,
       };
     }
   }
@@ -733,10 +748,10 @@ export function decideNextRun(input: {
         ...(action === 'add-repair-task' && held.length ? { heldTaskIds: held } : {}) },
       pendingDecision: 'attempt-care-escalation',
       why: fresh.length === 0
-        ? `리뷰 진동 반복 — ${signatureOf(oscillating)} · 사람 결정 필요(같은 전략 재발사 금지)${heldReasonSuffix}`
+        ? `리뷰 진동 반복 — ${signatureOf(oscillating)} · 사람 결정 필요(같은 전략 재발사 금지)${heldReasonSuffix}${revisionHoldNote}`
         : cannotRepair
-          ? `리뷰 진동 — ${signatureOf(oscillating)} · ${input.repairGoalExecution === false ? '이 감독 경로가 수리 골 실행을 선언하지 않았다(미선언 또는 불가)' : '수리 원문/PR 관측 불가'} · 사람 결정 필요(같은 전략 재발사 금지)${heldReasonSuffix}`
-          : `리뷰 진동 — ${signatureOf(fresh)} · review-oscillation 수리 조각을 한 번 붙인다${input.repairGoalExecution === true ? '' : '(실행 배선 미선언 — 결정 칸만)'}${repairedHeld.length ? ` · 이미 수리한 조각 ${repairedHeld.join(', ')} 은 사람 결정 대기` : ''}${classHeld.length ? ` · 분류로 보류한 조각 ${classHeld.join(', ')}` : ''}${heldReasonSuffix}`,
+          ? `리뷰 진동 — ${signatureOf(oscillating)} · ${input.repairGoalExecution === false ? '이 감독 경로가 수리 골 실행을 선언하지 않았다(미선언 또는 불가)' : '수리 원문/PR 관측 불가'} · 사람 결정 필요(같은 전략 재발사 금지)${heldReasonSuffix}${revisionHoldNote}`
+          : `리뷰 진동 — ${signatureOf(fresh)} · review-oscillation 수리 조각을 한 번 붙인다${input.repairGoalExecution === true ? '' : '(실행 배선 미선언 — 결정 칸만)'}${repairedHeld.length ? ` · 이미 수리한 조각 ${repairedHeld.join(', ')} 은 사람 결정 대기` : ''}${classHeld.length ? ` · 분류로 보류한 조각 ${classHeld.join(', ')}` : ''}${heldReasonSuffix}${revisionHoldNote}`,
     };
   }
 
@@ -746,14 +761,14 @@ export function decideNextRun(input: {
     return {
       ...base,
       action: 'add-repair-task',
-      why: `수리 조각을 붙인다 — 수리 ${t.repairable.length} · 그대로 재실행 ${t.rerunnable.length} · 재작업 ${t.reworkable.length} · 분해 ${t.decomposable.length} · 라운드 ${round + 1}/${maxRounds}`,
+      why: `수리 조각을 붙인다 — 수리 ${t.repairable.length} · 그대로 재실행 ${t.rerunnable.length} · 재작업 ${t.reworkable.length} · 분해 ${t.decomposable.length} · 라운드 ${round + 1}/${maxRounds}${revisionHoldNote}`,
     };
   }
 
   return {
     ...base,
     action: 'relaunch',
-    why: `다시 건다 — 그대로 재실행 ${t.rerunnable.length} · 재작업 ${t.reworkable.length} · 분해 ${t.decomposable.length} · 수리 ${t.repairable.length}${t.relaunchOnMain.length > 0 ? ` · main 위 재발사 ${t.relaunchOnMain.length}` : ''} · 라운드 ${round + 1}/${maxRounds}`,
+    why: `다시 건다 — 그대로 재실행 ${t.rerunnable.length} · 재작업 ${t.reworkable.length} · 분해 ${t.decomposable.length} · 수리 ${t.repairable.length}${t.relaunchOnMain.length > 0 ? ` · main 위 재발사 ${t.relaunchOnMain.length}` : ''} · 라운드 ${round + 1}/${maxRounds}${revisionHoldNote}`,
   };
 }
 

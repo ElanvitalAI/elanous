@@ -16,6 +16,27 @@ import { createSessionPostureState, resolveSessionTurnProfile } from '../session
 
 const fakeConfig = { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig>;
 
+test('research surface carries the current date and allows a full sourced report', () => {
+  const baseConfig = getUserConfig();
+  const config = { ...baseConfig, chat: { ...baseConfig.chat, conciseness: {
+    enabled: true, finalMessageMaxLines: 10, preambleMaxWords: 12, flatBullets: true,
+  } } };
+  const cwd = mkdtempSync(join(tmpdir(), 'research-preamble-'));
+  try {
+    const chatModeState = createSessionPostureState();
+    const build = (userText: string) => buildDashboardTurnPreamble({
+      userText, cwd, userConfig: config, memory: false,
+      turnProfile: resolveSessionTurnProfile({ userText, chatModeState }),
+    }).map((message) => String(message.content)).join('\n');
+    const research = build('최신 채권 금리 상승 원인을 조사해줘');
+    const ordinary = build('이 함수를 고쳐줘');
+    expect(research).toContain('Current local date:');
+    expect(research).not.toContain('Keep the final response to at most');
+    expect(ordinary).not.toContain('Current local date:');
+    expect(ordinary).toContain('Keep the final response to at most');
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
 describe('buildDashboardTurnPreamble — L1 자리 부트 카드(TUI-SESSION-BOOT)', () => {
   test('사람 안내 0: 새 대화 첫 턴이 자리·안 읽은 우편 수를 말한다 — /session new 도 첫 턴에 새 카드를 얻는다', () => {
     const home = mkdtempSync(join(tmpdir(), 'preamble-seatboot-'));
@@ -140,15 +161,67 @@ describe('buildDashboardTurnPreamble — 자기접근 규율', () => {
       finishedAt: Date.now(),
     });
 
+    const idle = buildDashboardTurnPreamble({ userText: '', cwd, userConfig: fakeConfig });
+    expect(idle.some((message) => String(message.content).includes('<task-notification'))).toBe(false);
+    expect(globalTaskNotificationQueue.size).toBe(1);
     const first = buildDashboardTurnPreamble({ userText: 'continue', cwd, userConfig: fakeConfig });
     const notification = first.find((message) => message.role === 'user'
-      && String(message.content).includes('<task-notification>'));
+      && String(message.content).includes('<task-notification'));
     expect(notification?.content).toContain('background result');
 
     const second = buildDashboardTurnPreamble({ userText: 'continue', cwd, userConfig: fakeConfig });
     expect(second).toHaveLength(first.length - 1);
-    expect(second.some((message) => String(message.content).includes('<task-notification>'))).toBe(false);
+    expect(second.some((message) => String(message.content).includes('<task-notification'))).toBe(false);
     globalTaskNotificationQueue.clear();
+  });
+
+  test('알림 자동 재개는 비요청 status receipt로 한 번 요약하고, 사용자 요청이 있으면 기존 흐름을 보존한다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'preamble-notify-receipt-'));
+    const events: Array<{ category: string; event: string; data?: unknown }> = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+      if (category === 'tui.notify') events.push({ category, event, data });
+    }) as typeof debug.log);
+    const enqueue = (taskId: string) => globalTaskNotificationQueue.enqueue({
+      taskId, agentName: 'receipt-child', state: 'done', output: `result-${taskId}`,
+      truncated: false, durationMs: 20, finishedAt: Date.now(),
+    });
+    try {
+      globalTaskNotificationQueue.clear();
+      enqueue('notify-only');
+      const receiptTurn = buildDashboardTurnPreamble({
+        userText: '[자동 재개] 위임 끝: receipt-child (done) — <task-notification> 의 결과를 읽고 이어서 처리',
+        cwd, userConfig: fakeConfig,
+      });
+      const receiptText = receiptTurn.map(message => String(message.content)).join('\n');
+      expect(receiptText).toContain('<task-notification kind="status-receipt" request="none">');
+      expect(receiptTurn.filter(message => message.role === 'system'
+        && String(message.content).includes('[알림 전용 턴]'))).toHaveLength(1);
+      expect(receiptText).toContain('Agent 또는 SelfImplement 위임을 시작하지 않는다');
+      expect(receiptText).toContain('한 번의 간결한 상태 요약만 답하고 멈춘다');
+      expect(events).toHaveLength(1);
+      expect(events[0]?.event).toBe('notification-only-turn');
+
+      globalTaskNotificationQueue.clear();
+      enqueue('notify-with-request');
+      const requestedTurn = buildDashboardTurnPreamble({
+        userText: '이 결과를 참고해 다음 작업을 구현해줘', cwd, userConfig: fakeConfig,
+      });
+      const requestedText = requestedTurn.map(message => String(message.content)).join('\n');
+      expect(requestedText).toContain('<task-notification>');
+      expect(requestedTurn.some(message => String(message.content).includes('[알림 전용 턴]'))).toBe(false);
+      expect(events).toHaveLength(2);
+      expect(events[1]?.event).toBe('notification-with-user-request');
+
+      const productionShapeWake = buildDashboardTurnPreamble({
+        userText: 'Context:\nDashboard mode: browse\n\nQuestion: [자동 재개] 위임 끝: receipt-child (done) — <task-notification> 의 결과를 읽고 이어서 처리',
+        cwd, userConfig: fakeConfig,
+      });
+      expect(productionShapeWake.some(message => message.role === 'system'
+        && String(message.content).includes('[알림 전용 턴]'))).toBe(true);
+    } finally {
+      globalTaskNotificationQueue.clear();
+      spy.mockRestore();
+    }
   });
 
   test('preamble 에 [elanous 자기접근 규율] system 메시지가 포함된다', () => {

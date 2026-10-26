@@ -23,7 +23,6 @@ import { createArtifactStore } from '../artifact/index.js';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
-import { forkSessionById, HARNESS_SESSION_ORIGIN, isHarnessSessionOrigin } from '../session/index.js';
 import { configuredWorktreeRoot, getUserConfig, resolveActiveProvider, resolveRoleLlm } from '../user-config.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { addHarnessQueue } from '../harness/harness-queue.js';
@@ -1305,7 +1304,9 @@ type SameCellRebindDecision =
 type SameCellRebindExtra = { boundPr?: number; detail?: string };
 
 /** 같은 칸 새 draft 뒤 카드 재결속 — 사유를 다섯 갈래로 나눠 남기고, 카드 저장소가 없는 실행은 던지지 않고
- *  deferred 로 돌려준다(Pod 자식은 본부 카드 저장소가 없다 · 부모 pr-terminal 결속은 #29948 이 맡는다). */
+ *  deferred 로 돌려준다(Pod 자식은 본부 카드 저장소가 없다 · 부모 pr-terminal 결속은 #29948 이 맡는다).
+ *  카드 저장소가 있는 호스트에서 card-missing·card-id-absent 는 조용한 성공이 아니라
+ *  debug.log('self-implement.same-cell','rebind-missing-on-host',{reason}) 경고로 분리한다(#30021 r4 shouldFix). */
 function rebindSameCellCardToPr(input: {
   taskCardId: string | undefined;
   storePath: string;
@@ -1329,8 +1330,14 @@ function rebindSameCellCardToPr(input: {
     debug.log('self-implement.pr', 'same-cell-card-rebind-failed', { ...base, ...extra, reason }, { level: 'warn' });
     throw new Error(`same-cell 새 draft ${input.url} 개설됨; 카드 재결속 실패(${reasonText}) — 새 PR 수확 필요`);
   };
-  if (!input.taskCardId) return deferred('card-id-absent');
-  if (!existsSync(input.storePath)) return deferred('card-store-absent');
+  const hostStore = existsSync(input.storePath);
+  /** 호스트(카드 저장소 있음)인데 결속 대상이 없으면 deferred 로 조용히 지나가지 않고 경고 이벤트로 분리한다. */
+  const missingOnHost = (reason: SameCellCardRebindReason): SameCellCardRebindObservation => {
+    debug.log('self-implement.same-cell', 'rebind-missing-on-host', { ...base, reason }, { level: 'warn' });
+    return deferred(reason);
+  };
+  if (!input.taskCardId) return hostStore ? missingOnHost('card-id-absent') : deferred('card-id-absent');
+  if (!hostStore) return deferred('card-store-absent');
   let decision: SameCellRebindDecision | undefined;
   let updated: ReturnType<typeof updateTaskCard>;
   try {
@@ -1372,7 +1379,7 @@ function rebindSameCellCardToPr(input: {
     case 'manual-ref':
       return failed('manual-ref');
     case 'card-missing':
-      return deferred('card-missing');
+      return missingOnHost('card-missing');
     case 'already-rebound':
       observe('already-rebound');
       return { outcome: 'already-rebound', reason: 'already-rebound', cardId, oldPr: input.oldPr, newPr: input.newPr };
@@ -1674,6 +1681,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
     },
 
     forkSession: async (parentSessionId) => {
+      const { forkSessionById, HARNESS_SESSION_ORIGIN, isHarnessSessionOrigin } = await import('../session/index.js');
       const forked = forkSessionById(parentSessionId, { origin: HARNESS_SESSION_ORIGIN });
       if (!forked) throw new Error(`self-implement fork: source session not found — ${parentSessionId}`);
       if (!isHarnessSessionOrigin(forked.meta.origin)) {
@@ -1738,7 +1746,11 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       }
       // P1 — 대상 repo: 명시 repoRoot(외부 개발) 우선, 없으면 데몬 cwd 의 repo(=elanous 자신·현행).
       const repoRoot = o.repoRoot ?? resolveMainRepoRoot(process.cwd()) ?? process.cwd();
-      const r = createWorktree({
+      // Keep the optional Pod-only implementation out of the TUI's static module graph.
+      const inPlaceCandidate = process.env.ELANOUS_POD_INPLACE_WORKTREE === '1'
+        ? (await import('./pod-inplace-worktree.js')).tryCreatePodInplaceWorktree({ repoRoot, cwd: process.cwd(), branch, ...(base ? { base } : {}), runId, ...(goalFile ? { goalFile } : {}), env: process.env })
+        : null;
+      const r = inPlaceCandidate ?? createWorktree({
         repoRoot,
         branch,
         worktreeRoot: configuredWorktreeRoot(),
@@ -1748,6 +1760,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         ...(base ? { base } : {}),
         ...(runId ? { currentOwner: `dev:${runId}` } : {}),
       });
+      const inPlace = 'inPlace' in r && r.inPlace === true;
       if (r.resolvedBase) baselineRefs.set(r.path, r.resolvedBase);
       const benchId = benchIdFromBase(base);
       if (benchId) benchWorktrees.set(r.path, benchId);
@@ -1775,6 +1788,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           baseIsIntegration: baseIsIntegration(r.path, r.resolvedBase),
           baseFreshness: r.baseFreshness,
           ...(r.reused ? { reused: true } : {}),
+          ...(inPlace ? { inPlace: true } : {}),
           ...provenance,
         };
         const goalMetadata: HarnessWorktreeGoalMetadata = {
@@ -1795,6 +1809,8 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         const provenanceError = error instanceof Error ? error.message : String(error);
         // Manual creation rolls back on a metadata failure; self-implement retains its workspace and continues.
         debug.log('self-implement', 'worktree-provenance-failed', { path: r.path, ...(provenance ?? {}), reason: provenanceError }, { level: 'warn' });
+        // This source tree is also the Pod's recovery anchor. Never continue in-place without an owner marker.
+        if (inPlace) throw new Error(`pod in-place provenance unavailable: ${provenanceError}`);
         return {
           path: r.path,
           branch: r.branch,
@@ -1804,6 +1820,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           baseIsIntegration: baseIsIntegration(r.path, r.resolvedBase),
           baseFreshness: r.baseFreshness,
           ...(r.reused ? { reused: true } : {}),
+          ...(inPlace ? { inPlace: true } : {}),
           provenanceError,
         };
       }
@@ -2598,19 +2615,24 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
                 // ⛔ writer 가 넘긴 command 를 믿지 않는다 — **로그에서 직접** 뽑아 문서와 대조한다(리뷰 must-fix).
         "const cm = testLine.match(/^\\[test\\]\\s+PASS\\s+(.+?)\\s*(?:—|$)/); if (!cm) process.exit(1);",
         "const cmdFromLog = cm[1].trim();",
-        "if (sections.some((p) => p.indexOf(cmdFromLog) < 0)) process.exit(1);",
+        "if (body('## 불변식').indexOf(cmdFromLog) < 0) process.exit(1);",
         // 문서가 baseline 문면도 담고 있어야 한다 — 근거가 문서 안에서 재검증 가능해야 한다.
                 // ⛔ 부분 문자열이 아니라 **로그의 baseline 줄 전체**와 대조한다 — `preexisting=9` 같은
         //   불일치가 통과하면 근거가 근거가 아니다(리뷰 must-fix).
         "const bl = log.split('\\n').find((l) => l.indexOf('[gate-baseline]') === 0);",
         "if (bl) { if (!/^\\[gate-baseline\\] introduced=0, preexisting=0, unknown=0, precondition-unmet=0(?:,|$)/.test(bl)) process.exit(1); if (e.baselineLine !== bl.trim()) process.exit(1); if (sections.some((p) => p.indexOf(bl.trim()) < 0)) process.exit(1); }",
         "else { if (e.baselineLine !== undefined) process.exit(1); if (sections.some((p) => p.indexOf('baseline not run (test PASS)') < 0)) process.exit(1); }",
-        // ② 조건 줄의 명령을 **그 필드에서** 파싱해 대조한다 — 절 어딘가에 있으면 통과하던 것을 막는다.
+        // ② 조건 줄의 저작 명령을 **그 필드에서** 파싱하고, 해당 명령의 별도 실행 결과가
+        // 정확히 일치하며 0으로 끝났는지 확인한다. 게이트 측정 명령은 독립된 증거다.
         "const condLine = body('## 불변식').split('\\n').find((l) => l.indexOf('조건 —') >= 0); if (!condLine) process.exit(1);",
+        // 불변식에는 writer가 측정한 명령 전문을 기록하므로, 원문 gate 명령이 해당 필드에도 있어야 한다.
         "if (condLine.indexOf(cmdFromLog) < 0) process.exit(1);",
+        "const signalLine = body('## 판정 신호').split('\\n').find((l) => l.indexOf('- Condition:') >= 0);",
+        "const authoredCommand = signalLine?.match(/- Condition:\\s*(.+?)\\s*$/)?.[1]?.trim().replace(/^`([^`]+)`(?=\\s|를|$)/, '$1').replace(/\\s*를\\s*실행한다[.。]?$/, '').replace(/[.。]$/, '').trim();",
+        "if (authoredCommand) { const s = e.authoredSignal; if (!s || s.command !== authoredCommand || s.exitCode !== 0) process.exit(1); const rendered = body('## 판정 신호'); if (!rendered.includes('exit 0') || !rendered.includes(s.command)) process.exit(1); const raw = (s.stdout + '\\n' + s.stderr).trim().slice(-1200) || '(출력 없음)'; if (!rendered.includes(raw.replace(/\\r?\\n/g, ' ⏎ '))) process.exit(1); }",
         // ⭐ 핵심 — 문서의 관측값이 로그의 값과 다르면 거부한다.
         "if (String(e.observedFail) !== String(failFromLog)) process.exit(1);",
-        "if (body('## 판정 신호').indexOf('fail ' + failFromLog) < 0) process.exit(1);",
+        "if (!e.authoredSignal && body('## 판정 신호').indexOf('fail ' + failFromLog) < 0) process.exit(1);",
         // ⛔ 불변식 쪽 관측값도 대조한다 — 한쪽만 보면 다른 쪽에 거짓 수치가 들어간다(리뷰 must-fix).
         "if (body('## 불변식').indexOf('관측됨 — fail ' + failFromLog) < 0) process.exit(1);",
         // 문서 어디에도 로그와 **다른** fail 수치가 있으면 안 된다(정규식은 런타임에 만든다).
@@ -2623,8 +2645,9 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         //   그 안에 게이트 로그가 통째로 들어 있어 `$(...)`·백틱이 **셸에서 실행**될 수 있었다(리뷰 must-fix).
         //   ⇒ 파일로 넘기고 검사기가 읽는다. 명령 문자열에는 **고정 리터럴만** 남는다.
         writeFileSync(join(root, 'evidence.json'), JSON.stringify(evidence));
+        writeFileSync(join(root, 'checker.cjs'), checker);
         const rule = withIndependentChecker({ kind: 'and', rules: [] }, {
-          command: `bun -e ${JSON.stringify(checker)}`,
+          command: 'bun checker.cjs',
           timeoutMs: 5_000,
         });
         const outcome = await evaluateTermination(rule, { vault: {} as never, budget: {} as never, goalRoot: root });

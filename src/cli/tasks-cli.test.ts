@@ -23,7 +23,14 @@ import { remoteLedgerMirrorDir } from '../task-agent/parent-host.js';
 import { adoptExistingPr, adoptedRunTerminal } from '../task-agent/adopt-pr.js';
 import { cardsBoard, type BoardNode } from '../task-agent/board.js';
 import { resetUserConfig } from '../user-config.js';
-import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, greenCloseDeclaredPaths, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TaskDoctorReport, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
+import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, greenCloseDeclaredPaths, podParentLaunchSelectors, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TaskDoctorReport, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
+
+test('Pod in-place worktree opt-in reaches the remote parent without forwarding unrelated HQ env', () => {
+  expect(podParentLaunchSelectors({}, { ELANOUS_POD_INPLACE_WORKTREE: '1', ELANOUS_POD_MEMORY_TIER: 'high', SECRET_TOKEN: 'private' }))
+    .toEqual({ ELANOUS_POD_INPLACE_WORKTREE: '1', ELANOUS_POD_MEMORY_TIER: 'high' });
+  expect(podParentLaunchSelectors({}, { ELANOUS_POD_INPLACE_WORKTREE: 'yes' })).toEqual({ ELANOUS_POD_INPLACE_WORKTREE: '0' });
+  expect(podParentLaunchSelectors({}, {})).toEqual({});
+});
 
 test('green close current checklist scope cannot be narrowed by an old TA card', () => {
   expect(greenCloseDeclaredPaths('대상 경로: src/one.ts · src/two.ts\n완료 경계 코드: 둘 다', ['src/one.ts']))
@@ -32,6 +39,31 @@ test('green close current checklist scope cannot be narrowed by an old TA card',
 });
 
 const token = 'secret-acp-token-sentinel';
+test('saturated and unknown parent capacity reports measured reasons without remote launch', async () => {
+  const events: Array<{ host: string; gaps: string[] }> = [];
+  const off = debug.registerSink({ name: 'capacity-refusal-cli-test', emit: (rec) => {
+    if (rec.category === 'task-agent' && rec.event === 'parent-host-fallback') events.push(rec.data as { host: string; gaps: string[] });
+  } });
+  const calls: string[] = [];
+  const ssh = (host: string, script: string) => {
+    calls.push(`${host}:${script}`);
+    if (host === 'unknown') return { status: 255, stdout: '', stderr: 'timeout' };
+    return { status: 0, stdout: '__ELANOUS_PARENT_CAPACITY__4\n'
+      + Array.from({ length: 10 }, (_, i) => JSON.stringify({ category: 'pod-lease', event: 'admit-by-usage', data: { runId: `waiting-${i}`, recommended: 0 } })).join('\n') + '\n'
+      + '__ELANOUS_PARENT_APPROVALS__\n__ELANOUS_PARENT_LOAD__0.000\n__ELANOUS_PARENT_LOAD__cores=4\n', stderr: '' };
+  };
+  const spawn: DetachedSpawn = () => ({ pid: 7, once(event: string, listener: () => void) { if (event === 'spawn') queueMicrotask(listener); return this; }, removeListener() { return this; }, unref() {} } as unknown as ReturnType<DetachedSpawn>);
+  try {
+    const result = await defaultTaskLauncher(['harness', 'say', 'goal'], undefined, { runId: 'run-capacity-refused', launchId: 'tl-capacity-refused', env: { ELANOUS_RUN_ID: 'run-capacity-refused' } }, {
+      parentHost: [{ host: 'measured', cwd: '/repo', approvalCapacity: 14 }, { host: 'unknown', cwd: '/repo', approvalCapacity: 14 }],
+      ssh, spawn, earlyExitWindowMs: 0, launchHoldActive: () => false, notice: () => {},
+    });
+    expect(result).toEqual({ runId: 'run-capacity-refused' });
+    expect(events).toContainEqual(expect.objectContaining({ host: 'measured', gaps: ['capacity-unavailable · host active=4 waiting=10 limit=14 headroom=0'] }));
+    expect(events).toContainEqual(expect.objectContaining({ host: 'unknown', gaps: ['capacity-unavailable · measurement=unknown'] }));
+    expect(calls.every((call) => !call.includes('nohup'))).toBe(true);
+  } finally { off(); }
+});
 test('tasks repair-outcomes reads repair-result in the card ledger, not rejudge decisions', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ta-repair-outcomes-'));
   try {
@@ -202,6 +234,62 @@ test('new-card PR adoption pins the selected checklist version and rejects a sec
     writeFileSync(path, JSON.stringify({ tasks: { [second.id]: second } }));
     expect(() => adoptExistingPr({ pr: { ...pr, number: 82, url: pr.url.replace('/80', '/82') }, repo: 'ElanvitalAI/elanous', statePath: path,
       checklist: { version: '0.2.26', id: 'CELL', title: 'work', status: 'yellow' } })).toThrow('--card로 그 카드를 선택');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks adopt-pr --rebind atomically moves a failed old-version PR to a new checklist card', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-adopt-rebind-'));
+  try {
+    const path = join(dir, 'cards.json');
+    const url = 'https://github.com/ElanvitalAI/elanous/pull/31230';
+    const old: TaskCard = { id: 'ta-old-version', text: 'old cell', checklistId: 'OLD-CELL', checklistVersion: '0.2.36',
+      status: 'failed', taLand: true, runId: 'run-old', createdAt: '2026-10-22T00:00:00Z',
+      pr: { number: 31230, url }, adoptedPr: { pr: 31230, url, head: 'a'.repeat(40), at: '2026-10-22T01:00:00Z' },
+      history: [{ at: '2026-10-22T01:00:00Z', event: 'pr-adopted', pr: 31230, head: 'a'.repeat(40), detail: 'original binding' }] };
+    writeTaskCards(path, [old]);
+    let launches = 0;
+    const deps: TasksCliDeps = {
+      taskStatePath: path, registerSink: async () => {}, taskLauncher: async () => { launches++; },
+      adoptPrView: () => ({ number: 31230, url, state: 'OPEN', baseRefName: 'main', headRefOid: 'b'.repeat(40) }),
+      adoptChecklist: (version) => ({ version, released: '', dev: '', items: version === '0.2.39'
+        ? [{ id: 'ADOPT-PR-CROSS-VERSION', title: 'new target', status: 'yellow', updatedAt: '', updatedBy: '' }] : [], history: [] }),
+    };
+    const result = await run(['tasks', 'adopt-pr', '31230', '--checklist', 'ADOPT-PR-CROSS-VERSION', '--version', '0.2.39', '--rebind', '--json'], deps);
+    expect(result.code ?? 0).toBe(0);
+    const output = JSON.parse(result.lines[0]!) as { card: string; previousCard: string; pr: number; created: boolean; changed: boolean };
+    expect(output).toMatchObject({ previousCard: old.id, pr: 31230, created: true, changed: true });
+    const released = readTaskCard(old.id, path)!;
+    expect(released.status).toBe('failed');
+    expect(released.pr).toBeUndefined();
+    expect(released.adoptedPr).toBeUndefined();
+    expect(released.taLand).toBeUndefined();
+    expect(released.history[0]).toEqual(old.history[0]);
+    expect(released.history.at(-1)).toMatchObject({ event: 'pr-rebound-out', pr: 31230, head: 'b'.repeat(40) });
+    expect(released.history.at(-1)?.detail).toContain(output.card);
+    const adopted = readTaskCard(output.card, path)!;
+    expect(adopted).toMatchObject({ checklistId: 'ADOPT-PR-CROSS-VERSION', checklistVersion: '0.2.39', status: 'launched', taLand: true,
+      pr: { number: 31230, url }, adoptedPr: { pr: 31230, url, head: 'b'.repeat(40) } });
+    expect(adopted.history[0]).toMatchObject({ event: 'pr-adopted', pr: 31230, head: 'b'.repeat(40) });
+    expect(launches).toBe(0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('tasks adopt-pr --rebind refuses a live old-card run without exact terminal PR evidence', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ta-adopt-rebind-live-'));
+  try {
+    const path = join(dir, 'cards.json');
+    const url = 'https://github.com/ElanvitalAI/elanous/pull/31230';
+    const old: TaskCard = { id: 'ta-old-live', text: 'old cell', checklistId: 'OLD-CELL', checklistVersion: '0.2.36',
+      status: 'launched', taLand: true, runId: 'run-old', createdAt: '2026-10-22T00:00:00Z', history: [], pr: { number: 31230, url } };
+    writeTaskCards(path, [old]);
+    const result = await run(['tasks', 'adopt-pr', '31230', '--checklist', 'ADOPT-PR-CROSS-VERSION', '--version', '0.2.39', '--rebind'], {
+      taskStatePath: path, registerSink: async () => {}, adoptRunTerminal: () => false,
+      adoptPrView: () => ({ number: 31230, url, state: 'OPEN', baseRefName: 'main', headRefOid: 'b'.repeat(40) }),
+      adoptChecklist: (version) => ({ version, released: '', dev: '', items: [{ id: 'ADOPT-PR-CROSS-VERSION', title: 'new target', status: 'yellow', updatedAt: '', updatedBy: '' }], history: [] }),
+    });
+    expect(result.code).toBe(1);
+    expect(result.lines[0]).toContain('원본 런 종결·정확한 PR 근거가 없다');
+    expect(readTaskCard(old.id, path)).toEqual(old);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1783,6 +1871,34 @@ test('TA-LIVE-MOVE-CARD-HISTORY — tasks show <card> reads the card ledger and 
     '수: 2026-10-10T02:00:00.000Z · propose-land shadow · executed=false ok=— · PR #9 · 효과: none — shadow (not executed) · judged\\nsecond line\\rthird',
   ]);
   expect(result.lines.some((line) => line.startsWith('다음 수: '))).toBe(true);
+});
+
+test('CARD-GOAL-BODY-EXPOSE — tasks show --json includes bounded authored-goal evidence and section flags', async () => {
+  const taskStatePath = join(mkdtempSync(join(tmpdir(), 'tasks-card-goal-')), 'task-agent-actions.json');
+  const goalBody = [
+    '# Goal',
+    '## TDD Plan',
+    'Write a failing test first.',
+    '## 완료 경계',
+    'Focused test passes.',
+    '[KNOWHOW-PACK v1 ids=K-MK-01]',
+    'x'.repeat(9_000),
+  ].join('\n');
+  writeFileSync(taskStatePath, JSON.stringify({ tasks: { 'ta-goal-proof': {
+    id: 'ta-goal-proof', text: 'implement goal', goalId: 'a'.repeat(16), runId: 'run-goal-proof',
+    createdAt: '2026-10-25T00:00:00.000Z', status: 'launched', history: [],
+  } } }));
+  const result = await run(['tasks', 'show', 'ta-goal-proof', '--json'], {
+    taskStatePath, registerSink: async () => true,
+    cardGoalDocument: (goalId) => goalId === 'a'.repeat(16) ? { goalFile: 'docs/goals/GOAL-proof.md', goalBody } : null,
+  });
+  const json = JSON.parse(result.lines[0] ?? '{}');
+  expect(json).toMatchObject({
+    goalFile: 'docs/goals/GOAL-proof.md', hasTddPlan: true, hasBoundary: true, knowhowInjected: true,
+  });
+  expect(json.goalBody).toContain('## TDD Plan');
+  expect(json.goalBody.length).toBeLessThan(goalBody.length);
+  expect(json.goalBody).toContain('[KNOWHOW-PACK v1 ids=K-MK-01]');
 });
 
 test('TA-REVIEW-RESULT-CAPTURE — tasks show <card> captures a pending review result file into a live-move-result line and prints it', async () => {

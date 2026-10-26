@@ -94,6 +94,7 @@ export function remoteSelfGateArgv(input: {
   changed?: boolean;
   base?: string;
   shards?: number;
+  shardConcurrency?: number;
   fixedShardDistribution?: boolean;
   includeImporters?: boolean;
   artifactDir?: string;
@@ -102,6 +103,7 @@ export function remoteSelfGateArgv(input: {
   return ['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', ...(input.changed ? ['--changed'] : []),
     ...(input.base ? ['--base', input.base === 'origin/main' ? input.base : sha(input.base)] : []),
     ...(shards !== undefined ? ['--shards', String(shards)] : []),
+    ...(input.shardConcurrency !== undefined ? ['--shard-concurrency', String(input.shardConcurrency)] : []),
     ...(input.fixedShardDistribution ? ['--fixed-shard-distribution'] : []),
     ...(input.includeImporters ? ['--include-importers'] : []),
     ...(input.artifactDir ? ['--artifact-dir', input.artifactDir] : [])];

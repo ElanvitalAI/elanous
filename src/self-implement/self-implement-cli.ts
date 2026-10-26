@@ -19,6 +19,7 @@ import type { DocumentReferenceStatus } from './self-implement-runtime.js';
 import { resolveObserveOnlyDecision } from './observe-only.js';
 import { getUserConfig } from '../user-config.js';
 import { resolveAutoReview } from './context-capsule.js';
+import { readDecomposeProposals } from '../self-dev/decompose-proposal.js';
 
 /** self implement CLI 옵션(commander) — `--no-draft` 는 draft:false 로, `--max-wait` 는 문자열로 도착. */
 export interface SelfImplementCliOpts {
@@ -71,6 +72,28 @@ export interface SelfImplementCliDeps {
   }>;
   /** runDevPipeline 내부 배선 주입(runSelfImplement/seams 등·테스트). */
   pipelineDeps?: DevPipelineDeps;
+  /** Parent-side run-ledger observation, injected to verify terminal JSON evidence. */
+  readGoalPlanRevision?: typeof readDecomposeProposals;
+}
+
+function attachGoalPlanRevisionObservation(
+  result: SelfImplementResult,
+  deps: SelfImplementCliDeps,
+): SelfImplementResult {
+  if (result.goalPlanRevision !== undefined || typeof result.runId !== 'string' || !result.runId.trim()) return result;
+  try {
+    // The ledger reader joins by shardId when present and otherwise by runId; a single-run
+    // child uses its runId as either key depending on the writer, so query both explicitly.
+    const scan = (deps.readGoalPlanRevision ?? readDecomposeProposals)({
+      shardIds: [result.runId],
+      runIds: [result.runId],
+    });
+    const observation = scan.goalPlanRevisions.get(result.runId) ?? scan.readFailure;
+    return observation ? { ...result, goalPlanRevision: observation } : result;
+  } catch {
+    // An unavailable observation stays absent; the supervisor treats that as a hold.
+    return result;
+  }
 }
 
 /**
@@ -210,6 +233,7 @@ export async function runSelfImplementCliCommand(
       : deps.pipelineDeps;
     const exec = deps.executeReroute ?? executeSelfImplementReroute;
     let { result, exitCode } = await exec(spec, pipelineDeps ? { pipelineDeps } : undefined);
+    result = attachGoalPlanRevisionObservation(result, deps);
 
     // ⭐⭐⭐ 단일 실행도 «루프»를 지난다 (E2) — 판정자는 연합과 «같은 자»다.
     //   ⛔ 종전엔 단일이 실패하면 그냥 끝났다. 아무도 「다시 걸까」를 묻지 않았다.
@@ -257,9 +281,9 @@ export async function runSelfImplementCliCommand(
         rerun: async (_, invocation) => {
           const repairGoal = invocation.repairGoals?.[initialJob.taskId];
           const next = await exec(repairGoal ? { ...spec, input: { ...spec.input, text: repairGoal } } : spec, pipelineDeps ? { pipelineDeps } : undefined);
-          result = next.result;
+          result = attachGoalPlanRevisionObservation(next.result, deps);
           exitCode = next.exitCode;
-          return [{ ...singleRunAsJobResult(feature, next.result), taskId: initialJob.taskId }];
+          return [{ ...singleRunAsJobResult(feature, result), taskId: initialJob.taskId }];
         },
       });
     }

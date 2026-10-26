@@ -543,6 +543,8 @@ describe('doctor --fix', () => {
         discoverChromeBinary: () => null,
         loadNativeModule: () => false,
         listAuthProviders: () => [],
+        // Four CLI calls must not probe this host's local LLM servers.
+        localLlmInventory: async () => ({ nodes: [], models: [], at: 0, cached: false, warnings: [] }),
         codeRevision: () => undefined,
         fetchHealth: () => null,
         readInstallPrefix: () => { probes.push('install-prefix'); return '/install/elanous'; },
@@ -669,6 +671,7 @@ test('registered doctor emits neither provider value in JSON or human output', a
       commandExists: () => false,
       discoverChromeBinary: () => null,
       loadNativeModule: () => false,
+      localLlmInventory: async () => ({ nodes: [], models: [], at: 0, cached: false, warnings: [] }),
       out: { log: (line) => logs.push(line) },
       setExitCode: () => {},
     });

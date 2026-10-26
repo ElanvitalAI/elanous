@@ -16,6 +16,8 @@ import { parse as parseYaml } from 'yaml';
 import { runGraph, validateUnitCalls, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
+import { getUserConfig } from '../user-config.js';
+import { readBudgetInputsLive, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harness-space.js';
 import { newLaunchUtteranceId, recordLaunchUtterance } from '../harness/launch-utterance-ledger.js';
 import { debug } from '../debug/log.js';
@@ -33,7 +35,7 @@ import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDone
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
 import { draftClaimComment, draftClaimRecordLive, draftClaimState, draftReleaseComment } from '../self-dev/draft-triage-rules.js';
 import { parseAskTargetPathHints, parseAskTargetPathHintsResult, type AskTargetPathHintsParseResult } from '../self-dev/launch-preflight-text.js';
-import { inspectGoalDoneBoundary, linesOutsideFencedCode } from '../self-implement/goal-author.js';
+import { draftMissingGoalDoneBoundary, inspectGoalDoneBoundary, linesOutsideFencedCode } from '../self-implement/goal-author.js';
 import { selectKnowhowPack } from '../self-implement/knowhow-pack.js';
 import { INFLIGHT_REGISTRY_FILE, registerInflight } from '../pr-tool/inflight-registry.js';
 import { taskParentRoleEnv, taskParentRolePinsForChild } from './task-parent-role-llm.js';
@@ -384,6 +386,11 @@ export interface TaskCard {
   repairs?: Array<{ pr: number; head: string; branch: string; at: string; move: string; runId: string;
     resultPath: string; fromModel: string; toModel: string; status: 'requested' | 'unconfirmed' | 'failed' | 'applied';
     detail?: string; commit?: string; bundleSha256?: string; bundlePath?: string;
+    /** Hash of exact review must-fix text at launch; old records have no comparable input. */
+    reviewSignature?: string;
+    /** Stable worker failure class; absent means retry policy remains unchanged. */
+    failureSignature?: string;
+    gateFailureTests?: string[];
     /** HARNESS-FULL-GRAPH-NEXTMOVE — next-move 결정 순간 만든 수 id. 이 칸 전 원장 줄엔 없다. */
     moveId?: string }>;
 }
@@ -779,6 +786,23 @@ export function writeTaskCards(path: string, cards: readonly TaskCard[]): void {
   });
 }
 
+/** 여러 카드의 관계 변경을 한 잠금 안에서 검사·기록한다(예: 기존 PR 결속 이동). */
+export function updateTaskCardsAtomically(path: string,
+  update: (tasks: Readonly<Record<string, TaskCard>>) => readonly TaskCard[] | undefined): TaskCard[] | undefined {
+  return withFileLockSync(`${path}.lock`, () => {
+    const disk = readState(path);
+    const current = disk.tasks ?? {};
+    const replacements = update(current);
+    if (!replacements) return undefined;
+    if (!replacements.length || replacements.some((card) => !card.id)) throw new Error('카드 원자 갱신은 id가 있는 카드가 필요하다');
+    const tasks = { ...current };
+    for (const card of replacements) tasks[card.id] = card;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({ ...disk, tasks }));
+    return [...replacements];
+  });
+}
+
 /** 카드 하나를 잠금 안에서 읽고 고쳐 쓴다 — `update` 가 undefined 를 돌려주면 쓰지 않는다. 쓴(또는 그대로인) 카드를 돌려준다. */
 export function updateTaskCard(path: string, id: string, update: (card: TaskCard | undefined, tasks: Readonly<Record<string, TaskCard>>) => TaskCard | undefined,
   options: { doctorLedgerDir?: string } = {}): TaskCard | undefined {
@@ -1020,6 +1044,8 @@ export interface HandTaskOptions {
   /** TASKS-HAND-CHILD-LLM — `<provider>/<model>`(`parseChildLlm`) ⊕ 선택 추론 노력. effort 만 주면 거부. */
   childLlm?: string;
   childLlmEffort?: string;
+  /** Injected budget facts for a mission child; production reads the live launch-budget inputs just before launch. */
+  childBudgetInputs?: () => Promise<BudgetInputs> | BudgetInputs;
   parentRoleLlm?: string[];
   tier?: TaskCard['tier'];
   /** TIER-SPLIT-BEFORE-LAUNCH — 조각 카드에 싣는 분해 연결(`tier-split.ts` 만 준다). */
@@ -1121,6 +1147,7 @@ export function dispatchDeliverableCompletion(id: string, input: { ref: string; 
 const GOAL_EVIDENCE_COMMAND_LINE = /^\s*(?:[-*]\s*)?완료 경계 증거 명령\s*:\s*(.*?)\s*$/;
 const GOAL_EVIDENCE_COMMAND_DESCRIPTION_SUFFIX = /->|→/;
 const GOAL_EVIDENCE_COMMAND_BACKTICK_DECORATION = /`/;
+const GOAL_EVIDENCE_COMMAND_TYPECHECK_DECORATION = /·\s*typecheck\b/i;
 
 function goalEvidenceCommandFormViolations(document: string): string[] {
   const violations: string[] = [];
@@ -1129,6 +1156,7 @@ function goalEvidenceCommandFormViolations(document: string): string[] {
     if (value === undefined || !value.trim()) continue;
     if (GOAL_EVIDENCE_COMMAND_BACKTICK_DECORATION.test(value)) violations.push(`백틱 장식: ${value}`);
     else if (GOAL_EVIDENCE_COMMAND_DESCRIPTION_SUFFIX.test(value)) violations.push(`설명 접미: ${value}`);
+    else if (GOAL_EVIDENCE_COMMAND_TYPECHECK_DECORATION.test(value)) violations.push(`설명 접미: ${value}`);
   }
   return violations;
 }
@@ -1165,8 +1193,14 @@ function firstLinePathListViolations(hints: AskTargetPathHintsParseResult): stri
 }
 
 export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
-  const text = opts.text.trim();
+  const { normalizeEvidenceCommandLines } = await import('./evidence-command-normalize.js');
+  const normalized = normalizeEvidenceCommandLines(opts.text.trim());
+  let text = normalized.text;
   if (!text) throw new Error('과제 한 줄이 비어 있다');
+  for (const warning of normalized.warnings) {
+    console.error(`⚠ ${warning}`);
+    try { debug.log('task-agent.hand', 'evidence-command-warning', { warning }); } catch { /* fail-soft */ }
+  }
   const path = opts.statePath ?? taskAgentStatePath();
   const targetPathHints = parseAskTargetPathHintsResult(text);
   const targetPaths = canonicalTargetPaths(targetPathHints.paths);
@@ -1197,7 +1231,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     }, birthTags);
   const childLlm = opts.childLlm !== undefined ? parseChildLlm(opts.childLlm, opts.childLlmEffort) : undefined;
   const parentRolePins = taskParentRolePinsForChild(opts.parentRoleLlm ?? [], childLlm);
-  const parentRoleEnv = taskParentRoleEnv(parentRolePins); // validate before writing the card
+  let parentRoleEnv = taskParentRoleEnv(parentRolePins); // validate before writing the card
   const completion = opts.completion ?? 'code-pr';
   const selected = selectTaskComposition(completion, opts.compositionRoot);
   // 2판 — launcher 'graph-run' 조합(단위 해석까지 완료)은 실제 graph run 으로 발사한다. 더 이상 거부하지 않는다.
@@ -1272,7 +1306,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(draftClaim ? { draftClaim } : {}),
   };
   // 2판 graph-run 조합의 다음 수는 실제 graph run — harness say 인자를 조립하지 않는다.
-  const move = graphRun && graphRunPath ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } satisfies TaskCardMove
+  let move = graphRun && graphRunPath ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } satisfies TaskCardMove
     : selectionFailure ? undefined : nextMoveFor(card, opts.landed);
   // 분해 실패로 막은 카드는 wait(failed 사유)가 정답이다 — 던지지 않고 카드를 적은 뒤 발사 0 으로 돌아간다.
   if (move && move.kind !== 'launch' && tierSplitBlocked === undefined) throw new Error(`발사할 수 없는 과제다 — ${move.reason}`);
@@ -1321,10 +1355,15 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   // Injected launchers are test seams and opt in explicitly at the contract test.
   if (opts.live && opts.preflightGoalDoneBoundary && !selectionFailure && tierSplitBlocked === undefined && move?.kind === 'launch') {
     readTaskAgentState(path);
-    const { missing } = inspectGoalDoneBoundary(text);
-    if (missing.length > 0) {
-      throw new Error(`goal-revision-required: 완료 경계 누락 ${missing.join(' · ')} — 골 문면에 완료 경계 코드·완료 경계 실물·완료 경계 증거 명령을 적은 뒤 다시 넘기세요`);
+    const drafted = draftMissingGoalDoneBoundary(text, targetPaths);
+    if (drafted.added.length > 0) {
+      text = drafted.document;
+      card = { ...card, text };
+      move = graphRun && graphRunPath ? { kind: 'launch' as const, command: ['graph', 'run', graphRunPath], reason: `조합 launcher graph-run — ${graphRun.file}` } : nextMoveFor(card, opts.landed);
+      try { debug.log('task-agent.hand', 'boundary-autodrafted', { taskId: id, labels: drafted.added, targetPathCount: targetPaths.length }); } catch { /* fail-soft */ }
     }
+    const { missing } = inspectGoalDoneBoundary(text);
+    if (missing.length > 0) throw new Error(`goal-revision-required: 완료 경계 누락 ${missing.join(' · ')}`);
     // ENTRANCE-EVIDENCE-COMMAND-ONLY — 존재 검사와 구분된 형태 판정: 증거 명령 줄은 명령 원문만 받는다.
     const formViolations = goalEvidenceCommandFormViolations(text);
     if (formViolations.length > 0) {
@@ -1419,13 +1458,58 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     writeCard(path, candidate);
     return { card: candidate, move: nextMoveFor(candidate), mode, launched: false, ...(project ? { cwd: project.target } : {}) };
   }
+  // A mission parent can carry its original explicit child model into later pieces. Recheck that model
+  // immediately before each launch; an exhausted provider must not pin every following child to the same stop.
+  if (opts.mission && card.childLlm && (card.childLlm.provider === 'grok' || card.childLlm.provider === 'openai-codex')) {
+    let inputs: BudgetInputs | undefined;
+    try { inputs = await (opts.childBudgetInputs ?? readBudgetInputsLive)(); }
+    catch (error) {
+      try { debug.log('task-agent', 'child-model-reselect-unavailable', { taskId: id,
+        reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+      catch { /* observation is fail-soft */ }
+    }
+    if (inputs) {
+      const { harnessLaunchBudgetDecision } = await import('../execution-loop/launch-gate.js');
+      const current = harnessLaunchBudgetDecision(inputs, { childLlmProvider: card.childLlm.provider,
+        childLlmModel: card.childLlm.model }).decision;
+      if (current.action === 'stop' || current.action === 'wait-reset') {
+        const alternatives = inputs.preference.chain.filter((slot) => slot.provider !== card.childLlm!.provider);
+        const next = alternatives.map((slot) => harnessLaunchBudgetDecision(inputs, {
+          childLlmProvider: slot.provider, ...(slot.model ? { childLlmModel: slot.model } : {}),
+        }).decision).find((decision) => decision.action === 'proceed' || decision.action === 'next-provider');
+        if (next?.provider) {
+          const from = card.childLlm;
+          const model = next.model ?? (await import('../self-dev/dev-cli.js')).defaultChildLlmModel(next.provider);
+          const to: TaskChildLlm = { provider: next.provider, model };
+          const nextParentRoleEnv = taskParentRoleEnv(taskParentRolePinsForChild(opts.parentRoleLlm ?? [], to));
+          const at = (opts.now ?? (() => new Date()))().toISOString();
+          card = { ...card, childLlm: to, history: [...card.history, { at, event: 'child-model-reselected',
+            detail: `${from.provider}/${from.model} → ${to.provider}/${to.model}: ${current.reasons.join(' · ')}` }] };
+          parentRoleEnv = nextParentRoleEnv;
+          move = { ...move!, command: launchArgs(card) };
+          writeCard(path, card);
+          try { debug.log('task-agent', 'child-model-reselected', { taskId: id, from, to, reason: current.reasons, mission: opts.mission }); }
+          catch { /* observation is fail-soft */ }
+        }
+      }
+    }
+  }
   // Only the code-PR harness Pod consumes podGoal. Keep the card and other launchers unchanged.
   const podLaunch = completion === 'code-pr' && selected.launcher === 'harness-say';
   let childGoal = card.text;
   if (podLaunch) {
-    const knowhow = selectKnowhowPack(project?.target ?? resolve(import.meta.dir, '../..'), card.text, targetPaths);
+    const configuredRepo = project ? undefined : getUserConfig().harness?.defaultRepo;
+    const knowhowRepo = project?.target ?? configuredRepo ?? resolve(import.meta.dir, '../..');
+    const knowhow = selectKnowhowPack(knowhowRepo, card.text, targetPaths);
     if (knowhow.text) childGoal = `${knowhow.text}\n\n${card.text}`;
-    try { debug.log('task-agent', 'knowhow-pack', { taskId: id, ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0 }); } catch { /* fail-soft */ }
+    let repoRevision: string | null = null;
+    try {
+      const head = execFileSync('git', ['-C', knowhowRepo, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      if (/^[0-9a-f]{40,64}$/i.test(head)) repoRevision = head;
+    } catch { /* The source may be absent; reason=source-unreadable records that boundary. */ }
+    try { debug.log('task-agent', 'knowhow-pack', { taskId: id, ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0,
+      reason: knowhow.reason, repoPath: knowhowRepo, repoRevision,
+      repoSource: project ? 'project' : configuredRepo ? 'harness.defaultRepo' : 'package' }); } catch { /* fail-soft */ }
   }
   const runId = mintRunId();
   const launchId = newLaunchUtteranceId();
@@ -1445,7 +1529,10 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     receipt = await opts.launcher(podLaunch ? [...move.command!.slice(0, -1), childGoal] : move.command!, project?.target, context);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const failed: TaskCard = { ...card, status: 'launch-failed', history: [{ at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch-failed', detail: reason }] };
+    const failed: TaskCard = { ...card, status: 'launch-failed', history: [
+      ...card.history.filter((entry) => entry.event === 'child-model-reselected'),
+      { at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch-failed', detail: reason },
+    ] };
     writeCard(path, failed);
     try { debug.log('task-agent', 'launch-failed', { taskId: id, seat: card.seat ?? null, reason }); } catch { /* fail-soft */ }
     throw new TaskLaunchError(failed, reason);
@@ -1462,6 +1549,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(boundRunId ? { runId: boundRunId, launchId } : {}),
     ...(receipt && receipt.parentHost && typeof receipt.parentHost.host === 'string' ? { parentHost: receipt.parentHost } : {}),
     history: [
+      ...card.history.filter((entry) => entry.event === 'child-model-reselected'),
       { at: launchedAt, event: 'launch', detail: `${receipt && receipt.parentHost ? `[parent@${receipt.parentHost.host} · PR 까지만] ` : ''}${move.command!.join(' ')}` },
       ...(boundRunId ? [{ at: launchedAt, event: 'run-bound', detail: boundRunId, runId: boundRunId }] : []),
     ],

@@ -1,0 +1,91 @@
+# Source: 44fe14face:docs/reports/gate-0226-failure-census.tsv (pre-change accepted census)
+apps/android/app/src/test/kotlin/com/elanvitalai/elanous/android/data/FeedbackEnvelopeVectors.test.ts > Android FeedbackEnvelope shared vectors > runs FeedbackEnvelopeVectorsTest and verifies every shared vector was accounted for
+apps/android/app/src/test/kotlin/com/elanvitalai/elanous/android/ui/chat/ChatHarnessBubble.test.ts > ChatScreen assistant bubble for harness-style turns > injects turn-end through NexusClient→ViewModel and observes the bubble badge
+apps/android/app/src/test/kotlin/com/elanvitalai/elanous/android/ui/chat/ChatLastItemScrollOffset.test.ts > chatLastItemScrollOffset aligns the list to the last item end > ChatScreenLayoutTest drives ChatScreenLayout and observes last-item end alignment
+scripts/hooks/claude-code-utterance.test.ts > UserPromptSubmit reaches the human Claude Code utterance query
+scripts/lib/nl-routing-measurement.test.ts > NL routing corpus runner safety gate > the runner entrypoint stops after final surface resolution with non-zero exit and safety guidance
+scripts/nl-routing-measurement.test.ts > NL routing corpus runner safety gate > the runner entrypoint stops after final surface resolution with non-zero exit and safety guidance
+scripts/release-loop/freeze-off-parity.test.ts > freeze switch off: gate, publish and unattended release are byte-identical to pre-freeze behavior
+scripts/test-deterministic.test.ts > terminateDirectChild > SIGKILLs the group when the direct child is already dead and a grandchild ignores SIGTERM
+scripts/test-diet/effectiveness.test.ts > TD3 effectiveness > measure --effectiveness counts unreachable imports and leaves unreadable results absent
+scripts/webclone/loop/mirror-age.test.ts > edition-check는 조용함을 재료 미러보다 앞에 두고, 미러는 기존 original-mirror 인자로 부른다
+scripts/webclone/loop/mirror-age.test.ts > mirror-age > 12시간 경계 양쪽과 여러 미러를 fetchedAt만으로 한 줄씩 판정한다
+scripts/webclone/loop/mirror-age.test.ts > mirror-age > 파일 mtime이 아니라 MIRROR.json fetchedAt으로 판정한다
+scripts/webclone/loop/ruler-version.test.ts > ruler-version rc 계약 > 12시간을 넘긴 기준선은 rc 1 이고 ***origin-drift 로 재라***를 같이 낸다
+scripts/webclone/loop/ruler-version.test.ts > ruler-version rc 계약 > 최근 기준선은 rc 0 이고 「묵었다」고 말하지 않는다
+scripts/webclone/measure-fidelity.test.ts > main RenderProbe wiring > 로컬 링크가 우세한 미러 진입 문서는 링크 수와 self-contained 상태를 보존한다
+scripts/webclone/measure-fidelity.test.ts > main RenderProbe wiring > 원격 링크가 60% 이상인 미러 진입 문서를 non-self-contained로 기록한다
+scripts/webclone/measure-fidelity.test.ts > main RenderProbe wiring > 통제한 로컬 원문과 성공 프로브가 최종 렌더 위치까지 JSON 산출로 연결된다
+scripts/webclone/measure-fidelity.test.ts > main mirror-entry locality wiring > 네트워크 지배 미러는 참조 수를 내고 픽셀 차이를 품질로 읽을 수 없다고 말한다
+scripts/webclone/measure-fidelity.test.ts > main mirror-entry locality wiring > 로컬 지배 미러는 참조 수를 내고 네트워크 지배 경고를 내지 않는다
+scripts/webclone/measure-fidelity.test.ts > main mirror-entry locality wiring > 미러 진입 문서가 없으면 참조 수와 지배 판정을 못 쟀다로 보존한다
+scripts/webclone/measure-fidelity.test.ts > main overlay observability wiring > 원본과 사본 처리 수를 더해 내고 잔여 덮개면 픽셀 차이를 미신뢰로 표시한다
+scripts/webclone/measure-fidelity.test.ts > main screenshot reliability wiring > 실제 정상·빈 PNG를 기본 통계 추출 경로로 읽어 RMSE를 보존하고 미러 공백 사유를 JSON에 낸다
+src/acp/grok-leader-manager.test.ts > GrokLeaderManager · ensureLeader idempotency contract > ensureLeader returns state object (does not throw)
+src/agent-mission/driver-workdir.test.ts > ignored files outside workdir are detected when created or modified
+src/agent-mission/driver-workdir.test.ts > workdir skips git, runs PTY in the folder by default, and accepts a new mp4
+src/autopilot/build/isolated-instance.test.ts > createIsolatedInstance — 주입 worktree > ★ defaultMergeMainIntoWorktree — fetch 실패 → error / up-to-date / merged (실 git)
+src/dashboard/first-screen-band-wiring.test.ts > showDashboard renders the startup band before and after the real first chat input
+src/directives/directive-index.test.ts > FTS5, incremental byte offsets, version search, redaction, track votes and labels; originals stay unchanged
+src/git-fs/spawn-discipline.test.ts > 실제 저장소 — 이 게이트가 지키는 것 > 실물 git 프론트도어는 --help를 git argv로 전달하고 상태 줄과 git 종료 코드를 보존한다
+src/git-fs/spawn-discipline.test.ts > 실제 저장소 — 이 게이트가 지키는 것 > 실물 진입점에서 scripts 유예와 요약을 산출한다
+src/graph-runner/graph-cli.test.ts > graph YAML triggers.schedule fires through the workflow scheduler into graph tick and persists a run
+src/graph-runner/graph-cli.test.ts > graph tick defaults to idle and --start passes JSON input, prints results, and does not restart a finished run
+src/graph-runner/graph-variant-cli.test.ts > a paused variant resumes from its saved graph after the original template changes
+src/graph-runner/graph-variant-cli.test.ts > a route plan without a budget also executes the changed route
+src/graph-runner/graph-variant-cli.test.ts > ambiguous outcome plan is rejected before ledger or node execution
+src/graph-runner/graph-variant-cli.test.ts > two plans on the same template execute distinct persisted variant graphs through fake nodes
+src/graph-runner/graph-variant-cli.test.ts > variant preserves unrelated node and edge metadata in its runnable snapshot
+src/harness/dogfood.test.ts > assertThrowawayTarget — C 안전 가드(auto-approve 우회 방지) > runHarnessDogfood 도 실경로 target 을 current CLI guidance와 함께 refuse
+src/harness/dogfood.test.ts > assertThrowawayTarget — C 안전 가드(auto-approve 우회 방지) > ★ 실경로(홈·repo·시스템) → refuse with current CLI guidance
+src/mss/logging/log-store.test.ts > LogStore writer contention > carries a failed open observation to the next writable connection
+src/plugins/adapters/claude-package.test.ts > readClaudePackageLedger > reads this machine live ledger without a pluginsRoot override
+src/self-implement/orchestrator-blocked-draft.test.ts > environment branch is committed and pushed to an existing origin without opening a PR
+src/self-implement/orchestrator-blocked-draft.test.ts > environment stop without origin commits changes on the local branch for checkout recovery
+src/self-implement/orchestrator-blocked-draft.test.ts > failed environment push is reported to the caller and never presented as preserved
+src/self-implement/orchestrator-blocked-draft.test.ts > missing worktree keeps provider attribution and reports failed preservation without a draft
+src/self-implement/orchestrator-blocked-draft.test.ts > no changes takes precedence over environment branch preservation
+src/self-implement/orchestrator-blocked-draft.test.ts > quota-exhausted blocked run preserves its branch without opening a draft; implementation deficit still opens one
+src/self-implement/orchestrator-blocked-draft.test.ts > worktree-only environment stop never pushes, even when an origin exists
+src/self-implement/run-chain-query.test.ts > queryRunChain > pages past a full matching dispatch result page to find an old matching session
+src/self-implement/seams-usage-role.test.ts > goal summary passes classify usage role alongside the unchanged resolved model
+src/session-runtime/coding-surface-shell.test.ts > coding surface — shell 실행 tool 노출 > runtime 없는 Agent 폴백은 부모 도구·dispatcher·중단 신호를 자식에 보존한다
+src/skills/tools/dev-harness.test.ts > dispatchRunDevHarness — P3 외부 repo 타깃 > target 실 git repo → repoRoot+elanousBinRoot 를 seam 으로
+src/task-agent/mission.test.ts > shadow --mission → 미션 카드 1 ⊕ 조각 카드 4 · 같은 상태 파일 · 선행 없는 조각만 launch 수 · 나머지 wait after
+src/task-orchestrator/surfaces/pod-pool-cli.test.ts > independent harness ask/say and self CLI dispatch run real kubectl apply only when lease permits
+src/video-pipeline/recipes/reframe.test.ts > reframe — Affinity 가 없어도 «끝까지» 간다 > ⛔ 러너가 «없어도» 멈추지 않는다 (앱이 없는 고객 기계의 모습)
+src/video-pipeline/recipes/vlog.test.ts > vlog 레시피 — 실제 ffmpeg > ⭐ build-layers — 덮는 층(스크림·자막)이 «투명»하다 (🩸 불투명 자막이 영상 전체를 덮었다)
+src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 실제 wget은 POSIX ERE를 컴파일해 www 형제 자산만 받고 외부 호스트는 받지 않는다
+test/acp-subagent-wire-meta.test.ts > AcpAgent.prompt · _meta forwarding > undefined meta → request omits _meta field
+test/ad-production.test.ts > renders planned captions after assembly while preserving the uncaptained master and named failures
+test/ad-qc-measure.test.ts > QC measurement adapter > uses distinct OCR artifacts for repeated and parallel video measurement plans
+test/dashboard-acp-boot.test.ts > bootDashboardAcpSession — boot observability > records the selected branch and every successful boot outcome
+test/dashboard-turn-typeahead-echo.test.ts > dashboard real user echo wiring > PTY screen preserves submitted Q2 → answer Q2 → submitted Q3 → answer Q3
+test/finance-tools.test.ts > finance tool surface > SQL-injection guard on attractiveness args
+test/finance-tools.test.ts > finance tool surface > finance_trend (A2.1/A4): rotation + country + guards + injection-safe
+test/harness-worktree-add.test.ts > harness worktree add > 판정 신호: goal context records a leading H1 goal title instead of structural H2 headings
+test/harness-worktree-add.test.ts > harness worktree add > 판정 신호: goal synthesis truncates generated output at 250 characters and falls back to title on empty or thrown model output
+test/intake-plane-check-repo-axis.test.ts > frequent matches do not overflow the search buffer and disclose sampling
+test/llm-openrouter-provider.test.ts > OpenRouter provider wire > ⛔ 교차 경로 — config 가 grok 이면 그 키·baseUrl 을 OpenRouter 로 «안» 보낸다
+test/nexus-api-terminals.test.ts > handleTerminalsList > merges web preview PTYs into local and federated lists with their first registration time
+test/oauth/codex-mirror-real-home-guard.test.ts > ① 가드 — 실홈이 대상이면 «던진다» (쓰기는 일어나지 않는다) > ⛔ «심볼릭 링크»로 우회해도 던진다 — 문자열 비교로는 통과했다(리뷰 must-fix)
+test/ocr-tesseract.test.ts > OcrRegistry · Tesseract picker behaviour > strengths:["context-aware"] still picks LLM Vision (Tesseract loses)
+test/persistent-grounding-runtime.test.ts > PersistentGrounding ToolRuntime > default registration alias dispatch runs the guarded search loop and records session observations
+test/persistent-grounding-runtime.test.ts > PersistentGrounding ToolRuntime > generates one session ID for ambient observations and grounding when no session ID is supplied
+test/plugin-hooks-shell.test.ts > shell-hook > array JSON → warn + {}
+test/plugin-hooks-shell.test.ts > shell-hook > env propagated to shell
+test/plugin-hooks-shell.test.ts > shell-hook > stdout JSON object → output
+test/plugin-manifest-hooks.test.ts > plugin-host hook registration > end-to-end dispatch through registered manifest hook
+test/plugin-missions-runtime.test.ts > PX-4 P3 — MissionRegistry > never policy: history grows + iteration advances each tick
+test/plugin-missions-runtime.test.ts > PX-4 P3 — MissionRegistry > score_improvement: only strictly-better score advances
+test/plugin-missions-runtime.test.ts > PX-4 P3 — runMissionEvaluator > parses JSON stdout into MissionResult
+test/preview-terminal.test.ts > PreviewTerminal > resize reaches the kernel PTY — the shell sees the new size (stty size)
+test/rules-contract.test.ts > 변경 ↔ 규칙 갱신 — sources 가 바뀌면 그 «규칙 파일»이 같은 diff 에 있다 > 이 검사가 무엇을 봤는지 «말한다»
+test/self-dev-manual-goal-evidence.test.ts > hand-authored --file goal evidence contract > passes the attached requirement to the self-implement boundary for --file input
+test/shell-audit-log.test.ts > shell-primitive audit-log: programmatic sink > run event includes truncated when output exceeds budget
+test/shell-primitive.test.ts > shell-primitive: runShell (no approval) > maxOutputChars truncates and sets truncated=true
+test/skill-tool-mermaid.test.ts > dispatchMermaidRender — happy path > renders a simple flowchart to Unicode boxes
+test/voice-tts-providers.test.ts > TTS provider availability and unpaid default > falls back to edge-tts, not openai-tts, when nobody chose and no credential resolves
+test/voice-tts-providers.test.ts > TTS provider availability and unpaid default > reports edge-tts and macos-say usable without credentials
+test/workflow-templates-packaged.test.ts > the npm package carries every workflow template the repository has
+test/plugin-missions-runtime.test.ts > [error]

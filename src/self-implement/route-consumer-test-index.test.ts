@@ -131,6 +131,7 @@ test('CLI runs the old PWA consumer when a committed server route is removed or 
         changedFiles: () => ({ files: [source], baseRef: 'HEAD' }),
         runTests: (_cwd: string, files: readonly string[]) => { ran.push([...files]); return { status: 0, stdout: '', stderr: '' }; },
         runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+        runEntryBudgetGate: () => ({ affected: false, errors: [] }),
       };
       const preflight = selectGateTestFiles(fixture.cwd, {}, deps);
       expect(ran).toEqual([]);
@@ -157,6 +158,7 @@ test('CLI executes a concrete PWA fetch for a changed parameterized server route
       changedFiles: () => ({ files: [source], baseRef: 'HEAD' }),
       runTests: (_cwd, files) => { ran.push([...files]); return { status: 0, stdout: '', stderr: '' }; },
       runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      runEntryBudgetGate: () => ({ affected: false, errors: [] }),
     });
     expect(result.testFiles).toEqual([consumer]);
     expect(ran).toEqual([[consumer]]);
@@ -208,6 +210,7 @@ test('CLI executes the PWA route and import consumers when only the server sourc
       changedFiles: () => ({ files: [source], baseRef: 'HEAD' }),
       runTests: (_cwd, files) => { ran.push([...files]); return { status: 0, stdout: '', stderr: '' }; },
       runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      runEntryBudgetGate: () => ({ affected: false, errors: [] }),
     });
     expect(result.testFiles).toEqual([pwa, importer]);
     expect(ran).toEqual([[pwa, importer]]);

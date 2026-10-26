@@ -383,7 +383,7 @@ export async function dispatchRunDevHarness(
   const { runStagedHarnessOnSurface } = await import('../../harness/harness-membrane.js');
   const { groundMissionInCodebase } = await import('../../autopilot/mission-codebase-gate.js'); // ★ 이식 §3.1 — 하니스 Planner grounding
   const { analyzeGoalAmbiguity } = await import('../../autopilot/mission-intake-clarify.js'); // ⓪ clarify(인터뷰·경량)
-  const { invokeResearch } = await import('../../research-bridge/invoke.js'); // ★ H3 외부 research(상황부·게이트)
+  const { runResearchQuestionLadder, researchTurnForGrounding } = await import('../../auto-research/research-turn.js'); // ★ Bloom 질문을 실제 조사 호출에 연결
   const { buildSkillHint } = await import('../../harness/skill-hint.js'); // ★ H3 skill 힌트(결정론·상황부)
   const { selectHarnessSkill } = await import('../../harness/skill-select.js'); // ★ S1 실행형(luna 주경로·substring fallback)
   const { buildAttractivenessSignal } = await import('../../harness/signal-gate.js'); // ★ R3 신호 게이트(판단층·부작용0)
@@ -532,7 +532,7 @@ export async function dispatchRunDevHarness(
     // ⓪ clarify(인터뷰·경량) — phase='scope'·heavy=false 로 과도한 조사 방지(대표 원칙: 명확하면 0질문·최상위 1개만).
     analyzeGoal: (obj) => analyzeGoalAmbiguity(obj, { phase: 'scope', heavy: false }),
     // ★ H3 외부 research(상황부) — objective 가 외부지식 요할 때만(intent-gate) web 조사 → grounding 에 얹음.
-    research: (topic) => invokeResearch(topic).then((r) => ({ ok: r.ok, output: r.output })),
+    research: (topic) => runResearchQuestionLadder(topic).then(researchTurnForGrounding),
     // ★ H3 skill 힌트(상황부) — objective 의 explicit 트리거가 특정 skill 을 강하게 가리키면 grounding 힌트
     //   (결정론·실행 안 함·luna 보완축). getSkillIndex 는 프로세스 캐시. fail-soft(index 로드 실패=null).
     skillHint: (objective) => { try { return buildSkillHint(objective, getSkillIndex()); } catch { return null; } },

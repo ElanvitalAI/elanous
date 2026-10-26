@@ -116,6 +116,14 @@ describe('toAnthropicToolsCached', () => {
       type: 'object', properties: {}, additionalProperties: false,
     });
   });
+
+  test('validates every tool for unsupported top-level composition before Anthropic serialization', () => {
+    expect(() => toAnthropicToolsCached([
+      mkTool('first'),
+      { ...mkTool('second'), parameters: { type: 'object', properties: {}, oneOf: [{ required: ['value'] }] } },
+      { ...mkTool('third'), parameters: { type: 'object', properties: {}, anyOf: [{ required: ['value'] }] } },
+    ], { cache: false })).toThrow('second (oneOf); third (anyOf)');
+  });
 });
 
 // ── parseAnthropicUsage ────────────────────────────────────────────

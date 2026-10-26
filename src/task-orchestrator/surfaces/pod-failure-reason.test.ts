@@ -1,5 +1,16 @@
 import { describe, expect, test } from 'bun:test';
-import { classifyPodExit, extractPodFailureReason, nestedPodResult, podChildFailureAttribution, podTerminalRow, POD_EXIT_CLASSES } from './pod-failure-reason.js';
+import { classifyPodExit, extractPodFailureReason, nestedPodResult, podChildFailureAttribution, podDeadlineResultMarker, podJobConditionReason, podTerminalRow, POD_EXIT_CLASSES } from './pod-failure-reason.js';
+
+test('FailureTarget deadline is available before the Failed condition and an unrelated marker is ignored', () => {
+  expect(podJobConditionReason('|DeadlineExceeded')).toBe('DeadlineExceeded');
+  expect(podJobConditionReason('DeadlineExceeded|DeadlineExceeded')).toBe('DeadlineExceeded');
+  expect(podJobConditionReason('|')).toBe('unknown');
+  const line = 'ELANOUS_POD_DEADLINE_RESULT si-one run-one stop-cause=deadline stage=run pr=31544 branch=tc/work';
+  expect(podDeadlineResultMarker(line, 'si-one', 'run-one')).toEqual({ stage: 'run', pr: 31544, branch: 'tc/work' });
+  expect(podDeadlineResultMarker(line, 'si-two', 'run-one')).toBeNull();
+  expect(podDeadlineResultMarker(line, 'si-one', 'run-two')).toBeNull();
+  expect(podDeadlineResultMarker(line.replace('stop-cause=deadline', 'stop-cause=success'), 'si-one', 'run-one')).toBeNull();
+});
 
 describe('classifyPodExit', () => {
   test('exports the closed class set and preserves terminal metadata fields', () => {

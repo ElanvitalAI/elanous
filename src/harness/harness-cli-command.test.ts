@@ -4503,7 +4503,9 @@ describe('recordHarnessPodStop — AUT-POD-EXIT-UNCLASSIFIED wiring', () => {
     const childEvidence = { classification: 'scope-escape', scopeEscape: true as const,
       abandonedClassification: { classification: 'implementation-deficit' },
       supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true as const,
-      terminationReason: 'goal-only-rework-exhausted', accountAvailability: { reason: 'no-candidate', candidateCount: 0 } };
+      terminationReason: 'goal-only-rework-exhausted', accountAvailability: { reason: 'no-candidate', candidateCount: 0 },
+      harvestable: true as const, prNumber: 30155,
+      goalPlanRevision: { status: 'read' as const, attempted: 1, applied: 0, failureReasons: ['expected-text-not-found'] } };
     const { entries, write } = capture();
     expect(recordHarnessPodStop(runId, 1, { reason: 'pod-failure', lines: ['Pod 안 자식이 실패했다'] }, 'short tail', {
       loadLedger: (() => [

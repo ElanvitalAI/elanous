@@ -104,9 +104,8 @@ function isEnglishDocument(content: string, file: string, scope: Scope): boolean
   return /\b[A-Za-z]{2,}(?:\s+[A-Za-z]{2,}){2,}\b/.test(body);
 }
 
-function findInFile(file: string, rules: Rule[], scope: Scope): Finding[] {
+function findInContent(file: string, content: string, rules: Rule[], scope: Scope): Finding[] {
   const findings: Finding[] = [];
-  const content = readFileSync(file, 'utf8');
   const html = ['.html', '.htm'].includes(extname(file).toLowerCase());
   const englishDocument = isEnglishDocument(content, file, scope);
   const markdown = ['.md', '.mdx'].includes(extname(file).toLowerCase());
@@ -144,14 +143,24 @@ function findInFile(file: string, rules: Rule[], scope: Scope): Finding[] {
   return findings;
 }
 
+function applicableRules(scope: Scope, rulesPath: string): Rule[] {
+  return loadRules(rulesPath).filter((rule) => scope === 'any' || rule.scope.includes('any') || rule.scope.includes(scope));
+}
+
+/** Scan in-memory text (for example a PR body) with the same rules as file scans. */
+export function checkBrandText(text: string, label: string, scope: Scope = 'public-docs', rulesPath = defaultRules): Finding[] {
+  if (!existsSync(rulesPath)) throw new Error(BRAND_RULES_UNMEASURED);
+  return findInContent(label, text, applicableRules(scope, rulesPath), scope);
+}
+
 export function checkBrand(scope: Scope, paths: string[], rulesPath = defaultRules): { files: number; findings: Finding[]; rules: number; missing: boolean; message?: string } {
   if (!existsSync(rulesPath)) {
     debug.log('brand.check', 'run', { scope, files: 0, findings: 0, rules: 0, missing: true, message: BRAND_RULES_UNMEASURED });
     return { files: 0, findings: [], rules: 0, missing: true, message: BRAND_RULES_UNMEASURED };
   }
-  const applicable = loadRules(rulesPath).filter((rule) => scope === 'any' || rule.scope.includes('any') || rule.scope.includes(scope));
+  const applicable = applicableRules(scope, rulesPath);
   const files = filesAt(paths);
-  const findings = files.flatMap((file) => findInFile(file, applicable, scope));
+  const findings = files.flatMap((file) => findInContent(file, readFileSync(file, 'utf8'), applicable, scope));
   debug.log('brand.check', 'run', { scope, files: files.length, findings: findings.length, rules: applicable.length });
   return { files: files.length, findings, rules: applicable.length, missing: false };
 }

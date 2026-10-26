@@ -141,6 +141,17 @@ describe('executeSkill foldMode seam', () => {
   }, 20_000);
 });
 
+describe('executeSkill final response', () => {
+  test('exposes the final assistant response separately from the rendered tool transcript', async () => {
+    const { display, result } = await runExecuteSkill();
+
+    expect(result.fullResponse).toBe(display);
+    expect(result.fullResponse).toContain('Read');
+    expect(result.finalResponse).toBe('ok');
+    expect(result.finalResponse).not.toContain('Read');
+  }, 20_000);
+});
+
 type LedgerLine = { skill: string; outcome: string; failureKind?: string; runId: string };
 const readLedger = (root: string): LedgerLine[] =>
   readFileSync(join(root, 'skills', 'feedback.jsonl'), 'utf8')

@@ -61,13 +61,18 @@ function worktreeAddTimeoutForTrackedFileCount(trackedFileCount: number | null):
   return { ms: Math.min(WORKTREE_ADD_TIMEOUT_MAX_MS, Math.max(WORKTREE_ADD_TIMEOUT_MS, scaledMs)), trackedFileCount, source: 'tracked-files' };
 }
 
+export function worktreeAddTimeoutSec(seconds: number | undefined): number | undefined {
+  return typeof seconds === 'number' && Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 2_147_483
+    ? seconds : undefined;
+}
+
 export function worktreeAddTimeoutForRepo(
   repoRoot: string,
   countTrackedFilesForRepo: (repoRoot: string, ref?: string) => number | null = countTrackedFiles,
   trackedFileRef?: string,
 ): WorktreeAddTimeout {
-  const seconds = getUserConfig().harness?.worktreeAddTimeoutSec;
-  if (typeof seconds === 'number' && Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 2_147_483) {
+  const seconds = worktreeAddTimeoutSec(getUserConfig().harness?.worktreeAddTimeoutSec);
+  if (seconds !== undefined) {
     return { ms: seconds * 1000, trackedFileCount: null, source: 'config' };
   }
   return worktreeAddTimeoutForTrackedFileCount(countTrackedFilesForRepo(repoRoot, trackedFileRef));
@@ -347,7 +352,18 @@ function bakedDependenciesMatch(repoTree: string, bakedTree: string): boolean {
   } catch { return false; }
 }
 
-function prepareWorktreeDependencies(repoRoot: string, worktreePath: string, opts: CreateWorktreeOpts, deps: WorktreeAddDeps): void {
+/** Pod source may omit node_modules while the image carries matching baked dependencies. */
+export function worktreeDependenciesAvailable(repoRoot: string, fallbackRoot = GATE_DEPS_DIR): boolean {
+  for (const tree of GATE_DEPS_TREES) {
+    const repoTree = join(repoRoot, tree);
+    if (!existsSync(join(repoTree, 'package.json')) || !existsSync(join(repoTree, 'bun.lock'))) continue;
+    if (existsSync(join(repoTree, 'node_modules'))) continue;
+    if (!bakedDependenciesMatch(repoTree, join(fallbackRoot, tree))) return false;
+  }
+  return true;
+}
+
+export function prepareWorktreeDependencies(repoRoot: string, worktreePath: string, opts: Pick<CreateWorktreeOpts, 'dependencyFallbackRoot' | 'dependencyInstallTimeoutMs'>, deps: WorktreeAddDeps): void {
   const fallbackRoot = opts.dependencyFallbackRoot?.trim() || GATE_DEPS_DIR;
   const timeoutMs = opts.dependencyInstallTimeoutMs ?? WORKTREE_DEPENDENCY_INSTALL_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('dependencyInstallTimeoutMs must be a positive integer');

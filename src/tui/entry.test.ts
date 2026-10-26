@@ -39,6 +39,8 @@ import {
   defaultControlSignalBus,
   type ControlSignal,
 } from '../input/control-signal.js';
+import { removePtyManifest, updatePtyManifestSession, upsertPtyManifest } from '../pty-shell/pty-manifest.js';
+import type { NextSidetabHandler } from './sidetab/nl-tool.js';
 
 // mock.module 복구용 원본 스냅샷 — 정적 import 가 먼저 실행되므로 mock 치환 전 실물이 담긴다.
 const restoreTui = { ...tuiOriginal };
@@ -63,7 +65,8 @@ const loopEvents: Array<{ event: string; data: unknown }> = [];
 const turnsSeen: string[] = [];
 const missionCalls: unknown[] = [];
 const transcript: string[] = [];
-let duringTurnHook: (() => void) | null = null;
+let duringTurnHook: (() => void | Promise<void>) | null = null;
+let nextSidetabHandler: NextSidetabHandler | null = null;
 const cliStderrEvents: Array<{ data: { source: string; exitCode: number; text: string; rawBase64: string; byteLength: number } }> = [];
 
 mock.module('../intent-gate/gate.js', () => ({
@@ -116,6 +119,7 @@ mock.module('../tui.js', () => ({
 }));
 
 mock.module('../tui-client/local-chat-turn.js', () => ({
+  setNextSidetabHandler: (handler: NextSidetabHandler | null) => { nextSidetabHandler = handler; },
   runLocalChatTurn: async (
     sessionId: string,
     _text: string,
@@ -126,11 +130,15 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
   ) => {
     turnsSeen.push(sessionId);
     onDelta?.('첫 응답 델타');
-    duringTurnHook?.();
+    await duringTurnHook?.();
   },
   closeLocalChatSession: async () => {},
   // 실물은 구독 정지 함수를 반환한다 — entry 가 backgroundSubscription.stop ??= 로 싣는 값이다.
   onLocalChatBackgroundStatus: (_sessionId: string, _onFrame: (frame: unknown) => void) => () => {},
+  onLocalChatSelfHealthStatus: (
+    _sessionId: string,
+    _listener: (snapshot: import('../tui/chat/self-health-status.js').NextTuiSelfHealthSnapshot | null) => void,
+  ) => () => {},
   localChatModel: () => 'fake-model',
 }));
 
@@ -166,18 +174,19 @@ mock.module('./chat/background-job-status.js', () => ({
 }));
 
 const { showNextTui } = await import('./entry.js');
-const { createSession } = await import('../session/index.js');
+const { appendMessage, createSession, setActiveSessionId } = await import('../session/index.js');
 
 // 턴 경계 줄을 debug.log 진입에서 캡처한다 — 싱크 등록 여부와 무관하게 recorder 가 남긴 줄이 여기를 지난다.
 const rawDebugLog = debug.log;
 const captured: Array<{ data: TurnStartSegments }> = [];
-debug.log = ((category: string, event: string, data?: unknown) => {
+const captureDebugLog = ((category: string, event: string, data?: unknown) => {
   if (category === TURN_START_CATEGORY && event === TURN_START_SEGMENTS_EVENT) {
     captured.push({ data: data as TurnStartSegments });
   }
   if (category === 'dashboard.loop') loopEvents.push({ event, data });
   return rawDebugLog.call(debug, category, event, data);
 }) as typeof debug.log;
+debug.log = captureDebugLog;
 
 afterEach(() => {
   debug.log = rawDebugLog;
@@ -194,6 +203,7 @@ afterEach(() => {
   missionCalls.length = 0;
   transcript.length = 0;
   duringTurnHook = null;
+  nextSidetabHandler = null;
   cliStderrEvents.length = 0;
   Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
   Object.defineProperty(process.stdout, 'columns', { value: undefined, configurable: true });
@@ -212,8 +222,59 @@ afterAll(() => {
 });
 
 describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
+  test('sidetab session switch during a turn waits for that turn before changing sessions', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const original = createSession({ source: 'tui' });
+    const target = createSession({ source: 'tui' });
+    setActiveSessionId(original.id);
+    appendMessage(target.id, { role: 'assistant', content: 'NL_SWITCH_TARGET_MARKER', ts: new Date().toISOString() });
+    const now = Date.now();
+    upsertPtyManifest({
+      id: 'tui:81000', kind: 'tui', cmd: 'elanous', purpose: `next-tui-sidetab:${target.id}`,
+      startedAt: now, now, ptyPid: 81000,
+    });
+    updatePtyManifestSession('tui:81000', target.id, now);
+    let duringTurnSessionId: string | undefined;
+    let switchResult: unknown;
+    duringTurnHook = async () => {
+      expect(nextSidetabHandler).not.toBeNull();
+      switchResult = await nextSidetabHandler!({ action: 'switch', target: 'tui:81000' });
+      const { getActiveSessionId } = await import('../session/index.js');
+      duringTurnSessionId = getActiveSessionId();
+    };
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    );
+    // Keep the sidetab available but collapsed so Enter submits the fake turn;
+    // duringTurnHook exercises the host handler while that turn is active.
+    submittedInputs.push('ordinary active turn');
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      transcript.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await showNextTui({ resumeSessionId: original.id, sidetabMode: 'collapsed' });
+      const { getActiveSessionId } = await import('../session/index.js');
+      expect(switchResult).toEqual({ ok: true, action: 'switch', target: 'tui:81000', scheduled: 'after-turn' });
+      expect(duringTurnSessionId).toBe(original.id);
+      expect(getActiveSessionId()).toBe(target.id);
+      expect(transcript.join('')).toContain('세션 전환됨');
+      expect(transcript.join('')).toContain('NL_SWITCH_TARGET_MARKER');
+      // Let the recorder's delayed close emit finish before the next test installs its capture hook.
+      await Bun.sleep(450);
+    } finally {
+      process.stdout.write = output;
+      removePtyManifest('tui:81000');
+    }
+  }, 10_000);
+
   test('한 턴에 시작·첫 응답 경계가 같은 세션 키로 닫히고 다른 세션 경계는 0건', async () => {
     captured.length = 0;
+    debug.log = captureDebugLog;
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
     Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });

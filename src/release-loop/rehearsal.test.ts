@@ -97,7 +97,7 @@ test('cut minus five hours launches one pinned full Pod gate with twelve shards 
   expect(stamp(root, 'hard-5h')).toMatchObject({ outcome: 'regression', selection: { remote: 'node-b', shards: 12 },
     hardGate: { outcome: 'regression', executor: 'pod', introduced: ['test/new.test.ts > new case'] } });
   expect(stamp(root, 'hard-5h')).toMatchObject({ hardGateRunId: runId, hardGateLog: join(root, 'release', schedule.version, 'rehearsal', `${runId}.log`) });
-  expect(h.notifications.some(text => text.includes('hard gate regression') && text.includes('node-b Pod · 12 shards'))).toBe(true);
+  expect(h.notifications.some(text => text.includes('hard gate regression') && text.includes('원격 Pod · 12 shards'))).toBe(true);
 });
 
 test('invalid pinned Pod result fails closed', async () => {

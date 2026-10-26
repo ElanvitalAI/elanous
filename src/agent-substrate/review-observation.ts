@@ -15,6 +15,7 @@
 // 순수 함수로 둔 이유: 절단 정책(무엇을 얼마나 남기나)이 **회귀 테스트 대상**이기 때문이다.
 // 로그가 폭주하면 관측 자체가 못 쓰게 되고, 너무 줄이면 감사가 안 된다 — 그 균형을 테스트로 고정한다.
 
+import { createHash } from 'node:crypto';
 import { redactSecretText } from '../debug/log.js';
 import { isScopeRevertMustFix, type ReviewResult } from './pr-reviewer.js';
 
@@ -31,6 +32,8 @@ interface ReviewObservationInput {
   readonly model: string;
   /** 리뷰에 준 의도(수용기준). 원문은 길어 **길이만** 남긴다 — 무엇을 기준으로 판정했나의 지표. */
   readonly intent: string;
+  /** Deterministic content-free fingerprint of the intent actually applied to the reviewer. */
+  readonly intentFingerprint?: string;
   /** Null when the CLI refused to run the engine because the fetched diff was knowingly stale. */
   readonly review: ReviewResult | null;
   readonly durationMs: number;
@@ -109,6 +112,8 @@ interface ReviewObservation {
   /** 상한을 넘겨 생략된 항목 수(0 이 아니면 로그가 전부가 아님을 알린다). */
   readonly omitted: number;
   readonly intentChars: number;
+  /** Content-free deterministic fingerprint of the intent actually applied to the reviewer. */
+  readonly intentFingerprint?: string;
   readonly durationMs: number;
   readonly diffTruncated?: boolean;
   readonly diffShownChars?: number;
@@ -161,6 +166,10 @@ function clip(items: readonly string[]): string[] {
  * 생략분은 `omitted` 로 **개수를 남긴다** — "로그에 8건뿐"을 "8건이 전부"로 오독하지 않게(정직 표기).
  * intent 는 **길이만** 남긴다(원문은 호출자 셸 히스토리·PR 본문에 있고, 로그 비대를 막는다).
  */
+export function reviewIntentFingerprint(intent: string): string {
+  return `sha256:${createHash('sha256').update(intent, 'utf8').digest('hex')}`;
+}
+
 export function buildReviewObservation(input: ReviewObservationInput): ReviewObservation {
   const { review } = input;
   const mustFix = review?.mustFix ?? [];
@@ -205,6 +214,7 @@ export function buildReviewObservation(input: ReviewObservationInput): ReviewObs
     shouldFixItems: clip(shouldFix),
     omitted: mustFix.length + shouldFix.length - shown,
     intentChars: input.intent.length,
+    ...(input.intentFingerprint ? { intentFingerprint: input.intentFingerprint } : {}),
     durationMs: input.durationMs,
     ...(input.diffTruncated !== undefined ? { diffTruncated: input.diffTruncated } : {}),
     ...(input.diffShownChars !== undefined ? { diffShownChars: input.diffShownChars } : {}),

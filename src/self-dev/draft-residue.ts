@@ -126,6 +126,8 @@ export interface DraftResidueAdapters {
   setLabels(repository: string, number: number, change: { add: string; remove: readonly string[] }): Promise<void> | void;
   comment(repository: string, number: number, body: string): Promise<void> | void;
   closePr(repository: string, number: number): Promise<void> | void;
+  /** Persist the existing `수확보류: harvest-deferred` PR-body marker after a verified close. */
+  editBody(repository: string, number: number, body: string): Promise<void> | void;
   /** Undefined means liveness could not be established, not that no branch is live. */
   listLiveBranches(repository: string): Promise<ReadonlySet<string> | undefined> | ReadonlySet<string> | undefined;
   /** Undefined means the prior run could not be identified as ended. */
@@ -133,11 +135,22 @@ export interface DraftResidueAdapters {
 }
 /** One close budget shared by every terminal replayed in a tick and the draft sweep that follows. */
 export interface DraftCloseBudget { remaining: number }
+export type HarvestExistingPr = { number: number; url?: string; labels?: readonly string[] };
+/** Injectable remote-branch / same-branch-PR / draft-create seams for timed-out-harvestable. */
+export interface HarvestableDraftAdapters {
+  /** Override host repository for harvest lookups and creates. */
+  repository?: string;
+  remoteBranchExists(repository: string, branch: string): Promise<boolean | undefined> | boolean | undefined;
+  findExistingPr(repository: string, branch: string): Promise<HarvestExistingPr | null | undefined> | HarvestExistingPr | null | undefined;
+  createDraftPr(repository: string, branch: string): Promise<HarvestExistingPr> | HarvestExistingPr;
+  addHarvestableLabel(repository: string, number: number): Promise<void> | void;
+}
 export interface DraftResidueContext {
   ledgerRunId: string;
   ledgerDir: string;
   adapters?: DraftResidueAdapters;
   closeBudget?: DraftCloseBudget;
+  harvest?: HarvestableDraftAdapters;
 }
 export type DraftResidueResult = { status: 'recorded' | 'skipped' | 'failed'; reason?: string; step?: string };
 
@@ -253,6 +266,7 @@ export function defaultAdapters(sources: ResidueRunStatusSources = defaultRunSta
     },
     comment: (repository, number, body) => { gh(['pr', 'comment', String(number), '-R', repository, '--body', body]); },
     closePr: (repository, number) => { gh(['pr', 'close', String(number), '-R', repository]); },
+    editBody: (repository, number, body) => { gh(['pr', 'edit', String(number), '-R', repository, '--body', body]); },
     listLiveBranches: (repository) => {
       if (repository.toLowerCase() !== hostRepository()?.toLowerCase()) return undefined;
       const root = findGitDir(process.cwd())?.root;
@@ -295,6 +309,117 @@ function hostRepository(): string | null {
   const result = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 60_000 });
   const match = result.status === 0 ? /^(?:https:\/\/github\.com\/|git@github\.com:)([\w.-]+\/[\w.-]+?)(?:\.git)?\/?\s*$/.exec(result.stdout) : null;
   return match?.[1] ?? null;
+}
+
+function harvestBranchOk(branch: string): boolean {
+  return /^[A-Za-z0-9._/-]+$/.test(branch) && !branch.includes('..');
+}
+
+/** Production harvest seams: remote branch via `git ls-remote --exit-code`, same-branch PR via `gh pr list --head`, draft via `gh pr create --draft`. */
+export function defaultHarvestAdapters(record?: PrTerminalRecord): HarvestableDraftAdapters {
+  return {
+    remoteBranchExists: (repository, branch) => {
+      if (!harvestBranchOk(branch) || !/^[\w.-]+\/[\w.-]+$/.test(repository)) return undefined;
+      const root = findGitDir(process.cwd())?.root;
+      const remote = `https://github.com/${repository}.git`;
+      const result = spawnSync('git', ['ls-remote', '--exit-code', remote, `refs/heads/${branch}`], {
+        cwd: root ?? process.cwd(), encoding: 'utf8', timeout: 10_000,
+      });
+      if (result.status === 0) return true;
+      if (result.status === 2) return false;
+      return undefined;
+    },
+    findExistingPr: (repository, branch) => {
+      if (!harvestBranchOk(branch) || !/^[\w.-]+\/[\w.-]+$/.test(repository)) return undefined;
+      try {
+        const rows: unknown = JSON.parse(gh(['pr', 'list', '-R', repository, '--state', 'open', '--head', branch,
+          '--json', 'number,url,labels,headRefName', '--limit', '100']));
+        if (!Array.isArray(rows)) return undefined;
+        const matching = rows.filter((row): row is { number: number; url?: string; headRefName: string; labels?: Array<{ name: string } | string> } =>
+          !!row && typeof row === 'object' && typeof (row as { headRefName?: unknown }).headRefName === 'string'
+          && (row as { headRefName: string }).headRefName === branch
+          && typeof (row as { number?: unknown }).number === 'number'
+          && Number.isSafeInteger((row as { number: number }).number) && (row as { number: number }).number > 0);
+        if (matching.length === 0) return null;
+        if (matching.length !== 1) return undefined;
+        const row = matching[0]!;
+        const labels = (row.labels ?? []).map((label) => typeof label === 'string' ? label : label.name).filter((name): name is string => typeof name === 'string');
+        return { number: row.number, url: typeof row.url === 'string' ? row.url : undefined, labels };
+      } catch {
+        return undefined;
+      }
+    },
+    createDraftPr: (repository, branch) => {
+      const title = `Harvest timed-out ${record?.childRunId ?? branch}`;
+      const body = `Draft residue: timed-out-harvestable · owner=${record?.owner ?? 'unknown'}(${record?.ownerSource ?? 'unknown'}) · run=${record?.childRunId ?? 'unobserved'} · branch=${branch}`;
+      const out = gh(['pr', 'create', '-R', repository, '--head', branch, '--draft', '--title', title, '--body', body]);
+      const match = /https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/.exec(out);
+      if (!match || match[1]!.toLowerCase() !== repository.toLowerCase()) throw new Error('draft-create-unobserved');
+      return { number: Number(match[2]), url: match[0] };
+    },
+    addHarvestableLabel: (repository, number) => { gh(['pr', 'edit', String(number), '-R', repository, '--add-label', harvestable]); },
+  };
+}
+
+/** Open one draft PR for a timed-out-harvestable terminal when the remote branch exists and no same-branch PR is open. */
+export async function harvestHarvestableDrafts(record: PrTerminalRecord, ctx: DraftResidueContext): Promise<DraftResidueResult> {
+  const adapters = ctx.adapters ?? defaultAdapters();
+  const harvest = ctx.harvest ?? defaultHarvestAdapters(record);
+  const fields = { childRunId: record.childRunId, prNumber: record.prNumber, terminalClass: record.terminalClass, owner: record.owner, ownerSource: record.ownerSource };
+  const log = (event: string, data: Record<string, unknown> = {}) => debug.log('draft.residue', event, { ...fields, ...data });
+  const skipped = (reason: string): DraftResidueResult => { log('skipped', { reason }); return { status: 'skipped', reason }; };
+  let step = 'ledger';
+  try {
+    if (record.terminalClass !== 'timed-out-harvestable') return skipped(record.terminalClass);
+    const branch = typeof record.branch === 'string' && record.branch.trim() ? record.branch.trim() : null;
+    if (!branch) return skipped('missing-branch');
+    const repository = harvest.repository ?? record.repository ?? hostRepository();
+    if (!repository) return skipped('host-repository-unobserved');
+    const ledger = adapters.loadLedger(ctx.ledgerRunId, ctx.ledgerDir);
+    if (ledger === undefined) throw new Error('Terminal ledger unavailable');
+    const rows = (ledger ?? []).filter((entry) => entry.data.childRunId === record.childRunId);
+    const completed = (effect: string, number: number): boolean => rows.some((entry) => entry.event === 'pr-terminal-effect'
+      && entry.data.effect === effect && entry.data.number === number);
+    const acknowledge = (effect: string, number: number): void => {
+      adapters.appendLedger({ runId: ctx.ledgerRunId, event: 'pr-terminal-effect', data: { childRunId: record.childRunId, effect, number } }, ctx.ledgerDir);
+    };
+    if (completed('complete', 0) || completed('complete', record.prNumber ?? 0)) return skipped('already-recorded');
+    step = 'remote-branch';
+    const exists = await harvest.remoteBranchExists(repository, branch);
+    if (exists === undefined) throw new Error('Remote branch lookup unavailable');
+    if (exists === false) {
+      acknowledge('complete', 0);
+      return skipped('missing-branch');
+    }
+    step = 'find-existing-pr';
+    const existing = await harvest.findExistingPr(repository, branch);
+    if (existing === undefined) throw new Error('Existing PR lookup unavailable');
+    let pr = existing;
+    if (!pr) {
+      step = 'create-draft-pr';
+      pr = await harvest.createDraftPr(repository, branch);
+      log('harvest-created', { number: pr?.number, branch, repository });
+    } else {
+      log('harvest-reused', { number: pr.number, branch, repository });
+    }
+    if (!pr || !Number.isSafeInteger(pr.number) || pr.number <= 0) throw new Error('draft-create-unobserved');
+    if (!completed('harvestable', pr.number)) {
+      if (!pr.labels?.includes(harvestable)) {
+        step = 'add-label';
+        await harvest.addHarvestableLabel(repository, pr.number);
+        log('harvestable-labeled', { prNumber: pr.number });
+      }
+      step = 'ledger';
+      acknowledge('harvestable', pr.number);
+    }
+    step = 'ledger';
+    acknowledge('complete', 0);
+    return { status: 'recorded' };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    log('failed', { step, reason });
+    return { status: 'failed', step, reason };
+  }
 }
 
 export interface DraftResidueReplayOptions {
@@ -385,7 +510,11 @@ export async function replayPodTerminals(options: DraftResidueReplayOptions = {}
       const outcome = await applyPodTerminal(record, { ledgerDir, ledgerRunId, adapters: replayAdapters, closeBudget });
       if (outcome.status === 'recorded' || outcome.reason === 'already-recorded') recovered++;
       else if (outcome.status === 'skipped' && outcome.reason === 'repository-unobserved') unresolved++;
-      else if (outcome.status === 'skipped' && !['previous-run-unverified', 'previous-run-live', 'close-cap', 'host-repository-unobserved', 'restore-unverified'].includes(outcome.reason ?? '')) recovered++;
+      else if (outcome.status === 'skipped' && ![
+        'previous-run-unverified', 'previous-run-live', 'close-cap', 'host-repository-unobserved', 'restore-unverified',
+        'deferred-close-ownership-unverified', 'deferred-close-reopened', 'deferred-close-unverified',
+        'deferred-close-run-unverified', 'deferred-close-raced',
+      ].includes(outcome.reason ?? '')) recovered++;
       else pending++;
     }
   }
@@ -409,12 +538,34 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
     const acknowledge = (effect: string, number: number): void => {
       adapters.appendLedger({ runId: ctx.ledgerRunId, event: 'pr-terminal-effect', data: { childRunId: record.childRunId, effect, number } }, ctx.ledgerDir);
     };
+    const markDeferredBody = async (number: number, expectedBranch: string): Promise<void> => {
+      if (record.terminalClass !== 'merge-ready-not-merged' || completed('harvest-deferred-body', number)) return;
+      const latest = await adapters.getPr(number);
+      if (!latest || latest.state !== 'CLOSED' || latest.headSha?.toLowerCase() !== record.headSha?.toLowerCase()
+        || latest.branch !== expectedBranch || typeof latest.body !== 'string') {
+        throw new Error('harvest-deferred-body-unverified');
+      }
+      const marker = '수확보류: harvest-deferred';
+      if (!latest.body.split(/\r?\n/).includes(marker)) {
+        step = 'edit-body';
+        await adapters.editBody(record.repository!, number, `${latest.body.trimEnd()}\n${marker}\n`);
+        const verified = await adapters.getPr(number);
+        if (!verified || verified.state !== 'CLOSED' || verified.headSha?.toLowerCase() !== record.headSha?.toLowerCase()
+          || verified.branch !== expectedBranch || !verified.body?.split(/\r?\n/).includes(marker)) {
+          throw new Error('harvest-deferred-body-unverified');
+        }
+      }
+      step = 'ledger';
+      acknowledge('harvest-deferred-body', number);
+    };
     if (completed('complete', record.prNumber ?? 0) || completed('protected', record.prNumber ?? 0)) return skipped('already-recorded');
     if (!rows.some((entry) => entry.event === 'pr-terminal')) {
       adapters.appendLedger({ runId: ctx.ledgerRunId, event: 'pr-terminal', data: { ...record } }, ctx.ledgerDir);
       log('terminal-recorded');
     }
-    // AUT-TIMEOUT-NO-HARVEST 첫 조각은 «분류만» — 그 branch 로 PR 을 여는 효과는 다음 조각(원격 가지 존재·기존 PR 확인 관문과 함께).
+    if (record.terminalClass === 'timed-out-harvestable') {
+      return harvestHarvestableDrafts(record, { ...ctx, adapters, harvest: ctx.harvest ?? defaultHarvestAdapters(record) });
+    }
     if (record.terminalClass === 'failed-no-pr' || record.terminalClass === 'failed-pr-unobserved' || record.prNumber === null) {
       acknowledge('complete', 0);
       return skipped(record.terminalClass);
@@ -441,6 +592,21 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
     step = 'get-pr';
     const pr = await adapters.getPr(record.prNumber);
     if (!pr || pr.number !== record.prNumber || !Array.isArray(pr.labels) || !pr.branch || !Number.isFinite(Date.parse(pr.createdAt))) throw new Error('PR lookup unavailable');
+    const deferredCloseTerminal = record.terminalClass === 'failed-with-pr' || record.terminalClass === 'merge-ready-not-merged';
+    if (deferredCloseTerminal && completed('deferred-close', pr.number)) {
+      if (pr.state !== 'CLOSED' || !record.headSha
+        || pr.headSha?.toLowerCase() !== record.headSha.toLowerCase()
+        || (record.branch && pr.branch !== record.branch)) return skipped('deferred-close-reopened');
+      await markDeferredBody(pr.number, pr.branch);
+      step = 'ledger';
+      acknowledge('complete', pr.number);
+      return { status: 'recorded' };
+    }
+    // After a close intent without its receipt, GitHub cannot prove whether our close was applied and
+    // subsequently reversed by another owner. Leave that ambiguity for a human instead of closing again.
+    if (deferredCloseTerminal && completed('deferred-close-intent', pr.number)) {
+      return skipped('deferred-close-ownership-unverified');
+    }
     // Review r8: the PR may have merged or closed after this run's terminal — a failed terminal then writes nothing
     // (no harvestable label, no owner comment) and settles once.
     if (record.terminalClass !== 'landed' && pr.state !== undefined && pr.state !== 'OPEN') {
@@ -733,6 +899,59 @@ export async function applyPodTerminal(record: PrTerminalRecord, ctx: DraftResid
     }
     if (deferred) return skipped('previous-run-unverified');
     if (capped) return skipped('close-cap');
+    if (deferredCloseTerminal) {
+      if (budget.remaining <= 0) return skipped('close-cap');
+      const restore = `Draft residue: harvest deferred · run=${record.childRunId} · head=${record.headSha} · branch=${pr.branch}. Close does not delete this ref; verify it before restore.${record.terminalClass === 'merge-ready-not-merged' ? ' 다시 여는 법: gh pr reopen + land-enqueue.' : ''}`;
+      step = 'get-pr';
+      const latest = await adapters.getPr(pr.number);
+      if (!latest || latest.state !== 'OPEN' || latest.isDraft !== true || !record.headSha
+        || latest.headSha?.toLowerCase() !== record.headSha.toLowerCase()
+        || latest.branch !== pr.branch || (record.branch && latest.branch !== record.branch)
+        || !Array.isArray(latest.labels) || latest.labels.some((label) => PROTECTED_LABELS.has(label) || label.includes('harvest-claimed'))) {
+        return skipped('deferred-close-unverified');
+      }
+      step = 'list-live-branches';
+      const activeBranches = await adapters.listLiveBranches(record.repository);
+      step = 'get-run-status';
+      const runStatus = await adapters.getRunStatus(latest, record.repository);
+      if (!activeBranches || activeBranches.has(latest.branch)
+        || !['completed', 'failed', 'cancelled', 'abandoned', 'self-implement.result final'].includes(runStatus ?? '')) {
+        return skipped('deferred-close-run-unverified');
+      }
+      step = 'list-comments';
+      const comments = await adapters.getAllComments?.(record.repository, pr.number);
+      if (!Array.isArray(comments) || comments.some((comment) => typeof comment !== 'string'
+        || /landing-verified\s*:|land-enqueue\s*:/i.test(comment))) return skipped('deferred-close-unverified');
+      if (!comments.includes(restore)) { step = 'comment'; await adapters.comment(record.repository, pr.number, restore); }
+      step = 'get-pr';
+      const beforeClose = await adapters.getPr(pr.number);
+      step = 'list-comments';
+      const commentsBeforeClose = await adapters.getAllComments?.(record.repository, pr.number);
+      step = 'list-live-branches';
+      const liveBeforeClose = await adapters.listLiveBranches(record.repository);
+      step = 'get-run-status';
+      const statusBeforeClose = await adapters.getRunStatus(latest, record.repository);
+      if (!beforeClose || beforeClose.state !== 'OPEN' || beforeClose.isDraft !== true
+        || beforeClose.headSha?.toLowerCase() !== record.headSha.toLowerCase()
+        || beforeClose.branch !== latest.branch || !Array.isArray(beforeClose.labels)
+        || beforeClose.labels.some((label) => PROTECTED_LABELS.has(label) || label.includes('harvest-claimed'))
+        || !Array.isArray(commentsBeforeClose) || !commentsBeforeClose.includes(restore)
+        || commentsBeforeClose.some((comment) => typeof comment !== 'string'
+          || /landing-verified\s*:|land-enqueue\s*:/i.test(comment))
+        || !liveBeforeClose || liveBeforeClose.has(latest.branch)
+        || !['completed', 'failed', 'cancelled', 'abandoned', 'self-implement.result final'].includes(statusBeforeClose ?? '')) {
+        return skipped('deferred-close-raced');
+      }
+      step = 'ledger';
+      acknowledge('deferred-close-intent', pr.number);
+      step = 'close-pr';
+      await adapters.closePr(record.repository, pr.number);
+      budget.remaining--;
+      step = 'ledger';
+      acknowledge('deferred-close', pr.number);
+      log('deferred-closed', { branch: latest.branch, headSha: record.headSha });
+      await markDeferredBody(pr.number, latest.branch);
+    }
     step = 'ledger';
     acknowledge('complete', record.prNumber);
     return { status: 'recorded' };

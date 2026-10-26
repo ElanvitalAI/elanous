@@ -137,6 +137,7 @@ export const FEATURE_MATURITY = {
     tablet: 'ops',
     surface: 'ops',
     term: 'tool',
+    side: 'tool',
     claude: 'tool',
     codex: 'tool',
     gemini: 'tool',

@@ -4412,8 +4412,10 @@ describe('assertBaseBranchOnOrigin — PR base 는 브랜치 이름이지 remote
 describe('defaultSeams.createWorktree — self-implement ownership provenance', () => {
   let root: string;
   let repo: string;
+  let originalCwd: string;
 
   beforeEach(() => {
+    originalCwd = process.cwd();
     root = mkdtempSync(join(tmpdir(), 'seam-worktree-provenance-'));
     repo = join(root, 'repo');
     git(root, 'init', '-q', '-b', 'main', repo);
@@ -4456,8 +4458,39 @@ describe('defaultSeams.createWorktree — self-implement ownership provenance', 
     }
   };
   afterEach(() => {
+    process.chdir(originalCwd);
     cleanupCreatedWorktrees();
     rmSync(root, { recursive: true, force: true });
+  });
+
+  test('Pod opt-in uses the source repo itself while recording normal owner provenance', async () => {
+    const originalCwd = process.cwd();
+    const keys = ['ELANOUS_POD_INPLACE_WORKTREE', 'ELANOUS_SUBSTRATE', 'ELANOUS_POD_SINGLE_CHILD', 'ELANOUS_POD_NAME', 'ELANOUS_RUN_ID'] as const;
+    const prior = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+    const pin = git(repo, 'rev-parse', 'HEAD').stdout.trim();
+    git(repo, 'update-ref', 'refs/remotes/origin/main', pin);
+    git(repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+    const goalFile = join(repo, 'docs/goals/GOAL-inplace-test.md');
+    mkdirSync(dirname(goalFile), { recursive: true });
+    writeFileSync(goalFile, '# Goal\n');
+    try {
+      process.chdir(repo);
+      process.env.ELANOUS_POD_INPLACE_WORKTREE = '1';
+      process.env.ELANOUS_SUBSTRATE = 'pod';
+      process.env.ELANOUS_POD_SINGLE_CHILD = '1';
+      process.env.ELANOUS_POD_NAME = 'si-task-test';
+      process.env.ELANOUS_RUN_ID = 'run-inplace-test';
+      const result = await defaultSeams({ repoRoot: repo }).createWorktree({ branch: 'se/inplace', base: DEFAULT_BRANCH_WORKTREE_BASE, runId: 'run-inplace-test', goalFile });
+      expect(result).toMatchObject({ path: realpathSync(repo), branch: 'se/inplace', resolvedBase: pin, inPlace: true, owner: 'dev:run-inplace-test' });
+      expect(git(repo, 'worktree', 'list', '--porcelain').stdout.match(/^worktree /gm)).toHaveLength(1);
+      expect(git(repo, 'config', '--worktree', '--get', 'elanous.harness.owner').stdout.trim()).toBe('dev:run-inplace-test');
+    } finally {
+      process.chdir(originalCwd);
+      for (const key of keys) {
+        if (prior[key] === undefined) delete process.env[key];
+        else process.env[key] = prior[key];
+      }
+    }
   });
 
   test('cleanup removes every empty owned ancestor but preserves the harness worktree root', async () => {

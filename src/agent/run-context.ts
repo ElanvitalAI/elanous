@@ -122,7 +122,7 @@ export function childLlmSelectionEnv(selection?: ChildLlmSelection): Record<stri
     };
   }
   // ⛔⭐ 상속 갈래도 local 이면 «주소»를 같이 넘긴다(BACKLOG B12 · 2026-09-25).
-  //   🩸 부모 env `ELANOUS_LLM_PROVIDER=local` ⊕ `LOCAL_LLM_URL=<node-b 경유 프록시>` 로 띄웠는데 자식엔 provider·model 만 가고
+  //   🩸 부모 env `ELANOUS_LLM_PROVIDER=local` ⊕ `LOCAL_LLM_URL=<원격 프록시>` 로 띄웠는데 자식엔 provider·model 만 가고
   //     주소가 빠져, 자식이 노드 캐시로 «호스트» LM Studio(127.0.0.1:1234)에 붙었다 — 준 엔드포인트가 조용히 무시됐다.
   const inheritedProvider = process.env.ELANOUS_LLM_PROVIDER?.trim();
   return {

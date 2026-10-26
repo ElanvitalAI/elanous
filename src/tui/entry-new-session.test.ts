@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { appendMessage, createSession, getActiveSessionId, listSessions, loadSession, setActiveSessionId } from '../session/index.js';
 import { ptyAvailable, startPty } from '../pty-shell/registry.js';
+import { spawnRealCli } from '../testing/real-cli-spawn.js';
 import { NEW_SESSION_BUSY_STATUS, isNewSessionCommand, nextTuiTitle, requestNewTuiSession } from './slash/new-session.js';
 
 let dir = '';
@@ -191,6 +192,103 @@ describe('next TUI /new in a real PTY (L3)', () => {
       await sleep(1500);
       try { pty.kill(); } catch { /* already exited */ }
       if (live) writeFileSync(join(live, 'screens.txt'), `${screens.join('\n\n')}\n`);
+    }
+  }, 120_000);
+});
+
+describe('bare next TUI launch after CLI automation (L3)', () => {
+  test('chat --new automation session is not resumed by a bare --tui next launch', async () => {
+    if (!ptyAvailable()) return;
+    const iso = mkdtempSync(join(tmpdir(), 'next-tui-bare-launch-'));
+    const sessionsRoot = join(iso, 'sessions');
+    const marker = '🩺 자동화 부검 팩 세션';
+    writeFileSync(join(iso, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+    process.env.ELANOUS_STATE_DIR = iso;
+    process.env.ELANOUS_SESSION_ROOT = sessionsRoot;
+    const repo = join(import.meta.dir, '..', '..');
+    const cliEntry = process.env.ELANOUS_BARE_LAUNCH_ENTRY ?? join(repo, 'bin', 'elanous.mjs');
+    const env = {
+      ...credentialFreeEnv(),
+      HOME: iso,
+      ELANOUS_SKIP_LOGIN_ENV: '1',
+      ELANOUS_STATE_DIR: iso,
+      ELANOUS_SESSION_ROOT: sessionsRoot,
+      ELANOUS_TEST_FAKE_LLM: '1',
+      ELANOUS_TEST_FAKE_LLM_RESPONSE: '[fake-llm] automation seed complete',
+    };
+    let pty: ReturnType<typeof startPty> | undefined;
+    const screens: string[] = [];
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    try {
+      const seed = await spawnRealCli(
+        [process.execPath, cliEntry, `--test=${iso}`, 'chat', '--new', '--json', marker],
+        { cwd: iso, env, timeoutMs: 45_000 },
+      );
+      expect(seed.error).toBeUndefined();
+      expect(seed.status).toBe(0);
+      const automationSessionId = JSON.parse(seed.stdout).sessionId as string;
+      expect(automationSessionId).toBeTruthy();
+
+      pty = startPty({
+        cmd: process.execPath,
+        args: [cliEntry, `--test=${iso}`, '--tui', 'next'],
+        cols: 80,
+        rows: 24,
+        workdir: iso,
+        unsetEnv: PROVIDER_KEYS,
+        env,
+      });
+      const deadline = Date.now() + 45_000;
+      let screen = '';
+      while (Date.now() < deadline) {
+        screen = await pty.renderScreen();
+        if (screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료')) break;
+        await sleep(200);
+      }
+      screens.push(`===== automation seed =====\n${seed.stdout}\n===== bare next boot =====\n${screen}`);
+      if (process.env.ELANOUS_BARE_LAUNCH_LIVE_OUT) {
+        mkdirSync(process.env.ELANOUS_BARE_LAUNCH_LIVE_OUT, { recursive: true });
+        writeFileSync(join(process.env.ELANOUS_BARE_LAUNCH_LIVE_OUT, 'before-after.txt'), screens.join('\n\n'));
+      }
+      expect(screen).toContain('elanous next · 새 대화');
+      expect(screen).not.toContain(marker);
+      expect(screen).not.toContain('[fake-llm] automation seed complete');
+      const humanSessionId = getActiveSessionId();
+      expect(humanSessionId).toBeTruthy();
+      expect(humanSessionId).not.toBe(automationSessionId);
+      pty.write('\x11');
+      await sleep(700);
+      try { pty.kill(); } catch { /* already exited */ }
+      pty = undefined;
+
+      pty = startPty({
+        cmd: process.execPath,
+        args: [cliEntry, `--test=${iso}`, '--continue', '--tui', 'next'],
+        cols: 80,
+        rows: 24,
+        workdir: iso,
+        unsetEnv: PROVIDER_KEYS,
+        env,
+      });
+      const continueDeadline = Date.now() + 45_000;
+      let continued = '';
+      while (Date.now() < continueDeadline) {
+        continued = await pty.renderScreen();
+        if (continued.includes('elanous next ·') && continued.includes('Ctrl+Q 종료')) break;
+        await sleep(200);
+      }
+      screens.push(`===== --continue after automation seed =====\n${continued}`);
+      expect(continued).toContain('elanous next · 새 대화');
+      expect(continued).not.toContain(marker);
+      expect(getActiveSessionId()).toBe(humanSessionId);
+      if (process.env.ELANOUS_BARE_LAUNCH_LIVE_OUT) {
+        writeFileSync(join(process.env.ELANOUS_BARE_LAUNCH_LIVE_OUT, 'before-after.txt'), screens.join('\n\n'));
+      }
+    } finally {
+      pty?.write('\x11');
+      await sleep(1000);
+      try { pty?.kill(); } catch { /* already exited */ }
+      rmSync(iso, { recursive: true, force: true });
     }
   }, 120_000);
 });

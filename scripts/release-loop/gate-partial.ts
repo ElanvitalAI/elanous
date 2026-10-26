@@ -5,7 +5,7 @@
 // GATE-REUSE-BY-DIFF (0.2.25): a code change no longer forces the full sweep — with the tip's import closure
 // (gate-closure.ts) the plan adds every test that can reach a changed file, and every test whose closure is opaque.
 // `release resume --from gate` now plans this by default when the tip moved (`--no-partial` = full gate).
-import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -23,6 +23,64 @@ export interface PartialPlan {
   files: string[];
   priorFailures: string[];
   priorErrors: string[];
+  /** Per-shard executed container imageID digest (never a Job image ref/tag). Present only when every shard recorded one. */
+  shardImageDigests?: string[];
+}
+
+/** A Pod shard result's executed image ID digest. Job image refs/tags are not this field. */
+export interface PartialPlanShardImage {
+  imageDigest?: string | null;
+}
+
+export type PartialPlanImageDigestDecision =
+  { reuse: 1; reason: 'executed-pod-image-digest-match' }
+  | { reuse: 0; reason: 'executed-pod-image-digest-missing' | 'executed-pod-image-digest-mismatch' };
+
+const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/i;
+
+function executedImageDigest(value: unknown): string | null {
+  return typeof value === 'string' && IMAGE_DIGEST.test(value) ? value.toLowerCase() : null;
+}
+
+function shardExecutedDigests(shards: readonly PartialPlanShardImage[]): Array<string | null> {
+  return shards.map((shard) => executedImageDigest(shard.imageDigest));
+}
+
+/** Reuse is allowed only when every shard digest is present and equal. Missing vs mismatch are distinct reasons. */
+export function partialPlanImageDigestsMatch(
+  prior: readonly PartialPlanShardImage[],
+  current?: readonly PartialPlanShardImage[],
+): PartialPlanImageDigestDecision {
+  const left = shardExecutedDigests(prior);
+  if (!left.length || left.some((digest) => !digest)) return { reuse: 0, reason: 'executed-pod-image-digest-missing' };
+  const first = left[0]!;
+  if (left.some((digest) => digest !== first)) return { reuse: 0, reason: 'executed-pod-image-digest-mismatch' };
+  if (current !== undefined) {
+    const right = shardExecutedDigests(current);
+    if (!right.length || right.some((digest) => !digest)) return { reuse: 0, reason: 'executed-pod-image-digest-missing' };
+    if (right.some((digest) => digest !== first)) return { reuse: 0, reason: 'executed-pod-image-digest-mismatch' };
+  }
+  return { reuse: 1, reason: 'executed-pod-image-digest-match' };
+}
+
+function planImageDigestDecision(digests: readonly unknown[]): PartialPlanImageDigestDecision {
+  return partialPlanImageDigestsMatch(digests.map((imageDigest) => ({ imageDigest: typeof imageDigest === 'string' ? imageDigest : null })));
+}
+
+/** Every executed root/retry Pod row. Reads `imageDigest` (container imageID); Job `image` ref/tag is ignored. */
+export function collectExecutedPodShardImages(dir: string, commit?: string): PartialPlanShardImage[] {
+  if (!existsSync(dir)) return [];
+  try {
+    return readdirSync(dir).filter((name) => /^pod-\d+(?:-[\w-]+)?\.json$/.test(name))
+      .sort((a, b) => Number(/^pod-(\d+)/.exec(a)![1]) - Number(/^pod-(\d+)/.exec(b)![1]) || a.localeCompare(b))
+      .map((name) => {
+        try {
+          const row = JSON.parse(readFileSync(join(dir, name), 'utf8')) as { commit?: string; imageDigest?: string };
+          if (commit && row.commit !== commit) return { imageDigest: null };
+          return { imageDigest: row.imageDigest ?? null };
+        } catch { return { imageDigest: null }; }
+      });
+  } catch { return []; }
 }
 
 /** G1: a second measurement of only the failed files on the very same release commit.
@@ -172,10 +230,22 @@ export function planPartialRegate(input: { version: string; priorCommit: string;
   closure?: (changedCode: string[]) => ClosureVerdict;
   /** Tracked at the tip — a deleted changed test is not re-run (nothing to run); a deleted prior-failure file is a full
    *  gate (its failure can be neither re-measured nor carried). Without it every changed test is planned. */
-  existsAtTip?: (file: string) => boolean }):
+  existsAtTip?: (file: string) => boolean;
+  /** Executed Pod shard imageID digests from the prior full gate. A Job image ref/tag is not this field. */
+  priorShards?: readonly PartialPlanShardImage[];
+  /** Executed Pod shard imageID digests of the current sweep, when already measured. */
+  currentShards?: readonly PartialPlanShardImage[];
+  /** Directory of prior full-gate `pod-N.json` rows; collected when `priorShards` is omitted. */
+  priorCutLogs?: string;
+  /** Directory of current-sweep `pod-N.json` rows; collected when `currentShards` is omitted. */
+  currentCutLogs?: string }):
   { ok: true; plan: PartialPlan; closure?: { reached: number; opaque: number } } | { ok: false; reason: string } {
   if (!/^[0-9a-f]{40}$/i.test(input.priorCommit) || !/^[0-9a-f]{40}$/i.test(input.forCommit)) return { ok: false, reason: 'commit is not a full sha' };
   if (input.priorCommit === input.forCommit) return { ok: false, reason: 'no new commit since the prior gate' };
+  const priorShards = input.priorShards ?? (input.priorCutLogs ? collectExecutedPodShardImages(input.priorCutLogs, input.priorCommit) : undefined);
+  const currentShards = input.currentShards ?? (input.currentCutLogs ? collectExecutedPodShardImages(input.currentCutLogs, input.forCommit) : undefined);
+  const imageIdentity = priorShards ? partialPlanImageDigestsMatch(priorShards, currentShards) : undefined;
+  if (imageIdentity && imageIdentity.reuse === 0) return { ok: false, reason: imageIdentity.reason };
   const source = input.changedFiles.filter((file) => !TEST_FILE.test(file) && !isInert(file));
   const list = (files: string[]) => `${files.slice(0, 5).join(', ')}${files.length > 5 ? ` (+${files.length - 5})` : ''}`;
   // Only code is followed through the closure: a changed fixture, JSON, lockfile, config or script is a full gate.
@@ -204,8 +274,12 @@ export function planPartialRegate(input: { version: string; priorCommit: string;
   // but it changes the measured suite and must not masquerade as a carry.
   if (!files.length && (!input.changedFiles.length || input.changedFiles.some((file) => !isInert(file))))
     return { ok: false, reason: 'nothing to re-run (not a docs-only append)' };
+  const shardImageDigests = imageIdentity?.reuse === 1
+    ? shardExecutedDigests(priorShards!).filter((digest): digest is string => !!digest)
+    : undefined;
   return { ok: true, plan: { ...(!files.length ? { kind: 'carry' as const } : {}), version: input.version, priorCommit: input.priorCommit, forCommit: input.forCommit, files,
-    priorFailures: [...input.priorFailures], priorErrors: [...input.priorErrors] }, ...(closure ? { closure } : {}) };
+    priorFailures: [...input.priorFailures], priorErrors: [...input.priorErrors],
+    ...(shardImageDigests ? { shardImageDigests } : {}) }, ...(closure ? { closure } : {}) };
 }
 
 export function writePartialPlan(root: string, plan: PartialPlan): string {
@@ -259,6 +333,11 @@ export function readPartialPlanResult(roots: readonly string[], version: string,
     catch { throw new Error(`invalid gate partial plan: ${path}`); }
     if (failureFiles.some((file) => !rerun.has(file))) throw new Error(`invalid gate partial plan (prior failure not re-run): ${path}`);
     if (raw.forCommit !== commit) { fallbackReason = 'plan-commit-mismatch'; continue; }
+    if (raw.shardImageDigests !== undefined) {
+      if (!Array.isArray(raw.shardImageDigests)) throw new Error(`invalid gate partial plan: ${path}`);
+      const identity = planImageDigestDecision(raw.shardImageDigests);
+      if (identity.reuse === 0) { fallbackReason = identity.reason; continue; }
+    }
     return { plan: raw as PartialPlan, fallbackReason: null };
   }
   return { plan: null, fallbackReason };

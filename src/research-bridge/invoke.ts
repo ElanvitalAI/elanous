@@ -15,6 +15,8 @@
 
 import type { ExternalResearchResult, InvokeResearchOpts } from './types.js';
 import type { SkillManifest } from '../skills/runner.js';
+import type { BloomResearchQuestion } from '../auto-research/question-ladder-contract.js';
+import type { AxisFanoutDeps, AxisFanoutResult } from '../research/axis-fanout.js';
 import { recordResult } from './store.js';
 
 const DEFAULT_SKILL = 'omni-crawl';
@@ -31,6 +33,15 @@ const DEFAULT_SKILL = 'omni-crawl';
 // 조사 부작용만 원천 봉쇄. deny wins over allow(tool-policy). 순수·spread(원본 불변).
 export const RESEARCH_DENIED_TOOLS = ['Write', 'Edit', 'NotebookEdit'] as const;
 
+const ANSI_CONTROL_SEQUENCES = /\u001B(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007]*(?:\u0007|\u001B\\))/g;
+
+/** Select the model's final answer, never the TUI-rendered tool transcript. */
+export function researchOutputFromSkillRun(
+  run: { finalResponse: string },
+): string {
+  return run.finalResponse.replace(ANSI_CONTROL_SEQUENCES, '');
+}
+
 export function withResearchIsolation(manifest: SkillManifest): SkillManifest {
   const deniedTools = [...new Set([...(manifest.deniedTools ?? []), ...RESEARCH_DENIED_TOOLS])];
   return { ...manifest, deniedTools };
@@ -43,6 +54,21 @@ export interface ResearchInvocationOutcome {
   output: string;
   ok: boolean;
   error?: string;
+}
+
+/** A successful skill call with no final answer is an incomplete invocation. */
+export function researchOutcomeFromSkillRun(
+  run: { finalResponse: string },
+): ResearchInvocationOutcome {
+  const output = researchOutputFromSkillRun(run);
+  if (output.length === 0) {
+    return {
+      output,
+      ok: false,
+      error: 'skill run finished without a final assistant response',
+    };
+  }
+  return { output, ok: true };
 }
 
 export type ResearchInvoker = (
@@ -59,6 +85,18 @@ export function setResearchInvoker(fn: ResearchInvoker | null): void {
   invoker = fn;
 }
 
+/** Research-turn entry once Bloom has supplied its question axes. This uses
+ *  native search per axis; it never sends the entire request to a skill. */
+export async function invokeResearchAxes(
+  questions: readonly BloomResearchQuestion[],
+  deps: AxisFanoutDeps = {},
+): Promise<AxisFanoutResult> {
+  // Keep the generic chat entry's static module closure unchanged; axis search
+  // is loaded only for a Bloom research turn.
+  const { fanOutAxisEvidence } = await import('../research/axis-fanout.js');
+  return fanOutAxisEvidence(questions, deps);
+}
+
 async function defaultInvoker(
   skillName: string,
   args: string,
@@ -73,17 +111,15 @@ async function defaultInvoker(
       error: `skill "${skillName}" not found under ~/.claude/skills/`,
     };
   }
-  let buffered = '';
   try {
     // ★ research 격리 — 파일-쓰기 도구 deny 주입(main 트리 오염 차단). Bash·검색도구는 유지.
-    const result = await executeSkill(withResearchIsolation(manifest), args, (delta, full) => {
-      buffered = full;
+    const result = await executeSkill(withResearchIsolation(manifest), args, (delta) => {
       if (onProgress) onProgress(delta);
     });
-    return { output: result.fullResponse || buffered, ok: true };
+    return researchOutcomeFromSkillRun(result);
   } catch (err) {
     return {
-      output: buffered,
+      output: '',
       ok: false,
       error: err instanceof Error ? err.message : String(err),
     };

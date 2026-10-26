@@ -1,5 +1,8 @@
 import { afterAll, describe, expect, it, test } from 'bun:test';
 import { appendRunLedgerEntry, appendRunLedgerEntryChecked, cleanupUnfinishedRunLedgers, classifyFederatedLedgerDirectoryReadFailure, describeFederatedMissingRunLedger, dispositionUnfinishedRunLedger, hasTerminalRunStatus, isTerminatedUnfinishedLifecycle, loadFederatedRunLedger, classifyUnfinishedLifecycle, loadRunLedger, loadRunLedgerWithMetadata, lookupPrGoalAcceptance, parseRunShardIdentity, queryCompletedRunLedgers, queryFederatedCompletedRunLedgers, queryFederatedInterruptedRunLedgers, queryFederatedUnfinishedRunLedgers, queryInterruptedRunLedgers, queryRunChain, queryRunLedgerTimeline, queryRunScreenKey, queryUnfinishedRunLedgers, readNonBlockingRunRecord, recordHumanStoppedRun, recordNonBlockingRunPending, recordNonBlockingRunResult, renderRunLedger, renderUnfinishedRunLedgers, runLedgerDir, runLedgerPath, summarizeRunLedgerRounds, RunLedgerCheckedAppendRunIdMismatchError, TERMINATED_UNFINISHED_LIFECYCLES, type RunChainLogStore, type RunLedgerCheckedAppendDecision, type RunLedgerEntry, type RunLedgerReader, type UnfinishedRunLedgerEntry } from './run-ledger.js';
+// 이 시험이 새로 들여온 대조 API 는 네임스페이스 접근으로 꺼낸다 — named import 면
+// 그 export 가 아직 없는 트리에서 파일 전체가 로드 실패해 나머지 시험까지 못 돈다.
+import * as runLedgerModule from './run-ledger.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2143,6 +2146,117 @@ describe('RUN-DOCTOR-LIVE #30468 — 잠금 runId와 쓰기 runId 일치 강제 
       expect(appendRunLedgerEntryChecked(RUN_ID, decide, dir)).toEqual({ appended: true, result: null, refusal: null });
       expect(loadRunLedger(RUN_ID, dir)!.filter((entry) => entry.event === 'unit-checked-append').length).toBe(1);
       expect(existsSync(join(dir, `.${RUN_ID}.lock`))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('RUN-REQUEST-VS-EFFECTIVE', () => {
+  const REQUEST_RUN_ID = 'run-00000000-0000-4000-8000-000000000911';
+  const REQUEST_MISSION_ID = 'e54dc953981a1236';
+
+  function seedRequestVsEffective(dir: string, effectiveModel: string): void {
+    appendRunLedgerEntry({ timestamp: '2026-10-24T02:53:19.250Z', runId: REQUEST_RUN_ID, event: 'start', data: {}, goalId: REQUEST_MISSION_ID }, dir);
+    appendRunLedgerEntry({
+      timestamp: '2026-10-24T02:53:20.000Z',
+      runId: REQUEST_RUN_ID,
+      event: 'run-origin',
+      goalId: REQUEST_MISSION_ID,
+      data: { childProvider: 'openai-codex', childModel: 'gpt-6-luna' },
+    }, dir);
+    appendRunLedgerEntry({
+      timestamp: '2026-10-24T02:54:02.000Z',
+      runId: REQUEST_RUN_ID,
+      event: 'start',
+      goalId: REQUEST_MISSION_ID,
+      data: { provider: 'openai-codex', model: effectiveModel },
+    }, dir);
+  }
+
+  it('대조 기록 API 와 mismatch 이벤트 이름이 export 되어 있다', () => {
+    expect(typeof runLedgerModule.recordRunRequestVsEffective).toBe('function');
+    expect(runLedgerModule.RUN_REQUEST_VS_EFFECTIVE_EVENT).toBe('run-request-vs-effective');
+  });
+
+  it('실제 run-origin/start 생산 형식: 요청 luna ↔ 실행 sol 이면 childModel mismatch 1건', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'run-ledger-request-vs-effective-'));
+    try {
+      seedRequestVsEffective(dir, 'gpt-6-sol');
+      const ledger = loadRunLedger(REQUEST_RUN_ID, dir)!;
+      expect(ledger.filter((entry) => entry.event === runLedgerModule.RUN_REQUEST_VS_EFFECTIVE_EVENT)).toHaveLength(1);
+      const timeline = queryRunLedgerTimeline(REQUEST_MISSION_ID, { dir });
+      expect(timeline).toHaveLength(1);
+      expect(timeline[0]?.mismatches).toEqual([
+        { axis: 'childModel', requested: 'gpt-6-luna', effective: 'gpt-6-sol' },
+      ]);
+      expect(timeline[0]?.requestVsEffective).toEqual({
+        requested: { childProvider: 'openai-codex', childModel: 'gpt-6-luna' },
+        effective: { childProvider: 'openai-codex', childModel: 'gpt-6-sol' },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('요청과 실행이 같으면 mismatch 0건', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'run-ledger-request-vs-effective-'));
+    try {
+      seedRequestVsEffective(dir, 'gpt-6-luna');
+      const ledger = loadRunLedger(REQUEST_RUN_ID, dir)!;
+      expect(ledger.filter((entry) => entry.event === runLedgerModule.RUN_REQUEST_VS_EFFECTIVE_EVENT)).toHaveLength(0);
+      const timeline = queryRunLedgerTimeline(REQUEST_MISSION_ID, { dir });
+      expect(timeline).toHaveLength(1);
+      expect(timeline[0]?.mismatches ?? []).toHaveLength(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('축마다 다른 값이면 축별 mismatch 행을 따로 쓴다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'run-ledger-request-vs-effective-'));
+    try {
+      appendRunLedgerEntry({ timestamp: '2026-10-24T02:53:19.250Z', runId: REQUEST_RUN_ID, event: 'start', data: {}, goalId: REQUEST_MISSION_ID }, dir);
+      const comparison = runLedgerModule.recordRunRequestVsEffective(REQUEST_RUN_ID, {
+        childProvider: 'openai-codex',
+        childModel: 'gpt-6-luna',
+        overagePolicy: 'fail',
+        podPool: 'pool-a',
+        parentHost: 'host-a',
+      }, {
+        childProvider: 'openai-codex',
+        childModel: 'gpt-6-luna',
+        overagePolicy: 'fallback',
+        podPool: 'pool-b',
+        parentHost: 'host-a',
+      }, { dir });
+      expect(comparison.mismatches).toEqual([
+        { axis: 'overagePolicy', requested: 'fail', effective: 'fallback' },
+        { axis: 'podPool', requested: 'pool-a', effective: 'pool-b' },
+      ]);
+      expect(queryRunLedgerTimeline(REQUEST_MISSION_ID, { dir })[0]?.mismatches ?? []).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('대조를 기록하지 않은 런의 기존 타임라인 행은 그대로다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'run-ledger-request-vs-effective-'));
+    try {
+      appendRunLedgerEntry({ timestamp: '2026-10-24T02:53:19.250Z', runId: REQUEST_RUN_ID, event: 'start', data: {}, goalId: REQUEST_MISSION_ID }, dir);
+      appendRunLedgerEntry({
+        timestamp: '2026-10-24T02:54:02.000Z',
+        runId: REQUEST_RUN_ID,
+        event: 'child-start',
+        goalId: REQUEST_MISSION_ID,
+        data: { childStart: { provider: 'openai-codex', model: 'gpt-6-luna' } },
+      }, dir);
+      const timeline = queryRunLedgerTimeline(REQUEST_MISSION_ID, { dir });
+      expect(timeline).toHaveLength(1);
+      expect(timeline[0]?.runId).toBe(REQUEST_RUN_ID);
+      expect(timeline[0]?.executedAt).toBe('2026-10-24T02:53:19.250Z');
+      expect(timeline[0]?.mismatches).toBeUndefined();
+      expect(timeline[0]?.requestVsEffective).toBeUndefined();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -90,6 +90,8 @@ export interface TasksCliDeps {
   adoptRunTerminal?: typeof import('../task-agent/adopt-pr.js').adoptedRunTerminal;
   /** `tasks show`·`advance` 의 런 근거 읽기(시험 주입) — 기본 = 런 원장(이 우주 ⊕ 연합) ⊕ 호스트 logs 의 Pod job-finished. */
   cardRunEvidence?: CardRunEvidenceDeps;
+  /** `tasks show --json` 의 저작 골 파일 조회(시험 주입). null 은 골 연결을 확인하지 못한 상태다. */
+  cardGoalDocument?: (goalId: string) => { goalFile: string; goalBody: string } | null;
   /** `tasks live-verified` 가 적는 런 원장 디렉터리(시험 주입). 기본 = `runLedgerDir()`. */
   liveVerifiedLedgerDir?: string;
   /** HARNESS-PARENT-ON-MSB1 — 원격 부모 카드의 원장 거울(시험 주입). 기본 = ssh 로 `<prodRoot>/remote-parents/<host>/run-ledger`. */
@@ -189,8 +191,6 @@ export interface DefaultTaskLauncherDeps {
   localVersion?: string;
   /** HQ-owned, refresh-less Codex access mirror to install before a remote parent launch. */
   codexAccessMirror?: () => Promise<{ elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number; mirrors?: Array<{ elanousAuth: string; codexAuth: string; account: string; usedPercent?: number; thresholdPercent: number; expiresAt: number }> } | null>;
-  /** HQ-owned Grok subscription access mirror; resolved before the first remote SSH call. */
-  grokAccessMirror?: () => import('../task-agent/parent-host.js').OwnerGrokAccessMirror;
   /** Clock used to recheck mirror freshness immediately before installation. */
   now?: () => number;
   /** Isolated integration seam; production still reads the HQ rotation snapshot and config directly. */
@@ -204,6 +204,18 @@ export interface DefaultTaskLauncherDeps {
 }
 
 class NoEligibleOwnerCodexAccountError extends Error {}
+
+/** Only declared Pod launch switches cross from HQ to the remote parent. */
+export function podParentLaunchSelectors(contextEnv: Record<string, string>, inheritedEnv: NodeJS.ProcessEnv): Record<string, string> {
+  const selectors: Record<string, string> = {};
+  for (const key of ['ELANOUS_POD_MEMORY_TIER', 'ELANOUS_POD_MEMORY', 'ELANOUS_POD_MEMORY_HIGH', 'ELANOUS_POD_MEMORY_LITE', 'ELANOUS_POD_GOAL_TYPE'] as const) {
+    const value = contextEnv[key] ?? inheritedEnv[key];
+    if (value !== undefined) selectors[key] = value;
+  }
+  const inplace = contextEnv.ELANOUS_POD_INPLACE_WORKTREE ?? inheritedEnv.ELANOUS_POD_INPLACE_WORKTREE;
+  if (inplace !== undefined) selectors.ELANOUS_POD_INPLACE_WORKTREE = inplace === '1' ? '1' : '0';
+  return selectors;
+}
 
 /**
  * HARNESS-PARENT-ON-MSB1 — 켜져 있고 발사 전 점검이 통과하면 원격(ssh)에서 부모를 띄운다(PR 까지만 · 병합은 HQ).
@@ -223,9 +235,21 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     ?? (args.includes('--child-llm-provider') ? args[args.indexOf('--child-llm-provider') + 1] : undefined);
   const effectiveChildProvider = context.effectiveChildProvider ?? providerFromArgs;
   const notice = deps.notice ?? ((line: string) => { try { process.stderr.write(`${line}\n`); } catch { /* ignore */ } });
+  const provisionRequests = new Set<string>();
+  const provision = (host: string, reason: string): void => {
+    const key = `${host}:${reason}`;
+    if (provisionRequests.has(key)) return;
+    provisionRequests.add(key);
+    try { debug.log('task-agent.parent-host', 'provision-requested', { host, runId: context.runId, provider: effectiveChildProvider ?? 'openai-codex', reason }); } catch { /* fail-soft */ }
+    notice(`[parent-host] ${host} provision 요청 — ${reason}; 준비 완료 전 배정 대기`);
+  };
   const failed = (target: typeof targets[number], gaps: string[], facts: Record<string, string> = {}): void => {
     try { debug.log('task-agent', 'parent-host-fallback', { host: target.host, runId: context.runId, gaps, facts }); } catch { /* fail-soft */ }
-    notice(`[parent-host] ${target.host} 로 못 띄움 — ${multi ? '다음 호스트 또는 로컬 발사로 간다' : '로컬 발사로 간다'}: ${gaps.join(' · ')}`);
+    // grok-credential-* 은 호스트가 스스로 보고한 자체 자격 상태다 — 무효면 OP 재로그인 요청이 나간다.
+    const provisionGaps = ['grok-cli-missing', 'codex-cli-missing', 'grok-credential-missing', 'grok-credential-expiring', 'grok-credential-expired', 'codex-access-mirror-unavailable'];
+    const missing = gaps.every((gap) => provisionGaps.includes(gap)) ? gaps : [];
+    notice(`[parent-host] ${target.host} 로 못 띄움 — ${missing.length ? '공급자 준비 뒤 재시도' : multi ? '다음 호스트 또는 로컬 발사로 간다' : '로컬 발사로 간다'}: ${gaps.join(' · ')}`);
+    for (const gap of missing) provision(target.host, gap);
   };
   type OwnerMirror = { elanousAuth: string; codexAuth: string; account?: string; usedPercent?: number; thresholdPercent?: number; mirrors?: Array<{ elanousAuth: string; codexAuth: string; account: string; usedPercent?: number; thresholdPercent: number; expiresAt: number }> };
   let accessMirror: OwnerMirror | null | undefined;
@@ -313,11 +337,9 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   //   그 앞의 readParentHostCapacity 도 ssh). 가드를 아래로 내리면 hold 경로에서 시험이 실 ssh 를 쏜다(R7 사고 모양).
   //   hold 경로를 재는 시험은 deps.ssh 가짜 또는 parentHost:null 을 주입한다(real-launch-guard.test 가 이 순서를 문다).
   if (!deps.ssh) (await import('../task-agent/real-launch-guard.js')).refuseRealLaunchUnderTest('remote-parent-ssh', targets.map((target) => target.host).join(','));
-  // Grok access is selected/refreshed on HQ before preflight performs any SSH call. A missing or stale
-  // subscription must fail closed without touching the remote host or falling back to a local launch.
-  const grokAccessMirror = effectiveChildProvider === 'grok'
-    ? (deps.grokAccessMirror?.() ?? parentHostModule.resolveOwnerGrokAccessMirror())
-    : undefined;
+  // GROK-MIRROR-REAL-SCOPE: HQ does not select or copy its own Grok access for a remote parent. Each host keeps
+  // its own device-auth session, and the preflight below blocks the Grok child when the host reports it invalid
+  // (grok-credential-*) — that gap drives the OP re-login request instead of a silent local fallback.
   let launchHoldActive = false;
   try {
     if (deps.launchHoldActive) launchHoldActive = deps.launchHoldActive();
@@ -328,7 +350,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     }
   } catch { launchHoldActive = true; /* 못 읽으면 막힌 것으로(fail-closed) */ }
   const podGoal = context.substrate === 'pod' ? context.podGoal : undefined;
-  // 부모에서 잰 메모리 선택자만 원격 자식에도 넘긴다. 로컬의 나머지 환경·자격은 SSH 로 복사하지 않는다.
+  // Pod 선택자만 원격 부모에 넘긴다. 로컬의 나머지 환경·자격은 SSH 로 복사하지 않는다.
   const remoteEnv = { ...context.env };
   // These labels describe an HQ-selected Codex access mirror; never forward an inherited label by itself.
   delete remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNT;
@@ -336,10 +358,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   delete remoteEnv.ELANOUS_REMOTE_CODEX_THRESHOLD_PERCENT;
   delete remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNTS;
   delete remoteEnv.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
-  if (podGoal) for (const key of ['ELANOUS_POD_MEMORY_TIER', 'ELANOUS_POD_MEMORY', 'ELANOUS_POD_MEMORY_HIGH', 'ELANOUS_POD_MEMORY_LITE', 'ELANOUS_POD_GOAL_TYPE'] as const) {
-    const value = context.env[key] ?? process.env[key];
-    if (value !== undefined) remoteEnv[key] = value;
-  }
+  if (podGoal) Object.assign(remoteEnv, podParentLaunchSelectors(context.env, process.env));
   const memoryLimit = podGoal ? (await import('../task-orchestrator/surfaces/self-implement-pod.js')).podMemoryLimitFor(podGoal, remoteEnv).limit : undefined;
   const fits = Object.fromEntries(targets.map((target) => {
     const fit = memoryLimit
@@ -354,7 +373,9 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     const details = targets.map((target) => `${target.host}: Pod ${fits[target.host]!.memoryLimit} (${fits[target.host]!.requiredBytes} bytes) > node allocatable ${fits[target.host]!.allocatableBytes} bytes`).join(' · ');
     throw new Error(`parent-host memory-never-fits — ${details}; local fallback refused`);
   }
-  const capacities = Object.fromEntries(multi ? eligible.map((target) => [target.host, parentHostModule.readParentHostCapacity(target, deps.ssh)]) : []);
+  const capacities: Record<string, import('../task-agent/parent-host.js').ParentHostCapacity | null> = Object.fromEntries(
+    multi ? eligible.map((target) => [target.host, parentHostModule.readParentHostCapacity(target, deps.ssh)]) : [],
+  );
   const measured = eligible.filter((target) => fits[target.host]?.state === 'fits');
   const unknown = eligible.filter((target) => fits[target.host]?.state !== 'fits');
   const ranked = multi
@@ -372,11 +393,14 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   };
   for (const target of ordered) {
     if (multi && (!capacities[target.host] || capacities[target.host]!.approvalHeadroom <= 0)) {
-      failed(target, ['capacity-unavailable']);
+      const capacity = capacities[target.host];
+      failed(target, [`capacity-unavailable · ${capacity
+        ? `host active=${capacity.active} waiting=${capacity.waiting} limit=${capacity.limit} headroom=${capacity.headroom}`
+        : 'measurement=unknown'}`]);
       continue;
     }
     let preflight: ReturnType<typeof parentHostModule.preflightParentHost>;
-    try { preflight = parentHostModule.preflightParentHost({ target, localVersion: deps.localVersion ?? parentHostModule.localElanousVersion(), launchHoldActive, ...(deps.ssh ? { ssh: deps.ssh } : {}) }); }
+    try { preflight = parentHostModule.preflightParentHost({ target, localVersion: deps.localVersion ?? parentHostModule.localElanousVersion(), launchHoldActive, childProvider: effectiveChildProvider ?? 'openai-codex', ...(deps.ssh ? { ssh: deps.ssh } : {}) }); }
     catch (error) { failed(target, [`preflight-error: ${error instanceof Error ? error.message : String(error)}`]); continue; }
     if (!preflight.ok) { failed(target, preflight.gaps, preflight.facts); continue; }
     if (preflight.warnings.length) notice(`⚠ ${target.host} 자격: ${preflight.warnings.join(' · ')}`);
@@ -422,8 +446,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
         else {
           try { debug.log('task-agent.parent-host', 'codex-access-mirror-unavailable', { host: target.host, runId: context.runId, reason: mirrorReason }); } catch { /* fail-soft */ }
           failed(target, ['codex-access-mirror-unavailable']);
-          recordHostRanking(null);
-          return null;
+          continue;
         }
         if (selected?.account) {
           remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNT = selected.account;
@@ -433,8 +456,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
         if (mirrors) remoteEnv.ELANOUS_REMOTE_CODEX_ACCOUNTS = JSON.stringify(mirrors.map(({ account, usedPercent, thresholdPercent, expiresAt }) => ({ account, usedPercent: usedPercent ?? null, thresholdPercent, expiresAt })));
         remoteEnv.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
       }
-      const launched = parentHostModule.launchRemoteParent(target, args, remoteEnv, deps.ssh,
-        grokAccessMirror ? () => grokAccessMirror : undefined, effectiveChildProvider, deps.now);
+      const launched = parentHostModule.launchRemoteParent(target, args, remoteEnv, deps.ssh, effectiveChildProvider);
       recordHostRanking(target.host);
       try { debug.log('task-agent', 'parent-host-launched', { host: target.host, runId: context.runId, pid: launched.pid, log: launched.log }); } catch { /* fail-soft */ }
       return { runId: context.runId, parentHost: { host: target.host, ...(target.configDir ? { configDir: target.configDir } : {}), pid: launched.pid, log: launched.log } };
@@ -447,6 +469,7 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
     }
   }
   recordHostRanking(null);
+  if (provisionRequests.size > 0) throw new Error(`parent-host-provision-pending: ${[...provisionRequests].join(', ')}; no child provider host launched`);
   return null;
 }
 
@@ -2486,14 +2509,17 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--card <id>', '기존 launched 카드(미바인딩 또는 같은 PR이 등록부에서 바인딩됨)')
     .option('--checklist <id>', '새 카드에 붙일 체크리스트 칸')
     .option('--version <version>', '체크리스트 판(기존 카드에도 고정 가능)')
+    .option('--rebind', '옛 판 또는 failed 카드의 기존 PR 결속을 풀고 지정 판의 새 카드로 원자 이동')
     .option('--unlinked-terminal', '기존 카드의 모든 구현 자식이 종결되고 PR 사건이 전혀 없을 때만 별도로 열린 PR을 명시적으로 입양')
     .option('--json', 'JSON 출력')
-    .action(async (value: string, opts: { card?: string; checklist?: string; version?: string; unlinkedTerminal?: boolean; json?: boolean }) => {
+    .action(async (value: string, opts: { card?: string; checklist?: string; version?: string; rebind?: boolean; unlinkedTerminal?: boolean; json?: boolean }) => {
       await registerTaskAgentSink(deps.registerSink);
       try {
         if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error(`PR 번호가 아니다: ${value}`);
         if ((opts.card === undefined) === (opts.checklist === undefined))
           throw new Error('--card 또는 --checklist [--version] 중 하나만 준다');
+        if (opts.rebind && (opts.card || !opts.checklist || !opts.version || opts.unlinkedTerminal))
+          throw new Error('--rebind는 --checklist와 --version을 지정하고 --card/--unlinked-terminal은 생략한다');
         if (opts.unlinkedTerminal && !opts.card) throw new Error('--unlinked-terminal은 --card와 함께 준다');
         if (opts.version) validateVersion(opts.version);
         let cardVersion = opts.version;
@@ -2534,15 +2560,28 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         const linkedEvidence = targetCard ? checkRun(targetCard, view) : undefined;
         const terminalRunEvidence = linkedEvidence || (opts.unlinkedTerminal && targetCard ? checkRun(targetCard, view, undefined, true) : false);
         const unlinkedTerminalUsed = opts.unlinkedTerminal === true && linkedEvidence !== true;
+        let rebindSource: { card: TaskCard; terminalRunEvidence: boolean } | undefined;
+        if (opts.rebind) {
+          const statePath = deps.taskStatePath ?? taskStatePathDefault();
+          const bound = Object.values(readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath).tasks ?? {})
+            .filter((card) => cardPrNumber(card) === number);
+          if (bound.length !== 1) throw new Error(bound.length
+            ? `PR #${number}가 여러 카드에 묶였다 — 임의로 rebind하지 않는다`
+            : `PR #${number}가 기존 카드에 묶이지 않았다 — --rebind 대상 없음`);
+          const source = bound[0]!;
+          rebindSource = { card: source, terminalRunEvidence: source.status === 'launched' ? checkRun(source, view) : false };
+        }
         const chosen = observedChecklist ?? checklist;
         const result = adoptExistingPr({ pr: view, repo, statePath: deps.taskStatePath ?? taskStatePathDefault(),
           ...(opts.card ? { cardId: opts.card, version: cardVersion, terminalRunEvidence, unlinkedTerminal: unlinkedTerminalUsed, observedChecklist,
             observedRun: { runId: targetCard?.runId, runChildId: targetCard?.runChildId, parentHost: targetCard?.parentHost?.host, launchId: targetCard?.launchId } } : {}),
+          ...(rebindSource ? { rebindSource } : {}),
+          ...(opts.rebind && opts.version ? { version: opts.version } : {}),
           ...(chosen ? { checklistAtWrite: () => (deps.adoptChecklist ?? listChecklist)(chosen.version).items.find((item) => item.id === chosen.id) } : {}),
           ...(checklist ? { checklist } : {}) });
         try { debug.log('task-agent', 'pr-adopted', { card: result.card.id, pr: number, head: view.headRefOid, created: result.created, changed: result.changed, launched: false }); } catch { /* fail-soft */ }
-        if (opts.json) out(JSON.stringify({ card: result.card.id, pr: number, head: view.headRefOid, created: result.created, changed: result.changed, next: `tasks rejudge ${result.card.id}` }));
-        else out(`${result.card.id}\tPR #${number}\t${result.changed ? 'adopted' : 'already-adopted'}\t구현 발사 0 · 다음: tasks rejudge ${result.card.id}`);
+        if (opts.json) out(JSON.stringify({ card: result.card.id, ...(result.previousCardId ? { previousCard: result.previousCardId } : {}), pr: number, head: view.headRefOid, created: result.created, changed: result.changed, next: `tasks rejudge ${result.card.id}` }));
+        else out(`${result.card.id}\tPR #${number}\t${result.changed ? 'adopted' : 'already-adopted'}${result.previousCardId ? ` · 이전 카드 ${result.previousCardId} 결속 해제` : ''}\t구현 발사 0 · 다음: tasks rejudge ${result.card.id}`);
       } catch (error) {
         out(error instanceof Error ? error.message : String(error));
         process.exitCode = 1;

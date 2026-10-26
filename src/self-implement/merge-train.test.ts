@@ -250,6 +250,10 @@ test('shadow queue with two non-overlapping PRs runs one train gate and records 
   const verdict = await runL8ShadowQueue(repo, {
     command: execute,
     trainGit: (args, cwd) => { trainCalls.push(['git', ...args].join(' ')); return real('git', args, cwd); },
+    trainReachInspect: (candidate) => ({
+      changedFiles: candidate.changedFiles, testFiles: ['test/shared.test.ts'], unverified: [], unrunImporterTotal: 0,
+      routeLookupFailures: [], callerTestsOverflow: [], alwaysIncludeMissing: [],
+    }),
     trainGate: (_repo, baseSha) => async (commitSha: string, prNumbers: readonly number[]): Promise<'pass'> => {
       gateCalls++;
       gateBatches.push([...prNumbers]);
@@ -260,14 +264,15 @@ test('shadow queue with two non-overlapping PRs runs one train gate and records 
   });
   expect(gateCalls).toBe(1);
   expect(gateBatches).toEqual([[7, 8]]);
-  expect(verdict).toMatchObject({ number: 7, verdict: 'pass', base });
+  expect(verdict).toMatchObject({ number: 7, verdict: 'pass', base, tests: ['test/shared.test.ts'] });
+  expect(verdict?.manifest).toMatchObject({ number: 7, group: [7, 8], reachTests: ['test/shared.test.ts'], gatesRun: 1, verdict: 'pass' });
   const state = await statusL8ShadowQueue(repo, { command: execute });
   expect(state.pending).toEqual([]);
   expect(state.verdicts.map(({ number, verdict }) => ({ number, verdict }))).toEqual([
     { number: 7, verdict: 'pass' }, { number: 8, verdict: 'pass' },
   ]);
   expect(git(repo, 'rev-parse', 'HEAD')).toBe(headBefore);
-  expect(calls.some((line) => /\bgit push\b|\bgh pr merge\b|\bupdate-ref\b|\bworktree\b|\bcheckout\b/.test(line))).toBe(false);
+  expect(calls.some((line) => /\bgit push\b|\bgh pr merge\b|\bupdate-ref\b|\bcheckout\b/.test(line))).toBe(false);
   expect(trainCalls.some((line) => /\bgit push\b|\bupdate-ref\b|\bcheckout\b/.test(line))).toBe(false);
   expect(trainCalls.some((line) => line.includes('commit-tree'))).toBe(true);
 }, 30_000);

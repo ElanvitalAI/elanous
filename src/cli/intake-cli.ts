@@ -13,6 +13,7 @@ import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 import { registerIntakeSourceCommands } from './intake-source-cli.js';
 import type { IntakeItem } from '../intake-plane/items.js';
+import type { CollectSavedResult, FetchSavedMessages } from '../intake-plane/collect-telegram-saved.js';
 import type { TaskCard } from '../task-cards/card-store.js';
 import { collectFunnelCandidates, type FunnelDirectiveRow } from '../intake-plane/requirement-funnel.js';
 
@@ -29,6 +30,13 @@ export interface IntakeCandidatesCliDeps {
   intakeItems?: () => IntakeItem[] | Promise<IntakeItem[]>;
   cards?: () => TaskCard[] | Promise<TaskCard[]>;
   write?: (text: string) => Promise<void>;
+}
+
+export interface IntakeCliDeps extends IntakeCandidatesCliDeps {
+  /** 흡수 원장 우주 (기본 effectiveInstanceRoot()) — 시험은 격리 임시 root 를 넣는다. */
+  root?: string;
+  /** 텔레그램 «저장된 메시지» 연결 (기본 gramjsFetchSaved) — 시험은 가짜 fetch 를 넣는다. */
+  connectSaved?: () => Promise<{ fetch: FetchSavedMessages; close: () => Promise<void> }>;
 }
 
 /** `--limit` 원 문자열 → 0 이상의 정수. 숫자만(`/^\d+$/`) 받고 나머지('' · 공백 · 음수 · 소수)는 거부한다. */
@@ -187,6 +195,40 @@ export async function runIntakeDigestCli(
   return {};
 }
 
+export interface CollectTelegramSavedCliDeps {
+  root?: string;
+  connect?: () => Promise<{ fetch: FetchSavedMessages; close: () => Promise<void> }>;
+  write?: (text: string) => Promise<void>;
+  error?: (message: string) => void;
+}
+
+/**
+ * `intake collect-telegram-saved` — 읽기만 · 커서 이후만.
+ * «메시지 0»(필터로 비었나 · 커서를 다른 주체가 넘겼나)과 «원장 입력 0»(다른 주체가 이미 가져갔나)을 갈라 보여준다.
+ */
+export async function runCollectTelegramSavedCli(
+  opts: { max?: string; dryRun?: boolean; json?: boolean },
+  deps: CollectTelegramSavedCliDeps = {},
+): Promise<CollectSavedResult | undefined> {
+  const { collectTelegramSaved, gramjsFetchSaved, renderCollectTelegramSavedResult } = await import('../intake-plane/collect-telegram-saved.js');
+  const root = deps.root ?? (await import('../instance/resolve.js')).effectiveInstanceRoot();
+  let conn: { fetch: FetchSavedMessages; close: () => Promise<void> };
+  try { conn = await (deps.connect ?? (() => gramjsFetchSaved()))(); }
+  catch (e) { (deps.error ?? ((message: string) => console.error(message)))(String((e as Error).message ?? e)); process.exitCode = 2; return undefined; }
+  try {
+    const res = await collectTelegramSaved(root, conn.fetch, {
+      max: Math.max(1, Number(opts.max ?? 300) || 300),
+      ...(opts.dryRun ? { dryRun: true } : {}),
+    });
+    const write = deps.write ?? writeStdoutFully;
+    if (opts.json) await write(JSON.stringify(res, null, 2));
+    else await write(renderCollectTelegramSavedResult(res));
+    return res;
+  } finally {
+    await conn.close();
+  }
+}
+
 export function resolveIntakeCheckRoot(
   cwd: string,
   git: typeof runGitCommand = runGitCommand,
@@ -200,7 +242,7 @@ export function resolveIntakeCheckRoot(
   }
 }
 
-export function registerIntakeCommands(program: Command, candidateDeps: IntakeCandidatesCliDeps = {}): void {
+export function registerIntakeCommands(program: Command, candidateDeps: IntakeCliDeps = {}): void {
   // ── intake check — 바깥 사실을 elanous 현재와 대조 (태스크 등록 없음) ──
   const intakeCmd = program.command('intake').description('바깥 사실·문서를 elanous 현재와 대조하거나 태스크로 받는다');
   registerIntakeSourceCommands(intakeCmd);
@@ -500,17 +542,11 @@ export function registerIntakeCommands(program: Command, candidateDeps: IntakeCa
     .option('--dry-run', '원장·커서를 바꾸지 않고 건수만')
     .option('--json', '구조화 출력')
     .action(async (opts: { max?: string; dryRun?: boolean; json?: boolean }) => {
-      const { collectTelegramSaved, gramjsFetchSaved } = await import('../intake-plane/collect-telegram-saved.js');
-      const { effectiveInstanceRoot } = await import('../instance/resolve.js');
-      let conn: Awaited<ReturnType<typeof gramjsFetchSaved>>;
-      try { conn = await gramjsFetchSaved(); } catch (e) { console.error(String((e as Error).message ?? e)); process.exitCode = 2; return; }
-      try {
-        const res = await collectTelegramSaved(effectiveInstanceRoot(), conn.fetch, { max: Math.max(1, Number(opts.max ?? 300) || 300), ...(opts.dryRun ? { dryRun: true } : {}) });
-        if (opts.json) await writeStdoutFully(JSON.stringify(res, null, 2));
-        else console.log(`텔레그램 저장된 메시지: 메시지 ${res.messages} · 원장 입력 ${res.raws} · 커서 ${res.cursorBefore} → ${res.cursorAfter}${res.dryRun ? ' (dry-run · 안 씀)' : res.ingest ? ` · 새 ${res.ingest.added} · 합침 ${res.ingest.merged} · 이미 끝난 것 ${res.ingest.seen}` : ''}`);
-      } finally {
-        await conn.close();
-      }
+      await runCollectTelegramSavedCli(opts, {
+        ...(candidateDeps.root ? { root: candidateDeps.root } : {}),
+        ...(candidateDeps.connectSaved ? { connect: candidateDeps.connectSaved } : {}),
+        ...(candidateDeps.write ? { write: candidateDeps.write } : {}),
+      });
     });
 
   intakeCmd

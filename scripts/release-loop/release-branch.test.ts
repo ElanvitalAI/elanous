@@ -446,10 +446,10 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     const first = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'),
       { input: { version: '0.2.18', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }, deps: { root: state, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(0, 6)).toEqual(['version-release', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate']);
+    expect(first.path.slice(0, 7)).toEqual(['version-release', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
-    expect(seen.map((item) => item.nodeId)).toEqual(['cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'gate-triage']);
-    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut]);
+    expect(seen.map((item) => item.nodeId)).toEqual(['traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate', 'gate-triage', 'traffic-failed-restore']);
+    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut, cut, cut]);
     const fix = f.land('fix.ts', 'export const fix = true;\n');
     const base = git(f.origin, 'rev-parse', `${cut}^`);
     cutReleaseBranch({ version: '0.2.18', base, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });
@@ -485,7 +485,7 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     expect(seen.map((item) => item.nodeId)).toContain('docs');
     expect(seen.map((item) => item.nodeId)).toContain('publish');
     // The final resumed tail includes the graph's publication and verification stages.
-    expect(resumed.state.path.slice(-13)).toEqual(['known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(resumed.state.path.slice(-14)).toEqual(['known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'verify', 'traffic-verify-complete', 'vault-note', 'release-story', 'ops-upgrade', 'version-dev-bump', 'done']);
     // Shadow publication on the real resume path: the three post-approval visits must dispatch three
     // distinct commands. The injected runner never publishes anything outside this temporary test universe.
     expect(seen.filter((item) => ['publish', 'npm-publish', 'docs-land'].includes(item.nodeId)).map((item) => [item.nodeId, item.command]))

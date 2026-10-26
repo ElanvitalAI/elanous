@@ -5,7 +5,8 @@
 //    이 파일의 상수 기대치(프록시 URL·필수 헤더)로 굳어 있다.
 
 import { describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -17,6 +18,7 @@ import {
   isGrokVersionRejected,
   refreshGrokSubscriptionToken,
   resolveGrokCredential,
+  readSelectedGrokScope,
 } from './credential.js';
 
 /** auth.json 을 «실제 형태»(<issuer>::<client_id> 키)로 심은 합성 HOME. */
@@ -85,14 +87,48 @@ describe('auth.json 읽기 — ⛔ flat 이 아니고, 판본마다 키가 다�
     expect(resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv })?.token).toBe('new-token');
   });
 
-  it('원격 hq-mirror 가 있으면 기존 다른 스코프를 보존하면서 그 access 를 우선한다', () => {
+  it('호스트 oidc가 hq-mirror보다 늦게 만료되면 호스트 expiresAt을 반환한다', () => {
     const home = homeWithAuth({
-      'https://auth.x.ai::other': { key: 'other-token', expires_at: '2035-12-01T00:00:00Z', refresh_token: 'existing-refresh' },
-      'https://auth.x.ai::hq-mirror': { key: 'hq-mirror-token', expires_at: '2030-12-01T00:00:00Z' },
+      'https://auth.x.ai::hq-mirror': { key: 'hq-mirror-token', expires_at: '2030-12-01T01:00:00Z' },
+      'https://auth.x.ai::host-oidc': { key: 'host-token', expires_at: '2030-12-01T06:00:00Z' },
+    });
+    const credential = resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv });
+    expect(credential?.token).toBe('host-token');
+    expect(credential?.expiresAt).toBe('2030-12-01T06:00:00Z');
+  });
+
+  it('hq-mirror와 호스트 oidc 만료가 같으면 hq-mirror를 고른다', () => {
+    const home = homeWithAuth({
+      'https://auth.x.ai::hq-mirror': { key: 'hq-mirror-token', expires_at: '2030-12-01T06:00:00Z' },
+      'https://auth.x.ai::host-oidc': { key: 'host-token', expires_at: '2030-12-01T06:00:00Z' },
     });
     const credential = resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv });
     expect(credential?.token).toBe('hq-mirror-token');
-    expect(credential?.expiresAt).toBe('2030-12-01T00:00:00Z');
+    expect(credential?.expiresAt).toBe('2030-12-01T06:00:00Z');
+  });
+
+  it('hq-mirror만 있으면 기존처럼 hq-mirror를 고른다', () => {
+    const home = homeWithAuth({
+      'https://auth.x.ai::hq-mirror': { key: 'hq-mirror-token', expires_at: '2030-12-01T01:00:00Z' },
+    });
+    expect(resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv })?.token).toBe('hq-mirror-token');
+  });
+
+  it('호스트 oidc만 있으면 기존처럼 그 자격을 고른다', () => {
+    const home = homeWithAuth({
+      'https://auth.x.ai::host-oidc': { key: 'host-token', expires_at: '2030-12-01T06:00:00Z' },
+    });
+    expect(resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv })?.token).toBe('host-token');
+  });
+
+  it('다른 스코프보다 늦게 만료되는 hq-mirror는 선택된다', () => {
+    const home = homeWithAuth({
+      'https://auth.x.ai::other': { key: 'other-token', expires_at: '2030-12-01T01:00:00Z', refresh_token: 'existing-refresh' },
+      'https://auth.x.ai::hq-mirror': { key: 'hq-mirror-token', expires_at: '2030-12-01T06:00:00Z' },
+    });
+    const credential = resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv });
+    expect(credential?.token).toBe('hq-mirror-token');
+    expect(credential?.expiresAt).toBe('2030-12-01T06:00:00Z');
   });
 
   it('README 판본 키(accounts.x.ai/sign-in)도 «훑어서» 잡는다', () => {
@@ -169,6 +205,40 @@ describe('실패 분류', () => {
 });
 
 describe('refreshGrokSubscriptionToken — ⭐ 강등보다 «앞»에 오는 칸', () => {
+  it('명시적 refresh는 아직 유효한 토큰에도 CLI를 실행한다', () => {
+    const home = homeWithAuth({ 's::c': { key: 'old', expires_at: '2030-01-01T00:00:00Z' } });
+    let called = 0;
+    expect(refreshGrokSubscriptionToken({ home, execImpl: () => {
+      called += 1;
+      writeFileSync(grokAuthFilePath(home), JSON.stringify({ 's::c': { key: 'new', expires_at: '2030-02-01T00:00:00Z' } }));
+    } })).toBe('refreshed');
+    expect(called).toBe(1);
+  });
+
+  it('다른 프로세스가 refresh lock을 잡아 제한 시간이 지나면 실패로 분류한다', () => {
+    const home = homeWithAuth({ 's::c': { key: 'old', expires_at: '2026-01-01T00:00:00Z' } });
+    const lock = `${grokAuthFilePath(home)}.refresh-lock`;
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'owner'), `${process.pid} ${Date.now() - 60_000}`);
+    let called = 0;
+    expect(refreshGrokSubscriptionToken({ home, timeoutMs: 20, execImpl: () => { called += 1; } })).toBe('failed');
+    expect(called).toBe(0);
+  });
+
+  it('owner 기록 전 죽은 오래된 잠금 디렉터리를 회수한다', () => {
+    const home = homeWithAuth({ 's::c': { key: 'old', expires_at: '2026-01-01T00:00:00Z' } });
+    const lock = `${grokAuthFilePath(home)}.refresh-lock`;
+    mkdirSync(lock);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+    let called = 0;
+    expect(refreshGrokSubscriptionToken({ home, timeoutMs: 1_000, execImpl: () => {
+      called += 1;
+      writeFileSync(grokAuthFilePath(home), JSON.stringify({ 's::c': { key: 'new', expires_at: '2030-01-01T00:00:00Z' } }));
+    } })).toBe('refreshed');
+    expect(called).toBe(1);
+  });
+
   it('만료가 «앞으로» 가면 refreshed', () => {
     const home = homeWithAuth({ 's::c': { key: 'k', expires_at: '2026-01-01T00:00:00Z' } });
     const outcome = refreshGrokSubscriptionToken({
@@ -195,9 +265,81 @@ describe('refreshGrokSubscriptionToken — ⭐ 강등보다 «앞»에 오는 �
     })).toBe('failed');
   });
 
+  it('CLI 성공 뒤 선택 자격을 읽을 수 없으면 no-credential로 분류한다', () => {
+    const home = homeWithAuth({ 's::c': { key: 'old', expires_at: '2026-01-01T00:00:00Z' } });
+    expect(refreshGrokSubscriptionToken({ home, execImpl: () => {
+      writeFileSync(grokAuthFilePath(home), '{ broken json');
+    } })).toBe('no-credential');
+  });
+
   it('자격 파일이 아예 없으면 no-credential (「없음」과 「실패」를 가른다)', () => {
     expect(refreshGrokSubscriptionToken({ home: EMPTY_HOME(), execImpl: () => { /* noop */ } }))
       .toBe('no-credential');
+  });
+
+  it('호출자가 요구하면 선택된 구독 scope의 비어 있지 않은 refresh_token이 없을 때 CLI를 실행하지 않는다', () => {
+    for (const refreshToken of [undefined, '']) {
+      let called = 0;
+      const home = homeWithAuth({ 's::c': { key: 'access', expires_at: '2026-01-01T00:00:00Z', refresh_token: refreshToken } });
+      expect(refreshGrokSubscriptionToken({ home, requireRefreshToken: true, execImpl: () => { called += 1; } })).toBe('no-credential');
+      expect(called).toBe(0);
+    }
+  });
+
+  it('같은 key가 있어도 선택된 scope에 refresh_token이 없으면 CLI를 실행하지 않는다', () => {
+    const home = homeWithAuth({
+      's::refreshable-other': { key: 'shared-access', expires_at: '2026-01-01T00:00:00Z', refresh_token: 'other-scope-refresh' },
+      's::selected': { key: 'shared-access', expires_at: '2026-02-01T00:00:00Z' },
+    });
+    let calls = 0;
+    const outcome = refreshGrokSubscriptionToken({ home, requireRefreshToken: true, execImpl: () => { calls += 1; } });
+    expect(calls).toBe(0);
+    expect(outcome).toBe('no-credential');
+  });
+
+  it('선택 scope에 refresh token이 없으면 다른 scope의 같은 key와 토큰을 빌리지 않는다', () => {
+    const home = homeWithAuth({
+      's::refreshable': { key: 'shared', expires_at: '2026-01-01T00:00:00Z', refresh_token: 'other-session' },
+      's::selected': { key: 'shared', expires_at: '2026-02-01T00:00:00Z' },
+    });
+    expect(readSelectedGrokScope(home)?.hasRefreshToken).toBe(false);
+    let calls = 0;
+    expect(refreshGrokSubscriptionToken({ home, requireRefreshToken: true, execImpl: () => { calls++; } })).toBe('no-credential');
+    expect(calls).toBe(0);
+  });
+
+  it('두 프로세스가 같은 auth.json을 동시에 refresh해도 CLI는 한 번만 실행한다', async () => {
+    const home = homeWithAuth({ 's::c': { key: 'old', expires_at: '2026-01-01T00:00:00Z', refresh_token: 'session' } });
+    const counter = join(home, 'calls');
+    const bin = join(home, 'bin');
+    mkdirSync(bin);
+    const cli = join(bin, 'grok');
+    writeFileSync(cli, `#!/usr/bin/env node\nconst fs=require('node:fs');const p=${JSON.stringify(grokAuthFilePath(home))};const c=${JSON.stringify(counter)};fs.appendFileSync(c,'call\\n');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,250);const a=JSON.parse(fs.readFileSync(p,'utf8'));a['s::c'].key='fresh';a['s::c'].expires_at='2030-01-01T00:00:00Z';fs.writeFileSync(p,JSON.stringify(a));\n`);
+    chmodSync(cli, 0o755);
+    const script = `import { refreshGrokSubscriptionToken } from ${JSON.stringify(new URL('./credential.ts', import.meta.url).pathname)}; console.log(refreshGrokSubscriptionToken({ home: ${JSON.stringify(home)}, grokPath: ${JSON.stringify(cli)}, requireRefreshToken: true, requiredValidityMs: 105*60*1000, nowMs: Date.parse('2026-01-01T00:00:00Z'), timeoutMs: 5000 }));`;
+    const run = () => new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ['--eval', script], { env: { ...process.env, HOME: home } });
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+      child.on('error', reject);
+      child.on('exit', (code) => code === 0 ? resolve(output.trim()) : reject(new Error(`child exit ${code}`)));
+    });
+    const results = await Promise.all([run(), run()]);
+    expect(results.filter((value) => value === 'refreshed')).toHaveLength(1);
+    expect(readFileSync(counter, 'utf8').trim().split(/\n/)).toHaveLength(1);
+  });
+
+  it('같은 auth.json의 재진입 refresh는 한 번만 CLI를 실행한다', () => {
+    const home = homeWithAuth({ 's::c': { key: 'access', expires_at: '2026-01-01T00:00:00Z' } });
+    let calls = 0;
+    let nested: ReturnType<typeof refreshGrokSubscriptionToken> | undefined;
+    const first = refreshGrokSubscriptionToken({ home, execImpl: () => {
+      calls += 1;
+      nested = refreshGrokSubscriptionToken({ home, execImpl: () => { calls += 1; } });
+    } });
+    expect(first).toBe('unchanged');
+    expect(nested).toBe('unchanged');
+    expect(calls).toBe(1);
   });
 
   it('Pod env + 만료 10분 전 access 는 중계의 새 key 로 0600 다시 쓰기를 하고, 500 이면 옛 key 를 유지한다', async () => {

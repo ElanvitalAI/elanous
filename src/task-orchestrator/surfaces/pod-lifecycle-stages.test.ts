@@ -344,7 +344,7 @@ test('si-task Job shell: run end sits right after `rc=$?` on every branch — po
   for (const [branch, job] of Object.entries(scripts)) {
     const script = ((job as any).spec.template.spec.containers[0].args as string[]).at(-1)!;
     expect(script.split(runEnd).length - 1, branch).toBe(1);
-    expect(script, branch).toContain(`wait "$si_pid"; rc=$?; ${runEnd}`);
+    expect(script, branch).toContain(`wait "$si_pid"; rc=$?; touch /tmp/si.finished; ${runEnd}`);
     expect(script.indexOf(siTaskPodStageShell('run', 'start')), branch).toBeLessThan(script.indexOf('& si_pid=$!'));
     expect(script.indexOf(runEnd), branch).toBeLessThan(script.indexOf('cat /tmp/si.out'));
   }

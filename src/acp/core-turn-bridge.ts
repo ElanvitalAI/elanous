@@ -53,6 +53,7 @@ import type { AcpServerOptions, AcpTurnContext } from './server.js';
 import { acpToolDenialResult } from './tool-approval.js';
 import { readOriginSessionMeta } from './origin-session-meta.js';
 import { isFactQuestion } from './fact-question.js';
+import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import { classifyTuiChatIntent, formatTuiRouteLine, isSeatOpsDirective, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 import { createReasoningThoughtBuffer } from './reasoning-thought-buffer.js';
@@ -306,8 +307,11 @@ export function bridgeCoreTurnToAcp(
       // 사실 질문 예산은 «단일 턴» 전용이다 — goal loop 와 겹치면 예산을 다 쓴 뒤에도 루프가 계속 재촉해
       // 매 continuation 이 «Tool budget reached» 로 거부되고, 모델은 그것을 도구 장애로 읽어 blocked 를 남긴다
       // (10-14 13:48 운영 TUI OP: route short-question·goalLoop ⊕ factQuestion → 소진 뒤 헛호출 7회).
+      const surfaceProfile = resolveSessionSurfaceProfile({ userText: turnCtx.userText });
       const factShaped = isFactQuestion(turnCtx.userText);
-      const factQuestion = factShaped && !armGoalLoop;
+      // A quick research/turn lookup still keeps the fact budget. Only the
+      // multi-source research/agent route needs enough rounds to compare axes.
+      const factQuestion = factShaped && !armGoalLoop && surfaceProfile.id !== 'research/agent';
       if (factShaped && armGoalLoop) {
         try { debug.log('chat.turn', 'fact-budget-skipped', { reason: 'goal-loop-armed', route: route.route }); }
         catch { /* observation cannot interrupt a turn */ }
@@ -420,6 +424,7 @@ export function bridgeCoreTurnToAcp(
         sessionId: turnCtx.sessionId,
         ...(originSessionId ? { originSessionId } : {}),
         ...(turnCtx.userText ? { userText: turnCtx.userText } : {}),
+        surfaceProfile,
         messages: turnMessages,
         tools,
         dispatchTool,

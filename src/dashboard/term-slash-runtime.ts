@@ -127,6 +127,8 @@ export function createDashboardTermSlashRuntime(
       deps.muted('  /term list                List all alive sessions (fg / bg / exited).'),
       deps.muted('  /term attach <id>         Bring a backgrounded session to foreground.'),
       deps.muted('  /term detach              Send foreground session to background (PTY survives).'),
+      deps.muted('  Ctrl+B (while streaming)  Background running child tasks; turn continues.'),
+      deps.muted('  Ctrl+X c (chat input)     Enter control mode.'),
       deps.muted('  /term switch              Open the session picker modal.'),
       deps.muted('  /term kill <id>           Stop the PTY and remove the session.'),
       deps.muted('  /term snapshot <id> [tail [bytes]]   Capture current grid (snapshot) or last N bytes (tail).'),

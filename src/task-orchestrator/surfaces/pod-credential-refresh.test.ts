@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
@@ -113,7 +113,7 @@ describe('Pod credential refresh', () => {
     const job = sim.applied.find((manifest) => manifest.kind === 'Job');
     expect(job?.spec.template.spec.containers[0].args[0]).toContain('export GH_TOKEN="$(cat /creds/gh-token)"');
     expect(job?.spec.template.spec.containers[0].args[0]).not.toContain('gh auth login --with-token < /creds/gh-token');
-  });
+  }, 15_000); // Simulated kubectl startup exceeded Bun's 5s default on the shared host.
 
   test('exit 7 backs off then retries the same goal once with a newly issued token; a second 7 fails with reason and other exits never retry', async () => {
     for (const [exits, expectedCode] of [[[7, 0], undefined], [[7, 7], 'pod-gh-login-failed'], [[8], 'pod-job-failed']] as const) {
@@ -144,6 +144,125 @@ describe('Pod credential refresh', () => {
         if (expectedCode === 'pod-gh-login-failed') expect(result.error?.message).toContain('1회 재시도했으나 다시 실패');
       } finally { off(); }
     }
+  }, 30_000); // Three sequential simulated Job runs exceed Bun's 5s default under shared host load.
+
+  test('1h44m Grok auth refreshes through the production host credential preflight before applying the Job', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-credential-grok-window-'));
+    try {
+      mkdirSync(join(home, '.grok'));
+      const auth = join(home, '.grok', 'auth.json');
+      const put = (key: string, expiresAt: number) => writeFileSync(auth, JSON.stringify({
+        'https://auth.x.ai::client': { key, expires_at: new Date(expiresAt).toISOString(), refresh_token: 'same-session' },
+      }));
+      put('old', now + 104 * 60_000);
+      const bin = join(home, 'bin');
+      mkdirSync(bin);
+      const grok = join(bin, 'grok');
+      writeFileSync(grok, `#!/usr/bin/env node\nconst fs=require('node:fs');fs.appendFileSync(${JSON.stringify(join(home, 'grok-calls'))},'called\\n');const p=${JSON.stringify(auth)};const a=JSON.parse(fs.readFileSync(p,'utf8'));const s=a['https://auth.x.ai::client'];s.key='new';s.expires_at=new Date(${now} + 6*60*60*1000).toISOString();fs.writeFileSync(p,JSON.stringify(a));\n`);
+      chmodSync(grok, 0o755);
+      const originalHome = process.env.HOME;
+      const originalPath = process.env.PATH;
+      process.env.HOME = home;
+      process.env.PATH = `${bin}:${originalPath ?? ''}`;
+      const sim = cluster([0]);
+      try {
+      const result = await podSelfImplementSpawn({ kubectl: sim.kubectl, provider: 'grok', env: {}, now: () => now,
+        grokCredentials: () => hostGrokCredentials({ home, env: {}, now: () => now, ghToken: () => 'human-token', grokPath: grok }),
+      })({ feature: 'grok proactive refresh', spaceId: 'grok-window-refresh' }).done;
+      expect(result.exitCode, result.error?.message).toBe(0);
+      expect(readFileSync(join(home, 'grok-calls'), 'utf8').trim().split(/\\n/)).toEqual(['called']);
+      const refreshed = JSON.parse(readFileSync(auth, 'utf8'))['https://auth.x.ai::client'];
+      expect(refreshed.key).toBe('new');
+      expect(refreshed.expires_at).toBe(new Date(now + 6 * 60 * 60_000).toISOString());
+      } finally {
+        if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
+        if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
+      }
+      expect(sim.applied.some((manifest) => manifest.kind === 'Job')).toBe(true);
+      const shipped = sim.applied.find((manifest) => manifest.kind === 'Secret')?.stringData?.['grok-auth.json'];
+      expect(shipped).toContain('new');
+      expect(shipped).not.toContain('same-session');
+      expect(JSON.stringify(sim.applied)).not.toContain('same-session');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('same-key scopes do not lend a refresh token to the selected scope; no Job is applied', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-credential-grok-scope-'));
+    try {
+      mkdirSync(join(home, '.grok'));
+      writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+        'https://auth.x.ai::refreshable': { key: 'shared', expires_at: new Date(now + 60 * 60_000).toISOString(), refresh_token: 'other-session' },
+        'https://auth.x.ai::selected': { key: 'shared', expires_at: new Date(now + 104 * 60_000).toISOString() },
+      }));
+      const sim = cluster([0]);
+      let refreshCalls = 0;
+      const result = await podSelfImplementSpawn({ kubectl: sim.kubectl, provider: 'grok', env: {}, now: () => now,
+        grokCredentials: () => hostGrokCredentials({ home, env: {}, now: () => now, ghToken: () => 'human-token', refresh: () => { refreshCalls++; return 'refreshed'; } }),
+      })({ feature: 'selected scope token check', spaceId: 'grok-selected-scope-no-token' }).done;
+      expect(result.exitCode).toBe(1);
+      expect(result.error?.message).toContain('선택된 구독 scope에 refresh token 없음');
+      expect(sim.applied.some((manifest) => manifest.kind === 'Job')).toBe(false);
+      expect(sim.calls.some((call) => call.includes('apply -f -') && sim.applied.some((manifest) => manifest.kind === 'Job'))).toBe(false);
+      expect(refreshCalls).toBe(0);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('a healthy selected scope without refresh token still launches without refresh', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-credential-grok-healthy-no-refresh-'));
+    try {
+      mkdirSync(join(home, '.grok'));
+      writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+        'https://auth.x.ai::selected': { key: 'healthy', expires_at: new Date(now + 6 * 60 * 60_000).toISOString() },
+      }));
+      const sim = cluster([0]);
+      let refreshCalls = 0;
+      const result = await podSelfImplementSpawn({ kubectl: sim.kubectl, provider: 'grok', env: {}, now: () => now,
+        grokCredentials: () => hostGrokCredentials({ home, env: {}, now: () => now, ghToken: () => 'human-token', refresh: () => { refreshCalls++; return 'refreshed'; } }),
+      })({ feature: 'healthy no refresh token', spaceId: 'grok-healthy-no-refresh' }).done;
+      expect(result.exitCode).toBe(0);
+      expect(sim.applied.some((manifest) => manifest.kind === 'Job')).toBe(true);
+      expect(refreshCalls).toBe(0);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('a selected-scope change during host refresh is rejected before any Job is applied', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-credential-grok-race-'));
+    try {
+      mkdirSync(join(home, '.grok'));
+      const auth = join(home, '.grok', 'auth.json');
+      writeFileSync(auth, JSON.stringify({
+        'https://auth.x.ai::initial': { key: 'old', expires_at: new Date(now + 104 * 60_000).toISOString(), refresh_token: 'same-session' },
+      }));
+      const sim = cluster([0]);
+      const result = await podSelfImplementSpawn({ kubectl: sim.kubectl, provider: 'grok', env: {}, now: () => now,
+        grokCredentials: () => hostGrokCredentials({ home, env: {}, now: () => now, ghToken: () => 'human-token', refresh: () => {
+          writeFileSync(auth, JSON.stringify({
+            'https://auth.x.ai::replacement': { key: 'unchecked', expires_at: new Date(now + 6 * 60 * 60_000).toISOString(), refresh_token: 'replacement-session' },
+          }));
+          return 'refreshed';
+        } }),
+      })({ feature: 'scope changes during preflight', spaceId: 'grok-scope-race' }).done;
+      expect(result.exitCode).toBe(1);
+      expect(result.error?.message).toContain('선택된 구독 scope가 사라졌거나 바뀜');
+      expect(sim.applied.some((manifest) => manifest.kind === 'Job')).toBe(false);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('1h44m Grok auth with failed refresh remains no-launch before any Job is applied', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-credential-grok-failed-window-'));
+    try {
+      mkdirSync(join(home, '.grok'));
+      writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+        'https://auth.x.ai::client': { key: 'old', expires_at: new Date(now + 104 * 60_000).toISOString(), refresh_token: 'same-session' },
+      }));
+      const sim = cluster([0]);
+      const result = await podSelfImplementSpawn({ kubectl: sim.kubectl, provider: 'grok', env: {}, now: () => now,
+        grokCredentials: () => hostGrokCredentials({ home, env: {}, now: () => now, ghToken: () => 'human-token', refresh: () => 'failed' }),
+      })({ feature: 'grok proactive refresh', spaceId: 'grok-window-no-launch' }).done;
+      expect(result.exitCode).toBe(1);
+      expect(result.error?.message).toContain('구독 access 토큰 남은 시간');
+      expect(sim.applied.some((manifest) => manifest.kind === 'Job')).toBe(false);
+    } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
   test('five-minute Grok auth refreshes on host and ships the new access copy without its refresh token', async () => {

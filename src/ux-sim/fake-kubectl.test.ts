@@ -32,7 +32,7 @@ function stage(jobForLease?: string) {
     ...(jobForLease ? { job: jobForLease } : {}) });
   let transports = 0;
   const provider = new WarmPodProvider({ candidates: [{ host: 'node-c', tier: 'standard', spec }],
-    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: device.kubectl, fetch: device.fetchLease, transport: () => ({ request: async () => { transports++;
       return { status: 'observed', reason: 'complete', reply: null }; } }),
   });

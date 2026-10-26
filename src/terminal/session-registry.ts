@@ -157,6 +157,7 @@ export class TerminalSessionRegistry {
         shell: spec.shell,
         shellArgs: spec.shellArgs,
         env: spec.env,
+        unsetEnv: spec.unsetEnv,
         termName: spec.termName,
         useRegistry: spec.useRegistry,
         registryKind: spec.registryKind,

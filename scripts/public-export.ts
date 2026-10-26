@@ -101,14 +101,74 @@ function redactionPattern(from: string): RegExp {
   const post = /[A-Za-z0-9]$/.test(from) ? '(?![A-Za-z0-9])' : '';
   return new RegExp(`${pre}${escapeRegExp(from)}${post}`, 'gu');
 }
+const CODE_FILE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs)$/iu;
+type RedactionProblem = { marker: 'private-redaction-identifier' | 'private-redaction-syntax' | 'private-source-syntax'; file: string; line: number; text: string };
+class PrivateRedactionError extends Error {
+  constructor(message: string, readonly hits: readonly RedactionProblem[]) { super(message); }
+}
+
+function codeIdentifierRanges(file: string, text: string): Array<{ start: number; end: number; name: string }> {
+  if (!CODE_FILE.test(file)) return [];
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false,
+    /\.(?:tsx|jsx)$/iu.test(file) ? ts.LanguageVariant.JSX : ts.LanguageVariant.Standard, text);
+  const ranges: Array<{ start: number; end: number; name: string }> = [];
+  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
+    if (token === ts.SyntaxKind.Identifier || token === ts.SyntaxKind.PrivateIdentifier
+      || token >= ts.SyntaxKind.FirstKeyword && token <= ts.SyntaxKind.LastKeyword) {
+      ranges.push({ start: scanner.getTokenPos(), end: scanner.getTextPos(), name: scanner.getTokenText() });
+    }
+  }
+  return ranges;
+}
+
+function assertRedactionsAvoidIdentifiers(file: string, text: string, redactions: readonly PrivateRedaction[]): void {
+  if (!CODE_FILE.test(file) || !redactions.some((redaction) => text.includes(redaction.from))) return;
+  const identifiers = codeIdentifierRanges(file, text);
+  if (!identifiers.length) return;
+  const hits: RedactionProblem[] = [];
+  for (const redaction of redactions) {
+    for (const match of text.matchAll(redactionPattern(redaction.from))) {
+      const start = match.index;
+      const token = identifiers.find((entry) => start < entry.end && start + match[0].length > entry.start);
+      if (!token) continue;
+      const line = text.slice(0, token.start).split('\n').length;
+      hits.push({ marker: 'private-redaction-identifier', file, line, text: token.name });
+    }
+  }
+  const unique = [...new Map(hits.map((hit) => [`${hit.file}:${hit.line}:${hit.text}`, hit])).values()];
+  if (unique.length) throw new PrivateRedactionError(`private redaction would change code identifiers: ${unique.slice(0, 12).map((hit) => `${hit.file}:${hit.line} ${hit.text}`).join(', ')}${unique.length > 12 ? ` (+${unique.length - 12} more)` : ''}`, unique);
+}
+
+function firstCodeParseError(file: string, text: string): { line: number; message: string } | null {
+  if (!CODE_FILE.test(file)) return null;
+  const kind = /\.(?:tsx|jsx)$/iu.test(file) ? ts.ScriptKind.TSX
+    : /\.(?:js|mjs|cjs)$/iu.test(file) ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+  const parsed = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, false, kind) as ts.SourceFile & { parseDiagnostics: readonly ts.Diagnostic[] };
+  const first = parsed.parseDiagnostics[0];
+  return first ? { line: parsed.getLineAndCharacterOfPosition(first.start ?? 0).line + 1,
+    message: ts.flattenDiagnosticMessageText(first.messageText, ' ') } : null;
+}
+
+function assertRedactedCodeParses(file: string, before: string, after: string): void {
+  const failure = firstCodeParseError(file, after);
+  if (!failure) return;
+  const baseline = firstCodeParseError(file, before);
+  const issue = baseline ?? failure;
+  const marker = baseline ? 'private-source-syntax' : 'private-redaction-syntax';
+  const label = baseline ? 'source code was already invalid before redaction' : 'private redaction produced invalid code';
+  throw new PrivateRedactionError(`${label} at ${file}:${issue.line}: ${issue.message}`,
+    [{ marker, file, line: issue.line, text: issue.message }]);
+}
+
 export function applyPrivateRedactions(contents: ReadonlyMap<string, string>, redactions: readonly PrivateRedaction[]): { contents: Map<string, string>; files: number; places: number } {
   const result = new Map(contents);
   let files = 0; let places = 0;
   for (const [file, text] of result) {
     if (text.includes('\u0000')) continue;
+    assertRedactionsAvoidIdentifiers(file, text, redactions);
     let out = text; let changed = 0;
     for (const r of redactions) out = out.replace(redactionPattern(r.from), () => { changed++; return r.to; });
-    if (changed) { result.set(file, out); files++; places += changed; }
+    if (changed) { assertRedactedCodeParses(file, text, out); result.set(file, out); files++; places += changed; }
   }
   return { contents: result, files, places };
 }
@@ -461,7 +521,14 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
     // ⭐ 개인 치환표(저장소 밖) — 규칙 변환 «뒤»에 건다. 없으면 «못 봤다»로 막는다.
     const redactions = loadPrivateRedactions();
     const noPrivateList = argv.includes('--no-private-list');
-    const redacted = redactions ? applyPrivateRedactions(transformedByRules.contents, redactions) : { contents: transformedByRules.contents, files: 0, places: 0 };
+    let redacted: ReturnType<typeof applyPrivateRedactions>;
+    try { redacted = redactions ? applyPrivateRedactions(transformedByRules.contents, redactions) : { contents: transformedByRules.contents, files: 0, places: 0 }; }
+    catch (error) {
+      console.error(`⛔ ${error instanceof Error ? error.message : String(error)}`);
+      if (json && error instanceof PrivateRedactionError) console.log(JSON.stringify({ files: scanned.length,
+        leaks: error.hits.length, hits: error.hits }));
+      return 1;
+    }
     const transformed = { contents: redacted.contents, counts: transformedByRules.counts };
     const privateRedactions = { table: privateRedactionsPath(), loaded: redactions !== null, entries: redactions?.length ?? 0, files: redacted.files, places: redacted.places };
     if (redactions) console.error(`private redactions: ${redacted.files} files · ${redacted.places} places (${redactions.length} entries · ${privateRedactionsPath()})`);

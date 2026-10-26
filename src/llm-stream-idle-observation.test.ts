@@ -50,7 +50,7 @@ async function observeTurn(
   });
   (globalThis as { setTimeout: typeof setTimeout }).setTimeout = ((handler: TimerHandler, timeout?: number) => {
     armedDelays.push(timeout ?? 0);
-    if (options.idle && typeof handler === 'function') queueMicrotask(() => { if (armedDelays.length === 1) handler(); });
+    if (options.idle && typeof handler === 'function') queueMicrotask(() => { if (armedDelays.length <= 2) handler(); });
     return realSetTimeout(handler, timeout);
   }) as typeof setTimeout;
   try {

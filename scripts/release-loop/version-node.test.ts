@@ -26,11 +26,24 @@ if (args[0] === 'show' && args[1] === 'origin/main:package.json') console.log(JS
 else if (args[0] === 'show' && args[1] === (state.chosen || 'chosen-sha') + ':package.json') console.log(JSON.stringify({name:'fixture',version:state.chosenVersion || state.version}));
 else if (args[0] === 'show' && String(args[1]).endsWith(':package.json')) console.log(JSON.stringify({name:'fixture',version:state.version}));
 else if (args[0] === 'fetch' && args[2] === 'refs/heads/release/0.2.4') { state.branchFetched = true; fs.writeFileSync(stateFile, JSON.stringify(state)); }
+else if (args[0] === 'fetch' && args[1] === 'origin' && String(args[2]).startsWith('refs/heads/release/')) { state.branchFetched = true; fs.writeFileSync(stateFile, JSON.stringify(state)); }
 else if (args[0] === 'rev-parse' && args[1] === '--verify') {
   if (state.chosenMissing && !state.branchFetched) { console.error('unknown revision'); process.exit(128); }
-  console.log(state.chosen || 'chosen-sha');
+  const ref = String(args[2] || '');
+  if (state.revParse && ref in state.revParse) console.log(state.revParse[ref]);
+  else console.log(state.chosen || 'chosen-sha');
 }
-else if (args[0] === 'merge-base') process.exit(state.onMain === false ? 1 : 0);
+else if (args[0] === 'merge-base') {
+  const key = args.slice(1).join(' ');
+  if (state.ancestor && key in state.ancestor) process.exit(state.ancestor[key] ? 0 : 1);
+  process.exit(state.onMain === false ? 1 : 0);
+}
+else if (args[0] === 'rev-list' && args[1] === '--parents') {
+  const sha = args.at(-1);
+  const parents = (state.parents || {})[sha] || [];
+  console.log([sha].concat(parents).join(' '));
+}
+else if (args[0] === 'show-ref') process.exit(state.localBranch ? 0 : 1);
 else if (args[0] === 'ls-remote' && args[1] === '--tags') {
   const published = state.publishedVersions || (state.publishedTag ? [state.publishedVersion || '0.2.27'] : []);
   const requested = args.at(-1);
@@ -122,7 +135,7 @@ function fixture(version: string, land = 'ok', install = 'ok') {
     const result = spawnSync(process.execPath, [resolve(import.meta.dir, 'version-node.ts'), ...args], {
       cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, VERSION_NODE_TEST_ROOT: root },
     });
-    return { status: result.status, output: JSON.parse(result.stdout.trim().split('\n').at(-1)!), calls: readFileSync(join(root, 'calls'), 'utf8'), stderr: result.stderr };
+    return { status: result.status, output: JSON.parse(result.stdout.trim().split('\n').at(-1)!), calls: readFileSync(join(root, 'calls'), 'utf8'), stderr: result.stderr, stdout: result.stdout };
   };
   return { root, run };
 }
@@ -736,3 +749,89 @@ test('RELEASE-DEVBUMP-ALWAYS: a published tag alone does not heal a non-adjacent
     }
   }
 });
+
+const cutSha = 'c'.repeat(40);
+const mainSha = 'b'.repeat(40);
+const pickSha = 'd'.repeat(40);
+
+/** RELEASE-APPEND-BASE-AUTO: stage the fake git so release/0.2.4 exists at cutSha whose first parent is mainSha. */
+function cutBranchState(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    branchTip: cutSha,
+    revParse: { [`refs/remotes/origin/release/0.2.4^{commit}`]: cutSha, [`${cutSha}^{commit}`]: cutSha, [`${pickSha}^{commit}`]: pickSha },
+    parents: { [cutSha]: [mainSha], [pickSha]: ['e'.repeat(40)] },
+    ancestor: {
+      [`--is-ancestor ${mainSha} origin/main`]: true,
+      [`--is-ancestor ${pickSha} origin/main`]: true,
+      [`--is-ancestor ${pickSha} ${mainSha}`]: false,
+      [`--is-ancestor ${pickSha} ${cutSha}`]: false,
+    },
+    ...extra,
+  };
+}
+
+test('RELEASE-APPEND-BASE-AUTO: cut-branch --append with base omitted resolves the main cut from the ledger record', () => {
+  const { root, run } = fixture('0.2.4');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, ...cutBranchState() }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4' }, outputs: { 'version-release': { commit: cutSha, branch: 'release/0.2.4' } } });
+  try {
+    const { status, output, calls, stdout } = run('cut-branch', '--append', '--pick', pickSha, '--dry-run', '--json');
+    expect(status).toBe(0);
+    expect(output).toMatchObject({ outcome: 'ok', kind: 'release', version: '0.2.4', commit: null, pr: null, branch: 'release/0.2.4' });
+    expect(stdout).toContain(`release/0.2.4: ${cutSha} + ${pickSha} (append) (dry-run) · base ${mainSha}`);
+    expect(calls).toContain(`git rev-list --parents -n 1 ${cutSha}`);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+}, 60_000);
+
+test('RELEASE-APPEND-BASE-AUTO: cut-branch --append with a cut commit --base corrects to its first parent with a notice', () => {
+  const f = fixture('0.2.4');
+  writeFileSync(join(f.root, 'state.json'), JSON.stringify({ ...JSON.parse(readFileSync(join(f.root, 'state.json'), 'utf8')), ...cutBranchState({
+    ancestor: {
+      [`--is-ancestor ${mainSha} origin/main`]: true,
+      [`--is-ancestor ${pickSha} origin/main`]: true,
+      [`--is-ancestor ${pickSha} ${mainSha}`]: false,
+      [`--is-ancestor ${pickSha} ${cutSha}`]: false,
+      [`--is-ancestor ${cutSha} origin/main`]: false,
+    },
+  }) }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4' }, outputs: { 'version-release': { commit: cutSha, branch: 'release/0.2.4' } } });
+  try {
+    const { status, output, calls, stdout } = f.run('cut-branch', '--append', '--base', cutSha, '--pick', pickSha, '--dry-run', '--json');
+    expect(status).toBe(0);
+    expect(output).toMatchObject({ outcome: 'ok', kind: 'release', version: '0.2.4', branch: 'release/0.2.4' });
+    expect(stdout).toContain(`그 부모 ${mainSha} 를 쓰라`);
+    expect(stdout).toContain(`· base ${mainSha}`);
+    expect(calls).toContain(`git rev-list --parents -n 1 ${cutSha}`);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+}, 60_000);
+
+test('RELEASE-APPEND-BASE-AUTO: cut-branch --append with no ledger and no resolvable parent keeps the verbatim refusal', () => {
+  const f = fixture('0.2.4');
+  const orphan = '9'.repeat(40);
+  writeFileSync(join(f.root, 'state.json'), JSON.stringify({ ...JSON.parse(readFileSync(join(f.root, 'state.json'), 'utf8')), ...cutBranchState({
+    branchTip: 'f'.repeat(40),
+    revParse: { [`refs/remotes/origin/release/0.2.4^{commit}`]: 'f'.repeat(40) },
+    parents: { ['f'.repeat(40)]: [orphan] },
+    ancestor: { [`--is-ancestor ${orphan} origin/main`]: false },
+  }) }));
+  const { status, output } = f.run('cut-branch', '--append', '--version', '0.2.4', '--pick', pickSha, '--dry-run', '--json');
+  expect(status).toBe(1);
+  expect(output).toMatchObject({ outcome: 'error', kind: 'release', version: '0.2.4' });
+  expect(output.error).toContain(`base ${orphan} is not an ancestor of origin/main`);
+}, 60_000);
+
+test('RELEASE-APPEND-BASE-AUTO: cut-branch without --append still requires --base', () => {
+  const f = fixture('0.2.4');
+  const { status, output } = f.run('cut-branch', '--version', '0.2.4', '--pick', pickSha, '--dry-run', '--json');
+  expect(status).toBe(1);
+  expect(output.error).toContain('--base is required without --append');
+}, 60_000);

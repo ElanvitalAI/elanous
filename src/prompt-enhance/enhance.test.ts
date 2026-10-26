@@ -360,6 +360,20 @@ describe('enhance — SCQA 요약과 echo 가드', () => {
     } finally { spy.mockRestore(); }
   });
 
+  it('prior authoring lessons are prompt context, never part of the verbatim ask or returned scaffold', async () => {
+    const spy = replyWith({ goal: 'g', constraints: [], checklist: ['keep scope bounded'] });
+    const lesson = '- [AL-123] class=g-umbrella-scope · lesson=큰 골은 하나의 완료 가능한 조각으로 나눈다';
+    try {
+      const result = await enhancePrompt(ASK, { authoringLessons: lesson });
+      const messages = spy.mock.calls[0]?.[0] as { content: string }[];
+      expect(String(messages[1]!.content)).toContain('## 지난 실패에서 배운 것');
+      expect(String(messages[1]!.content)).toContain(lesson);
+      expect(String(messages[1]!.content)).toContain('맞지 않으면 무시하라');
+      expect(result.original).toBe(ASK);
+      expect(result.enhanced).not.toContain('AL-123');
+    } finally { spy.mockRestore(); }
+  });
+
   it('접지 사실을 글자 그대로 옮긴 요약은 «버린다»(양쪽)', async () => {
     const spy = replyWith({ situation: FACT_A, complication: `앞말 ${FACT_B} 뒷말` });
     try {

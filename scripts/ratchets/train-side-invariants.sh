@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Train-side sentinel for the eight real HARD 0.2.32 regressions. Run on the
+# Train-side sentinel for the HARD regressions and release-critical invariants. Run on the
 # merged side tree before the changed-file gate; never interpret a missing test
 # or an incomplete run as a pass.
 set -u
 
 files=(
   scripts/ratchets/test-interference-patterns.test.ts
+  scripts/ratchets/next-tui-entry-budget.test.ts
   src/domains/finance-cli.test.ts
   src/instance/state-dir-provenance-ratchet.test.ts
   src/self-implement/graph-yaml.test.ts
@@ -13,6 +14,11 @@ files=(
   test/identity-env.test.ts
   test/no-absolute-path-imports.test.ts
   test/scenarios/integration.test.ts
+  test/rules-contract.test.ts
+  test/hook-order-sweep.test.ts
+  src/cli/g6a-commands.test.ts
+  test/spawn-sync-max-buffer.test.ts
+  test/telegram-coding-model-terra.test.ts
 )
 
 if [[ ${1:-} == --list ]]; then

@@ -47,7 +47,6 @@ async function seedFailedReleaseRun(root: string, runId = 'recovery-fixture') {
     if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
     return result.stdout.trim();
   };
-  git(root, 'init', '--bare', '-q', bare);
   git(checkout, 'init', '-q');
   git(checkout, 'config', 'user.name', 'MK test');
   git(checkout, 'config', 'user.email', 'mk-test@example.invalid');
@@ -58,10 +57,9 @@ async function seedFailedReleaseRun(root: string, runId = 'recovery-fixture') {
   git(checkout, 'add', 'graphs/release/release-loop.yaml', 'graphs/release/recipes.yaml', 'release-fixture.txt');
   git(checkout, 'commit', '-q', '-m', 'seed local recovery fixture');
   git(checkout, 'branch', '-M', `release/${version}`);
-  git(checkout, 'remote', 'add', 'origin', bare);
-  // pod 전역 core.hooksPath pre-push guard(only this run's branches)는 시험 /tmp bare 저장소의 release/* push를 거부한다.
-  git(checkout, 'push', '--no-verify', '-q', '-u', 'origin', `release/${version}`);
   const sha = git(checkout, 'rev-parse', 'HEAD');
+  git(root, 'clone', '--bare', '-q', checkout, bare);
+  git(checkout, 'remote', 'add', 'origin', bare);
   const graphPath = join(checkout, 'graphs', 'release', 'release-loop.yaml');
   const state = await runGraph(graphPath, { runId, input: { version, branchCut: true }, deps: { root,
     runBash: async (command) => {
@@ -172,7 +170,8 @@ test('recovery apply executes the real release graph from gate through gate-tria
     root, repo: fixture.checkout,
     runBash: async (body) => {
       commands.push(body);
-      visits.push(body.includes('gate-node.ts') ? 'gate' : body.includes('gate-triage-node.ts') ? 'gate-triage' : 'unexpected');
+      visits.push(body.includes('gate-node.ts') ? 'gate' : body.includes('gate-triage-node.ts') ? 'gate-triage'
+        : body.includes('traffic-node.ts traffic-failed-restore') ? 'traffic-failed-restore' : 'unexpected');
       return { stdout: '{"outcome":"fail"}', stderr: '', exitCode: 1 };
     },
   };
@@ -184,10 +183,11 @@ test('recovery apply executes the real release graph from gate through gate-tria
     const result = JSON.parse(lines[0]!) as { ok: boolean; recovery: string; runId: string; status: string; state: { nodes: Array<{ nodeId: string }> } };
     expect(result).toMatchObject({ ok: false, recovery: 'resumed', runId: fixture.runId, status: 'failed' });
     expect(process.exitCode).toBe(1);
-    expect(visits).toEqual(['gate', 'gate-triage']);
-    expect(commands).toHaveLength(2);
+    expect(visits).toEqual(['gate', 'gate-triage', 'traffic-failed-restore']);
+    expect(commands).toHaveLength(3);
     expect(commands[0]).toContain('gate-node.ts');
     expect(commands[1]).toContain('gate-triage-node.ts');
+    expect(commands[2]).toContain('traffic-node.ts traffic-failed-restore');
     expect(result.state.nodes.filter((node) => node.nodeId === 'gate')).toHaveLength(1);
     expect(result.state.nodes.filter((node) => node.nodeId === 'gate-triage')).toHaveLength(1);
     expect(result.state.nodes.filter((node) => node.nodeId === 'mac-smoke')).toHaveLength(0);
@@ -330,15 +330,34 @@ function fixture() {
   return { out, dist, manifest, notes };
 }
 
+function checklistTargetGitFixture(root: string): string {
+  const repo = join(root, 'repo');
+  const path = join(repo, 'src', 'release-loop');
+  mkdirSync(path, { recursive: true });
+  writeFileSync(join(path, 'checklist.ts'), 'export const checklistFixture = true;\n');
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  git('init', '-q');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'add', '.');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'checklist target');
+  git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+  return repo;
+}
+
 describe('release checklist CLI', () => {
   test('strict add/retitle rejects malformed code cells before ledger writes; skip-note keeps evidence once', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-target-paths-cli-'));
+    const repo = checklistTargetGitFixture(dir);
+    const previousCwd = process.cwd();
     setElanousConfigDir(dir);
     const output = spyOn(console, 'log').mockImplementation(() => {});
     const error = spyOn(console, 'error').mockImplementation(() => {});
     const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' }); };
     const good = '대상 경로: src/release-loop/checklist.ts\n- 완료 경계 코드: 검사기 변경\n- 완료 경계 실물: CLI 저장\n- 완료 경계 증거 명령: bun test src/release-loop/checklist.test.ts';
     try {
+      process.chdir(repo);
       await expect(run('add', 'PATH', '설명만 있음', '--strict')).rejects.toThrow('첫 줄 대상 경로');
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       await run('add', 'PATH', good, '--strict');
@@ -358,7 +377,35 @@ describe('release checklist CLI', () => {
       await run('set', 'PATH', '--evidence', `사람의 이전 근거\n${marker}\n사람의 후속 근거`);
       await run('skip-note', 'PATH', 'src/b.ts (없음)', '--expected-title', good, '--by', 'OP');
       expect(listChecklist('9.9.9').items[0]?.evidence).toMatch(/^사람의 이전 근거\n디스패처 건너뜀 \[[a-f0-9]{16}\]: src\/b\.ts \(없음\)\n사람의 후속 근거$/);
-    } finally { output.mockRestore(); error.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { process.chdir(previousCwd); output.mockRestore(); error.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  }, 30_000);
+  test('checklist add and retitle store the same normalized evidence command as tasks hand', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-evidence-normalize-'));
+    const repo = checklistTargetGitFixture(dir);
+    const previousCwd = process.cwd();
+    setElanousConfigDir(dir);
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    const errors: string[] = [];
+    const error = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
+    const run = async (...args: string[]) => {
+      const cmd = new Command(); registerReleaseCommands(cmd);
+      await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' });
+    };
+    const prefix = '대상 경로: src/release-loop/checklist.ts\n- 완료 경계 코드: 검사기 변경\n- 완료 경계 실물: CLI 저장\n- 완료 경계 증거 명령: ';
+    try {
+      process.chdir(repo);
+      await run('add', 'EVIDENCE', `${prefix}\`bun test src/release-loop/checklist.test.ts\` → 0 fail · typecheck PASS`, '--strict');
+      expect(listChecklist('9.9.9').items[0]?.title).toBe(`${prefix}bun test src/release-loop/checklist.test.ts`);
+      await run('retitle', 'EVIDENCE', `${prefix}bun test src/release-loop/checklist.test.ts · typecheck PASS`, '--strict');
+      expect(listChecklist('9.9.9').items[0]?.title).toBe(`${prefix}bun test src/release-loop/checklist.test.ts`);
+      expect(errors.filter((line) => line.includes('증거 명령 정규화'))).toHaveLength(2);
+      await run('add', 'UNKNOWN', `${prefix}bun test src/release-loop/checklist.test.ts → arbitrary`, '--kind', 'ops');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'UNKNOWN')?.title).toContain('→ arbitrary');
+      expect(errors.some((line) => line.includes('증거 명령 정규화 불가'))).toBe(true);
+      await expect(run('retitle', 'EVIDENCE', `${prefix}bun test src/release-loop/checklist.test.ts · typecheck FAIL`, '--strict'))
+        .rejects.toThrow('증거 명령 정규화 불가');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'EVIDENCE')?.title).toBe(`${prefix}bun test src/release-loop/checklist.test.ts`);
+    } finally { process.chdir(previousCwd); output.mockRestore(); error.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   });
   test('strict retitle validates every affected version before changing any title', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-retitle-all-versions-'));
@@ -591,7 +638,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'gate-history', 'rehearsal', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'recover', 'gate-history', 'rehearsal', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');

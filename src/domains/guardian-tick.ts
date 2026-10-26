@@ -19,6 +19,8 @@ export interface GuardianDeps {
   execute?: (command: string) => Promise<SpawnOutcome>;
   /** Injected only for deterministic expiry-alert tests. Production reads the local Grok auth file. */
   grokExpiry?: () => string | null;
+  /** Injected in tests; production reevaluates recorded doctor visits without dispatching a prescription. */
+  doctorShadow?: () => void | Promise<void>;
   hostName?: string;
 }
 
@@ -97,6 +99,13 @@ export async function guardianTick(now: Date, plan: GuardianPlan, deps: Guardian
     if (expiryLine) debug.log('guardian.credential-expiry', 'warning', { line: expiryLine });
   } catch (error) {
     debug.log('guardian.credential-expiry', 'read-failed', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+    });
+  }
+  try {
+    await deps.doctorShadow?.();
+  } catch (error) {
+    debug.log('guardian.doctor-shadow', 'reevaluation-failed', {
       errorName: error instanceof Error ? error.name : 'unknown',
     });
   }

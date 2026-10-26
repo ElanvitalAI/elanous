@@ -209,7 +209,7 @@ export function resolveProviderCredential(input: ResolveCredentialInput): Resolv
   // 목표 provider 의 엔드포인트 — 키와 **같은 규율**로 rotation 에서만 가져온다(10R).
   //   전환이면 옛 baseUrl 은 틀린 주소이므로, rotation 에 명시가 없으면 undefined(provider 기본).
   // ⛔⭐ local 은 «런 단위 env»(`LOCAL_LLM_URL`)가 config rotation 을 이긴다 — `ELANOUS_LLM_PROVIDER` 가 config 를 이기는 것과 같은 규칙(BACKLOG B13).
-  //   🩸 2026-09-25: 부모에 `LOCAL_LLM_URL=<node-b 경유>` 를 줬는데 rotation 의 `local → localhost:1234` 가 이겨 자식이 «호스트»
+  //   🩸 2026-09-25: 부모에 `LOCAL_LLM_URL=<원격 프록시>` 를 줬는데 rotation 의 `local → localhost:1234` 가 이겨 자식이 «호스트»
   //     LM Studio 로 갔다. Pod(config 없음)에선 안 드러났다.
   const envEndpoint = provider === 'local' ? env.LOCAL_LLM_URL?.trim() : undefined;
   const endpoint = envEndpoint || rotation?.find((r) => r.provider === provider && typeof r.baseUrl === 'string' && r.baseUrl.trim().length > 0)?.baseUrl?.trim();

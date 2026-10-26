@@ -39,7 +39,7 @@ import { createTuiScreenMirror } from './tui-screen-mirror.js';
 import { getChannelBus } from '../terminal-matrix/index.js';
 import { publishSelfReportFrame } from './self-report-frame.js';
 import {
-  upsertPtyManifest, updatePtyManifestFrame, touchLivePtyManifest, markPtyManifestClosed, removePtyManifest, getPtyManifest,
+  upsertPtyManifest, updatePtyManifestFrame, updatePtyManifestSession, touchLivePtyManifest, markPtyManifestClosed, removePtyManifest, getPtyManifest,
   updatePtyManifestBuild,
 } from '../pty-shell/pty-manifest.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';
@@ -468,7 +468,15 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
     lastEmittedText = text;
     // TUI-H9 — 이 프레임이 «지금 이 TUI 가 보여 주는 대화» 의 소유 기록이다. 재기동은 이 id 로만 잇는다
     // (읽기 실패 → 소유 없음 → 재기동 막힘 · 다른 세션으로 대체하지 않는다).
-    try { claimTuiOwnedSession(readActiveSessionId(), at); } catch { claimTuiOwnedSession(null, at); }
+    let sessionId: string | null = null;
+    try {
+      sessionId = readActiveSessionId();
+      claimTuiOwnedSession(sessionId, at);
+    } catch {
+      sessionId = null;
+      claimTuiOwnedSession(null, at);
+    }
+    try { updatePtyManifestSession(surfaceId, sessionId ?? '', at); } catch { /* fail-soft */ }
     const frame: SelfReportFrame = { surfaceId, instance, kind: 'tui', mode: 'self-report', text, cols, rows, at, ...(runId ? { runId } : {}) };
     try { publishFrame(frame); } catch { /* fail-soft */ }
     // `at` is shared with the manifest write → its internal throttle keys

@@ -151,13 +151,30 @@ test('GOAL-SLOT-UNVERIFIABLE-2 · authored signal remains intact', async () => {
   const gateLog = '[test] PASS bun test src/task-agent/judge.test.ts —  0 fail | 10 expect() calls';
   try {
     writeFileSync(path, original);
+    const command = 'bun test src/task-agent/judge.test.ts';
     expect(await fillUnverifiableGoalSlots({ path, round: 1, gate: { passed: true, log: gateLog },
+      authoredSignal: { command, exitCode: 0, stdout: '10 pass | 0 fail', stderr: '' },
       review: { verdict: 'pass' }, independentlyCheck: defaultSeams().independentlyCheckGoalSlots! })).toBe('filled');
     const filled = readFileSync(path, 'utf8');
     expect(filled).toContain('Candidate decision signal:');
     expect(filled).toContain('숫자 출처: UNVERIFIABLE: no numeric source evidence');
     expect(filled).toContain('filled-by: supervisor@round-1');
     expect(filled).toContain('관측 — `bun test src/task-agent/judge.test.ts`');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('GOAL-SLOT-UNVERIFIABLE-2 · independently executed authored test may differ from gate tests', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'goal-fill-independent-signal-'));
+  const path = join(directory, 'goal.txt');
+  const command = 'bun test src/a.test.ts';
+  const original = `## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- Candidate decision signal:\n  - Condition: ${command}\n`;
+  try {
+    writeFileSync(path, original);
+    expect(await fillUnverifiableGoalSlots({ path, round: 1,
+      gate: { passed: true, log: '[test] PASS bun test src/b.test.ts — 0 fail' },
+      authoredSignal: { command, exitCode: 0, stdout: '1 pass | 0 fail', stderr: '' },
+      review: { verdict: 'pass' }, independentlyCheck: defaultSeams().independentlyCheckGoalSlots! })).toBe('filled');
+    expect(readFileSync(path, 'utf8')).toContain('관측 — `bun test src/a.test.ts`');
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
@@ -176,11 +193,13 @@ test('GOAL-SLOT-UNVERIFIABLE-2 · authored numeric source remains unmeasured', a
       writeFileSync(path, original);
       expect(await fillUnverifiableGoalSlots({ path, round: 0,
         gate: { passed: true, log: `[test] PASS ${command} —  0 fail | 12 expect() calls` },
+        authoredSignal: { command, exitCode: 0, stdout: '12 pass | 0 fail', stderr: '' },
         review: { verdict: 'pass' }, independentlyCheck: check })).toBe('filled');
       const filled = readFileSync(path, 'utf8');
       expect(filled).toContain(authored);
       expect(filled).toContain(`- Condition: ${command}`);
-      expect(filled).toContain('이번 라운드 관측값 — fail 0');
+      expect(filled).toContain('gate 검증 — ');
+      expect(filled).toContain('이번 라운드 관측값 — exit 0');
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
@@ -222,5 +241,135 @@ test('GOAL-SLOT-UNVERIFIABLE-2 · unrelated PASS cannot certify authored conditi
       independentlyCheck: async () => true, observeDeficit: (d) => deficits.push(d) })).toBe('unverifiable');
     expect(readFileSync(path, 'utf8')).toBe(original);
     expect(deficits[0]?.reason).toBe('authored-signal-command-mismatch');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('GOAL-SLOT-UNVERIFIABLE-2 · non-test authored condition requires matching successful execution evidence', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'goal-fill-non-test-condition-'));
+  const path = join(directory, 'goal.txt');
+  const original = `## 불변식
+- UNVERIFIABLE
+
+## 판정 신호
+- Candidate decision signal:
+  - Condition: eslint 통과
+`;
+  const deficits: SupervisorGoalDeficit[] = [];
+  try {
+    writeFileSync(path, original);
+    expect(await fillUnverifiableGoalSlots({ path, round: 2,
+      gate: { passed: true, log: '[test] PASS bun test src/dashboard/index.test.ts — 0 fail' },
+      review: { verdict: 'pass' }, independentlyCheck: async () => true,
+      observeDeficit: (deficit) => deficits.push(deficit),
+    })).toBe('unverifiable');
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    expect(deficits[0]).toMatchObject({
+      reason: 'authored-signal-command-mismatch',
+      reasonDetail: 'authored command has no matching successful execution evidence',
+    });
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('GOAL-SLOT-UNVERIFIABLE-2 · executed authored rg signal is independently verified and recorded', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'goal-fill-authored-rg-'));
+  const path = join(directory, 'goal.txt');
+  const check = defaultSeams().independentlyCheckGoalSlots!;
+  const command = 'rg -n 미측정 src/example.md';
+  const original = `## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- Candidate decision signal:\n  - Condition: ${command}\n  - Observation: matching line\n`;
+  try {
+    writeFileSync(path, original);
+    const result = await fillUnverifiableGoalSlots({ path, round: 5,
+      gate: { passed: true, log: '[test] PASS bun test src/tg.test.ts — 0 fail' },
+      authoredSignal: { command, exitCode: 0, stdout: '12:미측정', stderr: '' },
+      review: { verdict: 'warn' }, independentlyCheck: check });
+    expect(result).toBe('filled');
+    expect(readFileSync(path, 'utf8')).toContain('이번 라운드 관측값 — exit 0');
+    expect(readFileSync(path, 'utf8')).toContain('12:미측정');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('GOAL-SLOT-UNVERIFIABLE-2 · authored signal with absent or failing execution remains byte-identical', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'goal-fill-authored-rg-unmeasured-'));
+  const path = join(directory, 'goal.txt');
+  const command = 'rg -n 미측정 docs/plans/plan.md';
+  const original = `## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- Candidate decision signal:\n  - Condition: ${command}\n`;
+  const deficits: SupervisorGoalDeficit[] = [];
+  try {
+    writeFileSync(path, original);
+    for (const authoredSignal of [undefined, { command, exitCode: 1, stdout: '', stderr: 'not found' }]) {
+      expect(await fillUnverifiableGoalSlots({ path, round: 6,
+        gate: { passed: true, log: '[test] PASS bun test src/tg.test.ts — 0 fail' },
+        ...(authoredSignal ? { authoredSignal } : {}), review: { verdict: 'pass' },
+        independentlyCheck: defaultSeams().independentlyCheckGoalSlots!, observeDeficit: (d) => deficits.push(d),
+      })).toBe('unverifiable');
+      expect(readFileSync(path, 'utf8')).toBe(original);
+    }
+    expect(deficits.every((d) => d.reason === 'authored-signal-command-mismatch')).toBe(true);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('GOAL-SLOT-UNVERIFIABLE-2 · measured gate command may include the authored test among additional files', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'goal-fill-covered-signal-'));
+  const path = join(directory, 'goal.txt');
+  const check = defaultSeams().independentlyCheckGoalSlots!;
+  const samples = [
+    {
+      authored: 'bun test src/dashboard/index.test.ts를 실행한다.',
+      measured: 'bun test src/dashboard/index.test.ts',
+      runId: 'run-0500d2c5',
+    },
+    {
+      authored: '`bun test src/dashboard/index.test.ts`를 실행한다.',
+      measured: 'bun test src/dashboard/index.test.ts',
+      runId: 'quoted-condition',
+    },
+    {
+      authored: 'bun test src/self-dev/draft-sweep.test.ts를 실행한다',
+      measured: 'bun test src/seat-loop/seat-report.test.ts src/self-dev/draft-sweep.test.ts',
+      runId: 'run-8171898a',
+    },
+    {
+      authored: 'bun test src/cli/msg-cli.test.ts',
+      measured: 'bun test src/cli/msg-cli.test.ts src/cli/release-cli.test.ts',
+      runId: 'run-6e20f879',
+    },
+  ];
+  try {
+    for (const sample of samples) {
+      const original = `## 불변식\n- UNVERIFIABLE: no measured invariant\n\n## 판정 신호\n- Candidate decision signal:\n  - Condition: ${sample.authored}\n  - Observation: gate summary\n  - Expected result: 0 fail\n`;
+      writeFileSync(path, original);
+      const signalCommand = sample.authored.replace(/^`([^`]+)`(?=\s|를|$)/, '$1').replace(/\s*를\s*실행한다[.。]?$/, '').replace(/[.。]$/, '').trim();
+      const deficits: SupervisorGoalDeficit[] = [];
+      const result = await fillUnverifiableGoalSlots({ path, round: 3,
+        gate: { passed: true, log: `[test] PASS ${sample.measured} — 0 fail | 19 expect() calls` },
+        authoredSignal: { command: signalCommand, exitCode: 0, stdout: 'signal observed', stderr: '' },
+        review: { verdict: 'pass' }, independentlyCheck: check, observeDeficit: (d) => deficits.push(d) });
+      expect(result, sample.runId).toBe('filled');
+      const filled = readFileSync(path, 'utf8');
+      expect(filled).toContain(`- Condition: ${sample.authored}`);
+      expect(filled).toContain(`조건 — ${sample.measured} 가 실패 없이 끝난다`);
+      expect(filled).toContain('이번 라운드 관측값 — exit 0');
+      expect(filled).toContain('gate 검증 — ');
+      expect(filled).not.toContain('UNVERIFIABLE');
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('GOAL-SLOT-UNVERIFIABLE-2 · mismatch names each authored test file missing from the measured command', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'goal-fill-missing-signal-file-'));
+  const path = join(directory, 'goal.txt');
+  const original = `## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- Candidate decision signal:\n  - Condition: bun test src/a.test.ts src/b.test.ts\n`;
+  const deficits: SupervisorGoalDeficit[] = [];
+  try {
+    writeFileSync(path, original);
+    expect(await fillUnverifiableGoalSlots({ path, round: 4,
+      gate: { passed: true, log: '[test] PASS bun test src/a.test.ts src/c.test.ts — 0 fail' },
+      review: { verdict: 'pass' }, independentlyCheck: defaultSeams().independentlyCheckGoalSlots!,
+      observeDeficit: (deficit) => deficits.push(deficit) })).toBe('unverifiable');
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    expect(deficits[0]).toMatchObject({
+      reason: 'authored-signal-command-mismatch',
+      reasonDetail: 'authored test file(s) absent from passing gate command: src/b.test.ts',
+    });
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

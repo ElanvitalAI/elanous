@@ -46,12 +46,12 @@ function text(): string {
 test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
 
 test('meta block renders an updating card and polls at five seconds; settled status stops', async () => {
-  const timers = new Map<number, () => void>();
+  const timers = new Map<number, { callback: () => void; delay: number }>();
   const delays: number[] = [];
   let nextTimer = 0;
   globalThis.setTimeout = ((callback: () => void, delay: number) => {
     delays.push(delay);
-    timers.set(++nextTimer, callback);
+    timers.set(++nextTimer, { callback, delay });
     return nextTimer;
   }) as typeof setTimeout;
   globalThis.clearTimeout = ((id: number) => { timers.delete(id); }) as typeof clearTimeout;
@@ -73,12 +73,14 @@ test('meta block renders an updating card and polls at five seconds; settled sta
   expect(text()).toContain('fix-button.md');
   expect(text()).not.toContain('/private/');
   expect(text()).toContain('경과 32초');
-  expect(delays).toEqual([5000]);
-  await act(async () => { const tick = timers.get(1)!; timers.delete(1); tick(); });
+  expect(delays.filter((delay) => delay === 5000)).toEqual([5000]);
+  const pollTimer = [...timers.entries()].find(([, timer]) => timer.delay === 5000)!;
+  timers.delete(pollTimer[0]);
+  await act(async () => { pollTimer[1].callback(); });
   expect(paths).toHaveLength(2);
   expect(text()).toContain('런 끝');
   expect(text()).toContain('경과 1분');
-  expect(timers.size).toBe(0);
+  expect([...timers.values()].filter((timer) => timer.delay === 5000)).toHaveLength(0);
 });
 
 test('404 stops with restart explanation; unmount cancels a scheduled poll', async () => {
@@ -156,9 +158,9 @@ test('mounted chat attaches the progress block to the acceptance message without
 });
 
 test('polling stops at 60 minutes without scheduling another request', async () => {
-  const timers = new Map<number, () => void>();
+  const timers = new Map<number, { callback: () => void; delay: number }>();
   let nextTimer = 0;
-  globalThis.setTimeout = ((callback: () => void) => { timers.set(++nextTimer, callback); return nextTimer; }) as typeof setTimeout;
+  globalThis.setTimeout = ((callback: () => void, delay: number) => { timers.set(++nextTimer, { callback, delay }); return nextTimer; }) as typeof setTimeout;
   globalThis.clearTimeout = ((id: number) => { timers.delete(id); }) as typeof clearTimeout;
   const realNow = Date.now;
   let now = 1000;
@@ -170,11 +172,14 @@ test('polling stops at 60 minutes without scheduling another request', async () 
       return { phase: 'launch-started', elapsedSeconds: calls * 5 };
     });
     await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><HarnessAskCard acceptanceId="a" /></DaemonContext.Provider>); });
-    expect(timers.size).toBe(1);
+    const pollTimers = () => [...timers.entries()].filter(([, timer]) => timer.delay === 5000);
+    expect(pollTimers()).toHaveLength(1);
     now += 60 * 60 * 1000;
-    await act(async () => { const tick = timers.get(1)!; timers.delete(1); tick(); });
+    const [pollTimerId, pollTimer] = pollTimers()[0]!;
+    timers.delete(pollTimerId);
+    await act(async () => { pollTimer.callback(); });
     expect(calls).toBe(1);
-    expect(timers.size).toBe(0);
+    expect(pollTimers()).toHaveLength(0);
   } finally { Date.now = realNow; }
 });
 

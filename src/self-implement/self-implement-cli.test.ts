@@ -1,4 +1,7 @@
 import { afterEach, describe, it, expect } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runSelfImplementCliCommand, singleRunAsJobResult, type SelfImplementCliOpts, type SelfImplementCliDeps } from './self-implement-cli.js';
 import { classifyFailure } from '../self-dev/orchestrate.js';
 import { _setObserveOnlyConfigReaderForTesting } from './observe-only.js';
@@ -23,6 +26,84 @@ const opts = (over: Partial<SelfImplementCliOpts> = {}): SelfImplementCliOpts =>
 afterEach(() => _setObserveOnlyConfigReaderForTesting());
 
 describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등가)', () => {
+  it('child terminal result carries parent-read revision evidence into the JSON result', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'self-implement-revision-ledger-'));
+    const ledgerDir = join(root, 'run-ledger');
+    mkdirSync(ledgerDir);
+    writeFileSync(join(ledgerDir, 'run-observed.jsonl'), `${JSON.stringify({
+      runId: 'run-observed',
+      event: 'rework-budget',
+      data: { verdict: 'CONTRACT-CONFLICT', contractConflictRelaxation: { application: { status: 'failed', detail: 'expected-text-not-found' } } },
+    })}\n`);
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    try {
+      const cap = capture(1, RESULT({ runId: 'run-observed' }));
+      const out = await runSelfImplementCliCommand('F', opts(), { executeReroute: cap.executeReroute });
+      const observation = { status: 'read' as const, attempted: 1, applied: 0, failureReasons: ['expected-text-not-found'] };
+      expect(out).toMatchObject({ ok: true, result: { runId: 'run-observed', goalPlanRevision: observation } });
+      expect(JSON.parse(JSON.stringify((out as Extract<typeof out, { kind: 'self' }>).result))).toMatchObject({
+        goalPlanRevision: observation,
+      });
+    } finally {
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not synthesize an empty revision observation when the ledger has no run evidence', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'self-implement-empty-revision-ledger-'));
+    mkdirSync(join(root, 'run-ledger'));
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    try {
+      const cap = capture(1, RESULT({ runId: 'run-without-revision' }));
+      const out = await runSelfImplementCliCommand('F', opts(), { executeReroute: cap.executeReroute });
+      expect(out.ok && out.kind === 'self' ? out.result : undefined).not.toHaveProperty('goalPlanRevision');
+    } finally {
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes a real ledger read failure instead of treating it as zero revisions', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'self-implement-missing-revision-ledger-'));
+    const missingLedgerDir = join(root, 'run-ledger');
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    try {
+      const cap = capture(1, RESULT({ runId: 'run-ledger-failed' }));
+      const out = await runSelfImplementCliCommand('F', opts(), { executeReroute: cap.executeReroute });
+      const observation = { status: 'read-failed', reason: 'directory-missing', scannedFiles: 0,
+        unreadableFiles: 0, ledgerDirectory: missingLedgerDir };
+      expect(out).toMatchObject({ ok: true, result: { goalPlanRevision: observation } });
+      expect(JSON.parse(JSON.stringify((out as Extract<typeof out, { kind: 'self' }>).result))).toMatchObject({
+        goalPlanRevision: observation,
+      });
+    } finally {
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the CLI result intact when an injected child omits its runId', async () => {
+    const cap = capture(1, RESULT());
+    let reads = 0;
+    const out = await runSelfImplementCliCommand('F', opts(), {
+      executeReroute: cap.executeReroute,
+      readGoalPlanRevision: () => {
+        reads += 1;
+        return { proposals: new Map(), goalPlanRevisions: new Map(), scannedFiles: 0,
+          unreadableFiles: 0, directoryMissing: false, ledgerDirectory: '/ledger' };
+      },
+    });
+    expect(out).toMatchObject({ ok: true, kind: 'self', exitCode: 1 });
+    expect(reads).toBe(0);
+  });
+
   it('single-run supervisor receives the harvestable branch without relaunching the completed implementation', async () => {
     const result = RESULT({ ok: false, stage: 'timed-out', outcome: 'abandoned', branch: 'self-impl/finished', harvestable: true });
     const decisions: string[] = [];

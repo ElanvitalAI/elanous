@@ -55,6 +55,8 @@ describe('dispatch decision', () => {
     expect(remoteSelfGateArgv({ changed: true, base: 'feature', shards: 16, includeImporters: true, artifactDir: '/tmp/gate-artifacts' }, () => HEAD))
       .toEqual(['bun', 'bin/elanous.mjs', 'self', 'gate', '--local', '--changed', '--base', HEAD, '--shards', '16', '--include-importers', '--artifact-dir', '/tmp/gate-artifacts']);
     expect(remoteSelfGateArgv({ changed: true, base: 'origin/main' }, () => MAIN)).not.toContain('--shards');
+    expect(remoteSelfGateArgv({ changed: true, base: 'origin/main', shards: 3, shardConcurrency: 4 }, () => MAIN))
+      .toContain('--shard-concurrency');
   });
   test('load above the threshold goes remote; at or below stays local', () => {
     expect(decideGateDispatch({ flags: { local: false }, settings, load1: 25, env: {} })).toMatchObject({ mode: 'remote', host: 'node-b' });
@@ -80,12 +82,12 @@ describe('dispatch decision', () => {
     expect(parseGateRemoteConfig('x')).toBeUndefined();
     expect(parseGateRemoteConfig({ hostCap: 0 })).toBeUndefined();
     expect(parseGateRemoteConfig({ hostCap: 1.5 })).toBeUndefined();
-    expect(parseGateRemoteConfig({ hostCap: 3, hostCaps: { node-b: 4, node-c: 1, 'bad host': 5, wsl: 9, zero: 0 } }))
-      .toEqual({ hostCaps: { node-b: 4, node-c: 1 } });
-    expect(parseGateRemoteConfig({ hostCaps: { node-b: 8 } })).toEqual({ hostCaps: { node-b: 8 } });
-    expect(parseGateRemoteConfig({ hostCaps: { node-b: 1.5 } })).toBeUndefined();
+    expect(parseGateRemoteConfig({ hostCap: 3, hostCaps: { 'node-b': 4, 'node-c': 1, 'bad host': 5, wsl: 9, zero: 0 } }))
+      .toEqual({ hostCaps: { 'node-b': 4, 'node-c': 1 } });
+    expect(parseGateRemoteConfig({ hostCaps: { 'node-b': 8 } })).toEqual({ hostCaps: { 'node-b': 8 } });
+    expect(parseGateRemoteConfig({ hostCaps: { 'node-b': 1.5 } })).toBeUndefined();
     expect(resolveGateRemoteSettings({ hostCap: 9 }, {}).hostCap).toBe(2);
-    const perHost = resolveGateRemoteSettings({ hostCaps: { node-b: 6, node-c: 3, bad: 9 } }, {});
+    const perHost = resolveGateRemoteSettings({ hostCaps: { 'node-b': 6, 'node-c': 3, bad: 9 } }, {});
     expect(gateRemoteHostCap(perHost, 'node-b')).toBe(6);
     expect(gateRemoteHostCap(perHost, 'ubuntu@node-b')).toBe(6);
     expect(gateRemoteHostCap(perHost, 'node-c')).toBe(3);
@@ -256,7 +258,7 @@ describe('host lock wiring', () => {
       now: () => clock, sleep: async (ms) => { clock += ms; }, log: (event, data) => events.push({ event, data }) });
     expect(rc).toBe(0);
     expect(io.err.slice(0, 2)).toEqual([
-      `[gate.remote] waiting on node-b — reason=host-busy load=${load1}/${threshold} slots=2/2 elapsed=0s\n`,
+      '[gate.remote] waiting on node-b — reason=host-busy load=' + load1 + '/' + threshold + ' slots=2/2 elapsed=0s\n',
       '[gate.remote] wait ended on node-b — reason=slot-open elapsed=15s\n',
     ]);
     expect(io.err.slice(2)).toEqual(['']);
@@ -269,7 +271,7 @@ describe('host lock wiring', () => {
   test('an explicit host uses its own configured cap and reports observed occupancy on busy', async () => {
     const runner = fakeRunner({ ssh: { rc: 98, stdout: '', stderr: '__GATE_REMOTE_BUSY=3\n' } });
     const io = sink();
-    const configured = resolveGateRemoteSettings({ hostCaps: { node-b: 6, node-c: 3 }, slotWaitSeconds: 0 }, {});
+    const configured = resolveGateRemoteSettings({ hostCaps: { 'node-b': 6, 'node-c': 3 }, slotWaitSeconds: 0 }, {});
     const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-c' }, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('local gate must not run'); } },
       { runner, settings: configured, env: {}, load1: 1, write: io.write });
     expect(rc).toBe(1);

@@ -700,6 +700,9 @@ export interface ExecuteSkillOpts {
 export interface ExecuteSkillResult {
   provider: string;
   model: string;
+  /** Final assistant answer, without the rendered tool-call transcript. */
+  finalResponse: string;
+  /** Rendered skill transcript used by interactive surfaces. */
   fullResponse: string;
 }
 
@@ -1199,6 +1202,7 @@ async function executeSkillUnrecorded(
         return {
           provider: provider.name,
           model: modelHint || provider.defaultModel,
+          finalResponse: '',
           fullResponse: display,
         };
       }
@@ -2036,9 +2040,9 @@ async function executeSkillUnrecorded(
   return {
     provider: provider.name,
     model: modelHint || provider.defaultModel,
-    // streamLLMWithTools returns LLM text only; dashboard echo uses
-    // `display` (text + bash IO) — but callers of executeSkill rarely
-    // need the raw text so we keep the public contract stable.
+    // Keep both products: interactive surfaces need the rendered transcript,
+    // while programmatic callers (e.g. skill_exec) need only the final answer.
+    finalResponse: typeof fullResponse === 'string' ? fullResponse : '',
     fullResponse: display || fullResponse,
   };
 }

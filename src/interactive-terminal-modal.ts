@@ -55,6 +55,8 @@ export interface InteractiveTerminalModalSpec {
    *  of a plain local shell. Empty default keeps the legacy behaviour. */
   shellArgs?: readonly string[];
   env?: Record<string, string>;
+  /** Remove captured login-shell environment keys after composition. */
+  unsetEnv?: readonly string[];
   /** Ghostty-compatible terminfo name. Defaults via PreviewTerminal
    *  to xterm-256color. */
   termName?: string;
@@ -212,6 +214,7 @@ export function createInteractiveTerminalModal(
     shell: spec.shell,
     shellArgs: spec.shellArgs,
     env: spec.env,
+    unsetEnv: spec.unsetEnv,
     termName: spec.termName,
     useRegistry: spec.useRegistry,
     registryKind: spec.registryKind,

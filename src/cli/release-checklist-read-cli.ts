@@ -56,7 +56,10 @@ export async function checklistOutput(v: string, codenames: Record<string, strin
   }
 }
 
+/** `version` scopes the item lookup; the default collector only needs that resolved item. */
 export type ChecklistEvidenceReader = (item: ReturnType<typeof listChecklist>['items'][number], version: string) => readonly ChecklistEvidenceStage[];
+
+const defaultChecklistEvidenceReader: ChecklistEvidenceReader = (item) => collectChecklistEvidenceStages(item);
 
 export type ChecklistEvidenceCommandRunner = (command: string, args: string[], timeout?: number) => { status: number | null; stdout: string; stderr: string; error?: string };
 const evidenceCommand: ChecklistEvidenceCommandRunner = (command, args, timeout = 20_000) => {
@@ -151,7 +154,7 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
 }
 
 /** Register the same read commands on the full and lightweight release roots. */
-export function registerChecklistReadCommands(checklist: Command, evidenceReader: ChecklistEvidenceReader = collectChecklistEvidenceStages): void {
+export function registerChecklistReadCommands(checklist: Command, evidenceReader: ChecklistEvidenceReader = defaultChecklistEvidenceReader): void {
   const withContext = (cmd: Command) => cmd.option('--version <v>', '판 또는 별칭').option('--json', '결과 JSON').option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
   withContext(checklist.command('list').description('모든 칸')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
     const { version, codenames, json } = readChecklistContext(cmd);
@@ -174,7 +177,7 @@ export function registerChecklistReadCommands(checklist: Command, evidenceReader
 }
 
 /** The light router enters only list/status, so no publishing modules are loaded. */
-export function registerReleaseChecklistReadCommands(program: Command, evidenceReader: ChecklistEvidenceReader = collectChecklistEvidenceStages): void {
+export function registerReleaseChecklistReadCommands(program: Command, evidenceReader: ChecklistEvidenceReader = defaultChecklistEvidenceReader): void {
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const checklist = release.command('checklist').description('판별 확인표 조회·갱신')
     .option('--version <v>', '판 또는 별칭(기본: package.json 의 개발판에서 -dev.N 제거)')

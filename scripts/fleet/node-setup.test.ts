@@ -14,7 +14,7 @@ test('node setup check requires both coredns Ready and one successful Pod DNS an
     ['0/1', 'Name: kubernetes.default.svc.cluster.local\nAddress: 10.43.0.1', false],
     ['1/1', 'Name: another.service\nAddress: 10.43.0.1', false],
   ] as const) {
-    const wrapper = `CTX=pool-node-c; FAIL=0
+    const wrapper = `CTX=pool-fixture-node; FAIL=0
 ok() { printf 'ok %s\n' "$1"; }
 bad() { printf 'bad %s\n' "$1"; FAIL=1; }
 kubectl() {
@@ -38,7 +38,7 @@ printf 'dns-check-rc=%s\n' "$FAIL"`;
 });
 
 test('node setup distinguishes image pull failure from DNS lookup failure', () => {
-  const wrapper = `CTX=pool-node-c; FAIL=0
+  const wrapper = `CTX=pool-fixture-node; FAIL=0
 ok() { printf 'ok %s\n' "$1"; }
 bad() { printf 'bad %s\n' "$1"; FAIL=1; }
 kubectl() {

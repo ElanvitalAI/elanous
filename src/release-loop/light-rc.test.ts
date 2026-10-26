@@ -167,6 +167,17 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     expect(fixedArgv.slice(fixedArgv.indexOf('--shards'), fixedArgv.indexOf('--shards') + 3)).toEqual(['--shards', '16', '--fixed-shard-distribution']);
   });
 
+  test('shard concurrency is bounded and forwarded to local and remote gate', async () => {
+    const setup = localDeps();
+    await runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, shards: 4, shardConcurrency: 2, log: () => {} }, setup.deps);
+    expect(setup.calls[0]).toMatchObject({ shards: 4, shardConcurrency: 2 });
+    const argv = (setup.dispatched[0]!.remoteArgv as (sha: (ref: string) => string) => string[])((sha) => sha);
+    expect(argv.slice(argv.indexOf('--shard-concurrency'), argv.indexOf('--shard-concurrency') + 2))
+      .toEqual(['--shard-concurrency', '2']);
+    await expect(runLightRc('0.2.19', { base: 'abc123', head: MAIN_SHA, shardConcurrency: 5, log: () => {} }, setup.deps))
+      .rejects.toThrow('invalid --shard-concurrency');
+  });
+
   test('remote rehearsal carries opt-in to child and refuses a missing screen result', async () => {
     let remoteArgv: string[] = [];
     const { deps } = localDeps({ dispatch: async (opts, channels) => {

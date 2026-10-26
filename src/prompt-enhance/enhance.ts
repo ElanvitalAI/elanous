@@ -118,6 +118,8 @@ export interface EnhanceOpts {
    * ⭐ 새 LLM 경로를 만들지 않는다 — 이 모듈이 이미 그 자리의 유일한 LLM 단계다.
    */
   groundedFacts?: readonly string[];
+  /** Relevant prior-failure lessons for goal-authoring prompts only; never part of the original ask. */
+  authoringLessons?: string;
   /** Clock seam for the first-token observation (ms epoch); defaults to `Date.now`. */
   now?: () => number;
 }
@@ -433,6 +435,9 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
               '--- 여기까지 ---',
               '위 사실을 «옮겨 적지 말고», 그것이 보여 주는 상태(situation)와 문제(complication)를 써라.',
             ]
+            : []),
+          ...(opts.authoringLessons?.trim()
+            ? ['', '## 지난 실패에서 배운 것', opts.authoringLessons.trim(), '위 교훈은 현재 ask의 대상 경로와 범위에 맞을 때만 적용하고, 맞지 않으면 무시하라.']
             : []),
         ].join('\n'),
       },

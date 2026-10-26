@@ -119,12 +119,119 @@ test('exact review must-fix launches one graph-routed commit-only worker, record
   const first = await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
   expect(first.decision).toBe('repair-requested');
   expect(launches).toHaveLength(1);
-  expect(launches[0]).toMatchObject({ pr: 30, head: A, model: { provider: 'glm', model: 'glm-5.3' } });
+  expect(launches[0]).toMatchObject({ pr: 30, head: A, model: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' } });
   expect(readFileSync(launches[0]!.goalFile, 'utf8')).toContain('fix the broken assertion');
   expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]).toMatchObject({ status: 'requested', fromModel: 'openai-codex/gpt-6-sol' });
   const second = await runRepairCycle(f.input({ request: async (request: RepairLaunchRequest) => { launches.push(request); } }));
   expect(second.decision).toBe('repair-pending');
   expect(launches).toHaveLength(1);
+});
+
+test('same head and review stop a repeated signed gate failure before a second worker', async () => {
+  const f = fixture();
+  const requests: RepairLaunchRequest[] = [];
+  const messages: string[] = [];
+  const events: Record<string, unknown>[] = [];
+  const off = debug.registerSink({ name: 'repeat-signature-test', emit: (record) => {
+    if (record.category === 'task-agent' && record.event === 'repair-signature-repeat-stopped') events.push(record.data as Record<string, unknown>);
+  } });
+  try {
+    const opts = { liveMoves: new Set(['narrow-relaunch', 'salvage-relaunch', 'alternative']),
+      request: async (request: RepairLaunchRequest) => { requests.push(request); },
+      notify: (_seat: string, body: string) => { messages.push(body); } };
+    expect((await runRepairCycle(f.input(opts))).decision).toBe('repair-requested');
+    writeFileSync(requests[0]!.resultPath, JSON.stringify({ pr: 30, head: A, runId: requests[0]!.runId, ok: false,
+      failureSignature: `gate:sha256:${'1'.repeat(64)}`, reason: 'childStage=gate-failed' }));
+    expect((await runRepairCycle(f.input(opts))).decision).toBe('repair-failed');
+    expect((await runRepairCycle(f.input(opts))).decision).toBe('repair-stopped');
+    expect((await runRepairCycle(f.input(opts))).decision).toBe('repair-stopped');
+    expect(requests).toHaveLength(1);
+    expect(messages).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ priorRunId: requests[0]!.runId, skippedRelaunch: true });
+    expect(readTaskCard(f.card.id, f.statePath)?.history.filter((entry) => entry.event === 'repair-signature-repeat-stopped')).toHaveLength(1);
+  } finally { off(); }
+});
+
+test('a restarted owner run records its own repeat-stop event on the same head', async () => {
+  const f = fixture();
+  const requests: RepairLaunchRequest[] = [];
+  const messages: string[] = [];
+  const opts = { liveMoves: new Set(['narrow-relaunch', 'salvage-relaunch', 'alternative']),
+    request: async (request: RepairLaunchRequest) => { requests.push(request); },
+    notify: (_seat: string, body: string) => { messages.push(body); } };
+  await runRepairCycle(f.input(opts));
+  const tests = ['src/a.test.ts > A (assertion)'];
+  writeFileSync(requests[0]!.resultPath, JSON.stringify({ pr: 30, head: A, runId: requests[0]!.runId,
+    ok: false, failureSignature: `gate:sha256:${'1'.repeat(64)}`, gateFailureTests: tests, reason: 'childStage=gate-failed' }));
+  await runRepairCycle(f.input(opts));
+  await runRepairCycle(f.input(opts));
+  const first = readTaskCard(f.card.id, f.statePath)!;
+  const firstRepair = first.repairs![0]!;
+  const restartedRunId = 'run-restarted-owner';
+  writeTaskCards(f.statePath, [{ ...first, status: 'launched', runId: restartedRunId, repairs: [
+    { ...firstRepair, runId: restartedRunId, status: 'failed' }] }]);
+  expect((await runRepairCycle(f.input(opts))).decision).toBe('repair-stopped');
+  const stops = readTaskCard(f.card.id, f.statePath)?.history.filter((entry) => entry.event === 'repair-signature-repeat-stopped');
+  expect(stops?.map((entry) => entry.runId)).toEqual([requests[0]!.runId, restartedRunId]);
+  expect(messages).toHaveLength(2);
+  expect(messages[1]).toContain(tests[0]!);
+  expect(requests).toHaveLength(1);
+});
+
+test('unsigned gate failure and changed review keep the bounded retry path', async () => {
+  for (const changedReview of [false, true]) {
+    const f = fixture();
+    const requests: RepairLaunchRequest[] = [];
+    const opts = { liveMoves: new Set(['narrow-relaunch', 'salvage-relaunch', 'alternative']),
+      request: async (request: RepairLaunchRequest) => { requests.push(request); } };
+    await runRepairCycle(f.input(opts));
+    writeFileSync(requests[0]!.resultPath, JSON.stringify({ pr: 30, head: A, runId: requests[0]!.runId, ok: false,
+      ...(changedReview ? { failureSignature: `gate:sha256:${'1'.repeat(64)}` } : {}), reason: 'childStage=gate-failed' }));
+    await runRepairCycle(f.input(opts));
+    expect((await runRepairCycle(f.input({ ...opts, ...(changedReview ? { mustFix: ['new review finding'] } : {}) }))).decision).toBe('repair-requested');
+    expect(requests).toHaveLength(2);
+  }
+});
+
+test('provider mismatch stops only if the next worker would use the same model route', async () => {
+  const f = fixture();
+  const requests: RepairLaunchRequest[] = [];
+  const opts = { liveMoves: new Set(['narrow-relaunch', 'salvage-relaunch', 'alternative']),
+    request: async (request: RepairLaunchRequest) => { requests.push(request); }, notify: () => {} };
+  await runRepairCycle(f.input(opts));
+  writeFileSync(requests[0]!.resultPath, JSON.stringify({ pr: 30, head: A, runId: requests[0]!.runId, ok: false,
+    reason: 'review fallback: ambiguous or unsupported primary model "glm-5.3"' }));
+  await runRepairCycle(f.input(opts));
+  expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]?.failureSignature).toBe('provider:ambiguous-primary:glm-5.3');
+  expect((await runRepairCycle(f.input(opts))).decision).toBe('repair-stopped');
+  expect(requests).toHaveLength(1);
+});
+
+test('repeat-stop claims its owner message before a reentrant tick and retries a failed send', async () => {
+  const f = fixture();
+  const requests: RepairLaunchRequest[] = [];
+  const liveMoves = new Set(['narrow-relaunch', 'salvage-relaunch', 'alternative']);
+  const request = async (item: RepairLaunchRequest) => { requests.push(item); };
+  await runRepairCycle(f.input({ liveMoves, request }));
+  writeFileSync(requests[0]!.resultPath, JSON.stringify({ pr: 30, head: A, runId: requests[0]!.runId, ok: false,
+    failureSignature: `gate:sha256:${'2'.repeat(64)}`, reason: 'childStage=gate-failed' }));
+  await runRepairCycle(f.input({ liveMoves, request }));
+  let calls = 0;
+  const failedNotify = () => { calls++; throw new Error('inbox unavailable'); };
+  await runRepairCycle(f.input({ liveMoves, request, notify: failedNotify }));
+  expect(readTaskCard(f.card.id, f.statePath)?.history.some((entry) => entry.event === 'repair-repeat-owner-failed')).toBe(true);
+  let reentered: Promise<unknown> | undefined;
+  const notify = () => {
+    calls++;
+    reentered = runRepairCycle(f.input({ liveMoves, request, notify }));
+  };
+  await runRepairCycle(f.input({ liveMoves, request, notify }));
+  await reentered;
+  await runRepairCycle(f.input({ liveMoves, request, notify }));
+  expect(calls).toBe(2);
+  expect(requests).toHaveLength(1);
+  expect(readTaskCard(f.card.id, f.statePath)?.history.filter((entry) => entry.event === 'repair-repeat-owner-sent')).toHaveLength(1);
 });
 
 test('accepted repair worker takes the declared next-move → dispatch edge once with the source PR and run identity', async () => {
@@ -546,22 +653,22 @@ test('repair stays bound to the card source PR when a later tick presents anothe
 
 test('repair model respects tier and measured subscription without reducing GLM capacity on retry', () => {
   const f = fixture();
-  expect(alternateRepairModel(f.card).to.model).toBe('glm-5.3');
+  expect(alternateRepairModel(f.card).to.model).toBe('openrouter/z-ai/glm-5.3');
   expect(alternateRepairModel({ ...f.card, childLlm: undefined })).toEqual({
-    from: 'unknown', to: { provider: 'glm', model: 'glm-5.3' },
+    from: 'unknown', to: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' },
   });
   const afterGlm: TaskCard = { ...f.card, repairs: [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
     move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'openai-codex/gpt-6-sol',
     toModel: 'openrouter/openrouter/z-ai/glm-5.3' }] };
-  expect(alternateRepairModel(afterGlm).to).toEqual({ provider: 'glm', model: 'glm-5.3' });
+  expect(alternateRepairModel(afterGlm).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
   expect(alternateRepairModel({ ...afterGlm, tier: '상' }, { codexSubscription: true, grokSubscription: true }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
   expect(alternateRepairModel({ ...afterGlm, tier: '상', pr: 31 }, { codexSubscription: true, grokSubscription: true }).to).toEqual({ provider: 'grok', model: 'grok-4.6' });
   expect(alternateRepairModel({ ...afterGlm, tier: '상' }, { codexSubscription: false, grokSubscription: true }).to).toEqual({ provider: 'grok', model: 'grok-4.6' });
   expect(alternateRepairModel({ ...afterGlm, tier: '특' }, { codexSubscription: false, grokSubscription: false }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
   expect(alternateRepairModel({ ...afterGlm, tier: '상', repairs: [{ ...afterGlm.repairs![0]!, toModel: 'openai-codex/gpt-6-sol' }] },
     { codexSubscription: false, grokSubscription: false }).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-sol' });
-  expect(alternateRepairModel({ ...afterGlm, tier: '중' }, { codexSubscription: true, grokSubscription: true }).to.model).toBe('glm-5.3');
-  expect(alternateRepairModel({ ...f.card, tier: '하', childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } }).to.model).toBe('glm-5.3');
+  expect(alternateRepairModel({ ...afterGlm, tier: '중' }, { codexSubscription: true, grokSubscription: true }).to.model).toBe('openrouter/z-ai/glm-5.3');
+  expect(alternateRepairModel({ ...f.card, tier: '하', childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3-flash' } }).to.model).toBe('openrouter/z-ai/glm-5.3');
 });
 
 test('live quota inputs gate Sol before repair model selection, including missing and exhausted quota', async () => {
@@ -576,7 +683,7 @@ test('live quota inputs gate Sol before repair model selection, including missin
   const unknown = await repairModelAvailability(async () => ({ ...input,
     codexCandidates: [{ name: 'team' }], grokUsedPercent: undefined }));
   expect(unknown).toEqual({ codexSubscription: false, grokSubscription: false });
-  expect(alternateRepairModel(card, unknown).to.model).toBe('glm-5.3');
+  expect(alternateRepairModel(card, unknown).to.model).toBe('openrouter/z-ai/glm-5.3');
   const unreadable = await repairModelAvailability(async () => { throw new Error('quota source down'); });
   expect(unreadable).toEqual(unknown);
 });
@@ -587,7 +694,7 @@ test('repair cycle reads quota and passes the tier model to the worker request',
   for (const [tier, usedPercent, expected] of [
     ['상', 42, 'gpt-6-sol'],
     ['상', 100, 'grok-4.6'],
-    ['중', 42, 'glm-5.3'],
+    ['중', 42, 'openrouter/z-ai/glm-5.3'],
   ] as const) {
     const f = fixture();
     writeTaskCards(f.statePath, [{ ...f.card, tier, childLlm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' } }]);
@@ -610,7 +717,7 @@ test('TA-PARENT-ROLE-LLM: card parent policy survives automatic same-PR repair r
   expect(outcome.decision).toBe('repair-requested');
   expect(launches).toHaveLength(1);
   expect(launches[0]?.parentRoleLlm).toEqual([pin]);
-  expect(launches[0]?.model).toEqual({ provider: 'glm', model: 'glm-5.3' });
+  expect(launches[0]?.model).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
 });
 
 test('PLANNING-FOLLOWS-CHILD-LLM: inferred planning pin survives a same-PR repair request', async () => {
@@ -627,23 +734,23 @@ test('PLANNING-FOLLOWS-CHILD-LLM: inferred planning pin survives a same-PR repai
 test('tier-less repair cards dispatch as 중 and never charge Sol on even PRs', () => {
   const f = fixture();
   expect(alternateRepairModel(f.card, { codexSubscription: true, grokSubscription: true }).to)
-    .toEqual({ provider: 'glm', model: 'glm-5.3' });
+    .toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
   const afterGlm: TaskCard = { ...f.card, repairs: [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
     move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'openai-codex/gpt-6-sol',
     toModel: 'openrouter/openrouter/z-ai/glm-5.3' }] };
   expect(alternateRepairModel(afterGlm, { codexSubscription: true, grokSubscription: true }).to)
-    .toEqual({ provider: 'glm', model: 'glm-5.3' });
+    .toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
 });
 
 test('하-tier repairs recover old flash attempts with the subscription GLM, never downgrade full GLM', () => {
   const f = fixture();
   const failed = (toModel: string): TaskCard => ({ ...f.card, tier: '하', repairs: [{ pr: 30, head: A, branch: 'feature', at: now.toISOString(),
     move: 'narrow-relaunch', runId: 'run-1', resultPath: 'x', status: 'failed', fromModel: 'a', toModel }] });
-  expect(alternateRepairModel({ ...f.card, tier: '하' }).to).toEqual({ provider: 'glm', model: 'glm-5.3' });
-  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3')).to).toEqual({ provider: 'glm', model: 'glm-5.3' });
-  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3-flash')).to).toEqual({ provider: 'glm', model: 'glm-5.3' });
+  expect(alternateRepairModel({ ...f.card, tier: '하' }).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3')).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3-flash')).to).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
   expect(alternateRepairModel(failed('openrouter/openrouter/z-ai/glm-5.3-flash'), { codexSubscription: true, grokSubscription: true }).to)
-    .toEqual({ provider: 'glm', model: 'glm-5.3' });
+    .toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
   expect(alternateRepairModel(failed('openai-codex/gpt-6-luna')).to).toEqual({ provider: 'openai-codex', model: 'gpt-6-luna' });
 });
 

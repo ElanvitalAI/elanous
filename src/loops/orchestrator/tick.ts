@@ -25,7 +25,7 @@ import * as testGuard from '../../instance/test-write-guard.js';
 import { seatCapDetails } from '../budget.js';
 export { isLaunchEligible } from './traffic.js';
 import { readTaskAgentState, TASK_SEATS, type HandTaskOptions, type TaskCard as TaskAgentCard, type HandTaskResult, type TaskLauncher, type TaskSeat } from '../../task-agent/task-hand.js';
-import { runCoordinatorAgentInbox, runCoordinatorInbox, type CoordinatorInboxResult } from './inbox.js';
+import { runAskOpContextInbox, runCoordinatorAgentInbox, type CoordinatorInboxResult } from './inbox.js';
 import type { KnowhowOptions } from './knowhow-pack.js';
 import { loadAgentRolePack, type AgentReplyInput } from '../agent-reply.js';
 import type { LLMProvider } from '../../llm.js';
@@ -97,6 +97,8 @@ export interface TickDeps {
   coordinatorAgentProvider?: LLMProvider;
   /** Resident knowhow pack seam; the real intake reads 내부 문서 `KNOWHOW` every tick. */
   coordinatorKnowhow?: KnowhowOptions | false;
+  /** Deterministic read-only ask-op context seam for isolated tick tests. */
+  coordinatorContext?: typeof import('../../context-bus/context-now.js').askOpContextBundle;
 }
 
 /** ORCH-TA-HAND ledger — one row per handed `orch:<card>:<cell>` key so a cell is handed once across ticks and processes. */
@@ -521,8 +523,9 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         ? runCoordinatorAgentInbox({ role, pack: loadAgentRolePack('coordinator'), path: inboxPath, root,
             ...(deps.coordinatorAgentRun ? { runAgent: deps.coordinatorAgentRun } : {}),
             ...(deps.coordinatorAgentProvider ? { provider: deps.coordinatorAgentProvider } : {}) })
-        : runCoordinatorInbox(undefined, 100, inboxPath,
-          deps.coordinatorKnowhow === undefined ? {} : { knowhow: deps.coordinatorKnowhow });
+        : runAskOpContextInbox({ path: inboxPath, limit: 100,
+            ...(deps.coordinatorKnowhow === undefined ? {} : { knowhow: deps.coordinatorKnowhow }),
+            ...(deps.coordinatorContext ? { context: deps.coordinatorContext } : {}) });
     }))();
     if (inbox.replied || inbox.acknowledged) {
       observe('exchange', 'coordinator-inbox-replied', inbox.replied);

@@ -22,14 +22,16 @@ import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
-import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
+import { POD_JOB_DEADLINE_SECONDS, POD_DEADLINE_AFTER_WAIT, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podDeadlineWatchdogScript, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
 import { stablePodRunGuard } from './pod-manifest-test-normalize.js';
 import { POD_PROVENANCE_ENV_NAMES } from './pod-provenance.js';
 import { makeScriptedKubectlDevice, type PodDeviceEvent } from '../../ux-sim/task-orchestrator-surfaces-self-implement-pod-device.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
 
-import { userConfigPath, type UserConfig } from '../../user-config.js';
+import { buildUserConfig, resetUserConfig, userConfigPath, type UserConfig } from '../../user-config.js';
+import { worktreeAddTimeoutForRepo } from '../../git-fs/worktree.js';
+import { getElanousConfigDirOverride, setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 
 // Unit fakes opt out explicitly; a supplied kubectl adapter in product code still measures on the host.
 const podSelfImplementSpawn: typeof realPodSelfImplementSpawn = (options = {}) =>
@@ -44,6 +46,50 @@ import { mintGroundingToken } from '../../grounding/token.js';
 import { handlePodGithubCredential, resetPodCredentialRateForTesting } from '../../nexus/api/pod-credential-api.js';
 
 const CREDS = () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' });
+
+test('deadline watchdog emits a scoped result and stops only its child before the hard limit', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-deadline-watch-'));
+  try {
+    expect(Bun.spawnSync(['git', 'init', '-q', '-b', 'tc/work', join(root, 'repo')]).exitCode).toBe(0);
+    const paths = (value: string) => value.replaceAll('/tmp/si.', `${root}/si.`);
+    const watch = paths(podDeadlineWatchdogScript({ deadlineSeconds: 2, job: 'si-test', runId: 'run-test', prNumber: 31544 }));
+    const afterWait = paths(POD_DEADLINE_AFTER_WAIT);
+    const run = Bun.spawnSync(['bash', '-c', `set -u\ncd ${JSON.stringify(root)}\nprintf 'child-start\\n' > ${JSON.stringify(join(root, 'si.out'))}\n${watch}\nprintf 'run\\n' > ${JSON.stringify(join(root, 'si.stage'))}\nsleep 20 & si_pid=$!\nprintf '%s\\n' "$si_pid" > ${JSON.stringify(join(root, 'si.pid'))}\nwait "$si_pid"; rc=$?\n${afterWait}\nkill "$si_deadline_watch_pid" 2>/dev/null || true\nprintf 'rc=%s\\n' "$rc"`], { timeout: 4_000 });
+    const output = run.stdout.toString();
+    expect(run.exitCode).toBe(0);
+    expect(output).toContain('ELANOUS_POD_DEADLINE_RESULT si-test run-test stop-cause=deadline stage=run pr=31544 branch=tc/work');
+    expect(output).toContain('rc=124');
+    expect(readFileSync(join(root, 'si.out'), 'utf8')).toContain('"stopCause":"deadline"');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('deadline watchdog leaves a completed child and its successful result alone', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-deadline-complete-'));
+  try {
+    const watch = podDeadlineWatchdogScript({ deadlineSeconds: 2, job: 'si-complete', runId: 'run-complete' })
+      .replaceAll('/tmp/si.', `${root}/si.`);
+    const run = Bun.spawnSync(['bash', '-c', `set -u\ncd ${JSON.stringify(root)}\n${watch}\nsleep 0.1 & si_pid=$!\nprintf '%s\\n' "$si_pid" > ${JSON.stringify(join(root, 'si.pid'))}\nwait "$si_pid"; rc=$?; touch ${JSON.stringify(join(root, 'si.finished'))}\nsleep 2\nkill "$si_deadline_watch_pid" 2>/dev/null || true\nprintf 'rc=%s\\n' "$rc"`], { timeout: 4_000 });
+    expect(run.exitCode).toBe(0);
+    expect(run.stdout.toString()).toContain('rc=0');
+    expect(run.stdout.toString()).not.toContain('ELANOUS_POD_DEADLINE_RESULT');
+    expect(existsSync(join(root, 'si.deadline-result'))).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('late deadline result cannot overwrite a successful child exit', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-deadline-success-'));
+  try {
+    const afterWait = POD_DEADLINE_AFTER_WAIT.replaceAll('/tmp/si.', `${root}/si.`);
+    const run = Bun.spawnSync(['bash', '-c', `printf 'success\\n' > ${JSON.stringify(join(root, 'si.out'))}\nprintf 'deadline\\n' > ${JSON.stringify(join(root, 'si.deadline-result'))}\nrc=0\n${afterWait}\nprintf 'rc=%s\\n' "$rc"`]);
+    expect(run.exitCode).toBe(0);
+    expect(run.stdout.toString()).toContain('rc=0');
+    expect(readFileSync(join(root, 'si.out'), 'utf8')).toBe('success\n');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+function goalWithCompletionBoundary(body: string): string {
+  return `${body}\n\n## ACCEPTANCE CRITERIA\n- 완료 경계 코드: Pod Job이 요청한 기능을 실행한다.\n- 완료 경계 실물: 실행 결과가 Job 로그에 기록된다.\n- 완료 경계 증거 명령: bun test src/task-orchestrator/surfaces/self-implement-pod.test.ts`;
+}
 
 test('three consecutive Job NotFound polls end the parent with a pod-vanished stop; API errors reset the count', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pod-vanished-'));
@@ -915,6 +961,61 @@ test('the host detail switch reaches only matching Pod runs before expiry withou
   } finally { resetLiveDetailCacheForTesting(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test('POD-WORKTREE-TIMEOUT-PASS: Pod child Job receives a load-safe worktree timeout while host timeout selection stays unchanged', async () => {
+  const previousConfigDir = getElanousConfigDirOverride();
+  const restoreConfigDir = () => {
+    if (previousConfigDir === undefined) resetElanousConfigDir();
+    else setElanousConfigDir(previousConfigDir);
+    resetUserConfig();
+  };
+  const launch = async (configured?: number) => {
+    const { k, calls } = fakeKubectl(['Complete'], '{"ok":true,"stage":"complete"}\n');
+    const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {},
+      fallbackConfig: () => ({ llm: {}, harness: configured === undefined ? {} : { worktreeAddTimeoutSec: configured } }) as UserConfig,
+    })({ feature: 'create worktree', spaceId: `pod-timeout-${configured ?? 'default'}` }).done;
+    expect(result.exitCode).toBe(0);
+    const [secret, job] = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+    expect([secret.kind, job.kind]).toEqual(['Secret', 'Job']);
+    const script: string = job.spec.template.spec.containers[0].args[0];
+    expect(script).toContain('install -m 600 /creds/llm-fallback-config.json "$HOME/.elanous/config.json"');
+    const childDir = mkdtempSync(join(tmpdir(), 'pod-child-worktree-timeout-'));
+    try {
+      const installed = join(childDir, 'config.json');
+      writeFileSync(installed, secret.stringData['llm-fallback-config.json']);
+      const seconds = buildUserConfig(installed).harness?.worktreeAddTimeoutSec;
+      const expectedSeconds = configured === 720 ? 720 : 1200;
+      expect(seconds).toBe(expectedSeconds);
+      setElanousConfigDir(childDir);
+      try {
+        resetUserConfig();
+        let trackedFileCounts = 0;
+        expect(worktreeAddTimeoutForRepo(childDir, () => { trackedFileCounts++; return 1; }))
+          .toEqual({ ms: expectedSeconds * 1000, trackedFileCount: null, source: 'config' });
+        expect(trackedFileCounts).toBe(0);
+      } finally { restoreConfigDir(); }
+      return seconds;
+    } finally { rmSync(childDir, { recursive: true, force: true }); }
+  };
+  expect(await launch()).toBe(1200);
+  expect(await launch(720)).toBe(720);
+  expect(await launch(-1)).toBe(1200);
+  const configDir = mkdtempSync(join(tmpdir(), 'pod-host-worktree-timeout-'));
+  setElanousConfigDir(configDir);
+  try {
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ harness: { worktreeAddTimeoutSec: 720 } }));
+    resetUserConfig();
+    expect(worktreeAddTimeoutForRepo(configDir, () => { throw new Error('configured host must not count files'); }))
+      .toEqual({ ms: 720_000, trackedFileCount: null, source: 'config' });
+    writeFileSync(join(configDir, 'config.json'), JSON.stringify({}));
+    resetUserConfig();
+    expect(worktreeAddTimeoutForRepo(configDir, () => 1))
+      .toEqual({ ms: 300_000, trackedFileCount: 1, source: 'tracked-files' });
+  } finally {
+    restoreConfigDir();
+    rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
 test('host seat reaches the actual Pod Job as a non-secret environment value', async () => {
   const { k, calls } = fakeKubectl(['Complete'], '');
   await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_HARNESS_SEAT: 'UX' } })({ feature: 'fix it', spaceId: 'seat-stamped' }).done;
@@ -1006,7 +1107,9 @@ test('TA warm reuse decision is observed but missing TA evidence keeps the exist
         if (runId) runId.value = '<run-id>';
         // POD-LAUNCH-PROVENANCE — the provenance run id and request time are launch-specific like ELANOUS_RUN_ID.
         for (const entry of container.env ?? []) if (entry.name === 'ELANOUS_POD_RUN' || entry.name === 'ELANOUS_POD_REQUESTED_AT') entry.value = '<launch>';
-        if (typeof container.args?.[0] === 'string') container.args[0] = stablePodRunGuard(container.args[0]);
+        if (typeof container.args?.[0] === 'string') container.args[0] = stablePodRunGuard(container.args[0])
+          .replace(/ELANOUS_POD_DEADLINE_RESULT [A-Za-z0-9_.:-]+ [A-Za-z0-9_.:-]+ stop-cause=/g,
+            'ELANOUS_POD_DEADLINE_RESULT <job> <run> stop-cause=');
       }
       for (const volume of spec.volumes ?? []) {
         if (volume.secret?.secretName) volume.secret.secretName = '<credential-secret>';
@@ -1248,7 +1351,7 @@ describe('pod memory evidence', () => {
       const ready = join(dir, 'ready');
       const json = '{"stage":"abandoned","ok":false}';
       writeFileSync(output, `${json}\n`);
-      const run = Bun.spawnSync(['bash', '-c', `set -u\nrc=7\n(trap 'printf "ELANOUS_MEM 42 1024 512:bun\\n"; exit 0' TERM; touch ${JSON.stringify(ready)}; while :; do sleep 0.01; done) & mem_sampler_pid=$!\nwhile [ ! -f ${JSON.stringify(ready)} ]; do sleep 0.01; done\n${shutdown.replaceAll('/tmp/si.out', output)}\nexit $rc`]);
+      const run = Bun.spawnSync(['bash', '-c', `set -u\nrc=7\nsi_deadline_watch_pid=999999\n(trap 'printf "ELANOUS_MEM 42 1024 512:bun\\n"; exit 0' TERM; touch ${JSON.stringify(ready)}; while :; do sleep 0.01; done) & mem_sampler_pid=$!\nwhile [ ! -f ${JSON.stringify(ready)} ]; do sleep 0.01; done\n${shutdown.replaceAll('/tmp/si.out', output).replaceAll('/tmp/si.finished', join(dir, 'si.finished')).replaceAll('/tmp/si.deadline-result', join(dir, 'si.deadline-result')).replaceAll('/tmp/si.deadline-marker', join(dir, 'si.deadline-marker'))}\nexit $rc`]);
       expect(run.exitCode).toBe(7);
       expect(run.stdout.toString().trimEnd().split('\n')).toEqual(['ELANOUS_MEM 42 1024 512:bun', json]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -1383,6 +1486,24 @@ describe('podSelfImplementSpawn', () => {
     expect(env).toContainEqual({ name: 'ELANOUS_SUBSTRATE', value: 'pod' });
     expect(applied[1].spec.template.spec.containers[0].args[0]).toContain("'--open-pr'");
     expect(calls.some((c) => c.args.includes('delete secret'))).toBe(true);
+  });
+
+  test('a measured introduced gate failure crosses the child JSON parser and emits a repair receipt', async () => {
+    const gate = { passed: false, testStepExecuted: true,
+      baselineFailures: [{ file: 'src/example.test.ts', name: 'example > fails', attribution: 'introduced' as const,
+        baselinePresence: 'present' as const,
+        diagnostic: 'error: expect(received).toBe(expected)' }],
+      reflectGateFacts: { introduced: 1, preexisting: 0, unknown: 0 } };
+    const { k } = fakeKubectl(['Failed'], `${JSON.stringify({ stage: 'gate-failed', ok: false, gate })}\n`);
+    const lines: string[] = [];
+    const logSpy = spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS })
+        ({ feature: 'gate receipt', spaceId: 'pod-gate-receipt' }).done;
+      expect(result.disposition?.gate).toEqual(gate);
+      expect(lines).toContainEqual(expect.stringMatching(/^GATE_FAILURE_SIGNATURE=sha256:[a-f0-9]{64}$/));
+      expect(lines).toContain(`GATE_FAILURE_TESTS=["src/example.test.ts > example > fails (assertion)"]`);
+    } finally { logSpy.mockRestore(); }
   });
 
   test('autoMerge Pod child requests merge-by-host, then invokes host regate once for merge-ready', async () => {
@@ -1560,7 +1681,7 @@ describe('podSelfImplementSpawn', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-goal-doc-'));
     const previous = process.cwd();
     const goal = 'docs/goals/ASK-a.md';
-    const document = '# private goal text 38fjx';
+    const document = goalWithCompletionBoundary('# private goal text 38fjx');
     try {
       execFileSync('git', ['init', '-q', root]);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
@@ -1589,7 +1710,7 @@ describe('podSelfImplementSpawn', () => {
       expect(script).not.toContain('--auto-review');
       expect(script).not.toContain('--no-draft');
       expect(result.exitCode).toBe(0);
-      const stamped = `${document}\n\n## Shard identity\n${JSON.stringify({ orchestrationId: 'a5096ecf-cb0b-4dd9-84eb-bfdffa07a280', shardId: 'task:abcdef', totalShards: 1, position: 1, summary: document, siblings: [] })}`;
+      const stamped = `${document}\n\n## Shard identity\n${JSON.stringify({ orchestrationId: 'a5096ecf-cb0b-4dd9-84eb-bfdffa07a280', shardId: 'task:abcdef', totalShards: 1, position: 1, summary: document.replace(/\s+/g, ' '), siblings: [] })}`;
       const { k: stampedKubectl, calls: stampedCalls } = fakeKubectl(['Complete'], '');
       await podSelfImplementSpawn({ kubectl: stampedKubectl, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal } })({ feature: stamped, spaceId: 'pod-stamped-top' }).done;
       const stampedJob = stampedCalls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!)).find((m) => m.kind === 'Job');
@@ -1676,7 +1797,7 @@ describe('podSelfImplementSpawn', () => {
     try {
       execFileSync('git', ['init', '-q', root]);
       mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
-      writeFileSync(join(root, goal), '# goal');
+      writeFileSync(join(root, goal), goalWithCompletionBoundary('# goal'));
       process.chdir(root);
       const { k, calls } = fakeKubectl(['Complete'], '');
       await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal } })({ feature: 'goal', spaceId: 'pod-noresult' }).done;
@@ -1767,7 +1888,7 @@ describe('podSelfImplementSpawn', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-single-shard-'));
     const previous = process.cwd();
     const goal = 'docs/goals/x.md';
-    const document = '# original goal';
+    const document = goalWithCompletionBoundary('# original goal');
     const modes: Array<Record<string, unknown>> = [];
     const off = debug.registerSink({ name: 'pod-single-shard-mode', emit: (record) => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
@@ -1794,7 +1915,7 @@ describe('podSelfImplementSpawn', () => {
       expect(topScript).toContain(`elanous harness ask '${goal}' --json`);
       expect(top.stringData['goal-doc']).toBe(document);
       expect(shard.stringData.feature).toStartWith(`${document}\n\n## Shard identity\n`);
-      expect(JSON.parse(shard.stringData.feature.split('## Shard identity\n')[1])).toMatchObject({ totalShards: 1, position: 1, summary: document });
+      expect(JSON.parse(shard.stringData.feature.split('## Shard identity\n')[1])).toMatchObject({ totalShards: 1, position: 1, summary: document.replace(/\s+/g, ' ') });
       expect(shard.stringData['goal-doc']).toBeUndefined();
       expect(shardScript).not.toContain('harness ask');
       expect(shardScript).toContain('elanous self implement "$(cat /creds/feature)" --json');
@@ -1809,7 +1930,7 @@ describe('podSelfImplementSpawn', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-real-shards-'));
     const previous = process.cwd();
     const goal = 'docs/goals/x.md';
-    const example = '# original goal\n\nExample of a proposed shard:\n## Shard identity\n{"pieceIndex":1,"totalShards":2}';
+    const example = goalWithCompletionBoundary('# original goal\n\nExample of a proposed shard:\n## Shard identity\n{"pieceIndex":1,"totalShards":2}');
     const modes: Array<Record<string, unknown>> = [];
     const off = debug.registerSink({ name: 'pod-real-shards-mode', emit: (record) => {
       if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
@@ -1854,7 +1975,7 @@ describe('podSelfImplementSpawn', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-shard-quoted-handoff-'));
     const previous = process.cwd();
     const goal = 'docs/goals/x.md';
-    const document = '# original goal';
+    const document = goalWithCompletionBoundary('# original goal');
     const quoted = 'implement A\n\n## Working-memory handoff\nquoted in the body\n\n## Dependency handoff\nalso quoted';
     const modes: Array<Record<string, unknown>> = [];
     const off = debug.registerSink({ name: 'pod-shard-quoted-handoff-mode', emit: (record) => {
@@ -2663,6 +2784,8 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     expect(tail[0]).toBe('stage line 21');
     expect(tail.at(-1)).toBe('child exploded: authentication failed for sk-proj-***');
     expect(tail.join('\n')).not.toContain('sk-proj-ABCDEFGHIJKLMNOP1234');
+    expect(podNoResultLogTailLines('  original   spacing  sk-proj-ABCDEFGHIJKLMNOP1234  \n'))
+      .toEqual(['  original   spacing  sk-proj-***  ']);
   });
 
   test('Pod log evidence bounds long lines and masks failed kubectl output and thrown errors', async () => {
@@ -2695,7 +2818,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     const parent = 'run-parent-no-result-log-tail';
     const previousState = process.env.ELANOUS_STATE_DIR;
     const diagnostics: Array<Record<string, unknown>> = [];
-    const fixtureJob = spawnSync('bash', ['-c', "printf 'stage line %s\\n' {0..99}; printf '%s\\n' 'child exploded: authentication failed for sk-proj-ABCDEFGHIJKLMNOP1234'; exit 1"], { encoding: 'utf8' });
+    const fixtureJob = spawnSync('bash', ['-c', "printf 'stage line %s\\n' {0..99}; printf '%s\\n' '  child exploded: authentication failed for sk-proj-ABCDEFGHIJKLMNOP1234  '; exit 1"], { encoding: 'utf8' });
     expect(fixtureJob.status).toBe(1);
     expect(fixtureJob.stdout).not.toContain('{0..99}');
     const fixtureTail = fixtureJob.stdout;
@@ -2721,6 +2844,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(result.error?.message).toContain('childError=no-result-line');
       expect(result.error?.message).not.toContain('sk-proj-ABCDEFGHIJKLMNOP1234');
       expect(tailArgs).toContain('--tail=80');
+      expect(tailArgs).toContain('-c child');
       expect(callOrder.indexOf('log-tail')).toBeGreaterThanOrEqual(0);
       // A terminal failed Job is retained for inspection; this path has no Job deletion to order.
       expect(callOrder).toEqual(['log-tail']);
@@ -2729,11 +2853,12 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       const childEvidence = evidence?.childEvidence;
       expect(childEvidence?.logTail).toHaveLength(POD_NO_RESULT_LOG_TAIL_LINES);
       expect(childEvidence?.logTail?.[0]).toBe('stage line 21');
-      expect(childEvidence?.logTail?.at(-1)).toBe('child exploded: authentication failed for sk-proj-***');
-      expect(childEvidence?.stderr).toContain('child exploded: authentication failed for sk-proj-***');
+      expect(childEvidence?.logTail?.at(-1)).toBe('  child exploded: authentication failed for sk-proj-***  ');
+      expect(childEvidence?.stderr).toContain('  child exploded: authentication failed for sk-proj-***  ');
       expect(JSON.stringify(evidence)).not.toContain('sk-proj-ABCDEFGHIJKLMNOP1234');
       expect(diagnostics).toHaveLength(1);
-      expect(diagnostics[0]).toMatchObject({ job: expect.stringContaining('si-'), lines: 80 });
+      expect(diagnostics[0]).toMatchObject({ job: expect.stringContaining('si-'), lines: 80,
+        logTail: expect.arrayContaining(['  child exploded: authentication failed for sk-proj-***  ']) });
       expect(JSON.stringify(diagnostics)).not.toContain('sk-proj-ABCDEFGHIJKLMNOP1234');
     } finally {
       off();
@@ -2825,9 +2950,15 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     const parent = 'run-parent-no-result-log-unavailable';
     const previousState = process.env.ELANOUS_STATE_DIR;
     const base = fakeKubectl(['Failed'], 'no result here\n', 1);
+    const secret = 'sk-proj-ABCDEFGHIJKLMNOP1234';
+    const failure = `Error from server (NotFound): pods "si-x" not found; token ${secret}`;
+    const diagnostics: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-no-result-log-unavailable', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'no-result-log-tail') diagnostics.push(record.data as Record<string, unknown>);
+    } });
     const k: Kubectl = (args, input) => {
       if (args.includes('logs') && args.includes('--tail=80')) {
-        return { status: 1, stdout: '', stderr: 'Error from server (NotFound): pods "si-x" not found' };
+        return { status: 1, stdout: '', stderr: failure };
       }
       return base.k(args, input);
     };
@@ -2838,9 +2969,12 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(result.exitCode).toBe(1);
       const evidence = loadRunLedger(parent, runLedgerDir(root))?.find((entry) => entry.event === 'pod-child-evidence')?.data as {
         childEvidence?: { stderr?: string } } | undefined;
-      expect(evidence?.childEvidence?.stderr).toContain('log-unavailable:');
-      expect(evidence?.childEvidence?.stderr).toContain('NotFound');
+      const unavailable = 'log-unavailable: Error from server (NotFound): pods "si-x" not found; token sk-proj-***';
+      expect(evidence?.childEvidence?.stderr).toBe(unavailable);
+      expect(diagnostics).toEqual([expect.objectContaining({ logUnavailable: unavailable })]);
+      expect(JSON.stringify(evidence) + JSON.stringify(diagnostics)).not.toContain(secret);
     } finally {
+      off();
       if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = previousState;
       rmSync(root, { recursive: true, force: true });
@@ -2900,7 +3034,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
         fallbackConfig: () => ({ llm: {} }) as UserConfig, openGatewayConfig: () => ({ llm: {} }) as UserConfig,
       })({ feature: 'failed child with draft', spaceId: 'pr-branch-fixture' }).done;
       expect(readFileSync(capture, 'utf8').trim().split('\n')).toEqual([expect.stringContaining(
-        `pr list --repo ElanvitalAI/elanous --state open --head ${branch}`)]);
+        'pr list --repo ElanvitalAI/elanous --state open --head ' + branch)]);
       const terminalRecords = (loadRunLedger(parentRunId, runLedgerDir(root)) ?? []).filter((entry) => entry.event === 'pr-terminal').map((entry) => entry.data);
       expect(terminalRecords).toEqual([expect.objectContaining({ branch, prNumber: 29999, prUrl,
         prNumberSource: 'branch-lookup', terminalClass: 'failed-with-pr' })]);
@@ -3013,15 +3147,15 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       calls.push(args.join(' '));
       if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
       if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
-      if (args.some((a) => a.includes('conditions[?(@.type=="Failed")].reason'))) return { status: 0, stdout: 'DeadlineExceeded', stderr: '' };
+      if (args.some((a) => a.includes('conditions[?(@.type=="FailureTarget")].reason'))) return { status: 0, stdout: '|DeadlineExceeded', stderr: '' };
       if (args.includes('get') && args.includes('pods')) return { status: 0, stdout: '2026-09-27T06:40:00Z\tOOMKilled\t137\n', stderr: '' };
-      if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Failed', stderr: '' };
+      if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'FailureTarget', stderr: '' };
       if (args.includes('logs')) return { status: 0, stdout: `${child}\n`, stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     };
     try {
       const r = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, deadlineSeconds: 10_800 })({ feature: 'x', spaceId: 'deadline' }).done;
-      expect(calls.some((c) => c.includes('jsonpath={.status.conditions[?(@.type=="Failed")].reason}'))).toBe(true);
+      expect(calls.some((c) => c.includes('conditions[?(@.type=="FailureTarget")].reason'))).toBe(true);
       expect(calls.some((c) => c.includes('get pods'))).toBe(true);
       expect(r.error).toEqual({ code: 'pod-deadline-exceeded', message: `Job ${podJobName('deadline')} 이 수명 상한 10800초에 닿았다` });
       expect(r.disposition?.failureClassification).toBe('run-deadline-exceeded');
@@ -3030,6 +3164,29 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(records.find((record) => record.category === 'self-implement.pod' && record.event === 'job-finished')?.data).not.toHaveProperty('childError');
       expect(records.some((record) => record.category === 'self-implement.pod' && record.event === 'child-error')).toBe(false);
     } finally { off(); }
+  });
+  test('predeadline marker supplies a terminal deadline result when the child JSON is missing', async () => {
+    const job = podJobName('deadline-marker-test');
+    let childRunId = '';
+    const k: Kubectl = (args, input) => {
+      if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
+      if (args.includes('apply') && input) {
+        const manifest = JSON.parse(input);
+        if (manifest.kind === 'Job') childRunId = manifest.spec.template.spec.containers[0].env.find((e: { name: string }) => e.name === 'ELANOUS_RUN_ID').value;
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.some((a) => a.includes('conditions[?(@.type=="FailureTarget")].reason'))) return { status: 0, stdout: 'BackoffLimitExceeded|', stderr: '' };
+      if (args.includes('get') && args.includes('pods')) return { status: 0, stdout: '2026-10-25T09:30:00Z\tError\t124\n', stderr: '' };
+      if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Failed', stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: `ELANOUS_POD_DEADLINE_RESULT ${job} ${childRunId} stop-cause=deadline stage=run pr=unknown branch=tc/work\n`, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, deadlineSeconds: 10_800 })({ feature: 'x', spaceId: 'deadline-marker-test' }).done;
+    expect(childRunId).toMatch(/^run-/);
+    expect(result.error?.code).toBe('pod-deadline-exceeded');
+    expect(result.disposition).toMatchObject({ stage: 'deadline', ok: false, branch: 'tc/work', failureClassification: 'run-deadline-exceeded' });
+    expect(result.error?.message).not.toContain('no-result-line');
   });
   test('failed Job reads the newest child termination by creation time: OOM, Error, or unknown', async () => {
     const cases = [
@@ -3059,7 +3216,8 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
         const job = podJobName(`termination-${c.id}`);
         const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_MEMORY_TIER: 'high', ELANOUS_POD_MEMORY_HIGH: '24Gi' } })({ feature: 'x', spaceId: `termination-${c.id}` }).done;
         const childPodQueries = calls.filter((args) => args.includes('get') && args.includes('pods') && args.includes(`job-name=${job}`) && args.some((arg) => arg.includes('containerStatuses[?(@.name=="child")]')));
-        expect(childPodQueries).toHaveLength(1);
+        // Classification still uses the first read; incomplete terminal evidence receives one bounded re-read.
+        expect(childPodQueries).toHaveLength(2);
         expect(calls.some((args) => args.includes('get') && args.includes('pods') && args.includes('json') && args.some((arg) => arg.startsWith('elanous.child-run=')))).toBe(true);
         expect(childPodQueries[0]).toEqual(expect.arrayContaining(['-n', 'elanous-test', '-l', `job-name=${job}`]));
         expect(childPodQueries[0]!.join(' ')).toContain('containerStatuses[?(@.name=="child")]');
@@ -3515,6 +3673,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
   describe('JOB-FAILURE-TERMINATION-CAPTURE — the failure verdict carries this Job\'s termination facts to the incident row', () => {
     /** The spawn's own calls (context · apply · reattach probe · logs) here; every Job/Pod state read goes to the fake kubectl device. */
     function terminationLaunch(o: { spaceId: string; event: Omit<PodDeviceEvent, 'jobName'>; logs: string; markerRc?: number;
+      retryPodRead?: { status: number; stdout: string; stderr: string };
       /** After the verdict poll saw Failed: `gc-after-first` — the first Job read answers, later ones are NotFound (GC);
        *  `throw-first` — the first Job read throws. */
       afterVerdict?: 'gc-after-first' | 'throw-first' }) {
@@ -3523,7 +3682,12 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       let childRunId = '';
       let verdictSeen = false;
       let jobReadsAfterVerdict = 0;
+      let terminationPodReads = 0;
       const kubectl: Kubectl = (args, input) => {
+        if (args.some((arg) => arg.startsWith('jsonpath={range .items[*]}{.metadata.creationTimestamp}'))) {
+          terminationPodReads++;
+          if (terminationPodReads > 1 && o.retryPodRead) return o.retryPodRead;
+        }
         if (o.afterVerdict && args.includes('get') && args.includes('job')) {
           if (args.includes('jsonpath={.status.conditions[*].type}')) {
             const answer = device.kubectl(args, input);
@@ -3594,7 +3758,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
         && call.args.some((arg) => arg.includes('conditions[?(@.type=="Failed")].reason')))).toHaveLength(1);
     });
 
-    test('result marker early exit: captured at that verdict while the Pod still runs — container facts stay unknown', async () => {
+    test('result marker early exit: a still-running Pod is queried again and the missing terminal facts are explained', async () => {
       const uid = '0a1b2c3d-0000-4000-8000-0000000000bb';
       const launch = terminationLaunch({ spaceId: 'term-marker', markerRc: 3, logs: '',
         event: { kind: 'result-marker-running', jobUid: uid, jobConditionType: '', activeDeadlineSeconds: 14400, podPhase: 'Running',
@@ -3602,9 +3766,44 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       const { result, finished, exits } = await runAndRecord(launch, 'term-marker', 'run-parent-term-marker', true);
       expect(result.exitCode).toBe(1);
       const expected = { job: launch.jobName, path: 'result-marker', jobLookup: 'ok', jobUid: uid, jobConditionReason: 'unknown', deadlineExceeded: 'unknown',
-        activeDeadlineSeconds: 14400, podLookup: 'running', containerReason: 'unknown', exitCode: 'unknown', finishedAt: 'unknown', oomKilled: 'unknown' };
+        activeDeadlineSeconds: 14400, podLookup: 'running', containerReason: 'unknown', exitCode: 'unknown', finishedAt: 'unknown', oomKilled: 'unknown',
+        collectionAttempts: 2, collectionFailureReason: 'pod-still-running-after-retry' };
       expect(finished.at(-1)).toMatchObject({ state: 'failed', podTermination: expected });
       expect(exits).toMatchObject([{ runId: 'run-parent-term-marker', podTermination: expected }]);
+    });
+
+    test('result marker early exit: retry captures terminated child facts in the incident', async () => {
+      const uid = '0a1b2c3d-0000-4000-8000-0000000000b1';
+      const launch = terminationLaunch({ spaceId: 'term-marker-ended', markerRc: 3, logs: '',
+        event: { kind: 'result-marker-running', jobUid: uid, jobConditionType: '', activeDeadlineSeconds: 14400, podPhase: 'Running',
+          containerReason: null, containerExitCode: null, containerFinishedAt: null },
+        retryPodRead: { status: 0, stdout: `2026-10-25T13:00:00Z\tError\t3\t2026-10-25T13:00:03Z\t\t\t|Failed\t${uid}\n`, stderr: '' } });
+      const { exits } = await runAndRecord(launch, 'term-marker-ended', 'run-parent-term-marker-ended', true);
+      expect(exits).toMatchObject([{ podTermination: { podLookup: 'terminated', containerReason: 'Error', exitCode: 3,
+        finishedAt: '2026-10-25T13:00:03Z', collectionAttempts: 2 } }]);
+      expect(exits[0]?.podTermination).not.toHaveProperty('collectionFailureReason');
+    });
+
+    test('result marker early exit: retry records a disappeared Pod without inventing an exit', async () => {
+      const uid = '0a1b2c3d-0000-4000-8000-0000000000b2';
+      const launch = terminationLaunch({ spaceId: 'term-marker-gc', markerRc: 3, logs: '',
+        event: { kind: 'result-marker-running', jobUid: uid, jobConditionType: '', activeDeadlineSeconds: 14400, podPhase: 'Running',
+          containerReason: null, containerExitCode: null, containerFinishedAt: null },
+        retryPodRead: { status: 0, stdout: '', stderr: '' } });
+      const { exits } = await runAndRecord(launch, 'term-marker-gc', 'run-parent-term-marker-gc', true);
+      expect(exits).toMatchObject([{ podTermination: { podLookup: 'absent', exitCode: 'unknown', finishedAt: 'unknown',
+        collectionAttempts: 2, collectionFailureReason: 'pod-absent-after-retry' } }]);
+    });
+
+    test('result marker early exit: retry API failure retains the observed running state and records why', async () => {
+      const uid = '0a1b2c3d-0000-4000-8000-0000000000b3';
+      const launch = terminationLaunch({ spaceId: 'term-marker-api', markerRc: 3, logs: '',
+        event: { kind: 'result-marker-running', jobUid: uid, jobConditionType: '', activeDeadlineSeconds: 14400, podPhase: 'Running',
+          containerReason: null, containerExitCode: null, containerFinishedAt: null },
+        retryPodRead: { status: 1, stdout: '', stderr: 'connection reset' } });
+      const { exits } = await runAndRecord(launch, 'term-marker-api', 'run-parent-term-marker-api', true);
+      expect(exits).toMatchObject([{ podTermination: { podLookup: 'running', exitCode: 'unknown', finishedAt: 'unknown',
+        collectionAttempts: 2, collectionFailureReason: 'pod-read-unavailable-after-retry' } }]);
     });
 
     test('GC right after the verdict: the capture keeps the reason · deadline · uid from the one Job read, not a re-read', async () => {
@@ -4610,6 +4809,21 @@ describe('included cost for subscription/local (BACKLOG C6)', () => {
 
 // 🅣 RFC run-origin(#20457 §A3) — Pod 가 자기 출처를 env 로 갖는다(칸 이름 합의).
 describe('pod run-origin env (RFC run-origin §A3)', () => {
+  test('in-place switch stays off by default and follows explicit host opt-in for a single child', () => {
+    const prior = process.env.ELANOUS_POD_INPLACE_WORKTREE;
+    const makeEnv = () => (podJobManifest({ name: 'si-x', namespace: 'elanous-test', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ env: Array<{ name: string; value?: string }> }> } } } }).spec.template.spec.containers[0]!.env;
+    try {
+      delete process.env.ELANOUS_POD_INPLACE_WORKTREE;
+      expect(makeEnv()).toContainEqual({ name: 'ELANOUS_POD_INPLACE_WORKTREE', value: '0' });
+      process.env.ELANOUS_POD_INPLACE_WORKTREE = '1';
+      const env = makeEnv();
+      expect(env).toContainEqual({ name: 'ELANOUS_POD_INPLACE_WORKTREE', value: '1' });
+      expect(env).toContainEqual({ name: 'ELANOUS_POD_SINGLE_CHILD', value: '1' });
+    } finally {
+      if (prior === undefined) delete process.env.ELANOUS_POD_INPLACE_WORKTREE;
+      else process.env.ELANOUS_POD_INPLACE_WORKTREE = prior;
+    }
+  });
   test('downward API pod/node/namespace, supervisor hostId and image commit are in the child env', () => {
     const job = podJobManifest({ name: 'si-x', namespace: 'elanous-test', image: 'elanous-harness:local', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, hostId: 'host-abc', imageCommit: 'deadbeef' }) as { spec: { template: { spec: { containers: Array<{ env: Array<Record<string, unknown>> }> } } } };
     const env = job.spec.template.spec.containers[0]!.env;
@@ -5295,7 +5509,7 @@ fi
       const human = fakeKubectl(['', '', 'Complete'], '');
       await podSelfImplementSpawn({ kubectl: human.k, credentials: CREDS, env: { ELANOUS_HOST_ID: 'frozen-human-host' }, githubInstallation: () => null, sleep: async () => {} })({ spaceId: 'human-token', feature: 'x' }).done;
       const [secret, job] = human.calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
-      expect(secret.stringData).toEqual({ 'elanous-auth.json': CREDS().elanousAuth, 'codex-auth.json': CREDS().codexAuth, 'gh-token': CREDS().ghToken, feature: 'x', 'llm-fallback-config.json': JSON.stringify({ llm: { fallbackChain: ['codex-rotate', 'grok'], zaiCodingPlan: { overage: 'stop' } } }) });
+      expect(secret.stringData).toEqual({ 'elanous-auth.json': CREDS().elanousAuth, 'codex-auth.json': CREDS().codexAuth, 'gh-token': CREDS().ghToken, feature: 'x', 'llm-fallback-config.json': JSON.stringify({ llm: { fallbackChain: ['codex-rotate', 'grok'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } }) });
       const child = job.spec.template.spec.containers[0];
       // Frozen from HEAD before host refresh: full human Job including script, env, mounts and volume.
       const previousHumanJob = "{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"metadata\":{\"name\":\"si-human-token-2ed574b3\",\"namespace\":\"elanous-test\",\"labels\":{\"elanous.substrate\":\"pod\",\"elanous.job\":\"si-human-token-2ed574b3\",\"elanous.run\":\"RUN_ID_PLACEHOLDER\"}},\"spec\":{\"backoffLimit\":0,\"ttlSecondsAfterFinished\":1800,\"activeDeadlineSeconds\":10800,\"template\":{\"metadata\":{\"labels\":{\"elanous.job\":\"si-human-token-2ed574b3\",\"elanous.run\":\"RUN_ID_PLACEHOLDER\"}},\"spec\":{\"restartPolicy\":\"Never\",\"securityContext\":{\"runAsUser\":1000,\"fsGroup\":1000},\"initContainers\":[{\"name\":\"isolation-gate\",\"image\":\"elanous-harness:local\",\"imagePullPolicy\":\"Never\",\"command\":[\"bash\",\"-c\"],\"args\":[\"ok=0\\nfor i in $(seq 1 60); do\\n  if curl -s -m 1 -o /dev/null http://host.orb.internal:31415/health || curl -s -m 1 -o /dev/null http://core.elanous-prod:8080/; then ok=0; else ok=$((ok+1)); fi\\n  [ \\\"$ok\\\" -ge 3 ] && { echo \\\"[gate] isolation enforced after ${i} probes\\\"; exit 0; }\\n  sleep 0.5\\ndone\\necho \\\"[gate] ISOLATION NOT ENFORCED within 30s\\\"; exit 1\"]}],\"containers\":[{\"name\":\"child\",\"image\":\"elanous-harness:local\",\"imagePullPolicy\":\"Never\",\"resources\":{\"requests\":{\"cpu\":\"1\",\"memory\":\"4Gi\"},\"limits\":{\"memory\":\"16Gi\",\"cpu\":\"4\"}},\"command\":[\"bash\",\"-c\"],\"args\":[\"set -u\\nmkdir -p ~/.elanous ~/.codex && cp /creds/elanous-auth.json ~/.elanous/auth.json && cp /creds/codex-auth.json ~/.codex/auth.json && chmod 600 ~/.elanous/auth.json ~/.codex/auth.json\\nexport ELANOUS_CODEX_QUOTA_POLICY='credits'\\nexport GH_TOKEN=\\\"$(cat /creds/gh-token)\\\"\\ngit config --global user.name \\\"elanous pod child\\\" && git config --global user.email \\\"noreply@anthropic.com\\\" && gh auth setup-git\\ncurl -s -m 3 -o /dev/null http://host.orb.internal:31415/health && { echo \\\"[pod] ISOLATION FAIL\\\"; exit 3; }\\nif [ -e repo ]; then exit 5; fi\\nif [ -d '/host-mirror' ] && git -C '/host-mirror' rev-parse --verify HEAD >/dev/null 2>&1 && git clone -q --shared -- '/host-mirror' repo && git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then\\n  git -C repo remote set-url origin 'https://github.com/ElanvitalAI/elanous' || exit 5\\n  source_via=mirror\\nelse\\n  if [ -e repo ]; then rm -r -- repo || exit 5; fi\\n  git clone -q --depth 50 'https://github.com/ElanvitalAI/elanous' repo || exit 5\\n  source_via=github\\nfi\\nprintf 'ELANOUS_POD_SOURCE_VIA %s\\\\n' \\\"$source_via\\\"\\ncd repo || exit 5\\nif [ \\\"$source_via\\\" = mirror ]; then\\n  remote_head=$(git ls-remote origin HEAD | cut -f1) || exit 5\\n  if ! [[ \\\"$remote_head\\\" =~ ^[0-9a-f]{40}$ ]]; then exit 5; fi\\n  if [ \\\"$remote_head\\\" != \\\"$(git rev-parse HEAD)\\\" ]; then\\n    git fetch --depth 50 origin HEAD && git reset --hard FETCH_HEAD || exit 5\\n  fi\\nfi\\nhead=$(git rev-parse HEAD)\\nprintf 'ELANOUS_POD_SOURCE default %s\\\\n' \\\"$head\\\"\\n(while :; do { mem=$(if [ -r /sys/fs/cgroup/memory.current ]; then cat /sys/fs/cgroup/memory.current; elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then cat /sys/fs/cgroup/memory/memory.usage_in_bytes; else printf -- -; fi); top=$(ps -eo rss=,comm=,args= --sort=-rss | head -5 | awk 'function encode(s) { gsub(/%/, \\\"%25\\\", s); gsub(/:/, \\\"%3A\\\", s); gsub(/ /, \\\"%20\\\", s); gsub(/\\\\t/, \\\"%09\\\", s); return s } { rss=$1; name=$2; sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, \\\"\\\"); n=split($0, a, /[[:space:]]+/); cmd=\\\"<redacted>\\\"; if (name==\\\"sleep\\\" && a[2]==\\\"30\\\") cmd=\\\"sleep 30\\\" (n>2 ? \\\" <redacted>\\\" : \\\"\\\"); else if (name==\\\"bun\\\") { cmd=\\\"bun <redacted>\\\"; if (a[2]==\\\"test\\\") cmd=\\\"bun test <redacted>\\\"; else if (a[2]==\\\"run\\\") cmd=\\\"bun run <redacted>\\\"; else if ((a[2]==\\\"x\\\" || a[2]==\\\"exec\\\") && a[3]==\\\"tsc\\\") cmd=\\\"bun x tsc <redacted>\\\" } else if (name==\\\"tsc\\\") cmd=\\\"tsc <redacted>\\\"; else if (name==\\\"elanous\\\") { cmd=\\\"elanous <redacted>\\\"; if (a[2]==\\\"self\\\") cmd=\\\"elanous self <redacted>\\\"; else if (a[2]==\\\"harness\\\") cmd=\\\"elanous harness <redacted>\\\" } else if (name==\\\"node\\\") cmd=\\\"node <redacted>\\\"; if (name==\\\"sleep\\\" && cmd==\\\"<redacted>\\\") cmd=\\\"sleep <redacted>\\\"; else if (cmd==\\\"<redacted>\\\" && name!=\\\"bash\\\" && name!=\\\"sh\\\") name=\\\"other\\\"; printf \\\" %s:%s:%s\\\", rss, encode(name), encode(substr(cmd,1,120)) }'); printf \\\"ELANOUS_MEM %s %s%s\\\\n\\\" \\\"$(date +%s)\\\" \\\"$mem\\\" \\\"$top\\\"; } || true; sleep 15 || break; done) & mem_sampler_pid=$!\\n(usage_partial_seq=0; while :; do { usage_partial_seq=$((usage_partial_seq+1)); [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq \\\"$usage_partial_seq\\\" || true; } || true; usage_partial_sleep=$(( ${ELANOUS_USAGE_PARTIAL_MINUTES:-5} * 60 )); sleep \\\"$usage_partial_sleep\\\" || break; done) & usage_partial_pid=$!\\ntrap '{ [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial; } || true' TERM\\nexport ELANOUS_HARNESS_ENTRANCE=self-implement; elanous self implement \\\"$(cat /creds/feature)\\\" --json '--open-pr' '--no-supervise' > /tmp/si.out 2>&1; rc=$?\\ncat /tmp/si.out\\n[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo \\\"ELANOUS_USAGE_ROLLUP {\\\"measured\\\":false,\\\"reason\\\":\\\"no rollup script\\\"}\\\"\\nif mkdir -p \\\"$HOME/outbox/pod-logs\\\" && elanous logs --all --include-test --since 12h --limit 20000 --json > \\\"$HOME/outbox/pod-logs/logs.jsonl\\\"; then\\n  logs_size=$(( $(wc -c < \\\"$HOME/outbox/pod-logs/logs.jsonl\\\") ))\\n  if [ \\\"$logs_size\\\" -gt 4500000 ]; then\\n    tail -c 4500000 \\\"$HOME/outbox/pod-logs/logs.jsonl\\\" | tail -n +2 > \\\"$HOME/outbox/pod-logs/logs.jsonl.tail\\\" && mv -f \\\"$HOME/outbox/pod-logs/logs.jsonl.tail\\\" \\\"$HOME/outbox/pod-logs/logs.jsonl\\\"\\n    printf 'ELANOUS_POD_LOGS_TRUNCATED %s %s\\\\n' \\\"$logs_size\\\" \\\"$(( $(wc -c < \\\"$HOME/outbox/pod-logs/logs.jsonl\\\") ))\\\"\\n  fi\\nelse\\n  logs_rc=$?\\n  rm -f \\\"$HOME/outbox/pod-logs/logs.jsonl\\\"\\n  printf 'ELANOUS_POD_LOGS_UNAVAILABLE export-exit-%s\\\\n' \\\"$logs_rc\\\"\\nfi\\nset -o pipefail\\nartifact_bytes=0\\nif [ -d \\\"$HOME/outbox\\\" ]; then\\n  while IFS= read -r -d '' file; do\\n    [ -f \\\"$file\\\" ] && [ ! -L \\\"$file\\\" ] || continue\\n    relative=${file#\\\"$HOME/outbox/\\\"}\\n    size=$(( $(wc -c < \\\"$file\\\") ))\\n    if [ \\\"$size\\\" -gt 5242880 ] || [ $((artifact_bytes + size)) -gt 20971520 ]; then\\n      printf 'ELANOUS_POD_ARTIFACT_SKIPPED %s %s\\\\n' \\\"$relative\\\" \\\"$size\\\"\\n      continue\\n    fi\\n    path_token=$(printf '%s' \\\"$relative\\\" | base64 | tr -d '\\\\n' | tr '+/' '-_' | tr -d '=')\\n    if encoded=$(gzip -c \\\"$file\\\" | base64 | tr -d '\\\\n'); then\\n      artifact_bytes=$((artifact_bytes + size))\\n      total=$(( (${#encoded} + 7999) / 8000 ))\\n      for ((n=1; n<=total; n++)); do\\n        chunk=${encoded:$(( (n-1)*8000 )):8000}\\n        printf 'ELANOUS_POD_ARTIFACT %s %s/%s %s\\\\n' \\\"$path_token\\\" \\\"$n\\\" \\\"$total\\\" \\\"$chunk\\\"\\n      done\\n    else\\n      printf 'ELANOUS_POD_ARTIFACT_SKIPPED %s %s\\\\n' \\\"$relative\\\" \\\"$size\\\"\\n    fi\\n  done < <(find \\\"$HOME/outbox\\\" -type f -print0 | while IFS= read -r -d '' f; do printf '%s\\\\t%s\\\\0' \\\"$(( $(wc -c < \\\"$f\\\") ))\\\" \\\"$f\\\"; done | sort -z -n -k1,1 | while IFS= read -r -d '' row; do printf '%s\\\\0' \\\"${row#*$'\\\\t'}\\\"; done)\\nfi\\nfound=0\\nfor ledger in \\\"${ELANOUS_STATE_DIR:-$HOME/.elanous}\\\"/run-ledger/*.jsonl; do\\n  [ -f \\\"$ledger\\\" ] || continue\\n  found=1\\n  run_id=${ledger##*/}; run_id=${run_id%.jsonl}\\n  if encoded=$(gzip -c \\\"$ledger\\\" | base64 | tr -d '\\\\n'); then\\n    total=$(( (${#encoded} + 7999) / 8000 ))\\n    for ((n=1; n<=total; n++)); do\\n      chunk=${encoded:$(( (n-1)*8000 )):8000}\\n      printf 'ELANOUS_RUN_LEDGER %s %s/%s %s\\\\n' \\\"$run_id\\\" \\\"$n\\\" \\\"$total\\\" \\\"$chunk\\\"\\n    done\\n  else\\n    echo \\\"[pod] ledger transfer failed: $run_id\\\" >&2\\n  fi\\ndone\\nif [ \\\"$found\\\" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi\\nkill \\\"$mem_sampler_pid\\\" 2>/dev/null || true\\n[ -n \\\"${usage_partial_pid:-}\\\" ] && kill \\\"$usage_partial_pid\\\" 2>/dev/null || true\\nwait \\\"$mem_sampler_pid\\\" 2>/dev/null || true\\n[ -n \\\"${usage_partial_pid:-}\\\" ] && wait \\\"$usage_partial_pid\\\" 2>/dev/null || true\\ntail -n 1 /tmp/si.out\\nif [ \\\"${rc:-0}\\\" -ne 0 ]; then\\n  job_name=\\\"${ELANOUS_POD_NAME:-unknown-job}\\\"\\n  salvage_any=0\\n  while IFS= read -r wt; do\\n    [ -n \\\"$wt\\\" ] || continue\\n    case \\\"$wt\\\" in\\n      /*) ;;\\n      *) printf 'ELANOUS_POD_SALVAGE_NONE bad-worktree-path\\\\n'; continue ;;\\n    esac\\n    wt_name=$(basename -- \\\"$wt\\\")\\n    case \\\"$wt_name\\\" in\\n      ''|.*|*/*|*'..'*) printf 'ELANOUS_POD_SALVAGE_NONE bad-worktree-name\\\\n'; continue ;;\\n    esac\\n    branch=\\\"salvage/${job_name}/${wt_name}\\\"\\n    case \\\"$branch\\\" in\\n      salvage/*) ;;\\n      *) printf 'ELANOUS_POD_SALVAGE_NONE refused-prefix\\\\n'; continue ;;\\n    esac\\n    case \\\"$branch\\\" in\\n      main|self-impl|self-impl/*) printf 'ELANOUS_POD_SALVAGE_NONE refused-prefix\\\\n'; continue ;;\\n    esac\\n    (\\n      set +e\\n      cd -- \\\"$wt\\\" || { printf 'ELANOUS_POD_SALVAGE_NONE cd-failed\\\\n'; exit 0; }\\n      git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { printf 'ELANOUS_POD_SALVAGE_NONE not-a-worktree\\\\n'; exit 0; }\\n      dirty=0\\n      git diff --quiet || dirty=1\\n      git diff --cached --quiet || dirty=1\\n      if [ -n \\\"$(git ls-files --others --exclude-standard)\\\" ]; then dirty=1; fi\\n      ahead=0\\n      if git rev-parse --verify HEAD >/dev/null 2>&1; then\\n        if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then\\n          if [ \\\"$(git rev-list --count '@{u}..HEAD' 2>/dev/null || true)\\\" != 0 ]; then ahead=1; fi\\n        else\\n          if git rev-parse --verify origin/HEAD >/dev/null 2>&1; then\\n            base=$(git rev-parse origin/HEAD)\\n          elif git rev-parse --verify origin/main >/dev/null 2>&1; then\\n            base=$(git rev-parse origin/main)\\n          else\\n            base=$(git rev-list --max-parents=0 HEAD 2>/dev/null | head -n 1)\\n          fi\\n          if [ -n \\\"$base\\\" ] && [ \\\"$(git rev-list --count \\\"${base}..HEAD\\\" 2>/dev/null || true)\\\" != 0 ]; then ahead=1; fi\\n        fi\\n      fi\\n      if [ \\\"$dirty\\\" -eq 0 ] && [ \\\"$ahead\\\" -eq 0 ]; then\\n        printf 'ELANOUS_POD_SALVAGE_NONE clean\\\\n'\\n        exit 0\\n      fi\\n      if [ \\\"$dirty\\\" -eq 1 ]; then\\n        git add -A -- . || { printf 'ELANOUS_POD_SALVAGE_NONE add-failed\\\\n'; exit 0; }\\n        git commit -m \\\"salvage: ${job_name} rc=${rc}\\\" || { printf 'ELANOUS_POD_SALVAGE_NONE commit-failed\\\\n'; exit 0; }\\n      fi\\n      git push origin \\\"HEAD:refs/heads/${branch}\\\" || { printf 'ELANOUS_POD_SALVAGE_NONE push-failed\\\\n'; exit 0; }\\n      commit=$(git rev-parse HEAD) || { printf 'ELANOUS_POD_SALVAGE_NONE rev-parse-failed\\\\n'; exit 0; }\\n      printf 'ELANOUS_POD_SALVAGE %s %s\\\\n' \\\"$branch\\\" \\\"$commit\\\"\\n    )\\n    salvage_any=1\\n  done < <(git worktree list --porcelain | awk '/^worktree / { sub(/^worktree /, \\\"\\\"); print }')\\n  if [ \\\"$salvage_any\\\" -eq 0 ]; then printf 'ELANOUS_POD_SALVAGE_NONE no-worktree\\\\n'; fi\\nfi\\nexit $rc\"],\"env\":[{\"name\":\"ELANOUS_RUN_ID\",\"value\":\"RUN_ID_PLACEHOLDER\"},{\"name\":\"ELANOUS_SUBSTRATE\",\"value\":\"pod\"},{\"name\":\"ELANOUS_CONTROL_INBOX_DIR\",\"value\":\"/tmp/elanous-control.inbox\"},{\"name\":\"ELANOUS_POD_NAME\",\"valueFrom\":{\"fieldRef\":{\"fieldPath\":\"metadata.name\"}}},{\"name\":\"ELANOUS_NODE_NAME\",\"valueFrom\":{\"fieldRef\":{\"fieldPath\":\"spec.nodeName\"}}},{\"name\":\"ELANOUS_POD_NAMESPACE\",\"valueFrom\":{\"fieldRef\":{\"fieldPath\":\"metadata.namespace\"}}},{\"name\":\"ELANOUS_SUBSTRATE\",\"value\":\"pod\"},{\"name\":\"ELANOUS_RUN_CONTRACT\",\"value\":\"{\\\"substrate\\\":\\\"pod\\\"}\"}],\"volumeMounts\":[{\"name\":\"creds\",\"mountPath\":\"/creds\",\"readOnly\":true}]}],\"volumes\":[{\"name\":\"creds\",\"secret\":{\"secretName\":\"si-human-token-2ed574b3-creds\",\"defaultMode\":256}}]}}}}";
@@ -5319,6 +5533,9 @@ fi
       expectedHumanJob.spec.template.metadata.annotations = job.spec.template.metadata.annotations;
       const provenanceEnv = child.env.filter((entry: { name: string }) => POD_PROVENANCE_ENV_NAMES.includes(entry.name));
       const frozenEnv = expectedHumanJob.spec.template.spec.containers[0].env as Array<{ name: string }>;
+      // POD-INPLACE-WORKTREE: the explicit disabled default and single-child guard are the only new env fields.
+      frozenEnv.splice(frozenEnv.findIndex((entry) => entry.name === 'ELANOUS_SUBSTRATE') + 1, 0,
+        { name: 'ELANOUS_POD_SINGLE_CHILD', value: '1' }, { name: 'ELANOUS_POD_INPLACE_WORKTREE', value: '0' });
       frozenEnv.splice(frozenEnv.findIndex((entry) => entry.name === 'ELANOUS_HOST_ID') + 1, 0, ...provenanceEnv);
       // SI-TASK-ADMIT-RIGHTSIZE: the default request is 3Gi; the 16Gi limit stays byte-identical.
       expectedHumanJob.spec.template.spec.containers[0].resources.requests.memory = '3Gi';
@@ -5363,7 +5580,21 @@ fi
         .replace('wait "$si_pid"; rc=$?\ncat /tmp/si.out\n', `wait "$si_pid"; rc=$?; ${marker('run', 'end')}\ncat /tmp/si.out\n`);
       frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!
         .replace(`${marker('run', 'end')}\ncat /tmp/si.out\n`, `${marker('run', 'end')}; ${POD_RESULT_FLATTEN}\ncat /tmp/si.out\n`);
-      expect(JSON.stringify(job)).toBe(JSON.stringify(expectedHumanJob));
+      // Deadline watchdog has its own executable short-deadline test above. This frozen comparison
+      // checks that host-token refresh did not change the remaining human Job bytes.
+      const withoutDeadlineWatchdog = (script: string): string => script
+        .replace(`${podDeadlineWatchdogScript({ deadlineSeconds: 10_800, job: job.metadata.name, runId: actualRunId })}\n`, '')
+        .replace("printf 'setup\\n' > /tmp/si.stage\n", '')
+        .replace("printf 'run\\n' > /tmp/si.stage\n", '')
+        .replace("; printf '%s\\n' \"$si_pid\" > /tmp/si.pid", '')
+        .replace('; touch /tmp/si.finished', '')
+        .replace('; rm -f /tmp/si.pid', '')
+        .replace(`; ${POD_DEADLINE_AFTER_WAIT}`, '')
+        .replace('if [ "$rc" -ne 0 ] && [ -f /tmp/si.deadline-result ]; then rc=124; fi\n', '')
+        .replace('touch /tmp/si.finished; kill "$si_deadline_watch_pid" 2>/dev/null || true; [ -f /tmp/si.deadline-marker ] && cat /tmp/si.deadline-marker || true\n', '');
+      const withoutWatchdogJob = structuredClone(job);
+      withoutWatchdogJob.spec.template.spec.containers[0].args[0] = withoutDeadlineWatchdog(child.args[0]);
+      expect(JSON.stringify(withoutWatchdogJob)).toBe(JSON.stringify(expectedHumanJob));
       expect(child.args[0]).toContain('export GH_TOKEN="$(cat /creds/gh-token)"');
       expect(human.calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toHaveLength(0);
     } finally {
@@ -5566,7 +5797,7 @@ describe('pod salvage', () => {
       execFileSync('git', ['-C', repo, 'commit', '-qm', 'base']);
       execFileSync('git', ['init', '--bare', '-q', bare]);
       execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', bare]);
-      execFileSync('git', ['-C', repo, 'push', '-q', 'origin', 'main']);
+      execFileSync('git', ['-C', bare, 'fetch', '-q', repo, 'main:main']);
       execFileSync('git', ['-C', repo, 'worktree', 'add', '-q', '-b', 'child', worktree]);
       writeFileSync(join(worktree, 'kept.txt'), 'preserved\n');
       writeFileSync(join(worktree, 'large.bin'), randomBytes(6 * 1024 * 1024));

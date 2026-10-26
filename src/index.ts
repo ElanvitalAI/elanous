@@ -4736,6 +4736,7 @@ selfCmd
   .option('--base <ref>', '커밋됐지만 PR 없는 변경의 비교 기준(ref...HEAD)')
   .option('--pr <number>', '열린 PR 번호에서 gh pr view files로 변경 파일을 읽는다')
   .option('--shards [number]', '메모리 예산에 맞춰 시험을 별도 프로세스로 분할한다 (기본 2)')
+  .option('--shard-concurrency <number>', '동시에 실행할 조각 묶음 수 (1–4, 기본 3)')
   .option('--fixed-shard-distribution', '--shards N 과 함께만: RSS 사전 측정 없이 정렬된 파일을 N 조각에 라운드로빈 고정 배정한다(opt-in · 메모리 보증 아님 · 조각 타임아웃/OOM = unmeasured)')
   .option('--include-importers', '변경 모듈을 가져오는 importer 시험도 실행한다 (기본 caller 한도 밖까지)')
   .option('--remote [host]', 'GATE-REMOTE — 같은 커밋을 원격 호스트(기본 config gateRemote.host=node-b)에서 돌리고 결과만 가져온다(깨끗한 트리 · --pr 은 로컬)')
@@ -4745,9 +4746,10 @@ selfCmd
   .option('--shard-id <id>', 'GATE-REMOTE-SHARD-PLAN — 조각 id(예: <orchestration-id>/shard-2). 원격 명령줄에 그대로 실린다')
   .option('--shard-position <n>', 'GATE-REMOTE-SHARD-PLAN — 조각 위치(1부터 정수). 원격 명령줄에 그대로 실린다')
   .option('--shard-plan <path>', 'GATE-REMOTE-SHARD-PLAN — 조각 계획 파일 경로. 주면 원격 명령줄에 --shard-plan 으로 실린다')
-  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; fixedShardDistribution?: boolean; includeImporters?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string; orchestrationId?: string; shardId?: string; shardPosition?: string; shardPlan?: string }) => {
+  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; shardConcurrency?: string; fixedShardDistribution?: boolean; includeImporters?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string; orchestrationId?: string; shardId?: string; shardPosition?: string; shardPlan?: string }) => {
     if (!opts.changed && opts.shards === undefined) { ui.error('self gate requires --changed or --shards'); process.exitCode = 2; return; }
     if (opts.fixedShardDistribution && opts.shards === undefined) { ui.error('self gate: --fixed-shard-distribution requires --shards <n>'); process.exitCode = 2; return; }
+    if (opts.shardConcurrency !== undefined && (!/^[1-4]$/.test(opts.shardConcurrency))) { ui.error('self gate: --shard-concurrency must be 1–4'); process.exitCode = 2; return; }
     if (opts.artifactDir !== undefined && !opts.artifactDir.trim()) { ui.error('self gate: --artifact-dir needs a non-empty directory'); process.exitCode = 2; return; }
     const shardIdentityFlags = [opts.orchestrationId, opts.shardId, opts.shardPosition].filter((value) => value !== undefined).length;
     if (shardIdentityFlags !== 0 && shardIdentityFlags !== 3) { ui.error('self gate: --orchestration-id, --shard-id and --shard-position are used as a set'); process.exitCode = 2; return; }
@@ -4763,11 +4765,11 @@ selfCmd
     const shards = opts.shards === undefined ? undefined : opts.shards === true ? 2 : Number(opts.shards);
     let ranLocal = false;
     let remoteArtifacts: { dir: string; fetch?: { ok: true; summaryPath: string; junitFiles: string[]; remoteDirKept: boolean } | { ok: false; reason: string } } | { unsupported: true } | undefined;
-    const runLocal = () => {
+    const runLocal = async () => {
       ranLocal = true;
       try {
-        const { runSelfGateCli } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
-        const result = runSelfGateCli(process.cwd(), { base: opts.base, pr: opts.pr, shards, ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), includeImporterTests: !!opts.includeImporters, ...(opts.artifactDir !== undefined ? { artifactDir: opts.artifactDir } : {}) });
+        const { runSelfGateCliAsync } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
+        const result = await runSelfGateCliAsync(process.cwd(), { base: opts.base, pr: opts.pr, shards, ...(opts.shardConcurrency !== undefined ? { shardConcurrency: Number(opts.shardConcurrency) } : {}), ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), includeImporterTests: !!opts.includeImporters, ...(opts.artifactDir !== undefined ? { artifactDir: opts.artifactDir } : {}) });
         console.log(result.lines.join('\n'));
         return result.exitCode;
       } catch (error) {
@@ -4798,7 +4800,7 @@ selfCmd
       // origin/main is pinned to this machine's origin/main on the host; any other base is passed as its resolved sha.
       const remoteArgv = (sha: (ref: string) => string) => {
         const argv = remoteSelfGateArgv({
-          changed: opts.changed, base: opts.base, shards, fixedShardDistribution: opts.fixedShardDistribution,
+          changed: opts.changed, base: opts.base, shards, shardConcurrency: opts.shardConcurrency === undefined ? undefined : Number(opts.shardConcurrency), fixedShardDistribution: opts.fixedShardDistribution,
           includeImporters: opts.includeImporters,
           // A measured commit without this option rejects it (exit ≠ 0) — read as not passed, never as a silent measured run.
           artifactDir: remoteArtifacts && 'dir' in remoteArtifacts ? remoteArtifacts.dir : undefined,
@@ -4837,7 +4839,7 @@ selfCmd
       const reason = error instanceof Error ? error.message : String(error);
       if (opts.local) {
         ui.error(`self gate dispatch failed: ${reason}`);
-        process.exitCode = runLocal();
+        process.exitCode = await runLocal();
       } else {
         ui.error(opts.remote !== undefined
           ? `self gate remote unmeasured — ${reason.replace(/\s+/g, ' ').trim()}`
@@ -12230,11 +12232,20 @@ const realContinueSessionLookup: ContinueSessionLookup = {
   activeSessionId: () => getActiveSessionId(),
 };
 
+const realNextTuiContinueSessionLookup: ContinueSessionLookup = {
+  projectIdForCwd: (cwd) => suggestProjectForFolder(cwd)?.id ?? null,
+  latestForProject: (projectId) => listSessions({ limit: 1, projectId, source: 'tui' })[0]?.id ?? null,
+  latestGlobal: () => listSessions({ limit: 1, source: 'tui' })[0]?.id ?? null,
+  activeSessionId: () => {
+    const id = getActiveSessionId();
+    return id && (loadSession(id) as unknown as { source?: string } | null)?.source === 'tui' ? id : null;
+  },
+};
+
 /**
  * TUI-CONTINUE-SESSION (0.2.35) — `--continue`(id 없는 `--resume`)의 «최근 세션» 을 cwd 기준으로
  * 먼저 좁힌다: cwd 가 속한 프로젝트(`primaryFolder` 또는 그 하위 디렉토리)의 최신 세션 id.
- * 매칭 프로젝트가 없거나 그 프로젝트에 세션이 하나도 없으면 전역 최신으로 폴백한다 —
- * 프로젝트와 무관한 디렉토리·화면의 이어가기 동작은 종전 그대로다.
+ * 프로젝트가 없거나 그 프로젝트에 세션이 없으면 전역 최신으로 폴백한다.
  */
 export function latestSessionIdForContinue(
   cwd: string = process.cwd(),
@@ -12243,6 +12254,26 @@ export function latestSessionIdForContinue(
   const projectId = lookup.projectIdForCwd(cwd);
   const localId = projectId ? lookup.latestForProject(projectId) : null;
   return localId ?? lookup.latestGlobal();
+}
+
+/** Next TUI only: resume a project TUI session, never an automation or cross-project session. */
+export function latestNextTuiSessionIdForContinue(
+  cwd: string = process.cwd(),
+  lookup: ContinueSessionLookup = realNextTuiContinueSessionLookup,
+): string | null {
+  const projectId = lookup.projectIdForCwd(cwd);
+  return projectId ? lookup.latestForProject(projectId) : lookup.latestGlobal();
+}
+
+/** Keep the source-filtered session selection scoped to the Next TUI entry. */
+export function latestRootSessionIdForContinue(
+  tuiEntry: 'classic' | 'next',
+  cwd: string = process.cwd(),
+  lookup?: ContinueSessionLookup,
+): string | null {
+  return tuiEntry === 'next'
+    ? latestNextTuiSessionIdForContinue(cwd, lookup ?? realNextTuiContinueSessionLookup)
+    : latestSessionIdForContinue(cwd, lookup ?? realContinueSessionLookup);
 }
 
 /**
@@ -12501,17 +12532,16 @@ async function main(): Promise<void> {
   // 우선순위: `--resume <id>` > `--continue`·id 없는 `--resume`(최신) > (폐기 예정) ELANOUS_RESUME_SESSION.
   //   ⛔ 명시 인자가 있으면 환경변수가 이기지 않는다(TUI-H8 r1 must-fix).
   const { resolveLatestSessionId, resolveRootResumeSessionId } = await import('./session/session-start.js');
+  const continueLookup = tuiEntry === 'next' ? realNextTuiContinueSessionLookup : realContinueSessionLookup;
   const rootResume = resolveRootResumeSessionId({
     ...(resumeFromFlag !== undefined ? { flagId: resumeFromFlag } : {}),
     continueLatest,
     // 명시 인자가 있으면 env 를 «읽지도» 않는다(폐기 경고가 명시 이어하기에 섞이지 않게).
     readEnvId: () => readDeprecatedEnvForResume('ELANOUS_RESUME_SESSION').value ?? null,
     latest: () => resolveLatestSessionId({
-      // TUI-CONTINUE-SESSION (0.2.35) — 활성 표지가 «다른 프로젝트» 세션이면 버리고 cwd 기준으로 고른다.
-      activeSessionId: () => activeSessionIdForContinue(),
-      // TUI-CONTINUE-SESSION (0.2.35) — «지금 이 디렉토리» 의 프로젝트 최근 세션을 먼저 본다.
-      //   그 프로젝트에 세션이 없으면 종전대로 전역 최신으로 폴백(다른 화면 동작 보존).
-      latestSessionId: () => latestSessionIdForContinue(),
+      // Next TUI는 사람 TUI 세션만 이어가고, classic dashboard의 기존 선택은 보존한다.
+      activeSessionId: () => activeSessionIdForContinue(process.cwd(), continueLookup),
+      latestSessionId: () => latestRootSessionIdForContinue(tuiEntry),
       // TUI-H8-FOLLOW ① — 활성 표지가 사라진 세션이면 최신 세션으로(#28509 리뷰 should-fix).
       sessionExists: (id) => loadSession(id) !== null,
     }),
@@ -12714,7 +12744,7 @@ async function main(): Promise<void> {
       return;
     }
     const { showNextTui } = await import('./tui/entry.js');
-    await showNextTui({ resumeSessionId });
+    await showNextTui({ resumeSessionId, sidetabMode: getUserConfig().tui?.sidetab ?? 'collapsed' });
     bootTimer.phase('show-next');
     bootTimer.done();
   } else {

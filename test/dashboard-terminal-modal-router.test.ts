@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
-import { createTerminalModalRouter } from '../src/dashboard/input/terminal-modal-router.js';
+import { createTerminalModalRouter, terminalModalRouter } from '../src/terminal/terminal-modal-router.js';
+import { terminalModalRouter as dashboardTerminalModalRouter } from '../src/dashboard/input/terminal-modal-router.js';
 import type { InteractiveTerminalModalHandle } from '../src/interactive-terminal-modal.js';
 import type { KeyEvent } from '../src/display/types.js';
 
@@ -43,6 +44,10 @@ function fakeModal(): InteractiveTerminalModalHandle & {
     get _lastKey() { return lastKey; },
   };
 }
+
+test('dashboard compatibility export resolves the shared terminal modal router', () => {
+  expect(dashboardTerminalModalRouter).toBe(terminalModalRouter);
+});
 
 describe('terminal modal router', () => {
   test('passthrough when no modal', () => {

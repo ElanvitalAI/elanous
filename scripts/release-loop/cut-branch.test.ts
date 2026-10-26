@@ -22,6 +22,11 @@ function fixture() {
   git(root, 'init', '-q', '-b', 'main', repo);
   git(repo, 'config', 'user.name', 'Fixture');
   git(repo, 'config', 'user.email', 'fixture@example.invalid');
+  // Test-fixture isolation: a pod may install a global core.hooksPath pre-push guard that
+  // refuses pushes to refs/heads/main and release/* branches. Point the fixture repo (and
+  // its worktrees, which share this config) at a hooks directory that never exists so the
+  // bare-remote pushes below run hookless. Scoped to this temp repo only.
+  git(repo, 'config', 'core.hooksPath', join(root, 'no-hooks'));
   git(repo, 'remote', 'add', 'origin', remote);
   const commit = (name: string, content: string) => {
     writeFileSync(join(repo, name), content);
@@ -224,3 +229,77 @@ test('cherry-pick conflict names the file, stops and leaves no branch', () => {
   expect(f.git(f.repo, 'status', '--porcelain')).toBe('');
   expect(readFileSync(join(f.repo, 'package.json'), 'utf8')).toContain('0.2.4');
 });
+
+/** RELEASE-APPEND-BASE-AUTO fixture: the cut commit (9.9.9 bump) lives only on the release branch — its parent is the main cut. */
+function appendFixture() {
+  const f = fixture();
+  f.git(f.repo, 'checkout', '-q', '--detach');
+  writeFileSync(join(f.repo, 'package.json'), '{"version":"9.9.9"}\n');
+  f.git(f.repo, 'add', 'package.json');
+  f.git(f.repo, 'commit', '-q', '-m', 'bump 9.9.9');
+  const cut = f.git(f.repo, 'rev-parse', 'HEAD');
+  const mainCut = f.pick;
+  return { f, cut, mainCut };
+}
+
+test('RELEASE-APPEND-BASE-AUTO: --append resolves the main cut from the release tip first parent when --base is omitted', () => {
+  const { f, cut, mainCut } = appendFixture();
+  f.git(f.repo, 'push', '-q', 'origin', `${cut}:refs/heads/release/9.9.9`);
+  f.git(f.repo, 'checkout', '-q', 'main');
+  const added = f.commit('repair-three.txt', 'fourth\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  const lines: string[] = [];
+  const appended = cutReleaseBranch({ version: '9.9.9', pick: [added], append: true, repoRoot: f.repo, log: (line) => lines.push(line) });
+  expect(appended.commit).toMatch(/^[0-9a-f]{40}$/);
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(appended.commit!);
+  expect(f.git(f.repo, 'merge-base', '--is-ancestor', cut, appended.commit!)).toBe('');
+  expect(f.git(f.repo, 'merge-base', '--is-ancestor', mainCut, appended.commit!)).toBe('');
+  expect(f.git(f.repo, 'show', `${appended.commit}:repair-three.txt`)).toBe('fourth');
+  expect(lines[0]).toContain(`· base ${mainCut}`);
+  expect(f.git(f.repo, 'worktree', 'list', '--porcelain')).not.toContain('release-cut-branch-');
+}, 120_000);
+
+test('RELEASE-APPEND-BASE-AUTO: a cut commit as --base auto-corrects to its first parent with a 그 부모 notice', () => {
+  const { f, cut, mainCut } = appendFixture();
+  f.git(f.repo, 'push', '-q', 'origin', `${cut}:refs/heads/release/9.9.9`);
+  f.git(f.repo, 'checkout', '-q', 'main');
+  const added = f.commit('repair-three.txt', 'fourth\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  const lines: string[] = [];
+  const appended = cutReleaseBranch({ version: '9.9.9', base: cut, pick: [added], append: true, repoRoot: f.repo, log: (line) => lines.push(line) });
+  expect(appended.commit).toMatch(/^[0-9a-f]{40}$/);
+  expect(lines[0]).toContain(`그 부모 ${mainCut} 를 쓰라`);
+  expect(lines[1]).toContain(`· base ${mainCut}`);
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(appended.commit!);
+}, 120_000);
+
+test('RELEASE-APPEND-BASE-AUTO: --append with no ledger and no main-ancestor parent keeps the verbatim refusal', () => {
+  const { f, cut } = appendFixture();
+  f.git(f.repo, 'commit', '-q', '--allow-empty', '-m', 'extra on branch');
+  const tip = f.git(f.repo, 'rev-parse', 'HEAD');
+  f.git(f.repo, 'push', '-q', 'origin', `${tip}:refs/heads/release/9.9.9`);
+  f.git(f.repo, 'checkout', '-q', 'main');
+  expect(() => cutReleaseBranch({ version: '9.9.9', pick: [f.pick], append: true, repoRoot: f.repo, log: () => {} }))
+    .toThrow(`base ${cut} is not an ancestor of origin/main`);
+}, 120_000);
+
+test('RELEASE-APPEND-BASE-AUTO: --append uses the run ledger version-release record when --base is omitted', () => {
+  const { f, cut, mainCut } = appendFixture();
+  f.git(f.repo, 'commit', '-q', '--allow-empty', '-m', 'extra on branch');
+  const tip = f.git(f.repo, 'rev-parse', 'HEAD');
+  f.git(f.repo, 'push', '-q', 'origin', `${tip}:refs/heads/release/9.9.9`);
+  f.git(f.repo, 'checkout', '-q', 'main');
+  const added = f.commit('repair-four.txt', 'fifth');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  const lines: string[] = [];
+  const appended = cutReleaseBranch({
+    version: '9.9.9', pick: [added], append: true, repoRoot: f.repo, log: (line) => lines.push(line),
+    ledger: () => ({ commit: cut, branch: 'release/9.9.9' }),
+  });
+  expect(appended.commit).toMatch(/^[0-9a-f]{40}$/);
+  expect(lines[0]).toContain(`· base ${mainCut}`);
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(appended.commit!);
+  expect(f.git(f.repo, 'merge-base', '--is-ancestor', mainCut, appended.commit!)).toBe('');
+  expect(f.git(f.repo, 'show', `${appended.commit}:repair-four.txt`)).toBe('fifth');
+  expect(f.git(f.repo, 'worktree', 'list', '--porcelain')).not.toContain('release-cut-branch-');
+}, 120_000);

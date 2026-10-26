@@ -20,6 +20,7 @@
 // caching went GA without a version bump.
 
 import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import { assertNoTopLevelToolSchemaCombinators } from '../llm-tool-schema.js';
 import {
   cacheControlFor,
   type CacheControl,
@@ -98,6 +99,7 @@ export function toAnthropicToolsCached(
   opts: CacheOpts,
 ): AnthropicToolBlock[] | undefined {
   if (!tools || tools.length === 0) return undefined;
+  assertNoTopLevelToolSchemaCombinators(tools);
   // ⭐ Anthropic 은 tool name UNIQUE 를 강제(400 "Tool names must be unique.")한다.
   //   OpenAI/codex 는 중복을 조용히 관대 처리 → 하니스가 codex 위주로 개발되며 중복 tool spec
   //   (예: goal-loop 이 카탈로그에 이미 있는 spec 을 append)이 claude 에서만 400 으로 터졌다.

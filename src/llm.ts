@@ -62,7 +62,7 @@ import { BUILTIN_CATALOG, reasoningEffortCeiling as reasoningEffortCeilingOf } f
 import { inferProviderFromModel as registryInferProviderFromModel } from './registry/normalize.js';
 import { closestMatches } from './tool-name-suggest.js';
 import { createProviderToolNameMap } from './llm-tool-name.js';
-import { isOpenRouterGrokModel, sanitizeToolSchemaForGrok } from './llm-tool-schema.js';
+import { assertNoTopLevelToolSchemaCombinators, isOpenRouterGrokModel, sanitizeToolSchemaForGrok } from './llm-tool-schema.js';
 import { undoTurnRuntime } from './tool-runtime/undo-turn-runtime.js';
 import { listSnapshots } from './undo-turn/index.js';
 // Zero-dep spec module (no tool-runtime registry) — safe for this hot path.
@@ -403,6 +403,9 @@ export type ToolChoice = 'auto' | 'required' | 'none' | { name: string };
 
 export interface LLMOpts {
   model?: string;
+  /** Explicit research surface verdict from the turn router. Relaxes early
+   *  exploration guards while retaining a finite tool-loop hard stop. */
+  researchTurn?: boolean;
   /** Reports the provider and model actually attempted, including fallbacks. */
   onResolvedProvider?(provider: string, model: string): void;
   temperature?: number;
@@ -4471,6 +4474,7 @@ function explainAndLogFallbackCandidates(
 
 /** 스트림 중 끊김 재시도 상한 — codex `DEFAULT_STREAM_MAX_RETRIES`(5) 와 같은 값. */
 const STREAM_DISCONNECT_MAX_RETRIES = 5;
+const STREAM_IDLE_TIMEOUT_MAX_RETRIES = 1;
 let streamDisconnectRetryDelayMs: (attempt: number) => number = backoffMs;
 
 /** @internal 시험 seam — 재시도 대기(기본 `backoffMs`)를 바꾼다. `undefined` 면 원복. */
@@ -4904,6 +4908,7 @@ export async function streamLLM(
     );
     activeProvider = finalized.provider;
     const activeModel = finalized.model;
+    if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools);
     opts.onResolvedProvider?.(activeProvider.name, activeModel);
     debug.log('llm.router', 'streamLLM', {
       provider: activeProvider.name,
@@ -5118,6 +5123,8 @@ export function resolveDefaultProvider(model?: string): LLMProvider {
 export interface StreamWithToolsHandlers {
   /** Streaming text delta — invoked for every text chunk across all turns. */
   onText(delta: string, fullAcrossTurns: string): void;
+  /** Optional status line for hosts that surface transient stream recovery. */
+  onStatus?(line: string): void;
   /** Dispatch a tool call. Returning undefined/null throws in the loop so
    *  callers should always return a JSON-serializable value (can be an
    *  error object — the model will see it as a tool_result either way).
@@ -7382,6 +7389,16 @@ function resultText(result: unknown): string {
   return '';
 }
 
+/** skill_exec returns structured host metadata, but its model-facing tool result is the answer body. */
+function toolResultContentForCall(toolName: string, result: unknown): string {
+  if (toolName === 'skill_exec' && result && typeof result === 'object'
+    && typeof (result as { output?: unknown }).output === 'string') {
+    if ((result as { ok?: unknown }).ok === false) return JSON.stringify(result);
+    return (result as { output: string }).output;
+  }
+  return typeof result === 'string' ? result : JSON.stringify(result);
+}
+
 function detectExecutionFailure(result: unknown): boolean {
   if (!result || typeof result !== 'object') return false;
   const typed = result as Record<string, unknown>;
@@ -8409,7 +8426,9 @@ export async function streamLLMWithTools(
   const familyDefaultMaxTurns = resolved === 0 ? Number.POSITIVE_INFINITY : (resolved || baselineForFamily);
   // `let` (not const) — the conditional budget-grant hook (opts.budgetGrant)
   // may extend this mid-loop when a designated multi-round tool is called.
-  let maxTurns = opts.maxTurns ?? familyDefaultMaxTurns;
+  let maxTurns = opts.maxTurns ?? (opts.researchTurn
+    ? Math.min(32, Math.max(16, familyDefaultMaxTurns))
+    : familyDefaultMaxTurns);
   const budgetGrant = opts.budgetGrant;
   // ⭐ Hydration-capable tool list (F2 gap④ · 2026-07-26). The provider tool
   // array used to be `opts.tools`, FIXED for the whole loop. That made
@@ -8428,7 +8447,9 @@ export async function streamLLMWithTools(
   } catch { /* config unreadable — default 비-면제·hot-path 는 config 손상에 안 막힌다 */ }
   const inspectBudgetThreshold = getInspectBudgetThreshold(history, modelFamily, codexInspectExemptFlag);
   const inspectFollowupMode = getInspectFollowupMode(history);
-  const explorationThresholdForTurn = getExplorationThreshold(history, maxTurns, modelFamily);
+  const explorationThresholdForTurn = opts.researchTurn
+    ? Number.POSITIVE_INFINITY
+    : getExplorationThreshold(history, maxTurns, modelFamily);
   const maxTurnsUnbounded = maxTurns === Infinity;
   const familyDefaultMaxTurnsUnbounded = familyDefaultMaxTurns === Infinity;
   const explorationUnbounded = !Number.isFinite(explorationThresholdForTurn);
@@ -8443,6 +8464,7 @@ export async function streamLLMWithTools(
       inspectBudgetThreshold,
       inspectFollowupMode,
       explorationThresholdForTurn,
+      researchTurn: opts.researchTurn === true,
       // ★ Infinity 는 JSON 직렬화 시 null 이 되므로 boolean 으로도 남긴다(관측·제1원칙).
       //   true = 프론티어 면제로 read/search 스트릭 컷 없음(대표 방침 2026-07-17).
       explorationUnbounded,
@@ -8831,7 +8853,7 @@ export async function streamLLMWithTools(
     let turnOpts = buildTurnOpts();
     // reasoning-heavy family(codex/claude/gemini/grok/local)는 침묵 추론 구간이 길어 idle watchdog 를
     // family-aware 로 상향(2026-07-19 goal-exec → 아크4 전-family). fast/mini(gpt·other)만 45s 유지.
-    const streamIdleTimeoutMs = usesLongReasoningIdle(modelFamily, activeProvider.name) ? STREAM_IDLE_TIMEOUT_MS_REASONING : STREAM_IDLE_TIMEOUT_MS;
+    const streamIdleTimeoutMs = opts.streamIdleTimeoutMs ?? (usesLongReasoningIdle(modelFamily, activeProvider.name) ? STREAM_IDLE_TIMEOUT_MS_REASONING : STREAM_IDLE_TIMEOUT_MS);
     // ⚠️ hang 진단(2026-07-17) — codex SSE 스트림이 완료 신호 없이 안 끝나는 케이스 확정용.
     // consume-start 후 consume-end 가 없으면 = for-await(streamChat SSE) hang. lastEvType 로 어느
     // 이벤트 뒤에서 멈추는지(usage/text/tool_call) 특정. 무장할 상한도 남겨 실험 런을 구별한다.
@@ -8847,6 +8869,7 @@ export async function streamLLMWithTools(
     // ⭐ TUI-STREAM-RETRY(2026-10-14 실측) — 200 OK 로 흐르던 스트림이 소켓 끊김으로 죽으면 같은 공급자로
     //   다시 건다(codex `stream_max_retries` 동형). 이 턴에서 받은 tool_call·image 가 있으면 재시도하지 않는다.
     let streamDisconnectRetries = 0;
+    let streamIdleTimeoutRetries = 0;
     let streamEmittedImage = false;
     // 끊긴 조각을 이력(turnText·fullText)에서 «조용히» 되감는다 — 화면엔 지우라고 알리지 않는다
     //   (TUI 의 빈 델타는 «커밋»이다). 이미 보인 글과 겹치는 재시도 본문은 `retryDisplay` 가 막는다.
@@ -8878,6 +8901,9 @@ export async function streamLLMWithTools(
     while (true) {
       let idleTimer: ReturnType<typeof setTimeout> | undefined;
       let step: { idle: true } | { idle: false; r: IteratorResult<LLMStreamEvent, void> };
+      // Validate before entering the provider stream's catch/fallback boundary.
+      // An incompatible request is deterministic and must not be retried elsewhere.
+      if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(turnOpts.tools);
       try {
         if (!streamIter) {
           const finalized = finalizeStreamingProviderModel(activeProvider, activeModel);
@@ -8918,8 +8944,46 @@ export async function streamLLMWithTools(
           streamIter.next().then((r) => ({ idle: false as const, r })),
           new Promise<{ idle: true }>((res) => { idleTimer = setTimeout(() => res({ idle: true }), streamIdleTimeoutMs); }),
         ]);
+        if (step.idle) {
+          const error = new Error(`stream idle timeout after ${streamIdleTimeoutMs}ms`);
+          error.name = 'StreamIdleTimeoutError';
+          Object.assign(error, { code: 'ETIMEDOUT' });
+          throw error;
+        }
       } catch (err) {
         if (idleTimer) clearTimeout(idleTimer);
+        if (err instanceof Error && err.name === 'StreamIdleTimeoutError') {
+          debug.log('llm.stream', 'idle-timeout', {
+            turn, evCount, lastEvType, idleMs: streamIdleTimeoutMs,
+            textChars: turnText.length, pendingCalls: pendingCalls.length,
+          }, { level: 'warn' });
+          // A provider async iterator can queue return() behind the pending next().
+          // Detach cleanup so it cannot keep the user turn busy forever.
+          const timedOutIterator = streamIter;
+          if (timedOutIterator?.return) {
+            try { void Promise.resolve(timedOutIterator.return(undefined)).catch(() => {}); } catch { /* fail-soft cleanup */ }
+          }
+          if (streamIdleTimeoutRetries < STREAM_IDLE_TIMEOUT_MAX_RETRIES
+            && pendingCalls.length === 0 && !streamEmittedImage && !opts.signal?.aborted) {
+            streamIdleTimeoutRetries++;
+            debug.log('llm.retry', 'idle-timeout-retry', {
+              provider: activeProvider.name, model: activeModel, turn,
+              attempt: streamIdleTimeoutRetries, maxRetries: STREAM_IDLE_TIMEOUT_MAX_RETRIES,
+              delayMs: 0, statusLine: '스트림 무응답 · 재시도',
+            }, { level: 'warn' });
+            handlers.onStatus?.(`스트림 무응답 · 재시도 ${streamIdleTimeoutRetries}/${STREAM_IDLE_TIMEOUT_MAX_RETRIES}`);
+            rewindDisconnectedStream();
+            streamIter = undefined;
+            continue;
+          }
+          // Once a tool call/image escaped, keep the old behavior: finish this
+          // provider turn and never replay or switch providers around side effects.
+          if (pendingCalls.length > 0 || streamEmittedImage || opts.signal?.aborted) break;
+          if (opts.provider) break; // pinned route preserves the prior partial-text result
+          // The retry's text was already sent to the view; drop it from the
+          // logical result before allowing the normal provider fallback path.
+          if (pendingCalls.length === 0 && !streamEmittedImage) rewindDisconnectedStream();
+        }
         if (err instanceof OverloadFailoverError && !opts.provider) {
           const switched = activeProvider.name === 'openai-codex'
             ? firstAvailableFallbackProvider(attemptedProviders, opts)
@@ -8934,6 +8998,7 @@ export async function streamLLMWithTools(
               status: err.status,
               kind: err.kind,
             }, { level: 'warn' });
+            handlers.onStatus?.(`⚠ 공급자 전환: ${activeProvider.name} → ${switched.name} (${err.kind ?? err.name ?? 'unknown'})`);
             const finalized = finalizeStreamingProviderModel(switched, switched.defaultModel);
             activeProvider = finalized.provider;
             activeModel = finalized.model;
@@ -8944,7 +9009,8 @@ export async function streamLLMWithTools(
             continue;
           }
         }
-        if (evCount > 0 && isStreamDisconnectRetryable(err, pendingCalls.length, streamEmittedImage) && !opts.signal?.aborted) {
+        if (!(err instanceof Error && err.name === 'StreamIdleTimeoutError')
+          && evCount > 0 && isStreamDisconnectRetryable(err, pendingCalls.length, streamEmittedImage) && !opts.signal?.aborted) {
           const retryData = {
             provider: activeProvider.name,
             model: activeModel,
@@ -9013,6 +9079,7 @@ export async function streamLLMWithTools(
           tools: activeTools.map((tool) => tool.name),
           ...(opts.model ? { modelOverrideDropped: opts.model } : {}),
         }, { level: 'warn' });
+        handlers.onStatus?.(`⚠ 공급자 전환: ${activeProvider.name} → ${fallback.name} (${verdict.category})`);
         const finalized = finalizeStreamingProviderModel(fallback, fallback.defaultModel);
         activeProvider = finalized.provider;
         activeModel = finalized.model;
@@ -9025,9 +9092,9 @@ export async function streamLLMWithTools(
       }
       if (idleTimer) clearTimeout(idleTimer);
       if (step.idle) {
-        debug.log('llm.stream', 'idle-timeout', { turn, evCount, lastEvType, idleMs: streamIdleTimeoutMs, textChars: turnText.length, pendingCalls: pendingCalls.length }, { level: 'warn' });
-        try { await streamIter.return?.(undefined); } catch { /* fail-soft — 스트림 정리 실패 무시 */ }
-        break;
+        // The race's idle branch is converted to StreamIdleTimeoutError above.
+        // Keep a fail-closed guard for future changes to this loop.
+        throw new Error('stream idle timeout branch escaped recovery');
       }
       if (step.r.done) break;
       const ev = step.r.value;
@@ -10289,7 +10356,8 @@ export async function streamLLMWithTools(
           //    rejection without colliding with the auto-narrow path)
           //  - call is in SEARCH_ONLY_TOOLS
           if (
-            dispatchedReadCount === 0
+            !opts.researchTurn
+            && dispatchedReadCount === 0
             && autoNarrowedReadCount === 0
             && searchOnlyTurnStreak >= 3
             && SEARCH_ONLY_TOOLS.has(call.name)
@@ -11066,7 +11134,7 @@ export async function streamLLMWithTools(
           resultBlocks.push({
             type: 'tool_result',
             tool_use_id: call.id,
-            content: typeof result === 'string' ? result : JSON.stringify(result),
+            content: toolResultContentForCall(call.name, result),
             ...(isError ? { isError: true } : {}),
           });
         }
@@ -11245,7 +11313,8 @@ export async function streamLLMWithTools(
     // synthesis attempt. Extended to gemini 2026-05-04 alongside
     // W5-E/W5-F for the same pathology shape.
     if (
-      !forceSynthesisAttempted
+      !opts.researchTurn
+      && !forceSynthesisAttempted
       && noContentReadTurnStreak >= 4
       && (modelFamily === 'gemini'
         || applyCodexBehaviorGuard('force-synthesis', effectiveModel, codexGuardCandidate, true))
@@ -11500,6 +11569,7 @@ function makeOpenAICompatProvider(
         throw new Error(`${name} unavailable: configure apiKey via \`elanous setup\``);
       }
       const activeModel = opts.model || model;
+      if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools);
       const wireModel = name === 'openrouter' ? openRouterWireModel(activeModel) : activeModel;
       const tools = toOpenAITools(
         opts.tools,

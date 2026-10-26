@@ -8,6 +8,7 @@ import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { buildUserConfig, saveUserConfig } from '../user-config.js';
 import { openSchedulesDb } from '../domains/schedule-registry.js';
 import { recordScheduleRun } from '../domains/schedule-runs.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 
 const cli = new URL('../../bin/elanous.mjs', import.meta.url).pathname;
 const cwd = new URL('../../', import.meta.url).pathname;
@@ -48,10 +49,37 @@ describe('guardian Commander production entry', () => {
         env: { ...process.env, ELANOUS_STATE_DIR: root }, stdout: 'pipe', stderr: 'pipe',
       });
       expect(result.exitCode, decode(result.stderr)).toBe(0);
-      expect(JSON.parse(decode(result.stdout))).toEqual({ mode: 'shadow', wouldRun: ['unsafe'], executed: 0 });
+      const tick = JSON.parse(decode(result.stdout)) as { credentialAlert?: unknown };
+      expect(tick).toMatchObject({ mode: 'shadow', wouldRun: ['unsafe'], executed: 0 });
+      if ('credentialAlert' in tick) {
+        expect(typeof tick.credentialAlert).toBe('string');
+        expect(tick.credentialAlert).toContain('Grok 자격 만료 경보');
+      }
       const observed = new Database(join(root, 'schedules.db'));
       try { expect(observed.query('SELECT COUNT(*) AS n FROM schedule_runs').get()).toEqual({ n: 0 }); }
       finally { observed.close(); }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 20_000);
+
+  test('production tick records knowhow pack IDs from an isolated run ledger without dispatch', () => {
+    const root = mkdtempSync(join(tmpdir(), 'guardian-doctor-cli-'));
+    const runId = 'run-0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d';
+    const ledgerDir = runLedgerDir(root);
+    try {
+      appendRunLedgerEntry({ timestamp: '2026-10-25T00:00:00.000Z', runId, event: 'run-start', data: {} }, ledgerDir);
+      appendRunLedgerEntry({ timestamp: '2026-10-25T00:00:01.000Z', runId, event: 'knowhow-pack', data: { ids: ['K-TC-777'], injected: true } }, ledgerDir);
+      appendRunLedgerEntry({ timestamp: '2026-10-25T00:00:02.000Z', runId, event: 'doctor-visit', data: { from: 'supervisor', symptom: 'admit-starved', evidence: 'admission queue stalled' } }, ledgerDir);
+      for (let i = 0; i < 2; i++) {
+        const result = Bun.spawnSync({
+          cmd: [process.execPath, cli, `--test=${root}`, 'guardian', 'tick'], cwd,
+          env: { ...process.env, ELANOUS_STATE_DIR: root }, stdout: 'pipe', stderr: 'pipe',
+        });
+        expect(result.exitCode, decode(result.stderr)).toBe(0);
+        expect(JSON.parse(decode(result.stdout)).executed).toBe(0);
+      }
+      const prescriptions = loadRunLedger(runId, ledgerDir)!.filter(row => row.event === 'doctor-rx');
+      expect(prescriptions).toHaveLength(1);
+      expect(prescriptions[0]!.data).toMatchObject({ knowhowPackSliceIds: ['K-TC-777'], execution: 'none' });
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 20_000);
 

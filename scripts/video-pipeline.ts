@@ -723,8 +723,8 @@ function strictVerdict(rows: { graphId: string; parsed: boolean; unbound: string
 const REMOTE_RAM = new Map<string, number | null>();
 /**
  * ⛔⭐⭐ ***어느 기계의 여유 메모리인가*** — 2026-09-23.
- * 🩸 초판은 «이 노트북»의 여유(70GB)를 ssh 구현(`node-b` 에서 도는 것)과 견줬다. ***틀린 기계다.***
- *   node-b 은 여유 435GB 다 — 여기서 「안 된다」가 나오면 그것은 «거짓»이다.
+ * 🩸 초판은 «이 노트북»의 여유를 ssh 구현(원격 노드에서 도는 것)과 견줬다. ***틀린 기계다.***
+ *   원격 노드의 여유가 더 클 수 있다 — 여기서 「안 된다」가 나오면 그것은 «거짓»이다.
  * ⇒ 구현의 `probe.kind` 가 `ssh` 면 ***그 호스트에게 묻는다***. 호스트당 한 번만.
  */
 function freeRamGbOf(impl: Impl): number | null {

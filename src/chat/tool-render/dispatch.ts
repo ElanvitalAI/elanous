@@ -89,7 +89,7 @@ export function renderToolResultVariants(
   // Only successful MsgPost results enter the compact renderer. Returning
   // null for errors lets the dashboard formatter use its existing generic
   // result path, including its expanded argument/result view.
-  if (kind === 'MsgPost' && extractErrorText(call.result)) return null;
+  if (kind === 'MsgPost' && isMsgPostErrorResult(call.result)) return null;
   const model = buildToolRenderModel(kind, call, config);
   const collapsed = renderToolBlock(model, config.blockMaxLines, config.foldMode, config.expandHint);
   // ⭐ MsgPost 는 접힌 행에서 본문을 빼고 펼친 행에서만 싣는다 ⇒ 같은 model 로는 두 변형을
@@ -111,6 +111,13 @@ export function renderToolResultVariants(
 interface ToolRenderModelOptions {
   /** 펼친 변형만 `message.body` 를 싣는다 — 접힌 행에는 본문·전체 JSON 이 남지 않는다. */
   includeMsgPostBody?: boolean;
+}
+
+/** MsgPost 오류 — `llm.ts` 가 throw 를 `{ error }` 로 감싼 형태와, `ok: false` 결과. */
+function isMsgPostErrorResult(result: unknown): boolean {
+  if (extractErrorText(result)) return true;
+  const rec = asRecord(result);
+  return rec?.ok === false;
 }
 
 function normalizeToolRenderName(name: string): ToolRenderKind | null {

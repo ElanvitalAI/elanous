@@ -14,12 +14,12 @@
 //
 // index.ts 의 액션은 옵션 파싱과 실제 의존 배선만 남는다(얇은 껍데기).
 
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { tierModel } from '../llm/model-defaults.js';
-import { buildReviewObservation, safeLogText } from './review-observation.js';
+import { buildReviewObservation, reviewIntentFingerprint, safeLogText } from './review-observation.js';
 import { checkCitedReviewPathsAtHead } from './review-finding-key.js';
 import { DEFAULT_REVIEW_BACKEND, defaultAcpReviewTimeoutSec } from './acp-reviewer.js';
 import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
@@ -171,37 +171,77 @@ export interface SelfReviewCliOutcome {
   failed: number;
 }
 
-/** Saved results are round evidence only when their PR, exact head and reviewed status agree. */
-function savedReviewRecords(pr: string, root = effectiveInstanceRoot()): Array<{ head: string; reviewedAt: number }> {
+interface SavedReviewEvidence {
+  heads: string[];
+  records: Array<{ head: string; reviewedAt: number }>;
+  unreadableFiles: string[];
+}
+
+function savedReviewEvidence(
+  pr: string,
+  root = effectiveInstanceRoot(),
+  onUnreadable?: (file: string) => void,
+): SavedReviewEvidence {
   const dir = join(root, 'review-results');
   let names: string[];
-  try { names = readdirSync(dir); } catch { return []; }
-  // Manual review saves in the operating house also use head10; the JSON's full head is authoritative.
-  const matching = new RegExp(`^.+-${pr}-([a-f0-9]{7,40})\\.json$`, 'i');
+  try { names = readdirSync(dir); } catch { return { heads: [], records: [], unreadableFiles: [] }; }
+  const escapedPr = pr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matchingPrInName = new RegExp(`(?:^|-)${escapedPr}(?:-|\\.json$)`, 'i');
   const records = new Map<string, { head: string; reviewedAt: number }>();
+  const unreadableFiles: string[] = [];
   for (const name of names) {
-    const match = matching.exec(name);
-    if (!match) continue;
+    if (!name.toLowerCase().endsWith('.json')) continue;
+    const nameSuggestsPr = matchingPrInName.test(name);
     try {
-      const recordPath = join(dir, name);
-      const raw: unknown = JSON.parse(readFileSync(recordPath, 'utf8'));
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const raw: unknown = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        if (nameSuggestsPr) { unreadableFiles.push(name); onUnreadable?.(name); }
+        continue;
+      }
       const result = raw as Record<string, unknown>;
+      const recordPr = typeof result.pr === 'string' ? result.pr
+        : Number.isSafeInteger(result.pr) ? String(result.pr) : undefined;
+      if (recordPr !== pr) {
+        // A parseable, explicit foreign PR identity outranks a misleading filename.
+        if (recordPr === undefined && nameSuggestsPr) { unreadableFiles.push(name); onUnreadable?.(name); }
+        continue;
+      }
+      if (result.reviewed !== true) continue;
       const head = result.headCommit;
-      if (String(result.pr) !== pr || result.reviewed !== true || typeof head !== 'string'
-        || !COMMIT_OID.test(head) || !head.toLowerCase().startsWith(match[1]!.toLowerCase())) continue;
-      const normalized = head.toLowerCase();
-      const existing = records.get(normalized);
+      if (typeof head !== 'string' || !COMMIT_OID.test(head)) {
+        unreadableFiles.push(name);
+        onUnreadable?.(name);
+        continue;
+      }
+      // The result payload is authoritative: round-tagged filenames and stale suffixes
+      // still count by their full PR/head identity, then deduplicate on that identity.
+      const recordPath = join(dir, name);
       const reviewedAt = typeof result.reviewedAt === 'number' && Number.isFinite(result.reviewedAt)
         ? result.reviewedAt : statSync(recordPath).mtimeMs;
+      const normalized = head.toLowerCase();
+      const existing = records.get(normalized);
       if (!existing || reviewedAt > existing.reviewedAt) records.set(normalized, { head: normalized, reviewedAt });
-    } catch { /* corrupt or partial result is not a completed round */ }
+    } catch {
+      // A filename can associate an unreadable record with this PR; fail closed at the cap.
+      if (nameSuggestsPr) { unreadableFiles.push(name); onUnreadable?.(name); }
+    }
   }
-  return [...records.values()];
+  const saved = [...records.values()];
+  return { heads: saved.map(({ head }) => head), records: saved, unreadableFiles };
 }
 
 export function savedReviewHeads(pr: string, root = effectiveInstanceRoot()): string[] {
-  return savedReviewRecords(pr, root).map(({ head }) => head);
+  return savedReviewEvidence(pr, root).heads;
+}
+
+function isReplaceableErrorArtifact(path: string, pr: string, head: string): boolean {
+  try {
+    const result = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    const recordPr = typeof result.pr === 'string' ? result.pr
+      : Number.isSafeInteger(result.pr) ? String(result.pr) : undefined;
+    return recordPr === pr && result.headCommit === head && result.reviewed === false
+      && typeof result.error === 'string' && result.error.length > 0;
+  } catch { return false; }
 }
 
 function normalizeReviewPrArg(input: string, deps: SelfReviewCliDeps): string | null {
@@ -1566,6 +1606,17 @@ export async function runSelfReviewCliCommand(
         let attemptedLane: ReviewLane | undefined;
         let completedWithError = false;
         const pinnedHead = initialHead.value;
+        const priorEvidence = savedReviewEvidence(pr);
+        const capWasActive = priorEvidence.heads.length + priorEvidence.unreadableFiles.length >= 5;
+        const canonicalResultPath = join(effectiveInstanceRoot(), 'review-results', `pr-${pr}-${pinnedHead.slice(0, 12)}.json`);
+        if (capWasActive && existsSync(canonicalResultPath)
+          && !isReplaceableErrorArtifact(canonicalResultPath, pr, pinnedHead)) {
+          const message = `PR ${pr}: 동일 head 리뷰 결과가 이미 저장되어 있습니다: ${canonicalResultPath}`;
+          results.push({ pr, reviewed: false, refusal: 'cap-refused', existingResult: canonicalResultPath, headCommit: pinnedHead });
+          deps.error(message);
+          failed += 1;
+          continue;
+        }
         let capClaimed = false;
         let pendingFallback: { from: ReviewLane; reason: string } | undefined;
         for (const [index, lane] of lanes.entries()) {
@@ -1624,6 +1675,33 @@ export async function runSelfReviewCliCommand(
           const enriched: Record<string, unknown> = { ...result, reviewerMixPrimaryLane: lanes[0],
             ...(selectedLane ? { reviewerMixSelectedLane: selectedLane } : {}) };
           results.push(enriched);
+          if (completed && completed.reviewed === true) {
+            try {
+              mkdirSync(dirname(canonicalResultPath), { recursive: true });
+              const normalized = normalizeSavedReviewMustFix(enriched);
+              if (enriched.headCommit !== pinnedHead || enriched.stale === true
+                || enriched.currentHeadCommit !== pinnedHead) {
+                throw new Error('review result is not pinned to the confirmed current PR head');
+              }
+              writeFileSync(canonicalResultPath, selfReviewJsonLine([normalized.result]));
+            } catch (error) {
+              failed += 1;
+              deps.error(`PR ${pr}: 리뷰 결과 저장 실패 (${canonicalResultPath}): ${error instanceof Error ? error.message : String(error)}`);
+              if (capWasActive) {
+                const authorization = readCapOverride(pr);
+                const claimPath = authorization?.head === pinnedHead.toLowerCase()
+                  ? join(effectiveInstanceRoot(), 'review-results', `cap-override-${pr}.json`)
+                  : join(effectiveInstanceRoot(), 'review-results', `cap-override-${pr}-head-${pinnedHead.toLowerCase()}.json`);
+                try { unlinkSync(claimPath); } catch { /* already absent or owned by another lane */ }
+              }
+            }
+          } else if (capWasActive && !completed && capClaimed) {
+            const authorization = readCapOverride(pr);
+            const claimPath = authorization?.head === pinnedHead.toLowerCase()
+              ? join(effectiveInstanceRoot(), 'review-results', `cap-override-${pr}.json`)
+              : join(effectiveInstanceRoot(), 'review-results', `cap-override-${pr}-head-${pinnedHead.toLowerCase()}.json`);
+            try { unlinkSync(claimPath); } catch { /* already absent or owned by another lane */ }
+          }
           if (!opts.json) deps.print(`\n━━ PR ${pr} (${String(enriched.model ?? 'review failed')}) ━━\n${deps.renderReview(enriched as unknown as ReviewResult)}`);
         }
         if (!completed || completedWithError) failed += 1;
@@ -1769,8 +1847,12 @@ async function runSelfReviewCliCommandPinned(
   const providedReviewerContext = loadReviewerContext(opts, deps.readReferencedFile);
   const hasProvidedReviewerContext = (opts.contextOrder?.length ?? 0) > 0 || (opts.context?.length ?? 0) > 0 || (opts.contextText?.length ?? 0) > 0;
   for (const pr of normalizedPrArgs as string[]) {
-    const previousHeads = savedReviewHeads(pr);
-    const previousRoundCount = previousHeads.length;
+    const savedEvidence = savedReviewEvidence(pr, undefined, (file) => {
+      deps.observeDoctorReview?.('saved-result-unreadable', { pr, file }, { level: 'warn' });
+    });
+    const previousHeads = savedEvidence.heads;
+    const previousRoundCount = previousHeads.length + savedEvidence.unreadableFiles.length;
+    const shouldPersistCapResult = previousRoundCount >= 5 && !opts.reviewerMixPrimaryLane;
     const reason = opts.overCapReason?.trim();
     const authorization = previousRoundCount >= 5 ? readCapOverride(pr) : undefined;
     deps.observeDoctorReview?.('round-counted', { pr, previousRoundCount, round: previousRoundCount + 1 });
@@ -1790,6 +1872,27 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     const diffRead = readDiffAtHead(pr, deps);
+    const canonicalResultPath = COMMIT_OID.test(diffRead.headCommit)
+      ? join(effectiveInstanceRoot(), 'review-results', `pr-${pr}-${diffRead.headCommit.slice(0, 12)}.json`)
+      : undefined;
+    let claimedCapPath: string | undefined;
+    const releaseCapClaim = (): void => {
+      if (!claimedCapPath || opts.reviewerMixPrimaryLane) return;
+      try {
+        unlinkSync(claimedCapPath);
+        claimedCapPath = undefined;
+      } catch (error) {
+        deps.error(`PR ${pr}: 상한 예외 사용 기록 롤백 실패 (${claimedCapPath}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    if (shouldPersistCapResult && canonicalResultPath && existsSync(canonicalResultPath)
+      && !isReplaceableErrorArtifact(canonicalResultPath, pr, diffRead.headCommit)) {
+      const message = `PR ${pr}: 동일 head 리뷰 결과가 이미 저장되어 있습니다: ${canonicalResultPath}`;
+      deps.error(message);
+      results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: diffRead.headCommit, existingResult: canonicalResultPath });
+      failed += 1;
+      continue;
+    }
     if (opts.reviewerMixExpectedHead && diffRead.headCommit !== opts.reviewerMixExpectedHead) {
       const refusal = { pr, reviewed: false, verdict: null, mustFix: [], shouldFix: [],
         refusal: 'reviewer-mix-head-changed', stale: true, headCommit: diffRead.headCommit,
@@ -1801,10 +1904,13 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     if (previousRoundCount >= 5 && authorization && diffRead.headCommit.toLowerCase() === authorization.head && !opts.reviewerMixCapClaimed) {
-      const message = `PR ${pr}: 동일 head는 이미 승인 소모 기록이 있습니다.`;
+      const resultExists = canonicalResultPath && existsSync(canonicalResultPath);
+      const message = resultExists
+        ? `PR ${pr}: 동일 head 리뷰 결과가 이미 저장되어 있습니다: ${canonicalResultPath}`
+        : `PR ${pr}: 동일 head는 이미 승인 소모 기록이 있습니다. 결과 파일을 찾을 수 없어 재리뷰하지 않습니다.`;
       deps.observeDoctorReview?.('cap-refused', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: 'same-head-already-used' }, { level: 'warn' });
       deps.error(message);
-      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: diffRead.headCommit });
+      if (opts.json || opts.save !== undefined || resultExists) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: diffRead.headCommit, ...(resultExists ? { existingResult: canonicalResultPath } : {}) });
       failed += 1;
       continue;
     }
@@ -1827,7 +1933,7 @@ async function runSelfReviewCliCommandPinned(
         failed += 1;
         continue;
       }
-      const savedRecords = savedReviewRecords(pr);
+      const savedRecords = savedEvidence.records;
       const latestReviewed = savedRecords.reduce<(typeof savedRecords)[number] | undefined>(
         (latest, record) => !latest || record.reviewedAt > latest.reviewedAt ? record : latest, undefined,
       );
@@ -1875,6 +1981,9 @@ async function runSelfReviewCliCommandPinned(
         failed += 1;
         continue;
       }
+      claimedCapPath = join(effectiveInstanceRoot(), 'review-results', authorization
+        ? `cap-override-${pr}-head-${diffRead.headCommit.toLowerCase()}.json`
+        : `cap-override-${pr}.json`);
       deps.observeDoctorReview?.('cap-override', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason }, { level: 'warn' });
     }
     if (mergeOnlyDeltaRange) {
@@ -1883,6 +1992,7 @@ async function runSelfReviewCliCommandPinned(
         const message = `PR ${pr}: merge-only 후속 head의 delta diff를 고정할 수 없습니다.`;
         deps.error(message);
         if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: diffRead.headCommit });
+        releaseCapClaim();
         failed += 1;
         continue;
       }
@@ -1897,6 +2007,7 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed) {
+      claimedCapPath = join(effectiveInstanceRoot(), 'review-results', `cap-override-${pr}-head-${diffRead.headCommit.toLowerCase()}.json`);
       deps.observeDoctorReview?.('cap-override', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: authorization.reason }, { level: 'warn' });
     }
     const localHeadComparison = compareLocalHead(pr, { value: diffRead.headCommit, state: diffRead.headCommitState }, deps);
@@ -1989,8 +2100,24 @@ async function runSelfReviewCliCommandPinned(
         { pr: safeLogText(pr), exit: diff.status, error: safeLogText(diff.stderr || err, 160) },
         { level: 'warn' });
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
-      if (opts.json || opts.save !== undefined) results.push({ pr, error: err, ...contextOutput, ...comparisonData, ...(mismatchWarning ?? {}) });
+      const errorResult = { pr, error: err, reviewed: false, headCommit: diffRead.headCommit,
+        currentHeadCommit: diffRead.currentHeadCommit, stale: diffRead.stale,
+        ...contextOutput, ...comparisonData, ...(mismatchWarning ?? {}) };
+      if (opts.json || opts.save !== undefined) results.push(errorResult);
+      if (canonicalResultPath && COMMIT_OID.test(diffRead.headCommit)
+        && diffRead.headCommitState === 'known' && diffRead.currentHeadCommitState === 'known'
+        && diffRead.currentHeadCommit === diffRead.headCommit && !diffRead.stale) {
+        try {
+          if (!existsSync(canonicalResultPath) || isReplaceableErrorArtifact(canonicalResultPath, pr, diffRead.headCommit)) {
+            mkdirSync(dirname(canonicalResultPath), { recursive: true });
+            writeFileSync(canonicalResultPath, selfReviewJsonLine([errorResult]));
+          }
+        } catch (error) {
+          deps.error(`PR ${pr}: 오류 리뷰 결과 저장 실패 (${canonicalResultPath}): ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       if (!opts.json) deps.error(`PR ${pr}: ${err}\n${reviewerContextStatus}`);
+      releaseCapClaim();
       failed += 1;
       continue;
     }
@@ -2052,6 +2179,7 @@ async function runSelfReviewCliCommandPinned(
       };
       if (opts.json || opts.save !== undefined) results.push(refused);
       if (!opts.json) deps.print(`\n━━ PR ${pr} (${primaryModel}) ━━\n${renderStaleRefusal(diffRead)}\n${reviewerContextStatus}`);
+      releaseCapClaim();
       continue;
     }
     // ⭐ 머지된 PR 만 머지 커밋 detached worktree 에서 리뷰한다 — main 최신이 아니라 그 PR 이 머지된 시점의 코드를 본다.
@@ -2105,6 +2233,7 @@ async function runSelfReviewCliCommandPinned(
       ...(deps.readReferencedFile ? { readReferencedFile: deps.readReferencedFile } : {}),
       ...(goalAcceptance.acceptance ? { acceptance: goalAcceptance.acceptance } : {}),
     };
+    const intentFingerprint = reviewIntentFingerprint(reviewInput.phaseIntent);
     // ⭐ Role-config ACP lane: a completed ACP review is used as-is; anything else (throw, reviewed≠true)
     //    falls to the same API review this command ran before the lane existed — and is observed.
     // ⚠️ Stricter than the harness lane on purpose: `runSubscriptionReviewer` accepts any non-empty text;
@@ -2299,7 +2428,7 @@ async function runSelfReviewCliCommandPinned(
     deps.log('done',
       {
         ...buildReviewObservation({
-          pr, model: selectedModel, intent, review, durationMs: deps.now() - startedAt,
+          pr, model: selectedModel, intent, intentFingerprint, review, durationMs: deps.now() - startedAt,
           ...reviewProvenance,
           ...intentTruncation,
           ...reviewDiffBudgetObservation(review),
@@ -2322,6 +2451,7 @@ async function runSelfReviewCliCommandPinned(
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
       if (opts.json || opts.save !== undefined) results.push({ pr, error: err, ...review, verdict: null, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput });
       if (!opts.json) deps.error(`PR ${pr}: ${err}\n${renderProvenance(diffRead)}\n${reviewerContextStatus}`);
+      releaseCapClaim();
       failed += 1;
       continue;
     }
@@ -2330,7 +2460,23 @@ async function runSelfReviewCliCommandPinned(
     // ⛔ 금지 백엔드가 낸 판정은 «근거 거부»다 — verdict·mustFix 를 그대로 실어 보내면 읽는 쪽이
     //    그것을 착지 판정으로 쓴다(관문도 reviewed===true 를 근거 조건으로 본다).
     const refusalOverride = landingGateAdmitted ? {} : { reviewed: false, verdict: null, refusal: 'review-forbidden-acp-backend' as const };
-    if (opts.json || opts.save !== undefined) results.push({ pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields, findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) });
+    const resultOutput = { pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields, findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) };
+    if (opts.json || opts.save !== undefined || shouldPersistCapResult) results.push(resultOutput);
+    if (!shouldPersistCapResult
+      && landingGateAdmitted && review.reviewed === true && diffRead.headCommitState === 'known'
+      && diffRead.currentHeadCommitState === 'known' && diffRead.currentHeadCommit === diffRead.headCommit
+      && !diffRead.stale && COMMIT_OID.test(diffRead.headCommit)) {
+      const path = canonicalResultPath ?? join(effectiveInstanceRoot(), 'review-results', `pr-${pr}-${diffRead.headCommit.slice(0, 12)}.json`);
+      const normalized = normalizeSavedReviewMustFix(resultOutput);
+      try {
+        mkdirSync(dirname(path), { recursive: true });
+        // A successful review replaces an earlier error artifact for the same PR head.
+        writeFileSync(path, selfReviewJsonLine([normalized.result]));
+        if (normalized.count > 0 && opts.save === undefined) deps.log('mustfix-normalized', { pr, head: diffRead.headCommit, count: normalized.count });
+      } catch (error) {
+        deps.error(`PR ${pr}: 리뷰 결과 저장 실패 (${path}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     if (!opts.json) {
       if (!landingGateAdmitted) deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n⛔ LANDING GATE: review-forbidden-acp-backend (${landingGateDeniedBackend ?? 'unknown'}) — 이 리뷰는 착지 근거가 아닙니다.\n${reviewerContextStatus}`);
       else deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}${pathWarnings.length ? `\n${pathWarnings.join('\n')}` : ''}`);
@@ -2358,6 +2504,28 @@ async function runSelfReviewCliCommandPinned(
         } catch (error) {
           failed += 1;
           deps.error(`PR ${pr}: --save 실패: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+    if (shouldPersistCapResult) {
+      if (!landingGateAdmitted || review.reviewed !== true || !canonicalResultPath
+        || diffRead.headCommitState !== 'known' || diffRead.currentHeadCommitState !== 'known'
+        || diffRead.currentHeadCommit !== diffRead.headCommit || !COMMIT_OID.test(diffRead.headCommit)) {
+        releaseCapClaim();
+        deps.error(`PR ${pr}: 상한 예외 리뷰 결과가 저장 가능한 상태가 아니어서 승인 사용 기록을 되돌렸습니다.`);
+      } else {
+        const rawResult = results.at(-1);
+        const normalized = rawResult && typeof rawResult === 'object'
+          ? normalizeSavedReviewMustFix(rawResult)
+          : { result: rawResult, count: 0 };
+        try {
+          mkdirSync(dirname(canonicalResultPath), { recursive: true });
+          writeFileSync(canonicalResultPath, selfReviewJsonLine([normalized.result]));
+          if (normalized.count > 0) deps.log('mustfix-normalized', { pr, head: diffRead.headCommit, count: normalized.count });
+        } catch (error) {
+          releaseCapClaim();
+          failed += 1;
+          deps.error(`PR ${pr}: 상한 예외 리뷰 결과 저장 실패${canonicalResultPath ? ` (${canonicalResultPath})` : ''}: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
     }

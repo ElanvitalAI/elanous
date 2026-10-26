@@ -4,6 +4,8 @@
 import { readFileSync } from 'node:fs';
 import { test, expect, describe } from 'bun:test';
 import { PreviewTerminal, type PreviewRegistryDeps } from './terminal.js';
+import { resolveSpawnShape } from '../pty-shell/registry.js';
+import { resetCapturedEnvForTesting, setCapturedEnvForTesting } from '../shell-env-bootstrap.js';
 
 function stub() {
   const listeners: Array<(ev: unknown) => void> = [];
@@ -59,6 +61,32 @@ describe('PreviewTerminal useRegistry (P0b-2 · 공유 버스 흡수)', () => {
       workdir: '/repo/seat', accessMode: 'write',
     });
     pt.stop();
+  });
+
+  test('subscription auth scrub survives captured-environment composition', () => {
+    const s = stub();
+    const unsetEnv = ['OPENAI_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+    setCapturedEnvForTesting({
+      PATH: '/captured/bin', HOME: '/captured/home', TERM: 'captured-term',
+      OPENAI_API_KEY: 'captured-openai-secret', CLAUDE_CODE_OAUTH_TOKEN: 'captured-claude-secret',
+    });
+    try {
+      const pt = new PreviewTerminal({
+        cols: 80, rows: 24, cwd: '/repo', env: { PATH: '/driver/bin' }, unsetEnv, useRegistry: true,
+      }, undefined, s.deps);
+      pt.start();
+      const startOpts = s.getStartOpts();
+      expect(startOpts.unsetEnv).toEqual(unsetEnv);
+      const child = resolveSpawnShape(startOpts as never);
+      expect(child.env.PATH).toBe('/driver/bin');
+      expect(child.env.HOME).toBe('/captured/home');
+      expect(child.env.TERM).toBe('xterm-256color');
+      expect(child.env.OPENAI_API_KEY).toBeUndefined();
+      expect(child.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      pt.stop();
+    } finally {
+      resetCapturedEnvForTesting();
+    }
   });
 
   test('onPtyEvent output → 매칭 id 만 에뮬레이터/raw 탭에 도달', () => {

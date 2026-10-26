@@ -322,7 +322,7 @@ function truncateAtParamSize(model: string): string {
 /** Current active LLM model pill. Pink matches Claude Code's palette.
  *
  *  2026-05-05 — provider name omitted (cloud) / `<node>:<model>` for
- *  local. Node name (e.g. `local`, `node-b`) doubles as the local-LLM
+ *  local. Node name (e.g. `local`, `node-a`) doubles as the local-LLM
  *  indicator (cloud entries have no `<node>:` prefix). When
  *  `opts.compact` is true (caller decides via terminal width), the
  *  model id portion truncates at the first parameter-size marker.
@@ -330,13 +330,13 @@ function truncateAtParamSize(model: string): string {
  *  Render shape examples:
  *   - Cloud:                       `claude-opus-4-6`, `grok-4.3`
  *   - Local (multi-node spec):     `local:qwen3.6-35b-a3b-ud-mlx`
- *                                  `node-b:qwen2.5-72b-instruct`
+ *                                  `node-a:qwen2.5-72b-instruct`
  *   - Local (legacy `local:<m>`):  `local:llama-3-8b` (unchanged)
  *   - Local (bare model):          `local:tinyllama-1b`
  *   - No model:                    bare provider name fallback.
  *  With `compact: true`:
  *   - `local:qwen3.6-35b-a3b-ud-mlx` → `local:qwen3.6-35b`
- *   - `node-b:qwen2.5-72b-instruct`    → `node-b:qwen2.5-72b`
+ *   - `node-a:qwen2.5-72b-instruct`  → `node-a:qwen2.5-72b`
  *   - `claude-opus-4-6`              → unchanged (no `\d+b` marker) */
 export function modelSegment(info: StatusModelInfo, opts: StatusBarRenderOptions = {}): string {
   // 이번 턴 실제 실행이 있으면 그 값이 «지금» 이다 — 설정/런타임 값은 실행 전 기본값일 뿐.

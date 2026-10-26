@@ -1,14 +1,44 @@
-import { describe, expect, test, vi } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'bun:test';
 import { debug } from '../../debug/log.js';
-import { checkPodPool, genericConfigPodPool, measureMemberOccupancy, parsePodPool, podWorkLabels, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
+import { checkPodPool, genericConfigPodPool, imageShipLockPath, measureMemberOccupancy, parsePodPool, podWorkLabels, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, snapshotWarmPoolMembers, syncPoolImage as syncPoolImageRaw, syncPoolImages as syncPoolImagesRaw, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
 import { podPlacementKind, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { HostPoolLease } from '../../pod-lease/host-lease.js';
 import { loadRunLedger } from '../../self-implement/run-ledger.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+let imageLockDir: string;
+beforeEach(() => { imageLockDir = mkdtempSync(join(tmpdir(), 'pod-pool-test-image-lock-')); });
+afterEach(() => { rmSync(imageLockDir, { recursive: true, force: true }); });
+const imageTestLock = () => ({ dir: imageLockDir, retryMs: 10, staleMs: 1_000, maxTries: 100 });
+const syncPoolImage: typeof syncPoolImageRaw = (member, image, commit, run) =>
+  syncPoolImageRaw(member, image, commit, typeof run === 'function'
+    ? { run, lock: imageTestLock() }
+    : { ...run, lock: run?.lock ?? imageTestLock() });
+const syncPoolImages: typeof syncPoolImagesRaw = (members, image, commit, deps = {}) =>
+  syncPoolImagesRaw(members, image, commit, { ...deps, lock: deps.lock ?? imageTestLock() });
+
 describe('pod pool — priority ⊕ per-node capacity', () => {
+  test('cut shadow reads warm worker identities without moving pool members', () => {
+    const members = parsePodPool('first:2,second:1');
+    const calls: string[] = [];
+    const kubectl = (args: readonly string[]) => {
+      calls.push(args.join(' '));
+      const context = args[1];
+      return { status: 0, stdout: JSON.stringify({ items: context === 'first'
+        ? [{ metadata: { name: 'warm-a', uid: 'uid-a' }, spec: { nodeName: 'node-a' } }]
+        : [{ metadata: { name: 'warm-b', uid: 'uid-b' }, spec: { nodeName: 'node-b' } }] }), stderr: '' };
+    };
+    const pool = new PodPoolScheduler(members, { kubectl, status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+      capacitySlots: 3, memorySlots: 3, placeableSlots: 3, running: 0, pending: 0 }) });
+    const before = pool.snapshot();
+    expect(snapshotWarmPoolMembers(members, kubectl)).toEqual({ first: [{ name: 'warm-a', uid: 'uid-a', node: 'node-a' }],
+      second: [{ name: 'warm-b', uid: 'uid-b', node: 'node-b' }] });
+    expect(pool.snapshot()).toEqual(before);
+    expect(calls).toHaveLength(2);
+    expect(calls.every((call) => call.includes('get pods -l elanous.kind=warm-worker -o json'))).toBe(true);
+  });
   test('MBP lite admission uses the requested 2Gi size and shares the two-slot host cap with standard launches', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'mbp-tier-admission-'));
     const hostLease = new HostPoolLease('mbp-tier-admission', { dir, processStart: () => 'test-start' });
@@ -151,39 +181,39 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       return original(category, event, data);
     }) as typeof debug.log;
     try {
-      const full: Record<string, MemberOccupancy> = { node-b: { occupied: 20 }, node-c: { occupied: 0 } };
+      const full: Record<string, MemberOccupancy> = { 'node-b': { occupied: 20 }, 'node-c': { occupied: 0 } };
       const fullPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => full });
       expect((await fullPool.tryAcquire())?.context).toBe('node-c');
-      expect(events.at(-1)).toEqual({ member: 'node-c', free: { node-b: 0, node-c: 4 }, measured: { node-b: true, node-c: true }, share: { node-b: 0, node-c: 1 } });
+      expect(events.at(-1)).toEqual({ member: 'node-c', free: { 'node-b': 0, 'node-c': 4 }, measured: { 'node-b': true, 'node-c': true }, share: { 'node-b': 0, 'node-c': 1 } });
 
-      const both: Record<string, MemberOccupancy> = { node-b: { occupied: 10 }, node-c: { occupied: 1 } };
+      const both: Record<string, MemberOccupancy> = { 'node-b': { occupied: 10 }, 'node-c': { occupied: 1 } };
       const bothPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => both });
       // POOL-SPREAD: node-b 10/20 free (50%) vs node-c 3/4 free (75%) — the small member is no longer left idle.
       expect((await bothPool.tryAcquire())?.context).toBe('node-c');
 
-      const mostlyFull: Record<string, MemberOccupancy> = { node-b: { occupied: 16 }, node-c: { occupied: 0 } };
+      const mostlyFull: Record<string, MemberOccupancy> = { 'node-b': { occupied: 16 }, 'node-c': { occupied: 0 } };
       const mostlyFullPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => mostlyFull });
       expect((await mostlyFullPool.tryAcquire())?.context).toBe('node-c');
-      const evenPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => ({ node-b: { occupied: 10 }, node-c: { occupied: 2 } }) });
+      const evenPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => ({ 'node-b': { occupied: 10 }, 'node-c': { occupied: 2 } }) });
       expect((await evenPool.tryAcquire())?.context).toBe('node-b');
 
-      const failed: Record<string, MemberOccupancy> = { node-b: { occupied: 0 }, node-c: { occupied: null, reason: 'timeout' } };
+      const failed: Record<string, MemberOccupancy> = { 'node-b': { occupied: 0 }, 'node-c': { occupied: null, reason: 'timeout' } };
       const failedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => failed });
       expect((await failedPool.tryAcquire())?.context).toBe('node-b');
-      expect(events.at(-1)?.measured).toEqual({ node-b: true, node-c: false });
+      expect(events.at(-1)?.measured).toEqual({ 'node-b': true, 'node-c': false });
       // An unanswered node must not win on a 100% share while a measured node still has room.
-      const busyFailed: Record<string, MemberOccupancy> = { node-b: { occupied: 15 }, node-c: { occupied: null, reason: 'timeout' } };
+      const busyFailed: Record<string, MemberOccupancy> = { 'node-b': { occupied: 15 }, 'node-c': { occupied: null, reason: 'timeout' } };
       const busyFailedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => busyFailed });
       expect((await busyFailedPool.tryAcquire())?.context).toBe('node-b');
-      const fullFailed: Record<string, MemberOccupancy> = { node-b: { occupied: 20 }, node-c: { occupied: null, reason: 'timeout' } };
+      const fullFailed: Record<string, MemberOccupancy> = { 'node-b': { occupied: 20 }, 'node-c': { occupied: null, reason: 'timeout' } };
       const fullFailedPool = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => fullFailed });
       expect((await fullFailedPool.tryAcquire())?.context).toBe('node-c');
 
       const picked: string[] = [];
       for (let n = 0; n < 10; n++) {
         const occupancy: Record<string, MemberOccupancy> = n % 2 === 0
-          ? { node-b: { occupied: 20 }, node-c: { occupied: 0 } }
-          : { node-b: { occupied: 10 }, node-c: { occupied: 3 } };
+          ? { 'node-b': { occupied: 20 }, 'node-c': { occupied: 0 } }
+          : { 'node-b': { occupied: 10 }, 'node-c': { occupied: 3 } };
         const launch = new PodPoolScheduler(parsePodPool('node-b:20,node-c:4'), { occupancy: () => occupancy });
         const member = await launch.tryAcquire();
         if (member) picked.push(member.context);
@@ -196,7 +226,7 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
 
   test('POOLGLOBAL-REG: a self-capped (gate) pool counts its own Jobs, not cluster occupancy — 17 occupied · own 1 · cap 8 → 7 free', async () => {
     let reads = 0;
-    const occupancy = () => { reads++; return { node-b: { occupied: 17 } } as Record<string, MemberOccupancy>; };
+    const occupancy = () => { reads++; return { 'node-b': { occupied: 17 } } as Record<string, MemberOccupancy>; };
     const gate = new PodPoolScheduler(parsePodPool('node-b:8'), { occupancy });
     const self = { selfCapped: true };
     expect((await gate.tryAcquire(undefined, undefined, self))?.context).toBe('node-b');   // the gate's own Job 1
@@ -747,7 +777,8 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       expect(nextAdmitted).toBe(false);
       expect(host.live()).toContainEqual(expect.objectContaining({ stage: 'job' }));
       phase = 'Failed';
-      for (let n = 0; n < 100 && !nextAdmitted; n++) await tick();
+      // Terminal evidence can wait 1s for a final Pod status before the Job releases its lease.
+      for (let n = 0; n < 300 && !nextAdmitted; n++) await tick();
       expect(nextAdmitted).toBe(true);
       await job.done;
       releaseNext = await next;
@@ -1329,6 +1360,27 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     });
     expect(matched.get('pool-node-b')?.action).toBe('shipped');
     expect(saves).toBe(1);
+  });
+
+  test('build fallback honors the injected ship lock and reports contention promptly', async () => {
+    const lockPath = imageShipLockPath('node-b', imageLockDir);
+    writeFileSync(lockPath, `${process.pid}\n`);
+    const run: RemoteRun = (_host, cmd) => {
+      if (cmd.includes('docker inspect k3d-elanous-registry')) return { status: 0, stdout: '', stderr: '' };
+      if (cmd.includes('/tags/list')) return { status: 0, stdout: JSON.stringify({ tags: [] }), stderr: '' };
+      if (cmd.includes('elanous.commit')) return { status: 0, stdout: 'old', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const result = await syncPoolImages(parsePodPool('pool-node-b@node-b:2'), 'img', 'target', {
+      run,
+      remoteBuild: async () => ({ ok: false, detail: 'build failed' }),
+      inspect: () => ({ status: 0, stdout: 'target' }),
+      transfer: () => { throw new Error('ship must wait for the injected lock'); },
+      waitMaxMs: 0,
+      lock: { dir: imageLockDir, retryMs: 1, staleMs: 60_000, maxTries: 3 },
+    });
+    expect(result.get('pool-node-b')).toMatchObject({ ok: false, action: 'failed' });
+    expect(result.get('pool-node-b')?.detail).toContain(`image ship lock: acquireLockSync: timed out at ${lockPath}`);
   });
 
   // ⭐ GATE-REGISTRY-IMAGE-FASTPATH (0.2.36): 레지스트리 manifest·config label(commit ⊕ pod-skills)이 이번 발사 값과

@@ -37,9 +37,9 @@ test('repository fleet intent agrees with duties and dated decision for each par
     expect(fleet(id).fleet?.cap).toBe(cap);
     expect(ledger.changes.at(-1)).toContain(`\`${pool}\`/approvalCapacity ${cap}`);
   }
-  expect(fleet('node-b').duties).toContain('`pool-node-b@node-b:8`');
+  expect(fleet('node-b').duties).toContain(String.fromCharCode(96) + 'pool-node-b@node-b:8' + String.fromCharCode(96));
   expect(fleet('node-b').duties).toContain('`k3d-elanous-pool:56`(approvalCapacity 20)');
-  expect(fleet('node-c').duties).toContain('`pool-node-c@node-c:6`(approvalCapacity 6');
+  expect(fleet('node-c').duties).toContain(String.fromCharCode(96) + 'pool-node-c@node-c:6' + String.fromCharCode(96) + '(approvalCapacity 6');
   expect(fleet('host-e').fleet?.sshName).toBe('host-e-wsl');
 });
 
@@ -96,7 +96,7 @@ test('accounts, tokens, pipes and line breaks are rejected without changing YAML
       expect(readFileSync(machineMarkdownPath(root), 'utf8')).toBe(markdownBefore);
     }
     // A pod pool spec carries «@» without being an account.
-    expect(() => setMachineField(root, 'mbp', 'duties', 'pods on `pool-node-b@node-b:8`')).not.toThrow();
+    expect(() => setMachineField(root, 'mbp', 'duties', 'pods on ' + String.fromCharCode(96) + 'pool-node-b@node-b:8' + String.fromCharCode(96))).not.toThrow();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

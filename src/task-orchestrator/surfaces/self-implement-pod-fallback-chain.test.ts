@@ -35,7 +35,7 @@ describe('Pod fallback chain relay', () => {
     expect(childConfig).toEqual({ llm: {
       fallbackChain: ['codex-rotate', 'grok'],
       zaiCodingPlan: { overage: 'openrouter' },
-    } });
+    }, harness: { worktreeAddTimeoutSec: 1200 } });
     expect(Object.keys(childConfig.llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
   });
 
@@ -46,9 +46,9 @@ describe('Pod fallback chain relay', () => {
       { stringData: Record<string, string> },
       { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
     ];
-    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } } });
+    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } });
     expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
-    expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!))).toEqual(['llm']);
+    expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!))).toEqual(['llm', 'harness']);
     const script = job.spec.template.spec.containers[0]!.args[0]!;
     expect(script).toContain('ELANOUS_POD_FALLBACK_CHAIN source=host steps=codex-rotate,codex-credits,grok');
     expect(script.indexOf('install -m 600 /creds/llm-fallback-config.json')).toBeLessThan(script.indexOf('elanous self implement'));
@@ -61,7 +61,7 @@ describe('Pod fallback chain relay', () => {
       { stringData: Record<string, string> },
       { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
     ];
-    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'grok'], zaiCodingPlan: { overage: 'stop' } } });
+    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'grok'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } });
     expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
     expect(job.spec.template.spec.containers[0]!.args[0]).toContain('ELANOUS_POD_FALLBACK_CHAIN source=default steps=codex-rotate,grok');
   });
@@ -79,7 +79,7 @@ describe('Pod fallback chain relay', () => {
         { stringData: Record<string, string> },
         { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
       ];
-      expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } } });
+      expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } });
       expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
       expect(job.spec.template.spec.containers[0]!.args[0]).toContain('ELANOUS_POD_FALLBACK_CHAIN source=host steps=codex-rotate,codex-credits,grok');
     } finally {
@@ -97,7 +97,7 @@ describe('Pod fallback chain relay', () => {
       { stringData: Record<string, string> },
       { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
     ];
-    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits'], zaiCodingPlan: { overage: 'stop' } } });
+    expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } });
     expect(job.spec.template.spec.containers[0]!.args[0]).not.toContain('unknown-step');
   });
 

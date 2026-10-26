@@ -19,7 +19,8 @@
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21.
  */
 import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import type { ReviewRework } from '../../self-dev/run-types.js';
+import type { ReviewRework, SelfDevJobResult } from '../../self-dev/run-types.js';
+import type { SelfImplementGateResult } from '../../self-implement/orchestrator.js';
 import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
 import { oldDoorInternalEnv } from '../../self-dev/old-door.js';
 import { selfDevRunsDir } from '../../self-dev/run-store.js';
@@ -52,11 +53,15 @@ export interface SelfImplementJobDone {
 export interface SelfImplementDisposition {
   stage?: string;
   ok?: boolean;
+  /** Measured child gate receipt, forwarded only for a failed gate. */
+  gate?: SelfImplementGateResult;
   worktreePath?: string;
   branch?: string;
   harvestable?: true;
   prUrl?: string;
   prNumber?: number;
+  /** Parent-side observation carried from the child's run ledger when available. */
+  goalPlanRevision?: SelfDevJobResult['goalPlanRevision'];
   /** Head SHA checked by the Pod before host regate. */
   checkedHeadCommit?: string;
   /** Review verdict only when the child bound a real pass to a clean, unchanged worktree head. */
@@ -99,6 +104,21 @@ export interface SelfImplementDisposition {
   childEvidence?: PodChildEvidence;
 }
 
+function isGoalPlanRevisionObservation(value: unknown): value is NonNullable<SelfDevJobResult['goalPlanRevision']> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  if (row.status === 'read') {
+    return Number.isSafeInteger(row.attempted) && Number(row.attempted) >= 0
+      && Number.isSafeInteger(row.applied) && Number(row.applied) >= 0
+      && Array.isArray(row.failureReasons) && row.failureReasons.every((reason) => typeof reason === 'string');
+  }
+  return row.status === 'read-failed'
+    && ['directory-missing', 'unreadable-directory', 'unreadable-files'].includes(String(row.reason))
+    && Number.isSafeInteger(row.scannedFiles) && Number(row.scannedFiles) >= 0
+    && Number.isSafeInteger(row.unreadableFiles) && Number(row.unreadableFiles) >= 0
+    && typeof row.ledgerDirectory === 'string';
+}
+
 export interface PodChildEvidence {
   /** Bounded, redacted diagnostics copied only from a failed child terminal result. */
   error?: string;
@@ -130,6 +150,10 @@ export interface PodChildEvidence {
     candidateCardId?: string;
     blockingCardId?: string;
   };
+  /** Harvest pointer and revision observation copied before the parent Pod stop is finalized. */
+  harvestable?: true;
+  prNumber?: number;
+  goalPlanRevision?: SelfDevJobResult['goalPlanRevision'];
 }
 
 const SCOPE_STOP_REASON_ORDER: readonly ScopeStopReason[] = SCOPE_STOP_REASONS;
@@ -208,6 +232,9 @@ export function podChildEvidenceFromResult(o: Record<string, unknown>): PodChild
     ...(o.goalCauseObserved === true ? { goalCauseObserved: true } : {}),
     ...(o.terminationReason !== undefined ? { terminationReason: scrubValue(o.terminationReason) } : {}),
     ...(accountAvailability ? { accountAvailability } : {}),
+    ...(o.harvestable === true && typeof o.branch === 'string' && o.branch.trim() ? { harvestable: true } : {}),
+    ...(typeof o.prNumber === 'number' && Number.isSafeInteger(o.prNumber) && o.prNumber > 0 ? { prNumber: o.prNumber } : {}),
+    ...(isGoalPlanRevisionObservation(o.goalPlanRevision) ? { goalPlanRevision: o.goalPlanRevision } : {}),
   };
   if (o.ok === false && typeof o.error === 'string'
     && /draft PR 생성 실패|PR (?:gh|guard) 실패|same-cell reuse:/u.test(o.error)) {
@@ -625,11 +652,15 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
       const mapped: SelfImplementDisposition = {
         ...(typeof o.stage === 'string' ? { stage: o.stage } : {}),
         ...(typeof o.ok === 'boolean' ? { ok: o.ok } : {}),
+        ...(o.stage === 'gate-failed' && o.ok === false && o.gate && typeof o.gate === 'object'
+          && !Array.isArray(o.gate) && (o.gate as { passed?: unknown }).passed === false
+          ? { gate: o.gate as SelfImplementGateResult } : {}),
         ...(typeof o.worktreePath === 'string' ? { worktreePath: o.worktreePath } : {}),
         ...(typeof o.branch === 'string' ? { branch: o.branch } : {}),
         ...(o.harvestable === true && typeof o.branch === 'string' && o.branch.trim() ? { harvestable: true } : {}),
         ...(typeof o.prUrl === 'string' ? { prUrl: o.prUrl } : {}),
-        ...(typeof o.prNumber === 'number' ? { prNumber: o.prNumber } : {}),
+        ...(Number.isSafeInteger(o.prNumber) && Number(o.prNumber) > 0 ? { prNumber: Number(o.prNumber) } : {}),
+        ...(isGoalPlanRevisionObservation(o.goalPlanRevision) ? { goalPlanRevision: o.goalPlanRevision } : {}),
         ...(typeof o.checkedHeadCommit === 'string' ? { checkedHeadCommit: o.checkedHeadCommit } : {}),
         ...(o.reviewedHeadCommit && typeof o.reviewedHeadCommit === 'string' && /^[0-9a-f]{40}$/i.test(o.reviewedHeadCommit)
           && o.review && typeof o.review === 'object' && !Array.isArray(o.review)

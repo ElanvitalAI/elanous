@@ -37,6 +37,10 @@ const observedLandRefusals = [
   ["✗ heavy-remote: 원격 게이트 gate-rc-1 · remote: stderr: 건드린 src/scripts 파일과 baseline 밖 test 파일은 tsc 클린이어야 합니다(touch-clean). | stderr: [tsc-gate] FAIL — 타입 에러가 있다 (범위·파일·건수는 위 [tsc-gate] FAIL 줄). | stdout: [tsc-gate] PWA env 패스 — 루트 비시험 2개 (Next ProcessEnv 선언 포함). | stdout: [tsc-cache] miss-cold key=1b7fd47da2c1 warmRc=2 coldRc=2 warmGate=FAIL coldGate=FAIL normalized=same — 로컬 게이트로 폴백하지 않는다.", "gate-touch-clean", "next-move"], // land-28888-2104.log
 ] as const;
 
+test('a named remote host reports gate-host-busy', () => {
+  expect(classifyPrLandRefusal('✗ heavy-remote: fixture-node 게이트 gate-host-busy — 로컬 게이트로 폴백하지 않는다.')).toBe('gate-host-busy');
+});
+
 for (const [line, label, destination] of observedLandRefusals) {
   test(`captured land refusal ${label} routes to ${destination}: ${line.slice(0, 50)}`, () => {
     expect(classifyPrLandRefusal(line)).toBe(label);

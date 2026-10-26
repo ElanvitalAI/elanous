@@ -55,7 +55,7 @@ if (process.argv[2] === 'rev-list') console.log('0');
     writeFileSync(notes, '# Release\n');
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(-2)).toEqual(['tui', 'failed']);
+    expect(first.path.slice(-3)).toEqual(['tui', 'traffic-failed-restore', 'failed']);
     const stateFile = join(root, 'graph-runs', 'release-loop', `${first.runId}.json`);
     const before = readFileSync(stateFile, 'utf8');
     const deps = { root, graphPath, git, runBash };
@@ -139,7 +139,7 @@ if (process.argv[2] === 'rev-list') console.log('0');
     writeFileSync(notes, '# Release\n');
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(-2)).toEqual(['tui', 'failed']);
+    expect(first.path.slice(-3)).toEqual(['tui', 'traffic-failed-restore', 'failed']);
     // A killed or timed-out node is recorded with exit null; rewrite the saved ledger to that shape.
     const stateFile = join(root, 'graph-runs', 'release-loop', `${first.runId}.json`);
     const saved = JSON.parse(readFileSync(stateFile, 'utf8')) as GraphRunState;
@@ -190,13 +190,13 @@ if (process.argv[2] === 'rev-list') console.log('0');
       writeFileSync(notes, '# Release\n');
       const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
       expect(first.status).toBe('failed');
-      expect(first.path.slice(-3)).toEqual(['gate', 'gate-triage', 'failed']);
+      expect(first.path.slice(-4)).toEqual(['gate', 'gate-triage', 'traffic-failed-restore', 'failed']);
       const stateFile = join(root, 'graph-runs', 'release-loop', `${first.runId}.json`);
       if (shape === 'stopped') {
         // The ledger `graph runs stop` leaves when it cuts a running gate (manageGraphRun): the gate is the last record.
         const saved = JSON.parse(readFileSync(stateFile, 'utf8')) as GraphRunState;
         // A stopped gate never reaches either the shadow triage or failed node.
-        saved.path.splice(-2); saved.nodes.splice(-2);
+        saved.path.splice(-3); saved.nodes.splice(-3);
         saved.nodes[saved.nodes.length - 1] = { nodeId: 'gate', ok: false, exit: null, executed: false, error: STOPPED_NODE_ERROR, endedAt: '2026-10-12T00:10:00.000Z' };
         saved.executed = saved.nodes.filter((node) => node.executed).length;
         writeFileSync(stateFile, `${JSON.stringify(saved, null, 2)}\n`);
@@ -293,7 +293,7 @@ test('rerunning a waived tui without waiver retires only its recorded issue befo
     const deps = { root, graphPath, git, runBash };
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18',
       acceptedRegressions: [{ id: 'R2', note: 'Settings do not persist' }] }, deps: { root, runBash } });
-    expect(first.path.slice(-2)).toEqual(['tui', 'failed']);
+    expect(first.path.slice(-3)).toEqual(['tui', 'traffic-failed-restore', 'failed']);
     const waived = await resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui', reason: 'Help does not close when requested' }, deps);
     expect(waived.state.status).toBe('failed');
     expect(waived.state.path).toContain('known-issues');
@@ -353,7 +353,7 @@ test('restarting before a waived tui (from mac-smoke) drops the waiver record an
     const deps = { root, graphPath, git, runBash };
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18',
       acceptedRegressions: [{ id: 'R2', note: 'Settings do not persist' }] }, deps: { root, runBash } });
-    expect(first.path.slice(-2)).toEqual(['tui', 'failed']);
+    expect(first.path.slice(-3)).toEqual(['tui', 'traffic-failed-restore', 'failed']);
     const waived = await resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui', reason: 'Help does not close when requested' }, deps);
     expect(waived.state.status).toBe('failed');
     expect(waived.state.path).toContain('known-issues');

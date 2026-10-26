@@ -284,7 +284,7 @@ describe('HQ lease (HQ-HB)', () => {
       read: () => backing.read(),
       cas: (expected, next) => {
         const proposed = parseLease(next);
-        if (proposed?.views?.node-b) {
+        if (proposed?.views?.['node-b']) {
           const current = parseLease(backing.raw)!;
           backing.raw = serializeLease({ ...current, holder: 'node-b', generation: 2, renewedAt: clock });
           return false;
@@ -304,7 +304,7 @@ describe('HQ lease (HQ-HB)', () => {
     const standby = hqHeartbeat(deps('node-b', store, fakeSsh(new Set())));
     expect(standby).toMatchObject({ outcome: 'standby', holder: 'mbp', holderReachable: false });
     expect(() => readFileSync(join(dir, 'lease-cache'))).toThrow(); // FENCE-LIGHT: a standby never writes the fast-path hint
-    expect(parseLease(store.raw)?.views?.node-b).toMatchObject({ target: 'mbp', reachable: false, at: clock });
+    expect(parseLease(store.raw)?.views?.['node-b']).toMatchObject({ target: 'mbp', reachable: false, at: clock });
     expect(logs.some(([c, e]) => c === 'hq.lease' && e === 'standby')).toBe(true);
   });
 });
@@ -315,7 +315,7 @@ describe('quorum (OP 08:40 rule ①②③)', () => {
     hqLease('acquire', deps('mbp', store, fakeSsh(new Set())));
     store.down = true;
     clock += 3000; // past TTL — the standby link alone keeps quorum
-    const decided = hqFenceDecision('telegram-poller', deps('mbp', store, fakeSsh(new Set(['node-b']), { node-b: '{"generation":1}' })));
+    const decided = hqFenceDecision('telegram-poller', deps('mbp', store, fakeSsh(new Set(['node-b']), { 'node-b': '{"generation":1}' })));
     expect(decided).toMatchObject({ run: true, reason: 'quorum-standby', generation: 1 });
   });
 
@@ -407,7 +407,7 @@ describe('quorum (OP 08:40 rule ①②③)', () => {
   });
 
   test('arbiter alone cannot promote: the standby still reaches mbp', () => {
-    const r = decideArbiterCheck({ holder: 'mbp', generation: 1, acquiredAt: 0, renewedAt: 0, ttlSeconds: 1500, views: { node-b: { target: 'mbp', reachable: true, at: 100 } }, dualUnreachableStreak: 1 },
+    const r = decideArbiterCheck({ holder: 'mbp', generation: 1, acquiredAt: 0, renewedAt: 0, ttlSeconds: 1500, views: { 'node-b': { target: 'mbp', reachable: true, at: 100 } }, dualUnreachableStreak: 1 },
       { arbiter: 'cloud-vm', standby: 'node-b', arbiterReachesHolder: false, now: 200 });
     expect(r).toMatchObject({ promoted: false, streak: 0 });
   });
@@ -424,7 +424,7 @@ describe('quorum (OP 08:40 rule ①②③)', () => {
       .toMatchObject({ run: false, reason: 'not-holder', holder: 'node-b', generation: 2 });
     // mbp comes back with arbiter unreachable but node-b reachable: node-b reports generation 2 > 1.
     store.down = true;
-    expect(hqFenceDecision('git-push', deps('mbp', store, fakeSsh(new Set(['node-b']), { node-b: JSON.stringify(readLocal(join(dir, 'node-b.json'))) }))))
+    expect(hqFenceDecision('git-push', deps('mbp', store, fakeSsh(new Set(['node-b']), { 'node-b': JSON.stringify(readLocal(join(dir, 'node-b.json'))) }))))
       .toMatchObject({ run: false, reason: 'stale-generation', generation: 2 });
   });
 

@@ -23,3 +23,15 @@ test('session snapshots distinguish live work, completed results, missing promis
   expect(status.accept('not json')).toBe(false);
   expect(status.accept(JSON.stringify({ sessionId: 'session-c', promised: true, running: -1, pending: 0 }))).toBe(false);
 });
+
+test('restores last observed job state when switching back to a session', () => {
+  const status = new BackgroundJobStatus('session-a');
+  status.accept(JSON.stringify({ sessionId: 'session-a', promised: true, running: 2, pending: 0 }));
+  status.setSessionId('session-b');
+  expect(status.snapshot()).toBeNull();
+  status.accept(JSON.stringify({ sessionId: 'session-b', promised: false, running: 0, pending: 1 }));
+  status.setSessionId('session-a');
+  expect(status.snapshot()).toEqual({ sessionId: 'session-a', promised: true, running: 2, pending: 0 });
+  status.setSessionId('session-b');
+  expect(status.snapshot()).toEqual({ sessionId: 'session-b', promised: false, running: 0, pending: 1 });
+});

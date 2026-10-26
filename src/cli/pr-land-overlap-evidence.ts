@@ -21,11 +21,13 @@
  *   하나라도 못 재거나 어긋나면 거부 — 호출부는 종전 거부를 그대로 낸다(fail-closed).
  * - 관측: `pr.land` · `overlap-evidence` (decision · reason · 잰 값).
  */
+import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { CmdRunner } from '../autopilot/pr-manager.js';
 import { parseReviewResultOutput } from '../task-agent/review-result-capture.js';
 import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
+import { proveReviewCarry } from './review-carry.js';
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 
@@ -36,6 +38,8 @@ interface OverlapEvidenceFile {
   gate?: { head: string; baseCommit: string; passed: boolean };
   /** `self review --json` stdout 을 받은 파일(TA: `<state>/review-results/<card>-<pr>-<head접두 10~40>.json`); 내용의 전체 head도 확인한다. */
   reviewResult: string;
+  /** Explicit old-head review for a mechanically merged main head. Always re-proved against Git. */
+  reviewCarry?: { oldHead: string; oldBase: string; newBase: string; patchId: string; pathsModesHash: string; reviewSha256: string };
   /** Evidence-file override for explicitly replaced failed reviews. Each reason is the verifier's refusal reason. */
   supersedes?: { reviewResult: string; reason: string }[];
   /** OPEN follow-up PR that owns the findings intentionally split from this landing. */
@@ -82,9 +86,15 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
   let names: readonly string[];
   try { names = input.listDir(dir); } catch { return { ok: false, reason: 'review-attempts-unmeasured' }; }
   const filename = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._-]*-${input.pr}-([a-f0-9]{10,40})\\.json$`, 'i');
-  const candidates = [...names].filter((name) => {
+  const selectedHead = e.reviewCarry?.oldHead?.toLowerCase() ?? head;
+  // A fresh review of the merged head supersedes carry. Never hide a failed current-head attempt.
+  if (e.reviewCarry && names.some((name) => {
     const match = filename.exec(name);
     return Boolean(match && head.startsWith(match[1]!.toLowerCase()));
+  })) return { ok: false, reason: 'carry-new-head-review-exists' };
+  const candidates = [...names].filter((name) => {
+    const match = filename.exec(name);
+    return Boolean(match && selectedHead.startsWith(match[1]!.toLowerCase()));
   }).map((name) => join(dir, name));
   if (!candidates.includes(selected)) return { ok: false, reason: 'review-selected-missing' };
   let physicalDir: string;
@@ -127,7 +137,7 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
   }
   for (const path of candidates) {
     if (path === selected) continue;
-    const review = checkReview(input, { reviewResult: path }, head);
+    const review = checkReview(input, { reviewResult: path }, selectedHead);
     if (review.ok) {
       if (superseded.has(path)) return { ok: false, reason: 'review-supersedes-passing' };
       continue;
@@ -324,8 +334,12 @@ type Checked = { ok: false; reason: string; baseTip?: string; gateBase?: string;
 const ACCEPTED_REVIEW_VERDICTS: ReadonlySet<string> = new Set(['pass', 'warn']);
 const COMMIT_MARK = '\u0001';
 
-function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'>, e: Partial<OverlapEvidenceFile>, head: string, baseTip?: string): { ok: false; reason: string; baseTip?: string } | { ok: true; reviewResult: string } {
+function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> & Partial<Pick<VerifyOverlapEvidenceInput, 'cwd' | 'remote' | 'branch'>>,
+  e: Partial<OverlapEvidenceFile>, head: string, baseTip?: string): { ok: false; reason: string; baseTip?: string } | { ok: true; reviewResult: string } {
   if (typeof e.reviewResult !== 'string' || !e.reviewResult) return { ok: false, reason: 'review-missing', baseTip };
+  const carry = e.reviewCarry;
+  const reviewHead = carry?.oldHead?.toLowerCase() ?? head;
+  if (carry && (!SHA40.test(reviewHead) || reviewHead === head)) return { ok: false, reason: 'carry-invalid-old-head', baseTip };
   // TA 가 받는 자리(`<state>/review-results/<card>-<pr>-<head접두 10~40>.json` · reviewResultPath)만; 내용의 전체 head도 확인한다.
   const resultName = basename(e.reviewResult);
   const resultMatch = /^([A-Za-z0-9][A-Za-z0-9._-]*)-(\d+)-([a-f0-9]{10,40})\.json$/i.exec(resultName);
@@ -333,7 +347,7 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'>,
     || !resultMatch
     || Number(resultMatch[2]) !== input.pr
     || resultMatch[3]!.length < 10
-    || !head.startsWith(resultMatch[3]!.toLowerCase())) {
+    || !reviewHead.startsWith(resultMatch[3]!.toLowerCase())) {
     return { ok: false, reason: 'review-path-not-for-this-pr-head', baseTip };
   }
   let text: string;
@@ -341,7 +355,7 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'>,
   const review = parseReviewResultOutput(text);
   if (!review) return { ok: false, reason: 'review-no-result', baseTip };
   if (review.pr !== input.pr) return { ok: false, reason: 'review-pr-mismatch', baseTip };
-  if (!review.head || review.head.toLowerCase() !== head) return { ok: false, reason: 'review-head-mismatch', baseTip };
+  if (!review.head || review.head.toLowerCase() !== reviewHead) return { ok: false, reason: 'review-head-mismatch', baseTip };
   // The capture parser projects away model provenance; inspect the same last result-shaped line here.
   const raw = lastReviewRecord(text);
   if (raw) {
@@ -377,6 +391,25 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'>,
   if (review.reviewed !== true) return { ok: false, reason: 'review-not-reviewed', baseTip };
   if (review.verdict === null || !ACCEPTED_REVIEW_VERDICTS.has(review.verdict)) return { ok: false, reason: `review-verdict-${review.verdict ?? 'null'}`, baseTip };
   if (review.mustFix !== 0) return { ok: false, reason: review.mustFix === null ? 'review-must-fix-unknown' : `review-must-fix-${review.mustFix}`, baseTip };
+  if (carry) {
+    if (!input.cwd || !input.remote || !input.branch) return { ok: false, reason: 'carry-repo-unmeasured', baseTip };
+    const digest = createHash('sha256').update(text).digest('hex');
+    if (carry.reviewSha256 !== digest) return { ok: false, reason: 'carry-review-hash-mismatch', baseTip };
+    const proof = proveReviewCarry(input.cwd, reviewHead, head, input.remote, input.branch);
+    if (!proof.ok) return { ok: false, reason: proof.reason, baseTip };
+    const gate = e.gate;
+    if (!gate || gate.passed !== true || gate.head?.toLowerCase() !== head
+      || gate.baseCommit?.toLowerCase() !== proof.newBase) {
+      return { ok: false, reason: 'carry-new-head-gate-missing-or-mismatch', baseTip };
+    }
+    if (carry.oldBase?.toLowerCase() !== proof.oldBase || carry.newBase?.toLowerCase() !== proof.newBase
+      || carry.patchId?.toLowerCase() !== proof.patchId || carry.pathsModesHash?.toLowerCase() !== proof.pathsModesHash) {
+      return { ok: false, reason: 'carry-proof-mismatch', baseTip };
+    }
+    debug.log('pr.land', 'review-carry', { pr: input.pr, remote: input.remote, branch: input.branch,
+      oldHead: reviewHead, newHead: head, oldBase: proof.oldBase,
+      newBase: proof.newBase, patchId: proof.patchId, reviewSha256: digest, decision: 'accepted' });
+  }
   return { ok: true, reviewResult: e.reviewResult };
 }
 

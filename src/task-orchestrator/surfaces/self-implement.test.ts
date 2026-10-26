@@ -63,6 +63,28 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
     expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"branch":"self-impl/finished"}')?.harvestable).toBeUndefined();
     expect(parseSelfImplementJson('{"stage":"timed-out","ok":false,"harvestable":true}')?.harvestable).toBeUndefined();
   });
+  test('aborted harvestable child keeps PR number and a present goal revision observation for the parent', () => {
+    const goalPlanRevision = { status: 'read', attempted: 1, applied: 0, failureReasons: ['expected-text-not-found'] };
+    const parsed = parseSelfImplementJson(JSON.stringify({ stage: 'aborted', ok: false,
+      branch: 'self-impl/aborted', harvestable: true, prNumber: 30155, goalPlanRevision }));
+    expect(parsed).toMatchObject({ harvestable: true, prNumber: 30155, goalPlanRevision });
+    expect(parsed?.childEvidence).toMatchObject({ harvestable: true, prNumber: 30155, goalPlanRevision });
+    expect(parseSelfImplementJson(JSON.stringify({ stage: 'aborted', ok: false, harvestable: true, prNumber: -1 }))?.childEvidence)
+      .not.toHaveProperty('harvestable');
+    expect(parseSelfImplementJson(JSON.stringify({ stage: 'aborted', ok: false, branch: 'self-impl/aborted', harvestable: true,
+      prNumber: 30155.5 }))?.prNumber).toBeUndefined();
+  });
+  test('aborted harvestable child keeps a valid read-failed observation and rejects malformed evidence', () => {
+    const readFailure = { status: 'read-failed', reason: 'unreadable-files', scannedFiles: 2,
+      unreadableFiles: 1, ledgerDirectory: '/tmp/ledger' };
+    const parsed = parseSelfImplementJson(JSON.stringify({ stage: 'aborted', ok: false,
+      branch: 'self-impl/aborted', harvestable: true, prNumber: 30155, goalPlanRevision: readFailure }));
+    expect(parsed?.childEvidence).toMatchObject({ goalPlanRevision: readFailure });
+    expect(parseSelfImplementJson(JSON.stringify({ stage: 'aborted', ok: false,
+      branch: 'self-impl/aborted', harvestable: true, prNumber: 30155,
+      goalPlanRevision: { ...readFailure, reason: 'unknown', unreadableFiles: 3 } }))?.childEvidence)
+      .not.toHaveProperty('goalPlanRevision');
+  });
   test('Pod failure keeps child classification facts and calls held out-of-scope edits with a stop reason scope-escape', () => {
     const abandonedClassification = { classification: 'implementation-deficit', classificationBasis: 'no-clean-worktree', worktreeClean: false };
     const accountAvailability = { reason: 'no-candidate', candidateCount: 0 };

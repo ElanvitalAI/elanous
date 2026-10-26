@@ -402,7 +402,7 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
     name: SCHEDULE_WAKEUP_TOOL_NAME,
     description:
       'Wake THIS TUI later with an internal turn: when you would write «다음 점검 HH:MM» and end the turn, call this instead so the check actually happens. '
-      + 'action=schedule (default) needs reason plus one of at ("HH:MM" local, past → tomorrow) / delaySeconds (≥60) / repeatMinutes (≥1; repeats expire after 7 days). Never provide both at and delaySeconds; the schema requires one timing variant. '
+      + 'action=schedule (default) needs reason plus one of at ("HH:MM" local, past → tomorrow) / delaySeconds (≥60) / repeatMinutes (≥1; repeats expire after 7 days). Never provide both at and delaySeconds; the scheduler validates the timing choice. '
       + 'ONE-SHOT (wake once): give only delaySeconds or at and OMIT repeatMinutes (0 also means one-shot). Set repeatMinutes only when you really want it to repeat. '
       + `action=list shows pending wakeups; action=cancel needs id. Limits: ≥60s ahead, ≤7 days, at most 5 pending, at most ${WAKEUP_MAX_CALLS_PER_TURN} schedule/cancel calls per turn. `
       + 'If the TUI is busy or the human is typing at that time it retries once a minute later, then gives up (repeats move to the next tick). '
@@ -418,11 +418,6 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
         id: { type: 'string', description: 'Wakeup id for action=cancel (from schedule/list).' },
       },
       required: [],
-      oneOf: [
-        { not: { anyOf: [{ required: ['at'] }, { required: ['delaySeconds'] }] } },
-        { required: ['at'], not: { required: ['delaySeconds'] } },
-        { required: ['delaySeconds'], not: { required: ['at'] } },
-      ],
     },
     handler: async (args) => {
       const action = typeof args.action === 'string' ? args.action : 'schedule';

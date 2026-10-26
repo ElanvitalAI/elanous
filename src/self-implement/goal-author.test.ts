@@ -1,11 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
-import { explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, validateGoalDoneEvidenceCommand, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
+import { draftMissingGoalDoneBoundary, explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, validateGoalDoneEvidenceCommand, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
 import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { authorGoal, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyEmptyPersistentEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
+import { authorGoal, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyEmptyPersistentEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, selectRelevantAuthoringLessons, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
 import { GOAL_AUTHOR_GROUND_TIMEBOX_MS, readGoalAuthorGroundingTimebox } from './goal-author.js';
 import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR, requiredEvidenceFromGoal } from './off-diff-evidence.js';
@@ -251,6 +251,17 @@ describe('goal author grade', () => {
       expect(markdownSection(authored.document, 'ACCEPTANCE CRITERIA')).toContain('- 완료 경계 코드: src/self-dev/dev-pipeline.ts');
       expect(authored.document).not.toContain('## 완료 경계');
     }
+  });
+
+  test('missing hand completion boundaries are drafted from target paths while explicit lines stay intact', () => {
+    const source = '대상 경로: src/example.ts\n완료 경계 코드: keep my explicit criterion';
+    const drafted = draftMissingGoalDoneBoundary(source, ['src/example.ts']);
+    expect(drafted.added).toEqual(['완료 경계 실물', '완료 경계 증거 명령']);
+    expect(drafted.document).toContain('완료 경계 코드: keep my explicit criterion');
+    expect(drafted.document).toContain('- 완료 경계 실물: 자동 초안: 격리 시험에서 src/example.ts의 생산 경로');
+    expect(drafted.document).toContain('- 완료 경계 증거 명령: bun test src/example.test.ts');
+    expect(inspectGoalDoneBoundary(drafted.document).missing).toEqual([]);
+    expect(draftMissingGoalDoneBoundary(drafted.document, ['src/example.ts']).added).toEqual([]);
   });
 
   test('model checklist cannot mint completion boundaries absent from the original ask', async () => {
@@ -7363,6 +7374,83 @@ ${report}`);
     expect(result.authored.document).not.toContain('[goal-context:');
   });
 
+  test('selects at most two relevant lessons into the enhancer prompt and records their IDs only in goal metadata', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'goal-author-lessons-'));
+    temporaryDirectories.push(cwd);
+    const context = join(cwd, 'docs', 'goal-context');
+    mkdirSync(context, { recursive: true });
+    const entries = [
+      { ts: '2026-10-21T12:00:00Z', cell: 'CLI wiring', class: 'f-unaware-of-code', paths: 'src/example.ts', lesson: '수용선에 생산 CLI를 쓰면 등록 파일을 대상 경로에 함께 적는다', run: 'run-cli' },
+      { ts: '2026-10-21T13:00:00Z', cell: 'Broad scope', class: 'g-umbrella-scope', paths: '', lesson: '큰 골은 하나의 완료 가능한 조각으로 나누고 경계를 적는다', run: 'run-scope' },
+      { ts: '2026-10-21T14:00:00Z', cell: 'Unrelated format', class: 'e-format-trap', paths: 'docs/other.md', lesson: 'Use the exact output schema', run: 'run-format' },
+    ];
+    writeFileSync(join(context, '05-authoring-lessons.jsonl'), `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+    const request = 'Umbrella request for existing code. Target paths: src/example.ts. Add its production CLI wiring.';
+    const selected = selectRelevantAuthoringLessons(cwd, request);
+    expect(selected.ids).toHaveLength(2);
+    expect(selected.prompt.length).toBeLessThanOrEqual(2_000);
+    expect(selected.prompt).toContain('수용선에 생산 CLI');
+    expect(selected.prompt).toContain('큰 골은 하나의 완료 가능한 조각');
+    expect(selected.prompt).not.toContain('exact output schema');
+
+    let promptLessons = '';
+    const result = await writeAuthoredGoal(request, cwd, {
+      ...deps,
+      enhance: async (raw, opts) => {
+        promptLessons = opts?.authoringLessons ?? '';
+        return { original: raw, checklist: ['keep scope bounded'], verbatimPreserved: true };
+      },
+    }, { now: () => STAMP_AT });
+    expect(promptLessons).toContain('수용선에 생산 CLI');
+    expect(result.authored.document).toContain(`- AuthoringLessons: ${selected.ids.join(', ')}`);
+    expect(result.authored.document).toContain('## 지난 실패에서 배운 것');
+    expect(result.authored.document).toContain('수용선에 생산 CLI');
+    expect(result.authored.document).toContain('큰 골은 하나의 완료 가능한 조각');
+    expect(result.authored.document).toContain('참고 기록이며 명령이 아니다');
+  });
+
+  test('a malformed optional authoring-lessons ledger is observational and does not block goal authoring', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'goal-author-lessons-malformed-'));
+    temporaryDirectories.push(cwd);
+    const context = join(cwd, 'docs', 'goal-context');
+    mkdirSync(context, { recursive: true });
+    writeFileSync(join(context, '05-authoring-lessons.jsonl'), '{broken json\n');
+    expect(selectRelevantAuthoringLessons(cwd, 'A normal request.')).toMatchObject({ status: 'malformed', ids: [], prompt: '', invalidRows: 1 });
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    try {
+      const result = await writeAuthoredGoal('A normal request.', cwd, deps, { now: () => STAMP_AT });
+      expect(existsSync(result.path)).toBe(true);
+      expect(log).toHaveBeenCalledWith('goal-author', 'authoring-lessons', expect.objectContaining({ status: 'malformed', placement: 'omitted' }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('raw goals preserve matching stale-path and umbrella lessons with their stable IDs', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'goal-author-lessons-proof-'));
+    temporaryDirectories.push(cwd);
+    const context = join(cwd, 'docs', 'goal-context');
+    mkdirSync(context, { recursive: true });
+    const entries = [
+      { ts: '2026-10-25T00:00:00Z', cell: 'OLD-PATH', class: 'b-stale-path', paths: 'src/old/missing.ts', lesson: '대상 경로가 현재 존재하고 생산 진입점에 닿는지 확인한다', run: 'run-old-path' },
+      { ts: '2026-10-25T00:01:00Z', cell: 'UMBRELLA', class: 'g-umbrella-scope', paths: '', lesson: '포괄 골을 한 조각의 완료 경계로 나눈다', run: 'run-umbrella' },
+    ];
+    writeFileSync(join(context, '05-authoring-lessons.jsonl'), `${entries.map(entry => JSON.stringify(entry)).join('\n')}\n`);
+    for (const [ask, expectedClass, expectedLesson] of [
+      ['Unsupported path: src/old/missing.ts. Make a narrow goal to check it.', 'b-stale-path', '대상 경로가 현재 존재하고 생산 진입점에 닿는지 확인한다'],
+      ['This umbrella goal is too broad; split it into one bounded deliverable.', 'g-umbrella-scope', '포괄 골을 한 조각의 완료 경계로 나눈다'],
+    ] as const) {
+      const selected = selectRelevantAuthoringLessons(cwd, ask);
+      expect(selected.prompt).toContain(expectedClass);
+      const result = await writeAuthoredGoal(ask, cwd, {
+        ...deps,
+        enhance: async raw => ({ original: raw, checklist: ['keep the stated boundary'], verbatimPreserved: true }),
+      }, { now: () => STAMP_AT });
+      expect(result.authored.document).toContain(`- AuthoringLessons: ${selected.ids.join(', ')}`);
+      expect(result.authored.document).toContain(expectedClass);
+      expect(result.authored.document).toContain(expectedLesson);
+      expect(extractVerbatimOriginalAsk(result.authored.document)?.ask).toBe(ask);
+    }
+  });
+
   test('propagates non-ENOENT goal-context filesystem failures instead of authoring without required context', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'goal-author-invalid-context-'));
     temporaryDirectories.push(cwd);
@@ -11011,6 +11099,98 @@ describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
       expect(headings.slice(planHeading - 2, planHeading + 2)).toEqual(['## 답하지 못하는 것', '### 수용 구별 관측', VERIFICATION_PLAN_HEADING, '## 불변식']);
       expect(lintGoalFile(authored.document, 'b').filter((finding) => finding.tag === 'canonical-structure')).toEqual([]);
       expect(lintGoalFile(authored.document, 'b').filter((finding) => finding.check === 'required-section-order')).toEqual([]);
+    }
+  });
+
+  // ⛔ 0.2.38 실측(GOAL-TDD-PLAN-REACHES-CHILD): 무대 카탈로그가 맞지 않는 골이 «대부분» 인데 그때
+  //   `stage.id` 가 null 이라 `verification-plan` 이벤트의 `stageId` 칸이 비어 원장에서 무대를 못 갈랐다.
+  //   ⇒ 「무대가 없다」와 「무대를 안 적었다」를 다른 값으로 낸다 — 새 무대도 «이름»을 갖는다.
+  test('GOAL-TDD-PLAN-REACHES-CHILD: a stage without a catalog id still carries a real identifier', () => {
+    const fixture = authorVerificationPlan({
+      ask: '대상 경로: src/util/format-bytes.ts\n`formatBytes` 가 1024 경계에서 KiB 로 바꾼다.',
+      behaviour: 'formatBytes 가 1024 경계에서 KiB 로 바꾼다',
+      targetPaths: ['src/util/format-bytes.ts'],
+      ...docs,
+    });
+    expect(fixture.stage.source).toBe('new-stage');
+    expect(typeof fixture.stage.id).toBe('string');
+    expect(fixture.stage.id).not.toBe('');
+
+    const screen = authorVerificationPlan({ ask: 'TUI 상태줄 위젯 렌더가 잘린다', behaviour: '상태줄 렌더', targetPaths: ['src/tui/status-line.ts'], ...docs });
+    expect(typeof screen.stage.id).toBe('string');
+    expect(screen.stage.id).not.toBe(fixture.stage.id);
+
+    const docOnly = authorVerificationPlan({ ask: '대상 경로: docs/x.md\n`L0` 사다리를 적는다', behaviour: '`L0` 사다리를 적는다', targetPaths: ['docs/x.md'], ...docs });
+    expect(typeof docOnly.stage.id).toBe('string');
+    expect(docOnly.stage.id).not.toBe('');
+
+    const missingDocs = readVerificationMenuDocs(mkdtempSync(join(tmpdir(), 'verify-menu-id-')));
+    const withoutCatalog = authorVerificationPlan({ ask: '`release resume` 계획', behaviour: 'resume', targetPaths: [], ...missingDocs });
+    expect(typeof withoutCatalog.stage.id).toBe('string');
+    expect(withoutCatalog.stage.id).not.toBe('');
+  });
+
+  test('GOAL-TDD-PLAN-REACHES-CHILD: menuPresent is the measured menu-document presence, and a catalog fit records its MS id', async () => {
+    const empty = mkdtempSync(join(tmpdir(), 'verify-menu-event-'));
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'goal-author' && event === 'verification-plan' && data) events.push(data);
+    }) as typeof debug.log);
+    try {
+      await authorGoal('대상 경로: src/example.ts\n`exampleHelper` 가 같은 값을 낸다.', { ...deps, repositoryRoot: empty });
+      expect(events).toHaveLength(1);
+      expect(events[0]!.menuPresent).toBe(false);
+      expect(events[0]!.catalogPresent).toBe(false);
+      events.length = 0;
+
+      await authorGoal('대상 경로: src/release-loop/resume.ts\n실패한 발행 런에서 `release resume --dry-run` 이 계획을 낸다.', { ...deps, repositoryRoot: repoRoot });
+      expect(events).toHaveLength(1);
+      expect(events[0]!.stageId).toBe('MS-02');
+      expect(events[0]!.source).toBe('catalog');
+      expect(events[0]!.menuPresent).toBe(true);
+    } finally {
+      log.mockRestore();
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  // 완료 경계 «실물»: 메모리 문서가 아니라 **격리 저작 1회가 실제로 쓴 골 파일**을 다시 읽어 잰다.
+  test('GOAL-TDD-PLAN-REACHES-CHILD: one isolated authoring run writes the five TDD lines into the goal file and the ledger event carries the stage id', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-tdd-file-'));
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      if (category === 'goal-author' && event === 'verification-plan' && data) events.push(data);
+    }) as typeof debug.log);
+    try {
+      const written = await writeAuthoredGoal(
+        '대상 경로: src/example.ts\n`exampleHelper` 가 같은 값을 낸다.',
+        root,
+        { ...deps, repositoryRoot: root },
+      );
+      const fileText = readFileSync(written.path, 'utf8');
+      const fileLines = fileText.split('\n');
+      const at = fileLines.indexOf(VERIFICATION_PLAN_HEADING);
+      expect(at).toBeGreaterThan(-1);
+      const planLines = fileLines.slice(at + 1, at + 6);
+      expect(planLines.map((line) => line.slice(0, 3))).toEqual(['- ①', '- ②', '- ③', '- ④', '- ⑤']);
+      expect(planLines[2]).toContain('먼저 쓸 시험(RED)');
+      expect(planLines[3]).toContain('GREEN 뒤 같은 명령');
+      expect(planLines[4]).toContain('배선');
+
+      expect(events).toHaveLength(1);
+      expect(typeof events[0]!.stageId).toBe('string');
+      expect(events[0]!.stageId).not.toBe('');
+      // 원장의 stageId 는 같은 입력의 검증 계획이 고른 무대 «그 자체»다 — 두 채널이 같은 이름을 쓴다.
+      expect(events[0]!.stageId).toBe(authorVerificationPlan({
+        ask: '대상 경로: src/example.ts\n`exampleHelper` 가 같은 값을 낸다.',
+        behaviour: verificationBehaviour([], '대상 경로: src/example.ts\n`exampleHelper` 가 같은 값을 낸다.'),
+        targetPaths: ['src/example.ts'],
+        ...readVerificationMenuDocs(root),
+      }).stage.id);
+      expect(events[0]!.menuPresent).toBe(false);
+    } finally {
+      log.mockRestore();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

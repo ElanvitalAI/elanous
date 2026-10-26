@@ -5,6 +5,8 @@ import { readCardSalvageBranch, refreshCardRunBinding } from '../task-agent/card
 import { captureReviewResults } from '../task-agent/review-result-capture.js';
 import type { TasksCliDeps } from './tasks-cli.js';
 import { registerTaskAgentSink } from './tasks-read-cli.js';
+import { readFileSync } from 'node:fs';
+import { loadGoalAskRecords } from '../self-implement/goal-ask-store.js';
 
 /**
  * CLI-ENTRY-LAZY — `tasks show ta-…`(TASK-AGENT 과제 카드) 상세. `tasks-read-cli.ts` 가 카드 id 일 때만 싣는다.
@@ -28,6 +30,34 @@ export async function mirrorRemoteCardLedger(cardId: string, deps: TasksCliDeps)
 function moveLine(card: TaskCard): string {
   const move = nextMoveFor(card);
   return `${move.kind}${move.command ? ` — elanous ${move.command.map(shellQuote).join(' ')}` : ''} (${move.reason})`;
+}
+
+const GOAL_BODY_SUMMARY_LIMIT = 8_000;
+
+function cardGoalEvidence(card: TaskCard, deps: TasksCliDeps): {
+  goalFile: string | null; goalBody: string | null; hasTddPlan: boolean | null;
+  hasBoundary: boolean | null; knowhowInjected: boolean | null;
+} {
+  let document: { goalFile: string; goalBody: string } | null = null;
+  try {
+    if (card.goalId && deps.cardGoalDocument) document = deps.cardGoalDocument(card.goalId);
+    else if (card.goalId) {
+      const record = loadGoalAskRecords({ goalId: card.goalId, limit: 1 })[0];
+      if (record) document = { goalFile: record.goalFile, goalBody: readFileSync(record.goalFile, 'utf8') };
+    }
+  } catch (error) {
+    try { debug.log('task-agent', 'card-goal-read-failed', { cardId: card.id, goalId: card.goalId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+  }
+  if (!document) return { goalFile: null, goalBody: null, hasTddPlan: null, hasBoundary: null, knowhowInjected: null };
+  const body = document.goalBody;
+  const hasTddPlan = /^#{1,6}\s+.*(?:TDD|test[- ]driven|테스트 주도).*$/im.test(body);
+  const hasBoundary = /(?:완료 경계|완료 조건|acceptance criteria|completion boundary)/i.test(body);
+  const knowhowInjected = /\[KNOWHOW-PACK\b[^\]]*\]/i.test(body);
+  return {
+    goalFile: document.goalFile,
+    goalBody: body.length <= GOAL_BODY_SUMMARY_LIMIT ? body : `${body.slice(0, GOAL_BODY_SUMMARY_LIMIT)}… [truncated]`,
+    hasTddPlan, hasBoundary, knowhowInjected,
+  };
 }
 
 export function headLine(text: string): string {
@@ -152,7 +182,7 @@ export async function showTaskCard(id: string, opts: { json?: boolean }, deps: T
   try { salvage = await readCardSalvageBranch(card, deps.cardRunEvidence ?? {}); }
   catch (error) { salvage = { salvageBranch: null, readErrors: [error instanceof Error ? error.message : String(error)] }; }
   const salvageUnread = !salvage.salvageBranch && !!salvage.readErrors?.length;
-  if (opts.json) out(JSON.stringify({ card, nextMove: nextMoveFor(card), salvageBranch: salvage.salvageBranch, ...(salvageUnread ? { salvageBranchUnread: true } : {}) }));
+  if (opts.json) out(JSON.stringify({ card, nextMove: nextMoveFor(card), ...cardGoalEvidence(card, deps), salvageBranch: salvage.salvageBranch, ...(salvageUnread ? { salvageBranchUnread: true } : {}) }));
   else {
     for (const line of taskCardLines(card)) out(line);
     if (card.parentHost) out(`부모 호스트: ${card.parentHost.host}${card.parentHost.pid ? ` (pid ${card.parentHost.pid})` : ''} · PR 까지만 — 병합은 HQ${card.parentHost.log ? ` · 로그 ${card.parentHost.host}:${card.parentHost.log}` : ''}`);

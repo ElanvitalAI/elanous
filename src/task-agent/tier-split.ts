@@ -30,9 +30,38 @@ export const TIER_SPLIT_DECOMPOSE_TIMEOUT_MS = 300_000;
 
 /** 조각이 부모 칸에서 물려받는 줄 머리 — hand 의 골 검사(완료 경계 셋)와 계약·경계 문맥. */
 const INHERITED_PARENT_LABELS = /^\s*(?:[-*]\s*)?(현재 계약|완료 경계 코드|완료 경계 실물|완료 경계 증거 명령|경계|증거 보충)\s*:/;
+const VERIFICATION_PLAN_HEADING = '### 검증 계획(TDD)';
+
+/** Read a real Markdown section, ignoring headings inside fenced verbatim asks. */
+function parentVerificationPlan(text: string): string[] {
+  const lines = text.split(/\r?\n/u);
+  let fence: { char: string; length: number } | null = null;
+  let start = -1;
+  const section: string[] = [];
+  for (const [index, line] of lines.entries()) {
+    const marker = /^ {0,3}(`{3,}|~{3,})/u.exec(line)?.[1];
+    if (marker) {
+      if (!fence) fence = { char: marker[0]!, length: marker.length };
+      else if (marker[0] === fence.char && marker.length >= fence.length) fence = null;
+      if (start >= 0 && fence) break;
+      continue;
+    }
+    if (fence) continue;
+    if (start < 0) {
+      if (line.trim() === VERIFICATION_PLAN_HEADING) {
+        start = index;
+        section.push(line);
+      }
+      continue;
+    }
+    if (/^ {0,3}#{1,6}\s/u.test(line)) break;
+    section.push(line);
+  }
+  return section;
+}
 
 /**
- * 조각 hand 문면 = 조각 골(대상 경로·동작 — 첫 줄 유지) ⊕ 조각 표지 ⊕ 부모 칸의 계약·완료 경계·경계 줄.
+ * 조각 hand 문면 = 조각 골(대상 경로·동작 — 첫 줄 유지) ⊕ 조각 표지 ⊕ 부모 칸의 계약·완료 경계·경계 줄·TDD 계획.
  * 분해기의 조각 골은 짧은 제목뿐이라 그대로 넘기면 hand 의 골 검사(완료 경계 누락)가 막는다(10-21 DEVICE-FIRST-AUTHORING 발사 0).
  * 부모에 그 줄이 없으면 아무것도 더하지 않는다 — 검사가 지금처럼 거부한다(보수 쪽).
  */
@@ -43,10 +72,14 @@ export function composeSliceHandText(sliceGoal: string, parentText: string, mark
     const label = INHERITED_PARENT_LABELS.exec(line)?.[1];
     return label !== undefined && !sliceHas.has(label);
   });
+  const sliceHasVerificationPlan = sliceLines.some((line) => line.trim() === VERIFICATION_PLAN_HEADING);
+  const verificationPlan = sliceHasVerificationPlan ? [] : parentVerificationPlan(parentText);
+  inherited.push(...verificationPlan);
   // 표지는 리뷰 범위를 나르므로 장치 우선 조각(총 2 이상)은 상속 줄이 없어도 남는다 —
   // 다만 «물려받았다» 는 물려받은 줄에 대한 주장이므로 그 줄이 있을 때만 붙인다.
   if (inherited.length === 0 && (marker.total < 2 || !sliceGoal.includes(`동작: ${DEVICE_FIRST_STEP}`))) return sliceGoal;
-  const inheritanceClaim = inherited.length > 0 ? ' 아래 계약·완료 경계는 부모 칸에서 물려받았다 — 이 조각 범위만 채운다.' : '';
+  const inheritedTopics = `계약·완료 경계${verificationPlan.length > 0 ? '·검증 계획' : ''}`;
+  const inheritanceClaim = inherited.length > 0 ? ` 아래 ${inheritedTopics}는 부모 칸에서 물려받았다 — 이 조각 범위만 채운다.` : '';
   const tag = `조각 ${marker.index}/${marker.total} — 부모 ${marker.cid ?? '(칸 없음)'}(${marker.fromTier}) 를 중 이하로 나눈 몫.${inheritanceClaim}`;
   return [...sliceLines, tag, ...inherited].join('\n');
 }
@@ -181,7 +214,8 @@ export async function handTaskWithTierSplit(opts: TierSplitHandOptions): Promise
         markFirstLaunchFailure(reason);
       }
     }
-    record({ cid, fromTier, outcome: 'device-first-deferred', group, first: ids[0], blockedUntilLanded: ids.slice(1) });
+    record({ cid, fromTier, outcome: 'device-first-deferred', group, first: ids[0], blockedUntilLanded: ids.slice(1),
+      unavoidable: [...unavoidable], ...counts });
     return { kind: 'split', group, fromTier, slices };
   }
   for (const [index, slice] of plan.slices.entries()) {

@@ -33,7 +33,7 @@ export {
 } from './pr-evidence-artifact.js';
 import { judgePredictionAccuracy } from './judge-prediction-accuracy.js';
 import { classifyPodReviewBudgetResidue, measureReviewFindingRecurrence, type ReviewFindingRecurrence, type RecurrenceFinding } from './review-finding-recurrence.js';
-import type { ReviewRework } from '../self-dev/run-types.js';
+import type { ReviewRework, SelfDevJobResult } from '../self-dev/run-types.js';
 import { createHash } from 'node:crypto';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { writeGoalDocumentAtomic } from './goal-document-write.js';
@@ -226,7 +226,7 @@ import { formatGateFailedId, type PremiseReviewCard, type PremiseReviewInput } f
 import { runWorkflowToCompletion } from '../workflow-runtime/executor.js';
 import { mapReworkVerdict, supervisionObservationFields } from './supervision-vocabulary.js';
 import { resolveRunOutcome } from './run-outcome.js';
-import { authorLimitationCountFromGoal, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import { authorLimitationCountFromGoal, authoredSignalExecution, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
 import { resolveEvidenceHeadCommit } from './evidence-command-budget.js';
 import { pressDecisionSignals, type DecisionSignalPressResult } from './decision-signal-press.js';
 import { inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations } from '../../scripts/ask-marker-check.js';
@@ -1107,6 +1107,8 @@ export interface SelfImplementSeams {
   synthesizeGoalContext?: (input: { goalFile?: string }) => Promise<Pick<import('../harness/harness-worktree-add.js').HarnessWorktreeGoalMetadata, 'goalTitle' | 'goalDescription' | 'goalDescriptionSource'>>;
   createWorktree: (opts: { branch: string; base?: string; runId?: string } & import('../harness/harness-worktree-add.js').HarnessWorktreeGoalMetadata) => Promise<{
     path: string; branch: string;
+    /** A single-use Pod may implement in its already checked-out source tree. */
+    inPlace?: boolean;
     /** Strict provenance values are returned only after their recording succeeds. */
     owner?: string;
     command?: string;
@@ -2355,6 +2357,8 @@ export interface SelfImplementResult {
   walk?: readonly { node: string; round: number }[];
   /** Canonical run-identity join key; always present because resolveRunIdentity always mints or inherits one. */
   runId: string;
+  /** Parent-observed goal-plan revision attempt evidence; omitted when no ledger evidence was read. */
+  goalPlanRevision?: SelfDevJobResult['goalPlanRevision'];
   ok: boolean;
   stage: SelfImplementStage;
   /** Verbatim must-fix findings retained on a review-blocked terminal result. */
@@ -3329,7 +3333,12 @@ async function runPostMergeCleanup(
   goalFile: string | undefined,
   remoteBranch: string | undefined,
   observe: (event: string, data: Record<string, unknown>) => void,
+  inPlace = false,
 ): Promise<void> {
+  if (inPlace) {
+    observe('post-merge-cleanup-preserved', { worktreePath, branch, reason: 'pod-inplace-source' });
+    return;
+  }
   if (!cleanup?.enabled) {
     observe('post-merge-cleanup-preserved', { worktreePath, branch, reason: cleanup ? 'disabled' : 'not-configured' });
     return;
@@ -5286,6 +5295,7 @@ async function runSelfImplementInner(
   observe('worktree', {
     path: wt.path,
     branch: wt.branch,
+    inPlace: wt.inPlace === true,
     terminalLaunchHead: terminalLaunchHead ?? null,
     terminalLaunchDirtyPaths: terminalLaunchDirtyPaths ? [...terminalLaunchDirtyPaths] : null,
     // ⭐ 우리가 **무엇을 요청했는지는 이미 안다** — 시임 반환에서 되읽지 않는다.
@@ -5306,7 +5316,7 @@ async function runSelfImplementInner(
   // ⛔ 발사 부모(`harness ask`·`dev`)에는 ELANOUS_HARNESS_SPACE_ID 가 «없다» — 그 env 는 자식에게만 심긴다.
   //   그래서 getHarnessSpace() 만 보면 운영에서 늘 undefined 이고 정지 확인이 «한 번도» 안 돈다(#20040 착지 직후 실측).
   //   `self send <space> --stop` 이 겨냥하는 것은 자식의 공간 = 워크트리 이름이다(아래 activeChildInboxId 와 같은 식 · dev-cli.ts recordRestart 폴백과 같다).
-  const parentSoftStopSpaceId = s.parentSoftStopSpaceId || getHarnessSpace()?.id || normalizeSpaceId(basename(wt.path)) || undefined;
+  const parentSoftStopSpaceId = s.parentSoftStopSpaceId || getHarnessSpace()?.id || normalizeSpaceId(wt.inPlace ? runId : basename(wt.path)) || undefined;
   if (parentSoftStopSpaceId) {
     try { s.onSoftStopSpaceReady?.(parentSoftStopSpaceId); } catch { /* UI registration must not break execution */ }
   }
@@ -5457,7 +5467,11 @@ async function runSelfImplementInner(
   // The repository copy travels with both local and Pod worktrees. Operational HQ ledgers are never read here.
   const knowhow = selectKnowhowPack(wt.path, opts.feature);
   if (knowhow.text) round0Feature = `${knowhow.text}\n\n${round0Feature}`;
-  observe('knowhow-pack', { ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0 });
+  const knowhowRevisionRead = runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 });
+  const knowhowRevision = knowhowRevisionRead.status === 0 && /^[0-9a-f]{40,64}$/i.test(knowhowRevisionRead.stdout.trim())
+    ? knowhowRevisionRead.stdout.trim() : null;
+  observe('knowhow-pack', { ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0,
+    reason: knowhow.reason, repoPath: wt.path, repoRevision: knowhowRevision });
 
   // E1 착수 구체화(RFC-progressive-goal-elaboration §2 E1 · §7 간선 ①) — 고정 층(KPI·판정 신호)은 그대로, 카드만 덧붙인다.
   const elaboration = await (await import('./goal-elaborate.js')).runArrivalElaboration({ goal: opts.feature, prompt: round0Feature, cwd: wt.path, callLLM: s.elaborateCallLLM, observe });
@@ -5523,7 +5537,7 @@ async function runSelfImplementInner(
     readonly update?: (delivery: SupervisorDeliveryState, reason?: string) => void;
   };
   let supervisorDeliveryUpdates: PendingSupervisorDelivery[] = [];
-  const activeChildInboxId = normalizeSpaceId(basename(wt.path));
+  const activeChildInboxId = normalizeSpaceId(wt.inPlace ? runId : basename(wt.path));
   const undeliveredSupervisorInputs: UndeliveredSupervisorInput[] = [];
   const recordUndeliveredSupervisorInput = (text: string, reason: string): void => {
     undeliveredSupervisorInputs.push({ text, reason });
@@ -7383,12 +7397,16 @@ async function runSelfImplementInner(
           try { after = (s.changedFilesForGateRoute ?? changedFiles)(wt.path); } catch { /* unknown diff */ }
           const targetDiff = after === undefined ? undefined : eligible(after);
           const resultLine = /(?:^|\n)\s*RESULT:\s*\S/m.test(impl.evidenceTranscript ?? impl.summary);
-          const succeeded = impl.ok && !!targetDiff?.length && resultLine;
+          // A completed child can leave a real, declared-target diff while its
+          // final screen omits RESULT. The measured diff is sufficient to enter
+          // review/gate; a failed child or an unmeasured/empty diff still stops.
+          const succeeded = impl.ok && !!targetDiff?.length;
           goalOnlyReworkExhausted = !succeeded;
           observe('implementation-goal-only-rework', {
             status: succeeded ? 'succeeded' : 'exhausted', round: retryRound, targets,
             firstToolCalls, retryToolCalls: impl.toolCalls ?? null,
             targetDiffCount: targetDiff?.length ?? null, diffMeasured: after !== undefined, resultLine,
+            ...(succeeded ? { evidenceBasis: resultLine ? 'result-and-target-diff' : 'declared-target-diff' } : {}),
           }, succeeded ? {} : { level: 'warn' });
           if (!succeeded) impl = { ...impl, ok: false, summary: `goal-only-rework-exhausted: ${impl.summary}` };
           round = retryRound;
@@ -7546,6 +7564,7 @@ async function runSelfImplementInner(
       catch { /* observation is fail-soft */ }
     }
     const evidenceChecks = runBudgetedEvidenceChecks(roundGoal, wt.path, runId, evidenceHead);
+    const authoredSignal = authoredSignalExecution(roundGoal, evidenceChecks);
     const tagCoverage = coverRequiredEvidence(requiredEvidence, offDiffEvidence.items);
     // EVIDENCE-WIRING-EXEMPT — a requirement whose own `|| bun test …` check passed is covered by what the harness measured.
     const settledByCheck = settleUncoveredEvidence(tagCoverage.uncovered, { checks: evidenceChecks, required: requiredEvidence });
@@ -8141,15 +8160,17 @@ async function runSelfImplementInner(
         let goalSlotFill: SupervisorGoalFillResult = 'unverifiable';
         let goalSlotDeficit: import('./goal-supervisor-fill.js').SupervisorGoalDeficit | undefined;
         let goalSlotAction: 'remeasure' | 'connect-goal' | undefined;
+        let goalSlotFillError = false;
         try {
           goalSlotFill = await fillUnverifiableGoalSlots({
-            path: opts.goalFile, round, gate, review,
+            path: opts.goalFile, round, gate, review, ...(authoredSignal ? { authoredSignal } : {}),
             ...(goalWiring ? { wiring: goalWiring } : {}),
             independentlyCheck: s.independentlyCheckGoalSlots ?? (async () => false),
             observeDeficit: (deficit) => { goalSlotDeficit = deficit; },
           });
         } catch {
           goalSlotFill = 'rejected';
+          goalSlotFillError = true;
         }
         if (goalSlotFill === 'not-applicable') {
           observe('goal-slot-remeasure-result', { round, result: goalSlotFill, gatePassed: gate.passed,
@@ -8173,7 +8194,7 @@ async function runSelfImplementInner(
           gate = measuredGate;
           let remeasureDeficit: import('./goal-supervisor-fill.js').SupervisorGoalDeficit | undefined;
           if (gate.passed) {
-            goalSlotFill = await fillUnverifiableGoalSlots({ path: opts.goalFile, round, gate, review,
+            goalSlotFill = await fillUnverifiableGoalSlots({ path: opts.goalFile, round, gate, review, ...(authoredSignal ? { authoredSignal } : {}),
               independentlyCheck: s.independentlyCheckGoalSlots ?? (async () => false),
               observeDeficit: (deficit) => { remeasureDeficit = deficit; } });
           }
@@ -8181,8 +8202,27 @@ async function runSelfImplementInner(
             gatePassed: measuredGate.passed,
             ...(remeasureDeficit ? { deficitKind: remeasureDeficit.kind,
               deficitEvidenceId: remeasureDeficit.evidenceId, gateLog: remeasureDeficit.gateLog,
-              reason: remeasureDeficit.reason, inputSummary: remeasureDeficit.inputSummary, gateLogRef: remeasureDeficit.gateLogRef } : {}) });
-          if (!gate.passed || goalSlotFill === 'unverifiable' || goalSlotFill === 'rejected') {
+              reason: remeasureDeficit.reason, reasonDetail: remeasureDeficit.reasonDetail,
+              inputSummary: remeasureDeficit.inputSummary, gateLogRef: remeasureDeficit.gateLogRef } : {}) });
+          if (goalSlotFill === 'unverifiable' && gate.passed) {
+            finalizeSupervisorDeliveries('goal-slot-remeasurement-unverifiable');
+            const evidenceReason = [remeasureDeficit?.reason, remeasureDeficit?.reasonDetail]
+              .filter((part): part is string => Boolean(part)).join(' · ');
+            const reason = `goal-slot remeasurement remained unverifiable after the second gate passed · evidence ${goalSlotDeficit.evidenceId}${evidenceReason ? ` · ${evidenceReason}` : ''}`;
+            observe('goal-slot-remeasurement-preserved', {
+              round, evidenceId: goalSlotDeficit.evidenceId, gatePassed: true,
+              reason: remeasureDeficit?.reason ?? 'remeasurement-deficit-not-reported',
+              ...(remeasureDeficit?.reasonDetail ? { reasonDetail: remeasureDeficit.reasonDetail } : {}),
+              ...(remeasureDeficit?.gateLogRef ? { gateLogRef: remeasureDeficit.gateLogRef } : {}),
+              disposition: 'preserve-for-recovery',
+            });
+            const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', reason, gate, salvageStatusExpected: false });
+            return { ok: false, stage: 'review-blocked', node: 'rework', ...resolveRunOutcome({ termination: 'budget-exhausted' }),
+              sessionId, worktreePath: wt.path, branch: wt.branch, gate,
+              quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(),
+              ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
+          }
+          if (!gate.passed || goalSlotFill === 'rejected') {
             finalizeSupervisorDeliveries('goal-slot-remeasure-gate-failed');
             const reason = `goal-slot remeasurement ${!gate.passed ? 'failed' : goalSlotFill === 'rejected' ? 'rejected' : 'unmeasured'} · evidence ${goalSlotDeficit.evidenceId}`;
             const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate, salvageStatusExpected: false });
@@ -8193,7 +8233,10 @@ async function runSelfImplementInner(
           }
         }
         observe('goal-slot-fill', { round, result: goalSlotFill, gatePassed: gate.passed, reviewVerdict: review.verdict,
-          ...(goalSlotFill === 'unverifiable' && goalSlotDeficit ? { reason: goalSlotDeficit.reason, inputSummary: goalSlotDeficit.inputSummary, gateLogRef: goalSlotDeficit.gateLogRef } : {}),
+          ...(goalSlotDeficit ? { reason: goalSlotDeficit.reason, reasonDetail: goalSlotDeficit.reasonDetail,
+            inputSummary: goalSlotDeficit.inputSummary, gateLogRef: goalSlotDeficit.gateLogRef } : {}),
+          ...(!goalSlotDeficit && goalSlotFill === 'unverifiable' ? { reason: 'goal-slot-fill-no-deficit' } : {}),
+          ...(goalSlotFillError ? { reason: 'goal-slot-fill-error' } : {}),
           ...(goalSlotFill === 'not-applicable' ? { reason: 'test-step-scope-skipped', scopeReason: gate.scopeReason,
             testStepExecuted: gate.testStepExecuted } : {}) });
         if (goalSlotAction === 'connect-goal' && goalSlotDeficit) {
@@ -9042,7 +9085,7 @@ async function runSelfImplementInner(
       await withJourneyNode('cleanup', { provenance: 'post-merge', runId }, () => runPostMergeCleanup(s.postMergeCleanup, wt.path, wt.branch, opts.goalFile, mergedBase && defaultBranch && displayBranchName(mergedBase) === displayBranchName(defaultBranch) ? defaultBranch : undefined, (event, data) => {
         if (event.startsWith('post-merge-cleanup-')) cleanupOutcome = event.slice('post-merge-cleanup-'.length);
         observe(event, data);
-      }));
+      }, wt.inPlace === true));
       exitJourneyNode('cleanup', { provenance: 'post-merge', runId, outcome: cleanupOutcome });
       const mergedLedger = (() => {
         try { return loadRunLedger(runId); } catch { return null; }

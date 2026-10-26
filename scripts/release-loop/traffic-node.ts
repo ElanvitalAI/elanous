@@ -7,8 +7,11 @@ import { errorResult, finishNode, readGraphContext } from './node-verdict.js';
 import { applyReleaseTrafficEvent, trafficOptionsFromConfig, type ReleaseTrafficEvent, type TrafficTransitionOptions } from './traffic-transition.js';
 
 const EVENTS: Record<string, ReleaseTrafficEvent> = {
+  'traffic-cut-start': 'cut-start',
   'traffic-gate-passed': 'gate-passed',
+  'traffic-npm-published': 'npm-published',
   'traffic-verify-complete': 'verify-complete',
+  'traffic-failed-restore': 'failed',
 };
 
 export interface TrafficNodeDeps {
@@ -40,12 +43,17 @@ export async function runTrafficNode(node = process.argv[2], env: NodeJS.Process
     }
     const result = await applyReleaseTrafficEvent(context, event, options);
     if (!result.applied) {
-      const consequence = event === 'verify-complete'
-        ? '릴리스 검증은 성공했으나 트래픽 복귀가 적용되지 않았습니다.'
-        : 'gate는 성공했으나 트래픽 감속이 적용되지 않았습니다.';
+      const consequence = event === 'failed' && result.reason === 'published-keeps-full'
+        ? 'npm 발행은 완료됐으므로 전체 트래픽을 유지합니다. 후속 발행 단계 실패를 확인하세요.'
+        : event === 'verify-complete' || event === 'npm-published'
+          ? '발행은 성공했으나 전체 트래픽 전환이 적용되지 않았습니다.'
+          : event === 'failed' ? '컷 전 트래픽 복귀가 적용되지 않았습니다.'
+            : event === 'cut-start' ? '컷은 시작했으나 gate 모드 전환이 적용되지 않았습니다.'
+              : 'gate는 성공했으나 트래픽 감속이 적용되지 않았습니다.';
       (deps.report ?? reportFailure)(`RELEASE-POSTPUB-TRAFFIC ${version} ${runId || 'unknown'} ${node} 무시 — ${result.reason ?? 'traffic state unchanged'}. ${consequence}`);
     }
-    return finishNode(node!, version, { outcome: 'ok', verdict: 'pass', summary: `${event} ${result.applied ? 'applied' : result.reason ?? 'ignored'}` });
+    return finishNode(node!, version, { outcome: result.applied ? 'ok' : 'fail', verdict: result.applied ? 'pass' : 'fail',
+      summary: `${event} ${result.applied ? 'applied' : result.reason ?? 'ignored'}` });
   } catch (error) {
     const detail = errorResult(error).summary;
     const isLockTimeout = detail.startsWith('traffic lock timeout:');

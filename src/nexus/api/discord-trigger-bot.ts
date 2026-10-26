@@ -37,6 +37,8 @@ import { createDiscordStreamSink } from '../../session/streaming/discord-stream-
 import { splitForDiscord } from '../../discord.js';
 import { formatForDiscord } from '../../discord-markdown.js';
 import { receiveChannelEvent } from '../outbound/router.js';
+import { openMsgStore } from '../../msg/msg-store.js';
+import { createAskOpDiscordIngress } from './channel-ask-op.js';
 
 export interface NexusDiscordTriggerBotOpts {
   /** Bot token (without `Bot ` prefix). Production reads
@@ -156,6 +158,30 @@ export function createNexusDiscordTriggerBot(
   // LF2 — 콘솔 하트비트 유지 + debug.log 병행(telegram-trigger 동형).
   const log = opts.log ?? createDiscordTriggerLogger();
   const onTriggerTap = buildDiscordTriggerTap(opts.dispatch, log);
+  let botRef: DiscordBot | undefined;
+  let botIdPromise: Promise<string> | undefined;
+  const askOpIngress = createAskOpDiscordIngress({
+    allowedUserIds: opts.allowedUsers,
+    allowedChannelIds: opts.guildTextChannels ?? [],
+    resolveBotId: () => {
+      if (!botRef) return Promise.reject(new Error('Discord bot is not ready'));
+      botIdPromise ??= botRef.getMe().then(({ id }) => id).catch((error: unknown) => {
+        botIdPromise = undefined;
+        throw error;
+      });
+      return botIdPromise;
+    },
+    append: (message, provenanceKey) => {
+      const store = openMsgStore();
+      try { return store.appendWithProvenance(message, provenanceKey); }
+      finally { store.close(); }
+    },
+  });
+  const onMessage: DcMessageHandler = async (ctx, streamer) => {
+    const askReply = await askOpIngress(ctx);
+    if (askReply !== undefined) return askReply;
+    return opts.onMessage?.(ctx, streamer);
+  };
 
   const botWasInjected = opts.bot !== undefined;
   const bot = opts.bot ?? new DiscordBot({
@@ -165,7 +191,7 @@ export function createNexusDiscordTriggerBot(
     // Chat path: the injected self-turn handler (M4b nexus wire) or the
     // legacy trigger-only no-op. Workflows wanting a chat reply can
     // still declare a `chatTrigger` (routes via `/v1/workflows/chat/*`).
-    onMessage: opts.onMessage ?? (async () => undefined),
+    onMessage,
     log,
     onTriggerTap,
     ...(opts.voiceTap ? { voiceTap: opts.voiceTap } : {}),
@@ -173,6 +199,7 @@ export function createNexusDiscordTriggerBot(
     ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     ...(opts.wsImpl ? { wsImpl: opts.wsImpl } : {}),
   });
+  botRef = bot;
 
   // §C3 — discord 서피스 sink(config gate·telegram-trigger 동형). shadowFanout OR
   // primary.discord 시 등록. endpoint 완전스코프면 parse→인스턴스 가드 후 channelId 배달,

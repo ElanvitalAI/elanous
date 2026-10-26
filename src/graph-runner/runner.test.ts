@@ -1040,6 +1040,33 @@ test('failed run restarts at saved node, keeps preceding output, and reports nod
   expect(logs.filter((entry) => entry.event === 'node-start' && entry.data.nodeId === 'first')).toHaveLength(1);
 });
 
+test('restart preserves a failed warning-only predecessor but refuses a branching failure', async () => {
+  for (const advisory of [true, false]) {
+    const { graph, root } = fixture('exit 1');
+    const source = readFileSync(graph, 'utf8');
+    writeFileSync(graph, source.replace('map: { ok: second, fail: failed }', advisory
+      ? 'map: { ok: second, fail: second, error: second }'
+      : 'map: { ok: done, fail: second, error: second }'));
+    let secondRuns = 0;
+    const deps = { root, runBash: async (body: string) => ({
+      exitCode: body === 'exit 1' ? 1 : secondRuns++ === 0 ? 1 : 0,
+      stdout: '', stderr: '',
+    }) };
+    const failed = await runGraph(graph, { deps });
+    expect(failed.path).toEqual(['first', 'second', 'failed']);
+    expect(failed.nodes[0]?.ok).toBe(false);
+    if (!advisory) {
+      await expect(runGraph(graph, { resumeRunId: failed.runId, fromNodeId: 'second', deps }))
+        .rejects.toThrow('cannot preserve a failed predecessor');
+      continue;
+    }
+    const resumed = await runGraph(graph, { resumeRunId: failed.runId, fromNodeId: 'second', deps });
+    expect(resumed.status).toBe('done');
+    expect(resumed.nodes[0]).toEqual(failed.nodes[0]);
+    expect(secondRuns).toBe(2);
+  }
+});
+
 test('restart refuses nodes outside the failed path or changed graph and leaves state intact', async () => {
   const { graph, root } = fixture('exit 1');
   const first = await runGraph(graph, { deps: { root } });
@@ -1191,7 +1218,7 @@ test('release-loop with no outgoing edge records the failed run exactly once', a
   const root = mkdtempSync(join(tmpdir(), 'graph-release-no-edge-'));
   dirs.push(root);
   const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
-  const source = readFileSync(graph, 'utf8').replace('ok: cutoff, fail: failed, error: failed', 'fail: failed, error: failed');
+  const source = readFileSync(graph, 'utf8').replace('ok: traffic-cut-start, fail: failed, error: failed', 'fail: failed, error: failed');
   const local = join(root, 'release-loop.yaml');
   writeFileSync(local, source);
   writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8'));
@@ -1211,7 +1238,7 @@ test('a broken heal inbox does not replace either persisted release failure verd
     dirs.push(root);
     const graph = join(root, 'release-loop.yaml');
     const source = readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8');
-    writeFileSync(graph, branch === 'no-edge' ? source.replace('ok: cutoff, fail: failed, error: failed', 'fail: failed, error: failed') : source);
+    writeFileSync(graph, branch === 'no-edge' ? source.replace('ok: traffic-cut-start, fail: failed, error: failed', 'fail: failed, error: failed') : source);
     writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8'));
     mkdirSync(join(root, 'heal'));
     writeFileSync(join(root, 'heal', 'inbox.jsonl'), '{invalid-json}\n');

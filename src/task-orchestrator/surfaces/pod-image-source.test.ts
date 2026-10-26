@@ -116,7 +116,7 @@ describe('resolvePodImageSource', () => {
 
 describe('preparePodImage — 실제 조회 경로(가짜 원격)', () => {
   test('신호 1: 기준값 ⊕ 레지스트리에 태그 있음 → 굽기 0번 · ref 가 <registry>/elanous-harness:<commit12>', async () => {
-    const remote = fakeRemote({ node-b: { 'k3d-elanous-registry': '5050' } }, () => ['latest', TAG]);
+    const remote = fakeRemote({ 'node-b': { 'k3d-elanous-registry': '5050' } }, () => ['latest', TAG]);
     const h = rig(remote);
     const r = await preparePodImage({ cfg: { harness: { imageCommit: COMMIT } }, members: [gateMember], ...h.deps });
     expect(h.builds.length).toBe(0);
@@ -127,7 +127,7 @@ describe('preparePodImage — 실제 조회 경로(가짜 원격)', () => {
   });
 
   test('ELANOUS_BUILD_REGISTRY 가 기본과 다르면 조회·Job ref 가 그 주소를 따른다', async () => {
-    const remote = fakeRemote({ node-b: { 'k3d-fleet-reg': '6000' } }, () => [TAG]);
+    const remote = fakeRemote({ 'node-b': { 'k3d-fleet-reg': '6000' } }, () => [TAG]);
     const h = rig(remote);
     const r = await preparePodImage({ cfg: { harness: { imageCommit: COMMIT } }, members: [gateMember], ...h.deps, env: { ELANOUS_BUILD_REGISTRY: 'k3d-fleet-reg:6000' } });
     expect(r.outcome).toBe('pinned-ready');
@@ -137,14 +137,14 @@ describe('preparePodImage — 실제 조회 경로(가짜 원격)', () => {
   });
 
   test('멤버가 레지스트리를 명시했으면 그 주소로 조회한다', async () => {
-    const remote = fakeRemote({ node-b: { 'k3d-elanous-registry': '5051' } }, () => [TAG]);
+    const remote = fakeRemote({ 'node-b': { 'k3d-elanous-registry': '5051' } }, () => [TAG]);
     const h = rig(remote);
     const r = await preparePodImage({ cfg: { harness: { imageCommit: COMMIT } }, members: [{ ...gateMember, registry: 'k3d-elanous-registry:5051' }], ...h.deps });
     expect(r.pinned[0]!.imageRef).toBe(`k3d-elanous-registry:5051/elanous-harness:${TAG}`);
   });
 
   test('신호 2: 기준값 ⊕ 태그 없음(대기 0초) → 굽기 0번 · outcome pinned-missing', async () => {
-    const remote = fakeRemote({ node-b: { 'k3d-elanous-registry': '5050' } }, () => ['latest']);
+    const remote = fakeRemote({ 'node-b': { 'k3d-elanous-registry': '5050' } }, () => ['latest']);
     const h = rig(remote);
     const r = await preparePodImage({ cfg: { harness: { imageCommit: COMMIT } }, members: [gateMember], maxWaitMs: 0, ...h.deps });
     expect(h.builds.length).toBe(0);
@@ -155,7 +155,7 @@ describe('preparePodImage — 실제 조회 경로(가짜 원격)', () => {
   });
 
   test('신호 3: 기준값이 없다 → kind head · 종전 경로를 전 멤버로 한 번 · 조회 0', async () => {
-    const remote = fakeRemote({ node-b: { 'k3d-elanous-registry': '5050' } }, () => [TAG]);
+    const remote = fakeRemote({ 'node-b': { 'k3d-elanous-registry': '5050' } }, () => [TAG]);
     const h = rig(remote);
     const r = await preparePodImage({ cfg: {}, members: [gateMember, minihHost], ...h.deps });
     expect(r.source.kind).toBe('head');
@@ -165,7 +165,7 @@ describe('preparePodImage — 실제 조회 경로(가짜 원격)', () => {
   });
 
   test('태그가 기다리는 중에 올라오면 pinned-waited · 굽지 않는다', async () => {
-    const remote = fakeRemote({ node-b: { 'k3d-elanous-registry': '5050' } }, (n) => (n >= 3 ? [TAG] : []));
+    const remote = fakeRemote({ 'node-b': { 'k3d-elanous-registry': '5050' } }, (n) => (n >= 3 ? [TAG] : []));
     const h = rig(remote);
     const r = await preparePodImage({ cfg: { harness: { imageCommit: COMMIT } }, members: [gateMember], pollMs: 1000, maxWaitMs: 60_000, ...h.deps });
     expect(r.outcome).toBe('pinned-waited');
@@ -174,7 +174,7 @@ describe('preparePodImage — 실제 조회 경로(가짜 원격)', () => {
   });
 
   test('레지스트리 없는 멤버(node-c)만 종전 경로 — 풀 발사를 죽이지 않는다', async () => {
-    const remote = fakeRemote({ node-b: { 'k3d-elanous-registry': '5050' }, node-c: {} }, () => [TAG]);
+    const remote = fakeRemote({ 'node-b': { 'k3d-elanous-registry': '5050' }, 'node-c': {} }, () => [TAG]);
     const h = rig(remote);
     const r = await preparePodImage({ cfg: { harness: { imageCommit: COMMIT } }, members: [gateMember, minihHost], ...h.deps });
     expect(r.outcome).toBe('pinned-ready');

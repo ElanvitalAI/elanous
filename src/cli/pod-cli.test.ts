@@ -69,7 +69,7 @@ describe('elanous pod lease status', () => {
     }
     expect(probes).toBe(1);
     expect(results[0]).not.toHaveProperty('externalGitHub');
-    expect(results[1]).toMatchObject({ externalGitHub: { node-b: { externalDns: false, githubHttps: null, reason: 'external DNS failed' } } });
+    expect(results[1]).toMatchObject({ externalGitHub: { 'node-b': { externalDns: false, githubHttps: null, reason: 'external DNS failed' } } });
     expect(results[1]!.recommended).toBe(results[0]!.recommended);
     expect(results[1]!.limitedBy).toBe(results[0]!.limitedBy);
   });

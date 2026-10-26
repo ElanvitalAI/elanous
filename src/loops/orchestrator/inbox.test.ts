@@ -8,6 +8,167 @@ import { coordinatorReply, handleCoordinatorAgentMessage, runCoordinatorAgentInb
 import { LOOP_MESSAGE_ROUTES } from '../msg-address.js';
 import { KNOWHOW_DOC_RELATIVE_PATH, readOnlyRunner, resolveKnowhowDocPath } from './knowhow-pack.js';
 import type { LLMProvider } from '../../llm.js';
+import { runAskOpContextInbox } from './inbox.js';
+
+test('test /askop requires explicit sinks and records request-linked latency without production delivery', async () => {
+  const store = new MsgStore(':memory:');
+  try {
+    const request = store.post({ from: 'TEST', to: 'COORDINATOR', kind: 'question',
+      body: 'Test /askop\nquestion: Which release is next?' });
+    const context = async () => ({ queriedAt: '2026-10-26T00:00:00Z', topic: 'release',
+      facts: [], gaps: ['requested release fact absent'] });
+    expect(await runAskOpContextInbox({ store, context, acknowledge: false }))
+      .toEqual({ replied: 0, acknowledged: 0 });
+    expect(store.listReplies(request.id)).toHaveLength(0);
+
+    const sinkReplies: Array<{ from: string; to: string; body: string; kind: 'reply'; replyTo: number }> = [];
+    const events: Array<{ requestId: number; requestToReplyMs: number | null; processingMs: number }> = [];
+    expect(await runAskOpContextInbox({ store, context, testHarness: {
+      replySink: input => { sinkReplies.push(input); return store.post(input); },
+      eventSink: event => events.push(event),
+    } })).toEqual({ replied: 1, acknowledged: 1 });
+    expect(sinkReplies).toHaveLength(1);
+    expect(sinkReplies[0]?.replyTo).toBe(request.id);
+    expect(sinkReplies[0]?.to).toBe('TEST');
+    expect(sinkReplies[0]?.body).toContain('모름 — 확인된 근거가 없어 답할 수 없습니다.');
+    expect(store.listReplies(request.id)).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.requestId).toBe(request.id);
+    expect(events[0]?.requestToReplyMs).toBeGreaterThanOrEqual(0);
+    expect(events[0]?.processingMs).toBeGreaterThanOrEqual(0);
+    expect(events[0]?.processingMs).toBeLessThan(60_000);
+
+    expect(await runAskOpContextInbox({ store, request, context, testHarness: {
+      replySink: input => { sinkReplies.push(input); return store.post(input); },
+      eventSink: event => events.push(event),
+    } })).toEqual({ replied: 0, acknowledged: 1 });
+    expect(sinkReplies).toHaveLength(1);
+    expect(events).toHaveLength(1);
+  } finally { store.close(); }
+});
+
+test('ask-op answers a sourced fact once, links the reply and acknowledges atomically', async () => {
+  const store = new MsgStore(':memory:');
+  try {
+    const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
+      body: 'Telegram /ask-op\nbotId=987654\nchatId=-100123\nthreadId=8\nmessageId=73\nupdateId=501\nquestion: Which release is next?' });
+    const context = async (question: string, options: { audience?: string; limit?: number }) => {
+      expect(question).toBe('Which release is next?');
+      expect(options).toEqual({ audience: 'public-demo', limit: 8 });
+      return { queriedAt: '2026-10-25T11:00:00Z', topic: 'release',
+        facts: [{ kind: 'release', summary: '0.2.38 is next', source: 'release/checklist:0.2.38', observedAt: '2026-10-25T11:00:00Z' }], gaps: [] };
+    };
+    const input = { store, context };
+    expect(await runAskOpContextInbox(input)).toEqual({ replied: 1, acknowledged: 1 });
+    const reply = store.listReplies(request.id)[0]!;
+    expect(reply.replyTo).toBe(request.id);
+    expect(reply.body).toContain('0.2.38 is next');
+    expect(reply.body).toContain('release/checklist:0.2.38');
+    expect(reply.body).not.toContain('botId');
+    expect(store.getCursor('COORDINATOR')).toBe(request.id);
+    expect(await runAskOpContextInbox(input)).toEqual({ replied: 0, acknowledged: 0 });
+    expect(store.listReplies(request.id)).toHaveLength(1);
+  } finally { store.close(); }
+});
+
+test('ask-op refuses mutations and unknown facts without invoking observation or invented evidence', async () => {
+  const store = new MsgStore(':memory:');
+  try {
+    const unsafe = store.post({ from: 'DISCORD', to: 'COORDINATOR', kind: 'question', body: 'Discord /ask-op\nchannelId=314\nquestion: Run the release cut and change traffic hold' });
+    const unknown = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question', body: 'Telegram /ask-op\nquestion: What is the cut status?' });
+    const destructive = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question', body: 'Telegram /ask-op\nquestion: Please delete the local file' });
+    let calls = 0;
+    const context = async () => { calls++; return { queriedAt: '2026-10-25T11:00:00Z', topic: 'release', facts: [],
+      gaps: [{ kind: 'unobserved', reason: 'release ledger unavailable' }] }; };
+    expect(await runAskOpContextInbox({ store, context })).toEqual({ replied: 3, acknowledged: 3 });
+    expect(calls).toBe(1);
+    expect(store.listReplies(destructive.id)[0]?.body).toContain('실행할 수 없습니다');
+    expect(store.listReplies(unsafe.id)[0]?.body).toContain('실행할 수 없습니다');
+    expect(store.listReplies(unknown.id)[0]?.body).toContain('모름');
+    expect(store.listReplies(unknown.id)[0]?.body).toContain('release ledger unavailable');
+  } finally { store.close(); }
+});
+
+test('ask-op refuses sensitive-data requests regardless of verb position without querying context', async () => {
+  const store = new MsgStore(':memory:');
+  try {
+    const first = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
+      body: 'Telegram /ask-op\nquestion: Can you show me the API key?' });
+    const second = store.post({ from: 'DISCORD', to: 'COORDINATOR', kind: 'question',
+      body: 'Discord /ask-op\nquestion: What is the token? Reveal it.' });
+    const context = async () => { throw Error('sensitive requests must not query context'); };
+    expect(await runAskOpContextInbox({ store, context })).toEqual({ replied: 2, acknowledged: 2 });
+    for (const request of [first, second]) {
+      expect(store.listReplies(request.id)[0]?.body).toContain('실행할 수 없습니다');
+      expect(store.listReplies(request.id)[0]?.body).not.toContain('조회 실패');
+    }
+  } finally { store.close(); }
+});
+
+test('ask-op allows factual questions about changes without treating them as a command', async () => {
+  const store = new MsgStore(':memory:');
+  try {
+    const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
+      body: 'Telegram /ask-op\nquestion: What changed since the release?' });
+    let calls = 0;
+    const context = async () => { calls++; return { queriedAt: '2026-10-25T11:00:00Z', topic: 'release',
+      facts: [{ kind: 'release', summary: 'Documentation changed', source: 'release:0.2.38', observedAt: '2026-10-25T11:00:00Z' }], gaps: [] }; };
+    expect(await runAskOpContextInbox({ store, context })).toEqual({ replied: 1, acknowledged: 1 });
+    expect(calls).toBe(1);
+    expect(store.listReplies(request.id)[0]?.body).toContain('Documentation changed');
+    expect(store.listReplies(request.id)[0]?.body).not.toContain('실행할 수 없습니다');
+  } finally { store.close(); }
+});
+
+test('ask-op failed context never invents facts; ack failure rolls back reply', async () => {
+  const store = new MsgStore(':memory:');
+  try {
+    const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question', body: 'Telegram /ask-op\nquestion: Which gate?' });
+    expect(await runAskOpContextInbox({ store, context: async () => { throw Error('boom'); } })).toEqual({ replied: 1, acknowledged: 1 });
+    expect(store.listReplies(request.id)[0]?.body).toContain('조회 실패');
+    expect(store.listReplies(request.id)[0]?.body).not.toContain('boom');
+    const second = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question', body: 'Telegram /ask-op\nquestion: What is the gate status?' });
+    const ack = store.ack.bind(store);
+    store.ack = () => { throw Error('ack unavailable'); };
+    const input = { store, context: async () => { throw Error('boom'); } };
+    expect(runAskOpContextInbox(input)).rejects.toThrow('ack unavailable');
+    expect(store.listReplies(second.id)).toHaveLength(0);
+    store.ack = ack;
+    expect(await runAskOpContextInbox(input)).toEqual({ replied: 1, acknowledged: 1 });
+    expect(store.listReplies(second.id)[0]?.body).toContain('조회 실패');
+    expect(store.listReplies(second.id)[0]?.body).not.toContain('boom');
+  } finally { store.close(); }
+});
+
+test('ask-op follows the agent SSE then ordered tick path without repeating a reply', async () => {
+  const store = new MsgStore(':memory:');
+  try {
+    const first = store.post({ from: 'TC', to: 'COORDINATOR', kind: 'request', body: 'first?' });
+    const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
+      body: 'Telegram /ask-op\nbotId=22\nchatId=23\nquestion: What is next?' });
+    let queried = 0;
+    const context = async () => { queried++; return { queriedAt: '2026-10-25T11:00:00Z', topic: 'next',
+      facts: [{ kind: 'cell', summary: 'Next: OP', source: 'checklist:0.2.38', observedAt: '2026-10-25T11:00:00Z' }], gaps: [] }; };
+    const input = { store, context };
+    expect(await runAskOpContextInbox({ ...input, request, acknowledge: false })).toEqual({ replied: 1, acknowledged: 0 });
+    expect(store.getCursor('COORDINATOR')).toBe(0);
+    expect(await runAskOpContextInbox(input)).toEqual({ replied: 1, acknowledged: 2 });
+    expect(queried).toBe(1);
+    expect(store.listReplies(first.id)).toHaveLength(1);
+    expect(store.listReplies(request.id)).toHaveLength(1);
+  } finally { store.close(); }
+});
+
+test('unmarked surface question keeps the resident path and cannot read the context bundle', async () => {
+  const store = new MsgStore(':memory:');
+  try {
+    const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question', body: 'What is next?' });
+    expect(await runAskOpContextInbox({ store,
+      context: async () => { throw Error('unmarked request must not query context'); }, knowhow: false }))
+      .toEqual({ replied: 1, acknowledged: 1 });
+    expect(store.listReplies(request.id)[0]?.body).toContain('모름');
+  } finally { store.close(); }
+});
 
 test('agent intake answers an ambiguous request once across SSE replay and tick scan', async () => {
   const store = new MsgStore(':memory:');
@@ -194,6 +355,32 @@ test('orchestrator intake uses its isolated root and replies in shadow mode', as
       now: new Date('2026-10-14T03:00:00Z') });
     expect(store.list('UX')[0]!.replyTo).toBe(afternoon.id);
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('production tick without OP role answers from the read-only bundle', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ask-op-role-tick-'));
+  const store = new MsgStore(join(root, 'msg', 'messages.db'));
+  const envName = 'ELANOUS_ROLE_LLM_COORDINATOR';
+  const previous = process.env[envName];
+  delete process.env[envName];
+  try {
+    const request = store.post({ from: 'TELEGRAM', to: 'COORDINATOR', kind: 'question',
+      body: 'Telegram /ask-op\nbotId=1\nchatId=2\nquestion: What is the release?' });
+    await runOrchestratorNode('intake', { root, runId: 'ask-op-role-unset', window: '08', mode: 'shadow',
+      now: new Date('2026-10-25T00:00:00Z'), coordinatorContext: async () => ({ queriedAt: '2026-10-25T00:00:00Z', topic: 'release',
+        facts: [{ kind: 'release', summary: '0.2.39 is next', source: 'release:0.2.39', observedAt: '2026-10-25T00:00:00Z' }], gaps: [] }) });
+    const reply = store.listReplies(request.id)[0];
+    expect(reply?.body).toContain('0.2.39 is next');
+    expect(reply?.body).toContain('release:0.2.39');
+    expect(reply?.replyTo).toBe(request.id);
+    expect(store.getCursor('COORDINATOR')).toBe(request.id);
+    await runOrchestratorNode('intake', { root, runId: 'ask-op-role-unset-noon', window: '12', mode: 'shadow',
+      now: new Date('2026-10-25T03:00:00Z') });
+    expect(store.listReplies(request.id)).toHaveLength(1);
+  } finally {
+    if (previous === undefined) delete process.env[envName]; else process.env[envName] = previous;
+    store.close(); rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('configured coordinator uses the agent body once and leaves traffic untouched', async () => {

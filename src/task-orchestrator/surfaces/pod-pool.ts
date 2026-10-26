@@ -193,7 +193,7 @@ export function parsePodPool(spec: string): PodPoolMember[] {
     // `:N` 이 없으면 «상한 없음»이 아니라 기본 상한 2 다 — 그 사실(`capacityDefaulted`)을 멤버에 남긴다.
     const capacityDefaulted = m[3] === undefined;
     const capacity = capacityDefaulted ? POD_POOL_DEFAULT_CAPACITY : Number(m[3]);
-    // POOL-LITE (10-07): `:0` means «this member is off» — a `node-c:0` entry once threw here and broke every launch.
+    // POOL-LITE (10-07): `:0` means «this member is off» — a zero-capacity entry once threw here and broke every launch.
     //   It is dropped below (never chosen); only a pool with no live member left is an error.
     if (!Number.isInteger(capacity) || capacity < 0) throw new Error(`--pod-pool: 상한은 1 이상 — 「${part}」`);
     if (m[5] && Number(m[5]) > 65535) throw new Error(`--pod-pool: 레지스트리 포트는 65535 이하 — 「${part}」`);
@@ -294,8 +294,8 @@ export interface PodPlacement {
 }
 
 /**
- * Preferred members for a placement kind: lite → the smallest-capacity member(s) (node-c), standard → the largest (node-b).
- * Capacity is the operator's own statement of member size (`pool-node-b@node-b:40,pool-node-c@node-c:6`), so no new spec syntax.
+ * Preferred members for a placement kind: lite → the smallest-capacity member(s), standard → the largest.
+ * Capacity is the operator's own statement of member size (`pool-node-a@node-a:40,pool-node-b@node-b:6`), so no new spec syntax.
  * When every member has the same capacity there is no small/big member and no preference (empty list).
  */
 export function preferredMembers(members: readonly PodPoolMember[], kind: PodPlacementKind | null | undefined): string[] {
@@ -888,6 +888,29 @@ export function syncPoolImage(member: PodPoolMember, image: string, localCommit:
 
 export type PoolKubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
 
+/** Read identities for a shadow decision; this never reserves or changes a Pod. */
+export function snapshotWarmPoolMembers(members: readonly PodPoolMember[], kubectl: PoolKubectl):
+  Record<string, Array<{ name: string; uid: string; node: string | null }>> | null {
+  const result: Record<string, Array<{ name: string; uid: string; node: string | null }>> = {};
+  for (const member of members) {
+    const observed = kubectl(['--context', member.context, '-n', 'elanous-test', 'get', 'pods', '-l', 'elanous.kind=warm-worker', '-o', 'json']);
+    if (observed.status !== 0) return null;
+    try {
+      const parsed: unknown = JSON.parse(observed.stdout);
+      if (!parsed || typeof parsed !== 'object' || !('items' in parsed) || !Array.isArray(parsed.items)) return null;
+      const rows: Array<{ name: string; uid: string; node: string | null }> = [];
+      for (const item of parsed.items) {
+        if (!item || typeof item !== 'object' || !item.metadata || typeof item.metadata.name !== 'string'
+          || typeof item.metadata.uid !== 'string' || !item.metadata.name || !item.metadata.uid) return null;
+        const node = typeof item.spec?.nodeName === 'string' ? item.spec.nodeName : null;
+        rows.push({ name: item.metadata.name, uid: item.metadata.uid, node });
+      }
+      result[member.context] = rows.sort((a, b) => a.uid.localeCompare(b.uid));
+    } catch { return null; }
+  }
+  return result;
+}
+
 /**
  * 발사 전 점검 — 노드마다 «컨텍스트가 닿나 · elanous-test 네임스페이스가 있나».
  * ⛔ 안 되는 노드는 «조용히» 빼지 않는다 — 이유를 낸다. 하나도 안 되면 ok=false.
@@ -972,7 +995,7 @@ export async function syncPoolImages(members: readonly PodPoolMember[], image: s
   const remoteBuild = deps.remoteBuild ?? (script ? defaultRemoteBuild(script, image) : null);
   // The registry-less build fallback below calls this ship path, including its remote import result check.
   const ship = deps.ship ?? ((m: PodPoolMember, img: string, commit: string | null, remote: RemoteRun) =>
-    syncPoolImage(m, img, commit, { run: remote, inspect: deps.inspect, transfer: deps.transfer }));
+    syncPoolImage(m, img, commit, { run: remote, inspect: deps.inspect, transfer: deps.transfer, lock: deps.lock }));
   const results = new Map<string, PoolImageSync>();
   // pack 한 번 ⊕ 나눠 쓰기 — 원격 멤버가 둘 이상일 때만(하나뿐이면 종전대로 build.sh 가 스스로 pack 한다).
   //   주입된 remoteBuild(시험)에는 진짜 pack 을 붙이지 않는다 — pack 도 주입해야 쓴다.

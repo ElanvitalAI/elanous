@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statfsSync, statSync, writeFileSync } from 'node:fs';
-import { availableParallelism, freemem, tmpdir } from 'node:os';
+import { availableParallelism, freemem, loadavg, tmpdir, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
 import { withGateTestEnv } from '../../scripts/lib/gate-test-env.js';
-import { withBaselineWorktree } from '../self-implement/gate-baseline.js';
+import { withBaselineWorktree, withBaselineWorktreeAsync } from '../self-implement/gate-baseline.js';
 import { aggregateGateTestShards, type GateShardAttempt, type GateShardAggregate } from './shard-aggregate.js';
 import { GateShardCapacityError, planFixedGateTestShards, planSelfGateSpawnSeparatedShards, type GateTestShard } from './shard-plan.js';
 import { isGateSpawnLaneFile } from './spawn-lane-files.js';
@@ -27,6 +27,15 @@ export interface ShardRunResult {
   unmeasuredByShard?: Record<string, string>;
   /** git stderr tail (redacted · ≤2KB · one line) when the baseline worktree could not be added. */
   baselineStderrTail?: string;
+  /** Effective live pool width and its host-load/memory decision, for gate artifacts and diagnosis. */
+  concurrency?: number;
+  concurrencyReason?: string;
+  /** Wall time spent in singleton RSS samples and current+baseline bundles, respectively. */
+  measurementMs?: number;
+  bundleMs?: number;
+  /** Sum of process wall times across bundles (overlaps under concurrency). */
+  currentProcessMs?: number;
+  baselineProcessMs?: number;
 }
 
 /** What a failed shard process leaves behind so «test failure vs runner error» can be told apart after the fact. */
@@ -50,9 +59,11 @@ export interface ShardRunMode {
   /** OP FU — sorted round-robin into `count` shards, zero pre-measurement runs. Default off: the measured planner. */
   fixedDistribution?: boolean;
   /** Measured on the executing host; override only for deterministic planning tests. */
-  hostResources?: { cores: number; freeMemoryGiB: number; freeTmpGiB: number };
+  hostResources?: { cores: number; freeMemoryGiB: number; freeTmpGiB: number; load1?: number };
   /** Observation after each bundle's first current+baseline attempt; never controls retries or verdict. */
   onShardComplete?: (progress: ShardRunProgress) => void;
+  /** Maximum concurrently active shard bundles. The default is three, bounded to one through four. */
+  concurrency?: number;
 }
 
 export interface ShardRunProgress {
@@ -73,12 +84,35 @@ function hostResources(): ShardRunMode['hostResources'] | undefined {
       const availableKiB = /^MemAvailable:\s+(\d+)\s+kB/m.exec(readFileSync('/proc/meminfo', 'utf8'))?.[1];
       if (availableKiB) freeMemoryGiB = Number(availableKiB) / (1024 ** 2);
     }
+    if (process.platform === 'darwin') {
+      // macOS freemem excludes reclaimable cache; node-b reported 5 GiB free of 512 GiB while
+      // memory_pressure reported 91% available. A freemem cap would silently serialize the gate.
+      const pressure = Bun.spawnSync(['memory_pressure', '-Q'], { stdout: 'pipe', stderr: 'ignore', timeout: 2_000 });
+      const percent = /System-wide memory free percentage:\s*(\d+(?:\.\d+)?)%/.exec(Buffer.from(pressure.stdout).toString('utf8'))?.[1];
+      if (pressure.exitCode === 0 && percent !== undefined && Number(percent) >= 0 && Number(percent) <= 100) {
+        freeMemoryGiB = totalmem() / (1024 ** 3) * Number(percent) / 100;
+      }
+    }
     return {
       cores: availableParallelism(),
       freeMemoryGiB,
       freeTmpGiB: Number(tmp.bavail) * Number(tmp.bsize) / (1024 ** 3),
+      load1: loadavg()[0],
     };
   } catch { return undefined; }
+}
+
+/** A conservative snapshot taken before sampling. Explicit 1 preserves the old serial child order. */
+export function resolveShardConcurrency(configured: number | undefined, resources: ShardRunMode['hostResources'], budgetGiB: number): { count: number; reason: string } {
+  if (!resources || !Number.isFinite(resources.cores) || resources.cores < 1) return { count: Math.max(1, Math.min(4, configured ?? 3)), reason: configured === undefined ? 'default; host load unavailable' : 'configured; host load unavailable' };
+  const loadRatio = Number.isFinite(resources.load1) ? resources.load1! / resources.cores : null;
+  const target = configured ?? (loadRatio !== null && loadRatio >= 0.8 ? 2
+    : loadRatio !== null && loadRatio <= 0.35 && resources.cores >= 8 ? 4 : 3);
+  const cpuCap = Math.max(1, Math.floor(resources.cores));
+  const memoryCap = Number.isFinite(resources.freeMemoryGiB) && Number.isFinite(budgetGiB) && budgetGiB > 0
+    ? Math.max(1, Math.floor(resources.freeMemoryGiB / budgetGiB)) : 4;
+  const count = Math.max(1, Math.min(4, target, cpuCap, memoryCap));
+  return { count, reason: `${configured === undefined ? 'adaptive' : `configured ${configured}`} · host load/cores ${loadRatio === null ? '?' : loadRatio.toFixed(2)} · free ${resources.freeMemoryGiB.toFixed(1)} GiB · shard budget ${budgetGiB} GiB` };
 }
 
 /** One expansion slot needs one CPU, one shard memory budget, and 1 GiB of free tmp space.
@@ -104,6 +138,7 @@ export type ShardProcess = (cwd: string, files: readonly string[]) => {
   /** Present only when the process failed (exit≠0 · signal · no JUnit) — observation only, never part of the verdict. */
   failure?: ShardFailureOutput;
 };
+export type AsyncShardProcess = (cwd: string, files: readonly string[]) => Promise<ReturnType<ShardProcess>>;
 
 export const SHARD_FAILURE_TAIL_BYTES = 64 * 1024;
 
@@ -111,6 +146,29 @@ function outputTail(bytes: Uint8Array | undefined): string {
   if (!bytes?.length) return '';
   const tail = bytes.length > SHARD_FAILURE_TAIL_BYTES ? bytes.subarray(bytes.length - SHARD_FAILURE_TAIL_BYTES) : bytes;
   return redactSecretText(Buffer.from(tail).toString('utf8'));
+}
+
+/** Drain a child pipe without retaining its entire output. Diagnostics need the opening context and failure tail. */
+async function boundedChildOutput(stream: ReadableStream<Uint8Array>, abort: AbortSignal): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const cancel = () => { void reader.cancel('child output drain timed out').catch(() => {}); };
+  abort.addEventListener('abort', cancel, { once: true });
+  const headLimit = 1024;
+  let head = new Uint8Array(0);
+  let tail = new Uint8Array(0);
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (head.byteLength < headLimit) head = Buffer.concat([head, value.subarray(0, headLimit - head.byteLength)]);
+      tail = value.byteLength >= SHARD_FAILURE_TAIL_BYTES
+        ? value.slice(-SHARD_FAILURE_TAIL_BYTES)
+        : Buffer.concat([tail, value]).subarray(-SHARD_FAILURE_TAIL_BYTES);
+    }
+  } finally { abort.removeEventListener('abort', cancel); reader.releaseLock(); }
+  return total <= SHARD_FAILURE_TAIL_BYTES ? tail : Buffer.concat([head, tail]);
 }
 
 /** `<shardId>.failure.json` per failed shard (shard ids are already `shard-<n>`). Top level = the latest current-side
@@ -321,6 +379,146 @@ function runPlannedShards(
   };
 }
 
+/** Runs planned bundles concurrently while retaining plan order in attempts and aggregate evidence. */
+export async function runShardedGateTestsAsync(
+  cwd: string,
+  files: readonly string[],
+  baseRef: string,
+  count = 2,
+  run: AsyncShardProcess = runBunShardAsync,
+  baselineWorktree: typeof withBaselineWorktreeAsync = withBaselineWorktreeAsync,
+  budgetGiB = 8,
+  mode: ShardRunMode = {},
+  measure: AsyncShardProcess = run,
+): Promise<ShardRunResult> {
+  if (mode.concurrency !== undefined && (!Number.isSafeInteger(mode.concurrency) || mode.concurrency < 1 || mode.concurrency > 4)) throw new Error('invalid shard concurrency (expected 1–4)');
+  const resources = mode.hostResources ?? hostResources();
+  const selectedConcurrency = resolveShardConcurrency(mode.concurrency, resources, budgetGiB);
+  const concurrency = selectedConcurrency.count;
+  debug.log('self-dev.shard', 'concurrency', { concurrency, reason: selectedConcurrency.reason });
+  const measurementStartedAt = performance.now();
+  const samples = new Map<string, ReturnType<ShardProcess>>();
+  if (!mode.fixedDistribution) {
+    const unique = [...new Set(files)];
+    let nextSample = 0;
+    const sampleWorker = async () => {
+      for (;;) {
+        const index = nextSample++;
+        if (index >= unique.length) return;
+        const file = unique[index]!;
+        try { samples.set(file, await measure(cwd, [file])); }
+        catch (error) {
+          debug.log('self-dev.shard', 'rss-measurement-failed', { file, error: redactSecretText(String(error)).slice(0, 500) });
+          samples.set(file, { exitCode: null });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, unique.length) }, () => sampleWorker()));
+  }
+  const measurementMs = Math.round(performance.now() - measurementStartedAt);
+  // Reuse the established measured/fixed planner and its host-cap fallback. The callback supplies a
+  // planning-only aggregate, so this phase never launches a shard or creates a baseline worktree.
+  const planningOnlyBaseline = (() => ({ status: 'passed' as const, retryShardIds: [] })) as unknown as typeof withBaselineWorktree;
+  const planned = runShardedGateTests(cwd, files, baseRef, count, (_cwd, selected) => samples.get(selected[0]!) ?? { exitCode: null },
+    planningOnlyBaseline, budgetGiB, { ...mode, ...(resources ? { hostResources: resources } : {}) });
+  if (planned.reason) return { ...planned, concurrency, concurrencyReason: selectedConcurrency.reason, measurementMs, bundleMs: 0 };
+  const shards = planned.shards;
+  const attempts: GateShardAttempt[] = [];
+  const failureEvidence: ShardFailureEvidence[] = [];
+  const bundlesStartedAt = performance.now();
+  let currentProcessMs = 0;
+  let baselineProcessMs = 0;
+  const baseline = await baselineWorktree(cwd, baseRef, async (dir) => {
+    const treeReadable = (() => { try { return statSync(dir).isDirectory(); } catch { return false; } })();
+    // Baseline membership is invariant for both rounds. Cache it before launching children.
+    const atBase = new Map(shards.map((shard) => [shard.id,
+      treeReadable ? shard.files.filter((file) => !absentAtBaseline(join(dir, file))) : [...shard.files]]));
+    const baselinePassCache = new Map<string, ReturnType<ShardProcess>>();
+    const totalFiles = new Set(shards.flatMap((shard) => shard.files)).size;
+    let completedShards = 0;
+    let completedFiles = 0;
+    let pending = shards;
+    for (let round = 1; round <= 2 && pending.length; round++) {
+      const roundAttempts = new Array<GateShardAttempt>(pending.length);
+      const roundEvidence = new Array<ShardFailureEvidence[]>(pending.length);
+      let next = 0;
+      const runSafely = async (location: string, selected: readonly string[]): Promise<ReturnType<ShardProcess>> => {
+        try { return await run(location, selected); }
+        catch (error) {
+          debug.log('self-dev.shard', 'bundle-runner-failed', { location, files: selected,
+            error: redactSecretText(String(error)).slice(0, 500) });
+          return { exitCode: null };
+        }
+      };
+      const worker = async () => {
+        for (;;) {
+          const index = next++;
+          if (index >= pending.length) return;
+          const shard = pending[index]!;
+          const baselineFiles = atBase.get(shard.id)!;
+          if (baselineFiles.length < shard.files.length) {
+            debug.log('self-dev.shard', 'baseline-files-absent', { shardId: shard.id, round,
+              absent: shard.files.filter((file) => !baselineFiles.includes(file)) });
+          }
+          const currentStartedAt = performance.now();
+          const current = await runSafely(cwd, shard.files);
+          currentProcessMs += performance.now() - currentStartedAt;
+          const cached = concurrency > 1 && round > 1 ? baselinePassCache.get(shard.id) : undefined;
+          if (cached) debug.log('self-dev.shard', 'baseline-cache-hit', { shardId: shard.id, round });
+          const baselineStartedAt = performance.now();
+          const base = cached ?? (baselineFiles.length ? await runSafely(dir, baselineFiles) : { exitCode: 0 });
+          baselineProcessMs += performance.now() - baselineStartedAt;
+          if (concurrency > 1 && baselineFiles.length && base.exitCode === 0 && !base.signal && base.junit) baselinePassCache.set(shard.id, base);
+          roundAttempts[index] = {
+            shardId: shard.id, attempt: round, currentJUnit: current.junit, baselineJUnit: base.junit,
+            currentExitCode: current.exitCode, baselineExitCode: base.exitCode,
+            currentSignal: current.signal, baselineSignal: base.signal,
+            currentDiagnostic: current.diagnostic, baselineDiagnostic: base.diagnostic,
+            baselineFiles, currentRoot: cwd, baselineRoot: dir,
+          };
+          roundEvidence[index] = [];
+          for (const [side, result, selected] of [
+            ['current', current, shard.files], ['baseline', base, baselineFiles],
+          ] as const) {
+            if (result.failure) roundEvidence[index]!.push({ shardId: shard.id, side, attempt: round,
+              files: [...selected], exitCode: result.exitCode, signal: result.signal ?? null, ...result.failure });
+          }
+          if (round === 1 && mode.onShardComplete) {
+            completedShards++;
+            completedFiles += shard.files.length;
+            try { mode.onShardComplete({ shardId: shard.id, completedShards, totalShards: shards.length,
+              completedFiles, totalFiles }); } catch { /* observation only */ }
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, () => worker()));
+      attempts.push(...roundAttempts);
+      for (const evidence of roundEvidence) failureEvidence.push(...evidence);
+      const retry = new Set(aggregateGateTestShards(shards, attempts).retryShardIds);
+      pending = shards.filter((shard) => retry.has(shard.id));
+    }
+    return aggregateGateTestShards(shards, attempts);
+  });
+  const evidence = failureEvidence.length ? { failureEvidence } : {};
+  const bundleMs = Math.round(performance.now() - bundlesStartedAt);
+  if ('retryShardIds' in baseline) return {
+    ...planned, aggregate: baseline, attempts, ...evidence, concurrency, concurrencyReason: selectedConcurrency.reason, measurementMs, bundleMs,
+    currentProcessMs: Math.round(currentProcessMs), baselineProcessMs: Math.round(baselineProcessMs),
+    ...(baseline.retryShardIds.length ? { unmeasuredByShard: incompleteShardReasons(baseline.retryShardIds, attempts) } : {}),
+  };
+  const retryShardIds = shards.map((shard) => shard.id);
+  const stderrTail = baseline.gitStderrTail;
+  const stderrPart = stderrTail ? ` · git stderr: ${stderrTail}` : '';
+  return {
+    ...planned, aggregate: { status: 'unmeasured', retryShardIds }, attempts, concurrency, concurrencyReason: selectedConcurrency.reason, measurementMs, bundleMs,
+    currentProcessMs: Math.round(currentProcessMs), baselineProcessMs: Math.round(baselineProcessMs),
+    reason: baseline.log, ...evidence,
+    unmeasuredByShard: Object.fromEntries(retryShardIds.map((id) => [id,
+      `baseline worktree: ${redactSecretText(baseline.log).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500)}${stderrPart}`])),
+    ...(stderrTail ? { baselineStderrTail: stderrTail } : {}),
+  };
+}
+
 function incompleteShardReasons(shardIds: readonly string[], attempts: readonly GateShardAttempt[]): Record<string, string> {
   return Object.fromEntries(shardIds.map((id) => {
     const latest = attempts.filter((attempt) => attempt.shardId === id).at(-1);
@@ -376,6 +574,65 @@ export function runBunShardWithSpawn(cwd: string, files: readonly string[], spaw
       ...(failed ? { failure: { durationMs: Math.round(durationMs), stdoutTail: outputTail(result.stdout), stderrTail: outputTail(result.stderr) } } : {}),
     };
   } finally {
+    isolated.cleanup();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Nonblocking child runner; each bundle still owns its own deterministic environment and JUnit path. */
+export async function runBunShardAsync(cwd: string, files: readonly string[], drainTimeoutMs = 5_000): Promise<ReturnType<ShardProcess>> {
+  const timeout = selfGateShardTimeoutMs(files);
+  const spawnLane = timeout === 120_000;
+  const dir = mkdtempSync(join(tmpdir(), 'elanous-shard-junit-'));
+  const report = join(dir, 'result.xml');
+  const isolated = prepareDeterministicChildEnvironment('elanous-shard-test-env-', { env: withGateTestEnv(process.env) });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  const drainAbort = new AbortController();
+  try {
+    const args = ['test', ...(spawnLane ? ['--timeout=120000'] : []), '--reporter=junit', `--reporter-outfile=${report}`, ...files];
+    const started = performance.now();
+    const child = Bun.spawn(['bun', ...args], { cwd, env: isolated.env, stdout: 'pipe', stderr: 'pipe' });
+    let timedOut = false;
+    let drainTimedOut = false;
+    timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeout);
+    const stdoutOutput = boundedChildOutput(child.stdout, drainAbort.signal);
+    const stderrOutput = boundedChildOutput(child.stderr, drainAbort.signal);
+    const exited = child.exited.then((code) => {
+      // Pipe draining can continue after process exit; a late timer must not relabel a clean exit as SIGKILL.
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      drainTimer = setTimeout(() => {
+        drainTimedOut = true;
+        debug.log('self-dev.shard', 'output-drain-timeout', { cwd, files, drainTimeoutMs });
+        drainAbort.abort();
+      }, drainTimeoutMs);
+      return code;
+    });
+    const [exitCode, stdoutBuffer, stderrBuffer] = await Promise.all([
+      exited,
+      stdoutOutput,
+      stderrOutput,
+    ]);
+    if (drainTimer) clearTimeout(drainTimer);
+    drainTimer = undefined;
+    const stdout = stdoutBuffer;
+    const stderr = stderrBuffer;
+    const durationMs = performance.now() - started;
+    const usage = child.resourceUsage();
+    const junit = existsSync(report) ? readFileSync(report, 'utf8') : undefined;
+    const signal = drainTimedOut ? 'DRAIN_TIMEOUT' : timedOut ? 'SIGKILL' : child.signalCode ? String(child.signalCode) : undefined;
+    const failed = exitCode !== 0 || !!signal || junit === undefined;
+    return {
+      exitCode, signal, junit,
+      ...(files.length === 1 ? { rssMb: usage ? usage.maxRSS / (1024 * 1024) : undefined, seconds: durationMs / 1000 } : {}),
+      ...(junit === undefined && (exitCode !== 0 || signal) ? { diagnostic: boundedDiagnostic(stdout, stderr) } : {}),
+      ...(failed ? { failure: { durationMs: Math.round(durationMs), stdoutTail: outputTail(stdout), stderrTail: outputTail(stderr) } } : {}),
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (drainTimer) clearTimeout(drainTimer);
+    drainAbort.abort();
     isolated.cleanup();
     rmSync(dir, { recursive: true, force: true });
   }

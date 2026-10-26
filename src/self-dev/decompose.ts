@@ -442,6 +442,24 @@ function isRawSubtask(value: unknown): value is RawSubtask {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function ensureSingleCompletionCriterion(feature: string, targetPaths: string[]): string {
+  const lines = feature.split(/\r?\n/);
+  const criteria = lines.filter((line) => /^\s*완료 기준\s*:/.test(line));
+  if (criteria.length === 0) {
+    return `${feature}\n완료 기준: ${targetPaths.join(' · ')}의 변경을 확인하고 관련 시험을 통과한다.`;
+  }
+  if (criteria.length === 1 && criteria[0]!.trim().length > '완료 기준:'.length) return feature;
+  const criterionText = criteria
+    .map((line) => line.replace(/^\s*완료 기준\s*:\s*/, '').trim())
+    .filter(Boolean)
+    .join(' · ');
+  const normalizedCriterion = criterionText || `${targetPaths.join(' · ')}의 변경을 확인하고 관련 시험을 통과한다.`;
+  const firstCriterionIndex = lines.findIndex((line) => /^\s*완료 기준\s*:/.test(line));
+  const withoutCriteria = lines.filter((line) => !/^\s*완료 기준\s*:/.test(line));
+  withoutCriteria.splice(Math.min(firstCriterionIndex, withoutCriteria.length), 0, `완료 기준: ${normalizedCriterion}`);
+  return withoutCriteria.join('\n');
+}
+
 /**
  * G6 (1c) — 결정론적 hotPaths 추론. 분해된 sub-goal 의 feature 텍스트에서 repo 파일
  * 경로(src/…·docs/…·scripts/… + 확장자)를 뽑는다. LLM 이 hotPaths 를 안 채워도 hot-file
@@ -476,7 +494,8 @@ export function inheritDecomposedTargetPaths(parentFeature: string, goals: SelfD
         ? own[index]!
         : (goal.hotPaths ?? []).filter((path) => parentTargets.includes(path)));
       const claimedOwners = parentTargets.map((path) => goals.flatMap((_, index) => claims[index]!.includes(path) ? [index] : []));
-      const conflictingClaims = claimedOwners.some((indices) => indices.length > 1);
+      const sharedExplicitTarget = own.length === 2 && own[0]!.some((path) => own[1]!.includes(path));
+      const conflictingClaims = sharedExplicitTarget || claimedOwners.some((indices) => indices.length > 1);
       const nameOwners = parentTargets.map((path) => {
         const stemWords = path.split('/').at(-1)!.replace(/\.[^.]+$/, '').toLowerCase().match(/[a-z0-9]+/g) ?? [];
         if (!stemWords.length || stemWords.join('').length < 4) return [];
@@ -507,24 +526,41 @@ export function inheritDecomposedTargetPaths(parentFeature: string, goals: SelfD
       // A named path wins over model order; if every path points at one child,
       // keep the old scope rather than inventing work for the other child.
       const partitions = goals.map((_, index) => parentTargets.filter((_, pathIndex) => owners[pathIndex] === index));
-      const sharedOtherPaths = (goals[0]?.hotPaths ?? []).some((path) =>
-        !parentTargets.includes(path) && (goals[1]?.hotPaths ?? []).includes(path));
       const conflictingParentReference = goals.some((goal, index) =>
         own[index]!.length > 0 && (goal.hotPaths ?? []).some((path) =>
           parentTargets.includes(path) && !own[index]!.includes(path)));
       if (partitions.every((paths) => paths.length > 0)
         && !conflictingClaims && !ambiguousName && !conflictingNameClaim && !conflictingUnclaimedHint
-        && !sharedOtherPaths && !conflictingParentReference) return goals.map((goal, index) => {
+        && !conflictingParentReference) return goals.map((goal, index) => {
         const targets = partitions[index]!;
-        return { ...goal, hotPaths: [...new Set([...(goal.hotPaths ?? []), ...targets])],
-          feature: `${goal.feature}${own[index]!.length ? '' : `\n대상 경로: ${targets.join(' · ')}`}\n완료 기준: ${targets.join(' · ')}의 변경을 확인하고 관련 시험을 통과한다.` };
+        // A declared child target may add a helper outside the parent fence. Bare
+        // hotPaths outside that fence are references, so do not widen the write fence.
+        const explicitHelpers = own[index]!.filter((path) => !parentTargets.includes(path));
+        const feature = `${goal.feature}${own[index]!.length ? '' : `\n대상 경로: ${targets.join(' · ')}`}`;
+        return { ...goal, hotPaths: [...new Set([...targets, ...explicitHelpers])],
+          feature: ensureSingleCompletionCriterion(feature, targets) };
       });
     }
   }
-  return goals.map((goal) => {
+  const explicitChildTargets = goals.map((goal) => declaredTargets(goal.feature ?? ''));
+  const explicitParentTargets = explicitChildTargets.map((paths) => paths.filter((path) => parentTargets.includes(path)));
+  const explicitTargetsArePartition = goals.length === 2
+    && explicitParentTargets.every((paths) => paths.length > 0)
+    && new Set(explicitChildTargets.flat()).size === explicitChildTargets.flat().length
+    && explicitParentTargets[0]!.every((path) => !explicitParentTargets[1]!.includes(path))
+    && new Set(explicitParentTargets.flat()).size === parentTargets.length
+    && parentTargets.every((path) => explicitParentTargets.flat().includes(path))
+    && goals.every((goal, index) => (goal.hotPaths ?? []).every((path) =>
+      !parentTargets.includes(path) || explicitChildTargets[index]!.includes(path)));
+  return goals.map((goal, index) => {
     // hotPaths also contains inferred references; only an explicit target line establishes child scope.
-    const own = declaredTargets(goal.feature ?? '');
-    if (own.length) return goal;
+    const own = explicitChildTargets[index]!;
+    if (own.length) {
+      if (explicitTargetsArePartition) {
+        return { ...goal, hotPaths: own, feature: ensureSingleCompletionCriterion(goal.feature ?? '', own) };
+      }
+      return goal;
+    }
     return { ...goal, hotPaths: [...new Set([...(goal.hotPaths ?? []), ...parentTargets])],
       feature: `${goal.feature}\n대상 경로: ${parentTargets.join(' · ')}` };
   });

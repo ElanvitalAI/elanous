@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +10,14 @@ const PROBE = join(import.meta.dir, 'mock-seat-pty-sequence-child.ts');
 const REPO_CLI = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
 
 describe('N03 key sequence: one screen per step on a real PTY', () => {
+  test('seat-seq CLI advertises the next-resume scenario', () => {
+    const run = spawnSync('bun', ['scripts/ux-sim.ts', 'seat-seq', 'not-a-scenario', '--root', '/tmp/n03-unused'], {
+      cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 30_000,
+    });
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain('next-resume');
+  });
+
   test('each step is read back as the screen the probe rendered, in order, with an isolated HOME', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-seq-'));
     try {
@@ -96,6 +105,17 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
       expect(r.checks).toEqual({
         autoCompactOnce: true, autoBeforeIsSeeded12: true, manualCompactOnce: true, screenShowsAuto: true,
         summaryFromFakeLlm: true, onlyFakeProvider: true, exitedClean: true,
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 150_000);
+
+  test('next-resume: /resume lists saved sessions, resumes a selected session, then sends the next turn there', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'n03-next-resume-'));
+    try {
+      const r = await runNextTuiScenario({ scenario: 'next-resume', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
+      expect(r.checks).toEqual({
+        listDisplaysSavedSession: true, selectedSessionBecomesActive: true, resumedHistoryRenders: true,
+        oldSessionPreserved: true, newTurnUsesResumedSession: true, onlyFakeProvider: true, exitedClean: true,
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 150_000);

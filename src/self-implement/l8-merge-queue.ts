@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,8 +7,14 @@ import { NEXT_MD_PATH, resolveNextMdConflict } from '../release-loop/next-md-mer
 import { defaultLlmResolve, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
 import { debug } from '../debug/log.js';
-import { integrateTrain, planTrain, runTrain, type TrainCandidate, type TrainDeferred, type TrainGit } from './merge-train.js';
+import { integrateTrain, runTrain, type TrainCandidate, type TrainDeferred, type TrainGit } from './merge-train.js';
 import { trainGateOnHost, type TrainGate } from './train-gate-remote.js';
+import {
+  buildTrainReachDecision,
+  type TrainReachCandidate,
+  type TrainReachGroup,
+  type TrainReachObservation,
+} from './train-reach-grouping.js';
 
 type Command = (bin: string, args: readonly string[], cwd: string) => { status: number | null; stdout: string; stderr: string };
 export type L8MergeQueueInput = { number: number; cwd: string; matchHeadCommit: string };
@@ -32,6 +39,17 @@ export type L8MergeQueueDeps = {
   acquire?: (cwd: string) => Promise<() => void>;
 };
 
+/** Per-PR shadow train record: reach group, tests, and the integrate/bisect verdict. */
+export type L8ShadowPrManifest = {
+  number: number;
+  head: string;
+  group: number[];
+  reachTests: string[];
+  interactionTests: string[];
+  queueSig: string;
+  gatesRun: number;
+  verdict: L8ShadowVerdict['verdict'];
+};
 export type L8ShadowVerdict = {
   number: number;
   head: string;
@@ -41,6 +59,8 @@ export type L8ShadowVerdict = {
   detail?: string;
   tests: string[];
   at: string;
+  /** Present when this verdict came from a reach-grouped shadow train. */
+  manifest?: L8ShadowPrManifest;
 };
 export type L8ShadowQueueItem = {
   number: number;
@@ -50,7 +70,9 @@ export type L8ShadowQueueItem = {
   overlapsWith?: number[];
   overlapsUnknownWith?: number[];
 };
-export type L8ShadowQueueState = { pending: L8ShadowQueueItem[]; verdicts: L8ShadowVerdict[] };
+/** Reach precheck outcome for a queued PR this run could not pin (stale view, changed head, or worktree failure). */
+export type L8ShadowDeferred = { number: number; head: string; reason: string; at: string };
+export type L8ShadowQueueState = { pending: L8ShadowQueueItem[]; verdicts: L8ShadowVerdict[]; deferred?: L8ShadowDeferred[] };
 export type L8ShadowEnqueueObservation = {
   number: number;
   head: string;
@@ -68,8 +90,10 @@ export type L8ShadowQueueDeps = L8MergeQueueDeps & {
   trainGate?: (repo: string, baseSha: string) => TrainGate;
   /** Shadow merge train integration git seam (default: the queue's own command executor). */
   trainGit?: TrainGit;
-  /** Maximum PRs per shadow train batch (default 2). */
+  /** Maximum PRs per shadow train batch (default 5, the reach-group capacity). */
   trainMaxBatch?: number;
+  /** Reach observation seam (default: inspect each fetched PR worktree via buildTrainReachDecision). */
+  trainReachInspect?: (candidate: TrainReachCandidate, baseSha: string) => TrainReachObservation;
 };
 
 function shadowCommand(execute: Command, bin: string, args: string[], cwd: string): string {
@@ -89,7 +113,8 @@ function readShadowQueue(path: string): L8ShadowQueueState {
   const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
   if (!value || typeof value !== 'object' || !('pending' in value) || !Array.isArray(value.pending)
     || !value.pending.every((p: { number?: number; head?: string }) => Number.isSafeInteger(p?.number) && p.number! > 0 && typeof p.head === 'string' && /^[0-9a-f]{40}$/i.test(p.head))
-    || !('verdicts' in value) || !Array.isArray(value.verdicts)) throw new Error('invalid shadow queue ledger');
+    || !('verdicts' in value) || !Array.isArray(value.verdicts)
+    || !('deferred' in value ? Array.isArray(value.deferred) : true)) throw new Error('invalid shadow queue ledger');
   return value as L8ShadowQueueState;
 }
 
@@ -180,10 +205,94 @@ export async function enqueueL8ShadowQueue(cwd: string, number: number, deps: L8
   });
 }
 
-/** LAND-QUEUE — shadow merge train: planTrain → integrateTrain → runTrain(trainGateOnHost) when the queue holds
- *  two or more measured, non-overlapping PRs. Per-PR verdicts (pass · culprit · unmeasured) land in the queue
- *  ledger and in debug.log ('self-implement.merge-train' · 'shadow-verdict'). Shadow only: no push, no merge API;
- *  the single-PR evaluation path in runL8ShadowQueue stays untouched for every queue this train cannot take. */
+function shadowQueueSig(base: string, pending: readonly L8ShadowQueueItem[]): string {
+  return createHash('sha256').update(`${base}\0${pending.map((item) => `${item.number}:${item.head}`).join('\0')}`).digest('hex');
+}
+
+function shadowReachWorktree(cwd: string, run: (bin: string, args: string[], where?: string) => string, item: L8ShadowQueueItem, base: string): string {
+  const tree = mkdtempSync(join(tmpdir(), `elanous-l8-reach-${item.number}-`));
+  try {
+    run('git', ['worktree', 'add', '--detach', tree, item.head], cwd);
+    if (run('git', ['rev-parse', 'HEAD'], tree) !== item.head) throw new Error(`reach worktree HEAD changed: #${item.number}`);
+    run('git', ['cat-file', '-e', `${base}^{commit}`], tree);
+    return tree;
+  } catch (error) {
+    try { run('git', ['worktree', 'remove', '--force', tree], cwd); } catch { /* still delete the directory */ }
+    rmSync(tree, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function pinShadowReachCandidates(
+  cwd: string,
+  run: (bin: string, args: string[], where?: string) => string,
+  pending: readonly L8ShadowQueueItem[],
+  base: string,
+  skip: ReadonlySet<number>,
+): { candidates: TrainReachCandidate[]; trees: string[]; failures: { number: number; head: string; reason: string }[] } {
+  const candidates: TrainReachCandidate[] = [];
+  const trees: string[] = [];
+  const failures: { number: number; head: string; reason: string }[] = [];
+  for (const item of pending) {
+    if (skip.has(item.number) || item.filesUnmeasured || !item.files?.length) continue;
+    try {
+      const tree = shadowReachWorktree(cwd, run, item, base);
+      trees.push(tree);
+      candidates.push({ pr: String(item.number), headSha: item.head, tree, changedFiles: [...item.files] });
+    } catch (error) {
+      // shadowReachWorktree cleans up its own tree; this PR only leaves the reach candidate set.
+      failures.push({ number: item.number, head: item.head, reason: String(error) });
+    }
+  }
+  return { candidates, trees, failures };
+}
+
+/** Keep one deferred record per queued PR (latest reason wins) so the ledger stays bounded. */
+function recordShadowDeferred(state: L8ShadowQueueState, entries: readonly L8ShadowDeferred[]): void {
+  const rest = (state.deferred ?? []).filter((entry) => !entries.some((current) => current.number === entry.number));
+  state.deferred = [...rest, ...entries];
+}
+
+function planShadowReachTrain(
+  pending: readonly L8ShadowQueueItem[],
+  group: TrainReachGroup,
+  { maxBatch }: { maxBatch: number },
+): { batch: TrainCandidate[]; deferred: TrainDeferred[] } {
+  const byNumber = new Map(pending.map((item) => [item.number, item]));
+  const numbers = group.prs.map((pr) => Number(pr)).filter((number) => byNumber.has(number));
+  const batch: TrainCandidate[] = [];
+  const deferred: TrainDeferred[] = [];
+  for (const number of numbers) {
+    const item = byNumber.get(number)!;
+    const candidate: TrainCandidate = { number: item.number, head: item.head, files: item.files, filesUnmeasured: item.filesUnmeasured };
+    if (batch.length < maxBatch) batch.push(candidate);
+    else deferred.push({ number, reason: 'overlap', with: batch.map((entry) => entry.number) });
+  }
+  return { batch, deferred };
+}
+
+function shadowPrManifest(
+  item: TrainCandidate,
+  group: TrainReachGroup,
+  queueSig: string,
+  gatesRun: number,
+  verdict: L8ShadowVerdict['verdict'],
+): L8ShadowPrManifest {
+  return {
+    number: item.number,
+    head: item.head,
+    group: group.prs.map((pr) => Number(pr)),
+    reachTests: [...group.reachTests],
+    interactionTests: [...group.interactionTests],
+    queueSig,
+    gatesRun,
+    verdict,
+  };
+}
+
+/** LAND-QUEUE — shadow merge train: pinned queue → buildTrainReachDecision → integrateTrain → runTrain.
+ *  Per-PR verdicts (pass · culprit · unmeasured) land in the queue ledger with a reach-group manifest.
+ *  Shadow only: no push, no merge API; the single-PR evaluation path stays for every queue this train cannot take. */
 async function runShadowMergeTrain(
   state: L8ShadowQueueState,
   path: string,
@@ -191,6 +300,9 @@ async function runShadowMergeTrain(
   run: (bin: string, args: string[], where?: string) => string,
   execute: Command,
   plan: { batch: TrainCandidate[]; deferred: TrainDeferred[] },
+  group: TrainReachGroup,
+  queueSig: string,
+  base: string,
   deps: L8ShadowQueueDeps,
 ): Promise<L8ShadowVerdict | null> {
   for (const item of plan.batch) {
@@ -200,9 +312,6 @@ async function runShadowMergeTrain(
     if (view.headRefOid !== item.head || view.baseRefName !== 'main' || view.state !== 'OPEN'
       || view.isDraft !== false || view.isCrossRepository !== false) throw new Error(`queued PR #${item.number} changed or is not ready`);
   }
-  run('git', ['fetch', 'origin', 'refs/heads/main'], cwd);
-  const base = run('git', ['rev-parse', 'FETCH_HEAD'], cwd);
-  if (!/^[0-9a-f]{40}$/i.test(base)) throw new Error('main commit unavailable');
   for (const item of plan.batch) {
     run('git', ['fetch', 'origin', `refs/pull/${item.number}/head`], cwd);
     if (run('git', ['rev-parse', 'FETCH_HEAD'], cwd) !== item.head) throw new Error(`fetched PR head changed: #${item.number}`);
@@ -213,49 +322,106 @@ async function runShadowMergeTrain(
     integrate: (batch) => integrateTrain(cwd, base, batch, trainGit),
     gate,
     deferred: plan.deferred,
-    // The train's observation channel is debug.log (LAND-QUEUE); the ledger below carries the authoritative state.
     observe: (data) => { debug.log('self-implement.merge-train', 'shadow-verdict', data); },
   });
   const at = new Date().toISOString();
   const batchNumbers = plan.batch.map((item) => item.number);
-  const verdicts: L8ShadowVerdict[] = result.verdicts.map((entry) => ({
-    number: entry.number,
-    head: plan.batch.find((item) => item.number === entry.number)!.head,
-    base,
-    verdict: entry.verdict,
-    detail: `merge train shadow · batch [${batchNumbers.join(',')}] · gatesRun ${result.gatesRun}`,
-    tests: [],
-    at,
-  }));
+  const verdicts: L8ShadowVerdict[] = result.verdicts.map((entry) => {
+    const item = plan.batch.find((candidate) => candidate.number === entry.number)!;
+    const manifest = shadowPrManifest(item, group, queueSig, result.gatesRun, entry.verdict);
+    return {
+      number: entry.number,
+      head: item.head,
+      base,
+      verdict: entry.verdict,
+      detail: `merge train shadow · reach [${group.prs.join(',')}] · batch [${batchNumbers.join(',')}] · gatesRun ${result.gatesRun}`,
+      tests: [...group.reachTests],
+      at,
+      manifest,
+    };
+  });
   state.pending = state.pending.filter((item) => !batchNumbers.includes(item.number));
   state.verdicts.push(...verdicts);
   writeShadowQueue(path, state);
   return verdicts[0] ?? null;
 }
 
-/** Evaluate one pinned queue head against freshly fetched main — or, when the queue holds two or more measured,
- *  non-overlapping PRs, one shadow merge train. Never push or call a merge API. */
+/** Evaluate one pinned queue head against freshly fetched main — or, when reach grouping finds a measured
+ *  two-or-more-PR component, one shadow merge train. Never push or call a merge API. */
 export async function runL8ShadowQueue(cwd: string, deps: L8ShadowQueueDeps = {}): Promise<L8ShadowVerdict | null> {
   return withShadowQueue(cwd, deps, async (state, path) => {
     const item = state.pending[0];
     if (!item) return null;
     const execute = deps.command ?? command;
     const run = (bin: string, args: string[], where = cwd) => shadowCommand(execute, bin, args, where);
-    // LAND-QUEUE — two or more measured, non-overlapping queued PRs evaluate as one shadow merge train first.
-    const trainPlan = planTrain(
-      state.pending.map((pending) => ({ number: pending.number, head: pending.head, files: pending.files, filesUnmeasured: pending.filesUnmeasured })),
-      { maxBatch: deps.trainMaxBatch ?? 2 },
-    );
-    if (trainPlan.batch.length >= 2) return runShadowMergeTrain(state, path, cwd, run, execute, trainPlan, deps);
+    run('git', ['fetch', 'origin', 'refs/heads/main']);
+    const base = run('git', ['rev-parse', 'FETCH_HEAD']);
+    if (!/^[0-9a-f]{40}$/i.test(base)) throw new Error('main commit unavailable');
+    const queueSig = shadowQueueSig(base, state.pending);
+    let trees: string[] = [];
+    // Preservation contract: a reach failure on any non-head queued PR defers only that PR; the queue head keeps
+    // both its shadow-train chance and the single-PR evaluation path. Only the head's own failure throws.
+    const reachDeferred: L8ShadowDeferred[] = [];
+    const reachSkip = new Set<number>();
+    try {
+      for (const pending of state.pending) {
+        if (pending.filesUnmeasured || !pending.files?.length) continue;
+        const isHead = pending === item;
+        try {
+          const view = JSON.parse(run('gh', ['pr', 'view', String(pending.number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'])) as {
+            headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;
+          };
+          if (view.headRefOid !== pending.head || view.baseRefName !== 'main' || view.state !== 'OPEN'
+            || view.isDraft !== false || view.isCrossRepository !== false) {
+            throw new Error(`queued PR #${pending.number} changed or is not ready`);
+          }
+          run('git', ['fetch', 'origin', `refs/pull/${pending.number}/head`]);
+          if (run('git', ['rev-parse', 'FETCH_HEAD']) !== pending.head) {
+            throw new Error(`fetched PR head changed: #${pending.number}`);
+          }
+        } catch (error) {
+          if (isHead) throw error;
+          reachDeferred.push({ number: pending.number, head: pending.head, reason: String(error), at: new Date().toISOString() });
+          reachSkip.add(pending.number);
+        }
+      }
+      const pinned = pinShadowReachCandidates(cwd, run, state.pending, base, reachSkip);
+      trees = pinned.trees;
+      for (const failure of pinned.failures) {
+        const reason = `reach worktree failed: #${failure.number}: ${failure.reason}`;
+        if (failure.number === item.number) throw new Error(reason);
+        reachDeferred.push({ number: failure.number, head: failure.head, reason, at: new Date().toISOString() });
+      }
+      if (reachDeferred.length) {
+        recordShadowDeferred(state, reachDeferred);
+        writeShadowQueue(path, state);
+      }
+      if (pinned.candidates.length >= 2) {
+        const decision = buildTrainReachDecision(
+          { version: 1, baseSha: base, queueSig, prs: pinned.candidates },
+          deps.trainReachInspect,
+        );
+        const group = decision.groups.find((entry) => entry.status === 'measured' && !entry.capacityBlocked && entry.prs.length >= 2
+          && entry.prs.includes(String(item.number)));
+        if (group) {
+          const trainPlan = planShadowReachTrain(state.pending, group, { maxBatch: deps.trainMaxBatch ?? 5 });
+          if (trainPlan.batch.length >= 2) {
+            return await runShadowMergeTrain(state, path, cwd, run, execute, trainPlan, group, queueSig, base, deps);
+          }
+        }
+      }
+    } finally {
+      for (const tree of trees) {
+        try { run('git', ['worktree', 'remove', '--force', tree]); } catch { /* still delete the directory */ }
+        rmSync(tree, { recursive: true, force: true });
+      }
+    }
     const verdict: L8ShadowVerdict = { number: item.number, head: item.head, verdict: 'fail', tests: [], at: new Date().toISOString() };
     const view = JSON.parse(run('gh', ['pr', 'view', String(item.number), '--json', 'headRefOid,baseRefName,state,isDraft,isCrossRepository'])) as {
       headRefOid?: string; baseRefName?: string; state?: string; isDraft?: boolean; isCrossRepository?: boolean;
     };
     if (view.headRefOid !== item.head || view.baseRefName !== 'main' || view.state !== 'OPEN'
       || view.isDraft !== false || view.isCrossRepository !== false) throw new Error('queued PR changed or is not ready');
-    run('git', ['fetch', 'origin', 'refs/heads/main']);
-    const base = run('git', ['rev-parse', 'FETCH_HEAD']);
-    if (!/^[0-9a-f]{40}$/i.test(base)) throw new Error('main commit unavailable');
     verdict.base = base;
     run('git', ['fetch', 'origin', `refs/pull/${item.number}/head`]);
     if (run('git', ['rev-parse', 'FETCH_HEAD']) !== item.head) throw new Error('fetched PR head changed');

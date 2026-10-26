@@ -319,6 +319,12 @@ export function recordShadowDoctorReevaluation(runId: string, dir?: string): {
   const visit = entries[visitIndex]!;
 
   const evidence = typeof visit.data.evidence === 'string' ? visit.data.evidence.trim() : '';
+  // The pack selected for this run was observed before the visit. Keep its actual slice ids;
+  // an absent or malformed observation must remain unknown, never imply an empty pack.
+  const pack = entries.slice(0, visitIndex).reverse().find((entry) => entry.event === 'knowhow-pack');
+  const packIds = Array.isArray(pack?.data?.ids) && pack.data.ids.length > 0
+    && pack.data.ids.every((id: unknown) => typeof id === 'string' && id.length > 0)
+    ? pack.data.ids as string[] : 'unknown';
   const rx = evidence ? 're-evaluate-member' as const : null;
   const outcome = evidence ? 'shadow-recorded' as const : 'needs-evidence' as const;
   const data: Record<string, unknown> = {
@@ -326,6 +332,7 @@ export function recordShadowDoctorReevaluation(runId: string, dir?: string): {
     visitIndex,
     visit: { runId, from: visit.data.from, symptom: 'admit-starved', timestamp: visit.timestamp, evidence: evidence || null },
     diagnosis: evidence ? 'admit-starved-reported' : 'evidence-unmeasured',
+    knowhowPackSliceIds: packIds,
     rx,
     cost: { estimatedTokens: 0, usedTokens: 0 },
     outcome,
@@ -335,6 +342,24 @@ export function recordShadowDoctorReevaluation(runId: string, dir?: string): {
   appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId, event: 'doctor-rx', data }, dir);
   debug.log('run-doctor', 'rx', { runId, visitIndex, rx, outcome, shadow: true, executed: false });
   return { status: 'recorded', ...(rx ? { rx } : {}), outcome, visitIndex };
+}
+
+/** Guardian shadow tick: prescribe only for ledgers with an admit-starved visit. Repeated ticks are idempotent. */
+export function recordPendingShadowDoctorReevaluations(dir?: string): { recorded: number; alreadyRecorded: number } {
+  let recorded = 0;
+  let alreadyRecorded = 0;
+  for (const ledger of listRunLedgers(dir ? { dir } : {}).matches) {
+    const visits = ledger.entries.flatMap((entry, index) => entry.event === 'doctor-visit' && entry.data.symptom === 'admit-starved' ? [index] : []);
+    if (visits.length === 0) continue;
+    const prescribed = new Set(ledger.entries.flatMap(entry => entry.event === 'doctor-rx' && entry.data.shadow === true
+      && typeof entry.data.visitIndex === 'number' ? [entry.data.visitIndex] : []));
+    if (visits.every(index => prescribed.has(index))) { alreadyRecorded++; continue; }
+    const result = recordShadowDoctorReevaluation(ledger.runId, ledger.ledgerDirectory);
+    if (result.status === 'recorded') recorded++;
+    else if (result.status === 'already-recorded') alreadyRecorded++;
+  }
+  debug.log('run-doctor', 'shadow-tick', { recorded, alreadyRecorded });
+  return { recorded, alreadyRecorded };
 }
 
 /** OP 손판정 한 건 — 시각과 결과만 받는다(그 밖의 입력은 받지 않는다). */

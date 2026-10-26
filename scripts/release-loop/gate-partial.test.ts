@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { changedFilesBetween, mergePartialFailures, partialPlanPath, planPartialRegate, readPartialPlan, writePartialPlan, testFileOfId } from './gate-partial';
+import * as gatePartial from './gate-partial';
+import { changedFilesBetween, mergePartialFailures, partialPlanPath, planPartialRegate, readPartialPlan, readPartialPlanResult, writePartialPlan, testFileOfId } from './gate-partial';
 import { bunfigPreload, gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure';
 
 const P = 'a'.repeat(40);
@@ -324,4 +325,137 @@ test('GATE-REUSE-BY-DIFF closure: the tip tree is read from git objects, not the
     expect(testsReachingChanged(tree, ['src/c.ts'], TESTS(tree))).toMatchObject({ ok: true, tests: ['src/a.test.ts'] });
     expect(() => gitClosureTree(repo, 'c'.repeat(40))).toThrow('git ls-tree failed');
   } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+// RELEASE-GATE-RADIUS-POD-IMAGE (#29549 Sol r5): reuse is never opened by a diff-only match.
+// imageDigest is the executed container imageID digest from a Pod shard result, never a Job image ref/tag.
+const DIGEST_035 = `sha256:${'e'.repeat(64)}`;
+const DIGEST_NEXT = `sha256:${'f'.repeat(64)}`;
+const podShard = (imageDigest?: string | null) => ({ imageDigest });
+
+function imageDigestsMatch(prior: readonly { imageDigest?: string | null }[], current?: readonly { imageDigest?: string | null }[]) {
+  const decide = (gatePartial as { partialPlanImageDigestsMatch?: (a: readonly { imageDigest?: string | null }[], b?: readonly { imageDigest?: string | null }[]) => { reuse: 0 | 1; reason: string } }).partialPlanImageDigestsMatch;
+  expect(typeof decide).toBe('function');
+  return decide!(prior, current);
+}
+
+function collectedShardImages(dir: string, commit?: string): Array<{ imageDigest?: string | null }> {
+  const collect = (gatePartial as { collectExecutedPodShardImages?: (dir: string, commit?: string) => Array<{ imageDigest?: string | null }> }).collectExecutedPodShardImages;
+  expect(typeof collect).toBe('function');
+  return collect!(dir, commit);
+}
+
+test('RELEASE-GATE-RADIUS-POD-IMAGE: matching executed shard digests allow reuse on the production plan path', () => {
+  const shards = [podShard(DIGEST_035), podShard(DIGEST_035)];
+  expect(imageDigestsMatch(shards)).toEqual({ reuse: 1, reason: 'executed-pod-image-digest-match' });
+  expect(imageDigestsMatch(shards, shards)).toEqual({ reuse: 1, reason: 'executed-pod-image-digest-match' });
+  const planned = planPartialRegate({ ...base, changedFiles: ['src/x.test.ts'], priorShards: shards, currentShards: shards });
+  expect(planned.ok).toBe(true);
+  if (!planned.ok) return;
+  expect(planned.plan.shardImageDigests).toEqual([DIGEST_035, DIGEST_035]);
+  const root = mkdtempSync(join(tmpdir(), 'gate-partial-digest-match-'));
+  try {
+    writePartialPlan(root, planned.plan);
+    expect(readPartialPlanResult([root], base.version, N)).toEqual({
+      plan: planned.plan,
+      fallbackReason: null,
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-GATE-RADIUS-POD-IMAGE: mismatched executed shard digests force full fallback with a mismatch reason', () => {
+  const shards = [podShard(DIGEST_035), podShard(DIGEST_NEXT)];
+  expect(imageDigestsMatch(shards)).toEqual({ reuse: 0, reason: 'executed-pod-image-digest-mismatch' });
+  expect(planPartialRegate({ ...base, changedFiles: ['src/x.test.ts'], priorShards: shards }))
+    .toEqual({ ok: false, reason: 'executed-pod-image-digest-mismatch' });
+  const mixedCurrent = planPartialRegate({
+    ...base, changedFiles: ['src/x.test.ts'],
+    priorShards: [podShard(DIGEST_035), podShard(DIGEST_035)],
+    currentShards: [podShard(DIGEST_NEXT), podShard(DIGEST_NEXT)],
+  });
+  expect(mixedCurrent).toEqual({ ok: false, reason: 'executed-pod-image-digest-mismatch' });
+  const planned = planPartialRegate({ ...base, changedFiles: ['src/x.test.ts'] });
+  if (!planned.ok) throw new Error('plan');
+  const root = mkdtempSync(join(tmpdir(), 'gate-partial-digest-mismatch-'));
+  try {
+    writePartialPlan(root, { ...planned.plan, shardImageDigests: [DIGEST_035, DIGEST_NEXT] });
+    expect(readPartialPlanResult([root], base.version, N)).toEqual({
+      plan: null,
+      fallbackReason: 'executed-pod-image-digest-mismatch',
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-GATE-RADIUS-POD-IMAGE: missing executed shard digest forces full fallback with a missing reason', () => {
+  expect(imageDigestsMatch([podShard(DIGEST_035), podShard()])).toEqual({ reuse: 0, reason: 'executed-pod-image-digest-missing' });
+  expect(imageDigestsMatch([])).toEqual({ reuse: 0, reason: 'executed-pod-image-digest-missing' });
+  expect(imageDigestsMatch([podShard('registry.local/elanous:0.2.35')])).toEqual({ reuse: 0, reason: 'executed-pod-image-digest-missing' });
+  expect(imageDigestsMatch([podShard(`registry.local/elanous@${DIGEST_035}`)])).toEqual({ reuse: 0, reason: 'executed-pod-image-digest-missing' });
+  expect(planPartialRegate({ ...base, changedFiles: ['src/x.test.ts'], priorShards: [podShard(DIGEST_035), podShard()] }))
+    .toEqual({ ok: false, reason: 'executed-pod-image-digest-missing' });
+  expect(planPartialRegate({
+    ...base, changedFiles: ['src/x.test.ts'],
+    priorShards: [podShard(DIGEST_035)],
+    currentShards: [podShard()],
+  })).toEqual({ ok: false, reason: 'executed-pod-image-digest-missing' });
+  const planned = planPartialRegate({ ...base, changedFiles: ['src/x.test.ts'] });
+  if (!planned.ok) throw new Error('plan');
+  const root = mkdtempSync(join(tmpdir(), 'gate-partial-digest-missing-'));
+  try {
+    mkdirSync(join(root, 'release', base.version), { recursive: true });
+    writeFileSync(partialPlanPath(root, base.version), JSON.stringify({ ...planned.plan, shardImageDigests: [DIGEST_035, ''] }));
+    expect(readPartialPlanResult([root], base.version, N)).toEqual({
+      plan: null,
+      fallbackReason: 'executed-pod-image-digest-missing',
+    });
+    writeFileSync(partialPlanPath(root, base.version), JSON.stringify({ ...planned.plan, shardImageDigests: [] }));
+    expect(readPartialPlanResult([root], base.version, N)).toEqual({
+      plan: null,
+      fallbackReason: 'executed-pod-image-digest-missing',
+    });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-GATE-RADIUS-POD-IMAGE: 0.2.35 rehearsal receipt digest decides the next remeasurement plan', () => {
+  const rehearsal = [podShard(DIGEST_035), podShard(DIGEST_035)];
+  const rematch = planPartialRegate({ ...base, version: '0.2.35', changedFiles: ['src/x.test.ts'], priorShards: rehearsal, currentShards: rehearsal });
+  expect(rematch).toMatchObject({ ok: true, plan: { version: '0.2.35', shardImageDigests: [DIGEST_035, DIGEST_035] } });
+  expect(planPartialRegate({
+    ...base, version: '0.2.35', changedFiles: ['src/x.test.ts'],
+    priorShards: rehearsal, currentShards: [podShard(DIGEST_NEXT), podShard(DIGEST_NEXT)],
+  })).toEqual({ ok: false, reason: 'executed-pod-image-digest-mismatch' });
+  expect(planPartialRegate({
+    ...base, version: '0.2.35', changedFiles: ['src/x.test.ts'],
+    priorShards: rehearsal, currentShards: [podShard(DIGEST_035), podShard()],
+  })).toEqual({ ok: false, reason: 'executed-pod-image-digest-missing' });
+  const root = mkdtempSync(join(tmpdir(), 'gate-partial-035-receipt-'));
+  try {
+    const cut = join(root, 'release', '0.2.35', 'gate-logs', 'cut');
+    mkdirSync(cut, { recursive: true });
+    const row = (n: number, imageDigest?: string) =>
+      writeFileSync(join(cut, `pod-${n}.json`), JSON.stringify({ commit: P, files: [`src/${n}.test.ts`], shardCount: 2, sweepId: 'sweep-035',
+        attemptId: `attempt-${n}`, ...(imageDigest ? { imageDigest } : {}) }));
+    row(0, DIGEST_035);
+    row(1, DIGEST_035);
+    writeFileSync(join(cut, 'pod-0-retry.json'), JSON.stringify({ commit: P, image: `registry.local/elanous:0.2.35`, imageDigest: DIGEST_035 }));
+    expect(collectedShardImages(cut, P)).toEqual([{ imageDigest: DIGEST_035 }, { imageDigest: DIGEST_035 }, { imageDigest: DIGEST_035 }]);
+    const fromLogs = planPartialRegate({ ...base, version: '0.2.35', changedFiles: ['src/x.test.ts'], priorCutLogs: cut });
+    expect(fromLogs).toMatchObject({ ok: true, plan: { version: '0.2.35', shardImageDigests: [DIGEST_035, DIGEST_035, DIGEST_035] } });
+    if (!fromLogs.ok) return;
+    writePartialPlan(root, fromLogs.plan);
+    expect(readPartialPlanResult([root], '0.2.35', N)).toEqual({ plan: fromLogs.plan, fallbackReason: null });
+    writeFileSync(join(cut, 'pod-0-retry.json'), JSON.stringify({ commit: P, imageDigest: DIGEST_NEXT }));
+    expect(planPartialRegate({ ...base, version: '0.2.35', changedFiles: ['src/x.test.ts'], priorCutLogs: cut }))
+      .toEqual({ ok: false, reason: 'executed-pod-image-digest-mismatch' });
+    writeFileSync(join(cut, 'pod-0-retry.json'), JSON.stringify({ commit: P, imageDigest: DIGEST_035 }));
+    row(1, DIGEST_NEXT);
+    expect(planPartialRegate({ ...base, version: '0.2.35', changedFiles: ['src/x.test.ts'], priorCutLogs: cut }))
+      .toEqual({ ok: false, reason: 'executed-pod-image-digest-mismatch' });
+    row(1);
+    expect(planPartialRegate({ ...base, version: '0.2.35', changedFiles: ['src/x.test.ts'], priorCutLogs: cut }))
+      .toEqual({ ok: false, reason: 'executed-pod-image-digest-missing' });
+    row(1, `registry.local/elanous@${DIGEST_035}`);
+    expect(planPartialRegate({ ...base, version: '0.2.35', changedFiles: ['src/x.test.ts'], priorCutLogs: cut }))
+      .toEqual({ ok: false, reason: 'executed-pod-image-digest-missing' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

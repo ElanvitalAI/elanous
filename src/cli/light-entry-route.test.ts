@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -63,6 +63,52 @@ describe('light CLI entry routing', () => {
     expect(selectLightCliRoute(['--help-all', 'msg', 'list'])).toBeUndefined();
     expect(selectLightCliRoute(['--config-dir', '--test', 'msg', 'list'])).toBeUndefined();
   }, 20000);
+
+  test('production checklist evidence CLI passes version separately from its command runner', () => {
+    const root = mkdtempSync(join(tmpdir(), 'release-evidence-cli-'));
+    tempDirs.push(root);
+    const binDir = join(root, 'bin');
+    mkdirSync(binDir);
+    const fakeEln = join(binDir, 'eln');
+    writeFileSync(fakeEln, String.raw`#!/bin/sh
+if [ "$1" = gh ]; then printf '%s\n' '{"state":"MERGED","mergeCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'; exit 0; fi
+if [ "$1" = --version ]; then echo "0.2.37"; exit 0; fi
+exit 0
+`);
+    chmodSync(fakeEln, 0o755);
+    const env = { ...entrypointEnv, ELANOUS_STATE_DIR: root, ELANOUS_SUPPRESS_XDG_WARNING: '1', PATH: `${binDir}:${process.env.PATH ?? ''}` };
+    const run = (args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--config-dir=${root}`, 'release', 'checklist', ...args], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 20000, env,
+    });
+    expect(selectLightCliRoute(['release', 'checklist', 'evidence', 'EVIDENCE-PROBE', '--version', '0.2.37', '--json'])).toBeUndefined();
+    const add = run(['add', 'EVIDENCE-PROBE', 'evidence reader probe', '--version', '0.2.37']);
+    expect(add.status, `${add.stdout}\n${add.stderr}`).toBe(0);
+    expect(run(['set', 'EVIDENCE-PROBE', '--evidence', '#123 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '--version', '0.2.37']).status).toBe(0);
+    const result = run(['evidence', 'EVIDENCE-PROBE', '--version', '0.2.37', '--json']);
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain('run is not a function');
+    const output = JSON.parse(result.stdout) as { version: string; id: string; stages: Array<{ id: string; state: string }> };
+    expect(output).toMatchObject({ version: '0.2.37', id: 'EVIDENCE-PROBE' });
+    expect(output.stages[0]).toMatchObject({ id: 'E1', state: 'observed' });
+  }, 45000);
+
+  test('PTY new command is registered in both fast and full test-isolated entrypoints', () => {
+    const root = mkdtempSync(join(tmpdir(), 'light-pty-new-'));
+    tempDirs.push(root);
+    const args = [`--test=${root}`, 'pty', 'new', '--help'];
+    const fast = spawnSync('bun', ['bin/elanous.mjs', ...args], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 20000, env: entrypointEnv,
+    });
+    const legacy = spawnSync('bun', ['bin/elanous.mjs', ...args], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 20000,
+      env: { ...entrypointEnv, ELANOUS_FAST_ROUTER: '0' },
+    });
+    expect(fast.status).toBe(0);
+    expect(legacy.status).toBe(0);
+    expect(fast.stdout).toBe(legacy.stdout);
+    expect(fast.stdout).toContain('--name <name>');
+    expect(fast.stdout).toContain('command and arguments to run after --');
+  }, 45000);
 
   test('release checklist list keeps the full entry output in an isolated house', () => {
     const root = mkdtempSync(join(tmpdir(), 'light-release-list-'));
@@ -134,6 +180,45 @@ describe('light CLI entry routing', () => {
     });
     expect(result.stderr).not.toContain('INDEX_EAGERLY_LOADED');
   }, 30000);
+
+  test('config get keeps JSON rejection and missing-path exit/output identical to the full entry', () => {
+    const root = mkdtempSync(join(tmpdir(), 'light-config-parity-'));
+    tempDirs.push(root);
+    const entry = new URL('../../bin/elanous.mjs', import.meta.url).href;
+    for (const { args, expected } of [
+      { args: ['config', 'get', 'llm.provider', '--json'], expected: "error: unknown option '--json'" },
+      { args: ['config', 'get', 'nonexistent.opt.probe', '--json'], expected: "error: unknown option '--json'" },
+      { args: ['config', 'get', 'nonexistent.opt.probe'], expected: 'config path not found: nonexistent.opt.probe' },
+    ]) {
+      const fastScript = `Bun.plugin({ name: 'block-index', setup(build) { build.onLoad({ filter: /[\\\\/]src[\\\\/]index\\.ts$/ }, () => { throw new Error('INDEX_EAGERLY_LOADED'); }); } });\n` +
+        `process.argv = ['node', 'elanous', ...${JSON.stringify(args)}];\nawait import(${JSON.stringify(entry)});\n`;
+      const env = { ...entrypointEnv, HOME: root, XDG_CONFIG_HOME: join(root, '.config'), ELANOUS_STATE_DIR: root };
+      const fast = spawnSync(process.execPath, ['-e', fastScript], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 20000, env,
+      });
+      const full = spawnSync('bun', ['bin/elanous.mjs', ...args], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 20000,
+        env: { ...env, ELANOUS_FAST_ROUTER: '0' },
+      });
+      expect([fast.status, fast.signal, fast.stdout, fast.stderr])
+        .toEqual([full.status, full.signal, full.stdout, full.stderr]);
+      expect(fast.status).toBe(1);
+      expect(fast.signal).toBeNull();
+      expect(fast.error).toBeUndefined();
+      expect(fast.stdout + fast.stderr).toContain(expected);
+      expect(fast.stderr).not.toContain('INDEX_EAGERLY_LOADED');
+      if (args[2] === 'llm.provider') {
+        // Positive control: the same import guard must reject the forced full route.
+        const fullGuarded = spawnSync(process.execPath, ['-e', fastScript], {
+          cwd: process.cwd(), encoding: 'utf8', timeout: 20000,
+          env: { ...env, ELANOUS_FAST_ROUTER: '0' },
+        });
+        expect(fullGuarded.error).toBeUndefined();
+        expect(fullGuarded.stderr).toContain('INDEX_EAGERLY_LOADED');
+        expect(fullGuarded.status).not.toBe(0);
+      }
+    }
+  }, 150000);
 
   test('msg watch --once routes lightweight; help is bounded and usable', () => {
     const help = spawnSync('bun', ['bin/elanous.mjs', 'msg', 'watch', '--help'], { cwd: process.cwd(), encoding: 'utf8', timeout: 5000 });

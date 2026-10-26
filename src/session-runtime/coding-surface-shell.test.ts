@@ -164,6 +164,15 @@ describe('coding surface — shell 실행 tool 노출', () => {
     expect(resolveSessionSurfaceProfile({ userText: '웹 검색 하니스로 개발해줘' }).id).toBe('research/turn');
   });
 
+  it('설명형 외부 조사와 조사 스킬은 research로, 코드 원인과 단순 사실은 기존 surface로 보낸다', () => {
+    expect(resolveSessionSurfaceProfile({ userText: '현재 채권 금리가 계속 올라가는 이유는요? omni market 활용' }).id).toBe('research/agent');
+    expect(resolveSessionSurfaceProfile({ userText: '금리 상승 원인을 분석해줘' }).id).toBe('research/agent');
+    expect(resolveSessionSurfaceProfile({ userText: '기후 전망 비교해줘' }).id).toBe('research/agent');
+    expect(resolveSessionSurfaceProfile({ userText: '이 함수 오류 원인을 분석해줘' }).id).toBe('coding/turn');
+    expect(resolveSessionSurfaceProfile({ userText: '채권 금리 얼마야?' }).id).toBe('coding/turn');
+    expect(resolveSessionSurfaceProfile({ userText: 'omni-market 코드 고쳐줘' }).id).toBe('coding/turn');
+  });
+
   it('family names 는 runtime ID 여야 한다(spec name 아님 — resolver 는 tool.id 로 키)', () => {
     // 회귀 가드: bashRuntime.id='bash'(spec 'Bash'), runShellRuntime.id='run_shell'.
     expect(bashRuntime.id).toBe('bash');

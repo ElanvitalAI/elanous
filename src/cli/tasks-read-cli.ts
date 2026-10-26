@@ -6,6 +6,7 @@ import { readNexusRuntime } from '../nexus/runtime.js';
 import { TASK_CARD_PREFIX } from '../task-agent/task-card-prefix.js';
 import type { Task } from '../task-orchestrator/types.js';
 import type { TasksCliDeps } from './tasks-cli.js';
+import { writeStdoutFully } from './stdout-flush.js';
 
 /**
  * CLI-ENTRY-LAZY — `tasks list`·`tasks show` 의 등록과 넥서스 조회 보조.
@@ -100,6 +101,7 @@ export function handleError(error: unknown, out: (line: string) => void): void {
 export interface TasksCliContext {
   deps: TasksCliDeps;
   out: (line: string) => void;
+  outFully: (line: string) => Promise<void>;
   authenticate: () => { baseUrl: string; token?: string };
   clearToken: () => void;
 }
@@ -107,9 +109,15 @@ export interface TasksCliContext {
 export function createTasksCliContext(deps: TasksCliDeps): TasksCliContext {
   let activeToken: string | undefined;
   const output = deps.output ?? console.log;
+  const maskToken = (line: string) => activeToken ? line.replaceAll(activeToken, '[redacted]') : line;
   return {
     deps,
-    out: (line: string) => output(activeToken ? line.replaceAll(activeToken, '[redacted]') : line),
+    out: (line: string) => output(maskToken(line)),
+    outFully: async (line: string) => {
+      const safeLine = maskToken(line);
+      if (deps.output) output(safeLine);
+      else await writeStdoutFully(safeLine);
+    },
     authenticate: () => {
       const auth = credentials(deps);
       activeToken = auth?.token;
@@ -126,7 +134,7 @@ export function registerTasksRoot(program: Command): Command {
 }
 
 export function registerTaskListCommand(tasks: Command, ctx: TasksCliContext): void {
-  const { deps, out, authenticate } = ctx;
+  const { deps, out, outFully, authenticate } = ctx;
   tasks.command('list')
     .description('우선순위와 생성 시각 순으로 태스크 보기')
     .option('--status <s>', '상태로 필터')
@@ -152,7 +160,7 @@ export function registerTaskListCommand(tasks: Command, ctx: TasksCliContext): v
           if (!opts.provider || (data.task.generatedBy?.kind === 'external' && data.task.generatedBy.provider === opts.provider)) rows.push(data.task);
         }
         rows.sort(taskOrder);
-        if (opts.json) out(JSON.stringify(rows));
+        if (opts.json) await outFully(JSON.stringify(rows));
         else {
           out('id\t우선순위\t상태\t승인\t출처\t제목');
           for (const row of rows) out(taskLine(row));
@@ -162,7 +170,7 @@ export function registerTaskListCommand(tasks: Command, ctx: TasksCliContext): v
 }
 
 export function registerTaskShowCommand(tasks: Command, ctx: TasksCliContext): void {
-  const { deps, out, authenticate } = ctx;
+  const { deps, out, outFully, authenticate } = ctx;
   tasks.command('show <id>')
     .description(`태스크 상세 보기 (id 가 \`${TASK_CARD_PREFIX}\` 로 시작하면 TASK-AGENT 과제 카드 ⊕ 다음 수)`)
     .option('--json', 'JSON 출력')
@@ -179,7 +187,7 @@ export function registerTaskShowCommand(tasks: Command, ctx: TasksCliContext): v
         if (!response.ok) throw httpError(response);
         const data = await responseJson(response) as { task?: TaskRow };
         if (!data?.task) throw new Error('넥서스 태스크 상세 형식이 유효하지 않다');
-        if (opts.json) out(JSON.stringify(data));
+        if (opts.json) await outFully(JSON.stringify(data));
         else {
           out(taskLine(data.task));
           out(JSON.stringify(data, null, 2));

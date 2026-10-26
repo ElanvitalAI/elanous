@@ -12,6 +12,12 @@ export type ShardState = typeof SHARD_STATES[number];
 export interface GateShard {
   id: string;
   state: ShardState;
+  /** Kubernetes Job for the current attempt; lets the gate watchdog reconcile a lost completion callback. */
+  job?: string;
+  /** Attempt identity associated with the currently recorded Job/result marker. */
+  attemptId?: string;
+  /** Result JSON for the current attempt; retries replace this so an older marker cannot close a new Job. */
+  resultFile?: string;
   startedAt?: string;
   endedAt?: string;
   /** 설치(install) 단계에 쓴 초. */
@@ -61,13 +67,68 @@ function shardOf(value: unknown): GateShard | null {
   const waitReason = str(raw.waitReason);
   const plannedMin = num(raw.plannedMin);
   const host = str(raw.host, 120);
+  const job = str(raw.job, 120);
+  const attemptId = str(raw.attemptId, 120);
+  const resultFile = str(raw.resultFile, 200);
   return {
     id, state,
+    ...(job ? { job } : {}),
+    ...(attemptId ? { attemptId } : {}),
+    ...(resultFile ? { resultFile } : {}),
     ...(startedAt ? { startedAt } : {}), ...(endedAt ? { endedAt } : {}),
     ...(installSec !== undefined ? { installSec } : {}), ...(rc !== undefined ? { rc } : {}),
     ...(waitReason ? { waitReason } : {}), ...(plannedMin !== undefined ? { plannedMin } : {}),
     ...(host ? { host } : {}),
   };
+}
+
+export type GateJobTerminal = 'complete' | 'failed';
+
+/** Forget the prior child Job before a shard descends into a retry/split attempt. */
+export function beginGateShardAttempt(shard: GateShard, now = new Date()): GateShard {
+  const next: GateShard = { ...shard, state: 'retry', startedAt: now.toISOString() };
+  delete next.endedAt;
+  delete next.waitReason;
+  delete next.host;
+  delete next.job;
+  delete next.resultFile;
+  delete next.attemptId;
+  return next;
+}
+
+/**
+ * Close each stale running row when its result marker or Kubernetes Job has terminal evidence.
+ * A result marker can close a row even when the Kubernetes status read is unavailable.
+ */
+export function finalizeTerminalGateShards(
+  file: GateShardsFile,
+  terminalJobs: ReadonlyMap<string, GateJobTerminal>,
+  results: ReadonlyMap<string, { completed?: boolean; jobName?: string; attemptId?: string; jobFailed?: boolean; rc?: number | null; reason?: 'timeout' | 'stall' }>,
+  now: Date = new Date(),
+  staleAfterMs = 120_000,
+): GateShardsFile {
+  const active = file.shards.filter((shard) => shard.state === 'running' || shard.state === 'retry');
+  if (!active.length) return file;
+  const at = now.getTime();
+  const ready = active.map((shard) => {
+    const result = results.get(shard.id);
+    const resultTerminal = result?.completed === true && result.jobName === shard.job && result.attemptId === shard.attemptId;
+    const k8sTerminal = shard.job ? terminalJobs.get(shard.job) : undefined;
+    const startedAt = shard.startedAt ? Date.parse(shard.startedAt) : Number.NaN;
+    if (!resultTerminal && !k8sTerminal) return undefined;
+    if (!Number.isFinite(startedAt) || at - startedAt < staleAfterMs) return undefined;
+    return { shard, result, state: resultTerminal
+      ? (result!.reason === 'timeout' ? 'timeout' as const : result!.reason === 'stall' || result!.jobFailed === true ? 'failed' as const : 'done' as const)
+      : k8sTerminal === 'failed' ? 'failed' as const : 'done' as const };
+  });
+  const finalized = ready.filter((entry): entry is NonNullable<typeof entry> => entry !== undefined);
+  if (!finalized.length) return file;
+  const byId = new Map(finalized.map(({ shard, result, state }) => {
+    const current = { ...shard };
+    delete current.waitReason;
+    return [shard.id, { ...current, state, endedAt: now.toISOString(), ...(result && typeof result.rc === 'number' ? { rc: result.rc } : {}) } satisfies GateShard];
+  }));
+  return { ...file, updatedAt: now.toISOString(), shards: file.shards.map((shard) => byId.get(shard.id) ?? shard) };
 }
 
 function verdictOf(value: unknown): GateShardsVerdict | undefined {

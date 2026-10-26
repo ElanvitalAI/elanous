@@ -3,8 +3,8 @@ export const WARM_POOL_PROFILES = ['fixed', 'gate', 'landing', 'feature'] as con
 export type WarmPoolProfile = (typeof WARM_POOL_PROFILES)[number];
 export type WarmPoolTier = 'lite' | 'standard';
 const STANDARD_HOST_MAX: Readonly<Record<string, number>> = {
-  node-b: 16,
-  node-c: 4,
+  'node-b': 16,
+  'node-c': 4,
   'elangram-wsl': 5,
   'host-e-wsl': 5,
 };

@@ -10,6 +10,28 @@ export interface GoalDocSourceLine {
   readonly start: number;
 }
 
+/** Parse the command on a goal's authored decision-signal Condition line. */
+function authoredSignalCommandFromCondition(condition: string | undefined): string | undefined {
+  if (!condition?.trim()) return undefined;
+  return condition.trim()
+    .replace(/^`([^`]+)`(?=\s|를|$)/, '$1')
+    .replace(/\s*를\s*실행한다[.。]?$/, '')
+    .replace(/[.。]$/, '')
+    .trim();
+}
+
+export function authoredSignalCommandFromBody(value: string): string | undefined {
+  return authoredSignalCommandFromCondition(value.match(/^\s*- Condition:\s*(.+?)\s*$/m)?.[1]);
+}
+
+export function authoredSignalCommandFromGoal(goal: string): string | undefined {
+  const lines = goal.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === '## 판정 신호');
+  if (start < 0) return undefined;
+  const next = lines.findIndex((line, index) => index > start && /^##\s/.test(line));
+  return authoredSignalCommandFromBody(lines.slice(start + 1, next < 0 ? lines.length : next).join('\n'));
+}
+
 type GoalDocSectionOptions =
   | {
     readonly search: 'exact-trimmed-line';

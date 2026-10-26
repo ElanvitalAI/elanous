@@ -243,6 +243,8 @@ export interface SessionMeta {
    *  **no runtime effect today** — placeholder for schema stability so
    *  future coordinator does not require a migration pass. */
   retiredAt?: string | null;
+  /** Per-session Next TUI presentation preferences. */
+  uiState?: { sidetabOpen?: boolean };
 }
 
 /** Runtime channel attachments. Each key is optional; presence means

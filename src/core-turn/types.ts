@@ -137,6 +137,9 @@ export interface CoreTurnContext {
   originSessionId?: string;
   /** Original human prompt for this turn, forwarded to tool dispatch. */
   userText?: string;
+  /** Caller-selected surface. ACP passes its one per-turn verdict through;
+   * direct callers can omit it and let core-turn resolve from userText. */
+  surfaceProfile?: import('../session-runtime/index.js').SessionSurfaceProfile;
   /** Full prompt (system + history + current user blocks). */
   messages: LLMMessage[];
   /** Tool catalog the model may call this turn. Empty array means

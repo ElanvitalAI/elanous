@@ -1,7 +1,9 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { growthDecision, proposeGrowth } from './graph-grow.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
 import type { GraphTemplateSpec } from '../self-implement/graph-yaml.js';
+import { createResearchEdgeDecisionRegistry } from '../research/edge-decision.js';
+import { debug } from '../debug/log.js';
 
 const graph: GraphTemplateSpec = {
   graphId: 'grow-test', version: 1, entryNode: 'judge', terminalNodes: ['done'],
@@ -86,4 +88,61 @@ test('invalid proposals fall back with a reason, while external effects require 
   expect(effect).toMatchObject({ ok: false, park: true, reason: expect.stringContaining('사람 확인 필요') });
   const upload = await proposeGrowth(input, () => ({ node: { ...node, recipe: 'cmd:upload', contract: { ...node.contract, tools: 'read-only' } }, returnTo: 'done', reason: 'upload' }), undefined, { ledger: fakeLedger });
   expect(upload).toMatchObject({ ok: false, park: true, reason: expect.stringContaining('사람 확인 필요') });
+});
+
+test('a registered Bloom edge provider can add a node through the existing graph validation path', async () => {
+  const registry = createResearchEdgeDecisionRegistry();
+  const unregister = registry.register(() => ({
+    action: 'add',
+    reason: 'fill a research gap',
+    evidence: ['bond-yield-series'],
+    proposal: { node, returnTo: 'judge', reason: 'verify the missing series' },
+  }));
+  let legacyProposerCalled = false;
+  const result = await proposeGrowth({
+    ...input,
+    output: { gaps: ['missing real-rate series'], contradictions: [], verdicts: ['mixed'] },
+  }, () => { legacyProposerCalled = true; return undefined; }, undefined, {}, registry);
+
+  expect(result.ok).toBe(true);
+  expect(legacyProposerCalled).toBe(false);
+  if (result.ok) {
+    expect(result.graph.nodes.at(-1)).toEqual(node);
+    expect(result.edgeDecision).toMatchObject({ action: 'add', evidence: ['bond-yield-series'] });
+  }
+  unregister();
+});
+
+test('a Bloom edge decision emits provider, decision, and reason observability', async () => {
+  const registry = createResearchEdgeDecisionRegistry();
+  const unregister = registry.register(() => ({
+    action: 'stop', reason: 'all reported gaps were considered', evidence: ['research-turn-1'],
+  }), 'test-provider');
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    await proposeGrowth({ ...input, output: { gaps: [], contradictions: [], verdicts: [] } }, () => undefined, undefined, {}, registry);
+    expect(log).toHaveBeenCalledWith('research.edge', 'decision', {
+      provider: 'test-provider', decision: 'stop', reason: 'all reported gaps were considered',
+    });
+  } finally {
+    log.mockRestore();
+    unregister();
+  }
+});
+
+test('the default Bloom decision stops growth while non-Bloom growth keeps its existing proposer path', async () => {
+  let calls = 0;
+  const stopped = await proposeGrowth({
+    ...input,
+    output: { gaps: [], contradictions: [], verdicts: [] },
+  }, () => { calls += 1; return { node, returnTo: 'judge', reason: 'legacy proposal' }; });
+  expect(stopped).toMatchObject({ ok: false, edgeDecision: { action: 'stop' } });
+  expect(calls).toBe(0);
+
+  const legacy = await proposeGrowth({ ...input, output: { outcome: 'needs-research' } }, () => {
+    calls += 1;
+    return { node, returnTo: 'judge', reason: 'legacy proposal' };
+  });
+  expect(legacy.ok).toBe(true);
+  expect(calls).toBe(1);
 });

@@ -11,6 +11,14 @@ import { podSelfImplementSpawn, type Kubectl, type PodSpawnOptions } from '../ta
 import { runDraftSweep, type DraftSweepAdapters, type SweepDraft } from './draft-sweep.js';
 import { applyPodTerminal, classifyPodTerminal, defaultAdapters, replayPodTerminals, terminalRunStatus, type DraftResidueAdapters, type ResiduePr, type ResidueRunStatusSources } from './draft-residue.js';
 
+type HarvestableDraftAdapters = {
+  repository?: string;
+  remoteBranchExists(repository: string, branch: string): Promise<boolean | undefined> | boolean | undefined;
+  findExistingPr(repository: string, branch: string): Promise<{ number: number; url?: string; labels?: readonly string[] } | null | undefined> | { number: number; url?: string; labels?: readonly string[] } | null | undefined;
+  createDraftPr(repository: string, branch: string): Promise<{ number: number; url?: string; labels?: readonly string[] }> | { number: number; url?: string; labels?: readonly string[] };
+  addHarvestableLabel(repository: string, number: number): Promise<void> | void;
+};
+
 const runId = 'run-12345678-1234-1234-1234-123456789abc';
 const input = { childRunId: runId, state: 'complete' as const, disposition: {
   stage: 'host-regate-failed', ok: false, merged: false, prNumber: 25437,
@@ -34,7 +42,8 @@ const fixture = (current = pr(25437, 'self-impl/main-goalid-abc123-new', '칸: C
       calls.push(`set:${n}:${change.add}`);
     },
     comment: (_repo, n, body) => { calls.push(`comment:${n}:${body}`); if (n === current.number) current.comments = [...(current.comments ?? []), body]; },
-    closePr: (_repo, n) => { calls.push(`close:${n}`); },
+    closePr: (_repo, n) => { calls.push(`close:${n}`); if (n === current.number) current.state = 'CLOSED'; },
+    editBody: (_repo, n, body) => { calls.push(`body:${n}`); if (n === current.number) current.body = body; },
     listLiveBranches: () => new Set(), getRunStatus: () => 'failed',
   };
   return { calls, dir, adapters, current, drafts, ctx: { ledgerRunId: runId, ledgerDir: dir, adapters }, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
@@ -187,6 +196,23 @@ describe('Pod terminal residue', () => {
     const second = pr(201, 'self-impl/second-run', '칸: CELL-A', [], '2026-10-10T00:00:00Z');
     const old = pr(100, 'self-impl/old-run', '칸: CELL-A');
     const f = fixture(first, [old]);
+    f.adapters.closePr = (_repo, number) => {
+      f.calls.push(`close:${number}`);
+      if (number === 200) first.state = 'CLOSED';
+      if (number === 201) second.state = 'CLOSED';
+    };
+    f.adapters.editBody = (_repo, number, body) => {
+      f.calls.push(`body:${number}`);
+      if (number === 200) first.body = body;
+      if (number === 201) second.body = body;
+    };
+    f.adapters.comment = (_repo, number, body) => {
+      f.calls.push(`comment:${number}:${body}`);
+      const target = number === 200 ? first : number === 201 ? second : old;
+      target.comments = [...(target.comments ?? []), body];
+    };
+    f.adapters.getAllComments = (_repo, number) =>
+      number === 200 ? first.comments : number === 201 ? second.comments : old.comments;
     let oldReads = 0;
     f.adapters.getPr = (number) => {
       if (number === 100) return ++oldReads >= 2 ? { ...old, headSha: 'b'.repeat(40) } : old;
@@ -206,7 +232,7 @@ describe('Pod terminal residue', () => {
       expect(f.calls.some((call) => call.startsWith('comment:100:'))).toBe(false);
       expect(f.calls).not.toContain('close:100');
       old.headSha = 'b'.repeat(40);
-      expect((await applyPodTerminal(terminal(201, 'run-22222222-2222-2222-2222-222222222222'), f.ctx)).status).toBe('recorded');
+      expect(await applyPodTerminal(terminal(201, 'run-22222222-2222-2222-2222-222222222222'), f.ctx)).toMatchObject({ status: 'recorded' });
       expect(f.calls).toContain('close:100');
     } finally { f.cleanup(); }
   });
@@ -225,6 +251,7 @@ describe('Pod terminal residue', () => {
     f.adapters.closePr = (_repo, number) => {
       f.calls.push(`close:${number}`);
       if (++closes === 1) throw new Error('temporary close failure');
+      if (number === current.number) current.state = 'CLOSED';
     };
     const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
       stage: 'pr-opened', ok: true, prNumber: 200, prUrl: 'https://github.com/ElanvitalAI/elanous/pull/200' } });
@@ -245,8 +272,10 @@ describe('Pod terminal residue', () => {
     f.adapters.listPrChangedPaths = () => ['src/example.ts'];
     f.adapters.closePr = (_repo, number) => {
       f.calls.push(`close:${number}`);
-      old.state = 'CLOSED';
-      old.labels = ['elanous:stalled']; // another writer set the same label after the pre-close read
+      if (number === old.number) {
+        old.state = 'CLOSED';
+        old.labels = ['elanous:stalled']; // another writer set the same label after the pre-close read
+      } else if (number === current.number) current.state = 'CLOSED';
     };
     f.adapters.setLabels = (_repo, number, change) => {
       expect(old.state).toBe('CLOSED');
@@ -504,14 +533,131 @@ describe('Pod terminal residue', () => {
         expect.objectContaining({ data: expect.objectContaining({ ...record }) }),
       ]);
       expect(f.calls).toEqual([`add:25437:elanous:harvestable`, expect.stringContaining('comment:25437:Draft residue: failed-with-pr · owner=TC(seat)'),
-        expect.stringContaining('comment:25437:Draft residue: failed-run recovery')]);
-      expect(f.calls.some((call) => call === 'close:25437')).toBe(false);
+        expect.stringContaining('comment:25437:Draft residue: failed-run recovery'),
+        expect.stringContaining('comment:25437:Draft residue: harvest deferred'), 'close:25437']);
       const count = f.calls.length;
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'skipped', reason: 'already-recorded' });
       expect(f.calls).toHaveLength(count);
       expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toHaveLength(1);
       expect(events.filter((row) => row.event === 'skipped' && row.data.reason === 'already-recorded')).toHaveLength(1);
     } finally { off(); f.cleanup(); }
+  });
+
+  test('closes a verified failed draft once while retaining a harvest pointer and branch', async () => {
+    const f = fixture();
+    const record = classifyPodTerminal(input);
+    try {
+      f.adapters.closePr = (_repo, number) => { f.calls.push(`close:${number}`); f.current.state = 'CLOSED'; };
+      expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
+      expect(f.calls).toContain('close:25437');
+      expect(f.calls.some((call) => call.includes('harvest deferred') && call.includes(f.current.branch))).toBe(true);
+      expect(f.current.branch).toBe('self-impl/main-goalid-abc123-new');
+      expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'skipped', reason: 'already-recorded' });
+      expect(f.calls.filter((call) => call === 'close:25437')).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
+  test('a merge-ready terminal defers an unclaimed draft, preserves its branch, and closes once', async () => {
+    const f = fixture();
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition, stage: 'pr-opened', ok: true } });
+    f.adapters.getRunStatus = () => 'completed';
+    f.adapters.closePr = (_repo, number) => { f.calls.push(`close:${number}`); f.current.state = 'CLOSED'; };
+    try {
+      expect(record.terminalClass).toBe('merge-ready-not-merged');
+      expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'recorded' });
+      expect(f.calls).toContain('add:25437:elanous:harvestable');
+      expect(f.calls).toContain('close:25437');
+      expect(f.current.body).toContain('수확보류: harvest-deferred');
+      expect(f.current.comments?.some((comment) => comment.includes('branch=self-impl/main-goalid-abc123-new')
+        && comment.includes('다시 여는 법: gh pr reopen + land-enqueue'))).toBe(true);
+      expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'skipped', reason: 'already-recorded' });
+      expect(f.calls.filter((call) => call === 'close:25437')).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
+  test('a merge-ready draft with a harvest claim or land-enqueue comment is never closed', async () => {
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition, stage: 'pr-opened', ok: true } });
+    for (const guard of ['harvest-claimed', 'land-enqueue'] as const) {
+      const f = fixture();
+      f.adapters.getRunStatus = () => 'completed';
+      if (guard === 'harvest-claimed') f.current.labels = ['elanous:harvest-claimed'];
+      else f.current.comments = ['land-enqueue: #25437'];
+      try {
+        const result = await applyPodTerminal(record, f.ctx);
+        expect(result.status).toBe('skipped');
+        expect(f.calls).not.toContain('close:25437');
+        expect(f.current.state).toBe('OPEN');
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test('a merge-ready close retries only the body marker after an edit failure', async () => {
+    const f = fixture();
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition, stage: 'pr-opened', ok: true } });
+    f.adapters.getRunStatus = () => 'completed';
+    f.adapters.closePr = (_repo, number) => { f.calls.push(`close:${number}`); f.current.state = 'CLOSED'; };
+    const edit = f.adapters.editBody!;
+    let failOnce = true;
+    f.adapters.editBody = (repo, number, body) => {
+      if (failOnce) { failOnce = false; throw new Error('fake body edit failed'); }
+      return edit(repo, number, body);
+    };
+    try {
+      expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'failed', step: 'edit-body' });
+      expect(f.calls.filter((call) => call === 'close:25437')).toHaveLength(1);
+      expect(await applyPodTerminal(record, f.ctx)).toMatchObject({ status: 'recorded' });
+      expect(f.current.body).toContain('수확보류: harvest-deferred');
+      expect(f.calls.filter((call) => call === 'close:25437')).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
+  test('a landing claim arriving after the harvest comment prevents the close', async () => {
+    const f = fixture();
+    const comment = f.adapters.comment;
+    try {
+      f.adapters.comment = async (repo, number, body) => {
+        await comment(repo, number, body);
+        if (body.includes('harvest deferred')) f.current.comments = [...(f.current.comments ?? []), 'landing-verified: #25437'];
+      };
+      expect(await applyPodTerminal(classifyPodTerminal(input), f.ctx)).toEqual({ status: 'skipped', reason: 'deferred-close-raced' });
+      expect(f.calls).not.toContain('close:25437');
+      expect(loadRunLedger(runId, f.dir)?.some((row) => row.event === 'pr-terminal-effect' && row.data.effect === 'complete')).toBe(false);
+    } finally { f.cleanup(); }
+  });
+
+  test('an active run or harvest claim leaves the failed draft open', async () => {
+    for (const hazard of ['live-branch', 'running-run', 'harvest-claimed'] as const) {
+      const f = fixture();
+      try {
+        if (hazard === 'live-branch') f.adapters.listLiveBranches = () => new Set([f.current.branch]);
+        if (hazard === 'running-run') f.adapters.getRunStatus = () => 'running';
+        if (hazard === 'harvest-claimed') f.current.labels = ['elanous:harvest-claimed'];
+        const outcome = await applyPodTerminal(classifyPodTerminal(input), f.ctx);
+        expect(outcome.status).toBe('skipped');
+        expect(f.calls).not.toContain('close:25437');
+        expect(loadRunLedger(runId, f.dir)?.some((row) => row.event === 'pr-terminal-effect' && row.data.effect === 'complete')).toBe(false);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  test('a close without a ledger receipt stays pending on replay', async () => {
+    const f = fixture();
+    const append = f.adapters.appendLedger;
+    try {
+      f.adapters.closePr = (_repo, number) => { f.calls.push(`close:${number}`); f.current.state = 'CLOSED'; };
+      f.adapters.appendLedger = (entry, dir) => {
+        if (entry.event === 'pr-terminal-effect' && entry.data.effect === 'deferred-close') throw new Error('receipt write failed');
+        append(entry, dir);
+      };
+      expect(await applyPodTerminal(classifyPodTerminal(input), f.ctx)).toMatchObject({ status: 'failed', step: 'ledger' });
+      expect(f.calls.filter((call) => call === 'close:25437')).toHaveLength(1);
+      f.adapters.appendLedger = append;
+      expect(await applyPodTerminal(classifyPodTerminal(input), f.ctx))
+        .toEqual({ status: 'skipped', reason: 'deferred-close-ownership-unverified' });
+      expect(f.calls.filter((call) => call === 'close:25437')).toHaveLength(1);
+      expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' }))
+        .toEqual({ attempted: 1, recovered: 0, pending: 1, unresolved: 0, closed: 0 });
+    } finally { f.cleanup(); }
   });
 
   test('a changed head, missing branch, failed lookup or landing claim leaves the restoration pointer pending', async () => {
@@ -587,15 +733,188 @@ describe('Pod terminal residue', () => {
       childRunId: runId, state: 'failed',
       disposition: { ...input.disposition, stage: 'timed-out', ok: false, branch: 'self-impl/with-pr' },
     }).terminalClass).toBe('failed-with-pr');
-    const f = fixture();
+    const harvestFixture = (harvest: HarvestableDraftAdapters) => {
+      const f = fixture();
+      return { ...f, ctx: { ...f.ctx, harvest } };
+    };
+    const missing = harvestFixture({
+      repository: 'ElanvitalAI/elanous',
+      remoteBranchExists: () => false,
+      findExistingPr: () => { throw new Error('findExistingPr must not run when the remote branch is missing'); },
+      createDraftPr: () => { throw new Error('createDraftPr must not run when the remote branch is missing'); },
+      addHarvestableLabel: () => { throw new Error('addHarvestableLabel must not run when the remote branch is missing'); },
+    });
     try {
-      // 첫 조각은 분류만 — apply 는 PR 이 없으니 지금처럼 건너뛰고 gh 효과 0.
-      expect(await applyPodTerminal(timedOut, f.ctx)).toMatchObject({ status: 'skipped' });
-      expect(f.calls.some((call) => call.includes('harvestable'))).toBe(false);
-      expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toEqual([
+      expect(await applyPodTerminal(timedOut, missing.ctx)).toMatchObject({ status: 'skipped', reason: 'missing-branch' });
+      expect(missing.calls.some((call) => call.includes('harvestable'))).toBe(false);
+      expect(loadRunLedger(runId, missing.dir)?.filter((row) => row.event === 'pr-terminal')).toEqual([
         expect.objectContaining({ data: expect.objectContaining({ terminalClass: 'timed-out-harvestable', branch: 'self-impl/timeout-goalid-abc123-run' }) }),
       ]);
-    } finally { f.cleanup(); }
+    } finally { missing.cleanup(); }
+  });
+
+  test('AUT-TIMEOUT-NO-HARVEST: harvest missing-branch / existing-PR / lookup-failure / first-create / rerun through applyPodTerminal', async () => {
+    const residueExports = await import('./draft-residue.js') as Record<string, unknown>;
+    const harvestHarvestableDrafts = residueExports['harvestHarvestableDrafts'];
+    expect(typeof harvestHarvestableDrafts).toBe('function');
+    const timedOut = classifyPodTerminal({
+      childRunId: runId, state: 'failed',
+      disposition: { stage: 'timed-out', ok: false, branch: 'self-impl/timeout-goalid-abc123-run' },
+      env: { ELANOUS_HARNESS_SEAT: 'TC' }, at: '2026-10-09T12:00:00Z',
+    });
+    const harvestCalls = () => {
+      const calls: string[] = [];
+      let existing: { number: number; labels: string[] } | null = null;
+      const harvest = (overrides: Partial<HarvestableDraftAdapters> = {}): HarvestableDraftAdapters => ({
+        repository: 'ElanvitalAI/elanous',
+        remoteBranchExists: () => true,
+        findExistingPr: () => existing,
+        createDraftPr: (_repo, branch) => {
+          calls.push(`create:${branch}`);
+          existing = { number: 31001, labels: [] };
+          return { number: 31001, url: 'https://github.com/ElanvitalAI/elanous/pull/31001', labels: [] };
+        },
+        addHarvestableLabel: (_repo, number) => {
+          calls.push(`label:${number}:elanous:harvestable`);
+          if (existing && existing.number === number && !existing.labels.includes('elanous:harvestable')) existing.labels.push('elanous:harvestable');
+        },
+        ...overrides,
+      });
+      return { calls, harvest, setExisting: (pr: { number: number; labels: string[] } | null) => { existing = pr; } };
+    };
+
+    const missing = harvestCalls();
+    const missingF = fixture();
+    try {
+      expect(await applyPodTerminal(timedOut, { ...missingF.ctx, harvest: missing.harvest({
+        remoteBranchExists: () => false,
+        findExistingPr: () => { missing.calls.push('find'); return null; },
+        createDraftPr: () => { missing.calls.push('create'); return { number: 1 }; },
+        addHarvestableLabel: () => { missing.calls.push('label'); },
+      }) })).toEqual({ status: 'skipped', reason: 'missing-branch' });
+      expect(missing.calls).toEqual([]);
+    } finally { missingF.cleanup(); }
+
+    const existingPr = harvestCalls();
+    existingPr.setExisting({ number: 31002, labels: [] });
+    const existingF = fixture();
+    try {
+      expect(await applyPodTerminal(timedOut, { ...existingF.ctx, harvest: existingPr.harvest() })).toEqual({ status: 'recorded' });
+      expect(existingPr.calls.filter((call) => call.startsWith('create:'))).toHaveLength(0);
+      expect(existingPr.calls).toEqual(['label:31002:elanous:harvestable']);
+      expect(loadRunLedger(runId, existingF.dir)?.some((row) => row.event === 'pr-terminal-effect' && row.data.effect === 'harvestable' && row.data.number === 31002)).toBe(true);
+    } finally { existingF.cleanup(); }
+
+    const lookup = harvestCalls();
+    const lookupF = fixture();
+    try {
+      expect(await applyPodTerminal(timedOut, { ...lookupF.ctx, harvest: lookup.harvest({
+        remoteBranchExists: () => true,
+        findExistingPr: () => undefined,
+      }) })).toMatchObject({ status: 'failed', step: 'find-existing-pr' });
+      expect(lookup.calls.filter((call) => call.startsWith('create:'))).toHaveLength(0);
+      expect(lookup.calls.filter((call) => call.startsWith('label:'))).toHaveLength(0);
+      const branchLookup = fixture();
+      try {
+        expect(await applyPodTerminal(timedOut, { ...branchLookup.ctx, harvest: lookup.harvest({
+          remoteBranchExists: () => undefined,
+          findExistingPr: () => { lookup.calls.push('find'); return null; },
+          createDraftPr: () => { lookup.calls.push('create'); return { number: 1 }; },
+        }) })).toMatchObject({ status: 'failed', step: 'remote-branch' });
+        expect(lookup.calls).toEqual([]);
+      } finally { branchLookup.cleanup(); }
+    } finally { lookupF.cleanup(); }
+
+    const first = harvestCalls();
+    const firstF = fixture();
+    try {
+      expect(await applyPodTerminal(timedOut, { ...firstF.ctx, harvest: first.harvest() })).toEqual({ status: 'recorded' });
+      expect(first.calls).toEqual(['create:self-impl/timeout-goalid-abc123-run', 'label:31001:elanous:harvestable']);
+      expect(loadRunLedger(runId, firstF.dir)?.filter((row) => row.event === 'pr-terminal')).toEqual([
+        expect.objectContaining({ data: expect.objectContaining({ terminalClass: 'timed-out-harvestable', branch: 'self-impl/timeout-goalid-abc123-run' }) }),
+      ]);
+      expect(loadRunLedger(runId, firstF.dir)?.some((row) => row.event === 'pr-terminal-effect' && row.data.effect === 'harvestable' && row.data.number === 31001)).toBe(true);
+      expect(await applyPodTerminal(timedOut, { ...firstF.ctx, harvest: first.harvest() })).toEqual({ status: 'skipped', reason: 'already-recorded' });
+      expect(first.calls).toEqual(['create:self-impl/timeout-goalid-abc123-run', 'label:31001:elanous:harvestable']);
+      expect(await (harvestHarvestableDrafts as (record: unknown, ctx: unknown) => Promise<unknown>)(timedOut, { ...firstF.ctx, harvest: first.harvest() })).toEqual({ status: 'skipped', reason: 'already-recorded' });
+      expect(first.calls).toEqual(['create:self-impl/timeout-goalid-abc123-run', 'label:31001:elanous:harvestable']);
+    } finally { firstF.cleanup(); }
+  });
+
+  test('AUT-TIMEOUT-NO-HARVEST L2: production default harvest never gh pr create when the remote branch is missing, then creates once when it exists', async () => {
+    const timedOut = classifyPodTerminal({
+      childRunId: runId, state: 'failed',
+      disposition: { stage: 'timed-out', ok: false, branch: 'self-impl/timeout-goalid-abc123-run' },
+      env: { ELANOUS_HARNESS_SEAT: 'TC' }, at: '2026-10-09T12:00:00Z',
+    });
+    const binDir = mkdtempSync(join(tmpdir(), 'draft-residue-harvest-gh-'));
+    const callLog = join(binDir, 'calls.jsonl');
+    const stateFile = join(binDir, 'state.json');
+    writeFileSync(stateFile, JSON.stringify({ remoteExists: false, created: false, labels: [] as string[] }));
+    writeFileSync(join(binDir, 'git'), [
+      `#!${process.execPath}`,
+      `const fs = require('node:fs');`,
+      `const args = process.argv.slice(2);`,
+      `fs.appendFileSync(${JSON.stringify(callLog)}, JSON.stringify(['git', ...args]) + '\\n');`,
+      `const state = JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)}, 'utf8'));`,
+      `if (args[0] === 'remote') { process.stdout.write('https://github.com/ElanvitalAI/elanous.git\\n'); process.exit(0); }`,
+      `if (args.includes('ls-remote')) process.exit(state.remoteExists ? 0 : 2);`,
+      `process.exit(0);`,
+    ].join('\n'));
+    writeFileSync(join(binDir, 'gh'), [
+      `#!${process.execPath}`,
+      `const fs = require('node:fs');`,
+      `const args = process.argv.slice(2);`,
+      `fs.appendFileSync(${JSON.stringify(callLog)}, JSON.stringify(['gh', ...args]) + '\\n');`,
+      `const state = JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)}, 'utf8'));`,
+      `if (args[0] === 'pr' && args[1] === 'list') {`,
+      `  process.stdout.write(state.created ? JSON.stringify([{ number: 31001, url: 'https://github.com/ElanvitalAI/elanous/pull/31001', headRefName: 'self-impl/timeout-goalid-abc123-run', labels: state.labels.map((name) => ({ name })) }]) : '[]');`,
+      `  process.exit(0);`,
+      `}`,
+      `if (args[0] === 'pr' && args[1] === 'create') {`,
+      `  if (args.includes('--draft') && args.includes('self-impl/timeout-goalid-abc123-run')) {`,
+      `    state.created = true; fs.writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify(state));`,
+      `    process.stdout.write('https://github.com/ElanvitalAI/elanous/pull/31001\\n'); process.exit(0);`,
+      `  }`,
+      `  process.exit(1);`,
+      `}`,
+      `if (args[0] === 'pr' && args[1] === 'edit' && args.includes('--add-label')) {`,
+      `  const label = args[args.indexOf('--add-label') + 1];`,
+      `  if (!state.labels.includes(label)) state.labels.push(label);`,
+      `  fs.writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify(state));`,
+      `  process.exit(0);`,
+      `}`,
+      `process.exit(1);`,
+    ].join('\n'));
+    chmodSync(join(binDir, 'git'), 0o755);
+    chmodSync(join(binDir, 'gh'), 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${binDir}${previousPath ? `:${previousPath}` : ''}`;
+    const missingF = fixture();
+    const createF = fixture();
+    const readCalls = () => existsSync(callLog) ? readFileSync(callLog, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[]) : [];
+    try {
+      expect(await applyPodTerminal(timedOut, missingF.ctx)).toEqual({ status: 'skipped', reason: 'missing-branch' });
+      expect(readCalls().some((args) => args[0] === 'gh' && args[1] === 'pr' && args[2] === 'create')).toBe(false);
+      writeFileSync(stateFile, JSON.stringify({ remoteExists: true, created: false, labels: [] }));
+      writeFileSync(callLog, '');
+      expect(await applyPodTerminal(timedOut, createF.ctx)).toEqual({ status: 'recorded' });
+      const creates = readCalls().filter((args) => args[0] === 'gh' && args[1] === 'pr' && args[2] === 'create');
+      expect(creates).toHaveLength(1);
+      expect(creates[0]).toContain('--draft');
+      expect(creates[0]).toContain('--head');
+      expect(creates[0]).toContain('self-impl/timeout-goalid-abc123-run');
+      expect(readCalls().some((args) => args.includes('--add-label') && args.includes('elanous:harvestable'))).toBe(true);
+      expect(JSON.parse(readFileSync(stateFile, 'utf8')).labels).toContain('elanous:harvestable');
+      expect(await applyPodTerminal(timedOut, createF.ctx)).toEqual({ status: 'skipped', reason: 'already-recorded' });
+      expect(readCalls().filter((args) => args[0] === 'gh' && args[1] === 'pr' && args[2] === 'create')).toHaveLength(1);
+      expect(readCalls().filter((args) => args.includes('--add-label') && args.includes('elanous:harvestable'))).toHaveLength(1);
+    } finally {
+      process.env.PATH = previousPath;
+      missingF.cleanup();
+      createF.cleanup();
+      rmSync(binDir, { recursive: true, force: true });
+    }
   });
 
   test('host-regate failure reason survives classification and the pr-terminal ledger row (AUT-HOST-REGATE-REASON-LOST)', async () => {
@@ -722,7 +1041,7 @@ describe('Pod terminal residue', () => {
       f.adapters.closePr = close;
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
       expect(f.calls.filter((call) => call.startsWith('add:200:'))).toHaveLength(1);
-      expect(f.calls.filter((call) => call.startsWith('comment:200:'))).toHaveLength(2);
+      expect(f.calls.filter((call) => call.startsWith('comment:200:'))).toHaveLength(3);
       expect(f.calls.filter((call) => call.startsWith('set:100:'))).toHaveLength(1);
       expect(f.calls.filter((call) => call.startsWith('comment:100:'))).toHaveLength(2);
       expect(old.labels).toContain('elanous:superseded');
@@ -755,7 +1074,7 @@ describe('Pod terminal residue', () => {
         expect(await applyPodTerminal(record, f.ctx)).toEqual(failure === 'comment'
           ? { status: 'recorded' } : { status: 'skipped', reason: 'already-recorded' });
         expect(f.calls.filter((call) => call.startsWith('add:200:'))).toHaveLength(1);
-        expect(f.calls.filter((call) => call.startsWith('comment:200:'))).toHaveLength(2);
+        expect(f.calls.filter((call) => call.startsWith('comment:200:'))).toHaveLength(3);
         expect(f.drafts[0]!.labels.includes('elanous:superseded')).toBe(failure === 'comment');
         expect(f.calls.filter((call) => call.startsWith('comment:100:'))).toHaveLength(1);
         expect(f.calls.filter((call) => call.startsWith('close:100'))).toHaveLength(1);
@@ -779,7 +1098,7 @@ describe('Pod terminal residue', () => {
       f.adapters.getPr = () => pr(25437, 'self-impl/main-goalid-abc123-new', '', ['elanous:harvestable'], '2026-10-09T00:00:00Z');
       expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
       expect(f.calls.filter((call) => call.startsWith('add:25437:'))).toHaveLength(1);
-      expect(f.calls.filter((call) => call.startsWith('comment:25437:'))).toHaveLength(2);
+      expect(f.calls.filter((call) => call.startsWith('comment:25437:'))).toHaveLength(3);
     } finally { f.cleanup(); }
   });
 
@@ -794,7 +1113,7 @@ describe('Pod terminal residue', () => {
         (f.adapters as unknown as Record<string, unknown>)[failure] = original;
         expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
         expect(f.calls.filter((call) => call.startsWith('add:25437:'))).toHaveLength(1);
-        expect(f.calls.filter((call) => call.startsWith('comment:25437:'))).toHaveLength(2);
+        expect(f.calls.filter((call) => call.startsWith('comment:25437:'))).toHaveLength(3);
         expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toHaveLength(1);
       } finally { f.cleanup(); }
     }
@@ -865,8 +1184,8 @@ describe('Pod terminal residue', () => {
       f.adapters.closePr = () => { throw new Error('retry later'); };
       expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 1, recovered: 0, pending: 1, unresolved: 0, closed: 0 });
       f.adapters.closePr = closePr;
-      expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 1, recovered: 1, pending: 0, unresolved: 0, closed: 2 });
-      expect(f.calls.filter((call) => call.startsWith('close:'))).toEqual(Array.from({ length: 12 }, (_, i) => `close:${i + 1}`));
+      expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 1, recovered: 1, pending: 0, unresolved: 0, closed: 3 });
+      expect(f.calls.filter((call) => call.startsWith('close:'))).toEqual([...Array.from({ length: 12 }, (_, i) => `close:${i + 1}`), 'close:200']);
       expect(f.calls.filter((call) => call.startsWith('set:'))).toHaveLength(12);
       expect(loadRunLedger(runId, f.dir)?.filter((entry) => entry.event === 'pr-terminal-effect' && entry.data.effect === 'complete')).toHaveLength(1);
       expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 0, recovered: 0, pending: 0, unresolved: 0, closed: 0 });
@@ -901,7 +1220,7 @@ describe('Pod terminal residue', () => {
       expect(await applyPodTerminal(pending, f.ctx)).toMatchObject({ status: 'failed', step: 'add-label' });
       f.adapters.addLabel = (_repo, number, label) => { f.calls.push(`add:${number}:${label}`); };
       // The record cannot learn its repository later: it is settled as unresolved, not retried, and never `complete`.
-      expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 1, recovered: 1, pending: 0, unresolved: 1, closed: 0 });
+      expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 1, recovered: 1, pending: 0, unresolved: 1, closed: 1 });
       expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 0, recovered: 0, pending: 0, unresolved: 1, closed: 0 });
       const effects = loadRunLedger(runId, f.dir)?.filter((entry) => entry.event === 'pr-terminal-effect' && entry.data.childRunId === 'run-no-url').map((entry) => entry.data.effect);
       expect(effects).toEqual(['unresolved-repository']);
@@ -1022,9 +1341,10 @@ describe('Pod terminal residue', () => {
       f.adapters.addLabel = add;
       await tick();
       expect(f.calls).toEqual([`add:25437:elanous:harvestable`, expect.stringContaining('comment:25437:Draft residue:'),
-        expect.stringContaining('comment:25437:Draft residue: failed-run recovery')]);
+        expect.stringContaining('comment:25437:Draft residue: failed-run recovery'),
+        expect.stringContaining('comment:25437:Draft residue: harvest deferred'), 'close:25437']);
       await tick();
-      expect(f.calls).toHaveLength(3);
+      expect(f.calls).toHaveLength(5);
       expect(loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal')).toHaveLength(1);
       expect(writes).toHaveLength(3);
     } finally { f.cleanup(); process.exitCode = 0; }
@@ -1091,7 +1411,7 @@ describe('Pod terminal residue', () => {
       rmSync(join(f.dir, `${runId}.jsonl`));
       f.adapters.addLabel = (_repo, number, label) => { f.calls.push(`add:${number}:${label}`); };
       const replay = await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' });
-      expect(replay).toEqual({ attempted: 1, recovered: 1, pending: 0, unresolved: 0, closed: 0 });
+      expect(replay).toEqual({ attempted: 1, recovered: 1, pending: 0, unresolved: 0, closed: 1 });
       expect(f.calls.filter((call) => call.startsWith('add:'))).toHaveLength(1);
       expect(existsSync(join(f.dir, `${runId}.jsonl`))).toBe(true);
       expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 0, recovered: 0, pending: 0, unresolved: 0, closed: 0 });
@@ -1119,7 +1439,7 @@ describe('Pod terminal residue', () => {
       expect(existsSync(join(f.dir, `${runId}.jsonl`))).toBe(true);
       // Second replay must still see the archived pr-terminal (archive ⊕ active), finish once, and not re-label.
       f.adapters.comment = comment;
-      expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 1, recovered: 1, pending: 0, unresolved: 0, closed: 0 });
+      expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 1, recovered: 1, pending: 0, unresolved: 0, closed: 1 });
       expect(f.calls.filter((call) => call.startsWith('add:'))).toHaveLength(1);
       expect(await replayPodTerminals({ ledgerDir: f.dir, adapters: f.adapters, repository: 'ElanvitalAI/elanous' })).toEqual({ attempted: 0, recovered: 0, pending: 0, unresolved: 0, closed: 0 });
     } finally { f.cleanup(); }
@@ -1443,7 +1763,13 @@ describe('Pod terminal residue', () => {
     const binDir = mkdtempSync(join(tmpdir(), 'draft-residue-gh-release-'));
     const callLog = join(binDir, 'calls.jsonl');
     const labelState = join(binDir, 'labels.json');
+    const commentState = join(binDir, 'comments.json');
+    const prState = join(binDir, 'state.txt');
+    const bodyState = join(binDir, 'body.txt');
     writeFileSync(labelState, JSON.stringify(['elanous:running', 'elanous:stalled']));
+    writeFileSync(commentState, JSON.stringify([]));
+    writeFileSync(prState, 'OPEN');
+    writeFileSync(bodyState, '칸: CELL-A');
     writeFileSync(join(binDir, 'gh'), [
       `#!${process.execPath}`,
       `const fs = require('node:fs');`,
@@ -1455,12 +1781,23 @@ describe('Pod terminal residue', () => {
       `  for (let i = 0; i < args.length; i++) {`,
       `    if (args[i] === '--remove-label') labels = labels.filter((name) => name !== args[i + 1]);`,
       `    if (args[i] === '--add-label' && !labels.includes(args[i + 1])) labels.push(args[i + 1]);`,
+      `    if (args[i] === '--body') fs.writeFileSync(${JSON.stringify(bodyState)}, args[i + 1]);`,
       `  }`,
       `  fs.writeFileSync(${JSON.stringify(labelState)}, JSON.stringify(labels));`,
       `}`,
+      `if (args[0] === 'pr' && args[1] === 'comment') {`,
+      `  const comments = JSON.parse(fs.readFileSync(${JSON.stringify(commentState)}, 'utf8'));`,
+      `  comments.push(args[args.indexOf('--body') + 1]);`,
+      `  fs.writeFileSync(${JSON.stringify(commentState)}, JSON.stringify(comments));`,
+      `}`,
+      `if (args[0] === 'pr' && args[1] === 'close') fs.writeFileSync(${JSON.stringify(prState)}, 'CLOSED');`,
       `if (args[0] === 'pr' && args[1] === 'view') process.stdout.write(JSON.stringify({ number: 200, title: 'Goal 200',`,
       `  headRefName: 'self-impl/new-goalid-def456-run', headRefOid: '${'a'.repeat(40)}', isDraft: true, createdAt: '2026-10-09T00:00:00Z',`,
-      `  body: '칸: CELL-A', labels: labels.map((name) => ({ name })), comments: [], state: 'OPEN' }));`,
+      `  body: fs.readFileSync(${JSON.stringify(bodyState)}, 'utf8'), labels: labels.map((name) => ({ name })), comments: [], state: fs.readFileSync(${JSON.stringify(prState)}, 'utf8') }));`,
+      `else if (args[0] === 'api' && args.includes('--slurp') && args.some((arg) => arg.includes('/issues/200/comments'))) {`,
+      `  const comments = JSON.parse(fs.readFileSync(${JSON.stringify(commentState)}, 'utf8'));`,
+      `  process.stdout.write(JSON.stringify([comments.map((body) => ({ body }))]));`,
+      `}`,
       `else if (args[0] === 'api' && args.includes('--slurp')) process.stdout.write('[[]]');`,
       `else if (args[0] === 'api') process.stdout.write('[]');`,
     ].join('\n'));
@@ -1478,8 +1815,12 @@ describe('Pod terminal residue', () => {
       // Production adapters (real gh argv), only the git-worktree / run-status probes are pinned.
       const adapters: DraftResidueAdapters = { ...defaultAdapters(), listLiveBranches: () => new Set<string>(), getRunStatus: () => 'failed' };
       expect(await applyPodTerminal(record, { ledgerRunId: runId, ledgerDir: dir, adapters })).toEqual({ status: 'recorded' });
+      expect(await applyPodTerminal(record, { ledgerRunId: runId, ledgerDir: dir, adapters })).toEqual({ status: 'skipped', reason: 'already-recorded' });
       const calls = readFileSync(callLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as string[]);
       const removals = calls.filter((args) => args.includes('--remove-label'));
+      expect(calls.filter((args) => args[0] === 'pr' && args[1] === 'close')).toHaveLength(1);
+      expect(calls.filter((args) => args[0] === 'pr' && args[1] === 'edit' && args.includes('--body'))).toHaveLength(1);
+      expect(readFileSync(bodyState, 'utf8')).toContain('수확보류: harvest-deferred');
       // Only the running state label is released; the other state label (stalled) is never touched.
       expect(removals).toEqual([['pr', 'edit', '200', '-R', 'ElanvitalAI/elanous', '--remove-label', 'elanous:running']]);
       expect(calls.some((args) => args.includes('elanous:stalled'))).toBe(false);
@@ -1501,5 +1842,5 @@ describe('Pod terminal residue', () => {
       rmSync(binDir, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 });

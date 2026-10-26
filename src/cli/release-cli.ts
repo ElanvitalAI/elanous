@@ -8,9 +8,11 @@
 //   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready] [--force-new]
 //   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--gate-pod-pool <pool>] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
+//   elanous release recover --run <runId> --pick <sha...> [--from export-check] [--command-root <path>] [--repo-root <path>] [--no-partial] [--json]
 //   elanous release rehearsal tick [--apply] [--checkout <dir>] [--shards <n>] [--remote <host>] [--recovery-run <id>] [--json]
 //   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 − 60분 main export 포함 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
-//   elanous release cut-branch --version <x.y.z> --base <sha> --pick <sha>... [--dry-run]
+//   elanous release cut-branch --version <x.y.z> [--base <sha>] --pick <sha>... [--append] [--dry-run]
+//     (--append 에서 --base 생략: 런 원장 version-release 기록 또는 release/<v> 끝의 첫 부모에서 스스로 찾는다)
 //
 // 🩸 계기(2026-09-25 v0.1.0 첫 공개): 손으로 밟은 절차에서 둘을 빠뜨릴 뻔했다 — 공개본 git 커밋(판 커밋이 공개본 커밋이 된다) ·
 //    PWA 빌드(빌드 산출은 공개본에 안 실린다 → 빠뜨리면 «웹 화면 없는 판»). 절차를 명령으로 굳힌다.
@@ -43,7 +45,7 @@ import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
 import { publishAtError } from '../../scripts/release-loop/publish-at.js';
 import { cutReleaseBranch } from '../../scripts/release-loop/cut-branch.js';
-import { planResumeReleaseRun, resumeReleaseRun, type ResumeReleaseDeps } from '../../scripts/release-loop/resume-release.js';
+import { planResumeReleaseRun, recoverReleaseRun, resumeReleaseRun, ReleaseRecoverStopped, type RecoverReleaseDeps } from '../../scripts/release-loop/resume-release.js';
 import type { AcceptedRegression } from '../../scripts/release-loop/resume.js';
 import type { PrereleaseKind } from '../../scripts/release-loop/release-version.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
@@ -604,7 +606,7 @@ function compareReleaseVersions(a: string, b: string): number {
   return 0;
 }
 
-export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: ResumeReleaseDeps = {}, checklistEvidenceReader?: ChecklistEvidenceReader): void {
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: RecoverReleaseDeps = {}, checklistEvidenceReader?: ChecklistEvidenceReader): void {
   registerRfcCommands(program);
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
@@ -917,9 +919,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--allow-duplicate-id', '다른 판에 같은 id 가 있어도 경고 후 추가')
     .option('--strict', '대상 경로·완료 경계 경고가 있으면 저장 전 거부')
     .option('--ref <path...>', '근거 문서 — 저장소 상대 경로[#절] (반복 가능)')
-    .action((id: string, title: string, opts: { ref?: string[]; owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean; strict?: boolean }, cmd: Command) => {
+    .action(async (id: string, title: string, opts: { ref?: string[]; owner?: string; kind?: string; priority?: string; deadlineVersion?: string; predecessor?: string[]; ceoMinutes?: string; ceoDate?: string; accelerator?: boolean; allowDuplicateId?: boolean; strict?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
     if (!mayWrite(cmd)) return;
+    const { normalizeEvidenceCommandLines } = await import('../task-agent/evidence-command-normalize.js');
+    const normalized = normalizeEvidenceCommandLines(title);
+    if (opts.strict && normalized.unrecognized.length) throw new CliUserError(`완료 경계 증거 명령 정규화 불가: ${normalized.unrecognized.join(' · ')}`);
+    title = normalized.text;
+    for (const warning of normalized.warnings) console.error(`⚠ ${warning}`);
     const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? opts.kind as ChecklistDispatchKind : undefined;
     warnChecklistTargetPaths({ title, refs: opts.ref, dispatchKind }, opts.strict);
     const data = addItem(version, { id, title, ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator ? { accelerator: true } : {}) }, { allowDuplicateId: opts.allowDuplicateId });
@@ -985,9 +992,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       else features.move(id, from, to, actor(), undefined, undefined, opts.reason);
       if (json) console.log(JSON.stringify(listChecklist(to))); else console.log(`✅ ${id} ${from} → ${to}`);
     });
-  withContext(checklist.command('retitle <id> <title>').description('칸 제목 수정')).option('--strict', '대상 경로·완료 경계 경고가 있으면 저장 전 거부').action((id: string, title: string, opts: { strict?: boolean }, cmd: Command) => {
+  withContext(checklist.command('retitle <id> <title>').description('칸 제목 수정')).option('--strict', '대상 경로·완료 경계 경고가 있으면 저장 전 거부').action(async (id: string, title: string, opts: { strict?: boolean }, cmd: Command) => {
     const { version, json } = context(cmd);
     if (!mayWrite(cmd)) return;
+    const { normalizeEvidenceCommandLines } = await import('../task-agent/evidence-command-normalize.js');
+    const normalized = normalizeEvidenceCommandLines(title);
+    if (opts.strict && normalized.unrecognized.length) throw new CliUserError(`완료 경계 증거 명령 정규화 불가: ${normalized.unrecognized.join(' · ')}`);
+    title = normalized.text;
+    for (const warning of normalized.warnings) console.error(`⚠ ${warning}`);
     const snapshot = listChecklist(version);
     const item = snapshot.items.find((entry) => entry.id === id);
     if (!opts.strict) warnChecklistTargetPaths({ title, evidence: item?.evidence, refs: item?.refs, dispatchKind: item?.dispatchKind });
@@ -1093,12 +1105,12 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   release.command('cut-branch')
     .description('원래 컷에 main 의 수리 커밋만 얹은 release/<v> 가지를 만들고 push. --append 는 이미 있는 가지에 fast-forward 로만 더 얹는다')
     .requiredOption('--version <v>', '릴리스 판(x.y.z)')
-    .requiredOption('--base <sha>', '원래 컷 SHA')
+    .option('--base <sha>', '원래 컷 SHA(--append 에서 생략하면 런 원장 version-release 기록이나 release/<v> 끝의 첫 부모에서 스스로 찾는다)')
     .requiredOption('--pick <sha...>', '차례로 얹을 main 커밋 SHA')
     .option('--append', '이미 있는 release/<v> 를 출발점으로 fast-forward push(강제 push 없음)')
     .option('--dry-run', '가지·worktree·push 없이 계획만 출력')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { version: string; base: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
+    .action(async (o: { version: string; base?: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
   const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
@@ -1259,16 +1271,17 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--remote <host>', '게이트 호스트(기본 config gateRemote.host)')
     .option('--local', '원격 대신 이 기계에서 돌린다(원격 자식이 이것으로 다시 불린다)')
     .option('--shards <n>', '시험 분할 수', '4')
+    .option('--shard-concurrency <n>', '동시에 실행할 조각 묶음 수 (1–4, 기본 3)')
     .option('--fixed-shard-distribution', 'self gate 에 그대로 전달 — RSS 사전 측정 없이 --shards N 조각에 정렬 라운드로빈 고정 배정(opt-in · 원격 자식 전달)')
     .option('--rehearsal-tui', '리허설 전용 TUI 화면 점검(원격 자식 전달)')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; fixedShardDistribution?: boolean; rehearsalTui?: boolean; json?: boolean }) => {
+    .action(async (o: { version: string; base?: string; head?: string; remote?: string; local?: boolean; shards: string; shardConcurrency?: string; fixedShardDistribution?: boolean; rehearsalTui?: boolean; json?: boolean }) => {
       // The root strips `--local` from argv (remote-bookmark attach) before Commander sees it — same read as `self gate`.
       const local = !!o.local || process.argv.slice(2).includes('--local');
       await jsonAction(o.json, async (log) => {
         if (o.remote !== undefined && local) throw new Error('release light-rc: --remote and --local cannot be combined');
         const shards = Number(o.shards);
-        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, ...(o.fixedShardDistribution ? { fixedShardDistribution: true } : {}), rehearsalTui: o.rehearsalTui, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
+        const result = await runLightRc(o.version, { base: o.base, head: o.head, remote: o.remote, local, shards, ...(o.shardConcurrency !== undefined ? { shardConcurrency: Number(o.shardConcurrency) } : {}), ...(o.fixedShardDistribution ? { fixedShardDistribution: true } : {}), rehearsalTui: o.rehearsalTui, ledgerRoot: releaseRunDeps.ledgerRoot, log: (l) => console.error(l) }, lightRcDeps);
         for (const line of formatLightRc(result)) log(line);
         return result;
       }, (r) => r.ok);
@@ -1327,6 +1340,31 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           ...(o.gateExecutor !== undefined && executorOverride?.kind === 'gate-executor' ? { gateExecutor: executorOverride } : {}),
           ...(o.gatePodPool !== undefined && poolOverride?.kind === 'gate-pod-pool' ? { gatePodPool: poolOverride } : {}) };
       }, (r) => 'preflight' in r || r.status === 'done' || r.status === 'awaiting-approval');
+    });
+  // RELEASE-RECOVER-ONE-CMD (0.2.36): the three repair steps RUNBOOK-release-recover chained by hand, in one command.
+  release.command('recover')
+    .description('발행 실패 복구를 한 명령으로 — release/<v> 에 수리 커밋을 fast-forward 로 얹는 append dry-run → append → resume --from export-check. resume이 거부할 런(상태 · --from 배치 · 컷 정체 · 시도 원장)은 append 전에 읽기 전용으로 먼저 가려 가지를 먼저 움직이지 않는다 · 원장의 append-ok가 가지 끝에 살아 있으면 append 없이 resume부터 재진입한다 · 한 단계라도 실패하면 그 자리에서 멈추고 다음 단계는 실행하지 않는다(사람 판단) · 단계 결과는 resume-attempts 원장에 남는다')
+    .requiredOption('--run <runId>', '실패한 release-loop 런 ID')
+    .requiredOption('--pick <sha...>', 'release/<v> 에 fast-forward 로 얹을 main 수리 커밋 SHA')
+    .option('--from <node>', '재개 시작 노드 — 기본 export-check(컷을 쓰는 첫 노드)')
+    .option('--command-root <path>', '노드 명령을 실행할 컷 tip checkout — 생략 시 recover가 append tip 의 임시 checkout 을 직접 마련한다(운영자 checkout 은 그대로) · 직접 지정하면 사람 판단 경계다: 계획 단계에서 tip 과 대조해 다르면 멈춘다')
+    .option('--repo-root <path>', 'append(cut-branch)를 실행할 checkout — git remote origin 이 있는 곳(생략 시 현재 폴더)')
+    .option('--no-partial', 'GATE-REUSE-BY-DIFF 기본 부분 재검을 끄고 전체 게이트')
+    .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
+    .action(async (o: { run: string; pick: string[]; from?: string; commandRoot?: string; repoRoot?: string; partial?: boolean; json?: boolean }) => {
+      await jsonAction(o.json, async (log) => {
+        try {
+          return await recoverReleaseRun({ runId: o.run, pick: o.pick,
+            ...(o.from === undefined ? {} : { from: o.from }),
+            ...(o.commandRoot === undefined ? {} : { commandRoot: o.commandRoot }),
+            ...(o.repoRoot === undefined ? {} : { repoRoot: o.repoRoot }),
+            ...(o.partial === undefined ? {} : { partial: o.partial }) },
+          { ...resumeDeps, onSource: log });
+        } catch (caught) {
+          if (!(caught instanceof ReleaseRecoverStopped)) throw caught;
+          return { ok: false as const, error: caught.message, stages: [...caught.stages], notRun: [...caught.notRun] };
+        }
+      }, (r) => r.stages.every((stage) => stage.outcome === 'ok'));
     });
   release.command('gate-history')
     .description('GATE-FAIL-HISTORY (0.2.29) — 판을 넘는 게이트 실패 표 — 모든 release-loop·light-rc 런 원장 ⊕ gate-verdict 에서 시험 파일별 introduced·preexisting·env·flaky 횟수 · 마지막 실패 판 · 원인 PR(수리 PR 본문 «원인 #N»)')

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { GATE_PREWARM_WINDOW_MS, GATE_PREWARM_OBSERVATION_MAX_AGE_MS, planGatePrewarm, type GatePrewarmInput } from './gate-prewarm-plan.js';
+import { GATE_PREWARM_WINDOW_MS, GATE_PREWARM_OBSERVATION_MAX_AGE_MS, observeGatePrewarmCutShadow, planGatePrewarm, planGatePrewarmCutShadow, type GatePrewarmInput } from './gate-prewarm-plan.js';
 
 const base: GatePrewarmInput = {
   nowMs: 1_000_000, cutAtMs: 1_000_000 + GATE_PREWARM_WINDOW_MS,
@@ -7,6 +7,28 @@ const base: GatePrewarmInput = {
   mirrorCommitSha: 'a'.repeat(40), observedAtMs: 1_000_000,
   occupiedPods: 2, capacity: 4, gateDemand: 0, taskDemand: 0,
 };
+
+test('cut shadow reports a measured plan only with complete inputs and consistent warm occupancy', () => {
+  expect(planGatePrewarmCutShadow(base, 2)).toEqual({ profile: 'gate', transition: 'shadow',
+    plan: { action: 'start-worker', cutSha: base.cutSha, lockHash: base.lockHash, slotAfter: 1 } });
+  expect(planGatePrewarmCutShadow({ cutSha: base.cutSha }, 2)).toEqual({ profile: 'gate', transition: 'shadow',
+    plan: { action: 'defer', reason: 'unmeasured' } });
+  expect(planGatePrewarmCutShadow(base, 3)).toEqual({ profile: 'gate', transition: 'shadow',
+    plan: { action: 'defer', reason: 'unmeasured' }, reason: 'warm-members-exceed-occupied' });
+});
+
+test('cut shadow pairs a plan with unchanged warm member identities and placement', () => {
+  const placement = { first: 0, second: 0 };
+  const warm = { first: [{ name: 'worker', uid: 'u1', node: 'n1' }], second: [] };
+  const recorded = observeGatePrewarmCutShadow(base, () => warm, () => placement);
+  expect(recorded).toMatchObject({ status: 'observed', memberCountBefore: 1, memberCountAfter: 1,
+    plan: { action: 'start-worker', cutSha: base.cutSha }, placementBefore: placement, placementAfter: placement });
+  let calls = 0;
+  const changed = observeGatePrewarmCutShadow(base, () => ++calls === 1 ? warm
+    : { first: [{ name: 'worker', uid: 'u2', node: 'n1' }], second: [] }, () => placement);
+  expect(changed).toMatchObject({ status: 'unmeasured', reason: 'warm-members-unmeasured-or-changed' });
+  expect(observeGatePrewarmCutShadow(base, () => null, () => placement)).toMatchObject({ status: 'unmeasured' });
+});
 
 test('prewarm starts only inside the window with a measured free slot', () => {
   expect(planGatePrewarm(base)).toEqual({ action: 'start-worker', cutSha: base.cutSha, lockHash: base.lockHash, slotAfter: 1 });

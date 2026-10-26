@@ -279,18 +279,41 @@ describe('git-fs: subscribeGitChanges', () => {
     const off = subscribeGitChanges(repo, () => { fired += 1; });
     try {
       runGit(repo, ['switch', '-q', '-c', 'feat']);
-      // fs.watch is async; poll for up to 500ms.
-      const deadline = Date.now() + 500;
-      while (fired === 0 && Date.now() < deadline) {
+      // The callback and updated branch are the readiness signals; allow fs.watch room under load.
+      const deadline = Date.now() + 5_000;
+      while ((fired === 0 || getGitStatusView(repo).head?.branch !== 'feat') && Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 20));
       }
       expect(fired).toBeGreaterThan(0);
       const v = getGitStatusView(repo);
       expect(v.head!.branch).toBe('feat');
+
+      // A subsequent atomic HEAD replace must still be observed by the same
+      // directory watcher (file-level fs.watch can remain on the old inode).
+      const switchEvents = fired;
+      runGit(repo, ['switch', '-q', 'main']);
+      const switchDeadline = Date.now() + 5_000;
+      while ((fired === switchEvents || getGitStatusView(repo).head?.branch !== 'main') && Date.now() < switchDeadline) {
+        await new Promise(r => setTimeout(r, 20));
+      }
+      expect(fired).toBeGreaterThan(switchEvents);
+      expect(getGitStatusView(repo).head!.branch).toBe('main');
+
+      // A commit atomically replaces a loose ref; its parent-directory watch
+      // must continue notifying subscribers after branch switches.
+      const refEvents = fired;
+      writeFileSync(join(repo, 'b'), '2');
+      runGit(repo, ['add', 'b']);
+      runGit(repo, ['commit', '-q', '-m', 'c2']);
+      const refDeadline = Date.now() + 5_000;
+      while (fired === refEvents && Date.now() < refDeadline) {
+        await new Promise(r => setTimeout(r, 20));
+      }
+      expect(fired).toBeGreaterThan(refEvents);
     } finally {
       off();
     }
-  });
+  }, 15_000);
 });
 
 describe('git-fs: listBranches', () => {
@@ -579,9 +602,7 @@ describe('git-fs: async refresh + stale-while-revalidate snapshot', () => {
     // The real move: main → feature.
     runGit(repo, ['switch', '-q', 'feature']);
     // Wait for the observable completion: the watcher invalidated and the background rebuild stored a new snapshot.
-    for (let i = 0; i < 200 && !__peekGitSnapshot(repo)?.includes('Current branch: feature'); i++) {
-      await new Promise(r => setTimeout(r, 25));
-    }
+    expect(await waitForPeek(repo, 'Current branch: feature')).toBe(true);
     expect(__peekGitSnapshot(repo)!).toContain('Current branch: feature');
     expect(__peekGitSnapshot(repo)!).toContain('Upstream: ahead 1, behind 0');
     // Written after the re-warm: a synchronous rebuild would list it, the warm cache does not.
@@ -590,7 +611,7 @@ describe('git-fs: async refresh + stale-while-revalidate snapshot', () => {
     expect(served!).toContain('Current branch: feature');
     expect(served!).toContain('Upstream: ahead 1, behind 0');
     expect(served!).not.toContain('after-warm.txt');
-  });
+  }, 15_000);
 
   test('store ordering is judged by a monotonic version, not wall-clock `at` (same-millisecond flip)', async () => {
     // Warm the cache with a frozen clock.

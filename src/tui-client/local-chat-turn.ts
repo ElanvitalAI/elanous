@@ -2,8 +2,14 @@
 import type { NextTuiCompactDeps, NextTuiCompactOutcome } from '../tui/slash/compact.js';
 import { NEXT_TUI_WAKEUP_IPC_ENV, answerWakeupCall, isWakeupCallMessage, nextTuiWakeupTool } from './next-wakeup.js';
 import { isNextTuiSelfHealthSnapshot, type NextTuiSelfHealthSnapshot } from '../tui/chat/self-health-status.js';
+import { answerNextSidetabCall, isNextSidetabCall, type NextSidetabHandler } from '../tui/sidetab/nl-tool.js';
 
 const STATUS_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
+let nextSidetabHandler: NextSidetabHandler | null = null;
+
+export function setNextSidetabHandler(handler: NextSidetabHandler | null): void {
+  nextSidetabHandler = handler;
+}
 
 interface TurnResult {
   event?: string | null;
@@ -18,6 +24,7 @@ interface TurnResult {
 interface WaitingTurn {
   turnId: string;
   onDelta?: (text: string) => void;
+  onStatus?: (text: string) => void;
   resolve: (result: TurnResult) => void;
   reject: (error: Error) => void;
 }
@@ -37,6 +44,7 @@ class LocalChatSession {
     // TUI-NEXT-QUEUE-AND-WAKE: the child's ScheduleWakeup asks this process over Bun IPC — the scheduler
     // lives here because the child dies on Esc and /new. No tool registered → no IPC, env unchanged.
     const wakeupTool = nextTuiWakeupTool();
+    const sidetabHandler = nextSidetabHandler;
     this.child = Bun.spawn({
       cmd: [process.execPath, cli, 'repl', '--session', sessionId, '--json', '--stdin-jsonl'],
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
@@ -44,13 +52,19 @@ class LocalChatSession {
         ...process.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1',
         ELANOUS_NEXT_TUI_SELF_HEALTH: '1',
         ...(wakeupTool ? { [NEXT_TUI_WAKEUP_IPC_ENV]: '1' } : {}),
+        ELANOUS_NEXT_TUI_SIDETAB_IPC: sidetabHandler ? '1' : '0',
       },
-      ...(wakeupTool ? {
+      ...(wakeupTool || sidetabHandler ? {
         ipc: (message: unknown, child: { send(message: unknown): unknown }) => {
-          if (!isWakeupCallMessage(message)) return;
-          void answerWakeupCall(wakeupTool, message).then((reply) => {
-            try { child.send(reply); } catch { /* the child exited mid-call; its dispatch times out */ }
-          });
+          if (wakeupTool && isWakeupCallMessage(message)) {
+            void answerWakeupCall(wakeupTool, message).then((reply) => {
+              try { child.send(reply); } catch { /* the child exited mid-call; its dispatch times out */ }
+            });
+          } else if (sidetabHandler && isNextSidetabCall(message)) {
+            void answerNextSidetabCall(sidetabHandler, message).then((reply) => {
+              try { child.send(reply); } catch { /* the child exited mid-call; its dispatch times out */ }
+            });
+          }
         },
       } : {}),
     });
@@ -83,6 +97,12 @@ class LocalChatSession {
         if (result.turnId !== waiting.turnId) return;
         if (typeof result.text === 'string') {
           try { waiting.onDelta?.(result.text); } catch { /* renderer cannot break the turn */ }
+        }
+        return;
+      }
+      if (result.event === 'status') {
+        if (result.turnId === waiting.turnId && typeof result.text === 'string') {
+          try { waiting.onStatus?.(result.text); } catch { /* renderer cannot break the turn */ }
         }
         return;
       }
@@ -155,12 +175,12 @@ class LocalChatSession {
     }
   }
 
-  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string) => void, attachments: readonly string[] = []): Promise<TurnResult> {
+  async turn(prompt: string, writePrompt?: (payload: string) => Promise<void>, onDelta?: (text: string) => void, attachments: readonly string[] = [], onStatus?: (text: string) => void): Promise<TurnResult> {
     if (this.closed) throw new Error('REPL child exited');
     if (this.waiting) throw new Error('REPL turn already running');
     const turnId = `tui-${++this.turnCount}`;
     const payload = JSON.stringify({ prompt, id: turnId, ...(attachments.length ? { attachments } : {}) }) + '\n';
-    const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, resolve, reject }; });
+    const response = new Promise<TurnResult>((resolve, reject) => { this.waiting = { turnId, onDelta, onStatus, resolve, reject }; });
     try {
       if (writePrompt) await writePrompt(payload);
       else await this.writeInput(payload);
@@ -238,6 +258,7 @@ export async function runLocalChatTurn(
   onDelta?: (text: string) => void,
   compact: LocalChatTurnCompact = {},
   attachments: readonly string[] = [],
+  onStatus?: (line: string) => void,
 ): Promise<void> {
   if (signal.aborted) throw new Error('응답을 취소했습니다');
   if (!cli) throw new Error('elanous CLI entry is unavailable');
@@ -259,7 +280,7 @@ export async function runLocalChatTurn(
   try {
     result = await session.turn(text, writePrompt, (delta) => {
       if (!signal.aborted) onDelta?.(delta);
-    }, attachments);
+    }, attachments, (line) => { if (!signal.aborted) onStatus?.(line); });
   } catch (error) {
     if (signal.aborted) throw new Error('응답을 취소했습니다');
     await closeLocalChatSession(sessionId);

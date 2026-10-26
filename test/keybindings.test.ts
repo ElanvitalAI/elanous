@@ -51,6 +51,31 @@ describe('keybinding registry', () => {
     }
   });
 
+  test('TUI-CTRLB-PREFIX-LEAK: mock catalog advertises Ctrl+X c control and Ctrl+B background', () => {
+    const advertised = (key: string) => KEYBINDINGS.filter(binding => binding.keys.includes(key)).map(binding => binding.action);
+    expect(advertised('Ctrl+X c')).toEqual([expect.stringMatching(/enter control mode/i)]);
+    expect(advertised('Ctrl+B')).toEqual(['Background running child tasks (while streaming; turn continues)']);
+    expect(KEYBINDINGS.find(binding => binding.keys.includes('Ctrl+X c'))?.context).toBe('input');
+    const help = renderKeyHelp();
+    expect(help).toMatch(/Ctrl\+X c\s+Enter control mode/i);
+    expect(help).not.toMatch(/Ctrl\+X c\s+New virtual window/i);
+    expect(help).toMatch(/Ctrl\+B\s+Background running/i);
+    const inputHelp = renderKeyHelp({ context: 'input' });
+    expect(inputHelp).toMatch(/Ctrl\+X c\s+Enter control mode/i);
+    expect(inputHelp).not.toContain('Ctrl+B');
+  });
+
+  test('TUI-CTRLB-PREFIX-LEAK: catalog does not advertise Ctrl+B as a prefix', () => {
+    const help = renderKeyHelp();
+    expect(KEYBINDINGS.filter(binding => binding.keys.some(key => key.startsWith('Ctrl+B ')))).toEqual([]);
+    expect(help).not.toMatch(/Ctrl\+B [a-zA-Z0-9%"?]/);
+    expect(KEYBINDINGS.find(binding => binding.keys.includes('Ctrl+X s'))?.action).toContain('Enter sync mode (chat input)');
+    expect(KEYBINDINGS.find(binding => binding.keys.includes('Ctrl+X g'))?.action).toContain('Exit sync/control mode');
+    expect(KEYBINDINGS.find(binding => binding.keys.includes('Ctrl+X s'))?.context).toBe('input');
+    expect(KEYBINDINGS.find(binding => binding.keys.includes('Ctrl+X Ctrl+S'))?.action).toContain('Reopen scratchpad');
+    expect(KEYBINDINGS.some(binding => binding.action.includes('Horizontal split') || binding.action.includes('Toggle modal ↔ virtual-window session'))).toBe(false);
+  });
+
   test('VP3 — Ctrl+7 binding wired for Widget Playground view', () => {
     const ctrl7 = KEYBINDINGS.find(b => b.keys.includes('Ctrl+7'));
     expect(ctrl7).toBeDefined();
@@ -92,9 +117,9 @@ describe('slash command hygiene', () => {
     for (const b of KEYBINDINGS) {
       for (const k of b.keys) chords.set(k, b.action);
     }
-    expect(chords.get('Ctrl+B S')).toMatch(/Focus sessions sidebar/i);
-    expect(chords.get('Ctrl+B n')).toMatch(/next session/i);
-    expect(chords.get('Ctrl+B p')).toMatch(/previous session/i);
+    expect(chords.get('Ctrl+X S')).toMatch(/Focus sessions sidebar/i);
+    expect(chords.get('Ctrl+X n')).toMatch(/next session/i);
+    expect(chords.get('Ctrl+X p')).toMatch(/previous session/i);
   });
 
   test('NT5 — notification bell chord is catalogued', () => {
@@ -102,6 +127,6 @@ describe('slash command hygiene', () => {
     for (const b of KEYBINDINGS) {
       for (const k of b.keys) chords.set(k, b.action);
     }
-    expect(chords.get('Ctrl+B b')).toMatch(/notification bell/i);
+    expect(chords.get('Ctrl+X b')).toMatch(/notification bell/i);
   });
 });

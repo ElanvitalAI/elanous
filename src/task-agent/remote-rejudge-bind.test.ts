@@ -79,7 +79,7 @@ test('fresh remote TA card pulls parent and child ledgers before PR selection', 
     expect(rejudgeCandidates(f.cards())).toEqual([]);
     expect(await bindMirroredRemoteRejudgeCards(f.cards(), f.statePath, { now: () => now, mirror }))
       .toEqual({ scanned: 1, bound: 1, skipped: 0, pulledUnmirrored: 0 });
-    expect(calls).toEqual([`node-b:${parent}`]);
+    expect(calls).toEqual(['node-b:' + parent]);
     expect(rejudgeCandidates(f.cards())).toEqual([f.card.id]);
   } finally { f.cleanup(); }
 });
@@ -245,7 +245,7 @@ const realChildRows = [
 ];
 
 for (const [name, childRows] of [['child pr-opened', [realChildPrOpened, ...realChildRows]], ['parent pr-terminal only (blocked-draft shape)', realChildRows]] as const) {
-  test(`real node-b ledger shape: ${REAL_PARENT} → ${REAL_CHILD} → #28037 binds from ${name}; rejudge candidates keep the taLand rule`, async () => {
+  test(`real remote ledger shape: ${REAL_PARENT} → ${REAL_CHILD} → #28037 binds from ${name}; rejudge candidates keep the taLand rule`, async () => {
     const f = setup();
     try {
       const real = { ...f.card, id: 'ta-20261015-e1c17a', runId: REAL_PARENT, createdAt: '2026-10-15T12:43:08.346Z',

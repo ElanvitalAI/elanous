@@ -452,6 +452,237 @@ export function loadRunGraphVariant(runId: string, dir = runLedgerDir()): RunGra
   return { variantId: record.variant_id, reason: record.reason };
 }
 
+/**
+ * Axes compared between what a run asked for and what it actually ran with:
+ * the child LLM request (`childModel`/`childProvider`), `zaiCodingPlan.overage`,
+ * the Pod pool and the parent host.
+ */
+export type RunRequestEffectiveAxis = 'childModel' | 'childProvider' | 'overagePolicy' | 'podPool' | 'parentHost';
+
+/** Ledger event carrying one requested-vs-effective comparison row set. */
+export const RUN_REQUEST_VS_EFFECTIVE_EVENT = 'run-request-vs-effective';
+
+const RUN_REQUEST_EFFECTIVE_AXES: readonly RunRequestEffectiveAxis[] = [
+  'childModel',
+  'childProvider',
+  'overagePolicy',
+  'podPool',
+  'parentHost',
+];
+
+/** Values of the compared axes. Requested and effective sides share this shape so a row can name both. */
+export interface RunRequestEffectiveValues {
+  childModel?: string;
+  childProvider?: string;
+  overagePolicy?: string;
+  podPool?: string;
+  parentHost?: string;
+}
+
+/** One axis whose requested value differs from the effective value observed while the run executed. */
+export interface RunRequestEffectiveMismatch {
+  axis: RunRequestEffectiveAxis;
+  requested: string;
+  effective: string;
+}
+
+export interface RunRequestEffectiveComparison {
+  requested: RunRequestEffectiveValues;
+  effective: RunRequestEffectiveValues;
+  mismatches: RunRequestEffectiveMismatch[];
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function readRunRequestEffectiveValues(value: unknown): RunRequestEffectiveValues {
+  if (!isPlainRecord(value)) return {};
+  const values: RunRequestEffectiveValues = {};
+  for (const axis of RUN_REQUEST_EFFECTIVE_AXES) {
+    const raw = value[axis];
+    if (typeof raw === 'string' && raw.trim()) values[axis] = raw.trim();
+  }
+  return values;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+/** Compare both sides axis by axis; an axis observed on one side only is not a mismatch. */
+export function compareRunRequestEffective(
+  requested: RunRequestEffectiveValues,
+  effective: RunRequestEffectiveValues,
+): RunRequestEffectiveMismatch[] {
+  const mismatches: RunRequestEffectiveMismatch[] = [];
+  for (const axis of RUN_REQUEST_EFFECTIVE_AXES) {
+    const requestedValue = requested[axis];
+    const effectiveValue = effective[axis];
+    if (requestedValue === undefined || effectiveValue === undefined || requestedValue === effectiveValue) continue;
+    mismatches.push({ axis, requested: requestedValue, effective: effectiveValue });
+  }
+  return mismatches;
+}
+
+/**
+ * Read the two sides out of one observer event. The canonical contract is an explicit
+ * `data.requested` / `data.effective` object. The real orchestrator records the
+ * requested child at run-origin and the selected execution provider at start.
+ */
+function runRequestEffectiveSidesOf(entry: RunLedgerEntry): RunRequestEffectiveComparison {
+  const data = isPlainRecord(entry.data) ? entry.data : {};
+  const requested = readRunRequestEffectiveValues(data.requested);
+  const effective = readRunRequestEffectiveValues(data.effective);
+
+  if (entry.event === 'run-origin') {
+    requested.childProvider ??= nonEmptyString(data.childProvider);
+    requested.childModel ??= nonEmptyString(data.childModel);
+  }
+  if (entry.event === 'start') {
+    effective.childProvider ??= nonEmptyString(data.provider);
+    effective.childModel ??= nonEmptyString(data.model);
+  }
+
+  const childLlm = data.childLlm;
+  if (isPlainRecord(childLlm)) {
+    const provider = nonEmptyString(childLlm.provider);
+    if (provider !== undefined && requested.childProvider === undefined) requested.childProvider = provider;
+    const model = nonEmptyString(childLlm.model);
+    if (model !== undefined && requested.childModel === undefined) requested.childModel = model;
+  }
+  const zaiCodingPlan = data.zaiCodingPlan;
+  if (isPlainRecord(zaiCodingPlan)) {
+    const overage = nonEmptyString(zaiCodingPlan.overage);
+    if (overage !== undefined && requested.overagePolicy === undefined) requested.overagePolicy = overage;
+  }
+
+  for (const key of ['childStart', 'llmConsumeStart'] as const) {
+    const start = data[key];
+    if (!isPlainRecord(start)) continue;
+    const provider = nonEmptyString(start.provider);
+    if (provider !== undefined && effective.childProvider === undefined) effective.childProvider = provider;
+    const model = nonEmptyString(start.model);
+    if (model !== undefined && effective.childModel === undefined) effective.childModel = model;
+  }
+
+  return { requested, effective, mismatches: compareRunRequestEffective(requested, effective) };
+}
+
+/**
+ * Merge every non-comparison event of a run into one comparison. The request side keeps the
+ * first recorded value (run-origin) and the effective side keeps the last observed one
+ * (child start, first llm consume-start, actual Pod pool).
+ */
+export function runRequestEffectiveFromLedger(ledger: readonly RunLedgerEntry[]): RunRequestEffectiveComparison {
+  const requested: RunRequestEffectiveValues = {};
+  const effective: RunRequestEffectiveValues = {};
+  for (const entry of ledger) {
+    if (entry.event === RUN_REQUEST_VS_EFFECTIVE_EVENT) continue;
+    const sides = runRequestEffectiveSidesOf(entry);
+    for (const axis of RUN_REQUEST_EFFECTIVE_AXES) {
+      const requestedValue = sides.requested[axis];
+      if (requestedValue !== undefined && requested[axis] === undefined) requested[axis] = requestedValue;
+      const effectiveValue = sides.effective[axis];
+      if (effectiveValue !== undefined && effective[axis] === undefined) effective[axis] = effectiveValue;
+    }
+  }
+  return { requested, effective, mismatches: compareRunRequestEffective(requested, effective) };
+}
+
+/** Mismatch rows this run already wrote, de-duplicated across repeated comparisons. */
+export function recordedRunRequestEffectiveMismatches(
+  ledger: readonly RunLedgerEntry[],
+): RunRequestEffectiveMismatch[] {
+  const seen = new Set<string>();
+  const rows: RunRequestEffectiveMismatch[] = [];
+  for (const entry of ledger) {
+    if (entry.event !== RUN_REQUEST_VS_EFFECTIVE_EVENT) continue;
+    const recorded = isPlainRecord(entry.data) ? entry.data.mismatches : undefined;
+    if (!Array.isArray(recorded)) continue;
+    for (const row of recorded) {
+      if (!isPlainRecord(row)) continue;
+      const axis = row.axis;
+      if (typeof axis !== 'string' || !RUN_REQUEST_EFFECTIVE_AXES.includes(axis as RunRequestEffectiveAxis)) continue;
+      const requested = nonEmptyString(row.requested);
+      const effective = nonEmptyString(row.effective);
+      if (requested === undefined || effective === undefined) continue;
+      const key = `${axis}\u0000${requested}\u0000${effective}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({ axis: axis as RunRequestEffectiveAxis, requested, effective });
+    }
+  }
+  return rows;
+}
+
+export interface RunRequestVsEffectiveRecordOptions {
+  /** Ledger directory; default = `runLedgerDir()`. */
+  dir?: string;
+}
+
+/**
+ * Write one `run-request-vs-effective` row under the run's own ledger file, inheriting the
+ * run's goalId and shard identity so the run stays a single mission on the timeline.
+ */
+export function recordRunRequestVsEffective(
+  runId: string,
+  requested: RunRequestEffectiveValues,
+  effective: RunRequestEffectiveValues,
+  options: RunRequestVsEffectiveRecordOptions = {},
+): RunRequestEffectiveComparison {
+  const dir = options.dir ?? runLedgerDir();
+  const ledger = loadRunLedger(runId, dir) ?? [];
+  const start = ledger.find((entry) => entry.event === 'start' && typeof entry.timestamp === 'string');
+  const goalOwner = ledger.find((entry) => nonEmptyString(entry.goalId) !== undefined);
+  const comparison: RunRequestEffectiveComparison = {
+    requested,
+    effective,
+    mismatches: compareRunRequestEffective(requested, effective),
+  };
+  appendRunLedgerEntry({
+    timestamp: new Date().toISOString(),
+    runId,
+    event: RUN_REQUEST_VS_EFFECTIVE_EVENT,
+    data: { requested: comparison.requested, effective: comparison.effective, mismatches: comparison.mismatches },
+    ...(goalOwner?.goalId === undefined ? {} : { goalId: goalOwner.goalId }),
+    ...(start?.orchestrationId === undefined ? {} : { orchestrationId: start.orchestrationId }),
+    ...(start?.shardId === undefined ? {} : { shardId: start.shardId }),
+    ...(start?.pieceIndex === undefined ? {} : { pieceIndex: start.pieceIndex }),
+    ...(start?.pieceTotal === undefined ? {} : { pieceTotal: start.pieceTotal }),
+  }, dir);
+  return comparison;
+}
+
+function sameRunRequestEffectiveMismatches(
+  left: readonly RunRequestEffectiveMismatch[],
+  right: readonly RunRequestEffectiveMismatch[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const keys = new Set(right.map((row) => `${row.axis}\u0000${row.requested}\u0000${row.effective}`));
+  return left.every((row) => keys.has(`${row.axis}\u0000${row.requested}\u0000${row.effective}`));
+}
+
+/**
+ * Production hook: after any observer event lands, compare the run's requested and effective
+ * sides and write the mismatch rows when they differ. Idempotent — a run whose rows already
+ * match its current comparison writes nothing. Recording only; no alerting and no repair.
+ */
+function recordRunRequestVsEffectiveFromLedger(runId: string, dir: string, appended: RunLedgerEntry): void {
+  // Keep unrelated observer writes O(1); only events carrying one side can
+  // change the comparison. In particular, a long run must not reread its
+  // complete ledger after every progress event.
+  if (!['run-origin', 'start', 'child-start', 'llm-consume-start'].includes(appended.event)
+    && !isPlainRecord(appended.data?.requested) && !isPlainRecord(appended.data?.effective)) return;
+  if (appended.event === RUN_REQUEST_VS_EFFECTIVE_EVENT) return;
+  const ledger = loadRunLedger(runId, dir);
+  if (!ledger?.length) return;
+  const comparison = runRequestEffectiveFromLedger(ledger);
+  if (comparison.mismatches.length === 0) return;
+  if (sameRunRequestEffectiveMismatches(recordedRunRequestEffectiveMismatches(ledger), comparison.mismatches)) return;
+  recordRunRequestVsEffective(runId, comparison.requested, comparison.effective, { dir });
+}
+
 /** Append one observer event. Callers own fail-soft handling. */
 export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()): void {
   if (refuseProductionLedgerWriteInTest(dir, 'run-ledger')) return;
@@ -465,6 +696,11 @@ export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()
     const line = `${JSON.stringify(row)}\n`;
     if (!restoreArchivedRunLedger(dir, entry.runId, line)) appendFileSync(live, line, 'utf8');
   });
+  try {
+    recordRunRequestVsEffectiveFromLedger(entry.runId, dir, entry);
+  } catch {
+    // The comparison is observation: it must never fail a producer write that already landed.
+  }
 }
 
 /** Caller decision inside `appendRunLedgerEntryChecked`: either `append` exactly one entry, or skip with `result`. */
@@ -836,12 +1072,33 @@ export interface RunLedgerTimelineEntry {
   pieceTotal?: number;
   /** Producer-recorded `graph.unit` visits of this run, with terminal unmatched enters reported as orphans. */
   unitVisits?: GraphUnitVisitClassification;
+  /** Requested vs effective values this run recorded; present only when the two sides differ. */
+  requestVsEffective?: {
+    requested: RunRequestEffectiveValues;
+    effective: RunRequestEffectiveValues;
+  };
+  /** Mismatch rows (axis · requested · effective) for this run; absent when requested equals effective. */
+  mismatches?: RunRequestEffectiveMismatch[];
 }
 
 export interface RunLedgerTimelineQueryOptions {
   dir?: string;
   read?: RunLedgerReader;
   list?: (path: string) => string[];
+}
+
+/**
+ * Timeline projection of the requested-vs-effective rows. Recorded rows win over a derived
+ * comparison so the timeline shows what the run actually wrote; equal sides project nothing.
+ */
+function runRequestEffectiveTimelineFields(
+  ledger: readonly RunLedgerEntry[],
+): Pick<RunLedgerTimelineEntry, 'mismatches' | 'requestVsEffective'> {
+  const recorded = recordedRunRequestEffectiveMismatches(ledger);
+  const derived = runRequestEffectiveFromLedger(ledger);
+  const mismatches = recorded.length > 0 ? recorded : derived.mismatches;
+  if (mismatches.length === 0) return {};
+  return { mismatches, requestVsEffective: { requested: derived.requested, effective: derived.effective } };
 }
 
 /**
@@ -878,6 +1135,7 @@ export function queryRunLedgerTimeline(missionId: string, options: RunLedgerTime
         ...(execution.pieceIndex === undefined ? {} : { pieceIndex: execution.pieceIndex }),
         ...(execution.pieceTotal === undefined ? {} : { pieceTotal: execution.pieceTotal }),
         unitVisits: classifyGraphUnitVisits(ledger),
+        ...runRequestEffectiveTimelineFields(ledger),
       });
     } catch {
       // A corrupt or concurrently replaced ledger must not leak a partial run into another mission timeline.

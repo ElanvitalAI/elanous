@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from 'bun:test';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -16,6 +16,7 @@ import { ingestIntakeItems, markIntakeItem, listIntakeItems } from '../intake-pl
 import { buildIntakeDigest } from '../intake-plane/digest.js';
 import { addSource } from '../intake-plane/intake-sources.js';
 import { debug } from '../debug/log.js';
+import { readSavedCursor, type SavedMessage } from '../intake-plane/collect-telegram-saved.js';
 
 test('registers the complete intake command tree on a fresh Command with its help and options', () => {
   const program = new Command().name('elanous');
@@ -320,4 +321,119 @@ test('intake digest --telegram annotates the lens before building the digest, an
   });
   expect(order).toEqual(['lens', 'digest', 'telegram']);
   expect(sent).toEqual({ sent: true });
+});
+
+// ── TG-SAVED-ZERO ── 사흘 0 을 «필터로 버려서» 인지 «다른 주체가 이미 가져가서» 인지 갈라 읽는다.
+// 무대: 실제 커맨드 트리(registerIntakeCommands) + program.parseAsync · 가짜 저장 메시지 fetch · 격리 임시 root.
+const savedMsg = (id: number, text: string, urls: string[] = []): SavedMessage => ({ id, date: '2026-10-24T00:00:00.000Z', text, urls });
+
+function savedTelegramRoot(prefix: string, lastId: number): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  mkdirSync(join(root, 'intake'), { recursive: true });
+  writeFileSync(join(root, 'intake', 'telegram-saved.cursor.json'), JSON.stringify({ lastId, at: '2026-10-21T00:00:00.000Z' }) + '\n');
+  return root;
+}
+
+test('intake collect-telegram-saved human output separates «메시지 0» from «원장 입력 0»: filter vs another consumer', async () => {
+  const root = savedTelegramRoot('intake-tg-saved-cli-', 8959);
+  try {
+    let all: SavedMessage[] = [];
+    let closes = 0;
+    const output: string[] = [];
+    const program = new Command().name('elanous').exitOverride();
+    registerIntakeCommands(program, {
+      root,
+      connectSaved: async () => ({
+        fetch: async (minId: number, limit: number) => all.filter((m) => m.id > minId).slice(0, limit),
+        close: async () => { closes++; },
+      }),
+      write: async (text: string) => { output.push(text); },
+    });
+
+    // ① 메시지는 왔지만 전부 빈 몸통 — 원장 입력 0 은 «필터» 때문이다.
+    all = [savedMsg(9060, '   '), savedMsg(9070, ''), savedMsg(9092, '')];
+    await program.parseAsync(['intake', 'collect-telegram-saved'], { from: 'user' });
+    const filtered = output.pop()!;
+    expect(filtered).toContain('읽음 3');
+    expect(filtered).toContain('필터로 버림 3');
+    expect(filtered).toContain('원장 입력 0');
+    expect(filtered).toContain('커서 8959 → 9092');
+    expect(filtered).toContain('필터 때문이다');
+    expect(filtered).not.toContain('다른 주체');
+    // 커서는 원장 입력 0 과 «독립»으로 전진한다(사흘 0 의 관측 사실 그대로).
+    expect(readSavedCursor(root)).toBe(9092);
+    expect(listIntakeItems(root)).toHaveLength(0);
+
+    // ② 원장 입력은 있지만 «새 것 0» — 같은 항목을 다른 주체(-queue)가 이미 가져갔다.
+    ingestIntakeItems(root, 'telegram-saved', [{ url: 'https://example.com/consumed', observedAt: '2026-10-22T00:00:00.000Z' }]);
+    const consumedId = listIntakeItems(root).find((item) => item.url === 'https://example.com/consumed')!.id;
+    expect(markIntakeItem(root, consumedId, { status: 'absorbed', output: { kind: 'note', ref: '/notes/consumed.md' } })).toBe(true);
+    all = [savedMsg(9093, '볼 것 https://example.com/consumed')];
+    await program.parseAsync(['intake', 'collect-telegram-saved'], { from: 'user' });
+    const consumed = output.pop()!;
+    expect(consumed).toContain('읽음 1');
+    expect(consumed).toContain('원장 입력 1');
+    expect(consumed).toContain('이미 끝난 것 1');
+    expect(consumed).toContain('새 0');
+    expect(consumed).toContain('다른 주체');
+    expect(consumed).not.toContain('필터 때문이다');
+    expect(readSavedCursor(root)).toBe(9093);
+    expect(closes).toBe(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('intake collect-telegram-saved --json reports fetched / dropped / ingest apart and the representative\'s saved message lands on the next collect', async () => {
+  const root = savedTelegramRoot('intake-tg-saved-json-', 8959);
+  try {
+    let all: SavedMessage[] = [];
+    const output: string[] = [];
+    const program = new Command().name('elanous').exitOverride();
+    registerIntakeCommands(program, {
+      root,
+      connectSaved: async () => ({
+        fetch: async (minId: number, limit: number) => all.filter((m) => m.id > minId).slice(0, limit),
+        close: async () => {},
+      }),
+      write: async (text: string) => { output.push(text); },
+    });
+    const collect = async (extra: string[] = []) => {
+      await program.parseAsync(['intake', 'collect-telegram-saved', '--json', ...extra], { from: 'user' });
+      return JSON.parse(output.pop()!) as {
+        cursorBefore: number; cursorAfter: number; messages: number; droppedByFilter: number; raws: number;
+        dryRun: boolean; ingest?: { shaped: number; added: number; merged: number; seen: number; skipped: number };
+      };
+    };
+
+    // 커서 이후 새 저장 메시지가 없는 판 — «메시지 0» 이고 커서도 안 움직인다.
+    const empty = await collect();
+    expect(empty).toMatchObject({ cursorBefore: 8959, cursorAfter: 8959, messages: 0, droppedByFilter: 0, raws: 0, dryRun: false });
+    expect(empty.ingest).toMatchObject({ added: 0, seen: 0 });
+
+    // 대표가 저장한 메시지 1건 — 다음 흡수에 원장으로 실제로 들어간다(판정선).
+    all = [savedMsg(9093, '판정선 https://example.com/judged')];
+    const judged = await collect();
+    expect(judged).toMatchObject({ cursorBefore: 8959, cursorAfter: 9093, messages: 1, droppedByFilter: 0, raws: 1 });
+    expect(judged.ingest).toMatchObject({ shaped: 1, added: 1, merged: 0, seen: 0, skipped: 0 });
+    const landed = listIntakeItems(root);
+    expect(landed).toHaveLength(1);
+    expect(landed[0]).toMatchObject({ url: 'https://example.com/judged', source: 'telegram-saved', privacy: 'user-private', status: 'new', text: '판정선' });
+    expect(readFileSync(join(root, 'intake', 'items.jsonl'), 'utf8').trim().split('\n')).toHaveLength(1);
+
+    // 같은 판을 다시 돌리면 새 메시지 0 — 이미 들어간 것을 되풀이해 넣지 않는다.
+    const again = await collect();
+    expect(again).toMatchObject({ cursorBefore: 9093, cursorAfter: 9093, messages: 0, raws: 0 });
+
+    // dry-run 은 원장·커서를 바꾸지 않고, 그래도 «들어갈 것» 을 센다.
+    all = [savedMsg(9094, 'https://example.com/dry')];
+    const dry = await collect(['--dry-run']);
+    expect(dry).toMatchObject({ cursorBefore: 9093, cursorAfter: 9094, messages: 1, raws: 1, dryRun: true });
+    expect(dry.ingest).toBeUndefined();
+    expect(readSavedCursor(root)).toBe(9093);
+    expect(listIntakeItems(root)).toHaveLength(1);
+
+    // --max 상한은 fetch 에 그대로 전달된다.
+    all = [savedMsg(9095, 'https://example.com/a'), savedMsg(9096, 'https://example.com/b')];
+    const limited = await collect(['--max', '1']);
+    expect(limited).toMatchObject({ messages: 1, cursorBefore: 9093, cursorAfter: 9095 });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

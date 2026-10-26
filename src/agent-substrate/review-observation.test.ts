@@ -3,7 +3,7 @@
 // 이 모듈의 존재 이유는 **관측 갭 수리**다(수동 `elanous self review` 의 verdict 가 보존되지 않았다).
 // 절단이 과하면 감사가 안 되고 느슨하면 로그가 폭주한다 — 그 균형을 여기서 고정한다.
 import { describe, expect, test } from 'bun:test';
-import { buildReviewObservation, safeLogText } from './review-observation.js';
+import { buildReviewObservation, reviewIntentFingerprint, safeLogText } from './review-observation.js';
 
 // ⚠️⚠️ **테스트 입력 함정**(세 번 밟았다) — `'x'.repeat(N)` 같은 **연속 영숫자**는 `redact()` 의
 //    "32자 이상 무작위 토큰" 규칙에 걸려 `***`(3자)이 된다. 길이 경계를 재려면 **공백·한글이 섞인
@@ -20,6 +20,20 @@ const base = (over: Partial<ReviewResult> = {}): ReviewResult =>
 
 const obs = (review: ReviewResult, intent = 'x') =>
   buildReviewObservation({ pr: '5500', model: 'gpt-5.6-sol', intent, review, durationMs: 1234 });
+
+describe('reviewIntentFingerprint — 결정적 내용 없는 SHA-256', () => {
+  test('같은 intent는 같은 지문, 다른 intent는 다른 지문이며 원문은 지문에 없다', () => {
+    const secretA = 'DOCTOR_SECRET_ALPHA';
+    const secretB = 'DOCTOR_SECRET_BRAVO';
+    const fingerprintA = reviewIntentFingerprint(secretA);
+    const fingerprintB = reviewIntentFingerprint(secretB);
+    expect(fingerprintA).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(fingerprintA).toBe(reviewIntentFingerprint(secretA));
+    expect(fingerprintA).not.toBe(fingerprintB);
+    expect(fingerprintA).not.toContain(secretA);
+    expect(fingerprintB).not.toContain(secretB);
+  });
+});
 
 describe('buildReviewObservation — 감사에 필요한 최소 집합', () => {
   test('verdict·개수·소요시간을 싣는다', () => {

@@ -17,6 +17,8 @@ export type OneScreenInput = {
   flow: OneScreenFlow | null | undefined;
   release: { green: number; yellow: number } | null | undefined;
   decisions: number | null | undefined;
+  /** Open decision titles already fetched on the live path — first title answers «무엇을 결정해야 하나». */
+  decisionTitles?: string[] | null;
   merged: number | null | undefined;
   risks: OneScreenRisk[] | null | undefined;
   grid: OneScreenGrid | null | undefined;
@@ -58,7 +60,8 @@ export function oneScreenAnswer(input: OneScreenInput): OneScreenAnswer {
   const spare = input.grid === undefined ? null : spareSlots(input.grid);
   return {
     blocked: `${flow} / 톱 ${top}`,
-    decide: input.decisions === undefined ? LOADING : input.decisions === null ? UNMEASURED : `결정 대기 ${input.decisions}건`,
+    decide: input.decisions === undefined ? LOADING : input.decisions === null ? UNMEASURED
+      : `결정 대기 ${input.decisions}건${input.decisionTitles?.[0] ? ` · ${input.decisionTitles[0]}` : ''}`,
     landed: input.merged === undefined ? LOADING : input.merged === null ? UNMEASURED : `${input.merged}건`,
     spare: input.grid === undefined ? LOADING : spare === null ? UNMEASURED : `${spare}칸`,
     heartbeat: input.grid === undefined ? LOADING : heartbeatText(input.grid?.hq.ageSeconds),

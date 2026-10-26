@@ -15,20 +15,21 @@ import { parseOverviewStrip, type FlowStrip } from './overview-strip';
 
 type Risk = { id: string; kind: string; title: string; at: string };
 type SchedulesResult = { summary: Record<string, number>; risks: Risk[] };
-type DecisionsResult = { count: number; risks: Risk[] };
+type DecisionsResult = { count: number; titles: string[]; risks: Risk[] };
 
 type Snapshot = {
   flow: FlowStrip | null | undefined;
   release: { green: number; yellow: number } | null | undefined;
   loops: Record<string, number> | null | undefined;
   decisions: number | null | undefined;
+  decisionTitles: string[] | null | undefined;
   merged: number | null | undefined;
   risks: Risk[] | null | undefined;
   grid: GridData | null | undefined;
   drafts: DraftMetricsCardValue;
 };
 
-const empty: Snapshot = { flow: undefined, release: undefined, loops: undefined, decisions: undefined, merged: undefined, risks: undefined, grid: undefined, drafts: { kind: 'loading' } };
+const empty: Snapshot = { flow: undefined, release: undefined, loops: undefined, decisions: undefined, decisionTitles: undefined, merged: undefined, risks: undefined, grid: undefined, drafts: { kind: 'loading' } };
 const validTime = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value));
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 
@@ -136,8 +137,12 @@ async function readDecisions(client: DaemonClient, now: number): Promise<Decisio
   try {
     const rows = await listOpenDecisions(client);
     if (!Array.isArray(rows) || !rows.every((row) => object(row) && typeof row.id === 'string')) return null;
-    return { count: rows.length, risks: rows.flatMap((row) => validTime(row.dueAt) && Date.parse(row.dueAt) < now
-      ? [{ id: `decision:${row.id}`, kind: '기한 지난 결정', title: typeof row.title === 'string' ? row.title : row.id, at: row.dueAt }] : []) };
+    return {
+      count: rows.length,
+      titles: rows.map((row) => typeof row.title === 'string' && row.title.trim() ? row.title.trim() : row.id),
+      risks: rows.flatMap((row) => validTime(row.dueAt) && Date.parse(row.dueAt) < now
+        ? [{ id: `decision:${row.id}`, kind: '기한 지난 결정', title: typeof row.title === 'string' ? row.title : row.id, at: row.dueAt }] : []),
+    };
   } catch { return null; }
 }
 
@@ -206,7 +211,10 @@ function readSnapshot(client: DaemonClient, update: (patch: Partial<Snapshot>) =
   void flow.then((value) => update({ flow: value }));
   void seats.then((value) => update({ release: value.kind === 'ready' ? releaseFromSeats(value.data) : null }));
   void loops.then((value) => update({ loops: value?.summary ?? null }));
-  void decisions.then((value) => update({ decisions: value?.count ?? null }));
+  void decisions.then((value) => update({
+    decisions: value?.count ?? null,
+    decisionTitles: value ? value.titles : null,
+  }));
   void merged.then((value) => update({ merged: value }));
   void grid.then((value) => update({ grid: value }));
   void Promise.all([loops, loopFailures, decisions, runRisks]).then(([schedule, failures, decision, runs]) => {
@@ -244,6 +252,7 @@ export default function CeoPage() {
     flow: snapshot.flow,
     release: snapshot.release,
     decisions: snapshot.decisions,
+    decisionTitles: snapshot.decisionTitles,
     merged: snapshot.merged,
     risks: snapshot.risks,
     grid: snapshot.grid,
@@ -289,7 +298,13 @@ export default function CeoPage() {
         ? '등록된 일정 0' : <div className="flex flex-wrap gap-1 text-xs font-medium">{Object.entries(snapshot.loops).map(([verdict, count]) =>
           <span key={verdict} className="rounded-full bg-muted px-2 py-1">{verdict} {count}</span>)}</div>}
         <Link href={LOOPS_INTERACT_HREF} className="mt-1 block rounded text-xs font-medium text-primary underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="루프 상호작용 보기 — 운영 › 루프 상호작용">루프 상호작용 보기 →</Link></Card>
-      <Card title="결정 대기 카드"><Link href="/decisions" className="rounded underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="결정 대기 카드 보기">{snapshot.decisions === undefined ? '불러오는 중…' : snapshot.decisions ?? '못 읽음'}</Link></Card>
+      <Card title="결정 대기 카드"><Link href="/decisions" className="rounded underline underline-offset-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary" aria-label="결정 대기 카드 보기">{snapshot.decisions === undefined ? '불러오는 중…' : snapshot.decisions === null ? '못 읽음'
+        : snapshot.decisions === 0 ? '0'
+          : <span className="block space-y-1 text-sm font-medium">
+            <span className="block tabular-nums">{snapshot.decisions}</span>
+            {(snapshot.decisionTitles ?? []).map((title) =>
+              <span key={title} className="block min-w-0 truncate rounded-lg bg-muted px-2 py-1" title={title}>{title}</span>)}
+          </span>}</Link></Card>
       <Card title="오늘 병합 PR">{snapshot.merged === undefined ? '불러오는 중…' : snapshot.merged ?? '못 읽음'}</Card>
     </div>
     <div className="mt-2 grid min-w-0 grid-cols-2 gap-2 sm:mt-4 sm:gap-4" aria-label="위험과 그리드 카드">

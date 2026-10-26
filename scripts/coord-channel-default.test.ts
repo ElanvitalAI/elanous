@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 test('coordination watcher selects #27708 only from the unique last-channel heading and fails closed', () => {
   const manualPath = resolve(import.meta.dir, '../docs/manual/MANUAL-multi-agent-coordination-channel-2026-07-28.md');
   const manual = readFileSync(manualPath, 'utf8');
-  expect(manual).toMatch(/^> ## .*마지막 채널 = \[PR #27708\]\(https:\/\/github\.com\/ElanvitalAI\/elanous-agent\/pull\/27708\)/m);
+  expect(manual).toMatch(/^> ## .*마지막 채널 = \[PR #27708\]\(https:\/\/github\.com\/[^/]+\/elanous-agent\/pull\/27708\)/m);
   const fixture = mkdtempSync(resolve(tmpdir(), 'coord-channel-watch-'));
   const scriptDir = resolve(fixture, 'scripts');
   const fixtureManual = resolve(fixture, 'docs/manual/MANUAL-multi-agent-coordination-channel-2026-07-28.md');
@@ -36,7 +36,7 @@ test('coordination watcher selects #27708 only from the unique last-channel head
     const mismatchedRun = run();
     expect(mismatchedRun.status).toBe(3);
 
-    const extraHeading = '\n> ## 마지막 채널 = [PR #26146](https://github.com/ElanvitalAI/elanous/pull/26146)\n';
+    const extraHeading = '\n> ## 마지막 채널 = [PR #26146](https://github.com/example-org/elanous-agent/pull/26146)\n';
     writeFileSync(fixtureManual, manual.replace('# MANUAL — 멀티 에이전트 조율 채널 감시', `# MANUAL — 멀티 에이전트 조율 채널 감시${extraHeading}`));
     const ambiguousRun = run();
     expect(ambiguousRun.status).toBe(3);

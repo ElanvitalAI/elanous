@@ -250,7 +250,7 @@ describe('MINIH-MODE on the production launch path (podSelfImplementSpawn → ac
       fallbackConfig: () => ({ llm: {} }) as UserConfig,
       openGatewayConfig: () => ({ llm: {} }) as UserConfig,
       lookupOpenPrByBranch: () => ({ status: 'not-found', reason: 'test-fixture' }),
-      env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: `node-c-mode-${launchSeq++}`, ...(minihLocation ? { ELANOUS_MINIH_LOCATION: minihLocation } : {}) },
+      env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: 'node-c-mode-' + launchSeq++, ...(minihLocation ? { ELANOUS_MINIH_LOCATION: minihLocation } : {}) },
     });
     try {
       const done = await run({ feature: 'node-c-mode', spaceId: 'node-c-mode-launch-fixture' }).done;

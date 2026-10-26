@@ -1,6 +1,11 @@
 import { describe, expect, test, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { recordDoctorVisit, recordPendingShadowDoctorReevaluations } from '../self-implement/doctor-visit.js';
+import { appendRunLedgerEntry, loadRunLedger } from '../self-implement/run-ledger.js';
 import { openSchedulesDb } from './schedule-registry.js';
 import { ensureScheduleRunsSchema, recordScheduleRun } from './schedule-runs.js';
 import { GROK_EXPIRY_ALERT_WINDOW_MS, grokExpiryAlertLine, grokExpiryStatusLine, guardianShadowDay, guardianTick, type GuardianPlan } from './guardian-tick.js';
@@ -12,6 +17,29 @@ const plan: GuardianPlan = { timeZone: 'Asia/Seoul', jobs: [
 const kst = (hour: number, minute = 0) => new Date(Date.UTC(2026, 9, 7, hour - 9, minute));
 
 describe('GUARD-ONE-a shadow tick', () => {
+  test('guardian shadow tick records one doctor prescription for an admitted visit across repeated ticks', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'guardian-doctor-shadow-'));
+    const runId = 'run-0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d';
+    const missingEvidenceRunId = 'run-1a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d';
+    try {
+      appendRunLedgerEntry({ timestamp: '2026-10-25T00:00:00.000Z', runId, event: 'run-start', data: {} }, dir);
+      appendRunLedgerEntry({ timestamp: '2026-10-25T00:00:01.000Z', runId, event: 'knowhow-pack', data: { ids: ['K-TC-777'], injected: true } }, dir);
+      recordDoctorVisit({ runId, from: 'supervisor', symptom: 'admit-starved', evidence: 'admission queue stalled', dir, incidentRoot: null });
+      appendRunLedgerEntry({ timestamp: '2026-10-25T00:00:00.000Z', runId: missingEvidenceRunId, event: 'run-start', data: {} }, dir);
+      recordDoctorVisit({ runId: missingEvidenceRunId, from: 'supervisor', symptom: 'admit-starved', dir, incidentRoot: null });
+      const doctorShadow = () => { recordPendingShadowDoctorReevaluations(dir); };
+      const deps = { doctorShadow, grokExpiry: () => null };
+      await guardianTick(kst(5), { ...plan, jobs: [] }, deps);
+      await guardianTick(kst(5, 5), { ...plan, jobs: [] }, deps);
+      const rows = loadRunLedger(runId, dir)!.filter(row => row.event === 'doctor-rx');
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.data).toMatchObject({ shadow: true, rx: 're-evaluate-member', execution: 'none', knowhowPackSliceIds: ['K-TC-777'] });
+      const unmeasured = loadRunLedger(missingEvidenceRunId, dir)!.filter(row => row.event === 'doctor-rx');
+      expect(unmeasured).toHaveLength(1);
+      expect(unmeasured[0]!.data).toMatchObject({ shadow: true, rx: null, outcome: 'needs-evidence', execution: 'none', knowhowPackSliceIds: 'unknown' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('Grok expiry alert starts at four hours and contains host/time without credential material', async () => {
     const now = kst(14);
     const expiresAt = new Date(now.getTime() + GROK_EXPIRY_ALERT_WINDOW_MS).toISOString();

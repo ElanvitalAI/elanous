@@ -1488,6 +1488,7 @@ describe('merge conflict relaunch', () => {
   const harvestableConflict = (id = 'big', feature = 'goal big') => ({
     taskId: id, feature, status: 'failed', stage: 'merge-conflict', branch: 'self-impl/big', harvestable: true,
     mergeReason: 'main-sync-conflict-unresolved',
+    goalPlanRevision: { status: 'read', attempted: 0, applied: 0, failureReasons: [] },
   }) as never;
   const quiet = { taskAgentShadow: false as const, sweepPendingMerges: async () => ({ pending: 0, merged: 0 }) };
 
@@ -1507,6 +1508,30 @@ describe('merge conflict relaunch', () => {
       expect(decision.relaunchGoals?.big).toBe(`${header}\ngoal big`);
       expect(log).toHaveBeenCalledWith('self-dev.supervisor', 'merge-conflict-relaunch', { taskId: 'big', branch: 'self-impl/big', attempt: 1 });
     } finally { log.mockRestore(); }
+  });
+
+  test('수확 가능 결과의 골 개정 관측이 없으면 같은 골 main 재발사를 막고 PR 수확을 기다린다', () => {
+    const missingObservation = decideNextRun({ results: [{ ...harvestableConflict(), goalPlanRevision: undefined }] });
+    expect(missingObservation).toMatchObject({ action: 'stop', stopReason: 'harvestable-awaiting-human', relaunchOnMain: [] });
+    expect(missingObservation.why).toContain('골 개정 관측 미확인 — 같은 골 재발사 보류');
+
+    const observed = decideNextRun({ results: [{ ...harvestableConflict(),
+      goalPlanRevision: { status: 'read', attempted: 0, applied: 0, failureReasons: [] } }] as never[] });
+    expect(observed).toMatchObject({ action: 'relaunch', relaunchOnMain: ['big'] });
+
+    const mixed = decideNextRun({ results: [harvestableConflict('observed'),
+      { ...harvestableConflict('unobserved'), goalPlanRevision: undefined }] as never[] });
+    expect(mixed).toMatchObject({ action: 'relaunch', relaunchOnMain: ['observed'], needsHuman: ['unobserved'] });
+    expect(mixed.why).toContain('골 개정 관측 미확인 — 같은 골 재발사 보류(unobserved)');
+  });
+
+  test('수확 가능 결과의 원장 read-failed 도 같은 골 main 재발사를 막는다', () => {
+    const decision = decideNextRun({ results: [{ ...harvestableConflict('read-failed'), goalPlanRevision: {
+      status: 'read-failed', reason: 'unreadable-files', scannedFiles: 2, unreadableFiles: 1, ledgerDirectory: '/tmp/ledger',
+    } }] as never[] });
+    expect(decision).toMatchObject({ action: 'stop', stopReason: 'harvestable-awaiting-human',
+      relaunchOnMain: [], needsHuman: ['read-failed'] });
+    expect(decision.why).toContain('골 개정 관측 미확인 — 같은 골 재발사 보류(read-failed)');
   });
 
   test('같은 조각 두 번째 main-sync-blocked 는 지금처럼 needs-human / harvestable-awaiting-human', () => {

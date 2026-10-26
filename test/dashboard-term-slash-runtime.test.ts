@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createDashboardTermSlashRuntime, resolveTuiShellSeat } from '../src/dashboard/term-slash-runtime.js';
+import { KEYBINDINGS } from '../src/keybindings.js';
 
 test('TUI shell seat comes from the workdir, then COORD_ID, then unknown', () => {
   expect(resolveTuiShellSeat('/tmp/hq/seats/OP', 'UX')).toBe('OP');
@@ -20,6 +21,16 @@ describe('createDashboardTermSlashRuntime', () => {
 
     expect(runtime.helpLines()[1]).toBe('accent:❯ /term');
     expect(runtime.helpLines().some((line) => line.includes('/term matrix'))).toBe(true);
+    expect(runtime.helpLines()).toContain('muted:  Ctrl+B (while streaming)  Background running child tasks; turn continues.');
+    expect(runtime.helpLines()).toContain('muted:  Ctrl+X c (chat input)     Enter control mode.');
+    for (const [key, action] of [
+      ['Ctrl+B', 'Background running child tasks'],
+      ['Ctrl+X c', 'Enter control mode'],
+    ]) {
+      expect(KEYBINDINGS.find(binding => binding.keys.includes(key))?.action).toContain(action);
+      expect(runtime.helpLines().filter(line => line.includes(key + ' ('))).toHaveLength(1);
+      expect(runtime.helpLines().find(line => line.includes(key + ' ('))).toContain(action);
+    }
     expect(runtime.terminalSessionsEmptyLine()).toBe('muted:  No terminal sessions.');
     expect(runtime.terminalSessionLine({
       idSuffix: '1234abcd',

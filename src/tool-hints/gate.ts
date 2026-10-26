@@ -171,17 +171,19 @@ export function evaluateGate(
 
   // ─── Step 6: model-tier budget cap ─────────────────────────────
   // Weak/cheap models pay a per-tool token tax. On codex/gpt-5 we
-  // cap the prompt at top-8 after boost sort to keep the per-call
-  // overhead bounded. Claude/Opus/Grok don't need this.
+  // cap the prompt after boost sort to keep per-call overhead bounded.
+  // Research already has an intent signal; it needs more source tools but
+  // still has a finite cap. Claude/Opus/Grok don't need this cap.
   let keep: string[] = [...enabled];
   const capped = signals.modelFamily === 'codex' || signals.modelFamily === 'gpt';
   if (capped) {
     const beforeModelFamilyCap = keep.length;
-    if (keep.length > 8) {
+    const cap = signals.researchAgent ? 16 : 8;
+    if (keep.length > cap) {
       keep = keep
         .map(id => ({ id, score: boost.get(id) ?? 0 }))
         .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id))
-        .slice(0, 8)
+        .slice(0, cap)
         .map(x => x.id);
     }
     stages.modelFamilyCap = executedStage(beforeModelFamilyCap, keep.length);

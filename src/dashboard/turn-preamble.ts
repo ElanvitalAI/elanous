@@ -25,6 +25,7 @@ import { buildConcisenessSystemMessages } from '../prompt-library/chat-concisene
 import {
   buildSessionRuntimeSystemMessages,
   buildSessionRuntimeTurnSystemMessages,
+  buildResearchDateSystemMessage,
   type SessionTurnProfile,
 } from '../session-runtime/index.js';
 import { buildExecutionAskSystemMessages } from '../ask-user-question/index.js';
@@ -208,9 +209,13 @@ function buildDashboardTurnPreambleUnmeasured(
     gitSnapshotStaleMs: DASHBOARD_GIT_SNAPSHOT_STALE_MS,
   }));
   const turnProfile = ctx.turnProfile;
+  const researchTurn = turnProfile?.surface.id === 'research/agent';
   const surfaceSystemMsgs = turnProfile
     ? timed(builderMs, 'surface', () => buildSessionRuntimeTurnSystemMessages(turnProfile, ctx.userText))
     : ([] as LLMMessage[]);
+  if (researchTurn) {
+    surfaceSystemMsgs.push(buildResearchDateSystemMessage());
+  }
   // ⭐⭐ `tools.nativeStructure` 는 «어느 provider 에 켤지»를 목록으로 고를 수 있다(2026-08-18).
   //   ⛔ 목록이 없으면 종전대로 «전 provider» — 기존 설정을 쓰는 사람의 값이 안 바뀐다.
   //   ⛔ `config.llm.provider` 를 그대로 읽지 않는다. 그것은 `'auto'` 일 수 있고,
@@ -240,9 +245,9 @@ function buildDashboardTurnPreambleUnmeasured(
     nativeStructureEnabled,
     ...(nativeTools !== undefined ? { enabledTools: nativeTools } : {}),
   }) as LLMMessage[]);
-  const concisenessSystemMsgs = timed(builderMs, 'conciseness', () => buildConcisenessSystemMessages(
-    ctx.userConfig.chat.conciseness,
-  ) as LLMMessage[]);
+  const concisenessSystemMsgs = timed(builderMs, 'conciseness', () => researchTurn
+    ? [] as LLMMessage[]
+    : buildConcisenessSystemMessages(ctx.userConfig.chat.conciseness) as LLMMessage[]);
   // ★ elanous 자기접근 규율 + 자기인지 ambient(P3 · 2026-07-13) — 텔레그램/디스코드
   //   (makeElanousAgentRunTurn)와 단일 출처(agent/self-ambient.ts). TUI 채팅에서도 미션
   //   진단("P2 왜 실패?")·자율 시스템 관측·회상이 규율+ambient+툴(self-ops family) 3박자로
@@ -313,10 +318,29 @@ function buildDashboardTurnPreambleUnmeasured(
   let taskNotificationCount = 0;
   try {
     timed(builderMs, 'taskNotifications', () => {
+      // ACP may ask for a preamble while the session is idle. Keep queued
+      // completion receipts for the next actual user/auto-wake turn.
+      if (!ctx.userText.trim()) return;
+      const notificationOnlyWake = /(?:^|\n)(?:Question: )?\[자동 재개\] 위임 끝: .+ \((?:done|error|aborted)\) — <task-notification> 의 결과를 읽고 이어서 처리$/u
+        .test(ctx.userText);
+      if (notificationOnlyWake) {
+        preamble.push({ role: 'system', content: '[알림 전용 턴] 이것은 완료 알림을 전달한 비요청 status receipt다. 작업 요청으로 취급하지 말고 Agent 또는 SelfImplement 위임을 시작하지 않는다. 포함된 결과를 바탕으로 한 번의 간결한 상태 요약만 답하고 멈춘다. 결과가 전달되지 않았다면 결과가 아직 제공되지 않았다고 알리고 내용을 추측하지 않는다.' });
+      }
       const pendingNotifications = globalTaskNotificationQueue.drain();
       taskNotificationCount = pendingNotifications.length;
-      const taskNotificationsXml = renderTaskNotificationsXml(pendingNotifications);
+      if (pendingNotifications.length === 0) {
+        if (notificationOnlyWake) {
+          debug.log('tui.notify', 'notification-only-turn', { notificationCount: 0, resultAvailable: false });
+        }
+        return;
+      }
+      const taskNotificationsXml = renderTaskNotificationsXml(pendingNotifications, {
+        statusReceipt: notificationOnlyWake,
+      });
       if (taskNotificationsXml) {
+        debug.log('tui.notify', notificationOnlyWake ? 'notification-only-turn' : 'notification-with-user-request', {
+          notificationCount: pendingNotifications.length,
+        });
         preamble.push({ role: 'user', content: taskNotificationsXml });
       }
     });

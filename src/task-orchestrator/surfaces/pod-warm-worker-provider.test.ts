@@ -85,7 +85,7 @@ test('named slots are independently reconciled and bounded by the measured host 
   const pods = new Map<string, any>();
   const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
   const provider = new WarmPodProvider({ candidates, controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: (args, input) => {
       if (args[4] === 'get' && args[5] === 'pods') return result({ items: [...pods.values()] });
       if (args[4] === 'create') {
@@ -118,7 +118,7 @@ test('named slots are independently reconciled and bounded by the measured host 
   expect(() => new WarmPodProvider({ candidates: [candidates[0]!, candidates[0]!],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64) })).toThrow();
   expect(() => new WarmPodProvider({ candidates: Array.from({ length: 5 }, (_, index) => ({
-    ...candidate, spec: { ...second, name: `warm-node-c-${index + 1}`, workerId: `node-c-uid-${index + 1}` },
+    ...candidate, spec: { ...second, name: 'warm-node-c-' + (index + 1), workerId: 'node-c-uid-' + (index + 1) },
   })), controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64) })).toThrow('quota');
 });
 
@@ -152,7 +152,7 @@ test('an old physical warm Pod consumes quota even when absent from configured c
   const calls: string[] = [];
   const provider = new WarmPodProvider({ candidates: [active],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => { calls.push(args[4]!); return {
       status: 0, stdout: JSON.stringify({ items: old }), stderr: '',
     }; },
@@ -172,7 +172,7 @@ test('a busy or unavailable first host lets the request lease a matching worker 
     const hosts: string[] = [];
     const provider = new WarmPodProvider({ candidates: [first, second],
       controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-      machineTokens: { node-c: '2'.repeat(64), 'elangram-wsl': '3'.repeat(64) },
+      machineTokens: { 'node-c': '2'.repeat(64), 'elangram-wsl': '3'.repeat(64) },
       kubectl: leaseKubectl([first.spec, second.spec]),
       fetch: async (_url, init) => {
         const body = JSON.parse(String(init?.body));
@@ -214,7 +214,7 @@ test('WARM-POD-PRODUCER-UID-FU: delayed install and competing prepares register 
   const pods: any[] = [];
   const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => {
       if (args[4] === 'get' && args[5] === 'pods') return result({ items: pods });
       if (args[4] === 'create') { created.push(prepareSpec.name); pods.push(createdPod); return result(createdPod); }
@@ -288,7 +288,7 @@ test('WARM-POD-PRODUCER-UID-FU: separate providers serialize the same host worke
   };
   const options = { candidates: [{ ...candidate, spec: prepareSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) }, kubectl, fetch, prepareLockDirectory: lockRoot };
+    machineTokens: { 'node-c': '2'.repeat(64) }, kubectl, fetch, prepareLockDirectory: lockRoot };
   try {
     const firstProvider = new WarmPodProvider(options);
     const secondProvider = new WarmPodProvider(options);
@@ -326,7 +326,7 @@ test('prepare lease wait is cancellable, records the reason, and kernel unlock p
   const result = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
   const providerOptions = (prepareAbortSignal?: AbortSignal) => ({
     candidates: [{ ...candidate, spec: prepareSpec }], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
     prepareLockDirectory: lockRoot, prepareAbortSignal,
     kubectl: (args: readonly string[], body?: string) => {
       if (args[4] === 'get' && args[5] === 'pods') return result({ items: [...pods.values()] });
@@ -390,7 +390,7 @@ test('prepare cancellation after acquiring the lease stops before Pod creation a
   const actions: string[] = [];
   const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) }, prepareAbortSignal: abort.signal,
+    machineTokens: { 'node-c': '2'.repeat(64) }, prepareAbortSignal: abort.signal,
     kubectl: args => { actions.push(args[4]!); return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' }; },
     fetch: async () => { preflightStarted(); await pause; return Response.json({ resources: [] }); },
   });
@@ -415,7 +415,7 @@ test('a failed kubectl wait backs off and its retry delay is cancellable', async
   const actions: string[] = [];
   const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) }, prepareAbortSignal: abort.signal,
+    machineTokens: { 'node-c': '2'.repeat(64) }, prepareAbortSignal: abort.signal,
     kubectl: args => {
       actions.push(args[4]!);
       if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: '{"items":[]}', stderr: '' };
@@ -439,7 +439,7 @@ test('an immediate kubectl wait failure retries after a bounded delay and regist
   let registrations = 0;
   const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => {
       actions.push(args[4]!);
       if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: '{"items":[]}', stderr: '' };
@@ -473,7 +473,7 @@ test('a Pod UID replaced during the Ready recheck is never registered', async ()
   let registrations = 0;
   const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => {
       actions.push(args[4]!);
       if (args[4] === 'get' && args[5] === 'pods') return result({ items: [] });
@@ -505,7 +505,7 @@ test('cold init beyond five minutes reaches Ready and registers its exact create
   const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
     now: () => clock,
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => {
       if (args[4] === 'get' && args[5] === 'pods') return result({ items: [] });
       if (args[4] === 'create') return result(createdPod);
@@ -538,7 +538,7 @@ test('Ready deadline leaves a created Pod unregistered for explicit recovery', a
   const controlPaths: string[] = [];
   const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => {
       actions.push(args[4]!);
       if (args[4] === 'get') return result({ items: [] });
@@ -567,7 +567,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
   const displacedCommands: string[] = [];
   const displaced = new WarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => {
       const action = args[4]!; displacedCommands.push(action);
       if (action === 'get' && args[5] === 'pods') return result({ items: [pod('old-uid')] });
@@ -580,7 +580,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
   let forgedKubectlCalls = 0;
   const unpinned = new WarmPodProvider({ candidates: [candidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: () => { forgedKubectlCalls++; return result({ items: [] }); },
   });
   expect(await unpinned.ensureStandingWorker(prepareCandidate)).toBe(false);
@@ -608,7 +608,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
     const calls: string[] = [];
     const refused = new WarmPodProvider({ candidates: [prepareCandidate],
       controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-      machineTokens: { node-c: '2'.repeat(64) },
+      machineTokens: { 'node-c': '2'.repeat(64) },
       kubectl: args => { calls.push(args[4]!); return result({ items: [changed] }); },
       fetch: async () => { throw new Error('mutated Pod reached the control plane'); },
     });
@@ -620,7 +620,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
   const registered: Array<{ path: string; authorization: string | null; body: any }> = [];
   const prepared = new WarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => {
       const action = args[4]!; commands.push(action);
       if (action === 'get' && args[5] === 'pods') {
@@ -651,7 +651,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
     let reads = 0;
     const conflicting = new WarmPodProvider({ candidates: [prepareCandidate],
       controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-      machineTokens: { node-c: '2'.repeat(64) },
+      machineTokens: { 'node-c': '2'.repeat(64) },
       kubectl: args => {
         actions.push(args[4]!);
         if (args[5] === 'pods') return result({ items: [] });
@@ -679,7 +679,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
   let foreignRegistrations = 0;
   const foreignIdentical = new WarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => result(args[5] === 'pods' ? { items: [pod('foreign-uid')] } : pod('foreign-uid')),
     fetch: async (_url, init) => {
       if (init?.method === 'POST') foreignRegistrations++;
@@ -694,7 +694,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
     const controlCalls: string[] = [];
     const repeated = new WarmPodProvider({ candidates: [prepareCandidate],
       controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-      machineTokens: { node-c: '2'.repeat(64) },
+      machineTokens: { 'node-c': '2'.repeat(64) },
       kubectl: args => {
         repeatCommands.push(args[4]!);
         const defaulted = { ...pod('new-uid'), spec: { ...(manifest.spec as object),
@@ -730,7 +730,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
   const wrongUidCalls: string[] = [];
   const wrongUid = new WarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => result(args[5] === 'pods' ? { items: [pod('new-uid')] } : pod('new-uid')),
     fetch: async (url, init) => {
       wrongUidCalls.push(`${init?.method} ${new URL(String(url)).pathname}`);
@@ -745,7 +745,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
   const legacyCalls: string[] = [];
   const legacyUid = new WarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => result(args[5] === 'pods' ? { items: [pod('new-uid')] } : pod('new-uid')),
     fetch: async (url, init) => {
       legacyCalls.push(`${init?.method} ${new URL(String(url)).pathname}`);
@@ -759,7 +759,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
   const expiredCalls: string[] = [];
   const expired = new WarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => result(args[5] === 'pods' ? { items: [pod('new-uid')] } : pod('new-uid')),
     fetch: async (url, init) => {
       expiredCalls.push(`${init?.method} ${new URL(String(url)).pathname}`);
@@ -773,7 +773,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
 
   const wrongTtl = new WarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => result(args[5] === 'pods' ? { items: [pod('new-uid')] } : pod('new-uid')),
     fetch: async () => Response.json({ resources: [{ kind: 'pod-worker-lease', machine: 'node-c',
       name: prepareSpec.workerId, observedAt: Date.now(), ttlMs: 60_000,
@@ -783,7 +783,7 @@ test('standing producer refuses a replaced Pod without create/delete and registe
 
   const future = new WarmPodProvider({ candidates: [prepareCandidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-    machineTokens: { node-c: '2'.repeat(64) },
+    machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: args => result(args[5] === 'pods' ? { items: [pod('new-uid')] } : pod('new-uid')),
     fetch: async () => Response.json({ resources: [{ kind: 'pod-worker-lease', machine: 'node-c',
       name: prepareSpec.workerId, observedAt: Date.now() + 60_000, ttlMs: 30 * 60_000,
@@ -806,7 +806,7 @@ test('real control GET keeps a matching Pod preparation idempotent with one regi
     let registrations = 0;
     const provider = new WarmPodProvider({ candidates: [{ ...candidate, spec: prepareSpec }],
       controlUrl: `${server.url}/`, memberToken: ensureControlTokens(root).member,
-      machineTokens: { node-c: issueMemberToken('node-c', root) },
+      machineTokens: { 'node-c': issueMemberToken('node-c', root) },
       kubectl: args => {
         const result = args[5] === 'pods' ? { items: created ? [pod] : [] } : pod;
         if (args[4] === 'create') created = true;
@@ -826,7 +826,7 @@ test('real control GET keeps a matching Pod preparation idempotent with one regi
 test('provider retains the lease through gate comparison, then releases and machine-sanitizes it', async () => {
   const calls: Array<{ path: string; token: string; body: any }> = [];
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: leaseKubectl(),
     fetch: async (url, init) => {
       const path = new URL(String(url)).pathname;
@@ -854,7 +854,7 @@ test('provider retains the lease through gate comparison, then releases and mach
 test('a sanitize failure followed by the gate fallback quarantines one lease only once', async () => {
   const paths: string[] = [];
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, kubectl: leaseKubectl(),
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, kubectl: leaseKubectl(),
     fetch: async (url) => {
       const path = new URL(String(url)).pathname;
       paths.push(path);
@@ -875,7 +875,7 @@ test('concurrent quarantine callers share one fenced lease transition', async ()
   let releaseQuarantine: (() => void) | undefined;
   const quarantinePause = new Promise<void>(resolve => { releaseQuarantine = resolve; });
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, kubectl: leaseKubectl(),
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, kubectl: leaseKubectl(),
     fetch: async (url) => {
       const path = new URL(String(url)).pathname;
       paths.push(path);
@@ -895,7 +895,7 @@ test('concurrent quarantine callers share one fenced lease transition', async ()
 test('a failed quarantine transition can retry the same lease', async () => {
   let quarantineCalls = 0;
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, kubectl: leaseKubectl(),
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, kubectl: leaseKubectl(),
     fetch: async (url) => {
       const path = new URL(String(url)).pathname;
       if (path === '/v1/leases/pod-worker') return Response.json(lease());
@@ -1091,7 +1091,7 @@ test('WARM-REUSE-TIME-PAIRS: production --reconcile wires pairingGateFile and ec
       candidates: [{ host: 'node-c', tier: 'standard', spec: prepareSpec }],
       controlUrl: 'http://127.0.0.1:31413/',
       memberToken: '1'.repeat(64),
-      machineTokens: { node-c: '2'.repeat(64) },
+      machineTokens: { 'node-c': '2'.repeat(64) },
       pairingGateFile: gateFile,
     }), { mode: 0o600 });
     // The private config path is the real production loadWarmPodProvider call chain; kubectl
@@ -1109,7 +1109,7 @@ test('WARM-REUSE-TIME-PAIRS: production --reconcile wires pairingGateFile and ec
     const legs = lines[1]?.warmReuseTimeLegs;
     expect(Array.isArray(legs)).toBe(true);
     expect(legs.length).toBe(1);
-    expect(legs[0]).toMatchObject({ gateKey: `${gateFile}/${prepareSpec.cutSha}/node-c`, leg: 'cold',
+    expect(legs[0]).toMatchObject({ gateKey: gateFile + '/' + prepareSpec.cutSha + '/node-c', leg: 'cold',
       file: gateFile, commit: prepareSpec.cutSha, host: 'node-c', reuse: false, podUid: '', success: false });
     expect(legs[0].totalDurationMs).toBe(legs[0].prepareDurationMs);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -1125,7 +1125,7 @@ test('WARM-REUSE-TIME-PAIRS: production --pairs joins the cold CLI leg persisted
       candidates: [{ host: 'node-c', tier: 'standard', spec: prepareSpec }],
       controlUrl: 'http://127.0.0.1:31413/',
       memberToken: '1'.repeat(64),
-      machineTokens: { node-c: '2'.repeat(64) },
+      machineTokens: { 'node-c': '2'.repeat(64) },
       pairingGateFile: gateFile,
     }), { mode: 0o600 });
     // NODE_ENV is dropped so the child boots the production log store instead of the test-disabled one.
@@ -1141,7 +1141,7 @@ test('WARM-REUSE-TIME-PAIRS: production --pairs joins the cold CLI leg persisted
     expect({ status: query.status, stderr: query.stderr }).toEqual({ status: 0, stderr: '' });
     const rows = JSON.parse(query.stdout.trim()).warmReuseTimePairs;
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toEqual({ gateKey: `${gateFile}/${prepareSpec.cutSha}/node-c`, file: gateFile,
+    expect(rows[0]).toEqual({ gateKey: gateFile + '/' + prepareSpec.cutSha + '/node-c', file: gateFile,
       commit: prepareSpec.cutSha, host: 'node-c',
       cold: { file: gateFile, commit: prepareSpec.cutSha, host: 'node-c', reuse: false, podUid: '', success: false,
         prepareDurationMs: rows[0].cold.prepareDurationMs, totalDurationMs: rows[0].cold.prepareDurationMs },
@@ -1173,7 +1173,7 @@ test('WARM-REUSE-TIME-PAIRS: unset pairingGateFile skips the cold measurement ro
     const provider = new WarmPodProvider({ candidates: [{ ...candidate,
       spec: { ...spec, nodeName: 'pool-node-c-server-0' } }],
       controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
-      machineTokens: { node-c: '2'.repeat(64) },
+      machineTokens: { 'node-c': '2'.repeat(64) },
       kubectl: () => ({ status: 1, stdout: '', stderr: 'unavailable' }) });
     expect(await provider.prepareWorker(spec.workerId)).toBe(false);
     // No unpaired `file: ''` row may reach the pairing store or the ledger when the gate file is unset.
@@ -1227,7 +1227,7 @@ const pairingFixture = () => {
     return Response.json({});
   };
   const base = { candidates: [{ ...candidate, spec: prepareSpec }], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) }, now: () => clock,
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, now: () => clock,
     kubectl, fetch: fetch as typeof globalThis.fetch };
   // The warm leg's exec takes 300ms on the already-standing Pod.
   const transport = () => ({ request: async () => { clock += 300;
@@ -1253,7 +1253,7 @@ test('WARM-REUSE-TIME-PAIRS: separate cold and warm provider processes pair into
     // Neither process holds the pair in memory; the read-only reader joins the shared rows.
     const pairs = readWarmReuseTimePairs(store);
     expect(pairs).toHaveLength(1);
-    expect(pairs[0]).toEqual({ gateKey: `${gateFile}/${spec.cutSha}/node-c`, file: gateFile,
+    expect(pairs[0]).toEqual({ gateKey: gateFile + '/' + spec.cutSha + '/node-c', file: gateFile,
       commit: spec.cutSha, host: 'node-c',
       cold: { file: gateFile, commit: spec.cutSha, host: 'node-c', reuse: false, podUid: 'new-uid',
         success: true, prepareDurationMs: 5_000, totalDurationMs: 5_000 },
@@ -1303,7 +1303,7 @@ test('WARM-REUSE-TIME-PAIRS: pairing joins only the same file·commit·host and 
 test('standing Pod preparation refuses a candidate without a pinned node', async () => {
   let calls = 0;
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { node-c: '2'.repeat(64) },
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
     fetch: async () => { calls++; throw new Error('unexpected control call'); },
   });
   expect(await provider.ensureStandingWorker(candidate)).toBe(false);

@@ -25,7 +25,7 @@ import { drainPendingUserInput } from '../session/pending-input.js';
 import type { StreamWithToolsHandlers } from '../llm.js';
 import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
 import { applyDeferredTools } from '../session-runtime/tier-flip.js';
-import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
+import { buildResearchDateSystemMessage, resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import type {
   CoreTurnContext,
   CoreTurnResult,
@@ -239,12 +239,18 @@ export async function runCoreTurn(
   // 있으면 그 스코프의 deferred 툴을 active 로 선주입(ToolSearch 왕복 0).
   const recentUserText = extractRecentUserText(ctx.messages);
   const surfaceUserText = selectSurfaceUserText(ctx);
-  const surface = resolveSessionSurfaceProfile({ userText: surfaceUserText });
+  const surface = ctx.surfaceProfile ?? resolveSessionSurfaceProfile({ userText: surfaceUserText });
   const { messages, tools, stats } = applyDeferredTools(
     ctx.messages,
     ctx.tools,
     { enabled: deferredEnabled, ...(recentUserText ? { userText: recentUserText } : {}) },
   );
+  if (surface.id === 'research/agent' && !messages.some((message) =>
+    message.role === 'system' && typeof message.content === 'string'
+      && message.content.startsWith('Current local date:'))
+  ) {
+    messages.unshift(buildResearchDateSystemMessage());
+  }
   if (debug.enabled) {
     debug.log('llm.request', 'tools-tier', {
       sessionId: ctx.sessionId,
@@ -282,6 +288,7 @@ export async function runCoreTurn(
       handlers,
       {
         tools,
+        researchTurn: surface.id === 'research/agent',
         signal: ctx.signal,
         ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
         ...(ctx.maxToolTurns !== undefined ? { maxTurns: ctx.maxToolTurns } : {}),

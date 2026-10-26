@@ -5,6 +5,7 @@
  * 판정: `docs/reports/gate-0226-failure-census.tsv`가 accepted 실패 ID 96건을 중복 없이 보존하고,
  * 그중 `provider-intake` 6건(첫 감소 칸 GATE-0226-PROVIDER-INTAKE6)을 제외한 90건이 정확히 남으며,
  * `Error: no ACP` 로그 사건(34회)은 실패 ID로 더해지지 않았음. 보고서 md의 96행 색인과 선언 카운트도 실측과 일치.
+ * intake 제외 90개 ID는 변경 전 `44fe14face` TSV에서 고정한 accepted 목록과 집합 비교한다.
  *
  * 사용: bun run scripts/gate-0226-failure-census.ts [--tsv <path>] [--report <path>] [--accepted <path|none>] [--json] [--write-repair-card]
  *
@@ -17,6 +18,7 @@ import { join, resolve } from 'node:path';
 export const CENSUS_TSV = 'docs/reports/gate-0226-failure-census.tsv';
 export const CENSUS_REPORT = 'docs/reports/REPORT-gate-0226-failure-census.md';
 export const DEFAULT_ACCEPTED = 'elanous-hq/seat-state/OP/tools/accepted-0226.json';
+export const DEFAULT_REMAINING_BASELINE = 'scripts/gate-0226-accepted-remaining-90.txt';
 
 export const EXPECTED_HEADER = [
   'no',
@@ -108,6 +110,7 @@ export type CensusAudit = {
   remainingIds: string[];
   acpLogEvents: number;
   ledger: { path: string; status: 'compared' | 'skipped' | 'failed'; ids: number };
+  remainingBaseline: { path: string; status: 'compared' | 'failed'; ids: number };
 };
 
 /** RFC4180 형식의 탭 구분 표를 읽는다. 실패 ID 안의 따옴표·탭·개행을 보존한다. */
@@ -259,6 +262,9 @@ export type AuditInput = {
   reportText: string;
   /** accepted 원장 ID. null 이면 비교 불가(원장 부재)를 산출로 남긴다. */
   acceptedIds: string[] | null;
+  /** 변경 전 독립 기준으로 고정한 remaining accepted ID 집합. */
+  remainingBaselineIds: string[] | null;
+  remainingBaselinePath: string;
   ledgerPath: string;
   ledgerRequired: boolean;
 };
@@ -355,6 +361,10 @@ export function auditCensus(input: AuditInput): CensusAudit {
     problems.push(`no-test-deletion-proposed: 근거 없이 시험 삭제를 제안한 행 ${deletionProposals.length}건 (${deletionProposals.slice(0, 6).join(',')})`);
   }
 
+  if (!input.reportText.includes('## 90건 후속 조사와 남은 수리 칸')) {
+    problems.push('report-follow-up: 90건 후속 조사·상태·주인 근거 절이 없다');
+  }
+
   const index = parseReportIndex(input.reportText);
   if (index.length !== rows.length) {
     problems.push(`report-index-parity: 보고서 색인 ${index.length}행 / TSV ${rows.length}행`);
@@ -386,6 +396,27 @@ export function auditCensus(input: AuditInput): CensusAudit {
     problems.push(`report-counts: 보고서가 \`${NO_ACP_MARKER}\` ${ACP_LOG_EVENTS}회 · 겹침 0건 배제를 명시하지 않는다`);
   }
 
+  let remainingBaseline: CensusAudit['remainingBaseline'];
+  if (input.remainingBaselineIds === null) {
+    problems.push(`remaining-baseline: 고정 기준 파일이 없다 (${input.remainingBaselinePath})`);
+    remainingBaseline = { path: input.remainingBaselinePath, status: 'failed', ids: 0 };
+  } else {
+    const baselineIds = input.remainingBaselineIds;
+    const baseline = new Set(baselineIds);
+    const actual = new Set(remainingIds);
+    const missing = [...baseline].filter((id) => !actual.has(id));
+    const extra = [...actual].filter((id) => !baseline.has(id));
+    if (baseline.size !== REMAINING_IDS || baseline.size !== baselineIds.length) {
+      problems.push(`remaining-baseline: 고정 기준은 중복 없이 ${REMAINING_IDS} ID여야 한다 (행 ${baselineIds.length} / 고유 ${baseline.size})`);
+    }
+    if (missing.length > 0 || extra.length > 0 || baseline.size !== actual.size) {
+      problems.push(`remaining-baseline: 기준 ${baseline.size}건 / TSV ${actual.size}건 · 누락 ${missing.length}${missing.length ? ` (${missing.slice(0, 3).join(' | ')})` : ''} · 추가 ${extra.length}${extra.length ? ` (${extra.slice(0, 3).join(' | ')})` : ''}`);
+      remainingBaseline = { path: input.remainingBaselinePath, status: 'failed', ids: baseline.size };
+    } else {
+      remainingBaseline = { path: input.remainingBaselinePath, status: 'compared', ids: baseline.size };
+    }
+  }
+
   let ledger: CensusAudit['ledger'];
   if (input.acceptedIds === null) {
     if (input.ledgerRequired) {
@@ -414,6 +445,7 @@ export function auditCensus(input: AuditInput): CensusAudit {
     remainingIds,
     acpLogEvents: acpAttributed.length,
     ledger,
+    remainingBaseline,
   };
 }
 
@@ -425,6 +457,7 @@ export function renderText(audit: CensusAudit): string {
   lines.push(`repair-cards: ${Object.entries(audit.counts.repair).map(([key, value]) => `${key}=${value}`).join(' ')}`);
   lines.push(`no-acp: ${audit.acpLogEvents} (로그 ${ACP_LOG_EVENTS}회 사건은 실패 ID가 아니다)`);
   lines.push(`accepted-ledger: ${audit.ledger.status} ${audit.ledger.path}${audit.ledger.status === 'skipped' ? ' (원장 부재 — 원장 대조 미실시)' : ''}`);
+  lines.push(`remaining-baseline: ${audit.remainingBaseline.status} ${audit.remainingBaseline.path} (${audit.remainingBaseline.ids})`);
   for (const problem of audit.problems) lines.push(`FAIL ${problem}`);
   lines.push(audit.ok ? 'census: PASS' : `census: FAIL (${audit.problems.length})`);
   return lines.join('\n');
@@ -491,10 +524,16 @@ export function main(argv: string[] = process.argv.slice(2), cwd: string = proce
     process.stdout.write(`repair-card: ${rewritten}행 재계산 → ${options.tsv}\n`);
   }
   const acceptedIds = options.accepted ? readAcceptedIds(options.accepted) : null;
+  const remainingBaselinePath = resolve(cwd, DEFAULT_REMAINING_BASELINE);
+  const remainingBaselineIds = existsSync(remainingBaselinePath)
+    ? readFileSync(remainingBaselinePath, 'utf8').split(/\r?\n/).filter((line) => line.length > 0 && !line.startsWith('#'))
+    : null;
   const audit = auditCensus({
     tsvText: readFileSync(options.tsv, 'utf8'),
     reportText: readFileSync(options.report, 'utf8'),
     acceptedIds,
+    remainingBaselineIds,
+    remainingBaselinePath: DEFAULT_REMAINING_BASELINE,
     ledgerPath: options.accepted ?? 'none',
     ledgerRequired: options.acceptedExplicit && options.accepted !== null,
   });

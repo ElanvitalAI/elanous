@@ -143,7 +143,7 @@ test('an ignored gate event reports that the traffic reduction was not applied',
       ELANOUS_GRAPH_CONTEXT: JSON.stringify(stale), ELANOUS_STATE_DIR: root,
     }, {
       options: { trafficFile }, report: (body) => reports.push(body),
-    })).toBe(0);
+    })).toBe(1);
     expect(reports).toHaveLength(1);
     expect(reports[0]).toContain('stale-run');
     expect(reports[0]).toContain('different-run-is-current');
@@ -158,8 +158,8 @@ test('a same-version retry replaces an incomplete gate run and rejects its late 
     global: 'yellow',
     seats: Object.fromEntries(['OP', 'TC', 'MK', 'UX'].map((seat) => [seat, { perCycle: 8 }])),
   } satisfies TrafficFile));
-  const prior: GraphContext = { runId: 'first-attempt', startedAt: '2026-10-19T00:00:00.000Z', input: { version: '0.2.34-rc.2', previousVersion: '0.2.33' }, outputs: {} };
-  const retry: GraphContext = { runId: 'retry-attempt', startedAt: '2026-10-19T01:00:00.000Z', input: { version: '0.2.34-rc.2', previousVersion: '0.2.33' }, outputs: {} };
+  const prior: GraphContext = { runId: 'first-attempt', startedAt: '2026-10-19T00:00:00.000Z', input: { version: '0.2.34-rc.2', previousVersion: '0.2.33' }, outputs: { 'npm-publish': { outcome: 'ok' } } };
+  const retry: GraphContext = { runId: 'retry-attempt', startedAt: '2026-10-19T01:00:00.000Z', input: { version: '0.2.34-rc.2', previousVersion: '0.2.33' }, outputs: { 'npm-publish': { outcome: 'ok' } } };
   try {
     expect(await applyReleaseTrafficEvent(prior, 'gate-passed', { trafficFile }))
       .toMatchObject({ applied: true, stage: 1 });
@@ -244,7 +244,7 @@ test('a verified run recovers traffic after OP clears an earlier gate write lock
   } satisfies TrafficFile));
   const current: GraphContext = {
     nodeId: 'traffic-verify-complete', runId: 'verified-attempt', startedAt: '2026-10-19T01:00:00.000Z',
-    input: { version: '0.2.34-rc.2', previousVersion: '0.2.33' }, outputs: {},
+    input: { version: '0.2.34-rc.2', previousVersion: '0.2.33' }, outputs: { 'npm-publish': { outcome: 'ok' } },
   };
   const reports: string[] = [];
   try {

@@ -1,5 +1,6 @@
 /** HQ same-PR repair launch and result collection; the reviewed head is the sole source of truth. */
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -13,13 +14,14 @@ import { applyRepairBundle, type RepairCasOutcome, type RepairCasRequest } from 
 import { pairMoveId, repairNextMove } from './repair-next-move.js';
 import type { SupervisorGoalDeficit } from '../self-implement/goal-supervisor-fill.js';
 import { loadRunLedger, type RunLedgerEntry } from '../self-implement/run-ledger.js';
-import { parseRepairWorkerResult } from './repair-worker.js';
+import { parseRepairWorkerResult, repairFailureSignature } from './repair-worker.js';
 import { TASK_SEATS, readTaskCard, updateTaskCard, type TaskCard, type TaskChildLlm, type TaskSeat } from './task-hand.js';
 
 const WAIT_MS = 90 * 60_000;
 const ESCALATE_MS = 6 * 60 * 60_000;
 const ALERT_CLAIM_STALE_MS = 10 * 60_000;
 const safe = (value: string) => value.replace(/[^A-Za-z0-9._-]/g, '_');
+const reviewSignature = (mustFix: readonly string[]) => createHash('sha256').update(JSON.stringify(mustFix)).digest('hex');
 
 export interface RepairLaunchRequest {
   card: string; pr: number; head: string; repo: string; resultPath: string;
@@ -108,9 +110,9 @@ export async function repairModelAvailability(readInputs: () => Promise<Pick<Bud
 export function alternateRepairModel(card: TaskCard, availability: RepairModelAvailability = { codexSubscription: false, grokSubscription: false }): { from: string; to: TaskChildLlm } {
   const last = card.repairs?.at(-1);
   const from = last?.toModel ?? (card.childLlm ? `${card.childLlm.provider}/${card.childLlm.model}` : 'unknown');
-  // The Pod's named ZAI subscription is the primary GLM route. A failed
-  // glm-5.3 repair must never be retried with the smaller flash model.
-  const glm: TaskChildLlm = { provider: 'glm', model: 'glm-5.3' };
+  // Pin the full model route; a bare glm-5.3 can be ambiguous in the Pod review path.
+  // A failed full GLM repair must never be retried with the smaller flash model.
+  const glm: TaskChildLlm = { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' };
   const sol: TaskChildLlm = { provider: 'openai-codex', model: 'gpt-6-sol' };
   const grok: TaskChildLlm = { provider: 'grok', model: 'grok-4.6' };
   const tier = card.tier ?? '중';
@@ -275,6 +277,8 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
       }
     }
     const status = applied?.ok ? 'applied' : applied?.unconfirmed ? 'unconfirmed' : 'failed';
+    const failureSignature = status === 'failed' && !result.ok
+      ? result.failureSignature ?? repairFailureSignature(result.reason ?? '') : null;
     // NEXTMOVE-GENERAL-RELAUNCH-MOVEID — 결과 파일의 수 id 를 카드(발사 순간 적은 값)와 짝짓는다. 못 짝지으면 관측만(소비는 그대로).
     const pairing = pairMoveId(latest.moveId, result.moveId);
     if (pairing.kind === 'unpaired') try { debug.log('task-agent', 'move-id-unpaired', { card: card.id, pr, head: latest.head,
@@ -282,13 +286,16 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
     const pairedMoveId = pairing.kind === 'paired' ? { moveId: pairing.moveId } : {};
     try { debug.log('task-agent', 'repair-attempt-result', { card: card.id, pr, head: latest.head,
       runId: latest.runId, failureType: status === 'applied' || status === 'unconfirmed' ? null : result.ok ? 'artifact-or-cas' : 'worker',
-      model: latest.toModel, resultPath: latest.resultPath, artifactDir: result.artifactDir ?? null, status, detail });
+      model: latest.toModel, resultPath: latest.resultPath, artifactDir: result.artifactDir ?? null, status, detail,
+      ...(result.gateFailureTests ? { gateFailureTests: result.gateFailureTests } : {}) });
     } catch { /* diagnostics cannot change the result */ }
     try {
       updateTaskCard(statePath, card.id, (current) => current?.repairs?.some((entry) => entry.runId === latest.runId
         && (entry.status === 'requested' || (claimedThisCycle && entry.status === 'unconfirmed' && entry.commit === result?.result?.commit)))
         ? { ...current, repairs: current.repairs.map((entry) => entry.runId === latest.runId
-          ? { ...entry, status, detail, ...(result?.result && status === 'unconfirmed' ? { commit: result.result.commit,
+          ? { ...entry, status, detail, ...(failureSignature ? { failureSignature } : {}),
+            ...(failureSignature?.startsWith('gate:') && result.gateFailureTests ? { gateFailureTests: result.gateFailureTests } : {}),
+            ...(result?.result && status === 'unconfirmed' ? { commit: result.result.commit,
             bundleSha256: result.result.bundleSha256, bundlePath: join(resolve(result.artifactDir!), 'commit.bundle') } : {}),
             ...(applied?.ok ? { commit: applied.toHead } : {}) } : entry),
           history: [...(current.history ?? []), { at: now.toISOString(), event: 'repair-result', pr, head: latest.head,
@@ -428,10 +435,61 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
     return { decision: 'would-repair', reason };
   }
   const next = attempts.length + 1;
-  const runId = mintRunId();
   // 결정 순간 만든 수 id — 아래 발사·카드·관측이 «이 값»만 쓴다(다시 만들지 않는다).
   const moveId = judged.moveId;
   const { from, to } = alternateRepairModel(card, availability);
+  const nextModel = `${to.provider}/${to.model}`;
+  const repeatSignature = latest?.status === 'failed' && latest.head.toLowerCase() === head.toLowerCase()
+    && latest.reviewSignature === reviewSignature(input.mustFix) && latest.failureSignature
+    && (latest.failureSignature.startsWith('gate:sha256:')
+      || latest.failureSignature.startsWith('provider:ambiguous-primary:') && latest.toModel === nextModel)
+    ? latest.failureSignature : null;
+  if (repeatSignature) {
+    const prior = latest!;
+    const tests = prior.gateFailureTests?.slice(0, 4).join(' | ');
+    const reason = `same PR/head/review deterministic repair failure ${repeatSignature}; owner repair required${tests ? ` · ${tests}` : ''}`;
+    let recorded = false;
+    updateTaskCard(statePath, card.id, (current) => {
+      if (!current || current.status !== 'launched' || !current.repairs?.some((entry) =>
+        entry.runId === prior.runId && entry.status === 'failed' && entry.failureSignature === repeatSignature
+        && entry.reviewSignature === prior.reviewSignature)
+        || current.history?.some((entry) => entry.event === 'repair-signature-repeat-stopped' && entry.pr === pr
+          && entry.head?.toLowerCase() === head.toLowerCase() && entry.runId === prior.runId)) return undefined;
+      recorded = true;
+      return { ...current, status: 'failed', history: [...(current.history ?? []),
+        { at: now.toISOString(), event: 'repair-signature-repeat-stopped', pr, head, runId: prior.runId, detail: reason }] };
+    });
+    if (recorded) try { debug.log('task-agent', 'repair-signature-repeat-stopped', { card: card.id, pr, head,
+      signature: repeatSignature, priorRunId: prior.runId, skippedRelaunch: true }); } catch { /* fail-soft */ }
+    let notifyClaimed = false;
+    updateTaskCard(statePath, card.id, (current) => {
+      const history = current?.history ?? [];
+      const lastAlert = history.filter((entry) => entry.runId === prior.runId && entry.event.startsWith('repair-repeat-owner-')).at(-1);
+      const staleClaim = lastAlert?.event === 'repair-repeat-owner-claimed'
+        && now.getTime() - Date.parse(lastAlert.at) >= ALERT_CLAIM_STALE_MS;
+      if (!current || !history.some((entry) => entry.event === 'repair-signature-repeat-stopped'
+        && entry.pr === pr && entry.head?.toLowerCase() === head.toLowerCase() && entry.runId === prior.runId)
+        || lastAlert && lastAlert.event !== 'repair-repeat-owner-failed' && !staleClaim) return undefined;
+      notifyClaimed = true;
+      return { ...current, history: [...history,
+        { at: now.toISOString(), event: 'repair-repeat-owner-claimed', pr, head, runId: prior.runId, detail: reason }] };
+    });
+    if (notifyClaimed) {
+      let event = 'repair-repeat-owner-sent';
+      let detail = reason;
+      try {
+        (input.notify ?? defaultNotify)(owner.seat, `${reason} · card ${card.id} · owner ${owner.seat} via ${owner.source}`);
+      } catch (error) {
+        event = 'repair-repeat-owner-failed';
+        detail = `${reason} · ${String(error).slice(0, 200)}`;
+      }
+      updateTaskCard(statePath, card.id, (current) => current?.history?.some((entry) =>
+        entry.event === 'repair-repeat-owner-claimed' && entry.runId === prior.runId)
+        ? { ...current, history: [...current.history, { at: now.toISOString(), event, pr, head, runId: prior.runId, detail }] } : undefined);
+    }
+    return { decision: 'repair-stopped', reason };
+  }
+  const runId = mintRunId();
   const resultPath = repairResultPath(statePath, card.id, pr, head, next, runId);
   const goalFile = resultPath.replace(/\.json$/, '.goal.txt');
   const goal = `기존 PR #${pr}의 리뷰 때 head ${head}를 같은 가지에서 수리한다. 새 PR을 열지 말고 아래 must-fix 원문만 고쳐 commit-only 결과를 반환한다.\n\n${input.mustFix.map((item, i) => `${i + 1}. ${item}`).join('\n')}`;
@@ -442,7 +500,8 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
     if (!current || current.status !== 'launched' || (current.repairs ?? []).length !== (card.repairs ?? []).length) return undefined;
     claimed = true;
     return { ...current, repairs: [...(current.repairs ?? []), { pr, head, branch, at: now.toISOString(),
-      move: judged.judgement.move, moveId, runId, resultPath, fromModel: from, toModel: `${to.provider}/${to.model}`, status: 'requested' }],
+      move: judged.judgement.move, moveId, runId, resultPath, fromModel: from, toModel: `${to.provider}/${to.model}`,
+      reviewSignature: reviewSignature(input.mustFix), status: 'requested' }],
       history: [...(current.history ?? []), { at: now.toISOString(), event: 'repair-launched', pr, head, runId,
         effect: judged.judgement.move, moveId, detail: `source pr:${pr} · owner ${owner.seat} via ${owner.source} · must-fix ${input.mustFix.length} · childLlm ${from} → ${to.provider}/${to.model}` }] };
   });

@@ -53,12 +53,20 @@ function printedVerdict(output: unknown): boolean {
   });
 }
 
-/** The only post-gate detour allowed before the terminal failure is the executed, release-only triage shadow. */
-function failedAfterGate(state: GraphRunState, index: number): boolean {
+/** A failed release may execute its warning-only traffic restore before the terminal failure. */
+function failedAfterTrafficRestore(state: GraphRunState, index: number): boolean {
   if (state.nodes.length !== state.path.length || state.path.at(-1) !== 'failed' || state.nodes.at(-1)?.nodeId !== 'failed') return false;
   if (index === state.path.length - 2) return true;
-  return index === state.path.length - 3 && state.path[index + 1] === 'gate-triage'
-    && state.nodes[index + 1]?.nodeId === 'gate-triage' && state.nodes[index + 1]?.executed === true;
+  return index === state.path.length - 3 && state.path[index + 1] === 'traffic-failed-restore'
+    && state.nodes[index + 1]?.nodeId === 'traffic-failed-restore' && state.nodes[index + 1]?.executed === true;
+}
+
+/** Gate may also pass through its executed triage shadow before the traffic restore. */
+function failedAfterGate(state: GraphRunState, index: number): boolean {
+  if (failedAfterTrafficRestore(state, index)) return true;
+  return state.path[index + 1] === 'gate-triage'
+    && state.nodes[index + 1]?.nodeId === 'gate-triage' && state.nodes[index + 1]?.executed === true
+    && failedAfterTrafficRestore(state, index + 1);
 }
 
 export function gateUnmeasuredDetail(state: GraphRunState, index: number): string | undefined {
@@ -113,7 +121,7 @@ export function releaseResumeWaiver(
   }
   if (!unique || state.path.lastIndexOf(opts.waive) !== index || state.nodes[index]?.nodeId !== opts.waive || state.nodes[index]?.ok !== false ||
     state.nodes[index]?.executed !== true || (opts.waive === 'gate' ? !failedAfterGate(state, index)
-      : state.path.at(-2) !== opts.waive || state.path.at(-1) !== 'failed' || state.nodes.at(-1)?.nodeId !== 'failed')) {
+      : !failedAfterTrafficRestore(state, index))) {
     throw new Error(`--waive ${opts.waive} requires the failed executable node on the saved path`);
   }
   // Only user-visible, non-publication checks can become accepted regressions; build, safety and approval gates stay blocking.

@@ -31,6 +31,19 @@ function writeConfig(value: unknown): void {
   writeFileSync(configPath, JSON.stringify(value));
 }
 
+test('tui.sidetab validates values and survives config save', () => {
+  writeConfig({ tui: { sidetab: 'open', role: 'contributor', showBeta: true } });
+  const cfg = buildUserConfig(configPath);
+  expect(cfg.tui?.sidetab).toBe('open');
+  saveUserConfig(cfg, configPath);
+  const roundTripped = buildUserConfig(configPath);
+  expect(roundTripped.tui?.sidetab).toBe('open');
+  const persistedTui = JSON.parse(readFileSync(configPath, 'utf8')).tui;
+  expect(persistedTui).toEqual({ sidetab: 'open', role: 'contributor', showBeta: true });
+  writeConfig({ tui: { sidetab: 'invalid' } });
+  expect(buildUserConfig(configPath).tui?.sidetab).toBe('collapsed');
+});
+
 test('taskAgent.rejudgeMaxAgeHours accepts a positive finite number and drops invalid values', () => {
   writeConfig({ taskAgent: { rejudgeMaxAgeHours: 48 } });
   expect(buildUserConfig(configPath).taskAgent?.rejudgeMaxAgeHours).toBe(48);

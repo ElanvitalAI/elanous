@@ -94,25 +94,26 @@ async function say(root: ReactTestInstance, prompt: string) {
 }
 
 describe('GRAPH-WIZARD chat ↔ real canvas', () => {
-  // No DOM in this repo's `bun test`: ReactFlow only needs a window that takes listeners. Restored after each test.
+  // ReactFlow's d3 transition may run after unmount. Keep the DOM shims until
+  // its scheduled work settles, then restore the exact previous globals.
   const g = globalThis as Record<string, unknown>;
-  let hadWindow = false;
-  let hadResize = false;
-  let hadRaf = false;
+  const keys = ['IS_REACT_ACT_ENVIRONMENT', 'window', 'ResizeObserver', 'requestAnimationFrame', 'SVGElement'] as const;
+  let originals: Map<string, PropertyDescriptor | undefined>;
   beforeEach(() => {
+    originals = new Map(keys.map((key) => [key, Object.getOwnPropertyDescriptor(g, key)]));
     g.IS_REACT_ACT_ENVIRONMENT = true;
-    hadWindow = 'window' in g;
-    hadRaf = 'requestAnimationFrame' in g;
-    if (!hadRaf) g.requestAnimationFrame = (fn: () => void) => setTimeout(fn, 0);
-    hadResize = 'ResizeObserver' in g;
-    if (!hadResize) g.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
-    if (!hadWindow) g.window = { setTimeout, clearTimeout, requestAnimationFrame: (fn: () => void) => setTimeout(fn, 0), cancelAnimationFrame: (id: number) => clearTimeout(id), addEventListener: noop, removeEventListener: noop, devicePixelRatio: 1, matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }) };
+    if (typeof g.requestAnimationFrame !== 'function') g.requestAnimationFrame = (fn: () => void) => setTimeout(fn, 0);
+    if (typeof g.ResizeObserver !== 'function') g.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+    if (typeof g.SVGElement !== 'function') g.SVGElement = class SVGElementStub {};
+    g.window = { setTimeout, clearTimeout, requestAnimationFrame: (fn: () => void) => setTimeout(fn, 0), cancelAnimationFrame: (id: number) => clearTimeout(id), addEventListener: noop, removeEventListener: noop, devicePixelRatio: 1, matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }) };
   });
-  afterEach(() => {
-    delete g.IS_REACT_ACT_ENVIRONMENT;
-    if (!hadWindow) delete g.window;
-    if (!hadResize) delete g.ResizeObserver;
-    if (!hadRaf) delete g.requestAnimationFrame;
+  afterEach(async () => {
+    await Bun.sleep(850);
+    for (const key of keys) {
+      const previous = originals.get(key);
+      if (previous && !('value' in previous && previous.value === undefined)) Object.defineProperty(g, key, previous);
+      else delete g[key];
+    }
   });
 
   test('unit card click opens its breadcrumb and group box while the folded view rejects edits', async () => {
@@ -123,7 +124,7 @@ describe('GRAPH-WIZARD chat ↔ real canvas', () => {
     graph = { ...graph, nodes: graph.nodes.map((node) => ({ ...node, extra: { group: node.id === 'ship' ? 'delivery' : 'work' } })) };
     let current: GraphCanvasContext | null = null;
     let root!: ReturnType<typeof create>;
-    act(() => { root = create(<GraphCanvasEditor palette={palette} initialGraph={graph} onChange={(value) => { current = value; }} />, { createNodeMock }); });
+    act(() => { root = create(<GraphCanvasEditor palette={palette} client={null} initialGraph={graph} onChange={(value) => { current = value; }} />, { createNodeMock }); });
     const toggle = root.root.findByProps({ 'data-testid': 'toggle-units' });
     act(() => { toggle.props.onClick(); });
     const flow = root.root.findByType(ReactFlow);

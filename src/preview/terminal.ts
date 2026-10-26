@@ -67,6 +67,8 @@ export interface PreviewTerminalOpts {
    *  splitting honest). */
   shellArgs?: readonly string[];
   env?: Record<string, string>;
+  /** Remove captured environment keys after env composition (for subscription-only child auth). */
+  unsetEnv?: readonly string[];
   /** Defaults to `xterm-256color` (universal). Override with
    *  `xterm-ghostty` to match a ghostty host, or another terminfo
    *  name for testing. The chosen name lands in $TERM of the child
@@ -343,7 +345,7 @@ export class PreviewTerminal {
       //   PreviewTerminal 자체 에뮬레이터가 렌더 담당이라 무관). 출력 구독/exit 배선은 아래 pump 분기에서.
       this.registryHandle = this.registryDeps.startPty({
         // 합성자 = registry(resolveSpawnShape) — 여기서는 overlay 만 넘긴다.
-        cmd: shell, args, workdir: this.opts.cwd, env: childEnv,
+        cmd: shell, args, workdir: this.opts.cwd, env: childEnv, unsetEnv: this.opts.unsetEnv,
         cols: this.term.cols, rows: this.term.rows,
         kind: this.opts.registryKind ?? 'preview',
         nickname: this.opts.registryNickname,
@@ -360,7 +362,7 @@ export class PreviewTerminal {
         cols: this.term.cols,
         rows: this.term.rows,
         cwd: this.opts.cwd,
-        env: buildPtyEnv(childEnv),
+        env: buildPtyEnv(childEnv, process.env, { unset: this.opts.unsetEnv }),
       });
       const masterFd = this.resolveMasterFd(this.pty);
       if (masterFd === null) throw new Error('PreviewTerminal: could not resolve PTY master fd');

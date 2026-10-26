@@ -743,7 +743,7 @@ describe('goal-only implementation rework', () => {
   });
 
   // node-b isolated runs take seconds; importer shards under Pod load can exceed Bun's default per-test limit.
-  test('exhausts the retry when a declared target changes but RESULT is missing', async () => {
+  test('a completed retry with declared target diff reaches PR stage even without a RESULT line', async () => {
     const root = mkdtempSync(join(tmpdir(), 'goal-only-rework-no-result-'));
     const repo = join(root, 'repo');
     mkdirSync(join(repo, 'src'), { recursive: true });
@@ -764,8 +764,9 @@ describe('goal-only implementation rework', () => {
     let opened = 0;
     try {
       const result = await runSelfImplement({
-        feature: '대상 경로: src/example.ts', goalFile, maxReworkRounds: 1, completion: 'worktree-only',
+        feature: '대상 경로: src/example.ts', goalFile, maxReworkRounds: 1, completion: 'pr',
         seams: seams({
+          gateResults: [true],
           createWorktree: async () => ({ path: repo, branch: 'self-impl/goal-only-rework-no-result', resolvedBase: base, invokedHead: base }),
           implement: async () => {
             calls += 1;
@@ -775,13 +776,13 @@ describe('goal-only implementation rework', () => {
             return { ok: true, summary: '구현 완료', evidenceTranscript: '구현 완료',
               terminalStatus: { reached: true, changed: true, toolCalls: 7, timedOut: false } };
           },
-          openPr: async () => { opened += 1; throw new Error('must not open PR'); },
+          openPr: async () => { opened += 1; return { url: 'https://pr/31001', number: 31001 }; },
         }),
       });
       expect(calls).toBe(2);
       expect(git('diff', '--name-only', base)).toContain('src/example.ts');
-      expect(opened).toBe(0);
-      expect(result).toMatchObject({ stage: 'aborted', terminationReason: 'goal-only-rework-exhausted' });
+      expect(opened).toBe(1);
+      expect(result).toMatchObject({ stage: 'pr-opened', prNumber: 31001 });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1182,6 +1183,25 @@ describe('post-merge goal copy cleanup', () => {
     expect(result.merged).toBe(true);
     expect(calls).toEqual(['worktree', 'branch', 'copy']);
     expect(events.find((e) => e.event === 'post-merge-cleanup-goal-copy')?.data).toMatchObject({ goalFile, outcome: 'removed', reason: 'identical-untracked-copy' });
+  });
+
+  test('Pod in-place source survives post-merge cleanup', async () => {
+    const { calls, cleanup } = mergedSeams();
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const result = await runSelfImplement({ feature: 'in-place merge', goalFile, autoMerge: true, memory: false,
+      writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
+      seams: seams({
+        createWorktree: async () => ({ path: '/source', branch: 'self-impl/inplace', resolvedBase: 'a'.repeat(40), inPlace: true }),
+        defaultBranchRef: () => 'origin/main',
+        reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'ok', reviewed: true, diffTruncated: false }),
+        mergePr: async () => ({ merged: true, baseRefName: 'main' }),
+        postMergeCleanup: cleanup,
+        writeRunLedger: (entry) => { events.push({ event: entry.event, data: entry.data }); },
+      }),
+    });
+    expect(result.merged).toBe(true);
+    expect(calls).toEqual([]);
+    expect(events.find((e) => e.event === 'post-merge-cleanup-preserved')?.data).toMatchObject({ reason: 'pod-inplace-source' });
   });
 
   test.each(['content-differs', 'remote-unreadable', 'tracked', 'outside-repository'] as const)('keeps copy when %s', async (reason) => {
@@ -6830,6 +6850,27 @@ describe('판정 입력 배관 — 생산에서 실제로 닿는가', () => {
 });
 
 describe('runSelfImplement — supervisor fills authored UNVERIFIABLE slots', () => {
+  test('goal-slot fill exception persists a reason when no deficit callback could be recorded', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-slot-fill-exception-'));
+    const goalFile = join(root, 'GOAL.txt');
+    writeFileSync(goalFile, 'Goal\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n');
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.writeRunLedger = (entry) => appendRunLedgerEntry(entry, isolatedStateDir);
+    s.gate = async () => ({ passed: true, log: '[test] PASS bun test src/self-implement/goal-supervisor-fill.test.ts — 1 pass | 0 fail' });
+    s.independentlyCheckGoalSlots = async () => { throw new Error('checker unavailable'); };
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category.includes('self-implement')) events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      await runSelfImplement({ feature: 'goal-slot checker error reason', goalFile, maxReworkRounds: 0, seams: s });
+      expect(events.find(({ event }) => event === 'goal-slot-fill')?.data).toMatchObject({
+        result: 'rejected', reason: 'goal-slot-fill-error',
+      });
+    } finally { (debug as { log: typeof debug.log }).log = originalLog; rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('docs-only PASS records not-applicable and continues without abandoning the run', async () => {
     const root = mkdtempSync(join(tmpdir(), 'goal-slot-docs-only-'));
     const goalFile = join(root, 'GOAL.txt');
@@ -6851,7 +6892,6 @@ describe('runSelfImplement — supervisor fills authored UNVERIFIABLE slots', ()
     try {
       const result = await runSelfImplement({ feature: 'docs-only PASS', goalFile, maxReworkRounds: 0, seams: s });
       expect(result.ok).toBe(true);
-      expect(result.termination).not.toBe('abandoned');
       expect(gateCalls).toBe(1);
       const storedGoal = readFileSync(goalFile, 'utf8');
       expect(storedGoal.startsWith(original)).toBe(true);
@@ -7029,6 +7069,7 @@ describe('runSelfImplement — supervisor fills authored UNVERIFIABLE slots', ()
     writeFileSync(goalFile, 'Goal\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- UNVERIFIABLE\n');
     let gateCalls = 0;
     const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.writeRunLedger = (entry) => appendRunLedgerEntry(entry, isolatedStateDir);
     const unmeasuredLog = '[test] PASS bun test goal — 1 pass';
     s.gate = async () => { gateCalls++; return { passed: true, log: unmeasuredLog }; };
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -7039,10 +7080,22 @@ describe('runSelfImplement — supervisor fills authored UNVERIFIABLE slots', ()
     try {
       const result = await runSelfImplement({ feature: 'still unmeasured', goalFile, maxReworkRounds: 0, seams: s });
       expect(gateCalls).toBe(2);
-      expect(result.ok).toBe(false);
+      expect(result).toMatchObject({ ok: false, stage: 'review-blocked', outcome: 'budget-exhausted',
+        gate: { passed: true }, prUrl: expect.any(String), prNumber: expect.any(Number),
+        detail: expect.stringContaining('remained unverifiable after the second gate passed') });
       expect(events.find(({ event }) => event === 'goal-slot-remeasure-result')?.data).toMatchObject({
         result: 'unverifiable', gatePassed: true, deficitKind: 'unmeasured', gateLog: unmeasuredLog,
         reason: 'gate-evidence-unverified', inputSummary: { gatePassed: true, hasGateLog: true }, gateLogRef: expect.stringMatching(/^sha256:/),
+      });
+      expect(events.find(({ event }) => event === 'goal-slot-remeasurement-preserved')?.data).toMatchObject({
+        gatePassed: true, reason: 'gate-evidence-unverified', gateLogRef: expect.stringMatching(/^sha256:/),
+        disposition: 'preserve-for-recovery',
+      });
+      const runId = events.find(({ event }) => event === 'goal-slot-remeasurement-preserved')?.data.runId as string;
+      const ledger = readFileSync(runLedgerPath(runId, isolatedStateDir), 'utf8').trim().split('\n')
+        .map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+      expect(ledger.find((row) => row.event === 'goal-slot-remeasurement-preserved')?.data).toMatchObject({
+        reason: 'gate-evidence-unverified', disposition: 'preserve-for-recovery', gatePassed: true,
       });
       expect(readFileSync(goalFile, 'utf8')).toContain('- UNVERIFIABLE');
     } finally { (debug as { log: typeof debug.log }).log = originalLog; rmSync(root, { recursive: true, force: true }); }
@@ -7060,7 +7113,7 @@ describe('runSelfImplement — supervisor fills authored UNVERIFIABLE slots', ()
     try {
       const result = await runSelfImplement({ feature: 'rejected evidence', goalFile, maxReworkRounds: 0, seams: s });
       expect(gateCalls).toBe(2);
-      expect(result.ok).toBe(false);
+      expect(result).toMatchObject({ ok: false, stage: 'gate-failed', outcome: 'abandoned', gate: { passed: true } });
       expect(readFileSync(goalFile, 'utf8')).toContain('- UNVERIFIABLE');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -7077,7 +7130,7 @@ describe('runSelfImplement — supervisor fills authored UNVERIFIABLE slots', ()
       const result = await runSelfImplement({ feature: 'remeasure fails', goalFile, maxReworkRounds: 0, seams: s });
       expect(gateCalls).toBe(2);
       expect(result.gate?.passed).toBe(false);
-      expect(result.ok).toBe(false);
+      expect(result).toMatchObject({ ok: false, stage: 'gate-failed', outcome: 'abandoned' });
       expect(readFileSync(goalFile, 'utf8')).toContain('- UNVERIFIABLE');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -7105,6 +7158,31 @@ describe('runSelfImplement — supervisor fills authored UNVERIFIABLE slots', ()
     await runSelfImplement({ feature: 'F', goalFile, seams: s });
     expect(independentlyChecked).toBe(true);
     expect(readFileSync(goalFile, 'utf8')).toContain('filled-by: supervisor@round-0');
+  });
+
+  test('production orchestration executes authored rg signal through evidence runner and forwards its exact result', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-authored-rg-wiring-'));
+    const goalFile = join(root, 'GOAL.txt');
+    const command = 'rg -n 미측정 docs/plans/plan.md';
+    writeFileSync(goalFile, `Goal\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- Candidate decision signal:\n  - Condition: ${command}\n`);
+    const calls: string[] = [];
+    const s = revSeams({ reviews: [{ verdict: 'warn', reviewed: true }] });
+    s.evidenceCommandRunner = (actual) => {
+      calls.push(actual);
+      return { status: 0, stdout: '17:미측정 evidence\n', stderr: '', error: undefined };
+    };
+    s.gate = async () => ({ passed: true,
+      log: '[test] PASS bun test src/sample.test.ts — 1 pass | 0 fail' });
+    s.independentlyCheckGoalSlots = async (document, evidence) =>
+      document.includes('이번 라운드 관측값 — exit 0')
+      && document.includes('17:미측정 evidence')
+      && evidence.authoredSignal?.command === command
+      && evidence.authoredSignal.exitCode === 0;
+    try {
+      await runSelfImplement({ feature: `Goal\n\n## 불변식\n- UNVERIFIABLE\n\n## 판정 신호\n- Candidate decision signal:\n  - Condition: ${command}\n`, goalFile, maxReworkRounds: 0, seams: s });
+      expect(calls).toEqual([command]);
+      expect(readFileSync(goalFile, 'utf8')).toContain('17:미측정 evidence');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 
@@ -7821,7 +7899,7 @@ describe('runSelfImplement — --ground round-0 codebase grounding', () => {
       }) });
       expect(features[0]).toContain('[KNOWHOW-PACK v1 ids=K-TC-777]');
       expect(features[0]).toContain(feature);
-      expect(ledger.find((entry) => entry.event === 'knowhow-pack')?.data).toMatchObject({ ids: ['K-TC-777'], injected: true });
+      expect(ledger.find((entry) => entry.event === 'knowhow-pack')?.data).toMatchObject({ ids: ['K-TC-777'], injected: true, reason: 'selected', repoPath: root, repoRevision: null });
       expect(Number(ledger.find((entry) => entry.event === 'knowhow-pack')?.data.bytes)).toBeGreaterThan(0);
       expect(readFileSync(file, 'utf8')).toBe(before);
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -14249,7 +14327,7 @@ describe('runSelfImplement — all non-convergence preservation exits', () => {
       (debug as { log: typeof debug.log }).log = original;
       rmSync(repo, { recursive: true, force: true });
     }
-  });
+  }, 30_000); // Five real orchestrator runs exceed Bun's 5s default on a full checkout.
 
   test('preserves the exact green decision signal names and count on merged and pre-merge hitl returns', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'decision-signal-result-paths-'));

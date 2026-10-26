@@ -1,5 +1,5 @@
 import { Database } from 'bun:sqlite';
-import { chmodSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
@@ -80,6 +80,12 @@ export class PatentLedger {
     try { return work(db); } finally { db.close(); }
   }
 
+  private usingExisting<T>(work: (db: Database) => T): T {
+    if (!existsSync(this.path)) throw new Error('patent ledger unavailable');
+    const db = new Database(this.path, { readonly: true, create: false, strict: true });
+    try { return work(db); } finally { db.close(); }
+  }
+
   private transaction<T>(db: Database, work: () => T): T {
     db.exec('BEGIN IMMEDIATE');
     try { const result = work(); db.exec('COMMIT'); return result; }
@@ -124,5 +130,16 @@ export class PatentLedger {
   listPublicCandidates(): PatentCandidate[] {
     return this.using(db =>
       db.query(`SELECT id, title, track, status, deadline, created_at, updated_at FROM patent_candidates WHERE status = '공개 허용' ORDER BY created_at, id`).all() as PatentCandidate[]);
+  }
+
+  /** Return only line numbers; candidate identifiers and titles remain private. */
+  unapprovedCandidateLineNumbers(text: string): number[] {
+    return this.usingExisting(db => {
+      if (!text.trim()) return [];
+      const rows = db.query(`SELECT title FROM patent_candidates WHERE status != '공개 허용'`).all() as Array<{ title: string }>;
+      const titles = rows.map(({ title }) => title.toLocaleLowerCase()).filter((title) => title.length >= 3);
+      return text.split(/\r?\n/).flatMap((line, index) =>
+        titles.some((title) => line.toLocaleLowerCase().includes(title)) ? [index + 1] : []);
+    });
   }
 }

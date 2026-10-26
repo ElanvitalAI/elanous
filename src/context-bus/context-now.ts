@@ -16,7 +16,7 @@ import { filterPublicDemoContext } from './context-now-public.js';
 
 export type ContextFact =
   | { kind: 'version'; version: string; source: string }
-  | { kind: 'cell'; version: string; id: string; title: string; status: string; owner: string | null; source: string }
+  | { kind: 'cell'; version: string; id: string; title: string; status: string; owner: string | null; source: string; priority?: string | null }
   | { kind: 'decision'; id: string; title: string; status: string; dueAt: string | null; source: string }
   | { kind: 'seat'; seat: string; at: string; status: string; id: string | null; title: string | null; source: string }
   | { kind: 'run'; goal: string; phase: string; elapsed: string; source: string; unreadable?: string }
@@ -157,7 +157,8 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
     for (const item of checklist.items) {
       if (item.status === 'done') continue;
       facts.push({ kind: 'cell', version: v, id: item.id, title: redactSecretText(item.title.split(/\r?\n/, 1)[0] ?? '').slice(0, 120),
-        status: item.status, owner: item.owner ?? null, source: `elanous://release/${v}/checklist#${encodeURIComponent(item.id)}` });
+        status: item.status, owner: item.owner ?? null, priority: item.priority ?? null,
+        source: `elanous://release/${v}/checklist#${encodeURIComponent(item.id)}` });
     }
   }
   for (const item of (deps.decisions ?? (() => new DecisionLedger().list({ status: 'open' })))()) {
@@ -216,6 +217,89 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
   const answer = { at, topic, facts: boundedFacts, events: selectedEvents, guide };
   debug.log('context.now', 'answer', { topic, facts: answer.facts, events: answer.events });
   return options.audience === 'public-demo' ? filterPublicDemoContext(answer, deps.brandCheck) : answer;
+}
+
+export type AskOpContextTopic = 'release' | 'required' | 'train' | 'incident' | 'decision' | 'general';
+export type AskOpContextBundle = {
+  queriedAt: string;
+  topic: AskOpContextTopic;
+  facts: Array<{ kind: string; summary: string; source: string; observedAt: string }>;
+  gaps: Array<{ kind: string; reason: string }>;
+};
+
+function askOpTopic(question: string): AskOpContextTopic {
+  const text = question.toLocaleLowerCase();
+  if (/열차|착지|병합|merge|train|pull request|\bpr\b/.test(text)) return 'train';
+  if (/사고|장애|incident|failure|실패|에러|오류/.test(text)) return 'incident';
+  if (/결정|승인|decision|approval/.test(text)) return 'decision';
+  if (/필수|p0|must|required|우선순위/.test(text)) return 'required';
+  if (/발행|출시|릴리스|release|컷|cut|게이트|gate|이번 판|다음 판|판 진도|\b\d+\.\d+\.\d+\b/.test(text)) return 'release';
+  return 'general';
+}
+
+/** A small evidence packet for an OP answer. A missing source stays a gap, never an inferred fact. */
+export function buildAskOpContextBundle(
+  question: string,
+  snapshot: ContextNowAnswer,
+  options: { audience?: 'operator' | 'public-demo'; limit?: number } = {},
+): AskOpContextBundle {
+  const answer = options.audience === 'public-demo' ? filterPublicDemoContext(snapshot) : snapshot;
+  const topic = askOpTopic(question);
+  const limit = typeof options.limit === 'number' && Number.isFinite(options.limit)
+    ? Math.max(1, Math.min(20, Math.floor(options.limit))) : 8;
+  const facts: AskOpContextBundle['facts'] = [];
+  const gaps: AskOpContextBundle['gaps'] = [];
+  const pushFact = (kind: string, summary: string, source: string, observedAt: string) => {
+    if (facts.length < limit) facts.push({ kind, summary: oneLine(summary), source, observedAt });
+  };
+  const relevant = (kind: ContextFact['kind']) => topic === 'general'
+    || (topic === 'release' && (kind === 'release' || kind === 'version'))
+    || (topic === 'required' && kind === 'cell')
+    || (topic === 'decision' && kind === 'decision')
+    || (topic === 'incident' && kind === 'run');
+  for (const fact of answer.facts) {
+    if (!relevant(fact.kind)) continue;
+    if ('unreadable' in fact && fact.unreadable) {
+      gaps.push({ kind: fact.kind, reason: fact.unreadable });
+      continue;
+    }
+    if (topic === 'required' && fact.kind === 'cell' && fact.priority !== 'P0') continue;
+    if (topic === 'incident' && fact.kind === 'run' && !/fail|error|timeout|실패|오류|정지|중단/i.test(`${fact.phase} ${fact.goal}`)) continue;
+    if (topic === 'train') continue;
+    const summary = fact.kind === 'version' ? `판 ${fact.version}`
+      : fact.kind === 'cell' ? `${fact.id} ${fact.status} ${fact.title}`
+      : fact.kind === 'decision' ? `${fact.id} ${fact.status} ${fact.title}`
+      : fact.kind === 'seat' ? `${fact.seat} ${fact.status} ${fact.id ?? ''}`
+      : fact.kind === 'run' ? `${fact.goal} ${fact.phase} ${fact.elapsed}`
+      : fact.kind === 'release' ? `${fact.version} ${fact.node} ${fact.status}`
+      : `${fact.count ?? '미관측'}건 ${fact.names.join(', ')}`;
+    pushFact(fact.kind, summary, fact.source, fact.kind === 'seat' ? fact.at : answer.at);
+  }
+  const eventMatches = (kind: string, summary: string) => topic === 'general'
+    || (topic === 'train' && /train|열차|착지|병합|merge|\bpr\b/i.test(`${kind} ${summary}`))
+    || (topic === 'incident' && /incident|사고|장애|failure|실패|에러|오류|timeout/i.test(`${kind} ${summary}`));
+  for (const event of answer.events) {
+    if (eventMatches(event.kind, event.summary)) pushFact(event.kind, event.summary, event.source, event.at);
+  }
+  if (topic === 'required' && !facts.length) {
+    const cells = answer.facts.filter(fact => fact.kind === 'cell');
+    if (cells.some(fact => fact.priority == null)) gaps.push({ kind: 'cell', reason: '우선순위 미관측' });
+    else if (cells.length) gaps.push({ kind: 'cell', reason: '조회 범위에서 일치하는 P0 없음' });
+  }
+  if (!facts.length && !gaps.length) gaps.push({ kind: topic, reason: '미관측' });
+  if (topic === 'release' && !answer.facts.some(fact => fact.kind === 'release' && !('unreadable' in fact && fact.unreadable))
+    && !gaps.some(gap => gap.kind === 'release')) gaps.push({ kind: 'release', reason: '미관측' });
+  return { queriedAt: answer.at, topic, facts, gaps: gaps.slice(0, 3) };
+}
+
+/** Worker scan keeps ledger IO away from the OP inbox turn; the packet itself is bounded. */
+export async function askOpContextBundle(
+  question: string,
+  options: { audience?: 'operator' | 'public-demo'; limit?: number } = {},
+  readSnapshot: () => Promise<ContextNowAnswer> = () => contextNowInWorker({ audience: 'operator', limit: 100 }),
+): Promise<AskOpContextBundle> {
+  try { return buildAskOpContextBundle(question, await readSnapshot(), { ...options, audience: options.audience ?? 'public-demo' }); }
+  catch { return { queriedAt: new Date().toISOString(), topic: askOpTopic(question), facts: [], gaps: [{ kind: 'context', reason: '조회 실패' }] }; }
 }
 
 const workerAnswers = new Map<string, { promise: Promise<ContextNowAnswer>; expiresAt: number }>();

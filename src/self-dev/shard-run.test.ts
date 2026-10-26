@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { aggregateGateTestShards } from './shard-aggregate.js';
-import { maxAutomaticShardCount, runBunShard, runBunShardWithSpawn, runShardedGateTests, SHARD_FAILURE_TAIL_BYTES, selfGateShardTimeoutMs, writeShardFailureEvidence, type ShardProcess } from './shard-run.js';
+import { maxAutomaticShardCount, resolveShardConcurrency, runBunShard, runBunShardAsync, runBunShardWithSpawn, runShardedGateTests, runShardedGateTestsAsync, SHARD_FAILURE_TAIL_BYTES, selfGateShardTimeoutMs, writeShardFailureEvidence, type ShardProcess } from './shard-run.js';
 import { GATE_SPAWN_LANE_FILES, isGateSpawnLaneFile } from './spawn-lane-files.js';
 import { planFixedGateTestShards, type GateTestShard } from './shard-plan.js';
 import { withFakeBins, type FakeBinSpec } from '../ux-sim/fake-bin.js';
@@ -13,6 +13,164 @@ const xml = (files: readonly string[], failing: readonly string[]) => `<testsuit
   + files.map((file) => `<testsuite file="${file}" tests="1" failures="${failing.includes(file) ? 1 : 0}">`
     + `<testcase name="case-${file}">${failing.includes(file) ? '<failure message="assertion failed"/>' : ''}</testcase></testsuite>`).join('')
   + '</testsuites>';
+
+test('async shard pool overlaps bounded bundles and keeps deterministic attempt order', async () => {
+  const files = Array.from({ length: 4 }, (_, i) => `test/parallel-${i}.test.ts`);
+  let active = 0;
+  let peak = 0;
+  const complete: string[] = [];
+  const progress: Array<[string, number, number]> = [];
+  const run = async (cwd: string, selected: readonly string[]) => {
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, selected[0] === files[0] ? 8 : 1));
+    complete.push(`${cwd}:${selected[0]}`);
+    active--;
+    return { exitCode: 0, junit: xml(selected, []) };
+  };
+  const baseline = async (_cwd: string, _ref: string, visit: (dir: string) => Promise<unknown>) => visit('/base');
+  const result = await runShardedGateTestsAsync('/head', files, 'HEAD', 4, run, baseline as never, 8,
+    { fixedDistribution: true, concurrency: 2, hostResources: { cores: 8, freeMemoryGiB: 64, freeTmpGiB: 64 }, onShardComplete: (item) => {
+      progress.push([item.shardId, item.completedShards, item.completedFiles]);
+    } });
+  expect(peak).toBe(2);
+  expect(result.attempts.map((item) => item.shardId)).toEqual(result.shards.map((item) => item.id));
+  expect(result.aggregate.status).toBe('passed');
+  expect(complete[0]).not.toBe(`/head:${files[0]}`);
+  expect(progress.map((item) => item.slice(1))).toEqual([[1, 1], [2, 2], [3, 3], [4, 4]]);
+  expect(result.measurementMs).toBeGreaterThanOrEqual(0);
+  expect(result.bundleMs).toBeGreaterThanOrEqual(0);
+  expect(result.currentProcessMs).toBeGreaterThan(0);
+  expect(result.baselineProcessMs).toBeGreaterThan(0);
+});
+
+test('host load adapts default pool within CPU and memory caps', () => {
+  expect(resolveShardConcurrency(undefined, { cores: 16, freeMemoryGiB: 64, freeTmpGiB: 64, load1: 2 }, 8).count).toBe(4);
+  expect(resolveShardConcurrency(undefined, { cores: 16, freeMemoryGiB: 64, freeTmpGiB: 64, load1: 8 }, 8).count).toBe(3);
+  expect(resolveShardConcurrency(undefined, { cores: 16, freeMemoryGiB: 64, freeTmpGiB: 64, load1: 14 }, 8).count).toBe(2);
+  expect(resolveShardConcurrency(undefined, { cores: 16, freeMemoryGiB: 16, freeTmpGiB: 64, load1: 2 }, 8).count).toBe(2);
+  expect(resolveShardConcurrency(1, { cores: 16, freeMemoryGiB: 64, freeTmpGiB: 64, load1: 2 }, 8).count).toBe(1);
+  expect(resolveShardConcurrency(4, { cores: 16, freeMemoryGiB: 16, freeTmpGiB: 64, load1: 2 }, 8).count).toBe(2);
+  expect(resolveShardConcurrency(99, undefined, 8).count).toBe(4);
+});
+
+test('async concurrency one matches the serial shard verdict, attempts and child order', async () => {
+  const files = ['test/a.test.ts', 'test/b.test.ts', 'test/c.test.ts'];
+  const calls: string[] = [];
+  const process: ShardProcess = (cwd, selected) => {
+    calls.push(`${cwd}:${selected.join(',')}`);
+    const failed = cwd === '/head' && selected.includes('test/b.test.ts');
+    return { exitCode: failed ? 1 : 0, junit: xml(selected, failed ? ['test/b.test.ts'] : []) };
+  };
+  const baseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const serial = runShardedGateTests('/head', files, 'HEAD', 3, process, baseline as never, 8, { fixedDistribution: true });
+  const serialCalls = [...calls];
+  calls.length = 0;
+  const parallel = await runShardedGateTestsAsync('/head', files, 'HEAD', 3,
+    async (cwd, selected) => process(cwd, selected), async (_cwd, _ref, visit) => visit('/base'), 8,
+    { fixedDistribution: true, concurrency: 1 });
+  expect(calls).toEqual(serialCalls);
+  expect(parallel.attempts).toEqual(serial.attempts);
+  expect(parallel.aggregate).toEqual(serial.aggregate);
+  await expect(runShardedGateTestsAsync('/head', files, 'HEAD', 3, undefined, undefined, 8,
+    { fixedDistribution: true, concurrency: 5 })).rejects.toThrow('invalid shard concurrency');
+});
+
+test('async measured planner samples each file once within the same pool limit', async () => {
+  const files = Array.from({ length: 6 }, (_, i) => `test/sample-${i}.test.ts`);
+  let active = 0;
+  let peak = 0;
+  const samples: string[] = [];
+  const measure = async (_cwd: string, selected: readonly string[]) => {
+    active++;
+    peak = Math.max(active, peak);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    active--;
+    samples.push(selected[0]!);
+    return { exitCode: 0, junit: xml(selected, []), rssMb: 100, seconds: 1 };
+  };
+  const baseline = async (_cwd: string, _ref: string, visit: (dir: string) => Promise<unknown>) => visit('/base');
+  const result = await runShardedGateTestsAsync('/head', [...files, files[0]!], 'HEAD', 3,
+    async (_cwd, selected) => ({ exitCode: 0, junit: xml(selected, []) }), baseline as never, 8,
+    { concurrency: 2, hostResources: { cores: 8, freeMemoryGiB: 64, freeTmpGiB: 8 } }, measure);
+  expect(samples.sort()).toEqual(files);
+  expect(peak).toBe(2);
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.shards.flatMap((shard) => shard.files).sort()).toEqual(files);
+});
+
+test('empty fixed plan still checks whether the baseline worktree can be opened', async () => {
+  let baselineCalls = 0;
+  const result = await runShardedGateTestsAsync('/head', [], 'HEAD', 1,
+    async () => ({ exitCode: 0 }),
+    (async () => { baselineCalls++; return { log: 'baseline unavailable' }; }) as never,
+    8, { fixedDistribution: true, concurrency: 1 });
+  expect(baselineCalls).toBe(1);
+  expect(result.aggregate.status).toBe('unmeasured');
+});
+
+test('async measured concurrency one retains the existing planner and aggregate order', async () => {
+  const files = ['test/a.test.ts', 'test/b.test.ts', 'test/c.test.ts', 'test/d.test.ts'];
+  const resultFor = (selected: readonly string[]) => ({ exitCode: 0, junit: xml(selected, []), rssMb: 200, seconds: 1 });
+  const syncBaseline = (_cwd: string, _ref: string, visit: (dir: string) => unknown) => visit('/base');
+  const sync = runShardedGateTests('/head', files, 'HEAD', 2, (_cwd, selected) => resultFor(selected), syncBaseline as never, 8);
+  const asyncResult = await runShardedGateTestsAsync('/head', files, 'HEAD', 2,
+    async (_cwd, selected) => resultFor(selected),
+    (async (_cwd: string, _ref: string, visit: (dir: string) => Promise<unknown>) => visit('/base')) as never, 8,
+    { concurrency: 1 }, async (_cwd, selected) => resultFor(selected));
+  expect(asyncResult.shards).toEqual(sync.shards);
+  expect(asyncResult.attempts).toEqual(sync.attempts);
+  expect(asyncResult.aggregate).toEqual(sync.aggregate);
+});
+
+test('async retry reruns only the incomplete bundle and leaves all attempts in plan order', async () => {
+  const files = ['test/a.test.ts', 'test/b.test.ts', 'test/c.test.ts'];
+  const calls = new Map<string, number>();
+  const run = async (cwd: string, selected: readonly string[]) => {
+    const key = `${cwd}:${selected[0]}`;
+    calls.set(key, (calls.get(key) ?? 0) + 1);
+    if (cwd === '/head' && selected[0] === files[1] && calls.get(key) === 1) return { exitCode: null, signal: 'SIGKILL' };
+    return { exitCode: 0, junit: xml(selected, []) };
+  };
+  const result = await runShardedGateTestsAsync('/head', files, 'HEAD', 3, run,
+    (async (_cwd: string, _ref: string, visit: (dir: string) => Promise<unknown>) => visit('/base')) as never, 8, { fixedDistribution: true, concurrency: 3 });
+  expect(result.aggregate.status).toBe('passed');
+  expect(result.attempts.map((attempt) => [attempt.shardId, attempt.attempt]))
+    .toEqual([['shard-1', 1], ['shard-2', 1], ['shard-3', 1], ['shard-2', 2]]);
+  expect(calls.get(`/head:${files[0]}`)).toBe(1);
+  expect(calls.get(`/head:${files[1]}`)).toBe(2);
+});
+
+test('async retry reuses a complete passing baseline JUnit in the same gate only', async () => {
+  const files = ['test/a.test.ts', 'test/b.test.ts'];
+  const calls = new Map<string, number>();
+  const run = async (cwd: string, selected: readonly string[]) => {
+    const key = `${cwd}:${selected[0]}`;
+    calls.set(key, (calls.get(key) ?? 0) + 1);
+    return cwd === '/head' && selected[0] === files[0] && calls.get(key) === 1
+      ? { exitCode: null, signal: 'SIGKILL' }
+      : { exitCode: 0, junit: xml(selected, []) };
+  };
+  const result = await runShardedGateTestsAsync('/head', files, 'HEAD', 2, run,
+    (async (_cwd: string, _ref: string, visit: (dir: string) => Promise<unknown>) => visit('/base')) as never, 8,
+    { fixedDistribution: true, concurrency: 2, hostResources: { cores: 8, freeMemoryGiB: 64, freeTmpGiB: 64 } });
+  expect(result.aggregate.status).toBe('passed');
+  expect(calls.get('/base:test/a.test.ts')).toBe(1);
+  expect(result.attempts[2]?.baselineJUnit).toBe(result.attempts[0]?.baselineJUnit);
+});
+
+test('async shard with no JUnit after retry stays unmeasured', async () => {
+  const files = ['test/a.test.ts', 'test/b.test.ts'];
+  const result = await runShardedGateTestsAsync('/head', files, 'HEAD', 2,
+    async (cwd, selected) => cwd === '/head' && selected[0] === files[0]
+      ? { exitCode: null, signal: 'SIGKILL' }
+      : { exitCode: 0, junit: xml(selected, []) },
+    (async (_cwd: string, _ref: string, visit: (dir: string) => Promise<unknown>) => visit('/base')) as never, 8,
+    { fixedDistribution: true, concurrency: 2 });
+  expect(result.aggregate.status).toBe('unmeasured');
+  expect(result.aggregate.retryShardIds).toEqual(['shard-1']);
+  expect(result.unmeasuredByShard?.['shard-1']).toContain('signal SIGKILL');
+});
 
 test('six fake test files in two processes have the same introduced/preexisting verdict as one bundle', () => {
   const files = Array.from({ length: 6 }, (_, i) => `test/f${i}.test.ts`);
@@ -378,6 +536,60 @@ test('real Bun JUnit runner records process RSS, duration, and selected files on
     expect(result.rssMb).toBeGreaterThan(0);
     expect(result.seconds).toBeGreaterThanOrEqual(0);
   } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('real async Bun child records JUnit and RSS; failed child keeps a diagnostic', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'elanous-shard-async-test-'));
+  try {
+    mkdirSync(join(cwd, 'test'));
+    writeFileSync(join(cwd, 'test/pass.test.ts'), "import { test } from 'bun:test'; test('pass', () => {});\n");
+    writeFileSync(join(cwd, 'test/fail.test.ts'), "import { test, expect } from 'bun:test'; test('fail', () => expect(1).toBe(2));\n");
+    const passed = await runBunShardAsync(cwd, ['test/pass.test.ts']);
+    expect(passed.exitCode).toBe(0);
+    expect(passed.junit).toContain('pass');
+    expect(passed.rssMb).toBeGreaterThan(0);
+    expect(passed.seconds).toBeGreaterThanOrEqual(0);
+    const failed = await runBunShardAsync(cwd, ['test/fail.test.ts']);
+    expect(failed.exitCode).toBe(1);
+    expect(failed.junit).toContain('failure');
+    expect(failed.failure?.stderrTail).toContain('fail');
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('real async Bun child bounds a large output while retaining its failure tail', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'elanous-shard-async-output-test-'));
+  try {
+    mkdirSync(join(cwd, 'test'));
+    writeFileSync(join(cwd, 'test/no-junit.test.ts'),
+      "console.log('OUTPUT-HEAD' + 'x'.repeat(256 * 1024) + 'OUTPUT-TAIL'); process.exit(2);\n");
+    const result = await runBunShardAsync(cwd, ['test/no-junit.test.ts']);
+    expect(result.exitCode).toBe(2);
+    expect(result.failure?.stdoutTail).toContain('OUTPUT-TAIL');
+    expect(result.failure?.stdoutTail.length).toBeLessThanOrEqual(SHARD_FAILURE_TAIL_BYTES);
+    expect(result.diagnostic).toContain('OUTPUT-HEAD');
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('real async Bun child stops waiting when a grandchild inherits its output pipe', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'elanous-shard-async-grandchild-test-'));
+  let grandchildPid: number | undefined;
+  try {
+    mkdirSync(join(cwd, 'test'));
+    writeFileSync(join(cwd, 'test/pipe.test.ts'),
+      "import { spawn } from 'node:child_process'; const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: ['ignore', 'inherit', 'inherit'] }); console.log('GRANDCHILD_PID=' + child.pid); process.exit(0);\n");
+    const started = performance.now();
+    const result = await runBunShardAsync(cwd, ['test/pipe.test.ts'], 100);
+    grandchildPid = Number(/GRANDCHILD_PID=(\d+)/.exec(result.failure?.stdoutTail ?? '')?.[1]) || undefined;
+    expect(result.signal).toBe('DRAIN_TIMEOUT');
+    expect(performance.now() - started).toBeLessThan(2_000);
+  } finally {
+    if (grandchildPid) { try { process.kill(grandchildPid, 'SIGKILL'); } catch { /* already exited */ } }
     rmSync(cwd, { recursive: true, force: true });
   }
 });

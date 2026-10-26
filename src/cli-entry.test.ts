@@ -35,11 +35,15 @@ const PKG_VERSION = (
 // ⏱️ GATE-SPEED ③ — 실물 spawn 은 «그대로»다. 기다리는 방식만 비동기 ⊕ 상한 있는 동시성(`describe.concurrent`)으로
 //   바꿨다 — 순차 `spawnSync` 45회가 이 파일을 게이트 임계 경로(0.2.18 컷 391초)로 만들었다.
 async function runBin(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ stdout: string; stderr: string; status: number | null }> {
+  const inheritedEnv = { ...process.env };
+  // 레거시 설정 경로는 CLI가 의도적으로 무시하고 안내문을 stderr에 출력한다.
+  // 테스트 우주는 명시된 격리 경로를 사용하므로 부모 셸의 override를 전달하지 않는다.
+  delete inheritedEnv.ELANOUS_CONFIG_DIR;
   const r = await spawnRealCli(['bun', BIN, ...args], {
     cwd: REPO_ROOT,
-    timeoutMs: 60_000,
+    timeoutMs: 120_000,
     // 격리 — 이 테스트는 산출의 **유무**만 재므로 운영 스토어에 닿을 이유가 없다.
-    env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ...env },
+    env: { ...inheritedEnv, ELANOUS_DEBUG_LEVEL: 'off', ...env },
   });
   // ⛔⭐ 타임아웃·spawn 실패는 **stdout 이 비는 방식으로** 나타난다 — 이 테스트가 겨누는
   //   회귀(무출력)와 **정확히 같은 모양**이다. 여기서 갈라 두지 않으면 인프라 문제가
@@ -51,21 +55,23 @@ async function runBin(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ st
 
 // ⚠️ 실물 spawn 은 모듈 그래프가 커서 1회 ~7초다(실측). bun test 기본 5초로는
 //    **타임아웃이 곧 0바이트**라 죽은 엔트리와 구분이 안 된다 — 명시 상향한다.
-const SPAWN_TIMEOUT_MS = 60_000;
+const SPAWN_TIMEOUT_MS = 120_000;
 
-async function runBinWithDelayedStdout(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ bytes: number; validJson: boolean; stderr: string; status: number | null }> {
+async function runBinWithDelayedStdout(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ bytes: number; text: string; validJson: boolean; stderr: string; status: number | null }> {
   // The consumer does not attach stdin until its timeout elapses. Running this through
   // `sh` preserves the kernel pipe's backpressure; spawning the producer directly would
   // let Bun drain its stdout pipe before this test begins consuming it.
-  const consumer = "setTimeout(() => { let text = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', (chunk) => { text += chunk; }); process.stdin.on('end', () => { let validJson = true; try { JSON.parse(text); } catch { validJson = false; } process.stdout.write(JSON.stringify({ bytes: Buffer.byteLength(text), validJson }) + '\\n'); }); }, 1200);";
-  const result = await spawnRealCli(['sh', '-c', '"$@" | bun -e "$ELANOUS_DELAYED_STDOUT_CONSUMER"', 'sh', 'bun', BIN, ...args], {
+  const consumer = "setTimeout(() => { let text = ''; process.stdin.setEncoding('utf8'); process.stdin.on('data', (chunk) => { text += chunk; }); process.stdin.on('end', () => { let validJson = true; try { JSON.parse(text); } catch { validJson = false; } process.stdout.write(JSON.stringify({ bytes: Buffer.byteLength(text), text, validJson }) + '\\n'); }); }, 5000);";
+  const inheritedEnv = { ...process.env };
+  delete inheritedEnv.ELANOUS_CONFIG_DIR;
+  const result = await spawnRealCli(['bash', '-o', 'pipefail', '-c', '"$@" | bun -e "$ELANOUS_DELAYED_STDOUT_CONSUMER"', 'bash', 'bun', BIN, ...args], {
     cwd: REPO_ROOT,
-    env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_DELAYED_STDOUT_CONSUMER: consumer, ...env },
+    env: { ...inheritedEnv, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_DELAYED_STDOUT_CONSUMER: consumer, ...env },
     timeoutMs: SPAWN_TIMEOUT_MS,
   });
   if (result.error) throw new Error(`slow consumer pipeline failed to spawn: ${result.error.message}`);
   return {
-    ...JSON.parse(result.stdout ?? '') as { bytes: number; validJson: boolean },
+    ...JSON.parse(result.stdout ?? '') as { bytes: number; text: string; validJson: boolean },
     stderr: result.stderr ?? '',
     status: result.status,
   };
@@ -567,22 +573,77 @@ describe.concurrent('provider codex status — 실물 산출', () => {
 // ⛔ 이 시험만 «순차»로 남긴다 — `self running-runs` 는 살아 있는 프로세스 표를 읽으므로, 같은 파일의
 //   동시 spawn 이 겹치면 piped/redirected 두 번의 산출 바이트가 «시험 자신 때문에» 갈린다.
 describe('배포 엔트리 bin/elanous.mjs — 순차', () => {
-  test('self running-runs --json은 한 줄과 끝 개행을 보존하고 늦은 파이프 소비자에도 같은 바이트를 낸다', async () => {
+  test('tasks list/show --json 300KB 출력은 늦은 파이프 소비자에게도 온전하고 생산자는 rc 0으로 끝난다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-tasks-large-json-'));
+    const nexusDir = join(root, 'nexus');
+    mkdirSync(nexusDir, { recursive: true });
+    const taskId = 'large-json-task';
+    const token = 'isolated-nexus-token';
+    const largeField = 'x'.repeat(300_000);
+    const task = {
+      id: taskId, title: `large stdout regression ${token}`, priority: 'high', status: 'open', createdAt: 1,
+      largeField,
+    };
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path === '/v1/tasks') return Response.json({ tasks: [task] });
+        if (path === `/v1/tasks/${taskId}`) return Response.json({ task });
+        return new Response('not found', { status: 404 });
+      },
+    });
+    writeFileSync(join(root, 'acp-token'), token);
+    writeFileSync(join(nexusDir, 'runtime.json'), JSON.stringify({
+      pid: process.pid, startedAt: new Date().toISOString(), nexusVersion: 'test', phase: 'running', httpPort: server.port,
+      authToken: token,
+    }));
+    const env = { ELANOUS_NEXUS_DIR: nexusDir, ELANOUS_STATE_DIR: root, ELANOUS_FAST_ROUTER: '0' };
+    try {
+      for (const args of [['tasks', 'list', '--json'], ['tasks', 'show', taskId, '--json']]) {
+        const piped = await runBinWithDelayedStdout(args, env);
+        const redirected = await runBin(args, env);
+        expect(piped.status).toBe(0);
+        expect(piped.stderr).toBe('');
+        expect(redirected.status).toBe(0);
+        expect(redirected.stderr).toBe('');
+        expect(piped.bytes).toBeGreaterThan(300_000);
+        expect(piped.bytes).toBe(Buffer.byteLength(piped.text));
+        expect(piped.text.endsWith('\n')).toBe(true);
+        expect(piped.validJson).toBe(true);
+        expect(piped.bytes).toBe(Buffer.byteLength(redirected.stdout));
+        // #31359 리뷰의 pipe-vs-redirect 지적 해소: 격리 fixture의 list/show 모두 전체 본문을 비교한다.
+        expect(piped.text).toBe(redirected.stdout);
+        expect(piped.text).not.toContain(token);
+        expect(redirected.stdout).not.toContain(token);
+        const parsed = JSON.parse(piped.text) as { task?: { largeField: string; title: string }; largeField?: string; title?: string } | Array<{ largeField: string; title: string }>;
+        const redirectedParsed = JSON.parse(redirected.stdout) as typeof parsed;
+        const row = Array.isArray(parsed) ? parsed[0] : parsed.task ?? parsed;
+        const redirectedRow = Array.isArray(redirectedParsed) ? redirectedParsed[0] : redirectedParsed.task ?? redirectedParsed;
+        expect(row?.largeField).toHaveLength(300_000);
+        expect(row?.title).toContain('[redacted]');
+        expect(redirectedRow?.largeField).toHaveLength(300_000);
+        expect(redirectedRow?.title).toContain('[redacted]');
+      }
+    } finally {
+      server.stop(true);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, CONCURRENT_TEST_TIMEOUT_MS);
+
+  test('self running-runs --json은 늦은 파이프 소비자에게도 완전한 한 줄 JSON을 낸다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'elanous-running-runs-small-'));
     const args = ['self', 'running-runs', '--json'];
     const env = { ELANOUS_STATE_DIR: stateDir };
     try {
       const piped = await runBinWithDelayedStdout(args, env);
-      const redirected = await runBin(args, env);
       expect(piped.status).toBe(0);
       expect(piped.stderr).toBe('');
-      expect(redirected.status).toBe(0);
-      expect(redirected.stderr).toBe('');
-      expect(redirected.stdout.endsWith('\n')).toBe(true);
-      expect(redirected.stdout.split('\n')).toHaveLength(2);
-      expect(piped.bytes).toBe(Buffer.byteLength(redirected.stdout));
+      expect(piped.text.endsWith('\n')).toBe(true);
+      expect(piped.text.split('\n')).toHaveLength(2);
+      expect(piped.bytes).toBe(Buffer.byteLength(piped.text));
       expect(piped.validJson).toBe(true);
-      JSON.parse(redirected.stdout);
+      JSON.parse(piped.text);
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }

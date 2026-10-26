@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
-import { contextNow, contextNowInWorker, scanContextNowInWorker, seatStatusNow, type ContextNowDeps } from './context-now.js';
+import { askOpContextBundle, buildAskOpContextBundle, contextNow, contextNowInWorker, scanContextNowInWorker, seatStatusNow, type ContextNowAnswer, type ContextNowDeps } from './context-now.js';
 import { renderTuiNow, renderVoiceNow } from './context-now-surfaces.js';
 import type { QueriedRunningRunsResult } from '../self-implement/running-runs.js';
 import { runLedgerDir, runLedgerScanIndexPath } from '../self-implement/run-ledger.js';
@@ -27,6 +27,74 @@ setDefaultTimeout(30_000);
 
 const at = '2026-10-03T04:00:00.000Z';
 const noOperations: ContextNowDeps = { runningRuns: () => [], releaseRun: () => null, lateSchedules: () => null };
+
+test('ASK-OP bundle selects required cells with source and read time, within limit', () => {
+  const snapshot: ContextNowAnswer = { at, topic: null, guide: [], events: [], facts: [
+    { kind: 'version', version: '0.2.39', source: 'elanous://release/0.2.39/checklist' },
+    { kind: 'cell', version: '0.2.39', id: 'P0-A', title: '필수 A', status: 'yellow', owner: 'TC', priority: 'P0', source: 'elanous://release/0.2.39/checklist#P0-A' },
+    { kind: 'cell', version: '0.2.39', id: 'P1-B', title: '다음 B', status: 'yellow', owner: 'MK', priority: 'P1', source: 'elanous://release/0.2.39/checklist#P1-B' },
+  ] };
+  const result = buildAskOpContextBundle('이번 판 필수 칸은?', snapshot, { limit: 2 });
+  expect(result.topic).toBe('required');
+  expect(result.queriedAt).toBe(at);
+  expect(result.facts).toEqual([{ kind: 'cell', summary: expect.stringContaining('P0-A'), source: 'elanous://release/0.2.39/checklist#P0-A', observedAt: at }]);
+  expect(result.gaps).toEqual([]);
+  const observedWithoutP0 = { ...snapshot, facts: snapshot.facts.filter(fact => fact.kind !== 'cell' || fact.priority === 'P1') };
+  expect(buildAskOpContextBundle('필수?', observedWithoutP0).gaps).toEqual([{ kind: 'cell', reason: '조회 범위에서 일치하는 P0 없음' }]);
+});
+
+test('ASK-OP bundle separates train evidence from absent evidence and unreadable release', () => {
+  const snapshot: ContextNowAnswer = { at, topic: null, guide: [], events: [
+    { at: '2026-10-03T03:59:00.000Z', kind: 'train-skip', summary: '#31413 열차 SKIP', source: 'elanous://context/event/train-1' },
+  ], facts: [
+    { kind: 'release', version: '', node: '', status: '', unreadable: '원장 읽기 실패', source: 'elanous://graph-runs/release-loop' },
+  ] };
+  expect(buildAskOpContextBundle('열차 상황?', snapshot).facts).toEqual([{ kind: 'train-skip', summary: '#31413 열차 SKIP', source: 'elanous://context/event/train-1', observedAt: '2026-10-03T03:59:00.000Z' }]);
+  const release = buildAskOpContextBundle('발행 상황?', snapshot);
+  expect(release.facts).toEqual([]);
+  expect(release.gaps).toContainEqual({ kind: 'release', reason: '원장 읽기 실패' });
+  expect(buildAskOpContextBundle('결정 상황?', snapshot).gaps).toContainEqual({ kind: 'decision', reason: '미관측' });
+});
+
+test('ASK-OP bundle includes sourced decisions and incidents but excludes a healthy run', () => {
+  const snapshot: ContextNowAnswer = { at, topic: null, guide: [], events: [
+    { at, kind: 'pod-failure', summary: 'Job DeadlineExceeded', source: 'elanous://context/event/incident-1' },
+  ], facts: [
+    { kind: 'decision', id: 'D7', title: '컷 연기', status: 'open', dueAt: null, source: 'elanous://decisions/D7' },
+    { kind: 'run', goal: 'healthy build', phase: 'implement', elapsed: '1분', source: 'elanous://self-implement/running-runs/ok' },
+  ] };
+  expect(buildAskOpContextBundle('결정은?', snapshot).facts).toEqual([
+    { kind: 'decision', summary: 'D7 open 컷 연기', source: 'elanous://decisions/D7', observedAt: at },
+  ]);
+  expect(buildAskOpContextBundle('사고는?', snapshot).facts).toEqual([
+    { kind: 'pod-failure', summary: 'Job DeadlineExceeded', source: 'elanous://context/event/incident-1', observedAt: at },
+  ]);
+});
+
+test('ASK-OP public bundle excludes operational facts and sanitizes event source', () => {
+  const snapshot: ContextNowAnswer = { at, topic: null, guide: [], events: [
+    { at, kind: 'train', summary: 'host node-b 열차 #123', source: 'elanous://context/event/private' },
+  ], facts: [{ kind: 'run', goal: 'private run', phase: 'implement', elapsed: '1분', source: 'elanous://self-implement/running-runs/x' }] };
+  const bundle = buildAskOpContextBundle('열차', snapshot, { audience: 'public-demo' });
+  expect(bundle.facts.some(fact => fact.summary.includes('node-b') || fact.summary.includes('#123'))).toBe(false);
+  expect(bundle.facts.every(fact => fact.source !== 'elanous://context/event/private')).toBe(true);
+});
+
+test('ASK-OP worker failure returns a bounded unknown packet without leaking its error', async () => {
+  const bundle = await askOpContextBundle('이번 판?', {}, async () => { throw new Error('secret /Users/private/auth.json'); });
+  expect(bundle).toMatchObject({ topic: 'release', facts: [], gaps: [{ kind: 'context', reason: '조회 실패' }] });
+  expect(JSON.stringify(bundle)).not.toContain('auth.json');
+});
+
+test('ASK-OP async entry defaults to public audience even when only limit is supplied', async () => {
+  const snapshot: ContextNowAnswer = { at, topic: null, guide: [], events: [], facts: [
+    { kind: 'run', goal: 'private run', phase: 'failed', elapsed: '1분', source: 'elanous://self-implement/running-runs/private' },
+  ] };
+  const bundle = await askOpContextBundle('사고?', { limit: 2 }, async () => snapshot);
+  expect(bundle.facts).toEqual([]);
+  expect(bundle.gaps).toContainEqual({ kind: 'incident', reason: '미관측' });
+  expect(buildAskOpContextBundle('열차 실패?', snapshot).topic).toBe('train');
+});
 
 test('TUI status reads seat facts without release or run sources', () => {
   const root = mkdtempSync(join(tmpdir(), 'context-now-seat-status-'));

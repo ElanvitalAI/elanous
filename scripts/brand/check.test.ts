@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { checkBrand } from './check.js';
+import { checkBrand, checkBrandText } from './check.js';
 
 const cli = join(import.meta.dir, 'check.ts');
 const rules = join(import.meta.dir, '../../docs/brand/brand-rules.yaml');
@@ -47,6 +47,11 @@ test('real rule file compiles and four public fixtures have exact findings and e
       files: 0, findings: [], rules: 0, missing: true, message: '규칙 없음 — 측정 불가',
     });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Codex is allowed as a factual backend flag but remains forbidden in promotional copy', () => {
+  const findings = checkBrandText('--backend codex\nCodex is better.\n', 'brand-exception.md', 'public-docs');
+  expect(findings).toEqual([{ file: 'brand-exception.md', line: 2, id: 'BRAND-COMPETITOR-NAME', match: 'Codex' }]);
 });
 
 test('B8 private markers and host names fail; rule-level code exemption does not bypass B2 or B8', () => {

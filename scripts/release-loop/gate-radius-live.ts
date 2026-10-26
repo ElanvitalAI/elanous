@@ -152,8 +152,10 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
       const planned = planPartialRegate({ version: input.version, priorCommit: stamp.sha, forCommit: input.forCommit,
         changedFiles: effective, priorFailures: failures.failures, priorErrors: failures.errors ?? [],
         existsAtTip: (file) => tree.files.includes(file),
-        closure: (code) => testsReachingChanged(tree, code, tests) });
-      if (!planned.ok && effective.length) return full(planned.reason);
+        closure: (code) => testsReachingChanged(tree, code, tests),
+        priorCutLogs: join(dir, 'gate-logs', 'cut') });
+      if (!planned.ok && (effective.length || planned.reason.startsWith('executed-pod-image-digest-')))
+        return full(planned.reason);
       let fileSet: string[];
       let base: PartialPlan;
       if (planned.ok) {

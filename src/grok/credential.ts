@@ -26,7 +26,7 @@
 //   「Using auth.json for API Access」 절이 유일한 문서다. ⇒ 조용히 깨질 수 있으니
 //   호출자는 실패를 fail-soft 로 접고 API 키 경로로 떨어질 수 있어야 한다.
 
-import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -98,6 +98,7 @@ export interface GrokCredential {
 interface GrokAuthScope {
   key?: unknown;
   expires_at?: unknown;
+  refresh_token?: unknown;
   user_id?: unknown;
 }
 
@@ -112,7 +113,7 @@ export function grokAuthFilePath(home: string = homedir()): string {
  *     키가 다르다(실측: 이 기계는 `https://auth.x.ai::<uuid>`). 그래서 «훑는다». */
 function readSubscriptionToken(
   path: string,
-): { token: string; expiresAt: string | null; userId: string | null } | null {
+): { token: string; expiresAt: string | null; userId: string | null; scopeName: string } | null {
   if (!existsSync(path)) return null;
   let parsed: unknown;
   try {
@@ -120,9 +121,15 @@ function readSubscriptionToken(
   } catch {
     return null;
   }
+  return selectSubscriptionToken(parsed);
+}
+
+function selectSubscriptionToken(
+  parsed: unknown,
+): { token: string; expiresAt: string | null; userId: string | null; scopeName: string } | null {
   if (!parsed || typeof parsed !== 'object') return null;
 
-  type SubscriptionToken = { token: string; expiresAt: string | null; userId: string | null; ms: number };
+  type SubscriptionToken = { token: string; expiresAt: string | null; userId: string | null; scopeName: string; ms: number };
   let best: SubscriptionToken | null = null;
   let hqMirror: SubscriptionToken | null = null;
   for (const [scopeName, scope] of Object.entries(parsed as Record<string, unknown>)) {
@@ -135,13 +142,14 @@ function readSubscriptionToken(
       token: s.key,
       expiresAt,
       userId: typeof s.user_id === 'string' ? s.user_id : null,
+      scopeName,
       ms: Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms,
     };
     if (scopeName === 'https://auth.x.ai::hq-mirror') hqMirror = cand;
     if (best === null || cand.ms > best.ms) best = cand;
   }
-  const selected = hqMirror ?? best;
-  return selected ? { token: selected.token, expiresAt: selected.expiresAt, userId: selected.userId } : null;
+  const selected = hqMirror && (best === null || hqMirror.ms >= best.ms) ? hqMirror : best;
+  return selected ? { token: selected.token, expiresAt: selected.expiresAt, userId: selected.userId, scopeName: selected.scopeName } : null;
 }
 
 /** 호스트 발급 문이 응답에 실을 access. user id 는 반환하지 않는다. */
@@ -156,6 +164,14 @@ export function readGrokSubscriptionAccess(
 /** Read only the selected subscription expiry for status/alert surfaces; never return token or account id. */
 export function readGrokSubscriptionExpiry(home?: string): string | null {
   return readSubscriptionToken(grokAuthFilePath(home))?.expiresAt ?? null;
+}
+
+/** Read the current selected scope for a host-side launch snapshot. */
+export function readSelectedGrokScope(home?: string): { scopeName: string; key: string; expiresAt: string | null; userId: string | null; hasRefreshToken: boolean } | null {
+  const selected = readSelectedScope(grokAuthFilePath(home));
+  if (!selected) return null;
+  return { scopeName: selected.scopeName, key: selected.token, expiresAt: selected.expiresAt,
+    userId: selected.userId, hasRefreshToken: Boolean(selected.refreshToken) };
 }
 
 /** 프록시 필수 헤더. ⛔ `x-grok-client-version` 을 빼면 426 이다(실측). */
@@ -366,23 +382,58 @@ export function resolveGrokCredential(opts: ResolveGrokCredentialOpts = {}): Gro
 
 /** 갱신 유도 결과. ⛔ 「갱신됐다」와 «안 됐다»와 «못 했다»를 다른 값으로. */
 export type GrokRefreshOutcome = 'refreshed' | 'unchanged' | 'failed' | 'no-credential';
+const grokSubscriptionRefreshesInProgress = new Set<string>();
 
 /** 토큰의 만료 시각만 뽑는다(비교용). ⛔ 토큰 값은 안 낸다. */
-function readExpiresAt(path: string): string | null {
-  if (!existsSync(path)) return null;
+function readSelectedScope(path: string): { token: string; expiresAt: string | null; refreshToken: string | null; scopeName: string; userId: string | null } | null {
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
-    if (!parsed || typeof parsed !== 'object') return null;
-    let latest: string | null = null;
-    for (const scope of Object.values(parsed as Record<string, unknown>)) {
-      if (!scope || typeof scope !== 'object') continue;
-      const raw = (scope as GrokAuthScope).expires_at;
-      if (typeof raw === 'string' && (latest === null || raw > latest)) latest = raw;
+    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+    const selected = selectSubscriptionToken(parsed);
+    if (!selected) return null;
+    const scope = parsed[selected.scopeName];
+    if (!scope || typeof scope !== 'object' || Array.isArray(scope)) return null;
+    const value = scope as GrokAuthScope;
+    if (value.key !== selected.token) return null;
+    return {
+      token: selected.token,
+      expiresAt: selected.expiresAt,
+      refreshToken: typeof value.refresh_token === 'string' && value.refresh_token.trim() ? value.refresh_token : null,
+      scopeName: selected.scopeName,
+      userId: selected.userId,
+    };
+  } catch { return null; }
+}
+
+function acquireGrokRefreshFileLock(path: string, timeoutMs: number): (() => void) | null {
+  const lock = `${path}.refresh-lock`;
+  const deadline = Date.now() + timeoutMs;
+  mkdirSync(join(path, '..'), { recursive: true });
+  while (Date.now() <= deadline) {
+    try {
+      mkdirSync(lock, { mode: 0o700 });
+      writeFileSync(join(lock, 'owner'), `${process.pid} ${Date.now()}`, { mode: 0o600, flag: 'wx' });
+      return () => { try { rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ } };
+    } catch {
+      try {
+        const owner = readFileSync(join(lock, 'owner'), 'utf8').trim().split(/\s+/);
+        const pid = Number(owner[0]);
+        const started = Number(owner[1]);
+        let alive = false;
+        if (Number.isSafeInteger(pid) && pid > 0) {
+          try { process.kill(pid, 0); alive = true; } catch (error) { alive = (error as NodeJS.ErrnoException).code === 'EPERM'; }
+        }
+        // The holder may outlive this waiter's timeout; only a dead PID is stale.
+        if (!alive && Number.isFinite(started) && Date.now() - started > 30_000) rmSync(lock, { recursive: true, force: true });
+      } catch {
+        // A crash between mkdir and writing owner leaves no PID to inspect.
+        // Give a live creator time to finish, then recover the orphan directory.
+        try { if (Date.now() - statSync(lock).mtimeMs > 30_000) rmSync(lock, { recursive: true, force: true }); }
+        catch { /* another process may be creating or removing the lock */ }
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
     }
-    return latest;
-  } catch {
-    return null;
   }
+  return null;
 }
 
 /**
@@ -412,30 +463,51 @@ export function refreshGrokSubscriptionToken(
     timeoutMs?: number;
     /** ⛔ 테스트 심 — 실 바이너리 없이 계약을 문다. */
     execImpl?: (cmd: string, args: string[], timeoutMs: number) => void;
+    /** Require a non-empty refresh token on the selected access scope before launching the CLI. */
+    requireRefreshToken?: boolean;
+    requiredValidityMs?: number;
+    nowMs?: number;
   } = {},
 ): GrokRefreshOutcome {
   const path = grokAuthFilePath(opts.home);
-  const before = readExpiresAt(path);
-  if (before === null && !existsSync(path)) return 'no-credential';
-
+  const selected = readSelectedScope(path);
+  if (!selected) return 'no-credential';
+  if (opts.requireRefreshToken && !selected.refreshToken) return 'no-credential';
+  // A nested refresh for the same auth file observes the outer call's result later.
+  if (grokSubscriptionRefreshesInProgress.has(path)) return 'unchanged';
+  grokSubscriptionRefreshesInProgress.add(path);
+  const releaseLock = acquireGrokRefreshFileLock(path, opts.timeoutMs ?? 20_000);
+  if (!releaseLock) { grokSubscriptionRefreshesInProgress.delete(path); return 'failed'; }
   try {
+    const current = readSelectedScope(path);
+    if (!current || current.scopeName !== selected.scopeName) return 'no-credential';
+    if (opts.requireRefreshToken && !current.refreshToken) return 'no-credential';
+    // Only the Pod preflight supplies a validity target. An explicit refresh call still invokes the CLI.
+    const expiresMs = current.expiresAt ? Date.parse(current.expiresAt) : NaN;
+    if (opts.requiredValidityMs !== undefined && Number.isFinite(expiresMs)
+      && expiresMs - (opts.nowMs ?? Date.now()) >= opts.requiredValidityMs) return 'unchanged';
     const timeoutMs = opts.timeoutMs ?? 20_000;
-    if (opts.execImpl) {
-      opts.execImpl(opts.grokPath ?? 'grok', ['models'], timeoutMs);
-    } else {
-      const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
-      execFileSync(opts.grokPath ?? 'grok', ['models'], {
-        timeout: timeoutMs,
-        stdio: ['ignore', 'ignore', 'ignore'],
-      });
-    }
-  } catch {
-    return 'failed';
+    try {
+      if (opts.execImpl) {
+        opts.execImpl(opts.grokPath ?? 'grok', ['models'], timeoutMs);
+      } else {
+        const { execFileSync } = require('node:child_process') as typeof import('node:child_process');
+        execFileSync(opts.grokPath ?? 'grok', ['models'], {
+          timeout: timeoutMs,
+          stdio: ['ignore', 'ignore', 'ignore'],
+        });
+      }
+    } catch { return 'failed'; }
+    const after = readSelectedScope(path);
+    if (!after) return 'no-credential';
+    const afterMs = after?.expiresAt ? Date.parse(after.expiresAt) : NaN;
+    return after?.scopeName === current.scopeName && Number.isFinite(afterMs)
+      && (!Number.isFinite(expiresMs) || afterMs > expiresMs)
+      ? 'refreshed' : 'unchanged';
+  } finally {
+    releaseLock();
+    grokSubscriptionRefreshesInProgress.delete(path);
   }
-
-  const after = readExpiresAt(path);
-  // ⛔ 「돌았다」가 아니라 「만료가 «앞으로» 갔다」를 본다.
-  return after !== null && after !== before ? 'refreshed' : 'unchanged';
 }
 
 // ── ⭐ 「접힌」 자격 해석 — 호출자가 «기억할 것»을 0 으로 ────────────────────────
@@ -492,7 +564,6 @@ export function isGrokSubscriptionExpiring(
 
 /** 구독 만료 상태 — 칸 CRED-EXPIRY-REFRESH 기준 창. 이 안에 만료가 오면 갱신 후보다. */
 export const GROK_EXPIRY_SOON_WINDOW_MS = 2 * 60 * 60 * 1000;
-
 /** 만료 상태 셋 — ⛔ boolean 으로 접으면 「모름」과 «여유»가 «같은 값»이 된다. */
 export type GrokSubscriptionExpiryState = 'healthy' | 'expiring' | 'unknown';
 
