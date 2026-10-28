@@ -54,7 +54,7 @@ export interface SurfaceUx {
   /** HITL 승인(버튼). 채널 없으면 **fail-closed → false**(자동승인 금지·제1원칙). */
   confirm(req: ConfirmRequest): Promise<boolean>;
   /** 구조화 질문(N옵션). 채널 없으면 null(호출자가 default-and-note). */
-  question(req: AskUserQuestionRequest): Promise<AskUserQuestionResult | null>;
+  question(req: AskUserQuestionRequest, opts?: { timeoutMs?: number }): Promise<AskUserQuestionResult | null>;
   /** 큰 출력 파일 첨부(fire-and-forget · 실패 삼킴). sink 없으면 no-op. */
   spillFile(f: SurfaceSpillFile): void;
   /** 진행 상태 push(비동기·best-effort). emitFeedback 없으면 no-op. */

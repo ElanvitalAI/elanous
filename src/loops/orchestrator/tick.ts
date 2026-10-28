@@ -6,6 +6,7 @@ import { Database } from 'bun:sqlite';
 import { checklistDevVersion, listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
 import { readTrafficSignal } from '../../seat-loop/traffic-signal.js';
 import { runHoldHygiene, type HygieneCell, type HygieneDeps } from '../../steward/hold-hygiene.js';
+import { runDirectiveAudit, type DirectiveAuditDeps } from '../../steward/directive-audit.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, resolveConfiguredAgentRoleLlm, type OrchestratorLoopConfig } from '../../user-config.js';
 import { rubricPriority } from '../../release-loop/rubric.js';
@@ -70,6 +71,7 @@ export interface TickDeps {
   heartbeatIntervalMs?: number;
   hygieneCells?: () => HygieneCell[];
   hygienePaths?: Pick<HygieneDeps, 'trafficPath' | 'metaPath' | 'dispatcherDir'>;
+  directiveAudit?: DirectiveAuditDeps;
   cards?: () => TaskCard[]; split?: SplitAdapter; placeCell?: PlaceAdapter;
   degradation?: () => { llm: boolean; board: boolean };
   gridHosts?: readonly GridHost[];
@@ -960,6 +962,12 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
           const sent = runHoldHygiene({ root, now, cells, ...deps.hygienePaths });
           for (const notice of sent) observe('exchange', `hold-hygiene:${notice.key}`, 1, SEAT_LOOP_IDS[notice.to]);
         } catch (error) { observe('hold-hygiene-failed', String(error).slice(0, 160), 0); }
+        // COORD-DIRECTIVE-AUDIT — 지시 원장 행마다 로직 점검(원장·로그·config)을 실제로 돌린다.
+        try {
+          const audit = runDirectiveAudit({ root, now: currentTime, ...deps.directiveAudit });
+          if (audit.alerts.length > 0) observe('directive-audit', `alerts:${audit.alerts.length}`, audit.alerts.length);
+          for (const proposal of audit.proposals) observe('directive-audit', `repair-proposal:${proposal.id}`, 1);
+        } catch (error) { observe('directive-audit-failed', String(error).slice(0, 160), 0); }
       }
       (deps.print ?? console.log)(reportLine(state));
     }

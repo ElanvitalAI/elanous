@@ -72,6 +72,9 @@ export interface AgentDefinition {
  *  other than by going through registry methods. */
 export interface AgentTask {
   id: string;
+  /** Optional identity links for managed non-LLM jobs hosted by the registry. */
+  runId?: string;
+  parentSessionId?: string;
   definition: AgentDefinition;
   /** Caller-supplied short label for this specific spawn — distinct
    *  from `definition.description` which is the boilerplate stamp

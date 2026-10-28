@@ -103,6 +103,14 @@ test('deadline and missing reply are unknown after exec and require reconciliati
     .toEqual({ next: 'reconcile-only', quarantineWorker: true });
 });
 
+test('a command whose deadline is not a usable future instant fails closed at the wire', () => {
+  expect(parseSiWarmCommand({ ...command, deadlineAt: 0 })).toBeNull();
+  expect(parseSiWarmCommand({ ...command, deadlineAt: -1 })).toBeNull();
+  expect(parseSiWarmCommand({ ...command, deadlineAt: Number.NaN })).toBeNull();
+  expect(parseSiWarmCommand({ ...command, deadlineAt: Number.POSITIVE_INFINITY })).toBeNull();
+  expect(parseSiWarmCommand(command)).toEqual(command);
+});
+
 test('only a fenced lease that never entered Pod exec may use a cold Job', () => {
   expect(decideSiWarmNextStep({ boundary: 'not-entered', leaseFenced: true }))
     .toEqual({ next: 'cold-job', quarantineWorker: false });

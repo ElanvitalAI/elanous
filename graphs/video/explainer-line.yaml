@@ -6,6 +6,8 @@ graph_id: explainer-line
 version: 1
 entry_node: script
 terminal_nodes: [delivered, needs-human, blocked, unobserved]
+# ⭐ 요청 동작 — 3분 영상: 이 라인이 만드는 영상 계획의 목표 총 길이는 180초다(지속 필드 target_seconds · 단위 초).
+target_seconds: 180
 nodes:
   - node_id: script
     kind: agent
@@ -55,4 +57,5 @@ edges:
   # check/snapshot failures are layout faults → rebuild; a wrong-length render is a timing fault → rebuild too.
   - { from: render, on: outcome, map: { ok: qc, check-fail: build, render-mismatch: build, unmeasurable: unobserved } }
   # speech ≠ script → re-voice that line; loudness off → rebuild (mix lives in the composition); public release is a human call.
-  - { from: qc, on: outcome, map: { pass: delivered, vo-mismatch: vo, loudness: build, public: needs-human, unmeasurable: unobserved } }
+  # narration past the target_seconds(180) plan is a timing fault → rebuild too.
+  - { from: qc, on: outcome, map: { pass: delivered, vo-mismatch: vo, loudness: build, too-long: build, public: needs-human, unmeasurable: unobserved } }

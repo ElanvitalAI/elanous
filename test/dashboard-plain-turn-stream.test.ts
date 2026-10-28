@@ -17,6 +17,7 @@ interface StreamSpy {
   toolCalls: unknown[];
   toolResults: unknown[];
   usage: unknown[];
+  statuses: string[];
   pushChunkCalls: string[];
   commitCalls: number;
   cancelCalls: number;
@@ -35,6 +36,7 @@ function buildDeps(opts: {
     toolCalls: [],
     toolResults: [],
     usage: [],
+    statuses: [],
     pushChunkCalls: [],
     commitCalls: 0,
     cancelCalls: 0,
@@ -52,6 +54,7 @@ function buildDeps(opts: {
     onToolCall: (call) => spy.toolCalls.push(call),
     onToolResult: (r) => spy.toolResults.push(r),
     onUsage: (u) => spy.usage.push(u),
+    onStatus: (line) => spy.statuses.push(line),
     autoTts: {
       pushChunk: (c) => spy.pushChunkCalls.push(c),
       commit: () => { spy.commitCalls += 1; },
@@ -72,6 +75,15 @@ function buildDeps(opts: {
 }
 
 describe('runDashboardPlainTurnStream — happy path', () => {
+  it('forwards transient status callbacks to the dashboard owner', async () => {
+    const send: DashboardPlainTurnAcpSend = {
+      async send(opts) { opts.onStatus?.('스트림 무응답 · 재시도'); opts.onText('recovered'); },
+    };
+    const { deps, spy } = buildDeps({ send });
+    await runDashboardPlainTurnStream(deps);
+    expect(spy.statuses).toEqual(['스트림 무응답 · 재시도']);
+  });
+
   it('forwards text chunks + accumulates fullResponse + settles end_turn', async () => {
     const send: DashboardPlainTurnAcpSend = {
       async send(opts) {

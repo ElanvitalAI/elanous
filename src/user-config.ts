@@ -187,6 +187,8 @@ export interface LLMConfig {
   apiKey?: string;
   model?: string;
   baseUrl?: string;
+  /** Override the text stream idle watchdog in milliseconds. Omitted keeps provider/family defaults. */
+  streamIdleTimeoutMs?: number;
   /** OpenRouter 설정 한 곳(두 골이 같은 키를 쓴다):
    *  - `providerPreferences` — 상류 라우팅 선호; 도구 가능 기본값(require_parameters·allow_fallbacks)을 얕게 덮는다(OR-LLM-ROUTING-1).
    *  - `fallbackModel` — 유료 OpenRouter 폴백 모델; 체인에 openrouter 를 명시하고 모델·키를 모두 줄 때만 선택된다(OR-FALLBACK-TIER-1).
@@ -1986,6 +1988,8 @@ function parseTasteConfig(raw: unknown): TasteConfig | undefined {
  */
 export interface WebSearchConfig {
   tavily?: { enabled?: boolean };
+  grokApi?: { enabled?: boolean };
+  firecrawl?: { enabled?: boolean };
 }
 
 /** OpenDesign 데몬 접속. url 이 없으면 시안 생성은 꺼진 것이다. tokenFile 은 토큰 «경로»만 담는다. */
@@ -2032,6 +2036,13 @@ function parseWebSearchConfig(raw: unknown): WebSearchConfig | undefined {
     const t = r.tavily as Record<string, unknown>;
     if (typeof t.enabled === 'boolean') out.tavily = { enabled: t.enabled };
   }
+  for (const key of ['grokApi', 'firecrawl'] as const) {
+    const section = r[key];
+    if (section && typeof section === 'object' && !Array.isArray(section)) {
+      const enabled = (section as Record<string, unknown>).enabled;
+      if (typeof enabled === 'boolean') out[key] = { enabled };
+    }
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -2039,6 +2050,11 @@ function parseWebSearchConfig(raw: unknown): WebSearchConfig | undefined {
  *  ⭐ 한 자리에서만 판정한다 — 소비처가 각자 `?.enabled` 를 읽으면 기본값 해석이 갈린다. */
 export function isTavilySearchEnabled(cfg: Pick<UserConfig, 'webSearch'> = getUserConfig()): boolean {
   return cfg.webSearch?.tavily?.enabled === true;
+}
+
+/** An API key being present does not authorize metered web search. */
+export function isPaidWebSearchEnabled(provider: 'grokApi' | 'firecrawl', cfg: Pick<UserConfig, 'webSearch'> = getUserConfig()): boolean {
+  return cfg.webSearch?.[provider]?.enabled === true;
 }
 
 function parseSessionFabricConfig(raw: unknown): SessionFabricConfig | undefined {
@@ -3901,8 +3917,8 @@ function parseProjectsConfig(raw: unknown): Record<string, ProjectConfig> | unde
 }
 
 export interface UserConfig {
-  /** Next TUI sidetab visibility: off disables it, collapsed starts folded, open starts visible. */
-  tui?: { sidetab?: 'off' | 'collapsed' | 'open' };
+  /** Next TUI options. `unattended` makes confirmation/clarification paths non-blocking. */
+  tui?: { sidetab?: 'off' | 'collapsed' | 'open'; unattended?: boolean };
   projects?: Record<string, ProjectConfig>;
   /** Default personal topic watch; absent = enabled when user sources exist. */
   watch?: { enabled?: boolean };
@@ -3937,7 +3953,7 @@ export interface UserConfig {
   loops?: { owners?: Record<string, EventSeat>; defaultOwner?: EventSeat; orchestrator?: OrchestratorLoopConfig; steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; /** `auto` = SUBSTRATE-ROUTE: routeAutoSubstrate 가 pod/local 을 고른다(신호가 없으면 pod). */ substrate?: 'local' | 'pod' | 'auto'; podPool?: string; /** IMAGE-ONE-SOURCE: Pod 발사가 당길 기준 이미지 커밋(hex 12~40 · 레지스트리 태그 = 앞 12자리). 없으면 종전대로 HEAD 비교·굽기. */ imageCommit?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number; /** QUEUE-BURST: most launches one scheduled tick may make (30 s apart, each within seat cap and Pod pool headroom). Absent or invalid = 5; 1 = one launch per tick. */ burstMax?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** SIBLING-RESYNC-ON-MERGE: most open sibling PR file inventories fetched per merge. Absent or invalid = 40. */ siblingResync?: { maxFetch?: number }; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
+  harness?: { /** KNOWHOW-PACK-TO-SUPERVISORS: child goal injection is legacy opt-in; omitted = off. */ knowhowChildInjection?: boolean; edgeRail?: { canaryOkRuns?: number; failureMultiplier?: number; minSamples?: number }; /** Goal authoring grade; absent or invalid config resolves to full. */ authorGrade?: 'full' | 'lite'; revertGuard?: { depth: number }; pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; exposeGate?: 'warn' | 'strict'; difficultyPlacement?: boolean; defaultRepo?: string; /** Optional GitHub repository name (owner/repo), distinct from the local defaultRepo path. */ repo?: string; /** `auto` = SUBSTRATE-ROUTE: routeAutoSubstrate 가 pod/local 을 고른다(신호가 없으면 pod). */ substrate?: 'local' | 'pod' | 'auto'; podPool?: string; /** IMAGE-ONE-SOURCE: Pod 발사가 당길 기준 이미지 커밋(hex 12~40 · 레지스트리 태그 = 앞 12자리). 없으면 종전대로 HEAD 비교·굽기. */ imageCommit?: string; worktreeAddTimeoutSec?: number; queue?: { seatCap?: Partial<Record<'OP' | 'TC' | 'MK' | 'UX', number>>; /** Direct `harness say|ask` goes through the seat queue first (ONEDOOR-2). Absent = env ELANOUS_HARNESS_QUEUE_DIRECT_SAY, else off. */ directSay?: boolean; /** SEAT-CAP-STALE: a run whose last ledger progress is older than this stops holding its seat. Absent = env ELANOUS_HARNESS_QUEUE_STALE_RUN_MINUTES, else 30. */ staleRunMinutes?: number; /** Seat-less runs count in one bucket with this cap instead of every seat. Absent = env ELANOUS_HARNESS_QUEUE_UNKNOWN_SEAT_CAP, else 2. */ unknownSeatCap?: number; /** QUEUE-BURST: most launches one scheduled tick may make (30 s apart, each within seat cap and Pod pool headroom). Absent or invalid = 5; 1 = one launch per tick. */ burstMax?: number }; /** `harness say` 문장을 Pod 안에서 저작부터 돌릴지. 생략·false = 끔(호스트가 저작). */ authorOnPod?: boolean; /** SIBLING-RESYNC-ON-MERGE: most open sibling PR file inventories fetched per merge. Absent or invalid = 40. */ siblingResync?: { maxFetch?: number }; /** Stopped-PR repair goals: shadow records only (default); live enqueues them. */ helper?: { repair?: 'shadow' | 'live'; /** Live launches allowed per UTC day. Absent or invalid means 3. */ repairPerDay?: number };
   /** Nested elanous launches. Only depth 0 may set `allow`. Absent or any other value refuses. A depth >= 1 `--nested-elanous allow` is ignored. */
   nestedElanous?: 'allow' | 'refuse';
   /** Maximum nested elanous depth; safe positive integer, default 2. */
@@ -5135,7 +5151,10 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const gateRemoteConfig = parseGateRemoteConfig(rawObj.gateRemote);
   const projects = parseProjectsConfig(rawObj.projects);
   return {
-    tui: { sidetab: tuiRaw.sidetab === 'off' || tuiRaw.sidetab === 'open' ? tuiRaw.sidetab : 'collapsed' },
+    tui: {
+      sidetab: tuiRaw.sidetab === 'off' || tuiRaw.sidetab === 'open' ? tuiRaw.sidetab : 'collapsed',
+      ...(typeof tuiRaw.unattended === 'boolean' ? { unattended: tuiRaw.unattended } : {}),
+    },
     ...(projects ? { projects } : {}),
     ...(rawObj.starter && typeof rawObj.starter === 'object' && !Array.isArray(rawObj.starter)
       && Array.isArray((rawObj.starter as Record<string, unknown>).topics)
@@ -5305,6 +5324,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         };
       })(),
       model: resolveRuntimeLlmModel(baseProvider, selectedProvider, str(llm.model), escalationProvider || undefined),
+      streamIdleTimeoutMs: positiveFiniteNumber(llm.streamIdleTimeoutMs),
       openrouter: (() => {
         const router = llm.openrouter;
         if (!router || typeof router !== 'object' || Array.isArray(router)) return undefined;
@@ -6227,6 +6247,15 @@ export function getUserConfig(path: string = defaultPath()): UserConfig {
   return cache;
 }
 
+/** Resolve the explicit TUI unattended switch: saved user config wins over the seat-launch env override. */
+export function resolveTuiUnattended(
+  config: UserConfig = getUserConfig(),
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (typeof config.tui?.unattended === 'boolean') return config.tui.unattended;
+  return env.ELANOUS_TUI_UNATTENDED === '1';
+}
+
 // Read at call time, not registration time, so reload/reset and on-disk edits keep their semantics.
 // Stored timezone is kept in raw by buildUserConfig; do not change getUserConfig's returned shape.
 setConfigTimeZoneSource(() => {
@@ -6623,6 +6652,7 @@ export function saveUserConfig(
       apiKey: cfg.llm.apiKey,
       model: cfg.llm.model,
       baseUrl: cfg.llm.baseUrl,
+      streamIdleTimeoutMs: cfg.llm.streamIdleTimeoutMs,
       // Persist the rotation exactly as held in memory — each entry
       // stripped of its own undefined fields so the on-disk JSON
       // stays minimal. Omit the key entirely when no rotation is

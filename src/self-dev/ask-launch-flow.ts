@@ -38,17 +38,15 @@ import {
 import { execFileSync } from 'node:child_process';
 import { dirname, isAbsolute as isAbsolutePath, relative as relativePath, resolve as resolvePath, sep } from 'node:path';
 import {
-  applyClarificationReply,
   planClarificationIntake,
   selfAnswerGoalDocumentClarifications,
   type GoalClarificationSelfResolver,
 } from '../self-implement/goal-author-clarification.js';
-import { classifyReauthoredAsk, countMissingAuthoredConstraintMarkers, askGoalTypeDeclaration, declaredGoalType, parseGoalId } from '../self-implement/goal-author.js';
+import { countMissingAuthoredConstraintMarkers, askGoalTypeDeclaration, declaredGoalType, parseGoalId } from '../self-implement/goal-author.js';
 import { observeFrontNodeEntry, observeFrontNodeExit, observeFrontNodeUnit, type AuthorExitOutcome } from './graph-front-nodes.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { decomposeSelfDevGoal, type SelfDevDecomposeOptions, type SelfDevDecomposition } from './decompose.js';
 import { observeDecomposerSelection, readFabricDecomposeConfig, selectFabricDecomposer } from './self-orchestrate-runtime.js';
-import type { GoalDocumentClarification } from '../self-implement/goal-author-clarification.js';
 
 export type SelfResolveClarificationsSource = 'flag' | 'default';
 
@@ -187,7 +185,6 @@ export interface AskLaunchFlowDeps {
   readLine(prompt: string): Promise<string>;
   /** Optional structured clarification adapter. Omitted callers retain the
    * existing CLI line-input contract exactly. */
-  readClarification?(clarification: GoalDocumentClarification): Promise<string>;
   selfResolveClarification?: GoalClarificationSelfResolver;
   /** Replaces the goal document after a self-answer; production entrances pass an atomic writer. */
   writeGoalDocument?(path: string, document: string): void;
@@ -753,8 +750,7 @@ async function runPrePreflight(
     : false;
 }
 
-/** ⑴b 되묻기 «수신» — 답이 들어가면 «재저작»하고 그 새 골을 돌려준다.
- *  ⛔ 무인 계약은 그대로다 — 대화형이 «아니면» 종전처럼 지나가고, 그 사실을 관측에 남긴다. */
+/** ⑴b 되묻기 intake — shared self-resolution policy, then continue with answered/deferred goal. */
 async function intakeClarifications(
   authored: AskAuthoredGoal,
   input: AskLaunchFlowInput,
@@ -775,113 +771,45 @@ async function intakeClarifications(
     interactive: deps.isInteractive(),
     goalFile: effectiveGoalFile,
   }, 'info');
-  if (mode === 'none') {
+  if (pending.length === 0) {
     deps.print('[ask] ⑴b 되묻기 없음 — 저작기가 물을 것이 없었다');
     return effectiveGoalFile;
   }
-  if (mode === 'deferred-noninteractive') {
-    // The resolver comes in through deps (I/O seam): production entrances pass the author
-    // self-resolver; a caller that injects none keeps the previous deferred behaviour.
-    if (selfResolveClarifications.value && deps.selfResolveClarification) try {
-      const resolution = await selfAnswerGoalDocumentClarifications(document, {
-        path: 'ask', ask: input.askText, resolver: deps.selfResolveClarification,
-      });
-      if (resolution.newlyAnswered > 0) {
-        (deps.writeGoalDocument ?? deps.writeFile)(effectiveGoalFile, resolution.document);
-        document = resolution.document;
-      }
-    } catch (error) {
-      deps.log('ask-clarify', { goalFile: effectiveGoalFile, reason: 'self-answer-failed', error: error instanceof Error ? error.message : String(error) }, 'warn');
-    }
-    const remaining = planClarificationIntake(document, false).pending;
-    // 미답으로 남은 문항만 기존 답변 창구를 안내한다.
-    deps.print(`[ask] ⑴b ⚠️ 미답 되묻기 ${remaining.length}건 — 저작은 그대로 간다 · 구현 전에 LLM 릴레이가 먼저 답하고, 못 하면 미답으로 진행한다 (사람을 기다리지 않는다)`);
-    for (const item of remaining) {
-      deps.print(`[ask]    ❓ [${item.questionId}] ${item.question}`);
-      item.options.forEach((option, index) => deps.print(`[ask]       ${index}) ${option.label}`));
-    }
-    if (remaining.length > 0) {
-      const goalArg = deps.relativeToCwd(effectiveGoalFile);
-      deps.print(`[ask]    ▶ 답하려면: elanous self clarify answer ${goalArg} <questionId> <옵션번호>   (자유 답은 --other "<문장>")`);
-      deps.print(`[ask]    ▶ 답한 뒤 재저작: elanous self author --supersedes ${goalArg}`);
-    }
-    return effectiveGoalFile;
-  }
-  deps.print(`[ask] ⑴b 저작기가 ${pending.length}건 묻는다 — 빈 줄은 건너뛴다(그 건은 DEFERRED 로 남는다)`);
-  let answeredCount = 0;
-  let seedQuestionId = '';
-  for (const item of pending) {
-    deps.print(`\n[ask] ❓ ${item.question}`);
-    item.options.forEach((option, index) => deps.print(`        ${index}) ${option.label} — ${option.description}`));
-    if (item.includeOther) deps.print('        (숫자 = 위 옵션 · 그 밖의 입력 = 자유 답 · 빈 줄 = 건너뜀)');
-    const reply = deps.readClarification
-      ? await deps.readClarification(item)
-      : await deps.readLine('        > ');
-    // ⛔ 「옵션인가 자유 답인가 · 빈 줄인가」 판정도 순수 seam 이 한다.
-    const applied = applyClarificationReply(document, item, reply);
-    if (!applied.answered) continue;
-    document = applied.document;
-    if (answeredCount === 0) seedQuestionId = item.questionId;
-    answeredCount += 1;
-  }
-  deps.log('ask-clarify', {
-    inputSource: input.inputSource, goalFile: effectiveGoalFile,
-    pendingCount: pending.length, answeredCount, interactive: deps.isInteractive(),
-  }, 'info');
-  if (answeredCount === 0) {
-    deps.print('[ask] ⑴b 답이 없다 — 그대로 간다(미답은 골에 DEFERRED 로 남는다)');
-    return effectiveGoalFile;
-  }
-  deps.writeFile(effectiveGoalFile, document);
-  deps.print(`[ask] ⑴b ${answeredCount}건 답함 — 그 답을 시드로 «재저작»한다`);
-  // ⭐ `--from-clarification` 은 답한 것 «전부»를 시드로 가져간다(하나만 지목해도 된다).
-  const reauthored = await deps.authorGoal([], {
-    cwd: deps.cwd(),
-    ...(input.groundingCwd === undefined ? {} : { groundingCwd: input.groundingCwd }),
-    ...(input.authorGrade === undefined ? {} : { authorGrade: input.authorGrade }),
-    fromClarification: `${deps.relativeToCwd(effectiveGoalFile)}#${seedQuestionId}`,
-    reauthorFromAnsweredClarification: true,
-    selfResolveClarifications: selfResolveClarifications.value,
-  });
-  const parentDocument = document;
-  effectiveGoalFile = isAbsolutePath(reauthored.path) ? reauthored.path : resolvePath(deps.cwd(), reauthored.path);
-  deps.print(`[ask] ⑴b 재저작됨: ${reauthored.path}`);
-  // 재저작도 «같은 저작 진입점»이다 — 접지가 예산 초과로 끊기면 같은 결과 줄을 쓴다(조용히 넘기지 않는다).
-  const reauthoredTimebox = reauthored.authored?.document === undefined
-    ? null
-    : readGoalAuthorGroundingTimebox(reauthored.authored.document);
-  if (reauthoredTimebox !== null) {
-    deps.print(formatGoalAuthorTimeboxResultLine(reauthored.path, reauthoredTimebox));
-    deps.log('ask-author-timebox', {
-      goalFile: reauthored.path,
-      provenance: 'reauthor',
-      outcome: 'NOT-GROUNDED',
-      budgetMs: reauthoredTimebox.budgetMs,
-      elapsedMs: reauthoredTimebox.elapsedMs,
-      grounded: reauthored.authored?.grounded ?? null,
-    }, 'warn');
-    // ⛔⭐⭐ 재저작 NOT-GROUNDED 도 «끝»이다 — 결과 줄을 쓰고 되묻기 이후 단계로 지나가지 않는다.
-    observeFrontNodeExit({ node: 'author', outcome: 'not-grounded' }, {
-      ...(input.runId === undefined ? {} : { runId: input.runId }),
-      attempt: 1, goalFile: effectiveGoalFile,
-      reason: `grounding-timebox-exhausted (budget ${reauthoredTimebox.budgetMs}ms, elapsed ${reauthoredTimebox.elapsedMs}ms)`,
+  // Deferred and interactive entrances share the same per-question resolution policy used by
+  // direct goal authoring. In particular, never read from the TUI here: unresolved stays DEFERRED.
+  if (selfResolveClarifications.value && deps.selfResolveClarification) try {
+    const resolution = await selfAnswerGoalDocumentClarifications(document, {
+      path: 'ask', ask: input.askText, resolver: deps.selfResolveClarification,
     });
-    return { kind: 'stopped-by-timebox', goalFile: effectiveGoalFile };
+    if (resolution.newlyAnswered > 0) {
+      (deps.writeGoalDocument ?? deps.writeFile)(effectiveGoalFile, resolution.document);
+      document = resolution.document;
+    }
+  } catch (error) {
+    deps.log('ask-clarify', { goalFile: effectiveGoalFile, reason: 'self-answer-failed', error: error instanceof Error ? error.message : String(error) }, 'warn');
+    }
+  const remaining = planClarificationIntake(document, false).pending;
+  deps.log('ask-clarify', {
+    goalFile: effectiveGoalFile, pendingCount: pending.length,
+    selfAnsweredCount: pending.length - remaining.length, unansweredCount: remaining.length,
+    interactive: deps.isInteractive(), continuedWithoutPrompt: true,
+  }, remaining.length ? 'warn' : 'info');
+  if (remaining.length > 0) {
+    deps.print(`[ask] ⑴b ⚠️ 미답 되묻기 ${remaining.length}건 — 골에 DEFERRED 로 기록하고 사람 입력을 기다리지 않고 진행한다`);
+    const goalFile = deps.relativeToCwd(effectiveGoalFile);
+    for (const item of remaining) {
+      deps.print(`[ask]    ❓ [${item.questionId}] ${item.question} — DEFERRED`);
+      if (item.options.length > 0) {
+        deps.print(`[ask]       선택지 답변: elanous self clarify answer ${goalFile} ${item.questionId} <0-based-optionIndex>`);
+      }
+      if (item.includeOther) {
+        deps.print(`[ask]       자유 답변: elanous self clarify answer ${goalFile} ${item.questionId} --other "<답>"`);
+      }
+      deps.print(`[ask]       골을 다시 저작하려면: elanous self author --from-clarification ${goalFile}#${item.questionId}`);
+    }
+  } else {
+    deps.print(`[ask] ⑴b ${pending.length}건 자동 후보 선택 — 근거와 가정을 골에 기록했다`);
   }
-  // ⛔ 「재저작이 «났다»」와 「재저작이 «옳았다»」는 다른 물음이다(JDG-T35 3단 ⑶).
-  const childDocument = reauthored.authored?.document ?? deps.readFile(effectiveGoalFile);
-  const askFidelity = classifyReauthoredAsk(parentDocument, childDocument);
-  if (askFidelity !== 'preserved') {
-    deps.print(`[ask] ⑴b ⚠️ 재저작 ask 판정: ${askFidelity} — ⛔ 「preserved」가 아니면 사람의 ask 가 살아남았는지 «확인하라»`);
-  }
-  deps.log('ask-reauthored', {
-    inputSource: input.inputSource, fromGoalFile: authored.path,
-    goalFile: reauthored.path, answeredCount,
-    grounded: reauthored.authored?.grounded ?? null,
-    askFidelity,
-    selfResolveClarifications: selfResolveClarifications.value,
-    selfResolveClarificationsSource: selfResolveClarifications.source,
-  }, 'info');
   return effectiveGoalFile;
 }
 

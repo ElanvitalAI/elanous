@@ -29,6 +29,9 @@ interface PodWorkerLeaseAttrs {
   idleTtlMs: number;
   leaseId?: string;
   leaseOwner?: string;
+  /** The just-sanitized generation remains fenceable until the next acquisition. */
+  lastLeaseId?: string;
+  lastLeaseOwner?: string;
   runId?: string;
   attemptId?: string;
   reason?: string;
@@ -235,8 +238,11 @@ export class ResourceLedger {
     if (index < 0) throw new ResourceLedgerError(409, 'no-warm-worker');
     const row = rows[index]!;
     const attrs = workerAttrs(row);
-    const next: ResourceRecord = { ...row, attrs: { ...attrs, state: 'leased', generation: attrs.generation + 1,
-      leaseId: randomUUID(), leaseOwner: request.owner, runId: request.runId, attemptId: request.attemptId },
+    const nextAttrs: PodWorkerLeaseAttrs = { ...attrs, state: 'leased', generation: attrs.generation + 1,
+      leaseId: randomUUID(), leaseOwner: request.owner, runId: request.runId, attemptId: request.attemptId };
+    delete nextAttrs.lastLeaseId;
+    delete nextAttrs.lastLeaseOwner;
+    const next: ResourceRecord = { ...row, attrs: nextAttrs as unknown as Record<string, unknown>,
       observedAt: at, ttlMs: request.ttlMs };
     rows[index] = next;
     this.write(rows);
@@ -252,9 +258,13 @@ export class ResourceLedger {
     if (index < 0) throw new ResourceLedgerError(404, 'not-found');
     const row = rows[index]!;
     const attrs = workerAttrs(row);
-    if (!request.leaseId || attrs.leaseId !== request.leaseId || attrs.generation !== request.generation) throw new ResourceLedgerError(409, 'stale-worker-lease');
+    const lateIdleQuarantine = request.action === 'quarantine' && attrs.state === 'idle'
+      && attrs.lastLeaseId === request.leaseId && attrs.generation === request.generation;
+    if (!request.leaseId || (attrs.leaseId !== request.leaseId && !lateIdleQuarantine)
+      || attrs.generation !== request.generation) throw new ResourceLedgerError(409, 'stale-worker-lease');
     const permitted = request.action === 'sanitize' ? row.owner === request.owner
       : request.action === 'quarantine' ? row.owner === request.owner || attrs.leaseOwner === request.owner
+        || (lateIdleQuarantine && attrs.lastLeaseOwner === request.owner)
       : attrs.leaseOwner === request.owner;
     if (!permitted) {
       throw new ResourceLedgerError(403, 'not-owner');
@@ -266,7 +276,14 @@ export class ResourceLedger {
     const state: PodWorkerState = request.action === 'renew' ? 'leased' : request.action === 'release' ? 'sanitizing'
       : request.action === 'sanitize' ? 'idle' : 'quarantined';
     const nextAttrs: PodWorkerLeaseAttrs = { ...attrs, state, ...(request.reason ? { reason: request.reason } : {}) };
-    if (state === 'idle') { delete nextAttrs.leaseId; delete nextAttrs.leaseOwner; delete nextAttrs.runId; delete nextAttrs.attemptId; delete nextAttrs.reason; }
+    if (state === 'idle') {
+      nextAttrs.lastLeaseId = attrs.leaseId;
+      nextAttrs.lastLeaseOwner = attrs.leaseOwner;
+      delete nextAttrs.leaseId; delete nextAttrs.leaseOwner; delete nextAttrs.runId; delete nextAttrs.attemptId; delete nextAttrs.reason;
+    } else if (state === 'quarantined') {
+      delete nextAttrs.lastLeaseId;
+      delete nextAttrs.lastLeaseOwner;
+    }
     const ttlMs = state === 'idle' ? attrs.idleTtlMs : request.ttlMs ?? row.ttlMs;
     const next: ResourceRecord = { ...row, attrs: nextAttrs as unknown as Record<string, unknown>, observedAt: now, ttlMs };
     rows[index] = next;

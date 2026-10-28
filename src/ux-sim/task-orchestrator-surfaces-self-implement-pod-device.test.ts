@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { parsePodTermination, readPodTermination } from '../task-orchestrator/surfaces/pod-failure-reason.js';
+import { parsePodTermination, POD_TERMINATION_JOB_JSONPATH, readPodTermination } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 import {
   POD_DEVICE_EVENTS,
   makeScriptedKubectlDevice,
@@ -18,6 +18,13 @@ function capture(kind: (typeof POD_DEVICE_EVENTS)[number]['kind'], path: 'job-fa
 }
 
 describe('readPodTermination over the fake kubectl device (JOB-FAILURE-TERMINATION-CAPTURE)', () => {
+  test('the simulated Job snapshot includes optional creation and completion timestamps', () => {
+    const fixture = event('job-deadline-exceeded');
+    const device = makeScriptedKubectlDevice([fixture]);
+    const read = device.kubectl(['-n', 'elanous', 'get', 'job', fixture.jobName, '-o', `jsonpath=${POD_TERMINATION_JOB_JSONPATH}`]);
+    expect(read.stdout).toBe('DeadlineExceeded\t3600\t33333333-3333-4333-8333-333333333333\t2026-10-22T12:55:10Z\t');
+  });
+
   test('Job Failed condition (BackoffLimitExceeded): reason · exitCode · finishedAt observed, not OOM, not deadline', () => {
     const { record, calls } = capture('job-failed-backoff');
     expect(record).toEqual({
@@ -77,7 +84,7 @@ describe('readPodTermination over the fake kubectl device (JOB-FAILURE-TERMINATI
     const uid = '77777777-7777-4777-8777-777777777777';
     const kubectl = (args: readonly string[]) => args.includes('pods')
       ? { status: 0, stdout: '', stderr: '' }
-      : { status: 0, stdout: 'DeadlineExceeded\t3600\t', stderr: '' };
+      : { status: 0, stdout: 'DeadlineExceeded\t3600\t\t\t', stderr: '' };
     expect(readPodTermination({ kubectl, namespace: 'elanous', job: 'si-x', path: 'job-failed-condition', jobUid: uid, now: NOW }))
       .toMatchObject({ jobLookup: 'unavailable', jobConditionReason: 'unknown', deadlineExceeded: 'unknown', activeDeadlineSeconds: 'unknown', podLookup: 'absent' });
   });

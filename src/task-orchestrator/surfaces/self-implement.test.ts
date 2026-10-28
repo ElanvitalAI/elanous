@@ -1,6 +1,6 @@
 import { test, expect, describe, spyOn } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
@@ -43,9 +43,13 @@ async function assertDefaultSpawnBin(cwd: string, expectedBin: string, expectedB
     const { done } = defaultSelfImplementSpawn()({ feature: 'verify bin root', spaceId: 'test-space' });
     await done;
     const [spawnCwd, entry, option, path] = readFileSync(capturePath, 'utf8').trim().split('\n');
-    expect([spawnCwd, entry, option]).toEqual([realpathSync(cwd), expectedBin, '--feature-file']);
+    const canonicalBin = realpathSync(expectedBin);
+    expect([realpathSync(spawnCwd), realpathSync(entry), option]).toEqual([realpathSync(cwd), canonicalBin, '--feature-file']);
     expect(path).toBe('verify bin root');
-    expect(launches).toEqual([{ bin: expectedBin, binSource: expectedBinSource }]);
+    expect(launches.map(({ bin, binSource }) => ({
+      bin: typeof bin === 'string' ? realpathSync(bin) : bin,
+      binSource,
+    }))).toEqual([{ bin: canonicalBin, binSource: expectedBinSource }]);
   } finally {
     process.chdir(originalCwd);
     if (originalPath === undefined) delete process.env.PATH;
@@ -367,11 +371,13 @@ mock.module(${JSON.stringify(orchestrator)}, () => ({ ...original, runSelfImplem
 
   test('production spawn keeps the current elanous repository bin', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'self-implement-bin-own-repo-'));
+    const aliasRoot = join(repo, 'alias');
     try {
       execFileSync('git', ['init', '-q'], { cwd: repo });
       mkdirSync(join(repo, 'bin'));
       writeFileSync(join(repo, 'bin', 'elanous.mjs'), '// isolated repository entrypoint\n');
-      await assertDefaultSpawnBin(repo, join(realpathSync(repo), 'bin', 'elanous.mjs'), 'cwd-repository');
+      symlinkSync(repo, aliasRoot, 'dir');
+      await assertDefaultSpawnBin(aliasRoot, join(aliasRoot, 'bin', 'elanous.mjs'), 'cwd-repository');
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

@@ -45,6 +45,7 @@ export interface DashboardTermSlashRuntimeDeps {
 
 export interface DashboardTermSlashRuntime {
   helpLines(): string[];
+  experimentalHelpLines(): string[];
   terminalSessionsEmptyLine(): string;
   terminalSessionLine(entry: DashboardTerminalListEntry): string;
   shellRunnerSectionDividerLine(): string;
@@ -122,7 +123,7 @@ export function createDashboardTermSlashRuntime(
     helpLines: () => [
       '',
       deps.accent('\u276f /term'),
-      deps.muted('Usage:'),
+      deps.muted('Formal commands:'),
       deps.muted('  /term new [command]       Open a shell PTY (Ctrl+Shift+T or Alt+T).'),
       deps.muted('  /term list                List all alive sessions (fg / bg / exited).'),
       deps.muted('  /term attach <id>         Bring a backgrounded session to foreground.'),
@@ -132,26 +133,23 @@ export function createDashboardTermSlashRuntime(
       deps.muted('  /term switch              Open the session picker modal.'),
       deps.muted('  /term kill <id>           Stop the PTY and remove the session.'),
       deps.muted('  /term snapshot <id> [tail [bytes]]   Capture current grid (snapshot) or last N bytes (tail).'),
-      deps.muted('  /term move <id> bg|modal|preview|vw   Move terminal between placements (vw uses current foreground VW).'),
-      deps.muted('  /term matrix              Show matrix-wide view (term:<N> | character | placement).'),
-      deps.muted('  /term group list                       Show groups + members.'),
-      deps.muted('  /term group join <id> <group>          Add terminal to a broadcast group.'),
-      deps.muted('  /term group leave <id> <group>         Remove terminal from a broadcast group.'),
-      deps.muted('  /term group send <group> <text>        Broadcast raw bytes to the group.'),
-      deps.muted('  /term channel list                     Show IPC channels + stats.'),
-      deps.muted('  /term channel pub <channel> <text>     Publish on a channel.'),
-      deps.muted('  /term channel tail <id> <channel> [--replay]   Subscribe <id> — msgs stream into PTY stdin.'),
-      deps.muted('  /term channel snapshot <channel> [N=10]        Show last N buffered messages (read-only).'),
-      deps.muted('  /term pipe <id> <channel> [--line]     Publish <id> stdout onto <channel> (raw|line).'),
-      deps.muted('  /term unpipe <pipeId>                  Detach a pipe started with /term pipe.'),
-      deps.muted('  /term pipes                            List every active stdout → channel pipe.'),
-      deps.muted('  /term readonly <id> [on|off]           Toggle read-only (matrix writeTo drops writes).'),
-      deps.muted('  /term recharacter <id> <shell|claude|codex|custom:<name>>  Swap character + reexec.'),
-      deps.muted('  /term vw-sync <windowId> <text>        Broadcast to every terminal-slot in a VW.'),
-      deps.muted('  /term vw-bar [windowId] [on|off]       Toggle per-VW sync input bar (default: current).'),
+      deps.muted('  /term resume <id>          Re-spawn a saved terminal session.'),
+      deps.muted('  /term help experimental   Show experimental commands.'),
       deps.muted(''),
       deps.muted('Shell-runner handles (RunShell) — separate registry:'),
       deps.muted('  /shell list|kill|attach                See /shell help.'),
+    ],
+    experimentalHelpLines: () => [
+      '',
+      deps.accent('\u276f /term help experimental'),
+      deps.muted('Experimental commands — behavior may change:'),
+      deps.muted('  /term matrix              Show matrix-wide view.'),
+      deps.muted('  /term move <id> bg|modal|preview   Move terminal between placements.'),
+      deps.muted('  /term group list|join|leave|send    Coordinate terminal groups.'),
+      deps.muted('  /term channel list|pub|tail|snapshot Manage terminal channels.'),
+      deps.muted('  /term pipe|unpipe|pipes             Pipe terminal output to channels.'),
+      deps.muted('  /term readonly <id> [on|off]        Toggle read-only.'),
+      deps.muted('  /term recharacter <id> <character>  Change terminal character.'),
     ],
     terminalSessionsEmptyLine: () => deps.muted('  No terminal sessions.'),
     terminalSessionLine: (entry) => {

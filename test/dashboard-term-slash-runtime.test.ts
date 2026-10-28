@@ -20,7 +20,23 @@ describe('createDashboardTermSlashRuntime', () => {
     });
 
     expect(runtime.helpLines()[1]).toBe('accent:❯ /term');
-    expect(runtime.helpLines().some((line) => line.includes('/term matrix'))).toBe(true);
+    const basicHelp = runtime.helpLines().join('\n');
+    expect(basicHelp).toContain('Formal commands:');
+    for (const command of ['/term new', '/term list', '/term attach', '/term detach', '/term switch', '/term kill', '/term resume', '/term snapshot']) {
+      expect(basicHelp).toContain(command);
+    }
+    expect(basicHelp).toContain('/term help experimental');
+    const experimentalCommands = ['/term matrix', '/term move', '/term group', '/term channel', '/term pipe', '/term readonly', '/term recharacter'];
+    for (const command of [...experimentalCommands, '/term vw-bar', '/term vw-sync']) {
+      expect(basicHelp).not.toContain(command);
+    }
+    const experimental = runtime.experimentalHelpLines().join('\n');
+    expect(experimental).toContain('Experimental commands');
+    for (const command of experimentalCommands) {
+      expect(experimental).toContain(command);
+    }
+    expect(experimental).not.toContain('/term vw-bar');
+    expect(experimental).not.toContain('/term vw-sync');
     expect(runtime.helpLines()).toContain('muted:  Ctrl+B (while streaming)  Background running child tasks; turn continues.');
     expect(runtime.helpLines()).toContain('muted:  Ctrl+X c (chat input)     Enter control mode.');
     for (const [key, action] of [

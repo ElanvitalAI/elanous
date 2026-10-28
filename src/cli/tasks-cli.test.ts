@@ -974,7 +974,7 @@ test('tasks cover joins bound card runs to merged run-ledger events for the 구�
   expect(lines.lines).toContain('7동사 live 2/7 · 출처 없음 정리');
   // 런 원장을 못 읽으면 구현만 unreadable — 전체 liveVerbs 는 null(0 으로 읽히지 않게).
   const unreadable = await run(['tasks', 'cover', '--json'], { ...deps, coverImplementRunMerges: () => null });
-  expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: null, shadow: null, state: 'unreadable' });
+  expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.verbs[5]).toMatchObject({ verb: '구현', source: 'card-run+merged', liveDone: null, shadow: null, state: 'unreadable', reason: 'run-ledger-null' });
   expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.liveVerbs).toBeNull();
   const unreadableLines = await run(['tasks', 'cover', '--lines'], { ...deps, coverImplementRunMerges: () => null });
   expect(unreadableLines.lines).toContain('7동사 live -/7 · 못 잼(구현 카드·런 원장 null·절단) · 출처 없음 정리');
@@ -1008,9 +1008,15 @@ test('tasks cover default 구현 readers join physical task-agent-actions.json a
   const writeLedger = (id: string, timestamp: string, succeeded: boolean, directory = ledgerDir) =>
     writeFileSync(join(directory, `${id}.jsonl`), `${JSON.stringify({ timestamp, runId: id, event: 'merged', data: { merged: succeeded } })}\n`);
   try {
+    const cleanup = (id: string, boundRun: string, outcome: 'complete' | 'partial', at = '2026-10-11T10:00:00.000Z'): TaskCard => ({
+      ...card(id, boundRun), status: 'done',
+      prTerminal: { pr: 123, url: 'https://example.test/pr/123', head: 'abc123', state: 'MERGED', at },
+      postLand: { outcome, pr: 123, head: 'abc123', at, evidence: [], remaining: [] },
+      history: [{ event: 'postland-card', pr: 123, head: 'abc123', at }],
+    });
     writeTaskCards(statePath, [
-      card('ta-merged', merged), card('ta-failed', failed),
-      card('ta-child', parent, child), card('ta-outside', outside), card('ta-split', split),
+      cleanup('ta-merged', merged, 'complete'), cleanup('ta-failed', failed, 'partial'),
+      card('ta-child', parent, child), cleanup('ta-outside', outside, 'complete', '2026-10-13T10:00:00.000Z'), card('ta-split', split),
     ]);
     writeLedger(merged, '2026-10-11T10:00:00.000Z', true);
     writeLedger(failed, '2026-10-11T10:00:00.000Z', false);
@@ -1031,12 +1037,72 @@ test('tasks cover default 구현 readers join physical task-agent-actions.json a
     expect(observed.code ?? 0).toBe(0);
     const live = JSON.parse(observed.lines[0]!).sevenVerbs;
     expect(live.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: 3, shadow: 0, state: 'live' });
-    expect(live.measuredVerbs).toBe(6);
+    expect(live.verbs[6]).toEqual({ verb: '정리', source: 'card:postland-card+postLand', liveDone: 1, shadow: 0, state: 'live' });
+    expect(live.measuredVerbs).toBe(7);
+    const refreshed = cleanup('ta-merged', merged, 'complete');
+    refreshed.postLand!.at = '2026-10-11T12:00:00.000Z';
+    writeTaskCards(statePath, [refreshed, cleanup('ta-failed', failed, 'partial')]);
+    const refreshedResult = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(JSON.parse(refreshedResult.lines[0]!).sevenVerbs.verbs[6]).toMatchObject({ liveDone: 1, state: 'live' });
+    const oldHistory = cleanup('ta-merged', merged, 'complete', '2026-10-09T10:00:00.000Z');
+    oldHistory.postLand!.at = '2026-10-11T12:00:00.000Z';
+    writeTaskCards(statePath, [oldHistory, cleanup('ta-failed', failed, 'partial')]);
+    const oldResult = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(JSON.parse(oldResult.lines[0]!).sevenVerbs.verbs[6]).toMatchObject({ liveDone: 0, state: 'none' });
+    const changedOutcome = cleanup('ta-merged', merged, 'complete');
+    changedOutcome.history.unshift({ event: 'postland-card', pr: 123, head: 'abc123', at: '2026-10-09T10:00:00.000Z' });
+    writeTaskCards(statePath, [changedOutcome, cleanup('ta-failed', failed, 'partial')]);
+    const changedResult = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(JSON.parse(changedResult.lines[0]!).sevenVerbs.verbs[6]).toMatchObject({ liveDone: 1, state: 'live' });
+    const lateTransition = cleanup('ta-merged', merged, 'complete', '2026-10-13T10:00:00.000Z');
+    lateTransition.history.unshift({ event: 'postland-card', pr: 123, head: 'abc123', at: '2026-10-11T10:00:00.000Z' });
+    lateTransition.postLand!.at = '2026-10-11T12:00:00.000Z';
+    writeTaskCards(statePath, [lateTransition, cleanup('ta-failed', failed, 'partial')]);
+    const lateResult = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(JSON.parse(lateResult.lines[0]!).sevenVerbs.verbs[6]).toMatchObject({ liveDone: 0, state: 'none' });
+    const invalidSource = cleanup('ta-merged', merged, 'complete');
+    invalidSource.history[0]!.at = 'not-a-timestamp';
+    writeTaskCards(statePath, [invalidSource, cleanup('ta-failed', failed, 'partial')]);
+    const invalidResult = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(JSON.parse(invalidResult.lines[0]!).sevenVerbs.verbs[6]).toMatchObject({ liveDone: null, state: 'unreadable' });
+    const unclosed = cleanup('ta-merged', merged, 'complete');
+    unclosed.status = 'launched';
+    writeTaskCards(statePath, [unclosed, cleanup('ta-failed', failed, 'partial')]);
+    const unclosedResult = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(JSON.parse(unclosedResult.lines[0]!).sevenVerbs.verbs[6]).toMatchObject({ liveDone: 0, state: 'none' });
+    const mismatchedTerminal = cleanup('ta-merged', merged, 'complete');
+    mismatchedTerminal.prTerminal!.head = 'different';
+    writeTaskCards(statePath, [mismatchedTerminal, cleanup('ta-failed', failed, 'partial')]);
+    const terminalResult = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(JSON.parse(terminalResult.lines[0]!).sevenVerbs.verbs[6]).toMatchObject({ liveDone: 0, state: 'none' });
+    const mismatched = cleanup('ta-merged', merged, 'complete');
+    mismatched.history = [{ event: 'postland-card', pr: 124, head: 'abc123', at: mismatched.postLand!.at }];
+    writeTaskCards(statePath, [mismatched, cleanup('ta-failed', failed, 'partial')]);
+    const unproven = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    expect(JSON.parse(unproven.lines[0]!).sevenVerbs.verbs[6]).toMatchObject({ liveDone: 0, state: 'none' });
+    const malformed = cleanup('ta-merged', merged, 'complete');
+    malformed.postLand!.at = 'not-a-timestamp';
+    writeTaskCards(statePath, [malformed, card('ta-failed', failed), card('ta-child', parent, child), card('ta-outside', outside), card('ta-split', split)]);
+    const cleanupUnreadable = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    const separated = JSON.parse(cleanupUnreadable.lines[0]!).sevenVerbs;
+    expect(separated.verbs[5]).toMatchObject({ liveDone: 3, state: 'live' });
+    expect(separated.verbs[6]).toMatchObject({ liveDone: null, state: 'unreadable' });
+    const damagedHistory = cleanup('ta-merged', merged, 'complete');
+    damagedHistory.history = [null as unknown as TaskCard['history'][number]];
+    writeTaskCards(statePath, [damagedHistory, card('ta-failed', failed), card('ta-child', parent, child), card('ta-outside', outside), card('ta-split', split)]);
+    const historyResult = await run(['tasks', 'cover', '--since', '2026-10-10T00:00:00Z', '--until', '2026-10-12T00:00:00Z', '--json'], deps);
+    const historyVerbs = JSON.parse(historyResult.lines[0]!).sevenVerbs.verbs;
+    expect(historyVerbs[5]).toMatchObject({ liveDone: 3, state: 'live' });
+    expect(historyVerbs[6]).toMatchObject({ liveDone: null, state: 'unreadable' });
+    writeTaskCards(statePath, [
+      cleanup('ta-merged', merged, 'complete'), cleanup('ta-failed', failed, 'partial'),
+      card('ta-child', parent, child), cleanup('ta-outside', outside, 'complete', '2026-10-13T10:00:00.000Z'), card('ta-split', split),
+    ]);
 
     writeFileSync(join(ledgerDir, `${child}.jsonl`), '{broken}\n');
     const unreadable = await run(['tasks', 'cover', '--json'], deps);
     expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.verbs[5]).toMatchObject({
-      source: 'card-run+merged', liveDone: null, state: 'unreadable',
+      source: 'card-run+merged', liveDone: null, state: 'unreadable', reason: 'run-ledger-unreadable',
     });
     expect(JSON.parse(unreadable.lines[0]!).sevenVerbs.liveVerbs).toBeNull();
     rmSync(join(ledgerDir, `${child}.jsonl`));
@@ -1047,7 +1113,7 @@ test('tasks cover default 구현 readers join physical task-agent-actions.json a
     rmSync(statePath);
     const missingCards = await run(['tasks', 'cover', '--json'], deps);
     expect(JSON.parse(missingCards.lines[0]!).sevenVerbs.verbs[5]).toMatchObject({
-      source: 'card-run+merged', liveDone: null, state: 'unreadable',
+      source: 'card-run+merged', liveDone: null, state: 'unreadable', reason: 'card-ledger-unreadable',
     });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

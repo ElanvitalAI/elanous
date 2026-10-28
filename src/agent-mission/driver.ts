@@ -31,7 +31,7 @@ import { verdictForFinalPtyScreen } from '../cli/pty-drive-verdict.js';
 import { reemitPtyUsage } from '../budget/pty-usage-reemit.js';
 import { classifyAuthError } from '../oauth/codex.js';
 import { normalizeFallbackChain, type FallbackStep } from '../oauth/fallback-chain.js';
-import { runPtyControlLoop, controlDepsForHandle, type ControlDecision, type ControlObservation, type RunSupervisor } from '../autopilot/pty-control-loop.js';
+import { runPtyControlLoop, controlDepsForHandle, VERIFY_DONE_STOP, type ControlDecision, type ControlObservation, type RunSupervisor } from '../autopilot/pty-control-loop.js';
 import { probeControlStance, stanceBlocksWrite } from '../pty-shell/pty-control-stance.js';
 import { mapControlStance, supervisionObservationFields } from '../self-implement/supervision-vocabulary.js';
 import { createLlmControlBrain, type StreamLLMFn } from '../autopilot/llm-control-brain.js';
@@ -956,6 +956,8 @@ export function createMissionVerifyDone(opts: MissionVerifyDoneOpts): (obs?: Con
 
 export interface MissionControlBrainOpts {
   readonly mission: string;
+  /** When false, the supervisor may observe and verify but must not inject unrequested follow-up text. */
+  readonly allowFollowup?: boolean;
   readonly evidenceReady: () => boolean;
   readonly search: (query: string, step?: number) => Promise<void> | void;
   /** PTY에서 실행 중인 에이전트. 미지정 시 기존 codex 기본값을 유지한다. */
@@ -1039,6 +1041,10 @@ ${opts.handoffEnabled ? ` - "handoff": 다른 담당자로 넘길 때 to(codex/c
       if (decision.action === 'handoff' && decision.to && decision.mission) return { action: 'handoff', to: decision.to, mission: decision.mission, ...(decision.carry ? { carry: decision.carry } : {}) };
       if (decision.action === 'ask-human') return { action: 'ask-human', reason: decision.reason, ...(decision.url ? { url: decision.url } : {}), ...(decision.code ? { code: decision.code } : {}) };
       if (decision.action === 'send') {
+        if (opts.allowFollowup === false) {
+          debug.log('agent-mission', 'followup-suppressed', { step: obs.step, reason: 'verbatim mission' });
+          return { action: 'wait' };
+        }
         lastCommand = decision.text || 'continue';
         return { action: 'input', text: `${lastCommand}\r` };
       }
@@ -1480,6 +1486,7 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   const startedAt = Date.now();
   const contextOwner = !deps.contextEventRun;
   const contextRunId = contextOwner ? ensureRunId() : undefined;
+  const resultRunId = contextRunId ?? ensureRunId();
   let contextPrNumber: number | undefined;
   const emitContext = (kind: 'task-claimed' | 'task-done', detail: string): void => {
     if (!contextOwner) return;
@@ -1604,7 +1611,13 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     }
   }
   return result;
-  } finally { emitContext('task-done', result?.ok ? 'completed' : 'ended'); }
+  } finally {
+    if (result?.reason === 'aborted') {
+      try { debug.log('agent-mission', 'result', { runId: resultRunId, ok: false, reason: 'aborted', rounds: result.rounds, committed: false }); }
+      catch { /* a result receipt must not mask the cancellation result */ }
+    }
+    emitContext('task-done', result?.ok ? 'completed' : 'ended');
+  }
 }
 
 async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDeps, startedAt: number, initialFiles?: ReadonlyMap<string, string>): Promise<AgentMissionResult> {
@@ -2060,6 +2073,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   const search = createMissionSearch({ worktree: wt.path, omniPath });
   const brain = createMissionControlBrain({
     mission: spec.mission,
+    allowFollowup: spec.enhance !== false,
     backend,
     stream: deps.controlStream,
     handoffEnabled: true,
@@ -2236,6 +2250,10 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       },
       verifyDone: spec.chain && spec.chain.length > 1 ? async () => ({ ok: true as const }) : async (obs) => {
         const verdict = await verifyDone(obs);
+        if (!verdict.ok && spec.enhance === false) {
+          decisionEvent({ step: 'recover', text: 'Evidence check failed; retry disabled for verbatim mission', detail: { blocked: verdict.retry, action: 'Stop without modifying the mission' } });
+          return { ...verdict, stop: VERIFY_DONE_STOP };
+        }
         if (!verdict.ok) decisionEvent({ step: 'recover', text: 'Evidence check requires another attempt', detail: { blocked: verdict.retry, action: 'Retry after fixing evidence' } });
         return verdict;
       },
@@ -2347,9 +2365,17 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     stopLive();
     throw new Error('AGENT_YIELDED: PTY 제어가 사람에게 이양됨(takeover) — 자율 미션 중단');
   }
-
   if (deps.isMissionAborted?.()) return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
     rounds: round, evidencePath: null, committed: false, usedOmniCrawl: usedOmni, detail: 'aborted' };
+
+  if (control.termination.kind === 'error' && control.termination.code === VERIFY_DONE_STOP) {
+    stopLive();
+    if (h.pid) await (deps.terminateProcessTree ?? terminateMissionProcessTree)(h.pid);
+    try { h.kill(); } catch { /* noop */ }
+    if (backend.name === 'claude') cleanupClaude();
+    return { ok: false, worktree: wt.path, branch: wt.branch,
+      rounds: round, evidencePath: null, evidenceSatisfied: false, committed: false, usedOmniCrawl: usedOmni, detail: control.termination.message };
+  }
   const finalEv = verifyEvidence(wt.path, spec.evidence);
   const finalScreen = await h.renderScreen();
   const driveVerdict = verdictForFinalPtyScreen({ screen: finalScreen, inputHistory: submittedInputs, exitCode: h.exitCode ?? null, artifactEvidence: finalEv.ok });

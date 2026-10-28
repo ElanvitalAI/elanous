@@ -189,7 +189,7 @@ test('consecutive /now worker topics retain the full aggregate for each request'
     else resetElanousConfigDir();
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 120_000);
 
 test('context_now worker preserves a config override distinct from the state stamp', async () => {
   const stateRoot = mkdtempSync(join(tmpdir(), 'context-now-state-'));

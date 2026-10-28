@@ -9,6 +9,58 @@ import { packSourceBundle } from './pod-source-bundle.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 
 describe('podSourceScript', () => {
+  test('default source uses the parent-resolved base SHA from the host mirror without Pod origin calls', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-parent-base-sha-'));
+    try {
+      const work = join(root, 'work');
+      const mirror = join(root, 'host-mirror.git');
+      const cwd = join(root, 'job');
+      mkdirSync(work); mkdirSync(cwd);
+      execFileSync('git', ['init', '-q', '-b', 'main', work]);
+      execFileSync('git', ['-C', work, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', work, 'config', 'user.name', 'pod']);
+      writeFileSync(join(work, 'README'), 'base\n');
+      execFileSync('git', ['-C', work, 'add', 'README']);
+      execFileSync('git', ['-C', work, 'commit', '-qm', 'base']);
+      const baseSha = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', work, mirror]);
+
+      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/unused/repo', mirror);
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror');
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE default ${baseSha}`);
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(baseSha);
+      const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+      expect(io).toBeTruthy();
+      expect(JSON.parse(io!)).toMatchObject({ originCalls: 0, sourceVia: 'mirror', sourceStatus: 'complete' });
+      expect(script).not.toContain('git ls-remote');
+      expect(script).not.toContain('git clone -q --depth 50');
+      expect(script).not.toContain('git fetch --depth 50 origin');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('parent-resolved default SHA fails closed when neither image nor host mirror has a checkout', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-parent-base-missing-'));
+    try {
+      const cwd = join(root, 'job');
+      mkdirSync(cwd);
+      const baseSha = '1'.repeat(40);
+      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/unused/repo', join(root, 'missing-mirror'));
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE ${baseSha}`);
+      const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+      expect(io).toBeTruthy();
+      expect(JSON.parse(io!)).toMatchObject({ originCalls: 0, sourceStatus: 'incomplete' });
+      expect(script).not.toContain('git clone -q --depth 50');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test('PR source from a one-commit image pin obtains a real main merge-base', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-pr-base-'));
     try {
@@ -303,7 +355,10 @@ describe('podSourceScript', () => {
         const script = podSourceScript(source, origin, path, { imageCommitFile: join(root, 'absent-image-commit') });
         const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
         expect(result.exitCode, result.stderr.toString()).toBe(0);
-        expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_VIA ${via}\nELANOUS_POD_SOURCE default ${bench}`);
+        expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_VIA ${via}\n`);
+        expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE default ${bench}\n`);
+        const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+        expect(JSON.parse(io!).originCalls).toBe(via === 'mirror' ? 1 : 2); // Pod origin fetches only; host preflight is outside this interval.
         expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(bench);
         expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8' }).trim()).toBe('bench/sample');
       }
@@ -325,7 +380,9 @@ describe('podSourceScript', () => {
       const origin = join(root, 'origin');
       const mirror = join(root, 'mirror.git');
       execFileSync('git', ['init', '-q', '-b', 'main', origin]);
-      execFileSync('git', ['-C', origin, '-c', 'user.email=pod@example.com', '-c', 'user.name=pod', 'commit', '-q', '--allow-empty', '-m', 'base']);
+      writeFileSync(join(origin, 'tracked.txt'), 'tracked\n');
+      execFileSync('git', ['-C', origin, 'add', 'tracked.txt']);
+      execFileSync('git', ['-C', origin, '-c', 'user.email=pod@example.com', '-c', 'user.name=pod', 'commit', '-q', '-m', 'base']);
       execFileSync('git', ['clone', '-q', '--bare', origin, mirror]);
       const stageLines = (out: string) => out.split('\n').filter((line) => line.startsWith('ELANOUS_POD_STAGE '));
       for (const [name, path, ends] of [['via-mirror', mirror, true], ['via-github', join(root, 'absent'), false]] as const) {
@@ -336,7 +393,25 @@ describe('podSourceScript', () => {
         const lines = stageLines(result.stdout.toString());
         expect(lines.map((line) => line.replace(/ \d+$/, ''))).toEqual(ends ? ['ELANOUS_POD_STAGE mirror start', 'ELANOUS_POD_STAGE mirror end'] : ['ELANOUS_POD_STAGE mirror start']);
         for (const line of lines) expect(line).toMatch(/^ELANOUS_POD_STAGE mirror (start|end) \d{9,12}$/);
+        const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+        expect(io).toBeDefined();
+        expect(JSON.parse(io!)).toMatchObject({
+          originCalls: 1,
+          checkoutFiles: 1,
+          sourceVia: ends ? 'mirror' : 'github',
+          sourceStatus: 'complete',
+          pushCalls: null,
+          installRan: null,
+          installSeconds: null,
+        });
+        expect(JSON.parse(io!).sourceSeconds).toEqual(expect.any(Number));
       }
+      const failedCwd = join(root, 'source-failed');
+      execFileSync('mkdir', ['-p', join(failedCwd, 'repo')]);
+      const failed = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default' }, origin, mirror, { stageMarkers: true })}`], { cwd: failedCwd });
+      expect(failed.exitCode).toBe(5);
+      const failedIo = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(failed.stdout.toString())?.[1];
+      expect(JSON.parse(failedIo!)).toMatchObject({ checkoutFiles: null, sourceStatus: 'incomplete', sourceVia: 'unknown' });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

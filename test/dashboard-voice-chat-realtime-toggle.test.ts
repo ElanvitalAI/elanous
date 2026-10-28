@@ -112,27 +112,25 @@ describe('toggleVoiceChatRealtime', () => {
 });
 
 describe('SLASH_COMMANDS registry — voice slashes registered', () => {
-  it("'/vc' (alias) and '/voice-chat' (name) match the slash picker filter", async () => {
+  it("'/vc' and '/voice-chat' stay registered but are hidden from the compact slash picker", async () => {
     const { SLASH_COMMANDS, filterSlashCommands } = await import('../src/chat/index.js');
     const haveVoiceChat = SLASH_COMMANDS.some((c) => c.name === 'voice-chat');
     const haveVcAlias = SLASH_COMMANDS.some((c) => (c.aliases ?? []).includes('vc'));
     expect(haveVoiceChat).toBe(true);
     expect(haveVcAlias).toBe(true);
-    // The picker uses filterSlashCommands(); user types '/vc' (the
-    // slash gets stripped before filterSlashCommands sees it).
     const ranked = filterSlashCommands('vc', SLASH_COMMANDS);
-    const top = ranked.slice(0, 5).map((c) => c.name);
-    expect(top).toContain('voice-chat');
+    expect(ranked.map((c) => c.name)).not.toContain('voice-chat');
+    expect(SLASH_COMMANDS.find((c) => c.name === 'voice-chat')?.hidden).toBe(true);
   });
 
-  it("'/auto-tts' + 'tts' alias both registered", async () => {
+  it("'/auto-tts' + 'tts' stay registered but are hidden from the compact slash picker", async () => {
     const { SLASH_COMMANDS, filterSlashCommands } = await import('../src/chat/index.js');
     const haveAutoTts = SLASH_COMMANDS.some((c) => c.name === 'auto-tts');
     const haveTtsAlias = SLASH_COMMANDS.some((c) => (c.aliases ?? []).includes('tts'));
     expect(haveAutoTts).toBe(true);
     expect(haveTtsAlias).toBe(true);
     const ranked = filterSlashCommands('tts', SLASH_COMMANDS);
-    const top = ranked.slice(0, 5).map((c) => c.name);
-    expect(top).toContain('auto-tts');
+    expect(ranked.map((c) => c.name)).not.toContain('auto-tts');
+    expect(SLASH_COMMANDS.find((c) => c.name === 'auto-tts')?.hidden).toBe(true);
   });
 });

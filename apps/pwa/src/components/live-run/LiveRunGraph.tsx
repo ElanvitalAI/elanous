@@ -71,7 +71,7 @@ function LiveNode({ data }: NodeProps) {
         {node.terminal && <span className="shrink-0 rounded bg-accent/15 px-1 text-accent">끝</span>}
         <span data-state-word className="ml-auto shrink-0 font-medium" style={{ color: STATE_RING[node.state] }}>{node.unrecorded ? '기록 없음' : STATE_WORD[node.state]}</span>
       </div>
-      <div className="truncate font-mono text-sm font-semibold text-text-primary">{isGroupNodeId(node.label) ? `▣ ${node.label.slice(GROUP_NODE_PREFIX.length)}` : node.label}</div>
+      <div className="overflow-x-auto whitespace-nowrap font-mono text-sm font-semibold text-text-primary" title={node.label}>{isGroupNodeId(node.label) ? `▣ ${node.label.slice(GROUP_NODE_PREFIX.length)}` : node.label}</div>
       <div className="truncate text-[11px] text-text-tertiary" title={node.recipe}>{node.recipe} · 최대 {node.maxVisits}회</div>
       {node.visits > 1 && (
         <span data-testid={`visit-badge-${node.label}`} className="absolute -right-2 -top-2 rounded-full bg-amber-500 px-1.5 text-xs font-bold text-white shadow">×{node.visits}</span>
@@ -97,10 +97,12 @@ function LiveEdge({ id, data, markerEnd, style }: EdgeProps) {
   const dashed = route.kind === 'back';
   return (
     <>
-      <BaseEdge id={id} path={route.path} markerEnd={markerEnd}
-        style={{ stroke: color, strokeWidth: edge.active ? 4 : edge.taken ? 3 : 1.5, opacity: edge.active || edge.taken ? 1 : 0.22, transition: 'opacity 300ms, stroke-width 300ms', ...(dashed ? { strokeDasharray: '6 4' } : {}), ...style, ...(style?.stroke ? { opacity: 1 } : {}) }} />
+      <g data-testid={edge.taken ? `edge-token-${route.from}-${route.to}` : undefined}>
+        <BaseEdge id={id} path={route.path} markerEnd={markerEnd}
+          style={{ stroke: color, strokeWidth: edge.active ? 4 : edge.taken ? 3 : 1.5, opacity: edge.active || edge.taken ? 1 : 0.22, transition: 'opacity 300ms, stroke-width 300ms', ...(dashed ? { strokeDasharray: '6 4' } : {}), ...style, ...(style?.stroke ? { opacity: 1 } : {}) }} />
+      </g>
       {edge.active && (
-        <g key={edge.tokenKey} data-testid={`edge-token-${route.from}-${route.to}`} opacity={style?.opacity}>
+        <g key={edge.tokenKey} opacity={style?.opacity}>
           <circle r={7} fill={color} opacity={0.25}>
             <animateMotion dur={`${edge.tokenMs}ms`} fill="freeze" path={route.path} />
           </circle>

@@ -34,6 +34,8 @@ export interface GraphWizardRequest {
   history?: GraphWizardTurn[];
   /** Installed pack selected for a knowledge (RAG) node. */
   packId?: string;
+  /** Task hand composition: only existing verb units and terminal gates, never free-form commands. */
+  missionBase?: { id: string; text: string };
 }
 
 export interface GraphWizardResult {
@@ -653,6 +655,11 @@ function buildPrompt(input: {
   if (req.history?.length) {
     lines.push('', '지금까지의 대화:', ...req.history.slice(-10).map((t) => `${t.role === 'user' ? '사용자' : '마법사'}: ${t.text.slice(0, 500)}`));
   }
+  if (req.missionBase) {
+    lines.push('', '미션 조합: 기존 graphs/work 표준 조합의 동사 단위(subgraph call: verb-…@정수판)와 끝 gate 만 사용한다.',
+      'cmd·새 권한·외부 효과를 추가하지 마라. merge 앞에는 gate·freeze-check·review 가 모든 경로에서 먼저 와야 한다.',
+      `표준 조합 ${req.missionBase.id}:`, '```yaml', req.missionBase.text.trim(), '```');
+  }
   if (editing) {
     lines.push('', '지금 그래프(이것을 고친다 — 바뀌지 않는 노드의 id 는 그대로 둔다):', '```yaml', req.currentYaml!.trim(), '```',
       '', `사용자의 수정 지시: ${req.prompt}`,
@@ -705,7 +712,7 @@ export async function generateGraphFromPrompt(req: GraphWizardRequest, deps: Gra
   let id = editing ? currentId! : wizardGraphId(prompt, undefined, taken);
   const callLLM = deps.callLLM ?? defaultCallLLM;
   const maxAttempts = Math.max(1, deps.maxAttempts ?? GRAPH_WIZARD_MAX_ATTEMPTS);
-  let base = keywordBase?.id;
+  let base = req.missionBase?.id ?? keywordBase?.id;
   let yaml = '';
   let issues: string[] = [];
   let llmSummary: string | undefined;
@@ -726,7 +733,7 @@ export async function generateGraphFromPrompt(req: GraphWizardRequest, deps: Gra
     }
     if (attempts === 1 && !editing) {
       const picked = lineValue(text, 'BASE');
-      if (picked && picked !== base && templates.some((t) => t.id === picked)) { base = picked; baseReason = `LLM 재선택 (키워드 후보 ${keywordBase?.id ?? '-'})`; }
+      if (!req.missionBase && picked && picked !== base && templates.some((t) => t.id === picked)) { base = picked; baseReason = `LLM 재선택 (키워드 후보 ${keywordBase?.id ?? '-'})`; }
       const slug = lineValue(text, 'SLUG');
       if (slug && !currentId) id = wizardGraphId(prompt, slug, taken);
     }
@@ -746,13 +753,15 @@ export async function generateGraphFromPrompt(req: GraphWizardRequest, deps: Gra
     recipes = undefined;
     dryRun = undefined;
     if (kind === 'harness' && issues.length === 0) {
-      issues = stepIssues(yaml, steps);
+      if (!req.missionBase) issues = stepIssues(yaml, steps);
       const nodes = ((parseYaml(yaml) as { nodes?: Array<{ node_id?: unknown; recipe?: unknown }> }).nodes ?? [])
         .map((n) => ({ nodeId: String(n.node_id), recipe: typeof n.recipe === 'string' ? n.recipe : '' }));
-      recipes = recipesYamlFor(nodes, steps);
-      const walked = await dryRunWizardGraph(yaml, recipes);
-      dryRun = { status: walked.status, path: walked.path };
-      if (walked.status !== 'done') issues.push(`graph run --dry-run: ${walked.status}${walked.error ? ` — ${walked.error}` : ''} (경로 ${walked.path.join(' → ')})`);
+      if (!req.missionBase) {
+        recipes = recipesYamlFor(nodes, steps);
+        const walked = await dryRunWizardGraph(yaml, recipes);
+        dryRun = { status: walked.status, path: walked.path };
+        if (walked.status !== 'done') issues.push(`graph run --dry-run: ${walked.status}${walked.error ? ` — ${walked.error}` : ''} (경로 ${walked.path.join(' → ')})`);
+      }
     }
     debug.log('graph.wizard', 'attempt', { id, attempt: attempts, base, ok: issues.length === 0, issues: issues.slice(0, 10) });
     if (issues.length === 0) break;

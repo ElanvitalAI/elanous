@@ -27,6 +27,7 @@ import { podMemoryLimitFor, type PodMemoryTier } from '../task-orchestrator/surf
 import { oldDoorInternalEnv } from '../self-dev/old-door.js';
 import { selectPodMemoryTier } from './pod-memory-policy.js';
 import { preflightGoalDoneBoundary } from '../self-dev/dev-pipeline.js';
+import { forwardChildStderr } from '../surface/child-process.js';
 
 export interface HarnessPodDispatchInput {
   readonly entrance: 'cli-harness-ask' | 'cli-harness-say';
@@ -294,9 +295,14 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     goalChars, ...(input.entrance === 'cli-harness-ask' ? { goalPath: input.input } : {}),
   });
   const run = deps.run ?? ((cmd: string, a: readonly string[], childEnv: NodeJS.ProcessEnv) => new Promise<number>((resolveStatus) => {
-    const child = (deps.spawnChild ?? spawn)(cmd, [...a], { stdio: deps.onOutput ? ['inherit', 'pipe', 'inherit'] : 'inherit', env: childEnv });
+    const ownsOutput = Boolean(deps.onOutput);
+    const child = (deps.spawnChild ?? spawn)(cmd, [...a], {
+      stdio: ownsOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+      env: childEnv,
+    });
     child.stdout?.setEncoding('utf8');
     child.stdout?.on('data', (chunk: string) => { process.stdout.write(chunk); deps.onOutput?.(chunk); });
+    if (ownsOutput) forwardChildStderr(child.stderr);
     let forwarded: NodeJS.Signals | undefined;
     const forward = (signal: NodeJS.Signals) => {
       forwarded = signal;

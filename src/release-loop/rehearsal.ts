@@ -67,6 +67,15 @@ export function planRehearsal(schedules: readonly ReleaseSchedule[], now: Date, 
   return { status: 'not-yet', version, cutAt, nextStepAt: new Date(cut - open[0]!.minutes * minute).toISOString() };
 }
 
+export interface RehearsalRecovery {
+  failedShard: string;
+  remeasuredFiles: number | null;
+  durationMs: number | null;
+  poolOverwriteApplied: boolean | null;
+  outcome: 'ok' | 'failed';
+  error?: string;
+}
+
 export interface RehearsalStamp {
   version: string;
   step: StepId;
@@ -79,6 +88,7 @@ export interface RehearsalStamp {
   regressionFiles?: string[];
   result?: LightRcResult;
   hardGate?: HardGateResult;
+  recovery?: RehearsalRecovery;
   hardGateRunId?: string;
   hardGateLog?: string;
   /** B6: an unmeasured hard gate always retains a cause, run id and durable local evidence path. */
@@ -94,6 +104,7 @@ export interface RehearsalOptions {
   apply?: boolean;
   checkout?: string;
   ledgerRoot?: string;
+  recoveryRun?: string;
   shards?: number;
   remote?: string;
 }
@@ -109,6 +120,7 @@ export interface RehearsalDeps {
   notify?: (text: string) => void | boolean | Promise<void | boolean>;
   git?: (args: string[], cwd: string) => { rc: number | null; stdout: string; stderr?: string };
   leakCheck?: (checkout: string) => { status: number | null; detail?: string };
+  resumeGate?: (runId: string, checkout: string) => Promise<{ files: number; durationMs: number; poolOverwriteApplied: boolean; ok: boolean }>;
 }
 
 export type RehearsalTickResult = RehearsalPlan & { applied?: boolean; stamps?: RehearsalStamp[]; notificationFailures?: number };
@@ -520,6 +532,21 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
                 console.error(line);
               } }, { cwd })))(plan.version, checkout, selection);
             stamp.result = result;
+            if (opts.recoveryRun && result.unmeasured !== null) {
+              const failedShard = result.unmeasured;
+              const started = Date.now();
+              try {
+                const recovered = await deps.resumeGate?.(opts.recoveryRun, checkout);
+                if (!recovered) throw new Error('release resume --from gate is unavailable for this rehearsal');
+                stamp.recovery = { failedShard, remeasuredFiles: recovered.files, durationMs: recovered.durationMs,
+                  poolOverwriteApplied: recovered.poolOverwriteApplied, outcome: recovered.ok ? 'ok' : 'failed',
+                  ...(!recovered.ok ? { error: 'resumed gate did not pass' } : {}) };
+              } catch (error) {
+                stamp.recovery = { failedShard, remeasuredFiles: null, durationMs: Math.max(0, Date.now() - started),
+                  poolOverwriteApplied: null, outcome: 'failed',
+                  error: oneLine(error instanceof Error ? error.message : String(error)) };
+              }
+            }
             if (regressionFiles.length) stamp.regressionFiles = regressionFiles;
             const shardMismatch = selection.shards !== undefined && result.shards !== selection.shards
               ? `selected shards ${selection.shards} but RC reported ${result.shards}` : null;

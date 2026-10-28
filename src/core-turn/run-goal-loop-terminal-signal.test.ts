@@ -16,18 +16,20 @@ const realStream = llmModule.streamLLMWithTools;
 const ANSWER = '대조 완료 — 남은 조치 0건입니다.';
 const tool: LLMToolSpec = { name: 'RunShell', description: 'run', parameters: { type: 'object', properties: {} } };
 
-function scriptedProvider(turns: LLMStreamEvent[][]): { provider: LLMProvider; callsSeen: () => number } {
+function scriptedProvider(turns: LLMStreamEvent[][], name = 'scripted'): { provider: LLMProvider; callsSeen: () => number; toolCounts: number[] } {
   let call = 0;
+  const toolCounts: number[] = [];
   const p: LLMProvider = {
-    name: 'scripted',
+    name,
     defaultModel: 'd',
     available: () => true,
-    async *streamChat() {
+    async *streamChat(_messages, opts) {
+      toolCounts.push(opts?.tools?.length ?? 0);
       for (const ev of turns[call++] ?? []) yield ev;
     },
     async *chat() {},
   };
-  return { provider: p, callsSeen: () => call };
+  return { provider: p, callsSeen: () => call, toolCounts };
 }
 
 beforeEach(() => {
@@ -54,8 +56,8 @@ const ANSWER_THEN_SIGNAL: LLMStreamEvent[][] = [
   [], [], [], [], [], [], [],
 ];
 
-async function drive(dropTerminal: boolean, turns: LLMStreamEvent[][] = ANSWER_THEN_SIGNAL) {
-  const { provider, callsSeen } = scriptedProvider(turns);
+async function drive(dropTerminal: boolean, turns: LLMStreamEvent[][] = ANSWER_THEN_SIGNAL, providerName = 'scripted', maxTurns = 10, userText = '우편 확인하고 대조해') {
+  const { provider, callsSeen, toolCounts } = scriptedProvider(turns, providerName);
   const seenTerminal: Array<readonly string[] | undefined> = [];
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, handlers, opts = {}) => {
     seenTerminal.push(opts.terminalToolNames);
@@ -64,13 +66,14 @@ async function drive(dropTerminal: boolean, turns: LLMStreamEvent[][] = ANSWER_T
       ...rest,
       ...(dropTerminal ? {} : terminalToolNames !== undefined ? { terminalToolNames } : {}),
       provider,
-      maxTurns: 10,
+      maxTurns,
     });
   });
   const shown: string[] = [];
   const ctx: CoreTurnContext = {
     sessionId: 'goal-friction',
-    messages: [{ role: 'user', content: '우편 확인하고 대조해' } as LLMMessage],
+    messages: [{ role: 'user', content: userText } as LLMMessage],
+    userText,
     tools: [tool],
     dispatchTool: async () => 'ok',
     signal: new AbortController().signal,
@@ -83,10 +86,75 @@ async function drive(dropTerminal: boolean, turns: LLMStreamEvent[][] = ANSWER_T
     attachLifecycleBridge: () => () => {},
     startLivenessHeartbeat: () => () => {},
   });
-  return { result, calls: callsSeen(), seenTerminal, shown: shown.join('') };
+  return { result, calls: callsSeen(), toolCounts, seenTerminal, shown: shown.join('') };
 }
 
 describe('goal loop terminal signal wiring (TUI-GOAL-LOOP-FRICTION)', () => {
+  test('research tool round followed by an explicit structured final answer does not launch another investigation', async () => {
+    const answer = '# HBM4 조사 결과\n\n## 근거\n' + '실측 자료와 출처를 대조했습니다. '.repeat(100)
+      + '\n\n## 결론\n검증된 수치를 요약하고 남은 불확실성을 표시했습니다.';
+    const r = await drive(false, [
+      [{ type: 'tool_call', id: 'research-1', name: 'RunShell', args: {} }],
+      [{ type: 'text', phase: 'final', delta: answer }, { type: 'turn_end', endTurn: true }],
+      [{ type: 'tool_call', id: 'unwanted', name: 'RunShell', args: {} }],
+    ], 'openai-codex', 10, 'HBM4 최신 자료를 조사하고 근거와 결론을 분석해줘');
+    expect(r.calls).toBe(2);
+    expect(r.result).toMatchObject({ finalText: answer, stopReason: 'goal_complete', goalComplete: true, iterations: 1 });
+  });
+
+  test('a short final-phase progress note still requires the goal completion signal', async () => {
+    const r = await drive(false, [
+      [{ type: 'tool_call', id: 'research-1', name: 'RunShell', args: {} }],
+      [{ type: 'text', phase: 'final', delta: '자료를 확인했습니다. 이어서 분석하겠습니다.' }],
+      [{ type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: '분석 완료' } }],
+      [{ type: 'text', delta: ANSWER }],
+    ], 'openai-codex');
+    expect(r.calls).toBeGreaterThan(2);
+    expect(r.result).toMatchObject({ stopReason: 'goal_complete', goalComplete: true, iterations: 2 });
+  });
+  test('Codex end_turn:false continues a text-only response and replays its phase', async () => {
+    const seen: LLMMessage[][] = [];
+    let calls = 0;
+    const provider: LLMProvider = {
+      name: 'openai-codex', defaultModel: 'gpt-6-sol', available: () => true,
+      async *streamChat(messages) {
+        seen.push([...messages]);
+        if (calls++ === 0) {
+          yield { type: 'text', phase: 'commentary', delta: 'I am checking.' } as LLMStreamEvent;
+          yield { type: 'turn_end', endTurn: false } as LLMStreamEvent;
+        } else {
+          yield { type: 'text', phase: 'final', delta: ANSWER } as LLMStreamEvent;
+          yield { type: 'turn_end', endTurn: true } as LLMStreamEvent;
+        }
+      },
+      async *chat() {},
+    };
+    const result = await realStream([{ role: 'user', content: 'check' }], { onText: () => {}, dispatchTool: async () => ({}) }, {
+      provider, tools: [], maxTurns: 1,
+    });
+    expect(calls).toBe(2);
+    expect(result).toBe(ANSWER);
+    expect(seen[1]).toContainEqual({ role: 'assistant', content: 'I am checking.', phase: 'commentary' });
+  });
+
+  test('Codex never treats a second end_turn:false response as final', async () => {
+    let calls = 0;
+    const provider: LLMProvider = {
+      name: 'openai-codex', defaultModel: 'gpt-6-sol', available: () => true,
+      async *streamChat() {
+        calls++;
+        yield { type: 'text', phase: 'commentary', delta: 'Still checking.' } as LLMStreamEvent;
+        yield { type: 'turn_end', endTurn: false } as LLMStreamEvent;
+      },
+      async *chat() {},
+    };
+    const result = await realStream([{ role: 'user', content: 'check' }], {
+      onText: () => {}, dispatchTool: async () => ({}),
+    }, { provider, tools: [], maxTurns: 1 });
+    expect(calls).toBe(2);
+    expect(result).toContain('[NO FINAL SYNTHESIS]');
+  });
+
   test('answer ⊕ update_goal(complete) → one model call, goal complete, the answer once, no internal notice', async () => {
     const r = await drive(false);
     expect(r.seenTerminal[0]).toContain('update_goal');
@@ -95,6 +163,108 @@ describe('goal loop terminal signal wiring (TUI-GOAL-LOOP-FRICTION)', () => {
     expect(r.result.finalText).toBe(ANSWER);
     expect(r.result.finalText).not.toContain('[NO FINAL SYNTHESIS]');
     expect(r.shown).toBe(ANSWER);
+  });
+
+  test('completion without current or prior visible answer gets another provider response', async () => {
+    const turns: LLMStreamEvent[][] = [
+      [{ type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: '실측 완료' } }],
+      [{ type: 'text', delta: ANSWER }],
+    ];
+    const r = await drive(false, turns);
+    expect(r.result).toMatchObject({ stopReason: 'goal_complete', goalComplete: true, iterations: 1 });
+    expect(r.calls).toBe(2);
+    expect(r.shown).toBe(ANSWER);
+    expect(r.result.finalText).toBe(ANSWER);
+  });
+
+  test('Codex completion with progress text waits for a final answer turn', async () => {
+    const progress = '자료를 확인했습니다. 이제 최종 답변을 작성하겠습니다.';
+    const turns: LLMStreamEvent[][] = [
+      [
+        { type: 'text', delta: progress },
+        { type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: '자료 확인 완료' } },
+      ],
+      [{ type: 'text', delta: ANSWER }],
+    ];
+    const r = await drive(false, turns, 'openai-codex');
+    expect(r.calls).toBe(2);
+    expect(r.toolCounts).toEqual([expect.any(Number), 0]);
+    expect(r.result).toMatchObject({ stopReason: 'goal_complete', goalComplete: true, iterations: 1 });
+    expect(r.result.finalText).toBe(ANSWER);
+  });
+
+  test('Opus-style final answer before completion keeps the one-call path', async () => {
+    const r = await drive(false, ANSWER_THEN_SIGNAL, 'anthropic');
+    expect(r.calls).toBe(1);
+    expect(r.result.finalText).toBe(ANSWER);
+  });
+
+  test('commentary phase before completion needs synthesis for any provider', async () => {
+    const r = await drive(false, [
+      [
+        { type: 'text', phase: 'commentary', delta: 'Source check complete.' },
+        { type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: 'source checked' } },
+      ],
+      [{ type: 'text', phase: 'final', delta: ANSWER }],
+    ], 'anthropic');
+    expect(r.calls).toBe(2);
+    expect(r.result.finalText).toBe(ANSWER);
+  });
+
+  test('explicit final phase keeps one call even when final text contains future tense', async () => {
+    const final = '계약상 다음 주에 배송하겠습니다.';
+    const r = await drive(false, [[
+      { type: 'text', phase: 'final', delta: final },
+      { type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: '계약 확인' } },
+    ]], 'anthropic');
+    expect(r.calls).toBe(1);
+    expect(r.result.finalText).toBe(final);
+  });
+
+  test('completion progress on the last allowed turn still receives one final synthesis call', async () => {
+    const r = await drive(false, [
+      [
+        { type: 'text', delta: '이제 답변하겠습니다.' },
+        { type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: '검증 완료' } },
+      ],
+      [{ type: 'text', delta: ANSWER }],
+    ], 'openai-codex', 1);
+    expect(r.calls).toBe(2);
+    expect(r.result.finalText).toBe(ANSWER);
+  });
+
+  test('Codex retries an empty response after completion instead of accepting progress', async () => {
+    const progress = '이제 최종 답변을 작성하겠습니다.';
+    const r = await drive(false, [
+      [
+        { type: 'text', delta: progress },
+        { type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: '검증 완료' } },
+      ],
+      [],
+      [{ type: 'text', delta: ANSWER }],
+    ], 'openai-codex');
+    expect(r.calls).toBe(3);
+    expect(r.result.finalText).toBe(ANSWER);
+  });
+
+  test('prior answer ⊕ completion with readback preface and novel detail: suppress repeat, preserve suffix', async () => {
+    const ADDENDUM = ' 확인된 추가 사실.';
+    const READBACK = `다시 확인: ${ANSWER}${ADDENDUM}`;
+    const turns: LLMStreamEvent[][] = [
+      [{ type: 'tool_call', id: 'work', name: 'RunShell', args: {} }],
+      [{ type: 'text', delta: ANSWER }],
+      [
+        { type: 'text', delta: READBACK },
+        { type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: '실측 결과 확인' } },
+      ],
+      [{ type: 'text', delta: 'unexpected provider request' }],
+    ];
+    const r = await drive(false, turns);
+    expect(r.result).toMatchObject({ stopReason: 'goal_complete', goalComplete: true, iterations: 2 });
+    expect(r.calls).toBe(3);
+    expect(r.shown).toBe(ANSWER + ADDENDUM);
+    expect(r.result.finalText).toContain(ADDENDUM);
+    expect(r.result.finalText).toBe(READBACK);
   });
 
   test('반증 — dropping terminalToolNames reopens empty turns and the internal notice leaks into the answer', async () => {
@@ -134,8 +304,8 @@ describe('goal loop empty tail after a signal-only iteration (TUI-H1-GOALLOOP-EM
     expect(r.result.finalText).not.toContain('[NO FINAL SYNTHESIS]');
     expect(r.shown).toBe(SHORT);
     expect(r.shown).not.toContain('could not finish');
-    // iteration 1 = RunShell 턴 ⊕ 답 턴 · iteration 2 = 신호 턴 ⊕ 빈 턴 하나(재촉 없이 끝).
-    expect(r.calls).toBe(4);
+    // 이전 답은 completion transcript에 보존하면서 완료 ack 뒤 provider 재호출은 하지 않는다.
+    expect(r.calls).toBe(3);
     expect(verdicts).toEqual([expect.objectContaining({ reason: 'goal-complete', stopReason: 'goal_complete' })]);
   });
 

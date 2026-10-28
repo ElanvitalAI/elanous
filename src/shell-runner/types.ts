@@ -213,6 +213,10 @@ export interface StreamOutput {
 
 export interface ShellResult {
   exitCode?: number;
+  /** Failure detail captured at the execution boundary (for example,
+   *  the original spawn error). Kept separate from outcome so callers
+   *  can explain why no process exit status exists. */
+  failureReason?: string;
   stdout: StreamOutput;
   stderr: StreamOutput;
   /** Merged (interleaved) stream in spawn order. For File engine

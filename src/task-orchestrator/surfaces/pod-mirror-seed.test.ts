@@ -72,7 +72,7 @@ describe('SI-SEED-DEFAULT resolveDefaultSourceHead', () => {
 
   test('resolves refs/heads/<base> (main by default) and uses the local commit without fetching', async () => {
     const g = git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 0 } });
-    expect(await resolveDefaultSourceHead({ repoUrl: 'https://example.invalid/r', cwd: '/t', git: g.fn })).toEqual({ sha: tip });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'https://example.invalid/r', cwd: '/t', git: g.fn })).toEqual({ sha: tip, originCalls: 1 });
     expect(g.calls).toEqual([['ls-remote', '--', 'https://example.invalid/r', 'refs/heads/main'], ['cat-file', '-e', `${tip}^{commit}`]]);
     const b = git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/bench/x\n` }, 'cat-file': { rc: 0 } });
     await resolveDefaultSourceHead({ repoUrl: 'u', base: 'bench/x', cwd: '/t', git: b.fn });
@@ -81,18 +81,18 @@ describe('SI-SEED-DEFAULT resolveDefaultSourceHead', () => {
 
   test('a commit missing from the seeding tree is fetched by sha (objects only); every miss is a reason, never a throw', async () => {
     const fetched = git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': [{ rc: 1 }, { rc: 0 }], fetch: { rc: 0 } });
-    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: fetched.fn })).toEqual({ sha: tip });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: fetched.fn })).toEqual({ sha: tip, originCalls: 2 });
     expect(fetched.calls[2]).toEqual(['fetch', '--quiet', '--no-write-fetch-head', '--', 'u', tip]);
-    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 128 } }).fn })).toEqual({ reason: 'ls-remote-failed' });
-    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: '' } }).fn })).toEqual({ reason: 'ls-remote-no-sha' });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 128 } }).fn })).toEqual({ reason: 'ls-remote-failed', originCalls: 1 });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: '' } }).fn })).toEqual({ reason: 'ls-remote-no-sha', originCalls: 1 });
     // Only the exact ref counts: a longer branch name listed first is not `main`.
     const other = 'e'.repeat(40);
     const exact = git({ 'ls-remote': { rc: 0, output: `${other}\trefs/heads/a/refs/heads/main\n${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 0 } });
-    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: exact.fn })).toEqual({ sha: tip });
-    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${other}\trefs/heads/a/refs/heads/main\n` } }).fn })).toEqual({ reason: 'ls-remote-no-sha' });
-    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 1 }, fetch: { rc: 1 } }).fn })).toEqual({ reason: 'commit-fetch-failed' });
-    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 1 }, fetch: { rc: 0 } }).fn })).toEqual({ reason: 'commit-not-local' });
-    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: async () => { throw new Error('spawn'); } })).toEqual({ reason: 'resolve-threw' });
-    for (const base of ['-x', 'a b', 'x;rm']) expect(await resolveDefaultSourceHead({ repoUrl: 'u', base, cwd: '/t', git: git({}).fn })).toEqual({ reason: 'invalid-ref' });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: exact.fn })).toEqual({ sha: tip, originCalls: 1 });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${other}\trefs/heads/a/refs/heads/main\n` } }).fn })).toEqual({ reason: 'ls-remote-no-sha', originCalls: 1 });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 1 }, fetch: { rc: 1 } }).fn })).toEqual({ reason: 'commit-fetch-failed', originCalls: 2 });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: git({ 'ls-remote': { rc: 0, output: `${tip}\trefs/heads/main\n` }, 'cat-file': { rc: 1 }, fetch: { rc: 0 } }).fn })).toEqual({ reason: 'commit-not-local', originCalls: 2 });
+    expect(await resolveDefaultSourceHead({ repoUrl: 'u', cwd: '/t', git: async () => { throw new Error('spawn'); } })).toEqual({ reason: 'resolve-threw', originCalls: 1 });
+    for (const base of ['-x', 'a b', 'x;rm']) expect(await resolveDefaultSourceHead({ repoUrl: 'u', base, cwd: '/t', git: git({}).fn })).toEqual({ reason: 'invalid-ref', originCalls: 0 });
   });
 });

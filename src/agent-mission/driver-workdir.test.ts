@@ -1,11 +1,16 @@
-import { expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkEvidence, claudeBackend, codexBackend, runAgentMission, terminateMissionProcessTree, type AgentMissionDeps, type AgentMissionSpec } from './driver.js';
+import { checkEvidence, claudeBackend, codexBackend, runAgentMission, setAgentMissionTimingForTest, terminateMissionProcessTree, type AgentMissionDeps, type AgentMissionSpec } from './driver.js';
 import { runClaudeHeadless } from './claude-headless.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
+import { debug } from '../debug/log.js';
+
+let restoreMissionTiming: (() => void) | undefined;
+beforeAll(() => { restoreMissionTiming = setAgentMissionTimingForTest({ readyQuietMs: 20, pollMs: 5, keystrokeGapMs: 0 }); });
+afterAll(() => { restoreMissionTiming?.(); });
 
 async function fixture(action: 'old' | 'write' | 'abort' | 'outside') {
   const root = mkdtempSync(join(tmpdir(), 'mission-workdir-'));
@@ -164,6 +169,20 @@ test('abort ends the PTY and includes grandchildren in tree termination', async 
   expect(result).toMatchObject({ ok: false, reason: 'aborted', committed: false });
   expect(termSignals.filter(([, sig]) => sig === 'SIGTERM').map(([pid]) => pid)).toEqual([12, 11, 10]);
   expect(calls.killed).toBe(1);
+});
+
+test('SIGINT cancellation records a durable agent-mission result event', async () => {
+  const rows: Array<{ runId: string; ok: boolean; reason: string; rounds: number; committed: boolean }> = [];
+  const originalLog = debug.log;
+  debug.log = ((category: string, event: string, data: { runId: string; ok: boolean; reason: string; rounds: number; committed: boolean }) => {
+    if (category === 'agent-mission' && event === 'result') rows.push(data);
+  }) as typeof debug.log;
+  try {
+    const { result } = await fixture('abort');
+    expect(result).toMatchObject({ ok: false, reason: 'aborted', committed: false });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ runId: expect.any(String), ok: false, reason: 'aborted', committed: false });
+  } finally { debug.log = originalLog; }
 });
 
 test('explicit Claude headless abort kills the spawned process tree before returning', async () => {

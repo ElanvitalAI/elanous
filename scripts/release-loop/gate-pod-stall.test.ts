@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   createGateRunner, gateBeatScript, gateEnvBaselineLine, gateShardAbortScript, gateShardShell, graphGateResult, readShardArtifacts, readShardLiveLog, runGateNode,
-  shardStallWatchRecord, watchShardStall, partialFailuresOf, GATE_POD_MIDRUN_STALL_SECONDS_DEFAULT, GATE_SHARD_ABORT_TRIES, POD_SHARD_FILE_CAP, type GateOptions, type GateResult, type GateRunner,
+  shardStallWatchRecord, watchShardStall, partialFailuresOf, GATE_POD_MIDRUN_STALL_SECONDS_DEFAULT, GATE_SHARD_ABORT_TRIES, type GateOptions, type GateResult, type GateRunner,
 } from './gate-node';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import type { RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
@@ -93,9 +93,8 @@ test('a malformed completed-shard log is reported but cannot replace the stalled
   ]);
 });
 
-test('a shard that prints only its checkout is stopped within the stall window, retried once fresh, never split, and the sweep fails as unmeasured', async () => {
-  // More files than the cap: a «no-output» root shard would otherwise cap-split into -c0/-c1 after its retry.
-  const files = Array.from({ length: POD_SHARD_FILE_CAP + 5 }, (_, i) => `src/s-${String(i).padStart(2, '0')}.test.ts`);
+test('a stalled multi-file shard fans out directly to file Pods and remains unmeasured when each file stalls', async () => {
+  const files = ['src/s-00.test.ts', 'src/s-01.test.ts'];
   const { root, repo, runner, calls, stopped, podOptions } = stallRig(files, () => true);
   const { events, restore } = captureGateEvents();
   const started = Date.now();
@@ -106,28 +105,30 @@ test('a shard that prints only its checkout is stopped within the stall window, 
   const elapsed = Date.now() - started;
   expect(error).toBeInstanceOf(Error);
   expect(String((error as Error).message)).toContain('unmeasured: no test output within 0.3s of checkout — shards 0');
-  expect((error as { stalledShards?: unknown }).stalledShards).toEqual([
-    { shard: 0, files, reason: 'no-output', stall: { seconds: 0.3, sinceCheckoutMs: expect.any(Number) } },
-  ]);
-  // First attempt ⊕ the one fresh retry — no -c<n> / -<n> split Pods.
-  expect(calls.map((call) => call.files)).toEqual([files, files]);
-  // GATE-ENV-BASELINE: the fresh retry Pod goes through the same shell assembly — it carries the env baseline too.
+  expect((error as { stalledShards?: unknown }).stalledShards).toEqual(files.map((file) =>
+    ({ shard: 0, files: [file], reason: 'no-output', stall: { seconds: 0.3, sinceCheckoutMs: expect.any(Number) } })));
+  // One watched parent, then one Pod per file; a stalled single file keeps its existing one fresh retry.
+  expect(calls.map((call) => call.files)).toEqual([files, ...files.map((file) => [file]), ...files.map((file) => [file])]);
+  // GATE-ENV-BASELINE: the file Pods and their retries carry the same env baseline.
   for (const call of calls) expect(call.shell.split('\n')).toContain(gateEnvBaselineLine());
   expect(stopped).toEqual(calls.map((call) => call.name));
-  expect(elapsed).toBeLessThan(10_000);
+  expect(elapsed).toBeLessThan(15_000);
   const stalls = events.filter((item) => item.event === 'pod-shard-stall');
   expect(stalls.map((item) => item.data)).toEqual([
     { shard: 0, branch: '', stallSeconds: 0.3, sinceCheckoutMs: expect.any(Number) },
-    { shard: 0, branch: '-retry', stallSeconds: 0.3, sinceCheckoutMs: expect.any(Number) },
+    { shard: 0, branch: '-file-0', stallSeconds: 0.3, sinceCheckoutMs: expect.any(Number) },
+    { shard: 0, branch: '-file-1', stallSeconds: 0.3, sinceCheckoutMs: expect.any(Number) },
+    { shard: 0, branch: '-file-0-retry', stallSeconds: 0.3, sinceCheckoutMs: expect.any(Number) },
+    { shard: 0, branch: '-file-1-retry', stallSeconds: 0.3, sinceCheckoutMs: expect.any(Number) },
   ]);
   for (const item of stalls) expect(item.data.sinceCheckoutMs as number).toBeGreaterThanOrEqual(300);
   expect(events.some((item) => /^pod-shard-(?:cap-)?split$|^pod-shard-isolate$|^retry-narrowed$/.test(item.event))).toBe(false);
   expect(events.filter((item) => item.event === 'pod-sweep-unmeasured').map((item) => item.data)).toEqual([{ shards: [0], files: files.length, stallSeconds: 0.3, measuredFiles: 0 }]);
-  for (const name of ['pod-0', 'pod-0-retry']) {
+  for (const name of ['pod-0', 'pod-0-file-0', 'pod-0-file-1', 'pod-0-file-0-retry', 'pod-0-file-1-retry']) {
     expect(JSON.parse(readFileSync(join(root, 'logs', `${name}.json`), 'utf8'))).toMatchObject({ rc: null, reason: 'stall', finishedFiles: 0, stallSeconds: 0.3,
       stallWatch: { armed: true, disarmedBy: 'stall-fired', firstTestAtSec: null, stallSeconds: 0.3 } });
   }
-  expect(existsSync(join(root, 'logs', 'pod-0-c0.json'))).toBe(false);
+  expect(existsSync(join(root, 'logs', 'pod-0-retry.json'))).toBe(false);
 }, 30_000);
 
 test('the gate node entry ends promptly with exit 2 and a failed verdict line, the stalled shard listed (an executed failure, not a hang)', async () => {
@@ -152,7 +153,7 @@ test('the gate node entry ends promptly with exit 2 and a failed verdict line, t
   expect(code).toBe(2);
   const line = JSON.parse(printed.at(-1)!) as Record<string, unknown>;
   expect(line).toMatchObject({ outcome: 'error', verdict: 'fail', stalledEnv: [],
-    stalledShards: [{ shard: 0, files, reason: 'no-output', stall: { seconds: 0.3, sinceCheckoutMs: expect.any(Number) } }] });
+    stalledShards: files.map((file) => ({ shard: 0, files: [file], reason: 'no-output', stall: { seconds: 0.3, sinceCheckoutMs: expect.any(Number) } })) });
   expect(String(line.summary)).toContain('게이트 error');
   expect(String(line.error)).toContain('unmeasured');
 }, 30_000);
@@ -187,7 +188,7 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
   };
   const first = await runGraph(graphPath, { input: { version: '9.9.97', branchCut: true, previousVersion: '9.9.96', gatePodPool: 'pool-test' }, deps: { root: ledger, runBash } });
   expect(gate.body).toContain('gate-node.ts --json');
-  // Ends within the stall window ⊕ one retry — never the shard deadline (10-10: 1697s · rc=null · neither ended nor failed).
+  // Ends after the file-level rechecks — never the shard deadline (10-10: 1697s · rc=null · neither ended nor failed).
   expect(gate.elapsedMs!).toBeLessThan(15_000);
   expect(gate.code).toBe(2);
   expect(first.status).toBe('failed');
@@ -203,15 +204,15 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
   const line = JSON.parse(String(record.output).trim().split('\n').at(-1)!) as Record<string, unknown>;
   expect(line).toMatchObject({ outcome: 'error', verdict: 'fail', introduced: [],
     commit: CUT, partialFailures: { failures: [], errors: [] },
-    stalledShards: [{ shard: 0, files, reason: 'no-output', stall: { seconds: 0.3, sinceCheckoutMs: expect.any(Number) } }] });
+    stalledShards: files.map((file) => ({ shard: 0, files: [file], reason: 'no-output', stall: { seconds: 0.3, sinceCheckoutMs: expect.any(Number) } })) });
   expect(String(line.error)).toContain('unmeasured: no test output within 0.3s of checkout');
   // The unmeasured marker the waiver rule reads off that saved record.
-  expect(gateUnmeasuredDetail(saved, saved.nodes.indexOf(record))).toStartWith('sweep incomplete: pod sweep incomplete: stalled shards 0 (unmeasured: no test output within 0.3s of checkout');
+  expect(gateUnmeasuredDetail(saved, saved.nodes.indexOf(record))).toStartWith('sweep incomplete: pod sweep incomplete: stalled shards 0, 0 (unmeasured: no test output within 0.3s of checkout');
   const reason = 'alternative gate evidence: the pod gate printed no test output after checkout and was recorded unmeasured';
   const waived = releaseResumeWaiver(saved, { from: 'gate', waive: 'gate', reason });
   expect(waived).toMatchObject({ nodeId: 'gate', reason, acceptedRegressions: [{ id: 'waive:gate', note: reason }] });
-  expect(waived?.unmeasured).toStartWith('sweep incomplete: pod sweep incomplete: stalled shards 0 (unmeasured: no test output within 0.3s of checkout');
-  expect(waived?.unmeasured).toContain('stalled shards 1 (no-output×1)');
+  expect(waived?.unmeasured).toStartWith('sweep incomplete: pod sweep incomplete: stalled shards 0, 0 (unmeasured: no test output within 0.3s of checkout');
+  expect(waived?.unmeasured).toContain('stalled shards 2 (no-output×2)');
   // Exercise the persisted graph output all the way through resume planning; don't inject a synthetic gate result.
   setElanousConfigDir(ledger);
   try {

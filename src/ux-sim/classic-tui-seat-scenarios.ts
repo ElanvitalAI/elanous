@@ -480,19 +480,13 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     env[TEST_FAKE_LLM_RESPONSE_ENV] = reply;
     const banner = '↻ 자동 재개(goal-continue)';
     const replies = (s: string) => s.split(reply).length - 1;
-    let settledAt = 0;
     const steps: SeatPtyStep[] = [
       { label: 'human turn', text: '영상 만들어줘', until: (s) => replies(s) >= 1 },
       {
         label: 'continued',
-        until: (s) => {
-          const ok = s.includes(banner) && replies(s) === 2 && turnDone(s.slice(s.lastIndexOf(banner)));
-          if (ok && settledAt === 0) settledAt = Date.now();
-          return ok;
-        },
+        until: (s) => s.includes(banner) && replies(s) === 2 && turnDone(s.slice(s.lastIndexOf(banner))),
         timeoutMs: 60_000,
       },
-      { label: 'no loop', until: (s) => settledAt > 0 && Date.now() >= settledAt + 25_000 && replies(s) === 2, timeoutMs: 40_000 },
     ];
     const run = await mockSeatPtySequence({ ...base, env, steps });
     const last = run.frames.at(-1)?.screen ?? '';

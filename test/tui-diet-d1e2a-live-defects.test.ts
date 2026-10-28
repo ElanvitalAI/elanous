@@ -199,13 +199,16 @@ describe('TUI D1e-2a live defects', () => {
     expect(resolveDashboardChatMainSlashCommand('/g').cmdLower).toBe('g');
     expect(await registry.dispatch('g', [], {} as DashboardSlashContext)).toEqual({ kind: 'unregistered' });
     expect(registry.has('gemini')).toBe(true);
-    await picker.dispatch({ name: 'down' } as Key, buf);
-    const selected = await picker.dispatch({ name: 'enter' } as Key, buf);
-    expect(selected).toEqual({ consumed: true, action: { kind: 'submit', text: '/' + picker.slashFiltered(buf)[picker.selectedIdx()]!.name } });
+    expect(picker.slashFiltered(buf).map(({ name }) => name)).not.toContain('gemini');
+    const selectable = { lines: ['/he'], lineIdx: 0, colIdx: 3 };
+    await picker.refresh(selectable);
+    await picker.dispatch({ name: 'down' } as Key, selectable);
+    const selected = await picker.dispatch({ name: 'enter' } as Key, selectable);
+    expect(selected).toEqual({ consumed: true, action: { kind: 'submit', text: '/' + picker.slashFiltered(selectable)[picker.selectedIdx()]!.name } });
     expect(resolveDashboardChatMainSlashCommand('/goal').cmdLower).toBe('goal');
     expect(resolveDashboardChatMainSlashCommand('/ask').cmdLower).toBe('ask');
     expect(resolveDashboardChatMainSlashCommand('/clipboard').cmdLower).toBe('clipboard');
-    for (const typed of ['/goal', '/ask', '/clipboard']) {
+    for (const typed of ['/goal', '/ask']) {
       const entry = { lines: [typed], lineIdx: 0, colIdx: typed.length };
       picker.onBufferEdit();
       await picker.refresh(entry);
@@ -213,6 +216,11 @@ describe('TUI D1e-2a live defects', () => {
         consumed: true, action: { kind: 'submit', text: typed },
       });
     }
+    const hiddenTyped = { lines: ['/clipboard'], lineIdx: 0, colIdx: '/clipboard'.length };
+    picker.onBufferEdit();
+    await picker.refresh(hiddenTyped);
+    expect(await picker.dispatch({ name: 'enter' } as Key, hiddenTyped)).toEqual({ consumed: false });
+    expect(resolveDashboardChatMainSlashCommand('/clipboard').cmdLower).toBe('clipboard');
   });
 
   test('argument picker does not invent an /acp subcommand on trailing space', async () => {

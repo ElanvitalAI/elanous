@@ -22,8 +22,8 @@ export interface LaunchPreflightBlocker {
   readonly name: string;
   /** 왜 막혔는지 한 줄 — 경로와 수를 포함한다. */
   readonly detail: string;
-  /** 골 판독 실패(`goal-unreadable`)와 traced-path 오류(`missing-traced-path`)를 가르는 사유 코드. */
-  readonly reasonCode?: 'goal-unreadable' | 'missing-traced-path';
+  /** 골 판독 실패(`goal-unreadable`) · 골 해석 실패(`goal-parse`) · traced-path 오류(`missing-traced-path`)를 가르는 사유 코드. */
+  readonly reasonCode?: 'goal-unreadable' | 'goal-parse' | 'missing-traced-path';
   /** 어느 검사인지 — 경로를 접지 않은 검사 이름. */
   readonly checkName?: string;
   /** 잘리지 않은 대상 경로. 경로 없는 검사(빈 traced paths)는 생략한다. */

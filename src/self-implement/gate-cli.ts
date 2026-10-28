@@ -1,8 +1,8 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path/posix';
+import { basename, join, resolve } from 'node:path/posix';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
 import { audit as auditEntryBudget, entryBudgetAffected } from '../../scripts/ratchets/next-tui-entry-budget.js';
 import { withGateTestEnv } from '../../scripts/lib/gate-test-env.js';
@@ -14,11 +14,12 @@ import { runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
 import { runPwaBuildGate } from '../../scripts/ci-pwa-build-gate.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
 import { parseReviewDepthFromFilesJson } from '../agent-mission/review-depth.js';
-import { buildGateBaselineReport, calculateGateTestCountChange, formatGateBaselineNote, formatGateTestCountNote, isGateTestFile, recheckTimeoutOnlyIntroducedFailures, runGateBaseline, type BaselineProcessResult, type BaselineProcessStatus, type GateTestFailure, type TimeoutRecheckRecord, type TimeoutRerunObservation } from './gate-baseline.js';
+import { buildGateBaselineReport, calculateGateTestCountChange, formatGateBaselineNote, formatGateTestCountNote, isGateTestFile, recheckOutsideScopeFailures, recheckTimeoutOnlyIntroducedFailures, runGateBaseline, type BaselineProcessResult, type BaselineProcessStatus, type GateBaselineReport, type GateTestFailure, type InterferenceRecheckRecord, type TimeoutRecheckRecord, type TimeoutRerunObservation } from './gate-baseline.js';
 import { resolveGateScope } from './gate-scope.js';
 import { publicExposureFiles, runExposeGate } from './expose-gate.js';
 import { getUserConfig } from '../user-config.js';
 import { debug, redactSecretText } from '../debug/log.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { buildDocumentGuardianIndex, formatDocumentGuardians } from './document-guardian-index.js';
 import { buildImporterTestIndex, importerTestsNotInRunSet, isTestPath, type ImporterTestIndex } from './importer-test-index.js';
 import { isCommentOnlySourceChange } from './comment-only-source.js';
@@ -38,6 +39,8 @@ import { defaultGateEnvKey, defaultRevResolver, resolveArtifactDir, writeGateArt
 export interface SelfGateCliOptions {
   base?: string;
   pr?: string;
+  /** Bypass reuse of the last passing test radius; still write this run's receipt for the next invocation. */
+  noInherit?: boolean;
   shards?: number;
   /** Live shard bundle concurrency; default three, bounded to one through four. */
   shardConcurrency?: number;
@@ -106,11 +109,11 @@ interface SelfGateCliDeps {
   runTests?: (cwd: string, files: readonly string[]) => ProcessResult;
   runBaseline?: (cwd: string, files: readonly string[], baseRef: string) => BaselineProcessResult;
   runTimeoutRecheck?: (cwd: string, file: string, name: string, timeoutMs: number) => { observation?: TimeoutRerunObservation; elapsedMs: number; output: string };
+  runInterferenceRecheck?: (cwd: string, report: GateBaselineReport, baseRef: string, relatedTestFiles: readonly string[]) => GateBaselineReport;
   runShards?: typeof runShardedGateTests;
   runShardsAsync?: typeof runShardedGateTestsAsync;
   /** Test seam for the live progress line. */
   writeProgressStderr?: (line: string) => void;
-  now?: () => number;
   runIsolationGate?: (out: GateOutput) => number;
   runMockModuleRestoreGate?: (out: GateOutput) => number;
   /** 모델 이름 하드코딩 래칫(🅕 #20521) — `pr land` 만 물고 하니스 무인 병합은 안 물면 위반이 main 에 들어가 남의 착지를 막는다(🅣 2026-09-25). */
@@ -128,12 +131,19 @@ interface SelfGateCliDeps {
   /** `--artifact-dir` 전용 심 — 커밋 sha 해석(실패 = null) · 환경 키. */
   resolveRev?: RevResolver;
   envKey?: () => string;
+  /** Receipt-store seam for tests; production stores under ~/.elanous/gate-receipts. */
+  gateReceiptDir?: () => string;
+  now?: () => number;
 }
 
 /** `--artifact-dir` 가 쓸 재료 — 판정 경로가 «채우기만» 하고 읽지 않는다. */
 interface GateArtifactCapture {
   baseRef?: string;
   testFiles?: readonly string[];
+  fullTestFiles?: readonly string[];
+  failedTestFiles?: readonly string[];
+  testReceiptMeasured?: boolean;
+  receiptDecision?: GateReceiptDecision;
   sharded?: ReturnType<typeof runShardedGateTests>;
   verdict?: string;
   verdictLine?: string;
@@ -144,6 +154,7 @@ interface GateArtifactCapture {
   unrunImporters?: number | null;
   importerLookupFailed?: string;
   timeoutRechecks?: readonly TimeoutRecheckRecord[];
+  interferenceRechecks?: readonly InterferenceRecheckRecord[];
 }
 
 /** SIDE-VERIFY ③ — summary 정수 칸: 게이트가 이미 낸 `result.baseline` ⊕ `unrunImporterTotal` 을 «옮기기만» 한다.
@@ -799,6 +810,7 @@ export function selectGateTestFiles(cwd: string, options: GateSelectionOptions =
 export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, deps: SelfGateCliDeps = {}): SelfGateCliResult {
   const capture: GateArtifactCapture = {};
   const result = runSelfGateCliCore(cwd, options, deps, capture, false) as SelfGateCliResult;
+  persistGateReceipt(cwd, capture, deps);
   if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps);
   return result;
 }
@@ -807,6 +819,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
 export async function runSelfGateCliAsync(cwd: string, options: SelfGateCliOptions = {}, deps: SelfGateCliDeps = {}): Promise<SelfGateCliResult> {
   const capture: GateArtifactCapture = {};
   const result = await runSelfGateCliCore(cwd, options, deps, capture, true);
+  persistGateReceipt(cwd, capture, deps);
   if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps);
   return result;
 }
@@ -830,6 +843,7 @@ function emitGateArtifacts(cwd: string, artifactDir: string, result: SelfGateCli
       verdict: capture.verdict ?? null,
       ...(capture.verdictLine !== undefined ? { verdictLine: capture.verdictLine } : {}),
       ...(capture.timeoutRechecks ? { timeoutRechecks: capture.timeoutRechecks } : {}),
+      ...(capture.interferenceRechecks ? { interferenceRechecks: capture.interferenceRechecks } : {}),
       exitCode: result.exitCode,
       counts: counts.counts,
       ...(counts.reason !== undefined ? { countsUnavailableReason: counts.reason } : {}),
@@ -841,6 +855,246 @@ function emitGateArtifacts(cwd: string, artifactDir: string, result: SelfGateCli
     result.lines.push(`artifacts: ${written.summaryPath} (junit ${written.junitFiles.length}${capture.artifactsUnavailable ? ` · unavailable=${capture.artifactsUnavailable}` : ''})`);
   } catch (error) {
     result.lines.push(`⚠ artifacts: ${dir} 에 못 썼다 — ${error instanceof Error ? error.message : String(error)} (판정은 그대로다)`);
+  }
+}
+
+const GATE_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const GATE_RECEIPT_SCHEMA = 1;
+
+interface GateReceipt {
+  schema: 1;
+  createdAt: number;
+  repositoryHash: string;
+  branch: string;
+  baseSha: string;
+  headSha: string;
+  runtime: string;
+  environmentKey: string;
+  lockfileHash: string;
+  fullTestFiles: string[];
+  failedTestFiles: string[];
+  measured: boolean;
+}
+
+interface GateReceiptIdentity extends Omit<GateReceipt, 'createdAt' | 'fullTestFiles' | 'failedTestFiles' | 'measured'> {
+  receiptPath: string;
+  receiptDir: string;
+}
+
+interface GateReceiptDecision {
+  mode: 'full' | 'inherit';
+  reason: string;
+  identity?: GateReceiptIdentity;
+  sourceHead?: string;
+  runTestFiles?: readonly string[];
+  inheritedTestFiles?: readonly string[];
+}
+
+function sha256(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function normalizedRepositoryUrl(value: string): string | undefined {
+  const raw = value.trim();
+  if (!raw) return undefined;
+  if (!raw.includes('://')) {
+    const scp = /^(?:[^@]+@)?([^:]+):(.+)$/.exec(raw);
+    if (scp) return `${scp[1].toLowerCase()}/${scp[2]}`.replace(/\.git$/i, '');
+  }
+  try {
+    const url = new URL(raw);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return `${url.protocol.toLowerCase()}//${url.host.toLowerCase()}${url.pathname}`.replace(/\.git$/i, '').replace(/\/$/, '');
+  } catch { return undefined; }
+}
+
+function gateReceiptIdentity(
+  cwd: string,
+  selection: ChangedFileSelection,
+  deps: SelfGateCliDeps,
+): { identity?: GateReceiptIdentity; reason?: string } {
+  const run = deps.runCommand ?? defaultRunCommand;
+  const command = (args: string[]) => {
+    try { return run('git', args, cwd); }
+    catch (error) { return { status: null, stderr: error instanceof Error ? error.message : String(error) }; }
+  };
+  const worktree = command(['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  if (worktree.status !== 0 || worktree.error || worktree.stdout === undefined) {
+    return { reason: 'worktree-status-unavailable' };
+  }
+  if (worktree.stdout.length > 0) return { reason: 'worktree-dirty' };
+  const remote = command(['config', '--get', 'remote.origin.url']);
+  const repositoryUrl = remote.status === 0 ? normalizedRepositoryUrl(remote.stdout ?? '') : undefined;
+  if (!repositoryUrl) return { reason: 'repository-origin-unavailable' };
+  const branch = selection.prHeadRefName?.trim() || (() => {
+    const result = command(['branch', '--show-current']);
+    return result.status === 0 ? (result.stdout ?? '').trim() : '';
+  })();
+  if (!branch) return { reason: 'branch-unavailable' };
+  if (selection.baseRef === 'HEAD') return { reason: 'uncommitted-or-no-stable-base' };
+  const resolveRev = deps.resolveRev ?? defaultRevResolver(cwd);
+  const baseSha = resolveRev(selection.baseRef);
+  const headSha = resolveRev('HEAD');
+  if (!baseSha || !headSha || !/^[0-9a-f]{40}$/.test(baseSha) || !/^[0-9a-f]{40}$/.test(headSha)) {
+    return { reason: 'base-or-head-sha-unavailable' };
+  }
+  const lockfile = ['bun.lock', 'bun.lockb'].map((name) => join(cwd, name)).find((path) => existsSync(path));
+  if (!lockfile) return { reason: 'lockfile-unavailable' };
+  let lockfileHash: string;
+  try { lockfileHash = sha256(readFileSync(lockfile)); }
+  catch { return { reason: 'lockfile-unreadable' }; }
+  const runtime = process.versions.bun ?? (globalThis as { Bun?: { version?: string } }).Bun?.version;
+  if (!runtime) return { reason: 'bun-runtime-unavailable' };
+  let environmentKey: string;
+  try { environmentKey = (deps.envKey ?? defaultGateEnvKey)(); }
+  catch { return { reason: 'environment-key-unavailable' }; }
+  const repositoryHash = sha256(repositoryUrl);
+  const receiptDir = deps.gateReceiptDir?.() ?? join(getElanousConfigDir(), 'gate-receipts');
+  const key = sha256(`${repositoryUrl}\0${branch}\0${baseSha}`);
+  return {
+    identity: {
+      schema: GATE_RECEIPT_SCHEMA, repositoryHash, branch, baseSha, headSha, runtime,
+      environmentKey, lockfileHash, receiptDir, receiptPath: join(receiptDir, `${key}.json`),
+    },
+  };
+}
+
+function pruneExpiredGateReceipts(receiptDir: string, now: number): void {
+  try {
+    for (const name of readdirSync(receiptDir)) {
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) continue;
+      const path = join(receiptDir, name);
+      try {
+        const stat = lstatSync(path);
+        if (stat.isFile() && !stat.isSymbolicLink() && now - stat.mtimeMs > GATE_RECEIPT_TTL_MS) rmSync(path, { force: true });
+      } catch { /* a stale receipt disappearing concurrently is harmless */ }
+    }
+  } catch { /* the first receipt has no directory to prune */ }
+}
+
+function isGateReceipt(value: unknown): value is GateReceipt {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Partial<GateReceipt>;
+  return item.schema === GATE_RECEIPT_SCHEMA && typeof item.createdAt === 'number'
+    && typeof item.repositoryHash === 'string' && typeof item.branch === 'string'
+    && typeof item.baseSha === 'string' && /^[0-9a-f]{40}$/.test(item.baseSha)
+    && typeof item.headSha === 'string' && /^[0-9a-f]{40}$/.test(item.headSha)
+    && typeof item.runtime === 'string' && typeof item.environmentKey === 'string'
+    && typeof item.lockfileHash === 'string' && /^[0-9a-f]{64}$/.test(item.lockfileHash)
+    && Array.isArray(item.fullTestFiles) && item.fullTestFiles.every((path) => typeof path === 'string' && isGateTestFile(path))
+    && Array.isArray(item.failedTestFiles) && item.failedTestFiles.every((path) => typeof path === 'string' && isGateTestFile(path))
+    && typeof item.measured === 'boolean';
+}
+
+function rejectGateReceipt(cwd: string, reason: string, details: Record<string, unknown> = {}): GateReceiptDecision {
+  try { debug.log('self-implement', 'gate.receipt-inheritance-rejected', { reason, ...details }); } catch { /* telemetry must not alter the gate */ }
+  return { mode: 'full', reason };
+}
+
+function decideGateReceiptInheritance(
+  cwd: string,
+  options: SelfGateCliOptions,
+  selection: ChangedFileSelection,
+  fullTestFiles: readonly string[],
+  deps: SelfGateCliDeps,
+): GateReceiptDecision {
+  // Existing injected-command fixtures stay isolated unless a test explicitly supplies a receipt directory.
+  if (deps.runCommand && !deps.gateReceiptDir) return { mode: 'full', reason: 'injected-command-no-receipt-store' };
+  const resolved = gateReceiptIdentity(cwd, selection, deps);
+  if (!resolved.identity) return rejectGateReceipt(cwd, resolved.reason ?? 'receipt-identity-unavailable');
+  const identity = resolved.identity;
+  if (options.noInherit) {
+    try { debug.log('self-implement', 'gate.receipt-inheritance-rejected', { reason: 'forced-full', baseSha: identity.baseSha, headSha: identity.headSha }); } catch { /* observation only */ }
+    return { mode: 'full', reason: 'forced-full', identity };
+  }
+  const now = deps.now?.() ?? Date.now();
+  pruneExpiredGateReceipts(identity.receiptDir, now);
+  let prior: unknown;
+  try {
+    const stat = lstatSync(identity.receiptPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return rejectGateReceipt(cwd, 'receipt-not-regular-file', { baseSha: identity.baseSha });
+    prior = JSON.parse(readFileSync(identity.receiptPath, 'utf8'));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    return rejectGateReceipt(cwd, code === 'ENOENT' ? 'no-prior-receipt' : 'receipt-read-failed', { baseSha: identity.baseSha });
+  }
+  if (!isGateReceipt(prior)) return rejectGateReceipt(cwd, 'receipt-schema-invalid', { baseSha: identity.baseSha });
+  if (now - prior.createdAt > GATE_RECEIPT_TTL_MS) {
+    try { rmSync(identity.receiptPath, { force: true }); } catch { /* stale file can remain without affecting the full gate */ }
+    return rejectGateReceipt(cwd, 'receipt-expired', { previousHead: prior.headSha });
+  }
+  if (prior.repositoryHash !== identity.repositoryHash || prior.branch !== identity.branch) return rejectGateReceipt(cwd, 'repository-or-branch-mismatch');
+  if (prior.baseSha !== identity.baseSha) return rejectGateReceipt(cwd, 'base-sha-mismatch', { previousBase: prior.baseSha, currentBase: identity.baseSha });
+  if (prior.runtime !== identity.runtime || prior.environmentKey !== identity.environmentKey) return rejectGateReceipt(cwd, 'runtime-mismatch', { previousRuntime: prior.runtime, currentRuntime: identity.runtime });
+  if (prior.lockfileHash !== identity.lockfileHash) return rejectGateReceipt(cwd, 'lockfile-hash-mismatch');
+  if (!prior.measured) return rejectGateReceipt(cwd, 'previous-test-run-unmeasured', { previousHead: prior.headSha });
+  const ancestor = (deps.runCommand ?? defaultRunCommand)('git', ['merge-base', '--is-ancestor', prior.headSha, identity.headSha], cwd);
+  if (ancestor.status !== 0 || ancestor.error) return rejectGateReceipt(cwd, 'previous-head-not-ancestor', { previousHead: prior.headSha, currentHead: identity.headSha });
+
+  const diff = (deps.runCommand ?? defaultRunCommand)('git', ['diff', '--name-only', `${prior.headSha}..${identity.headSha}`], cwd);
+  if (diff.status !== 0 || diff.error || diff.stdout === undefined) return rejectGateReceipt(cwd, 'head-delta-unavailable', { previousHead: prior.headSha });
+  const changedFiles = [...new Set(diff.stdout.split('\n').map((path) => normalizeGatePath(path.trim())).filter(Boolean))].sort();
+  try {
+    const deltaSelection = { files: changedFiles, baseRef: prior.headSha };
+    const deltaOptions: GateSelectionOptions = { ...options, base: prior.headSha, pr: undefined };
+    const deltaDeps: GateSelectionDeps = { ...deps, changedFiles: () => deltaSelection };
+    const deltaPrepared = prepareGateTestSelection(cwd, deltaOptions, deltaDeps);
+    if (deltaPrepared.lookupFailed || deltaPrepared.routeIndex?.lookupFailures.length) {
+      return rejectGateReceipt(cwd, 'head-delta-test-radius-unmeasured', { previousHead: prior.headSha });
+    }
+    const deltaTests = finishGateTestSelection(deltaPrepared, deltaOptions, cwd, deltaDeps).testFiles;
+    const current = new Set(fullTestFiles);
+    const previous = new Set(prior.fullTestFiles);
+    const previousFailures = new Set(prior.failedTestFiles);
+    const changed = new Set(deltaTests);
+    const runTestFiles = fullTestFiles.filter((path) => changed.has(path) || previousFailures.has(path) || !previous.has(path));
+    const run = new Set(runTestFiles);
+    const inheritedTestFiles = fullTestFiles.filter((path) => previous.has(path) && !previousFailures.has(path) && !run.has(path));
+    // A current scope path not accounted for by the receipt is run, never silently inherited.
+    for (const path of fullTestFiles) if (!previous.has(path) && !run.has(path)) return rejectGateReceipt(cwd, 'new-test-not-selected', { path });
+    if (current.size !== fullTestFiles.length) return rejectGateReceipt(cwd, 'current-test-scope-duplicate');
+    try {
+      debug.log('self-implement', 'gate.receipt-inheritance-accepted', {
+        previousHead: prior.headSha, currentHead: identity.headSha, baseSha: identity.baseSha,
+        changedFiles, rerunTestFiles: runTestFiles, inheritedTestFiles,
+      });
+    } catch { /* observation only */ }
+    return { mode: 'inherit', reason: 'matching-prior-receipt', identity, sourceHead: prior.headSha,
+      runTestFiles, inheritedTestFiles };
+  } catch (error) {
+    return rejectGateReceipt(cwd, 'head-delta-test-radius-failed', { message: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+function persistGateReceipt(cwd: string, capture: GateArtifactCapture, deps: SelfGateCliDeps): void {
+  const decision = capture.receiptDecision;
+  const identity = decision?.identity;
+  if (!identity) return;
+  if (deps.runCommand && !deps.gateReceiptDir) return;
+  if (capture.testReceiptMeasured !== true || !capture.fullTestFiles || !capture.failedTestFiles) {
+    try { debug.log('self-implement', 'gate.receipt-write-rejected', { reason: 'test-outcome-unmeasured', headSha: identity.headSha }); } catch { /* observation only */ }
+    return;
+  }
+  const failed = [...new Set(capture.failedTestFiles)].filter((path) => capture.fullTestFiles!.includes(path)).sort();
+  const receipt: GateReceipt = {
+    schema: GATE_RECEIPT_SCHEMA, createdAt: deps.now?.() ?? Date.now(), repositoryHash: identity.repositoryHash,
+    branch: identity.branch, baseSha: identity.baseSha, headSha: identity.headSha, runtime: identity.runtime,
+    environmentKey: identity.environmentKey, lockfileHash: identity.lockfileHash,
+    fullTestFiles: [...new Set(capture.fullTestFiles)].sort(), failedTestFiles: failed, measured: true,
+  };
+  const temporary = join(identity.receiptDir, `.${basename(identity.receiptPath)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    mkdirSync(identity.receiptDir, { recursive: true, mode: 0o700 });
+    pruneExpiredGateReceipts(identity.receiptDir, receipt.createdAt);
+    writeFileSync(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    renameSync(temporary, identity.receiptPath);
+    try { debug.log('self-implement', 'gate.receipt-written', { headSha: identity.headSha, baseSha: identity.baseSha, testFiles: receipt.fullTestFiles.length, failedTestFiles: failed.length }); } catch { /* observation only */ }
+  } catch (error) {
+    try { rmSync(temporary, { force: true }); } catch { /* best effort */ }
+    try { debug.log('self-implement', 'gate.receipt-write-rejected', { reason: 'receipt-write-failed', message: error instanceof Error ? error.message : String(error) }); } catch { /* observation only */ }
   }
 }
 
@@ -879,8 +1133,17 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
   const expose = publicExposureFiles(selection.files).length > 0
     ? runExposeGate(cwd, selection.files, getUserConfig().harness?.exposeGate === 'strict' ? 'strict' : 'warn', deps.runCommand)
     : { passed: true, log: '' };
-  const { alwaysInclude, alwaysIncludeMissing, alwaysIncludeExtra, importerTestsAdded, commentOnlySources, scenarioTests, testFiles,
+  const { alwaysInclude, alwaysIncludeMissing, alwaysIncludeExtra, importerTestsAdded, commentOnlySources, scenarioTests, testFiles: fullTestFiles,
     skipTestStep, importerTestsNotRun, unrunImporterTotal, callerTestsOverflow, importerLookupFailed } = finishGateTestSelection(prepared, options, cwd, deps);
+  const receiptDecision = options.base || options.pr || options.noInherit
+    ? decideGateReceiptInheritance(cwd, options, selection, fullTestFiles, deps) : undefined;
+  if (receiptDecision && !receiptDecision.identity && (!deps.runCommand || deps.gateReceiptDir)) {
+    receiptDecision.identity = gateReceiptIdentity(cwd, selection, deps).identity;
+  }
+  const testFiles = receiptDecision?.mode === 'inherit' ? [...(receiptDecision.runTestFiles ?? fullTestFiles)] : [...fullTestFiles];
+  capture.fullTestFiles = [...fullTestFiles];
+  capture.receiptDecision = receiptDecision;
+  const relatedTestFiles = [...new Set([...selection.files.filter(isTestPath), ...(scope.testArgs ?? []), ...importerTestsAdded])];
   const lines = [
     // ⛔⭐ 「changed=0」을 «초록»으로 읽는 사고가 났다(2026-09-02 · 🅕 보고 · 🅣 재현).
     //   커밋 «전»에 돌리면 작업 트리 변경은 «안 세므로» changed=0 이 나오는데,
@@ -889,7 +1152,10 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
       + (selection.files.length === 0 && (selection.ignoredDirtyPaths?.length ?? 0) > 0
         ? `  ⚠️ 센 것이 0인데 «커밋 안 된» 변경 ${selection.ignoredDirtyPaths!.length}개가 있다 — 「통과」가 아니라 「안 쟀다」다(커밋 뒤 다시 돌려라)`
         : ''),
-    `scope: ${scope.testArgs?.join(', ') ?? '(test step skipped)'}`,
+    `scope: ${receiptDecision?.mode === 'inherit' ? testFiles.join(', ') || '(all tests inherited)' : scope.testArgs?.join(', ') ?? '(test step skipped)'}`,
+    ...(receiptDecision ? [receiptDecision.mode === 'inherit'
+      ? `gate receipt: inherited ${receiptDecision.inheritedTestFiles?.length ?? 0} · rerun ${testFiles.length} · source head ${receiptDecision.sourceHead?.slice(0, 12) ?? '(unknown)'}`
+      : `gate receipt: full radius (${receiptDecision.reason})`] : []),
     `ignored unrelated worktree changes: ${selection.ignoredDirtyPaths === undefined ? '(not checked)' : selection.ignoredDirtyPaths.join(', ') || '(none)'}`,
     `unverified: ${scope.unverified.length} (${scope.unverified.join(', ') || '(none)'})`,
     `elanous runtime artifacts: ${scope.elanousRuntimeArtifacts.length} (${scope.elanousRuntimeArtifacts.join(', ') || '(none)'})`,
@@ -958,8 +1224,29 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     lines.push(`next-tui-entry-budget: UNMEASURED ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  if (receiptDecision?.mode === 'inherit' && testFiles.length === 0 && fullTestFiles.length > 0) {
+    capture.testReceiptMeasured = true;
+    capture.failedTestFiles = [];
+    capture.verdict = 'passed';
+    const testLine = formatPartialObservationNote(unrunImporterTotal ?? 0,
+      `tests: pass (${receiptDecision.inheritedTestFiles?.length ?? 0} files inherited from ${receiptDecision.sourceHead?.slice(0, 12) ?? 'prior receipt'})`);
+    lines.push(testLine);
+    capture.verdictLine = testLine;
+    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+    logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
+    return {
+      exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && entryBudgetPassed && expose.passed ? 0 : 1,
+      lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
+      documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
+      alwaysIncludeMissing, importerTestsAdded,
+      baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 },
+    };
+  }
+
   if (skipTestStep) {
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+    capture.testReceiptMeasured = false;
+    capture.failedTestFiles = [];
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
     Object.assign(capture, { verdict: 'skipped', artifactsUnavailable: 'no-tests' } satisfies GateArtifactCapture);
     return { exitCode: androidPassed && iosPassed && pwaPassed && entryBudgetPassed && policyPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
@@ -1006,6 +1293,8 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
       let shardBaseline: SelfGateCliResult['baseline'];
       let unmeasuredReason: string | undefined;
       if (aggregate.status === 'unmeasured') {
+        capture.testReceiptMeasured = false;
+        capture.failedTestFiles = [];
         unmeasuredReason = sharded.reason
           ? redactSecretText(sharded.reason).replace(/[\r\n\t\x00-\x1f\x7f]+/g, ' ').slice(0, 500)
           : aggregate.retryShardIds.join(', ') || 'no complete JUnit';
@@ -1017,8 +1306,12 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
         capture.unmeasuredReason = unmeasuredReason;
       }
       else if (aggregate.report) {
-        const report = recheckTimeoutOnlyIntroducedFailures(cwd, aggregate.report, deps.runTimeoutRecheck);
+        const timeoutReport = recheckTimeoutOnlyIntroducedFailures(cwd, aggregate.report, deps.runTimeoutRecheck);
+        const report = deps.runShards || deps.runShardsAsync
+          ? deps.runInterferenceRecheck?.(cwd, timeoutReport, selection.baseRef, relatedTestFiles) ?? timeoutReport
+          : (deps.runInterferenceRecheck ?? recheckOutsideScopeFailures)(cwd, timeoutReport, selection.baseRef, relatedTestFiles);
         capture.timeoutRechecks = report.timeoutRechecks;
+        capture.interferenceRechecks = report.interferenceRechecks;
         const timeoutRecheckResolvedFailure = aggregate.status === 'failed'
           && (report.loadTimeout ?? 0) > 0
           && report.introduced === 0 && report.unknown === 0 && report.preconditionUnmet === 0
@@ -1026,6 +1319,8 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
           && report.baselineStatus !== 'unknown';
         const effectiveStatus = timeoutRecheckResolvedFailure ? 'passed' : aggregate.status;
         capture.verdict = effectiveStatus;
+        capture.testReceiptMeasured = report.unknown === 0 && report.preconditionUnmet === 0 && report.worktreeFailuresParsed;
+        capture.failedTestFiles = [...new Set(report.failures.map((failure) => failure.file).filter((file): file is string => typeof file === 'string'))];
         logGateCliBaseline(cwd, {
           introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown,
           preconditionUnmet: report.preconditionUnmet, timedOut: report.timedOut,
@@ -1035,6 +1330,8 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
         lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, formatGateBaselineNote(report, unrunImporterTotal ?? 0)));
         shardBaseline = { introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown, preconditionUnmet: report.preconditionUnmet };
       } else {
+        capture.testReceiptMeasured = true;
+        capture.failedTestFiles = [];
         lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
         logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
         shardBaseline = { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 };
@@ -1056,6 +1353,8 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
   const worktreeLog = formatProcessOutput(test);
   Object.assign(capture, { unshardedRc: test.status, artifactsUnavailable: 'unsharded' } satisfies GateArtifactCapture);
   if (test.status === 0 && !test.error) {
+    capture.testReceiptMeasured = true;
+    capture.failedTestFiles = [];
     lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
     Object.assign(capture, { verdict: 'passed', verdictLine: lines[lines.length - 1] } satisfies GateArtifactCapture);
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
@@ -1065,8 +1364,17 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
 
   if (worktreeLog.includes('deterministic environment setup failed')) lines.push(worktreeLog);
   const baseline = (deps.runBaseline ?? runGateBaseline)(cwd, testFiles, selection.baseRef);
-  const report = recheckTimeoutOnlyIntroducedFailures(cwd, buildGateBaselineReport(worktreeLog, baseline), deps.runTimeoutRecheck);
+  // An injected runner can represent a virtual checkout; only the real runner may use this host's file tree.
+  const currentFileExists = deps.runTests ? undefined : (file: string) => existsSync(resolve(cwd, file));
+  const timeoutReport = recheckTimeoutOnlyIntroducedFailures(cwd,
+    buildGateBaselineReport(worktreeLog, baseline, undefined, 0, currentFileExists), deps.runTimeoutRecheck);
+  const report = deps.runTests
+    ? deps.runInterferenceRecheck?.(cwd, timeoutReport, selection.baseRef, relatedTestFiles) ?? timeoutReport
+    : (deps.runInterferenceRecheck ?? recheckOutsideScopeFailures)(cwd, timeoutReport, selection.baseRef, relatedTestFiles);
   capture.timeoutRechecks = report.timeoutRechecks;
+  capture.interferenceRechecks = report.interferenceRechecks;
+  capture.testReceiptMeasured = report.unknown === 0 && report.preconditionUnmet === 0 && report.worktreeFailuresParsed;
+  capture.failedTestFiles = [...new Set(report.failures.map((failure) => failure.file).filter((file): file is string => typeof file === 'string'))];
   logGateCliBaseline(cwd, {
     introduced: report.introduced,
     preexisting: report.preexisting,

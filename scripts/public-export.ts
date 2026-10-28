@@ -109,15 +109,23 @@ class PrivateRedactionError extends Error {
 
 function codeIdentifierRanges(file: string, text: string): Array<{ start: number; end: number; name: string }> {
   if (!CODE_FILE.test(file)) return [];
-  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false,
-    /\.(?:tsx|jsx)$/iu.test(file) ? ts.LanguageVariant.JSX : ts.LanguageVariant.Standard, text);
+  // A raw scanner cannot track template-expression braces without rescanning. It can
+  // report words in later strings/comments as identifiers after a template literal.
+  // The parsed token tree has already resolved those boundaries.
+  const kind = /\.(?:tsx|jsx)$/iu.test(file) ? ts.ScriptKind.TSX
+    : /\.(?:js|mjs|cjs)$/iu.test(file) ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, false, kind);
   const ranges: Array<{ start: number; end: number; name: string }> = [];
-  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
-    if (token === ts.SyntaxKind.Identifier || token === ts.SyntaxKind.PrivateIdentifier
-      || token >= ts.SyntaxKind.FirstKeyword && token <= ts.SyntaxKind.LastKeyword) {
-      ranges.push({ start: scanner.getTokenPos(), end: scanner.getTextPos(), name: scanner.getTokenText() });
+  const visit = (node: ts.Node): void => {
+    if (ts.isJSDoc(node)) return;
+    if (node.kind === ts.SyntaxKind.Identifier || node.kind === ts.SyntaxKind.PrivateIdentifier
+      || node.kind >= ts.SyntaxKind.FirstKeyword && node.kind <= ts.SyntaxKind.LastKeyword) {
+      ranges.push({ start: node.getStart(source), end: node.getEnd(), name: node.getText(source) });
+      return;
     }
-  }
+    for (const child of node.getChildren(source)) visit(child);
+  };
+  visit(source);
   return ranges;
 }
 

@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildReferenceCard, nodeRefIndexFs, type RefIndexFs } from './ref-index.js';
-import type { GroundingSource } from './sources.js';
+import { sourceStatus, type GroundingSource } from './sources.js';
 
 function git(cwd: string, args: string[]): void {
   execFileSync('git', args, { cwd, stdio: 'ignore' });
@@ -45,6 +45,7 @@ describe('buildReferenceCard', () => {
       const card = buildReferenceCard(sourceOf('alpha', repo), nodeRefIndexFs);
       expect(card.name).toBe('alpha');
       expect(card.oneLine).toBe('Alpha parses things across two lines.');
+      expect(card.oneLineFile).toBe('README.md');
       expect(card.directories).toEqual(['docs', 'src']);
       expect(card.receivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
       expect(card.titles).toEqual([
@@ -175,6 +176,24 @@ describe('buildReferenceCard', () => {
     const card = buildReferenceCard(sourceOf('d', '/d', 'local-docs'), fs, { maxFiles: 2 });
     expect(card.truncated).toBe(true);
     expect(listed).toBeLessThan(6);
+  });
+
+  test('REF-INDEX-L0L1: card stamps orchestrationId and sourceStatus reaches buildReferenceCard from sources.ts', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'ref-index-'));
+    try {
+      const repo = makeRepo(home, 'wired');
+      writeFileSync(join(repo, 'README.md'), '# Wired\n\nwired repo\n');
+      commitAll(repo);
+
+      const card = buildReferenceCard(sourceOf('wired', repo), nodeRefIndexFs);
+      expect(card.orchestrationId).toBe('grounding:local-repo:wired');
+
+      const status = await sourceStatus(sourceOf('wired', repo));
+      expect(status.measured).toBe(true);
+      expect(status.lastCommitAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test('a missing source path throws instead of yielding an empty card', () => {

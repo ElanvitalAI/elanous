@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { SLASH_COMMANDS } from '../../chat/index.js';
+import { SLASH_COMMANDS, SLASH_MENU_POLICY } from '../../chat/index.js';
 import { FEATURE_MATURITY } from '../../maturity/feature-maturity.js';
 import { setUserConfigOverlay } from '../../user-config.js';
 import { buildEssentialHelpLines } from './help-from-registry.js';
-import { HELP_GROUP_BY_NAME, HELP_GROUP_ORDER, HELP_OTHER_GROUP, HELP_VERB_GROUPS } from './help-groups.js';
+import { HELP_GROUP_BY_NAME, HELP_GROUP_ORDER, HELP_VERB_GROUPS } from './help-groups.js';
 
 const descriptions = [
   { name: 'help', description: 'Show help overlay' },
@@ -18,13 +18,30 @@ afterEach(() => setUserConfigOverlay(null));
 
 test('MAT1c default help audience reads tui config', () => {
   const names = ['help', 'research', 'debug', 'directive'];
-  const descriptions = SLASH_COMMANDS.filter(({ name }) => names.includes(name));
+  const descriptions = names.map((name) => ({ name, description: name }));
   setUserConfigOverlay((config) => ({ ...config, raw: { ...config.raw, tui: { role: 'general', showBeta: true } } }));
   const lines = buildEssentialHelpLines({ names, descriptions, width: 80 }).join('\n');
   expect(lines).toContain('/help');
   expect(lines).toContain('/research');
   expect(lines).not.toContain('/debug');
   expect(lines).not.toContain('/directive');
+  setUserConfigOverlay((config) => ({ ...config, raw: { ...config.raw, tui: { role: 'general', showBeta: false } } }));
+  expect(buildEssentialHelpLines({ names, descriptions, width: 80 }).join('\n')).not.toContain('/research');
+});
+
+test('SLASH-HELP-DIET lists exactly the required ten and reserve five commands', () => {
+  const names = SLASH_COMMANDS.map(({ name }) => name);
+  const lines = buildEssentialHelpLines({ names, descriptions: SLASH_COMMANDS, width: 120, audience: { role: 'owner', showBeta: false } });
+  const help = lines.join('\n');
+  const expected = [...SLASH_MENU_POLICY.required, ...SLASH_MENU_POLICY.reserve];
+  for (const name of expected) {
+    expect(help).toMatch(new RegExp(`(?:^|\\s)/${name}(?:\\s|\\()`, 'm'));
+  }
+  const listed = [...help.matchAll(/^\/([a-z][a-z0-9-]*)/gm)].map((match) => match[1]);
+  expect(new Set(listed)).toEqual(new Set(expected));
+  for (const name of ['research', 'debug', 'directive']) {
+    expect(help).not.toContain(`/${name}`);
+  }
 });
 
 test('MAT1c registered ungraded command appears for owner but not general or contributor', () => {
@@ -42,11 +59,12 @@ test('MAT1c registered ungraded command appears for owner but not general or con
 });
 
 test('MAT1c help defaults to owner and filters the same grades for general and contributor', () => {
-  const names = SLASH_COMMANDS.map(({ name }) => name);
-  const descriptions = SLASH_COMMANDS;
+  const visibleCommands = SLASH_COMMANDS.filter(({ hidden }) => !hidden);
+  const names = visibleCommands.map(({ name }) => name);
+  const descriptions = visibleCommands;
   const render = (audience?: { role: 'owner' | 'contributor' | 'general'; showBeta: boolean }) =>
     buildEssentialHelpLines({ names, descriptions, width: 110, audience }).join('\n');
-  const listed = (text: string) => SLASH_COMMANDS.filter(({ name }) => new RegExp(`(?:^|\\s)/${name}(?:\\s|\\()`).test(text)).map(({ name }) => name);
+  const listed = (text: string) => visibleCommands.filter(({ name }) => new RegExp(`(?:^|\\s)/${name}(?:\\s|\\()`).test(text)).map(({ name }) => name);
   const owner = render();
   expect(listed(owner)).toEqual(names);
   const general = render({ role: 'general', showBeta: false });
@@ -57,13 +75,13 @@ test('MAT1c help defaults to owner and filters the same grades for general and c
   expect(general).not.toContain('/directive');
   const beta = render({ role: 'general', showBeta: true });
   expect(listed(beta)).toEqual(names.filter((name) => ['stable', 'beta'].includes(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash])));
-  expect(beta).toContain('/research');
+  expect(beta).not.toContain('/research');
   expect(beta).not.toContain('/debug');
   expect(beta).not.toContain('/directive');
   const contributor = render({ role: 'contributor', showBeta: false });
   expect(listed(contributor)).toEqual(names.filter((name) => FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash] !== 'ops'));
-  expect(contributor).toContain('/research');
-  expect(contributor).toContain('/debug');
+  expect(contributor).not.toContain('/research');
+  expect(contributor).not.toContain('/debug');
   expect(contributor).not.toContain('/directive');
 });
 
@@ -176,11 +194,12 @@ test('truncates long descriptions to terminal columns without splitting a graphe
 test('TUI-SLASH-DECIDE-NOW C: group order is 시작, the seven verbs, then 그 밖 — /model, /decide and /now under their groups', () => {
   expect(HELP_GROUP_ORDER).toEqual(['시작', '지켜보기', '조사하기', '판단하기', '만들기', '실행하기', '확인하기', '기억하기', '그 밖']);
   expect([...HELP_VERB_GROUPS]).toEqual(['지켜보기', '조사하기', '판단하기', '만들기', '실행하기', '확인하기', '기억하기']);
-  const names = SLASH_COMMANDS.flatMap(({ name, aliases }) => [name, ...(aliases ?? [])]);
-  const lines = buildEssentialHelpLines({ names, descriptions: SLASH_COMMANDS, width: 80, audience: { role: 'owner', showBeta: true } });
+  const visibleCommands = SLASH_COMMANDS.filter(({ hidden }) => !hidden);
+  const names = visibleCommands.flatMap(({ name, aliases }) => [name, ...(aliases ?? [])]);
+  const lines = buildEssentialHelpLines({ names, descriptions: visibleCommands, width: 80, audience: { role: 'owner', showBeta: true } });
   const commands = lines.slice(1, lines.indexOf(''));
   const heads = commands.filter((line) => line.startsWith('▸ ')).map((line) => line.slice(2));
-  expect(heads).toEqual([...HELP_GROUP_ORDER]);
+  expect(heads).toEqual(['시작', '지켜보기', '조사하기', '판단하기', '만들기', '기억하기', '그 밖']);
   const groupOf = (name: string) => {
     const at = commands.findIndex((line) => new RegExp(`^/${name}(?:\\s|\\()`).test(line));
     expect(at).toBeGreaterThan(-1);
@@ -189,22 +208,24 @@ test('TUI-SLASH-DECIDE-NOW C: group order is 시작, the seven verbs, then 그 �
   expect(groupOf('model')).toBe('시작');
   expect(groupOf('help')).toBe('시작');
   expect(groupOf('status')).toBe('시작');
+  expect(SLASH_MENU_POLICY.reserve).toContain('decide');
   expect(groupOf('decide')).toBe('판단하기');
   expect(groupOf('now')).toBe('지켜보기');
   expect(groupOf('harness')).toBe('만들기');
   expect(groupOf('memory')).toBe('기억하기');
-  expect(groupOf('provider')).toBe(HELP_OTHER_GROUP);
+  expect(SLASH_COMMANDS.find(({ name }) => name === 'provider')?.hidden).toBe(true);
   // Inside a group: name order.
   const start = commands.slice(commands.indexOf('▸ 시작') + 1, commands.indexOf('▸ 지켜보기')).map((line) => line.split(/[ (]/)[0]);
   expect(start).toEqual([...start].sort((a, b) => a.localeCompare(b)));
 });
 
 test('TUI-SLASH-DECIDE-NOW C: every registered command sits in exactly one group — none disappears', () => {
-  const names = SLASH_COMMANDS.flatMap(({ name, aliases }) => [name, ...(aliases ?? [])]);
+  const visibleCommands = SLASH_COMMANDS.filter(({ hidden }) => !hidden);
+  const names = visibleCommands.flatMap(({ name, aliases }) => [name, ...(aliases ?? [])]);
   for (const width of [80, 152]) {
-    const lines = buildEssentialHelpLines({ names, descriptions: SLASH_COMMANDS, width, audience: { role: 'owner', showBeta: true } });
+    const lines = buildEssentialHelpLines({ names, descriptions: visibleCommands, width, audience: { role: 'owner', showBeta: true } });
     const commandText = lines.slice(1, lines.indexOf('')).join('\n');
-    for (const { name } of SLASH_COMMANDS) {
+    for (const { name } of visibleCommands) {
       // At 80 columns each row holds one command, so a command line starts with its label.
       if (width === 80) expect(commandText.match(new RegExp(`^/${name}(?:\\s|\\()`, 'gm'))?.length).toBe(1);
       else expect(commandText).toMatch(new RegExp(`(?:^|\\s)/${name}(?:\\s|\\()`, 'm'));
@@ -219,7 +240,8 @@ test('TUI-SLASH-DECIDE-NOW C: every registered command sits in exactly one group
 });
 
 test('TUI-HELP-OVERLAY: with the modal row budget the full owner catalog fits — more columns before the chat-log fallback', () => {
-  const all = { names: SLASH_COMMANDS.map(({ name }) => name), descriptions: SLASH_COMMANDS };
+  const visibleCommands = SLASH_COMMANDS.filter(({ hidden }) => !hidden);
+  const all = { names: visibleCommands.map(({ name }) => name), descriptions: visibleCommands };
   // The 0.2.19 release tui node drew two columns of ~43 rows against a 40-row modal and fell back to the chat log.
   for (const [width, maxRows] of [[152, 40], [140, 38], [120, 33]] as const) {
     for (const showBeta of [false, true]) {
@@ -227,7 +249,7 @@ test('TUI-HELP-OVERLAY: with the modal row budget the full owner catalog fits �
       const fitted = buildEssentialHelpLines({ ...all, width, maxRows, audience: { role: 'owner', showBeta } });
       expect(fitted.length).toBeLessThanOrEqual(maxRows);
       // Nothing disappears to make it fit: every command and every group head is still there.
-      for (const { name } of SLASH_COMMANDS) {
+      for (const { name } of visibleCommands) {
         if (unbounded.some((line) => line.includes(`/${name} `) || line.includes(`/${name}  `))) {
           expect(fitted.some((line) => line.includes(`/${name}`))).toBe(true);
         }

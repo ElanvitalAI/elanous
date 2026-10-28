@@ -55,6 +55,9 @@ export interface GrokAgentSearchOpts {
   signal?: AbortSignal;
   fetchImpl?: FetchLike;
   apiKey?: string;
+  /** Subscription proxy endpoint and required CLI headers. Omit for the metered xAI API. */
+  baseUrl?: string;
+  headers?: Record<string, string>;
 }
 
 export interface GrokCitation {
@@ -106,10 +109,13 @@ export async function grokAgentSearch(
 
   let res: Response;
   try {
-    res = await fetchImpl(GROK_RESPONSES_URL, {
+    const endpoint = opts.baseUrl
+      ? `${opts.baseUrl.replace(/\/$/, '').replace(/\/responses$/, '')}/responses`
+      : GROK_RESPONSES_URL;
+    res = await fetchImpl(endpoint, {
       method: 'POST',
       signal: ac.signal,
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}`, ...opts.headers },
       body: JSON.stringify({
         model,
         input,

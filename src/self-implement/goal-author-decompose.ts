@@ -471,6 +471,7 @@ export function createGoalAuthorDecomposeSteps(
   config: {
     adversarialReview?: boolean;
     adversarialReviewSource?: 'cli' | 'default' | 'unknown';
+    goalId?: string;
     recentStepCounts?: readonly number[];
     onSizedSlices?: (slices: SizedSlice[], redecomposed: number) => void;
     repositoryRoot?: string;
@@ -589,38 +590,46 @@ export function createGoalAuthorDecomposeSteps(
         return parsed ? { sizes: parsed, sizeSource: 'planner-estimate' as const }
           : { sizes: deriveGoalSliceSizes(slices), sizeSource: 'derived' as const };
       };
-      const observe = (event: 'slice-sized' | 'slice-oversize', sizeSource: 'planner-estimate' | 'derived', data: Record<string, unknown>) => {
+      const observe = (event: 'slice-sized' | 'slice-oversize' | 'resplit' | 'slice-oversize-unavoidable', sizeSource: 'planner-estimate' | 'derived', data: Record<string, unknown>) => {
         try { debug.log('goal-author.decompose', event, { surface: 'goal-author', sizeSource, ...data,
           ...(options?.runId === undefined ? {} : { runId: options.runId }) }); } catch { /* observation is fail-soft */ }
       };
       let redecomposed = 0;
       let measured = await measure(candidate);
       let sizes = measured.sizes;
-      if (sizes) observe('slice-sized', measured.sizeSource, { retry: 0, slices: sizes });
-      const oversized = sizes?.flatMap((size, index) => size.tier === 'high' ? [index] : []) ?? [];
-      if (oversized.length || !sizes) {
-        observe('slice-oversize', measured.sizeSource, { retry: 0, indexes: oversized,
+      for (let retry = 0; ; retry++) {
+        if (sizes) observe('slice-sized', measured.sizeSource, { retry, slices: sizes });
+        const oversized = sizes?.flatMap((size, index) => size.tier === 'high' ? [index] : []) ?? [];
+        if (sizes && oversized.length === 0) break;
+        observe('slice-oversize', measured.sizeSource, { retry, indexes: oversized,
           reasons: sizes ? oversized.map((index) => sizes![index]!.unavoidableReason) : [],
           ...(sizes ? {} : { error: 'size metadata missing or inconsistent' }) });
+        if (retry === 2) {
+          if (!sizes) throw new Error('goal-author slice sizing: size metadata missing after 2 resplits');
+          const unavoidableReason = 'auto';
+          for (const index of oversized) sizes[index] = { ...sizes[index]!,
+            unavoidableReason: sizes[index]!.unavoidableReason ?? unavoidableReason };
+          observe('slice-oversize-unavoidable', measured.sizeSource, {
+            goalId: options?.goalId ?? config.goalId ?? null,
+            resplitCount: redecomposed,
+            slices: oversized.map((index) => ({ index, ...sizes![index]! })),
+          });
+          break;
+        }
+        observe('resplit', measured.sizeSource, { retry: retry + 1, indexes: oversized,
+          ...(sizes ? {} : { reason: 'size metadata missing or inconsistent' }) });
         const retryAsk = [objective, '', 'The previous goal-author proposal had missing size metadata or oversized slices.',
           `PREVIOUS_STEPS_JSON: ${JSON.stringify(candidate)}`,
           `OVERSIZED_INDEXES_JSON: ${JSON.stringify(oversized)}`,
-          'Regenerate the full plan once. Preserve fitting slices and split each oversized slice into dependent low/medium slices where possible.',
-          'If an oversized slice truly cannot split, leave it high and state a concrete unavoidable reason.'].join('\n');
+          `RESPLIT_ATTEMPT: ${retry + 1} of 2. Regenerate the full plan; preserve fitting slices and split every oversized slice into dependent low/medium slices. If any oversized slice remains after the second resplit, keep it as high tier; a concrete unavoidable reason is optional because the system marks it unavoidable=auto.`].join('\n');
         const regenerated = await decompose(retryAsk);
         if (!regenerated.length) throw new Error('goal-author slice sizing: regeneration produced no slices');
-        redecomposed = 1;
+        redecomposed++;
         candidate = ensureDeviceFirstSteps(objective, regenerated, config.repositoryRoot).steps;
         rationale = decompositionRationale;
         measured = await measure(candidate);
         sizes = measured.sizes;
-        if (!sizes) throw new Error('goal-author slice sizing: size metadata missing after one retry');
-        observe('slice-sized', measured.sizeSource, { retry: 1, slices: sizes });
-        const remaining = sizes.flatMap((size, index) => size.tier === 'high' ? [index] : []);
-        if (remaining.length) observe('slice-oversize', measured.sizeSource, { retry: 1, indexes: remaining,
-          reasons: remaining.map((index) => sizes![index]!.unavoidableReason) });
-        if (remaining.some((index) => !sizes![index]!.unavoidableReason))
-          throw new Error('goal-author slice sizing: high slice lacks unavoidable reason after one retry');
+        if (!sizes && retry === 1) throw new Error('goal-author slice sizing: size metadata missing after 2 resplits');
       }
       config.onSizedSlices?.(restoreSlicePaths(publicSizedSlices(candidate, sizes), objective), redecomposed);
       return finalize(candidate, rationale);

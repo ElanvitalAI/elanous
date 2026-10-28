@@ -308,6 +308,7 @@ import {
 } from '../../user-config.js';
 import { listProviders } from '../../llm.js';
 import { enabledModels, loadCatalog } from '../../intelligence-map/model-catalog.js';
+import { readTuiSlashAudience, slashMaturity } from '../../maturity/tui-slash-maturity.js';
 import { selfOrchestrateRuntime } from '../../self-dev/self-orchestrate-runtime.js';
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import { getSessionCwd } from '../../session/working-dir.js';
@@ -383,8 +384,7 @@ import { resolveLocalEndpoints, runLocalLLMCompat } from '../../local-llm-test.j
 import { registerTermSlash, type TermSlashHost } from '../../tui/slash/term.js';
 // 옛 입구 re-export shim 은 slash-runtime/index.ts 한 곳뿐(RFC A5 · /mission 과 같은 꼴).
 import { SlashCommandRegistry } from './registry.js';
-import { readDashboardAskClarification } from './ask-clarification.js';
-export { readDashboardAskClarification };
+export { readDashboardAskClarification } from './ask-clarification.js';
 import { createLoopScheduler, type LoopScheduler } from '../loop-scheduler.js';
 import { registerShellSlash } from './shell-slash.js';
 import { registerClassicSideSlash } from '../side-basic-runtime.js';
@@ -1199,6 +1199,15 @@ export const DASHBOARD_SLASH_CATALOG_BASELINE = {
     'skills-reload', 'spend', 'squeeze',
     'tk', 'tokens',
     'undo', 'w', 'wd',
+    'ad', 'agent-room', 'api', 'api-allow', 'auto-tts', 'autotts',
+    'board', 'capture', 'chat', 'claude', 'codex', 'control', 'conv',
+    'dash', 'dashboard', 'debug', 'default', 'delta', 'design', 'design-check', 'diffs',
+    'directive', 'export', 'fork', 'gemini', 'handoff', 'hist', 'history', 'inject', 'inputs',
+    'lane', 'll', 'local', 'log', 'loops', 'mission', 'p', 'paste', 'persona', 'plan', 'plugin',
+    'plugins', 'prompt', 'prompts', 'provider', 'qc', 'r', 'reasoning', 'rebind', 'relay',
+    'reply', 'research', 'resume-turn', 'rewind', 'rs', 'run', 'run-skill', 's', 'showroom',
+    'surface', 'sync', 'tablet', 'telegram', 'term', 'terminal', 'tg', 'theme', 'think', 'tts',
+    'vc', 'voice-chat', 'widget', 'widgets', 'wish',
   ],
   listedOnly: [
     'acp', 'rsh', 'sr',
@@ -1496,6 +1505,12 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
   });
 
   registry.register('directive', async (args, ctx) => {
+    const { role } = readTuiSlashAudience();
+    if (slashMaturity('directive') === 'ops' && role === 'general') {
+      ctx.pushChatLine(ctx.warning('  /directive는 ops 등급 기능이라 general 역할에서는 실행할 수 없습니다.'));
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
     try {
       const { addDirective } = await import('../../steward/directive.js');
       const result = await addDirective(args.join(' '), { source: 'tui' });
@@ -2300,7 +2315,9 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       return;
     }
     if (sub === 'ask') {
-      const say = args.slice(1).join(' ').replace(/^["'“]|["'”]$/g, '').trim();
+      // `/harness ask` arrives as one raw tail so a pasted path header keeps its line boundary.
+      const askTail = args.length === 2 ? args[1]! : args.slice(1).join(' ');
+      const say = askTail.replace(/^["'“]|["'”]$/g, '').trim();
       ctx.chatLines.push('');
       ctx.chatLines.push(ctx.accent('❯ /harness ask'));
       if (!say) {
@@ -2346,11 +2363,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
         print: (line) => { for (const part of line.split('\n')) ctx.chatLines.push(`  ${part}`); },
         log: (event, data, level) => debug.log('dev-pipeline', event, { ...data, surface: 'tui-slash' }, { level }),
         readLine: async () => '',
-        readClarification: (clarification) => readDashboardAskClarification(clarification, ctx.surfaceUx, (line) => {
-          ctx.pushChatLine(line);
-          ctx.setChatScrollOffset(-1);
-          ctx.draw();
-        }),
         readFile: (file) => readFileSync(file, 'utf8'),
         writeFile: (file, data) => writeFileSync(file, data, 'utf8'),
         cwd: () => process.cwd(),

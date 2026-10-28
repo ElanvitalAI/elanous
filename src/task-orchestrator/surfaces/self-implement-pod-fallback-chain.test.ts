@@ -24,7 +24,7 @@ function captureLaunch(config?: UserConfig, useRealHostConfig = false) {
 }
 
 describe('Pod fallback chain relay', () => {
-  test('carries only the host ZAI overage policy in the child config', async () => {
+  test('carries allowed host ZAI settings in the child config', async () => {
     const { applied, done } = captureLaunch({ llm: {
       fallbackChain: ['codex-rotate', 'grok'],
       zaiCodingPlan: { overage: 'openrouter', maxConcurrent: 9 },
@@ -34,7 +34,7 @@ describe('Pod fallback chain relay', () => {
     const childConfig = JSON.parse(secret.stringData['llm-fallback-config.json']!);
     expect(childConfig).toEqual({ llm: {
       fallbackChain: ['codex-rotate', 'grok'],
-      zaiCodingPlan: { overage: 'openrouter' },
+      zaiCodingPlan: { overage: 'openrouter', maxConcurrent: 9 },
     }, harness: { worktreeAddTimeoutSec: 1200 } });
     expect(Object.keys(childConfig.llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
   });
@@ -48,7 +48,7 @@ describe('Pod fallback chain relay', () => {
     ];
     expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } });
     expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
-    expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!))).toEqual(['llm', 'harness']);
+    expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!))).toEqual(['harness', 'llm']);
     const script = job.spec.template.spec.containers[0]!.args[0]!;
     expect(script).toContain('ELANOUS_POD_FALLBACK_CHAIN source=host steps=codex-rotate,codex-credits,grok');
     expect(script.indexOf('install -m 600 /creds/llm-fallback-config.json')).toBeLessThan(script.indexOf('elanous self implement'));
@@ -79,8 +79,11 @@ describe('Pod fallback chain relay', () => {
         { stringData: Record<string, string> },
         { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
       ];
-      expect(JSON.parse(secret.stringData['llm-fallback-config.json']!)).toEqual({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } });
-      expect(Object.keys(JSON.parse(secret.stringData['llm-fallback-config.json']!).llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
+      const childConfig = JSON.parse(secret.stringData['llm-fallback-config.json']!);
+      expect(childConfig).toMatchObject({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'], zaiCodingPlan: { overage: 'stop' } }, harness: { worktreeAddTimeoutSec: 1200 } });
+      expect(childConfig.llm.provider).toBe('auto');
+      expect(childConfig.loops.orchestrator.mode).toBe('shadow');
+      expect(childConfig.tools.selfImplement.childInstanceMode).toBe('isolated');
       expect(job.spec.template.spec.containers[0]!.args[0]).toContain('ELANOUS_POD_FALLBACK_CHAIN source=host steps=codex-rotate,codex-credits,grok');
     } finally {
       resetElanousConfigDir();

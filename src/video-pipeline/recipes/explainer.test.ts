@@ -7,6 +7,10 @@ import { ALL_RECIPES } from '../walk-line.js';
 import { BROLL } from './broll.js';
 import { CHARACTER } from './character.js';
 import { explainerBuild, explainerQc, explainerScript, explainerVo, EXPLAINER } from './explainer.js';
+// ⚠️ 정적 named import 대신 namespace import: 골이 바꾼 파일을 base 조상 위에서 그대로 돌릴 때
+// (reverse verify-by-breaking) 아직 없는 export 로 인해 모듈 로드 SyntaxError 로 죽지 않게 한다.
+// base 에서는 아래 `load` 가 undefined → assertion 실패(레드 목격), head 에서는 통과(그린).
+import * as explainerLine from './explainer.js';
 import { FILM } from './film.js';
 import { FREE_LINE } from './free-line.js';
 import { HYPERFRAMES } from './hyperframes.js';
@@ -15,6 +19,7 @@ import { VLOG } from './vlog.js';
 import type { RunResult } from './ffmpeg.js';
 import { UNOBSERVED, type RecipeCtx } from './types.js';
 
+const declaration2 = resolve(import.meta.dir, '../../../graphs/video/explainer-line.yaml');
 const example = resolve(import.meta.dir, '../../../skills/explainer-video/examples/elanous-0.2.5/script.json');
 const good: RunResult = { ok: true, code: 0, signal: null, err: '', out: '' };
 const spawnFailed: RunResult = { ok: false, code: null, signal: null, err: 'ENOENT', out: '' };
@@ -237,6 +242,27 @@ describe('explainer-line', () => {
     expect((await explainerQc({ run: () => loud('NaN') })(ctx())).outcome).toBe(UNOBSERVED);
   });
 
+  test('qc: 3분 목표(target_seconds 180)를 넘는 내레이션은 too-long(재구성)으로, 이내면 pass 로 간다', async () => {
+    state.hf_render_path = join(root, 'render.mp4');
+    writeFileSync(String(state.hf_render_path), 'video');
+    const loud = (peak: string) => ({ ...good, err: `{"input_i":"-14","input_tp":"${peak}"}` });
+    state.narration_seconds = 200;
+    const tooLong = await explainerQc({ run: () => loud('-1.5') })(ctx());
+    expect(tooLong.outcome).toBe('too-long');
+    expect(tooLong.produced).toEqual({ loudness_lufs: -14, true_peak_db: -1.5 });
+    expect(tooLong.note).toContain('180');
+    state.narration_seconds = 100;
+    expect((await explainerQc({ run: () => loud('-1.5') })(ctx())).outcome).toBe('pass');
+    // 선언 파일을 바꾼 목표길이도 생산 로드가 그대로 소비한다.
+    const alt = join(root, 'alt-line.yaml');
+    writeFileSync(alt, readFileSync(declaration2, 'utf8').replace('target_seconds: 180', 'target_seconds: 60'));
+    state.narration_seconds = 100;
+    expect((await explainerQc({ run: () => loud('-1.5'), declarationPath: alt })(ctx())).outcome).toBe('too-long');
+    // narration_seconds 를 못 쟀으면(계약 밖) 길이 판정을 건너뛴다 — 기존 동작 보존.
+    delete state.narration_seconds;
+    expect((await explainerQc({ run: () => loud('-1.5') })(ctx())).outcome).toBe('pass');
+  });
+
   test('ALL_RECIPES 는 네 키를 등록하고 기존 hyperframes-render 와 그 외 키를 보존한다', () => {
     expect(Object.keys(EXPLAINER).sort()).toEqual(['explainer-build', 'explainer-qc', 'explainer-script', 'explainer-vo']);
     for (const [key, value] of Object.entries(EXPLAINER)) expect(ALL_RECIPES[key]).toBe(value);
@@ -244,5 +270,47 @@ describe('explainer-line', () => {
     expect(Object.keys(EXPLAINER).filter((key) => key in existing)).toEqual([]);
     for (const [key, value] of Object.entries(existing)) expect(ALL_RECIPES[key]).toBe(value);
     expect(ALL_RECIPES['hyperframes-render']).toBe(HYPERFRAMES['hyperframes-render']);
+  });
+});
+
+describe('explainer-line 계획(선언 로드·컴파일)', () => {
+  const declaration = resolve(import.meta.dir, '../../../graphs/video/explainer-line.yaml');
+
+  test('완료 경계가 3개 모두 유지된다: 코드 — graphs/video/explainer-line.yaml에 요청 동작(3분 영상) 구현 + 대상 밖 기본 동작 보존, 실물 — 격리 시험에서 생산 경로를 지나 요청 동작과 기존 동작을 함께 관측, 증거 — bun test', () => {
+    // namespace 로 꺼낸 뒤 assertion 으로 붉게 목격한다 — base 조상에는 아직 이 export 가 없으므로
+    // 정적 named import 대신 이 경로로 가져온다(base 에서는 이 줄이 깔끔한 실패 = 레드 목격).
+    const load = (explainerLine as unknown as Record<string, unknown>).loadExplainerLine as
+      | typeof explainerLine.loadExplainerLine
+      | undefined;
+    expect(typeof load).toBe('function');
+    const plan = load!(declaration);
+    expect(plan.errors).toEqual([]);
+    // (a) 요청 동작 — 3분 영상: 생산 로드가 이 선언에서 읽은 목표 총 길이는 180초다.
+    expect(plan.targetSeconds).toBe(180);
+    // 배선 — 뿌리 인자 없는 생산 기본 호출도 같은 저작본을 읽는다(loadExplainerLine → 이 선언 파일).
+    expect(load!().targetSeconds).toBe(180);
+    // (b) 기존 동작 보존 — 컴파일된 나머지 선언(노드·계약·엣지)과 레시피 기본 출력은 변경 전과 같다.
+    const t = plan.template!;
+    expect(t).toMatchObject({ graphId: 'explainer-line', version: 1, entryNode: 'script' });
+    expect(t.terminalNodes).toEqual(['delivered', 'needs-human', 'blocked', 'unobserved']);
+    expect(t.nodes.map((node) => [node.nodeId, node.kind, node.recipe, node.maxVisits, node.contract])).toEqual([
+      ['script', 'agent', 'explainer-script', 3, { inputs: ['facts', 'sources'], tools: 'read-only', outputs: ['script_path'] }],
+      ['vo', 'agent', 'explainer-vo', 2, { inputs: ['script_path'], tools: 'network-write', outputs: ['vo_dir', 'narration_seconds'] }],
+      ['build', 'agent', 'explainer-build', 3, { inputs: ['script_path', 'vo_dir'], tools: 'workspace-write', outputs: ['hyperframes_project', 'timeline_path'] }],
+      ['render', 'gate', 'hyperframes-render', 2, { inputs: ['hyperframes_project'], tools: 'workspace-write', outputs: ['hf_render_path', 'hf_snapshot_dir', 'hf_check'] }],
+      ['qc', 'gate', 'explainer-qc', 2, { inputs: ['hf_render_path', 'script_path'], tools: 'read-and-run', outputs: ['vo_match', 'loudness_lufs', 'true_peak_db'] }],
+      ['delivered', 'judge', 'terminal-delivered', 1, undefined],
+      ['needs-human', 'judge', 'terminal-needs-human', 1, undefined],
+      ['blocked', 'judge', 'terminal-blocked', 1, undefined],
+      ['unobserved', 'judge', 'terminal-unobserved', 1, undefined],
+    ]);
+    expect(t.edges.map((edge) => [edge.from, edge.on, edge.map])).toEqual([
+      ['script', 'outcome', { ok: 'vo', 'no-facts': 'needs-human', unmeasurable: 'unobserved' }],
+      ['vo', 'outcome', { ok: 'build', 'no-key': 'needs-human', error: 'blocked', unmeasurable: 'unobserved' }],
+      ['build', 'outcome', { ok: 'render', 'bad-script': 'script', error: 'blocked', unmeasurable: 'unobserved' }],
+      ['render', 'outcome', { ok: 'qc', 'check-fail': 'build', 'render-mismatch': 'build', unmeasurable: 'unobserved' }],
+      ['qc', 'outcome', { pass: 'delivered', 'vo-mismatch': 'vo', loudness: 'build', 'too-long': 'build', public: 'needs-human', unmeasurable: 'unobserved' }],
+    ]);
+    expect(Object.keys(EXPLAINER).sort()).toEqual(['explainer-build', 'explainer-qc', 'explainer-script', 'explainer-vo']);
   });
 });

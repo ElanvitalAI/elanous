@@ -269,6 +269,10 @@ export interface LLMMessage {
   role: 'system' | 'user' | 'assistant';
   /** Plain string for text-only messages; ContentBlock[] when images are mixed in. */
   content: string | ContentBlock[];
+  /** Codex Responses message phase, preserved when replaying a stateless turn. */
+  phase?: 'commentary' | 'partial_answer' | 'final_answer';
+  /** Opaque Codex stateless reasoning items, before this assistant message. */
+  codexReasoningItems?: Array<{ type: 'reasoning'; encrypted_content: string; summary: unknown[]; id?: string }>;
 }
 
 /** JSONSchema-shaped tool definition sent to the provider (no handler). */
@@ -282,6 +286,21 @@ function toolUseNames(messages: readonly LLMMessage[]): string[] {
   return messages.flatMap((message) => Array.isArray(message.content)
     ? message.content.flatMap((block) => block.type === 'tool_use' ? [block.name] : [])
     : []);
+}
+
+/** Return paths for legacy tuple-form `items` schemas without logging schema
+ * values. Provider 400s often omit the rejected tool name, so these paths let
+ * the next TUI recurrence identify the source contract without logging args. */
+function collectTupleItemsSchemaPaths(schema: unknown, path = 'parameters'): string[] {
+  if (Array.isArray(schema)) {
+    return schema.flatMap((value, index) => collectTupleItemsSchemaPaths(value, `${path}[${index}]`));
+  }
+  if (!schema || typeof schema !== 'object') return [];
+  return Object.entries(schema as Record<string, unknown>).flatMap(([key, value]) => {
+    const childPath = `${path}.${key}`;
+    const tuplePath = key === 'items' && Array.isArray(value) ? [childPath] : [];
+    return [...tuplePath, ...collectTupleItemsSchemaPaths(value, childPath)];
+  });
 }
 
 function mapProviderToolNamesInMessages(
@@ -340,7 +359,10 @@ function restoreProviderToolCallNames(
  *  (currently Anthropic only) — consumers that don't care should
  *  ignore it; `textOnly()` filters it out. */
 export type LLMStreamEvent =
-  | { type: 'text'; delta: string }
+  | { type: 'text'; delta: string; phase?: 'commentary' | 'final' }
+  | { type: 'text_phase'; phase: 'commentary' | 'final' }
+  | { type: 'turn_end'; endTurn: boolean }
+  | { type: 'codex_reasoning_item'; item: { type: 'reasoning'; encrypted_content: string; summary: unknown[]; id?: string } }
   | {
       type: 'tool_call';
       id: string;
@@ -415,6 +437,24 @@ export interface LLMOpts {
   streamIdleTimeoutMs?: number;
   /** Optional per-request usage telemetry from the provider stream. */
   onUsage?(usage: LLMUsage): void;
+  /** Optional request-size policy. Providers that expose a serialized request
+   *  can compact the normalized conversation before sending it. The callback
+   *  is opt-in; providers without a serializer hook preserve their wire path. */
+  requestSizeGuard?: {
+    maxChars: number;
+    compactMessages: (
+      messages: LLMMessage[],
+      info: { provider: string; requestChars: number; maxChars: number },
+    ) => Promise<{ messages: LLMMessage[]; reason: string } | null>;
+    onMeasured?: (info: {
+      provider: string;
+      requestChars: number;
+      maxChars: number;
+      compacted: boolean;
+      reason: string;
+      previousChars?: number;
+    }) => void;
+  };
   /** Optional model role attached to this request's usage observation. */
   usageRole?: ModelRole;
   /** Optional per-call metering phase; absent calls keep the existing ledger shape. */
@@ -476,6 +516,9 @@ export interface LLMOpts {
    *  그러면 종결 신호 뒤 빈 턴은 이 스트림에 쓴 답이 없어도 재촉·`[NO FINAL SYNTHESIS]` 없이 빈 답으로 끝낸다.
    *  비우면(기본) 종전대로 — 답이 «어디에도» 없을 때의 경고는 그대로 보인다. */
   terminalPriorAnswerVisible?: boolean;
+  /** Goal-loop only: a validated completion ends the provider loop after tool results settle.
+   *  Omitted for ordinary terminal tools, which may need a further answer turn. */
+  terminalCompletionAccepted?: (name: string, args: Record<string, unknown>) => boolean;
   /** Prompt-caching toggle. Honored by Anthropic (attaches
    *  cache_control markers on system + tools + 2nd-to-last history
    *  message) and OpenAI (passes stream_options.include_usage so
@@ -1628,7 +1671,8 @@ type ResponsesContentBlock =
  *    codex answer began with "tool_result 가 없다" because, from the
  *    model's perspective, no tool result ever arrived. */
 type ResponsesInputItem =
-  | { role: string; content: ResponsesContentBlock[] }
+  | { role: string; content: ResponsesContentBlock[]; phase?: 'commentary' | 'partial_answer' | 'final_answer' }
+  | { type: 'reasoning'; encrypted_content: string; summary: unknown[]; id?: string }
   | { type: 'function_call'; name: string; arguments: string; call_id: string }
   // Image-pipeline P3 (2026-05-05) — `output` accepts string OR a
   // ContentItem[] mirroring the user-message content block shape.
@@ -1655,6 +1699,8 @@ type ResponsesInputItem =
  *  Codex variants — current gpt-5 family all true per allowlist). */
 export interface MessagesToResponsesInputOpts {
   acceptToolImages?: boolean;
+  /** Server-stored continuation already contains prior reasoning items. */
+  replayCodexReasoning?: boolean;
   acceptUserMessageImages?: boolean;
   onOrphanToolResult?: (callId: string) => void;
 }
@@ -1827,6 +1873,9 @@ export function messagesToResponsesInput(
       continue;
     }
 
+    // Stateless Codex requires the opaque reasoning item in its original
+    // position before the corresponding assistant message/tool calls.
+    if (m.role === 'assistant' && opts.replayCodexReasoning !== false && m.codexReasoningItems) input.push(...m.codexReasoningItems);
     // Assemble the final content block list: text first (matches
     // how users usually write prompts — "describe this image" then
     // attachment), images second. Responses API is order-sensitive
@@ -1844,7 +1893,7 @@ export function messagesToResponsesInput(
     // representation — emitting an empty Message wrapper would just
     // add a stray empty-text block to the conversation history.
     if (content.length > 0) {
-      input.push({ role: m.role, content });
+      input.push({ role: m.role, content, ...(m.role === 'assistant' && m.phase ? { phase: m.phase } : {}) });
     }
     input.push(...trailingItems);
   }
@@ -2175,6 +2224,41 @@ function mapReasoningLevelToGeminiThinking(
 /** Stream against /responses (Codex, OpenAI Responses API). Exported
  *  so tests can exercise header/body shape without spinning up the
  *  full makeCodexProvider path. */
+function buildCodexResponsesWireBody(
+  body: {
+    model: string;
+    instructions: string;
+    input: unknown[];
+    tools?: unknown[];
+    tool_choice?: unknown;
+    reasoning?: { effort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'; summary?: 'auto' | 'concise' | 'detailed' };
+    store?: boolean;
+    previousResponseId?: string;
+  },
+  promptCache: boolean,
+): Record<string, unknown> {
+  const cacheKey = promptCache ? computePromptCacheKey(body.model, body.instructions) : undefined;
+  return {
+    ...body,
+    stream: true,
+    store: body.store === true,
+    ...(body.tool_choice ? { tool_choice: body.tool_choice } : {}),
+    ...(body.previousResponseId ? { previous_response_id: body.previousResponseId } : {}),
+    ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
+    ...(body.reasoning ? {
+      reasoning: body.reasoning,
+      include: ['reasoning.encrypted_content'],
+    } : {}),
+  };
+}
+
+function serializeCodexResponsesWireBody(
+  body: Parameters<typeof buildCodexResponsesWireBody>[0],
+  promptCache: boolean,
+): string {
+  return JSON.stringify(buildCodexResponsesWireBody(body, promptCache));
+}
+
 export async function* streamCodexResponsesEvents(
   url: string,
   bearer: string,
@@ -2221,6 +2305,9 @@ export async function* streamCodexResponsesEvents(
     /** Opt-out hook (tests). When false, skips the
      *  `prompt_cache_key` body field; production always passes true. */
     promptCache?: boolean;
+    /** Exact body string already serialized by the request-size preflight.
+     *  Passing it through ensures the measured bytes are the bytes fetched. */
+    serializedWireBody?: string;
     /** Callback fired when the SSE stream emits `response.created`
      *  carrying the new response's id. Used by makeCodexProvider to
      *  capture the id and thread `previousResponseId` on the next
@@ -2274,32 +2361,16 @@ export async function* streamCodexResponsesEvents(
   //                         value codex_cli_rs ships) so the backend
   //                         applies the same tool/SSE conventions
   const promptCache = extra.promptCache !== false;
-  const cacheKey = promptCache ? computePromptCacheKey(body.model, body.instructions) : undefined;
-  // TUI-OBS-400-SHAPE(#69) — 전송 객체·문자열을 한 번 만들어 둔다: 4xx 거절 때 «실제로 보낸 것» 의 모양을 잰다.
-  const wireBody: Record<string, unknown> = {
-    ...body,
-    stream: true,
-    // store=true wave: when caller opts in, the backend persists the
-    // response and the next request can thread `previous_response_id`
-    // to send only the delta input items. Default still false so any
-    // caller that doesn't opt in (tests building bodies directly)
-    // sees the legacy wire shape.
+  // TUI-REQUEST-SIZE-COMPACT — the exact serializer is shared with the
+  // preflight guard, so the size decision and fetch body cannot drift.
+  const wireBody = buildCodexResponsesWireBody(body, promptCache);
+  const wireJson = extra.serializedWireBody ?? JSON.stringify(wireBody);
+  debug.log('llm.request', 'request-size', {
+    provider: 'openai-codex',
+    requestChars: wireJson.length,
     store: body.store === true,
-    ...(body.tool_choice ? { tool_choice: body.tool_choice } : {}),
-    ...(body.previousResponseId ? { previous_response_id: body.previousResponseId } : {}),
-    ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
-    // Reasoning opt-in (gpt-5 family). When the caller sets
-    // body.reasoning we mirror it onto the wire AND append the
-    // include directive that lets multi-turn requests thread the
-    // model's encrypted reasoning context. Omit both when absent
-    // so non-reasoning models / opt-out users see the legacy
-    // wire shape unchanged.
-    ...(body.reasoning ? {
-      reasoning: body.reasoning,
-      include: ['reasoning.encrypted_content'],
-    } : {}),
-  };
-  const wireJson = JSON.stringify(wireBody);
+    previousResponseId: body.previousResponseId ? `${body.previousResponseId.slice(0, 12)}…` : null,
+  });
   const response = await fetchApiWithRetry(
     url,
     {
@@ -2328,6 +2399,10 @@ export async function* streamCodexResponsesEvents(
   debug.log('llm.response.status', `codex ${response.status}`, {
     url, status: response.status, elapsedMs: Date.now() - startedAt,
   });
+  let messagePhase: 'commentary' | 'final' | undefined;
+  const codexTextPhase = (value: unknown): 'commentary' | 'final' | undefined =>
+    value === 'commentary' || value === 'partial_answer' ? 'commentary'
+      : value === 'final_answer' ? 'final' : undefined;
   try {
     for await (const line of sseLineStream(response.body!)) {
       if (!line.startsWith('data: ')) continue;
@@ -2347,15 +2422,32 @@ export async function* streamCodexResponsesEvents(
           extra.onResponseCreated(id);
         }
       }
+      if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+        if (parsed.item?.type === 'message') {
+          const phase = codexTextPhase(parsed.item.phase);
+          if (type === 'response.output_item.added') messagePhase = phase;
+          if (phase) {
+            messagePhase = phase;
+            yield { type: 'text_phase', phase };
+          }
+        }
+      }
       // Text tokens — both `response.output_text.delta` (new naming) and
       // raw `output_text.delta` (older streams).
       if (type.endsWith('output_text.delta')) {
         const delta = parsed.delta || '';
-        if (delta) yield { type: 'text', delta };
+        if (delta) yield { type: 'text', delta, ...(messagePhase ? { phase: messagePhase } : {}) };
       }
       // Tool calls come in as `response.output_item.done` with item.type = 'function_call'.
       if (type === 'response.output_item.done') {
         const item = parsed.item;
+        if (item?.type === 'reasoning' && typeof item.encrypted_content === 'string' && item.encrypted_content) {
+          yield { type: 'codex_reasoning_item', item: {
+            type: 'reasoning', encrypted_content: item.encrypted_content,
+            summary: Array.isArray(item.summary) ? item.summary : [],
+            ...(typeof item.id === 'string' ? { id: item.id } : {}),
+          } };
+        }
         if (item && item.type === 'function_call') {
           let args: Record<string, unknown> = {};
           try { args = item.arguments ? JSON.parse(item.arguments) : {}; } catch { /* empty */ }
@@ -2410,6 +2502,9 @@ export async function* streamCodexResponsesEvents(
       // hit rate for codex regardless. See store=true wave (next+1)
       // for the volume-side counterpart.
       if (type === 'response.completed') {
+        if (typeof parsed.response?.end_turn === 'boolean') {
+          yield { type: 'turn_end', endTurn: parsed.response.end_turn };
+        }
         const u = parsed.response?.usage;
         if (u && typeof u === 'object') {
           const cached = u.input_tokens_details?.cached_tokens
@@ -4474,6 +4569,13 @@ function explainAndLogFallbackCandidates(
 
 /** 스트림 중 끊김 재시도 상한 — codex `DEFAULT_STREAM_MAX_RETRIES`(5) 와 같은 값. */
 const STREAM_DISCONNECT_MAX_RETRIES = 5;
+class StreamIdleTimeoutError extends Error {
+  constructor(readonly idleMs: number) {
+    super(`stream idle timeout after ${idleMs}ms`);
+    this.name = 'StreamIdleTimeoutError';
+    Object.assign(this, { code: 'ETIMEDOUT' });
+  }
+}
 const STREAM_IDLE_TIMEOUT_MAX_RETRIES = 1;
 let streamDisconnectRetryDelayMs: (attempt: number) => number = backoffMs;
 
@@ -4799,6 +4901,20 @@ type ProviderTextResult =
   | { ok: true; full: string; usage: ObservedUsage | 'unmeasured' }
   | { ok: false; full: string; error: unknown };
 
+function resolveStreamIdleTimeout(opts: LLMOpts, provider: LLMProvider, model: string): { ms: number; source: 'call' | 'config' | 'default' } {
+  if (opts.streamIdleTimeoutMs !== undefined
+    && Number.isFinite(opts.streamIdleTimeoutMs) && opts.streamIdleTimeoutMs > 0) {
+    return { ms: opts.streamIdleTimeoutMs, source: 'call' };
+  }
+  let configured: number | undefined;
+  try {
+    configured = (require('./user-config.js') as typeof import('./user-config.js')).getUserConfig().llm.streamIdleTimeoutMs;
+  } catch { /* config lookup is fail-soft; preserve provider defaults */ }
+  if (configured !== undefined) return { ms: configured, source: 'config' };
+  const longIdle = usesLongReasoningIdle(getModelFamily(model), provider.name);
+  return { ms: longIdle ? STREAM_IDLE_TIMEOUT_MS_REASONING : STREAM_IDLE_TIMEOUT_MS, source: 'default' };
+}
+
 function accumulateUsage(usage: ObservedUsage | undefined, received: LLMUsage): ObservedUsage {
   const total = { ...usage };
   for (const field of ['inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens', 'reportedCostUsd'] as const) {
@@ -4836,10 +4952,8 @@ async function consumeProviderText(
       // Preserve the provider or callback error that caused this close.
     }
   };
-  const idleMs = opts.streamIdleTimeoutMs ?? (
-    usesLongReasoningIdle(getModelFamily(opts.model ?? provider.defaultModel), provider.name)
-      ? STREAM_IDLE_TIMEOUT_MS_REASONING : STREAM_IDLE_TIMEOUT_MS
-  );
+  const idleTimeout = resolveStreamIdleTimeout(opts, provider, opts.model ?? provider.defaultModel);
+  const idleMs = idleTimeout.ms;
 
   while (true) {
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -4860,10 +4974,9 @@ async function consumeProviderText(
     if (step.idle) {
       debug.log('llm', 'stream-idle-timeout', {
         provider: provider.name, model: opts.model ?? provider.defaultModel,
-        idleMs, receivedChars: full.length, site: 'stream-llm',
+        idleMs, idleMsSource: idleTimeout.source, receivedChars: full.length, site: 'stream-llm',
       });
-      const error = new Error(`stream idle timeout after ${idleMs}ms`);
-      error.name = 'StreamIdleTimeoutError';
+      const error = new StreamIdleTimeoutError(idleMs);
       // An async generator can leave return() pending behind a stalled next().
       void closeIterator();
       return { ok: false, full, error };
@@ -4945,6 +5058,7 @@ export async function streamLLM(
         textChars: full.length,
         usage: consumed.usage,
       });
+      (await import('./session-runtime/provider-circuit.js')).recordProviderSuccess(activeProvider.name, Date.now());
       return full;
     }
 
@@ -4962,6 +5076,7 @@ export async function streamLLM(
           status: err.status,
           kind: err.kind,
         }, { level: 'warn' });
+        (await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, 'overload-failover', Date.now());
         activeProvider = switched;
         modelOverride = undefined;
         attemptedProviders.add(activeProvider.name);
@@ -4998,6 +5113,7 @@ export async function streamLLM(
         tools: opts.tools?.map((tool) => tool.name) ?? [],
         ...(opts.model ? { modelOverrideDropped: opts.model } : {}),
       }, { level: 'warn' });
+      (await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, verdict.category, Date.now());
       activeProvider = fallback;
       modelOverride = undefined;
       attemptedProviders.add(activeProvider.name);
@@ -5123,7 +5239,7 @@ export function resolveDefaultProvider(model?: string): LLMProvider {
 export interface StreamWithToolsHandlers {
   /** Streaming text delta — invoked for every text chunk across all turns. */
   onText(delta: string, fullAcrossTurns: string): void;
-  /** Optional status line for hosts that surface transient stream recovery. */
+  /** Transient user-visible status emitted by stream recovery (not model text). */
   onStatus?(line: string): void;
   /** Dispatch a tool call. Returning undefined/null throws in the loop so
    *  callers should always return a JSON-serializable value (can be an
@@ -8336,12 +8452,42 @@ export async function streamLLMWithTools(
     skipProviders?: readonly string[];
   } = {},
 ): Promise<string> {
+  // Fixed providers keep the original synchronous launch path. Load the circuit before
+  // selection only when it can change this turn's initial provider.
+  const circuit = !opts.provider && !opts.initialProvider
+    ? await import('./session-runtime/provider-circuit.js')
+    : undefined;
   const provider = opts.provider ?? opts.initialProvider ?? resolveDefaultProvider(opts.model);
   const initial = finalizeStreamingProviderModel(provider, opts.model ?? provider.defaultModel);
   let activeProvider = initial.provider;
   let activeModel = initial.model;
+  let circuitBlockedInitialProvider: string | undefined;
+  // SURVIVAL-PROVIDER-CIRCUIT (S2): 명시·고정 공급자(`provider`·`initialProvider`)가 없고
+  // 회로가 열려(open) 있으면, 체인 해석(`remainingFallbackProviderNames` 순서)의 첫
+  // closed(없으면 half-open) 공급자로 이번 턴을 연다. 모두 open 이면 원래 1순위를 그대로
+  // 쓴다(«갈 곳 없음 = 멈춤»이 아니다) — `circuit-all-open` 관측만 남긴다.
+  if (circuit && circuit.circuitState(activeProvider.name, Date.now()) === 'open') {
+    const chainNames = [activeProvider.name, ...remainingFallbackProviderNames(new Set(opts.skipProviders ?? []), opts)]
+      .filter((name) => providerByName(name)?.available());
+    const pickedName = circuit.pickInitialProvider(chainNames, Date.now());
+    const picked = pickedName && pickedName !== activeProvider.name ? providerByName(pickedName) : undefined;
+    if (picked && picked.available()) {
+      circuitBlockedInitialProvider = activeProvider.name;
+      debug.log('tui.survival', 'turn-opened-on-fallback', { blocked: activeProvider.name, opened: picked.name });
+      handlers.onStatus?.(`⚡ ${activeProvider.name} 회로 열림 — 이번 턴은 ${picked.name}`);
+      const pickedInitial = finalizeStreamingProviderModel(picked, picked.defaultModel);
+      activeProvider = pickedInitial.provider;
+      activeModel = pickedInitial.model;
+    } else {
+      debug.log('tui.survival', 'circuit-all-open', { blocked: activeProvider.name });
+    }
+  }
   opts.onResolvedProvider?.(activeProvider.name, activeModel);
-  const attemptedProviders = new Set<string>([activeProvider.name, ...(opts.skipProviders ?? [])]);
+  const attemptedProviders = new Set<string>([
+    activeProvider.name,
+    ...(circuitBlockedInitialProvider ? [circuitBlockedInitialProvider] : []),
+    ...(opts.skipProviders ?? []),
+  ]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   const effectiveModel = activeModel;
   const modelFamily = getModelFamily(effectiveModel);
@@ -8361,7 +8507,7 @@ export async function streamLLMWithTools(
     tools: opts.tools?.map(t => t.name),
     toolsAvailable: !!provider.streamChat && (opts.tools?.length ?? 0) > 0,
   }, { level: 'info' });
-  if (!provider.streamChat || !opts.tools || opts.tools.length === 0) {
+  if (!provider.streamChat || ((opts.tools?.length ?? 0) === 0 && provider.name !== 'openai-codex')) {
     // No tool support or no tools requested — delegate to plain streamLLM.
     debug.log('llm.router', 'streamLLMWithTools.fallback', {
       reason: !provider.streamChat ? 'provider-no-streamChat' : 'no-tools',
@@ -8522,6 +8668,8 @@ export async function streamLLMWithTools(
   }
   // OR-DEEPSEEK-TUNE — 마지막 턴의 «도구 없는» 추론(deepseek/* 만 채워진다). 매 턴 시작에 비운다.
   let turnReasoningDetails: Array<Record<string, unknown>> | undefined;
+  let turnCodexReasoningItems: LLMMessage['codexReasoningItems'];
+  let turnCodexTextPhase: LLMMessage['phase'];
   const emitTurnComplete = (finalAssistantText?: string): void => {
     if (finalAssistantText && finalAssistantText.length > 0) {
       history.push({
@@ -8530,18 +8678,23 @@ export async function streamLLMWithTools(
           type: 'text', text: finalAssistantText,
           ...(turnReasoningDetails ? { providerMeta: { reasoningDetails: turnReasoningDetails } } : {}),
         }],
+        ...(turnCodexReasoningItems?.length ? { codexReasoningItems: turnCodexReasoningItems } : {}),
+        ...(turnCodexTextPhase ? { phase: turnCodexTextPhase } : {}),
       });
     }
     handlers.onTurnComplete?.(history.slice(initialHistoryLen));
   };
   let fullText = '';
   let sawToolRound = false;
+  let codexContinuationNeeded = false;
   // TUI-GOAL-LOOP-FRICTION — 종결 신호 도구(LLMOpts.terminalToolNames). 비면 아래 분기는 전부 꺼진다.
   const terminalToolNames: ReadonlySet<string> = new Set(opts.terminalToolNames ?? []);
   /** 이 스트림에서 종결 신호를 한 번이라도 디스패치했나. */
   let terminalSignalDispatched = false;
+  let completionNeedsFinalTurn = false;
   /** 도구 라운드에 실린 마지막 «비지 않은» 답 텍스트(종결 신호 턴 마감·빈 턴 포기에서 쓴다). */
   let lastToolRoundText = '';
+  let lastToolRoundTextPhase: 'commentary' | 'final' | undefined;
   const agentBatchTickIntervalMs = opts.agentBatchTickIntervalMs ?? BATCH_TICK_INTERVAL_MS;
 
   // Empty-turn guard: smaller models (gpt-5.4-mini, haiku) sometimes
@@ -8715,7 +8868,7 @@ export async function streamLLMWithTools(
   let loopTermination: 'budget-exhausted' | 'aborted' = 'budget-exhausted';
   let terminalTurn = maxTurns;
 
-  for (let turn = 0; turn < maxTurns; turn++) {
+  for (let turn = 0; turn < maxTurns || ((completionNeedsFinalTurn || codexContinuationNeeded) && turn === maxTurns); turn++) {
     // ★ /cancel 범용화(대표 2026-07-12) — abort 신호가 오면 tool 루프를 즉시 중단한다. 이게 없으면
     //   fetch 는 abort 돼도 루프가 다음 turn 으로 계속 돌아 tool 반복(grep 폭주 등)이 멈추지 않는다.
     if (opts.signal?.aborted) {
@@ -8748,6 +8901,11 @@ export async function streamLLMWithTools(
       }
     }
     let turnText = '';
+    let turnTextPhase: 'commentary' | 'final' | undefined;
+    let turnEnd: boolean | undefined;
+    codexContinuationNeeded = false;
+    turnCodexReasoningItems = undefined;
+    turnCodexTextPhase = undefined;
     // TUI-TURN-NARRATION — 이 라운드에 받은 추론 요약 글자 수(내용은 남기지 않는다).
     let turnReasoningChars = 0;
     turnReasoningDetails = undefined;
@@ -8847,13 +9005,14 @@ export async function streamLLMWithTools(
     // revert to auto (see above).
     const buildTurnOpts = () => {
       const remainingFallbacks = opts.provider ? 0 : remainingFallbackProviderNames(attemptedProviders, opts).length;
-      const base = { ...opts, model: activeModel, tools: activeTools, remainingFallbacks };
+      const base = { ...opts, model: activeModel, tools: completionNeedsFinalTurn ? [] : activeTools, remainingFallbacks };
       return turn === 0 ? base : { ...base, toolChoice: undefined };
     };
     let turnOpts = buildTurnOpts();
     // reasoning-heavy family(codex/claude/gemini/grok/local)는 침묵 추론 구간이 길어 idle watchdog 를
     // family-aware 로 상향(2026-07-19 goal-exec → 아크4 전-family). fast/mini(gpt·other)만 45s 유지.
-    const streamIdleTimeoutMs = opts.streamIdleTimeoutMs ?? (usesLongReasoningIdle(modelFamily, activeProvider.name) ? STREAM_IDLE_TIMEOUT_MS_REASONING : STREAM_IDLE_TIMEOUT_MS);
+    const idleTimeout = resolveStreamIdleTimeout(opts, activeProvider, activeModel);
+    const streamIdleTimeoutMs = idleTimeout.ms;
     // ⚠️ hang 진단(2026-07-17) — codex SSE 스트림이 완료 신호 없이 안 끝나는 케이스 확정용.
     // consume-start 후 consume-end 가 없으면 = for-await(streamChat SSE) hang. lastEvType 로 어느
     // 이벤트 뒤에서 멈추는지(usage/text/tool_call) 특정. 무장할 상한도 남겨 실험 런을 구별한다.
@@ -8862,6 +9021,7 @@ export async function streamLLMWithTools(
       provider: activeProvider.name,
       model: activeModel,
       idleMs: streamIdleTimeoutMs,
+      idleMsSource: idleTimeout.source,
       ...(modelFamily !== 'other' ? { modelFamily } : {}),
     });
     let evCount = 0;
@@ -8870,6 +9030,7 @@ export async function streamLLMWithTools(
     //   다시 건다(codex `stream_max_retries` 동형). 이 턴에서 받은 tool_call·image 가 있으면 재시도하지 않는다.
     let streamDisconnectRetries = 0;
     let streamIdleTimeoutRetries = 0;
+    let streamIdleRetryPartial = '';
     let streamEmittedImage = false;
     // 끊긴 조각을 이력(turnText·fullText)에서 «조용히» 되감는다 — 화면엔 지우라고 알리지 않는다
     //   (TUI 의 빈 델타는 «커밋»이다). 이미 보인 글과 겹치는 재시도 본문은 `retryDisplay` 가 막는다.
@@ -8887,6 +9048,7 @@ export async function streamLLMWithTools(
       if (turnText.length > 0) {
         fullText = fullText.slice(0, fullText.length - turnText.length);
         turnText = '';
+        turnTextPhase = undefined;
       }
       turnReasoningChars = 0;
       retryDisplay.arm();
@@ -8898,6 +9060,19 @@ export async function streamLLMWithTools(
     // 이벤트 대기를 idle timeout 과 race — STREAM_IDLE_TIMEOUT_MS 무이벤트면 스트림 정리·탈출(받은
     // 텍스트로 진행). 35분 무한 hang → 자동 복구. 원인 규명은 consume-end 부재/idle-timeout 로그가.
     let streamIter: AsyncIterator<LLMStreamEvent> | undefined;
+    let streamAttemptAbort: AbortController | undefined;
+    let streamAttemptAbortCleanup: (() => void) | undefined;
+    const releaseStreamAttempt = (abort = false, reason?: unknown): void => {
+      if (abort) streamAttemptAbort?.abort(reason);
+      streamAttemptAbortCleanup?.();
+      streamAttemptAbortCleanup = undefined;
+      streamAttemptAbort = undefined;
+    };
+    let providerToolSchemaDiagnostics: Record<string, {
+      originalName: string;
+      providerName: string;
+      tupleItemsPaths: Record<string, string>;
+    }> | undefined;
     while (true) {
       let idleTimer: ReturnType<typeof setTimeout> | undefined;
       let step: { idle: true } | { idle: false; r: IteratorResult<LLMStreamEvent, void> };
@@ -8927,8 +9102,22 @@ export async function streamLLMWithTools(
               ? [turnOpts.toolChoice.name]
               : []),
           ]);
+          const attemptAbort = new AbortController();
+          const forwardExternalAbort = () => attemptAbort.abort(opts.signal?.reason);
+          if (opts.signal?.aborted) forwardExternalAbort();
+          else opts.signal?.addEventListener('abort', forwardExternalAbort, { once: true });
+          streamAttemptAbort = attemptAbort;
+          streamAttemptAbortCleanup = () => opts.signal?.removeEventListener('abort', forwardExternalAbort);
+          providerToolSchemaDiagnostics = Object.fromEntries((turnOpts.tools ?? []).map((tool, index) => [String(index), {
+            originalName: tool.name,
+            providerName: nameMap.toProviderName(tool.name),
+            tupleItemsPaths: Object.fromEntries(
+              collectTupleItemsSchemaPaths(tool.parameters).map((path, pathIndex) => [String(pathIndex), path]),
+            ),
+          }]));
           const providerOpts: LLMOpts = {
             ...turnOpts,
+            signal: attemptAbort.signal,
             tools: turnOpts.tools?.map((tool) => ({ ...tool, name: nameMap.toProviderName(tool.name) })),
             toolChoice: turnOpts.toolChoice && typeof turnOpts.toolChoice === 'object'
               ? { name: nameMap.toProviderName(turnOpts.toolChoice.name) }
@@ -8944,21 +9133,25 @@ export async function streamLLMWithTools(
           streamIter.next().then((r) => ({ idle: false as const, r })),
           new Promise<{ idle: true }>((res) => { idleTimer = setTimeout(() => res({ idle: true }), streamIdleTimeoutMs); }),
         ]);
-        if (step.idle) {
-          const error = new Error(`stream idle timeout after ${streamIdleTimeoutMs}ms`);
-          error.name = 'StreamIdleTimeoutError';
-          Object.assign(error, { code: 'ETIMEDOUT' });
-          throw error;
-        }
+        if (step.idle) throw new StreamIdleTimeoutError(streamIdleTimeoutMs);
       } catch (err) {
         if (idleTimer) clearTimeout(idleTimer);
-        if (err instanceof Error && err.name === 'StreamIdleTimeoutError') {
+        releaseStreamAttempt(true, err);
+        if (err instanceof ApiHttpError && err.status === 400 && providerToolSchemaDiagnostics) {
+          debug.log('llm.tool-schema', 'provider-request-rejected', {
+            provider: activeProvider.name,
+            model: activeModel,
+            turn,
+            status: err.status,
+            tools: providerToolSchemaDiagnostics,
+          }, { level: 'warn' });
+        }
+        if (err instanceof StreamIdleTimeoutError) {
           debug.log('llm.stream', 'idle-timeout', {
-            turn, evCount, lastEvType, idleMs: streamIdleTimeoutMs,
+            turn, evCount, lastEvType, idleMs: err.idleMs, idleMsSource: idleTimeout.source,
             textChars: turnText.length, pendingCalls: pendingCalls.length,
           }, { level: 'warn' });
-          // A provider async iterator can queue return() behind the pending next().
-          // Detach cleanup so it cannot keep the user turn busy forever.
+          // Provider iterators can queue return() behind a pending next(). Detach cleanup.
           const timedOutIterator = streamIter;
           if (timedOutIterator?.return) {
             try { void Promise.resolve(timedOutIterator.return(undefined)).catch(() => {}); } catch { /* fail-soft cleanup */ }
@@ -8971,18 +9164,29 @@ export async function streamLLMWithTools(
               attempt: streamIdleTimeoutRetries, maxRetries: STREAM_IDLE_TIMEOUT_MAX_RETRIES,
               delayMs: 0, statusLine: '스트림 무응답 · 재시도',
             }, { level: 'warn' });
-            handlers.onStatus?.(`스트림 무응답 · 재시도 ${streamIdleTimeoutRetries}/${STREAM_IDLE_TIMEOUT_MAX_RETRIES}`);
+            try { handlers.onStatus?.(`스트림 무응답 · 재시도 ${streamIdleTimeoutRetries}/${STREAM_IDLE_TIMEOUT_MAX_RETRIES}`); } catch { /* UI notification must not block recovery */ }
+            streamIdleRetryPartial = turnText;
             rewindDisconnectedStream();
             streamIter = undefined;
             continue;
           }
-          // Once a tool call/image escaped, keep the old behavior: finish this
-          // provider turn and never replay or switch providers around side effects.
-          if (pendingCalls.length > 0 || streamEmittedImage || opts.signal?.aborted) break;
-          if (opts.provider) break; // pinned route preserves the prior partial-text result
-          // The retry's text was already sent to the view; drop it from the
-          // logical result before allowing the normal provider fallback path.
-          if (pendingCalls.length === 0 && !streamEmittedImage) rewindDisconnectedStream();
+          // Do not replay or advance providers after a tool side effect or image escaped.
+          if (pendingCalls.length > 0 || streamEmittedImage) break;
+          if (opts.signal?.aborted) throw err;
+          if (opts.provider && (turnText.length > 0 || streamIdleRetryPartial.length > 0)) {
+            // A pinned provider cannot advance to fallback. Keep already shown partial text
+            // and complete the turn instead of rewinding it and failing the whole response.
+            if (turnText.length === 0 && streamIdleRetryPartial.length > 0) {
+              turnText = streamIdleRetryPartial;
+              fullText += streamIdleRetryPartial;
+            }
+            try { handlers.onStatus?.('스트림 무응답 · 재시도 소진 (부분 응답 유지)'); } catch { /* status is fail-soft */ }
+            debug.log('llm.stream', 'idle-timeout-pinned-partial-preserved', { turn, evCount, lastEvType, textChars: turnText.length }, { level: 'warn' });
+            break;
+          }
+          if (opts.provider) throw err;
+          rewindDisconnectedStream();
+          streamIter = undefined;
         }
         if (err instanceof OverloadFailoverError && !opts.provider) {
           const switched = activeProvider.name === 'openai-codex'
@@ -8990,6 +9194,7 @@ export async function streamLLMWithTools(
             : providerByName('grok');
           if (switched && !attemptedProviders.has(switched.name)
             && (activeProvider.name === 'openai-codex' || switched.available()) && evCount === 0) {
+            (circuit ?? await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, 'overload-failover', Date.now());
             debug.log('llm.router', 'overload-failover', {
               turn,
               blockedProvider: activeProvider.name,
@@ -9004,13 +9209,13 @@ export async function streamLLMWithTools(
             activeModel = finalized.model;
             attemptedProviders.add(activeProvider.name);
             streamDisconnectRetries = 0;
+            streamIdleTimeoutRetries = 0;
             turnOpts = buildTurnOpts();
             streamIter = undefined;
             continue;
           }
         }
-        if (!(err instanceof Error && err.name === 'StreamIdleTimeoutError')
-          && evCount > 0 && isStreamDisconnectRetryable(err, pendingCalls.length, streamEmittedImage) && !opts.signal?.aborted) {
+        if (!(err instanceof StreamIdleTimeoutError) && evCount > 0 && isStreamDisconnectRetryable(err, pendingCalls.length, streamEmittedImage) && !opts.signal?.aborted) {
           const retryData = {
             provider: activeProvider.name,
             model: activeModel,
@@ -9054,6 +9259,7 @@ export async function streamLLMWithTools(
           remainingProviders: remaining,
           attempted: blockedProviders,
         });
+        (circuit ?? await import('./session-runtime/provider-circuit.js')).recordProviderFailure(activeProvider.name, verdict.category, Date.now());
         blockedProviders = [...verdict.attempts];
         const fallback = verdict.action === 'advance' ? providerByName(verdict.nextProvider) : undefined;
         if (!fallback) {
@@ -9086,24 +9292,36 @@ export async function streamLLMWithTools(
         attemptedProviders.add(activeProvider.name);
         // 재시도 상한은 «공급자마다» — 넘어간 공급자도 스트림 도중 끊김이면 다시 5회까지 건다.
         streamDisconnectRetries = 0;
+        streamIdleTimeoutRetries = 0;
         turnOpts = buildTurnOpts();
         streamIter = undefined;
         continue;
       }
       if (idleTimer) clearTimeout(idleTimer);
-      if (step.idle) {
-        // The race's idle branch is converted to StreamIdleTimeoutError above.
-        // Keep a fail-closed guard for future changes to this loop.
-        throw new Error('stream idle timeout branch escaped recovery');
+      if (step.r.done) {
+        (circuit ?? await import('./session-runtime/provider-circuit.js')).recordProviderSuccess(activeProvider.name, Date.now());
+        releaseStreamAttempt();
+        break;
       }
-      if (step.r.done) break;
       const ev = step.r.value;
       evCount++;
       lastEvType = ev.type;
+      // One same-provider idle retry is allowed per turn; progress clears the stale partial marker,
+      // but does not reset that retry budget.
+      if (streamIdleTimeoutRetries > 0) streamIdleRetryPartial = '';
       if (ev.type === 'text') {
         turnText += ev.delta;
+        if (ev.phase) turnTextPhase = ev.phase;
+        if (ev.phase) turnCodexTextPhase = ev.phase === 'final' ? 'final_answer' : 'commentary';
         fullText += ev.delta;
         emitRetryDisplayStep(retryDisplay.onText(ev.delta, turnText));
+      } else if (ev.type === 'text_phase') {
+        turnTextPhase = ev.phase;
+        turnCodexTextPhase = ev.phase === 'final' ? 'final_answer' : 'commentary';
+      } else if (ev.type === 'turn_end') {
+        turnEnd = ev.endTurn;
+      } else if (ev.type === 'codex_reasoning_item') {
+        (turnCodexReasoningItems ??= []).push(ev.item);
       } else if (ev.type === 'reasoning_details') {
         turnReasoningDetails = ev.details;
       } else if (ev.type === 'tool_call') {
@@ -9230,6 +9448,26 @@ export async function streamLLMWithTools(
       }
     }
 
+    // Codex can explicitly mark a response as unfinished even when it emitted
+    // text and no tools. Keep that text in history with its phase, then ask
+    // again. The extra turn is bounded to one past maxTurns.
+    if (pendingCalls.length === 0 && turnEnd === false) {
+      if (turnText || turnCodexReasoningItems?.length) history.push({
+        role: 'assistant', content: turnText,
+        ...(turnTextPhase ? { phase: turnTextPhase === 'final' ? 'final_answer' as const : 'commentary' as const } : {}),
+        ...(turnCodexReasoningItems?.length ? { codexReasoningItems: turnCodexReasoningItems } : {}),
+      });
+      if (turnText) {
+        clearVisibleAssistantTextForToolRound(handlers, sawToolRound);
+        sawToolRound = true;
+      }
+      codexContinuationNeeded = true;
+      debug.log('llm.router', 'codex.end-turn-false-continue', { turn, phase: turnTextPhase ?? 'unknown', textChars: turnText.length });
+      // The one grace turn is also unfinished. Fall through to the existing
+      // budget notice; never present a phase-marked progress item as final.
+      if (turn >= maxTurns) break;
+      continue;
+    }
     // No tool calls + non-empty text = the model gave its final answer.
     if (pendingCalls.length === 0 && turnText.length > 0) {
       const visibleText = finalizeVisibleAssistantText(fullText, turnText, sawToolRound);
@@ -9267,7 +9505,7 @@ export async function streamLLMWithTools(
       //   TUI-H1-GOALLOOP-EMPTY-TAIL — 답이 이 스트림 «앞»에 이미 보였어도 같다(opts.terminalPriorAnswerVisible —
       //   예: Bash → «끝» → 재주입 → update_goal 만 → 빈 턴). 이 스트림에 답이 없으면 빈 문자열로 끝내고 화면은
       //   건드리지 않는다(onText 생략 · emitTurnComplete 는 빈 답을 이력에 안 싣는다). 마감은 호출자(goal loop) 몫.
-      if (terminalSignalDispatched && (lastToolRoundText.trim().length > 0 || opts.terminalPriorAnswerVisible === true)) {
+      if (!completionNeedsFinalTurn && terminalSignalDispatched && (lastToolRoundText.trim().length > 0 || opts.terminalPriorAnswerVisible === true)) {
         const answer = lastToolRoundText.trim().length > 0 ? lastToolRoundText : '';
         debug.log('goal.loop', 'empty-turn-after-terminal-signal', {
           turn, emptyRetries, answerChars: answer.length,
@@ -9311,7 +9549,10 @@ export async function streamLLMWithTools(
       clearVisibleAssistantTextForToolRound(handlers, sawToolRound);
     }
     sawToolRound = true;
-    if (turnText.trim().length > 0) lastToolRoundText = turnText;
+    if (turnText.trim().length > 0) {
+      lastToolRoundText = turnText;
+      lastToolRoundTextPhase = turnTextPhase;
+    }
     // TUI-GOAL-LOOP-FRICTION(#46) — 이 턴의 호출이 «종결 신호뿐»이면 예산·후속 단계 거부를 걸지 않는다.
     const terminalOnlyTurn = terminalToolNames.size > 0
       && pendingCalls.length > 0
@@ -9360,7 +9601,10 @@ export async function streamLLMWithTools(
         ...(call.providerMeta !== undefined ? { providerMeta: call.providerMeta } : {}),
       });
     }
-    history.push({ role: 'assistant', content: assistantBlocks });
+    history.push({ role: 'assistant', content: assistantBlocks,
+      ...(turnTextPhase ? { phase: turnTextPhase === 'final' ? 'final_answer' as const : 'commentary' as const } : {}),
+      ...(turnCodexReasoningItems?.length ? { codexReasoningItems: turnCodexReasoningItems } : {}),
+    });
 
     // Final-synthesis window: in the last FINAL_SYNTHESIS_TURNS of the
     // budget, refuse to execute tool calls. Each pending call gets a
@@ -11183,10 +11427,43 @@ export async function streamLLMWithTools(
     }
     // 신호뿐인 턴 · 섞인 턴(정상 디스패치 · 부분 거부 · 통째 거부의 수신 확인) 모두 — 종결 신호가 이 턴에 «받아들여졌다».
     if (!hardStopText && pendingCalls.some(isTerminalCall)) terminalSignalDispatched = true;
+    // A goal completion with evidence has already been acknowledged by dispatch. The
+    // across-turn goal loop owns final acceptance (test evidence / rejected calls),
+    // but no further provider request is needed to make that decision. Keep the
+    // tool-result blocks in onTurnComplete so it can inspect the original call.
+    const hasAcceptedCompletion = !hardStopText && opts.terminalCompletionAccepted && pendingCalls.some((call) =>
+      isTerminalCall(call) && resultBlocks.some((block) => block.type === 'tool_result'
+        && block.tool_use_id === call.id && !block.isError)
+      && opts.terminalCompletionAccepted!(call.name, call.args));
+    const hasVisibleAnswer = lastToolRoundText.trim().length > 0 || opts.terminalPriorAnswerVisible === true;
+    // A completion tool can follow a commentary/progress segment on any provider.
+    // Its successful ack does not turn that segment into a final user answer.
+    const completionTextIsProgress = lastToolRoundTextPhase === 'commentary'
+      || (lastToolRoundTextPhase !== 'final' && lastToolRoundText.trim().length <= 240
+        && /(?:하겠습니다|드리겠습니다|할게요|할 예정입니다|확인하겠|살펴보겠|작성하겠|정리하겠|I(?:'ll| will)\b|\bnext[,]?\s+I\b)/i.test(lastToolRoundText));
+    if (hasAcceptedCompletion && completionTextIsProgress) {
+      completionNeedsFinalTurn = true;
+      history.push({ role: LOOP_SELF_NOTE_ROLE, content: 'The goal completion was accepted. Write your final answer to the user now as plain text. Do not call tools or describe what you will do next.' });
+      debug.log('goal.loop', 'completion-await-final', { turn, progressChars: lastToolRoundText.length, phase: lastToolRoundTextPhase ?? 'unknown' }, { level: 'info' });
+    }
+    if (hasAcceptedCompletion && hasVisibleAnswer && !completionNeedsFinalTurn) {
+      const answer = lastToolRoundText.trim().length > 0 ? lastToolRoundText : '';
+      const visiblePriorAnswer = opts.terminalPriorAnswerVisible === true;
+      debug.log('goal.loop', 'accepted-terminal-completion-finish', {
+        turn, answerChars: answer.length, priorAnswerVisible: visiblePriorAnswer,
+        tools: pendingCalls.map((call) => call.name),
+      }, { level: 'info' });
+      // Every text delta was already streamed above (and fullText accumulates
+      // all rounds). A second onText here would violate the cumulative-full
+      // contract and duplicate text shown before this terminal tool call.
+      const finalAnswer = answer || (opts.terminalPriorAnswerVisible ? fullText.trim() : '');
+      emitTurnComplete(finalAnswer);
+      return finalAnswer;
+    }
     // TUI-GOAL-LOOP-FRICTION(#63) — 종결 신호뿐인 턴 ⊕ 같은 턴에 쓴 답 = 이 턴이 최종 답이다.
     //   다음 모델 턴을 열면 할 말이 없는 모델이 빈 턴을 되풀이하고 `[NO FINAL SYNTHESIS]` 가 붙는다(10-15 22:36Z 표본).
     //   이 턴에 답이 없으면 종전처럼 다음 턴을 연다(앞 라운드 글은 «하겠습니다» 류 서술일 수 있다 — 모델이 답을 쓰게).
-    if (terminalOnlyTurn && !hardStopText && !postToolResultUserNote && turnText.trim().length > 0) {
+    if (terminalOnlyTurn && !completionNeedsFinalTurn && !hardStopText && !postToolResultUserNote && turnText.trim().length > 0) {
       const answer = turnText;
       debug.log('goal.loop', 'terminal-signal-finish', {
         turn, maxTurns, tools: pendingCalls.map((call) => call.name), answerChars: answer.length,
@@ -11400,6 +11677,7 @@ export async function streamLLMWithTools(
   let synthesizedText: string | null = null;
   const shouldForceSynthesisOnBudget =
     loopTermination === 'budget-exhausted'
+    && !codexContinuationNeeded
     && !forceSynthesisAttempted
     && (modelFamily === 'gemini'
       || applyCodexBehaviorGuard('force-synthesis', effectiveModel, codexGuardCandidate, true));
@@ -11867,6 +12145,8 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         const responsesUrl = cfgBase
           ? (cfgBase.endsWith('/responses') ? cfgBase : `${cfgBase.replace(/\/$/, '')}/responses`)
           : `${CODEX_API_BASE_URL}/responses`;
+        const endpointSupportsStore = !responsesUrl.includes('chatgpt.com/backend-api');
+        const useStore = endpointSupportsStore && cfg.codexStore !== false;
         // Image-pipeline P3 (2026-05-05) — gate the function_call_output
         // ContentItem[] wire on the active model. gpt-5 family supports
         // image_url in tool results; legacy gpt-4 / non-vision routes
@@ -11886,6 +12166,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         const { instructions, input } = messagesToResponsesInput(messages, {
           acceptToolImages: codexAcceptToolImages,
           acceptUserMessageImages: codexAcceptUserImages,
+          replayCodexReasoning: !useStore,
           onOrphanToolResult: (callId) => {
             try { debug.log('llm.codex', 'orphan-tool-output-dropped', { callId }); }
             catch { /* observation must not block the request */ }
@@ -11935,12 +12216,17 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         // wave for ChatGPT regardless of cfg.codexStore — the
         // infrastructure stays in place for Azure/API-key paths and
         // for any future ChatGPT-side policy change.
-        const endpointSupportsStore = !responsesUrl.includes('chatgpt.com/backend-api');
-        const useStore = endpointSupportsStore && cfg.codexStore !== false;
         const delta = useStore ? getIncrementalItems(lastInput, input) : null;
-        const wireInput = delta ?? input;
+        // A stored continuation already has old reasoning. A full rebase has
+        // no previous_response_id, so it must replay those opaque items.
+        const wireInput = delta ?? (useStore
+          ? messagesToResponsesInput(messages, {
+              acceptToolImages: codexAcceptToolImages,
+              acceptUserMessageImages: codexAcceptUserImages,
+            }).input
+          : input);
         const wirePrevId = (delta && lastResponseId) ? lastResponseId : undefined;
-        yield* streamCodexResponsesEvents(responsesUrl, tokens.accessToken, {
+        let requestBody = {
           model: opts.model || model,
           instructions,
           input: wireInput,
@@ -11954,8 +12240,77 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
           // can disable via llm.codexStore=false.
           store: useStore,
           ...(wirePrevId ? { previousResponseId: wirePrevId } : {}),
-        }, opts.signal, {
+        };
+        const requestGuard = opts.requestSizeGuard;
+        const promptCache = opts.promptCache !== false;
+        let serializedWireBody: string | undefined;
+        if (requestGuard) {
+          serializedWireBody = serializeCodexResponsesWireBody(requestBody, promptCache);
+          let requestChars = serializedWireBody.length;
+          const initialRequestChars = requestChars;
+          let requestCompacted = false;
+          let requestCompactReason = requestChars > requestGuard.maxChars
+            ? 'store-threading-skipped'
+            : 'under-cap';
+          if (requestChars > requestGuard.maxChars && !useStore) {
+            try {
+              const compacted = await requestGuard.compactMessages(messages, {
+                provider: 'openai-codex', requestChars, maxChars: requestGuard.maxChars,
+              });
+              if (compacted) {
+                const compactInput = messagesToResponsesInput(compacted.messages, {
+                  acceptToolImages: codexAcceptToolImages,
+                  acceptUserMessageImages: codexAcceptUserImages,
+                  // Compaction runs only when store threading is off, matching
+                  // the original non-threaded wire input policy.
+                  replayCodexReasoning: !useStore,
+                });
+                const compactBody = { ...requestBody, instructions: compactInput.instructions, input: compactInput.input };
+                const compactWireBody = serializeCodexResponsesWireBody(compactBody, promptCache);
+                const compactChars = compactWireBody.length;
+                if (compactChars < requestChars) {
+                  messages.splice(0, messages.length, ...compacted.messages);
+                  requestBody = compactBody;
+                  serializedWireBody = compactWireBody;
+                  requestChars = compactChars;
+                  requestCompacted = true;
+                  requestCompactReason = compactChars > requestGuard.maxChars
+                    ? `compaction-still-over-cap:${compacted.reason}`
+                    : compacted.reason;
+                } else {
+                  requestCompactReason = 'compaction-no-reduction';
+                }
+              } else {
+                requestCompactReason = 'compaction-no-op';
+              }
+            } catch (error) {
+              requestCompactReason = 'compaction-error';
+              debug.log('llm.request', 'request-size-compact-error', {
+                provider: 'openai-codex',
+                requestChars,
+                maxChars: requestGuard.maxChars,
+                message: error instanceof Error ? error.message : String(error),
+              }, { level: 'warn' });
+            }
+          }
+          requestGuard.onMeasured?.({
+            provider: 'openai-codex', requestChars, maxChars: requestGuard.maxChars,
+            compacted: requestCompacted, reason: requestCompactReason,
+            ...(requestCompacted ? { previousChars: initialRequestChars } : {}),
+          });
+          debug.log('llm.request', 'request-size-compact', {
+            provider: 'openai-codex',
+            beforeChars: initialRequestChars,
+            afterChars: requestChars,
+            maxChars: requestGuard.maxChars,
+            compacted: requestCompacted,
+            reason: requestCompactReason,
+          });
+        }
+        yield* streamCodexResponsesEvents(responsesUrl, tokens.accessToken, requestBody, opts.signal, {
           accountId,
+          promptCache,
+          ...(serializedWireBody ? { serializedWireBody } : {}),
           // Capture the new response id from the SSE stream so the
           // next call can thread it. If the backend skips the event
           // lastResponseId stays undefined and we fall back to full

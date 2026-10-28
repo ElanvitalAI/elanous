@@ -25,6 +25,8 @@ const toolBody = (text: string): LogEntry => ({ kind: 'tool-body', text });
 const TOOL_OUTPUT = body(4);
 /** When set, the mocked tool loop throws this exact object (SK1 failure path). */
 let streamFailure: Error | null = null;
+let streamWaitForAbort = false;
+let observedStreamSignal: AbortSignal | undefined;
 
 const testProvider: LLMProvider = {
   name: 'test',
@@ -41,7 +43,15 @@ mock.module('../llm.js', () => ({
   streamLLMWithTools: async (
     _messages: LLMMessage[],
     handlers: StreamWithToolsHandlers,
+    opts?: { signal?: AbortSignal },
   ) => {
+    if (streamWaitForAbort) {
+      observedStreamSignal = opts?.signal;
+      return await new Promise<string>((_resolve, reject) => {
+        if (opts?.signal?.aborted) reject(opts.signal.reason ?? new Error('aborted'));
+        else opts?.signal?.addEventListener('abort', () => reject(opts.signal?.reason ?? new Error('aborted')), { once: true });
+      });
+    }
     if (streamFailure) throw streamFailure;
     const call = { id: 'call-1', name: 'Read', args: { file_path: '/tmp/demo.txt' } };
     handlers.onToolCall?.(call);
@@ -84,6 +94,25 @@ async function runExecuteSkill(foldMode?: FoldMode) {
   }, opts);
   return { display, folds, result };
 }
+
+describe('executeSkill cancellation', () => {
+  test('passes AbortSignal to streamLLMWithTools and settles when the stream aborts', async () => {
+    const controller = new AbortController();
+    streamWaitForAbort = true;
+    observedStreamSignal = undefined;
+    const run = executeSkill(demoManifest, '', () => {}, { signal: controller.signal });
+    setTimeout(() => controller.abort(new Error('follow-up budget exhausted')), 5);
+
+    try {
+      await expect(run).rejects.toThrow('follow-up budget exhausted');
+      expect(observedStreamSignal).toBe(controller.signal);
+      expect(observedStreamSignal?.aborted).toBe(true);
+    } finally {
+      streamWaitForAbort = false;
+      observedStreamSignal = undefined;
+    }
+  });
+});
 
 describe('skillFoldRenderOpts', () => {
   test('omitted foldMode keeps the empty RenderOpts that renderLogEntry already defaults to line', () => {
@@ -187,6 +216,8 @@ describe('executeSkill feedback ledger (SK1)', () => {
       expect(existsSync(join(demoManifest.skillDir, '.skill-feedback.jsonl'))).toBe(false);
     } finally {
       streamFailure = null;
+      streamWaitForAbort = false;
+      observedStreamSignal = undefined;
       if (prevState === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = prevState;
       rmSync(root, { recursive: true, force: true });
@@ -223,6 +254,8 @@ describe('executeSkill feedback ledger (SK1)', () => {
       expect(readFileSync(blocker, 'utf8')).toBe('not a directory');
     } finally {
       streamFailure = null;
+      streamWaitForAbort = false;
+      observedStreamSignal = undefined;
       if (prevState === undefined) delete process.env.ELANOUS_STATE_DIR;
       else process.env.ELANOUS_STATE_DIR = prevState;
       rmSync(root, { recursive: true, force: true });

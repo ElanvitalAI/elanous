@@ -22,6 +22,19 @@ export function savedMessageToRaws(m: SavedMessage): RawIntakeItem[] {
 }
 
 function cursorFile(root: string): string { return join(intakeLedgerDir(root), 'telegram-saved.cursor.json'); }
+function recoveryFile(root: string): string { return join(intakeLedgerDir(root), 'telegram-saved.recovery.json'); }
+
+function readRecoveryCursor(root: string): number | undefined {
+  try {
+    const cursor = Number(JSON.parse(readFileSync(recoveryFile(root), 'utf8')).lastId);
+    return Number.isSafeInteger(cursor) ? cursor : undefined;
+  } catch { return undefined; }
+}
+
+function writeRecoveryCursor(root: string, lastId: number): void {
+  mkdirSync(intakeLedgerDir(root), { recursive: true });
+  writeFileSync(recoveryFile(root), JSON.stringify({ lastId }) + '\n');
+}
 
 export function readSavedCursor(root: string): number {
   try { return Number(JSON.parse(readFileSync(cursorFile(root), 'utf8')).lastId) || 0; } catch { return 0; }
@@ -89,7 +102,27 @@ export function renderCollectTelegramSavedResult(res: CollectSavedResult): strin
  */
 export async function collectTelegramSaved(root: string, fetch: FetchSavedMessages, opts: { max: number; dryRun?: boolean }): Promise<CollectSavedResult> {
   const cursorBefore = readSavedCursor(root);
-  const messages = await fetch(cursorBefore, opts.max);
+  const fetched = await fetch(cursorBefore, opts.max);
+  let messages = fetched.filter((message) => Number.isSafeInteger(message.id) && message.id > cursorBefore);
+  // A cursor may have advanced without this consumer seeing the bounded interval. Scan that span
+  // once for each cursor value, even when the forward read has newer messages. Telegram's minId is
+  // exclusive, so include the cursor ID because another consumer may have consumed it.
+  if (cursorBefore > 0 && readRecoveryCursor(root) !== cursorBefore) {
+    const recoveryLimit = Math.max(1, opts.max);
+    let recoveryFrom = Math.max(0, cursorBefore - recoveryLimit - 1);
+    const recovered: SavedMessage[] = [];
+    while (recoveryFrom < cursorBefore) {
+      const recovery = await fetch(recoveryFrom, recoveryLimit);
+      const page = recovery.filter((message) => Number.isSafeInteger(message.id)
+        && message.id > recoveryFrom && message.id <= cursorBefore);
+      recovered.push(...page);
+      if (page.length < recoveryLimit) break;
+      const nextFrom = page.reduce((last, message) => Math.max(last, message.id), recoveryFrom);
+      if (nextFrom <= recoveryFrom) break;
+      recoveryFrom = nextFrom;
+    }
+    messages = [...recovered, ...messages];
+  }
   const rowsPerMessage = messages.map(savedMessageToRaws);
   const raws = rowsPerMessage.flat();
   const droppedByFilter = rowsPerMessage.filter((rows) => rows.length === 0).length;
@@ -98,6 +131,8 @@ export async function collectTelegramSaved(root: string, fetch: FetchSavedMessag
   if (!opts.dryRun) {
     result.ingest = ingestIntakeItems(root, 'telegram-saved', raws);
     if (cursorAfter > cursorBefore) writeSavedCursor(root, cursorAfter);
+    // The marker commits the scan only after ingestion succeeds; keep it monotonic at the saved cursor boundary.
+    writeRecoveryCursor(root, Math.max(cursorAfter, cursorBefore));
   }
   // ⛔ 본문·링크는 싣지 않는다 — 커서와 건수만. 두 축(메시지·원장 입력)을 따로 남겨 사흘 0 을 갈라 읽게.
   debug.log('intake.collect', 'telegram-saved', {

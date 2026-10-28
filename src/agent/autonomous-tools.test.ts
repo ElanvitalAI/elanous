@@ -75,6 +75,8 @@ describe('autonomous-tools — Phase 1 골든룰(이름배열 diff=0)', () => {
     await dispatchAutonomousTool('SelfImplement', { feature: '요약된 구현 요청' }, {
       cwd: process.cwd(),
       signal: new AbortController().signal,
+      sessionId: 'session-autonomous-test',
+      toolCallId: 'tool-call-autonomous-test',
       userText,
       selfImplementDispatch: async (args, ctx) => {
         receivedCtx = ctx;
@@ -88,5 +90,7 @@ describe('autonomous-tools — Phase 1 골든룰(이름배열 diff=0)', () => {
     });
 
     expect(receivedCtx?.userText).toBe(userText);
+    expect(receivedCtx?.sessionId).toBe('session-autonomous-test');
+    expect(receivedCtx?.toolCallId).toBe('tool-call-autonomous-test');
   });
 });

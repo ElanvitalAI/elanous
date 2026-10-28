@@ -283,6 +283,29 @@ test('구현 counts card-bound runs whose own ledger recorded a successful merge
   expect(empty.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: 0, shadow: 0, state: 'none' });
 });
 
+test('KNOWHOW-PACK isolated card and run ledgers distinguish null implementation from unreadable input and bound cleanup outcomes', () => {
+  const base: TaskAgentCoverInput = { taskAgentActions: [], liveLandMoves: [], allLands: [], goalAsks: [], goalRuns: [],
+    implementCardRuns: [{ cardId: 'c1', runId: 'run-1' }], implementRunMerges: new Map([['run-1', { merged: true }]]),
+    cleanupCards: [{ cardId: 'c1', outcome: 'complete' }, { cardId: 'c1', outcome: 'complete' },
+      { cardId: 'c2', outcome: 'partial' }],
+  };
+  const measured = measureSevenVerbLive(base);
+  expect(measured.verbs[5]).toMatchObject({ liveDone: 1, state: 'live' });
+  expect(measured.verbs[6]).toEqual({ verb: '정리', source: 'card:postland-card+postLand', liveDone: 1, shadow: 0, state: 'live' });
+  expect(measured.liveVerbs).toBe(2);
+  expect(measureSevenVerbLive({ ...base, cleanupCards: [{ cardId: 'c2', outcome: 'partial' }] }).verbs[6])
+    .toMatchObject({ liveDone: 0, state: 'none' });
+  const missingCleanup = measureSevenVerbLive({ ...base, cleanupCards: null });
+  expect(missingCleanup.verbs[6]).toMatchObject({ liveDone: null, state: 'unreadable' });
+  expect(formatSevenVerbLive(missingCleanup)).toBe('7동사 live -/7 · 못 잼(정리 카드 원장 null·절단)');
+  expect(measureSevenVerbLive({ ...base, implementCardRuns: null }).verbs[5])
+    .toMatchObject({ reason: 'card-ledger-null', liveDone: null, state: 'unreadable' });
+  expect(measureSevenVerbLive({ ...base, implementRunMerges: null }).verbs[5])
+    .toMatchObject({ reason: 'run-ledger-null', liveDone: null, state: 'unreadable' });
+  expect(measureSevenVerbLive({ ...base, truncated: { taskAgentActions: false, allLands: false, implementRunMerges: true } }).verbs[5])
+    .toMatchObject({ reason: 'run-ledger-truncated', liveDone: null, state: 'unreadable' });
+});
+
 test('구현 stays no-source unwired, and unreadable card or merge ledgers never read as zero', () => {
   // 배선 없음(기본) — 종전 계약 그대로 no-source.
   const unwired = measureSevenVerbLive({ taskAgentActions: [], allLands: [], goalAsks: [], goalRuns: [] });
@@ -296,7 +319,7 @@ test('구현 stays no-source unwired, and unreadable card or merge ledgers never
     { implementCardRuns: [{ cardId: 'c-merged', runId: 'run-merged' }], implementRunMerges: new Map(), truncated: { taskAgentActions: false, allLands: false, implementRunMerges: true } },
   ]) {
     const unknown = measureSevenVerbLive({ taskAgentActions: [], allLands: [], goalAsks: [], goalRuns: [], ...patch });
-    expect(unknown.verbs[5]).toEqual({ verb: '구현', source: 'card-run+merged', liveDone: null, shadow: null, state: 'unreadable' });
+    expect(unknown.verbs[5]).toMatchObject({ verb: '구현', source: 'card-run+merged', liveDone: null, shadow: null, state: 'unreadable' });
     expect(unknown.liveVerbs).toBeNull();
     expect(formatSevenVerbLive(unknown)).toBe('7동사 live -/7 · 못 잼(구현 카드·런 원장 null·절단) · 출처 없음 정리');
   }

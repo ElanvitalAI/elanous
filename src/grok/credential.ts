@@ -345,6 +345,11 @@ function readGrokCredential(opts: {
   return null;
 }
 
+/** Read-only credential check for synchronous provider availability. Never refreshes or calls the network. */
+export function peekGrokCredential(opts: { home?: string; model?: string } = {}): GrokCredential | null {
+  return readGrokCredential(opts);
+}
+
 export interface ResolveGrokCredentialOpts {
   env?: NodeJS.ProcessEnv;
   home?: string;

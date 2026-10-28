@@ -72,6 +72,12 @@ export function ensureDeviceFirstSteps(goal: string, steps: readonly string[], r
   const evidenceCommand = /완료\s*경계\s*증거\s*명령\s*[:：]\s*([^\r\n]+)/u.exec(goal)?.[1] ?? '';
   const goalFeatureTest = [evidenceCommand, goal].flatMap((text) => [...text.matchAll(/(?:src|test)\/[\w./-]+\.test\.[cm]?[jt]sx?/gu)]
     .map((match) => match[0])).find((path) => path !== test && !path.startsWith('src/ux-sim/'));
+  // ⭐ TDD 를 로직으로(S4) — 문면이 아니라 로직 판정에 필요한 RED→GREEN 기록 필드를 조각 계획에 실어
+  //   넘긴다. 오케스트레이터가 [tdd-red]/[tdd-green] 기록의 태그·같은 명령·결과를 판정한다(문면 유지).
+  const tddRecordFields = 'TDD 기록 필드: 첫 조각 커밋에 피처 시험을 먼저 쓰고 구현 전 실행 RED 기록을 남긴다'
+    + " — 'EVIDENCE: [tdd-red] <무엇을 확인했나> || <증거 명령>' 다음 줄 'RESULT: <실패 요약 한 줄>'"
+    + " · 구현 뒤 같은 명령의 GREEN 기록을 남긴다 — 'EVIDENCE: [tdd-green] <무엇을 확인했나> || <같은 증거 명령>' 다음 줄 'RESULT: <통과 요약 한 줄>'"
+    + ' · 오케스트레이터가 두 기록의 태그·같은 명령·결과를 로직으로 판정하고 없으면 수리 라운드를 돌린다';
   const completeFeatureStage = (stage: string, index: number): string => {
     const withPredecessor = stage.includes(predecessor) ? stage : `${stage}\n${predecessor}`;
     const declaredGoalTest = index === 0 ? goalFeatureTest : undefined;
@@ -87,10 +93,10 @@ export function ensureDeviceFirstSteps(goal: string, steps: readonly string[], r
       ? stageSource.replace(/\.ts$/u, '.test.ts') : undefined;
     const featureTest = declaredGoalTest ?? stageTest
       ?? (existingSiblingTest && existsSync(join(root!, existingSiblingTest)) ? existingSiblingTest : undefined);
-    if (!featureTest) return `${withoutWrongPlan}\n검증 계획(TDD): 시험 경로 미확정(${stageSource ? `${stageSource}의 시험 확장자 미정` : '조각 대상 경로 없음'}) · 이 조각에서 시험 경로를 먼저 정하고 RED 실패 뒤 같은 명령으로 GREEN을 확인한다.`;
+    if (!featureTest) return `${withoutWrongPlan}\n검증 계획(TDD): 시험 경로 미확정(${stageSource ? `${stageSource}의 시험 확장자 미정` : '조각 대상 경로 없음'}) · 이 조각에서 시험 경로를 먼저 정하고 RED 실패 뒤 같은 명령으로 GREEN을 확인한다. ${tddRecordFields}`;
     const inventory = root === undefined ? '시험 재고 미측정(대상 루트 미상)'
       : existsSync(join(root, featureTest)) ? '기존 시험' : '신규 시험(이 조각에서 먼저 신설)';
-    return `${withoutWrongPlan}\n검증 계획(TDD): ${inventory} ${featureTest} · 피처 시험 bun test ${featureTest}를 구현 전에 RED로 확인하고 생산 경로를 구현한 뒤 같은 명령으로 GREEN을 확인한다.`;
+    return `${withoutWrongPlan}\n검증 계획(TDD): ${inventory} ${featureTest} · 피처 시험 bun test ${featureTest}를 구현 전에 RED로 확인하고 생산 경로를 구현한 뒤 같은 명령으로 GREEN을 확인한다. ${tddRecordFields}`;
   };
   const targetPaths = [decision.device, test].filter((path) => root !== undefined && existsSync(join(root, path)));
   const newPaths = [decision.device, test].filter((path) => !targetPaths.includes(path));

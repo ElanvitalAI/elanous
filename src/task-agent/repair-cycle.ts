@@ -532,7 +532,7 @@ export async function runRepairCycle(input: RepairCycleInput): Promise<RepairCyc
     else {
       passJourneyNode('next-move', { provenance: 'task-agent-repair', outcome: judged.judgement.move, runId,
         data: { card: card.id, source: `pr:${pr}`, pr, head, branch, mustFix: input.mustFix, moveId } });
-      recordJourneyEdge(judged.route, 'dispatch', undefined, { moveId });
+      recordJourneyEdge(judged.route, 'dispatch', undefined, { moveId, runId, card: card.id, pr, head });
     }
   } catch (error) {
     const detail = `repair observation failed after worker launch: ${error instanceof Error ? error.message : String(error)}`;

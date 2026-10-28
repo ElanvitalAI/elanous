@@ -106,10 +106,14 @@ export async function scanOriginMainExport(): Promise<{ mainSha: string; files: 
     try { code = runPublicExport(['--leak-check', '--json'], snapshot); }
     finally { console.log = originalLog; console.error = originalError; }
     const report = JSON.parse(output.trim()) as {
-      files?: number; leaks?: number; hits?: Array<{ marker: string }>; codeLiterals?: { hits?: number };
+      files?: number; leaks?: number; hits?: Array<{ marker: string; file?: string; line?: number }>; codeLiterals?: { hits?: number };
       privateRedactions?: { loaded?: boolean };
     };
-    if (report.privateRedactions?.loaded !== true) throw new Error('개인 치환표를 읽지 못해 export 누수 검사를 완결할 수 없다');
+    if (report.privateRedactions?.loaded !== true) {
+      const failure = report.hits?.find((hit) => hit.marker.startsWith('private-redaction-'));
+      if (failure) throw new Error(`공개 export 개인 치환 실패: ${failure.marker} ${failure.file ?? ''}:${failure.line ?? 0}`);
+      throw new Error('개인 치환표를 읽지 못해 export 누수 검사를 완결할 수 없다');
+    }
     if (typeof report.files !== 'number' || typeof report.leaks !== 'number') throw new Error('public-export 검사 결과가 완전하지 않다');
     if (code !== (report.leaks > 0 ? 1 : 0)) throw new Error(`public-export 종료 코드와 누수 결과 불일치: rc=${code} leaks=${report.leaks}`);
     return { mainSha, files: report.files, leaks: report.leaks, codeLiterals: report.codeLiterals?.hits ?? 0 };

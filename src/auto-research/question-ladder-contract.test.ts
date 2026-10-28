@@ -34,6 +34,30 @@ describe('research question/evidence contract', () => {
     expect(parsed.value.questions.map(question => question.level)).toEqual([1, 2, 3, 4, 5, 6]);
   });
 
+  it('binds questions to declared output sections when a Working Backwards contract supplies section ids', () => {
+    const sectionIds = ['causes', 'uncertainty'];
+    const prompt = buildResearchQuestionLadderPrompt('Compare bond yields', sectionIds);
+    expect(prompt).toContain('Assign every question to exactly one output section using sectionId');
+    expect(prompt).toContain('sectionId from: causes, uncertainty');
+    const questions = Array.from({ length: 6 }, (_, index) => ({
+      id: `q${index + 1}`,
+      level: index + 1,
+      prompt: `Question ${index + 1}`,
+      searchTerms: [`term-${index + 1}`],
+      sectionId: sectionIds[index % sectionIds.length],
+    }));
+    const parsed = parseSixLevelResearchQuestionLadder({ request: 'Compare bond yields', questions }, sectionIds);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.value.questions.map((question) => question.sectionId)).toEqual([
+      'causes', 'uncertainty', 'causes', 'uncertainty', 'causes', 'uncertainty',
+    ]);
+    expect(parseSixLevelResearchQuestionLadder({
+      request: 'Compare bond yields', questions: questions.map((question, index) =>
+        index === 5 ? { ...question, sectionId: 'unlisted' } : question),
+    }, sectionIds)).toMatchObject({ ok: false, reason: 'questions[5] requires sectionId from the output contract' });
+  });
+
   it('rejects missing levels and empty per-level search terms', () => {
     const questions = Array.from({ length: 6 }, (_, index) => ({
       id: `q${index + 1}`,

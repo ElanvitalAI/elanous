@@ -234,8 +234,12 @@ test('repeat-stop claims its owner message before a reentrant tick and retries a
   expect(readTaskCard(f.card.id, f.statePath)?.history.filter((entry) => entry.event === 'repair-repeat-owner-sent')).toHaveLength(1);
 });
 
-test('accepted repair worker takes the declared next-move → dispatch edge once with the source PR and run identity', async () => {
+test('accepted repair worker joins next-move edge identity without losing ambient journey fields', async () => {
   const f = fixture();
+  const previousJourneyKey = process.env.ELANOUS_JOURNEY_KEY;
+  const previousQueueLaunchId = process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+  process.env.ELANOUS_JOURNEY_KEY = 'journey-test';
+  process.env.ELANOUS_HARNESS_QUEUE_LAUNCH = 'queue-test';
   const edges: Array<Record<string, unknown>> = [];
   const off = debug.registerSink({ name: 'ta-next-move-edge-test', emit: (record) => {
     if (record.category === 'self-implement' && record.event === 'graph-edge-taken') edges.push(record.data as Record<string, unknown>);
@@ -248,10 +252,19 @@ test('accepted repair worker takes the declared next-move → dispatch edge once
     expect(edges).toHaveLength(1);
     expect(edges[0]).toMatchObject({ graphId: 'self-implement', from: 'next-move', on: 'move', label: 'narrow-relaunch',
       to: 'dispatch', source: 'graph', taken: 'dispatch', honored: true });
-    expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]).toMatchObject({ pr: 30, head: A, runId: launched[0]!.runId, status: 'requested' });
+    const request = launched[0]!;
+    expect(edges[0]).toMatchObject({ runId: request.runId, card: request.card, pr: request.pr, head: request.head,
+      moveId: request.moveId, journeyKey: 'journey-test', queueLaunchId: 'queue-test' });
+    expect(readTaskCard(f.card.id, f.statePath)?.repairs?.[0]).toMatchObject({ pr: 30, head: A, runId: request.runId, status: 'requested' });
     expect((await runRepairCycle(f.input({ request: async () => { throw new Error('duplicate launch'); } }))).decision).toBe('repair-pending');
     expect(edges).toHaveLength(1);
-  } finally { off(); }
+  } finally {
+    off();
+    if (previousJourneyKey === undefined) delete process.env.ELANOUS_JOURNEY_KEY;
+    else process.env.ELANOUS_JOURNEY_KEY = previousJourneyKey;
+    if (previousQueueLaunchId === undefined) delete process.env.ELANOUS_HARNESS_QUEUE_LAUNCH;
+    else process.env.ELANOUS_HARNESS_QUEUE_LAUNCH = previousQueueLaunchId;
+  }
 });
 
 test('observation failure after a worker starts leaves its repair requested and prevents a second launch', async () => {

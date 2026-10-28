@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GoalRunRecord } from '../../self-implement/goal-run-store.js';
+import { defaultGoalAuthorSelfResolve } from '../../self-implement/goal-author-clarification.js';
 import { readReportOrigin } from '../../self-implement/report-origin.js';
 import { queryRunningRuns } from '../../self-implement/running-runs.js';
 import { LogStore } from '../../mss/logging/log-store.js';
@@ -41,6 +42,7 @@ const goalRun = (
 describe('harness API handlers', () => {
   test('ask returns 202 before authoring settles, then invokes shared authoring and detached launch', async () => {
     const askCalls: unknown[] = [];
+    let askDeps: unknown;
     const launchCalls: unknown[] = [];
     const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
     const feedback: unknown[] = [];
@@ -50,8 +52,9 @@ describe('harness API handlers', () => {
       createAcceptanceId: () => 'accept-1',
       createFeedbackEmitter: (acceptanceId) => (env) => { feedback.push({ acceptanceId, env }); },
       log: (event, data) => logs.push({ event, data }),
-      runAskLaunchFlow: async (input) => {
+      runAskLaunchFlow: async (input, deps) => {
         askCalls.push(input);
+        askDeps = deps;
         return await askPending as never;
       },
       launchDevGoalFileDetached: async (input) => { launchCalls.push(input); },
@@ -60,6 +63,7 @@ describe('harness API handlers', () => {
     expect(await response.json()).toEqual({ accepted: true, acceptanceId: 'accept-1', entrance: 'daemon-harness-ask' });
     await Bun.sleep(0);
     expect(askCalls).toHaveLength(1);
+    expect((askDeps as { selfResolveClarification?: unknown }).selfResolveClarification).toBe(defaultGoalAuthorSelfResolve);
     expect(askCalls[0]).toMatchObject({ askText: '대상 경로: src/x.ts', inputSource: 'say', entrance: { id: 'daemon-harness-ask' } });
     expect(launchCalls).toEqual([]);
 

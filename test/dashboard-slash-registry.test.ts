@@ -54,7 +54,7 @@ test('essential slashes remain registered while VW slashes are absent', () => {
     expect(displayedSlashCommandNames()).not.toContain(command);
   }
   expect(names).toContain('paste');
-  expect(displayedSlashCommandNames()).toContain('paste');
+  expect(displayedSlashCommandNames()).not.toContain('paste');
 });
 
 /**
@@ -671,7 +671,7 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
     }
   });
 
-  test('help / ? → scrollable chat at 160×40 when readable lines exceed the modal', async () => {
+  test('help / ? → the compact menu fits the 160×40 modal', async () => {
     const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
     const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
     try {
@@ -683,8 +683,8 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
         const r = await reg.dispatch(name, [], ctx);
         expect(r.kind).toBe('continue');
         expect(state.helpCalls).toEqual([]);
-        expect(state.helpModalCalls).toHaveLength(0);
-        const lines = ctx.chatLines;
+        expect(state.helpModalCalls).toHaveLength(1);
+        const lines = state.helpModalCalls[0]!.lines;
         expect(lines.length).toBeGreaterThan(0);
         expect(lines.join('\n')).not.toContain('Focus left pane');
         expect(lines.join('\n')).not.toContain('Focus right pane');
@@ -692,9 +692,8 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
         expect(lines.join('\n')).toContain('/model (m)  ');
         expect(lines.join('\n')).toContain('/quit (q, exit)  ');
         expect(lines.join('\n')).toContain('Ctrl+W');
-        const modalContentRows = Math.max(Math.min(6, Math.max(3, 40 - 2)), Math.min(40 - 4, Math.floor(40 * 0.7))) - 2;
-        expect(lines.length).toBeGreaterThan(modalContentRows);
-        expect(lines[0]).toContain('scroll the chat log');
+        expect(lines.join('\n')).not.toContain('/research');
+        expect(lines.join('\n')).not.toContain('/directive');
         expect(lines.join('\n')).not.toMatch(/[│╭╰┌┐└┘─]/);
       }
     } finally {
@@ -709,18 +708,17 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
     const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
     const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
     try {
-      // TUI-SLASH-DECIDE-NOW C: group head lines (시작 ⊕ seven verbs ⊕ 그 밖) make the catalog taller,
-      // so the modal case uses a taller terminal; 160×40 still falls back to the scrollable chat log.
+      // The compact 15-command menu fits at 160×40; the taller case checks that the modal remains readable.
       for (const [cols, rows] of [[160, 40], [220, 80]] as const) {
         Object.defineProperty(process.stdout, 'columns', { configurable: true, value: cols });
         Object.defineProperty(process.stdout, 'rows', { configurable: true, value: rows });
         const registry = buildDashboardSlashRegistry();
         const { ctx, state } = makeFakeCtx();
         await registry.dispatch('help', [], ctx);
-        expect(state.helpModalCalls).toHaveLength(cols === 160 ? 0 : 1);
+        expect(state.helpModalCalls).toHaveLength(1);
         const allLines = state.helpModalCalls.length ? state.helpModalCalls[0]!.lines : ctx.chatLines;
         const registered = new Set(registry.names());
-        const expectedCommands = SLASH_COMMANDS.filter((command) => registered.has(command.name));
+        const expectedCommands = SLASH_COMMANDS.filter((command) => !command.hidden && registered.has(command.name));
         const commandText = allLines.slice(allLines.indexOf('Commands') + 1, allLines.indexOf('')).join('\n');
         const labels = expectedCommands.map((command) => {
           const aliases = (command.aliases ?? []).filter((alias) => registered.has(alias));
@@ -730,8 +728,9 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
         const lastLabel = labels.at(-1)!;
         expect(commandText).toContain(lastLabel);
         expect(commandText).not.toMatch(/(?:H\d+ P\d+|CV-\d+|Sprint \d+|Showroom v2)/);
-        expect(commandText).toContain('/handoff  cross-agent');
-        expect(commandText).toContain('/showroom  multi-LLM');
+        expect(commandText).toContain('/session (sess)');
+        expect(commandText).not.toContain('/handoff');
+        expect(commandText).not.toContain('/showroom');
         expect(allLines.join('\n')).not.toContain('Focus left pane');
         expect(allLines.join('\n')).not.toContain('Focus right pane');
         expect(allLines.join('\n')).toContain('/session (sess)  ');
@@ -753,9 +752,6 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
           } finally {
             modal.dispose();
           }
-        } else {
-          expect(ctx.chatLines[0]).toContain('scroll the chat log');
-          expect(ctx.chatLines.at(-1)).toContain('Ctrl+↑  ');
         }
       }
     } finally {
@@ -828,7 +824,7 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
     const text = commandLines.join('\n');
     // TUI-SLASH-DECIDE-NOW C: commands appear once each, in group order, by name inside a group.
     const groupRank = new Map(HELP_GROUP_ORDER.map((group, index) => [group, index]));
-    const orderedCommands = SLASH_COMMANDS.filter(({ name }) => registered.has(name))
+    const orderedCommands = SLASH_COMMANDS.filter(({ name, hidden }) => !hidden && registered.has(name))
       .sort((a, b) => (groupRank.get(helpGroupFor(a.name))! - groupRank.get(helpGroupFor(b.name))!) || a.name.localeCompare(b.name));
     let previousPosition = -1;
     for (const command of orderedCommands) {

@@ -709,16 +709,16 @@ export function buildAgentMissionDevSpec(o: {
 export async function executeAgentMissionReroute(
   spec: DevPipelineSpec,
   agentBackend: AgentBackend,
-  deps?: { runDevPipeline?: typeof runDevPipeline },
+  deps?: { runDevPipeline?: typeof runDevPipeline; signal?: AbortSignal },
 ): Promise<{ result: AgentMissionResult; exitCode: number }> {
   const run = deps?.runDevPipeline ?? runDevPipeline;
-  const r = await run(spec, { resolveBackend: () => agentBackend });
+  const r = await run(spec, { resolveBackend: () => agentBackend, ...(deps?.signal ? { signal: deps.signal } : {}) });
   // ★ 잘못된 라우팅 즉시 표면화 — spec 이 external+pty 가 아니면 kind 불일치(무조건 캐스팅 금지).
   if (r.kind !== 'agent-mission') {
     throw new DevPipelineError(`executeAgentMissionReroute: 예상 밖 dispatch(kind=${r.kind}) — external+pty spec 이어야`);
   }
   const result = r.result;
-  return { result, exitCode: result.ok ? 0 : 2 };
+  return { result, exitCode: result.reason === 'aborted' ? 130 : result.ok ? 0 : 2 };
 }
 
 // ── U4b: self implement 재라우팅 seam(테스트 가능) ──
@@ -2234,6 +2234,7 @@ async function runDevPipelineDispatch(
     const result = await run({
       ...toSelfImplementOptions(text, plan, seams),
       ...(spec.runId ? { runId: spec.runId } : {}),
+      ...(deps.signal ? { signal: deps.signal } : {}),
       onNodeEntry: (node, round) => { walk.push({ node, round }); },
     });
     // ⛔ 「걸음이 비었다」와 「안 걸었다」를 가른다 — 빈 배열은 «싣지 않는다».
@@ -2252,5 +2253,8 @@ async function runDevPipelineDispatch(
   // agent-mission-pty
   const run = deps.runAgentMission ?? (await import('../agent-mission/driver.js')).runAgentMission;
   const resolveBackend = deps.resolveBackend ?? (await import('../agent-mission/driver.js')).resolveBackend;
-  return { plan, kind: 'agent-mission', result: await run(toAgentMissionSpec(text, plan, resolveBackend)) };
+  return { plan, kind: 'agent-mission', result: await run({
+    ...toAgentMissionSpec(text, plan, resolveBackend),
+    ...(deps.signal ? { signal: deps.signal } : {}),
+  }) };
 }

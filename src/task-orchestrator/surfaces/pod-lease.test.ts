@@ -100,7 +100,7 @@ test('GitHub probe create failure has no Pod log identity to claim', async () =>
     const plain = JSON.parse(lines[0]!);
     const observed = JSON.parse(lines[1]!);
     expect(plain).not.toHaveProperty('externalGitHub');
-    expect(observed.externalGitHub.node-b).toEqual(result);
+    expect(observed.externalGitHub['node-b']).toEqual(result);
     for (const key of ['recommended', 'limitedBy', 'capacitySlots', 'memorySlots', 'placeableSlots', 'running', 'pending', 'reserved', 'waitingJobs'])
       expect(observed[key]).toEqual(plain[key]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -140,12 +140,12 @@ test('pod lease status opt-in executes the GitHub Pod probe and exposes its exac
     expect(calls.some((args) => args.includes('create'))).toBe(false);
     expect(plain).not.toHaveProperty('externalGitHub');
     const observed = JSON.parse((await run(['--json', '--github-egress']))[0]!);
-    expect(observed.externalGitHub.node-b).toEqual({ externalDns: true, githubHttps: false,
+    expect(observed.externalGitHub['node-b']).toEqual({ externalDns: true, githubHttps: false,
       measuredAt: expect.any(String), reason: 'GitHub HTTPS failed', podName,
       podLog: 'Server: 10.43.0.10\nName: github.com\nEXTERNAL_DNS_OK\nwget: connection refused\nGITHUB_HTTPS_FAILED\n' });
     expect(podName).toStartWith('elanous-egress-');
     expect(probeLog.mock.calls.filter((entry) => entry[0] === 'pod.lease' && entry[1] === 'github-egress-probe'))
-      .toEqual([['pod.lease', 'github-egress-probe', { context: 'node-b', ...observed.externalGitHub.node-b }]]);
+      .toEqual([['pod.lease', 'github-egress-probe', { context: 'node-b', ...observed.externalGitHub['node-b'] }]]);
     expect(calls.filter((args) => args.includes('create'))).toHaveLength(1);
     expect(calls.filter((args) => args.includes('logs'))[0]).toContain(`pod/${podName}`);
     expect(calls.filter((args) => args.includes('delete'))[0]).toContain(`pod/${podName}`);

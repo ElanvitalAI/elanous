@@ -20,7 +20,7 @@ import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, reviewIntentFingerprint, safeLogText } from './review-observation.js';
-import { checkCitedReviewPathsAtHead } from './review-finding-key.js';
+import { checkCitedReviewPathsAtHead, citedReviewPaths } from './review-finding-key.js';
 import { DEFAULT_REVIEW_BACKEND, defaultAcpReviewTimeoutSec } from './acp-reviewer.js';
 import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
 import { debug } from '../debug/log.js';
@@ -89,9 +89,13 @@ export interface SelfReviewCliOpts {
   context?: string[] | undefined;
   contextText?: string[] | undefined;
   contextOrder?: Array<{ kind: 'file' | 'text'; value: string }> | undefined;
+  /** Skip the default repository-grounded review context pack. */
+  noContextPack?: boolean | undefined;
   json?: boolean | undefined;
   /** Save completed reviews under the task-agent state's review-results directory. */
   save?: string | undefined;
+  /** Review only commits after a previously saved PR review head. */
+  sinceReview?: string | undefined;
   /** One invocation past r5, only for a PR in OP's traffic.json allowlist; the reason is recorded before review starts. */
   overCapReason?: string | undefined;
 }
@@ -175,6 +179,116 @@ interface SavedReviewEvidence {
   heads: string[];
   records: Array<{ head: string; reviewedAt: number }>;
   unreadableFiles: string[];
+}
+
+interface SavedReviewForDelta {
+  file: string;
+  headCommit: string;
+  mustFix: string[];
+  reviewInputChars: number;
+  reviewDurationMs: number;
+}
+
+function selectSavedReviewForDelta(pr: string, selector: string, root = effectiveInstanceRoot()):
+  | { review: SavedReviewForDelta }
+  | { error: string } {
+  const dir = join(root, 'review-results');
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return { error: 'saved-review-directory-missing' }; }
+  const token = selector.trim();
+  if (!token) return { error: 'saved-review-selector-empty' };
+  const records: Array<SavedReviewForDelta & { mtimeMs: number }> = [];
+  for (const name of names) {
+    if (!name.toLowerCase().endsWith('.json')) continue;
+    let raw: unknown;
+    try { raw = JSON.parse(readFileSync(join(dir, name), 'utf8')); } catch { continue; }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const row = raw as Record<string, unknown>;
+    const recordPr = typeof row.pr === 'string' ? row.pr
+      : Number.isSafeInteger(row.pr) ? String(row.pr) : undefined;
+    if (recordPr !== pr || row.reviewed !== true || typeof row.headCommit !== 'string' || !COMMIT_OID.test(row.headCommit)) continue;
+    const named = name === token || name === `${token}.json` || name.startsWith(`${token}-${pr}-`);
+    const byHead = /^[a-f0-9]{7,64}$/i.test(token) && row.headCommit.toLowerCase().startsWith(token.toLowerCase());
+    if (!named && !byHead) continue;
+    if (!Array.isArray(row.mustFix) || !row.mustFix.every((item) => typeof item === 'string')) continue;
+    if (typeof row.reviewInputChars !== 'number' || !Number.isFinite(row.reviewInputChars) || row.reviewInputChars <= 0
+      || typeof row.reviewDurationMs !== 'number' || !Number.isFinite(row.reviewDurationMs) || row.reviewDurationMs <= 0) continue;
+    let mtimeMs = 0;
+    try { mtimeMs = statSync(join(dir, name)).mtimeMs; } catch { continue; }
+    records.push({ file: name, headCommit: row.headCommit.toLowerCase(), mustFix: row.mustFix as string[],
+      reviewInputChars: row.reviewInputChars, reviewDurationMs: row.reviewDurationMs, mtimeMs });
+  }
+  const distinctHeads = [...new Set(records.map((record) => record.headCommit))];
+  if (distinctHeads.length > 1) return { error: 'saved-review-selector-ambiguous' };
+  const selected = records.sort((a, b) => b.mtimeMs - a.mtimeMs)[0];
+  return selected ? { review: selected } : { error: 'saved-review-not-found-or-missing-efficiency-receipt' };
+}
+
+function reviewInputCharacterCount(input: ReviewInput): number {
+  return input.prDiff.length + input.phaseIntent.length + (input.acceptance?.length ?? 0)
+    + (input.evidenceNote?.length ?? 0)
+    + (input.workingMemory?.length ?? 0)
+    + (input.reviewerContext ?? []).reduce((sum, item) => sum + item.label.length + item.body.length, 0);
+}
+
+function readDeltaDiffAtHead(pr: string, base: string, deps: SelfReviewCliDeps):
+  | { read: DiffRead }
+  | { error: string; headCommit?: string } {
+  if (!COMMIT_OID.test(base)) return { error: 'saved-review-head-malformed' };
+  const before = prHeadCommit(pr, deps);
+  if (before.state !== 'known') return { error: 'current-pr-head-unavailable' };
+  if (before.value.toLowerCase() === base.toLowerCase()) return { error: 'no-new-head-since-review', headCommit: before.value };
+  const { repo } = prCompareAnchors(pr, deps);
+  if (!repo) return { error: 'pr-repository-unavailable', headCommit: before.value };
+  const comparePath = `repos/${repo}/compare/${base}...${before.value}`;
+  const comparison = deps.gh(['api', comparePath], 25_000);
+  if (comparison.status !== 0) return { error: 'saved-review-head-not-ancestor', headCommit: before.value };
+  try {
+    const parsed = JSON.parse(comparison.stdout) as { status?: unknown; merge_base_commit?: { sha?: unknown } };
+    if (parsed.status !== 'ahead' || typeof parsed.merge_base_commit?.sha !== 'string'
+      || parsed.merge_base_commit.sha.toLowerCase() !== base.toLowerCase()) {
+      return { error: 'saved-review-head-not-ancestor', headCommit: before.value };
+    }
+  } catch { return { error: 'compare-response-invalid', headCommit: before.value }; }
+  const diff = deps.gh(['api', comparePath, '-H', 'Accept: application/vnd.github.diff'], 25_000);
+  if (diff.status !== 0 || !diff.stdout.trim()) return { error: 'delta-diff-unavailable', headCommit: before.value };
+  const after = prHeadCommit(pr, deps);
+  if (after.state !== 'known' || after.value !== before.value) return { error: 'current-pr-head-moved', headCommit: before.value };
+  return { read: { diff, headCommit: before.value, headCommitState: 'known', currentHeadCommit: after.value,
+    currentHeadCommitState: 'known', stale: false, refetched: false, source: 'sha-pinned', baseCommit: base.toLowerCase() } };
+}
+
+function deltaReviewIntent(base: SavedReviewForDelta): string {
+  const findings = base.mustFix.length
+    ? base.mustFix.map((finding, index) => `${index + 1}. ${finding}`).join('\n')
+    : '(직전 mustFix 없음 — 새 정확성·안전·데이터 손실 문제만 확인)';
+  return [
+    'DELTA REVIEW — 직전 저장 리뷰와 현재 head 사이의 변경만 판정한다.',
+    '직전 mustFix 각각을 REQUIREMENTS 항목에 `DELTA-FINDING <번호>: FIXED|OPEN` 형식으로 정확히 한 번 기록한다. OPEN에는 짧은 근거를 덧붙인다.',
+    '새 MUST-FIX는 현재 delta가 만든 정확성·안전·데이터 손실 문제만 허용하며, 각 항목은 `[NEW-CORRECTNESS]`, `[NEW-SAFETY]`, `[NEW-DATA-LOSS]` 중 하나로 시작한다.',
+    '새 SHOULD-FIX나 스타일·범위 확장 지적은 만들지 않는다. 직전 findings를 다시 리뷰 전체로 확장하지 않는다.',
+    '직전 mustFix:', findings,
+  ].join('\n\n');
+}
+
+function assessDeltaReview(review: ReviewResult, previous: SavedReviewForDelta):
+  | { valid: true; mustFix: string[]; deltaFindings: Array<{ finding: string; status: 'fixed' | 'open' }>; excludedNewFindings: number }
+  | { valid: false; reason: string } {
+  const statuses = new Map<number, 'fixed' | 'open'>();
+  for (const item of review.requirements ?? []) {
+    const match = /^DELTA-FINDING\s+(\d+):\s*(FIXED|OPEN)(?:\s+—.*)?$/i.exec(item.trim());
+    if (!match) continue;
+    const index = Number(match[1]);
+    if (index < 1 || index > previous.mustFix.length || statuses.has(index)) return { valid: false, reason: 'delta-assessment-invalid' };
+    statuses.set(index, match[2]!.toLowerCase() as 'fixed' | 'open');
+  }
+  if (statuses.size !== previous.mustFix.length) return { valid: false, reason: 'delta-assessment-incomplete' };
+  const deltaFindings = previous.mustFix.map((finding, index) => ({ finding, status: statuses.get(index + 1)! }));
+  const openFindings = deltaFindings.filter((item) => item.status === 'open').map((item) => item.finding);
+  const allowedPrefix = /^\[(?:NEW-CORRECTNESS|NEW-SAFETY|NEW-DATA-LOSS)\]\s*/i;
+  const newFindings = review.mustFix.filter((finding) => allowedPrefix.test(finding)).map((finding) => finding.replace(allowedPrefix, ''));
+  const excludedNewFindings = review.mustFix.length - newFindings.length;
+  return { valid: true, mustFix: [...openFindings, ...newFindings], deltaFindings, excludedNewFindings };
 }
 
 function savedReviewEvidence(
@@ -782,7 +896,7 @@ interface AuthoredEvidence {
   /** 리뷰 증거로 쓸 diff. */
   diff: string;
   /** 좁혔나. `full` = 종전 three-dot 그대로. */
-  evidence: 'full' | 'authored-only';
+  evidence: 'full' | 'authored-only' | 'saved-review-delta';
   prDiffFiles: number;
   /** 좁힌 뒤 파일 수. 안 좁혔으면 **잰 적 없음**을 뜻하는 undefined 가 아니라, 잰 경우에만 채운다. */
   authoredFiles?: number;
@@ -1579,7 +1693,7 @@ export async function runSelfReviewCliCommand(
       : opts.reviewerMix;
     // The route is chosen outside the existing single-review pipeline so explicit CLI flags retain
     // their exact behavior. A failed reviewer is retried on the same pinned PR diff by the next lane.
-    if (reviewerMix && (opts.save === undefined || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(opts.save)) &&
+    if (!opts.sinceReview && reviewerMix && (opts.save === undefined || /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(opts.save)) &&
         !opts.model?.trim() && !opts.acp && !opts.acpBackend && !opts.acpModel && !deps.envModel()) {
       const results: Array<Record<string, unknown>> = [];
       let failed = 0;
@@ -1740,6 +1854,11 @@ async function runSelfReviewCliCommandPinned(
     deps.error('--save 이름은 영문자·숫자로 시작하고 영문자·숫자·점·밑줄·하이픈만 포함해야 합니다.');
     return { results: [], failed: 1 };
   }
+  if (opts.sinceReview && ((opts.contextOrder?.length ?? 0) > 0 || (opts.context?.length ?? 0) > 0 || (opts.contextText?.length ?? 0) > 0)) {
+    const message = '--since-review 는 직전 지적에 인용된 파일만 맥락으로 싣습니다; --context/--context-text 와 함께 쓸 수 없습니다.';
+    deps.error(message);
+    return { results: opts.json ? [{ error: message, reviewed: false, refusal: 'delta-context-expansion' }] : [], failed: 1 };
+  }
 
   // An explicit API model is the caller's reviewer choice even when a default ACP lane supplied both flags.
   const requestedModel = opts.model?.trim() || undefined;
@@ -1871,7 +1990,28 @@ async function runSelfReviewCliCommandPinned(
       failed += 1;
       continue;
     }
-    const diffRead = readDiffAtHead(pr, deps);
+    let deltaBase: SavedReviewForDelta | undefined;
+    if (opts.sinceReview !== undefined) {
+      const selected = selectSavedReviewForDelta(pr, opts.sinceReview);
+      if ('error' in selected) {
+        const message = `PR ${pr}: --since-review 기준을 읽지 못했습니다 (${selected.error}).`;
+        deps.error(message);
+        if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'delta-base-invalid', deltaRefusal: selected.error });
+        failed += 1;
+        continue;
+      }
+      deltaBase = selected.review;
+    }
+    const diffResult = deltaBase ? readDeltaDiffAtHead(pr, deltaBase.headCommit, deps) : { read: readDiffAtHead(pr, deps) };
+    if ('error' in diffResult) {
+      const message = `PR ${pr}: 델타 리뷰를 고정하지 못했습니다 (${diffResult.error}).`;
+      deps.error(message);
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'delta-base-invalid', deltaRefusal: diffResult.error,
+        ...(diffResult.headCommit ? { headCommit: diffResult.headCommit } : {}) });
+      failed += 1;
+      continue;
+    }
+    const diffRead = diffResult.read;
     const canonicalResultPath = COMMIT_OID.test(diffRead.headCommit)
       ? join(effectiveInstanceRoot(), 'review-results', `pr-${pr}-${diffRead.headCommit.slice(0, 12)}.json`)
       : undefined;
@@ -2012,28 +2152,53 @@ async function runSelfReviewCliCommandPinned(
     }
     const localHeadComparison = compareLocalHead(pr, { value: diffRead.headCommit, state: diffRead.headCommitState }, deps);
     const { diff } = diffRead;
-    const baseReviewerContext = hasProvidedReviewerContext
-      ? providedReviewerContext
-      : loadPrDiffReviewerContext(pr, diffRead.headCommit, diffFilePaths(diff.stdout), deps);
+    const deltaContextPaths = deltaBase ? [...new Set(deltaBase.mustFix.flatMap(citedReviewPaths))] : undefined;
+    const baseReviewerContext = deltaBase
+      ? loadPrDiffReviewerContext(pr, diffRead.headCommit, deltaContextPaths ?? [], deps)
+      : hasProvidedReviewerContext
+        ? providedReviewerContext
+        : loadPrDiffReviewerContext(pr, diffRead.headCommit, diffFilePaths(diff.stdout), deps);
     const comparisonData = comparisonObservation(localHeadComparison);
     // ⛔ `relation-unknown` 도 경고한다(위 주석 · 리뷰가 두 라운드 반복 지적) — 그 밖 unavailable 은 조용하다.
     //    ⭐ 경고 여부 판정은 `localHeadWarningDetails` 한 곳에 있다(호출부에서 같은 함수를 두 번 부르지 않는다).
     const mismatchWarning = localHeadWarningDetails(localHeadComparison);
     const mergeState = readPrMergeState(pr, deps);
-    const view = deps.gh(['pr', 'view', pr, '--json', 'title,body'], 15_000);
+    const view = deltaBase ? { status: 1, stdout: '', stderr: '' }
+      : deps.gh(['pr', 'view', pr, '--json', 'title,body'], 15_000);
     let prView: { title?: string; body?: string } | undefined;
     if (view.status === 0) {
       try { prView = JSON.parse(view.stdout) as { title?: string; body?: string }; } catch { /* fallback below */ }
     }
     const title = prView?.title ?? '';
     const body = prView?.body;
-    const decompositionContext = lookupDecompositionContextForReview(`${title}\n${body ?? ''}`, deps);
-    const reviewerContext = appendDecompositionContext(baseReviewerContext, decompositionContext);
+    const decompositionContext = deltaBase ? { status: 'absent' as const }
+      : lookupDecompositionContextForReview(`${title}\n${body ?? ''}`, deps);
+    const pack = deltaBase || opts.noContextPack ? undefined : await import('./review-context-pack.js').then(({ buildReviewContextPack }) => buildReviewContextPack({
+      pr,
+      prTitle: title,
+      prBody: body ?? '',
+      files: diffFilePaths(diff.stdout),
+      rootDir: deps.reviewRepositoryPath,
+      gh: (args) => {
+        const result = deps.gh([...args], 15_000);
+        return result.status === 0
+          ? { ok: true, stdout: result.stdout }
+          : { ok: false, stdout: result.stdout, error: result.stderr || `gh exited ${String(result.status)}` };
+      },
+    }));
+    const contextWithPack = pack
+      ? { ...baseReviewerContext, items: [...baseReviewerContext.items, { label: 'review context pack', body: pack.text }] }
+      : baseReviewerContext;
+    const reviewerContext = appendDecompositionContext(contextWithPack, decompositionContext);
     const reviewerContextStatus = renderReviewerContextStatus(reviewerContext, decompositionContext);
     let intent: string;
     let intentSource: 'flag' | 'flag+pr-body' | 'pr-body' | 'pr-title' | 'fallback';
     let intentTruncation: ReturnType<typeof reviewIntentTruncationObservation>;
-    if (opts.intent !== undefined) {
+    if (deltaBase) {
+      intent = deltaReviewIntent(deltaBase);
+      intentTruncation = {};
+      intentSource = 'fallback';
+    } else if (opts.intent !== undefined) {
       if (body?.trim()) {
         const intentText = `## 명시 intent\n${opts.intent}\n\n## PR 본문\n${body.trim()}`;
         intent = buildManualReviewIntent(opts.intent, body.trim());
@@ -2052,7 +2217,7 @@ async function runSelfReviewCliCommandPinned(
       intentSource = body?.trim() ? 'pr-body' : title.trim() ? 'pr-title' : 'fallback';
       if (!intent) intent = `PR ${pr}`;
     }
-    if (previousRoundCount >= 2 && diff.status === 0 && !diffRead.stale && diffRead.headCommitState === 'known') {
+    if (!deltaBase && previousRoundCount >= 2 && diff.status === 0 && !diffRead.stale && diffRead.headCommitState === 'known') {
       if (!deps.loadDoctorReviewBrief) {
         deps.observeDoctorReview?.('brief-unavailable', { pr, head: diffRead.headCommit, previousRoundCount, reason: 'module-not-wired' });
       } else {
@@ -2124,14 +2289,16 @@ async function runSelfReviewCliCommandPinned(
     // ⭐ S2(2026-07-30) — 리뷰 증거를 **이 PR 이 저작한 변경**으로 좁힌다. 실측 7건에서 1건만
     //   좁히고(49→6) 나머지는 그대로다. ⚠️ 새 이벤트를 만들지 않는다 — 증거는 **입력의 성질**이므로
     //   `start` payload 에 싣는다(발화 순서 계약 보존).
-    const evidence = narrowEvidenceToAuthored(pr, diffRead.headCommit, diff.stdout, deps);
+    const evidence = deltaBase
+      ? { diff: diff.stdout, evidence: 'saved-review-delta' as const, prDiffFiles: diffFilePaths(diff.stdout).length }
+      : narrowEvidenceToAuthored(pr, diffRead.headCommit, diff.stdout, deps);
     const evidenceLine = renderEvidenceProvenance(evidence);
     // ⭐ 골 판정 신호는 reviewInput 조립 전에 PR당 한 번만 조회한다. ACP 폴백이 같은 객체를
     //    재사용하므로 리뷰 루프 안에서 queryRunChain 을 반복하지 않는다.
     const lookupGoalAcceptance = deps.lookupPrGoalAcceptance ?? lookupPrGoalAcceptance;
     let goalAcceptance: PrGoalAcceptanceLookup = { goalLoaded: false, acceptanceChars: 0 };
     try {
-      goalAcceptance = lookupGoalAcceptance(Number(pr));
+      if (!deltaBase) goalAcceptance = lookupGoalAcceptance(Number(pr));
     } catch {
       goalAcceptance = { goalLoaded: false, acceptanceChars: 0 };
     }
@@ -2224,7 +2391,7 @@ async function runSelfReviewCliCommandPinned(
     // ⛔ evidenceNote 는 **별도 채널**이다 — phaseIntent 에 섞으면 의도 채널이 오염된다(실측: 그렇게
     //   했다가 intent 배선 테스트 3개가 즉시 깨졌다).
     // ⛔ 사람 `--intent`(phaseIntent) 와 골 acceptance 는 다른 인자 — 충돌하지 않고, 충돌해도 intent 가 이긴다.
-    const reviewInput = {
+    const reviewInput: ReviewInput = {
       prDiff: evidence.diff,
       phaseIntent: intent,
       evidenceNote: evidenceLine,
@@ -2233,6 +2400,7 @@ async function runSelfReviewCliCommandPinned(
       ...(deps.readReferencedFile ? { readReferencedFile: deps.readReferencedFile } : {}),
       ...(goalAcceptance.acceptance ? { acceptance: goalAcceptance.acceptance } : {}),
     };
+    const reviewInputChars = reviewInputCharacterCount(reviewInput);
     const intentFingerprint = reviewIntentFingerprint(reviewInput.phaseIntent);
     // ⭐ Role-config ACP lane: a completed ACP review is used as-is; anything else (throw, reviewed≠true)
     //    falls to the same API review this command ran before the lane existed — and is observed.
@@ -2325,6 +2493,43 @@ async function runSelfReviewCliCommandPinned(
       if (glmFailureReason !== undefined) fallbackFailures.push({ backend: ZAI_OPENROUTER_FALLBACK_MODEL, reason: glmFailureReason });
       claudeFallbackGlm = { reason, model: ZAI_OPENROUTER_FALLBACK_MODEL, glmReviewed: glmFailureReason === undefined,
         ...(glmFailureReason !== undefined ? { glmFailureReason } : {}) };
+    }
+    const reviewDurationMs = Math.max(0, deps.now() - startedAt);
+    let deltaReceipt: Record<string, unknown> = {};
+    if (deltaBase) {
+      const assessed = assessDeltaReview(review, deltaBase);
+      const deltaEfficiency = {
+        inputRatio: reviewInputChars / deltaBase.reviewInputChars,
+        timeRatio: reviewDurationMs / deltaBase.reviewDurationMs,
+        maxRatio: 1 / 3,
+      };
+      const efficient = deltaEfficiency.inputRatio <= deltaEfficiency.maxRatio
+        && deltaEfficiency.timeRatio <= deltaEfficiency.maxRatio;
+      if (review.reviewed !== true) {
+        const reason = review.failureReason || 'delta-review-not-completed';
+        review = { ...review, reviewed: false, verdict: 'fail', mustFix: [], shouldFix: [], failureReason: reason };
+        deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
+          deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency,
+          deltaRefusal: 'delta-review-not-completed' };
+      } else if (!assessed.valid) {
+        review = { ...review, reviewed: false, verdict: 'fail', mustFix: [], shouldFix: [],
+          failureReason: assessed.reason };
+        deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
+          deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency,
+          deltaRefusal: assessed.reason };
+      } else if (!efficient) {
+        review = { ...review, reviewed: false, verdict: 'fail', mustFix: [], shouldFix: [],
+          failureReason: 'delta-efficiency-limit-exceeded' };
+        deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
+          deltaFindings: assessed.deltaFindings, deltaInputChars: reviewInputChars,
+          deltaDurationMs: reviewDurationMs, deltaEfficiency, deltaRefusal: 'delta-efficiency-limit-exceeded' };
+      } else {
+        review = { ...review, reviewed: true, verdict: assessed.mustFix.length ? 'fail' : 'pass',
+          mustFix: assessed.mustFix, shouldFix: [] };
+        deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
+          deltaFindings: assessed.deltaFindings, excludedNewFindings: assessed.excludedNewFindings,
+          deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency };
+      }
     }
     reviewPin?.remove();
     // reviewCwdCommit 은 «최종 판정을 낸 LLM 이 실제로 그 cwd 를 받았을 때만» 싣는다(role 실패 → API 폴백이면 안 싣는다).
@@ -2428,7 +2633,7 @@ async function runSelfReviewCliCommandPinned(
     deps.log('done',
       {
         ...buildReviewObservation({
-          pr, model: selectedModel, intent, intentFingerprint, review, durationMs: deps.now() - startedAt,
+          pr, model: selectedModel, intent, intentFingerprint, review, durationMs: reviewDurationMs,
           ...reviewProvenance,
           ...intentTruncation,
           ...reviewDiffBudgetObservation(review),
@@ -2460,7 +2665,11 @@ async function runSelfReviewCliCommandPinned(
     // ⛔ 금지 백엔드가 낸 판정은 «근거 거부»다 — verdict·mustFix 를 그대로 실어 보내면 읽는 쪽이
     //    그것을 착지 판정으로 쓴다(관문도 reviewed===true 를 근거 조건으로 본다).
     const refusalOverride = landingGateAdmitted ? {} : { reviewed: false, verdict: null, refusal: 'review-forbidden-acp-backend' as const };
-    const resultOutput = { pr, model: selectedModel, ...jsonReview, ...reviewProvenance, ...respondedOutput, ...reviewerSelection, ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields, findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles, ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) };
+    const resultOutput = { pr, model: selectedModel, ...jsonReview, reviewInputChars, reviewDurationMs,
+      ...(deltaBase ? deltaReceipt : {}), ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
+      ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields,
+      findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles,
+      ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) };
     if (opts.json || opts.save !== undefined || shouldPersistCapResult) results.push(resultOutput);
     if (!shouldPersistCapResult
       && landingGateAdmitted && review.reviewed === true && diffRead.headCommitState === 'known'

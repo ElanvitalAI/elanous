@@ -14,6 +14,7 @@ import {
   isNativeStructureEnabledForProvider,
   isRuntimeLlmModelCompatibleWithProvider,
   parseProjectRubricAxes,
+  resolveTuiUnattended,
   resolveRoleModel,
   saveUserConfig,
 } from './user-config.js';
@@ -42,6 +43,24 @@ test('tui.sidetab validates values and survives config save', () => {
   expect(persistedTui).toEqual({ sidetab: 'open', role: 'contributor', showBeta: true });
   writeConfig({ tui: { sidetab: 'invalid' } });
   expect(buildUserConfig(configPath).tui?.sidetab).toBe('collapsed');
+});
+
+test('tui.unattended is a sparse boolean and user config overrides the seat env switch', () => {
+  writeConfig({ tui: { unattended: true } });
+  const enabled = buildUserConfig(configPath);
+  expect(enabled.tui?.unattended).toBe(true);
+  expect(resolveTuiUnattended(enabled, { ELANOUS_TUI_UNATTENDED: '0' })).toBe(true);
+
+  writeConfig({ tui: { unattended: false } });
+  const disabled = buildUserConfig(configPath);
+  expect(disabled.tui?.unattended).toBe(false);
+  expect(resolveTuiUnattended(disabled, { ELANOUS_TUI_UNATTENDED: '1' })).toBe(false);
+
+  writeConfig({ tui: { unattended: 'true' } });
+  const invalid = buildUserConfig(configPath);
+  expect(invalid.tui?.unattended).toBeUndefined();
+  expect(resolveTuiUnattended(invalid, { ELANOUS_TUI_UNATTENDED: '1' })).toBe(true);
+  expect(resolveTuiUnattended(invalid, { ELANOUS_TUI_UNATTENDED: 'true' })).toBe(false);
 });
 
 test('taskAgent.rejudgeMaxAgeHours accepts a positive finite number and drops invalid values', () => {
@@ -142,6 +161,19 @@ test('projects rubric axes validate and survive save/reload without dropping unr
   const invalid = { ...buildUserConfig(configPath), projects: { p1: { rubric: { axes: [{ key: '고객', weight: NaN }] } } } };
   expect(() => saveUserConfig(invalid, configPath)).toThrow('projects.p1.rubric.axes[0].weight');
   expect(buildUserConfig(configPath).projects?.p1?.rubric?.axes).toEqual([{ key: '고객', weight: 1 }]);
+});
+
+test('llm.streamIdleTimeoutMs accepts a positive value and survives save/reload', () => {
+  writeConfig({ llm: { provider: 'local', baseUrl: 'http://127.0.0.1:43123/v1', streamIdleTimeoutMs: 5 } });
+  const cfg = buildUserConfig(configPath);
+  expect(cfg.llm.streamIdleTimeoutMs).toBe(5);
+  saveUserConfig(cfg, configPath);
+  expect(JSON.parse(readFileSync(configPath, 'utf8')).llm.streamIdleTimeoutMs).toBe(5);
+  expect(buildUserConfig(configPath).llm.streamIdleTimeoutMs).toBe(5);
+  for (const invalid of [0, -1, '5', null]) {
+    writeConfig({ llm: { streamIdleTimeoutMs: invalid } });
+    expect(buildUserConfig(configPath).llm.streamIdleTimeoutMs).toBeUndefined();
+  }
 });
 
 test('orchestrator maxDelegatePerTick is optional, accepts safe nonnegative integers and survives save', () => {

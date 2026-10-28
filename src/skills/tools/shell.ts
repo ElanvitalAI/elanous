@@ -586,6 +586,8 @@ export interface ShellCompletionNoticeInput {
   ok: boolean;
   exitCode: number | null;
   durationMs: number;
+  /** Full bounded runner result, when the runner resolved normally. */
+  result?: RunnerResult;
   /** Set when ok === false — the runner's failure reason. */
   errorMessage?: string;
   /** Caller-supplied free-form label (RunShell's `description` arg). */
@@ -598,6 +600,29 @@ export interface ShellCompletionNoticeInput {
  *  settle (an id-keyed record here would). */
 const notifiedHandles = new WeakSet<ShellHandle>();
 let nextShellCompletionNoticeId = 0;
+const SHELL_NOTICE_STREAM_TAIL_CHARS = 64;
+
+function shellNoticeTail(output: RunnerResult['stdout'] | undefined): { text: string; truncated: boolean } {
+  if (!output) return { text: '', truncated: false };
+  const source = output.tail ?? output.text;
+  const safe = redactSecretText(source);
+  const chars = Array.from(safe);
+  return {
+    text: shellNoticeJsonField(chars.slice(-SHELL_NOTICE_STREAM_TAIL_CHARS).join('')),
+    truncated: chars.length > SHELL_NOTICE_STREAM_TAIL_CHARS,
+  };
+}
+
+function shellNoticeReason(value: string): string {
+  return redactSecretText(value);
+}
+
+function shellNoticeJsonField(value: string): string {
+  return JSON.stringify(redactSecretText(value)).replace(/\p{White_Space}/gu, (char) => {
+    const hex = char.codePointAt(0)!.toString(16).padStart(4, '0');
+    return `\\u${hex}`;
+  });
+}
 
 /** Enqueue one bg shell-handle completion notice. Returns true when this
  *  handle had not notified before (the notice was handed to `queue`),
@@ -614,15 +639,35 @@ export function enqueueShellCompletionNotice(
   if (notifiedHandles.has(input.handle)) return false;
   notifiedHandles.add(input.handle);
   const header = `RunShell bg handle=${input.handle.id} ${input.ok ? 'completed' : 'failed'}`;
-  const output = `${header}${input.ok || input.exitCode !== null ? ` exitCode=${input.exitCode ?? 'null'}` : ''} elapsed=${input.durationMs}ms${input.errorMessage ? ` error=${input.errorMessage}` : ''}`;
+  const taskId = `shell:${input.handle.id}:${++nextShellCompletionNoticeId}`;
+  const result = input.result;
+  const reason = input.errorMessage ?? result?.failureReason;
+  const reportedExitCode = result?.exitCode ?? input.exitCode;
+  const stdoutTail = shellNoticeTail(result?.stdout);
+  const stderrTail = shellNoticeTail(result?.stderr);
+  const truncated = (result?.truncated ?? false) || stdoutTail.truncated || stderrTail.truncated;
+  const output = [
+    header,
+    `taskId=${taskId}`,
+    `outcome=${result?.outcome ?? 'unknown'}`,
+    ...(result ? [`exitCode=${reportedExitCode ?? 'null'}`]
+      : reportedExitCode !== null ? [`exitCode=${reportedExitCode}`] : []),
+    `elapsed=${input.durationMs}ms`,
+    ...(result ? [`stdoutTail=${stdoutTail.text}`, `stderrTail=${stderrTail.text}`] : []),
+    ...(stdoutTail.truncated ? ['stdoutTailTruncated=true'] : []),
+    ...(stderrTail.truncated ? ['stderrTailTruncated=true'] : []),
+    ...(truncated ? ['truncated=true'] : []),
+    ...(result?.outputFilePath ? [`outputFile=${shellNoticeJsonField(result.outputFilePath)}`] : []),
+    ...(reason ? [`failureReason=${shellNoticeJsonField(reason)}`] : []),
+  ].join(' ');
   queue.enqueue({
-    taskId: `shell:${input.handle.id}:${++nextShellCompletionNoticeId}`,
+    taskId,
     agentName: 'RunShell',
     ...(input.label ? { label: input.label } : {}),
     state: input.ok ? 'done' : 'error',
     output,
-    truncated: false,
-    ...(input.errorMessage ? { errorMessage: input.errorMessage } : {}),
+    truncated,
+    ...(reason ? { errorMessage: shellNoticeReason(reason) } : {}),
     durationMs: input.durationMs,
     finishedAt: Date.now(),
   });
@@ -748,8 +793,9 @@ async function dispatchViaRunner(args: {
           ok,
           exitCode: result.exitCode ?? null,
           durationMs: result.durationMs,
+          result,
           ...(!ok ? { errorMessage: result.exitCode !== undefined
-            ? `exitCode=${result.exitCode}` : `outcome=${result.outcome}` } : {}),
+            ? `exitCode=${result.exitCode}` : result.failureReason ?? `outcome=${result.outcome}` } : {}),
           ...(args.description !== undefined ? { label: args.description } : {}),
         });
       },

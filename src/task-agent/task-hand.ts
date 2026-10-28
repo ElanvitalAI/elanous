@@ -14,6 +14,7 @@ import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { runGraph, validateUnitCalls, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
+import type { GraphWizardDeps } from '../graph-wizard/generate.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
 import { getUserConfig } from '../user-config.js';
@@ -22,6 +23,7 @@ import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harnes
 import { newLaunchUtteranceId, recordLaunchUtterance } from '../harness/launch-utterance-ledger.js';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { LAUNCH_DOOR_RECEIPT_ENV, openLaunchRequestDoor, type LaunchRequestDoor } from '../execution-loop/launch-gate.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { checkCompletionEvidence, deliverableReceiptEvidence } from './completion-evidence.js';
 import { judgeNextMove } from './judge.js';
@@ -37,6 +39,8 @@ import { draftClaimComment, draftClaimRecordLive, draftClaimState, draftReleaseC
 import { parseAskTargetPathHints, parseAskTargetPathHintsResult, type AskTargetPathHintsParseResult } from '../self-dev/launch-preflight-text.js';
 import { draftMissingGoalDoneBoundary, inspectGoalDoneBoundary, linesOutsideFencedCode } from '../self-implement/goal-author.js';
 import { selectKnowhowPack } from '../self-implement/knowhow-pack.js';
+// IMPL-FINDINGS-FEEDBACK — 병합 판정(postLand) 뒤 구현이 밝힌 절의 되먹임(원장 1회 기록·다음 저작 주입·후속 초안).
+import type { recordImplFindingsFeedback as RecordImplFindingsFeedback } from '../self-implement/impl-findings-feedback.js';
 import { INFLIGHT_REGISTRY_FILE, registerInflight } from '../pr-tool/inflight-registry.js';
 import { taskParentRoleEnv, taskParentRolePinsForChild } from './task-parent-role-llm.js';
 import { runHarvestUnit, type ReviewInvocation } from './harvest-unit.js';
@@ -182,7 +186,22 @@ export interface CompositionSelection {
 export const COMPOSITION_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** 1판은 조합을 고르고 단위 해석 결과를 기록한다. 단위 실행은 2판의 몫이다. */
-export function selectTaskComposition(completion: CompletionKind, root = COMPOSITION_ROOT): CompositionSelection {
+export function selectTaskComposition(completion: CompletionKind, root?: string): CompositionSelection;
+export function selectTaskComposition(completion: CompletionKind, root: string, mission: {
+  text: string; ledgerPath: string; cardId: string; callLLM?: GraphWizardDeps['callLLM']; onPersist?: (persist: () => void) => void;
+}): Promise<CompositionSelection>;
+export function selectTaskComposition(completion: CompletionKind, root = COMPOSITION_ROOT, mission?: {
+  text: string; ledgerPath: string; cardId: string; callLLM?: GraphWizardDeps['callLLM']; onPersist?: (persist: () => void) => void;
+}): CompositionSelection | Promise<CompositionSelection> {
+  if (mission) {
+    const standard = selectTaskComposition(completion, root);
+    return import('../graph-wizard/mission-compose.js').then(async ({ composeMissionGraph }) => {
+      const result = await composeMissionGraph({ text: mission.text, completion, root, ledgerPath: mission.ledgerPath,
+        cardId: mission.cardId, standard }, { callLLM: mission.callLLM, deferPersistence: mission.onPersist !== undefined });
+      mission.onPersist?.(result.persist);
+      return result.selection;
+    });
+  }
   const requested = `graphs/work/${completion}.yaml`;
   // DEFAULT-HANDS — 종류별 조합이 없으면 그 손의 기본 조합(«실행·조사»)으로 내려간다.
   // 비개발 종결이 «조합 없음»으로 막히면 사람별 표본이 과제 담당에 닿지도 못한다.
@@ -284,7 +303,7 @@ export interface TaskCard {
   completion?: CompletionKind;
   /** 선택된 일 조합 파일과 판(1판: 실행은 launcher 에 위임). */
   composition?: TaskComposition;
-  graphSelectedBy?: 'completion';
+  graphSelectedBy?: 'completion' | 'mission-compose';
   unitsResolved?: boolean;
   missingUnits?: string[];
   /** 과제 대상 프로젝트(§A4b②) — target 은 절대 경로(git 이 아닐 수 있다). id 는 `task hand --project` 가 싣는다(옛 카드엔 없을 수 있다). */
@@ -839,6 +858,41 @@ export function readTaskCard(id: string, path = taskAgentStatePath()): TaskCard 
   return readState(path).tasks?.[id];
 }
 
+/**
+ * IMPL-FINDINGS-FEEDBACK — 착지(landed·landed-by-hand) 판정이 난 카드의 병합 PR 본문 절을
+ * 되먹임한다: 원장 1회 기록(중복 억제) ⊕ 관련 기록만 다음 저작 입력 주입 ⊕ 후속 초안(자동 발사 없음).
+ * PR 이 묶이지 않았거나 아직 착지 판정이 아니면 아무것도 하지 않는다. 실패는 관측(`debug.log`)만.
+ */
+export async function recordPostLandImplFindings(
+  card: TaskCard,
+  input: { prBody: string; ask: string },
+  options: { ledgerDir?: string; followUp?: NonNullable<Parameters<typeof RecordImplFindingsFeedback>[1]>['followUp'] } = {},
+): Promise<Awaited<ReturnType<typeof RecordImplFindingsFeedback>> | null> {
+  const pr = cardPrNumber(card);
+  if (pr === undefined || !(card.status === 'landed' || card.status === 'landed-by-hand'
+    || (card.status === 'done' && card.prTerminal?.pr === pr))) return null;
+  if (!card.runId?.trim()) {
+    try { debug.log('task-agent', 'impl-findings-skipped', { card: card.id, pr, reason: 'run-id-missing' }); } catch { /* fail-soft */ }
+    return null;
+  }
+  try {
+    const { recordImplFindingsFeedback } = await import('../self-implement/impl-findings-feedback.js');
+    return await recordImplFindingsFeedback({
+      runId: card.runId,
+      prNumber: pr,
+      prBody: input.prBody,
+      ask: input.ask,
+      ...(card.goalId ? { goalId: card.goalId } : {}),
+    }, {
+      ...(options.ledgerDir ? { dir: options.ledgerDir } : {}),
+      ...(options.followUp ? { followUp: options.followUp } : {}),
+    });
+  } catch (error) {
+    try { debug.log('task-agent', 'impl-findings-failed', { card: card.id, pr, reason: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
+    return null;
+  }
+}
+
 /** TA-REVIEW-PASS — runId 기준 단일 카드 멱등 생성 결과. `ok: false` 는 임의 생성 없이 사유만 남긴 보류(fail-closed)다. */
 export type IdempotentRunCardCreate =
   | { ok: true; card: TaskCard; created: boolean }
@@ -899,6 +953,9 @@ export function cardsTouchingPaths(cards: readonly TaskCard[], paths: readonly s
 }
 
 export const CLOSED_BY_HAND_EVENT = 'closed-by-hand';
+
+/** LAUNCH-SINGLE-DOOR-1C — 단일문 거절 줄 — 같은 requestId 로 이미 소비된 중복 발사를 카드 history 에 남긴다. */
+export const LAUNCH_REFUSED_DUPLICATE_EVENT = 'launch-refused-duplicate';
 
 /** 카드를 손으로 닫는다 — 상태를 `failed` 로 두고 history 에 한 줄(`closed-by-hand`)을 남긴다. 이미 손으로 닫은 카드는 그대로 돌려준다(멱등). */
 export function closeTaskCard(card: TaskCard, input: { reason: string; by: string; at: string }): TaskCard {
@@ -1065,6 +1122,10 @@ export interface HandTaskOptions {
   statePath?: string;
   /** 시험에서만 조합 저장소를 바꿔 해석·거부를 검증한다. */
   compositionRoot?: string;
+  /** Explicit opt-in for mission graph composition; omitted is the fixed completion graph. */
+  composeGraph?: boolean;
+  /** Injectable LLM boundary for isolated composition tests. */
+  composeCallLLM?: GraphWizardDeps['callLLM'];
   /** `--live` 일 때만 불린다. */
   launcher?: TaskLauncher;
   /**
@@ -1096,6 +1157,11 @@ export interface HandTaskOptions {
    * 거짓이면 쓰지 않고 `TaskCardSupersededError` — 다른 넘김이 그 카드를 가져갔다(발사 전이면 발사하지 않는다).
    */
   writeGuard?: (current: TaskCard | undefined) => boolean;
+  /**
+   * LAUNCH-SINGLE-DOOR-1C — 발사 직전 단일문(append 요청 원장 ⊕ requestId 단위 단일 소비 영수증).
+   * 생산은 기본 문(이 우주의 인스턴스 루트)을 쓰고, 시험은 격리 루트의 문을 주입해 같은 생산 경로로 검증한다.
+   */
+  launchRequestDoor?: LaunchRequestDoor;
 }
 
 /** `writeGuard` 가 거짓 — 다른 넘김이 카드를 가져갔다. 카드는 건드리지 않았다. */
@@ -1233,20 +1299,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
   const parentRolePins = taskParentRolePinsForChild(opts.parentRoleLlm ?? [], childLlm);
   let parentRoleEnv = taskParentRoleEnv(parentRolePins); // validate before writing the card
   const completion = opts.completion ?? 'code-pr';
-  const selected = selectTaskComposition(completion, opts.compositionRoot);
-  // 2판 — launcher 'graph-run' 조합(단위 해석까지 완료)은 실제 graph run 으로 발사한다. 더 이상 거부하지 않는다.
-  const graphRun = selected.composition && selected.launcher === 'graph-run' && !selected.error && selected.unitsResolved
-    ? selected.composition : undefined;
-  const graphRunPath = graphRun ? join(opts.compositionRoot ?? COMPOSITION_ROOT, graphRun.file) : undefined;
-  const selectionFailure = graphRun ? undefined
-    : !selected.composition ? `조합 없음: graphs/work/${completion}.yaml`
-    : selected.error ?? (selected.launcher === 'graph-run' && !selected.unitsResolved
-      ? `조합 단위 미해석: ${selected.composition.file} — 대상 unit: ${selected.missingUnits.length ? selected.missingUnits.join(', ') : '해석 실패'} (graph-run 발사는 단위 해석이 필요하다)`
-      // DEFAULT-HANDS — 코드 하니스(harness-say 자식 구현 런)는 개발자 팩(code-pr)만 쓴다.
-      : !DEFAULT_HANDS[completion].codeHarness && selected.launcher === 'harness-say'
-        ? `조합 실행기 없음: ${selected.composition.file} — ${completion} 은 «실행·조사» 손이라 코드 하니스(harness-say)를 쓰지 않는다(개발자 팩 전용)`
-        : selected.launcher === undefined
-          ? `조합 실행기 없음: ${selected.composition.file} (발사 가능한 launcher: harness-say · graph-run)` : undefined);
+  const now = (opts.now ?? (() => new Date()))();
+  const id = opts.id ?? `${TASK_CARD_PREFIX}${now.toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(3).toString('hex')}`;
   let project: TaskCard['project'];
   let targetIsGit: boolean | null = null;
   if (opts.project) {
@@ -1262,8 +1316,6 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     if (!selection.ok) throw new Error(`코드 종결은 git 대상이 필요 — --completion 을 고르거나 git init: ${target}`);
     project = { id: opts.project.id, target: selection.repo };
   }
-  const now = (opts.now ?? (() => new Date()))();
-  const id = opts.id ?? `${TASK_CARD_PREFIX}${now.toISOString().slice(0, 10).replaceAll('-', '')}-${randomBytes(3).toString('hex')}`;
   const mode = opts.live ? 'live' : 'shadow';
   // DRAFT-CLAIM-AUTO-2-FU — claim 은 카드를 쓰기 «전»에 판정한다(거부면 원장에 아무것도 남기지 않는다).
   // 견줄 상대는 카드 원장(디스크)의 다른 카드다 — 손이 들고 있는 사본이 아니라 정본을 본다.
@@ -1273,6 +1325,25 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
       ...(opts.seat !== undefined ? { seat: opts.seat } : {}), now, ask: text,
     })
     : undefined;
+  let persistComposition: (() => void) | undefined;
+  const selected = (opts.composeGraph ?? (process.env.ELANOUS_MISSION_GRAPH_COMPOSE === '1'))
+    ? await selectTaskComposition(completion, opts.compositionRoot ?? COMPOSITION_ROOT,
+      { text, ledgerPath: path, cardId: id, callLLM: opts.composeCallLLM,
+        onPersist: persist => { persistComposition = persist; } })
+    : selectTaskComposition(completion, opts.compositionRoot);
+  // 2판 — launcher 'graph-run' 조합(단위 해석까지 완료)은 실제 graph run 으로 발사한다. 더 이상 거부하지 않는다.
+  const graphRun = selected.composition && selected.launcher === 'graph-run' && !selected.error && selected.unitsResolved
+    ? selected.composition : undefined;
+  const graphRunPath = graphRun ? resolve(opts.compositionRoot ?? COMPOSITION_ROOT, graphRun.file) : undefined;
+  const selectionFailure = graphRun ? undefined
+    : !selected.composition ? `조합 없음: graphs/work/${completion}.yaml`
+    : selected.error ?? (selected.launcher === 'graph-run' && !selected.unitsResolved
+      ? `조합 단위 미해석: ${selected.composition.file} — 대상 unit: ${selected.missingUnits.length ? selected.missingUnits.join(', ') : '해석 실패'} (graph-run 발사는 단위 해석이 필요하다)`
+      // DEFAULT-HANDS — 코드 하니스(harness-say 자식 구현 런)는 개발자 팩(code-pr)만 쓴다.
+      : !DEFAULT_HANDS[completion].codeHarness && selected.launcher === 'harness-say'
+        ? `조합 실행기 없음: ${selected.composition.file} — ${completion} 은 «실행·조사» 손이라 코드 하니스(harness-say)를 쓰지 않는다(개발자 팩 전용)`
+        : selected.launcher === undefined
+          ? `조합 실행기 없음: ${selected.composition.file} (발사 가능한 launcher: harness-say · graph-run)` : undefined);
   let card: TaskCard = {
     id, text,
     ...(!targetPathHints.labelMissing ? { targetPaths } : {}),
@@ -1280,7 +1351,9 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(opts.checklistId ? { checklistId: opts.checklistId } : {}),
     ...(opts.checklistVersion !== undefined ? { checklistVersion: opts.checklistVersion } : {}),
     ...(opts.completion ? { completion: opts.completion } : {}),
-    ...(selected.composition ? { composition: selected.composition, graphSelectedBy: 'completion' as const } : {}),
+    ...(selected.composition ? { composition: selected.composition,
+      graphSelectedBy: selected.composition.file === join(dirname(path), `${id}.generated.yaml`)
+        ? 'mission-compose' as const : 'completion' as const } : {}),
     unitsResolved: selected.unitsResolved,
     missingUnits: selected.missingUnits,
     ...(project ? { project } : {}),
@@ -1378,6 +1451,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     }
   }
   writeCard(path, card);
+  if (!selectionFailure && tierSplitBlocked === undefined && move?.kind === 'launch') persistComposition?.();
   try { debug.log('task-agent.hand', 'target-paths', { card: id, count: targetPaths.length, labelMissing: targetPathHints.labelMissing }); } catch { /* fail-soft */ }
   try { debug.log('task-agent.graph-select', !selected.composition ? 'composition-missing' : selected.error ? 'composition-invalid' : 'composition-selected', {
     completion, file: selected.composition?.file ?? `graphs/work/${completion}.yaml`,
@@ -1418,7 +1492,14 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     recordLaunchUtterance({ source: 'hand', utterance: opts.text, launchId });
     let state: GraphRunState;
     try {
-      state = await (opts.graphRunner ?? runGraph)(graphRunPath, { runId, input: { ask: text }, quiet: true });
+      // Graph-run unit contracts consume all three envelope fields. `make-doc` forwards
+      // context.worktree to its headless goal loop, so preserve the card's project target
+      // when available; otherwise keep absence explicit for units that can decide safely.
+      state = await (opts.graphRunner ?? runGraph)(graphRunPath, {
+        runId,
+        input: { ask: text, context: project ? { worktree: project.target } : {}, prior: {} },
+        quiet: true,
+      });
     } catch (error) {
       // 조합 파일·대상 node가 없으면 runGraph 가 구체 사유로 던진다 — 임의 성공 처리하지 않는다.
       const reason = `graph run 실패: ${error instanceof Error ? error.message : String(error)}`;
@@ -1431,8 +1512,9 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     const at = (opts.now ?? (() => new Date()))().toISOString();
     const ok = state.status === 'done';
     // 실패 종료도 구체 blocker(종료 상태·이유·마지막 node)를 기록한다 — 임의 성공 처리하지 않는다.
+    const lastNode = state.nodes.at(-1);
     const blocker = ok ? undefined : `graph run 종료 상태 ${state.status}${state.reason ? ` — ${state.reason}` : ''}`
-      + `${state.nodes.length ? ` — 마지막 node ${state.nodes.at(-1)?.nodeId} (ok=${state.nodes.at(-1)?.ok})` : ' — node 없음'}`;
+      + `${lastNode ? ` — 마지막 node ${lastNode.nodeId} (ok=${lastNode.ok})${lastNode.failure?.message ?? lastNode.reason ?? lastNode.error ? ` — ${lastNode.failure?.errorCode ?? 'GRAPH_NODE_FAILED'}: ${lastNode.failure?.message ?? lastNode.reason ?? lastNode.error}` : ''}` : ' — node 없음'}`;
     const launchedGraph: TaskCard = { ...card, status: ok ? 'launched' : 'failed', runId: state.runId, launchId,
       history: [...card.history,
         { at, event: 'launch', detail: `graph run ${graphRunPath} (run ${state.runId})` },
@@ -1440,7 +1522,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
         ...(blocker ? [{ at, event: 'graph-run-failed', detail: blocker, runId: state.runId }] : [])] };
     writeCard(path, launchedGraph);
     try { debug.log('task-agent', 'launched', { taskId: id, seat: card.seat ?? null, runId: state.runId }); } catch { /* fail-soft */ }
-    return { card: launchedGraph, move, mode, launched: true, ...(project ? { cwd: project.target } : {}) };
+    return { card: launchedGraph, move: ok ? move : nextMoveFor(launchedGraph), mode, launched: true, ...(project ? { cwd: project.target } : {}) };
   }
   if (!opts.launcher) throw new Error('--live 인데 launcher 가 없다');
   let prelaunch: AlreadyDoneDecision;
@@ -1501,21 +1583,42 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     const configuredRepo = project ? undefined : getUserConfig().harness?.defaultRepo;
     const knowhowRepo = project?.target ?? configuredRepo ?? resolve(import.meta.dir, '../..');
     const knowhow = selectKnowhowPack(knowhowRepo, card.text, targetPaths);
-    if (knowhow.text) childGoal = `${knowhow.text}\n\n${card.text}`;
+    // Keep the card's target-path first line intact for launch preflight and PR title derivation.
+    const injectKnowhow = getUserConfig().harness?.knowhowChildInjection === true;
+    if (injectKnowhow && knowhow.text) childGoal = `${card.text}\n\n${knowhow.text}`;
     let repoRevision: string | null = null;
     try {
       const head = execFileSync('git', ['-C', knowhowRepo, 'rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
       if (/^[0-9a-f]{40,64}$/i.test(head)) repoRevision = head;
     } catch { /* The source may be absent; reason=source-unreadable records that boundary. */ }
-    try { debug.log('task-agent', 'knowhow-pack', { taskId: id, ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0,
+    try { debug.log('task-agent', 'knowhow-pack', { taskId: id, goal: card.text.slice(0, 4096), ids: knowhow.ids, bytes: knowhow.bytes, injected: injectKnowhow && knowhow.bytes > 0,
       reason: knowhow.reason, repoPath: knowhowRepo, repoRevision,
       repoSource: project ? 'project' : configuredRepo ? 'harness.defaultRepo' : 'package' }); } catch { /* fail-soft */ }
+  }
+  // LAUNCH-SINGLE-DOOR-1C — 발사 직전 단일문: 모든 요청(중복 포함)은 원장에 append 되고, 소비 영수증은
+  // requestId 단위로 최초 1회만 발급된다. 주입된 문이 없으면 생산 우주의 기본 문을 쓴다(시험 환경은 건너뛴다).
+  const launchDoor = opts.launchRequestDoor
+    ?? (process.env.NODE_ENV === 'test' ? undefined : openLaunchRequestDoor({ source: 'hand' }));
+  const launchDoorRequestId = launchDoor?.requestId(card.text);
+  let inheritedLaunchDoorReceipt: string | undefined;
+  if (launchDoor !== undefined && launchDoorRequestId !== undefined) {
+    const doorConsumption = launchDoor.consume(launchDoorRequestId);
+    if (doorConsumption.status === 'refused') {
+      const at = (opts.now ?? (() => new Date()))().toISOString();
+      const refused: TaskCard = { ...card, history: [...card.history, { at, event: LAUNCH_REFUSED_DUPLICATE_EVENT, detail: doorConsumption.reason }] };
+      writeCard(path, refused);
+      try { debug.log('task-agent', 'launch-refused-duplicate', { taskId: id, requestId: launchDoorRequestId, reason: doorConsumption.reason }); } catch { /* fail-soft */ }
+      return { card: refused, move, mode, launched: false, ...(project ? { cwd: project.target } : {}) };
+    }
+    // 소비 영수증을 자식 say 에 물려줘 그 문을 다시 두드리지 않게 한다(한 번만 상속).
+    inheritedLaunchDoorReceipt = doorConsumption.status === 'consumed' ? launchDoorRequestId : undefined;
   }
   const runId = mintRunId();
   const launchId = newLaunchUtteranceId();
   recordLaunchUtterance({ source: 'hand', utterance: opts.text, launchId });
   const context: TaskLaunchContext = { runId, launchId, launchUtterance: opts.text, env: { [HARNESS_RUN_ID_ENV]: runId, ELANOUS_TASK_CARD_ID: card.id,
     ...parentRoleEnv,
+    ...(inheritedLaunchDoorReceipt !== undefined ? { [LAUNCH_DOOR_RECEIPT_ENV]: inheritedLaunchDoorReceipt } : {}),
     ...(cardPrNumber(card) ? { ELANOUS_TASK_BOUND_PR: String(cardPrNumber(card)) } : {}),
     ...(card.checklistId ? { ELANOUS_POD_SLOT_ID: card.checklistId } : {}),
     ...(card.seat ? { ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: card.seat } : {}),
@@ -1529,6 +1632,8 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     receipt = await opts.launcher(podLaunch ? [...move.command!.slice(0, -1), childGoal] : move.command!, project?.target, context);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    // LAUNCH-SINGLE-DOOR-1C — 발사 실패 사유를 원장에 append 한다(관측 — 소비된 영수증은 그대로다).
+    if (launchDoor !== undefined && launchDoorRequestId !== undefined) launchDoor.fail(launchDoorRequestId, reason);
     const failed: TaskCard = { ...card, status: 'launch-failed', history: [
       ...card.history.filter((entry) => entry.event === 'child-model-reselected'),
       { at: (opts.now ?? (() => new Date()))().toISOString(), event: 'launch-failed', detail: reason },

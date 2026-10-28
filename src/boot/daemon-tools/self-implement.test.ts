@@ -1,9 +1,14 @@
 // P0 — SelfImplement 막(SurfaceUx) 배선 헬퍼 검증(approvePr=confirm·onProgress=progress·base 무손상).
 import { test, expect, describe, beforeEach, afterEach, spyOn } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { _setCreateGoalAuthorDecomposeStepsForTesting, _setObserveOnlyConfigReaderForTesting, _setRecentStepCountReaderForTesting, buildLaunchedToolResult, buildObservedOnlyToolResult, buildSelfImplementDaemonSpec, buildSelfImplementSurfaceSeams, dispatchSelfImplement, parseRecentStepCountsFromLogRows, readRecentStepCountsFromLogStore, resolveDispatchEntry, type SelfImplementLaunchedToolResult } from './self-implement.js';
+import { _setCreateGoalAuthorDecomposeStepsForTesting, _setObserveOnlyConfigReaderForTesting, _setRecentStepCountReaderForTesting, buildLaunchedToolResult, buildObservedOnlyToolResult, buildSelfImplementDaemonSpec, buildSelfImplementSurfaceSeams, dispatchSelfImplement, dispatchSelfImplementManaged, ManagedTaskAdmissionStore, parseRecentStepCountsFromLogRows, readRecentStepCountsFromLogStore, resolveDispatchEntry, type SelfImplementLaunchedToolResult, type SelfImplementRunner } from './self-implement.js';
+import { AgentRegistry, globalAgentRegistry } from '../../agent/registry.js';
+import { TaskNotificationQueue } from '../../agent/task-notification.js';
+import { recordRunStop } from '../../self-implement/run-stop.js';
+import { createAgentWake } from '../../dashboard/input/agent-wake.js';
 import { summarizeToolResult } from '../daemon-prompt-turn.js';
 import type { SelfImplementResult, SelfImplementSeams } from '../../self-implement/orchestrator.js';
 import type { DefaultSeamsOptions } from '../../self-implement/seams.js';
@@ -12,12 +17,25 @@ import { setUserConfigOverlay } from '../../user-config.js';
 import { _setAutoOpenPrConfigReaderForTesting } from '../../self-implement/auto-open-pr.js';
 import { writeAuthoredGoal } from '../../self-implement/goal-author.js';
 import { debug } from '../../debug/log.js';
+import { DecisionLedger } from '../../decisions/decision-ledger.js';
 
 afterEach(() => {
   _setAutoOpenPrConfigReaderForTesting();
   _setRecentStepCountReaderForTesting();
   _setCreateGoalAuthorDecomposeStepsForTesting();
+  for (const root of managedAdmissionTestRoots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+
+const managedAdmissionTestRoots: string[] = [];
+
+function authoredGoalFixture(path: string): string {
+  const root = mkdtempSync(join(tmpdir(), 'self-implement-goal-fixture-'));
+  managedAdmissionTestRoots.push(root);
+  const file = join(root, path);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, '# Test goal\n');
+  return file;
+}
 
 function fakeUx(over: { confirmAnswer?: boolean; interactive?: boolean } = {}): SurfaceUx & { progressLog: { msg: string; phase?: string }[]; confirmReqs: string[] } {
   const progressLog: { msg: string; phase?: string }[] = [];
@@ -77,6 +95,72 @@ describe('SelfImplement daemon spec', () => {
     }
   });
 });
+
+test('safety clarification records a decision but withholds launch until the goal is edited and rerun', async () => {
+  console.info('[self-implement-safety-clarification] start; testTimeoutMs=30000');
+  _setRecentStepCountReaderForTesting(() => {
+    console.info('[self-implement-safety-clarification] recent-step-count reader reached');
+    return [];
+  });
+  const stateDir = mkdtempSync(join(tmpdir(), 'self-implement-clarification-state-'));
+  const goalRoot = mkdtempSync(join(tmpdir(), 'self-implement-safety-goal-'));
+  const goalFile = join(goalRoot, 'GOAL.md');
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = stateDir;
+  writeFileSync(goalFile, [
+    '## WHAT TO BUILD',
+    'Question: UNANSWERED — payment_target',
+    'Answer: UNANSWERED — payment_target',
+    '',
+    '- Clarification:',
+    '  - id: payment_target',
+    '  - header: Payment',
+    '  - question: May I charge the customer?',
+    '  - options:',
+    '    - label: Yes',
+    '      description: Charge the customer.',
+    '  - includeOther: true',
+    '  - answer: DEFERRED-UNTIL: May I charge the customer?',
+    '',
+  ].join('\n'));
+  let runnerCalls = 0;
+  try {
+    console.info('[self-implement-safety-clarification] before dispatch');
+    const result = await dispatchSelfImplement(
+      { feature: 'safety clarification' },
+      { cwd: goalRoot, signal: new AbortController().signal, entry: 'elanous-apparatus', userText: 'charge the customer' },
+      async () => { runnerCalls += 1; return { runId: 'unexpected', ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed' }; },
+      async () => {
+        console.info('[self-implement-safety-clarification] injected goal author reached');
+        return { path: goalFile };
+      },
+      undefined,
+      undefined,
+      undefined,
+      () => {
+        console.info('[self-implement-safety-clarification] injected version resolver avoids repository reflog scan');
+        return new DecisionLedger({
+          stateDir,
+          resolveVersion: () => ({ released: '0.2.40', dev: '0.2.39-dev.0', codename: null }),
+        });
+      },
+    );
+    console.info('[self-implement-safety-clarification] dispatch settled; reading DecisionLedger');
+    const decisions = new DecisionLedger({ stateDir }).list({ status: 'open' });
+    console.info(`[self-implement-safety-clarification] ledger read complete; decisions=${decisions.length}`);
+    expect(runnerCalls).toBe(0);
+    expect(result).toMatchObject({ kind: 'failed' });
+    expect(JSON.stringify(result)).toContain('record the answer in the goal document and rerun SelfImplement');
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.options[0]).toMatchObject({ label: '답을 골 문서에 반영 후 재실행' });
+    expect(decisions[0]?.options[0]?.consequence).toContain('다시 호출한다');
+  } finally {
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(goalRoot, { recursive: true, force: true });
+  }
+}, 30_000);
 
 describe('dispatchSelfImplement — result addressability', () => {
   beforeEach(() => setUserConfigOverlay((config) => ({
@@ -275,13 +359,13 @@ describe('dispatchSelfImplement — result addressability', () => {
         { feature: 'harness mention' },
         { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus', userText: '하니스로 구현해줘!' },
         async () => expected,
-        async () => ({ path: '/goal' }),
+        async () => ({ path: authoredGoalFixture('GOAL.md') }),
       );
       await dispatchSelfImplement(
         { feature: 'plain mention' },
         { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus', userText: '그냥 구현해줘' },
         async () => expected,
-        async () => ({ path: '/goal' }),
+        async () => ({ path: authoredGoalFixture('GOAL.md') }),
       );
       await dispatchSelfImplement(
         { feature: 'absent mention' },
@@ -372,12 +456,12 @@ describe('dispatchSelfImplement — result addressability', () => {
       async (_ask, _cwd, authorDeps) => {
         authorDeps?.onProgress?.('ground', 'start');
         authorDeps?.onProgress?.('ground', 'end');
-        return { path: '/goal' };
+        return { path: authoredGoalFixture('GOAL.md') };
       },
     );
     expect(progress.slice(0, 2)).toEqual(['goal-author ground started', 'goal-author ground ended']);
     expect(progress).toHaveLength(3);
-    expect(progress[2]).toContain('goal-author authored goal');
+    expect(progress[2]).toContain('goal-author authored GOAL.md');
   });
 
   test('emits one authored summary with the human-readable goal filename and existing authoring facts', async () => {
@@ -394,7 +478,7 @@ describe('dispatchSelfImplement — result addressability', () => {
         },
       },
       async () => expected,
-      async () => ({ path: '/tmp/docs/goals/GOAL-readable-name.md' }),
+      async () => ({ path: authoredGoalFixture('docs/goals/GOAL-readable-name.md') }),
     );
     const summaries = progress.filter((line) => line.includes('GOAL-readable-name.md'));
     expect(summaries).toEqual(['goal-author authored GOAL-readable-name.md (present; 16 chars; truncated=false)']);
@@ -430,7 +514,7 @@ describe('dispatchSelfImplement — result addressability', () => {
         emitFeedback: () => { throw new Error('display unavailable'); },
       },
       async () => expected,
-      async () => ({ path: '/tmp/GOAL-feedback-failure.md' }),
+      async () => ({ path: authoredGoalFixture('GOAL-feedback-failure.md') }),
     );
     expect(result).toEqual(buildLaunchedToolResult(expected));
   });
@@ -456,6 +540,130 @@ describe('dispatchSelfImplement — result addressability', () => {
     expect(authored).toBe(false);
     expect(received).toEqual(expect.objectContaining({ feature: 'legacy natural language dispatch', naturalLanguageDispatch: true }));
     expect(received?.goalFile).toBeUndefined();
+  });
+});
+
+describe('dispatchSelfImplementManaged — nonblocking admission', () => {
+  beforeEach(() => setUserConfigOverlay((config) => ({
+    ...config,
+    tools: { ...config.tools, selfImplement: { ...config.tools.selfImplement, observeOnly: false } },
+  })));
+  afterEach(() => setUserConfigOverlay(null));
+
+  test('returns an addressable queued receipt before the implementation runner completes', async () => {
+    const admissionRoot = mkdtempSync(join(tmpdir(), 'managed-dispatch-admission-'));
+    managedAdmissionTestRoots.push(admissionRoot);
+    const registry = new AgentRegistry();
+    const notifications = new TaskNotificationQueue();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let markDone!: () => void;
+    const done = new Promise<void>((resolve) => { markDone = resolve; });
+    let observedRunId: string | undefined;
+    const result = await dispatchSelfImplementManaged(
+      { feature: 'managed dispatch test' },
+      { cwd: '/tmp', signal: new AbortController().signal, sessionId: 'session-managed' },
+      async (opts) => {
+        observedRunId = opts.runId;
+        await held;
+        markDone();
+        return { runId: opts.runId!, ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed' };
+      },
+      undefined, undefined, undefined, new ManagedTaskAdmissionStore(admissionRoot),
+      { registry, taskNotifications: notifications },
+    );
+    if (!('taskId' in result)) throw new Error('managed dispatch did not return an addressable task receipt');
+    expect(result.kind).toBe('launched');
+    expect(result.state).toBe('queued');
+    const task = registry.list().find((item) => item.runId === result.runId);
+    expect(task).toBeDefined();
+    expect(task?.id).toBe(result.taskId);
+    for (let i = 0; i < 20 && observedRunId === undefined; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(task).toMatchObject({ runId: result.runId, parentSessionId: 'session-managed', state: 'running', background: true });
+    expect(observedRunId).toBe(result.runId);
+    release();
+    await done;
+    for (let i = 0; i < 20 && task?.state === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(task?.state).toBe('done');
+  });
+
+  test('same session and tool-call identity reuses the durable admission without launching twice', async () => {
+    const admissionRoot = mkdtempSync(join(tmpdir(), 'managed-dispatch-admission-'));
+    managedAdmissionTestRoots.push(admissionRoot);
+    const registry = new AgentRegistry();
+    const notifications = new TaskNotificationQueue();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let launches = 0;
+    const ctx = { cwd: '/tmp', signal: new AbortController().signal, sessionId: `session-${randomUUID()}`, toolCallId: randomUUID() };
+    const runner: SelfImplementRunner = async (opts) => {
+      launches += 1;
+      await held;
+      return { runId: opts.runId!, ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed' };
+    };
+    const store = new ManagedTaskAdmissionStore(admissionRoot);
+    const first = await dispatchSelfImplementManaged({ feature: 'dedupe request' }, ctx, runner, undefined, undefined, undefined, store, { registry, taskNotifications: notifications });
+    for (let i = 0; i < 20 && launches === 0; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    const second = await dispatchSelfImplementManaged({ feature: 'dedupe request' }, ctx, runner, undefined, undefined, undefined, store, { registry, taskNotifications: notifications });
+    if (!('taskId' in first) || !('taskId' in second)) throw new Error('deduplicated request did not return addressable task receipts');
+    expect(second.taskId).toBe(first.taskId);
+    expect(second.runId).toBe(first.runId);
+    expect(launches).toBe(1);
+    release();
+  });
+
+  test('a fake pod-died run-stop event wakes the parent before the managed runner settles', async () => {
+    const admissionRoot = mkdtempSync(join(tmpdir(), 'managed-dispatch-run-stop-'));
+    managedAdmissionTestRoots.push(admissionRoot);
+    const registry = new AgentRegistry();
+    const queue = new TaskNotificationQueue();
+    const notices: import('../../agent/task-notification.js').PendingTaskNotification[] = [];
+    queue.onEnqueue((notice) => notices.push(notice));
+    const openedTurns: string[] = [];
+    const wake = createAgentWake({
+      subscribe: (listener) => queue.onEnqueue(listener),
+      notify: (line) => { openedTurns.push(`notice:${line}`); },
+      openTurn: {
+        getCwd: () => '/tmp',
+        detectSeat: () => ({ seat: 'OPC' as const, source: 'cwd' as const }),
+        isPending: (taskId) => queue.has(taskId),
+        startTurnIfIdle: (input) => { openedTurns.push(input); return { opened: true, turnId: 'turn-stop-event' }; },
+      },
+    });
+    let started!: () => void;
+    const runnerStarted = new Promise<void>((resolve) => { started = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const receipt = await dispatchSelfImplementManaged(
+      { feature: 'stop event wake regression' },
+      { cwd: '/tmp', signal: new AbortController().signal, sessionId: `session-${randomUUID()}` },
+      async (opts) => {
+        started();
+        recordRunStop({
+          runId: opts.runId!, site: 'pod-exit', class: 'pod-died', cause: 'pod job exited unexpectedly',
+          evidenceRef: `run-ledger:${opts.runId}:stop`, nextMove: 'Inspect preserved child output',
+        }, () => {});
+        await held;
+        return { runId: opts.runId!, ok: false, stage: 'aborted', node: 'implement', outcome: 'abandoned' };
+      },
+      undefined, undefined, undefined, new ManagedTaskAdmissionStore(admissionRoot),
+      { taskNotifications: queue, registry },
+    );
+    if (!('taskId' in receipt)) throw new Error('managed dispatch did not return an addressable task receipt');
+    await runnerStarted;
+    for (let i = 0; i < 20 && notices.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      taskId: `self-implement-stop:${receipt.runId}:${receipt.taskId}`,
+      agentName: 'SelfImplement', state: 'error', errorMessage: 'pod job exited unexpectedly',
+    });
+    expect(notices[0]?.output).toContain('pod-died at pod-exit');
+    expect(openedTurns.some((input) => input.startsWith('[자동 재개] 위임 끝: stop event wake regression (error)'))).toBe(true);
+    expect(registry.get(receipt.taskId)?.state).toBe('running');
+    wake.dispose();
+    release();
+    for (let i = 0; i < 20 && registry.get(receipt.taskId)?.state === 'running'; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(registry.get(receipt.taskId)).toMatchObject({ state: 'error', error: 'aborted' });
   });
 });
 
@@ -510,7 +718,7 @@ describe('dispatchSelfImplement — recentStepCounts wiring', () => {
   test('forwards the injected recent step-count array to decompose-step creation', async () => {
     const recentStepCounts = [9, 4, 2];
     const signal = new AbortController().signal;
-    const configs: Array<{ adversarialReview?: boolean; recentStepCounts?: readonly number[] }> = [];
+    const configs: Array<{ repositoryRoot?: string; adversarialReview?: boolean; recentStepCounts?: readonly number[] }> = [];
     _setRecentStepCountReaderForTesting(() => recentStepCounts);
     _setCreateGoalAuthorDecomposeStepsForTesting((receivedSignal, config) => {
       expect(receivedSignal).toBe(signal);
@@ -527,7 +735,7 @@ describe('dispatchSelfImplement — recentStepCounts wiring', () => {
         authorCalls += 1;
         receivedOnProgress = deps?.onProgress;
         expect(typeof deps?.decomposeSteps).toBe('function');
-        return { path: '/goal' };
+        return { path: authoredGoalFixture('GOAL.md') };
       },
     );
     expect(authorCalls).toBe(1);
@@ -539,7 +747,7 @@ describe('dispatchSelfImplement — recentStepCounts wiring', () => {
   });
 
   test('omits recentStepCounts and continues authoring when the reader throws', async () => {
-    const configs: Array<{ adversarialReview?: boolean; recentStepCounts?: readonly number[] }> = [];
+    const configs: Array<{ repositoryRoot?: string; adversarialReview?: boolean; recentStepCounts?: readonly number[] }> = [];
     _setRecentStepCountReaderForTesting(() => {
       throw new Error('log store unavailable');
     });
@@ -555,13 +763,13 @@ describe('dispatchSelfImplement — recentStepCounts wiring', () => {
       async (_ask, _cwd, deps) => {
         authorCalls += 1;
         expect(typeof deps?.onProgress).toBe('function');
-        return { path: '/goal' };
+        return { path: authoredGoalFixture('GOAL.md') };
       },
     );
     expect(result).toEqual(buildLaunchedToolResult(expected));
     expect(authorCalls).toBe(1);
     expect(configs).toHaveLength(1);
-    expect(configs[0]).toEqual({ repositoryRoot: '/tmp' });
+    expect(configs[0]?.repositoryRoot).toBe('/tmp');
     expect(Object.hasOwn(configs[0] ?? {}, 'recentStepCounts')).toBe(false);
     expect(Object.hasOwn(configs[0] ?? {}, 'adversarialReview')).toBe(false);
     expect(Object.hasOwn(configs[0] ?? {}, 'adversarialReviewSource')).toBe(false);
@@ -579,7 +787,7 @@ describe('dispatchSelfImplement — recentStepCounts wiring', () => {
       { feature: 'empty recent step counts' },
       { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus', userText: 'author this goal' },
       async () => expected,
-      async () => ({ path: '/goal' }),
+      async () => ({ path: authoredGoalFixture('GOAL.md') }),
     );
     expect(configs).toHaveLength(1);
     expect(Object.hasOwn(configs[0] ?? {}, 'recentStepCounts')).toBe(true);

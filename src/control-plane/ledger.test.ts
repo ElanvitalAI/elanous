@@ -66,6 +66,8 @@ test('warm worker lease is fenced across release, sanitize, and a later attempt'
   const second = ledger.acquirePodWorker({ key, owner: 'other', runId: 'r2', attemptId: 'a2', ttlMs: 100 }, 106);
   expect(second.attrs.generation).toBe(2);
   expect(() => ledger.transitionPodWorker(first.id, { owner: 'gate', leaseId, generation, action: 'renew' }, 107)).toThrow('stale-worker-lease');
+  expect(() => ledger.transitionPodWorker(first.id, { owner: 'gate', leaseId, generation,
+    action: 'quarantine', reason: 'too-late' }, 107)).toThrow('stale-worker-lease');
   expect(() => ledger.registerPodWorker({ workerId: 'worker-1', machine: 'node-c', podUid: 'pod-uid-1', key, owner: 'host', ttlMs: 1000 }, 107)).toThrow('worker-id-used');
 });
 
@@ -96,6 +98,24 @@ test('a mismatched shadow reply can quarantine its leased worker without making 
   expect(quarantined.attrs).toMatchObject({ state: 'quarantined', reason: 'shadow-result-mismatch' });
   expect(() => ledger.acquirePodWorker({ key, owner: 'next', runId: 'next', attemptId: 'next', ttlMs: 100 }, 103)).toThrow('no-warm-worker');
   expect(() => ledger.registerPodWorker({ workerId: 'worker-3', machine: 'node-c', podUid: 'pod-uid-1', key, owner: 'host', ttlMs: 1000 }, 2000)).toThrow('worker-id-used');
+});
+
+test('late gate fallback can quarantine the just-sanitized generation before another lease', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-late-fence-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  ledger.registerPodWorker({ workerId: 'worker-late', machine: 'node-c', podUid: 'pod-late', key, owner: 'host', ttlMs: 1000 }, 100);
+  const lease = ledger.acquirePodWorker({ key, owner: 'gate', runId: 'r1', attemptId: 'a1', ttlMs: 100 }, 101);
+  const leaseId = lease.attrs.leaseId as string;
+  const generation = lease.attrs.generation as number;
+  ledger.transitionPodWorker(lease.id, { owner: 'gate', leaseId, generation, action: 'release' }, 102);
+  ledger.transitionPodWorker(lease.id, { owner: 'host', leaseId, generation, action: 'sanitize' }, 103);
+  const fenced = ledger.transitionPodWorker(lease.id, { owner: 'gate', leaseId, generation,
+    action: 'quarantine', reason: 'adoption-timeout' }, 104);
+  expect(fenced.attrs).toMatchObject({ state: 'quarantined', generation, reason: 'adoption-timeout' });
+  expect(() => ledger.acquirePodWorker({ key, owner: 'other', runId: 'r2', attemptId: 'a2', ttlMs: 100 }, 105))
+    .toThrow('no-warm-worker');
 });
 
 test('a legacy idle row with a whitespace Pod UID cannot be leased', () => {

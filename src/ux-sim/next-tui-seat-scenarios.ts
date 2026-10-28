@@ -7,6 +7,8 @@ import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from '
 import { join, resolve } from 'node:path';
 import { appendMessage, createSession, getActiveSessionId, loadSession, setActiveSessionId } from '../session/index.js';
 import { mockSeatPtySequence, type SeatPtySequenceEvidence, type SeatPtyStep } from './mock-seat-pty-sequence.js';
+import { GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL } from './goal-interim-trace.js';
+export { GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL } from './goal-interim-trace.js';
 import { pasteFoldToken } from '../chat/paste-fold.js';
 import { DEFAULT_GOAL_CONTINUE_CAP } from '../dashboard/input/goal-continue.js';
 import {
@@ -471,29 +473,24 @@ async function runNextProactiveContinueScenario(spec: NextTuiScenarioSpec, root:
 /** TUI-NEXT-QUEUE-AND-WAKE ② — a turn calls ScheduleWakeup(60s); a slow human turn covers the due time
  *  (NotIdle → deferred a minute), then the wakeup opens one internal turn on its own. */
 async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
-  let scheduledAt = 0;
   const banner = '↻ 자동 재개(scheduled): 점검';
   const steps: SeatPtyStep[] = [
     {
       label: 'scheduled',
       text: '60초 뒤 예약해줘',
-      until: (s) => {
-        const ok = done(1)(s) && s.includes('⏰ 예약 깨움');
-        if (ok && scheduledAt === 0) scheduledAt = Date.now();
-        return ok;
-      },
+      until: (s) => done(1)(s) && s.includes('⏰ 예약 깨움'),
     },
-    { label: 'before due', until: () => scheduledAt > 0 && Date.now() >= scheduledAt + 45_000, timeoutMs: 60_000 },
-    { label: 'busy over the due time', text: '긴 작업 하나', until: (s) => s.includes('응답 중') },
-    { label: 'long turn done', until: done(2, '긴 작업 하나'), timeoutMs: 60_000 },
-    { label: 'woke', until: (s) => s.includes(banner) && done(3)(s), timeoutMs: 150_000 },
+    { label: 'busy over the due time', text: '긴 작업 하나', until: (s) => s.includes('응답 중'), timeoutMs: 30_000 },
+    { label: 'long turn done', until: done(2, '긴 작업 하나'), timeoutMs: 30_000 },
+    { label: 'woke after one deferral', until: (s) => s.includes(banner) && done(3)(s), timeoutMs: 30_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
     env: {
       ...base.env,
+      ELANOUS_TEST_FAST_WAKEUP_CLOCK: '1',
       [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '예약해줘', name: 'ScheduleWakeup', args: { delaySeconds: 60, reason: '점검' } }),
-      [TEST_FAKE_LLM_DELAY_MS_ENV]: '25000',
+      [TEST_FAKE_LLM_DELAY_MS_ENV]: '5000',
       [TEST_FAKE_LLM_DELAY_WHEN_ENV]: '긴 작업',
     },
     steps,
@@ -737,13 +734,11 @@ async function runNextGoalContinueScenario(spec: NextTuiScenarioSpec, root: stri
 
 /** TUI-GOAL-INTERIM-QUIET — every step ends with «아직 못 했다» (a different reply per turn via `{step}`, so the
  *  same-reply stop does not end it early). The fake reply's honesty sentence, counted on screen. */
-export const GOAL_INTERIM_NOT_DONE_REPLY = '[fake-llm] {step}단계 렌더를 진행했습니다.\n남은 작업 {step}단계: 완료 영상 경로는 아직 보고할 수 없습니다 — 아직 못 했습니다.';
 const GOAL_INTERIM_STEP_MARK = '단계 렌더를 진행했습니다';
 const GOAL_INTERIM_NOT_DONE_MARK = '아직 못 했습니다';
 /** An internal turn drawn as if a person typed it (classic «❯ …» · next «나: …»). */
 /** The first (human) turn also calls one tool, so a folded reply must leave that turn's tool lines on screen.
  *  ScheduleWakeup an hour out: a real registered tool with no approval prompt that never fires inside the run. */
-export const GOAL_INTERIM_TOOL_CALL = JSON.stringify({ when: '영상 만들어줘', name: 'ScheduleWakeup', args: { delaySeconds: 3600, reason: '렌더 점검' } });
 export const INTERNAL_TURN_USER_HEADER = /(?:나:|❯)\s*\[(?:골 이어가기|자동 재개)\]/u;
 
 export interface GoalInterimScreenCounts { steps: number; notDone: number; folded: number; userHeader: boolean }

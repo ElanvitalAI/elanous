@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { federatedPtyRefs, findPtyManifestRows, listPtyRefs, runPtyFind, runPtyKey, runPtyList, runPtyRelease, runPtyRename, runPtyResize, runPtyRetire, runPtySnapshot, runPtyState, runPtyTakeover, runPtyText, runPtyTextWhenIdle, runPtyWait, registerPtyTakeoverCommands, type PtyTakeoverCommandDeps } from '../../src/cli/pty-takeover-cli.js';
+import { federatedPtyRefs, findPtyManifestRows, listPtyRefs, runPtyFind, runPtyKey, runPtyList, runPtyRelease, runPtyRename, runPtyResize, runPtyRetire, runPtySnapshot, runPtyState, runPtyStopTurn, runPtyTakeover, runPtyText, runPtyTextWhenIdle, runPtyWait, registerPtyTakeoverCommands, type PtyTakeoverCommandDeps } from '../../src/cli/pty-takeover-cli.js';
 import { getPtyManifest, setPtyManifestDbPathForTesting, upsertPtyManifest, type PtyManifestRow } from '../../src/pty-shell/pty-manifest.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -190,7 +190,7 @@ describe('pty takeover CLI commands', () => {
       // ⭐ #14980 이 원격·로컬 «키 대칭»으로 더한 셋 — null 은 「모른다」이지 「없다」가 아니다.
       webUrl: null, webUrlSource: null, pwaUnavailableReason: null,
       // ⭐ H10 — 턴·판 칸은 «언제나» 실린다. 턴 기록이 없는 행은 unknown/null.
-      turn: { state: 'unknown', at: null, sinceSec: null }, build: null,
+      turn: { state: 'unknown', at: null, sinceSec: null }, progress: 'unknown', build: null,
     }]);
   });
 
@@ -718,7 +718,7 @@ describe('pty takeover CLI commands', () => {
       requestRemote: async () => ({ status: 'success', screen: '❯ /command, or type a question' }),
       listRefs: () => [{ id: 'pty_x', kind: 'tui', source: 'remote', alive: true }], now: () => 1234, log() {},
     };
-    await expect(runPtyState('pty_x', deps, true)).resolves.toEqual({ exitCode: 0, message: JSON.stringify({ id: 'pty_x', state: 'idle', stateSource: 'screen', screenState: 'idle', label: 'bare-prompt', at: 1234, turn: 'unknown', build: null, installed: null, stale: null, staleReason: 'unknown' }) });
+    await expect(runPtyState('pty_x', deps, true)).resolves.toEqual({ exitCode: 0, message: JSON.stringify({ id: 'pty_x', state: 'idle', stateSource: 'screen', screenState: 'idle', label: 'bare-prompt', at: 1234, turn: 'unknown', progress: 'unknown', build: null, installed: null, stale: null, staleReason: 'unknown' }) });
     await expect(runPtyState('pty_x', deps)).resolves.toEqual({ exitCode: 0, message: 'pty state: pty_x state=idle source=screen label=bare-prompt turn=unknown build=unknown installed=- stale=unknown' });
   });
 
@@ -1349,6 +1349,31 @@ describe('pty rename CLI', () => {
         ['rename', { nickname: 'op' }, { actor: 'human' }],
         ['rename', { nickname: 'op2' }, { actor: 'agent' }],
       ]);
+      expect(process.exitCode).toBe(0);
+    } finally {
+      process.stdout.write = originalOut;
+    }
+  });
+});
+
+describe('pty stop-turn CLI', () => {
+  test('sends an explicit force request to the owner through Commander', async () => {
+    const remote: unknown[] = [];
+    const deps: PtyTakeoverCommandDeps = {
+      getPty: () => undefined, requestPtyTakeover: () => false,
+      requestRemote: async (id, action, payload, options) => { remote.push([id, action, payload, options]); return { status: 'success' }; },
+      listRefs: () => [{ id: 'tui:4242', kind: 'tui', source: 'remote', alive: true }], log() {},
+    };
+    await expect(runPtyStopTurn('tui:4242', 'agent', 'OP', 'stuck unattended turn', deps)).resolves.toEqual({ exitCode: 0, message: 'pty stop-turn: delivered to tui:4242' });
+    expect(remote).toEqual([['tui:4242', 'stop-turn', { force: true, actorIdentity: 'OP', reason: 'stuck unattended turn' }, { actor: 'agent' }]]);
+
+    const program = new Command();
+    const originalOut = process.stdout.write;
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    try {
+      registerPtyTakeoverCommands(program, deps);
+      await program.parseAsync(['node', 'elanous', 'pty', 'stop-turn', 'tui:4242', '--force', '--actor', 'agent', '--actor-id', 'OP', '--reason', 'stuck unattended turn']);
+      expect(remote).toHaveLength(2);
       expect(process.exitCode).toBe(0);
     } finally {
       process.stdout.write = originalOut;

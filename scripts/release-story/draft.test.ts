@@ -320,14 +320,15 @@ test('real release/next.md produces clean drafts in an isolated checklist, ledge
 
 test('internal prefixes and trailing metadata are removed before drafting', () => {
   const options = fixture();
-  writeFileSync(options.nextPath, '# Next\n## Fix\n- Internal: hidden\n- internal - also hidden\n- internal — not public\n- fix — visible. "Documentation: none. Target: next."\n- feat — another change. "Target: next."\n');
+  writeFileSync(options.nextPath, '# Next\n## Fix\n- Internal: hidden\n- internal - also hidden\n- internal — not public\n- fix — visible. "Documentation: none. Target: next."\n- feat — another change. "Target: next."\n- fix — with refs. Target: next. (#12)\n');
   const result = draftReleaseStory(options);
-  expect(result).toMatchObject({ internalDropped: 3, userLines: 2 });
+  expect(result).toMatchObject({ internalDropped: 3, userLines: 3 });
   const announcement = readFileSync(join(options.outDir, 'announcement.md'), 'utf8');
   const news = readFileSync(join(options.outDir, 'site-news.md'), 'utf8');
   for (const text of [announcement, news]) {
     expect(text).toContain('- visible.');
     expect(text).toContain('- another change.');
+    expect(text).toContain('- with refs. (#12)');
     expect(text).not.toMatch(/^\s*-\s*internal\b/im);
     expect(text).not.toContain('Documentation:');
     expect(text).not.toContain('Target: next');

@@ -343,8 +343,8 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       ] }), stderr: '' };
     };
     const reading = measureMemberOccupancy(members, { kubectl, dns: () => 'ready' });
-    expect(reading.node-b).toEqual({ occupied: 2 });
-    expect(reading.node-c?.occupied).toBeNull();
+    expect(reading['node-b']).toEqual({ occupied: 2 });
+    expect(reading['node-c']?.occupied).toBeNull();
   });
 
   test('check drops unreachable nodes with the reason, never silently', () => {

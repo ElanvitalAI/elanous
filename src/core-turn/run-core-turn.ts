@@ -25,6 +25,7 @@ import { drainPendingUserInput } from '../session/pending-input.js';
 import type { StreamWithToolsHandlers } from '../llm.js';
 import { debug, redactSecretText, withAmbientSessionScope } from '../debug/log.js';
 import { applyDeferredTools } from '../session-runtime/tier-flip.js';
+import { isResearchAgentIntent } from '../tool-hints/signals.js';
 import { buildResearchDateSystemMessage, resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import type {
   CoreTurnContext,
@@ -101,6 +102,7 @@ function selectSurfaceUserText(ctx: CoreTurnContext): string | undefined {
  */
 export interface RunCoreTurnOptions {
   now?: () => number;
+  runResearch?: (request: string) => Promise<{ ok: boolean; output: string; error?: string }>;
 }
 
 export async function runCoreTurn(
@@ -127,12 +129,14 @@ export async function runCoreTurn(
 
     let accumulatedText = '';
     let dispatchCount = 0;
+    let finalPhaseAnswer = false;
 
     const handlers: StreamWithToolsHandlers = {
     onText: (delta, full) => {
       accumulatedText = full;
       ctx.callbacks?.onText?.(delta, full);
     },
+    ...(ctx.callbacks?.onStatus ? { onStatus: (line: string) => ctx.callbacks?.onStatus?.(line) } : {}),
     ...(ctx.callbacks?.onFinalAnswerSupplement
       ? { onFinalAnswerSupplement: (info: { answer: string; supplement: string; finalText: string }) => ctx.callbacks?.onFinalAnswerSupplement?.(info) }
       : {}),
@@ -213,7 +217,11 @@ export async function runCoreTurn(
     handlers.onUsage = (usage) => ctx.callbacks!.onUsage!(usage);
   }
   if (ctx.callbacks?.onTurnComplete) {
-    handlers.onTurnComplete = (msgs) => ctx.callbacks!.onTurnComplete!(msgs);
+    handlers.onTurnComplete = (msgs) => {
+      const lastAssistant = [...msgs].reverse().find((message) => message.role === 'assistant');
+      finalPhaseAnswer = lastAssistant?.phase === 'final_answer';
+      ctx.callbacks!.onTurnComplete!(msgs);
+    };
   }
   if (ctx.callbacks?.onReasoning) {
     handlers.onReasoning = (event) => ctx.callbacks!.onReasoning!(event);
@@ -240,16 +248,46 @@ export async function runCoreTurn(
   const recentUserText = extractRecentUserText(ctx.messages);
   const surfaceUserText = selectSurfaceUserText(ctx);
   const surface = ctx.surfaceProfile ?? resolveSessionSurfaceProfile({ userText: surfaceUserText });
+  // Use the shared #31663 research-intent verdict. Surface labels are a
+  // presentation/routing result and may remain `chat` for a research turn.
+  const researchTurn = isResearchAgentIntent(surfaceUserText);
   const { messages, tools, stats } = applyDeferredTools(
     ctx.messages,
     ctx.tools,
     { enabled: deferredEnabled, ...(recentUserText ? { userText: recentUserText } : {}) },
   );
-  if (surface.id === 'research/agent' && !messages.some((message) =>
+  if (researchTurn && !messages.some((message) =>
     message.role === 'system' && typeof message.content === 'string'
       && message.content.startsWith('Current local date:'))
   ) {
     messages.unshift(buildResearchDateSystemMessage());
+  }
+  if (researchTurn && surfaceUserText?.trim()) {
+    debug.log('research.turn', 'tui-research-started', { sessionId: ctx.sessionId });
+    try {
+      const result = await (options.runResearch ?? (async (request) => {
+        // Keep the Bloom/skill pipeline out of ordinary and packaged TUI startup graphs.
+        const { researchTurnForGrounding, runResearchQuestionLadder } = await import('../auto-research/research-turn.js');
+        return researchTurnForGrounding(await runResearchQuestionLadder(request));
+      }))(surfaceUserText);
+      if (result.output.trim()) {
+        messages.unshift({
+          role: 'system',
+          content: `<bloom-research>\n${result.output.trim()}\n</bloom-research>\nUse this axis evidence and counterevidence in the answer; preserve uncertainty and distinguish sourced facts from inference.`,
+        });
+      }
+      debug.log('research.turn', 'tui-research-completed', {
+        sessionId: ctx.sessionId,
+        ok: result.ok,
+        outputChars: result.output.length,
+        fallbackReason: result.error,
+      });
+    } catch (error) {
+      debug.log('research.turn', 'tui-research-fallback', {
+        sessionId: ctx.sessionId,
+        reason: error instanceof Error ? error.message : String(error),
+      }, { level: 'warn' });
+    }
   }
   if (debug.enabled) {
     debug.log('llm.request', 'tools-tier', {
@@ -288,8 +326,9 @@ export async function runCoreTurn(
       handlers,
       {
         tools,
-        researchTurn: surface.id === 'research/agent',
+        researchTurn,
         signal: ctx.signal,
+        ...(ctx.requestSizeGuard ? { requestSizeGuard: ctx.requestSizeGuard } : {}),
         ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
         ...(ctx.maxToolTurns !== undefined ? { maxTurns: ctx.maxToolTurns } : {}),
         ...(ctx.initialProvider !== undefined
@@ -299,6 +338,7 @@ export async function runCoreTurn(
         ...(ctx.budgetGrant !== undefined ? { budgetGrant: ctx.budgetGrant } : {}),
         ...(ctx.terminalToolNames !== undefined ? { terminalToolNames: ctx.terminalToolNames } : {}),
         ...(ctx.terminalPriorAnswerVisible !== undefined ? { terminalPriorAnswerVisible: ctx.terminalPriorAnswerVisible } : {}),
+        ...(ctx.terminalCompletionAccepted !== undefined ? { terminalCompletionAccepted: ctx.terminalCompletionAccepted } : {}),
         // ⭐⭐⭐ `B3`(2026-08-19 · 대표 지시 ②) — 도는 턴 «안»으로 들어오는 사용자 발화의 배수구.
         //   ⛔ 종전엔 스트리밍 중 친 발화가 ***턴이 끝난 뒤***에야 나갔다.
         //   ⭐ 이제 «다음 모델 요청을 만들기 직전»(루프 경계)에 이력으로 들어가고,
@@ -319,6 +359,7 @@ export async function runCoreTurn(
     return {
       stopReason: ctx.signal.aborted ? 'aborted' : 'end_turn',
       finalText,
+      ...(ctx.callbacks?.onTurnComplete ? { finalPhaseAnswer } : {}),
     };
     } catch (err) {
       const stopReason = classifyStopReason(err, ctx.signal);

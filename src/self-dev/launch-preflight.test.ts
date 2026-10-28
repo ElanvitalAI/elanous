@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, sy
 import { LogStore } from '../mss/logging/log-store.js';
 import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import {
   DEFAULT_RECENT_CHANGE_WINDOW_DAYS,
   combineWorktreePathTouchAxes,
@@ -374,6 +374,58 @@ test('goal-read failure and traced-path errors record separate reason code, chec
       targetPath: 'src/occupied.ts/locked.ts',
     }));
     expect(traced.result.blockers.some((blocker) => blocker.kind === 'goal-unreadable')).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a goal document that cannot be parsed records its own reason code and untruncated goal path, apart from traced-path errors', () => {
+  const root = mkdtempSync(join(tmpdir(), 'goal-parse-reason-'));
+  try {
+    const longGoalFile = join(root, 'nested/'.repeat(40), 'GOAL-parse-failure.md');
+    mkdirSync(dirname(longGoalFile), { recursive: true });
+    const document = '## TRACED PATHS\n- src/a.ts\n';
+    writeFileSync(longGoalFile, document);
+    expect(longGoalFile.length).toBeGreaterThan(240);
+    const options = { goalFile: longGoalFile, declaredPathsRoot: root, liveRunWindowMinutes: 30, recentChangeWindowDays: 7 };
+    const deps = {
+      readGoalDocument: () => document, listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+    };
+
+    const parseFailed = decideAskPreflight({
+      ...options,
+    }, {
+      ...deps,
+      // ⛔ 파서가 던지는 자리 — 그 예외가 밖으로 새면 사유가 원장에 안 남는다.
+      tracedPaths: () => { throw new Error('TRACED PATHS 절 판독 실패: 닫히지 않은 코드 펜스'); },
+    }, true);
+    expect(parseFailed.shouldLaunch).toBe(false);
+    const parseBlocker = parseFailed.result.blockers.find((blocker) => blocker.reasonCode === 'goal-parse');
+    expect(parseBlocker).toMatchObject({
+      kind: 'goal-unreadable',
+      reasonCode: 'goal-parse',
+      checkName: 'goal-parse',
+      targetPath: longGoalFile,
+    });
+    expect(parseBlocker?.targetPath).toBe(longGoalFile);
+    expect(parseBlocker?.targetPath?.length).toBeGreaterThan(240);
+    expect(parseBlocker?.name).not.toContain(' — ');
+    expect(parseBlocker?.detail).toContain('닫히지 않은 코드 펜스');
+    // 골 판독 실패(goal-unreadable)도 traced path 오류(missing-traced-path)도 아닌 «별개 갈래»다.
+    expect(parseFailed.result.blockers.some((blocker) => blocker.reasonCode === 'goal-unreadable')).toBe(false);
+    expect(parseFailed.result.blockers.some((blocker) => blocker.reasonCode === 'missing-traced-path')).toBe(false);
+    // 해석 실패는 「대상 경로 0」이 아니다 — 일반 문면으로 뭉개지 않는다.
+    expect(parseFailed.result.blockers.some((blocker) => blocker.kind === 'no-target-paths')).toBe(false);
+
+    // 대조 — 해석은 되고 경로가 없을 때의 사유는 그대로 traced path 갈래다.
+    writeFileSync(join(root, 'goal.md'), document);
+    const tracedVm = decideAskPreflight({
+      ...options, goalFile: join(root, 'goal.md'), declaredPathsRoot: root,
+    }, { ...deps, tracedPaths: () => ['src/absent.ts'] }, true);
+    expect(tracedVm.result.blockers).toContainEqual(expect.objectContaining({
+      reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: 'src/absent.ts',
+    }));
+    expect(tracedVm.result.blockers.some((blocker) => blocker.reasonCode === 'goal-parse')).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -3521,6 +3573,11 @@ describe('셋째 축이 «실행 경로»에 있다 — 실물 진입점', () =>
 describe('parseAskTargetPathHints — 저작 «전»에 쓸 경로 힌트', () => {
   test('[first-line-only] 첫 줄의 「대상 경로:」만 읽는다', () => {
     const ask = '대상 경로: src/a.ts · src/b.ts\n\nSituation: 본문에 src/never.ts 가 나와도 안 뽑는다';
+    expect(parseAskTargetPathHints(ask)).toEqual(['src/a.ts', 'src/b.ts']);
+  });
+
+  test('[multiline-original-preserves-first-line-paths] 첫 줄 경로 라벨과 여러 줄 산문이 함께 있어도 경로를 보존한다', () => {
+    const ask = '대상 경로: src/a.ts · src/b.ts\n수리 이유: 두 경로의 경계를 확인한다';
     expect(parseAskTargetPathHints(ask)).toEqual(['src/a.ts', 'src/b.ts']);
   });
 

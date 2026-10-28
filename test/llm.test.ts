@@ -33,6 +33,7 @@ import { createContextRegistry, addAttachment } from '../src/context';
 import { setUserConfigOverlay } from '../src/user-config';
 import { debug } from '../src/debug/log';
 import { ProviderFallbackError } from '../src/session-runtime/retry-policy';
+import { resetProviderCircuitForTest } from '../src/session-runtime/provider-circuit';
 
 // ── Helpers ────────────────────────────────────────────────
 
@@ -93,6 +94,7 @@ describe('streamLLMWithTools provider fallback', () => {
   }
 
   beforeEach(() => {
+    resetProviderCircuitForTest();
     for (const key of ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'LOCAL_LLM_URL']) {
       savedEnv[key] = process.env[key];
     }
@@ -106,6 +108,7 @@ describe('streamLLMWithTools provider fallback', () => {
   });
 
   afterEach(() => {
+    resetProviderCircuitForTest();
     Object.assign(PROVIDERS, originalProviders);
     setUserConfigOverlay(null);
     for (const [key, value] of Object.entries(savedEnv)) {

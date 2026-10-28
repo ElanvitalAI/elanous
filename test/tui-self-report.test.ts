@@ -9,7 +9,7 @@ import { join } from 'node:path';
 
 import { type SelfReportFrame } from '../src/capture/self-report-frame.js';
 import {
-  createTuiControlTarget, createTuiFrameObserver, startTuiSelfReport, type TuiRowMissingEvent,
+  createTuiControlTarget, createTuiFrameObserver, registerTuiForceStopHandler, startTuiSelfReport, type TuiRowMissingEvent,
 } from '../src/capture/tui-self-report.js';
 import {
   getPtyManifest, removePtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestFrame, upsertPtyManifest,
@@ -112,6 +112,20 @@ describe('createTuiControlTarget · foreground terminal adapter', () => {
     });
     expect(target.canWrite('human')).toBe(true);
     expect(target.canWrite('agent')).toBe(false);
+  });
+
+  test('routes explicit force-stop requests to the registered dashboard turn owner', () => {
+    let calls = 0;
+    const unregister = registerTuiForceStopHandler(() => { calls += 1; return true; });
+    const target = createTuiControlTarget('tui:force-stop');
+    try {
+      expect(target.stopTurn?.(true)).toBe(true);
+      expect(calls).toBe(1);
+    } finally {
+      unregister();
+    }
+    expect(target.stopTurn?.(true)).toBe(false);
+    expect(calls).toBe(1);
   });
 });
 

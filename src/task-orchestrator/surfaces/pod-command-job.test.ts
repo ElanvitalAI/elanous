@@ -14,6 +14,12 @@ import {
   podCommandTargetCommit,
   podCpuMillis,
   resolvePodCpu,
+  podCpuQuantity,
+  podCpuRightsize,
+  podLaunchPreconditions,
+  podRightsizeRefusal,
+  POD_RIGHTSIZE_CONDITION,
+  POD_RIGHTSIZE_VOID_LAUNCHES,
   POD_RESULT_MARKER,
   POD_MARKER_LOG_RETRIES,
   runPodCommand as runPodCommandImpl,
@@ -41,7 +47,7 @@ const base = {
 const testProvenance = { actorKind: 'seat', actor: 'OPC', kind: 'command', run: 'test-run-12345678',
   phase: 'exec', requestedAt: '2026-10-20T09:00:00Z' };
 // The required launch identity changes the baseline bytes; optional Job fields must still leave this baseline untouched.
-const PROVENANCE_MANIFEST_SHA256 = '9b927c763d685222d12552a5f43c94c7560096b06b43fef709976ea037d56760';
+const PROVENANCE_MANIFEST_SHA256 = '885410325c0a6335a8132ed1e56052e85dabaf1b4c4ba0ae4a57bd2c880c6251';
 const runPodCommand = (options: RunPodCommandOptions) => runPodCommandImpl({ provenance: testProvenance, ...options });
 
 function manifest(over: Partial<Parameters<typeof podCommandJobManifest>[0]> = {}) {
@@ -59,7 +65,7 @@ describe('pod command job manifest', () => {
     expect(res(manifest({ clone: true })).requests.memory).toBe('6Gi');
   });
 
-  test('memoryLimit raises only the container memory limit; omitted keeps 16Gi and the pre-change bytes', () => {
+  test('memoryLimit raises only the container memory limit; omitted keeps 16Gi and the baseline bytes', () => {
     const original = manifest({ clone: true });
     const raised = manifest({ clone: true, memoryLimit: '32Gi' });
     const limits = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { limits: { memory: string } } }> } } }).template.spec.containers[0]!.resources.limits;
@@ -68,7 +74,7 @@ describe('pod command job manifest', () => {
     expect(JSON.stringify(manifest({ clone: true, memoryLimit: undefined }))).toBe(JSON.stringify(original));
   });
 
-  test('hostMirror mounts a read-only Directory; omitted mirror preserves the pre-change manifest bytes', () => {
+  test('hostMirror mounts a read-only Directory; omitted mirror preserves the baseline manifest bytes', () => {
     const original = manifest({ clone: true });
     const withMirror = manifest({ clone: true, hostMirror: '/mirror-host/elanous-agent.git' });
     const spec = (withMirror.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }> } } }).template.spec;
@@ -155,7 +161,7 @@ describe('pod command job manifest', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test('W5: tmpfsSizeLimit mounts a memory emptyDir as TMPDIR; omitted keeps the pre-change bytes', () => {
+  test('W5: tmpfsSizeLimit mounts a memory emptyDir as TMPDIR; omitted keeps the baseline bytes', () => {
     const original = manifest({ clone: true });
     const spec = (manifest({ clone: true, tmpfsSizeLimit: '2Gi' }).spec as { template: { spec: { volumes: unknown[]; containers: Array<{ env: unknown[]; volumeMounts: unknown[] }> } } }).template.spec;
     expect(spec.volumes).toContainEqual({ name: 'tmp-mem', emptyDir: { medium: 'Memory', sizeLimit: '2Gi' } });
@@ -165,7 +171,7 @@ describe('pod command job manifest', () => {
     expect(JSON.stringify(manifest({ clone: true, tmpfsSizeLimit: ' ' }))).toBe(JSON.stringify(original));
   });
 
-  test('GATE-SPEED A3①: cpu omitted keeps request 1 / limit 4 and the pre-change bytes; cpu override reaches the Job spec', () => {
+  test('GATE-SPEED A3①: cpu omitted keeps request 1 / limit 4 and the baseline bytes; cpu override reaches the Job spec', () => {
     const res = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { requests: Record<string, string>; limits: Record<string, string> } }> } } }).template.spec.containers[0]!.resources;
     const original = manifest({ clone: true });
     expect(res(original)).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
@@ -1561,5 +1567,203 @@ describe('GATE-POD-RESULT-MARKER — the child prints a done marker so the host 
     expect(childLog).toBe('out');
     expect(calls.some((c) => c.includes('--tail=2'))).toBe(false);
     expect(events.some((e) => e.event === 'result-marker-early')).toBe(false);
+  });
+});
+
+// POD-CPU-REQUEST-RIGHTSIZE-2-FU 무대: 가짜 kubectl(K8s API 응답 고정) ⊕ 가짜 ssh 시험 ⊕ 가짜 풀 — runPodCommand 생산
+// 경로를 그대로 지나며 발사 선행 조건·no-launch 재발사 금지·측정값 기반 요청량을 본다.
+describe('POD-CPU-REQUEST-RIGHTSIZE-2-FU — gate16+harness40 공존 재측정', () => {
+  function rightsizeStage(o: {
+    nodes?: Array<{ name: string; allocatableCpu: string }>;
+    pods?: Array<{ nodeName: string; cpu?: string }>;
+    canI?: string;
+    podsRc?: number;
+  } = {}) {
+    const applied: Array<Record<string, any>> = [];
+    const calls: string[][] = [];
+    const events: Array<{ category: string; event: string; data: Record<string, any> }> = [];
+    const kubectl: Kubectl = (args, input) => {
+      calls.push([...args]);
+      if (input) { applied.push(JSON.parse(input) as Record<string, any>); return { status: 0, stdout: '', stderr: '' }; }
+      const joined = args.join(' ');
+      if (joined.includes('auth can-i')) return { status: 0, stdout: `${o.canI ?? 'yes'}\n`, stderr: '' };
+      if (args.includes('nodes')) {
+        const nodes = o.nodes ?? [{ name: 'node-b-node', allocatableCpu: '8' }];
+        return { status: 0, stdout: JSON.stringify({ items: nodes.map((n) => ({ metadata: { name: n.name }, status: { allocatable: { cpu: n.allocatableCpu } } })) }), stderr: '' };
+      }
+      if (args.includes('pods') && joined.includes('--all-namespaces')) {
+        const items = (o.pods ?? []).map((p) => ({ spec: { nodeName: p.nodeName, containers: [{ resources: { requests: { cpu: p.cpu ?? '1' } } }] } }));
+        return { status: o.podsRc ?? 0, stdout: JSON.stringify({ items }), stderr: '' };
+      }
+      if (joined.includes('.status.conditions')) return { status: 0, stdout: 'Complete', stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: '', stderr: '' };
+      return { status: 0, stdout: '0', stderr: '' };
+    };
+    return { kubectl, applied, calls, events, log: (category: string, event: string, data: Record<string, unknown>) => { events.push({ category, event, data: data as Record<string, any> }); } };
+  }
+  const resources = (job: Record<string, any>) => job.spec.template.spec.containers[0].resources as { requests: Record<string, string>; limits: Record<string, string> };
+  const jobOf = (stage: ReturnType<typeof rightsizeStage>) => stage.applied.find((body) => body.kind === 'Job');
+
+  test('run-477b2ee2·run-7bc13989 는 CPU 측정 전에 no-launch(pod-error)로 끝나 같은 조건의 무효 재발사를 금지한다', async () => {
+    const stage = rightsizeStage();
+    await expect(runPodCommand({
+      command: ['true'], name: 'rightsize-void', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-void', kubectl: stage.kubectl, log: stage.log,
+      cpuRightsize: {},
+    })).rejects.toThrow('same condition gate16+harness40 re-launch refused — run-477b2ee2:pod-error·run-7bc13989:pod-error ended before any CPU measurement');
+    // 발사 0: Secret 도 Job 도 적용되지 않았고, local substrate 로 대체한 흔적도 없다.
+    expect(stage.applied).toEqual([]);
+    const refused = stage.events.filter((e) => e.event === 'rightsize-relaunch-refused');
+    expect(refused).toHaveLength(1);
+    expect(refused[0]).toMatchObject({
+      category: 'pod.command-job',
+      data: { condition: POD_RIGHTSIZE_CONDITION, launched: false, fallback: 'none', hitl: true, substrate: 'pod' },
+    });
+    expect(refused[0]!.data.priorVoid.map((record: { run: string }) => record.run)).toEqual(['run-477b2ee2', 'run-7bc13989']);
+    expect(POD_RIGHTSIZE_VOID_LAUNCHES.map((record) => record.run)).toEqual(['run-477b2ee2', 'run-7bc13989']);
+    // 판정은 기억이 아니라 기록이다: 사용량을 잰 표본이 있으면 같은 조건이라도 재발사가 아니다.
+    const measured = rightsizeStage();
+    const { refused: stillRefused } = podRightsizeRefusal({
+      condition: POD_RIGHTSIZE_CONDITION,
+      samples: [{ label: 'gate16', requestMillis: 1000, usageMillis: 2200, waitMs: 1_000 }],
+    });
+    expect(stillRefused).toBe(false);
+    await runPodCommand({
+      command: ['true'], name: 'rightsize-measured', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-measured', kubectl: measured.kubectl, log: measured.log,
+      cpuRightsize: { samples: [{ label: 'gate16', requestMillis: 1000, usageMillis: 2200, waitMs: 1_000 }] },
+    });
+    expect(measured.events.some((e) => e.event === 'rightsize-relaunch-refused')).toBe(false);
+    expect(resources(jobOf(measured)!).requests.cpu).toBe('2800m');
+  });
+
+  test('풀 슬롯·SSH·Pod admission·allocatable/request 기준선을 기록하고 하나라도 불가하면 발사 0·사유·HITL 이며 local substrate 로 대체하지 않는다', async () => {
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
+    const blocked = rightsizeStage({ canI: 'no', nodes: [{ name: 'node-b-node', allocatableCpu: '2' }], pods: [{ nodeName: 'node-b-node', cpu: '1500m' }] });
+    const samples = [{ label: 'gate16', requestMillis: 1000, usageMillis: 2200, waitMs: 1_000 }];
+    await expect(runPodCommand({
+      command: ['true'], name: 'rightsize-blocked', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-blocked', kubectl: blocked.kubectl, log: blocked.log,
+      poolScheduler: new PodPoolScheduler([member]),
+      syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+      sshProbe: () => ({ status: 255, stdout: '', stderr: 'ssh: connect to host node-b port 22: Connection refused' }),
+      cpuRightsize: { samples },
+    })).rejects.toThrow('발사 선행 조건 미충족(ssh, admission, baseline) — 발사 0 · HITL');
+    expect(blocked.applied).toEqual([]);
+    const refused = blocked.events.find((e) => e.event === 'rightsize-launch-refused')!;
+    expect(refused.data).toMatchObject({ condition: POD_RIGHTSIZE_CONDITION, host: 'node-b', blocked: ['ssh', 'admission', 'baseline'], launched: false, fallback: 'none', hitl: true, substrate: 'pod' });
+    expect(refused.data.preconditions).toMatchObject({
+      slots: { ok: true, ready: 1, capacity: 1 },
+      ssh: { ok: false, host: 'node-b', detail: 'ssh: connect to host node-b port 22: Connection refused' },
+      admission: { ok: false, detail: 'can-i no' },
+      baseline: {
+        ok: false, node: 'node-b-node', allocatableCpuMillis: 2000, requestedCpuMillis: 1500,
+        requestCpuMillis: 1000, freeCpuMillis: 500, detail: 'free 500m < request 1000m',
+      },
+    });
+
+    // 풀 슬롯 0 — 자리가 없으면 발사하지 않고 slots 를 사유로 남긴다.
+    const noSlot = rightsizeStage();
+    const emptyPool = { context: 'pool-node-b', capacity: 0, k3dCluster: 'elanous-pool' } as PodPoolMember;
+    const stubPool = {
+      members: [emptyPool],
+      tryAcquire: async () => emptyPool,
+      release: () => {},
+    } as unknown as PodPoolScheduler;
+    await expect(runPodCommand({
+      command: ['true'], name: 'rightsize-no-slot', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-no-slot', kubectl: noSlot.kubectl, log: noSlot.log,
+      poolScheduler: stubPool, cpuRightsize: { samples },
+    })).rejects.toThrow('발사 선행 조건 미충족(slots) — 발사 0 · HITL');
+    expect(noSlot.applied).toEqual([]);
+    expect(noSlot.events.find((e) => e.event === 'rightsize-launch-refused')!.data.preconditions.slots)
+      .toEqual({ ok: false, ready: 0, capacity: 0, detail: 'no ready pool member' });
+
+    // 선행 조건이 다 충족되면 같은 기록이 ok 이고 Job 이 실제로 발사된다.
+    const passing = rightsizeStage({ pods: [{ nodeName: 'node-b-node', cpu: '2000m' }] });
+    const oneSlotPool = { members: [member], tryAcquire: async () => member, release: () => {} } as unknown as PodPoolScheduler;
+    await runPodCommand({
+      command: ['true'], name: 'rightsize-provided', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-provided', kubectl: passing.kubectl, log: passing.log,
+      poolScheduler: oneSlotPool,
+      syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
+      sshProbe: () => ({ status: 0, stdout: '', stderr: '' }),
+      cpuRightsize: { samples, host: 'node-b' },
+    });
+    const recorded = passing.events.find((e) => e.event === 'rightsize-preconditions')!.data.preconditions;
+    expect(recorded).toMatchObject({
+      slots: { ok: true, ready: 1, capacity: 1 },
+      ssh: { ok: true, host: 'node-b' },
+      admission: { ok: true },
+      baseline: { ok: true, node: 'node-b-node', allocatableCpuMillis: 8000, requestedCpuMillis: 2000, freeCpuMillis: 6000, requestCpuMillis: 1000 },
+    });
+    expect(jobOf(passing)).toBeDefined();
+  });
+
+  test('공존 측정값(usage·대기 시간·eviction 원문)으로 요청량을 조정하고, 재측정 불가면 yellow 로 기본 요청량을 지킨다', async () => {
+    const coResident = [
+      { label: 'gate16', requestMillis: 1000, usageMillis: 2200, waitMs: 4_000 },
+      { label: 'harness40', requestMillis: 1000, usageMillis: 1900, waitMs: 6_000 },
+    ];
+    const green = rightsizeStage({ pods: [{ nodeName: 'node-b-node', cpu: '2000m' }] });
+    await runPodCommand({
+      command: ['true'], name: 'rightsize-green', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-green', kubectl: green.kubectl, log: green.log,
+      cpuRightsize: { host: 'node-b', samples: coResident },
+    });
+    expect(resources(jobOf(green)!)).toEqual({ requests: { cpu: '2800m', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
+    // 매니페스트에 실린 값 = 측정 판정값(같은 계산이 두 곳에 있지 않다).
+    expect(podCpuRightsize(coResident)).toMatchObject({ status: 'green', request: '2800m', requestMillis: 2800 });
+    expect(resources(jobOf(green)!).requests.cpu).toBe(podCpuRightsize(coResident).request);
+    const verdict = green.events.find((e) => e.event === 'cpu-rightsize')!.data;
+    expect(verdict).toMatchObject({ condition: POD_RIGHTSIZE_CONDITION, host: 'node-b', status: 'green', request: '2800m' });
+    expect(verdict.reason).toContain('peak usage 2200m over 2 samples');
+    expect(verdict.samples).toEqual([
+      { label: 'gate16', requestMillis: 1000, usageMillis: 2200, waitMs: 4_000, eviction: null },
+      { label: 'harness40', requestMillis: 1000, usageMillis: 1900, waitMs: 6_000, eviction: null },
+    ]);
+
+    // eviction 원문이 있으면 그 원문을 사유로 남기고 기본 요청량을 지킨다(yellow).
+    const evicted = rightsizeStage();
+    await runPodCommand({
+      command: ['true'], name: 'rightsize-evicted', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-evicted', kubectl: evicted.kubectl, log: evicted.log,
+      cpuRightsize: { samples: [coResident[0]!, { label: 'harness40', requestMillis: 1000, usageMillis: null, waitMs: null, eviction: 'Evicted  0/1 nodes are available: 1 Insufficient cpu.' }] },
+    });
+    expect(resources(jobOf(evicted)!)).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
+    const evictedVerdict = evicted.events.find((e) => e.event === 'cpu-rightsize')!.data;
+    expect(evictedVerdict).toMatchObject({ status: 'yellow', request: '1' });
+    expect(evictedVerdict.reason).toContain('eviction on harness40: Evicted 0/1 nodes are available: 1 Insufficient cpu.');
+
+    // 발사는 됐지만 사용량을 못 쟀으면(재측정 불가) yellow · 기본값 — 무효 재발사 금지와는 다른 축이다.
+    const unmeasured = rightsizeStage();
+    await runPodCommand({
+      command: ['true'], name: 'rightsize-unmeasured', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-unmeasured', kubectl: unmeasured.kubectl, log: unmeasured.log,
+      cpuRightsize: {
+        priorLaunches: [{ run: 'run-4dd07a14aa', condition: POD_RIGHTSIZE_CONDITION, outcome: 'launched' }],
+        samples: [{ label: 'gate16', requestMillis: 1000, usageMillis: null, waitMs: 1_000 }],
+      },
+    });
+    expect(resources(jobOf(unmeasured)!).requests.cpu).toBe('1');
+    expect(unmeasured.events.find((e) => e.event === 'cpu-rightsize')!.data)
+      .toMatchObject({ status: 'yellow', request: '1', reason: 'usage unmeasured on gate16' });
+
+    // 표본이 없으면 같은 yellow — 측정 없이 요청량을 바꾸지 않는다.
+    expect(podCpuRightsize([])).toMatchObject({ status: 'yellow', request: '1', reason: 'no same-host co-residency samples' });
+    expect(podCpuQuantity(1000)).toBe('1');
+    expect(podCpuQuantity(2800)).toBe('2800m');
+  });
+
+  test('요청량 없이 오는 발사(다른 명령·화면)는 선행 조건도 측정도 지나지 않고 종전 Job 바이트 그대로다', async () => {
+    const plain = rightsizeStage();
+    await runPodCommand({
+      command: ['true'], name: 'rightsize-omitted', imageCommit: null, env: {}, configHostMirror: () => undefined,
+      artifactsRoot: '/tmp/pod-command-rightsize-omitted', kubectl: plain.kubectl, log: plain.log,
+    });
+    expect(plain.events.some((e) => e.event.startsWith('rightsize') || e.event === 'cpu-rightsize')).toBe(false);
+    expect(plain.calls.some((args) => args.join(' ').includes('auth can-i'))).toBe(false);
+    expect(resources(jobOf(plain)!)).toEqual({ requests: { cpu: '1', memory: '6Gi' }, limits: { memory: '16Gi', cpu: '4' } });
+    expect(createHash('sha256').update(JSON.stringify(manifest({ clone: true }))).digest('hex')).toBe(PROVENANCE_MANIFEST_SHA256);
   });
 });

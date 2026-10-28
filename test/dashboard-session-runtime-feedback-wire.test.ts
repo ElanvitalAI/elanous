@@ -44,12 +44,12 @@ describe('dashboard → session-runtime 진행 엔벨로프 배선 (wire pin)', 
   });
 
   test('진입점이 그 디스패처를 «부른다»', () => {
-    expect(dashboard).toContain('await dispatchDashboardSessionRuntimeTool(name, args, {');
+    expect(dashboard).toContain('const dispatchPromise = dispatchDashboardSessionRuntimeTool(name, args, {');
   });
 
   test('그 호출이 렌더 의존 셋을 «넘긴다» — 하나라도 빠지면 진행이 화면에 못 닿는다', () => {
     const callSite = dashboard.slice(
-      dashboard.indexOf('await dispatchDashboardSessionRuntimeTool(name, args, {'),
+      dashboard.indexOf('const dispatchPromise = dispatchDashboardSessionRuntimeTool(name, args, {'),
     ).slice(0, 600);
     expect(callSite).toContain('muted: C.muted');
     expect(callSite).toContain('pushChatLine');

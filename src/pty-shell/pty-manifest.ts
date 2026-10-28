@@ -104,6 +104,10 @@ export interface PtyManifestRow {
   /** TUI 턴 상태 — TUI 가 턴 시작·끝에 스스로 적는다(화면 글자 추정 아님). 없으면 기록 안 하는 행/옛 판. */
   turnState?: PtyTurnState;
   turnAt?: number;
+  /** 마지막 진전 시각(epoch ms) — 스트림 텍스트·도구 시작/끝·상태 줄에서 갱신(SURVIVAL-PROGRESS-CLOCK). */
+  progressAt?: number;
+  /** Esc 로 턴 중단을 청한 시각(epoch ms) — 이후 busy 가 지속되면 abort-ignored 판정 재료. */
+  abortRequestedAt?: number;
   /** 행 소유 프로세스가 «기동 때» 실은 코드 판 — 트리 HEAD(`codeSha`)와 다른 축이다. */
   build?: PtyBuildIdentity;
 }
@@ -128,6 +132,7 @@ let _dbFailed = false;
 let _dbPathForTesting: string | null = null;
 const _lastSnapshotAt = new Map<string, number>();
 const _lastFrameAt = new Map<string, number>();
+const _lastProgressAt = new Map<string, number>();
 
 export function setPtyManifestDbPathForTesting(path: string | null): void {
   _db?.close();
@@ -136,6 +141,7 @@ export function setPtyManifestDbPathForTesting(path: string | null): void {
   _dbPathForTesting = path;
   _lastSnapshotAt.clear();
   _lastFrameAt.clear();
+  _lastProgressAt.clear();
 }
 
 function db(): Database | null {
@@ -172,6 +178,11 @@ function db(): Database | null {
 }
 
 export function migratePtyManifestSchema(d: Database): void {
+  // 이행 문장 전체를 한 트랜잭션에 묶는다 — 문장별 autocommit fsync(첫 열기 ~35회)를 없애
+  // 매니페스트 DB 를 처음 여는 비용을 크게 줄인다. 이미 트랜잭션 안이면 그대로 진행한다.
+  let ownsTxn = false;
+  try { d.run('BEGIN'); ownsTxn = true; } catch { /* caller transaction */ }
+  try {
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN nickname TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN purpose TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN seat TEXT'); } catch { /* already exists */ }
@@ -201,12 +212,19 @@ export function migratePtyManifestSchema(d: Database): void {
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN last_control_at INTEGER'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN turn_state TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN turn_at INTEGER'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN progress_at INTEGER'); } catch { /* already exists */ }
+  try { d.run('ALTER TABLE pty_manifest ADD COLUMN abort_requested_at INTEGER'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_version TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_sha TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_source TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest ADD COLUMN build_code_root TEXT'); } catch { /* already exists */ }
   try { d.run('ALTER TABLE pty_manifest DROP COLUMN chain_depth'); } catch { /* legacy schema has no duplicate column */ }
   try { d.run('UPDATE pty_manifest SET closed_at=updated_at WHERE alive=0 AND closed_at=0'); } catch { /* fail-soft */ }
+  } finally {
+    if (ownsTxn) {
+      try { d.run('COMMIT'); } catch { try { d.run('ROLLBACK'); } catch { /* fail-soft */ } }
+    }
+  }
 }
 
 function codeShaForWorkdir(workdir: string | undefined): string {
@@ -290,6 +308,7 @@ export function upsertPtyManifest(row: {
     // 행을 (다시) 세우면 snapshot·frame 칸이 비워진다 — 같은 프로세스의 쓰기 스로틀도 비워 다음 쓰기가 바로 닿게 한다.
     _lastSnapshotAt.delete(row.id);
     _lastFrameAt.delete(row.id);
+    _lastProgressAt.delete(row.id);
     const d = db(); if (!d) return;
     const runId = getHarnessRunId(process.env);
     const runIdSource = getHarnessRunIdSource();
@@ -343,7 +362,7 @@ export function upsertPtyManifest(row: {
            terminal_origin_reason=excluded.terminal_origin_reason, external_tool_name=excluded.external_tool_name,
            started_at=excluded.started_at, alive=1, exit_code=NULL,
            snapshot='', snapshot_at=0, frame='', frame_at=0, closed_at=0, updated_at=excluded.updated_at,
-           turn_state=NULL, turn_at=NULL, build_version=NULL, build_sha=NULL, build_source=NULL, build_code_root=NULL`,
+           turn_state=NULL, turn_at=NULL, progress_at=NULL, abort_requested_at=NULL, build_version=NULL, build_sha=NULL, build_source=NULL, build_code_root=NULL`,
         values,
       );
       d.run('COMMIT');
@@ -434,11 +453,46 @@ export function updatePtyManifestSession(id: string, sessionId: string, now: num
   }
 }
 
-/** 턴 상태 기록 — 행이 없거나 db 를 못 열면 false(호출자가 관측을 남긴다). */
+/** 턴 상태 기록 — 행이 없거나 db 를 못 열면 false(호출자가 관측을 남긴다). 새 busy 턴은 이전 Esc 청구를 비운다. */
 export function updatePtyManifestTurn(id: string, turn: PtyTurnState, at: number): boolean {
   try {
     const d = db(); if (!d) return false;
-    return d.run('UPDATE pty_manifest SET turn_state=?, turn_at=? WHERE id=?', [turn, at, id]).changes > 0;
+    const result = turn === 'busy'
+      ? d.run('UPDATE pty_manifest SET turn_state=?, turn_at=?, progress_at=?, abort_requested_at=NULL WHERE id=?', [turn, at, at, id])
+      : d.run('UPDATE pty_manifest SET turn_state=?, turn_at=? WHERE id=?', [turn, at, id]);
+    if ((result.changes ?? 0) > 0 && turn === 'busy') _lastProgressAt.set(id, at);
+    return (result.changes ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** 진전 기록 스로틀 — 같은 행은 이만큼 안에 다시 쓰지 않는다. */
+export const PTY_MANIFEST_PROGRESS_THROTTLE_MS = 5_000;
+
+/**
+ * 마지막 진전 시각 기록(SURVIVAL-PROGRESS-CLOCK). 같은 행을 5초 안에 다시 쓰면 생략하지만
+ * «실패가 아니다» — true 를 돌려 호출자의 실패 관측을 일으키지 않는다. 실패(0행·db 오류)만 false.
+ */
+export function updatePtyManifestProgress(id: string, at: number): boolean {
+  try {
+    const last = _lastProgressAt.get(id);
+    if (last !== undefined && at - last < PTY_MANIFEST_PROGRESS_THROTTLE_MS) return true;
+    const d = db(); if (!d) return false;
+    const result = d.run('UPDATE pty_manifest SET progress_at=?, updated_at=? WHERE id=?', [at, at, id]);
+    const ok = (result.changes ?? 0) > 0;
+    if (ok) _lastProgressAt.set(id, at);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Esc 로 턴 중단을 청한 시각 기록 — busy 턴이 이 뒤로 계속되면 abort-ignored 판정 재료가 된다. */
+export function updatePtyManifestAbortRequested(id: string, at: number): boolean {
+  try {
+    const d = db(); if (!d) return false;
+    return (d.run('UPDATE pty_manifest SET abort_requested_at=?, updated_at=? WHERE id=?', [at, at, id]).changes ?? 0) > 0;
   } catch {
     return false;
   }
@@ -903,6 +957,8 @@ function mapRow(r: Record<string, unknown>): PtyManifestRow {
     closedAt: Number(r.closed_at ?? 0),
     codeSha: String(r.code_sha ?? ''),
     ...(r.turn_state === 'busy' || r.turn_state === 'idle' ? { turnState: r.turn_state, turnAt: Number(r.turn_at ?? 0) } : {}),
+    ...(r.progress_at === null || r.progress_at === undefined ? {} : { progressAt: Number(r.progress_at) }),
+    ...(r.abort_requested_at === null || r.abort_requested_at === undefined ? {} : { abortRequestedAt: Number(r.abort_requested_at) }),
     ...(typeof r.build_sha === 'string' ? { build: mapBuild(r) } : {}),
     updatedAt: Number(r.updated_at),
   };

@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { act, create, type ReactTestInstance } from 'react-test-renderer';
 import { ReactFlow } from '@xyflow/react';
+import { AppRouterContext } from 'next/dist/shared/lib/app-router-context.shared-runtime';
+import { SearchParamsContext } from 'next/dist/shared/lib/hooks-client-context.shared-runtime';
+import LiveRunPage from '@/app/live-run/page';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { createNexusClient, type HarnessRunTraversal, type HarnessTraversalStepWire, type RunGraphDetail } from '@/nexus/client';
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
@@ -42,10 +45,11 @@ const nodeMock = (width: number) => () => ({
   clientWidth: width, clientHeight: 700, offsetWidth: width, offsetHeight: 700, style: {}, ownerDocument: globalThis.document,
 });
 
-async function mount(width: number) {
+async function mount(width: number, requests: string[] = [], traversal = TRAVERSAL, graph = GRAPH, throughPage = false) {
   const fetchImpl = (async (url: string) => {
-    if (String(url).includes('/v1/harness/run-traversal')) return new Response(JSON.stringify(TRAVERSAL), { status: 200 });
-    if (String(url).includes('/v1/graphs/')) return new Response(JSON.stringify(GRAPH), { status: 200 });
+    requests.push(String(url));
+    if (String(url).includes('/v1/harness/run-traversal')) return new Response(JSON.stringify(traversal), { status: 200 });
+    if (String(url).includes('/v1/graphs/')) return new Response(JSON.stringify(graph), { status: 200 });
     return new Response('{}', { status: 200 });
   }) as unknown as typeof fetch;
   const client = createNexusClient({ baseUrl: 'http://daemon', fetchImpl });
@@ -55,7 +59,13 @@ async function mount(width: number) {
     root = create(
       <QueryClientProvider client={queryClient}>
         <NexusProvider client={client}>
-          <LiveRunGraph runId="run-390" />
+          {throughPage ? (
+            <AppRouterContext.Provider value={{ replace: () => {} } as never}>
+              <SearchParamsContext.Provider value={new URLSearchParams({ run: 'run-390' })}>
+                <LiveRunPage />
+              </SearchParamsContext.Provider>
+            </AppRouterContext.Provider>
+          ) : <LiveRunGraph runId="run-390" />}
         </NexusProvider>
       </QueryClientProvider>,
       { createNodeMock: nodeMock(width) },
@@ -137,6 +147,35 @@ describe('LiveRunGraph — 390px', () => {
     const aside = root.root.findByProps({ 'aria-label': '실행 타임라인' });
     expect(aside.props.className).toContain('max-h-[300px]');
     expect(aside.props.className).not.toContain('max-h-[420px]');
+  });
+
+  test('390px 조회 경로 — 완료된 런의 노드 이름·상태와 밟은 간선의 캡처 대기 표식', async () => {
+    const requests: string[] = [];
+    const longName = 'compose-the-actual-task-agent-result';
+    const traversal = { ...TRAVERSAL, steps: STEPS.map((step) => step.node === 'compose' ? { ...step, node: longName } : step) };
+    const graph = { ...GRAPH, nodes: GRAPH.nodes.map((node) => node.node_id === 'compose' ? { ...node, node_id: longName } : node),
+      edges: GRAPH.edges.map((edge) => ({ ...edge, from: edge.from === 'compose' ? longName : edge.from, to: edge.to === 'compose' ? longName : edge.to })) };
+    root = await mount(390, requests, traversal, graph, true);
+    expect(root.root.findAllByType(LiveRunPage)).toHaveLength(1);
+    expect(root.root.findAllByType(LiveRunGraph)).toHaveLength(1);
+    expect(requests).toContain('http://daemon/v1/harness/run-traversal?runId=run-390');
+    expect(requests).toContain('http://daemon/v1/graphs/demo-loop');
+    await act(async () => { root!.root.findByProps({ 'data-testid': 'timeline-step-2' }).props.onClick(); });
+    const flow = root.root.findByType(ReactFlow);
+    const edges = flow.props.edges as Array<{ source: string; target: string; data: { taken: boolean; active: boolean } }>;
+    expect(edges.some((edge) => edge.source === 'intake' && edge.target === longName && edge.data.taken && !edge.data.active)).toBe(true);
+    const node = root.root.findByProps({ 'data-testid': `live-node-${longName}` });
+    expect(node.props['data-state']).toBe('passed');
+    const label = node.findAll((child) => child.type === 'div' && text(child) === longName && child.props.className?.includes('font-mono'))[0];
+    expect(label.props.className).toContain('overflow-x-auto');
+    expect(label.props.className).not.toContain('truncate');
+    expect(label.props.title).toBe(longName);
+    const section = root.root.findByProps({ 'aria-label': '실행 그래프' });
+    expect(section.props['data-viewport']).toBe('narrow');
+    expect(section.props.className).toContain('h-[65dvh]');
+    const taken = edges.find((edge) => edge.source === 'intake' && edge.target === longName)!;
+    const renderedEdge = flow.props.edgeTypes.live({ id: `intake-${longName}`, data: taken.data });
+    expect(renderedEdge.props.children[0].props['data-testid']).toBe(`edge-token-intake-${longName}`);
   });
 
   test('넓은 화면(≥700px) 배치는 그대로 — 좁은 화면 수리가 넓은 골을 침범하지 않는다', async () => {

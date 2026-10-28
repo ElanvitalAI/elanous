@@ -40,6 +40,15 @@ export interface RunStopRecord {
 export const RUN_STOP_EVENT = 'stop';
 export const RUN_STOP_CAUSE_MAX = 120;
 
+type RunStopListener = (entry: RunLedgerEntry) => void;
+const runStopListeners = new Set<RunStopListener>();
+
+/** Subscribe to live terminal run-stop facts. The durable ledger remains the source of truth. */
+export function onRunStop(listener: RunStopListener): () => void {
+  runStopListeners.add(listener);
+  return () => { runStopListeners.delete(listener); };
+}
+
 export interface RunStopInput {
   runId: string;
   goalId?: string;
@@ -121,6 +130,9 @@ export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appe
   write(entry);
   if (recordedThisProcess.size >= RECORDED_MAX) recordedThisProcess.clear();
   recordedThisProcess.add(input.runId);
+  for (const listener of runStopListeners) {
+    try { listener(entry); } catch { /* wake consumers cannot change run outcome */ }
+  }
   try {
     debug.log('self-implement.run-stop', 'recorded', { runId: input.runId, site: input.site ?? null, ...record, requestedClass: input.class ?? null });
   } catch { /* observation is fail-soft */ }

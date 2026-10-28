@@ -2236,7 +2236,10 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       };
       if (failedTest) {
         const worktreeLog = failedTest.output ?? '';
-        const failedFiles = [...new Set(extractGateTestFailures(worktreeLog)
+        // A supplied gate runner can report a virtual checkout, just like gate-cli's injected runner.
+        const currentFileExists = o.runIntegrityGate ? undefined : (file: string) => existsSync(resolve(cwd, file));
+        const worktreeFailures = extractGateTestFailures(worktreeLog, currentFileExists);
+        const failedFiles = [...new Set(worktreeFailures
           .flatMap((failure) => failure.file ? [failure.file] : []))];
         // 워크트리와 같은 묶음으로 베이스라인을 돌려 파일 간 간섭을 재현한다. 스코프가 없으면 실패 파일로 폴백.
         const testArgs = gateOpts.testArgs;
@@ -2246,14 +2249,14 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         const baseline = (o.runGateBaseline ?? runGateBaseline)(cwd, baselineFiles, baselineRefs.get(cwd));
         const rerun = (o.rerunBunTimeoutFailures ?? rerunBunTimeoutFailures)(
           cwd,
-          extractGateTestFailures(worktreeLog),
+          worktreeFailures,
           undefined,
           baseline.status === 'unknown' ? undefined : (baseline.output ?? ''),
           baseline.missingAtBase ?? [],
         );
         const rerunObservations = rerun instanceof Map ? rerun : rerun.observations;
         const rerunNotRun = rerun instanceof Map ? 0 : rerun.rerunNotRun;
-        const report = buildGateBaselineReport(worktreeLog, baseline, rerunObservations, rerunNotRun);
+        const report = buildGateBaselineReport(worktreeLog, baseline, rerunObservations, rerunNotRun, currentFileExists);
         baselineReport = report;
         baselineFailures = report.failures;
         const unknownReason = baseline.unknownReason;

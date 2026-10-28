@@ -1,8 +1,12 @@
 // M4-5 (2026-05-12 · Phase 4 N5-5) — node catalog tests.
 //
-// Lock the 20-node catalog · search ranking · spec rendering · list
+// Lock the 24-kind catalog · search ranking · spec rendering · list
 // grouping. Any new node kind added to the catalog needs to surface
 // here (catalog 정합성 + render 깔끔).
+//
+// GRAPH-UNIFY-KINDS (0.2.40 · 2026-10-27) — the expected kind set is the
+// registry vocabulary itself (WORKFLOW_CORE_KINDS · showroom · subworkflow
+// included); the catalog is a view over src/graph-kinds/registry.ts.
 
 import { describe, expect, it } from 'bun:test';
 import {
@@ -13,16 +17,11 @@ import {
   renderNodeSpec,
   type NodeCategory,
 } from '../src/workflow-runtime/node-catalog';
+import { WORKFLOW_CORE_KINDS } from '../src/graph-kinds/registry';
 
 describe('NODE_CATALOG · invariants', () => {
-  it('covers all 22 expected node kinds (v1 ⊕ task ⊕ knowledge)', () => {
-    const expectedKinds = [
-      'prompt', 'bash', 'skill', 'cft', 'approval',
-      'if', 'switch', 'iteration',
-      'classify', 'extract', 'set', 'filter', 'template',
-      'http', 'task', 'knowledge',
-      'scheduleTrigger', 'webhookTrigger', 'discordTrigger', 'telegramTrigger', 'manualTrigger', 'chatTrigger',
-    ];
+  it('covers all 24 registry workflow kinds (v1 ⊕ task ⊕ knowledge ⊕ showroom ⊕ subworkflow)', () => {
+    const expectedKinds = [...WORKFLOW_CORE_KINDS];
     const actualKinds = NODE_CATALOG.map(s => s.kind).sort();
     expect(actualKinds).toEqual(expectedKinds.sort());
   });

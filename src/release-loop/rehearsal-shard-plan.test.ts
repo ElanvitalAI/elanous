@@ -33,6 +33,16 @@ test('persisted gate shard board is read from the release ledger, not inferred f
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('split, retry and tail observations do not increase the persisted root shard plan', () => {
+  const rows = ['pod-0', 'pod-1', 'pod-0-0', 'pod-0-retry', 'pod-1-tail'];
+  const plan = planRehearsalShards('0.2.23', '/ledger', '/checkout', {
+    ...deps, board: () => ({ v: 1, version: '0.2.23', updatedAt: new Date().toISOString(),
+      shards: rows.map(id => ({ id, state: 'done' })) }),
+  });
+  expect(plan.gatePlanShards).toBe(2);
+  expect(plan.shards).toBe(2);
+});
+
 test('selection uses the same base and always-include inputs as light RC; board count is only a candidate, not proof', () => {
   const seen: unknown[] = [];
   const plan = planRehearsalShards('0.2.23', '/ledger', '/checkout', { ...deps, select: (cwd, options) => { seen.push([cwd, options]); return deps.select!(cwd, options); } });

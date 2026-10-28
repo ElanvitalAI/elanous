@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations } from '../scripts/ask-marker-check.js';
 import { parseSafeDecisionSignalCommand, pressDecisionSignals } from '../src/self-implement/decision-signal-press.js';
-import { runSelfImplement } from '../src/self-implement/orchestrator.js';
+import { resolveDecisionSignalPress, runSelfImplement } from '../src/self-implement/orchestrator.js';
 import { seams } from '../src/self-implement/test-seams.js';
 
 const temporary: string[] = [];
@@ -59,34 +59,34 @@ describe('decision signal press', () => {
     expect(classified(source).signals[0]?.kind).toBe('real');
   });
 
-  test('a pressed red signal prevents mergePr and preserves the merge-decision event name', async () => {
-    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
-    let merges = 0;
-    const s = seams({
-      createWorktree: async ({ branch, base }) => ({ path: process.cwd(), branch, base }),
-      mergePr: async () => { merges++; return { merged: true }; },
-      writeRunLedger: (entry) => events.push({ event: entry.event, data: entry.data }),
-      reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'clean', reviewed: true, diffTruncated: false }),
-    });
+  // The end-to-end merge refusal stays covered by orchestrator.test.ts; keep this file at the resolver seam.
+  test('resolver passes classified red signals to the injected press without spawning a command', () => {
     const source = '판정 신호: 조건 = false; 관측 = `bun test test/does-not-exist.test.ts`; 기대 = blocked';
-    const result = await runSelfImplement({
-      feature: 'red signal blocks auto merge', autoMerge: true,
-      goalFile: goal([source]), seams: s,
+    const classification = classified(source);
+    let pressCalls = 0;
+    const result = resolveDecisionSignalPress('/goal.md', '/worktree', {
+      stat: () => ({ isFile: () => true }),
+      read: () => source,
+      inspectKinds: () => classification.kinds,
+      inspectObservations: () => classification.observations,
+      inspectSignals: () => classification.signals,
+      press: (input, cwd) => {
+        pressCalls++;
+        expect(cwd).toBe('/worktree');
+        expect(input.signals).toEqual(classification.signals);
+        return {
+          classification: { kinds: input.kinds, observations: input.observations },
+          pressedGreen: [],
+          pressedRed: [{ signal: input.signals[0]!.signal, command: input.signals[0]!.command!, exitCode: 1, stdout: '(fail) missing test file', durationMs: 0 }],
+          pressedBaselineOnly: [],
+          unpressed: [],
+          pressedCount: 1,
+        };
+      },
     });
-
-    expect(merges).toBe(0);
-    expect(result.stage).toBe('pr-opened');
-    const decision = events.find(({ event }) => event === 'merge-decision');
-    expect(decision?.data).toMatchObject({ decision: 'hitl', reason: 'decision-signal-red' });
-    const press = decision?.data.decisionSignalPress as {
-      classification: { kinds: ReturnType<typeof inspectDecisionSignalKinds>; observations: ReturnType<typeof inspectDecisionObservations> };
-      pressedRed: unknown[];
-    };
-    expect(press.classification).toEqual({
-      kinds: inspectDecisionSignalKinds(source),
-      observations: inspectDecisionObservations(source),
-    });
-    expect(press.pressedRed).toHaveLength(1);
+    expect(pressCalls).toBe(1);
+    expect(result.decisionSignalPress?.classification).toEqual({ kinds: classification.kinds, observations: classification.observations });
+    expect(result.decisionSignalPress?.pressedRed).toHaveLength(1);
   });
 
   test('zero executable signals preserves auto merge and records zero presses', async () => {

@@ -46,7 +46,7 @@ function userFacingLines(markdown: string): { lines: string[]; internalDropped: 
       if (text) internalDropped++;
       return [];
     }
-    const publicText = text.replace(/\s+["'“]?Target:\s*next\.["'”]?\s*$/i, '')
+    const publicText = text.replace(/\s+["'“]?Target:\s*next\.["'”]?(?=\s*(?:\([^)]*\))?\s*$)/i, '')
       .replace(/\s+["'“]?Documentation:\s*.*\.["'”]?\s*$/i, '').trim()
       .replace(/^(?:feat|fix)\s*—\s*/i, '');
     return publicText ? [publicText] : [];

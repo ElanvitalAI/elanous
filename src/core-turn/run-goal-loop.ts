@@ -46,6 +46,7 @@ import {
   SEAT_IDLE_NO_WORK_NOTICE, SEAT_TURN_CAP_CONTINUE_PROMPT, SEAT_TURN_CAP_TOOL_NOTICE,
   isEmptyMailListResult, isIdleWaitCall, type SeatTurnCapConfig,
 } from './seat-turn-cap.js';
+import type { TuiChatContext } from './short-question.js';
 
 export {
   CHILD_LIVENESS_HEARTBEAT_ENV,
@@ -186,6 +187,26 @@ export const GOAL_FINAL_ITERATION_NOTE =
 
 /** 중간 답이 «최종 보고형»(미완 목록)인가 — 관측 전용(행동을 바꾸지 않는다). */
 const INTERIM_REPORT_SHAPED = /(?:보고할 수 없|하지\s?못했습니다|못\s?했습니다|완료되지 않았|검증되지 않았|확인하지 못했|not (?:yet )?(?:verified|completed)|cannot report)/i;
+// TUI-FINAL-ANSWER-COMPLETION(S5 · 10-12 S5-01 실측) — «단순 상태·상황 질문 턴»의 결정론 판별.
+//   LLM 호출 0 — 질문 문면만으로 분류한다(AL-eb6797f3b7: 첫 조각은 결정론 분류만). 이 턴의 «완료»는
+//   파일·시험이 아니라 완결 답변 자체다. 그 밖의 실제 골 턴(코딩·자리 운영·쓰기 지시)은 기존대로
+//   update_goal 증거 게이트를 지킨다 — 필요한 작업 도구와 update_goal 을 같은 턴에 쓰는 경로는 그대로다.
+export async function isSimpleStatusQuestionTurn(
+  userText: string | undefined,
+  ctx: TuiChatContext = {},
+): Promise<boolean> {
+  if (!userText) return false;
+  const { classifyTuiChatIntent, isSeatOpsDirective } = await import('./short-question.js');
+  if (isSeatOpsDirective(userText)) return false;
+  const chat = classifyTuiChatIntent(userText, ctx);
+  if (chat.goalLoop || chat.route === '코딩·구현') return false;
+  if (chat.route === '조회') return true;
+  // 읽기·분석 은 «판정기가 잡지 못한 나머지 전부»의 기본 라우팅이기도 하다(reason 'read') —
+  // 작업 지시(예: 「네 편 영상 재촬영」)까지 상태 질문으로 들이면 진행 중인 골이
+  // 미완 진행 한 줄 답에 완결 답으로 끊긴다(TUI-GOAL-INTERIM-QUIET 반례). 물음 형태만 수용한다.
+  return chat.route === '읽기·분석' && chat.reason === 'short-question';
+}
+
 export function isInterimReportShaped(text: string): boolean {
   return INTERIM_REPORT_SHAPED.test(text);
 }
@@ -316,6 +337,8 @@ export function stripGoalRepeatReadbackPreface(text: string): string {
 export interface GoalLoopOptions {
   /** 목표 문구(관측·프레이밍용). 생략 시 마지막 user 메시지에서 추출. */
   objective?: string;
+  /** ACP 대화형 호출자는 false로 기존 provider 재호출 유지; 비대화형·직접 실행은 기본 단축. */
+  terminalCompletionShortcut?: boolean;
   /** across-turn 최대 반복. 폭주 방지 하드캡. 기본 8. (ralph max_iterations 류) */
   maxIterations?: number;
   /** 연속 무진전(동일 tool 시그니처 반복) 허용 횟수 → 초과 시 no_progress 종료로 caller 가
@@ -524,6 +547,12 @@ export async function runGoalLoop(
   //   ✅ 진입 시점의 messages 에는 아직 그 기계 문장이 «없다» ⇒ 여기서 뽑은 값이 이 턴의 사람 문장이다.
   //   ⛔ 고정 prefix 사전으로 「기계 문장인지」를 판별하지 «않는다» — 미등록·변형 프롬프트를 오판하기 때문이다.
   const surfaceUserText = ctx.userText ?? extractRecentUserText(ctx.messages);
+  // TUI-FINAL-ANSWER-COMPLETION(S5) — 이 턴이 «단순 상태·상황 질문»인가(결정론 분류 · LLM 호출 0).
+  //   seatTurnCap 유무를 자리 TUI 판정 신호로 넘긴다 — 자리의 읽기·운영 지시는 기존대로 골 루프를 탄다.
+  const statusQuestionTurn = await isSimpleStatusQuestionTurn(
+    surfaceUserText,
+    { seat: opts.seatTurnCap != null },
+  );
   const harnessRunId = getHarnessRunId();
   const runAttribution = harnessRunId ? { runId: harnessRunId } : {};
 
@@ -570,6 +599,8 @@ export async function runGoalLoop(
   let intentStallReprompts = 0;
   // GOAL-LOOP-MIDRUN-STALL — 도구를 쓴 «뒤»의 말뿐인 턴 재촉은 런당 1회뿐이다.
   let intentStallMidrunUsed = false;
+  // TUI-FINAL-ANSWER-COMPLETION(S5) — 상태 질문 턴의 미완 보고형 답 재촉도 런당 1회뿐이다(④ 참조).
+  let statusQuestionInterimReprompted = false;
 
   debug.log('goal.loop', 'start', {
     sessionId: ctx.sessionId, ...runAttribution, objective, maxIterations, noProgressLimit,
@@ -638,7 +669,8 @@ export async function runGoalLoop(
         reportShaped, finalChars: lastResult.finalText.length,
       }, { level: 'debug' });
     } catch { /* 관측 실패가 루프를 막지 않는다 */ }
-    // Only a real continuation is interim; terminal and last-iteration answers stay visible.
+    // Every non-empty reply that crosses a real iteration boundary is display-only interim;
+    // the renderer's shared verdict decides whether it folds, independent of this loop's continuation reason.
     if (lastResult.finalText.trim()) ctx.callbacks?.onGoalInterim?.(lastResult.finalText, iterations);
     const nextIteration = iterations + 1;
     const toolBudget = ctx.maxToolTurns ?? TOOL_LOOP_MAX_TURNS_DEFAULT;
@@ -851,6 +883,17 @@ export async function runGoalLoop(
       goalRepeatWithheld = '';
       ctx.callbacks?.onText?.(withheld, full);
     };
+    const flushNovelGoalRepeatWithheld = (full: string): void => {
+      if (goalRepeatWithheld === '') return;
+      const readback = stripGoalRepeatReadbackPreface(goalRepeatWithheld);
+      const normalized = goalRepeatStreamNormalize(readback);
+      const prior = goalRepeatPreviousAnswer;
+      const novel = normalized.startsWith(prior)
+        ? normalized.slice(prior.length)
+        : normalized;
+      goalRepeatWithheld = '';
+      if (novel.length > 0) ctx.callbacks?.onText?.(novel, full);
+    };
     const turnCtx: CoreTurnContext = {
       ...ctx,
       messages,
@@ -860,8 +903,12 @@ export async function runGoalLoop(
       ...(surfaceUserText !== undefined ? { userText: surfaceUserText } : {}),
       // TUI-GOAL-LOOP-FRICTION(#46·#63) — update_goal 은 도구 예산 거부를 받지 않고, 답과 함께 오면 그 턴으로 마감한다.
       terminalToolNames: [...(ctx.terminalToolNames ?? []), UPDATE_GOAL_TOOL_NAME],
-      // TUI-H1-GOALLOOP-EMPTY-TAIL — 앞 iteration 의 답이 이미 화면에 있으면 «update_goal 만 → 빈 턴» 은 할 말이 없는
-      //   것이다 — 재촉·경고 없이 빈 답으로 끝내고 아래 완료 판정이 앞 답으로 마감한다(중복 접기와 같은 길).
+      ...(opts.terminalCompletionShortcut !== false ? {
+        terminalCompletionAccepted: (name: string, args: Record<string, unknown>) => name === UPDATE_GOAL_TOOL_NAME
+          && args.status === 'complete' && typeof args.evidence === 'string' && args.evidence.trim().length > 0,
+      } : {}),
+      // The visible-answer hint also guards ACP's legacy empty-tail path; only
+      // the validated completion shortcut is caller-scoped.
       ...(previousFinalText.trim().length > 0 ? { terminalPriorAnswerVisible: true } : {}),
       // update_goal 은 종결 신호 — 실 dispatcher 로 새지 않게 가로채 ack 만 돌려준다.
       dispatchTool: (name, args, dctx) => {
@@ -902,6 +949,13 @@ export async function runGoalLoop(
               return;
             }
             goalRepeatWithholding = false;
+            const combined = goalRepeatWithheld + delta;
+            if (opts.terminalCompletionShortcut !== false && previousFinalText
+              && stripGoalRepeatReadbackPreface(combined).startsWith(previousFinalText)) {
+              goalRepeatWithheld = combined;
+              flushNovelGoalRepeatWithheld(full);
+              return;
+            }
             flushGoalRepeatWithheld(full);
           }
           ctx.callbacks?.onText?.(delta, full);
@@ -955,7 +1009,17 @@ export async function runGoalLoop(
             const pureRepeat = normalized === goalRepeatPreviousAnswer
               || GOAL_REPEAT_READBACK_PHRASES.some((phrase) => normalized.startsWith(phrase)
                 && normalized.slice(phrase.length).replace(GOAL_REPEAT_PREFACE_SEPS, '') === goalRepeatPreviousAnswer);
-            if (!pureRepeat) flushGoalRepeatWithheld(normalized);
+            if (!pureRepeat) {
+              // A completion-only round may have skipped LLM onText because the prior
+              // answer is already visible. Keep only its genuinely new suffix.
+              if (opts.terminalCompletionShortcut !== false && previousFinalText
+                && stripGoalRepeatReadbackPreface(goalRepeatWithheld).startsWith(previousFinalText)) {
+                flushNovelGoalRepeatWithheld(goalRepeatWithheld);
+              } else {
+                // ACP keeps its legacy normalized iteration-flush behavior.
+                flushGoalRepeatWithheld(normalized);
+              }
+            }
           }
           turnNewMessages = msgs;
           ctx.callbacks?.onTurnComplete?.(msgs);
@@ -1018,13 +1082,22 @@ export async function runGoalLoop(
 
     // ①-0 #29 처방 — 자리 운영 턴은 빈 evidence 를 반려하지 않고 이 턴의 답을 증거로 받는다(관측 남김).
     //      답도 비었으면 받을 증거가 없다 — 종전 반려(evidence required)로 그대로 간다.
-    const lenientAnswer = opts.lenientCompletionEvidence === true
-      ? boundReadableText(lastResult.finalText, 200).text.trim()
-      : '';
+    //      TUI-FINAL-ANSWER-COMPLETION(S5) — 단순 상태 질문 턴도 같은 수용을 받는다: 이 턴의 «완료»는
+    //      완결 답변 자체다. 빈 evidence 로 반려·재주입하면 답 뒤 빈 턴이 [NO FINAL SYNTHESIS] 로
+    //      떨어져 최종 답이 비었다(10-12 S5-01 실측). 그 안내 문면 자체는 «증거»가 아니다.
+    const lenientScope: 'seat' | 'status-question' | null = opts.lenientCompletionEvidence === true
+      ? 'seat'
+      : statusQuestionTurn && !lastResult.finalText.includes('[NO FINAL SYNTHESIS]')
+        ? 'status-question'
+        : null;
+    const lenientAnswer = lenientScope === null
+      ? ''
+      : boundReadableText(lastResult.finalText, 200).text.trim();
     if (goalUpdate?.status === 'complete' && goalUpdate.evidence.trim().length === 0 && lenientAnswer.length > 0) {
-      goalUpdate.evidence = `(자리 운영 턴 — 답을 증거로 수용) ${lenientAnswer}`;
+      goalUpdate.evidence = `${lenientScope === 'status-question' ? '(상태 질문 턴 — 완결 답을 증거로 수용)' : '(자리 운영 턴 — 답을 증거로 수용)'} ${lenientAnswer}`;
       debug.log('goal.loop', 'complete-evidence-lenient', {
         sessionId: ctx.sessionId, ...runAttribution, iterations, finalChars: lastResult.finalText.length,
+        scope: lenientScope,
       }, { level: 'info' });
     }
 
@@ -1177,6 +1250,60 @@ export async function runGoalLoop(
       continue;
     }
 
+    // An explicit provider final phase is a bounded terminal signal for a
+    // substantial structured answer outside the coding executor. A finished
+    // report must not reopen tools solely because update_goal was omitted.
+    const structuredFinalAnswer = lastResult.finalPhaseAnswer === true
+      && getHarnessRole() !== 'executor'
+      && lastResult.finalText.trim().length >= 1_200
+      && (lastResult.finalText.match(/^#{1,3}\s+\S+/gm)?.length ?? 0) >= 2
+      && goalUpdate == null
+      && rejectedTools.length === 0
+      && !markerComplete
+      && !markerBlocked
+      && runTests.last?.ok !== false
+      && !seatCapHit;
+    if (structuredFinalAnswer) {
+      debug.log('goal.loop', 'complete', {
+        sessionId: ctx.sessionId, ...runAttribution, iterations, via: 'structured-final-phase',
+        finalChars: lastResult.finalText.length,
+      }, { level: 'info' });
+      return finish(
+        { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
+        { summary: 'Structured answer completed in the provider final phase.', changedFiles: [] },
+      );
+    }
+
+    // ③-5 TUI-FINAL-ANSWER-COMPLETION(S5) — 단순 상태 질문 턴의 완결한 최종 답 = 그 턴의 목표 달성이다.
+    //     structuredFinalAnswer 가 «대형 보고서»의 종결 신호라면, 이것은 그 «한 줄 답» 짝이다. «완료 신호는
+    //     update_goal 호출뿐»이라는 계약은 실제 골 턴(코딩·자리 운영·쓰기)의 것이다 — 상태 질문 턴에 그대로
+    //     밀면 완결 답 뒤에 불필요한 update_goal 재촉이 이어붙고 빈 턴이 [NO FINAL SYNTHESIS] 로 떨어져
+    //     최종 답이 비었다(10-12 S5-01 실측 · 0.2.28 TUI-NO-SYNTH-FALLBACK은 그 빈 답의 사람 말 안내일 뿐).
+    //     결정론 분류(statusQuestionTurn) 턴에서 이번 반복이 도구·신호 없이 완결 답으로 끝났으면 추가 골
+    //     도구 0으로 종결한다. 미완 보고형(isInterimReportShaped)과 [NO FINAL SYNTHESIS] 안내 문면은 완결 답이 아니다.
+    const statusQuestionFinalAnswer = statusQuestionTurn
+      && getHarnessRole() !== 'executor'
+      && goalUpdate == null
+      && rejectedTools.length === 0
+      && !markerComplete
+      && !markerBlocked
+      && runTests.last?.ok !== false
+      && !seatCapHit
+      && lastResult.stopReason === 'end_turn'
+      && lastResult.finalText.trim().length > 0
+      && !isInterimReportShaped(lastResult.finalText)
+      && !lastResult.finalText.includes('[NO FINAL SYNTHESIS]');
+    if (statusQuestionFinalAnswer) {
+      debug.log('goal.loop', 'complete', {
+        sessionId: ctx.sessionId, ...runAttribution, iterations, via: 'status-question-final-answer',
+        finalChars: lastResult.finalText.length,
+      }, { level: 'info' });
+      return finish(
+        { finalText: lastResult.finalText, iterations, stopReason: 'goal_complete', goalComplete: true },
+        { summary: '상태 질문 턴 완결 답 종결 — 추가 골 도구 0 (TUI-FINAL-ANSWER-COMPLETION S5)', changedFiles: [] },
+      );
+    }
+
     // ② blocked(구조화 or 마커) — 3연속(hysteresis)일 때만 수용(조기 give-up 방지).
     if (goalUpdate?.status === 'blocked' || markerBlocked) {
       blockedStreak += 1;
@@ -1244,7 +1371,24 @@ export async function runGoalLoop(
 
     // ④ 순수 텍스트(도구 없음)로 끝났고 종결 신호도 없음 = 일상 답변(목표성 작업 아님).
     //    재주입하지 않고 그대로 수용해 trivial chat 을 이중 루프하지 않는다.
+    //    TUI-FINAL-ANSWER-COMPLETION(S5) — 단 하나의 예외: «단순 상태 질문» 턴의 미완 보고형 답
+    //    (예: 「아직 확인하지 못했습니다」)은 유효한 최종 답이 아니다. 런당 1회만 continuation 을
+    //    재주입해 답을 완성하게 한다(④-0b «런당 1회» 관례와 같은 상한). 두 번째에도 그 모양이면
+    //    이곳의 수용으로 그대로 끝난다 — 이중 루프 방지·maxIterations 하드캡 불변.
     if (!toolActivity) {
+      if (statusQuestionTurn
+        && !seatCapHit
+        && lastResult.finalText.trim().length > 0
+        && isInterimReportShaped(lastResult.finalText)
+        && !lastResult.finalText.includes('[NO FINAL SYNTHESIS]')
+        && !statusQuestionInterimReprompted) {
+        statusQuestionInterimReprompted = true;
+        debug.log('goal.loop', 'status-question-interim-reprompt', {
+          sessionId: ctx.sessionId, ...runAttribution, iterations, finalChars: lastResult.finalText.length,
+        }, { level: 'info' });
+        reinject(GOAL_CONTINUATION_PROMPT);
+        continue;
+      }
       debug.log('goal.loop', 'text-only-accept', { sessionId: ctx.sessionId, ...runAttribution, iterations }, { level: 'info' });
       return finish({ finalText: lastResult.finalText, iterations, stopReason: lastResult.stopReason, goalComplete: false });
     }

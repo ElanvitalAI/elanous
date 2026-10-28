@@ -510,8 +510,8 @@ export class DashboardAcpChat {
         const text = c.text as string;
         if (text.length === 0) return;
         this.closeStreamBuffer(sess, 'flush');
-        const meta = (update as any)._meta as { reasoning?: unknown } | undefined;
-        const isReasoning = meta?.reasoning === true;
+        const meta = (update as any)._meta as { reasoning?: unknown; status?: unknown } | undefined;
+        const isReasoning = meta?.status !== true && meta?.reasoning === true;
         if (handlers.pushThought) {
           handlers.pushThought(text, isReasoning);
         } else {

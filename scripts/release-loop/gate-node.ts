@@ -43,6 +43,9 @@ import { resolveWarmPoolProfile } from '../../src/self-implement/pod-warm-pool-p
 import { decideWarmReuse, type WarmReuseSwitchConfig, type WarmReuseEvidence } from '../../src/task-orchestrator/surfaces/pod-warm-switch.js';
 import { getUserConfig } from '../../src/user-config.js';
 import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, recordGateShardsVerdict, writeGateShards, type GateJobTerminal, type GateShard } from '../../src/release-loop/gate-shards.js';
+import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
+import { markGateShardUnmeasured, nextGateShardAttempt, readGateShardManifest, readGateShardResult, saveGateShardResult } from './gate-shard-receipts.js';
+import { planGateShardDispatch, type GateShardReceipt } from './gate-shard-dispatch.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 import { executeTuiNodeCheck, type ExecutedTuiCheck } from './tui-node-checks.js';
 import { runWithReleaseGateTraffic } from './gate-traffic-mode.js';
@@ -218,6 +221,12 @@ export interface GateOptions {
   recheckFileLimit?: number;
   /** freshShards — GATE-SHARD-RESUME off: every shard starts a Pod even when this logDir already holds its result. */
   pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number; durationSource?: string; bunCache?: string; freshShards?: boolean;
+    /** Remeasure one named shard, or all incomplete shards with auto. Complete siblings keep their receipts. */
+    rerouteShard?: string | 'auto';
+    /** Pool context for the rerouted shard; the planner otherwise distributes missing shards over pool contexts. */
+    shardHost?: string;
+    /** Shard capability requirements are independent of host names; placement resolves them at run time. */
+    shardCapabilities?: Readonly<Record<string, { os?: 'darwin' | 'linux' }>>;
     /** Opt-in gate shadow: provider fills the fenced lease identity. The Job remains authoritative. */
     warmReplay?: (input: Omit<WarmWorkerCommand, 'leaseId' | 'generation' | 'workerId' | 'key'>) => Promise<{ command: WarmWorkerCommand | null; transport: WarmPodTransportResult }>;
     warmQuarantine?: (command: WarmWorkerCommand, reason: string) => Promise<void>;
@@ -253,8 +262,8 @@ export interface GateOptions {
     hostMirrorReaders?: GateHostMirrorReaders;
     /** GATE-INSTALL-CACHE — concurrent `bun install`s per node (`release.loop.gatePodInstallSlots`); omitted = 4 · 0 = off. */
     installSlots?: number;
-    /** GATE-MEM-ADMIT — seconds a shard waits for pool admission (memory headroom) before it launches anyway with
-     *  `admission-timeout` (`release.loop.gatePodAdmissionWaitSeconds`); omitted = {@link GATE_ADMISSION_WAIT_SECONDS_DEFAULT} · 0 = off. */
+    /** GATE-MEM-ADMIT — seconds an active shard waits for pool admission. Root shards beyond the pool cap queue
+     *  outside this timer; an exhausted wait stays unmeasured (`release.loop.gatePodAdmissionWaitSeconds`); 0 = off. */
     admissionWaitSeconds?: number;
     /** GATE-MEM-ADMIT — an injected admission (tests · embedders); config never sets it. Absent = the gate's own pool's. */
     admission?: GateAdmission;
@@ -279,7 +288,8 @@ export interface GateOptions {
      *  of {@link gateShardAbortScript} on the gate's own pool; an injected pool without it runs without the mid-run watch. */
     abortTests?: (job: { name: string; context?: string }, reason: string) => boolean | void;
     /** GATE-LIVE-OBS — the shard state file (`gateShardsPath(version)`) this sweep keeps current; absent = not written. */
-    shardsFile?: { path: string; version: string };
+    shardsFile?: { path: string; version: string; ledgerPath?: string; envFingerprint?: string;
+      receiptRoot?: string; base40?: string; expectedImageDigest?: string | null };
     /** GATE-RISK-LANE — the ledgers `gateHistory` reads its watch list from; absent = no risk lane (the sweep plans as before). */
     riskWatch?: { instanceRoots: readonly string[]; ledgerRoots: readonly string[] };
     /** GATE-MULTI-HOST — is this pool member reachable (kubectl ns ⊕ ssh)? Injected by tests; absent = the real probe on
@@ -523,6 +533,31 @@ const lastMatch = (output: string, pattern: RegExp): RegExpExecArray | null => {
   return last;
 };
 const summaryCount = (output: string, label: string) => Number(lastMatch(output, new RegExp(`(?:^|\\n)\\s*(\\d+) ${label}s?\\s*(?=\\n|$)`))?.[1] ?? NaN);
+/** `test:deterministic` runs several Bun commands. Its final clean command is not the verdict for earlier commands. */
+function deterministicSubrunCounts(output: string): { fail: number; error: number } | undefined {
+  if (!/error: script "test:deterministic" exited with code 1/.test(output)) return undefined;
+  const lines = output.split(/\r?\n/).map((line) => line.trim());
+  const runs: Array<{ fail: number; error: number }> = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/^Ran \d+ tests? across [1-9]\d* files?\./.test(lines[i]!)) continue;
+    let pass: number | undefined;
+    let fail: number | undefined;
+    let error = 0;
+    for (let j = i - 1; j >= Math.max(0, i - 8); j -= 1) {
+      const line = lines[j]!;
+      const count = /^(\d+) (pass|fail|skip|errors?|expect\(\) calls)$/.exec(line);
+      if (!line) continue;
+      if (!count) break;
+      if (count[2] === 'pass') { pass = Number(count[1]); break; }
+      if (count[2] === 'fail') fail = Number(count[1]);
+      if (count[2] === 'error' || count[2] === 'errors') error = Number(count[1]);
+    }
+    if (pass === undefined || fail === undefined) return undefined;
+    runs.push({ fail, error });
+  }
+  if (runs.length < 2) return undefined;
+  return runs.reduce((sum, run) => ({ fail: sum.fail + run.fail, error: sum.error + run.error }), { fail: 0, error: 0 });
+}
 /** bun reads a bare positional as a substring filter (`test` matches every *.test.ts); `./` makes it a path. */
 const asPath = (path: string) => path.startsWith('./') || path.startsWith('/') ? path : `./${path}`;
 /** A Pod path (`~/repo/src/…` · `../..~/repo/src/…`) as a repository-relative one. */
@@ -1045,20 +1080,29 @@ export function gateShardAbortScript(reason: string, graceSeconds = GATE_SHARD_A
   return [
     `reason=${quote(reason.replace(/[^\w .:-]/g, '_'))}`,
     `only=${quote(outbox ?? '')}`,
-    "pg_of() { sed 's/^.*) //' \"/proc/$1/stat\" 2>/dev/null | cut -d' ' -f3; }",
+    // Read after the final ')' because comm can itself contain spaces and ')'. starttime is field 20 in the suffix
+    // (field 22 in proc stat); pairing it with PID prevents a recycled PID from validating an old group number.
+    "proc_identity() { sed 's/^.*) //' \"/proc/$1/stat\" 2>/dev/null | awk '{print $3, $20}'; }",
+    "pg_of() { proc_identity \"$1\" | awk '{print $1}'; }",
     'root_pg=$(pg_of 1); my_pg=$(pg_of $$); found=0',
     'for d in /proc/[0-9]*; do',
     '  pid=${d#/proc/}',
     "  out=$(tr '\\0' '\\n' < \"$d/cmdline\" 2>/dev/null | grep -m1 -E '^--reporter-outfile=.*/outbox/part-[0-9]+\\.junit\\.xml$') || continue",
     '  if [ -n "$only" ]; then case "$out" in "--reporter-outfile=$only/part-"*) ;; *) continue;; esac; fi',
-    '  pg=$(pg_of "$pid")',
-    '  case "$pg" in ""|*[!0-9]*) continue;; esac',
+    '  identity=$(proc_identity "$pid")',
+    '  pg=${identity%% *}; started=${identity#* }',
+    '  case "$pg:$started" in *[!0-9:]*|:|*:|:*) continue;; esac',
     '  if [ "$pg" != "$pid" ] || [ "$pg" -le 1 ] || [ "$pg" = "$root_pg" ] || [ "$pg" = "$my_pg" ]; then continue; fi',
+    // Re-read the process identity immediately before signaling. The same check guards delayed KILL so a PID/PGID
+    // that disappeared and was reused during the grace interval is never signaled as if it were the original test.
+    '  [ "$(proc_identity "$pid")" = "$identity" ] || continue',
     '  out=${out#--reporter-outfile=}; dir=${out%/part-*}; part=${out##*/part-}; part=${part%.junit.xml}',
-    '  printf "%s\\n" "$reason" > "$dir/part-$part.abort"',
-    '  [ -f "$dir/shard.timeout" ] || echo "$part" > "$dir/shard.timeout"',
-    '  if kill -TERM -- "-$pg" 2>/dev/null; then found=$((found + 1)); echo "ELANOUS_GATE_ABORT part=$part pgid=$pg"; fi',
-    `  ( sleep ${Math.max(1, Math.floor(graceSeconds))}; kill -KILL -- "-$pg" 2>/dev/null ) >/dev/null 2>&1 </dev/null &`,
+    '  if [ "$(proc_identity "$pid")" = "$identity" ] && kill -TERM -- "-$pg" 2>/dev/null; then',
+    '    printf "%s\\n" "$reason" > "$dir/part-$part.abort"',
+    '    [ -f "$dir/shard.timeout" ] || echo "$part" > "$dir/shard.timeout"',
+    '    found=$((found + 1)); echo "ELANOUS_GATE_ABORT part=$part pgid=$pg"',
+    `    ( sleep ${Math.max(1, Math.floor(graceSeconds))}; [ "$(proc_identity "$pid")" = "$identity" ] && kill -KILL -- "-$pg" 2>/dev/null ) >/dev/null 2>&1 </dev/null &`,
+    '  fi',
     'done',
     'echo "ELANOUS_GATE_ABORT signalled=$found"',
     '[ "$found" -gt 0 ]',
@@ -1190,8 +1234,8 @@ const lastStartedTestFile = (output: string, paths: string[]): string | undefine
  *  split shape follows from depth and size alone, so the same plan reaches the same child names (TC 09:30 review ②).
  *  `runKey` hashes where and how the Pod ran the shard (pool · command · ignores · memory · deadline · Bun cache): a fix on the Pod side
  *  makes every old result a miss instead of re-reading an old failure as introduced (TC 09:48 review). */
-export function previousShardDescent(logDir: string, name: string, commit: string, files: readonly string[], runKey: string, parentAttempt?: string, splitChild?: string): { way: 'retry' | 'split'; attemptId: string } | undefined {
-  const meta = (file: string): { commit?: unknown; files?: unknown; rc?: unknown; runKey?: unknown; attemptId?: unknown; parentAttempt?: unknown } | undefined => {
+export function previousShardDescent(logDir: string, name: string, commit: string, files: readonly string[], runKey: string, parentAttempt?: string, splitChild?: string): { way: 'retry' | 'split' | 'file-fanout'; attemptId: string } | undefined {
+  const meta = (file: string): { commit?: unknown; files?: unknown; rc?: unknown; reason?: unknown; runKey?: unknown; attemptId?: unknown; parentAttempt?: unknown } | undefined => {
     try { return JSON.parse(readFileSync(join(logDir, `${file}.json`), 'utf8')); } catch { return undefined; }
   };
   const own = meta(name);
@@ -1208,6 +1252,8 @@ export function previousShardDescent(logDir: string, name: string, commit: strin
       && (!whole || row.files.length === files.length);
   };
   if (child(`${name}-retry`, true)) return { way: 'retry', attemptId };
+  // A stalled multi-file parent may have descended directly to one Pod per file. Keep that shape on resume.
+  if (own.reason === 'stall' && files.length > 1 && child(`${name}-file-0`, false)) return { way: 'file-fanout', attemptId };
   // Only the first child of the split the caller takes now (`-file-0` · `-c0` · `-0` · review r3): a record of another
   // split shape is not followed.
   return splitChild !== undefined && child(`${name}${splitChild}`, false) ? { way: 'split', attemptId } : undefined;
@@ -1239,9 +1285,11 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
   const output = stripPodRepoRoot(run.output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''));
   const ran = lastMatch(output, /Ran (\d+) tests? across ([1-9]\d*) files?/);
   const reportedErrors = summaryCount(output, 'error');
-  const errorCount = Number.isNaN(reportedErrors) ? 0 : reportedErrors;
-  const incomplete = (reason: string) => new Error(`${label} incomplete (rc=${run.rc}; Ran=${ran ? ran[0] : 'missing'}; errors=${Number.isNaN(reportedErrors) ? 'missing' : errorCount}; ${reason})\n${tail40(output)}`);
-  const count = summaryCount(output, 'fail');
+  // Validated Pod shards were checked separately before their logs were joined; only the host sweep needs subrun totals.
+  const subruns = !run.validatedShards && run.rc === 1 ? deterministicSubrunCounts(output) : undefined;
+  const errorCount = subruns?.error ?? (Number.isNaN(reportedErrors) ? 0 : reportedErrors);
+  const incomplete = (reason: string) => new Error(`${label} incomplete (rc=${run.rc}; Ran=${ran ? ran[0] : 'missing'}; errors=${subruns || !Number.isNaN(reportedErrors) ? errorCount : 'missing'}; ${reason})\n${tail40(output)}`);
+  const count = subruns?.fail ?? summaryCount(output, 'fail');
   const failures = parseFailures(output);
   // Bun repeats failed test names under "N tests failed:". A validated Pod sweep joins
   // separately checked shards, so a summary in one shard can precede real failures
@@ -1271,7 +1319,7 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
     }
   }
   if (errors.length !== errorCount) throw incomplete(`error attribution identified=${errors.length}`);
-  if (!Number.isFinite(count) || (count !== occurrences && !(run.validatedShards && occurrences > count && failures.length === count)) || (count > 0 && failures.length === 0)
+  if (!Number.isFinite(count) || (count !== occurrences && !(run.validatedShards && occurrences > count && failures.length === count)) || (subruns && failures.length !== count) || (count > 0 && failures.length === 0)
     || (rc === 1 && count === 0 && errorCount === 0) || (rc === 0 && count + errorCount > 0)) {
     throw incomplete(`failure attribution incomplete: summary=${count}, identified=${failures.length}`);
   }
@@ -1298,7 +1346,7 @@ export function readIsolatedRun(run: CommandResult, label: string, file: string)
   if (!cleanNonzero) {
     const read = failuresOf(run, label);
     // Two (fail) lines folding into one id would undercount the file's failures: unreadable, not fewer.
-    const failCount = summaryCount(output, 'fail');
+    const failCount = deterministicSubrunCounts(output)?.fail ?? summaryCount(output, 'fail');
     if (Number.isFinite(failCount) && read.failures.length !== failCount)
       throw new Error(`${label} incomplete (rc=${run.rc}; failure attribution summary=${failCount}, identified=${read.failures.length})`);
     return { kind: 'read', ...read };
@@ -1419,7 +1467,40 @@ export interface GateAdmission {
   /** The pool-wide reading admission waits on (recommended · limitedBy · memorySlots); null before any reading. */
   waitReason(): string | null;
 }
-export const GATE_ADMISSION_WAIT_SECONDS_DEFAULT = 300;
+export const GATE_ADMISSION_WAIT_SECONDS_DEFAULT = 1800;
+/** Queue pressure scales the default wait but never creates an unbounded admission timer. */
+export function gateAdmissionWaitSeconds(shards: number, slots: number): number {
+  return Math.max(GATE_ADMISSION_WAIT_SECONDS_DEFAULT, Math.min(3600,
+    Math.ceil(shards / Math.max(1, slots)) * 300));
+}
+export function createGateRootLimiter(slots: number): <T>(run: () => Promise<T>) => Promise<T> {
+  if (!Number.isSafeInteger(slots) || slots < 1) throw new Error('invalid gate root slots');
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  return async <T>(run: () => Promise<T>): Promise<T> => {
+    if (active >= slots) await new Promise<void>((resolve) => waiters.push(resolve));
+    else active++;
+    try { return await run(); }
+    finally {
+      const next = waiters.shift();
+      if (next) next(); // transfer the occupied slot before another caller can enter
+      else active--;
+    }
+  };
+}
+/** A direct gate has no preflight image pin. Its measured receipt still carries its own image digest. */
+export function gateReceiptReuseKey(receipt: GateShardReceipt | null, fingerprint: string, expectedImageDigest: string | null | undefined,
+  hosts: ReadonlySet<string>): { envKey?: string; reason: string } {
+  if (!receipt) return { reason: 'receipt-missing' };
+  if (receipt.status !== 'complete') return { reason: 'receipt-unmeasured' };
+  if (!hosts.has(receipt.host)) return { reason: 'receipt-host-outside-pool' };
+  if (expectedImageDigest) return receipt.envKey === `${fingerprint}:${expectedImageDigest}`
+    ? { envKey: receipt.envKey, reason: 'image-pinned' } : { reason: 'receipt-image-or-env-drift' };
+  const prefix = `${fingerprint}:`;
+  if (!receipt.envKey.startsWith(prefix)) return { reason: 'receipt-env-drift' };
+  return /^sha256:[a-f0-9]{64}$/i.test(receipt.envKey.slice(prefix.length))
+    ? { envKey: receipt.envKey, reason: 'measured-image' } : { reason: 'receipt-image-unmeasured' };
+}
 export type GateAdmissionOutcome = 'granted' | 'admission-timeout' | 'admission-error' | 'off';
 export interface GateAdmissionResult { outcome: GateAdmissionOutcome; waitedMs: number; reason?: string; release: () => void }
 export const gateAdmissionWaitText = (reading: string | null) => `메모리 여유 대기(admission) · ${reading ?? '측정 전'}`.slice(0, 160);
@@ -1569,6 +1650,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const watchList = pod.riskWatch ? readGateRiskWatchList(pod.riskWatch) : [];
     const riskPlan = planGateRiskLaneShards({ assignable, durations, shardCount, heavy, watchList });
     const shards = riskPlan.shards;
+    const receiptRoot = pod.shardsFile?.receiptRoot;
+    const base40 = pod.shardsFile?.base40;
+    const envFingerprint = pod.shardsFile?.envFingerprint;
+    const expectedImageDigest = pod.shardsFile?.expectedImageDigest;
     if (riskPlan.spawnFiles.length) debug.log('release-loop.gate', 'pod-spawn-lane', { files: riskPlan.spawnFiles, shards: riskPlan.spawnShardCount });
     if (riskPlan.riskFiles.length) debug.log('release-loop.gate', 'pod-risk-lane-plan', { files: riskPlan.riskFiles, shard: 0,
       plannedSeconds: riskPlan.riskPlannedSeconds, shards: shards.length, watch: watchList.length });
@@ -1590,6 +1675,56 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const ready = poolOverride ? undefined : checkPodPool(parsePodPool(pod.pool), kubectl);
     if (ready && !ready.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
     const poolScheduler = poolOverride ?? new PodPoolScheduler(ready!.ready);
+    const receiptChecks = shards.map((item, shard) => {
+      if (pod.freshShards) return { reason: 'fresh-shards' };
+      if (!receiptRoot || !base40 || !envFingerprint) return { reason: 'receipt-context-missing' };
+      const prior = readGateShardManifest(receiptRoot, `pod-${shard}`);
+      const key = gateReceiptReuseKey(prior, envFingerprint, expectedImageDigest,
+        new Set(poolScheduler.members.map((member) => member.context)));
+      if (!key.envKey) return { reason: key.reason };
+      const result = readGateShardResult(receiptRoot, { shard: { id: `pod-${shard}`, files: item.files },
+        head40: commit, base40, envKey: key.envKey });
+      return result ? { reason: key.reason, result } : { reason: 'receipt-identity-or-evidence-invalid' };
+    });
+    const receipts = receiptChecks.flatMap((check) => check.result ? [check.result.receipt] : []);
+    const requiredOs = pod.shardCapabilities ?? {};
+    const envKnownIds = loadEnvKnownFailures(tree);
+    const envKnownFiles = new Set([...envKnownIds].map(fileOf));
+    const macPassShardIds = shards.flatMap((shard, index) => {
+      const prior = receipts.find((receipt) => receipt.id === `pod-${index}`);
+      if (!prior) return [];
+      const knownFailure = [...prior.failureIds, ...prior.errorIds].some((id) => envKnownIds.has(id));
+      const knownUnmeasuredFile = prior.status === 'unmeasured' && shard.files.some((file) => envKnownFiles.has(file));
+      return knownFailure || knownUnmeasuredFile ? [`pod-${index}`] : [];
+    });
+    for (const id of Object.keys(requiredOs)) if (!/^pod-\d+$/.test(id) || Number(id.slice(4)) >= shards.length)
+      throw new Error(`unknown shard capability target: ${id}`);
+    const needsPlatform = Object.values(requiredOs).some((value) => value.os)
+      || (pod.rerouteShard === 'auto' && macPassShardIds.length > 0);
+    const hosts = poolScheduler.members.map((member) => {
+      let platform: 'darwin' | 'linux' | 'other' = 'other';
+      if (needsPlatform) {
+        const system = member.sshHost ? remoteRun(member.sshHost, 'uname -s') :
+          { status: 0, stdout: process.platform, stderr: '' };
+        if (system.status === 0) platform = /^(?:darwin)$/i.test(system.stdout.trim()) ? 'darwin'
+          : /^(?:linux)$/i.test(system.stdout.trim()) ? 'linux' : 'other';
+      }
+      return { id: member.context, platform, available: true, reserved: false };
+    });
+    const hostPlan = planGateShardDispatch({ head40: commit, base40: base40 ?? commit,
+      shards: shards.map((item, shard) => ({ id: `pod-${shard}`, files: item.files,
+        ...(requiredOs[`pod-${shard}`]?.os ? { requiredOs: requiredOs[`pod-${shard}`]!.os } : {}) })), receipts,
+      hosts,
+      macPassShardIds,
+      ...(pod.rerouteShard ? { rerouteShard: pod.rerouteShard } : {}), ...(pod.shardHost ? { shardHost: pod.shardHost } : {}) });
+    // Leave ordinary shards to the live free-slot scheduler. A static plan can pick a busy member
+    // while another is idle; pin only a capability or a deliberate cross-host replacement.
+    const hostPins = new Map(hostPlan.flatMap((item) => item.kind === 'run'
+      && (requiredOs[item.shardId]?.os || (pod.rerouteShard === 'auto' && macPassShardIds.includes(item.shardId))
+        || (item.replacing && item.host !== item.replacing.host)
+        || (pod.shardHost && item.host === pod.shardHost)) ? [[item.shardId, item.host] as const] : []));
+    const unavailable = hostPlan.find((item) => item.kind === 'unmeasured');
+    if (unavailable) throw new Error(`gate shard ${unavailable.shardId} unmeasured: ${unavailable.reason}`);
     const configCache = typeof pod.bunCache === 'string' ? pod.bunCache.trim() : '';
     const envCache = process.env[POD_BUN_CACHE_HOST_PATH]?.trim();
     const bunCache = configCache || envCache || undefined;
@@ -1600,11 +1735,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     if (!Number.isSafeInteger(installSlots) || installSlots < 0) throw new Error('invalid pod sweep options');
     debug.log('release-loop.gate', 'pod-install-slots', { slots: installSlots, source: pod.installSlots !== undefined ? 'config' : 'default' });
     // GATE-MEM-ADMIT: every shard Job (retries and splits too) asks pool admission before it is placed.
-    const admissionWaitSeconds = pod.admissionWaitSeconds ?? GATE_ADMISSION_WAIT_SECONDS_DEFAULT;
+    const rootSlots = Math.max(1, poolScheduler.members.reduce((total, member) => total + member.capacity, 0));
+    const admissionWaitSeconds = pod.admissionWaitSeconds ?? gateAdmissionWaitSeconds(shards.length, rootSlots);
     if (!Number.isSafeInteger(admissionWaitSeconds) || admissionWaitSeconds < 0) throw new Error('invalid pod sweep options');
     // An injected pool (tests) runs without admission unless `pod.admission` is passed; the gate's own pool asks it.
     const gateAdmission = pod.admission ?? tools.admission ?? (poolOverride ? undefined : poolGateAdmission(poolScheduler));
-    debug.log('release-loop.gate', 'pod-admission', { waitSeconds: admissionWaitSeconds, source: pod.admissionWaitSeconds !== undefined ? 'config' : 'default', enabled: !!gateAdmission && admissionWaitSeconds > 0 });
+    debug.log('release-loop.gate', 'pod-admission', { waitSeconds: admissionWaitSeconds, source: pod.admissionWaitSeconds !== undefined ? 'config' : 'default', enabled: !!gateAdmission && admissionWaitSeconds > 0,
+      rootSlots, shards: shards.length });
     // GATE-POD-STALL-FAILFAST: a shard with no test output within the stall window is stopped and recorded unmeasured.
     const stallSeconds = pod.stallSeconds ?? GATE_POD_STALL_SECONDS_DEFAULT;
     const stallPollMs = pod.stallPollMs ?? GATE_POD_STALL_POLL_MS;
@@ -1722,29 +1859,88 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     }, 0);
     const knownTimes = assignable.map((file) => durations.get(file)).filter((value): value is number => value !== undefined && Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
     const unknownSeconds = knownTimes.length ? (knownTimes[Math.floor((knownTimes.length - 1) / 2)]! + knownTimes[Math.floor(knownTimes.length / 2)]!) / 2 : 1;
-    // GATE-LIVE-OBS — one row per root shard in the release ledger's shards.json (UX contract · src/release-loop/gate-shards.ts).
-    // Retries and splits of a shard update its row. A write failure is logged and never stops the gate.
+    // GATE-LIVE-OBS — root rows stay stable; each recursive split/retry and tail gets its own row.
+    // Otherwise a finished root Job can hide a still-running child (or tail) behind 80/80 done.
     const board: GateShard[] = shards.map((item, index) => ({ id: `pod-${index}`, state: 'pending', plannedMin: Math.round(item.plannedSeconds / 6) / 10 }));
+    const filesById = new Map(shards.map((item, index) => [`pod-${index}`, [...item.files]]));
+    const detailsById = new Map<string, Partial<GateShardLedgerRow>>();
+    const observeShard = (row: GateShard) => {
+      if (!pod.shardsFile?.ledgerPath || !pod.shardsFile.envFingerprint) return;
+      const detail = detailsById.get(row.id) ?? {};
+      const logName = row.resultFile?.replace(/\.json$/, '') ?? null;
+      const logPath = logName && logDir ? join(logDir, `${logName}.log`) : null;
+      const junitPath = logName && logDir ? join(logDir, `${logName}.junit.xml`) : null;
+      try {
+        appendGateShardLedger(pod.shardsFile.ledgerPath, {
+          v: 1, version: pod.shardsFile.version, phase: 'cut', shardId: row.id,
+          files: filesById.get(row.id) ?? [], host: row.host ?? null, executor: 'pod',
+          imageDigest: detail.imageDigest ?? null, commit, envFingerprint: pod.shardsFile.envFingerprint,
+          startedAt: row.startedAt ?? null, endedAt: row.endedAt ?? null, observedAt: new Date().toISOString(),
+          state: row.state, rc: row.rc ?? null, pass: detail.pass ?? null, fail: detail.fail ?? null,
+          errors: detail.errors ?? null, ran: detail.ran ?? null,
+          failureIds: detail.failureIds ?? null, errorIds: detail.errorIds ?? null,
+          attribution: detail.attribution ?? 'unmeasured', logPath, junitPath,
+          stopReason: detail.stopReason ?? row.waitReason ?? null, attemptId: row.attemptId ?? null,
+        });
+      } catch (error) { debug.log('release-loop.gate', 'shard-ledger-write-failed', { shard: row.id, error: String(error) }, { level: 'warn' }); }
+    };
     const flushBoard = () => {
       if (!pod.shardsFile) return;
       try { writeGateShards(pod.shardsFile.path, { v: 1, version: pod.shardsFile.version, updatedAt: new Date().toISOString(), shards: board }); }
       catch (error) { debug.log('release-loop.gate', 'shards-write-failed', { path: pod.shardsFile.path, error: String(error) }); }
     };
-    const markShard = (shard: number, patch: Partial<GateShard>, clear: Array<keyof GateShard> = []) => {
-      const row = board[shard];
+    const rowIndex = (shard: number, branch = '') => branch ? board.findIndex((row) => row.id === `pod-${shard}${branch}`) : shard;
+    const markShard = (shard: number, patch: Partial<GateShard>, clear: Array<keyof GateShard> = [], branch = '') => {
+      const index = rowIndex(shard, branch);
+      const row = board[index];
       if (!row) return;
       const next: GateShard = { ...row, ...patch };
       for (const key of clear) delete next[key];
       if (JSON.stringify(next) === JSON.stringify(row)) return;
-      board[shard] = next;
+      board[index] = next;
+      observeShard(next);
       flushBoard();
     };
-    const resetShardAttempt = (shard: number) => {
-      const row = board[shard];
+    const resetShardAttempt = (shard: number, branch = '', plannedMin?: number) => {
+      if (branch && rowIndex(shard, branch) < 0) board.push({ id: `pod-${shard}${branch}`, state: 'pending', ...(plannedMin !== undefined ? { plannedMin } : {}) });
+      const index = rowIndex(shard, branch);
+      const row = board[index];
       if (!row) return;
-      board[shard] = beginGateShardAttempt(row);
+      board[index] = beginGateShardAttempt(row);
+      delete board[index]!.rc;
+      delete board[index]!.installSec;
+      // The root is a logical aggregate while its descendants run, not the terminal state of its first Job.
+      if (branch) {
+        board[shard] = beginGateShardAttempt(board[shard]!);
+        delete board[shard]!.rc;
+        delete board[shard]!.installSec;
+        observeShard(board[shard]!);
+      }
+      detailsById.delete(row.id);
+      observeShard(board[index]!);
       flushBoard();
     };
+    const recordShardResult = (id: string, done: { runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }) => {
+      const index = board.findIndex((row) => row.id === id);
+      if (index < 0) return;
+      const counts = done.runs.reduce((sum, run) => ({ pass: sum.pass + run.pass, fail: sum.fail + run.fail,
+        errors: sum.errors + run.errors, ran: sum.ran + run.ran }), { pass: 0, fail: 0, errors: 0, ran: 0 });
+      const failureIds: string[] = [];
+      const errorIds: string[] = [];
+      let attributed = done.stalled.length === 0 && done.runs.length > 0;
+      for (const run of done.runs) {
+        try {
+          const parsed = failuresOf({ rc: run.rc, output: run.output, validatedShards: true }, `ledger ${id}`);
+          failureIds.push(...parsed.failures); errorIds.push(...parsed.errors);
+        } catch { attributed = false; }
+      }
+      const detail: Partial<GateShardLedgerRow> = { ...(detailsById.get(id) ?? {}), ...counts, failureIds: attributed ? [...new Set(failureIds)].sort() : null,
+        errorIds: attributed ? [...new Set(errorIds)].sort() : null, attribution: attributed ? 'complete' : 'unmeasured',
+        stopReason: done.stalled.map((item) => item.reason).join(', ') || null };
+      detailsById.set(id, detail);
+      observeShard(board[index]!);
+    };
+    for (const row of board) observeShard(row);
     flushBoard();
     // A result collector can lose its callback after the Kubernetes Job has already completed. Reconcile
     // the public shard board independently so a finished Job cannot remain «running» indefinitely.
@@ -1758,6 +1954,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           const index = board.findIndex((shard) => shard.id === item.shard);
           if (index < 0) continue;
           board[index] = reconciled.board.find((shard) => shard.id === item.shard)!;
+          observeShard(board[index]!);
           debug.log('release.gate', 'shard-stale-finalized', item);
         }
         flushBoard();
@@ -1768,22 +1965,25 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     /** The gate's scheduler, seen through one shard: a slot wait and the Pod start become row states. */
     // GATE-MEM-ADMIT: `placed` releases the shard's admission once a member is chosen — from then on the Job is
     // Pending/Running in the cluster and the next admission reading counts it, so holding the lease would count it twice.
-    const trackedPool = (shard: number, retry: boolean, jobName: string, resultFile: string, attemptId: string, placed: (member: NonNullable<Awaited<ReturnType<PodPoolScheduler['tryAcquire']>>>) => void = () => {}, skipMembers: ReadonlySet<string> = new Set()): PodPoolScheduler => ({
+    const trackedPool = (shard: number, branch: string, jobName: string, resultFile: string, attemptId: string, placed: (member: NonNullable<Awaited<ReturnType<PodPoolScheduler['tryAcquire']>>>) => void = () => {}, skipMembers: ReadonlySet<string> = new Set(), allowPin = false): PodPoolScheduler => ({
       members: poolScheduler.members,
       tryAcquire: async (...[skip, onEmpty, mode]: Parameters<PodPoolScheduler['tryAcquire']>) => {
         // GATE-MULTI-HOST: a lost member is skipped while another member is left (all lost = the old behaviour).
         const anyLeft = poolScheduler.members.some((m) => !downMembers.has(m.context));
-        const excluded = new Set([...(skip ?? []), ...skipMembers, ...(downMembers.size && anyLeft ? downMembers : [])]);
+        // Only the first placement follows the plan; retries and unavailable hosts can move.
+        const planned = allowPin && !skip?.size ? hostPins.get(`pod-${shard}`) : undefined;
+        const pin = planned && !downMembers.has(planned) ? planned : undefined;
+        const excluded = new Set([...(skip ?? []), ...skipMembers, ...(downMembers.size && anyLeft ? downMembers : []),
+          ...(pin ? poolScheduler.members.filter((m) => m.context !== pin).map((m) => m.context) : [])]);
         const member = await poolScheduler.tryAcquire(excluded.size ? excluded : undefined, onEmpty, mode);
         if (member) placed(member);
-        if (member) markShard(shard, { state: retry ? 'retry' : 'running', startedAt: board[shard]?.startedAt ?? new Date().toISOString(), host: member.context, job: jobName, resultFile, attemptId }, ['waitReason']);
-        else markShard(shard, { waitReason: 'Pod 자리 대기' });
+        if (member) markShard(shard, { state: 'running', startedAt: board[rowIndex(shard, branch)]?.startedAt ?? new Date().toISOString(), host: member.context, job: jobName, resultFile, attemptId }, ['waitReason'], branch);
+        else markShard(shard, { waitReason: 'Pod 자리 대기' }, [], branch);
         return member;
       },
       release: (member: Parameters<PodPoolScheduler['release']>[0]) => poolScheduler.release(member),
     }) as unknown as PodPoolScheduler;
-    const runShard = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string, hostRetries = 0, batchIsolation = false, skipMembers: ReadonlySet<string> = new Set(), singleShotTail = false): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
-      if (branch || depth > 0 || parentAttempt !== undefined || hostRetries > 0) resetShardAttempt(shard);
+    const runShardImpl = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string, hostRetries = 0, batchIsolation = false, skipMembers: ReadonlySet<string> = new Set(), singleShotTail = false): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
       // 파일별 소요는 junit 으로 남긴다 — 콘솔 요약(판정 원천)은 그대로이고, 느린 시험 목록(K10 D4)·계층 분리(D2)의 자가 된다.
       // GATE-TIMEOUT-HEAL: parts (each with its own junit) under a soft deadline inside this shard's own Job deadline.
       const shardDeadline = shardDeadlineSeconds(batchIsolation ? Math.max(...paths.map((file) => estimated([file]))) * Math.ceil(paths.length / batchWidth) : estimated(paths), deadlineSeconds);
@@ -1847,13 +2047,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       if (descent === 'retry') {
         // «descend» is only the way down; «resumed» comes from each leaf whose log reads cleanly (review r4).
         debug.log('release-loop.gate', 'pod-shard-descend', { shard, branch, files: paths.length, via: 'retry' });
-        resetShardAttempt(shard);
+        resetShardAttempt(shard, branch);
         return runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId, hostRetries, batchIsolation, skipMembers);
       }
-      if (descent === 'split') {
-        resetShardAttempt(shard);
+      if (descent === 'split' || descent === 'file-fanout') {
+        resetShardAttempt(shard, branch);
         output = undefined;
-        debug.log('release-loop.gate', 'pod-shard-descend', { shard, branch, files: paths.length, via: 'split' });
+        debug.log('release-loop.gate', 'pod-shard-descend', { shard, branch, files: paths.length, via: descent });
       } else if (reused) {
         output = reused.output;
         junit = reused.junit;
@@ -1862,7 +2062,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         lastFile = lastStartedTestFile(output, paths);
       } else try {
         stamp('admissionStart');
-        admitted = await admitGateShard(gateAdmission, { waitMs: admissionWaitSeconds * 1000, onWait: (reason) => markShard(shard, { waitReason: reason }) });
+        admitted = await admitGateShard(gateAdmission, { waitMs: admissionWaitSeconds * 1000, onWait: (reason) => markShard(shard, { waitReason: reason }, [], branch) });
         stamp('admissionEnd');
         if (admitted.outcome !== 'off') debug.log('release-loop.gate', 'shard-admission', { shard, branch, outcome: admitted.outcome, waitedMs: admitted.waitedMs, ...(admitted.reason ? { reason: admitted.reason } : {}) },
           admitted.outcome === 'granted' ? undefined : { level: 'warn' });
@@ -1903,10 +2103,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             graphNode: 'gate', version: pod.shardsFile?.version, commit, shard: `${shard + 1}-of-${shards.length}`,
             reason: `release gate shard ${shard + 1}/${shards.length}`, pool: pod.pool, cpuReq: cpu.request,
             memReq: memoryLimit ?? POD_ISOLATION_MEMORY_LIMIT, warmReused: false },
-          pool: pod.pool, poolScheduler: trackedPool(shard, depth > 0 || branch !== '', jobName, resultFile, attemptId, (member) => {
+          pool: pod.pool, poolScheduler: trackedPool(shard, branch, jobName, resultFile, attemptId, (member) => {
             stamp('poolPlaced'); jobContext = member.context; jobContextForCapture = member.context; placedOn = member.context; placed();
             if (branch === '-tail') tailPlacedHost = member.context;
-          }, skipMembers), clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds: shardDeadline,
+          }, skipMembers, depth === 0 && branch === '' && hostRetries === 0 && !retriedNoOutput && !batchIsolation && skipMembers.size === 0), clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds: shardDeadline,
           ...gateHostMirror(pod),
           ...(multiHost ? { statusUnreadableMs: memberUnreadableSeconds * 1000 } : {}),
           ...(bunCache ? { bunCache } : {}),
@@ -2029,6 +2229,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         }
       }
       const installSeconds = parseInstallSeconds(output ?? '');
+      if (imageDigest) detailsById.set(`pod-${shard}${branch}`, { ...(detailsById.get(`pod-${shard}${branch}`) ?? {}), imageDigest });
       // GATE-TIMEOUT-HEAL ③: a cut shard is «reason: timeout» (with the files that still finished), not a bare rc=null.
       if (!reused && !descent) debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds, gateDeps: parseGateDeps(output ?? ''), deadlineSeconds: shardDeadline, parts: parts.length, ...(placedOn ? { host: placedOn } : {}),
         ...(testSeconds !== undefined ? { testSeconds } : {}),
@@ -2037,7 +2238,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       // only for a Job that came back (a launch that failed before the Job returned has no Pod to describe).
       if (!reused && !descent && podJobName !== undefined) emitPodLifecycle(gatePodLifecycleEvent({ runId: process.env.ELANOUS_RUN_ID ?? null, podJob: podJobName, host: placedOn ?? null,
         shard: `pod-${shard}${branch}`, attemptId, phaseTimes, podStages, podLifecycle, outcome: gatePodOutcome({ jobFailed, stalled: !!stall, timedOut, rc }) }));
-      if (!reused && !descent) markShard(shard, { ...(installSeconds !== null ? { installSec: installSeconds } : {}), ...(rc !== undefined ? { rc } : {}), ...(timedOut ? { state: 'timeout' as const } : {}) });
+      if (!reused && !descent) markShard(shard, { ...(installSeconds !== null ? { installSec: installSeconds } : {}), ...(rc !== undefined ? { rc } : {}), ...(timedOut ? { state: 'timeout' as const } : {}) }, [], branch);
       let clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
       const ran = clean && lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/);
       const passes = clean === undefined ? NaN : summaryCount(clean, 'pass');
@@ -2103,6 +2304,22 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       // 137 (killed · OOM) keeps the isolation path: re-running an OOM file only re-measures the same kill.
       const diedBeforeTests = reason === 'job-failed' && output === undefined && !jobFailed && jobExitCode !== undefined && jobExitCode !== 0
         && jobExitCode !== 137 && (paths.length === 1 || jobExitCode === 5);
+      // A watched stall in a multi-file Job has already spent its first deadline. Measure each file on its own
+      // under the sweep-wide isolation permit pool instead of paying for another whole-bundle Job and split tree.
+      // The same descent is replayed after a cut resume when the parent and first child records are attributed.
+      if (reason === 'no-output' && paths.length > 1 && !singleShotTail && (stall || descent === 'file-fanout')) {
+        const count = Math.min(paths.length, isolationRemaining[shard]!);
+        isolationRemaining[shard]! -= count;
+        debug.log('release-loop.gate', 'pod-stall-file-fanout', { shard, branch, files: paths.length, launched: count,
+          resumed: descent === 'file-fanout', limit: isolationConcurrency });
+        const children = await Promise.all(paths.slice(0, count).map((file, index) => isolatedFile(() =>
+          runShard([file], shard, depth + 1, `${branch}-file-${index}`, false, undefined, attemptId))));
+        return { runs: children.flatMap((child) => child.runs), stalled: [
+          ...children.flatMap((child) => child.stalled),
+          ...(paths.length > count ? [{ shard, files: paths.slice(count), reason: 'no-output' as const,
+            ...(placedOn ? { lastHost: placedOn } : {}) }] : []),
+        ] };
+      }
       if ((reason === 'no-output' || diedBeforeTests) && !retriedNoOutput) {
         const retry = await runShard(paths, shard, depth, `${branch}-retry`, true, undefined, attemptId, hostRetries, batchIsolation, skipMembers);
         debug.log('release-loop.gate', 'pod-shard-retry', { shard, files: paths, reason, outcome: retry.stalled[0]?.reason ?? 'ok' });
@@ -2233,9 +2450,29 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         errors: Number.isNaN(errors) ? 0 : errors,
         ran: Number(ran![1]), files: Number(ran![2]), passedIds: junit ? junitPassedIds(junit) : [] }], stalled: [] };
     };
+    const runShard = async (...args: Parameters<typeof runShardImpl>): ReturnType<typeof runShardImpl> => {
+      const [paths, shard, depth = 0, branch = '', , , parentAttempt, hostRetries = 0] = args;
+      filesById.set(`pod-${shard}${branch}`, [...paths]);
+      if (branch || depth > 0 || parentAttempt !== undefined || hostRetries > 0) {
+        resetShardAttempt(shard, branch, Math.round(estimated(paths) / 6) / 10);
+      }
+      try {
+        const done = await runShardImpl(...args);
+        if (branch) markShard(shard, { state: !done.stalled.length ? 'done' : done.stalled.some((stall) => stall.reason === 'timeout') ? 'timeout' : 'failed', endedAt: new Date().toISOString() }, ['waitReason'], branch);
+        if (branch) recordShardResult(`pod-${shard}${branch}`, done);
+        return done;
+      } catch (error) {
+        if (branch) markShard(shard, { state: 'failed', endedAt: new Date().toISOString() }, ['waitReason'], branch);
+        throw error;
+      }
+    };
     // 모든 조각이 끝난 뒤 판정한다 — 한 조각의 예외로 먼저 돌아가면 다른 Pod 가 도는 채로 정리가 시작된다(#22002 리뷰 R3).
     // GATE-RISK-LANE — the risk shard's own wall time (planned vs measured in its log line); it never changes a verdict.
     const shardDurations: number[] = [];
+    // Keep root shards outside the timed Pod admission until a gate slot is available.
+    // Otherwise a wide sweep starts every admission clock together and later waves expire before placement.
+    const withRootSlot = createGateRootLimiter(rootSlots);
+    debug.log('release-loop.gate', 'pod-root-concurrency', { limit: rootSlots, shards: shards.length });
     let settled: Array<PromiseSettledResult<Awaited<ReturnType<typeof runShard>>>>;
     if (shardsFile) {
       reconcileTimer = setInterval(reconcileTick, 30_000);
@@ -2245,10 +2482,59 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       settled = await Promise.allSettled(shards.map(async (item, shard) => {
         const shardStartedAt = clock();
         try {
-          const done = await runShard(item.files, shard);
+          const shardId = `pod-${shard}`;
+          const expected = hostPlan[shard]?.kind === 'reuse' ? receiptChecks[shard]?.result : null;
+          if (expected) {
+            const done = { runs: expected.runs, stalled: [] };
+            shardDurations[shard] = 0;
+            detailsById.set(shardId, { ...(detailsById.get(shardId) ?? {}), imageDigest: expected.receipt.envKey.slice(envFingerprint!.length + 1) });
+            markShard(shard, { state: 'done', rc: done.runs.some((run) => run.fail || run.errors) ? 1 : 0,
+              startedAt: expected.receipt.measuredAt, endedAt: new Date().toISOString(), host: expected.receipt.host }, ['waitReason']);
+            recordShardResult(shardId, done);
+            debug.log('release-loop.gate', 'shard-receipt-reused', { shard: shardId, host: expected.receipt.host, files: item.files.length });
+            return done;
+          }
+          debug.log('release-loop.gate', 'shard-receipt-not-reused', { shard: shardId,
+            reason: pod.rerouteShard === shardId ? 'reroute-requested'
+              : receiptChecks[shard]?.result && pod.rerouteShard === 'auto' ? 'auto-reroute'
+                : receiptChecks[shard]?.result ? 'dispatch-remeasure-required'
+                  : receiptChecks[shard]?.reason ?? 'receipt-unavailable',
+            plan: hostPlan[shard]?.kind ?? 'none' });
+          const receiptAttempt = receiptRoot ? nextGateShardAttempt(receiptRoot, shardId) : 1;
+          if (receiptRoot && base40 && envFingerprint) {
+            try {
+              markGateShardUnmeasured(receiptRoot, { id: shardId, files: [...item.files], head40: commit, base40,
+                host: 'pending', envKey: `${envFingerprint}:${expectedImageDigest ?? 'unmeasured'}`, status: 'unmeasured',
+                failureIds: [], errorIds: [], evidencePath: 'pending', evidenceSha256: '0'.repeat(64),
+                measuredAt: new Date().toISOString(), attempt: receiptAttempt });
+            } catch (error) {
+              debug.log('release-loop.gate', 'shard-receipt-invalidate-failed', { shard: shardId, error: String(error) }, { level: 'warn' });
+              throw error;
+            }
+          }
+          // A missing or deliberately replaced receipt must execute a new Job. The older log-only resume
+          // has no base/environment/image binding and cannot authorize this cross-host measurement.
+          // The sixth runShardImpl argument is `fresh`: a missing receipt must launch a new Job.
+          const freshForReceipt = !!receiptRoot || pod.freshShards === true;
+          const done = await withRootSlot(() => runShard(item.files, shard, 0, '', false, freshForReceipt));
           shardDurations[shard] = clock() - shardStartedAt;
           const state = !done.stalled.length ? 'done' as const : done.stalled.some((stall) => stall.reason === 'timeout') ? 'timeout' as const : 'failed' as const;
-          markShard(shard, { state, endedAt: new Date().toISOString() }, ['waitReason']);
+          markShard(shard, { state, rc: done.stalled.length || done.runs.some((run) => run.fail || run.errors) ? 1 : 0, endedAt: new Date().toISOString() }, ['waitReason']);
+          recordShardResult(`pod-${shard}`, done);
+          if (receiptRoot && base40 && envFingerprint && !done.stalled.length) {
+            const imageDigest = detailsById.get(shardId)?.imageDigest;
+            const attribution = detailsById.get(shardId)?.attribution;
+            const row = board[shard];
+            if (imageDigest && row?.host && attribution === 'complete') {
+              try {
+                saveGateShardResult(receiptRoot, { receipt: { id: shardId, files: [...item.files], head40: commit, base40,
+                  host: row.host, envKey: `${envFingerprint}:${imageDigest}`, status: 'complete',
+                  failureIds: detailsById.get(shardId)?.failureIds ?? [], errorIds: detailsById.get(shardId)?.errorIds ?? [],
+                  evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: new Date().toISOString(),
+                  attempt: receiptAttempt }, runs: done.runs });
+              } catch (error) { debug.log('release-loop.gate', 'shard-receipt-write-failed', { shard: shardId, error: String(error) }, { level: 'warn' }); }
+            }
+          }
           return done;
         } catch (error) {
           markShard(shard, { state: 'failed', endedAt: new Date().toISOString() }, ['waitReason']);
@@ -2274,6 +2560,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     // GATE-STALLED-TAIL-REMEASURE: after the sweep, give only a one-file no-output leaf one fresh attempt on a different
     // pool member. Keep the original unmeasured evidence if no alternate is available or the remeasure is incomplete.
     const remainingStalls: typeof stalledShards = [];
+    const tailTouched = new Set<number>();
+    const tailRc = new Map<number, number>();
     for (const stalled of stalledShards) {
       const alternatives = stalled.lastHost
         ? poolScheduler.members.filter((member) => member.context !== stalled.lastHost && !downMembers.has(member.context))
@@ -2284,6 +2572,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       }
       debug.log('release-loop.gate', 'pod-stalled-tail-remeasure-start', { shard: stalled.shard, file: stalled.files[0], fromHost: stalled.lastHost,
         availableHosts: alternatives.map((member) => member.context) });
+      tailTouched.add(stalled.shard);
       try {
         tailPlacedHost = undefined;
         const tail = await runShard(stalled.files, stalled.shard, 0, '-tail', true, true, undefined, 0, false, new Set([stalled.lastHost]), true);
@@ -2296,6 +2585,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             fromHost: stalled.lastHost, toHost: unresolved.lastHost ?? null, reason: unresolved.reason }, { level: 'warn' });
         } else {
           measured.push(...tail.runs);
+          tailRc.set(stalled.shard, tail.runs.some((run) => run.fail || run.errors) ? 1 : 0);
           debug.log('release-loop.gate', 'pod-stalled-tail-remeasure-complete', { shard: stalled.shard, file: stalled.files[0],
             fromHost: stalled.lastHost, toHost: tailPlacedHost ?? null });
         }
@@ -2306,6 +2596,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       }
     }
     stalledShards = remainingStalls;
+    for (const shard of tailTouched) {
+      const unresolved = stalledShards.some((item) => item.shard === shard);
+      markShard(shard, { state: unresolved ? 'failed' : 'done', rc: unresolved ? 1 : tailRc.get(shard) ?? 0, endedAt: new Date().toISOString() }, ['waitReason']);
+    }
     const total = measured.reduce((sum, run) => ({ pass: sum.pass + run.pass, fail: sum.fail + run.fail,
       errors: sum.errors + run.errors, ran: sum.ran + run.ran, files: sum.files + run.files }),
     { pass: 0, fail: 0, errors: 0, ran: 0, files: 0 });
@@ -2819,6 +3113,11 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       existsSync(join(root, 'release', opts.version, 'rehearsal', `${step}.json`)));
     const currentImage = !explicitPartial && opts.graphRunId && opts.pod && rehearsalStampPresent
       ? imageProbe(opts.pod.pool) : null;
+    const receiptImage = currentImage ?? (opts.graphRunId && opts.pod && process.env.ELANOUS_GRAPH_CONTEXT
+      ? imageProbe(opts.pod.pool) : null);
+    const receiptBase = opts.baselineCommit ?? (opts.baselineVersion && roots.some((location) =>
+      existsSync(join(location, 'release', opts.baselineVersion!, 'release.json')))
+      ? baselineReleaseCommit(opts.baselineVersion) : undefined);
     const radius = !explicitPartial && opts.graphRunId && opts.pod && rehearsalStampPresent
       ? planHardRehearsalRadius({ root, repo, version: opts.version, forCommit: opts.commit,
         graphPins: gateGraphPins(root, opts.graphRunId), envFingerprint: gateEnvFingerprint(process.env), imageDigest: currentImage })
@@ -2879,8 +3178,12 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
         // the cut sweep puts those files first, the baseline sweep keeps its plan.
         riskWatch: { instanceRoots: roots, ledgerRoots: roots },
         // GATE-LIVE-OBS: the release ledger's shards.json (UX #24782) — never the run tree's universe; an explicit
-        // --ledger-root (tests) keeps it in that ledger.
-        shardsFile: { path: opts.ledgerRoot ? gateShardsPath(opts.version, opts.ledgerRoot) : gateShardsPath(opts.version), version: opts.version } } : undefined,
+        // --ledger-root or an explicit test instance keeps it in that ledger.
+        shardsFile: { path: gateShardsPath(opts.version, ledger), version: opts.version,
+          ledgerPath: gateShardLedgerPath(opts.version, ledger), envFingerprint: gateEnvFingerprint(process.env),
+          receiptRoot: join(ledger, 'release', opts.version, 'gate-logs', 'cut', 'receipts'),
+          base40: receiptBase,
+          expectedImageDigest: receiptImage } } : undefined,
       selected?.files);
     let cutRun = await runCut(partial);
     const radiusSelectionMatched = partial?.files && cutRun?.podSweep?.files
@@ -3418,7 +3721,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
   // GATE-LIVE-OBS-RC-WORDING ⓒ — the shards board says «판정 전» until this lands; then «새 실패 N» only (UX · gate-shards.ts).
   // Same ledger as the board's own writes (sweep's shardsFile). A write failure is logged and never changes the verdict.
   if (result.outcome !== 'error' && opts.pod) {
-    const path = opts.ledgerRoot ? gateShardsPath(opts.version, opts.ledgerRoot) : gateShardsPath(opts.version);
+    const path = gateShardsPath(opts.version, ledger);
     try {
       const written = recordGateShardsVerdict(path, { introduced: result.introduced.length, preexisting: result.preexisting });
       debug.log('release-loop.gate', 'shards-verdict', { version: opts.version, path, written, introduced: result.introduced.length, preexisting: result.preexisting });
@@ -3483,6 +3786,12 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
   if (fromGraph.gateExecutor !== undefined && !isGateExecutor(fromGraph.gateExecutor)) throw new Error(`gateExecutor must be pod or host: ${String(fromGraph.gateExecutor)}`);
   // GATE-HOST-EXECUTOR: a host gate never reads the pod settings (a bad pod value must not block the fallback executor).
   const hostExecutor = fromGraph.gateExecutor === 'host';
+  const graphCapabilities = fromGraph.gateShardCapabilities;
+  if (!hostExecutor && graphCapabilities !== undefined && (!graphCapabilities || typeof graphCapabilities !== 'object'
+    || Array.isArray(graphCapabilities) || Object.entries(graphCapabilities).some(([id, value]) =>
+      !/^pod-\d+$/.test(id) || !value || typeof value !== 'object' || Array.isArray(value)
+      || !['darwin', 'linux'].includes((value as { os?: string }).os ?? ''))))
+    throw new Error('gateShardCapabilities must map pod-N to {os: darwin|linux}');
   const opts: GateOptions = {
     rehearsalTui: fromGraph.rehearsalTui === true,
     recheckFileLimit: fromGraph.gateRecheckFileLimit !== undefined ? Number(fromGraph.gateRecheckFileLimit) : undefined,
@@ -3504,11 +3813,16 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
       ...(fromGraph.gatePodStallSeconds !== undefined ? { stallSeconds: Number(fromGraph.gatePodStallSeconds) } : {}),
       ...(fromGraph.gatePodMidRunStallSeconds !== undefined ? { midRunStallSeconds: Number(fromGraph.gatePodMidRunStallSeconds) } : {}),
       ...(fromGraph.gatePodFreshShards === true ? { freshShards: true } : {}),
+      ...(typeof fromGraph.gateRerouteShard === 'string' ? { rerouteShard: fromGraph.gateRerouteShard } : {}),
+      ...(typeof fromGraph.gateShardHost === 'string' ? { shardHost: fromGraph.gateShardHost } : {}),
+      ...(graphCapabilities ? { shardCapabilities: graphCapabilities as Record<string, { os: 'darwin' | 'linux' }> } : {}),
       ...((cpu) => cpu ? { cpu } : {})(parsePodCpu(fromGraph.gatePodCpu, 'release.loop.gatePodCpu')),
     } : undefined,
   };
   if (isGateExecutor(fromGraph.gateExecutor)) opts.executor = fromGraph.gateExecutor;
   let freshShards = false;
+  let rerouteShard: string | undefined;
+  let shardHost: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--help') return 'help';
@@ -3516,6 +3830,18 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
     if (arg === '--rehearsal-baseline') { opts.rehearsalBaseline = true; continue; }
     // Applied after the loop and only to a Pod gate — on its own it must not turn a local gate into a Pod one (review r5).
     if (arg === '--fresh-shards') { freshShards = true; continue; }
+    if (arg === '--reroute-shard') {
+      const value = args[++i];
+      if (!value || !/^(?:auto|pod-\d+)$/.test(value)) throw new Error('--reroute-shard requires auto or pod-N');
+      rerouteShard = value;
+      continue;
+    }
+    if (arg === '--shard-host') {
+      const value = args[++i];
+      if (!value || value.startsWith('--')) throw new Error('--shard-host requires a pool context');
+      shardHost = value;
+      continue;
+    }
     if (arg === '--rehearsal-tui') { opts.rehearsalTui = true; continue; }
     if (arg === '--recheck-file-limit') {
       const value = args[++i];
@@ -3544,6 +3870,11 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
     else if (key === 'remoteMirror') opts.remoteMirror = value;
   }
   if (freshShards && opts.pod) opts.pod = { ...opts.pod, freshShards: true };
+  if ((rerouteShard || shardHost) && !opts.pod?.pool) throw new Error('shard reroute requires a Pod pool');
+  if (shardHost && !rerouteShard) throw new Error('--shard-host requires --reroute-shard');
+  if (opts.pod && rerouteShard) opts.pod = { ...opts.pod, rerouteShard, ...(shardHost ? { shardHost } : {}) };
+  if (opts.pod?.rerouteShard && !/^(?:auto|pod-\d+)$/.test(opts.pod.rerouteShard)) throw new Error('gateRerouteShard must be auto or pod-N');
+  if (opts.pod?.shardHost && !opts.pod.rerouteShard) throw new Error('gateShardHost requires gateRerouteShard');
   // GATE-HOST-EXECUTOR: the host executor is the existing non-pod sweep on gateRemote — a configured pool must not pull it
   // back into Pods, and without a host it would silently sweep on the runner's own machine.
   if (opts.executor === 'host') {
@@ -3576,7 +3907,7 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
       debug.log('release-loop.gate', 'executor', { version: opts.version, ...placement, requested: opts.executor ?? null });
     }
     if (opts === 'help') {
-      console.log('Usage: bun scripts/release-loop/gate-node.ts --commit <sha> --version <v> [--baseline-version <prev>] [--baseline-commit <sha>] [--remote <ssh-host>] [--remote-mirror <path>] [--pod-pool <pool>] [--pod-shards <n>] [--pod-shard-timeout-seconds <n>] [--recheck-file-limit <n>] [--fresh-shards] [--executor <pod|host>] [--rehearsal-baseline] [--json]\nWithout flags, input.commit, input.version and input.previousVersion come from the JSON file at ELANOUS_GRAPH_CONTEXT.\n--executor host (input.gateExecutor) ignores every pod option and sweeps on --remote (input.gateRemote, required).\n--rehearsal-baseline pins source graph bytes only for a direct Pod gate on an isolated rc version.');
+      console.log('Usage: bun scripts/release-loop/gate-node.ts --commit <sha> --version <v> [--baseline-version <prev>] [--baseline-commit <sha>] [--remote <ssh-host>] [--remote-mirror <path>] [--pod-pool <pool>] [--pod-shards <n>] [--pod-shard-timeout-seconds <n>] [--recheck-file-limit <n>] [--fresh-shards] [--reroute-shard <pod-N|auto>] [--shard-host <pool-context>] [--executor <pod|host>] [--rehearsal-baseline] [--json]\nWithout flags, input.commit, input.version and input.previousVersion come from the JSON file at ELANOUS_GRAPH_CONTEXT.\n--executor host (input.gateExecutor) ignores every pod option and sweeps on --remote (input.gateRemote, required).\n--rehearsal-baseline pins source graph bytes only for a direct Pod gate on an isolated rc version.');
       return 0;
     }
     version = opts.version;

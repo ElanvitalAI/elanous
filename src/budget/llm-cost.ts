@@ -25,15 +25,48 @@ export interface LlmPricingUsd {
 }
 
 /** AWS Bedrock Global Standard prices, USD per million tokens (AWS pricing API, ap-northeast-2).
- *  ⛔ BEDROCK-COST-LEDGER(0.2.26) — mantle-openai 비-Anthropic Bedrock id(`openai.gpt-6-sol`·`zai.glm-5` 등
- *  `src/llm/bedrock.ts` BEDROCK_MODELS 의 `route:'mantle-openai'` 행)는 여기에 행이 «없다»: 단가 수치 근거가
- *  하나도 확보되지 않았다. 근거 없는 id는 `isBedrockPricingModel` 게이트(`claude-` 시작)를 지나지 않아
- *  `unknownCost()` 로 `kind:'unknown'` 에 머문다 — 0원으로 꾸미지 않는다. */
+ *  Anthropic(Claude) 축만 담는다 — 이 표는 `isBedrockPricingModel` 게이트(`claude-` 시작) 뒤에 있다.
+ *  ⛔ BEDROCK-COST-LEDGER(0.2.38) — mantle-openai 비-Anthropic id 는 «다른 표»
+ *  (`BEDROCK_NON_ANTHROPIC_PRICING_USD`)로 분리했다. 이 객체는 Claude 5.5 착지분 그대로다(보존 계약). */
 export const BEDROCK_PRICING_USD: Readonly<Record<string, LlmPricingUsd>> = {
   'claude-haiku-5-5': { inputPerM: 0.1, outputPerM: 0.5, cacheWritePerM: 0.125, cacheReadPerM: 0.01 },
   'claude-sonnet-5-5': { inputPerM: 2, outputPerM: 10, cacheWritePerM: 2.5, cacheReadPerM: 0.1 },
   'claude-opus-5-5': { inputPerM: 4, outputPerM: 20, cacheWritePerM: 5, cacheReadPerM: 0.2 },
 };
+
+/** Bedrock 비-Anthropic(mantle-openai) 단가의 근거 — AWS Price List API(`AmazonBedrock` offer,
+ *  us-east-1 = mantle-openai 고정 리전) 조회 결과. 게시 시각 2026-10-16T21:08:06Z.
+ *  재현: `awscurl`/SDK 로 `GetProducts`(serviceCode=AmazonBedrock, regionCode=USE1) 후
+ *  `USE1-<id>-mantle-{input,output}-tokens-standard` 키의 `pricePerUnit.USD` 를 읽는다(1K 토큰 단가 ×1000 = per-M).
+ *  ⛔ 근거 없는 id 는 표에 «넣지 않는다» — `kind:'unknown'` 에 머문다(0원으로 꾸미지 않는다). */
+export const BEDROCK_NON_ANTHROPIC_PRICING_USD: Readonly<Record<string, LlmPricingUsd>> = {
+  // AWS price list key: USE1-deepseek.v3.2-mantle-{input,output}-tokens-standard
+  'deepseek.v3.2': { inputPerM: 0.62, outputPerM: 1.85 },
+  // AWS price list key: USE1-zai.glm-4.7-flash-mantle-{input,output}-tokens-standard
+  'zai.glm-4.7-flash': { inputPerM: 0.07, outputPerM: 0.4 },
+  // AWS price list key: USE1-moonshotai.kimi-k2.5-mantle-{input,output}-tokens-standard
+  'moonshotai.kimi-k2.5': { inputPerM: 0.6, outputPerM: 3 },
+  // AWS price list key: USE1-qwen.qwen3-coder-next-mantle-{input,output}-tokens-standard
+  'qwen.qwen3-coder-next': { inputPerM: 0.5, outputPerM: 1.2 },
+  // AWS price list key: USE1-minimax.minimax-m2.5-mantle-{input,output}-tokens-standard
+  'minimax.minimax-m2.5': { inputPerM: 0.3, outputPerM: 1.2 },
+  // AWS price list key: USE1-mistral.devstral-2-123b-mantle-{input,output}-tokens-standard
+  'mistral.devstral-2-123b': { inputPerM: 0.4, outputPerM: 2 },
+  // ⛔ 근거 없음(AWS price list 조회 0행 → 표에 없음): openai.gpt-6-sol · openai.gpt-6-luna · zai.glm-5.
+  //    이 셋은 지금 mantle-openai 로 선택 가능하지만 단가 근거가 없으므로 `kind:'unknown'` 이 정직한 답이다.
+};
+
+/** Bedrock 비-Anthropic(mantle-openai) 단가 조회용 id 정규화 — invoke id 모양을 표의 키로 되돌린다.
+ *  - `bedrock/` 접두(레지스트리 별칭) · `us.`/`global.` 같은 리전 스코프 접두
+ *  - `-v1:0` 버전 꼬리 · `-20251001` 날짜 꼬리
+ *  Anthropic id(`anthropic.claude-…`)는 이 축이 아니다 — `bedrockPricingModelId` 가 맡는다. */
+export function bedrockNonAnthropicPricingModelId(model: string): string {
+  return model.trim()
+    .replace(/^bedrock\//, '')
+    .replace(/^(?:us|eu|apac|global)\./, '')
+    .replace(/-v1:\d+$/, '')
+    .replace(/-\d{8}$/, '');
+}
 
 export interface LlmCostUsage {
   model: string;
@@ -202,7 +235,7 @@ function resolvePricing(
   model: string,
   opts?: EstimateLlmCostOptions,
 ): { pricing: LlmPricingUsd; source: 'catalog' | 'bedrock-catalog' | 'config' | 'registry' } | undefined {
-  // ⭐ 순서: 손 카탈로그(정확) → 정규화 id → config 오버레이 → Bedrock 표 → 저장소 정본 → 레지스트리. 앞이 이긴다.
+  // ⭐ 순서: 손 카탈로그(정확) → 정규화 id → config 오버레이 → Claude Bedrock 표 → 저장소 정본 → mantle Bedrock 표 → 레지스트리. 앞이 이긴다.
   const normalized = normalizePricingModelId(model);
   for (const id of normalized === model ? [model] : [model, normalized]) {
     const catalog = catalogPricing(id);
@@ -216,8 +249,14 @@ function resolvePricing(
     const bedrock = BEDROCK_PRICING_USD[bedrockPricingModelId(model)];
     if (validPricing(bedrock)) return { pricing: bedrock, source: 'bedrock-catalog' };
   }
+  // 저장소 정본이 mantle 표보다 우선한다. 같은 id 가 생기면 직접 모델 가격을 Bedrock 가격으로 덮지 않는다.
   const builtin = builtinCatalogPricing(normalized);
   if (validPricing(builtin)) return { pricing: builtin, source: 'catalog' };
+  // BEDROCK-COST-LEDGER(0.2.38) — mantle-openai 비-Anthropic 축: 근거 있는 행만 bedrock-catalog 로 값을 낸다.
+  // 표에 없는 id(openai.gpt-6-sol·zai.glm-5 등)는 여기서 결정되지 않아 아래 정본·레지스트리로 내려가고,
+  // 그것도 없으면 `unknownCost()` — 0원으로 꾸미지 않는다.
+  const mantle = BEDROCK_NON_ANTHROPIC_PRICING_USD[bedrockNonAnthropicPricingModelId(model)];
+  if (validPricing(mantle)) return { pricing: mantle, source: 'bedrock-catalog' };
   const registry = registryPricing(model);
   if (validPricing(registry)) return { pricing: registry, source: 'registry' };
   return undefined;

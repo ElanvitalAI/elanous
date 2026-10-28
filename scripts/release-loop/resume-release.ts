@@ -14,7 +14,7 @@ import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
-import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
+import { assertReleaseResumeApprovalBoundary, releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { cutReleaseBranch } from './cut-branch.js';
 import { releaseLoopConfig } from './unattended-release.js';
@@ -55,6 +55,7 @@ export interface ResumeReleaseDeps {
 export interface ResumeReleaseOptions {
   runId: string; from: string; partial?: boolean; waive?: string; reason?: string;
   acceptedRegressions?: AcceptedRegression[]; gateExecutor?: string; gateHost?: string; gatePodPool?: string;
+  rerouteShard?: string; shardHost?: string; shardOs?: 'darwin' | 'linux';
   commandRoot?: string;
 }
 
@@ -456,12 +457,16 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
   const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
+  assertReleaseResumeApprovalBoundary({ ...savedRun, statePath }, opts.from);
   if (opts.gateHost !== undefined && opts.gateExecutor === undefined) throw new Error('--gate-host requires --gate-executor host');
+  if ((opts.shardHost !== undefined || opts.shardOs !== undefined) && opts.rerouteShard === undefined)
+    throw new Error('--shard-host/--shard-os require --reroute-shard');
   const hasOverrides = opts.waive !== undefined || opts.reason !== undefined || opts.acceptedRegressions !== undefined
-    || opts.gateExecutor !== undefined || opts.gatePodPool !== undefined;
+    || opts.gateExecutor !== undefined || opts.gatePodPool !== undefined || opts.rerouteShard !== undefined;
   const original = hasOverrides ? savedRun : undefined;
   if (original && opts.gateExecutor !== undefined) releaseResumeGateExecutor(original, { from: opts.from, executor: opts.gateExecutor, host: opts.gateHost });
   if (original && opts.gatePodPool !== undefined) releaseResumeGatePodPool(original, { from: opts.from, pool: opts.gatePodPool });
+  if (original && opts.rerouteShard !== undefined) releaseResumeGateShardReroute(original, { from: opts.from, shard: opts.rerouteShard, host: opts.shardHost, os: opts.shardOs });
   const waiver = original && (opts.waive !== undefined || opts.reason !== undefined) ? releaseResumeWaiver(original, opts) : undefined;
   if (original && opts.acceptedRegressions !== undefined && !waiver)
     releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from);
@@ -478,10 +483,11 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
     waiverCommit = recorded;
   }
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
+  if (opts.rerouteShard !== undefined && tip.changed) throw new Error('shard reroute requires the original cut head; moved tip needs a full re-gate');
   verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, tip.version);
   const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), tip.to, deps.git);
   verifyResumePreflight(savedRun, opts, deps, tip.version, tip.from, tip.to, commandRoot);
-  const partial = preparePartial(tip, opts, deps, true);
+  const partial = preparePartial(tip, opts.rerouteShard !== undefined ? { ...opts, partial: false } : opts, deps, true);
   const fromIndex = savedRun.path.indexOf(opts.from);
   const gateIndex = savedRun.path.indexOf('gate');
   const gateWillRun = fromIndex >= 0 && gateIndex >= fromIndex;
@@ -498,15 +504,20 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   deps = { ...deps, root: releaseRunUniverse({ root: deps.root }) };
   const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
+  assertReleaseResumeApprovalBoundary({ ...savedRun, statePath }, opts.from);
   let waiverCommit: string | undefined;
   if (opts.gateHost !== undefined && opts.gateExecutor === undefined) throw new Error('--gate-host requires --gate-executor host');
-  const original = opts.waive !== undefined || opts.reason !== undefined || opts.acceptedRegressions !== undefined || opts.gateExecutor !== undefined || opts.gatePodPool !== undefined
+  if ((opts.shardHost !== undefined || opts.shardOs !== undefined) && opts.rerouteShard === undefined)
+    throw new Error('--shard-host/--shard-os require --reroute-shard');
+  const original = opts.waive !== undefined || opts.reason !== undefined || opts.acceptedRegressions !== undefined || opts.gateExecutor !== undefined || opts.gatePodPool !== undefined || opts.rerouteShard !== undefined
     ? savedRun : undefined;
   // GATE-HOST-EXECUTOR: checked before the tip refresh writes anything; the runner checks it again under the resume lock.
   const gateExecutor = original && opts.gateExecutor !== undefined
     ? releaseResumeGateExecutor(original, { from: opts.from, executor: opts.gateExecutor, host: opts.gateHost }) : undefined;
   const gatePodPool = original && opts.gatePodPool !== undefined
     ? releaseResumeGatePodPool(original, { from: opts.from, pool: opts.gatePodPool }) : undefined;
+  const shardReroute = original && opts.rerouteShard !== undefined
+    ? releaseResumeGateShardReroute(original, { from: opts.from, shard: opts.rerouteShard, host: opts.shardHost, os: opts.shardOs }) : undefined;
   if (gateExecutor) debug.log('release-loop.resume', 'gate-executor', { runId: opts.runId, from: opts.from, executor: gateExecutor.set.gateExecutor, host: gateExecutor.set.gateRemote ?? null, previous: gateExecutor.previous });
   if (gatePodPool) debug.log('release-loop.resume', 'gate-pod-pool', {
     runId: opts.runId, from: opts.from, pool: gatePodPool.set.gatePodPool, previous: gatePodPool.previous,
@@ -534,11 +545,12 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   }
   // The read-only tip and recipe pin preflight must pass before fetch or a saved-run rewrite.
   const previewTip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
+  if (shardReroute && previewTip.changed) throw new Error('shard reroute requires the original cut head; moved tip needs a full re-gate');
   verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, previewTip.version);
   const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), previewTip.to, deps.git);
   verifyResumePreflight(savedRun, opts, deps, previewTip.version, previewTip.from, previewTip.to, commandRoot);
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, false, previewTip.to);
-  const partial = preparePartial(tip, opts, deps);
+  const partial = preparePartial(tip, shardReroute ? { ...opts, partial: false } : opts, deps);
   // A failed preflight does not consume an observed release resume attempt.
   const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now });
   debug.log('release-loop.resume', 'attempt', { runId: opts.runId, attempt: attempt.attempt,
@@ -553,6 +565,9 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     ...(acceptedRegressions ? { releaseAcceptedRegressions: { requested: opts.acceptedRegressions!, acceptedRegressions } } : {}),
     ...(gateExecutor ? { releaseGateExecutor: { executor: gateExecutor.set.gateExecutor, ...(opts.gateHost !== undefined ? { host: opts.gateHost } : {}) } } : {}),
     ...(gatePodPool ? { releaseGatePodPool: gatePodPool.set.gatePodPool } : {}),
+    ...(shardReroute ? { releaseGateShardReroute: { shard: shardReroute.set.gateRerouteShard,
+      ...(shardReroute.set.gateShardHost ? { host: shardReroute.set.gateShardHost } : {}),
+      ...(opts.shardOs ? { os: opts.shardOs } : {}) } } : {}),
     deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } });
   return { tip, partial, state };
 }

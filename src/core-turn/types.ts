@@ -84,6 +84,8 @@ export interface CoreTurnCallbacks {
   /** Streaming text delta — `full` is the accumulated text across the
    *  entire turn (not just the current round). */
   onText?(delta: string, full: string): void;
+  /** Transient runtime status (for example, a stream retry notice). */
+  onStatus?(line: string): void;
   /** The final answer came back enriched with a runtime verification
    *  supplement — forwarded from `StreamWithToolsHandlers.onFinalAnswerSupplement`. */
   onFinalAnswerSupplement?(info: { answer: string; supplement: string; finalText: string }): void;
@@ -142,6 +144,9 @@ export interface CoreTurnContext {
   surfaceProfile?: import('../session-runtime/index.js').SessionSurfaceProfile;
   /** Full prompt (system + history + current user blocks). */
   messages: LLMMessage[];
+  /** Optional provider request-size hook. Only providers with a measured
+   *  serializer consume it; all others retain their existing request path. */
+  requestSizeGuard?: LLMOpts['requestSizeGuard'];
   /** Tool catalog the model may call this turn. Empty array means
    *  "text-only" — the loop delegates to plain `streamLLM`. */
   tools: LLMToolSpec[];
@@ -166,6 +171,8 @@ export interface CoreTurnContext {
   /** TUI-H1-GOALLOOP-EMPTY-TAIL — 이 턴 «앞»에 사람에게 답을 이미 보였다. `streamLLMWithTools` 의
    *  `terminalPriorAnswerVisible` 로 그대로 간다(종결 신호 뒤 빈 턴 = 경고 없이 빈 답). goal loop 가 넣는다. */
   terminalPriorAnswerVisible?: LLMOpts['terminalPriorAnswerVisible'];
+  /** Only a structurally valid goal completion may stop before the next provider request. */
+  terminalCompletionAccepted?: LLMOpts['terminalCompletionAccepted'];
   /** Optional model override (forwarded to `streamLLMWithTools`). */
   modelOverride?: string;
   /** TUI-400-AUTOHEAL-FALLBACK — 이 턴을 이 공급자부터 연다(`streamLLMWithTools` `initialProvider` · 폴백은 허용).
@@ -178,6 +185,8 @@ export interface CoreTurnContext {
 export interface CoreTurnResult {
   stopReason: CoreTurnStopReason;
   finalText: string;
+  /** The completed provider response explicitly marked its last assistant answer as final. */
+  finalPhaseAnswer?: boolean;
   /** `auth_rejected` 일 때만 — 공급자 오류 원문(비밀값 가림). 호스트가 처방 줄에 원문을 붙인다. */
   errorMessage?: string;
 }

@@ -8,11 +8,20 @@ import { join } from 'node:path';
 import { buildControllerSystemMessage, buildDashboardTurnPreamble } from './turn-preamble.js';
 import { SEAT_MEMORY_RECALL_PREFIX, startSeatBootConversation } from './seat-boot-preamble.js';
 import { LAST_SESSION_FILE } from './seat-local-instructions.js';
-import { globalTaskNotificationQueue } from '../agent/task-notification.js';
+import { globalTaskNotificationQueue, type PendingTaskNotification } from '../agent/task-notification.js';
 import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { MsgStore } from '../msg/msg-store.js';
 import { createSessionPostureState, resolveSessionTurnProfile } from '../session-runtime/index.js';
+import { withSimClock } from '../ux-sim/fake-clock.js';
+import {
+  createDashboardAgentWakeNotify,
+  formatAgentWakePrompt,
+  installSeatedAgentWake,
+  resetAgentWakeForTest,
+  wrapAgentWakePort,
+} from './input/agent-wake.js';
+import { createInternalTurnGate, type StartTurnIfIdleOptions } from './input/internal-turn.js';
 
 const fakeConfig = { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig>;
 
@@ -173,6 +182,31 @@ describe('buildDashboardTurnPreamble — 자기접근 규율', () => {
     expect(second).toHaveLength(first.length - 1);
     expect(second.some((message) => String(message.content).includes('<task-notification'))).toBe(false);
     globalTaskNotificationQueue.clear();
+  });
+
+  test('자동 완료 턴에는 원문 task id와 결과의 로그·PR 포인터를 함께 보존한다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'preamble-completion-pointers-'));
+    globalTaskNotificationQueue.clear();
+    globalTaskNotificationQueue.enqueue({
+      taskId: 'message-source-1042', agentName: 'dashboard-agent', state: 'done',
+      output: '완료 · log=https://logs.example/run-1042 · PR=https://github.com/example/repo/pull/31877',
+      truncated: false, durationMs: 50, finishedAt: Date.now(),
+    });
+    try {
+      const turn = buildDashboardTurnPreamble({
+        userText: '[자동 재개] 위임 끝: dashboard-agent (done) — <task-notification> 의 결과를 읽고 이어서 처리',
+        cwd, userConfig: fakeConfig,
+      });
+      const notification = turn.find((message) => message.role === 'user'
+        && String(message.content).includes('<task-notification'));
+      expect(notification?.content).toContain('id="message-source-1042"');
+      expect(notification?.content).toContain('https://logs.example/run-1042');
+      expect(notification?.content).toContain('https://github.com/example/repo/pull/31877');
+      expect(globalTaskNotificationQueue.size).toBe(0);
+    } finally {
+      globalTaskNotificationQueue.clear();
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test('알림 자동 재개는 비요청 status receipt로 한 번 요약하고, 사용자 요청이 있으면 기존 흐름을 보존한다', () => {
@@ -487,4 +521,205 @@ describe('buildDashboardTurnPreamble — 매 턴 자기 건강 한 줄(TUI-SELF-
     expect((data!.builderMs as Record<string, number>).selfHealth).toBeGreaterThanOrEqual(0);
     expect((data!.builderCounts as Record<string, number>).selfHealth).toBe(1);
   });
+});
+
+// ── TUI-EVENT-TURN-QUEUE — 완료 경계 실물 무대 (fake clock ⊕ 생산 조립) ─────────────────────
+//
+// 완료 경계(부모 칸 TUI-EVENT-TURN-QUEUE 에서 물려받은 3행):
+//   완료 통지가 idle 동안 들어오면 턴 하나만 열고 같은 완료 중복 신호는 턴을 추가하지 않는다.
+//   응답 active 중 신호는 다음 턴까지 큐에 둔다. 입력창 변형·inbox.md·정시 프롬프트는 범위 밖이다.
+//
+// 무대(L2 · fake clock): src/ux-sim/fake-clock.ts 의 withSimClock 이 생산 기본 defer
+// (`setTimeout(fn, 0)` — agent-wake.ts 가 defers 재시도에 쓰는 것)를 돌린다. 나머지는 전부 실물:
+//   • 실제 큐 globalTaskNotificationQueue ⊕ 실제 dashboard 구독 subscribeDashboardAgentResults
+//     — showDashboard 조립부가 installSeatedAgentWake 에 넘기는 것(src/dashboard/index.ts)
+//   • 생산 조립 installSeatedAgentWake(showDashboard 가 부르는 그 함수 하나)
+//   • 실제 H2 문 createInternalTurnGate ⊕ 실제 입력칸 문 감싸기 wrapAgentWakePort
+//   • 실제 자리 판정 detectSeatTui(home 픽스처 — 생산은 detectSeat 을 안 넘긴다)
+//   • 실제 턴 프리앰블 buildDashboardTurnPreamble(깨움 턴 진입의 <task-notification> drain)
+// 생산 호출자(배선 증거): src/dashboard/index.ts — subscribeDashboardAgentResults(정의 ~1319) ·
+//   wrapAgentWakePort(~3601) · installSeatedAgentWake(~13497) · consumeInternalTurnYield(~17232)
+//   · buildDashboardTurnPreamble(getPreamble 단일 출처 — turn-preamble.ts).
+// 첫 화면 콜백 회귀: 부팅(첫 화면) 때 프리앰블 getter 는 userText 없이 불린다(turn-preamble.ts
+//   Phase 5a 주석 ⊕ «ACP may ask for a preamble while the session is idle») — 그 콜백이 완료
+//   영수증을 큐에서 꺼내 먹으면 안 된다(다음 실제 턴까지 보존).
+describe('TUI-EVENT-TURN-QUEUE — 완료 경계 실물(fake clock ⊕ 생산 조립)', () => {
+  /** 자리 TUI 판정이 통과하는 home 픽스처(이 파일의 TUI-SESSION-BOOT 시험과 같은 모양). */
+  function makeSeatHome(): { home: string; seatCwd: string } {
+    const home = mkdtempSync(join(tmpdir(), 'turn-queue-seat-'));
+    const seatCwd = join(home, 'elanous-hq', 'seats', 'OP');
+    mkdirSync(seatCwd, { recursive: true });
+    mkdirSync(join(home, 'elanous-hq', 'seat-state', 'OP'), { recursive: true });
+    writeFileSync(join(seatCwd, 'AGENTS.local.md'), '역할 = 완료 경계 시험 자리\n');
+    writeFileSync(join(seatCwd, LAST_SESSION_FILE), '## 지난 세션 (시험 픽스처)\n- 마지막 요청: 완료 경계 시험\n');
+    return { home, seatCwd };
+  }
+
+  function completion(taskId: string, output: string, finishedAt: number): PendingTaskNotification {
+    return {
+      taskId,
+      agentName: 'general-purpose',
+      label: 'pr-review',
+      state: 'done',
+      output,
+      truncated: false,
+      durationMs: 1200,
+      finishedAt,
+    };
+  }
+
+  /** 실물 무대: 실제 큐·구독·생산 조립·H2 문·입력칸 감싸기. 시계만 fake-clock 몫이다. */
+  async function seatStage(home: string, seatCwd: string) {
+    const logs: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const lines: string[] = [];
+    const historyLines: string[] = [];
+    const h2Calls: Array<{ text: string; opts: StartTurnIfIdleOptions }> = [];
+    const state = { running: false, buffer: '' as string | undefined, yields: 0 };
+    const log = (category: string, event: string, data: Record<string, unknown>) => {
+      logs.push({ category, event, data });
+    };
+    const gate = createInternalTurnGate({
+      isEnabled: () => true,
+      isTurnRunning: () => state.running,
+      getBufferText: () => state.buffer,
+      getTypeaheadCount: () => 0,
+      pendingKeyCount: () => 0,
+      lastHumanKeyAt: () => 0,
+      log,
+    });
+    // 생산 배선과 같은 모양: 입력칸 문은 깨움 감싸기를 거친다(index.ts `wrapAgentWakePort(...)`).
+    const port = wrapAgentWakePort(gate.port);
+    const mount = () => port.attach(() => { if (state.buffer) return false; state.yields += 1; return true; });
+    const { subscribeDashboardAgentResults } = await import('./index.js');
+    const wake = installSeatedAgentWake({
+      subscribe: (listener) => subscribeDashboardAgentResults(globalTaskNotificationQueue, listener, (line) => { historyLines.push(line); }),
+      notify: createDashboardAgentWakeNotify((line) => { lines.push(line); }, () => { /* draw */ }),
+      startTurnIfIdle: (text, opts) => { h2Calls.push({ text, opts }); return gate.startTurnIfIdle(text, opts); },
+      getCwd: () => seatCwd,
+      isPending: (taskId) => globalTaskNotificationQueue.has(taskId),
+      home,
+      log,
+    });
+    const opened = () => logs.filter((row) => row.category === 'tui.autoturn' && row.event === 'opened');
+    return { gate, mount, lines, historyLines, h2Calls, logs, state, wake, opened };
+  }
+
+  test('TUI-EVENT-TURN-QUEUE: acceptance 1완료 경계 코드: 완료 통지가 idle 동안 들어오면 턴 하나만 열고 같은 완료 중복 신호는 턴을 추가하지 않는다', async () => {
+    resetAgentWakeForTest();
+    globalTaskNotificationQueue.clear();
+    const { home, seatCwd } = makeSeatHome();
+    try {
+      const stage = await seatStage(home, seatCwd);
+      await withSimClock(Date.UTC(2026, 9, 27, 8, 0, 0), async (clock) => {
+        stage.mount();
+        const notice = completion('turn-queue-idle-a1', 'idle 결과', clock.now());
+        globalTaskNotificationQueue.enqueue(notice);
+        // 완료 1건 → idle 턴 정확히 1개(origin child-complete · 깨움 프롬프트 그대로 · 입력칸 무접촉).
+        expect(stage.opened()).toHaveLength(1);
+        expect(stage.opened()[0]!.data).toMatchObject({ origin: 'child-complete' });
+        expect(stage.lines).toEqual(['✓ 위임 끝: pr-review — 다음 턴에 결과']);
+        const request = stage.gate.takePending();
+        expect(request).toMatchObject({ origin: 'child-complete', input: formatAgentWakePrompt(notice) });
+        expect(stage.state.buffer).toBe('');
+        expect(stage.state.yields).toBe(1);
+        // 같은 완료 중복 신호 ① — 큐 `seen` 이 막는다: 깨움 리스너조차 다시 안 불린다.
+        const logCount = stage.logs.length;
+        globalTaskNotificationQueue.enqueue(notice);
+        expect(stage.logs.length).toBe(logCount);
+        // 같은 완료 중복 신호 ② — 큐 clear 뒤 재신호: 깨움 `handled` 집합이 'duplicate' 로 거부한다.
+        globalTaskNotificationQueue.clear();
+        globalTaskNotificationQueue.enqueue(notice);
+        expect(stage.opened()).toHaveLength(1);
+        expect(stage.h2Calls).toHaveLength(1);
+        expect(stage.logs.at(-1)).toMatchObject({
+          category: 'tui.agent-wake',
+          event: 'rejected',
+          data: { taskId: 'turn-queue-idle-a1', reason: 'duplicate' },
+        });
+      });
+    } finally {
+      resetAgentWakeForTest();
+      globalTaskNotificationQueue.clear();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('TUI-EVENT-TURN-QUEUE: 완료 경계 실물: 응답 active 중 도착한 신호는 다음 턴까지 큐에 둔다 — fake clock 이 생산 defer(setTimeout 0) 재시도를 돌려 다음 턴 1개', async () => {
+    resetAgentWakeForTest();
+    globalTaskNotificationQueue.clear();
+    const { home, seatCwd } = makeSeatHome();
+    try {
+      const stage = await seatStage(home, seatCwd);
+      await withSimClock(Date.UTC(2026, 9, 27, 8, 0, 0), async (clock) => {
+        stage.mount();
+        stage.state.running = true; // 응답 active — 완료가 도착한다
+        const notice = completion('turn-queue-active-a1', 'active 중 도착 결과', clock.now());
+        globalTaskNotificationQueue.enqueue(notice);
+        expect(stage.opened()).toHaveLength(0); // 그 순간 턴 0
+        expect(globalTaskNotificationQueue.has('turn-queue-active-a1')).toBe(true); // 큐에 그대로
+        const deferredRow = stage.logs.find((row) => row.category === 'tui.agent-wake' && row.event === 'deferred');
+        expect(deferredRow?.data).toMatchObject({ taskId: 'turn-queue-active-a1', reason: 'NotIdle', trigger: 'enqueue' });
+        // 턴이 끝나 입력칸이 다시 뜬다 — 재시도는 생산 기본 defer(setTimeout 0) 로 미뤄진다.
+        stage.state.running = false;
+        stage.mount();
+        expect(stage.opened()).toHaveLength(0); // 아직 예약일 뿐
+        expect(clock.pendingTimers()).toBe(1);
+        clock.tick(0); // fake clock 이 생산 defer 를 돌린다
+        expect(stage.opened()).toHaveLength(1); // 다음 턴 정확히 1개
+        expect(stage.opened()[0]!.data).toMatchObject({ origin: 'child-complete' });
+        const wakeOpened = stage.logs.find((row) => row.category === 'tui.agent-wake' && row.event === 'opened');
+        expect(wakeOpened?.data).toMatchObject({ taskId: 'turn-queue-active-a1', trigger: 'input-mounted' });
+        const request = stage.gate.takePending();
+        expect(request?.origin).toBe('child-complete');
+        // 재시도는 한 번 — 다시 떠도 시계를 돌려도 추가 턴은 없다.
+        stage.mount();
+        clock.tick(0);
+        expect(stage.opened()).toHaveLength(1);
+      });
+    } finally {
+      resetAgentWakeForTest();
+      globalTaskNotificationQueue.clear();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('TUI-EVENT-TURN-QUEUE: 완료 경계 실물: 첫 화면 콜백 회귀 — 부팅 프리앰블 콜백은 큐를 안 먹고 깨움 턴 프리앰블이 정확히 한 번 실는다', async () => {
+    resetAgentWakeForTest();
+    globalTaskNotificationQueue.clear();
+    const { home, seatCwd } = makeSeatHome();
+    const cwd = mkdtempSync(join(tmpdir(), 'turn-queue-preamble-'));
+    try {
+      const stage = await seatStage(home, seatCwd);
+      await withSimClock(Date.UTC(2026, 9, 27, 8, 0, 0), async (clock) => {
+        stage.mount();
+        const unique = `turn-queue-first-screen-${Math.random()}`;
+        const notice = completion('turn-queue-first-screen-a1', unique, clock.now());
+        globalTaskNotificationQueue.enqueue(notice);
+        expect(stage.opened()).toHaveLength(1);
+        // 첫 화면(부팅) 콜백 — userText 없이 프리앰블 getter 가 불릴 때: 영수증은 큐에 그대로(회귀 확인).
+        const firstScreen = buildDashboardTurnPreamble({ userText: '', cwd, userConfig: fakeConfig });
+        expect(firstScreen.some((m) => String(m.content).includes('<task-notification'))).toBe(false);
+        expect(globalTaskNotificationQueue.size).toBe(1);
+        // 깨움 턴 진입 — 실제 턴 프리앰블이 영수증을 정확히 한 번 싣는다(알림 전용 status receipt).
+        const request = stage.gate.takePending();
+        expect(request?.origin).toBe('child-complete');
+        const turnPreamble = buildDashboardTurnPreamble({ userText: request!.input, cwd, userConfig: fakeConfig });
+        const carried = turnPreamble.filter((m) => m.role === 'user' && String(m.content).includes('<task-notification'));
+        expect(carried).toHaveLength(1);
+        expect(String(carried[0]!.content)).toContain('<task-notification kind="status-receipt" request="none">');
+        expect(String(carried[0]!.content)).toContain('id="turn-queue-first-screen-a1"');
+        expect(String(carried[0]!.content)).toContain(unique);
+        expect(turnPreamble.filter((m) => m.role === 'system' && String(m.content).includes('[알림 전용 턴]'))).toHaveLength(1);
+        expect(globalTaskNotificationQueue.size).toBe(0);
+        // 다음 턴은 더 싣지 않는다.
+        const nextTurn = buildDashboardTurnPreamble({ userText: '이 결과를 보고 다음 작업을 정해줘', cwd, userConfig: fakeConfig });
+        expect(nextTurn.some((m) => String(m.content).includes('<task-notification'))).toBe(false);
+      });
+    } finally {
+      resetAgentWakeForTest();
+      globalTaskNotificationQueue.clear();
+      rmSync(home, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

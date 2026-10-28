@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { debug } from '../debug/log.js';
+import { selectKnowhowPack } from './knowhow-pack.js';
 import { loadReviewRoundBrief, type ReviewRoundBrief } from './review-round-brief.js';
 import { findIncidentPrecedents, type IncidentPrecedent } from '../harness/harness-incidents.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -10,7 +11,7 @@ import {
   listRunLedgers,
   loadRunLedger,
   lookupRunLedger,
-  RunLedgerCheckedAppendRunIdMismatchError,
+  runLedgerDir,
   type RunLedgerCheckedAppendOutcome,
   type RunLedgerLookupOptions,
 } from './run-ledger.js';
@@ -325,6 +326,12 @@ export function recordShadowDoctorReevaluation(runId: string, dir?: string): {
   const packIds = Array.isArray(pack?.data?.ids) && pack.data.ids.length > 0
     && pack.data.ids.every((id: unknown) => typeof id === 'string' && id.length > 0)
     ? pack.data.ids as string[] : 'unknown';
+  // Pull the repository lesson at prescription time. A vanished worktree leaves the prior observed ids
+  // as provenance only; it must never manufacture a current remedy.
+  const sourceRepo = typeof pack?.data?.repoPath === 'string' ? pack.data.repoPath : null;
+  const sourceGoal = typeof pack?.data?.goal === 'string' ? pack.data.goal : null;
+  const pulled = sourceRepo && sourceGoal ? selectKnowhowPack(sourceRepo, sourceGoal) : null;
+  const currentIds = pulled?.ids.length ? pulled.ids : packIds;
   const rx = evidence ? 're-evaluate-member' as const : null;
   const outcome = evidence ? 'shadow-recorded' as const : 'needs-evidence' as const;
   const data: Record<string, unknown> = {
@@ -332,12 +339,14 @@ export function recordShadowDoctorReevaluation(runId: string, dir?: string): {
     visitIndex,
     visit: { runId, from: visit.data.from, symptom: 'admit-starved', timestamp: visit.timestamp, evidence: evidence || null },
     diagnosis: evidence ? 'admit-starved-reported' : 'evidence-unmeasured',
-    knowhowPackSliceIds: packIds,
+    knowhowPackSliceIds: currentIds,
+    knowhowPackDecision: { source: pulled ? 'repository' : 'unavailable', ids: pulled?.ids ?? [], reason: pulled?.reason ?? 'source-unavailable',
+      reference: pulled?.text || null },
     rx,
     cost: { estimatedTokens: 0, usedTokens: 0 },
     outcome,
     execution: 'none',
-    handoff: evidence ? 'parent-re-evaluate-member' : 'visit-owner-provide-admission-evidence',
+    handoff: evidence ? `parent-re-evaluate-member${pulled?.ids.length ? ` · 검토할 노하우 ${pulled.ids.join(',')}` : ''}` : 'visit-owner-provide-admission-evidence',
   };
   appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId, event: 'doctor-rx', data }, dir);
   debug.log('run-doctor', 'rx', { runId, visitIndex, rx, outcome, shadow: true, executed: false });
@@ -387,6 +396,18 @@ export interface DoctorComparisonRecord {
 }
 
 /**
+ * 하류 계약: 운영/시험 원장 쓰기 거부는 message 문자열이 아니라 typed identity(`reason`·`runId`·
+ * `ledgerDir`)로 도착한다. 사람이 읽는 문면은 종전과 같은 문장 그대로다.
+ */
+export class DoctorComparisonLedgerWriteRefusedError extends Error {
+  readonly reason = 'ledger-write-refused' as const;
+  constructor(readonly runId: string, readonly ledgerDir: string) {
+    super(`ledger-write-refused: 테스트 우주가 운영 원장 쓰기를 거부했습니다 (runId=${runId}) — 운영 원장에 쓰지 않았습니다`);
+    this.name = 'DoctorComparisonLedgerWriteRefusedError';
+  }
+}
+
+/**
  * RUN-DOCTOR-LIVE 0.2.36 첫 비교 슬라이스 — 그 정확한 runId 의 OP 손판정 1건(timestamp·result)을
  * 이미 기록된 shadow doctor-rx/visit 에 결속해 원장에 `doctor-compare` 한 행을 남긴다.
  * 행에는 양쪽 판단 시각(visit·shadowRx·OP), 원본 shadow rx/outcome, OP 판정 결과,
@@ -395,6 +416,11 @@ export interface DoctorComparisonRecord {
  * 명명된 실패 — invalid-op-judgment · run-ledger-missing · shadow-rx-missing · runId-mismatch ·
  * visit-missing. 어떤 경우도 shadow 결과를 지어내지 않는다. 같은 shadow rx 에 대한 재시도는
  * already-recorded 로 원장에 한 행만 남긴다(멱등).
+ * 하류 계약(typed identity) — ① 원장 쓰기 거부는 DoctorComparisonLedgerWriteRefusedError
+ * (`reason='ledger-write-refused'`·`runId`·`ledgerDir`), ② runId 불일치는 원장 바이트와 checked
+ * append 양쪽 모두 RunLedgerCheckedAppendRunIdMismatchError(`reason='runId-mismatch'`·
+ * `decisionRunId`·`lockedRunId`)로 도착한다. 문자열 파싱 없이 분류하고, 실제로 없는 원장만
+ * `run-ledger-missing` 이다.
  *
  * 배선 경계(의도적): 이 슬라이스의 호출자는 시험 경로뿐이다 — live dispatch·stall-watch retirement
  * 은 후속 cross-judgment 증거 슬라이스에서 붙는다(현행 `eln doctor status --json` = total 0
@@ -409,65 +435,57 @@ export function recordDoctorComparison(input: RecordDoctorComparisonInput): Doct
     throw new Error(`invalid-op-judgment: OP 손판정은 timestamp·result 문자열이 필요합니다 (runId=${runId})`);
   }
   const holder: { recorded?: DoctorComparisonRecord } = {};
-  let outcome: RunLedgerCheckedAppendOutcome<DoctorComparisonRecord>;
-  try {
-    // 단일 per-run lock 안에서 비교 행 존재 판정과 단일 append를 원자적으로 수행한다(#30403 동시 중복 결함).
-    // lock 안에서 appendRunLedgerEntry 를 다시 부르지 않는다(중첩 lock 시간초과).
-    outcome = appendRunLedgerEntryChecked<DoctorComparisonRecord>(runId, (entries) => {
-      if (entries === null) {
-        throw new Error(`run-ledger-missing: 런 원장이 없습니다 (runId=${runId}) — 새 원장을 만들지 않습니다`);
-      }
-      let shadowRxIndex = -1;
-      for (let index = 0; index < entries.length; index++) {
-        const entry = entries[index]!;
-        if (entry.event === 'doctor-rx' && entry.data.shadow === true) shadowRxIndex = index;
-      }
-      if (shadowRxIndex < 0) {
-        throw new Error(`shadow-rx-missing: 이 runId 의 shadow doctor-rx 가 없습니다 (runId=${runId}) — shadow 결과를 지어내지 않습니다`);
-      }
-      const shadowRx = entries[shadowRxIndex]!;
-      const rx = typeof shadowRx.data.rx === 'string' ? shadowRx.data.rx : null;
-      const shadowOutcome = typeof shadowRx.data.outcome === 'string' ? shadowRx.data.outcome : null;
-      const visitIndex = typeof shadowRx.data.visitIndex === 'number' ? shadowRx.data.visitIndex : -1;
-      const visit = visitIndex >= 0 && visitIndex < entries.length ? entries[visitIndex] : undefined;
-      if (visit === undefined || visit.event !== 'doctor-visit' || visit.runId !== runId) {
-        throw new Error(`visit-missing: shadow doctor-rx 가 가리키는 doctor-visit 행이 없습니다 (runId=${runId}, visitIndex=${visitIndex})`);
-      }
-      const existing = entries.find((entry) => entry.event === 'doctor-compare' && entry.data.shadowRxIndex === shadowRxIndex);
-      if (existing !== undefined) {
-        const stored = existing.data.opJudgment as { timestamp?: unknown; result?: unknown };
-        if (typeof stored?.timestamp !== 'string' || stored.timestamp.length === 0
-          || typeof stored?.result !== 'string' || stored.result.length === 0) {
-          throw new Error(`comparison-corrupt: 이미 기록된 doctor-compare 의 저장 판단이 손상됐습니다 (runId=${runId}, shadowRxIndex=${shadowRxIndex}, stored=${JSON.stringify(stored)}) — 거짓 already-recorded 를 승인하지 않습니다`);
-        }
-        if (stored.timestamp !== judgment.timestamp || stored.result !== judgment.result) {
-          throw new Error(`comparison-conflict: 이미 기록된 doctor-compare 와 손판정이 다릅니다 (runId=${runId}, shadowRxIndex=${shadowRxIndex}, stored=${JSON.stringify(stored)}, received=${JSON.stringify(judgment)}) — 기존 행을 유지합니다`);
-        }
-        return { append: false as const, result: { status: 'already-recorded' as const, visitIndex, shadowRxIndex, rx, outcome: shadowOutcome, opResult: judgment.result } };
-      }
-      const data: Record<string, unknown> = {
-        shadow: true,
-        visitIndex,
-        shadowRxIndex,
-        visit: { runId, from: visit.data.from, symptom: visit.data.symptom, timestamp: visit.timestamp },
-        shadowRx: { timestamp: shadowRx.timestamp, rx, outcome: shadowOutcome },
-        opJudgment: { timestamp: judgment.timestamp, result: judgment.result },
-      };
-      holder.recorded = { status: 'recorded', visitIndex, shadowRxIndex, rx, outcome: shadowOutcome, opResult: judgment.result };
-      return { append: true as const, entry: { timestamp: new Date().toISOString(), runId, event: 'doctor-compare', data } };
-    }, input.dir);
-  } catch (error) {
-    if (error instanceof RunLedgerCheckedAppendRunIdMismatchError) {
-      throw new Error(`runId-mismatch: 원장 항목의 runId 가 요청 runId 와 다릅니다 (runId=${runId}) — ${error.message}`);
+  // ⛔ typed identity 를 «문자열 하나»로 뭉개지 않는다 — checked append 가 던지는
+  // RunLedgerCheckedAppendRunIdMismatchError(원장 바이트 불일치는 같은 reason 의
+  // RunLedgerEntryRunIdMismatchError)의 reason·decisionRunId·lockedRunId 가 그대로 하류까지 간다.
+  // 그래서 이 호출을 try/catch 로 감싸 재발사하지 않는다(감싸면 identity 가 사라진다).
+  // 단일 per-run lock 안에서 비교 행 존재 판정과 단일 append를 원자적으로 수행한다(#30403 동시 중복 결함).
+  // lock 안에서 appendRunLedgerEntry 를 다시 부르지 않는다(중첩 lock 시간초과).
+  const outcome: RunLedgerCheckedAppendOutcome<DoctorComparisonRecord> = appendRunLedgerEntryChecked<DoctorComparisonRecord>(runId, (entries) => {
+    if (entries === null) {
+      throw new Error(`run-ledger-missing: 런 원장이 없습니다 (runId=${runId}) — 새 원장을 만들지 않습니다`);
     }
-    const message = error instanceof Error ? error.message : String(error);
-    if (message.includes('runId does not match')) {
-      throw new Error(`runId-mismatch: 원장 항목의 runId 가 요청 runId 와 다릅니다 (runId=${runId}) — ${message}`);
+    let shadowRxIndex = -1;
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index]!;
+      if (entry.event === 'doctor-rx' && entry.data.shadow === true) shadowRxIndex = index;
     }
-    throw error;
-  }
+    if (shadowRxIndex < 0) {
+      throw new Error(`shadow-rx-missing: 이 runId 의 shadow doctor-rx 가 없습니다 (runId=${runId}) — shadow 결과를 지어내지 않습니다`);
+    }
+    const shadowRx = entries[shadowRxIndex]!;
+    const rx = typeof shadowRx.data.rx === 'string' ? shadowRx.data.rx : null;
+    const shadowOutcome = typeof shadowRx.data.outcome === 'string' ? shadowRx.data.outcome : null;
+    const visitIndex = typeof shadowRx.data.visitIndex === 'number' ? shadowRx.data.visitIndex : -1;
+    const visit = visitIndex >= 0 && visitIndex < entries.length ? entries[visitIndex] : undefined;
+    if (visit === undefined || visit.event !== 'doctor-visit' || visit.runId !== runId) {
+      throw new Error(`visit-missing: shadow doctor-rx 가 가리키는 doctor-visit 행이 없습니다 (runId=${runId}, visitIndex=${visitIndex})`);
+    }
+    const existing = entries.find((entry) => entry.event === 'doctor-compare' && entry.data.shadowRxIndex === shadowRxIndex);
+    if (existing !== undefined) {
+      const stored = existing.data.opJudgment as { timestamp?: unknown; result?: unknown };
+      if (typeof stored?.timestamp !== 'string' || stored.timestamp.length === 0
+        || typeof stored?.result !== 'string' || stored.result.length === 0) {
+        throw new Error(`comparison-corrupt: 이미 기록된 doctor-compare 의 저장 판단이 손상됐습니다 (runId=${runId}, shadowRxIndex=${shadowRxIndex}, stored=${JSON.stringify(stored)}) — 거짓 already-recorded 를 승인하지 않습니다`);
+      }
+      if (stored.timestamp !== judgment.timestamp || stored.result !== judgment.result) {
+        throw new Error(`comparison-conflict: 이미 기록된 doctor-compare 와 손판정이 다릅니다 (runId=${runId}, shadowRxIndex=${shadowRxIndex}, stored=${JSON.stringify(stored)}, received=${JSON.stringify(judgment)}) — 기존 행을 유지합니다`);
+      }
+      return { append: false as const, result: { status: 'already-recorded' as const, visitIndex, shadowRxIndex, rx, outcome: shadowOutcome, opResult: judgment.result } };
+    }
+    const data: Record<string, unknown> = {
+      shadow: true,
+      visitIndex,
+      shadowRxIndex,
+      visit: { runId, from: visit.data.from, symptom: visit.data.symptom, timestamp: visit.timestamp },
+      shadowRx: { timestamp: shadowRx.timestamp, rx, outcome: shadowOutcome },
+      opJudgment: { timestamp: judgment.timestamp, result: judgment.result },
+    };
+    holder.recorded = { status: 'recorded', visitIndex, shadowRxIndex, rx, outcome: shadowOutcome, opResult: judgment.result };
+    return { append: true as const, entry: { timestamp: new Date().toISOString(), runId, event: 'doctor-compare', data } };
+  }, input.dir);
   if (outcome.refusal === 'ledger-write-refused') {
-    throw new Error(`ledger-write-refused: 테스트 우주가 운영 원장 쓰기를 거부했습니다 (runId=${runId}) — 운영 원장에 쓰지 않았습니다`);
+    throw new DoctorComparisonLedgerWriteRefusedError(runId, input.dir ?? runLedgerDir());
   }
   if (outcome.result !== null) {
     return outcome.result;

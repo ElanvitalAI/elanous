@@ -2,7 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applySidetabKey, createSidetabState, formatSidetabLines, sidetabRowIndexAtTerminalRow, sidetabRowsFromManifest, sidetabWidthForTerminal, type SidetabRow } from './list.js';
+import * as listCompatibility from './list.js';
+import { applySidetabKey, createSidetabState, formatSidetabLines, loadSidetabRows, sidetabRowIndexAtTerminalRow, sidetabRowsFromManifest, sidetabWidthForTerminal, type SidetabRow } from '../../sidetab-core/model.js';
 import { setPtyManifestDbPathForTesting, updatePtyManifestSession, upsertPtyManifest, type PtyManifestRow } from '../../pty-shell/pty-manifest.js';
 import { mockSeatPtySequence } from '../../ux-sim/mock-seat-pty-sequence.js';
 import { appendMessage, createSession } from '../../session/index.js';
@@ -17,6 +18,12 @@ const manifestRow = (overrides: Partial<PtyManifestRow>): PtyManifestRow => ({
 });
 
 describe('next TUI sidetab', () => {
+  test('legacy list entry point re-exports the shared model', () => {
+    expect(listCompatibility.applySidetabKey).toBe(applySidetabKey);
+    expect(listCompatibility.loadSidetabRows).toBe(loadSidetabRows);
+    expect(listCompatibility.formatSidetabLines).toBe(formatSidetabLines);
+  });
+
   test('toggle opens and closes without changing selection', () => {
     const closed = createSidetabState();
     const opened = applySidetabKey(closed, 'toggle', 2);

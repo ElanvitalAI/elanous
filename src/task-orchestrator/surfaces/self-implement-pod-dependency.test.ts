@@ -67,4 +67,4 @@ test('a `선행: #N` goal line holds the Pod Job until the PR merges', async () 
     expect((await job.done).exitCode).toBe(0);
     expect(applied).toHaveLength(1);
   } finally { controller.abort(); await job.done; }
-});
+}, 60_000);

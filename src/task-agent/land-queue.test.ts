@@ -21,7 +21,8 @@ const input = (): QueueLandingInput => {
 const noRecover = async () => ({ plan: {} as never, executed: false });
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-const review = JSON.stringify({ pr: 123, headCommit: head, verdict: 'warn', reviewed: true, mustFix: [] });
+const review = JSON.stringify({ pr: 123, headCommit: head, basedOn: 'c'.repeat(40),
+  basedOnReview: 'baseline-123-cccccccccccc.json', verdict: 'warn', reviewed: true, mustFix: [] });
 const summary = { head40: head, base40: base, remoteHost: 'node-c', verdict: 'passed', exitCode: 0,
   introduced: 0, unknown: 0, preconditionUnmet: 0 };
 

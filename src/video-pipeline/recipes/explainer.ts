@@ -1,13 +1,16 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import type { RunResult } from './ffmpeg.js';
 import { UNOBSERVED, type Recipe, type RecipeCtx, type RecipeResult } from './types.js';
+import { parseGraphTemplateYaml, type GraphParseIssue, type GraphTemplateSpec } from '../../self-implement/graph-yaml.js';
 
 type CommandRunner = (bin: string, args: readonly string[], timeoutMs: number, cwd?: string) => RunResult;
-interface ExplainerDeps { readonly run?: CommandRunner; readonly engineDir?: string }
+interface ExplainerDeps { readonly run?: CommandRunner; readonly engineDir?: string; readonly declarationPath?: string }
 
 const ENGINE = resolve(import.meta.dir, '../../../skills/explainer-video/engine');
+const LINE_DECLARATION = resolve(import.meta.dir, '../../../graphs/video/explainer-line.yaml');
 const ENGINE_MS = 600_000;
 const QC_MS = 180_000;
 
@@ -199,7 +202,19 @@ export function explainerQc(deps: ExplainerDeps = {}): Recipe {
       const peak = Number(j.input_tp);
       if (j.input_i == null || j.input_tp == null || !Number.isFinite(loudness) || !Number.isFinite(peak)) throw new Error('통합 음량/트루 피크가 비수다');
       const produced = { loudness_lufs: loudness, true_peak_db: peak };
-      const outcome = loudness >= -16 && loudness <= -12 && peak <= -1 ? 'pass' : 'loudness';
+      let outcome = loudness >= -16 && loudness <= -12 && peak <= -1 ? 'pass' : 'loudness';
+      // ⭐ «3분 영상» — qc 생산 경로에서 loadExplainerLine 으로 선언의 target_seconds(180)를 소비한다.
+      // 내레이션이 목표 총 길이를 넘으면 too-long → build(재구성). narration_seconds 를 못 쟀으면 건너뛴다(기존 동작 보존).
+      const narrationSeconds = ctx.state.narration_seconds;
+      if (outcome === 'pass' && typeof narrationSeconds === 'number' && Number.isFinite(narrationSeconds)) {
+        const plan = loadExplainerLine(deps.declarationPath);
+        if (plan.targetSeconds !== null && narrationSeconds > plan.targetSeconds) {
+          return finish(ctx, 'qc', {
+            outcome: 'too-long', produced,
+            note: `${Math.round(narrationSeconds)}초 내레이션이 선언 목표 ${plan.targetSeconds}초를 넘는다 — build 로 재구성한다`,
+          });
+        }
+      }
       return finish(ctx, 'qc', { outcome, produced, note: `${loudness} LUFS · ${peak} dBTP` });
     } catch (e) { return finish(ctx, 'qc', { outcome: UNOBSERVED, note: `loudnorm 결과를 못 읽었다: ${String(e)}` }); }
   };
@@ -211,3 +226,40 @@ export const EXPLAINER: Readonly<Record<string, Recipe>> = {
   'explainer-build': explainerBuild(),
   'explainer-qc': explainerQc(),
 };
+
+/** ⭐ «3분 영상» — explainer-line 선언이 이 라인의 영상 계획에 건 목표 총 길이(초). */
+export interface ExplainerLinePlan {
+  /** 지속 필드 `target_seconds`(초). 선언에 없으면 이 라인은 목표 총 길이를 정하지 않았다(null). */
+  readonly targetSeconds: number | null;
+  /** 생산 컴파일러(parseGraphTemplateYaml)가 낸 정규형 — 나머지 선언(노드·계약·엣지)은 이것으로 관측한다. */
+  readonly template: GraphTemplateSpec | null;
+  readonly errors: readonly GraphParseIssue[];
+}
+
+/** ⭐ 생산 로드 — 라인 저작본(graphs/video/explainer-line.yaml)을 읽어 영상 계획을 낸다.
+ *  컴파일러는 top-level 계획 상수를 정규형에 싣지 않는다 — 지속 필드 `target_seconds` 는 로드에서 직접 읽는다.
+ *  ⛔ 던지지 않는다(graph-yaml 계약) · 뿌리는 인자로 덮는다(ENGINE 과 같은 관습). */
+export function loadExplainerLine(declarationPath = LINE_DECLARATION): ExplainerLinePlan {
+  let source: string;
+  try {
+    source = readFileSync(declarationPath, 'utf8');
+  } catch (error) {
+    return {
+      targetSeconds: null,
+      template: null,
+      errors: [{ path: declarationPath, message: `선언 읽기 실패: ${error instanceof Error ? error.message : String(error)}` }],
+    };
+  }
+  const compiled = parseGraphTemplateYaml(source, 'explainer-line.yaml');
+  let targetSeconds: number | null = null;
+  try {
+    const raw: unknown = parseYaml(source);
+    const declared = raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).target_seconds
+      : undefined;
+    if (typeof declared === 'number' && Number.isFinite(declared) && declared > 0) targetSeconds = declared;
+  } catch {
+    // YAML 파싱 실패는 컴파일 결과(errors)가 이미 싣는다 — 로드는 던지지 않는다.
+  }
+  return { targetSeconds, template: compiled.template ?? null, errors: compiled.errors };
+}

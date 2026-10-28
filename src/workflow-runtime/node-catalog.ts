@@ -1,6 +1,10 @@
 // M4-5 (2026-05-12 · Phase 4 N5-5) — workflow node catalog.
 //
-// Single source of truth for the 20 workflow-runtime node kinds.
+// GRAPH-UNIFY-KINDS (0.2.40 · 2026-10-27) — this catalog is a view over the
+// node-kind vocabulary registry `src/graph-kinds/registry.ts` (WORKFLOW_CORE_
+// KINDS · 24 workflow kinds). The registry owns the vocabulary; this file owns
+// the per-kind YAML specs, and NODE_CATALOG below is derived so the catalog can
+// never drift from the registry again.
 // CLI (`elanous wf node search/spec/list`) + PWA NodeCreator + external
 // LLM (R3 NL synth · M4-1 node suggestion) all read this catalog.
 //
@@ -15,10 +19,12 @@ export type NodeCategory =
   | 'core'         // prompt · bash · skill · cft
   | 'hitl'         // approval
   | 'branch'       // if · switch
-  | 'iteration'    // iteration
+  | 'iteration'    // iteration · showroom
   | 'transform'    // classify · extract · set · filter · template
-  | 'integration'  // http · task
+  | 'integration'  // http · task · subworkflow
   | 'trigger';     // scheduleTrigger · webhookTrigger · discordTrigger · telegramTrigger · manualTrigger · chatTrigger
+
+import { WORKFLOW_CORE_KINDS } from '../graph-kinds/registry.js';
 
 export interface NodeSpec {
   /** Stable identifier (snake-case in the YAML key when relevant). */
@@ -42,7 +48,7 @@ export interface NodeSpec {
   related?: string[];
 }
 
-export const NODE_CATALOG: readonly NodeSpec[] = [
+const NODE_SPECS: readonly NodeSpec[] = [
   // ── core ────────────────────────────────────────────────────────
   {
     kind: 'prompt',
@@ -149,6 +155,26 @@ export const NODE_CATALOG: readonly NodeSpec[] = [
     body: |
       echo "item $index = $item"`,
     related: ['filter'],
+  },
+  {
+    kind: 'showroom',
+    category: 'iteration',
+    summary: 'Run a showroom · parallel lane prompts aggregated into a digest pane (strict by default)',
+    yamlKey: 'showroom',
+    required: ['lanes'],
+    optional: ['aggregator', 'mode'],
+    example: `- id: digest
+  depends_on: [fetch]
+  showroom:
+    mode: parallel
+    lanes:
+      - prompt: |
+          $ARGUMENTS 어제 이야기를 레인 요약으로 정리.
+      - prompt: |
+          오늘 일정을 레인 요약으로 정리.
+    aggregator: |
+      레인들을 아침 브리핑으로 합친다.`,
+    related: ['iteration', 'subworkflow'],
   },
 
   // ── transform ───────────────────────────────────────────────────
@@ -267,6 +293,21 @@ export const NODE_CATALOG: readonly NodeSpec[] = [
       url: $hook.output.body.data.url`,
     related: ['http'],
   },
+  {
+    kind: 'subworkflow',
+    category: 'integration',
+    summary: 'Call another workflow · child output feeds the parent node result',
+    yamlKey: 'subworkflow',
+    required: ['workflow'],
+    optional: ['inputs'],
+    example: `- id: call
+  depends_on: [build]
+  subworkflow:
+    workflow: child-graph
+    inputs:
+      value: $build.output.value`,
+    related: ['task', 'http'],
+  },
 
   // ── trigger ─────────────────────────────────────────────────────
   {
@@ -354,6 +395,14 @@ export const NODE_CATALOG: readonly NodeSpec[] = [
     related: ['webhookTrigger', 'discordTrigger'],
   },
 ] as const;
+
+/** The workflow-node catalog is a view over the registry's WORKFLOW_CORE_KINDS
+ *  vocabulary (24 kinds · showroom · subworkflow included): a spec whose kind
+ *  is not a registry workflow kind is dropped, and `src/graph-kinds/registry.test.ts`
+ *  asserts the catalog and the registry cover the same 24-kind set. */
+export const NODE_CATALOG: readonly NodeSpec[] = NODE_SPECS.filter(
+  (spec): boolean => (WORKFLOW_CORE_KINDS as readonly string[]).includes(spec.kind),
+);
 
 /** Look up a node spec by kind. Case-insensitive. */
 export function getNodeSpec(kind: string): NodeSpec | undefined {

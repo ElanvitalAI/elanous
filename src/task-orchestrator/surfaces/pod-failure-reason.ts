@@ -42,7 +42,32 @@ function ledgerString(value: unknown): string {
   return typeof value === 'string' && value.trim().length > 0 ? value : '';
 }
 
-type PreflightCheck = { reasonCode: string; checkName: string; targetPath?: string };
+export type PreflightCheck = { reasonCode: string; checkName: string; targetPath?: string };
+
+/**
+ * A Pod failure's structured ledger axes: the rejection's own reason code, check name and *untruncated* target
+ * path, kept apart from the human-readable reason text — and, separately from all of them, whether the child's
+ * terminal result line was absent at all.
+ */
+export interface PodFailureLedgerAxes {
+  readonly reasonCode?: string;
+  readonly checkName?: string;
+  readonly targetPath?: string;
+  readonly preflightChecks?: readonly PreflightCheck[];
+  /** `true` = the child wrote no terminal result line. Absence is never folded into the rejection reason. */
+  readonly noResultLine?: true;
+}
+
+/** Keep the failure's structured facts as their own ledger fields; absent facts stay omitted (never `''`). */
+export function podFailureLedgerAxes(exit: PodFailureLedgerAxes): PodFailureLedgerAxes {
+  return {
+    ...(exit.reasonCode ? { reasonCode: exit.reasonCode } : {}),
+    ...(exit.checkName ? { checkName: exit.checkName } : {}),
+    ...(exit.targetPath ? { targetPath: exit.targetPath } : {}),
+    ...(exit.preflightChecks?.length ? { preflightChecks: exit.preflightChecks } : {}),
+    ...(exit.noResultLine ? { noResultLine: true as const } : {}),
+  };
+}
 
 /** Keep each structured check paired with its own path; legacy blockers retain their name/detail diagnostic. */
 function preflightBlockerText(blockers: unknown): { error: string; preflightChecks: PreflightCheck[] } {
@@ -341,7 +366,7 @@ export interface PodTermination {
 }
 
 /** FailureTarget can precede Failed at the deadline. Read both in the same Job snapshot. */
-export const POD_TERMINATION_JOB_JSONPATH = '{.status.conditions[?(@.type=="Failed")].reason}{"|"}{.status.conditions[?(@.type=="FailureTarget")].reason}{"\\t"}{.spec.activeDeadlineSeconds}{"\\t"}{.metadata.uid}';
+export const POD_TERMINATION_JOB_JSONPATH = '{.status.conditions[?(@.type=="Failed")].reason}{"|"}{.status.conditions[?(@.type=="FailureTarget")].reason}{"\\t"}{.spec.activeDeadlineSeconds}{"\\t"}{.metadata.uid}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.status.completionTime}';
 
 export function podJobConditionReason(value: string | undefined): string {
   const [failed, target] = (value ?? '').split('|');

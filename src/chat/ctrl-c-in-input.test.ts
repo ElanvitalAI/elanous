@@ -7,7 +7,12 @@ import type { Key } from '../tui.js';
 const ctrlC: Key = { name: 'c', ctrl: true, shift: false };
 const enter: Key = { name: 'enter', ctrl: false, shift: false };
 
-async function drive(keys: Key[], initialText = '', dispatchGlobalAction?: () => void) {
+async function drive(
+  keys: Key[],
+  initialText = '',
+  dispatchGlobalAction?: () => void,
+  onQuitChord?: (key: Key) => 'consumed' | 'passthrough',
+) {
   const output: string[] = [];
   const originalWrite = process.stdout.write;
   const log = spyOn(debug, 'log').mockImplementation(() => {});
@@ -20,6 +25,7 @@ async function drive(keys: Key[], initialText = '', dispatchGlobalAction?: () =>
     const result = await textInput({
       row: 3, col: 1, width: 80, initialText,
       ...(dispatchGlobalAction ? { host: { dispatchGlobalAction } } : {}),
+      ...(onQuitChord ? { onQuitChord } : {}),
       readKey: async () => {
         const key = keys[idx++];
         if (!key) throw new Error('unexpected additional key read');
@@ -54,6 +60,19 @@ describe('resolveCtrlCInInput', () => {
 });
 
 describe('textInput Ctrl+C wiring', () => {
+  test('host consumes Ctrl+\\ before the text-input hard-exit branch', async () => {
+    const chord: Key = { name: '\\', ctrl: true, shift: false };
+    const seen: Key[] = [];
+    const { result } = await drive(
+      [chord, { name: 'escape', ctrl: false, shift: false }],
+      '',
+      undefined,
+      (key) => { seen.push(key); return 'consumed'; },
+    );
+    expect(seen).toEqual([chord]);
+    expect(result).toEqual({ text: '', submitted: false, cancelledBy: 'escape' });
+  });
+
   test('clears multiline input, resets cursor and submits only a later typed key', async () => {
     const { result, output, calls } = await drive([ctrlC, { name: 'x', ctrl: false, shift: false }, enter], 'secret\nsecond');
     expect(result).toEqual({ text: 'x', submitted: true });

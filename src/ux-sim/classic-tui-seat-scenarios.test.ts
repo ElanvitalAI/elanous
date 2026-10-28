@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { CLASSIC_TUI_SCENARIOS, runClassicTuiScenario, type ClassicTuiScenario } from './classic-tui-seat-scenarios.js';
 import { dispatchDashboardChatMainAcpSend } from '../dashboard/input/chat-main-acp-dispatch.js';
 import { DashboardAcpChat } from '../dashboard/chat/acp-chat.js';
+import { goalInterimScreenCounts } from './next-tui-seat-scenarios.js';
+import { GOAL_INTERIM_RENDER_TRACE, goalInterimRenderMessages } from './goal-interim-trace.js';
+import { logViewLines } from '../tui/chat/log-view.js';
 
 const REPO_CLI = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
 
@@ -21,7 +24,7 @@ async function run(scenario: ClassicTuiScenario) {
 describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
   test('ACP production renderer folds two goal iterations, preserving tool and final reply', async () => {
     const lines: string[] = [];
-    const interim = ['1단계 렌더했습니다.\n아직 못 했습니다.', '2단계 렌더했습니다.\n아직 못 했습니다.'];
+    const { interimReplies: interim, userInput, finalReply, toolCalls } = GOAL_INTERIM_RENDER_TRACE;
     const chat = new DashboardAcpChat({
       cwd: process.cwd(), disableStreamSmoothing: true,
       sessionStore: { get: () => null, set: () => {}, delete: () => true },
@@ -30,14 +33,14 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
         prompt: async (_sessionId, _blocks, onUpdate) => {
           const chunk = (text: string) => onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
           const tool = (label: string) => onUpdate({ sessionUpdate: 'tool_call', toolCallId: label, title: label, kind: 'other', status: 'completed' });
-          tool('ScheduleWakeup');
+          tool(toolCalls[0]);
           for (const reply of interim) {
             chunk(reply.split('\n')[0]!);
-            tool('ScheduleWakeup progress');
+            tool(toolCalls[1]);
             chunk(reply.split('\n')[1]!);
             onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' }, _meta: { goalInterim: reply } });
           }
-          chunk('완료 영상: /tmp/final.mp4');
+          chunk(finalReply);
           return { stopReason: 'end_turn' };
         },
         cancel: async () => {},
@@ -46,7 +49,7 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     const done = Promise.withResolvers<void>();
     dispatchDashboardChatMainAcpSend({
       dashboardAcpChat: chat,
-      backend: 'claude', message: 'n8n 영상 제작', attachments: [], debugEnabled: false,
+      backend: 'claude', message: userInput, attachments: [], debugEnabled: false,
       chatLines: lines, setChatScrollToTail: () => {}, redraw: () => {},
       formatAssistantLines: (text) => text.split('\n'), formatUserLine: (_display, text) => text,
       formatMutedLine: (line) => line, formatToolLine: (line) => line,
@@ -56,14 +59,19 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     });
     await done.promise;
     const screen = lines.join('\n');
-    expect(screen).toContain('· 진행 —');
-    expect(screen.match(/· 진행 —/g)).toHaveLength(2);
+    const nextScreen = logViewLines(goalInterimRenderMessages('2026-10-22T00:00:00.000Z'), 100).join('\n');
+    const classicInterimCount = screen.match(/· 진행 —/g)?.length ?? 0;
+    const nextInterimCount = goalInterimScreenCounts(nextScreen).folded;
+    expect(interim.length).toBeGreaterThan(0);
+    expect(classicInterimCount).toBe(interim.length);
+    expect(nextInterimCount).toBe(classicInterimCount);
+    expect(screen.split('\n').filter((line) => line.includes('· 진행 —')).every((line) => !line.includes('아직 못 했습니다.'))).toBe(true);
     expect(screen).not.toContain('아직 못 했습니다.');
     expect(screen).not.toContain('  1단계 렌더했습니다.');
     expect(screen).not.toContain('  2단계 렌더했습니다.');
     expect(screen.match(/ScheduleWakeup progress/g)).toHaveLength(2);
-    expect(screen).toContain('ScheduleWakeup');
-    expect(screen).toContain('완료 영상: /tmp/final.mp4');
+    expect(screen).toContain(toolCalls[0]);
+    expect(screen).toContain(finalReply);
   });
   test('scenario list is the CLI contract', () => {
     expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
@@ -146,7 +154,7 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     });
   }, 180_000);
 
-  test('classic-goal-continue: a reply that only promises opens one goal-continue turn and the identical reply stops it', async () => {
+  test('classic-goal-continue: same-reply rejection stops the loop without a timed quiet window', async () => {
     const r = await run('classic-goal-continue');
     expect(r.checks).toEqual({
       goalContinueOpenedOnce: true, classicTurnEndReachedProactiveJudge: true, classicHumanOnlyActionStops: true, classicRemainingWorkContinues: true,

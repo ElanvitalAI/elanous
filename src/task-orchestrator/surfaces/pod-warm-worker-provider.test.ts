@@ -1,7 +1,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WarmPodProvider, requestWarmPodReplay, configureWarmPodProvider, parseWarmPodProviderArgs,
@@ -289,12 +289,15 @@ test('WARM-POD-PRODUCER-UID-FU: separate providers serialize the same host worke
   const options = { candidates: [{ ...candidate, spec: prepareSpec }],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
     machineTokens: { 'node-c': '2'.repeat(64) }, kubectl, fetch, prepareLockDirectory: lockRoot };
+  const pendingPrepares: Promise<boolean>[] = [];
   try {
     const firstProvider = new WarmPodProvider(options);
     const secondProvider = new WarmPodProvider(options);
     const first = firstProvider.prepareWorker(prepareSpec.workerId);
+    pendingPrepares.push(first);
     await started;
     const second = secondProvider.prepareWorker(prepareSpec.workerId);
+    pendingPrepares.push(second);
     releaseFirst();
     expect(await Promise.all([first, second])).toEqual([true, true]);
     expect({ actions, created, registrations, controlCalls }).toEqual({
@@ -304,7 +307,11 @@ test('WARM-POD-PRODUCER-UID-FU: separate providers serialize the same host worke
     });
     expect(created).toEqual([prepareSpec.name]);
     expect(registrations).toEqual(['one-pod-uid']);
-  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+  } finally {
+    releaseFirst();
+    await Promise.allSettled(pendingPrepares);
+    rmSync(lockRoot, { recursive: true, force: true });
+  }
 }, 20_000);
 
 test('prepare lease wait is cancellable, records the reason, and kernel unlock permits retry', async () => {
@@ -355,13 +362,16 @@ test('prepare lease wait is cancellable, records the reason, and kernel unlock p
 
     },
   });
+  const pendingPrepares: Promise<boolean>[] = [];
   try {
     const firstProvider = new WarmPodProvider(providerOptions());
     const first = firstProvider.prepareWorker(prepareSpec.workerId);
+    pendingPrepares.push(first);
     await started;
     const abort = new AbortController();
     const waitingProvider = new WarmPodProvider(providerOptions(abort.signal));
     const waiting = waitingProvider.prepareWorker(prepareSpec.workerId);
+    pendingPrepares.push(waiting);
     abort.abort();
     await expect(waiting).rejects.toThrow('warm prepare lock wait cancelled');
     expect(events).toContainEqual({ event: 'prepare-lease-failed', data: {
@@ -370,10 +380,17 @@ test('prepare lease wait is cancellable, records the reason, and kernel unlock p
     releaseFirst();
     expect(await first).toBe(true);
     const retry = new WarmPodProvider(providerOptions());
-    expect(await retry.prepareWorker(prepareSpec.workerId)).toBe(true);
+    const retryPrepare = retry.prepareWorker(prepareSpec.workerId);
+    pendingPrepares.push(retryPrepare);
+    expect(await retryPrepare).toBe(true);
     expect(created).toEqual([prepareSpec.name]);
     expect(registrations).toBe(1);
-  } finally { releaseFirst(); log.mockRestore(); rmSync(lockRoot, { recursive: true, force: true }); }
+  } finally {
+    releaseFirst();
+    await Promise.allSettled(pendingPrepares);
+    log.mockRestore();
+    rmSync(lockRoot, { recursive: true, force: true });
+  }
 });
 
 test('prepare cancellation after acquiring the lease stops before Pod creation and records its reason', async () => {
@@ -406,6 +423,89 @@ test('prepare cancellation after acquiring the lease stops before Pod creation a
     } });
   } finally { releasePreflight(); log.mockRestore(); }
 });
+
+test('WARM-POD-PRODUCER-UID-FU-FU6: an injected flock-unsupported platform refuses only that slot and keeps reconciling', async () => {
+  const first = { ...candidate, spec: { ...spec, name: 'warm-node-c-standard-1',
+    workerId: 'fu6-worker-1', nodeName: 'pool-node-c-server-0' } };
+  const second = { ...candidate, spec: { ...spec, name: 'warm-node-c-standard-2',
+    workerId: 'fu6-worker-2', nodeName: 'pool-node-c-server-0' } };
+  const lockRoot = mkdtempSync(join(tmpdir(), 'warm-provider-flock-unsupported-'));
+  const events: Array<{ event: string; data: any }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm') events.push({ event, data });
+  }) as typeof debug.log);
+  const kubectlCalls: string[] = [];
+  const created: string[] = [];
+  let controlCalls = 0;
+  try {
+    const provider = new WarmPodProvider({ candidates: [first, second],
+      controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+      machineTokens: { 'node-c': '2'.repeat(64) }, prepareLockDirectory: lockRoot,
+      // The injected seam: this platform cannot take an OS prepare lease.
+      prepareFlock: false,
+      kubectl: (args, body) => {
+        kubectlCalls.push(args[4]!);
+        if (args[4] === 'create') {
+          const manifest = JSON.parse(body!);
+          const pod = { ...manifest, metadata: { ...manifest.metadata, uid: `${manifest.metadata.name}-uid` },
+            status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } };
+          created.push(manifest.metadata.name);
+          return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
+        }
+        if (args[4] === 'get' && args[5] === 'pods') return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+        if (args[4] === 'wait') return { status: 0, stdout: '{}', stderr: '' };
+        if (args[4] === 'get') return { status: 0, stdout: '{}', stderr: '' };
+        throw new Error(`unexpected ${args.join(' ')}`);
+      },
+      fetch: async () => { controlCalls++; return Response.json({ resources: [] }); },
+    });
+    expect(await provider.reconcilePool()).toMatchObject({ target: 2, ready: 0,
+      failed: ['fu6-worker-1', 'fu6-worker-2'] });
+    // Zero Pods: no slot reached kubectl or the control plane after the lease refusal.
+    expect(created).toEqual([]);
+    expect(kubectlCalls).toEqual([]);
+    expect(controlCalls).toBe(0);
+    // Only that slot is refused, with the unchanged reason text.
+    expect(events.filter(row => row.event === 'prepare-lease-failed').map(row => row.data)).toEqual([
+      { host: 'node-c', workerId: 'fu6-worker-1', reason: 'warm prepare OS locks are unavailable on this platform' },
+      { host: 'node-c', workerId: 'fu6-worker-2', reason: 'warm prepare OS locks are unavailable on this platform' },
+    ]);
+    // The next candidate is still evaluated after the first refusal.
+    expect(events.filter(row => row.event === 'pool-slot').map(row => [row.data.workerId, row.data.ready]))
+      .toEqual([['fu6-worker-1', false], ['fu6-worker-2', false]]);
+  } finally { log.mockRestore(); rmSync(lockRoot, { recursive: true, force: true }); }
+});
+
+test('WARM-POD-PRODUCER-UID-FU-FU6: production --reconcile absorbs a config-declared flock-unsupported platform per slot', () => {
+  const root = mkdtempSync(join(tmpdir(), 'warm-provider-flock-cli-'));
+  try {
+    const bin = join(root, 'bin');
+    const marker = join(root, 'kubectl-calls');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'kubectl'), '#!/bin/sh\nprintf "%s\\n" "$*" >> "$WARM_KUBECTL_MARKER"\nexit 1\n', { mode: 0o700 });
+    const file = join(root, 'provider.json');
+    const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
+    writeFileSync(file, JSON.stringify({
+      candidates: [{ host: 'node-c', tier: 'standard', spec: prepareSpec }],
+      controlUrl: 'http://127.0.0.1:31413/',
+      memberToken: '1'.repeat(64),
+      machineTokens: { 'node-c': '2'.repeat(64) },
+      prepareFlock: false,
+    }), { mode: 0o600 });
+    // The private config is loaded by the real loadWarmPodProvider call chain of --reconcile;
+    // the fake kubectl would record its first `get pods` if a slot ever reached Pod creation.
+    const run = spawnSync(process.execPath,
+      [join(import.meta.dir, 'pod-warm-worker-provider.ts'), '--reconcile'],
+      { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`,
+        WARM_KUBECTL_MARKER: marker, ELANOUS_WARM_POD_PROVIDER_CONFIG: file,
+        HOME: join(root, 'home'), ELANOUS_STATE_DIR: join(root, 'state'),
+        ELANOUS_STATE_DIR_SOURCE: 'explicit', ELANOUS_CONFIG_DIR: join(root, 'config') } });
+    expect(run.status).toBe(2);
+    expect(JSON.parse(run.stdout.trim().split('\n')[0]!)).toMatchObject({ target: 1, ready: 0,
+      failed: [prepareSpec.workerId] });
+    expect(existsSync(marker)).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}, 120_000);
 
 test('a failed kubectl wait backs off and its retry delay is cancellable', async () => {
   const prepareSpec = { ...spec, name: 'warm-node-c', nodeName: 'pool-node-c-server-0' };
@@ -870,6 +970,41 @@ test('a sanitize failure followed by the gate fallback quarantines one lease onl
   expect(paths.filter(path => path.endsWith('/quarantine'))).toHaveLength(1);
 });
 
+test('gate fallback quarantines a lease even when sanitize completes after the timeout', async () => {
+  const paths: string[] = [];
+  const sibling = { ...spec, name: 'warm-test-2', workerId: 'warm-test-2-uid' };
+  let acquisitions = 0;
+  let releaseSanitize: (() => void) | undefined;
+  let sanitizeStarted: (() => void) | undefined;
+  const sanitizePause = new Promise<void>(resolve => { releaseSanitize = resolve; });
+  const enteredSanitize = new Promise<void>(resolve => { sanitizeStarted = resolve; });
+  const provider = new WarmPodProvider({ candidates: [candidate, { ...candidate, spec: sibling }], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, kubectl: leaseKubectl([spec, sibling]),
+    fetch: async (url) => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      if (path.endsWith('/sanitize')) { sanitizeStarted!(); await sanitizePause; }
+      return path === '/v1/leases/pod-worker'
+        ? Response.json(acquisitions++ === 0 ? lease() : { ...lease(), name: sibling.workerId, attrs: { ...lease().attrs, leaseId: 'lease-2' } })
+        : Response.json({ attrs: { state: 'idle' } });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  });
+  const result = await provider.request(input());
+  const finalizing = provider.finalize(result.command!);
+  await enteredSanitize;
+  const fallback = provider.quarantine(result.command!, 'adoption-fallback');
+  const next = await provider.request(input());
+  expect(next.command?.workerId).toBe(sibling.workerId);
+  expect(paths.filter(path => path === '/v1/leases/pod-worker')).toHaveLength(2);
+  releaseSanitize!();
+  const settled = await Promise.allSettled([finalizing, fallback]);
+  expect(settled[0]).toMatchObject({ status: 'rejected' });
+  expect(settled[1]).toMatchObject({ status: 'fulfilled' });
+  expect(paths.filter(path => path.endsWith('/sanitize'))).toHaveLength(1);
+  expect(paths.filter(path => path.endsWith('/quarantine'))).toHaveLength(1);
+});
+
 test('concurrent quarantine callers share one fenced lease transition', async () => {
   const paths: string[] = [];
   let releaseQuarantine: (() => void) | undefined;
@@ -908,6 +1043,28 @@ test('a failed quarantine transition can retry the same lease', async () => {
   await expect(provider.quarantine(result.command!, 'first-failure')).rejects.toThrow('warm quarantine unavailable');
   await provider.quarantine(result.command!, 'retry');
   expect(quarantineCalls).toBe(2);
+});
+
+test('an uncertain quarantine refuses the same Pod before a second transport', async () => {
+  let acquisitions = 0;
+  let transportRuns = 0;
+  const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/v1/leases/pod-worker') return Response.json({ ...lease(), attrs: {
+        ...lease().attrs, leaseId: `lease-${++acquisitions}`, generation: acquisitions,
+      } });
+      if (path.endsWith('/quarantine') && acquisitions === 1) return new Response('{}', { status: 503 });
+      return Response.json({ attrs: { state: 'quarantined' } });
+    },
+    transport: () => ({ request: async () => { transportRuns++; return { status: 'observed', reason: 'complete', reply: null }; } }),
+  });
+  const first = await provider.request(input());
+  await expect(provider.quarantine(first.command!, 'first-failure')).rejects.toThrow('warm quarantine unavailable');
+  const second = await provider.request(input());
+  expect(second.command).toBeNull();
+  expect(transportRuns).toBe(1);
 });
 
 test('a replaced Pod refuses the acquired lease before transport and quarantines it', async () => {

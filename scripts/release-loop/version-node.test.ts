@@ -505,6 +505,58 @@ test('dev-bump rejects a source other than the released version', () => {
   expect(calls).not.toContain('pr land');
 });
 
+test('branch-cut dev-bump accepts main still on the released -dev line when release output names its branch', () => {
+  const { run } = fixture('0.2.38-dev.0');
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.38' },
+    outputs: { 'version-release': { outcome: 'ok', commit: 'cut-sha', branch: 'release/0.2.38' } } });
+  try {
+    const result = run('dev-bump', '--json');
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ outcome: 'ok', kind: 'dev-bump', version: '0.2.39-dev.0', commit: 'merged-sha' });
+    expect(result.calls).toContain('bun bin/elanous.mjs pr land --commit-message version: 0.2.39-dev.0');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('dev-bump does not infer branch-cut mode from a missing or unrelated release branch', () => {
+  for (const output of [
+    { commit: 'cut-sha' },
+    { outcome: 'ok', commit: 'cut-sha', branch: 'release/0.2.37' },
+    { outcome: 'error', commit: 'cut-sha', branch: 'release/0.2.38' },
+  ]) {
+    const { run } = fixture('0.2.38-dev.0');
+    const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.38' },
+      outputs: { 'version-release': output } });
+    try {
+      const result = run('dev-bump', '--json');
+      expect(result.status).toBe(1);
+      expect(result.output.error).toContain('origin/main version 0.2.38-dev.0 is not 0.2.38');
+      expect(result.calls).not.toContain('pr land');
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+      else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+    }
+  }
+});
+
+test('dev-bump preserves explicit branchCut input when main is still on the released -dev line', () => {
+  const { run } = fixture('0.2.38-dev.0');
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.38', branchCut: true } });
+  try {
+    const result = run('dev-bump', '--json');
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ outcome: 'ok', kind: 'dev-bump', version: '0.2.39-dev.0', commit: 'merged-sha' });
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
 test('dev-bump computes next patch from graph context, lands, then becomes idempotent', () => {
   const { root, run } = fixture('0.2.4');
   const previous = process.env.ELANOUS_GRAPH_CONTEXT;

@@ -134,6 +134,7 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
       onToolResult: (call: unknown) => void;
       onUsage: (usage: unknown) => void;
       onThought?: (text: string) => void;
+      onStatus?: (line: string) => void;
       /** ACP `_meta` — 자동 회복 ② 가 «다음 공급자로» 표지를 싣는다. */
       meta?: Record<string, unknown>;
     }): Promise<unknown>;
@@ -174,7 +175,7 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
   autoheal?: DashboardTurnAutoheal;
   /** 실패 지문이 맞은 오류: 화면엔 한국어 처방 한 줄, 원문은 여기(`/detail`)로. 없으면 원문을 그대로 낸다. */
   pushFailureNotice?: (notice: string, raw: string) => void;
-  finalizeTurn: (status: 'completed' | 'interrupted' | 'failed', error?: string) => void;
+  finalizeTurn: (status: 'completed' | 'interrupted' | 'failed', error?: string) => void | Promise<void>;
 }
 
 /** Select a safe, actionable message for a failed dashboard chat turn. */
@@ -618,6 +619,10 @@ ${summary}` }] : []),
         deps.runTurnUsageRuntime(usage);
       },
       onThought: (text) => { turnStreamRuntime.onThought?.(text); },
+      onStatus: (line) => {
+        deps.pushChatLine(`  · ${line}`);
+        deps.draw();
+      },
       autoTts: deps.autoTts,
       voiceChat: deps.voiceChat,
       drainCooldownMs: userConfig.voice.tts.drainCooldownMs,
@@ -725,7 +730,7 @@ ${summary}` }] : []),
     try {
       cleanupEsc();
     } finally {
-      deps.finalizeTurn(finalStatus, finalError);
+      await deps.finalizeTurn(finalStatus, finalError);
     }
   }
 }

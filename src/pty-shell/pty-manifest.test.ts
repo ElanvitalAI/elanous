@@ -22,7 +22,7 @@ const {
   purgeClosedPtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, reapOrphanedOwnedPtyManifest,
   reapStalePtyManifest, touchLivePtyManifest, PTY_MANIFEST_STALE_MS, migratePtyManifestSchema,
   listPtyManifestByRun, listPtyManifestAt, listPtyManifestRowsAt, reapDeadPtyManifest, reapDeadPtyManifestAt, markPtyControlled, classifyTerminalOrigin,
-  listLongLivedLivePtyManifest,
+  listLongLivedLivePtyManifest, updatePtyManifestProgress, updatePtyManifestAbortRequested, PTY_MANIFEST_PROGRESS_THROTTLE_MS,
 } = await import('./pty-manifest.js');
 const { readPtyEventsAfter, recordSurfaceStateTransition, latestSurfaceState, resetPtyEventLogForTesting } = await import('./pty-event-log.js');
 const { ensureRunIdentity } = await import('../harness/harness-space.js');
@@ -501,6 +501,50 @@ describe('pty-manifest store (크로스-프로세스 관측)', () => {
     touchLivePtyManifest(new Set(['hb_live', 'hb_closed']), t + 5000);
     expect(getPtyManifest('hb_live')!.updatedAt).toBe(t + 5000);
     expect(getPtyManifest('hb_closed')!.updatedAt).toBe(t);
+  });
+
+  test('SURVIVAL-PROGRESS-CLOCK: 같은 행에 5초 안 두 번 진전 기록 → 두 번째 쓰기는 생략된다', () => {
+    const t0 = 70_000_000;
+    upsertPtyManifest({ id: 'progress-clock', kind: 'tui', cmd: 'elanous', startedAt: 0, now: t0 });
+    expect(getPtyManifest('progress-clock')?.progressAt).toBeUndefined();
+    expect(updatePtyManifestProgress('progress-clock', t0 + 1_000)).toBe(true);
+    expect(getPtyManifest('progress-clock')?.progressAt).toBe(t0 + 1_000);
+    // 5초 안의 재기록 — progress_at 은 첫 기록 값으로 남고 두 번째 쓰기는 생략(스로틀 생략은 실패가 아니다).
+    expect(updatePtyManifestProgress('progress-clock', t0 + 2_000)).toBe(true);
+    expect(getPtyManifest('progress-clock')?.progressAt).toBe(t0 + 1_000);
+    // 5초가 지나면 다음 기록이 닿는다.
+    expect(updatePtyManifestProgress('progress-clock', t0 + 1_000 + PTY_MANIFEST_PROGRESS_THROTTLE_MS)).toBe(true);
+    expect(getPtyManifest('progress-clock')?.progressAt).toBe(t0 + 1_000 + PTY_MANIFEST_PROGRESS_THROTTLE_MS);
+    expect(PTY_MANIFEST_PROGRESS_THROTTLE_MS).toBe(5_000);
+    // Esc 청구 시각은 스로틀 없이 매번 남는다.
+    expect(updatePtyManifestAbortRequested('progress-clock', t0 + 3_000)).toBe(true);
+    expect(getPtyManifest('progress-clock')?.abortRequestedAt).toBe(t0 + 3_000);
+    expect(updatePtyManifestAbortRequested('progress-clock', t0 + 3_500)).toBe(true);
+    expect(getPtyManifest('progress-clock')?.abortRequestedAt).toBe(t0 + 3_500);
+    // 행 재등록(upsert)은 진전·Esc 청구 칸을 비운다.
+    upsertPtyManifest({ id: 'progress-clock', kind: 'tui', cmd: 'elanous', startedAt: 0, now: t0 + 4_000 });
+    expect(getPtyManifest('progress-clock')?.progressAt).toBeUndefined();
+    expect(getPtyManifest('progress-clock')?.abortRequestedAt).toBeUndefined();
+  });
+
+  test('SURVIVAL-PROGRESS-CLOCK: 새 busy 턴은 progress_at 을 turn_at 으로 리셋(턴 시작 = 진전 0초)', () => {
+    const t0 = 71_000_000;
+    upsertPtyManifest({ id: 'progress-reset', kind: 'tui', cmd: 'elanous', startedAt: 0, now: t0 });
+    // 이전 턴의 마지막 진전 — 정체 임계(12분)보다 오래 묵은 값.
+    expect(updatePtyManifestProgress('progress-reset', t0 - 20 * 60_000)).toBe(true);
+    expect(getPtyManifest('progress-reset')?.progressAt).toBe(t0 - 20 * 60_000);
+    // 새 busy 턴 — progress_at 이 turn_at 과 같아져야 오판정(stalled)이 안 생긴다.
+    expect(updatePtyManifestTurn('progress-reset', 'busy', t0)).toBe(true);
+    expect(getPtyManifest('progress-reset')?.turnState).toBe('busy');
+    expect(getPtyManifest('progress-reset')?.turnAt).toBe(t0);
+    expect(getPtyManifest('progress-reset')?.progressAt).toBe(t0);
+    // busy 리셋 뒤 5초 안 진전 기록은 스로틀 생략(실패 아님) — progress_at 은 리셋값 유지.
+    expect(updatePtyManifestProgress('progress-reset', t0 + 1_000)).toBe(true);
+    expect(getPtyManifest('progress-reset')?.progressAt).toBe(t0);
+    // idle 턴 종료는 progress_at 을 건드리지 않는다.
+    expect(updatePtyManifestTurn('progress-reset', 'idle', t0 + 2_000)).toBe(true);
+    expect(getPtyManifest('progress-reset')?.turnState).toBe('idle');
+    expect(getPtyManifest('progress-reset')?.progressAt).toBe(t0);
   });
 });
 

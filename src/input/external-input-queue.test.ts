@@ -12,7 +12,7 @@ import {
 } from './external-input-queue.js';
 import type { InputSourceRef } from './input-source-kind.js';
 
-function fakeHost(init: { turn?: boolean; composer?: string | undefined } = {}) {
+function fakeHost(init: { turn?: boolean; composer?: string | undefined; handleInlineChoice?: (text: string) => boolean } = {}) {
   const state = { turn: init.turn ?? false, composer: 'composer' in init ? init.composer : '' as string | undefined, keys: 0 };
   const submitted: Array<{ text: string; source: InputSourceRef }> = [];
   const events: number[] = [];
@@ -21,6 +21,7 @@ function fakeHost(init: { turn?: boolean; composer?: string | undefined } = {}) 
     composerText: () => state.composer,
     hasPendingKeys: () => state.keys > 0,
     submit: (text, source) => { submitted.push({ text, source }); return true; },
+    ...(init.handleInlineChoice ? { handleInlineChoice: init.handleInlineChoice } : {}),
     onQueueChange: (pending) => { events.push(pending.length); },
   };
   return { state, host, submitted, events };
@@ -75,6 +76,18 @@ describe('decideExternalInputRoute', () => {
 });
 
 describe('createExternalInputQueue', () => {
+  test('submitted PTY text answers an active inline choice instead of waiting behind the turn', () => {
+    const { q } = manualQueue();
+    const answers: string[] = [];
+    const host = fakeHost({ turn: true, composer: 'active turn', handleInlineChoice: (text) => { answers.push(text); return true; } });
+    q.register(host.host);
+
+    expect(q.route('2\r')).toBe('submitted');
+    expect(answers).toEqual(['2']);
+    expect(q.pending()).toHaveLength(0);
+    expect(host.submitted).toHaveLength(0);
+  });
+
   test('호스트가 없으면 종전대로 키 주입(passthrough)', () => {
     const { q } = manualQueue();
     expect(q.route('hello\r')).toBe('passthrough');

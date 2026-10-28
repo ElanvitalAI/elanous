@@ -28,7 +28,7 @@ import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
 import { executeClassifyNode } from '../workflow-runtime/nodes/classify.js';
 import { interpolate } from '../workflow-runtime/variables.js';
 import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
-import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride, type GatePodPoolOverride } from '../../scripts/release-loop/resume.js';
+import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride, type GatePodPoolOverride, type GateShardRerouteOverride } from '../../scripts/release-loop/resume.js';
 
 type BashRun = WorkflowDeps['runBash'];
 const DEFAULT_BASH_TIMEOUT_MS = 5 * 60 * 1_000;
@@ -148,7 +148,8 @@ export interface GraphRunState {
   reason?: string;
   path: string[];
   /** startedAt/endedAt (ISO) and seconds are written when the node runs; ledgers before GRAPH-NODE-TIMES (0.2.19) have none. */
-  nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; reason?: string; decidedBy?: string; decidedAt?: string;
+  nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; reason?: string;
+    failure?: { errorCode: string; message: string; stage: string }; decidedBy?: string; decidedAt?: string;
     startedAt?: string; endedAt?: string; seconds?: number;
     waiver?: { reason: string; at: string; /** RELEASE-WAIVE-UNMEASURED — why the waived gate had no verdict. */ unmeasured?: string; original: { exit: number | null; output?: unknown; error?: string } } }>;
   /** The node now running and when it started; cleared when its record is written. */
@@ -170,7 +171,7 @@ export interface GraphRunState {
   growthPark?: { from: string; outcome: string; reason: string; decisionId: string; decisionRef: string; growth: GraphGrowth; command?: GrowthCommand; approval?: string };
   resume?: { from: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current' };
   /** GATE-HOST-EXECUTOR — every explicit input change a resume made (what was set and what it replaced), oldest first. */
-  inputOverrides?: Array<GateExecutorOverride | GatePodPoolOverride>;
+  inputOverrides?: Array<GateExecutorOverride | GatePodPoolOverride | GateShardRerouteOverride>;
   executed: number;
   dryRun: boolean;
   statePath: string;
@@ -241,6 +242,8 @@ export interface GraphRunOptions {
   releaseGateExecutor?: { executor: string; host?: string };
   /** Release-only (RESUME-GATE-POOL-OVERRIDE): replace the saved gate pool for this resumed gate. */
   releaseGatePodPool?: string;
+  /** Release-only: remeasure a shard after the same-commit resume preflight. */
+  releaseGateShardReroute?: { shard: string; host?: string; os?: 'darwin' | 'linux' };
   useCurrentGraph?: boolean;
   /** Internal unit invocation context, propagated only by runGraph. */
   unitContext?: { parentRunId: string; ancestors: readonly string[]; remainingSteps: number; entryNodeId?: string };
@@ -652,6 +655,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.releaseAcceptedRegressions && (!options.resumeRunId || !options.fromNodeId || options.releaseWaiver)) throw new Error('accepted regressions require a release resume boundary');
   if (options.releaseGateExecutor && (!options.resumeRunId || !options.fromNodeId)) throw new Error('gate executor override requires a release resume boundary');
   if (options.releaseGatePodPool !== undefined && (!options.resumeRunId || !options.fromNodeId)) throw new Error('gate pod pool override requires a release resume boundary');
+  if (options.releaseGateShardReroute && (!options.resumeRunId || options.fromNodeId !== 'gate')) throw new Error('shard reroute requires release resume --from gate');
   const root = options.deps?.root ?? effectiveInstanceRoot();
   const matchingRuns = options.resumeRunId && !options.resumeGraphId
     ? listGraphRuns(root).runs.filter((run) => run.runId === options.resumeRunId && run.graphPath === resolve(path)) : [];
@@ -718,6 +722,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     return existsSync(graphsDir) && graphFile.startsWith(`${realpathSync(graphsDir)}${sep}`);
   });
   const credentials = owner ? pluginEnv(owner.name, pluginRoot) : {};
+  const redactCredentials = (text: string) => Object.values(credentials).filter(value => value.length > 0)
+    .reduce((safe, value) => safe.replaceAll(value, '[REDACTED]'), text);
   const declaredEnv = [...new Set(installed.map(item => item.name))]
     .flatMap(name => credentialStatus(name, pluginRoot).fields.map(field => field.env));
   const credentialFields = owner ? credentialStatus(owner.name, pluginRoot).fields.filter(field => field.set).map(field => field.name) : [];
@@ -921,6 +927,13 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       state.inputOverrides = [...(state.inputOverrides ?? []), override];
       debug.log('graph.runs', 'input-override', { graphId, runId, ...override });
     }
+    if (options.releaseGateShardReroute) {
+      if (graphId !== 'release-loop') throw new Error('shard reroute requires the release-loop graph');
+      const override = releaseResumeGateShardReroute(state, { from: options.fromNodeId, ...options.releaseGateShardReroute });
+      state.input = { ...(state.input as Record<string, unknown>), ...override.set };
+      state.inputOverrides = [...(state.inputOverrides ?? []), override];
+      debug.log('graph.runs', 'input-override', { graphId, runId, ...override });
+    }
     if (state.unitCalls) {
       const calls = state.unitCalls;
       state.unitCalls = calls.filter(call => {
@@ -1102,8 +1115,6 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       mkdirSync(dirname(contextPath), { recursive: true });
       writeFileSync(contextPath, JSON.stringify({ graphId, runId, startedAt: state.startedAt, nodeId: current, input: state.input ?? null, outputs }, null, 2) + '\n');
       let code: number | null = null;
-      const redactCredentials = (text: string) => Object.values(credentials).filter(value => value.length > 0)
-        .reduce((safe, value) => safe.replaceAll(value, '[REDACTED]'), text);
       const runBash: BashRun = async (body, opts) => {
         const commandRoot = verifyReleaseSource();
         // Hash the actual /bin/bash argv after interpolation. Keep the command text (which may contain
@@ -1243,7 +1254,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         log('graph.unit', { ...info, phase: 'exit', exit: childExit, steps });
       } catch (cause) {
         ok = false;
-        error = cause instanceof Error ? cause.message : String(cause);
+        error = redactCredentials(cause instanceof Error ? cause.message : String(cause));
         if (entered) {
           debug.log('graph.unit', 'exit', { ...info, error });
           log('graph.unit', { ...info, phase: 'exit', error });
@@ -1326,7 +1337,16 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', graphId, runId, nodeId: current,
           ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
-      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...((waiving || harnessLoopRoute || units.has(current) || ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}), ...(commandFailureReason ? { reason: commandFailureReason } : {}),
+      const failureMessage = !ok
+        ? redactCredentials(commandFailureReason ?? error ?? `Node ${current} failed without a diagnostic.`)
+        : undefined;
+      const failure = failureMessage === undefined ? undefined : {
+        errorCode: error?.startsWith('unit input missing:') ? 'GRAPH_UNIT_INPUT_MISSING' : 'GRAPH_NODE_FAILED',
+        message: failureMessage,
+        stage: units.has(current) ? 'unit-invocation' : command ? 'command-execution' : prompt ? 'prompt-execution' : 'node-execution',
+      };
+      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...((waiving || harnessLoopRoute || units.has(current) || ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+        ...(failure ? { reason: failure.message, failure } : {}), ...(commandFailureReason && !failure ? { reason: commandFailureReason } : {}),
         ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, ...(options.releaseWaiver!.unmeasured === undefined ? {} : { unmeasured: options.releaseWaiver!.unmeasured }), original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
         startedAt: nodeStartedAt, endedAt: nodeEndedAt, seconds });
@@ -1342,12 +1362,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const reported: unknown = waiving || harnessLoopRoute || units.has(current) || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome: string | undefined = typeof reported === 'string' ? reported : undefined;
     if (!options.quiet) console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
+    const nodeFailure = state.nodes.at(-1)?.nodeId === current ? state.nodes.at(-1)?.failure : undefined;
+    const nodeReason = state.nodes.at(-1)?.nodeId === current ? state.nodes.at(-1)?.reason : undefined;
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit,
-      ...(commandFailureReason ? { reason: commandFailureReason } : {}) });
+      ...(nodeReason ? { reason: nodeReason } : {}), ...(nodeFailure ? { failure: nodeFailure } : {}) });
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds });
     publishInsideEvent({ kind: 'verdict', graphId, runId, nodeId: current, verdict: ok ? 'ok' : 'fail', ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }) });
     log('node-end', { graphId, runId, nodeId: current, ok, exit,
-      ...(commandFailureReason ? { reason: commandFailureReason } : {}),
+      ...(nodeReason ? { reason: nodeReason } : {}), ...(nodeFailure ? { failure: nodeFailure } : {}),
       ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }), dryRun: state.dryRun });
     if (!resumingCompleted) {
       // Recipe commands expose stdout/exit but no provider usage; never infer zero from success.

@@ -79,12 +79,12 @@ function attempt(dir: string, commit: string, pods: TimedPod[]): GateWallAttempt
 const SHARDS_WINDOW_SLACK_MS = 5 * 60_000;
 /**
  * shards.json is a snapshot of the latest attempt, not an archive of every commit, and has no attempt identity.
- * A row is attributed to the attempt only when its root id is one of the attempt's roots AND
+ * A row is attributed to the attempt only when its id is one of the attempt's pod records AND
  * a row starts inside the attempt's pod-record window (from 5 min before its first start to its last end) — a
  * previous attempt's snapshot reusing `pod-0` started earlier and is rejected. The end is free: a longer
  * snapshot is exactly the disagreement this report keeps.
  */
-function shardsSpan(dir: string, rootNames: Set<string>, window: { start: number; end: number }): number | 'outside-attempt-window' | null {
+function shardsSpan(dir: string, podNames: Set<string>, window: { start: number; end: number }): number | 'outside-attempt-window' | null {
   try {
     const file: unknown = JSON.parse(readFileSync(join(dir, 'shards.json'), 'utf8'));
     if (!file || typeof file !== 'object' || !('shards' in file) || !Array.isArray(file.shards)) return null;
@@ -94,7 +94,7 @@ function shardsSpan(dir: string, rootNames: Set<string>, window: { start: number
     const ends: number[] = [];
     for (const row of rows) {
       if (!row || typeof row !== 'object' || !('id' in row) || typeof row.id !== 'string'
-        || !rootNames.has(`${row.id}.json`)) return null;
+        || !podNames.has(`${row.id}.json`)) return null;
       const start = 'startedAt' in row && typeof row.startedAt === 'string' ? Date.parse(row.startedAt) : NaN;
       const end = 'endedAt' in row && typeof row.endedAt === 'string' ? Date.parse(row.endedAt) : NaN;
       if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
@@ -134,10 +134,10 @@ export function gateWall(dir: string, opts: { commit?: string; targetMin?: numbe
   const chosen = matching.find(([, pods]) => pods.some((p) => p.root));
   const attempts = ordered.map(([commit, pods]) => attempt(dir, commit, pods));
   const selected = chosen && attempts.find((a) => a.commit === chosen[0]);
-  // The snapshot has no commit field. Only the latest recorded attempt can own it; require its root row IDs too.
+  // The snapshot has no commit field. Only the latest recorded attempt can own it; require every row's pod record.
   const latest = chosen !== undefined && ordered[0]?.[0] === chosen[0];
   const span = chosen && latest
-    ? shardsSpan(dir, new Set(chosen[1].filter((p) => p.root).map((p) => p.name)),
+    ? shardsSpan(dir, new Set(chosen[1].map((p) => p.name)),
       { start: Math.min(...chosen[1].map((p) => p.start)), end: Math.max(...chosen[1].map((p) => p.end)) }) : null;
   const snapshot = typeof span === 'number' ? span : null;
   const shardsWallMin = snapshot;

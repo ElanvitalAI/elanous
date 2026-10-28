@@ -1,9 +1,10 @@
 import { expect, test } from 'bun:test';
 import { filterSlashCommands, SLASH_COMMANDS } from './index.js';
 
-test('persona is discoverable in the TUI slash picker with removal suggestion', () => {
+test('persona stays directly registered with removal suggestion but is hidden from the compact picker', () => {
+  const persona = SLASH_COMMANDS.find((command) => command.name === 'persona');
+  expect(persona?.hidden).toBe(true);
+  expect(persona?.subcommands).toContain('-');
   const matches = filterSlashCommands('persona', SLASH_COMMANDS);
-  expect(matches[0]?.name).toBe('persona');
-  expect(matches[0]?.description).toContain('이 대화의 페르소나 보기·고르기·빼기');
-  expect(matches[0]?.subcommands).toContain('-');
+  expect(matches.map(({ name }) => name)).not.toContain('persona');
 });

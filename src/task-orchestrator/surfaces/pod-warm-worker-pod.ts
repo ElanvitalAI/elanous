@@ -389,6 +389,7 @@ export class WarmPodTransport {
       || command.workerId !== this.spec.workerId || command.cutSha !== this.spec.cutSha
       || !equalKey(command.key, this.spec.key)
       || ![command.runId, command.attemptId, command.leaseId, command.workerId].every(value => TOKEN.test(value))
+      || typeof command.podUid !== 'string' || !command.podUid
       || !Number.isSafeInteger(command.generation) || command.generation < 1) return fallback('key-drift');
     const prefix = ['--context', this.spec.kubectlContext, '-n', this.spec.namespace];
     const observed = this.kubectl([...prefix, 'get', 'pod', this.spec.name, '-o', 'json']);
@@ -425,7 +426,7 @@ export class WarmPodTransport {
     try { nodeArch = node.status === 0 ? JSON.parse(node.stdout)?.metadata?.labels?.['kubernetes.io/arch'] : null; }
     catch { nodeArch = null; }
     if (nodeArch !== this.spec.key.architecture) return fallback('pod-unready');
-    if ((command.podUid && uid !== command.podUid) || (this.podUid && uid !== this.podUid)) {
+    if (uid !== command.podUid || (this.podUid !== null && uid !== this.podUid)) {
       this.quarantined = true; return fallback('pod-replaced');
     }
     this.podUid = uid;

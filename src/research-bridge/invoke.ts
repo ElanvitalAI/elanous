@@ -75,6 +75,7 @@ export type ResearchInvoker = (
   skillName: string,
   args: string,
   onProgress?: (delta: string) => void,
+  signal?: AbortSignal,
 ) => Promise<ResearchInvocationOutcome>;
 
 let invoker: ResearchInvoker | null = null;
@@ -101,6 +102,7 @@ async function defaultInvoker(
   skillName: string,
   args: string,
   onProgress?: (delta: string) => void,
+  signal?: AbortSignal,
 ): Promise<ResearchInvocationOutcome> {
   const { parseSkillMd, executeSkill } = await import('../skills/runner.js');
   const manifest = parseSkillMd(skillName);
@@ -115,7 +117,7 @@ async function defaultInvoker(
     // ★ research 격리 — 파일-쓰기 도구 deny 주입(main 트리 오염 차단). Bash·검색도구는 유지.
     const result = await executeSkill(withResearchIsolation(manifest), args, (delta) => {
       if (onProgress) onProgress(delta);
-    });
+    }, { signal });
     return researchOutcomeFromSkillRun(result);
   } catch (err) {
     return {
@@ -136,7 +138,7 @@ export async function invokeResearch(
 ): Promise<ExternalResearchResult> {
   const skillName = opts.skill || DEFAULT_SKILL;
   const startedAt = new Date();
-  const outcome = await (invoker ?? defaultInvoker)(skillName, topic, opts.onProgress);
+  const outcome = await (invoker ?? defaultInvoker)(skillName, topic, opts.onProgress, opts.signal);
   const finishedAt = new Date();
   const result: ExternalResearchResult = {
     topic,

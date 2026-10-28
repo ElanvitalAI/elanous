@@ -556,6 +556,52 @@ exit 0
     expect(cap.code()).toBe(0);
   });
 
+  test('POD-CPU-REQUEST-RIGHTSIZE-2-FU: --cpu-rightsize 가 재측정 요청을 발사 옵션으로 넘기고, 잘못된 요청은 발사 전에 거부한다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-cli-rightsize-'));
+    const file = join(dir, 'request.json');
+    writeFileSync(file, JSON.stringify({ host: 'node-b', samples: [
+      { label: 'gate16', requestMillis: 1000, usageMillis: 2200, waitMs: 4000 },
+      { label: 'harness40', requestMillis: 1000, usageMillis: 1900, waitMs: 6000 },
+    ] }));
+    const seen: RunPodCommandOptions[] = [];
+    const launchRun = async (argv: string[]) => {
+      const cap = capture();
+      const program = new Command();
+      program.exitOverride();
+      const prev = process.argv;
+      process.argv = ['bun', 'elanous', ...argv];
+      try {
+        registerPodCommands(program, { io: cap.io, run: async (options) => {
+          seen.push(options);
+          return { exitCode: 0, artifactsDir: '/artifacts/job', job: 'job' };
+        } });
+        await program.parseAsync(argv, { from: 'user' });
+      } finally { process.argv = prev; }
+      return cap;
+    };
+    try {
+      const fromFile = await launchRun(['pod', 'run', '--cpu-rightsize', file, '--', 'echo', 'hi']);
+      expect(fromFile.code()).toBe(0);
+      expect(seen.at(-1)?.cpuRightsize).toEqual({ host: 'node-b', samples: [
+        { label: 'gate16', requestMillis: 1000, usageMillis: 2200, waitMs: 4000, eviction: null },
+        { label: 'harness40', requestMillis: 1000, usageMillis: 1900, waitMs: 6000, eviction: null },
+      ] });
+      // 인라인 JSON 도 같은 파서를 지난다(표본 없음 = yellow 경로).
+      const inline = await launchRun(['pod', 'run', '--cpu-rightsize', '{"samples":[]}', '--', 'echo', 'hi']);
+      expect(inline.code()).toBe(0);
+      expect(seen.at(-1)?.cpuRightsize).toEqual({ samples: [] });
+      // 옵션이 없는 종전 발사는 재측정 요청을 싣지 않는다(보존 계약).
+      await launchRun(['pod', 'run', '--', 'echo', 'hi']);
+      expect(seen.at(-1)).not.toHaveProperty('cpuRightsize');
+      // 잘못된 요청은 발사 «전에» rc 2 로 멈춘다.
+      const before = seen.length;
+      const bad = await launchRun(['pod', 'run', '--cpu-rightsize', '{"samples":[{"label":"gate16"}]}', '--', 'echo', 'hi']);
+      expect(bad.code()).toBe(2);
+      expect(bad.errors.at(-1)).toBe('pod run: --cpu-rightsize — --cpu-rightsize.samples[0].requestMillis is required');
+      expect(seen.length).toBe(before);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('로그 조회 실패면 알린 경로와 함께 «산출 회수 못 함: <사유>» 를 출력한다', async () => {
     const cap = capture();
     const program = new Command();

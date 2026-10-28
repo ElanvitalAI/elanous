@@ -7,6 +7,7 @@
  * 🔑 ***내가 가진 환경이 「통과」한 것을 「검증」으로 읽지 않는다.***
  */
 import { describe, expect, test, spyOn } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -61,10 +62,10 @@ describe('reframe — Affinity 가 없어도 «끝까지» 간다', () => {
   }, T);
 
   test('⛔ 러너가 «없어도» 멈추지 않는다 (앱이 없는 고객 기계의 모습)', () => {
-    // This case checks the missing-runner fallback, not whether /tmp is an
-    // Affinity-safe output location. Keep its fixture independent of HOME so
-    // an env -i temporary HOME cannot trip the separate /tmp safety guard.
-    const d = mkdtempSync(join(import.meta.dir, '.rf-'));
+    // Bun's userInfo() follows injected HOME under the isolated gate; Node reads
+    // the account database. Neither the checkout nor test HOME need be outside /tmp.
+    const accountHome = execFileSync('node', ['-p', "require('node:os').userInfo().homedir"], { encoding: 'utf8' }).trim();
+    const d = mkdtempSync(join(accountHome, '.rf-'));
     const src = mkSrc(d, 800, 600);
     const out = join(d, 'out.png');
     resetAffinityReachCache();

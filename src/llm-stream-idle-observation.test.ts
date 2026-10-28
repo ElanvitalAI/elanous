@@ -53,6 +53,7 @@ async function observeTurn(
     if (options.idle && typeof handler === 'function') queueMicrotask(() => { if (armedDelays.length <= 2) handler(); });
     return realSetTimeout(handler, timeout);
   }) as typeof setTimeout;
+  let error: unknown;
   try {
     await streamLLMWithTools(
       [{ role: 'user', content: 'observe idle timeout' }],
@@ -64,11 +65,14 @@ async function observeTurn(
         maxTurns: 1,
       },
     );
+  } catch (caught) {
+    if (!options.idle) throw caught;
+    error = caught;
   } finally {
     logSpy.mockRestore();
     (globalThis as { setTimeout: typeof setTimeout }).setTimeout = realSetTimeout;
   }
-  return { observed, armedDelays };
+  return { observed, armedDelays, error };
 }
 
 afterEach(() => {
@@ -122,9 +126,10 @@ describe('llm.stream consume-start idle watchdog observation', () => {
   });
 
   it('preserves the idle-timeout warning payload and level', async () => {
-    const { observed } = await observeTurn('gpt-4o-mini', [], { idle: true });
+    const { observed, error } = await observeTurn('gpt-4o-mini', [], { idle: true });
     const idleTimeout = observed.find(({ event }) => event === 'idle-timeout')!;
 
+    expect(error).toMatchObject({ name: 'StreamIdleTimeoutError', code: 'ETIMEDOUT', idleMs: 45_000 });
     expect(idleTimeout).toMatchObject({
       level: 'warn',
       data: {

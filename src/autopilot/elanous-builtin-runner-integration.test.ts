@@ -13,7 +13,8 @@
 //   - cancel(): in-flight abort propagate
 //   - multi-iter: 2회 호출 시 history 누적
 //
-// mock.module 은 test file boot 시 1회 호출 — runtime swap. dynamic
+// mock.module 은 test file boot 시 1회 호출 — runtime swap. Barrel의 다른
+// runtime export를 보존해야 같은 suite의 runGoalLoop import가 깨지지 않는다. dynamic
 // behavior (per-test 다른 onText/onToolCall 의 시퀀스) 는 mock state
 // (`__mockRunCoreTurn`) 통해 inject.
 
@@ -25,6 +26,7 @@ import type {
 } from '../core-turn/types.js';
 import type { LLMMessage } from '../llm.js';
 import type { ContentBlock, SessionUpdate, StopReason } from '@agentclientprotocol/sdk';
+import * as goalLoop from '../core-turn/run-goal-loop.js';
 
 // ── Mock state ──────────────────────────────────────────────────
 //
@@ -69,6 +71,7 @@ function resetMockState(): void {
 // 후 mockState.stopReason / finalText 반환. signal.aborted 이미 set 시
 // pre-flight abort. 각 event 사이 microtask yield — cancel() race 가능.
 mock.module('../core-turn/index.js', () => ({
+  ...goalLoop,
   runCoreTurn: async (ctx: CoreTurnContext): Promise<CoreTurnResult> => {
     mockState.callCount += 1;
     mockState.lastCtx = ctx;
@@ -115,6 +118,7 @@ mock.module('../core-turn/index.js', () => ({
 }));
 
 // Imported AFTER mock.module — picks up the stub.
+const coreTurn = await import('../core-turn/index.js');
 const { ElanousBuiltinTurnRunner } = await import('./elanous-builtin-runner.js');
 
 function noopDispatch() {
@@ -123,6 +127,10 @@ function noopDispatch() {
 
 describe('ElanousBuiltinTurnRunner — integration (mocked runCoreTurn)', () => {
   beforeEach(() => resetMockState());
+
+  test('mock preserves the core-turn barrel exports used by other test files', async () => {
+    expect(typeof coreTurn.runGoalLoop).toBe('function');
+  });
 
   test('end_turn stopReason: ACP end_turn 으로 매핑 + 빈 onUpdate', async () => {
     const runner = new ElanousBuiltinTurnRunner({

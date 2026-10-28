@@ -1,8 +1,30 @@
+import { readFileSync } from 'node:fs';
 import { lastJsonObject, STOPPED_NODE_ERROR, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { publicWaiverReason } from './known-issues-node.js';
 import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 
 export interface AcceptedRegression { id: string; note: string }
+
+/** Match the graph runner's approval boundary before release resume performs tip refresh or writes an attempt. */
+export function assertReleaseResumeApprovalBoundary(state: GraphRunState, from: string): void {
+  if (!Array.isArray(state.path)) return;
+  const start = state.path.indexOf(from);
+  if (start < 0 || state.path.lastIndexOf(from) !== start) {
+    return;
+  }
+  for (let index = 0; index < state.nodes.length; index++) {
+    const record = state.nodes[index]!;
+    if (typeof record.decidedAt !== 'string') continue;
+    if (index >= start) throw new Error('cannot restart across an approval decision — start a new release run with the full gate');
+    if (!record.ok) throw new Error('cannot preserve a failed predecessor when resuming');
+    let decision: { nodeId?: unknown; decision?: unknown; decidedAt?: unknown };
+    try { decision = JSON.parse(readFileSync(`${state.statePath}.${index + 1}.decision.json`, 'utf8')); }
+    catch { throw new Error(`missing approval decision for ${record.nodeId}`); }
+    if (decision.nodeId !== record.nodeId || decision.decision !== 'approved' || decision.decidedAt !== record.decidedAt) {
+      throw new Error(`invalid approval decision for ${record.nodeId}`);
+    }
+  }
+}
 
 /** Merge explicit public issues with the saved release input without changing the ledger shape. */
 export function releaseResumeAcceptedRegressions(state: GraphRunState, additions: AcceptedRegression[], from?: string): AcceptedRegression[] {
@@ -152,6 +174,32 @@ export interface GatePodPoolOverride {
   from: string;
   set: { gatePodPool: string };
   previous: { gatePodPool: unknown };
+}
+
+/** One shard keeps its component identity while the run-time scheduler chooses a compatible member. */
+export interface GateShardRerouteOverride {
+  kind: 'gate-shard-reroute'; at: string; from: string;
+  set: { gateRerouteShard: string; gateShardHost?: string; gateShardCapabilities?: Record<string, { os: 'darwin' | 'linux' }> };
+  previous: { gateRerouteShard: unknown; gateShardHost: unknown; gateShardCapabilities: unknown };
+}
+
+export function releaseResumeGateShardReroute(state: GraphRunState, opts: {
+  from: string; shard: unknown; host?: unknown; os?: unknown; at?: string;
+}): GateShardRerouteOverride {
+  const input = state.input as Record<string, unknown> | undefined;
+  if (!input || typeof input.gatePodPool !== 'string' || !input.gatePodPool.trim())
+    throw new Error('shard reroute requires the saved Pod gate pool');
+  if (opts.from !== 'gate' || !state.path.includes('gate')) throw new Error('shard reroute requires --from gate');
+  if (typeof opts.shard !== 'string' || !/^(?:auto|pod-\d+)$/.test(opts.shard))
+    throw new Error('--reroute-shard requires auto or pod-N');
+  if (opts.host !== undefined && (typeof opts.host !== 'string' || !opts.host.trim())) throw new Error('--shard-host requires a pool context');
+  if (opts.os !== undefined && (opts.shard === 'auto' || opts.os !== 'darwin' && opts.os !== 'linux'))
+    throw new Error('--shard-os requires pod-N and darwin or linux');
+  return { kind: 'gate-shard-reroute', at: opts.at ?? new Date().toISOString(), from: opts.from,
+    set: { gateRerouteShard: opts.shard, ...(opts.host ? { gateShardHost: opts.host.trim() } : {}),
+      ...(opts.os ? { gateShardCapabilities: { [opts.shard]: { os: opts.os } } } : {}) },
+    previous: { gateRerouteShard: input.gateRerouteShard ?? null, gateShardHost: input.gateShardHost ?? null,
+      gateShardCapabilities: input.gateShardCapabilities ?? null } };
 }
 
 export function releaseResumeGatePodPool(state: GraphRunState, opts: { from: string; pool: unknown; at?: string }): GatePodPoolOverride {

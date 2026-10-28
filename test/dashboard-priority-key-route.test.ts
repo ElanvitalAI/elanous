@@ -235,4 +235,16 @@ describe('routeDashboardPriorityKey', () => {
     expect(result).toEqual({ type: 'quit' });
     expect(calls).toEqual(['force-quit-check']);
   });
+
+  test('classic guidance is prioritized ahead of force-quit', async () => {
+    const { calls, deps } = createDeps({
+      routeClassicSigquitChord: (routeKey) => { calls.push(`classic-guidance:${routeKey.name}`); return true; },
+      isForceQuitChord: () => { calls.push('force-quit-check'); return true; },
+    });
+
+    const result = await routeDashboardPriorityKey(key('backslash', { ctrl: true }), deps);
+
+    expect(result).toEqual({ type: 'handled' });
+    expect(calls).toEqual(['classic-guidance:backslash']);
+  });
 });

@@ -5,11 +5,11 @@
 // order) and routes the query. Callers that want a specific
 // provider pass `providerId` to force the choice.
 
-import { buildGrokWebSearchProvider } from './grok.js';
+import { buildGrokSubscriptionWebSearchProvider, buildGrokWebSearchProvider } from './grok.js';
 import { buildFirecrawlWebSearchProvider } from './firecrawl.js';
 import { buildTavilyWebSearchProvider } from './tavily.js';
 import { buildFreeWebSearchProvider } from './free.js';
-import { isTavilySearchEnabled } from '../user-config.js';
+import { isPaidWebSearchEnabled, isTavilySearchEnabled } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { wantsXSearch } from './x-intent.js';
 import {
@@ -35,8 +35,9 @@ function registerBuiltins(): void {
   //   ⇒ 켜면 종전과 «똑같이» 1순위로 복귀한다: `elanous config set webSearch.tavily.enabled true`.
   //   ⚠️ 등록 시점이라 config 변경은 **다음 기동부터** 먹는다(이미 뜬 프로세스엔 안 먹는다).
   if (isTavilySearchEnabled()) providers.push(buildTavilyWebSearchProvider());
-  providers.push(buildGrokWebSearchProvider());
-  providers.push(buildFirecrawlWebSearchProvider());
+  providers.push(buildGrokSubscriptionWebSearchProvider());
+  if (isPaidWebSearchEnabled('grokApi')) providers.push(buildGrokWebSearchProvider({ id: 'grok-api' }));
+  if (isPaidWebSearchEnabled('firecrawl')) providers.push(buildFirecrawlWebSearchProvider());
   providers.push(buildFreeWebSearchProvider());
 }
 registerBuiltins();
@@ -70,10 +71,10 @@ export async function searchWeb(
 ): Promise<WebSearchResult> {
   const xIntent = !opts.providerId && wantsXSearch(q.query);
   const candidates = opts.providerId
-    ? providers.filter(p => p.id === opts.providerId)
+    ? providers.filter(p => p.id === opts.providerId || (opts.providerId === 'grok' && p.id === 'grok-api'))
     : providers.filter(p => p.available());
   if (xIntent) {
-    const grokIndex = candidates.findIndex(p => p.id === 'grok');
+    const grokIndex = candidates.findIndex(p => p.id === 'grok' || p.id === 'grok-api');
     if (grokIndex > 0) candidates.unshift(...candidates.splice(grokIndex, 1));
   }
   if (candidates.length === 0) {
@@ -91,7 +92,7 @@ export async function searchWeb(
     try {
       const result = await provider.search(q, opts.signal);
       if (!xIntent) return result;
-      if (provider.id === 'grok') {
+      if (provider.id === 'grok' || provider.id === 'grok-api') {
         const isXUrl = (raw: string): boolean => {
           try {
             const url = new URL(raw);

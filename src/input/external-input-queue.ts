@@ -43,6 +43,8 @@ export interface ExternalInputHost {
   submit(text: string, source: InputSourceRef): boolean;
   /** 지금 턴을 ESC 와 같은 경로로 멈춘다. 멈출 턴(escGate)이 없으면 false. 없으면 외부 stop 은 «턴 없음»으로 처리. */
   requestStop?(): boolean;
+  /** Consume submitted external text as the answer to a live non-modal TUI question. */
+  handleInlineChoice?(text: string): boolean;
   /** 외부 stop 의 결과 표지(채팅 로그 한 줄). */
   onExternalStop?(result: 'stopped' | 'no-turn' | 'failed'): void;
   /** 대기열의 현재 상태가 바뀌었다 — 화면 표지를 다시 그린다. */
@@ -213,6 +215,14 @@ export function createExternalInputQueue(deps: ExternalInputQueueDeps = {}) {
       if (host && line) {
         try { turnActive = host.isTurnActive(); composer = host.composerText(); pendingKeys = host.hasPendingKeys(); }
         catch { return 'passthrough'; }
+      }
+      if (line?.submit && host?.handleInlineChoice) {
+        let consumed = false;
+        try { consumed = host.handleInlineChoice(line.text); } catch { consumed = false; }
+        if (consumed) {
+          log('route', { length: chars.length, submit: true, turnActive, route: 'inline-choice', pending: pending.length });
+          return 'submitted';
+        }
       }
       const { decision, reason } = decideExternalInputRoute({
         line, hostRegistered: host !== null, pendingCount: pending.length, turnActive, composerText: composer, pendingKeys,

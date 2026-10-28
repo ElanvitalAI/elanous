@@ -30,11 +30,13 @@ export interface GateTestFailure {
   attributedBy?: 'name-across-files' | 'copied-across-files';
   precondition?: GateFailurePrecondition;
   /** 귀속 불일치 등으로 `unknown` 판정을 내린 이유. 판정 enum 은 바꾸지 않는다. */
-  unknownReason?: '귀속 불일치';
+  unknownReason?: '귀속 불일치' | 'interference';
   /** 같은 gate 실행 안에서 같은 시험의 통과 기록이 있으면 `may-vary`로 보존한다. 타임아웃은 재실행 결과 변동성도 함께 표현한다. */
   timeoutVariability?: TimeoutVariability;
   /** 시간 초과한 정확한 시험이 base 로그에서는 통과해 자식 회귀로 귀속됐는지 나타낸다. */
   timeoutRegression?: 'passed-at-base';
+  /** Unrelated file passed alone on both the candidate and base; this remains a blocking unknown. */
+  interference?: true;
 }
 
 export interface GateBaselineSummary {
@@ -74,6 +76,15 @@ export interface GateBaselineReport extends GateBaselineSummary {
   log: string;
   timeoutRechecks?: TimeoutRecheckRecord[];
   loadTimeout?: number;
+  interferenceRechecks?: InterferenceRecheckRecord[];
+}
+
+export interface InterferenceRecheckRecord {
+  name: string;
+  file: string;
+  head: TimeoutRerunObservation | 'unknown';
+  base: TimeoutRerunObservation | 'unknown';
+  classification: 'interference' | 'unchanged';
 }
 
 export interface TimeoutRecheckRecord {
@@ -355,7 +366,7 @@ function stripAnsi(text: string): string {
   return text.replace(/\u001B\[[0-9;]*[A-Za-z]/g, '');
 }
 
-export function extractGateTestFailures(log: string): Array<Omit<GateTestFailure, 'attribution' | 'baselinePresence'>> {
+export function extractGateTestFailures(log: string, currentFileExists?: (file: string) => boolean): Array<Omit<GateTestFailure, 'attribution' | 'baselinePresence'>> {
   const failures: Array<Omit<GateTestFailure, 'attribution' | 'baselinePresence'>> = [];
   const lines = stripAnsi(log).split('\n');
   let currentFile: string | undefined;
@@ -405,6 +416,13 @@ export function extractGateTestFailures(log: string): Array<Omit<GateTestFailure
     const rawName = normalizeFailureName(match[1]!);
     const inlineFile = rawName.match(TEST_FILE_RE)?.[1];
     const file = inlineFile ?? currentFile;
+    // A failing test may print a nested Bun run from a temporary repository in its diagnostic.
+    // Its reporter-shaped lines are not tests in this checkout. The outer failure remains;
+    // if none remains, the caller reports an unparsed failure instead of accepting the gate.
+    if (file && currentFileExists && !currentFileExists(file)) {
+      lastBoundary = i;
+      continue;
+    }
     const testName = inlineFile
       ? rawName.replace(new RegExp(`^${inlineFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*>?\\s*`), '')
       : rawName;
@@ -540,6 +558,7 @@ export function classifyGateTestFailures(
   missingAtBase: readonly string[] = [],
   rerunObservations?: GateRerunObservations,
   baselinePassedEvidence?: GatePassedTestEvidence,
+  currentFileExists?: (file: string) => boolean,
 ): GateTestFailure[] {
   const missing = new Set(missingAtBase);
   const observationsFor = (name: string): readonly TimeoutRerunObservation[] => {
@@ -547,7 +566,7 @@ export function classifyGateTestFailures(
     if (rerunObservations instanceof Map) return rerunObservations.get(name) ?? [];
     return (rerunObservations as Readonly<Record<string, readonly TimeoutRerunObservation[]>>)[name] ?? [];
   };
-  const worktreeFailures = extractGateTestFailures(worktreeLog);
+  const worktreeFailures = extractGateTestFailures(worktreeLog, currentFileExists);
   const baselineFailures = baselineLog === undefined ? [] : extractGateTestFailures(baselineLog);
   const testPath = ({ file, name }: GateTestIdentitySource): string | undefined =>
     file && name.startsWith(`${file} > `) ? name.slice(file.length + 3) : undefined;
@@ -734,6 +753,52 @@ export function classifyBunSingleTestRerun(result: ProcessResult): TimeoutRerunO
 export function rerunBunSingleTest(cwd: string, file: string, testName: string, timeout: number): TimeoutRerunObservation | undefined {
   const result = runIsolatedBunTest(cwd, ['--test-name-pattern', buildBunSingleTestPattern(testName), file], timeout);
   return classifyBunSingleTestRerun(result);
+}
+
+/** An unrelated failing test is interference only when the same host passes it alone on both trees.
+ *  Interference is a blocking unknown, never an exemption or a green gate. */
+export function recheckOutsideScopeFailures(
+  cwd: string,
+  report: GateBaselineReport,
+  baseRef: string,
+  relatedTestFiles: readonly string[],
+  runOne: (dir: string, file: string, name: string) => TimeoutRerunObservation | undefined =
+    (dir, file, name) => rerunBunSingleTest(dir, file, name, 60_000),
+  runBase: (dir: string, ref: string, cases: readonly { file: string; name: string }[], run: typeof runOne) =>
+    ReadonlyMap<string, TimeoutRerunObservation | undefined> | undefined = defaultInterferenceBaseRecheck,
+): GateBaselineReport {
+  const related = new Set(relatedTestFiles);
+  const candidates = report.failures.filter((failure) => failure.attribution === 'introduced'
+    && failure.file && !related.has(failure.file) && failure.baselinePresence === 'present')
+    .map((failure) => {
+      const file = failure.file!;
+      const prefix = `${file} > `;
+      return { failure, file, name: failure.name.startsWith(prefix) ? failure.name.slice(prefix.length) : failure.name };
+    });
+  if (!candidates.length) return report;
+  const head = candidates.map(({ file, name }) => runOne(cwd, file, name) ?? 'unknown');
+  const base = runBase(cwd, baseRef, candidates.map(({ file, name }) => ({ file, name })), runOne);
+  const records: InterferenceRecheckRecord[] = candidates.map(({ failure, file }, index) => {
+    const baseObservation = base?.get(`${file}\u0000${candidates[index]!.name}`) ?? 'unknown';
+    const classification = head[index] === 'pass' && baseObservation === 'pass' ? 'interference' : 'unchanged';
+    return { name: failure.name, file, head: head[index]!, base: baseObservation, classification };
+  });
+  const interference = new Set(records.filter((record) => record.classification === 'interference')
+    .map((record) => `${record.file}\u0000${record.name}`));
+  const failures = report.failures.map((failure) => failure.attribution === 'introduced'
+    && interference.has(`${failure.file}\u0000${failure.name}`)
+    ? { ...failure, attribution: 'unknown' as const, unknownReason: 'interference' as const, interference: true as const }
+    : failure);
+  return { ...report, ...summarizeGateBaseline(failures), failures, interferenceRechecks: records };
+}
+
+function defaultInterferenceBaseRecheck(
+  cwd: string, baseRef: string, cases: readonly { file: string; name: string }[],
+  runOne: (dir: string, file: string, name: string) => TimeoutRerunObservation | undefined,
+): ReadonlyMap<string, TimeoutRerunObservation | undefined> | undefined {
+  const result = withBaselineWorktree(cwd, baseRef, (baseDir) => new Map(cases.map(({ file, name }) =>
+    [`${file}\u0000${name}`, runOne(baseDir, file, name)] as const)));
+  return result instanceof Map ? result : undefined;
 }
 
 /** A standalone timeout-only retry is allowed only when every introduced failure is explicitly a Bun timeout. */
@@ -1547,6 +1612,7 @@ export function buildGateBaselineReport(
   baseline: BaselineProcessResult,
   rerunObservations?: GateRerunObservations,
   rerunNotRun = 0,
+  currentFileExists?: (file: string) => boolean,
 ): GateBaselineReport {
   let failures = classifyGateTestFailures(
     worktreeLog,
@@ -1554,6 +1620,7 @@ export function buildGateBaselineReport(
     baseline.missingAtBase ?? [],
     rerunObservations,
     baseline.passedTestEvidence,
+    currentFileExists,
   );
   const worktreeFailuresParsed = failures.length > 0;
   if (!worktreeFailuresParsed) {
@@ -1629,11 +1696,15 @@ export function formatGateBaselineNote(report: GateBaselineReport, unrunImporter
   const timeoutRecheckLines = report.timeoutRechecks?.length
     ? `\n[gate.baseline.timeout-recheck] ${report.timeoutRechecks.map((item) => `${item.name}: ${item.result} elapsed=${item.elapsedMs}ms · original=${flattenControlChars(item.originalDiagnostic).slice(-500)} · ${item.rawResultLine}`).join('\n')}`
     : '';
+  const interferenceLines = report.interferenceRechecks?.length
+    ? `\n[gate.interference] ${report.interferenceRechecks.map((item) => `${item.classification}: ${item.name} head=${item.head} base=${item.base}`).join('\n')}`
+    : '';
   return `${head}\n${lines.join('\n')}\n${report.log}`
     + timedOutLine
     + mayVaryNonTimeoutLine
     + rerunLine
     + timeoutRecheckLines
+    + interferenceLines
     + (report.preexisting > 0 ? '\n⚠️ preexisting 실패는 base에서도 재현됨 — 이 PR의 책임이 아니다.' : '');
 }
 
@@ -1649,5 +1720,5 @@ export function formatVerifyByBreakingScopeSkipNote(reason: string, changedFiles
 export function allowsBaselineOnlyFailure(report: GateBaselineReport): boolean {
   if (report.baselineStatus === 'unknown') return false;
   if (!report.worktreeFailuresParsed) return false;
-  return report.introduced === 0 && report.preconditionUnmet === 0 && report.timedOut === 0 && report.flakyRerun === 0;
+  return report.introduced === 0 && report.unknown === 0 && report.preconditionUnmet === 0 && report.timedOut === 0 && report.flakyRerun === 0;
 }

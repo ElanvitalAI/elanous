@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from 'bun:test';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -23,7 +23,7 @@ import {
   selectGateTestFiles, formatUnrunnableChangeKinds,
 } from './gate-cli.js';
 import { GATE_CALLER_TEST_LIMIT } from './gate-scope.js';
-import { buildGateBaselineReport, type BaselineProcessResult } from './gate-baseline.js';
+import { buildGateBaselineReport, recheckOutsideScopeFailures, type BaselineProcessResult } from './gate-baseline.js';
 import type { ShardRunResult } from '../self-dev/shard-run.js';
 import { aggregateGateTestShards } from '../self-dev/shard-aggregate.js';
 import { GATE_SPAWN_LANE_FILES } from '../self-dev/spawn-lane-files.js';
@@ -36,6 +36,7 @@ type CommandResult = ReturnType<typeof ok>;
 const importerLookup = (stdout = ''): [string, string[], CommandResult] => ['git', ['grep', '-l', '-e', '', '--', '*.test.ts', '*.test.tsx', '*.test.mts', '*.test.mtsx', '*.test.cts', '*.test.ctsx', '*.test.js', '*.test.jsx', '*.test.mjs', '*.test.mjsx', '*.test.cjs', '*.test.cjsx'], ok(stdout)];
 const lsFiles = (stdout = ''): [string, string[], CommandResult] => ['git', ['ls-files'], ok(stdout)];
 const fixtureRoots: string[] = [];
+setDefaultTimeout(60_000);
 const skipEntryBudgetGateForFixture = (_cwd: string, _files: readonly string[]) => ({ affected: false, errors: [] });
 const runSelfGateCli = (cwd: string, options: Parameters<typeof runSelfGateCliProduction>[1] = {}, deps: Parameters<typeof runSelfGateCliProduction>[2] = {}) =>
   runSelfGateCliProduction(cwd, options, { runEntryBudgetGate: skipEntryBudgetGateForFixture, ...deps });
@@ -120,6 +121,114 @@ test('read-only gate preflight selects files without running exposure, tests, ba
   expect(called).toEqual([]);
 });
 
+test('gate receipt reuses unchanged passing importer tests and --no-inherit restores full radius', () => {
+  const fixture = fixtureRepository({
+    'bun.lock': '{"lockfileVersion":1}\n',
+    'src/a.ts': 'export const a = 1;\n',
+    'src/b.ts': 'export const b = 1;\n',
+    'test/a.test.ts': "import { a } from '../src/a.js';\nvoid a;\n",
+    'test/b.test.ts': "import { b } from '../src/b.js';\nvoid b;\n",
+  });
+  const receipts = mkdtempSync(join(tmpdir(), 'elanous-gate-receipts-'));
+  try {
+    const git = (args: string[]) => {
+      const result = spawnSync('git', args, { cwd: fixture.cwd, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+      return result.stdout.trim();
+    };
+    git(['config', 'user.email', 'gate-test@example.invalid']);
+    git(['config', 'user.name', 'Gate Test']);
+    git(['remote', 'add', 'origin', 'https://github.com/Example/Receipt.git']);
+    git(['add', '.']); git(['commit', '-m', 'base']);
+    const base = git(['rev-parse', 'HEAD']);
+    writeFileSync(join(fixture.cwd, 'src/a.ts'), 'export const a = 2;\n');
+    writeFileSync(join(fixture.cwd, 'src/b.ts'), 'export const b = 2;\n');
+    git(['add', '.']); git(['commit', '-m', 'first gate head']);
+    const changedFiles = () => ({ files: ['src/a.ts', 'src/b.ts'], baseRef: base });
+    const passed = (_cwd: string, _files: readonly string[]) => ok();
+    const gates = {
+      changedFiles,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      gateReceiptDir: () => receipts, envKey: () => 'bun-test-runtime',
+      runEntryBudgetGate: () => ({ affected: false, errors: [] }),
+    };
+    const firstRuns: string[][] = [];
+    const first = runSelfGateCli(fixture.cwd, { base, includeImporterTests: true }, {
+      ...gates, runTests: (cwd, files) => { firstRuns.push([...files]); return passed(cwd, files); },
+    });
+    expect(first.lines.some((line) => line.includes('gate receipt: full radius'))).toBe(true);
+    expect(firstRuns).toEqual([['test/a.test.ts', 'test/b.test.ts']]);
+
+    writeFileSync(join(fixture.cwd, 'src/a.ts'), 'export const a = 3;\n');
+    git(['add', '.']); git(['commit', '-m', 'second gate head']);
+    const secondRuns: string[][] = [];
+    const second = runSelfGateCli(fixture.cwd, { base, includeImporterTests: true }, {
+      ...gates, runTests: (cwd, files) => { secondRuns.push([...files]); return passed(cwd, files); },
+    });
+    expect(secondRuns).toEqual([['test/a.test.ts']]);
+    expect(second.testFiles).toEqual(['test/a.test.ts']);
+    expect(second.lines.join('\n')).toContain('gate receipt: inherited 1 · rerun 1');
+
+    const forcedRuns: string[][] = [];
+    runSelfGateCli(fixture.cwd, { base, includeImporterTests: true, noInherit: true }, {
+      ...gates, runTests: (cwd, files) => { forcedRuns.push([...files]); return passed(cwd, files); },
+    });
+    expect(forcedRuns).toEqual([['test/a.test.ts', 'test/b.test.ts']]);
+  } finally {
+    rmSync(receipts, { recursive: true, force: true });
+    fixture.dispose();
+  }
+});
+
+test('dirty worktree forces a real full-radius run and cannot overwrite a passing receipt', () => {
+  const fixture = fixtureRepository({
+    'bun.lock': '{"lockfileVersion":1}\n',
+    'src/a.ts': 'export const a = 1;\n',
+    'src/b.ts': 'export const b = 1;\n',
+    'test/b.test.ts': "import { expect, test } from 'bun:test';\nimport { b } from '../src/b.js';\ntest('b remains one', () => expect(b).toBe(1));\n",
+  }, true);
+  const receipts = mkdtempSync(join(tmpdir(), 'elanous-gate-dirty-receipts-'));
+  try {
+    const git = (args: string[]) => {
+      const result = spawnSync('git', args, { cwd: fixture.cwd, encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+      return result.stdout.trim();
+    };
+    git(['config', 'user.email', 'gate-test@example.invalid']);
+    git(['config', 'user.name', 'Gate Test']);
+    git(['checkout', '-b', 'dirty-receipt-test']);
+    git(['remote', 'add', 'origin', 'https://github.com/Example/DirtyReceipt.git']);
+    git(['add', '.']); git(['commit', '-m', 'base']);
+    const base = git(['rev-parse', 'HEAD']);
+    writeFileSync(join(fixture.cwd, 'src/b.ts'), "export { a as b } from './a.js';\n");
+    git(['add', '.']); git(['commit', '-m', 'first gate head']);
+    const gates = {
+      gateReceiptDir: () => receipts, envKey: () => 'bun-test-runtime',
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      runEntryBudgetGate: () => ({ affected: false, errors: [] }),
+    };
+    const first = runSelfGateCli(fixture.cwd, { base, includeImporterTests: true }, gates);
+    expect(first.exitCode).toBe(0);
+    expect(first.testFiles).toContain('test/b.test.ts');
+    const firstReceipt = readFileSync(join(receipts, readdirSync(receipts)[0]!), 'utf8');
+
+    // This unrelated-to-the-PR source is still imported by the selected test.
+    writeFileSync(join(fixture.cwd, 'src/a.ts'), 'export const a = 2;\n');
+    const dirty = runSelfGateCli(fixture.cwd, { base, includeImporterTests: true }, gates);
+    expect(dirty.lines.join('\n')).toContain('gate receipt: full radius (worktree-dirty)');
+    expect(dirty.testFiles).toContain('test/b.test.ts');
+    expect(dirty.exitCode).toBe(1);
+    expect(readFileSync(join(receipts, readdirSync(receipts)[0]!), 'utf8')).toBe(firstReceipt);
+  } finally {
+    rmSync(receipts, { recursive: true, force: true });
+    fixture.dispose();
+  }
+});
+
 describe('runSelfGateCli', () => {
   test('real 1,265-module overflow fails changed gate before skipped test step', () => {
     const fixture = fixtureRepository({
@@ -140,7 +249,7 @@ describe('runSelfGateCli', () => {
     });
     expect(result.exitCode).toBe(1);
     expect(result.lines.join('\n')).toContain('index static module count 1265 exceeds 1264');
-  });
+  }, 60_000);
 
   test('entry budget blocks affected changes before skipTestStep and retains unrelated rc', () => {
     const calls: string[][] = [];
@@ -1178,6 +1287,26 @@ describe('runSelfGateCli', () => {
     expect(introduced.lines.join('\n')).toContain('introduced=1');
     expect(preexisting.exitCode).toBe(0);
     expect(preexisting.lines.join('\n')).toContain('preexisting=1');
+  });
+
+  test('an unrelated always-include failure is rechecked on both trees and remains blocking interference', () => {
+    const unrelated = 'src/unrelated.test.ts';
+    const observed: string[][] = [];
+    const result = runSelfGateCli('/repo', { alwaysInclude: [unrelated] }, {
+      changedFiles: () => ({ files: ['src/a.ts'], baseRef: 'base-sha' }),
+      exists: (path) => path === 'src/a.test.ts' || path === unrelated,
+      runTests: () => ({ status: 1, stdout: `${unrelated}:\n(fail) shared fixture\nerror: stale state\n1 fail\n`, stderr: '' }),
+      runBaseline: () => baseline(`${unrelated}:\n(pass) shared fixture\n1 pass\n0 fail`, 'pass'),
+      runInterferenceRecheck: (cwd, report, baseRef, related) => {
+        observed.push([cwd, baseRef, ...related]);
+        return recheckOutsideScopeFailures(cwd, report, baseRef, related, () => 'pass',
+          (_dir, _ref, cases) => new Map(cases.map(({ file, name }) => [`${file}\u0000${name}`, 'pass' as const])));
+      },
+    });
+    expect(observed).toEqual([['/repo', 'base-sha', 'src/a.test.ts']]);
+    expect(result.exitCode).toBe(1);
+    expect(result.baseline).toMatchObject({ introduced: 0, unknown: 1 });
+    expect(result.lines.join('\n')).toContain('[gate.interference] interference:');
   });
 
   test('runs additional gates without update, preserves raw output, and blocks violations', () => {

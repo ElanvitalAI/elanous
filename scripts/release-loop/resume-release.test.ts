@@ -201,6 +201,47 @@ test('resume preflight rejects each environment/artifact mismatch before graph o
   }
 });
 
+test('resume refuses to cross a rejected publish approval after an appended cut, before dry-run or mutation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-rejected-approval-'));
+  setElanousConfigDir(root);
+  const saved = writeFailedRun(root);
+  const state = JSON.parse(saved.original) as Record<string, any>;
+  const decidedAt = '2026-10-26T07:00:00.000Z';
+  state.path = ['version-release', 'gate', 'auto-approve', 'approve-publish', 'failed'];
+  state.nodes = [
+    { nodeId: 'version-release', ok: true, exit: 0, executed: true,
+      output: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) },
+    { nodeId: 'gate', ok: true, exit: 0, executed: true, output: '{"outcome":"ok"}' },
+    { nodeId: 'auto-approve', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' },
+    { nodeId: 'approve-publish', ok: false, exit: 1, executed: true, decidedAt },
+    { nodeId: 'failed', ok: true, exit: 0, executed: false },
+  ];
+  state.executed = 4;
+  writeFileSync(saved.statePath, JSON.stringify(state));
+  writeFileSync(`${saved.statePath}.4.decision.json`, JSON.stringify({
+    nodeId: 'approve-publish', decision: 'rejected', decidedAt,
+  }));
+  const appended = 'b'.repeat(40);
+  const git = (args: string[]) => {
+    if (args[0] === 'ls-remote') return `${appended}\trefs/heads/release/${VERSION}`;
+    if (args[0] === 'rev-parse') return appended;
+    return '';
+  };
+  let graphCalls = 0;
+  const deps = { root, git, isAncestor: () => true, repo: process.cwd() };
+  try {
+    await expect(planResumeReleaseRun({ runId: 'r', from: 'gate', partial: false }, deps))
+      .rejects.toThrow('cannot restart across an approval decision');
+    await expect(resumeReleaseRun({ runId: 'r', from: 'gate', partial: false }, {
+      ...deps, graph: async () => { graphCalls++; throw new Error('graph should not run'); },
+    })).rejects.toThrow('cannot restart across an approval decision');
+    expect(readFileSync(saved.statePath, 'utf8')).toBe(JSON.stringify(state));
+    expect(readdirSync(join(root, 'graph-runs', 'release-loop')).some((name) => name.includes('.before-tip-'))).toBe(false);
+    expect(graphCalls).toBe(0);
+    expect(existsSync(join(root, 'release', VERSION, 'resume-attempts', 'r.json'))).toBe(false);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test('resume dry-run marks an explicit no-partial gate restart as a full gate', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-resume-dry-run-full-gate-'));
   setElanousConfigDir(root);
@@ -378,6 +419,27 @@ test('GATE-RESUME-STALLED-ONLY: same-commit resume plans stalled files and prese
       priorFailures: ['src/completed.test.ts > kept'], priorErrors: ['src/error.test.ts > [error]'],
     });
     expect(readFileSync(state.statePath, 'utf8')).toContain('partialFailures');
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-SHARD-HOST-REROUTE: release resume passes the exact shard override to runGraph', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resume-shard-reroute-'));
+  setElanousConfigDir(root);
+  const saved = writeFailedRun(root);
+  const state = JSON.parse(saved.original) as { input: Record<string, unknown> };
+  state.input.gatePodPool = 'pool-test';
+  writeFileSync(saved.statePath, JSON.stringify(state));
+  const commandRoot = createPreflightCommandRoot(root);
+  let graphOptions: Parameters<typeof runGraph>[1];
+  try {
+    await resumeReleaseRun({ runId: 'r', from: 'gate', partial: false,
+      rerouteShard: 'pod-2', shardHost: 'pool-mac', shardOs: 'darwin', commandRoot }, {
+      root, git: gitStub, isAncestor: () => true,
+      graph: async (_path, options) => { graphOptions = options; return { status: 'done' } as never; },
+    });
+    expect(graphOptions).toMatchObject({ resumeRunId: 'r', fromNodeId: 'gate',
+      releaseGateShardReroute: { shard: 'pod-2', host: 'pool-mac', os: 'darwin' } });
+    expect(graphOptions?.releaseCommandSource?.cutTip).toBe(SHA);
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 

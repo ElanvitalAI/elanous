@@ -50,7 +50,7 @@ describe('MAT1c slash picker visibility', () => {
     expect(names(state)).not.toContain('research');
     for (const name of names(state)) expect(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash]).toBe('stable');
     setAudience({ role: 'general', showBeta: true });
-    expect(names(state)).toContain('research');
+    expect(names(state)).not.toContain('research');
     for (const name of names(state)) expect(['stable', 'beta']).toContain(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash]);
     expect(names(state)).not.toContain('debug');
     expect(names(state)).not.toContain('directive');
@@ -59,8 +59,9 @@ describe('MAT1c slash picker visibility', () => {
   it('contributor sees tool and beta but not ops', () => {
     setAudience({ role: 'contributor' });
     const visible = names(picker());
-    expect(visible).toContain('research');
-    expect(visible).toContain('debug');
+    expect(visible).toContain('help');
+    expect(visible).not.toContain('research');
+    expect(visible).not.toContain('debug');
     expect(visible).not.toContain('directive');
     for (const name of visible) expect(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash]).not.toBe('ops');
   });
@@ -78,25 +79,25 @@ describe('MAT1c slash picker visibility', () => {
 });
 
 describe('filterSlashCommands', () => {
-  it('reorders only existing essential commands without changing the order of others', () => {
+  it('keeps registry order while omitting commands outside the 15-item menu', () => {
     const names = filterSlashCommands('', SLASH_COMMANDS).map(c => c.name);
     expect(names).not.toContain('new');
-    expect(names.slice(0, 9)).toEqual([
-      'help', 'resume', 'model', 'clear', 'status', 'now', 'wish', 'remaining', 'setup',
-    ]);
-    // TG-SLASH: the rest keep registry order — derived, so a new command needs no edit here.
-    const essential = new Set(names.slice(0, 9));
-    expect(names.slice(9)).toEqual(SLASH_COMMANDS.map(c => c.name).filter(n => !essential.has(n) && names.includes(n)));
+    expect(names).toEqual(SLASH_COMMANDS.filter((command) => !command.hidden).map((command) => command.name));
+    for (const visible of ['context', 'remaining', 'session', 'setup', 'decide']) expect(names).toContain(visible);
+    expect(names).not.toContain('research');
     expect(new Set(names).size).toBe(names.length);
   });
 
   it('returns the input list unchanged for empty text', () => {
     const out = filterSlashCommands('', SLASH_COMMANDS);
-    expect(out).toEqual(SLASH_COMMANDS);
+    expect(out).toEqual(SLASH_COMMANDS.filter((command) => !command.hidden));
   });
 
   it('prefers prefix-on-name over every other match kind', () => {
-    const out = filterSlashCommands('teleg', SLASH_COMMANDS);
+    const out = filterSlashCommands('teleg', [
+      { name: 'debug', description: 'Toggle runtime tracer: LLM req/resp + plugin dispatch → log file + chat mirror' },
+      { name: 'telegram', description: 'Telegram things' },
+    ]);
     expect(out[0]?.name).toBe('telegram');
   });
 
@@ -106,7 +107,10 @@ describe('filterSlashCommands', () => {
     // "Toggle runtime tracer: LLM req/resp + plugin dispatch → log
     // file + chat mirror" in order. Under the new rules, nothing
     // besides /telegram itself should match "teleg".
-    const names = filterSlashCommands('teleg', SLASH_COMMANDS).map(c => c.name);
+    const names = filterSlashCommands('teleg', [
+      { name: 'debug', description: 'Toggle runtime tracer: LLM req/resp + plugin dispatch → log file + chat mirror' },
+      { name: 'telegram', description: 'Telegram things' },
+    ]).map(c => c.name);
     expect(names).toEqual(['telegram']);
   });
 

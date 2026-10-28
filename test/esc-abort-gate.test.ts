@@ -5,6 +5,8 @@ import type { ModalSurface } from '../src/display/modal-stack.js';
 import { DEFAULT_THEME_TOKENS } from '../src/theme/tokens.js';
 import { debug } from '../src/debug/log.js';
 import { KeyStreamParser } from '../src/tui.js';
+import { childLifetimeSignal } from '../src/turn-abort-scope.js';
+import { InlineChoiceBroker } from '../src/tui/inline-choice.js';
 
 const originalElanousRunId = process.env.ELANOUS_RUN_ID;
 
@@ -54,6 +56,83 @@ describe('createEscAbortGate', () => {
     expect(ctx.pushedSurfaces.length).toBe(0);
     expect(ctx.gate.isGateOpen()).toBe(false);
     expect(ctx.pendingEvents).toEqual([{ running: 0, repeat: 0, targets: ['Read'] }]);
+  });
+
+  test('unattended seat with running children force-stops without confirmation modal', () => {
+    const ctrl = new AbortController();
+    const child = childLifetimeSignal(ctrl.signal)!;
+    const pushed: ModalSurface[] = [];
+    const gate = createEscAbortGate({
+      abortCtrl: ctrl,
+      getRunningCount: () => 2,
+      mountModal: (surface) => { pushed.push(surface); return () => {}; },
+      getViewport: () => ({ cols: 80, rows: 24 }),
+      forceStopWithoutModal: () => true,
+    });
+
+    gate.handleEscape();
+
+    expect(ctrl.signal.aborted).toBe(true);
+    expect(child.aborted).toBe(true);
+    expect(pushed).toHaveLength(0);
+    expect(gate.isGateOpen()).toBe(false);
+  });
+
+  test('unattended inline stop timeout/cancel keeps the turn and child lifetimes alive', async () => {
+    const ctrl = new AbortController();
+    const child = childLifetimeSignal(ctrl.signal)!;
+    const pushed: ModalSurface[] = [];
+    let fireTimeout!: () => void;
+    let timeoutDelay = 0;
+    const observed: Array<{ id: string; outcome: string }> = [];
+    const broker = new InlineChoiceBroker({
+      appendLines: () => {},
+      schedule: (callback, delayMs) => { fireTimeout = callback; timeoutDelay = delayMs; return 1 as never; },
+      cancelSchedule: () => {},
+      observe: (event) => observed.push({ id: event.id, outcome: event.outcome }),
+    });
+    const gate = createEscAbortGate({
+      abortCtrl: ctrl,
+      getRunningCount: () => 2,
+      mountModal: (surface) => { pushed.push(surface); return () => {}; },
+      getViewport: () => ({ cols: 80, rows: 24 }),
+      forceStopWithoutModal: () => true,
+      confirmStopInline: async () => {
+        const result = await broker.ask({
+          id: 'stop-confirm', question: 'Stop this turn?',
+          options: [{ value: 'stop', label: 'Stop' }], timeoutMs: 60_000,
+        });
+        return !('cancelled' in result) && result.selected.includes('stop');
+      },
+    });
+
+    gate.handleEscape();
+    expect(ctrl.signal.aborted).toBe(false);
+    expect(pushed).toHaveLength(0);
+    expect(timeoutDelay).toBe(60_000);
+    fireTimeout();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(observed).toEqual([{ id: 'stop-confirm', outcome: 'timeout' }]);
+    expect(ctrl.signal.aborted).toBe(false);
+    expect(child.aborted).toBe(false);
+  });
+
+  test('late affirmative inline answer cannot abort a turn after its gate was disposed', async () => {
+    const ctrl = new AbortController();
+    let answer!: (confirmed: boolean) => void;
+    const gate = createEscAbortGate({
+      abortCtrl: ctrl,
+      getRunningCount: () => 1,
+      mountModal: () => () => {},
+      getViewport: () => ({ cols: 80, rows: 24 }),
+      forceStopWithoutModal: () => true,
+      confirmStopInline: () => new Promise<boolean>((resolve) => { answer = resolve; }),
+    });
+    gate.handleEscape();
+    gate.dispose();
+    answer(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(ctrl.signal.aborted).toBe(false);
   });
 
   test('running>0 pops a modal + does NOT abort until answered', () => {

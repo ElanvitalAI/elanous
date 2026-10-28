@@ -17,6 +17,12 @@ export {
 } from './modal.js';
 
 export {
+  createInlineAskUserQuestionResolver,
+  resolveUnattendedInlineChoiceTimeoutMs,
+  UNATTENDED_INLINE_CHOICE_TIMEOUT_MS,
+} from './inline-resolver.js';
+
+export {
   buildAskUserQuestionTool, createFileAskUserQuestionResolver, dispatchAskUserQuestion,
   ASK_USER_QUESTION_OBSERVABILITY_CATEGORY,
   setAskUserQuestionDeps, getAskUserQuestionDeps,

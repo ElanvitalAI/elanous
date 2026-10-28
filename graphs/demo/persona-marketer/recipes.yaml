@@ -1,0 +1,19 @@
+# 마케터 장면 데모 레시피 — inert 데모 명령만(실제 게시·외부 호출 없음). brand-tone 방문 상태는 런 statePath 로 격리된다.
+event-photos:
+  command: >-
+    bun -e 'console.log(JSON.stringify({ outcome: "ok" }))' # event-photos
+  timeout_ms: 30000
+reel:
+  command: >-
+    bun -e 'console.log(JSON.stringify({ outcome: "ok" }))' # reel
+  timeout_ms: 30000
+feed-text:
+  command: >-
+    bun -e 'console.log(JSON.stringify({ outcome: "ok" }))' # feed-text
+  timeout_ms: 30000
+brand-tone:
+  command: >-
+    bun -e 'console.log(JSON.stringify({ outcome: "ok" }))' # brand-tone
+  timeout_ms: 30000
+pre-post-check:
+  approval: '{"kind":"게시 대기","auto_post":0}'

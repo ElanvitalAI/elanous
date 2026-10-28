@@ -8,7 +8,7 @@ setDefaultTimeout(60_000);
 
 const cliModule = new URL('../src/cli/agent-cli.ts', import.meta.url).pathname;
 
-function probe(json: boolean, enableTools = true, finalAfterTool = true, mode: 'tool' | 'text-only' = 'tool'): { stdout: string; status: number } {
+function probe(json: boolean, enableTools = true, finalAfterTool = true, mode: 'tool' | 'text-only' = 'tool', expectedStatus = 0): { stdout: string; status: number } {
   const stateDir = mkdtempSync(join(tmpdir(), 'elanous-agent-reply-'));
   try {
     const child = Bun.spawnSync(['bun', '-e', `
@@ -40,8 +40,12 @@ function probe(json: boolean, enableTools = true, finalAfterTool = true, mode: '
       cwd: process.cwd(), env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
       stdout: 'pipe', stderr: 'pipe',
     });
-    if (child.exitCode !== 0) throw new Error(new TextDecoder().decode(child.stderr));
-    return { status: child.exitCode, stdout: new TextDecoder().decode(child.stdout) };
+    if (child.exitCode !== expectedStatus) throw new Error(`expected exit ${expectedStatus}, got ${child.exitCode}: ${new TextDecoder().decode(child.stderr)}`);
+    return {
+      status: child.exitCode,
+      stdout: new TextDecoder().decode(child.stdout),
+      stderr: new TextDecoder().decode(child.stderr),
+    };
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -49,25 +53,34 @@ function probe(json: boolean, enableTools = true, finalAfterTool = true, mode: '
 
 describe('agent CLI reply', () => {
   test('--json reply and finalReply contain only the final message; transcript preserves all deltas', () => {
-    const { stdout } = probe(true);
+    const { stdout, status } = probe(true);
+    expect(status).toBe(0);
     const value = JSON.parse(stdout.trim());
     expect(value.reply).toBe('Final answer.');
     expect(value.finalReply).toBe('Final answer.');
+    expect(value.incomplete).toBe(false);
     expect(value.transcript).toBe('Before the tool. Final answer.');
   });
 
   test('human output excludes pre-tool assistant text', () => {
-    const { stdout } = probe(false);
+    const { stdout, status } = probe(false);
+    expect(status).toBe(0);
     expect(stdout).toContain('Final answer.');
     expect(stdout).not.toContain('Before the tool.');
   });
 
-  test('an empty post-tool message does not repeat the pre-tool answer', () => {
-    const value = JSON.parse(probe(true, true, false).stdout.trim());
+  test('an empty post-tool message is incomplete and does not promote pre-tool progress to finalReply', () => {
+    const incomplete = probe(true, true, false, 'tool', 1);
+    const value = JSON.parse(incomplete.stdout.trim());
     expect(value.reply).toBe('');
-    expect(value.finalReply).toBe('Before the tool.');
+    expect(value.finalReply).toBe('');
     expect(value.transcript).toBe('Before the tool. ');
-    expect(probe(false, true, false).stdout).not.toContain('Before the tool.');
+    expect(value.incomplete).toBe(true);
+    expect(incomplete.status).toBe(1);
+    const humanIncomplete = probe(false, true, false, 'tool', 1);
+    expect(humanIncomplete.status).toBe(1);
+    expect(humanIncomplete.stdout).not.toContain('Before the tool.');
+    expect(humanIncomplete.stderr).toContain('without a final assistant reply');
   });
 
   test('text-only mode returns its body without tool callbacks in the child stdout JSON', () => {
@@ -77,6 +90,7 @@ describe('agent CLI reply', () => {
     expect(value.reply).toBe('Answer without deltas.');
     expect(value.transcript).toBe('Answer without deltas.');
     expect(value.finalReply).toBe('Answer without deltas.');
+    expect(value.incomplete).toBe(false);
   });
 
   test('tool-enabled turn without tool calls or deltas falls back to returned text', () => {

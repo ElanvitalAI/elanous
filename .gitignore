@@ -175,3 +175,6 @@ CLAUDE.local.md
 *.local.last-session.md.tmp-*
 # 자기 편집 직전 판 백업(L0 로더가 한 벌 덮어쓴다)
 *.local.md.prev
+
+# bun test 실행 잔채 로그(SURVIVAL-PROGRESS-CLOCK 리뷰 — 의도된 산출 아님)
+.mtest.log

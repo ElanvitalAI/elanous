@@ -64,6 +64,9 @@ function mockSpawn(): {
       const signal = sig ?? 'SIGTERM';
       kills.push(signal);
       killEvents.push({ pid, signal });
+      // The synthetic process exits on a signal, as a cooperative PTY does.
+      // This also cancels its escalation timer before the next test starts.
+      ctrl.emitExit(0);
     },
     onData(cb) { dataCbs.push(cb); return { dispose() { /* noop */ } }; },
     onExit(cb) { exitCbs.push(cb); return { dispose() { /* noop */ } }; },
@@ -118,8 +121,9 @@ describe('PtyShell tool schemas', () => {
 describe('PtyShellStart', () => {
   test('creates a process and returns process_id + initial yield', async () => {
     const startPromise = dispatchPtyShellStart({ cmd: 'sh', yield_time_ms: 60 });
-    // Emit some data while start is yielding.
-    setTimeout(() => controllers[0]?.emitData('hello\n'), 20);
+    // Spawn can be delayed on a loaded host; emit after the adapter exists.
+    while (!controllers[0]) await Bun.sleep(1);
+    controllers[0].emitData('hello\n');
     const r = await startPromise;
     expect(r.output).toMatch(/process_id=pty_/);
     expect(r.output).toContain('hello');

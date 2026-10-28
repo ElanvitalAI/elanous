@@ -1,0 +1,66 @@
+[
+  {
+    "id": "finance-01-kgb-10y",
+    "domain": "finance",
+    "bloom": ["remember", "understand", "analyze", "evaluate", "create"],
+    "requiresHigherOrder": true,
+    "prompt": "현재 기준으로 한국 국고채 10년물 금리의 최근 30일 변화를 조사하라. 공신력 있는 시계열 값과 날짜를 먼저 제시하고, 움직임을 설명하는 요인을 데이터로 분해하라. 가장 강한 대안 설명과 반대 근거를 포함하고, 향후 3개월의 조건부 시나리오를 제시하되 투자 권유는 하지 마라. 핵심 주장마다 원문 출처 URL과 기준 시각을 붙여라."
+  },
+  {
+    "id": "finance-02-usdkrw",
+    "domain": "finance",
+    "bloom": ["remember", "understand", "apply", "analyze", "evaluate"],
+    "requiresHigherOrder": true,
+    "prompt": "현재 기준 최근 90일 원/달러 환율 변화를 조사하고, 달러지수·미 국채금리·한국 수출 및 자금 흐름이 각각 설명하는 부분을 구분하라. 인과관계와 동시 움직임을 혼동하지 말고, 각 설명을 지지하는 자료와 반대 사례를 대조하라. 근거가 부족한 요인은 미확인으로 남기고, 출처 URL·값·날짜를 제시하라."
+  },
+  {
+    "id": "finance-03-korean-memory-producers",
+    "domain": "finance",
+    "bloom": ["remember", "understand", "apply", "analyze", "evaluate", "create"],
+    "requiresHigherOrder": true,
+    "prompt": "현재 공개된 최신 실적 기준으로 삼성전자와 SK하이닉스의 메모리 사업을 비교하라. 매출·수익성·제품 믹스·CAPEX 등 비교 가능한 수치를 같은 기간으로 정렬하고, 차이의 원인을 분해하라. 두 회사 각각에 유리한 반대 근거와 데이터 공백을 포함하고, 다음 두 분기에 관찰할 지표와 조건부 시나리오를 제안하라. 투자 권유는 하지 말고 원문 출처·기간·단위를 표시하라."
+  },
+  {
+    "id": "technology-01-hbm4",
+    "domain": "technology",
+    "bloom": ["remember", "understand", "apply", "analyze", "evaluate", "create"],
+    "requiresHigherOrder": true,
+    "prompt": "HBM4의 현재 개발·양산·고객 인증 상태와 공급망 병목을 1차 자료 중심으로 조사하라. 발표·샘플·인증·양산을 서로 다른 상태로 구분하고, 메모리 업체·패키징·가속기 공급망의 인과 관계를 설명하라. 일정 지연 또는 채택 축소를 뒷받침하는 반대 근거도 찾고, 2027년까지 확인 가능한 관측 지표와 시나리오를 제시하라."
+  },
+  {
+    "id": "technology-02-coding-agent-adoption",
+    "domain": "technology",
+    "bloom": ["remember", "understand", "apply", "analyze", "evaluate"],
+    "prompt": "2025년 이후 코딩 에이전트의 실제 조직 도입과 생산성 효과를 조사하라. 벤더 발표·설문·독립 실험을 출처 유형별로 분리하고, 표본·측정 정의·선택 편향을 비교하라. 생산성 향상 주장에 대한 반대 결과와 보안·검토 비용도 포함하고, 근거가 말할 수 있는 범위를 제안하라. 핵심 수치에는 모집단·기간·원문 URL을 붙여라."
+  },
+  {
+    "id": "technology-03-inference-economics",
+    "domain": "technology",
+    "bloom": ["remember", "understand", "apply", "analyze", "evaluate", "create"],
+    "prompt": "최근 12개월의 frontier 및 open-weight 모델 추론 비용·성능 변화를 비교하라. 공개 가격표와 재현 가능한 독립 평가를 분리하고, 토큰 가격·지연·품질·하드웨어 이용률이 실제 총비용에 미치는 영향을 계산 가능한 단위로 제시하라. '더 싸다'는 주장에 대한 반례와 작업별 차이를 분석하고, 12개월의 조건부 시나리오를 제시하라."
+  },
+  {
+    "id": "market-01-enterprise-research-agents",
+    "domain": "market",
+    "bloom": ["remember", "understand", "analyze", "evaluate", "create"],
+    "prompt": "기업용 조사·리서치 에이전트 시장의 규모와 성장률 주장을 비교하라. 최소 세 출처의 정의·포함 제품·기준 연도·예측 기간을 대조하고, 같은 시장을 측정하는지 판단하라. 도입 사례와 실사용 효과의 독립 근거를 벤더 전망과 분리하고, 가장 큰 불확실성 및 반대 근거를 제시하라."
+  },
+  {
+    "id": "market-02-korean-enterprise-automation",
+    "domain": "market",
+    "bloom": ["remember", "understand", "apply", "analyze", "evaluate", "create"],
+    "prompt": "한국 기업의 에이전트형 AI 업무 자동화에서 현재 가치가 검증된 부문을 조사하라. 금융·제조·고객지원 등 최소 세 부문에서 실제 배포, 실험, 계획 발표를 구분하고, 도입 전후의 비용·시간·오류 지표를 찾아라. 규제·데이터·통합 비용과 효과가 없었던 사례도 포함하고, 다음 12개월에 검증할 측정 설계를 제안하라."
+  },
+  {
+    "id": "market-03-ai-research-assistants",
+    "domain": "market",
+    "bloom": ["remember", "understand", "apply", "analyze", "evaluate"],
+    "prompt": "AI 조사 보조 제품군의 최근 경쟁 구도를 조사하라. 제품 기능 나열 대신 출처 발견·교차검증·기억·도구 실행·인용 정확도·가격을 축으로 비교하라. 독립 평가와 공식 문서를 구분하고, 강점 주장을 뒤집을 수 있는 반례 및 기능 미지원 증거를 찾으라. 사용 사례별로 승자를 달리 제시하고 근거 수준을 표시하라."
+  },
+  {
+    "id": "market-04-agentic-knowledge-work",
+    "domain": "market",
+    "bloom": ["understand", "apply", "analyze", "evaluate", "create"],
+    "prompt": "지식 노동에서 조사 에이전트가 검색·분석·보고 과정을 바꾸는 방식을 조사하라. 현장 도입 사례와 통제된 연구를 분리하고, 어떤 작업은 자동화되고 어떤 판단은 사람에게 남는지 사례로 분석하라. 생산성 이익과 함께 오류·근거 누락·데이터 유출·검토 비용의 반대 근거를 다루고, 측정 가능한 성공 기준과 실패 시 대안을 설계하라."
+  }
+]

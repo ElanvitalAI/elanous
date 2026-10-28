@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { classifyPodExit, extractPodFailureReason, nestedPodResult, podChildFailureAttribution, podDeadlineResultMarker, podJobConditionReason, podTerminalRow, POD_EXIT_CLASSES } from './pod-failure-reason.js';
+import { recordHarnessPodStop } from '../../harness/harness-cli-command.js';
 
 test('FailureTarget deadline is available before the Failed condition and an unrelated marker is ignored', () => {
   expect(podJobConditionReason('|DeadlineExceeded')).toBe('DeadlineExceeded');
@@ -380,6 +381,68 @@ describe('podChildFailureAttribution', () => {
     expect(first?.error.split('\n')[0]).toBe('Error: dependency unavailable');
     const bookkeeping = JSON.stringify({ kind: 'self', ok: false, stage: 'error', error: 'ELANOUS_RUN_LEDGER chunk' });
     expect(podChildFailureAttribution(bookkeeping)).toBeNull();
+  });
+});
+
+/**
+ * 무대: mock 장치 — «생산 호출 경로를 그대로 지나는» 부모 원장 기록 장치.
+ * `harness ask/say` 의 onPod → `recordHarnessPodStop` → `podExitDetail` → `classifyPodExit` → 원장 writer.
+ * kubectl·Pod 는 안 띄우고 writer 만 가로챈다 — 사유·검사 이름·잘리지 않은 경로·result line 부재가
+ * «원장 행»에 실제로 어떻게 남는지 잰다.
+ */
+describe('PRODUCTION LEDGER: 부모 원장 stop 행이 사유와 result line 부재를 따로 남긴다', () => {
+  const noLedger = () => null;
+  const uniqueRunId = (tag: string) => `run-podfailure-${tag}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const capture = () => {
+    const entries: Array<{ event: string; data: Record<string, unknown> }> = [];
+    return { entries, write: (entry: { event: string; data: Record<string, unknown> }) => { entries.push(entry); } };
+  };
+
+  test('자식 result line 이 없는 종료는 그 부재를 실패 사유와 «따로» 원장에 적는다', () => {
+    const runId = uniqueRunId('absent');
+    // 결과 행이 «한 줄도» 없는 Pod 출력 — 마지막 줄이 죽은 자리다.
+    const output = ['[self-dev] launching run', 'installing dependencies', 'Error: dependency unavailable'].join('\n');
+    const { entries, write } = capture();
+    expect(recordHarnessPodStop(runId, 1, { reason: 'unknown', lines: ['Pod 실행 여부 또는 종료 이유를 확인하지 못했다'] }, output,
+      { loadLedger: noLedger, write: write as never })).toBe(true);
+    const data = entries[0]!.data;
+    expect(data.podExitClass).toBe('child-error');
+    // ⛔ 부재는 사유와 «다른 필드»다 — 사유 코드가 없어도 부재는 남고, 부재가 사유를 덮지 않는다.
+    expect(data.noResultLine).toBe(true);
+    expect(data.reasonCode).toBeUndefined();
+    expect(data.checkName).toBeUndefined();
+    expect(data.targetPath).toBeUndefined();
+    expect(data.cause).toBe('Pod exit 1: child-error — Error: dependency unavailable');
+  });
+
+  test('프리플라이트 거절 행은 사유 코드·검사 이름·잘리지 않은 대상 경로를 원장에 따로 남긴다', () => {
+    const runId = uniqueRunId('preflight');
+    const longGoal = `/untruncated/${'nested/'.repeat(40)}GOAL-parse-failure.md`;
+    const longTraced = `src/${'deep/'.repeat(50)}missing-file.ts`;
+    expect(longTraced.length).toBeGreaterThan(240);
+    // 실제 자식이 방출하는 «중첩» 결과 행 — 골 판독(해석) 실패 ⊕ traced path 오류가 한 행에 같이 있다.
+    const row = {
+      kind: 'self', ok: false, result: { stage: 'preflight-blocked', ok: false, blockers: [
+        { kind: 'goal-unreadable', name: '골 문서 해석 실패', detail: 'goal-parse 검사가 골 문서를 해석하지 못했다', reasonCode: 'goal-parse', checkName: 'goal-parse', targetPath: longGoal },
+        { kind: 'missing-traced-path', name: `실재하지 않는 traced path: ${longTraced}`, detail: '골의 TRACED PATHS 에 없다', reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: longTraced },
+      ] },
+    };
+    const output = `${JSON.stringify(row)}\n`;
+    const { entries, write } = capture();
+    expect(recordHarnessPodStop(runId, 1, { reason: 'unknown', lines: [] }, output, { loadLedger: noLedger, write: write as never })).toBe(true);
+    const data = entries[0]!.data;
+    expect(data.podExitClass).toBe('child-unconverged');
+    expect(data.preflightChecks).toEqual([
+      { reasonCode: 'goal-parse', checkName: 'goal-parse', targetPath: longGoal },
+      { reasonCode: 'missing-traced-path', checkName: 'missing', targetPath: longTraced },
+    ]);
+    // 경로는 «잘리지 않은» 채 구조 필드에 남고, 사람용 원인 문면만 짧게 유지된다.
+    expect((data.preflightChecks as Array<{ targetPath: string }>)[1]!.targetPath).toBe(longTraced);
+    expect(String(data.cause).length).toBeLessThanOrEqual(400);
+    expect(data.cause).not.toContain(longTraced);
+    // 결과 행이 «있는» 종료이므로 부재 표시는 붙지 않는다.
+    expect(data.noResultLine).toBeUndefined();
+    expect(data.class).toBe('unclassified');
   });
 });
 

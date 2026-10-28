@@ -369,6 +369,8 @@ export function bridgeCoreTurnToAcp(
       const runTurnDispatch = (c: CoreTurnContext): Promise<unknown> =>
         armGoalLoop
           ? runGoalLoop(c, {
+              // ACP owns an interactive provider loop: keep its post-completion response contract.
+              terminalCompletionShortcut: false,
               ...(goalLoopCfg?.maxIterations !== undefined ? { maxIterations: goalLoopCfg.maxIterations } : {}),
               // #29 처방 — 자리 판정으로 goal loop 에 «되돌아온» 턴만 빈 evidence 완료를 답으로 받는다.
               ...(route.reason.startsWith('seat-') ? { lenientCompletionEvidence: true } : {}),
@@ -434,6 +436,12 @@ export function bridgeCoreTurnToAcp(
         ...(maxToolTurns !== undefined ? { maxToolTurns } : {}),
         ...((!factQuestion || explicitMaxToolTurns !== undefined) && deps.budgetGrant !== undefined ? { budgetGrant: deps.budgetGrant } : {}),
         callbacks: {
+          onStatus: (line) => {
+            void turnCtx.pushSessionUpdate(
+              { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: line } },
+              { status: true },
+            );
+          },
           onGoalInterim: (text) => {
             void turnCtx.pushSessionUpdate(
               { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } },

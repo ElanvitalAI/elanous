@@ -70,7 +70,7 @@ import { buildDelegateAgentTool, dispatchDelegateAgent } from './delegate-agent.
 import {
   SELF_IMPLEMENT_TOOL_NAMES,
   buildSelfImplementDaemonSpec,
-  dispatchSelfImplement,
+  dispatchSelfImplementManaged,
 } from './self-implement.js';
 // ⭐ 소환기(F2 · RFC-observability-driven-tool-selection · 2026-07-26) —
 //   tier-flip 이 deferred 를 만들면 ToolSearch 를 active 에 **주입**하므로, 이 서피스는
@@ -395,6 +395,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
       // L2 core + L3 finance(gated) — buildSharedAppTools 단일 dispatch · B5: 진행 한 줄(emitFeedback)·세션·호출 id 를 넘긴다.
       return shared.dispatch(name, args, {
         surface: 'tui',
+        signal: ctx.signal,
         ...(ctx.requestOrigin ? { requestOrigin: ctx.requestOrigin } : {}),
         ...(ctx.verifiedOwner ? { verifiedOwner: ctx.verifiedOwner } : {}),
         ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
@@ -458,7 +459,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
             debug.log('substrate.nest', 'spawn-refused', { tool: name, ...nestInfo() }, { level: 'warn' });
             return { error: `nest-cap: 재귀 상한(${nestInfo().max}중) 도달 — SelfImplement 비활성(액자 폭주 방지)` };
           }
-          return dispatchSelfImplement(args, ctx);
+          return dispatchSelfImplementManaged(args, ctx);
         }
         throw new ToolSafetyError(
           'unavailable',
@@ -532,7 +533,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
           debug.log('substrate.nest', 'spawn-refused', { tool: name, ...nestInfo() }, { level: 'warn' });
           return { error: `nest-cap: 재귀 상한(${nestInfo().max}중) 도달 — SelfImplement 비활성(액자 폭주 방지)` };
         }
-        return dispatchSelfImplement(args, ctx);
+        return dispatchSelfImplementManaged(args, ctx);
       }
       if (name === 'RunDevHarness') {
         if (nestCapReached()) {

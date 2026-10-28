@@ -12,10 +12,9 @@
 //     경로(model 미지정 ⇒ providerFor(cfg))를 그대로 보존한다. 값이 없거나 빈 값이면
 //     parseArgv 오류를 던져 기본 모델로 조용히 실행되지 않도록 한다.
 //
-// ⛔ 의도된 경계(비연결 선언): 이 유닛은 «정의 + 단위시험» 에서 멈춘다.
-//   scripts/morning-report.ts 탑레벨(CLI 진입) → composeMorningReport(..., { model }) 배선은
-//   의존 형제 샤드(task:d0183079b142)의 몫이다. 지금 이 유닛을 실행 경로에서 부르는 곳은
-//   scripts/lib/morning-report-options.test.ts(bun test, in-process) 다.
+// ✅ 배선 완료(SWAP-BENCH-CRON): scripts/morning-report.ts 탑레벨(CLI 진입)이 이 파서를
+//   호출해 --narrative-model 값을 composeMorningReport(..., { model }) 로 넘긴다.
+//   배선 계약 시험은 test/morning-report.test.ts(mock 무대)가 누른다.
 
 import { parseArgv, type ArgvContract } from './argv.js';
 

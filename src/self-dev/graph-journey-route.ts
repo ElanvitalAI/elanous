@@ -122,6 +122,10 @@ export function readJourneyEdge(
  *  그 밖의 칸은 그 간선에 결속할 근거(예: 착지 거부 원문·cardId · LAND-REFUSAL-EDGES) — 간선 칸(from·to·taken…)을 덮지 못한다. */
 export interface JourneyEdgeFields {
   readonly moveId?: string;
+  readonly runId?: string;
+  readonly card?: string;
+  readonly pr?: number;
+  readonly head?: string;
   readonly [key: string]: unknown;
 }
 
@@ -140,11 +144,15 @@ export function recordJourneyEdge(route: JourneyRoute, taken: string, reason?: s
       graphId: 'self-implement', node: skipped.node, reason: 'condition', condition: skipped.condition,
       ...journeyJoinFields(),
     });
-    // Evidence never overrides an edge field: the later spread wins, and `reason`/join keys are reserved.
-    const { reason: _reservedReason, journeyKey: _reservedJourney, queueLaunchId: _reservedLaunch, ...evidence } = data ?? {};
+    // Evidence never overrides an edge field: the later spread wins. Explicit repair join keys win over ambient context.
+    const { reason: _reservedReason, journeyKey: _reservedJourney, queueLaunchId: _reservedLaunch,
+      runId, card, pr, head, moveId, ...evidence } = data ?? {};
     debug.log('self-implement', 'graph-edge-taken', {
       ...evidence, graphId: 'self-implement', ...route, taken, honored: route.to === null || route.to === taken,
       ...(reason === undefined ? {} : { reason }), ...journeyJoinFields(),
+      ...(runId === undefined ? {} : { runId }), ...(card === undefined ? {} : { card }),
+      ...(pr === undefined ? {} : { pr }), ...(head === undefined ? {} : { head }),
+      ...(moveId === undefined ? {} : { moveId }),
     });
   } catch { /* 관측은 fail-soft */ }
 }

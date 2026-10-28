@@ -80,6 +80,45 @@ test('graph adapt-report measures same-goal A/A/B ledger paths, adaptations, lan
     nonAdapted: { landed: 0, denominator: 0, rate: null } });
 }, 120_000);
 
+test('graph adapt-report windows by start time and separates in-flight and missing graph artifacts', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-adapt-window-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const ledgerDir = join(stateRoot, 'run-ledger');
+  const graphDir = join(stateRoot, 'graph-runs', 'self-implement');
+  mkdirSync(ledgerDir, { recursive: true });
+  mkdirSync(graphDir, { recursive: true });
+  const goalId = 'window-goal';
+  const put = (suffix: number, timestamp: string, artifact: boolean, terminal: boolean, parked = false) => {
+    const runId = `run-00000000-0000-4000-8000-${String(suffix).padStart(12, '0')}`;
+    const entry = (event: string, data: Record<string, unknown>) => JSON.stringify({ runId, goalId, timestamp, event, data });
+    writeFileSync(join(ledgerDir, `${runId}.jsonl`), [entry('start', {}),
+      entry('pipeline-traversal-shadow', { observedNodes: ['A', 'done'] }),
+      ...(terminal ? [entry('run-status', { runStatus: 'completed' }), entry('merged', { merged: true })] : []),
+      ...(parked ? [entry('run-status', { runStatus: 'parked' })] : []),
+    ].join('\n') + '\n');
+    if (artifact) writeFileSync(join(graphDir, `${runId}.json`), JSON.stringify({ runId, graphId: 'self-implement', unitCalls: [] }));
+  };
+  put(1, '2026-10-24T00:00:00Z', true, true); // before the window
+  put(2, '2026-10-25T00:00:00Z', true, true); // included at lower bound
+  put(3, '2026-10-25T01:00:00Z', true, false); // in flight
+  put(4, '2026-10-25T02:00:00Z', false, true); // unmeasured, not a failed landing
+  put(5, '2026-10-26T00:00:00Z', true, true); // excluded at upper bound
+  put(6, '2026-10-25T03:00:00Z', true, false, true); // parked and resumable
+  const result = spawnGraph(stateRoot, 'adapt-report', '--goal', goalId,
+    '--from', '2026-10-25T00:00:00Z', '--to', '2026-10-26T00:00:00Z', '--json');
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ runCount: 1,
+    nonAdapted: { landed: 1, denominator: 1, rate: 1 },
+    excludedCount: 4, exclusionReasons: { 'outside-start-window': 2, 'in-flight': 2 },
+    unmeasuredCount: 1, unmeasuredReasons: { 'graph-run-missing': 1 },
+    window: { since: '2026-10-25T00:00:00Z', until: '2026-10-26T00:00:00Z' } });
+  const invalid = spawnGraph(stateRoot, 'adapt-report', '--goal', goalId,
+    '--from', '2026-10-27T00:00:00Z', '--to', '2026-10-26T00:00:00Z');
+  expect(invalid.code).not.toBe(0);
+  expect(invalid.stderr).toContain('invalid adaptation measurement window');
+}, 120_000);
+
 test('graph wizard-run is exposed as the smart wizard request entrypoint', () => {
   const program = new Command();
   registerGraphCommands(program);

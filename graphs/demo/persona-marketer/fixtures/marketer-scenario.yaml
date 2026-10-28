@@ -1,0 +1,10 @@
+# field-feed 생산 런에서 수집한 표본이 아니라 격리 데모 입력이다.
+# 이 값으로 마케터 장면의 테스트 전용 runGraph 실행을 구성한다.
+persona:
+  name: mira
+  label: 마케터
+  brand_tone: 따뜻하고 사람 중심 · 과장 없는 사실형
+input:
+  event_photos:
+    - { file: 'DJI_0951.jpg', aspect: '9:16', subject: '무대 전경' }
+    - { file: 'DJI_0962.jpg', aspect: '9:16', subject: '관객 반응' }

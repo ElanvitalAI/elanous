@@ -11,6 +11,7 @@ import { createTurnStreamFormatter } from './dashboard/turn-stream-formatter.js'
 import { setUserConfigOverlay } from './user-config.js';
 import { testFakeLlmProvider } from './ux-sim/fake-llm.js';
 import { OverloadFailoverError } from './session-runtime/retry-api.js';
+import { resetProviderCircuitForTest } from './session-runtime/provider-circuit.js';
 import {
   _explainAndLogFallbackCandidatesForTest,
   _setStreamDisconnectRetryDelayForTest,
@@ -60,6 +61,7 @@ beforeEach(() => {
     logs.push({ category, event, data: (data ?? {}) as Record<string, unknown> });
   }) as typeof debug.log);
   _setStreamDisconnectRetryDelayForTest(() => 0);
+  resetProviderCircuitForTest();
 });
 
 afterEach(() => {

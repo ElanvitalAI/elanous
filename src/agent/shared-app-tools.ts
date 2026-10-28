@@ -39,7 +39,7 @@ export function buildSharedAppTools(cfg?: UserConfig): SharedAppTools {
   // context(B5) — 기억 조회 같은 긴 코어 도구가 진행 한 줄(emitFeedback)을 낼 수 있게 코어까지 넘긴다.
   const dispatch = async (name: string, args: Record<string, unknown>, context?: ToolRuntimeContext): Promise<unknown> =>
     name === skillsList.name ? dispatchElanousSkillsList(args as ElanousSkillsListArgs) :
-      name === skill.id ? skill.run(args as unknown as SkillExecArgs, { surface: 'skill' }) :
+      name === skill.id ? skill.run(args as unknown as SkillExecArgs, { surface: context?.surface ?? 'skill', signal: context?.signal }) :
         fin && fin.names.has(name) ? fin.dispatch(name, args) : core.dispatch(name, args, undefined, context);
   return { specs, names, dispatch };
 }

@@ -1,6 +1,7 @@
 import { setDefaultTimeout, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { diffFailures, junitFailures, parseFailures } from './gate-diff';
+import { shardFailureIds } from './gate-node';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -45,19 +46,40 @@ test('GATE-RECHECK-REMOTE: 대상 경로이자 완료 경계 코드는 scripts/r
   const crRow = `src/real.test.ts:\n(pass) title contains (fail) as ordinary text\n  body also says (fail) here\n(fail) actual broken case [1.00ms]\r`;
   expect(parseFailures(title)).toEqual([]);
   expect(parseFailures(body)).toEqual([]);
+  expect(shardFailureIds(`${title}0 fail\n0 errors\n`, undefined, 0, 0)).toEqual({ failures: [], errors: [] });
+  expect(shardFailureIds(`${body}0 fail\n0 errors\n`, undefined, 0, 0)).toEqual({ failures: [], errors: [] });
   expect(parseFailures(mixed)).toEqual([
     'src/real.test.ts > actual broken case',
     'src/real.test.ts > reports (fail) in the title on purpose',
   ]);
   expect(parseFailures(crRow)).toEqual(['src/real.test.ts > actual broken case']);
+  expect(shardFailureIds(mixed + '2 pass\n2 fail\n0 errors\nRan 4 tests across 1 files.\n', undefined, 2, 0))
+    .toEqual({ failures: ['src/real.test.ts > actual broken case', 'src/real.test.ts > reports (fail) in the title on purpose'], errors: [] });
 });
 
-test('parser consumes the actual Bun failure reporter, including the file header', () => {
-  const probe = spawnSync('bun', ['test', '--dots', import.meta.path, '-t', 'deliberate parser fixture failure'], {
+test('parser distinguishes a passing Bun reporter title and body from an actual failure row', () => {
+  const passing = spawnSync('bun', ['test', import.meta.path, '-t', 'gate-diff-pass-probe-unique'], {
+    env: { ...process.env, GATE_PARSER_PASS_PROBE: '1' }, encoding: 'utf8', timeout: 15_000,
+  });
+  expect(passing.status).toBe(0);
+  const passingOutput = `${passing.stdout}\n${passing.stderr}`;
+  expect(passingOutput).toContain('(fail) is ordinary passing-test output');
+  expect(passingOutput).toContain('scripts/release-loop/gate-diff.test.ts:');
+  expect(parseFailures(passingOutput)).toEqual([]);
+  expect(shardFailureIds(`${passingOutput}0 fail\\n0 errors\\n`, undefined, 0, 0)).toEqual({ failures: [], errors: [] });
+
+  const failing = spawnSync('bun', ['test', '--dots', import.meta.path, '-t', 'deliberate parser fixture failure'], {
     env: { ...process.env, GATE_PARSER_PROBE: '1' }, encoding: 'utf8', timeout: 15_000,
   });
-  expect(probe.status).toBe(1);
-  expect(parseFailures(probe.stderr)).toContain('scripts/release-loop/gate-diff.test.ts > deliberate parser fixture failure');
+  expect(failing.status).toBe(1);
+  const failingOutput = `${failing.stdout}\n${failing.stderr}`;
+  const failureId = 'scripts/release-loop/gate-diff.test.ts > deliberate parser fixture failure';
+  expect(parseFailures(failingOutput)).toContain(failureId);
+  expect(shardFailureIds(failingOutput, undefined, 1, 0)).toEqual({ failures: [failureId], errors: [] });
+});
+
+test('gate-diff-pass-probe-unique', () => {
+  if (process.env.GATE_PARSER_PASS_PROBE === '1') console.log('(fail) is ordinary passing-test output');
 });
 
 test('deliberate parser fixture failure', () => {

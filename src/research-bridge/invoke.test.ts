@@ -5,6 +5,8 @@ import {
   RESEARCH_DENIED_TOOLS,
   researchOutputFromSkillRun,
   researchOutcomeFromSkillRun,
+  invokeResearch,
+  setResearchInvoker,
 } from './invoke.js';
 
 const mf = (over: Partial<SkillManifest> = {}): SkillManifest =>
@@ -54,4 +56,22 @@ describe('researchOutputFromSkillRun', () => {
     });
   });
 
+});
+
+describe('invokeResearch cancellation', () => {
+  it('forwards the caller signal to the invoker so bounded follow-ups can stop', async () => {
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    setResearchInvoker(async (_skill, _args, _progress, signal) => {
+      received = signal;
+      return { output: 'read-only result', ok: true };
+    });
+    try {
+      const result = await invokeResearch('query', { skill: 'omni-crawl', signal: controller.signal });
+      expect(result.ok).toBe(true);
+      expect(received).toBe(controller.signal);
+    } finally {
+      setResearchInvoker(null);
+    }
+  });
 });

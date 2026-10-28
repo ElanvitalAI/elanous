@@ -435,7 +435,7 @@ describe('runPtyList --json — 회수 판단 관측값', () => {
       // ⭐ #14980 이 원격·로컬 «키 대칭»을 위해 더한 셋 — null 은 「모른다」이지 「없다」가 아니다.
       webUrl: null, webUrlSource: null, pwaUnavailableReason: null,
       // ⭐ H10 — 턴·판 칸은 «언제나» 실린다(턴 기록 없는 행 = unknown/null).
-      turn: { state: 'unknown', at: null, sinceSec: null }, build: null,
+      turn: { state: 'unknown', at: null, sinceSec: null }, progress: 'unknown', build: null,
     }]);
   });
 

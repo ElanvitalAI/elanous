@@ -15,6 +15,38 @@ setDefaultTimeout(60_000);
 const root = new URL('../../', import.meta.url).pathname;
 const fixture = new URL('./__fixtures__/agent-help-before/', import.meta.url);
 
+test('CLI tool turn passes SIGINT cancellation to a running skill_exec result', () => {
+  const home = mkdtempSync(join(tmpdir(), 'elanous-cli-skill-cancel-'));
+  const script = `
+    const { runChatTurnCli } = await import('./src/cli/agent-cli.ts');
+    const { setResearchInvoker } = await import('./src/research-bridge/invoke.ts');
+    setResearchInvoker(async () => new Promise(() => {}));
+    await runChatTurnCli({
+      cfg: { llm: { provider: 'auto', model: '' }, chat: { toolDeny: [] } },
+      userText: 'research', explicitSessionId: undefined,
+      reuseActive: false, forceNew: true, json: true, enableTools: true,
+      runTurn: async ({ dispatchTool, sessionId }) => {
+        const pending = dispatchTool('skill_exec', { skill: 'omni-digest', task: 'research' });
+        setTimeout(() => process.emit('SIGINT'), 10);
+        const result = await pending;
+        return { text: JSON.stringify(result), provider: 'test', model: 'test',
+          meta: { id: sessionId }, usedTokens: 0, droppedMessages: 0, memoryIds: [] };
+      },
+    });
+  `;
+  try {
+    const result = spawnSync(process.execPath, ['-e', script], {
+      cwd: root, encoding: 'utf8', timeout: 30_000,
+      env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: join(home, 'state') },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).reply).toContain('skill-exec-cancelled');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('CLI chat keeps its default tools until a knowledge pack is installed, then cites that pack', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'elanous-cli-kpack-'));
   const dbPath = join(dir, 'kgs.db');
@@ -312,6 +344,42 @@ describe('agent CLI extraction', () => {
       expect(index).toMatch(new RegExp(`export (?:const ${name}\\b|\\{[^}]*\\b${name}\\b)`));
     }
   });
+});
+
+test('agent --json exits after the completed turn even when a background handle remains', () => {
+  const home = mkdtempSync(join(tmpdir(), 'elanous-agent-cli-exit-'));
+  const stateDir = join(home, 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(join(stateDir, 'config.json'), JSON.stringify({
+    onboarding: { completed: true },
+    llm: { provider: 'auto', model: '', memoryJudge: { enabled: false } },
+  }));
+  const script = `
+    process.argv = ['bun', 'elanous', 'agent', '--json', 'hello'];
+    const { Command } = await import('commander');
+    const { registerAgentCommands, setCliRunTurnForTesting } = await import(${JSON.stringify(new URL('./agent-cli.ts', import.meta.url).href)});
+    setCliRunTurnForTesting(async ({ sessionId }) => {
+      setInterval(() => {}, 10_000);
+      return { text: 'completed reply', provider: 'test', model: 'test',
+        meta: { id: sessionId }, usedTokens: 0, droppedMessages: 0, memoryIds: [] };
+    });
+    const program = new Command();
+    registerAgentCommands(program);
+    await program.parseAsync(process.argv);
+  `;
+  try {
+    const result = spawnSync(process.execPath, ['-e', script], {
+      cwd: root, encoding: 'utf8', timeout: 8_000,
+      env: { ...process.env, HOME: home, ELANOUS_CONFIG_DIR: stateDir,
+        ELANOUS_STATE_DIR: stateDir, NODE_ENV: 'test', TEST_STATE_DIR: stateDir },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout).reply).toBe('completed reply');
+    expect(result.stdout.trim().split('\n')).toHaveLength(1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 

@@ -31,4 +31,6 @@ export interface InvokeResearchOpts {
   /** Stream progress chunks back to the caller (e.g. dashboard chat
    *  pane) so the user sees activity for long-running invocations. */
   onProgress?: (delta: string) => void;
+  /** Cancel a bounded automatic follow-up when its caller's time budget expires. */
+  signal?: AbortSignal;
 }

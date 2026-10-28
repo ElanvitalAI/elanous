@@ -83,6 +83,19 @@ describe('gateWall', () => {
     expect(gateWall(dir)).toMatchObject({ commit: 'new', shardsWallMin: null, disagree: false });
   });
 
+  test('분기 관측 행은 같은 커밋의 자식 Pod 기록에 귀속하고 다른 커밋 자식은 거부한다', () => {
+    const dir = fixture();
+    pod(dir, 'pod-0.json', 'cut', 20, 20);
+    pod(dir, 'pod-0-0.json', 'cut', 35, 10);
+    writeFileSync(join(dir, 'shards.json'), JSON.stringify({ shards: [
+      { id: 'pod-0', startedAt: '2026-10-09T00:00:00.000Z', endedAt: '2026-10-09T00:35:00.000Z' },
+      { id: 'pod-0-0', startedAt: '2026-10-09T00:25:00.000Z', endedAt: '2026-10-09T00:35:00.000Z' },
+    ] }));
+    expect(gateWall(dir)).toMatchObject({ shardsWallMin: 35, disagree: false });
+    pod(dir, 'pod-0-0.json', 'other', 35, 10);
+    expect(gateWall(dir, { commit: 'cut' })).toMatchObject({ shardsWallMin: null, disagree: false });
+  });
+
   test('이어 붙인 junit 부분에서 파일별 초를 합산하고 누락·읽지 못하는 루트는 제외한다', () => {
     const dir = fixture();
     pod(dir, 'pod-0.json', 'b', 20, 20);

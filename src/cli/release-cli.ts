@@ -56,6 +56,7 @@ import { defaultReleaseGraphRunsRoot, formatPublishProposal, measurePublishWindo
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
 import { runRehearsalTick, type RehearsalDeps } from '../release-loop/rehearsal.js';
 import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../release-loop/landing-freeze.js';
+import { gateShardLedgerPath, latestGateShardLedger, readGateShardLedger } from '../release-loop/gate-shard-ledger.js';
 import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
 import { applyWatchList, formatGateHistory, gateHistory, ghMergedPrs } from '../../scripts/release-loop/gate-history.js';
 import { registerRfcCommands } from './rfc-cli.js';
@@ -609,6 +610,19 @@ function compareReleaseVersions(a: string, b: string): number {
 export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: RecoverReleaseDeps = {}, checklistEvidenceReader?: ChecklistEvidenceReader): void {
   registerRfcCommands(program);
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
+  release.command('gate-shards').description('실행 중에도 읽는 게이트 조각 원장(시도·귀속·증거)')
+    .requiredOption('--version <v>', '조회할 판').option('--all', '과거 전이와 재시도까지 조회').option('--json', '결과 JSON')
+    .action((o: { version: string; all?: boolean; json?: boolean }) => {
+      const path = gateShardLedgerPath(o.version, releaseRunDeps.ledgerRoot ?? releaseLedgerRoot());
+      const ledger = readGateShardLedger(path);
+      if (!ledger) throw new CliUserError(`게이트 조각 원장 없음: ${o.version}`, '게이트가 시작되면 다시 조회하세요.');
+      const rows = o.all ? ledger.rows : latestGateShardLedger(ledger.rows);
+      if (o.json) console.log(JSON.stringify({ version: o.version, path, malformed: ledger.malformed, rows }));
+      else {
+        console.log(`${o.version} 조각 ${rows.length} · 읽지 못한 행 ${ledger.malformed} · ${path}`);
+        for (const row of rows) console.log(`${row.phase}/${row.shardId} ${row.state} ${row.host ?? '?'} rc=${row.rc ?? '?'} ${row.ran ?? '?'}시험 · 실패 ${row.failureIds?.length ?? '?'} · 귀속 ${row.attribution} · ${row.files.length}파일${row.stopReason ? ` · ${row.stopReason}` : ''}`);
+      }
+    });
   const schedule = release.command('schedule').description('판별 컷·착지 마감 조회·갱신');
   const scheduleLedgerRoot = () => releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();
   const ledgerFenceDeps = (): HqDeps => getElanousConfigDirOverride() && !hqDeps.store && !getUserConfig().hq?.arbiter
@@ -1298,10 +1312,13 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--gate-executor <pod|host>', '다시 도는 gate 의 실행기 전환(--from gate 이전만) — 런 입력에 기록 · 면제 아님')
     .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 저장된 런 입력 gateRemote)')
     .option('--gate-pod-pool <pool>', '다시 도는 gate 의 Pod 풀을 전환(--from gate 이전만) — 런 입력에 기록')
+    .option('--reroute-shard <pod-N|auto>', '같은 컷의 조각 한 개를 새로 측정하고 나머지 완전 영수증은 승계(--from gate)')
+    .option('--shard-host <pool-context>', '재지정 조각의 호스트 수동 지정(생략 시 가용 능력 기반 배치)')
+    .option('--shard-os <darwin|linux>', '재지정 pod-N 조각에 필요한 OS 능력')
     .option('--command-root <path>', '노드 명령을 실행할 컷 tip checkout(생략 시 현재 폴더)')
     .option('--dry-run', '재개 preflight만 수행하고 런·상태 원장·시도 횟수는 변경하지 않는다')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
+    .action(async (o: { run: string; from: string; partial?: boolean; waive?: string; reason?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         let acceptedRegressions: AcceptedRegression[] | undefined;
         if (o.acceptedRegressions !== undefined) {
@@ -1312,13 +1329,18 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             throw new Error('acceptedRegressions must be an array of {id, note}');
           }
         }
+        if (o.shardOs !== undefined && o.shardOs !== 'darwin' && o.shardOs !== 'linux') throw new Error('--shard-os must be darwin or linux');
+        const shardOs = o.shardOs as 'darwin' | 'linux' | undefined;
         const resumeOptions = { runId: o.run, from: o.from, partial: o.partial, commandRoot: o.commandRoot,
           ...(o.waive === undefined ? {} : { waive: o.waive }),
           ...(o.reason === undefined ? {} : { reason: o.reason }),
           ...(o.acceptedRegressions === undefined ? {} : { acceptedRegressions }),
           ...(o.gateExecutor === undefined ? {} : { gateExecutor: o.gateExecutor }),
           ...(o.gateHost === undefined ? {} : { gateHost: o.gateHost }),
-          ...(o.gatePodPool === undefined ? {} : { gatePodPool: o.gatePodPool }) };
+          ...(o.gatePodPool === undefined ? {} : { gatePodPool: o.gatePodPool }),
+          ...(o.rerouteShard === undefined ? {} : { rerouteShard: o.rerouteShard }),
+          ...(o.shardHost === undefined ? {} : { shardHost: o.shardHost }),
+          ...(shardOs === undefined ? {} : { shardOs }) };
         if (o.dryRun) {
           const plan = await planResumeReleaseRun(resumeOptions, { onSource: log });
           const gate = plan.gatePlan.mode === 'not-run' ? 'gate 실행 없음'
@@ -1427,12 +1449,36 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             return { recovery: 'planned', ...plan };
           }
           if (!mayWriteLedger('release rehearsal recovery', false, ledgerRoot)) throw new Error('release rehearsal recovery: ledger write denied');
-          const result = await resumeReleaseRun(resumeOptions, resumeDeps);
-          log(`· 리허설 복구 완료 · run ${o.recoveryRun} · ${result.state.status} · gate에서 재개`);
-          return { recovery: 'resumed', runId: o.recoveryRun, status: result.state.status, ...result };
+          const schedules = listSchedules(ledgerRoot);
+          if (schedules.length === 0) {
+            const resumed = await resumeReleaseRun(resumeOptions, resumeDeps);
+            log(`· 리허설 복구 완료 · run ${o.recoveryRun} · ${resumed.state.status} · gate에서 재개`);
+            return { recovery: 'resumed', runId: o.recoveryRun, status: resumed.state.status, ...resumed };
+          }
         }
         if (o.apply && !mayWriteLedger('release rehearsal tick', false, ledgerRoot)) throw new Error('release rehearsal tick: ledger write denied');
-        const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, shards: o.shards === undefined ? undefined : Number(o.shards), remote: o.remote, ledgerRoot }, rehearsalDeps);
+        const result = await runRehearsalTick({ apply: o.apply, checkout: o.checkout, shards: o.shards === undefined ? undefined : Number(o.shards), remote: o.remote, recoveryRun: o.recoveryRun, ledgerRoot }, {
+          ...rehearsalDeps,
+          resumeGate: rehearsalDeps.resumeGate ?? (async (runId, checkout) => {
+            const resumed = await resumeReleaseRun({ runId, from: 'gate', commandRoot: checkout }, resumeDeps);
+            const gate = resumed.state.nodes.find((node) => node.nodeId === 'gate');
+            if (typeof gate?.output !== 'string') throw new Error('release resume --from gate produced no gate output');
+            const outputLine = gate.output.split(/\r?\n/).filter((line) => line.trim().startsWith('{')).at(-1);
+            if (!outputLine) throw new Error('release resume --from gate produced no JSON output');
+            let parsed: Record<string, unknown>;
+            try { parsed = JSON.parse(outputLine) as Record<string, unknown>; }
+            catch { throw new Error('release resume --from gate produced invalid gate JSON'); }
+            const startedAt = Date.parse(gate?.startedAt ?? '');
+            const endedAt = Date.parse(gate?.endedAt ?? '');
+            const summary = parsed.partialSummary as { files?: unknown } | undefined;
+            if (!Number.isSafeInteger(summary?.files) || Number(summary!.files) < 0) throw new Error('release resume --from gate omitted measured partialSummary.files');
+            if (!Number.isFinite(startedAt) || !Number.isFinite(endedAt) || endedAt < startedAt) throw new Error('release resume --from gate omitted valid gate timestamps');
+            return { files: Number(summary!.files),
+              durationMs: endedAt - startedAt,
+              poolOverwriteApplied: (resumed.state.inputOverrides ?? []).some((item) => item.kind === 'gate-pod-pool'),
+              ok: resumed.state.status === 'done' && parsed.outcome === 'ok' };
+          }),
+        });
         log(`· 리허설 ${result.status}${'version' in result ? ` ${result.version}` : ''}${result.status === 'due' ? ` · 실행 ${result.run ?? '-'} · 건너뜀 ${result.supersede.join(', ') || '-'}` : ''}`);
         for (const stamp of result.stamps ?? []) {
           if (stamp.outcome === 'unmeasured' && !stamp.result && stamp.shardPlan && (stamp.shardPlan.testFiles === 0 || stamp.shardPlan.gatePlanShards === null))

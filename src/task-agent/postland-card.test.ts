@@ -4,6 +4,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { closeMergedTaskCard, reconcileHandMergedCard, type LandedTaskPr } from './postland-card.js';
+import { syncMergedPrChecklistWithFeedback } from '../release-loop/merged-pr-checklist.js';
+import { selectRelevantAuthoringLessons } from '../self-implement/knowhow-pack.js';
+import { recordFollowUpOnMerge, type FollowUpDraftRecord } from '../self-implement/follow-up-goals.js';
 import { executeLiveLand } from './live-moves.js';
 import { judgeLandedCell } from '../release-loop/landed-to-green.js';
 import { updateTaskCard, type TaskCard } from './task-hand.js';
@@ -33,6 +36,55 @@ function fixture(title: string) {
 }
 
 describe('TA postland cell and card closure', () => {
+  test('bound merged PR body reaches the postland feedback ledger', async () => {
+    const f = fixture('판정 신호: 조건=focused; 관측=bun test feature.test.ts; 기대=0 fail');
+    const prior = process.env.ELANOUS_STATE_DIR;
+    const runId = 'run-0123456789abcdef0123456789abcdef';
+    process.env.ELANOUS_STATE_DIR = f.dir;
+    try {
+      f.card.runId = runId;
+      f.card.goalId = 'CELL';
+      f.card.text = 'implement src/feature.ts';
+      writeFileSync(f.statePath, JSON.stringify({ tasks: { [f.card.id]: f.card } }));
+      const mergedPr = { ...pr, body: '칸: CELL\n\n## 구현이 밝힌 요구사항\n- preserve the feature boundary\n\n## 새 범위\n- src/feature.ts\n\n## 남은 것\n- add the follow-up test\n' };
+      const followUpDrafts: FollowUpDraftRecord[] = [];
+      const sync = () => syncMergedPrChecklistWithFeedback(79, f.dir, undefined, {
+        readPr: () => ({ ...mergedPr, title: 'feature merge', mergedAt: pr.mergedAt }),
+        versions: () => ['0.2.28'], checklist: f.deps.checklist,
+        setStatus: f.deps.setStatus,
+        candidateTaskCells: () => ['CELL'], boundTaskCells: () => ['CELL'],
+        closeTaskCard: (merged, cwd, options) => closeMergedTaskCard(merged, cwd, {
+          ...options, statePath: f.statePath, checklist: f.deps.checklist, setStatus: f.deps.setStatus, judge: () => 'proposed', log: () => {},
+        }),
+        feedbackStatePath: f.statePath,
+        feedbackFollowUp: (input) => recordFollowUpOnMerge(input, {
+          stateRoot: f.dir, mode: 'shadow', readDrafts: () => followUpDrafts,
+          appendDraft: (row) => { followUpDrafts.push(row); },
+        }),
+      });
+      const first = await sync();
+      const second = await sync();
+      const entries = readFileSync(join(f.dir, 'run-ledger', `${runId}.jsonl`), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      const feedback = entries.filter((entry) => entry.event === 'impl-findings-feedback');
+      expect(feedback).toHaveLength(1);
+      expect(feedback[0].data.requirements).toContain('preserve the feature boundary');
+      expect(feedback[0].data.paths).toContain('src/feature.ts');
+      expect(first?.appended).toBe(true);
+      expect(second?.appended).toBe(false);
+      expect(first?.authoringInjection).toContain('preserve the feature boundary');
+      expect(first?.followUp?.queued).toBe(false);
+      expect(first?.followUp?.draft).toContain('add the follow-up test');
+      expect(followUpDrafts).toHaveLength(1);
+      expect(f.read().postLand.outcome).toBe('complete');
+      expect(entries.find((entry) => entry.event === 'impl-findings-feedback')?.data.requirements).toContain('preserve the feature boundary');
+      expect(selectRelevantAuthoringLessons(f.dir, 'next task src/feature.ts', f.dir).prompt).toContain('preserve the feature boundary');
+    } finally {
+      if (prior === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = prior;
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
   test('goal-only merged PR cannot make the TA card or release cell green', () => {
     const f = fixture('판정 신호: 조건=focused; 관측=bun test feature.test.ts; 기대=0 fail');
     try {

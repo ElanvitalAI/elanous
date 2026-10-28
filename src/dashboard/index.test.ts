@@ -29,6 +29,8 @@ import {
   createEscAbortToolState,
   trackEscAbortToolCall,
   settleEscAbortToolCall,
+  cancelDelegatedToolOnEscape,
+  activeEscDelegatedPty,
   registerDashboardFinderAndHistoryKeys,
   activeDashboardTypeaheadSessionId,
   applyDashboardStreamingTypeaheadKey,
@@ -43,6 +45,7 @@ import {
 import { buildAdRunSetup } from '../ad-pipeline/ad-run-setup.js';
 import type { CommandRunner } from '../ad-pipeline/higgsfield-backend.js';
 import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.js';
+import { runDashboardChatMainPlainTurn, type DashboardChatMainPlainTurnRuntimeDeps } from './input/chat-main-plain-turn-runtime.js';
 import { HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
 import { toolSearchRuntime } from '../tool-runtime/tool-search-runtime.js';
 import { tuiSourceText } from '../../test/helpers/dashboard-source.js';
@@ -453,10 +456,37 @@ test.skipIf(!ptyAvailable())('classic PTY Ctrl+X c enters control mode from idle
       throw new Error(`control chord timeout: ${(await handle.renderScreen()).slice(-1000)}`);
     };
     await wait(async () => (await handle.renderScreen()).split('\n').some(line => line.trim() === '❯'));
+    // Isolated classic PTY scenario matrix: help and dispatch share the production slash registry.
+    handle.write('/term help\r');
+    await wait(async () => (await handle.renderScreen()).includes('/term help experimental'));
+    let screen = await handle.renderScreen();
+    expect(screen).toContain('Formal commands:');
+    for (const name of ['new', 'list', 'attach', 'detach', 'switch', 'kill', 'resume', 'snapshot']) {
+      expect(screen).toContain(`/term ${name}`);
+    }
+    expect(screen).not.toContain('/term matrix');
+    handle.write('/term help experimental\r');
+    await wait(async () => (await handle.renderScreen()).includes('Experimental commands'));
+    screen = await handle.renderScreen();
+    for (const name of ['matrix', 'move', 'group', 'channel', 'pipe', 'readonly', 'recharacter']) {
+      expect(screen).toContain(`/term ${name}`);
+    }
+    handle.write('/term list\r');
+    await wait(async () => (await handle.renderScreen()).includes('No terminal sessions.'));
+    handle.write('/term readonly\r');
+    await wait(async () => (await handle.renderScreen()).includes('Usage: /term readonly'));
+    handle.write('/term vw-bar\r');
+    await wait(async () => (await handle.renderScreen()).includes('/term vw-bar is retired'));
+    handle.write('/term vw-sync 7 hello\r');
+    await wait(async () => (await handle.renderScreen()).includes('/term vw-sync is retired'));
+    handle.write('/term move term:1 vw\r');
+    await wait(async () => (await handle.renderScreen()).includes('/term move <id> vw is retired'));
     handle.write('\x18c');
     await wait(async () => (await handle.renderScreen()).includes('-- CONTROL MODE — (via ^X c chord)'));
-    expect(await handle.renderScreen()).toContain('-- CONTROL MODE — (via ^X c chord)');
-    console.log('CONTROL_PTY Ctrl+X c control-mode=entered');
+    screen = await handle.renderScreen();
+    expect(screen).toContain('-- CONTROL MODE — (via ^X c chord)');
+    expect(screen.split('\n').filter(line => line.includes('❯')).at(-1)?.trim()).toBe('❯');
+    console.log('TERM_CONTROL_PTY formal=help,list experimental=help,readonly retired=vw-bar,vw-sync,move-vw control-mode=entered draft=empty');
   } finally {
     handle.kill(); unregisterPty(handle.id); server.stop(true); rmSync(root, { recursive: true, force: true });
   }
@@ -535,7 +565,7 @@ test.skipIf(!ptyAvailable())('legacy production log-search modal: same PTY direc
   }
 }, 100_000);
 
-test.skipIf(!ptyAvailable())('classic /mission dispatch records one private-safe usage event under default trail logging', async () => {
+test.skipIf(!ptyAvailable())('classic slash dispatch records one private-safe usage event under default trail logging', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dashboard-legacy-mission-usage-'));
   mkdirSync(join(root, 'state'), { recursive: true });
   const slashSecret = 'SENSITIVE_SLASH_ARGUMENT_527';
@@ -584,18 +614,18 @@ test.skipIf(!ptyAvailable())('classic /mission dispatch records one private-safe
     await wait(() => {
       const db = new Database(dbPath, { readonly: true });
       try {
-        events = db.query("select event, data, session_id from logs where category = 'tui.legacy-slash-use' order by id")
+        events = db.query("select event, data, session_id from logs where category = 'tui.slash-use' order by id")
           .all() as typeof events;
       } finally { db.close(); }
       return events.length >= 1;
     });
     expect(events).toHaveLength(1);
-    expect(events[0]!.event).toBe('mission');
+    expect(events[0]!.event).toBe('dispatch');
     const payload = JSON.parse(events[0]!.data ?? 'null') as Record<string, unknown>;
-    expect(payload.surface).toBe('classic');
-    expect(payload.tuiSession).toBeNull();
+    expect(payload).toMatchObject({ command: 'mission', alias: null, surface: 'classic' });
+    expect(typeof payload.runId).toBe('string');
     expect(typeof payload.tuiPid).toBe('number');
-    expect(Object.keys(payload).sort()).toEqual(['surface', 'tuiPid', 'tuiSession']);
+    expect(Object.keys(payload).sort()).toEqual(['alias', 'command', 'runId', 'surface', 'tuiPid']);
     expect(events[0]!.session_id).toBeNull();
     expect(JSON.stringify(events)).not.toContain(slashSecret);
     expect(JSON.stringify(events)).not.toContain(proseSecret);
@@ -809,6 +839,10 @@ describe('dashboard /loop wiring (index.ts production path)', () => {
     expect(ctxBlock).toContain('schedulerRef: dashboardLoopSchedulerRef');
     expect(ctxBlock).not.toContain('current: null');
 
+    const continueStart = dashboard.indexOf("if (slashOutcome.kind === 'continue') {", dispatchCall);
+    const continueBlock = dashboard.slice(continueStart, continueStart + 180);
+    expect(continueBlock).toMatch(/draw\(\);\s*continue;/);
+
     const registryDecl = dashboard.indexOf('const dashboardSlashRegistry = buildDashboardSlashRegistry();');
     expect(registryDecl).toBeGreaterThan(-1);
     expect(registryDecl).toBeLessThan(showStart);
@@ -923,6 +957,247 @@ test('ESC selects only one identified active SelfImplement call, never a stale o
   expect(activeEscHarnessSpace(calls, spaces)).toBeNull();
 });
 
+test.skipIf(!ptyAvailable())('TUI-LEGACY-STREAM-CANCEL-TERM: isolated --legacy Esc terminates a delegated long-running tool', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'legacy-stream-cancel-'));
+  const pidPath = join(root, 'child.pid');
+  const cli = process.env.ELANOUS_CANCEL_TEST_INSTALLED_CLI ?? join(repoRoot, 'bin/elanous.mjs');
+  const server = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    fetch(request) {
+      if (new URL(request.url).pathname === '/v1/models') return Response.json({ data: [{ id: 'cancel-test' }] });
+      if (new URL(request.url).pathname !== '/v1/chat/completions') return new Response('not found', { status: 404 });
+      const tool = { index: 0, id: 'cancel-sleep', type: 'function', function: { name: 'Bash',
+        arguments: JSON.stringify({ command: `echo $$ > ${pidPath}; exec sleep 60`, timeout: 90000, sandbox: 'off' }) } };
+      const data = JSON.stringify({ choices: [{ delta: { tool_calls: [tool] }, finish_reason: 'tool_calls' }] });
+      return new Response(`data: ${data}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true },
+    llm: { provider: 'local', model: 'cancel-test', baseUrl: `http://127.0.0.1:${server.port}/v1` },
+    mcp: { enabled: false }, skillRouter: { llmFallback: false },
+  }));
+  const env: Record<string, string> = { ...process.env as Record<string, string>, HOME: root,
+    NODE_ENV: 'development', ELANOUS_STATE_DIR: join(root, 'state'), TERM: 'xterm-256color' };
+  for (const key of ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR']) delete env[key];
+  const pty = startPty({ cmd: 'bun', args: [cli, `--test=${root}`, '--config-dir', root, '--legacy'],
+    workdir: repoRoot, cols: 120, rows: 30, env,
+    unsetEnv: ['ELANOUS_TEST_FAKE_LLM', 'XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR'] });
+  const deadline = Date.now() + 100_000;
+  const wait = async (predicate: () => Promise<boolean> | boolean) => {
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await Bun.sleep(100);
+    }
+    throw new Error(`installed legacy cancel timeout: ${(await pty.renderScreen()).slice(-800)}`);
+  };
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    await wait(async () => (await pty.renderScreen()).split('\n').some(line => line.trim() === '❯'));
+    pty.write('Run the Bash tool to run the requested command.\r');
+    await wait(() => existsSync(pidPath));
+    const pid = Number(readFileSync(pidPath, 'utf8').trim());
+    expect(pid).toBeGreaterThan(0);
+    expect(alive(pid)).toBe(true);
+    const before = await pty.renderScreen();
+    expect(before).toContain('Streaming Bash');
+    expect(before).not.toContain('⏹ 중단됨');
+    const beforeSnapshot = pty.snapshot();
+    pty.write('\x1b');
+    await wait(() => !alive(pid));
+    const exitedScreen = await pty.renderScreen();
+    await wait(async () => (await pty.renderScreen()).includes('⏹ 중단됨'));
+    const after = await pty.renderScreen();
+    const afterSnapshot = pty.snapshot();
+    expect(alive(pid)).toBe(false);
+    expect(after).toContain('⏹ 중단됨');
+    console.log(`INSTALLED_LEGACY_CANCEL pid=${pid} beforeAlive=true afterAlive=${alive(pid)} beforeScreen=${JSON.stringify(before)} exitConfirmedScreen=${JSON.stringify(exitedScreen)} afterScreen=${JSON.stringify(after)} beforePtySnapshot=${JSON.stringify(beforeSnapshot.slice(-1200))} afterPtySnapshot=${JSON.stringify(afterSnapshot.slice(-1200))}`);
+  } finally {
+    pty.kill(); unregisterPty(pty.id); server.stop(true); rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test.skipIf(!ptyAvailable())('TUI-LEGACY-STREAM-CANCEL-TERM: live delegated PTY pid exits before interruption', async () => {
+  const handle = startPty({ cmd: 'sleep', args: ['60'], cols: 80, rows: 24 });
+  const ctrl = new AbortController();
+  const lines: string[] = [];
+  const before = await handle.renderScreen();
+  try {
+    expect(handle.pid).toBeGreaterThan(0);
+    expect(handle.isAlive()).toBe(true);
+    const finished = cancelDelegatedToolOnEscape({
+      abortCtrl: ctrl,
+      child: handle,
+      waitForExit: async () => {
+        const deadline = Date.now() + 3_000;
+        while (handle.isAlive() && Date.now() < deadline) await Bun.sleep(25);
+        if (handle.isAlive()) throw new Error('PTY child termination timeout');
+      },
+      pushChatLine: line => { lines.push(line); },
+    });
+    expect(ctrl.signal.aborted).toBe(true);
+    expect(lines).not.toContain('  ⏹ 중단됨');
+    expect(await finished).toBe(true);
+    expect(handle.isAlive()).toBe(false);
+    expect(lines).toContain('  ⏹ 중단됨');
+    const after = await handle.renderScreen();
+    console.log(`DELEGATED_PTY pid=${handle.pid} beforeAlive=true afterAlive=${handle.isAlive()} beforeScreen=${JSON.stringify(before.slice(0, 120))} afterScreen=${JSON.stringify(after.slice(0, 120))} state=${lines.at(-1)}`);
+  } finally { handle.kill(); unregisterPty(handle.id); }
+}, 12_000);
+
+test('TUI-LEGACY-STREAM-CANCEL-TERM: Esc abort cannot complete plain turn before delegated exit acknowledgement', async () => {
+  const events: string[] = [];
+  let release!: () => void;
+  const exitAcknowledged = new Promise<void>(resolveExit => { release = resolveExit; });
+  let returned = false;
+  const turn = runDashboardChatMainPlainTurn({
+    userText: 'delegate', turnStartedAt: Date.now(),
+    attachChatStreamingKeys: (abortCtrl: AbortController) => {
+      abortCtrl.abort();
+      events.push('Esc:turnAbort');
+      return () => { events.push('keys-detached'); };
+    },
+    finalizeTurn: async (status: string) => {
+      events.push(`finalize:${status}`);
+      await exitAcknowledged;
+      events.push('child-exit-acknowledged');
+    },
+  } as unknown as DashboardChatMainPlainTurnRuntimeDeps).then(() => { returned = true; events.push('turn-returned'); });
+  try {
+    await Bun.sleep(0);
+    expect(events).toEqual(['Esc:turnAbort', 'keys-detached', 'finalize:interrupted']);
+    expect(returned).toBe(false);
+  } finally { release(); }
+  await turn;
+  expect(events).toEqual(['Esc:turnAbort', 'keys-detached', 'finalize:interrupted', 'child-exit-acknowledged', 'turn-returned']);
+});
+
+test('TUI-LEGACY-STREAM-CANCEL-TERM: plain turn awaits child termination finalizer before returning', async () => {
+  const events: string[] = [];
+  let release!: () => void;
+  const childExited = new Promise<void>(resolveExit => { release = resolveExit; });
+  const deps = {
+    userText: 'cancel',
+    intent: undefined,
+    turnStartedAt: Date.now(),
+    attachChatStreamingKeys: (ctrl: AbortController) => {
+      ctrl.abort();
+      events.push('turnAbort');
+      return () => { events.push('cleanup'); };
+    },
+    debugLog: () => {},
+    finalizeTurn: async (status: string) => {
+      events.push(`finalize:${status}`);
+      await childExited;
+      events.push('child-exited');
+    },
+  } as unknown as DashboardChatMainPlainTurnRuntimeDeps;
+  let returned = false;
+  const turn = runDashboardChatMainPlainTurn(deps).then(() => { returned = true; });
+  await Bun.sleep(0);
+  expect(events).toEqual(['turnAbort', 'cleanup', 'finalize:interrupted']);
+  expect(returned).toBe(false);
+  release();
+  await turn;
+  expect(events).toEqual(['turnAbort', 'cleanup', 'finalize:interrupted', 'child-exited']);
+  expect(returned).toBe(true);
+});
+
+test('TUI-LEGACY-STREAM-CANCEL-TERM: plain turn propagates termination-finalizer failure instead of returning success', async () => {
+  let rejectExit!: (reason: Error) => void;
+  const childExit = new Promise<void>((_resolve, reject) => { rejectExit = reject; });
+  const events: string[] = [];
+  const deps = {
+    userText: 'cancel',
+    turnStartedAt: Date.now(),
+    attachChatStreamingKeys: (ctrl: AbortController) => {
+      ctrl.abort();
+      events.push('turnAbort');
+      return () => { events.push('cleanup'); };
+    },
+    debugLog: () => {},
+    finalizeTurn: async (status: string) => {
+      events.push(`finalize:${status}`);
+      await childExit;
+    },
+  } as unknown as DashboardChatMainPlainTurnRuntimeDeps;
+  const turn = runDashboardChatMainPlainTurn(deps);
+  const outcome = turn.then(() => 'resolved', error => String(error));
+  await Bun.sleep(0);
+  expect(events).toEqual(['turnAbort', 'cleanup', 'finalize:interrupted']);
+  rejectExit(new Error('child termination timeout'));
+  expect(await outcome).toContain('child termination timeout');
+});
+
+test('TUI-LEGACY-STREAM-CANCEL-TERM: only the identified active delegated PTY is terminable', () => {
+  const calls = createEscAbortToolState();
+  const ids = new Map([['call-a', 'pty-a']]);
+  const child = { pid: 42, isAlive: () => true, kill: () => {} };
+  const get = (id: string) => id === 'pty-a' ? child : undefined;
+  expect(activeEscDelegatedPty(calls, ids, get)).toBeNull();
+  trackEscAbortToolCall(calls, { id: 'call-a', name: 'PtyShellPoll' });
+  expect(activeEscDelegatedPty(calls, ids, get)).toBe(child);
+  trackEscAbortToolCall(calls, { id: 'call-b', name: 'Read' });
+  expect(activeEscDelegatedPty(calls, ids, get)).toBeNull();
+  settleEscAbortToolCall(calls, { id: 'call-b' });
+  ids.clear();
+  expect(activeEscDelegatedPty(calls, ids, get)).toBeNull();
+});
+
+test('TUI-LEGACY-STREAM-CANCEL-TERM: Esc waits for delegated child termination before showing interruption', async () => {
+  const ctrl = new AbortController();
+  const lines: string[] = [];
+  const events: string[] = [];
+  let release!: () => void;
+  const exited = new Promise<void>(resolveExit => { release = resolveExit; });
+  let alive = true;
+  const confirmationLog = spyOn(debug, 'log');
+  const cancellation = cancelDelegatedToolOnEscape({
+    abortCtrl: ctrl,
+    child: { pid: 4321, isAlive: () => alive, kill: () => { events.push('SIGTERM'); } },
+    waitForExit: () => exited,
+    pushChatLine: line => { lines.push(line); events.push(line); },
+  });
+  expect(ctrl.signal.aborted).toBe(true);
+  expect(events).toEqual(['SIGTERM']);
+  expect(lines.join('\n')).not.toContain('중단됨');
+  alive = false;
+  release();
+  await cancellation;
+  expect(lines).toContain('  ⏹ 중단됨');
+  expect(confirmationLog.mock.calls.some(([category, event, data]) => category === 'dashboard.esc-child'
+    && event === 'termination-confirmed' && (data as { pid: number }).pid === 4321)).toBe(true);
+  confirmationLog.mockRestore();
+
+  const stillAliveLines: string[] = [];
+  const stillAliveLog = spyOn(debug, 'log');
+  try {
+    expect(await cancelDelegatedToolOnEscape({
+      abortCtrl: new AbortController(),
+      child: { pid: 4323, isAlive: () => true, kill: () => {} },
+      waitForExit: async () => {},
+      pushChatLine: line => { stillAliveLines.push(line); },
+    })).toBe(false);
+    expect(stillAliveLines.join('\n')).toContain('종료 실패');
+    expect(stillAliveLines.join('\n')).not.toContain('중단됨');
+    expect(stillAliveLog.mock.calls.some(([category, event, data]) => category === 'dashboard.esc-child'
+      && event === 'termination-failed' && JSON.stringify(data).includes('child still alive'))).toBe(true);
+  } finally { stillAliveLog.mockRestore(); }
+
+  const failureLines: string[] = [];
+  const log = spyOn(debug, 'log');
+  try {
+    await cancelDelegatedToolOnEscape({
+      abortCtrl: new AbortController(),
+      child: { pid: 4322, isAlive: () => true, kill: () => {} },
+      waitForExit: async () => { throw new Error('termination timeout'); },
+      pushChatLine: line => { failureLines.push(line); },
+    });
+    expect(failureLines.join('\n')).toContain('종료 실패');
+    expect(failureLines.join('\n')).not.toContain('중단됨');
+    expect(log.mock.calls.some(([category, event, data]) => category === 'dashboard.esc-child' && event === 'termination-failed' && JSON.stringify(data).includes('termination timeout'))).toBe(true);
+  } finally { log.mockRestore(); }
+});
+
 describe('dashboard tool dispatch signal observation', () => {
   test('records signal provenance on a separate category before the existing runtime dispatch call', () => {
     const helper = dashboard.slice(
@@ -935,7 +1210,7 @@ describe('dashboard tool dispatch signal observation', () => {
 
     const dispatchPrelude = dashboard.slice(
       dashboard.indexOf('const hasParentTurnAbortSignal = acpTurnRef.abortCtrl?.signal !== undefined;'),
-      dashboard.indexOf('const result = await dispatchDashboardSessionRuntimeTool(name, args, {'),
+      dashboard.indexOf('const dispatchPromise = dispatchDashboardSessionRuntimeTool(name, args, {'),
     );
     expect(dispatchPrelude).toContain('observeDashboardToolDispatchSignal({');
     expect(dispatchPrelude).toContain('toolName: name');
@@ -943,14 +1218,17 @@ describe('dashboard tool dispatch signal observation', () => {
     expect(dispatchPrelude).toContain("signalSource: hasParentTurnAbortSignal ? 'parent-turn' : 'fallback'");
     expect(dispatchPrelude).toContain('hasParentTurnAbortSignal');
     expect(dashboard).toContain('toolCallId: ctx?.callId,');
-    expect(dispatchPrelude).toContain('signalAlreadyAborted: (acpTurnRef.abortCtrl?.signal ?? new AbortController().signal).aborted');
+    expect(dispatchPrelude).toContain('const turnSignal = acpTurnRef.abortCtrl?.signal ?? new AbortController().signal');
+    expect(dispatchPrelude).toContain('signalAlreadyAborted: turnSignal.aborted');
   });
 
   test('preserves the signal value passed to dispatchDashboardSessionRuntimeTool', () => {
     const callSite = dashboard.slice(
-      dashboard.indexOf('await dispatchDashboardSessionRuntimeTool(name, args, {'),
-    ).slice(0, 900);
-    expect(callSite).toContain('signal: acpTurnRef.abortCtrl?.signal ?? new AbortController().signal');
+      dashboard.indexOf('const dispatchPromise = dispatchDashboardSessionRuntimeTool(name, args, {'),
+      dashboard.indexOf('const result = await dispatchPromise;'),
+    );
+    expect(callSite).toContain('signal: turnSignal,');
+    expect(callSite).toContain('signal: hasParentTurnAbortSignal ? turnSignal : undefined,');
   });
 
   test('forwards the current turn signal into the nested tool runtime context', () => {
@@ -960,9 +1238,30 @@ describe('dashboard tool dispatch signal observation', () => {
     expect(dispatchClosure).toContain('runtime.dispatchToolByName(toolName, input, {');
     expect(dispatchClosure).toContain("surface: 'tui'");
     expect(dispatchClosure).toContain('toolCallId,');
-    expect(dispatchClosure).toContain('signal: acpTurnRef.abortCtrl?.signal');
+    expect(dispatchClosure).toContain('signal: hasParentTurnAbortSignal ? turnSignal : undefined');
     expect(dispatchClosure).toContain('agentHostTools: acpTurnToolSpecs');
     expect(dispatchClosure).toContain('agentDispatchTool: (childName, childArgs) =>');
+  });
+
+  test('preserves the original turn AbortSignal at the delegated runtime boundary', async () => {
+    const ctrl = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    const runtime = makeProbeRuntime((signal) => { observedSignal = signal; });
+    const result = await dispatchDashboardSessionRuntimeTool('DashboardSignalProbe', {}, {
+      turnRefUserText: null,
+      signal: ctrl.signal,
+      muted: (line) => line,
+      pushChatLine: () => {},
+      draw: () => {},
+      getToolRuntime: (name) => name === 'DashboardSignalProbe' ? runtime : undefined,
+      dispatchToolRuntime: async (_name, input) => runtime.run(input, { surface: 'tui', signal: ctrl.signal }),
+      dispatchPluginTool: async () => ({ ok: false, error: 'plugin fallback must not run' }),
+      ptyDashboardOn: true,
+    });
+    expect(result).toEqual({ output: 'probe-ok' });
+    expect(observedSignal).toBe(ctrl.signal);
+    ctrl.abort();
+    expect(observedSignal?.aborted).toBe(true);
   });
 
   test('keeps the nested tool runtime signal optional through the production dispatch path', async () => {

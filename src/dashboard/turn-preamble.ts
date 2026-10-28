@@ -209,6 +209,8 @@ function buildDashboardTurnPreambleUnmeasured(
     gitSnapshotStaleMs: DASHBOARD_GIT_SNAPSHOT_STALE_MS,
   }));
   const turnProfile = ctx.turnProfile;
+  // Keep the synchronous preamble on the already-resolved surface. Shared
+  // research-intent routing and Bloom evidence guidance are added by core-turn.
   const researchTurn = turnProfile?.surface.id === 'research/agent';
   const surfaceSystemMsgs = turnProfile
     ? timed(builderMs, 'surface', () => buildSessionRuntimeTurnSystemMessages(turnProfile, ctx.userText))

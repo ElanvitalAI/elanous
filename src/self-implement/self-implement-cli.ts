@@ -23,6 +23,8 @@ import { readDecomposeProposals } from '../self-dev/decompose-proposal.js';
 
 /** self implement CLI 옵션(commander) — `--no-draft` 는 draft:false 로, `--max-wait` 는 문자열로 도착. */
 export interface SelfImplementCliOpts {
+  /** Managed tool dispatch cancellation signal, forwarded through the pipeline to the active implementation child. */
+  signal?: AbortSignal;
   base?: string;
   draft?: boolean;
   openPr?: boolean;
@@ -228,8 +230,8 @@ export async function runSelfImplementCliCommand(
       entry: opts.entry ?? 'external-verbatim', // CLI = 외부 창구(외부가 프롬프트 엔지니어 → verbatim 존중)
     });
     spec.entrance = opts.naturalLanguageDispatch ? 'nl-self-implement' : 'cli-self-implement';
-    const pipelineDeps = opts.approver || opts.progress
-      ? { ...deps.pipelineDeps, ...(opts.approver ? { approver: opts.approver } : {}), ...(opts.progress ? { progress: opts.progress } : {}) }
+    const pipelineDeps = opts.approver || opts.progress || opts.signal
+      ? { ...deps.pipelineDeps, ...(opts.approver ? { approver: opts.approver } : {}), ...(opts.progress ? { progress: opts.progress } : {}), ...(opts.signal ? { signal: opts.signal } : {}) }
       : deps.pipelineDeps;
     const exec = deps.executeReroute ?? executeSelfImplementReroute;
     let { result, exitCode } = await exec(spec, pipelineDeps ? { pipelineDeps } : undefined);

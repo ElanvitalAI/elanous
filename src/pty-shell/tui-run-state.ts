@@ -27,7 +27,7 @@ import {
   versionedDashboardInstallDir,
 } from './stale-install-check.js';
 import {
-  updatePtyManifestBuild, updatePtyManifestTurn,
+  updatePtyManifestAbortRequested, updatePtyManifestBuild, updatePtyManifestProgress, updatePtyManifestTurn,
   type PtyBuildIdentity, type PtyManifestRow, type PtyTurnState,
 } from './pty-manifest.js';
 
@@ -231,6 +231,10 @@ export type PtyTurnView = PtyTurnState | 'unknown';
 export interface PtyRunStateView {
   readonly turn: PtyTurnView;
   readonly turnAt?: number;
+  /** 마지막 진전 시각(SURVIVAL-PROGRESS-CLOCK) — 기록 없는 행·옛 판은 undefined. */
+  readonly progressAt?: number;
+  /** Esc 로 턴 중단을 청한 시각 — 이 뒤로 busy 가 지속되면 abort-ignored 판정 재료. */
+  readonly abortRequestedAt?: number;
   readonly build: PtyBuildIdentity | null;
   readonly installed: string | null;
   readonly stale: boolean | null;
@@ -244,7 +248,7 @@ export interface DescribeRunStateDeps {
 
 /** manifest 행 하나의 턴 ⊕ 판 ⊕ stale. 행이 없거나 죽었으면 턴은 unknown. */
 export function describePtyRunState(
-  row: Pick<PtyManifestRow, 'alive' | 'startedAt' | 'kind' | 'turnState' | 'turnAt' | 'build'> | null,
+  row: Pick<PtyManifestRow, 'alive' | 'startedAt' | 'kind' | 'turnState' | 'turnAt' | 'progressAt' | 'abortRequestedAt' | 'build'> | null,
   deps: DescribeRunStateDeps = {},
 ): PtyRunStateView {
   let installed: InstalledRecord = {};
@@ -265,6 +269,8 @@ export function describePtyRunState(
   const turnView = ptyTurnViewOfRow(row);
   return {
     ...turnView,
+    ...(row?.alive && row.progressAt !== undefined ? { progressAt: row.progressAt } : {}),
+    ...(row?.alive && row.abortRequestedAt !== undefined ? { abortRequestedAt: row.abortRequestedAt } : {}),
     build: build ?? null,
     installed: installed.sha ?? null,
     stale: staleness.stale,
@@ -446,6 +452,50 @@ export const spawnTuiRelaunch = (sessionId: string): Promise<void> => {
   });
 };
 
+// ── SURVIVAL-PROGRESS-CLOCK — «마지막 진전 시각»로 느림·정체·Esc 무시를 가른다 ──
+//
+// `turnAt` 은 턴 값이 «바뀔 때만» 적히므로 busy 경과만으로는 «일하는 중»인지 «죽었다»인지를 못 가른다.
+// 진전 신호(스트림 텍스트·도구 시작/끝·상태 줄)가 `progress_at` 를 계속 올리면 긴 턴도 «느리지만 가는 중»이
+// 되고, 진전이 끊기면 «정체», Esc 청구 뒤에도 busy 가 지속되면 «Esc 무시»로 판정한다.
+
+export const DEFAULT_TURN_STALL_MS = 12 * 60 * 1000;
+export const DEFAULT_SLOW_TURN_MS = 20 * 60 * 1000;
+export const DEFAULT_ABORT_IGNORE_MS = 30 * 1000;
+
+export type TurnProgressJudgment = 'progressing' | 'slow' | 'stalled' | 'abort-ignored' | 'unknown';
+
+export interface TurnProgressInput {
+  readonly turn: PtyTurnView;
+  readonly turnAt?: number;
+  readonly progressAt?: number;
+  readonly abortRequestedAt?: number;
+  readonly now: number;
+  /** 정체 임계 — 진전이 이만큼 끊기면 stalled. 기본 12분. */
+  readonly stallMs?: number;
+  /** 느린 턴 임계 — 턴 경과가 이만큼이면 slow. 기본 20분. */
+  readonly slowTurnMs?: number;
+  /** Esc 무시 임계 — 청구 뒤 이만큼 busy 면 abort-ignored. 기본 30초. */
+  readonly abortIgnoreMs?: number;
+}
+
+/** 순수 판정: busy 턴의 진전·정체·Esc 무시를 임계로 가른다. 재료가 없으면 unknown(«괜찮다»가 아니다). */
+export function judgeTurnProgress(input: TurnProgressInput): TurnProgressJudgment {
+  const { turn, turnAt, progressAt, abortRequestedAt, now } = input;
+  if (turn !== 'busy') return 'unknown';
+  if (!Number.isFinite(now)) return 'unknown';
+  // Esc 청구 뒤에도 busy 가 지속되면 무시 — 정체보다 구체적이므로 먼저 가른다.
+  if (abortRequestedAt !== undefined && Number.isFinite(abortRequestedAt)) {
+    if (now - abortRequestedAt >= (input.abortIgnoreMs ?? DEFAULT_ABORT_IGNORE_MS)) return 'abort-ignored';
+  }
+  // 진전 시각이 없으면 턴 시작(turnAt)이 진전의 0초다.
+  const since = progressAt !== undefined && Number.isFinite(progressAt) ? progressAt : turnAt;
+  if (since === undefined || !Number.isFinite(since)) return 'unknown';
+  const elapsed = Math.max(0, now - since);
+  if (elapsed >= (input.stallMs ?? DEFAULT_TURN_STALL_MS)) return 'stalled';
+  if (turnAt !== undefined && Number.isFinite(turnAt) && now - turnAt >= (input.slowTurnMs ?? DEFAULT_SLOW_TURN_MS)) return 'slow';
+  return 'progressing';
+}
+
 // ── 기록(TUI) ──
 
 export interface TuiRunStateRecorderDeps {
@@ -453,6 +503,10 @@ export interface TuiRunStateRecorderDeps {
   readonly build?: () => PtyBuildIdentity;
   readonly writeBuild?: (id: string, build: PtyBuildIdentity) => boolean;
   readonly writeTurn?: (id: string, turn: PtyTurnState, at: number) => boolean;
+  /** 진전 시각 기록 — 생략하면 `updatePtyManifestProgress`(같은 행 5초 스로틀). */
+  readonly writeProgress?: (id: string, at: number) => boolean;
+  /** Esc 청구 시각 기록 — 생략하면 `updatePtyManifestAbortRequested`. */
+  readonly writeAbortRequested?: (id: string, at: number) => boolean;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
   /**
    * herdr pane 신고기. 생략 시: `writeTurn` 을 주입하지 않은 기본 녹음기만
@@ -476,6 +530,8 @@ interface ActiveRecorder {
   readonly surfaceId: string;
   readonly now: () => number;
   readonly writeTurn: (id: string, turn: PtyTurnState, at: number) => boolean;
+  readonly writeProgress: (id: string, at: number) => boolean;
+  readonly writeAbortRequested: (id: string, at: number) => boolean;
   readonly log: (event: string, data: Record<string, unknown>) => void;
   readonly herdr: HerdrAgentReporterLike | null;
   /** manifest 에 실제로 적힌 마지막 턴. 실패면 안 바뀐다(재시도). */
@@ -495,6 +551,8 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
   const now = deps.now ?? Date.now;
   const log = deps.log ?? defaultLog;
   const writeTurn = deps.writeTurn ?? updatePtyManifestTurn;
+  const writeProgress = deps.writeProgress ?? updatePtyManifestProgress;
+  const writeAbortRequested = deps.writeAbortRequested ?? updatePtyManifestAbortRequested;
   // 기본 신고기는 기본 manifest 쓰기와 짝일 때만. writeTurn 주입(시험)은 herdr 를 안 만든다.
   const herdr = deps.herdr !== undefined
     ? deps.herdr
@@ -508,7 +566,7 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
     log(ok ? 'build-recorded' : 'build-write-failed', { ptyId: surfaceId, sha: build.sha, version: build.version, source: build.source });
   }
   // 기동 순서: 판 → manifest 초기 idle → herdr 신고. herdr start 가 idle 을 신고하므로 초기 idle 을 turn 으로 다시 안 보낸다.
-  const recorder: ActiveRecorder = { surfaceId, now, writeTurn, log, herdr, herdrLast: herdr ? 'idle' : undefined };
+  const recorder: ActiveRecorder = { surfaceId, now, writeTurn, writeProgress, writeAbortRequested, log, herdr, herdrLast: herdr ? 'idle' : undefined };
   active = recorder;
   writeTurnState(recorder, 'idle');
   if (herdr) { try { herdr.start(); } catch { /* 신고 실패가 녹음기를 깨지 않는다 */ } }
@@ -612,6 +670,25 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
 export function reportTuiTurn(turn: PtyTurnState): void {
   if (!active || active.last === turn) return;
   writeTurnState(active, turn);
+}
+
+/** 진전 신호(스트림 텍스트·도구 시작/끝·상태 줄)에서 부른다 — 마지막 진전 시각을 올린다. 녹음기가 없으면 아무것도 안 한다. */
+export function reportTuiProgress(): void {
+  if (!active) return;
+  const at = active.now();
+  let ok = false;
+  try { ok = active.writeProgress(active.surfaceId, at); } catch { ok = false; }
+  // 실패(0행·예외)는 관측으로만 남긴다 — 진전 기록이 턴을 막지 않는다. 스로틀 생략(false 아님 실패만)은 조용히 지나간다.
+  if (!ok) active.log('progress-write-failed', { ptyId: active.surfaceId, at });
+}
+
+/** Esc 게이트가 턴 중단을 청할 때 부른다 — 청구 시각을 남긴다(busy 가 지속되면 abort-ignored 판정 재료). */
+export function reportTuiAbortRequested(): void {
+  if (!active) return;
+  const at = active.now();
+  let ok = false;
+  try { ok = active.writeAbortRequested(active.surfaceId, at); } catch { ok = false; }
+  if (!ok) active.log('abort-requested-write-failed', { ptyId: active.surfaceId, at });
 }
 
 function writeTurnState(recorder: ActiveRecorder, turn: PtyTurnState): void {

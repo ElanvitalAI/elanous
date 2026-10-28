@@ -95,6 +95,10 @@ test('submitting a masked token clears its input and renders the bot name and re
   expect(calls).toEqual([{ platform: 'telegram', token: 'private-token', allowedUsers: ['19'] }]);
   expect(input().props.value).toBe('');
   const text = JSON.stringify(tree!.toJSON());
+  expect(tree!.root.findByProps({ 'data-testid': 'channel-publish-stages-help-telegram' }).children.join(''))
+    .toContain('현재 상태 미표시');
+  expect(tree!.root.findByProps({ 'data-testid': 'channel-publish-stages-help-telegram' }).children.join(''))
+    .toContain('대기열 단계 안내');
   expect(tree!.root.findAllByType('p').map(node => node.children.join(''))).toContain('봇 이름: test_bot');
   expect(text).toContain('봇을 재시작해야 반영됩니다');
   expect(text).not.toContain('private-token');

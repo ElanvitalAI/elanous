@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireSlot, defaultInterference, needsPwaBuild, provideCheckoutDependencies, runHostRegate, typecheckGateTouchesPwa, type HostRegateDeps } from './host-regate.js';
+import { computeReceiptKey, gateEnvFingerprint, gateLockfileHash, GATE_RECEIPT_SCHEMA, loadGateReceipts, saveGateReceipt, type GateReceipt, type GateReceiptIdentity } from './gate-receipt-registry.js';
 import { regateFailureFacts } from './regate-detail.js';
 import { MAX_INSPECTED_TEST_FILES } from '../../scripts/ci-test-interference-gate.js';
 import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
@@ -305,7 +306,7 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(existsSync(tree)).toBe(false);
       expect(git('worktree', 'list', '--porcelain')).not.toContain(tree);
     } finally { rmSync(d, { recursive: true, force: true }); }
-  });
+  }, 60_000); // 실물 git worktree — 기본 5초를 넘는다
 
   test('a competing real Git fetch between PR fetch and verification cannot replace checked head', async () => {
     const d = mkdtempSync(join(tmpdir(), 'host-regate-fetch-race-'));
@@ -352,7 +353,7 @@ describe('host regate: never merge without a measured host pass', () => {
       expect(result.failures[0]?.step).toBe('test-interference');
       expect(git('for-each-ref', '--format=%(refname)', 'refs/elanous/regate')).toBe('');
     } finally { rmSync(d, { recursive: true, force: true }); }
-  });
+  }, 60_000); // 실물 git fetch 경합 — 기본 5초를 넘는다
 
   test('a warm locked slot checks out base without worktree add and cleans after a failed gate while preserving caches', async () => {
     const root = mkdtempSync(join(tmpdir(), 'host-regate-warm-'));
@@ -760,7 +761,7 @@ describe('host regate: never merge without a measured host pass', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 60_000); // 실물 파일 재설치 — 기본 5초를 넘는다
 
   test('a pre-existing empty candidate node_modules is replaced by the installed source link', () => {
     const root = mkdtempSync(join(tmpdir(), 'host-regate-empty-candidate-'));
@@ -1736,5 +1737,282 @@ describe('host regate interference: changed sources select reverse importers bef
         changed: 1, importers: 0, neighbors: 1, trimmed: 0, observation: 'importer 못 셌다',
       }));
     } finally { logged.mockRestore(); }
+  });
+});
+
+describe('GATE-ONCE-PER-HEAD: host regate inherits only an exact-match passed receipt (OP 10-27 23:0x 지시)', () => {
+  interface ReceiptStageOpts { head?: string; base?: string; env?: NodeJS.ProcessEnv; lockfile?: string | null; bunVersion?: string }
+  interface ReceiptStage { deps: HostRegateDeps; calls: string[]; interferenceRuns: () => number; root: string }
+  const defaultLockfile = '# lock v1\n';
+
+  /** L1 무대: 주입 command 스파이 ⊕ 임시 후보 워크트리 ⊕ 지속 등록부 경로 — 외부 PR·실제 착지 없음. */
+  function receiptStage(registryPath: string, opts: ReceiptStageOpts = {}): ReceiptStage {
+    const head = opts.head ?? HEAD;
+    const base = opts.base ?? BASE;
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-receipt-'));
+    const worktree = join(root, 'candidate');
+    const view = JSON.stringify({ headRefOid: head, baseRefName: 'main', baseRefOid: base, state: 'OPEN', isDraft: false });
+    const calls: string[] = [];
+    let interferenceRuns = 0;
+    const deps: HostRegateDeps = {
+      command: (bin, args) => {
+        const call = `${bin} ${args.join(' ')}`;
+        calls.push(call);
+        if (call.startsWith(`git worktree add --detach ${worktree} `)) {
+          mkdirSync(join(worktree, 'apps/pwa/node_modules/next'), { recursive: true });
+          writeFileSync(join(worktree, 'apps/pwa/node_modules/next/package.json'), '{}');
+          if (opts.lockfile !== null) writeFileSync(join(worktree, 'bun.lock'), opts.lockfile ?? defaultLockfile);
+        }
+        if (call === 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: view, stderr: '' };
+        if (call === 'bun --version') return { status: 0, stdout: opts.bunVersion ?? '1.4.2\n', stderr: '' };
+        if (call === 'git rev-parse HEAD') return { status: 0, stdout: base, stderr: '' };
+        if (call === 'git rev-parse HEAD^1') return { status: 0, stdout: base, stderr: '' };
+        if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: head, stderr: '' };
+        if (/^git rev-parse refs\/elanous\/regate\/[^ ]+\/base$/.test(call)) return { status: 0, stdout: base, stderr: '' };
+        if (/^git rev-parse refs\/elanous\/regate\/[^ ]+\/head$/.test(call)) return { status: 0, stdout: head, stderr: '' };
+        if (call === `git merge-base ${base} ${head}`) return { status: 0, stdout: MERGE_BASE, stderr: '' };
+        if (call === `git diff --name-only ${MERGE_BASE} ${head}`) return { status: 0, stdout: 'src/feature.test.ts\n', stderr: '' };
+        if (call === `git diff --find-renames --name-status -z ${MERGE_BASE} ${head}`) return { status: 0, stdout: 'M\0src/feature.test.ts\0', stderr: '' };
+        if (call === 'gh pr view 42 --json state,mergeCommit') return { status: 0, stdout: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: SQUASH } }), stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      acquire: async () => Object.assign(() => {}, { worktree }),
+      interference: async () => { interferenceRuns += 1; return { passed: true }; },
+      log: () => {},
+      prodFreezeRoot: testFreezeRoot,
+      gateReceiptPath: registryPath,
+      ...(opts.env ? { gateReceiptEnv: opts.env } : {}),
+    };
+    return { deps, calls, interferenceRuns: () => interferenceRuns, root };
+  }
+
+  /** 이 무대의 runHostRegate 가 계산할 측정 정체 — 손으로 영수증을 심는 갈래가 쓴다. */
+  function stageIdentity(opts: ReceiptStageOpts = {}): GateReceiptIdentity {
+    const lockRoot = mkdtempSync(join(tmpdir(), 'gate-receipt-lockfile-'));
+    let lockfileHash = 'absent';
+    try {
+      const lockfile = opts.lockfile === undefined ? defaultLockfile : opts.lockfile;
+      if (lockfile !== null) {
+        writeFileSync(join(lockRoot, 'bun.lock'), lockfile);
+        lockfileHash = gateLockfileHash(lockRoot);
+      }
+    } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+    return {
+      headCommit: opts.head ?? HEAD,
+      baseCommit: opts.base ?? BASE,
+      bunVersion: opts.bunVersion?.trim() ?? '1.4.2',
+      lockfileHash,
+      radiusFiles: ['src/feature.test.ts'],
+      checks: ['isolation-gate', 'nexus-build', 'test-interference:with-neighbours', `typecheck@${MERGE_BASE}`],
+      envFingerprint: gateEnvFingerprint(opts.env ?? process.env),
+    };
+  }
+
+  const seeded = (registryPath: string, rowIdentity: GateReceiptIdentity, verdict: GateReceipt['verdict']) => {
+    saveGateReceipt(registryPath, {
+      ...rowIdentity,
+      schema: GATE_RECEIPT_SCHEMA,
+      key: computeReceiptKey(rowIdentity, verdict),
+      verdict,
+      savedAt: '2026-10-27T23:27:00.000Z',
+    });
+  };
+
+  test('GATE-ONCE-PER-HEAD: 통과 영수증을 지속 등록부에 원자적으로 기록한다 (OP 10-27 23:0x 지시)', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'host-regate-receipt-once-'));
+    const registryPath = join(registryRoot, 'gate-receipts.json');
+    const first = receiptStage(registryPath);
+    const second = receiptStage(registryPath);
+    try {
+      const firstResult = await runHostRegate({ ...input, noMerge: true }, first.deps);
+      expect(firstResult).toMatchObject({ passed: true, status: 'passed' });
+      expect(first.interferenceRuns()).toBe(1);
+      const registry = loadGateReceipts(registryPath);
+      expect(Object.keys(registry)).toHaveLength(1);
+      const [receipt] = Object.values(registry);
+      expect(receipt).toMatchObject({ schema: 1, verdict: 'passed', headCommit: HEAD, baseCommit: BASE, bunVersion: '1.4.2', radiusFiles: ['src/feature.test.ts'] });
+      expect(receipt!.checks).toContain('test-interference:with-neighbours');
+      expect(receipt!.checks).toContain('nexus-build');
+      expect(receipt!.envFingerprint).toBe(stageIdentity().envFingerprint);
+      expect(computeReceiptKey(receipt!, 'passed')).toBe(receipt!.key);
+
+      const logged = spyOn(debug, 'log');
+      try {
+        const secondResult = await runHostRegate({ ...input, noMerge: true }, second.deps);
+        expect(secondResult).toEqual(firstResult);
+        // 동일 통합 입력의 둘째 호출 — 대상 시험 실행 횟수는 0.
+        expect(second.interferenceRuns()).toBe(0);
+        expect(second.calls).not.toContain('bun scripts/ci-typecheck-changed.ts');
+        expect(second.calls).not.toContain('bun scripts/ci-isolation-hardcode-gate.ts --changed-files src/feature.test.ts');
+        expect(second.calls).not.toContain('bun bin/elanous.mjs --test nexus build');
+        // 입장 검사는 건너뛰지 않는다 — PR 재검증과 통합 후보 구성이 그대로 돈다.
+        expect(second.calls.filter((call) => call === 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft')).toHaveLength(2);
+        expect(second.calls).toContain(`git merge --no-ff --no-commit ${HEAD}`);
+        // 승계 사건이 debug.log 에 남는다.
+        expect(logged).toHaveBeenCalledWith('harness.host-regate', 'gate-receipt-reuse', expect.objectContaining({ pr: 42, key: receipt!.key }));
+      } finally { logged.mockRestore(); }
+      // 승계 호출 뒤에도 등록부는 온전하다.
+      expect(Object.keys(loadGateReceipts(registryPath))).toHaveLength(1);
+    } finally {
+      rmSync(first.root, { recursive: true, force: true });
+      rmSync(second.root, { recursive: true, force: true });
+      rmSync(registryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('bun --version 이 성공했어도 빈 출력이면 영수증 승계를 거부하고 원래 검사를 실행한다', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'host-regate-receipt-no-bun-version-'));
+    const registryPath = join(registryRoot, 'gate-receipts.json');
+    const seed = receiptStage(registryPath);
+    const blank = receiptStage(registryPath, { bunVersion: ' \n' });
+    const logged = spyOn(debug, 'log');
+    try {
+      expect((await runHostRegate({ ...input, noMerge: true }, seed.deps)).passed).toBe(true);
+      expect((await runHostRegate({ ...input, noMerge: true }, blank.deps)).passed).toBe(true);
+      expect(blank.interferenceRuns()).toBe(1);
+      expect(blank.calls).toContain('bun scripts/ci-isolation-hardcode-gate.ts --changed-files src/feature.test.ts');
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'gate-receipt-decline', expect.objectContaining({ pr: 42, reason: 'bun version unavailable' }));
+      expect(Object.keys(loadGateReceipts(registryPath))).toHaveLength(1);
+    } finally {
+      logged.mockRestore();
+      rmSync(seed.root, { recursive: true, force: true });
+      rmSync(blank.root, { recursive: true, force: true });
+      rmSync(registryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('원본 영수증 없이 통과 판정 금지 — 등록부가 비면 원래 검사가 판정을 만든다', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'host-regate-receipt-empty-'));
+    const registryPath = join(registryRoot, 'gate-receipts.json');
+    const stage = receiptStage(registryPath);
+    const logged = spyOn(debug, 'log');
+    try {
+      stage.deps.interference = async () => ({ passed: false, detail: 'no receipt — the real check decides' });
+      const result = await runHostRegate({ ...input, noMerge: true }, stage.deps);
+      expect(result).toMatchObject({ passed: false, failures: [{ step: 'test-interference', detail: 'no receipt — the real check decides' }] });
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'gate-receipt-decline', expect.objectContaining({ pr: 42, reason: 'gate receipt registry empty' }));
+      expect(Object.keys(loadGateReceipts(registryPath))).toHaveLength(0);
+    } finally {
+      logged.mockRestore();
+      rmSync(stage.root, { recursive: true, force: true });
+      rmSync(registryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ['head drift', { head: 'f'.repeat(40) }, 'no receipt for head'],
+    ['base drift', { base: 'e'.repeat(40) }, 'no receipt for head'],
+    ['env drift', { env: { ...process.env, ELANOUS_TEST_FAKE_LLM: process.env.ELANOUS_TEST_FAKE_LLM === '0' ? '1' : '0' } }, 'env fingerprint differs'],
+    ['lockfile drift', { lockfile: '# lock v2\n' }, 'bun/lockfile differs'],
+  ])('%s 는 승계하지 않고 원래 검사를 다시 실행한다', async (_name, drift, reason) => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'host-regate-receipt-drift-'));
+    const registryPath = join(registryRoot, 'gate-receipts.json');
+    const seed = receiptStage(registryPath);
+    const drifted = receiptStage(registryPath, drift as ReceiptStageOpts);
+    const logged = spyOn(debug, 'log');
+    try {
+      expect((await runHostRegate({ ...input, noMerge: true }, seed.deps)).passed).toBe(true);
+      expect(seed.interferenceRuns()).toBe(1);
+      const driftedHead = (drift as ReceiptStageOpts).head ?? HEAD;
+      expect((await runHostRegate({ ...input, headCommit: driftedHead, noMerge: true }, drifted.deps)).passed).toBe(true);
+      expect(drifted.interferenceRuns()).toBe(1);
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'gate-receipt-decline', expect.objectContaining({ pr: 42, reason: expect.stringContaining(reason) }));
+    } finally {
+      logged.mockRestore();
+      rmSync(seed.root, { recursive: true, force: true });
+      rmSync(drifted.root, { recursive: true, force: true });
+      rmSync(registryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('failed/unmeasured 영수증은 승계하지 않고 원래 검사를 실행한다', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'host-regate-receipt-failed-'));
+    const registryPath = join(registryRoot, 'gate-receipts.json');
+    const stage = receiptStage(registryPath);
+    const logged = spyOn(debug, 'log');
+    try {
+      seeded(registryPath, stageIdentity(), 'failed');
+      seeded(registryPath, stageIdentity(), 'unmeasured');
+      const result = await runHostRegate({ ...input, noMerge: true }, stage.deps);
+      expect(result).toMatchObject({ passed: true, status: 'passed' });
+      expect(stage.interferenceRuns()).toBe(1);
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'gate-receipt-decline', expect.objectContaining({ pr: 42, reason: expect.stringContaining('verdict=') }));
+      // 원래 검사가 통과했으므로 통과 영수증이 추가로 남는다.
+      const registry = loadGateReceipts(registryPath);
+      expect(Object.values(registry).filter((row) => row.verdict === 'passed')).toHaveLength(1);
+    } finally {
+      logged.mockRestore();
+      rmSync(stage.root, { recursive: true, force: true });
+      rmSync(registryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('불완전 영수증(현재 측정 범위 미커버)은 승계하지 않는다', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'host-regate-receipt-partial-'));
+    const registryPath = join(registryRoot, 'gate-receipts.json');
+    const stage = receiptStage(registryPath);
+    const logged = spyOn(debug, 'log');
+    try {
+      const partial = stageIdentity();
+      seeded(registryPath, { ...partial, checks: partial.checks.filter((check) => check !== 'nexus-build') }, 'passed');
+      expect((await runHostRegate({ ...input, noMerge: true }, stage.deps)).passed).toBe(true);
+      expect(stage.interferenceRuns()).toBe(1);
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'gate-receipt-decline', expect.objectContaining({ pr: 42, reason: expect.stringContaining('receipt does not cover') }));
+    } finally {
+      logged.mockRestore();
+      rmSync(stage.root, { recursive: true, force: true });
+      rmSync(registryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('key 가 자기 필드에서 다시 계산되지 않는 위조 행은 승계하지 않는다', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'host-regate-receipt-forged-'));
+    const registryPath = join(registryRoot, 'gate-receipts.json');
+    const stage = receiptStage(registryPath);
+    const logged = spyOn(debug, 'log');
+    try {
+      const rowIdentity = stageIdentity();
+      const forged: GateReceipt = {
+        ...rowIdentity,
+        schema: GATE_RECEIPT_SCHEMA,
+        key: computeReceiptKey(rowIdentity, 'passed'),
+        verdict: 'passed',
+        savedAt: '2026-10-27T23:27:00.000Z',
+        radiusFiles: ['src/never-measured.test.ts'],
+      };
+      // saveGateReceipt 는 이런 행을 거절한다 — 위조 행은 등록부 파일에 직접 심는다.
+      writeFileSync(registryPath, JSON.stringify({ [forged.key]: forged }));
+      expect((await runHostRegate({ ...input, noMerge: true }, stage.deps)).passed).toBe(true);
+      expect(stage.interferenceRuns()).toBe(1);
+      expect(logged).toHaveBeenCalledWith('harness.host-regate', 'gate-receipt-decline', expect.objectContaining({ pr: 42, reason: 'stored receipt does not recompute to its own key' }));
+    } finally {
+      logged.mockRestore();
+      rmSync(stage.root, { recursive: true, force: true });
+      rmSync(registryRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('동시 쓰기: 같은 등록부를 향한 두 병렬 host-regate 가 등록부를 온전히 남긴다', async () => {
+    const registryRoot = mkdtempSync(join(tmpdir(), 'host-regate-receipt-race-'));
+    const registryPath = join(registryRoot, 'gate-receipts.json');
+    const a = receiptStage(registryPath);
+    const b = receiptStage(registryPath);
+    try {
+      const results = await Promise.all([
+        runHostRegate({ ...input, noMerge: true }, a.deps),
+        runHostRegate({ ...input, noMerge: true }, b.deps),
+      ]);
+      expect(results.every((result) => result.passed)).toBe(true);
+      expect(a.interferenceRuns()).toBe(1);
+      expect(b.interferenceRuns()).toBe(1);
+      JSON.parse(readFileSync(registryPath, 'utf8'));
+      const registry = loadGateReceipts(registryPath);
+      expect(Object.keys(registry)).toHaveLength(1);
+      expect(Object.values(registry)[0]?.verdict).toBe('passed');
+    } finally {
+      rmSync(a.root, { recursive: true, force: true });
+      rmSync(b.root, { recursive: true, force: true });
+      rmSync(registryRoot, { recursive: true, force: true });
+    }
   });
 });

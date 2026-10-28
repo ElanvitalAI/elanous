@@ -465,14 +465,19 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
         runId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown };
-        outputs?: Record<string, { commit?: unknown; base?: unknown; branch?: unknown } | undefined> };
+        outputs?: Record<string, { outcome?: unknown; commit?: unknown; base?: unknown; branch?: unknown } | undefined> };
       if (context.runId !== undefined) {
         if (typeof context.runId !== 'string') throw new Error('runId must be a string');
         runId = context.runId;
       }
       if (!version && typeof context.input?.version === 'string') version = context.input.version;
       forceFreeze = context.input?.forceFreeze === true;
-      branchCut = context.input?.branchCut === true;
+      const releasedBranch = context.outputs?.['version-release']?.branch;
+      branchCut = context.input?.branchCut === true
+        || (kind === 'dev-bump'
+          && context.outputs?.['version-release']?.outcome === 'ok'
+          && typeof version === 'string'
+          && releasedBranch === `release/${version}`);
       if (kind === 'release' && cutCommit === undefined && context.input?.cutCommit !== undefined) {
         if (typeof context.input.cutCommit !== 'string') throw new Error('cutCommit must be a commit SHA');
         cutCommit = context.input.cutCommit;

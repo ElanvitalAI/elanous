@@ -222,6 +222,55 @@ describe('TA-REJUDGE-ON-HEAD — 런 멈춤 뒤 머리가 바뀌면 재게이트
     expect(f.decisions()).toContain('repair:repair-pending');
   });
 
+  test('empty-implementation must-fix reroutes the same cell to a fresh test-first launch instead of a same-PR repair', async () => {
+    const f = fixture();
+    const resultPath = f.card().reviewRequests![0]!.resultPath!;
+    mkdirSync(dirname(resultPath), { recursive: true });
+    const text = reviewJson(A, { verdict: 'fail', mustFix: ['구현 파일 변경 0 — 대상 경로에 실제 구현이 없다(빈 구현)'] });
+    writeFileSync(resultPath, text);
+    writeTaskCards(f.statePath, [{ ...f.card(), history: f.card().history.map((entry) => entry.resultPath === resultPath
+      ? { ...entry, reviewSha256: repairReviewDigest(text) } : entry) }]);
+    const launched: Array<{ pr: number; head: string }> = [];
+    const notified: Array<{ seat: string; body: string }> = [];
+    const deps = { ...f.deps(['review', 'propose-land', 'narrow-relaunch']),
+      requestRepair: async (request: { pr: number; head: string }) => { launched.push(request); },
+      notifyRepair: (seat: string, body: string) => { notified.push({ seat, body }); } };
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(launched).toHaveLength(0);
+    expect(notified).toEqual([]);
+    const card = f.card();
+    expect(card.status).toBe('launch-failed');
+    expect(card.text).toContain('시험 먼저');
+    expect(f.decisions()).toContain('repair:empty-implementation-reimplement');
+    expect((card.repairs ?? []).every(entry => entry.move !== 'narrow-relaunch')).toBe(true);
+    expect((card.history ?? []).some(entry => entry.event === 'pr-superseded-candidate' && entry.pr === 30)).toBe(true);
+  });
+
+  test('second empty-implementation must-fix hands the cell to its seat owner instead of relaunching', async () => {
+    const f = fixture();
+    const resultPath = f.card().reviewRequests![0]!.resultPath!;
+    mkdirSync(dirname(resultPath), { recursive: true });
+    const text = reviewJson(A, { verdict: 'fail', mustFix: ['GOODHART — 자기 문구 시험만 통과하고 구현 파일 변경 0'] });
+    writeFileSync(resultPath, text);
+    writeTaskCards(f.statePath, [{ ...f.card(),
+      history: [...f.card().history.map(entry => entry.resultPath === resultPath
+        ? { ...entry, reviewSha256: repairReviewDigest(text) } : entry),
+      { at: '2026-10-11T00:25:00.000Z', event: 'rejudge-on-head', kind: 'repair', pr: 30, head: A,
+        effect: 'empty-implementation-reimplement', detail: '빈 구현 must-fix — 같은 칸 새 발사' }] }]);
+    const launched: Array<{ pr: number; head: string }> = [];
+    const notified: Array<{ seat: string; body: string }> = [];
+    const deps = { ...f.deps(['review', 'propose-land', 'narrow-relaunch']),
+      requestRepair: async (request: { pr: number; head: string }) => { launched.push(request); },
+      notifyRepair: (seat: string, body: string) => { notified.push({ seat, body }); } };
+    await rejudgeCardOnHead(f.card().id, deps);
+    expect(launched).toHaveLength(0);
+    expect(f.card().status).toBe('failed');
+    expect(f.decisions()).toContain('repair:empty-implementation-needs-owner');
+    expect(notified.map(entry => entry.seat)).toEqual(['TC']);
+    expect(notified[0].body).toContain('빈 구현');
+    expect((f.card().history ?? []).some(entry => entry.event === 'pr-superseded-candidate' && entry.pr === 30)).toBe(true);
+  });
+
   test('repair reads the captured review file, rejects changed bytes, and ignores a later request for the same head', async () => {
     const f = fixture();
     const path = f.card().reviewRequests![0]!.resultPath!;

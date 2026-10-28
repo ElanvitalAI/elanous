@@ -31,6 +31,8 @@ export interface PodDeviceEvent {
   jobConditionReason?: string;
   jobConditionMessage?: string;
   activeDeadlineSeconds?: number;
+  jobCreatedAt?: string;
+  jobCompletedAt?: string;
   podPhase?: string;
   podCreatedAt?: string;
   containerReason?: string | null;
@@ -86,6 +88,7 @@ export const POD_DEVICE_EVENTS: readonly PodDeviceEvent[] = [
     jobConditionReason: 'DeadlineExceeded',
     jobConditionMessage: 'Job was active longer than specified deadline',
     activeDeadlineSeconds: 3600,
+    jobCreatedAt: '2026-10-22T12:55:10Z',
     podPhase: 'Failed',
     containerReason: 'Error',
     containerExitCode: 143,
@@ -114,7 +117,7 @@ const ok = (stdout: string) => ({ status: 0, stdout, stderr: '' });
 
 function answerJob(event: PodDeviceEvent, jsonpath: string): { status: number; stdout: string; stderr: string } {
   if (jsonpath === POD_TERMINATION_JOB_JSONPATH) {
-    return ok(`${event.jobConditionReason ?? ''}\t${event.activeDeadlineSeconds ?? ''}\t${event.jobUid ?? ''}`);
+    return ok(`${event.jobConditionReason ?? ''}\t${event.activeDeadlineSeconds ?? ''}\t${event.jobUid ?? ''}\t${event.jobCreatedAt ?? ''}\t${event.jobCompletedAt ?? ''}`);
   }
   if (jsonpath.includes('.spec.activeDeadlineSeconds')) return ok(event.activeDeadlineSeconds != null ? String(event.activeDeadlineSeconds) : '');
   if (jsonpath.includes('conditions[?(@.type=="Failed")].reason')) return ok(event.jobConditionReason ?? '');

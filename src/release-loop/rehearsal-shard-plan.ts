@@ -87,7 +87,12 @@ export function planRehearsalShards(version: string, root: string, checkout: str
   let gatePlanShards: number | null = null;
   try {
     const board = (deps.board ?? readGateShards)(gateShardsPath(version, root));
-    gatePlanShards = board?.version === version && board.shards.length && new Set(board.shards.map(shard => shard.id)).size === board.shards.length ? board.shards.length : null;
+    if (board?.version === version && board.shards.length
+      && new Set(board.shards.map(shard => shard.id)).size === board.shards.length) {
+      // Split/retry/tail rows are observations, not extra planned shards. Older boards used arbitrary IDs.
+      const roots = board.shards.filter(shard => /^pod-\d+$/.test(shard.id));
+      gatePlanShards = roots.length || (board.shards.some(shard => /^pod-\d+/.test(shard.id)) ? null : board.shards.length);
+    }
   } catch (error) { reasons.push(`persisted gate shard plan unreadable: ${error instanceof Error ? error.message : String(error)}`); }
   let testFiles: number | null = null;
   let measuredFiles = 0;

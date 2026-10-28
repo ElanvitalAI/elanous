@@ -22,6 +22,7 @@ function fixture(text = question, overrides: { max?: number; configMax?: number;
   const pushes: string[] = [];
   const persisted: string[] = [];
   const completed: LLMMessage[][] = [];
+  const updates: Array<{ update: Record<string, unknown>; meta?: Record<string, unknown> }> = [];
   const dispatched: string[] = [];
   const log = spyOn(debug, 'log');
   const base = config.getUserConfig();
@@ -48,11 +49,11 @@ function fixture(text = question, overrides: { max?: number; configMax?: number;
     sessionId: 'fact-test', cwd: '/tmp', userText: text,
     promptBlocks: [{ type: 'text', text }], isAborted: () => false,
     push: async (delta: string) => { pushes.push(delta); },
-    pushWithMeta: async () => {}, pushSessionUpdate: async () => {},
+    pushWithMeta: async () => {}, pushSessionUpdate: async (update: Record<string, unknown>, meta?: Record<string, unknown>) => { updates.push({ update, ...(meta ? { meta } : {}) }); },
     pushToolCall: async () => {}, pushToolResult: async () => {}, pushUsage: async () => {},
     requestApproval: async () => 'deny-once' as const,
   } as unknown as AcpTurnContext;
-  return { runTurn: () => runTurn(turn), calls, pushes, persisted, completed, dispatched, log };
+  return { runTurn: () => runTurn(turn), calls, pushes, persisted, completed, dispatched, updates, log };
 }
 
 afterEach(() => mock.restore());
@@ -68,6 +69,16 @@ test('user config parses a positive fact budget and falls back to six for malfor
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('forwards stream recovery status over the existing ACP thought update', async () => {
+  const f = fixture();
+  await f.runTurn();
+  f.calls[0]!.callbacks?.onStatus?.('스트림 무응답 · 재시도');
+  expect(f.updates).toContainEqual({
+    update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '스트림 무응답 · 재시도' } },
+    meta: { status: true },
+  });
 });
 
 test('fact question adds one-turn instruction, six-turn cap and search evidence without shell/browser', async () => {

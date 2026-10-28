@@ -13,6 +13,16 @@ export interface ChannelBotCardClient {
 
 const platforms: ChannelBotPlatform[] = ['telegram', 'discord'];
 
+// 채널 게시 대기열의 안내용 단계 문구. 실제 대기열 상태를 표시하지 않는다.
+export function channelPublishStatusLabel(status: 'queued' | 'approved' | 'published'): string {
+  if (status === 'queued') return '대기열 대기 (승인 전)';
+  if (status === 'approved') return '승인 대기 (게시 전)';
+  return '게시됨';
+}
+
+const channelPublishStages = (['queued', 'approved', 'published'] as const)
+  .map(status => channelPublishStatusLabel(status)).join(' → ');
+
 export function ChannelBotSetupCard({ client: suppliedClient }: { client?: ChannelBotCardClient } = {}) {
   const contextClient = useOptionalNexusClient();
   const client = suppliedClient ?? contextClient;
@@ -78,6 +88,7 @@ export function ChannelBotSetupCard({ client: suppliedClient }: { client?: Chann
           <div key={platform} className="space-y-2 border-t border-border pt-3">
             <h3 className="text-sm font-medium capitalize">{platform}</h3>
             <p className="text-xs text-muted-foreground">{state?.configured ? `연결됨 (${state.source})` : '미연결'}</p>
+            <p className="text-xs text-muted-foreground" data-testid={`channel-publish-stages-help-${platform}`}>게시 대기열 단계 안내(현재 상태 미표시): {channelPublishStages}</p>
             {names[platform] && <p className="text-xs">봇 이름: {names[platform]}</p>}
             <label htmlFor={`${platform}-bot-token`} className="block text-xs">봇 토큰</label>
             <Input id={`${platform}-bot-token`} type="password" autoComplete="off" value={tokens[platform] ?? ''}

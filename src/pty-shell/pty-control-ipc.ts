@@ -15,7 +15,7 @@ import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from './pty-mo
 import { startPtyRecording, stopPtyRecording } from './pty-recording.js';
 import { withExternalKeyCommand } from '../input/external-input-queue.js';
 
-const OWNER_PTY_CONTROL_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'input-mouse', 'resize', 'snapshot', 'rename', 'terminate', 'capabilities', 'record-start', 'record-stop'] as const;
+const OWNER_PTY_CONTROL_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'input-mouse', 'resize', 'snapshot', 'rename', 'terminate', 'stop-turn', 'capabilities', 'record-start', 'record-stop'] as const;
 export type PtyControlAction = typeof OWNER_PTY_CONTROL_ACTIONS[number];
 type PtyControlStatus = 'success' | 'unknown-pty' | 'denied' | 'failed' | 'write-failed' | 'owner-unreachable';
 
@@ -42,7 +42,8 @@ export type PtyControlPayload =
   | { readonly cols: number; readonly rows: number }
   | { readonly ansi: boolean }
   | { readonly nickname: string }
-  | { readonly cols: number; readonly rows: number; readonly title?: string };
+  | { readonly cols: number; readonly rows: number; readonly title?: string }
+  | { readonly force: true; readonly actorIdentity: string; readonly reason: string };
 
 export interface PtyControlRequestOptions {
   /** 요청자가 주장하는 쓰기 주체. `'agent'` 는 run-identity 일치를 요구한다(`resolveRemoteControlActor`). */
@@ -609,6 +610,19 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
       else if (!isOwnerPtyControlAction(row.action)) result = { status: 'denied', reason: 'unsupported-action' };
       else if (row.action === 'capabilities') result = { status: 'success', actions: OWNER_PTY_CONTROL_ACTIONS };
       else if (row.action === 'terminate') result = await terminatePty(handle);
+      else if (row.action === 'stop-turn') {
+        const payload = parsePayload(row);
+        const targetRunId = getPtyManifest(row.pty_id)?.runId?.trim() ?? '';
+        const requesterRunId = row.requester_run_id?.trim() ?? '';
+        if (requested === null) result = { status: 'denied', reason: 'invalid-actor' };
+        else if (payload === null || typeof payload !== 'object' || Array.isArray(payload) || !('force' in payload) || payload.force !== true) result = { status: 'denied', reason: 'force-required' };
+        else if (!('actorIdentity' in payload) || typeof payload.actorIdentity !== 'string' || !payload.actorIdentity.trim()) result = { status: 'denied', reason: 'actor-identity-required' };
+        else if (!('reason' in payload) || typeof payload.reason !== 'string' || !payload.reason.trim()) result = { status: 'denied', reason: 'reason-required' };
+        else if (!requesterRunId || !targetRunId) result = { status: 'denied', reason: 'run-identity-unavailable' };
+        else if (requesterRunId === targetRunId) result = { status: 'denied', reason: 'self-turn-refused' };
+        else if (!handle.stopTurn) result = { status: 'denied', reason: 'force-stop-unsupported' };
+        else result = handle.stopTurn(true) ? { status: 'success' } : { status: 'denied', reason: 'no-active-turn' };
+      }
       else if (row.action === 'record-start' || row.action === 'record-stop') {
         if (requested === null) result = { status: 'denied', reason: 'invalid-actor' };
         else if (row.action === 'record-stop') {
@@ -732,6 +746,19 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
     } catch (error) {
       result = { status: 'failed', reason: 'control-processing-error' };
       debug.log('pty.takeover', 'control-processing-error', { id: row.pty_id, action: row.action, actor: requested ?? row.actor, error: (error as Error).message });
+    }
+    if (row.action === 'stop-turn') {
+      const payload = parsePayload(row);
+      debug.log('pty.turn', 'force-stop-settled', {
+        ptyId: row.pty_id,
+        actor: requested ?? row.actor ?? 'unknown',
+        actorIdentity: payload && 'actorIdentity' in payload && typeof payload.actorIdentity === 'string' ? payload.actorIdentity.trim() || null : null,
+        reason: payload && 'reason' in payload && typeof payload.reason === 'string' ? payload.reason.trim() || null : null,
+        requesterRunId: row.requester_run_id?.trim() || null,
+        targetRunId: getPtyManifest(row.pty_id)?.runId?.trim() || null,
+        outcome: result.status,
+        refusal: result.reason ?? null,
+      });
     }
     d.run("UPDATE pty_control_requests SET status=?, result_json=?, updated_at=? WHERE request_id=? AND status='processing'", [result.status, JSON.stringify(result), Date.now(), row.request_id]);
     debug.log('pty.arbiter', 'control-settled', { id: row.pty_id, action: row.action, actor: requested ?? row.actor, outcome: result.status, reason: result.reason });

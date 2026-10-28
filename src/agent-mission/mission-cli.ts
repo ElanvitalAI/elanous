@@ -33,6 +33,7 @@ export interface MissionCliOpts {
 
 export interface MissionCliDeps {
   resolveBackend: (name?: string) => AgentBackend;
+  signal?: AbortSignal;
   readFile?: (path: string) => string;
   runDevPipeline?: typeof runDevPipeline;
 }
@@ -115,7 +116,7 @@ export async function runAgentMissionCliCommand(
   });
   const { result, exitCode } = await executeAgentMissionReroute(
     spec, agentBackend,
-    deps.runDevPipeline ? { runDevPipeline: deps.runDevPipeline } : undefined,
+    { ...(deps.runDevPipeline ? { runDevPipeline: deps.runDevPipeline } : {}), ...(deps.signal ? { signal: deps.signal } : {}) },
   );
   return { ok: true, result, exitCode };
 }

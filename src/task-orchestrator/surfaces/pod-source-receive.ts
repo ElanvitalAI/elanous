@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { siTaskPodStageShell } from './pod-lifecycle-stages.js';
 
 export type PodSource =
-  | { kind: 'default'; base?: string }
+  | { kind: 'default'; base?: string; baseSha?: string }
   | { kind: 'commit'; sha: string }
   | { kind: 'pr'; number: number }
   | { kind: 'bundle'; bundlePath: string; sha256: string; sizeBytes: number; headCommit: string };
@@ -64,6 +64,24 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
   const quotedCommitFile = `'${(options.imageCommitFile ?? '/opt/elanous-source-commit').replace(/'/g, `'\\''`)}'`;
   const quotedImageGitDir = `'${(options.imageGitDir ?? '/opt/elanous-pin.git').replace(/'/g, `'\\''`)}'`;
   const clone = `git clone -q --depth 50 ${quotedUrl} repo`;
+  // First observation slice: count source checkout work without changing its routing.
+  const ioStart = [
+    // Count calls performed by this Pod source stage. Branch validation via
+    // assertRemoteBase runs on the host before Job creation and is outside it.
+    'pod_source_io_origin_calls=0',
+    'pod_source_io_started=$(date +%s)',
+    'pod_source_io_reported=0',
+    'pod_source_io_measured=0',
+    'pod_source_io_measure() { pod_source_io_files=$(git ls-files -z | tr -cd "\\000" | wc -c | tr -d " "); pod_source_io_seconds=$(( $(date +%s) - pod_source_io_started )); pod_source_io_measured=1; }',
+    'pod_source_io_emit() {',
+    '  [ "$pod_source_io_reported" -eq 0 ] || return 0; pod_source_io_reported=1',
+    '  [ -n "${pod_source_io_seconds:-}" ] || pod_source_io_seconds=$(( $(date +%s) - pod_source_io_started ))',
+    '  [ -n "${pod_source_io_files:-}" ] || pod_source_io_files=null',
+    '  pod_source_io_status=incomplete; if [ "$pod_source_io_measured" -eq 1 ]; then pod_source_io_status=complete; fi',
+    '  printf \'ELANOUS_POD_SOURCE_IO {"originCalls":%s,"checkoutFiles":%s,"sourceVia":"%s","sourceSeconds":%s,"sourceStatus":"%s","pushCalls":null,"installRan":null,"installSeconds":null}\\n\' "$pod_source_io_origin_calls" "$pod_source_io_files" "${source_via:-unknown}" "$pod_source_io_seconds" "$pod_source_io_status"',
+    '}',
+    'trap pod_source_io_emit EXIT',
+  ];
   const start = [
     'if [ -e repo ]; then exit 5; fi',
     // POD-MIRROR-IO: the image's pinned tree is a shared read-only lower layer.
@@ -113,7 +131,11 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     'else',
     "  printf 'ELANOUS_POD_SOURCE_MIRROR_SKIP %s\\n' \"$mirror_skip\"",
     '  if [ -e repo ]; then rm -r -- repo || exit 5; fi',
-    `  ${clone} || exit 5`,
+    ...(source.kind === 'default' && source.baseSha ? [] : ['  pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))']),
+    ...(source.kind === 'default' && source.baseSha ? [
+      `  printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${source.baseSha}'`,
+      '  exit 5',
+    ] : [`  ${clone} || exit 5`]),
     '  source_via=github',
     'fi',
     'fi',
@@ -121,22 +143,50 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     'cd repo || exit 5',
   ];
   if (source.kind === 'default') {
+    if (source.baseSha) {
+      const sha = assertSha(source.baseSha, 'base sha');
+      const base = source.base ?? 'main';
+      if (base.startsWith('-') || !/^[\w./-]+$/.test(base)) throw new Error(`invalid Pod base ref: ${base}`);
+      const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+      const quotedBase = quote(base);
+      const quotedTrackingRef = quote(`refs/remotes/origin/${base}`);
+      const quotedUpstream = quote(`origin/${base}`);
+      return [
+        ...ioStart,
+        ...start,
+        `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then git fetch --quiet --no-write-fetch-head ${quotedMirror} '${sha}' || { printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${sha}'; exit 5; }; fi`,
+        `git checkout -q -B ${quotedBase} '${sha}' || exit 5`,
+        `git update-ref ${quotedTrackingRef} '${sha}' || exit 5`,
+        `git symbolic-ref refs/remotes/origin/HEAD ${quotedTrackingRef} || exit 5`,
+        `git branch --set-upstream-to=${quotedUpstream} ${quotedBase} >/dev/null || exit 5`,
+        'head=$(git rev-parse HEAD)',
+        'pod_source_io_measure',
+        "printf 'ELANOUS_POD_SOURCE default %s\\n' \"$head\"",
+        'pod_source_io_emit',
+      ].join('\n');
+    }
     if (source.base && source.base !== 'main') {
       assertRemoteBase(repoUrl, source.base);
       const base = source.base;
       const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
       const quotedTrackingRef = quote(`refs/remotes/origin/${base}`);
       return [
+        ...ioStart,
         ...start,
+        'pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
         `git fetch --depth 50 origin ${quote(`+refs/heads/${base}:refs/remotes/origin/${base}`)} || exit 5`,
         `git checkout -q -B ${quote(base)} ${quotedTrackingRef} || exit 5`,
         'head=$(git rev-parse HEAD)',
+        'pod_source_io_measure',
         "printf 'ELANOUS_POD_SOURCE default %s\\n' \"$head\"",
+        'pod_source_io_emit',
       ].join('\n');
     }
     return [
+      ...ioStart,
       ...start,
       'if [ "$source_via" != github ]; then',
+      '  pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
       '  remote_info=$(git ls-remote --symref origin HEAD) || exit 5',
       `  remote_head=$(printf '%s\\n' "$remote_info" | awk '$2=="HEAD" && $1!="ref:" {print $1}')`,
       `  remote_branch=$(printf '%s\\n' "$remote_info" | awk '$1=="ref:" && $3=="HEAD" && $2 ~ /^refs\\/heads\\// {sub(/^refs\\/heads\\//, "", $2); print $2}')`,
@@ -146,6 +196,7 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
       '      git reset --hard "$remote_head" || exit 5',
       "      printf 'ELANOUS_POD_SOURCE_DELTA mirror\\n'",
       '    else',
+      '      pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
       '      git fetch --depth 50 origin HEAD && git reset --hard FETCH_HEAD || exit 5',
       "      printf 'ELANOUS_POD_SOURCE_DELTA origin\\n'",
       '    fi',
@@ -158,53 +209,68 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
       '  git branch --set-upstream-to="origin/$remote_branch" "$remote_branch" >/dev/null || exit 5',
       'fi',
       'head=$(git rev-parse HEAD)',
+      'pod_source_io_measure',
       "printf 'ELANOUS_POD_SOURCE default %s\\n' \"$head\"",
+      'pod_source_io_emit',
     ].join('\n');
   }
   if (source.kind === 'commit') {
     const sha = assertSha(source.sha, 'sha');
     return [
+      ...ioStart,
       ...start,
-      `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then git fetch --depth 1 origin ${sha} || exit 5; fi`,
+      `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --depth 1 origin ${sha} || exit 5; fi`,
       `git checkout --detach ${sha} || exit 5`,
       'head=$(git rev-parse HEAD)',
+      'pod_source_io_measure',
       "printf 'ELANOUS_POD_SOURCE commit %s\\n' \"$head\"",
+      'pod_source_io_emit',
     ].join('\n');
   }
   if (source.kind === 'pr') {
     const n = assertPositiveInt(source.number);
     return [
+      ...ioStart,
       ...start,
+      'pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
       `pr_sha=$(git ls-remote origin refs/pull/${n}/head | cut -f1) || exit 5`,
       'if ! [[ "$pr_sha" =~ ^[0-9a-f]{40}$ ]]; then exit 5; fi',
-      `if ! git cat-file -e "$pr_sha^{commit}" 2>/dev/null; then git fetch --depth 50 origin pull/${n}/head || exit 5; fi`,
+      `if ! git cat-file -e "$pr_sha^{commit}" 2>/dev/null; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --depth 50 origin pull/${n}/head || exit 5; fi`,
       `git checkout -B pr-${n} "$pr_sha" || exit 5`,
       // A pinned image starts at one shallow main commit. Fetching a PR tip at
       // depth 50 can leave that pin and the PR in disconnected shallow spans.
       // Deepen only after merge-base fails; the gate still reports unavailable
       // if ancestry cannot be obtained.
+      'pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
       'remote_info=$(git ls-remote --symref origin HEAD 2>/dev/null) || { printf \'ELANOUS_POD_COMPARISON_BASE unavailable\\n\'; exit 5; }',
       `base_branch=$(printf '%s\\n' "$remote_info" | awk '$1=="ref:" && $3=="HEAD" && $2 ~ /^refs\\/heads\\// {sub(/^refs\\/heads\\//, "", $2); print $2}')`,
       'if [ -n "$base_branch" ] && git check-ref-format --branch "$base_branch" >/dev/null 2>&1; then',
       '  base_ref="refs/remotes/origin/$base_branch"',
+      '  pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
       '  git fetch --depth 50 origin "+refs/heads/$base_branch:$base_ref" || { printf \'ELANOUS_POD_COMPARISON_BASE unavailable\\n\'; exit 5; }',
       '  git symbolic-ref refs/remotes/origin/HEAD "$base_ref" || exit 5',
       '  if ! git merge-base HEAD "$base_ref" >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository)" = true ]; then',
+      '    pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
       `    git fetch --deepen=100 origin "+refs/heads/$base_branch:$base_ref" +refs/pull/${n}/head:refs/remotes/origin/pr-${n}-head || printf 'ELANOUS_POD_COMPARISON_BASE deepen-failed\\n'`,
       '  fi',
       '  if ! git merge-base HEAD "$base_ref" >/dev/null 2>&1 && [ "$(git rev-parse --is-shallow-repository)" = true ]; then',
+      '    pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
       `    git fetch --unshallow origin "+refs/heads/$base_branch:$base_ref" +refs/pull/${n}/head:refs/remotes/origin/pr-${n}-head || { printf 'ELANOUS_POD_COMPARISON_BASE unavailable\\n'; exit 5; }`,
       '  fi',
       "  if ! git merge-base HEAD \"$base_ref\" >/dev/null 2>&1; then printf 'ELANOUS_POD_COMPARISON_BASE unavailable\\n'; fi",
       "else printf 'ELANOUS_POD_COMPARISON_BASE unavailable\\n'; exit 5; fi",
       'head=$(git rev-parse HEAD)',
+      'pod_source_io_measure',
       "printf 'ELANOUS_POD_SOURCE pr %s\\n' \"$head\"",
+      'pod_source_io_emit',
     ].join('\n');
   }
   const sha256 = assertSha256(source.sha256);
   const sizeBytes = assertSize(source.sizeBytes);
   const headCommit = assertSha(source.headCommit, 'headCommit');
   return [
+    ...ioStart,
+    'source_via=bundle',
     'ready=0',
     'for i in $(seq 1 300); do',
     '  if [ -f /tmp/source.ready ]; then ready=1; break; fi',
@@ -242,8 +308,10 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     '  git -C repo fetch /tmp/source.bundle "refs/elanous/pod-source/*:refs/remotes/bundle/*" || exit 5',
     'fi',
     `git -C repo checkout --detach ${headCommit} || exit 5`,
-    'head=$(git -C repo rev-parse HEAD) || exit 5',
-    "printf 'ELANOUS_POD_SOURCE bundle %s\\n' \"$head\"",
     'cd repo || exit 5',
+    'head=$(git rev-parse HEAD) || exit 5',
+    'pod_source_io_measure',
+    "printf 'ELANOUS_POD_SOURCE bundle %s\\n' \"$head\"",
+    'pod_source_io_emit',
   ].join('\n');
 }

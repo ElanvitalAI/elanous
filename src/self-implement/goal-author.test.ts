@@ -10655,8 +10655,8 @@ describe('goal author — 판정 신호의 «셋째 출처»(저작 LLM) 배선�
  * 📚 이 저장소가 이미 아는 형태다: 「의존 주입 심은 «배선»까지 물어야 한다」.
  */
 describe('goal author — 저작 경로가 enhance 에 checklistUse 를 넘긴다 (배선)', () => {
-  test('defaultGoalAuthorDeps leaves clarification self-resolution disabled', () => {
-    expect(defaultGoalAuthorDeps(process.cwd()).selfResolveClarification).toBeUndefined();
+  test('defaultGoalAuthorDeps wires clarification self-resolution', () => {
+    expect(defaultGoalAuthorDeps(process.cwd()).selfResolveClarification).toBeTypeOf('function');
   });
 
   test('defaultGoalAuthorDeps().enhance 가 authoring 을 실어 부른다', async () => {

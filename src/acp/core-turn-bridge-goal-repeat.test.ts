@@ -90,6 +90,34 @@ test('골 루프 반복의 같은 답 재방출 — 최종 답은 화면에 정�
   expect(extractLastAssistantText(f.persisted[1]!)).toBe(ANSWER);
 }, 30_000);
 
+test('완료 선언 뒤 재호출에서 새 문장이 동반되면 기존 화면 보존·새 내용 보존', async () => {
+  const f = setup();
+  const rounds: LLMStreamEvent[][] = [
+    goalUpdate(''),
+    [
+      { type: 'text', delta: '고쳤습니다: ' },
+      { type: 'text', delta: '중복 렌더를 제거했습니다. ' },
+      { type: 'text', delta: '판정: bun test → 0 fail' },
+    ],
+    goalUpdate(EVIDENCE),
+    [
+      { type: 'text', delta: '고쳤습니다: 중복 ' },
+      { type: 'text', delta: '렌더를 제거했습니다. 판정: ' },
+      { type: 'text', delta: 'bun test → 0 fail' },
+      { type: 'text', delta: ADDENDUM },
+    ],
+  ];
+  spyOn(llm, 'resolveDefaultProvider').mockReturnValue(goalRepeatProvider(rounds));
+  await f.run();
+  const shown = f.pushes.join('');
+  // ACP retains its interactive divergence contract (the prior answer is
+  // re-rendered on divergence); only noninteractive callers use the shortcut.
+  expect(shown.split(ANSWER).length - 1).toBe(2);
+  expect(shown.split(ADDENDUM).length - 1).toBe(1);
+  expect(f.persisted).toHaveLength(2);
+  expect(extractLastAssistantText(f.persisted[1]!)).toContain(ADDENDUM);
+}, 30_000);
+
 test('«확인 결과» 인사를 붙인 재방출도 화면에 한 번 — 인사는 화면 밖', async () => {
   const f = setup();
   const rounds: LLMStreamEvent[][] = [

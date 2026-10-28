@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { dispatchHarnessOnPod, podOrchestrateArgs, resolveHarnessPodPool } from './harness-pod-dispatch.js';
+import { installTuiStderrOwner } from '../surface/tui-stderr-owner.js';
 import { podMemoryLimitFor } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { podSourceScript } from '../task-orchestrator/surfaces/pod-source-receive.js';
@@ -439,18 +440,26 @@ describe('harness say/ask --substrate pod', () => {
     } finally { rmSync(root, { recursive: true, force: true }); if (origin) rmSync(origin, { recursive: true, force: true }); }
   });
 
-  test('real spawned orchestrator stdout reaches the CLI observer without changing its exit status', async () => {
+  test('isolated TUI pod-child git stderr reaches the notice owner without inheriting terminal stdio', async () => {
     const output: string[] = [];
+    const notices: string[] = [];
+    const restoreStderrOwner = installTuiStderrOwner((line) => notices.push(line));
     const stdout = spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const outsideRepo = mkdtempSync(join(tmpdir(), 'tui-child-stderr-not-repo-'));
+    let childStdio: unknown;
     try {
       const status = await dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'x' }, {
-        spawnChild: ((_cmd, _args, _opts) => spawn(process.execPath, ['-e', 'process.stdout.write("[result] pod-job-failed\\n"); process.exit(1)'], { stdio: ['ignore', 'pipe', 'ignore'] })) as typeof spawn,
+        spawnChild: ((_cmd, _args, opts) => {
+          childStdio = opts?.stdio;
+          return spawn('git', ['-C', outsideRepo, 'status'], opts);
+        }) as typeof spawn,
         onOutput: (chunk) => output.push(chunk),
       });
-      expect(status).toBe(1);
-      expect(output.join('')).toBe('[result] pod-job-failed\n');
-      expect(stdout).toHaveBeenCalled();
-    } finally { stdout.mockRestore(); }
+      expect(status).toBe(128);
+      expect(notices.some((line) => line.startsWith('fatal: not a git repository'))).toBe(true);
+      expect(childStdio).toEqual(['ignore', 'pipe', 'pipe']);
+      expect(output).toEqual([]);
+    } finally { restoreStderrOwner(); stdout.mockRestore(); rmSync(outsideRepo, { recursive: true, force: true }); }
   });
 
   test('host dispatch marker travels to the orchestrator without changing Pod arguments', () => {

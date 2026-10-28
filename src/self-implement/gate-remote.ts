@@ -97,6 +97,7 @@ export function remoteSelfGateArgv(input: {
   shardConcurrency?: number;
   fixedShardDistribution?: boolean;
   includeImporters?: boolean;
+  noInherit?: boolean;
   artifactDir?: string;
 }, sha: (ref: string) => string): string[] {
   const shards = input.shards ?? (input.includeImporters ? 2 : undefined);
@@ -106,6 +107,7 @@ export function remoteSelfGateArgv(input: {
     ...(input.shardConcurrency !== undefined ? ['--shard-concurrency', String(input.shardConcurrency)] : []),
     ...(input.fixedShardDistribution ? ['--fixed-shard-distribution'] : []),
     ...(input.includeImporters ? ['--include-importers'] : []),
+    ...(input.noInherit ? ['--no-inherit'] : []),
     ...(input.artifactDir ? ['--artifact-dir', input.artifactDir] : [])];
 }
 
@@ -131,6 +133,8 @@ export function decideGateDispatch(input: { flags: Pick<GateRemoteFlags, 'remote
 
 export const SLOT_DIR = '/tmp/elanous-gate-remote-slots';
 const BUSY = '__GATE_REMOTE_BUSY';
+const HEARTBEAT = '__GATE_REMOTE_HEARTBEAT=';
+const REMOTE_RUN_LIMIT_SECONDS = 105 * 60;
 
 /** Shell lines that run "$W/run.sh" under the first free of `cap` slot locks, or print the busy marker and exit 98.
  *  run.sh must create "$W/started" first: that is how a lock refusal is told apart from the run's own exit code. */
@@ -138,20 +142,67 @@ export type SlotLockTool = 'flock' | 'lockf';
 const SLOT_LOCK = { flock: 'flock -n', lockf: 'lockf -k -s -t 0' } as const;
 
 /** `tools` is the preference order (default: Linux flock, then BSD/macOS lockf); a test can pin one path. */
-function hostSlotScriptWithSlot(cap: number, dir: string, tools: readonly SlotLockTool[], passSlot: boolean): string[] {
+function hostSlotScriptWithSlot(cap: number, dir: string, tools: readonly SlotLockTool[], passSlot: boolean, supervised = false): string[] {
   const n = Math.min(MAX_HOST_CAP, Math.max(1, Math.floor(cap)));
   const pick = tools.map((tool, i) => `${i ? 'elif' : 'if'} command -v ${tool} >/dev/null 2>&1; then GL="${SLOT_LOCK[tool]}"; `).join('');
   return [
     `GS=${quote(dir)}; mkdir -p "$GS" || infra slots`,
     `${pick}else infra lock-tool; fi`,
     'load1() { if [ -r /proc/loadavg ]; then awk \'NR==1 {print $1}\' /proc/loadavg; elif command -v sysctl >/dev/null 2>&1; then sysctl -n vm.loadavg 2>/dev/null | awk \'{gsub(/[{}]/, ""); print $1}\'; else echo unknown; fi; }',
-    `n=1; while [ $n -le ${n} ]; do $GL "$GS/slot$n" ${passSlot ? 'env GATE_REMOTE_SLOT="$n" ' : ''}sh "$W/run.sh"; s=$?; [ -f "$W/started" ] && exit $s; n=$((n+1)); done`,
+    `n=1; while [ $n -le ${n} ]; do $GL "$GS/slot$n" ${passSlot ? 'env GATE_REMOTE_SLOT="$n" ' : ''}sh "$W/${supervised ? 'supervise.sh' : 'run.sh'}"; s=$?; ${supervised ? '[ -f "$W/supervisor-timeout" ] && infra run-timeout; [ -f "$W/supervisor-infra" ] && infra supervisor-lost; ' : ''}[ -f "$W/started" ] && exit $s; n=$((n+1)); done`,
     `echo "${BUSY}=$((n-1));load1=$(load1)" >&2; exit 98`,
   ];
 }
 
 export function hostSlotScript(cap: number, dir = SLOT_DIR, tools: readonly SlotLockTool[] = ['flock', 'lockf']): string[] {
   return hostSlotScriptWithSlot(cap, dir, tools, false);
+}
+
+/** A slot holder owns exactly one new process group. On a lost SSH shell or wall limit it signals only that group,
+ *  after checking its unreaped direct child's PGID. The heartbeat also detects a severed SSH output pipe while
+ *  a silent test is running; runOnRemote removes only these transport lines from the tool's stderr. */
+export function remoteSupervisorScript(limitSeconds = REMOTE_RUN_LIMIT_SECONDS): string {
+  const limit = Number.isSafeInteger(limitSeconds) && limitSeconds > 0 ? limitSeconds : REMOTE_RUN_LIMIT_SECONDS;
+  return [
+    '#!/bin/sh',
+    'child=',
+    'ready=0',
+    'owned_group() {',
+    '  [ -n "$child" ] && kill -0 "$child" 2>/dev/null && [ "$(ps -p "$child" -o pgid= 2>/dev/null | tr -d " ")" = "$child" ] || return 1',
+    '}',
+    'reap() {',
+    // Our direct child stays unreaped until the caller waits, so its PID/PGID cannot be reused here.
+    '  [ "$ready" -eq 1 ] && owned_group || return 0',
+    '  kill -TERM -- "-$child" 2>/dev/null || kill -TERM "-$child" 2>/dev/null || :',
+    '  sleep 2',
+    // The leader remains our unreaped child until the caller waits, so its PGID cannot be reused here. A TERM-ignoring
+    // grandchild may outlive the leader; rechecking only the leader would miss that member of the same owned group.
+    '  kill -KILL -- "-$child" 2>/dev/null || kill -KILL "-$child" 2>/dev/null || :',
+    '}',
+    'trap \'reap\' HUP INT TERM EXIT',
+    'perl -MPOSIX -e \'POSIX::setpgid(0,0) == 0 or die "setpgid: $!"; exec @ARGV\' sh "$W/run.sh" &',
+    'child=$!',
+    // Set this only after spawning the worker so the worker keeps its normal SIGPIPE behavior.
+    'trap \'\' PIPE',
+    // The SSH parent can disappear before the child has called setpgid. Wait briefly for the ownership proof first.
+    'ready=0; attempt=0',
+    'while [ "$attempt" -lt 20 ] && kill -0 "$child" 2>/dev/null; do',
+    '  if owned_group; then ready=1; break; fi',
+    '  attempt=$((attempt+1)); sleep 1',
+    'done',
+    'if [ "$ready" -eq 0 ] && kill -0 "$child" 2>/dev/null; then kill -TERM "$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; : > "$W/supervisor-infra"; exit 125; fi',
+    'started=$(date +%s)',
+    'while kill -0 "$child" 2>/dev/null; do',
+    '  if [ "$(($(date +%s) - started))" -ge ' + limit + ' ]; then reap; wait "$child" 2>/dev/null || :; : > "$W/supervisor-timeout"; exit 124; fi',
+    '  if ! kill -0 "$GATE_REMOTE_SSH_SHELL" 2>/dev/null; then reap; wait "$child" 2>/dev/null || :; : > "$W/supervisor-infra"; exit 125; fi',
+    '  if ! printf "\\n' + HEARTBEAT + '%s\\n" "$W" >&2; then reap; wait "$child" 2>/dev/null || :; : > "$W/supervisor-infra"; exit 125; fi',
+    '  sleep 5',
+    'done',
+    'wait "$child"; rc=$?',
+    'trap - HUP INT TERM EXIT',
+    'exit "$rc"',
+    '',
+  ].join('\n');
 }
 
 // ── remote execution ───────────────────────────────────────────────
@@ -217,7 +268,7 @@ export interface PayloadFile { env: string; content: string }
 export type RemoteArgv = string[] | ((sha: (ref: string) => string) => string[]);
 
 /** Build the remote shell script (exported for tests). Every setup failure ends in an INFRA marker, the tool's rc in an RC marker. */
-export function remoteScript(input: { mirror: string; commit: string; fetchShas: string[]; mainSha?: string; argv: string[]; installPwa: boolean; stableCheckout?: boolean; payloadFiles?: PayloadFile[]; hostCap?: number; slotDir?: string }): string {
+export function remoteScript(input: { mirror: string; commit: string; fetchShas: string[]; mainSha?: string; argv: string[]; installPwa: boolean; stableCheckout?: boolean; payloadFiles?: PayloadFile[]; hostCap?: number; slotDir?: string; runLimitSeconds?: number }): string {
   const mirror = input.mirror.startsWith('~/') ? `"$HOME"/${quote(input.mirror.slice(2))}` : quote(input.mirror);
   const fetches = input.fetchShas.map((sha) => `refs/elanous/gate/${sha}:refs/elanous/gate/${sha}`).join(' ');
   const payloads = (input.payloadFiles ?? []).filter((file) => /^[A-Z_][A-Z0-9_]*$/.test(file.env));
@@ -280,11 +331,16 @@ export function remoteScript(input: { mirror: string; commit: string; fetchShas:
     'W=$(mktemp -d /var/tmp/elanous-gate-remote-XXXXXXXX) || infra mktemp',
     'export W',
     'trap \'rm -rf "$W"\' EXIT',
+    'command -v perl >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 || infra supervisor-tool',
+    'GATE_REMOTE_SSH_SHELL=$$; export GATE_REMOTE_SSH_SHELL',
     ...payloadLines,
     `cat > "$W/run.sh" <<'${RUN}' || infra run-script`,
     ...work,
     RUN,
-    ...hostSlotScriptWithSlot(input.hostCap ?? GATE_REMOTE_DEFAULTS.hostCap, input.slotDir ?? SLOT_DIR, ['flock', 'lockf'], !!input.stableCheckout),
+    'cat > "$W/supervise.sh" <<\'__GATE_REMOTE_SUPERVISE__\' || infra supervise-script',
+    remoteSupervisorScript(input.runLimitSeconds),
+    '__GATE_REMOTE_SUPERVISE__',
+    ...hostSlotScriptWithSlot(input.hostCap ?? GATE_REMOTE_DEFAULTS.hostCap, input.slotDir ?? SLOT_DIR, ['flock', 'lockf'], !!input.stableCheckout, true),
     '}',
     '',
   ].join('\n');
@@ -340,11 +396,22 @@ export function runOnRemote(opts: RemoteRunOptions, runner: GateRemoteRunner = r
     env: { ...process.env, GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o ConnectTimeout=10', GIT_TERMINAL_PROMPT: '0' },
   });
   if (push.rc !== 0 || push.error) return { kind: 'infra', stage: 'push', rc: push.rc, stderr: push.stderr || push.error || '', reason: `push-failed rc=${push.rc}: ${(push.stderr || push.error || '').trim().split('\n').slice(-2).join(' | ')}` };
-  const script = remoteScript({ mirror: opts.mirror, commit, fetchShas: shas, mainSha, argv, installPwa: opts.installPwa ?? false, stableCheckout: opts.stableCheckout, payloadFiles: opts.payloadFiles, hostCap: opts.hostCap, slotDir: opts.slotDir });
-  const run = runner.ssh(opts.host, script, opts.timeoutMs ?? 120 * 60_000);
+  const sshTimeoutMs = opts.timeoutMs ?? 120 * 60_000;
+  const script = remoteScript({ mirror: opts.mirror, commit, fetchShas: shas, mainSha, argv, installPwa: opts.installPwa ?? false, stableCheckout: opts.stableCheckout, payloadFiles: opts.payloadFiles, hostCap: opts.hostCap, slotDir: opts.slotDir,
+    runLimitSeconds: Math.min(REMOTE_RUN_LIMIT_SECONDS, Math.max(1, Math.floor((sshTimeoutMs - 30_000) / 1000))) });
+  const run = runner.ssh(opts.host, script, sshTimeoutMs);
   // The script prints "\n<marker><rc>\n": everything before that leading newline is the tool's own stderr, byte for byte.
   const stdoutBytes = Buffer.from(run.stdout);
-  const stderrBytes = Buffer.from(run.stderr);
+  const rawStderr = Buffer.from(run.stderr);
+  // Transport heartbeats may arrive after the RC marker when a short run races the supervisor's final poll.
+  // Strip only complete, run-scoped heartbeat lines as bytes so arbitrary tool stderr stays byte-identical.
+  const heartbeatLine = /\n__GATE_REMOTE_HEARTBEAT=\/var\/tmp\/elanous-gate-remote-[A-Za-z0-9]+\n/g;
+  const heartbeatRanges = [...rawStderr.toString('latin1').matchAll(heartbeatLine)].map((match) => [match.index!, match.index! + match[0].length] as const);
+  let previous = 0;
+  const kept: Buffer[] = [];
+  for (const [from, to] of heartbeatRanges) { kept.push(rawStderr.subarray(previous, from)); previous = to; }
+  kept.push(rawStderr.subarray(previous));
+  const stderrBytes = Buffer.concat(kept);
   const stderrText = stderrBytes.toString('utf8');
   const marker = stderrBytes.lastIndexOf(Buffer.from(`\n${RC}`));
   // Busy (98) and setup failure (97) are the script's own exits, each with its marker as the last stderr line. A completed
@@ -450,6 +517,11 @@ export interface DispatchOptions {
   reportRemoteHost?: boolean;
   /** Release gate host reservations shared by self gate and changed typecheck. */
   reservationRoot?: string;
+  /** Self gate only: hosts to try when the first host holds a release reservation (default: `host-e-wsl` for
+   *  `node-b`, the same alternative the unmeasured hint names — a reservation is never a local fallback). */
+  reservationAltHosts?: string[];
+  /** Self gate only: bounded wait for the reservation release, in seconds (default: `settings.slotWaitSeconds`). */
+  reservationWaitSeconds?: number;
   runLocal: () => number | Promise<number>;
   /** Called once with the final remote outcome (never on a local decision), before its output passes through or the
    *  local fallback runs — e.g. `self gate --artifact-dir` fetches (ran) or removes (infra) the host-side artifact dir.
@@ -467,6 +539,26 @@ export interface DispatchDeps {
   /** Test seam for gate.remote events; production defaults to the structured debug log. */
   log?: (event: string, data: Record<string, unknown>) => void;
   write?: { out: (data: string | Uint8Array) => void; err: (data: string | Uint8Array) => void };
+}
+
+/** Hosts a reserved self gate may fall back to: an explicit list wins, otherwise `node-b` (the only host the old
+ *  unmeasured hint named an alternative for) falls back to `host-e-wsl`. Invalid or duplicate entries are dropped. */
+export function gateReservationAlternateHosts(reservedHost: string, explicit?: string[]): string[] {
+  const candidates = explicit ?? (reservedHost === 'node-b' ? ['host-e-wsl'] : []);
+  const seen = new Set<string>([reservedHost]);
+  const hosts: string[] = [];
+  for (const candidate of candidates) {
+    if (!candidate || seen.has(candidate) || !isValidGateHost(candidate)) continue;
+    seen.add(candidate);
+    hosts.push(candidate);
+  }
+  return hosts;
+}
+
+/** Reservation diagnostics stamp — ISO 시각 printed next to the claim owner (runId). Claims written before
+ *  `reservedAt` existed fall back to the gate's own observation time. */
+export function formatReservationStamp(ms: number): string {
+  return new Date(ms).toISOString();
 }
 
 async function loadSettings(): Promise<GateRemoteSettings> {
@@ -498,26 +590,59 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
     return opts.runLocal();
   }
   let host = decision.host!;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = deps.now ?? Date.now;
   const reservationRoot = opts.tool === 'self-gate' || opts.tool === 'ci-typecheck-changed'
     ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
   if (reservationRoot) {
     const reservationHost = host.split('@').at(-1)!;
     const first = inspectReleaseGateHost(reservationRoot, reservationHost);
     if (first.status !== 'free') {
-      // Changed typecheck has a fixed node-b placement; a release reservation makes it unmeasured.
-      const alternate = opts.tool === 'self-gate' && reservationHost === 'node-b' ? 'node-c' : null;
-      const other = alternate ? inspectReleaseGateHost(reservationRoot, alternate) : null;
-      if (alternate && other?.status === 'free') {
-        debug.log('gate.remote', 'host-reserved-reroute', { from: host, to: alternate, reason: first.reason, status: first.status });
-        write.err(`[gate.remote] ${host} reserved (${first.reason}) — using ${alternate}\n`);
-        host = alternate;
+      // A reserved host is never a reason to run this check locally (반증: 예약 상태에서 --local 무거운 시험 금지).
+      // Self gate first tries another remote host, then waits bounded for the release, then ends unmeasured with
+      // the owner and the observation stamp.
+      const observedAt = formatReservationStamp(now());
+      const owner = first.runId || 'unknown';
+      // Owner (runId) plus 시각: the claim's own reservedAt when recorded, else the moment this gate observed it.
+      const stamp = first.reservedAt !== undefined
+        ? `reserved-at=${formatReservationStamp(first.reservedAt)}`
+        : `observed-at=${observedAt}`;
+      const alternates = opts.tool === 'self-gate'
+        ? gateReservationAlternateHosts(reservationHost, opts.reservationAltHosts) : [];
+      const alternate = alternates.find((candidate) => inspectReleaseGateHost(reservationRoot, candidate).status === 'free');
+      if (alternate) {
+        const rerouted = host.includes('@') ? `${host.slice(0, host.lastIndexOf('@'))}@${alternate}` : alternate;
+        debug.log('gate.remote', 'host-reserved-reroute', { tool: opts.tool, from: host, to: rerouted, owner, reason: first.reason, reservedAt: first.reservedAt, observedAt });
+        write.err(`[gate.remote] host-reserved: ${host} (${first.reason}) owner=${owner} ${stamp} — rerouting to ${rerouted}\n`);
+        host = rerouted;
       } else {
-        const reason = `host-reserved: ${host} (${first.reason}); alternate ${alternate ?? '(none)'} ${other?.status ?? 'unavailable'}`;
-        debug.log('gate.remote', 'host-reserved-unmeasured', { host, reason });
-        write.err(opts.tool === 'self-gate'
-          ? `[gate.remote] remote unmeasured on ${host} (stage=host-reserved, rc=unknown) — ${reason}\n`
-          : `[gate.remote] remote unmeasured — ${reason}\n`);
-        return 1;
+        const waitSeconds = opts.tool === 'self-gate' ? opts.reservationWaitSeconds ?? settings.slotWaitSeconds : 0;
+        const waitStart = now();
+        const deadline = waitStart + Math.max(0, waitSeconds) * 1000;
+        let latest = inspectReleaseGateHost(reservationRoot, reservationHost);
+        while (waitSeconds > 0 && latest.status !== 'free') {
+          const left = deadline - now();
+          if (left <= 0) break;
+          write.err(`[gate.remote] waiting for host-reserved release on ${host} — owner=${owner} ${stamp} elapsed=${Math.floor(Math.max(0, now() - waitStart) / 1000)}s/${waitSeconds}s\n`);
+          const before = now();
+          await sleep(Math.min(15_000, left));
+          if (now() <= before) break; // a frozen test clock must not spin past the bound
+          latest = inspectReleaseGateHost(reservationRoot, reservationHost);
+        }
+        const waitedMs = Math.max(0, now() - waitStart);
+        if (latest.status === 'free') {
+          debug.log('gate.remote', 'host-reserved-released', { tool: opts.tool, host, owner, waitedMs });
+          write.err(`[gate.remote] host-reserved released on ${host} after ${Math.floor(waitedMs / 1000)}s — proceeding remotely\n`);
+        } else {
+          const reason = `host-reserved: ${host} (${latest.reason})`;
+          const manualAlternative = reservationHost === 'node-b'
+            ? '; if available, non-PWA checks may explicitly select --remote host-e-wsl' : '';
+          debug.log('gate.remote', 'host-reserved-unmeasured', { host, reason, owner, reservedAt: latest.reservedAt ?? first.reservedAt, observedAt, waitedMs, alternates: alternates.length });
+          write.err(opts.tool === 'self-gate'
+            ? `[gate.remote] remote unmeasured on ${host} (stage=host-reserved, rc=unknown) — ${reason}; owner=${owner} ${stamp} waited=${Math.floor(waitedMs / 1000)}s${manualAlternative}\n`
+            : `[gate.remote] remote unmeasured — ${reason}\n`);
+          return 1;
+        }
       }
     }
   }
@@ -535,8 +660,6 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   };
   if (opts.localOnlyReason) return fallback(opts.localOnlyReason, { stage: 'reproducibility', rc: null });
   const hostCap = gateRemoteHostCap(settings, host);
-  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const now = deps.now ?? Date.now;
   const deadline = now() + settings.slotWaitSeconds * 1000;
   let waitStartedAt: number | undefined;
   const logWait = deps.log ?? ((event: string, data: Record<string, unknown>) => debug.log('gate.remote', event, data));

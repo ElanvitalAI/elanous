@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -108,8 +108,14 @@ test('?mode=live keeps only live hand edges, other kinds untouched Â· bad mode â
     seatIds: () => ['UX'],
   });
   try {
-    const all = await edgesAll(url(), deps);
-    const live = await edgesAll(url('&mode=live'), deps);
+    const now = Date.now();
+    const clock = spyOn(Date, 'now').mockReturnValue(now);
+    let all: LoopEdge[];
+    let live: LoopEdge[];
+    try {
+      all = await edgesAll(url(), deps);
+      live = await edgesAll(url('&mode=live'), deps);
+    } finally { clock.mockRestore(); }
     expect(all.filter(edge => edge.kind === 'hand').map(edge => edge.ref).sort()).toEqual(['c3', 'ta-live', 'ta-shadow']);
     expect(live.filter(edge => edge.kind === 'hand').map(edge => [edge.ref, edge.mode])).toEqual([['ta-live', 'live'], ['c3', 'live']]);
     expect(live.filter(edge => edge.kind !== 'hand')).toEqual(all.filter(edge => edge.kind !== 'hand'));

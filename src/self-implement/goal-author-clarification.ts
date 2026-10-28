@@ -50,6 +50,8 @@ export type GoalAuthorClarificationAnswerSource = 'injected' | 'recommended' | '
 export interface GoalAuthorClarificationProvenance {
   source: GoalAuthorClarificationAnswerSource;
   evidence?: string[];
+  assumption?: string;
+  assumptionSource?: 'resolver' | 'policy-default' | 'recommended';
 }
 
 export interface GoalAuthorClarificationResponse {
@@ -81,7 +83,7 @@ export interface GoalAuthorSelfResolutionContext {
 }
 
 export type GoalAuthorSelfResolution =
-  | { answer: string; evidence: readonly string[]; declined?: undefined }
+  | { answer: string; evidence: readonly string[]; assumption?: string; declined?: undefined }
   | { answer?: undefined; evidence?: undefined; declined?: boolean };
 
 export interface GoalAuthorClarificationResolutionDeps {
@@ -125,8 +127,8 @@ function truncateAsk(ask: string): string {
 function selfResolutionPrompt(context: GoalAuthorSelfResolutionContext): string {
   return [
     'Answer this goal-author clarification using only the supplied repository evidence.',
-    'Do not delegate to an implementation agent. If the evidence cannot justify one single-line answer, return {"answer":null}.',
-    'Return JSON only: {"answer":"..."} or {"answer":null}.',
+    'Do not delegate to an implementation agent. Choose the best supported candidate and state the assumption that makes it the best fit. If the evidence cannot justify one answer, return {"answer":null}.',
+    'Return JSON only: {"answer":"...","assumption":"..."} or {"answer":null}.',
     ...(context.ask?.trim() ? [`Request being authored:\n${truncateAsk(context.ask.trim())}`] : []),
     `Question: ${context.question}`,
     `Options: ${context.options.join(' | ') || '(free input)'}`,
@@ -195,22 +197,31 @@ export async function defaultGoalAuthorSelfResolve(
     return context.questionId === 'preservation_contract' ? { declined: true } : {};
   }
   const controller = new AbortController();
+  const prompt = selfResolutionPrompt(context);
+  let rejectTimeout!: (reason: Error) => void;
+  const timeoutPromise = new Promise<never>((_, reject) => { rejectTimeout = reject; });
   const timeout = setTimeout(
-    () => controller.abort(new Error(SELF_RESOLUTION_TIMEOUT_MESSAGE)),
+    () => {
+      const error = new Error(SELF_RESOLUTION_TIMEOUT_MESSAGE);
+      controller.abort(error);
+      rejectTimeout(error);
+    },
     selfResolutionTimeoutMs(deps.timeoutMs),
   );
-  const prompt = selfResolutionPrompt(context);
   const onUsage = (usage: LLMUsage) => { usages.push(usage); };
   try {
-    const result = await (deps.stream ?? (async (input, signal, reportUsage) => {
-      const { streamLLM } = await import('../llm.js');
-      return streamLLM([{ role: 'user', content: input }], () => {}, {
-        model: process.env.ELANOUS_GOAL_AUTHOR_MODEL || tierModel('better'),
-        reasoningEffort: 'high',
-        signal,
-        onUsage: reportUsage,
-      });
-    }))(prompt, controller.signal, onUsage);
+    const result = await Promise.race([
+      (deps.stream ?? (async (input, signal, reportUsage) => {
+        const { streamLLM } = await import('../llm.js');
+        return streamLLM([{ role: 'user', content: input }], () => {}, {
+          model: process.env.ELANOUS_GOAL_AUTHOR_MODEL || tierModel('better'),
+          reasoningEffort: 'high',
+          signal,
+          onUsage: reportUsage,
+        });
+      }))(prompt, controller.signal, onUsage),
+      timeoutPromise,
+    ]);
     let parsed: unknown;
     try {
       parsed = JSON.parse(result);
@@ -222,11 +233,15 @@ export async function defaultGoalAuthorSelfResolve(
       ? (parsed as { answer?: unknown }).answer
       : undefined;
     if (typeof answer === 'string') {
+      const assumptionValue = (parsed as { assumption?: unknown }).assumption;
+      const assumption = typeof assumptionValue === 'string' && assumptionValue.trim()
+        ? assumptionValue.trim()
+        : undefined;
       observeSelfResolve('self-resolve-answered', context, startedAt, {
         answerLength: answer.length,
         usage: deriveUsage(usages),
       });
-      return { answer, evidence: context.evidence };
+      return { answer, evidence: context.evidence, ...(assumption ? { assumption } : {}) };
     }
     observeSelfResolve('self-resolve-unanswered', context, startedAt, {
       reason: answer === null ? 'declined' : 'shape-mismatch',
@@ -281,7 +296,11 @@ function responseFor(clarification: IntakeClarification, observe = false, selfRe
     ...deferredResponse(clarification),
     answer: automaticAnswer,
     status: 'ANSWERED',
-    provenance: { source: 'recommended' },
+    provenance: {
+      source: 'recommended',
+      assumption: '저작기가 표시한 단일 recommended 후보를 우선 선택하는 정책을 적용한다',
+      assumptionSource: 'recommended',
+    },
   };
 }
 
@@ -331,11 +350,17 @@ export async function resolveGoalAuthorClarification(
     if (!answer || /[\r\n]/.test(answer) || evidence.length === 0) {
       return deterministic;
     }
+    const resolverAssumption = 'assumption' in resolution ? resolution.assumption?.trim() : undefined;
+    const assumption = resolverAssumption
+      || `정책 가정(resolver가 별도 가정을 생략함): 제공 근거와 요청에 가장 맞는 후보를 선택한다 (${answer})`;
     const response: GoalAuthorClarificationResponse = {
       ...deferredResponse(clarification),
       answer,
       status: 'ANSWERED',
-      provenance: { source: 'self-authored', evidence },
+      provenance: {
+        source: 'self-authored', evidence, assumption,
+        assumptionSource: resolverAssumption ? 'resolver' : 'policy-default',
+      },
     };
     observeGoalAuthor('goal-author.clarify', 'self-answered', {
       questionId: clarification.questionId,
@@ -407,31 +432,58 @@ function parseRecord(raw: string): SerializedGoalAuthorClarification | null {
       && Array.isArray(provenance.evidence)
       && provenance.evidence.length > 0
       && provenance.evidence.every((item) => typeof item === 'string' && item.length > 0);
+    const selfAuthoredAssumption = typeof provenance?.assumption === 'string' && provenance.assumption.trim()
+      ? provenance.assumption.trim()
+      : undefined;
     const response = isSelfAuthored
       ? {
         ...deferredResponse(value.clarification),
         answer: value.response.answer!,
         status: 'ANSWERED' as const,
-        provenance: { source: 'self-authored' as const, evidence: provenance.evidence },
+        provenance: {
+          source: 'self-authored' as const,
+          evidence: provenance.evidence,
+          ...(selfAuthoredAssumption ? { assumption: selfAuthoredAssumption } : {}),
+          ...(provenance.assumptionSource === 'resolver' || provenance.assumptionSource === 'policy-default'
+            ? { assumptionSource: provenance.assumptionSource }
+            : {}),
+        },
       }
       : expected;
     const responseProvenance = response.provenance;
     const serializedProvenance = value.response.provenance;
     const expectedProvenanceKeys = responseProvenance === undefined
       ? []
-      : responseProvenance.evidence === undefined ? ['source'] : ['evidence', 'source'];
+      : [
+        ...(responseProvenance.assumption === undefined ? [] : ['assumption']),
+        ...(responseProvenance.assumptionSource === undefined ? [] : ['assumptionSource']),
+        ...(responseProvenance.evidence === undefined ? [] : ['evidence']),
+        'source',
+      ];
     const serializedProvenanceKeys = serializedProvenance === undefined
       ? []
       : Object.keys(serializedProvenance).sort();
+    // Older serialized goal rows predate assumption provenance. Keep accepting those rows while
+    // still validating every field they actually contain; parsing upgrades them to the current
+    // deterministic response shape above.
+    const legacyAssumptionKeys = responseProvenance?.source === 'recommended'
+      ? ['assumption', 'assumptionSource']
+      : [];
+    const provenanceKeysMatch = (serializedProvenanceKeys.length === expectedProvenanceKeys.length
+      && expectedProvenanceKeys.every((key) => serializedProvenanceKeys.includes(key)))
+      || (legacyAssumptionKeys.length > 0
+        && expectedProvenanceKeys.filter((key) => !legacyAssumptionKeys.includes(key)).every((key) => serializedProvenanceKeys.includes(key))
+        && serializedProvenanceKeys.every((key) => expectedProvenanceKeys.includes(key)));
     const provenanceMatches = (serializedProvenance === undefined) === (responseProvenance === undefined)
-      && serializedProvenanceKeys.length === expectedProvenanceKeys.length
-      && serializedProvenanceKeys.every((key, index) => key === expectedProvenanceKeys[index])
+      && provenanceKeysMatch
       && serializedProvenance?.source === responseProvenance?.source
       && (responseProvenance?.evidence === undefined
         ? serializedProvenance?.evidence === undefined
         : Array.isArray(serializedProvenance?.evidence)
           && serializedProvenance.evidence.length === responseProvenance.evidence.length
-          && serializedProvenance.evidence.every((item, index) => item === responseProvenance.evidence?.[index]));
+          && serializedProvenance.evidence.every((item, index) => item === responseProvenance.evidence?.[index]))
+      && (serializedProvenance?.assumption === undefined || serializedProvenance.assumption === responseProvenance?.assumption)
+      && (serializedProvenance?.assumptionSource === undefined || serializedProvenance.assumptionSource === responseProvenance?.assumptionSource);
     if (value.response.questionId !== response.questionId
       || value.response.answer !== response.answer
       || value.response.status !== response.status
@@ -467,6 +519,21 @@ export interface GoalDocumentClarification {
   answerLine: number;
   provenanceSource?: GoalAuthorClarificationAnswerSource;
   provenanceLines?: number[];
+}
+
+export type GoalClarificationDecisionCategory = 'money' | 'security' | 'irreversible';
+
+/** Only questions that could authorize money, security, or irreversible external effects need a decision card. */
+export function goalClarificationDecisionCategory(
+  clarification: Pick<GoalDocumentClarification, 'header' | 'question' | 'options'>,
+): GoalClarificationDecisionCategory | undefined {
+  const text = [clarification.header, clarification.question, ...clarification.options.flatMap((option) => [option.label, option.description])]
+    .join(' ')
+    .toLocaleLowerCase();
+  if (/\b(payment|purchase|spend|budget|credit|charge|price|cost|paid)\b|결제|구매|지출|예산|크레딧|과금|가격|비용/.test(text)) return 'money';
+  if (/\b(security|credential|token|secret|password|authorization|authentication|permission|access control)\b|보안|자격 증명|토큰|비밀키|비밀번호|인가|인증|권한/.test(text)) return 'security';
+  if (/\b(publish|publication|deploy|send|delete|release|irreversible|external side effect|production)\b|발행|게시|배포|전송|삭제|릴리스|되돌릴 수 없|외부 효과|운영 환경/.test(text)) return 'irreversible';
+  return undefined;
 }
 
 interface GoalAuthorClarificationSeed {
@@ -572,6 +639,17 @@ export function parseGoalDocumentClarifications(document: string): GoalDocumentC
       const provenanceSource = /^  - provenance\.source: (injected|recommended|self-authored|default)$/.exec(line);
       if (provenanceSource) {
         fields.set('provenanceSource', provenanceSource[1]);
+        provenanceLines.push(index);
+        readingOptions = false;
+        continue;
+      }
+      const provenanceAssumption = /^  - provenance\.assumption: (.*)$/.exec(line);
+      if (provenanceAssumption) {
+        provenanceLines.push(index);
+        readingOptions = false;
+        continue;
+      }
+      if (/^  - provenance\.assumption-source: (resolver|policy-default|recommended)$/.test(line)) {
         provenanceLines.push(index);
         readingOptions = false;
         continue;
@@ -747,6 +825,7 @@ export async function selfAnswerGoalDocumentClarifications(
     evidence?: readonly string[];
     resolver?: GoalClarificationSelfResolver;
     runId?: string;
+    skipQuestionIds?: ReadonlySet<string>;
   },
 ): Promise<{ document: string; asked: number; answered: number; unanswered: number; newlyAnswered: number }> {
   const clarifications = parseGoalDocumentClarifications(document);
@@ -761,7 +840,7 @@ export async function selfAnswerGoalDocumentClarifications(
   const evidence = options.evidence ?? document.split(/\r?\n/)
     .filter((line) => /^(?:\s*- (?:\[code:|\[document:|TRACED PATHS|evidence:|Evidence:)|\s*-?\s*`?(?:src|test|scripts)\/[^\s`]+:\d+)/i.test(line))
     .slice(0, 40);
-  for (const item of pending) {
+  for (const item of pending.filter((entry) => !options.skipQuestionIds?.has(entry.questionId))) {
     if (parseGoalDocumentClarifications(updated).filter((entry) => entry.questionId === item.questionId).length !== 1) continue;
     let response: Awaited<ReturnType<typeof resolveGoalAuthorClarification>>;
     let declined = false;
@@ -789,7 +868,9 @@ export async function selfAnswerGoalDocumentClarifications(
     if (response.answer === null && item.questionId === 'preservation_contract'
       && declined) {
       const fallback = preservationDefault(options.ask ?? document);
-      response = { ...response, answer: fallback.answer, status: 'ANSWERED', provenance: { source: 'default' } };
+      response = { ...response, answer: fallback.answer, status: 'ANSWERED', provenance: {
+        source: 'default', assumption: '기존 공개 동작 보존을 기본 가정으로 적용한다', assumptionSource: 'policy-default',
+      } };
       defaultExportCount = fallback.exportCount;
     }
     if (response.answer === null || (response.provenance?.source !== 'self-authored' && response.provenance?.source !== 'default')
@@ -806,6 +887,8 @@ export async function selfAnswerGoalDocumentClarifications(
       lines[answerLine] = `  - answer: ${response.answer}`;
       lines.splice(answerLine + 1, 0,
         `  - provenance.source: ${answerSource}`,
+        ...(response.provenance.assumption ? [`  - provenance.assumption: ${response.provenance.assumption.replace(/[\r\n]/g, ' ')}`] : []),
+        ...(response.provenance.assumptionSource ? [`  - provenance.assumption-source: ${response.provenance.assumptionSource}`] : []),
         ...(response.provenance.evidence ?? []).map((entry) => `  - evidence: ${entry.replace(/[\r\n]/g, ' ')}`));
       updateWhatToBuildRenderAnswers(lines, item.questionId, response.answer);
       if (hasWhatToBuildUnansweredRenderAnswer(lines, item.questionId)) continue;
@@ -834,6 +917,77 @@ export async function selfAnswerGoalDocumentClarifications(
     reason: unanswered === 0 ? 'answered' : 'insufficient-evidence',
   });
   return { document: updated, asked, answered, unanswered, newlyAnswered };
+}
+
+/** SelfImplement boundary: resolve pending questions itself and record a bounded policy assumption if that fails.
+ *  Interactive callers must not turn an authoring clarification into a human popup. */
+export async function selfAnswerOrAssumeGoalDocumentClarifications(
+  document: string,
+  options: Parameters<typeof selfAnswerGoalDocumentClarifications>[1],
+): Promise<Awaited<ReturnType<typeof selfAnswerGoalDocumentClarifications>> & {
+  assumed: number;
+  decisionRequired: Array<{ questionId: string; header: string; question: string; category: GoalClarificationDecisionCategory }>;
+}> {
+  const safetyQuestions = parseGoalDocumentClarifications(document).filter((entry) => !entry.answered)
+    .map((entry) => ({ entry, category: goalClarificationDecisionCategory(entry) }))
+    .filter((item): item is { entry: GoalDocumentClarification; category: GoalClarificationDecisionCategory } => item.category !== undefined);
+  const attempted = await selfAnswerGoalDocumentClarifications(document, {
+    ...options,
+    skipQuestionIds: new Set(safetyQuestions.map((item) => item.entry.questionId)),
+  });
+  let updated = attempted.document;
+  let assumed = 0;
+  const decisionRequired: Array<{ questionId: string; header: string; question: string; category: GoalClarificationDecisionCategory }> =
+    safetyQuestions.map(({ entry, category }) => ({ questionId: entry.questionId, header: entry.header, question: entry.question, category }));
+  for (const item of parseGoalDocumentClarifications(updated).filter((entry) => !entry.answered)) {
+    const category = goalClarificationDecisionCategory(item);
+    if (category) continue;
+    const offered = item.options.filter((option) => option.label.trim() && !/[\r\n]/.test(option.label));
+    const useOfferedOption = !item.includeOther && offered.length > 0;
+    const answer = useOfferedOption
+      ? offered[0]!.label.trim()
+      : '근거가 부족하므로 요청에 명시된 범위만 진행한다고 가정한다';
+    const assumption = useOfferedOption
+      ? '자가 해소가 답을 내지 못해 자유 답변 없이 제시된 첫 후보를 정책 가정으로 선택했다'
+      : '자가 해소가 답을 내지 못해 추가 범위를 만들지 않고 요청에 명시된 범위만 진행한다고 가정했다';
+    try {
+      const current = findUnansweredGoalDocumentClarification(updated, item.questionId);
+      const lines = updated.split(/\r?\n/);
+      const provenanceLines = current.provenanceLines ?? [];
+      for (const line of [...provenanceLines].sort((left, right) => right - left)) lines.splice(line, 1);
+      const answerLine = current.answerLine - provenanceLines.filter((line) => line < current.answerLine).length;
+      lines[answerLine] = `  - answer: ${answer}`;
+      lines.splice(answerLine + 1, 0,
+        '  - provenance.source: default',
+        `  - provenance.assumption: ${assumption}`,
+        '  - provenance.assumption-source: policy-default',
+      );
+      updateWhatToBuildRenderAnswers(lines, item.questionId, answer);
+      if (hasWhatToBuildUnansweredRenderAnswer(lines, item.questionId)) continue;
+      const candidate = lines.join(updated.includes('\r\n') ? '\r\n' : '\n');
+      if (!parseGoalDocumentClarifications(candidate).some((entry) => entry.questionId === item.questionId
+        && entry.answered && entry.answer === answer && entry.provenanceSource === 'default')) continue;
+      updated = candidate;
+      assumed += 1;
+      observeGoalAuthor('goal-author.clarify', 'self-answer-assumed', {
+        runId: options.runId ?? process.env.ELANOUS_RUN_ID,
+        questionId: item.questionId,
+        assumptionSource: 'policy-default',
+        selectedOfferedOption: useOfferedOption,
+      });
+    } catch {
+      // Keep the pending question visible to the caller as a no-launch reason; never dispatch it to a popup.
+    }
+  }
+  return {
+    ...attempted,
+    document: updated,
+    answered: attempted.answered + assumed,
+    unanswered: Math.max(0, attempted.unanswered - assumed),
+    newlyAnswered: attempted.newlyAnswered + assumed,
+    assumed,
+    decisionRequired,
+  };
 }
 
 

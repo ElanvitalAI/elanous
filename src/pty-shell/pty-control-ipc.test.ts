@@ -1,6 +1,6 @@
 // P2b — 크로스-프로세스 PTY 제어 IPC(SQLite 큐)의 핵심 acceptance. 같은 프로세스에서 요청자↔owner
 // round-trip 을 검증한다(upsertPtyManifest 가 owner_pid=process.pid 로 등록하므로 동일 프로세스가 처리).
-import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { tmpdir } from 'node:os';
@@ -152,6 +152,67 @@ describe('pty-control-ipc round-trip', () => {
       await processPtyControlRequests(getPtyControlTarget, () => false);
       expect(await claimed).toEqual({ status: 'denied', reason: 'dimensions-unknown' });
       expect(stopPtyRecording(id)).toEqual({ ok: false, reason: 'not-recording' });
+    } finally {
+      unregister();
+      process.stdout.write = original;
+    }
+  });
+
+  test('stop-turn requires force, actor identity, and reason; accepts a different-run supervisor only', async () => {
+    const id = `tui:${process.pid}`;
+    let stops = 0;
+    const target = createTuiControlTarget(id, { stopTurn: () => { stops += 1; return true; } });
+    const original = process.stdout.write;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const unregister = registerPtyControlTarget(target);
+    try {
+      registerInRun(id, 'tui-turn-run');
+      const missingForce = requestRemotePtyControl(id, 'stop-turn', undefined, { actor: 'human', timeoutMs: 2000 });
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      expect(await missingForce).toEqual({ status: 'denied', reason: 'force-required' });
+      const missingIdentity = requestRemotePtyControl(id, 'stop-turn', { force: true, reason: 'stuck turn' } as never, { actor: 'agent', timeoutMs: 2000 });
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      expect(await missingIdentity).toEqual({ status: 'denied', reason: 'actor-identity-required' });
+      const self = withRunId('tui-turn-run', () => requestRemotePtyControl(id, 'stop-turn', { force: true, actorIdentity: 'OPC', reason: 'self test' }, { actor: 'agent', timeoutMs: 2000 }));
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      expect(await self).toEqual({ status: 'denied', reason: 'self-turn-refused' });
+      expect(log).toHaveBeenCalledWith('pty.turn', 'force-stop-settled', expect.objectContaining({
+        actor: 'agent', actorIdentity: 'OPC', reason: 'self test', outcome: 'denied', refusal: 'self-turn-refused',
+      }));
+      const forced = withRunId('op-supervisor-run', () => requestRemotePtyControl(id, 'stop-turn', { force: true, actorIdentity: 'OP', reason: 'unattended seat stuck' }, { actor: 'agent', timeoutMs: 2000 }));
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      expect(await forced).toEqual({ status: 'success' });
+      expect(stops).toBe(1);
+      expect(log).toHaveBeenCalledWith('pty.turn', 'force-stop-settled', expect.objectContaining({
+        actor: 'agent', actorIdentity: 'OP', reason: 'unattended seat stuck', outcome: 'success', refusal: null,
+      }));
+    } finally {
+      log.mockRestore();
+      unregister();
+      process.stdout.write = original;
+    }
+  });
+
+  test('stop-turn refuses unknown requester identity and an inactive TUI turn', async () => {
+    const id = `tui:${process.pid}`;
+    const target = createTuiControlTarget(id, { stopTurn: () => false });
+    const original = process.stdout.write;
+    const unregister = registerPtyControlTarget(target);
+    try {
+      registerInRun(id, 'active-tui-run');
+      const payload = { force: true, actorIdentity: 'OP', reason: 'seat recovery' } as const;
+      const unknown = withRunId(undefined, () => requestRemotePtyControl(id, 'stop-turn', payload, { actor: 'agent', timeoutMs: 2000 }));
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      expect(await unknown).toEqual({ status: 'denied', reason: 'run-identity-unavailable' });
+      const inactive = withRunId('op-supervisor-run', () => requestRemotePtyControl(id, 'stop-turn', payload, { actor: 'agent', timeoutMs: 2000 }));
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      expect(await inactive).toEqual({ status: 'denied', reason: 'no-active-turn' });
     } finally {
       unregister();
       process.stdout.write = original;

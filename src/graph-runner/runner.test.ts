@@ -448,6 +448,16 @@ test('subgraph rejects incompatible contracts, missing inputs/outputs, over-budg
   expect(rejectedEvents.filter(entry => entry.event === 'graph.unit')).toEqual([]);
   expect(noInput.status).toBe('failed');
   expect(noInput.nodes[0]).toMatchObject({ executed: false, error: expect.stringContaining('unit input missing') });
+  expect(noInput.nodes[0]?.failure).toMatchObject({
+    errorCode: 'GRAPH_UNIT_INPUT_MISSING',
+    message: expect.stringContaining('unit input missing'),
+    stage: 'unit-invocation',
+  });
+  expect(rejectedEvents.find(entry => entry.event === 'node-end')?.data).toMatchObject({
+    ok: false,
+    reason: expect.stringContaining('unit input missing'),
+    failure: { errorCode: 'GRAPH_UNIT_INPUT_MISSING', stage: 'unit-invocation' },
+  });
   expect(noInput.executed).toBe(0);
   expect(JSON.parse(readFileSync(noInput.statePath, 'utf8')).nodes[0].executed).toBe(false);
   expect(noInput.unitCalls).toBeUndefined();
@@ -743,7 +753,10 @@ test('failed command-spawn nodes persist exit and masked stderr tail on node-end
       runBash: async () => ({ stdout: '', stderr: '', exitCode: 9 }),
     } });
     expect(emptyFailure.nodes[0]).toMatchObject({ exit: 9, ok: false });
-    expect(emptyFailure.nodes[0]).not.toHaveProperty('reason');
+    expect(emptyFailure.nodes[0]).toMatchObject({
+      reason: expect.stringContaining('bash exit 9'),
+      failure: { errorCode: 'GRAPH_NODE_FAILED', stage: 'command-execution', message: expect.stringContaining('bash exit 9') },
+    });
   } finally {
     if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previousState;
@@ -1337,6 +1350,59 @@ test('loop named terminals preserve success and failure status', async () => {
     expect(result.path.at(-1)).toBe(terminal);
     expect(JSON.parse(readFileSync(result.statePath, 'utf8')).reason).toBe(terminal);
   }
+});
+
+test('checked-in research loop reaches landed in runner plan and failure parks at needs-human', async () => {
+  const shippedPath = join(import.meta.dir, '../../graphs/research-loop.yaml');
+  const shipped = parseYaml(readFileSync(shippedPath, 'utf8')) as Record<string, unknown>;
+  const root = mkdtempSync(join(tmpdir(), 'research-loop-runner-fixture-'));
+  dirs.push(root);
+  const graph = join(root, 'research-loop.yaml');
+  writeFileSync(graph, '{}\n');
+  writeFileSync(join(root, 'recipes.yaml'), 'fixture-work:\n  command: "fixture-work"\n');
+
+  // The checked-in graph is passed unchanged through the production planner for the normal route.
+  const planned = await runGraph(shippedPath, { dryRun: true, deps: { root } });
+  expect(planned).toMatchObject({ status: 'done', reason: 'landed' });
+  expect(planned.path.at(-1)).toBe('landed');
+  expect(planned.executed).toBe(0);
+
+  // Keep the shipped identity and terminal contract while narrowing execution to a deterministic branch fixture.
+  const fixtureGraph = {
+    graph_id: shipped.graph_id,
+    version: shipped.version,
+    entry_node: 'fixture-work',
+    terminal_nodes: shipped.terminal_nodes,
+    nodes: [
+      { node_id: 'fixture-work', kind: 'agent', recipe: 'cmd:fixture-work', max_visits: 1 },
+      { node_id: 'after-work', kind: 'agent', recipe: 'cmd:fixture-work', max_visits: 1 },
+      { node_id: 'landed', kind: 'gate', recipe: 'none', max_visits: 1 },
+      { node_id: 'needs-human', kind: 'gate', recipe: 'none', max_visits: 1 },
+    ],
+    edges: [
+      { from: 'fixture-work', on: 'outcome', map: { ok: 'after-work', fail: 'needs-human' } },
+      { from: 'after-work', to: 'landed' },
+    ],
+  };
+  const run = async (exitCode: 0 | 1) => {
+    const commands: string[] = [];
+    const result = await runGraph(graph, { graphSource: JSON.stringify(fixtureGraph), deps: {
+      root,
+      runBash: async (body: string) => {
+        commands.push(body);
+        return { stdout: '', stderr: '', exitCode };
+      },
+    } });
+    return { result, commands };
+  };
+
+  const success = await run(0);
+  expect(success.result).toMatchObject({ status: 'done', reason: 'landed', path: ['fixture-work', 'after-work', 'landed'] });
+  expect(success.commands).toHaveLength(2);
+
+  const failure = await run(1);
+  expect(failure.result).toMatchObject({ status: 'failed', reason: 'needs-human', path: ['fixture-work', 'needs-human'] });
+  expect(failure.commands).toHaveLength(1);
 });
 
 test('loop graph still rejects undeclared terminal names before running', async () => {

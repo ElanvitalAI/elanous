@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withFakeBins } from '../ux-sim/fake-bin.js';
 import {
   annotateJsonStdout, decideGateDispatch, dispatchHeavyCheck, extractGateRemoteFlags, GATE_REMOTE_DEFAULTS, relativizeArgs,
-  gateRemoteHostCap, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type SshResult,
+  gateRemoteHostCap, gateReservationAlternateHosts, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, remoteSupervisorScript, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type SshResult,
 } from './gate-remote.js';
 import { parseGateRemoteConfig } from '../user-config.js';
 import { reserveReleaseGateHosts } from '../release-loop/gate-host-reservation.js';
@@ -57,6 +57,8 @@ describe('dispatch decision', () => {
     expect(remoteSelfGateArgv({ changed: true, base: 'origin/main' }, () => MAIN)).not.toContain('--shards');
     expect(remoteSelfGateArgv({ changed: true, base: 'origin/main', shards: 3, shardConcurrency: 4 }, () => MAIN))
       .toContain('--shard-concurrency');
+    expect(remoteSelfGateArgv({ changed: true, base: 'origin/main', noInherit: true }, () => MAIN))
+      .toContain('--no-inherit');
   });
   test('load above the threshold goes remote; at or below stays local', () => {
     expect(decideGateDispatch({ flags: { local: false }, settings, load1: 25, env: {} })).toMatchObject({ mode: 'remote', host: 'node-b' });
@@ -192,7 +194,7 @@ describe('host lock wiring', () => {
   test('heavy typecheck uses a stable slot checkout and a private per-slot cache', () => {
     const script = remoteScript({ mirror: '~/m.git', commit: HEAD, fetchShas: [HEAD],
       argv: ['bun', 'run', 'scripts/ci-typecheck-changed.ts', '--local'], installPwa: true, stableCheckout: true });
-    expect(script).toContain('env GATE_REMOTE_SLOT="$n" sh "$W/run.sh"');
+    expect(script).toContain('env GATE_REMOTE_SLOT="$n" sh "$W/supervise.sh"');
     expect(script).toContain('T="$HOME/.cache/elanous/gate-remote/slot$GATE_REMOTE_SLOT/checkout"');
     expect(script).toContain('ELANOUS_TSC_CACHE_DIR="$HOME/.cache/elanous/gate-remote/slot$GATE_REMOTE_SLOT/cache"');
     expect(script).toContain('git -C "$T" reset --hard -q');
@@ -219,8 +221,93 @@ describe('host lock wiring', () => {
     const script = remoteScript({ mirror: '~/m.git', commit: HEAD, fetchShas: [HEAD], argv: ['x'], installPwa: false, hostCap: 2 });
     const runStart = script.indexOf("<<'__GATE_REMOTE_RUN__'");
     expect(runStart).toBeLessThan(script.indexOf('git clone'));
-    expect(script.lastIndexOf('__GATE_REMOTE_RUN__')).toBeLessThan(script.indexOf('$GL "$GS/slot$n" sh "$W/run.sh"'));
+    expect(script.lastIndexOf('__GATE_REMOTE_RUN__')).toBeLessThan(script.indexOf('$GL "$GS/slot$n" sh "$W/supervise.sh"'));
+    expect(script).toContain('POSIX::setpgid(0,0)');
     expect(script).toContain('while [ $n -le 2 ]');
+  });
+
+  test('supervisor wall limit reaps its own worker group and leaves an unrelated process alive', () => {
+    expect(has('perl') && has('ps')).toBe(true);
+    const w = slotDir();
+    writeFileSync(join(w, 'run.sh'), 'echo $$ > "$W/worker.pid"\nsleep 30\necho done\n');
+    const unrelated = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+    try {
+      const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1), encoding: 'utf8', timeout: 12_000,
+        env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: String(process.pid) } });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(124);
+      expect(existsSync(join(w, 'supervisor-timeout'))).toBe(true);
+      expect(existsSync(join(w, 'worker.pid'))).toBe(true);
+      const worker = Number(readFileSync(join(w, 'worker.pid'), 'utf8').trim());
+      expect(Number.isSafeInteger(worker)).toBe(true);
+      expect(spawnSync('sh', ['-c', `kill -0 ${worker} 2>/dev/null`]).status).not.toBe(0);
+      expect(spawnSync('sh', ['-c', `kill -0 ${unrelated.pid} 2>/dev/null`]).status).toBe(0);
+    } finally {
+      if (unrelated.pid) { try { process.kill(-unrelated.pid, 'SIGTERM'); } catch { /* already gone */ } }
+    }
+  });
+
+  test('wall limit kills a TERM-ignoring worker after the owned group leader exits', () => {
+    expect(has('perl') && has('ps')).toBe(true);
+    const w = slotDir();
+    writeFileSync(join(w, 'run.sh'), 'echo $$ > "$W/worker.pid"\ntrap "" TERM\nsleep 30\n');
+    const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1), encoding: 'utf8', timeout: 12_000,
+      env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: String(process.pid) } });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(124);
+    const worker = Number(readFileSync(join(w, 'worker.pid'), 'utf8').trim());
+    expect(spawnSync('sh', ['-c', `kill -0 ${worker} 2>/dev/null`]).status).not.toBe(0);
+  });
+
+  test('wall limit reaps an exec-replaced group leader after startup ownership proof', () => {
+    expect(has('perl') && has('ps')).toBe(true);
+    const w = slotDir();
+    writeFileSync(join(w, 'run.sh'), 'echo $$ > "$W/worker.pid"\nexec sleep 30\n');
+    const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1), encoding: 'utf8', timeout: 12_000,
+      env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: String(process.pid) } });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(124);
+    expect(existsSync(join(w, 'supervisor-timeout'))).toBe(true);
+    const worker = Number(readFileSync(join(w, 'worker.pid'), 'utf8').trim());
+    expect(spawnSync('sh', ['-c', `kill -0 ${worker} 2>/dev/null`]).status).not.toBe(0);
+  });
+
+  test('supervisor reaps its worker when the owning SSH shell disappears', () => {
+    expect(has('perl') && has('ps')).toBe(true);
+    const w = slotDir();
+    writeFileSync(join(w, 'run.sh'), 'echo $$ > "$W/worker.pid"\nsleep 30\necho done\n');
+    const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(30), encoding: 'utf8', timeout: 12_000,
+      env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: '99999999' } });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(125);
+    expect(existsSync(join(w, 'supervisor-infra'))).toBe(true);
+    const worker = Number(readFileSync(join(w, 'worker.pid'), 'utf8').trim());
+    expect(spawnSync('sh', ['-c', `kill -0 ${worker} 2>/dev/null`]).status).not.toBe(0);
+  });
+
+  test('a naturally completed worker keeps its exit code without a supervisor failure marker', () => {
+    expect(has('perl') && has('ps')).toBe(true);
+    const w = slotDir();
+    writeFileSync(join(w, 'run.sh'), 'exit 124\n');
+    const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(30), encoding: 'utf8', timeout: 12_000,
+      env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: String(process.pid) } });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(124);
+    expect(existsSync(join(w, 'supervisor-timeout'))).toBe(false);
+    expect(existsSync(join(w, 'supervisor-infra'))).toBe(false);
+  });
+
+  test('a broken stderr pipe reaps the owned worker group', () => {
+    expect(has('perl') && has('ps')).toBe(true);
+    const w = slotDir();
+    writeFileSync(join(w, 'run.sh'), 'echo $$ > "$W/worker.pid"\nsleep 30\n');
+    const result = spawnSync('sh', ['-s'], { input: `exec 2>&-\n${remoteSupervisorScript(30)}`, encoding: 'utf8', timeout: 12_000,
+      env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: String(process.pid) } });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(125);
+    expect(existsSync(join(w, 'supervisor-infra'))).toBe(true);
+    const worker = Number(readFileSync(join(w, 'worker.pid'), 'utf8').trim());
+    expect(spawnSync('sh', ['-c', `kill -0 ${worker} 2>/dev/null`]).status).not.toBe(0);
   });
 
   test('busy marker carries the host-observed occupied slots and load', () => {
@@ -363,24 +450,47 @@ describe('self gate explicit remote placement', () => {
     } finally { release(); }
   });
 
-  test('a release gate reservation reroutes node-b to node-c and names the reason', async () => {
+  test.each([['node-b', 'node-b'], [true, 'node-b']] as const)(
+    'a release reservation reroutes self gate %s to the free WSL host without local execution', async (remote, reservedHost) => {
+      const root = slotDir();
+      const release = reserveReleaseGateHosts(root, 'gate-run', [reservedHost]);
+      try {
+        const runner = fakeRunner();
+        const io = sink();
+        let localCalls = 0;
+        const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote },
+          explicitRemoteOnly: true, reportRemoteHost: true, reservationRoot: root, remoteArgv: ['x'],
+          runLocal: () => { localCalls++; return 0; } },
+        { runner, settings, env: {}, load1: 1, write: io.write });
+        expect(rc).toBe(0);
+        expect(localCalls).toBe(0);
+        expect(runner.calls).toContainEqual(['ssh', 'host-e-wsl']);
+        expect(runner.calls.some(([kind, target]) => kind === 'ssh' && target === reservedHost)).toBe(false);
+        expect(io.err.join('')).toContain(`host-reserved: ${reservedHost} (release gate gate-run holds ${reservedHost})`);
+        expect(io.err.join('')).toContain('owner=gate-run');
+        expect(io.err.join('')).toMatch(/reserved-at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+        expect(io.err.join('')).toContain('rerouting to host-e-wsl');
+        expect(io.err.join('')).not.toContain('using node-c');
+      } finally { release(); }
+  });
+
+  test('an explicitly selected WSL host stays selected while node-b is reserved', async () => {
     const root = slotDir();
     const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b']);
     try {
       const runner = fakeRunner();
       const io = sink();
-      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'host-e-wsl' },
         explicitRemoteOnly: true, reportRemoteHost: true, reservationRoot: root, remoteArgv: ['x'],
         runLocal: () => { throw new Error('must stay remote'); } },
       { runner, settings, env: {}, load1: 1, write: io.write });
       expect(rc).toBe(0);
-      expect(runner.calls).toContainEqual(['ssh', 'node-c']);
-      expect(io.err.join('')).toContain('node-b reserved (release gate gate-run holds node-b) — using node-c');
-      expect(io.err.join('')).toContain('executed on node-c (rc=0)');
+      expect(runner.calls).toContainEqual(['ssh', 'host-e-wsl']);
+      expect(io.err.join('')).toContain('executed on host-e-wsl (rc=0)');
     } finally { release(); }
   });
 
-  test('an SSH user prefix still matches the reserved machine', async () => {
+  test('an SSH user prefix still matches the reserved machine and reroutes with the prefix kept', async () => {
     const root = slotDir();
     const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b']);
     try {
@@ -390,12 +500,94 @@ describe('self gate explicit remote placement', () => {
         explicitRemoteOnly: true, reservationRoot: root, remoteArgv: ['x'], runLocal: () => { throw new Error('must stay remote'); } },
       { runner, settings, env: {}, load1: 1, write: io.write });
       expect(rc).toBe(0);
-      expect(runner.calls).toContainEqual(['ssh', 'node-c']);
-      expect(io.err.join('')).toContain('agent@node-b reserved');
+      expect(runner.calls).toContainEqual(['ssh', 'agent@host-e-wsl']);
+      expect(io.err.join('')).toContain('host-reserved: agent@node-b');
+      expect(io.err.join('')).toContain('rerouting to agent@host-e-wsl');
     } finally { release(); }
   });
 
-  test('unreadable reservation evidence blocks both hosts without local fallback', async () => {
+  test('a reserved node-b whose alternative is reserved too ends unmeasured with owner and stamp', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b', 'host-e-wsl']);
+    try {
+      const runner = fakeRunner();
+      const io = sink();
+      let localCalls = 0;
+      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+        explicitRemoteOnly: true, reportRemoteHost: true, reservationRoot: root, remoteArgv: ['x'],
+        runLocal: () => { localCalls++; return 0; } },
+      { runner, settings, env: {}, load1: 1, write: io.write });
+      expect(rc).toBe(1);
+      expect(localCalls).toBe(0);
+      expect(runner.calls).toEqual([]);
+      const err = io.err.join('');
+      expect(err).toContain('remote unmeasured on node-b (stage=host-reserved, rc=unknown)');
+      expect(err).toContain('owner=gate-run');
+      const stamp = /reserved-at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/.exec(err);
+      expect(stamp).toBeTruthy();
+      expect(Math.abs(Date.parse(`${stamp![1]}Z`) - Date.now())).toBeLessThan(60_000);
+      expect(err).toContain('waited=0s');
+    } finally { release(); }
+  });
+
+  test('a reserved node-b waits bounded for the release and then runs on the reserved host', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b', 'host-e-wsl']);
+    let released = false;
+    const drop = () => { if (!released) { released = true; release(); } };
+    try {
+      const runner = fakeRunner();
+      const io = sink();
+      let clock = Date.parse('2026-10-27T00:00:00.000Z');
+      const sleeps: number[] = [];
+      let localCalls = 0;
+      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+        explicitRemoteOnly: true, reservationRoot: root, remoteArgv: ['x'], reservationWaitSeconds: 30,
+        runLocal: () => { localCalls++; return 0; } },
+      { runner, settings, env: {}, load1: 1, write: io.write, now: () => clock,
+        sleep: async (ms) => { sleeps.push(ms); clock += ms; if (sleeps.length === 2) drop(); } });
+      expect(rc).toBe(0);
+      expect(localCalls).toBe(0);
+      expect(sleeps).toEqual([15_000, 15_000]);
+      expect(runner.calls).toContainEqual(['ssh', 'node-b']);
+      const err = io.err.join('');
+      expect(err).toMatch(/waiting for host-reserved release on node-b — owner=gate-run reserved-at=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z elapsed=0s\/30s/);
+      expect(err).toContain('host-reserved released on node-b after 30s — proceeding remotely');
+    } finally { drop(); }
+  });
+
+  test('a reservation that never releases ends unmeasured after the bounded wait', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b', 'host-e-wsl']);
+    try {
+      const runner = fakeRunner();
+      const io = sink();
+      let clock = Date.parse('2026-10-27T00:00:00.000Z');
+      const sleeps: number[] = [];
+      let localCalls = 0;
+      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+        explicitRemoteOnly: true, reservationRoot: root, remoteArgv: ['x'], reservationWaitSeconds: 10,
+        runLocal: () => { localCalls++; return 0; } },
+      { runner, settings, env: {}, load1: 1, write: io.write, now: () => clock,
+        sleep: async (ms) => { sleeps.push(ms); clock += ms; } });
+      expect(rc).toBe(1);
+      expect(localCalls).toBe(0);
+      expect(sleeps).toEqual([10_000]);
+      expect(runner.calls).toEqual([]);
+      const err = io.err.join('');
+      expect(err).toContain('remote unmeasured on node-b (stage=host-reserved, rc=unknown)');
+      expect(err).toContain('owner=gate-run');
+      expect(err).toContain('waited=10s');
+    } finally { release(); }
+  });
+
+  test('gateReservationAlternateHosts defaults to the WSL host for node-b and drops unusable entries', () => {
+    expect(gateReservationAlternateHosts('node-b')).toEqual(['host-e-wsl']);
+    expect(gateReservationAlternateHosts('msb2')).toEqual([]);
+    expect(gateReservationAlternateHosts('node-b', ['host-e-wsl', 'node-b', 'node-b', '', '../bad'])).toEqual(['host-e-wsl']);
+  });
+
+  test('unreadable reservation evidence blocks the requested host without local fallback', async () => {
     const root = slotDir();
     const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b']);
     release();
@@ -423,6 +615,7 @@ describe('self gate explicit remote placement', () => {
       expect(runner.calls.some(call => call[0] === 'ssh')).toBe(false);
       expect(io.err.join('')).toContain('host-reserved: msb2');
       expect(io.err.join('')).not.toContain('using node-c');
+      expect(io.err.join('')).not.toContain('host-e-wsl');
     } finally { release(); }
   });
 
@@ -589,6 +782,14 @@ describe('remote run and fallback', () => {
       { runner, settings, env: {}, load1: 1, write: io.write });
     expect(rc).toBe(1);
     expect(io.err.join('')).toBe('no newline at end');
+  });
+
+  test('transport heartbeats before and after the RC marker leave tool bytes unchanged', () => {
+    const beat = '\n__GATE_REMOTE_HEARTBEAT=/var/tmp/elanous-gate-remote-Ab12Cd34\n';
+    const stderr = Buffer.concat([Buffer.from([0xff, 0x00]), Buffer.from(`${beat}tool err\n__GATE_REMOTE_RC=1\n${beat}`)]);
+    const outcome = runOnRemote({ repo: '/r', host: 'node-b', mirror: '~/m.git', argv: ['x'] }, fakeRunner({ ssh: { rc: 0, stdout: '', stderr } }));
+    expect(outcome.kind).toBe('ran');
+    if (outcome.kind === 'ran') expect(outcome.stderr).toEqual(Buffer.concat([Buffer.from([0xff, 0x00]), Buffer.from('tool err')]));
   });
 
   test('a completed run whose tool prints the busy/infra marker strings is still the tool\'s result', async () => {
@@ -904,7 +1105,7 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     });
   });
 
-  test('the spawned self gate CLI reads the live release reservation from its selected state root', () => {
+  test('the spawned self gate CLI reads the live release reservation and reroutes off the reserved host', () => {
     const scratch = slotDir();
     const state = slotDir();
     spawnSync('git', ['init', '-q'], { cwd: scratch });
@@ -915,8 +1116,12 @@ describe('entry-point wiring (spawned, no remote work)', () => {
       const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--config-dir', state, 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b'],
         { cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test', ELANOUS_STATE_DIR: state } });
       expect(gate.status).toBe(1);
-      expect(gate.stderr).toContain('node-b reserved (release gate graph-run-live holds node-b) — using node-c');
-      expect(gate.stderr).toContain('remote unmeasured on node-c (stage=preflight, rc=unknown) — origin-main-unresolved');
+      expect(gate.stderr).toContain('host-reserved: node-b (release gate graph-run-live holds node-b)');
+      expect(gate.stderr).toContain('owner=graph-run-live');
+      const stamp = /reserved-at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/.exec(gate.stderr);
+      expect(stamp).toBeTruthy();
+      expect(Math.abs(Date.parse(`${stamp![1]}Z`) - Date.now())).toBeLessThan(120_000);
+      expect(gate.stderr).toContain('rerouting to host-e-wsl');
     } finally { release(); }
   });
 

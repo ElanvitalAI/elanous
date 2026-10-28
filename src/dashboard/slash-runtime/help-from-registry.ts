@@ -47,7 +47,7 @@ export function buildEssentialHelpLines({
   maxRows,
 }: {
   names: readonly string[];
-  descriptions: readonly Pick<SlashCommand, 'name' | 'aliases' | 'description'>[];
+  descriptions: readonly Pick<SlashCommand, 'name' | 'aliases' | 'description' | 'hidden'>[];
   width: number;
   audience?: { role: Role; showBeta: boolean };
   /** The modal's row budget. When the readable layout overflows it, add columns (shorter descriptions)
@@ -56,7 +56,7 @@ export function buildEssentialHelpLines({
 }): string[] {
   const registered = new Set(names);
   const entries = descriptions
-    .filter((command) => registered.has(command.name) &&
+    .filter((command) => !command.hidden && registered.has(command.name) &&
       ((audience.role === 'owner' && slashMaturity(command.name) === undefined) || slashVisibleFor(command.name, audience.role, { showBeta: audience.showBeta })))
     .map((command) => {
       const aliases = [...new Set(command.aliases ?? [])].filter((alias) => registered.has(alias) && alias !== command.name);

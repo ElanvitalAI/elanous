@@ -30,7 +30,7 @@ import type {
   ShellResult,
 } from '../../shell-runner/types.js';
 
-function fakeSpawnExit(exitCode: number) {
+function fakeSpawnExit(exitCode: number, stdout = 'runner stdout', stderr = 'runner stderr') {
   return () => {
     const child = new EventEmitter() as any;
     child.stdout = new PassThrough();
@@ -38,8 +38,8 @@ function fakeSpawnExit(exitCode: number) {
     child.stdin = new PassThrough();
     child.kill = () => true;
     queueMicrotask(() => {
-      child.stdout.end();
-      child.stderr.end();
+      child.stdout.end(stdout);
+      child.stderr.end(stderr);
       child.emit('exit', exitCode, null);
     });
     return child;
@@ -67,6 +67,18 @@ function fakeBgHandle(id: string, result: Promise<ShellResult>): ShellHandle {
 }
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+function noticeJsonField(output: string, field: string): string {
+  const marker = `${field}=`;
+  const markerStart = output.indexOf(marker);
+  if (markerStart < 0) throw new Error(`missing notice field ${field}`);
+  const start = markerStart + marker.length;
+  for (let i = start + 1; i < output.length; i += 1) {
+    if (output[i] === '\\') { i += 1; continue; }
+    if (output[i] === '"') return JSON.parse(output.slice(start, i + 1)) as string;
+  }
+  throw new Error(`unterminated JSON notice field ${field}`);
+}
 
 describe('RunShell bg completion → turn notification queue', () => {
   beforeEach(() => {
@@ -97,6 +109,9 @@ describe('RunShell bg completion → turn notification queue', () => {
     expect(notice.agentName).toBe('RunShell');
     expect(notice.state).toBe('done');
     expect(notice.output).toContain(`handle=${handleId}`);
+    expect(notice.output).toContain(`taskId=shell:${handleId}:`);
+    expect(noticeJsonField(notice.output, 'stdoutTail')).toBe('runner stdout');
+    expect(noticeJsonField(notice.output, 'stderrTail')).toBe('runner stderr');
     expect(notice.output).toContain('exitCode=0');
     // Drain empties the queue — no duplicate completion notice.
     expect(globalTaskNotificationQueue.size).toBe(0);
@@ -106,7 +121,7 @@ describe('RunShell bg completion → turn notification queue', () => {
     const registry = createShellRegistry();
     setShellRunnerDeps({
       registry,
-      fileEngine: createFileCaptureEngine({ spawnFn: fakeSpawnExit(1) }),
+      fileEngine: createFileCaptureEngine({ spawnFn: fakeSpawnExit(1, 'compile output', 'missing dependency') }),
     });
     const started = await dispatchRunShell({ command: ['bg-notify-nonzero'], mode: 'bg' });
     expect(started.outcome).toBe('started');
@@ -119,8 +134,44 @@ describe('RunShell bg completion → turn notification queue', () => {
     expect(drained[0]?.taskId.startsWith(`shell:${handle.id}:`)).toBe(true);
     expect(drained[0]?.state).toBe('error');
     expect(drained[0]?.output).toContain('failed');
+    expect(drained[0]?.output).toContain('taskId=shell:');
     expect(drained[0]?.output).toContain('exitCode=1');
+    expect(noticeJsonField(drained[0]!.output, 'stdoutTail')).toBe('compile output');
+    expect(noticeJsonField(drained[0]!.output, 'stderrTail')).toBe('missing dependency');
     expect(drained[0]?.errorMessage).toBe('exitCode=1');
+    const xml = renderTaskNotificationsXml([drained[0]!]);
+    expect(xml).toContain(`id="${drained[0]?.taskId}"`);
+    expect(xml).toContain('stdoutTail=&quot;compile\\u0020output&quot;');
+    expect(xml).toContain('stderrTail=&quot;missing\\u0020dependency&quot;');
+  });
+
+  test('bg spawn error preserves its original failure reason', async () => {
+    const spawnFn = (() => {
+      const child = new EventEmitter() as any;
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.stdin = new PassThrough();
+      child.kill = () => true;
+      queueMicrotask(() => child.emit('error', new Error('ENOENT: missing command')));
+      return child;
+    }) as any;
+    const registry = createShellRegistry();
+    setShellRunnerDeps({ registry, fileEngine: createFileCaptureEngine({ spawnFn }) });
+
+    const started = await dispatchRunShell({ command: ['missing-command'], mode: 'bg' });
+    expect(started.outcome).toBe('started');
+    const handle = registry.list()[0]!;
+    const result = await handle.result;
+    expect(result.outcome).toBe('spawn-error');
+    expect(result.failureReason).toContain('ENOENT: missing command');
+    await tick();
+
+    const [notice] = globalTaskNotificationQueue.drain();
+    expect(notice?.taskId).toMatch(new RegExp(`^shell:${handle.id}:`));
+    expect(notice?.output).toContain('outcome=spawn-error');
+    expect(notice?.output).toContain('failureReason="ENOENT:\\u0020missing\\u0020command"');
+    expect(notice?.errorMessage).toBe('ENOENT: missing command');
+    expect(renderTaskNotificationsXml([notice!])).toContain('<error>ENOENT: missing command</error>');
   });
 
   test('bg failure enqueues exactly one error notification per handle', async () => {
@@ -166,9 +217,98 @@ describe('RunShell bg completion → turn notification queue', () => {
     expect(enqueueShellCompletionNotice(input, queue)).toBe(true);
     expect(enqueueShellCompletionNotice(input, queue)).toBe(false);
     expect(queue.size).toBe(1);
-    expect(queue.drain()[0]?.state).toBe('done');
+    const notice = queue.drain()[0];
+    expect(notice?.state).toBe('done');
+    expect(notice?.output).toContain('outcome=unknown');
     expect(enqueueShellCompletionNotice(input, queue)).toBe(false);
     expect(queue.size).toBe(0);
+  });
+
+  test('completion notices preserve truncation and visibly bound sanitized details', () => {
+    const queue = new TaskNotificationQueue();
+    const handle = fakeBgHandle('bounded-result', Promise.resolve({} as ShellResult));
+    const bearer = `sk-ant-api03-${'q7W2e5R9t3Y6u1I4o8P0'.repeat(2)}`;
+    const longReason = `${'E'.repeat(100)} root cause`;
+    const result = {
+      outcome: 'exit', exitCode: 0,
+      stdout: { text: 'first\nsecond\tline' },
+      stderr: { text: `Bearer ${bearer}` },
+      truncated: true,
+      failureReason: longReason,
+    } as unknown as ShellResult;
+
+    enqueueShellCompletionNotice({ handle, ok: true, exitCode: 0, durationMs: 8, result }, queue);
+    const notice = queue.drain()[0]!;
+    expect(notice.truncated).toBe(true);
+    expect(notice.output).toContain('outcome=exit');
+    expect(notice.output).toContain('truncated=true');
+    expect(noticeJsonField(notice.output, 'stdoutTail')).toBe('first\nsecond\tline');
+    expect(noticeJsonField(notice.output, 'stderrTail')).toContain('Bearer ');
+    expect(notice.output).not.toContain(bearer);
+    expect(notice.output).toContain('failureReason=');
+    expect(notice.errorMessage).toBe(longReason);
+    expect(notice.errorMessage).toContain('root cause');
+    expect(noticeJsonField(notice.output, 'failureReason')).toBe(longReason);
+    expect(renderTaskNotificationsXml([notice])).toContain(longReason.replaceAll(' ', '\\u0020'));
+  });
+
+  test('spill paths with control characters remain exactly recoverable', () => {
+    const queue = new TaskNotificationQueue();
+    const handle = fakeBgHandle('escaped-spill-path', Promise.resolve({} as ShellResult));
+    const bearer = `sk-ant-api03-${'q7W2e5R9t3Y6u1I4o8P0'.repeat(2)}`;
+    const outputFilePath = `/tmp/spill\nsegment\t"quoted"\u00a0\u2028${bearer} name.txt`;
+    const result = {
+      outcome: 'exit', exitCode: 0,
+      stdout: { text: '' }, stderr: { text: '' }, truncated: false, outputFilePath,
+    } as unknown as ShellResult;
+
+    enqueueShellCompletionNotice({ handle, ok: true, exitCode: 0, durationMs: 8, result }, queue);
+    const notice = queue.drain()[0]!;
+    const output = notice.output;
+    const recoveredPath = noticeJsonField(output, 'outputFile');
+    expect(recoveredPath).toContain('/tmp/spill\nsegment\t"quoted"\u00a0\u2028');
+    expect(recoveredPath).toContain('***');
+    expect(recoveredPath).not.toContain(bearer);
+    expect(output).not.toContain('\u00a0');
+    expect(output).not.toContain('\u2028');
+    expect(renderTaskNotificationsXml([notice])).toContain('name.txt');
+  });
+
+  test('failure reason is recoverable without creating apparent notice fields', () => {
+    const queue = new TaskNotificationQueue();
+    const handle = fakeBgHandle('escaped-failure-reason', Promise.resolve({} as ShellResult));
+    const failureReason = 'spawn failed\r\n taskId=forged "quoted" \u0001tail cause';
+    const result = {
+      outcome: 'spawn-error', stdout: { text: '' }, stderr: { text: '' },
+      failureReason, truncated: false,
+    } as unknown as ShellResult;
+
+    enqueueShellCompletionNotice({
+      handle, ok: false, exitCode: null, durationMs: 8, result, errorMessage: failureReason,
+    }, queue);
+    const notice = queue.drain()[0]!;
+    expect(notice.errorMessage).toBe(failureReason);
+    expect(noticeJsonField(notice.output, 'failureReason')).toBe(failureReason);
+    expect(notice.output).not.toContain(' taskId=forged');
+    expect(notice.output).toContain('\\u0020taskId=forged');
+  });
+
+  test('a notice marks stream-tail truncation even when the runner result is complete', () => {
+    const queue = new TaskNotificationQueue();
+    const handle = fakeBgHandle('tail-truncated', Promise.resolve({} as ShellResult));
+    const result = {
+      outcome: 'exit', exitCode: 0,
+      stdout: { text: `${'s'.repeat(100)} outcome=exit` }, stderr: { text: '' }, truncated: false,
+    } as unknown as ShellResult;
+
+    enqueueShellCompletionNotice({ handle, ok: true, exitCode: 0, durationMs: 8, result }, queue);
+    const notice = queue.drain()[0]!;
+    expect(notice.truncated).toBe(true);
+    expect(notice.output).toContain('stdoutTailTruncated=true');
+    expect(notice.output).toContain('truncated=true');
+    expect(noticeJsonField(notice.output, 'stdoutTail')).toBe(`${'s'.repeat(51)} outcome=exit`);
+    expect(notice.output).toContain('\\u0020outcome=exit"');
+    expect(notice.output).not.toContain(`stdoutTail="${'s'.repeat(51)} outcome=exit"`);
   });
 
   test('fresh handle reusing a settled id gets a second notification through the real dispatch path', async () => {

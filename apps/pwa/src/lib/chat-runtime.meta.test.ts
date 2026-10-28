@@ -329,7 +329,7 @@ describe('PWA slash-command boundary', () => {
 
   it('keeps the local TUI-name snapshot in sync with names and aliases, without a runtime server import', () => {
     const tuiSource = readFileSync(resolve(import.meta.dir, '../../../../src/chat/index.ts'), 'utf8');
-    const catalog = tuiSource.split('export const SLASH_COMMANDS: SlashCommand[] = [')[1]?.split('\n];')[0];
+    const catalog = tuiSource.split('export const SLASH_COMMANDS: SlashCommand[] = ([')[1]?.split('\n]);')[0];
     expect(catalog).toBeDefined();
     const names = [...catalog!.matchAll(/\{ name: '([^']+)',\s*aliases: \[([^\]]*)\]/g)]
       .flatMap((match) => [match[1], ...[...match[2]!.matchAll(/'([^']+)'/g)].map((alias) => alias[1])]);

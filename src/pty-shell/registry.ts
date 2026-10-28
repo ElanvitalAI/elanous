@@ -180,6 +180,8 @@ export interface PtyControlTarget {
   isAlive(): boolean;
   /** Registry-backed PTY targets expose termination; non-PTY control targets omit it. */
   kill?(signal?: NodeJS.Signals): void;
+  /** TUI owners may expose an explicit, forceful cancellation of the active turn. */
+  stopTurn?(force: true): boolean;
   canWrite(actor?: PtyWriteActor): boolean;
   write(chars: string, actor?: PtyWriteActor): void;
   resize(cols: number, rows: number): void;

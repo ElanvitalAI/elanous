@@ -50,6 +50,8 @@ export interface ReferenceCard {
   kind: GroundingSource['kind'];
   name: string;
   oneLine: string;
+  /** Relative path that supplied oneLine, when a README was readable. */
+  oneLineFile?: string;
   directories: string[];
   receivedAt?: string;
   /** L1 */
@@ -57,6 +59,13 @@ export interface ReferenceCard {
   commands: string[];
   /** A file-count or byte limit cut the read short — the lists may be incomplete. */
   truncated: boolean;
+  /** Stable identity of this card inside the grounding orchestration log. */
+  orchestrationId: string;
+}
+
+/** Stable identity of this card inside the grounding orchestration log. */
+export function orchestrationId(kind: string, id: string): string {
+  return `grounding:${kind}:${id}`;
 }
 
 export function buildReferenceCard(
@@ -132,11 +141,13 @@ export function buildReferenceCard(
     kind: source.kind,
     name: packageName ?? basename(root),
     oneLine,
+    ...(oneLine && readme ? { oneLineFile: readme.name } : {}),
     directories,
     ...(receivedAt ? { receivedAt } : {}),
     titles,
     commands,
     truncated,
+    orchestrationId: orchestrationId(source.kind, source.id),
   };
 }
 

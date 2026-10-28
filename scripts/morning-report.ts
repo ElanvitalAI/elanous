@@ -4,12 +4,14 @@
 //   bun run scripts/morning-report.ts --dry        # compose only (stdout, no send)
 //   bun run scripts/morning-report.ts --no-narrate # skip the LLM 시장서사 layer
 //   bun run scripts/morning-report.ts --no-upload  # skip S3 상세 업로드(로컬 미리보기)
+//   bun run scripts/morning-report.ts --narrative-model <model>  # 시장서사 LLM 모델 명시(A/B)
 
 import { composeMorningReport } from '../src/domains/morning-report.js';
 import { explainReportRoute, sendTelegramReport, sendReportPhoto } from '../src/telegram-report.js';
 import { getUserConfig } from '../src/user-config.js';
 import { getFirecrawlConfig } from '../src/registry/discovery/config.js';
 import { captureFinvizMapImageUrl } from '../src/domains/finviz-image.js';
+import { parseNarrativeModelArg } from './lib/morning-report-options.js';
 
 import { registerStandaloneLogSink } from '../src/domains/standalone-log-sink.js';
 
@@ -20,6 +22,8 @@ const dry = process.argv.includes('--dry');
 const cfg = getUserConfig();
 const narrate = cfg.finance.morningNarrative !== false && !process.argv.includes('--no-narrate');
 const upload = !process.argv.includes('--no-upload');
+// --narrative-model X / =X — 값이 없으면 parseNarrativeModelArg 가 throw(기본 모델로 조용히 대체하지 않는다).
+const model = parseNarrativeModelArg(process.argv.slice(2));
 
 // finviz S&P 히트맵 이미지 — HTML 상세 리포트에 임베드 + 텔레그램 포토로도 발송. 키 있을 때만.
 let heatmapImageUrl: string | undefined;
@@ -31,7 +35,7 @@ if (cfg.finance.morningHeatmapImage !== false) {
   } catch (e) { console.error(`[morning-report] heatmap capture error: ${e instanceof Error ? e.message : String(e)}`); }
 }
 
-const report = await composeMorningReport(new Date(), { narrate, heatmapImageUrl, upload });
+const report = await composeMorningReport(new Date(), { narrate, heatmapImageUrl, upload, model });
 
 if (dry) {
   console.log(report);

@@ -2,17 +2,23 @@ import { afterEach, describe, expect, mock, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { LLMMessage, LLMOpts, LLMProvider, LLMToolSpec, StreamWithToolsHandlers } from '../llm.js';
+import type { ContentBlock, LLMMessage, LLMOpts, LLMProvider, LLMToolSpec, StreamWithToolsHandlers } from '../llm.js';
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import { PTY_BUDGET_GRANT, TERMINAL_MISSION_DISCIPLINE } from '../agent/terminal-surface.js';
 import * as actualMemory from '../memory.js';
 import { debug } from '../debug/log.js';
+import { compactSessionHistory } from './compact-session.js';
+import { appendMessage, createSession, loadSession, rewriteSessionMessages } from './index.js';
+import { resetAutoCompactStateForTest } from '../compact/auto-state.js';
+import type { CompactProvider } from '../compact/provider.js';
+import type { ChatAutoCompactConfig } from '../user-config.js';
 
 const streamCalls: Array<{
   messages: LLMMessage[];
   opts: LLMOpts & { tools?: LLMToolSpec[]; provider?: LLMProvider };
   dispatchResult: unknown;
 }> = [];
+const directCalls: Array<{ messages: LLMMessage[]; opts: LLMOpts }> = [];
 let activeProvider: LLMProvider | undefined;
 const OMIT_DISPATCH_CTX = Symbol('omit-dispatch-ctx');
 let nextDispatchCtx: unknown = OMIT_DISPATCH_CTX;
@@ -53,7 +59,6 @@ mock.module('../llm.js', () => ({
   },
 }));
 
-const { createSession } = await import('./index.js');
 const { runTurn } = await import('./chat.js');
 
 function tool(name: string): LLMToolSpec {
@@ -80,6 +85,7 @@ async function runToolTurn(
   llmOpts?: LLMOpts,
   extra?: {
     userText?: string;
+    providerName?: string;
     goalLoop?: boolean;
     goalLoopMaxIterations?: number;
     dispatchTool?: CoreTurnDispatchTool;
@@ -88,11 +94,14 @@ async function runToolTurn(
   },
 ): Promise<string> {
   const provider: LLMProvider = {
-    name: 'test-provider',
+    name: extra?.providerName ?? 'test-provider',
     defaultModel: 'test-model',
     available: () => true,
     async *chat() { yield 'plain'; },
-    async *streamChat() { yield { type: 'text', delta: 'plain' } as const; },
+    async *streamChat(messages, opts = {}) {
+      directCalls.push({ messages, opts });
+      yield { type: 'text', delta: 'plain' } as const;
+    },
   };
   activeProvider = provider;
   const session = extra?.sessionId
@@ -124,6 +133,8 @@ describe('session chat terminal-capable turns', () => {
 
   afterEach(() => {
     streamCalls.length = 0;
+    directCalls.length = 0;
+    resetAutoCompactStateForTest();
     activeProvider = undefined;
     nextDispatchCtx = OMIT_DISPATCH_CTX;
     if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
@@ -153,11 +164,139 @@ describe('session chat terminal-capable turns', () => {
 
     expect(streamCalls).toHaveLength(1);
     expect(streamCalls[0]?.opts.budgetGrant).toBeUndefined();
+    expect(streamCalls[0]?.opts.requestSizeGuard).toBeUndefined();
     expect(String(streamCalls[0]?.messages[0]?.content ?? '')).not.toContain(TERMINAL_MISSION_DISCIPLINE);
     expect(streamCalls[0]?.dispatchResult).toEqual({
       output: 'captured',
       _imageFile: '/tmp/nonexistent-chat-test.png',
     });
+  });
+
+  test('wires the request-size guard through Codex TUI tool turns', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-codex-request-size-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+
+    await runToolTurn([tool('Read')], undefined, { providerName: 'openai-codex' });
+
+    expect(streamCalls).toHaveLength(1);
+    expect(streamCalls[0]?.opts.requestSizeGuard?.maxChars).toBe(400_000);
+    expect(typeof streamCalls[0]?.opts.requestSizeGuard?.compactMessages).toBe('function');
+    expect(typeof streamCalls[0]?.opts.requestSizeGuard?.onMeasured).toBe('function');
+  });
+
+  test('wires the request-size guard through Codex TUI goal-loop turns', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-codex-request-size-goal-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+
+    await runToolTurn([tool('Read')], undefined, {
+      providerName: 'openai-codex',
+      goalLoop: true,
+      goalLoopMaxIterations: 1,
+    });
+
+    expect(streamCalls.length).toBeGreaterThan(0);
+    expect(streamCalls.every(call => call.opts.requestSizeGuard?.maxChars === 400_000)).toBe(true);
+  });
+
+  test('wires the request-size guard through direct Codex TUI turns', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-codex-request-size-direct-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'openai-codex',
+      defaultModel: 'test-model',
+      available: () => true,
+      async *chat() { yield 'plain'; },
+      async *streamChat(messages, opts = {}) {
+        directCalls.push({ messages, opts });
+        yield { type: 'text', delta: 'plain' } as const;
+      },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    await runTurn({
+      userConfig: testConfig(provider),
+      sessionId: session.id,
+      userText: 'hello',
+      systemPrompt: 'base prompt',
+      skipMemoryInjection: true,
+      provider,
+    });
+
+    expect(directCalls).toHaveLength(1);
+    expect(directCalls[0]?.opts.requestSizeGuard?.maxChars).toBe(400_000);
+  });
+
+  test('after direct session compaction, the next provider input has the latest text and image exactly once', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-codex-compact-preserves-image-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    resetAutoCompactStateForTest();
+    const provider: LLMProvider = {
+      name: 'openai-codex',
+      defaultModel: 'test-model',
+      available: () => true,
+      async *chat() { yield 'plain'; },
+      async *streamChat(messages, opts = {}) {
+        directCalls.push({ messages, opts });
+        yield { type: 'text', delta: 'plain' } as const;
+      },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    const latestText = 'latest user request survives compact';
+    for (let i = 0; i < 6; i++) {
+      appendMessage(session.id, {
+        role: i % 2 === 0 ? 'user' : 'assistant',
+        content: `older-${i} ${'x'.repeat(200)}`,
+        ts: new Date().toISOString(),
+      });
+    }
+    appendMessage(session.id, {
+      role: 'user',
+      content: `[+1 image]\n${latestText}`,
+      ts: new Date().toISOString(),
+    });
+    const compactProvider: CompactProvider = {
+      async summarize() {
+        return { summary: 'prior history summary', modelUsed: 'stub', sourceMessageCount: 4 };
+      },
+      getContextWindow() { return 32_000; },
+      getAutoCompactThreshold() { return 16_000; },
+    };
+    const compactConfig: ChatAutoCompactConfig = {
+      enabled: true, triggerRatio: 0, preserveLastN: 1, preserveFirstN: 0,
+      partial: true, workingBudgetTokens: 256_000,
+    };
+    const compacted = await compactSessionHistory(session.id, {
+      config: compactConfig,
+      provider: compactProvider,
+      force: true,
+    });
+    expect(compacted.fired).toBe(true);
+    const compactedHistory = loadSession(session.id)!.messages;
+    expect(compactedHistory.length).toBeLessThan(7);
+    expect(compactedHistory.at(-1)?.content).toBe(`[+1 image]\n${latestText}`);
+    // Mirror runTurn's first-compaction rebuild: omit the persisted current row,
+    // then assemble the canonical user text and image blocks exactly once.
+    rewriteSessionMessages(session.id, compactedHistory.slice(0, -1));
+    const image: ContentBlock = { type: 'image', mediaType: 'image/png', base64: 'aW1hZ2UtYnl0ZXM=' };
+    await runTurn({
+      userConfig: testConfig(provider),
+      sessionId: session.id,
+      userText: latestText,
+      userImages: [image],
+      systemPrompt: 'base prompt',
+      skipMemoryInjection: true,
+      provider,
+    });
+
+    const nextInput = directCalls[0]?.messages ?? [];
+    const latest = nextInput.filter(message => message.role === 'user' && Array.isArray(message.content)
+      && message.content.some(block => block.type === 'text' && block.text === latestText));
+    expect(latest).toHaveLength(1);
+    expect(latest[0]!.content).toEqual([
+      image,
+      { type: 'text', text: latestText },
+    ]);
   });
 
   test('does not treat matching budget and prompt values as already terminal-capable', async () => {

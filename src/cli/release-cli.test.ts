@@ -22,9 +22,32 @@ import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 import { readActiveForceReleaseRun } from './release-single-flight.js';
+import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
 
 const originalCwd = process.cwd();
 afterEach(() => { if (process.cwd() !== originalCwd) process.chdir(originalCwd); });
+
+test('release gate-shards CLI names a missing ledger and reads measured rows as JSON', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-gate-shards-cli-'));
+  const command = () => { const program = new Command(); registerReleaseCommands(program, { ledgerRoot: root }); return program; };
+  const lines: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation((value: unknown) => { lines.push(String(value)); });
+  try {
+    await expect(command().parseAsync(['release', 'gate-shards', '--version', '9.9.9', '--json'], { from: 'user' }))
+      .rejects.toThrow('게이트 조각 원장 없음: 9.9.9');
+    const row: GateShardLedgerRow = {
+      v: 1, version: '9.9.9', phase: 'cut', shardId: 'pod-0', files: ['src/example.test.ts'],
+      host: 'pool-test', executor: 'pod', imageDigest: `sha256:${'a'.repeat(64)}`,
+      commit: 'b'.repeat(40), envFingerprint: 'c'.repeat(64),
+      startedAt: '2026-10-27T00:00:00Z', endedAt: '2026-10-27T00:00:01Z', observedAt: '2026-10-27T00:00:01Z',
+      state: 'done', rc: 0, pass: 1, fail: 0, errors: 0, ran: 1, failureIds: [], errorIds: [],
+      attribution: 'complete', logPath: 'pod-0.log', junitPath: null, stopReason: null, attemptId: 'attempt-1',
+    };
+    appendGateShardLedger(gateShardLedgerPath('9.9.9', root), row);
+    await command().parseAsync(['release', 'gate-shards', '--version', '9.9.9', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version: '9.9.9', malformed: 0, rows: [row] });
+  } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
 
 function installPinnedReleaseFiles(checkout: string) {
   const target = join(checkout, 'graphs', 'release');
@@ -196,6 +219,85 @@ test('recovery apply executes the real release graph from gate through gate-tria
     expect(readFileSync(join(root, 'release', fixture.version, 'resume-attempts', `${fixture.runId}.json`), 'utf8')).toContain(fixture.runId);
   } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
   // 실제 git seed ⊕ 실제 release 그래프 실행(게이트→게이트 분류) — 기본 5초로는 로드 상황에서 잘린다.
+}, 60_000);
+
+test('rehearsal recovery records evidence from the CLI default resumeGate path', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-recovery-default-resume-'));
+  const exit = process.exitCode, lines: string[] = [], commands: string[] = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  const fixture = await seedFailedReleaseRun(root);
+  const publishMain = spawnSync('git', ['push', 'origin', `${fixture.sha}:refs/heads/main`], { cwd: fixture.checkout, encoding: 'utf8' });
+  if (publishMain.status !== 0) throw new Error(`git push main fixture failed: ${publishMain.stderr}`);
+  setSchedule(fixture.version, { cutAt: '2026-10-26T13:00:00Z' }, 'test', root);
+  const rehearsalDeps: RehearsalDeps = {
+    now: () => new Date('2026-10-26T06:00:00Z'),
+    shardPlan: () => ({ shards: 2, testFiles: 7, gatePlanShards: 2,
+      resources: { cpus: 2, freeBytes: 2e9, totalBytes: 4e9 }, unmeasured: null }),
+    lightRc: async () => ({ version: fixture.version, base: fixture.sha, measuredCommit: fixture.sha, worktreeHead: fixture.sha,
+      importerTests: 0, introduced: null, preexisting: null, unclassified: 1, alwaysInclude: 0, alwaysIncludeMissing: [],
+      shards: 2, remote: null, gateExitCode: 2, ok: false, unmeasured: 'shard-2 measurement unavailable' }),
+    notify: () => true,
+    leakCheck: () => ({ status: 0 }),
+  };
+  const resumeDeps: ResumeReleaseDeps = {
+    root, repo: fixture.checkout,
+    runBash: async (command) => {
+      commands.push(command);
+      const isGate = command.includes('/gate-node.ts');
+      return { stdout: JSON.stringify(isGate ? { outcome: 'fail', partialSummary: { files: 3, pass: 9, fail: 0 } } : { outcome: 'ok' }),
+        stderr: '', exitCode: isGate ? 1 : 0 };
+    },
+  };
+  try {
+    setElanousConfigDir(root);
+    const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, rehearsalDeps, resumeDeps);
+    process.exitCode = 0;
+    await cmd.parseAsync(['release', 'rehearsal', 'tick', '--recovery-run', fixture.runId, '--apply', '--checkout', fixture.checkout, '--json'], { from: 'user' });
+    const result = JSON.parse(lines[0]!) as { status: string; stamps: Array<{ step: string; recovery?: { failedShard: string; remeasuredFiles: number | null; durationMs: number | null; poolOverwriteApplied: boolean | null; outcome: string; error?: string } }> };
+    expect(result.status).toBe('due');
+    const recoveryStamp = result.stamps.find((stamp) => stamp.step === 'rc-7h');
+    expect(recoveryStamp).toMatchObject({ recovery: { failedShard: 'shard-2 measurement unavailable',
+      remeasuredFiles: 3, poolOverwriteApplied: false, outcome: 'failed' } });
+    expect(recoveryStamp!.recovery!.durationMs).toBeGreaterThanOrEqual(0);
+    expect(recoveryStamp!.recovery!.error).toBe('resumed gate did not pass');
+    expect(commands.filter((command) => command.includes('/gate-node.ts'))).toHaveLength(1);
+    expect(readFileSync(join(root, 'release', fixture.version, 'rehearsal', 'rc-7h.json'), 'utf8')).toContain('"remeasuredFiles":3');
+    expect(process.exitCode).toBe(1);
+  } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
+}, 60_000);
+
+test('rehearsal recovery keeps missing gate measurement unknown', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-rehearsal-recovery-missing-measurement-'));
+  const exit = process.exitCode, lines: string[] = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write);
+  const fixture = await seedFailedReleaseRun(root);
+  const publishMain = spawnSync('git', ['push', 'origin', `${fixture.sha}:refs/heads/main`], { cwd: fixture.checkout, encoding: 'utf8' });
+  if (publishMain.status !== 0) throw new Error(`git push main fixture failed: ${publishMain.stderr}`);
+  setSchedule(fixture.version, { cutAt: '2026-10-26T13:00:00Z' }, 'test', root);
+  const rehearsalDeps: RehearsalDeps = {
+    now: () => new Date('2026-10-26T06:00:00Z'),
+    shardPlan: () => ({ shards: 2, testFiles: 7, gatePlanShards: 2, resources: { cpus: 2, freeBytes: 2e9, totalBytes: 4e9 }, unmeasured: null }),
+    lightRc: async () => ({ version: fixture.version, base: fixture.sha, measuredCommit: fixture.sha, worktreeHead: fixture.sha,
+      importerTests: 0, introduced: null, preexisting: null, unclassified: 1, alwaysInclude: 0, alwaysIncludeMissing: [],
+      shards: 2, remote: null, gateExitCode: 2, ok: false, unmeasured: 'shard-2 measurement unavailable' }),
+    notify: () => true, leakCheck: () => ({ status: 0 }),
+  };
+  const resumeDeps: ResumeReleaseDeps = {
+    root, repo: fixture.checkout,
+    runBash: async (command) => ({ stdout: JSON.stringify(command.includes('/gate-node.ts') ? { outcome: 'fail' } : { outcome: 'ok' }),
+      stderr: '', exitCode: command.includes('/gate-node.ts') ? 1 : 0 }),
+  };
+  try {
+    setElanousConfigDir(root);
+    const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, rehearsalDeps, resumeDeps);
+    process.exitCode = 0;
+    await cmd.parseAsync(['release', 'rehearsal', 'tick', '--recovery-run', fixture.runId, '--apply', '--checkout', fixture.checkout, '--json'], { from: 'user' });
+    const result = JSON.parse(lines[0]!) as { stamps: Array<{ step: string; recovery?: { remeasuredFiles: number | null; outcome: string; error?: string } }> };
+    expect(result.stamps.find((stamp) => stamp.step === 'rc-7h')?.recovery).toMatchObject({
+      remeasuredFiles: null, outcome: 'failed', error: 'release resume --from gate omitted measured partialSummary.files',
+    });
+    expect(readFileSync(join(root, 'release', fixture.version, 'rehearsal', 'rc-7h.json'), 'utf8')).toContain('"remeasuredFiles":null');
+  } finally { output.mockRestore(); resetElanousConfigDir(); process.exitCode = exit ?? 0; rmSync(root, { recursive: true, force: true }); }
 }, 60_000);
 
 test('recovery apply write-fence denial does not invoke the resume graph', async () => {
@@ -638,7 +740,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'recover', 'gate-history', 'rehearsal', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['gate-shards', 'schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'recover', 'gate-history', 'rehearsal', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');

@@ -76,6 +76,62 @@ export function mustFixSignature(mustFix?: readonly string[]): string | undefine
   return `fnv1a-${hash.toString(16).padStart(8, '0')}`;
 }
 
+/**
+ * 빈 구현 must-fix 신호(대상 3종) — 리뷰가 이 신호를 담은 must-fix 를 내면 같은 PR 수리(narrow-relaunch)로는 수렴하지 않는다.
+ * 결정론 분류만 한다(LLM 경로 없음). 판별은 문구 일치로 하되 오탐을 피해 좁게 잡는다.
+ */
+const EMPTY_IMPLEMENTATION_SIGNALS: readonly { name: string; patterns: readonly RegExp[] }[] = [
+  {
+    name: '구현 파일 변경 0',
+    patterns: [
+      /빈 구현/u,
+      /empty[- ]implementation/iu,
+      /구현 파일[^\n.]{0,8}(없음|없다|미변경)|구현 파일[^\n.]{0,24}변경[^\n.]{0,8}0(?!\d)/u,
+      /구현 (diff|변경|차분)[^\n.]{0,8}0(?!\d)/u,
+      /implementation files?[^\n.]{0,32}(unchanged|zero|no change)/iu,
+      /(no|zero) (implementation|code) (changes|diff)/iu,
+      /target diff (is )?0(?!\d)/iu,
+    ],
+  },
+  {
+    name: 'GOODHART/자기 문구 시험',
+    patterns: [/GOODHART/iu, /자기 ?문구/u, /골 문면/u, /goal[ -]?(text|wording)/iu],
+  },
+  {
+    name: '대상 경로 미배선',
+    patterns: [/미배선/u, /배선되지 않/u, /호출부[^\n.]{0,8}(없음|없다)/u, /not[ -]?wired/iu, /unwired/iu, /no caller/iu, /dead code/iu],
+  },
+];
+
+/** 빈 구현 must-fix 판정의 수 — 첫 회는 같은 칸 새 발사(재구현), 이미 두 번째면 칸 주인 이관(needs-owner). */
+export type EmptyImplementationMove = 'reimplement' | 'needs-owner';
+
+/** 판정 관측 한 줄 — `reason` 이 그대로 관측 로그 문면이다(줄바꿈 없음). */
+export interface EmptyImplementationJudgement {
+  move: EmptyImplementationMove;
+  signals: readonly string[];
+  reason: string;
+}
+
+/**
+ * 리뷰 must-fix 가 «빈 구현» 신호(구현 파일 변경 0 · GOODHART/자기 문구 시험 · 대상 경로 미배선)를 담는지 결정론 분류한다.
+ * 신호를 담으면 narrow-relaunch 대신 재구현 판정 — 같은 칸의 앞 런에서 이미 빈 구현 must-fix 였으면
+ * (priorEmptyImplementation ≥ 1) 두 번째이므로 needs-owner. 신호가 없으면 null — 일반 must-fix 는 종전대로 narrow-relaunch.
+ */
+export function judgeEmptyImplementation(
+  mustFix: readonly string[] | undefined,
+  priorEmptyImplementation = 0,
+): EmptyImplementationJudgement | null {
+  const signals: string[] = [];
+  for (const { name, patterns } of EMPTY_IMPLEMENTATION_SIGNALS) {
+    if ((mustFix ?? []).some(fix => typeof fix === 'string' && patterns.some(pattern => pattern.test(fix)))) signals.push(name);
+  }
+  if (!signals.length) return null;
+  const move: EmptyImplementationMove = priorEmptyImplementation >= 1 ? 'needs-owner' : 'reimplement';
+  const disposition = move === 'needs-owner' ? '두 번째 빈 구현 — 칸 주인에게 이관' : '같은 PR 수리로는 수렴 불가 — 같은 칸 새 발사(시험 먼저)';
+  return { move, signals, reason: `빈 구현 must-fix(${signals.join(' · ')}) — ${disposition}` };
+}
+
 export interface TaskJudgement {
   move: TaskMove;
   stage: 'observing' | 'closing' | 'reviewing' | 'repairing' | 'waiting' | 'escalated';

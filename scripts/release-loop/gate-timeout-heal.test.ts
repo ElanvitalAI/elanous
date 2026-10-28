@@ -423,7 +423,10 @@ test('reproduction through the sweep: a cut shard is reason=timeout, keeps its f
   const meta = JSON.parse(readFileSync(join(root, 'logs', 'pod-0.json'), 'utf8'));
   expect(meta).toMatchObject({ reason: 'timeout', rc: null, finishedFiles: POD_SHARD_FILE_CAP, deadlineSeconds: 1200 });
   const board = readGateShards(shardsPath);
-  expect(board).toMatchObject({ version: '9.9.9', shards: [{ id: 'pod-0', state: 'done', installSec: 2.5, rc: 0 }] });
+  expect(board).toMatchObject({ version: '9.9.9', shards: [
+    { id: 'pod-0', state: 'done', rc: 0 },
+    { id: 'pod-0-n', state: 'done', installSec: 2.5, rc: 0 },
+  ] });
   expect(typeof board!.shards[0]!.endedAt).toBe('string');
 });
 

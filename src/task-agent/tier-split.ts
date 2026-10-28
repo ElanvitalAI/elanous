@@ -30,6 +30,7 @@ export const TIER_SPLIT_DECOMPOSE_TIMEOUT_MS = 300_000;
 
 /** 조각이 부모 칸에서 물려받는 줄 머리 — hand 의 골 검사(완료 경계 셋)와 계약·경계 문맥. */
 const INHERITED_PARENT_LABELS = /^\s*(?:[-*]\s*)?(현재 계약|완료 경계 코드|완료 경계 실물|완료 경계 증거 명령|경계|증거 보충)\s*:/;
+const PARENT_ACCEPTANCE_LABEL = /^\s*(?:[-*]\s*)?(수용선|판정|완료 조건|완료 경계 코드|완료 경계 실물|완료 경계 증거 명령)\s*:/;
 const VERIFICATION_PLAN_HEADING = '### 검증 계획(TDD)';
 
 /** Read a real Markdown section, ignoring headings inside fenced verbatim asks. */
@@ -77,7 +78,8 @@ export function composeSliceHandText(sliceGoal: string, parentText: string, mark
   inherited.push(...verificationPlan);
   // 표지는 리뷰 범위를 나르므로 장치 우선 조각(총 2 이상)은 상속 줄이 없어도 남는다 —
   // 다만 «물려받았다» 는 물려받은 줄에 대한 주장이므로 그 줄이 있을 때만 붙인다.
-  if (inherited.length === 0 && (marker.total < 2 || !sliceGoal.includes(`동작: ${DEVICE_FIRST_STEP}`))) return sliceGoal;
+  const isAcceptanceIntegration = sliceGoal.includes('부모 수용선 몫(자동 통합 조각):');
+  if (inherited.length === 0 && (marker.total < 2 || (!isAcceptanceIntegration && !sliceGoal.includes(`동작: ${DEVICE_FIRST_STEP}`)))) return sliceGoal;
   const inheritedTopics = `계약·완료 경계${verificationPlan.length > 0 ? '·검증 계획' : ''}`;
   const inheritanceClaim = inherited.length > 0 ? ` 아래 ${inheritedTopics}는 부모 칸에서 물려받았다 — 이 조각 범위만 채운다.` : '';
   const tag = `조각 ${marker.index}/${marker.total} — 부모 ${marker.cid ?? '(칸 없음)'}(${marker.fromTier}) 를 중 이하로 나눈 몫.${inheritanceClaim}`;
@@ -88,22 +90,58 @@ export type TierSplitPlan =
   | { kind: 'split'; slices: SizedSlice[] }
   | { kind: 'blocked'; reason: string };
 
-/** 순수 판정 — 분해 결과 → 발사 계획. 이유 없는 상 조각이 하나라도 있으면 결과 전체를 실패로 본다(이유 없는 상 0). */
+function parentAcceptanceLines(parentText: string): string[] {
+  return parentText.split(/\r?\n/u).map((line) => line.trim()).filter((line) => PARENT_ACCEPTANCE_LABEL.test(line));
+}
+
+function coveredAcceptanceLines(slices: readonly SizedSlice[], acceptance: readonly string[], parentText: string,
+  fromTier: '상' | '특', cid: string | null): string[] {
+  const effectiveGoals = slices.map((slice, index) => composeSliceHandText(slice.goal, parentText,
+    { index: index + 1, total: slices.length, fromTier, cid }));
+  return acceptance.filter((line) => effectiveGoals.some((goal) => goal.includes(line)));
+}
+
+function annotateAcceptanceShares(slices: readonly SizedSlice[], acceptance: readonly string[], integratedAdded = false): SizedSlice[] {
+  return slices.map((slice) => {
+    const share = acceptance.filter((line) => slice.goal.includes(line));
+    if (slice.goal.includes('부모 수용선 몫')) {
+      if (!integratedAdded || share.length >= acceptance.length || slice.goal.includes('누락 수용선은 자동 통합 조각이 담당한다.')) return slice;
+      return { ...slice, goal: `${slice.goal}\n- 누락 수용선은 자동 통합 조각이 담당한다.` };
+    }
+    if (share.length > 0) return { ...slice, goal: `${slice.goal}\n부모 수용선 몫:\n${share.map((line) => `- ${line}`).join('\n')}` };
+    if (acceptance.length > 0 && integratedAdded) return { ...slice, goal: `${slice.goal}\n부모 수용선 몫: 없음 — 누락 수용선은 자동 통합 조각이 담당한다.` };
+    return slice;
+  });
+}
+
+function recordAcceptanceCoverage(data: Record<string, unknown>): void {
+  try { debug.log('tier-split', 'slice-acceptance-coverage', data); } catch { /* fail-soft */ }
+}
+
+function integratedAcceptanceSlice(parentText: string, missing: readonly string[], slices: readonly SizedSlice[]): SizedSlice {
+  const paths = [...new Set(slices.flatMap((slice) => slice.goal.match(/[\w./-]+\.[A-Za-z][\w-]*/gu) ?? []))];
+  const goal = `${parentText}\n\n부모 수용선 몫(자동 통합 조각):\n${missing.map((line) => `- ${line}`).join('\n')}`;
+  return { goal, files: Math.max(1, paths.length), behaviours: Math.max(1, slices.reduce((sum, slice) => sum + slice.behaviours, 0)),
+    newFiles: slices.reduce((sum, slice) => sum + slice.newFiles, 0), tier: '상', unavoidable: 'acceptance-coverage-integration' };
+}
+
+/** 순수 판정 — 분해 결과에 남은 상 조각은 불가피 사유가 없어도 unavoidable=auto로 발사한다. */
 export function planTierSplit(result: TierSizedDecomposeResult): TierSplitPlan {
   if (!result.ok) return { kind: 'blocked', reason: `decompose-failed: ${result.reason}` };
   if (result.slices.length === 0) return { kind: 'blocked', reason: 'no-slices' };
   for (const [index, slice] of result.slices.entries()) {
     if (!['하', '중', '상'].includes(slice.tier)) return { kind: 'blocked', reason: `invalid-slice-tier: #${index + 1} ${String(slice.tier)}` };
     if (!slice.goal?.trim()) return { kind: 'blocked', reason: `empty-slice-goal: #${index + 1}` };
-    if (slice.tier === '상' && !slice.unavoidable?.trim()) return { kind: 'blocked', reason: `unjustified-상-slice: #${index + 1}` };
   }
-  const deviceSlices = result.slices.filter((slice) => slice.deviceFirst === 'device-test');
-  if (deviceSlices.length === 0 && result.slices.some((slice) => slice.deviceFirst === 'feature'))
+  const slices = result.slices.map((slice) => slice.tier === '상'
+    ? { ...slice, unavoidable: slice.unavoidable?.trim() || 'auto' } : slice);
+  const deviceSlices = slices.filter((slice) => slice.deviceFirst === 'device-test');
+  if (deviceSlices.length === 0 && slices.some((slice) => slice.deviceFirst === 'feature'))
     return { kind: 'blocked', reason: 'device-first-stage-missing' };
-  if (deviceSlices.length > 0 && (deviceSlices.length !== 1 || result.slices[0]?.deviceFirst !== 'device-test'
-    || result.slices.slice(1).some((slice) => slice.deviceFirst !== 'feature')))
+  if (deviceSlices.length > 0 && (deviceSlices.length !== 1 || slices[0]?.deviceFirst !== 'device-test'
+    || slices.slice(1).some((slice) => slice.deviceFirst !== 'feature')))
     return { kind: 'blocked', reason: 'device-first-order-invalid' };
-  return { kind: 'split', slices: result.slices };
+  return { kind: 'split', slices };
 }
 
 export interface TierSplitSliceOutcome { slice: SizedSlice; result?: HandTaskResult; error?: string }
@@ -144,19 +182,63 @@ export async function handTaskWithTierSplit(opts: TierSplitHandOptions): Promise
     record({ cid, fromTier, outcome: 'whole', reason: TIER_SPLIT_UNAVAILABLE, slices: [], unavoidable: [], ...acceptedSliceCounts([]) });
     return { kind: 'whole', result: await handTask(hand), reason: TIER_SPLIT_UNAVAILABLE };
   }
-  let plan: TierSplitPlan;
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => { controller.abort(); resolve('timeout'); }, decomposeTimeoutMs); });
-  try {
-    const raced = await Promise.race([decompose(hand.text.trim(), { signal: controller.signal,
-      ...(hand.project ? { repositoryRoot: resolve(hand.project.target) } : {}) }), timedOut]);
-    plan = raced === 'timeout' ? { kind: 'blocked', reason: `decompose-timeout: ${decomposeTimeoutMs}ms` } : planTierSplit(raced);
-  } catch (error) {
-    plan = { kind: 'blocked', reason: `decompose-threw: ${String((error as Error)?.message ?? error).slice(0, 200)}` };
-  } finally { clearTimeout(timer); }
+  const runDecompose = async (goal: string): Promise<{ plan: TierSplitPlan; result?: TierSizedDecomposeResult }> => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => { controller.abort(); resolve('timeout'); }, decomposeTimeoutMs); });
+    try {
+      const raced = await Promise.race([decompose(goal, { signal: controller.signal,
+        ...(hand.project ? { repositoryRoot: resolve(hand.project.target) } : {}) }), timedOut]);
+      if (raced === 'timeout') return { plan: { kind: 'blocked', reason: `decompose-timeout: ${decomposeTimeoutMs}ms` } };
+      return { plan: planTierSplit(raced), result: raced };
+    } catch (error) {
+      return { plan: { kind: 'blocked', reason: `decompose-threw: ${String((error as Error)?.message ?? error).slice(0, 200)}` } };
+    } finally { clearTimeout(timer); }
+  };
+  const first = await runDecompose(hand.text.trim());
+  let plan = first.plan;
+  let decomposed = first.result;
+  const acceptance = parentAcceptanceLines(hand.text);
+  if (plan.kind === 'split') {
+    let candidateSlices = plan.slices;
+    let covered = coveredAcceptanceLines(candidateSlices, acceptance, hand.text, fromTier, cid);
+    let missing = acceptance.filter((line) => !covered.includes(line));
+    const inheritedByComposition = acceptance.filter((line) => INHERITED_PARENT_LABELS.test(line));
+    recordAcceptanceCoverage({ cid, fromTier, attempt: 1, coverageMode: 'exact-parent-line', inheritedByComposition, covered, missing });
+    if (missing.length > 0) {
+      const retryPrompt = `${hand.text.trim()}\n\n### 분해 필수 수용선\n각 조각의 "부모 수용선 몫"에 담당하는 원문 수용선 전체를 그대로 싣고, 조각들의 합집합으로 아래 모든 줄을 덮으세요.\n${missing.map((line) => `- ${line}`).join('\n')}`;
+      const retry = await runDecompose(retryPrompt);
+      if (retry.plan.kind === 'split') {
+        plan = retry.plan;
+        decomposed = retry.result;
+        candidateSlices = annotateAcceptanceShares(retry.plan.slices, acceptance);
+      }
+      covered = coveredAcceptanceLines(candidateSlices, acceptance, hand.text, fromTier, cid);
+      missing = acceptance.filter((line) => !covered.includes(line));
+      recordAcceptanceCoverage({ cid, fromTier, attempt: 2, coverageMode: 'exact-parent-line', inheritedByComposition, covered, missing,
+        retryReason: retry.plan.kind === 'blocked' ? retry.plan.reason : undefined });
+      let integratedAdded = false;
+      if (missing.length > 0) {
+        candidateSlices = [...candidateSlices, integratedAcceptanceSlice(hand.text, missing, candidateSlices)];
+        integratedAdded = true;
+        covered = coveredAcceptanceLines(candidateSlices, acceptance, hand.text, fromTier, cid);
+        missing = acceptance.filter((line) => !covered.includes(line));
+      }
+      candidateSlices = annotateAcceptanceShares(candidateSlices, acceptance, integratedAdded);
+      recordAcceptanceCoverage({ cid, fromTier, attempt: 'final', coverageMode: 'exact-parent-line', inheritedByComposition,
+        covered, missing, integrated: integratedAdded });
+      plan = { kind: 'split', slices: candidateSlices };
+    } else {
+      plan = { kind: 'split', slices: candidateSlices };
+    }
+  }
   if (plan.kind === 'blocked') {
-    record({ cid, fromTier, outcome: 'blocked', reason: plan.reason, slices: [], unavoidable: [], ...acceptedSliceCounts([]) });
+    const rejectedOversized = decomposed?.ok
+      ? decomposed.slices.flatMap((slice, index) => slice.tier === '상' ? [{ index: index + 1, files: slice.files, behaviours: slice.behaviours }] : [])
+      : [];
+    record({ cid, fromTier, outcome: 'blocked', reason: plan.reason, slices: [], unavoidable: [],
+      ...(decomposed?.ok ? { redecomposed: decomposed.redecomposed } : {}),
+      rejectedOversized, rejectedOversizedCount: rejectedOversized.length, ...acceptedSliceCounts([]) });
     return { kind: 'blocked', result: await handTask({ ...hand, tierSplitBlocked: plan.reason }), reason: plan.reason };
   }
   const group = `${TASK_CARD_PREFIX}split-${randomBytes(4).toString('hex')}`;
@@ -165,7 +247,9 @@ export async function handTaskWithTierSplit(opts: TierSplitHandOptions): Promise
   const unavoidable = counts.unavoidableReasons;
   // 조각은 새 카드다 — 호출자 id·pr·goalId 를 조각마다 복제하면 «PR: #N» 조회·수확이 엇갈린다. 버린 것은 기록에 남긴다.
   const dropped = { ...(hand.id ? { id: hand.id } : {}), ...(hand.cardFields?.pr !== undefined ? { pr: hand.cardFields.pr } : {}), ...(hand.cardFields?.goalId !== undefined ? { goalId: hand.cardFields.goalId } : {}) };
-  record({ cid, fromTier, outcome: 'split', group, ...(Object.keys(dropped).length ? { dropped } : {}), slices: plan.slices.map((s) => ({ tier: s.tier, files: s.files, behaviours: s.behaviours })), unavoidable: [...unavoidable],
+  record({ cid, fromTier, outcome: 'split', group, ...(Object.keys(dropped).length ? { dropped } : {}),
+    ...(decomposed?.ok ? { redecomposed: decomposed.redecomposed } : {}),
+    slices: plan.slices.map((s) => ({ tier: s.tier, files: s.files, behaviours: s.behaviours })), unavoidable: [...unavoidable],
     ...counts });
   const { id: _wholeId, cardFields, ...rest } = hand;
   const base = { ...rest, ...(cardFields?.handed !== undefined ? { cardFields: { handed: cardFields.handed } } : {}) };

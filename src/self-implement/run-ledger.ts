@@ -719,7 +719,9 @@ export interface RunLedgerCheckedAppendOutcome<T> {
  * Thrown (typed, with the stable `runId-mismatch` reason) when a checked-append
  * decision returns an entry whose `runId` differs from the locked `runId`. Callers
  * classify identity violations from `error.reason === 'runId-mismatch'` instead of
- * parsing message substrings.
+ * parsing message substrings. `RunLedgerEntryRunIdMismatchError` below is the same
+ * identity violation observed on already-written ledger bytes, so one `instanceof`
+ * covers both producers.
  */
 export class RunLedgerCheckedAppendRunIdMismatchError extends Error {
   readonly reason = 'runId-mismatch' as const;
@@ -728,6 +730,21 @@ export class RunLedgerCheckedAppendRunIdMismatchError extends Error {
       `runId-mismatch: appendRunLedgerEntryChecked: decision entry runId ${JSON.stringify(decisionRunId)} does not match locked runId ${JSON.stringify(lockedRunId)}`,
     );
     this.name = 'RunLedgerCheckedAppendRunIdMismatchError';
+  }
+}
+
+/**
+ * Thrown (typed, same `runId-mismatch` reason) when a stored ledger *row* declares a
+ * `runId` other than the one being loaded. The message prefixes the stable reason and keeps
+ * the parser's existing wording, so message-based classifiers (`goal-archive`, the
+ * doctor-compare caller's own regression test) keep recognizing it, while
+ * `decisionRunId`/`lockedRunId` travel as typed fields so no caller has to re-parse it.
+ */
+export class RunLedgerEntryRunIdMismatchError extends RunLedgerCheckedAppendRunIdMismatchError {
+  constructor(decisionRunId: string, lockedRunId: string, readonly lineNumber: number) {
+    super(decisionRunId, lockedRunId);
+    this.name = 'RunLedgerEntryRunIdMismatchError';
+    this.message = `runId-mismatch: invalid run ledger entry at line ${lineNumber}: runId does not match ${lockedRunId}`;
   }
 }
 
@@ -896,7 +913,7 @@ function parseRunLedgerEntry(line: string, lineNumber: number, expectedRunId: st
     throw new Error(`invalid run ledger entry at line ${lineNumber}: expected optional timestamp, goalId, shard identity, runId, event, and object data`);
   }
   if (entry.runId !== expectedRunId) {
-    throw new Error(`invalid run ledger entry at line ${lineNumber}: runId does not match ${expectedRunId}`);
+    throw new RunLedgerEntryRunIdMismatchError(entry.runId, expectedRunId, lineNumber);
   }
   return entry as RunLedgerEntry;
 }
@@ -1154,15 +1171,24 @@ export interface GraphAdaptReport {
   nonAdapted: { landed: number; denominator: number; rate: number | null };
   excludedCount: number;
   exclusionReasons: Record<string, number>;
+  unmeasuredCount: number;
+  unmeasuredReasons: Record<string, number>;
+  window: { since: string | null; until: string | null };
 }
 
 /** Measure only producer-observed traversals and variant applications; never activate adaptation. */
-export function queryGraphAdaptReport(goalId: string, stateDir = elanousStateRoot()): GraphAdaptReport {
+export function queryGraphAdaptReport(goalId: string, stateDir = elanousStateRoot(), window: { since?: string; until?: string } = {}): GraphAdaptReport {
   const dir = runLedgerDir(stateDir);
   const signatures = new Set<string>();
   const counts = { adapted: { landed: 0, denominator: 0 }, nonAdapted: { landed: 0, denominator: 0 } };
   const exclusionReasons: Record<string, number> = {};
+  const unmeasuredReasons: Record<string, number> = {};
   const exclude = (reason: string): void => { exclusionReasons[reason] = (exclusionReasons[reason] ?? 0) + 1; };
+  const unmeasured = (reason: string): void => { unmeasuredReasons[reason] = (unmeasuredReasons[reason] ?? 0) + 1; };
+  const since = window.since === undefined ? null : Date.parse(window.since);
+  const until = window.until === undefined ? null : Date.parse(window.until);
+  if ((since !== null && !Number.isFinite(since)) || (until !== null && !Number.isFinite(until)) ||
+    (since !== null && until !== null && since > until)) throw new Error('invalid adaptation measurement window');
   let unitCallCount = 0;
   let adaptationCount = 0;
   let fileNames: string[];
@@ -1181,6 +1207,15 @@ export function queryGraphAdaptReport(goalId: string, stateDir = elanousStateRoo
     const goalIds = new Set(ledger.map(entry => entry.goalId).filter((id): id is string => typeof id === 'string' && id.length > 0));
     if (goalIds.size === 1 && !goalIds.has(goalId)) continue;
     if (goalIds.size !== 1) { exclude('goal-id-missing-or-conflicting'); continue; }
+    const start = ledger.find(entry => entry.event === 'start');
+    const startedAt = start && typeof start.timestamp === 'string' ? Date.parse(start.timestamp) : NaN;
+    if (!Number.isFinite(startedAt)) { unmeasured('start-time-missing-or-invalid'); continue; }
+    if ((since !== null && startedAt < since) || (until !== null && startedAt >= until)) { exclude('outside-start-window'); continue; }
+    const lastStatus = [...ledger].reverse().find(entry => entry.event === 'run-status');
+    if (lastStatus && !['completed', 'failed', 'cancelled'].includes(String(lastStatus.data.runStatus))) {
+      exclude('in-flight'); continue;
+    }
+    if (!lastStatus && !ledger.some(entry => entry.event === 'merged')) { exclude('in-flight'); continue; }
     const traversals = ledger.filter(entry => entry.event === 'pipeline-traversal-shadow');
     const paths = traversals.map(entry => entry.data.observedNodes);
     if (paths.length === 0 || paths.some(path => !Array.isArray(path) || path.length === 0 || !path.every(node => typeof node === 'string' && node.length > 0))) {
@@ -1189,12 +1224,13 @@ export function queryGraphAdaptReport(goalId: string, stateDir = elanousStateRoo
     let graphRun: unknown;
     try { graphRun = JSON.parse(readFileSync(join(stateDir, 'graph-runs', 'self-implement', `${runId}.json`), 'utf8')); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { exclude('graph-run-unreadable'); continue; }
+      unmeasured((error as NodeJS.ErrnoException).code === 'ENOENT' ? 'graph-run-missing' : 'graph-run-unreadable');
+      continue;
     }
     const recorded = graphRun && typeof graphRun === 'object' && !Array.isArray(graphRun) ? graphRun as Record<string, unknown> : null;
-    if (recorded && (recorded.runId !== runId || recorded.graphId !== 'self-implement' ||
-      (recorded.unitCalls !== undefined && !Array.isArray(recorded.unitCalls)))) {
-      exclude('unit-calls-invalid'); continue;
+    if (!recorded || recorded.runId !== runId || recorded.graphId !== 'self-implement' ||
+      (recorded.unitCalls !== undefined && !Array.isArray(recorded.unitCalls))) {
+      unmeasured('graph-run-invalid'); continue;
     }
     const merge = [...ledger].reverse().find(entry => entry.event === 'merged');
     if (merge && typeof merge.data.merged !== 'boolean') { exclude('landing-invalid'); continue; }
@@ -1210,7 +1246,9 @@ export function queryGraphAdaptReport(goalId: string, stateDir = elanousStateRoo
   return { goalId, runCount: counts.adapted.denominator + counts.nonAdapted.denominator,
     uniquePathSignatures: signatures.size, unitCallCount, adaptationCount,
     adapted: rate(counts.adapted), nonAdapted: rate(counts.nonAdapted),
-    excludedCount: Object.values(exclusionReasons).reduce((total, count) => total + count, 0), exclusionReasons };
+    excludedCount: Object.values(exclusionReasons).reduce((total, count) => total + count, 0), exclusionReasons,
+    unmeasuredCount: Object.values(unmeasuredReasons).reduce((total, count) => total + count, 0), unmeasuredReasons,
+    window: { since: window.since ?? null, until: window.until ?? null } };
 }
 
 export interface GoalSourceDistributionQuery {

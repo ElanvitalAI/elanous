@@ -3,6 +3,7 @@ import { debug } from '../debug/log.js';
 import { buildWebSearchTool, dispatchWebSearch } from '../boot/daemon-tools/web-search.js';
 import { ToolSafetyError } from '../boot/daemon-tools/types.js';
 import { nativeToolCatalog } from '../native-tool-catalog.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { buildFreeWebSearchProvider } from './free.js';
 import {
   _resetWebSearchProvidersForTests,
@@ -25,7 +26,7 @@ const fakeFetch = (body: string, status = 200): typeof fetch =>
 
 const query = { query: 'private search terms' };
 
-afterEach(() => _resetWebSearchProvidersForTests());
+afterEach(() => { setUserConfigOverlay(null); _resetWebSearchProvidersForTests(); });
 
 describe('keyless DuckDuckGo provider', () => {
   test('POST form, paired snippets, unwrapped URL and three hits; no query text in provider logs', async () => {
@@ -89,11 +90,11 @@ describe('keyless DuckDuckGo provider', () => {
   });
 
   test('registry puts builtin ddg-free last and cascades from unavailable providers to injected fetch', async () => {
+    setUserConfigOverlay(c => ({ ...c, webSearch: { tavily: { enabled: false }, grokApi: { enabled: false }, firecrawl: { enabled: false } } }));
     _resetWebSearchProvidersForTests();
     const builtins = listWebSearchProviders();
     expect(builtins.at(-1)).toMatchObject({ id: 'ddg-free', available: true });
-    expect(builtins.slice(0, -1).map(p => p.id)).toEqual(builtins.some(p => p.id === 'tavily')
-      ? ['tavily', 'grok', 'firecrawl'] : ['grok', 'firecrawl']);
+    expect(builtins.slice(0, -1).map(p => p.id)).toEqual(['grok']);
 
     _resetWebSearchProvidersForTests(false);
     for (const id of ['tavily', 'grok', 'firecrawl']) {

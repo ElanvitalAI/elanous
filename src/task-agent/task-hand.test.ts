@@ -23,9 +23,12 @@ import { parseWorkOrder } from './work-order.js';
 import { draftReleaseComment } from '../self-dev/draft-triage-rules.js';
 import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack } from '../self-implement/knowhow-pack.js';
 import { authorGoal, inspectGoalDoneBoundary, type GoalAuthorDeps } from '../self-implement/goal-author.js';
+import { parseAskTargetPathHints } from '../self-dev/launch-preflight-text.js';
+import { prTitle } from '../self-implement/pr-title.js';
 
 // MS-05 + isolated temporary git: the real tasks hand CLI decides, only the external launcher is captured.
-test('tasks hand --live carries one bounded KNOWHOW pack to the first child goal without changing cards or ledgers', async () => {
+test('tasks hand --live opt-in carries one bounded KNOWHOW pack to the first child goal without changing cards or ledgers', async () => {
+  setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, knowhowChildInjection: true } }));
   const repo = mkdtempSync(join(tmpdir(), 'task-hand-knowhow-git-'));
   const state = statePath();
   const source = join(repo, 'docs/roles/OP/KNOWHOW.md');
@@ -60,9 +63,12 @@ test('tasks hand --live carries one bounded KNOWHOW pack to the first child goal
     expect(result.card.text).toBe(input);
     expect(result.move.command.at(-1)).toBe(input);
     expect(calls).toHaveLength(1);
-    const firstGoal = `${pack.text}\n\n${input}`;
+    const firstGoal = `${input}\n\n${pack.text}`;
     expect(calls[0]!.args.at(-1)).toBe(firstGoal);
     expect(calls[0]!.context!.podGoal).toBe(firstGoal);
+    expect(firstGoal.startsWith('대상 경로: src/task-agent/task-hand.ts')).toBe(true);
+    expect(parseAskTargetPathHints(firstGoal)).toEqual(['src/task-agent/task-hand.ts']);
+    expect(prTitle(firstGoal)).toBe(prTitle(input));
     expect(calls[0]!.args.at(-1)!.split('[KNOWHOW-PACK v1').length - 1).toBe(1);
     expect(observations).toContainEqual(expect.objectContaining({ data: expect.objectContaining({ ids: pack.ids, bytes: pack.bytes, injected: true,
       reason: 'selected', repoPath: repo, repoRevision: null }) }));
@@ -115,7 +121,7 @@ test('tasks hand --live carries one bounded KNOWHOW pack to the first child goal
       try { return [file, hash(resolve(import.meta.dir, '../..', file))]; }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [file, null]; throw error; }
     })).toEqual(operationalHashes);
-  } finally { off(); rmSync(repo, { recursive: true, force: true }); }
+  } finally { setUserConfigOverlay(null); off(); rmSync(repo, { recursive: true, force: true }); }
 });
 
 test('projectless live hand selects knowhow from harness.defaultRepo', async () => {
@@ -140,8 +146,8 @@ test('projectless live hand selects knowhow from harness.defaultRepo', async () 
       taskStatePath: state, taskLauncher: (args, _cwd, context) => { goals.push(args.at(-1)!); return { runId: context!.runId }; },
     });
     expect(handed.code ?? 0).toBe(0);
-    expect(goals[0]).toContain('[KNOWHOW-PACK v1 ids=K-TC-919]');
-    expect(observations.at(-1)?.data).toMatchObject({ ids: ['K-TC-919'], injected: true, reason: 'selected', repoPath: repo, repoRevision });
+    expect(goals[0]).toBe(goal);
+    expect(observations.at(-1)?.data).toMatchObject({ ids: ['K-TC-919'], injected: false, reason: 'selected', repoPath: repo, repoRevision });
   } finally { setUserConfigOverlay(null); off(); rmSync(repo, { recursive: true, force: true }); }
 });
 
@@ -433,7 +439,7 @@ test('2판 graph-run 조합(research-report)은 선택된 조합 경로로 실�
   const calls: Array<{ path: string; options: GraphRunOptions }> = [];
   let sayLaunches = 0;
   const result = await handTask({ id: 'ta-graph-run-live', text: 'report', completion: 'research-report',
-    compositionRoot: root, statePath: path, live: true,
+    compositionRoot: root, statePath: path, live: true, project: { id: 'fixture-project', target: root },
     launcher: () => { sayLaunches++; },   // harness say 발사기는 graph-run 조합에 불리지 않는다
     graphRunner: async (launchedPath, options) => {
       calls.push({ path: launchedPath, options });
@@ -442,7 +448,7 @@ test('2판 graph-run 조합(research-report)은 선택된 조합 경로로 실�
   expect(sayLaunches).toBe(0);
   expect(calls).toHaveLength(1);
   expect(calls[0]!.path).toBe(graphPath);
-  expect(calls[0]!.options).toMatchObject({ input: { ask: 'report' }, quiet: true });
+  expect(calls[0]!.options).toMatchObject({ input: { ask: 'report', context: { worktree: root }, prior: {} }, quiet: true });
   expect(calls[0]!.options.runId).toStartWith('run-');
   expect(result).toMatchObject({ mode: 'live', launched: true, card: { status: 'launched', runId: calls[0]!.options.runId } });
   expect(result.move).toEqual({ kind: 'launch', command: ['graph', 'run', graphPath], reason: expect.stringContaining('graph-run') });
@@ -478,11 +484,16 @@ test('graph run이 실패 상태로 끝나면 구체 blocker를 실패 카드에
   const path = statePath();
   const result = await handTask({ id: 'ta-graph-run-failed-state', text: 'report', completion: 'research-report',
     compositionRoot: root, statePath: path, live: true,
-    graphRunner: async (_launchedPath, options) => fakeGraphRunState('failed', options.runId!) });
+    graphRunner: async (_launchedPath, options) => ({ ...fakeGraphRunState('failed', options.runId!), path: ['make-doc'],
+      nodes: [{ nodeId: 'make-doc', ok: false, exit: null, executed: false,
+        error: 'unit input missing: make-doc.context', reason: 'unit input missing: make-doc.context',
+        failure: { errorCode: 'GRAPH_UNIT_INPUT_MISSING', message: 'unit input missing: make-doc.context', stage: 'unit-invocation' } }] }) });
   expect(result.launched).toBe(true);
   const stored = readTaskCard('ta-graph-run-failed-state', path)!;
+  const failureDetail = 'graph run 종료 상태 failed — 마지막 node make-doc (ok=false) — GRAPH_UNIT_INPUT_MISSING: unit input missing: make-doc.context';
   expect(stored.status).toBe('failed');
-  expect(stored.history.at(-1)).toMatchObject({ event: 'graph-run-failed', detail: expect.stringContaining('graph run 종료 상태 failed') });
+  expect(stored.history.at(-1)).toMatchObject({ event: 'graph-run-failed', detail: failureDetail });
+  expect(result.move.reason).toBe(failureDetail);
 });
 
 test('graph run 진입점(runGraph)이 던지면 launch-failed 카드에 구체 사유를 남긴다', async () => {
@@ -2197,30 +2208,43 @@ function tierSplitHarness(decompose?: TierSizedDecompose | 'unwired') {
 const slice = (name: string, tier: SizedSlice['tier'], extra: Partial<SizedSlice> = {}): SizedSlice =>
   ({ goal: liveGoal(`대상 경로: src/${name}.ts\n${name} 조각`), files: 1, behaviours: 1, newFiles: 0, tier, ...extra });
 
-test('TIER-SPLIT planTierSplit: 이유 없는 상 조각 · ok:false · 빈 조각 · 잘못된 tier 는 blocked, 나머지는 split', () => {
+test('TIER-SPLIT planTierSplit: 분해 뒤 남은 상 조각은 재분할 횟수와 무관하게 auto 발사', () => {
   expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '하')] })).toMatchObject({ kind: 'split' });
+  expect(planTierSplit({ ok: true, redecomposed: 2, slices: [slice('a', '상')] })).toMatchObject({ kind: 'split', slices: [{ unavoidable: 'auto' }] });
+  expect(planTierSplit({ ok: true, redecomposed: 2, slices: [slice('a', '상', { unavoidable: '한 트랜잭션 경계' })] })).toMatchObject({ kind: 'split' });
   expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '상', { unavoidable: '한 트랜잭션 경계' })] })).toMatchObject({ kind: 'split' });
-  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '상')] })).toEqual({ kind: 'blocked', reason: 'unjustified-상-slice: #2' });
-  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '상', { unavoidable: '  ' })] })).toMatchObject({ kind: 'blocked' });
+  expect(planTierSplit({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '상')] })).toMatchObject({ kind: 'split', slices: [{}, { unavoidable: 'auto' }] });
   expect(planTierSplit({ ok: false, reason: 'llm-timeout' })).toEqual({ kind: 'blocked', reason: 'decompose-failed: llm-timeout' });
   expect(planTierSplit({ ok: true, redecomposed: 0, slices: [] })).toEqual({ kind: 'blocked', reason: 'no-slices' });
   expect(planTierSplit({ ok: true, redecomposed: 0, slices: [{ ...slice('a', '중'), tier: '특' as never }] })).toMatchObject({ kind: 'blocked' });
   expect(DEFAULT_TIER_SIZED_DECOMPOSE).toBe(decomposeToTierSizedSlices);
 });
 
-test('TIER-HIGH-UNAVOIDABLE-MIN counts accepted high slices and reasons in the tier-split event', async () => {
+test('TIER-SPLIT accepts a remaining high slice as unavoidable=auto without requiring two resplits', () => {
+  expect(planTierSplit({ ok: true, redecomposed: 1, slices: [slice('still-high', '상')] }))
+    .toMatchObject({ kind: 'split', slices: [{ tier: '상', unavoidable: 'auto' }] });
+});
+
+test('TIER-SPLIT launches a remaining high slice as unavoidable=auto without waiting for two resplits', async () => {
   const h = tierSplitHarness();
   const base = { text: liveGoal('대상 경로: src/a.ts · src/b.ts\n상 덩어리'), tier: '상' as const,
     live: true, statePath: h.path, launcher: h.deps.taskLauncher! };
   try {
-    await handTaskWithTierSplit({ ...base, decompose: async () => ({ ok: true, redecomposed: 0, slices: [
-      slice('a', '중'), slice('b', '상', { unavoidable: '한 트랜잭션 경계' }),
+    const dispatched = await handTaskWithTierSplit({ ...base, decompose: async () => ({ ok: true, redecomposed: 0, slices: [
+      slice('a', '중'), slice('b', '상'),
     ] }) });
-    expect(h.records.at(-1)).toMatchObject({ outcome: 'split', totalSlices: 2, highSlices: 1,
-      unavoidableCount: 1, unavoidableReasons: ['한 트랜잭션 경계'] });
-    await handTaskWithTierSplit({ ...base, decompose: async () => ({ ok: true, redecomposed: 0, slices: [slice('bad', '상')] }) });
-    expect(h.records.at(-1)).toMatchObject({ outcome: 'blocked', totalSlices: 0, highSlices: 0,
-      unavoidableCount: 0, unavoidableReasons: [], countScope: 'accepted-slices' });
+    expect(dispatched.kind).toBe('split');
+    if (dispatched.kind === 'split') {
+      expect(dispatched.slices).toHaveLength(2);
+      expect(dispatched.slices[1]?.slice.tier).toBe('상');
+      expect(dispatched.slices[1]?.result?.launched).toBe(true);
+      expect(dispatched.slices[1]?.result?.card.tier).toBe('상');
+      expect(dispatched.slices[1]?.result?.card.tierSplit?.unavoidable).toBe('auto');
+    }
+    expect(h.calls).toHaveLength(2);
+    expect(h.records.at(-1)).toMatchObject({ outcome: 'split', redecomposed: 0, unavoidable: ['auto'], unavoidableCount: 1, highSlices: 1 });
+    await handTaskWithTierSplit({ ...base, decompose: async () => ({ ok: false, reason: 'llm-timeout' }) });
+    expect(h.records.at(-1)).toMatchObject({ outcome: 'blocked', reason: 'decompose-failed: llm-timeout' });
     await handTaskWithTierSplit({ ...base, decompose: undefined });
     expect(h.records.at(-1)).toMatchObject({ outcome: 'whole', totalSlices: 0, highSlices: 0,
       unavoidableCount: 0, unavoidableReasons: [], countScope: 'accepted-slices' });
@@ -2281,7 +2305,7 @@ test('DEVICE-FIRST tier split launches only the device test and records a landin
   } finally { h.off(); }
 });
 
-test('TIER-HIGH-UNAVOIDABLE-MIN: device-first-deferred tier-split 레코드가 조각 계수와 상 사유 원문을 싣는다', async () => {
+test('TIER-HIGH-UNAVOIDABLE-MIN: 재분할 횟수와 무관하게 남은 불가피 상은 발사 가능한 종속 조각이 된다', async () => {
   const h = tierSplitHarness();
   try {
     const out = await handTaskWithTierSplit({ text: liveGoal('대상 경로: src/device.ts · src/feature.ts\n장치 우선'), tier: '상', live: true,
@@ -2292,12 +2316,13 @@ test('TIER-HIGH-UNAVOIDABLE-MIN: device-first-deferred tier-split 레코드가 �
         slice('feature2', '중', { deviceFirst: 'feature' }),
       ] }) });
     expect(out.kind).toBe('split');
-    const deferred = h.records.at(-1)!;
-    expect(deferred).toMatchObject({ outcome: 'device-first-deferred', fromTier: '상',
-      countScope: 'accepted-slices', totalSlices: 3, highSlices: 1, unavoidableCount: 1,
-      unavoidableReasons: ['한 트랜잭션 경계'] });
-    // high 비율 = highSlices/totalSlices — 이 한 행만으로 재현된다.
-    expect((deferred.highSlices as number) / (deferred.totalSlices as number)).toBeCloseTo(1 / 3, 10);
+    if (out.kind === 'split') {
+      expect(out.slices[0]?.result?.launched).toBe(true);
+      expect(out.slices[1]?.result?.launched).toBe(false);
+      expect(out.slices[1]?.result?.card.tierSplit?.unavoidable).toBe('한 트랜잭션 경계');
+    }
+    expect(h.calls).toHaveLength(1);
+    expect(h.records.at(-1)).toMatchObject({ outcome: 'device-first-deferred', blockedUntilLanded: expect.any(Array) });
   } finally { h.off(); }
 });
 
@@ -2421,7 +2446,14 @@ test('TIER-SPLIT (a) 상 hand → 분해(중 2 · 하 1) → 조각 카드 3장�
     expect(code).toBe(0);
     expect(h.decomposeCalls).toEqual([text]);
     expect(h.calls).toHaveLength(3);
-    expect(h.calls.map((args) => args.at(-1))).toEqual([slice('a', '중').goal, slice('b', '중').goal, slice('c', '하').goal]);
+    const launchedGoals = h.calls.map((args) => String(args.at(-1)));
+    expect(launchedGoals).toHaveLength(3);
+    for (const goal of launchedGoals) {
+      expect(goal).not.toContain('부모 수용선 몫:');
+      expect(goal).toContain('완료 경계 코드: src/task-agent/task-hand.ts live hand 조건을 판정한다');
+      expect(goal).toContain('완료 경계 실물: 카드가 발사 전 완료 경계를 요구한다');
+      expect(goal).toContain('완료 경계 증거 명령: bun test src/task-agent/task-hand.test.ts');
+    }
     const out = JSON.parse(lines[0]!) as { kind: string; group: string; slices: Array<{ result: { card: TaskCard; launched: boolean } }> };
     expect(out.kind).toBe('split');
     const cards = out.slices.map((s) => readTaskCard(s.result.card.id, h.path)!);
@@ -2438,17 +2470,12 @@ test('TIER-SPLIT (a) 상 hand → 분해(중 2 · 하 1) → 조각 카드 3장�
   } finally { h.off(); }
 });
 
-test('TIER-SPLIT (b) 불가피 이유가 붙은 상 조각만 상으로 발사한다', async () => {
+test('TIER-SPLIT (b) 한 번의 분해 결과에 남은 상 조각은 명시 사유 없이도 발사한다', async () => {
   const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '상', { unavoidable: '스키마 이전과 읽기 경로가 한 커밋이어야 한다' }), slice('b', '중')] }));
   try {
     const { lines, code } = await cli(['task', 'hand', liveGoal('특 덩어리'), '--tier', '특', '--live', '--json'], h.deps);
     expect(code).toBe(0);
     expect(h.calls).toHaveLength(2);
-    const out = JSON.parse(lines[0]!) as { slices: Array<{ result: { card: TaskCard } }> };
-    const cards = out.slices.map((s) => readTaskCard(s.result.card.id, h.path)!);
-    expect(cards.map((c) => c.tier)).toEqual(['상', '중']);
-    expect(cards[0]!.tierSplit).toMatchObject({ fromTier: '특', unavoidable: '스키마 이전과 읽기 경로가 한 커밋이어야 한다' });
-    expect(cards[1]!.tierSplit?.unavoidable).toBeUndefined();
     expect(h.records[0]).toMatchObject({ fromTier: '특', outcome: 'split', unavoidable: ['스키마 이전과 읽기 경로가 한 커밋이어야 한다'] });
   } finally { h.off(); }
 });
@@ -2456,7 +2483,7 @@ test('TIER-SPLIT (b) 불가피 이유가 붙은 상 조각만 상으로 발사�
 // ⭐ 경계 3행 골의 생산 소비자 실증 — 기본 분해기(DEFAULT_TIER_SIZED_DECOMPOSE = decomposeToTierSizedSlices)가
 //   경계 분기에서 크기 메타를 만들지 못하면 ok:false(no sized slices) → 발사 0 · 카드 failed(tier-split-failed).
 //   주입 분해기가 아니라 «실물 기본 seam» 을 태운다(0.2.36 회귀 반증).
-test('TIER-SPLIT 경계 3행 골 → 기본 분해기로 조각 1 발사(발사 1) · 카드 failed 아님', async () => {
+test('TIER-SPLIT 경계 3행 oversized 골 → 기본 분해기 차단 카드 · 발사 0', async () => {
   const h = tierSplitHarness();
   try {
     const text = `[UX] 대시보드 로그 창이 비어 보인다 — 원인 측정과 표시 보정
@@ -2474,38 +2501,23 @@ test('TIER-SPLIT 경계 3행 골 → 기본 분해기로 조각 1 발사(발사 
     expect(out.kind).toBe('split');
     if (out.kind !== 'split') return;
     expect(out.slices).toHaveLength(1);
-    expect(h.calls).toHaveLength(1); // 발사 1 — 조각 카드 한 장만 쏜다.
-    const first = out.slices[0]!;
-    expect(first.error).toBeUndefined();
-    expect(first.result?.launched).toBe(true);
-    expect(first.result?.card.status).not.toBe('failed');
-    expect(readTaskCard(first.result!.card.id, h.path)?.status).not.toBe('failed');
-    // ⭐ must-fix — 접힌 경계 조각은 device-test 로 분류되지 않는다. 분류가 남으면 «장치 시험 카드»
-    //    미션만 발사되고(outcome: 'device-first-deferred') 기능 카드가 0장이 된다.
+    expect(h.calls).toHaveLength(1);
+    expect(out.slices[0]?.slice.tier).toBe('하');
     expect(h.records.at(-1)).toMatchObject({ fromTier: '상', outcome: 'split' });
-    // 발사된 카드 문면 — 구현 지시가 있고 모순 문구(«운영 코드 변경 0»·«선행:»)가 없음을 읽는다.
-    const cardText = readTaskCard(first.result!.card.id, h.path)?.text ?? '';
-    expect(cardText).toInclude('완료 경계 코드');
-    expect(cardText).toInclude('첫 동작(같은 런)');
-    expect(cardText).not.toInclude('운영 코드 변경 0');
-    expect(cardText).not.toInclude('선행:');
-    expect(cardText).not.toInclude('동작: DEVICE-FIRST-STAGE');
   } finally { h.off(); }
 });
 
-test('TIER-SPLIT (c) 이유 없는 상 조각 → 발사 0 · 카드 failed(tier-split-failed) · 한 덩어리로 쏘지 않는다', async () => {
+test('TIER-SPLIT (c) 분해 뒤 남은 상 조각은 auto 사유를 붙여 발사한다', async () => {
   const h = tierSplitHarness(async () => ({ ok: true, redecomposed: 0, slices: [slice('a', '중'), slice('b', '상')] }));
   try {
     const { lines, code } = await cli(['task', 'hand', liveGoal('상 덩어리'), '--tier', '상', '--live', '--json'], h.deps);
-    expect(code).toBe(1);
-    expect(h.calls).toEqual([]);
-    const card = readTaskCard((JSON.parse(lines[0]!) as { card: TaskCard }).card.id, h.path)!;
-    expect(card.status).toBe('failed');
-    expect(card.tier).toBe('상');
-    expect(card.history.at(-1)).toMatchObject({ event: 'tier-split-failed', detail: 'tier-split-failed: unjustified-상-slice: #2' });
-    expect(nextMoveFor(card).kind).toBe('wait');
-    expect(h.records).toMatchObject([{ cid: null, fromTier: '상', outcome: 'blocked', reason: 'unjustified-상-slice: #2', slices: [], unavoidable: [],
-      countScope: 'accepted-slices', totalSlices: 0, highSlices: 0, unavoidableCount: 0, unavoidableReasons: [] }]);
+    expect(code).toBe(0);
+    expect(h.calls).toHaveLength(2);
+    const output = JSON.parse(lines[0]!) as { slices: Array<{ result: { card: TaskCard; launched: boolean } }> };
+    expect(output.slices[1]?.result.launched).toBe(true);
+    expect(output.slices[1]?.result.card.tierSplit?.unavoidable).toBe('auto');
+    expect(h.records).toMatchObject([{ cid: null, fromTier: '상', outcome: 'split', unavoidable: ['auto'],
+      countScope: 'accepted-slices', totalSlices: 2, highSlices: 1, unavoidableCount: 1, unavoidableReasons: ['auto'] }]);
   } finally { h.off(); }
 });
 

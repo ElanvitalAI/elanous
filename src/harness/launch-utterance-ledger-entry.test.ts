@@ -102,7 +102,8 @@ test('pod ask-file uses the recorded snapshot after the source is removed', asyn
     rmSync(file);
     for (let attempt = 0; attempt < 120 && child.exitCode === null; attempt++) await Bun.sleep(250);
     expect(child.exitCode).not.toBeNull();
-    expect(stderr).toContain('골 완료 경계 누락');
+    // The Pod failure text depends on the host; source removal must not turn it into a second file read.
+    expect(stderr).toMatch(/Pod 실행 여부 또는 종료 이유를 확인하지 못했다|Pod 풀 또는 현재 컨텍스트에 닿지 못했다|골 완료 경계 누락/);
     expect(stderr).not.toContain('ENOENT');
   } finally { child.kill('SIGKILL'); }
 }, 120_000);

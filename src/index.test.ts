@@ -2908,9 +2908,11 @@ describe('buildCliAgentTools — harnessPlan child tool wiring', () => {
   }
 
   function assertCliAgentChildToolWiring(text: string): void {
-    const dispatchStart = text.indexOf('const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {');
-    const dispatchEnd = text.indexOf('  return { specs, dispatch, workingDirectory };', dispatchStart);
+    const dispatchSignature = 'const dispatch = async (name: string, args: Record<string, unknown>, context?: { signal?: AbortSignal }): Promise<unknown> => {';
+    const dispatchStart = text.indexOf(dispatchSignature);
     expect(dispatchStart).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf(dispatchSignature, dispatchStart + dispatchSignature.length)).toBe(-1);
+    const dispatchEnd = text.indexOf('  return { specs, dispatch, workingDirectory };', dispatchStart);
     expect(dispatchEnd).toBeGreaterThan(dispatchStart);
     const block = text.slice(dispatchStart, dispatchEnd);
 

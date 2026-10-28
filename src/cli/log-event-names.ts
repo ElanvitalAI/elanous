@@ -1362,6 +1362,7 @@ export const KNOWN_LOG_EVENT_NAMES: ReadonlySet<string> = new Set([
   "status",
   "status-ledger",
   "status-port-resolved",
+  "status-question-interim-reprompt",
   "stdin-backpressure",
   "stdout",
   "step",

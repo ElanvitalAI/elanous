@@ -17,6 +17,7 @@ import { buildIntakeDigest } from '../intake-plane/digest.js';
 import { addSource } from '../intake-plane/intake-sources.js';
 import { debug } from '../debug/log.js';
 import { readSavedCursor, type SavedMessage } from '../intake-plane/collect-telegram-saved.js';
+import { CHANNEL_PUBLISH_CROWN_OWNER, ChannelPublishQueue } from '../intake-plane/intake-to-tasks.js';
 
 test('registers the complete intake command tree on a fresh Command with its help and options', () => {
   const program = new Command().name('elanous');
@@ -28,7 +29,7 @@ test('registers the complete intake command tree on a fresh Command with its hel
   expect(intake!.helpInformation()).toContain('elanous intake');
   expect(intake!.commands.map((command) => command.name())).toEqual([
     'source', 'check', 'candidates', 'collect-pod', 'ingest', 'items', 'mark', 'digest', 'route',
-    'grounding-sync', 'queue', 'to-tasks', 'collect-telegram-saved', 'collect-github',
+    'grounding-sync', 'queue', 'to-tasks', 'approve-channel-post', 'collect-telegram-saved', 'collect-github',
   ]);
 
   const expected: Record<string, { help: string; options: string[] }> = {
@@ -44,6 +45,7 @@ test('registers the complete intake command tree on a fresh Command with its hel
     'grounding-sync': { help: '흡수 그라운딩 후보 큐의 노트를 등록 가능한 단일 문서 폴더로 복사한다 (레지스트리는 읽기만)', options: ['--dry-run', '--json'] },
     queue: { help: '자동 흡수 대기열 — 텔레그램 저장 링크를 별도 레인으로 먼저 고르고 일반 몫을 하루 상한까지 queued 로 옮긴다', options: ['--max', '--lane-max', '--kind', '--dry-run', '--json'] },
     'to-tasks': { help: '소비하지 않은 골 줄과 공개 아이디어 노트를 해석해 Nexus 태스크로 등록한다 (기본 최대 5건)', options: ['--limit', '--dry-run', '--json'] },
+    'approve-channel-post': { help: '보호 범주의 채널 게시 초안을 사람 승인한다 (외부 게시 커넥터는 호출하지 않는다)', options: ['--by', '--json'] },
     'collect-telegram-saved': { help: '텔레그램 «저장된 메시지»를 읽기만 해 흡수 원장에 넣는다 (커서 이후만 · 호스트 전용 · 개인 메모는 user-private)', options: ['--max', '--dry-run', '--json'] },
     'collect-github': { help: '관심 주제의 GitHub 저장소를 별 순으로 모아 흡수 원장에 넣는다 (최근 생성·푸시만 · 별 스냅숏으로 증가량)', options: ['--days', '--per-query', '--dry-run', '--json'] },
   };
@@ -193,6 +195,38 @@ test('to-tasks CLI uses the Nexus runtime port and bearer auth; dry-run leaves g
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('intake approve-channel-post records explicit approval without publishing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'intake-channel-approve-cli-'));
+  const previousExitCode = process.exitCode;
+  try {
+    const queue = new ChannelPublishQueue(root);
+    const id = 'goal:first-release';
+    queue.enqueue(id, {
+      channel: 'telegram', cadence: 'one-off', voice: 'release', owner: 'MK',
+      category: 'first-release', title: '0.2.40', body: 'Release notes',
+    });
+    const program = new Command().name('elanous');
+    registerIntakeCommands(program, { root });
+    await program.parseAsync(['intake', 'approve-channel-post', id, '--by', 'MK', '--json'], { from: 'user' });
+    expect(queue.plan(id)).toMatchObject({ status: 'approved', approvedBy: 'MK', category: 'first-release' });
+    expect(queue.publishedIds().size).toBe(0);
+
+    const crownId = 'goal:patent';
+    queue.enqueue(crownId, {
+      channel: 'linkedin', cadence: 'one-off', voice: 'formal', owner: CHANNEL_PUBLISH_CROWN_OWNER,
+      category: 'patent', title: 'Patent review', body: 'Needs review',
+    });
+    const rejected = new Command().name('elanous');
+    registerIntakeCommands(rejected, { root });
+    await rejected.parseAsync(['intake', 'approve-channel-post', crownId, '--by', 'OP'], { from: 'user' });
+    expect(process.exitCode).toBe(1);
+    expect(queue.plan(crownId)).toMatchObject({ status: 'queued' });
+  } finally {
+    process.exitCode = previousExitCode ?? 0;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('to-tasks CLI retries HTTP failures and accepts Nexus deduplication', async () => {
   const root = mkdtempSync(join(tmpdir(), 'intake-to-tasks-retry-'));
   try {
@@ -334,6 +368,23 @@ function savedTelegramRoot(prefix: string, lastId: number): string {
   return root;
 }
 
+test('intake collect-telegram-saved reports connection failures through the registered CLI dependency', async () => {
+  const errors: string[] = [];
+  const previousExitCode = process.exitCode;
+  const program = new Command().name('elanous').exitOverride();
+  registerIntakeCommands(program, {
+    connectSaved: async () => { throw new Error('mock saved connection unavailable'); },
+    error: (message) => { errors.push(message); },
+  });
+  try {
+    await program.parseAsync(['intake', 'collect-telegram-saved'], { from: 'user' });
+    expect(errors).toEqual(['mock saved connection unavailable']);
+    expect(process.exitCode).toBe(2);
+  } finally {
+    process.exitCode = previousExitCode ?? 0;
+  }
+});
+
 test('intake collect-telegram-saved human output separates «메시지 0» from «원장 입력 0»: filter vs another consumer', async () => {
   const root = savedTelegramRoot('intake-tg-saved-cli-', 8959);
   try {
@@ -382,6 +433,40 @@ test('intake collect-telegram-saved human output separates «메시지 0» from 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('intake collect-telegram-saved recovers the cursor-boundary message and every missed saved message through the registered CLI', async () => {
+  const root = savedTelegramRoot('intake-tg-saved-recovery-', 9092);
+  try {
+    const messages = [
+      savedMsg(8960, '앞쪽 누락 https://example.com/first'),
+      savedMsg(9050, '가운데 누락 https://example.com/middle'),
+      savedMsg(9092, '커서 경계 https://example.com/boundary'),
+      savedMsg(9100, '새 메시지 https://example.com/newer'),
+    ];
+    const output: string[] = [];
+    const requested: number[] = [];
+    const program = new Command().name('elanous').exitOverride();
+    registerIntakeCommands(program, {
+      root,
+      connectSaved: async () => ({
+        fetch: async (minId: number, limit: number) => {
+          requested.push(minId);
+          return messages.filter((message) => message.id > minId).slice(0, limit);
+        },
+        close: async () => {},
+      }),
+      write: async (text: string) => { output.push(text); },
+    });
+    await program.parseAsync(['intake', 'collect-telegram-saved', '--json'], { from: 'user' });
+    expect(JSON.parse(output.pop()!)).toMatchObject({ cursorBefore: 9092, cursorAfter: 9100, messages: 4, raws: 4, ingest: { added: 4 } });
+    expect(requested).toEqual([9092, 8791]);
+    expect(listIntakeItems(root)).toHaveLength(4);
+    expect(listIntakeItems(root).map((item) => item.url)).toEqual([
+      'https://example.com/first', 'https://example.com/middle', 'https://example.com/boundary', 'https://example.com/newer',
+    ]);
+    expect(listIntakeItems(root).every((item) => item.source === 'telegram-saved' && item.privacy === 'user-private')).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('intake collect-telegram-saved --json reports fetched / dropped / ingest apart and the representative\'s saved message lands on the next collect', async () => {
   const root = savedTelegramRoot('intake-tg-saved-json-', 8959);
   try {
@@ -404,15 +489,17 @@ test('intake collect-telegram-saved --json reports fetched / dropped / ingest ap
       };
     };
 
-    // 커서 이후 새 저장 메시지가 없는 판 — «메시지 0» 이고 커서도 안 움직인다.
-    const empty = await collect();
-    expect(empty).toMatchObject({ cursorBefore: 8959, cursorAfter: 8959, messages: 0, droppedByFilter: 0, raws: 0, dryRun: false });
-    expect(empty.ingest).toMatchObject({ added: 0, seen: 0 });
+    // 첫 흡수는 빈 메시지만 받아 커서를 9092로 옮기지만 원장에는 넣지 않는다.
+    all = [savedMsg(9060, ''), savedMsg(9092, '')];
+    const filtered = await collect();
+    expect(filtered).toMatchObject({ cursorBefore: 8959, cursorAfter: 9092, messages: 2, droppedByFilter: 2, raws: 0, dryRun: false });
+    expect(filtered.ingest).toMatchObject({ added: 0, seen: 0 });
+    expect(listIntakeItems(root)).toHaveLength(0);
 
-    // 대표가 저장한 메시지 1건 — 다음 흡수에 원장으로 실제로 들어간다(판정선).
-    all = [savedMsg(9093, '판정선 https://example.com/judged')];
+    // 대표가 그 뒤 저장한 1건이 다음 CLI 수집에서 원장에 실제 유입된다(판정선).
+    all.push(savedMsg(9093, '판정선 https://example.com/judged'));
     const judged = await collect();
-    expect(judged).toMatchObject({ cursorBefore: 8959, cursorAfter: 9093, messages: 1, droppedByFilter: 0, raws: 1 });
+    expect(judged).toMatchObject({ cursorBefore: 9092, cursorAfter: 9093, messages: 1, droppedByFilter: 0, raws: 1 });
     expect(judged.ingest).toMatchObject({ shaped: 1, added: 1, merged: 0, seen: 0, skipped: 0 });
     const landed = listIntakeItems(root);
     expect(landed).toHaveLength(1);

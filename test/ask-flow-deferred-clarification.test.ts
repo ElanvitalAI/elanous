@@ -90,10 +90,9 @@ describe('runAskLaunchFlow — 비대화형 되묻기', () => {
     // ⛔ 물음 «내용»과 questionId — 이것이 없으면 사람이 무엇에 답할지 모른다.
     expect(text).toContain('[implementation_anchor]');
     expect(text).toContain('Which function should the target contain?');
-    expect(text).toContain('0) Function or constant');
     // ⛔ 답변 «경로» — 이미 있는 창구를 가리킨다(새 UI 를 만들지 않는다).
-    expect(text).toContain('elanous self clarify answer docs/goals/GOAL-x.md <questionId>');
-    expect(text).toContain('elanous self author --supersedes docs/goals/GOAL-x.md');
+    expect(text).toContain('선택지 답변: elanous self clarify answer docs/goals/GOAL-x.md implementation_anchor <0-based-optionIndex>');
+    expect(text).toContain('골을 다시 저작하려면: elanous self author --from-clarification docs/goals/GOAL-x.md#implementation_anchor');
     expect(logs.find(({ event }) => event === 'ask-clarification-intake')?.data)
       .toMatchObject({ mode: 'deferred-noninteractive', pendingCount: 1, interactive: false });
     // runAskLaunchFlow → recommendLaunchDecomposition 및 인보커 git 관측은 둘 다 fake seam만 소비한다.

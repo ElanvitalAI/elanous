@@ -14,6 +14,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { defaultSeams, preservationHasChanges, parseBehindCount, removeMatchingGoalCopy, toReviewIntentInput } from './seams.js';
 import { runSelfImplementCliCommand } from './self-implement-cli.js';
 import { runDraftSweep } from '../self-dev/draft-sweep.js';
+import { parseAskTargetPathHints } from '../self-dev/launch-preflight-text.js';
 import { GoalRunStore } from './goal-run-store.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerPath } from './run-ledger.js';
 import { compactForLog, debug } from '../debug/log.js';
@@ -981,6 +982,25 @@ describe('L0 graph.path skipped-node attribution', () => {
 });
 
 describe('run stop ledger attribution', () => {
+  test('parent managed-task abort reaches the active implementation child', async () => {
+    const controller = new AbortController();
+    let started!: () => void;
+    const implementationStarted = new Promise<void>((resolve) => { started = resolve; });
+    let childSignal: AbortSignal | undefined;
+    const run = runSelfImplement({ feature: 'parent cancellation', signal: controller.signal, seams: seams({
+      implement: async (ctx) => {
+        childSignal = ctx.signal;
+        started();
+        await new Promise<void>((resolve) => ctx.signal?.addEventListener('abort', () => resolve(), { once: true }));
+        return { ok: false, summary: 'aborted' };
+      },
+    }) });
+    await implementationStarted;
+    controller.abort(new Error('AgentStop requested'));
+    await expect(run).rejects.toThrow('AgentStop requested');
+    expect(childSignal?.aborted).toBe(true);
+  });
+
   test('implement aborted adds exactly one stop without replacing existing ledger events', async () => {
     const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
     const result = await runSelfImplement({ feature: 'stop on failed implement', seams: seams({
@@ -1810,10 +1830,9 @@ describe('runSelfImplement — escalation triage wiring', () => {
       { round: 1, purpose: 'budget' },
       { round: 1, purpose: 'escalation-triage' },
     ]);
-    expect(received).toEqual([
-      { escalateTier: undefined, feature: 'escalation triage wiring' },
-      { escalateTier: 'sol', feature: expect.stringContaining('TRIAGE: rewrite the contract') },
-    ]);
+    expect(received[0]).toMatchObject({ escalateTier: undefined });
+    expect(received[0]?.feature).toBe('escalation triage wiring');
+    expect(received[1]).toMatchObject({ escalateTier: 'sol', feature: expect.stringContaining('TRIAGE: rewrite the contract') });
   });
 
   test('EXTEND that moves the final tier leaves the now non-escalated retry without triage', async () => {
@@ -7882,7 +7901,7 @@ describe('runSelfImplement — pre-launch authored clarification escalation', ()
 });
 
 describe('runSelfImplement — --ground round-0 codebase grounding', () => {
-  test('TA-KNOWHOW-PACK injects promoted context into the real round-0 implement path and records ids and bytes', async () => {
+  test('TA-KNOWHOW-PACK defaults to decision evidence without changing the round-0 goal', async () => {
     const root = mkdtempSync(join(tmpdir(), 'knowhow-orchestrator-'));
     const file = join(root, 'docs/roles/TC/KNOWHOW.md');
     mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
@@ -7897,15 +7916,19 @@ describe('runSelfImplement — --ground round-0 codebase grounding', () => {
         createWorktree: async ({ branch, base }) => ({ path: root, branch, base }),
         writeRunLedger: (entry) => { ledger.push({ event: entry.event, data: entry.data }); },
       }) });
-      expect(features[0]).toContain('[KNOWHOW-PACK v1 ids=K-TC-777]');
-      expect(features[0]).toContain(feature);
-      expect(ledger.find((entry) => entry.event === 'knowhow-pack')?.data).toMatchObject({ ids: ['K-TC-777'], injected: true, reason: 'selected', repoPath: root, repoRevision: null });
+      expect(features[0]).toBe(feature);
+      // The first line is parsed as the TA target-path label by the child preflight.
+      expect(features[0]?.startsWith(feature)).toBe(true);
+      expect(parseAskTargetPathHints(features[0]!)).toEqual(['src/self-implement/orchestrator.ts']);
+      expect(prTitle(features[0]!)).toBe(prTitle(feature));
+      expect(ledger.find((entry) => entry.event === 'knowhow-pack')?.data).toMatchObject({ ids: ['K-TC-777'], injected: false, reason: 'selected', repoPath: root, repoRevision: null });
       expect(Number(ledger.find((entry) => entry.event === 'knowhow-pack')?.data.bytes)).toBeGreaterThan(0);
       expect(readFileSync(file, 'utf8')).toBe(before);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('TA-KNOWHOW-PACK does not repeat the reference block in rework goals', async () => {
+    setUserConfigOverlay((config) => ({ ...config, harness: { ...config.harness, knowhowChildInjection: true } }));
     const root = mkdtempSync(join(tmpdir(), 'knowhow-rework-'));
     mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
     writeFileSync(join(root, 'docs/roles/TC/KNOWHOW.md'), '## K-TC-778 gate-failed\n- 상황: src/self-implement/orchestrator.ts gate-failed.\n- 출처: 시험 · 상태: active\n');

@@ -3,22 +3,27 @@ import { debug } from './debug/log.js';
 import { PROVIDERS, streamLLMWithTools, type LLMProvider, type LLMStreamEvent } from './llm.js';
 import { setUserConfigOverlay } from './user-config.js';
 
+const realTimeout = globalThis.setTimeout;
+
 function providerForTimeout(retryEvents: LLMStreamEvent[] | null): {
   provider: LLMProvider;
   getCalls(): number;
   getReturns(): number;
   returnSettled(): boolean;
+  getSignals(): AbortSignal[];
 } {
   let calls = 0;
   let returns = 0;
   let returnSettled = false;
+  const signals: AbortSignal[] = [];
   const provider: LLMProvider = {
     name: 'idle-timeout-test-provider',
     defaultModel: 'idle-timeout-test-model',
     available: () => true,
     async *chat() { yield 'unused'; },
-    streamChat() {
+    streamChat(_messages, opts) {
       calls++;
+      if (opts.signal) signals.push(opts.signal);
       if (calls > 1 && retryEvents !== null) {
         return (async function* () { yield* retryEvents; })();
       }
@@ -43,7 +48,7 @@ function providerForTimeout(retryEvents: LLMStreamEvent[] | null): {
       return iterator;
     },
   };
-  return { provider, getCalls: () => calls, getReturns: () => returns, returnSettled: () => returnSettled };
+  return { provider, getCalls: () => calls, getReturns: () => returns, returnSettled: () => returnSettled, getSignals: () => signals };
 }
 
 describe('LLM stream idle timeout recovery', () => {
@@ -71,6 +76,8 @@ describe('LLM stream idle timeout recovery', () => {
       expect(result).toBe('partial answer');
       expect(fake.getCalls()).toBe(2);
       expect(fake.getReturns()).toBe(1);
+      expect(fake.getSignals()[0]?.aborted).toBe(true);
+      expect(fake.getSignals()[1]?.aborted).toBe(false);
       expect(fake.returnSettled()).toBe(false);
       expect(chunks).toContain('partial');
       expect(statuses).toContain('스트림 무응답 · 재시도 1/1');
@@ -200,4 +207,72 @@ describe('LLM stream idle timeout recovery', () => {
       log.mockRestore();
     }
   }, 500);
+
+
+  it('uses the configured idle timeout and preserves pinned partial text after retry exhaustion', async () => {
+    const fake = providerForTimeout(null);
+    const statuses: string[] = [];
+    setUserConfigOverlay((config) => ({
+      ...config,
+      llm: { ...config.llm, streamIdleTimeoutMs: 10 },
+    }));
+    try {
+      const result = await Promise.race([
+        streamLLMWithTools(
+          [{ role: 'user', content: 'preserve partial output' }],
+          { onText: () => {}, onStatus: (line) => statuses.push(line), dispatchTool: async () => ({}) },
+          {
+            provider: fake.provider,
+            model: 'idle-timeout-test-model',
+            tools: [{ name: 'probe', description: 'probe', parameters: { type: 'object' } }],
+            maxTurns: 1,
+          },
+        ),
+        new Promise<never>((_, reject) => realTimeout(() => reject(new Error('configured idle timeout ignored')), 300)),
+      ]);
+      expect(result).toBe('partial');
+      expect(fake.getCalls()).toBe(2);
+      expect(fake.getReturns()).toBe(2);
+      expect(statuses).toContain('스트림 무응답 · 재시도 소진 (부분 응답 유지)');
+    } finally {
+      setUserConfigOverlay(null);
+    }
+  }, 500);
+
+  it('surfaces an idle timeout when a pinned provider has no partial output', async () => {
+    const never = new Promise<IteratorResult<LLMStreamEvent, void>>(() => {});
+    const provider: LLMProvider = {
+      name: 'idle-timeout-empty-provider',
+      defaultModel: 'idle-timeout-empty-model',
+      available: () => true,
+      async *chat() {},
+      streamChat() {
+        return {
+          [Symbol.asyncIterator]() { return this; },
+          next: () => never,
+          return: () => never,
+        } as AsyncGenerator<LLMStreamEvent, void, unknown>;
+      },
+    };
+    const result = streamLLMWithTools(
+      [{ role: 'user', content: 'no partial output' }],
+      { onText: () => {}, dispatchTool: async () => ({}) },
+      {
+        provider,
+        model: provider.defaultModel,
+        streamIdleTimeoutMs: 10,
+        tools: [{ name: 'probe', description: 'probe', parameters: { type: 'object' } }],
+        maxTurns: 1,
+      },
+    );
+    await expect(Promise.race([
+      result,
+      new Promise<never>((_, reject) => realTimeout(() => reject(new Error('pinned timeout did not settle')), 300)),
+    ])).rejects.toMatchObject({
+      name: 'StreamIdleTimeoutError',
+      code: 'ETIMEDOUT',
+      message: 'stream idle timeout after 10ms',
+    });
+  }, 500);
+
 });

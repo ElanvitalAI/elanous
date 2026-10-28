@@ -11,11 +11,13 @@ interface GateHostClaim {
   hosts: string[];
   pid: number;
   pidStartedAt: number | null;
+  /** Wall-clock claim time. Claims written before this field existed stay readable (optional on read). */
+  reservedAt?: number;
 }
 
 export type GateHostReservation =
   | { status: 'free' }
-  | { status: 'reserved' | 'unknown'; reason: string; runId?: string };
+  | { status: 'reserved' | 'unknown'; reason: string; runId?: string; reservedAt?: number };
 
 const hostName = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const claimsDir = (root: string) => join(root, 'release', 'gate-host-reservations');
@@ -44,7 +46,7 @@ export function reserveReleaseGateHosts(root: string, runId: string, hosts: read
   const token = randomUUID();
   const pidStartedAt = psProcessStartMs(process.pid);
   if (pidStartedAt === null) throw new Error('release gate owner start time unmeasured');
-  const claim: GateHostClaim = { token, runId, hosts: unique, pid: process.pid, pidStartedAt };
+  const claim: GateHostClaim = { token, runId, hosts: unique, pid: process.pid, pidStartedAt, reservedAt: Date.now() };
   const path = join(dir, `${token}.json`);
   const temp = join(dir, `.${token}.tmp`);
   try {
@@ -82,7 +84,9 @@ export function inspectReleaseGateHost(root: string, host: string): GateHostRese
         || !Number.isSafeInteger(claim.pid) || claim.pid <= 0 || typeof claim.token !== 'string'
         || typeof claim.runId !== 'string' || !claim.runId
         || (claim.pidStartedAt !== null && (!Number.isSafeInteger(claim.pidStartedAt)
-          || claim.pidStartedAt <= 0 || claim.pidStartedAt > Date.now()))) throw new Error('invalid claim');
+          || claim.pidStartedAt <= 0 || claim.pidStartedAt > Date.now()))
+        || (claim.reservedAt !== undefined && (!Number.isSafeInteger(claim.reservedAt)
+          || claim.reservedAt <= 0 || claim.reservedAt > Date.now()))) throw new Error('invalid claim');
     } catch (error) { return { status: 'unknown', reason: `reservation unreadable: ${name}: ${String(error)}` }; }
     const live = claimAlive(claim);
     if (live === 'dead') {
@@ -91,7 +95,12 @@ export function inspectReleaseGateHost(root: string, host: string): GateHostRese
       continue;
     }
     if (!claim.hosts.includes(host) && !claim.hosts.includes('*')) continue;
-    return { status: live === 'unknown' ? 'unknown' : 'reserved', reason: `release gate ${claim.runId} holds ${host}`, runId: claim.runId };
+    return {
+      status: live === 'unknown' ? 'unknown' : 'reserved',
+      reason: `release gate ${claim.runId} holds ${host}`,
+      runId: claim.runId,
+      ...(claim.reservedAt !== undefined ? { reservedAt: claim.reservedAt } : {}),
+    };
   }
   return { status: 'free' };
 }

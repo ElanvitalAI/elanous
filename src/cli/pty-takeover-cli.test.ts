@@ -7,13 +7,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 import { RemotesStore } from './remotes.js';
-import { federatedPtyRefs, findPtyManifestRows, joinPtyLineage, ptyGitDiscoveryEnv, registerPtyTakeoverCommands, resolvePtyWorktreeProvenance, runPtyFind, runPtyLineage, runPtyList, runPtyReap, runPtyRelease, runPtyRetire, runPtySnapshot, runPtyText, runPtyMouse, type PtyTakeoverCommandDeps } from './pty-takeover-cli.js';
+import { federatedPtyRefs, findPtyManifestRows, joinPtyLineage, ptyGitDiscoveryEnv, registerPtyTakeoverCommands, resolvePtyWorktreeProvenance, runPtyFind, runPtyLineage, runPtyList, runPtyReap, runPtyRelease, runPtyRetire, runPtySnapshot, runPtyText, runPtyMouse, runPtyStopTurn, type PtyTakeoverCommandDeps } from './pty-takeover-cli.js';
 import { PTY_MANIFEST_CLOSED_TTL_MS, getPtyManifest, listPtyManifestRows, reapDeadPtyManifestAt, setPtyManifestDbPathForTesting, upsertPtyManifest, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { getPty as getRegisteredPty, setPtyManifestEnabledForTesting, startPty as startRegisteredPty, unregisterPty } from '../pty-shell/registry.js';
 import { enqueueControlMemo } from '../harness/control-inbox.js';
 import type { PtyEventRow } from '../pty-shell/pty-event-log.js';
 import type { PtyControlResult } from '../pty-shell/pty-control-ipc.js';
 import { createExternalInputQueue, EXTERNAL_INPUT_QUEUE_LIMIT } from '../input/external-input-queue.js';
+import { HARNESS_RUN_ID_ENV } from '../harness/harness-space.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -2415,6 +2416,31 @@ describe('runPtyRelease', () => {
 
     await expect(runPtyRelease('pty-release', local)).resolves.toEqual({ exitCode: 1, message: 'pty release: denied for pty-release (transition-policy)' });
     await expect(runPtyRelease('pty-release', remote)).resolves.toEqual({ exitCode: 1, message: 'pty release: denied for pty-release (transition-policy)' });
+  });
+});
+
+describe('runPtyStopTurn', () => {
+  test('standalone CLI creates a distinct caller identity before requesting stop-turn', async () => {
+    const beforeRunId = process.env[HARNESS_RUN_ID_ENV];
+    const beforeHostId = process.env.ELANOUS_HOST_ID;
+    delete process.env[HARNESS_RUN_ID_ENV];
+    process.env.ELANOUS_HOST_ID = 'test-stop-turn-host';
+    let requesterRunId = '';
+    try {
+      const deps = {
+        ...lineageDeps([], []),
+        requestRemote: async () => {
+          requesterRunId = process.env[HARNESS_RUN_ID_ENV] ?? '';
+          return { status: 'success' as const };
+        },
+      };
+      const result = await runPtyStopTurn('pty-target', 'agent', 'OPT', 'interrupt mission', deps);
+      expect(result.exitCode).toBe(0);
+      expect(requesterRunId).toMatch(/^run-/);
+    } finally {
+      if (beforeRunId === undefined) delete process.env[HARNESS_RUN_ID_ENV]; else process.env[HARNESS_RUN_ID_ENV] = beforeRunId;
+      if (beforeHostId === undefined) delete process.env.ELANOUS_HOST_ID; else process.env.ELANOUS_HOST_ID = beforeHostId;
+    }
   });
 });
 

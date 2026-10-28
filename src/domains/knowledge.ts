@@ -52,7 +52,7 @@ export interface KnowledgeDoc {
   //     의미검색으로 회상(domain='elanous'). [[self-awareness]].
   //   memory = M3 consolidation(2026-07-08): 흐린 에피소드 다수를 의미 umbrella 1건으로
   //     압축·영속(에피소드→의미·수면 공고화). 원본은 consolidated 마킹.
-  kind: 'signal' | 'dig' | 'alpha' | 'xreport' | 'morning' | 'outbound' | 'docs' | 'memory' | 'taste';
+  kind: 'signal' | 'dig' | 'alpha' | 'xreport' | 'morning' | 'outbound' | 'docs' | 'memory' | 'taste' | 'reference';
   sector_tags: string | null;
   text: string;
   source_ref: string | null;

@@ -33,6 +33,7 @@ import {
   runGateBaseline,
   rerunBunSingleTest,
   recheckTimeoutOnlyIntroducedFailures,
+  recheckOutsideScopeFailures,
   rerunBunTimeoutFailures,
   runReverseVerifyByBreaking,
   runVerifyByBreaking,
@@ -91,6 +92,29 @@ afterEach(() => {
 });
 
 describe('gate baseline case attribution', () => {
+  test('nested temporary-repo Bun fixture cannot become an introduced checkout failure', () => {
+    const log = [
+      'scripts/release-loop/gate-node.test.ts:',
+      'error: inner Pod diagnostic follows',
+      'src/warm-reference.test.ts:',
+      '(fail) fails [1.00ms]',
+      'scripts/release-loop/gate-node.test.ts:',
+      '(fail) real outer failure [2.00ms]',
+    ].join('\n');
+    const present = (file: string) => file === 'scripts/release-loop/gate-node.test.ts';
+    expect(extractGateTestFailures(log, present).map(({ name }) => name))
+      .toEqual(['scripts/release-loop/gate-node.test.ts > real outer failure']);
+    expect(buildGateBaselineReport(log, { status: 'pass', output: '0 fail', log: 'base clean' }, undefined, 0, present))
+      .toMatchObject({ introduced: 1, unknown: 0, failures: [{ name: 'scripts/release-loop/gate-node.test.ts > real outer failure' }] });
+  });
+
+  test('a log containing only a temporary-repo failure stays unmeasured', () => {
+    const log = 'src/warm-reference.test.ts:\n(fail) fails [1.00ms]\n';
+    const report = buildGateBaselineReport(log, { status: 'pass', output: '0 fail', log: 'base clean' }, undefined, 0, () => false);
+    expect(report).toMatchObject({ introduced: 0, unknown: 1,
+      failures: [{ name: '(unparsed test failure)', attribution: 'unknown' }] });
+  });
+
   test('Bun 단일 시험 패턴은 > 세그먼트를 공백으로 바꾸고 각각 정규식 이스케이프한 앵커다', () => {
     expect(buildBunSingleTestPattern('outer suite > nested [pass].$')).toBe('^outer suite nested \\[pass\\]\\.\\$$');
   });
@@ -1834,6 +1858,59 @@ describe('gate baseline — introduced timeout-only standalone recheck', () => {
     expect(unchanged.introduced).toBe(1);
     expect(unchanged.failures[0]?.attribution).toBe('introduced');
     expect(unchanged.timeoutRechecks).toBeUndefined();
+  });
+});
+
+describe('gate baseline — outside-scope interference recheck', () => {
+  const file = 'test/unrelated.test.ts';
+  const failed = `${file}:\n(fail) shared fixture\nerror: stale shared state\n1 fail`;
+  const initial = () => {
+    const report = buildGateBaselineReport(failed, { status: 'pass', output: '1 pass\n0 fail', log: 'base clean' });
+    return { ...report, failures: report.failures.map((failure) => ({ ...failure, baselinePresence: 'present' as const })) };
+  };
+
+  test('both standalone trees pass: classify interference with evidence and keep gate blocked', () => {
+    const calls: string[] = [];
+    const report = recheckOutsideScopeFailures('/host/head', initial(), 'main', ['test/related.test.ts'],
+      (dir, target, name) => { calls.push(`${dir}:${target}:${name}`); return 'pass'; },
+      (_dir, _ref, cases, run) => new Map(cases.map(({ file: target, name }) =>
+        [`${target}\u0000${name}`, run('/host/base', target, name)] as const)));
+    expect(calls).toEqual(['/host/head:test/unrelated.test.ts:shared fixture', '/host/base:test/unrelated.test.ts:shared fixture']);
+    expect(report).toMatchObject({ introduced: 0, unknown: 1 });
+    expect(report.failures[0]).toMatchObject({ attribution: 'unknown', unknownReason: 'interference', interference: true });
+    expect(report.interferenceRechecks).toEqual([{
+      file, name: `${file} > shared fixture`, head: 'pass', base: 'pass', classification: 'interference',
+    }]);
+    expect(allowsBaselineOnlyFailure(report)).toBe(false);
+    expect(formatGateBaselineNote(report, 0)).toContain('[gate.interference] interference:');
+  });
+
+  test('real Bun and baseline worktree confirm the same standalone test on both trees', () => {
+    const cwd = repo();
+    mkdirSync(join(cwd, 'test'));
+    writeFileSync(join(cwd, file), "import { test, expect } from 'bun:test';\ntest('shared fixture', () => expect(1).toBe(1));\n");
+    git(cwd, 'add', '-A');
+    git(cwd, 'commit', '-m', 'add standalone test');
+    const base = git(cwd, 'rev-parse', 'HEAD');
+    writeFileSync(join(cwd, 'README.md'), 'head\n');
+    git(cwd, 'add', '-A');
+    git(cwd, 'commit', '-m', 'change unrelated file');
+
+    const report = recheckOutsideScopeFailures(cwd, initial(), base, []);
+    expect(report).toMatchObject({ introduced: 0, unknown: 1 });
+    expect(report.interferenceRechecks).toEqual([{
+      file, name: `${file} > shared fixture`, head: 'pass', base: 'pass', classification: 'interference',
+    }]);
+  });
+
+  test('related files are not rechecked, and either standalone failure keeps introduced', () => {
+    let calls = 0;
+    expect(recheckOutsideScopeFailures('/host/head', initial(), 'main', [file], () => { calls++; return 'pass'; })).toMatchObject({ introduced: 1 });
+    expect(calls).toBe(0);
+    const report = recheckOutsideScopeFailures('/host/head', initial(), 'main', [], () => 'failure',
+      (_dir, _ref, cases) => new Map(cases.map(({ file: target, name }) => [`${target}\u0000${name}`, 'pass' as const])));
+    expect(report).toMatchObject({ introduced: 1, unknown: 0 });
+    expect(report.interferenceRechecks?.[0]).toMatchObject({ head: 'failure', base: 'pass', classification: 'unchanged' });
   });
 });
 

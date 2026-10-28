@@ -563,3 +563,127 @@ export function coverRequiredEvidence(
     uncoveredCount: uncovered.length,
   };
 }
+
+// ── TDD 를 로직으로 (S4 · 대표 10-26 20:5x «쪼개기·TDD 가 로직에 박혀 있나») ──────
+//
+// ⛔ **왜 필요한가** — 조각 골(device-first)은 «검증 계획(TDD)» 문면만 조립하고, 사후 판정은
+// 증거 명령이 덮였는지만 본다(required-evidence-uncovered). ⇒ 자식이 **시험을 먼저 쓰고 구현 전에
+// RED 를 확인했는지**를 검사하는 경로가 전혀 없다. TDD 가 문면 요청으로만 존재한다.
+// ⇒ 오케스트레이터가 **첫 조각 커밋에 피처 시험·구현 전 실행 RED 기록**을 요구하고
+//   **구현 뒤 같은 명령의 GREEN 기록**을 요구한다. 판정은 기존 태그 동등 문법과 같다:
+//   자식은 `EVIDENCE: [tdd-red] … || <명령>` ⊕ `RESULT: <실패>` ·
+//   `EVIDENCE: [tdd-green] … || <같은 명령>` ⊕ `RESULT: <통과>` 를 남긴다.
+
+/** 자식이 남겨야 하는 TDD 증거 태그. ⛔ 판정은 **태그 동등**이다(해석 금지). */
+export const TDD_RED_TAG = 'tdd-red';
+export const TDD_GREEN_TAG = 'tdd-green';
+export type TddRecordTag = typeof TDD_RED_TAG | typeof TDD_GREEN_TAG;
+
+/** 골 문서의 «검증 계획(TDD)» 절 형식(완료 경계 증거 명령이 골 문서가 아니라 조각 계획에 박혀 있다). */
+const TDD_PLAN_HEADING = /^#{2,3}\s*검증\s*계획\s*\(TDD\)\s*$/iu;
+const TDD_RED_PLAN_PREFIX = /^[-*]\s*③\s*먼저\s*쓸\s*시험\(RED\)\s*:\s*/u;
+const TDD_GREEN_PLAN_PREFIX = /^[-*]\s*④\s*GREEN\s*뒤\s*같은\s*명령\s*:\s*/u;
+/** device-first 조각 계획의 한 줄 형식 — «피처 시험 bun test <경로>» 를 같은 명령으로 잡는다. 경로 토큰 경계([\\w./-]) 로 조사·역따옴표를 삼키지 않는다. */
+const TDD_PLAN_INLINE = /(?:--test-)?bun(?:x)?\s+test\s+(?:src|test)\/[\w./-]+/iu;
+/** `RESULT:` 한 줄이 통과 기록인가 — 기존 bun test 판정 문법(`0 fail`)과 같은 신호. */
+const TDD_PASS_RESULT = /(?:^|\s)0\s+fail/iu;
+
+export interface TddPlan {
+  readonly planned: boolean;
+  /** ③ 먼저 쓸 시험(RED) 문면(앞뒤 공백만 정리). */
+  readonly redStage: string | undefined;
+  /** ④ GREEN 뒤 같은 명령(예: `bun test <대상>.test.ts`). */
+  readonly greenCommand: string | undefined;
+}
+
+/** 골 문서에서 «검증 계획(TDD)» 절을 읽는다. **순수** — 절이 없으면 `planned: false`(추측 금지). */
+export function tddPlanFromGoal(goal: string): TddPlan {
+  const lines = goal.split(/\r?\n/);
+  const headingIndex = lines.findIndex((line) => TDD_PLAN_HEADING.test(line.trim()));
+  if (headingIndex >= 0) {
+    const section: string[] = [];
+    for (const line of lines.slice(headingIndex + 1)) {
+      const text = line.trim();
+      // ⛔ 다음 절 제목(`#`·`###` 도 절이다)에서 멈춘다 — requiredEvidenceFromGoal 과 같은 규율.
+      if (/^#{1,6}\s/.test(text)) break;
+      section.push(text);
+    }
+    const redStage = section.find((line) => TDD_RED_PLAN_PREFIX.test(line))
+      ?.replace(TDD_RED_PLAN_PREFIX, '').trim() || undefined;
+    const greenBody = section.find((line) => TDD_GREEN_PLAN_PREFIX.test(line))
+      ?.replace(TDD_GREEN_PLAN_PREFIX, '').trim();
+    const greenCommand = greenBody ? TDD_PLAN_INLINE.exec(greenBody)?.[0]?.trim() : undefined;
+    return { planned: true, redStage, greenCommand: greenCommand || undefined };
+  }
+  // device-first 조각 계획의 한 줄 형식 — «검증 계획(TDD): … 피처 시험 bun test <경로> …».
+  const inlineLine = lines.find((line) => /검증\s*계획\s*\(TDD\)\s*:\s*\S/u.test(line) && TDD_PLAN_INLINE.test(line));
+  const greenCommand = inlineLine ? TDD_PLAN_INLINE.exec(inlineLine)?.[0]?.trim() : undefined;
+  if (!greenCommand) return { planned: false, redStage: undefined, greenCommand: undefined };
+  return { planned: true, redStage: undefined, greenCommand };
+}
+
+export interface TddEvidenceRecord {
+  readonly tag: TddRecordTag;
+  /** 자식이 남긴 `EVIDENCE: [tag] …` 한 건(태그를 떼지 않는다). */
+  readonly claim: string;
+  /** 재현 명령. 없으면 기록이 아니다(기존 파서 규율과 같다). */
+  readonly verify: string | undefined;
+  /** 바로 다음 `RESULT:` 줄 — RED 는 실패 기록, GREEN 은 통과 기록이어야 한다. */
+  readonly result: string | undefined;
+  readonly observed: boolean;
+}
+
+export interface TddEvidenceJudgment {
+  readonly planned: boolean;
+  readonly red: TddEvidenceRecord;
+  readonly green: TddEvidenceRecord;
+  /** RED·GREEN 이 **같은 증거 명령**인가 — «GREEN 뒤 같은 명령» 계약의 판정. */
+  readonly sameCommand: boolean;
+  /** 결손 태그(관측·수리 지시의 원천). */
+  readonly missing: readonly TddRecordTag[];
+  /** 계획이 있는데 결손이 있다 — 오케스트레이터가 수리 라운드를 돌린다. */
+  readonly needsRepair: boolean;
+}
+
+/** 자식 기록 한 건의 태그를 뗀다 — coverRequiredEvidence 와 같은 문법. */
+function tddClaimTag(claim: string): string | undefined {
+  return claim.match(/^\s*\[([^\]]+)\]/)?.[1]?.trim() || undefined;
+}
+
+/** 태그 하나에 대한 자식 기록을 판정한다. RED 는 실패 기록(`0 fail` 없음), GREEN 은 통과 기록이다. */
+function tddRecordFromItems(items: readonly OffDiffEvidenceParse['items'][number][], tag: TddRecordTag): TddEvidenceRecord {
+  const item = items.find((candidate) => tddClaimTag(candidate.claim) === tag);
+  if (!item) return { tag, claim: '', verify: undefined, result: undefined, observed: false };
+  const verify = item.verify.trim() || undefined;
+  const result = item.result?.trim() || undefined;
+  const resultPasses = result !== undefined && TDD_PASS_RESULT.test(result);
+  const observed = tag === TDD_RED_TAG
+    ? verify !== undefined && result !== undefined && !resultPasses
+    : verify !== undefined && result !== undefined && resultPasses;
+  return { tag, claim: item.claim, verify, result, observed };
+}
+
+/**
+ * ★ TDD 를 로직으로 판정한다. **순수**.
+ *
+ * 판정은 셋이다: ① 골이 «검증 계획(TDD)» 을 계획했는가 ② 자식이 [tdd-red] RED 기록(구현 전 실패)을
+ * 남겼는가 ③ [tdd-green] GREEN 기록(구현 뒤 **같은 명령** 통과)을 남겼는가. 셋째는 문면이 아니라
+ * **명령 동등**으로 판정한다 — RED 의 명령과 GREEN 의 명령이 문자열로 같아야 한다.
+ */
+export function judgeTddEvidence(goal: string, evidence: OffDiffEvidenceParse): TddEvidenceJudgment {
+  const plan = tddPlanFromGoal(goal);
+  const red = tddRecordFromItems(evidence.items, TDD_RED_TAG);
+  const green = tddRecordFromItems(evidence.items, TDD_GREEN_TAG);
+  const sameCommand = red.verify !== undefined && red.verify === green.verify;
+  const missing: TddRecordTag[] = [];
+  if (!red.observed) missing.push(TDD_RED_TAG);
+  if (!green.observed || (red.verify !== undefined && green.verify !== undefined && !sameCommand)) missing.push(TDD_GREEN_TAG);
+  return {
+    planned: plan.planned,
+    red,
+    green,
+    sameCommand,
+    missing,
+    needsRepair: plan.planned && missing.length > 0,
+  };
+}

@@ -226,7 +226,7 @@ import { formatGateFailedId, type PremiseReviewCard, type PremiseReviewInput } f
 import { runWorkflowToCompletion } from '../workflow-runtime/executor.js';
 import { mapReworkVerdict, supervisionObservationFields } from './supervision-vocabulary.js';
 import { resolveRunOutcome } from './run-outcome.js';
-import { authorLimitationCountFromGoal, authoredSignalExecution, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
+import { authorLimitationCountFromGoal, authoredSignalExecution, harvestEvidenceLines, harvestedEvidenceObservation, MAX_HARVESTED_EVIDENCE_CHARS, parseOffDiffEvidence, judgeTddEvidence, requiredEvidenceFromGoal, createRequiredEvidenceBudget, coverRequiredEvidence, settleUncoveredEvidence, formatUncoveredEvidenceFeedback, type OffDiffEvidenceParse } from './off-diff-evidence.js';
 import { resolveEvidenceHeadCommit } from './evidence-command-budget.js';
 import { pressDecisionSignals, type DecisionSignalPressResult } from './decision-signal-press.js';
 import { inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations } from '../../scripts/ask-marker-check.js';
@@ -2180,6 +2180,8 @@ export function appendGoalExecutionRecord(goalFile: string, record: GoalExecutio
 }
 
 export interface SelfImplementOptions {
+  /** Parent managed-task cancellation, linked to the active implementation child. */
+  signal?: AbortSignal;
   /** ⭐ 걸음을 «호출부»로 흘리는 이음매 — 노드에 들어갈 때마다 한 번.
    *  🩸 2026-09-08: 이 콜백은 «내부에» 있었고 ***호출부가 0*** 이라 걸음이 런 밖으로 안 나갔다.
    *    ⇒ 런 슈퍼바이저는 「시도의 요약 판정」만 보고 「어떻게 걸었나」를 «못 봤다».
@@ -5465,13 +5467,20 @@ async function runSelfImplementInner(
   }
 
   // The repository copy travels with both local and Pod worktrees. Operational HQ ledgers are never read here.
-  const knowhow = selectKnowhowPack(wt.path, opts.feature);
-  if (knowhow.text) round0Feature = `${knowhow.text}\n\n${round0Feature}`;
+  const knowhow = selectKnowhowPack(
+    wt.path,
+    opts.feature,
+    undefined,
+    { goalFile: opts.goalFile ?? null },
+  );
+  // Keep the original ask first: the child preflight and PR title read its first line.
+  const injectKnowhow = getUserConfig().harness?.knowhowChildInjection === true;
+  if (injectKnowhow && knowhow.text) round0Feature = `${round0Feature}\n\n${knowhow.text}`;
   const knowhowRevisionRead = runGitCommand(wt.path, ['rev-parse', '--verify', 'HEAD'], { encoding: 'utf8', timeout: 10_000 });
   const knowhowRevision = knowhowRevisionRead.status === 0 && /^[0-9a-f]{40,64}$/i.test(knowhowRevisionRead.stdout.trim())
     ? knowhowRevisionRead.stdout.trim() : null;
-  observe('knowhow-pack', { ids: knowhow.ids, bytes: knowhow.bytes, injected: knowhow.bytes > 0,
-    reason: knowhow.reason, repoPath: wt.path, repoRevision: knowhowRevision });
+  observe('knowhow-pack', { goal: opts.feature.slice(0, 4096), ids: knowhow.ids, bytes: knowhow.bytes, sources: knowhow.sources ?? [], injected: injectKnowhow && knowhow.bytes > 0,
+    reason: knowhow.reason, knowhowReason: knowhow.knowhowReason ?? knowhow.reason, repoPath: wt.path, repoRevision: knowhowRevision });
 
   // E1 착수 구체화(RFC-progressive-goal-elaboration §2 E1 · §7 간선 ①) — 고정 층(KPI·판정 신호)은 그대로, 카드만 덧붙인다.
   const elaboration = await (await import('./goal-elaborate.js')).runArrivalElaboration({ goal: opts.feature, prompt: round0Feature, cwd: wt.path, callLLM: s.elaborateCallLLM, observe });
@@ -7270,6 +7279,9 @@ async function runSelfImplementInner(
       throw error;
     }
     const implementAbortController = new AbortController();
+    const abortImplementation = (): void => implementAbortController.abort(opts.signal?.reason);
+    if (opts.signal?.aborted) abortImplementation();
+    else opts.signal?.addEventListener('abort', abortImplementation, { once: true });
     let implementPromise: ReturnType<SelfImplementSeams['implement']>;
     // Rework needs landed sibling PRs only after the initial round; shard eligibility avoids an expensive impossible lookup.
     const landedSiblings = round > 0
@@ -7336,7 +7348,10 @@ async function runSelfImplementInner(
       }
       finalizeSupervisorDeliveries(error instanceof StepTimeoutError ? 'next-round-implement-timeout' : 'next-round-implement-rejected');
       throw error;
+    } finally {
+      opts.signal?.removeEventListener('abort', abortImplementation);
     }
+    if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('SelfImplement aborted');
     // ⭐ 성공 경로에서도 닫는다 — 이 호출은 끝났고, 이후 자식이 늦게 보내는 입력은
     //   「이 라운드의 재투입」이 아니다(다음 라운드는 자기 콜백을 새로 만든다).
     closeSupervisorInput();
@@ -7452,6 +7467,69 @@ async function runSelfImplementInner(
         impl = { ...impl, ok: true, completionDisposition: undefined };
       }
     }
+    // ⭐ TDD 를 로직으로(S4) — 문면(device-first 조각 계획)이 아니라 실행 판정으로 끼운다.
+    //   ① 자식의 [tdd-red]/[tdd-green] 기록을 태그·같은 명령·결과로 판정한다.
+    //   ② 첫 조각 커밋의 피처 시험·구현 전 실행 RED 기록과 구현 뒤 같은 명령 GREEN 기록이
+    //     없으면 수리 라운드 1회(완료 경계·기존 동작은 보존), 그래도 없으면 fail-closed.
+    //   ③ 관측 원장에 tdd-red/tdd-green 이벤트를 남긴다.
+    let tddJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(impl.evidenceTranscript?.trim() || impl.summary));
+    if (tddJudgment.needsRepair && impl.ok && round < effectiveMax && opts.goalFile
+      && !hasCurrentProviderError() && !hasCurrentCredentialFailure()) {
+      let goalDocument: string | undefined;
+      try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { goalDocument = undefined; }
+      if (goalDocument !== undefined) {
+        const tddRetryNote = [
+          '[구현 재작업 · tdd-evidence-missing]',
+          `대상 경로: ${declaredPathsFromGoalDocumentText(goalDocument).paths.join(' · ') || '골 문서에 선언된 대상 경로 없음'}`,
+          '첫 조각 커밋에 피처 시험을 먼저 쓰고 구현 전 실행 RED 기록을 남기고, 구현 뒤 같은 명령의 GREEN 기록을 남겨라.',
+          "기록 양식(두 줄씩): 'EVIDENCE: [tdd-red] <무엇을 확인했나> || <증거 명령>' 다음 줄 'RESULT: <실패 요약 한 줄>' ·",
+          "'EVIDENCE: [tdd-green] <무엇을 확인했나> || <같은 증거 명령>' 다음 줄 'RESULT: <통과 요약 한 줄>'.",
+          `지금 잡힌 결손: ${tddJudgment.missing.join(' · ')}`,
+          '원래 골 문서(완료 경계 포함):',
+          goalDocument,
+        ].join('\n');
+        const tddRetryRound = round + 1;
+        observe('implementation-tdd-rework', { status: 'started', round: tddRetryRound, missing: [...tddJudgment.missing] }, { level: 'warn' });
+        progress('implementing', `[구현 재작업 · tdd-evidence-missing] 수리 라운드 ${tddRetryRound} 시작 — RED/GREEN 기록 결손`);
+        onNodeEntry(node('rework'), tddRetryRound);
+        onNodeEntry(node('implement'), tddRetryRound);
+        const tddRetryAbort = new AbortController();
+        const beforeTddRetry = impl;
+        let tddRetryImpl = impl;
+        try {
+          tddRetryImpl = await stepTimeout(s.implement({
+            sessionId, cwd: wt.path, feature: `${feature}\n\n${tddRetryNote}`, runId, shardIdentity, signal: tddRetryAbort.signal,
+            ...(harnessSeededPaths.length ? { harnessSeededPaths } : {}),
+            onSurfaceProgress: (line) => progress('implementing', line.trimEnd()),
+            roundContext: { round: tddRetryRound, effectiveMax, previousRoundFailure: tddRetryNote },
+            ...(opts.childLlm ? { childLlm: opts.childLlm } : {}),
+            ...(opts.documentReferences ? { documentReferences: opts.documentReferences } : {}),
+          }), T.implement, 'implement');
+        } catch (error) {
+          tddRetryAbort.abort();
+          tddRetryImpl = { ...beforeTddRetry, ok: false, summary: `[구현 재작업 · tdd-evidence-missing] 수리 라운드 실패 — ${safeErrorDescription(error)}` };
+        }
+        const tddRetryJudgment = judgeTddEvidence(roundGoal, parseOffDiffEvidence(tddRetryImpl.evidenceTranscript?.trim() || tddRetryImpl.summary));
+        if (tddRetryImpl.ok && !tddRetryJudgment.needsRepair) {
+          observe('implementation-tdd-rework', { status: 'succeeded', round: tddRetryRound, missing: [] });
+          tddJudgment = tddRetryJudgment;
+          impl = tddRetryImpl;
+          round = tddRetryRound;
+        } else {
+          observe('implementation-tdd-rework', { status: 'exhausted', round: tddRetryRound, missing: [...tddRetryJudgment.missing] }, { level: 'warn' });
+          impl = { ...beforeTddRetry, ok: false, summary: `[구현 재작업 · tdd-evidence-missing] RED/GREEN 기록 결손 — ${beforeTddRetry.summary}` };
+        }
+      }
+    }
+    observe('tdd-red', {
+      round, planned: tddJudgment.planned, observed: tddJudgment.red.observed, missing: tddJudgment.red.observed ? [] : ['tdd-red'],
+      verify: tddJudgment.red.verify ?? null, result: tddJudgment.red.result ?? null,
+    }, tddJudgment.planned && !tddJudgment.red.observed ? { level: 'warn' } : {});
+    observe('tdd-green', {
+      round, planned: tddJudgment.planned, observed: tddJudgment.green.observed, sameCommand: tddJudgment.sameCommand,
+      missing: tddJudgment.green.observed && tddJudgment.sameCommand ? [] : ['tdd-green'],
+      verify: tddJudgment.green.verify ?? null, result: tddJudgment.green.result ?? null,
+    }, tddJudgment.planned && !(tddJudgment.green.observed && tddJudgment.sameCommand) ? { level: 'warn' } : {});
     // A finished child can leave edits without a commit. Measure them before any
     // diff/no-changes classification, and commit only paths declared in the goal.
     finishedChildCommitMissing = false;
@@ -9046,9 +9124,9 @@ async function runSelfImplementInner(
       const mergedBase = m.baseRefName?.trim() || observedPrBase;
       if (mergedBase && displayBranchName(mergedBase) === 'main') {
         try {
-          const { syncMergedPrChecklist } = await import('../release-loop/merged-pr-checklist.js');
+          const { syncMergedPrChecklistWithFeedback } = await import('../release-loop/merged-pr-checklist.js');
           const goalFile = opts.goalFile ?? (opts.goalId ? s.goalDocumentPathByGoalId?.(opts.goalId) : undefined);
-          syncMergedPrChecklist(pr.number, wt.path, goalFile);
+          await syncMergedPrChecklistWithFeedback(pr.number, wt.path, goalFile);
         } catch (error) {
           observe('merged-pr-checklist-sync-failed', { number: pr.number, error: safeErrorDescription(error) }, { level: 'warn' });
         }

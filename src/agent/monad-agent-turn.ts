@@ -18,6 +18,7 @@ import { existsSync } from 'node:fs';
 import type { UserConfig } from '../user-config.js';
 import { runTurn, type RunTurnOpts } from '../session/chat.js';
 import type { SessionSource } from '../session/index.js';
+import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import { buildContinuationAgentTools } from '../dispatch/continuation-turn-runner.js';
 import { buildTerminalCapableTurn } from './terminal-surface.js';
 // ★ turn 조립기 통일 Phase 1(2026-07-22) — 자율tool 5종(delegate·SelfImplement·RelayShell·RunDevHarness·
@@ -202,7 +203,7 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource,
     // Track whether the turn handed off to an ACP delegate — the footer then
     // reads acp-<backend> instead of self·<model>.
     let delegatedBackend: string | undefined;
-    const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
+    const dispatch: CoreTurnDispatchTool = async (name, args, dispatchCtx) => {
       // ⭐ 소환기(F2 · 2026-07-26) — 이 서피스도 SelfImplement/RunDevHarness/
       //   SolveMission 을 defer 하므로 tier-flip 이 ToolSearch 를 주입한다.
       //   라우팅이 없으면 모델이 소환을 시도하는 순간 "unknown tool" 이다.
@@ -217,6 +218,8 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource,
           // Forward the turn's abort signal (from a /cancel-aware controller) so
           // an in-flight delegation can be cancelled; inert signal otherwise.
           signal: opts.signal ?? new AbortController().signal,
+          ...(dispatchCtx?.sessionId ? { sessionId: dispatchCtx.sessionId } : {}),
+          ...(dispatchCtx?.callId ? { toolCallId: dispatchCtx.callId } : {}),
           ...(surfaceChannels ? { surfaceHitlChannels: surfaceChannels } : {}),
           ...(surfaceQuestionChannels ? { surfaceQuestionChannels } : {}),
           ...(surfaceFileSink ? { surfaceFileSink } : {}),

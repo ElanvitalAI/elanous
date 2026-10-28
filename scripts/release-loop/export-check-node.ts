@@ -46,9 +46,27 @@ export function runExportCheck(run: CommandRunner = runCommand, repoRoot = proce
             step = 'build';
             const publicDir = join(out, 'export');
             symlinkSync(join(modulesRoot, 'node_modules'), join(publicDir, 'node_modules'), 'dir');
-            const pwaModules = join(modulesRoot, 'apps', 'pwa', 'node_modules');
-            if (!existsSync(pwaModules)) result = failed('build', 'PWA dependencies missing; run bun install --cwd apps/pwa in the release-loop repository');
-            else {
+            let pwaModules = join(root, 'apps', 'pwa', 'node_modules');
+            let pwaReady = existsSync(pwaModules);
+            if (!pwaReady) {
+              const installed = run('bun', ['install', '--cwd', join(root, 'apps', 'pwa'), '--frozen-lockfile'], root);
+              if (installed.status !== 0) {
+                // This path was absent before install. Remove partial output so a later retry cannot mistake it for a complete install.
+                let cleanupFailed = false;
+                try { rmSync(pwaModules, { recursive: true, force: true }); }
+                catch (error) {
+                  cleanupFailed = true;
+                  result = failed('build', `PWA dependency install partial-output cleanup: ${error instanceof Error ? error.message : String(error)}`, installed);
+                }
+                if (!cleanupFailed) result = failed('build', 'PWA dependency install', installed);
+              }
+              else {
+                pwaReady = existsSync(pwaModules);
+                if (!pwaReady) result = failed('build', 'PWA dependency install did not create apps/pwa/node_modules', installed);
+              }
+            }
+            if (pwaReady) {
+              pwaModules = realpathSync(pwaModules);
               if (existsSync(join(publicDir, 'apps', 'pwa'))) symlinkSync(pwaModules, join(publicDir, 'apps', 'pwa', 'node_modules'), 'dir');
               const built = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], publicDir);
               result = built.status === 0 && existsSync(join(publicDir, 'apps', 'pwa', 'out', 'index.html'))

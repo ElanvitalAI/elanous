@@ -323,16 +323,21 @@ describe('si-task Job result marker and mirror seed', () => {
           resolveSourceHead: async (o) => {
             resolves.push(o);
             if (outcome === 'threw') throw new Error('ls-remote hung');
-            return outcome === 'resolved' ? { sha: HEAD } : outcome === 'not-a-sha' ? { sha: 'HEAD' } : { reason: 'ls-remote-failed' };
+            return outcome === 'resolved' ? { sha: HEAD, originCalls: 1 } : outcome === 'not-a-sha' ? { sha: 'HEAD' } : { reason: 'ls-remote-failed' };
           },
           seedMirror: async ({ host, commit, cwd }) => { seeds.push({ host, commit, cwd, callsBefore: run.calls.length }); return { host, ok: true, ms: 3 }; } }, `seed-default-${outcome}`);
         expect(job.kind).toBe('Job');
         expect(resolves).toEqual([{ repoUrl: 'https://example.invalid/r', cwd: '/tmp/tree' }]);
         if (outcome === 'resolved') {
           expect(seeds).toEqual([{ host: 'node-b', commit: HEAD, cwd: '/tmp/tree', callsBefore: expect.any(Number) }]);
+          const script = job.spec.template.spec.containers[0].args[0] as string;
+          expect(script).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${HEAD}`);
+          expect(script).toContain(`git fetch --quiet --no-write-fetch-head '/host-mirror' '${HEAD}'`);
+          expect(script).not.toContain('git ls-remote --symref origin HEAD');
+          expect(script).not.toContain('git fetch --depth 50 origin HEAD');
           const applies = run.calls.map((call, index) => call.endsWith('apply -f -') ? index : -1).filter((index) => index >= 0);
           expect(applies[1]!).toBeGreaterThanOrEqual(seeds[0]!.callsBefore);   // seeded before the Job is applied
-          expect(seen.seen).toEqual([{ event: 'mirror-seed', data: expect.objectContaining({ host: 'node-b', commit: HEAD, sourceKind: 'default', ok: true }) }]);
+          expect(seen.seen).toEqual([{ event: 'mirror-seed', data: expect.objectContaining({ host: 'node-b', commit: HEAD, sourceKind: 'default', sourceBaseSha: HEAD, ok: true }) }]);
         } else {
           expect(seeds).toEqual([]);
           const reason = outcome === 'threw' ? 'default-head-resolve-threw' : outcome === 'not-a-sha' ? 'default-head-unresolved' : 'default-head-ls-remote-failed';
@@ -348,5 +353,21 @@ describe('si-task Job result marker and mirror seed', () => {
       resolveSourceHead: async (o) => { based.push({ base: o.base, jobsBefore: baseRun.applied.filter((e) => e.kind === 'Job').length }); return { reason: 'x' }; },
       seedMirror: async () => undefined }, 'seed-default-base')).catch(() => undefined);
     expect(based).toEqual([{ base: 'bench/x', jobsBefore: 0 }]);
-  });
+  }, 30_000);
+
+  test('host default-source resolver origin calls are joined to the Pod source IO summary', async () => {
+    const run = fakeLaunch('ELANOUS_POD_SOURCE_IO {"originCalls":0,"checkoutFiles":0,"sourceVia":"mirror","sourceSeconds":1,"sourceStatus":"complete","pushCalls":null,"installRan":null,"installSeconds":null}\n{"stage":"pr-opened","ok":true}\n');
+    const pool = { tryAcquire: () => ({ context: 'test-context', sshHost: 'node-b', capacity: 2 }), release: () => {}, snapshot: () => ({}) };
+    const ioRows: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'si-source-io-host-origin-count-test', emit: (record) => {
+      if (record.category === 'pod.source' && record.event === 'io-summary') ioRows.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      await run.launch({ pool: pool as never, hostMirror: '/srv/mirror.git', mirrorSeedCwd: '/tmp/tree',
+        resolveSourceHead: async () => ({ sha: 'c'.repeat(40), originCalls: 1 }),
+        seedMirror: async ({ host }) => ({ host, ok: true, ms: 1 }) }, 'source-io-host-origin-count');
+      expect(ioRows).toHaveLength(1);
+      expect(ioRows[0]).toMatchObject({ hostOriginCalls: 1, originCalls: 0, sourceVia: 'mirror' });
+    } finally { off(); }
+  }, 15_000);
 });

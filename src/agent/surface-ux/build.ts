@@ -75,7 +75,7 @@ function buildSurfaceUx(src: SurfaceUxSource): SurfaceUx {
       debug.log('surface-ux.confirm', 'answered', { surface, channel: res.channel, answer: res.answer });
       return res.answer === true;
     },
-    async question(req) {
+    async question(req, opts) {
       if (!questionChannels || questionChannels.length === 0) {
         debug.log('surface-ux.confirm', 'question', {
           surface,
@@ -83,8 +83,17 @@ function buildSurfaceUx(src: SurfaceUxSource): SurfaceUx {
         });
         return null;
       }
-      const res = await requestQuestion({ request: req, channels: questionChannels });
-      if (res.channel === 'all-failed' || res.channel === 'timeout') {
+      const res = await requestQuestion({ request: req, channels: questionChannels, ...(opts?.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }) });
+      if (res.channel === 'timeout') {
+        debug.log('surface-ux.confirm', 'question', {
+          surface,
+          mode: 'timeout',
+          elapsedMs: res.elapsedMs,
+          timeoutMs: opts?.timeoutMs,
+        });
+        return null;
+      }
+      if (res.channel === 'all-failed') {
         debug.log('surface-ux.confirm', 'question', {
           surface,
           mode: QUESTION_OBSERVATION_MODE.unanswered,

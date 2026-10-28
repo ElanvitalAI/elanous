@@ -159,9 +159,9 @@ export class AgentRegistry {
    *  wants to register the task with the registry before deciding
    *  whether to run it (e.g., confirmation gate). Always depth=0 —
    *  manual register has no parent context. */
-  register(definition: AgentDefinition, prompt: string): AgentTask {
+  register(definition: AgentDefinition, prompt: string, opts: { id?: string } = {}): AgentTask {
     const task: AgentTask = {
-      id: randomUUID(),
+      id: opts.id ?? randomUUID(),
       definition,
       prompt,
       depth: 0,
@@ -174,6 +174,30 @@ export class AgentRegistry {
     };
     this.tasks.set(task.id, task);
     return task;
+  }
+
+  /** Run a registered non-LLM job under the same observable/cancellable task lifecycle. */
+  async runManaged<T>(id: string, runner: (signal: AbortSignal) => Promise<T>, renderResult: (value: T) => string = String): Promise<T> {
+    const task = this.tasks.get(id);
+    if (!task) throw new Error(`agent task not found: ${id}`);
+    if (task.state !== 'pending') throw new Error(`agent task is not pending: ${id} (${task.state})`);
+    task.state = 'running';
+    task.startedAt = Date.now();
+    try {
+      const value = await runner(task.controller.signal);
+      task.state = task.controller.signal.aborted ? 'aborted' : 'done';
+      task.result = renderResult(value);
+      return value;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (task.controller.signal.aborted) task.state = 'aborted';
+      else { task.state = 'error'; task.error = message; }
+      task.result = message;
+      throw error;
+    } finally {
+      task.finishedAt = Date.now();
+      this.notifyTaskDone(task);
+    }
   }
 
   get(id: string): AgentTask | undefined {

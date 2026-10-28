@@ -97,6 +97,25 @@ describe('SurfaceUx — question / spill / progress 위임', () => {
       log.mockRestore();
     }
   });
+  test('question timeout cancels pending channel and records an explicit timeout outcome', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    let cancelled = 0;
+    try {
+      const ux = resolveSurfaceUx({ surface: 'tui', surfaceQuestionChannels: [{
+        name: 'telegram',
+        ask: async () => new Promise<null>(() => {}),
+        cancel: () => { cancelled += 1; },
+      }] });
+      const result = await ux.question({ questions: [{ id: 'h', header: 'h', question: '?', options: [] }] }, { timeoutMs: 5 });
+      expect(result).toBeNull();
+      expect(cancelled).toBe(1);
+      expect(log).toHaveBeenCalledWith('surface-ux.confirm', 'question', expect.objectContaining({
+        surface: 'tui', mode: 'timeout', timeoutMs: 5,
+      }));
+    } finally {
+      log.mockRestore();
+    }
+  });
   test('spillFile → FileSink.sendFile 위임', () => {
     const fs = captureFileSink();
     const ux = resolveSurfaceUx({ surfaceFileSink: fs.sink });

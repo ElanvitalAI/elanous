@@ -9,6 +9,7 @@ import { queryRunScreenKey } from '../../self-implement/run-ledger.js';
 import { logsDbPath } from '../../mss/logging/log-store.js';
 import { redactSecretText } from '../../debug/log.js';
 import { runAskLaunchFlow, type AskLaunchFlowResult } from '../../self-dev/ask-launch-flow.js';
+import { defaultGoalAuthorSelfResolve } from '../../self-implement/goal-author-clarification.js';
 import * as askIo from '../../self-dev/ask-launch-io.js';
 import { DAEMON_HARNESS_ASK_ENTRANCE } from '../../self-dev/entrance-registry.js';
 import { prepareAskLaunch } from '../../self-dev/launch-preflight.js';
@@ -211,12 +212,12 @@ function defaultAskDeps(rows: Awaited<ReturnType<typeof askIo.readAskPreflightLo
     print: () => {},
     log: (event: string, data: Record<string, unknown>, level?: 'info' | 'warn' | 'error') => debug.log('harness-http', event, data, { level }),
     readLine: async () => '',
-    readClarification: async () => '',
     readFile: (file: string) => readFileSync(file, 'utf8'),
     writeFile: (file: string, data: string) => writeFileSync(file, data, 'utf8'),
     cwd: () => process.cwd(),
     now: () => Date.now(),
     isInteractive: () => false,
+    selfResolveClarification: defaultGoalAuthorSelfResolve,
     buildPreflightDeps: askIo.buildAskPreflightDeps,
     priorBlockSamples: () => askIo.priorBlockSamplesFrom(rows),
     recentAuthoringSamples: () => askIo.recentAuthoringSamplesFrom(rows),

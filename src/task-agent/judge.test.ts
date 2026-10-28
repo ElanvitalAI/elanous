@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { judgeNextMove, mustFixSignature } from './judge.js';
+import { judgeEmptyImplementation, judgeNextMove, mustFixSignature } from './judge.js';
 import { STOP_CLASS_NO_LAUNCH, STOP_CLASS_POD_FAILURE } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 
 describe('TASK-AGENT 판단부 — 종료 어휘 → 다음 한 수 (RFC §A2)', () => {
@@ -251,5 +251,46 @@ describe('TASK-AGENT 판단부 — 선례(precedent) — 같은 must-fix 서명�
     events.length = 0;
     judgeNextMove({ stopReason: 'needs-human', review: 'fail', mustFix, observe });
     expect(events).toEqual([['task-agent.judge', { precedent: { matched: false, priorRunId: undefined, signature } }]]);
+  });
+});
+
+describe('TASK-AGENT 판단부 — 빈 구현 must-fix 감지 (결정론 분류 · narrow-relaunch 대신 재구현/needs-owner)', () => {
+  test('빈 구현 신호(구현 파일 변경 0 · GOODHART/자기 문구 시험 · 대상 경로 미배선) 첫 회 → 재구현 판정', () => {
+    const samples: readonly [string, readonly string[]][] = [
+      ['구현 파일 변경 0', ['구현 파일 변경 0 — 대상 경로에 실물 diff 없음']],
+      ['GOODHART/자기 문구 시험', ['시험이 골 문면만 그대로 주장해 통과 — GOODHART']],
+      ['대상 경로 미배선', ['대상 경로 미배선 — 새 판정을 부르는 생산 호출부 없음']],
+    ];
+    for (const [signal, mustFix] of samples) {
+      const judged = judgeEmptyImplementation(mustFix, 0);
+      expect(judged?.move).toBe('reimplement');
+      expect(judged?.signals).toEqual([signal]);
+      // 판정 관측 한 줄 — 신호와 처분이 한 줄에 남는다(제목과 구별된 판정 문면).
+      expect(judged?.reason).not.toMatch(/\n/u);
+      expect(judged?.reason).toContain(signal);
+      expect(judged?.reason).toContain('새 발사');
+    }
+  });
+
+  test('이미 두 번째 빈 구현 must-fix → needs-owner 판정(칸 주인 이관)', () => {
+    const judged = judgeEmptyImplementation(['구현 파일 변경 0 — 시험이 기능 부재를 통과'], 1);
+    expect(judged?.move).toBe('needs-owner');
+    expect(judged?.signals).toEqual(['구현 파일 변경 0']);
+    expect(judged?.reason).toContain('칸 주인');
+    expect(judged?.reason).not.toMatch(/\n/u);
+  });
+
+  test('일반 must-fix → 분류 없음(종전 narrow-relaunch 불변 — 신호 없으면 이전 횟수와 무관)', () => {
+    for (const mustFix of [['A 원문 확보', '테스트 추가'], ['타임아웃 증가'], ['변경 파일 범위 게이트 통과'], []] as const) {
+      expect(judgeEmptyImplementation(mustFix, 0)).toBeNull();
+      expect(judgeEmptyImplementation(mustFix, 1)).toBeNull();
+    }
+    expect(judgeEmptyImplementation(undefined, 2)).toBeNull();
+  });
+
+  test('한 must-fix 목록에 신호가 여럿이면 전부 잡는다', () => {
+    const judged = judgeEmptyImplementation(['구현 파일 변경 0', '대상 경로 미배선 — 호출부 없음'], 0);
+    expect(judged?.move).toBe('reimplement');
+    expect(judged?.signals).toEqual(['구현 파일 변경 0', '대상 경로 미배선']);
   });
 });

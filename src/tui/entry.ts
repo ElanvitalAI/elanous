@@ -7,7 +7,7 @@ import { createInlineEditorState, type InlineEditorState } from '../input-core/i
 import { isNewSessionCommand, nextTuiTitle, requestNewTuiSession } from './slash/new-session.js';
 import { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS, isCompactCommand } from './slash/compact-command.js';
 import { RESUME_BUSY_STATUS, parseResumeCommand } from './slash/resume-command.js';
-import { reportTuiTurn } from '../pty-shell/tui-run-state.js';
+import { reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
 import { createPasteFold } from '../chat/paste-fold.js';
 import { createTurnTypeaheadState, dequeueTurnTypeaheadHandoff, drainTurnTypeaheadOnce, restoreTurnTypeaheadSubmission } from '../chat/turn-typeahead.js';
 import { debug } from '../debug/log.js';
@@ -100,7 +100,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let sidetabRemoteFrame: string | null = null;
   let sidetabRows: import('./sidetab/list.js').SidetabRow[] = [];
   let sidetabApi: typeof import('./sidetab/list.js') | null = null;
-  let sidetabAttachments: import('./sidetab/attach.js').SidetabAttachmentController | null = null;
+  // ⚠️ `as` 단언은 «null 로 좁혀지는» 흐름 분석을 푸는 것 — 값은 클로저(ensureSidetabAttachments) 안에서만 바뀐다.
+  let sidetabAttachments: import('./sidetab/attach.js').SidetabAttachmentController | null = null as import('./sidetab/attach.js').SidetabAttachmentController | null;
   let pendingSidetabSwitch: string | null = null;
   let sidetabRefreshTimer: ReturnType<typeof setInterval> | null = null;
   let paintingCoordinatorFrame = false;
@@ -479,6 +480,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   };
 
   let restoreCliStderrSink: (() => void) | null = null;
+  let restoreTuiStderrOwner: (() => void) | null = null;
 
   const refreshAtPicker = async (): Promise<void> => {
     const query = editor.text.slice(0, editor.cursor).match(/(?:^|\s)@([\p{L}\p{N}_./~\\-]*)$/u);
@@ -550,6 +552,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     // herdr pane 이면 턴 시작·끝을 working → idle 로 신고한다(`eln herdr prompt --wait` 가 이것을 기다린다).
     // 녹음기는 startTuiSelfReport 가 이미 열었다 — 없으면 아무것도 안 한다.
     reportTuiTurn('busy');
+    // 턴 시작도 진전이다(SURVIVAL-PROGRESS-CLOCK) — 마지막 진전 시각의 0초를 잡는다.
+    reportTuiProgress();
     // An internal turn says where it came from (classic «↻ 자동 재개(<origin>): <이유>») instead of looking typed.
     // TUI-GOAL-INTERIM-QUIET — the log draws a recognized internal input in place («↻ 자동 재개(<origin>)»), so the
     // notice list would only repeat it under the last reply; the status line still names it while the turn runs.
@@ -570,6 +574,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         observeSession(turnSessionId, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus);
         let firstResponseSeen = false;
         return runLocalChatTurn(turnSessionId, turnText, abort.signal, undefined, undefined, (delta) => {
+          // 스트림 텍스트 = 진전 신호 — 마지막 진전 시각을 올린다(녹음기 없으면 아무 일도 안 한다).
+          reportTuiProgress();
           // 첫 응답 경계: 첫 스트림 델타에서 턴 시작 트레이스를 닫는다(endedBy=stream-open).
           if (!firstResponseSeen) {
             firstResponseSeen = true;
@@ -659,6 +665,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }, 1_000);
   }
   initTui();
+  const { installTuiStderrOwner } = await import('../surface/tui-stderr-owner.js');
+  restoreTuiStderrOwner = installTuiStderrOwner((line) => {
+    pushNotice(`[stderr] ${line}`);
+    render();
+  });
   restoreCliStderrSink = setCliStderrSink(({ source, exitCode, raw }) => {
     // Keep the exact bytes in the normal debug log while rendering only failures through the
     // TUI-owned notice area. Writing the CLI stream to process.stderr would overwrite the prompt.
@@ -1358,6 +1369,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     sidetabAttachments?.close();
     restoreCliStderrSink?.();
     restoreCliStderrSink = null;
+    restoreTuiStderrOwner?.();
+    restoreTuiStderrOwner = null;
     if (residueTimer !== null) clearTimeout(residueTimer);
     loopCommand?.dispose();
     missionWatchesClosed = true;

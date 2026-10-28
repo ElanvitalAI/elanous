@@ -28,12 +28,15 @@ function trace(step: string, key: Key, claimed: boolean | string): void {
 }
 
 export interface DashboardPriorityKeyRouteDeps<Action> {
+  /** Classic-dashboard Ctrl+\\ is a recoverable guidance action, not
+   *  a process quit. Claim it before the global force-quit matcher. */
+  routeClassicSigquitChord?: (key: Key) => boolean;
   /** Step 0 — global force-quit chord that fires from ANYWHERE,
    *  including inside popup terminals + bell modal + dashboard
    *  scenes. Plain Ctrl+Q has too many child-app bindings (e.g.
-   *  emacs quoted-insert), so the true escape hatches live on
-   *  chords that terminal-resident apps are less likely to own:
-   *  Ctrl+Shift+Q and Ctrl+\ . Returns true when the matcher
+   *  emacs quoted-insert), so Ctrl+Shift+Q is the force-quit escape
+   *  hatch. Ctrl+\\ is reserved by the classic dashboard for guidance.
+   *  Returns true when the matcher
    *  fires; the route then short-circuits to `{type:'quit'}`
    *  regardless of any other state. */
   isForceQuitChord: (key: Key) => boolean;
@@ -70,6 +73,8 @@ export interface DashboardPriorityKeyRouteDeps<Action> {
    *  the controller is idle so legacy dispatch paths stay reachable. */
   routeVoiceChatActiveKey: (key: Key) => boolean | Promise<boolean>;
   routeBellKey: (key: Key) => boolean | Promise<boolean>;
+  /** Classic sidetab prefix keys must be seen before an exclusive shell modal. */
+  routeSidetabKey?: (key: Key) => boolean;
   inputOwner?: InputOwner;
   dispatchPreKey: (key: Key, targetHandlerName?: string) => boolean | Promise<boolean>;
   routeExclusiveTerminalModalKey: (key: Key) => boolean | Promise<boolean>;
@@ -86,8 +91,9 @@ export async function routeDashboardPriorityKey<Action>(
   deps: DashboardPriorityKeyRouteDeps<Action>,
 ): Promise<DashboardPriorityKeyRouteResult> {
   // Step 0: global force-quit. Wins over EVERYTHING — bell modal,
-  // popup terminal, drag interceptors. Bound to Ctrl+Shift+Q and
-  // Ctrl+\ (both rare terminal-app bindings) to preserve the
+  // popup terminal, drag interceptors. Bound to Ctrl+Shift+Q;
+  // Ctrl+\\ has already been claimed by the classic guidance route.
+  // This preserves the
   // "elanous escape hatch" concept the user explicitly wanted to keep:
   //   "ctrl+q 전체 강제 종료 컨셉은 남았으면 좋겠습니다.
   //    터미널모드에서는 잘 사용하지 않을 복잡 패턴으로 리 어사인 해도 됩니다."
@@ -100,6 +106,11 @@ export async function routeDashboardPriorityKey<Action>(
   // micro-cost when disabled).
   const tracing = debug.isKeyTraceEnabled();
   if (tracing) trace('begin', key, 'pending');
+
+  if (deps.routeClassicSigquitChord?.(key)) {
+    if (tracing) trace('routeClassicSigquitChord', key, true);
+    return { type: 'handled' };
+  }
 
   if (deps.isForceQuitChord(key)) {
     if (tracing) trace('isForceQuitChord', key, 'quit');
@@ -134,6 +145,11 @@ export async function routeDashboardPriorityKey<Action>(
   // every other surface (it's a TOAST-priority overlay).
   if (await deps.routeBellKey(key)) {
     if (tracing) trace('routeBellKey', key, true);
+    return { type: 'handled' };
+  }
+
+  if (deps.routeSidetabKey?.(key)) {
+    if (tracing) trace('routeSidetabKey', key, true);
     return { type: 'handled' };
   }
 

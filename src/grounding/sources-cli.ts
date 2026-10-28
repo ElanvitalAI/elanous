@@ -118,7 +118,7 @@ export function registerGroundingSourcesCli(program: Command): void {
     .command('status [id]')
     .description('local-repo 신선도(로컬 참조만 · fetch/pull 없음)')
     .option('--json', 'JSON 출력')
-    .action((id: string | undefined, opts: { json?: boolean }) => {
+    .action(async (id: string | undefined, opts: { json?: boolean }) => {
       const listed = listGroundingSources(load());
       const targets = id ? listed.filter((source) => source.id === id) : listed;
       if (id && targets.length === 0) {
@@ -126,7 +126,7 @@ export function registerGroundingSourcesCli(program: Command): void {
         process.exitCode = 1;
         return;
       }
-      const rows = targets.map((source) => sourceStatus(source));
+      const rows = await Promise.all(targets.map((source) => sourceStatus(source)));
       if (opts.json) printJson(id ? rows[0] : rows);
       else for (const row of rows) {
         console.log(`${row.id} dirty=${String(row.dirty ?? false)} behind=${String(row.behind ?? 'unknown')}${row.branch ? ` branch=${row.branch}` : ''}`);

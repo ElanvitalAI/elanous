@@ -63,6 +63,22 @@ async function run(messages: LLMMessage[], userText?: string): Promise<void> {
 }
 
 describe('runCoreTurn surface input isolation', () => {
+  test('forwards transient status callbacks from the stream to the host', async () => {
+    const statuses: string[] = [];
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {
+      handlers.onStatus?.('스트림 무응답 · 재시도');
+      return 'done';
+    });
+    await runCoreTurn({
+      sessionId: 'stream-status-forwarding',
+      messages: [{ role: 'user', content: 'recover stream' }],
+      tools: [tool],
+      dispatchTool: async () => null,
+      signal,
+      callbacks: { onStatus: (line) => statuses.push(line) },
+    });
+    expect(statuses).toEqual(['스트림 무응답 · 재시도']);
+  });
   test('passes the selected research surface to the tool-loop guard once', async () => {
     spyOn(surfaceModule, 'resolveSessionSurfaceProfile').mockReturnValue({
       id: 'research/agent', domain: 'research', selectionReason: 'test',
@@ -76,7 +92,14 @@ describe('runCoreTurn surface input isolation', () => {
         && typeof message.content === 'string' && message.content.startsWith('Current local date:')).length;
       return 'done';
     });
-    await run([{ role: 'user', content: '최신 채권 금리 조사' }], '최신 채권 금리 조사');
+    await runCoreTurn({
+      sessionId: 'surface-selection-test',
+      messages: [{ role: 'user', content: '최신 채권 금리 조사' }],
+      tools: [tool],
+      dispatchTool: async () => null,
+      signal,
+      userText: '최신 채권 금리 조사',
+    }, { runResearch: async () => ({ ok: true, output: 'test evidence' }) });
     expect(researchTurn).toBe(true);
     expect(dateLines).toBe(1);
   });

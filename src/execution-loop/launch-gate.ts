@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, writeSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { assertLedgerPathPolicy } from '../harness/launch-utterance-ledger.js';
 import { extractVerbatimOriginalAsk } from '../self-implement/goal-author.js';
 import { loadRunLedger } from '../self-implement/run-ledger.js';
 import { queryRunningRuns, type QueriedRunningRunsResult } from '../self-implement/running-runs.js';
@@ -252,6 +255,8 @@ export interface PreLaunchGateInput {
 
 export interface PreLaunchGateDeps extends ActiveRunsForGoalDeps {
   activeRuns?: (goalId: string) => ActiveRunsForGoal;
+  /** LAUNCH-SINGLE-DOOR-1C — 주입 우선 단일문: 시험 우주가 격리 루트의 문을 끼워 생산 배선을 그대로 검증한다. */
+  launchDoor?: LaunchRequestDoor;
 }
 
 export interface PreLaunchGateDecision {
@@ -278,4 +283,204 @@ function decidePreLaunch(input: PreLaunchGateInput, deps: PreLaunchGateDeps): Pr
     return { action: 'blocked-duplicate', sameGoalActiveRuns, budget, reason: `same-goal active runs: ${sameGoalActiveRuns.join(', ')}` };
   }
   return { action: 'proceed', sameGoalActiveRuns, budget, reason: sameGoalActiveRuns === 'unknown' ? 'active runs unknown' : input.forceLaunch && sameGoalActiveRuns.length > 0 ? 'duplicate overridden by force-launch' : 'no confirmed duplicate' };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// LAUNCH-SINGLE-DOOR-1C — 발사 요청의 단일 문.
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+/** Env contract: hand 가 소비한 requestId 를 자식 say 가 물려받아 같은 문을 다시 두드리지 않게 한다(한 번만 상속). */
+export const LAUNCH_DOOR_RECEIPT_ENV = 'ELANOUS_LAUNCH_DOOR_RECEIPT';
+
+/** append 전용 요청 원장의 행 종류 — 요청(중복 포함)·소비·거절·강제·실패·단일문 사용 불가 관측. */
+export type LaunchRequestLedgerEvent = 'requested' | 'consumed' | 'refused-duplicate' | 'forced-duplicate' | 'launch-failed' | 'door-unavailable';
+
+/** append 전용 요청 원장의 한 행 — 행은 지우거나 고치지 않는다(관측 전용). */
+export interface LaunchRequestLedgerRow {
+  readonly event: LaunchRequestLedgerEvent;
+  readonly requestId: string;
+  readonly at: string;
+  readonly source?: string;
+  readonly receiptId?: string;
+  readonly reason?: string;
+}
+
+/** requestId 단위 소비 영수증 — 최초 1회만 발급된다(O_EXCL 파일이 곧 영수증이다). */
+export interface LaunchRequestReceipt {
+  readonly requestId: string;
+  readonly receiptId: string;
+  readonly at: string;
+  readonly source?: string;
+}
+
+/** `consume` 의 답 — `refused` 는 기존 영수증을 읽어 사유와 함께 거절한 것이다. */
+export type LaunchRequestConsumption =
+  | { readonly status: 'consumed'; readonly requestId: string; readonly receiptId: string; readonly receiptAt: string; readonly inherited?: true }
+  | { readonly status: 'forced'; readonly requestId: string; readonly receiptId: string | null; readonly receiptAt: string | null; readonly reason: string }
+  | { readonly status: 'refused'; readonly requestId: string; readonly receiptId: string | null; readonly receiptAt: string | null; readonly reason: string }
+  | { readonly status: 'unavailable'; readonly requestId: string; readonly reason: string };
+
+/** 발사 요청의 단일 문 — 원장 append · 단일 소비 · 실패 기록 · 원장 조회. */
+export interface LaunchRequestDoor {
+  /** 요청 한 건을 원장에 append 하고 그 requestId 를 돌려준다(중복 재요청도 매번 append 된다). */
+  requestId(ask: string): string;
+  /** requestId 단위 단일 소비 — 영수증은 최초 1회만 발급된다(두 번째는 기존 영수증과 사유로 거절). */
+  consume(requestId: string, opts?: { readonly force?: boolean; readonly inheritedReceipt?: string }): LaunchRequestConsumption;
+  /** 발사 실패 사유를 원장에 append 한다(관측 — 발사를 막지 않는다). */
+  fail(requestId: string, reason: string): void;
+  /** 원장 조회 — 중복 거절·실패·재시도 사유를 읽는다(인자를 주면 그 requestId 의 행만). */
+  rows(requestId?: string): readonly LaunchRequestLedgerRow[];
+}
+
+/** 단일문 deps — 원장 뿌리(기본 = 이 우주의 실효 인스턴스 루트)·시계·요청 출처 표지. */
+export interface LaunchRequestDoorDeps {
+  readonly root?: string;
+  readonly now?: () => Date;
+  readonly source?: string;
+}
+
+const LAUNCH_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const LAUNCH_REQUEST_DATE_FILE = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
+
+function launchRequestLedgerDir(root: string): string {
+  return join(resolve(root), 'launch-requests');
+}
+
+/** 단일문을 연다 — 문 자체는 상태를 갖지 않고, 원장·영수증은 이 우주의 인스턴스 루트 아래 파일로 남는다. */
+export function openLaunchRequestDoor(deps: LaunchRequestDoorDeps = {}): LaunchRequestDoor {
+  const dir = launchRequestLedgerDir(deps.root ?? effectiveInstanceRoot());
+  const receiptsDir = join(dir, 'receipts');
+  const now = deps.now ?? (() => new Date());
+  const source = deps.source;
+
+  const observe = (event: string, data: Record<string, unknown>): void => {
+    try { debug.log('execution-loop.launch-gate', event, data, { level: 'warn' }); } catch { /* 관측은 fail-soft */ }
+  };
+
+  const appendRow = (row: LaunchRequestLedgerRow): boolean => {
+    try {
+      assertLedgerPathPolicy(dir);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      assertLedgerPathPolicy(dir);
+      if (!lstatSync(dir).isDirectory()) throw new Error(`launch request ledger dir is not a directory: ${dir}`);
+      const file = join(dir, `${row.at.slice(0, 10)}.jsonl`);
+      const fd = openSync(file, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+      try {
+        if (!fstatSync(fd).isFile()) throw new Error(`launch request ledger file is not a regular file: ${file}`);
+        writeSync(fd, `${JSON.stringify(row)}\n`);
+      } finally { closeSync(fd); }
+      return true;
+    } catch (error) {
+      observe('request-ledger-unwritten', { event: row.event, requestId: row.requestId, reason: error instanceof Error ? error.message : String(error) });
+      return false;
+    }
+  };
+
+  const readReceipt = (requestId: string): LaunchRequestReceipt | null => {
+    try {
+      const fd = openSync(join(receiptsDir, `${requestId}.json`), constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        if (!fstatSync(fd).isFile()) return null;
+        const parsed = JSON.parse(readFileSync(fd, 'utf8')) as LaunchRequestReceipt;
+        return parsed && typeof parsed === 'object' && parsed.requestId === requestId
+          && typeof parsed.receiptId === 'string' && typeof parsed.at === 'string' ? parsed : null;
+      } finally { closeSync(fd); }
+    } catch { return null; }
+  };
+
+  const requestId = (ask: string): string => {
+    const id = launchRequestId(ask);
+    appendRow({ event: 'requested', requestId: id, at: now().toISOString(), ...(source ? { source } : {}) });
+    return id;
+  };
+
+  const consume = (id: string, opts: { readonly force?: boolean; readonly inheritedReceipt?: string } = {}): LaunchRequestConsumption => {
+    if (!LAUNCH_REQUEST_ID_PATTERN.test(id)) {
+      return { status: 'unavailable', requestId: id, reason: `requestId 가 원장 키로 쓸 수 없다: ${JSON.stringify(id)}` };
+    }
+    const at = now().toISOString();
+    // 부모(hand)가 같은 requestId 를 이미 소비했다면 상속 영수증으로 지나간다 — 새 영수증을 만들지 않는다.
+    if (opts.inheritedReceipt !== undefined && opts.inheritedReceipt === id) {
+      const inherited = readReceipt(id);
+      if (inherited !== null) {
+        try { debug.log('execution-loop.launch-gate', 'request-consumption-inherited', { requestId: id, receiptId: inherited.receiptId }); } catch { /* 관측은 fail-soft */ }
+        return { status: 'consumed', requestId: id, receiptId: inherited.receiptId, receiptAt: inherited.at, inherited: true };
+      }
+    }
+    const receipt: LaunchRequestReceipt = { requestId: id,
+      receiptId: `receipt-${createHash('sha256').update(`${id}:${at}`).digest('hex').slice(0, 12)}`, at,
+      ...(source ? { source } : {}) };
+    let created = true;
+    try {
+      assertLedgerPathPolicy(receiptsDir);
+      mkdirSync(receiptsDir, { recursive: true, mode: 0o700 });
+      assertLedgerPathPolicy(receiptsDir);
+      const fd = openSync(join(receiptsDir, `${id}.json`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      try {
+        if (!fstatSync(fd).isFile()) throw new Error(`소비 영수증이 일반 파일이 아니다: ${id}`);
+        writeSync(fd, JSON.stringify(receipt));
+      } finally { closeSync(fd); }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') {
+        const reason = error instanceof Error ? error.message : String(error);
+        observe('request-receipt-unavailable', { requestId: id, reason });
+        appendRow({ event: 'door-unavailable', requestId: id, at, ...(source ? { source } : {}), reason });
+        return { status: 'unavailable', requestId: id, reason: `소비 영수증을 만들지 못했다 — 발사를 막지 않는다: ${reason}` };
+      }
+      created = false;
+    }
+    if (created) {
+      appendRow({ event: 'consumed', requestId: id, at, ...(source ? { source } : {}), receiptId: receipt.receiptId });
+      return { status: 'consumed', requestId: id, receiptId: receipt.receiptId, receiptAt: receipt.at };
+    }
+    const existing = readReceipt(id);
+    if (existing === null) {
+      const reason = `requestId ${id} 의 소비 영수증이 이미 있지만 읽지 못했다 — 중복 발사 거절`;
+      appendRow({ event: 'refused-duplicate', requestId: id, at, ...(source ? { source } : {}), reason });
+      return { status: 'refused', requestId: id, receiptId: null, receiptAt: null, reason };
+    }
+    if (opts.force === true) {
+      const reason = `requestId ${id} 는 영수증 ${existing.receiptId} (${existing.at}) 로 이미 소비됐다 — force 로 다시 띄운다`;
+      appendRow({ event: 'forced-duplicate', requestId: id, at, ...(source ? { source } : {}), receiptId: existing.receiptId, reason });
+      return { status: 'forced', requestId: id, receiptId: existing.receiptId, receiptAt: existing.at, reason };
+    }
+    const reason = `requestId ${id} 는 영수증 ${existing.receiptId} (${existing.at}) 로 이미 소비됐다 — 중복 발사 거절`;
+    appendRow({ event: 'refused-duplicate', requestId: id, at, ...(source ? { source } : {}), receiptId: existing.receiptId, reason });
+    return { status: 'refused', requestId: id, receiptId: existing.receiptId, receiptAt: existing.at, reason };
+  };
+
+  const fail = (id: string, reason: string): void => {
+    appendRow({ event: 'launch-failed', requestId: id, at: now().toISOString(),
+      ...(source ? { source } : {}), reason: reason.trim() || '사유 없음' });
+  };
+
+  const rows = (requestId?: string): readonly LaunchRequestLedgerRow[] => {
+    const result: LaunchRequestLedgerRow[] = [];
+    let names: string[];
+    try {
+      assertLedgerPathPolicy(dir);
+      names = readdirSync(dir);
+    } catch { return result; }
+    for (const name of names.filter((candidate) => LAUNCH_REQUEST_DATE_FILE.test(candidate)).sort()) {
+      let text: string;
+      try {
+        const fd = openSync(join(dir, name), constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          if (!fstatSync(fd).isFile()) continue;
+          text = readFileSync(fd, 'utf8');
+        } finally { closeSync(fd); }
+      } catch { continue; }
+      for (const line of text.split('\n')) {
+        if (!line) continue;
+        try {
+          const row = JSON.parse(line) as LaunchRequestLedgerRow;
+          if (row && typeof row === 'object' && typeof row.event === 'string' && typeof row.requestId === 'string'
+            && typeof row.at === 'string' && (requestId === undefined || row.requestId === requestId)) result.push(row);
+        } catch { /* 찢어진 줄은 건너뛴다 */ }
+      }
+    }
+    return result;
+  };
+
+  return { requestId, consume, fail, rows };
 }

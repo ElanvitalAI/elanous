@@ -33,7 +33,7 @@ import type { ModalBounds, ModalSurface } from './display/modal-stack.js';
 import type { KeyEvent } from './display/types.js';
 import type { ThemeTokens } from './theme/tokens.js';
 import { debug } from './debug/log.js';
-import { abortTurnOnly } from './turn-abort-scope.js';
+import { abortAndKillChildren, abortTurnOnly } from './turn-abort-scope.js';
 import { SELF_IMPLEMENT_TOOL_NAMES } from './boot/daemon-tools/self-implement-names.js';
 
 export const DASHBOARD_CLARIFICATION_REQUEST = Symbol.for('elanous.dashboard.clarification-request');
@@ -57,6 +57,10 @@ export interface EscAbortGateDeps {
   getWaitingTargetNames?: () => readonly string[];
   /** Only an identified foreground harness run may bypass the sub-agent confirmation. */
   shouldAbortImmediately?: () => boolean;
+  /** Seat mode can have no operator to answer a confirmation: Esc stops this turn and its children without opening a modal. */
+  forceStopWithoutModal?: () => boolean;
+  /** Non-modal replacement for the approval surface in unattended TUI mode. Timeout/cancel resolves false. */
+  confirmStopInline?: () => Promise<boolean>;
   /** Called before abortTurnOnly so the UI can paint a visible pending state immediately. */
   onAbortPending?: (event: { running: number; repeat: number; targets: readonly string[] }) => void;
   /** Called when another Escape arrives after the first abort request. */
@@ -218,7 +222,9 @@ export function createEscAbortGate(deps: EscAbortGateDeps): EscAbortGate {
   let current: ApprovalModalHandle | null = null;
   let currentDispose: (() => void) | null = null;
   let abortPending = false;
+  let inlineConfirmationPending = false;
   let escapePresses = 0;
+  let disposed = false;
 
   const redraw = (): void => {
     try { deps.requestRedraw?.(); } catch { /* ignore */ }
@@ -282,6 +288,31 @@ export function createEscAbortGate(deps: EscAbortGateDeps): EscAbortGate {
         return;
       }
       const running = deps.getRunningCount();
+      if (running > 0 && deps.forceStopWithoutModal?.()) {
+        if (inlineConfirmationPending) return;
+        if (!deps.confirmStopInline) {
+          debug.log('esc.abort', 'unattended-force-stop', { running, repeat: Math.max(0, escapePresses - 1) });
+          abortAndKillChildren(deps.abortCtrl);
+          redraw();
+          return;
+        }
+        inlineConfirmationPending = true;
+        debug.log('esc.abort', 'unattended-inline-confirmation', { running, repeat: Math.max(0, escapePresses - 1) });
+        void deps.confirmStopInline().then((confirmed) => {
+          if (confirmed && !disposed && !deps.abortCtrl.signal.aborted) {
+            debug.log('esc.abort', 'unattended-inline-confirmed', { running });
+            abortAndKillChildren(deps.abortCtrl);
+          } else {
+            debug.log('esc.abort', 'unattended-inline-cancelled', { running, reason: 'declined-or-timeout' });
+            resetAbortRequestState();
+          }
+        }).catch((error) => {
+          debug.log('esc.abort', 'unattended-inline-failed', { reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+          resetAbortRequestState();
+        }).finally(() => { inlineConfirmationPending = false; redraw(); });
+        redraw();
+        return;
+      }
       if (running <= 0 || deps.shouldAbortImmediately?.()) {
         debug.log('esc.abort', 'abort-immediately', { running, repeat: Math.max(0, escapePresses - 1) });
         abortPendingTurn(running);
@@ -347,6 +378,7 @@ export function createEscAbortGate(deps: EscAbortGateDeps): EscAbortGate {
       resetAbortRequestState();
     },
     dispose(): void {
+      disposed = true;
       if (current) current.dispose(false);
       resetAbortRequestState();
       close();

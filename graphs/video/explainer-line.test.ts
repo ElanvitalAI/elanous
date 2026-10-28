@@ -22,7 +22,7 @@ const routes: Record<string, Record<string, string>> = {
   vo: { ok: 'build', 'no-key': 'needs-human', error: 'blocked', unmeasurable: 'unobserved' },
   build: { ok: 'render', 'bad-script': 'script', error: 'blocked', unmeasurable: 'unobserved' },
   render: { ok: 'qc', 'check-fail': 'build', 'render-mismatch': 'build', unmeasurable: 'unobserved' },
-  qc: { pass: 'delivered', 'vo-mismatch': 'vo', loudness: 'build', public: 'needs-human', unmeasurable: 'unobserved' },
+  qc: { pass: 'delivered', 'vo-mismatch': 'vo', loudness: 'build', 'too-long': 'build', public: 'needs-human', unmeasurable: 'unobserved' },
 };
 
 describe('explainer-line declaration', () => {

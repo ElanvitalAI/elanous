@@ -176,7 +176,10 @@ type TermSubHandler = (sub: string, args: string[], ctx: TermSlashContext, local
 
 async function termHelp(sub: string, args: string[], ctx: TermSlashContext, locals: TermSlashLocals): Promise<void> {
   const { slashRuntime } = locals;
-  for (const line of slashRuntime.helpLines()) ctx.chatLines.push(line);
+  const lines = (args[1] ?? '').toLowerCase() === 'experimental'
+    ? slashRuntime.experimentalHelpLines()
+    : slashRuntime.helpLines();
+  for (const line of lines) ctx.chatLines.push(line);
   ctx.setChatScrollOffset(-1);
   return;
 }
@@ -850,6 +853,14 @@ export async function handleTermSlash(args: string[], ctx: TermSlashContext): Pr
   // dispatchTerminalModalObserve. Behavior preserved verbatim from
   // the inline case.
   const sub = (args[0] ?? '').toLowerCase();
+  const destination = (args[2] ?? '').trim().toLowerCase();
+  if (sub === 'vw-bar' || sub === 'vwbar' || sub === 'vw-sync' || sub === 'vwsync'
+      || (sub === 'move' && (destination === 'vw' || destination === 'window'))) {
+    const command = sub === 'move' ? 'move <id> vw' : sub === 'vwbar' ? 'vw-bar' : sub === 'vwsync' ? 'vw-sync' : sub;
+    ctx.chatLines.push(ctx.warning(`  /term ${command} is retired; it no longer changes terminal state.`));
+    ctx.setChatScrollOffset(-1);
+    return;
+  }
   const slashRuntime = ctx.termSlash.slashRuntime;
   const sessionRegistry = ctx.termSlash.sessionRegistry;
   const terminalMatrix = ctx.termSlash.terminalMatrix;

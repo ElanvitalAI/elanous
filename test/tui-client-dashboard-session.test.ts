@@ -168,4 +168,21 @@ describe('DashboardSession — 추론 요약 thought (TUI-TURN-NARRATION · 결�
     intercept(wrap({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'plain' } }));
     expect(thoughts).toEqual([]);
   });
+
+  test('_meta.status 는 reasoning 과 분리해 onStatus 로 라우팅한다', () => {
+    const statuses: string[] = [];
+    const thoughts: string[] = [];
+    const intercept = _buildSendInterceptorForTest({
+      userText: 'x',
+      onStatus: (line) => statuses.push(line),
+      onThought: (line) => thoughts.push(line),
+    });
+    intercept(wrap({
+      sessionUpdate: 'agent_thought_chunk',
+      content: { type: 'text', text: '스트림 무응답 · 재시도' },
+      _meta: { status: true, reasoning: true },
+    }));
+    expect(statuses).toEqual(['스트림 무응답 · 재시도']);
+    expect(thoughts).toEqual([]);
+  });
 });

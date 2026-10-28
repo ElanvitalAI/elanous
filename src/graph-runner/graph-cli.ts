@@ -31,19 +31,21 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
   graph.command('adapt-report')
     .description('Measure recorded graph path diversity, unit calls, adaptations and landings for one goal')
     .requiredOption('--goal <id>', 'Goal ID to measure')
+    .option('--from <timestamp>', 'Include runs started at or after this ISO timestamp')
+    .option('--to <timestamp>', 'Exclude runs started at or after this ISO timestamp')
     .option('--json', 'Print measurement as JSON')
-    .action(async (opts: { goal: string; json?: boolean }) => {
+    .action(async (opts: { goal: string; from?: string; to?: string; json?: boolean }) => {
       try {
         const { queryGraphAdaptReport } = await import('../self-implement/run-ledger.js');
-        const report = queryGraphAdaptReport(opts.goal);
+        const report = queryGraphAdaptReport(opts.goal, undefined, { since: opts.from, until: opts.to });
         if (opts.json) await writeStdoutJson(JSON.stringify(report) + '\n');
-        else if (report.runCount === 0) console.log(`graph adapt-report: ${opts.goal} · 표본 0 · 제외 ${report.excludedCount} ${JSON.stringify(report.exclusionReasons)}`);
+        else if (report.runCount === 0) console.log(`graph adapt-report: ${opts.goal} · 표본 0 · 제외 ${report.excludedCount} ${JSON.stringify(report.exclusionReasons)} · 미측정 ${report.unmeasuredCount} ${JSON.stringify(report.unmeasuredReasons)}`);
         else {
           const landing = (group: typeof report.adapted) => group.denominator
             ? `${group.landed}/${group.denominator} (${(group.rate! * 100).toFixed(1)}%)` : '표본 0';
           console.log(`graph adapt-report: ${opts.goal} · 경로 ${report.uniquePathSignatures} · 유닛 호출 ${report.unitCallCount} · 적응 ${report.adaptationCount}`);
           console.log(`적응 착지율 ${landing(report.adapted)} · 비적응 착지율 ${landing(report.nonAdapted)}`);
-          console.log(`제외 ${report.excludedCount} ${JSON.stringify(report.exclusionReasons)}`);
+          console.log(`제외 ${report.excludedCount} ${JSON.stringify(report.exclusionReasons)} · 미측정 ${report.unmeasuredCount} ${JSON.stringify(report.unmeasuredReasons)}`);
         }
       } catch (error) {
         console.error(`graph adapt-report: ${error instanceof Error ? error.message : String(error)}`);

@@ -703,6 +703,16 @@ describe('createMissionControlBrain', () => {
     expect(await make('{"action":"done","reason":"complete"}').decide(observation)).toEqual({ action: 'done', reason: 'complete' });
   });
 
+  test('verbatim mission suppresses supervisor follow-up text while keeping normal send behavior opt-in', async () => {
+    const verbatim = createMissionControlBrain({ mission: 'goal', allowFollowup: false,
+      evidenceReady: () => false, search: () => {}, stream: scriptedStream('{"action":"send","text":"rewrite this"}') });
+    const assisted = createMissionControlBrain({ mission: 'goal', allowFollowup: true,
+      evidenceReady: () => false, search: () => {}, stream: scriptedStream('{"action":"send","text":"continue"}') });
+
+    expect(await verbatim.decide(observation)).toEqual({ action: 'wait' });
+    expect(await assisted.decide(observation)).toEqual({ action: 'input', text: 'continue\r' });
+  });
+
   test.each([asideBackend, claudeBackend, codexBackend, grokBackend])('$name 백엔드 이름만 시스템 프롬프트와 화면 머리표에 사용한다', async (backend) => {
     let messages: LLMMessage[] = [];
     const brain = createMissionControlBrain({

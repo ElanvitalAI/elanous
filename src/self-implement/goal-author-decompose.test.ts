@@ -381,11 +381,11 @@ describe('TIER-SIZED-DECOMPOSE fake-LLM L2', () => {
       slices: [{ goal: 'wire a', files: 2, behaviours: 1, newFiles: 1, tier: '하' }] });
   });
 
-  test('missing metadata without explicit path and action remains blocked after one retry', async () => {
+  test('missing metadata without explicit path and action stays blocked after two resplits', async () => {
     useRealDecompose = true;
-    scriptedLlmReplies.push(proposal(['implement a feature']), '{}', proposal(['still vague']), '{}');
+    scriptedLlmReplies.push(proposal(['implement a feature']), '{}', proposal(['still vague']), '{}', proposal(['still vague again']), '{}');
     expect(await decomposeToTierSizedSlices('build goal')).toEqual({ ok: false,
-      reason: 'goal-author slice sizing: size metadata missing after one retry' });
+      reason: 'goal-author slice sizing: size metadata missing after 2 resplits' });
   });
 
   test('public hand seam returns each final goal, tier, size and retry count', async () => {
@@ -426,38 +426,52 @@ describe('TIER-SIZED-DECOMPOSE fake-LLM L2', () => {
     } finally { log.mockRestore(); }
   });
 
-  test('an unavoidable high slice survives one retry only with its reason', async () => {
+  test('a high slice surviving two bounded resplits is marked unavoidable with size telemetry', async () => {
     useRealDecompose = true;
     scriptedLlmReplies.push(
       proposal(['inseparable integration']),
       sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high' }]),
       proposal(['inseparable integration']),
       sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: 'shared transaction must change together' }]),
+      proposal(['still inseparable integration']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: 'same transaction' }]),
     );
+    let finalSlices: import('./goal-author-decompose.js').SizedSlice[] = [];
     const log = spyOn(debug, 'log').mockImplementation(() => undefined);
     try {
-      expect(await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })('build atomic integration'))
-        .toEqual(['inseparable integration']);
+      expect(await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false, goalId: 'goal-atomic-7',
+        onSizedSlices: (slices) => { finalSlices = slices; } })('build atomic integration')).toEqual(['still inseparable integration']);
+      expect(finalSlices).toEqual([expect.objectContaining({ tier: '상', unavoidable: 'same transaction' })]);
+      expect(scriptedLlmReplies).toHaveLength(0);
       expect(log).toHaveBeenCalledWith('goal-author.decompose', 'slice-oversize', expect.objectContaining({
-        retry: 1, reasons: ['shared transaction must change together'],
+        retry: 2, reasons: ['same transaction'],
       }));
+      expect(log).toHaveBeenCalledWith('goal-author.decompose', 'slice-oversize-unavoidable', expect.objectContaining({
+        goalId: 'goal-atomic-7', resplitCount: 2,
+        slices: [{ index: 0, files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: 'same transaction' }],
+      }));
+      expect(log.mock.calls.filter(([category, event]) => category === 'goal-author.decompose' && event === 'resplit')).toHaveLength(2);
     } finally { log.mockRestore(); }
   });
 
-  test('a high slice without an unavoidable reason fails after its single retry', async () => {
+  test('high slice without model reason is marked unavoidable=auto after two resplits', async () => {
     useRealDecompose = true;
     scriptedLlmReplies.push(
       proposal(['large slice']),
       sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high' }]),
       proposal(['still large']),
       sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: null }]),
+      proposal(['still large again']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: null }]),
     );
-    await expect(createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false })('build large goal'))
-      .rejects.toThrow('high slice lacks unavoidable reason after one retry');
+    let finalSlices: import('./goal-author-decompose.js').SizedSlice[] = [];
+    expect(await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: false,
+      onSizedSlices: (slices) => { finalSlices = slices; } })('build large goal')).toEqual(['still large again']);
+    expect(finalSlices[0]).toMatchObject({ tier: '상', unavoidable: 'auto' });
     expect(scriptedLlmReplies).toHaveLength(0);
   });
 
-  test('a revised adversarial plan keeps its sizing failure instead of falling back to the original', async () => {
+  test('a revised adversarial plan keeps the final unavoidable slice instead of falling back to the original', async () => {
     useRealDecompose = true;
     critique = { revisedSteps: ['revised large slice'], issues: ['scope too large'] };
     scriptedLlmReplies.push(
@@ -465,9 +479,11 @@ describe('TIER-SIZED-DECOMPOSE fake-LLM L2', () => {
       sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high' }]),
       proposal(['still large']),
       sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: null }]),
+      proposal(['still large again']),
+      sizes([{ files: 5, actions: 3, newFiles: 2, tier: 'high', unavoidableReason: null }]),
     );
-    await expect(createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })('build large goal'))
-      .rejects.toThrow('high slice lacks unavoidable reason after one retry');
+    expect(await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })('build large goal'))
+      .toEqual(['still large again']);
     expect(scriptedLlmReplies).toHaveLength(0);
   });
 });

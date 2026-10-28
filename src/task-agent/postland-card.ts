@@ -2,10 +2,10 @@ import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { listChecklist, setItemIfSnapshot, type Checklist } from '../release-loop/checklist.js';
 import { judgeLandedCell, parseJudgeSignals, type GreenVerdict } from '../release-loop/landed-to-green.js';
-import { HAND_MOVE_HISTORY_EVENT, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, cardPrNumber, readTaskAgentState, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
+import { HAND_MOVE_HISTORY_EVENT, LIVE_MOVE_HISTORY_EVENT, LIVE_MOVE_RESULT_EVENT, cardPrNumber, readTaskAgentState, taskAgentStatePath, updateTaskCard, recordPostLandImplFindings, type TaskCard } from './task-hand.js';
 import { isGoalOnlyPr } from './judge.js';
 
-export interface LandedTaskPr { number: number; url: string; headRefOid: string; state: string; baseRefName: string; mergedAt: string; files?: Array<{ path: string }> }
+export interface LandedTaskPr { number: number; url: string; headRefOid: string; state: string; baseRefName: string; mergedAt: string; body?: string | null; files?: Array<{ path: string }> }
 export interface PostlandDeps {
   statePath?: string;
   versions: readonly string[];
@@ -142,6 +142,39 @@ export function closeMergedTaskCard(pr: LandedTaskPr, cwd: string, deps: Postlan
   }
   log('task-agent', 'postland-card-closed', { pr: pr.number, card: card.id, version, id: item.id, outcome: complete ? 'complete' : 'partial', verdict });
   return item.id;
+}
+
+/** Awaited postland feedback for the confirmed merge caller; card+PR URL/head must still bind exactly. */
+export async function recordMergedTaskImplFindings(
+  pr: LandedTaskPr,
+  cwd: string,
+  options: { statePath?: string; ledgerDir?: string; followUp?: NonNullable<Parameters<typeof recordPostLandImplFindings>[2]>['followUp'] } = {},
+): Promise<Awaited<ReturnType<typeof recordPostLandImplFindings>> | null> {
+  if (pr.state !== 'MERGED' || pr.baseRefName !== 'main' || !pr.url || !pr.headRefOid || pr.body == null) return null;
+  const path = options.statePath ?? taskAgentStatePath();
+  const tasks = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(path).tasks ?? {};
+  const cards = Object.values(tasks).filter((card) => card.taLand && cardPrNumber(card) === pr.number
+    && typeof card.pr === 'object' && card.pr.url?.replace(/\/+$/, '') === pr.url!.replace(/\/+$/, '')
+    && card.status === 'done' && card.prTerminal?.pr === pr.number
+    && card.prTerminal.head.toLowerCase() === pr.headRefOid!.toLowerCase()
+    && card.prTerminal.url.replace(/\/+$/, '') === pr.url!.replace(/\/+$/, '')
+    && (card.landAttempts ?? []).some((attempt) => attempt.pr === pr.number && attempt.head.toLowerCase() === pr.headRefOid!.toLowerCase()));
+  if (cards.length !== 1) {
+    debug.log('task-agent', 'impl-findings-skipped', { pr: pr.number, reason: cards.length ? 'ambiguous-postland-card' : 'postland-card-not-bound' });
+    return null;
+  }
+  const card = cards[0]!;
+  const result = await recordPostLandImplFindings(card, { prBody: pr.body, ask: card.text }, {
+    ...(options.ledgerDir ? { ledgerDir: options.ledgerDir } : {}),
+    ...(options.followUp ? { followUp: options.followUp } : {}),
+  });
+  debug.log('task-agent', 'impl-findings-postland-result', {
+    pr: pr.number, card: card.id, appended: result?.appended ?? false,
+    lessonIds: result?.lessonIds ?? [], injectedSections: result?.injectedSections ?? [], skippedSections: result?.skippedSections ?? [],
+    authoringInjectionBytes: result ? Buffer.byteLength(result.authoringInjection, 'utf8') : 0,
+    followUp: result?.followUp?.queued ?? null,
+  });
+  return result;
 }
 
 const defaultGit = (cwd: string, args: string[]): { status: number; stdout: string; stderr: string } => {

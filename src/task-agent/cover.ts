@@ -34,7 +34,11 @@ export interface TaskAgentCoverInput {
   /** null means the pending-landing age source could not be read; [] means no pending landings. */
   pendingLandingAgeSeconds?: readonly number[] | null;
   /** A source reached the query safety limit; its aggregate is not known to be complete. */
-  truncated?: { taskAgentActions: boolean; allLands: boolean; liveLandMoves?: boolean; goalAsks?: boolean; goalRuns?: boolean; implementCardRuns?: boolean; implementRunMerges?: boolean };
+  truncated?: { taskAgentActions: boolean; allLands: boolean; liveLandMoves?: boolean; goalAsks?: boolean; goalRuns?: boolean; implementCardRuns?: boolean; implementRunMerges?: boolean; cleanupCards?: boolean };
+  /** The physical read failed, as distinct from a reader explicitly returning null. */
+  implementReadFailure?: 'card-ledger-unreadable' | 'run-ledger-unreadable';
+  /** Confirmed post-land outcomes from the TA card ledger. undefined = not wired; null = unreadable. */
+  cleanupCards?: readonly { cardId: string; outcome: 'complete' | 'partial' }[] | null;
   /** Completed authoring provenance and terminal goal records. undefined = not wired; null = unreadable. */
   goalAsks?: readonly { authorRunId: string; goalId: string }[] | null;
   goalRuns?: readonly { goalId: string; outcome: string; stage?: string }[] | null;
@@ -205,10 +209,10 @@ export type SevenVerbState = 'live' | 'shadow-only' | 'none' | 'no-source' | 'un
 /** 7동사 출처 표의 한 칸 — source 는 그 동사를 관측하는 원천, null 이면 출처가 아직 없다. */
 export interface SevenVerbSource {
   verb: SevenVerbName;
-  source: Exclude<NextActionKind, 'decision' | 'deliver'> | 'goal-ask+goal-run' | 'card-run+merged' | null;
+  source: Exclude<NextActionKind, 'decision' | 'deliver'> | 'goal-ask+goal-run' | 'card-run+merged' | 'card:postland-card+postLand' | null;
 }
 
-/** TA-THEME-VERBS-LIVE — 저작은 완료 골 조인; 구현은 카드 런 결합 ⊕ 원장 merged 조인; 정리는 아직 출처가 없다. */
+/** TA-THEME-VERBS-LIVE — 저작은 완료 골 조인; 구현은 카드 런 ⊕ merged 원장; 정리는 카드 postland 이력. */
 export const SEVEN_VERB_SOURCES: readonly SevenVerbSource[] = [
   { verb: '리뷰', source: 'review' },
   { verb: '착지', source: 'land' },
@@ -216,7 +220,7 @@ export const SEVEN_VERB_SOURCES: readonly SevenVerbSource[] = [
   { verb: '검증', source: 'green' },
   { verb: '저작', source: 'goal-ask+goal-run' },
   { verb: '구현', source: 'card-run+merged' },
-  { verb: '정리', source: null },
+  { verb: '정리', source: 'card:postland-card+postLand' },
 ];
 
 /** 동사 하나의 관측 — 원장을 못 읽었으면 liveDone·shadow 는 null(0 이 아니다). */
@@ -226,6 +230,8 @@ export interface SevenVerbLiveRow {
   liveDone: number | null;
   shadow: number | null;
   state: SevenVerbState;
+  /** Present only for an unreadable implementation source. */
+  reason?: 'card-ledger-null' | 'run-ledger-null' | 'card-ledger-truncated' | 'run-ledger-truncated' | 'card-ledger-unreadable' | 'run-ledger-unreadable' | 'card-binding-invalid';
 }
 
 /** 합계 — liveVerbs 는 원장을 못 읽었으면 null(0 으로 쓰지 않는다) · measuredVerbs 는 출처 있는 동사 수. */
@@ -244,15 +250,17 @@ export function measureSevenVerbLive(input: TaskAgentCoverInput): SevenVerbLive 
       if (input.implementCardRuns === undefined && input.implementRunMerges === undefined) {
         return { verb, source: null, liveDone: null, shadow: null, state: 'no-source' };
       }
-      if (input.implementCardRuns == null || input.implementRunMerges == null
-        || input.truncated?.implementCardRuns === true || input.truncated?.implementRunMerges === true) {
-        return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
-      }
-      const merges = input.implementRunMerges;
+      const reason = input.implementReadFailure
+        ?? (input.implementCardRuns == null ? 'card-ledger-null'
+          : input.implementRunMerges == null ? 'run-ledger-null'
+            : input.truncated?.implementCardRuns ? 'card-ledger-truncated'
+              : input.truncated?.implementRunMerges ? 'run-ledger-truncated' : null);
+      if (reason) return { verb, source, liveDone: null, shadow: null, state: 'unreadable', reason };
+      const merges = input.implementRunMerges ?? new Map();
       const cards = new Set<string>();
-      for (const binding of input.implementCardRuns) {
+      for (const binding of input.implementCardRuns ?? []) {
         // 카드 신원 없이는 중복 없는 분자를 낼 수 없다 — 그 원장은 못 읽은 것으로 한다.
-        if (!binding.cardId) return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
+        if (!binding.cardId) return { verb, source, liveDone: null, shadow: null, state: 'unreadable', reason: 'card-binding-invalid' };
         const bound = [binding.runId, binding.runChildId];
         if (bound.some((runId) => typeof runId === 'string' && runId && merges.get(runId)?.merged === true)) {
           cards.add(binding.cardId);
@@ -260,6 +268,12 @@ export function measureSevenVerbLive(input: TaskAgentCoverInput): SevenVerbLive 
       }
       const liveDone = cards.size;
       return { verb, source, liveDone, shadow: 0, state: liveDone >= 1 ? 'live' : 'none' };
+    }
+    if (source === 'card:postland-card+postLand') {
+      if (input.cleanupCards === undefined) return { verb, source: null, liveDone: null, shadow: null, state: 'no-source' };
+      if (input.cleanupCards === null || input.truncated?.cleanupCards) return { verb, source, liveDone: null, shadow: null, state: 'unreadable' };
+      const liveDone = new Set(input.cleanupCards.filter((card) => card.outcome === 'complete').map((card) => card.cardId)).size;
+      return { verb, source, liveDone, shadow: 0, state: liveDone > 0 ? 'live' : 'none' };
     }
     if (source === null) return { verb, source: null, liveDone: null, shadow: null, state: 'no-source' };
     if (source !== 'goal-ask+goal-run' && (unreadable || (source === 'land'
@@ -296,14 +310,18 @@ export function formatSevenVerbLive(measurement: SevenVerbLive): string {
     const landUnreadable = measurement.verbs.some((row) => row.source === 'land' && row.state === 'unreadable');
     const authorUnreadable = measurement.verbs.some((row) => row.source === 'goal-ask+goal-run' && row.state === 'unreadable');
     const implementUnreadable = measurement.verbs.some((row) => row.source === 'card-run+merged' && row.state === 'unreadable');
+    const cleanupUnreadable = measurement.verbs.some((row) => row.source === 'card:postland-card+postLand' && row.state === 'unreadable');
     const failures = [
       actionUnreadable ? '행동' : landUnreadable ? '착지' : null,
       authorUnreadable ? '저작·골' : null,
       implementUnreadable ? '구현 카드·런' : null,
+      cleanupUnreadable ? '정리 카드' : null,
     ].filter((part): part is string => part !== null);
     const reason = `${failures.join('·') || '저작·골'} 원장 null·절단`;
+    const physicalFailure = measurement.verbs.find((row) => row.verb === '구현')?.reason;
+    const detail = physicalFailure?.endsWith('-unreadable') ? ` · 구현 원인 ${physicalFailure}` : '';
     const noSource = measurement.verbs.filter((row) => row.state === 'no-source').map((row) => row.verb).join('·');
-    return `${total}동사 live -/${total} · 못 잼(${reason})${noSource ? ` · 출처 없음 ${noSource}` : ''}`;
+    return `${total}동사 live -/${total} · 못 잼(${reason})${detail}${noSource ? ` · 출처 없음 ${noSource}` : ''}`;
   }
   const noSource = measurement.verbs.filter((row) => row.state === 'no-source').map((row) => row.verb).join('·');
   return `${total}동사 live ${measurement.liveVerbs}/${total}${noSource ? ` · 출처 없음 ${noSource}` : ''}`;

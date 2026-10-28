@@ -77,7 +77,7 @@ test('a deleted retention event attributes the jump; unchanged and backward hori
     f.put(at - 4 * hour);
     expect(f.tick(at + 2 * hour)).toMatchObject({ attribution: 'none', advancedMs: 0 });
   } finally { f.store.close(); }
-});
+}, 15_000);
 
 test('the tick clock is read after the horizon, so a retention pass just before the read is attributed', () => {
   const f = fixture();

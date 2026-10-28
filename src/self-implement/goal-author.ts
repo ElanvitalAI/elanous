@@ -39,7 +39,7 @@ export function resolveGoalAuthorGrade(flag?: GoalAuthorGrade, configured?: unkn
 import type { ObserveOnlySource } from './observe-only.js';
 import type { Question } from '../ask-user-question/types.js';
 import { requestTestScenario as defaultRequestTestScenario, type TestScenarioRequestInput, type TestScenarioRequestResult } from './test-scenario-request.js';
-import { resolveGoalAuthorClarification, parseGoalDocumentClarifications, serializeGoalAuthorParent, type GoalAuthorClarificationResponse, type GoalAuthorParent, type GoalAuthorSelfResolution } from './goal-author-clarification.js';
+import { defaultGoalAuthorSelfResolve, resolveGoalAuthorClarification, parseGoalDocumentClarifications, serializeGoalAuthorParent, type GoalAuthorClarificationResponse, type GoalAuthorParent, type GoalAuthorSelfResolution } from './goal-author-clarification.js';
 import { acquireLockSync } from '../storage/file-lock.js';
 import { createRepositoryReferencedFileReader, type ReferencedFileReadResult } from './goal-file-reader.js';
 import { extractGoalDocSections, type GoalDocSourceLine } from './goal-doc/section.js';
@@ -59,6 +59,7 @@ import { declaredNewFilePaths } from './goal-new-paths.js';
 import { classifyGoalCommandExecution, type GoalCommandExecutionResult } from './goal-command-execution.js';
 import { identityLines, repositoryIdentifiers } from './goal-author-identity.js';
 import { selectRelevantAuthoringLessons } from './knowhow-pack.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 export { selectRelevantAuthoringLessons } from './knowhow-pack.js';
 export { formatSubmittedAt } from './goal-author-identity.js';
 import { hasUnmetRequirementOutsidePreservationClause } from './goal-author-preservation-obligation.js';
@@ -116,7 +117,7 @@ export interface GoalAuthorDeps {
   /** Optional externally decomposed plan steps rendered verbatim into the authored goal; the author never generates them. */
   steps?: readonly string[];
   /** Optional injected decomposition seam; omitted means authoring never invokes an LLM or decomposition. */
-  decomposeSteps?: (objective: string, opts?: { context?: string; runId?: string }) => Promise<readonly string[]>;
+  decomposeSteps?: (objective: string, opts?: { context?: string; runId?: string; goalId?: string }) => Promise<readonly string[]>;
   /** Optional launch preflight result supplied by the caller; authoring never reads the ledger or logs itself. */
   launchPreflight?: LaunchPreflightResult;
   /** Optional in-process notification for each authored-goal phase transition. */
@@ -3907,6 +3908,8 @@ function renderClarification(
     `  - includeOther: ${question.includeOther !== false}`,
     `  - answer: ${answerValue}`,
     ...(provenance ? [`  - provenance.source: ${provenance.source}`] : []),
+    ...(provenance?.assumption ? [`  - provenance.assumption: ${renderClarificationValue(provenance.assumption)}`] : []),
+    ...(provenance?.assumptionSource ? [`  - provenance.assumption-source: ${provenance.assumptionSource}`] : []),
     ...(provenance?.evidence ?? []).map((evidence) => `  - evidence: ${renderClarificationValue(evidence)}`),
   ];
 }
@@ -6031,6 +6034,7 @@ async function authorGoalWithSupersededRootIntent(
     throw new Error('legacy parent document has no RootIntent; rootIntent is required');
   }
   const rootIntent = validateRootIntent(supersessionRootIntent ?? inheritedRootIntent ?? requestedRootIntent ?? goalSummary(enhancement.original));
+  const assignedGoalId = deps.goalId ?? generateGoalId();
   let resolvedSteps = deps.steps;
   if (resolvedSteps === undefined && goalType === 'implement' && deps.decomposeSteps) {
     const startedAt = Date.now();
@@ -6041,7 +6045,7 @@ async function authorGoalWithSupersededRootIntent(
         ? [device.exists ? `existing: ${device.device}` : `missing: ${device.device}`] : undefined;
       const context = [facts?.context, deviceInventory?.length ? `Device inventory (measured at goal-author repository root): ${deviceInventory.join(', ')}` : undefined]
         .filter(Boolean).join('\n') || undefined;
-      const decomposed = await deps.decomposeSteps(ask, { context, runId: process.env.ELANOUS_RUN_ID?.trim() || authorRunId });
+      const decomposed = await deps.decomposeSteps(ask, { context, runId: process.env.ELANOUS_RUN_ID?.trim() || authorRunId, goalId: assignedGoalId });
       if (decomposed.length > 0) resolvedSteps = decomposed;
     } catch {
       failed = true;
@@ -6270,7 +6274,6 @@ async function authorGoalWithSupersededRootIntent(
   //   ⚠️⭐ 계약 — 이 줄은 조립·린트가 «끝나기 전»에 난다(goalId 가 여기서 정해지므로 더 늦출 수 없다).
   //      ⇒ 저작이 그 «뒤»에 실패하면 이 조인 행만 남는다(dangling). 그러므로 ***집계는 「착지한 골」과의
   //      inner join 으로만 한다*** — 이 행 자체를 「골이 하나 생겼다」로 세면 «실패분까지» 센다(무인 리뷰 지적).
-  const assignedGoalId = deps.goalId ?? generateGoalId();
   const askFile = deps.askFile === undefined ? undefined : validateAskFile(deps.askFile);
   try { observeGoalAuthor('goal-author', 'goal-id-assigned', { authorRunId, goalId: assignedGoalId, superseded: Boolean(deps.goalId) }); }
   catch { /* 관측은 fail-soft */ }
@@ -6565,6 +6568,7 @@ export function defaultGoalAuthorDeps(cwd: string): GoalAuthorDeps {
     },
     readSourceFile: createRepositoryReferencedFileReader(cwd),
     runHelpProbe: (argv) => runDefaultHelpProbe(cwd, argv),
+    selfResolveClarification: defaultGoalAuthorSelfResolve,
   };
 }
 
@@ -6613,7 +6617,7 @@ export async function writeAuthoredGoal(
     repositoryRoot: deps.repositoryRoot ?? groundingRoot,
   };
   const mandatoryGoalContextEvidence = goalContextEvidence(cwd);
-  const authoringLessons = selectRelevantAuthoringLessons(cwd, ask);
+  const authoringLessons = selectRelevantAuthoringLessons(cwd, ask, elanousStateRoot());
   observeGoalAuthor('goal-author', 'authoring-lessons', {
     status: authoringLessons.status,
     invalidRows: authoringLessons.invalidRows,

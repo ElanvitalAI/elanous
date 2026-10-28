@@ -21,7 +21,7 @@ import { runGitCommand } from '../git-fs/runner.js';
 import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, resolveGoalAuthorGrade, tracedPathReferences, type GoalAuthorGrade, type GoalAuthorGradeSelection, type GoalType } from '../self-implement/goal-author.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { appendRunLedgerEntry, listRunLedgers, loadFederatedRunLedger, loadRunLedger, queryRunScreenKey, runLedgerDir, type RunLedgerEntry, type RunLedgerMatch, type RunLedgerWriter } from '../self-implement/run-ledger.js';
-import { classifyPodExit, parsePodTermination, type PodExitClass, type PodTermination } from '../task-orchestrator/surfaces/pod-failure-reason.js';
+import { classifyPodExit, parsePodTermination, podFailureLedgerAxes, type PodExitClass, type PodFailureLedgerAxes, type PodTermination } from '../task-orchestrator/surfaces/pod-failure-reason.js';
 import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
 import { classifyPodExitStop, readRunStopRecord, recordRunStop, runStopRecorded, RUN_STOP_EVENT } from '../self-implement/run-stop.js';
 import { captureStopKnowhowCandidate } from '../self-implement/stop-autoheal.js';
@@ -40,7 +40,7 @@ import { debug } from '../debug/log.js';
 import { installHarnessSalvageCommand, installHarnessSalvageRetentionCommand } from './harness-salvage-cli.js';
 import { decideNestedElanousLaunch, readNestedElanousDepth } from './nested-elanous-policy.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
-import { harnessLaunchBudgetDecision, launchRequestId, preLaunchGate, resolveLaunchBudget, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
+import { LAUNCH_DOOR_RECEIPT_ENV, harnessLaunchBudgetDecision, launchRequestId, openLaunchRequestDoor, preLaunchGate, resolveLaunchBudget, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
 import { PR_LABELS } from '../github/pr-labels.js';
 import { ghAutomationEnv } from '../autopilot/pr-manager.js';
 import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
@@ -842,7 +842,7 @@ export function recordHarnessPodStop(
         runId, site: 'pod-exit', class: scopeEscape ? 'scope-escape' : classifyPodExitStop(classified.reason),
         cause: `Pod exit ${status}: ${detail.podExitClass}${detail.lead ? ` — ${detail.lead}` : ''}`,
         evidenceRef, nextMove, ...(childEvidence ? { childEvidence } : {}),
-      }, (entry) => write({ ...entry, data: { ...entry.data, podExitClass: detail.podExitClass, tail: detail.tail } }));
+      }, (entry) => write({ ...entry, data: { ...entry.data, podExitClass: detail.podExitClass, tail: detail.tail, ...detail.axes } }));
       return true;
     }
     // The classified line is our own one-line verdict («Pod 안 자식이 실패했다 — OOMKilled»), not the raw output tail.
@@ -885,20 +885,24 @@ const POD_EXIT_CAUSE_LEAD_CHARS = 160;
  * The closed Pod exit class ⊕ the last meaningful output lines for an exit the host could not classify.
  * Empty output is no evidence at all — `unknown` with an empty tail, never a guess. Fail-soft: a throw reads as `unknown`.
  */
-function podExitDetail(runId: string, status: number, output: string | undefined): { podExitClass: PodExitClass; tail: string[]; lead: string } {
+function podExitDetail(runId: string, status: number, output: string | undefined): { podExitClass: PodExitClass; tail: string[]; lead: string; axes: PodFailureLedgerAxes } {
   let podExitClass: PodExitClass = 'unknown';
   let tail: string[] = [];
+  // The rejection's reason code · check name · untruncated path, and the absence of a child result line, are
+  //   kept as their own ledger fields — the human `cause` line is bounded and cannot carry them.
+  let axes: PodFailureLedgerAxes = {};
   if (output?.trim()) {
     try {
       const exit = classifyPodExit({ logs: output, containerExitCode: status });
       podExitClass = exit.class;
       tail = exit.tail.slice(-POD_EXIT_TAIL_LINES).map((line) => Array.from(line).slice(0, POD_EXIT_TAIL_LINE_CHARS).join(''));
-    } catch { podExitClass = 'unknown'; tail = []; }
+      axes = podFailureLedgerAxes(exit);
+    } catch { podExitClass = 'unknown'; tail = []; axes = {}; }
   }
   // The last meaningful line is where the child died (`Error: ENOSPC …`) — earlier tail lines are context.
   const lead = Array.from(tail.at(-1) ?? '').slice(0, POD_EXIT_CAUSE_LEAD_CHARS).join('');
-  try { debug.log('harness.pod', 'exit-classified-detail', { runId, podExitClass, tailLines: tail.length }); } catch { /* observation is fail-soft */ }
-  return { podExitClass, tail, lead };
+  try { debug.log('harness.pod', 'exit-classified-detail', { runId, podExitClass, tailLines: tail.length, ...axes }); } catch { /* observation is fail-soft */ }
+  return { podExitClass, tail, lead, axes };
 }
 
 /**
@@ -1179,13 +1183,30 @@ async function dispatchHarnessAskSay(
       return;
     }
     enterJourneyNode('launch-gate', journey);
+    // LAUNCH-SINGLE-DOOR-1C — 부모(hand)가 소비한 영수증 상속: 이 요청이면 그 영수증으로 지나간다(한 번만 읽고 지운다).
+    const inheritedLaunchDoorReceipt = process.env[LAUNCH_DOOR_RECEIPT_ENV];
+    delete process.env[LAUNCH_DOOR_RECEIPT_ENV];
+    // 주입된 문이 없으면 생산 우주의 기본 문을 쓴다(시험 환경은 관문 관례와 같이 건너뛴다 — 시험 단언이 단일문 때문에 바뀌지 않는다).
+    const launchDoor = gate.launchDoor ?? (process.env.NODE_ENV === 'test' ? undefined : openLaunchRequestDoor({ source: dryRunPreview.entrance }));
+    const launchDoorRequestId = launchDoor?.requestId(identity);
     const decision = await withJourneyNode('launch-gate', journey, async () => {
       const { budget, budgetSource, snapshotAgeSec } = await resolveLaunchBudget({
         provider: opts.childLlmProvider,
         measureLocal: gate.readBudget ?? (() => readHarnessLaunchBudget(opts)),
         env: gate.readBudget ? { ELANOUS_SUBSTRATE: 'local' } : process.env,   // an injected budget reader is a host measurement, whatever substrate runs the test
       });
-      return preLaunchGate({ goalId, budget, budgetSource, ...(snapshotAgeSec !== undefined ? { snapshotAgeSec } : {}), forceLaunch: opts.forceGate === true }, gate);
+      const gateDecision = preLaunchGate({ goalId, budget, budgetSource, ...(snapshotAgeSec !== undefined ? { snapshotAgeSec } : {}), forceLaunch: opts.forceGate === true }, gate);
+      // LAUNCH-SINGLE-DOOR-1C — 관문을 통과한 요청만 단일문을 두드린다: 소비 영수증은 requestId 기준 최초 1회만
+      // 발급되고, 이미 소비됐으면 중복 발사로 거절한다(force 와 부모 상속 영수증은 그대로 지나간다).
+      if (gateDecision.action !== 'proceed' || launchDoor === undefined || launchDoorRequestId === undefined) return gateDecision;
+      const doorConsumption = launchDoor.consume(launchDoorRequestId, {
+        force: opts.forceGate === true,
+        ...(inheritedLaunchDoorReceipt !== undefined ? { inheritedReceipt: inheritedLaunchDoorReceipt } : {}),
+      });
+      if (doorConsumption.status === 'refused') {
+        return { ...gateDecision, action: 'blocked-duplicate' as const, reason: doorConsumption.reason };
+      }
+      return gateDecision;
     });
     exitJourneyNode('launch-gate', { ...journey, outcome: decision.action === 'proceed' ? 'pass' : 'refuse', data: { action: decision.action } });
     if (decision.action !== 'proceed') {
@@ -1198,7 +1219,15 @@ async function dispatchHarnessAskSay(
       ...(decision.budget === 'unknown' ? ['budget unknown'] : decision.budget.action === 'next-provider' ? [decision.budget.reasons.join(' · ') || 'next-provider'] : []),
     ];
     if (warnings.length > 0) console.error(`⚠️ launch gate: ${warnings.join(' · ').split(/\r?\n/, 1)[0]}`);
-    await launch();
+    try {
+      await launch();
+    } catch (error) {
+      // LAUNCH-SINGLE-DOOR-1C — 발사 실패 사유를 원장에 append 한다(관측 — 소비된 영수증은 그대로다).
+      if (launchDoor !== undefined && launchDoorRequestId !== undefined) {
+        launchDoor.fail(launchDoorRequestId, error instanceof Error ? error.message : String(error));
+      }
+      throw error;
+    }
   }); } finally { if (!journeyPreset) delete process.env[JOURNEY_KEY_ENV]; }
 }
 

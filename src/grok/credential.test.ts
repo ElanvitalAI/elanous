@@ -16,6 +16,7 @@ import {
   grokSubscriptionHeaders,
   isGrokUnauthorized,
   isGrokVersionRejected,
+  peekGrokCredential,
   refreshGrokSubscriptionToken,
   resolveGrokCredential,
   readSelectedGrokScope,
@@ -33,6 +34,12 @@ const EMPTY_HOME = (): string => mkdtempSync(join(tmpdir(), 'grok-cred-empty-'))
 const KEY_ENV = { XAI_API_KEY: 'xai-test-key' } as NodeJS.ProcessEnv;
 
 describe('resolveGrokCredential — ⭐ 구독 1순위 / API 키 2순위', () => {
+  it('동기 가용성 판정은 Pod refresh env와 무관하게 기존 구독 파일을 읽는다', () => {
+    const home = homeWithAuth({
+      'https://auth.x.ai::client-uuid': { key: 'sub-token', expires_at: '2026-09-01T00:00:00Z', user_id: 'u1' },
+    });
+    expect(peekGrokCredential({ home, model: 'grok-4.6' })?.kind).toBe('subscription');
+  });
   it('구독과 API 키가 «둘 다» 있으면 구독이 이긴다', () => {
     const home = homeWithAuth({
       'https://auth.x.ai::client-uuid': { key: 'sub-token', expires_at: '2026-09-01T00:00:00Z', user_id: 'u1' },

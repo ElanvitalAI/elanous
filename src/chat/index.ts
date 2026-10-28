@@ -452,12 +452,21 @@ export interface SlashCommand {
   name: string;        // e.g. 'quit'
   aliases?: string[];  // e.g. ['q', 'exit']
   description: string; // shown in picker
+  /** Keep a command executable, but omit it from slash discovery surfaces. */
+  hidden?: boolean;
   /** First-positional-arg suggestions (static). E.g. /plugin → [list, activate, ...]. */
   subcommands?: string[];
 }
 
+/** The 15 slash commands exposed on the first-use menu and in /help. */
+export const SLASH_MENU_POLICY = {
+  required: ['help', 'status', 'model', 'clear', 'resume', 'quit', 'now', 'harness', 'memory', 'side'],
+  reserve: ['context', 'remaining', 'session', 'setup', 'decide'],
+} as const;
+const FIRST_USE_SLASH_COMMANDS: ReadonlySet<string> = new Set([...SLASH_MENU_POLICY.required, ...SLASH_MENU_POLICY.reserve]);
+
 // Default commands available in the input
-export const SLASH_COMMANDS: SlashCommand[] = [
+export const SLASH_COMMANDS: SlashCommand[] = ([
   { name: 'help',  aliases: ['?'],         description: '명령과 키 보기' },
   { name: 'resume',    aliases: [],             description: '지난 대화 이어 가기 · /resume <id 앞자리>' },
   { name: 'model',     aliases: ['m'],           description: '모델 바꾸기 — /model 빠름|보통|깊음 (코드명도 됨)', subcommands: ['빠름', '보통', '깊음', 'codex', 'terra', 'sol', 'luna', 'opus', 'sonnet', 'grok'] },
@@ -538,11 +547,12 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'voice-chat', aliases: ['vc'], description: 'Continuous voice chat mode — speak, elanous replies in voice (Phase 4-5). Subcommands: start / stop / cancel / status. Chord: Alt+R toggles enter/exit anywhere.', subcommands: ['start', 'stop', 'cancel', 'status'] },
   { name: 'auto-tts', aliases: ['tts', 'autotts'], description: 'Auto-TTS for chat responses (Phase 2) — speaks LLM replies sentence-by-sentence. Subcommands: on / off / toggle / status.', subcommands: ['on', 'off', 'toggle', 'status'] },
   { name: 'directive', aliases: [], description: '(운영) 지시를 Linear 이슈로 기록' },
-];
+]).map((command) => ({ ...command, hidden: !FIRST_USE_SLASH_COMMANDS.has(command.name) }));
 
 /** Every user-visible slash spelling, normalized for runtime-catalog comparison. */
 export function displayedSlashCommandNames(commands: readonly SlashCommand[] = SLASH_COMMANDS): string[] {
-  return commands.flatMap((command) => [command.name, ...(command.aliases ?? [])]);
+  return commands.filter((command) => !command.hidden)
+    .flatMap((command) => [command.name, ...(command.aliases ?? [])]);
 }
 
 /** Score and rank slash commands against the user's typed text (sans leading `/`).
@@ -553,15 +563,16 @@ export function displayedSlashCommandNames(commands: readonly SlashCommand[] = S
  *    prefix-on-alias         80
  *    substring-on-name       50
  *    word-start in desc      10  (regex \b<text>)
- *  Sort by score desc, then name asc. Empty text returns the input list
- *  unchanged. */
+ *  Sort by score desc, then name asc. Hidden commands are omitted from discovery,
+ *  while the dispatch registry continues to accept direct input. */
 export function filterSlashCommands(text: string, commands: SlashCommand[]): SlashCommand[] {
+  const discoverable = commands.filter((command) => !command.hidden);
   const q = text.toLowerCase();
-  if (!q) return commands;
+  if (!q) return discoverable;
   const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const descRe = new RegExp(`\\b${escaped}`, 'i');
   const scored: { cmd: SlashCommand; score: number }[] = [];
-  for (const cmd of commands) {
+  for (const cmd of discoverable) {
     const name = cmd.name.toLowerCase();
     const aliases = (cmd.aliases ?? []).map(a => a.toLowerCase());
     let score = 0;
@@ -799,6 +810,11 @@ export async function textInput(opts: {
    *  `'passthrough'` to let textInput's buffer / specialized handlers
    *  proceed. Omit to disable (legacy behaviour preserved). */
   onKey?: (key: import('../tui.js').Key) =>
+    | 'consumed' | 'passthrough'
+    | Promise<'consumed' | 'passthrough'>;
+  /** Host escape-chord override. Runs before textInput's unconditional
+   *  quit path so a host can turn a chord into an in-app action. */
+  onQuitChord?: (key: import('../tui.js').Key) =>
     | 'consumed' | 'passthrough'
     | Promise<'consumed' | 'passthrough'>;
   /** Provide candidate file/directory entries for the `@`-mention
@@ -1594,6 +1610,16 @@ export async function textInput(opts: {
         alt: key.alt ?? false,
         rawHex,
       });
+    }
+
+    // A host may claim a quit chord as an in-app action (classic
+    // dashboard Ctrl+\\ shows side-tab guidance and keeps the TUI alive).
+    if (isTextInputQuitChord(key) && opts.onQuitChord) {
+      const quitRoute = await Promise.resolve(opts.onQuitChord(key));
+      if (quitRoute === 'consumed') {
+        drawAll();
+        continue;
+      }
     }
 
     // Hard exit must win over modal/VW pre-routing. When a foreground

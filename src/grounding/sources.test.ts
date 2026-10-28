@@ -19,7 +19,7 @@ function git(cwd: string, args: string[]): void {
 }
 
 describe('grounding sources', () => {
-  test('discover yields two candidates, rejects duplicate id and missing path, and reports dirtiness', () => {
+  test('discover yields two candidates, rejects duplicate id and missing path, and reports dirtiness', async () => {
     const home = mkdtempSync(join(tmpdir(), 'grounding-sources-'));
     try {
       const alpha = join(home, 'source', 'ref', 'alpha');
@@ -53,13 +53,13 @@ describe('grounding sources', () => {
         path: join(home, 'source', 'ref', 'nope'),
       })).toThrow(/missing path/);
 
-      const clean = sourceStatus(listGroundingSources(config)[0]!);
+      const clean = await sourceStatus(listGroundingSources(config)[0]!);
       expect(clean.dirty).toBe(false);
       expect(clean.branch).toBe('main');
       expect(typeof clean.lastCommitAt).toBe('string');
 
       writeFileSync(join(alpha, 'dirty.txt'), 'changed\n');
-      const dirty = sourceStatus(listGroundingSources(config)[0]!);
+      const dirty = await sourceStatus(listGroundingSources(config)[0]!);
       expect(dirty.dirty).toBe(true);
 
       config = removeGroundingSource(config, 'alpha');

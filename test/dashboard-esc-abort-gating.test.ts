@@ -14,6 +14,12 @@ import {
 } from '../src/dashboard/index.js';
 import { SELF_IMPLEMENT_TOOL_NAMES } from '../src/boot/daemon-tools/self-implement-names.js';
 import { createEscAbortGate } from '../src/esc-abort-gate.js';
+import { createDashboardExternalInputHost } from '../src/dashboard/input/external-input-host.js';
+import { createExternalInputQueue } from '../src/input/external-input-queue.js';
+import { createInlineAskUserQuestionResolver } from '../src/ask-user-question/inline-resolver.js';
+import { InlineChoiceBroker } from '../src/tui/inline-choice.js';
+import { createInlineChoiceTurnEndCleanup } from '../src/tui/inline-choice.js';
+import { readDashboardAskClarification } from '../src/dashboard/slash-runtime/ask-clarification.js';
 import type { ModalSurface } from '../src/display/modal-stack.js';
 import { DEFAULT_THEME_TOKENS } from '../src/theme/tokens.js';
 import { tuiSourceText } from './helpers/dashboard-source.js';
@@ -54,11 +60,80 @@ function extractCallbackBlock(source: string, callbackStart: string): string | n
 }
 
 function finalizeTurnClearsEscAbortToolState(source: string): boolean {
-  const finalizeTurnBlock = extractCallbackBlock(source, 'finalizeTurn: (finalStatus, finalError) =>');
+  const finalizeTurnBlock = extractCallbackBlock(source, 'finalizeTurn: async (finalStatus, finalError) =>')
+    ?? extractCallbackBlock(source, 'finalizeTurn: (finalStatus, finalError) =>');
   return finalizeTurnBlock?.includes('clearEscAbortToolState(escAbortToolState);') ?? false;
 }
 
 describe('dashboard ESC abort gating', () => {
+  test('dashboard unattended clarification applies the 60s broker timeout and resolves empty on timeout', async () => {
+    let fireTimeout!: () => void;
+    let timeoutDelay = 0;
+    let surfaceTimeout: number | undefined;
+    const broker = new InlineChoiceBroker({
+      appendLines: () => {},
+      schedule: (callback, delayMs) => { fireTimeout = callback; timeoutDelay = delayMs; return 1 as never; },
+      cancelSchedule: () => {},
+    });
+    const resolveQuestion = createInlineAskUserQuestionResolver(broker, { timeoutMs: () => 60_000, createId: () => 'dashboard-clarify' });
+    const pending = readDashboardAskClarification({
+      questionId: 'dashboard-clarify', question: 'Which scope?', includeOther: false,
+      options: [{ label: 'small' }, { label: 'wide' }],
+    }, {
+      question: (request, options) => {
+        surfaceTimeout = options?.timeoutMs;
+        return resolveQuestion(request);
+      },
+    }, undefined, true);
+
+    expect(surfaceTimeout).toBe(60_000);
+    expect(timeoutDelay).toBe(60_000);
+    fireTimeout();
+    await expect(pending).resolves.toBe('');
+  });
+
+  test('turn teardown cancels active prompt and frees the next turn prompt slot', async () => {
+    const broker = new InlineChoiceBroker({ appendLines: () => {} });
+    const cancelAtTurnEnd = createInlineChoiceTurnEndCleanup(broker);
+    const first = broker.ask({
+      id: 'turn-1', question: 'First?', options: [{ value: 'yes', label: 'Yes' }], timeoutMs: 60_000,
+    });
+    expect(broker.activeId).toBe('turn-1');
+    cancelAtTurnEnd();
+    await expect(first).resolves.toMatchObject({ cancelled: true, reason: 'cancelled' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const second = broker.ask({ id: 'turn-2', question: 'Next?', options: [{ value: 'yes', label: 'Yes' }] });
+    expect(broker.activeId).toBe('turn-2');
+    expect(broker.handleInput('1')).toBe(true);
+    await expect(second).resolves.toEqual({ selected: ['yes'] });
+  });
+
+  test('active inline clarification consumes submitted PTY answer instead of queuing it behind its turn', async () => {
+    const lines: string[] = [];
+    const broker = new InlineChoiceBroker({ appendLines: (next) => lines.push(...next) });
+    const resolveQuestion = createInlineAskUserQuestionResolver(broker, { timeoutMs: () => 60_000, createId: () => 'clarify' });
+    const queue = createExternalInputQueue({ log: () => {}, logInput: () => {}, schedule: () => () => {} });
+    const host = createDashboardExternalInputHost({
+      isTurnActive: () => false,
+      promptCtl: { getBufferText: () => '', submit: () => true },
+      pushNotice: () => {},
+      setQueueNotice: () => {},
+      handleInlineChoice: (text) => broker.handleInput(text),
+    });
+    queue.register(host);
+
+    const pending = resolveQuestion({ questions: [{
+      id: 'scope', header: 'Scope', question: 'Which scope?',
+      options: [{ label: 'small', description: 'Small scope' }, { label: 'wide', description: 'Wide scope' }],
+      includeOther: false,
+    }] });
+    expect(queue.route('1\r')).toBe('submitted');
+    await expect(pending).resolves.toEqual({ answers: { scope: 'small' } });
+    expect(queue.pending()).toHaveLength(0);
+    expect(lines.join('\n')).toContain('1. small');
+  });
+
   test('production dashboard wiring tracks stream callbacks and clears at turn boundaries', () => {
     const source = tuiSourceText();
     const start = source.indexOf('const attachChatStreamingKeys =');
@@ -75,11 +150,15 @@ describe('dashboard ESC abort gating', () => {
     expect(pendingGateBlock).toContain('runSoftStop: runEscAbortPendingSoftStop,');
     expect(pendingGateBlock).toContain('formatWaitingTargets: formatEscAbortWaitingTargets,');
     expect(pendingGateBlock).toContain('getActiveHarnessSpace: activeHarnessSpace,');
-    expect(pendingGateBlock).toContain('pushChatLine: (line) => pushChatLine(line),');
+    expect(pendingGateBlock).toContain('pushChatLine: (line) => {');
+    expect(pendingGateBlock).toContain('!delegatedTerminationPending && !delegatedTerminationFailed');
+    expect(pendingGateBlock).toContain('pushChatLine(line);');
     expect(pendingGateBlock).toContain('showHarnessEscHint,');
-    expect(gateCallback).toContain('onAbortPending: escAbortPendingGate.onAbortPending,');
+    expect(gateCallback).toContain('onAbortPending: (event) => {');
+    expect(gateCallback).toContain('escAbortPendingGate.onAbortPending(event);');
     expect(gateCallback).toContain('onAbortRepeat: escAbortPendingGate.onAbortRepeat,');
     expect(source).toContain('createTurnStreamRuntime: (initialAssistantStart) => {\n              latestTurnUsage = undefined;\n              createDashboardTurnStreamRuntimeEscBoundary(escAbortToolState);');
+    expect(source).toContain('createDashboardTurnStreamRuntimeEscBoundary(escAbortToolState);\n              delegatedTerminationPending = false;\n              delegatedTerminationFailed = false;');
     expect(source).toContain('trackEscAbortToolCall(escAbortToolState, toolCall);');
     expect(source).toContain('settleEscAbortToolCall(escAbortToolState, toolCall);');
     expect(finalizeTurnClearsEscAbortToolState(source)).toBe(true);

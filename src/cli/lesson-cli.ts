@@ -2,6 +2,7 @@ import type { Command } from 'commander';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { FrictionInputError, FrictionLedger, frictionActor, type FrictionRecordInput } from '../lessons/friction-ledger.js';
 import { importLessons, scanLessonDocs } from '../lessons/lesson-import.js';
 import { LessonInputError, LessonLedger, type LessonLedgerOptions, type LessonRow, type LessonDetail } from '../lessons/lesson-ledger.js';
 
@@ -47,6 +48,18 @@ function validAuthoringLessonClass(value: string): boolean {
 export function registerLessonCommands(program: Command, options: LessonLedgerOptions = {}, out: Pick<Console, 'log'> = console): void {
   const root = program.command('lesson').description('사고 · 원인 · 처방 · 재발 교훈 원장');
   const ledger = () => new LessonLedger(options);
+  // 손 걸음 원장은 그림자 기록이다: 비밀 꼴 note 는 빼고 남기며, 어떤 경우에도 lesson 명령을 실패시키지 않는다.
+  const recordFriction = (input: FrictionRecordInput): void => {
+    const friction = new FrictionLedger(options);
+    const attempts = input.note ? [input, { ...input, note: '' }] : [input];
+    for (const attempt of attempts) {
+      try { friction.record(attempt); return; }
+      catch (error) {
+        debug.log('lessons.friction', 'skipped', { kind: attempt.kind, signature: attempt.signature,
+          reason: error instanceof FrictionInputError ? error.message : String(error) });
+      }
+    }
+  };
   const emit = (value: unknown, json: boolean | undefined, text: string) => out.log(json ? JSON.stringify(value) : text);
   root.command('import').description('INCIDENT·FINDING 문서 교훈 미리 보기 (기본값); --apply 로 적재')
     .option('--apply', '원장에 적재').option('--json', 'JSON 출력').option('--by <name>', '기록자 (기본 AI_AGENT)')
@@ -128,11 +141,12 @@ export function registerLessonCommands(program: Command, options: LessonLedgerOp
         return;
       }
       const required = ['incident', 'cause', 'remedy', 'owner', 'source'] as const;
+      const lessonId = id ?? '';
       const missing: string[] = required.filter((key) => typeof o[key] !== 'string' || !(o[key] as string).trim());
-      if (!id?.trim()) missing.unshift('id');
+      if (!lessonId.trim()) missing.unshift('id');
       if (missing.length) throw new LessonInputError(`required: ${missing.map(key => key === 'id' ? 'id' : `--${key}`).join(', ')}`);
       const by = actor(typeof o.by === 'string' ? o.by : undefined);
-      const row = ledger().add({ id, incident: o.incident as string, cause: o.cause as string, remedy: o.remedy as string,
+      const row = ledger().add({ id: lessonId, incident: o.incident as string, cause: o.cause as string, remedy: o.remedy as string,
         owner: o.owner as string, source: o.source as string, by,
         ...(o.enforcedBy !== undefined ? { enforcedBy: o.enforcedBy as string } : {}),
         ...(o.disproof !== undefined ? { disproof: o.disproof as string } : {}) });
@@ -140,7 +154,9 @@ export function registerLessonCommands(program: Command, options: LessonLedgerOp
     }));
   root.command('recur <id>').requiredOption('--source <path>').option('--note <text>').option('--by <name>')
     .action(handle('recur', (id: string, o: { source: string; note?: string; by?: string }) => {
-      const row = ledger().recur(id, { source: o.source, note: o.note ?? '', by: actor(o.by) });
+      const by = actor(o.by);
+      const row = ledger().recur(id, { source: o.source, note: o.note ?? '', by });
+      recordFriction({ actor: frictionActor(by), kind: 'hand-step', signature: row.incident ?? `lesson ${row.id}`, note: o.note ?? '', ref: o.source });
       emit(row, false, format(row));
     }));
   root.command('enforce <id>').requiredOption('--enforced-by <paths>').option('--by <name>')

@@ -13,7 +13,9 @@
 //   - onProgress ← ux.progress (각 스테이지 진행을 서피스로).
 //   - 큰 gate log → ux.spillFile (파일 첨부).
 
-import { basename } from 'node:path';
+import { basename, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import type { LLMToolSpec } from '../../llm.js';
 import { childLifetimeSignal } from '../../turn-abort-scope.js';
 import { buildSelfImplementSpec } from '../../self-implement/self-implement-runtime.js';
@@ -25,7 +27,13 @@ import type { SurfaceUx } from '../../agent/surface-ux/types.js';
 import { resolveAutoOpenPrDecision } from '../../self-implement/auto-open-pr.js';
 import { resolveObserveOnlyDecision, _setObserveOnlyConfigReaderForTesting as _setSharedObserveOnlyReaderForTesting } from '../../self-implement/observe-only.js';
 import { debug } from '../../debug/log.js';
+import { globalAgentRegistry, type AgentRegistry } from '../../agent/registry.js';
+import type { TaskNotificationQueue } from '../../agent/task-notification.js';
+import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { writeAuthoredGoal } from '../../self-implement/goal-author.js';
+import { selfAnswerOrAssumeGoalDocumentClarifications, type GoalClarificationSelfResolver } from '../../self-implement/goal-author-clarification.js';
+import { writeGoalDocumentAtomic } from '../../self-implement/goal-document-write.js';
+import { DecisionLedger } from '../../decisions/decision-ledger.js';
 import { createGoalAuthorDecomposeSteps, readRecentStepCountsFailOpen, readRecentStepCountsFromLogStore, type RecentStepCountReader } from '../../self-implement/goal-author-decompose.js';
 import type { DaemonToolDispatchCtx } from './types.js';
 
@@ -188,6 +196,7 @@ type RunSelfImplementCliFn = (
   deps: SelfImplementCliDeps,
 ) => Promise<SelfImplementCliOutcome>;
 type SelfImplementSeamsFactory = (opts: import('../../self-implement/seams.js').DefaultSeamsOptions) => SelfImplementSeams | Promise<SelfImplementSeams>;
+type DecisionLedgerFactory = () => DecisionLedger;
 
 async function runSelfImplementViaCli(
   command: RunSelfImplementCliFn,
@@ -240,9 +249,12 @@ export async function dispatchSelfImplement(
   authorGoal: SelfImplementGoalAuthor = writeAuthoredGoal,
   runCli: RunSelfImplementCliFn = runSelfImplementCliCommand,
   seamsFactory?: SelfImplementSeamsFactory,
+  clarificationResolver?: GoalClarificationSelfResolver,
+  decisionLedgerFactory?: DecisionLedgerFactory,
 ): Promise<SelfImplementToolResult> {
   const feature = typeof args.feature === 'string' ? args.feature.trim() : '';
   if (!feature) return buildFailedToolResult('SelfImplement: `feature` is required');
+  if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('SelfImplement aborted');
   try {
   const base = typeof args.base === 'string' && args.base.trim() ? args.base.trim() : undefined;
   const draft = typeof args.draft === 'boolean' ? args.draft : true;
@@ -292,6 +304,72 @@ export async function dispatchSelfImplement(
       }),
       onProgress: (phase, event) => ux.progress(`goal-author ${phase} ${event === 'start' ? 'started' : 'ended'}`, { phase: 'delta' }),
     })).path;
+    if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('SelfImplement aborted');
+  }
+  if (goalFile) {
+    let authoredDocument: string;
+    try {
+      authoredDocument = readFileSync(goalFile, 'utf8');
+    } catch (error) {
+      const errorCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'string'
+        ? error.code
+        : undefined;
+      const reason = errorCode === 'ENOENT'
+        ? 'goal file missing before clarification'
+        : 'goal file unreadable before clarification';
+      debug.log('daemon-tools.self-implement', 'goal-clarification-file-read-failed', {
+        goalFile,
+        errorCode: errorCode ?? null,
+        reason,
+      });
+      return buildFailedToolResult(reason);
+    }
+    const clarification = await selfAnswerOrAssumeGoalDocumentClarifications(authoredDocument, {
+      path: 'say-first',
+      ...(goalSourceText !== undefined ? { ask: goalSourceText } : {}),
+      ...(typeof args.runId === 'string' ? { runId: args.runId } : {}),
+      ...(clarificationResolver !== undefined ? { resolver: clarificationResolver } : {}),
+    });
+    if (clarification.document !== authoredDocument) writeGoalDocumentAtomic(goalFile, clarification.document);
+    if (clarification.decisionRequired.length > 0) {
+      const ledger = decisionLedgerFactory?.() ?? new DecisionLedger();
+      const decisions = clarification.decisionRequired.map((item) => {
+        const ref = `self-implement-clarification:${args.runId ?? goalFile}:${item.questionId}`;
+        return ledger.raiseOnce({
+          title: `SelfImplement 확인 필요: ${item.header}`.slice(0, 120),
+          category: item.category,
+          scqa: {
+            s: 'SelfImplement 골 저작 중 자동 답변이 끝나지 않은 확인 질문이 남았다',
+            c: '금전·보안·되돌릴 수 없는 외부 효과는 정책 가정으로 승인하지 않는다',
+            q: item.question.slice(0, 240),
+          },
+          pendingQuestion: item.question,
+          options: [
+            { key: 'a', label: '답을 골 문서에 반영 후 재실행', consequence: '결정 내용을 골 문서에 명시하고 SelfImplement을 다시 호출한다' },
+            { key: 'b', label: '진행하지 않음', consequence: '이 범위는 실행하지 않는다' },
+          ],
+          recommendation: { skipped: true, reason: '금전·보안·되돌릴 수 없는 외부 효과는 자동으로 선택하지 않는다' },
+          crossCheckSkipped: '안전상 대표 판단 필요',
+          raisedBy: { agent: 'OPC', track: 'OP' },
+          refs: [ref],
+        }, ref);
+      });
+      debug.log('daemon-tools.self-implement', 'goal-clarification-no-launch', {
+        goalFile,
+        decisionIds: decisions.map((decision) => decision.id),
+        unanswered: clarification.decisionRequired.length,
+        reason: 'safety-critical-clarification-requires-recorded-decision',
+      });
+      return buildFailedToolResult(`goal author clarification requires a recorded decision before launch; record the answer in the goal document and rerun SelfImplement (${decisions.map((decision) => decision.id).join(', ')})`);
+    }
+    if (clarification.unanswered > 0) {
+      debug.log('daemon-tools.self-implement', 'goal-clarification-assumption-incomplete', {
+        goalFile,
+        unanswered: clarification.unanswered,
+        reason: 'no-launch-unanswered-clarification',
+      });
+      return buildFailedToolResult(`goal author clarification remains unanswered; launch withheld to prevent a human popup (${clarification.unanswered})`);
+    }
   }
   const goalAuthorSummary: GoalAuthorSummary = {
     authored: goalFile !== undefined,
@@ -322,6 +400,7 @@ export async function dispatchSelfImplement(
   );
 
   const cliOpts: SelfImplementCliOpts = {
+    ...(ctx.runId ? { runId: ctx.runId } : {}),
     entry,
     ...(ctx.sessionId ? { parentSessionId: ctx.sessionId } : {}),
     ...(base ? { base } : {}),
@@ -336,10 +415,12 @@ export async function dispatchSelfImplement(
   };
   // 승인 통로는 surface seams.approvePr 하나다. opts/pipelineDeps.approver를 보강하면
   // 중앙 심이 seams를 다시 조립해 fail-closed 승인 게이트를 우회할 수 있다.
-  const pipelineDeps: DevPipelineDeps = { buildSelfImplementSeams: () => seams };
+  const pipelineDeps: DevPipelineDeps = { buildSelfImplementSeams: () => seams, signal: ctx.signal };
   const result = run
     ? await run({
       feature,
+      ...(ctx.runId ? { runId: ctx.runId } : {}),
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
       ...(ctx.sessionId ? { parentSessionId: ctx.sessionId } : {}),
       ...(base ? { base } : {}),
       draft,
@@ -368,4 +449,191 @@ export async function dispatchSelfImplement(
     debug.log('daemon-tools.self-implement', 'failed', { reason, stage: 'dispatch' });
     return buildFailedToolResult(reason);
   }
+}
+
+export type SelfImplementQueuedToolResult = {
+  kind: 'launched'; runId: string; taskId: string; state: 'queued' | 'running' | 'done' | 'error' | 'aborted'; ok: boolean;
+  message: string; next: string; missing: [];
+};
+
+type ManagedAdmissionState = 'queued' | 'running' | 'done' | 'error' | 'aborted';
+export interface ManagedTaskAdmission {
+  version: 1;
+  requestKey: string;
+  runId: string;
+  taskId: string;
+  parentSessionId?: string;
+  feature: string;
+  state: ManagedAdmissionState;
+  createdAt: number;
+  updatedAt: number;
+  result?: string;
+  error?: string;
+}
+
+/** File-backed admission ledger. A hard-link claim makes duplicate tool-call admission atomic. */
+export class ManagedTaskAdmissionStore {
+  constructor(private readonly root = resolveManagedAdmissionRoot()) {}
+
+  claim(input: Omit<ManagedTaskAdmission, 'version' | 'createdAt' | 'updatedAt'>): { record: ManagedTaskAdmission; created: boolean } {
+    mkdirSync(this.root, { recursive: true });
+    const path = this.pathFor(input.requestKey);
+    const now = Date.now();
+    const record: ManagedTaskAdmission = { ...input, version: 1, createdAt: now, updatedAt: now };
+    const temp = join(this.root, `.claim-${randomUUID()}.tmp`);
+    writeFileSync(temp, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    try {
+      linkSync(temp, path);
+      return { record, created: true };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      return { record: this.read(path), created: false };
+    } finally { rmSync(temp, { force: true }); }
+  }
+
+  update(requestKey: string, patch: Partial<Pick<ManagedTaskAdmission, 'state' | 'result' | 'error'>>): ManagedTaskAdmission {
+    const path = this.pathFor(requestKey);
+    const record = { ...this.read(path), ...patch, updatedAt: Date.now() };
+    const temp = join(this.root, `.update-${randomUUID()}.tmp`);
+    writeFileSync(temp, `${JSON.stringify(record)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+    renameSync(temp, path);
+    return record;
+  }
+
+  get(requestKey: string): ManagedTaskAdmission | undefined {
+    const path = this.pathFor(requestKey);
+    return existsSync(path) ? this.read(path) : undefined;
+  }
+
+  private pathFor(requestKey: string): string {
+    const digest = createHash('sha256').update(requestKey).digest('hex');
+    return join(this.root, `${digest}.json`);
+  }
+
+  private read(path: string): ManagedTaskAdmission {
+    const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (!value || typeof value !== 'object' || (value as ManagedTaskAdmission).version !== 1) {
+      throw new Error(`invalid SelfImplement admission record: ${path}`);
+    }
+    return value as ManagedTaskAdmission;
+  }
+}
+
+export function resolveManagedAdmissionRoot(instanceRoot = effectiveInstanceRoot()): string {
+  const dataDir = process.env.ELANOUS_DATA_DIR?.trim() || join(instanceRoot, 'data');
+  return join(dataDir, 'self-implement-admissions');
+}
+
+/** Return a durable-addressable registry identity before doing any goal authoring or child setup. */
+export function dispatchSelfImplementManaged(
+  args: Record<string, unknown>,
+  ctx: DaemonToolDispatchCtx & { autoMerge?: boolean },
+  run?: SelfImplementRunner,
+  authorGoal: SelfImplementGoalAuthor = writeAuthoredGoal,
+  runCli: RunSelfImplementCliFn = runSelfImplementCliCommand,
+  seamsFactory?: SelfImplementSeamsFactory,
+  admissionStore: ManagedTaskAdmissionStore = new ManagedTaskAdmissionStore(),
+  runtime: { taskNotifications?: TaskNotificationQueue; registry?: AgentRegistry } = {},
+): Promise<SelfImplementQueuedToolResult | SelfImplementToolResult> {
+  const feature = typeof args.feature === 'string' ? args.feature.trim() : '';
+  if (!feature) return Promise.resolve(buildFailedToolResult('SelfImplement: `feature` is required'));
+  const runId = randomUUID();
+  const taskId = randomUUID();
+  const requestKey = ctx.sessionId && ctx.toolCallId
+    ? `tool-call:${ctx.sessionId}:${ctx.toolCallId}`
+    : `request:${runId}`;
+  let claim: ReturnType<ManagedTaskAdmissionStore['claim']>;
+  try {
+    claim = admissionStore.claim({
+      requestKey, runId, taskId, feature,
+      ...(ctx.sessionId ? { parentSessionId: ctx.sessionId } : {}), state: 'queued',
+    });
+  } catch (error) {
+    return Promise.resolve(buildFailedToolResult(`SelfImplement admission could not be persisted: ${error instanceof Error ? error.message : String(error)}`));
+  }
+  const registry = runtime.registry ?? globalAgentRegistry;
+  if (!claim.created) {
+    let record = claim.record;
+    let existingTask = registry.get(record.taskId);
+    if (!existingTask) {
+      existingTask = registry.register(
+        { name: 'self-implement', systemPrompt: 'Managed SelfImplement execution; do not invoke an LLM agent.' },
+        record.feature, { id: record.taskId },
+      );
+      existingTask.runId = record.runId;
+      existingTask.parentSessionId = record.parentSessionId;
+      existingTask.label = `SelfImplement ${record.feature.slice(0, 80)}`;
+      existingTask.background = true;
+      if (record.state === 'queued' || record.state === 'running') {
+        record = admissionStore.update(requestKey, { state: 'error', error: 'SelfImplement worker was interrupted by process restart; submit a new request to retry.' });
+        existingTask.error = record.error;
+        existingTask.result = record.error;
+        existingTask.state = 'error';
+        existingTask.finishedAt = Date.now();
+        registry.notifyTaskDone(existingTask);
+      } else {
+        existingTask.state = record.state;
+        existingTask.result = record.result;
+        existingTask.error = record.error;
+      }
+    }
+    return Promise.resolve({
+      kind: 'launched', runId: record.runId, taskId: record.taskId, state: record.state,
+      ok: record.state !== 'error' && record.state !== 'aborted',
+      message: `SelfImplement prior admission · run ${record.runId} · task ${record.taskId}${record.error ? ` · ${record.error}` : ''}`,
+      next: `AgentOutput(${record.taskId})`, missing: [],
+    });
+  }
+  const task = registry.register(
+    { name: 'self-implement', systemPrompt: 'Managed SelfImplement execution; do not invoke an LLM agent.' },
+    feature, { id: taskId },
+  );
+  task.runId = runId;
+  task.parentSessionId = ctx.sessionId;
+  task.label = `SelfImplement ${feature.slice(0, 80)}`;
+  task.background = true;
+  const parentChildSignal = childLifetimeSignal(ctx.signal);
+  const signal = parentChildSignal
+    ? AbortSignal.any([task.controller.signal, parentChildSignal])
+    : task.controller.signal;
+  let unsubscribeRunStop = (): void => {};
+  const runStopListenerReady = import('../../self-implement/run-stop.js').then(({ onRunStop, readRunStopRecord }) => {
+    unsubscribeRunStop = onRunStop((entry) => {
+      if (entry.runId !== runId) return;
+      const stop = readRunStopRecord(entry);
+      if (!stop) return;
+      void import('../../agent/task-notification.js').then(({ enqueueSelfImplementRunStopNotification, globalTaskNotificationQueue }) => {
+        enqueueSelfImplementRunStopNotification(
+          { runId, taskId: task.id, feature, stop },
+          runtime.taskNotifications ?? globalTaskNotificationQueue,
+        );
+        debug.log('daemon-tools.self-implement', 'run-stop-wake-enqueued', { runId, taskId: task.id, stopClass: stop.class, site: stop.site ?? null });
+      });
+      unsubscribeRunStop();
+    });
+  });
+  // The task registry owns cancellation and terminal notification. All slow setup,
+  // including goal authoring and seam construction, happens after this receipt.
+  queueMicrotask(() => {
+    void runStopListenerReady.then(() => registry.runManaged(task.id, async () => {
+      admissionStore.update(requestKey, { state: 'running' });
+      if (signal.aborted) throw signal.reason ?? new Error('SelfImplement aborted');
+      const result = await dispatchSelfImplement(args, { ...ctx, runId, signal }, run, authorGoal, runCli, seamsFactory);
+      if (signal.aborted) throw signal.reason ?? new Error('SelfImplement aborted');
+      if (result.kind === 'failed') throw new Error(result.reason);
+      admissionStore.update(requestKey, { state: 'done', result: JSON.stringify(result) });
+      return result;
+    }, (result) => JSON.stringify(result)).catch((error) => {
+      try { admissionStore.update(requestKey, { state: task.controller.signal.aborted ? 'aborted' : 'error', error: error instanceof Error ? error.message : String(error) }); } catch { /* registry remains authoritative for this process */ }
+      debug.log('daemon-tools.self-implement', 'managed-task-failed', {
+        runId, taskId: task.id, reason: error instanceof Error ? error.message : String(error),
+      }, { level: 'warn' });
+    })).finally(unsubscribeRunStop);
+  });
+  debug.log('daemon-tools.self-implement', 'managed-admitted', { runId, taskId: task.id, parentSessionId: ctx.sessionId ?? null });
+  return Promise.resolve({
+    kind: 'launched', runId, taskId: task.id, state: claim.record.state, ok: true,
+    message: `SelfImplement accepted · run ${runId} · task ${task.id}`,
+    next: `AgentOutput(${task.id})`, missing: [],
+  });
 }

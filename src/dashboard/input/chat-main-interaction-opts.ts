@@ -18,6 +18,7 @@ export type DashboardChatMainInteractionOpts = Pick<
   | 'onPasteImage'
   | 'onKey'
   | 'onPreKey'
+  | 'onQuitChord'
   | 'onMouse'
 >;
 
@@ -46,6 +47,7 @@ export interface CreateDashboardChatMainInteractionOptsDeps {
    *  instead of "<transcript>a" (PR #1109 review fix). */
   routeLongPressDictation?: (key: Key) => 'consumed' | 'passthrough' | Promise<'consumed' | 'passthrough'>;
   routeInputKey: NonNullable<DashboardChatMainInteractionOpts['onKey']>;
+  routeQuitChord?: NonNullable<DashboardChatMainInteractionOpts['onQuitChord']>;
   shouldRouteInputDispatcherKey?: (key: Key) => boolean;
   hasActiveStatusPopup: () => boolean;
   hasTerminalModal: () => boolean;
@@ -73,6 +75,7 @@ export function createDashboardChatMainInteractionOpts(
       }
       return await deps.routeInputKey(key);
     },
+    onQuitChord: deps.routeQuitChord,
     onPreKey: async (key) => {
       if (deps.routeVoiceKey) {
         const voiceRoute = await deps.routeVoiceKey(key);

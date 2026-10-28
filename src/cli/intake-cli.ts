@@ -5,7 +5,7 @@ import type { Command } from 'commander';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { readNexusRuntime } from '../nexus/runtime.js';
 import { resolveRoleLlm } from '../user-config.js';
-import { runIntakeToTasks, type IntakeTaskInput, type IntakeTaskRequest, type IntakeToTasksResult } from '../intake-plane/intake-to-tasks.js';
+import { approveChannelPublish, runIntakeToTasks, type IntakeTaskInput, type IntakeTaskRequest, type IntakeToTasksResult } from '../intake-plane/intake-to-tasks.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { writeStdoutFully } from './stdout-flush.js';
 import { runGitCommand } from '../git-fs/runner.js';
@@ -37,6 +37,8 @@ export interface IntakeCliDeps extends IntakeCandidatesCliDeps {
   root?: string;
   /** 텔레그램 «저장된 메시지» 연결 (기본 gramjsFetchSaved) — 시험은 가짜 fetch 를 넣는다. */
   connectSaved?: () => Promise<{ fetch: FetchSavedMessages; close: () => Promise<void> }>;
+  /** 수집 연결 실패를 CLI 사용자에게 보고한다. */
+  error?: (message: string) => void;
 }
 
 /** `--limit` 원 문자열 → 0 이상의 정수. 숫자만(`/^\d+$/`) 받고 나머지('' · 공백 · 음수 · 소수)는 거부한다. */
@@ -536,6 +538,24 @@ export function registerIntakeCommands(program: Command, candidateDeps: IntakeCl
     });
 
   intakeCmd
+    .command('approve-channel-post <id>')
+    .description('보호 범주의 채널 게시 초안을 사람 승인한다 (외부 게시 커넥터는 호출하지 않는다)')
+    .requiredOption('--by <approver>', '승인자: MK | 대표')
+    .option('--json', '구조화 출력')
+    .action(async (id: string, opts: { by: string; json?: boolean }) => {
+      const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+      const approved = approveChannelPublish(candidateDeps.root ?? effectiveInstanceRoot(), id, opts.by);
+      if (!approved) {
+        console.error(`대기 중인 보호 초안을 찾지 못했거나 승인자(${opts.by})가 MK·대표가 아니다: ${id}`);
+        process.exitCode = 1;
+        return;
+      }
+      const result = { id, status: approved.status, approvedBy: approved.approvedBy, category: approved.category };
+      if (opts.json) await writeStdoutFully(JSON.stringify(result) + '\n');
+      else console.log(`${id} → ${approved.status} · 승인자 ${approved.approvedBy} · 외부 게시 미실행`);
+    });
+
+  intakeCmd
     .command('collect-telegram-saved')
     .description('텔레그램 «저장된 메시지»를 읽기만 해 흡수 원장에 넣는다 (커서 이후만 · 호스트 전용 · 개인 메모는 user-private)')
     .option('--max <n>', '한 번에 읽을 메시지 수 상한 (기본 300 — 쌓인 것은 판마다 따라잡는다)')
@@ -546,6 +566,7 @@ export function registerIntakeCommands(program: Command, candidateDeps: IntakeCl
         ...(candidateDeps.root ? { root: candidateDeps.root } : {}),
         ...(candidateDeps.connectSaved ? { connect: candidateDeps.connectSaved } : {}),
         ...(candidateDeps.write ? { write: candidateDeps.write } : {}),
+        ...(candidateDeps.error ? { error: candidateDeps.error } : {}),
       });
     });
 

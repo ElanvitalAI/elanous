@@ -693,6 +693,184 @@ describe('openrouter 선불 크레딧 행 (2026-09-23)', () => {
     expect(row.credits).toMatchObject({ status: 'ok', usedPercent: 2.3, balance: 58.64, prepaidBalance: 60 });
     expect(row.note).toBeUndefined();
   });
+
+  it.each([
+    ['limit Infinity', { limit: Number.POSITIVE_INFINITY, limit_remaining: 7.25 }],
+    ['limit_remaining NaN', { limit: 20, limit_remaining: Number.NaN }],
+  ])('CREDIT-READOUT: /key 비유한 %s 는 유한수 판정에 걸려 note 를 안 만든다', async (_kind, keyData) => {
+    const report = await collectUnifiedUsage({
+      ...noCodexGrok,
+      openRouterKey: () => 'k',
+      fetchOpenRouterImpl: (async (input: RequestInfo | URL) => String(input).endsWith('/api/v1/credits')
+        ? new Response(JSON.stringify({ data: { total_credits: 60, total_usage: 1.36 } }))
+        : new Response(JSON.stringify({ data: keyData }))) as typeof fetch,
+    });
+    const row = report.rows.find((x) => x.provider === 'openrouter')!;
+    expect(row.credits).toMatchObject({ status: 'ok', usedPercent: 2.3, balance: 58.64, prepaidBalance: 60 });
+    expect(row.note).toBeUndefined();
+  });
+
+  // CREDIT-READOUT 관측(logs 관측 무대) — note 가 «안» 붙은 이유를 usage/openrouter-key-unavailable 로 남긴다.
+  // 행·잔액·문면은 그대로고(보존 계약), 관측은 «/key 를 불렀는데 왜 한도가 없나» 를 가르는 판단 근거다.
+  const collectWithKeyReadoutSink = async (keyOutcome: () => Response | Promise<Response>) => {
+    const seen: unknown[] = [];
+    const off = debug.registerSink({
+      name: 'credit-readout-key-unavailable',
+      emit: (record) => {
+        if (record.category === 'usage' && record.event === 'openrouter-key-unavailable') seen.push(record.data);
+      },
+    });
+    try {
+      const report = await collectUnifiedUsage({
+        ...noCodexGrok,
+        openRouterKey: () => 'k',
+        fetchOpenRouterImpl: (async (input: RequestInfo | URL) => String(input).endsWith('/api/v1/credits')
+          ? new Response(JSON.stringify({ data: { total_credits: 60, total_usage: 1.36 } }))
+          : keyOutcome()) as unknown as typeof fetch,
+      });
+      return { report, seen };
+    } finally { off(); }
+  };
+
+  it('CREDIT-READOUT 관측: /key 404 → reason=http-error detail=http-404 · credits 행은 그대로', async () => {
+    const { report, seen } = await collectWithKeyReadoutSink(() => new Response('{}', { status: 404 }));
+    expect(seen).toEqual([expect.objectContaining({ reason: 'http-error', detail: 'http-404' })]);
+    const row = report.rows.find((x) => x.provider === 'openrouter')!;
+    expect(row.credits).toMatchObject({ status: 'ok', usedPercent: 2.3, balance: 58.64, prepaidBalance: 60 });
+    expect(row.note).toBeUndefined();
+  });
+
+  it('CREDIT-READOUT 관측: /key throw → reason=throw detail=메시지 · credits 행은 그대로', async () => {
+    const { report, seen } = await collectWithKeyReadoutSink(() => { throw new Error('/key unavailable'); });
+    expect(seen).toEqual([expect.objectContaining({ reason: 'throw', detail: '/key unavailable' })]);
+    const row = report.rows.find((x) => x.provider === 'openrouter')!;
+    expect(row.credits).toMatchObject({ status: 'ok', usedPercent: 2.3, balance: 58.64, prepaidBalance: 60 });
+    expect(row.note).toBeUndefined();
+  });
+
+  it('CREDIT-READOUT 관측: /key limit null → reason=limit-not-finite · 원 값이 detail 에 남는다', async () => {
+    const { report, seen } = await collectWithKeyReadoutSink(
+      () => new Response(JSON.stringify({ data: { limit: null, limit_remaining: 7.25 } })));
+    expect(seen).toEqual([expect.objectContaining({ reason: 'limit-not-finite', detail: 'limit=null limit_remaining=7.25' })]);
+    const row = report.rows.find((x) => x.provider === 'openrouter')!;
+    expect(row.credits).toMatchObject({ status: 'ok', usedPercent: 2.3, balance: 58.64, prepaidBalance: 60 });
+    expect(row.note).toBeUndefined();
+  });
+
+  it('CREDIT-READOUT 관측: /key 응답에 limit 필드 자체가 없으면 detail=absent 로 남는다', async () => {
+    const { seen } = await collectWithKeyReadoutSink(() => new Response(JSON.stringify({ data: {} })));
+    expect(seen).toEqual([expect.objectContaining({ reason: 'limit-not-finite', detail: 'limit=absent limit_remaining=absent' })]);
+  });
+
+  it('CREDIT-READOUT 관측: 유한 limit·limit_remaining 이면 note 가 붙고 unavailable 관측은 0건', async () => {
+    const { report, seen } = await collectWithKeyReadoutSink(
+      () => new Response(JSON.stringify({ data: { limit: 20, limit_remaining: 7.25 } })));
+    expect(seen).toEqual([]);
+    const row = report.rows.find((x) => x.provider === 'openrouter')!;
+    expect(row.note).toContain('키 한도 남은 금액 $7.25');
+  });
+});
+
+// CREDIT-READOUT 생산 배선 무대(fake-fetch · MS-05) — `elanous usage` CLI 진입점
+// (registerUsageCommand → 기본 collect = collectUnifiedUsage → collectOpenRouterRows)을
+// 그대로 지나며, OpenRouter /credits→/key 호출만 fake-fetch 로 갈아끼운다(실물 네트워크 無).
+describe('CREDIT-READOUT 생산 배선 — usage CLI 진입점 ⊕ fake-fetch 무대', () => {
+  const openRouterStage = (keyOutcome: () => Response | Promise<Response>) => {
+    const calls: string[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith('/api/v1/credits')) {
+        return new Response(JSON.stringify({ data: { total_credits: 60, total_usage: 1.36 } }));
+      }
+      return keyOutcome();
+    }) as typeof fetch;
+    const lines: string[] = [];
+    const program = new Command();
+    registerUsageCommand(program, {
+      // 생산 기본 collect 를 그대로 탄다 — 무대는 키·fetch seam 만 갈아끼운다.
+      collect: (deps = {}) => collectUnifiedUsage({
+        ...deps,
+        listCodexAccounts: () => [],
+        resolveGrokCredential: () => null,
+        zaiKey: () => undefined,
+        openRouterKey: () => 'k',
+        fetchOpenRouterImpl: fetchImpl,
+      }),
+      creditPlan: () => null,
+      out: { log: (s) => { lines.push(s); } },
+    });
+    return { calls, lines, program };
+  };
+
+  it('/credits 성공 뒤 /key 의 유한 limit·limit_remaining 이 note 로 사람 문면에 나온다 — 호출 순서 credits→key', async () => {
+    const { calls, lines, program } = openRouterStage(
+      () => new Response(JSON.stringify({ data: { limit: 20, limit_remaining: 7.25 } })));
+    await program.parseAsync(['usage'], { from: 'user' });
+    expect(calls).toEqual([
+      'https://openrouter.ai/api/v1/credits',
+      'https://openrouter.ai/api/v1/key',
+    ]);
+    const openrouterLine = lines.find((l) => l.includes('openrouter') && l.includes('default'))!;
+    expect(openrouterLine).toContain('2.3% ($58.64 left)');
+    expect(openrouterLine).toContain('— 키 한도 남은 금액 $7.25');
+  });
+
+  it('/key 404 는 무대에서도 격리된다 — 잔액 문면은 그대로 · note 는 없다', async () => {
+    const { calls, lines, program } = openRouterStage(() => new Response('{}', { status: 404 }));
+    await program.parseAsync(['usage'], { from: 'user' });
+    expect(calls).toEqual([
+      'https://openrouter.ai/api/v1/credits',
+      'https://openrouter.ai/api/v1/key',
+    ]);
+    const openrouterLine = lines.find((l) => l.includes('openrouter') && l.includes('default'))!;
+    expect(openrouterLine).toContain('2.3% ($58.64 left)');
+    expect(openrouterLine).not.toContain('키 한도');
+  });
+
+  const runUsageWithKeyReadoutSink = async (keyOutcome: () => Response | Promise<Response>) => {
+    const { calls, lines, program } = openRouterStage(keyOutcome);
+    const seen: unknown[] = [];
+    const off = debug.registerSink({
+      name: 'credit-readout-cli-key-unavailable',
+      emit: (record) => {
+        if (record.category === 'usage' && record.event === 'openrouter-key-unavailable') seen.push(record.data);
+      },
+    });
+    try {
+      await program.parseAsync(['usage'], { from: 'user' });
+    } finally { off(); }
+    return { calls, lines, seen };
+  };
+
+  it('/key 404 무대에서도 관측이 찍힌다 — usage CLI(생산 진입점) 경로를 그대로 지나고 행 문면은 그대로', async () => {
+    const { calls, lines, seen } = await runUsageWithKeyReadoutSink(() => new Response('{}', { status: 404 }));
+    expect(calls).toEqual([
+      'https://openrouter.ai/api/v1/credits',
+      'https://openrouter.ai/api/v1/key',
+    ]);
+    expect(seen).toEqual([expect.objectContaining({ reason: 'http-error', detail: 'http-404' })]);
+    const openrouterLine = lines.find((l) => l.includes('openrouter') && l.includes('default'))!;
+    expect(openrouterLine).toContain('2.3% ($58.64 left)');
+    expect(openrouterLine).not.toContain('키 한도');
+  });
+
+  it('/key limit null 무대에서는 reason=limit-not-finite 관측만 찍히고 note 문면은 없다', async () => {
+    const { lines, seen } = await runUsageWithKeyReadoutSink(
+      () => new Response(JSON.stringify({ data: { limit: null, limit_remaining: null } })));
+    expect(seen).toEqual([expect.objectContaining({ reason: 'limit-not-finite', detail: 'limit=null limit_remaining=null' })]);
+    const openrouterLine = lines.find((l) => l.includes('openrouter') && l.includes('default'))!;
+    expect(openrouterLine).toContain('2.3% ($58.64 left)');
+    expect(openrouterLine).not.toContain('키 한도');
+  });
+
+  it('/key 유한 한도 무대에서는 unavailable 관측이 0건 — note 문면만 나온다', async () => {
+    const { lines, seen } = await runUsageWithKeyReadoutSink(
+      () => new Response(JSON.stringify({ data: { limit: 20, limit_remaining: 7.25 } })));
+    expect(seen).toEqual([]);
+    const openrouterLine = lines.find((l) => l.includes('openrouter') && l.includes('default'))!;
+    expect(openrouterLine).toContain('— 키 한도 남은 금액 $7.25');
+  });
 });
 
 // CREDIT-READOUT 첫 조각 — 한 공급자의 예외가 usage «전체» 를 죽이지 않는다(Promise.allSettled ⊕ 그 공급자만 error 한 행).

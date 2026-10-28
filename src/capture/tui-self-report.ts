@@ -125,6 +125,8 @@ export interface TuiControlTargetDeps {
   dims?: () => { readonly cols: number; readonly rows: number } | undefined;
   /** 외부 주입 라우터 — 글 한 줄을 사용자 버퍼에 섞지 않고 별도 대기열로 돌린다(`input/external-input-queue`). */
   routeExternal?: (chars: string) => ExternalInputRoute;
+  /** Active TUI turn cancellation hook; absent means there is no force-stop capability. */
+  stopTurn?: () => boolean;
 }
 
 function stdoutDims(): { cols: number; rows: number } | undefined {
@@ -136,6 +138,16 @@ export interface TuiControlTarget extends PtyControlTarget {
   deactivate(): void;
 }
 
+let activeTuiForceStop: (() => boolean) | null = null;
+
+/** Dashboard turn owner hook used by the foreground TUI's control target. */
+export function registerTuiForceStopHandler(handler: () => boolean): () => void {
+  activeTuiForceStop = handler;
+  return () => {
+    if (activeTuiForceStop === handler) activeTuiForceStop = null;
+  };
+}
+
 /** Adapt the foreground TUI's own terminal to the existing PTY control
  * protocol without pretending it is a spawned child process. */
 export function createTuiControlTarget(surfaceId: string, deps: TuiControlTargetDeps = {}): TuiControlTarget {
@@ -143,6 +155,7 @@ export function createTuiControlTarget(surfaceId: string, deps: TuiControlTarget
   const parse = deps.splitKeys ?? splitKeys;
   const dims = deps.dims ?? stdoutDims;
   const routeExternal = deps.routeExternal ?? routeExternalInput;
+  const stopTurn = deps.stopTurn ?? (() => activeTuiForceStop?.() ?? false);
   let alive = true;
   let accessMode: PtyAccessMode = 'write';
   let transitionPolicy: PtyTransitionPolicy = 'open';
@@ -160,6 +173,7 @@ export function createTuiControlTarget(surfaceId: string, deps: TuiControlTarget
       return true;
     },
     isAlive: () => alive,
+    stopTurn: (force: true) => force && stopTurn(),
     canWrite: (actor: PtyWriteActor = 'human') => resolveWriteDecision(accessMode, actor).allow,
     write(chars: string): void {
       // ⭐ 이 write 는 «바깥»(제어 IPC)에서만 온다 — 키보드와 섞이기 전에 라우터가 먼저 가른다.

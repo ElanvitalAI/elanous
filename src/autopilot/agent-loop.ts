@@ -50,7 +50,7 @@ export type AutopilotTermination =
   | { kind: 'budget'; budget: 'iterations' | 'wallClock' | 'outputChars'; observed: number; limit: number }
   | { kind: 'cancelled' }
   | { kind: 'risky'; pattern: RiskyPattern; iteration: number }
-  | { kind: 'error'; message: string };
+  | { kind: 'error'; message: string; code?: string };
 
 /** Decision returned by the optional risky-tool-call policy hook. */
 export type RiskyPolicyDecision = 'allow' | 'deny';

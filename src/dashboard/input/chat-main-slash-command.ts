@@ -17,6 +17,13 @@ export function resolveDashboardChatMainSlashCommand(
     args = command === undefined ? ['new'] : ['new', command];
   }
 
+  // `/harness ask` is prose, not a whitespace-delimited command. Keep its raw
+  // tail intact so pasted path labels stay on the first line for ask preflight.
+  if (cmdLower === 'harness' && args[0]?.toLowerCase() === 'ask') {
+    const rawAsk = /^\S+\s+ask(?:\s+([\s\S]*))?$/i.exec(commandText.slice(1))?.[1];
+    args = rawAsk === undefined ? ['ask'] : ['ask', rawAsk];
+  }
+
   // Top-level alias: `/resume <id>` → `/session load <id>`.
   // Reuses the existing /session subcommand handler so the resume
   // flow stays in one place. A bare `/resume` is NOT rewritten: it must reach

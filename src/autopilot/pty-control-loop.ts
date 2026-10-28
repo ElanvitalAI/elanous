@@ -97,9 +97,11 @@ export interface RunSupervisor {
 }
 
 /** brain의 완료 선언을 현재 관측으로 검증하는 ground-truth 게이트 결과. */
+export const VERIFY_DONE_STOP = 'VERIFY_DONE_STOP' as const;
+
 export type VerifyDoneResult =
   | { readonly ok: true }
-  | { readonly ok: false; readonly retry: string };
+  | { readonly ok: false; readonly retry: string; readonly stop?: typeof VERIFY_DONE_STOP };
 
 export interface PtyControlDeps {
   /** 현재 화면 텍스트(예: handle.renderScreen). */
@@ -612,6 +614,11 @@ export async function runPtyControlLoop(
         debug.log('autopilot.control', 'verify-done', { ok: verification.ok });
         if (verification.ok) {
           return finish({ kind: 'success', reason: decision.reason }, step);
+        }
+        if (verification.stop === VERIFY_DONE_STOP) {
+          const message = `verification failed and retry is disabled: ${verification.retry}`;
+          debug.log('autopilot.control', 'verify-stop', { step, reason: message });
+          return finish({ kind: 'error', code: VERIFY_DONE_STOP, message }, step);
         }
         if (!deps.inject(verification.retry)) {
           debug.log('autopilot.control', 'yield', { step, reason: 'arbiter denied verify retry inject — 사람 takeover' });

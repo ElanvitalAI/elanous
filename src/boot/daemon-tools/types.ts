@@ -59,6 +59,8 @@ export interface DaemonToolDispatchCtx {
    *  the args. Optional for backward compat with tests / surfaces that
    *  build the ctx by hand without a session in scope. */
   sessionId?: string;
+  /** Caller-minted SelfImplement identity, propagated by managed dispatch. */
+  runId?: string;
   /** Trusted server-side classification of the current turn, never supplied as a tool argument. */
   requestOrigin?: RequestOrigin;
   /** Owner principal verified at the server request boundary, not from input source metadata. */

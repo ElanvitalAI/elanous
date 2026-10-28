@@ -28,6 +28,7 @@ const card = (id: string): ReferenceCard => ({
   titles: [],
   commands: [],
   truncated: false,
+  orchestrationId: `grounding:local-repo:${id}`,
 });
 
 describe('proactiveReferences', () => {

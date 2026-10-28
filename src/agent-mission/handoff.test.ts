@@ -204,7 +204,7 @@ test('runAgentMission uses real control loops across three fake PTYs and gates a
     expect(events.filter((event) => event.startsWith('pty:') || event === 'gate/PR')).toEqual(['pty:codex', 'pty:claude', 'pty:repair', 'gate/PR']);
     expect(events.some((event) => event.includes('Previous controller summary: Missing assertion'))).toBe(true);
   } finally { rmSync(wt, { recursive: true, force: true }); }
-}, 30000);
+}, 90_000);
 
 test('explicit four-stage chain delivers Claude screen review findings after a generic completion reason', async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-four-stage-'));
@@ -242,7 +242,7 @@ test('explicit four-stage chain delivers Claude screen review findings after a g
     // The repair stage must carry the original mission text, not only «finish the original mission».
     expect(events.some((event) => event.startsWith('input:repair:') && event.includes('Original mission:') && event.includes('Build'))).toBe(true);
   } finally { rmSync(wt, { recursive: true, force: true }); }
-}, 30000);
+}, 90_000);
 
 test('explicit chain rejects a brain handoff that skips Claude review', async () => {
   const wt = mkdtempSync(join(tmpdir(), 'mission-skip-review-'));

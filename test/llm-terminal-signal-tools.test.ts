@@ -7,6 +7,12 @@
 // 반증: 같은 대본을 terminalToolNames 없이 돌리면 종전 결함(빈 턴 → [NO FINAL SYNTHESIS] · 거부 스텁)이 그대로 난다.
 
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runCoreTurn } from '../src/core-turn/run-core-turn.js';
+import { runGoalLoop } from '../src/core-turn/run-goal-loop.js';
+import { testFakeLlmProvider, TEST_FAKE_LLM_CAPTURE_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV } from '../src/ux-sim/fake-llm.js';
 import { streamLLMWithTools } from '../src/llm';
 import type { LLMMessage, LLMProvider, LLMStreamEvent } from '../src/llm';
 
@@ -67,6 +73,50 @@ async function run(turns: LLMStreamEvent[][], terminal: boolean, maxTurns = 10, 
   );
   return { result, calls: callsSeen(), dispatched, newMessages, shown };
 }
+
+test('fake-llm production path: goal completion ends the CoreTurn provider loop', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'goal-complete-fake-llm-'));
+  const capture = join(dir, 'provider-requests.jsonl');
+  const env = [TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV, TEST_FAKE_LLM_CAPTURE_ENV,
+    'ELANOUS_TEST_FAKE_LLM_RESPONSE', 'ELANOUS_TEST_FAKE_LLM_AS_PROVIDER'] as const;
+  const prior = env.map((key) => process.env[key]);
+  try {
+    process.env[TEST_FAKE_LLM_ENV] = '1';
+    process.env.ELANOUS_TEST_FAKE_LLM_RESPONSE = ANSWER;
+    process.env.ELANOUS_TEST_FAKE_LLM_AS_PROVIDER = '1';
+    process.env[TEST_FAKE_LLM_CAPTURE_ENV] = capture;
+    process.env[TEST_FAKE_LLM_TOOL_CALL_ENV] = JSON.stringify({
+      when: 'finish fixture', name: 'update_goal',
+      args: { status: 'complete', evidence: 'fixture checked' },
+    });
+    const result = await runGoalLoop({
+      sessionId: `goal-complete-fixture-${Date.now()}`,
+      messages: [{ role: 'user', content: 'finish fixture' }],
+      tools: [], dispatchTool: async () => { throw new Error('update_goal must be handled by goal loop'); },
+      signal: new AbortController().signal,
+      initialProvider: testFakeLlmProvider,
+    }, { maxIterations: 2, runTurn: runCoreTurn, changedFiles: () => [] });
+    const requests = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(result.stopReason).toBe('goal_complete');
+    expect(result.goalComplete).toBe(true);
+    expect(result.iterations).toBe(1);
+    expect(result.finalText).toBe(ANSWER);
+    // The first request emits update_goal; its acknowledged tool result is
+    // visible in the second request, whose answer becomes finalText. No third
+    // provider call is needed after completion is accepted.
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[0]?.messages)).not.toContain('tool_result');
+    expect(JSON.stringify(requests[1]?.messages)).toContain('tool_result');
+    expect(JSON.stringify(requests[1]?.messages)).toContain('update_goal');
+  } finally {
+    for (let index = 0; index < env.length; index++) {
+      const value = prior[index];
+      if (value === undefined) delete process.env[env[index]];
+      else process.env[env[index]] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 describe('streamLLMWithTools — terminal signal tools (TUI-GOAL-LOOP-FRICTION)', () => {
   test('answer ⊕ update_goal in one turn ends the stream — no extra model turn, no [NO FINAL SYNTHESIS]', async () => {
@@ -150,11 +200,132 @@ describe('streamLLMWithTools — terminal signal tools (TUI-GOAL-LOOP-FRICTION)'
     ];
     const r = await run(script, true);
     expect(r.result).toBe(ANSWER);
-    expect(toolResults(r.newMessages, 'X').at(-1)).toContain('TOOL CALL REJECTED');
+    const x9Use = r.newMessages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+      .find((block) => block.type === 'tool_use' && block.id === 'x9');
+    const x9Result = r.newMessages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+      .find((block) => block.type === 'tool_result' && block.tool_use_id === 'x9');
+    expect(x9Use).toBeDefined();
+    expect(x9Result).toBeDefined();
+    expect(x9Result?.type === 'tool_result' ? x9Result.content : '').toContain('TOOL CALL REJECTED');
     const ack = toolResults(r.newMessages, 'update_goal');
     expect(ack).toHaveLength(1);
     expect(ack[0]).not.toContain('TOOL CALL REJECTED');
     expect(ack[0]).toContain('terminalSignal');
+  });
+
+  test('same-round failed tool result and accepted completion acknowledgment are both preserved', async () => {
+    const { provider, callsSeen } = scriptedProvider([
+      [
+        { type: 'text', delta: ANSWER },
+        { type: 'tool_call', id: 'x1', name: 'X', args: {} },
+        { type: 'tool_call', id: 'g1', name: 'update_goal', args: COMPLETE },
+      ],
+      [{ type: 'text', delta: '도구 실패를 확인하고 최종 답변을 이어갑니다.' }],
+    ]);
+    let messages: LLMMessage[] = [];
+    const result = await streamLLMWithTools([{ role: 'user', content: 'finish' }], {
+      onText: () => {},
+      dispatchTool: async (name) => name === 'X' ? { ok: false, error: 'denied' } : { ok: true },
+      onTurnComplete: (value) => { messages = value; },
+    }, {
+      provider, tools: TOOLS, terminalToolNames: ['update_goal'],
+      terminalCompletionAccepted: (name, args) => name === 'update_goal'
+        && args.status === 'complete' && typeof args.evidence === 'string',
+    });
+    // A dispatched tool error is fail-closed; the accepted completion cannot
+    // mask it or trigger another provider turn.
+    expect(callsSeen()).toBe(1);
+    expect(result).not.toContain('최종 답변');
+    expect(result).toBe(ANSWER);
+    expect(toolResults(messages, 'X')).toHaveLength(1);
+    expect(toolResults(messages, 'X')[0]).toContain('denied');
+    expect(toolResults(messages, 'update_goal')).toEqual(['{"ok":true}']);
+  });
+
+  test('accepted completion after a visible prior answer still streams new text', async () => {
+    const { provider, callsSeen } = scriptedProvider([[
+      { type: 'tool_call', id: 'g1', name: 'update_goal', args: COMPLETE },
+      { type: 'text', delta: 'Additional verified detail.' },
+    ]]);
+    const shown: Array<{ delta: string; full: string }> = [];
+    let messages: LLMMessage[] = [];
+    const result = await streamLLMWithTools([{ role: 'user', content: 'finish' }], {
+      onText: (delta, full) => shown.push({ delta, full }),
+      dispatchTool: async () => ({ ok: true }),
+      onTurnComplete: (value) => { messages = value; },
+    }, {
+      provider, tools: TOOLS, maxTurns: 10, terminalToolNames: ['update_goal'],
+      terminalPriorAnswerVisible: true,
+      terminalCompletionAccepted: (name, args) => name === 'update_goal'
+        && args.status === 'complete' && typeof args.evidence === 'string' && args.evidence.trim().length > 0,
+    });
+    expect(callsSeen()).toBe(1);
+    expect(result).toBe('Additional verified detail.');
+    expect(shown.some(({ delta }) => delta === 'Additional verified detail.')).toBe(true);
+    expect(toolResults(messages, 'update_goal')).toHaveLength(1);
+  });
+
+  test('accepted completion after a visible prior answer stops without re-emitting that answer', async () => {
+    const { provider, callsSeen } = scriptedProvider([
+      [{ type: 'tool_call', id: 'g1', name: 'update_goal', args: COMPLETE }],
+      [{ type: 'text', delta: 'unexpected extra answer' }],
+    ]);
+    const shown: Array<{ delta: string; full: string }> = [];
+    let messages: LLMMessage[] = [];
+    const priorMessages: LLMMessage[] = [
+      { role: 'user', content: 'finish' },
+      { role: 'assistant', content: [{ type: 'text', text: ANSWER }] },
+    ];
+    const result = await streamLLMWithTools(priorMessages, {
+      onText: (delta, full) => shown.push({ delta, full }),
+      dispatchTool: async () => ({ ok: true }),
+      onTurnComplete: (value) => { messages = value; },
+    }, {
+      provider, tools: TOOLS, maxTurns: 10,
+      terminalToolNames: ['update_goal'],
+      terminalPriorAnswerVisible: true,
+      terminalCompletionAccepted: (name, args) => name === 'update_goal'
+        && args.status === 'complete' && typeof args.evidence === 'string' && args.evidence.trim().length > 0,
+    });
+    expect(callsSeen()).toBe(1);
+    expect(result).toBe('');
+    expect(shown).toEqual([]);
+    expect(toolResults(messages, 'update_goal')).toHaveLength(1);
+    expect(messages.at(-1)?.role).toBe('user');
+    // The visible answer is caller-owned history and must remain there exactly
+    // once; the tool-result-only completion must not invent a second answer.
+    // Prior assistant answer is still represented exactly once across the
+    // caller-owned input history and the newly completed tool-result history.
+    const combinedHistory = [...priorMessages, ...messages];
+    expect(combinedHistory.filter((message) => message.role === 'assistant'
+      && Array.isArray(message.content)
+      && message.content.some((block) => block.type === 'text' && block.text === ANSWER))).toHaveLength(1);
+    expect(messages.filter((message) => message.role === 'assistant'
+      && Array.isArray(message.content)
+      && message.content.some((block) => block.type === 'text' && block.text === ANSWER))).toHaveLength(0);
+  });
+
+  test('accepted completion-only call without a visible answer requests a final answer and preserves tool results', async () => {
+    const { provider, callsSeen } = scriptedProvider([
+      [{ type: 'tool_call', id: 'g1', name: 'update_goal', args: COMPLETE }],
+      [{ type: 'text', delta: ANSWER }],
+    ]);
+    let messages: LLMMessage[] = [];
+    const result = await streamLLMWithTools([{ role: 'user', content: 'finish' }], {
+      onText: () => {},
+      dispatchTool: async () => ({ ok: true }),
+      onTurnComplete: (value) => { messages = value; },
+    }, {
+      provider, tools: TOOLS, maxTurns: 10,
+      terminalToolNames: ['update_goal'],
+      terminalCompletionAccepted: (name, args) => name === 'update_goal'
+        && args.status === 'complete' && typeof args.evidence === 'string' && args.evidence.trim().length > 0,
+    });
+    expect(callsSeen()).toBe(2);
+    expect(result).toBe(ANSWER);
+    expect(toolResults(messages, 'update_goal')).toHaveLength(1);
+    expect(messages.at(-1)?.role).toBe('assistant');
+    expect(messages.at(-1)?.content).toEqual([{ type: 'text', text: ANSWER }]);
   });
 
   test('signal-only turn without text opens the next turn so the model can write the answer', async () => {
@@ -166,6 +337,22 @@ describe('streamLLMWithTools — terminal signal tools (TUI-GOAL-LOOP-FRICTION)'
     const r = await run(script, true);
     expect(r.calls).toBe(3);
     expect(r.result).toBe(ANSWER);
+  });
+
+  test('evidence-less completion keeps the answer turn instead of short-circuiting', async () => {
+    const { provider, callsSeen } = scriptedProvider([
+      [{ type: 'tool_call', id: 'g1', name: 'update_goal', args: { status: 'complete', evidence: '   ' } }],
+      [{ type: 'text', delta: ANSWER }],
+    ]);
+    const result = await streamLLMWithTools([{ role: 'user', content: 'finish' }], {
+      onText: () => {}, dispatchTool: async () => ({ ok: true }),
+    }, {
+      provider, tools: TOOLS, maxTurns: 10, terminalToolNames: ['update_goal'],
+      terminalCompletionAccepted: (_name, args) => args.status === 'complete'
+        && typeof args.evidence === 'string' && args.evidence.trim().length > 0,
+    });
+    expect(callsSeen()).toBe(2);
+    expect(result).toBe(ANSWER);
   });
 
   test('empty turns after the signal end with the answer already written — no retries, no internal notice', async () => {

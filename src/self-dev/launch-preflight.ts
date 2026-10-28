@@ -1112,14 +1112,31 @@ export function decideAskPreflight(
   const inspectionRoot = goalDocument === null || !hasAuthoredGoal
     ? undefined
     : opts.declaredPathsRoot?.trim() || process.cwd();
-  const authoredTracedPaths = goalDocument === null
-    ? []
-    : inspectableAuthoredTracedPaths(deps.tracedPaths(goalDocument), inspectionRoot);
+  // ⛔ 골 «판독»(읽기) 실패와 골 «해석» 실패는 고칠 곳이 다르다 — 파서가 던진 예외를 사유 코드로 바꿔
+  //   원장에 «어느 검사가» 막았는지 남긴다(AUT-PREFLIGHT-REASON-OPAQUE: 두 갈래가 한 문장으로 뭉개졌다).
+  let goalParseFailure: { readonly checkName: string; readonly message: string } | undefined;
+  const authoredTracedPaths = (() => {
+    if (goalDocument === null) return [];
+    try {
+      return inspectableAuthoredTracedPaths(deps.tracedPaths(goalDocument), inspectionRoot);
+    } catch (error) {
+      goalParseFailure = { checkName: 'goal-parse', message: oneLineConfidenceFailureDetail(error) };
+      return [];
+    }
+  })();
   const tracedPathsRaw = opts.pathsOverride ?? authoredTracedPaths;
   const tracedPaths = inspectionRoot && !opts.pathsOverride
     ? tracedPathsRaw.filter((path) => tracedPathExists(path, inspectionRoot) || isFileShapedTracedPath(path))
     : tracedPathsRaw;
-  const declaredNewPaths = goalDocument === null ? new Set<string>() : new Set(declaredNewFilePaths(goalDocument));
+  const declaredNewPaths = (() => {
+    if (goalDocument === null) return new Set<string>();
+    try {
+      return new Set(declaredNewFilePaths(goalDocument));
+    } catch (error) {
+      goalParseFailure ??= { checkName: 'goal-new-paths', message: oneLineConfidenceFailureDetail(error) };
+      return new Set<string>();
+    }
+  })();
   const invalidTracedPaths: Array<{ path: string; reason: 'occupied-new' | 'not-file' | 'missing' | 'inaccessible' }> = inspectionRoot
     ? authoredTracedPaths.flatMap<{ path: string; reason: 'occupied-new' | 'not-file' | 'missing' | 'inaccessible' }>((path) => {
       const occupation = tracedPathOccupation(path, inspectionRoot);
@@ -1315,7 +1332,8 @@ export function decideAskPreflight(
     ...(recentChangesUnknownReason ? { recentChangesUnknownReason } : {}),
   });
   const missingTracedPathBlockers: LaunchPreflightBlocker[] = [
-    ...(hasAuthoredGoal && authoredTracedPaths.length === 0 ? [{
+    // ⛔ 해석 실패를 「traced path 0」으로 한 번 더 뭉개지 않는다 — 그건 다른 갈래다.
+    ...(hasAuthoredGoal && authoredTracedPaths.length === 0 && goalParseFailure === undefined ? [{
       kind: 'missing-traced-path' as const,
       name: '최종 골의 TRACED PATHS 경로 0',
       detail: '정리 후 보존된 traced 경로가 없다 — 실제 파일 또는 유효한 신설: 파일 경로를 골에 선언해야 발사할 수 있다',
@@ -1347,16 +1365,29 @@ export function decideAskPreflight(
     checkName: 'goal-read',
     targetPath: resolvedGoalFile,
   }] : [];
+  const goalParseBlockers: LaunchPreflightBlocker[] = goalParseFailure ? [{
+    kind: 'goal-unreadable',
+    name: `골 문서 해석 실패: ${opts.goalFile}`,
+    detail: `${goalParseFailure.checkName} 검사가 골 문서를 해석하지 못했다(${goalParseFailure.message}) — 골 판독 실패(goal-unreadable)도 traced path 오류(missing-traced-path)도 아닌 별개 갈래다 · 어느 검사가 막았는지는 checkName 이 가른다 — 골의 TRACED PATHS · 신설: 문면을 바로잡아야 한다`,
+    reasonCode: 'goal-parse' as const,
+    checkName: goalParseFailure.checkName,
+    targetPath: resolvedGoalFile,
+  }] : [];
   const decisionResult = {
     ...result,
-    blockers: [...result.blockers, ...missingTracedPathBlockers, ...goalReadBlockers],
+    // ⛔ 해석 실패를 「대상 경로 0」 문면으로 덮지 않는다 — 사유 코드가 이미 그 자리를 말한다.
+    blockers: [
+      ...result.blockers.filter((blocker) => goalParseFailure === undefined || blocker.kind !== 'no-target-paths'),
+      ...missingTracedPathBlockers, ...goalParseBlockers, ...goalReadBlockers,
+    ],
     warnings: [...result.warnings, ...askMarkerWarnings],
     runningRunsConfidenceAppendix: runningRunsConfidence.appendix,
   };
   emittedAskMarkerObservations.add(decisionResult);
   return {
     result: decisionResult,
-    shouldLaunch: missingTracedPathBlockers.length === 0 && goalReadBlockers.length === 0 && (result.blockers.length === 0 || force),
+    shouldLaunch: missingTracedPathBlockers.length === 0 && goalParseBlockers.length === 0 && goalReadBlockers.length === 0
+      && (result.blockers.length === 0 || force),
     plannedBranchResolution,
   };
 }

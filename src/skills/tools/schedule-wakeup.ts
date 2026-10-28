@@ -449,8 +449,30 @@ export function createDashboardWakeupScheduler(
   gate: Pick<InternalTurnGate, 'startTurnIfIdle' | 'isInternalTurnActive' | 'lastTurnId'>,
   deps: Omit<WakeupSchedulerDeps, 'startTurnIfIdle' | 'isTurnActive'> = {},
 ): WakeupScheduler {
+  // The N03 real-TUI scenario must cover a scheduled wake while a turn is busy,
+  // then the one-minute retry after it settles. Keep the logical clock exact,
+  // but let that isolated fake-LLM fixture advance timer deadlines quickly.
+  // Both opt-ins are required; ordinary TUI sessions always use wall-clock time.
+  const acceleratedTestClock = process.env.ELANOUS_TEST_FAKE_LLM === '1'
+    && process.env.ELANOUS_TEST_FAST_WAKEUP_CLOCK === '1';
+  let testNow = Date.now();
+  let testTimerCount = 0;
+  const schedulerDeps: Omit<WakeupSchedulerDeps, 'startTurnIfIdle' | 'isTurnActive'> = acceleratedTestClock
+    ? {
+      ...deps,
+      now: () => testNow,
+      setTimer: (callback, logicalDelayMs) => {
+        const realDelayMs = testTimerCount++ === 0 ? 3_000 : 8_000;
+        return setTimeout(() => {
+          testNow += logicalDelayMs;
+          callback();
+        }, realDelayMs);
+      },
+      clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+    }
+    : deps;
   return createWakeupScheduler({
-    ...deps,
+    ...schedulerDeps,
     startTurnIfIdle: (text, opts) => gate.startTurnIfIdle(text, opts),
     isTurnActive: (turnId) => gate.isInternalTurnActive() && gate.lastTurnId() === turnId,
     // 한 턴 호출 상한의 턴 경계 = H2 가 아는 마지막 턴 id(사람 제출마다 human-N · 내부 턴마다 auto-N).

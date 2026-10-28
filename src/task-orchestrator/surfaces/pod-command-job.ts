@@ -17,7 +17,7 @@ import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.j
 import { podBunCacheVolume } from './pod-bun-cache.js';
 import { POD_JOB_TTL_AFTER_FINISHED_SECONDS } from './pod-lease.js';
 import { podHostDirsCheckScript, podInstallSlotsVolume, prepareHostDirsOnce, type HostDirsPrepResult, podHostDirsScript } from './pod-install-slots.js';
-import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, registryImageRef, type PoolKubectl } from './pod-pool.js';
+import { type PodPoolMember, PodPoolScheduler, defaultRemoteRun, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, registryImageRef, type PoolKubectl } from './pod-pool.js';
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 import { podProvenanceMetadata, type PodProvenance } from './pod-provenance.js';
@@ -106,6 +106,287 @@ export function memoryRequestWithin(limit: string | undefined): string {
   const request = gi(POD_COMMAND_MEMORY_REQUEST_DEFAULT);
   const max = gi(limit);
   return request !== null && max !== null && request > max ? limit! : POD_COMMAND_MEMORY_REQUEST_DEFAULT;
+}
+
+// ═══════════ POD-CPU-REQUEST-RIGHTSIZE-2-FU ═══════════
+// CPU 요청량(기본 request 1)을 바꾸려면 «gate16+harness40 이 같은 호스트에서 함께 도는» 측정값이 있어야 한다.
+// 그 측정을 내는 발사는 두 관문을 지난다 — ①발사 선행 조건(풀 슬롯·SSH·Pod admission·allocatable/request 기준선)을
+// 먼저 읽어 기록하고 하나라도 불가하면 발사 0 · 사유 · HITL(local substrate 대체 없음) ②측정이 없는 같은 조건의
+// 재발사 금지(run-477b2ee2·run-7bc13989 는 CPU 측정 전에 no-launch(pod-error)로 끝났다). 측정이 모자라면 yellow —
+// 기본 요청량 그대로다.
+
+/** POD-CPU-REQUEST-RIGHTSIZE-2-FU — 이 요청량을 정당화하는 공존 조건(게이트 조각 16 ⊕ 하니스 40 동시 실행). */
+export const POD_RIGHTSIZE_CONDITION = 'gate16+harness40';
+/** 측정 사용량 위에 남기는 여유 — 조정 요청량은 100m 단위로 올린다. */
+export const POD_RIGHTSIZE_HEADROOM = 1.25;
+/** 스케줄 대기가 이보다 길면 그 요청은 그 호스트에 «너무 크다» — 조정 사유에 원문을 남긴다. */
+export const POD_RIGHTSIZE_WAIT_LIMIT_MS = 120_000;
+
+/** 한 발사의 결과 기록 — `no-launch` 는 CPU 측정 «전에» 끝난 발사다(pod-error). */
+export interface PodRightsizeLaunchRecord {
+  run: string;
+  condition: string;
+  outcome: 'no-launch' | 'launched';
+  reason?: string;
+  /** 그 발사가 CPU 사용량을 쟀나 — no-launch 면 false. */
+  cpuMeasured?: boolean;
+}
+
+/** run-477b2ee2·run-7bc13989 — CPU 측정 전에 no-launch(pod-error)로 끝나 gate16+harness40 공존 증거가 0 인 두 발사. */
+export const POD_RIGHTSIZE_VOID_LAUNCHES: readonly PodRightsizeLaunchRecord[] = [
+  { run: 'run-477b2ee2', condition: POD_RIGHTSIZE_CONDITION, outcome: 'no-launch', reason: 'pod-error', cpuMeasured: false },
+  { run: 'run-7bc13989', condition: POD_RIGHTSIZE_CONDITION, outcome: 'no-launch', reason: 'pod-error', cpuMeasured: false },
+];
+
+/** 동일 호스트 동시 실행 한 표본 — 요청량·사용량·스케줄 대기·eviction 원문을 그대로 든다. */
+export interface PodCpuSample {
+  /** 이 표본을 낸 실행(게이트 조각 16 · 하니스 40). */
+  label: string;
+  /** 매니페스트에 실려 실제로 발사된 CPU 요청(millis). */
+  requestMillis: number;
+  /** 실행 중 측정된 CPU 사용량(millis) — 못 쟀으면 null. */
+  usageMillis: number | null;
+  /** 스케줄 대기(ms) — 못 쟀으면 null. */
+  waitMs: number | null;
+  /** eviction 원문(있으면 그대로 · 없으면 null/빈 문자열). */
+  eviction?: string | null;
+}
+
+/** `runPodCommand` 에 붙는 재측정 요청 — 어떤 조건의 표본인지, 앞선 발사 기록, 이번 발사의 호스트 이름. */
+export interface PodCpuRightsizeRequest {
+  /** 공존 조건 이름 — 기본 {@link POD_RIGHTSIZE_CONDITION}. */
+  condition?: string;
+  /** 같은 호스트 동시 실행 표본. 비었거나 사용량을 못 쟀으면 yellow(기본 요청량 유지). */
+  samples?: readonly PodCpuSample[];
+  /** 앞선 발사 기록 — 기본 {@link POD_RIGHTSIZE_VOID_LAUNCHES}(측정 전 no-launch 두 건). */
+  priorLaunches?: readonly PodRightsizeLaunchRecord[];
+  /** 기록·사유에 남길 대상 호스트(없으면 임차한 멤버의 ssh 호스트). */
+  host?: string;
+}
+
+/**
+ * CLI(`elanous pod run --cpu-rightsize`)가 받는 JSON → 재측정 요청. `{ condition?, samples?, priorLaunches?, host? }` 만 받고
+ * 모르는 키·잘못된 수량은 사유와 함께 거부한다(발사 전에 막는다). 비었으면 undefined = 종전 발사.
+ */
+export function parseCpuRightsizeRequest(value: unknown, label = 'cpuRightsize'): PodCpuRightsizeRequest | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be { condition?, samples?, priorLaunches?, host? }`);
+  const raw = value as Record<string, unknown>;
+  const unknownKeys = Object.keys(raw).filter((key) => !['condition', 'samples', 'priorLaunches', 'host'].includes(key));
+  if (unknownKeys.length) throw new Error(`${label} has unknown keys: ${unknownKeys.join(', ')}`);
+  const text = (v: unknown, key: string): string | undefined => {
+    if (v === undefined || v === null || v === '') return undefined;
+    if (typeof v !== 'string') throw new Error(`${label}.${key} must be a string`);
+    return v.trim() || undefined;
+  };
+  const millis = (v: unknown, key: string, allowZero = false): number | null => {
+    if (v === undefined || v === null) return null;
+    if (typeof v !== 'number' || !Number.isSafeInteger(v) || (allowZero ? v < 0 : v <= 0)) {
+      throw new Error(`${label}.${key} must be ${allowZero ? 'non-negative' : 'positive'} whole millicores`);
+    }
+    return v;
+  };
+  const sampleList = raw.samples === undefined || raw.samples === null ? [] : raw.samples;
+  if (!Array.isArray(sampleList)) throw new Error(`${label}.samples must be an array`);
+  const samples = sampleList.map((entry, i) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`${label}.samples[${i}] must be an object`);
+    const row = entry as Record<string, unknown>;
+    const name = text(row.label, `samples[${i}].label`);
+    if (!name) throw new Error(`${label}.samples[${i}].label is required`);
+    const requestMillis = millis(row.requestMillis, `samples[${i}].requestMillis`);
+    if (requestMillis === null) throw new Error(`${label}.samples[${i}].requestMillis is required`);
+    return {
+      label: name, requestMillis,
+      usageMillis: millis(row.usageMillis, `samples[${i}].usageMillis`),
+      waitMs: millis(row.waitMs, `samples[${i}].waitMs`, true),
+      eviction: text(row.eviction, `samples[${i}].eviction`) ?? null,
+    };
+  });
+  const launchList = raw.priorLaunches === undefined || raw.priorLaunches === null ? [] : raw.priorLaunches;
+  if (!Array.isArray(launchList)) throw new Error(`${label}.priorLaunches must be an array`);
+  const priorLaunches = launchList.map((entry, i) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`${label}.priorLaunches[${i}] must be an object`);
+    const row = entry as Record<string, unknown>;
+    const run = text(row.run, `priorLaunches[${i}].run`);
+    if (!run) throw new Error(`${label}.priorLaunches[${i}].run is required`);
+    const rawOutcome = row.outcome;
+    if (rawOutcome !== 'no-launch' && rawOutcome !== 'launched') throw new Error(`${label}.priorLaunches[${i}].outcome must be no-launch or launched`);
+    const outcome: 'no-launch' | 'launched' = rawOutcome === 'launched' ? 'launched' : 'no-launch';
+    const condition = text(row.condition, `priorLaunches[${i}].condition`) ?? POD_RIGHTSIZE_CONDITION;
+    const reason = text(row.reason, `priorLaunches[${i}].reason`);
+    return { run, condition, outcome, ...(reason ? { reason } : {}) };
+  });
+  const condition = text(raw.condition, 'condition');
+  const host = text(raw.host, 'host');
+  return {
+    ...(condition ? { condition } : {}),
+    samples,
+    ...(priorLaunches.length ? { priorLaunches } : {}),
+    ...(host ? { host } : {}),
+  };
+}
+
+/** millis → 쿠버네티스 수량(`2000` → `2` · `2800` → `2800m`). */
+export function podCpuQuantity(millis: number): string {
+  if (!Number.isSafeInteger(millis) || millis <= 0) throw new Error(`pod cpu quantity needs positive millicores: ${millis}`);
+  return millis % 1000 === 0 ? String(millis / 1000) : `${millis}m`;
+}
+
+export interface PodCpuRightsizeVerdict {
+  /** green = 측정값이 요청량을 정한다 · yellow = 재측정 불가(기본 요청량 유지). */
+  status: 'green' | 'yellow';
+  /** 이번 발사에 실을 요청량(yellow 면 기본값). */
+  request: string;
+  requestMillis: number;
+  reason: string;
+  /** 판정에 쓴 표본(사용량을 잰 것만). */
+  measured: Array<{ label: string; requestMillis: number; usageMillis: number; waitMs: number | null; eviction: string | null }>;
+}
+
+/**
+ * 측정값 → 요청량. 표본이 하나도 없거나, 사용량을 못 쟀거나, eviction 원문이 있으면 yellow 로 기본 요청량을 지킨다
+ * (재측정 불가 = 결함 없음이 아니다). 그 밖에는 표본들의 최대 사용량 ⊕ 여유(POD_RIGHTSIZE_HEADROOM)를 100m 로
+ * 올린 값이 요청량이고, 한도(POD_COMMAND_CPU_LIMIT_DEFAULT)를 넘지 않는다.
+ */
+export function podCpuRightsize(samples: readonly PodCpuSample[]): PodCpuRightsizeVerdict {
+  const yellow = (reason: string): PodCpuRightsizeVerdict => ({
+    status: 'yellow', request: POD_COMMAND_CPU_REQUEST_DEFAULT,
+    requestMillis: podCpuMillis(POD_COMMAND_CPU_REQUEST_DEFAULT)!, reason, measured: [],
+  });
+  if (samples.length === 0) return yellow('no same-host co-residency samples');
+  const evicted = samples.find((s) => (s.eviction ?? '').trim().length > 0);
+  if (evicted) return yellow(`eviction on ${evicted.label}: ${evicted.eviction!.trim().replace(/\s+/g, ' ').slice(0, 200)}`);
+  const unmeasured = samples.find((s) => s.usageMillis === null);
+  if (unmeasured) return yellow(`usage unmeasured on ${unmeasured.label}`);
+  const measured = samples.map((s) => ({
+    label: s.label, requestMillis: s.requestMillis, usageMillis: s.usageMillis!, waitMs: s.waitMs, eviction: null,
+  }));
+  const peak = Math.max(...measured.map((s) => s.usageMillis));
+  const limitMillis = podCpuMillis(POD_COMMAND_CPU_LIMIT_DEFAULT)!;
+  const sized = Math.min(Math.ceil((peak * POD_RIGHTSIZE_HEADROOM) / 100) * 100, limitMillis);
+  const waits = measured.map((s) => s.waitMs).filter((ms): ms is number => ms !== null);
+  const slow = waits.filter((ms) => ms > POD_RIGHTSIZE_WAIT_LIMIT_MS);
+  const waitNote = waits.length === 0
+    ? 'wait unreadable'
+    : `waited ${Math.max(...waits)}ms${slow.length ? ` (over ${POD_RIGHTSIZE_WAIT_LIMIT_MS}ms on ${slow.length})` : ''}`;
+  return {
+    status: 'green', request: podCpuQuantity(sized), requestMillis: sized,
+    reason: `peak usage ${peak}m over ${measured.length} samples · ${waitNote} · no eviction → request ${podCpuQuantity(sized)}`,
+    measured,
+  };
+}
+
+/**
+ * 같은 조건의 «무효 재발사» 금지 — 그 조건의 발사가 CPU 측정 전에 no-launch(pod-error)로 끝났고 아직 사용량을 잰
+ * 표본이 없으면, 같은 조건을 다시 쏘는 것은 같은 무효를 한 번 더 사는 일이다.
+ */
+export function podRightsizeRefusal(o: {
+  condition: string;
+  samples: readonly PodCpuSample[];
+  priorLaunches?: readonly PodRightsizeLaunchRecord[];
+}): { refused: boolean; reason: string; priorVoid: PodRightsizeLaunchRecord[] } {
+  // Only a no-launch that measured nothing is a void — a launch that died after a reading is not «no evidence».
+  const priorVoid = (o.priorLaunches ?? POD_RIGHTSIZE_VOID_LAUNCHES)
+    .filter((r) => r.condition === o.condition && r.outcome === 'no-launch' && r.cpuMeasured !== true);
+  if (priorVoid.length === 0) return { refused: false, reason: 'no no-launch record for this condition', priorVoid };
+  if (o.samples.some((s) => s.usageMillis !== null)) return { refused: false, reason: 'a measured sample exists', priorVoid };
+  const seen = priorVoid.map((r) => `${r.run}:${r.reason ?? r.outcome}`).join('·');
+  return {
+    refused: true,
+    reason: `same condition ${o.condition} re-launch refused — ${seen} ended before any CPU measurement`,
+    priorVoid,
+  };
+}
+
+/** 발사 선행 조건 기록 — 풀 슬롯 · SSH · Pod admission · allocatable/request 기준선. 하나라도 ok=false 면 발사하지 않는다. */
+export interface PodLaunchPreconditions {
+  slots: { ok: boolean; ready: number; capacity: number; detail?: string };
+  ssh: { ok: boolean; host: string | null; detail?: string };
+  admission: { ok: boolean; detail?: string };
+  baseline: {
+    ok: boolean; node: string | null;
+    allocatableCpuMillis: number | null; requestedCpuMillis: number | null;
+    requestCpuMillis: number | null; freeCpuMillis: number | null;
+    detail?: string;
+  };
+}
+
+export interface PodLaunchPreconditionsDeps {
+  kubectl: Kubectl;
+  namespace: string;
+  member?: PodPoolMember | null;
+  /** 발사할 풀의 자리 — 풀이 없으면 null(단일 컨텍스트 하나). */
+  pool?: { ready: number; capacity: number } | null;
+  /** 이번 발사가 요청할 CPU(millis) — 기준선 여유와 비교한다. */
+  requestCpuMillis: number;
+  /** 원격 멤버 SSH 도달 시험. null/생략 = 못 잼(원격이면 불가로 센다). */
+  sshProbe?: ((host: string) => { status: number | null; stdout: string; stderr: string }) | null;
+}
+
+/** 대상 호스트의 선행 조건을 실제 클러스터에서 읽어 기록한다 — 판정하지 않고 «읽은 그대로» 남긴다. */
+export function podLaunchPreconditions(o: PodLaunchPreconditionsDeps): PodLaunchPreconditions {
+  const slots: PodLaunchPreconditions['slots'] = o.pool
+    ? { ok: o.pool.ready > 0, ready: o.pool.ready, capacity: o.pool.capacity, ...(o.pool.ready > 0 ? {} : { detail: 'no ready pool member' }) }
+    : { ok: true, ready: 1, capacity: 1, detail: 'single context (no pool)' };
+
+  const host = o.member?.sshHost ?? null;
+  let ssh: PodLaunchPreconditions['ssh'];
+  if (!host) ssh = { ok: true, host: null, detail: 'this machine (no ssh)' };
+  else if (!o.sshProbe) ssh = { ok: false, host, detail: 'ssh probe unavailable' };
+  else {
+    const probed = o.sshProbe(host);
+    ssh = probed.status === 0
+      ? { ok: true, host }
+      : { ok: false, host, detail: (probed.stderr.trim().split('\n').pop() ?? '').slice(0, 200) || `ssh exit ${probed.status}` };
+  }
+
+  const cani = o.kubectl(['-n', o.namespace, 'auth', 'can-i', 'create', 'jobs.batch']);
+  const admission: PodLaunchPreconditions['admission'] = cani.status === 0 && /^yes$/i.test(cani.stdout.trim())
+    ? { ok: true, detail: 'can-i create jobs.batch' }
+    : { ok: false, detail: (cani.stderr.trim().split('\n').pop() ?? '').slice(0, 200) || `can-i ${cani.stdout.trim() || `exit ${cani.status}`}` };
+
+  const nodes = o.kubectl(['get', 'nodes', '-o', 'json']);
+  const pods = o.kubectl(['get', 'pods', '--all-namespaces', '-o', 'json']);
+  let allocatable: Array<{ name: string; cpu: number }> = [];
+  let perNode: Record<string, number> = {};
+  let baselineError: string | null = null;
+  try {
+    const parsed = JSON.parse(nodes.stdout) as { items?: Array<{ metadata?: { name?: string }; status?: { allocatable?: { cpu?: string } } }> };
+    allocatable = (parsed.items ?? []).flatMap((item) => {
+      const name = item.metadata?.name;
+      const cpu = podCpuMillis(item.status?.allocatable?.cpu ?? '');
+      return name && cpu !== null ? [{ name, cpu }] : [];
+    });
+  } catch { baselineError = `node list unreadable: ${(nodes.stderr.trim() || 'invalid json').slice(0, 200)}`; }
+  if (!baselineError) {
+    try {
+      const parsed = JSON.parse(pods.stdout) as { items?: Array<{ spec?: { nodeName?: string; containers?: Array<{ resources?: { requests?: { cpu?: string } } }> } }> };
+      for (const pod of parsed.items ?? []) {
+        const node = pod.spec?.nodeName;
+        if (!node) continue;
+        for (const container of pod.spec?.containers ?? []) {
+          perNode[node] = (perNode[node] ?? 0) + (podCpuMillis(container.resources?.requests?.cpu ?? '') ?? 0);
+        }
+      }
+    } catch { baselineError = `pod list unreadable: ${(pods.stderr.trim() || 'invalid json').slice(0, 200)}`; }
+  }
+  const ranked = [...allocatable]
+    .map((node) => ({ ...node, requested: perNode[node.name] ?? 0 }))
+    .sort((a, b) => (b.cpu - b.requested) - (a.cpu - a.requested) || a.name.localeCompare(b.name));
+  const chosen = baselineError ? undefined : ranked[0];
+  const baseline: PodLaunchPreconditions['baseline'] = !chosen
+    ? {
+      ok: false, node: null, allocatableCpuMillis: null, requestedCpuMillis: null,
+      requestCpuMillis: o.requestCpuMillis, freeCpuMillis: null,
+      detail: baselineError ?? (nodes.status !== 0 ? `node list exit ${nodes.status}` : 'no node reports an allocatable cpu'),
+    }
+    : {
+      ok: chosen.cpu - chosen.requested >= o.requestCpuMillis,
+      node: chosen.name, allocatableCpuMillis: chosen.cpu, requestedCpuMillis: chosen.requested,
+      requestCpuMillis: o.requestCpuMillis, freeCpuMillis: chosen.cpu - chosen.requested,
+      ...(chosen.cpu - chosen.requested >= o.requestCpuMillis ? {} : { detail: `free ${chosen.cpu - chosen.requested}m < request ${o.requestCpuMillis}m` }),
+    };
+  return { slots, ssh, admission, baseline };
 }
 
 /** POD7 must-fix: the skill list alone can't tell a network-only job from one that needs ffmpeg/browser — so lite is
@@ -429,6 +710,11 @@ export interface RunPodCommandOptions {
   memoryLimit?: string;
   /** GATE-SPEED A3①: CPU request/limit override — only the release gate passes it. Omitted = request 1 / limit 4. */
   cpu?: PodCpu;
+  /**
+   * POD-CPU-REQUEST-RIGHTSIZE-2-FU — this launch is a co-residency CPU measurement (게이트 조각 16 ⊕ 하니스 40 on one host).
+   * Omitted callers keep today's behaviour byte for byte: no precondition read, no measurement-driven request.
+   */
+  cpuRightsize?: PodCpuRightsizeRequest;
   /** W5 — memory-backed TMPDIR sizeLimit mounted at {@link POD_TMPFS_MOUNT_PATH}; only the release gate passes it. Omitted = image `/tmp`. */
   tmpfsSizeLimit?: string;
   /** POD7: 호출부가 «네트워크 스킬만 쓰는 명령»이라고 말할 때만 lite 이미지 ⊕ 2Gi. */
@@ -465,6 +751,8 @@ export interface RunPodCommandOptions {
   mirrorSeedCwd?: string;
   /** GATE-WARM-BOOT-NO-INIT — hands the hostPath dirs to uid 1000 on the member's nodes (test seam · default {@link prepareHostDirsOnce}). */
   prepareHostDirs?: (o: { member: PodPoolMember; hostPaths: readonly string[] }) => Promise<HostDirsPrepResult | undefined>;
+  /** POD-CPU-REQUEST-RIGHTSIZE-2-FU — SSH 도달 시험(test seam · 기본 `ssh <host> true`; 주입된 kubectl 이면 기본 없음). */
+  sshProbe?: (host: string) => { status: number | null; stdout: string; stderr: string };
   checkPool?: typeof checkPodPool;
   syncImages?: typeof syncPoolImages;
   imageCommit?: string | null;
@@ -641,9 +929,48 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const artifactRoot = options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`;
   const artifactsDir = `${artifactRoot}/${name}`;
   let jobApplied = false;
+  /** POD-CPU-REQUEST-RIGHTSIZE-2-FU — 측정값이 정한 요청량(yellow 면 undefined = 기본값 그대로). */
+  let rightsizeCpu: PodCpu | undefined;
   try {
     ensureLive();
     if (!context && !options.kubectl) throw new Error('pod command: kubectl context 를 확인할 수 없다');
+    if (options.cpuRightsize) {
+      const condition = options.cpuRightsize.condition?.trim() || POD_RIGHTSIZE_CONDITION;
+      const samples = [...(options.cpuRightsize.samples ?? [])];
+      const priorLaunches = [...(options.cpuRightsize.priorLaunches ?? POD_RIGHTSIZE_VOID_LAUNCHES)];
+      const targetHost = options.cpuRightsize.host?.trim() || member?.sshHost || null;
+      // A no-launch(pod-error) run never produced a reading — firing the same condition again would buy the same void.
+      const refusal = podRightsizeRefusal({ condition, samples, priorLaunches });
+      if (refusal.refused) {
+        log('pod.command-job', 'rightsize-relaunch-refused', {
+          condition, host: targetHost, reason: refusal.reason, substrate: 'pod', launched: false, fallback: 'none',
+          hitl: true, priorVoid: refusal.priorVoid,
+        });
+        throw new Error(`pod command: ${refusal.reason}`);
+      }
+      const requestCpuMillis = podCpuMillis(resolvePodCpu(options.cpu).request)!;
+      const members = (pool as { members?: readonly PodPoolMember[] } | undefined)?.members;
+      const preconditions = podLaunchPreconditions({
+        kubectl, namespace, member,
+        pool: members ? { ready: members.filter((m) => m.capacity > 0).length, capacity: members.reduce((sum, m) => sum + Math.max(0, m.capacity), 0) } : null,
+        requestCpuMillis,
+        sshProbe: options.sshProbe ?? (options.kubectl ? null : (host) => defaultRemoteRun(host, 'true')),
+      });
+      log('pod.command-job', 'rightsize-preconditions', { condition, host: targetHost, job: name, context, preconditions });
+      const blocked = (['slots', 'ssh', 'admission', 'baseline'] as const).filter((key) => !preconditions[key].ok);
+      if (blocked.length) {
+        log('pod.command-job', 'rightsize-launch-refused', {
+          condition, host: targetHost, job: name, context, blocked, preconditions,
+          substrate: 'pod', launched: false, fallback: 'none', hitl: true,
+        });
+        throw new Error(`pod command: 발사 선행 조건 미충족(${blocked.join(', ')}) — 발사 0 · HITL`);
+      }
+      const verdict = podCpuRightsize(samples);
+      log('pod.command-job', 'cpu-rightsize', {
+        condition, host: targetHost, job: name, status: verdict.status, request: verdict.request, reason: verdict.reason, samples: verdict.measured,
+      });
+      if (verdict.status === 'green') rightsizeCpu = { request: verdict.request };
+    }
     let grokAuth: string | undefined;
     if (llm === 'grok') {
       // POD-GROK-VALIDITY-FIT — this Job's deadline is not fitted to the token, so the copy must outlive the whole Job.
@@ -750,12 +1077,13 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       const applied = kubectl(['apply', '-f', '-'], JSON.stringify(secret));
       if (applied.status !== 0) throw new Error(applied.stderr.trim() || 'pod command: Secret 적용 실패');
     }
+    const effectiveCpu = options.cpu ?? rightsizeCpu;
     const manifest = podCommandJobManifest({
       name, namespace, launch, image: imageRef ?? image,
       provenance: options.provenance, provenanceGate: options.provenanceGate,
       ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(options.returnLogs ? { returnLogs: true } : {}), ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
-      ...(options.source ? { source: options.source } : {}), ...(options.warmProducer ? { warmFiles: options.warmProducer.files } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(options.cpu ? { cpu: options.cpu } : {}), ...(options.tmpfsSizeLimit ? { tmpfsSizeLimit: options.tmpfsSizeLimit } : {}), deadlineSeconds,
+      ...(options.source ? { source: options.source } : {}), ...(options.warmProducer ? { warmFiles: options.warmProducer.files } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(effectiveCpu ? { cpu: effectiveCpu } : {}), ...(options.tmpfsSizeLimit ? { tmpfsSizeLimit: options.tmpfsSizeLimit } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
       ...(hostDirsInit ? { hostDirsInit: true } : {}),
     });

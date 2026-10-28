@@ -9,6 +9,7 @@ export { SUPERVISOR_STOP_REASONS } from './run-types.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
+import { selectKnowhowPack } from '../self-implement/knowhow-pack.js';
 import { routeSupervisorVerdict } from './supervisor-verdict-edges.js';
 import type { TaskAgentShadowInput } from '../task-agent/shadow.js';
 import { cardPrNumber, taskAgentStatePath } from '../task-agent/task-hand.js';
@@ -101,6 +102,10 @@ export interface SupervisorDecision {
   action: 'relaunch' | 'add-repair-task' | 'stop';
   stopReason?: SupervisorStopReason;
   why: string;
+  /** Repository lessons pulled at this decision, never appended to a child's goal. */
+  knowhowPackSliceIds?: string[];
+  /** Bounded reference for the supervisor handoff. It is evidence, not an executable child instruction. */
+  knowhowPackReference?: string;
   round: number;
   rerunnable: string[];
   reworkable: string[];
@@ -1027,6 +1032,8 @@ export function patternMineSignaturesFromDecision(decision: SupervisorDecision):
 
 export interface SuperviseRunOptions {
   initial: readonly SupervisorJobResult[];
+  /** Stable repository source for decision-time knowhow; falls back to a result worktree if omitted. */
+  knowhowRepo?: string;
   rerun: (previous: readonly SupervisorJobResult[], invocation: { relaunch: true; repairGoals?: Record<string, string> }) => Promise<readonly SupervisorJobResult[]>;
   limits?: SupervisorLimits;
   enrich?: (results: readonly SupervisorJobResult[]) => readonly SupervisorJobResult[];
@@ -1146,6 +1153,18 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
         ...(allUnreviewedAreNoDiff ? { reviewReason: 'no-diff' } : {}),
       } : {}),
     });
+
+    // The supervisor consumes knowhow when it judges a failed piece. Keep the child prompt untouched.
+    const failedPiece = results.find((result) => result.status === 'failed' && result.feature.trim());
+    if (failedPiece) {
+      const repo = opts.knowhowRepo ?? failedPiece.worktreePath;
+      if (repo) {
+        const pulled = selectKnowhowPack(repo, failedPiece.feature);
+        try { opts.observe?.('knowhow-pack-decision', { taskId: failedPiece.taskId, ids: pulled.ids, reason: pulled.reason, action: decision.action }); } catch { /* fail-soft */ }
+        if (pulled.ids.length) decision = { ...decision, knowhowPackSliceIds: pulled.ids, knowhowPackReference: pulled.text,
+          why: `${decision.why} · 판단 참고 노하우 ${pulled.ids.join(',')}` };
+      }
+    }
 
     const runId = opts.runStore?.runId ?? results.find((result) => result.runId?.trim())?.runId ?? null;
 

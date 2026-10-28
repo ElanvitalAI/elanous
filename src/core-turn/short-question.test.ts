@@ -30,3 +30,14 @@ describe('TUI-H1-ROUTE-WRITEVERB-FP · «도구 쓰지 말고 답해: … 첫 �
     expect(classifyTuiChatIntent('도구 쓰지 말고 답해: 파일의 첫 줄을 그대로 옮기고').route).toBe('읽기·분석');
   });
 });
+
+describe('TUI-FINAL-ANSWER-COMPLETION · 숫자 상태 조회는 자리에서도 한 턴 답변', () => {
+  test.each([
+    '현재 상태 값은 3이야?',
+    'S5 상태 값이 3 맞아?',
+    '상태 값 3인지 확인해줘',
+  ])('seat lookup «%s» does not open a goal loop or request UpdateGoal', (question) => {
+    const verdict = classifyTuiChatIntent(question, { seat: true });
+    expect(verdict).toMatchObject({ route: '조회', goalLoop: false });
+  });
+});

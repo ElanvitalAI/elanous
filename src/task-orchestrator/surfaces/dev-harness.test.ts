@@ -1,6 +1,6 @@
 import { test, expect, describe, spyOn } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
@@ -40,8 +40,13 @@ async function assertDefaultSpawnBin(cwd: string, expectedBin: string, expectedB
     process.chdir(cwd);
     const { done } = defaultDevHarnessSpawn()({ objective: 'verify bin root', spaceId: 'test-space' });
     await done;
-    expect(readFileSync(capturePath, 'utf8').trim().split('\n')).toEqual([realpathSync(cwd), expectedBin]);
-    expect(launches).toEqual([{ bin: expectedBin, binSource: expectedBinSource }]);
+    const [spawnCwd, entry] = readFileSync(capturePath, 'utf8').trim().split('\n');
+    const canonicalBin = realpathSync(expectedBin);
+    expect([realpathSync(spawnCwd), realpathSync(entry)]).toEqual([realpathSync(cwd), canonicalBin]);
+    expect(launches.map(({ bin, binSource }) => ({
+      bin: typeof bin === 'string' ? realpathSync(bin) : bin,
+      binSource,
+    }))).toEqual([{ bin: canonicalBin, binSource: expectedBinSource }]);
   } finally {
     process.chdir(originalCwd);
     if (originalPath === undefined) delete process.env.PATH;
@@ -125,7 +130,14 @@ describe('dev-harness surface adapter (병렬 실행 라인)', () => {
 
   test('production spawn keeps this elanous repository bin', async () => {
     const elanousRoot = resolve(import.meta.dir, '../../..');
-    await assertDefaultSpawnBin(elanousRoot, join(elanousRoot, 'bin', 'elanous.mjs'), 'cwd-repository');
+    const aliasParent = mkdtempSync(join(tmpdir(), 'dev-harness-repo-alias-'));
+    const aliasRoot = join(aliasParent, 'repo');
+    try {
+      symlinkSync(elanousRoot, aliasRoot, 'dir');
+      await assertDefaultSpawnBin(aliasRoot, join(aliasRoot, 'bin', 'elanous.mjs'), 'cwd-repository');
+    } finally {
+      rmSync(aliasParent, { recursive: true, force: true });
+    }
   });
 
   test('잘못된 kind → throw', async () => {

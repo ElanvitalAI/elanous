@@ -57,3 +57,25 @@ test('an impossible owner start time cannot make a live claim look stale', () =>
   writeFileSync(file, JSON.stringify(claim));
   release();
 });
+
+test('a claim publishes when it was reserved, and pre-existing claims stay readable', () => {
+  const state = root();
+  const before = Date.now();
+  const release = reserveReleaseGateHosts(state, 'run-gate-5', ['node-b']);
+  const reserved = inspectReleaseGateHost(state, 'node-b');
+  expect(reserved.status).toBe('reserved');
+  if (reserved.status === 'free') throw new Error('unreachable');
+  expect(reserved.reservedAt).toBeGreaterThanOrEqual(before);
+  expect(reserved.reservedAt).toBeLessThanOrEqual(Date.now());
+  const dir = join(state, 'release', 'gate-host-reservations');
+  const file = join(dir, readdirSync(dir).find(name => name.endsWith('.json'))!);
+  const claim = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+  const { reservedAt: _dropped, ...legacy } = claim;
+  writeFileSync(file, JSON.stringify(legacy));
+  expect(inspectReleaseGateHost(state, 'node-b')).toMatchObject({ status: 'reserved', runId: 'run-gate-5' });
+  expect((inspectReleaseGateHost(state, 'node-b') as { reservedAt?: number }).reservedAt).toBeUndefined();
+  writeFileSync(file, JSON.stringify({ ...claim, reservedAt: Date.now() + 60_000 }));
+  expect(inspectReleaseGateHost(state, 'node-b').status).toBe('unknown');
+  writeFileSync(file, JSON.stringify(claim));
+  release();
+});

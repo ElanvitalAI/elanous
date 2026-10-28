@@ -451,6 +451,7 @@ export async function runSelfOrchestrateCliCommand(
       await recordRoundPrs(results);
       results = await superviseRun({
         initial: results,
+        knowhowRepo: deps.repositoryRoot ?? process.cwd(),
         // The add-repair-task branch below runs each authored review-oscillation repair goal as that goal's new
         // feature (a fresh piece, same goal id) — the supervisor records the repair text, so a second oscillation stops.
         repairGoalExecution: true,

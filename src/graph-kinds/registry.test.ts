@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { HARNESS_CORE_KINDS, WORKFLOW_CORE_KINDS, hasNodeKind, listNodeKinds, registerCoreKinds, registerNodeKind } from './registry.js';
+import { NODE_CATALOG, getNodeSpec, renderCatalogList, searchNodes } from '../workflow-runtime/node-catalog.js';
 import { WORKFLOW_NODE_VARIANT_KEYS } from '../workflow-runtime/schema.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 
@@ -73,6 +74,22 @@ test('MCP run accepts gateway names and rejects empty, invalid, or mixed executo
     expect(registerNodeKind(entry(kind, { mcp: spec }))).toEqual({ ok: false, reason: 'bad-name' });
   }
   expect(registerNodeKind(entry('mixed', { ...valid, bash: 'echo x' }))).toEqual({ ok: false, reason: 'bad-name' });
+});
+
+test('GRAPH-UNIFY-KINDS: node catalog is a view over the registry 24-kind vocabulary (showroom · subworkflow)', () => {
+  expect(NODE_CATALOG).toHaveLength(24);
+  expect([...new Set(NODE_CATALOG.map((spec) => spec.kind))].sort()).toEqual([...WORKFLOW_CORE_KINDS].sort());
+  expect(new Set(NODE_CATALOG.map((spec) => spec.kind)).size).toBe(24);
+  expect(getNodeSpec('showroom')).toBeDefined();
+  expect(getNodeSpec('subworkflow')).toBeDefined();
+  expect(searchNodes('showroom')[0]?.spec.kind).toBe('showroom');
+  expect(renderCatalogList()).toContain('showroom');
+  expect(renderCatalogList()).toContain('subworkflow');
+  for (const spec of NODE_CATALOG) {
+    expect(spec.category).toBeDefined();
+    expect(spec.summary.length).toBeGreaterThan(0);
+    expect(spec.yamlKey.length).toBeGreaterThan(0);
+  }
 });
 
 test('workflow kind keeps its run body; harness and core kinds cannot carry one', () => {

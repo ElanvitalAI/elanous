@@ -1422,6 +1422,8 @@ describe('selfImplementRuntime — 자연어 dispatch 출처', () => {
 
   test('CLI/daemon 어댑터는 기존 골 문서 전달과 자연어 출처를 보존한다', async () => {
     let received: import('./orchestrator.js').SelfImplementOptions | undefined;
+    const goalFile = join(goalDirectory, 'cli-goal.md');
+    writeFileSync(goalFile, '- GoalId: 0123456789abcdef\n- GoalType: implement\n');
     await dispatchSelfImplement(
       { feature: 'CLI authoring regression' },
       { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus', userText: 'CLI authoring regression' } as never,
@@ -1429,12 +1431,29 @@ describe('selfImplementRuntime — 자연어 dispatch 출처', () => {
         received = options;
         return { runId: 'run-cli', ok: true, stage: 'pr-declined', node: 'open-pr', outcome: 'completed' };
       },
-      async () => ({ path: '/goals/cli.md' }),
+      async () => ({ path: goalFile }),
     );
     expect(received).toEqual(expect.objectContaining({
-      goalFile: '/goals/cli.md',
+      goalFile,
       naturalLanguageDispatch: true,
     }));
+  });
+
+  test('goal author가 파일을 남기지 않으면 이유를 돌려주고 runner를 발사하지 않는다', async () => {
+    let runnerCalls = 0;
+    const missingGoalFile = join(goalDirectory, 'missing-goal.md');
+    const result = await dispatchSelfImplement(
+      { feature: 'missing authored goal file' },
+      { cwd: goalDirectory, signal: new AbortController().signal, entry: 'elanous-apparatus', userText: 'missing authored goal file' } as never,
+      async () => {
+        runnerCalls += 1;
+        return { runId: 'run-missing-goal', ok: true, stage: 'pr-declined', node: 'open-pr', outcome: 'completed' };
+      },
+      async () => ({ path: missingGoalFile }),
+    );
+    expect(result.kind).toBe('failed');
+    expect(result.reason).toContain('goal file missing');
+    expect(runnerCalls).toBe(0);
   });
 
   test('TUI/dashboard 자연어 런을 natural-language-dispatch로 기록한다', async () => {

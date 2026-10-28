@@ -79,9 +79,13 @@ describe('self gate --artifact-dir (R2 입력 재료)', () => {
       dir, head40: HEAD, base40: BASE, envKey: ENV, testFiles: ['src/a.test.ts'], verdict: 'passed',
       verdictLine: '[gate-baseline] introduced=0, load-timeout=1', exitCode: 0,
       timeoutRechecks: [{ name: 'src/a.test.ts > slow', file: 'src/a.test.ts', originalDiagnostic: '^ this test timed out after 10000ms', result: 'pass', elapsedMs: 2300, rawResultLine: 'Ran 1 test across 1 file.' }],
+      interferenceRechecks: [{ name: 'src/extra.test.ts > shared state', file: 'src/extra.test.ts', head: 'pass', base: 'pass', classification: 'interference' }],
     });
     expect(JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8')).timeoutRechecks).toEqual([
       { name: 'src/a.test.ts > slow', file: 'src/a.test.ts', originalDiagnostic: '^ this test timed out after 10000ms', result: 'pass', elapsedMs: 2300, rawResultLine: 'Ran 1 test across 1 file.' },
+    ]);
+    expect(JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8')).interferenceRechecks).toEqual([
+      { name: 'src/extra.test.ts > shared state', file: 'src/extra.test.ts', head: 'pass', base: 'pass', classification: 'interference' },
     ]);
   });
 

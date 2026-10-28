@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
 import { getPty, listPty, renamePty, requestPtyTakeover, startPty, type StartOpts } from '../pty-shell/registry.js';
-import { describePtyRunState, describeTurnCell, formatTurnCell, ptyTurnViewOfRow, readCheckoutHead, readCurrentInstallRecord, shortSha, UNKNOWN_TURN_CELL, type InstalledRecord, type PtyRunStateView, type PtyTurnCell } from '../pty-shell/tui-run-state.js';
+import { describePtyRunState, describeTurnCell, formatTurnCell, judgeTurnProgress, ptyTurnViewOfRow, readCheckoutHead, readCurrentInstallRecord, shortSha, UNKNOWN_TURN_CELL, type InstalledRecord, type PtyRunStateView, type PtyTurnCell, type TurnProgressJudgment } from '../pty-shell/tui-run-state.js';
 import { getPtyManifest, isProcessAlive, listPtyManifest, listPtyManifestRows, listPtyManifestRowsAt, ptyManifestDbPath, readPtyManifestFrame, reapDeadPtyManifest, reapDeadPtyManifestAt, reapStalePtyManifest, removePtyManifest, PTY_MANIFEST_CLOSED_TTL_MS, PTY_MANIFEST_STALE_MS, type PtyManifestExternalReapResult, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { readPtyEventsAfter, readPtyEventsAfterAt, type PtyEventLogReadResult, type PtyEventRow } from '../pty-shell/pty-event-log.js';
 import { resolvePtyRef, type PtyRefItem } from '../pty-shell/pty-ref.js';
@@ -13,7 +13,7 @@ import { parsePtyWriteActor, resolveRemoteControlActor, resolveTakeover, type Pt
 import { registerPtyAttachDriveCommand } from './pty-drive-cli.js';
 import { resolveNexusPwa, type NexusPwaResolution } from './nexus-show.js';
 import { formatPtyWebAddress, ptyWebAddress, type PtyWebAddress } from './pty-web-address.js';
-import { getHarnessRunId, normalizeRunIdSource, type RunIdSource } from '../harness/harness-space.js';
+import { ensureRunId, getHarnessRunId, normalizeRunIdSource, type RunIdSource } from '../harness/harness-space.js';
 import { inspectControlInbox, type ControlInboxSnapshot } from '../harness/control-inbox.js';
 import { requestRemotePtyControl, type PtyControlAction, type PtyControlPayload, type PtyControlRequestOptions, type PtyControlResult } from '../pty-shell/pty-control-ipc.js';
 import { resolvePtySpecialKey, type PtyKeyEncoding } from '../pty-shell/pty-special-keys.js';
@@ -1467,6 +1467,10 @@ interface PtyListJsonRow extends PtyWebAddress {
   readonly ageMs?: number;
   /** ⭐ H10 — TUI 가 스스로 적은 턴(화면 추정 아님) ⊕ 그 상태 경과 초. 턴 기록 없는 행·원격 행은 `state:'unknown'`. */
   readonly turn: PtyTurnCell;
+  /** ⭐ SURVIVAL-PROGRESS-CLOCK — 마지막 진전 시각(epoch ms). 기록 없는 행·옛 판은 칸을 비운다. */
+  readonly progressAt?: number;
+  /** ⭐ SURVIVAL-PROGRESS-CLOCK — 진전 판정(progressing·slow·stalled·abort-ignored·unknown). */
+  readonly progress: TurnProgressJudgment;
   /** ⭐ H10 — 기동 판(실행판 sha) ⊕ 낡음. 판 기록 없는 행·판독 실패는 null. */
   readonly build: { readonly version: string; readonly sha: string; readonly source: string; readonly stale: boolean | null; readonly staleReason: string } | null;
 }
@@ -1534,10 +1538,15 @@ function ptyListJsonRow(row: PtyManifestRow, instance: string, sourceRoot: PtyMa
 
 /** `pty list --json` 의 턴·판 칸 — ⛔ 키는 «언제나» 싣는다(값으로만 갈린다 · 모르면 unknown/null).
  *  ⭐ 턴은 행의 자기보고 값만 읽는다 — 판 판독(설치본·git)이 실패해도 기록된 턴은 버리지 않는다. */
-function ptyListRunFields(row: PtyManifestRow, deps: PtyTakeoverCommandDeps, observedAt: number, installed: () => InstalledRecord): Pick<PtyListJsonRow, 'turn' | 'build'> {
+function ptyListRunFields(row: PtyManifestRow, deps: PtyTakeoverCommandDeps, observedAt: number, installed: () => InstalledRecord): Pick<PtyListJsonRow, 'turn' | 'progressAt' | 'progress' | 'build'> {
   const turn = describeTurnCell(ptyTurnViewOfRow(row), observedAt);
+  // SURVIVAL-PROGRESS-CLOCK — 진전 판정을 같은 관측 시각으로 잡고 전환을 관측한다.
+  const progress = judgeTurnProgress({
+    turn: turn.state, turnAt: turn.at ?? undefined, progressAt: row.progressAt, abortRequestedAt: row.abortRequestedAt, now: observedAt,
+  });
+  noteTurnProgressSurvival(row.id, progress, { turnAt: turn.at ?? undefined, progressAt: row.progressAt, now: observedAt });
   try {
-    if (!row.build) return { turn, build: null };
+    if (!row.build) return { turn, ...(row.progressAt !== undefined ? { progressAt: row.progressAt } : {}), progress, build: null };
     // 판독 예외 계약: 판 sha 는 기록값이라 그대로 두고 낡음만 «모른다»(stale=null · unknown) ⊕ `list-build-read-failed` 관측.
     //   그 밖의 뜻밖 예외는 판을 null 로(아래 catch) — 어느 쪽이든 기록된 턴은 버리지 않는다.
     const run = describePtyRunState(row, {
@@ -1549,10 +1558,11 @@ function ptyListRunFields(row: PtyManifestRow, deps: PtyTakeoverCommandDeps, obs
         }
       },
     });
-    return { turn, build: run.build ? { version: run.build.version, sha: run.build.sha, source: run.build.source, stale: run.stale, staleReason: run.staleReason } : null };
+    const progressFields = { ...(row.progressAt !== undefined ? { progressAt: row.progressAt } : {}), progress };
+    return { turn, ...progressFields, build: run.build ? { version: run.build.version, sha: run.build.sha, source: run.build.source, stale: run.stale, staleReason: run.staleReason } : null };
   } catch (error) {
     deps.log('list-build-read-failed', { ptyId: row.id, source: 'describe', error: error instanceof Error ? error.message : String(error) });
-    return { turn, build: null };
+    return { turn, ...(row.progressAt !== undefined ? { progressAt: row.progressAt } : {}), progress, build: null };
   }
 }
 
@@ -1848,8 +1858,9 @@ function remotePtyListJsonRow(row: RemoteTerminalListItem): PtyListJsonRow {
     runTerminationSource: 'unknown',
     runStoreIo: 'not-checked',
     ownerRunUsage: 'unknown',
-    // 원격 응답은 턴·판을 안 싣는다 — «모른다»로(로컬과 같은 키).
+    // 원격 응답은 턴·판·진전을 안 싣는다 — «모른다»로(로컬과 같은 키).
     turn: UNKNOWN_TURN_CELL,
+    progress: 'unknown',
     build: null,
   };
 }
@@ -2167,12 +2178,16 @@ export async function runPtyState(ref: string, deps: PtyTakeoverCommandDeps = li
 function formatPtyStateResult(id: string, screen: { state: FrameState; label?: string | null }, run: PtyRunStateView, at: number, json: boolean, deps: PtyTakeoverCommandDeps, screenUnavailable?: string): PtyTakeoverCommandResult {
   const reconciled = reconcileFrameStateWithTurn(screen.state, run.turn);
   if (reconciled.overridden) deps.log('state-reconciled', { ptyId: id, turn: run.turn, screenState: reconciled.screenState, label: screen.label ?? null, state: reconciled.state });
+  // SURVIVAL-PROGRESS-CLOCK — 진전·정체·Esc 무시 판정을 turnAt 옆에 싣고 전환을 관측한다.
+  const progress = judgeTurnProgress({ turn: run.turn, turnAt: run.turnAt, progressAt: run.progressAt, abortRequestedAt: run.abortRequestedAt, now: at });
+  noteTurnProgressSurvival(id, progress, { turnAt: run.turnAt, progressAt: run.progressAt, now: at });
   const guess = reconciled.screenState !== reconciled.state && !screenUnavailable ? ` guess=${reconciled.screenState}` : '';
   return { exitCode: 0, message: json
     ? JSON.stringify({
       id, state: reconciled.state, stateSource: reconciled.source, screenState: reconciled.screenState, label: screen.label, at,
       ...(screenUnavailable ? { screenUnavailable } : {}),
       turn: run.turn, ...(run.turnAt !== undefined ? { turnAt: run.turnAt } : {}),
+      ...(run.progressAt !== undefined ? { progressAt: run.progressAt } : {}), progress,
       build: run.build ? { version: run.build.version, sha: run.build.sha, source: run.build.source } : null,
       installed: run.installed, stale: run.stale, staleReason: run.staleReason,
     })
@@ -2191,6 +2206,29 @@ function ptyRunStateFor(id: string, deps: PtyTakeoverCommandDeps): PtyRunStateVi
 
 function formatRunBuild(run: PtyRunStateView): string {
   return run.build ? `${run.build.version}@${shortSha(run.build.sha)}(${run.build.source})` : 'unknown';
+}
+
+// ── SURVIVAL-PROGRESS-CLOCK — «마지막 진전 시각» 판정을 state/list 에 싣고 전환을 한 번만 관측한다 ──
+const SURVIVAL_EVENT_OF: Record<'stalled' | 'abort-ignored' | 'slow', 'stall-detected' | 'abort-ignored' | 'slow-turn'> = {
+  stalled: 'stall-detected',
+  'abort-ignored': 'abort-ignored',
+  slow: 'slow-turn',
+};
+const lastSurvivalJudgmentByPtyId = new Map<string, TurnProgressJudgment>();
+
+/** 판정이 stalled·abort-ignored·slow 로 «바뀔 때» `tui.survival` 관측을 전환마다 한 번만 남긴다(같은 값이면 조용히). */
+function noteTurnProgressSurvival(ptyId: string, judgment: TurnProgressJudgment, fields: { turnAt?: number; progressAt?: number; now: number }): void {
+  if (lastSurvivalJudgmentByPtyId.get(ptyId) === judgment) return;
+  lastSurvivalJudgmentByPtyId.set(ptyId, judgment);
+  const event = SURVIVAL_EVENT_OF[judgment as keyof typeof SURVIVAL_EVENT_OF];
+  if (!event) return;
+  const since = fields.progressAt ?? fields.turnAt;
+  debug.log('tui.survival', event, {
+    ptyId,
+    turnAt: fields.turnAt ?? null,
+    progressAt: fields.progressAt ?? null,
+    elapsedMs: since !== undefined ? Math.max(0, fields.now - since) : null,
+  });
 }
 
 /** `pty list` 한 칸 — 판을 적는 행(TUI)만. `run=<sha>` · 낡았으면 `,stale` · 옛 행 추정은 `run=?,stale`. */
@@ -2294,6 +2332,20 @@ export async function runPtyRename(ref: string, name: string, deps: PtyTakeoverC
   const renamed = (deps.renameLocal ?? renamePty)(id, nickname);
   return mapResult('rename', id, renamed ? { status: 'success' } : { status: 'unknown-pty' }, deps, observed);
 }
+/** `pty stop-turn` cancels the TUI's active turn through its owner; it never terminates the PTY process. */
+export async function runPtyStopTurn(ref: string, actor: PtyWriteActor, actorIdentity: string, reason: string, deps: PtyTakeoverCommandDeps = liveDeps): Promise<PtyTakeoverCommandResult> {
+  const identity = actorIdentity.trim();
+  const why = reason.trim();
+  if (!identity) return { exitCode: 2, message: 'pty stop-turn: --actor-id must not be empty' };
+  if (!why) return { exitCode: 2, message: 'pty stop-turn: --reason must not be empty' };
+  const refResult = resolveId(ref, 'stop-turn', deps); if (typeof refResult !== 'string') return refResult;
+  const id = refResult;
+  // A standalone CLI may not inherit a TUI run id. Mint one for this caller; inherited identity is retained so the
+  // owner still rejects a request from the same run as the target turn.
+  ensureRunId();
+  const request = { force: true as const, actorIdentity: identity, reason: why };
+  return mapResult('stop-turn', id, await deps.requestRemote(id, 'stop-turn', request, { actor }), deps, { ...request, actor });
+}
 export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverCommandDeps = liveDeps, toolInstallDeps: ToolInstallDeps = {}): void {
   const pty = program.command('pty').description(
     // ⭐ `<ref>` = id · nickname · unique prefix — **ref 를 받는 하위명령**이 resolvePtyRef 로 해석한다(`list` 는 인자 없음).
@@ -2369,6 +2421,14 @@ export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverC
   pty.command('takeover <ref>').description('Request human write ownership through the PTY arbiter').action((id: string) => run(() => runPtyTakeover(id, deps)));
   registerPtyAttachDriveCommand(pty, run);
   pty.command('release <ref>').description('Return human-owned PTY control to its prior mode').action((id: string) => run(() => runPtyRelease(id, deps)));
+  pty.command('stop-turn <ref>').requiredOption('--force', 'cancel the active turn and its child work without terminating the PTY')
+    .requiredOption('--actor <who>', 'actor type: human or agent').requiredOption('--actor-id <identity>', 'named requesting actor, such as OP or CEO')
+    .requiredOption('--reason <reason>', 'why this turn must be force-stopped').description('Force-stop an active TUI turn').action((id: string, opts: { actor: string; actorId: string; reason: string }) => {
+      const actor = parsePtyWriteActor(opts.actor);
+      return run(() => actor
+        ? runPtyStopTurn(id, actor, opts.actorId, opts.reason, deps)
+        : Promise.resolve({ exitCode: 2, message: `pty stop-turn: --actor must be 'human' or 'agent' (got ${opts.actor})` }));
+    });
   pty.command('state <ref>').option('--json', 'emit the classified frame state as JSON')
     .description('Classify the current PTY screen state').action((id: string, opts: { json?: boolean }) => run(() => runPtyState(id, deps, opts.json === true)));
   pty.command('wait <ref>').requiredOption('--until <state>', 'wait until idle, working, blocked, waiting, or done')

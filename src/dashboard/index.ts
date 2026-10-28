@@ -7,7 +7,8 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { fileURLToPath } from 'node:url';
 import { createRunningBuildStatus } from './running-build-status.js';
-import { reportTuiTurn } from '../pty-shell/tui-run-state.js';
+import { reportTuiAbortRequested, reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
+import { installTuiStderrOwner } from '../surface/tui-stderr-owner.js';
 import { logTurnThrew, runTurnTeardownStep } from './turn-busy-teardown.js';
 import { createStaleInstallCheck, formatStaleInstallNotice, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
 import { spawn, spawnSync } from 'node:child_process';
@@ -188,6 +189,7 @@ import {
   formatResponse,
   onEscAbort,
   attachStreamingKeys,
+  SLASH_COMMANDS,
   type InputResult,
   type TextInputExternalSubmitRequest,
 } from '../chat/index.js';
@@ -397,6 +399,7 @@ import { resolveDashboardChatMainSubmitIntent } from './input/chat-main-submit-r
 import { maybeEmitDashboardSubmitQuickPass } from './input/chat-main-submit-control.js';
 import { attachDashboardQuickPassConsumers } from './input/control-signal-consumers.js';
 import { resolveDashboardChatMainSlashCommand } from './input/chat-main-slash-command.js';
+import { isClassicSigquitChord, registerClassicSigquitHandler } from './classic-sigquit.js';
 import { TuiChatPersonaSelection, tuiChatPersonaMessages } from './slash-runtime/chat-persona.js';
 import { awaitGlobalPersonaLoad } from '../persona/global-registry.js';
 import { createDashboardInlineSetupFlow } from './setup-inline.js';
@@ -524,6 +527,41 @@ export function observeDashboardDevRequestRoute(
   cfg: DevRequestRoutingConfig,
 ): void {
   observeDevRequestRouteFailSoft(text, cfg, { surface: 'dashboard' });
+}
+
+export async function cancelDelegatedToolOnEscape(deps: {
+  abortCtrl: AbortController;
+  child: { pid: number; isAlive(): boolean; kill(signal?: NodeJS.Signals): void };
+  waitForExit(): Promise<void>;
+  pushChatLine(line: string): void;
+}): Promise<boolean> {
+  abortTurnOnly(deps.abortCtrl);
+  try {
+    if (deps.child.isAlive()) deps.child.kill();
+    await deps.waitForExit();
+    if (deps.child.isAlive()) throw new Error('child still alive after exit acknowledgement');
+    debug.log('dashboard.esc-child', 'termination-confirmed', { pid: deps.child.pid });
+    deps.pushChatLine('  ⏹ 중단됨');
+    return true;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    debug.log('dashboard.esc-child', 'termination-failed', { pid: deps.child.pid, reason });
+    deps.pushChatLine(`  ✘ 종료 실패 — ${reason}`);
+    return false;
+  }
+}
+
+export function activeEscDelegatedPty(
+  toolState: EscAbortToolState,
+  ptyIdsByCallId: ReadonlyMap<string, string>,
+  getPtyById: (id: string) => { pid: number; isAlive(): boolean; kill(signal?: NodeJS.Signals): void } | undefined,
+): { pid: number; isAlive(): boolean; kill(signal?: NodeJS.Signals): void } | null {
+  const active = [...toolState.activeToolNamesByCallId];
+  if (active.length !== 1) return null;
+  const [callId, name] = active[0]!;
+  if (name !== 'PtyShellPoll' && name !== 'PtyShellSnapshot' && name !== 'PtyShellSend') return null;
+  const ptyId = ptyIdsByCallId.get(callId);
+  return ptyId ? getPtyById(ptyId) ?? null : null;
 }
 
 export interface EscAbortToolState {
@@ -741,7 +779,7 @@ import { needsOnboarding, resetOnboardingMarker } from '../onboarding.js';
 import {
   getUserConfig, reloadUserConfig, saveUserConfig,
   rotateNextProvider, jumpToRotationEntry, rotationEntryLabel, applyRotationEntry,
-  resolveAcpHopCapFromConfig,
+  resolveAcpHopCapFromConfig, resolveTuiUnattended,
   VOICE_HARDCODED_DEFAULTS,
 } from '../user-config.js';
 import { streamLLM, anyProviderAvailable, getProviderForConfig, nextReasoningLevel, reasoningLevelLabel, effectiveReasoningLevel, modelSupportsReasoning, type LLMMessage, type LLMToolSpec } from '../llm.js';
@@ -917,6 +955,7 @@ import {
   runDashboardScratchExportAction,
 } from './context-menu-action-runtime.js';
 import { createDashboardTerminalPopupRuntime } from './terminal-popup-runtime.js';
+import { createDashboardSidetabRuntime } from './sidetab-runtime.js';
 import { toggleDashboardAssistantRenderState } from './assistant-render-state-runtime.js';
 import { bootDashboardAcpBgSweep } from './acp-bg-sweep-boot.js';
 import { bootDashboardConfigTools } from './config-tools-boot.js';
@@ -1143,7 +1182,7 @@ import type { PlainTurnSubmit } from '../input/turn-submit.js';
 import { findBlock, logPaneContentHeight, maxLogPaneScroll, visibleSearchRowOffset } from '../panes/log-pane.js';
 import { createQuitConfirmationState, gracefulQuit, type QuitConfirmationState } from './graceful-quit.js';
 import { consumeTurnEndInterrupted, handoffTurnTypeaheadAtTurnEnd, releaseTurnTypeaheadPending, runTurnTypeaheadPushNow, steerLastTurnTypeaheadSubmission } from './input/turn-steer-bridge.js';
-import { abortTurnOnly } from '../turn-abort-scope.js';
+import { abortAndKillChildren, abortTurnOnly } from '../turn-abort-scope.js';
 import { consumeInternalTurnYield, createInternalTurnGate, formatInternalTurnBanner, resolveInternalTurnSubmitIntent, type InternalTurnRequest } from './input/internal-turn.js';
 import { createClassicInterimFold } from './input/goal-interim.js';
 import { createSeatAutowake } from './input/seat-autowake.js';
@@ -1293,6 +1332,7 @@ export function subscribeDashboardAgentResults(
       }
     }
   });
+  queue.replayPendingWakes(listener);
   return () => { offWake(); offDrain(); };
 }
 
@@ -1451,6 +1491,9 @@ import {
 } from './input/space-longpress-detector.js';
 import { isAllowlistedDictationSurface } from './input/dictation-surface-allowlist.js';
 import { createDashboardExternalInputHost, stopTurnViaEscGate, updateDashboardExternalInputQueueNotice } from './input/external-input-host.js';
+import { registerTuiForceStopHandler } from '../capture/tui-self-report.js';
+import { createInlineAskUserQuestionResolver, resolveUnattendedInlineChoiceTimeoutMs, UNATTENDED_INLINE_CHOICE_TIMEOUT_MS } from '../ask-user-question/index.js';
+import { createInlineChoiceTurnEndCleanup, InlineChoiceBroker } from '../tui/inline-choice.js';
 import { registerExternalInputHost } from '../input/external-input-queue.js';
 // H3 #6 follow-up #3 — background sessions render as a distinct sidebar
 // kind with live state badge + tap-to-Join. Dashboard pulls BG records
@@ -2043,9 +2086,18 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
   let disposeDashboardEventLoopMonitor = (): void => {};
   // TUI-AGENT-IDLE-WAKE — 이 대시보드 «자기» 완료 알림 구독만 푼다(배선 지점에서 채운다).
   let disposeDashboardAgentWake = (): void => {};
+  let disposeClassicSigquit = (): void => {};
+  let closeClassicSidetabRuntime = (): void => {};
+  let restoreTuiStderrOwner = (): void => {};
   const closeDashboardTui = (): void => {
     disposeDashboardEventLoopMonitor();
     try { disposeDashboardAgentWake(); } catch { /* never block exit */ }
+    disposeClassicSigquit();
+    disposeClassicSigquit = (): void => {};
+    try { closeClassicSidetabRuntime(); } catch { /* never block exit */ }
+    closeClassicSidetabRuntime = (): void => {};
+    try { restoreTuiStderrOwner(); } catch { /* never block screen cleanup */ }
+    restoreTuiStderrOwner = (): void => {};
     closeTui();
   };
   const exitDashboardTui = (): void => {
@@ -2582,6 +2634,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }
     chatScrollOffset = -1;
   };
+  const inlineChoiceBroker = new InlineChoiceBroker({
+    appendLines: (lines) => {
+      for (const line of lines) pushChatLine(C.info(line));
+      draw();
+    },
+  });
+  const resolveInlineAskUserQuestion = createInlineAskUserQuestionResolver(inlineChoiceBroker, {
+    timeoutMs: () => resolveUnattendedInlineChoiceTimeoutMs(getUserConfig()),
+  });
   const liveTypeaheadEchoes: { at: number; lines: string[] }[] = [];
   const restoreLiveTypeaheadEchoes = (): void => {
     let after = 0;
@@ -3076,6 +3137,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   let attachedSessionId: string | null = null;
   const chatPersonaSelection = new TuiChatPersonaSelection();
   let chatPersonaConversationId = crypto.randomUUID();
+  const slashUsageRunId = crypto.randomUUID();
   const currentChatPersonaSessionId = () => attachedSessionId ?? chatPersonaConversationId;
   let attachedChatId: number | null = null;
   const forkableSessionHistory = (source: ChatMessage[] = chat.history): ForkableSessionTurn[] =>
@@ -5138,6 +5200,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   };
   registerLogFoldInputBinding(toggleAllLogFolds);
 
+  const showClassicSigquitGuidance = (): void => {
+    debug.log('dashboard.signal', 'sigquit-guidance', { surface: 'classic', source: 'ctrl-backslash' });
+    chatLines.push(C.warning('  classic 사이드탭: /side · /side new · /side attach <번호>'));
+    chatScrollOffset = -1;
+    draw({ force: true });
+  };
+
+  restoreTuiStderrOwner = installTuiStderrOwner((line) => {
+    chatLines.push(C.warning(`[stderr] ${line}`));
+    draw({ force: true });
+  });
   initTui(true);
 
   // ── Working-dir browser glyphs (shared between the list widget and
@@ -6748,6 +6821,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
    * this function is invoked.
    */
   const escAbortToolState = createEscAbortToolState();
+  let escDelegatedTermination: Promise<boolean> | null = null;
+  let delegatedTerminationPending = false;
+  let delegatedTerminationFailed = false;
+  const escDelegatedPtyIdsByCallId = new Map<string, string>();
+  const escDelegatedShellResultsByCallId = new Map<string, Promise<unknown>>();
   const escHarnessSpacesByCallId = new Map<string, string>();
   setSelfImplementSoftStopSpaceObserver((callId, spaceId) => {
     const toolName = escAbortToolState.activeToolNamesByCallId.get(callId);
@@ -6768,6 +6846,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // the stream — the running count is visible in the HUD (T3-B1)
     // so the user can make an informed call.
     let abortGateModalId: string | null = null;
+    const getDelegatedPty = () => activeEscDelegatedPty(escAbortToolState, escDelegatedPtyIdsByCallId, getPty);
+    const getDelegatedShell = () => {
+      const active = [...escAbortToolState.activeToolNamesByCallId];
+      if (active.length !== 1 || (active[0]![1] !== 'Bash' && active[0]![1] !== 'RunShell')) return null;
+      return escDelegatedShellResultsByCallId.get(active[0]![0]) ?? null;
+    };
     const showHarnessEscHint = createHarnessEscHint((line) => pushChatLine(line));
     const activeHarnessSpace = (): string | null => activeEscHarnessSpace(escAbortToolState, escHarnessSpacesByCallId);
     // ⭐ TUI-ESC-EXIT — `createEscAbortPendingGate` is the production
@@ -6779,7 +6863,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       runSoftStop: runEscAbortPendingSoftStop,
       formatWaitingTargets: formatEscAbortWaitingTargets,
       getActiveHarnessSpace: activeHarnessSpace,
-      pushChatLine: (line) => pushChatLine(line),
+      pushChatLine: (line) => { if (!getDelegatedPty() && !getDelegatedShell() && !delegatedTerminationPending && !delegatedTerminationFailed) pushChatLine(line); },
       showHarnessEscHint,
       afterAbortEvent: () => { chatScrollOffset = -1; },
     });
@@ -6796,11 +6880,77 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       requestRedraw: () => draw(),
       getTheme: () => currentThemeTokens(),
       getWaitingTargetNames: () => getEscAbortWaitingToolNames(escAbortToolState),
-      shouldAbortImmediately: () => activeHarnessSpace() !== null,
+      shouldAbortImmediately: () => activeHarnessSpace() !== null || getDelegatedPty() !== null || getDelegatedShell() !== null,
+      forceStopWithoutModal: () => resolveTuiUnattended(getUserConfig()),
+      confirmStopInline: async () => {
+        const result = await inlineChoiceBroker.ask({
+          id: `stop-turn:${Date.now().toString(36)}`,
+          question: '도는 작업과 하위 에이전트를 함께 중단할까요?',
+          options: [
+            { value: 'stop', label: '중단', description: '현재 턴과 자식 작업을 종료합니다.' },
+            { value: 'continue', label: '계속', description: '현재 작업을 계속 실행합니다.' },
+          ],
+          includeOther: false,
+          timeoutMs: UNATTENDED_INLINE_CHOICE_TIMEOUT_MS,
+        });
+        return !('cancelled' in result) && result.selected[0] === 'stop';
+      },
       // ⭐ TUI-ESC-EXIT — `runEscAbortPendingSoftStop` is the production
       // soft-stop callback seam; the incident test in
       // test/esc-harness-stop.test.ts exercises this same function.
-      onAbortPending: escAbortPendingGate.onAbortPending,
+      onAbortPending: (event) => {
+        const child = getDelegatedPty();
+        const shell = getDelegatedShell();
+        if (!child && !shell) { escAbortPendingGate.onAbortPending(event); return; }
+        if (shell && !child) {
+          delegatedTerminationPending = true;
+          pushChatLine('  ⏳ 중단 요청됨 — 위임 자식 종료를 확인하는 중입니다.');
+          escDelegatedTermination = (async () => {
+            abortTurnOnly(abortCtrl);
+            try {
+              const result = await Promise.race([shell, Bun.sleep(4_000).then(() => { throw new Error('shell child termination timeout'); })]);
+              const status = result as { aborted?: boolean; outcome?: string; output?: string } | null;
+              if (!status?.aborted && status?.outcome !== 'aborted'
+                && !status?.output?.includes('[aborted]')) throw new Error('shell child exit not confirmed as aborted');
+              debug.log('dashboard.esc-child', 'termination-confirmed', { tool: event.targets });
+              const pendingIndex = chatLines.lastIndexOf('  ⏳ 중단 요청됨 — 위임 자식 종료를 확인하는 중입니다.');
+              if (pendingIndex >= 0) chatLines.splice(pendingIndex, 1);
+              pushChatLine('  ⏹ 중단됨');
+              draw();
+              return true;
+            } catch (error) {
+              delegatedTerminationFailed = true;
+              const reason = error instanceof Error ? error.message : String(error);
+              debug.log('dashboard.esc-child', 'termination-failed', { tool: event.targets, reason });
+              const pendingIndex = chatLines.lastIndexOf('  ⏳ 중단 요청됨 — 위임 자식 종료를 확인하는 중입니다.');
+              if (pendingIndex >= 0) chatLines.splice(pendingIndex, 1);
+              pushChatLine(`  ✘ 종료 실패 — ${reason}`);
+              draw();
+              return false;
+            }
+          })().finally(() => { delegatedTerminationPending = false; });
+          return;
+        }
+        if (!child) return;
+        delegatedTerminationPending = true;
+        pushChatLine('  ⏳ 중단 요청됨 — 위임 자식 종료를 확인하는 중입니다.');
+        escDelegatedTermination = cancelDelegatedToolOnEscape({
+          abortCtrl,
+          child,
+          waitForExit: async () => {
+            const deadline = Date.now() + 3_000;
+            while (child.isAlive() && Date.now() < deadline) await Bun.sleep(50);
+            if (child.isAlive()) throw new Error('PTY child termination timeout');
+          },
+          pushChatLine: (line) => {
+            delegatedTerminationFailed = line.includes('종료 실패');
+            const pendingIndex = chatLines.lastIndexOf('  ⏳ 중단 요청됨 — 위임 자식 종료를 확인하는 중입니다.');
+            if (pendingIndex >= 0) chatLines.splice(pendingIndex, 1);
+            pushChatLine(line);
+            draw();
+          },
+        }).finally(() => { delegatedTerminationPending = false; });
+      },
       onAbortRepeat: escAbortPendingGate.onAbortRepeat,
       // ⭐⭐⭐ 턴을 멈추기 «전»에 살아남을 자식을 백그라운드 라우팅으로 넘긴다(`R4a` · 2026-08-19).
       //   ⛔ 없으면 `R1` 이후 자식이 «고아»가 된다 — 살아 있는데 완료를 실어 나를 채널이 없다
@@ -6818,6 +6968,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         } catch { /* 관측·핸드오프가 중단을 막지 않는다 */ }
       },
     });
+    const unregisterTuiForceStop = registerTuiForceStopHandler(() => {
+      if (abortCtrl.signal.aborted) return false;
+      debug.log('pty.stop-turn', 'force-requested', { targets: getEscAbortWaitingToolNames(escAbortToolState) });
+      abortAndKillChildren(abortCtrl);
+      pushChatLine('  ⏹ 강제 중단을 요청했습니다. 현재 턴과 자식 작업이 정리되면 유휴 상태로 돌아갑니다.');
+      draw();
+      return true;
+    });
+    const cancelInlineChoiceAtTurnEnd = createInlineChoiceTurnEndCleanup(inlineChoiceBroker);
 
     // Scroll the log pane by ±N rows from whatever the current tail-
     // relative offset resolves to. Shared by keyboard and mouse-wheel
@@ -7337,15 +7496,21 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     streamingInFlight = true;
     noteClipboardBusyChange();
     reportTuiTurn('busy');
-    const externalStop = (): void => { stopTurnViaEscGate(escGate); };
+    const externalStop = (): void => {
+      // Esc 게이트가 턴 중단을 청하는 순간 — busy 가 이 뒤로 지속되면 abort-ignored 판정 재료가 된다.
+      reportTuiAbortRequested();
+      stopTurnViaEscGate(escGate);
+    };
     currentTurnExternalStop = externalStop;
     return () => {
       if (currentTurnExternalStop === externalStop) currentTurnExternalStop = null;
       // 단계마다 격리 — 앞 단계가 던져도 settle·idle 전이에 닿는다(키 층 유휴 ∧ 턴 층 busy 이원 판정 #55 차단).
       runTurnTeardownStep('stream-keys-detach', cleanup);
+      runTurnTeardownStep('inline-choice-cancel', cancelInlineChoiceAtTurnEnd);
+      runTurnTeardownStep('tui-force-stop-detach', unregisterTuiForceStop);
       runTurnTeardownStep('esc-gate-dispose', () => { escGate.dispose(); });
       try {
-        if (!escAbortPendingGate.getStoppedHarnessSpace()) settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
+        if (!escAbortPendingGate.getStoppedHarnessSpace() && !delegatedTerminationPending && !delegatedTerminationFailed) settleEscAbortPendingLines(chatLines, chatLinesStartIndex);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const stackHead = err instanceof Error ? err.stack?.split('\n')[1]?.trim() : undefined;
@@ -12734,6 +12899,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const disposeExternalInputHost = registerExternalInputHost(createDashboardExternalInputHost({
     isTurnActive: () => streamingInFlight,
     getTurnStop: () => currentTurnExternalStop,
+    handleInlineChoice: (text) => inlineChoiceBroker.handleInput(text),
     promptCtl,
     pushNotice: (line) => { chatLines.push(C.muted(`  ${line}`)); chatScrollOffset = -1; draw(); },
     setQueueNotice: setExternalInputQueueNotice,
@@ -13578,6 +13744,87 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const spawnGlobalTerminalModal = (command?: string): void => {
       openInteractiveTerminalPopup({ kind: 'shell', cwd: workingDir.cwd, command });
     };
+    const classicSidetabRuntime = createDashboardSidetabRuntime({
+      currentSessionId: () => currentChatPersonaSessionId(),
+      termSize,
+      pushModal: (surface) => {
+        attachSurfaceToWorkspace(surface, currentWorkspaceOwnerId());
+        const handle = display.pushModal(surface);
+        draw();
+        return { dispose: () => { handle.dispose(); draw(); } };
+      },
+      attach: (row) => {
+        if (row.sessionId && sessionRegistry.get(row.sessionId)) {
+          const { cols, rows } = termSize();
+          const attached = sessionRegistry.attach(row.sessionId, { termCols: cols, termRows: rows });
+          if (attached?.modal) {
+            terminalModalRouter.set(attached.modal, {
+              onClose: () => { sessionRegistry.detach(attached.id); draw(); },
+            });
+            draw();
+          }
+          return;
+        }
+        if (!row.ptyId) return;
+        void requestRemotePtyControl(row.ptyId, 'snapshot', { ansi: false }, { timeoutMs: 450 })
+          .then((result) => {
+            if (result.status === 'success' && result.screen?.trim()) {
+              chatLines.push(C.muted(`  ${row.label} · 읽기 전용 snapshot (입력은 전달되지 않습니다)`));
+              chatLines.push(...stripAnsi(result.screen).split('\n'));
+            } else chatLines.push(C.warning(`  PTY 화면 읽기 실패 · ${result.status}`));
+            chatScrollOffset = -1;
+            draw();
+          })
+          .catch((error) => {
+            chatLines.push(C.warning(`  PTY 화면 읽기 오류 · ${error instanceof Error ? error.message : String(error)}`));
+            chatScrollOffset = -1;
+            draw();
+          });
+      },
+      spawnShell: () => { spawnGlobalTerminalModal(); },
+      detach: (row) => {
+        if (row?.currentProcess) {
+          chatLines.push(C.muted('  현재 classic TUI는 분리할 수 없습니다'));
+        } else {
+          const id = row?.sessionId ?? terminalModalRouter.current()?.id ?? sessionRegistry.foreground()?.id;
+          if (!id) chatLines.push(C.muted('  분리할 셸 세션이 없습니다'));
+          else if (terminalModalRouter.current()?.id === id) terminalModalRouter.close();
+          else sessionRegistry.detach(id);
+        }
+        chatScrollOffset = -1;
+        draw();
+      },
+      kill: (row) => {
+        if (row.sessionId && sessionRegistry.get(row.sessionId)) {
+          if (terminalModalRouter.current()?.id === row.sessionId) terminalModalRouter.close();
+          sessionRegistry.kill(row.sessionId);
+          chatLines.push(C.muted(`  ${row.label} 종료 요청 완료`));
+        } else if (row.ptyId) {
+          void requestRemotePtyControl(row.ptyId, 'terminate', undefined, { timeoutMs: 1_000 })
+            .then((result) => chatLines.push(result.status === 'success'
+              ? C.muted(`  ${row.label} 종료 요청 완료`)
+              : C.warning(`  PTY 종료 거부 · ${result.status}`)))
+            .catch((error) => chatLines.push(C.warning(`  PTY 종료 오류 · ${error instanceof Error ? error.message : String(error)}`)))
+            .finally(() => { chatScrollOffset = -1; draw(); });
+        }
+        chatScrollOffset = -1;
+        draw();
+      },
+      returnToParent: () => {
+        if (terminalModalRouter.current()) terminalModalRouter.close();
+        setWorkingFocus('input', 'classic-sidetab-parent');
+        draw();
+      },
+      status: (message) => {
+        chatLines.push(C.muted(`  ${message}`));
+        chatScrollOffset = -1;
+        draw();
+      },
+    });
+    closeClassicSidetabRuntime = () => classicSidetabRuntime.close();
+    disposeClassicSigquit = registerClassicSigquitHandler(() => {
+      classicSidetabRuntime.beginPrefix();
+    });
 
     // E3 (2026-05-17) — copyLastAssistantTurnToClipboard /
     // copyLastAssistantCodeToClipboard land into the outer-scoped
@@ -15147,20 +15394,21 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const contextUserText = ctx?.userText;
           const turnRefUserText = acpTurnRef.userText;
           const hasParentTurnAbortSignal = acpTurnRef.abortCtrl?.signal !== undefined;
+          const turnSignal = acpTurnRef.abortCtrl?.signal ?? new AbortController().signal;
           observeDashboardToolDispatchSignal({
             toolName: name,
             turnIndex: ctx?.turnIndex ?? null,
             signalSource: hasParentTurnAbortSignal ? 'parent-turn' : 'fallback',
             hasParentTurnAbortSignal,
-            signalAlreadyAborted: (acpTurnRef.abortCtrl?.signal ?? new AbortController().signal).aborted,
+            signalAlreadyAborted: turnSignal.aborted,
           });
-          const result = await dispatchDashboardSessionRuntimeTool(name, args, {
+          const dispatchPromise = dispatchDashboardSessionRuntimeTool(name, args, {
             contextUserText,
             turnRefUserText,
             muted: C.muted,
             pushChatLine,
             draw,
-            signal: acpTurnRef.abortCtrl?.signal ?? new AbortController().signal,
+            signal: turnSignal,
             toolCallId: ctx?.callId,
             // ⛔⭐ 폴백은 `''` 가 아니라 `undefined` 다 — 「안 넘김」과 「말했는데 어휘가 없음」은 «다른 값»이다.
             //   harnessMentionState(session-runtime 소비처)는 `undefined → 'absent'` · `'' → 'not-matched'` 로
@@ -15187,7 +15435,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               runtime.dispatchToolByName(toolName, input, {
                 surface: 'tui',
                 toolCallId,
-                signal: acpTurnRef.abortCtrl?.signal,
+                signal: hasParentTurnAbortSignal ? turnSignal : undefined,
                 // ⭐ Agent-family context. Without these two the sub-agent runs
                 //  text-only (see getTools above). `agentDispatchTool` routes the
                 //  child's calls back through THIS dispatcher so the child gets the
@@ -15206,6 +15454,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             dispatchPluginTool: (toolName, input) =>
               pluginHost.dispatchTool(toolName, input),
           });
+          if (ctx?.callId && (name === 'Bash' || name === 'RunShell')) {
+            escDelegatedShellResultsByCallId.set(ctx.callId, dispatchPromise);
+          }
+          const result = await dispatchPromise;
           // Mirror the direct-path truncation wrapper at
           // dashboard/index.ts L19917-19932 so large tool outputs
           // land in the preview store + the LLM sees the short
@@ -15655,6 +15907,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
       const priorityRoute = await routeDashboardPriorityKey(key, {
         inputOwner: chatMainVisibility.inputOwnership?.owner,
+        routeClassicSigquitChord: (routeKey) => {
+          if (classicSidetabRuntime.routeKey(routeKey)) return true;
+          if (!isClassicSigquitChord(routeKey)) return false;
+          showClassicSigquitGuidance();
+          return true;
+        },
         routeBellKey: async (routeKey) => {
           if (!bellOpen || routeKey.mouse) return false;
           const inst = widgetHost.get('wd-notification-bell');
@@ -15701,6 +15959,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           draw();
           return true;
         },
+        routeSidetabKey: (routeKey) => classicSidetabRuntime.routeKey(routeKey),
         dispatchPreKey: (routeKey, targetHandlerName) => {
           const questionViewHandler = {
             name: 'question-view',
@@ -15789,13 +16048,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           return true;
         },
         // Step 0 force-quit — fires from anywhere (bell modal, popup
-        // terminal, drag, dashboard). Escape-hatch aliases:
-        //   - Ctrl+Shift+Q
-        //   - Ctrl+\
-        // The second alias is for terminal/VW-heavy contexts where
-        // Shift-modified control chords may get normalized away by the
-        // terminal emulator. Plain Ctrl+Q is still *not* the true
-        // force-quit because terminal-resident apps use it.
+        // terminal, drag, dashboard). Ctrl+Shift+Q is the escape chord;
+        // Ctrl+\ is reserved for classic side-tab guidance. Plain Ctrl+Q
+        // remains available to terminal-resident apps.
         // Korean shifted ㅃ (Shift+ㅂ on 2-bul) accepts ctrl-only
         // because the shift bit may be implicit in the codepoint.
         isForceQuitChord: (routeKey) => {
@@ -15812,7 +16067,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             });
           }
           if (!routeKey.ctrl) return false;
-          if (routeKey.name === '\\' || routeKey.name === 'backslash') return true;
           if (routeKey.shift && (routeKey.name === 'q' || routeKey.name === 'Q' || routeKey.name === 'ㅂ')) return true;
           if (routeKey.name === 'ㅃ') return true;
           return false;
@@ -16573,6 +16827,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   chatMainInputVisibilityState().inputOwnership?.owner === 'chat-main',
                 onPasteImage: attachClipboardImage,
                 routeVoiceKey: async (routeKey) => {
+                if (classicSidetabRuntime.routeKey(routeKey)) return 'consumed';
                 // 2026-04-30 — voice-chat ESC: when the controller is
                 // active and the user hits ESC inside chat-main, take
                 // it as a "exit voice mode" gesture and DO NOT let
@@ -16824,6 +17079,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 };
                 const outcome = await inputCoreRouteInputEventAsync(ev, ctx);
                 return outcome === 'consumed' ? 'consumed' : 'passthrough';
+              },
+              routeQuitChord: (key) => {
+                if (classicSidetabRuntime.routeKey(key)) return 'consumed';
+                if (!isClassicSigquitChord(key)) return 'passthrough';
+                showClassicSigquitGuidance();
+                return 'consumed';
               },
               shouldRouteInputDispatcherKey: (key) => {
                 const topModalId = display.modalStack().at(-1) ?? null;
@@ -17249,9 +17510,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             // { return: DashboardAction }.
             const dashboardSlashSurfaceUx = resolveDashboardSlashSurfaceUx();
             const clarificationSurfaceUx = dashboardSlashSurfaceUx ? {
-              question: (request: Parameters<typeof dashboardSlashSurfaceUx.question>[0]) => {
-                const pending = dashboardSlashSurfaceUx.question(request);
-                if ((request as typeof request & { [DASHBOARD_CLARIFICATION_REQUEST]?: boolean })[DASHBOARD_CLARIFICATION_REQUEST]) {
+              question: (request: Parameters<typeof dashboardSlashSurfaceUx.question>[0], options?: Parameters<typeof dashboardSlashSurfaceUx.question>[1]) => {
+                const clarification = (request as typeof request & { [DASHBOARD_CLARIFICATION_REQUEST]?: boolean })[DASHBOARD_CLARIFICATION_REQUEST] === true;
+                if (clarification && resolveTuiUnattended(getUserConfig())) return resolveInlineAskUserQuestion(request);
+                const pending = dashboardSlashSurfaceUx.question(request, options);
+                if (clarification) {
                   const handle = approvalModalRouter.current();
                   if (approvalModalRouter.currentKind() === 'askUser' && handle) {
                     clarificationModalId = handle.surface.id;
@@ -17603,6 +17866,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                       pushModalSurface: (surface: import('../display/modal-stack.js').ModalSurface) => display.pushModal(surface),
                       redraw: draw,
                       onStatus: (line: string) => {
+                        // 상태 줄 = 진전 신호(SURVIVAL-PROGRESS-CLOCK) — 마지막 진전 시각을 올린다.
+                        reportTuiProgress();
                         chatLines.push(C.muted(`  ${line}`));
                         chatScrollOffset = -1;
                       },
@@ -17947,10 +18212,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 schedulerRef: dashboardLoopSchedulerRef,
               },
             };
-            const slashOutcome = await dashboardSlashRegistry.dispatch(cmdLower, args, slashCtx);
-            if (cmdLower === 'mission') {
-              debug.log('tui.legacy-slash-use', 'mission', { surface: 'classic', tuiSession: null });
+            const slashCommand = SLASH_COMMANDS.find((entry) => entry.name === cmdLower || entry.aliases?.includes(cmdLower));
+            if (slashCommand) {
+              debug.log('tui.slash-use', 'dispatch', {
+                command: slashCommand.name,
+                alias: cmdLower === slashCommand.name ? null : cmdLower,
+                surface: 'classic',
+                runId: slashUsageRunId,
+              });
             }
+            const slashOutcome = await dashboardSlashRegistry.dispatch(cmdLower, args, slashCtx);
             if (debug.enabled) {
               debug.log('dashboard.slash.dispatch', cmdLower, {
                 argsCount: args.length,
@@ -17963,6 +18234,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             if (slashOutcome.kind === 'return') return slashOutcome.value;
             if (slashOutcome.kind === 'continue') {
               if (exitInputLoop) break;
+              draw();
               continue;
             }
             switch (cmdLower) {
@@ -18771,7 +19043,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             createTurnStreamRuntime: (initialAssistantStart) => {
               latestTurnUsage = undefined;
               createDashboardTurnStreamRuntimeEscBoundary(escAbortToolState);
+              delegatedTerminationPending = false;
+              delegatedTerminationFailed = false;
               escHarnessSpacesByCallId.clear();
+              escDelegatedPtyIdsByCallId.clear();
+              escDelegatedShellResultsByCallId.clear();
               liveTypeaheadEchoes.length = 0;
               const toolRendering = {
                 ...getUserConfig().chat.rendering.tool,
@@ -18814,19 +19090,31 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               return {
                 ...turnStreamRuntime,
                 onText: (chunk, accumulated) => {
+                  // 스트림 텍스트 = 진전 신호(SURVIVAL-PROGRESS-CLOCK) — 마지막 진전 시각을 올린다.
+                  reportTuiProgress();
                   turnStreamRuntime.onText(chunk, accumulated);
                   restoreLiveTypeaheadEchoes();
                   draw();
                 },
                 onToolCall: (call) => {
                   const toolCall = call as DashboardTurnStreamCall;
+                  // 도구 시작 = 진전 신호 — 녹음기가 없으면(reportTuiProgress 계약) 아무 일도 안 한다.
+                  reportTuiProgress();
                   trackEscAbortToolCall(escAbortToolState, toolCall);
+                  if ((toolCall.name === 'PtyShellPoll' || toolCall.name === 'PtyShellSnapshot' || toolCall.name === 'PtyShellSend')
+                    && typeof toolCall.args.process_id === 'string') {
+                    escDelegatedPtyIdsByCallId.set(toolCall.id, toolCall.args.process_id);
+                  }
                   turnStreamRuntime.onToolCall(toolCall);
                 },
                 onToolResult: (call) => {
                   const toolCall = call as DashboardTurnStreamCall;
+                  // 도구 끝 = 진전 신호 — 마지막 진전 시각을 올린다.
+                  reportTuiProgress();
                   turnStreamRuntime.onToolResult(toolCall);
                   settleEscAbortToolCall(escAbortToolState, toolCall);
+                  escDelegatedPtyIdsByCallId.delete(toolCall.id);
+                  escDelegatedShellResultsByCallId.delete(toolCall.id);
                   escHarnessSpacesByCallId.delete(toolCall.id);
                 },
                 onThought: (text) => {
@@ -18968,7 +19256,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               chatLines.push(C.warning(notice));
               detailViewerRuntime.stage('turn error', raw.split(/\r?\n/));
             },
-            finalizeTurn: (finalStatus, finalError) => {
+            finalizeTurn: async (finalStatus, finalError) => {
+              if (escDelegatedTermination) {
+                const terminated = await escDelegatedTermination;
+                finalStatus = terminated ? 'interrupted' : 'failed';
+                if (!terminated) finalError = 'delegated PTY termination failed';
+                escDelegatedTermination = null;
+              }
               lastTurnFinalStatus = finalStatus;
               clearEscAbortToolState(escAbortToolState);
               finalizeDashboardTurn({

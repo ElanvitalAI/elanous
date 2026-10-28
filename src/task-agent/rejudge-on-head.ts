@@ -45,14 +45,14 @@ import { remoteLedgerMirrorDir } from './parent-host.js';
 import { appendLandOrderRow, joinLandOrderRow } from './land-order-ledger.js';
 import { recordLiveMoveHistory } from './live-move-history.js';
 import { advanceLandedPieceMission } from './mission.js';
-import { runRepairCycle, type RepairLaunchRequest } from './repair-cycle.js';
+import { runRepairCycle, resolveRepairOwner, type RepairLaunchRequest } from './repair-cycle.js';
 import { repairMustFixFromReview, repairReviewDigest } from './repair-review.js';
 import type { RepairCasOutcome, RepairCasRequest } from './repair-branch-cas.js';
 import { configuredMsb1Worker, defaultLandPrHead, defaultPrHead, defaultReviewRepoCandidates, executeLiveLand, executeLiveReview, landRetryPending, remoteTaWorkerCommand, type LiveMoveDeps, type LiveMoveResult, type PrHeadView, type ReviewRepoCandidate, type TaskAgentLiveMove } from './live-moves.js';
 import { capturedLandReview, captureReviewResults, parseReviewResultOutput, pendingReviewResults, reviewResultPath, type ParsedReviewResult } from './review-result-capture.js';
 import { boundPrTerminal, cardPrNumber, LIVE_MOVE_RESULT_EVENT, readTaskCard, taskAgentStatePath, updateTaskCard, type TaskCard } from './task-hand.js';
 import { verifiedTrainLanding, type TrainLanding } from './train-landing.js';
-import { isGoalOnlyPr } from './judge.js';
+import { isGoalOnlyPr, judgeEmptyImplementation } from './judge.js';
 import { defaultPrFiles } from './shadow.js';
 
 export const REJUDGE_ON_HEAD_EVENT = 'rejudge-on-head';
@@ -669,6 +669,50 @@ export async function rejudgeCardOnHead(cardId: string, deps: RejudgeDeps): Prom
     if (mustFix?.length || (card.repairs ?? []).some((entry) => entry.pr === pr && (entry.status === 'requested' || entry.status === 'unconfirmed'))) {
       if (!view.branch) {
         step('repair', 'repair-stopped', 'PR branch name unavailable', true);
+        return outcomes;
+      }
+      // 빈 구현 must-fix — 같은 PR 수리(narrow-relaunch)로는 수렴하지 않는다: 첫 회는 같은 칸 새 발사(시험 먼저), 두 번째는 칸 주인 이관.
+      const priorEmpty = (card.history ?? []).filter((entry) => entry.event === REJUDGE_ON_HEAD_EVENT && entry.kind === 'repair'
+        && (entry.effect === 'empty-implementation-reimplement' || entry.effect === 'empty-implementation-needs-owner')).length;
+      const emptyJudgement = mustFix?.length ? judgeEmptyImplementation(mustFix, priorEmpty) : null;
+      if (emptyJudgement) {
+        if (emptyJudgement.move === 'needs-owner') {
+          let ownerSeat: string | null = card.seat ?? null;
+          try {
+            const owner = resolveRepairOwner(card);
+            if (owner?.seat) ownerSeat = owner.seat;
+          } catch { /* 결정 실패 시 칸 좌석을 유지한다 */ }
+          if (ownerSeat) {
+            try {
+              (deps.notifyRepair ?? (() => {}))(ownerSeat,
+                `빈 구현 needs-owner: 칸 ${card.id} PR #${pr} head ${toHead.slice(0, 12)} — ${emptyJudgement.reason} · 칸 주인이 재구현 지시를 결정한다`);
+            } catch { /* 통보 실패가 이관을 막지 않는다 */ }
+          }
+          const handedOver = updateTaskCard(statePath, card.id, (current) => {
+            if (!current) return undefined;
+            if ((current.history ?? []).some((entry) => entry.event === REJUDGE_ON_HEAD_EVENT && entry.kind === 'repair'
+              && entry.pr === pr && entry.head && sameHead(entry.head, toHead) && entry.effect === 'empty-implementation-needs-owner')) return current;
+            return { ...current, status: 'failed',
+              history: [...(current.history ?? []), { at: now().toISOString(), event: 'pr-superseded-candidate', kind: 'repair', pr,
+                ...(toHead ? { head: toHead } : {}), effect: 'superseded-candidate',
+                detail: `빈 구현 needs-owner — 옛 PR #${pr} 은 superseded 후보` }] };
+          });
+          if (handedOver) step('repair', 'empty-implementation-needs-owner',
+            `${emptyJudgement.reason} · 칸 주인 ${ownerSeat ?? 'unknown'} 이관 · 옛 PR #${pr} superseded 후보`, true);
+          return outcomes;
+        }
+        const relaunched = updateTaskCard(statePath, card.id, (current) => {
+          if (!current) return undefined;
+          if ((current.history ?? []).some((entry) => entry.event === REJUDGE_ON_HEAD_EVENT && entry.kind === 'repair'
+            && entry.pr === pr && entry.head && sameHead(entry.head, toHead) && entry.effect === 'empty-implementation-reimplement')) return current;
+          return { ...current, status: 'launch-failed',
+            text: `${current.text}\n- 재구현 지시(빈 구현 판정): 시험 먼저 — 구현 전에 실패하는 시험(RED)을 먼저 쓰고 구현 파일 변경 0이 되지 않게 한다.`,
+            history: [...(current.history ?? []), { at: now().toISOString(), event: 'pr-superseded-candidate', kind: 'repair', pr,
+              ...(toHead ? { head: toHead } : {}), effect: 'superseded-candidate',
+              detail: `빈 구현 재구현 — 옛 PR #${pr} 은 superseded 후보` }] };
+        });
+        if (relaunched) step('repair', 'empty-implementation-reimplement',
+          `${emptyJudgement.reason} · 같은 칸 새 발사(시험 먼저) · 옛 PR #${pr} superseded 후보`, true);
         return outcomes;
       }
       const result = await runRepairCycle({ card, statePath, repo: cwd, pr, head: toHead, branch: view.branch,

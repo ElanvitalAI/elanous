@@ -19,15 +19,16 @@ import {
 } from '../src/llm';
 import { debug } from '../src/debug/log';
 
-type Capture = { url: string; headers: Record<string, string>; body: any };
+type Capture = { url: string; headers: Record<string, string>; body: any; wireJson: string };
 
 function installFetch(capture: Capture[]): typeof fetch {
   const prior = globalThis.fetch;
   const stub: any = async (url: string, init: any) => {
     const hdrs = init?.headers as Record<string, string>;
+    const wireJson = String(init?.body ?? '');
     let parsed: any = init?.body;
     try { if (typeof init?.body === 'string') parsed = JSON.parse(init.body); } catch {}
-    capture.push({ url, headers: { ...hdrs }, body: parsed });
+    capture.push({ url, headers: { ...hdrs }, body: parsed, wireJson });
     // Minimal SSE body with one text delta + [DONE] — enough to let
     // the generator finish without throwing.
     const sse = [
@@ -206,6 +207,35 @@ describe('streamCodexResponsesEvents body', () => {
       { promptCache: false },
     ));
     expect(calls[0]!.body.prompt_cache_key).toBeUndefined();
+  });
+
+  test('sends the exact pre-serialized body used by request-size measurement', async () => {
+    const previousLevel = debug.level();
+    let inputSerializations = 0;
+    const input = [{
+      toJSON() {
+        inputSerializations++;
+        return { role: 'user', content: 'hi' };
+      },
+    }];
+    const measuredWireJson = JSON.stringify({
+      model: 'gpt-5-codex', instructions: 'sys', input: [{ role: 'user', content: 'hi' }],
+      stream: true, store: false,
+    });
+    debug.setLevel('off');
+    try {
+      await drain(streamCodexResponsesEvents(
+        'https://chatgpt.com/backend-api/codex/responses',
+        'b',
+        { model: 'gpt-5-codex', instructions: 'sys', input },
+        undefined,
+        { promptCache: false, serializedWireBody: measuredWireJson },
+      ));
+      expect(calls[0]!.wireJson).toBe(measuredWireJson);
+      expect(inputSerializations).toBe(0);
+    } finally {
+      debug.setLevel(previousLevel);
+    }
   });
 });
 

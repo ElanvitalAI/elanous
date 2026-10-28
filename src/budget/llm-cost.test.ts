@@ -4,6 +4,7 @@ import * as codexModels from '../codex/models.js';
 import { findCodexModel } from '../codex/models.js';
 import { findGeminiModel } from '../gemini/models.js';
 import { findGrokModel } from '../grok/models.js';
+import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import { debug } from '../debug/log.js';
 import { logAgentTurnUsage } from '../llm.js';
 import * as userConfig from '../user-config.js';
@@ -425,25 +426,129 @@ describe('pricing lookup chain (BACKLOG C1·C2)', () => {
   });
 });
 
-// BEDROCK-COST-LEDGER(0.2.26) — mantle-openai 비-Anthropic Bedrock id 분류.
-// 이 id 들의 Bedrock 단가 수치 근거가 하나도 확보되지 않아 BEDROCK_PRICING_USD 에 행을 «추가하지 않았다»
-// ⇒ 지금 선택 가능한 전 id 가 unknown 에 머문다(0원으로 꾸미지 않는다). 단가 근거가 들어오면 그 칸은 known·source:'bedrock-catalog' 로 옮겨간다.
+// BEDROCK-COST-LEDGER(0.2.38) — mantle-openai 비-Anthropic Bedrock id 분류.
+// 근거 = AWS Bedrock price list(us-east-1 — mantle-openai 고정 리전)의 `USE1-<id>-mantle-{input,output}-tokens-standard`
+// (게시 2026-10-16T21:08:06Z). 근거 있는 행만 known·source:'bedrock-catalog', 근거 없는 id 는 unknown(0원으로 꾸미지 않는다).
 import { BEDROCK_MODELS } from '../llm/bedrock.js';
-describe('Bedrock non-Anthropic classification (BEDROCK-COST-LEDGER 0.2.26)', () => {
-  it('every currently selectable mantle-openai non-Anthropic id stays unknown — no evidence-backed price row exists', () => {
-    const nonAnthropic = BEDROCK_MODELS.filter((m) => m.route === 'mantle-openai');
-    expect(nonAnthropic.length).toBeGreaterThan(0);
-    for (const entry of nonAnthropic) {
-      const got = estimateLlmCost({ model: entry.id, inputTokens: MILLION, outputTokens: MILLION }, noOverlay);
-      expect(got).toEqual({ kind: 'unknown', model: entry.id });
+import { BEDROCK_PRICING_USD, type LlmPricingUsd } from './llm-cost.js';
+// ⛔ `BEDROCK_NON_ANTHROPIC_PRICING_USD` 는 정적 import 금지 — 착지 전 base 에 «없는» export 다.
+// 정적으로 당기면 base 실행이 판정 실패가 아니라 module-load-error 로 죽어 RED 증인이 «구분된 실패»로
+// 잡히지 않는다(0.2.38 게이트 회고). 지연 import 면 base 에서는 `undefined` → 아래 단언이 판정 실패로 떨어진다.
+async function bedrockNonAnthropicPricingTable(): Promise<Readonly<Record<string, LlmPricingUsd>> | undefined> {
+  const mod = await import('./llm-cost.js') as { BEDROCK_NON_ANTHROPIC_PRICING_USD?: Readonly<Record<string, LlmPricingUsd>> };
+  return mod.BEDROCK_NON_ANTHROPIC_PRICING_USD;
+}
+describe('Bedrock non-Anthropic classification (BEDROCK-COST-LEDGER 0.2.38)', () => {
+  it('lets the built-in catalog win when an id collides with a Bedrock price row', async () => {
+    const table = await bedrockNonAnthropicPricingTable();
+    const ids = Object.keys(table ?? {});
+    expect(ids.length).toBeGreaterThan(0);
+    for (const id of ids) {
+      expect(BUILTIN_CATALOG.models.some((entry) => entry.id === id)).toBe(false);
+      const synthetic = {
+        id,
+        provider: 'openai',
+        family: 'test',
+        contextWindow: 1_000,
+        inputPerMtok: 9,
+        outputPerMtok: 17,
+        local: false,
+        tags: [],
+        bestFor: [],
+      } as (typeof BUILTIN_CATALOG.models)[number];
+      BUILTIN_CATALOG.models.push(synthetic);
+      try {
+        expect(estimateLlmCost({ model: id, inputTokens: MILLION, outputTokens: 0 }, noOverlay))
+          .toMatchObject({ kind: 'known', usd: 9, source: 'catalog' });
+      } finally {
+        BUILTIN_CATALOG.models.pop();
+      }
+    }
+  });
+
+  it('keeps every AWS Bedrock price row free of a built-in catalog id collision', async () => {
+    const table = await bedrockNonAnthropicPricingTable();
+    for (const id of Object.keys(table ?? {})) {
+      expect(BUILTIN_CATALOG.models.some((entry) => entry.id === id)).toBe(false);
+    }
+  });
+
+  it('evidence-backed mantle-openai ids price as bedrock-catalog/known (1M in + 1M out)', async () => {
+    // base 에는 이 표가 «없다» — 이 단언이 base 에서 판정 실패로 떨어지는 RED 증인의 하나다.
+    const table = await bedrockNonAnthropicPricingTable();
+    expect(table).toBeDefined();
+    const evidenced: Array<[id: string, inputPerM: number, outputPerM: number]> = [
+      ['zai.glm-4.7-flash', 0.07, 0.4],
+      ['deepseek.v3.2', 0.62, 1.85],
+      ['moonshotai.kimi-k2.5', 0.6, 3],
+      ['qwen.qwen3-coder-next', 0.5, 1.2],
+      ['minimax.minimax-m2.5', 0.3, 1.2],
+      ['mistral.devstral-2-123b', 0.4, 2],
+    ];
+    const selectable = new Set(BEDROCK_MODELS.filter((m) => m.route === 'mantle-openai').map((m) => m.id));
+    for (const [id, inputPerM, outputPerM] of evidenced) {
+      // 표에 있는 id 는 «지금 mantle-openai 로 선택 가능한» 정본 목록(src/llm/bedrock.ts)의 원소여야 한다.
+      expect(selectable.has(id)).toBe(true);
+      // 표 행이 AWS price list 근거의 수치 그대로다 — 추정치가 아니다.
+      expect(table?.[id]).toEqual({ inputPerM, outputPerM });
+      expect(estimateLlmCost({ model: id, inputTokens: MILLION, outputTokens: MILLION }, noOverlay)).toEqual({
+        kind: 'known',
+        model: id,
+        usd: inputPerM + outputPerM,
+        source: 'bedrock-catalog',
+        cacheReadPricedAt: 'input-rate',
+        cacheWritePricedAt: 'input-rate',
+      });
+      // 실제 invoke id 모양(`bedrock/<id>-v1:0`)도 같은 칸으로 온다.
+      expect(estimateLlmCost({ model: `bedrock/${id}-v1:0`, inputTokens: MILLION, outputTokens: 0 }, noOverlay))
+        .toMatchObject({ kind: 'known', source: 'bedrock-catalog', usd: inputPerM });
+    }
+  });
+
+  it('ids with no price row in the AWS price list stay unknown — never a zero-dressed known', async () => {
+    const table = await bedrockNonAnthropicPricingTable();
+    for (const id of ['openai.gpt-6-sol', 'openai.gpt-6-luna', 'zai.glm-5']) {
+      expect(table?.[id]).toBeUndefined();
+      const got = estimateLlmCost({ model: id, inputTokens: MILLION, outputTokens: MILLION }, noOverlay);
+      expect(got).toEqual({ kind: 'unknown', model: id });
       expect('usd' in got).toBe(false);
     }
   });
 
-  it('bedrock/ aliases of non-Anthropic ids stay unknown too', () => {
-    for (const model of ['bedrock/zai.glm-5', 'bedrock/openai.gpt-6-sol']) {
+  it('bedrock/ aliases without a price row and ids outside the catalog fall to the unknown safety branch', () => {
+    for (const model of ['bedrock/zai.glm-5', 'bedrock/openai.gpt-6-sol', 'bedrock/acme.mystery-1']) {
       expect(estimateLlmCost({ model, inputTokens: MILLION, outputTokens: MILLION }, noOverlay)).toEqual({ kind: 'unknown', model });
     }
+  });
+
+  it('every selectable mantle-openai id has exactly one decided outcome — known iff a price row exists', async () => {
+    const table = (await bedrockNonAnthropicPricingTable()) ?? {};
+    const nonAnthropic = BEDROCK_MODELS.filter((m) => m.route === 'mantle-openai');
+    expect(nonAnthropic.length).toBeGreaterThan(0);
+    for (const entry of nonAnthropic) {
+      const got = estimateLlmCost({ model: entry.id, inputTokens: MILLION, outputTokens: MILLION }, noOverlay);
+      const row = table[entry.id];
+      if (row) {
+        expect(got).toEqual({
+          kind: 'known',
+          model: entry.id,
+          usd: row.inputPerM + row.outputPerM,
+          source: 'bedrock-catalog',
+          cacheReadPricedAt: 'input-rate',
+          cacheWritePricedAt: 'input-rate',
+        });
+      } else {
+        expect(got).toEqual({ kind: 'unknown', model: entry.id });
+      }
+    }
+  });
+
+  it('the landed Claude 5.5 Bedrock table is byte-identical (preservation contract)', () => {
+    expect(JSON.stringify(BEDROCK_PRICING_USD)).toBe(
+      '{"claude-haiku-5-5":{"inputPerM":0.1,"outputPerM":0.5,"cacheWritePerM":0.125,"cacheReadPerM":0.01},'
+      + '"claude-sonnet-5-5":{"inputPerM":2,"outputPerM":10,"cacheWritePerM":2.5,"cacheReadPerM":0.1},'
+      + '"claude-opus-5-5":{"inputPerM":4,"outputPerM":20,"cacheWritePerM":5,"cacheReadPerM":0.2}}',
+    );
   });
 
   it('date suffixes and us./global. prefixes do not open the Claude-only Bedrock gate', () => {
@@ -470,6 +575,25 @@ describe('Bedrock non-Anthropic classification (BEDROCK-COST-LEDGER 0.2.26)', ()
       expect(row).toBeDefined();
       expect(row![2]).toMatchObject({ model: 'zai.glm-5', billingProvider: 'bedrock' });
       expect((row![2] as { cost: unknown }).cost).toEqual({ kind: 'unknown', model: 'zai.glm-5' });
+
+      // 근거 있는 id 는 같은 생산 원장 경로에서 bedrock-catalog/known 으로 찍힌다.
+      logAgentTurnUsage('deepseek.v3.2', {
+        provider: 'openai',
+        inputTokens: MILLION,
+        outputTokens: MILLION,
+      }, { providerName: 'bedrock', site: 'bedrock-cost-known-test' });
+      const knownRow = spy.mock.calls.find((call) =>
+        call[0] === 'llm.usage' && call[1] === 'llm-usage' && (call[2] as { site?: string })?.site === 'bedrock-cost-known-test');
+      expect(knownRow).toBeDefined();
+      expect(knownRow![2]).toMatchObject({ model: 'deepseek.v3.2', billingProvider: 'bedrock' });
+      expect((knownRow![2] as { cost: unknown }).cost).toEqual({
+        kind: 'known',
+        model: 'deepseek.v3.2',
+        usd: 0.62 + 1.85,
+        source: 'bedrock-catalog',
+        cacheReadPricedAt: 'input-rate',
+        cacheWritePricedAt: 'input-rate',
+      });
     } finally {
       spy.mockRestore();
     }

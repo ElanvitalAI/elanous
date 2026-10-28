@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { displayedSlashCommandNames } from '../src/chat/index.js';
+import { displayedSlashCommandNames, SLASH_COMMANDS } from '../src/chat/index.js';
 import { defaultTelegramCommands, dispatchTelegramSlash, type TgCommandContext } from '../src/telegram-commands.js';
 import { classifyIntake } from '../src/ad-pipeline/intake.js';
 import { createAdPipelineDeps, runAdPipeline, type AdPipelinePlan } from '../src/ad-pipeline/run.js';
@@ -52,8 +52,9 @@ describe('/ad surface wiring', () => {
     expect(formatAdProductionWarnings({ unwiredProduction: [] } as Pick<AdPipelinePlan, 'unwiredProduction'>)).toEqual([]);
   });
 
-  test('TUI catalog exposes ad and the dashboard dispatcher consumes the same catalog name', () => {
-    expect(displayedSlashCommandNames()).toContain('ad');
+  test('compact TUI catalog hides ad while the dashboard dispatcher retains registration', () => {
+    expect(SLASH_COMMANDS.find(({ name }) => name === 'ad')?.hidden).toBe(true);
+    expect(displayedSlashCommandNames()).not.toContain('ad');
     const registry = buildDashboardSlashRegistry();
     expect(registry.names()).toContain('ad');
   });

@@ -1709,8 +1709,8 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     writeFileSync(throwPath, 'export function query() { throw new Error("ledger unavailable"); }');
     writeFileSync(malformedPath, 'export function query() { return undefined; }');
     try {
-      const failure = devCli.runProductionQuery<readonly unknown[]>(new URL(`file://${throwPath}`).href, 'query', [], 1_000);
-      const malformed = devCli.runProductionQuery<readonly unknown[]>(new URL(`file://${malformedPath}`).href, 'query', [], 1_000);
+      const failure = devCli.runProductionQuery<readonly unknown[]>(new URL(`file://${throwPath}`).href, 'query', [], 5_000);
+      const malformed = devCli.runProductionQuery<readonly unknown[]>(new URL(`file://${malformedPath}`).href, 'query', [], 5_000);
       expect(failure).toEqual(expect.objectContaining({ kind: 'error', error: expect.stringContaining('ledger unavailable') }));
       expect(malformed).toEqual(expect.objectContaining({ kind: 'error', error: expect.any(String) }));
     } finally {

@@ -86,6 +86,7 @@ export interface GateArtifactSummary extends GateArtifactCounts {
   /** 판정 줄(`tests: …` / `[gate-baseline] …` / `shards: unmeasured (…)`) 그대로. */
   verdictLine?: string;
   timeoutRechecks?: readonly { name: string; file: string; originalDiagnostic?: string; result: 'pass' | 'timeout' | 'failure' | 'unknown'; elapsedMs: number; rawResultLine: string }[];
+  interferenceRechecks?: readonly { name: string; file: string; head: 'pass' | 'timeout' | 'failure' | 'unknown'; base: 'pass' | 'timeout' | 'failure' | 'unknown'; classification: 'interference' | 'unchanged' }[];
   exitCode: number;
   /** 정수 칸 중 하나라도 null 일 때만 — 왜 못 셌나(한 줄). */
   countsUnavailableReason?: string;
@@ -131,6 +132,7 @@ export interface GateArtifactInput {
   verdict: string | null;
   verdictLine?: string;
   timeoutRechecks?: readonly { name: string; file: string; originalDiagnostic: string; result: 'pass' | 'timeout' | 'failure' | 'unknown'; elapsedMs: number; rawResultLine: string }[];
+  interferenceRechecks?: readonly { name: string; file: string; head: 'pass' | 'timeout' | 'failure' | 'unknown'; base: 'pass' | 'timeout' | 'failure' | 'unknown'; classification: 'interference' | 'unchanged' }[];
   exitCode: number;
   /** 판정 정수(못 센 칸은 null ⊕ countsUnavailableReason). 안 주면 다섯 다 null · 이유 'not recorded' — 칸은 «늘» 쓴다. */
   counts?: GateArtifactCounts;
@@ -222,6 +224,7 @@ export function writeGateArtifacts(input: GateArtifactInput): { summaryPath: str
     verdict: input.verdict,
     ...(input.verdictLine !== undefined ? { verdictLine: input.verdictLine } : {}),
     ...(input.timeoutRechecks ? { timeoutRechecks: input.timeoutRechecks } : {}),
+    ...(input.interferenceRechecks ? { interferenceRechecks: input.interferenceRechecks } : {}),
     exitCode: input.exitCode,
     introduced: counts.introduced,
     preexisting: counts.preexisting,

@@ -1113,6 +1113,8 @@ export async function executeDevSelfRun(
     }
     await superviseRun({
       initial: [initialJob],
+      // Pod worktree paths are not necessarily mounted in this parent process.
+      knowhowRepo: process.cwd(),
       // A review-oscillation repair goal runs through the existing piece executor (fragment re-execution with the
       // authored goal as its feature). Without that executor the rerun could only replay the same goal — declare false.
       repairGoalExecution: supervise.executePiece !== undefined,

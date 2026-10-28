@@ -104,6 +104,73 @@ describe('skill_exec runtime', () => {
     expect(result.output.length).toBeGreaterThan(50_000);
   });
 
+  test('a stalled skill returns a timeout tool result and aborts its child', async () => {
+    let childSignal: AbortSignal | undefined;
+    setResearchInvoker(async (_skill, _task, _progress, signal) => {
+      childSignal = signal;
+      return new Promise(() => {});
+    });
+    const result = await dispatchSkillExec(
+      { skill: 'omni-digest', task: 'research' }, {}, { timeoutMs: 20 },
+    );
+    expect(result).toMatchObject({ skill: 'omni-digest', ok: false, error: 'skill-exec-timeout' });
+    expect(result.output).toContain('시간');
+    expect(childSignal?.aborted).toBe(true);
+  });
+
+  test('parent cancellation ends a stalled skill without waiting for the invoker', async () => {
+    const parent = new AbortController();
+    setResearchInvoker(async () => new Promise(() => {}));
+    const pending = dispatchSkillExec(
+      { skill: 'omni-digest', task: 'research' }, {}, { signal: parent.signal, timeoutMs: 60_000 },
+    );
+    parent.abort();
+    await expect(pending).resolves.toMatchObject({ ok: false, error: 'skill-exec-cancelled' });
+  });
+
+  test('a cooperative child abort still reports the parent timeout reason', async () => {
+    setResearchInvoker(async (_skill, _task, _progress, signal) => new Promise((resolve) => {
+      signal?.addEventListener('abort', () => resolve({ ok: false, output: '', error: 'AbortError' }), { once: true });
+    }));
+    await expect(dispatchSkillExec({ skill: 'omni-digest', task: 'research' }, {}, { timeoutMs: 20 }))
+      .resolves.toMatchObject({ ok: false, error: 'skill-exec-timeout' });
+  });
+
+  test('registered runtime passes parent signal into the nested skill', async () => {
+    const parent = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    setResearchInvoker(async (_skill, _task, _progress, signal) => {
+      receivedSignal = signal;
+      return new Promise(() => {});
+    });
+    const pending = skillExecRuntime.run({ skill: 'omni-digest', task: 'research' }, { surface: 'tui', signal: parent.signal });
+    parent.abort();
+    await expect(pending).resolves.toMatchObject({ ok: false, error: 'skill-exec-cancelled' });
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
+  test('already cancelled parent never starts a nested skill', async () => {
+    const parent = new AbortController();
+    parent.abort();
+    let invoked = false;
+    setResearchInvoker(async () => { invoked = true; return { ok: true, output: 'unexpected' }; });
+    const result = await dispatchSkillExec({ skill: 'omni-digest', task: 'research' }, {}, { signal: parent.signal });
+    expect(result).toMatchObject({ ok: false, error: 'skill-exec-cancelled' });
+    expect(invoked).toBe(false);
+  });
+
+  test('a low-quality research result yields a bounded discovery card without changing failure', async () => {
+    setResearchInvoker(async () => ({ ok: false, output: 'No data found for the period premium.' }));
+    let gap = '';
+    const result = await dispatchSkillExec({ skill: 'omni-digest', task: 'period premium data' }, {
+      discoverPlugin: async (request) => { gap = request; return { card: 'Plugin discovery · proposal only' }; },
+    });
+    expect(gap).toBe('period premium data');
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('No data found');
+    expect(result.discoveryCard).toBe('Plugin discovery · proposal only');
+  });
+
   test('rejects a whitespace-padded skill name rather than normalizing it', async () => {
     const result = await dispatchSkillExec({ skill: ' omni-digest ', task: 'do work' });
 

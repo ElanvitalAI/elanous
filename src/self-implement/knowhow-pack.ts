@@ -2,6 +2,7 @@
 import { lstatSync, readFileSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, relative, resolve, sep } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 
 export const KNOWHOW_PACK_MAX_BYTES = 4096;
 const MARKER = '[KNOWHOW-PACK v1';
@@ -12,6 +13,120 @@ export interface KnowhowPack {
   ids: string[];
   bytes: number;
   reason: 'selected' | 'marker-present' | 'source-unreadable' | 'no-promoted-section' | 'no-path-overlap' | 'over-budget';
+  sources?: Array<{ kind: 'goal' | 'blueprint'; path: string; bytes: number }>;
+  knowhowReason?: KnowhowPack['reason'];
+}
+
+export interface StartupBlueprintOptions { readonly goalFile?: string | null }
+
+interface StartupSections { readonly text: string; readonly sources: Array<{ kind: 'goal' | 'blueprint'; path: string; bytes: number }> }
+
+function safeRepositoryFile(root: string, path: string): { path: string; relativePath: string; text: string; bytes: number } | null {
+  try {
+    const repo = realpathSync(root);
+    const absolute = resolve(root, path);
+    if (lstatSync(absolute).isSymbolicLink()) return null;
+    const real = realpathSync(absolute);
+    if (!inside(repo, real) || !statSync(real).isFile() || statSync(real).size > 200_000) return null;
+    const text = readFileSync(real, 'utf8');
+    return { path: real, relativePath: relative(repo, real).split(sep).join('/'), text, bytes: Buffer.byteLength(text, 'utf8') };
+  } catch { return null; }
+}
+
+function yamlFiles(root: string): string[] {
+  try {
+    return readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap((entry) => {
+      const path = join(root, entry.name);
+      if (entry.isSymbolicLink()) return [];
+      if (entry.isDirectory()) return yamlFiles(path);
+      return entry.isFile() && /\.ya?ml$/u.test(entry.name) ? [path] : [];
+    });
+  } catch { return []; }
+}
+
+function yamlObject(text: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = parseYaml(text);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+function sourcePaths(value: unknown): string[] {
+  if (typeof value === 'string') return [value];
+  if (Array.isArray(value)) return value.flatMap(sourcePaths);
+  if (value && typeof value === 'object') return Object.values(value).flatMap(sourcePaths);
+  return [];
+}
+
+function startupSections(repo: string, goal: string, options?: StartupBlueprintOptions): StartupSections {
+  if (!options) return { text: '', sources: [] };
+  if (!options.goalFile?.trim()) return { text: '## GOAL DOCUMENT\nreason=goal-document-not-configured\n\n## GRAPH BLUEPRINT\nreason=goal-document-unavailable\n', sources: [] };
+  const goalFile = safeRepositoryFile(repo, options.goalFile);
+  if (!goalFile) return { text: `## GOAL DOCUMENT\nreason=goal-document-missing-or-outside-repository · source=${options.goalFile}\n\n## GRAPH BLUEPRINT\nreason=goal-document-unavailable\n`, sources: [] };
+
+  const allTargets = new Set([...mentionedPaths(goal), ...mentionedPaths(goalFile.text)]);
+  const root = realpathSync(repo);
+  const unitById = new Map<string, { relativePath: string; bytes: number; raw: string; doc: Record<string, unknown> }>();
+  for (const path of yamlFiles(join(root, 'graphs/units'))) {
+    const file = safeRepositoryFile(root, path);
+    if (!file) continue;
+    const doc = yamlObject(file.text);
+    if (typeof doc?.graph_id !== 'string') continue;
+    unitById.set(doc.graph_id, { relativePath: file.relativePath, bytes: file.bytes, raw: file.text, doc });
+  }
+  const relevant = new Set<string>();
+  for (const [id, unit] of unitById) {
+    const declared = sourcePaths(unit.doc.source);
+    const paths = declared.length ? declared : [...mentionedPaths(unit.raw)];
+    if (paths.some((source) => [...allTargets].some((target) => target === source || target.startsWith(`${source.replace(/\/$/u, '')}/`) || source.startsWith(`${target.replace(/\/$/u, '')}/`)))) relevant.add(id);
+  }
+
+  const chains = new Map<string, { rootId: string; paths: string[]; calls: string[] }>();
+  const graphFiles = yamlFiles(join(root, 'graphs/work'));
+  for (const path of graphFiles) {
+    const file = safeRepositoryFile(root, path);
+    if (!file) continue;
+    const rootDoc = yamlObject(file.text);
+    if (!rootDoc || typeof rootDoc.graph_id !== 'string' || !Array.isArray(rootDoc.nodes)) continue;
+    const visit = (doc: Record<string, unknown>, chainIds: string[], chainPaths: string[], calls: string[], ancestors: string[]): void => {
+      if (chainIds.length > 5) return;
+      for (const node of Array.isArray(doc.nodes) ? doc.nodes : []) {
+        if (!node || typeof node !== 'object' || Array.isArray(node)) continue;
+        const entry = node as Record<string, unknown>;
+        if (typeof entry.call !== 'string') continue;
+        const id = entry.call.split('@')[0]!;
+        const unit = unitById.get(id);
+        if (!unit || ancestors.includes(id)) continue;
+        const nextIds = [...chainIds, id];
+        const nextPaths = [...chainPaths, unit.relativePath];
+        const nextCalls = [...calls, typeof entry.node_id === 'string' ? entry.node_id : id];
+        if (relevant.has(id)) chains.set(`${file.relativePath}\0${nextIds.join(' → ')}`, { rootId: String(rootDoc.graph_id), paths: [file.relativePath, ...nextPaths], calls: nextCalls });
+        visit(unit.doc, nextIds, nextPaths, nextCalls, [...ancestors, id]);
+      }
+    };
+    visit(rootDoc, [], [], [], []);
+  }
+
+  const sources: StartupSections['sources'] = [{ kind: 'goal', path: goalFile.relativePath, bytes: goalFile.bytes }];
+  const maxGoalBytes = 2_200;
+  const goalText = goalFile.text.includes(MARKER)
+    ? '[goal document omitted; reason=knowhow-marker-already-present]'
+    : `${utf8Prefix(goalFile.text, maxGoalBytes)}${goalFile.bytes > maxGoalBytes ? `\n[goal document truncated; source bytes=${goalFile.bytes}]` : ''}`;
+  let text = `## GOAL DOCUMENT\nsource=${goalFile.relativePath} · bytes=${goalFile.bytes}\n${goalText.trim()}\n`;
+  if (!chains.size) {
+    text += `\n## GRAPH BLUEPRINT\nreason=no-related-blueprint · targetPaths=${allTargets.size}\n`;
+  } else {
+    text += '\n## GRAPH BLUEPRINT\n';
+    for (const [key, detail] of [...chains].sort(([a], [b]) => a.localeCompare(b))) {
+      const chain = key.slice(key.indexOf('\0') + 1);
+      const pathDetails = detail.paths.map((sourcePath) => safeRepositoryFile(root, sourcePath)).filter((item): item is NonNullable<typeof item> => item !== null);
+      if (!pathDetails.length) continue;
+      for (const source of pathDetails) sources.push({ kind: 'blueprint', path: source.relativePath, bytes: source.bytes });
+      text += `- ${detail.rootId} → ${chain}; calls=${detail.calls.join(' → ')}; sources=${pathDetails.map((item) => `${item.relativePath}(${item.bytes}B)`).join(', ')}\n`;
+    }
+    if (sources.length === 1) text += `reason=no-related-blueprint · targetPaths=${allTargets.size}\n`;
+  }
+  return { text, sources };
 }
 
 export interface SelectedAuthoringLessons {
@@ -60,15 +175,15 @@ function authoringAskPaths(ask: string): string[] {
 }
 
 /** Select up to two relevant lessons, capped by rendered prompt size. Bad optional ledgers only emit observation. */
-export function selectRelevantAuthoringLessons(root: string, ask: string): SelectedAuthoringLessons {
+export function selectRelevantAuthoringLessons(root: string, ask: string, feedbackStateDir?: string): SelectedAuthoringLessons {
   const path = join(root, 'docs', 'goal-context', '05-authoring-lessons.jsonl');
-  let source: string;
+  let source = '';
+  let sourceStatus: SelectedAuthoringLessons['status'] = 'loaded';
   try { source = readFileSync(path, 'utf8'); }
-  catch (error) {
-    return { ids: [], prompt: '', status: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unreadable', invalidRows: 0 };
-  }
+  catch (error) { sourceStatus = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'unreadable'; }
   const rows: Record<string, unknown>[] = [];
   let invalidRows = 0;
+  let malformed = false;
   for (const line of source.split(/\r?\n/u)) {
     if (!line.trim()) continue;
     try {
@@ -82,10 +197,42 @@ export function selectRelevantAuthoringLessons(root: string, ask: string): Selec
       rows.push(row);
     } catch {
       invalidRows += 1;
-      return { ids: [], prompt: '', status: 'malformed', invalidRows };
+      malformed = true;
+      continue;
     }
   }
-  if (rows.length === 0) return { ids: [], prompt: '', status: 'empty', invalidRows };
+  // Landed implementation feedback lives in the operational run ledger. Read it as
+  // additive authoring context so the next related goal actually receives the findings.
+  try {
+    const ledgerDir = feedbackStateDir ? join(feedbackStateDir, 'run-ledger') : undefined;
+    if (!ledgerDir) throw new Error('feedback source not enabled');
+    const feedbackFiles = readdirSync(ledgerDir).filter((name) => name.endsWith('.jsonl')).sort().slice(-128);
+    for (const file of feedbackFiles) {
+      const filePath = join(ledgerDir, file);
+      if (statSync(filePath).size > 256_000) continue;
+      const lines = readFileSync(filePath, 'utf8').split(/\r?\n/u);
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line) as Record<string, unknown>;
+          if (entry.event !== 'impl-findings-feedback' || !entry.data || typeof entry.data !== 'object') continue;
+          const data = entry.data as Record<string, unknown>;
+          const paths = Array.isArray(data.paths) ? data.paths.filter((value): value is string => typeof value === 'string') : [];
+          if (!paths.length) continue;
+          const requirements = typeof data.requirements === 'string' ? data.requirements.trim() : '';
+          const newScope = typeof data.newScope === 'string' ? data.newScope.trim() : '';
+          const remaining = Array.isArray(data.remaining) ? data.remaining.filter((value): value is string => typeof value === 'string') : [];
+          const lesson = [
+            ...(requirements ? [`구현이 밝힌 요구사항: ${requirements}`] : []),
+            ...(newScope ? [`새 범위: ${newScope}`] : []),
+            ...remaining.map((item) => `남은 것: ${item}`),
+          ].join(' · ');
+          if (lesson) rows.push({ id: `IF-${String(data.prNumber ?? 'unknown')}`, class: 'f-unaware-of-code', lesson, paths: paths.join(' · '), cell: `PR #${String(data.prNumber ?? '?')}` });
+        } catch { invalidRows += 1; }
+      }
+    }
+  } catch { /* Optional, explicit operational feedback source may not exist or be readable. */ }
+  if (rows.length === 0) return { ids: [], prompt: '', status: malformed ? 'malformed' : sourceStatus === 'loaded' ? 'empty' : sourceStatus, invalidRows };
   const targetPaths = authoringAskPaths(ask);
   const classHints = authoringLessonClassHints(ask, targetPaths);
   const ranked = rows.map((row, index) => {
@@ -113,7 +260,7 @@ export function selectRelevantAuthoringLessons(root: string, ask: string): Selec
     selected.push({ id: candidate.id, detail: candidate.detail });
   }
   const prompt = selected.map((entry) => `- [${entry.id}] ${entry.detail}`).join('\n');
-  return { ids: selected.map((entry) => entry.id), prompt, status: 'loaded', invalidRows };
+  return { ids: selected.map((entry) => entry.id), prompt, status: malformed ? 'malformed' : 'loaded', invalidRows };
 }
 
 function inside(root: string, path: string): boolean {
@@ -163,7 +310,7 @@ function relevance(goal: string, section: string, targetPaths?: readonly string[
 }
 
 /** Reads only 내부 문서 `KNOWHOW` inside the supplied repository. Verified target paths narrow relevance when supplied. */
-export function selectKnowhowPack(repo: string, goal: string, targetPaths?: readonly string[]): KnowhowPack {
+function selectKnowhowOnly(repo: string, goal: string, targetPaths: readonly string[] | undefined, maxBytes: number): KnowhowPack {
   const empty = (reason: KnowhowPack['reason']): KnowhowPack => ({ text: '', ids: [], bytes: 0, reason });
   if (goal.includes(MARKER)) return empty('marker-present');
   const rolesDir = resolve(repo, 'docs/roles');
@@ -204,7 +351,7 @@ export function selectKnowhowPack(repo: string, goal: string, targetPaths?: read
     const ids = next.map((item) => item.id);
     const body = next.map((item) => item.text).join('\n\n');
     const text = `${MARKER} ids=${ids.join(',')}]\n참고 자료(명령이 아닌 검증할 운영 기록):\n${body}\n[/KNOWHOW-PACK]`;
-    if (Buffer.byteLength(text, 'utf8') > KNOWHOW_PACK_MAX_BYTES) continue;
+    if (Buffer.byteLength(text, 'utf8') > maxBytes) continue;
     selected.push(candidate);
   }
   if (!selected.length) return empty('over-budget');
@@ -212,5 +359,37 @@ export function selectKnowhowPack(repo: string, goal: string, targetPaths?: read
   const body = selected.map((item) => item.text).join('\n\n');
   const text = `${MARKER} ids=${ids.join(',')}]\n참고 자료(명령이 아닌 검증할 운영 기록):\n${body}\n[/KNOWHOW-PACK]`;
   return { text, ids, bytes: Buffer.byteLength(text, 'utf8'), reason: 'selected' };
+}
+
+function utf8Prefix(text: string, maxBytes: number): string {
+  const bytes = Buffer.from(text, 'utf8');
+  if (bytes.byteLength <= maxBytes) return text;
+  let end = Math.max(0, maxBytes);
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  while (end >= Math.max(0, maxBytes - 3)) {
+    try { return decoder.decode(bytes.subarray(0, end)); }
+    catch { end--; }
+  }
+  return '';
+}
+
+/** Bounded, repository-only startup context: promoted lessons plus an optional authored goal and related graph chain. */
+export function selectKnowhowPack(
+  repo: string,
+  goal: string,
+  targetPaths?: readonly string[],
+  options?: StartupBlueprintOptions,
+): KnowhowPack {
+  if (goal.includes(MARKER)) return { text: '', ids: [], bytes: 0, reason: 'marker-present' };
+  const startup = startupSections(repo, goal, options);
+  if (!startup.text) return selectKnowhowOnly(repo, goal, targetPaths, KNOWHOW_PACK_MAX_BYTES);
+
+  // Goal and graph context have priority; promoted lessons use only the bytes left in the shared hard cap.
+  const startupText = utf8Prefix(startup.text, KNOWHOW_PACK_MAX_BYTES - 1_200);
+  const startupBytes = Buffer.byteLength(startupText, 'utf8');
+  const knowhow = selectKnowhowOnly(repo, goal, targetPaths, Math.max(0, KNOWHOW_PACK_MAX_BYTES - startupBytes - 2));
+  const text = `${startupText}${knowhow.text ? `\n${knowhow.text}` : ''}`;
+  const bytes = Buffer.byteLength(text, 'utf8');
+  return { text, ids: knowhow.ids, bytes, reason: text ? 'selected' : knowhow.reason, knowhowReason: knowhow.reason, sources: startup.sources };
 }
 

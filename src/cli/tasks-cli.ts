@@ -843,7 +843,7 @@ export function coverCardsInWindow(cards: readonly CoverCardRow[] | null, window
 }
 
 /** Read the card ledger itself. A missing file or malformed row makes the aggregate unknown. */
-function readImplementCardBindings(statePath: string): ImplementCardRunBinding[] {
+function readImplementCardBindings(statePath: string): { bindings: ImplementCardRunBinding[]; cleanup: Array<{ cardId: string; outcome: 'complete' | 'partial'; at: string }> | null } {
   if (!existsSync(statePath)) throw new Error('TASK-AGENT card ledger is missing');
   const state = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath);
   if (state.tasks !== undefined && (!state.tasks || typeof state.tasks !== 'object' || Array.isArray(state.tasks))) {
@@ -851,14 +851,38 @@ function readImplementCardBindings(statePath: string): ImplementCardRunBinding[]
   }
   const cards = Object.entries(state.tasks ?? {});
   if (cards.length >= COVER_QUERY_LIMIT) throw new Error('TASK-AGENT card ledger reached query bound');
-  return cards.map(([key, card]) => {
+  const bindings: ImplementCardRunBinding[] = [];
+  const cleanup: Array<{ cardId: string; outcome: 'complete' | 'partial'; at: string }> = [];
+  let cleanupUnreadable = false;
+  for (const [key, card] of cards) {
     if (!card || typeof card !== 'object' || Array.isArray(card) || typeof card.id !== 'string' || !card.id
       || card.id !== key || (card.runId != null && typeof card.runId !== 'string')
       || (card.runChildId != null && typeof card.runChildId !== 'string')) {
       throw new Error('TASK-AGENT card binding is malformed');
     }
-    return { cardId: card.id, runId: card.runId, runChildId: card.runChildId };
-  });
+    bindings.push({ cardId: card.id, runId: card.runId, runChildId: card.runChildId });
+    if (card.postLand === undefined) continue;
+    const post = card.postLand;
+    if (!post || (post.outcome !== 'complete' && post.outcome !== 'partial')
+      || !Number.isSafeInteger(post.pr) || typeof post.head !== 'string' || !post.head
+      || typeof post.at !== 'string' || !Number.isFinite(Date.parse(post.at))
+      || !Array.isArray(card.history)) { cleanupUnreadable = true; continue; }
+    if (card.history.some((event) => !event || typeof event !== 'object')) { cleanupUnreadable = true; continue; }
+    if (card.status !== 'done' || card.prTerminal?.state !== 'MERGED'
+      || card.prTerminal.pr !== post.pr || typeof card.prTerminal.head !== 'string'
+      || card.prTerminal.head.toLowerCase() !== post.head.toLowerCase()) continue;
+    // A same-outcome reconciliation refreshes postLand.at without appending another history event.
+    const sourceEvents = card.history.filter((event) => event.event === 'postland-card' && event.pr === post.pr
+      && typeof event.head === 'string' && event.head.toLowerCase() === post.head.toLowerCase());
+    if (sourceEvents.length === 0) continue;
+    if (sourceEvents.some((event) => typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at)))) {
+      cleanupUnreadable = true;
+      continue;
+    }
+    const sourceAt = sourceEvents[sourceEvents.length - 1]!.at;
+    cleanup.push({ cardId: card.id, outcome: post.outcome, at: sourceAt });
+  }
+  return { bindings, cleanup: cleanupUnreadable ? null : cleanup };
 }
 
 function implementLedgerDirectories(statePath: string, includeTest: boolean): string[] {
@@ -987,10 +1011,13 @@ export function readTaskAgentCover(
   };
   // A supplied reader overrides only its own source. The ordinary CLI always reads both physical ledgers.
   try {
-    input.implementCardRuns = goalReaders.coverImplementCardRuns
-      ? goalReaders.coverImplementCardRuns()
-      : readImplementCardBindings(goalReaders.taskStatePath ?? taskStatePathDefault());
-  } catch { input.implementCardRuns = null; }
+    if (goalReaders.coverImplementCardRuns) input.implementCardRuns = goalReaders.coverImplementCardRuns();
+    else {
+      const { bindings, cleanup } = readImplementCardBindings(goalReaders.taskStatePath ?? taskStatePathDefault());
+      input.implementCardRuns = bindings;
+      input.cleanupCards = cleanup?.filter((card) => inWindow(card.at)) ?? null;
+    }
+  } catch { input.implementCardRuns = null; input.cleanupCards = null; input.implementReadFailure = 'card-ledger-unreadable'; }
   try {
     input.implementRunMerges = goalReaders.coverImplementRunMerges
       ? goalReaders.coverImplementRunMerges()
@@ -1001,7 +1028,7 @@ export function readTaskAgentCover(
           implementLedgerDirectories(goalReaders.taskStatePath ?? taskStatePathDefault(), goalReaders.coverIncludeTest === true),
           window,
         );
-  } catch { input.implementRunMerges = null; }
+  } catch { input.implementRunMerges = null; input.implementReadFailure ??= 'run-ledger-unreadable'; }
   const orders = orderRead && !orderRead.limitReached ? coverEvents(orderRead.rows, 'task-agent.land-order', 'appended', (data) =>
     Number.isSafeInteger(data.pr) ? { pr: data.pr as number } : null) : null;
   const landSignals: CoverLandSignals = {

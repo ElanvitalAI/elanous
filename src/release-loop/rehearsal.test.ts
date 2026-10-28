@@ -1164,9 +1164,17 @@ test('production release CLI retries the same RC after a preflight shortage with
   const args = ['bin/elanous.mjs', '--test', '--config-dir', root, 'release', 'rehearsal', 'tick', '--apply', '--checkout', checkout, '--json'];
   const before = existsSync(stage);
   // The export preflight must not treat this host's unrelated test fixture paths as leaks.
-  const run = () => spawnSync('bun', args, { cwd: repo, encoding: 'utf8', timeout: 60_000,
-    env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_EXPORT_REDACTIONS: join(root, 'empty-redactions.tsv'),
-      ELANOUS_LEAK_HOME_USER: 'rehearsal-fixture' } });
+  // 0.2.37 needed 86.5 s for both real CLI invocations; the 0.2.38 gate
+  // returned status=null after 89 s with a 60 s per-child budget.
+  const run = () => {
+    const startedAt = Date.now();
+    // Two sequential children must fit within the enclosing 300 s test budget.
+    const result = spawnSync('bun', args, { cwd: repo, encoding: 'utf8', timeout: 135_000,
+      env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_EXPORT_REDACTIONS: join(root, 'empty-redactions.tsv'),
+        ELANOUS_LEAK_HOME_USER: 'rehearsal-fixture' } });
+    if (result.status === null) throw new Error(`rehearsal CLI did not exit: code=${(result.error as NodeJS.ErrnoException | undefined)?.code ?? 'none'} signal=${result.signal ?? 'none'} elapsedMs=${Date.now() - startedAt}`);
+    return result;
+  };
   writeFileSync(join(root, 'empty-redactions.tsv'), '');
   const first = run(), afterFirst = existsSync(stage);
   const second = run(), afterSecond = existsSync(stage);
@@ -1188,7 +1196,7 @@ test('production release CLI retries the same RC after a preflight shortage with
   console.log(`stage before=${before} after tick 1=${afterFirst}`);
   console.log(`CLI tick 2 rc=${second.status} stdout=${second.stdout.trim()} stderr=${second.stderr.trim()}`);
   console.log(`stage after tick 2=${afterSecond}`);
-}, 120_000);
+}, 300_000);
 
 test('CLI rejects invalid --shards and --remote before RC stamp', async () => {
   for (const args of [['--shards', '0'], ['--shards', 'NaN'], ['--remote', '-invalid']]) {
@@ -1314,4 +1322,34 @@ test('recipe actually launches in configured checkout and passes the CLI JSON in
   expect(result.status).toBe(0);
   expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'ok', tick: { ok: true, status: 'no-schedule' } });
   expect(realpathSync(readFileSync(seen, 'utf8').trim())).toBe(realpathSync(checkout));
+});
+
+test('REHEARSAL-RECOVERY-PATH: gate shard measurement gap resumes from gate and records recovery evidence', async () => {
+  const root = newRoot(), h = harness(at(420), rc({ introduced: null, unmeasured: 'gate shard-2 measurement unavailable', ok: false }));
+  let resumes = 0;
+  (h.deps as RehearsalDeps & { resumeGate?: (runId: string, checkout: string) => Promise<{ files: number; durationMs: number; poolOverwriteApplied: boolean; ok: boolean }> }).resumeGate = async (runId, checkout) => {
+    resumes++;
+    expect(runId).toBe('failed-release-run');
+    expect(checkout).toBe('/fake/checkout');
+    return { files: 3, durationMs: 25, poolOverwriteApplied: true, ok: true };
+  };
+  const result = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true,
+    recoveryRun: 'failed-release-run' } as never, h.deps);
+  expect(resumes).toBe(1);
+  expect(result.stamps?.[0]).toMatchObject({ recovery: {
+    failedShard: 'gate shard-2 measurement unavailable', remeasuredFiles: 3, durationMs: 25,
+    poolOverwriteApplied: true, outcome: 'ok',
+  } });
+  console.log(`recovery stage: ${JSON.stringify(result.stamps?.[0]?.recovery)}`);
+
+  const failedRoot = newRoot(), failed = harness(at(420), rc({ introduced: null, unmeasured: 'gate shard-3 timed out', ok: false }));
+  (failed.deps as RehearsalDeps & { resumeGate?: (runId: string, checkout: string) => Promise<{ files: number; durationMs: number; poolOverwriteApplied: boolean; ok: boolean }> }).resumeGate = async () => {
+    throw new Error('resume --from gate failed');
+  };
+  const failedResult = await runRehearsalTick({ ledgerRoot: failedRoot, checkout: '/fake/checkout', apply: true,
+    recoveryRun: 'failed-release-run' } as never, failed.deps);
+  expect(failedResult.stamps?.[0]?.recovery).toMatchObject({
+    failedShard: 'gate shard-3 timed out', remeasuredFiles: null, poolOverwriteApplied: null,
+    outcome: 'failed', error: 'resume --from gate failed',
+  });
 });

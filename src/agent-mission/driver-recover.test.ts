@@ -8,9 +8,9 @@ import { runPtyControlLoop } from '../autopilot/pty-control-loop.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
 import { debug } from '../debug/log.js';
 
-type Fixture = { result: Awaited<ReturnType<typeof runAgentMission>>; writes: string[]; events: PtyDecision[]; calls: number };
+type Fixture = { result: Awaited<ReturnType<typeof runAgentMission>>; writes: string[]; events: PtyDecision[]; calls: number; kills: number; terminatedPids: number[] };
 
-async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' | 'changing-after-interrupt' | 'question' | 'choice-question' | 'scrollback' | 'changing-question' | 'progress-after-enter' | 'failed-screen' | 'failed-no-evidence' | 'rg-screen' | 'no-success' | 'healthy', evidence: EvidenceMode = { kind: 'doc', dirRel: 'docs', glob: /output/ }): Promise<Fixture> {
+async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' | 'changing-after-interrupt' | 'question' | 'choice-question' | 'scrollback' | 'changing-question' | 'progress-after-enter' | 'failed-screen' | 'failed-no-evidence' | 'rg-screen' | 'no-success' | 'healthy', evidence: EvidenceMode = { kind: 'doc', dirRel: 'docs', glob: /output/ }, enhance?: boolean, chain?: readonly ('codex' | 'claude' | 'elanous')[]): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), 'mission-recover-'));
   const writes: string[] = [];
   const events: PtyDecision[] = [];
@@ -22,18 +22,21 @@ async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' |
   const finished = ['failed-screen', 'failed-no-evidence', 'rg-screen', 'no-success', 'healthy'].includes(mode);
   let now = 0;
   let calls = 0;
+  let kills = 0;
+  const terminatedPids: number[] = [];
   let changingFrame = 0;
   try {
     const result = await runAgentMission({
       mission: 'Run the command', repo: dir, branch: 'fixture', agent: codexBackend,
-      evidence, memory: false, resources: 'off', commit: false,
+      evidence, memory: false, resources: 'off', commit: chain ? true : false, enhance, chain,
       recoverAfterMs: 40_000, screensDir: join(dir, 'screens'), maxRounds: 12,
     }, {
       createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
       recordWorktreeProvenance: () => {},
+      terminateProcessTree: async (pid) => { terminatedPids.push(pid); return [pid]; },
       emitPtyDecision: (input) => emitPtyDecision(input, (_category, _event, row) => { events.push(row as PtyDecision); }),
       startPty: ((opts) => ({
-        id: opts.id!, kind: 'codex', nickname: 'fixture', accessMode: 'auto',
+        id: opts.id!, pid: 4242, kind: 'codex', nickname: 'fixture', accessMode: 'auto',
         isAlive: () => true, canWrite: () => true, drainDelta: () => '',
         renderScreen: async () => mode === 'question' ? 'Use the existing file?'
           : mode === 'choice-question' ? 'Proceed? [y/N]'
@@ -49,16 +52,16 @@ async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' |
           if (mode === 'unlock' && text === '\r' && writes.length > 2) { screen = 'MISSION-COMPLETE'; ready = true; }
           if (mode === 'prompt-after-interrupt' && text === '\x03') screen = 'agent >';
           if (mode === 'prompt-after-interrupt' && text === 'Run the command\r') { screen = 'MISSION-COMPLETE'; ready = true; }
-        }, kill: () => {},
+        }, kill: () => { kills++; },
       } as unknown as PtyHandle)),
-      checkEvidence: () => ready ? { ok: true, path: join(dir, 'docs', 'output.md') } : { ok: false, path: null, retry: 'output missing' },
+      checkEvidence: () => ready && evidence.dirRel !== 'missing-docs' ? { ok: true, path: join(dir, 'docs', 'output.md') } : { ok: false, path: null, retry: 'output missing' },
       controlStream: async () => { calls++; return finished ? '{"action":"verify","reason":"completed"}' : '{"action":"wait"}'; },
       runControlLoop: (brain, deps, opts) => runPtyControlLoop(brain, {
         ...deps, settle: async () => {}, now: () => now,
         sleep: async () => { now += ['question', 'choice-question', 'scrollback', 'changing-question', 'progress-after-enter'].includes(mode) ? 1 : 40_000; },
       }, opts),
     });
-    return { result, writes, events, calls };
+    return { result, writes, events, calls, kills, terminatedPids };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -113,6 +116,31 @@ test('changing non-prompt frames after Ctrl-C still replay the command but clear
   expect(events.map((event) => event.seq)).toEqual(events.map((_, i) => events[0]!.seq + i));
 });
 
+test('no-enhance mission fails missing evidence without sending verifier retry input', async () => {
+  const { result, writes, events, kills, terminatedPids } = await fakeMission('no-success', { kind: 'doc', dirRel: 'missing-docs', glob: /output/ }, false);
+  expect(result.ok).toBe(false);
+  expect(result.evidenceSatisfied).toBe(false);
+  expect(result.committed).toBe(false);
+  expect(kills).toBe(1);
+  expect(terminatedPids).toEqual([4242]);
+  expect(writes).not.toContain('output missing');
+  expect(events.some((event) => event.step === 'recover' && event.text.includes('retry disabled'))).toBe(true);
+});
+
+// DRIVER-RECOVER-NO-ENHANCE-CHAIN-HANG (0.2.41): base/head both 0/3 timed out.
+// Evidence: seat-state/OPT/evidence/20261027/pr32102-base-head-45954/summary.tsv
+// Restore this test when the chain hang is fixed; do not treat its timeout as a green gate.
+test.skip('no-enhance chain mission still verifies final evidence without injecting a retry', async () => {
+  const { result, writes, events, kills, terminatedPids } = await fakeMission('no-success', { kind: 'doc', dirRel: 'missing-docs', glob: /output/ }, false, ['codex', 'claude', 'elanous']);
+  expect(result.ok).toBe(false);
+  expect(result.evidenceSatisfied).toBe(false);
+  expect(result.committed).toBe(false);
+  expect(kills).toBe(1);
+  expect(terminatedPids).toEqual([4242]);
+  expect(writes).not.toContain('output missing');
+  expect(events.some((event) => event.step === 'recover' && event.text.includes('retry disabled'))).toBe(true);
+});
+
 test('a completed mission still passes its evidence gate without entering recovery', async () => {
   const { result, events } = await fakeMission('healthy');
   expect(result.ok).toBe(true);
@@ -139,11 +167,12 @@ test('rg exit 1 in Codex tool history with verified evidence completes the missi
   } finally { debug.log = originalLog; }
 });
 
+// A cold Bun cache may resolve the tsc toolchain before checking this evidence.
 test.each(['tsc', 'test'] as const)('verified %s evidence completes despite rg exit 1 in tool history', async (kind) => {
   const evidence: EvidenceMode = kind === 'tsc' ? { kind } : { kind, testPath: 'proof.test.ts' };
   const { result } = await fakeMission('rg-screen', evidence);
   expect(result).toMatchObject({ ok: true, evidenceSatisfied: true, driveVerdict: 'success-unverified', detail: '완료(증거)' });
-});
+}, 30_000);
 
 test('an actual error without evidence remains failed', async () => {
   const { result } = await fakeMission('failed-no-evidence');

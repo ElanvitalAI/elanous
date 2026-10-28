@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,6 +37,15 @@ import type { LogSurfaceStateContract } from '../../widgets/contracts/log-surfac
 import { checkSlashCatalogBaseline } from './registry.js';
 import type { LoopScheduler } from '../loop-scheduler.js';
 import type { dashboardLoops } from '../../domains/dashboard-data.js';
+import * as directiveModule from '../../steward/directive.js';
+import { slashMaturity } from '../../maturity/tui-slash-maturity.js';
+
+const originalDirectiveModule = { ...directiveModule };
+const addDirectiveSpy = mock(async () => ({ issue: 'ELA-1', status: 'created' }));
+mock.module('../../steward/directive.js', () => ({ ...originalDirectiveModule, addDirective: addDirectiveSpy }));
+afterAll(() => {
+  mock.module('../../steward/directive.js', () => originalDirectiveModule);
+});
 
 type AskLaunchInput = {
   entrance: { id: 'tui-slash-ask'; status: 'live'; surface: 'slash'; stampability: 'stampable' };
@@ -180,6 +189,49 @@ function createContext(
     },
   } as unknown as DashboardSlashContext;
 }
+
+test('/directive execution rejects the general role before recording a directive', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-directive-general-guard-'));
+  addDirectiveSpy.mockClear();
+  expect(slashMaturity('directive')).toBe('ops');
+  setElanousConfigDir(root);
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ tui: { role: 'general', showBeta: true } }));
+  reloadUserConfig();
+  const lines: string[] = [];
+  let scrollOffset: number | undefined;
+  const ctx = createContext(lines);
+  ctx.setChatScrollOffset = (value) => { scrollOffset = value; };
+  try {
+    await expect(buildDashboardSlashRegistry().dispatch('directive', ['승인 없이 기록하지 말 것'], ctx))
+      .resolves.toEqual({ kind: 'continue' });
+    expect(lines.join('\n')).toContain('general 역할에서는 실행할 수 없습니다');
+    expect(addDirectiveSpy).not.toHaveBeenCalled();
+    expect(scrollOffset).toBe(-1);
+  } finally {
+    resetElanousConfigDir();
+    reloadUserConfig();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/directive keeps its owner-role execution path', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tui-directive-owner-'));
+  addDirectiveSpy.mockClear();
+  setElanousConfigDir(root);
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ tui: { role: 'owner' } }));
+  reloadUserConfig();
+  const lines: string[] = [];
+  try {
+    await expect(buildDashboardSlashRegistry().dispatch('directive', ['허용된 지시'], createContext(lines)))
+      .resolves.toEqual({ kind: 'continue' });
+    expect(addDirectiveSpy).toHaveBeenCalledWith('허용된 지시', { source: 'tui' });
+    expect(lines.join('\n')).toContain('ELA-1: created');
+  } finally {
+    resetElanousConfigDir();
+    reloadUserConfig();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('/plugin install resolves a local directory and delegates to the shared installer', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dashboard-plugin-install-'));
@@ -482,6 +534,8 @@ test('/session new suggests a matching project once without assigning it to a se
   ctx.sessionSlash = { remoteDaemon: () => null } as DashboardSlashContext['sessionSlash'];
   setElanousConfigDir(root);
   try {
+    expect(SLASH_COMMANDS.find(({ name }) => name === 'session')?.hidden).toBe(false);
+    expect(buildDashboardSlashRegistry().has('session')).toBe(true);
     await buildDashboardSlashRegistry().dispatch('session', ['new'], ctx);
     expect(lines.filter(line => line.includes('Project suggestion: TUI Workspace'))).toHaveLength(1);
     expect(lines.join('\n')).toContain(project.id);
@@ -615,11 +669,12 @@ test('SurfaceUx clarification bridge prefers selected options, accepts permitted
   };
   const asked: unknown[] = [];
   const answer = await readDashboardAskClarification(clarification, {
-    question: async (request) => {
+    question: async (request, opts) => {
       asked.push(request);
+      expect(opts).toEqual({ timeoutMs: 60_000 });
       return { answers: { scope: 'full' }, otherText: { scope: 'custom answer' } };
     },
-  });
+  }, undefined, true);
   expect(answer).toBe('1');
   expect(asked).toHaveLength(1);
   const askedQuestion = (asked[0] as { questions: Array<Record<string, unknown>> }).questions[0];
@@ -790,7 +845,7 @@ test('fixed plain submit executes the real harness slash handler once before mod
   });
 });
 
-test('harness enables structured clarification only when SurfaceUx is available', async () => {
+test('harness uses the shared self-resolver with or without SurfaceUx', async () => {
   const registry = buildDashboardSlashRegistry();
   const goal = '대상 경로: src/a.ts 를 고친다';
   const ux = { question: async () => ({ answers: { choice: '1' } }) };
@@ -799,15 +854,13 @@ test('harness enables structured clarification only when SurfaceUx is available'
   await Bun.sleep(0);
   const [, interactiveDeps] = runAskLaunchFlow.mock.calls.at(-1)!;
   expect((interactiveDeps as { isInteractive(): boolean }).isInteractive()).toBe(true);
-  await expect((interactiveDeps as { readClarification(clarification: GoalDocumentClarification): Promise<string> }).readClarification({
-    questionId: 'choice', header: '선택', question: '질문', includeOther: false,
-    options: [{ label: '1', description: '첫째' }], answer: '', answered: false, answerLine: 1,
-  })).resolves.toBe('0');
+  expect((interactiveDeps as { selfResolveClarification: unknown }).selfResolveClarification).toBeTypeOf('function');
 
   await registry.dispatch('harness', ['ask', goal], createContext([]));
   await Bun.sleep(0);
   const [, deferredDeps] = runAskLaunchFlow.mock.calls.at(-1)!;
   expect((deferredDeps as { isInteractive(): boolean }).isInteractive()).toBe(false);
+  expect((deferredDeps as { selfResolveClarification: unknown }).selfResolveClarification).toBeTypeOf('function');
   await expect((deferredDeps as { readLine(prompt: string): Promise<string> }).readLine('질문')).resolves.toBe('');
 });
 
@@ -847,7 +900,7 @@ test('harness ask routes goal-author start progress to chat lines through its au
   expect(drawCalls).toBe(drawBeforeProgress + 1);
 });
 
-test('harness ask subcommand returns before the shared launch flow settles while its SurfaceUx modal clarification still round-trips', async () => {
+test('harness ask subcommand returns before launch settles and passes the shared resolver without a modal', async () => {
   runAskLaunchFlow.mockClear();
   let settleLaunch: ((value: { kind: 'stopped-before-authoring' }) => void) | undefined;
   runAskLaunchFlow.mockImplementationOnce(() => new Promise((resolve) => { settleLaunch = resolve; }));
@@ -870,12 +923,8 @@ test('harness ask subcommand returns before the shared launch flow settles while
     decomposeBeforeLaunch: true,
   }), expect.anything());
   const [, deps] = runAskLaunchFlow.mock.calls.at(-1)!;
-  await expect((deps as { readClarification(clarification: GoalDocumentClarification): Promise<string> }).readClarification({
-    questionId: 'scope', header: '범위', question: '무엇을 고칠까요?', includeOther: false,
-    options: [{ label: 'minimal', description: '최소 변경' }, { label: 'full', description: '전체 변경' }],
-    answer: '', answered: false, answerLine: 1,
-  })).resolves.toBe('1');
-  expect(modalQuestions).toHaveLength(1);
+  expect((deps as { selfResolveClarification: unknown }).selfResolveClarification).toBeTypeOf('function');
+  expect(modalQuestions).toHaveLength(0);
   settleLaunch!({ kind: 'stopped-before-authoring' });
 });
 
@@ -1182,7 +1231,10 @@ test('/log help replies on chat and leaves debug empty', async () => {
   const debugLines: string[] = [];
   const context = createContext(chatLines, undefined, debugLines);
 
-  await expect(registry.dispatch('log', ['help'], context))
+  expect(SLASH_COMMANDS.find(({ name }) => name === 'log')?.hidden).toBe(true);
+  const typed = resolveDashboardChatMainSlashCommand('/log help');
+  expect(typed).toEqual({ cmdLower: 'log', args: ['help'] });
+  await expect(registry.dispatch(typed.cmdLower, typed.args, context))
     .resolves.toEqual({ kind: 'continue' });
   expect(chatLines.length).toBeGreaterThan(0);
   expect(chatLines).toContain('');

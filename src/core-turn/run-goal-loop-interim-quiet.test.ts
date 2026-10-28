@@ -96,6 +96,23 @@ describe('TUI-GOAL-INTERIM-QUIET', () => {
     expect(r.interimSignals.some(([text]) => text === replies[2])).toBe(false);
   });
 
+  test('반복 경계: 판정기 분류와 무관하게 다음 반복에 들어가는 답을 보내고 최종 답은 제외한다', async () => {
+    const replies = ['1단계 렌더했습니다.\n아직 못 했습니다.', '2단계 렌더 결과를 확인했습니다.', '최종 영상: /tmp/final.mp4'];
+    const r = await drive(replies, 3);
+    expect(r.calls).toBe(3);
+    expect(isInterimReportShaped(replies[1]!)).toBe(false);
+    expect(r.interimSignals).toEqual([[replies[0]!, 1], [replies[1]!, 2]]);
+    expect(r.result.finalText).toBe(replies[2]);
+    expect(r.interimSignals.some(([text]) => text === replies[2])).toBe(false);
+  });
+
+  test('빈 값이나 공백만 있는 중간 응답은 화면 접기 신호를 만들지 않는다', async () => {
+    const r = await drive([' \n\t ', '최종 답'], 2);
+    expect(r.calls).toBe(2);
+    expect(r.interimSignals).toEqual([]);
+    expect(r.events.filter((e) => e.event === 'interim-reply').map((e) => e.data.finalChars)).toEqual([4]);
+  });
+
   test('r2 반례: 상한에 닿은 뒤엔 소비되지 않을 재주입 메시지를 쌓지 않는다', async () => {
     const r = await drive(['과제1 렌더 끝 · 다음 과제2'], 2);
     expect(r.calls).toBe(2);

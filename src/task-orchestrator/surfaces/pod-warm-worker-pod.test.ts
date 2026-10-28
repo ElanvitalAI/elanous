@@ -15,7 +15,7 @@ const spec: WarmPodSpec = { name: 'warm-worker-1', namespace: 'elanous-test', ku
   sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', cutSha, key,
   hostProbeUrl: 'http://host.orb.internal:10001/health', prodProbeUrl: 'http://core.elanous-prod:10002/' };
 const command = (attemptId: string): WarmWorkerCommand => ({ protocol: 1, runId: 'run-1', attemptId,
-  cutSha, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', key,
+  cutSha, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', podUid: 'pod-uid-1', key,
   deadlineAt: Date.now() + 60_000, files: ['src/example/worker.test.ts'], envProfile: 'gate-v1' });
 
 test('a missing remote-internal context retains the original kubectl error', () => {
@@ -78,6 +78,17 @@ const admissionFieldOrder = (value: any): any => Array.isArray(value) ? value.ma
     .map(([name, item]) => [name, admissionFieldOrder(item)])) : value;
 const getResult = (args: readonly string[], uid?: string) => ({ status: 0,
   stdout: JSON.stringify(args.includes('node') ? node() : admissionFieldOrder(pod(uid))), stderr: '' });
+
+test('a lease without a Pod UID is rejected before any kubectl call', async () => {
+  const calls: string[][] = [];
+  const kubectl: Kubectl = args => { calls.push([...args]); return getResult(args); };
+  const request = command('attempt-1');
+  delete request.podUid;
+
+  expect(await new WarmPodTransport(spec, kubectl).request(request))
+    .toMatchObject({ status: 'fallback', reason: 'key-drift' });
+  expect(calls).toEqual([]);
+});
 
 test('manifest pins image, source SHA and lock hash; worker stays Running for later exec requests', () => {
   const manifest = warmWorkerPodManifest(spec) as any;
@@ -292,7 +303,7 @@ test('replacement Pod or incomplete reply quarantines the transport', async () =
   let gets = 0;
   let execs = 0;
   const kubectl: Kubectl = (args, input) => {
-    if (args.includes('get')) return getResult(args, args.includes('pod') ? (++gets <= 4 ? 'old-uid' : 'new-uid') : undefined);
+    if (args.includes('get')) return getResult(args, args.includes('pod') ? (++gets <= 4 ? 'pod-uid-1' : 'new-uid') : undefined);
     if (args.includes(WARM_POD_ACK)) return { status: 0, stdout: 'ack', stderr: '' };
     if (args.includes(WARM_POD_READ)) {
       const path = args.at(-1)!;
@@ -317,6 +328,35 @@ test('replacement Pod or incomplete reply quarantines the transport', async () =
       reply: { ...reply(JSON.parse(input!)), files: [] } }), stderr: '' };
   expect(await new WarmPodTransport(spec, malformed).request(command('attempt-1')))
     .toMatchObject({ status: 'fallback', reason: 'invalid-result' });
+});
+
+test('a Pod replacement in the first get immediately after work exec is rejected and quarantined', async () => {
+  let podGets = 0;
+  let workExecs = 0;
+  let acknowledgements = 0;
+  const request = command('attempt-1');
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('get')) {
+      if (args.includes('pod')) return getResult(args, ++podGets === 1 ? request.podUid : 'replacement-uid');
+      return getResult(args);
+    }
+    if (args.includes(WARM_POD_ACK)) { acknowledgements++; return { status: 0, stdout: 'ack', stderr: '' }; }
+    if (args.includes(WARM_POD_READ)) return { status: 1, stdout: '', stderr: 'artifact read must not run' };
+    workExecs++;
+    const body = JSON.parse(input!) as WarmWorkerCommand;
+    return { status: 0, stdout: JSON.stringify({ reason: 'complete', quarantineWorker: false,
+      artifactsDir: artifactsDir(body), artifactHashes: artifactHashes(body), reply: reply(body) }), stderr: '' };
+  };
+  const transport = new WarmPodTransport(spec, kubectl);
+
+  expect(await transport.request(request)).toMatchObject({ status: 'fallback', reason: 'pod-replaced', reply: null });
+  expect(podGets).toBe(2);
+  expect(workExecs).toBe(1);
+  expect(acknowledgements).toBe(0);
+  expect(await transport.request(command('attempt-2')))
+    .toMatchObject({ status: 'fallback', reason: 'worker-quarantined', reply: null });
+  expect(podGets).toBe(2);
+  expect(workExecs).toBe(1);
 });
 
 test('a changed JUnit after the worker reply is unmeasured on the host', async () => {
@@ -381,7 +421,7 @@ test('artifact collection refuses a replaced Pod and a forged isolation init com
   const request = command('attempt-1');
   let gets = 0;
   const replaced: Kubectl = (args, input) => {
-    if (args.includes('get')) return getResult(args, args.includes('pod') ? (++gets <= 2 ? 'old' : 'new') : undefined);
+    if (args.includes('get')) return getResult(args, args.includes('pod') ? (++gets <= 2 ? request.podUid : 'new') : undefined);
     if (args.includes(WARM_POD_ACK)) return { status: 0, stdout: 'ack', stderr: '' };
     if (args.includes(WARM_POD_READ)) {
       const suffix = args.at(-1)!.slice(args.at(-1)!.indexOf('file-0.') + 'file-0.'.length) as keyof ReturnType<typeof artifacts>;

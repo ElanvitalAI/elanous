@@ -8,6 +8,8 @@ import { defaultGoalAuthorSelfResolve, injectGoalDocumentClarificationAnswer, in
   planClarificationIntake,
   applyClarificationReply,
   selfAnswerGoalDocumentClarifications,
+  selfAnswerOrAssumeGoalDocumentClarifications,
+  goalClarificationDecisionCategory,
 } from './goal-author-clarification.js';
 
 function clarification(overrides: Partial<IntakeClarification> = {}): IntakeClarification {
@@ -126,6 +128,41 @@ test('other questions remain unanswered when evidence is insufficient', async ()
   expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
 });
 
+test('self-implement author boundary records a fallback assumption instead of leaving a popup question', async () => {
+  const document = preservationDocument('implementation_target');
+  const result = await selfAnswerOrAssumeGoalDocumentClarifications(document, {
+    path: 'say-first',
+    evidence: [],
+    resolver: async () => ({}),
+    runId: 'run-no-popup',
+  });
+  expect(result).toMatchObject({ asked: 1, answered: 1, unanswered: 0, newlyAnswered: 1, assumed: 1 });
+  expect(parseGoalDocumentClarifications(result.document)[0]).toMatchObject({
+    answered: true,
+    answer: '근거가 부족하므로 요청에 명시된 범위만 진행한다고 가정한다',
+    provenanceSource: 'default',
+  });
+  expect(result.document).toContain('provenance.assumption: 자가 해소가 답을 내지 못해 추가 범위를 만들지 않고 요청에 명시된 범위만 진행한다고 가정했다');
+  expect(result.document).not.toContain('Answer: UNANSWERED — implementation_target');
+});
+
+test('only money, security, and irreversible external-effect questions request a decision', async () => {
+  expect(goalClarificationDecisionCategory({ header: 'Scope', question: 'Which module should change?', options: [] })).toBeUndefined();
+  expect(goalClarificationDecisionCategory({ header: 'Security', question: 'May I store this access token?', options: [] })).toBe('security');
+  const document = preservationDocument('payment_target')
+    .replace('Question: NOT-GROUNDED — Preserve?', 'Question: UNANSWERED — payment_target')
+    .replace('Answer: UNANSWERED — payment_target', 'Answer: UNANSWERED — payment_target')
+    .replace('  - header: Clarification', '  - header: Payment')
+    .replace('  - question: Preserve?', '  - question: May I charge the customer?');
+  let resolverCalls = 0;
+  const result = await selfAnswerOrAssumeGoalDocumentClarifications(document, {
+    path: 'say-first', evidence: [], resolver: async () => { resolverCalls += 1; return {}; }, runId: 'run-payment-question',
+  });
+  expect(result).toMatchObject({ unanswered: 1, assumed: 0, decisionRequired: [{ questionId: 'payment_target', category: 'money' }] });
+  expect(resolverCalls).toBe(0);
+  expect(parseGoalDocumentClarifications(result.document)[0]?.answered).toBe(false);
+});
+
 test('an unrelated question explicitly declined despite evidence remains unanswered', async () => {
   const document = preservationDocument('implementation_target');
   const log = spyOn(debug, 'log').mockImplementation(() => undefined);
@@ -169,6 +206,29 @@ test('declined preservation contract with nonzero evidence receives the default;
     resolver: (context) => defaultGoalAuthorSelfResolve(context, { stream: async () => 'not json' }),
   });
   expect(malformed).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+});
+
+test('legacy default answer without assumption metadata survives document reparse', () => {
+  const legacy = [
+    '## WHAT TO BUILD',
+    '- Clarification:',
+    '  - id: preserve-api',
+    '  - header: Existing API',
+    '  - question: Should the public API remain compatible?',
+    '  - options:',
+    '    - label: Preserve current API',
+    '      description: Keep the existing public behavior',
+    '  - answer: Preserve current API',
+    '  - provenance.source: default',
+    '',
+  ].join('\n');
+
+  expect(parseGoalDocumentClarifications(legacy)).toMatchObject([{
+    questionId: 'preserve-api',
+    answer: 'Preserve current API',
+    answered: true,
+    provenanceSource: 'default',
+  }]);
 });
 
 test('shared document self-answer persists one response and leaves the other deferred', async () => {
@@ -361,7 +421,7 @@ test('self-authors eligible multi-option, zero-option, and free-input answers wi
     clarification({ question: 'Provide a value that preserves the contract.', options: [] }),
   ]) {
     const response = await resolveGoalAuthorClarification(item, deps);
-    expect(response).toMatchObject({ answer: item.question.includes('value') ? 'bun test src/self-implement/goal-author-clarification.test.ts' : 'Alternative target', status: 'ANSWERED', provenance: { source: 'self-authored', evidence: deps.evidence } });
+    expect(response).toMatchObject({ answer: item.question.includes('value') ? 'bun test src/self-implement/goal-author-clarification.test.ts' : 'Alternative target', status: 'ANSWERED', provenance: { source: 'self-authored', evidence: deps.evidence, assumptionSource: 'policy-default' } });
   }
   const serialized = await serializeResolvedGoalAuthorClarification(clarification({ options: [] }), deps);
   expect(parseGoalAuthorClarifications(serialized)[0].response).toMatchObject({
@@ -393,6 +453,27 @@ test('parser requires the exact provenance shape for deterministic and self-auth
   expect(parseGoalAuthorClarifications(mutate(selfAuthored, { source: 'self-authored', evidence: ['src/example.ts: grounded'], extra: true }))).toEqual([]);
   expect(parseGoalAuthorClarifications(recommended)).toHaveLength(1);
   expect(parseGoalAuthorClarifications(selfAuthored)).toHaveLength(1);
+});
+
+test('parser keeps legacy recommended records without assumption provenance and upgrades them on read', () => {
+  const serialized = serializeGoalAuthorClarification(clarification());
+  const record = JSON.parse(serialized.slice('- Clarification: '.length)) as {
+    response: { provenance: Record<string, unknown> };
+  };
+  delete record.response.provenance.assumption;
+  delete record.response.provenance.assumptionSource;
+
+  const parsed = parseGoalAuthorClarifications(`- Clarification: ${JSON.stringify(record)}`);
+  expect(parsed).toHaveLength(1);
+  expect(parsed[0]?.response).toMatchObject({
+    answer: 'Recommended target',
+    status: 'ANSWERED',
+    provenance: {
+      source: 'recommended',
+      assumption: expect.any(String),
+      assumptionSource: 'recommended',
+    },
+  });
 });
 
 test('self-resolution remains unresolved without an injected resolver and never invokes the default model resolver', async () => {
@@ -517,6 +598,29 @@ test('default self-resolver prompts the elanous model, parses valid JSON, and ab
     }, { once: true })),
   })).resolves.toEqual({});
   expect(aborted).toBe(true);
+});
+
+test('default self-resolver returns on timeout when the stream ignores abort', async () => {
+  const context = {
+    questionId: 'q-ignored-abort',
+    question: 'Which command preserves the contract?',
+    kind: 'term' as const,
+    options: [],
+    evidence: ['src/example.ts: command contract'],
+  };
+  let finishStream!: (value: string) => void;
+  let signal: AbortSignal | undefined;
+  const resolution = await defaultGoalAuthorSelfResolve(context, {
+    timeoutMs: 10,
+    stream: (_prompt, streamSignal) => {
+      signal = streamSignal;
+      return new Promise((resolve) => { finishStream = resolve; });
+    },
+  });
+
+  expect(resolution).toEqual({});
+  expect(signal?.aborted).toBe(true);
+  finishStream('{"answer":"late answer"}');
 });
 
 describe('defaultGoalAuthorSelfResolve observations distinguish five outcomes', () => {

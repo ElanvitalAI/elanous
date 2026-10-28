@@ -368,6 +368,7 @@ function buildResult(
   const aggCapped = capString(agg, meta.maxOutputBytes);
   const r: ShellResult = {
     ...(meta.exitCode !== undefined ? { exitCode: meta.exitCode } : {}),
+    ...(meta.spawnError !== undefined ? { failureReason: meta.spawnError } : {}),
     stdout: stdout.toStream(meta.maxOutputBytes),
     stderr: stderr.toStream(meta.maxOutputBytes),
     aggregated: aggCapped,

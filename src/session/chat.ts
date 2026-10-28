@@ -285,7 +285,8 @@ const childContextComposedSessions = new Set<string>();
 export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   const loaded = loadSession(opts.sessionId);
   if (!loaded) throw new Error(`session not found: ${opts.sessionId}`);
-  const { meta, messages } = loaded;
+  const { meta } = loaded;
+  let messages = loaded.messages;
 
   // Memory injection: build the block once per turn, folded into the
   // system prompt. Never fails loud — if the store isn't set up, we
@@ -368,6 +369,19 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   };
   appendMessage(opts.sessionId, userMsg);
 
+  const explicitTier = opts.llmOpts?.model ? undefined : explicitTurnTier(opts.userConfig, opts.sessionId);
+  const llmOpts = explicitTier ? {
+    ...(opts.llmOpts ?? {}), model: explicitTier.model,
+    ...(explicitTier.reasoningEffort && !opts.llmOpts?.reasoningEffort ? { reasoningEffort: explicitTier.reasoningEffort } : {}),
+  } : opts.llmOpts;
+  if (explicitTier) {
+    debug.log('llm.tier', 'turn-tier-applied', {
+      sessionId: opts.sessionId, tier: explicitTier.tier, source: explicitTier.source, model: explicitTier.model,
+      reasoningEffort: llmOpts?.reasoningEffort ?? null,
+    });
+  }
+  const provider = opts.provider ?? getProviderForConfig(opts.userConfig, llmOpts?.model);
+
   // 2) Assemble, trim, call. When images are attached for THIS turn,
   //    swap the string content of the latest user message for
   //    ContentBlock[] so the provider adapter sends them multimodally.
@@ -386,18 +400,67 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     return trimToBudget(wire, opts.maxTokens ?? DEFAULT_TOKEN_BUDGET);
   };
 
-  const explicitTier = opts.llmOpts?.model ? undefined : explicitTurnTier(opts.userConfig, opts.sessionId);
-  const llmOpts = explicitTier ? {
-    ...(opts.llmOpts ?? {}), model: explicitTier.model,
-    ...(explicitTier.reasoningEffort && !opts.llmOpts?.reasoningEffort ? { reasoningEffort: explicitTier.reasoningEffort } : {}),
-  } : opts.llmOpts;
-  if (explicitTier) {
-    debug.log('llm.tier', 'turn-tier-applied', {
-      sessionId: opts.sessionId, tier: explicitTier.tier, source: explicitTier.source, model: explicitTier.model,
-      reasoningEffort: llmOpts?.reasoningEffort ?? null,
-    });
-  }
-  const provider = opts.provider ?? getProviderForConfig(opts.userConfig, llmOpts?.model);
+  let measuredProviderRequests = 0;
+  const requestSizeGuard: NonNullable<LLMOpts['requestSizeGuard']> | undefined =
+    meta.source === 'tui' && provider.name === 'openai-codex'
+      ? {
+          maxChars: 400_000,
+          compactMessages: async (currentMessages) => {
+            // The first request has only the persisted transcript plus this
+            // user turn, so use the shared session compactor and rebuild from
+            // the rewritten history. Later tool rounds compact their live
+            // message list so no just-produced tool context is lost.
+            if (measuredProviderRequests === 0) {
+              const { compactSessionHistory } = await import('./compact-session.js');
+              const result = await compactSessionHistory(opts.sessionId, {
+                config: opts.userConfig.chat.autoCompact,
+                force: true,
+                modelId: llmOpts?.model ?? provider.defaultModel,
+              });
+              if (result.fired) {
+                const refreshed = loadSession(opts.sessionId);
+                if (refreshed) {
+                  // The persisted compacted session includes this turn's
+                  // user message. Drop that final persisted row here, then
+                  // assembleTurnMessages re-adds the canonical userMsg and
+                  // any image blocks from opts.userImages exactly once.
+                  messages = refreshed.messages.slice(0, -1);
+                  const rebuilt = assembleTurnMessages(effectiveSystemPrompt).kept;
+                  return { messages: rebuilt, reason: `session-${result.reason}` };
+                }
+              }
+            }
+
+            const { runCompactPipeline } = await import('../compact/pipeline.js');
+            const { getDefaultCompactProvider } = await import('../compact/provider.js');
+            const compacted = await runCompactPipeline(currentMessages, {
+              sessionId: opts.sessionId,
+              provider: getDefaultCompactProvider(),
+              activeModelId: llmOpts?.model ?? provider.defaultModel,
+              policy: {
+                preserveLastN: opts.userConfig.chat.autoCompact.preserveLastN,
+                archiveEnabled: opts.userConfig.chat.compact.archiveEnabled,
+              },
+            });
+            const diagnostics = compacted.diagnostics;
+            const changed = diagnostics.layer1ResponsesTrimmed > 0
+              || diagnostics.layer2MicrocompactCleared > 0
+              || diagnostics.layer3SummaryApplied === 1
+              || diagnostics.layer5FallbackTruncated === 1;
+            return changed
+              ? { messages: compacted.messages, reason: 'live-request-compact' }
+              : null;
+          },
+          onMeasured: (measurement) => {
+            measuredProviderRequests += 1;
+            opts.onStatusLine?.(
+              `ctx ${measurement.requestChars.toLocaleString()} chars / ${measurement.maxChars.toLocaleString()}`
+              + (measurement.compacted ? ` · compact ${measurement.reason}` : ''),
+            );
+          },
+        }
+      : undefined;
+
   let kept: LLMMessage[] = [];
   let dropped = 0;
   let used = 0;
@@ -432,6 +495,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       effectiveSystemPrompt = terminal.systemPromptParts.join('\n\n');
     }
     const turnLlmOpts = terminal ? terminal.llmOpts : llmOpts;
+    const guardedTurnLlmOpts = requestSizeGuard
+      ? { ...(turnLlmOpts ?? {}), requestSizeGuard: turnLlmOpts?.requestSizeGuard ?? requestSizeGuard }
+      : turnLlmOpts;
     ({ kept, dropped, used } = assembleTurnMessages(effectiveSystemPrompt));
     // Durable tool telemetry (추적성) — pair each call's args (onToolCall) with its
     // result (onToolResult) and persist a role:'tool' message so later "어떤 도구
@@ -471,6 +537,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         userText: opts.userText,
         messages: kept,
         tools: turnTools,
+        ...(guardedTurnLlmOpts?.requestSizeGuard
+          ? { requestSizeGuard: guardedTurnLlmOpts.requestSizeGuard } : {}),
         dispatchTool: async (name, args, ctx) => dispatchTool(name, args, ctx),
         signal: opts.signal ?? new AbortController().signal,
         callbacks: {
@@ -491,6 +559,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         },
         ...(turnLlmOpts?.model ? { modelOverride: turnLlmOpts.model } : {}),
         ...(turnLlmOpts?.budgetGrant ? { budgetGrant: turnLlmOpts.budgetGrant } : {}),
+        ...(guardedTurnLlmOpts?.requestSizeGuard
+          ? { requestSizeGuard: guardedTurnLlmOpts.requestSizeGuard } : {}),
       };
       const maxIterations = opts.goalLoopMaxIterations ?? goalLoopCfg?.maxIterations;
       const gl = await runGoalLoop(coreCtx, maxIterations !== undefined ? { maxIterations } : {});
@@ -513,7 +583,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         },
       },
       {
-        ...(turnLlmOpts ?? {}),
+        ...(guardedTurnLlmOpts ?? {}),
         tools: turnTools,
         provider,
         // ★ /cancel 범용화(대표 2026-07-12) — per-turn abort signal 을 tool 루프·llm 호출에 전파.
@@ -527,7 +597,11 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     }
   } else {
     ({ kept, dropped, used } = assembleTurnMessages(effectiveSystemPrompt));
-    const plainOpts = opts.signal ? { ...(llmOpts ?? {}), signal: opts.signal } : (llmOpts ?? {});
+    const plainOpts = {
+      ...(llmOpts ?? {}),
+      ...(requestSizeGuard ? { requestSizeGuard: llmOpts?.requestSizeGuard ?? requestSizeGuard } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    };
     const stream = provider.streamChat
       ? provider.streamChat(kept, plainOpts)
       : wrapTextOnly(provider.chat(kept, plainOpts));

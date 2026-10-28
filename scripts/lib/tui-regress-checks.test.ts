@@ -59,5 +59,6 @@ describe('V1 TUI regression verdicts (screen text only)', () => {
 
   test('inputRow picks the last prompt line', () => {
     expect(inputRow('❯ old\nanswer\n❯ new')).toBe('❯ new');
+    expect(inputRow('elanous | daemon: offline')).toBeUndefined();
   });
 });

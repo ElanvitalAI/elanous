@@ -14,7 +14,7 @@ import { getUserConfig } from '../user-config.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { parsePodPool, resolvePodPoolSpec, podPoolHostLease, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
 import { leaseKubectl, measurePoolLease, probePoolDns, probePoolGitHub, recommendConcurrency, type PoolLeaseMeasure, type PoolDnsProbe, type ExternalGitHubProbe } from '../task-orchestrator/surfaces/pod-lease.js';
-import { POD_COMMAND_DEADLINE_SECONDS, runPodCommand, type PodCommandResult, type RunPodCommandOptions } from '../task-orchestrator/surfaces/pod-command-job.js';
+import { POD_COMMAND_DEADLINE_SECONDS, parseCpuRightsizeRequest, runPodCommand, type PodCommandResult, type PodCpuRightsizeRequest, type RunPodCommandOptions } from '../task-orchestrator/surfaces/pod-command-job.js';
 import { hostLeaseCounts, leaseHasPendingPod } from '../pod-lease/host-lease.js';
 
 export interface PodCliIo {
@@ -220,7 +220,8 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
     .allowUnknownOption(true)
     .allowExcessArguments(true)
     .option('--lite', '네트워크 스킬(omni-crawl·omni-digest)만 쓰는 명령 — 작은 이미지 ⊕ 2Gi 한도(POD7 · clone 불가)')
-    .action(async (opts: { pool?: string; skill?: string; llm?: string; clone?: boolean; deadline?: string; lite?: boolean }, command: Command) => {
+    .option('--cpu-rightsize <json>', 'POD-CPU-REQUEST-RIGHTSIZE-2-FU: 공존 재측정 요청(JSON 파일 경로 또는 인라인 JSON) — { condition?, samples[], priorLaunches[] }. 선행 조건·측정이 모자라면 발사하지 않는다')
+    .action(async (opts: { pool?: string; skill?: string; llm?: string; clone?: boolean; deadline?: string; lite?: boolean; cpuRightsize?: string }, command: Command) => {
       const argv = process.argv.slice(2);
       const sep = argv.indexOf('--');
       const fromArgv = sep >= 0 ? argv.slice(sep + 1) : [];
@@ -240,6 +241,19 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
         deadlineSeconds = Number(opts.deadline);
         if (!Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1) {
           io.error('pod run: --deadline 은 1 이상의 정수(초)');
+          io.exit(2);
+          return;
+        }
+      }
+      // POD-CPU-REQUEST-RIGHTSIZE-2-FU — the OP-facing measurement launch reads its request from JSON (file path or inline).
+      let cpuRightsize: PodCpuRightsizeRequest | undefined;
+      if (opts.cpuRightsize !== undefined) {
+        try {
+          const source = opts.cpuRightsize.trim();
+          const text = source.startsWith('{') ? source : readFileSync(source, 'utf8');
+          cpuRightsize = parseCpuRightsizeRequest(JSON.parse(text), '--cpu-rightsize');
+        } catch (err) {
+          io.error(`pod run: --cpu-rightsize — ${err instanceof Error ? err.message : String(err)}`);
           io.exit(2);
           return;
         }
@@ -268,6 +282,7 @@ export function registerPodCommands(program: Command, deps: PodCliDeps = {}): vo
           ...(opts.llm === 'grok' ? { llm: 'grok' as const } : {}),
           ...(opts.clone ? { clone: true } : {}),
           ...(opts.lite ? { lite: true } : {}),
+          ...(cpuRightsize ? { cpuRightsize } : {}),
           ...(deadlineSeconds !== undefined ? { deadlineSeconds } : {}),
         });
         if (result.image) io.error(`[pod] image ${result.image} · job ${result.job}`);

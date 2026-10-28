@@ -186,7 +186,21 @@ export function discoverReferenceSources(home: string): GroundingSource[] {
   return [...repos, ...docs];
 }
 
-export function sourceStatus(source: GroundingSource): GroundingSourceStatus {
+export async function sourceStatus(source: GroundingSource): Promise<GroundingSourceStatus> {
+  if ((source.kind === 'local-repo' || source.kind === 'local-docs') && source.path) {
+    // Wiring: the reference card is built from the existing status path (local git refs only).
+    try {
+      const { buildReferenceCard, nodeRefIndexFs } = await import('./ref-index.js');
+      const card = buildReferenceCard(source, nodeRefIndexFs);
+      debug.log('grounding.sources', 'card', {
+        id: source.id,
+        name: card.name,
+        orchestrationId: card.orchestrationId,
+      });
+    } catch (error) {
+      debug.log('grounding.sources', 'card-skip', { id: source.id, error: String(error) });
+    }
+  }
   if (source.kind !== 'local-repo' || !source.path) {
     const status: GroundingSourceStatus = { id: source.id, kind: source.kind, measured: false };
     debug.log('grounding.sources', 'status', { id: source.id, behind: 'unknown', dirty: false });

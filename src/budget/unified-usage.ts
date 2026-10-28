@@ -459,6 +459,16 @@ function subscriptionFromCodexSnapshot(snap: UsageSnapshot): SubscriptionAxis {
  *  📏 응답 모양(실측 2026-09-23): `{data:{total_credits, total_usage}}` (USD). */
 export const OPENROUTER_CREDITS_ENDPOINT = 'https://openrouter.ai/api/v1/credits';
 export const OPENROUTER_KEY_ENDPOINT = 'https://openrouter.ai/api/v1/key';
+
+/** 📏 CREDIT-READOUT 관측 — /key readout 이 «키 한도 note» 를 못 만든 이유를 남긴다.
+ *  note 없는 openrouter 행만 보면 «/key 를 안 불렀나 · 404 인가 · 한도가 null(무제한) 인가» 가
+ *  안 갈리므로 판단 근거를 로그에 남긴다(행·문면·원장 형식은 불변 — 진단 전용). */
+const OPENROUTER_KEY_UNAVAILABLE_EVENT = 'openrouter-key-unavailable';
+type OpenRouterKeyUnavailableReason = 'http-error' | 'limit-not-finite' | 'throw';
+function logOpenRouterKeyUnavailable(reason: OpenRouterKeyUnavailableReason, detail?: string): void {
+  debug.log('usage', OPENROUTER_KEY_UNAVAILABLE_EVENT, detail === undefined ? { reason } : { reason, detail });
+}
+
 async function collectOpenRouterRows(deps: UnifiedUsageDeps): Promise<AccountUsageRow[]> {
   // ⛔ 시험 런타임은 seam 이 없으면 «키 없음»으로 본다 — 키 캐시는 «파일»이라 env 스크럽을 통과해
   //   기존 시험들이 실제 네트워크를 치게 된다(seam 을 모르는 옛 시험이 다수).
@@ -497,10 +507,16 @@ async function collectOpenRouterRows(deps: UnifiedUsageDeps): Promise<AccountUsa
         if (typeof limit === 'number' && Number.isFinite(limit)
           && typeof limitRemaining === 'number' && Number.isFinite(limitRemaining)) {
           note = `키 한도 남은 금액 $${limitRemaining.toFixed(2)}`;
+        } else {
+          logOpenRouterKeyUnavailable('limit-not-finite',
+            `limit=${JSON.stringify(limit) ?? 'absent'} limit_remaining=${JSON.stringify(limitRemaining) ?? 'absent'}`);
         }
+      } else {
+        logOpenRouterKeyUnavailable('http-error', `http-${keyRes.status}`);
       }
-    } catch {
+    } catch (err) {
       // Key metadata is optional; preserve the successful credits row when unavailable.
+      logOpenRouterKeyUnavailable('throw', err instanceof Error ? err.message : String(err));
     }
     return [{
       ...base,

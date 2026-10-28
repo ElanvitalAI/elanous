@@ -40,7 +40,7 @@ test('a partial text stream that stalls rejects within a second, closes once, an
     expect(returns).toBe(1);
     expect(records).toContainEqual({
       category: 'llm', event: 'stream-idle-timeout',
-      data: { provider: 'probe-provider', model: 'gpt-4o-mini', idleMs: 50, receivedChars: 7, site: 'stream-llm' },
+      data: { provider: 'probe-provider', model: 'gpt-4o-mini', idleMs: 50, idleMsSource: 'call', receivedChars: 7, site: 'stream-llm' },
     });
   } finally {
     log.mockRestore();

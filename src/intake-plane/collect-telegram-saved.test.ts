@@ -18,6 +18,11 @@ function seedCursor(r: string, lastId: number): void {
   writeFileSync(join(r, 'intake', 'telegram-saved.cursor.json'), JSON.stringify({ lastId, at: '2026-10-21T00:00:00.000Z' }) + '\n');
 }
 
+function seedRecoveryCursor(r: string, lastId: number): void {
+  mkdirSync(join(r, 'intake'), { recursive: true });
+  writeFileSync(join(r, 'intake', 'telegram-saved.recovery.json'), JSON.stringify({ lastId }) + '\n');
+}
+
 const msg = (id: number, text: string, urls: string[] = []): SavedMessage => ({ id, date: '2026-10-24T00:00:00.000Z', text, urls });
 const fake = (all: SavedMessage[]): FetchSavedMessages & { calls: [number, number][] } => {
   const calls: [number, number][] = [];
@@ -66,14 +71,85 @@ test('TG-SAVED-ZERO: 원장 입력은 있는데 새 것 0 — 다른 주체(queu
   expect(text).not.toContain('필터 때문이다');
 });
 
+test('TG-SAVED-ZERO: 복구 상한 안의 커서 이하 저장 메시지를 흡수하고 다음 같은 커서 조회에서 반복하지 않는다', async () => {
+  const r = root();
+  seedCursor(r, 9092);
+  const staleFetch: FetchSavedMessages = async () => [msg(9092, 'https://example.com/old'), msg(9000, '   '), msg(8990, 'https://example.com/older')];
+  const first = await collectTelegramSaved(r, staleFetch, { max: 300 });
+  expect(first).toMatchObject({ cursorBefore: 9092, cursorAfter: 9092, messages: 3, droppedByFilter: 1, raws: 2 });
+  expect(first.ingest).toMatchObject({ shaped: 2, added: 2, merged: 0, seen: 0, skipped: 0 });
+  expect(listIntakeItems(r).map((item) => item.url)).toEqual(['https://example.com/old', 'https://example.com/older']);
+
+  const again = await collectTelegramSaved(r, staleFetch, { max: 300 });
+  expect(again).toMatchObject({ cursorBefore: 9092, cursorAfter: 9092, messages: 0, raws: 0 });
+  expect(readSavedCursor(r)).toBe(9092);
+  expect(listIntakeItems(r)).toHaveLength(2);
+  expect(diagnoseSavedCollect(again)).toBe('no-new-messages');
+});
+
+test('TG-SAVED-ZERO: 커서 뒤 새 메시지가 먼저 와도 미흡수 복구 구간을 함께 읽는다', async () => {
+  const r = root();
+  seedCursor(r, 9092);
+  seedRecoveryCursor(r, 8959);
+  const all = [
+    msg(8960, '복구 앞쪽 https://example.com/recovered-first'),
+    msg(9050, '복구 중간 https://example.com/recovered-middle'),
+    msg(9092, '커서 경계 https://example.com/recovered-boundary'),
+    msg(9100, '새 메시지 https://example.com/new'),
+  ];
+  const f = fake(all);
+
+  const res = await collectTelegramSaved(r, f, { max: 300 });
+
+  expect(f.calls).toEqual([[9092, 300], [8791, 300]]);
+  expect(res).toMatchObject({ cursorBefore: 9092, cursorAfter: 9100, messages: 4, raws: 4 });
+  expect(res.ingest).toMatchObject({ added: 4 });
+  expect(listIntakeItems(r).map((item) => item.url).sort()).toEqual([
+    'https://example.com/new',
+    'https://example.com/recovered-boundary',
+    'https://example.com/recovered-first',
+    'https://example.com/recovered-middle',
+  ]);
+});
+
+test('TG-SAVED-ZERO: 흡수 실패 뒤 복구 완료 커서를 앞당기지 않아 재시도한다', async () => {
+  const r = root();
+  seedCursor(r, 9092);
+  seedRecoveryCursor(r, 8959);
+  const brokenLedger = join(r, 'intake', 'items.jsonl');
+  mkdirSync(brokenLedger);
+
+  await expect(collectTelegramSaved(r, fake([msg(9000, 'https://example.com/retry')]), { max: 300 })).rejects.toThrow();
+  expect(JSON.parse(readFileSync(join(r, 'intake', 'telegram-saved.recovery.json'), 'utf8')).lastId).toBe(8959);
+
+  rmSync(brokenLedger, { recursive: true, force: true });
+  const retry = fake([msg(9000, 'https://example.com/retry')]);
+  const res = await collectTelegramSaved(r, retry, { max: 300 });
+  expect(retry.calls).toEqual([[9092, 300], [8791, 300]]);
+  expect(res.ingest).toMatchObject({ added: 1 });
+  expect(listIntakeItems(r).map((item) => item.url)).toEqual(['https://example.com/retry']);
+});
+
+test('TG-SAVED-ZERO: 복구 메시지의 최대 ID가 커서보다 작아도 완료 마커는 퇴행하지 않는다', async () => {
+  const r = root();
+  seedCursor(r, 9092);
+  seedRecoveryCursor(r, 8959);
+
+  const res = await collectTelegramSaved(r, fake([msg(9050, 'https://example.com/below-cursor')]), { max: 300 });
+
+  expect(res).toMatchObject({ cursorBefore: 9092, cursorAfter: 9092, messages: 1, raws: 1 });
+  expect(JSON.parse(readFileSync(join(r, 'intake', 'telegram-saved.recovery.json'), 'utf8')).lastId).toBe(9092);
+});
+
 test('TG-SAVED-ZERO: 커서 이후 새 저장 메시지가 없으면 그 까닭을 «새 메시지 없음»으로 따로 말한다', async () => {
   const r = root();
   seedCursor(r, 8959);
   // minId 배타 — 8959 이하의 옛 메시지는 다시 오지 않는다.
   const res = await collectTelegramSaved(r, fake([msg(8959, 'https://example.com/old')]), { max: 300 });
-  expect(res).toMatchObject({ cursorBefore: 8959, cursorAfter: 8959, messages: 0, droppedByFilter: 0, raws: 0 });
-  expect(diagnoseSavedCollect(res)).toBe('no-new-messages');
-  expect(renderCollectTelegramSavedResult(res)).toContain('커서는 이미 다른 주체가 넘겼을 수 있다');
+  expect(res).toMatchObject({ cursorBefore: 8959, cursorAfter: 8959, messages: 1, droppedByFilter: 0, raws: 1 });
+  expect(res.ingest).toMatchObject({ added: 1 });
+  expect(listIntakeItems(r)).toHaveLength(1);
+  expect(diagnoseSavedCollect(res)).toBe('new-items');
 });
 
 test('TG-SAVED-ZERO: 판정: 대표가 저장한 메시지 1건이 다음 흡수에 들어감 — 칸 문면의 판정선을 시험필요하면 실물', async () => {
@@ -116,7 +192,7 @@ test('TG-SAVED-ZERO: minId 배타 · dry-run 무쓰기 · max 계약은 그대�
   const f = fake([msg(9060, 'https://example.com/a'), msg(9092, 'https://example.com/b')]);
   const dry = await collectTelegramSaved(r, f, { max: 7, dryRun: true });
   // minId 배타 = id > minId — fetch 는 커서 값을 그대로 받는다.
-  expect(f.calls).toEqual([[8959, 7]]);
+  expect(f.calls).toEqual([[8959, 7], [8951, 7]]);
   expect(dry).toMatchObject({ messages: 2, droppedByFilter: 0, raws: 2, dryRun: true });
   expect(dry.ingest).toBeUndefined();
   expect(readSavedCursor(r)).toBe(8959);

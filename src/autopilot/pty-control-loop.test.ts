@@ -1,7 +1,7 @@
 // PLAN §7 P3 — ReAct PTY 제어 루프. 관측→판단→행동 조립·termination. deps 주입(순수·시간무관).
 import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { runPtyControlLoop, controlDepsForHandle, type RunSupervisor, type ControlObservation, type ControlDecision } from './pty-control-loop.js';
+import { runPtyControlLoop, controlDepsForHandle, VERIFY_DONE_STOP, type RunSupervisor, type ControlObservation, type ControlDecision } from './pty-control-loop.js';
 import { encodeSgrMouse, MAX_PTY_KEY_REPEAT } from '../pty-shell/pty-mouse.js';
 
 // 결정론 brain — 스크립트된 결정 시퀀스.
@@ -397,6 +397,19 @@ describe('runPtyControlLoop', () => {
     };
     const r = await runPtyControlLoop(scriptedBrain([{ action: 'done', reason: '골 완료' }]), { ...deps, verifyDone }, { maxSteps: 5, pollMs: 0 });
     expect(r.termination).toEqual({ kind: 'success', reason: '골 완료' });
+  });
+
+  test('verifyDone reject with stop — fail closed without retry injection', async () => {
+    const { deps, injected } = harness(['MISSION-COMPLETE']);
+    const verifyDone = () => ({ ok: false as const, retry: 'verbatim prompt must not be changed', stop: VERIFY_DONE_STOP });
+    const r = await runPtyControlLoop(
+      scriptedBrain([{ action: 'done', reason: 'claimed complete' }]),
+      { ...deps, verifyDone },
+      { maxSteps: 5, pollMs: 0 },
+    );
+    expect(injected).toEqual([]);
+    expect(r.termination).toMatchObject({ kind: 'error', code: VERIFY_DONE_STOP });
+    expect(r.termination.kind).not.toBe('success');
   });
 
   test('verifyDone reject — retry inject 뒤 다음 done 검증 success', async () => {

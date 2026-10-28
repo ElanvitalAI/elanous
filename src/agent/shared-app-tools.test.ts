@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { buildSharedAppTools } from './shared-app-tools.js';
 import { findNativeTool } from '../native-tool-catalog.js';
 import { buildSkillExecTool } from '../tool-runtime/skill-exec-runtime.js';
+import { setResearchInvoker } from '../research-bridge/invoke.js';
 import { resetUserConfig } from '../user-config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import type { UserConfig } from '../user-config.js';
@@ -86,6 +87,18 @@ describe('buildSharedAppTools — core + finance(gated) + skill execution 단일
     const s = buildSharedAppTools();
     const result = await s.dispatch('skill_exec', { skill: '__not_allowlisted__', task: 'test' });
     expect(result).toMatchObject({ skill: '__not_allowlisted__', ok: false });
+  });
+
+  test('skill_exec forwards caller cancellation through shared dispatch', async () => {
+    const parent = new AbortController();
+    setResearchInvoker(async () => new Promise(() => {}));
+    try {
+      const pending = buildSharedAppTools().dispatch('skill_exec', { skill: 'omni-digest', task: 'research' }, { surface: 'tui', signal: parent.signal });
+      parent.abort();
+      await expect(pending).resolves.toMatchObject({ ok: false, error: 'skill-exec-cancelled' });
+    } finally {
+      setResearchInvoker(null);
+    }
   });
 
   test('dispatch 라우팅 — finance_* → finance, 그 외 → core', async () => {

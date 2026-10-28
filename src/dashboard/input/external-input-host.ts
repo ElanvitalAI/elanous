@@ -20,6 +20,7 @@ export interface DashboardExternalInputHostDeps {
   setQueueNotice: (line: string | null) => void;
   /** 지금 턴의 ESC 중단 경로(escGate) — 턴 밖이면 null. 외부 `/stop` 이 이것을 부른다. */
   getTurnStop?: () => (() => void) | null;
+  handleInlineChoice?: (text: string) => boolean;
   /** 미소비 키 수 — 기본 tui.ts 키 큐. */
   pendingKeyCount?: () => number;
 }
@@ -61,6 +62,7 @@ export function createDashboardExternalInputHost(deps: DashboardExternalInputHos
       stop();
       return true;
     },
+    handleInlineChoice: (text) => deps.handleInlineChoice?.(text) ?? false,
     onExternalStop: (result) => {
       deps.pushNotice(result === 'stopped' ? '⏹ 외부 /stop — 대기열을 건너뛰고 이 턴에 중단을 요청했습니다'
         : result === 'no-turn' ? '⏹ 외부 /stop — 도는 턴이 없어 무시했습니다'

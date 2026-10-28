@@ -103,7 +103,7 @@ export function parseSiWarmCommand(raw: unknown): SiWarmCommand | null {
     || !digest(row.executionKey) || !str(row.sourceSha) || !SHA.test(row.sourceSha)
     || !token(row.podUid) || !integer(row.generation) || row.generation < 1
     || !validKey(row.key) || row.envProfile !== 'si-standard-v1'
-    || !finite(row.deadlineAt) || !digest(row.payloadSha256)
+    || !finite(row.deadlineAt) || row.deadlineAt <= 0 || !digest(row.payloadSha256)
     || !digest(row.credentialBundleSha256)) return null;
   return raw as SiWarmCommand;
 }

@@ -28,11 +28,12 @@ import {
   type AgentRegistry,
 } from './registry.js';
 import type { AgentTask } from './types.js';
+import type { RunStopRecord } from '../self-implement/run-stop.js';
 import { globalAgentFlash } from '../display/agent-flash.js';
 import { debug } from '../debug/log.js';
-import { DATA_DIR } from '../config.js';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 /** Max chars of the child's final result we echo in the notification.
@@ -65,10 +66,15 @@ export interface PendingTaskNotification {
 }
 
 export class TaskNotificationQueue {
+  private readonly persistencePath: string;
   constructor(
-    private readonly resultDir = join(DATA_DIR, 'agent-results'),
+    private readonly resultDir = join(effectiveInstanceRoot(), 'data', 'agent-results'),
     private readonly maxResultChars = 10_000_000,
-  ) {}
+    persistencePath?: string,
+  ) {
+    this.persistencePath = persistencePath ?? '';
+    if (this.persistencePath) this.restore();
+  }
 
   private queue: PendingTaskNotification[] = [];
   /** De-dup guard — same task.finishedAt can fire twice if a caller
@@ -96,6 +102,13 @@ export class TaskNotificationQueue {
     return () => { this.wakeListeners.delete(listener); };
   }
 
+  /** Replay restored pending receipts to one newly installed wake consumer. */
+  replayPendingWakes(listener: (n: PendingTaskNotification) => void): void {
+    for (const pending of this.queue) {
+      try { listener(pending); } catch { /* replay listener isolation */ }
+    }
+  }
+
   enqueue(n: PendingTaskNotification): void {
     if (this.seen.has(n.taskId)) return;
     let pending = n;
@@ -119,6 +132,7 @@ export class TaskNotificationQueue {
     }
     this.seen.add(n.taskId);
     this.queue.push(pending);
+    this.persist();
     debug.log('agent.task-notification', 'wake', { taskId: n.taskId, size: this.queue.length });
     for (const listener of this.wakeListeners) {
       try {
@@ -141,6 +155,7 @@ export class TaskNotificationQueue {
   drain(): PendingTaskNotification[] {
     const out = this.queue;
     this.queue = [];
+    this.persist();
     // NOTE: we keep `seen` populated so a listener firing a second
     // time for the same task (rare but possible under races) still
     // can't double-inject. `seen` grows unbounded across a session;
@@ -172,10 +187,64 @@ export class TaskNotificationQueue {
   clear(): void {
     this.queue = [];
     this.seen.clear();
+    this.persist();
+  }
+
+  private restore(): void {
+    try {
+      const value: unknown = JSON.parse(readFileSync(this.persistencePath, 'utf8'));
+      if (!value || typeof value !== 'object') throw new Error('invalid task notification snapshot');
+      const snapshot = value as { version?: number; queue?: PendingTaskNotification[]; seen?: string[] };
+      if (snapshot.version !== 1 || !Array.isArray(snapshot.queue) || !Array.isArray(snapshot.seen)) throw new Error('invalid task notification snapshot');
+      this.queue = snapshot.queue;
+      this.seen = new Set(snapshot.seen);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      debug.log('agent.task-notification', 'restore-failed', { path: this.persistencePath, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+    }
+  }
+
+  private persist(): void {
+    if (!this.persistencePath) return;
+    try {
+      mkdirSync(dirname(this.persistencePath), { recursive: true });
+      const temp = `${this.persistencePath}.${randomUUID()}.tmp`;
+      writeFileSync(temp, `${JSON.stringify({ version: 1, queue: this.queue, seen: [...this.seen] })}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      renameSync(temp, this.persistencePath);
+    } catch (error) {
+      debug.log('agent.task-notification', 'persist-failed', { path: this.persistencePath, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+    }
   }
 }
 
-export const globalTaskNotificationQueue = new TaskNotificationQueue();
+export function resolveTaskNotificationPaths(instanceRoot = effectiveInstanceRoot()): { resultDir: string; persistencePath: string } {
+  const dataDir = process.env.ELANOUS_DATA_DIR?.trim() || join(instanceRoot, 'data');
+  return { resultDir: join(dataDir, 'agent-results'), persistencePath: join(dataDir, 'agent-task-notifications.json') };
+}
+
+const taskNotificationPaths = resolveTaskNotificationPaths();
+export const globalTaskNotificationQueue = new TaskNotificationQueue(
+  taskNotificationPaths.resultDir, 10_000_000, taskNotificationPaths.persistencePath,
+);
+
+/** Wake a parent as soon as a SelfImplement run records its terminal stop, even if post-stop cleanup stalls. */
+export function enqueueSelfImplementRunStopNotification(
+  input: { runId: string; taskId: string; feature: string; stop: RunStopRecord },
+  queue: TaskNotificationQueue = globalTaskNotificationQueue,
+): void {
+  const { runId, taskId, feature, stop } = input;
+  queue.enqueue({
+    taskId: `self-implement-stop:${runId}:${taskId}`,
+    agentName: 'SelfImplement',
+    label: feature.slice(0, 80),
+    state: 'error',
+    output: `SelfImplement run ${runId} stopped (${stop.class}${stop.site ? ` at ${stop.site}` : ''}): ${stop.cause} · next: ${stop.nextMove}`,
+    truncated: false,
+    errorMessage: stop.cause,
+    durationMs: 0,
+    finishedAt: Date.now(),
+  });
+}
 
 // ── Auto-wire background task completion ─────────────────────────────
 //

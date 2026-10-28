@@ -14,6 +14,7 @@ import { pwaGraph, pwaReach } from '../../scripts/ci-pwa-build-gate.js';
 import { changedPathPairs, changedTsFiles, readGitFile, requiredExportFieldsInChanges } from '../../scripts/ci-typecheck-changed.js';
 import { classifyMergeFailure, clipRegateDetail, parseConflictFiles, type HostRegateFailure } from './regate-detail.js';
 import { buildImporterTestIndex, isTestPath } from './importer-test-index.js';
+import type { GateReceipt, GateReceiptIdentity } from './gate-receipt-registry.js';
 
 /** Use pr-land's PWA reachability (including its undecidable-graph build fallback), not a blanket src/** trigger. */
 export function needsPwaBuild(files: readonly string[], repoRoot: string, graph: (root: string) => ReturnType<typeof pwaGraph> = pwaGraph): boolean {
@@ -86,6 +87,10 @@ export type HostRegateDeps = {
   prodFreezeRoot?: string;
   runExposeGate?: typeof runExposeGate;
   syncMergedChecklist?: typeof import('../release-loop/merged-pr-checklist.js').syncMergedPrChecklist;
+  /** GATE-ONCE-PER-HEAD (OP 10-27 23:0x): persistent passed-receipt registry file. Default: <git-common-dir>/elanous-host-regate/gate-receipts.json. */
+  gateReceiptPath?: string;
+  /** Environment the receipt fingerprint reads; production uses the host process env. */
+  gateReceiptEnv?: NodeJS.ProcessEnv;
 };
 
 /**
@@ -308,6 +313,20 @@ function removeBrokenSlotRegistration(repoRoot: string, worktree: string): void 
   }
 }
 
+/** GATE-ONCE-PER-HEAD: 생산 등록부는 host-regate 슬롯과 같은 Git common directory 에 산다. 못 찾으면 승계 없이 원래 검사로 연다. */
+function defaultGateReceiptPath(repoRoot: string, command: NonNullable<HostRegateDeps['command']>): string | undefined {
+  const r = command('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], repoRoot);
+  const dir = r.status === 0 ? r.stdout.trim() : '';
+  return dir ? join(dir, 'elanous-host-regate', 'gate-receipts.json') : undefined;
+}
+
+/** 영수증의 Bun 식별값 — 검사를 실제로 돌릴 그 Bun. 못 재면 null 로 승계를 닫는다(빈 값으로 흐리지 않는다). */
+function commandBunVersion(command: NonNullable<HostRegateDeps['command']>, cwd: string): string | null {
+  const r = command('bun', ['--version'], cwd);
+  const version = r.status === 0 ? r.stdout.trim() : '';
+  return version || null;
+}
+
 /** Callers: podSelfImplementSpawn in src/task-orchestrator/surfaces/self-implement-pod.ts calls
  *  (options.hostRegate ?? runHostRegate)({ prNumber, headCommit, repoRoot: hostRoot, ... });
  *  sweepFrozenMerges in frozen-merges.ts also calls runHostRegate(entry); landing queue serialization stays there. */
@@ -383,6 +402,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     let stalePrBase: string | undefined;
     const initialPrBase = baseCommit;
     let buildPwa = false;
+    let typecheckBase = '';
     // REGATE-PWA-DEPS-FOR-TSC (#26698 → #27484 must-fix): the typecheck gate picks its own changed set and its own
     // whole-repository promotion triggers — TSC_BASE_REF..HEAD — which can carry apps/pwa files that landed on
     // main after this PR branched, and root-file export changes that widen the inspection to the whole repository.
@@ -494,54 +514,109 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       // apps/pwa/ OR any of its whole-repository promotion triggers (필수 export 필드 추가 · exported 심볼 삭제 ·
       // exported 함수 매개변수 증가, in ANY changed file), even when buildPwa never turns on: without app deps
       // the gate fails such runs as «의존성 없음» for environment reasons, not code defects.
-      const typecheckBase = input.verifyOnly ? baseCommit : base;
+      typecheckBase = input.verifyOnly ? baseCommit : base;
       typecheckTouchesPwa = typecheckGateTouchesPwa(worktree, typecheckBase, command);
       if ((buildPwa || typecheckTouchesPwa) && existsSync(join(worktree, 'apps/pwa'))) provide('apps/pwa', 'next');
     } catch (e) { return result('unmeasured', 'worktree', String(e)); }
-    try {
-      const interferenceOptions = { neighbors: !input.verifyOnly };
-      const interference = await (deps.interference ?? ((f: readonly string[], c: string) => defaultInterference(f, c, interferenceOptions)))(files, worktree);
-      if (interference.neighborsTrimmed || interference.importerTrimmed) interferenceNote = {
-        ...(interference.neighborsTrimmed ? { neighborsTrimmed: interference.neighborsTrimmed } : {}),
-        ...(interference.importerTrimmed ? { importerTrimmed: interference.importerTrimmed } : {}),
-        interferenceDetail: (interference.detail ?? '').slice(0, 300),
-      };
-      if (!interference.passed) return result(interference.unmeasured ? 'unmeasured' : 'failed', 'test-interference', interference.detail);
-    } catch (e) { return result('unmeasured', 'test-interference', String(e)); }
-    // Landing can also be initiated by the host after the child gate; judge the checked PR here too.
-    if (publicExposureFiles(files).length > 0) {
-      const exposure = (deps.runExposeGate ?? runExposeGate)(worktree, files,
-        getUserConfig().harness?.exposeGate === 'strict' ? 'strict' : 'warn',
-        (bin, args, dir) => command(bin, args, dir));
-      if (!exposure.passed) return result('failed', 'expose', exposure.log);
-    }
-    // The checked checkout is shared with interference/exposure gates. Verify dependencies at the
-    // typecheck boundary as well: a missing PWA link here made #27414 fail as an unmeasured host regate.
-    if ((buildPwa || typecheckTouchesPwa) && !existsSync(join(worktree, 'apps/pwa/node_modules'))) {
-      let failure: string | null = null;
+    // GATE-ONCE-PER-HEAD (0.2.40 첫 조각 · OP 10-27 23:0x 지시): 입장 검사(PR open/ready·head/base 재검증)와
+    // 통합 후보 구성이 끝난 뒤, 지속 등록부에서 이 측정의 key 로 통과 영수증을 찾는다. 정확히 같은
+    // head·측정 base·Bun/lockfile·radius·검사 범위·환경의 통과 영수증만 아래 비용 큰 검사를 승계하고,
+    // 불일치·결손·불완전·실패/측정불가 영수증은 원래 검사를 그대로 실행한다 — 영수증이 커버하지 않는
+    // 검사는 승계하지 않는다. 등록부를 못 쓰는 경우도 검사 쪽으로 실패 열린다.
+    const gateReceiptPath = deps.gateReceiptPath ?? defaultGateReceiptPath(input.repoRoot, command);
+    // Gate receipt support is optional for this host path. Keep its registry and test-env helpers
+    // outside the Next TUI's static startup closure, loading them only when receipt lookup is enabled.
+    const gateReceiptRegistry = gateReceiptPath ? await import('./gate-receipt-registry.js') : null;
+    const gateChecks = [
+      `test-interference:${input.verifyOnly ? 'changed-only' : 'with-neighbours'}`,
+      ...(publicExposureFiles(files).length > 0 ? ['expose'] : []),
+      `typecheck@${typecheckBase}`,
+      ...((deps.command || existsSync(join(worktree, 'scripts/ci-isolation-hardcode-gate.ts'))) ? ['isolation-gate'] : []),
+      ...(buildPwa ? ['nexus-build'] : []),
+    ];
+    let gateReceiptIdentity: GateReceiptIdentity | undefined;
+    let gateReceiptKey = '';
+    let gateReceiptReused = false;
+    let gateReceiptDecline = 'gate receipt registry unavailable';
+    if (gateReceiptPath) {
       try {
-        if (existsSync(join(worktree, 'apps/pwa'))) {
-          provideCheckoutDependencies(worktree, input.repoRoot, 'apps/pwa', 'next', (cwd) => { run('bun', ['install', '--frozen-lockfile'], cwd); });
-        } else failure = 'apps/pwa absent before typecheck';
-      } catch (e) { failure = String(e); }
-      const ready = existsSync(join(worktree, 'apps/pwa/node_modules'));
-      if (!ready && !failure) failure = 'apps/pwa/node_modules absent after provision before typecheck';
-      try { debug.log('harness.host-regate', 'pwa-dependencies-before-typecheck', { pr: input.prNumber, restored: ready, failure }); } catch { /* observation must not block regate */ }
-      if (!ready) return result('unmeasured', 'dependencies', failure!);
+        const bunVersion = commandBunVersion(command, worktree);
+        if (bunVersion === null) gateReceiptDecline = 'bun version unavailable';
+        else {
+          gateReceiptIdentity = {
+            headCommit: input.headCommit,
+            baseCommit,
+            bunVersion,
+            lockfileHash: gateReceiptRegistry!.gateLockfileHash(worktree),
+            radiusFiles: [...new Set(files)].sort(),
+            checks: gateChecks,
+            envFingerprint: gateReceiptRegistry!.gateEnvFingerprint(deps.gateReceiptEnv ?? process.env),
+          };
+          gateReceiptKey = gateReceiptRegistry!.computeReceiptKey(gateReceiptIdentity, 'passed');
+          const registry = gateReceiptRegistry!.loadGateReceipts(gateReceiptPath);
+          const stored = registry[gateReceiptKey];
+          if (stored && gateReceiptRegistry!.gateReceiptSelfKey(stored) === gateReceiptKey) gateReceiptReused = true;
+          else gateReceiptDecline = stored ? 'stored receipt does not recompute to its own key' : gateReceiptRegistry!.describeGateReceiptDecline(gateReceiptIdentity, registry);
+        }
+      } catch (e) { gateReceiptDecline = `gate receipt lookup failed: ${String(e).slice(0, 200)}`; }
     }
-    // verifyOnly: 통합 후보는 «지금 main 끝»(baseCommit)에 얹은 것이다 — 옛 merge-base 로 비교하면 그사이 main 착지분
-    //   수백 파일이 «이 PR 의 변경»으로 잡혀 저장소 전체 검사로 승격된다(2026-09-28 #21239 실측: 456파일 · PWA 636건).
-    try { run('bun', ['scripts/ci-typecheck-changed.ts'], worktree, { ...process.env, TSC_BASE_REF: input.verifyOnly ? baseCommit : base }); }
-    catch (e) { return result(String(e).includes('error TS') ? 'failed' : 'unmeasured', 'typecheck', String(e)); }
-    // ⛔ 2026-09-28: a Pod landing brought `join(home, '.elanous', …)` into main without this gate, and every human
-    //    `pr land` after it failed the isolation gate regardless of its own files (#21336 → #21343).
-    if (deps.command || existsSync(join(worktree, 'scripts/ci-isolation-hardcode-gate.ts'))) {
-      try { run('bun', ['scripts/ci-isolation-hardcode-gate.ts', '--changed-files', ...files], worktree); }
-      catch (e) { return result(/\[isolation-gate\] FAIL/.test(String(e)) ? 'failed' : 'unmeasured', 'isolation-gate', String(e)); }
-    }
-    if (buildPwa) {
-      try { run('bun', ['bin/elanous.mjs', '--test', 'nexus', 'build'], worktree); }
-      catch (e) { return result(String(e).includes('command unavailable') ? 'unmeasured' : 'failed', 'nexus-build', String(e)); }
+    if (gateReceiptReused) debug.log('harness.host-regate', 'gate-receipt-reuse', { pr: input.prNumber, key: gateReceiptKey, checks: gateChecks });
+    else debug.log('harness.host-regate', 'gate-receipt-decline', { pr: input.prNumber, ...(gateReceiptKey ? { key: gateReceiptKey } : {}), reason: gateReceiptDecline });
+    if (!gateReceiptReused) {
+      try {
+        const interferenceOptions = { neighbors: !input.verifyOnly };
+        const interference = await (deps.interference ?? ((f: readonly string[], c: string) => defaultInterference(f, c, interferenceOptions)))(files, worktree);
+        if (interference.neighborsTrimmed || interference.importerTrimmed) interferenceNote = {
+          ...(interference.neighborsTrimmed ? { neighborsTrimmed: interference.neighborsTrimmed } : {}),
+          ...(interference.importerTrimmed ? { importerTrimmed: interference.importerTrimmed } : {}),
+          interferenceDetail: (interference.detail ?? '').slice(0, 300),
+        };
+        if (!interference.passed) return result(interference.unmeasured ? 'unmeasured' : 'failed', 'test-interference', interference.detail);
+      } catch (e) { return result('unmeasured', 'test-interference', String(e)); }
+      // Landing can also be initiated by the host after the child gate; judge the checked PR here too.
+      if (publicExposureFiles(files).length > 0) {
+        const exposure = (deps.runExposeGate ?? runExposeGate)(worktree, files,
+          getUserConfig().harness?.exposeGate === 'strict' ? 'strict' : 'warn',
+          (bin, args, dir) => command(bin, args, dir));
+        if (!exposure.passed) return result('failed', 'expose', exposure.log);
+      }
+      // The checked checkout is shared with interference/exposure gates. Verify dependencies at the
+      // typecheck boundary as well: a missing PWA link here made #27414 fail as an unmeasured host regate.
+      if ((buildPwa || typecheckTouchesPwa) && !existsSync(join(worktree, 'apps/pwa/node_modules'))) {
+        let failure: string | null = null;
+        try {
+          if (existsSync(join(worktree, 'apps/pwa'))) {
+            provideCheckoutDependencies(worktree, input.repoRoot, 'apps/pwa', 'next', (cwd) => { run('bun', ['install', '--frozen-lockfile'], cwd); });
+          } else failure = 'apps/pwa absent before typecheck';
+        } catch (e) { failure = String(e); }
+        const ready = existsSync(join(worktree, 'apps/pwa/node_modules'));
+        if (!ready && !failure) failure = 'apps/pwa/node_modules absent after provision before typecheck';
+        try { debug.log('harness.host-regate', 'pwa-dependencies-before-typecheck', { pr: input.prNumber, restored: ready, failure }); } catch { /* observation must not block regate */ }
+        if (!ready) return result('unmeasured', 'dependencies', failure!);
+      }
+      // verifyOnly: 통합 후보는 «지금 main 끝»(baseCommit)에 얹은 것이다 — 옛 merge-base 로 비교하면 그사이 main 착지분
+      //   수백 파일이 «이 PR 의 변경»으로 잡혀 저장소 전체 검사로 승격된다(2026-09-28 #21239 실측: 456파일 · PWA 636건).
+      try { run('bun', ['scripts/ci-typecheck-changed.ts'], worktree, { ...process.env, TSC_BASE_REF: typecheckBase }); }
+      catch (e) { return result(String(e).includes('error TS') ? 'failed' : 'unmeasured', 'typecheck', String(e)); }
+      // ⛔ 2026-09-28: a Pod landing brought `join(home, '.elanous', …)` into main without this gate, and every human
+      //    `pr land` after it failed the isolation gate regardless of its own files (#21336 → #21343).
+      if (deps.command || existsSync(join(worktree, 'scripts/ci-isolation-hardcode-gate.ts'))) {
+        try { run('bun', ['scripts/ci-isolation-hardcode-gate.ts', '--changed-files', ...files], worktree); }
+        catch (e) { return result(/\[isolation-gate\] FAIL/.test(String(e)) ? 'failed' : 'unmeasured', 'isolation-gate', String(e)); }
+      }
+      if (buildPwa) {
+        try { run('bun', ['bin/elanous.mjs', '--test', 'nexus', 'build'], worktree); }
+        catch (e) { return result(String(e).includes('command unavailable') ? 'unmeasured' : 'failed', 'nexus-build', String(e)); }
+      }
+      // 원래 검사가 모두 통과했다 — 이 측정의 통과 영수증을 지속 등록부에 원자적으로 남긴다.
+      // 저장 실패는 영수증 최적화의 실패일 뿐 게이트 판정이 아니므로 관측만 남긴다.
+      if (gateReceiptPath && gateReceiptIdentity && gateReceiptRegistry) {
+        try {
+          const receipt: GateReceipt = { ...gateReceiptIdentity, schema: gateReceiptRegistry.GATE_RECEIPT_SCHEMA, key: gateReceiptRegistry.computeReceiptKey(gateReceiptIdentity, 'passed'), verdict: 'passed', savedAt: new Date().toISOString() };
+          gateReceiptRegistry.saveGateReceipt(gateReceiptPath, receipt);
+          debug.log('harness.host-regate', 'gate-receipt-saved', { pr: input.prNumber, key: receipt.key, checks: gateChecks });
+        } catch (e) { debug.log('harness.host-regate', 'gate-receipt-save-failed', { pr: input.prNumber, error: String(e).slice(0, 200) }); }
+      }
     }
     let current: PrView;
     try { current = readPr(); }
@@ -576,8 +651,8 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     if (merged.state !== 'MERGED') return result('unmeasured', 'merge-confirm', `PR state after merge is ${merged.state ?? 'unknown'}`);
     landed = true;
     try {
-      const sync = deps.syncMergedChecklist ?? (await import('../release-loop/merged-pr-checklist.js')).syncMergedPrChecklist;
-      sync(input.prNumber, input.repoRoot, input.goalFile);
+      const sync = deps.syncMergedChecklist ?? (await import('../release-loop/merged-pr-checklist.js')).syncMergedPrChecklistWithFeedback;
+      await sync(input.prNumber, input.repoRoot, input.goalFile);
     } catch (error) {
       debug.log('release.checklist', 'merged-pr-sync-failed', { pr: input.prNumber, error: String(error) });
     }

@@ -1,0 +1,25 @@
+# 독립 마케터 데모 (RFC §A3 ③) — 행사 사진 → 세로(9:16) 영상 ⊕ 피드 글 → 브랜드 톤 확인 루프 → 게시 전 사람 확인.
+graph_id: persona-marketer
+loop:
+  title: 마케터 장면
+  description: 행사 사진에서 세로 영상과 피드 글을 만들고 브랜드 톤 확인 루프를 지나 게시 전 사람 확인 뒤 «게시 대기» 카드로 종결한다(자동 게시 없음)
+  inputs: [event_photos]
+  trigger:
+    events: [manual]
+version: 1
+entry_node: event-photos
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: event-photos, kind: agent, recipe: 'cmd:event-photos', max_visits: 1 }
+  - { node_id: reel, kind: agent, recipe: 'cmd:reel', max_visits: 1 }
+  - { node_id: feed-text, kind: agent, recipe: 'cmd:feed-text', max_visits: 2 }
+  - { node_id: brand-tone, kind: agent, recipe: 'cmd:brand-tone', max_visits: 2 }
+  - { node_id: pre-post-check, kind: hitl, recipe: 'approval:pre-post-check', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: event-photos, on: outcome, map: { ok: reel, fail: failed, error: failed } }
+  - { from: reel, on: outcome, map: { ok: feed-text, fail: failed, error: failed } }
+  - { from: feed-text, on: outcome, map: { ok: brand-tone, rework: brand-tone, error: failed } }
+  - { from: brand-tone, on: outcome, map: { rework: feed-text, ok: pre-post-check, fail: failed, error: failed } }
+  - { from: pre-post-check, on: outcome, map: { ok: done, fail: failed, error: failed } }

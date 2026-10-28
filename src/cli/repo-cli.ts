@@ -6,6 +6,7 @@ import type { Command } from 'commander';
 
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
+import { spawnWithOwnedStderr } from '../surface/child-process.js';
 import { applyDesignDirection } from '../design/apply-direction.js';
 import { createCustomSystemFromPalette, createCustomSystemFromUrl, unreadTokenCount } from '../design/custom-system-create.js';
 import { libraryDir } from '../design/design-library.js';
@@ -731,7 +732,7 @@ export function registerRepoCommands(program: Command, overrides: RepoCliDeps = 
         // ⭐ stderr 는 «흘려 보낸다» — 채점기가 쪽마다 진행을 거기 적는다.
         //   🩸 2026-09-14 7판 terra: 전 쪽 채점이 5분 넘게 «말없이» 돌자 감독자가 「진행 없음」으로 판정해 재작업을 걸었다.
         //   ⛔ 게다가 'pipe' 로 받고 «안 읽으면» 버퍼가 차는 순간 자식이 멈춘다.
-        const proc = Bun.spawn(['bun', join(scripts, script), ...args], { stdout: 'pipe', stderr: 'inherit' });
+        const proc = spawnWithOwnedStderr(['bun', join(scripts, script), ...args], { stdout: 'pipe' });
         const out = await new Response(proc.stdout).text();
         await proc.exited;
         return { code: proc.exitCode ?? 1, out };

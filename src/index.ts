@@ -4739,6 +4739,7 @@ selfCmd
   .option('--shard-concurrency <number>', '동시에 실행할 조각 묶음 수 (1–4, 기본 3)')
   .option('--fixed-shard-distribution', '--shards N 과 함께만: RSS 사전 측정 없이 정렬된 파일을 N 조각에 라운드로빈 고정 배정한다(opt-in · 메모리 보증 아님 · 조각 타임아웃/OOM = unmeasured)')
   .option('--include-importers', '변경 모듈을 가져오는 importer 시험도 실행한다 (기본 caller 한도 밖까지)')
+  .option('--no-inherit', '이전 게이트 시험 영수증의 통과 시험을 상속하지 않고 전체 범위를 실행한다')
   .option('--remote [host]', 'GATE-REMOTE — 같은 커밋을 원격 호스트(기본 config gateRemote.host=node-b)에서 돌리고 결과만 가져온다(깨끗한 트리 · --pr 은 로컬)')
   .option('--local', '원격 실행을 끄고 명시적으로 로컬에서 돌린다')
   .option('--artifact-dir <dir>', '조각별 지금/기준 JUnit ⊕ summary.json 을 이 디렉토리에 남긴다(판정 불변 · JUnit 은 --shards 경로만 · 원격 실행이면 그 호스트에서 가져온다)')
@@ -4746,7 +4747,7 @@ selfCmd
   .option('--shard-id <id>', 'GATE-REMOTE-SHARD-PLAN — 조각 id(예: <orchestration-id>/shard-2). 원격 명령줄에 그대로 실린다')
   .option('--shard-position <n>', 'GATE-REMOTE-SHARD-PLAN — 조각 위치(1부터 정수). 원격 명령줄에 그대로 실린다')
   .option('--shard-plan <path>', 'GATE-REMOTE-SHARD-PLAN — 조각 계획 파일 경로. 주면 원격 명령줄에 --shard-plan 으로 실린다')
-  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; shardConcurrency?: string; fixedShardDistribution?: boolean; includeImporters?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string; orchestrationId?: string; shardId?: string; shardPosition?: string; shardPlan?: string }) => {
+  .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; shardConcurrency?: string; fixedShardDistribution?: boolean; includeImporters?: boolean; inherit?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string; orchestrationId?: string; shardId?: string; shardPosition?: string; shardPlan?: string }) => {
     if (!opts.changed && opts.shards === undefined) { ui.error('self gate requires --changed or --shards'); process.exitCode = 2; return; }
     if (opts.fixedShardDistribution && opts.shards === undefined) { ui.error('self gate: --fixed-shard-distribution requires --shards <n>'); process.exitCode = 2; return; }
     if (opts.shardConcurrency !== undefined && (!/^[1-4]$/.test(opts.shardConcurrency))) { ui.error('self gate: --shard-concurrency must be 1–4'); process.exitCode = 2; return; }
@@ -4769,7 +4770,7 @@ selfCmd
       ranLocal = true;
       try {
         const { runSelfGateCliAsync } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
-        const result = await runSelfGateCliAsync(process.cwd(), { base: opts.base, pr: opts.pr, shards, ...(opts.shardConcurrency !== undefined ? { shardConcurrency: Number(opts.shardConcurrency) } : {}), ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), includeImporterTests: !!opts.includeImporters, ...(opts.artifactDir !== undefined ? { artifactDir: opts.artifactDir } : {}) });
+        const result = await runSelfGateCliAsync(process.cwd(), { base: opts.base, pr: opts.pr, shards, ...(opts.shardConcurrency !== undefined ? { shardConcurrency: Number(opts.shardConcurrency) } : {}), ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), includeImporterTests: !!opts.includeImporters, noInherit: opts.inherit === false, ...(opts.artifactDir !== undefined ? { artifactDir: opts.artifactDir } : {}) });
         console.log(result.lines.join('\n'));
         return result.exitCode;
       } catch (error) {
@@ -4802,6 +4803,7 @@ selfCmd
         const argv = remoteSelfGateArgv({
           changed: opts.changed, base: opts.base, shards, shardConcurrency: opts.shardConcurrency === undefined ? undefined : Number(opts.shardConcurrency), fixedShardDistribution: opts.fixedShardDistribution,
           includeImporters: opts.includeImporters,
+          noInherit: opts.inherit === false,
           // A measured commit without this option rejects it (exit ≠ 0) — read as not passed, never as a silent measured run.
           artifactDir: remoteArtifacts && 'dir' in remoteArtifacts ? remoteArtifacts.dir : undefined,
         }, sha);
@@ -6277,10 +6279,12 @@ selfCmd
   .option('--acp-timeout <sec>', 'ACP 리뷰 1턴 최대 대기 초(초과 시 cancel·기본 claude 600 · 그 외 300)')
   .option('--context <path>', '리뷰어가 함께 판단할 레포 상대 파일 경로(반복 가능)', (value: string, previous: string[] = []) => [...previous, value])
   .option('--context-text <text>', '리뷰어가 함께 판단할 텍스트(반복 가능)', (value: string, previous: string[] = []) => [...previous, value])
+  .option('--no-context-pack', '기본 저장소 리뷰 맥락 팩을 끈다')
   .option('--json', '구조화 출력 {pr, verdict, mustFix, shouldFix, reviewed}')
   .option('--save <name>', '리뷰 결과를 상태 디렉터리의 review-results/<name>-<PR>-<head12>.json에 저장')
+  .option('--since-review <saved review name|head>', '저장된 리뷰의 mustFix와 해당 head 이후 변경만 다시 판정')
   .option('--over-cap-reason <reason>', '저장 리뷰 r5 상한 이후 이번 호출 1회 예외 사유(doctor.review cap-override 기록)')
-  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; json?: boolean; save?: string; overCapReason?: string }) => {
+  .action(async (prParts: string[], opts: { intent?: string; model?: string; acp?: boolean; acpModel?: string; acpBackend?: string; acpTimeout?: string; context?: string[]; contextText?: string[]; contextPack?: boolean; json?: boolean; save?: string; sinceReview?: string; overCapReason?: string }) => {
     const prArgs = prParts.flatMap((p) => String(p).split(/[,\s]+/).filter(Boolean)); // 번호/#번호/URL·콤마목록.
     if (!prArgs.length) { ui.error('PR 필요: elanous self review <번호|URL> [..]'); process.exit(2); }
     // ⭐ 본문은 seam(`runSelfReviewCliCommand`)에 있다 — 이 액션은 **의존 배선만** 한다.
@@ -6308,6 +6312,7 @@ selfCmd
     const configuredReviewModel = apiReviewModelFromRoleSpec(reviewRoleSpec);
     const { results, failed } = await runSelfReviewCliCommand(prArgs, {
       ...opts,
+      noContextPack: opts.contextPack === false,
       ...(configuredReviewModel ? { configuredReviewModel } : {}),
       ...(configuredReviewModel && reviewRoleSpec?.provider ? { configuredReviewProvider: reviewRoleSpec.provider } : {}),
       ...(configuredAcpBackend ? { configuredAcpBackend } : {}),
@@ -7058,7 +7063,16 @@ agentCmd
     //   runAgentMissionCliCommand(테스트 가능 seam)로 추출. 액션은 I/O(print/exit)만 담당.
     const { resolveBackend } = await import('./agent-mission/driver.js');
     const { runAgentMissionCliCommand } = await import('./agent-mission/mission-cli.js');
-    const outcome = await runAgentMissionCliCommand(textParts, opts as import('./agent-mission/mission-cli.js').MissionCliOpts, { resolveBackend });
+    const controller = new AbortController();
+    const onSigint = (): void => { controller.abort(); };
+    process.once('SIGINT', onSigint);
+    let outcome: Awaited<ReturnType<typeof runAgentMissionCliCommand>>;
+    try {
+      outcome = await runAgentMissionCliCommand(textParts, opts as import('./agent-mission/mission-cli.js').MissionCliOpts,
+        { resolveBackend, signal: controller.signal });
+    } finally {
+      process.removeListener('SIGINT', onSigint);
+    }
     if (!outcome.ok) { console.error(`❌ ${outcome.message}`); process.exit(outcome.exitCode); }
     await writeStdoutJson(JSON.stringify(outcome.result, null, 2) + '\n');
     process.exit(outcome.exitCode);

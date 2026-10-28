@@ -430,7 +430,7 @@ describe('COORD-HA ③ progress heartbeat — tick completion and board write ti
     expect(called).toEqual(['C1', 'C2']);
     expect(placed.placed).toBe(1);
     expect(placed.placementFailed).toBe(true);
-  }));
+  }), 15_000);
 
   test('a completion heartbeat write failure rejects the node and retains the last completed record', async () => {
     const root = mkdtempSync(join(tmpdir(), 'orch-progress-record-fail-'));

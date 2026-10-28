@@ -44,6 +44,8 @@ function waitForPrepareRetry(signal?: AbortSignal): Promise<void> {
 export type WarmReplayInput = Omit<WarmWorkerCommand, 'leaseId' | 'generation' | 'workerId' | 'key'>;
 export interface WarmReplayResult { command: WarmWorkerCommand | null; transport: WarmPodTransportResult }
 export interface WarmWorkerCandidate { host: string; tier: WarmPoolTier; spec: WarmPodSpec }
+/** The OS `flock(fd, operation)` binding the prepare lease waits on. */
+export type WarmPrepareFlock = (fd: number, operation: number) => number;
 export interface WarmPodProviderOptions {
   candidates: readonly WarmWorkerCandidate[];
   /** One pinned template per host/tier. Each expands to the measured profile quota. */
@@ -64,6 +66,8 @@ export interface WarmPodProviderOptions {
   prepareLockDirectory?: string;
   /** Cancels a prepare waiting for another process to finish the same host/worker slot. */
   prepareAbortSignal?: AbortSignal;
+  /** Injects the prepare-lease flock binding. Omitted keeps this platform's binding; null/false declares it unsupported. */
+  prepareFlock?: WarmPrepareFlock | null | false;
   /** Gate file this pool serves, used to bind cold prepare legs to their 1-file gate measurement key. */
   pairingGateFile?: string;
 }
@@ -164,7 +168,7 @@ const prepareLockLib = process.platform === 'linux' || process.platform === 'dar
     flock: { args: ['int', 'int'], returns: 'int' },
     [process.platform === 'linux' ? '__errno_location' : '__error']: { args: [], returns: 'ptr' },
   }) : null;
-const prepareFlock = prepareLockLib?.symbols.flock ?? null;
+const prepareFlock: WarmPrepareFlock | null = prepareLockLib?.symbols.flock ?? null;
 const prepareErrnoLocation = prepareLockLib?.symbols[process.platform === 'linux' ? '__errno_location' : '__error'];
 const readPrepareErrno = (): number => (prepareErrnoLocation ? read.i32(prepareErrnoLocation() as Pointer) : -1);
 const LOCK_EX = 2;
@@ -173,7 +177,7 @@ const LOCK_UN = 8;
 const PREPARE_LOCK_WAIT_MS = (POD_READY_WAIT_SECONDS * 1_000) + 30_000;
 
 async function withPrepareLease<T>(candidate: WarmWorkerCandidate, directory: string | undefined,
-  work: () => Promise<T>, signal?: AbortSignal): Promise<T | null> {
+  work: () => Promise<T>, signal?: AbortSignal, flock?: WarmPrepareFlock | null): Promise<T | null> {
   const uid = typeof process.getuid === 'function' ? process.getuid() : userInfo().uid;
   const root = directory ?? join(tmpdir(), `elanous-warm-prepare-${uid}`);
   const identity = createHash('sha256').update(`${candidate.host}/${candidate.spec.workerId}`).digest('hex');
@@ -186,11 +190,11 @@ async function withPrepareLease<T>(candidate: WarmWorkerCandidate, directory: st
     const info = lstatSync(lock);
     if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o077) !== 0)
       throw new Error('unsafe warm prepare lock file');
-    if (!prepareFlock) throw new Error('warm prepare OS locks are unavailable on this platform');
+    if (!flock) throw new Error('warm prepare OS locks are unavailable on this platform');
     const lockDeadline = performance.now() + PREPARE_LOCK_WAIT_MS;
     while (!acquired) {
       if (signal?.aborted) throw new Error('warm prepare lock wait cancelled');
-      if (prepareFlock(fd, LOCK_EX | LOCK_NB) === 0) { acquired = true; break; }
+      if (flock(fd, LOCK_EX | LOCK_NB) === 0) { acquired = true; break; }
       const errno = readPrepareErrno();
       // EWOULDBLOCK/EAGAIN: Linux 11, Darwin 35. EINTR is safe to retry.
       if (errno !== 11 && errno !== 35 && errno !== 4)
@@ -209,7 +213,7 @@ async function withPrepareLease<T>(candidate: WarmWorkerCandidate, directory: st
       workerId: candidate.spec.workerId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
     throw error;
   } finally {
-    if (acquired && fd !== undefined) prepareFlock?.(fd, LOCK_UN);
+    if (acquired && fd !== undefined) flock?.(fd, LOCK_UN);
     if (fd !== undefined) closeSync(fd);
   }
 }
@@ -223,7 +227,14 @@ export class WarmPodProvider {
   private readonly legs: WarmReuseTimeLegRow[] = [];
   /** One terminal transition per fenced lease, including concurrent callers. Failed transitions remain retryable. */
   private readonly terminalLeases = new Map<string, Promise<'sanitized' | 'quarantined'>>();
+  /** A gate fallback supersedes an in-flight sanitize even if its control reply is late. */
+  private readonly quarantineRequested = new Set<string>();
+  private readonly terminalEndLogged = new Set<string>();
+  /** While quarantine is settling, reject only that Pod incarnation after acquisition. */
+  private readonly quarantiningPods = new Set<string>();
   private readonly standingWorkers = new Map<string, Promise<boolean>>();
+  /** This instance's prepare-lease flock binding; null means the platform cannot lock and every slot fails. */
+  private readonly prepareFlock: WarmPrepareFlock | null;
   constructor(private readonly options: WarmPodProviderOptions) {
     const url = new URL(options.controlUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
@@ -266,6 +277,9 @@ export class WarmPodProvider {
     }
     this.fetcher = options.fetch ?? fetch;
     this.now = options.now ?? Date.now;
+    // An omitted option keeps the platform binding; an explicit false/null declares flock unsupported.
+    this.prepareFlock = options.prepareFlock === undefined ? prepareFlock
+      : options.prepareFlock === false ? null : options.prepareFlock;
   }
 
   private async control(path: string, credential: string, body?: Record<string, unknown>): Promise<{ status: number; value: any }> {
@@ -347,7 +361,8 @@ export class WarmPodProvider {
     const inFlight = this.standingWorkers.get(key);
     if (inFlight) return inFlight;
     const preparation = withPrepareLease(configured, this.options.prepareLockDirectory,
-      () => this.prepareStandingWorker(configured, this.options.prepareAbortSignal), this.options.prepareAbortSignal)
+      () => this.prepareStandingWorker(configured, this.options.prepareAbortSignal), this.options.prepareAbortSignal,
+      this.prepareFlock)
       .then(result => result === true);
     this.standingWorkers.set(key, preparation);
     try { return await preparation; }
@@ -626,6 +641,12 @@ export class WarmPodProvider {
       podName: leasedCandidate.spec.name, podContext: leasedCandidate.spec.kubectlContext, image: leasedCandidate.spec.image,
       requestedAt: new Date(this.now()).toISOString(),
       workerId: row.name, key: leasedCandidate.spec.key };
+    // Acquisition is by pool key. A healthy sibling or replacement Pod must remain eligible.
+    // Never run transport on the old Pod while its previous lease is being quarantined.
+    if (this.quarantiningPods.has(JSON.stringify([command.workerId, command.podUid]))) {
+      await this.quarantine(command, 'prior-lease-quarantine-pending', false);
+      return fallback('lease-unavailable');
+    }
     const admitted = patchWarmLeaseMetadata(leasedCandidate.spec, command, 'leased', this.options.kubectl);
     if (!admitted.ok) {
       debug.log('pod.provenance', 'lease-patch-refused', { pod: leasedCandidate.spec.name,
@@ -685,7 +706,7 @@ export class WarmPodProvider {
     let outcome: 'sanitized' | 'quarantined';
     try { outcome = await terminal; }
     catch (error) { if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key); throw error; }
-    if (outcome === 'quarantined') throw new Error('warm sanitize unavailable');
+    if (outcome === 'quarantined' || this.quarantineRequested.has(key)) throw new Error('warm sanitize unavailable');
   }
 
   private async finalizeOnce(command: WarmWorkerCommand): Promise<'sanitized' | 'quarantined'> {
@@ -702,25 +723,39 @@ export class WarmPodProvider {
       await this.quarantineOnce(command, 'sanitize-unavailable', true);
       return 'quarantined';
     }
-    debug.log('pod.provenance', 'lease-end', { pod: candidate.spec.name, podUid: command.podUid,
-      leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId,
-      releasedAt: new Date(this.now()).toISOString(), result: 'sanitized' });
+    const key = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
+    if (!this.quarantineRequested.has(key)) {
+      debug.log('pod.provenance', 'lease-end', { pod: candidate.spec.name, podUid: command.podUid,
+        leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId,
+        releasedAt: new Date(this.now()).toISOString(), result: 'sanitized' });
+      this.terminalEndLogged.add(key);
+    }
     return 'sanitized';
   }
 
   /** `leaseStarted=false` marks a refusal before `lease-start`, so start/end history stays paired. */
   async quarantine(command: WarmWorkerCommand, reason: string, leaseStarted = true): Promise<void> {
     const key = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
+    const podKey = JSON.stringify([command.workerId, command.podUid]);
+    this.quarantiningPods.add(podKey);
     const prior = this.terminalLeases.get(key);
     if (prior) {
-      const outcome = await prior;
-      debug.log('pod.provenance', 'lease-terminal-suppressed', { workerId: command.workerId,
-        leaseId: command.leaseId, generation: command.generation, requested: 'quarantine', outcome });
+      this.quarantineRequested.add(key);
+      const terminal = prior.then(async outcome => {
+        if (outcome === 'sanitized') {
+          await this.quarantineOnce(command, reason, leaseStarted);
+          return 'quarantined' as const;
+        }
+        return outcome;
+      });
+      this.terminalLeases.set(key, terminal);
+      try { await terminal; this.quarantiningPods.delete(podKey); }
+      catch (error) { if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key); throw error; }
       return;
     }
     const terminal = this.quarantineOnce(command, reason, leaseStarted).then(() => 'quarantined' as const);
     this.terminalLeases.set(key, terminal);
-    try { await terminal; }
+    try { await terminal; this.quarantiningPods.delete(podKey); }
     catch (error) { if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key); throw error; }
   }
 
@@ -734,9 +769,11 @@ export class WarmPodProvider {
       if (!cleared.ok && reason !== 'provenance-unavailable') debug.log('pod.provenance', 'lease-patch-refused', { pod: candidate.spec.name,
         podUid: command.podUid, leaseId: command.leaseId, reason: cleared.reason }, { level: 'warn' });
     }
-    debug.log('pod.provenance', leaseStarted ? 'lease-end' : 'lease-refused', { podUid: command.podUid,
+    const key = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
+    debug.log('pod.provenance', this.terminalEndLogged.has(key) ? 'lease-late-quarantine' : leaseStarted ? 'lease-end' : 'lease-refused', { podUid: command.podUid,
       leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId, leaseStarted,
       releasedAt: new Date(this.now()).toISOString(), result: 'quarantined', reason });
+    this.terminalEndLogged.add(key);
   }
 
 
@@ -751,6 +788,10 @@ export function loadWarmPodProvider(path: string, pairingGateFile?: string): War
   const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid warm provider config');
   const options = parsed as WarmPodProviderOptions;
+  // JSON cannot carry a real OS binding: only the unsupported-platform declaration is meaningful here.
+  // Omitting the field keeps this platform's dlopen binding (undefined), so the default path is unchanged.
+  if (options.prepareFlock !== undefined && options.prepareFlock !== null && options.prepareFlock !== false)
+    throw new Error('invalid warm provider prepare flock');
   // The production entry points (--prepare/--reconcile/--serve) bind the 1-file gate key here.
   if (pairingGateFile !== undefined) {
     if (!pairingGateFile.trim()) throw new Error('warm provider pairing gate file must not be empty');

@@ -18,18 +18,43 @@
 //     custom MCP provider without touching skill bodies.
 
 import { getGrokApiKey } from '../config.js';
-import { grokAgentSearch, GROK_SEARCH_MODEL } from '../grok/agent-search.js';
+import { grokAgentSearch, GROK_SEARCH_MODEL, type GrokAgentSearchOpts } from '../grok/agent-search.js';
+import { peekGrokCredential, resolveFreshGrokCredential } from '../grok/credential.js';
 import { wantsXSearch } from './x-intent.js';
 import type { WebSearchHit, WebSearchProvider, WebSearchResult } from './provider.js';
 
 const DEFAULT_LIMIT = 5;
 const GROK_TIMEOUT_MS = 45_000;
+// The subscription proxy's known working model differs from the metered API default.
+const GROK_SUBSCRIPTION_SEARCH_MODEL = 'grok-4.6';
 
-export function buildGrokWebSearchProvider(): WebSearchProvider {
+/** Explicitly metered API provider. The registry only adds it with webSearch.grokApi.enabled. */
+export function buildGrokWebSearchProvider(opts: { id?: string } = {}): WebSearchProvider {
+  return makeGrokProvider(opts.id ?? 'grok', 'Grok (xAI agent-tools search)',
+    () => !!getGrokApiKey(), () => ({}));
+}
+
+/** Subscription search uses the proven cli-chat-proxy /responses route. No API-key fallback. */
+export function buildGrokSubscriptionWebSearchProvider(): WebSearchProvider {
+  return makeGrokProvider('grok', 'Grok (subscription search)',
+    () => peekGrokCredential({ model: GROK_SUBSCRIPTION_SEARCH_MODEL })?.kind === 'subscription',
+    () => {
+      const credential = resolveFreshGrokCredential({ model: GROK_SUBSCRIPTION_SEARCH_MODEL });
+      if (credential?.kind !== 'subscription') throw new Error('Grok subscription search unavailable');
+      return { apiKey: credential.token, baseUrl: credential.baseUrl, headers: credential.headers, model: GROK_SUBSCRIPTION_SEARCH_MODEL };
+    });
+}
+
+function makeGrokProvider(
+  id: string,
+  displayName: string,
+  available: () => boolean,
+  searchOptions: () => GrokAgentSearchOpts,
+): WebSearchProvider {
   return {
-    id: 'grok',
-    displayName: 'Grok (xAI agent-tools search)',
-    available: () => !!getGrokApiKey(),
+    id,
+    displayName,
+    available,
     search: async (q, signal) => {
       const startedAt = Date.now();
       const limit = Math.max(1, Math.min(20, q.limit ?? DEFAULT_LIMIT));
@@ -45,6 +70,7 @@ export function buildGrokWebSearchProvider(): WebSearchProvider {
 
       const r = await grokAgentSearch(query, {
         model: GROK_SEARCH_MODEL,
+        ...searchOptions(),
         tools: ['web_search', 'x_search'],
         systemPrompt: 'You are a concise web-search assistant. Answer in one or two sentences and let the cited sources carry the detail.',
         timeoutMs: GROK_TIMEOUT_MS,
@@ -67,7 +93,7 @@ export function buildGrokWebSearchProvider(): WebSearchProvider {
       const note = r.text.length > 0 ? r.text.slice(0, 1500) : undefined;
       return {
         hits,
-        providerName: 'grok',
+        providerName: id,
         durationMs: Date.now() - startedAt,
         ...(note ? { note } : {}),
       } satisfies WebSearchResult;

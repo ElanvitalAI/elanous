@@ -13,7 +13,7 @@
 // 콜백으로 위임(tgChat/dcChannel 정체성은 서피스가 소유).
 
 import { buildDelegateAgentTool, dispatchDelegateAgent } from '../boot/daemon-tools/delegate-agent.js';
-import { buildSelfImplementDaemonSpec, dispatchSelfImplement } from '../boot/daemon-tools/self-implement.js';
+import { buildSelfImplementDaemonSpec, dispatchSelfImplement, dispatchSelfImplementManaged } from '../boot/daemon-tools/self-implement.js';
 // ⛔ 잎 모듈에서 받는다 — 순환 import TDZ 를 «구조적으로» 없앤 자리(`self-implement-names.ts` 머리말).
 import { SELF_IMPLEMENT_TOOL_NAMES } from '../boot/daemon-tools/self-implement-names.js';
 import { dispatchRelayShellPrompt } from '../skills/tools/relay-shell.js';
@@ -80,6 +80,9 @@ export function buildAutonomousToolSpecs(): LLMToolSpec[] {
 export interface AutonomousToolTurnCtx {
   cwd: string;
   signal: AbortSignal;
+  /** Core-turn identity used to make a managed SelfImplement admission retry-safe. */
+  sessionId?: string;
+  toolCallId?: string;
   surfaceHitlChannels?: ConfirmChannel[];
   surfaceQuestionChannels?: QuestionChannel[];
   surfaceFileSink?: FileSink;
@@ -139,18 +142,22 @@ export async function dispatchAutonomousTool(
     const hctx = {
       cwd: ctx.cwd,
       signal: ctx.signal,
+      ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+      ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}),
       ...(ctx.userText ? { userText: ctx.userText } : {}),
       ...(surfaceChannels ? { surfaceHitlChannels: surfaceChannels } : {}),
       ...(surfaceQuestionChannels ? { surfaceQuestionChannels } : {}),
       ...(surfaceFileSink ? { surfaceFileSink } : {}),
       ...(ctx.emitFeedback ? { emitFeedback: ctx.emitFeedback } : {}), // start-ack/진행 push
     };
-    const dispatch = ctx.selfImplementDispatch ?? dispatchSelfImplement;
+    const dispatch = ctx.selfImplementDispatch;
     return wrapAutonomousTool(
       {
         toolNames: SELF_IMPLEMENT_TOOL_NAMES as readonly string[],
         label: 'SelfImplement',
-        run: () => dispatch(args, hctx as Parameters<typeof dispatchSelfImplement>[1]),
+        run: () => dispatch
+          ? dispatch(args, hctx as Parameters<typeof dispatchSelfImplement>[1])
+          : dispatchSelfImplementManaged(args, hctx as Parameters<typeof dispatchSelfImplementManaged>[1]),
       },
       args,
       hctx,

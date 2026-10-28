@@ -22,6 +22,36 @@ function captureRun(result: AgentMissionResult = RESULT): { fn: typeof import('.
 const baseOpts = (over: Partial<MissionCliOpts> = {}): MissionCliOpts => ({ branch: 'wt/a', maxRounds: '16', ...over });
 
 describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => {
+  it('SIGINT signal reaches the pipeline and preserves the interrupted exit code', async () => {
+    const cap = captureRun({ ...RESULT, ok: false, reason: 'aborted', committed: false, detail: 'aborted' });
+    const controller = new AbortController();
+    const runDevPipeline: typeof import('../self-dev/dev-pipeline.js').runDevPipeline = async (spec, deps) => {
+      const result = await cap.fn(spec, deps);
+      controller.abort();
+      return result;
+    };
+    const out = await runAgentMissionCliCommand(['M'], baseOpts(), {
+      resolveBackend: () => BACKEND, runDevPipeline, signal: controller.signal,
+    });
+
+    expect(out).toMatchObject({ ok: true, exitCode: 130 });
+    expect(cap.last().deps?.signal).toBe(controller.signal);
+  });
+
+  it('완료된 성공 뒤에 도착한 SIGINT는 성공 종료 코드를 보존한다', async () => {
+    const cap = captureRun();
+    const controller = new AbortController();
+    const runDevPipeline: typeof import('../self-dev/dev-pipeline.js').runDevPipeline = async (spec, deps) => {
+      const result = await cap.fn(spec, deps);
+      controller.abort();
+      return result;
+    };
+    const out = await runAgentMissionCliCommand(['M'], baseOpts(), {
+      resolveBackend: () => BACKEND, runDevPipeline, signal: controller.signal,
+    });
+    expect(out).toMatchObject({ ok: true, exitCode: 0 });
+  });
+
   it('미지정 선택 입력은 seam spec에 키를 만들지 않고, Commander 기본은 그대로 전달', async () => {
     const cap = captureRun();
     const deps: MissionCliDeps = { resolveBackend: () => BACKEND, runDevPipeline: cap.fn };
@@ -72,6 +102,7 @@ describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => 
     expect(spec!.base).toBe('main');
     expect(spec!.enhance).toBe(false);
     expect(spec!.mission).toMatchObject({ maxRounds: 9, commit: false, deliverableHint: 'PPT', screensDir: '/s', entry: 'elanous-apparatus' });
+    expect(toAgentMissionSpec('M', planDevPipeline(spec!), () => BACKEND).enhance).toBe(false);
     expect((spec!.mission!.evidence as { kind: string; dirRel: string }).kind).toBe('doc');
     expect((spec!.mission!.evidence as { dirRel: string }).dirRel).toBe('docs/x');
   });

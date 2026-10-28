@@ -68,6 +68,25 @@ export function setCliAgentDispatchForTesting(dispatch: CliAgentDispatch | undef
   cliAgentDispatchForTesting = dispatch;
 }
 
+/** A completed standalone agent turn must not wait forever for a tool's leftover handle. */
+function armAgentCliExitSafetyNet(): void {
+  const timer = setTimeout(() => {
+    try {
+      const runtime = process as typeof process & {
+        _getActiveHandles?: () => Array<{ constructor?: { name?: string } }>;
+        _getActiveRequests?: () => Array<{ constructor?: { name?: string } }>;
+      };
+      const handleTypes = runtime._getActiveHandles?.().map(h => h.constructor?.name ?? 'unknown') ?? [];
+      const requestTypes = runtime._getActiveRequests?.().map(r => r.constructor?.name ?? 'unknown') ?? [];
+      debug.log('agent.cli.exit', 'grace-expired', { handleTypes, requestTypes }, { level: 'warn' });
+      debug.flush();
+    } finally {
+      process.exit(0);
+    }
+  }, 1_000);
+  timer.unref();
+}
+
 export function registerAgentCommands(program: Command): void {
   const agentCommand = program
   .command('agent')
@@ -128,6 +147,10 @@ export function registerAgentCommands(program: Command): void {
       // commander stores --no-tools as `tools: false`, plain absence as undefined → default true here.
       enableTools: opts.tools !== false,
     });
+    // runChatTurnCli has already flushed its JSON reply. Let clean turns exit
+    // naturally; a referenced child/socket/timer left by a tool gets one second
+    // before we log the surviving handles and end this standalone process.
+    armAgentCliExitSafetyNet();
   });
 
 // ── agent dispatch — RFC #7333 `A1` (트리거) ──
@@ -413,7 +436,7 @@ tierCmd
  *  ui.info trailer and instead emits exactly ONE JSON line on stdout
  *  at end-of-turn:
  *    {sessionId, provider, model, reply, finalReply, transcript, logPath,
- *     budget, durationMs, ts}
+ *     budget, durationMs, ts, incomplete}
  *  Stable shape so LLMs can self-spawn `elanous chat` for follow-ups
  *  without parsing human-readable terminal output. */
 export async function runChatTurnCli(opts: {
@@ -484,7 +507,7 @@ export async function runChatTurnCli(opts: {
     dbg.setAmbientSessionId?.(session.id);
   } catch { /* debug module unavailable — fine */ }
   const replyChunks: string[] = [];
-  // Tool calls delimit assistant messages. finalReply retains its last non-empty-message meaning.
+  // Tool calls delimit assistant messages. Only text after the last tool call can be the final reply.
   let segmentChunks: string[] = [];
   let lastSegment = '';
   let finalMessage = '';
@@ -507,14 +530,17 @@ export async function runChatTurnCli(opts: {
   let tools: ReturnType<typeof buildCliAgentTools> | undefined;
   let dispatchTool: ((name: string, args: Record<string, unknown>) => Promise<unknown>) | undefined;
   let enabledToolNames: string[] | undefined;
+  const toolAbort = new AbortController();
+  const abortToolsOnSigint = (): void => toolAbort.abort();
   if (opts.enableTools) {
     const built = buildCliAgentTools(opts.cfg, harnessSpace ? {
       sessionId: session.id,
       emitFeedback: emitHarnessFeedbackProgress,
     } : undefined);   // ★ cfg 전달 → financeEnabled 시 finance 팩 노출(서피스 게이팅 정리)
     tools = built;
-    dispatchTool = built.dispatch;
+    dispatchTool = (name, args) => built.dispatch(name, args, { signal: toolAbort.signal });
     enabledToolNames = built.specs.map(s => s.name);
+    process.once('SIGINT', abortToolsOnSigint);
   }
   // Wire the universal preamble (project anchor + project tree +
   // family addendum + session-specific guidance) into every CLI system
@@ -604,6 +630,8 @@ export async function runChatTurnCli(opts: {
       process.exit(2);
     }
     throw err;
+  } finally {
+    if (opts.enableTools) process.removeListener('SIGINT', abortToolsOnSigint);
   }
   if (!sawToolCall && replyChunks.length === 0 && result.text) {
     replyChunks.push(result.text);
@@ -611,6 +639,7 @@ export async function runChatTurnCli(opts: {
     if (!opts.json && !opts.enableTools) process.stdout.write(result.text);
   }
   closeSegment();
+  const incomplete = sawToolCall && finalMessage.length === 0;
   if (opts.json) {
     let logPath: string | null = null;
     try {
@@ -624,17 +653,23 @@ export async function runChatTurnCli(opts: {
       model: result.model ?? null,
       reply: finalMessage,
       transcript: replyChunks.join(''),
-      finalReply: lastSegment,
+      finalReply: sawToolCall ? finalMessage : lastSegment,
+      incomplete,
       budget: sessionBudget(session.id),
       durationMs: Date.now() - startedAt,
       logPath,
       ts: new Date().toISOString(),
     };
     await writeStdoutJson(JSON.stringify(out) + '\n');
+    if (incomplete) process.exitCode = 1;
     return;
   }
   if (opts.enableTools) process.stdout.write(`${finalMessage}\n`);
   else process.stdout.write('\n');
+  if (incomplete) {
+    console.error('Turn ended without a final assistant reply.');
+    process.exitCode = 1;
+  }
   ui.info(`[session ${session.id.slice(0, 8)}  ${result.provider}${result.model ? '/' + result.model : ''}  ${sessionBudget(session.id)}]`);
 }
 
@@ -655,7 +690,7 @@ export function buildCliAgentTools(
   trustedWorkingDirectory?: string,
 ): {
   specs: import('../llm.js').LLMToolSpec[];
-  dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+  dispatch: (name: string, args: Record<string, unknown>, context?: { signal?: AbortSignal }) => Promise<unknown>;
   workingDirectory: string;
 } {
   // An explicitly assigned child cwd is stable for its isolated lifetime. An
@@ -706,7 +741,7 @@ export function buildCliAgentTools(
   //   게이트. [[project_skill_native_duplication_surface_gating]].
   const shared = (require('../agent/shared-app-tools.js') as typeof import('../agent/shared-app-tools.js')).buildSharedAppTools(cfg);
   for (const s of shared.specs) specs.push(s);
-  for (const name of shared.names) dispatchByName.set(name, async (args) => shared.dispatch(name, args));
+  for (const name of shared.names) dispatchByName.set(name, async (args, signal) => shared.dispatch(name, args, { surface: 'tui', signal }));
   // Installed knowledge is queryable in CLI chat as well as the dashboard runtime.
   // No installed packs => preserve the existing CLI tool list and avoid creating a KGS database.
   const { kgsDefaultDbPath } = require('../knowledge/kgs/sqlite-store.js') as typeof import('../knowledge/kgs/sqlite-store.js');
@@ -751,10 +786,10 @@ export function buildCliAgentTools(
   const dispatchSessionRuntimeTool = sr.dispatchSessionRuntimeTool;
   const createPlanner = sr.createSearchPlannerState;
   const plannerState = createPlanner({ maxAutoNarrowCandidates: 2 });
-  const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
+  const dispatch = async (name: string, args: Record<string, unknown>, context?: { signal?: AbortSignal }): Promise<unknown> => {
     try {
       const direct = dispatchByName.get(name);
-      if (direct) return await direct(args);
+      if (direct) return await direct(args, context?.signal);
       // ⭐ BACKLOG L1b (2026-09-25) — ToolSearch 는 지연 도구가 있으면 «자동으로 광고»되는데 이 CLI 디스패처만
       //   라우팅이 없어 `plugin tool unavailable in CLI: ToolSearch` 로 죽었다(daemon·monad-agent-turn 은 라우팅한다).
       //   ⇒ 같은 공용 라우터로 이 CLI 의 도구 풀에서 찾는다.

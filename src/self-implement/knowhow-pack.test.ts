@@ -44,6 +44,102 @@ test('selects only matching promoted repository knowhow, bounded and without cha
   expect(selectKnowhowPack(root, `${pack.text}\n\n${goal}`)).toMatchObject({ ids: [], reason: 'marker-present' });
 });
 
+test('adds a bounded goal document and only the connected graph-unit chain for its target paths', () => {
+  const { root } = fixture();
+  const goalPath = join(root, 'docs/goals/GOAL-feature.md');
+  mkdirSync(join(root, 'docs/goals'), { recursive: true });
+  writeFileSync(goalPath, '# Feature goal\n## TRACED PATHS\n- src/feature/entry.ts\n');
+  mkdirSync(join(root, 'graphs/work'), { recursive: true });
+  mkdirSync(join(root, 'graphs/units/feature'), { recursive: true });
+  mkdirSync(join(root, 'graphs/units/unrelated'), { recursive: true });
+  writeFileSync(join(root, 'graphs/work/feature.yaml'), 'graph_id: work-feature\nnodes:\n  - { node_id: implement, call: feature@1 }\n');
+  writeFileSync(join(root, 'graphs/work/other.yaml'), 'graph_id: work-other\nnodes:\n  - { node_id: implement, call: unrelated@1 }\n');
+  writeFileSync(join(root, 'graphs/units/feature/unit.yaml'), 'graph_id: feature\nversion: 1\nsource: [src/feature/entry.ts]\nnodes: []\n');
+  writeFileSync(join(root, 'graphs/units/unrelated/unit.yaml'), 'graph_id: unrelated\nversion: 1\nsource: [src/other/entry.ts]\nnodes: []\n');
+  const before = createHash('sha256').update(readFileSync(goalPath)).digest('hex');
+
+  const pack = selectKnowhowPack(root, 'implement feature', undefined, { goalFile: 'docs/goals/GOAL-feature.md' });
+
+  expect(pack.text).toContain('## GOAL DOCUMENT');
+  expect(pack.text).toContain('## GRAPH BLUEPRINT');
+  expect(pack.text).toContain('work-feature → feature');
+  expect(pack.text).not.toContain('work-other');
+  expect(pack.sources).toEqual(expect.arrayContaining([
+    expect.objectContaining({ kind: 'goal', path: 'docs/goals/GOAL-feature.md', bytes: Buffer.byteLength(readFileSync(goalPath)) }),
+    expect.objectContaining({ kind: 'blueprint', path: 'graphs/work/feature.yaml' }),
+    expect.objectContaining({ kind: 'blueprint', path: 'graphs/units/feature/unit.yaml' }),
+  ]));
+  expect(pack.bytes).toBe(Buffer.byteLength(pack.text));
+  expect(pack.bytes).toBeLessThanOrEqual(KNOWHOW_PACK_MAX_BYTES);
+  expect(createHash('sha256').update(readFileSync(goalPath)).digest('hex')).toBe(before);
+});
+
+test('preserves explicit missing-input and selector reasons without reinjecting a goal-file marker', () => {
+  const { root } = fixture();
+  const absent = selectKnowhowPack(root, 'goal', undefined, { goalFile: null });
+  expect(absent.text).toContain('reason=goal-document-not-configured');
+  expect(absent.knowhowReason).toBe('no-path-overlap');
+  mkdirSync(join(root, 'docs/goals'), { recursive: true });
+  writeFileSync(join(root, 'docs/goals/GOAL-marker.md'), '# Prior\n[KNOWHOW-PACK v1 ids=K-TC-1]\n대상 경로: src/self-implement/orchestrator.ts\n');
+  const marked = selectKnowhowPack(root, 'goal', undefined, { goalFile: 'docs/goals/GOAL-marker.md' });
+  expect(marked.text).toContain('reason=knowhow-marker-already-present');
+  expect(marked.text).not.toContain('[KNOWHOW-PACK v1');
+});
+
+test('keeps graph chains distinct when different root graphs call the same unit', () => {
+  const { root } = fixture();
+  mkdirSync(join(root, 'docs/goals'), { recursive: true });
+  mkdirSync(join(root, 'graphs/work'), { recursive: true });
+  mkdirSync(join(root, 'graphs/units'), { recursive: true });
+  writeFileSync(join(root, 'docs/goals/GOAL-feature.md'), '# Goal\n## TRACED PATHS\n- src/shared.ts\n');
+  writeFileSync(join(root, 'graphs/units/shared.yaml'), 'graph_id: shared\nsource: [src/shared.ts]\nnodes: []\n');
+  writeFileSync(join(root, 'graphs/work/a.yaml'), 'graph_id: root-a\nnodes:\n  - { node_id: call, call: shared@1 }\n');
+  writeFileSync(join(root, 'graphs/work/b.yaml'), 'graph_id: root-b\nnodes:\n  - { node_id: call, call: shared@1 }\n');
+  const pack = selectKnowhowPack(root, 'goal', undefined, { goalFile: 'docs/goals/GOAL-feature.md' });
+  expect(pack.text).toContain('root-a → shared');
+  expect(pack.text).toContain('root-b → shared');
+});
+
+test('combined goal, blueprint, and selected knowhow remain within the shared UTF-8 cap', () => {
+  const { root, file } = fixture();
+  mkdirSync(join(root, 'docs/goals'), { recursive: true });
+  mkdirSync(join(root, 'graphs/work'), { recursive: true });
+  mkdirSync(join(root, 'graphs/units'), { recursive: true });
+  writeFileSync(join(root, 'docs/goals/GOAL-feature.md'), `# Goal\n## TRACED PATHS\n- src/self-implement/orchestrator.ts\n${'설명'.repeat(1800)}\n`);
+  writeFileSync(join(root, 'graphs/units/shared.yaml'), 'graph_id: shared\nsource: [src/self-implement/orchestrator.ts]\nnodes: []\n');
+  writeFileSync(join(root, 'graphs/work/shared.yaml'), 'graph_id: root-shared\nnodes:\n  - { node_id: call, call: shared@1 }\n');
+  writeFileSync(file, '## K-TC-1 scope-escape\n- 상황: src/self-implement/orchestrator.ts scope-escape.\n- 처방: bounded lesson\n- 출처: test · 상태: active\n');
+  const pack = selectKnowhowPack(root, 'scope-escape', ['src/self-implement/orchestrator.ts'], { goalFile: 'docs/goals/GOAL-feature.md' });
+  expect(pack.text).toContain('root-shared → shared');
+  expect(pack.ids).toEqual(['K-TC-1']);
+  expect(pack.bytes).toBe(Buffer.byteLength(pack.text, 'utf8'));
+  expect(pack.bytes).toBeLessThanOrEqual(KNOWHOW_PACK_MAX_BYTES);
+});
+
+test('reports explicit reasons when the configured goal or a related graph chain is absent', () => {
+  const { root } = fixture();
+  expect(selectKnowhowPack(root, 'goal', undefined, { goalFile: 'docs/goals/missing.md' }).text).toContain('goal-document-missing-or-outside-repository');
+  mkdirSync(join(root, 'docs/goals'), { recursive: true });
+  writeFileSync(join(root, 'docs/goals/GOAL-feature.md'), '# Goal\n## TRACED PATHS\n- src/feature.ts\n');
+  expect(selectKnowhowPack(root, 'goal', undefined, { goalFile: 'docs/goals/GOAL-feature.md' }).text).toContain('no-related-blueprint');
+  expect(selectKnowhowPack(root, 'goal', undefined, { goalFile: null }).text).toContain('goal-document-not-configured');
+});
+
+test('does not read a goal document through a symlink or outside the repository', () => {
+  const { root } = fixture();
+  mkdirSync(join(root, 'docs/goals'), { recursive: true });
+  const external = join(tmpdir(), `outside-goal-${Date.now()}.md`);
+  writeFileSync(external, '# confidential external goal');
+  roots.push(external);
+  symlinkSync(external, join(root, 'docs/goals/external.md'));
+
+  for (const goalFile of ['docs/goals/external.md', external]) {
+    const pack = selectKnowhowPack(root, 'goal', undefined, { goalFile });
+    expect(pack.text).toContain('goal-document-missing-or-outside-repository');
+    expect(pack.text).not.toContain('confidential external goal');
+  }
+});
+
 test('empty selections say which source or relevance boundary stopped injection', () => {
   const { root, file } = fixture();
   expect(selectKnowhowPack(join(root, 'missing'), '대상 경로: src/self-implement/orchestrator.ts')).toMatchObject({ ids: [], reason: 'source-unreadable' });
@@ -119,6 +215,30 @@ test('authoring lesson selector fails open for absent or malformed optional ledg
   mkdirSync(directory, { recursive: true });
   writeFileSync(join(directory, '05-authoring-lessons.jsonl'), '{bad json\n');
   expect(selectRelevantAuthoringLessons(root, 'Ordinary goal')).toMatchObject({ status: 'malformed', ids: [], prompt: '', invalidRows: 1 });
+});
+
+test('next goal author receives path-relevant landed implementation feedback from the run ledger', () => {
+  const { root } = fixture();
+  const stateDir = mkdtempSync(join(tmpdir(), 'knowhow-feedback-state-'));
+  roots.push(stateDir);
+  mkdirSync(join(stateDir, 'run-ledger'), { recursive: true });
+  const prior = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = stateDir;
+  try {
+    writeFileSync(join(stateDir, 'run-ledger', 'run-0123456789abcdef0123456789abcdef.jsonl'), `${JSON.stringify({
+      runId: 'run-0123456789abcdef0123456789abcdef', event: 'impl-findings-feedback', data: {
+        prNumber: 4321, paths: ['src/self-implement/goal-author.ts'],
+        requirements: 'keep the authoring boundary explicit', newScope: 'include merged implementation notes', remaining: ['wire the bounded selector'],
+      },
+    })}\n`);
+    const selected = selectRelevantAuthoringLessons(root, 'Update src/self-implement/goal-author.ts from the landed feedback.', stateDir);
+    expect(selected.ids).toContain('IF-4321');
+    expect(selected.prompt).toContain('구현이 밝힌 요구사항: keep the authoring boundary explicit');
+    expect(selected.prompt).toContain('남은 것: wire the bounded selector');
+  } finally {
+    if (prior === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = prior;
+  }
 });
 
 test('canonical authoring ledger keeps valid closed-world lessons available while ignoring legacy other rows', () => {

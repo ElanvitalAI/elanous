@@ -12,10 +12,10 @@ const previousStateDir = process.env.ELANOUS_STATE_DIR;
 const stateDir = mkdtempSync(join(tmpdir(), 'tui-run-state-'));
 process.env.ELANOUS_STATE_DIR = stateDir;
 
-const { upsertPtyManifest, getPtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestBuild, updatePtyManifestTurn, markPtyManifestClosed } = await import('./pty-manifest.js');
+const { upsertPtyManifest, getPtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestBuild, updatePtyManifestProgress, updatePtyManifestTurn, markPtyManifestClosed } = await import('./pty-manifest.js');
 const {
-  buildSelfHealthLine, describePtyRunState, describeTurnCell, formatTurnCell, judgeBuildStaleness, ptyTurnViewOfRow, readCurrentInstallRecord, reportTuiTurn, resetTuiRunStateForTesting,
-  resolveRunningBuild, startTuiRunStateRecorder,
+  buildSelfHealthLine, describePtyRunState, describeTurnCell, formatTurnCell, judgeBuildStaleness, judgeTurnProgress, ptyTurnViewOfRow, readCurrentInstallRecord, reportTuiAbortRequested, reportTuiProgress, reportTuiTurn, resetTuiRunStateForTesting,
+  resolveRunningBuild, startTuiRunStateRecorder, DEFAULT_ABORT_IGNORE_MS, DEFAULT_SLOW_TURN_MS, DEFAULT_TURN_STALL_MS,
   DEFAULT_SELF_RESTART_IDLE_MS, decideSelfRestart,
   setTuiRelaunchSpawnForTesting, TUI_RELAUNCH_FLAG,
 } = await import('./tui-run-state.js');
@@ -812,6 +812,143 @@ describe('TUI-H9 무대 — 생산 spawnTuiRelaunch · 생산 defaultWatch (fake
     expect(yielded).toEqual([]);
     reportTuiTurn('busy');
     expect(turns).toEqual(['idle', 'busy']);
+    stop();
+  });
+});
+
+// ── SURVIVAL-PROGRESS-CLOCK ────────────────────────────────────────────────
+// 마지막 진전 시각(progress_at)으로 느림·정체·Esc 무시를 가른다. 판정은 순수(L0) — 가짜 시계 값으로.
+describe('SURVIVAL-PROGRESS-CLOCK — judgeTurnProgress 네 판정', () => {
+  const MIN = 60 * 1000;
+
+  test('진전이 이어지면 98분 busy 도 slow 이지 stalled 가 아니다', () => {
+    const now = 100 * MIN;
+    expect(judgeTurnProgress({ turn: 'busy', turnAt: 2 * MIN, progressAt: now - 5_000, now }))
+      .toBe('slow');
+    // 진전이 «방금»이면 정체가 아니다 — 길이는 느림으로만 말한다.
+    expect(judgeTurnProgress({ turn: 'busy', turnAt: 2 * MIN, progressAt: now - 5_000, now })).not.toBe('stalled');
+  });
+
+  test('진전이 12분 끊기면 stalled 다', () => {
+    const now = 100 * MIN;
+    expect(judgeTurnProgress({ turn: 'busy', turnAt: now - 98 * MIN, progressAt: now - 12 * MIN, now }))
+      .toBe('stalled');
+    // 진전 기록이 아예 없어도 턴 시작 뒤 12분이면 정체로 본다.
+    expect(judgeTurnProgress({ turn: 'busy', turnAt: now - 12 * MIN, now })).toBe('stalled');
+  });
+
+  test('Esc 청구 뒤 30초가 지나도 busy 면 abort-ignored 다', () => {
+    const now = 100 * MIN;
+    expect(judgeTurnProgress({ turn: 'busy', turnAt: now - 40 * MIN, progressAt: now - 1_000, abortRequestedAt: now - 30_000, now }))
+      .toBe('abort-ignored');
+    // 30초 전이면 아직 무시라고 못 한다.
+    expect(judgeTurnProgress({ turn: 'busy', turnAt: now - 40 * MIN, progressAt: now - 1_000, abortRequestedAt: now - 29_000, now }))
+      .toBe('slow');
+  });
+
+  test('짧은 턴은 progressing 이다 · idle·재료 없음은 unknown', () => {
+    const now = 100 * MIN;
+    expect(judgeTurnProgress({ turn: 'busy', turnAt: now - 5_000, progressAt: now - 1_000, now }))
+      .toBe('progressing');
+    expect(judgeTurnProgress({ turn: 'idle', turnAt: now - 5_000, now })).toBe('unknown');
+    expect(judgeTurnProgress({ turn: 'unknown', now })).toBe('unknown');
+    expect(judgeTurnProgress({ turn: 'busy', now })).toBe('unknown');
+  });
+
+  test('기본 임계는 정체 12분 · 느린 턴 20분 · Esc 무시 30초다(임계 주입으로 덮을 수 있다)', () => {
+    expect(DEFAULT_TURN_STALL_MS).toBe(12 * MIN);
+    expect(DEFAULT_SLOW_TURN_MS).toBe(20 * MIN);
+    expect(DEFAULT_ABORT_IGNORE_MS).toBe(30_000);
+    const now = 1_000_000;
+    expect(judgeTurnProgress({ turn: 'busy', turnAt: 0, progressAt: now - 60_000, now, stallMs: 30_000, slowTurnMs: 10 * MIN }))
+      .toBe('stalled');
+  });
+});
+
+describe('SURVIVAL-PROGRESS-CLOCK — 진전·Esc 청구 기록(recorder)', () => {
+  test('reportTuiProgress 는 progress_at 을 올리고 5초 스로틀은 생략 · 실패는 관측만 남긴다', () => {
+    upsertPtyManifest({ id: 'tui:progress', kind: 'tui', cmd: 'elanous', startedAt: 1, now: 1 });
+    let t = 1_000;
+    const logs: Array<[string, Record<string, unknown>]> = [];
+    const stop = startTuiRunStateRecorder('tui:progress', {
+      now: () => t,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      log: (e, d) => logs.push([e, d]),
+      herdr: null,
+    });
+    reportTuiProgress();
+    expect(getPtyManifest('tui:progress')?.progressAt).toBe(1_000);
+    t = 2_000;
+    reportTuiProgress(); // 5초 안 — 스로틀 생략(실패 관측 없음)
+    expect(getPtyManifest('tui:progress')?.progressAt).toBe(1_000);
+    expect(logs.filter(([e]) => e === 'progress-write-failed')).toEqual([]);
+    t = 7_000;
+    reportTuiProgress();
+    expect(getPtyManifest('tui:progress')?.progressAt).toBe(7_000);
+    stop();
+    // 녹음기가 없으면 아무 일도 안 한다.
+    resetTuiRunStateForTesting();
+    reportTuiProgress();
+    expect(getPtyManifest('tui:progress')?.progressAt).toBe(7_000);
+  });
+
+  test('reportTuiTurn(\'busy\') 는 이전 턴의 progress_at 을 리셋한다(턴 시작 = 진전 0초)', () => {
+    upsertPtyManifest({ id: 'tui:busy-reset', kind: 'tui', cmd: 'elanous', startedAt: 1, now: 1 });
+    let t = 5_000;
+    startTuiRunStateRecorder('tui:busy-reset', {
+      now: () => t,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      log: () => {},
+      herdr: null,
+    });
+    reportTuiProgress();
+    expect(getPtyManifest('tui:busy-reset')?.progressAt).toBe(5_000);
+    // 이전 턴의 마지막 진전이 정체 임계(12분)보다 오래 묵은 뒤 새 busy 턴.
+    t = 5_000 + 20 * 60_000;
+    reportTuiTurn('busy');
+    expect(getPtyManifest('tui:busy-reset')).toMatchObject({ turnState: 'busy', turnAt: t, progressAt: t });
+    // busy 직후 5초 안 진전 기록은 스로틀 생략 — progress_at 은 리셋값(t) 유지.
+    reportTuiProgress();
+    expect(getPtyManifest('tui:busy-reset')?.progressAt).toBe(t);
+    resetTuiRunStateForTesting();
+  });
+
+  test('reportTuiAbortRequested 는 abort_requested_at 을 남기고 새 busy 턴은 비운다', () => {
+    upsertPtyManifest({ id: 'tui:abort', kind: 'tui', cmd: 'elanous', startedAt: 1, now: 1 });
+    let t = 5_000;
+    startTuiRunStateRecorder('tui:abort', {
+      now: () => t,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      log: () => {},
+      herdr: null,
+    });
+    reportTuiAbortRequested();
+    expect(getPtyManifest('tui:abort')?.abortRequestedAt).toBe(5_000);
+    t = 6_000;
+    reportTuiTurn('busy'); // 새 busy 턴 — 이전 Esc 청구는 이번 턴과 무관하다
+    expect(getPtyManifest('tui:abort')?.abortRequestedAt).toBeUndefined();
+    expect(getPtyManifest('tui:abort')).toMatchObject({ turnState: 'busy', turnAt: 6_000 });
+    resetTuiRunStateForTesting();
+    reportTuiAbortRequested();
+    expect(getPtyManifest('tui:abort')?.abortRequestedAt).toBeUndefined();
+  });
+
+  test('진전 기록 실패(행 없음)는 턴을 막지 않고 관측으로 남긴다', () => {
+    const logs: Array<[string, Record<string, unknown>]> = [];
+    let fail = false;
+    const stop = startTuiRunStateRecorder('tui:progress-fail', {
+      now: () => 1,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true,
+      writeTurn: () => true,
+      writeProgress: () => fail,
+      log: (e, d) => logs.push([e, d]),
+    });
+    reportTuiProgress();
+    expect(logs.filter(([e]) => e === 'progress-write-failed')).toEqual([['progress-write-failed', { ptyId: 'tui:progress-fail', at: 1 }]]);
+    fail = true;
+    reportTuiProgress(); // 이번엔 성공 — 실패 관측 추가 없음
+    expect(logs.filter(([e]) => e === 'progress-write-failed')).toHaveLength(1);
     stop();
   });
 });
