@@ -18,6 +18,11 @@ describe('tierModel — 지점은 «성능»만 선언하고 provider 가 모델
     expect(new Set((['budget', 'better', 'loaded'] as const)
       .map(t => tierModel(t, 'openai-codex'))).size).toBeGreaterThan(1);
   });
+  it('Codex ladder and fallback both use GPT-6.1 Terra/Sol', () => {
+    expect(tierModel('balanced', 'openai-codex')).toBe('gpt-6.1-terra');
+    expect(tierModel('better', 'openai-codex')).toBe('gpt-6.1-terra');
+    expect(tierModel('best', 'openai-codex')).toBe('gpt-6.1-sol');
+  });
 
   // ⛔⭐ 「못 잰 것」을 «0»이나 «통과»로 접지 않는다 — 값이 없는 provider 는 «세어서 드러낸다».
   //   📏 2026-09-23: grok 사다리의 budget(`grok-4.20-non-reasoning`)이 카탈로그에 «없다»

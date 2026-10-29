@@ -414,12 +414,20 @@ export function runGraphVariantPath(runId: string, dir = runLedgerDir()): string
   return `${runLedgerPath(runId, dir)}.graph.yaml`;
 }
 
+/** 원장에 실린 unit 선언 근거 한 줄 — 경로와 내용 해시뿐이고 본문은 원장에 없다. */
+export interface RunGraphVariantUnitDeclaration {
+  readonly path: string;
+  readonly contentHash: string;
+}
+
 /** 최초 graph variant 선택의 원장 옆 재조회 계약 — 같은 runId·파일이면 같은 id·선택 이유가 돌아온다. */
 export interface RunGraphVariantSelection {
   /** createGraphVariant 가 골 종류·대상 경로 수에서 유도한 최초 variant id. */
   readonly variantId: string;
   /** 그 variant가 최초로 선택된 근거(종류·경로 수 기반) — 저장·재조회가 같은 문자열. */
   readonly reason: string;
+  /** 이 런이 읽은 unit 선언의 경로·내용 해시 — 옛 원장에는 키가 없어 값도 없다(추가 키). */
+  readonly unitDeclarations?: readonly RunGraphVariantUnitDeclaration[];
 }
 
 /** 런 원장 옆 .graph.yaml 을 처음 한 번 쓰고 저장 경로를 돌려준다 — 이미 있으면 덮쓰지 않는다(flag wx). */
@@ -447,9 +455,24 @@ export function loadRunGraphVariant(runId: string, dir = runLedgerDir()): RunGra
     throw new Error(`invalid run graph variant YAML at ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  const record = parsed as { variant_id?: unknown; reason?: unknown };
+  const record = parsed as { variant_id?: unknown; reason?: unknown; unit_declarations?: unknown };
   if (typeof record.variant_id !== 'string' || typeof record.reason !== 'string') return null;
-  return { variantId: record.variant_id, reason: record.reason };
+  const unitDeclarations = parseRunGraphVariantUnitDeclarations(record.unit_declarations);
+  return { variantId: record.variant_id, reason: record.reason,
+    ...(unitDeclarations === undefined ? {} : { unitDeclarations }) };
+}
+
+/** `unit_declarations: [{ path, content_hash }]` 추가 키의 재읽기 — 키가 없거나 비면 근거도 없다. */
+function parseRunGraphVariantUnitDeclarations(value: unknown): RunGraphVariantUnitDeclaration[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const declarations: RunGraphVariantUnitDeclaration[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const record = entry as { path?: unknown; content_hash?: unknown };
+    if (typeof record.path !== 'string' || typeof record.content_hash !== 'string') continue;
+    declarations.push({ path: record.path, contentHash: record.content_hash });
+  }
+  return declarations.length === 0 ? undefined : declarations;
 }
 
 /**
@@ -1811,6 +1834,8 @@ export interface UnfinishedRunLedgerQuery {
    * 엉킨 visit 을 셀 수 있게 하는 값이다.
    */
   orphanUnitVisitCount?: number;
+  /** True when a caller deadline stopped the scan before every ledger was visited. */
+  timedOut?: boolean;
   scope: 'self-implement-run-ledger';
   note: string;
 }
@@ -1824,6 +1849,8 @@ export interface UnfinishedRunLedgerQueryOptions {
   noCache?: boolean;
   /** ⛔ 「도는 중」으로 볼 마지막 활동 나이(ms). 호출자가 준다 — 이 모듈이 새 수를 정하지 않는다. */
   liveWindowMs?: number;
+  /** Absolute wall-clock deadline; when reached, return the rows scanned so far as partial evidence. */
+  deadlineAtMs?: number;
 }
 
 const UNFINISHED_RUN_LEDGER_NOTE = 'Read-only scan of the specified run-ledger directory. A terminal-status-missing ledger is not the same as an unreadable ledger; planned paths are extracted only from a goal document matched by the final hyphen-separated branch segment.';
@@ -2470,7 +2497,12 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
   let callerCwdCount = 0;
   // ⭐ 터미널 원장도 «세기만» 한다 — entries 로 되살리지 않는다(부활 금지).
   let orphanUnitVisitCount = 0;
+  let timedOut = false;
   for (const fileName of fileNames) {
+    if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) {
+      timedOut = true;
+      break;
+    }
     const runId = runIdFromCanonicalLedgerFile(fileName);
     if (!runId) continue;
     scanned += 1;
@@ -2555,9 +2587,10 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     indexOrigin,
     indexHits,
     ms: Date.now() - startedAt,
+    ...(timedOut ? { timedOut: true, stopReason: 'deadline-exceeded' } : {}),
   });
   if (options.path === undefined) {
-    return { entries, ledgerDirectory: dir, goalsDirectory: goalsDir, unreadableLedgerCount, orphanUnitVisitCount, ledgerDirectoryMissing: false, terminalByTrailingRunStatus, cacheHits, cacheMisses, indexHits, indexOrigin, scope: 'self-implement-run-ledger', note: UNFINISHED_RUN_LEDGER_NOTE };
+    return { entries, ledgerDirectory: dir, goalsDirectory: goalsDir, unreadableLedgerCount, orphanUnitVisitCount, ledgerDirectoryMissing: false, terminalByTrailingRunStatus, cacheHits, cacheMisses, indexHits, indexOrigin, ...(timedOut ? { timedOut: true } : {}), scope: 'self-implement-run-ledger', note: UNFINISHED_RUN_LEDGER_NOTE };
   }
   const pathFilter = options.path;
   const unknownPathStatus = (entry: UnfinishedRunLedgerEntry): boolean => entry.plannedPathStatus !== 'found-ledger-goal-file'
@@ -2583,6 +2616,7 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     pathFilter,
     matchingPathCount: matchingEntries.length,
     unknownPathCount: unknownEntries.length,
+    ...(timedOut ? { timedOut: true } : {}),
     scope: 'self-implement-run-ledger',
     note: UNFINISHED_RUN_LEDGER_NOTE,
   };
@@ -2619,6 +2653,8 @@ export interface FederatedUnfinishedRunLedgerQuery {
   cacheMisses?: number;
   /** Hits served by the persisted cross-process scan index (subset of cacheHits). */
   indexHits?: number;
+  timedOut?: boolean;
+  stalledStage?: 'ledger-scan' | 'cross-directory-reconciliation';
   pathFilter?: string;
   matchingPathCount?: number;
   unknownPathCount?: number;
@@ -2640,6 +2676,7 @@ export interface FederatedUnfinishedRunLedgerQueryOptions {
    * canonical *.jsonl plus the cross-directory unfinished-runId reconciliation.
    */
   runIds?: readonly string[];
+  deadlineAtMs?: number;
 }
 
 const FEDERATED_UNFINISHED_RUN_LEDGER_NOTE = 'Read-only union of run-ledger directories selected by the same --all/--include-test target policy as elanous logs. Each row carries its physical ledger directory because instance names can identify multiple state roots.';
@@ -2659,12 +2696,19 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
   let cacheHits = 0;
   let cacheMisses = 0;
   let indexHits = 0;
+  let timedOut = false;
+  let stalledStage: FederatedUnfinishedRunLedgerQuery['stalledStage'];
   const recordDirectoryFailure = (kind: FederatedLedgerDirectoryFailureKind): void => {
     if (kind === 'missing') missingLedgerDirectoryCount += 1;
     else if (kind === 'unreadable') unreadableLedgerDirectoryAccessCount += 1;
     else indeterminateLedgerDirectoryCount += 1;
   };
   for (const ledgerDirectory of candidateLedgerDirectories) {
+    if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) {
+      timedOut = true;
+      stalledStage = 'ledger-scan';
+      break;
+    }
     try {
       const listDirectory = options.list ?? readdirSync;
       const list = requestedRunIds === undefined
@@ -2673,7 +2717,7 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
           const runId = runIdFromCanonicalLedgerFile(fileName);
           return runId !== null && requestedRunIds.has(runId);
         });
-      const result = queryUnfinishedRunLedgers({ dir: ledgerDirectory, goalsDir: goalsDirectory, ...(options.path === undefined ? {} : { path: options.path }), ...(list === undefined ? {} : { list }), noCache: options.noCache });
+      const result = queryUnfinishedRunLedgers({ dir: ledgerDirectory, goalsDir: goalsDirectory, ...(options.path === undefined ? {} : { path: options.path }), ...(list === undefined ? {} : { list }), noCache: options.noCache, deadlineAtMs: options.deadlineAtMs });
       if (result.ledgerDirectoryMissing) {
         recordDirectoryFailure('missing');
         continue;
@@ -2685,10 +2729,15 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
       cacheHits += result.cacheHits ?? 0;
       cacheMisses += result.cacheMisses ?? 0;
       indexHits += result.indexHits ?? 0;
+      if (result.timedOut) {
+        timedOut = true;
+        stalledStage = 'ledger-scan';
+      }
       entries.push(...result.entries.map((entry) => ({ ...entry, ledgerDirectory })));
     } catch (error) {
       recordDirectoryFailure(classifyFederatedLedgerDirectoryReadFailure(error));
     }
+    if (timedOut) break;
   }
   const unreadableLedgerDirectoryCount = missingLedgerDirectoryCount + unreadableLedgerDirectoryAccessCount + indeterminateLedgerDirectoryCount;
   // ⛔⭐⭐ 가로 대조 — 원장 «하나»만 보고 「미완」이라 말하지 않는다 (2026-08-11 · 🅣 71차 실측).
@@ -2698,20 +2747,28 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
   //   📏 실측(2026-08-11): 미완 57 중 ***7*** 이 다른 원장에 종결을 갖고 있었다.
   // ⛔ 판정 술어는 스캐너와 «같은 것»을 쓴다(`run-status` 또는 `terminal`) — 어휘를 새로 만들지 않는다.
   const terminatedElsewhere = new Set<string>();
+  const reconciledRunIds = new Set<string>();
   // Runs carrying a non-blocking request record never drop out of the union: their requestId
   // reason·next must survive restarts and cross-directory reconciliation alike.
   const unfinishedRunIds = requestedRunIds === undefined
     ? new Set(entries.filter((entry) => !entry.nonBlocking).map((entry) => entry.runId))
     : new Set([...requestedRunIds].filter((runId) => entries.some((entry) => entry.runId === runId && !entry.nonBlocking)));
-  for (const runId of unfinishedRunIds) {
+  for (const runId of timedOut ? [] : unfinishedRunIds) {
+    if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) {
+      timedOut = true;
+      stalledStage = 'cross-directory-reconciliation';
+      break;
+    }
     for (const ledgerDirectory of ledgerDirectories) {
       try {
         const reconciliationIndex = options.noCache ? undefined : loadRunLedgerScanIndex(ledgerDirectory);
         if (readUnfinishedLedgerFacts(runId, ledgerDirectory, undefined, options.noCache, reconciliationIndex).facts.terminal) { terminatedElsewhere.add(runId); break; }
       } catch { /* An absent or unreadable sibling cannot establish termination. */ }
     }
+    reconciledRunIds.add(runId);
   }
-  const reconciledEntries = entries.filter((entry) => !terminatedElsewhere.has(entry.runId));
+  const reconciledEntries = entries.filter((entry) => !terminatedElsewhere.has(entry.runId)
+    && (stalledStage !== 'cross-directory-reconciliation' || reconciledRunIds.has(entry.runId)));
   const reconciledTerminatedElsewhereCount = entries.length - reconciledEntries.length;
   entries.length = 0;
   entries.push(...reconciledEntries);
@@ -2729,6 +2786,7 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
     cacheHits,
     cacheMisses,
     indexHits,
+    ...(timedOut ? { timedOut: true, stalledStage } : {}),
     ...(options.path === undefined ? {} : { pathFilter: options.path, matchingPathCount, unknownPathCount }),
     scope: 'self-implement-run-ledger-federated',
     note: FEDERATED_UNFINISHED_RUN_LEDGER_NOTE,

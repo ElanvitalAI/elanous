@@ -157,7 +157,7 @@ test('graph YAML triggers.schedule fires through the workflow scheduler into gra
   const graph = join(dir, 'graph.yaml');
   const executed = join(dir, 'executed');
   writeFileSync(join(dir, 'recipes.yaml'), `a:\n  command: "printf x >> '${executed}'"\n`);
-  writeFileSync(graph, `graph_id: cli-scheduled\nversion: 1\nentry_node: a\nterminal_nodes: [done]\ntriggers:\n  schedule: { type: interval, interval: 1000 }\nnodes:\n  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, notify: false }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - { from: a, to: done }\n`);
+  writeFileSync(graph, `graph_id: cli-scheduled\nloop:\n  trigger:\n    events: [release.cut.due]\nversion: 1\nentry_node: a\nterminal_nodes: [done]\ntriggers:\n  schedule: { type: interval, interval: 1000 }\nnodes:\n  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, notify: false }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - { from: a, to: done }\n`);
   const child = Bun.spawn(['bun', join(root, 'bin/elanous.mjs'), `--test=${stateRoot}`, 'graph', 'tick', 'graph.yaml', '--schedule'], {
     cwd: dir, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_STATE_DIR: stateRoot },
   });

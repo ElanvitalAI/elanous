@@ -37,6 +37,11 @@ describe('lookupLlmTierSpec — SSOT 회귀 (대표 지적)', () => {
     const all = MODEL_TIERS.map(t => cost(lookupLlmTierSpec('openai-codex', t).model));
     expect(cost(budget.model)).toBe(Math.min(...all));
   });
+  it('Codex 6.1 사다리는 better=Terra · best=Sol이며 Elanous effort medium을 유지한다', () => {
+    expect(lookupLlmTierSpec('openai-codex', 'balanced')).toMatchObject({ model: 'gpt-6.1-terra', reasoningLevel: 'low' });
+    expect(lookupLlmTierSpec('openai-codex', 'better')).toMatchObject({ model: 'gpt-6.1-terra', reasoningLevel: 'medium' });
+    expect(lookupLlmTierSpec('openai-codex', 'best')).toMatchObject({ model: 'gpt-6.1-sol', reasoningLevel: 'high' });
+  });
   it('anthropic best = opus 5.5 (09-25 최신)', () => {
     expect(lookupLlmTierSpec('anthropic', 'best').model).toBe('claude-opus-5-5');
   });

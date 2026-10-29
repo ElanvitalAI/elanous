@@ -14,7 +14,7 @@ export function explicitTurnTier(
   try {
     const resolved = resolveLlmTier(cfg.modelTier, cfg.llm.provider, { sessionId });
     if (resolved.source !== 'session-override' && resolved.source !== 'user-config-surface') return undefined;
-    // On codex the balanced·better·best tiers share one model and differ only in reasoning level (low·medium·high),
+    // Codex tiers can share a model while differing by reasoning level (low·medium·high),
     // so carrying the model alone left the slider a no-op there (10-01 live).
     const reasoningEffort = resolved.reasoningLevel ? REASONING_EFFORT[resolved.reasoningLevel] : undefined;
     return { model: resolved.model, tier: resolved.tier, source: resolved.source, ...(reasoningEffort ? { reasoningEffort } : {}) };

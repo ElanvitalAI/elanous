@@ -237,7 +237,7 @@ test('a timed-out, unreadable, or failed-to-launch unhandled isolation stays unm
   }
 });
 
-test('only an aggregate of individually validated shard failures tolerates a repeated printed id', async () => {
+test('host and validated Pod sweeps collapse repeated failure IDs when every row is file-attributed', async () => {
   for (const validatedShards of [false, true]) {
     const { runner, opts } = gateFixture(1, 0);
     const original = runner.command;
@@ -248,9 +248,8 @@ test('only an aggregate of individually validated shard failures tolerates a rep
       output: `${FILE}:\n(fail) A [1.00ms]\n(fail) A [1.00ms]\n2 pass\n1 fail\n0 errors\nRan 3 tests across 1 file.\n`,
       validatedShards });
     const result = await judgeGate(opts, runner);
-    expect(result.outcome).toBe(validatedShards ? 'regression' : 'error');
-    if (validatedShards) expect(result.introduced).toEqual([`${FILE} > A`]);
-    else expect(result.error).toContain('failure attribution incomplete');
+    expect(result.outcome).toBe('regression');
+    expect(result.introduced).toEqual([`${FILE} > A`]);
   }
 });
 

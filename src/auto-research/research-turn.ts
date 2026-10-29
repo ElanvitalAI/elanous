@@ -23,6 +23,8 @@ export interface ResearchQuestionLadderRunOptions {
   invokeOutputSkill?: (skill: string, args: string) => Promise<{ ok: boolean; output: string; error?: string }>;
   /** Test seam for the bounded Bloom 4/5 evidence-gap follow-up. */
   gapFollowup?: typeof runGapFollowup;
+  /** Test/config seam for an explicitly installed private Bloom exemplar pack. */
+  bloomExemplarPackPath?: string;
 }
 
 export interface ResearchGroundingResult {
@@ -238,8 +240,15 @@ export async function runResearchQuestionLadder(
   let raw: string;
   try {
     const sectionIds = outputContract.sections.map((section) => section.id);
+    // Keep the premium exemplar bank outside the TUI's static import closure.
+    const { getBloomExemplarContext } = await import('../research/bloom-exemplars.js');
+    const exemplar = getBloomExemplarContext(request, options.bloomExemplarPackPath);
+    debug.log('research.turn', 'bloom-exemplars-selected', {
+      domain: exemplar.domain, domainSignal: exemplar.domainSignal,
+      source: exemplar.source, count: exemplar.count, levels: exemplar.levels,
+    });
     raw = await (options.generate ?? ((prompt) => defaultGenerate(prompt, 'research-question-ladder')))(
-      `${buildResearchQuestionLadderPrompt(request, sectionIds)}\n\n${ladderContext}${retroGroundingContext(request)}`,
+      `${buildResearchQuestionLadderPrompt(request, sectionIds)}\n\n${exemplar.context ? `${exemplar.context}\n\n` : ''}${ladderContext}${retroGroundingContext(request)}`,
     );
     debug.log('research.turn', 'bloom-generated', { questionCount: 6 });
   } catch (error) {

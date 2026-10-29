@@ -2,7 +2,7 @@ import { describe, it, expect } from 'bun:test';
 import { assertCurationProposal } from './doc-curation.js';
 import {
   extractClaims, defaultDetectConflict, proposeWikiClaimItems,
-  buildWikiClaimProposal, proposeWikiClaimsFromHandoff, type WikiClaimDeps,
+  buildWikiClaimProposal, proposeWikiClaimsFromHandoff, type WikiClaimDeps, type WikiClaimStatistics,
 } from './wiki-claim-proposer.js';
 
 const HANDOFF = `# HANDOFF 테스트
@@ -117,6 +117,31 @@ describe('proposeWikiClaimItems', () => {
     expect(items[0]!.diff).toContain('parallel-evidence');
     expect(items[0]!.diff).toContain('원문 보존');
   });
+
+  it('근거 없는 쓰기·고치기·링크 제안은 성립하지 않는다 — provenance 없는 claim 은 제안 목록에 남지 않고 근거 있는 기존 제안과 함께 관측된다', () => {
+    const observed: WikiClaimStatistics[] = [];
+    const noQuote = { ...claim, text: '근거 없는 첫 claim 은 제안이 성립하지 않는다', sourceQuote: '' };
+    const noPath = { ...claim, text: '출처 경로 없는 claim 은 제안이 성립하지 않는다', sourcePath: '' };
+    const noDate = { ...claim, text: '검증 시점 없는 claim 은 제안이 성립하지 않는다', lastVerified: '' };
+    const items = proposeWikiClaimItems([noQuote, claim, noPath, noDate], deps({
+      logSink: (_category, _event, data) => observed.push(data),
+    }));
+    expect(items).toHaveLength(1); // 근거 없는 3건은 제안 항목으로 성립하지 않는다
+    expect(items[0]!.reason).toContain(claim.text); // 근거 있는 기존 제안은 그대로 관측
+    expect(items[0]!.action).toBe('update'); // 기존 동작(고치기 제안) 보존
+    expect(items[0]!.evidenceQuote).toBe(claim.sourceQuote);
+    expect(items[0]!.sourcePath).toBe(claim.sourcePath);
+    expect(JSON.stringify(items)).not.toContain(noQuote.text);
+    expect(JSON.stringify(items)).not.toContain(noPath.text);
+    expect(JSON.stringify(items)).not.toContain(noDate.text);
+    expect(items.statistics.receivedClaims).toBe(4);
+    expect(items.statistics.proposedItems).toBe(1);
+    expect(items.statistics.discardedClaims).toBe(0); // 페이지 폐기와 다른 축 — 근거 거부는 가산 관측에 남는다
+    expect(items.statistics.rejected?.reason).toBe('missing-provenance');
+    expect(items.statistics.rejected?.claims).toBe(3);
+    expect(items.statistics.rejected?.sourcePaths).toEqual(['docs/H.md', '', 'docs/H.md']);
+    expect(observed[0]?.rejected?.claims).toBe(3); // 명시적 거부가 관측 통계(로그)로도 흐른다
+  });
 });
 
 describe('buildWikiClaimProposal · end-to-end', () => {
@@ -134,5 +159,20 @@ describe('buildWikiClaimProposal · end-to-end', () => {
     const again = proposeWikiClaimsFromHandoff(HANDOFF, 'docs/H.md', deps(), { nowIso: '2026-07-14T00:00:00Z', nowDate: '2026-07-14', existingIdempotencyKeys: new Set([first.idempotencyKey]) });
     expect(again.suppressed).toBe(true);
     expect(again.items).toHaveLength(0);
+  });
+
+  it('근거 없는 흡수 입력은 0제안·유효 큐 봉투 — 근거 있는 입력은 기존처럼 제안한다(생산 경로 관측)', () => {
+    const noProvenance = proposeWikiClaimsFromHandoff(HANDOFF, '', deps({ readWikiPage: () => null }), { nowIso: '2026-07-14T00:00:00Z', nowDate: '' });
+    expect(noProvenance.items).toHaveLength(0); // 근거 없는 원문에서는 쓰기·고치기·링크 제안이 성립하지 않는다
+    expect(() => assertCurationProposal(noProvenance)).not.toThrow(); // 근거 없는 항목이 큐 계약을 깨뜨리지 않는다
+    const rejectedStats = noProvenance.wikiClaimStatistics as WikiClaimStatistics | undefined;
+    expect(rejectedStats?.receivedClaims).toBeGreaterThan(0);
+    expect(rejectedStats?.rejected?.reason).toBe('missing-provenance');
+    expect(rejectedStats?.rejected?.claims).toBe(rejectedStats?.receivedClaims); // 받은 claim 전부 근거 없음
+
+    const grounded = proposeWikiClaimsFromHandoff(HANDOFF, 'docs/HANDOFF-x.md', deps({ readWikiPage: () => null }), { nowIso: '2026-07-14T00:00:00Z', nowDate: '2026-07-14' });
+    expect(grounded.items.length).toBeGreaterThan(0); // 기존 동작 — 근거 있으면 제안을 생산한다
+    expect(() => assertCurationProposal(grounded)).not.toThrow();
+    expect(grounded.items.every((i) => Boolean(i.evidenceQuote && i.sourcePath))).toBe(true); // 모든 제안이 근거를 싣는다
   });
 });

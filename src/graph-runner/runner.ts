@@ -26,6 +26,7 @@ import { createGraphVariant, type GraphVariantPlan } from '../self-implement/gra
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
 import { executeClassifyNode } from '../workflow-runtime/nodes/classify.js';
+import { requireInProcessHandler, type InProcessHandlerRegistry } from './in-process-registry.js';
 import { interpolate } from '../workflow-runtime/variables.js';
 import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride, type GatePodPoolOverride, type GateShardRerouteOverride } from '../../scripts/release-loop/resume.js';
@@ -257,7 +258,7 @@ export interface GraphRunOptions {
   releaseCommandSource?: { root: string; cutTip: string; git?: (args: string[]) => string };
   /** Optional per-run Bloom edge policy hook. */
   researchEdgeDecisionRegistry?: ResearchEdgeDecisionRegistry;
-  deps?: { root?: string; runBash?: BashRun; callLLM?: (prompt: string) => Promise<string>; log?: (event: string, data: Record<string, unknown>) => void; beforeNode?: () => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] } };
+  deps?: { root?: string; runBash?: BashRun; callLLM?: (prompt: string) => Promise<string>; log?: (event: string, data: Record<string, unknown>) => void; beforeNode?: () => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect; growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] }; inProcessHandlers?: InProcessHandlerRegistry };
 }
 
 /** The command directory must itself be the checkout at the cut tip. */
@@ -756,6 +757,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   for (const node of graph.nodes) {
     if (node.kind === 'classify' && node.recipe !== 'none') throw new Error(`classify node cannot execute a recipe: ${node.nodeId}`);
     if (node.recipe === 'none') continue;
+    if (node.recipe.startsWith('handler:')) {
+      requireInProcessHandler(node.recipe, node.nodeId, options.deps?.inProcessHandlers);
+      continue;
+    }
     const resolved = resolveNodeRecipe(node, recipes, catalogRoles);
     // Harness loop recipes are labels the self-implement harness dispatches by node id (most are outside the
     // node catalog — graph-catalog.test.ts); a planned loop never executes them, and a real run is refused above.
@@ -1107,6 +1112,31 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     let commandFailureReason: string | undefined;
     let output: unknown;
     const waiving = options.releaseWaiver?.nodeId === current && waivedRecord !== undefined;
+    const inProcessHandler = requireInProcessHandler(node.recipe, current, options.deps?.inProcessHandlers);
+    let handlerExecuted = false;
+    if (inProcessHandler && !waiving && !state.dryRun && !resumingCompleted) {
+      const outputs: Record<string, unknown> = Object.create(null);
+      for (const previous of state.nodes) outputs[previous.nodeId] = lastJsonObject(previous.output) ?? previous.output ?? null;
+      handlerExecuted = true;
+      debug.log('graph.run', 'handler-dispatch', { graphId, runId, nodeId: current, recipe: node.recipe });
+      try {
+        const result = await inProcessHandler({ graphId, runId, nodeId: current, input: state.input ?? null, outputs });
+        if (!result || typeof result.ok !== 'boolean' || typeof result.outcome !== 'string' || !result.outcome.trim())
+          throw new Error(`invalid in-process handler result: ${current}`);
+        output = JSON.stringify({ ...(result.evidence === undefined ? {} : { evidence: result.evidence }), outcome: result.outcome });
+        ok = result.ok;
+        exit = ok ? 0 : 1;
+        error = result.error;
+      } catch (cause) {
+        ok = false;
+        exit = 1;
+        error = redactCredentials(cause instanceof Error ? cause.message : String(cause));
+        output = JSON.stringify({ outcome: 'fail', error });
+      }
+      debug.log('graph.run', 'handler-result', { graphId, runId, nodeId: current, recipe: node.recipe, ok,
+        outcome: lastJsonObject(output)?.outcome ?? null, ...(error ? { error } : {}) });
+      state.executed++;
+    }
     if (command && !waiving && (!approval || state.dryRun || ok) && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
       const outputs: Record<string, unknown> = Object.create(null);
       // 구조 산출(마지막 JSON 줄)이 있으면 그것을, 없으면 원문을 준다 — 다음 노드가 판단을 «값»으로 받는다.
@@ -1345,7 +1375,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         message: failureMessage,
         stage: units.has(current) ? 'unit-invocation' : command ? 'command-execution' : prompt ? 'prompt-execution' : 'node-execution',
       };
-      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && ((!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...((waiving || harnessLoopRoute || units.has(current) || ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
+      state.nodes.push({ nodeId: current, ok, exit, executed: !waiving && (handlerExecuted || (!!command && (!state.dryRun || !!command.dry_run_command)) || (!!prompt && !state.dryRun) || (node.kind === 'classify' && !state.dryRun) || unitExecuted), ...((waiving || harnessLoopRoute || units.has(current) || handlerExecuted || ((command || prompt || approval || node.kind === 'classify') && (!state.dryRun || !!command?.dry_run_command))) && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
         ...(failure ? { reason: failure.message, failure } : {}), ...(commandFailureReason && !failure ? { reason: commandFailureReason } : {}),
         ...(waiving ? { waiver: { reason: options.releaseWaiver!.reason, at: nodeEndedAt, ...(options.releaseWaiver!.unmeasured === undefined ? {} : { unmeasured: options.releaseWaiver!.unmeasured }), original: { exit: waivedRecord!.exit, ...(waivedRecord!.output === undefined ? {} : { output: waivedRecord!.output }), ...(waivedRecord!.error === undefined ? {} : { error: waivedRecord!.error }) } } } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}),
@@ -1359,7 +1389,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       delete state.pending;
       delete state.approvalSourceHash;
     }
-    const reported: unknown = waiving || harnessLoopRoute || units.has(current) || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
+    const reported: unknown = waiving || harnessLoopRoute || units.has(current) || handlerExecuted || (resumingCompleted && inProcessHandler) || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome: string | undefined = typeof reported === 'string' ? reported : undefined;
     if (!options.quiet) console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
     const nodeFailure = state.nodes.at(-1)?.nodeId === current ? state.nodes.at(-1)?.failure : undefined;

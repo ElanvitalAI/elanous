@@ -740,7 +740,9 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['gate-shards', 'schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'recover', 'gate-history', 'rehearsal', 'auto-start']);
+      // recover-landing is part of this PR's CLI surface; keep the registered command and its help discoverable.
+      expect(release.commands.map((c) => c.name())).toEqual(['gate-shards', 'schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'recover', 'recover-landing', 'gate-history', 'rehearsal', 'auto-start']);
+      expect(release.commands.find((c) => c.name() === 'recover-landing')!.helpInformation()).toContain('착지 알림 수동 재생 입구');
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');

@@ -15491,6 +15491,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         pushTurnToolHistory: (msgs) => {
           for (const m of msgs) chat.history.push(m as ChatMessage);
         },
+        // TUI-TOKEN-GUARD-WIRE — the request-size cap writes its compaction back here so the
+        // next prompt reads the compacted history instead of reloading the original.
+        replaceChatHistory: (msgs) => {
+          chat.history.length = 0;
+          for (const m of msgs) chat.history.push(m);
+        },
         // F1 — Phase 3 · ACP `requestPermission` gateway. Routes
         // every inbound permission request to the dashboard's shared
         // approval modal so the UX matches direct-dispatch approvers

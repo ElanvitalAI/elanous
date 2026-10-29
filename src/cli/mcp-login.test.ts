@@ -119,6 +119,7 @@ function loginFixture(device: boolean) {
 test('local HTTP OAuth round trip: login, reuse, cancel, and MCP Bearer', async () => {
   const storePath = join(mkdtempSync(join(tmpdir(), 'mcp-login-http-')), 'auth.json');
   const requests: Array<{ phase: string; method: string; path: string; body: string; authorization?: string }> = [];
+  const transcript: Array<{ phase: string; request: string; response: string }> = [];
   let phase = 'first';
   let deny = false;
   let registrations = 0;
@@ -134,15 +135,20 @@ test('local HTTP OAuth round trip: login, reuse, cancel, and MCP Bearer', async 
     requests.push({ phase, method: req.method ?? '', path, body,
       ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}) });
     const reply = (status: number, value: object, headers: Record<string, string> = {}) => {
+      const responseBody = JSON.stringify(value);
+      transcript.push({ phase, request: `${req.method} ${path} ${body}`, response: `${status} ${responseBody} ${JSON.stringify(headers)}` });
       res.writeHead(status, { 'content-type': 'application/json', ...headers });
-      res.end(JSON.stringify(value));
+      res.end(responseBody);
     };
     if (path === '/mcp') {
       if (req.headers.authorization !== `Bearer access-${exchanges}`) {
         reply(401, {}, { 'www-authenticate': `Bearer resource_metadata="${base}/meta", scope="read"` });
       } else {
         const rpc = JSON.parse(body) as { id?: number; method: string };
-        if (rpc.method === 'notifications/initialized') { res.writeHead(202); res.end(); }
+        if (rpc.method === 'notifications/initialized') {
+          transcript.push({ phase, request: `${req.method} ${path} ${body}`, response: '202 (empty body)' });
+          res.writeHead(202); res.end();
+        }
         else reply(200, { jsonrpc: '2.0', id: rpc.id, result: rpc.method === 'initialize'
           ? { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'local', version: '1' } }
           : { tools: [] } });
@@ -162,6 +168,7 @@ test('local HTTP OAuth round trip: login, reuse, cancel, and MCP Bearer', async 
       redirect.searchParams.set('state', url.searchParams.get('state')!);
       if (deny) redirect.searchParams.set('error', 'access_denied');
       else redirect.searchParams.set('code', `code-${exchanges + 1}`);
+      transcript.push({ phase, request: `${req.method} ${path} ${body}`, response: `302 Location: ${redirect.toString()}` });
       res.writeHead(302, { location: redirect.toString() }); res.end();
     } else if (path === '/token') {
       const params = new URLSearchParams(body);
@@ -192,6 +199,7 @@ test('local HTTP OAuth round trip: login, reuse, cancel, and MCP Bearer', async 
     expect((await login()).exitCode).toBe(0);
     const first = readFileSync(storePath, 'utf8');
     expect(loadTokens(base, storePath)).toMatchObject({ accountUuid: 'client-1', tokens: { accessToken: 'access-1', refreshToken: 'refresh-1' } });
+    const firstCredentials = { clientId: loadTokens(base, storePath)?.accountUuid, accessToken: '[redacted]', refreshToken: '[redacted]' };
     const config = JSON.parse(readFileSync(configPath, 'utf8')) as { mcp: { servers: Array<{ oauthIssuer: string; oauthTokenEndpoint: string }> } };
     expect(config.mcp.servers[0]).toMatchObject({ oauthIssuer: base, oauthTokenEndpoint: `${base}/token` });
     phase = 'repeat';
@@ -200,14 +208,17 @@ test('local HTTP OAuth round trip: login, reuse, cancel, and MCP Bearer', async 
     expect(registrations).toBe(1);
     expect(repeated).not.toBe(first);
     expect(loadTokens(base, storePath)).toMatchObject({ accountUuid: 'client-1', tokens: { accessToken: 'access-2', refreshToken: 'refresh-2' } });
+    const repeatedCredentials = { clientId: loadTokens(base, storePath)?.accountUuid, accessToken: '[redacted]', refreshToken: '[redacted]' };
     phase = 'cancel'; deny = true;
     expect((await login()).exitCode).toBe(1);
     const cancelled = readFileSync(storePath, 'utf8');
     expect(cancelled).toBe(repeated);
+    const cancelledTokens = loadTokens(base, storePath);
+    expect(cancelledTokens).toMatchObject({ accountUuid: 'client-1', tokens: { accessToken: 'access-2', refreshToken: 'refresh-2' } });
+    const cancelledCredentials = { clientId: cancelledTokens?.accountUuid, accessToken: '[redacted]', refreshToken: '[redacted]' };
     expect(exchanges).toBe(2);
     expect(requests.filter((entry) => entry.phase === 'first').map((entry) => entry.path.split('?')[0])).toEqual([
-      '/mcp', '/meta', '/.well-known/oauth-authorization-server', '/meta',
-      '/.well-known/oauth-authorization-server', '/meta', '/.well-known/oauth-authorization-server',
+      '/mcp', '/meta', '/.well-known/oauth-authorization-server',
       '/register', '/authorize', '/token',
     ]);
     expect(requests.filter((entry) => entry.path === '/register')).toHaveLength(1);
@@ -224,12 +235,22 @@ test('local HTTP OAuth round trip: login, reuse, cancel, and MCP Bearer', async 
     expect(requests.filter((entry) => entry.phase === 'client' && entry.path === '/mcp').every((entry) => entry.authorization === 'Bearer access-2')).toBe(true);
     expect(requests.filter((entry) => entry.phase === 'client' && entry.path === '/mcp')).toHaveLength(3);
     expect(readFileSync(storePath, 'utf8')).toBe(cancelled);
+    console.log('HTTP-OAUTH-TRANSCRIPT ' + JSON.stringify(transcript.map((entry) => ({
+      phase: entry.phase,
+      request: entry.request.replace(/(code_verifier|device_code|client_secret|refresh_token)=[^& ]+/g, '$1=[redacted]')
+        .replace(/(state|code_challenge|code)=([^& ]+)/g, '$1=[redacted]'),
+      response: entry.response.replace(/"(access_token|refresh_token|device_code|client_secret)":"[^"]+"/g, '"$1":"[redacted]"')
+        .replace(/(state|code)=[^& ]+/g, '$1=[redacted]'),
+    }))));
     console.log('HTTP-OAUTH-ROUNDTRIP ' + JSON.stringify({ requests: requests.map((entry) => ({
       phase: entry.phase, method: entry.method, path: entry.path.split('?')[0],
       hasBody: entry.body.length > 0, hasBearer: entry.authorization?.startsWith('Bearer ') ?? false,
     })), credentials: {
-      beforeAbsent: before === null, firstStored: first.length > 0,
-      repeatedRotated: repeated !== first, cancelPreserved: cancelled === repeated,
+      before: before === null ? 'absent' : 'present',
+      afterFirst: firstCredentials,
+      afterRepeat: repeatedCredentials,
+      afterCancel: cancelledCredentials,
+      firstStored: first.length > 0, repeatedRotated: repeated !== first, cancelPreserved: cancelled === repeated,
     }, config: { issuerPersisted: config.mcp.servers[0]!.oauthIssuer === base,
       tokenEndpointPersisted: config.mcp.servers[0]!.oauthTokenEndpoint === `${base}/token` },
     exitCodes: [0, 0, 1], cliLineCount: lines.length }));

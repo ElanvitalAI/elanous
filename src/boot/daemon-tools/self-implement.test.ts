@@ -16,6 +16,7 @@ import type { SurfaceUx } from '../../agent/surface-ux/types.js';
 import { setUserConfigOverlay } from '../../user-config.js';
 import { _setAutoOpenPrConfigReaderForTesting } from '../../self-implement/auto-open-pr.js';
 import { writeAuthoredGoal } from '../../self-implement/goal-author.js';
+import { injectGoalDocumentClarificationAnswer } from '../../self-implement/goal-author-clarification.js';
 import { debug } from '../../debug/log.js';
 import { DecisionLedger } from '../../decisions/decision-ledger.js';
 
@@ -94,6 +95,12 @@ describe('SelfImplement daemon spec', () => {
       expect(description).toContain(example);
     }
   });
+
+  test('goalFile 재개 인자는 데몬 경로에만 노출한다', () => {
+    const properties = buildSelfImplementDaemonSpec().parameters.properties as Record<string, Record<string, unknown>>;
+    expect(properties.goalFile).toMatchObject({ type: 'string' });
+    expect(properties.goalFile?.description).toContain('같은 골을 다시 실행');
+  });
 });
 
 test('safety clarification records a decision but withholds launch until the goal is edited and rerun', async () => {
@@ -104,9 +111,10 @@ test('safety clarification records a decision but withholds launch until the goa
   });
   const stateDir = mkdtempSync(join(tmpdir(), 'self-implement-clarification-state-'));
   const goalRoot = mkdtempSync(join(tmpdir(), 'self-implement-safety-goal-'));
-  const goalFile = join(goalRoot, 'GOAL.md');
+  const goalFile = join(goalRoot, '.elanous', 'goals', 'GOAL-payment.md');
   const previousStateDir = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = stateDir;
+  mkdirSync(dirname(goalFile), { recursive: true });
   writeFileSync(goalFile, [
     '## WHAT TO BUILD',
     'Question: UNANSWERED — payment_target',
@@ -150,10 +158,25 @@ test('safety clarification records a decision but withholds launch until the goa
     console.info(`[self-implement-safety-clarification] ledger read complete; decisions=${decisions.length}`);
     expect(runnerCalls).toBe(0);
     expect(result).toMatchObject({ kind: 'failed' });
-    expect(JSON.stringify(result)).toContain('record the answer in the goal document and rerun SelfImplement');
+    expect(JSON.stringify(result)).toContain(`Record the answer in ${goalFile}`);
     expect(decisions).toHaveLength(1);
     expect(decisions[0]?.options[0]).toMatchObject({ label: '답을 골 문서에 반영 후 재실행' });
     expect(decisions[0]?.options[0]?.consequence).toContain('다시 호출한다');
+    expect(result).toMatchObject({ goalFile, next: expect.stringContaining(`goalFile=${goalFile}`) });
+    expect(JSON.stringify(result)).toContain('A decision-card choice alone does not resume the run');
+
+    writeFileSync(goalFile, injectGoalDocumentClarificationAnswer(readFileSync(goalFile, 'utf8'), 'payment_target', 'Do not charge the customer'));
+    const resumed = await dispatchSelfImplement(
+      { feature: 'safety clarification', goalFile },
+      { cwd: goalRoot, signal: new AbortController().signal, entry: 'elanous-apparatus', userText: 'safety clarification' },
+      async () => {
+        runnerCalls += 1;
+        return { runId: 'resumed-safety-goal', ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed' };
+      },
+      async () => { throw new Error('resume must reuse the authored goal rather than authoring a replacement'); },
+    );
+    expect(resumed).toMatchObject({ kind: 'launched', runId: 'resumed-safety-goal' });
+    expect(runnerCalls).toBe(1);
   } finally {
     if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previousStateDir;
@@ -161,6 +184,55 @@ test('safety clarification records a decision but withholds launch until the goa
     rmSync(goalRoot, { recursive: true, force: true });
   }
 }, 30_000);
+
+test('resolver failure on an ordinary unanswered clarification returns failed without a popup or runner launch', async () => {
+  const goalRoot = mkdtempSync(join(tmpdir(), 'self-implement-helper-failure-'));
+  const goalFile = join(goalRoot, '.elanous', 'goals', 'GOAL-helper.md');
+  mkdirSync(join(goalRoot, '.elanous', 'goals'), { recursive: true });
+  writeFileSync(goalFile, [
+    '## WHAT TO BUILD',
+    '- Clarification:', '  - id: target', '  - header: Scope', '  - question: Which requested file should change?',
+    '  - options:', '    - label: Modify the target file', '      description: Keep the work within the named file.',
+    '  - includeOther: true', '  - answer: DEFERRED-UNTIL: Which requested file should change?', '',
+  ].join('\n'));
+  let runnerCalls = 0;
+  try {
+    const result = await dispatchSelfImplement(
+      { feature: 'helper failure clarification' },
+      { cwd: goalRoot, signal: new AbortController().signal, entry: 'elanous-apparatus', userText: 'Implement the requested change.' },
+      async () => { runnerCalls += 1; return { runId: 'unexpected-helper-run', ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed' }; },
+      async () => ({ path: goalFile }),
+      undefined,
+      undefined,
+      async () => { throw new Error('resolver unavailable'); },
+    );
+    expect(result).toMatchObject({ kind: 'failed', reason: expect.stringContaining('clarification remains unanswered') });
+    expect(JSON.stringify(result)).toContain('human popup');
+    expect(runnerCalls).toBe(0);
+    expect(readFileSync(goalFile, 'utf8')).toContain('answer: DEFERRED-UNTIL:');
+  } finally {
+    rmSync(goalRoot, { recursive: true, force: true });
+  }
+});
+
+test('goal-file resume rejects paths outside the repository before authoring or launching', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'self-implement-goal-resume-boundary-'));
+  let runnerCalls = 0;
+  let authorCalls = 0;
+  try {
+    const result = await dispatchSelfImplement(
+      { feature: 'resume goal', goalFile: '/etc/passwd' },
+      { cwd, signal: new AbortController().signal, entry: 'elanous-apparatus', userText: 'resume goal' },
+      async () => { runnerCalls += 1; return { runId: 'unexpected-resume', ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed' }; },
+      async () => { authorCalls += 1; return { path: join(cwd, 'GOAL-generated.md') }; },
+    );
+    expect(result).toMatchObject({ kind: 'failed', reason: expect.stringContaining('inside the repository') });
+    expect(runnerCalls).toBe(0);
+    expect(authorCalls).toBe(0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 describe('dispatchSelfImplement — result addressability', () => {
   beforeEach(() => setUserConfigOverlay((config) => ({

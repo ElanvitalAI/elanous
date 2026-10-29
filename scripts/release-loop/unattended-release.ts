@@ -49,6 +49,7 @@ export interface ReleaseLoopConfig {
 export interface ReleaseRunInput extends ReleaseLoopConfig {
   version: string;
   previousVersion: string;
+  triggerEvent?: { id: string; type: 'release.cut.due'; version: string; cutAt: string; at: string };
   cutCommit?: string;
   /** Required for the pod executor (the default); a host-executor run may have none. */
   gatePodPool?: string;
@@ -143,7 +144,7 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
 
 /** Fail closed at the entry boundary, before any graph node can change a release. */
 export async function runUnattendedRelease(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
   deps: UnattendedReleaseDeps = {},
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // A dry run only builds the input and mutates nothing, so it neither creates nor waits on the OP-seat lock.
@@ -154,7 +155,7 @@ export async function runUnattendedRelease(
 }
 
 async function runUnattendedReleaseLocked(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
   deps: UnattendedReleaseDeps,
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // RELEASE-BRANCH (10-06): the default cut is a release branch, so main keeps landing and the run no longer needs a
@@ -171,6 +172,7 @@ async function runUnattendedReleaseLocked(
   }
   const version = resolveRunVersion(opts.version, opts.prerelease, deps);
   const input = buildReleaseRunInput(version, deps, opts.cutCommit, { executor: opts.gateExecutor, host: opts.gateHost });
+  if (opts.triggerEvent) input.triggerEvent = opts.triggerEvent;
   if (opts.publishAt !== undefined) {
     const invalid = publishAtError(opts.publishAt);
     if (invalid) throw new Error(invalid);

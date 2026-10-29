@@ -56,6 +56,8 @@ export interface TickState {
   /** ORCH-TA-HAND — cells handed to TASK-AGENT this run (card id · mode · launched). */
   handed?: Array<{ key: string; cell: string; cardId: string; mode: 'shadow' | 'live'; launched: boolean }>;
   queueOutcomes?: Array<{ queueId: string; key?: string; outcome: string }>;
+  /** COORD-ABSORB-OP-BRIDGES-FU — coordinator 수신 소비(버스 배수)의 이번 run 누적. 노드마다 배수한 replied·acknowledged 를 더해 durable 상태 파일에 남긴다. */
+  inbox?: { replied: number; acknowledged: number };
   steps: Array<{ node: Node; reason: string; count: number; targetLoopId?: string }>;
   nodes: Partial<Record<Node, 'ok' | 'skipped'>>;
   missing: string[];
@@ -131,6 +133,47 @@ function handedKeys(path: string): Set<string> {
     if (row.status === 'released') keys.delete(row.key); else keys.add(row.key);
   }
   return keys;
+}
+
+/** COORD-ONE 조각 1 — coordinator shadow 의 TASK-AGENT 판정 소비 원장 행: `handKey`(넘김 원장 행 키, shadow: 접두 포함)가 중복 소비를 막는 식별자다. */
+type ConsumedVerdictRow = { at: string; runId: string; key: string; cell: string; cardId: string; mode: 'shadow' | 'live'; launched: boolean; handKey: string; handRunId?: string; consumed: true };
+function coordVerdictLedger(root: string): string { return join(root, 'loop', 'orchestrator', 'coord-verdicts.jsonl'); }
+/** 소비 원장이 완료로 표시한 판정들의 넘김 행 키 — 같은 판정은 두 번 소비되지 않는다. */
+function consumedVerdictHandKeys(path: string): Set<string> {
+  const keys = new Set<string>();
+  if (!existsSync(path)) return keys;
+  for (const line of readFileSync(path, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    let row: Partial<ConsumedVerdictRow>;
+    try { row = JSON.parse(line) as typeof row; } catch { throw new Error('invalid coordinator verdict ledger'); }
+    if (row.consumed === true && typeof row.handKey === 'string') keys.add(row.handKey);
+  }
+  return keys;
+}
+/**
+ * COORD-ONE 조각 1 — tick 진입에서 coordinator shadow 가 TASK-AGENT 판정 1건(완료 넘김 행)을 소비한다.
+ * 소비는 기록 전용이다: 소비 원장에 완료 표시 한 줄을 남길 뿐 넘김 원장·자리 저널·발사 어느 live 부수효과도 내지 않고
+ * seat-loop 기본 발사 경로도 그대로 둔다(스튜어드 흡수·좌석 이관은 후속 조각). 원장을 못 읽는 진입은 소비 0건으로 끝난다.
+ */
+function consumeTaskAgentVerdict(root: string, runId: string, now: Date): void {
+  try {
+    const handLedger = handedLedger(root);
+    if (!existsSync(handLedger)) return;
+    const path = coordVerdictLedger(root);
+    const consumed = consumedVerdictHandKeys(path);
+    const verdict = [...handedRows(handLedger)].find(([handKey]) => !consumed.has(handKey));
+    if (!verdict) return;
+    const [handKey, row] = verdict;
+    const key = handKey.replace(/^shadow:/, '');
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify({ at: now.toISOString(), runId, key, cell: row.cell, cardId: row.cardId,
+      mode: row.mode, launched: row.launched, handKey, ...(row.runId ? { handRunId: row.runId } : {}), consumed: true } as ConsumedVerdictRow)}\n`);
+    try { debug.log('loop.orchestrator', 'coord-verdict', { runId, key, mode: row.mode, launched: row.launched }); }
+    catch { /* 관측이 소비를 바꾸지 않는다 */ }
+  } catch (error) {
+    try { debug.log('loop.orchestrator', 'coord-verdict-unreadable', { error: String(error).slice(0, 200) }, { level: 'warn' }); }
+    catch { /* a failed observation cannot change the tick */ }
+  }
 }
 
 export function kstWindow(now: Date): Window {
@@ -529,11 +572,16 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
             ...(deps.coordinatorKnowhow === undefined ? {} : { knowhow: deps.coordinatorKnowhow }),
             ...(deps.coordinatorContext ? { context: deps.coordinatorContext } : {}) });
     }))();
+    // 생산 tick 경로의 실행 원문: 배수 결과를 이벤트로만 남기지 않고 run 상태에 누적해 다른 프로세스(보호자·리뷰)가 파일로 관측하게 한다.
+    state.inbox = { replied: (state.inbox?.replied ?? 0) + inbox.replied, acknowledged: (state.inbox?.acknowledged ?? 0) + inbox.acknowledged };
     if (inbox.replied || inbox.acknowledged) {
       observe('exchange', 'coordinator-inbox-replied', inbox.replied);
       observe('exchange', 'coordinator-inbox-acknowledged', inbox.acknowledged);
     }
   }
+  // COORD-ONE 조각 1 — tick 진입에서 coordinator shadow 가 TASK-AGENT 판정 1건을 소비한다: 소비 원장 기록이 전부고
+  // live 부수효과(운영 발사·자리 루프 은퇴)는 0, seat-loop 기본 발사 경로는 그대로다(흡수·이관은 후속 조각).
+  if (mode !== 'off') consumeTaskAgentVerdict(root, runId, now);
   if (mode !== 'off' && activeNode(node, window) && state.nodes[node] !== 'ok') {
     if (node === 'intake') {
       if (mode === 'live' && deps.cards) { state.cards = wishCards(deps.cards()); state.skippedCards = []; }

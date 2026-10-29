@@ -17,6 +17,7 @@ import {
   type SessionMeta, type SerializedMessage, type CreateSessionOpts,
 } from './index.js';
 import { debug } from '../debug/log.js';
+import { createRequestSizeGuard, formatRequestSizeStatus, type RequestSizeGuard } from './request-size-guard.js';
 import type { InputSourceKind } from '../input/input-source-kind.js';
 import {
   getProviderForConfig, streamLLMWithTools, type LLMMessage, type LLMOpts, type LLMProvider,
@@ -400,65 +401,41 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     return trimToBudget(wire, opts.maxTokens ?? DEFAULT_TOKEN_BUDGET);
   };
 
-  let measuredProviderRequests = 0;
-  const requestSizeGuard: NonNullable<LLMOpts['requestSizeGuard']> | undefined =
+  const requestSizeGuard: RequestSizeGuard | undefined =
     meta.source === 'tui' && provider.name === 'openai-codex'
-      ? {
-          maxChars: 400_000,
-          compactMessages: async (currentMessages) => {
-            // The first request has only the persisted transcript plus this
-            // user turn, so use the shared session compactor and rebuild from
-            // the rewritten history. Later tool rounds compact their live
-            // message list so no just-produced tool context is lost.
-            if (measuredProviderRequests === 0) {
-              const { compactSessionHistory } = await import('./compact-session.js');
-              const result = await compactSessionHistory(opts.sessionId, {
-                config: opts.userConfig.chat.autoCompact,
-                force: true,
-                modelId: llmOpts?.model ?? provider.defaultModel,
-              });
-              if (result.fired) {
-                const refreshed = loadSession(opts.sessionId);
-                if (refreshed) {
-                  // The persisted compacted session includes this turn's
-                  // user message. Drop that final persisted row here, then
-                  // assembleTurnMessages re-adds the canonical userMsg and
-                  // any image blocks from opts.userImages exactly once.
-                  messages = refreshed.messages.slice(0, -1);
-                  const rebuilt = assembleTurnMessages(effectiveSystemPrompt).kept;
-                  return { messages: rebuilt, reason: `session-${result.reason}` };
-                }
-              }
-            }
-
-            const { runCompactPipeline } = await import('../compact/pipeline.js');
-            const { getDefaultCompactProvider } = await import('../compact/provider.js');
-            const compacted = await runCompactPipeline(currentMessages, {
-              sessionId: opts.sessionId,
-              provider: getDefaultCompactProvider(),
-              activeModelId: llmOpts?.model ?? provider.defaultModel,
-              policy: {
-                preserveLastN: opts.userConfig.chat.autoCompact.preserveLastN,
-                archiveEnabled: opts.userConfig.chat.compact.archiveEnabled,
-              },
+      ? createRequestSizeGuard({
+          compactOptions: () => ({
+            sessionId: opts.sessionId,
+            activeModelId: llmOpts?.model ?? provider.defaultModel,
+            preserveLastN: opts.userConfig.chat.autoCompact.preserveLastN,
+            archiveEnabled: opts.userConfig.chat.compact.archiveEnabled,
+          }),
+          // The first request has only the persisted transcript plus this
+          // user turn, so use the shared session compactor and rebuild from
+          // the rewritten history. Later tool rounds compact their live
+          // message list (shared guard) so no just-produced tool context is lost.
+          compactFirstRequest: async () => {
+            const { compactSessionHistory } = await import('./compact-session.js');
+            const result = await compactSessionHistory(opts.sessionId, {
+              config: opts.userConfig.chat.autoCompact,
+              force: true,
+              modelId: llmOpts?.model ?? provider.defaultModel,
             });
-            const diagnostics = compacted.diagnostics;
-            const changed = diagnostics.layer1ResponsesTrimmed > 0
-              || diagnostics.layer2MicrocompactCleared > 0
-              || diagnostics.layer3SummaryApplied === 1
-              || diagnostics.layer5FallbackTruncated === 1;
-            return changed
-              ? { messages: compacted.messages, reason: 'live-request-compact' }
-              : null;
+            if (!result.fired) return null;
+            const refreshed = loadSession(opts.sessionId);
+            if (!refreshed) return null;
+            // The persisted compacted session includes this turn's
+            // user message. Drop that final persisted row here, then
+            // assembleTurnMessages re-adds the canonical userMsg and
+            // any image blocks from opts.userImages exactly once.
+            messages = refreshed.messages.slice(0, -1);
+            const rebuilt = assembleTurnMessages(effectiveSystemPrompt).kept;
+            return { messages: rebuilt, reason: `session-${result.reason}` };
           },
           onMeasured: (measurement) => {
-            measuredProviderRequests += 1;
-            opts.onStatusLine?.(
-              `ctx ${measurement.requestChars.toLocaleString()} chars / ${measurement.maxChars.toLocaleString()}`
-              + (measurement.compacted ? ` · compact ${measurement.reason}` : ''),
-            );
+            opts.onStatusLine?.(formatRequestSizeStatus(measurement));
           },
-        }
+        })
       : undefined;
 
   let kept: LLMMessage[] = [];

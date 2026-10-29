@@ -55,6 +55,19 @@ export function resetFrontVisitCountsForTesting(now?: () => number): void {
   lastFrontVisitPruneMs = Number.NEGATIVE_INFINITY;
 }
 
+/** Explicit context carried by a front-node handler. The same object can grow to
+ *  hold authoring evidence and budget/checkpoint data without changing handlers. */
+export interface FrontNodeUnitContext {
+  readonly runId?: string;
+  readonly goalType?: GoalType;
+}
+
+/** A front-half processing unit with an explicit input, context, and output. */
+export interface FrontNodeUnit<Input, Output> {
+  readonly node: FrontNodeId;
+  readonly execute: (input: Input, context: FrontNodeUnitContext) => Promise<Output>;
+}
+
 /** Record the actual front-half execution boundary, without controlling the stage. */
 export async function observeFrontNodeUnit<T>(node: FrontNodeId, runId: string | undefined, goalType: GoalType | undefined, execute: () => Promise<T>): Promise<T> {
   const emit = (phase: 'enter' | 'exit'): void => {
@@ -72,6 +85,16 @@ export async function observeFrontNodeUnit<T>(node: FrontNodeId, runId: string |
   emit('enter');
   try { return await execute(); }
   finally { emit('exit'); }
+}
+
+/** Execute one typed front-node unit while preserving the caller's context and
+ *  the fail-soft graph.unit observation contract. */
+export function runFrontNodeUnit<Input, Output>(
+  unit: FrontNodeUnit<Input, Output>,
+  input: Input,
+  context: FrontNodeUnitContext,
+): Promise<Output> {
+  return observeFrontNodeUnit(unit.node, context.runId, context.goalType, () => unit.execute(input, context));
 }
 
 function pruneIdleFrontVisitRuns(nowMs: number): void {

@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { createProject, getProject, listProjects, ProjectStore, relationsOf, suggestProjectForFolder } from './project-store.js';
+import { anonymousExport, anonymousToken, createProject, getProject, listProjects, ProjectStore, relationsOf, suggestProjectForFolder } from './project-store.js';
 
 let root: string;
 beforeEach(() => {
@@ -136,4 +136,41 @@ test('round-trips all four relation types through save and read', () => {
   expect(loaded).toEqual(record);
   expect(relationsOf(loaded!)).toEqual(relations);
   expect(listProjects().find(item => item.id === created.id)).toEqual(record);
+});
+
+test('TENANT-BOUNDARY: 고객 프로젝트 원장은 익명 내보내기만 나간다', () => {
+  const secret = 'Acme 트레이딩';
+  const folder = '/home/acme/private/trading';
+  const created = createProject({ name: secret, primaryFolder: folder });
+  const other = createProject({ name: 'Other' });
+  const exported = anonymousExport({ ...created, relations: [{ type: 'dependsOn' as const, target: other.id }] });
+
+  expect(JSON.stringify(exported)).not.toContain(secret);
+  expect(JSON.stringify(exported)).not.toContain('acme');
+  expect(exported.id).toBe(created.id);
+  expect(exported.createdAt).toBe(created.createdAt);
+  expect(exported.name).toMatch(/^project-[0-9a-f]{16}$/);
+  expect(exported.primaryFolder).toMatch(/^folder-[0-9a-f]{16}$/);
+  expect(exported.relations).toEqual([{ type: 'dependsOn', target: other.id }]);
+
+  const b = createProject({ name: 'B' });
+  expect(anonymousExport(created).name).toBe(exported.name);
+  expect(anonymousExport(created).name).not.toBe(anonymousExport(b).name);
+  expect('primaryFolder' in anonymousExport(b)).toBe(false);
+});
+
+test('TENANT-BOUNDARY: 익명 토큰 salt는 설치별 비밀로 저장되고 다른 설치와 연결되지 않는다', () => {
+  const token = anonymousToken('project', 'low-entropy project name');
+  const secretPath = join(root, 'tenant-boundary-secret');
+  expect(readFileSync(secretPath)).toHaveLength(32);
+  expect(statSync(secretPath).mode & 0o777).toBe(0o600);
+
+  const otherRoot = mkdtempSync(join(tmpdir(), 'elanous-project-store-other-install-'));
+  try {
+    setElanousConfigDir(otherRoot);
+    expect(anonymousToken('project', 'low-entropy project name')).not.toBe(token);
+  } finally {
+    setElanousConfigDir(root);
+    rmSync(otherRoot, { recursive: true, force: true });
+  }
 });

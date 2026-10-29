@@ -5,8 +5,8 @@
 #   stop_class == main-sync          → rebase-regate
 #   stop_class == pod-died           → resume-from-salvage
 #   stop_class == evidence-uncovered → derive-evidence-rejudge
-# ⛔ 이 넷 밖의 갈래(review-repeat · review-out-of-scope · scope-escape · fabric · launch-failed · unclassified)는 선언이 «없다» —
-#   처방은 `needs-owner` 이고 그것은 코드 기본(`AUTOHEAL_ACTION_BY_CLASS`)이 말한다.
+#   stop_class == review-budget-exhausted → review-round-reauthor
+# ⛔ 일반 반복·범위 밖·scope-escape·fabric·launch-failed·gate-failed·unclassified는 `needs-owner`로 남긴다.
 #
 # 🔑 노드 id 가 곧 처방 이름이다. `src/self-implement/stop-autoheal.ts` 는 그 갈래에 얹힌 오버레이가 «더한 노드 id» 로
 #   처방을 고르고, 선언이 없거나 못 읽으면 코드 표로 간다(원장·관측의 `source` = graph | code-default).
@@ -103,3 +103,24 @@ patch:
   - op: add
     path: /edges/-
     value: { from: derive-evidence-rejudge, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-review-budget-exhausted
+target: self-implement
+stage: heal
+applies_when: stop_class == review-budget-exhausted
+patch:
+  - op: add
+    path: /nodes/-
+    value:
+      nodeId: review-round-reauthor
+      kind: judge
+      recipe: review-round-reauthor
+      maxVisits: 1
+      journeyStage: recover
+      contract: { inputs: [goal, review-history], tools: read-only, outputs: [partial-landing, follow-up-goal] }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { review-budget-exhausted: review-round-reauthor } }
+  - op: add
+    path: /edges/-
+    value: { from: review-round-reauthor, on: outcome, map: { healed: dispatch, follow-up: stopped, needs-owner: stopped } }

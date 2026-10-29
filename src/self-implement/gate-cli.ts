@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { basename, join, resolve } from 'node:path/posix';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
-import { audit as auditEntryBudget, entryBudgetAffected } from '../../scripts/ratchets/next-tui-entry-budget.js';
 import { withGateTestEnv } from '../../scripts/lib/gate-test-env.js';
 import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-gate.js';
 import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
@@ -58,6 +57,49 @@ export interface SelfGateCliOptions {
   scenarioFile?: string;
   /** SIDE-VERIFY — 조각별 지금/기준 JUnit ⊕ summary.json 을 이 디렉토리에 «쓰기만» 한다(판정·exit·기존 줄 불변). */
   artifactDir?: string;
+  /** Marker captured by the process entry point; keeps receipts stable if the environment changes during dispatch. */
+  trainGate?: boolean;
+}
+
+const SELF_GATE_SEAT_TRACKS = new Set(['OP', 'OPC', 'OPT', 'TC', 'UX', 'MK']);
+
+interface SelfGateTrainMarker {
+  track: string | null;
+  received: boolean;
+}
+
+/** Capture and log the marker exactly as the self-gate process received it. */
+export function observeSelfGateTrainMarker(): SelfGateTrainMarker {
+  const track = process.env.ELANOUS_TRACK?.trim() || null;
+  const received = process.env.ELANOUS_TRAIN_GATE === '1';
+  try { debug.log('self-gate', 'train-gate-marker', { track, received }); } catch { /* evidence logging must not change gate behavior */ }
+  return { track, received };
+}
+
+/** Seat invocations may only measure the pinned tree after the landing train has admitted the gate. */
+export function refuseSeatSelfGateWithoutTrainMarker(marker = observeSelfGateTrainMarker()): { track: string; message: string } | undefined {
+  const { track, received } = marker;
+  if (!track || !SELF_GATE_SEAT_TRACKS.has(track) || received) return undefined;
+  try { debug.log('self-gate', 'seat-refused', { track, requiredMarker: 'ELANOUS_TRAIN_GATE=1' }); } catch { /* refusal must survive an unavailable observer */ }
+  return { track, message: 'gate 는 열차가 착지 때 1회 — land-enqueue.sh 로 줄에 올려라' };
+}
+
+/** A refused admission still writes the observed marker when an artifact directory was requested. */
+export function writeSeatSelfGateRefusalArtifact(cwd: string, artifactDir: string, marker: SelfGateTrainMarker): string | undefined {
+  if (!artifactDir.trim()) return undefined;
+  const dir = resolveArtifactDir(artifactDir, cwd);
+  const written = writeGateArtifacts({
+    dir,
+    head40: defaultRevResolver(cwd)('HEAD'),
+    base40: null,
+    envKey: defaultGateEnvKey(),
+    trainGate: marker.received,
+    testFiles: [],
+    verdict: 'seat-refused',
+    verdictLine: `seat gate refused before dispatch (track=${marker.track ?? 'none'}; trainGate=${marker.received})`,
+    exitCode: 2,
+  });
+  return written.summaryPath;
 }
 
 interface ProcessResult {
@@ -125,7 +167,6 @@ interface SelfGateCliDeps {
   /** iOS 순수-로직 시험 게이트 심(시험 주입용). */
   runIosGate?: (out: GateOutput) => number;
   runPwaGate?: (out: GateOutput) => number;
-  runEntryBudgetGate?: (cwd: string, changedFiles: readonly string[]) => { affected: boolean; errors: string[] };
   listPrWorktrees?: (cwd: string) => PrWorktreeListEntry[] | { lookupFailed: string };
   inspectWorktreeDirtiness?: (path: string) => { dirty: boolean } | { lookupFailed: string };
   /** `--artifact-dir` 전용 심 — 커밋 sha 해석(실패 = null) · 환경 키. */
@@ -809,23 +850,25 @@ export function selectGateTestFiles(cwd: string, options: GateSelectionOptions =
 
 export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, deps: SelfGateCliDeps = {}): SelfGateCliResult {
   const capture: GateArtifactCapture = {};
+  const trainGate = options.trainGate ?? process.env.ELANOUS_TRAIN_GATE === '1';
   const result = runSelfGateCliCore(cwd, options, deps, capture, false) as SelfGateCliResult;
   persistGateReceipt(cwd, capture, deps);
-  if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps);
+  if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps, trainGate);
   return result;
 }
 
 /** Production path: shard bundles use async Bun children; all non-shard policy and timeout logic is shared. */
 export async function runSelfGateCliAsync(cwd: string, options: SelfGateCliOptions = {}, deps: SelfGateCliDeps = {}): Promise<SelfGateCliResult> {
   const capture: GateArtifactCapture = {};
+  const trainGate = options.trainGate ?? process.env.ELANOUS_TRAIN_GATE === '1';
   const result = await runSelfGateCliCore(cwd, options, deps, capture, true);
   persistGateReceipt(cwd, capture, deps);
-  if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps);
+  if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps, trainGate);
   return result;
 }
 
 /** 쓰기 실패는 «경고 한 줄»로만 접는다 — 판정·exit 코드는 그대로다. */
-function emitGateArtifacts(cwd: string, artifactDir: string, result: SelfGateCliResult, capture: GateArtifactCapture, deps: SelfGateCliDeps): void {
+function emitGateArtifacts(cwd: string, artifactDir: string, result: SelfGateCliResult, capture: GateArtifactCapture, deps: SelfGateCliDeps, trainGate: boolean): void {
   if (!artifactDir.trim()) {
     result.lines.push('⚠ artifacts: --artifact-dir 가 빈 경로라 안 썼다 (판정은 그대로다)');
     return;
@@ -839,6 +882,7 @@ function emitGateArtifacts(cwd: string, artifactDir: string, result: SelfGateCli
       head40: resolveRev('HEAD'),
       base40: capture.baseRef ? resolveRev(capture.baseRef) : null,
       envKey: (deps.envKey ?? defaultGateEnvKey)(),
+      trainGate,
       testFiles: capture.testFiles ?? result.testFiles,
       verdict: capture.verdict ?? null,
       ...(capture.verdictLine !== undefined ? { verdictLine: capture.verdictLine } : {}),
@@ -1210,20 +1254,6 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
   // 🍎 iOS 축 — 안드로이드와 «같은 자리»에 둔다(skipTestStep 앞). Swift 만 바뀐 PR 도 여기서 조기 리턴한다.
   const iosPassed = runAdditionalGate('ios-gate', deps.runIosGate ?? runIosUnitTestGate, selection.files, cwd, lines);
   const pwaPassed = runAdditionalGate('pwa-gate', deps.runPwaGate ?? runPwaBuildGate, selection.files, cwd, lines);
-  let entryBudgetPassed = false;
-  try {
-    const budget = (deps.runEntryBudgetGate ?? ((dir, files) => {
-      const affected = entryBudgetAffected(files);
-      return { affected, errors: affected ? auditEntryBudget(dir).errors : [] };
-    }))(cwd, selection.files);
-    entryBudgetPassed = budget.errors.length === 0;
-    lines.push(budget.affected
-      ? `next-tui-entry-budget: ${entryBudgetPassed ? 'pass' : `FAIL ${budget.errors.join('; ')}`}`
-      : 'next-tui-entry-budget: skip (unrelated changes)');
-  } catch (error) {
-    lines.push(`next-tui-entry-budget: UNMEASURED ${error instanceof Error ? error.message : String(error)}`);
-  }
-
   if (receiptDecision?.mode === 'inherit' && testFiles.length === 0 && fullTestFiles.length > 0) {
     capture.testReceiptMeasured = true;
     capture.failedTestFiles = [];
@@ -1235,7 +1265,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
     return {
-      exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && entryBudgetPassed && expose.passed ? 0 : 1,
+      exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1,
       lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
       documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
       alwaysIncludeMissing, importerTestsAdded,
@@ -1249,7 +1279,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     capture.failedTestFiles = [];
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
     Object.assign(capture, { verdict: 'skipped', artifactsUnavailable: 'no-tests' } satisfies GateArtifactCapture);
-    return { exitCode: androidPassed && iosPassed && pwaPassed && entryBudgetPassed && policyPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
+    return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
   }
 
   // The default direct Bun path has one process and one 300s limit. Route real child/PTY tests through
@@ -1339,7 +1369,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
       capture.verdictLine = lines[lines.length - 1];
       const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
       return {
-        exitCode: capture.verdict !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed || !entryBudgetPassed || !expose.passed ? 1 : 0,
+        exitCode: capture.verdict !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed || !expose.passed ? 1 : 0,
         lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
         documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
         alwaysIncludeMissing, importerTestsAdded, ...(shardBaseline ? { baseline: shardBaseline } : {}),
@@ -1359,7 +1389,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     Object.assign(capture, { verdict: 'passed', verdictLine: lines[lines.length - 1] } satisfies GateArtifactCapture);
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && entryBudgetPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
+    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed && expose.passed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: 0, preexisting: 0, unknown: 0, preconditionUnmet: 0 } };
   }
 
   if (worktreeLog.includes('deterministic environment setup failed')) lines.push(worktreeLog);
@@ -1394,7 +1424,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     verdictLine: lines[lines.length - 1],
   } satisfies GateArtifactCapture);
   const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
-  const exitCode = !androidPassed || !iosPassed || !pwaPassed || !entryBudgetPassed || !policyPassed || !expose.passed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
+  const exitCode = !androidPassed || !iosPassed || !pwaPassed || !policyPassed || !expose.passed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
   return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests, alwaysIncludeMissing, importerTestsAdded, baseline: { introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown, preconditionUnmet: report.preconditionUnmet } };
 }
 

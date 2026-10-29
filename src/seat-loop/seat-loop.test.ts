@@ -25,6 +25,7 @@ import { writePersonaTodos } from '../persona/persona-todo.js';
 import { FORBID_JUDGMENT_LINE, alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runPersonaLoopOnce, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, seatLoopLaunchCommand, seatLoopLaunchSeat, seatLoopTickLine, seatTargetPaths, seatTaskText, type SeatDeps, type SeatItem } from './seat-loop.js';
 import { parseAskTargetPathHints } from '../self-dev/launch-preflight.js';
 import { SEAT_PACK_TOTAL_BUDGET_CHARS } from './seat-knowhow.js';
+import { runOrchestratorNode } from '../loops/orchestrator/tick.js';
 // The owner mark is assembled at runtime so the public export carries no literal (LEAK1).
 const CEO = '\u{1F451}';
 
@@ -2138,6 +2139,50 @@ test('on: harness say once, runId recorded, next loop does not reselect same cel
     expect(entries(f).find((entry) => entry.status === 'launched')?.runId).toBe('run-12345678-1234-1234-1234-123456789abc');
   } finally { f.close(); }
 });
+
+// COORD-ONE 조각 1 — tick 진입의 coordinator shadow 판정 소비가 seat-loop 기본 발사를 하나도 바꾸지 않는다(격리 실물 관측).
+test('acceptance 1코드: coordinator shadow가 TASK-AGENT 판정 1건을 tick 진입에서 소비하고 seat-loop 기본 발사를 바꾸지 않는다', async () => {
+  const fireOnce = async (withVerdict: boolean) => {
+    const f = fixture();
+    try {
+      const key = 'orch:card-1:C1';
+      writeFileSync(join(f.root, 'seat-requests', 'requests.jsonl'),
+        JSON.stringify({ key, seat: 'TC', text: '구현', status: 'pending', queuedAt: now.toISOString() }) + '\n');
+      if (withVerdict) {
+        // 소비 대기 중인 TASK-AGENT 판정 1건(완료 넘김 행) — 과제 키가 아래 의뢰와 같다.
+        mkdirSync(join(f.root, 'loop', 'orchestrator'), { recursive: true });
+        writeFileSync(join(f.root, 'loop', 'orchestrator', 'handed.jsonl'),
+          JSON.stringify({ key: `shadow:${key}`, cell: 'C1', cardId: 'card-1', mode: 'shadow', launched: false, status: 'handed', runId: 'coord-shadow', at: now.toISOString() }) + '\n');
+        // tick 진입 1회 — coordinator shadow 가 판정 1건을 소비한다(기록만).
+        await runOrchestratorNode('intake', { root: f.root, runId: 'coord-shadow', window: '08', mode: 'shadow', now, print: () => {} });
+      }
+      // 격리 seat-loop 1회 — 기본 발사 경로(pickNext → planAction → harness say)를 그대로 걷는다.
+      const calls: string[][] = [];
+      const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] },
+        run: async (args) => { calls.push(args); return args[1] === 'budget' ? '{"outcome":"proceed"}' : '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]'; } });
+      const firing = readFileSync(seatLedgerPath('TC', f.root, now), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      const verdictPath = join(f.root, 'loop', 'orchestrator', 'coord-verdicts.jsonl');
+      const consumed = existsSync(verdictPath) ? readFileSync(verdictPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line)) : [];
+      return { result, firing, calls, consumed,
+        request: JSON.parse(readFileSync(join(f.root, 'seat-requests', 'requests.jsonl'), 'utf8')) };
+    } finally { f.close(); }
+  };
+  const consumed = await fireOnce(true);
+  const control = await fireOnce(false);
+  // 동일 run/task 식별자 관측: 소비 기록은 정확히 1건이고, 그 과제 키가 발사된 의뢰와 같다.
+  expect(consumed.consumed).toEqual([{ at: now.toISOString(), runId: 'coord-shadow', key: 'orch:card-1:C1', cell: 'C1', cardId: 'card-1',
+    mode: 'shadow', launched: false, handKey: 'shadow:orch:card-1:C1', handRunId: 'coord-shadow', consumed: true }]);
+  expect(control.consumed).toEqual([]);
+  expect(consumed.firing.find((row) => row.status === 'launched')).toMatchObject({ runId: 'run-12345678-1234-1234-1234-123456789abc', item: { id: 'orch:card-1:C1' } });
+  // seat-loop 기본 발사 불변: 소비 전(대조 루트)과 발사 결과·발사 방식·호출이 같다.
+  expect(consumed.firing).toEqual(control.firing);
+  expect(consumed.calls).toEqual(control.calls);
+  expect(consumed.result).toEqual(control.result);
+  // 운영 발사 0 · 자리 루프 은퇴 0: 소비는 의뢰 행을 그대로 두고, 자리 루프는 은퇴(skipped-off)하지 않고 발사된다.
+  expect(consumed.result).toMatchObject({ status: 'launched' });
+  expect(consumed.request).toEqual({ key: 'orch:card-1:C1', seat: 'TC', text: '구현', status: 'pending', queuedAt: now.toISOString() });
+  expect(consumed.calls.map((args) => args[1])).toEqual(['budget', 'say']);
+}, 60_000);
 
 for (const [title, command, receipt, expected] of [
   ['구현', 'say', '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]', 'launched'],

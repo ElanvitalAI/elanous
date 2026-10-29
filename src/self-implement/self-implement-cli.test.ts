@@ -1,4 +1,4 @@
-import { afterEach, describe, it, expect } from 'bun:test';
+import { afterEach, describe, it, expect, spyOn } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +7,8 @@ import { classifyFailure } from '../self-dev/orchestrate.js';
 import { _setObserveOnlyConfigReaderForTesting } from './observe-only.js';
 import { planDevPipeline, type DevPipelineDeps, type DevPipelineSpec } from '../self-dev/dev-pipeline.js';
 import type { SelfImplementResult } from './orchestrator.js';
+import { setUserConfigOverlay } from '../user-config.js';
+import { debug } from '../debug/log.js';
 
 const RESULT = (over: Partial<SelfImplementResult> = {}): SelfImplementResult =>
   ({ ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed', ...over } as SelfImplementResult);
@@ -23,9 +25,64 @@ function capture(exitCode = 0, result = RESULT()) {
 
 const opts = (over: Partial<SelfImplementCliOpts> = {}): SelfImplementCliOpts => ({ ...over });
 
-afterEach(() => _setObserveOnlyConfigReaderForTesting());
+afterEach(() => { _setObserveOnlyConfigReaderForTesting(); setUserConfigOverlay(null); });
 
 describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등가)', () => {
+  it('runtime config keeps reason repair off by default and launches one repair only when explicitly enabled with paths', async () => {
+    const feature = '# Repair CLI failure\n\n## TRACED PATHS\n- src/self-implement/self-implement-cli.ts — verified target';
+    // Omit runId so terminal supervisor persistence has no key and writes no process-default state.
+    const failure = RESULT({ ok: false, stage: 'error' as never, detail: 'uncaught failure' } as never);
+    const repaired = RESULT({ stage: 'merged', node: 'merge', merged: true } as never);
+    const skipped: Array<Record<string, unknown>> = [];
+    const heals: Array<Record<string, unknown>> = [];
+    let optInCalls = 0;
+    const isolatedSupervisor = {
+      taskAgentShadow: false as const, taskAgentRejudge: false as const,
+      sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+    };
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'self-dev.supervisor' && typeof data === 'object' && data !== null) {
+        if (event === 'supervisor.reason-repair-skipped') skipped.push(data as Record<string, unknown>);
+        if (event === 'supervisor-self-heal') heals.push(data as Record<string, unknown>);
+      }
+    });
+    try {
+      const job = singleRunAsJobResult(feature, failure as never);
+      expect(job.targetPaths).toBeUndefined();
+      expect(singleRunAsJobResult(feature, failure as never, true).targetPaths).toContain('src/self-implement/self-implement-cli.ts');
+      setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
+        selfImplement: { ...config.tools.selfImplement, supervisor: undefined } } }));
+      const offCalls = capture(1, failure);
+      await runSelfImplementCliCommand(feature, { ...opts(), supervise: { rounds: 2 } }, {
+        resolveWantAutoReview: () => false, executeReroute: offCalls.executeReroute,
+        ...isolatedSupervisor,
+      });
+      expect(skipped).toContainEqual(expect.objectContaining({ reason: 'disabled' }));
+      expect(offCalls.calls).toHaveLength(1);
+
+      setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
+        selfImplement: { ...config.tools.selfImplement, supervisor: { reasonRepair: true } } } }));
+      const noRepairCapability = capture(1, failure);
+      await runSelfImplementCliCommand(feature, { ...opts(), supervise: { rounds: 2 } }, {
+        resolveWantAutoReview: () => false, executeReroute: noRepairCapability.executeReroute,
+        reasonRepairExecutionAvailable: false,
+        ...isolatedSupervisor,
+      });
+      expect(noRepairCapability.calls).toHaveLength(1);
+      expect(skipped).toHaveLength(2);
+      expect(skipped[1]).toMatchObject({ reason: 'disabled' });
+
+      const executeReroute = (async () => ({ result: ++optInCalls === 1 ? failure : repaired, exitCode: 0 })) as SelfImplementCliDeps['executeReroute'];
+      await runSelfImplementCliCommand(feature, { ...opts(), supervise: { rounds: 2 } }, {
+        resolveWantAutoReview: () => false, executeReroute,
+        ...isolatedSupervisor,
+      });
+      expect(optInCalls).toBe(2);
+      expect(skipped).toHaveLength(2);
+      expect(heals).toContainEqual(expect.objectContaining({ reason: 'supervisor-no-piece', outcome: 'relaunching' }));
+    } finally { log.mockRestore(); }
+  });
+
   it('child terminal result carries parent-read revision evidence into the JSON result', async () => {
     const root = mkdtempSync(join(tmpdir(), 'self-implement-revision-ledger-'));
     const ledgerDir = join(root, 'run-ledger');
@@ -466,10 +523,55 @@ describe('단일 실행의 런 슈퍼바이저 (E2)', () => {
     expect(Object.hasOwn(succeeded, 'error')).toBe(false);
   });
 
-  it('⛔ 모르는 실패면 «안» 다시 건다 — 무한 재실행 금지', async () => {
+  it('⛔ 모르는 실패면 «한 번만» 다시 걸어 보고 안 되면 선다 — 무한 재실행 금지', async () => {
+    // NEEDS-HUMAN-REASON-REPAIR — 모르는 실패는 남은 사유가 «조각 없음(no-piece)» 하나다.
+    //   ⇒ 골이 요구한 대로 그 사유로 «한 번» 재걸고, 같은 실패로 돌아오면 사람에게 넘긴다(재실행 상한 1회 유지).
     const cap = capture(1, RESULT({ ok: false, stage: 'error' as never, error: { code: 'X', message: 'TypeError: boom' } } as never));
-    await runSelfImplementCliCommand('f', { ...opts(), supervise: { rounds: 3 } } as never, { executeReroute: cap.executeReroute });
-    expect(cap.calls.length).toBe(1);
+    const decisions: Array<{ action: string; stopReason?: string; selfHeal?: { reason: string; attempt: number } }> = [];
+    setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
+      selfImplement: { ...config.tools.selfImplement, supervisor: { reasonRepair: true } } } }));
+    await runSelfImplementCliCommand(
+      '# Unknown failure repair\n\n## TRACED PATHS\n- src/self-implement/self-implement-cli.ts — verified target',
+      { ...opts(), supervise: { rounds: 3, onDecision: (d: { action: string; stopReason?: string; selfHeal?: { reason: string; attempt: number } }) => { decisions.push(d); } } } as never,
+      { executeReroute: cap.executeReroute, taskAgentShadow: false, taskAgentRejudge: false,
+        sweepPendingMerges: async () => ({ pending: 0, merged: 0 }) },
+    );
+    expect(cap.calls.length).toBe(2);
+    expect(decisions[0]).toMatchObject({ action: 'relaunch', selfHeal: { reason: 'supervisor-no-piece', attempt: 1 } });
+    expect(decisions.at(-1)).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+  });
+
+  // ⭐ NEEDS-HUMAN-REASON-REPAIR — 생산 진입점(`runSelfImplementCliCommand`)을 «그대로» 부른다.
+  //   심은 자식 실행(`executeReroute`) «하나»뿐이고, 감독·사유 판별·수복 골·원장은 전부 진짜다.
+  //   ⇒ 「실행 범위 가드가 잰 대상 밖 변경」이 생산 경로에서 범위 확장 사유 → 수복 1회 → needs-human 1 로 이어진다.
+  it('NEEDS-HUMAN-REASON-REPAIR: 대상 밖 변경이 CLI 경로에서 사유별 수복 1회 → 실패 시 needs-human 1', async () => {
+    const heldOutside = ['src/other/expanded.ts'];
+    const held = (): SelfImplementResult => RESULT({
+      ok: false, stage: 'error' as never,
+      detail: '실행 범위 가드: 대상 경로 밖 변경을 보류했다',
+      outOfScopeEdits: heldOutside,
+    } as never);
+    const decisions: Array<{ action: string; stopReason?: string; why: string; selfHeal?: { reason: string; attempt: number } }> = [];
+    const cap = capture(1, held());
+    setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
+      selfImplement: { ...config.tools.selfImplement, supervisor: { reasonRepair: true } } } }));
+    await runSelfImplementCliCommand(
+      '# Scope expansion repair\n\n## TRACED PATHS\n- src/self-implement/self-implement-cli.ts — verified target',
+      { ...opts(), supervise: { rounds: 3, onDecision: (d: { action: string; stopReason?: string; why: string; selfHeal?: { reason: string; attempt: number } }) => { decisions.push(d); } } } as never,
+      { executeReroute: cap.executeReroute, taskAgentShadow: false, taskAgentRejudge: false,
+        sweepPendingMerges: async () => ({ pending: 0, merged: 0 }) },
+    );
+    // ① 초기 실행 ⊕ ② 사유별 수복 1회 — 세 번째는 띄우지 않는다.
+    expect(cap.calls).toHaveLength(2);
+    // 수복 골이 «실제로» 실행됐다 — 좁히기 지시 ⊕ 잰 이름이 그 골에 실린다.
+    const repairInput = cap.last().input;
+    const repairText = 'text' in repairInput ? repairInput.text : '';
+    expect(repairText).toContain('[supervisor-needs-human-repair:scope-expansion]');
+    expect(repairText).toContain('src/other/expanded.ts');
+    expect(decisions[0]).toMatchObject({ action: 'relaunch', selfHeal: { reason: 'supervisor-scope-expansion', attempt: 1 } });
+    expect(decisions.filter((decision) => decision.stopReason === 'needs-human')).toHaveLength(1);
+    expect(decisions.at(-1)).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    expect(decisions.at(-1)!.why).toContain('supervisor-scope-expansion (attempt: 1/1)');
   });
 
   it('착지하면 «한 번»에 선다', async () => {

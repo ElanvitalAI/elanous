@@ -49,7 +49,7 @@ const MODEL_ALIASES: Readonly<Record<string, string>> = {
   'pro':             'gemini-3.1-pro-preview',
   'gemini-pro':      'gemini-3.1-pro-preview',
   // OpenAI / Codex
-  'codex':           'gpt-6-sol',   // ⭐ 2026-09-25: 운영 codex 기본(gpt-6-sol)과 맞춘다 — gpt-5.5 는 두 세대 낡았다
+  'codex':           'gpt-6.1-terra',
   'gpt-5':           'gpt-5.5',
   'mini':            'gpt-5-mini',
   'nano':            'gpt-5-nano',
@@ -57,15 +57,16 @@ const MODEL_ALIASES: Readonly<Record<string, string>> = {
   //   🔑 왜 — `sol`·`luna` 라는 «같은 이름»이 두 세대에 걸쳐 있다. 세대를 안 쓰면
   //     «어느 세대인지 말하지 않은 것»이고, 그때 골라야 할 것은 ***최신***이다.
   //     (실제로 이 겹침 때문에 커뮤니티 조사기가 5.6 과 6 을 섞어 답한 일이 있었다.)
-  //   ⛔ `terra` 는 GPT-6 에 «없다» — 중간 등급이 접혔고 GPT-6 Sol 이 그 가격대를 흡수했다.
-  //     그래서 `terra` 는 5.6 을 계속 가리킨다(은퇴가 아니라 «후속이 없는» 것이다).
+  //   GPT-6.1 restores a Terra tier; unsuffixed aliases follow the current 6.1 generation.
   //   📏 세대 확인 = `curl /v1/models` ⊕ `codex debug models` (2026-09-23 둘 다 실측).
   'astra':           'gpt-6-astra',
-  'sol':             'gpt-6-sol',
+  'sol':             'gpt-6.1-sol',
   'luna':            'gpt-6-luna',
-  'terra':           'gpt-5.6-terra',   // ⛔ GPT-6 에 후속 없음
+  'terra':           'gpt-6.1-terra',
   // 세대를 «명시»해 부르는 길 — 겹치는 이름을 또렷하게 가리킬 때.
   '6-sol':           'gpt-6-sol',
+  '6.1-sol':         'gpt-6.1-sol',
+  '6.1-terra':       'gpt-6.1-terra',
   '6-luna':          'gpt-6-luna',
   '5.6-sol':         'gpt-5.6-sol',
   '5.6-terra':       'gpt-5.6-terra',

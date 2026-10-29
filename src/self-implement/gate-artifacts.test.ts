@@ -58,7 +58,6 @@ describe('self gate --artifact-dir (R2 입력 재료)', () => {
     let rerunArgs: unknown[] = [];
     const result = runSelfGateCli('/remote/node-b/repo', { base: 'origin/main', shards: 2, artifactDir: dir }, {
       changedFiles: () => ({ files, baseRef: 'origin/main' }), exists: () => true,
-      runEntryBudgetGate: () => ({ affected: false, errors: [] }),
       runShards: () => ({ ...sharded, aggregate: { status: 'failed', retryShardIds: [], report } }),
       runTimeoutRecheck: (cwd, target, name, timeoutMs) => {
         rerunArgs = [cwd, target, name, timeoutMs];

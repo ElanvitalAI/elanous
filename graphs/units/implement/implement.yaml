@@ -1,0 +1,19 @@
+graph_id: implement
+version: 1
+unit:
+  inputs: [goal, context, feedback, budget, checkpoint]
+  outputs: [diff, evidence, result]
+  exits: [done, rework, failed]
+entry_node: implement
+terminal_nodes: [done, rework, failed]
+nodes:
+  - node_id: implement
+    kind: agent
+    recipe: implement-stage
+    max_visits: 6
+    contract: { inputs: [goal, context, feedback, budget, checkpoint], tools: external-write, outputs: [diff, evidence, result] }
+  - { node_id: done, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - { from: implement, on: outcome, map: { done: done, rework: rework, failed: failed } }

@@ -237,7 +237,13 @@ export function createPickerState(deps: PickerDeps): PickerState {
 
   const filteredSlash = (buf: PickerBufferView): SlashCommand[] => {
     const { role, showBeta } = readTuiSlashAudience();
-    return filterSlashCommands((buf.lines[0] ?? '').slice(1), deps.commands)
+    // /directive is intentionally outside the compact first-use menu, but an owner must be able
+    // to discover its ops-only command in the live palette. Keep that role-specific exception local
+    // to the palette so the shared first-use menu and help catalog remain at their 15-command policy.
+    const paletteCommands = role === 'owner'
+      ? deps.commands.map((command) => command.name === 'directive' ? { ...command, hidden: false } : command)
+      : deps.commands;
+    return filterSlashCommands((buf.lines[0] ?? '').slice(1), paletteCommands)
       .filter((cmd) => (role === 'owner' && slashMaturity(cmd.name) === undefined) || slashVisibleFor(cmd.name, role, { showBeta }));
   };
 

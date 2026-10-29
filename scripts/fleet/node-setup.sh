@@ -54,6 +54,56 @@ R true >/dev/null 2>&1 && ok "ssh" || { bad "ssh 불통 — 이 맥에서 ssh �
 # 1b. 원격 OS — Linux(WSL Ubuntu 등)면 리눅스 갈래(scripts/fleet/node-setup-linux.sh · apt·docker-ce·k3d install.sh). 맥은 아래 종전 단계 그대로.
 NODE_OS="$(R 'uname -s' 2>/dev/null)"
 if [ "$NODE_OS" = Linux ]; then . "$ROOT/scripts/fleet/node-setup-linux.sh"; linux_base; else
+# 1c. 전용 서버 macOS 전원·재시작 기본값 — 이 스크립트는 gate·Pod 플릿 호스트 전용이다.
+#     --check 는 조회만 한다. sudo -n 이 안 되면 이 단계만 건너뛰고 경고하며, 나머지 셋업은 계속한다.
+if [ $CHECK = 1 ]; then
+  if R 'sudo -n true' >/dev/null 2>&1; then
+    POWER_SETTINGS="$(R 'sudo -n pmset -g custom' 2>/dev/null)"
+    RESTART_SETTINGS="$(R 'sudo -n systemsetup -getrestartpowerfailure' 2>/dev/null)"
+    UPDATE_INSTALL="$(R 'sudo -n defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticInstallMacOSUpdates' 2>/dev/null)"
+    UPDATE_DOWNLOAD="$(R 'sudo -n defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload' 2>/dev/null)"
+    POWER_SOURCES_OK=0
+    if awk '
+      function check_source() {
+        if (autorestart != "1" || powernap != "0" || sleep_value != "0" || disksleep != "0") bad = 1
+      }
+      /^[[:space:]]*(Battery|AC) Power:[[:space:]]*$/ {
+        if (found) check_source()
+        found = 1
+        autorestart = powernap = sleep_value = disksleep = ""
+        next
+      }
+      found {
+        if ($1 == "autorestart") autorestart = $2
+        else if ($1 == "powernap") powernap = $2
+        else if ($1 == "sleep") sleep_value = $2
+        else if ($1 == "disksleep") disksleep = $2
+      }
+      END {
+        if (found) check_source()
+        if (!found || bad) exit 1
+      }
+    ' <<< "$POWER_SETTINGS"; then POWER_SOURCES_OK=1; fi
+    if [ "$POWER_SOURCES_OK" = 1 ] \
+      && [ "$RESTART_SETTINGS" = 'Restart After Power Failure: On' ] \
+      && [ "$UPDATE_INSTALL" = '0' ] \
+      && [ "$UPDATE_DOWNLOAD" = '0' ]; then
+      ok "macOS 서버 전원·재시작 기본값"
+    else todo "macOS 서버 전원·재시작 기본값 적용"; fi
+  else
+    printf '  ⚠ macOS 서버 전원 기본값 건너뜀 — sudo -n 사용 불가\n' >&2
+    todo "macOS 서버 전원·재시작 기본값 (sudo 필요)"
+  fi
+else
+  if R 'sudo -n true' >/dev/null 2>&1; then
+    if R 'sudo -n pmset -a autorestart 1 powernap 0 sleep 0 disksleep 0 && sudo -n systemsetup -setrestartpowerfailure on && sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticInstallMacOSUpdates -bool false && sudo -n defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool false'; then
+      ok "macOS 서버 전원·재시작 기본값 적용"
+    else bad "macOS 서버 전원·재시작 기본값 적용 실패"; fi
+  else
+    printf '  ⚠ macOS 서버 전원 기본값 건너뜀 — sudo -n 사용 불가\n' >&2
+    todo "macOS 서버 전원·재시작 기본값 (sudo 필요)"
+  fi
+fi
 # 2. brew · docker(OrbStack)
 R 'command -v brew' >/dev/null && ok "brew" || bad "brew 없음 — https://brew.sh 로 먼저 설치(사람이)"
 if R 'docker info --format "{{.ServerVersion}}"' >/dev/null 2>&1; then ok "docker $(R 'docker info --format "{{.ServerVersion}} cpu={{.NCPU}} mem={{.MemTotal}}"')"; else bad "docker 없음·꺼짐 — OrbStack 을 설치·실행(사람이 · ⛔ OrbStack 내장 k8s 는 NetworkPolicy 를 집행 안 한다 · k3d 를 쓴다)"; fi

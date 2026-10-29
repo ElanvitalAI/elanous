@@ -1,8 +1,7 @@
 // ── OpenAI Codex model catalog ──
 //
-// Curated subset of the full OpenAI Codex CLI model roster — the six
-// options that cover the most common use cases without overwhelming
-// the onboarding picker. Source: omni-crawl sweep on 2026-04-14 across
+// Curated subset of the full OpenAI Codex CLI model roster, covering
+// common use cases without overwhelming the onboarding picker. Source: omni-crawl sweep on 2026-04-14 across
 //   - developers.openai.com/api/docs/models/{all,codex-mini-latest,gpt-5-codex}
 //   - developers.openai.com/codex/models
 //   - platform.openai.com/docs/models
@@ -20,10 +19,9 @@
 // 2026-09-09 refresh (live 1차 대조 — developers.openai.com/api/내부 문서 `gpt-6-astra`
 // ⊕ openai.com/api/pricing/ ⊕ `codex exec --model gpt-6-astra` 실호출):
 //   + gpt-6-astra  (2026-09-03 출시 · 현 최상단)
-//   + gpt-5.6-terra (elanous 가 «실제로» 기본으로 쓰는 모델 — llm.model 이 이 값이다)
-// ⛔ recommended 를 gpt-5.5 → gpt-5.6-terra 로 옮겼다. 이 표의 recommended 는 「가장 센 것」이
-//   아니라 「기본으로 골라도 되는 것」이고, 그 자리에 두 세대 전 모델이 앉아 있었다.
-//   astra 는 recommended 가 «아니다» — terra 대비 input 4배·output 3.3배라 기본값이 될 수 없다.
+//   + gpt-5.6-terra (at the time, the configured `llm.model` default)
+// GPT-6.1 refresh (2026-10-28): recommended is GPT-6.1 Terra; Sol is available for higher-cost deep work.
+// `recommended` means a safe default, not the strongest model; Astra remains opt-in due to its higher cost.
 
 export type CodexModelTier = 'flagship' | 'balanced' | 'cheap' | 'specialist' | 'legacy';
 
@@ -44,11 +42,21 @@ export interface CodexModel {
   recommended?: boolean;
 }
 
-/** Six curated models for the 1-point setup picker. Ordering
- *  reflects the UI: recommended first, then by descending tier. */
+/** Curated models for the 1-point setup picker. Ordering reflects the UI:
+ *  recommended first, then by descending tier. */
 export const CODEX_MODELS: CodexModel[] = [
   {
-    // 📏 2026-09-25 캐시 읽기 단가 = 입력의 10%(OpenRouter 목록 gpt-6-astra 1.0 · sol 0.2 · luna 0.01) — 없으면 캐시분이 입력 단가로 10배 매겨졌다.
+    id: 'gpt-6.1-terra',
+    label: 'GPT-6.1 Terra',
+    tier: 'balanced',
+    description: 'Recommended everyday Codex model. 500K context; $1/$5 per million tokens, cached input $0.05.',
+    contextWindow: 500_000,
+    pricingUsd: { inputPerM: 1.0, outputPerM: 5.0, cacheReadPerM: 0.05 },
+    recommended: true,
+  },
+  {
+    // Cache-read rates: Astra $1.00/M, GPT-6.1 Sol $0.10/M, Terra $0.05/M, Luna $0.01/M.
+    // Per OP 2026-10-28 price direction, legacy GPT-6 Sol also uses $0.10/M for cost estimates.
     id: 'gpt-6-astra',
     label: 'GPT-6 Astra (frontier)',
     tier: 'flagship',
@@ -57,13 +65,20 @@ export const CODEX_MODELS: CodexModel[] = [
     pricingUsd: { inputPerM: 10.0, outputPerM: 50.0, cacheReadPerM: 1.0 },
   },
   {
+    id: 'gpt-6.1-sol',
+    label: 'GPT-6.1 Sol',
+    tier: 'flagship',
+    description: 'Higher-capability reasoning and coding model. 500K context; $2/$10 per million tokens, cached input $0.10.',
+    contextWindow: 500_000,
+    pricingUsd: { inputPerM: 2.0, outputPerM: 10.0, cacheReadPerM: 0.1 },
+  },
+  {
     id: 'gpt-6-sol',
-    label: 'GPT-6 Sol',   // «recommended» 표시는 목록이 `recommended: true` 로 붙인다 — 라벨에도 쓰면 두 번 뜬다(UX 8)
-    tier: 'balanced',
-    description: 'elanous 운영 기본(대표 2026-09-23). 복합 코딩·agentic 워크플로. Reasoning «Highest» 인데 가격은 5.6 Terra 와 같은 입력·더 싼 출력. 1.05M ctx, effort none..max(기본 medium).',
+    label: 'GPT-6 Sol',
+    tier: 'legacy',
+    description: 'Legacy GPT-6 Sol retained for compatibility; GPT-6.1 Sol is its higher-performing successor at the same price, while Terra is a lower-cost default.',
     contextWindow: 1_050_000,
-    pricingUsd: { inputPerM: 2.0, outputPerM: 10.0, cacheReadPerM: 0.2 },
-    recommended: true,
+    pricingUsd: { inputPerM: 2.0, outputPerM: 10.0, cacheReadPerM: 0.1 },
   },
   {
     id: 'gpt-6-luna',

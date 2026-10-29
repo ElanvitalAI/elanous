@@ -1,0 +1,20 @@
+graph_id: verb-research
+version: 1
+entry_node: research
+terminal_nodes: [done, failed]
+unit:
+  inputs: [ask]
+  outputs: [result, evidence]
+  exits: [done, failed]
+nodes:
+  - node_id: research
+    kind: agent
+    recipe: 'cmd:research'
+    max_visits: 1
+    contract: { inputs: [ask], tools: omni-crawl-research-write-edit-denied, outputs: [outcome, result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+edges:
+  - from: research
+    on: outcome
+    map: { done: done, failed: failed }

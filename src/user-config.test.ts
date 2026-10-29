@@ -7,6 +7,7 @@ import {
   __resetRetiredConfigKeysObservationForTests,
   buildUserConfig,
   CHAT_DEFAULTS,
+  PROVIDER_DEFAULT_MODEL,
   findRetiredConfigKeys,
   findRetiredConfigKeysInFile,
   RETIRED_CONFIG_KEYS,
@@ -43,6 +44,10 @@ test('tui.sidetab validates values and survives config save', () => {
   expect(persistedTui).toEqual({ sidetab: 'open', role: 'contributor', showBeta: true });
   writeConfig({ tui: { sidetab: 'invalid' } });
   expect(buildUserConfig(configPath).tui?.sidetab).toBe('collapsed');
+});
+
+test('openai-codex provider default follows the recommended GPT-6.1 Terra model', () => {
+  expect(PROVIDER_DEFAULT_MODEL['openai-codex']).toBe('gpt-6.1-terra');
 });
 
 test('tui.unattended is a sparse boolean and user config overrides the seat env switch', () => {
@@ -622,6 +627,15 @@ describe('tools.nativeStructure provider list', () => {
 
     writeConfig({ tools: { selfImplement: {} } });
     expect(buildUserConfig(configPath).tools.selfImplement.goalAuthorPersistentGrounding).toBeUndefined();
+  });
+
+  test('reason-specific supervisor repair is opt-in and defaults off', () => {
+    writeConfig({ tools: { selfImplement: {} } });
+    expect(buildUserConfig(configPath).tools.selfImplement.supervisor?.reasonRepair).toBe(false);
+    writeConfig({ tools: { selfImplement: { supervisor: { reasonRepair: true } } } });
+    expect(buildUserConfig(configPath).tools.selfImplement.supervisor?.reasonRepair).toBe(true);
+    writeConfig({ tools: { selfImplement: { supervisor: { reasonRepair: 'true' } } } });
+    expect(buildUserConfig(configPath).tools.selfImplement.supervisor?.reasonRepair).toBe(false);
   });
 
   test('parses opt-in self-implement child escalation map without inventing a default', () => {

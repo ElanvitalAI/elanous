@@ -3,8 +3,20 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
 import { buildReferenceCard, nodeRefIndexFs, type RefIndexFs } from './ref-index.js';
+import * as refIndexModule from './ref-index.js';
+import { registerGroundingSourcesCli } from './sources-cli.js';
 import { sourceStatus, type GroundingSource } from './sources.js';
+
+/**
+ * Reached through the module namespace instead of a static named import so this
+ * file still *loads* on a tree where the export is absent: the batch test below
+ * then fails as a real assertion (red witness) instead of dying as a
+ * module-load SyntaxError, which no check can observe. Not optional — the first
+ * assertion of that test requires the export to exist and be callable.
+ */
+const buildReferenceCardsForRegistry = refIndexModule.buildReferenceCardsForRegistry;
 
 function git(cwd: string, args: string[]): void {
   execFileSync('git', args, { cwd, stdio: 'ignore' });
@@ -201,6 +213,61 @@ describe('buildReferenceCard', () => {
     try {
       expect(() => buildReferenceCard(sourceOf('gone', join(home, 'nope')), nodeRefIndexFs)).toThrow(/not readable/);
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('batch: cards for a discovery batch, skipping non-local kinds and unreadable paths', () => {
+    const home = mkdtempSync(join(tmpdir(), 'ref-index-'));
+    try {
+      const repo = makeRepo(home, 'alpha');
+      writeFileSync(join(repo, 'README.md'), '# Alpha Batch\n\nalpha batch one line\n');
+      commitAll(repo);
+      const sources: GroundingSource[] = [
+        sourceOf('alpha', repo),
+        { id: 'w', kind: 'web', url: 'https://x.test', sync: 'manual' },
+        sourceOf('gone', join(home, 'nope')),
+      ];
+      expect(typeof buildReferenceCardsForRegistry).toBe('function');
+      const cards = buildReferenceCardsForRegistry(sources, nodeRefIndexFs);
+      expect(cards.length).toBe(1);
+      expect(cards[0]!.id).toBe('alpha');
+      expect(cards[0]!.name).toBe('alpha');
+      expect(cards[0]!.truncated).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('wiring: production CLI `grounding sources discover --ref-index` yields the cards (read-only)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'ref-index-'));
+    let printed = '';
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => { printed += `${args.join(' ')}\n`; };
+    try {
+      const repo = makeRepo(home, 'alpha');
+      writeFileSync(join(repo, 'README.md'), '# Alpha CLI\n\nalpha cli one line\n');
+      writeFileSync(join(repo, 'package.json'), JSON.stringify({ name: 'alpha-cli', bin: { alpha: 'a.js' } }));
+      commitAll(repo);
+
+      const program = new Command();
+      // exitOverride + silenced output keep a rejected flag (a tree where
+      // `--ref-index` is not registered yet) inside this test as a thrown error
+      // — a real fail — instead of commander calling process.exit and killing
+      // the whole run before any result is reported.
+      program.exitOverride();
+      program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
+      registerGroundingSourcesCli(program);
+      program.parse(['node', 'elanous', 'grounding', 'sources', 'discover', '--ref-index', '--home', home]);
+
+      const cards = JSON.parse(printed.trim() || '[]') as Array<Record<string, unknown>>;
+      expect(cards.length).toBe(1);
+      expect(cards[0]!.name).toBe('alpha-cli');
+      expect(cards[0]!.oneLine).toBe('alpha cli one line');
+      expect(cards[0]!.commands).toEqual(['alpha']);
+      expect(cards[0]!.truncated).toBe(false);
+    } finally {
+      console.log = originalLog;
       rmSync(home, { recursive: true, force: true });
     }
   });

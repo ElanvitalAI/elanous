@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { GOAL_TYPES, type GoalType } from './goal-author.js';
 import type { GraphRunContractSpec } from './graph-run-contract.js';
-import { edgeMapOf, loadGraphTemplates, type GraphNodeContract, type GraphNodeKind, type GraphNodeSpec, type GraphTemplateSpec } from './graph-yaml.js';
+import { edgeMapOf, loadGraphTemplates, type GraphEdgeSpec, type GraphNodeContract, type GraphNodeKind, type GraphNodeSpec, type GraphTemplateSpec } from './graph-yaml.js';
 
 /** ⭐ RFC §5 «3단계» — 템플릿을 «데이터»로 둔다(RFC §4.1 어휘).
  *
@@ -95,6 +95,167 @@ const RESEARCH_LOOP: GraphTemplate = {
     merge: [],
   },
 };
+
+/** ⭐ SELFIMPL-NODE-SEAMS-BACK — 한 NodeContext 가 저작→구현으로 흐르는 다섯 입력 칸.
+ *
+ *  ⛔ 이 다섯은 «부품의 계약»이다 — units/<stage>/<stage>.yaml 의 unit.inputs 와 글자 그대로 같아야 한다
+ *    (flattenGraphUnits 가 호출 노드의 contract 와 unit.inputs 를 «길이·원소» 둘 다로 대조한다). */
+export const NODE_CONTEXT_INPUTS = ['goal', 'context', 'feedback', 'budget', 'checkpoint'] as const;
+
+/** 등록 부품의 이름 — 요구가 이름으로 든 다섯 단계(구현·gate·리뷰·git·착지). */
+export type ImplementStageUnitId = 'implement' | 'gate' | 'review' | 'git' | 'landing';
+
+export interface ImplementStageUnitExit {
+  /** unit.exits 의 이름 — flattenGraphUnits 가 호출 간선 map 의 키와 «정확히» 대조한다. */
+  readonly exit: string;
+  /** 그 출구가 향하는 «파이프라인 노드» — PIPELINE_EDGES_BY_NODE 의 목적지에서만 고른다. */
+  readonly to: string;
+}
+
+export interface ImplementStageUnitSeam {
+  readonly stage: ImplementStageUnitId;
+  /** `id@version` — createGraphUnitResolver 규약 그대로. */
+  readonly call: string;
+  /** 그 부품이 소유한 파이프라인 노드(PIPELINE_EDGES_BY_NODE 의 키). */
+  readonly nodes: readonly string[];
+  /** 이 부품에서 처음 밟는 노드(= 호출 노드의 call_entry). */
+  readonly entry: string;
+  /** 합성 호출되는 단계만 계약을 갖는다; landing은 종결 노드라 호출 계약이 없다. */
+  readonly outputs?: readonly string[];
+  readonly exits?: readonly ImplementStageUnitExit[];
+}
+
+/** ⛔ 출처는 «둘»이다 — kind 는 IMPLEMENT_LOOP, edges 는 PIPELINE_EDGES_BY_NODE. 여기서 새 어휘를 만들지 않는다.
+ *
+ *  📌 착지(landing) 부품은 합성 그래프에서 «평범한 merge 노드»로 남는다: flattenGraphUnits 는 호출 노드마다
+ *    나가는 outcome map 을 요구하는데 종결 노드(merge)에는 나가는 간선이 없다 — 즉 «종결 노드는 호출일 수 없다».
+ *    그래서 landing 은 등록·해석·단독 평탄화(계약 검증)로 생산 경로를 지나고, 합성 그래프의 종결은 merge 가 맡는다. */
+export const IMPLEMENT_STAGE_UNITS: readonly ImplementStageUnitSeam[] = [
+  { stage: 'implement', call: 'implement@1', nodes: ['implement'], entry: 'implement',
+    outputs: ['diff', 'evidence', 'result'],
+    exits: [{ exit: 'done', to: 'gate' }, { exit: 'rework', to: 'gate' }, { exit: 'failed', to: 'gate' }] },
+  { stage: 'gate', call: 'gate@1', nodes: ['gate'], entry: 'gate',
+    outputs: ['gate-verdict', 'evidence'],
+    exits: [{ exit: 'pass', to: 'review' }, { exit: 'fail', to: 'rework' },
+      { exit: 'sync', to: 'main-sync' }, { exit: 'open', to: 'open-pr' }] },
+  { stage: 'review', call: 'review@1', nodes: ['review'], entry: 'review',
+    outputs: ['verdict', 'must-fix', 'evidence'],
+    exits: [{ exit: 'pass', to: 'main-sync' }, { exit: 'fail', to: 'rework' },
+      { exit: 'sync', to: 'main-sync' }, { exit: 'open', to: 'open-pr' }] },
+  { stage: 'git', call: 'git@1', nodes: ['main-sync', 'open-pr'], entry: 'main-sync',
+    outputs: ['commit', 'pr-number', 'evidence'],
+    exits: [{ exit: 'to-regate', to: 'regate' }, { exit: 'to-open-pr', to: 'open-pr' },
+      { exit: 'to-merge', to: 'merge' }] },
+  { stage: 'landing', call: 'landing@1', nodes: ['merge'], entry: 'merge',
+    // 합성 그래프의 merge는 종결 노드라 landing 부품의 종료 매핑을 만들지 않는다.
+  },
+];
+
+/** 그 그래프가 «부품으로 떼어 놓은» 단계 목록 — self-implement 밖의 그래프는 빈 배열(동작 불변). */
+export function stageUnitSeamsForGraph(graphId: string): readonly ImplementStageUnitSeam[] {
+  return graphId === PIPELINE_GRAPH_ID ? IMPLEMENT_STAGE_UNITS : [];
+}
+
+/** 파이프라인 노드의 kind — IMPLEMENT_LOOP 과 «같은 출처»에서 읽는다(두 벌로 갈리지 않게). */
+export function pipelineNodeKind(nodeId: string): string | undefined {
+  return IMPLEMENT_LOOP.nodes.find((node) => node.nodeId === nodeId)?.kind;
+}
+
+const UNIT_CALL_CONTRACT = (outputs: readonly string[]): GraphNodeContract => ({
+  inputs: [...NODE_CONTEXT_INPUTS],
+  tools: 'none',
+  outputs: [...outputs],
+});
+
+/** ⭐ 부품 호출로 «재조립한» self-implement 선언 — 실행 그래프가 아니라 «정적 검증용 합성»이다.
+ *
+ *  ⛔ 실행 그래프(graphs/implement-loop.yaml)는 건드리지 않는다(보존 계약: 도는 동작 불변).
+ *    이 spec 은 flattenGraphUnits 의 정적 검증(entry/exit 매핑·inputs/outputs 계약·이름 충돌·순환/깊이≤3)을
+ *    «실제 등록 부품»에 걸어, 부품 분해가 기존 kind+edges 를 그대로 재현함을 값으로 낸다. */
+export function implementLoopUnitSpec(): GraphTemplateSpec {
+  const call = (seam: ImplementStageUnitSeam, callEntry?: string): GraphNodeSpec => ({
+    nodeId: callEntry ?? seam.entry,
+    kind: 'subgraph',
+    recipe: 'none',
+    maxVisits: 1,
+    call: seam.call,
+    ...(callEntry === undefined ? {} : { callEntry }),
+    contract: UNIT_CALL_CONTRACT(seam.outputs ?? []),
+  });
+  const seamOf = (stage: ImplementStageUnitId): ImplementStageUnitSeam =>
+    IMPLEMENT_STAGE_UNITS.find((seam) => seam.stage === stage)!;
+  const outcome = (stage: ImplementStageUnitId, from: string): GraphEdgeSpec => ({
+    from,
+    on: 'outcome',
+    map: Object.fromEntries((seamOf(stage).exits ?? []).map(({ exit, to }) => [exit, to])),
+  });
+  const nodes: GraphNodeSpec[] = [
+    call(seamOf('implement')),
+    call(seamOf('gate')),
+    call(seamOf('review')),
+    call(seamOf('git'), 'main-sync'),
+    call(seamOf('git'), 'open-pr'),
+    { nodeId: 'rework', kind: pipelineNodeKind('rework')!, recipe: 'none', maxVisits: 6 },
+    { nodeId: 'regate', kind: pipelineNodeKind('regate')!, recipe: 'none', maxVisits: 2 },
+    { nodeId: 'merge', kind: pipelineNodeKind('merge')!, recipe: 'none', maxVisits: 1 },
+  ];
+  const edges: GraphEdgeSpec[] = [
+    outcome('implement', 'implement'),
+    outcome('gate', 'gate'),
+    outcome('review', 'review'),
+    outcome('git', 'main-sync'),
+    outcome('git', 'open-pr'),
+    { from: 'rework', to: 'implement' },
+    { from: 'regate', to: 'open-pr' },
+  ];
+  return {
+    graphId: PIPELINE_GRAPH_ID,
+    version: 1,
+    entryNode: 'implement',
+    terminalNodes: ['merge'],
+    nodes,
+    edges,
+  };
+}
+
+export interface ImplementLoopUnitEquivalence {
+  /** 파이프라인 노드마다 «합성 그래프의 kind» 가 IMPLEMENT_LOOP 과 다른 것. */
+  readonly kindMismatches: readonly { node: string; expected: string; actual: string | undefined }[];
+  /** PIPELINE_EDGES_BY_NODE 에 있는데 평탄화 결과에 «없는» 간선. */
+  readonly missingEdges: readonly string[];
+  /** 평탄화 결과에 있는데 PIPELINE_EDGES_BY_NODE 에 «없는» 간선 — 0 이어야 동작 불변이다. */
+  readonly extraEdges: readonly string[];
+}
+
+/** flattenGraphUnits 는 호출 노드의 자식을 `${callNodeId}__${nodeId}` 로 접두한다 — 그 접두를 벗겨 되돌린다. */
+export function normalizeFlattenedNodeId(nodeId: string): string {
+  const at = nodeId.lastIndexOf('__');
+  return at < 0 ? nodeId : nodeId.slice(at + 2);
+}
+
+/** ⭐ 판정선: 평탄화 결과가 기존 kind+edges 와 «같은가»를 세 방향으로 낸다. */
+export function implementLoopUnitEquivalence(flattened: GraphTemplateSpec): ImplementLoopUnitEquivalence {
+  const kindMismatches: { node: string; expected: string; actual: string | undefined }[] = [];
+  const actualKinds = new Map<string, string>();
+  for (const node of flattened.nodes) actualKinds.set(normalizeFlattenedNodeId(node.nodeId), node.kind);
+  for (const nodeId of Object.keys(PIPELINE_EDGES_BY_NODE)) {
+    const expected = pipelineNodeKind(nodeId);
+    const actual = actualKinds.get(nodeId);
+    if (expected !== undefined && actual !== expected) kindMismatches.push({ node: nodeId, expected, actual });
+  }
+  const edgesOf = (map: Readonly<Record<string, readonly string[]>>): Set<string> =>
+    new Set(Object.entries(map).flatMap(([from, targets]) => targets.map((to) => `${from}->${to}`)));
+  const normalizedFlattened = Object.fromEntries(
+    Object.entries(edgeMapOf(flattened)).map(([from, targets]) => [normalizeFlattenedNodeId(from), targets.map(normalizeFlattenedNodeId)]),
+  );
+  const actual = edgesOf(normalizedFlattened);
+  const expected = edgesOf(PIPELINE_EDGES_BY_NODE as unknown as Record<string, readonly string[]>);
+  return {
+    kindMismatches,
+    missingEdges: [...expected].filter((edge) => !actual.has(edge)).sort(),
+    extraEdges: [...actual].filter((edge) => !expected.has(edge)).sort(),
+  };
+}
 
 /** ⭐⭐ RFC §5 «배선» — 선언의 «출처»가 YAML 이다(대표 지시: TypeScript 는 저장에서 빠진다).
  *

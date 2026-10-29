@@ -473,14 +473,15 @@ async function tryRemoteParent(args: string[], cwd: string | undefined, context:
   return null;
 }
 
-/** stderr 파일의 첫 비어 있지 않은 줄(최대 4KB 만 읽는다 — 원 로그 꼬리를 싣지 않는다). */
-function firstStderrLine(path: string): string {
+/** Advisory lines may precede the actual fatal error. Keep the full stderr as evidence. */
+function actionableStderrLine(path: string): string {
   try {
     const fd = openSync(path, 'r');
     try {
       const buf = Buffer.alloc(4096);
       const n = readSync(fd, buf, 0, buf.length, 0);
-      return buf.subarray(0, n).toString('utf8').split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0) ?? '';
+      const lines = buf.subarray(0, n).toString('utf8').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      return lines.find((line) => /^(?:❌|error:|fatal:)/i.test(line)) ?? lines[0] ?? '';
     } finally { closeSync(fd); }
   } catch { return ''; }
 }
@@ -529,7 +530,7 @@ export async function defaultTaskLauncher(args: string[], cwd?: string, context?
     : undefined;
   if (timer) clearTimeout(timer);
   if (early && early.code !== 0) {
-    const first = firstStderrLine(stderrPath);
+    const first = actionableStderrLine(stderrPath);
     const cause = `child rc=${early.code ?? early.signal ?? 'unknown'}${first ? `: ${first}` : ''}`;
     const { boundRunStopCause, recordRunStop, runStopRecorded, RUN_STOP_EVENT } = await import('../self-implement/run-stop.js');
     const hasStop = deps.hasStop ?? ((id: string) => {

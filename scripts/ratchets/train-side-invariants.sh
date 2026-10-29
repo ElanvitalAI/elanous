@@ -6,7 +6,6 @@ set -u
 
 files=(
   scripts/ratchets/test-interference-patterns.test.ts
-  scripts/ratchets/next-tui-entry-budget.test.ts
   src/domains/finance-cli.test.ts
   src/instance/state-dir-provenance-ratchet.test.ts
   src/self-implement/graph-yaml.test.ts

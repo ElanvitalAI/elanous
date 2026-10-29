@@ -266,6 +266,65 @@ describe('NL-UTTERANCE-PATTERNS v5 28문항 경로·복합 처리 채점 입구'
     }
   });
 
+  test('NL-UTTERANCE-V5-MIN-TURNS-FU: 채점 턴 정책이 CORPUS_BUDGETS와 분리되었음을 증명하는 완료 경계 실물', async () => {
+    const outDir = mkdtempSync(resolve(tmpdir(), 'nl-routing-v5-min-turns-'));
+    const out = resolve(outDir, 'corpus.json');
+    const logs: string[] = [];
+    const originalLog = console.log;
+    const observedMaxTurns = new Map<string, number[]>();
+    try {
+      console.log = ((line: string) => logs.push(line)) as typeof console.log;
+      await withRunnerEnv({
+        ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY: '1',
+        CORPUS_CWD: outDir,
+        CORPUS_OUT: out,
+        CORPUS_REPEATS: '1',
+        CORPUS_BUDGETS: '1',
+        CORPUS_CONCURRENCY: '1',
+        CORPUS_V5: '1',
+      }, async () => {
+        await runCorpusMain(
+          () => ({ description: 'test', surface: 'cli', tiers: { test: 'test' }, items: [{ id: 'item', tier: 'test', prompt: '일반 라우팅 문항', accept: ['Read'] }] }),
+          async (options): Promise<EvalPromptResult> => {
+            const prompt = options.prompt ?? '';
+            const turns = observedMaxTurns.get(prompt) ?? [];
+            turns.push(options.maxTurns ?? 0);
+            observedMaxTurns.set(prompt, turns);
+            const fixture = V5_TOOL_FIXTURES[prompt];
+            return evalPromptResult(options, fixture ?? { Read: 1 });
+          },
+          resolveCorpusRunSafetyFromProcessEnv,
+          () => ['Read', 'Grep', 'Glob'],
+        );
+      });
+      const output = JSON.parse(readFileSync(out, 'utf8')) as {
+        budgets: number[];
+        v5?: { scored: number; passed: number; verdict: string };
+      };
+      // 예산 관측: 코퍼스 예산은 CORPUS_BUDGETS=1 을 그대로 기록한다.
+      expect(output.budgets).toEqual([1]);
+      const corpusTurns = observedMaxTurns.get('일반 라우팅 문항') ?? [];
+      expect(corpusTurns).toEqual([1]);
+      // 최소 채점 턴 관측: v5 채점 문항의 maxTurns 는 예산 1 과 무관하게 최소 채점 턴(기본 6)이다.
+      const compoundPrompt = 'surface-events.ts 읽고 지난 기록 찾고 폴더 목록도 뽑아 줘';
+      const v5Turns = observedMaxTurns.get(compoundPrompt) ?? [];
+      expect(v5Turns.length).toBeGreaterThan(0);
+      expect(v5Turns.every((turns) => turns === 6)).toBe(true);
+      expect(v5Turns.every((turns) => turns !== output.budgets[0] || output.budgets[0] >= 6)).toBe(true);
+      // 복합 발화 회귀: 예산 1 에서도 채점이 최소 채점 턴만큼 실행돼 통과한다.
+      expect(output.v5).toBeDefined();
+      expect(output.v5!.scored).toBe(28);
+      expect(output.v5!.passed).toBe(28);
+      expect(output.v5!.verdict).toBe('pass');
+      const v5Line = logs.find((line) => line.includes('[v5]'));
+      expect(v5Line).toBeDefined();
+      expect(v5Line).toContain('판정 pass');
+    } finally {
+      console.log = originalLog;
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
   test('채점 문항 25 미만인 런은 임계 미달로 거부한다', async () => {
     const outDir = mkdtempSync(resolve(tmpdir(), 'nl-routing-v5-fail-'));
     try {

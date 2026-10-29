@@ -76,8 +76,7 @@ describe('TUI-SLASH-DECIDE-NOW C — /model lines', () => {
     expect(now).toBe(`지금: 깊음 (${deep.model}) · 고르기: /model 빠름 | 보통 | 깊음`);
     const fast = lookupLlmTierSpec('openai-codex', 'budget').model;
     expect(modelOverviewLines('openai-codex', fast)[0]).toStartWith(`지금: 빠름 (${fast})`);
-    // better and best share a model on this ladder: without the reasoning level the word would be a guess.
-    expect(humanWordForModel('openai-codex', deep.model)).toBeUndefined();
+    expect(humanWordForModel('openai-codex', deep.model)).toBe('깊음');
     expect(codes).toContain(MODEL_CODE_NAMES.join(' · '));
     expect(modelOverviewLines('anthropic', 'some-custom-model')[0]).toBe('지금: some-custom-model · 고르기: /model 빠름 | 보통 | 깊음');
     expect(modelOverviewLines('anthropic', undefined)[0]).toStartWith('지금: 기본 모델 · ');
@@ -97,7 +96,7 @@ describe('TUI-SLASH-DECIDE-NOW C — /model lines', () => {
     if (code.kind !== 'code') throw new Error('expected a code resolution');
     const opus = lookupLlmTierSpec('anthropic', 'better');
     expect(modelChangeLine({ provider: 'anthropic', model: opus.model, reasoning: opus.reasoningLevel }, code))
-      .toBe(`모델: 보통 → sol (${code.target.model})  · provider openai-codex`);
+      .toBe(`모델: 보통 → 깊음 (${code.target.model})  · provider openai-codex`);
     const luna = resolveModelChoice('luna', 'openai-codex');
     if (luna.kind !== 'code') throw new Error('expected a code resolution');
     expect(modelChangeLine({ provider: 'openai-codex', model: 'custom' }, luna)).toBe(`모델: custom → 빠름 (${luna.target.model})`);

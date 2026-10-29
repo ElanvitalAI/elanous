@@ -1,0 +1,92 @@
+version: 1
+kind: release-graph
+id: release-sim-rig-0241
+isolation: test
+input:
+  version: '0.2.41'
+  previousVersion: '0.2.40'
+cases:
+  - id: baseline-full-graph
+    mode: baseline
+    expect:
+      status: done
+      mustVisit: [version-release, gate, publish, npm-publish, done]
+      mustNotVisit: [failed]
+  - id: gate-attribution-incomplete
+    fault:
+      node: gate
+      outcome: fail
+      evidence: { summaryFailures: 39, identifiedOccurrences: 78, uniqueFailures: 39, baselineRecheck: true }
+    expect:
+      status: failed
+      mustVisit: [gate, gate-triage, traffic-failed-restore, failed]
+      mustNotVisit: [publish, npm-publish]
+  - id: gate-three-new-regressions
+    fault:
+      node: gate
+      outcome: fail
+      evidence: { introducedFailures: 3, baselineRecheck: true }
+    expect:
+      status: failed
+      mustVisit: [gate, gate-triage, failed]
+      mustNotVisit: [publish, npm-publish]
+  - id: gate-host-occupied
+    fault:
+      node: gate
+      outcome: error
+      evidence: { host: node-b, reservation: occupied, executor: pod }
+    expect:
+      status: failed
+      mustVisit: [gate, gate-triage, failed]
+      mustNotVisit: [publish]
+  - id: release-version-skip
+    fault:
+      node: cutoff
+      outcome: fail
+      evidence: { previousVersion: '0.2.40', selectedVersion: '0.2.41', sequenceGap: true }
+    expect:
+      status: failed
+      mustVisit: [cutoff, traffic-failed-restore, failed]
+      mustNotVisit: [checklist-gate, gate, publish]
+  - id: public-export-leak
+    fault:
+      node: export-check
+      outcome: fail
+      evidence: { publicArtifactLeak: true, classification: release-blocking }
+    expect:
+      status: failed
+      mustVisit: [export-check, traffic-failed-restore, failed]
+      mustNotVisit: [prefetch, gate, publish]
+  - id: cut-tip-moved-after-resume
+    mode: cut-tip-moved-after-resume
+    expect:
+      status: resume-refused
+      mustVisit: [version-release]
+      mustNotVisit: [cutoff, gate, publish]
+  - id: prefetch-cache-miss
+    fault:
+      node: prefetch
+      outcome: error
+      evidence: { cacheMiss: true, continueToGate: true }
+    expect:
+      status: done
+      mustVisit: [prefetch, gate, publish, npm-publish, done]
+      mustNotVisit: [failed]
+  - id: publish-command-fails
+    fault:
+      node: publish
+      outcome: fail
+      evidence: { published: false, restoreTraffic: true }
+    expect:
+      status: failed
+      mustVisit: [publish, traffic-failed-restore, failed]
+      mustNotVisit: [npm-publish, docs-land]
+  - id: pwa-node-times-out
+    fault:
+      node: pwa
+      outcome: timeout
+      evidence: { timeoutSeconds: 900, restoreTraffic: true }
+    expect:
+      status: failed
+      mustVisit: [pwa, traffic-failed-restore, failed]
+      mustNotVisit: [prepare, publish]

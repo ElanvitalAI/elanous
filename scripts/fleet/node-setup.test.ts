@@ -79,7 +79,7 @@ cmd="\${@: -1}"
 printf '%s\n' "$cmd" >> "$FAKE_CALLS"
 while IFS=$'\t' read -r pat rc out; do
   [ -n "$pat" ] || continue
-  case "$cmd" in *"$pat"*) [ -z "$out" ] || printf '%s\n' "$out"; exit "$rc";; esac
+  case "$cmd" in *"$pat"*) [ -z "$out" ] || printf '%b\n' "$out"; exit "$rc";; esac
 done < "$FAKE_RULES"
 exit "$FAKE_DEFAULT_RC"
 `, { mode: 0o755 });
@@ -260,5 +260,45 @@ describe('fleet node setup — 원격 OS 갈래', () => {
     for (const line of ['✗ brew 없음', '→ ~/.zshenv 에 PATH 블록', '→ Chrome 설치', '→ k3d 설치', '→ 호스트 git 미러 ~/mirror/elanous-agent.git 생성(git init --bare) ⊕ 이 맥에서 첫 push']) expect(r.stdout).toContain(line);
     expect(r.stdout).not.toContain('사람 손 할 일');
     expect(r.stdout).not.toContain('OS Linux');
+  });
+
+  test('Darwin --check: sudo가 없으면 서버 전원 설정을 건너뛰고 쓰기 명령 없이 경고한다', () => {
+    const r = runNodeSetup({ os: 'Darwin', check: true, defaultRc: 1 });
+    expect(r.stderr).toContain('⚠ macOS 서버 전원 기본값 건너뜀 — sudo -n 사용 불가');
+    expect(r.stdout).toContain('→ macOS 서버 전원·재시작 기본값 (sudo 필요)');
+    expect(anyCall(r.invocations, 'pmset -a')).toBe(false);
+    expect(anyCall(r.invocations, 'systemsetup -setrestartpowerfailure')).toBe(false);
+    expect(anyCall(r.invocations, 'defaults write')).toBe(false);
+  });
+
+  test('Darwin --check: sudo 성공과 AC·Battery 설정 일치면 ✓, 어느 한 프로필이 다르면 todo', () => {
+    const good = runNodeSetup({ os: 'Darwin', check: true, defaultRc: 1, rules: [
+      ['sudo -n true', 0],
+      ['sudo -n pmset -g custom', 0, 'Battery Power:\\n autorestart 1\\n powernap 0\\n sleep 0\\n disksleep 0\\nAC Power:\\n autorestart 1\\n powernap 0\\n sleep 0\\n disksleep 0'],
+      ['sudo -n systemsetup -getrestartpowerfailure', 0, 'Restart After Power Failure: On'],
+      ['AutomaticInstallMacOSUpdates', 0, '0'],
+      ['AutomaticDownload', 0, '0'],
+    ] });
+    expect(good.stdout).toContain('✓ macOS 서버 전원·재시작 기본값');
+    expect(good.stdout).not.toContain('→ macOS 서버 전원·재시작 기본값 적용');
+
+    const partial = runNodeSetup({ os: 'Darwin', check: true, defaultRc: 1, rules: [
+      ['sudo -n true', 0],
+      ['sudo -n pmset -g custom', 0, 'Battery Power:\\n autorestart 1\\n powernap 0\\n sleep 1\\n disksleep 0\\nAC Power:\\n autorestart 1\\n powernap 0\\n sleep 0\\n disksleep 0'],
+      ['sudo -n systemsetup -getrestartpowerfailure', 0, 'Restart After Power Failure: On'],
+      ['AutomaticInstallMacOSUpdates', 0, '0'],
+      ['AutomaticDownload', 0, '0'],
+    ] });
+    expect(partial.stdout).toContain('→ macOS 서버 전원·재시작 기본값 적용');
+    expect(partial.stdout).not.toContain('✓ macOS 서버 전원·재시작 기본값');
+  });
+
+  test('Darwin apply: passwordless sudo receives the requested server power defaults', () => {
+    const r = runNodeSetup({ os: 'Darwin', check: false, defaultRc: 0 });
+    expect(anyCall(r.invocations, 'sudo -n pmset -a autorestart 1 powernap 0 sleep 0 disksleep 0')).toBe(true);
+    expect(anyCall(r.invocations, 'sudo -n systemsetup -setrestartpowerfailure on')).toBe(true);
+    expect(anyCall(r.invocations, 'AutomaticInstallMacOSUpdates -bool false')).toBe(true);
+    expect(anyCall(r.invocations, 'AutomaticDownload -bool false')).toBe(true);
+    expect(r.stdout).toContain('✓ macOS 서버 전원·재시작 기본값 적용');
   });
 });

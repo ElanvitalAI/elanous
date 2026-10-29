@@ -33,6 +33,8 @@ import type {
   CoreTurnStopReason,
 } from './types.js';
 
+const CORE_TURN_TOOL_RESULT_INLINE_LIMIT_BYTES = 50 * 1024;
+
 /** Classify an error thrown out of `streamLLMWithTools` into the
  *  Core-turn stop-reason set. Abort wins over everything else;
  *  credential rejection (`isAuthRejectionError`) is distinct from a
@@ -329,6 +331,7 @@ export async function runCoreTurn(
         researchTurn,
         signal: ctx.signal,
         ...(ctx.requestSizeGuard ? { requestSizeGuard: ctx.requestSizeGuard } : {}),
+        toolResultInlineLimitBytes: CORE_TURN_TOOL_RESULT_INLINE_LIMIT_BYTES,
         ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
         ...(ctx.maxToolTurns !== undefined ? { maxTurns: ctx.maxToolTurns } : {}),
         ...(ctx.initialProvider !== undefined

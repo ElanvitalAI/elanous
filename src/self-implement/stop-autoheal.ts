@@ -13,11 +13,12 @@
  *   main-sync          → rebase-regate            리베이스(MERGE-INTENT-RESOLVE 의도 해석) 뒤 재게이트
  *   pod-died           → resume-from-salvage      `salvage/run-<6hex>/<leaf>` 가지에서 resume(DRAFT-NOT-ARCHIVE)
  *   evidence-uncovered → derive-evidence-rejudge  런 출력·시험·배선에서 증거를 끌어내 1회 재판정
+ *   review-budget-exhausted → needs-owner (code fallback; reauthor is an optional graph exit)
  *   review-repeat · review-out-of-scope · scope-escape · fabric · launch-failed · gate-failed · unclassified → needs-owner(새 라운드 없음)
  *
  * 사다리의 «출처»: `graphs/overlays/stop-heal-ladder.yaml` 이 갈래마다 처방 노드(id = 처방 이름)를 선언한다.
  *    그 갈래에 얹힌 오버레이가 더한 노드 id 가 처방이다(source='graph'). 선언이 없거나 못 읽으면
- *    위 표(`AUTOHEAL_ACTION_BY_CLASS`)로 간다(source='code-default'). 둘이 같은 답을 내는지는 시험이 문다.
+ *    위 표(`AUTOHEAL_ACTION_BY_CLASS`)로 간다(source='code-default'). 선택된 노드가 실제 실행 가능한지는 별도 경계다.
  *
  * 모드 `tools.selfImplement.autoheal.mode` = `shadow`(기본: 할 일을 원장에만 적고 손대지 않는다) | `live`.
  * ⛔ live 에서도 행동은 주입 seam 으로만 한다 — seam 이 없는 행동은 `needs-owner`(action-unwired)로 떨어진다.
@@ -44,6 +45,7 @@ export type AutohealAction =
   | 'rebase-regate'
   | 'resume-from-salvage'
   | 'derive-evidence-rejudge'
+  | 'review-round-reauthor'
   | 'needs-owner';
 
 /** 닫힌 목록 전체를 덮는다 — 새 class 가 생기면 여기서 타입 오류가 난다. */
@@ -55,6 +57,8 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
   'evidence-uncovered': 'derive-evidence-rejudge',
   'review-repeat': 'needs-owner',
   'review-out-of-scope': 'needs-owner',
+  // Reauthoring is an optional graph exit, not a code-level guarantee.
+  'review-budget-exhausted': 'needs-owner',
   'scope-escape': 'needs-owner',
   fabric: 'needs-owner',
   'launch-failed': 'needs-owner',
@@ -64,7 +68,7 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
 
 /** 처방 노드 id 로 인정하는 이름 — 오버레이가 더한 노드 중 이 넷만 처방으로 읽는다. */
 const HEAL_ACTION_NODE_IDS: ReadonlySet<string> = new Set<Exclude<AutohealAction, 'needs-owner'>>([
-  'clean-workspace-regate', 'rebase-regate', 'resume-from-salvage', 'derive-evidence-rejudge',
+  'clean-workspace-regate', 'rebase-regate', 'resume-from-salvage', 'derive-evidence-rejudge', 'review-round-reauthor',
 ]);
 
 /** 처방이 «어디서» 왔나 — `graph` = 그 갈래에 얹힌 오버레이가 더한 노드 · `code-default` = 위 표. */
@@ -75,6 +79,8 @@ export interface AutohealPick {
   source: AutohealActionSource;
   /** source='graph' 일 때 그 처방 노드를 더한 오버레이. */
   overlayId?: string;
+  /** Code fallback when an optional graph exit is not declared. */
+  fallbackReason?: string;
 }
 
 /** 사다리를 읽어 오는 자리 — 활성 템플릿 선언 ⊕ 오버레이 목록. 시험이 갈아 끼운다. */
@@ -93,7 +99,10 @@ function loadDefaultLadder(): AutohealLadder {
  *    «조용히» 코드 표로 간다 — 그 사실은 `source` 가 말한다. 던지지 않는다.
  */
 export function pickAutohealAction(cls: RunStopClass, loadLadder: () => AutohealLadder = loadDefaultLadder): AutohealPick {
-  const codeDefault: AutohealPick = { action: AUTOHEAL_ACTION_BY_CLASS[cls] ?? 'needs-owner', source: 'code-default' };
+  const codeDefault: AutohealPick = {
+    action: AUTOHEAL_ACTION_BY_CLASS[cls] ?? 'needs-owner', source: 'code-default',
+    ...(cls === 'review-budget-exhausted' ? { fallbackReason: 'declared-node-unavailable: review-round-reauthor' } : {}),
+  };
   try {
     const { template, overlays } = loadLadder();
     if (!template) return codeDefault;
@@ -297,8 +306,8 @@ export async function autohealFromStop(ctx: AutohealContext, deps: AutohealDeps 
   }
   const mode = deps.mode ?? DEFAULT_AUTOHEAL_MODE;
   const cls = ctx.record.class;
-  const { action, source, overlayId } = pickAutohealAction(cls, deps.loadLadder);
-  const base = { runId: ctx.runId, class: cls, action, source, ...(overlayId ? { overlayId } : {}), mode };
+  const { action, source, overlayId, fallbackReason } = pickAutohealAction(cls, deps.loadLadder);
+  const base = { runId: ctx.runId, class: cls, action, source, ...(overlayId ? { overlayId } : {}), ...(fallbackReason ? { fallbackReason } : {}), mode };
 
   if (repeatedStop(deps.priorStops, ctx.record)) {
     // ⛔ 같은 골에서 같은 갈래의 멈춤이 반복되면 자동 재시도를 하지 않는다 — 사유를 골 되먹임 대상으로 넘긴다.
@@ -329,7 +338,7 @@ export async function autohealFromStop(ctx: AutohealContext, deps: AutohealDeps 
   let detail: string | undefined;
   if (action === 'needs-owner') {
     outcome = 'needs-owner';
-    reason = `stop ${cls}: ${ctx.record.cause}`;
+    reason = `${fallbackReason ? `${fallbackReason}; ` : ''}stop ${cls}: ${ctx.record.cause}`;
   } else if (mode === 'shadow') {
     outcome = 'would-act';
   } else {

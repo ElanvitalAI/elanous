@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { GRAPH_SPECS } from './graph-templates.js';
-import { createGraphVariant, initialGraphVariantSelection, type GraphVariantPlan } from './graph-variant.js';
+import { createGraphVariant, hashUnitDeclarationContent, initialGraphVariantSelection, type GraphVariantPlan } from './graph-variant.js';
 import { edgeMapOf, type GraphTemplateSpec } from './graph-yaml.js';
 import { selectOverlays } from './graph-overlay-yaml.js';
 import { loadRunGraphVariant, runGraphVariantPath, runLedgerPath, saveRunGraphVariant } from './run-ledger.js';
@@ -171,6 +171,108 @@ describe('harness graph variant', () => {
       }), dir)).toBe(graphFile);
       expect(loadRunGraphVariant(runId, dir)).toEqual({ variantId: selection.variantId, reason: selection.reason });
       expect(runGraphVariantPath(runId, dir)).toBe(graphFile);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// GRAPH-UNIT-DECLARED-HASH — 한 런이 «어느 unit 선언 버전»을 읽었는지 내용 해시만 남겨 시험 fixture 와 정본 선언을 가른다.
+// ⛔ 선언 본문은 근거에 복제하지 않는다 — 경로·해시만.
+describe('GRAPH-UNIT-DECLARED-HASH: unit 선언 경로·내용 해시 근거', () => {
+  const goalAnalysis = { goalType: 'implement' as const, targetPathCount: 1 };
+  const declarationPath = 'graphs/self-implement.yaml';
+  // 같은 fixture 의 두 원문 — 정확히 «한 줄»만 다르다(recipe 값).
+  const originalUnit = 'unit: self-implement\nstep: review\nrecipe: unit\n';
+  const editedUnit = 'unit: self-implement\nstep: review\nrecipe: rework\n';
+
+  function variantOf(content: string, declarations?: readonly { readonly path: string; readonly content: string }[]) {
+    return createGraphVariant({ template, goal: 'g_unit_hash', plan, goalAnalysis,
+      unitDeclarations: declarations ?? [{ path: declarationPath, content }] });
+  }
+
+  test('unit 파일 한 줄만 바꾸면 변형 근거 해시가 달라지고 variantId·overlay 는 그대로다', () => {
+    const before = variantOf(originalUnit);
+    const after = variantOf(editedUnit);
+    expect(before.ok).toBe(true);
+    expect(after.ok).toBe(true);
+    if (!before.ok || !after.ok) return;
+
+    // ① 경로는 그대로, 내용 해시는 갈린다 — 두 원문을 가르는 유일한 근거.
+    const beforeEvidence = before.selection?.unitDeclarations;
+    const afterEvidence = after.selection?.unitDeclarations;
+    expect(beforeEvidence).toHaveLength(1);
+    expect(afterEvidence).toHaveLength(1);
+    expect(beforeEvidence?.[0]?.path).toBe(declarationPath);
+    expect(afterEvidence?.[0]?.path).toBe(declarationPath);
+    expect(beforeEvidence?.[0]?.contentHash).not.toBe(afterEvidence?.[0]?.contentHash);
+    expect(beforeEvidence?.[0]?.contentHash).toBe(hashUnitDeclarationContent(originalUnit));
+    expect(beforeEvidence?.[0]?.contentHash).toMatch(/^[0-9a-f]{64}$/);
+
+    // ② 변형 «신원» 은 unit 선언에 흔들리지 않는다 — id·선택 이유·overlay·patches 는 두 입력에서 같다.
+    expect(after.selection?.variantId).toBe(before.selection?.variantId);
+    expect(after.selection?.reason).toBe(before.selection?.reason);
+    expect(after.overlay).toEqual(before.overlay);
+    expect(after.patches).toEqual(before.patches);
+  });
+
+  test('근거에는 경로·해시만 실리고 unit 선언 본문은 결과 어디에도 복제되지 않는다', () => {
+    const result = variantOf(`unit_body_sentinel_7f3a: true\n${originalUnit}`);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain('unit_body_sentinel_7f3a');
+    expect(serialized).not.toContain('recipe: unit');
+    expect(Object.keys(result.selection ?? {}).sort()).toEqual(['reason', 'unitDeclarations', 'variantId']);
+  });
+
+  test('선언이 없으면 근거 키 자체가 없고, 정렬·중복은 결정론적이다', () => {
+    const withoutDeclarations = initialGraphVariantSelection(goalAnalysis);
+    expect(Object.keys(withoutDeclarations).sort()).toEqual(['reason', 'variantId']);
+
+    const ordered = initialGraphVariantSelection(goalAnalysis, [
+      { path: 'src/b.ts', content: 'b\n' },
+      { path: 'src/a.ts', content: 'a\n' },
+    ]);
+    const reversed = initialGraphVariantSelection(goalAnalysis, [
+      { path: 'src/a.ts', content: 'a\n' },
+      { path: 'src/b.ts', content: 'b\n' },
+    ]);
+    expect(ordered).toEqual(reversed);
+    expect(ordered.unitDeclarations?.map((entry) => entry.path)).toEqual(['src/a.ts', 'src/b.ts']);
+
+    // 같은 경로를 두 번 선언하면 마지막 해시 하나만 남는다 — 경로당 근거 한 줄.
+    const duplicated = initialGraphVariantSelection(goalAnalysis, [
+      { path: 'src/a.ts', content: 'a\n' },
+      { path: 'src/a.ts', content: 'a changed\n' },
+    ]);
+    expect(duplicated.unitDeclarations).toEqual([{ path: 'src/a.ts', contentHash: hashUnitDeclarationContent('a changed\n') }]);
+  });
+
+  test('원장 옆 .graph.yaml 이 unit 선언 경로·해시를 추가 키로 저장하고 재조회가 같은 값을 돌려준다', () => {
+    const variant = variantOf(originalUnit);
+    expect(variant.ok).toBe(true);
+    if (!variant.ok) return;
+    expect(variant.selection).toBeDefined();
+    if (variant.selection === undefined) return;
+    const { variantId, reason, unitDeclarations } = variant.selection;
+    expect(unitDeclarations).toBeDefined();
+    if (unitDeclarations === undefined) return;
+
+    const dir = mkdtempSync(join(tmpdir(), 'graph-unit-declared-hash-'));
+    try {
+      const runId = 'run-9f9f9f9f-2222-4333-8444-555566667777';
+      saveRunGraphVariant(runId, stringify({
+        graph_id: 'self-implement', variant_id: variantId, reason,
+        unit_declarations: unitDeclarations.map((entry) => ({ path: entry.path, content_hash: entry.contentHash })),
+        nodes: [], edges: [],
+      }), dir);
+      const loaded = loadRunGraphVariant(runId, dir);
+      // 보존 계약: 기존 두 키의 재조회는 «문자 그대로» 그대로다.
+      expect(loaded?.variantId).toBe(variantId);
+      expect(loaded?.reason).toBe(reason);
+      // 추가 키: 경로·해시가 원장에서 돌아온다.
+      expect(loaded?.unitDeclarations).toEqual(unitDeclarations);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

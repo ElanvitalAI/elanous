@@ -26,7 +26,7 @@ import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
 import { debug } from '../debug/log.js';
 import { ACP_BACKENDS, canonicalizeBackendId } from '../acp/backend-registry.js';
 import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationFromPr, reviewIntentTruncationObservation } from './review-intent.js';
-import { budgetReviewerContext, isNoneSentinelFinding, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
+import { NO_VERDICT_LINE_REASON, budgetReviewerContext, isNoneSentinelFinding, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
 import { getUserConfig, type LLMProviderName, type ReviewerMixSpec, type RoleLlmSpec, type SubscriptionReviewerSpec } from '../user-config.js';
 import { loadLlmPolicy } from '../policy/llm-policy.js';
@@ -96,6 +96,8 @@ export interface SelfReviewCliOpts {
   save?: string | undefined;
   /** Review only commits after a previously saved PR review head. */
   sinceReview?: string | undefined;
+  /** Internal delta self-heal metadata; never parsed from user CLI arguments. */
+  deltaHeal?: { cause: string; prescription: string } | undefined;
   /** One invocation past r5, only for a PR in OP's traffic.json allowlist; the reason is recorded before review starts. */
   overCapReason?: string | undefined;
 }
@@ -187,6 +189,7 @@ interface SavedReviewForDelta {
   mustFix: string[];
   reviewInputChars: number;
   reviewDurationMs: number;
+  result: Record<string, unknown>;
 }
 
 function selectSavedReviewForDelta(pr: string, selector: string, root = effectiveInstanceRoot()):
@@ -206,17 +209,20 @@ function selectSavedReviewForDelta(pr: string, selector: string, root = effectiv
     const row = raw as Record<string, unknown>;
     const recordPr = typeof row.pr === 'string' ? row.pr
       : Number.isSafeInteger(row.pr) ? String(row.pr) : undefined;
-    if (recordPr !== pr || row.reviewed !== true || typeof row.headCommit !== 'string' || !COMMIT_OID.test(row.headCommit)) continue;
+    if (recordPr !== pr || row.reviewed !== true || !['pass', 'warn', 'fail'].includes(String(row.verdict))
+      || typeof row.headCommit !== 'string' || !COMMIT_OID.test(row.headCommit)) continue;
     const named = name === token || name === `${token}.json` || name.startsWith(`${token}-${pr}-`);
     const byHead = /^[a-f0-9]{7,64}$/i.test(token) && row.headCommit.toLowerCase().startsWith(token.toLowerCase());
     if (!named && !byHead) continue;
-    if (!Array.isArray(row.mustFix) || !row.mustFix.every((item) => typeof item === 'string')) continue;
+    if (!Array.isArray(row.mustFix)) continue;
+    const mustFix = row.mustFix.filter((item): item is string => typeof item === 'string');
+    if (mustFix.length !== row.mustFix.length) continue;
     if (typeof row.reviewInputChars !== 'number' || !Number.isFinite(row.reviewInputChars) || row.reviewInputChars <= 0
       || typeof row.reviewDurationMs !== 'number' || !Number.isFinite(row.reviewDurationMs) || row.reviewDurationMs <= 0) continue;
     let mtimeMs = 0;
     try { mtimeMs = statSync(join(dir, name)).mtimeMs; } catch { continue; }
-    records.push({ file: name, headCommit: row.headCommit.toLowerCase(), mustFix: row.mustFix as string[],
-      reviewInputChars: row.reviewInputChars, reviewDurationMs: row.reviewDurationMs, mtimeMs });
+    records.push({ file: name, headCommit: row.headCommit.toLowerCase(), mustFix,
+      reviewInputChars: row.reviewInputChars, reviewDurationMs: row.reviewDurationMs, result: row, mtimeMs });
   }
   const distinctHeads = [...new Set(records.map((record) => record.headCommit))];
   if (distinctHeads.length > 1) return { error: 'saved-review-selector-ambiguous' };
@@ -1985,28 +1991,52 @@ async function runSelfReviewCliCommandPinned(
         ? `PR ${pr}: r5 상한 초과 리뷰는 OP traffic.json reviewOverCapAllow 허용 목록에 있어야 합니다.`
         : `PR ${pr}: 저장된 서로 다른 head 리뷰 ${previousRoundCount}개로 r5 상한에 도달했습니다. OP 허용 상태와 --over-cap-reason <사유>가 필요합니다.`;
       deps.observeDoctorReview?.('cap-refused', { pr, head: refusalHead, previousRoundCount, round: previousRoundCount + 1, reason: opAllowed ? 'missing-reason' : 'not-op-allowlisted' }, { level: 'warn' });
+      if (opts.sinceReview !== undefined) deps.log('review.delta-heal', {
+        pr, cause: 'cap-refused', prescription: 'retain-explicit-refusal', result: 'refused', headCommit: refusalHead,
+      }, { level: 'warn' });
       deps.error(message);
-      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: refusalHead });
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused',
+        ...(opts.sinceReview !== undefined ? { verdict: null, deltaOutcome: 'refused', deltaRefusal: 'cap-refused' } : {}),
+        previousRoundCount, headCommit: refusalHead });
       failed += 1;
       continue;
     }
     let deltaBase: SavedReviewForDelta | undefined;
+    let deltaHeal = opts.deltaHeal;
     if (opts.sinceReview !== undefined) {
       const selected = selectSavedReviewForDelta(pr, opts.sinceReview);
       if ('error' in selected) {
-        const message = `PR ${pr}: --since-review 기준을 읽지 못했습니다 (${selected.error}).`;
-        deps.error(message);
-        if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'delta-base-invalid', deltaRefusal: selected.error });
-        failed += 1;
-        continue;
+        if (selected.error === 'saved-review-directory-missing'
+          || selected.error === 'saved-review-not-found-or-missing-efficiency-receipt') {
+          deltaHeal = { cause: 'no-prior-reviewed-head', prescription: 'full-review-once' };
+        } else {
+          const message = `PR ${pr}: --since-review 기준을 읽지 못했습니다 (${selected.error}).`;
+          deps.error(message);
+          if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,
+            refusal: 'delta-base-invalid', deltaOutcome: 'refused', deltaRefusal: selected.error });
+          failed += 1;
+          continue;
+        }
+      } else {
+        deltaBase = selected.review;
       }
-      deltaBase = selected.review;
     }
     const diffResult = deltaBase ? readDeltaDiffAtHead(pr, deltaBase.headCommit, deps) : { read: readDiffAtHead(pr, deps) };
     if ('error' in diffResult) {
+      if (diffResult.error === 'no-new-head-since-review' && deltaBase) {
+        const reused = { ...deltaBase.result, deltaOutcome: 'reused', deltaHeal: {
+          cause: 'no-new-head', prescription: 'reuse-saved-verdict', result: 'verdict-reused',
+        } };
+        deps.log('review.delta-heal', { pr, cause: 'no-new-head', prescription: 'reuse-saved-verdict',
+          result: 'verdict-reused', headCommit: diffResult.headCommit ?? deltaBase.headCommit }, { level: 'info' });
+        if (opts.json || opts.save !== undefined) results.push(reused);
+        else deps.print(`\n━━ PR ${pr} (${String(deltaBase.result.model ?? 'saved review')}) ━━\n${deps.renderReview(reused as unknown as ReviewResult)}\n판정 재사용: ${deltaBase.headCommit}`);
+        continue;
+      }
       const message = `PR ${pr}: 델타 리뷰를 고정하지 못했습니다 (${diffResult.error}).`;
       deps.error(message);
-      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'delta-base-invalid', deltaRefusal: diffResult.error,
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,
+        refusal: 'delta-base-invalid', deltaOutcome: 'refused', deltaRefusal: diffResult.error,
         ...(diffResult.headCommit ? { headCommit: diffResult.headCommit } : {}) });
       failed += 1;
       continue;
@@ -2494,41 +2524,63 @@ async function runSelfReviewCliCommandPinned(
       claudeFallbackGlm = { reason, model: ZAI_OPENROUTER_FALLBACK_MODEL, glmReviewed: glmFailureReason === undefined,
         ...(glmFailureReason !== undefined ? { glmFailureReason } : {}) };
     }
+    if (deltaBase && review.reviewed !== true && review.failureReason === NO_VERDICT_LINE_REASON) {
+      let retryReview: ReviewResult;
+      try {
+        retryReview = await deps.reviewPullRequest(reviewInput, llmReview ?? prAcpReviewLLM ?? makeApi());
+      } catch (error) {
+        retryReview = { verdict: 'fail', mustFix: [], shouldFix: [], reviewed: false,
+          failureReason: safeLogText(error instanceof Error ? error.message : String(error), 400) };
+      }
+      if (retryReview.reviewed === true) {
+        review = retryReview;
+        deltaHeal = { cause: 'no-verdict-line', prescription: 'retry-delta-once' };
+      } else {
+        const retryResult = safeLogText(retryReview.failureReason === NO_VERDICT_LINE_REASON
+          ? 'no-verdict-line' : `retry-failed-${retryReview.failureReason || 'reviewed-false'}`, 400);
+        deps.log('review.delta-heal', { pr, cause: 'no-verdict-line', prescription: 'retry-delta-once',
+          result: retryResult, headCommit: diffRead.headCommit }, { level: 'warn' });
+        reviewPin?.remove();
+        const fallback = await runSelfReviewCliCommandPinned([pr], {
+          ...opts, sinceReview: undefined,
+          reviewerMixCapClaimed: opts.reviewerMixCapClaimed || Boolean(claimedCapPath),
+          deltaHeal: { cause: 'no-verdict-line', prescription: 'full-review-once-after-delta-retry' },
+        }, deps, pins);
+        results.push(...fallback.results);
+        failed += fallback.failed;
+        releaseCapClaim();
+        continue;
+      }
+    }
     const reviewDurationMs = Math.max(0, deps.now() - startedAt);
     let deltaReceipt: Record<string, unknown> = {};
     if (deltaBase) {
       const assessed = assessDeltaReview(review, deltaBase);
+      const inputRatio = reviewInputChars / deltaBase.reviewInputChars;
+      const timeRatio = reviewDurationMs / deltaBase.reviewDurationMs;
+      const maxRatio = 1 / 3;
       const deltaEfficiency = {
-        inputRatio: reviewInputChars / deltaBase.reviewInputChars,
-        timeRatio: reviewDurationMs / deltaBase.reviewDurationMs,
-        maxRatio: 1 / 3,
+        inputRatio, timeRatio, maxRatio,
+        withinTarget: inputRatio <= maxRatio && timeRatio <= maxRatio,
       };
-      const efficient = deltaEfficiency.inputRatio <= deltaEfficiency.maxRatio
-        && deltaEfficiency.timeRatio <= deltaEfficiency.maxRatio;
       if (review.reviewed !== true) {
         const reason = review.failureReason || 'delta-review-not-completed';
         review = { ...review, reviewed: false, verdict: 'fail', mustFix: [], shouldFix: [], failureReason: reason };
         deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
           deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency,
-          deltaRefusal: 'delta-review-not-completed' };
+          deltaOutcome: 'refused', deltaRefusal: 'delta-review-not-completed' };
       } else if (!assessed.valid) {
         review = { ...review, reviewed: false, verdict: 'fail', mustFix: [], shouldFix: [],
           failureReason: assessed.reason };
         deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
           deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency,
-          deltaRefusal: assessed.reason };
-      } else if (!efficient) {
-        review = { ...review, reviewed: false, verdict: 'fail', mustFix: [], shouldFix: [],
-          failureReason: 'delta-efficiency-limit-exceeded' };
-        deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
-          deltaFindings: assessed.deltaFindings, deltaInputChars: reviewInputChars,
-          deltaDurationMs: reviewDurationMs, deltaEfficiency, deltaRefusal: 'delta-efficiency-limit-exceeded' };
+          deltaOutcome: 'refused', deltaRefusal: assessed.reason };
       } else {
         review = { ...review, reviewed: true, verdict: assessed.mustFix.length ? 'fail' : 'pass',
           mustFix: assessed.mustFix, shouldFix: [] };
         deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
           deltaFindings: assessed.deltaFindings, excludedNewFindings: assessed.excludedNewFindings,
-          deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency };
+          deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency, deltaOutcome: 'reviewed' };
       }
     }
     reviewPin?.remove();
@@ -2661,12 +2713,22 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
-    const jsonReview = review.reviewed === true ? review : { ...review, verdict: null };
+    const jsonReview = review.reviewed === true ? review : { ...review, verdict: null,
+      ...(deltaHeal ? { failureReason: safeLogText(review.failureReason || 'reviewed-false', 400) } : {}) };
     // ⛔ 금지 백엔드가 낸 판정은 «근거 거부»다 — verdict·mustFix 를 그대로 실어 보내면 읽는 쪽이
     //    그것을 착지 판정으로 쓴다(관문도 reviewed===true 를 근거 조건으로 본다).
     const refusalOverride = landingGateAdmitted ? {} : { reviewed: false, verdict: null, refusal: 'review-forbidden-acp-backend' as const };
+    const deltaHealResult = safeLogText(review.reviewed === true && landingGateAdmitted
+      ? `verdict-${review.verdict}` : `refused-${review.failureReason || (landingGateAdmitted ? 'reviewed-false' : 'landing-gate')}`, 400);
+    if (deltaHeal) deps.log('review.delta-heal', { pr, cause: deltaHeal.cause,
+      prescription: deltaHeal.prescription, result: deltaHealResult, headCommit: diffRead.headCommit },
+    { level: review.reviewed === true && landingGateAdmitted ? 'info' : 'warn' });
+    const deltaHealOutput = deltaHeal ? {
+      ...(deltaBase ? {} : { deltaOutcome: review.reviewed === true && landingGateAdmitted ? 'healed-full-review' : 'refused' }),
+      deltaHeal: { ...deltaHeal, result: deltaHealResult },
+    } : {};
     const resultOutput = { pr, model: selectedModel, ...jsonReview, reviewInputChars, reviewDurationMs,
-      ...(deltaBase ? deltaReceipt : {}), ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
+      ...(deltaBase ? deltaReceipt : {}), ...deltaHealOutput, ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
       ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields,
       findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles,
       ...(evidence.authoredFiles !== undefined ? { authoredFiles: evidence.authoredFiles } : {}) };

@@ -78,6 +78,8 @@ export interface GateArtifactSummary extends GateArtifactCounts {
   head40: string | null;
   base40: string | null;
   envKey: string;
+  /** Seat self-gate marker observed at process entry (true only for ELANOUS_TRAIN_GATE=1). */
+  trainGate?: boolean;
   shards: number;
   cohort: string[];
   shardsDetail: GateArtifactShard[];
@@ -128,6 +130,7 @@ export interface GateArtifactInput {
   head40: string | null;
   base40: string | null;
   envKey: string;
+  trainGate?: boolean;
   testFiles: readonly string[];
   verdict: string | null;
   verdictLine?: string;
@@ -218,6 +221,7 @@ export function writeGateArtifacts(input: GateArtifactInput): { summaryPath: str
     head40: input.head40,
     base40: input.base40,
     envKey: input.envKey,
+    ...(input.trainGate !== undefined ? { trainGate: input.trainGate } : {}),
     shards: input.sharded ? input.sharded.shards.length : 0,
     cohort: sorted(input.testFiles),
     shardsDetail,
@@ -251,12 +255,14 @@ export function writeRemoteUnavailableGateArtifacts(
   reason: 'remote-unsupported' | 'remote-fetch-failed',
   resolveRev: RevResolver = defaultRevResolver(cwd),
   envKey: () => string = defaultGateEnvKey,
+  trainGate?: boolean,
 ): { summaryPath: string; junitFiles: string[] } {
   return writeGateArtifacts({
     dir: resolveArtifactDir(dir, cwd),
     head40: resolveRev('HEAD'),
     base40: baseRef ? resolveRev(baseRef) : null,
     envKey: envKey(),
+    trainGate,
     testFiles: [],
     verdict: null,
     exitCode,
@@ -264,6 +270,13 @@ export function writeRemoteUnavailableGateArtifacts(
     countsUnavailableReason: reason,
     artifactsUnavailable: reason,
   });
+}
+
+/** The local train wrapper owns the receipt marker, including when artifacts came from a remote host. */
+export function recordGateTrainMarker(summaryPath: string, trainGate: boolean): void {
+  const summary = JSON.parse(readFileSync(summaryPath, 'utf8')) as Record<string, unknown>;
+  summary.trainGate = trainGate;
+  writeFileSync(summaryPath, `${JSON.stringify(summary, null, 2)}\n`);
 }
 
 // ── 원격 산출 회수 (SIDE-VERIFY-GATE-SHARDS ②) ──────────────────────────────

@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ensurePrLandHeavyRemote, PR_LAND_HEAVY_HOSTS } from './pr-land-heavy-remote.js';
@@ -435,22 +436,69 @@ test('schema 2 success without new extra-gate status cannot skip remote gates', 
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
 
+test('LAND-HEAVY-MULTIHOST-FU: WSL production gate requires the complete measured heavy-gate command before caching', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
+  const input = { pr: 74, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
+  const calls: RemoteRunOptions[] = [];
+  try {
+    const passing = ensurePrLandHeavyRemote(input, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl', hostCaps: { 'host-e-wsl': 2 } },
+      observe: () => {},
+      runRemote: (options: RemoteRunOptions) => {
+        calls.push(options);
+        return {
+          kind: 'ran', rc: 0,
+          stdout: Buffer.from('[tsc-gate] root-plan {"mode":"affected","roots":3,"promoted":false,"reason":"changed"}\n[pr-land-extra-gates] pass global=measured interference=measured files=2\n'),
+          stderr: Buffer.alloc(0), commit: options.commit!, host: options.host, ms: 9,
+        };
+      },
+    });
+    expect(passing).toMatchObject({ ok: true, source: 'remote', host: 'host-e-wsl', interferenceMeasured: true });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ host: 'host-e-wsl', hostCap: 2, commit: HEAD, refs: [MAIN], installPwa: true, stableCheckout: true });
+    const argv = (calls[0]!.argv as (sha: (ref: string) => string) => string[])((ref) => ref);
+    expect(argv[2]).toContain('git -c user.name=elanous-gate');
+    expect(argv[2]).toContain('TSC_BASE_REF="$1" bun run scripts/ci-typecheck-changed.ts --local');
+    expect(argv[2]).toContain('self gate --changed --base "$1" --local --shards 4');
+    expect(argv[2]).toContain('bun scripts/pr-land-extra-remote-gates.ts "$1"');
+    expect(JSON.parse(readFileSync(join(evidenceDir, '74.json'), 'utf8')))
+      .toMatchObject({ schema: 2, host: 'host-e-wsl', head: HEAD, main: MAIN, interferenceMeasured: true });
+
+    const unmeasured = ensurePrLandHeavyRemote({ ...input, pr: 75 }, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' }, observe: () => {},
+      runRemote: (options: RemoteRunOptions) => ({
+        kind: 'ran', rc: 0, stdout: Buffer.from('self gate passed without extra gate measurement'),
+        stderr: Buffer.alloc(0), commit: HEAD, host: options.host, ms: 9,
+      }),
+    });
+    expect(unmeasured).toMatchObject({ ok: false, source: 'unmeasured', reason: expect.stringContaining('extra-global-unmeasured') });
+    expect(existsSync(join(evidenceDir, '75.json'))).toBe(false);
+  } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
+
 test('the WSL host is allowlisted third and its run is reusable landing evidence', () => {
   expect(PR_LAND_HEAVY_HOSTS).toEqual(['node-b', 'node-c', 'host-e-wsl']);
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
   const input = { pr: 54, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
-  const hosts: string[] = [];
-  const events: Record<string, unknown>[] = [];
+    const hosts: string[] = [];
+    const events: Record<string, unknown>[] = [];
+    let wslRun: RemoteRunOptions | undefined;
   try {
     const result = ensurePrLandHeavyRemote(input, {
       settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' }, observe: (_event, data) => { events.push(data); },
       runRemote: (options: RemoteRunOptions) => {
         hosts.push(options.host);
+        if (options.host !== 'host-e-wsl') return { kind: 'busy' };
+        wslRun = options;
         return { kind: 'ran', rc: 0, stdout: extraPass, stderr: Buffer.alloc(0), commit: HEAD, host: options.host, ms: 7 };
       },
     });
     expect(result).toMatchObject({ ok: true, source: 'remote', host: 'host-e-wsl' });
     expect(hosts).toEqual(['host-e-wsl']);
+    expect(wslRun).toMatchObject({ host: 'host-e-wsl', commit: HEAD, refs: [MAIN], installPwa: true, stableCheckout: true });
+    const wslArgv = wslRun!.argv as (sha: (ref: string) => string) => string[];
+    expect(wslArgv((ref) => ref)).toEqual(['sh', '-c', expect.stringContaining('git -c user.name=elanous-gate') , 'sh', MAIN]);
+    expect(wslArgv((ref) => ref).join(' ')).toContain('self gate --changed --base "$1" --local --shards 4');
     expect(events[0]).toMatchObject({ host: 'host-e-wsl', attemptedHost: 'host-e-wsl', outcome: 'pass' });
     expect(JSON.parse(readFileSync(join(evidenceDir, '54.json'), 'utf8')))
       .toMatchObject({ schema: 2, host: 'host-e-wsl', head: HEAD, main: MAIN, interferenceMeasured: true });
@@ -461,7 +509,7 @@ test('the WSL host is allowlisted third and its run is reusable landing evidence
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
 
-test('a busy WSL primary falls back to the stable hosts in allowlist order', () => {
+test('a busy WSL primary falls back through stable hosts in allowlist order', () => {
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
   const input = { pr: 55, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
   const hosts: string[] = [];
@@ -549,6 +597,104 @@ test('busy node-b selects node-c and caches only its exact head/main evidence', 
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
 
+test('LAND-HEAVY-MULTIHOST-FU: configured WSL is tried first before allowlisted fallbacks', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
+  const input = { pr: 73, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
+  const hosts: string[] = [];
+  try {
+    const result = ensurePrLandHeavyRemote(input, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl', slotWaitSeconds: 0 },
+      observe: () => {},
+      runRemote: (options: RemoteRunOptions) => {
+        hosts.push(options.host);
+        return { kind: 'busy' };
+      },
+    });
+    expect(result).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-busy' });
+    expect(hosts).toEqual(['host-e-wsl', 'node-b', 'node-c']);
+  } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
+
+test('LAND-HEAVY-MULTIHOST-FU: production argv executes in an isolated remote mock and gate failure refuses landing', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
+  const binDir = join(evidenceDir, 'bin');
+  mkdirSync(binDir);
+  const input = { pr: 74, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
+  const execute = (failGate: boolean) => {
+    const argvRuns: string[][] = [];
+    const commandLog = join(evidenceDir, 'commands.log');
+    const runRemote = (options: RemoteRunOptions) => {
+      const argv = (options.argv as (sha: (ref: string) => string) => string[])((ref) => ref === MAIN ? MAIN : HEAD);
+      argvRuns.push(argv);
+      const result = spawnSync(argv[0]!, argv.slice(1), {
+        cwd: evidenceDir,
+        env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, MOCK_FAIL_GATE: failGate ? '1' : '0' },
+        encoding: 'utf8',
+      });
+      return { kind: 'ran' as const, rc: result.status ?? 1,
+        stdout: Buffer.from(result.stdout), stderr: Buffer.from(result.stderr), commit: HEAD, host: options.host, ms: 4 };
+    };
+    writeFileSync(join(binDir, 'git'), `#!/bin/sh\nprintf 'git %s\\n' "$*" >> '${commandLog}'\nexit 0\n`);
+    writeFileSync(join(binDir, 'bun'), `#!/bin/sh\nprintf 'bun %s\\n' "$*" >> '${commandLog}'\ncase "$*" in *"self gate"*) [ "$MOCK_FAIL_GATE" = 1 ] && { echo "gate failure" >&2; exit 19; };; esac\ncase "$*" in *"pr-land-extra-remote-gates.ts"*) echo "[pr-land-extra-gates] pass global=measured interference=measured files=2";; esac\nexit 0\n`);
+    chmodSync(join(binDir, 'git'), 0o755);
+    chmodSync(join(binDir, 'bun'), 0o755);
+    const result = ensurePrLandHeavyRemote(input, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' }, observe: () => {}, runRemote,
+    });
+    return { result, argvRuns };
+  };
+  try {
+    const passed = execute(false);
+    expect(passed.result).toMatchObject({ ok: true, source: 'remote', host: 'host-e-wsl' });
+    expect(passed.argvRuns[0]).toEqual(['sh', '-c', expect.any(String), 'sh', MAIN]);
+    expect(passed.argvRuns[0]![2]).toContain('self gate --changed --base "$1" --local --shards 4');
+    expect(readFileSync(join(evidenceDir, 'commands.log'), 'utf8')).toContain(`bun bin/elanous.mjs self gate --changed --base ${MAIN} --local --shards 4`);
+    expect(readFileSync(join(evidenceDir, 'commands.log'), 'utf8')).toContain(`bun scripts/pr-land-extra-remote-gates.ts ${MAIN}`);
+    rmSync(join(evidenceDir, '74.json'));
+    writeFileSync(join(evidenceDir, 'commands.log'), '');
+    const failed = execute(true);
+    expect(failed.result).toMatchObject({ ok: false, source: 'unmeasured', attemptedHost: 'host-e-wsl', reason: expect.stringContaining('gate-rc-19') });
+    expect(existsSync(join(evidenceDir, '74.json'))).toBe(false);
+    expect(failed.argvRuns).toHaveLength(1);
+    const failedCommands = readFileSync(join(evidenceDir, 'commands.log'), 'utf8');
+    expect(failedCommands).toContain(`bun bin/elanous.mjs self gate --changed --base ${MAIN} --local --shards 4`);
+    expect(failedCommands).not.toContain('pr-land-extra-remote-gates.ts');
+    expect(failedCommands).toContain('bun run scripts/ci-typecheck-changed.ts --local');
+    expect(failedCommands).toContain('git -c user.name=elanous-gate');
+    expect(PR_LAND_HEAVY_HOSTS).toEqual(['node-b', 'node-c', 'host-e-wsl']);
+    const landingAttemptHosts: string[] = [];
+    expect(ensurePrLandHeavyRemote({ ...input, pr: 75 }, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl', slotWaitSeconds: 0 }, observe: () => {},
+      runRemote: (options: RemoteRunOptions) => {
+        landingAttemptHosts.push(options.host);
+        return { kind: 'busy' };
+      },
+    })).toMatchObject({ ok: false, reason: 'gate-host-busy' });
+    expect(landingAttemptHosts).toEqual(['host-e-wsl', 'node-b', 'node-c']);
+  } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
+
+test('each configured allowlisted host leads and fallback visits only the remaining hosts in stable order', () => {
+  for (const preferredHost of PR_LAND_HEAVY_HOSTS) {
+    const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
+    const hosts: string[] = [];
+    try {
+      const result = ensurePrLandHeavyRemote({ pr: 76, head: HEAD, main: MAIN, repo: '/repo', evidenceDir }, {
+        settings: { ...GATE_REMOTE_DEFAULTS, host: preferredHost, slotWaitSeconds: 0 },
+        observe: () => {},
+        runRemote: (options: RemoteRunOptions) => {
+          hosts.push(options.host);
+          return { kind: 'busy' };
+        },
+      });
+      const fallbackHosts = PR_LAND_HEAVY_HOSTS.filter((host) => host !== preferredHost);
+      expect(hosts).toEqual([preferredHost, fallbackHosts[0], fallbackHosts[1]]);
+      expect(result).toMatchObject({ ok: false, source: 'unmeasured', reason: 'gate-host-busy', attemptedHost: fallbackHosts[1] });
+      expect(existsSync(join(evidenceDir, '76.json'))).toBe(false);
+    } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+  }
+});
+
 test('all three allowlisted hosts busy block landing and a failed gate never tries the next host', () => {
   const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
   const input = { pr: 53, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
@@ -619,6 +765,28 @@ test('a busy host that frees within slotWaitSeconds is used for landing', () => 
     expect(hosts).toEqual(['node-b', 'node-c', 'host-e-wsl', 'node-b']);
     expect(JSON.parse(readFileSync(join(evidenceDir, '71.json'), 'utf8'))).toMatchObject({ host: 'node-b' });
     expect(clock).toBe(15_000);
+  } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
+
+test('LAND-HEAVY-MULTIHOST-FU: malformed cached root-plan evidence is remeasured on the selected allowlisted host', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
+  const input = { pr: 73, head: HEAD, main: MAIN, repo: '/repo', evidenceDir };
+  mkdirSync(evidenceDir, { recursive: true });
+  writeFileSync(join(evidenceDir, '73.json'), `${JSON.stringify({
+    schema: 2, pr: 73, head: HEAD, main: MAIN, host: 'host-e-wsl', passedAt: '2026-10-14T00:00:00.000Z',
+    elapsedMs: 12, rootPlan: { mode: 'affected', roots: -1, promoted: 'false', reason: 7 }, interferenceMeasured: true,
+  })}\n`);
+  const hosts: string[] = [];
+  try {
+    expect(ensurePrLandHeavyRemote(input, {
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'host-e-wsl' }, observe: () => {},
+      runRemote: (options: RemoteRunOptions) => {
+        hosts.push(options.host);
+        return { kind: 'ran', rc: 0, stdout: extraPass, stderr: Buffer.alloc(0), commit: HEAD, host: options.host, ms: 7 };
+      },
+    })).toMatchObject({ ok: true, source: 'remote', host: 'host-e-wsl' });
+    expect(hosts).toEqual(['host-e-wsl']);
+    expect(JSON.parse(readFileSync(join(evidenceDir, '73.json'), 'utf8')).rootPlan).toBeNull();
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
 });
 

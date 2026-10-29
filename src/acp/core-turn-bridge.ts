@@ -57,6 +57,13 @@ import { resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import { classifyTuiChatIntent, formatTuiRouteLine, isSeatOpsDirective, type TuiChatRoute } from '../core-turn/short-question.js';
 import { HARNESS_ROLE_ENV } from '../harness/harness-space.js';
 import { createReasoningThoughtBuffer } from './reasoning-thought-buffer.js';
+import {
+  REQUEST_SIZE_MAX_CHARS,
+  createRequestSizeGuard,
+  estimateRequestChars,
+  formatRequestSizeStatus,
+  type RequestSizeGuard,
+} from '../session/request-size-guard.js';
 
 const FACT_QUESTION_INSTRUCTION = '사실·최신 정보 질문이다. WebSearch 를 1~2회 쓰고 검색 결과(제목·스니펫·URL)로 답하라. 출처 링크를 붙여라. 셸·브라우저·파일 도구는 검색 결과로 부족할 때만. 도구 예산에 닿으면 지금까지 근거로 답하고 끝에 «더 찾아볼까요?»를 붙여라.';
 
@@ -143,6 +150,18 @@ export interface CoreTurnBridgeDeps {
   /** TUI-H1-SEAT-GOALLOOP — the seat this TUI works for (`detectSeatTui`), read per turn. null/absent = a human
    *  conversation TUI (routing unchanged). A seat TUI sends operational directives to the goal loop. */
   resolveSeat?: () => string | null;
+  /** TUI-TOKEN-GUARD-WIRE — host write-back for the #32254 request-size cap.
+   *  Compacts the host's own history store (the one `getMessages` reads) in place
+   *  so the next prompt does not reload the original. The bridge re-reads
+   *  `getMessages` after `fired:true`. Only consulted on `tuiRouting` turns. */
+  compactPersistedHistory?: (ctx: {
+    sessionId: string;
+    userText: string;
+    requestChars: number;
+    maxChars: number;
+  }) => Promise<{ fired: boolean; reason: string }>;
+  /** Override the request-size cap (tests). Defaults to `REQUEST_SIZE_MAX_CHARS`. */
+  requestSizeMaxChars?: number;
 }
 
 /** Default abort-poll cadence. 50ms = 20 Hz: responsive without
@@ -224,7 +243,7 @@ export function bridgeCoreTurnToAcp(
     (poll as unknown as { unref?: () => void }).unref?.();
 
     try {
-      const messages = await Promise.resolve(
+      let messages = await Promise.resolve(
         deps.getMessages({
           sessionId: turnCtx.sessionId,
           userText: turnCtx.userText,
@@ -318,9 +337,71 @@ export function bridgeCoreTurnToAcp(
       }
       const explicitMaxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
       const maxToolTurns = explicitMaxToolTurns ?? (factQuestion ? getUserConfig().chat.factQuestion.maxToolTurns : undefined);
-      const turnMessages: LLMMessage[] = factQuestion
-        ? [{ role: 'system', content: FACT_QUESTION_INSTRUCTION }, ...messages]
-        : messages;
+      const withFactInstruction = (seed: LLMMessage[]): LLMMessage[] => factQuestion
+        ? [{ role: 'system', content: FACT_QUESTION_INSTRUCTION }, ...seed]
+        : seed;
+      let turnMessages: LLMMessage[] = withFactInstruction(messages);
+      // TUI-TOKEN-GUARD-WIRE — exact serialized provider measurement owns
+      // first-request compaction; the seed estimate is telemetry only. This
+      // keeps turn-0 history untouched until compactFirstRequest writes back.
+      let requestSizeGuard: RequestSizeGuard | undefined;
+      if (deps.tuiRouting === true) {
+        const maxChars = deps.requestSizeMaxChars ?? REQUEST_SIZE_MAX_CHARS;
+        let historyCompacted = false;
+        const compactHistory = async (requestChars: number, stage: 'first-request') => {
+          if (!deps.compactPersistedHistory || historyCompacted) return false;
+          let fired = false;
+          let reason = 'no-op';
+          try {
+            const result = await deps.compactPersistedHistory({
+              sessionId: turnCtx.sessionId, userText: turnCtx.userText, requestChars, maxChars,
+            });
+            fired = result.fired;
+            reason = result.reason;
+            historyCompacted = fired;
+          } catch (error) {
+            reason = 'compaction-error';
+            debug.log('llm.request', 'request-size-compact-error', {
+              stage, requestChars, maxChars, message: error instanceof Error ? error.message : String(error),
+            }, { level: 'warn' });
+          }
+          return { fired, reason };
+        };
+        const estimatedSeedChars = estimateRequestChars(turnMessages, tools);
+        debug.log('llm.request', 'request-size-compact', {
+          stage: 'estimate', sessionId: turnCtx.sessionId,
+          beforeChars: estimatedSeedChars, maxChars,
+          compacted: false, reason: 'awaiting-exact-wire-measurement',
+        });
+        requestSizeGuard = createRequestSizeGuard({
+          maxChars,
+          compactOptions: () => {
+            const guardModel = modelOverride ?? getUserConfig().llm?.model;
+            const guardConfig = getUserConfig().chat;
+            const preserveLastN = guardConfig?.autoCompact?.preserveLastN;
+            const archiveEnabled = guardConfig?.compact?.archiveEnabled;
+            return {
+              sessionId: turnCtx.sessionId,
+              ...(guardModel ? { activeModelId: guardModel } : {}),
+              ...(preserveLastN !== undefined ? { preserveLastN } : {}),
+              ...(archiveEnabled !== undefined ? { archiveEnabled } : {}),
+            };
+          },
+          // The preflight estimate missed (wire over cap, seed under): still write the
+          // compaction back so the next prompt starts small, then compact this request live.
+          compactFirstRequest: async (_current, info) => {
+            await compactHistory(info.requestChars, 'first-request');
+            return null;
+          },
+          onMeasured: (measurement) => {
+            if (!measurement.compacted) return;
+            void turnCtx.pushSessionUpdate(
+              { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: formatRequestSizeStatus(measurement) } },
+              { status: true },
+            );
+          },
+        });
+      }
       let toolCallCount = 0;
       const toolKinds = new Set<string>();
       const observeToolBudget = () => {
@@ -434,6 +515,7 @@ export function bridgeCoreTurnToAcp(
         ...(modelOverride !== undefined ? { modelOverride } : {}),
         ...(autohealProvider ?? {}),
         ...(maxToolTurns !== undefined ? { maxToolTurns } : {}),
+        ...(requestSizeGuard ? { requestSizeGuard } : {}),
         ...((!factQuestion || explicitMaxToolTurns !== undefined) && deps.budgetGrant !== undefined ? { budgetGrant: deps.budgetGrant } : {}),
         callbacks: {
           onStatus: (line) => {

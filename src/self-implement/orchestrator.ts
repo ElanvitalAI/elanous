@@ -107,8 +107,9 @@ import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-ru
 import { writeGoalRunRecordFragment } from './goal-execution-records.js';
 import { getUserConfig } from '../user-config.js';
 import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
-import { classifyMergeHoldStop, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
-import { autohealFromStop, parseAutohealMode, type AutohealActions, type AutohealResult } from './stop-autoheal.js';
+import { classifyMergeHoldStop, classifyTerminalHarnessFailure, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
+import { autohealFromStop, parseAutohealMode, pickAutohealAction, type AutohealActions, type AutohealResult } from './stop-autoheal.js';
+import { operationalAutohealActions } from './stop-autoheal-operational.js';
 import { recordParentNeedsOwnerVisit } from './doctor-visit.js';
 import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSupersedeOpenDraft } from './lineage-supersede.js';
@@ -136,7 +137,7 @@ import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
 import { askAtExecution, type ExecutionClarificationResult } from './execution-clarification.js';
 import { decideScopeExpansion, renderScopeExpansionSection, SCOPE_EXPANSION_CAP, type ScopeExpansion, type ScopeStopReason } from './scope-adjacency.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
-import { selectKnowhowPack } from './knowhow-pack.js';
+import { selectKnowhowPack, selectHealKnowhowPack } from './knowhow-pack.js';
 import { declaredNewFilePaths } from './goal-new-paths.js';
 import { dropStaleReverts, type RevertGuardResult } from './revert-guard.js';
 import type { SelfDevGoalType } from '../self-dev/orchestrate.js';
@@ -321,7 +322,14 @@ import { buildRuntimeOverlayState } from './graph-overlay-condition.js';
 import { activeTemplate, decideTemplate, graphAuthorityFields, nodeNameForStage, overlayDecisionObservation, resolveGraphAuthorityForUserConfig, routeGate, visitBudgetOf } from './graph-authority.js';
 import type { GraphTemplate } from './graph-templates.js';
 import { defaultOverlaysDir, loadGraphOverlays, type GraphOverlaySpec } from './graph-overlay-yaml.js';
-import { graphIdentityOf, measureL0Coverage, pipelineNodeEntryPayload } from './graph-templates.js';
+import { defaultGraphsDir, graphIdentityOf, measureL0Coverage, pipelineNodeEntryPayload } from './graph-templates.js';
+import {
+  buildStageNodeContext,
+  resolveGraphStageUnits,
+  stageNodeContextObservation,
+  stageUnitDrift,
+  type StageNodeContext,
+} from './graph-stage-units.js';
 import { AMBIGUOUS_STAGES, checkPipelineTraversal, nodesForStage, pipelineGraphIdentity, TERMINAL_STAGES_BY_NODE, type PipelineNodeId, type PipelineTraversalCheck } from './pipeline-shape.js';
 import { appendGateWorktreeFreshnessEvidence, gateEvidenceNote } from '../harness/review-adapter.js';
 import { diffHeaderPaths } from '../agent-substrate/self-review-cli.js';
@@ -1061,6 +1069,8 @@ export interface SelfImplementSeams {
   stopAutohealActions?: AutohealActions;
   /** STOP-AUTOHEAL — one-attempt guard reader. Default: real run ledger, or none when `writeRunLedger` is injected. */
   stopAutohealLoadLedger?: (runId: string) => readonly RunLedgerEntry[] | null;
+  /** Supervisor heal delivery history reader; defaults to the run ledger unless a test injects a writer. */
+  healPackLoadLedger?: (runId: string) => readonly RunLedgerEntry[] | null;
   /** STOP-AUTOHEAL — observes each dispatcher result (tests). */
   onStopAutoheal?: (result: AutohealResult) => void;
   /** Optional context-journal sink for isolated runs. */
@@ -1083,7 +1093,7 @@ export interface SelfImplementSeams {
    * store, the orchestrator must not claim the child had zero provider failures.
    */
   queryChildProviderErrors?: (input: { runId: string; sinceMs: number; untilMs: number }) => Promise<
-    | { status: 'found'; providerErrorCount: number; credentialFailureCount: number; lastProviderError?: { provider?: string; message?: string }; lastCredentialFailure?: { provider?: string; message?: string } }
+    | { status: 'found'; providerErrorCount: number; credentialFailureCount: number; lastProviderError?: { provider?: string; model?: string; message?: string; observedAt?: string }; lastCredentialFailure?: { provider?: string; model?: string; message?: string; observedAt?: string } }
     | { status: 'none' }
     | { status: 'unavailable'; reason?: string }
   >;
@@ -3014,8 +3024,8 @@ export function queryStructuredChildProviderErrors(
     });
     if (rows.length === 0) return { status: 'none' };
     let credentialFailureCount = 0;
-    let lastProviderError: { provider?: string; message?: string } | undefined;
-    let lastCredentialFailure: { provider?: string; message?: string } | undefined;
+    let lastProviderError: { provider?: string; model?: string; message?: string; observedAt?: string } | undefined;
+    let lastCredentialFailure: { provider?: string; model?: string; message?: string; observedAt?: string } | undefined;
     for (const row of rows) {
       let data: Record<string, unknown> | undefined;
       try {
@@ -3024,7 +3034,9 @@ export function queryStructuredChildProviderErrors(
       } catch { /* malformed payload is still a structured router-error record */ }
       const detail = {
         ...(typeof data?.provider === 'string' ? { provider: data.provider } : {}),
+        ...(typeof data?.model === 'string' ? { model: data.model } : {}),
         ...(typeof data?.message === 'string' ? { message: data.message } : {}),
+        ...(typeof row.ts === 'string' ? { observedAt: row.ts } : {}),
       };
       lastProviderError = detail;
       if (data?.authRejected === true) {
@@ -3568,15 +3580,22 @@ async function autohealRecordedStop(stopEntry: RunLedgerEntry, s: SelfImplementS
   try {
     const record = readRunStopRecord(stopEntry);
     if (!record) return;
+    try { debug.log('harness.heal', 'symptom', { runId: stopEntry.runId, class: record.class, cause: record.cause, evidenceRef: record.evidenceRef }); } catch { /* observation is fail-soft */ }
+    const pick = pickAutohealAction(record.class);
+    try { debug.log('harness.heal', 'prescription', { runId: stopEntry.runId, class: record.class, action: pick.action, source: pick.source, ...(pick.overlayId ? { overlayId: pick.overlayId } : {}) }); } catch { /* observation is fail-soft */ }
     const mode = parseAutohealMode((await import('../user-config.js')).getUserConfig().tools.selfImplement.autoheal?.mode);
     const loadLedger = s?.stopAutohealLoadLedger ?? (s?.writeRunLedger ? () => null : undefined);
+    // A test ledger must never trigger a production host gate. Explicit seams override operational hands.
+    const actions = s?.writeRunLedger ? s.stopAutohealActions
+      : { ...operationalAutohealActions({ repoRoot: process.cwd() }), ...s?.stopAutohealActions };
     const result = await autohealFromStop({ runId: stopEntry.runId, ...(stopEntry.goalId ? { goalId: stopEntry.goalId } : {}), record }, {
       mode,
       knowhowCandidateDir: join(effectiveInstanceRoot(), 'self-implement', 'knowhow-candidates'),
-      ...(s?.stopAutohealActions ? { actions: s.stopAutohealActions } : {}),
+      ...(actions ? { actions } : {}),
       ...(loadLedger ? { loadLedger } : {}),
       ...(s?.writeRunLedger ? { writeLedger: s.writeRunLedger } : {}),
     });
+    try { debug.log('harness.heal', 'outcome', { runId: stopEntry.runId, class: result.class, action: result.action, mode: result.mode, outcome: result.outcome, ...(result.reason ? { reason: result.reason } : {}), ...(result.detail ? { detail: result.detail } : {}) }); } catch { /* observation is fail-soft */ }
     if (result.action === 'needs-owner') {
       try {
         const stopKey = JSON.stringify([stopEntry.timestamp, record.site ?? '', record.class, record.cause, record.evidenceRef]);
@@ -3592,6 +3611,40 @@ async function autohealRecordedStop(stopEntry: RunLedgerEntry, s: SelfImplementS
   } catch (error) {
     try { debug.log('self-implement.autoheal', 'dispatch-failed', { runId: stopEntry.runId, error: error instanceof Error ? error.message : String(error) }); } catch { /* fail-soft */ }
   }
+}
+
+async function dispatchTerminalHarnessHeal(input: {
+  result: SelfImplementResult;
+  runId: string;
+  goalId?: string;
+  shardIdentity: RunShardIdentity;
+  seams: SelfImplementSeams;
+}): Promise<void> {
+  const { result, runId, goalId, shardIdentity, seams } = input;
+  const mergeHeld = Boolean(result.mergeReason && result.mergeReason !== 'auto');
+  if (result.outcome !== 'abandoned' && result.outcome !== 'budget-exhausted' && result.stage !== 'timed-out' && !mergeHeld) return;
+  if (runStopRecorded(runId)) return;
+  const stopClass = mergeHeld ? classifyMergeHoldStop(result.mergeReason) : classifyTerminalHarnessFailure({
+    stage: result.stage,
+    mergeReason: result.mergeReason,
+    abandonedClassification: result.abandonedClassification?.classification,
+    providerErrorCategory: result.providerErrors?.category,
+    supervisorVerdict: result.supervisorVerdict,
+  });
+  let stopEntry: RunLedgerEntry | undefined;
+  try {
+    stopEntry = recordRunStop({
+      runId,
+      ...(goalId ? { goalId } : {}),
+      shardIdentity,
+      site: mergeHeld ? 'merge-hold' : `terminal-${result.stage}`,
+      class: stopClass,
+      cause: mergeHeld ? `merge held: ${result.mergeReason}` : result.detail ?? `terminal failure: ${result.stage}`,
+      evidenceRef: result.prUrl ?? `run-ledger:${runId}:${result.stage}`,
+      nextMove: `Existing heal ladder: ${stopClass}; failure disposition remains until its prescribed action resolves`,
+    }, seams.writeRunLedger ?? appendRunLedgerEntry);
+  } catch { /* stop observation cannot change the run outcome */ }
+  if (stopEntry) await autohealRecordedStop(stopEntry, seams);
 }
 
 export function measureReviewRework(counts: readonly number[], findings: readonly (readonly RecurrenceFinding[])[]): ReviewRework {
@@ -3761,17 +3814,20 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   let lastCredentialFailureSeq = 0;
   let lastFailedGateSeq = 0;
   let lastMustFixReviewSeq = 0;
+  let providerErrorAtLastGate: string | undefined;
   const recordFailureVerdict = async (kind: 'gate' | 'review'): Promise<void> => {
     // Capture child errors at the verdict boundary, not when terminal reporting eventually reads them.
     await mergeChildProviderErrors();
+    providerErrorAtLastGate = lastProviderErrorSeq > Math.max(lastFailedGateSeq, lastMustFixReviewSeq)
+      ? lastProviderError?.message : undefined;
     if (kind === 'gate') lastFailedGateSeq = ++failureSequence;
     else lastMustFixReviewSeq = ++failureSequence;
   };
   const latestVerdictSeq = (): number => Math.max(lastFailedGateSeq, lastMustFixReviewSeq);
   const hasCurrentProviderError = (): boolean => providerErrorCount > 0 && lastProviderErrorSeq > latestVerdictSeq();
   const hasCurrentCredentialFailure = (): boolean => credentialFailureCount > 0 && lastCredentialFailureSeq > latestVerdictSeq();
-  let lastProviderError: { provider?: string; message?: string } | undefined;
-  let lastCredentialFailure: { provider?: string; message?: string } | undefined;
+  let lastProviderError: { provider?: string; model?: string; message?: string; observedAt?: string } | undefined;
+  let lastCredentialFailure: { provider?: string; model?: string; message?: string; observedAt?: string } | undefined;
   let childProviderErrorQueryStatus: 'found' | 'none' | 'unavailable' | 'not-configured' = 'not-configured';
   let queriedProviderErrorCount = 0;
   let queriedCredentialFailureCount = 0;
@@ -3808,18 +3864,43 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       childProviderErrorQueryStatus = 'unavailable';
     }
   };
+  const observeFailureClassificationInputs = (result: SelfImplementResult): void => {
+    if (!isAbandonedClassificationOutcome(result.outcome)) return;
+    observeOuter('failure-classification-inputs', {
+      stage: result.stage,
+      node: result.node,
+      outcome: result.outcome,
+      classification: result.abandonedClassification?.classification ?? null,
+      classificationBasis: result.abandonedClassification?.classificationBasis ?? null,
+      childProviderErrorQueryStatus,
+      providerErrorCount,
+      credentialFailureCount,
+      queriedProviderErrorCount,
+      queriedCredentialFailureCount,
+      lastProviderError: lastProviderError ? { provider: lastProviderError.provider ?? null, model: lastProviderError.model ?? null, observedAt: lastProviderError.observedAt ?? null } : null,
+      lastCredentialFailure: lastCredentialFailure ? { provider: lastCredentialFailure.provider ?? null, model: lastCredentialFailure.model ?? null, observedAt: lastCredentialFailure.observedAt ?? null } : null,
+      lastProviderErrorSeq,
+      lastCredentialFailureSeq,
+      lastFailedGateSeq,
+      lastMustFixReviewSeq,
+      currentProviderError: hasCurrentProviderError(),
+      currentCredentialFailure: hasCurrentCredentialFailure(),
+    });
+  };
   const unregisterProviderErrorSink = debug.registerSink({
     name: `self-implement-provider-error-${runId}`,
     emit(record) {
       if (record.category !== 'llm.router.error') return;
       const data = record.data;
       if (!data || typeof data !== 'object') return;
-      const { provider, message } = data as Record<string, unknown>;
+      const { provider, model, message } = data as Record<string, unknown>;
       providerErrorCount++;
       lastProviderErrorSeq = ++failureSequence;
       lastProviderError = {
         ...(typeof provider === 'string' ? { provider } : {}),
+        ...(typeof model === 'string' ? { model } : {}),
         ...(typeof message === 'string' ? { message } : {}),
+        ...(typeof record.ts === 'string' ? { observedAt: record.ts } : {}),
       };
       // ⛔⭐⭐⭐ 자격 거부는 「프로바이더 오류」의 부분집합이지만 ***사람이 할 다음 행동이 다르다***
       //   (2026-08-14 실측 · `[T]` 83차): grok 자식 «둘»이 401 로 죽었는데 부모가 남긴 것은
@@ -4108,6 +4189,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     }
   };
   let terminalResult: SelfImplementResult | undefined;
+  let uncaughtTerminalStop: SelfImplementResult | undefined;
   let reviewReflectRejectedCount: number | undefined;
   const attachReviewReflectionOutcome = <T extends Omit<SelfImplementResult, 'runId'>>(result: T): T & Pick<SelfImplementResult, 'completionStatus' | 'reviewReflectRejectedCount'> => ({
     ...result,
@@ -4287,6 +4369,11 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       (sessionId) => { terminalSessionId = sessionId; },
       (contract) => { runContract = contract; },
       recordFailureVerdict,
+      () => {
+        const error = providerErrorAtLastGate;
+        providerErrorAtLastGate = undefined;
+        return error;
+      },
       () => providerErrorCount > 0,
       () => credentialFailureCount > 0,
       hasCurrentProviderError,
@@ -4307,6 +4394,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       opts.seams.inspectCodexRotation,
       runProviderName,
     );
+    observeFailureClassificationInputs(addressedResult);
     if (isAbandonedClassificationOutcome(addressedResult.outcome)) logQuotaProvider(addressedResult.quotaExhaustionAssessment);
     observeOuter('child-provider-error-query', { status: childProviderErrorQueryStatus });
     if (lastProviderError) {
@@ -4318,20 +4406,24 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     }
     terminalResult = withEvidenceCoverage(withMeasuredRework(addressedResult));
     // runSelfImplement is the terminal caller: retain every existing PR/ledger/log observation and append one stop fact.
-    if ((addressedResult.stage === 'aborted' || (addressedResult.mergeReason && addressedResult.mergeReason !== 'auto')) && !runStopRecorded(runId)) {
+    const envDeficitStop = addressedResult.stage === 'gate-failed' && addressedResult.harvestable === true
+      && addressedResult.detail?.includes(GATE_ENV_DEFICIT_HARVESTABLE_MARK) === true;
+    if ((addressedResult.stage === 'aborted' || envDeficitStop || (addressedResult.mergeReason && addressedResult.mergeReason !== 'auto')) && !runStopRecorded(runId)) {
       const reason = addressedResult.mergeReason;
       const aborted = addressedResult.stage === 'aborted';
       let stopEntry: RunLedgerEntry | undefined;
       try {
         stopEntry = recordRunStop({ runId, ...(opts.goalId ? { goalId: opts.goalId } : {}), shardIdentity,
-          site: aborted ? 'implement-aborted' : 'merge-hold',
-          class: aborted ? 'unclassified' : classifyMergeHoldStop(reason), cause: aborted ? 'implement aborted' : `merge held: ${reason}`,
+          site: envDeficitStop ? 'gate-env-deficit' : aborted ? 'implement-aborted' : 'merge-hold',
+          class: envDeficitStop ? 'env-unrelated' : aborted ? 'unclassified' : classifyMergeHoldStop(reason),
+          cause: envDeficitStop ? addressedResult.detail ?? 'gate environment deficit' : aborted ? 'implement aborted' : `merge held: ${reason}`,
           evidenceRef: addressedResult.prUrl ?? `run-ledger:${runId}:${aborted ? 'implemented' : 'merge-decision'}`,
-          nextMove: aborted ? 'Inspect preserved worktree and child summary' : 'Review merge decision and PR before landing',
+          nextMove: envDeficitStop ? 'Measure the preserved PR head in a clean checkout' : aborted ? 'Inspect preserved worktree and child summary' : 'Review merge decision and PR before landing',
         }, opts.seams.writeRunLedger ?? appendRunLedgerEntry);
       } catch { /* stop observation cannot change the run outcome */ }
       if (stopEntry) await autohealRecordedStop(stopEntry, opts.seams);
     }
+    await dispatchTerminalHarnessHeal({ result: addressedResult, runId, ...(opts.goalId ? { goalId: opts.goalId } : {}), shardIdentity, seams: opts.seams });
     observeDeclaredScopeDiff(observeOuter, {
       goalFile: opts.goalFile,
       changedFiles: opts.goalFile && addressedResult.worktreePath
@@ -4420,6 +4512,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       terminalNode = result.node;
       await mergeChildProviderErrors();
       const addressedResult = attachAbandonedClassification(attachReviewReflectionOutcome({ ...result, ...providerErrorsForResult() }), opts.goalFile, hasCurrentProviderError(), hasCurrentCredentialFailure(), opts.seams.inspectCodexRotation, runProviderName);
+      observeFailureClassificationInputs(addressedResult);
       logQuotaProvider(addressedResult.quotaExhaustionAssessment);
       observeOuter('child-provider-error-query', { status: childProviderErrorQueryStatus });
       if (lastProviderError) {
@@ -4429,6 +4522,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
         observeOuter('credential-failure-observed', { count: credentialFailureCount, ...lastCredentialFailure });
       }
       terminalResult = withMeasuredRework(addressedResult);   // ⛔ 이 분기(StepTimeoutError)는 스코프가 달라 달성 근사값은 «없다»(0 으로 채우지 않는다)
+      await dispatchTerminalHarnessHeal({ result: addressedResult, runId, ...(opts.goalId ? { goalId: opts.goalId } : {}), shardIdentity, seams: opts.seams });
       observeDeclaredScopeDiff(observeOuter, {
         goalFile: opts.goalFile,
         changedFiles: opts.goalFile && addressedResult.worktreePath
@@ -4489,9 +4583,12 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
         ...terminalDetail(terminalSessionId),
       },
     });
+    uncaughtTerminalStop = { runId, ok: false, stage: 'aborted', node: terminalNode ?? 'implement', outcome: 'abandoned', detail: safeErrorDescription(e) };
     throw e;
   } finally {
     if (loopRegistered) registerRunLoop('ended');
+    // Persist the outer-exception stop and its prescription before the crashed run-status below.
+    if (uncaughtTerminalStop) await dispatchTerminalHarnessHeal({ result: uncaughtTerminalStop, runId, ...(opts.goalId ? { goalId: opts.goalId } : {}), shardIdentity, seams: opts.seams });
     const terminalStage = terminalResult?.stage ?? 'crashed';
     // A blocked draft may be opened on the first failed attempt, before the
     // normal outcome observer has written its terminal status. Persist the
@@ -4952,6 +5049,38 @@ function reworkCapFailureSummary(feature: string, decision: ReworkCapHealDecisio
   return `${title} [${decision.defectClass} → ${decision.nextAction}] ${evidence}`;
 }
 
+/** ⭐ SELFIMPL-NODE-SEAMS-BACK — 등록 부품(구현·gate·리뷰·git·착지)을 graphs/units 에서 해석하고
+ *  합성 선언을 평탄화해 «하나의 NodeContext» 로 묶는다. ⛔ 실패는 값(reason)으로 낸다 — 실행을 막지 않는다. */
+export function resolveRunStageNodeContext(input: {
+  readonly graphId: string;
+  readonly graphVersion: string;
+  readonly graphsDir: string;
+  readonly runId: string;
+  readonly attempts?: number;
+  readonly round?: number;
+  readonly goalId?: string;
+  readonly goalType?: string;
+}): { readonly nodeContext?: StageNodeContext; readonly reason?: string } {
+  const resolution = resolveGraphStageUnits(input.graphId, input.graphsDir);
+  if (resolution.units.length === 0) {
+    return { reason: resolution.reason ?? 'no-unit-resolved' };
+  }
+  return {
+    nodeContext: buildStageNodeContext({
+      resolution,
+      graphId: input.graphId,
+      graphVersion: input.graphVersion,
+      runId: input.runId,
+      ...(input.attempts === undefined ? {} : { attempts: input.attempts }),
+      ...(input.round === undefined ? {} : { round: input.round }),
+      ...(input.goalId === undefined ? {} : { goalId: input.goalId }),
+      ...(input.goalType === undefined ? {} : { goalType: input.goalType }),
+    }),
+    ...(resolution.reason === undefined ? {} : { reason: resolution.reason }),
+  };
+}
+
+/** 라운드마다 같은 부품이 «그 파일·그 판»인지 — 도는 중에 바뀌면 걸음과 신원이 갈린다. */
 async function runSelfImplementInner(
   opts: SelfImplementOptions,
   identity?: { runId: string; source: ReturnType<typeof resolveRunIdentity>['source'] },
@@ -4988,13 +5117,14 @@ async function runSelfImplementInner(
   hasCredentialFailure: () => boolean = () => false,
   providerErrorCategory: () => NonNullable<SelfImplementResult['providerErrors']>['category'] | undefined = () => undefined,
   onReviewReflectRejected: (rejectedCount: number) => void = () => {},
-  observe: ReturnType<typeof makeRunObserver> = makeRunObserver(identity?.runId ?? resolveRunIdentity({ explicit: opts.runId }).runId, opts.goalId, debug.log.bind(debug), opts.seams.writeRunLedger, shardIdentity),
+  observe?: ReturnType<typeof makeRunObserver>,
   /** ⭐ 「이 런이 «실제로» 어느 두뇌로 돌았나」를 원장까지 나른다 — ⛔ 기록 «시점»에 다시 읽지 않는다
    *  (그러면 「런이 끝날 무렵의 provider」가 되어 `F45` 를 그대로 밟는다). 시작 시점 값을 넘긴다. */
   onActiveProvider: (active: { provider?: string; model?: string; auth?: string }) => void = () => {},
   onSessionCreated: (sessionId: string) => void = () => {},
   onRunContractResolved: (contract: RunContract) => void = () => {},
   onFailureVerdict: (kind: 'gate' | 'review') => Promise<void> = async () => {},
+  providerErrorAtLastGate: () => string | undefined = () => undefined,
   hasObservedProviderError: () => boolean = hasProviderError,
   hasObservedCredentialFailure: () => boolean = hasCredentialFailure,
   hasCurrentProviderError: () => boolean = hasProviderError,
@@ -5005,7 +5135,23 @@ async function runSelfImplementInner(
   onPrAttributed: (number: number) => void = () => {},
   onPrAttributionMismatch: () => void = () => {},
 ): Promise<Omit<SelfImplementResult, 'runId'>> {
+  const runIdentity = identity ?? resolveRunIdentity({ explicit: opts.runId });
+  observe ??= makeRunObserver(runIdentity.runId, opts.goalId, debug.log.bind(debug), opts.seams.writeRunLedger, shardIdentity);
   const s = opts.seams;
+  const deliveredHealPacks = new Set<string>();
+  const healRunId = identity?.runId ?? resolveRunIdentity({ explicit: opts.runId }).runId;
+  try {
+    const entries = (s.healPackLoadLedger ?? (s.writeRunLedger ? () => null : loadRunLedger))(healRunId);
+    for (const entry of entries ?? []) {
+      if (entry.runId !== healRunId || entry.event !== 'supervisor-heal-pack'
+        || !['matched', 'already-delivered'].includes(String(entry.data?.decision))) continue;
+      const { signature, packIds } = entry.data;
+      if (typeof signature !== 'string' || !Array.isArray(packIds)) continue;
+      for (const id of packIds) {
+        if (typeof id === 'string') deliveredHealPacks.add(`${healRunId}:${signature}:${id}`);
+      }
+    }
+  } catch { /* An unavailable history contributes no invented deliveries. */ }
   const pipelineStartedAtMs = Date.now();
   // Graph authority is always ON; retain the resolved event with default provenance.
   // For research documents, its declared docs-only routing intentionally skips the gate.
@@ -5046,9 +5192,16 @@ async function runSelfImplementInner(
       : undefined;
     if (launch && !launch.ok) throw new Error(`graph variant rejected: ${JSON.stringify(launch.rejections)}`);
     const sourceSpec = launch?.ok ? launch.template : baseSpec;
+    // ⭐ unit 선언 근거 — 이 런이 읽은 «대상 경로»(단위 선언) 원문의 내용 해시만 남긴다.
+    //   ⛔ 본문은 로그에도 원장에도 복제하지 않는다(goalContentHash 와 같은 해시-only 예비).
+    //   ⛔ 읽지 못한 경로(신설 파일 등)는 해시를 지어내지 않고 근거에서 뺀다.
+    const unitDeclarations = declaredPremiseScopePaths(opts.feature).flatMap(path => {
+      try { return [{ path, content: readFileSync(resolve(process.cwd(), path), 'utf8') }]; } catch { return []; }
+    });
     // ⭐ 최초 변형 선택 — 골 종류(graphGoalType)·대상 경로 수(declaredPremiseScopePaths) 두 입력만으로
     //   결정론적으로 id·선택 이유를 유도해 검증 결과에 싣는다(종류를 못 읽었으면 지어내지 않는다).
     const variant = createGraphVariant({ template: sourceSpec, goal: `g_${variantRunId.replace(/[^a-z0-9_-]/gi, '_')}`, plan: opts.graphVariantPlan,
+      ...(unitDeclarations.length === 0 ? {} : { unitDeclarations }),
       ...(graphGoalType === undefined ? {} : { goalAnalysis: { goalType: graphGoalType, targetPathCount: declaredPremiseScopePaths(opts.feature).length } }) });
     if (!variant.ok) throw new Error(`graph variant rejected: ${JSON.stringify(variant.rejections)}`);
     variantSpec = variant.template;
@@ -5056,6 +5209,9 @@ async function runSelfImplementInner(
     const graphFile = saveRunGraphVariant(variantRunId, stringify({
       graph_id: variantSpec.graphId, version: variantSpec.version,
       ...(variant.selection === undefined ? {} : { variant_id: variant.selection.variantId, reason: variant.selection.reason }),
+      // 추가 키 — 한 런이 어느 unit 선언 «버전»을 읽었는지. 경로·내용 해시뿐이고 본문은 없다.
+      ...(variant.selection?.unitDeclarations === undefined ? {}
+        : { unit_declarations: variant.selection.unitDeclarations.map(entry => ({ path: entry.path, content_hash: entry.contentHash })) }),
       entry_node: variantSpec.entryNode, terminal_nodes: variantSpec.terminalNodes,
       ...(variantSpec.journeyStages ? { journey_stages: variantSpec.journeyStages } : {}),
       ...(variantSpec.runContract ? { run_contract: variantSpec.runContract } : {}),
@@ -5080,13 +5236,15 @@ async function runSelfImplementInner(
     // ⭐ 저장·diff — 방금 원장 옆에 쓴 선택(id·이유)을 다시 읽어 «같은지» 확인한다(다르면 이 런의 그래프 신원이 거짓).
     if (variant.selection !== undefined) {
       const persisted = loadRunGraphVariant(variantRunId);
-      if (persisted === null || persisted.variantId !== variant.selection.variantId || persisted.reason !== variant.selection.reason) {
+      if (persisted === null || persisted.variantId !== variant.selection.variantId || persisted.reason !== variant.selection.reason
+        || JSON.stringify(persisted.unitDeclarations ?? null) !== JSON.stringify(variant.selection.unitDeclarations ?? null)) {
         throw new Error(`graph variant rejected: persisted selection mismatch: ${JSON.stringify(persisted)}`);
       }
     }
     observe('graph-variant-applied', { graphId: variant.template.graphId, overlayId: variant.overlay.overlayId,
       graphFile, patches: variant.patches,
-      ...(variant.selection === undefined ? {} : { variantId: variant.selection.variantId, variantReason: variant.selection.reason }) });
+      ...(variant.selection === undefined ? {} : { variantId: variant.selection.variantId, variantReason: variant.selection.reason }),
+      ...(variant.selection?.unitDeclarations === undefined ? {} : { unitDeclarations: variant.selection.unitDeclarations }) });
   }
   /** 단계 이름 → 그 템플릿의 노드 이름. */
   const node = (stage: PipelineNodeId): PipelineNodeId => nodeNameForStage(stage, graphTemplate) as PipelineNodeId;
@@ -5103,6 +5261,28 @@ async function runSelfImplementInner(
     onRunContractResolved(runContract);
     observe('graph-run-contract-resolved', { ...graphIdentityOf(graphTemplate), ...runContract, ...runContractAtNode(runContract) });
   }
+  // ⭐ SELFIMPL-NODE-SEAMS-BACK — 등록 부품을 «생산 진입점»에서 해석·평탄화해 하나의 NodeContext 로 만든다.
+  //   ⛔ 이 줄이 없으면 부품은 선언만 있고 걸음에서 안 불린다. 실패는 값으로 남기고 실행은 안 막는다.
+  let nodeContext: StageNodeContext | undefined;
+  {
+    const unitResolution = resolveRunStageNodeContext({
+      graphId: graphTemplate.graphId,
+      graphVersion: graphTemplate.version,
+      graphsDir: defaultGraphsDir(),
+      runId: runIdentity.runId,
+      ...(typeof attemptOrdinal === 'number' ? { attempts: attemptOrdinal } : {}),
+      ...(opts.goalId === undefined ? {} : { goalId: opts.goalId }),
+      ...(graphGoalType === undefined ? {} : { goalType: graphGoalType }),
+    });
+    nodeContext = unitResolution.nodeContext;
+    if (nodeContext === undefined) {
+      if (graphTemplate.graphId === 'self-implement') {
+        observe('graph-stage-units-unresolved', { ...graphIdentityOf(graphTemplate), reason: unitResolution.reason ?? 'no-unit-resolved' });
+      }
+    } else {
+      observe('graph-stage-units-resolved', stageNodeContextObservation(nodeContext));
+    }
+  }
   // ⛔ 승격이 꺼져 있으면 «심지 않는다» — 그러면 예산 관측도 안 난다(운영 원장이 오늘과 같다).
   if (graphAuthority.enabled) onGraphTemplateResolved(graphTemplate);
   // ⛔ 선택을 «전부» 싣는다 — 얹힌 것만 실으면 「왜 안 얹혔나」를 사후에 못 묻는다.
@@ -5116,7 +5296,7 @@ async function runSelfImplementInner(
     // ⛔ 「지금 아는 것」만 준다 — 없는 값을 0 으로 지어내지 않는다(key-absent 가 그것을 말한다).
     let stopClass: import('./run-stop.js').RunStopClass | undefined;
     try {
-      const { runId } = identity ?? resolveRunIdentity({ explicit: opts.runId });
+      const { runId } = runIdentity;
       const entries = loadRunLedger(runId);
       const lastStop = entries?.slice().reverse().find((entry) => entry.event === 'stop');
       if (lastStop && isRunStopClass(lastStop.data.class)) stopClass = readRunStopRecord(lastStop)?.class;
@@ -5136,6 +5316,16 @@ async function runSelfImplementInner(
       ...(variantSpec ? { specs: { [variantSpec.graphId]: variantSpec } } : {}),
     });
     if (decision.appliedIds.length > 0) graphTemplate = decision.template;
+    // ⭐ SELFIMPL-NODE-SEAMS-BACK — 같은 NodeContext 가 라운드로 이어진다: 체크포인트를 옮기고,
+    //   부품이 도는 중에 다른 판으로 바뀌었으면 그 사실을 값으로 낸다(걸음과 신원이 갈리는 것을 막는다).
+    if (nodeContext !== undefined) {
+      nodeContext = { ...nodeContext, checkpoint: { ...nodeContext.checkpoint, round } };
+      const drift = stageUnitDrift(nodeContext.grounding.units, defaultGraphsDir());
+      observe('graph-stage-units-drift', {
+        graphId: nodeContext.goal.graphId, graphVersion: nodeContext.goal.graphVersion,
+        round, missing: drift.missing, changed: drift.changed,
+      });
+    }
     // ⛔⭐ 승격이 켜져 있으면 «언제나» 낸다 — 후보가 0이어도 낸다.
     //   🩸 안 내면 「얹을 게 없었다」와 「이 배선이 «안 돌았다»」가 원장에서 «같은 값»(0건)이 된다.
     //   ⇒ `considered` 가 그 둘을 가른다: 배선이 돌면 이 줄이 있고, 그 수가 «본 오버레이 수»다.
@@ -5174,7 +5364,7 @@ async function runSelfImplementInner(
     roundClassifications.push(classification);
     onRoundClassification(classification);
   };
-  const { runId, source: runIdSource } = identity ?? resolveRunIdentity({ explicit: opts.runId });
+  const { runId, source: runIdSource } = runIdentity;
   const branch = opts.branchName ?? plannedSelfImplBranch(opts.feature, opts.goalId, runId);
   try {
     debug.log('run-identity', 'own', {
@@ -7278,6 +7468,30 @@ async function runSelfImplementInner(
       }
       throw error;
     }
+    // Only the preceding round's observed error or gate evidence can authorize a remedy.
+    let healInput = '';
+    if (round > 0) {
+      const failure = reworkKind === 'gate' && gate?.passed === false ? gate : undefined;
+      const failures = failure?.baselineFailures;
+      const facts = failure?.reflectGateFacts;
+      const providerMessage = providerErrorAtLastGate();
+      const signature = providerMessage && /\b1310\b.*\blimit\b|\blimit\b.*\b1310\b/i.test(providerMessage) ? 'provider-1310'
+        : failure && facts?.introduced === 0 && facts.preexisting !== undefined && facts.preexisting > 0
+          && facts.unknown === 0 && failures?.length && failures.every(item => item.attribution === 'preexisting')
+          ? 'preexisting'
+          : failure && failures?.some(item => item.timeoutVariability === 'may-vary'
+            && /\b(?:order|time)[ -]dependent\b/i.test(`${item.name} ${item.diagnostic ?? ''}`))
+            ? 'order-time-dependent' : 'unknown';
+      const pack = signature === 'unknown' ? { text: '', ids: [], bytes: 0 } : selectHealKnowhowPack(wt.path, signature);
+      const freshIds = pack.ids.filter(id => !deliveredHealPacks.has(`${healRunId}:${signature}:${id}`));
+      const decision = !pack.ids.length ? 'unknown' : freshIds.length ? 'matched' : 'already-delivered';
+      if (decision === 'matched') {
+        for (const id of freshIds) deliveredHealPacks.add(`${healRunId}:${signature}:${id}`);
+        healInput = `[SUPERVISOR-HEAL-PACK signature=${signature} ids=${freshIds.join(',')}]\n${pack.text.split('\n').slice(1).filter(line => freshIds.some(id => line.startsWith(`${id}:`))).join('\n')}`;
+      }
+      observe('supervisor-heal-pack', { runId: healRunId, round, signature, packIds: decision === 'matched' ? freshIds : decision === 'already-delivered' ? pack.ids : [], decision,
+        ...(decision === 'unknown' ? { missingEvidence: signature === 'unknown' ? 'observed-signature-unavailable' : 'matching-active-pack-unavailable' } : {}) });
+    }
     const implementAbortController = new AbortController();
     const abortImplementation = (): void => implementAbortController.abort(opts.signal?.reason);
     if (opts.signal?.aborted) abortImplementation();
@@ -7304,7 +7518,7 @@ async function runSelfImplementInner(
       ...(harnessSeededPaths.length ? { harnessSeededPaths } : {}),
       onSurfaceProgress: (line) => progress('implementing', line.trimEnd()),
       onLifecycleScreenClassification: recordRoundClassification,
-      ...(round > 0 ? { roundContext: { round, effectiveMax, previousRoundFailure: reworkPromptNote, ...(landedSiblings ? { landedSiblings } : {}) } } : {}),
+      ...(round > 0 ? { roundContext: { round, effectiveMax, previousRoundFailure: healInput ? `${reworkPromptNote}\n\n${healInput}` : reworkPromptNote, ...(landedSiblings ? { landedSiblings } : {}) } } : {}),
       onSupervisorInput: (text, updateDelivery) => {
         const normalized = text.trim();
         if (!normalized) {

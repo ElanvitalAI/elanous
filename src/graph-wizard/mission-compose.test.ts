@@ -32,12 +32,12 @@ test('MISSION-GRAPH-COMPOSE: 정상 미션은 가장 가까운 표준 조합에�
     expect(validateGraphYaml('harness', yaml).ok).toBe(true);
     expect(yaml).toContain('done: verify, rework: verify');
     expect(yaml).not.toContain('done: verify, rework: make-doc');
-    expect(validateUnitCalls(parseGraphTemplateYaml(yaml).template!, result.card.composition!.file).size).toBe(2);
+    expect(validateUnitCalls(parseGraphTemplateYaml(yaml).template!, result.card.composition!.file).size).toBe(3);
     const dry = await runGraph(result.card.composition!.file, { dryRun: true, deps: { root: join(dir, 'dry-run'), log: () => {} } });
     expect(dry.status).toBe('done');
     expect(dry.executed).toBe(0);
     const graph = parseYaml(yaml) as { nodes: Array<{ kind: string; call?: string }> };
-    expect(graph.nodes.filter(node => node.kind !== 'gate').map(node => node.call)).toEqual(['verb-make-doc@1', 'verb-verify@1']);
+    expect(graph.nodes.filter(node => node.kind !== 'gate').map(node => node.call)).toEqual(['verb-research@1', 'verb-make-doc@1', 'verb-verify@1']);
     expect(readTaskCard(result.card.id, ledger)?.composition).toEqual(result.card.composition);
     expect(readFileSync(join(dir, `${result.card.id}.composition.json`), 'utf8')).toContain('research-report.yaml');
   } finally { rmSync(dir, { recursive: true, force: true }); }

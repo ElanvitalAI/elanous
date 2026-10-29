@@ -46,6 +46,14 @@ describe('lazy sim command registration', () => {
       expect(child.stderr).toContain('sim run:');
       expect(child.stderr).toContain('scenario runner requires --test isolated mode');
       expect(child.stderr).not.toContain("unknown command 'run'");
+      const releaseRig = resolve(cwd, 'scenarios/ux-sim/release-sim-rig.yaml');
+      const release = spawnSync(process.execPath, ['-e',
+        `const { program } = await import(${JSON.stringify(index)});` +
+        `process.argv=['node','elanous','sim','run',${JSON.stringify(releaseRig)}];await program.parseAsync(process.argv);`,
+      ], { cwd, encoding: 'utf8', timeout: 45_000 });
+      expect(release.status).toBe(2);
+      expect(release.stderr).toContain('scenario runner requires --test isolated mode');
+      expect(release.stderr).not.toContain('release simulation rig requires --test isolated mode');
       const sync = spawnSync(process.execPath, ['-e',
         `const { program } = await import(${JSON.stringify(index)});` +
         `process.argv=['node','elanous','sim','run',${JSON.stringify(missing)}];program.parse(process.argv);`,

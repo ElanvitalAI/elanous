@@ -1,0 +1,17 @@
+# SW-PERSONA-TEACHER-WEEKLY-FU · GoalId d68f0e7e17725cef — weekly-lesson 과 lesson-pack 이 함께 쓰는 명령 카탈로그.
+# 이 demo 는 repo 내 그래프 배치에 고정한다: 러너가 ELANOUS_GRAPH_DIR=graphs/demo/persona-teacher 를 심고,
+# ../../../ 는 repo root 의 scripts/persona-teacher/weekly-lesson-node.ts 로 간다. 외부 게시 없음.
+read-progress:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/persona-teacher/weekly-lesson-node.ts" read-progress'
+  timeout_ms: 60000
+select-next:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/persona-teacher/weekly-lesson-node.ts" select-next'
+  timeout_ms: 60000
+pack:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/persona-teacher/weekly-lesson-node.ts" pack'
+  timeout_ms: 60000
+record-progress:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/persona-teacher/weekly-lesson-node.ts" record-progress'
+  timeout_ms: 60000
+teacher:
+  approval: '다음 주 수업 팩이 준비됐다 — 교사가 확인해야 진도에 기록한다. 이 단원을 그대로 진행할까?'

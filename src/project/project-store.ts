@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { linkSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse, stringify } from 'yaml';
@@ -132,4 +132,51 @@ export function getProject(id: string): Project | null {
 
 export function suggestProjectForFolder(folder: string): Project | null {
   return new ProjectStore().suggestForFolder(folder);
+}
+
+// TENANT-BOUNDARY (0.2.41 · nfr:security): 고객 프로젝트 원장이 설치 밖으로 나가는
+// 출구는 이 익명 내보내기 하나다 — 식별 필드(이름·경로)는 익명 토큰으로 치환되고
+// id(이미 불투명한 uuid)·createdAt·relations 만 남는다.
+export interface AnonymousProject {
+  id: string;
+  name: string;
+  createdAt: string;
+  primaryFolder?: string;
+  relations?: Project['relations'];
+}
+
+const ANONYMOUS_EXPORT_DOMAIN = 'elanous-tenant-boundary';
+
+function anonymousExportSecret(): Buffer {
+  const configDir = getElanousConfigDir();
+  const path = join(configDir, 'tenant-boundary-secret');
+  try {
+    const existing = readFileSync(path);
+    if (existing.length === 32) return existing;
+  } catch { /* first use */ }
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  const secret = randomBytes(32);
+  try { writeFileSync(path, secret, { flag: 'wx', mode: 0o600 }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const existing = readFileSync(path);
+    if (existing.length === 32) return existing;
+    throw new Error('invalid tenant boundary secret');
+  }
+  return secret;
+}
+
+export function anonymousToken(prefix: 'project' | 'folder', value: string): string {
+  return `${prefix}-${createHmac('sha256', anonymousExportSecret()).update(`${ANONYMOUS_EXPORT_DOMAIN}\u0000${prefix}\u0000${value}`).digest('hex').slice(0, 16)}`;
+}
+
+export function anonymousExport(project: Project): AnonymousProject {
+  const exported: AnonymousProject = {
+    id: project.id,
+    name: anonymousToken('project', project.name),
+    createdAt: project.createdAt,
+  };
+  if (project.primaryFolder !== undefined) exported.primaryFolder = anonymousToken('folder', project.primaryFolder);
+  if (project.relations !== undefined) exported.relations = project.relations;
+  return exported;
 }

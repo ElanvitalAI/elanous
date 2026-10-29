@@ -53,7 +53,7 @@ test('zero evidence preservation contract applies default exactly once and count
     const repeated = await selfAnswerGoalDocumentClarifications(result.document, {
       path: 'say-first', evidence: [], resolver: async () => { throw new Error('answered again'); },
     });
-    expect(repeated).toEqual({ document: result.document, asked: 1, answered: 1, unanswered: 0, newlyAnswered: 0 });
+    expect(repeated).toEqual({ document: result.document, asked: 1, answered: 1, unanswered: 0, newlyAnswered: 0, resolverFailedQuestionIds: [] });
     expect(log.mock.calls.filter(([category, event]) => category === 'goal-author' && event === 'self-answer-default-applied'))
       .toEqual([['goal-author', 'self-answer-default-applied', { runId: 'run-preserve', questionId: 'preservation_contract', exportCount: 0 }]]);
   } finally { log.mockRestore(); }
@@ -108,7 +108,7 @@ test('unmarked resolver abstention does not apply a preservation default', async
   const result = await selfAnswerGoalDocumentClarifications(document, {
     path: 'say-first', evidence: [], resolver: async () => ({}),
   });
-  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0, resolverFailedQuestionIds: [] });
 });
 
 test('default does not require an Other option or change human clarification requirements', async () => {
@@ -125,7 +125,7 @@ test('other questions remain unanswered when evidence is insufficient', async ()
   const result = await selfAnswerGoalDocumentClarifications(document, {
     path: 'say-first', evidence: [],
   });
-  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0, resolverFailedQuestionIds: [] });
 });
 
 test('self-implement author boundary records a fallback assumption instead of leaving a popup question', async () => {
@@ -146,6 +146,51 @@ test('self-implement author boundary records a fallback assumption instead of le
   expect(result.document).not.toContain('Answer: UNANSWERED — implementation_target');
 });
 
+test('helper failures stay unresolved at the self-implement boundary instead of becoming a scope assumption', async () => {
+  const document = preservationDocument('implementation_target');
+  const result = await selfAnswerOrAssumeGoalDocumentClarifications(document, {
+    path: 'say-first', ask: 'Implement only the requested change.', evidence: [],
+    resolver: async () => { throw new Error('provider unavailable'); },
+  });
+  expect(result).toMatchObject({
+    document, answered: 0, unanswered: 1, assumed: 0,
+    resolverFailedQuestionIds: ['implementation_target'], decisionRequired: [],
+  });
+});
+
+test('returned resolver failure marker stays unresolved and is reported', async () => {
+  const document = preservationDocument('implementation_target');
+  const result = await selfAnswerGoalDocumentClarifications(document, {
+    path: 'say-first', evidence: [], resolver: async () => ({ failed: true }),
+  });
+  expect(result).toMatchObject({ document, answered: 0, unanswered: 1,
+    resolverFailedQuestionIds: ['implementation_target'] });
+});
+
+test('includeOther=false only assumes a unique offered candidate explicitly named by the request', async () => {
+  const document = [
+    '## WHAT TO BUILD', 'Original ask (verbatim, unmodified):', '```', 'Only modify the target file.', '```',
+    '- Clarification:', '  - id: target', '  - header: Scope', '  - question: Which scope?',
+    '  - options:',
+    '    - label: Refactor the whole subsystem', '      description: Rewrite all files.',
+    '    - label: Modify the target file only', '      description: Keep changes to the requested file.',
+    '  - includeOther: false', '  - answer: DEFERRED-UNTIL: Which scope?', '',
+  ].join('\n');
+  const result = await selfAnswerOrAssumeGoalDocumentClarifications(document, {
+    path: 'say-first', ask: 'Modify the target file only.', resolver: async () => ({}),
+  });
+  expect(result).toMatchObject({ answered: 1, unanswered: 0, assumed: 1 });
+  expect(parseGoalDocumentClarifications(result.document)[0]).toMatchObject({
+    answer: 'Modify the target file only', includeOther: false, provenanceSource: 'default',
+  });
+
+  const ambiguous = await selfAnswerOrAssumeGoalDocumentClarifications(document, {
+    path: 'say-first', ask: 'Make the requested change.', resolver: async () => ({}),
+  });
+  expect(ambiguous).toMatchObject({ answered: 0, unanswered: 1, assumed: 0 });
+  expect(parseGoalDocumentClarifications(ambiguous.document)[0]?.answered).toBe(false);
+});
+
 test('only money, security, and irreversible external-effect questions request a decision', async () => {
   expect(goalClarificationDecisionCategory({ header: 'Scope', question: 'Which module should change?', options: [] })).toBeUndefined();
   expect(goalClarificationDecisionCategory({ header: 'Security', question: 'May I store this access token?', options: [] })).toBe('security');
@@ -163,6 +208,20 @@ test('only money, security, and irreversible external-effect questions request a
   expect(parseGoalDocumentClarifications(result.document)[0]?.answered).toBe(false);
 });
 
+test('money and irreversible safety synonyms are classified before assumption fallback', () => {
+  const cases: Array<[string, ReturnType<typeof goalClarificationDecisionCategory>]> = [
+    ['Should the customer receive a refund?', 'money'],
+    ['Should we transfer the balance?', 'money'],
+    ['송금해도 되는가?', 'money'],
+    ['계좌 이체를 진행할까?', 'money'],
+    ['구독을 시작할까?', 'money'],
+    ['Should the paid subscription renew?', 'money'],
+  ];
+  for (const [question, category] of cases) {
+    expect(goalClarificationDecisionCategory({ header: 'Scope', question, options: [] })).toBe(category);
+  }
+});
+
 test('an unrelated question explicitly declined despite evidence remains unanswered', async () => {
   const document = preservationDocument('implementation_target');
   const log = spyOn(debug, 'log').mockImplementation(() => undefined);
@@ -171,7 +230,7 @@ test('an unrelated question explicitly declined despite evidence remains unanswe
       path: 'say-first', evidence: ['src/example.ts:1: exports only'],
       resolver: (context) => defaultGoalAuthorSelfResolve(context, { stream: async () => '{"answer":null}' }),
     });
-    expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+    expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0, resolverFailedQuestionIds: [] });
     expect(log.mock.calls.filter(([, event]) => event === 'self-answer-default-applied')).toHaveLength(0);
   } finally { log.mockRestore(); }
 });
@@ -205,7 +264,7 @@ test('declined preservation contract with nonzero evidence receives the default;
     path: 'say-first', evidence,
     resolver: (context) => defaultGoalAuthorSelfResolve(context, { stream: async () => 'not json' }),
   });
-  expect(malformed).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+  expect(malformed).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0, resolverFailedQuestionIds: ['preservation_contract'] });
 });
 
 test('legacy default answer without assumption metadata survives document reparse', () => {
@@ -284,7 +343,7 @@ test('say-first with no evidence-backed answer leaves the question unanswered an
     '  - answer: DEFERRED-UNTIL: Which other?', '',
   ].join('\n');
   const result = await selfAnswerGoalDocumentClarifications(document, { path: 'say-first', resolver: async () => ({}) });
-  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0 });
+  expect(result).toEqual({ document, asked: 1, answered: 0, unanswered: 1, newlyAnswered: 0, resolverFailedQuestionIds: [] });
 });
 
 test('a resolver failure on one question leaves it unanswered, still attempts the rest and still observes', async () => {
@@ -301,7 +360,7 @@ test('a resolver failure on one question leaves it unanswered, still attempts th
         return { answer: 'Option', evidence };
       },
     });
-    expect(result).toMatchObject({ asked: 2, answered: 1, unanswered: 1, newlyAnswered: 1 });
+    expect(result).toMatchObject({ asked: 2, answered: 1, unanswered: 1, newlyAnswered: 1, resolverFailedQuestionIds: ['one'] });
     expect(parseGoalDocumentClarifications(result.document).map(({ questionId, answered }) => ({ questionId, answered }))).toEqual([
       { questionId: 'one', answered: false }, { questionId: 'two', answered: true },
     ]);
@@ -318,7 +377,7 @@ test('say-first counts existing self-authored answers but reports none as newly 
     '  - answer: Keep API', '  - provenance.source: self-authored', '  - evidence: src/api.ts:12', '',
   ].join('\n');
   const result = await selfAnswerGoalDocumentClarifications(document, { path: 'say-first', resolver: async () => { throw new Error('not called'); } });
-  expect(result).toEqual({ document, asked: 1, answered: 1, unanswered: 0, newlyAnswered: 0 });
+  expect(result).toEqual({ document, asked: 1, answered: 1, unanswered: 0, newlyAnswered: 0, resolverFailedQuestionIds: [] });
 });
 
 test('shared self-answer keeps duplicate IDs deferred and never overwrites a prior answer', async () => {
@@ -587,7 +646,7 @@ test('default self-resolver prompts the elanous model, parses valid JSON, and ab
   expect(prompt).toContain('Do not delegate to an implementation agent.');
   expect(prompt).toContain('Options: (free input)');
   expect(resolved).toEqual({ answer: 'bun test src/example.test.ts', evidence: context.evidence });
-  await expect(defaultGoalAuthorSelfResolve(context, { stream: async () => 'not json' })).resolves.toEqual({});
+  await expect(defaultGoalAuthorSelfResolve(context, { stream: async () => 'not json' })).resolves.toEqual({ failed: true });
 
   let aborted = false;
   await expect(defaultGoalAuthorSelfResolve(context, {
@@ -596,7 +655,7 @@ test('default self-resolver prompts the elanous model, parses valid JSON, and ab
       aborted = signal.aborted;
       reject(signal.reason);
     }, { once: true })),
-  })).resolves.toEqual({});
+  })).resolves.toEqual({ failed: true });
   expect(aborted).toBe(true);
 });
 
@@ -618,7 +677,7 @@ test('default self-resolver returns on timeout when the stream ignores abort', a
     },
   });
 
-  expect(resolution).toEqual({});
+  expect(resolution).toEqual({ failed: true });
   expect(signal?.aborted).toBe(true);
   finishStream('{"answer":"late answer"}');
 });
@@ -785,7 +844,7 @@ describe('defaultGoalAuthorSelfResolve observations distinguish five outcomes', 
       }),
     });
     const observations = selfResolveLogs(log);
-    expect(resolved).toEqual({});
+    expect(resolved).toEqual({ failed: true });
     expect(observations).toHaveLength(1);
     expect(observations[0][1]).toBe('self-resolve-timeout');
     expect(observations[0][2]).toEqual(expect.objectContaining({
@@ -803,7 +862,7 @@ describe('defaultGoalAuthorSelfResolve observations distinguish five outcomes', 
       stream: async () => 'not json',
     });
     const observations = selfResolveLogs(log);
-    expect(resolved).toEqual({});
+    expect(resolved).toEqual({ failed: true });
     expect(observations).toHaveLength(1);
     expect(observations[0][1]).toBe('self-resolve-parse-failed');
     expect(observations[0][1]).not.toBe('self-resolve-timeout');
@@ -820,7 +879,7 @@ describe('defaultGoalAuthorSelfResolve observations distinguish five outcomes', 
       stream: async () => { throw new Error('stream exploded'); },
     });
     const observations = selfResolveLogs(log);
-    expect(resolved).toEqual({});
+    expect(resolved).toEqual({ failed: true });
     expect(observations).toHaveLength(1);
     expect(observations[0][1]).toBe('self-resolve-error');
     expect(observations[0][1]).not.toBe('self-resolve-timeout');
@@ -836,9 +895,9 @@ describe('defaultGoalAuthorSelfResolve observations distinguish five outcomes', 
         evidence: context.evidence,
         timeoutMs: 1,
         stream: (_: string, signal: AbortSignal) => new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })),
-        expected: {},
+        expected: { failed: true },
       },
-      { evidence: context.evidence, stream: async () => 'not json', expected: {} },
+      { evidence: context.evidence, stream: async () => 'not json', expected: { failed: true } },
     ];
     for (const item of cases) {
       await expect(defaultGoalAuthorSelfResolve(

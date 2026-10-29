@@ -1,0 +1,18 @@
+graph_id: landing
+version: 1
+unit:
+  inputs: [goal, context, feedback, budget, checkpoint]
+  outputs: [merge-sha, evidence]
+  exits: [merged, refused]
+entry_node: merge
+terminal_nodes: [merged, refused]
+nodes:
+  - node_id: merge
+    kind: git
+    recipe: git-merge
+    max_visits: 1
+    contract: { inputs: [goal, context, feedback, budget, checkpoint], tools: external-write, outputs: [merge-sha, evidence] }
+  - { node_id: merged, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: refused, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - { from: merge, on: outcome, map: { merged: merged, refused: refused } }

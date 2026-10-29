@@ -135,6 +135,17 @@ export interface DashboardAcpBootDeps {
    *  blocks). Dashboard stashes this into its history store so the
    *  next turn sees real tool evidence. */
   pushTurnToolHistory(messages: readonly LLMMessage[]): void;
+  /** TUI-TOKEN-GUARD-WIRE — replace the chat history store in place after the
+   *  request-size cap compacted it, so the next prompt reads the compacted
+   *  history (not the original 400+ messages). Absent = no write-back. */
+  replaceChatHistory?(messages: readonly ChatMessage[]): void;
+  /** Test seam — request-size cap override (defaults to 400k chars). */
+  requestSizeMaxChars?: number;
+  /** Test seam — the live compactor used for the history write-back. */
+  compactHistoryMessages?: (
+    messages: LLMMessage[],
+    ctx: { sessionId: string; activeModelId?: string },
+  ) => Promise<{ messages: LLMMessage[]; reason: string } | null>;
   /** Optional: agent name/version piped into the ACP handshake. */
   agentName?: string;
   agentVersion?: string;
@@ -219,6 +230,7 @@ export async function bootDashboardAcpSession(
   const gateway = deps.approvalGateway;
   const opts: DashboardSessionOptions = {
     cwd: deps.getCwd(),
+    tuiRouting: true,
     getMessages: ({ sessionId, userText }) => buildTurnMessages(deps, sessionId, userText),
     getTools: ({ sessionId, userText }) => {
       const tools = [...deps.getTools({ userText })];
@@ -229,6 +241,13 @@ export async function bootDashboardAcpSession(
     onTurnComplete: ({ newMessages }) => {
       deps.pushTurnToolHistory(newMessages);
     },
+    ...(deps.replaceChatHistory
+      ? {
+          compactPersistedHistory: ({ sessionId, userText }: { sessionId: string; userText: string }) =>
+            compactDashboardChatHistory(deps, { sessionId, userText }),
+        }
+      : {}),
+    ...(deps.requestSizeMaxChars !== undefined ? { requestSizeMaxChars: deps.requestSizeMaxChars } : {}),
     resolveModel: ({ userText }) => {
       const model = deps.getActiveModel({ userText });
       return model ?? undefined;
@@ -413,6 +432,58 @@ export function createDefaultRequestPermissionHandler(
  *  contains the latest user message for the direct path, so this
  *  helper does NOT append another one; callers that haven't stored
  *  the user message yet should do so before invoking `.send()`. */
+/** TUI-TOKEN-GUARD-WIRE — compact the dashboard chat history store in place.
+ *  Keeps a trailing current-turn user message verbatim (buildTurnMessages
+ *  detects it) and writes the result back through `replaceChatHistory`. */
+export async function compactDashboardChatHistory(
+  deps: Pick<DashboardAcpBootDeps, 'getChatHistory' | 'replaceChatHistory' | 'getActiveModel' | 'compactHistoryMessages'>,
+  ctx: { sessionId: string; userText: string },
+): Promise<{ fired: boolean; reason: string }> {
+  if (!deps.replaceChatHistory) return { fired: false, reason: 'no-history-writer' };
+  const history = [...deps.getChatHistory()];
+  const last = history[history.length - 1];
+  const trailingUser = isCurrentDashboardUser(last, ctx.userText) ? last : undefined;
+  const body = (trailingUser ? history.slice(0, -1) : history) as unknown as LLMMessage[];
+  if (body.length === 0) return { fired: false, reason: 'empty-history' };
+  const activeModelId = deps.getActiveModel({ userText: ctx.userText }) ?? undefined;
+  const compacted = deps.compactHistoryMessages
+    ? await deps.compactHistoryMessages(body, { sessionId: ctx.sessionId, ...(activeModelId ? { activeModelId } : {}) })
+    : await (async () => {
+        const { compactLiveMessages } = await import('../session/request-size-guard.js');
+        const { getUserConfig } = await import('../user-config.js');
+        const chatCfg = getUserConfig().chat;
+        return compactLiveMessages(body, {
+          sessionId: ctx.sessionId,
+          ...(activeModelId ? { activeModelId } : {}),
+          ...(chatCfg?.autoCompact?.preserveLastN !== undefined ? { preserveLastN: chatCfg.autoCompact.preserveLastN } : {}),
+          ...(chatCfg?.compact?.archiveEnabled !== undefined ? { archiveEnabled: chatCfg.compact.archiveEnabled } : {}),
+        });
+      })();
+  if (!compacted) return { fired: false, reason: 'compaction-no-op' };
+  const next = [
+    ...(compacted.messages as unknown as ChatMessage[]),
+    ...(trailingUser ? [trailingUser] : []),
+  ];
+  deps.replaceChatHistory(next);
+  debug.log('dashboard.acp', 'chat-history-compacted', {
+    before: history.length,
+    after: next.length,
+    reason: compacted.reason,
+  });
+  return { fired: true, reason: `history-${compacted.reason}` };
+}
+
+function isCurrentDashboardUser(
+  message: ChatMessage | undefined,
+  userText: string,
+): message is ChatMessage {
+  if (message?.role !== 'user') return false;
+  if (typeof message.content === 'string') return message.content === userText;
+  return message.content.some((block) =>
+    Boolean(block && typeof block === 'object' && 'text' in block
+      && typeof block.text === 'string' && block.text === userText));
+}
+
 function buildTurnMessages(
   deps: DashboardAcpBootDeps,
   sessionId: string,
@@ -425,9 +496,7 @@ function buildTurnMessages(
   // don't need to re-add. This mirrors the dashboard's current flow
   // where `chat.history.push(userMsg)` runs BEFORE streamLLMWithTools.
   const last = history[history.length - 1];
-  const hasTrailingUser = last?.role === 'user'
-    && typeof last.content === 'string'
-    && last.content.includes(userText);
+  const hasTrailingUser = isCurrentDashboardUser(last as ChatMessage | undefined, userText);
   if (hasTrailingUser) {
     return [...preamble, ...history];
   }

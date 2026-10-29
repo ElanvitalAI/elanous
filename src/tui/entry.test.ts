@@ -432,6 +432,32 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     }
   }, 10_000);
 
+  test('Next /help 화면에 Commands와 사용 가능한 Keys 절을 표시한다', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      transcript.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    );
+    submittedInputs.push('/help');
+    try {
+      await showNextTui({ resumeSessionId: createSession().id });
+      expect(transcript.join('')).toContain('Commands');
+      expect(transcript.join('')).toContain('Keys');
+      expect(transcript.join('')).toContain('PgUp/PgDn');
+      expect(transcript.join('')).toContain('Ctrl+Q 종료');
+      expect(transcript.join('')).toContain('Ctrl+\\ 사이드탭 토글');
+    } finally {
+      process.stdout.write = output;
+    }
+  }, 10_000);
+
   test('Next 입력의 new/watch가 ready·run 관찰 snapshot을 실제 폴링한다', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });

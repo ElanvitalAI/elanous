@@ -3,7 +3,58 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack, selectRelevantAuthoringLessons } from './knowhow-pack.js';
+import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack, selectRelevantAuthoringLessons, selectHealKnowhowPack } from './knowhow-pack.js';
+
+const healSections = [
+  ['K-TC-101', 'provider-1310', '공급자 교체를 검토한다.'],
+  ['K-TC-102', 'preexisting', '같은 변경의 무의미한 재작업을 중지한다.'],
+  ['K-TC-103', 'order-time-dependent', '고정 시계와 시험 순서로 결정적으로 재현한다.'],
+] as const;
+
+function healFixture(): { root: string; file: string } {
+  const { root, file } = fixture();
+  writeFileSync(file, [...healSections.map(([id, signature, remedy]) =>
+    `## ${id} healing\n- 원인 서명: ${signature}\n- 처방(힐링): ${remedy}\n- 출처: 시험 · 상태: active`),
+  '## K-TC-104 retired\n- 원인 서명: provider-1310\n- 처방(힐링): 사용하지 않는다.\n- 출처: 시험 · 상태: stale',
+  '## K-TC-105 incomplete\n- 원인 서명: provider-1310\n- 출처: 시험 · 상태: active'].join('\n'));
+  return { root, file };
+}
+
+test('SUPERVISOR-HEAL-PACK: 활성 절의 명시적 실패 서명에 맞는 처방만 상한 안에서 선택한다', () => {
+  const { root, file } = healFixture();
+  const before = readFileSync(file, 'utf8');
+  for (const [id, signature, remedy] of healSections) {
+    const pack = selectHealKnowhowPack(root, signature);
+    expect(pack.ids).toEqual([id]);
+    expect(pack.text).toContain(remedy);
+    expect(pack.bytes).toBe(Buffer.byteLength(pack.text));
+  }
+  expect(selectHealKnowhowPack(root, 'provider-13100')).toEqual({ text: '', ids: [], bytes: 0, reason: 'no-promoted-section' });
+  expect(selectHealKnowhowPack(root, 'unknown')).toEqual({ text: '', ids: [], bytes: 0, reason: 'no-promoted-section' });
+  expect(readFileSync(file, 'utf8')).toBe(before);
+});
+
+test('heal selector limits sections and UTF-8 bytes independently', () => {
+  const { root, file } = healFixture();
+  writeFileSync(file, Array.from({ length: 6 }, (_, index) =>
+    `## K-TC-${index + 200} remedy\n- 원인 서명: provider-1310\n- 처방(힐링): ${'가'.repeat(450)}\n- 출처: 시험 · 상태: active`).join('\n'));
+  const bounded = selectHealKnowhowPack(root, 'provider-1310');
+  expect(bounded.ids.length).toBeGreaterThan(0);
+  expect(bounded.ids.length).toBeLessThanOrEqual(3);
+  expect(bounded.bytes).toBeLessThanOrEqual(KNOWHOW_PACK_MAX_BYTES);
+  writeFileSync(file, Array.from({ length: 4 }, (_, index) =>
+    `## K-TC-${index + 210} remedy\n- 원인 서명: provider-1310\n- 처방(힐링): 재현한다.\n- 출처: 시험 · 상태: active`).join('\n'));
+  expect(selectHealKnowhowPack(root, 'provider-1310').ids).toEqual(['K-TC-210', 'K-TC-211', 'K-TC-212']);
+  writeFileSync(file, `## K-TC-220 oversized\n- 원인 서명: provider-1310\n- 처방(힐링): ${'가'.repeat(1500)}\n- 출처: 시험 · 상태: active`);
+  expect(selectHealKnowhowPack(root, 'provider-1310').ids).toEqual([]);
+});
+
+test('heal selector does not read a symlinked role file', () => {
+  const { root, file } = healFixture();
+  mkdirSync(join(root, 'docs/roles/UX'), { recursive: true });
+  symlinkSync(file, join(root, 'docs/roles/UX/KNOWHOW.md'));
+  expect(selectHealKnowhowPack(root, 'provider-1310').ids).toEqual(['K-TC-101']);
+});
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });

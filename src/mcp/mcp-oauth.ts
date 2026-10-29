@@ -144,6 +144,8 @@ export interface PrepareMcpOAuthAuthorizationOpts extends McpOAuthRuntimeOpts {
   scope?: string;
   /** 저장된 등록의 포트를 못 열었을 때 새 client_id 로 다시 등록한다. */
   forceReregister?: boolean;
+  /** Discovery already verified against resourceUrl by this caller. */
+  discovered?: { resource: ProtectedResourceMetadata; metadata: AuthorizationServerMetadata };
 }
 
 /** ⛔⭐⭐ MCP 자격은 «우주를 따라가지 않는다» — 격리 매뉴얼 §6 의 전역 사용자 자산이다.
@@ -968,7 +970,7 @@ export async function getValidAccessToken(
 export async function prepareMcpOAuthAuthorization(
   opts: PrepareMcpOAuthAuthorizationOpts,
 ): Promise<McpOAuthAuthorization> {
-  const { resource, metadata } = await discoverMcpOAuth(opts.resourceMetadataUrl, opts);
+  const { resource, metadata } = opts.discovered ?? await discoverMcpOAuth(opts.resourceMetadataUrl, opts);
   const registration = await ensureClientRegistration(metadata, {
     ...opts,
     ...(opts.forceReregister ? { forceReregister: true } : {}),

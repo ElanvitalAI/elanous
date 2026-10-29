@@ -15,6 +15,7 @@
 //   bun scripts/ux-sim.ts --list-trajectories # 저장한 궤적과 출처 목록
 //   bun scripts/ux-sim.ts --fault cred-expiry # 결함 주입: grok 구독 만료 임박 × 갱신 결과 → 디스패처·발사 판정
 //   bun scripts/ux-sim.ts --fault pod-death   # 결함 주입: PARTIAL 줄을 남긴 Pod 가 SIGTERM 으로 지워짐 → 호스트 재방출 판정
+//   bun scripts/ux-sim.ts --fault pod-child-result # 결함 주입: Completed Pod 안의 report-deficit child 결과 보존
 //   bun scripts/ux-sim.ts --fault pool-cap    # 결함 주입: --pod-pool 에 :N 이 빠진 풀 → 승인 판정(limitedBy)
 //   bun scripts/ux-sim.ts --fault sqlite-busy # 결함 주입: 실제 SQLite 잠금 → 로그 배치 버퍼·복구
 //   bun scripts/ux-sim.ts emit child-error-long --json # 사건 주입(L0): 격리 우주 원장에 주입 줄 → 소비자 목록
@@ -128,7 +129,7 @@ if (argv[0] === 'seat-seq') {
 //     ***영영 모른다*** — 오늘 이 저장소가 같은 함정을 다른 도구에서 이미 한 번 고쳤다.
 //  ⛔ 그래서 「알려진 플래그」를 «한 곳»에 두고, 그 밖의 `--` 인자는 거부한다.
 const KNOWN_FLAGS = new Set([
-  '--list', '--list-trajectories', '--computer-use', '--trajectory', '--from-run',
+  '--list', '--list-trajectories', '--computer-use', '--trajectory', '--from-run', '--seminar-rehearsal',
   '--save-trajectory', '--esc', '--queue', '--width', '--height', '--draft', '--fault',
 ]);
 {
@@ -141,6 +142,17 @@ const KNOWN_FLAGS = new Set([
   }
 }
 if (argv.includes('--list')) { console.log([...PHASES, 'computer-use: normal | capture-stalls | capture-fails | target-missing'].join('\n')); process.exit(0); }
+
+if (argv.includes('--seminar-rehearsal')) {
+  if (argv.length !== 1) {
+    console.error('⛔ --seminar-rehearsal 는 단독 모드다');
+    process.exit(2);
+  }
+  const { renderSeminarRehearsal, seminarRehearsalSweep } = await import('../src/ux-sim/seminar-rehearsal.js');
+  const result = seminarRehearsalSweep();
+  console.log(renderSeminarRehearsal(result).join('\n'));
+  process.exit(result.verdict === 'pass' ? 0 : 1);
+}
 
 {
   // `--fault=<이름>` 꼴도 받는다 — KNOWN_FLAGS 는 등호 꼴을 통과시키므로 여기서 놓치면 조용히 기본 국면으로 빠진다.
@@ -159,6 +171,11 @@ if (argv.includes('--fault')) {
     console.log(renderPodDeath(simPodDeath()).join('\n'));
     process.exit(0);
   }
+  if (fault === 'pod-child-result') {
+    const { podChildResultScenario, renderPodChildResult } = await import('../src/ux-sim/fault-pod-child-result.js');
+    console.log(renderPodChildResult(podChildResultScenario()).join('\n'));
+    process.exit(0);
+  }
   if (fault === 'pool-cap') {
     const { poolCapSweep, renderPoolCap } = await import('../src/ux-sim/fault-pool-cap.js');
     console.log(renderPoolCap(poolCapSweep()).join('\n'));
@@ -169,7 +186,7 @@ if (argv.includes('--fault')) {
     console.log(renderSqliteBusy(simSqliteBusy()).join('\n'));
     process.exit(0);
   }
-  console.error(`⛔ 모르는 결함이다: ${fault ?? '(없음)'} — 아는 것: cred-expiry · pod-death · pool-cap · sqlite-busy`);
+  console.error(`⛔ 모르는 결함이다: ${fault ?? '(없음)'} — 아는 것: cred-expiry · pod-death · pod-child-result · pool-cap · sqlite-busy`);
   process.exit(2);
 }
 

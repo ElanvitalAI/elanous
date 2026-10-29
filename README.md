@@ -8,7 +8,7 @@
 > **élan, and nous** — The red point at the center is *élan* — the drive to move on its own. The three white blades around it are *nous* — the mind that brings order. They turn one way — observe, understand, heal — widening a little with every turn. A spark meets a mind and keeps widening itself. That is Elanous.
 
 **Elanous is the conductor that coordinates many AI agents and brings back only finished results.**
-It works with Codex and Claude (beta) — and gives them wings.
+It works with supported coding agents (beta) — and gives them wings.
 
 - **Loop agents** — a team of AI on duty for the work that repeats, kept at it until it is done.
 - **Graph engineering** — work you hand over runs as an execution graph: a work manual you can see, edit and share.
@@ -62,11 +62,11 @@ elanous --version && elanous doctor
 
 To run the daemon and the harness, let `doctor` install the tools it needs —
 build tools and the node-pty rebuild, a pinned static `gh`, `rg`, Node and
-the Codex CLI (about 80 seconds on a bare Debian 12 VM):
+the supported agent CLI (about 80 seconds on a bare Debian 12 VM):
 
 ```bash
 elanous doctor --fix --yes --sudo
-elanous login openai-codex              # ChatGPT subscription, device code, no API key
+elanous login openai-codex             # provider subscription login, device code, no API key
 gh auth login
 elanous nexus run                       # daemon · web app at http://127.0.0.1:31415/app/
 ```
@@ -98,8 +98,8 @@ elanous doctor        # every credential the code reads: is it resolved, and fro
 `elanous --version`, `elanous where`, `elanous config get` and `elanous usage` all
 work with zero credentials. Each key you add unlocks one capability; see
 [`.env.example`](.env.example). The primary path for LLM access is a
-**subscription**, not an API key (`elanous login openai-codex`) — details in
-[Codex subscription](https://docs.elanous.ai/models/codex-subscription/).
+**subscription**, not an API key (`elanous login openai-codex`) — see the
+[subscription sign-in guide](https://docs.elanous.ai/models/codex-subscription/).
 
 ## Quick start
 
@@ -130,7 +130,7 @@ Two more properties follow from that:
   run on it through a compatibility layer. Merging the executors
   themselves is still in progress.
 - **The eyes are partly borrowed.** Web and browser sight leans on paid
-  services (firecrawl, grok inside omni-crawl, aside, CDP). elanous records
+  services (firecrawl, model-backed retrieval, aside, CDP). elanous records
   *what stops working without each one* in `catalog/resources.yaml`.
 
 > Lineage: `sync-skills` → `skillpad` → a 3-pane TUI chassis → **this**.
@@ -169,7 +169,7 @@ All documentation lives at **[docs.elanous.ai](https://docs.elanous.ai/)** (한�
 |---|---|
 | Install, update, uninstall | [Install](https://docs.elanous.ai/getting-started/install/) · [Update and uninstall](https://docs.elanous.ai/getting-started/update-and-uninstall/) |
 | First run | [Quickstart](https://docs.elanous.ai/getting-started/quickstart/) · [Commands you will use](https://docs.elanous.ai/using-elanous/commands/) |
-| Models and logins | [Providers](https://docs.elanous.ai/models/providers/) · [Codex subscription](https://docs.elanous.ai/models/codex-subscription/) |
+| Models and logins | [Providers](https://docs.elanous.ai/models/providers/) · [Subscription sign-in](https://docs.elanous.ai/models/codex-subscription/) |
 | Sessions and the TUI | [Sessions](https://docs.elanous.ai/using-elanous/sessions/) · [The TUI](https://docs.elanous.ai/using-elanous/tui/) |
 | Chat channels | [Telegram](https://docs.elanous.ai/surfaces/telegram/) · [Discord](https://docs.elanous.ai/surfaces/discord/) |
 | Settings and tools | [Configuration](https://docs.elanous.ai/reference/configuration/) · [External commands](https://docs.elanous.ai/reference/external-commands/) · [Source layout](https://docs.elanous.ai/concepts/source-layout/) |

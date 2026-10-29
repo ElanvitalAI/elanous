@@ -35,6 +35,12 @@ describe('summarizeAbsorbStatus', () => {
     expect(summarizeAbsorbStatus(null)).toEqual({ label: '찾을 수 없음', settled: false, noteRef: null });
   });
 
+  test('흡수 완료는 서버 상태와 note ref 를 그대로 노출한다', () => {
+    expect(summarizeAbsorbStatus(statusOf('absorbed', [
+      { kind: 'note', ref: 'notes/a.md' },
+    ]))).toEqual({ label: '흡수됨', settled: true, noteRef: 'notes/a.md' });
+  });
+
   test('끝난 상태 목록은 서버 SETTLED 와 일치한다', () => {
     const source = readFileSync(resolve(import.meta.dir, '../../../../src/intake-plane/items.ts'), 'utf8');
     const settled = source.match(/const SETTLED[^\n]*new Set\(\[([^\]]+)\]\)/)?.[1];

@@ -5,8 +5,9 @@ import { join } from 'node:path';
 import { getUserConfig, type UserConfig } from '../../user-config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
 import { podJobManifest, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
+import type { PodChildProvider } from './pod-child-providers.js';
 
-function captureLaunch(config?: UserConfig, useRealHostConfig = false) {
+function captureLaunch(config?: UserConfig, useRealHostConfig = false, child?: { provider: PodChildProvider; model: string }) {
   const applied: unknown[] = [];
   const kubectl: Kubectl = (args, input) => {
     if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
@@ -16,9 +17,11 @@ function captureLaunch(config?: UserConfig, useRealHostConfig = false) {
     return { status: 0, stdout: '', stderr: '' };
   };
   const spawn = podSelfImplementSpawn({
-    kubectl, env: {}, sleep: async () => {}, budgetSnapshot: () => undefined,
+    kubectl, env: child ? { OPENROUTER_API_KEY: 'or-test-key', ELANOUS_POD_AUTHOR_ON_POD: '1' } : {}, sleep: async () => {}, budgetSnapshot: () => undefined,
     credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'gh' }),
+    ...(child ? { openrouterGhToken: () => 'gh-or-test' } : {}),
     ...(!useRealHostConfig ? { fallbackConfig: () => config ?? ({ llm: {} } as UserConfig) } : {}),
+    ...(child ? { provider: child.provider, childModel: child.model, childProviderExplicit: true } : {}),
   });
   return { applied, done: spawn({ feature: 'fix fallback chain', spaceId: 'fallback-chain-test' }).done };
 }
@@ -127,5 +130,27 @@ describe('Pod fallback chain relay', () => {
       expect(child.exitCode).toBe(0);
       expect(JSON.parse(child.stdout.toString().trim())).toEqual(['codex-rotate', 'codex-credits', 'grok']);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('POD-CHILD-PIN-VS-CHAIN: a pinned delegated child keeps the host fallback chain in the same launch', async () => {
+    // POD-CHILD-PIN-VS-CHAIN — 하나의 mock kubectl 무대에서 두 조건을 같이 관측한다:
+    // (a) host fallback chain 이 pod-config-snapshot 경로로 child 에 순서·source까지 보존되어 전달되고
+    // (b) child LLM pin 인자가 delegated Pod 시작 명령 라인에 정확히 한 번, 셸 인용 규칙과 함께 보존된다.
+    const { applied, done } = captureLaunch({ llm: { fallbackChain: ['codex-rotate', 'codex-credits', 'grok'] } } as UserConfig, false,
+      { provider: 'openrouter', model: 'openrouter/openai/gpt-6-luna' });
+    await done;
+    const [secret, job] = applied as [
+      { stringData: Record<string, string> },
+      { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } },
+    ];
+    const childConfig = JSON.parse(secret.stringData['llm-fallback-config.json']!);
+    expect(childConfig.llm.fallbackChain).toEqual(['codex-rotate', 'codex-credits', 'grok']);
+    expect(Object.keys(childConfig.llm).sort()).toEqual(['fallbackChain', 'zaiCodingPlan']);
+    const script = job.spec.template.spec.containers[0]!.args[0]!;
+    expect(script).toContain('ELANOUS_POD_FALLBACK_CHAIN source=host steps=codex-rotate,codex-credits,grok');
+    const sayLine = script.split('\n').find((line) => line.includes('elanous harness say'))!;
+    expect(sayLine).toContain(`'--child-llm-provider' 'openrouter' '--child-llm-model' 'openrouter/openai/gpt-6-luna'`);
+    expect(sayLine.split('--child-llm-provider').length - 1).toBe(1);
+    expect(script.indexOf('install -m 600 /creds/llm-fallback-config.json')).toBeLessThan(script.indexOf('elanous harness say'));
   });
 });

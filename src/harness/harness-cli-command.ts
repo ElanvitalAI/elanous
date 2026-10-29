@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { dlopen, FFIType } from 'bun:ffi';
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { Worker } from 'node:worker_threads';
 import { constants as osConstants, hostname } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { HarnessCliInputError } from '../cli/cli-user-error.js';
@@ -27,7 +28,8 @@ import { classifyPodExitStop, readRunStopRecord, recordRunStop, runStopRecorded,
 import { captureStopKnowhowCandidate } from '../self-implement/stop-autoheal.js';
 import { ensureOpenRouterChildModelLive, resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
-import { buildRunProgressRows, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable } from '../self-implement/running-runs.js';
+import { buildRunProgressRows, isPartialRunningRuns, queryRunningRuns, renderRunProgressTable, type RunningRunsResult } from '../self-implement/running-runs.js';
+import type { ProgressQueryWorkerAbortRequest, ProgressQueryWorkerReply, ProgressQueryWorkerRequest } from './progress-worker-entry.js';
 import { launchBindingRunIds, readLaunchBinding } from './launch-registry.js';
 import { psProcessStartMs } from './harness-stop.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
@@ -3524,12 +3526,240 @@ export interface HarnessCliCommandDeps {
   missionLoop?: HarnessMissionLoopHandler;
   /** `harness progress` 가 도는 런 관측을 읽는 자리(시험 주입). 기본은 queryRunningRuns. */
   progress?: {
-    query?: typeof queryRunningRuns;
+    /** 하위 조회. 값 또는 약속을 돌려줄 수 있고, 시간 상한은 `timeoutMs` 가 정한다. */
+    query?: HarnessProgressQuery;
     nowMs?: () => number;
     bindingRunIds?: typeof launchBindingRunIds;
     readBinding?: typeof readLaunchBinding;
     processStartMs?: typeof psProcessStartMs;
+    /** 시험이 좁히는 상한. 없으면 `ELANOUS_HARNESS_PROGRESS_TIMEOUT_MS` → 기본 상수. */
+    timeoutMs?: number;
   };
+}
+
+/** 8-second end-to-end cap; the cooperative scan returns partial evidence by 7 seconds. */
+export const PROGRESS_COMMAND_TIMEOUT_MS = 8_000;
+
+/** 운영·시험이 상한을 좁히는 자리. 없거나 0 이하·비정수면 기본 상수. */
+export function progressCommandTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.ELANOUS_HARNESS_PROGRESS_TIMEOUT_MS ?? Number.NaN);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : PROGRESS_COMMAND_TIMEOUT_MS;
+}
+
+export type ProgressCommandStage = NonNullable<RunningRunsResult['stalled']>['stage'] | 'run-query';
+
+/** 정지 한 건의 구조화된 근거 — 출력(stderr)·`debug.log`·행 보존 수가 같은 값을 쓴다. */
+export interface ProgressCommandStall {
+  readonly event: 'progress-command-stalled';
+  readonly stage: ProgressCommandStage;
+  readonly reason: 'timeout' | 'deadline-exceeded';
+  readonly timeoutMs: number;
+  readonly elapsedMs: number;
+  readonly observedAt: string;
+  readonly caller: string;
+  readonly preservedRowCount: number;
+}
+
+export type HarnessProgressQuery = (options: { caller: string; runIds?: readonly string[]; timeBudgetMs?: number }) => RunningRunsResult | Promise<RunningRunsResult>;
+
+type ProgressQuerySettle =
+  | { readonly kind: 'value'; readonly value: RunningRunsResult }
+  | { readonly kind: 'threw'; readonly error: unknown }
+  | { readonly kind: 'timeout' };
+
+/** 상한 뒤에 도착한 결과 — 즉시 정지로 돌려준 뒤에라도 행을 버리지 않고 보존하는 자료. */
+type ProgressLateSettle =
+  | { readonly kind: 'value'; readonly value: RunningRunsResult }
+  | { readonly kind: 'threw'; readonly error: unknown };
+
+/**
+ * 운영 기본 경로. `queryRunningRuns` 는 전부 동기라 같은 스레드에서는 끊을 수 없으므로
+ * 워커에 넘긴다. 워커는 «전용 엔트리»(`./progress-worker-entry.ts`)를 직접 적재하므로
+ * 번들·컴파일 산출물에서도 `parentPort` 핸들러가 그 스레드에 오른다(HARNESS-PROGRESS-HANG).
+ * 상한에 도달해도 즉시 `terminate()` 하지 않고 `abort` 를 보내 유예 창 안에
+ * «현재 행» 회신을 기다린다 — 도착하면 `progress-command-late` 로 행을 보존한다(시험 주입 경로와 같은 코드).
+ */
+/** 실제 워커 스폰→응답→종료 중 어디까지 갔는지 — 시험이 «주입 없이» 그 경로를 목격하는 자리. */
+export interface ProgressWorkerLifecycle {
+  readonly event: 'spawn' | 'message' | 'error' | 'terminate';
+  readonly elapsedMs: number;
+}
+
+let progressWorkerLifecycleObserver: ((event: ProgressWorkerLifecycle) => void) | undefined;
+
+/** 시험 전용 관측자. 운영 경로는 이 값을 세우지 않는다. */
+export function setHarnessProgressWorkerObserverForTesting(observer?: (event: ProgressWorkerLifecycle) => void): void {
+  progressWorkerLifecycleObserver = observer;
+}
+
+function observeProgressWorker(event: ProgressWorkerLifecycle['event'], startedAt: number): void {
+  progressWorkerLifecycleObserver?.({ event, elapsedMs: Math.max(0, Date.now() - startedAt) });
+}
+
+/** 상한 도달 뒤 워커의 «현재 행» 회신을 기다리는 유예 창. 운영·시험이 환경으로 좁힌다. */
+export const PROGRESS_WORKER_ABORT_GRACE_MS = 0;
+
+export function progressWorkerAbortGraceMs(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = Number(env.ELANOUS_HARNESS_PROGRESS_ABORT_GRACE_MS ?? Number.NaN);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : PROGRESS_WORKER_ABORT_GRACE_MS;
+}
+
+function progressQueryInWorker(request: ProgressQueryWorkerRequest, timeoutMs: number): Promise<ProgressQuerySettle> {
+  const startedAt = Date.now();
+  const graceMs = progressWorkerAbortGraceMs();
+  return new Promise<ProgressQuerySettle>((done) => {
+    // 전용 워커 엔트리 — CLI 디스패치를 재진입하지 않으므로 산출물 배치에서도 핸들러가 오른다.
+    const worker = new Worker(new URL('./progress-worker-entry.ts', import.meta.url));
+    observeProgressWorker('spawn', startedAt);
+    let settled = false;
+    let boundExceeded = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (settle: ProgressQuerySettle): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (abortTimer) clearTimeout(abortTimer);
+      void worker.terminate();
+      observeProgressWorker('terminate', startedAt);
+      done(settle);
+    };
+    timer = setTimeout(() => {
+      // 상한 도달: 즉시 죽이지 않고 abort 를 보내 유예 창 안의 «현재 행» 회신을 보존 경로로 받는다.
+      boundExceeded = true;
+      worker.postMessage({ kind: 'abort' } satisfies ProgressQueryWorkerAbortRequest);
+      abortTimer = setTimeout(() => finish({ kind: 'timeout' }), graceMs);
+    }, timeoutMs);
+    worker.on('message', (reply: ProgressQueryWorkerReply) => {
+      observeProgressWorker('message', startedAt);
+      if (settled) return;
+      if (!boundExceeded) {
+        finish(reply.ok && reply.result
+          ? { kind: 'value', value: reply.result }
+          : { kind: 'threw', error: new Error(reply.error ?? 'progress 조회 워커가 결과 없이 끝났습니다') });
+        return;
+      }
+      // 상한 뒤 유예 창 안 회신 — stall 로 끝내되 행과 정지 원인을 버리지 않고 보존한다(주입 경로와 같은 `recordProgressLate`).
+      if (reply.ok && reply.result) {
+        recordProgressLate(request.caller, timeoutMs, Math.max(0, Date.now() - startedAt), { kind: 'value', value: reply.result });
+      } else {
+        recordProgressLate(request.caller, timeoutMs, Math.max(0, Date.now() - startedAt), { kind: 'threw', error: new Error(reply.error ?? 'progress 조회 워커가 상한 뒤 빈 회신을 했습니다') });
+      }
+    });
+    worker.on('error', (error: unknown) => {
+      observeProgressWorker('error', startedAt);
+      finish({ kind: 'threw', error });
+    });
+    worker.postMessage(request);
+  });
+}
+
+function progressQueryInProcess(
+  query: HarnessProgressQuery,
+  request: ProgressQueryWorkerRequest,
+  timeoutMs: number,
+  onLate?: (settle: ProgressLateSettle) => void,
+): Promise<ProgressQuerySettle> {
+  return new Promise<ProgressQuerySettle>((done) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (settle: ProgressQuerySettle): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      done(settle);
+    };
+    timer = setTimeout(() => finish({ kind: 'timeout' }), timeoutMs);
+    Promise.resolve().then(() => query(request)).then(
+      (value) => { if (settled) onLate?.({ kind: 'value', value }); else finish({ kind: 'value', value }); },
+      (error) => { if (settled) onLate?.({ kind: 'threw', error }); else finish({ kind: 'threw', error }); },
+    );
+  });
+}
+
+function progressStall(caller: string, timeoutMs: number, elapsedMs: number): ProgressCommandStall {
+  return {
+    event: 'progress-command-stalled',
+    stage: 'run-query',
+    reason: 'timeout',
+    timeoutMs,
+    elapsedMs,
+    observedAt: new Date().toISOString(),
+    caller,
+    preservedRowCount: 0,
+  };
+}
+
+function progressQueryBudgetMs(timeoutMs: number): number {
+  return Math.max(0, timeoutMs - Math.min(1_000, Math.max(1, Math.floor(timeoutMs / 8))));
+}
+
+/** 정지 뒤에 도착한 결과를 `debug.log` 에 남긴다 — 상한 뒤의 행이 관측에서 유실되지 않게. */
+function recordProgressLate(caller: string, timeoutMs: number, elapsedMs: number, late: ProgressLateSettle): void {
+  const common = {
+    event: 'progress-command-late',
+    stage: 'run-query',
+    reason: late.kind === 'value' ? 'late-value' : 'late-threw',
+    timeoutMs,
+    elapsedMs,
+    observedAt: new Date().toISOString(),
+    caller,
+  };
+  try {
+    if (late.kind === 'value') {
+      debug.log('harness.progress', 'progress-command-late', { ...common, preservedRowCount: late.value.entries.length, result: late.value });
+    } else {
+      debug.log('harness.progress', 'progress-command-late', { ...common, preservedRowCount: 0, error: late.error instanceof Error ? late.error.message : String(late.error) });
+    }
+  } catch { /* 로그 실패가 정지 응답을 가리면 안 된다 */ }
+}
+
+/**
+ * 하위 조회 한 번을 상한 안에서 끝낸다. 상한 안에(또는 event-loop 를 붙잡은 동기·loop-blocking 조회로) 결과가
+ * 오면 행을 그대로 돌려주고, 경과가 상한을 넘었으면 stall 도 함께 기록한다. 상한에 결과가 아직 없으면
+ * stall 만 즉시 돌려준다. 이때 주입된 비동기 조회 경로는 상한 뒤에 도착한 결과를 버리지 않고
+ * `progress-command-late` 관측(`recordProgressLate`)으로 행을 보존하고, 워커 경로도 상한 뒤
+ * 유예 창(`progressWorkerAbortGraceMs`) 안에 도착한 «현재 행» 회신을 같은 `recordProgressLate` 로
+ * 보존한다 — 유예 창 밖의 무응답만 `preservedRowCount` 0 으로 정상 종료된다.
+ */
+export async function queryProgressBounded(
+  input: { readonly caller: string; readonly runIds?: readonly string[] },
+  options: { readonly query?: HarnessProgressQuery; readonly timeoutMs: number },
+): Promise<{ readonly result: RunningRunsResult | null; readonly stall: ProgressCommandStall | null }> {
+  const startedAt = Date.now();
+  const request: ProgressQueryWorkerRequest = {
+    caller: input.caller,
+    timeBudgetMs: progressQueryBudgetMs(options.timeoutMs),
+    ...(input.runIds === undefined ? {} : { runIds: input.runIds }),
+  };
+  const settled = options.query
+    ? await progressQueryInProcess(options.query, request, options.timeoutMs, (late) => {
+      recordProgressLate(input.caller, options.timeoutMs, Math.max(0, Date.now() - startedAt), late);
+    })
+    : await progressQueryInWorker(request, options.timeoutMs);
+  const elapsedMs = Math.max(0, Date.now() - startedAt);
+  if (settled.kind === 'threw') throw settled.error;
+  if (settled.kind === 'value') {
+    const queryStall = settled.value.stalled;
+    return {
+      result: settled.value,
+      stall: queryStall
+        ? { ...progressStall(input.caller, options.timeoutMs, elapsedMs), stage: queryStall.stage, reason: queryStall.reason }
+        : elapsedMs > options.timeoutMs ? progressStall(input.caller, options.timeoutMs, elapsedMs) : null,
+    };
+  }
+  return { result: null, stall: progressStall(input.caller, options.timeoutMs, elapsedMs) };
+}
+
+/** 정지 근거를 `debug.log` 에 남긴다 — 진행 정지가 관측 불가로 남지 않게. */
+export function recordProgressStall(stall: ProgressCommandStall): void {
+  try {
+    debug.log('harness.progress', 'progress-command-stalled', { ...stall });
+  } catch { /* 로그 실패가 보존한 부분 행을 가리면 안 된다 */ }
+}
+
+export function renderProgressStallLine(stall: ProgressCommandStall): string {
+  return `⏱ progress 정지 — 단계 ${stall.stage} · 원인 ${stall.reason} · 상한 ${stall.timeoutMs}ms · 경과 ${stall.elapsedMs}ms · 보존 행 ${stall.preservedRowCount} · ${stall.event}`;
 }
 
 export function installHarnessCliCommand(program: Command, deps: HarnessCliCommandDeps): Command {
@@ -3591,7 +3821,10 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   harnessCmd.command('progress').description('도는 골마다 진도를 한 표로 읽는다 — 단계 · 진입 시각 · 마지막 진전 · pty (읽기 전용)')
     .option('--json', '같은 행 배열을 JSON 으로 출력')
     .option('--pid <number>', '기록된 로컬 PID 에 연결된 런 한 건만 조회')
-    .action((opts: { json?: boolean; pid?: string }) => {
+    .action(async (opts: { json?: boolean; pid?: string }) => {
+      const timeoutMs = deps.progress?.timeoutMs ?? progressCommandTimeoutMs();
+      const progressQuery = deps.progress?.query;
+      const nowMs = (): number => (deps.progress?.nowMs ?? Date.now)();
       try {
         if (opts.pid !== undefined) {
           const pid = Number(opts.pid);
@@ -3608,21 +3841,41 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
           // ps lstart has second precision. A wider stop-oriented tolerance would attribute a reused PID to this run.
           const observed = binding && startedAt !== null
             && startedAt === Math.floor(binding.binding!.startedAt / 1_000) * 1_000;
-          const result = observed
-            ? (deps.progress?.query ?? queryRunningRuns)({ runIds: [binding.runId], caller: 'harness.progress.pid' })
-            : null;
-          const row = result ? buildRunProgressRows(result, (deps.progress?.nowMs ?? Date.now)())
+          const outcome = observed
+            ? await queryProgressBounded(
+              { caller: 'harness.progress.pid', runIds: [binding!.runId] },
+              { query: progressQuery, timeoutMs },
+            )
+            : { result: null, stall: null };
+          const result = outcome.result;
+          const row = result ? buildRunProgressRows(result, nowMs())
             .find((item) => item.runId === binding!.runId && item.status !== 'ended-unclosed' && item.status !== 'unknown') : undefined;
-          if (opts.json) console.log(JSON.stringify({ pid, observation: row ? 'observed' : 'unobserved', runId: row?.runId ?? null, progress: row ?? null }));
-          else console.log(row ? `pid ${pid} · ${renderRunProgressTable({ ...result!, entries: result!.entries.filter((item) => item.runId === row.runId) }, (deps.progress?.nowMs ?? Date.now)()).split('\n').slice(1).join('\n')}` : `pid ${pid} · 미관측`);
+          const stall = outcome.stall ? { ...outcome.stall, preservedRowCount: row ? 1 : 0 } : null;
+          if (stall) recordProgressStall(stall);
+          if (opts.json) {
+            console.log(JSON.stringify({ pid, observation: row ? 'observed' : 'unobserved', runId: row?.runId ?? null, progress: row ?? null, ...(stall ? { stall } : {}) }));
+            if (stall) console.error(JSON.stringify(stall));
+          } else {
+            console.log(row && result ? `pid ${pid} · ${renderRunProgressTable({ ...result, entries: result.entries.filter((item) => item.runId === row.runId) }, nowMs()).split('\n').slice(1).join('\n')}` : `pid ${pid} · 미관측`);
+            if (stall) console.error(renderProgressStallLine(stall));
+          }
           return;
         }
-        const result = (deps.progress?.query ?? queryRunningRuns)({ caller: 'harness.progress' });
-        const nowMs = (deps.progress?.nowMs ?? Date.now)();
+        const outcome = await queryProgressBounded({ caller: 'harness.progress' }, { query: progressQuery, timeoutMs });
+        const result = outcome.result;
+        const rows = result ? buildRunProgressRows(result, nowMs()) : [];
+        const stall = outcome.stall ? { ...outcome.stall, preservedRowCount: rows.length } : null;
+        if (stall) recordProgressStall(stall);
         if (opts.json) {
-          console.log(JSON.stringify(buildRunProgressRows(result, nowMs)));
-          if (isPartialRunningRuns(result)) console.error(renderRunProgressTable(result, nowMs).split('\n')[0]);
-        } else console.log(renderRunProgressTable(result, nowMs));
+          console.log(JSON.stringify(rows));
+          if (result && isPartialRunningRuns(result)) console.error(renderRunProgressTable(result, nowMs()).split('\n')[0]);
+        } else if (result) console.log(renderRunProgressTable(result, nowMs()));
+        if (stall) {
+          if (opts.json || result) {
+            console.error(renderProgressStallLine(stall));
+            console.error(JSON.stringify(stall));
+          } else console.log(renderProgressStallLine(stall));
+        }
       } catch (error) {
         console.error(humanErrorLine(error));
         process.exitCode = 1;

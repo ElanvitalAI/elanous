@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -39,6 +40,29 @@ export function captureFailedPodJobs(input: {
   }
   const location = { host: first.host, context: first.context, namespace: first.namespace, childRunId: first.childRunId, jobUid: first.jobUid };
   const evidenceDir = join(artifactDir, 'pod-failure-capture', runId, job, first.childRunId as string);
+  // A failed kubectl/SSH read is itself the missing diagnostic. Keep its stderr in
+  // the private artifact directory and put only the path and exit status in the ledger.
+  const readFailure = (reason: string, result: { status: number | null; stderr: string }, extra: Record<string, unknown> = {}): void => {
+    let stderrEvidence: string | null = null;
+    let stderrCaptureStatus: 'saved' | 'redacted' | 'empty' | 'write-failed' = result.stderr ? 'saved' : 'empty';
+    if (result.stderr) {
+      try {
+        mkdirSync(evidenceDir, { recursive: true });
+        const tail = result.stderr.slice(-8192).split(/\r?\n/).map(line => {
+          if (!SECRET_VALUE.test(line)) return line;
+          stderrCaptureStatus = 'redacted';
+          return '[redacted credential line]';
+        }).join('\n');
+        const digest = createHash('sha256').update(tail).digest('hex').slice(0, 16);
+        stderrEvidence = join(evidenceDir, `${reason}-${digest}.stderr.log`);
+        try { writeFileSync(stderrEvidence, tail, { flag: 'wx', mode: 0o600 }); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || readFileSync(stderrEvidence, 'utf8') !== tail) throw error;
+        }
+      } catch { stderrEvidence = null; stderrCaptureStatus = 'write-failed'; }
+    }
+    finish('failed', reason, { ...location, ...extra, kubectlStatus: result.status, stderrEvidence, stderrCaptureStatus });
+  };
   const previous = rows.find(row => row.event === 'pod-failure-capture' && row.data?.job === job && row.data?.outcome === 'collected'
     && row.data.childRunId === first.childRunId && row.data.jobUid === first.jobUid
     && row.data.host === first.host && row.data.context === first.context && row.data.namespace === first.namespace);
@@ -54,8 +78,8 @@ export function captureFailedPodJobs(input: {
   try {
     const jobResult = kubectl(first.host as string, [...args, 'get', 'job', job, '-o', 'json']);
     if (jobResult.status !== 0) {
-      finish(/\bNotFound\b|not found/i.test(jobResult.stderr) ? 'vanished' : 'failed',
-        /\bNotFound\b|not found/i.test(jobResult.stderr) ? 'job-not-found' : 'job-read-failed', location);
+      if (/\bNotFound\b|not found/i.test(jobResult.stderr)) finish('vanished', 'job-not-found', { ...location, kubectlStatus: jobResult.status });
+      else readFailure('job-read-failed', jobResult);
       return;
     }
     const jobBody = JSON.parse(jobResult.stdout) as { metadata?: { name?: string; uid?: string } };
@@ -78,7 +102,7 @@ export function captureFailedPodJobs(input: {
       } catch { return false; }
     });
     const podResult = kubectl(first.host as string, [...args, 'get', 'pods', '-l', `job-name=${job}`, '-o', 'json']);
-    if (podResult.status !== 0) { finish('failed', 'pods-read-failed', { ...location, jobEvidence }); return; }
+    if (podResult.status !== 0) { readFailure('pods-read-failed', podResult, { jobEvidence }); return; }
     const pods = JSON.parse(podResult.stdout) as { items?: Array<{ metadata?: { name?: string; ownerReferences?: Array<{ uid?: string }> } }> };
     if (!pods.items?.length || pods.items.some(p => !p.metadata?.ownerReferences?.some(owner => owner.uid === jobBody.metadata?.uid))) {
       finish('failed', 'pod-owner-mismatch', { ...location, jobEvidence }); return;
@@ -89,7 +113,8 @@ export function captureFailedPodJobs(input: {
       finish('failed', 'pod-ambiguous', { ...location, jobEvidence, podEvidence }); return;
     }
     const logs = kubectl(first.host as string, [...args, 'logs', `pod/${podName}`, '-c', 'child']);
-    if (logs.status !== 0) { finish('failed', 'logs-read-failed', { ...location, jobEvidence, podEvidence }); return; }
+    if (logs.status !== 0) { readFailure('logs-read-failed', logs, { jobEvidence, podEvidence }); return; }
+    if (!logs.stdout.trim()) { finish('failed', 'logs-empty', { ...location, jobEvidence, podEvidence }); return; }
     const logEvidence = save('child.log', logs.stdout);
     finish('collected', 'job-failed', { ...location, jobEvidence, podEvidence, logEvidence });
   } catch { finish('failed', 'capture-error', location); }

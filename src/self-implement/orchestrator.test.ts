@@ -1,6 +1,8 @@
 // runSelfImplement — Fix A rework 루프(gate 실패 시 clean 에러 재주입 self-heal) 테스트
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, test, expect } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, test, expect, spyOn } from 'bun:test';
+beforeAll(async () => { await import('./graph-stage-units.js'); }, 30_000);
+import { debug } from '../debug/log.js';
 import { buildReviewIntent } from '../agent-substrate/review-intent.js';
 import { REVIEW_FINDING_KEY_VERSION, reviewFindingKey as sharedReviewFindingKey } from '../agent-substrate/review-finding-key.js';
 import { parse as parsePrComment } from '../agent-substrate/pr-comment-meta.js';
@@ -29,7 +31,7 @@ import { DEFAULT_STEP_TIMEOUTS, collectRunFacts, completionIntentOf, federationO
 import * as orchestratorModule from './orchestrator.js';
 import { classifyAbandonedRun } from './abandoned-classification.js';
 import { decideDraft } from '../self-dev/draft-triage-rules.js';
-import { resetAutohealProcessMemory } from './stop-autoheal.js';
+import { resetAutohealProcessMemory, type AutohealResult } from './stop-autoheal.js';
 import { defaultGitMergeSeam, defaultLlmResolve, mergeMainIntoWorktreeWithResolveOptions, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { stableMustFixId } from './reflect-mustfix.js';
 import { decideReviewRound } from './rework-policy.js';
@@ -1003,15 +1005,52 @@ describe('run stop ledger attribution', () => {
 
   test('implement aborted adds exactly one stop without replacing existing ledger events', async () => {
     const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
-    const result = await runSelfImplement({ feature: 'stop on failed implement', seams: seams({
-      implement: async () => ({ ok: false, summary: 'child failed' }),
+    const healEvents: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event) => { if (category === 'harness.heal') healEvents.push(event); });
+    try {
+      const result = await runSelfImplement({ feature: 'stop on failed implement', seams: seams({
+        implement: async () => ({ ok: false, summary: 'child failed' }),
+        writeRunLedger: (entry) => { entries.push(entry); },
+      }) });
+      expect(result.stage).toBe('aborted');
+      expect(entries.filter((entry) => entry.event === 'stop')).toHaveLength(1);
+      expect(entries.find((entry) => entry.event === 'stop')!.data).toMatchObject({ class: 'unclassified', cause: 'implement aborted', nextMove: expect.any(String), evidenceRef: expect.any(String) });
+      expect(entries.some((entry) => entry.event === 'implemented')).toBe(true);
+      const autohealResult = entries.findIndex((entry) => entry.event === 'autoheal' && entry.data.phase === 'result');
+      const finalRunStatus = entries.map((entry, index) => entry.event === 'run-status' ? index : -1).filter((index) => index >= 0).at(-1)!;
+      expect(autohealResult).toBeGreaterThan(-1);
+      expect(autohealResult).toBeLessThan(finalRunStatus);
+      expect(healEvents).toEqual(['symptom', 'prescription', 'outcome']);
+    } finally { log.mockRestore(); }
+  });
+
+  test('StepTimeout dispatches stop and autoheal before the final failed run status', async () => {
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const result = await runSelfImplement({ feature: 'timeout enters heal intake', stepTimeouts: { gate: 40 }, seams: seams({
+      gate: () => new Promise(() => {}) as Promise<{ passed: boolean }>,
       writeRunLedger: (entry) => { entries.push(entry); },
     }) });
-    expect(result.stage).toBe('aborted');
-    expect(entries.filter((entry) => entry.event === 'stop')).toHaveLength(1);
-    expect(entries.find((entry) => entry.event === 'stop')!.data).toMatchObject({ class: 'unclassified', cause: 'implement aborted', nextMove: expect.any(String), evidenceRef: expect.any(String) });
-    expect(entries.some((entry) => entry.event === 'implemented')).toBe(true);
-    expect(entries.some((entry) => entry.event === 'run-status')).toBe(true);
+    expect(result).toMatchObject({ stage: 'timed-out', outcome: 'abandoned' });
+    const stop = entries.findIndex((entry) => entry.event === 'stop');
+    const healResult = entries.findIndex((entry) => entry.event === 'autoheal' && entry.data.phase === 'result');
+    const finalFailedStatus = entries.map((entry, index) => entry.event === 'run-status' && entry.data.runStatus === 'failed' ? index : -1).filter((index) => index >= 0).at(-1)!;
+    expect(stop).toBeGreaterThan(-1);
+    expect(healResult).toBeGreaterThan(stop);
+    expect(healResult).toBeLessThan(finalFailedStatus);
+  });
+
+  test('outer exception dispatches stop and autoheal before the crashed run status', async () => {
+    const entries: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    await expect(runSelfImplement({ feature: 'exception enters heal intake', seams: seams({
+      createWorktree: async () => { throw new Error('injected outer failure'); },
+      writeRunLedger: (entry) => { entries.push(entry); },
+    }) })).rejects.toThrow('injected outer failure');
+    const stop = entries.findIndex((entry) => entry.event === 'stop');
+    const healResult = entries.findIndex((entry) => entry.event === 'autoheal' && entry.data.phase === 'result');
+    const finalCrashedStatus = entries.map((entry, index) => entry.event === 'run-status' && entry.data.failureKind === 'crashed' ? index : -1).filter((index) => index >= 0).at(-1)!;
+    expect(stop).toBeGreaterThan(-1);
+    expect(healResult).toBeGreaterThan(stop);
+    expect(healResult).toBeLessThan(finalCrashedStatus);
   });
 
   test('merge hold adds exactly one stop and retains merge decision', async () => {
@@ -5123,17 +5162,24 @@ describe('runSelfImplement — Fix A rework', () => {
   test('구조화된 자식 router 오류는 provider-error로 분류하고 자격 거부를 분리한다', async () => {
     const row = (over: Partial<{ instance: string; surface: string; category: string; ts_ms: number; data: string }> = {}) => ({
       id: 1, ts: '2026-08-17T13:44:48.899Z', ts_ms: 100, level: 'error', instance: 'test:child', surface: 'dev-pipeline', category: 'llm.router.error', event: 'streamLLM', session_id: null, trace_id: null,
-      data: JSON.stringify({ provider: 'openai-codex', durationMs: 81429, message: 'Codex API error: upstream' }), ...over,
+      data: JSON.stringify({ provider: 'openai-codex', model: 'gpt-5.6-terra', durationMs: 81429, message: 'Codex API error: upstream' }), ...over,
     });
     const matching = queryStructuredChildProviderErrors(['test:child'], 0, 200, (query) => {
       expect(query).toMatchObject({ instances: ['test:child'], surfaces: [DEV_PIPELINE_SINK_SURFACE], exactCategories: ['llm.router.error'], sinceMs: 0, untilMs: 200 });
       return [row()];
     });
-    expect(matching).toMatchObject({ status: 'found', providerErrorCount: 1, credentialFailureCount: 0, lastProviderError: { provider: 'openai-codex', message: 'Codex API error: upstream' } });
+    expect(matching).toMatchObject({ status: 'found', providerErrorCount: 1, credentialFailureCount: 0, lastProviderError: { provider: 'openai-codex', model: 'gpt-5.6-terra', observedAt: '2026-08-17T13:44:48.899Z', message: 'Codex API error: upstream' } });
     expect(queryStructuredChildProviderErrors([], 0, 200, () => [])).toMatchObject({ status: 'unavailable' });
     expect(queryStructuredChildProviderErrors(['test:child'], 0, 200, () => [])).toEqual({ status: 'none' });
     expect(queryStructuredChildProviderErrors(['test:child'], 0, 200, () => { throw new Error('logs unavailable'); })).toMatchObject({ status: 'unavailable' });
-    const result = await runSelfImplement({
+    const observations: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      observations.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    let result: Awaited<ReturnType<typeof runSelfImplement>>;
+    try {
+      result = await runSelfImplement({
       feature: 'child structured provider error',
       runId: 'child-provider-run',
       seams: seams({
@@ -5144,8 +5190,23 @@ describe('runSelfImplement — Fix A rework', () => {
           return matching;
         },
       }),
-    });
+      });
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+    }
     expect(result.abandonedClassification).toMatchObject({ classification: 'provider-error', providerError: true });
+    expect(observations).toContainEqual({
+      event: 'failure-classification-inputs',
+      data: expect.objectContaining({
+        classification: 'provider-error', providerErrorCount: 1, credentialFailureCount: 0,
+        queriedProviderErrorCount: 1, queriedCredentialFailureCount: 0,
+        lastProviderError: { provider: 'openai-codex', model: 'gpt-5.6-terra', observedAt: '2026-08-17T13:44:48.899Z' },
+        currentProviderError: true, currentCredentialFailure: false,
+      }),
+    });
+    const inputs = observations.find((entry) => entry.event === 'failure-classification-inputs')!.data;
+    expect(Number(inputs.lastProviderErrorSeq)).toBeGreaterThan(Number(inputs.lastFailedGateSeq));
+    expect(Number(inputs.lastMustFixReviewSeq)).toBe(0);
   });
 
   test('provider-error abandoned classification carries the start provider identity only when known', async () => {
@@ -5262,7 +5323,7 @@ describe('runSelfImplement — Fix A rework', () => {
           implement: async () => {
             debug.log('other.category', 'ignored', { provider: 'ignored', message: 'ignored' });
             debug.log('llm.router.error', 'streamLLM', { provider: 'first', message: 'first error' });
-            debug.log('llm.router.error', 'streamLLM', { provider: 'last', message: 'last error' });
+            debug.log('llm.router.error', 'streamLLM', { provider: 'last', model: 'last-model', message: 'last error' });
             return { ok: false, completionDisposition: 'completed-without-changes', summary: 'provider failed' };
           },
         }),
@@ -5276,6 +5337,11 @@ describe('runSelfImplement — Fix A rework', () => {
       expect(events).toContainEqual({
         event: 'provider-error-observed',
         data: expect.objectContaining({ count: 2, provider: 'last', message: 'last error' }),
+      });
+      expect(events).toContainEqual({
+        event: 'failure-classification-inputs',
+        data: expect.objectContaining({ lastProviderError: { provider: 'last', model: 'last-model', observedAt: expect.any(String) },
+          currentProviderError: true, queriedProviderErrorCount: 0 }),
       });
       expect(activeSinks).toBe(0);
       expect(unregisterCalls).toBe(1);
@@ -6541,6 +6607,7 @@ describe('판정 입력 배관 — 생산에서 실제로 닿는가', () => {
     const original = (debug as { log: typeof debug.log }).log;
     const features: string[] = [];
     let gates = 0;
+    const healed: AutohealResult[] = [];
     (debug as { log: typeof debug.log }).log = ((category, event, data) => {
       events.push({ category, event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
@@ -6548,6 +6615,7 @@ describe('판정 입력 배관 — 생산에서 실제로 닿는가', () => {
     try {
       const s = seams({
         features,
+        onStopAutoheal: (result) => { healed.push(result); },
         gate: async () => {
           gates++;
           return { passed: false, log: "fatal: Unable to create '/r/.git/index.lock': File exists.", reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 1, childResponsibility: 'none' } };
@@ -6563,6 +6631,7 @@ describe('판정 입력 배관 — 생산에서 실제로 닿는가', () => {
     expect(result).toMatchObject({ ok: false, stage: 'gate-failed', harvestable: true, prNumber: 7 });
     expect(result.detail).toContain('env-deficit, harvestable');
     expect(result.detail).toContain('git-lock');
+    expect(healed).toContainEqual(expect.objectContaining({ class: 'env-unrelated', action: 'clean-workspace-regate', outcome: 'would-act' }));
     expect(events).toContainEqual(expect.objectContaining({ category: 'self-implement.gate-env-retry', event: 'exhausted', data: expect.objectContaining({ kind: 'git-lock', attempts: 2 }) }));
     expect(events).toContainEqual(expect.objectContaining({ event: 'gate-env-deficit-harvestable', data: expect.objectContaining({ kind: 'git-lock' }) }));
     expect(events).not.toContainEqual(expect.objectContaining({ event: 'gate-failed-child-unrelated-escalated' }));
@@ -7898,6 +7967,178 @@ describe('runSelfImplement — pre-launch authored clarification escalation', ()
     });
     expect(order).toEqual(['implement']);
   });
+});
+
+describe('SUPERVISOR-HEAL-PACK — observed rework remedies', () => {
+  test.each([
+    { signature: 'provider-1310', id: 'K-TC-101', remedy: '공급자 교체를 검토한다.', source: 'provider' },
+    { signature: 'preexisting', id: 'K-TC-102', remedy: '같은 변경의 무의미한 재작업을 중지한다.', source: 'baseline' },
+    { signature: 'order-time-dependent', id: 'K-TC-103', remedy: '고정 시계와 시험 순서로 결정적으로 재현한다.', source: 'variability' },
+  ] as const)('$signature: next implement input and ledger agree without changing gate/provider execution', async ({ signature, id, remedy, source }) => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-heal-'));
+    mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
+    writeFileSync(join(root, 'docs/roles/TC/KNOWHOW.md'), [
+      '## K-TC-101 provider\n- 원인 서명: provider-1310\n- 처방(힐링): 공급자 교체를 검토한다.\n- 출처: 시험 · 상태: active',
+      '## K-TC-102 baseline\n- 원인 서명: preexisting\n- 처방(힐링): 같은 변경의 무의미한 재작업을 중지한다.\n- 출처: 시험 · 상태: active',
+      '## K-TC-103 order\n- 원인 서명: order-time-dependent\n- 처방(힐링): 고정 시계와 시험 순서로 결정적으로 재현한다.\n- 출처: 시험 · 상태: active',
+    ].join('\n'));
+    const contexts: Array<Parameters<SelfImplementSeams['implement']>[0]> = [];
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let gateCalls = 0;
+    let providerQueries = 0;
+    try {
+      await runSelfImplement({ feature: 'heal input', runId: `heal-${source}`, maxReworkRounds: 2, memory: false,
+        seams: seams({
+          createWorktree: async ({ branch, base }) => ({ path: root, branch, base }),
+          implement: async (ctx) => { contexts.push(ctx); return { ok: true, summary: 'impl' }; },
+          queryChildProviderErrors: async () => { providerQueries++; return source === 'provider'
+            ? { status: 'found', providerErrorCount: 1, credentialFailureCount: 0, lastProviderError: { provider: 'fake', message: 'provider error 1310 limit' } }
+            : { status: 'none' }; },
+          gate: async () => { gateCalls++; return gateCalls === 1
+            ? { passed: false, log: 'fake failure', reflectGateFacts: { introduced: 0, preexisting: source === 'baseline' ? 1 : 0, unknown: 0 },
+              baselineFailures: source === 'baseline'
+                ? [{ name: 'baseline failure', file: 'src/a.test.ts', baselinePresence: 'present', attribution: 'preexisting' }]
+                : source === 'variability'
+                  ? [{ name: 'order test', file: 'src/a.test.ts', baselinePresence: 'present', attribution: 'flaky-rerun', timeoutVariability: 'may-vary', diagnostic: 'order and time dependent' }]
+                  : [] }
+            : { passed: true, log: 'ok' }; },
+          writeRunLedger: entry => { ledger.push({ event: entry.event, data: entry.data }); },
+        }) });
+      expect(contexts.length).toBeGreaterThanOrEqual(2);
+      expect(contexts[0]!.roundContext).toBeUndefined();
+      expect(contexts[1]!.roundContext?.previousRoundFailure).toContain(remedy);
+      expect(contexts[1]!.roundContext?.previousRoundFailure).toContain(id);
+      expect(ledger).toContainEqual(expect.objectContaining({ event: 'supervisor-heal-pack', data: expect.objectContaining({ runId: `heal-${source}`, round: 1, signature, packIds: [id], decision: 'matched' }) }));
+      expect(gateCalls).toBe(2);
+      expect(providerQueries).toBeGreaterThan(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
+  test('a repeated runId/signature/pack ID is delivered once, then observed as already-delivered', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-heal-repeat-'));
+    mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
+    writeFileSync(join(root, 'docs/roles/TC/KNOWHOW.md'),
+      '## K-TC-102 baseline\n- 원인 서명: preexisting\n- 처방(힐링): 같은 변경의 무의미한 재작업을 중지한다.\n- 출처: 시험 · 상태: active');
+    const contexts: Array<Parameters<SelfImplementSeams['implement']>[0]> = [];
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let calls = 0;
+    try {
+      await runSelfImplement({ feature: 'repeat heal', runId: 'heal-repeat', maxReworkRounds: 2, memory: false,
+        seams: seams({
+          createWorktree: async ({ branch, base }) => ({ path: root, branch, base }),
+          implement: async ctx => { contexts.push(ctx); return { ok: true, summary: 'impl' }; },
+          gate: async () => ++calls <= 2 ? { passed: false, log: 'baseline failed',
+            reflectGateFacts: { introduced: 0, preexisting: 1, unknown: 0 },
+            baselineFailures: [{ name: 'existing', file: 'src/a.test.ts', baselinePresence: 'present', attribution: 'preexisting' }] }
+            : { passed: true, log: 'ok' },
+          writeRunLedger: entry => { ledger.push({ event: entry.event, data: entry.data }); },
+        }) });
+      expect(contexts).toHaveLength(3);
+      expect(contexts[1]!.roundContext?.previousRoundFailure).toContain('K-TC-102');
+      expect(contexts[2]!.roundContext?.previousRoundFailure).not.toContain('K-TC-102');
+      expect(ledger.filter(entry => entry.event === 'supervisor-heal-pack').map(entry => entry.data))
+        .toEqual([expect.objectContaining({ runId: 'heal-repeat', round: 1, signature: 'preexisting', packIds: ['K-TC-102'], decision: 'matched' }),
+          expect.objectContaining({ runId: 'heal-repeat', round: 2, signature: 'preexisting', packIds: ['K-TC-102'], decision: 'already-delivered' })]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
+  test('same runId reentry restores delivered IDs and delivers only new IDs in header and rows', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-heal-reentry-'));
+    mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
+    const file = join(root, 'docs/roles/TC/KNOWHOW.md');
+    const first = '## K-TC-301 first\n- 원인 서명: preexisting\n- 처방(힐링): 첫 처방.\n- 출처: 시험 · 상태: active';
+    const second = '## K-TC-302 second\n- 원인 서명: preexisting\n- 처방(힐링): 새 처방.\n- 출처: 시험 · 상태: active';
+    writeFileSync(file, first);
+    const ledger: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    const contexts: Array<Parameters<SelfImplementSeams['implement']>[0]> = [];
+    const run = async () => {
+      let calls = 0;
+      await runSelfImplement({ feature: 'heal reentry', runId: 'heal-reentry', maxReworkRounds: 1, memory: false,
+        seams: seams({
+          createWorktree: async ({ branch, base }) => ({ path: root, branch, base }),
+          implement: async ctx => { contexts.push(ctx); return { ok: true, summary: 'impl' }; },
+          gate: async () => ++calls === 1 ? { passed: false, log: 'existing',
+            reflectGateFacts: { introduced: 0, preexisting: 1, unknown: 0 },
+            baselineFailures: [{ name: 'existing', file: 'src/a.test.ts', baselinePresence: 'present', attribution: 'preexisting' }] }
+            : { passed: true, log: 'ok' },
+          healPackLoadLedger: () => ledger,
+          writeRunLedger: entry => { ledger.push(entry); },
+        }) });
+    };
+    try {
+      await run();
+      writeFileSync(file, `${first}\n${second}`);
+      await run();
+      await run();
+      const reworkInputs = contexts.filter(ctx => ctx.roundContext).map(ctx => ctx.roundContext!.previousRoundFailure);
+      expect(reworkInputs[0]).toContain('ids=K-TC-301]');
+      expect(reworkInputs[1]).toContain('ids=K-TC-302]');
+      expect(reworkInputs[1]).toContain('K-TC-302: 새 처방.');
+      expect(reworkInputs[1]).not.toContain('K-TC-301');
+      expect(reworkInputs[2]).not.toContain('[SUPERVISOR-HEAL-PACK');
+      expect(ledger.filter(entry => entry.event === 'supervisor-heal-pack').map(entry => entry.data))
+        .toEqual([expect.objectContaining({ decision: 'matched', packIds: ['K-TC-301'] }),
+          expect.objectContaining({ decision: 'matched', packIds: ['K-TC-302'] }),
+          expect.objectContaining({ decision: 'already-delivered', packIds: ['K-TC-301', 'K-TC-302'] })]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
+  test('observed 1310 on review rework reaches the next implement input', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-heal-review-'));
+    mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
+    writeFileSync(join(root, 'docs/roles/TC/KNOWHOW.md'),
+      '## K-TC-101 provider\n- 원인 서명: provider-1310\n- 처방(힐링): 공급자 교체를 검토한다.\n- 출처: 시험 · 상태: active');
+    const contexts: Array<Parameters<SelfImplementSeams['implement']>[0]> = [];
+    const ledger: Array<import('./run-ledger.js').RunLedgerEntry> = [];
+    let reviews = 0;
+    try {
+      await runSelfImplement({ feature: 'heal review 1310', runId: 'heal-review-1310', maxReworkRounds: 1, memory: false,
+        seams: seams({
+          createWorktree: async ({ branch, base }) => ({ path: root, branch, base }),
+          implement: async ctx => { contexts.push(ctx); return { ok: true, summary: 'impl' }; },
+          gate: async () => ({ passed: true, log: 'ok' }),
+          reviewDiff: async () => ++reviews === 1
+            ? { verdict: 'fail', mustFix: ['repair review finding'], shouldFix: [], summary: 'repair', reviewed: true, diffTruncated: false }
+            : { verdict: 'pass', mustFix: [], shouldFix: [], summary: 'ok', reviewed: true, diffTruncated: false },
+          queryChildProviderErrors: async () => ({ status: 'found', providerErrorCount: 1,
+            credentialFailureCount: 0, lastProviderError: { provider: 'fake', message: 'provider error 1310 limit' } }),
+          writeRunLedger: entry => { ledger.push(entry); },
+        }) });
+      expect(contexts[1]!.roundContext?.previousRoundFailure).toContain('공급자 교체를 검토한다.');
+      expect(ledger).toContainEqual(expect.objectContaining({ event: 'supervisor-heal-pack', data: expect.objectContaining({
+        runId: 'heal-review-1310', signature: 'provider-1310', packIds: ['K-TC-101'], decision: 'matched',
+      }) }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
+  test.each(['missing', 'mismatch', 'unknown-baseline', 'incomplete-provider'] as const)('%s evidence delivers no invented remedy', async (caseName) => {
+    const root = mkdtempSync(join(tmpdir(), 'supervisor-heal-unknown-'));
+    mkdirSync(join(root, 'docs/roles/TC'), { recursive: true });
+    if (caseName !== 'missing') writeFileSync(join(root, 'docs/roles/TC/KNOWHOW.md'),
+      '## K-TC-101 provider\n- 원인 서명: provider-1310\n- 처방(힐링): 공급자 교체를 검토한다.\n- 출처: 시험 · 상태: active');
+    const contexts: Array<Parameters<SelfImplementSeams['implement']>[0]> = [];
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let calls = 0;
+    try {
+      await runSelfImplement({ feature: 'unknown heal', runId: `heal-${caseName}`, maxReworkRounds: 1, memory: false,
+        seams: seams({
+          createWorktree: async ({ branch, base }) => ({ path: root, branch, base }),
+          implement: async ctx => { contexts.push(ctx); return { ok: true, summary: 'impl' }; },
+          queryChildProviderErrors: async () => caseName === 'incomplete-provider'
+            ? { status: 'found', providerErrorCount: 1, credentialFailureCount: 0, lastProviderError: { provider: 'fake' } }
+            : { status: 'none' },
+          gate: async () => ++calls === 1
+            ? { passed: false, log: 'failure', reflectGateFacts: { introduced: 0, preexisting: 0, unknown: caseName === 'unknown-baseline' ? 1 : 0 },
+              baselineFailures: caseName === 'unknown-baseline' ? [{ name: 'not attributed', file: 'src/a.test.ts', baselinePresence: 'unknown', attribution: 'unknown' }] :
+                caseName === 'missing' || caseName === 'mismatch' ? [{ name: 'baseline', file: 'src/a.test.ts', baselinePresence: 'present', attribution: 'preexisting' }] : [] }
+            : { passed: true, log: 'ok' },
+          writeRunLedger: entry => { ledger.push({ event: entry.event, data: entry.data }); },
+        }) });
+      expect(contexts).toHaveLength(2);
+      expect(contexts[1]!.roundContext?.previousRoundFailure).not.toContain('공급자 교체를 검토한다.');
+      expect(ledger).toContainEqual(expect.objectContaining({ event: 'supervisor-heal-pack', data: expect.objectContaining({ runId: `heal-${caseName}`, round: 1, packIds: [], decision: 'unknown' }) }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
 });
 
 describe('runSelfImplement — --ground round-0 codebase grounding', () => {
@@ -18210,5 +18451,93 @@ describe('runSelfImplement — merge decision with a warn verdict that still car
     expect(mergeCalls).toBe(0);
     expect(result).toMatchObject({ stage: 'pr-opened', mergeReason: 'review-must-fix' });
     expect(events[0]).toMatchObject({ verdict: 'fail', decision: 'hitl', reason: 'review-must-fix', mustFixCount: 0 });
+  });
+});
+
+describe('SELFIMPL-NODE-SEAMS-BACK — 생산 진입점이 등록 부품을 해석·평탄화한다', () => {
+  test('생산 runSelfImplement 진입점이 해석된 NodeContext 관측을 원장에 기록한다', async () => {
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    await runSelfImplement({
+      runId: 'run-node-seams-back-observation',
+      feature: 'SELFIMPL-NODE-SEAMS-BACK production observation',
+      memory: false,
+      maxReworkRounds: 0,
+      seams: seams({ writeRunLedger: (entry) => { ledger.push({ event: entry.event, data: entry.data }); } }),
+    });
+    const resolved = ledger.find(({ event }) => event === 'graph-stage-units-resolved');
+    expect(resolved?.data).toMatchObject({
+      graphId: 'self-implement',
+      runId: 'run-node-seams-back-observation',
+      units: expect.arrayContaining([
+        expect.objectContaining({ stage: 'implement', unitId: 'implement', exits: ['done', 'rework', 'failed'] }),
+        expect.objectContaining({ stage: 'landing', unitId: 'landing', exits: ['merged', 'refused'] }),
+      ]),
+    });
+    expect(resolved?.data).not.toHaveProperty('round');
+    expect(ledger.some(({ event }) => event === 'graph-stage-units-unresolved')).toBe(false);
+    const drift = ledger.find(({ event }) => event === 'graph-stage-units-drift');
+    expect(drift?.data).toMatchObject({
+      graphId: resolved?.data.graphId, graphVersion: resolved?.data.graphVersion,
+      round: 0, missing: [], changed: [],
+    });
+  });
+
+  test('SELFIMPL-NODE-SEAMS-BACK: 보존 계약: 다른 명령·화면의 기본 동작과 원장 형식은 지금과 같다 — 동작', async () => {
+    const { defaultGraphsDir, GRAPH_TEMPLATES, IMPLEMENT_STAGE_UNITS } = await import('./graph-templates.js');
+    const { PIPELINE_EDGES_BY_NODE } = await import('./pipeline-shape.js');
+    const { resolveRunStageNodeContext } = await import('./orchestrator.js');
+    const { stageUnitDrift } = await import('./graph-stage-units.js');
+    const graphsDir = defaultGraphsDir();
+
+    const resolved = resolveRunStageNodeContext({
+      graphId: 'self-implement', graphVersion: 'test-version', graphsDir,
+      runId: 'run-seams-back', attempts: 1,
+    });
+
+    expect(resolved.reason).toBeUndefined();
+    const context = resolved.nodeContext!;
+    expect(context.grounding.units.map((unit) => unit.stage)).toEqual(['implement', 'gate', 'review', 'git', 'landing']);
+    for (const unit of context.grounding.units) {
+      expect(unit.version).toBe(1);
+      expect(unit.hash.length).toBe(64);
+      expect(unit.path.startsWith(graphsDir)).toBe(true);
+    }
+    expect(context.grounding.equivalence).toEqual({ kindMismatches: [], missingEdges: [], extraEdges: [] });
+    expect(context.grounding.flattenedNodeCount).toBeGreaterThanOrEqual(8);
+    expect(context.budget).toMatchObject({ unitCount: IMPLEMENT_STAGE_UNITS.length });
+    expect(stageUnitDrift(context.grounding.units, graphsDir)).toEqual({ missing: [], changed: [] });
+    const unknownAttempts = resolveRunStageNodeContext({
+      graphId: 'self-implement', graphVersion: 'test-version', graphsDir,
+      runId: 'run-seams-back-unknown-attempt',
+    });
+    expect(unknownAttempts.nodeContext?.feedback).toEqual({});
+
+    // 보존 계약 — 도는 선언(GRAPH_TEMPLATES)의 kind+edges 는 부품 등록 전과 «같은 출처» 그대로다.
+    const production = GRAPH_TEMPLATES['self-implement']!;
+    const productionKinds = Object.fromEntries(production.nodes.map((node) => [node.nodeId, node.kind]));
+    expect(Object.fromEntries(Object.keys(PIPELINE_EDGES_BY_NODE).map((node) => [node, productionKinds[node]]))).toEqual({
+      implement: 'agent', gate: 'gate', review: 'judge', rework: 'agent',
+      'main-sync': 'git', regate: 'gate', 'open-pr': 'git', merge: 'git',
+    });
+    // 도는 선언은 파이프라인 간선을 «직접 또는 한 칸 경유»로 덮는다(open-pr→freeze-check→merge 가 그 한 칸이다).
+    const reaches = (from: string, to: string): boolean => {
+      const direct = production.edges[from] ?? [];
+      return direct.includes(to) || direct.some((via) => (production.edges[via] ?? []).includes(to));
+    };
+    for (const [from, targets] of Object.entries(PIPELINE_EDGES_BY_NODE)) {
+      for (const to of targets) expect({ from, to, reaches: reaches(from, to) }).toEqual({ from, to, reaches: true });
+    }
+    // 도는 선언 «전체»(intake 부터 merge 까지)의 입구·종결도 그대로다 — 부품 등록이 그 둘을 못 건드린다.
+    expect(production.entryNode).toBe('intake');
+    expect(production.terminalNodes).toEqual(['cleanup', 'stopped', 'needs-human', 'decision-card']);
+    // 등록표가 가리키는 노드·출구 목적지는 «도는 선언에 실재하는» 노드여야 한다(부품이 유령 노드로 안 샌다).
+    const declaredNodeIds = new Set(production.nodes.map((node) => node.nodeId));
+    for (const seam of IMPLEMENT_STAGE_UNITS) {
+      for (const node of seam.nodes) expect({ node, declared: declaredNodeIds.has(node) }).toEqual({ node, declared: true });
+      for (const { to } of seam.exits ?? []) expect({ to, declared: declaredNodeIds.has(to) }).toEqual({ to, declared: true });
+    }
+    // 다른 그래프는 부품이 없다 — 기본 동작 불변.
+    expect(resolveRunStageNodeContext({ graphId: 'research-loop', graphVersion: 'v', graphsDir, runId: 'r', attempts: 1 }))
+      .toEqual({ reason: 'no-unit-resolved' });
   });
 });

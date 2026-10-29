@@ -1,6 +1,9 @@
 make-doc-input:
   command: 'bun scripts/graph-units/verbs-envelope.ts make-doc-input'
   timeout_ms: 10000
+research:
+  command: 'bun scripts/graph-units/verbs/research.ts'
+  timeout_ms: 300000
 make-doc-output:
   command: 'bun scripts/graph-units/verbs-envelope.ts make-doc-output'
   timeout_ms: 10000

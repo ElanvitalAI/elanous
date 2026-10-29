@@ -309,6 +309,44 @@ function relevance(goal: string, section: string, targetPaths?: readonly string[
   return score;
 }
 
+/** Selects explicit, active failure-signature remedies from repository-contained KNOWHOW files. */
+export function selectHealKnowhowPack(repo: string, signature: string): KnowhowPack {
+  const empty = (reason: KnowhowPack['reason']): KnowhowPack => ({ text: '', ids: [], bytes: 0, reason });
+  if (!/^[a-z][a-z0-9-]*$/.test(signature)) return empty('no-promoted-section');
+  const rolesDir = resolve(repo, 'docs/roles');
+  let realRoles: string;
+  try {
+    realRoles = realpathSync(rolesDir);
+    if (!inside(realpathSync(repo), realRoles)) return empty('source-unreadable');
+  } catch { return empty('source-unreadable'); }
+  let seats: string[];
+  try { seats = readdirSync(rolesDir).sort(); } catch { return empty('source-unreadable'); }
+  const selected: Array<{ id: string; remedy: string }> = [];
+  for (const seat of seats) {
+    if (!/^[A-Z]{2,4}$/.test(seat)) continue;
+    const file = join(rolesDir, seat, 'KNOWHOW.md');
+    try {
+      if (lstatSync(file).isSymbolicLink()) continue;
+      const real = realpathSync(file);
+      if (!inside(realRoles, real) || !statSync(real).isFile() || statSync(real).size > 2_000_000) continue;
+      for (const section of promotedSections(readFileSync(real, 'utf8'))) {
+        const explicit = /^- 원인 서명:\s*([a-z][a-z0-9-]*)\s*$/m.exec(section.text)?.[1];
+        const remedy = /^- 처방(?:\(힐링\))?:\s*(\S[^\r\n]*)$/m.exec(section.text)?.[1];
+        if (explicit !== signature || !remedy || selected.some((item) => item.id === section.id)) continue;
+        const next = [...selected, { id: section.id, remedy }];
+        const text = `[SUPERVISOR-HEAL-PACK signature=${signature} ids=${next.map((item) => item.id).join(',')}]\n${next.map((item) => `${item.id}: ${item.remedy}`).join('\n')}`;
+        if (Buffer.byteLength(text, 'utf8') <= KNOWHOW_PACK_MAX_BYTES) selected.push({ id: section.id, remedy });
+        if (selected.length === 3) break;
+      }
+    } catch { /* Missing or unreadable files contribute no remedy. */ }
+    if (selected.length === 3) break;
+  }
+  if (!selected.length) return empty('no-promoted-section');
+  const ids = selected.map((item) => item.id);
+  const text = `[SUPERVISOR-HEAL-PACK signature=${signature} ids=${ids.join(',')}]\n${selected.map((item) => `${item.id}: ${item.remedy}`).join('\n')}`;
+  return { ids, text, bytes: Buffer.byteLength(text, 'utf8'), reason: 'selected' };
+}
+
 /** Reads only 내부 문서 `KNOWHOW` inside the supplied repository. Verified target paths narrow relevance when supplied. */
 function selectKnowhowOnly(repo: string, goal: string, targetPaths: readonly string[] | undefined, maxBytes: number): KnowhowPack {
   const empty = (reason: KnowhowPack['reason']): KnowhowPack => ({ text: '', ids: [], bytes: 0, reason });

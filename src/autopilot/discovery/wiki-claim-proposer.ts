@@ -2,7 +2,8 @@
 //
 // 구 핸드오프의 생존 지식을 **문서 전체 요약이 아닌 claim 단위**로 추출해, 기존 하이브리드 검색으로
 // 대상 WIKI-* living 페이지를 골라 doc-curate 큐에 제안한다. 핵심 규율(미션 불변식):
-//   · 각 claim proposal 에 원문 구절·출처 경로·마지막 검증 시점(provenance) 필수.
+//   · 각 claim proposal 에 원문 구절·출처 경로·마지막 검증 시점(provenance) 필수 — 하나라도 없으면
+//     제안이 성립하지 않는다(rejected 관측): 어떤 페이지에도 자동 쓰기·고치기·링크 제안을 남기지 않는다.
 //   · 기존 claim 과 충돌하면 **덮어쓰지 않고** 병렬 근거 + contradiction 플래그(비파괴).
 //   · 출력은 doc-curate CurationProposal(큐) 로만 — 자동 이동·병합·archive 없음(HITL 승인 게이트).
 //   · 깨진 판정을 LLM 에 안 맡김(결정론 추출·검색/충돌만 주입). 새 큐/파서 안 만들고 재사용.
@@ -49,6 +50,7 @@ export function extractClaims(text: string, sourcePath: string, nowDate: string)
 }
 
 const WIKI_CLAIM_DISCARD_REASON = 'no-matching-wiki-page' as const;
+const WIKI_CLAIM_REJECT_REASON = 'missing-provenance' as const;
 
 export interface WikiClaimStatistics {
   receivedClaims: number;
@@ -56,6 +58,12 @@ export interface WikiClaimStatistics {
   discardedClaims: number;
   discarded: {
     reason: typeof WIKI_CLAIM_DISCARD_REASON;
+    sourcePaths: string[];
+  };
+  /** 가산 관측(근거 필수 불변식 시행) — provenance 없어 명시적 거부된 claim. 0건이면 기존 계약 보존을 위해 필드를 싣지 않는다. */
+  rejected?: {
+    reason: typeof WIKI_CLAIM_REJECT_REASON;
+    claims: number;
     sourcePaths: string[];
   };
 }
@@ -85,12 +93,22 @@ export function defaultDetectConflict(claim: Claim, existing: string): boolean {
   return hit >= 2 && neg;
 }
 
+/** 근거(provenance 3요소 — 원문 구절·출처 경로·마지막 검증 시점)가 온전한가. 하나라도 비면 제안이 성립하지 않는다. */
+function hasCompleteProvenance(claim: Claim): boolean {
+  return claim.sourceQuote.trim() !== '' && claim.sourcePath.trim() !== '' && claim.lastVerified.trim() !== '';
+}
+
 /** claim → CurationItem (add/update · provenance · 충돌 시 contradiction 플래그·비파괴 diff). 순수+주입. */
 export function proposeWikiClaimItems(claims: readonly Claim[], deps: WikiClaimDeps): WikiClaimItems {
   const detect = deps.detectConflict ?? defaultDetectConflict;
   const items = [] as unknown as WikiClaimItems;
   const discardedSourcePaths: string[] = [];
+  const rejectedSourcePaths: string[] = [];
   for (const c of claims) {
+    if (!hasCompleteProvenance(c)) {
+      rejectedSourcePaths.push(c.sourcePath);
+      continue; // 근거 필수 불변식 — provenance 없는 claim 은 쓰기·고치기·링크 제안으로 성립하지 않는다.
+    }
     const page = deps.findWikiPage(c);
     if (!page) {
       discardedSourcePaths.push(c.sourcePath);
@@ -121,6 +139,9 @@ export function proposeWikiClaimItems(claims: readonly Claim[], deps: WikiClaimD
     proposedItems: items.length,
     discardedClaims: discardedSourcePaths.length,
     discarded: { reason: WIKI_CLAIM_DISCARD_REASON, sourcePaths: discardedSourcePaths },
+    ...(rejectedSourcePaths.length > 0
+      ? { rejected: { reason: WIKI_CLAIM_REJECT_REASON, claims: rejectedSourcePaths.length, sourcePaths: rejectedSourcePaths } }
+      : {}),
   };
   Object.defineProperty(items, 'statistics', { value: statistics, enumerable: false });
   try {

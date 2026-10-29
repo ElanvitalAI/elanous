@@ -1280,6 +1280,41 @@ describe('ORCH-TA-HAND — delegate hands the picked cell to TASK-AGENT', () => 
     await retryDelegate(root, 'fail08', deps);
     expect(attempts).toBe(1);
   }));
+
+  // COORD-ONE 조각 1 — tick 진입에서 coordinator shadow 가 TASK-AGENT 판정 1건을 소비한다(기록만).
+  test('COORD-ONE 조각 1: tick 진입에서 coordinator shadow가 TASK-AGENT 판정 1건을 소비한다 — 기록 1줄 · 중복 소비 0 · live 부수효과 0', async () => fixture(async (root) => {
+    const handLedger = join(root, 'loop', 'orchestrator', 'handed.jsonl');
+    const verdictLedger = join(root, 'loop', 'orchestrator', 'coord-verdicts.jsonl');
+    const rows = (path: string) => existsSync(path) ? readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+    mkdirSync(dirname(handLedger), { recursive: true });
+    writeFileSync(handLedger, [
+      JSON.stringify({ key: 'shadow:orch:card:C1', cell: 'C1', cardId: 'card', mode: 'shadow', launched: false, status: 'handed', runId: 'hand-run', at: '2026-10-04T00:00:00.000Z' }),
+      JSON.stringify({ key: 'orch:card:C2', cell: 'C2', cardId: 'card', mode: 'live', launched: true, status: 'handed', runId: 'hand-run', at: '2026-10-04T00:01:00.000Z' }),
+    ].join('\n') + '\n');
+    const entry = (runId: string, mode: 'shadow' | 'live') => runOrchestratorNode('intake', { root, runId, window: '08', mode, now: new Date('2026-10-04T00:00:00Z'), print: () => {} });
+    const handedBefore = readFileSync(handLedger, 'utf8');
+    await entry('consume-1', 'shadow');
+    expect(rows(verdictLedger)).toEqual([{ at: '2026-10-04T00:00:00.000Z', runId: 'consume-1', key: 'orch:card:C1', cell: 'C1', cardId: 'card',
+      mode: 'shadow', launched: false, handKey: 'shadow:orch:card:C1', handRunId: 'hand-run', consumed: true }]);
+    // tick 진입 1회 = 판정 1건: 다음 진입은 다음 미소비 판정을 가져가고, 소비된 판정은 다시 소비되지 않는다.
+    await entry('consume-2', 'live');
+    expect(rows(verdictLedger)).toEqual([
+      { at: '2026-10-04T00:00:00.000Z', runId: 'consume-1', key: 'orch:card:C1', cell: 'C1', cardId: 'card', mode: 'shadow', launched: false, handKey: 'shadow:orch:card:C1', handRunId: 'hand-run', consumed: true },
+      { at: '2026-10-04T00:00:00.000Z', runId: 'consume-2', key: 'orch:card:C2', cell: 'C2', cardId: 'card', mode: 'live', launched: true, handKey: 'orch:card:C2', handRunId: 'hand-run', consumed: true },
+    ]);
+    await entry('consume-3', 'shadow');
+    expect(rows(verdictLedger)).toHaveLength(2);
+    // 소비는 기록만이다: 넘김 원장은 그대로이고, 자리 저널·TASK-AGENT 카드·넘김·발사는 0이다.
+    expect(readFileSync(handLedger, 'utf8')).toBe(handedBefore);
+    expect(existsSync(join(root, 'seat-requests', 'requests.jsonl'))).toBe(false);
+    expect(existsSync(join(root, 'task-agent-actions.json'))).toBe(false);
+    for (const runId of ['consume-1', 'consume-2', 'consume-3']) {
+      const state = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', `${runId}.json`), 'utf8'));
+      expect(state.handed).toBeUndefined();
+      expect(state.delegated).toBe(0);
+      expect(state.launched).toBeUndefined();
+    }
+  }), 30_000);
 });
 
 // Real processes: a delegate tick that dies mid-way, and two delegate ticks racing on one root.
@@ -1294,7 +1329,8 @@ await runOrchestratorNode('delegate', { root, runId, window: '08', mode: 'live',
   handTask: async (opts) => {
     // File barriers: announce we are inside the hand, then wait for the peer — the race order is forced, not timed.
     if (signal !== '-') appendFileSync(root + '/' + signal, 'x');
-    if (waitFor !== '-') { for (let i = 0; i < 400 && !existsSync(root + '/' + waitFor); i++) await Bun.sleep(25); }
+    // 경주 배리어 예산은 게이트 pod 부하(스코프 타입검사 150초와 병행)까지 견딘다 — 2400 × 25ms = 60초.
+    if (waitFor !== '-') { for (let i = 0; i < 2400 && !existsSync(root + '/' + waitFor); i++) await Bun.sleep(25); }
     await Bun.sleep(Number(sleepMs));
     return { card: { id: 'card-' + runId + '-' + opts.checklistId }, move: { kind: 'launch' }, mode: 'live', launched: true }; },
   observe: (event, data) => {
@@ -1338,7 +1374,8 @@ test('ORCH-TA-HAND: two real delegate ticks racing on C2 leave exactly one of a 
   const script = childScript(root);
   // B reads the ledger, enters C1's hand and signals «b-in-hand», then waits for «a-handed».
   const b = runChild(script, [root, 'raceB', 'C1', '0', '-', 'b-in-hand', 'a-handed']);
-  for (let i = 0; i < 400 && !existsSync(join(root, 'b-in-hand')); i++) await Bun.sleep(25);
+  // 같은 예산: 부하 상황에서 B 의 «b-in-hand» 신호가 늦게 파일로 떠도 기다린다(2400 × 25ms = 60초).
+  for (let i = 0; i < 2400 && !existsSync(join(root, 'b-in-hand')); i++) await Bun.sleep(25);
   expect(existsSync(join(root, 'b-in-hand'))).toBe(true);
   // A live-claims C2 and signals «a-handed» from inside its hand — only then does B reach C2's seat append.
   const a = runChild(script, [root, 'raceA', 'C2', '0', '-', 'a-handed', '-']);
@@ -1354,7 +1391,7 @@ test('ORCH-TA-HAND: two real delegate ticks racing on C2 leave exactly one of a 
   expect(bObs.some(row => row.event === 'exchange' && String(row.reason).startsWith('seat-suppressed-handed:') && String(row.reason).endsWith(':C2'))).toBe(true);
   expect(c2Claims).toHaveLength(1);
   expect(c2Seat).toHaveLength(0);
-}), 30_000);
+}), 120_000);
 
 test('ORCH-TA-HAND: a shadow hand whose seat row landed before the run state was saved is restored on re-entry', async () => fixture(async (root) => {
   await placedRun(root, 'shadowcrash08');
@@ -1713,3 +1750,47 @@ test('COORD-HA: board down only during place (back by delegate) still carries th
   const next = await invoke(root, 'placeOnly-next', '08', { mode: 'live', split, placeCell: () => ({ version: '0.2.19' }), loadAdapter: async () => undefined }, logged);
   expect(next.delegated).toBe(1);
 }));
+
+describe('COORD-ABSORB-OP-BRIDGES-FU: 세 브리지(coordinator 수신 소비 · traffic 반영 · TASK-AGENT delegate)가 같은 tick 생산 경로를 지나 관측된다', () => {
+  test('한 번의 전체 pass 에서 coordinator 소비 관측 · dispatch-ledger source:tick 행 · handed.jsonl claim/handed 행이 모두 생긴다', async () => fixture(async (root, id, logged) => {
+    const configDir = mkdtempSync(join(tmpdir(), 'orch-absorb-config-'));
+    setElanousConfigDir(configDir);
+    try {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({ loops: { orchestrator: {
+        maxDelegatePerTick: 1, dispatch: { podTarget: 4, localLane: 2 },
+      } } }));
+      let coordinatorCalls = 0;
+      const state = await invoke(root, id, '08', {
+        mode: 'live', gridHosts: [], launchProcesses: () => ({ status: 'ok', records: [] }),
+        split: () => [{ id: 'C1', title: '첫 칸', seat: 'MK' }, { id: 'C2', title: '둘째 칸', seat: 'TC' }],
+        placeCell: () => ({ version: '0.2.32' }), seatTurn: async () => ({ status: 'skipped-empty' }),
+        handToTaskAgent: 'shadow',
+        coordinatorInbox: () => { coordinatorCalls++; return { replied: 1, acknowledged: 2 }; },
+      }, logged);
+
+      // ① coordinator 수신 소비: 생산 경로의 모든 노드가 deps.coordinatorInbox 로 버스를 배수한다.
+      expect(coordinatorCalls).toBe(stages.length);
+      expect(logged.filter(row => row.event === 'exchange' && row.reason === 'coordinator-inbox-replied')).toHaveLength(stages.length);
+      expect(logged.filter(row => row.event === 'exchange' && row.reason === 'coordinator-inbox-acknowledged')).toHaveLength(stages.length);
+      // ①′ 실행 원문: 배수 결과는 observe 이벤트만이 아니라 durable run 상태에도 누적된다(노드마다 replied 1 · acknowledged 2).
+      expect(state.inbox).toEqual({ replied: stages.length, acknowledged: stages.length * 2 });
+      const saved = JSON.parse(readFileSync(join(root, 'loop', 'orchestrator', `${id}.json`), 'utf8')) as { inbox?: { replied: number; acknowledged: number } };
+      expect(saved.inbox).toEqual({ replied: stages.length, acknowledged: stages.length * 2 });
+
+      // ② traffic 반영: launch 노드가 dispatch-ledger.jsonl 에 source:tick 사이클 한 행을 쓴다.
+      expect(readFileSync(join(root, 'orchestrator', 'dispatch-ledger.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))).toEqual([
+        { at: '2026-10-04T00:00:00.000Z', source: 'tick', mode: 'live', runId: id, supply: 2, capacity: 4, eligible: 1,
+          skipped: { 'cap-deferred': 1 }, dispatch: { podTarget: 4, localLane: 2 } }]);
+
+      // ③ TASK-AGENT delegate: delegate 노드가 handed.jsonl 에 claim/handed 행을 쓰고 state.handed 로 관측된다.
+      const handRows = readFileSync(join(root, 'loop', 'orchestrator', 'handed.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(handRows.filter(row => row.status === 'claimed').map(row => ({ cell: row.cell, seat: row.seat, mode: row.mode, runId: row.runId }))).toEqual([
+        { cell: 'C1', seat: 'MK', mode: 'shadow', runId: id }, { cell: 'C2', seat: 'TC', mode: 'shadow', runId: id }]);
+      expect(handRows.filter(row => row.status === 'handed').map(row => ({ cell: row.cell, mode: row.mode, launched: row.launched, cardId: typeof row.cardId }))).toEqual([
+        { cell: 'C1', mode: 'shadow', launched: false, cardId: 'string' }, { cell: 'C2', mode: 'shadow', launched: false, cardId: 'string' }]);
+      expect(state.handed?.map(row => ({ cell: row.cell, mode: row.mode, launched: row.launched }))).toEqual([
+        { cell: 'C1', mode: 'shadow', launched: false }, { cell: 'C2', mode: 'shadow', launched: false }]);
+      expect(logged.filter(row => row.event === 'hand-to-task-agent')).toHaveLength(2);
+    } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
+  }), 30_000);
+});

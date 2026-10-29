@@ -43,6 +43,17 @@ export type ParentHostSetting = Partial<ParentHostConfig> | readonly Partial<Par
 export const PARENT_HOST_ENV = 'ELANOUS_TA_PARENT_HOST';
 const DEFAULT_REMOTE_ELANOUS = '$HOME/.local/share/elanous/bin/elanous';
 const DEFAULT_REMOTE_CONFIG_DIR = '$HOME/.elanous';
+/**
+ * 원격 부모 상태 루트의 출처 태그 — 루트(`ELANOUS_STATE_DIR`)와 «한 벌»로 넘긴다(src/agent/identity-env.ts).
+ * HQ 가 git worktree/`--test` 라면 그 env 에 `derived` 가 실린다. 루트만 원격 값으로 바꾸고 태그를 그대로
+ * 흘리면 원격 부모는 «명시한 운영 루트 + 파생 태그»를 받아 자기 우주를 test 로 오독한다 —
+ * `SOURCE === 'derived'` 를 보는 codexCredentialRoot(src/budget/codex-reset-credit-state.ts)·
+ * harnessLaunchPolicyConfig(src/harness/harness-substrate-default.ts) 가 그 자리다.
+ * 떼어 띄운 운영 부모의 기존 꼴(src/task-orchestrator/surfaces/pod-si-warm-runner.ts)과 같은 `explicit` 를 찍는다.
+ */
+const REMOTE_STATE_DIR_SOURCE = 'explicit';
+/** 원격 발사에서 HQ 값을 버리고 원격 기준으로 다시 찍는 상태 루트 env(한 벌). */
+const STATE_ROOT_ENV_KEYS: ReadonlySet<string> = new Set(['ELANOUS_STATE_DIR', 'ELANOUS_STATE_DIR_SOURCE']);
 const HOST_RE = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/;
 /** A parent can wait for a child for tens of minutes; the two-minute HTTP refresh floor is too short here. */
 export const PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS = 60 * 60_000;
@@ -227,7 +238,9 @@ export function remoteLaunchScript(target: ParentHostConfig, args: readonly stri
   const log = remoteParentLogPath(target, env.ELANOUS_RUN_ID ?? 'unknown');
   // --config-dir keeps the parent's operational config/state; authStorePath()
   // reads XDG_CONFIG_HOME/elanous/auth.json first, as the entrypoint test proves.
-  const envPart = [...Object.entries(env).filter(([key]) => key !== 'ELANOUS_STATE_DIR' && /^[A-Z_][A-Z0-9_]*$/.test(key)).map(([key, value]) => `${key}=${key === 'XDG_CONFIG_HOME' || key === 'CODEX_HOME' || key === 'GH_CONFIG_DIR' ? remotePath(value) : shellQuote(value)}`), `ELANOUS_STATE_DIR=${remotePath(configDir)}`].join(' ');
+  // 상태 루트는 태그와 한 벌로 넘긴다(REMOTE_STATE_DIR_SOURCE 주석) — HQ 의 derived 태그가
+  // 함께 흐르면 방금 명시한 운영 루트를 원격 부모가 test 우주로 오독한다.
+  const envPart = [...Object.entries(env).filter(([key]) => !STATE_ROOT_ENV_KEYS.has(key) && /^[A-Z_][A-Z0-9_]*$/.test(key)).map(([key, value]) => `${key}=${key === 'XDG_CONFIG_HOME' || key === 'CODEX_HOME' || key === 'GH_CONFIG_DIR' ? remotePath(value) : shellQuote(value)}`), `ELANOUS_STATE_DIR=${remotePath(configDir)}`, `ELANOUS_STATE_DIR_SOURCE=${shellQuote(REMOTE_STATE_DIR_SOURCE)}`].join(' ');
   const argv = [remotePath(elanous), '--config-dir', remotePath(configDir), ...remoteParentArgs(args, target.podPool).map(shellQuote)].join(' ');
   // 준비가 실패하면 «확실히 안 띄웠다»(not-launched=…)를 찍고 끝낸다 — 그때만 호출부가 로컬로 돌아간다.
   // 띄운 뒤에는 짧게 살아 있는지 보고 pid 를 찍는다(조기 종료면 early-exit — 역시 «안 돈다»가 확실).

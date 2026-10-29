@@ -1,13 +1,20 @@
 import type { Command } from 'commander';
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { canonicalSeatId, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
 import { clearPostOffice, ensurePostOffice, writePostOffice } from '../msg/msg-post-office.js';
+import { acquireLockSync } from '../storage/file-lock.js';
+import { GitHubMsgMirrorTransport } from '../msg/msg-mirror-github.js';
+import { configuredMirrorTarget, runMsgMirrorTick, type MirrorTarget, type MsgMirrorStateStore, type MsgMirrorTransport } from '../msg/msg-mirror-runner.js';
+import { JsonMsgMirrorStateStore } from '../msg/msg-mirror-state.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
+import { debug } from '../debug/log.js';
 import type { AgentReplyAddress, AgentReplyInput, AgentReplyResult } from '../loops/agent-reply.js';
 import { messageRouteFor, noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
 import { resolveWake, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
-import type { RoleLlmSpec } from '../user-config.js';
+import { getUserConfig, type RoleLlmSpec } from '../user-config.js';
 
 /** The loop rows whose reply body is an LLM agent: `--agent-reply` picks one of these. */
 const AGENT_REPLY_ROLES = { COORDINATOR: 'coordinator', GUARDIAN: 'guardian' } as const;
@@ -22,6 +29,9 @@ export interface MsgCliDeps {
   signal?: AbortSignal;
   fetch?: typeof fetch;
   authToken?: () => string;
+  mirrorTarget?: MirrorTarget | null;
+  mirrorState?: MsgMirrorStateStore;
+  mirrorTransport?: MsgMirrorTransport;
   /** Wake-path resolution for `msg route` (tests inject; default reads pty manifest ⊕ seat folders). */
   wakeDeps?: WakeDeps;
   /** Attach the logs.db sink so `msg.wake` reaches `elanous logs` (a short CLI otherwise writes only the file trail). */
@@ -197,6 +207,52 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   const requireAgentTarget = (address: AgentReplyAddress, to: string): void => {
     if (address !== to) throw new Error(`--agent-reply ${address} requires --to ${address}`);
   };
+
+  msg.command('mirror').description('Mirror selected seat messages to the configured GitHub issue')
+    .option('--dry-run', 'read the configured channel and ledger without writing')
+    .option('--watch', 'repeat until interrupted')
+    .option('--interval <seconds>', 'poll interval in watch mode (default 60)', '60')
+    .option('--json')
+    .action((opts: CommonOptions & { dryRun?: boolean; watch?: boolean; interval?: string }) => run(async () => {
+      const intervalSeconds = integer(opts.interval, '--interval', 60, 1, 3600);
+      const state = deps.mirrorState ?? new JsonMsgMirrorStateStore();
+      const configTarget = deps.mirrorTarget === undefined
+        ? configuredMirrorTarget(getUserConfig().raw.msgMirror) : deps.mirrorTarget ?? undefined;
+      const existingState = state.read();
+      if (!configTarget && !existingState) {
+        const result = { status: 'disabled', reason: 'msgMirror.target is not configured', target: null };
+        debug.log('msg.mirror', 'disabled', result);
+        out.log(opts.json ? JSON.stringify(result) : 'msg mirror 비활성: msgMirror.target 미설정');
+        return;
+      }
+      const store = openRead();
+      const transport = deps.mirrorTransport ?? new GitHubMsgMirrorTransport();
+      const signal = deps.signal;
+      try {
+        do {
+          let release = () => {};
+          if (state instanceof JsonMsgMirrorStateStore) {
+            mkdirSync(dirname(state.path), { recursive: true, mode: 0o700 });
+            release = acquireLockSync(`${state.path}.lock`, { breakDeadHolder: true });
+          }
+          let result: Awaited<ReturnType<typeof runMsgMirrorTick>>;
+          try {
+            result = await runMsgMirrorTick({
+              ...(configTarget ? { configuredTarget: configTarget } : {}),
+              ...(opts.dryRun ? { dryRun: true } : {}),
+              source: { listAfter: (after, limit) => store.listAfter(after, limit),
+                listWindow: (start, end) => store.listCreatedBetween(start, end), latestId: () => store.latestId() },
+              state, transport,
+            });
+          } finally { release(); }
+          debug.log('msg.mirror', 'tick', result);
+          out.log(opts.json ? JSON.stringify(result)
+            : `msg mirror ${result.status} · scanned ${result.scanned} · posted ${result.posted} · rotated ${result.rotated} · summaries ${result.summaries}`);
+          if (!opts.watch || signal?.aborted) break;
+          await sleep(intervalSeconds * 1000);
+        } while (!signal?.aborted);
+      } finally { store.close(); }
+    })());
 
   /**
    * Human-free live conversation: the selected address's LLM body answers the message that was just saved.

@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { ModelCatalog, ModelEntry } from './types.js';
+import { resolveModelAlias } from './model-alias.js';
 
 // 2026-05-03 snapshot — added Kimi (Moonshot) / Qwen 3.6 (Alibaba) /
 // GLM 5.x (Zhipu) families. Open-weight vs cloud-only is captured by
@@ -172,16 +173,55 @@ export const BUILTIN_CATALOG: ModelCatalog = {
       inputPerMtok: 2,
       outputPerMtok: 10,
       local: false,
-      tags: ['coding', 'reasoning', 'agentic', 'balanced', 'long-context'],
+      tags: ['coding', 'reasoning', 'agentic', 'balanced', 'legacy', 'long-context'],
       bestFor: ['daily-coding', 'multi-file-edit', 'autonomous-implementation', 'complex-architecture'],
       reservedOutputTokens: 12_000,
+      // Coarse capability tier (legacy state is recorded in tags; this schema has no `legacy` tier).
       tier: 'better',
       variantOf: 'gpt-6',
       effortAxis: 'sol',
       reasoningEffortCeiling: 'max',
       releasedAt: '2026-09-22',
       classification: { source: 'builtin', at: '2026-09-23' },
-      notes: '대표 2026-09-23 운영 기본(medium) — 구 gpt-5.6-terra 대체. 구독·API 둘 다 확인. effort none/low/medium(기본)/high/xhigh/max · 1.05M ctx(입력 922K · 출력 128K) · 컷오프 2026-04-20. ⚠️ 272K 초과 프롬프트는 input·cache 2배 · output 1.5배로 «요청 전체»가 재과금된다.',
+      notes: 'Legacy GPT-6 Sol retained for explicit compatibility; GPT-6.1 Terra is the current Codex default. 1.05M context. Per OP 2026-10-28 price direction, its cached-input estimate matches GPT-6.1 Sol ($0.10/M).',
+    },
+    {
+      id: 'gpt-6.1-terra',
+      provider: 'openai-codex',
+      family: 'gpt-6',
+      contextWindow: 500_000,
+      inputPerMtok: 1,
+      outputPerMtok: 5,
+      local: false,
+      tags: ['coding', 'reasoning', 'agentic', 'balanced'],
+      bestFor: ['daily-coding', 'multi-file-edit', 'autonomous-implementation'],
+      reservedOutputTokens: 12_000,
+      tier: 'better',
+      variantOf: 'gpt-6',
+      effortAxis: 'terra',
+      reasoningEffortCeiling: 'max',
+      releasedAt: '2026-10-26',
+      classification: { source: 'builtin', at: '2026-10-28' },
+      notes: 'GPT-6.1 Terra · Codex CLI 0.164.0 카탈로그 실측 · 500K context · $1/$5, cached input $0.05/M. CLI 기본 effort=low; elanous 경로 기본 medium 유지.',
+    },
+    {
+      id: 'gpt-6.1-sol',
+      provider: 'openai-codex',
+      family: 'gpt-6',
+      contextWindow: 500_000,
+      inputPerMtok: 2,
+      outputPerMtok: 10,
+      local: false,
+      tags: ['coding', 'reasoning', 'agentic', 'frontier'],
+      bestFor: ['complex-architecture', 'long-horizon-agentic', 'deep-analysis'],
+      reservedOutputTokens: 16_000,
+      tier: 'best',
+      variantOf: 'gpt-6',
+      effortAxis: 'sol',
+      reasoningEffortCeiling: 'max',
+      releasedAt: '2026-10-26',
+      classification: { source: 'builtin', at: '2026-10-28' },
+      notes: 'GPT-6.1 Sol · Codex CLI 0.164.0 카탈로그 실측 · 500K context · $2/$10, cached input $0.10/M. CLI 기본 effort=low; elanous 경로 기본 medium 유지.',
     },
     {
       id: 'gpt-6-luna',
@@ -942,6 +982,23 @@ export function reasoningEffortCeiling(modelId: string | undefined): ReasoningEf
   if (m.startsWith('gpt-5')) return 'high';      // 기타 gpt-5.x
   if (m.startsWith('gpt-4') || m.startsWith('o1') || m.startsWith('o3')) return 'none';  // 비추론/구세대
   return 'medium';                               // local 등 미상 — 보수적
+}
+
+export const CHILD_LLM_EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** Shared explicit effort check for task hand and the dev entrypoint. */
+export function childLlmEffortProblem(model: string, entered: string): string | undefined {
+  const effort = entered.trim().toLowerCase();
+  const ladder: readonly string[] = CHILD_LLM_EFFORT_LADDER;
+  if (!ladder.includes(effort)) {
+    return `--child-llm-effort 알 수 없음: ${entered} · 후보: ${CHILD_LLM_EFFORT_LADDER.join(', ')}`;
+  }
+  const ceiling = reasoningEffortCeiling(resolveModelAlias(model.trim()) ?? model.trim());
+  if (ceiling === 'none') return `--child-llm-effort 거부: ${model} 은 추론 노력을 «안 받는다»(ceiling=none)`;
+  if (ladder.indexOf(effort) > ladder.indexOf(ceiling)) {
+    return `--child-llm-effort 거부: ${effort} 가 ${model} 의 상한(${ceiling})을 넘는다`;
+  }
+  return undefined;
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────

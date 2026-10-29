@@ -70,7 +70,10 @@ export function recordPodSourceIoSummary(logs: string, job: string, runId: strin
   if (!ioSummary) return;
   try {
     const measured = JSON.parse(ioSummary) as Record<string, unknown>;
-    log('pod.source', 'io-summary', { job, runId, runIdSource, ...measured, hostOriginCalls });
+    const pushCounterReady = /^ELANOUS_POD_GIT_PUSH_COUNTER ready\r?$/m.test(logs);
+    const pushCalls = (logs.match(/^ELANOUS_POD_GIT_PUSH_ATTEMPT\r?$/gm) ?? []).length;
+    log('pod.source', 'io-summary', { job, runId, runIdSource, ...measured, hostOriginCalls,
+      ...(pushCounterReady ? { pushCalls } : {}) });
   } catch (error) {
     log('pod.source', 'io-summary-invalid', { job, runId, runIdSource, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
   }
@@ -137,7 +140,7 @@ import { ZAI_POD_EGRESS_LABEL, checkZaiPodSecret, countActiveZaiJobs, decideZaiP
 import { ZAI_CODING_DEFAULT_MODEL, ZAI_OPENROUTER_FALLBACK_MODEL, zaiSettingsFromConfig, type ZaiCodingPlanSettings } from '../../llm/zai-coding-plan.js';
 import { normalizePlanningFallbackReason, selectEnhanceLlm } from '../../prompt-enhance/enhance.js';
 import { inferProviderFromModel } from '../../llm.js';
-import { classifyPodExit, extractPodFailureReason, podChildFailureAttribution, podDeadlineResultMarker, podJobConditionReason, podTerminalRow, POD_TERMINATION_JOB_JSONPATH, POD_TERMINATION_PODS_JSONPATH, readPodTermination, type PodExitClass, type PodTermination } from './pod-failure-reason.js';
+import { classifyPodExit, extractPodFailureReason, podChildEvidenceLedgerRow, podChildFailureAttribution, podDeadlineResultMarker, podJobConditionReason, podTerminalRow, POD_TERMINATION_JOB_JSONPATH, POD_TERMINATION_PODS_JSONPATH, readPodTermination, type PodExitClass, type PodTermination } from './pod-failure-reason.js';
 import { kubectlTransientReason, retryKubectlTransient } from './kubectl-transient-retry.js';
 import { OLD_DOOR_STAMP_ENV } from '../../self-dev/old-door.js';
 import { resolveDefaultSourceHead, seedMirrorOnce, type MirrorSeedResult } from './pod-mirror-seed.js';
@@ -771,9 +774,10 @@ export function podGitPushGuardScript(runId?: string): string {
     '    *) echo "[pod] git-guard: refused push to $rref (only this run\'s branches)" >&2; exit 1 ;;',
     '  esac',
     'done',
+    'case "$2" in https://github.com/*|http://github.com/*|git@github.com:*|ssh://git@github.com/*) printf \'ELANOUS_POD_GIT_PUSH_ATTEMPT\\n\' >&2 ;; esac',
     'exit 0',
     'ELANOUS_PRE_PUSH',
-    `chmod 755 "${POD_GIT_HOOKS_DIR}/pre-push" && git config --global core.hooksPath "${POD_GIT_HOOKS_DIR}"`,
+    `chmod 755 "${POD_GIT_HOOKS_DIR}/pre-push" && git config --global core.hooksPath "${POD_GIT_HOOKS_DIR}" && printf 'ELANOUS_POD_GIT_PUSH_COUNTER ready\\n'`,
   ].join('\n');
 }
 
@@ -1604,19 +1608,42 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
     }
     if (options.siWarmAttempt) {
       const done = (async (): Promise<SelfImplementJobDone> => {
+        // POD-REUSE-REQUEST-CLEAN-FU — one fail-soft row per request decision. `runId` is the
+        // ledger partition (warm child, then parent run, then the legacy spaceId fallback);
+        // `correlationId` always names the request's spaceId. `warm-path-selected` is recorded
+        // before transport, so only the later return/quarantine row settles whether reuse completed.
+        // A ledger write failure is an observation failure only.
+        const recordWarmRequestDecision = (data: Record<string, unknown>, runId?: string) => {
+          const parentRunId = env.ELANOUS_RUN_ID;
+          const ledgerRunId = runId ?? parentRunId ?? input.spaceId;
+          const runIdSource = runId ? 'warm-child-run' : parentRunId ? 'parent-run' : 'space-id-fallback';
+          try { writeWarmLedger({ runId: ledgerRunId, event: 'pod-reuse-request-decision',
+            data: { ...data, correlationId: input.spaceId, runIdSource } }); }
+          catch (error) { debug.log('pod.reuse', 'ledger-unavailable', { spaceId: input.spaceId,
+            event: 'pod-reuse-request-decision',
+            reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+        };
         let attempt: SiWarmChildAttempt;
         try {
           const acquired = await options.siWarmAttempt!(input);
           if (!acquired) {
             // No lease was fenced: use the existing one-shot Job path.
+            recordWarmRequestDecision({ spaceId: input.spaceId, outcome: 'cold-job',
+              workerId: null, leaseId: null, generation: null, podUid: null });
             const { siWarmAttempt: _unused, siWarmHostPostprocess: _postprocess, ...coldOptions } = options;
             return podSelfImplementSpawn(coldOptions)(input).done;
           }
           attempt = acquired;
+          recordWarmRequestDecision({ spaceId: input.spaceId, outcome: 'warm-path-selected',
+            workerId: acquired.command?.workerId ?? null, leaseId: acquired.command?.leaseId ?? null,
+            generation: acquired.command?.generation ?? null, podUid: acquired.command?.podUid ?? null },
+            acquired.command?.runId);
         }
         catch (error) {
           // A lost exec reply may conceal an already opened PR. Never start another child here.
           const message = error instanceof Error ? error.message : String(error);
+          recordWarmRequestDecision({ spaceId: input.spaceId, outcome: 'acquire-failed', reason: message,
+            workerId: null, leaseId: null, generation: null, podUid: null });
           debug.log('pod.reuse', 'attempt-unavailable', { spaceId: input.spaceId, reason: message }, { level: 'warn' });
           return { exitCode: 1, output: '', error: { code: 'si-warm-reconcile-only', message } };
         }
@@ -1985,7 +2012,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         return 'pool-slot-unavailable';
       };
       const recordSlotObservation = (attempt: { observationKey: string; requestedAtMs: number; requestedAt: string },
-        outcome: 'requested' | 'queued' | 'admitted' | 'rejected', reasonCode: string): void => {
+        outcome: 'requested' | 'queued' | 'admitted' | 'rejected', reasonCode: string,
+        cancellation?: { abortReason?: string; waitReason: string | null }): void => {
         const pool = options.pool;
         let occupants: Record<string, number> | null = null;
         try { occupants = pool ? pool.snapshot() : null; } catch { /* observation must not change scheduling */ }
@@ -1994,6 +2022,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           observationKey: attempt.observationKey, runId: childRunId, host: resolveHostId(env),
           requestedAt: attempt.requestedAt, waitedMs: Math.max(0, slotNow() - attempt.requestedAtMs),
           queued: outcome === 'queued', poolCapacity, occupants, reasonCode, parentId: ledgerRunId, outcome,
+          ...(cancellation ? { waitReason: cancellation.waitReason,
+            ...(cancellation.abortReason === undefined ? {} : { abortReason: cancellation.abortReason }) } : {}),
         };
         debug.log('pod.slot', outcome, data, { level: outcome === 'admitted' || outcome === 'requested' ? 'info' : 'warn' });
         try {
@@ -2045,6 +2075,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         const attempt = { observationKey: `${childRunId}:pod-slot:${requestedAtMs}:${++slotAttemptNumber}`,
           requestedAtMs, requestedAt: new Date(requestedAtMs).toISOString() };
         let firstSlotReasonCode: string | undefined;
+        stageReason['pool-slot'] = null;
         let slotQueuedRecorded = false;
         const stop = watchStall('pool-slot');
         // MINIH-MODE (0.2.37): the location is declared by the launch env — absent/unknown keeps the configured
@@ -2110,7 +2141,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       let member: PodPoolMember | null;
       try { member = await acquireSlot(); } catch (error) { podAdmitError(error); throw error; }
       if (options.pool && !member) {
-        if (lastSlotAttempt) recordSlotObservation(lastSlotAttempt, 'rejected', lastSlotReasonCode ?? 'aborted');
+        if (lastSlotAttempt) recordSlotObservation(lastSlotAttempt, 'rejected', lastSlotReasonCode ?? 'aborted', {
+          waitReason: stageReason['pool-slot'] ?? null,
+          ...(typeof input.signal?.reason === 'string' ? { abortReason: input.signal.reason } : {}),
+        });
         exitJourneyNode('pool-admit', { provenance: 'self-implement-pod', outcome: 'refused', data: { spaceId: input.spaceId, reason: 'no-slot' } });
         return { exitCode: null, output: '', error: { code: 'aborted', message: 'aborted before a pool slot opened', ...(lastSlotReasonCode ? { reasonCode: lastSlotReasonCode } : {}) } };
       }
@@ -3005,7 +3039,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         }
         try {
-          appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-run', data: { childRunId: liveChildRunId, job: name, attempt: oomRetried ? 2 : 1, ...(goalFile ? { goalFile } : {}) } }, ledgerDir);
+          appendRunLedgerEntry({ runId: ledgerRunId, timestamp: new Date((options.now ?? Date.now)()).toISOString(),
+            event: 'pod-child-run', data: { childRunId: liveChildRunId, job: name, attempt: oomRetried ? 2 : 1, ...(goalFile ? { goalFile } : {}) } }, ledgerDir);
           appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-job-applied', data: { job: name, childRunId: liveChildRunId, jobUid: lifecycleJobUid, host: member?.sshHost ?? resolveHostId(env), context, namespace } }, ledgerDir);
           if (lastPlacement) appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-placement', data: { job: name, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1, member: lastPlacement.member, kind: lastPlacement.kind, outcome: lastPlacement.outcome, preferred: lastPlacement.preferred, reason: lastPlacement.reason } }, ledgerDir);
           appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-memory-selected', data: { job: name, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1, limit: memoryLimit, ...(appliedMemoryRequest ? { request: appliedMemoryRequest } : {}), tier: oomRetried ? retryTier : memoryTier, source: oomRetried ? 'oom-retry' : memorySource, reason: oomRetried ? 'OOMKilled' : memoryReason, declaredGoalType: selectedGoalType } }, ledgerDir);
@@ -3181,8 +3216,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             if (seen !== null) {
               releaseAdmission?.observed?.();
               state = seen === 0 ? 'complete' : 'failed';
-              // The child's own rc (the Pod's terminated state may lag like the condition) — exit-code paths read it as before.
-              if (seen !== 0) containerExitCode = seen;
+              // The child's own rc is the parent's exit code even when 0 — the condition path below yields none here.
+              containerExitCode = seen;
               if (seen !== 0) podTermination = readPodTermination({ kubectl, namespace, job: name, path: 'result-marker', jobUid: lifecycleJobUid });
               if (seen !== 0) captureFailedJob(liveChildRunId);
               debug.log('self-implement.pod', 'result-marker-early', { job: name, waitedMs: Date.now() - waitStartedAt, rc: seen });
@@ -3498,12 +3533,57 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         // exitCode stays null when the container's code was not read (never filled in as 0).
         const finishedRow = { job: name, run: launchRunId, ...(liveChildRunId !== launchRunId ? { childRun: liveChildRunId } : {}),
           attempt: oomRetried ? 2 : 1, phase: state, exitCode: containerExitCode,
-          reason: failedReason || containerReason || (state === 'complete' ? 'complete' : 'unknown') };
+          reason: failedReason || containerReason || (state === 'complete' ? 'complete' : 'unknown'),
+          // POD-TERMINAL-EVIDENCE-JOIN: keep classifier and termination cause on this Job/childRun/attempt row.
+          failureClassification: disposition?.failureClassification ?? null,
+          classificationBasis: disposition?.childEvidence?.classificationBasis ?? null,
+          // The child-run status is a different axis from the implementation's abandoned classification.
+          // Preserve it even when the child did not emit a parseable self-implement disposition.
+          podExitClass: state === 'failed' ? classifyPodExit({ containerReason: containerReason ?? null,
+            containerExitCode: containerExitCode ?? null, jobReason: failedReason || null, logs }).class : null,
+          childFailureStage: childFailure?.stage ?? null,
+          terminationReason: typeof disposition?.childEvidence?.terminationReason === 'string'
+            ? redactSecretText(disposition.childEvidence.terminationReason).slice(0, 200) : null };
         try { appendRunLedgerEntry({ runId: ledgerRunId, event: POD_LAUNCH_FINISHED_EVENT, timestamp: new Date((options.now ?? Date.now)()).toISOString(), data: finishedRow }, ledgerDir); }
         catch (error) { debug.log('pod.provenance', 'history-unavailable', { job: name, row: 'finished', reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
         debug.log('pod.provenance', 'job-finished', finishedRow);
-        debug.log('self-implement.pod', 'job-finished', { job: name, ...(member ? { context: member.context } : {}), state, containerReason, stage: disposition?.stage ?? null, prUrl: disposition?.prUrl ?? null, childRunId: liveChildRunId, ledgerCompleteness,
+        // Keep report-deficit incidents queryable as one bounded event. The child detail field is
+        // intentionally capped elsewhere, so cause evidence must not depend on that full payload.
+        const reportDeficit = disposition?.failureClassification === 'report-deficit';
+        const noResultIncident = state === 'failed' && failedReason !== 'DeadlineExceeded' && !disposition;
+        if (reportDeficit || noResultIncident) {
+          const evidence = disposition?.childEvidence;
+          const diagnosticLines = [
+            ...(Array.isArray(evidence?.podLogTail) ? evidence.podLogTail : []),
+            ...(typeof evidence?.detail === 'string' ? evidence.detail.split('\n') : []),
+            ...(typeof evidence?.detailTail === 'string' ? evidence.detailTail.split('\n') : []),
+            ...(typeof evidence?.stderr === 'string' ? evidence.stderr.split('\n') : []),
+            ...(Array.isArray(noResultLogEvidence?.logTail) ? noResultLogEvidence.logTail as string[] : []),
+            ...(Array.isArray(noResultLogEvidence?.podLogTail) ? noResultLogEvidence.podLogTail as string[] : []),
+            ...(typeof noResultLogEvidence?.stderr === 'string' ? noResultLogEvidence.stderr.split('\n') : []),
+          ].slice(-12).map((line) => redactSecretText(line).slice(0, 500));
+          debug.log('pod.child', reportDeficit ? 'report-deficit-cause' : 'terminal-cause', {
+            job: name, run: launchRunId, childRun: liveChildRunId, attempt: oomRetried ? 2 : 1,
+            // A missing parsed result is an incident trigger, not proof of the child's classifier.
+            classification: disposition?.failureClassification ?? null,
+            ...(noResultIncident ? { trigger: 'no-result' } : {}),
+            podExitClass: finishedRow.podExitClass,
+            classificationBasis: evidence?.classificationBasis ?? null,
+            phase: state, exitCode: containerExitCode,
+            reason: failedReason || containerReason || 'unknown',
+            terminationReason: evidence?.terminationReason ?? null,
+            providerErrors: disposition?.providerErrors ?? null,
+            oomKilled, podTermination: podTermination ?? null,
+            detailTail: evidence?.detailTail ?? null,
+            lastLines: diagnosticLines,
+          }, { level: 'warn', compact: { stringMax: 4_500 } });
+        }
+        debug.log('self-implement.pod', 'job-finished', { job: name, ...(member ? { context: member.context } : {}), state, containerReason, stage: disposition?.stage ?? null, prUrl: disposition?.prUrl ?? null, childRunId: liveChildRunId, attempt: oomRetried ? 2 : 1, ledgerCompleteness,
+          ...(noResultLogEvidence ? { stopEvidenceTail: podStopEvidenceTail(noResultLogEvidence) } : {}),
           ...(podTermination ? { podTermination } : {}),
+          failureClassification: finishedRow.failureClassification,
+          classificationBasis: finishedRow.classificationBasis,
+          terminationReason: finishedRow.terminationReason,
           ...(state === 'failed' && !oomKilled && failedReason !== 'DeadlineExceeded'
             ? { ...(childFailure ? { childStage: childFailure.stage } : disposition?.stage ? { childStage: disposition.stage } : {}),
               // POD-NORESULT: a parsed result row without error text is not a missing result line (UX 10-07 01:01: 28 of 28 exit-2 Jobs printed one).
@@ -3569,7 +3649,10 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             if (!await acquireAdmission()) return admissionFailure();
             member = await acquireSlot();
             if (options.pool && !member) {
-              if (lastSlotAttempt) recordSlotObservation(lastSlotAttempt, 'rejected', lastSlotReasonCode ?? 'aborted');
+              if (lastSlotAttempt) recordSlotObservation(lastSlotAttempt, 'rejected', lastSlotReasonCode ?? 'aborted', {
+                waitReason: stageReason['pool-slot'] ?? null,
+                ...(typeof input.signal?.reason === 'string' ? { abortReason: input.signal.reason } : {}),
+              });
               return { exitCode: null, output: '', error: { code: 'aborted', message: 'aborted before a pool slot opened', ...(lastSlotReasonCode ? { reasonCode: lastSlotReasonCode } : {}) } };
             }
             if (member) context = member.context;
@@ -3595,13 +3678,21 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         }
         // The host still has the complete Pod log here. The CLI only retains a short stdout tail,
         // so preserve the parsed child facts in the parent ledger before that tail is returned.
-        if (state === 'failed' || state === 'aborted' || noResultLogEvidence || (state === 'complete' && noResultDiagnostic !== null)) {
+        const childEvidenceRow = podChildEvidenceLedgerRow({
+          job: name,
+          childRunId: liveChildRunId,
+          state,
+          result: disposition ?? null,
+          noResultDiagnostic,
+          noResultLogEvidence,
+          podTermination,
+        });
+        if (childEvidenceRow) {
           // Every terminal attempt writes a marker, including one with no parseable child facts.
           // The next attempt must never inherit an earlier Pod's classification.
-          const childEvidence = noResultLogEvidence
-            ? { ...(disposition?.childEvidence ?? {}), ...noResultLogEvidence }
-            : disposition?.childEvidence ?? null;
-          try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-evidence', data: { childEvidence, childRunId: liveChildRunId, job: name, ...(podTermination ? { podTermination } : {}) } }, ledgerDir); }
+          // Also persist completed Jobs whose child result is unsuccessful; Kubernetes
+          // Completed is container success, not proof the requested work converged.
+          try { appendRunLedgerEntry({ runId: ledgerRunId, event: 'pod-child-evidence', data: childEvidenceRow }, ledgerDir); }
           catch (error) { debug.log('self-implement.pod', 'child-evidence-write-failed', { job: name, childRunId: liveChildRunId, reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
         }
         let prLookup: OpenPrByBranch | undefined;
@@ -3829,6 +3920,15 @@ const POD_NO_RESULT_LOG_REASON_MAX_CHARS = 512;
 function boundedPodLogText(source: string, maxChars: number): string {
   const redacted = redactSecretText(source).replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
   return redacted.length > maxChars ? `${redacted.slice(0, maxChars)}…[truncated]` : redacted;
+}
+
+/** A compact, redacted stop clue carried on the attempt-scoped finished row. */
+function podStopEvidenceTail(evidence: Record<string, unknown>): string[] {
+  const raw = Array.isArray(evidence.logTail) ? evidence.logTail
+    : Array.isArray(evidence.podLogTail) ? evidence.podLogTail
+    : typeof evidence.stderr === 'string' ? evidence.stderr.split(/\r\n|\n|\r/u) : [];
+  return raw.slice(-12).filter((line): line is string => typeof line === 'string' && line.length > 0)
+    .map((line) => redactSecretText(line).slice(0, 240));
 }
 
 /** 로그 꼬리 — 마지막 N줄만, 한 줄씩 비밀값 마스킹. */

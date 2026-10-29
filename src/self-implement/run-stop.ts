@@ -16,7 +16,7 @@ import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implem
 /** 닫힌 목록 — 못 고르면 `unclassified`. */
 export const RUN_STOP_CLASSES = [
   'env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat',
-  'review-out-of-scope', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified',
+  'review-out-of-scope', 'review-budget-exhausted', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified',
 ] as const;
 export type RunStopClass = typeof RUN_STOP_CLASSES[number];
 
@@ -81,7 +81,8 @@ export function classifyMergeHoldStop(mergeReason: string | undefined): RunStopC
   const reason = mergeReason ?? '';
   if (reason.startsWith('main-sync') || reason === 'default-branch-unresolved') return 'main-sync';
   if (reason === 'required-evidence-uncovered') return 'evidence-uncovered';
-  if (reason === 'review-must-fix' || reason === 'review-warn-with-must-fix' || reason.startsWith('review-budget')) return 'review-repeat';
+  if (reason.startsWith('review-budget')) return 'review-budget-exhausted';
+  if (reason === 'review-must-fix' || reason === 'review-warn-with-must-fix') return 'review-repeat';
   if (reason.startsWith('review-diff') || reason === 'no-real-review') return 'review-out-of-scope';
   return 'unclassified';
 }
@@ -94,6 +95,24 @@ export function classifyPodExitStop(reason: string | undefined, stage?: string):
     case 'no-launch': return 'launch-failed';
     default: return 'unclassified';
   }
+}
+
+/** Terminal implementation failures are classified only after the inner repair/round budget has ended. */
+export function classifyTerminalHarnessFailure(input: {
+  stage: string;
+  mergeReason?: string;
+  abandonedClassification?: string;
+  providerErrorCategory?: string;
+  supervisorVerdict?: string;
+}): RunStopClass {
+  if (input.mergeReason) return classifyMergeHoldStop(input.mergeReason);
+  if (input.providerErrorCategory === 'credential' || input.abandonedClassification === 'credential-failure') return 'launch-failed';
+  if (input.abandonedClassification === 'report-deficit') return 'pod-died';
+  if (input.stage === 'gate-failed') return 'gate-failed';
+  if (input.stage === 'review-blocked' || input.stage === 'no-changes' || input.supervisorVerdict === 'UNCONVERGEABLE') return 'review-repeat';
+  if (input.stage === 'merge-conflict') return 'main-sync';
+  if (input.stage === 'timed-out') return 'pod-died';
+  return 'unclassified';
 }
 
 /** 이 프로세스에서 stop 을 이미 쓴 런 — 한 런이 두 자리(예: draft PR 실패 ⊕ aborted)에서 두 줄을 쓰지 않게. */

@@ -43,7 +43,7 @@ import {
   type GoalClarificationSelfResolver,
 } from '../self-implement/goal-author-clarification.js';
 import { countMissingAuthoredConstraintMarkers, askGoalTypeDeclaration, declaredGoalType, parseGoalId } from '../self-implement/goal-author.js';
-import { observeFrontNodeEntry, observeFrontNodeExit, observeFrontNodeUnit, type AuthorExitOutcome } from './graph-front-nodes.js';
+import { observeFrontNodeEntry, observeFrontNodeExit, runFrontNodeUnit, type AuthorExitOutcome } from './graph-front-nodes.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { decomposeSelfDevGoal, type SelfDevDecomposeOptions, type SelfDevDecomposition } from './decompose.js';
 import { observeDecomposerSelection, readFabricDecomposeConfig, selectFabricDecomposer } from './self-orchestrate-runtime.js';
@@ -406,21 +406,28 @@ export async function recommendLaunchDecomposition(
       fabricDecomposeConfig.autoPathThreshold,
     );
     const decomposeGoalType = input.goalType ?? declaredGoalType(input.askText);
+    const frontRunId = input.runId ?? process.env.ELANOUS_RUN_ID;
     observeFrontNodeEntry('decompose', {
       provenance: 'authoring-decomposition-start',
-      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(frontRunId === undefined ? {} : { runId: frontRunId }),
       ...(decomposeGoalType === null ? {} : { goalType: decomposeGoalType }),
     });
-    const result = await observeFrontNodeUnit('decompose', input.runId ?? process.env.ELANOUS_RUN_ID, decomposeGoalType ?? undefined, () => Promise.race([
-      deps.decomposeGoal
-        ? deps.decomposeGoal(document!)
-        : decomposeSelfDevGoal(document!, {
-          ...deps.decomposeOptions,
-          decomposer: selection.decomposer,
-          observation: prelaunchDecompositionObservation(document!),
-        }),
-      timeout,
-    ]));
+    const result = await runFrontNodeUnit({
+      node: 'decompose',
+      execute: (goalDocument) => Promise.race([
+        deps.decomposeGoal
+          ? deps.decomposeGoal(goalDocument)
+          : decomposeSelfDevGoal(goalDocument, {
+            ...deps.decomposeOptions,
+            decomposer: selection.decomposer,
+            observation: prelaunchDecompositionObservation(goalDocument),
+          }),
+        timeout,
+      ]),
+    }, document!, {
+      ...(frontRunId === undefined ? {} : { runId: frontRunId }),
+      ...(decomposeGoalType === null ? {} : { goalType: decomposeGoalType }),
+    });
     if (result === timedOut) {
       // ⛔ 「시간 초과」를 「못 쟀다」로 뭉개지 않는다 — 분해기는 «아직 답하는 중»이고
       //   그 답은 `prelaunch-decomposition` 이름으로 «따로» 내려앉는다(위 주석).
@@ -871,25 +878,32 @@ export async function runAskLaunchFlow(
     //   ⛔ 선언이 «없을 때» 넘기면 안 된다 — 저작기의 정식 기본값을 덮어쓰게 된다.
     const declaredAskGoalType = declaredGoalType(input.askText);
     const goalType = input.goalType ?? declaredAskGoalType;
+    const frontRunId = input.runId ?? process.env.ELANOUS_RUN_ID;
     const frontObservation = {
-      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(frontRunId === undefined ? {} : { runId: frontRunId }),
       ...(goalType === null ? {} : { goalType }),
     };
     // ⭐ RFC §5 5단계 — 확인된 implement 저작만 활성 구현 그래프에 이름을 잇는다.
     observeFrontNodeEntry('author', { ...frontObservation, provenance: 'authoring-start' });
-    const authored = await deps.authorGoal([authorAskText], {
-      cwd: deps.cwd(),
-      ...(input.groundingCwd === undefined ? {} : { groundingCwd: input.groundingCwd }),
-      ...(input.authorGrade === undefined ? {} : { authorGrade: input.authorGrade }),
+    const authored = await runFrontNodeUnit({
+      node: 'author',
+      execute: (text, context) => deps.authorGoal([text], {
+        cwd: deps.cwd(),
+        ...(input.groundingCwd === undefined ? {} : { groundingCwd: input.groundingCwd }),
+        ...(input.authorGrade === undefined ? {} : { authorGrade: input.authorGrade }),
+        ...(context.goalType === undefined ? {} : { goalType: context.goalType }),
+        // ⛔ 인라인 ask(`harness say`)는 askFile 이 없다 — 그 칸을 넘기면 저작기가 빈 줄을 쓴다.
+        ...(() => {
+          if (input.inputSource !== 'ask' || input.askFile === undefined) return {};
+          const askFile = lineageAskFile(input.askFile);
+          return askFile === undefined ? {} : { askFile };
+        })(),
+        ...(launchPreflight === undefined ? {} : { launchPreflight }),
+        selfResolveClarifications: selfResolveClarifications.value,
+      }),
+    }, authorAskText, {
+      ...(frontRunId === undefined ? {} : { runId: frontRunId }),
       ...(goalType === null ? {} : { goalType }),
-      // ⛔ 인라인 ask(`harness say`)는 askFile 이 없다 — 그 칸을 넘기면 저작기가 빈 줄을 쓴다.
-      ...(() => {
-        if (input.inputSource !== 'ask' || input.askFile === undefined) return {};
-        const askFile = lineageAskFile(input.askFile);
-        return askFile === undefined ? {} : { askFile };
-      })(),
-      ...(launchPreflight === undefined ? {} : { launchPreflight }),
-      selfResolveClarifications: selfResolveClarifications.value,
     }).catch((error: unknown) => {
       // GRAPH-AUTHOR-FAIL-EDGE: 저작기가 던진 자리 = author `fail` 출구. ⛔ 관측만 하고 같은 오류를 그대로 다시 던진다.
       observeFrontNodeExit({ node: 'author', outcome: 'fail' }, {

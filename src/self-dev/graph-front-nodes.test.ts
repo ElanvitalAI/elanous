@@ -8,7 +8,7 @@ import { runLedgerPath } from '../self-implement/run-ledger.js';
 import { spawnRealCli } from '../testing/real-cli-spawn.js';
 import { CLI_DEV_ASK_ENTRANCE } from './entrance-registry.js';
 import { runAskLaunchFlow } from './ask-launch-flow.js';
-import { FRONT_VISIT_IDLE_TTL_MS, frontVisitRunCountForTesting, observeFrontNodeEntry, observeFrontNodeExit, observeFrontNodeUnit, resetFrontVisitCountsForTesting } from './graph-front-nodes.js';
+import { FRONT_VISIT_IDLE_TTL_MS, frontVisitRunCountForTesting, observeFrontNodeEntry, observeFrontNodeExit, observeFrontNodeUnit, resetFrontVisitCountsForTesting, runFrontNodeUnit } from './graph-front-nodes.js';
 
 function observedFrontEntries(run: () => void): Array<{
   readonly category: string;
@@ -50,14 +50,14 @@ function observedFrontEvents(run: () => void): Array<{
 }
 
 test('real --test harness ask records decompose boundaries before the goal-done launch guard', async () => {
-  const scratch = join(process.cwd(), '.elanous-test', 'scratch');
-  mkdirSync(scratch, { recursive: true });
-  const root = mkdtempSync(join(scratch, 'front-unit-cli-'));
+  const root = mkdtempSync(join(tmpdir(), 'front-unit-cli-'));
+  const configDir = join(root, 'config');
+  mkdirSync(configDir, { recursive: true });
   const runId = `run-${randomUUID()}`;
   const goalFile = join(root, 'GOAL-front-unit-observation-2026-10-20.txt');
   try {
     writeFileSync(goalFile, [
-      '- GoalId: 1111111111111111',
+      `- GoalId: ${randomUUID().replaceAll('-', '').slice(0, 16)}`,
       '- GoalType: implement',
       '## WHAT TO BUILD',
       'Observe the front-half decomposition of a goal without launching its superseded work.',
@@ -67,13 +67,17 @@ test('real --test harness ask records decompose boundaries before the goal-done 
       '- Completed: Do not launch this superseded goal.',
     ].join('\n'));
     const result = await spawnRealCli([
-      process.execPath, 'bin/elanous.mjs', '--test', 'harness', 'ask', goalFile, '--no-auto-merge',
-    ], { cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'development', ELANOUS_TEST_HOME: undefined,
+      process.execPath, 'bin/elanous.mjs', '--test', '--config-dir', configDir, 'harness', 'ask', goalFile, '--no-auto-merge',
+    ], { cwd: process.cwd(), env: { ...process.env, HOME: join(root, 'home'), XDG_CONFIG_HOME: join(root, 'xdg'),
+      ELANOUS_STATE_DIR: configDir, ELANOUS_KEY_CACHE_DIR: join(root, 'key-cache'),
+      XAI_API_KEY: undefined, OPENAI_API_KEY: undefined, ANTHROPIC_API_KEY: undefined, GEMINI_API_KEY: undefined,
+      OPENROUTER_API_KEY: undefined, LOCAL_LLM_URL: undefined,
+      ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
       ELANOUS_RUN_ID: runId, ELANOUS_TASK_CARD_ID: 'ta-front-unit-observation' }, timeoutMs: 120_000 });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('[ask] ⑷ 발사 전 분해 권고');
     expect(result.stderr).toContain('골 완료 경계 누락');
-    const lines = readFileSync(runLedgerPath(runId, join(process.cwd(), '.elanous-test', 'run-ledger')), 'utf8')
+    const lines = readFileSync(runLedgerPath(runId, join(configDir, 'run-ledger')), 'utf8')
       .trim().split('\n').filter((line) => JSON.parse(line).event === 'graph.unit');
     expect(lines).toHaveLength(2);
     expect(lines.map((line) => JSON.parse(line))).toEqual([
@@ -91,6 +95,11 @@ test('isolated ask launch entrance records actual decompose boundaries in one ru
   process.env.ELANOUS_STATE_DIR = join(root, '.elanous-test');
   const runId = 'run-11111111-2222-4333-8444-555555555555';
   process.env.ELANOUS_RUN_ID = runId;
+  const previousLog = debug.log;
+  const frontEntries: Record<string, unknown>[] = [];
+  debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
+    if (category === 'self-implement' && event === 'pipeline-node-entry') frontEntries.push(data ?? {});
+  }) as typeof debug.log;
   const goalFile = join(root, 'goal.md');
   const sourceFile = join(root, 'src', 'one.ts');
   try {
@@ -105,18 +114,21 @@ test('isolated ask launch entrance records actual decompose boundaries in one ru
     }, {
       cwd: () => root, print: () => undefined, log: () => undefined,
       readLine: async () => '', isInteractive: () => false, now: () => 1_000,
+      measureInvokerBehindDefaultBranch: () => ({ state: 'measured', commits: 0, baseRef: 'origin/main' }),
       measureToolTreeBehindDefaultBranch: () => null,
       readFile: (path) => readFileSync(path, 'utf8'), writeFile: (path, value) => writeFileSync(path, value),
       relativeToCwd: (path) => path.replace(`${root}/`, ''),
       authorGoal: async () => { events.push('author'); return { path: goalFile }; },
       decomposeGoal: async () => {
         events.push('decompose');
-        return { decomposition: { outcome: 'single-no-subtasks', actualTaskCount: 1,
+        return { decomposition: { outcome: 'single-no-subtasks', actualTaskCount: 0,
           recommendedMaxTasks: 6, truncatedAtHardMax: false, exceededRecommendedMax: false }, goals: [] };
       },
       buildPreflightDeps: async () => ({
         readGoalDocument: (path) => readFileSync(path, 'utf8'), tracedPaths: () => ['src/one.ts'],
         askTargetPaths: () => ['src/one.ts'], listOpenPrs: () => [], listUnfinishedRuns: () => [],
+        queryRunningRuns: () => { throw new Error('test query intentionally disabled'); },
+        listPreexistingFailureTestFiles: () => ({ state: 'checked', files: [] }),
         countRecentChanges: () => ({}),
       }),
       priorBlockSamples: () => [], recentAuthoringSamples: () => [],
@@ -125,13 +137,21 @@ test('isolated ask launch entrance records actual decompose boundaries in one ru
       .trim().split('\n').filter((line) => JSON.parse(line).event === 'graph.unit');
     expect(events).toEqual(['author', 'decompose']);
     expect(result.kind).toBe('launch');
-    expect(lines).toHaveLength(2);
+    expect(frontEntries).toEqual([
+      expect.objectContaining({ node: 'author', runId }),
+      expect.objectContaining({ node: 'plan', runId }),
+      expect.objectContaining({ node: 'decompose', runId }),
+    ]);
+    expect(lines).toHaveLength(4);
     expect(lines.map((line) => JSON.parse(line))).toEqual([
+      expect.objectContaining({ runId, event: 'graph.unit', data: expect.objectContaining({ unit: 'author', phase: 'enter', contractId: 'goal-author' }) }),
+      expect.objectContaining({ runId, event: 'graph.unit', data: expect.objectContaining({ unit: 'author', phase: 'exit', contractId: 'goal-author' }) }),
       expect.objectContaining({ runId, event: 'graph.unit', data: expect.objectContaining({ unit: 'decompose', phase: 'enter', contractId: 'fabric-decompose-adapter' }) }),
       expect.objectContaining({ runId, event: 'graph.unit', data: expect.objectContaining({ unit: 'decompose', phase: 'exit', contractId: 'fabric-decompose-adapter' }) }),
     ]);
     console.log(`GRAPH.UNIT RAW ${lines.join(' | ')}`);
   } finally {
+    debug.log = previousLog;
     if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previousState;
     if (previousRunId === undefined) delete process.env.ELANOUS_RUN_ID;
@@ -146,13 +166,17 @@ test('isolated ask launch entrance records actual decompose boundaries in one ru
 const AUTHOR_FLOW_TIMEOUT_MS = 120_000;
 async function runAuthorFlow(grounded: readonly boolean[], options: { readonly authorThrows?: Error } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'author-exit-'));
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = join(root, '.elanous-test');
   // 가상 골 문서(디스크에 없음) — 전제 검사의 파일 실재 축을 빼고 «대상 경로» 축만 남긴다(ask-launch-flow.test 의 /repo/goal 꼴).
   const goalFile = join(root, 'virtual-goal.md');
   const goalDocument = '## TRACED PATHS\n- src/one.ts\n';
   const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const unitEvents: Array<{ event: string; data: Record<string, unknown> }> = [];
   const originalLog = debug.log;
   debug.log = ((category: string, event: string, data?: Record<string, unknown>) => {
     if (category === 'self-implement' && (event === 'front-node-exit' || event === 'graph-edge-taken')) events.push({ event, data: data ?? {} });
+    if (category === 'graph.unit') unitEvents.push({ event, data: data ?? {} });
   }) as typeof debug.log;
   let authorCalls = 0;
   try {
@@ -163,6 +187,7 @@ async function runAuthorFlow(grounded: readonly boolean[], options: { readonly a
     const paths = (): string[] => (isGrounded() ? ['src/one.ts'] : []);
     const outcome = await runAskLaunchFlow({
       entrance: CLI_DEV_ASK_ENTRANCE, inputSource: 'say', askText: 'one 모듈을 고친다',
+      runId: 'run-author-flow-unit-boundary',
       liveRunWindowMinutes: 30, recentChangeWindowDays: 7, forceRequested: false, decomposeBeforeLaunch: false,
     }, {
       cwd: () => root, print: () => undefined, log: () => undefined,
@@ -176,17 +201,21 @@ async function runAuthorFlow(grounded: readonly boolean[], options: { readonly a
         if (options.authorThrows) throw options.authorThrows;
         return { path: goalFile };
       },
-      decomposeGoal: async () => ({ decomposition: { outcome: 'single-no-subtasks', actualTaskCount: 1,
+      decomposeGoal: async () => ({ decomposition: { outcome: 'single-no-subtasks', actualTaskCount: 0,
         recommendedMaxTasks: 6, truncatedAtHardMax: false, exceededRecommendedMax: false }, goals: [] }),
       buildPreflightDeps: async () => ({
         readGoalDocument: () => goalDocument, tracedPaths: paths, askTargetPaths: paths,
         listOpenPrs: () => [], listUnfinishedRuns: () => [], countRecentChanges: () => ({}),
+        queryRunningRuns: () => { throw new Error('test query intentionally disabled'); },
+        listPreexistingFailureTestFiles: () => ({ state: 'checked', files: [] }),
       }),
       priorBlockSamples: () => [], recentAuthoringSamples: () => [],
     });
-    return { outcome, events, authorCalls };
+    return { outcome, events, unitEvents, authorCalls };
   } finally {
     debug.log = originalLog;
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -228,6 +257,10 @@ describe('observeFrontNodeExit — GRAPH-AUTHOR-FAIL-EDGE', () => {
   test('ok author takes plan and a throwing author records fail toward needs-human while rethrowing', async () => {
     const ok = await runAuthorFlow([true]);
     expect(ok.authorCalls).toBe(1);
+    expect(ok.unitEvents).toEqual([
+      expect.objectContaining({ event: 'enter', data: expect.objectContaining({ nodeId: 'author', unit: 'author', phase: 'enter' }) }),
+      expect.objectContaining({ event: 'exit', data: expect.objectContaining({ nodeId: 'author', unit: 'author', phase: 'exit' }) }),
+    ]);
     expect(ok.events.map((row) => [row.event, row.data.node ?? row.data.from, row.data.outcome ?? row.data.label, row.data.taken]))
       .toEqual([['graph-edge-taken', 'author', 'ok', 'plan'], ['front-node-exit', 'author', 'ok', 'plan']]);
     const error = new Error('author exploded');
@@ -254,6 +287,36 @@ test('unit boundary is fail-soft and preserves rejected stage result', async () 
   try {
     await expect(observeFrontNodeUnit('author', 'invalid/run', 'implement', async () => { throw error; })).rejects.toBe(error);
   } finally { debug.log = previousLog; }
+});
+
+test('typed front-node unit receives the original input and shared context and returns its output', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'front-unit-context-'));
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = join(root, '.elanous-test');
+  const context = { runId: 'run-front-unit-context', goalType: 'implement' as const };
+  const input = { goal: 'ground one target', evidence: ['src/one.ts'] };
+  let received: unknown;
+  try {
+    const result = await runFrontNodeUnit({
+      node: 'author',
+      execute: async (actualInput, actualContext) => {
+        received = { input: actualInput, context: actualContext };
+        return { outcome: 'grounded', evidence: actualInput.evidence };
+      },
+    }, input, context);
+    expect(received).toEqual({ input, context });
+    expect(result).toEqual({ outcome: 'grounded', evidence: ['src/one.ts'] });
+    const noMetadataContext = {};
+    const noMetadataResult = await runFrontNodeUnit({
+      node: 'plan',
+      execute: async (actualInput, actualContext) => ({ actualInput, actualContext }),
+    }, input, noMetadataContext);
+    expect(noMetadataResult).toEqual({ actualInput: input, actualContext: noMetadataContext });
+  } finally {
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 describe('observeFrontNodeEntry', () => {

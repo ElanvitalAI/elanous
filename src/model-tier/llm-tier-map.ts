@@ -222,23 +222,23 @@ const CODEX: TierMap = {
     status: 'shipping',
   },
   balanced: {
-    model: 'gpt-6-sol',
+    model: 'gpt-6.1-terra',
     reasoningLevel: 'low',
-    label: 'GPT-6 Sol · low',
-    rationale: 'Default · 빠른 코딩 (구 gpt-5.6-terra 자리 · 출력이 오히려 싸다 $10<$12)',
+    label: 'GPT-6.1 Terra · low',
+    rationale: 'Default · Codex CLI low effort · elanous 경로 기본 effort medium은 유지',
     status: 'shipping',
   },
   better: {
-    model: 'gpt-6-sol',
+    model: 'gpt-6.1-terra',
     reasoningLevel: 'medium',
-    label: 'GPT-6 Sol · medium',
-    rationale: '대표 2026-09-23 운영 기본 — 일상 코딩·구현 역할',
+    label: 'GPT-6.1 Terra · medium',
+    rationale: '일상 코딩·구현 역할 · Codex CLI 기본 effort=low에서 한 단계 높임',
     status: 'shipping',
   },
   best: {
-    model: 'gpt-6-sol',
+    model: 'gpt-6.1-sol',
     reasoningLevel: 'high',
-    label: 'GPT-6 Sol · high',
+    label: 'GPT-6.1 Sol · high',
     rationale: 'Hard reasoning · architecture (⚠️ 여기부터 과잉설계·scope creep 신고가 급증한다)',
     status: 'shipping',
   },
@@ -247,7 +247,7 @@ const CODEX: TierMap = {
   //   (2026-09-23 정정: 종전 문면 「terra 대비 4배/3.3배」는 terra 가격을 2.5/15 로 잘못 안 값이었다)
   //   기본을 올리면 사다리 맨 위 칸의 비용이 조용히 곱해진다. 더 깊게 필요하면 그때 올린다
   //   (`llm.codexReasoning.effort` = high/xhigh/max · 상한 판정은 reasoningEffortCeiling).
-  // ⛔ 아래 칸들(=일상 코딩 드라이버)은 gpt-6-sol 이다. 여기만 astra 다.
+  // Daily coding uses 6.1 Terra; this loaded tier remains GPT-6 Astra.
   loaded: {
     model: 'gpt-6-astra',
     reasoningLevel: 'medium',

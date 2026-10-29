@@ -1,0 +1,26 @@
+graph_id: git
+version: 1
+unit:
+  inputs: [goal, context, feedback, budget, checkpoint]
+  outputs: [commit, pr-number, evidence]
+  exits: [to-regate, to-open-pr, to-merge]
+  entries: [main-sync, open-pr]
+entry_node: main-sync
+terminal_nodes: [to-regate, to-open-pr, to-merge]
+nodes:
+  - node_id: main-sync
+    kind: git
+    recipe: git-main-sync
+    max_visits: 2
+    contract: { inputs: [goal, context, feedback, budget, checkpoint], tools: external-write, outputs: [commit, evidence] }
+  - node_id: open-pr
+    kind: git
+    recipe: git-open-pr
+    max_visits: 1
+    contract: { inputs: [goal, context, feedback, budget, checkpoint], tools: external-write, outputs: [pr-number, evidence] }
+  - { node_id: to-regate, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: to-open-pr, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: to-merge, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - { from: main-sync, on: outcome, map: { to-regate: to-regate, to-open-pr: to-open-pr } }
+  - { from: open-pr, on: outcome, map: { to-merge: to-merge } }

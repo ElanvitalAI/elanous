@@ -13,7 +13,7 @@ const HEAD_FETCH = `git fetch --no-write-fetch-head origin +refs/pull/42/head:${
 const normalized = (calls: string[]) => calls.map((call) => call.replace(/refs\/elanous\/regate\/[^/ ]+/g, 'refs/elanous/regate/<run>'));
 const input = { prNumber: 42, headCommit: HEAD, repoRoot: '/repo' };
 
-function fixture(views: string[], fetchedBase: string, fetchedHead = HEAD) {
+function fixture(views: string[], fetchedBase: string, fetchedHead = HEAD, draft = false) {
   const calls: string[] = [];
   const events: string[] = [];
   let viewReads = 0;
@@ -29,7 +29,7 @@ function fixture(views: string[], fetchedBase: string, fetchedHead = HEAD) {
       calls.push(call);
       if (call === PR_VIEW) {
         const baseRefOid = views[Math.min(viewReads++, views.length - 1)];
-        return { status: 0, stdout: JSON.stringify({ headRefOid: HEAD, baseRefName: 'main', baseRefOid, state: 'OPEN', isDraft: false }), stderr: '' };
+        return { status: 0, stdout: JSON.stringify({ headRefOid: HEAD, baseRefName: 'main', baseRefOid, state: 'OPEN', isDraft: draft }), stderr: '' };
       }
       const normalizedCall = normalized([call])[0]!;
       let stdout = '';
@@ -58,6 +58,14 @@ function retryLog() {
 const retries = (entries: ReturnType<typeof retryLog>['entries']) => entries.filter(({ category, event }) => category === 'harness.host-regate' && event === 'base-moved-retry');
 
 describe('host regate: PR base moves between view and fetch', () => {
+  test('draft measurement reaches the clean gate only with explicit verifyOnly + allowDraft', async () => {
+    const { deps, measured } = fixture([BASE_A], BASE_A, HEAD, true);
+    const readOnly = await runHostRegate({ ...input, verifyOnly: true, allowDraft: true }, deps);
+    expect(readOnly.failures[0]?.step).toBe('test-interference');
+    expect(measured()).toBe(1);
+    const refused = await runHostRegate({ ...input, allowDraft: true }, deps);
+    expect(refused.failures[0]?.step).toBe('input');
+  });
   test('re-reads and fetches after one mismatch; only the matched B is measured', async () => {
     const { deps, calls, measured } = fixture([BASE_A, BASE_B], BASE_B);
     const log = retryLog();

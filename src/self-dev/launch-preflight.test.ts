@@ -2165,7 +2165,7 @@ describe('실제 도는 런 확신 부록 — 나이 기반 기존 집계와 분
       calls.push(options);
       return confidenceRunningRuns(1, 2);
     });
-    expect(calls).toEqual([{ includeTest: true }]);
+    expect(calls).toEqual([{ includeTest: true, timeBudgetMs: 3_000 }]);
     expect(appendix).toBe(legacySuccess);
   });
 
@@ -2349,7 +2349,7 @@ describe('decideAskPreflight — CLI 배선', () => {
     const d = decideAskPreflight({ goalFile: 'g.md', liveRunWindowMinutes: 30, recentChangeWindowDays: 7 }, deps({
       listUnfinishedRuns: () => [{ runId: 'legacy-active', plannedPaths: ['src/a.ts'], lastActivityAgeMs: 1_000 }],
       queryRunningRuns: (options) => {
-        expect(options).toEqual({ includeTest: true });
+        expect(options).toEqual({ includeTest: true, timeBudgetMs: 3_000 });
         return confidenceRunningRuns(0, 2);
       },
     }), false);
@@ -2575,6 +2575,29 @@ describe('decideAskPreflight — CLI 배선', () => {
       const lines = renderLaunchPreflight(d.result).split('\n');
       expect(lines.filter((line) => line.includes('확신 판정')).length).toBe(1);
       expect(lines.find((line) => line.includes('확신 판정'))).toContain('얻지 못했다 (ledger unavailable)');
+      expect(d.result.blockers).toEqual([]);
+      expect(d.shouldLaunch).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('[confidence-query-is-bounded-and-timeout-does-not-block-launch] launch-preflight 조회는 3초 예산을 전달하고 초과 시 측정 불가 경고만 남긴 채 발사한다', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    const received: { includeTest: true; timeBudgetMs?: number }[] = [];
+    try {
+      const d = decideAskPreflight({ goalFile: 'g.md', liveRunWindowMinutes: 30, recentChangeWindowDays: 7 }, deps({
+        queryRunningRuns: (options) => {
+          received.push(options);
+          return { ...confidenceRunningRuns(0, 0), stalled: { stage: 'ledger-scan', reason: 'deadline-exceeded' } };
+        },
+      }), false);
+      expect(received).toEqual([{ includeTest: true, timeBudgetMs: 3_000 }]);
+      expect(log).toHaveBeenCalledWith('harness.preflight', 'running-runs-confidence', expect.objectContaining({
+        assessment: 'unavailable',
+        failure: '조회 예산 초과(ledger-scan: deadline-exceeded)',
+      }));
+      expect(renderLaunchPreflight(d.result)).toContain('이 경고는 발사를 막지 않는다');
       expect(d.result.blockers).toEqual([]);
       expect(d.shouldLaunch).toBe(true);
     } finally {

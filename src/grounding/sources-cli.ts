@@ -6,6 +6,7 @@ import type { Command } from 'commander';
 import { homedir } from 'node:os';
 import { basename } from 'node:path';
 import { exportMirrorManifest } from './mirror-export.js';
+import { buildReferenceCardsForRegistry, nodeRefIndexFs } from './ref-index.js';
 import {
   addGroundingSource,
   discoverReferenceSources,
@@ -83,8 +84,15 @@ export function registerGroundingSourcesCli(program: Command): void {
     .description('~/source/ref 와 ~/docs/ref 후보를 찾는다(등록하지 않는다)')
     .option('--json', 'JSON 출력')
     .option('--home <dir>', '홈 디렉터리(기본: os homedir)')
-    .action((opts: { json?: boolean; home?: string }) => {
+    .option('--ref-index', 'local-repo·local-docs 후보를 L0 카드 ⊕ L1 목록으로 색인해 JSON 으로 낸다(읽기 전용 · 쓰기 0)')
+    .action((opts: { json?: boolean; home?: string; refIndex?: boolean }) => {
       const found = discoverReferenceSources(opts.home ?? homedir());
+      if (opts.refIndex) {
+        // 읽기 전용: 카드는 stdout 으로만 낸다 — `<stateDir>/ref-index.jsonl` 원장
+        // (⊕ BM25 낱말 색인 ⊕ 보조 서버 부하 규칙)은 다음 조각의 몫.
+        printJson(buildReferenceCardsForRegistry(found, nodeRefIndexFs));
+        return;
+      }
       if (opts.json) printJson(found);
       else if (found.length === 0) console.log('(none)');
       else for (const source of found) console.log(formatSource(source));

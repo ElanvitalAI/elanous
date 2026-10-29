@@ -1858,6 +1858,18 @@ test('STOP-RECORD launch-failed: a child that exits nonzero right after launch w
   expect(String(written[0]!.data.cause)).not.toContain('frame');
 });
 
+test('STOP-RECORD launch-failed: a warning before the fatal error does not replace the cause', async () => {
+  const stderrDir = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
+  const written: RunLedgerEntry[] = [];
+  const stderr = '[dev] ⚠️ OpenRouter 모델 스냅숏이 16일 묵었다\n❌ --child-llm-effort 거부: high 가 openrouter/z-ai/glm-5.3 의 상한(medium)을 넘는다\n';
+  await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-launchfail-effort'),
+    { parentHost: null, spawn: exitingSpawn(1, stderr).spawn, stderrDir, earlyExitWindowMs: 1_000, writeStop: (entry) => { written.push(entry); } })).rejects.toThrow('--child-llm-effort 거부');
+  expect(written).toHaveLength(1);
+  expect(String(written[0]!.data.cause)).toContain('--child-llm-effort 거부');
+  expect(String(written[0]!.data.cause)).not.toContain('스냅숏');
+  expect(written[0]!.data.evidenceRef).toBe(join(stderrDir, 'run-launchfail-effort.stderr'));
+});
+
 test('STOP-RECORD launch-failed: a child still running after the window (or exiting 0) records no stop and returns the receipt', async () => {
   const stderrDir = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-'));
   const written: RunLedgerEntry[] = [];

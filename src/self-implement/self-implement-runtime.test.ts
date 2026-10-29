@@ -104,6 +104,7 @@ describe('selfImplementRuntime — feature/goals 배타 계약', () => {
     expect(parameters.anyOf).toBeUndefined();
     expect(parameters.oneOf).toBeUndefined();
     expect(properties.feature).toMatchObject({ type: 'string' });
+    expect(properties.goalFile).toBeUndefined();
     expect(properties.goals).toMatchObject({ type: 'array', items: { type: 'string' }, minItems: 1 });
   });
 

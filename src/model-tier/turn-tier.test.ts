@@ -32,9 +32,9 @@ describe('explicitTurnTier', () => {
     }
   });
 
-  test('codex tiers that share one model differ by reasoning effort', () => {
+  test('codex 6.1 tiers resolve Terra for balanced/better and Sol for best, with distinct efforts', () => {
     const efforts = (['balanced', 'better', 'best'] as const).map(llm => explicitTurnTier(cfg({ llm }), sessionId));
-    expect(new Set(efforts.map(t => t?.model)).size).toBe(1);
+    expect(efforts.map(t => t?.model)).toEqual(['gpt-6.1-terra', 'gpt-6.1-terra', 'gpt-6.1-sol']);
     expect(efforts.map(t => t?.reasoningEffort)).toEqual(['low', 'medium', 'high']);
   });
 

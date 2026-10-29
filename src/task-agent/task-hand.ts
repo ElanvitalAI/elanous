@@ -45,6 +45,7 @@ import { INFLIGHT_REGISTRY_FILE, registerInflight } from '../pr-tool/inflight-re
 import { taskParentRoleEnv, taskParentRolePinsForChild } from './task-parent-role-llm.js';
 import { runHarvestUnit, type ReviewInvocation } from './harvest-unit.js';
 import { TASK_CARD_PREFIX } from './task-card-prefix.js';
+import { childLlmEffortProblem } from '../intelligence-map/model-catalog.js';
 
 export interface ResolveHandTextDeps {
   cwd: string;
@@ -414,7 +415,7 @@ export interface TaskCard {
     moveId?: string }>;
 }
 
-/** 구현 자식 LLM 선택 — 하니스 `--child-llm-provider/--child-llm-model/--child-llm-effort` 로 그대로 넘긴다(검증 권위는 하니스). */
+/** 구현 자식 LLM 선택 — 하니스 `--child-llm-provider/--child-llm-model/--child-llm-effort` 로 넘긴다. */
 export interface TaskChildLlm { provider: string; model: string; effort?: string }
 
 /**
@@ -431,6 +432,8 @@ export function parseChildLlm(value: string, effort?: string): TaskChildLlm {
   const model = provider === 'openrouter' && !rest.startsWith('openrouter/') ? `openrouter/${rest}` : rest;
   if (effort === undefined) return { provider, model };
   if (!effort || /[\s\p{Cc}]/u.test(effort)) throw new Error(`--child-llm-effort 가 비었거나 공백·제어 문자를 담았다: ${JSON.stringify(effort)}`);
+  const problem = childLlmEffortProblem(model, effort);
+  if (problem) throw new Error(problem);
   return { provider, model, effort };
 }
 

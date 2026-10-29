@@ -125,6 +125,49 @@ export const POD_EXIT_CLASSES = ['oom-killed', 'deadline-exceeded', 'gh-login-fa
 
 export type PodExitClass = typeof POD_EXIT_CLASSES[number];
 
+/** Build the parent-ledger row for a terminal child attempt. A Job can complete
+ * successfully while its child result is still unsuccessful (for example,
+ * report-deficit after preserving a partial PR); retain both facts together. */
+export function podChildEvidenceLedgerRow(input: {
+  job: string;
+  childRunId: string;
+  state: 'complete' | 'failed' | 'aborted';
+  result?: {
+    stage?: unknown;
+    ok?: unknown;
+    failureClassification?: unknown;
+    completionDisposition?: unknown;
+    error?: unknown;
+    childEvidence?: unknown;
+  } | null;
+  noResultDiagnostic?: string | null;
+  noResultLogEvidence?: Record<string, unknown> | null;
+  podTermination?: PodTermination | null;
+}): Record<string, unknown> | null {
+  const { result } = input;
+  const persist = input.state === 'failed' || input.state === 'aborted' || input.noResultLogEvidence != null
+    || (input.state === 'complete' && (input.noResultDiagnostic != null || result?.ok === false));
+  if (!persist) return null;
+
+  const childEvidence = input.noResultLogEvidence
+    ? { ...(result?.childEvidence && typeof result.childEvidence === 'object' && !Array.isArray(result.childEvidence)
+      ? result.childEvidence as Record<string, unknown> : {}), ...input.noResultLogEvidence }
+    : result?.childEvidence ?? null;
+  const completedButUnsuccessful = input.state === 'complete' && result?.ok === false;
+  const childResult = completedButUnsuccessful && result ? Object.fromEntries([
+    ['stage', result.stage], ['ok', result.ok], ['failureClassification', result.failureClassification],
+    ['completionDisposition', result.completionDisposition], ['error', result.error],
+  ].filter(([, value]) => value !== undefined)) : null;
+
+  return {
+    childEvidence,
+    childRunId: input.childRunId,
+    job: input.job,
+    ...(input.podTermination ? { podTermination: input.podTermination } : {}),
+    ...(childResult && Object.keys(childResult).length > 0 ? { childResult } : {}),
+  };
+}
+
 const isPodBookkeepingLine = (line: string): boolean =>
   /^(?:ELANOUS_(?:MEM|RUN_LEDGER|USAGE_ROLLUP|POD_)|\[graph\] |\[ask\]\s+\d+\)\s)/u.test(line) || /^(?:at\s+\S|\.\.\.\s+\d+\s+more\b|cleanup\s+(?:complete|done|finished)\b)/iu.test(line);
 

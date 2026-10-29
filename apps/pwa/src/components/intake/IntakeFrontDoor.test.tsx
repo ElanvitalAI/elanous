@@ -224,9 +224,14 @@ describe('IntakeFrontDoor', () => {
     };
     try {
       await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><IntakeFrontDoor /></DaemonContext.Provider>); });
-      expect(calls).toEqual(['/v1/intake-ledger/items/done', '/v1/intake-ledger/items/waiting', '/v1/intake-ledger/items/missing']);
+      expect(calls).toEqual([
+        '/v1/intake-ledger/items/done', '/v1/intake-ledger/items/waiting', '/v1/intake-ledger/items/missing',
+      ]);
       const statuses = () => tree!.root.findAllByProps({ 'data-testid': 'intake-absorb-status' }).map((node) => node.children.join(''));
-      expect(statuses()).toEqual([' · 흡수: 흡수됨 · notes/result.md', ' · 흡수: 대기 중', ' · 흡수: 찾을 수 없음']);
+      expect(statuses()).toEqual([
+        ' · 흡수: 흡수됨 · notes/result.md · 위키: 준비 중',
+        ' · 흡수: 대기 중', ' · 흡수: 찾을 수 없음',
+      ]);
       expect(timers.size).toBe(2);
       waitingDone = true;
       missingFound = true;
@@ -235,7 +240,10 @@ describe('IntakeFrontDoor', () => {
         '/v1/intake-ledger/items/done', '/v1/intake-ledger/items/waiting', '/v1/intake-ledger/items/missing',
         '/v1/intake-ledger/items/waiting', '/v1/intake-ledger/items/missing',
       ]);
-      expect(statuses()).toEqual([' · 흡수: 흡수됨 · notes/result.md', ' · 흡수: 확인됨', ' · 흡수: 버림']);
+      expect(statuses()).toEqual([
+        ' · 흡수: 흡수됨 · notes/result.md · 위키: 준비 중',
+        ' · 흡수: 확인됨', ' · 흡수: 버림',
+      ]);
       expect(timers.size).toBe(0);
       await act(async () => { tree!.unmount(); });
       expect(timers.size).toBe(0);
@@ -261,10 +269,12 @@ describe('IntakeFrontDoor', () => {
     let rejectFirst!: (error: Error) => void;
     let calls = 0;
     const daemon = { ...STUB_DAEMON, client: { fetchJson: async (path: string) => {
-      expect(path).toBe('/v1/intake-ledger/items/slow');
-      calls++;
-      if (calls === 1) return new Promise((_, reject) => { rejectFirst = reject; });
-      return { id: 'slow', status: 'absorbed', outputs: [{ kind: 'note', ref: 'notes/slow.md' }] };
+      if (path === '/v1/intake-ledger/items/slow') {
+        calls++;
+        if (calls === 1) return new Promise((_, reject) => { rejectFirst = reject; });
+        return { id: 'slow', status: 'absorbed', outputs: [{ kind: 'note', ref: 'notes/slow.md' }] };
+      }
+      throw new Error(`unexpected path: ${path}`);
     } } as never };
     let tree: ReturnType<typeof create> | undefined;
     try {
@@ -279,7 +289,7 @@ describe('IntakeFrontDoor', () => {
       timers.delete(retry[0]);
       await act(async () => { retry[1].fn(); });
       expect(calls).toBe(2);
-      expect(status()).toBe(' · 흡수: 흡수됨 · notes/slow.md');
+      expect(status()).toBe(' · 흡수: 흡수됨 · notes/slow.md · 위키: 준비 중');
       expect(timers.size).toBe(0);
       await act(async () => { tree!.unmount(); });
     } finally {
@@ -340,7 +350,8 @@ describe('IntakeFrontDoor', () => {
     const daemon = { ...STUB_DAEMON, client: { fetchJson: async (path: string) => {
       calls.push(path);
       if (path === '/v1/intake-ledger/items') return { ids: ['new'], added: 1, merged: 0 };
-      if (path.startsWith('/v1/intake-ledger/items/')) return { id: path.split('/').at(-1), status: 'queued', outputs: [] };
+      if (path === '/v1/intake-ledger/items/old') return { id: 'old', status: 'queued', outputs: [] };
+      if (path === '/v1/intake-ledger/items/new') return { id: 'new', status: 'absorbed', outputs: [{ kind: 'note', ref: 'notes/new.md' }] };
       throw new Error(`unexpected path: ${path}`);
     } } as never };
     let tree: ReturnType<typeof create> | undefined;
@@ -352,9 +363,15 @@ describe('IntakeFrontDoor', () => {
       await act(async () => { tree!.root.findByProps({ 'data-testid': 'intake-absorb' }).props.onClick(); });
       expect(calls.filter((path) => path.endsWith('/old'))).toHaveLength(1);
       expect(calls.filter((path) => path.endsWith('/new'))).toHaveLength(1);
+      expect(calls).toEqual([
+        '/v1/intake-ledger/items/old',
+        '/v1/intake-ledger/items',
+        '/v1/intake-ledger/items/new',
+      ]);
       expect(timers.get(oldTimer[0])).toBe(oldTimer[1]);
       expect(tree!.root.findAllByProps({ 'data-testid': 'intake-absorb-status' }).map((node) => node.children.join(''))).toEqual([
-        ' · 흡수: 대기 중', ' · 흡수: 대기 중',
+        ' · 흡수: 흡수됨 · notes/new.md · 위키: 준비 중',
+        ' · 흡수: 대기 중',
       ]);
       timers.delete(oldTimer[0]);
       await act(async () => { oldTimer[1].fn(); });
@@ -367,6 +384,26 @@ describe('IntakeFrontDoor', () => {
       globalThis.setTimeout = originalSetTimeout;
       globalThis.clearTimeout = originalClearTimeout;
     }
+  });
+
+  test('흡수 뒤 미구현 위키 동작은 호출하지 않고 준비 중으로 표시한다', async () => {
+    const calls: string[] = [];
+    const daemon = { ...STUB_DAEMON, client: { fetchJson: async (path: string) => {
+      calls.push(path);
+      if (path === '/v1/intake-ledger/items') return { ids: ['ungrounded'], added: 1, merged: 0 };
+      if (path === '/v1/intake-ledger/items/ungrounded') return { id: 'ungrounded', status: 'absorbed', outputs: [] };
+      throw new Error(`unexpected path: ${path}`);
+    } } as never };
+    let tree!: ReturnType<typeof create>;
+    await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><IntakeFrontDoor /></DaemonContext.Provider>); });
+    try {
+      await act(async () => { tree.root.findByProps({ 'data-testid': 'intake-front-door-field' }).props.onChange({ target: { value: '근거가 없는 흡수' } }); });
+      await act(async () => { tree.root.findByProps({ 'data-testid': 'intake-absorb' }).props.onClick(); });
+      expect(calls).toEqual(['/v1/intake-ledger/items', '/v1/intake-ledger/items/ungrounded']);
+      expect(tree.root.findAllByProps({ 'data-testid': 'intake-front-door-error' })).toHaveLength(0);
+      expect(tree.root.findByProps({ 'data-testid': 'intake-absorb-status' }).children.join(''))
+        .toBe(' · 흡수: 흡수됨 · 위키: 준비 중');
+    } finally { await act(async () => { tree.unmount(); }); }
   });
 
   test('«흡수» 뒤 «대기열» 문구와 항목 id', () => {

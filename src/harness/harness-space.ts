@@ -25,7 +25,7 @@
 //    spaceId 선례와 동형. 계약 = [[DESIGN-executor-pty-ref-contract-2026-07-25]] ExecutorPtyRef.runId.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { ensureHostId } from '../platform/host-id.js';
@@ -99,6 +99,20 @@ export function harnessBoundaryEnv(worktreeAbsPath: string): Record<string, stri
 /** 현 프로세스에 실린 명시 쓰기 경계 절대경로(스포너가 심음). 없으면 ''. 순수 reader. */
 export function getHarnessBoundaryPath(env: NodeJS.ProcessEnv = process.env): string {
   return env[HARNESS_BOUNDARY_ENV]?.trim() ?? '';
+}
+
+/** TENANT-BOUNDARY (0.2.41): 경계 회신 mailbox(HARNESS_BOUNDARY_RESPONSES_ENV)에 payload 한 줄(JSONL)을
+ *  남긴다 — 익명 내보내기 전용 출구. env 가 비거나 절대경로가 아니면 fail-open(빈 문자열 반환, 파일 안 만듦). */
+export function appendBoundaryResponseLine(env: NodeJS.ProcessEnv, payload: object): string {
+  const path = env[HARNESS_BOUNDARY_RESPONSES_ENV]?.trim() ?? '';
+  if (!path || !isAbsolute(path)) return '';
+  try {
+    mkdirSync(resolve(path, '..'), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(payload)}\n`);
+    return path;
+  } catch {
+    return '';
+  }
 }
 
 /** 전 공간 종류(SSOT) — logs `--space` 필터·검증 등이 공유. */

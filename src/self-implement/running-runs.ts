@@ -116,6 +116,8 @@ export interface RunningRunsResult {
   };
   /** Additive phase-store observability; queryRunningRuns always supplies this value. */
   readonly phases?: RunningRunsPhaseStoreObservation;
+  /** Present when a caller time budget stopped one observation stage before full coverage. */
+  readonly stalled?: { readonly stage: 'ledger-scan' | 'cross-directory-reconciliation' | 'pty-observation' | 'phase-observation' | 'launch-parent-classification'; readonly reason: 'deadline-exceeded' };
 }
 
 export interface QueriedRunningRunsResult extends RunningRunsResult {
@@ -263,7 +265,7 @@ export interface RunningRunsQueryObservation {
 }
 
 export interface RunningRunsQueryDeps {
-  readonly queryLedgers?: (options: { includeTest?: boolean; ledgerDirectories?: readonly string[]; runIds?: readonly string[]; noCache?: boolean }) => FederatedUnfinishedRunLedgerQuery;
+  readonly queryLedgers?: (options: { includeTest?: boolean; ledgerDirectories?: readonly string[]; runIds?: readonly string[]; noCache?: boolean; deadlineAtMs?: number }) => FederatedUnfinishedRunLedgerQuery;
   readonly ledgerDirectories?: (options: { includeTest?: boolean }) => readonly string[];
   readonly ptyTargets?: (options: { includeTest?: boolean }) => readonly { name: string; dbPath: string }[];
   readonly readPtyRows?: typeof listPtyManifestRowsAt;
@@ -303,6 +305,7 @@ export function assessLingeringLaunchParents(
   isProcessAlive: (pid: number) => boolean,
   processStartTime: (pid: number) => number | null,
   ledgerObservation?: Pick<RunningRunsLedgerObservation, 'unreadableLedgerCount' | 'unreadableLedgerDirectoryCount' | 'unreadableLedgerDirectoryAccessCount' | 'indeterminateLedgerDirectoryCount'>,
+  deadlineAtMs?: number,
 ): LingeringLaunchParentAssessment {
   if (!ledgerObservation || hasUnreadableLedgerObservation(ledgerObservation)) return { observation: 'indeterminate' };
 
@@ -316,6 +319,7 @@ export function assessLingeringLaunchParents(
   let reusedPidCount = 0;
   try {
     for (const [runId, ledgerDirectory] of terminatedRunDirectories) {
+      if (deadlineAtMs !== undefined && Date.now() >= deadlineAtMs) return { observation: 'indeterminate' };
       const run = loadRun(runId, ledgerDirectory);
       const pid = run?.pid;
       if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
@@ -454,7 +458,7 @@ export function distinctPhysicalLedgerDirectories(
   return distinct;
 }
 
-export function queryRunningRuns(options: { includeTest?: boolean; runIds?: readonly string[]; caller?: string; noCache?: boolean } = {}, deps: RunningRunsQueryDeps = {}): QueriedRunningRunsResult {
+export function queryRunningRuns(options: { includeTest?: boolean; runIds?: readonly string[]; caller?: string; noCache?: boolean; timeBudgetMs?: number } = {}, deps: RunningRunsQueryDeps = {}): QueriedRunningRunsResult {
   const directoryFailures = new Map<string, ReturnType<typeof classifyFederatedLedgerDirectoryReadFailure>>();
   const queryLedgers = deps.queryLedgers ?? ((queryOptions: Parameters<typeof queryFederatedUnfinishedRunLedgers>[0]) => queryFederatedUnfinishedRunLedgers({
     ...queryOptions,
@@ -480,6 +484,9 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
   const processStartTime = deps.processStartedAt ?? processStartedAt;
   const observeQuery = deps.observeQuery ?? ((observation: RunningRunsQueryObservation) => debug.log('self-implement.running-runs', 'query', observation));
   const startedAt = Date.now();
+  const deadlineAtMs = options.timeBudgetMs === undefined ? undefined : startedAt + Math.max(0, options.timeBudgetMs);
+  let stalled: RunningRunsResult['stalled'];
+  const deadlineExceeded = (): boolean => deadlineAtMs !== undefined && Date.now() >= deadlineAtMs;
   // ID 조회 배선 — src/index.ts의 `self running-runs [runId]` 액션이 넘겨준 options.runIds 를 이 조회가 소비한다:
   // 정의된 runIds 는 연합 원장 질의 전달·엔트리·pty 관측을 모두 그 runId 들로 한정한다.
   const requestedRunIdSet = options.runIds === undefined ? undefined : new Set(options.runIds);
@@ -509,20 +516,25 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     try {
       const requestedRunIds = options.runIds === undefined ? {} : { runIds: options.runIds };
       const cacheOption = options.noCache === undefined ? {} : { noCache: options.noCache };
+      const deadlineOption = deadlineAtMs === undefined ? {} : { deadlineAtMs };
       ledger = collectLedgerDirectories
-        ? queryLedgers({ includeTest: options.includeTest, ledgerDirectories: collectedLedgerDirectories, ...requestedRunIds, ...cacheOption })
-        : queryLedgers({ includeTest: options.includeTest, ...requestedRunIds, ...cacheOption });
+        ? queryLedgers({ includeTest: options.includeTest, ledgerDirectories: collectedLedgerDirectories, ...requestedRunIds, ...cacheOption, ...deadlineOption })
+        : queryLedgers({ includeTest: options.includeTest, ...requestedRunIds, ...cacheOption, ...deadlineOption });
       ledgerDirectoryCount = ledger.ledgerDirectories.length;
       ledgerEntryCount = ledger.entries.length;
       cacheHits = ledger.cacheHits ?? 0;
       cacheMisses = ledger.cacheMisses ?? 0;
+      if (ledger.timedOut) stalled = { stage: ledger.stalledStage ?? 'ledger-scan', reason: 'deadline-exceeded' };
     } finally {
       ledgerReadElapsedMs = Date.now() - ledgerReadStartedAt;
     }
     const screenProcessReadStartedAt = Date.now();
     let pty: FederatedPtyListing;
     try {
-      pty = listPtyRefs(targets({ includeTest: options.includeTest }), readPtyRows);
+      if (deadlineExceeded()) {
+        stalled ??= { stage: 'pty-observation', reason: 'deadline-exceeded' };
+        pty = { refs: [], unreadable: ['<skipped:deadline-exceeded>'] };
+      } else pty = listPtyRefs(targets({ includeTest: options.includeTest }), readPtyRows);
     } finally {
       screenProcessReadElapsedMs = Date.now() - screenProcessReadStartedAt;
     }
@@ -538,7 +550,8 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     let observedPhases: ObservedRunPhases = { events: [], targetCount: 0, unreadableTargets: [] };
     const stageStoreReadStartedAt = Date.now();
     try {
-      observedPhases = readRunPhases({ includeTest: options.includeTest }, runIds);
+      if (deadlineExceeded()) stalled ??= { stage: 'phase-observation', reason: 'deadline-exceeded' };
+      else observedPhases = readRunPhases({ includeTest: options.includeTest }, runIds);
     } catch {
       observedPhases = { events: [], targetCount: 1, unreadableTargets: ['phase-query'] };
     } finally {
@@ -583,13 +596,23 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     const launchParentClassificationStartedAt = Date.now();
     let lingeringLaunchParents: LingeringLaunchParentAssessment;
     try {
-      lingeringLaunchParents = assessLingeringLaunchParents(
-        scopedLedgerEntries, loadRun, isProcessAlive, processStartTime, ledger,
-      );
+      if (deadlineExceeded()) {
+        stalled ??= { stage: 'launch-parent-classification', reason: 'deadline-exceeded' };
+        lingeringLaunchParents = { observation: 'indeterminate' };
+      } else {
+        lingeringLaunchParents = assessLingeringLaunchParents(
+          scopedLedgerEntries, loadRun, isProcessAlive, processStartTime, ledger, deadlineAtMs,
+        );
+        if (deadlineExceeded()) stalled ??= { stage: 'launch-parent-classification', reason: 'deadline-exceeded' };
+      }
     } finally {
       launchParentClassificationElapsedMs = Date.now() - launchParentClassificationStartedAt;
     }
-    return { ...result, completeness, unreadable, count, observation, quantities: quantitySummary({ ...result, observation }), lingeringLaunchParents: lingeringLaunchParents!, ledger: { ledgerDirectories: ledger.ledgerDirectories, unreadableLedgerCount: ledger.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledger.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledger.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledger.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledger.indeterminateLedgerDirectoryCount, cacheHits, cacheMisses }, phases: phaseStoreObservation(observedPhases) };
+    const finalCompleteness = hasUnreadableLedgerObservation(ledger) || stalled ? 'partial' : 'complete';
+    const finalCount: RunningRunsCount = finalCompleteness === 'partial'
+      ? { count: null, lowerBound: result.counts.running + result.counts['probable-running'], unreadable }
+      : result.counts.running + result.counts['probable-running'];
+    return { ...result, completeness: finalCompleteness, unreadable, count: finalCount, observation, quantities: quantitySummary({ ...result, observation }), lingeringLaunchParents: lingeringLaunchParents!, ledger: { ledgerDirectories: ledger.ledgerDirectories, unreadableLedgerCount: ledger.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledger.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledger.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledger.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledger.indeterminateLedgerDirectoryCount, cacheHits, cacheMisses }, phases: phaseStoreObservation(observedPhases), ...(stalled ? { stalled } : {}) };
   } finally {
     try {
       observeQuery({
@@ -614,7 +637,7 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
 
 export function isPartialRunningRuns(result: RunningRunsResult): boolean {
   return (result.count !== undefined && typeof result.count !== 'number' && result.count.count === null)
-    || result.completeness === 'partial' || hasUnreadableLedgerObservation(result.ledger) || (result.unreadable?.length ?? 0) > 0;
+    || result.completeness === 'partial' || result.stalled !== undefined || hasUnreadableLedgerObservation(result.ledger) || (result.unreadable?.length ?? 0) > 0;
 }
 
 function runningRunsLowerBound(result: RunningRunsResult): number {
@@ -670,7 +693,7 @@ function formatElapsed(ms: number): string {
 export function renderRunProgressTable(result: RunningRunsResult, nowMs: number = Date.now()): string {
   const partial = isPartialRunningRuns(result);
   const header = partial
-    ? `부분 관측 — 최소 ${runningRunsLowerBound(result)} (읽지 못한 원장: ${runningRunsUnreadable(result).map((item) => `${item.dir}:${item.reason}`).join(',') || '목록 미관측'})`
+    ? `부분 관측 — 최소 ${runningRunsLowerBound(result)} (${result.stalled ? `중단 단계 ${result.stalled.stage} · 사유 ${result.stalled.reason}` : `읽지 못한 원장: ${runningRunsUnreadable(result).map((item) => `${item.dir}:${item.reason}`).join(',') || '목록 미관측'}`})`
     : `도는 런 ${result.counts.running + result.counts['probable-running']} (확인 ${result.counts.running} · 추정 ${result.counts['probable-running']})`;
   const rows = buildRunProgressRows(result, nowMs).map((row) => {
     const phaseUnreadable = row.phaseObservation === 'unreadable' || row.phaseObservation === 'partially-unreadable';

@@ -1,0 +1,36 @@
+# SW-PERSONA-TEACHER-WEEKLY-FU · GoalId d68f0e7e17725cef · 0.2.41 칸
+#
+# 교사 페르소나의 주간 반복: 일요일 20:00 Asia/Seoul 스케줄이 저장된 진도(앞선 런 원장의 record-progress 산출)를 읽고
+# 다음 단원을 lesson-pack 유닛으로 넘긴다. 진도를 아직 아무것도 못 읽은 첫 실행은 «기준선»만 기록하고 끝나며,
+# 그 기록이 다음 실행의 단원 선택을 바꾼다. lesson-pack 을 넘긴 실행은 교사 승인(hitl)에서 멈춘다 —
+# 승인은 사람 결정만 claim 하는 graph-approval-card 경로를 그대로 쓴다.
+graph_id: weekly-lesson
+version: 1
+loop:
+  title: 주간 수업 준비 (교사 페르소나)
+  description: 일요일 20:00 KST 에 저장된 진도를 읽어 다음 단원을 lesson-pack 그래프로 넘기고 교사 승인에서 멈춘다
+  trigger:
+    cron: '0 20 * * 0'
+    timezone: Asia/Seoul
+entry_node: read-progress
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: read-progress, kind: agent, recipe: 'cmd:read-progress', max_visits: 1 }
+  - { node_id: select-next, kind: agent, recipe: 'cmd:select-next', max_visits: 1 }
+  - node_id: lesson-pack
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: lesson-pack@1
+    budget: { inner_steps: 3 }
+    contract: { inputs: [select-next], tools: state-write, outputs: [lesson] }
+  - { node_id: teacher-approval, kind: hitl, recipe: 'approval:teacher', max_visits: 1 }
+  - { node_id: record-progress, kind: agent, recipe: 'cmd:record-progress', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: read-progress, on: outcome, map: { ok: select-next, fail: failed, error: failed } }
+  - { from: select-next, on: outcome, map: { baseline: record-progress, next: lesson-pack, fail: failed } }
+  - { from: lesson-pack, on: outcome, map: { ok: teacher-approval, fail: failed } }
+  - { from: teacher-approval, on: outcome, map: { ok: record-progress, fail: failed } }
+  - { from: record-progress, on: outcome, map: { ok: done, fail: failed } }

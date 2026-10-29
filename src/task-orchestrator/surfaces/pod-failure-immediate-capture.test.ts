@@ -196,6 +196,63 @@ describe('AUTOPSY-FAILURE-IMMEDIATE-CAPTURE', () => {
     expect(s.rows().at(-1)?.data).toMatchObject({ outcome: 'vanished', reason: 'job-not-found', job: jobs[0] });
   });
 
+  test('Job 조회 실패는 SSH stderr 꼬리와 종료 코드를 사설 증거로 남긴다', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    const stderr = 'ssh: connect to host node-b port 22: Connection timed out';
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir,
+      kubectl: () => ({ status: 255, stdout: '', stderr }), record: s.record });
+    const result = s.rows().at(-1)?.data;
+    expect(result).toMatchObject({ outcome: 'failed', reason: 'job-read-failed', kubectlStatus: 255, childRunId: `run-${job}` });
+    expect(readFileSync(String(result?.stderrEvidence), 'utf8')).toBe(stderr);
+  });
+
+  test('같은 Job 조회를 다시 실패해 stderr가 바뀌면 두 번째 원문도 별도 보존한다', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    const input = { runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, record: s.record };
+    const stderr = ['ssh: connection timed out', 'ssh: host key verification failed'];
+    for (const message of stderr) captureFailedPodJobs({ ...input,
+      kubectl: () => ({ status: 255, stdout: '', stderr: message }) });
+    const captures = s.rows().filter(row => row.event === 'pod-failure-capture');
+    expect(captures).toHaveLength(2);
+    expect(captures.map(row => row.data.stderrEvidence).every(Boolean)).toBe(true);
+    expect(captures[0]?.data.stderrEvidence).not.toBe(captures[1]?.data.stderrEvidence);
+    for (const [index, row] of captures.entries()) {
+      expect(row.data.kubectlStatus).toBe(255);
+      expect(readFileSync(String(row.data.stderrEvidence), 'utf8')).toBe(stderr[index]);
+    }
+    captureFailedPodJobs({ ...input, kubectl: () => ({ status: 255, stdout: '', stderr: stderr[1]! }) });
+    expect(s.rows().at(-1)?.data.stderrEvidence).toBe(captures[1]?.data.stderrEvidence);
+  });
+
+  test('SSH stderr의 자격증명 줄은 원문 증거에서 가리고 가림 상태를 남긴다', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    captureFailedPodJobs({ runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, record: s.record,
+      kubectl: () => ({ status: 255, stdout: '', stderr: 'ssh timeout\nAuthorization: Bearer sk-1234567890' }) });
+    const result = s.rows().at(-1)?.data;
+    expect(result?.stderrCaptureStatus).toBe('redacted');
+    const saved = readFileSync(String(result?.stderrEvidence), 'utf8');
+    expect(saved).toContain('ssh timeout');
+    expect(saved).not.toContain('sk-1234567890');
+  });
+
+  test('실패 Job의 빈 child 로그는 수집 성공으로 기록하지 않는다', () => {
+    const job = jobs[0]!;
+    const s = stage([entered(job)]);
+    const input = { runId: 'incident', job, ledgerPath: s.ledger, artifactDir: s.dir, record: s.record };
+    captureFailedPodJobs({ ...input,
+      kubectl: (host, args) => args[4] === 'logs' ? { status: 0, stdout: ' \n\t ', stderr: '' } : s.kubectl(host, args) });
+    const result = s.rows().at(-1)?.data;
+    expect(result).toMatchObject({ outcome: 'failed', reason: 'logs-empty', childRunId: `run-${job}` });
+    expect(readFileSync(String(result?.jobEvidence), 'utf8')).toContain(job);
+    expect(readFileSync(String(result?.podEvidence), 'utf8')).toContain(job);
+    expect(result?.logEvidence).toBeUndefined();
+    captureFailedPodJobs({ ...input, kubectl: s.kubectl });
+    expect(s.rows().at(-1)?.data).toMatchObject({ outcome: 'collected', reason: 'job-failed' });
+  });
+
   test('podSelfImplementSpawn의 Failed Job 두 건은 mbp가 아닌 ledger host에서 수집한다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-autopsy-entry-'));
     const runId = 'incident';

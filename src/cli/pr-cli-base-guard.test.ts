@@ -31,12 +31,20 @@ const passingHeavyRemote: (input: HeavyRemoteInput) => HeavyRemoteResult = (inpu
   elapsedMs: 0,
   evidencePath: `${input.pr}.json`,
 });
+const failingHeavyRemote: (input: HeavyRemoteInput) => HeavyRemoteResult = (input) => ({
+  ok: false,
+  source: 'unmeasured',
+  reason: 'gate-rc-19',
+  elapsedMs: 1,
+  evidencePath: `${input.pr}.json`,
+});
 
 function land(
   prBase: string,
   opts: PrLandOpts = {},
   baseReads: Array<{ ok: boolean; out: string; err?: string }> = [],
   finalBaseReads: Array<{ ok: boolean; out: string; err?: string }> = [],
+  runHeavyRemote: (input: HeavyRemoteInput) => HeavyRemoteResult = passingHeavyRemote,
 ) {
   const lines: string[] = [];
   const waits: number[] = [];
@@ -79,7 +87,7 @@ function land(
     runAndroidGate: () => true,
     runPwaGate: () => true,
     runIosGate: () => true,
-    runHeavyRemote: passingHeavyRemote,
+    runHeavyRemote,
     listOpenPrs: () => [],
     out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
     manager: {
@@ -90,6 +98,13 @@ function land(
   };
   return realRunPrLand({ body: 'Human-requested atomic PR landing.', ...opts }, deps).then((code) => ({ code, lines, merges: () => merges, waits, baseReads: baseRead, finalBaseReads: finalBaseRead, finalBaseTargets }));
 }
+
+test('failed heavy remote gate refuses production landing before merge', async () => {
+  const result = await land('main', { heavyRemote: true, pr: '26022', base: 'main', expectedHead: 'a'.repeat(40) }, [], [], failingHeavyRemote);
+  expect(result.code).toBe(1);
+  expect(result.merges()).toBe(0);
+  expect(result.lines.some((line) => line.includes('heavy-remote: 원격 게이트 gate-rc-19'))).toBe(true);
+});
 
 test('a reused PR whose base is not main is refused before any merge call (exit 1)', async () => {
   const result = await land('bench/x');

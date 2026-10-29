@@ -8,10 +8,8 @@ import { debug, redactSecretText } from '../debug/log.js';
 import { gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type RemoteRunOutcome } from '../self-implement/gate-remote.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
-// WSL still lands last: its gate environment was repaired (WSL-GATE-ENV, 2026-10-17 — baselineWorkspaceRoot in
-// scripts/ci-typecheck-changed.ts now picks the host disk /var/tmp instead of WSL's 20GiB tmpfs), so the host is
-// allowlisted as the third slot while node-b/node-c keep discovery order — the recorded host order stays part of the
-// evidence contract.
+// This is the stable fallback order when settings.host is unavailable; an explicitly configured allowlisted host
+// always leads, and the remaining allowlisted hosts retain their relative order.
 export const PR_LAND_HEAVY_HOSTS = ['node-b', 'node-c', 'host-e-wsl'] as const;
 export const PR_LAND_HEAVY_HOST = PR_LAND_HEAVY_HOSTS[0];
 export type PrLandHeavyHost = typeof PR_LAND_HEAVY_HOSTS[number];
@@ -74,14 +72,23 @@ function evidencePath(input: HeavyRemoteInput): string {
   return join(input.evidenceDir ?? join(effectiveInstanceRoot(), 'pr-land-heavy-results'), `${input.pr}.json`);
 }
 
+function validRootPlan(value: unknown): value is RootPlanSummary | null {
+  if (value === null) return true;
+  if (!value || typeof value !== 'object') return false;
+  const plan = value as Partial<RootPlanSummary>;
+  return (plan.mode === 'affected' || plan.mode === 'full')
+    && (plan.roots === null || (Number.isSafeInteger(plan.roots) && plan.roots >= 0))
+    && typeof plan.promoted === 'boolean'
+    && (plan.reason === null || typeof plan.reason === 'string');
+}
+
 function matchingEvidence(path: string, input: HeavyRemoteInput): HeavyRemoteEvidence | null {
   if (!existsSync(path)) return null;
   try {
     const data: HeavyRemoteEvidence = JSON.parse(readFileSync(path, 'utf8'));
     return data.schema === 2 && data.pr === input.pr && data.head === input.head
       && data.main === input.main && allowedHost(data.host) && Number.isFinite(data.elapsedMs)
-      && typeof data.interferenceMeasured === 'boolean'
-      && (data.rootPlan === null || (data.rootPlan?.mode === 'affected' || data.rootPlan?.mode === 'full')) ? data : null;
+      && typeof data.interferenceMeasured === 'boolean' && validRootPlan(data.rootPlan) ? data : null;
   } catch { return null; }
 }
 
@@ -214,9 +221,8 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
   const started = now();
   const deadline = started + settings.slotWaitSeconds * 1000;
   let outcome: RemoteRunOutcome = { kind: 'busy' };
-  const primaryHost: PrLandHeavyHost = settings.host;
-  let selectedHost: PrLandHeavyHost = primaryHost;
-  const hosts = [primaryHost, ...PR_LAND_HEAVY_HOSTS.filter((candidate) => candidate !== primaryHost)];
+  let selectedHost: PrLandHeavyHost = PR_LAND_HEAVY_HOSTS[0];
+  const hosts: readonly PrLandHeavyHost[] = [settings.host, ...PR_LAND_HEAVY_HOSTS.filter((host) => host !== settings.host)];
   wait: for (;;) {
     for (const host of hosts) {
       selectedHost = host;

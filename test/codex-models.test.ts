@@ -8,7 +8,7 @@ import {
 import { CODEX_DEFAULT_MODEL } from '../src/llm';
 
 describe('codex model catalog', () => {
-  test('has exactly 8 curated entries', () => {
+  test('has exactly 10 curated entries', () => {
     // #1450 added the gpt-5.5 flagship entry, growing the curated catalog
     // from 5 → 6. 2026-09-09 added gpt-6-astra (2026-09-03 release) and
     // gpt-5.6-terra (elanous's actual default driver): 6 → 8.
@@ -16,9 +16,10 @@ describe('codex model catalog', () => {
     //   뺀 것: `gpt-5-codex-mini` · `codex-mini-latest` — ***API 에도 구독 카탈로그에도 없었다***
     //          (라이브 대조: `bun scripts/check-codex-picker-models.ts`).
     //   넣은 것: `gpt-6-sol`(운영 기본) · `gpt-6-luna`.
+    // 2026-10-28: GPT-6.1 Terra/Sol add two current Codex models, growing 8 → 10.
     // ⛔ 이 수는 「8이어야 한다」가 아니라 ***「피커는 «고를 수 있는 만큼»만 담는다」***는 규율의
     //    대리 지표다 — 늘릴 땐 이 줄이 빨개져서 「왜 늘렸나」를 적게 된다.
-    expect(CODEX_MODELS.length).toBe(8);
+    expect(CODEX_MODELS.length).toBe(10);
   });
 
   test('the recommended entry is the model elanous actually defaults to', () => {

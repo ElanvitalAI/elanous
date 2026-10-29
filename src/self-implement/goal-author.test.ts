@@ -11020,6 +11020,130 @@ describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
     expect(plan.lines[5]).toContain('src/release-loop/resume.ts');
   });
 
+  test('mock-catalog-g1-v4: production plan carries MS id, universe, injection, observation, and E1-E4 policy candidates', async () => {
+    const ask = '대상 경로: src/self-implement/orchestrator.ts\n`runSelfImplement` 생산 경로를 격리 HOME 및 test 무대에서 실행하고 부모 원장 관측을 확인한다.\n완료 경계 증거 명령: bun test src/self-implement/orchestrator.test.ts';
+    const plan = authorVerificationPlan({
+      ask,
+      behaviour: '`runSelfImplement` 생산 경로를 격리 입력으로 확인하고 부모 원장을 관측한다',
+      targetPaths: ['src/self-implement/orchestrator.ts'],
+      ...docs,
+    });
+    expect(plan.stage).toMatchObject({ source: 'catalog', id: 'MS-03', level: 'L3' });
+    expect(plan.lines[2]).toContain('MS-03');
+    expect(plan.lines[2]).toContain('우주: 격리 HOME 및 test');
+    expect(plan.lines[2]).toContain('사건 주입: 원본에 미기재');
+    expect(plan.lines[2]).toContain('관측: 원본 표본은 round 0 호출 1/0');
+    expect(plan.lines[2]).toContain('실행: `runSelfImplement`');
+    expect(plan.lines[5]).toContain('G1 v4');
+    expect(plan.lines[5]).toContain('생산 호출 문장 1건 이상(0건만으로 미배선 판정 금지)');
+    expect(plan.lines[5]).toContain('E1 착지 뒤 PR head가 main의 조상인지 확인');
+    expect(plan.lines[5]).toContain('E2 완료 경계 증거 명령 `bun test src/self-implement/orchestrator.test.ts` 을 origin/main 에서 rc0 확인');
+    expect(plan.lines[5]).toContain('E3 생산 진입점 시험 또는 mock 무대');
+    expect(plan.lines[5]).toContain('E4 운영 실물은 필수 아님');
+
+    const authored = await authorGoal(ask, {
+      ...deps,
+      repositoryRoot: repoRoot,
+      decomposeSteps: async () => ['대상 경로: src/self-implement/orchestrator.ts · 생산 진입점과 원장 관측을 확인한다.'],
+    });
+    expect(authored.document).toContain(ask);
+    expect(authored.document).toContain('G1 v4');
+    expect(authored.document).toContain('MS-03');
+  });
+
+  test('mock-catalog-g1-v4 fixed author scenario: injecting the pack changes only the verification plan', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'goal-author-mock-pack-'));
+    const catalogDir = join(root, 'docs', 'goal-context');
+    mkdirSync(catalogDir, { recursive: true });
+    // Keep the real production target and evidence command valid in the fixture repository.
+    // Their contents do not drive the pack comparison: grounding and source reads are injected,
+    // while the fixture pack is the only changed authoring input. If the production path changes,
+    // this scenario must be updated with the accepted main evidence command.
+    mkdirSync(join(root, 'src', 'self-implement'), { recursive: true });
+    symlinkSync(join(repoRoot, 'src', 'self-implement', 'orchestrator.ts'), join(root, 'src', 'self-implement', 'orchestrator.ts'));
+    symlinkSync(join(repoRoot, 'src', 'self-implement', 'orchestrator.test.ts'), join(root, 'src', 'self-implement', 'orchestrator.test.ts'));
+    const ask = '대상 경로: src/self-implement/orchestrator.ts\n'
+      + '`runSelfImplement` 생산 진입점이 격리 HOME 및 test 무대에서 한 바퀴 실행되고 부모 원장 결과를 기록한다.\n'
+      + '완료 경계 증거 명령: bun test src/self-implement/orchestrator.test.ts';
+    const fixturePack = [
+      '# Fixed mock scenario pack',
+      '',
+      '### MS-03 격리 self-implement 한 바퀴',
+      '- **증명하는 동작:** `runSelfImplement` 생산 진입점이 한 바퀴 실행되고 부모 원장에 결과를 기록한다.',
+      '- **언제 쓰나:** 생산 진입점과 부모 원장 결과를 함께 확인할 때.',
+      '- **우주:** 격리 HOME 및 test.',
+      '- **무대 세우기:** 고정 ask와 메모리 원장을 사용한다.',
+      '- **실행:** `bun bin/elanous.mjs --test self author "fixed mock pack scenario"`',
+      '- **판정:** 생성 문서의 무대·생산 경로·원장 관측을 대조한다.',
+      '- **치우기:** 임시 fixture root를 제거한다.',
+      '- **함정:** 운영 HOME·Pod·GitHub를 호출하지 않는다.',
+      '- **출처:** KNOWHOW-PACK-TDD-AUTHORING 고정 시험 fixture.',
+      '',
+    ].join('\n');
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    const planWithoutPack = (document: string) => document.replace(
+      /### 검증 계획\(TDD\)\n[\s\S]*?(?=\n## 불변식)/u,
+      '### 검증 계획(TDD)\n<plan>',
+    );
+    try {
+      const stableDeps = {
+        ...deps,
+        repositoryRoot: root,
+        goalId: 'goal-fixed-mock-catalog',
+        readSourceFile: () => null,
+        decomposeSteps: async () => ['대상 경로: src/self-implement/orchestrator.ts · 생산 진입점과 부모 원장을 확인한다.'],
+      };
+      const before = await authorGoal(ask, stableDeps);
+      writeFileSync(join(catalogDir, '04-mock-scenarios.md'), fixturePack);
+      const after = await authorGoal(ask, stableDeps);
+
+      expect(before.document).toContain('새 무대:');
+      expect(after.document).toContain('MS-03 격리 self-implement 한 바퀴');
+      expect(after.document).toContain('우주: 격리 HOME 및 test');
+      expect(after.document).toContain('사건 주입: 고정 ask와 메모리 원장을 사용한다');
+      expect(after.document).toContain('G1 v4');
+      expect(after.document).toContain('git grep -n -F');
+      expect(after.document).toContain("git grep -n -F 'runSelfImplement(' HEAD -- src/self-implement/orchestrator.ts");
+      expect(after.document).toContain('E2 완료 경계 증거 명령 `bun test src/self-implement/orchestrator.test.ts` 을 origin/main 에서 rc0 확인');
+      expect(planWithoutPack(after.document)).toBe(planWithoutPack(before.document));
+
+      const planEvents = log.mock.calls
+        .filter(([category, event]) => category === 'goal-author' && event === 'verification-plan')
+        .map(([, , data]) => data as Record<string, unknown>);
+      expect(planEvents).toEqual([
+        expect.objectContaining({ stageId: 'new-stage:fixture', catalogPresent: false }),
+        expect.objectContaining({ stageId: 'MS-03', catalogPresent: true }),
+      ]);
+      // This asserts the author event producer boundary, not durable debug-log storage; STOP-HEAL's
+      // paired fixture below separately verifies the in-memory run-ledger event chain.
+      console.log(`[sim-receipt] runId=${before.authorRunId} event=goal-author.verification-plan stageId=new-stage:fixture catalogPresent=false; runId=${after.authorRunId} event=goal-author.verification-plan stageId=MS-03 catalogPresent=true; verificationCommand=bun test src/self-implement/goal-author.test.ts -t mock-catalog-g1-v4`);
+    } finally {
+      log.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('mock-catalog-g1-v4: invalid evidence command remains author input', () => {
+    const plan = authorVerificationPlan({
+      ask: '대상 경로: src/feature.ts\n기능을 연결한다.\n완료 경계 증거 명령: bun test src/feature.test.ts && rm -rf /tmp/proof',
+      behaviour: '기능을 연결한다',
+      targetPaths: ['src/feature.ts'],
+      ...docs,
+    });
+    expect(plan.lines[5]).toContain('E2 완료 경계 증거 명령은 ask에 없거나 유효하지 않아 저작자가 채움');
+    expect(plan.lines[5]).not.toContain('rm -rf');
+  });
+
+  test('mock-catalog-g1-v4: absent evidence command remains author input', () => {
+    const plan = authorVerificationPlan({
+      ask: '대상 경로: src/feature.ts\n기능을 연결한다.',
+      behaviour: '기능을 연결한다',
+      targetPaths: ['src/feature.ts'],
+      ...docs,
+    });
+    expect(plan.lines[5]).toContain('E2 완료 경계 증거 명령은 ask에 없거나 유효하지 않아 저작자가 채움');
+  });
+
   test('no catalog fit: the plan writes «새 무대: <name> — <command>» instead of inventing a catalog id', () => {
     const plan = authorVerificationPlan({
       ask: '대상 경로: src/util/format-bytes.ts\n`formatBytes` 가 1024 경계에서 KiB 로 바꾼다.',

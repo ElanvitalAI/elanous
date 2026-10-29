@@ -65,7 +65,7 @@ export function provideCheckoutDependencies(candidate: string, sourceRoot: strin
   } else install(join(candidate, dir));
 }
 
-export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; verifyOnly?: boolean; /** TA-LIVE-LAND-2: run the full landing gates (release-path hold · neighbours · PR re-read) but stop before the freeze admission and `gh pr merge` — the task agent lands it later via `pr land --expected-head`. */ noMerge?: true; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
+export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; goalFile?: string; verifyOnly?: boolean; /** STOP-HEAL-WINNOW: measurement only on a preserved draft; never valid for landing. */ allowDraft?: true; /** TA-LIVE-LAND-2: run the full landing gates (release-path hold · neighbours · PR re-read) but stop before the freeze admission and `gh pr merge` — the task agent lands it later via `pr land --expected-head`. */ noMerge?: true; /** Called by a resume sweep that already holds this PR's claim. */ resumed?: true }
 export interface HostRegateResult { passed: boolean; failures: HostRegateFailure[]; os: string; status?: 'passed' | 'failed' | 'unmeasured' | 'frozen'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
 /** Only a missing host repository is recoverable by selecting the run's recorded root. Gate failures are final. */
 export function hostRepositoryUnavailable(result: HostRegateResult): boolean {
@@ -382,7 +382,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     return run('git', ['rev-parse', ref], input.repoRoot);
   };
   try {
-    if (!Number.isSafeInteger(input.prNumber) || input.prNumber <= 0 || !/^[0-9a-f]{40}$/i.test(input.headCommit)) return result('unmeasured', 'input', 'invalid PR number or checked head SHA');
+    if (!Number.isSafeInteger(input.prNumber) || input.prNumber <= 0 || !/^[0-9a-f]{40}$/i.test(input.headCommit) || (input.allowDraft && !input.verifyOnly)) return result('unmeasured', 'input', 'invalid PR number, checked head SHA, or draft measurement mode');
     release = await (deps.acquire ?? acquireSlot)(input.repoRoot);
     type PrView = { headRefOid?: string; baseRefName?: string; baseRefOid?: string; state?: string; isDraft?: boolean };
     const readPr = (): PrView => JSON.parse(run('gh', ['pr', 'view', String(input.prNumber), '--json', 'headRefOid,baseRefName,baseRefOid,state,isDraft'], input.repoRoot));
@@ -392,7 +392,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     let view: PrView;
     try { view = readPr(); }
     catch (e) { return result('unmeasured', 'pr-view', String(e)); }
-    if (view.headRefOid !== input.headCommit || view.state !== 'OPEN' || view.isDraft !== false || !view.baseRefName || !/^[0-9a-f]{40}$/i.test(view.baseRefOid ?? '')) return prHeadFailure(view);
+    if (view.headRefOid !== input.headCommit || view.state !== 'OPEN' || (view.isDraft !== false && !(input.allowDraft && view.isDraft === true)) || !view.baseRefName || !/^[0-9a-f]{40}$/i.test(view.baseRefOid ?? '')) return prHeadFailure(view);
     const baseRefName = view.baseRefName;
     // verifyOnly(승인 탭): PR 에 기록된 base(baseRefOid)는 main 의 «지금 끝»보다 늙을 수 있다 — 지금 끝에 얹어 잰다.
     let baseCommit = view.baseRefOid!;
@@ -621,7 +621,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     let current: PrView;
     try { current = readPr(); }
     catch (e) { return result('unmeasured', 'pr-view', String(e)); }
-    if (current.headRefOid !== input.headCommit || current.baseRefName !== baseRefName || (!input.verifyOnly && current.baseRefOid !== (stalePrBase ?? baseCommit)) || current.state !== 'OPEN' || current.isDraft !== false) {
+    if (current.headRefOid !== input.headCommit || current.baseRefName !== baseRefName || (!input.verifyOnly && current.baseRefOid !== (stalePrBase ?? baseCommit)) || current.state !== 'OPEN' || current.isDraft !== view.isDraft) {
       return result('unmeasured', 'pr-base-changed', 'PR head or base changed during host regate; rerun against the new base');
     }
     // --match-head-commit pins the head. gh has no base pin, so the base was re-read just

@@ -1,0 +1,16 @@
+id: gpt-6.1-sol
+provider: openai
+displayName: GPT-6.1 Sol
+family: gpt-6
+familyShortcut: sol
+contextSize: 500000
+pricing:
+  inputPerMTok: 2
+  outputPerMTok: 10
+  cachedInputPerMTok: 0.1
+releaseDate: 2026-10-26
+discoveryMeta:
+  source: manual
+  lastSeen: 2026-10-28
+  autoFilled: false
+  confidence: high

@@ -3,6 +3,7 @@
 // Auto-routes based on model name prefix, or picks the first available provider.
 
 import { wellFormedLLMMessages } from './llm-wellformed.js';
+import { truncateOutput } from './output-truncation.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
 import { realpathSync } from 'node:fs';
@@ -455,6 +456,9 @@ export interface LLMOpts {
       previousChars?: number;
     }) => void;
   };
+  /** Optional cap for text tool results accumulated into the conversation history.
+   *  Oversized results are spilled to a local file and represented by head/tail. */
+  toolResultInlineLimitBytes?: number;
   /** Optional model role attached to this request's usage observation. */
   usageRole?: ModelRole;
   /** Optional per-call metering phase; absent calls keep the existing ledger shape. */
@@ -7506,13 +7510,33 @@ function resultText(result: unknown): string {
 }
 
 /** skill_exec returns structured host metadata, but its model-facing tool result is the answer body. */
-function toolResultContentForCall(toolName: string, result: unknown): string {
+function toolResultContentForCall(toolName: string, result: unknown, inlineLimitBytes?: number): string {
+  let content: string;
   if (toolName === 'skill_exec' && result && typeof result === 'object'
     && typeof (result as { output?: unknown }).output === 'string') {
-    if ((result as { ok?: unknown }).ok === false) return JSON.stringify(result);
-    return (result as { output: string }).output;
+    content = (result as { ok?: unknown }).ok === false
+      ? JSON.stringify(result)
+      : (result as { output: string }).output;
+  } else {
+    content = typeof result === 'string' ? result : JSON.stringify(result);
   }
-  return typeof result === 'string' ? result : JSON.stringify(result);
+  if (!Number.isFinite(inlineLimitBytes) || inlineLimitBytes === undefined || inlineLimitBytes <= 0) return content;
+  const safeToolName = toolName.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'tool';
+  const capped = truncateOutput(content, {
+    toolName: `tool-result-${safeToolName}`,
+    inlineLimit: inlineLimitBytes,
+    headBytes: Math.floor(inlineLimitBytes * 0.6),
+    tailBytes: Math.floor(inlineLimitBytes * 0.2),
+  });
+  if (capped.spilled) {
+    debug.log('llm.router', 'tool-result.output-spilled', {
+      tool: safeToolName,
+      originalBytes: capped.originalBytes,
+      inlineLimitBytes,
+      savedPath: capped.savedPath,
+    });
+  }
+  return capped.output;
 }
 
 function detectExecutionFailure(result: unknown): boolean {
@@ -8921,7 +8945,7 @@ export async function streamLLMWithTools(
       turn, historyLen: history.length,
     }, { level: 'info' });
 
-    // Mid-loop context backstop — with the codex/unlimited tool-loop cap
+    // Turn context backstop — with the codex/unlimited tool-loop cap
     // removed, a long tool-heavy turn (esp. mission build) grows `history`
     // unbounded until it overflows the model context window and the provider
     // throws. ref codex / opencode bound exploration by COMPACTION, not a
@@ -9371,6 +9395,8 @@ export async function streamLLMWithTools(
           ...(ev.revisedPrompt !== undefined ? { revisedPrompt: ev.revisedPrompt } : {}),
         });
       } else if (ev.type === 'usage') {
+        // Provider parsers normalize inputTokens to uncached input; cache
+        // reads/writes are separate fields (prompt-cache/types.ts contract).
         // ⭐ 주 에이전트 턴의 토큰·비용을 «게이트 없이» 남긴다(2026-09-24 실측: 이 줄이 없어 3시간 `llm.usage`
         //   18행이 전부 곁가지 두 자리였고, 하니스 런 비용의 거의 전부가 관측 밖이었다). 곁가지와 같은 모양 ·
         //   모르는 모델은 금액 대신 `cost.kind='unknown'`. runId 는 debug.log 가 붙인다. 실패해도 턴은 계속.
@@ -11358,6 +11384,11 @@ export async function streamLLMWithTools(
         }
         const dispatchIndex = callsToDispatch.findIndex((candidate) => candidate.id === call.id);
         const { result, isError } = dispatchedResults[dispatchIndex]!;
+        const toolResultInlineLimitBytes = opts.toolResultInlineLimitBytes === undefined
+          ? undefined
+          : activeProvider.name === 'openai-codex'
+            ? Math.min(opts.toolResultInlineLimitBytes, 10 * 1024)
+            : opts.toolResultInlineLimitBytes;
         const imageBearing = maybeImageBearingResult(result);
         if (imageBearing) {
           // Image-bearing tool result (Phase 1, 2026-05-05) — see
@@ -11370,7 +11401,7 @@ export async function streamLLMWithTools(
             tool_use_id: call.id,
             content: [
               { type: 'image', mediaType: imageBearing.mediaType, base64: imageBearing.dataB64 },
-              { type: 'text', text: JSON.stringify(imageBearing.rest) },
+              { type: 'text', text: toolResultContentForCall(call.name, JSON.stringify(imageBearing.rest), toolResultInlineLimitBytes) },
             ],
             ...(isError ? { isError: true } : {}),
           });
@@ -11378,7 +11409,7 @@ export async function streamLLMWithTools(
           resultBlocks.push({
             type: 'tool_result',
             tool_use_id: call.id,
-            content: toolResultContentForCall(call.name, result),
+            content: toolResultContentForCall(call.name, result, toolResultInlineLimitBytes),
             ...(isError ? { isError: true } : {}),
           });
         }
@@ -11764,11 +11795,11 @@ import {
 } from './oauth/codex.js';
 import { extractChatGPTClaims } from './oauth/jwt.js';
 
-// ⭐ 2026-09-23 (대표) — 운영 기본을 GPT-6 Sol 로 옮겼다(구 gpt-5.6-terra).
+// ⭐ 2026-10-28 — current Codex default is GPT-6.1 Terra.
 //   ⛔ 이 상수는 «최후 폴백»이다 — 정상 경로는 `llm-tier-map` 의 사다리를 탄다.
-//   📏 구독 경로 실호출 확인(codex-cli 0.155.1 · 2026-09-23): `codex exec --model gpt-6-sol` ✅
-//   ⚠️ 0.154.0 에서는 같은 계정이 400 이었다 — 클라이언트 판이 게이트였다.
-export const CODEX_DEFAULT_MODEL = 'gpt-6-sol';
+//   Codex CLI 0.164.0: `codex exec -m gpt-6.1-terra` returned successfully on 2026-10-28.
+//   Elanous ACP Codex app-server also returned on this model; Elanous's better-tier effort remains medium.
+export const CODEX_DEFAULT_MODEL = 'gpt-6.1-terra';
 export const CODEX_DEFAULT_URL = 'https://api.openai.com/v1/chat/completions';
 
 /** Build an OpenAI-compatible provider (grok / openai) using the

@@ -1,0 +1,16 @@
+# SW-PERSONA-TEACHER-WEEKLY-FU · GoalId d68f0e7e17725cef — weekly-lesson 이 넘긴 단원을 수업 팩으로 묶는 유닛.
+# 입력은 앞 노드(select-next)의 구조 산출 그대로이고, 낸 산출은 lesson 하나다.
+graph_id: lesson-pack
+version: 1
+unit:
+  inputs: [select-next]
+  outputs: [lesson]
+  exits: [ok, fail]
+entry_node: pack
+terminal_nodes: [ok, fail]
+nodes:
+  - { node_id: pack, kind: agent, recipe: 'cmd:pack', max_visits: 1 }
+  - { node_id: ok, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: fail, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: pack, on: outcome, map: { ok: ok, fail: fail } }

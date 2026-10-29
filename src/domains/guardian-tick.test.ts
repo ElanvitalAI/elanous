@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { recordDoctorVisit, recordPendingShadowDoctorReevaluations } from '../self-implement/doctor-visit.js';
 import { appendRunLedgerEntry, loadRunLedger } from '../self-implement/run-ledger.js';
+import type { TcellHealthCard } from '../harness/harness-incidents.js';
 import { openSchedulesDb } from './schedule-registry.js';
 import { ensureScheduleRunsSchema, recordScheduleRun } from './schedule-runs.js';
 import { GROK_EXPIRY_ALERT_WINDOW_MS, grokExpiryAlertLine, grokExpiryStatusLine, guardianShadowDay, guardianTick, type GuardianPlan } from './guardian-tick.js';
@@ -17,6 +18,36 @@ const plan: GuardianPlan = { timeZone: 'Asia/Seoul', jobs: [
 const kst = (hour: number, minute = 0) => new Date(Date.UTC(2026, 9, 7, hour - 9, minute));
 
 describe('GUARD-ONE-a shadow tick', () => {
+  test('guardian tick records T-cell decisions as shadow only and never executes an external action', async () => {
+    const now = kst(7);
+    const healthCards: TcellHealthCard[] = [{
+      runId: 'run-0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d', stage: 'implement',
+      startedAt: now.getTime() - 60_000, progressAt: now.getTime() - 60_000, stageBudgetMs: 5 * 60_000,
+      heartbeatAt: now.getTime(), parentPresent: true, leaseExpiresAt: now.getTime() + 60_000, riskSignal: false,
+      stopClass: 'pod-died', site: 'launch', signatureTail: 'bounded-tail',
+    }];
+    let sourceReads = 0;
+    let executions = 0;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await guardianTick(now, { ...plan, jobs: [] }, {
+        config: { guardian: { mode: 'live' } }, grokExpiry: () => null,
+        readTcellHealthCards: () => { sourceReads++; return healthCards; },
+        execute: async () => { executions++; return { code: 0, ms: 0 }; },
+      });
+      expect(result.tcellPatrol).toEqual({ total: 1, measured: 1, unmeasured: 0,
+        counts: { healthy: 1, slow: 0, stalled: 0, infected: 0, zombie: 0 } });
+      expect(sourceReads).toBe(1);
+      expect(executions).toBe(0);
+      expect(log.mock.calls.some(([category, event, data]) => {
+        const payload = data as Record<string, unknown>;
+        const decisions = payload.decisions as Array<{ runId: string; classification: string }> | undefined;
+        return category === 'guardian.tcell' && event === 'shadow-classification'
+          && payload.mode === 'shadow' && decisions?.[0]?.classification === 'healthy';
+      })).toBe(true);
+    } finally { log.mockRestore(); }
+  });
+
   test('guardian shadow tick records one doctor prescription for an admitted visit across repeated ticks', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'guardian-doctor-shadow-'));
     const runId = 'run-0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d';

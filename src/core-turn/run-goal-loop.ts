@@ -211,6 +211,40 @@ export function isInterimReportShaped(text: string): boolean {
   return INTERIM_REPORT_SHAPED.test(text);
 }
 
+// TUI-FACT-TOOL-REPEAT — 턴 안에서 같은 값을 보장하는 안정 read-only 도구만 억제한다.
+//   Registry-wide readOnly metadata는 없다(FU). Live/poll·stream-consuming 조회(MsgList,
+//   ChecklistList, PtyShellPoll, AgentOutput), 외부 조회와 쓰기 동작은 이 좁은 목록 밖이다.
+const GOAL_LOOP_READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'Read', 'Grep', 'Glob', 'ListDir', 'release_status', 'self_recall', 'ops_seats', 'decisions_pending', 'proact_meter',
+]);
+
+/** TUI-FACT-TOOL-REPEAT — 중복 판정 키: 도구명 + 인자의 stable 직렬화(키 순서와 무관하게 같은 내용=같은 키). */
+function goalLoopReadOnlyCallKey(name: string, args: Record<string, unknown>): string {
+  return `${name}:${stableSerializeToolArgs(args)}`;
+}
+
+function stableSerializeToolArgs(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? String(value);
+  if (Array.isArray(value)) return `[${value.map(stableSerializeToolArgs).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${stableSerializeToolArgs(entry)}`);
+  return `{${entries.join(',')}}`;
+}
+
+type ReadOnlyRepeatCacheEntry =
+  | { kind: 'inflight'; pending: Promise<unknown> }
+  | { kind: 'ok'; result: unknown }
+  | { kind: 'error'; error: unknown };
+
+/** TUI-FACT-TOOL-REPEAT — 오류 캐시 적중 시 재호출 없이 돌려주는 억제 안내: 실패 근거를 실어
+ *  이 도구를 다시 호출하지 말고, 이 실패를 설명하는 최종 답으로 종결하게 유도한다. */
+function buildReadOnlyRepeatSuppressedNotice(name: string, error: unknown): string {
+  const reason = error instanceof Error ? error.message : String(error);
+  return `[tool repeat suppressed] ${name} 은(는) 이 턴에서 이미 같은 인자로 실패했습니다(오류: ${reason}). `
+    + `재시도는 억제되어 실제로 실행하지 않았습니다 — 이 도구를 다시 호출하지 말고, 이 실패 근거를 설명하는 최종 답을 지금 작성하세요.`;
+}
+
 /** 목표 실행 계약 — 첫 turn 앞에 leading system 메시지로 주입. codex 자체 prompt.md /
  *  ext-goal continuation.md 의 지속·anti-shrink·증거완료 언어 이식. ASCII + 한국어. */
 export const GOAL_SYSTEM_PREAMBLE = [
@@ -790,6 +824,30 @@ export async function runGoalLoop(
     let turnNewMessages: LLMMessage[] = [];
     let dispatchCount = 0;
     toolCallsThisIteration = 0;
+    // TUI-FACT-TOOL-REPEAT — 이번 core 턴의 read-only 중복 억제 캐시. 턴 시작마다 새로 만든다
+    //   (캐시는 현재 턴 밖으로 유지하지 않는다 — 다음 반복은 새 턴이라 같은 조회도 다시 실제 실행된다).
+    const readOnlyRepeatCache = new Map<string, ReadOnlyRepeatCacheEntry>();
+    let readOnlyRepeatGeneration = 0;
+    const invalidateReadOnlyRepeatCache = () => {
+      readOnlyRepeatGeneration += 1;
+      readOnlyRepeatCache.clear();
+    };
+    const dispatchEffect = (
+      name: string, args: Record<string, unknown>, dctx: Parameters<CoreTurnContext["dispatchTool"]>[2],
+      ack?: () => Promise<unknown>,
+    ) => {
+      // A write or external effect can change a later read in this same turn. Clear before dispatch,
+      // then clear again on settlement so an in-flight read cannot repopulate stale data.
+      invalidateReadOnlyRepeatCache();
+      let dispatched: Promise<unknown>;
+      try {
+        dispatched = Promise.resolve(seatDispatch(name, args, dctx, ack ? (() => ack()) : undefined));
+      } catch (error) {
+        invalidateReadOnlyRepeatCache();
+        return Promise.reject(error);
+      }
+      return dispatched.finally(invalidateReadOnlyRepeatCache);
+    };
     let iterInputTokens = 0;
     let iterOutputTokens = 0;
     let iterCacheReadTokens = 0;
@@ -932,9 +990,37 @@ export async function runGoalLoop(
           // 종결 신호는 예산 거부를 받지 않는다(#28503 terminalToolNames 계약과 같은 방향). 그 밖의 진행 선언
           // (in_progress·blocked)은 도구 한 번으로 세고 상한 뒤엔 같은 안내로 거부한다(리뷰 r2 — 61번 넘게 불러도 안 막히던 구멍).
           if ((args as { status?: unknown }).status === 'complete') return ack();
-          return seatDispatch(name, args, dctx, ack);
+          return dispatchEffect(name, args, dctx, ack);
         }
-        return seatDispatch(name, args, dctx);
+        // TUI-FACT-TOOL-REPEAT — update_goal 가로채기 판정 «뒤» read-only 실 실행 직전:
+        //   동일 read-only tool+args 는 이 턴에서 실제 실행 1회 이하(성공 결과 재사용 · 오류 재시도 억제).
+        //   쓰기·외부 효과 도구는 허용목록 밖이라 억제 없이 매번 실제 실행된다(경계 보존).
+        if (GOAL_LOOP_READ_ONLY_TOOL_NAMES.has(name)) {
+          const repeatKey = goalLoopReadOnlyCallKey(name, args);
+          const cachedRepeat = readOnlyRepeatCache.get(repeatKey);
+          if (cachedRepeat !== undefined) {
+            try {
+              debug.log('goal.loop', 'readonly-tool-repeat-suppressed', {
+                sessionId: ctx.sessionId, ...runAttribution, iteration: iterations,
+                tool: name, dispatch: dispatchCount, outcome: cachedRepeat.kind,
+              }, { level: 'info' });
+            } catch {
+              // Observability must not change the suppressed result.
+            }
+            if (cachedRepeat.kind === 'inflight') return cachedRepeat.pending;
+            if (cachedRepeat.kind === 'ok') return Promise.resolve(cachedRepeat.result);
+            return Promise.resolve(buildReadOnlyRepeatSuppressedNotice(name, cachedRepeat.error));
+          }
+          const generation = readOnlyRepeatGeneration;
+          const dispatchedRead = Promise.resolve(seatDispatch(name, args, dctx));
+          readOnlyRepeatCache.set(repeatKey, { kind: 'inflight', pending: dispatchedRead });
+          dispatchedRead.then(
+            (result) => { if (generation === readOnlyRepeatGeneration) readOnlyRepeatCache.set(repeatKey, { kind: 'ok', result }); },
+            (error) => { if (generation === readOnlyRepeatGeneration) readOnlyRepeatCache.set(repeatKey, { kind: 'error', error }); },
+          );
+          return dispatchedRead;
+        }
+        return dispatchEffect(name, args, dctx);
       },
       callbacks: {
         ...ctx.callbacks,

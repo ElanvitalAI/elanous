@@ -15,7 +15,7 @@
 
 import type { LLMMessage } from '../llm.js';
 import type { ModelFamily } from '../models/prompts.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
 import type { NativeToolCatalogEntry } from '../native-tool-catalog.js';
 import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
 import { buildSeatBootSystemMessages, type SeatBootDeps } from './seat-boot-preamble.js';
@@ -343,6 +343,17 @@ function buildDashboardTurnPreambleUnmeasured(
         debug.log('tui.notify', notificationOnlyWake ? 'notification-only-turn' : 'notification-with-user-request', {
           notificationCount: pendingNotifications.length,
         });
+        // Preserve bounded, secret-redacted evidence of the exact XML body
+        // delivered to the model. This lets live TUI diagnosis distinguish
+        // an opened turn from a notification whose fields were dropped.
+        const safeXml = redactSecretText(taskNotificationsXml);
+        const xmlPreview = safeXml.slice(0, 2_000);
+        debug.log('tui.notify', 'notification-payload', {
+          notificationCount: pendingNotifications.length,
+          xmlChars: taskNotificationsXml.length,
+          xmlPreview,
+          xmlPreviewTruncated: safeXml.length > xmlPreview.length,
+        }, { compact: { stringMax: 2_100 } });
         preamble.push({ role: 'user', content: taskNotificationsXml });
       }
     });

@@ -208,6 +208,12 @@ function expectationsMet(expects: readonly NlRoutingToolExpectation[], breakdown
   return expects.every((expectation) => (breakdown[expectation.tool] ?? 0) >= (expectation.minCount ?? 1));
 }
 
+/**
+ * v5 채점의 최소 실행 턴 — 코퍼스 예산(CORPUS_BUDGETS) 과 «독립»인 채점 턴 정책 상수.
+ * 낮은 예산에서 복합 발화가 예산 부족만으로 거짓 실패하지 않게 한다.
+ */
+export const NL_ROUTING_V5_MIN_SCORING_TURNS = 6;
+
 /** v5 28문항을 «생산 runEvalPrompt seam» 으로 그대로 돌려 경로·복합 처리를 채점한다. */
 export async function scoreNlRoutingV5(opts: {
   runPrompt: typeof runEvalPrompt;
@@ -215,7 +221,7 @@ export async function scoreNlRoutingV5(opts: {
   cwd: string;
   maxTurns?: number;
 }): Promise<NlRoutingV5Score> {
-  const maxTurns = opts.maxTurns ?? 6;
+  const maxTurns = opts.maxTurns ?? NL_ROUTING_V5_MIN_SCORING_TURNS;
   const matched = new Set<string>();
   const failed: string[] = [];
   const patternMismatches: string[] = [];
@@ -401,7 +407,9 @@ export async function main(
   //   (다른 자로 재면 판정선과 비교 불가 · 형태 F3). 임계 미달은 «조용한 0» 이 아니라 거부다.
   let v5: NlRoutingV5Score | undefined;
   if (process.env.CORPUS_V5 === '1') {
-    v5 = await scoreNlRoutingV5({ runPrompt, surface, cwd: corpusCwd, maxTurns: budgets[0] });
+    // ⛔ 채점 턴 정책은 코퍼스 예산과 «독립»이다 — 예산은 코퍼스 생성 실행 횟수만 제어하고
+    //   채점 maxTurns 는 NL_ROUTING_V5_MIN_SCORING_TURNS 기본(또는 명시적 opts)에서만 온다.
+    v5 = await scoreNlRoutingV5({ runPrompt, surface, cwd: corpusCwd });
     console.log(`[v5] patterns ${v5.patterns} (path ${v5.pathPatterns} · compound ${v5.compoundPatterns}) · 문항 ${v5.questions} (path ${v5.pathQuestions} · compound ${v5.compoundQuestions}) · 채점 ${v5.scored} · 통과 ${v5.passed} · 실패 ${v5.failed.length ? v5.failed.join(',') : '(없음)'} · 실행 실패 ${v5.failedRuns} · masking-leak ${v5.maskingLeaks.length} ${v5.maskingLeaks.length ? v5.maskingLeaks.join(',') : '(없음)'} · pattern-mismatch ${v5.patternMismatches.length ? v5.patternMismatches.join(',') : '(없음)'} · 판정 ${v5.verdict}`);
     if (!v5.thresholdsMet) {
       throw new Error(

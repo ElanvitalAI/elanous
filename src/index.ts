@@ -4748,6 +4748,20 @@ selfCmd
   .option('--shard-position <n>', 'GATE-REMOTE-SHARD-PLAN — 조각 위치(1부터 정수). 원격 명령줄에 그대로 실린다')
   .option('--shard-plan <path>', 'GATE-REMOTE-SHARD-PLAN — 조각 계획 파일 경로. 주면 원격 명령줄에 --shard-plan 으로 실린다')
   .action(async (opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean; shardConcurrency?: string; fixedShardDistribution?: boolean; includeImporters?: boolean; inherit?: boolean; remote?: string | boolean; local?: boolean; artifactDir?: string; orchestrationId?: string; shardId?: string; shardPosition?: string; shardPlan?: string }) => {
+    const { observeSelfGateTrainMarker, refuseSeatSelfGateWithoutTrainMarker, writeSeatSelfGateRefusalArtifact } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
+    const trainMarker = observeSelfGateTrainMarker();
+    if (process.env.ELANOUS_TRACK) {
+      const seatRefusal = refuseSeatSelfGateWithoutTrainMarker(trainMarker);
+      if (seatRefusal) {
+        if (opts.artifactDir !== undefined) {
+          try { writeSeatSelfGateRefusalArtifact(process.cwd(), opts.artifactDir, trainMarker); }
+          catch (error) { ui.error(`self gate artifact: ${error instanceof Error ? error.message : String(error)}`); }
+        }
+        ui.error(seatRefusal.message);
+        process.exitCode = 2;
+        return;
+      }
+    }
     if (!opts.changed && opts.shards === undefined) { ui.error('self gate requires --changed or --shards'); process.exitCode = 2; return; }
     if (opts.fixedShardDistribution && opts.shards === undefined) { ui.error('self gate: --fixed-shard-distribution requires --shards <n>'); process.exitCode = 2; return; }
     if (opts.shardConcurrency !== undefined && (!/^[1-4]$/.test(opts.shardConcurrency))) { ui.error('self gate: --shard-concurrency must be 1–4'); process.exitCode = 2; return; }
@@ -4770,7 +4784,7 @@ selfCmd
       ranLocal = true;
       try {
         const { runSelfGateCliAsync } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
-        const result = await runSelfGateCliAsync(process.cwd(), { base: opts.base, pr: opts.pr, shards, ...(opts.shardConcurrency !== undefined ? { shardConcurrency: Number(opts.shardConcurrency) } : {}), ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), includeImporterTests: !!opts.includeImporters, noInherit: opts.inherit === false, ...(opts.artifactDir !== undefined ? { artifactDir: opts.artifactDir } : {}) });
+        const result = await runSelfGateCliAsync(process.cwd(), { base: opts.base, pr: opts.pr, shards, ...(opts.shardConcurrency !== undefined ? { shardConcurrency: Number(opts.shardConcurrency) } : {}), ...(opts.fixedShardDistribution ? { fixedShardDistribution: true } : {}), includeImporterTests: !!opts.includeImporters, noInherit: opts.inherit === false, trainGate: trainMarker.received, ...(opts.artifactDir !== undefined ? { artifactDir: opts.artifactDir } : {}) });
         console.log(result.lines.join('\n'));
         return result.exitCode;
       } catch (error) {
@@ -4854,6 +4868,8 @@ selfCmd
       const fetched = remoteArtifacts && 'dir' in remoteArtifacts ? remoteArtifacts.fetch : undefined;
       try {
         if (fetched?.ok) {
+          const { recordGateTrainMarker } = await import('./self-implement/gate-artifacts.js');
+          recordGateTrainMarker(fetched.summaryPath, trainMarker.received);
           console.log(`artifacts: ${fetched.summaryPath} (junit ${fetched.junitFiles.length} · fetched from remote)`);
           if (fetched.remoteDirKept) console.log(`⚠ artifacts: 원격 산출 디렉토리를 못 지웠다 — ${(remoteArtifacts as { dir: string }).dir} (판정은 그대로다)`);
         }
@@ -4861,7 +4877,7 @@ selfCmd
           const reason = remoteArtifacts && 'unsupported' in remoteArtifacts ? 'remote-unsupported' as const : 'remote-fetch-failed' as const;
           if (reason === 'remote-fetch-failed') console.log(`⚠ artifacts: 원격 산출을 못 가져왔다 — ${fetched && !fetched.ok ? fetched.reason : 'no remote fetch ran'} (판정은 그대로다)`);
           const { writeRemoteUnavailableGateArtifacts } = await import('./self-implement/gate-artifacts.js');
-          const written = writeRemoteUnavailableGateArtifacts(opts.artifactDir, process.cwd(), opts.base, Number(process.exitCode ?? 0), reason);
+          const written = writeRemoteUnavailableGateArtifacts(opts.artifactDir, process.cwd(), opts.base, Number(process.exitCode ?? 0), reason, undefined, undefined, trainMarker.received);
           console.log(`artifacts: ${written.summaryPath} (junit 0 · unavailable=${reason})`);
         }
       } catch (error) {

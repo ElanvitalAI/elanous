@@ -20,6 +20,7 @@ import { resolveObserveOnlyDecision } from './observe-only.js';
 import { getUserConfig } from '../user-config.js';
 import { resolveAutoReview } from './context-capsule.js';
 import { readDecomposeProposals } from '../self-dev/decompose-proposal.js';
+import { tracedPathReferences } from './goal-author.js';
 
 /** self implement CLI 옵션(commander) — `--no-draft` 는 draft:false 로, `--max-wait` 는 문자열로 도착. */
 export interface SelfImplementCliOpts {
@@ -65,6 +66,12 @@ export interface SelfImplementCliDeps {
   resolveWantAutoReview?: (flag: boolean) => boolean | Promise<boolean>;
   /** reroute 실행(테스트 주입). 기본 executeSelfImplementReroute. */
   executeReroute?: typeof executeSelfImplementReroute;
+  /** Capability seam: false disables reason-repair reruns; omitted means available because this CLI has a production rerouter. */
+  reasonRepairExecutionAvailable?: boolean;
+  /** Supervisor side-effect seams for focused runtime tests. */
+  taskAgentShadow?: false;
+  taskAgentRejudge?: false;
+  sweepPendingMerges?: typeof import('./frozen-merges.js').sweepFrozenMerges;
   /** ⭐ 산출물의 «눈» 심(테스트 주입). 기본은 실제 브라우저 검증(`observeDeliverables`).
    *  ⛔ 심이 «없으면» 이 배선을 시험으로 재현할 수 없고, 그러면 「손으로 돌려 봤다」만 남는다
    *  — 그것은 「그때 됐다」이지 「앞으로도 된다」가 아니다(리뷰 #10556 must-fix). */
@@ -124,11 +131,25 @@ export interface SingleRunSuperviseOptions {
 type SelfImplementResultWithProposalMetadata = SelfImplementResult
   & Pick<SelfDevJobResult, 'decomposeProposal' | 'goalPlanRevision'>;
 
-export function singleRunAsJobResult(feature: string, r: SelfImplementResultWithProposalMetadata): SupervisorJobResult {
+/**
+ * NEEDS-HUMAN-REASON-REPAIR — 실행 범위 가드가 «대상 밖»으로 잰 변경을 감독 판정 재료로 옮긴다.
+ * ⛔ 가드가 잰 이름만 쓴다 — 결과에 없으면 빈 배열이고, 「없다」를 지어내지 않는다.
+ */
+function measuredOutsideTargetFiles(r: SelfImplementResult): string[] {
+  return [...new Set([
+    ...(r.outOfScopeEdits ?? []),
+    ...(r.scopeExpansion?.files.map((file) => file.path) ?? []),
+  ])];
+}
+
+export function singleRunAsJobResult(feature: string, r: SelfImplementResultWithProposalMetadata, includeDeclaredTargets = false): SupervisorJobResult {
+  const outsideTargetFiles = measuredOutsideTargetFiles(r);
+  const targetPaths = includeDeclaredTargets ? tracedPathReferences(feature).map(({ path }) => path) : [];
   return {
     taskId: r.runId,
     runId: r.runId,
     feature,
+    ...(targetPaths.length ? { targetPaths } : {}),
     status: r.ok ? 'done' : 'failed',
     stage: r.stage,
     ...(!r.ok && r.detail ? { error: { message: r.detail } } : {}),
@@ -145,6 +166,7 @@ export function singleRunAsJobResult(feature: string, r: SelfImplementResultWith
     ...(r.abandonedClassification?.classification
       ? { failureClassification: r.abandonedClassification.classification } : {}),
     ...(r.decomposeProposal ? { decomposeProposal: r.decomposeProposal } : {}),
+    ...(outsideTargetFiles.length > 0 ? { outsideTargetFiles } : {}),
     ...(r.rework ? { rework: r.rework } : {}),
     ...(r.review?.reviewed && r.review.mustFix?.length ? { reviewMustFix: r.review.mustFix } : {}),
     ...(r.goalPlanRevision ? { goalPlanRevision: r.goalPlanRevision } : {}),
@@ -268,10 +290,20 @@ export async function runSelfImplementCliCommand(
           }
         : undefined;
 
-      const initialJob = singleRunAsJobResult(feature, result);
+      const reasonRepairEnabled = getUserConfig().tools.selfImplement.supervisor?.reasonRepair === true
+        && (deps.reasonRepairExecutionAvailable ?? true);
+      const initialJob = singleRunAsJobResult(feature, result, reasonRepairEnabled);
+      // NEEDS-HUMAN-REASON-REPAIR — 사유별 수복 골을 «실행하는» 경로인가.
+      //   ⛔ 아래 rerun 이 invocation.repairGoals[taskId] 를 spec.input.text 로 그대로 실행하므로 «그렇다».
+      //   ⇒ 그래서 이 감독 경로는 사유별 수복(needs-human 전 1회)을 연다.
+      const repairGoalExecution = true;
       await superviseRun({
         initial: [initialJob],
-        repairGoalExecution: true,
+        ...(deps.taskAgentShadow === false ? { taskAgentShadow: false } : {}),
+        ...(deps.taskAgentRejudge === false ? { taskAgentRejudge: false } : {}),
+        ...(deps.sweepPendingMerges ? { sweepPendingMerges: deps.sweepPendingMerges } : {}),
+        repairGoalExecution,
+        needsHumanReasonRepairExecution: reasonRepairEnabled,
         limits,
         ...(deliverableEye ? { observeDeliverables: deliverableEye } : {}),
         ...(opts.supervise.onDecision ? { onDecision: opts.supervise.onDecision } : {}),
@@ -285,7 +317,7 @@ export async function runSelfImplementCliCommand(
           const next = await exec(repairGoal ? { ...spec, input: { ...spec.input, text: repairGoal } } : spec, pipelineDeps ? { pipelineDeps } : undefined);
           result = attachGoalPlanRevisionObservation(next.result, deps);
           exitCode = next.exitCode;
-          return [{ ...singleRunAsJobResult(feature, result), taskId: initialJob.taskId }];
+          return [{ ...singleRunAsJobResult(feature, result, reasonRepairEnabled), taskId: initialJob.taskId }];
         },
       });
     }

@@ -25,8 +25,7 @@ import { inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisio
 import type { EvidenceMode } from '../agent-mission/driver.js';
 import type { PreparedDevWorktree } from '../harness/harness-worktree-auto.js';
 import type { ChildLlmEffort, ChildLlmSelection } from '../agent/run-context.js';
-import { reasoningEffortCeiling } from '../intelligence-map/model-catalog.js';
-import type { ReasoningEffortCeiling } from '../intelligence-map/model-catalog.js';
+import { reasoningEffortCeiling, childLlmEffortProblem, type ReasoningEffortCeiling } from '../intelligence-map/model-catalog.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { LLM_TIER_MAP_BY_PROVIDER } from '../model-tier/llm-tier-map.js';
 import { MODEL_TIERS } from '../model-tier/types.js';
@@ -225,6 +224,10 @@ export interface DevSelfRunSuperviseOptions {
   queryTerminalRunStatuses?: (runIds: readonly string[], timeoutMs: number) => Readonly<Record<string, string>> | undefined;
   nowMs?: () => number;
   printDecision?: (line: string) => void;
+  /** Test-only supervisor side-effect seams. */
+  taskAgentShadow?: false;
+  taskAgentRejudge?: false;
+  sweepPendingMerges?: typeof import('../self-implement/frozen-merges.js').sweepFrozenMerges;
 }
 
 export interface DevSelfRunExecution {
@@ -1047,8 +1050,11 @@ export async function executeDevSelfRun(
     executedRounds = 1;
     if (!supervise) return { result };
 
-    const asSupervisorJobResult = (currentFeature: string, current: SelfImplementResult) => singleRunAsJobResult(currentFeature, current);
-    const initialJob = singleRunAsJobResult(feature, result);
+    const reasonRepairEnabled = getUserConfig().tools.selfImplement.supervisor?.reasonRepair === true
+      && supervise.executePiece !== undefined;
+    const asSupervisorJobResult = (currentFeature: string, current: SelfImplementResult) =>
+      singleRunAsJobResult(currentFeature, current, reasonRepairEnabled);
+    const initialJob = singleRunAsJobResult(feature, result, reasonRepairEnabled);
     const wiring = supervise.deliverableDocument === undefined
       ? undefined
       : buildDeliverableTargets(supervise.deliverableDocument, ['single'], 'all', '127.0.0.1');
@@ -1113,11 +1119,15 @@ export async function executeDevSelfRun(
     }
     await superviseRun({
       initial: [initialJob],
+      ...(supervise.taskAgentShadow === false ? { taskAgentShadow: false } : {}),
+      ...(supervise.taskAgentRejudge === false ? { taskAgentRejudge: false } : {}),
+      ...(supervise.sweepPendingMerges ? { sweepPendingMerges: supervise.sweepPendingMerges } : {}),
       // Pod worktree paths are not necessarily mounted in this parent process.
       knowhowRepo: process.cwd(),
       // A review-oscillation repair goal runs through the existing piece executor (fragment re-execution with the
       // authored goal as its feature). Without that executor the rerun could only replay the same goal — declare false.
       repairGoalExecution: supervise.executePiece !== undefined,
+      needsHumanReasonRepairExecution: reasonRepairEnabled,
       enrich: (results) => hydrateDevGoalCauseObserved(
         hydrateDevDecomposeProposals(results, supervise.readProposals ?? readDecomposeProposals),
       ),
@@ -1578,7 +1588,7 @@ export function __resetStaleOpenRouterSnapshotWarningForTests(): void {
   staleOpenRouterSnapshotWarned = false;
 }
 
-export const CHILD_LLM_EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export { CHILD_LLM_EFFORT_LADDER } from '../intelligence-map/model-catalog.js';
 
 export function childLlmEffortCeiling(_provider: string, model: string): ReasoningEffortCeiling {
   return reasoningEffortCeiling(resolveModelAlias(model.trim()) ?? model.trim());
@@ -1588,20 +1598,10 @@ export function resolveChildLlmEffort(
   provider: string, model: string, entered: string,
 ): { effort: ChildLlmEffort; ceiling: ReasoningEffortCeiling } {
   const value = entered.trim().toLowerCase();
-  const ladder: readonly string[] = CHILD_LLM_EFFORT_LADDER;
-  if (!ladder.includes(value)) {
-    throw new DevPipelineError(`--child-llm-effort 알 수 없음: ${entered} · 후보: ${CHILD_LLM_EFFORT_LADDER.join(', ')}`);
-  }
+  const problem = childLlmEffortProblem(model, entered);
+  if (problem) throw new DevPipelineError(problem);
   const effort = value as ChildLlmEffort;
   const ceiling = childLlmEffortCeiling(provider, model);
-  if (ceiling === 'none') {
-    throw new DevPipelineError(`--child-llm-effort 거부: ${model} 은 추론 노력을 «안 받는다»(ceiling=none)`);
-  }
-  if (ladder.indexOf(effort) > ladder.indexOf(ceiling)) {
-    throw new DevPipelineError(
-      `--child-llm-effort 거부: ${effort} 가 ${model} 의 상한(${ceiling})을 넘는다`,
-    );
-  }
   return { effort, ceiling };
 }
 

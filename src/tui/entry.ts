@@ -346,9 +346,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const sidetabLines = sidetabOpen
       ? sidetabApi!.formatSidetabLines(sidetabRows, sidetabSelected, sidetabWidth, Math.max(1, rows - 1), sidetabMode)
       : [];
-    const screenLines = sidetabOpen
-      ? lines.map((line, index) => `${sidetabLines[index] ?? ' '.repeat(sidetabWidth)}│${line}`)
-      : lines;
+    const screenLineCount = sidetabOpen ? Math.max(lines.length, sidetabLines.length) : lines.length;
+    const screenLines = Array.from({ length: screenLineCount }, (_, index) => {
+      const line = lines[index] ?? '';
+      return sidetabOpen ? `${sidetabLines[index] ?? ' '.repeat(sidetabWidth)}│${line}` : line;
+    });
     process.stdout.write(`\x1b[H\x1b[2J${screenLines.join('\n')}\x1b[${promptRow};${prompt.cursorCol + (sidetabOpen ? sidetabWidth + 1 : 0)}H\x1b[?25h`);
     if (sidetabAttachments?.hasModal() && !paintingCoordinatorFrame) sidetabAttachments.refresh();
   };
@@ -1258,10 +1260,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         if (submitted === '/help' || submitted === '/help next') {
           activity.push(
+            'Commands',
             'Next TUI: /side · /sidetab — 세션/PTY 목록',
             '사이드탭: Ctrl+\\ 토글 · ↑↓ 선택 · 빈 prompt Enter=attach · /side new · /side kill',
             '새 PTY: s shell · e elanous · c codex 구독 · l claude code 구독',
             'PTY 분리: Ctrl+\\ 후 d · /term help 는 읽기 전용 목록 명령',
+            '',
+            'Keys',
+            'Enter 전송 · Esc 취소 · PgUp/PgDn 대화 스크롤 · Ctrl+Q 종료',
+            'Ctrl+\\ 사이드탭 토글 · ↑/↓ 목록 이동 · Esc 입력으로 돌아오기',
           );
           status = 'Enter 전송';
           render();

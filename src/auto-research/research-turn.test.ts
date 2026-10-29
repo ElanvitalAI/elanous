@@ -1,5 +1,10 @@
 import { expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setElanousConfigDir } from '../elanous-config-dir.js';
+import { BLOOM_2D_SCOPED } from '../knowledge/kgs/types.js';
+import { BLOOM_EXEMPLAR_DOMAINS } from '../research/bloom-exemplars.js';
 import type { ResearchQuestionLadderRunOptions } from './research-turn.js';
 import type { ResearchOutputRouteDecision } from '../research/output-router.js';
 
@@ -40,6 +45,9 @@ test('a research turn sends all six Bloom axes to native search and attaches sou
     routeOutput: noOutputSkillRoute,
     generate: async (prompt) => {
       expect(prompt).toContain('Why are bond yields rising?');
+      expect(prompt).toContain('Bloom exemplar examples');
+      expect(prompt).toContain('L4 analyze/conceptual');
+      expect(prompt).toContain('L5 evaluate/metacognitive');
       expect(prompt).toContain('Working Backwards output contract');
       expect(prompt).toContain('Assign every question to exactly one output section using sectionId');
       expect(prompt).toContain('[causes] Causes: Explain the main supported causes.');
@@ -67,6 +75,48 @@ test('a research turn sends all six Bloom axes to native search and attaches sou
   expect(result.outputContract).toEqual(outputContract);
   expect(result.output).toContain('## Output contract');
   expect(result.output).toContain('Evidence');
+});
+
+test('a configured complete pro bank injects finance Bloom 4/5 examples into a bond-rate ladder prompt', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'research-turn-bloom-pack-'));
+  const packPath = join(directory, 'bloom-exemplars.json');
+  const exemplars = BLOOM_EXEMPLAR_DOMAINS.flatMap((domain) => [1, 2, 3, 4, 5, 6].flatMap((level) => {
+    const cognitive = ['remember', 'understand', 'apply', 'analyze', 'evaluate', 'create'][level - 1];
+    const bloom = BLOOM_2D_SCOPED.find(cell => cell.cognitive === cognitive)!;
+    return Array.from({ length: 5 }, (_, index) => ({
+      domain, level, bloom,
+      question: domain === 'finance' && level === 4
+        ? `Pro finance analysis exemplar ${index + 1}`
+        : domain === 'finance' && level === 5
+          ? `Pro finance evaluation exemplar ${index + 1}`
+          : `Fixture ${domain} level ${level} example ${index + 1}`,
+    }));
+  }));
+  writeFileSync(packPath, JSON.stringify({ version: 1, exemplars }));
+  try {
+    const result = await runResearchQuestionLadder('bond yields', {
+      generateContract,
+      routeOutput: noOutputSkillRoute,
+      bloomExemplarPackPath: packPath,
+      generate: async (prompt) => {
+        expect(prompt).toContain('Pro finance analysis exemplar 1');
+        expect(prompt).toContain('Pro finance evaluation exemplar 1');
+        expect(prompt).toContain('L4 analyze/conceptual');
+        expect(prompt).toContain('L5 evaluate/metacognitive');
+        return JSON.stringify({ questions });
+      },
+      invokeAxes: async (axes) => ({
+        plan: [],
+        axes: axes.map(axis => ({ questionId: axis.id, evidence: [{
+          questionId: axis.id, sourceKind: 'test', source: 'fixture://evidence', content: 'evidence',
+          outcome: 'complete' as const, truncated: false,
+        }] })),
+      }),
+    });
+    expect(result.ok).toBe(true);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('routes the synthesized evidence through the selected output skill and preserves axis evidence', async () => {

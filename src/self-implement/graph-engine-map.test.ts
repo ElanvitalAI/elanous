@@ -6,6 +6,7 @@ import { parse } from 'yaml';
 const repoRoot = resolve(import.meta.dir, '../..');
 const mapText = readFileSync(join(repoRoot, 'seat-state/OPC/MAP-orchestrator-to-graph-1027.md'), 'utf8');
 const sourceLines = readFileSync(join(repoRoot, 'src/self-implement/orchestrator.ts'), 'utf8').split('\n');
+const graphLines = readFileSync(join(repoRoot, 'graphs/implement-loop.yaml'), 'utf8').split('\n');
 const graph = parse(readFileSync(join(repoRoot, 'graphs/implement-loop.yaml'), 'utf8')) as {
   nodes: Array<{ node_id: string }>;
   edges: Array<{ from: string; to?: string; map?: Record<string, string> }>;
@@ -95,5 +96,47 @@ describe('GRAPH-ENGINE-MAP', () => {
     expect(mapText).toContain('## 레고 부품 후보 — graphs/units 등록 계약 초안');
     const unitRows = mapText.split('\n').filter((line) => line.startsWith('| unit:') || line.startsWith('| unit-'));
     expect(unitRows.length).toBeGreaterThanOrEqual(8);
+  });
+
+  test('방문 예산 보조 인용이 현재 observeNodeEntry 구현을 덮는다', () => {
+    const observerLine = sourceLine(/^\s*const observeNodeEntry\s*=/, 'observeNodeEntry');
+    const budgetCitation = mapText.split('\n').find((line) => line.startsWith('- 예산 보조:')) ?? '';
+    expect(budgetCitation).toContain('observeNodeEntry');
+    expect(budgetCitation).not.toContain('recordNodeVisit');
+    expect(rangeContains(budgetCitation, observerLine)).toBe(true);
+  });
+
+  test('주요 실행 단계 인용이 현재 orchestrator 경계들을 덮는다', () => {
+    const currentMarkers: Array<[string, RegExp, string]> = [
+      ['dispatch', /^async function runSelfImplementInner\(/, 'runSelfImplementInner entry'],
+      ['plan', /^\s*const goalSource = opts\.naturalLanguageDispatch/, 'plan preparation boundary'],
+      ['decompose', /^\s*if \(opts\.goalFile && resolvedGoalFile\)/, 'goal clarification boundary'],
+      ['implement', /progress\('implementing',/, 'implement progress'],
+      ['gate', /onNodeEntry\(node\('gate'\)/, 'gate node entry'],
+      ['review', /onNodeEntry\(node\('review'\)/, 'review node entry'],
+      ['result-parse', /^\s*const preserveBlockedArtifacts = async/, 'failure preservation'],
+      ['salvage', /^\s*const salvageHardCap = async/, 'hard-cap salvage'],
+      ['re-ground', /^function goalContentHash\(/, 'goal content hash'],
+      ['main-sync', /progress\('gating', `최신/, 'main-sync progress'],
+      ['regate', /const regate = await/, 'post-sync gate'],
+      ['open-pr', /^\s*progress\('pr-opening', 'PR 생성…'\);/, 'PR opening'],
+      ['freeze-check', /const landing = admitLandingMerge\(/, 'landing freeze admission'],
+      ['hold', /const detail = landing\.kind === 'held'/, 'held landing result'],
+      ['merge', /progress\('merged', formatAutoMergeSuccessMessage/, 'merged result'],
+      ['cleanup', /withJourneyNode\('cleanup'/, 'post-merge cleanup'],
+    ];
+    for (const [nodeId, pattern, label] of currentMarkers) {
+      const line = sourceLine(pattern, label);
+      expect(rangeContains(mapRows.get(nodeId)![2]!, line), `${nodeId} range covers ${label} at ${line}`).toBe(true);
+    }
+  });
+
+  test('non-executable candidate nodes cite their YAML declarations, not stale orchestrator lines', () => {
+    for (const nodeId of ['ready', 'pr-head-checkout']) {
+      const line = graphLines.findIndex((source) => new RegExp(`^\\s*- node_id: ${nodeId}$`).test(source)) + 1;
+      expect(line, `${nodeId} declaration exists`).toBeGreaterThan(0);
+      expect(mapRows.get(nodeId)![2]).toContain(`graphs/implement-loop.yaml:${line}`);
+      expect(mapRows.get(nodeId)![2]).not.toContain('orchestrator.ts:');
+    }
   });
 });

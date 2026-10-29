@@ -27,9 +27,9 @@ describe('planRerun (순수)', () => {
     expect(p.model).toBe('gpt-5.6-terra');
   });
 
-  it('저장 모델도 opts 도 없으면 codex 사다리 balanced 기본(GPT-6 에 terra 없음)', () => {
+  it('저장 모델도 opts 도 없으면 codex 사다리 balanced 기본을 쓴다', () => {
     expect(planRerun({ prompt: 'P' }).model).toBe(lookupLlmTierSpec('openai-codex', 'balanced').model);
-    expect(planRerun({ prompt: 'P' }).model).not.toMatch(/terra|gpt-5\.6/);
+    expect(planRerun({ prompt: 'P' }).model).not.toMatch(/gpt-5\.6/);
   });
 
   it('append 는 프롬프트 끝에 추가 지시 섹션으로 덧붙는다', () => {

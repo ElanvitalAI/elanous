@@ -297,7 +297,7 @@ test('GATE-REUSE-BY-DIFF: a current-graph export-check resume plans the later ga
     const result = await resumeReleaseRun({ runId: 'r', from: 'export-check' }, { root, ledgerRoot: root, git,
       isAncestor: () => true, closureTree: () => ({ files: ['src/a.test.ts'], read: () => '', preload: [] }),
       graph: (async () => ({ status: 'done', runId: 'r' })) as never });
-    expect(result.partial).toEqual({ requested: true, applied: true, files: 0, priorCommit: old, auto: true });
+    expect(result.partial).toEqual({ requested: true, applied: true, files: 0, plannedFiles: [], priorCommit: old, auto: true });
     expect(JSON.parse(readFileSync(join(releaseDir, 'gate-partial.json'), 'utf8'))).toMatchObject({ kind: 'carry', forCommit: tip, files: [] });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -609,7 +609,7 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
     write();
     const applied = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
     expect(paths).toEqual(['/elsewhere/wt-release/graphs/release/release-loop.yaml']);
-    expect(applied.partial).toEqual({ requested: true, applied: true, files: 2, priorCommit: old });
+    expect(applied.partial).toEqual({ requested: true, applied: true, files: 2, plannedFiles: ['scripts/audit.test.ts', 'src/x.test.ts'], priorCommit: old });
     expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8'))).toMatchObject({ forCommit: tip, files: ['scripts/audit.test.ts', 'src/x.test.ts'] });
     // A code change: the tests reaching it join the plan (GATE-REUSE-BY-DIFF); src/other.test.ts is reused.
     const previousTip = tip;
@@ -618,7 +618,8 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
     writeFileSync(join(ledger, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: previousTip, failures: ['src/x.test.ts > slow'] }));
     changed = 'scripts/audit.test.ts\nsrc/release-loop/gate.ts\n';
     const reached = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: true }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
-    expect(reached.partial).toEqual({ requested: true, applied: true, files: 3, priorCommit: previousTip, closure: { reached: 2, opaque: 0 } });
+    expect(reached.partial).toEqual({ requested: true, applied: true, files: 3,
+      plannedFiles: ['scripts/audit.test.ts', 'src/release-loop/gate.test.ts', 'src/x.test.ts'], priorCommit: previousTip, closure: { reached: 2, opaque: 0 } });
     expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8'))).toMatchObject({
       forCommit: tip, priorCommit: previousTip, files: ['scripts/audit.test.ts', 'src/release-loop/gate.test.ts', 'src/x.test.ts'],
     });
@@ -658,7 +659,8 @@ test('GATE-PARTIAL resume: the graph is resumed at the run’s own saved path; -
     write();
     changed = 'src/release-loop/gate.ts\n';
     const auto = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });
-    expect(auto.partial).toEqual({ requested: true, applied: true, files: 2, priorCommit: old, auto: true, closure: { reached: 1, opaque: 0 } });
+    expect(auto.partial).toEqual({ requested: true, applied: true, files: 2,
+      plannedFiles: ['src/release-loop/gate.test.ts', 'src/x.test.ts'], priorCommit: old, auto: true, closure: { reached: 1, opaque: 0 } });
     expect(JSON.parse(readFileSync(join(root, 'release', '0.2.18', 'gate-partial.json'), 'utf8')).files).toEqual(['src/release-loop/gate.test.ts', 'src/x.test.ts']);
     write();
     const optOut = await resumeReleaseRun({ runId: 'r', from: 'gate', partial: false }, { root, ledgerRoot: ledger, git, isAncestor: () => true, graph, now, closureTree });

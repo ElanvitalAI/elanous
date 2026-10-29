@@ -4,9 +4,28 @@ export interface FailureDiff {
   common: string[];
 }
 
+/** One failure identity may be printed more than once when a host retries or concatenates a test run. */
+export function collapseGateFailureAttempts(ids: readonly string[]): { failures: string[]; observed: number; collapsed: number } {
+  const failures = [...new Set(ids)].sort();
+  return { failures, observed: ids.length, collapsed: ids.length - failures.length };
+}
+
+export class GateFailureAttributionMismatch extends Error {
+  constructor(readonly label: string, readonly summary: number, readonly observed: number,
+    readonly identified: number, readonly collapsed: number, readonly failures: readonly string[]) {
+    super(`${label} incomplete (failure attribution mismatch: summary=${summary}, observed=${observed}, identified=${identified})`);
+    this.name = 'GateFailureAttributionMismatch';
+  }
+}
+
 /** Bun's file header followed by `(fail) name` lines is the identity source. */
 export function parseFailures(output: string): string[] {
-  const failures = new Set<string>();
+  return [...new Set(parseFailureAttempts(output))].sort();
+}
+
+/** Raw reporter rows, retaining repeated identities so gate attribution can distinguish retries from missing names. */
+export function parseFailureAttempts(output: string): string[] {
+  const failures: string[] = [];
   let file: string | undefined;
   for (const raw of output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split(/\r?\n/)) {
     const line = raw.trim();
@@ -14,9 +33,9 @@ export function parseFailures(output: string): string[] {
     if (header) { file = header[1]; continue; }
     // Line-start only: a title/body `(fail)` is not a reporter row. Trailing CR is still a real Bun fail row.
     const failed = /^\(fail\)[ \t]+(.+?)(?:[ \t]+\[[\d.]+(?:ms|s)\])?[ \t]*\r?$/.exec(raw);
-    if (failed && file) failures.add(`${file} > ${failed[1]!.trim()}`);
+    if (failed && file) failures.push(`${file} > ${failed[1]!.trim()}`);
   }
-  return [...failures].sort();
+  return failures;
 }
 
 /** GATE-INTRO-RECHECK (0.2.19) — the failures that are bun's «timed out» shape: a `(fail) name` line whose next line is

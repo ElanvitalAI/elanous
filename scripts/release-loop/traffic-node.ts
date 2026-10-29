@@ -42,7 +42,10 @@ export async function runTrafficNode(node = process.argv[2], env: NodeJS.Process
       return finishNode(node!, version, { outcome: 'fail', verdict: 'fail', summary });
     }
     const result = await applyReleaseTrafficEvent(context, event, options);
-    if (!result.applied) {
+    // Replaying the terminal restore after this run already restored its pre-cut traffic is a successful no-op.
+    const alreadyRestored = event === 'failed' && result.reason === 'already-restored';
+    const applied = result.applied || alreadyRestored;
+    if (!applied) {
       const consequence = event === 'failed' && result.reason === 'published-keeps-full'
         ? 'npm 발행은 완료됐으므로 전체 트래픽을 유지합니다. 후속 발행 단계 실패를 확인하세요.'
         : event === 'verify-complete' || event === 'npm-published'
@@ -52,8 +55,8 @@ export async function runTrafficNode(node = process.argv[2], env: NodeJS.Process
               : 'gate는 성공했으나 트래픽 감속이 적용되지 않았습니다.';
       (deps.report ?? reportFailure)(`RELEASE-POSTPUB-TRAFFIC ${version} ${runId || 'unknown'} ${node} 무시 — ${result.reason ?? 'traffic state unchanged'}. ${consequence}`);
     }
-    return finishNode(node!, version, { outcome: result.applied ? 'ok' : 'fail', verdict: result.applied ? 'pass' : 'fail',
-      summary: `${event} ${result.applied ? 'applied' : result.reason ?? 'ignored'}` });
+    return finishNode(node!, version, { outcome: applied ? 'ok' : 'fail', verdict: applied ? 'pass' : 'fail',
+      summary: `${event} ${alreadyRestored ? 'already-restored' : applied ? 'applied' : result.reason ?? 'ignored'}` });
   } catch (error) {
     const detail = errorResult(error).summary;
     const isLockTimeout = detail.startsWith('traffic lock timeout:');

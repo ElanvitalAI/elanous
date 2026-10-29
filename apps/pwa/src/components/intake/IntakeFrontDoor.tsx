@@ -187,6 +187,7 @@ export function IntakeFrontDoor({
     .filter((row) => row.track === 'absorb')
     .flatMap((row) => row.ids ?? []))], [recent]);
   const absorbIdsRef = useRef(absorbIdsToCheck);
+  // State shows the latest submission; this ref tracks every recent id with an active poll.
   absorbIdsRef.current = absorbIdsToCheck;
   const pollAbsorbRef = useRef<(id: string) => void>(() => {});
   const [route, setRoute] = useState<IntakeRouteDecision | null>(null);
@@ -260,9 +261,13 @@ export function IntakeFrontDoor({
     setError(null);
     setAbsorbIds(null);
     try {
-      const result = await runIntakeAction(client, 'absorb', value);
-      setAbsorbIds(result.absorbIds ?? []);
-      record({ track: 'absorb', preview: result.recentPreview, ids: result.absorbIds });
+      const submitted = await runIntakeAction(client, 'absorb', value);
+      const ids = submitted.absorbIds ?? [];
+      // Include these immediately; the recent-list render updates the ref from its full history next.
+      absorbIdsRef.current = [...new Set([...ids, ...absorbIdsRef.current])];
+      setAbsorbIds(ids);
+      record({ track: 'absorb', preview: submitted.recentPreview, ids });
+      ids.forEach(pollAbsorbRef.current);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -516,7 +521,14 @@ export function IntakeFrontDoor({
                   const summary = Object.hasOwn(absorbStatuses, id)
                     ? summarizeAbsorbStatus(absorbStatuses[id] ?? null)
                     : null;
-                  return <span key={id} data-testid="intake-absorb-status"> · 흡수: {summary?.label ?? '조회 중'}{summary?.noteRef ? ` · ${summary.noteRef}` : ''}</span>;
+                  const wikiPending = absorbStatuses[id]?.status === 'absorbed';
+                  return (
+                    <span key={id} data-testid="intake-absorb-status">
+                      {' · '}흡수: {summary?.label ?? '조회 중'}
+                      {summary?.noteRef ? ` · ${summary.noteRef}` : ''}
+                      {wikiPending ? ' · 위키: 준비 중' : ''}
+                    </span>
+                  );
                 })}
                 {row.cardId ? ` · 카드 ${row.cardId}` : ''}
                 {row.acceptanceId ? ` · ${row.acceptanceId}` : ''}

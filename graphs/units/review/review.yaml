@@ -1,0 +1,20 @@
+graph_id: review
+version: 1
+unit:
+  inputs: [goal, context, feedback, budget, checkpoint]
+  outputs: [verdict, must-fix, evidence]
+  exits: [pass, fail, sync, open]
+entry_node: review
+terminal_nodes: [pass, fail, sync, open]
+nodes:
+  - node_id: review
+    kind: judge
+    recipe: review-stage
+    max_visits: 8
+    contract: { inputs: [goal, context, feedback, budget, checkpoint], tools: read-only, outputs: [verdict, must-fix, evidence] }
+  - { node_id: pass, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: fail, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: sync, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: open, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - { from: review, on: outcome, map: { pass: pass, fail: fail, sync: sync, open: open } }

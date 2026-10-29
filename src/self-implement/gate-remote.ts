@@ -7,7 +7,7 @@ import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import { loadavg } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
-import { gateHostReservationRoot, inspectReleaseGateHost } from '../release-loop/gate-host-reservation.js';
+import { gateHostReservationRoot, inspectReleaseGateHost, readGateHostResourcesForHost, type GateHostResourceReading } from '../release-loop/gate-host-reservation.js';
 import type { GateRemoteConfig } from '../user-config.js';
 
 export type GateRemoteTool = 'self-gate' | 'ci-typecheck-changed' | 'public-export-test-run';
@@ -538,6 +538,8 @@ export interface DispatchDeps {
   now?: () => number;
   /** Test seam for gate.remote events; production defaults to the structured debug log. */
   log?: (event: string, data: Record<string, unknown>) => void;
+  /** Read-only host-resource probe; production reads Pod pool ledgers, tests inject the same measured snapshot. */
+  readHostResources?: (host: string) => GateHostResourceReading;
   write?: { out: (data: string | Uint8Array) => void; err: (data: string | Uint8Array) => void };
 }
 
@@ -595,8 +597,24 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   const reservationRoot = opts.tool === 'self-gate' || opts.tool === 'ci-typecheck-changed'
     ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
   if (reservationRoot) {
+    const resourceStatus = (target: string) => {
+      if (!deps.readHostResources && deps.runner) return null; // fake runners keep tests hermetic unless the producer is explicitly exercised
+      return (deps.readHostResources ?? ((selected) => readGateHostResourcesForHost(selected, env)))(target.split('@').at(-1)!);
+    };
+    const inspect = (target: string) => {
+      const claim = inspectReleaseGateHost(reservationRoot, target);
+      const resources = resourceStatus(target);
+      if (!resources) return claim;
+      if (resources.status === 'unmeasurable') {
+        // Keep a concrete release owner visible even if the independent Pod ledgers cannot be read.
+        if (claim.status === 'reserved') return claim;
+        return { status: 'unknown' as const, reason: `resource probe unmeasurable: ${resources.reason}` };
+      }
+      if (!resources.empty) return { status: 'reserved' as const, reason: `Pod resource pool occupied (${resources.reservations} reservations)` };
+      return claim;
+    };
     const reservationHost = host.split('@').at(-1)!;
-    const first = inspectReleaseGateHost(reservationRoot, reservationHost);
+    const first = inspect(reservationHost);
     if (first.status !== 'free') {
       // A reserved host is never a reason to run this check locally (반증: 예약 상태에서 --local 무거운 시험 금지).
       // Self gate first tries another remote host, then waits bounded for the release, then ends unmeasured with
@@ -609,7 +627,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
         : `observed-at=${observedAt}`;
       const alternates = opts.tool === 'self-gate'
         ? gateReservationAlternateHosts(reservationHost, opts.reservationAltHosts) : [];
-      const alternate = alternates.find((candidate) => inspectReleaseGateHost(reservationRoot, candidate).status === 'free');
+      const alternate = alternates.find((candidate) => inspect(candidate).status === 'free');
       if (alternate) {
         const rerouted = host.includes('@') ? `${host.slice(0, host.lastIndexOf('@'))}@${alternate}` : alternate;
         debug.log('gate.remote', 'host-reserved-reroute', { tool: opts.tool, from: host, to: rerouted, owner, reason: first.reason, reservedAt: first.reservedAt, observedAt });
@@ -619,7 +637,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
         const waitSeconds = opts.tool === 'self-gate' ? opts.reservationWaitSeconds ?? settings.slotWaitSeconds : 0;
         const waitStart = now();
         const deadline = waitStart + Math.max(0, waitSeconds) * 1000;
-        let latest = inspectReleaseGateHost(reservationRoot, reservationHost);
+        let latest = inspect(reservationHost);
         while (waitSeconds > 0 && latest.status !== 'free') {
           const left = deadline - now();
           if (left <= 0) break;
@@ -627,7 +645,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
           const before = now();
           await sleep(Math.min(15_000, left));
           if (now() <= before) break; // a frozen test clock must not spin past the bound
-          latest = inspectReleaseGateHost(reservationRoot, reservationHost);
+          latest = inspect(reservationHost);
         }
         const waitedMs = Math.max(0, now() - waitStart);
         if (latest.status === 'free') {

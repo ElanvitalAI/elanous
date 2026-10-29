@@ -31,10 +31,38 @@ export interface GraphVariantGoalAnalysis {
   readonly targetPathCount: number;
 }
 
+/** 한 런이 읽은 unit 선언의 원문 — 해시 근거를 만들 입력이며 결과에는 실리지 않는다. */
+export interface GraphVariantUnitDeclaration {
+  readonly path: string;
+  readonly content: string;
+}
+
+/** 선택된 unit 선언의 근거 — 경로와 내용 해시만. 본문은 로그·원장에 복제하지 않는다. */
+export interface GraphVariantUnitDeclarationEvidence {
+  readonly path: string;
+  readonly contentHash: string;
+}
+
 /** 최초 graph variant 선택 — id·선택 이유가 런 원장 옆 .graph.yaml 에 함께 저장되고 재조회된다. */
 export interface GraphVariantSelection {
   readonly variantId: string;
   readonly reason: string;
+  /** 선택된 unit 선언의 경로·내용 해시 — 선언이 없으면 키 자체가 없다(기존 두 키 계약 불변). */
+  readonly unitDeclarations?: readonly GraphVariantUnitDeclarationEvidence[];
+}
+
+/** unit 선언 본문의 sha256 — 내용 대신 이 값만 근거에 남긴다(goalContentHash 와 같은 해시-only 예비). */
+export function hashUnitDeclarationContent(content: string): string {
+  return createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
+/** 경로 오름차순·경로당 한 줄로 정렬한 근거 — 선언 순서가 달라도 같은 값을 낸다. */
+function unitDeclarationEvidence(unitDeclarations: readonly GraphVariantUnitDeclaration[]): GraphVariantUnitDeclarationEvidence[] {
+  const byPath = new Map<string, string>();
+  for (const declaration of [...unitDeclarations].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0)) {
+    byPath.set(declaration.path, hashUnitDeclarationContent(declaration.content));
+  }
+  return [...byPath].map(([path, contentHash]) => ({ path, contentHash }));
 }
 
 export type GraphVariantRejection =
@@ -55,14 +83,17 @@ export type GraphVariantResult =
   | { readonly ok: true; readonly overlay: GraphOverlaySpec; readonly template: GraphTemplateSpec; readonly patches: readonly OverlayPatchOp[]; readonly selection?: GraphVariantSelection }
   | { readonly ok: false; readonly rejections: readonly GraphVariantRejection[] };
 
-/** 최초 변형 선택(id·선택 이유)의 결정론적 유도 — 같은 종류·대상 경로 수면 항상 같은 값을 낸다. */
-export function initialGraphVariantSelection(analysis: GraphVariantGoalAnalysis): GraphVariantSelection {
+/** 최초 변형 선택(id·선택 이유 + 선택된 unit 선언의 경로·해시)의 결정론적 유도 — 같은 입력이면 항상 같은 값을 낸다. */
+export function initialGraphVariantSelection(analysis: GraphVariantGoalAnalysis,
+    unitDeclarations: readonly GraphVariantUnitDeclaration[] = []): GraphVariantSelection {
   const variantId = `variant-${analysis.goalType}-${createHash('sha256')
     .update(JSON.stringify({ goalType: analysis.goalType, targetPathCount: analysis.targetPathCount }))
     .digest('hex').slice(0, 12)}`;
+  const evidence = unitDeclarationEvidence(unitDeclarations);
   return {
     variantId,
     reason: `initial graph variant selected from goal type ${analysis.goalType} with ${analysis.targetPathCount} target path${analysis.targetPathCount === 1 ? '' : 's'}`,
+    ...(evidence.length === 0 ? {} : { unitDeclarations: evidence }),
   };
 }
 
@@ -72,8 +103,10 @@ export function createGraphVariant(input: {
   readonly goal: string;
   readonly plan: GraphVariantPlan;
   readonly goalAnalysis?: GraphVariantGoalAnalysis;
+  /** 이 런이 읽은 unit 선언 — 경로·내용 해시만 근거에 실리고 본문은 결과에 남지 않는다. */
+  readonly unitDeclarations?: readonly GraphVariantUnitDeclaration[];
 }): GraphVariantResult {
-  const { template, goal, plan, goalAnalysis } = input;
+  const { template, goal, plan, goalAnalysis, unitDeclarations = [] } = input;
   const known = new Set(template.nodes.map((node) => node.nodeId));
   const rejections: GraphVariantRejection[] = [];
   if (!/^g_[a-z0-9_-]+$/i.test(goal)) rejections.push({ kind: 'invalid-goal' });
@@ -82,7 +115,7 @@ export function createGraphVariant(input: {
     if (!GOAL_TYPES.includes(goalAnalysis.goalType) || !Number.isSafeInteger(goalAnalysis.targetPathCount) || goalAnalysis.targetPathCount < 0) {
       rejections.push({ kind: 'invalid-goal-analysis' });
     } else {
-      selection = initialGraphVariantSelection(goalAnalysis);
+      selection = initialGraphVariantSelection(goalAnalysis, unitDeclarations);
     }
   }
   if (plan.growth) {

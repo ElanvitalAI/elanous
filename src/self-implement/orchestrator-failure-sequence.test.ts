@@ -7,7 +7,7 @@ const noQuota = (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccoun
 
 function providerError(credential = false): void {
   debug.log('llm.router.error', 'streamLLM', {
-    provider: 'openai-codex', message: 'upstream failed', ...(credential ? { authRejected: true } : {}),
+    provider: 'openai-codex', model: 'test-model', message: 'upstream failed', ...(credential ? { authRejected: true } : {}),
   });
 }
 
@@ -109,9 +109,21 @@ describe('failure and verdict sequence wiring', () => {
   });
 
   test('credential rejection after failed gate remains classifiable', async () => {
-    const result = await stoppedRun({ verdict: 'gate', errorAt: 'preservation', credential: true });
+    const observations: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data, options) => {
+      observations.push({ event, data: data as Record<string, unknown> });
+      return originalLog.call(debug, category, event, data, options);
+    }) as typeof debug.log;
+    let result: Awaited<ReturnType<typeof stoppedRun>>;
+    try { result = await stoppedRun({ verdict: 'gate', errorAt: 'preservation', credential: true }); }
+    finally { (debug as { log: typeof debug.log }).log = originalLog; }
     expect(result.abandonedClassification?.classification).toBe('credential-failure');
     expect(result.abandonedClassification?.credentialFailure).toBe(true);
+    const inputs = observations.find((entry) => entry.event === 'failure-classification-inputs')?.data;
+    expect(inputs).toMatchObject({ classification: 'credential-failure', currentCredentialFailure: true,
+      lastCredentialFailure: { provider: 'openai-codex', model: 'test-model', observedAt: expect.any(String) } });
+    expect(Number(inputs?.lastCredentialFailureSeq)).toBeGreaterThan(Number(inputs?.lastFailedGateSeq));
   });
 
   test('provider error after must-fix review remains classifiable', async () => {

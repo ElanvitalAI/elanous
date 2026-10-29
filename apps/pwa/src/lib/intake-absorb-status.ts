@@ -12,11 +12,16 @@ const LABELS: Record<string, string> = {
   deferred: '미룸',
 };
 
-export function summarizeAbsorbStatus(status: AbsorbStatus | null): { label: string; settled: boolean; noteRef: string | null } {
+export function summarizeAbsorbStatus(status: AbsorbStatus | null): {
+  label: string;
+  settled: boolean;
+  noteRef: string | null;
+} {
   if (status === null) return { label: '찾을 수 없음', settled: false, noteRef: null };
+  const outputs = status.outputs ?? [];
   return {
     label: Object.hasOwn(LABELS, status.status) ? LABELS[status.status]! : status.status,
     settled: (ABSORB_SETTLED_STATUSES as readonly string[]).includes(status.status),
-    noteRef: status.outputs?.find((output) => output.kind === 'note')?.ref ?? null,
+    noteRef: outputs.find((output) => output.kind === 'note')?.ref ?? null,
   };
 }

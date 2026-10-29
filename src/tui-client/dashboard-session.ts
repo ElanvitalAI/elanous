@@ -211,6 +211,9 @@ export class DashboardSession {
         ? { resolveMaxToolTurns: opts.resolveMaxToolTurns }
         : {}),
       ...(opts.abortPollMs !== undefined ? { abortPollMs: opts.abortPollMs } : {}),
+      // TUI-TOKEN-GUARD-WIRE — the host history write-back for the request-size cap.
+      ...(opts.compactPersistedHistory ? { compactPersistedHistory: opts.compactPersistedHistory } : {}),
+      ...(opts.requestSizeMaxChars !== undefined ? { requestSizeMaxChars: opts.requestSizeMaxChars } : {}),
     });
 
     const serverPromise = runAcpServer({

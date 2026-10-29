@@ -1,4 +1,6 @@
 import type { Command } from 'commander';
+import { getTestStateRoot } from '../nexus/paths.js';
+import { runReleaseSimRigIfFile } from '../ux-sim/release-sim-rig.js';
 import { runScenarioFile } from '../ux-sim/scenario.js';
 
 export function registerSimCommands(program: Command): void {
@@ -7,7 +9,11 @@ export function registerSimCommands(program: Command): void {
     .description('등록된 UX simulation 시나리오를 test 우주에서 실행한다')
     .action(async (scenarioFile: string) => {
       try {
-        const result = await runScenarioFile(scenarioFile);
+        // Enforce isolation before either runner inspects the supplied path. Otherwise
+        // release-graph dispatch can leak a path-validation error outside test mode.
+        if (!getTestStateRoot()) throw new Error('scenario runner requires --test isolated mode');
+        const releaseResult = await runReleaseSimRigIfFile(scenarioFile);
+        const result = releaseResult ?? await runScenarioFile(scenarioFile);
         console.log(JSON.stringify(result));
         if (!result.pass) process.exitCode = 1;
       } catch (error) {

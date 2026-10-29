@@ -7,10 +7,10 @@ import {
   mintRunId, normalizeRunId, getHarnessRunId, getHarnessRunIdSource, ensureRunId, ensureRunIdentity, pickRunId, perCallRunId, resolveRunIdentity,
   HARNESS_SPACE_ENV, HARNESS_SPACE_ID_ENV, HARNESS_ROLE_ENV, HARNESS_RUN_ID_ENV,
   HARNESS_BOUNDARY_REQUESTS_ENV, HARNESS_BOUNDARY_RESPONSES_ENV,
-  harnessBoundaryRequestsEnv, harnessBoundaryResponsesEnv,
+  harnessBoundaryRequestsEnv, harnessBoundaryResponsesEnv, appendBoundaryResponseLine,
 } from './harness-space.js';
-import { existsSync, rmSync } from 'node:fs';
-import { dirname, relative, resolve } from 'node:path';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
 
@@ -29,6 +29,24 @@ describe('harness boundary response mailbox', () => {
   test('blank execution id fails open without response mailbox env', () => {
     expect(harnessBoundaryResponsesEnv('')).toEqual({});
     expect(harnessBoundaryResponsesEnv('   ')).toEqual({});
+  });
+
+  test('TENANT-BOUNDARY: appendBoundaryResponseLine 은 익명 payload 를 회신 mailbox 경로에 JSONL 로만 남긴다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-boundary-line-'));
+    const responses = join(dir, 'responses.jsonl');
+    const parent = join(dir, 'nested');
+    const env = { [HARNESS_BOUNDARY_RESPONSES_ENV]: join(parent, 'responses.jsonl') };
+    appendBoundaryResponseLine(env, { devProject: 'prj-x', project: { name: 'project-abc' } });
+    appendBoundaryResponseLine(env, { devProject: 'prj-y' });
+    const lines = readFileSync(join(parent, 'responses.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+    expect(lines).toEqual([
+      { devProject: 'prj-x', project: { name: 'project-abc' } },
+      { devProject: 'prj-y' },
+    ]);
+    expect(existsSync(responses)).toBe(false);
+    expect(appendBoundaryResponseLine({}, { anything: 1 })).toBe('');
+    expect(appendBoundaryResponseLine({ [HARNESS_BOUNDARY_RESPONSES_ENV]: '' }, { anything: 1 })).toBe('');
+    rmSync(dir, { recursive: true, force: true });
   });
 
   test.each(['../outside', '/absolute/path', '\\windows\\path', 'nested/../id'])(

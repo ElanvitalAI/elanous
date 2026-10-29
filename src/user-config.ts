@@ -1156,6 +1156,8 @@ export interface HarnessBudgetGateConfig {
 }
 
 export interface SelfImplementToolConfig {
+  /** Explicit opt-in for the needs-human reason-specific automatic repair goal. Defaults off. */
+  supervisor?: { reasonRepair?: boolean };
   /** Absolute root that holds per-repository child worktree directories. */
   worktreeRoot: string;
   /** Self-implement children receive a derived isolated universe by default; `inherit` keeps the parent's universe. */
@@ -1292,7 +1294,7 @@ const TOOLS_DEFAULTS: ToolsConfig = {
   selfOrchestrate: {},
   nativeStructure: { enabled: false },
   // 대표 결정(2026-07-26): 오토 선호 — 기본 ON.
-  selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, goalRecordInDoc: true, fabricDecompose: false, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
+  selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, goalRecordInDoc: true, fabricDecompose: false, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, supervisor: { reasonRepair: false }, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
 };
 
 // ── Debug ────────────────────────────────────────────────────────────
@@ -2649,6 +2651,10 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
   const selfImplRaw = (root.selfImplement && typeof root.selfImplement === 'object' && !Array.isArray(root.selfImplement))
     ? root.selfImplement as Record<string, unknown>
     : {};
+  const supervisorRaw = selfImplRaw.supervisor && typeof selfImplRaw.supervisor === 'object' && !Array.isArray(selfImplRaw.supervisor)
+    ? selfImplRaw.supervisor as Record<string, unknown>
+    : {};
+  const supervisor = { reasonRepair: supervisorRaw.reasonRepair === true };
   const observeOnly = typeof selfImplRaw.observeOnly === 'boolean'
     ? selfImplRaw.observeOnly
     : TOOLS_DEFAULTS.selfImplement.observeOnly;
@@ -2807,7 +2813,7 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     runDevHarness,
     selfOrchestrate,
     nativeStructure,
-    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(escalateChild && Object.keys(escalateChild).length ? { escalateChild } : {}), ...(selfImplRaw.podChildDefault !== undefined ? { podChildDefault: selfImplRaw.podChildDefault } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
+    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, supervisor, draftOnStop, salvageRetention, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}), ...(escalateChild && Object.keys(escalateChild).length ? { escalateChild } : {}), ...(selfImplRaw.podChildDefault !== undefined ? { podChildDefault: selfImplRaw.podChildDefault } : {}), ...(runTtlHours !== undefined ? { runTtlHours } : {}), ...(draftSweepCloseCap !== undefined ? { draftSweepCloseCap } : {}), ...(runTtl ? { runTtl } : {}), ...(autoheal ? { autoheal } : {}) },
   };
 }
 
@@ -6344,11 +6350,11 @@ export const PROVIDER_DEFAULT_MODEL: Record<LLMProviderName, string> = {
   //   ⛔ openai(API 키)는 gpt-4o 그대로 — `gpt-6-*` 는 openai-codex 계열이라 openai 로 부르면 호환 판정이 거부한다(09-23 대표 · 같은 날 되돌림).
   anthropic: 'claude-opus-5-5',
   openai: 'gpt-4o',
-  // ⛔ 2026-09-23: `gpt-5.5` 는 ***두 세대 낡았다***. 운영 기본은 `gpt-6-sol` 이고
-  //    (대표 2026-09-23 · `llm.ts` `CODEX_DEFAULT_MODEL`), 이 표만 안 따라왔다.
+  // 2026-10-28: GPT-6.1 Terra is the current recommended Codex default.
+  //    `llm.ts` avoids importing this UI-facing module, so keep its local default aligned here.
   //    ⚠️ `llm.ts` 에서 import 하지 «않는다» — 이 파일은 UI 소비자가 CLI 표면을 안 끌어오게
   //    «일부러» 독립돼 있다(이 상수의 머리말). ⇒ 값을 맞추고 «자»로 묶는다.
-  'openai-codex': 'gpt-6-sol',
+  'openai-codex': 'gpt-6.1-terra',
   // ⛔ 2026-08-18: 'grok-4-1-fast' 는 «200 OK 로 응답하지만 실제로는 grok-4.3 이 도는»
   //    레거시 별칭이었다(xAI 실호출 대조). 실물 flagship 으로 고친다.
   grok: 'grok-4.7',

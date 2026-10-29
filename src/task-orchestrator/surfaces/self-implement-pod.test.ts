@@ -1,4 +1,4 @@
-import { setDefaultTimeout, afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { makePrManager, type CmdRunner } from '../../autopilot/pr-manager.js';
 import { guardNewPr } from '../../pr-tool/census.js';
@@ -23,6 +23,8 @@ import { podFragmentFinished, readPodFragment } from '../../harness/self-send-ta
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
 import { POD_JOB_DEADLINE_SECONDS, POD_DEADLINE_AFTER_WAIT, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podDeadlineWatchdogScript, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podJobFinishedTiming, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, recordPodSourceIoSummary, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
+import type { SiWarmChildAttempt } from './self-implement-pod.js';
+import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
 import { stablePodRunGuard } from './pod-manifest-test-normalize.js';
 import { POD_PROVENANCE_ENV_NAMES } from './pod-provenance.js';
 import { makeScriptedKubectlDevice, type PodDeviceEvent } from '../../ux-sim/task-orchestrator-surfaces-self-implement-pod-device.js';
@@ -33,6 +35,22 @@ import { buildPodConfigSnapshot } from './pod-config-snapshot.js';
 import { buildUserConfig, resetUserConfig, userConfigPath, type UserConfig } from '../../user-config.js';
 import { worktreeAddTimeoutForRepo } from '../../git-fs/worktree.js';
 import { getElanousConfigDirOverride, setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
+
+// 이 파일의 무대는 고정 입력이다 — 하니스가 자식에게 주입한 런/카드 식별자와 호스트 git 훅이 새어 들어오면
+// orchestrateSelfDev 가 카드 경계로 판정하고 임시 저장소 push 가 훅에 막혀 무대가 흔들린다. 시험 프로세스 사본만 정리한다.
+let originalInjectedEnv: Record<string, string | undefined> = {};
+beforeEach(() => {
+  originalInjectedEnv = Object.fromEntries(['ELANOUS_TASK_CARD_ID', 'ELANOUS_RUN_ID', 'ELANOUS_PARENT_RUN_ID', 'GIT_CONFIG_GLOBAL']
+    .map((key) => [key, process.env[key]]));
+  for (const injected of ['ELANOUS_TASK_CARD_ID', 'ELANOUS_RUN_ID', 'ELANOUS_PARENT_RUN_ID']) delete process.env[injected];
+  process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+});
+afterEach(() => {
+  for (const [key, value] of Object.entries(originalInjectedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 // Unit fakes opt out explicitly; a supplied kubectl adapter in product code still measures on the host.
 const podSelfImplementSpawn: typeof realPodSelfImplementSpawn = (options = {}) =>
@@ -323,7 +341,8 @@ test('aborted Pod slot wait retains the first reasonCode on its no-launch result
     const rows = (loadRunLedger(parentRunId, runLedgerDir(root)) ?? []).filter((entry) => entry.event === 'pod-slot-observation');
     expect(rows.map((row) => row.data.outcome)).toEqual(['requested', 'queued', 'rejected']);
     expect(new Set(rows.map((row) => row.data.observationKey)).size).toBe(1);
-    expect(rows.at(-1)?.data.reasonCode).toBe('no-free-slot');
+    expect(rows.at(-1)?.data).toMatchObject({ reasonCode: 'no-free-slot', waitReason: 'no free slot' });
+    expect(rows.at(-1)?.data).not.toHaveProperty('abortReason');
     const incidents = (loadRunLedger(parentRunId, runLedgerDir(root)) ?? []).filter((entry) => entry.event === 'pod-slot-incident');
     expect(incidents).toHaveLength(1);
     expect(incidents[0]?.data).toMatchObject({ observationKey: rows.at(-1)?.data.observationKey, runId: rows.at(-1)?.data.runId,
@@ -331,6 +350,67 @@ test('aborted Pod slot wait retains the first reasonCode on its no-launch result
       queued: false, poolCapacity: 2, reasonCode: 'no-free-slot', parentId: parentRunId, outcome: 'rejected' });
     expect(reasonEvents).toBe(3);
   } finally { debugSpy.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Pod slot cancellation receipts keep the dispatcher reason, last waitReason and measured wait without launching', async () => {
+  for (const abortReason of ['user', 'cascade', 'timeout'] as const) {
+    const root = mkdtempSync(join(tmpdir(), 'pod-slot-cancellation-'));
+    const parentRunId = `run-pod-slot-cancel-${abortReason}`;
+    const controller = new AbortController();
+    const { k, calls } = fakeKubectl([], '');
+    let clock = 1_000;
+    let attempts = 0;
+    const pool = {
+      members: [{ context: 'pool-node-b', capacity: 2, k3dCluster: 'node-b' }],
+      tryAcquire: (_skip: unknown, onEmpty: (reason: string) => void) => {
+        onEmpty(++attempts === 1 ? 'no free slot' : 'lease capacity unavailable');
+        return null;
+      },
+      release: () => {}, snapshot: () => ({ 'pool-node-b': 2 }),
+    };
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: k, pool: pool as never, pollMs: 0,
+        sleep: async () => { clock += 25; if (attempts === 2) controller.abort(abortReason); }, now: () => clock,
+        credentials: CREDS, env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })
+        ({ feature: 'slot cancellation', spaceId: `pod-slot-cancel-${abortReason}`, signal: controller.signal }).done;
+      expect(result.error).toMatchObject({ code: 'aborted', reasonCode: 'no-free-slot' });
+      const ledger = loadRunLedger(parentRunId, runLedgerDir(root)) ?? [];
+      const rows = ledger.filter((entry) => entry.event === 'pod-slot-observation');
+      expect(rows.map((row) => row.data.outcome)).toEqual(['requested', 'queued', 'rejected']);
+      expect(rows.at(-1)?.data).toMatchObject({ abortReason, waitReason: 'lease capacity unavailable',
+        reasonCode: 'no-free-slot', waitedMs: 50, runId: expect.any(String), parentId: parentRunId });
+      expect(ledger.filter((entry) => entry.event === 'pod-slot-incident').map((entry) => entry.data))
+        .toEqual([rows.at(-1)!.data]);
+      expect(attempts).toBe(2);
+      expect(calls.filter((call) => call.args.endsWith('apply -f -'))).toHaveLength(0);
+      expect(ledger.some((entry) => entry.event === 'stop' || entry.event === 'run-status')).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test('Pod slot cancelled before any pool reading records unknown waitReason without claiming shortage', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-slot-pre-cancel-'));
+  const parentRunId = 'run-pod-slot-pre-cancel';
+  const controller = new AbortController();
+  controller.abort('user');
+  const { k, calls } = fakeKubectl([], '');
+  let attempts = 0;
+  const pool = {
+    tryAcquire: () => { attempts++; return null; }, release: () => {}, snapshot: () => ({}),
+  };
+  try {
+    const result = await podSelfImplementSpawn({ kubectl: k, pool: pool as never, pollMs: 0,
+      now: () => 1_000, sleep: async () => {}, credentials: CREDS,
+      env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })
+      ({ feature: 'pre-cancel', spaceId: 'pod-slot-pre-cancel', signal: controller.signal }).done;
+    expect(result.error).toEqual({ code: 'aborted', message: 'aborted before a pool slot opened' });
+    const rows = (loadRunLedger(parentRunId, runLedgerDir(root)) ?? [])
+      .filter((entry) => entry.event === 'pod-slot-observation');
+    expect(rows.map((row) => row.data.outcome)).toEqual(['requested', 'rejected']);
+    expect(rows.at(-1)?.data).toMatchObject({ abortReason: 'user', waitReason: null, waitedMs: 0, reasonCode: 'aborted' });
+    expect(attempts).toBe(0);
+    expect(calls.filter((call) => call.args.endsWith('apply -f -'))).toHaveLength(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('OOM retry records a fresh Pod slot wait observation', async () => {
@@ -433,7 +513,9 @@ test('OOM retry records a fresh Pod slot wait observation', async () => {
       expect(abortRows.map((row) => row.data.outcome)).toEqual(['requested', 'queued', 'admitted', 'requested', 'queued', 'rejected']);
       const retryRows = abortRows.slice(3);
       expect(new Set(retryRows.map((row) => row.data.observationKey)).size).toBe(1);
-      expect(retryRows.at(-1)?.data).toMatchObject({ reasonCode: 'capacity', outcome: 'rejected', queued: false });
+      expect(retryRows.at(-1)?.data).toMatchObject({ reasonCode: 'capacity', outcome: 'rejected', queued: false,
+        waitReason: 'pod lease capacity unavailable', waitedMs: 17 });
+      expect(retryRows.at(-1)?.data).not.toHaveProperty('abortReason');
       const abortIncidents = (loadRunLedger(abortParentRunId, runLedgerDir(abortRoot)) ?? []).filter((entry) => entry.event === 'pod-slot-incident');
       expect(abortIncidents).toHaveLength(1);
       expect(abortIncidents[0]?.data).toMatchObject({ observationKey: retryRows.at(-1)?.data.observationKey,
@@ -641,6 +723,15 @@ describe('pod source delivery', () => {
       job: 'job-1', runId: 'run-1', runIdSource: 'pod-launch-child-run-id', hostOriginCalls: 1, originCalls: 2, checkoutFiles: 17, sourceVia: 'github', sourceSeconds: 3,
       sourceStatus: 'complete', pushCalls: null, installRan: null, installSeconds: null,
     }, options: undefined }]);
+    rows.length = 0;
+    recordPodSourceIoSummary('ELANOUS_POD_GIT_PUSH_COUNTER ready\nELANOUS_POD_GIT_PUSH_ATTEMPT\nELANOUS_POD_GIT_PUSH_ATTEMPT\nELANOUS_POD_SOURCE_IO {"originCalls":0,"checkoutFiles":10,"sourceVia":"mirror","sourceSeconds":1,"sourceStatus":"complete","pushCalls":null,"installRan":null,"installSeconds":null}\n', 'job-2', 'run-2', 'explicit-child-id', log);
+    expect(rows[0]?.data).toMatchObject({ job: 'job-2', runId: 'run-2', runIdSource: 'explicit-child-id', pushCalls: 2 });
+    rows.length = 0;
+    recordPodSourceIoSummary('ELANOUS_POD_GIT_PUSH_COUNTER ready\nELANOUS_POD_GIT_PUSH_ATTEMPT\nELANOUS_POD_SOURCE_IO {"originCalls":0,"checkoutFiles":10,"sourceVia":"mirror","sourceSeconds":1,"sourceStatus":"complete","pushCalls":null,"installRan":null,"installSeconds":null}\n', 'job-2', 'run-2', 'explicit-child-id', log, 1);
+    expect(rows[0]?.data).toMatchObject({ originCalls: 0, hostOriginCalls: 1, sourceVia: 'mirror', pushCalls: 1 });
+    rows.length = 0;
+    recordPodSourceIoSummary('ELANOUS_POD_GIT_PUSH_COUNTER ready\nELANOUS_POD_SOURCE_IO {"originCalls":0,"checkoutFiles":10,"sourceVia":"image","sourceSeconds":0,"sourceStatus":"complete","pushCalls":null,"installRan":null,"installSeconds":null}\n', 'job-3', 'run-3', 'explicit-child-id', log);
+    expect(rows[0]?.data).toMatchObject({ pushCalls: 0 });
     rows.length = 0;
     recordPodSourceIoSummary('ELANOUS_POD_SOURCE_IO {bad-json}\n', 'job-1', null, 'pod-launch-child-run-id', log);
     expect(rows).toHaveLength(1);
@@ -1463,6 +1554,152 @@ test('sync throw, async rejection, and pending warm hooks cannot prevent the fre
       expect(unavailableEvents.some((entry) => entry.data.spaceId === spaceId)).toBe(index < 2);
     }
   } finally { logSpy.mockRestore(); }
+});
+
+// POD-REUSE-REQUEST-CLEAN-FU — 워밍 요청 경계가 같은 Pod 임대 하나를 clean 반환하고, 두 번째 명령이
+// 그 임대를 다시 얻어 처리한다(잔여 0). 생산 진입점 podSelfImplementSpawn 을 그대로 지나며, 클러스터는
+// ux-sim 스크립트 kubectl 장치가 대신한다 — 어느 단계에서도 새 Job 이 만들어지지 않아야 한다.
+test('POD-REUSE-REQUEST-CLEAN-FU: two warm commands clean and return one Pod lease twice with zero residue', async () => {
+  const encoder = new TextEncoder();
+  const payload = encoder.encode('{"feature":"a"}');
+  const credentialBundle = encoder.encode('private fixture');
+  const returned: SiWarmReturnedBytes = {
+    terminal: encoder.encode('{"ok":true,"stage":"pr-opened","prNumber":123}'),
+    ledger: encoder.encode('{"event":"done"}\n'), log: encoder.encode('child done\n'), artifacts: [],
+  };
+  const command: SiWarmCommand = { protocol: 'si-v1', runId: 'run-1', attemptId: 'attempt-1',
+    executionKey: 'a'.repeat(64), sourceSha: 'b'.repeat(40), leaseId: 'lease-1', generation: 1,
+    workerId: 'worker-1', podUid: 'uid-1',
+    key: { context: 'test-context', imageDigest: `sha256:${'c'.repeat(64)}`, lockHash: 'd'.repeat(64), architecture: 'amd64' },
+    envProfile: 'si-standard-v1', deadlineAt: 2000,
+    payloadSha256: siWarmSha256(payload), credentialBundleSha256: siWarmSha256(credentialBundle) };
+  const reply: SiWarmReply = { protocol: 'si-v1', runId: command.runId, attemptId: command.attemptId,
+    executionKey: command.executionKey, sourceSha: command.sourceSha, leaseId: command.leaseId,
+    generation: command.generation, workerId: command.workerId, podUid: command.podUid,
+    key: command.key, envProfile: command.envProfile, payloadSha256: command.payloadSha256,
+    startedAt: 1000, finishedAt: 1500, exitCode: 0,
+    terminalSha256: siWarmSha256(returned.terminal), ledgerSha256: siWarmSha256(returned.ledger),
+    logSha256: siWarmSha256(returned.log), artifacts: [] };
+  const events: string[] = [];
+  const residue: number[] = [];
+  const returnedLeases: Array<{ podUid: string; leaseId: string; generation: number }> = [];
+  const ledgerRows: Array<{ event: string; runId: string; data: Record<string, unknown> }> = [];
+  const receipt: { reply: SiWarmReply | null; bytes: SiWarmReturnedBytes | null } = { reply, bytes: returned };
+  let held = false;
+  let generation = 0;
+  const attempt: SiWarmChildAttempt = {
+    leaseFenced: true, command, payload, credentialBundle,
+    cleanup: {
+      stopChildProcesses: async () => { events.push('stop'); const remaining = 0; residue.push(remaining); return { remaining }; },
+      git: async (_lease, argv) => { events.push(argv[0]!); return { status: 0, stdout: '' }; },
+      removeRunCredentials: async () => { events.push('revoke'); return { remaining: 0 }; },
+      returnLease: async (lease) => { events.push('return');
+        returnedLeases.push({ podUid: lease.podUid, leaseId: lease.leaseId, generation: lease.generation });
+        held = false; },
+      quarantine: async () => { events.push('quarantine'); },
+      observe: (event) => { events.push(event); },
+    },
+    transport: {
+      pod: { context: command.key.context, namespace: 'elanous-test', name: 'warm-1', podUid: command.podUid,
+        workerId: command.workerId, sourceSha: command.sourceSha, imageDigest: command.key.imageDigest,
+        lockHash: command.key.lockHash, architecture: command.key.architecture },
+      now: () => 0,
+      runner: { inspect: async () => attempt.transport.pod,
+        execute: async () => ({ reply: receipt.reply, bytes: receipt.bytes, cleanup: 'clean' as const }),
+        quarantine: async () => true },
+    },
+    quarantineUnknown: async () => { events.push('quarantine-unknown'); },
+    adopt: async () => { events.push('adopt'); },
+  };
+  const acquire = async (): Promise<SiWarmChildAttempt> => {
+    if (held) throw new Error('lease already held');
+    held = true;
+    generation += 1;
+    const sourceSha = generation === 1 ? command.sourceSha : 'e'.repeat(40);
+    attempt.command = { ...command, runId: `run-${generation}`, attemptId: `attempt-${generation}`,
+      leaseId: `lease-${generation}`, generation, sourceSha };
+    receipt.reply = { ...reply, runId: attempt.command.runId, attemptId: attempt.command.attemptId,
+      leaseId: attempt.command.leaseId, generation, sourceSha };
+    attempt.transport.pod = { ...attempt.transport.pod, sourceSha };
+    events.push('acquire');
+    return attempt;
+  };
+  const device = makeScriptedKubectlDevice([]);
+  const appliedJobs: string[] = [];
+  const kubectl: Kubectl = (args, input) => {
+    if (args.includes('current-context')) return { status: 0, stdout: 'test-context\n', stderr: '' };
+    if (args.includes('apply') && input) {
+      const manifest = JSON.parse(input) as { kind?: string };
+      if (manifest.kind === 'Job') appliedJobs.push(manifest.kind);
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    return device.kubectl(args, input);
+  };
+  const spawn = podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {}, pollMs: 1, sleep: async () => {},
+    siWarmAttempt: acquire,
+    siWarmHostPostprocess: async (result) => result,
+    siWarmLedger: (entry) => { ledgerRows.push({ event: entry.event, runId: entry.runId, data: entry.data }); } });
+
+  for (const spaceId of ['request-round-1', 'request-round-2']) {
+    const result = await spawn({ feature: 'fix it', spaceId }).done;
+    expect(result.exitCode).toBe(0);
+    expect(result.disposition).toMatchObject({ stage: 'pr-opened', prNumber: 123 });
+  }
+
+  expect(events.filter((event) => event === 'acquire' || event === 'return'))
+    .toEqual(['acquire', 'return', 'acquire', 'return']);
+  expect(held).toBe(false);
+  expect(appliedJobs).toHaveLength(0);
+  expect(events.filter((event) => event === 'adopt')).toHaveLength(2);
+  // 잔여 0: 회차당 clean 단계 1회 + 반환 직전 재관측 1회 = 2회, 네 번 모두 remaining 0.
+  expect(events.filter((event) => event === 'stop' || event === 'return'))
+    .toEqual(['stop', 'stop', 'return', 'stop', 'stop', 'return']);
+  expect(residue).toEqual([0, 0, 0, 0]);
+  expect(returnedLeases).toEqual([
+    { podUid: command.podUid, leaseId: 'lease-1', generation: 1 },
+    { podUid: command.podUid, leaseId: 'lease-2', generation: 2 },
+  ]);
+  expect(ledgerRows.filter((row) => row.event === 'pod-reuse-return-decision' && row.data.outcome === 'returned')).toHaveLength(2);
+  expect(ledgerRows.filter((row) => row.event.startsWith('pod-reuse-quarantine'))).toHaveLength(0);
+  // The request boundary itself is ledger-clean: each warm request is paired with the fenced lease that served it before transport.
+  expect(ledgerRows.filter((row) => row.event === 'pod-reuse-request-decision')).toEqual([
+    { event: 'pod-reuse-request-decision', runId: 'run-1',
+      data: { spaceId: 'request-round-1', correlationId: 'request-round-1', runIdSource: 'warm-child-run',
+        outcome: 'warm-path-selected', workerId: 'worker-1', leaseId: 'lease-1', generation: 1, podUid: command.podUid } },
+    { event: 'pod-reuse-request-decision', runId: 'run-2',
+      data: { spaceId: 'request-round-2', correlationId: 'request-round-2', runIdSource: 'warm-child-run',
+        outcome: 'warm-path-selected', workerId: 'worker-1', leaseId: 'lease-2', generation: 2, podUid: command.podUid } },
+  ]);
+});
+
+test('POD-REUSE-REQUEST-CLEAN-FU: cold-job and acquire-failed requests are ledgered and never touch a warm lease', async () => {
+  // No fenced lease: the decision names the cold-Job fallback, and the fresh Job still runs as today.
+  const coldRows: Array<{ event: string; runId: string; data: Record<string, unknown> }> = [];
+  const coldKubectl = fakeKubectl(['Complete'], '{"ok":true,"stage":"complete"}\n');
+  const cold = await podSelfImplementSpawn({ kubectl: coldKubectl.k, credentials: CREDS, env: {}, pollMs: 1, sleep: async () => {},
+    siWarmAttempt: async () => null,
+    siWarmHostPostprocess: async (result) => result,
+    siWarmLedger: (entry) => { coldRows.push({ event: entry.event, runId: entry.runId, data: entry.data }); },
+  })({ feature: 'fix it', spaceId: 'request-cold-job' }).done;
+  expect(cold.exitCode).toBe(0);
+  expect(coldKubectl.calls.some((call) => call.args.endsWith('apply -f -') && JSON.parse(call.input ?? '{}').kind === 'Job')).toBe(true);
+  expect(coldRows).toEqual([{ event: 'pod-reuse-request-decision', runId: 'request-cold-job',
+    data: { spaceId: 'request-cold-job', correlationId: 'request-cold-job', runIdSource: 'space-id-fallback',
+      outcome: 'cold-job', workerId: null, leaseId: null, generation: null, podUid: null } }]);
+
+  // A failed acquisition: the decision names the failure, and no cold Job is started (reconcile only).
+  const failedRows: Array<{ event: string; runId: string; data: Record<string, unknown> }> = [];
+  const failedKubectl = fakeKubectl(['Complete'], '{"ok":true,"stage":"complete"}\n');
+  const failed = await podSelfImplementSpawn({ kubectl: failedKubectl.k, credentials: CREDS, env: {}, pollMs: 1, sleep: async () => {},
+    siWarmAttempt: async () => { throw new Error('lease fence lost'); },
+    siWarmHostPostprocess: async (result) => result,
+    siWarmLedger: (entry) => { failedRows.push({ event: entry.event, runId: entry.runId, data: entry.data }); },
+  })({ feature: 'fix it', spaceId: 'request-acquire-failed' }).done;
+  expect(failed.error?.code).toBe('si-warm-reconcile-only');
+  expect(failedKubectl.calls).toHaveLength(0);
+  expect(failedRows).toEqual([{ event: 'pod-reuse-request-decision', runId: 'request-acquire-failed',
+    data: { spaceId: 'request-acquire-failed', correlationId: 'request-acquire-failed', runIdSource: 'space-id-fallback',
+      outcome: 'acquire-failed', reason: 'lease fence lost', workerId: null, leaseId: null, generation: null, podUid: null } }]);
 });
 
 describe('pod memory evidence', () => {
@@ -2609,18 +2846,33 @@ describe('podSelfImplementSpawn', () => {
   });
 
   test('failed nested child result is the Job error, not a later graph failure', async () => {
-    const child = JSON.stringify({ ok: false, kind: 'self', result: { ok: false, stage: 'aborted', node: 'implement', outcome: 'abandoned', abandonedClassification: { classification: 'report-deficit' } } });
-    const { k } = fakeKubectl(['Failed'], `${child}\n[graph] collect fail (0.28s)`);
+    const child = JSON.stringify({ ok: false, kind: 'self', result: { ok: false, stage: 'aborted', node: 'implement', outcome: 'abandoned',
+      detail: `${'x'.repeat(5_000)} RED/GREEN record gap; write isolation rejected: unknown command sed; FINAL-CAUSE-MARKER`,
+      abandonedClassification: { classification: 'report-deficit', classificationBasis: 'terminal-state-not-reviewed' },
+      failureClassification: 'report-deficit', terminationReason: 'goal-only-rework-exhausted' } });
+    // Simulate the reattached/running observation before the same Job becomes terminal.
+    const { k, calls } = fakeKubectl(['Active', 'Failed'], `${child}\n[graph] collect fail (0.28s)`);
     const finished: Array<Record<string, unknown>> = [];
+    const causes: Array<Record<string, unknown>> = [];
     const off = debug.registerSink({ name: 'pod-nested-result', emit: (record) => {
       if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+      if (record.event === 'report-deficit-cause') causes.push(record.data as Record<string, unknown>);
     } });
     try {
-      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'nested-result' }).done;
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {}, pollMs: 1, sleep: async () => {} })({ feature: 'x', spaceId: 'nested-result' }).done;
       expect(result.error?.message).toContain('childStage=aborted · childError=implement abandoned · report-deficit');
       expect(result.error?.message).not.toContain('no-result-line');
       expect(result.error?.message).not.toContain('[graph] collect fail');
-      expect(finished[0]).toMatchObject({ childStage: 'aborted', childError: 'implement abandoned · report-deficit' });
+      expect(finished[0]).toMatchObject({ childStage: 'aborted', childError: 'implement abandoned · report-deficit',
+        failureClassification: 'report-deficit', classificationBasis: 'terminal-state-not-reviewed',
+        terminationReason: 'goal-only-rework-exhausted' });
+      expect(causes[0]).toMatchObject({ classification: 'report-deficit',
+        classificationBasis: 'terminal-state-not-reviewed', terminationReason: 'goal-only-rework-exhausted',
+        job: expect.any(String), childRun: expect.any(String), phase: 'failed' });
+      expect(causes[0]?.detailTail).toContain('RED/GREEN record gap; write isolation rejected: unknown command sed; FINAL-CAUSE-MARKER');
+      expect(Buffer.byteLength(String(causes[0]?.detailTail), 'utf8')).toBeLessThanOrEqual(4_096);
+      expect(calls.filter((call) => call.args.includes('conditions[*].type')).length).toBeGreaterThanOrEqual(2);
+      expect(causes).toHaveLength(1); // Active 중에는 cause를 확정하지 않고 terminal 실패 뒤 한 번만 기록한다.
     } finally { off(); }
   });
 
@@ -3095,7 +3347,8 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     const parent = 'run-parent-no-result-log-tail';
     const previousState = process.env.ELANOUS_STATE_DIR;
     const diagnostics: Array<Record<string, unknown>> = [];
-    const fixtureJob = spawnSync('bash', ['-c', "printf 'stage line %s\\n' {0..99}; printf '%s\\n' '  child exploded: authentication failed for sk-proj-ABCDEFGHIJKLMNOP1234  '; exit 1"], { encoding: 'utf8' });
+    const finishedLogs: Array<Record<string, unknown>> = [];
+    const fixtureJob = spawnSync('bash', ['-c', "printf 'stage line %s\\n' {0..99}; printf '%s\\n' '  child exploded: authentication failed for sk-proj-ABCDEFGHIJKLMNOP1234  '; printf '%s\\n' '[elanous] provider: openrouter / openrouter/z-ai/glm-5.3 · API key (config)'; exit 1"], { encoding: 'utf8' });
     expect(fixtureJob.status).toBe(1);
     expect(fixtureJob.stdout).not.toContain('{0..99}');
     const fixtureTail = fixtureJob.stdout;
@@ -3112,6 +3365,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     };
     const off = debug.registerSink({ name: 'pod-no-result-log-tail', emit: (record) => {
       if (record.category === 'self-implement.pod' && record.event === 'no-result-log-tail') diagnostics.push(record.data as Record<string, unknown>);
+      if (record.category === 'self-implement.pod' && record.event === 'job-finished') finishedLogs.push(record.data as Record<string, unknown>);
     } });
     try {
       process.env.ELANOUS_STATE_DIR = root;
@@ -3127,11 +3381,17 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(callOrder).toEqual(['log-tail']);
       const evidence = loadRunLedger(parent, runLedgerDir(root))?.find((entry) => entry.event === 'pod-child-evidence')?.data as {
         childEvidence?: { stderr?: string; logTail?: string[] } } | undefined;
+      const finished = loadRunLedger(parent, runLedgerDir(root))?.find((entry) => entry.event === 'pod-launch-finished')?.data;
       const childEvidence = evidence?.childEvidence;
       expect(childEvidence?.logTail).toHaveLength(POD_NO_RESULT_LOG_TAIL_LINES);
-      expect(childEvidence?.logTail?.[0]).toBe('stage line 21');
-      expect(childEvidence?.logTail?.at(-1)).toBe('  child exploded: authentication failed for sk-proj-***  ');
+      expect(childEvidence?.logTail?.[0]).toBe('stage line 22');
+      expect(childEvidence?.logTail?.at(-2)).toBe('  child exploded: authentication failed for sk-proj-***  ');
+      expect(childEvidence?.logTail?.at(-1)).toBe('[elanous] provider: openrouter / openrouter/z-ai/glm-5.3 · API key (config)');
       expect(childEvidence?.stderr).toContain('  child exploded: authentication failed for sk-proj-***  ');
+      expect(finished).not.toHaveProperty('stopEvidenceTail');
+      expect(finishedLogs[0]).toMatchObject({ attempt: 1, childRunId: expect.any(String), stopEvidenceTail: expect.arrayContaining([
+        '[elanous] provider: openrouter / openrouter/z-ai/glm-5.3 · API key (config)',
+      ]) });
       expect(JSON.stringify(evidence)).not.toContain('sk-proj-ABCDEFGHIJKLMNOP1234');
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0]).toMatchObject({ job: expect.stringContaining('si-'), lines: 80,
@@ -6729,7 +6989,7 @@ describe('AUTHOR-POD2 — authoring runs inside the Pod', () => {
 describe('pod git push guard', () => {
   const zero = '0'.repeat(40);
   const sha = 'a'.repeat(40);
-  const runHook = (lines: string, runId?: string) => {
+  const runHook = (lines: string, runId?: string, remoteUrl = 'https://example.invalid/repo.git') => {
     const home = mkdtempSync(join(tmpdir(), 'pod-git-guard-'));
     try {
       const env = { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: join(home, '.gitconfig') };
@@ -6737,13 +6997,33 @@ describe('pod git push guard', () => {
       expect(install.status).toBe(0);
       const hooksPath = spawnSync('git', ['config', '--global', 'core.hooksPath'], { env, encoding: 'utf8' }).stdout.trim();
       expect(hooksPath).toBe(join(home, '.elanous-git-hooks'));
-      return spawnSync(join(hooksPath, 'pre-push'), ['origin', 'https://example.invalid/repo.git'], { env, input: lines, encoding: 'utf8' });
+      return spawnSync(join(hooksPath, 'pre-push'), ['origin', remoteUrl], { env, input: lines, encoding: 'utf8' });
     } finally { rmSync(home, { recursive: true, force: true }); }
   };
   test('a run pushes its own self-impl, salvage and bench arm branches', () => {
     for (const ref of ['refs/heads/self-impl/goalid-x-r1', 'refs/heads/salvage/si-task-1/wt', 'refs/heads/bench/chk-1011/glm-5.3-flash-fc1fdf']) {
       expect(runHook(`HEAD ${sha} ${ref} ${zero}\n`).status).toBe(0);
     }
+  });
+  test('the push hook reports one measured GitHub push attempt after all refs pass the guard', () => {
+    const hook = runHook(`HEAD ${sha} refs/heads/self-impl/goalid-x-r1 ${zero}\nHEAD ${sha} refs/heads/salvage/job/wt ${zero}\n`, undefined,
+      'https://github.com/example/repo.git');
+    expect(hook.status).toBe(0);
+    expect(hook.stderr.match(/^ELANOUS_POD_GIT_PUSH_ATTEMPT$/gm)).toHaveLength(1);
+    const denied = runHook(`HEAD ${sha} refs/heads/main ${zero}\n`, undefined, 'https://github.com/example/repo.git');
+    expect(denied.status).toBe(1);
+    expect(denied.stderr).not.toContain('ELANOUS_POD_GIT_PUSH_ATTEMPT');
+    const nonGithub = runHook(`HEAD ${sha} refs/heads/self-impl/goalid-x-r1 ${zero}\n`);
+    expect(nonGithub.stderr).not.toContain('ELANOUS_POD_GIT_PUSH_ATTEMPT');
+  });
+  test('the Pod guard announces when push-attempt measurement is installed', () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-git-counter-ready-'));
+    try {
+      const env = { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: join(home, '.gitconfig') };
+      const install = spawnSync('sh', ['-c', podGitPushGuardScript()], { env, encoding: 'utf8' });
+      expect(install.status).toBe(0);
+      expect(install.stdout).toContain('ELANOUS_POD_GIT_PUSH_COUNTER ready');
+    } finally { rmSync(home, { recursive: true, force: true }); }
   });
   test('a run uploads and cleans up its own PR scratch ref but cannot push another run branch', () => {
     const runId = 'run-a1b2c3d4-1111-2222-3333-444444444444';
@@ -6957,15 +7237,19 @@ describe('BUDGET-SNAPSHOT-TO-POD — the host budget snapshot rides the Job env'
 describe('POD-FAIL-EVIDENCE-CAPTURE-FU: provider-error 우선순위 ⊕ duplicate-cap 귀속', () => {
   type PodRecord = { event: string; data: Record<string, unknown> };
 
-  const failedJob = async (logs: string, spaceId: string): Promise<{ message: string; events: PodRecord[] }> => {
+  const failedJob = async (logs: string, spaceId: string, ledger?: { root: string; runId: string }): Promise<{ message: string; events: PodRecord[]; provenance: PodRecord[] }> => {
     const { k } = fakeKubectl(['Failed'], logs);
     const events: PodRecord[] = [];
+    const provenance: PodRecord[] = [];
     const off = debug.registerSink({ name: `pod-fu-${spaceId}`, emit: (record) => {
-      if (record.category.startsWith('self-implement.pod')) events.push({ event: record.event, data: record.data as Record<string, unknown> });
+      if (record.category.startsWith('self-implement.pod') || record.event === 'report-deficit-cause' || record.event === 'terminal-cause')
+        events.push({ event: record.event, data: record.data as Record<string, unknown> });
+      if (record.category === 'pod.provenance') provenance.push({ event: record.event, data: record.data as Record<string, unknown> });
     } });
     try {
-      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {}, pollMs: 1 })({ feature: 'x', spaceId }).done;
-      return { message: result.error?.message ?? '', events };
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS,
+        env: ledger ? { ELANOUS_STATE_DIR: ledger.root, ELANOUS_RUN_ID: ledger.runId } : {}, pollMs: 1 })({ feature: 'x', spaceId }).done;
+      return { message: result.error?.message ?? '', events, provenance };
     } finally { off(); }
   };
 
@@ -6981,6 +7265,25 @@ describe('POD-FAIL-EVIDENCE-CAPTURE-FU: provider-error 우선순위 ⊕ duplicat
     // provider error 는 결과행 없음(no-result-line)보다도 먼저다.
     const credential = await failedJob('llm.claude credential error: upstream 503\n', 'fu-provider-priority-credential');
     expect(exitClassOf(credential.events)).toBe('provider-error');
+  });
+
+  test('POD-TERMINAL-EVIDENCE-JOIN writer records classifier and child stage on the same terminal row', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-terminal-writer-'));
+    const runId = 'run-terminal-writer-proof';
+    const child = JSON.stringify({ stage: 'error', ok: false, error: 'credential setup missing' });
+    try {
+      await failedJob(`${child}\n`, 'terminal-evidence-writer-fields', { root, runId });
+      const finished = (loadRunLedger(runId, runLedgerDir(root)) ?? []).find((record) => record.event === 'pod-launch-finished');
+      expect(finished?.data).toMatchObject({ phase: 'failed', podExitClass: 'child-unconverged', childFailureStage: 'error' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('no-result incident preserves unknown child classification instead of guessing report-deficit', async () => {
+    const { events } = await failedJob('OpenRouter provider error: 429 quota exhausted\n', 'no-result-cause-unknown');
+    const cause = events.find((record) => record.event === 'terminal-cause')?.data;
+    expect(cause).toMatchObject({ classification: null, trigger: 'no-result', phase: 'failed', exitCode: null, oomKilled: false,
+      podExitClass: 'provider-error' });
+    expect(events.some((record) => record.event === 'report-deficit-cause')).toBe(false);
   });
 
   test('provider error of an earlier terminal is not reused by the last terminal', async () => {
@@ -7024,3 +7327,110 @@ describe('POD-FAIL-EVIDENCE-CAPTURE-FU: provider-error 우선순위 ⊕ duplicat
     expect(message).not.toContain('childError=ELANOUS_USAGE_ROLLUP');
   });
 });
+
+test('TA-POD-WARMBOOT-PARITY: si-task Pod 종료 마커가 공용 결과 표지에 runId·exitCode 를 남기고 부모 회수가 같은 값을 읽는다', async () => {
+  // 무대: integration · L2 — si-task Pod 생산 런치 경로를 그대로 지나며 kubectl 만 mock 한다(fake kubectl · 격리 ELANOUS_STATE_DIR).
+  const { POD_RESULT_MARKER, splitPodResultMarker } = await import('./pod-command-job');
+  const { readFileSync } = await import('node:fs');
+  const root = mkdtempSync(join(tmpdir(), 'pod-warmboot-parity-'));
+  let armedToken: string | null = null;
+  let markerShellLine = '';
+  let markerLine = '';
+  let jobReads = 0;
+  let appliedJob = false;
+  const calls: string[] = [];
+  // 생산 런치가 Job 매니페스트에 실은 공용 표지 «줄» 을 그대로 집는다(= 자식 스크립트 원문 증거 · 재구성 아님).
+  const harvestMarkerToken = (args: readonly string[], input?: string) => {
+    const applied = typeof input === 'string' ? input : '';
+    const sources = [applied];
+    for (const arg of args) {
+      if (typeof arg !== 'string' || !arg.includes('/')) continue;
+      try {
+        sources.push(readFileSync(arg, 'utf8'));
+      } catch {
+        // 파일 인자가 아니면 넘어간다.
+      }
+    }
+    for (const text of sources) {
+      // 매니페스트는 JSON 이라 자식 스크립트(str)를 꺼내야 셸 원문(개행·역슬래시)이 산다.
+      let script = text;
+      try {
+        const job = JSON.parse(text) as { spec?: { template?: { spec?: { containers?: { args?: string[] }[] } } } };
+        const raw = job.spec?.template?.spec?.containers?.[0]?.args?.[0];
+        if (typeof raw === 'string') script = raw;
+      } catch {
+        // JSON 이 아니면 원문 그대로 본다.
+      }
+      const found = script.match(new RegExp(`${POD_RESULT_MARKER} ${'run-[A-Za-z0-9-]+'}`));
+      const token = found?.[0].slice(POD_RESULT_MARKER.length + 1);
+      if (!token) continue;
+      armedToken = token;
+      const line = script.split('\n').find((candidate) => candidate.includes(POD_RESULT_MARKER));
+      if (line) markerShellLine = line;
+    }
+  };
+  const kubectl = (args: readonly string[], input?: string, _timeoutMs?: number) => {
+    calls.push(args.join(' '));
+    harvestMarkerToken(args, input);
+    if (args.includes('config') && args.includes('current-context')) {
+      return { status: 0, stdout: 'kind-pod-test\n', stderr: '' };
+    }
+    if (args.includes('apply')) {
+      appliedJob = true;
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    if (args.includes('logs')) {
+      // 마커 대기 읽기(--tail=2)만 자식의 마지막 줄(공용 결과 표지)을 돌려준다.
+      if (args.join(' ').includes('--tail=2')) {
+        // 자식이 실제로 남기는 바이트: 생산 매니페스트의 표지 줄 «그대로» 를 rc=0 으로 셸에서 실행한다.
+        markerLine = markerShellLine ? (spawnSync('bash', ['-c', `rc=0\n${markerShellLine}`], { encoding: 'utf8' }).stdout ?? '') : '';
+        return { status: 0, stdout: markerLine, stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    }
+    if (args.includes('get') && args.includes('job')) {
+      if (args.join(' ').includes('{.metadata.uid}')) {
+        // 존재 프로브: 적용 전에는 Job 이 없다(신규 런치 경로) · 적용 뒤에는 uid 를 준다.
+        if (!appliedJob) return { status: 1, stdout: '', stderr: 'Error from server (NotFound): jobs.batch not found' };
+        return { status: 0, stdout: 'uid-pod-warmboot-parity', stderr: '' };
+      }
+      jobReads += 1;
+      // 마커 판정이 없으면 조건이 터미널이 되어 루프가 닫힌다(무한 대기 방지).
+      return { status: 0, stdout: jobReads > 2 ? 'Complete' : 'Running', stderr: '' };
+    }
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const previousState = process.env.ELANOUS_STATE_DIR;
+  const previousRun = process.env.ELANOUS_RUN_ID;
+  try {
+    process.env.ELANOUS_STATE_DIR = root;
+    process.env.ELANOUS_RUN_ID = 'run-ta-pod-warmboot-parity';
+    // resultMarker 는 생산 기본값(주입 kubectl 없음 → ON)과 같은 상태로 무대를 세운다.
+    const result = await podSelfImplementSpawn({ kubectl, resultMarker: true, credentials: CREDS, sleep: async () => {} })({
+      feature: 'x',
+      spaceId: 'pod-warmboot-parity',
+    }).done;
+    const finished = loadRunLedger('run-ta-pod-warmboot-parity', runLedgerDir(root))
+      ?.filter((entry) => entry.data && typeof entry.data === 'object' && 'exitCode' in entry.data && 'phase' in entry.data)
+      .at(-1)?.data as { run?: string; phase?: string; exitCode?: number | null } | undefined;
+    // (1) 종료 마커 — 생산 매니페스트의 공용 표지 줄에 이 런치의 runId 가 실렸고, 자식이 그 줄을 남겼다.
+    // 생산 런치가 이 런치의 runId 로 표지를 무장했다(= 신규 Job 경로가 살아 있다).
+    expect(armedToken).toBeTruthy();
+    // 표지 «줄» 은 생산 매니페스트의 자식 스크립트에서 그대로 꺼낸 것이고, 그 줄을 셸에서 실행한 산출이 마커 로그다.
+    expect(markerShellLine).toContain(String(armedToken));
+    expect(markerLine).toBe(`\n${POD_RESULT_MARKER} ${armedToken} rc=0\n`);
+    // (2) 공용 결과 표지 파싱 — 부모가 읽은 로그에서 같은 runId·exitCode 가 나온다.
+    expect(splitPodResultMarker(markerLine, String(armedToken))).toEqual({ logs: '', rc: 0 });
+    // (3) 부모 회수 — run-ledger 종료 행이 같은 runId·exitCode 를 읽는다.
+    expect(finished).toMatchObject({ run: String(armedToken), phase: 'complete', exitCode: 0 });
+    // 판정은 마커가 냈다: Job 조건이 터미널이 되기 전(첫 폴)에 회수됐다.
+    expect(jobReads).toBe(1);
+    expect(calls.some((call) => call.includes('logs'))).toBe(true);
+    expect(result).toBeTruthy();
+  } finally {
+    if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousState;
+    if (previousRun === undefined) delete process.env.ELANOUS_RUN_ID;
+    else process.env.ELANOUS_RUN_ID = previousRun;
+  }
+}, 120_000);

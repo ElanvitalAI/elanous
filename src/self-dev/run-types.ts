@@ -114,6 +114,9 @@ export interface SelfDevJobResult {
   completionDisposition?: string;
   /** Abandoned-run classification from the child. Independent of completionDisposition. */
   failureClassification?: AbandonedClassification;
+  /** Basis and explicit terminal reason are kept separate from the classification label. */
+  classificationBasis?: string;
+  terminationReason?: string;
   /** Provider failure evidence from the child result; absent when unobserved. */
   providerErrors?: { count: number; provider: string; category: 'quota' | 'credential' | 'request' | 'other' };
   /** Stable child run identity used to join its run-ledger proposal. */

@@ -9,6 +9,7 @@
 //   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--gate-pod-pool <pool>] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
 //   elanous release recover --run <runId> --pick <sha...> [--from export-check] [--command-root <path>] [--repo-root <path>] [--no-partial] [--json]
+//   elanous release recover-landing --run <runId> --merge <full-sha> [--from export-check] [--repo-root <path>] [--no-partial] [--json]
 //   elanous release rehearsal tick [--apply] [--checkout <dir>] [--shards <n>] [--remote <host>] [--recovery-run <id>] [--json]
 //   elanous release preflight --version <x.y.z> [--publish-at <iso>] [--json]   (컷 − 60분 main export 포함 사전 점검 · 읽기 전용 · ⛔ 있으면 exit 1)
 //   elanous release cut-branch --version <x.y.z> [--base <sha>] --pick <sha>... [--append] [--dry-run]
@@ -45,7 +46,7 @@ import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
 import { publishAtError } from '../../scripts/release-loop/publish-at.js';
 import { cutReleaseBranch } from '../../scripts/release-loop/cut-branch.js';
-import { planResumeReleaseRun, recoverReleaseRun, resumeReleaseRun, ReleaseRecoverStopped, type RecoverReleaseDeps } from '../../scripts/release-loop/resume-release.js';
+import { planResumeReleaseRun, recoverLandingPartialOption, recoverReleaseRun, recoverReleaseRunFromLanding, resumeReleaseRun, ReleaseRecoverStopped, type RecoverReleaseDeps } from '../../scripts/release-loop/resume-release.js';
 import type { AcceptedRegression } from '../../scripts/release-loop/resume.js';
 import type { PrereleaseKind } from '../../scripts/release-loop/release-version.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
@@ -1387,6 +1388,31 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           return { ok: false as const, error: caught.message, stages: [...caught.stages], notRun: [...caught.notRun] };
         }
       }, (r) => r.stages.every((stage) => stage.outcome === 'ok'));
+    });
+  release.command('recover-landing')
+    .description('착지 알림 수동 재생 입구 — merge SHA로 중복을 억제하고 append → tip 고정 → export-check 재개를 수행한다. release-loop event hook 착지 전에는 사람이 직접 호출한다')
+    .requiredOption('--run <runId>', '실패한 release-loop 런 ID')
+    .requiredOption('--merge <sha>', 'main에 착지한 수리 커밋의 전체 40자리 SHA')
+    .option('--from <node>', '재개 시작 노드 — 기본 export-check')
+    .option('--command-root <path>', '재개 명령을 실행할 checkout — 생략 시 append tip 임시 checkout')
+    .option('--repo-root <path>', 'append를 실행할 checkout — origin remote 필요')
+    .option('--no-partial', 'Pod image digest 등이 맞지 않으면 전체 gate를 실행하며 부분 재검을 사용하지 않음')
+    .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
+    .action(async (o: { run: string; merge: string; from?: string; commandRoot?: string; repoRoot?: string; partial?: boolean; json?: boolean }) => {
+      await jsonAction(o.json, async (log) => {
+        try {
+          const partial = recoverLandingPartialOption(o.partial);
+          return await recoverReleaseRunFromLanding({ runId: o.run, mergeSha: o.merge,
+            ...(o.from === undefined ? {} : { from: o.from }),
+            ...(o.commandRoot === undefined ? {} : { commandRoot: o.commandRoot }),
+            ...(o.repoRoot === undefined ? {} : { repoRoot: o.repoRoot }),
+            ...(partial === undefined ? {} : { partial }) },
+          { ...resumeDeps, onSource: log });
+        } catch (caught) {
+          if (!(caught instanceof ReleaseRecoverStopped)) throw caught;
+          return { ok: false as const, error: caught.message, stages: [...caught.stages], notRun: [...caught.notRun], duplicate: false };
+        }
+      }, (r) => r.duplicate || r.stages.every((stage) => stage.outcome === 'ok'));
     });
   release.command('gate-history')
     .description('GATE-FAIL-HISTORY (0.2.29) — 판을 넘는 게이트 실패 표 — 모든 release-loop·light-rc 런 원장 ⊕ gate-verdict 에서 시험 파일별 introduced·preexisting·env·flaky 횟수 · 마지막 실패 판 · 원인 PR(수리 PR 본문 «원인 #N»)')

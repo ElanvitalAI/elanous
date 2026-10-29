@@ -1,0 +1,16 @@
+id: gpt-6.1-terra
+provider: openai
+displayName: GPT-6.1 Terra
+family: gpt-6
+familyShortcut: terra
+contextSize: 500000
+pricing:
+  inputPerMTok: 1
+  outputPerMTok: 5
+  cachedInputPerMTok: 0.05
+releaseDate: 2026-10-26
+discoveryMeta:
+  source: manual
+  lastSeen: 2026-10-28
+  autoFilled: false
+  confidence: high

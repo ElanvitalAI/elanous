@@ -2,11 +2,13 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Terminal } from '@xterm/headless';
 import * as listCompatibility from './list.js';
 import { applySidetabKey, createSidetabState, formatSidetabLines, loadSidetabRows, sidetabRowIndexAtTerminalRow, sidetabRowsFromManifest, sidetabWidthForTerminal, type SidetabRow } from '../../sidetab-core/model.js';
-import { setPtyManifestDbPathForTesting, updatePtyManifestSession, upsertPtyManifest, type PtyManifestRow } from '../../pty-shell/pty-manifest.js';
+import { listPtyManifestRows, setPtyManifestDbPathForTesting, updatePtyManifestSession, updatePtyManifestSnapshot, updatePtyManifestTurn, upsertPtyManifest, type PtyManifestRow } from '../../pty-shell/pty-manifest.js';
 import { mockSeatPtySequence } from '../../ux-sim/mock-seat-pty-sequence.js';
 import { appendMessage, createSession } from '../../session/index.js';
+import { bunSpawnPty, type MinimalPty } from '../../pty-shell/bun-native-pty.js';
 
 const BIN = join(import.meta.dir, '..', '..', '..', 'bin', 'elanous.mjs');
 
@@ -18,10 +20,10 @@ const manifestRow = (overrides: Partial<PtyManifestRow>): PtyManifestRow => ({
 });
 
 describe('next TUI sidetab', () => {
-  test('legacy list entry point re-exports the shared model', () => {
+  test('legacy list entry point re-exports core controls and enriches rows for previews', () => {
     expect(listCompatibility.applySidetabKey).toBe(applySidetabKey);
-    expect(listCompatibility.loadSidetabRows).toBe(loadSidetabRows);
-    expect(listCompatibility.formatSidetabLines).toBe(formatSidetabLines);
+    expect(listCompatibility.loadSidetabRows).not.toBe(loadSidetabRows);
+    expect(listCompatibility.formatSidetabLines).not.toBe(formatSidetabLines);
   });
 
   test('toggle opens and closes without changing selection', () => {
@@ -109,6 +111,20 @@ describe('next TUI sidetab', () => {
     expect(lines.every((line) => Bun.stringWidth(line) === 12)).toBe(true);
   });
 
+  test('renders only the selected row snapshot beneath that row', () => {
+    const rows = [
+      { id: 'pty:1', label: 'first › marker', kind: 'shell', badge: 'idle', previewSource: 'first-output' },
+      { id: 'pty:2', label: 'second', kind: 'agent', badge: 'busy', previewSource: 'old\nlatest-output' },
+    ] as SidetabRow[];
+    const lines = listCompatibility.formatSidetabLines(rows, 1, 28, 12);
+    const selectedLine = lines.findIndex((line) => line.includes('› busy second'));
+    expect(selectedLine).toBeGreaterThanOrEqual(0);
+    expect(lines[selectedLine + 1]).toBe(' '.repeat(28));
+    expect(lines[selectedLine + 2]).toContain('old');
+    expect(lines[selectedLine + 3]).toContain('latest-output');
+    expect(lines.join('\n')).not.toContain('first-output');
+  });
+
   test('scrolls a selected row into the available panel height', () => {
     const rows: SidetabRow[] = Array.from({ length: 8 }, (_, index) => ({
       id: `pty:${index}`, label: `agent-${index}`, kind: 'agent', badge: 'idle',
@@ -124,6 +140,136 @@ describe('next TUI sidetab', () => {
     const lines = formatSidetabLines([], 0, 16, 4, 'new');
     expect(lines).toEqual([' 새 PTY         ', ' s shell · e el…', ' c codex · l cl…']);
   });
+
+  test('real PTY key-to-paint latency stays within baseline with a large selected snapshot', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'next-sidetab-input-lag-'));
+    const terminal = new Terminal({ rows: 24, cols: 80, scrollback: 0, allowProposedApi: true });
+    const children: MinimalPty[] = [];
+    const childDataHandlers: Array<{ dispose(): void }> = [];
+    const envKeys = ['ELANOUS_STATE_DIR', 'ELANOUS_STATE_DIR_SOURCE', 'ELANOUS_SESSION_ROOT'] as const;
+    const savedEnv = Object.fromEntries(envKeys.map((name) => [name, process.env[name]]));
+    const env = {
+      PATH: process.env.PATH ?? '', HOME: root, TERM: 'xterm-256color', LANG: 'C.UTF-8',
+      USER: process.env.USER ?? 'sidetab-test', LOGNAME: process.env.LOGNAME ?? 'sidetab-test',
+      XDG_CONFIG_HOME: join(root, '.config'), XDG_DATA_HOME: join(root, '.local', 'share'),
+      XDG_CACHE_HOME: join(root, '.cache'), ELANOUS_STATE_DIR: root, ELANOUS_STATE_DIR_SOURCE: 'explicit',
+      ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_SKIP_LOGIN_ENV: '1',
+      ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
+    };
+    const readScreen = () => Array.from({ length: 24 }, (_, row) => terminal.buffer.active.getLine(terminal.buffer.active.viewportY + row)?.translateToString(true) ?? '').join('\n');
+    let app: MinimalPty | undefined;
+    let appData: { dispose(): void } | undefined;
+    let appExit: { dispose(): void } | undefined;
+    let exitCode: number | null = null;
+    let outputPending = Promise.resolve();
+    let lastScreen = '';
+    const waitForScreen = async (predicate: (screen: string) => boolean, label: string, timeoutMs = 30_000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await outputPending;
+        lastScreen = readScreen();
+        if (predicate(lastScreen)) return lastScreen;
+        if (exitCode !== null) throw new Error(`next TUI exited (${exitCode}) before ${label}\n${lastScreen}`);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      throw new Error(`timed out waiting for ${label}\n${lastScreen}`);
+    };
+    const keyToPaint = async () => {
+      const startedAt = performance.now();
+      app!.write('a');
+      await waitForScreen((screen) => screen.includes('❯ a'), 'typed composer character');
+      const elapsedMs = performance.now() - startedAt;
+      app!.write('\x15');
+      await waitForScreen((screen) => screen.includes('❯') && !screen.includes('❯ a'), 'cleared composer');
+      return elapsedMs;
+    };
+    const median = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]!;
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      process.env.ELANOUS_STATE_DIR_SOURCE = 'explicit';
+      process.env.ELANOUS_SESSION_ROOT = join(root, 'sessions');
+      writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+      setPtyManifestDbPathForTesting(join(root, 'pty', 'manifest.db'));
+      app = bunSpawnPty(process.execPath, [BIN, '--config-dir', root, '--test-state-dir', root, '--tui', 'next'], {
+        name: 'xterm-256color', cols: 80, rows: 24, cwd: root, env,
+      });
+      appData = app.onData((chunk) => {
+        outputPending = outputPending.then(() => new Promise<void>((resolve) => terminal.write(chunk, resolve)));
+      });
+      appExit = app.onExit(({ exitCode: code }) => { exitCode = code; });
+      await waitForScreen((screen) => screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료') && screen.includes('❯'), 'next TUI ready');
+
+      const now = Date.now();
+      for (const [id, label] of [['pty:82001', 'shell-child-a']] as const) {
+        const prefix = JSON.stringify(`${label}-line-`);
+        const child = bunSpawnPty(process.execPath, ['-e', `let n=0; setInterval(() => process.stdout.write(${prefix} + (++n) + '\\n'), 300)`], {
+          name: 'xterm-256color', cols: 80, rows: 24, cwd: root,
+          env: { PATH: env.PATH, HOME: root, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
+        });
+        children.push(child);
+        upsertPtyManifest({
+          id, kind: id.includes('82001') ? 'shell' : 'agent', cmd: label, purpose: label,
+          startedAt: now, now, ptyPid: child.pid,
+          identity: { parentPtyId: `tui:${app.pid}`, parentPid: app.pid },
+        });
+        let captured = Array.from({ length: 6_000 }, (_, line) => `${label}-seed-${line}`).join('\n');
+        expect(updatePtyManifestSnapshot(id, () => captured, now)).toBe(true);
+        expect(listPtyManifestRows().find((row) => row.id === id)?.snapshot).toContain(`${label}-seed-5999`);
+        childDataHandlers.push(child.onData((chunk) => {
+          captured = `${captured}\n${chunk}`.slice(-128_000);
+          updatePtyManifestSnapshot(id, () => captured, Date.now());
+        }));
+        updatePtyManifestTurn(id, 'idle', now);
+      }
+
+      app.write('\x1c');
+      await waitForScreen((screen) => screen.includes('shell-child-a'), 'sidetab open');
+      // Let the first manifest write pass the snapshot throttle, then update the
+      // already-visible row so this exercises the TUI refresh path as well as
+      // its initial list load.
+      await new Promise((resolve) => setTimeout(resolve, 1_600));
+      // Stop fixture writes so the same open sidetab can measure a preview-free
+      // baseline and then a large selected snapshot under matching conditions.
+      setPtyManifestDbPathForTesting(join(root, 'pty', 'manifest.db'));
+      childDataHandlers[0]?.dispose();
+      expect(updatePtyManifestSnapshot('pty:82001', () => '', Date.now())).toBe(true);
+      await waitForScreen((screen) => !screen.includes('shell-child-a-seed'), 'open sidetab without preview');
+      const baseline = [] as number[];
+      for (let i = 0; i < 12; i++) baseline.push(await keyToPaint());
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      const selectedSnapshot = `${Array.from({ length: 6_000 }, (_, line) => `shell-child-a-seed-${line}`).join('\n')}\nfresh-live-99999\n`;
+      expect(updatePtyManifestSnapshot('pty:82001', () => selectedSnapshot, Date.now())).toBe(true);
+      expect(listPtyManifestRows().find((row) => row.id === 'pty:82001')?.snapshot).toContain('fresh-live-99999');
+      await waitForScreen((screen) => screen.includes('fresh-live-99999'), 'selected live snapshot refresh');
+      const withPeek = [] as number[];
+      for (let i = 0; i < 12; i++) withPeek.push(await keyToPaint());
+      const beforeMs = median(baseline);
+      const afterMs = median(withPeek);
+      console.info(`sidetab key-to-paint ms p50: baseline=${beforeMs.toFixed(1)} preview=${afterMs.toFixed(1)} samples=${baseline.length}`);
+      expect(withPeek).toHaveLength(12);
+      expect(afterMs).toBeLessThanOrEqual(beforeMs + 10);
+      app.write('\x1c');
+      await waitForScreen((screen) => !screen.includes('fresh-live-99999'), 'sidetab close after snapshot update');
+      app.write('\x1c');
+      await waitForScreen((screen) => screen.includes('↑↓ 전환'), 'sidetab reopen after snapshot update');
+
+      app.write('\x11');
+      await waitForScreen(() => exitCode !== null, 'next TUI exit', 10_000);
+    } finally {
+      try { app?.kill(); } catch { /* already exited */ }
+      appData?.dispose();
+      appExit?.dispose();
+      for (const data of childDataHandlers) data.dispose();
+      for (const child of children) { try { child.kill(); } catch { /* already exited */ } }
+      setPtyManifestDbPathForTesting(null);
+      terminal.dispose();
+      for (const name of envKeys) {
+        const value = savedEnv[name];
+        if (value === undefined) delete process.env[name]; else process.env[name] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   test('real next TUI shows two isolated PTY children and restores the closed chat frame', async () => {
     const root = mkdtempSync(join(tmpdir(), 'next-sidetab-'));

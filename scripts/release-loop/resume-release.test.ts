@@ -1,12 +1,12 @@
-import { expect, test } from 'bun:test';
+import { afterAll, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { acquireOpSeatFlock, opSeatFlockPath, resyncTickWithReleaseProbe } from '../../src/steward/resync-tick.js';
-import { planResumeReleaseRun, resumeReleaseRun, type RecoverReleaseDeps } from './resume-release.js';
+import { planResumeReleaseRun, recoverLandingPartialOption, resumeReleaseRun, type RecoverReleaseDeps, type RecoverReleaseResult } from './resume-release.js';
 import { type CutBranchOptions } from './cut-branch.js';
 import { Command } from 'commander';
 import { registerReleaseCommands } from '../../src/cli/release-cli.js';
@@ -14,10 +14,25 @@ import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { partialPlanPath } from './gate-partial.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
 import { runGraph, verifyReleaseCommandRoot } from '../../src/graph-runner/runner.js';
+import { createGateRunner, runGateNode, type GateRunner } from './gate-node.js';
+import { gateEnvFingerprint } from './gate-baseline-receipt.js';
+import { markGateShardUnmeasured, saveGateShardResult } from './gate-shard-receipts.js';
+import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 
 const SHA = 'a'.repeat(40);
 const VERSION = '0.2.19';
 const releaseGraphDir = join(import.meta.dir, '../../graphs/release');
+
+// The Pod gate checkout installs root packages but intentionally omits apps/pwa dependencies. Most resume tests use
+// the real checkout as commandRoot while stubbing graph execution; provide the directory-only preflight fixture they
+// require, then remove only the directory this module created. The explicit missing-dependencies case below uses its
+// own temp commandRoot and continues to exercise the fail-closed production check.
+const podPwaNodeModules = join(process.cwd(), 'apps', 'pwa', 'node_modules');
+const createdPodPwaNodeModules = !existsSync(podPwaNodeModules);
+if (createdPodPwaNodeModules) mkdirSync(podPwaNodeModules, { recursive: true });
+afterAll(() => {
+  if (createdPodPwaNodeModules) rmdirSync(podPwaNodeModules);
+});
 
 function configureTraffic(root: string): void {
   const trafficFile = join(root, 'release-traffic.json');
@@ -47,14 +62,15 @@ function writeFailedRun(root: string, runId = 'r', gateOutput = '{"outcome":"ok"
   const state = {
     graphId: 'release-loop', runId, status: 'failed',
     input: { version: VERSION, branchCut: true },
-    path: ['version-release', 'gate', 'tui', 'failed'],
+    path: ['version-release', 'cutoff', 'gate', 'tui', 'failed'],
     nodes: [
       { nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutCommit, branch: `release/${VERSION}` }) },
+      { nodeId: 'cutoff', ok: true, exit: 0, executed: true, output: JSON.stringify({ baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: cutCommit } }) },
       { nodeId: 'gate', ok: true, exit: 0, executed: true, output: gateOutput },
       { nodeId: 'tui', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' },
       { nodeId: 'failed', ok: true, exit: 0, executed: false },
     ],
-    executed: 3, dryRun: false, statePath,
+    executed: 4, dryRun: false, statePath,
     graphSnapshot: {
       graphSha: createHash('sha256').update(readFileSync(join(releaseGraphDir, 'release-loop.yaml'))).digest('hex'),
       recipesSha: createHash('sha256').update(readFileSync(join(releaseGraphDir, 'recipes.yaml'))).digest('hex'),
@@ -68,6 +84,95 @@ function gitStub(args: string[]): string {
   if (args[0] === 'ls-remote') return `${SHA}\trefs/heads/release/${VERSION}`;
   if (args[0] === 'rev-parse') return SHA;
   return '';
+}
+
+function writeInterruptedShardReceipts(root: string, envKey = `${gateEnvFingerprint(process.env)}:sha256:${'c'.repeat(64)}`): void {
+  const receiptRoot = join(root, 'release', VERSION, 'gate-logs', 'cut', 'receipts');
+  mkdirSync(receiptRoot, { recursive: true });
+  saveGateShardResult(receiptRoot, { receipt: { id: 'pod-0', files: ['src/complete.test.ts'], head40: SHA,
+    base40: 'b'.repeat(40), host: 'node-b', envKey, status: 'complete', failureIds: [], errorIds: [],
+    evidencePath: 'pending', evidenceSha256: '0'.repeat(64), measuredAt: '2026-10-29T02:00:00.000Z', attempt: 1 },
+    runs: [{ output: '1 pass', rc: 0, pass: 1, fail: 0, errors: 0, ran: 1, files: 1, passedIds: ['src/complete.test.ts > ok'] }] });
+  markGateShardUnmeasured(receiptRoot, { id: 'pod-1', files: ['src/stalled.test.ts'], head40: SHA,
+    base40: 'b'.repeat(40), host: 'pending', envKey: `${gateEnvFingerprint(process.env)}:unmeasured`, status: 'unmeasured',
+    failureIds: [], errorIds: [], evidencePath: 'pending', evidenceSha256: '0'.repeat(64),
+    measuredAt: '2026-10-29T02:00:00.000Z', attempt: 1 });
+  writeFileSync(join(root, 'release', VERSION, 'gate-logs', 'cut', 'pod-0.json'), JSON.stringify({
+    commit: SHA, imageDigest: `sha256:${'c'.repeat(64)}`,
+  }));
+}
+
+async function sigtermActualGate(root: string): Promise<void> {
+  const gateUrl = new URL('./gate-node.js', import.meta.url).href;
+  const poolUrl = new URL('../../src/task-orchestrator/surfaces/pod-pool.js', import.meta.url).href;
+  const script = `import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createGateRunner, runGateNode } from ${JSON.stringify(gateUrl)};
+import { PodPoolScheduler } from ${JSON.stringify(poolUrl)};
+import { setElanousConfigDir } from ${JSON.stringify(new URL('../../src/elanous-config-dir.js', import.meta.url).href)};
+const root = ${JSON.stringify(root)}, head40 = ${JSON.stringify(SHA)}, base40 = 'b'.repeat(40);
+const repo = join(root, 'fixture-repo');
+const files = ['src/complete.test.ts', 'src/stalled.test.ts'], imageDigest = 'sha256:' + 'c'.repeat(64);
+setElanousConfigDir(root);
+process.env.ELANOUS_STATE_DIR = root;
+const context = JSON.stringify({ runId: 'r', nodeId: 'gate', input: { version: ${JSON.stringify(VERSION)}, previousVersion: '0.2.18', gatePodPool: 'pool-test', gatePodShards: 2 },
+  outputs: { 'version-release': { commit: head40 }, cutoff: { baseline: { sha: base40 } } } });
+mkdirSync(repo, { recursive: true });
+mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });
+writeFileSync(join(root, 'release', '0.2.18', 'release.json'), JSON.stringify({ version: '0.2.18', sourceCommit: base40 }));
+writeFileSync(join(root, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: base40, failures: [], errors: [] }));
+const command = async (cmd, args) => cmd === 'git' && args[0] === 'rev-parse' ? { rc: 0, output: head40 + '\\n' }
+  : cmd === 'git' && args[0] === 'ls-files' ? { rc: 0, output: files.join('\\n') + '\\n' }
+    : cmd === 'rg' ? { rc: 1, output: '' } : { rc: 0, output: '' };
+const kubectl = (args) => args.includes('get') && args.includes('ns')
+  ? { status: 0, stdout: '{}', stderr: '' }
+  : args.includes('get') && args.includes('pods')
+    ? { status: 0, stdout: JSON.stringify({ items: [{ status: { containerStatuses: [{ name: 'child', imageID: 'registry.local/elanous@' + imageDigest }] } }] }), stderr: '' }
+    : { status: 0, stdout: '{}', stderr: '' };
+let job = 0;
+const podCommand = async (options) => {
+  job++;
+  const lease = await options.poolScheduler.tryAcquire();
+  if (!lease) throw new Error('fixture pool did not grant the shard slot');
+  const text = options.command[2] || '';
+  if (options.provenance.shard === '2-of-2') {
+    const completedReceipt = join(root, 'release', ${JSON.stringify(VERSION)}, 'gate-logs', 'cut', 'receipts', 'pod-0.receipt.json');
+    const receiptDeadline = Date.now() + 10_000;
+    let complete = false;
+    while (Date.now() < receiptDeadline) {
+      if (existsSync(completedReceipt)) {
+        try { complete = JSON.parse(readFileSync(completedReceipt, 'utf8')).status === 'complete'; } catch { /* atomic write may be in progress */ }
+        if (complete) break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (!complete) throw new Error('completed shard receipt did not appear before the stalled shard signal');
+    writeFileSync(join(root, 'receipt-writer-ready'), 'ready');
+    await new Promise(() => {});
+  }
+  const assigned = files.filter((file) => text.includes("'./" + file + "'"));
+  if (!assigned.length) throw new Error('gate shard shell did not name its assigned test files');
+  const artifactsDir = join(root, 'artifacts-' + job);
+  mkdirSync(artifactsDir, { recursive: true });
+  writeFileSync(join(artifactsDir, 'install.rc'), '0\\n');
+  writeFileSync(join(artifactsDir, 'install.log'), '');
+  writeFileSync(join(artifactsDir, 'part-0.rc'), '0\\n');
+  const suites = assigned.map((file) => '<testsuite file="' + file + '" tests="1"><testcase name="ok" file="' + file + '"/></testsuite>').join('');
+  const log = assigned.map((file) => file + ':\\n(pass) ok [1.00ms]').join('\\n')
+    + '\\n' + assigned.length + ' pass\\n0 fail\\nRan ' + assigned.length + ' tests across ' + assigned.length + ' files.\\n';
+  writeFileSync(join(artifactsDir, 'part-0.log'), log);
+  writeFileSync(join(artifactsDir, 'part-0.junit.xml'), '<testsuites tests="' + assigned.length + '">' + suites + '</testsuites>');
+  options.poolScheduler.release(lease);
+  return { exitCode: 0, artifactsDir, job: 'gate-' + job };
+};
+const runner = createGateRunner(repo, undefined, command, podCommand, undefined, undefined, { kubectl });
+await runGateNode(['--json'], { ELANOUS_GRAPH_CONTEXT: context, ELANOUS_STATE_DIR: root }, runner, undefined, () => imageDigest);`;
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'ignore', stderr: 'pipe' });
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(join(root, 'receipt-writer-ready')) && Date.now() < deadline) await Bun.sleep(10);
+  if (!existsSync(join(root, 'receipt-writer-ready'))) { child.kill('SIGKILL'); await child.exited; throw new Error('receipt writer child did not become ready'); }
+  child.kill('SIGTERM');
+  await child.exited;
 }
 
 test('resume dry-run checks the saved cut and checkout without running nodes or changing release state', async () => {
@@ -274,7 +379,90 @@ test('resume dry-run on a moved cut reports the fail-closed full-gate fallback w
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test('RELEASE-GATE-RADIUS-POD-IMAGE: a Pod resume without prior shard receipts falls back to a full gate', async () => {
+test('GATE-RESUME-STALLED-ONLY: SIGTERM leaves shard receipts and moved-tip resume plans the bounded rerun', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-moved-stall-receipts-'));
+  setElanousConfigDir(root);
+  const moved = 'b'.repeat(40);
+  await sigtermActualGate(root);
+  const receiptDir = join(root, 'release', VERSION, 'gate-logs', 'cut', 'receipts');
+  const completed = JSON.parse(readFileSync(join(receiptDir, 'pod-0.receipt.json'), 'utf8')) as { files: string[]; status: string };
+  const stalled = JSON.parse(readFileSync(join(receiptDir, 'pod-1.receipt.json'), 'utf8')) as { files: string[]; status: string };
+  expect(completed.status).toBe('complete');
+  expect(stalled.status).toBe('unmeasured');
+  writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: SHA,
+    stalledShards: [{ shard: 1, files: stalled.files, reason: 'job-failed' }],
+    partialSummary: { pass: 1, fail: 0, errors: 0, ran: 1, files: 1 },
+    partialFailures: { failures: [], errors: [] }, preservedShardCount: 1 }));
+  const state = JSON.parse(readFileSync(join(root, 'graph-runs', 'release-loop', 'r.json'), 'utf8')) as { input: Record<string, unknown> };
+  state.input.gatePodPool = 'pool-test';
+  writeFileSync(join(root, 'graph-runs', 'release-loop', 'r.json'), JSON.stringify(state));
+  const git = (args: string[]) => args[0] === 'ls-remote' ? `${moved}\trefs/heads/release/${VERSION}`
+    : args[0] === 'rev-parse' ? moved : args[0] === 'diff' ? 'src/changed.test.ts\n' : '';
+  try {
+    const resumed = await planResumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git, isAncestor: () => true,
+      gateTestsAtCommit: () => [...completed.files, ...stalled.files],
+      closureTree: () => ({ files: ['src/complete.test.ts', 'src/stalled.test.ts', 'src/changed.test.ts',
+        'src/other-1.test.ts', 'src/other-2.test.ts'] }) as never });
+    expect(resumed.partial).toMatchObject({ requested: true, applied: true, files: 2,
+      plannedFiles: ['src/changed.test.ts', 'src/stalled.test.ts'], priorCommit: SHA, auto: true });
+    expect(resumed.gatePlan).toEqual({ mode: 'partial' });
+    expect(resumed.tip).toMatchObject({ changed: true, from: SHA, to: moved });
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-RESUME-STALLED-ONLY: moved tip falls back to full gate when a shard receipt baseline differs from cutoff', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-moved-stall-baseline-'));
+  setElanousConfigDir(root);
+  const moved = 'b'.repeat(40);
+  writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: SHA,
+    stalledShards: [{ shard: 1, files: ['src/stalled.test.ts'], reason: 'job-failed' }],
+    partialSummary: { pass: 1, fail: 0, errors: 0, ran: 1, files: 1 },
+    partialFailures: { failures: [], errors: [] }, preservedShardCount: 1 }));
+  const statePath = join(root, 'graph-runs', 'release-loop', 'r.json');
+  const state = JSON.parse(readFileSync(statePath, 'utf8')) as { input: Record<string, unknown>; nodes: Array<{ nodeId: string; output?: string }> };
+  state.input.gatePodPool = 'pool-test';
+  const cutoff = state.nodes.find((node) => node.nodeId === 'cutoff')!;
+  cutoff.output = JSON.stringify({ baseline: { sha: 'd'.repeat(40) }, cutoff: { sha: SHA } });
+  writeFileSync(statePath, JSON.stringify(state));
+  writeInterruptedShardReceipts(root);
+  const git = (args: string[]) => args[0] === 'ls-remote' ? `${moved}\trefs/heads/release/${VERSION}`
+    : args[0] === 'rev-parse' ? moved : args[0] === 'diff' ? 'src/changed.test.ts\n' : '';
+  try {
+    const plan = await planResumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git, isAncestor: () => true,
+      gateTestsAtCommit: () => ['src/complete.test.ts', 'src/stalled.test.ts'],
+      closureTree: () => ({ files: ['src/complete.test.ts', 'src/stalled.test.ts', 'src/changed.test.ts'] }) as never });
+    expect(plan.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('baseline differs from saved cutoff') });
+    expect(plan.gatePlan.mode).toBe('full');
+    expect(existsSync(join(root, 'release', VERSION, 'gate-partial.json'))).toBe(false);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-RESUME-STALLED-ONLY: moved tip falls back to full gate when a shard receipt fingerprint differs', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-moved-stall-fingerprint-'));
+  setElanousConfigDir(root);
+  const moved = 'b'.repeat(40);
+  writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: SHA,
+    stalledShards: [{ shard: 1, files: ['src/stalled.test.ts'], reason: 'job-failed' }],
+    partialSummary: { pass: 1, fail: 0, errors: 0, ran: 1, files: 1 },
+    partialFailures: { failures: [], errors: [] }, preservedShardCount: 1 }));
+  const state = JSON.parse(readFileSync(join(root, 'graph-runs', 'release-loop', 'r.json'), 'utf8')) as { input: Record<string, unknown> };
+  state.input.gatePodPool = 'pool-test';
+  writeFileSync(join(root, 'graph-runs', 'release-loop', 'r.json'), JSON.stringify(state));
+  writeInterruptedShardReceipts(root, `wrong-fingerprint:sha256:${'c'.repeat(64)}`);
+  const git = (args: string[]) => args[0] === 'ls-remote' ? `${moved}\trefs/heads/release/${VERSION}`
+    : args[0] === 'rev-parse' ? moved : args[0] === 'diff' ? 'src/changed.test.ts\n' : '';
+  try {
+    const plan = await planResumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git, isAncestor: () => true,
+      gateTestsAtCommit: () => ['src/complete.test.ts', 'src/stalled.test.ts'],
+      closureTree: () => ({ files: ['src/complete.test.ts', 'src/stalled.test.ts', 'src/changed.test.ts',
+        'src/other-1.test.ts', 'src/other-2.test.ts'] }) as never });
+    expect(plan.partial).toMatchObject({ requested: true, applied: false, reason: expect.stringContaining('environment mismatch') });
+    expect(plan.gatePlan.mode).toBe('full');
+    expect(existsSync(join(root, 'release', VERSION, 'gate-partial.json'))).toBe(false);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RELEASE-GATE-RADIUS-POD-IMAGE: missing or mismatched Pod shard digests force a full resume gate', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-resume-pod-image-missing-'));
   setElanousConfigDir(root);
   const saved = writeFailedRun(root);
@@ -294,10 +482,15 @@ test('RELEASE-GATE-RADIUS-POD-IMAGE: a Pod resume without prior shard receipts f
     const plan = await planResumeReleaseRun({ runId: 'r', from: 'gate', commandRoot }, deps);
     expect(plan.gatePlan).toEqual({ mode: 'full', reason: 'executed-pod-image-digest-missing' });
     expect(existsSync(partialPlanPath(root, VERSION))).toBe(false);
-    delete state.input.gatePodPool;
-    writeFileSync(saved.statePath, JSON.stringify(state));
     const cut = join(releaseDir, 'gate-logs', 'cut');
     mkdirSync(cut, { recursive: true });
+    writeFileSync(join(cut, 'pod-0.json'), JSON.stringify({ commit: SHA, imageDigest: `sha256:${'e'.repeat(64)}` }));
+    writeFileSync(join(cut, 'pod-1.json'), JSON.stringify({ commit: SHA, imageDigest: `sha256:${'f'.repeat(64)}` }));
+    const mismatched = await planResumeReleaseRun({ runId: 'r', from: 'gate', commandRoot }, deps);
+    expect(mismatched.gatePlan).toEqual({ mode: 'full', reason: 'executed-pod-image-digest-mismatch' });
+    expect(existsSync(partialPlanPath(root, VERSION))).toBe(false);
+    delete state.input.gatePodPool;
+    writeFileSync(saved.statePath, JSON.stringify(state));
     writeFileSync(join(cut, 'pod-0.json'), JSON.stringify({ commit: SHA }));
     const hostPlan = await planResumeReleaseRun({ runId: 'r', from: 'gate', commandRoot }, deps);
     expect(hostPlan.gatePlan).toEqual({ mode: 'partial' });
@@ -938,6 +1131,31 @@ async function invokeRecover(args: string[], deps: RecoverReleaseDeps): Promise<
   } finally { process.stdout.write = write; }
 }
 
+async function invokeRecoverLanding(args: string[], deps: RecoverReleaseDeps): Promise<RecoverReleaseResult & { duplicate: boolean }> {
+  const lines: string[] = [];
+  const write = process.stdout.write;
+  process.stdout.write = ((value: string | Uint8Array) => { lines.push(String(value).trim()); return true; }) as typeof process.stdout.write;
+  try {
+    process.exitCode = 0;
+    const cmd = new Command();
+    registerReleaseCommands(cmd, {}, {}, {}, {}, {}, deps);
+    await cmd.parseAsync(['release', 'recover-landing', ...args, '--json'], { from: 'user' });
+    return JSON.parse(lines.at(-1)!) as RecoverReleaseResult & { duplicate: boolean };
+  } finally { process.stdout.write = write; }
+}
+
+test('RELEASE-RESUME-LIFECYCLE-AUTO: Commander default allows partial planning and --no-partial passes false', () => {
+  const normalized: Array<boolean | undefined> = [];
+  for (const extra of [[], ['--no-partial']]) {
+    const command = new Command();
+    command.command('recover-landing').option('--no-partial').action((options: { partial?: boolean }) => {
+      normalized.push(recoverLandingPartialOption(options.partial));
+    });
+    command.parse(['node', 'test', 'recover-landing', ...extra], { from: 'node' });
+  }
+  expect(normalized).toEqual([undefined, false]);
+});
+
 test('RELEASE-RECOVER-ONE-CMD: one recover appends the repair with the real cutReleaseBranch push and reaches the resume plan from its own tip checkout', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-recover-one-cmd-'));
   setElanousConfigDir(root);
@@ -983,6 +1201,77 @@ test('RELEASE-RECOVER-ONE-CMD: one recover appends the repair with the real cutR
     expect(ledger.attempts.every((at) => Number.isFinite(Date.parse(at)))).toBe(true);
     expect(ledger.recoveries.map((stage) => [stage.stage, stage.outcome]))
       .toEqual([['append-dry-run', 'ok'], ['append', 'ok'], ['resume', 'ok']]);
+  } finally {
+    process.exitCode = previousExit ?? 0;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test('RELEASE-RESUME-LIFECYCLE-AUTO E4: replaying one merge SHA appends and resumes once', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-recover-landing-dedupe-'));
+  setElanousConfigDir(root);
+  const previousExit = process.exitCode;
+  const seat = buildRecoverSeat(root);
+  writeRecoverRun(root, 'r', seat.cut);
+  mkdirSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts'), { recursive: true });
+  writeFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'),
+    JSON.stringify({ version: RECOVER_VERSION, runId: 'r', attempts: [] }));
+  let graphCalls = 0;
+  try {
+    const deps: RecoverReleaseDeps = { root, repo: seat.work,
+      graph: async () => { graphCalls++; return { status: 'done', runId: 'r' } as never; } };
+    const first = await invokeRecoverLanding(['--run', 'r', '--merge', seat.pick, '--repo-root', seat.work, '--no-partial'], deps);
+    const tipAfterFirst = seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`);
+    const second = await invokeRecoverLanding(['--run', 'r', '--merge', seat.pick, '--repo-root', seat.work, '--no-partial'], deps);
+    const tipAfterSecond = seatGit(seat.origin, 'rev-parse', `refs/heads/release/${RECOVER_VERSION}`);
+
+    expect(first).toMatchObject({ duplicate: false, runId: 'r', version: RECOVER_VERSION, fromNode: 'export-check',
+      stages: [{ stage: 'append-dry-run', outcome: 'ok', pick: [seat.pick] },
+        { stage: 'append', outcome: 'ok', pick: [seat.pick] }, { stage: 'resume', outcome: 'ok', pick: [seat.pick] }] });
+    expect(first.resume?.partial).toMatchObject({ requested: false });
+    expect(second).toMatchObject({ duplicate: true, runId: 'r', version: RECOVER_VERSION, fromNode: 'export-check' });
+    expect(second.stages.map(({ stage, outcome }) => [stage, outcome])).toEqual([['append-dry-run', 'ok'], ['append', 'ok'], ['resume', 'ok']]);
+    expect(tipAfterFirst).not.toBe(seat.cut);
+    expect(tipAfterSecond).toBe(tipAfterFirst);
+    expect(graphCalls).toBe(1);
+  } finally {
+    process.exitCode = previousExit ?? 0;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test('RELEASE-RESUME-LIFECYCLE-AUTO E4: merge SHA inside a multi-pick recovery is deduped without append or resume', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-recover-landing-multipick-dedupe-'));
+  setElanousConfigDir(root);
+  const previousExit = process.exitCode;
+  const seat = buildRecoverSeat(root);
+  writeRecoverRun(root, 'r', seat.cut);
+  mkdirSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts'), { recursive: true });
+  const picks = ['f'.repeat(40), seat.pick];
+  writeFileSync(join(root, 'release', RECOVER_VERSION, 'resume-attempts', 'r.json'), JSON.stringify({
+    version: RECOVER_VERSION, runId: 'r', attempts: [], recoveries: [
+      { stage: 'append-dry-run', outcome: 'ok', at: '2026-10-28T00:00:00.000Z', pick: picks },
+      { stage: 'append', outcome: 'ok', at: '2026-10-28T00:01:00.000Z', branch: `release/${RECOVER_VERSION}`, commit: 'a'.repeat(40), pick: picks },
+      { stage: 'resume', outcome: 'ok', at: '2026-10-28T00:02:00.000Z', from: 'export-check', pick: picks },
+    ],
+  }));
+  let graphCalls = 0;
+  let cutCalls = 0;
+  try {
+    const deps: RecoverReleaseDeps = { root, repo: seat.work,
+      graph: async () => { graphCalls++; return { status: 'done', runId: 'r' } as never; },
+      cutBranch: () => { cutCalls++; throw new Error('duplicate landing must not append'); },
+    };
+    const duplicate = await invokeRecoverLanding(['--run', 'r', '--merge', seat.pick, '--repo-root', seat.work, '--no-partial'], deps);
+
+    expect(duplicate).toMatchObject({ duplicate: true, runId: 'r', version: RECOVER_VERSION, fromNode: 'export-check' });
+    expect(duplicate.stages.map(({ stage, outcome, pick }) => [stage, outcome, pick])).toEqual([
+      ['append-dry-run', 'ok', picks], ['append', 'ok', picks], ['resume', 'ok', picks],
+    ]);
+    expect(cutCalls).toBe(0);
+    expect(graphCalls).toBe(0);
   } finally {
     process.exitCode = previousExit ?? 0;
     resetElanousConfigDir();

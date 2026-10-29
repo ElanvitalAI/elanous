@@ -4,7 +4,11 @@ import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout, spyOn, test } from 'bun:test';
+
+// `ask dry-run`·`progress` 시험은 실제 골 문서 검사기와 실제 워커를 지나 파일당 5초 기본 상한을
+// 넘긴다(실측 5.9~6.8초). 상한을 파일 단위로 올려 부하에 따른 flake 를 없앤다 — 시험 동작은 불변.
+setDefaultTimeout(30_000);
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { loadRunLedger, runLedgerDir, appendRunLedgerEntry } from '../self-implement/run-ledger.js';
 import { readRunStopRecord } from '../self-implement/run-stop.js';
@@ -26,12 +30,15 @@ import { createFakeGh } from '../ux-sim/fake-gh.js';
 import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
 import { assessRunningRuns, buildRunProgressRows, renderRunProgressTable } from '../self-implement/running-runs.js';
+import type { RunningRunsResult } from '../self-implement/running-runs.js';
 import { launchRegistryDir, removeLaunchBinding, writeLaunchBinding } from './launch-registry.js';
 import { psProcessStartMs } from './harness-stop.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { GRAPH_SPECS } from '../self-implement/graph-templates.js';
 import type { GraphOverlaySpec } from '../self-implement/graph-overlay-yaml.js';
 import { setJourneyOverlaysForTesting } from '../self-dev/graph-journey-route.js';
+import { Worker } from 'node:worker_threads';
+import { shouldRunCliEntry } from './progress-worker-runtime.js';
 import {
   DEFAULT_HARNESS_PROCESS_THRESHOLDS,
   HARNESS_PROCESS_LONG_RUNNING_ELAPSED_SECONDS,
@@ -64,6 +71,9 @@ import {
   resolveHarnessProcessOwnership,
   resolveHarnessProcessParentStatus,
   setHarnessAskMarkerInspectorForTesting,
+  setHarnessProgressWorkerObserverForTesting,
+  queryProgressBounded,
+  type ProgressWorkerLifecycle,
   setHarnessUnpressedDecisionSignalInspectorForTesting,
   type HarnessLaunchdPidObservation,
   type HarnessProcessLedgerLookup,
@@ -109,6 +119,22 @@ const MEASURED_PS_EWW_OWNERSHIP = {
 };
 
 describe('harness CLI command', () => {
+  // 정지·발사 환경(자식 프로세스)이 물려주는 저작 등급 seam — 시험은 «자기가 세운» 값만 본다.
+  const AUTHOR_GRADE_SEAM_ENV = ['ELANOUS_AUTHOR_GRADE', 'ELANOUS_POD_AUTHOR_ON_POD', 'ELANOUS_POD_AUTHOR_GRADE', 'ELANOUS_POD_AUTHOR_GRADE_SOURCE'] as const;
+  let ambientAuthorGradeSeam: Array<string | undefined> = [];
+  beforeEach(() => {
+    ambientAuthorGradeSeam = AUTHOR_GRADE_SEAM_ENV.map((key) => process.env[key]);
+    for (const key of AUTHOR_GRADE_SEAM_ENV) delete process.env[key];
+  });
+  afterEach(() => {
+    AUTHOR_GRADE_SEAM_ENV.forEach((key, index) => {
+      const value = ambientAuthorGradeSeam[index];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    });
+    ambientAuthorGradeSeam = [];
+  });
+
   it('depth >= 1 ignores --nested-elanous allow and the launch stays refused', async () => {
     const program = new Command().exitOverride();
     const seen: Array<string | undefined> = [];
@@ -157,6 +183,11 @@ describe('harness CLI command', () => {
       setUserConfigOverlay((config) => ({ ...config, harness: { ...prior, authorGrade: undefined } }));
       await program.parseAsync(['harness', 'say', 'same sentence'], { from: 'user' });
       expect(seen.at(-1)).toEqual({ authorGrade: undefined, authorGradeSource: undefined });
+      process.env.ELANOUS_AUTHOR_GRADE = 'lite';
+      await program.parseAsync(['harness', 'say', 'same sentence'], { from: 'user' });
+      expect(seen.at(-1)).toEqual({ authorGrade: 'lite', authorGradeSource: 'env' });
+      await program.parseAsync(['harness', 'say', 'same sentence', '--author-grade', 'full'], { from: 'user' });
+      expect(seen.at(-1)).toEqual({ authorGrade: 'full', authorGradeSource: 'flag' });
     } finally {
       setUserConfigOverlay(null);
     }
@@ -4398,8 +4429,8 @@ test('harness progress --pid: a recorded live local binding returns only its run
     await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--pid', '4242', '--json']);
   } finally { console.log = original; }
   expect(queries).toEqual([
-    { runIds: ['run-local'], caller: 'harness.progress.pid' },
-    { runIds: ['run-local'], caller: 'harness.progress.pid' },
+    { runIds: ['run-local'], caller: 'harness.progress.pid', timeBudgetMs: 7_000 },
+    { runIds: ['run-local'], caller: 'harness.progress.pid', timeBudgetMs: 7_000 },
   ]);
   expect(printed[0]).toContain('pid 4242 · run-local · running');
   expect(printed[0]).not.toContain('run-other');
@@ -4475,6 +4506,317 @@ test('harness progress --pid reads a recorded local binding from the launch regi
   expect(printed).toHaveLength(3);
 });
 
+
+test('HARNESS-PROGRESS-HANG: a stalled provider stops inside the bound, keeps the rows it already has, and records progress-command-stalled', async () => {
+  const events: unknown[][] = [];
+  const originalDebugLog = debug.log;
+  debug.log = ((...args: unknown[]) => { events.push(args); }) as typeof debug.log;
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress: {
+    query: (() => new Promise(() => {})) as never,
+    nowMs: () => Date.parse('2026-10-11T00:30:00.000Z'),
+    timeoutMs: 25,
+  } as never });
+  const printed: string[] = [];
+  const errors: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  let hung = false;
+  const startedAt = Date.now();
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const guard = new Promise<boolean>((done) => { watchdog = setTimeout(() => done(true), 3_000); });
+  try {
+    hung = await Promise.race([
+      program.parseAsync(['node', 'elanous', 'harness', 'progress', '--json']).then(() => false),
+      guard,
+    ]);
+  } finally {
+    if (watchdog) clearTimeout(watchdog);
+    console.log = originalLog;
+    console.error = originalError;
+    debug.log = originalDebugLog;
+  }
+  expect(hung).toBe(false);
+  expect(Date.now() - startedAt).toBeLessThan(3_000);
+  expect(JSON.parse(printed[0]!)).toEqual([]);
+  const stallCall = events.find((args) => args[1] === 'progress-command-stalled');
+  expect(stallCall?.[0]).toBe('harness.progress');
+  expect(stallCall?.[2]).toMatchObject({
+    event: 'progress-command-stalled', stage: 'run-query', reason: 'timeout',
+    timeoutMs: 25, preservedRowCount: 0, caller: 'harness.progress',
+  });
+  expect(typeof (stallCall?.[2] as { observedAt?: unknown } | undefined)?.observedAt).toBe('string');
+  expect(errors[0]).toContain('progress-command-stalled');
+  expect(JSON.parse(errors[1]!)).toMatchObject({ event: 'progress-command-stalled', stage: 'run-query', reason: 'timeout', timeoutMs: 25 });
+});
+
+test('HARNESS-PROGRESS-HANG: a provider answering after the bound keeps its rows and is still recorded as stalled', async () => {
+  const result = assessRunningRuns(
+    [{ runId: 'run-slow', lifecycle: 'live', ledgerDirectory: '/state/run-slow', lastActivityTimestamp: '2026-10-11T00:00:00.000Z' } as never],
+    { refs: [], unreadable: [] },
+  );
+  const events: unknown[][] = [];
+  const originalDebugLog = debug.log;
+  debug.log = ((...args: unknown[]) => { events.push(args); }) as typeof debug.log;
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress: {
+    query: (() => {
+      const until = Date.now() + 40;
+      while (Date.now() < until) { /* hold the thread past the bound, then answer */ }
+      return result;
+    }) as never,
+    nowMs: () => Date.parse('2026-10-11T00:30:00.000Z'),
+    timeoutMs: 10,
+  } as never });
+  const printed: string[] = [];
+  const errors: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--json']);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    debug.log = originalDebugLog;
+  }
+  expect(JSON.parse(printed[0]!)).toEqual(buildRunProgressRows(result, Date.parse('2026-10-11T00:30:00.000Z')));
+  const stallCall = events.find((args) => args[1] === 'progress-command-stalled');
+  expect(stallCall?.[2]).toMatchObject({ stage: 'run-query', reason: 'timeout', timeoutMs: 10, preservedRowCount: 1 });
+  expect(errors[0]).toContain('progress-command-stalled');
+});
+
+test('HARNESS-PROGRESS-HANG: normal and partial-observation providers never report a stall', async () => {
+  const normal = assessRunningRuns(
+    [{ runId: 'run-ok', lifecycle: 'live', ledgerDirectory: '/state/run-ok', lastActivityTimestamp: '2026-10-11T00:00:00.000Z' } as never],
+    { refs: [{ instance: 'prod', id: 'pty-ok', kind: 'shell', alive: true, runId: 'run-ok' }], unreadable: [] },
+  );
+  const base = assessRunningRuns([{ runId: 'run-partial', lifecycle: 'live', ledgerDirectory: '/state/run-partial' } as never], { refs: [], unreadable: [] });
+  const partial = { ...base, ledger: { ...base.ledger, unreadableLedgerCount: 1 } };
+  const events: unknown[][] = [];
+  const originalDebugLog = debug.log;
+  debug.log = ((...args: unknown[]) => { events.push(args); }) as typeof debug.log;
+  const runProgress = async (payload: unknown): Promise<{ printed: string[]; errors: string[] }> => {
+    const program = new Command().exitOverride();
+    installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress: {
+      query: (() => payload) as never,
+      nowMs: () => Date.parse('2026-10-11T00:30:00.000Z'),
+    } as never });
+    const printed: string[] = [];
+    const errors: string[] = [];
+    const originalLog = console.log;
+    const originalError = console.error;
+    console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+    console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+    try {
+      await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--json']);
+    } finally {
+      console.log = originalLog;
+      console.error = originalError;
+    }
+    return { printed, errors };
+  };
+  try {
+    const full = await runProgress(normal);
+    expect(JSON.parse(full.printed[0]!)).toEqual(buildRunProgressRows(normal, Date.parse('2026-10-11T00:30:00.000Z')));
+    expect(full.errors).toEqual([]);
+    const shortened = await runProgress(partial);
+    expect(JSON.parse(shortened.printed[0]!)).toEqual(buildRunProgressRows(partial, Date.parse('2026-10-11T00:30:00.000Z')));
+    expect(shortened.errors[0]).toStartWith('부분 관측 — 최소');
+  } finally {
+    debug.log = originalDebugLog;
+  }
+  expect(events.filter((args) => args[1] === 'progress-command-stalled')).toEqual([]);
+});
+
+test('HARNESS-PROGRESS-HANG: a cooperative scan exposes its partial rows and deadline stage as a stall', async () => {
+  const base = assessRunningRuns([], { refs: [], unreadable: [] });
+  const result = { ...base, stalled: { stage: 'ledger-scan', reason: 'deadline-exceeded' } } as RunningRunsResult;
+  const events: unknown[][] = [];
+  const originalDebugLog = debug.log;
+  debug.log = ((...args: unknown[]) => { events.push(args); }) as typeof debug.log;
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, {
+    registerSink: async () => {}, resolveSurface: async () => 'harness',
+    progress: { query: (() => result) as never, timeoutMs: 8_000 },
+  });
+  const printed: string[] = [];
+  const errors: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--json']);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    debug.log = originalDebugLog;
+  }
+  expect(JSON.parse(printed[0]!)).toEqual([]);
+  expect(JSON.parse(errors[2]!)).toMatchObject({
+    event: 'progress-command-stalled', stage: 'ledger-scan', reason: 'deadline-exceeded',
+    timeoutMs: 8_000, preservedRowCount: 0,
+  });
+  expect(events.find((args) => args[1] === 'progress-command-stalled')?.[2]).toMatchObject({
+    stage: 'ledger-scan', reason: 'deadline-exceeded',
+  });
+});
+
+test('HARNESS-PROGRESS-HANG: harness progress --pid reports a stalled lookup beside the unchanged observation keys', async () => {
+  const events: unknown[][] = [];
+  const originalDebugLog = debug.log;
+  debug.log = ((...args: unknown[]) => { events.push(args); }) as typeof debug.log;
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress: {
+    bindingRunIds: () => ['run-local'],
+    readBinding: () => ({ pid: 4242, startedAt: 10_450, cwd: '/local' }),
+    processStartMs: () => 10_000,
+    query: (() => new Promise(() => {})) as never,
+    nowMs: () => 20_000,
+    timeoutMs: 25,
+  } as never });
+  const printed: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => { /* the stall line is asserted through the debug event below */ };
+  try {
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--pid', '4242', '--json']);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    debug.log = originalDebugLog;
+  }
+  expect(JSON.parse(printed[0]!)).toMatchObject({ pid: 4242, observation: 'unobserved', runId: null, progress: null });
+  expect(JSON.parse(printed[0]!).stall).toMatchObject({ stage: 'run-query', reason: 'timeout', timeoutMs: 25, caller: 'harness.progress.pid', preservedRowCount: 0 });
+  expect(events.find((args) => args[1] === 'progress-command-stalled')?.[2]).toMatchObject({ caller: 'harness.progress.pid' });
+});
+
+test('HARNESS-PROGRESS-HANG: ELANOUS_HARNESS_PROGRESS_TIMEOUT_MS lowers the bound without a test seam', async () => {
+  const result = assessRunningRuns(
+    [{ runId: 'run-env', lifecycle: 'live', ledgerDirectory: '/state/run-env', lastActivityTimestamp: '2026-10-11T00:00:00.000Z' } as never],
+    { refs: [], unreadable: [] },
+  );
+  const events: unknown[][] = [];
+  const originalDebugLog = debug.log;
+  const previousBound = process.env.ELANOUS_HARNESS_PROGRESS_TIMEOUT_MS;
+  debug.log = ((...args: unknown[]) => { events.push(args); }) as typeof debug.log;
+  const program = new Command().exitOverride();
+  installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', progress: {
+    query: (() => {
+      const until = Date.now() + 30;
+      while (Date.now() < until) { /* overrun the operator-supplied bound */ }
+      return result;
+    }) as never,
+    nowMs: () => Date.parse('2026-10-11T00:30:00.000Z'),
+  } as never });
+  const printed: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => { printed.push(args.map(String).join(' ')); };
+  console.error = (...args: unknown[]) => { /* stall evidence is asserted through the debug event */ };
+  try {
+    process.env.ELANOUS_HARNESS_PROGRESS_TIMEOUT_MS = '5';
+    await program.parseAsync(['node', 'elanous', 'harness', 'progress', '--json']);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    debug.log = originalDebugLog;
+    if (previousBound === undefined) delete process.env.ELANOUS_HARNESS_PROGRESS_TIMEOUT_MS;
+    else process.env.ELANOUS_HARNESS_PROGRESS_TIMEOUT_MS = previousBound;
+  }
+  expect(JSON.parse(printed[0]!)).toEqual(buildRunProgressRows(result, Date.parse('2026-10-11T00:30:00.000Z')));
+  expect(events.find((args) => args[1] === 'progress-command-stalled')?.[2]).toMatchObject({ timeoutMs: 5, preservedRowCount: 1 });
+});
+
+test('HARNESS-PROGRESS-HANG: queryProgressBounded preserves rows when the async path has no result yet', async () => {
+  const result = assessRunningRuns(
+    [{ runId: 'run-late', lifecycle: 'live', ledgerDirectory: '/state/run-late', lastActivityTimestamp: '2026-10-11T00:00:00.000Z' } as never],
+    { refs: [], unreadable: [] },
+  );
+  const events: unknown[][] = [];
+  const originalDebugLog = debug.log;
+  debug.log = ((...args: unknown[]) => { events.push(args); }) as typeof debug.log;
+  let release!: (value: RunningRunsResult) => void;
+  const query = (() => new Promise<RunningRunsResult>((done) => { release = done; })) as never;
+  const startedAt = Date.now();
+  try {
+    const outcome = await queryProgressBounded({ caller: 'harness.progress' }, { query, timeoutMs: 5 });
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(outcome.result).toBeNull();
+    expect(outcome.stall).toMatchObject({
+      event: 'progress-command-stalled', stage: 'run-query', reason: 'timeout',
+      timeoutMs: 5, caller: 'harness.progress', preservedRowCount: 0,
+    });
+    release(result);
+    await new Promise((done) => setTimeout(done, 20));
+    const late = events.find((args) => args[1] === 'progress-command-late');
+    expect(late?.[0]).toBe('harness.progress');
+    expect(late?.[2]).toMatchObject({
+      reason: 'late-value', timeoutMs: 5, caller: 'harness.progress',
+      preservedRowCount: 1, result,
+    });
+  } finally {
+    debug.log = originalDebugLog;
+  }
+});
+
+test('HARNESS-PROGRESS-HANG: the real progress worker is spawned and terminated when the bound expires — no query injection', async () => {
+  const lifecycle: ProgressWorkerLifecycle[] = [];
+  setHarnessProgressWorkerObserverForTesting((event) => { lifecycle.push(event); });
+  const startedAt = Date.now();
+  try {
+    const outcome = await queryProgressBounded({ caller: 'harness.progress' }, { timeoutMs: 5 });
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(outcome.result).toBeNull();
+    expect(outcome.stall).toMatchObject({
+      event: 'progress-command-stalled', stage: 'run-query', reason: 'timeout',
+      timeoutMs: 5, caller: 'harness.progress', preservedRowCount: 0,
+    });
+  } finally {
+    setHarnessProgressWorkerObserverForTesting(undefined);
+  }
+  // 상한 뒤 유예 창 안에 워커가 «현재 행» 을 회신하면 'message' 가 추가로 관찰될 수 있다 —
+  // 무응답이면 spawn → terminate 만 찍힌다. 두 경우 모두 «상한 내 종료»다.
+  expect(lifecycle[0]?.event).toBe('spawn');
+  expect(lifecycle.some((event) => event.event === 'terminate')).toBe(true);
+  expect(lifecycle.some((event) => event.event === 'error')).toBe(false);
+}, 20_000);
+
+test('HARNESS-PROGRESS-HANG: the real progress worker answers inside a generous bound and is terminated — no query injection', async () => {
+  const lifecycle: ProgressWorkerLifecycle[] = [];
+  setHarnessProgressWorkerObserverForTesting((event) => { lifecycle.push(event); });
+  try {
+    const outcome = await queryProgressBounded({ caller: 'harness.progress' }, { timeoutMs: 60_000 });
+    expect(outcome.stall).toBeNull();
+    expect(outcome.result).not.toBeNull();
+    expect(Array.isArray(outcome.result!.entries)).toBe(true);
+  } finally {
+    setHarnessProgressWorkerObserverForTesting(undefined);
+  }
+  expect(lifecycle.map((event) => event.event)).toEqual(['spawn', 'message', 'terminate']);
+}, 90_000);
+
+test('HARNESS-PROGRESS-HANG: the deploy entry re-entered inside a worker thread skips the CLI', async () => {
+  expect(shouldRunCliEntry()).toBe(true);
+  const startedAt = Date.now();
+  const exited = await new Promise<{ code: number | null; elapsedMs: number; error?: string }>((done) => {
+    const worker = new Worker(new URL('../../bin/elanous.mjs', import.meta.url));
+    const timer = setTimeout(() => {
+      void worker.terminate();
+      done({ code: null, elapsedMs: Date.now() - startedAt });
+    }, 8_000);
+    worker.once('exit', (code) => { clearTimeout(timer); done({ code, elapsedMs: Date.now() - startedAt }); });
+    worker.once('error', (error: unknown) => { clearTimeout(timer); done({ code: -1, elapsedMs: Date.now() - startedAt, error: String(error) }); });
+  });
+  expect(exited.error).toBeUndefined();
+  expect(exited.code).toBe(0);
+  expect(exited.elapsedMs).toBeLessThan(8_000);
+}, 20_000);
 
 test.skipIf(process.platform !== 'darwin')('macOS pid-bound handle: SIGTERM reaches the same process; a gone pid is refused (PROC1 · no pidfd on darwin)', async () => {
   const child = spawn('sleep', ['30']);

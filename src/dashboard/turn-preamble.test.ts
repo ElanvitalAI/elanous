@@ -213,7 +213,7 @@ describe('buildDashboardTurnPreamble — 자기접근 규율', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'preamble-notify-receipt-'));
     const events: Array<{ category: string; event: string; data?: unknown }> = [];
     const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
-      if (category === 'tui.notify') events.push({ category, event, data });
+      if (category === 'tui.notify' && event !== 'notification-payload') events.push({ category, event, data });
     }) as typeof debug.log);
     const enqueue = (taskId: string) => globalTaskNotificationQueue.enqueue({
       taskId, agentName: 'receipt-child', state: 'done', output: `result-${taskId}`,
@@ -255,6 +255,33 @@ describe('buildDashboardTurnPreamble — 자기접근 규율', () => {
     } finally {
       globalTaskNotificationQueue.clear();
       spy.mockRestore();
+    }
+  });
+
+  test('주입 XML의 비밀 마스킹된 본문을 bounded 관측으로 남긴다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'preamble-notify-payload-'));
+    const payloadEvents: Array<Record<string, unknown>> = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'tui.notify' && event === 'notification-payload') payloadEvents.push(data);
+    }) as typeof debug.log);
+    try {
+      globalTaskNotificationQueue.clear();
+      globalTaskNotificationQueue.enqueue({
+        taskId: 'payload-task', agentName: 'RunShell', state: 'error',
+        output: 'taskId=shell:test:1 outcome=error exitCode=7 stdoutTail=OUT stderrTail=ERR',
+        truncated: false, durationMs: 120, finishedAt: Date.now(),
+      });
+      const turn = buildDashboardTurnPreamble({ userText: 'next user turn', cwd, userConfig: fakeConfig });
+      const delivered = turn.find(message => message.role === 'user' && String(message.content).includes('<task-notification>'));
+      expect(delivered?.content).toContain('exitCode=7');
+      expect(payloadEvents).toHaveLength(1);
+      expect(payloadEvents[0]).toMatchObject({ notificationCount: 1, xmlPreviewTruncated: false });
+      expect(payloadEvents[0]?.xmlPreview).toContain('taskId=shell:test:1');
+      expect(payloadEvents[0]?.xmlPreview).toContain('stdoutTail=OUT stderrTail=ERR');
+    } finally {
+      globalTaskNotificationQueue.clear();
+      spy.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
     }
   });
 

@@ -6,7 +6,7 @@
 // and ranks prefix/substring matches explicitly.
 
 import { describe, it, expect, afterEach } from 'bun:test';
-import { filterSlashCommands, SLASH_COMMANDS, type SlashCommand } from '../src/chat/index.js';
+import { displayedSlashCommandNames, filterSlashCommands, SLASH_COMMANDS, type SlashCommand } from '../src/chat/index.js';
 import { createPickerState, type PickerBufferView } from '../src/chat/pickers/state.js';
 import { setUserConfigOverlay } from '../src/user-config.js';
 import { FEATURE_MATURITY } from '../src/maturity/feature-maturity.js';
@@ -22,9 +22,27 @@ describe('MAT1c slash picker visibility', () => {
   const names = (state: ReturnType<typeof picker>) => state.slashFiltered(buf('/')).map(({ name }) => name);
 
   it('keeps every command visible for absent or invalid role (owner)', () => {
+    const menuNames = filterSlashCommands('', SLASH_COMMANDS).map(({ name }) => name);
+    expect(menuNames).toHaveLength(15);
     for (const tui of [undefined, { role: 'unknown' }]) {
       setAudience(tui);
-      expect(names(picker())).toEqual(filterSlashCommands('', SLASH_COMMANDS).map(({ name }) => name));
+      expect(names(picker())).toEqual([...menuNames, 'directive']);
+    }
+    expect(names(picker())).toContain('directive');
+    // The compact first-use menu remains a separate, fixed 15-command policy.
+    expect(displayedSlashCommandNames()).not.toContain('directive');
+  });
+
+  it('lets only the owner discover and select the hidden ops /directive command', async () => {
+    const state = picker();
+    setAudience({ role: 'owner' });
+    expect(state.slashFiltered(buf('/dir')).map(({ name }) => name)).toEqual(['directive']);
+    expect(await state.dispatch({ name: 'tab' } as import('../src/tui.js').Key, buf('/dir'))).toMatchObject({
+      consumed: true, action: { kind: 'splice', text: '/directive' },
+    });
+    for (const role of ['general', 'contributor'] as const) {
+      setAudience({ role });
+      expect(state.slashFiltered(buf('/dir'))).toEqual([]);
     }
   });
 

@@ -8,11 +8,14 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
+import { acquireLockAsync } from '../../src/storage/file-lock.js';
 import { lastJsonObject, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
-import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
+import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, planPartialRegate, planSameCommitRecheck, planStalledShardRecheck, testFileOfId, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
+import { gateAssignableTestsAtCommit, gateEnvFingerprint } from './gate-baseline-receipt.js';
+import { readGateShardManifest, readGateShardResult } from './gate-shard-receipts.js';
 import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
 import { assertReleaseResumeApprovalBoundary, releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
@@ -46,6 +49,8 @@ export interface ResumeReleaseDeps {
   ledgerRoot?: string;
   /** GATE-REUSE-BY-DIFF: the tip tree for the import closure — default read from git objects of the tip commit. */
   closureTree?: (commit: string) => ClosureTree;
+  /** Test seam for the pinned Pod gate selection; production reads the selected test universe at the cut commit. */
+  gateTestsAtCommit?: (commit: string) => string[] | null;
   /** Source observation before the first resumed node. */
   onSource?: (line: string) => void;
   /** Test seam; production resolves this from ELANOUS_RELEASE_TRAFFIC_FILE / release.loop.trafficFile. */
@@ -293,14 +298,111 @@ function verifyResumePreflight(run: GraphRunState, opts: ResumeReleaseOptions, d
   }
 }
 
-/** GATE-PARTIAL outcome of a resume — applied (plan written) or the reason it fell back to a full gate. `auto` marks the
- *  default plan of `--from gate` (GATE-REUSE-BY-DIFF); `closure` is set when code changes were followed. */
+/** GATE-PARTIAL outcome of a resume — applied (with its exact remeasure selection) or the reason it fell back to a full gate.
+ *  `auto` marks the default plan of `--from gate` (GATE-REUSE-BY-DIFF); `closure` is set when code changes were followed. */
 export type PartialOutcome = { requested: false }
-  | { requested: true; applied: true; files: number; priorCommit: string; auto?: true; closure?: { reached: number; opaque: number } }
+  | { requested: true; applied: true; files: number; plannedFiles: string[]; priorCommit: string; auto?: true; closure?: { reached: number; opaque: number } }
   | { requested: true; applied: false; reason: string; auto?: true };
 
 /** Build (or clear) the partial re-gate plan for the new tip. Fail-closed: any doubt leaves a full gate.
  *  GATE-REUSE-BY-DIFF: `--from gate` on a moved tip plans by default (`partial: undefined`); `partial: false` opts out. */
+type StalledGateEvidence = {
+  stalledShards: Array<{ shard: number; files: string[]; reason: string }>;
+  partialSummary: { pass: number; fail: number; errors: number; ran: number; files: number };
+  partialFailures: { failures: string[]; errors: string[] };
+  preservedShardCount: number;
+};
+
+/** Recover an interrupted Pod sweep from its atomic shard receipts. No receipt or identity doubt authorizes a partial gate. */
+function stalledGateEvidence(input: { version: string; commit: string; repo: string; roots: string[];
+  gateOutput?: Record<string, unknown>; expectedBase40?: string; expectedTests?: (commit: string) => string[] | null }):
+  { ok: true; evidence: StalledGateEvidence } | { ok: false; reason: string } {
+  const fail = (reason: string) => ({ ok: false as const, reason });
+  if (input.gateOutput && (input.gateOutput.outcome !== 'error' || input.gateOutput.commit !== input.commit))
+    return fail('saved gate result is not an error for the recorded cut');
+  if (!/^[a-f0-9]{40}$/i.test(input.expectedBase40 ?? ''))
+    return fail('saved cutoff baseline is absent or invalid');
+  const fingerprint = gateEnvFingerprint(process.env);
+  let receiptDir: string | undefined;
+  for (const root of input.roots) {
+    const candidate = join(root, 'release', input.version, 'gate-logs', 'cut', 'receipts');
+    if (existsSync(candidate)) { receiptDir = candidate; break; }
+  }
+  if (!receiptDir) return fail('stalled gate receipts are absent');
+  const names = readdirSync(receiptDir).filter((name) => /^pod-\d+\.receipt\.json$/.test(name)).sort((a, b) =>
+    Number(/^pod-(\d+)/.exec(a)![1]) - Number(/^pod-(\d+)/.exec(b)![1]));
+  if (!names.length || names.some((name, index) => Number(/^pod-(\d+)/.exec(name)![1]) !== index))
+    return fail('stalled gate receipt shard set is incomplete');
+  const allFiles: string[] = [];
+  const failures: string[] = [];
+  const errors: string[] = [];
+  const stalledShards: StalledGateEvidence['stalledShards'] = [];
+  const imageDigests = new Set<string>();
+  let pass = 0, failCount = 0, errorCount = 0, ran = 0, files = 0, preservedShardCount = 0;
+  let base40: string | undefined;
+  for (const name of names) {
+    const id = name.slice(0, -'.receipt.json'.length);
+    const receipt = readGateShardManifest(receiptDir, id);
+    if (!receipt || receipt.head40 !== input.commit || !/^[a-f0-9]{40}$/i.test(receipt.base40)
+      || !receipt.files.length
+      || receipt.files.some((file) => typeof file !== 'string'
+        || !/^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file) || file.split('/').includes('..'))
+      || typeof receipt.envKey !== 'string' || typeof receipt.host !== 'string')
+      return fail(`stalled gate receipt identity or file list is invalid: ${id}`);
+    if (receipt.base40 !== input.expectedBase40)
+      return fail(`stalled gate receipt baseline differs from saved cutoff baseline: ${id}`);
+    if (base40 && receipt.base40 !== base40) return fail(`stalled gate receipts disagree on baseline: ${id}`);
+    base40 = receipt.base40;
+    allFiles.push(...receipt.files);
+    if (receipt.status === 'unmeasured') {
+      stalledShards.push({ shard: Number(id.slice(4)), files: [...receipt.files], reason: 'incomplete' });
+      continue;
+    }
+    if (!receipt.envKey.startsWith(`${fingerprint}:`)) return fail(`stalled gate receipt environment mismatch: ${id}`);
+    const imageDigest = receipt.envKey.slice(fingerprint.length + 1);
+    if (!/^sha256:[a-f0-9]{64}$/i.test(imageDigest)) return fail(`stalled gate receipt image identity is missing: ${id}`);
+    imageDigests.add(imageDigest.toLowerCase());
+    const result = readGateShardResult(receiptDir, { shard: { id, files: receipt.files }, head40: input.commit,
+      base40: receipt.base40, envKey: receipt.envKey });
+    if (!result) return fail(`stalled gate receipt payload is incomplete or corrupt: ${id}`);
+    const totals = result.runs.reduce((sum, run) => ({ pass: sum.pass + run.pass, fail: sum.fail + run.fail,
+      errors: sum.errors + run.errors, ran: sum.ran + run.ran, files: sum.files + run.files }),
+    { pass: 0, fail: 0, errors: 0, ran: 0, files: 0 });
+    if (!Object.values(totals).every(Number.isSafeInteger) || receipt.failureIds.length !== totals.fail
+      || receipt.errorIds.length !== totals.errors)
+      return fail(`stalled gate receipt counts do not reconcile: ${id}`);
+    pass += totals.pass; failCount += totals.fail; errorCount += totals.errors; ran += totals.ran; files += totals.files;
+    failures.push(...receipt.failureIds); errors.push(...receipt.errorIds); preservedShardCount++;
+  }
+  if (!stalledShards.length) return fail('no incomplete shard receipt identifies the interrupted work');
+  if (new Set(allFiles).size !== allFiles.length) return fail('stalled gate receipt file assignments overlap');
+  if (imageDigests.size !== 1) return fail('stalled gate completed shards do not share one executed image');
+  const expected = (input.expectedTests ?? ((commit) => gateAssignableTestsAtCommit(input.repo, commit)))(input.commit);
+  if (!expected || JSON.stringify([...expected].sort()) !== JSON.stringify([...allFiles].sort()))
+    return fail('stalled gate receipts do not cover the pinned test selection');
+  const partialSummary = { pass, fail: failCount, errors: errorCount, ran, files };
+  const partialFailures = { failures: [...new Set(failures)].sort(), errors: [...new Set(errors)].sort() };
+  const gate = input.gateOutput;
+  if (gate) {
+    const savedSummary = gate.partialSummary as Partial<StalledGateEvidence['partialSummary']> | undefined;
+    const savedFailures = gate.partialFailures as Partial<StalledGateEvidence['partialFailures']> | undefined;
+    if (savedSummary && JSON.stringify(savedSummary) !== JSON.stringify(partialSummary))
+      return fail('saved gate summary disagrees with shard receipts');
+    if (savedFailures && (JSON.stringify([...((savedFailures.failures as string[] | undefined) ?? [])].sort()) !== JSON.stringify(partialFailures.failures)
+      || JSON.stringify([...((savedFailures.errors as string[] | undefined) ?? [])].sort()) !== JSON.stringify(partialFailures.errors)))
+      return fail('saved gate failures disagree with shard receipts');
+    if (gate.preservedShardCount !== undefined && gate.preservedShardCount !== preservedShardCount)
+      return fail('saved preserved shard count disagrees with shard receipts');
+    if (Array.isArray(gate.stalledShards)) {
+      const savedStalled = gate.stalledShards.flatMap((item) => item && typeof item === 'object'
+        && Array.isArray((item as { files?: unknown }).files) ? (item as { files: string[] }).files : []).sort();
+      if (JSON.stringify(savedStalled) !== JSON.stringify(stalledShards.flatMap((item) => item.files).sort()))
+        return fail('saved stalled shard list disagrees with shard receipts');
+    }
+  }
+  return { ok: true, evidence: { stalledShards, partialSummary, partialFailures, preservedShardCount } };
+}
+
 function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean; gateExecutor?: string }, deps: ResumeReleaseDeps, dryRun = false): PartialOutcome {
   const root = deps.root ?? effectiveInstanceRoot();
   // Any resume starts from no plan: one without a partial plan (from whatever node) never inherits an older plan.
@@ -356,9 +458,11 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     debug.log('release-loop.resume', 'stalled-recheck-planned', { version: tip.version, commit: tip.to,
       planKind: planned.plan.kind, remeasureFileCount: planned.plan.files.length,
       preservedShardCount: planned.plan.preservedShardCount ?? 0, fallbackReason: null, path });
-    return { requested: true, applied: true, files: planned.plan.files.length, priorCommit: tip.to, ...(auto ? { auto: true as const } : {}) };
+    return { requested: true, applied: true, files: planned.plan.files.length, plannedFiles: [...planned.plan.files], priorCommit: tip.to,
+      ...(auto ? { auto: true as const } : {}) };
   }
   let prior: { commit?: unknown; failures?: unknown; errors?: unknown } | undefined;
+  let movedStalledEvidence: StalledGateEvidence | undefined;
   for (const location of [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])]) {
     const path = join(location, 'release', tip.version, 'gate-failures.json');
     if (!existsSync(path)) continue;
@@ -368,7 +472,19 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     if (record?.commit === tip.from) { prior = record; break; }
   }
   if (!prior || !Array.isArray(prior.failures) || !(prior.errors === undefined || Array.isArray(prior.errors))) {
-    return fallback(`no complete gate record for ${tip.from.slice(0, 12)} (a stalled or errored gate keeps none)`);
+    const gateRecord = saved.nodes.find((node) => node.nodeId === 'gate');
+    const gateOutput = gateRecord ? lastJsonObject(gateRecord.output) as Record<string, unknown> | undefined : undefined;
+    const cutoffRecord = saved.nodes.find((node) => node.nodeId === 'cutoff');
+    const cutoffOutput = cutoffRecord ? lastJsonObject(cutoffRecord.output) as Record<string, unknown> | undefined : undefined;
+    const expectedBase40 = (cutoffOutput?.baseline as { sha?: unknown } | undefined)?.sha;
+    const evidence = stalledGateEvidence({ version: tip.version, commit: tip.from, repo: deps.repo ?? process.cwd(),
+      roots: [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])], gateOutput,
+      ...(typeof expectedBase40 === 'string' ? { expectedBase40 } : {}),
+      expectedTests: deps.gateTestsAtCommit });
+    if (!evidence.ok) return fallback(`no complete gate record for ${tip.from.slice(0, 12)}; ${evidence.reason}`);
+    movedStalledEvidence = evidence.evidence;
+    prior = { commit: tip.from, failures: movedStalledEvidence.partialFailures.failures,
+      errors: movedStalledEvidence.partialFailures.errors };
   }
   // Both sides of a rename count (`--no-renames`): a source moved to a test/Markdown name is still a source change.
   let changed: string[];
@@ -404,10 +520,11 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
   const savedInput = saved.input as { gateExecutor?: unknown; gatePodPool?: unknown };
   const podGate = (opts.gateExecutor ?? savedInput.gateExecutor ?? (savedInput.gatePodPool ? 'pod' : undefined)) === 'pod';
   const priorShards = priorCutLogs ? collectExecutedPodShardImages(priorCutLogs, tip.from) : undefined;
-  const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: changed,
+  const stalledFiles = movedStalledEvidence?.stalledShards.flatMap((shard) => shard.files) ?? [];
+  const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: [...changed, ...stalledFiles],
     priorFailures: prior.failures as string[], priorErrors: (prior.errors ?? []) as string[],
     existsAtTip: (file) => tracked.has(file),
-    ...(podGate ? { priorShards: priorShards ?? [] } : {}),
+    ...((podGate || movedStalledEvidence) ? { priorShards: priorShards ?? [] } : {}),
     closure: (changedCode) => testsReachingChanged(tree, changedCode, tests, { cliEntries: CLI_ENTRIES }) });
   if (!planned.ok) return fallback(planned.reason);
   if (planned.plan.files.length >= tests.length) return fallback(`every test is re-run (${tests.length}) — full gate`);
@@ -427,7 +544,7 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
   const path = dryRun ? undefined : writePartialPlan(root, planned.plan);
   debug.log('release-loop.resume', 'partial-planned', { version: tip.version, priorCommit: tip.from, commit: tip.to, files: planned.plan.files.length,
     tests: tests.length, auto, ...(path ? { path } : {}), dryRun, ...(planned.closure ? { reached: planned.closure.reached, opaque: planned.closure.opaque } : {}) });
-  return { requested: true, applied: true, files: planned.plan.files.length, priorCommit: tip.from,
+  return { requested: true, applied: true, files: planned.plan.files.length, plannedFiles: [...planned.plan.files], priorCommit: tip.from,
     ...(auto ? { auto: true as const } : {}), ...(planned.closure ? { closure: planned.closure } : {}) };
 }
 
@@ -604,6 +721,23 @@ export interface RecoverReleaseResult {
   resume?: { status: string; tip: TipRefresh; partial: PartialOutcome };
 }
 
+export interface RecoverReleaseLandingOptions {
+  runId: string;
+  /** The landed repair commit on main; this is the idempotency key for a landing notification. */
+  mergeSha: string;
+  from?: string;
+  commandRoot?: string;
+  partial?: boolean;
+  repoRoot?: string;
+}
+
+export type RecoverReleaseLandingResult = RecoverReleaseResult & { duplicate: boolean };
+
+/** Commander represents `--no-partial` as false and its default (flag omitted) as true. */
+export function recoverLandingPartialOption(optionValue?: boolean): boolean | undefined {
+  return optionValue === false ? false : undefined;
+}
+
 export interface RecoverReleaseDeps extends ResumeReleaseDeps {
   /** `release cut-branch --append` — tests record the plan instead of pushing the branch. */
   cutBranch?: typeof cutReleaseBranch;
@@ -619,11 +753,19 @@ export class ReleaseRecoverStopped extends Error {
   }
 }
 
+function readRecoverJson(path: string, label: string): unknown {
+  try { return JSON.parse(readFileSync(path, 'utf8')) as unknown; }
+  catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`release ${label} JSON을 읽을 수 없다: ${path} (${detail}) — 파일을 보존하고 원장을 올바른 JSON으로 복구한 뒤 재시도하라.`);
+  }
+}
+
 /** Append one stage result to the resume-attempts ledger. `attempts[]` keeps its shape — the stage results are added. */
 function recordRecoverStage(entry: { root: string; runId: string; version: string; priorCountKnown: boolean; stage: RecoverStageRecord }): void {
   const path = join(entry.root, 'release', entry.version, 'resume-attempts', `${entry.runId}.json`);
   const saved = existsSync(path)
-    ? JSON.parse(readFileSync(path, 'utf8')) as { attempts?: unknown; recoveries?: unknown; priorCountKnown?: unknown }
+    ? readRecoverJson(path, 'resume attempts 원장') as { attempts?: unknown; recoveries?: unknown; priorCountKnown?: unknown }
     : undefined;
   if (saved !== undefined && (!saved || typeof saved !== 'object' || Array.isArray(saved) || !Array.isArray(saved.attempts)
     || (saved.recoveries !== undefined && !Array.isArray(saved.recoveries)))) throw new Error('release resume attempts ledger invalid');
@@ -637,16 +779,39 @@ function recordRecoverStage(entry: { root: string; runId: string; version: strin
   renameSync(temporary, path);
 }
 
+async function acquireReleaseRecoveryLock(root: string, runId: string) {
+  const lockDir = join(root, 'release', 'recovery-locks');
+  mkdirSync(lockDir, { recursive: true });
+  // A full-gate subprocess can block this process's event loop, delaying the async lock heartbeat.
+  // The observed release gate reached 2h20m; leave a finite four-hour stale/wait window for one recovery.
+  const lock = await acquireLockAsync(join(lockDir, `${runId}.lock`), {
+    staleMs: 4 * 60 * 60_000, retryBusyMs: 1_000, maxTries: 14_400,
+  });
+  if (!lock.stillHeld()) {
+    lock.release();
+    throw new Error(`release recovery lock was lost for ${runId} — retry after inspecting the recovery ledger`);
+  }
+  return lock;
+}
+
 /**
  * Repair a failed release run in one command: append dry-run (plan only) → append (fast-forward release/<v> onto the
  * picked repairs) → resume --from export-check (preflight plan, then the graph). A failing stage stops the command:
  * the later stages never run, and the stage results are already in the ledger for the human to read.
  */
 export async function recoverReleaseRun(opts: RecoverReleaseOptions, deps: RecoverReleaseDeps = {}): Promise<RecoverReleaseResult> {
-  if (!Array.isArray(opts.pick) || !opts.pick.length) throw new Error('release recover requires at least one --pick commit');
   const root = releaseRunUniverse({ root: deps.root });
+  const runId = safeRunId(opts.runId);
+  const lock = await acquireReleaseRecoveryLock(root, runId);
+  try {
+    return await recoverReleaseRunLocked(opts, deps, root);
+  } finally { lock.release(); }
+}
+
+async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: RecoverReleaseDeps, root: string): Promise<RecoverReleaseResult> {
+  if (!Array.isArray(opts.pick) || !opts.pick.length) throw new Error('release recover requires at least one --pick commit');
   const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
-  const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
+  const savedRun = readRecoverJson(statePath, 'release run 상태') as GraphRunState;
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
   // The saved version-release record names what to repair: the release branch and the commit the run cut.
   const versionRecord = savedRun.nodes.find((node) => node.nodeId === 'version-release');
@@ -707,8 +872,9 @@ export async function recoverReleaseRun(opts: RecoverReleaseOptions, deps: Recov
   const now = (): string => (deps.now?.() ?? new Date()).toISOString();
   const stages: RecoverStageRecord[] = [];
   const record = (stage: RecoverStageRecord): void => {
-    stages.push(stage);
-    recordRecoverStage({ root, runId: opts.runId, version, priorCountKnown: !savedRun.resume, stage });
+    const withPick = { ...stage, pick: stage.pick ?? [...opts.pick] };
+    stages.push(withPick);
+    recordRecoverStage({ root, runId: opts.runId, version, priorCountKnown: !savedRun.resume, stage: withPick });
   };
   const stop = (stage: RecoverStageName, error: unknown): never => {
     throw new ReleaseRecoverStopped(stage, stages, RECOVER_STAGES.slice(RECOVER_STAGES.indexOf(stage) + 1),
@@ -733,7 +899,7 @@ export async function recoverReleaseRun(opts: RecoverReleaseOptions, deps: Recov
   };
   const ledgerPath = join(root, 'release', version, 'resume-attempts', `${opts.runId}.json`);
   const recoveries: RecoverStageRecord[] = existsSync(ledgerPath)
-    ? ((JSON.parse(readFileSync(ledgerPath, 'utf8')) as { recoveries?: unknown[] }).recoveries ?? []) as RecoverStageRecord[]
+    ? ((readRecoverJson(ledgerPath, 'resume attempts 원장') as { recoveries?: unknown[] }).recoveries ?? []) as RecoverStageRecord[]
     : [];
   let appendedCommit: string | undefined;
   for (let index = recoveries.length - 1; index >= 0; index -= 1) {
@@ -842,4 +1008,70 @@ export async function recoverReleaseRun(opts: RecoverReleaseOptions, deps: Recov
       rmSync(dirname(preparedRoot.dir), { recursive: true, force: true });
     }
   }
+}
+
+/**
+ * Manual landing-event entrypoint. The event's merge SHA is the dedupe key; once that repair has completed its
+ * resume stage, a redelivered event returns the recorded result without appending or running the graph again.
+ * The event producer can call this after its own hook lands; this function does not subscribe to PR-land events.
+ */
+export async function recoverReleaseRunFromLanding(opts: RecoverReleaseLandingOptions,
+  deps: RecoverReleaseDeps = {}): Promise<RecoverReleaseLandingResult> {
+  if (!/^[0-9a-f]{40}$/i.test(opts.mergeSha)) throw new Error('release recover-landing requires a full 40-hex merge SHA');
+  const root = releaseRunUniverse({ root: deps.root });
+  const runId = safeRunId(opts.runId);
+  // Share one run-scoped lock with manual `release recover`: the dedupe read, append, and resume must not race.
+  const landingLock = await acquireReleaseRecoveryLock(root, runId);
+  try {
+    return await recoverReleaseRunFromLandingLocked(opts, deps, root, runId);
+  } finally { landingLock.release(); }
+}
+
+async function recoverReleaseRunFromLandingLocked(opts: RecoverReleaseLandingOptions, deps: RecoverReleaseDeps,
+  root: string, runId: string): Promise<RecoverReleaseLandingResult> {
+  const pick = [opts.mergeSha.toLowerCase()];
+  const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
+  if (existsSync(statePath)) {
+    const savedRun = readRecoverJson(statePath, 'release run 상태') as GraphRunState;
+    const versionNode = savedRun.nodes.find((node) => node.nodeId === 'version-release');
+    const recorded = lastJsonObject(versionNode?.output);
+    const version = typeof recorded?.version === 'string' ? recorded.version : '';
+    if (savedRun.graphId === 'release-loop' && savedRun.runId === runId && isReleaseVersion(version)) {
+      const ledgerPath = join(root, 'release', version, 'resume-attempts', `${runId}.json`);
+      if (existsSync(ledgerPath)) {
+        const ledger = readRecoverJson(ledgerPath, 'resume attempts 원장') as { recoveries?: unknown };
+        if (ledger.recoveries !== undefined && !Array.isArray(ledger.recoveries)) throw new Error(`release resume attempts ledger invalid: ${ledgerPath}`);
+        const records = (ledger.recoveries ?? []) as RecoverStageRecord[];
+        const matchesPick = (entry: RecoverStageRecord): boolean => Array.isArray(entry.pick)
+          && entry.pick.some((sha) => typeof sha === 'string' && sha.toLowerCase() === pick[0]);
+        let completedIndex = -1;
+        for (let index = records.length - 1; index >= 0; index -= 1) {
+          const entry = records[index]!;
+          if (matchesPick(entry) && entry.stage === 'resume' && entry.outcome === 'ok') {
+            completedIndex = index;
+            break;
+          }
+        }
+        if (completedIndex >= 0) {
+          let cycleStart = completedIndex;
+          for (let index = completedIndex; index >= 0; index -= 1) {
+            const entry = records[index]!;
+            if (matchesPick(entry) && entry.stage === 'append-dry-run') {
+              cycleStart = index;
+              break;
+            }
+          }
+          const completed = records[completedIndex]!;
+          return { runId, version, branch: `release/${version}`, fromNode: completed.from ?? opts.from ?? RECOVER_FIRST_NODE,
+            stages: records.slice(cycleStart, completedIndex + 1).filter(matchesPick), duplicate: true };
+        }
+      }
+    }
+  }
+  const result = await recoverReleaseRunLocked({ runId, pick,
+    ...(opts.from === undefined ? {} : { from: opts.from }),
+    ...(opts.commandRoot === undefined ? {} : { commandRoot: opts.commandRoot }),
+    ...(opts.partial === undefined ? {} : { partial: opts.partial }),
+    ...(opts.repoRoot === undefined ? {} : { repoRoot: opts.repoRoot }) }, deps, root);
+  return { ...result, duplicate: false };
 }

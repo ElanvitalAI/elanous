@@ -1128,6 +1128,8 @@ test('TASKS-HAND-CHILD-LLM: split on the first / only · openrouter keeps the fu
   expect(parseChildLlm('local/qwen/qwen3-coder')).toEqual({ provider: 'local', model: 'qwen/qwen3-coder' });
   expect(parseChildLlm('openrouter/z-ai/glm-5.3')).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
   expect(parseChildLlm('openrouter/openrouter/z-ai/glm-5.3')).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3' });
+  expect(parseChildLlm('openrouter/z-ai/glm-5.3', 'medium')).toEqual({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3', effort: 'medium' });
+  expect(() => parseChildLlm('openrouter/z-ai/glm-5.3', 'high')).toThrow(/high.*openrouter\/z-ai\/glm-5\.3.*medium/);
   expect(launchArgs({ text: 'x', childLlm: parseChildLlm('openrouter/z-ai/glm-5.3') }))
     .toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', '--child-llm-provider', 'openrouter', '--child-llm-model', 'openrouter/z-ai/glm-5.3', 'x']);
 });
@@ -1138,7 +1140,7 @@ test('TASKS-HAND-CHILD-LLM: bad values are rejected and nothing is launched or w
   const path = statePath();
   const calls: string[][] = [];
   const launcher = (args: string[]) => { calls.push(args); };
-  for (const args of [['--child-llm', 'grok'], ['--child-llm', 'grok/'], ['--child-llm-effort', 'high'], ['--child-llm', 'grok/grok-4.7', '--child-llm-effort', ' ']]) {
+  for (const args of [['--child-llm', 'grok'], ['--child-llm', 'grok/'], ['--child-llm-effort', 'high'], ['--child-llm', 'grok/grok-4.7', '--child-llm-effort', ' '], ['--child-llm', 'openrouter/z-ai/glm-5.3', '--child-llm-effort', 'high']]) {
     const { lines, code } = await cli(['task', 'hand', 'ship it', ...args, '--live'], { taskStatePath: path, taskLauncher: launcher });
     expect(code).toBe(1);
     expect(lines.join('\n')).toContain('--child-llm');

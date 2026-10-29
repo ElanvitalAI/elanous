@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import { debug } from '../debug/log.js';
 import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-gate.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
-import { audit as auditEntryBudget, INDEX_MODULE_LIMIT } from '../../scripts/ratchets/next-tui-entry-budget.js';
 import { landingHistoryLogArgs } from '../cli/pr-granularity.js';
 import {
   classifyDirtyWorktreePaths,
@@ -37,11 +36,10 @@ const importerLookup = (stdout = ''): [string, string[], CommandResult] => ['git
 const lsFiles = (stdout = ''): [string, string[], CommandResult] => ['git', ['ls-files'], ok(stdout)];
 const fixtureRoots: string[] = [];
 setDefaultTimeout(60_000);
-const skipEntryBudgetGateForFixture = (_cwd: string, _files: readonly string[]) => ({ affected: false, errors: [] });
 const runSelfGateCli = (cwd: string, options: Parameters<typeof runSelfGateCliProduction>[1] = {}, deps: Parameters<typeof runSelfGateCliProduction>[2] = {}) =>
-  runSelfGateCliProduction(cwd, options, { runEntryBudgetGate: skipEntryBudgetGateForFixture, ...deps });
+  runSelfGateCliProduction(cwd, options, deps);
 const runSelfGateCliAsync = (cwd: string, options: Parameters<typeof runSelfGateCliAsyncProduction>[1] = {}, deps: Parameters<typeof runSelfGateCliAsyncProduction>[2] = {}) =>
-  runSelfGateCliAsyncProduction(cwd, options, { runEntryBudgetGate: skipEntryBudgetGateForFixture, ...deps });
+  runSelfGateCliAsyncProduction(cwd, options, deps);
 
 function fixtureRepository(files: Record<string, string>, linkNodeModules = false): { cwd: string; dispose: () => void } {
   const cwd = mkdtempSync(join(tmpdir(), 'elanous-gate-cli-'));
@@ -152,7 +150,6 @@ test('gate receipt reuses unchanged passing importer tests and --no-inherit rest
       runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
       runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
       gateReceiptDir: () => receipts, envKey: () => 'bun-test-runtime',
-      runEntryBudgetGate: () => ({ affected: false, errors: [] }),
     };
     const firstRuns: string[][] = [];
     const first = runSelfGateCli(fixture.cwd, { base, includeImporterTests: true }, {
@@ -209,7 +206,6 @@ test('dirty worktree forces a real full-radius run and cannot overwrite a passin
       runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
       runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
       runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
-      runEntryBudgetGate: () => ({ affected: false, errors: [] }),
     };
     const first = runSelfGateCli(fixture.cwd, { base, includeImporterTests: true }, gates);
     expect(first.exitCode).toBe(0);
@@ -230,49 +226,31 @@ test('dirty worktree forces a real full-radius run and cannot overwrite a passin
 });
 
 describe('runSelfGateCli', () => {
-  test('real 1,265-module overflow fails changed gate before skipped test step', () => {
-    const fixture = fixtureRepository({
-      'tsconfig.json': JSON.stringify({ compilerOptions: { moduleResolution: 'bundler', module: 'esnext' } }),
-      'src/index.ts': "import './budget-0000';\n",
-      'src/tui/entry.ts': 'export {};\n',
-      'src/tui/local.ts': 'export {};\n',
-      'src/tui.ts': 'export {};\n',
-      'src/dashboard/loop-scheduler.ts': 'export {};\n',
-      'bin/elanous.mjs': "await import('../src/index.ts');\n",
-    }, true);
-    for (let i = 0; i < INDEX_MODULE_LIMIT; i += 1) {
-      writeFileSync(join(fixture.cwd, `src/budget-${String(i).padStart(4, '0')}.ts`),
-        i + 1 < INDEX_MODULE_LIMIT ? `import './budget-${String(i + 1).padStart(4, '0')}';\n` : 'export const last = true;\n');
-    }
-    const result = runSelfGateCliProduction(fixture.cwd, {}, {
-      changedFiles: () => ({ files: ['src/budget-0000.ts'], baseRef: 'HEAD' }),
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.lines.join('\n')).toContain('index static module count 1265 exceeds 1264');
-  }, 60_000);
-
-  test('entry budget blocks affected changes before skipTestStep and retains unrelated rc', () => {
-    const calls: string[][] = [];
+  test('local artifact emission uses the train marker captured by sync and async entry points', async () => {
+    const previousMarker = process.env.ELANOUS_TRAIN_GATE;
+    const syncDir = mkdtempSync(join(tmpdir(), 'gate-local-train-marker-sync-'));
+    const asyncDir = mkdtempSync(join(tmpdir(), 'gate-local-train-marker-async-'));
     const deps = {
-      changedFiles: () => ({ files: ['src/tui/entry.ts'], baseRef: 'HEAD' }),
-      exists: () => false,
-      runTests: () => { throw new Error('no test selected'); },
-      runEntryBudgetGate: (_cwd: string, files: readonly string[]) => {
-        calls.push([...files]);
-        return { affected: true, errors: ['index static module count 1265 exceeds 1264'] };
-      },
+      changedFiles: () => ({ files: [], baseRef: 'HEAD' }),
+      resolveRev: () => 'a'.repeat(40),
+      envKey: () => 'test-env',
     };
-    const blocked = runSelfGateCliProduction('/repo', {}, deps);
-    expect(blocked.exitCode).toBe(1);
-    expect(blocked.lines.join('\n')).toContain('next-tui-entry-budget: FAIL index static module count 1265 exceeds 1264');
-    expect(calls).toEqual([['src/tui/entry.ts']]);
-    const skipped = runSelfGateCliProduction('/repo', {}, { ...deps, changedFiles: () => ({ files: ['docs/note.md'], baseRef: 'HEAD' }),
-      runEntryBudgetGate: () => ({ affected: false, errors: [] }) });
-    expect(skipped.exitCode).toBe(0);
-    expect(skipped.lines).toContain('next-tui-entry-budget: skip (unrelated changes)');
-    const unmeasured = runSelfGateCliProduction('/repo', {}, { ...deps, runEntryBudgetGate: () => { throw new Error('closure unavailable'); } });
-    expect(unmeasured.exitCode).toBe(1);
-    expect(unmeasured.lines.join('\n')).toContain('next-tui-entry-budget: UNMEASURED closure unavailable');
+    try {
+      process.env.ELANOUS_TRAIN_GATE = '0';
+      const sync = runSelfGateCli('/repo', { artifactDir: syncDir, trainGate: true }, deps);
+      expect(JSON.parse(readFileSync(join(syncDir, 'summary.json'), 'utf8'))).toMatchObject({ trainGate: true });
+      expect(sync.lines.some(line => line.startsWith('⚠ artifacts:'))).toBe(false);
+
+      process.env.ELANOUS_TRAIN_GATE = '1';
+      const asyncResult = await runSelfGateCliAsync('/repo', { artifactDir: asyncDir, trainGate: false }, deps);
+      expect(JSON.parse(readFileSync(join(asyncDir, 'summary.json'), 'utf8'))).toMatchObject({ trainGate: false });
+      expect(asyncResult.lines.some(line => line.startsWith('⚠ artifacts:'))).toBe(false);
+    } finally {
+      if (previousMarker === undefined) delete process.env.ELANOUS_TRAIN_GATE;
+      else process.env.ELANOUS_TRAIN_GATE = previousMarker;
+      rmSync(syncDir, { recursive: true, force: true });
+      rmSync(asyncDir, { recursive: true, force: true });
+    }
   });
 
   test('scenario adds an importer test to the programmatic self gate and rejects a stale head', () => {

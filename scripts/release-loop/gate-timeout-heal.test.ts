@@ -305,6 +305,13 @@ test('readShardArtifacts: every part done → one summary and rc; a crashed part
   expect(all.output).toContain('2 pass\n1 fail\n0 errors\nRan 3 tests across 3 files.');
   writeFileSync(join(dir, 'part-1.rc'), '137\n');
   expect(readShardArtifacts(dir, parts)).toMatchObject({ rc: 137, timedOut: false, finished: ['src/a.test.ts'] });
+  const mismatched = temp('gate-timeout-attribution-');
+  writeFileSync(join(mismatched, 'install.rc'), '0\n');
+  writeFileSync(join(mismatched, 'install.log'), '');
+  writeFileSync(join(mismatched, 'part-0.rc'), '124\n');
+  writeFileSync(join(mismatched, 'part-0.log'), '2 pass\n0 fail\nRan 2 tests across 2 files.\n');
+  writeFileSync(join(mismatched, 'part-0.junit.xml'), junitFor(['src/a.test.ts', 'src/a.test.ts']));
+  expect(readShardArtifacts(mismatched, [['src/a.test.ts', 'src/b.test.ts']])).toMatchObject({ rc: 124, finished: [] });
   const legacy = temp('gate-legacy-');
   writeFileSync(join(legacy, 'shard.log'), summary(['src/a.test.ts']));
   writeFileSync(join(legacy, 'shard.rc'), '0\n');

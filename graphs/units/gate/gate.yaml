@@ -1,0 +1,20 @@
+graph_id: gate
+version: 1
+unit:
+  inputs: [goal, context, feedback, budget, checkpoint]
+  outputs: [gate-verdict, evidence]
+  exits: [pass, fail, sync, open]
+entry_node: gate
+terminal_nodes: [pass, fail, sync, open]
+nodes:
+  - node_id: gate
+    kind: gate
+    recipe: gate-stage
+    max_visits: 8
+    contract: { inputs: [goal, context, feedback, budget, checkpoint], tools: read-only, outputs: [gate-verdict, evidence] }
+  - { node_id: pass, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: fail, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: sync, kind: observe, recipe: none, max_visits: 1 }
+  - { node_id: open, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - { from: gate, on: outcome, map: { pass: pass, fail: fail, sync: sync, open: open } }

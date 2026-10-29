@@ -3,11 +3,12 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { hostname, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { Command } from 'commander';
-import { classifyIncidentReasonFromLastLines, detectBursts, detectCommonCauseBursts, findIncidentPrecedents, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit, type RunExit } from './harness-incidents.js';
+import { classifyIncidentReasonFromLastLines, classifyTcellHealthCards, detectBursts, detectCommonCauseBursts, findIncidentPrecedents, formatIncidentBurstWarning, incidentLastLines, readRunExits, recentBurst, recordRunExit, type RunExit, type TcellHealthCard } from './harness-incidents.js';
 import { installHarnessCliCommand, recordClassifiedHarnessPodExit, warnRecentIncidentBurst } from './harness-cli-command.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { debug } from '../debug/log.js';
 import { appendRunLedgerEntry, runLedgerDir } from '../self-implement/run-ledger.js';
+import { makeRunObserver } from '../self-implement/orchestrator.js';
 
 const roots: string[] = [];
 const oldRoot = process.env.ELANOUS_STATE_DIR;
@@ -38,6 +39,33 @@ function cli() {
   installHarnessCliCommand(program, { registerSink: async () => {}, resolveSurface: async () => 'harness', ask: async () => {} });
   return program;
 }
+
+test('T-cell shadow classifier separates five health states and groups infection by stop class, site, and signature tail', () => {
+  const now = Date.parse('2026-10-28T00:00:00.000Z');
+  const card = (runId: string, overrides: Partial<TcellHealthCard> = {}): TcellHealthCard => ({
+    runId, stage: 'implement', startedAt: now - 60_000, progressAt: now - 60_000, stageBudgetMs: 5 * 60_000,
+    heartbeatAt: now, parentPresent: true, leaseExpiresAt: now + 60_000, riskSignal: false, ...overrides,
+  });
+  const cards = [
+    card('healthy'),
+    card('slow', { progressAt: now - 11 * 60_000 }),
+    card('stalled', { startedAt: now - 31 * 60_000, progressAt: now - 30 * 60_000 }),
+    card('zombie', { parentPresent: false }),
+    card('infected-a', { stopClass: 'pod-died', site: 'launch', signatureTail: 'sig-tail-a', hostname: 'node-b' }),
+    card('infected-b', { stopClass: 'pod-died', site: 'launch', signatureTail: 'sig-tail-a', hostname: 'node-c' }),
+    card('infected-c', { stopClass: 'pod-died', site: 'launch', signatureTail: 'sig-tail-a', hostname: 'wsl' }),
+    card('unmeasured', { heartbeatAt: Number.NaN }),
+  ];
+  const result = classifyTcellHealthCards(cards, now);
+  expect(result.counts).toEqual({ healthy: 1, slow: 1, stalled: 1, infected: 3, zombie: 1 });
+  expect(result.unmeasuredRunIds).toEqual(['unmeasured']);
+  expect(result.total).toBe(8);
+  expect(result.measured).toBe(7);
+  const infected = result.decisions.filter((decision) => decision.classification === 'infected');
+  expect(infected.map(({ runId }) => runId)).toEqual(['infected-a', 'infected-b', 'infected-c']);
+  expect(new Set(infected.map(({ causeGroupId }) => causeGroupId)).size).toBe(1); // host is not part of the cause key
+  expect(infected.every(({ causeGroupSize }) => causeGroupSize === 3)).toBe(true);
+});
 
 test('seven signal exits in a minute form exactly one burst; spread unknown exits do not', () => {
   const at = Date.parse('2026-10-02T13:49:07.000Z');
@@ -536,6 +564,123 @@ test('incident reads the child evidence ledger row even when forwarded stdout is
   expect(readRunExits(dir)).toMatchObject([{ runId: 'run-evidence', reason: 'scope-escape', childEvidence }]);
 });
 
+test('POD-TERMINAL-EVIDENCE-JOIN persists current child tail, container exit, and parent verdict under one runId', () => {
+  const dir = root();
+  process.env.ELANOUS_STATE_DIR = dir;
+  const runId = 'run-terminal-evidence-join';
+  const job = 'si-terminal-join';
+  const secret = 'ghp_123456789012345678901234567890123456';
+  const termination = (exitCode: number) => ({ job, path: 'result-marker', observedAt: '2026-10-28T00:00:00Z',
+    jobLookup: 'ok', jobUid: '0a1b2c3d-0000-4000-8000-0000000000ee', jobConditionReason: 'unknown', activeDeadlineSeconds: 'unknown',
+    deadlineExceeded: 'unknown', podLookup: 'terminated', containerReason: exitCode === 0 ? 'Completed' : 'OOMKilled', exitCode,
+    finishedAt: '2026-10-28T00:00:00Z', oomKilled: exitCode !== 0 });
+  appendRunLedgerEntry({ runId, event: 'pod-child-run', data: { job, childRunId: 'child-old', attempt: 1 } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId, event: 'pod-child-evidence', data: { job, childRunId: 'child-old',
+    childEvidence: { podLogTail: ['old attempt'] }, podTermination: termination(137) } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId, event: 'pod-launch-finished', data: { job, run: 'child-old', attempt: 1,
+    failureClassification: 'stale-classification', terminationReason: 'stale-reason' } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId, event: 'pod-child-run', data: { job, childRunId: 'child-current', attempt: 2 } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId, event: 'pod-child-evidence', data: { job, childRunId: 'child-current',
+    childEvidence: { podLogTail: [`child final: child-error ${secret}`] }, podTermination: termination(0) } }, runLedgerDir(dir));
+  appendRunLedgerEntry({ runId, event: 'pod-launch-finished', data: { job, run: 'child-current', attempt: 2,
+    failureClassification: 'child-error', terminationReason: `BackoffLimitExceeded ${secret}` } }, runLedgerDir(dir));
+
+  recordClassifiedHarnessPodExit(runId, 'pod-failure', 0, { output: 'parent output' });
+
+  expect(readRunExits(dir)).toMatchObject([{ runId, reason: 'pod-failure', status: 0, terminalEvidence: {
+    job, childRunId: 'child-current', attempt: 2, childOutputTail: [`child final: child-error ${secret.slice(0, 4)}***`],
+    containerExitCode: 0, parentVerdict: 'pod-failure', failureClassification: 'child-error',
+    terminationReason: `BackoffLimitExceeded ${secret.slice(0, 4)}***`,
+  } }]);
+  const incidentFiles = readdirSync(join(dir, 'incidents'));
+  expect(incidentFiles).toHaveLength(1);
+  expect(incidentFiles[0]).toMatch(/^\d{4}-\d{2}-\d{2}\.jsonl$/u);
+  const persisted = readFileSync(join(dir, 'incidents', incidentFiles[0]!), 'utf8');
+  expect(persisted).not.toContain(secret);
+});
+
+test('POD-TERMINAL-EVIDENCE-JOIN sim separates provider credential skip from malformed shard identity', () => {
+  const dir = root();
+  process.env.ELANOUS_STATE_DIR = dir;
+  const at = '2026-10-28T00:00:00Z';
+  const seedChild = (parentRunId: string, childRunId: string, job: string, shardFailure: string | null,
+    status: 'crashed' | 'pr-opened', options: { priorShardFailure?: boolean; sameAttemptPriorShardFailure?: boolean; providerSkip?: boolean } = {}) => {
+    const attempt = 1;
+    if (options.priorShardFailure) {
+      appendRunLedgerEntry({ runId: childRunId, timestamp: '2026-10-27T23:59:50Z', event: 'run-status', data: { stage: 'crashed', runStatus: 'failed', failureKind: 'crashed' } }, runLedgerDir(dir));
+      appendRunLedgerEntry({ runId: childRunId, timestamp: '2026-10-27T23:59:51Z', event: 'shard-sibling-query',
+        shardIdentityReadFailure: 'malformed-structure', data: { status: 'failed', reason: 'read-failed' } }, runLedgerDir(dir));
+    }
+    appendRunLedgerEntry({ runId: parentRunId, timestamp: at, event: 'pod-child-run', data: { job, childRunId, attempt } }, runLedgerDir(dir));
+    appendRunLedgerEntry({ runId: parentRunId, timestamp: '2026-10-28T00:00:01Z', event: 'pod-child-evidence', data: { job, childRunId,
+      childEvidence: { error: 'openrouter unavailable: configure apiKey via `elanous setup`', podLogTail: ['bounded child tail'] },
+      podTermination: { job, path: 'result-marker', observedAt: at, jobLookup: 'ok', jobUid: 'job-uid',
+        jobConditionReason: 'unknown', activeDeadlineSeconds: 'unknown', deadlineExceeded: 'unknown', podLookup: 'terminated',
+        containerReason: 'Error', exitCode: status === 'crashed' ? 1 : 0, finishedAt: at, oomKilled: false } } }, runLedgerDir(dir));
+    appendRunLedgerEntry({ runId: parentRunId, timestamp: '2026-10-28T00:00:02Z', event: 'pod-launch-finished', data: { job, run: childRunId, attempt,
+      phase: status === 'crashed' ? 'failed' : 'complete', podExitClass: status === 'crashed' ? 'child-error' : null,
+      childFailureStage: status === 'crashed' ? 'error' : null } }, runLedgerDir(dir));
+    if (options.providerSkip !== false) appendRunLedgerEntry({ runId: childRunId, timestamp: '2026-10-28T00:00:00.500Z', event: 'goal-elaboration-skipped', data: { outcome: 'skipped', reason: 'provider-failed',
+      error: 'openrouter unavailable: configure apiKey via `elanous setup`', runId: childRunId } }, runLedgerDir(dir));
+    appendRunLedgerEntry({ runId: childRunId, timestamp: '2026-10-28T00:00:00.600Z', event: 'run-status', data: { stage: status, runStatus: status === 'crashed' ? 'failed' : 'completed',
+      failureKind: status === 'crashed' ? 'crashed' : undefined, runId: childRunId } }, runLedgerDir(dir));
+    if (options.sameAttemptPriorShardFailure) appendRunLedgerEntry({ runId: childRunId, timestamp: '2026-10-28T00:00:00.650Z', event: 'shard-sibling-query',
+      shardIdentityReadFailure: 'malformed-structure', data: { status: 'failed', reason: 'read-failed' } }, runLedgerDir(dir));
+    appendRunLedgerEntry({ runId: childRunId, timestamp: '2026-10-28T00:00:00.700Z', event: 'shard-sibling-query', data: {
+      status: shardFailure === 'unknown' ? 'failed' : 'skipped', reason: shardFailure === 'unknown' ? 'unknown' : 'not-sharded',
+      ...(shardFailure === 'unknown' ? { shardIdentityReadFailure: 'unknown' } : {}),
+    }, ...(shardFailure && shardFailure !== 'unknown' ? { shardIdentityReadFailure: shardFailure } : {}) }, runLedgerDir(dir));
+    recordClassifiedHarnessPodExit(parentRunId, 'pod-failure', status === 'crashed' ? 1 : 0, { output: 'simulated parent verdict' });
+  };
+
+  seedChild('parent-shard-corrupt', 'child-shard-corrupt', 'job-shard-corrupt', 'malformed-structure', 'crashed');
+  seedChild('parent-shard-unknown', 'child-shard-unknown', 'job-shard-unknown', 'unknown', 'crashed');
+  seedChild('parent-key-skip-only', 'child-key-skip-only', 'job-key-skip-only', null, 'pr-opened', { priorShardFailure: true, sameAttemptPriorShardFailure: true });
+  seedChild('parent-provider-unknown', 'child-provider-unknown', 'job-provider-unknown', null, 'pr-opened', { providerSkip: false });
+
+  const exits = Object.fromEntries(readRunExits(dir).map((exit) => [exit.runId, exit]));
+  expect(exits['parent-shard-corrupt']).toMatchObject({ terminalEvidence: { childFailureStage: 'error', failureClassification: 'child-error',
+    childRunStatus: { stage: 'crashed', status: 'failed', failureKind: 'crashed' },
+    shardIdentityReadFailure: 'malformed-structure', providerFailure: 'credential-not-configured' } });
+  expect(exits['parent-shard-unknown']?.terminalEvidence?.shardIdentityReadFailure).toBe('unknown');
+  expect(exits['parent-key-skip-only']).toMatchObject({ terminalEvidence: { childFailureStage: 'unknown',
+    childRunStatus: { stage: 'pr-opened', status: 'completed', failureKind: 'unknown' },
+    shardIdentityReadFailure: 'none', providerFailure: 'credential-not-configured' } });
+  expect(exits['parent-provider-unknown']?.terminalEvidence).toMatchObject({ providerFailure: 'unknown' });
+});
+
+test('POD-TERMINAL-EVIDENCE-JOIN joins shard identity written by the production child observer', () => {
+  const dir = root();
+  process.env.ELANOUS_STATE_DIR = dir;
+  const observeChild = (parentRunId: string, job: string, childRunId: string, attempt: number,
+    identity: { pieceTotal: number; shardIdentityReadFailure?: 'malformed-structure' | 'invalid-values' }, finalize = true) => {
+    const start = new Date(Date.now() - 1_000).toISOString();
+    appendRunLedgerEntry({ runId: parentRunId, timestamp: start, event: 'pod-child-run', data: { job, childRunId, attempt } }, runLedgerDir(dir));
+    const observe = makeRunObserver(childRunId, undefined, () => {}, (entry) => appendRunLedgerEntry(entry, runLedgerDir(dir)), identity);
+    observe('shard-sibling-query', { status: identity.shardIdentityReadFailure ? 'failed' : 'skipped',
+      reason: identity.shardIdentityReadFailure ?? 'not-sharded' });
+    appendRunLedgerEntry({ runId: parentRunId, timestamp: new Date(Date.now() + 60_000).toISOString(), event: 'pod-launch-finished',
+      data: { job, run: childRunId, attempt } }, runLedgerDir(dir));
+    if (finalize) recordClassifiedHarnessPodExit(parentRunId, 'pod-failure', 1, { output: 'simulated parent verdict' });
+  };
+
+  observeChild('parent-real-shard-failure', 'job-real-shard-failure', 'child-real-shard-failure', 1,
+    { pieceTotal: 1, shardIdentityReadFailure: 'malformed-structure' });
+  const malformed = readRunExits(dir).find((exit) => exit.runId === 'parent-real-shard-failure');
+  expect(malformed?.terminalEvidence?.shardIdentityReadFailure).toBe('malformed-structure');
+
+  // A later current-attempt no-sharding observation is authoritative even when the same child id has old shard facts.
+  observeChild('parent-real-not-sharded', 'job-real-not-sharded', 'child-real-shared', 2,
+    { pieceTotal: 1, shardIdentityReadFailure: 'malformed-structure' }, false);
+  const second = makeRunObserver('child-real-shared', undefined, () => {}, (entry) => appendRunLedgerEntry(entry, runLedgerDir(dir)), { pieceTotal: 1 });
+  second('shard-sibling-query', { status: 'skipped', reason: 'not-sharded' });
+  appendRunLedgerEntry({ runId: 'parent-real-not-sharded', timestamp: new Date(Date.now() + 60_000).toISOString(), event: 'pod-launch-finished',
+    data: { job: 'job-real-not-sharded', run: 'child-real-shared', attempt: 2 } }, runLedgerDir(dir));
+  recordClassifiedHarnessPodExit('parent-real-not-sharded', 'pod-failure', 1, { output: 'simulated parent verdict' });
+  const notSharded = readRunExits(dir).find((exit) => exit.runId === 'parent-real-not-sharded');
+  expect(notSharded?.terminalEvidence?.shardIdentityReadFailure).toBe('none');
+});
+
 test('incident ignores earlier Pod evidence after the current attempt has no child JSON', () => {
   const dir = root();
   process.env.ELANOUS_STATE_DIR = dir;
@@ -548,7 +693,10 @@ test('incident ignores earlier Pod evidence after the current attempt has no chi
   appendRunLedgerEntry({ runId: 'run-evidence-mask', event: 'pod-child-evidence', data: {
     job: 'new', childRunId: 'run-new', childEvidence: null } }, runLedgerDir(dir));
   recordClassifiedHarnessPodExit('run-evidence-mask', 'pod-failure', 1, { output: 'current failure' });
-  expect(readRunExits(dir)).toMatchObject([{ runId: 'run-evidence-mask', reason: 'pod-failure' }]);
+  expect(readRunExits(dir)).toMatchObject([{ runId: 'run-evidence-mask', reason: 'pod-failure', terminalEvidence: {
+    job: 'new', childRunId: 'run-new', attempt: 'unknown', childOutputTail: 'unknown',
+    containerExitCode: 'unknown', parentVerdict: 'pod-failure',
+  } }]);
   expect(readRunExits(dir)[0]?.childEvidence).toBeUndefined();
 });
 
@@ -652,8 +800,6 @@ test('findIncidentPrecedents returns only recorded same-reason exits before the 
 test('classifyIncidentReasonFromLastLines: 10-22 운영 unknown 사고의 lastLines 꼴을 사유로 나눈다 · 안 맞으면 null', () => {
   expect(classifyIncidentReasonFromLastLines(['  ❌ failed · 대상 경로: src/dashboard/index.ts — pod-deadline-exceeded'])).toBe('pod-deadline-exceeded');
   expect(classifyIncidentReasonFromLastLines(['  ❌ blocked · 대상 경로: src/x.ts — DEPENDENCY_NEEDS_HUMAN'])).toBe('dependency-needs-human');
-  // 앞 조각 실패(근본) ⊕ 뒤 조각 의존 막힘(증상) — 근본을 고른다
-  expect(classifyIncidentReasonFromLastLines(['  ❌ failed · a [needs-human] — GOAL_DONE_BOUNDARY_MISSING', '  ❌ blocked · b — DEPENDENCY_NEEDS_HUMAN'])).toBe('goal-done-boundary-missing');
   expect(classifyIncidentReasonFromLastLines(['  ❌ failed · c [error] — pod-job-failed: Job si-task-1 failed (BackoffLimitExceeded)'])).toBe('pod-backoff-limit');
   expect(classifyIncidentReasonFromLastLines(['  ❌ failed · d — pod-job-failed: Job si-task-2 failed — childError=no-result'])).toBe('pod-child-no-result');
   expect(classifyIncidentReasonFromLastLines(['  ❌ failed · e [aborted] — pod-job-failed: Job si-task-3 failed — '])).toBe('pod-job-failed');
@@ -662,6 +808,31 @@ test('classifyIncidentReasonFromLastLines: 10-22 운영 unknown 사고의 lastLi
   expect(classifyIncidentReasonFromLastLines(['quoted goal-elaboration-ungrounded-path in unrelated error'])).toBeNull();
   expect(classifyIncidentReasonFromLastLines(['그냥 끝났다'])).toBeNull();
   expect(classifyIncidentReasonFromLastLines(undefined)).toBeNull();
+});
+
+test('INCIDENT-REASON-FROM-LASTLINES: 충돌 꼬리는 첫 매치로 확정하지 않고 unknown을 보존한다', () => {
+  // 앞 조각 실패(근본) ⊕ 뒤 조각 의존 막힘(증상) — 두 사유가 서로 다른 사건을 말한다 = 충돌
+  const rootAndSymptom = ['  ❌ failed · a [needs-human] — GOAL_DONE_BOUNDARY_MISSING', '  ❌ blocked · b — DEPENDENCY_NEEDS_HUMAN'];
+  expect(classifyIncidentReasonFromLastLines(rootAndSymptom)).toBeNull();
+  // 줄 순서를 뒤집어도 같다 — 표 순서(첫 매치 우선순위)가 사유를 정하지 않는다
+  expect(classifyIncidentReasonFromLastLines([...rootAndSymptom].reverse())).toBeNull();
+  expect(classifyIncidentReasonFromLastLines(['  ❌ failed · c — pod-deadline-exceeded', '  ❌ blocked · d — [needs-human]'])).toBeNull();
+  // 한 줄 안에서 서로 다른 사유가 부딪혀도 충돌이다
+  expect(classifyIncidentReasonFromLastLines(['pod-deadline-exceeded · DEPENDENCY_NEEDS_HUMAN'])).toBeNull();
+  // 빈 꼬리·무증거는 unknown 유지
+  expect(classifyIncidentReasonFromLastLines([])).toBeNull();
+  expect(classifyIncidentReasonFromLastLines([''])).toBeNull();
+});
+
+test('INCIDENT-REASON-FROM-LASTLINES: ux-sim device 표지는 사유가 아니라 조각 표지로 정규화한다', () => {
+  // device 조각 표지만 있는 꼬리 — 사유를 지어내지 않고, 조각 표지는 살린다
+  const deviceOnly = ['  ❌ failed · 대상 경로: src/ux-sim/hq-seats-device.ts — DEVICE-FIRST'];
+  expect(classifyIncidentReasonFromLastLines(deviceOnly)).toBeNull();
+  const dir = root();
+  recordRunExit({ ...row('run-device', 'unknown', Date.now()), lastLines: deviceOnly }, dir);
+  const device = readRunExits(dir).find((exit) => exit.runId === 'run-device')!;
+  expect(device).toMatchObject({ reason: 'unknown', slice: 'device' });
+  expect(device.recordedReason).toBeUndefined();
 });
 
 test('readRunExits: reason unknown 만 lastLines 로 다시 분류(원문은 recordedReason) · 기록된 구체 reason 은 그대로 · 장치 조각 표지', () => {
@@ -673,6 +844,7 @@ test('readRunExits: reason unknown 만 lastLines 로 다시 분류(원문은 rec
       { runId: 'run-b', reason: 'pod-failure', status: 1, signal: null, at: '2026-10-22T08:01:00.000Z', lastLines: ['— DEPENDENCY_NEEDS_HUMAN'] },
       { runId: 'run-c', reason: 'unknown', status: 1, signal: null, at: '2026-10-22T08:02:00.000Z', lastLines: ['아무 실마리 없음'] },
       { runId: 'run-d', reason: 'unknown', status: 1, signal: null, at: '2026-10-22T08:03:00.000Z', lastLines: ['goal-elaboration needs-human: goal-elaboration-ungrounded-path (attempts: 2) · ungrounded path: src/nowhere.ts'] },
+      { runId: 'run-e', reason: 'unknown', status: 1, signal: null, at: '2026-10-22T08:04:00.000Z', lastLines: ['  ❌ failed · a [needs-human] — GOAL_DONE_BOUNDARY_MISSING', '  ❌ blocked · b — DEPENDENCY_NEEDS_HUMAN'] },
     ];
     writeFileSync(join(root, 'incidents', '2026-10-22.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
     const exits = readRunExits(root);
@@ -689,6 +861,10 @@ test('readRunExits: reason unknown 만 lastLines 로 다시 분류(원문은 rec
     expect(c.recordedReason).toBeUndefined();
     const d = exits.find((e) => e.runId === 'run-d')!;
     expect(d).toMatchObject({ reason: 'goal-elaboration-ungrounded-path', recordedReason: 'unknown', reasonSource: 'lastLines' });
+    const e = exits.find((e) => e.runId === 'run-e')!;
+    expect(e.reason).toBe('unknown'); // 충돌 꼬리 — 첫 매치로 확정하지 않는다
+    expect(e.recordedReason).toBeUndefined();
+    expect(e.reasonSource).toBeUndefined();
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -708,10 +884,11 @@ test('readRunExits: reclassified result equals classifyIncidentReasonFromLastLin
   expect(a.reasonSource).toBe('lastLines');
   expect(a.slice).toBe('device');
   const mixed = exits.find((e) => e.runId === 'run-mixed')!;
-  // 앞줄 DEPENDENCY_NEEDS_HUMAN(증상)보다 뒷줄 근본 원인이 이긴다 — 'needs-human' 아님
-  expect(mixed.reason).toBe('pod-deadline-exceeded');
-  expect(mixed.reason).toBe(classifyIncidentReasonFromLastLines(mixedLines) ?? 'unmatched');
+  // 줄마다 다른 사유(증상 DEPENDENCY_NEEDS_HUMAN ⊕ 근본 pod-deadline-exceeded) — 충돌은 unknown 보존
+  expect(mixed.reason).toBe('unknown');
+  expect(classifyIncidentReasonFromLastLines(mixedLines)).toBeNull();
   expect(mixed.reason).not.toBe('needs-human');
-  expect(mixed.recordedReason).toBe('unknown');
+  expect(mixed.recordedReason).toBeUndefined();
+  expect(mixed.reasonSource).toBeUndefined();
 });
 

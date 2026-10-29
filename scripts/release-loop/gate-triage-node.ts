@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
+import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import type { GateResult } from './gate-node.js';
 import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
@@ -39,8 +41,32 @@ export interface GateTriageShadow {
     loadFlaky: string[] | null;
     stalledEnv: Array<{ file: string; local: string }>;
   };
-  /** Shadow always goes to the existing failure exit. */
-  outcome: 'fail';
+  /** Classification succeeded; the release graph still routes to its failure exit. */
+  outcome: 'ok' | 'error';
+}
+
+/** A prescription is selected from observed gate facts. Execution waits until the failed run is terminal. */
+export type GatePrescription =
+  | { action: 'rerun-pod'; reason: string; runId: string | null; commit: string }
+  | { action: 'repair-card'; reason: string; runId: string | null; commit: string; failureIds: string[] }
+  | { action: 'decision-card'; reason: string; runId: string | null; commit: string }
+  | { action: 'none'; reason: string; runId: string | null; commit: string };
+
+export function chooseGatePrescription(context: GraphContext, triage: GateTriageShadow): GatePrescription {
+  const runId = context.runId ?? null;
+  const common = { runId, commit: triage.commit };
+  const gate = context.outputs.gate;
+  const unattributed = (Array.isArray(gate?.stalledShards)
+    && gate.stalledShards.some((shard: unknown) => shard && typeof shard === 'object'
+      && (shard as { reason?: unknown }).reason === 'unattributed'))
+    || (typeof gate?.error === 'string' && /failure attribution (?:incomplete|summary=)|unattributed/.test(gate.error));
+  if (triage.classification === 'exhausted')
+    return { ...common, action: 'decision-card', reason: 'same gate symptom recurred twice' };
+  if (unattributed && triage.introduced.length === 0 && context.input.gateExecutor === 'host')
+    return { ...common, action: 'rerun-pod', reason: 'host gate attribution incomplete' };
+  if (triage.classification === 'regression' && triage.introduced.length > 0)
+    return { ...common, action: 'repair-card', reason: 'introduced gate regressions', failureIds: [...triage.introduced] };
+  return { ...common, action: 'none', reason: `no evidence-backed automatic remedy for ${triage.classification}` };
 }
 
 function timeoutShape(gate: GateResult): boolean {
@@ -104,11 +130,12 @@ export function classifyGateShadow(gate: GateResult, evidence: GateTriageEvidenc
       environmentFailureIds: evidence.environmentFailureIds ? [...evidence.environmentFailureIds] : null,
       loadFlaky: gate.loadFlaky ? [...gate.loadFlaky] : null,
       stalledEnv: gate.stalledEnv.map((item) => ({ file: item.file, local: item.local })) },
-    outcome: 'fail' };
+    outcome: 'ok' };
 }
 
 /** Read only the completed gate output. The graph wiring is a separate change after M3. */
-export function gateTriageShadowFromContext(context: GraphContext, evidence?: GateTriageEvidence): GateTriageShadow {
+export function gateTriageShadowFromContext(context: GraphContext, evidence?: GateTriageEvidence,
+  ledgerHistory: NonNullable<GateTriageEvidence['priorDecisions']> = []): GateTriageShadow {
   const value = context.outputs.gate;
   if (!value || typeof value.commit !== 'string' || !Array.isArray(value.introduced)
     || !value.introduced.every((item) => typeof item === 'string')
@@ -140,6 +167,7 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
       && item.failureIds.every((id: unknown) => typeof id === 'string'))
       ? { priorDecisions: supplied.priorDecisions as GateTriageEvidence['priorDecisions'] } : {}),
   };
+  if (!observed.priorDecisions && ledgerHistory.length) observed.priorDecisions = ledgerHistory;
   // The graph adapter maps a measured gate regression to `fail` for edge routing.
   // Restore the gate verdict before classifying the shadow; keep the context untouched.
   const gate = value.outcome === 'fail' ? { ...value, outcome: 'regression' } : value;
@@ -148,6 +176,34 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
 
 export function logGateTriageShadow(result: GateTriageShadow, version: string): void {
   debug.log('graph.ground', 'gate-triage-shadow', { version, ...result });
+}
+
+/** Last two completed triage facts from distinct release runs on this exact cut commit. */
+export function priorGateDecisionsFromLedger(context: GraphContext, root = effectiveInstanceRoot()): NonNullable<GateTriageEvidence['priorDecisions']> {
+  const commit = context.outputs.gate?.commit;
+  if (typeof commit !== 'string' || !commit) return [];
+  const dir = join(root, 'graph-runs', 'release-loop');
+  try {
+    const files = readdirSync(dir).filter(name => name.endsWith('.json'))
+      .map(name => ({ name, mtime: statSync(join(dir, name)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime).slice(0, 200);
+    const prior: NonNullable<GateTriageEvidence['priorDecisions']> = [];
+    for (const { name } of files) {
+      try {
+        const state = JSON.parse(readFileSync(join(dir, name), 'utf8')) as Record<string, unknown>;
+        if (state.runId === context.runId || (state.input as Record<string, unknown> | undefined)?.version !== context.input.version) continue;
+        const nodes = Array.isArray(state.nodes) ? state.nodes as Array<Record<string, unknown>> : [];
+        const node = [...nodes].reverse().find(item => item.nodeId === 'gate-triage' && item.executed === true);
+        const raw = node?.output;
+        const output = typeof raw === 'string' ? JSON.parse(raw) as Record<string, unknown> : raw as Record<string, unknown> | undefined;
+        if (output?.commit !== commit || !['unmeasured', 'load', 'env', 'regression', 'clean'].includes(String(output.classification))
+          || !Array.isArray(output.failureIds) || !output.failureIds.every(id => typeof id === 'string')) continue;
+        prior.push({ classification: output.classification as GateTriageClass, commit, failureIds: output.failureIds as string[] });
+        if (prior.length === 2) break;
+      } catch { /* Other runs may be incomplete while their ledger is being written. */ }
+    }
+    return prior.reverse();
+  } catch { return []; }
 }
 
 /** A saved verdict has fewer fields than the live gate output. Keep the absent evidence absent. */
@@ -174,20 +230,24 @@ if (import.meta.main) {
   try {
     const savedPath = process.argv[2] === '--gate-verdict' ? process.argv[3] : undefined;
     if (process.argv[2] && !savedPath) throw new Error('usage: gate-triage-node.ts [--gate-verdict <path>]');
+    const context = savedPath ? undefined : readGraphContext();
+    const history = context ? priorGateDecisionsFromLedger(context) : [];
     const { version, result } = savedPath
       ? gateTriageShadowFromSavedVerdict(JSON.parse(readFileSync(savedPath, 'utf8')))
-      : (() => { const context = readGraphContext(); return { version: context.input.version,
-        result: gateTriageShadowFromContext(context) }; })();
+      : { version: context!.input.version, result: gateTriageShadowFromContext(context!, undefined, history) };
     logGateTriageShadow(result, version);
-    emitNodeResult({ ...result, verdict: 'fail', summary: `gate-triage shadow: ${result.classification} — ${result.reason}` });
+    const prescription = context ? chooseGatePrescription(context, result) : undefined;
+    if (prescription) debug.log('release-loop.heal', 'prescribed-shadow', { version, ...prescription });
+    emitNodeResult({ ...result, ...(prescription ? { prescription } : {}), verdict: 'ok',
+      summary: `gate-triage shadow: ${result.classification} — ${result.reason}` });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    const result: GateTriageShadow = { outcome: 'fail', classification: 'unmeasured', reason,
+    const result: GateTriageShadow = { outcome: 'error', classification: 'unmeasured', reason,
       commit: 'unknown', introduced: [], stalledFiles: [], failureIds: [],
       evidence: { highLoad: null, isolatedReproductions: null, isolatedCheckedFailureIds: null,
         isolatedPassedFiles: null, environmentFailureIds: null, loadFlaky: null, stalledEnv: [] } };
     logGateTriageShadow(result, 'unknown');
     emitNodeResult({ ...result, verdict: 'fail', summary: `gate-triage shadow: ${reason}` });
+    process.exitCode = 1;
   }
-  process.exitCode = 1;
 }

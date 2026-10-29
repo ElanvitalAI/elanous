@@ -178,3 +178,4 @@ CLAUDE.local.md
 
 # bun test 실행 잔채 로그(SURVIVAL-PROGRESS-CLOCK 리뷰 — 의도된 산출 아님)
 .mtest.log
+/scratch-repro-*

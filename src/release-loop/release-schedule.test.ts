@@ -1,11 +1,15 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { formatSchedule, getSchedule, listSchedules, setSchedule } from './release-schedule.js';
+import { formatSchedule, getSchedule, listSchedules, setSchedule, dueReleaseCutEvents, emitDueReleaseCutEvents } from './release-schedule.js';
+import { runGraph } from '../graph-runner/runner.js';
+import { runUnattendedRelease } from '../../scripts/release-loop/unattended-release.js';
+import { graphScheduleEntries } from '../workflow-runtime/triggers/registry.js';
+import { parse as yaml } from 'yaml';
 
 let dir = '';
 function setup() { dir = mkdtempSync(join(tmpdir(), 'release-schedule-')); setElanousConfigDir(dir); }
@@ -68,4 +72,60 @@ test('옛 피처 DB 는 기존 칸·이벤트 보존한 채 판 표만 추가한
   expect(migrated.query('SELECT title FROM features WHERE id = ?').get('K1')).toEqual({ title: '보존' });
   expect(migrated.query('SELECT name FROM sqlite_master WHERE name = ?').get('release_schedules')).toEqual({ name: 'release_schedules' });
   migrated.close();
+});
+
+test('컷 일정 사건이 구독한 그래프를 손 명령 없이 한 번 시작한다', async () => {
+  setup();
+  mkdirSync(join(dir, 'release', '0.2.9'), { recursive: true });
+  writeFileSync(join(dir, 'release', '0.2.9', 'release.json'), JSON.stringify({ version: '0.2.9', publishedAt: '2026-10-01T00:00:00Z' }));
+  const cutAt = '2026-10-03T08:00+09:00';
+  setSchedule('0.2.10', { cutAt }, 'OP');
+  const graphFile = join(dir, 'release-event.yaml');
+  writeFileSync(join(dir, 'recipes.yaml'), '{}\n');
+  writeFileSync(graphFile, `graph_id: release-loop
+loop:
+  trigger:
+    events: [manual, release.cut.due]
+version: 1
+entry_node: done
+terminal_nodes: [done]
+nodes:
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+edges: []
+`);
+  expect(dueReleaseCutEvents('2026-10-02T22:59:59Z', dir)).toEqual([]);
+  const now = '2026-10-02T23:00:01Z';
+  const started: string[] = [];
+  const emit = async (event: { type: string; id: string; version: string }) => {
+    const fired = await runUnattendedRelease({ version: event.version,
+      triggerEvent: event as { id: string; type: 'release.cut.due'; version: string; cutAt: string; at: string } }, {
+      ledgerRoot: dir, config: { gatePodPool: 'test-pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }),
+      graph: (_path, options) => runGraph(graphFile, options),
+    });
+    expect(fired.state?.status).toBe('done');
+    started.push(fired.state!.runId);
+  };
+  const first = await emitDueReleaseCutEvents(now, emit, dir);
+  expect(first).toMatchObject([{ type: 'release.cut.due', version: '0.2.10' }]);
+  expect(started).toHaveLength(1);
+  expect(await emitDueReleaseCutEvents(now, emit, dir)).toEqual([]);
+  expect(readdirSync(join(dir, 'graph-runs', 'release-loop')).filter(name => name.endsWith('.json'))).toHaveLength(1);
+  const run = JSON.parse(readFileSync(join(dir, 'graph-runs', 'release-loop', `${started[0]}.json`), 'utf8'));
+  expect(run.input.triggerEvent.id).toBe(first[0]!.id);
+  const claims = join(dir, 'release', 'cut-events');
+  const claim = join(claims, readdirSync(claims)[0]!);
+  writeFileSync(claim, JSON.stringify({ status: 'pending', pid: 999999 }));
+  expect(await emitDueReleaseCutEvents(now, emit, dir)).toEqual([]);
+  expect(JSON.parse(readFileSync(claim, 'utf8'))).toMatchObject({ status: 'emitted', recovered: true });
+  expect(started).toHaveLength(1);
+});
+
+test('실제 릴리스 그래프는 컷 사건과 스케줄러 tick을 모두 선언한다', () => {
+  const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
+    loop: { trigger: { events: string[] } } };
+  expect(graph.loop.trigger.events).toContain('release.cut.due');
+  expect(graphScheduleEntries(graph)).toMatchObject([{
+    workflowName: 'graph:release-loop', trigger: { type: 'cron', cron: '* * * * *' },
+  }]);
 });

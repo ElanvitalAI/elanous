@@ -79,6 +79,14 @@ test('only a pinned, complete, clean full cut with one observed Pod digest earns
   expect(gateBaselineReceipt({ ...input, graphPins: null })).toMatchObject({ valid: false, reason: 'pinned graph or recipe SHA absent' });
 });
 
+test('an unresolved failure attribution recheck cannot mint or mislabel a reusable receipt', () => {
+  expect(gateBaselineReceipt({ root: root(), version: '0.2.41', commit: sha, fullSweep: false, graphPins: pins,
+    envFingerprint: gateEnvFingerprint({}), attributionRecheck: { summary: 39, observed: 78, identified: 39,
+      baselineResult: 'completed', targetFiles: ['src/a.test.ts'] } }))
+    .toMatchObject({ valid: false, reason: 'failure attribution unresolved after baseline recheck (completed): summary=39, observed=78, identified=39',
+      attributionRecheck: { summary: 39, observed: 78, identified: 39, baselineResult: 'completed', targetFiles: ['src/a.test.ts'] } });
+});
+
 test('graph and recipe pins come from the exact release graph run state', () => {
   const dir = root();
   const runs = join(dir, 'graph-runs', 'release-loop');

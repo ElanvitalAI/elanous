@@ -57,6 +57,7 @@ import { targetScopedGoalText } from './goal-text-path-scope.js';
 import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { declaredNewFilePaths } from './goal-new-paths.js';
 import { classifyGoalCommandExecution, type GoalCommandExecutionResult } from './goal-command-execution.js';
+import { formatShadowArmProbeRecord, probeShadowArm, type ShadowArmProbeRecord, type ShadowDifficulty } from '../budget/shadow-arms.js';
 import { identityLines, repositoryIdentifiers } from './goal-author-identity.js';
 import { selectRelevantAuthoringLessons } from './knowhow-pack.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -385,6 +386,7 @@ type GoalAuthorTimedPhase = GoalAuthorPhase | GoalAuthorAssembleSubphase;
 function startGoalAuthorPhase(phase: GoalAuthorTimedPhase, authorRunId: string, onProgress?: GoalAuthorDeps['onProgress']): number {
   observeGoalAuthor('goal-author', 'phase-start', { phase, authorRunId });
   if (GOAL_AUTHOR_PHASES.includes(phase as GoalAuthorPhase)) {
+    if (phase === 'assemble') probeAuthoringShadowArm(authorRunId);
     if (onProgress) onProgress(phase as GoalAuthorPhase, 'start');
     else process.stderr.write(`[goal-author] ${phase} started\n`);
   }
@@ -401,6 +403,56 @@ function endGoalAuthorPhase(phase: GoalAuthorTimedPhase, startedAt: number, auth
     if (onProgress) onProgress(phase as GoalAuthorPhase, 'end');
     else process.stderr.write(`[goal-author] ${phase} ended in ${elapsedMs}ms\n`);
   }
+}
+
+// ── SHADOW-MODEL-ARMS · 저작 단계 그림자 «1팔» probe(명시 실행 · 관측만) ────────────────
+/**
+ * ⭐ 저작 단계 그림자 1팔 — `planShadowArms`(src/budget/shadow-arms.ts) 를 일일 상한
+ *   안에서 «실제 호출»해 난이도·모델·예상/실제 비용·결과를 한 줄 원장 형식으로 기록한다.
+ *   ⛔ 관측만 한다 — 라이브 LLM(Claude 구독) 호출 0 · 골/PR/착지 파일 쓰기 0.
+ *      팔은 «계획»이고, 실행·자동 런 훅·다른 단계(implement·review·judge) 팔은 후속 조각이다.
+ *   ⛔ 오늘 이미 쓴 그림자 예산의 실 지출 원장 배선도 후속 — 지금은 0지출 고정값으로 판정한다.
+ */
+export const SHADOW_AUTHORING_ARM_MODEL = 'gpt-5.6-terra';
+export const SHADOW_AUTHORING_ARM_DIFFICULTY: ShadowDifficulty = 'medium';
+export const SHADOW_AUTHORING_ARM_INPUT_TOKENS = 24_000;
+export const SHADOW_AUTHORING_ARM_OUTPUT_TOKENS = 8_000;
+export const SHADOW_AUTHORING_SPENT_TODAY_USD = 0;
+export const SHADOW_AUTHORING_DAILY_CAP_USD = 5;
+
+export interface AuthoringShadowArmProbe {
+  record: ShadowArmProbeRecord;
+  line: string;
+}
+
+let shadowArmProbeObserver: ((probe: AuthoringShadowArmProbe, authorRunId: string) => void) | undefined;
+
+function defaultShadowArmProbeObserver(probe: AuthoringShadowArmProbe, authorRunId: string): void {
+  observeGoalAuthor('goal-author', 'shadow-arm-authoring', { authorRunId, ...probe.record, line: probe.line });
+}
+
+/** 저작 단계 그림자 1팔을 실제 호출해 기록을 낸다 — 부작용은 관측 원장뿐이다(관측만). */
+export function probeAuthoringShadowArm(authorRunId: string): AuthoringShadowArmProbe {
+  const record = probeShadowArm({
+    stage: 'authoring',
+    difficulty: SHADOW_AUTHORING_ARM_DIFFICULTY,
+    inputTokens: SHADOW_AUTHORING_ARM_INPUT_TOKENS,
+    expectedOutputTokens: SHADOW_AUTHORING_ARM_OUTPUT_TOKENS,
+    candidates: [SHADOW_AUTHORING_ARM_MODEL],
+    spentTodayUsd: SHADOW_AUTHORING_SPENT_TODAY_USD,
+    dailyCapUsd: SHADOW_AUTHORING_DAILY_CAP_USD,
+  });
+  const probe: AuthoringShadowArmProbe = { record, line: formatShadowArmProbeRecord(record) };
+  const observer = shadowArmProbeObserver ?? defaultShadowArmProbeObserver;
+  observer(probe, authorRunId);
+  return probe;
+}
+
+/** 관측 접합점 갈아끼우기(시험 전용) — 인자 없이 부르면 생산 기본 관측자로 복원한다. */
+export function _setShadowArmProbeObserverForTesting(
+  observer?: (probe: AuthoringShadowArmProbe, authorRunId: string) => void,
+): void {
+  shadowArmProbeObserver = observer;
 }
 
 export type GoalFileLintLevel = 'ERROR' | 'WARN';
@@ -2972,7 +3024,17 @@ export function readVerificationMenuDocs(root: string | undefined): { menu: stri
   return { menu: read(VERIFICATION_MENU_DOC), catalog: read(MOCK_CATALOG_DOC) };
 }
 
-interface CatalogStage { id: string; name: string; run: string; level: InjectionLadderLevel; strong: string[]; weak: string[] }
+interface CatalogStage {
+  id: string;
+  name: string;
+  universe: string;
+  injection: string;
+  observation: string;
+  run: string;
+  level: InjectionLadderLevel;
+  strong: string[];
+  weak: string[];
+}
 interface MenuRow { method: string; command: string; stages: string }
 
 const CATALOG_STOP_WORDS = new Set(['bun', 'bin', 'elanous', 'elanous.mjs', 'mjs', 'test', 'git', 'grep', 'head', 'json', 'path', 'paths']);
@@ -2999,8 +3061,10 @@ function parseCatalogStages(catalog: string): CatalogStage[] {
     const [, id, name] = header as unknown as [string, string, string];
     const universe = catalogField(block, '우주');
     const behaviour = catalogField(block, '증명하는 동작');
+    const injection = catalogField(block, '무대 세우기');
+    const observation = catalogField(block, '판정');
     const run = catalogField(block, '실행');
-    const text = `${name} ${behaviour} ${run}`;
+    const text = `${name} ${behaviour} ${universe} ${injection} ${observation} ${run}`;
     const strong = new Set<string>();
     const weak = new Set<string>();
     for (const span of text.match(/`[^`]+`/gu) ?? []) {
@@ -3015,7 +3079,8 @@ function parseCatalogStages(catalog: string): CatalogStage[] {
       if (word.length >= 2 && !CATALOG_KOREAN_STOP_WORDS.has(word)) weak.add(word);
     }
     for (const word of strong) weak.delete(word);
-    return [{ id, name: name.trim(), run, level: ladderLevelForUniverse(universe), strong: [...strong], weak: [...weak] }];
+    return [{ id, name: name.trim(), universe, injection, observation, run,
+      level: ladderLevelForUniverse(universe), strong: [...strong], weak: [...weak] }];
   });
 }
 
@@ -3095,6 +3160,10 @@ export function authorVerificationPlan(input: VerificationPlanInput): Verificati
   const operationalNote = operational
     ? ` · 운영 실물: 메뉴 «${operationalRow?.method ?? '운영 실물 로그 관측'}» — 운영 데이터가 입력일 때만${operationalRow ? ` (${oneLine(operationalRow.command.replace(/`/gu, ''), 120)})` : ''}`
     : '';
+  const completionEvidenceCommandValue = /^\s*(?:[-*]\s*)?완료\s*경계\s*증거\s*명령\s*:\s*(.+?)\s*$/mu.exec(ask)?.[1];
+  const completionEvidenceCommand = completionEvidenceCommandValue
+    ? validateGoalDoneEvidenceCommand(completionEvidenceCommandValue).command
+    : undefined;
   const testFile = firstTestTarget(input.targetPaths);
   const cellId = ask.match(/\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b/u)?.[0];
   const behaviour = oneLine((input.behaviour || '').split(/\s*(?:판정선|판정\s*신호)\s*(?:\(반증\))?\s*:/u)[0] || 'ask 에서 동작 문장을 고르지 못했다 — 사람이 ① 을 채운다', 120);
@@ -3109,7 +3178,7 @@ export function authorVerificationPlan(input: VerificationPlanInput): Verificati
     const row = menuRows.find((candidate) => candidate.stages.includes(best!.stage.id));
     const run = /`([^`]+)`/u.exec(best.stage.run)?.[1];
     stage = { source: 'catalog', id: best.stage.id, level: best.stage.level };
-    stageLine = `- ② 무대: ${best.stage.id} ${best.stage.name} · ${best.stage.level} (${INJECTION_LADDER[best.stage.level]})${row ? ` · 메뉴: ${row.method}` : ''}${run ? ` · 실행: \`${run}\`` : ''}${operationalNote}`;
+    stageLine = `- ② 무대: ${best.stage.id} ${best.stage.name} · 우주: ${oneLine(best.stage.universe, 90)} · 사건 주입: ${oneLine(best.stage.injection, 120)} · 관측: ${oneLine(best.stage.observation, 120)} · ${best.stage.level} (${INJECTION_LADDER[best.stage.level]})${row ? ` · 메뉴: ${row.method}` : ''}${run ? ` · 실행: \`${run}\`` : ''}${operationalNote}`;
   } else {
     const screen = /TUI|화면|렌더|위젯|ux-sim|fake-llm|fake-bin|fake-clock|타이머/iu.test(ask);
     const level: InjectionLadderLevel = screen ? 'L2' : 'L1';
@@ -3146,6 +3215,9 @@ export function authorVerificationPlan(input: VerificationPlanInput): Verificati
   const symbol = wiringSymbol(ask);
   const productionPaths = input.targetPaths.filter((path) => !/\.test\./u.test(path) && !/\.md$/u.test(path));
   const wiring = `git grep -n -F '${symbol ?? '<새 함수>'}(' HEAD -- ${productionPaths.length ? productionPaths.join(' ') : 'src'}`;
+  const e2 = completionEvidenceCommand
+    ? `E2 완료 경계 증거 명령 \`${completionEvidenceCommand}\` 을 origin/main 에서 rc0 확인`
+    : 'E2 완료 경계 증거 명령은 ask에 없거나 유효하지 않아 저작자가 채움';
   return {
     lines: [
       VERIFICATION_PLAN_HEADING,
@@ -3153,7 +3225,7 @@ export function authorVerificationPlan(input: VerificationPlanInput): Verificati
       stageLine,
       `- ③ 먼저 쓸 시험(RED): \`${testFile}\` › '${testName}' — ① 의 동작이 아직 없어 단언이 실패한다(구현 전에 먼저 쓰고 실패를 확인한다)`,
       `- ④ GREEN 뒤 같은 명령: \`${testCommand}\` → 0 fail`,
-      `- ⑤ 생산 진입점 배선(MS-05): \`${wiring}\` — 호출부를 커밋한 뒤 PR head 에서 돌린다 · 정의·주석·시험 행이 아닌 생산 호출 문장 1건 이상(0건만으로 미배선 판정 금지)`,
+      `- ⑤ 생산 진입점 배선(MS-05 · G1 v4): \`${wiring}\` — 호출부를 커밋한 뒤 PR head에서 돌린다 · 정의·주석·시험 행이 아닌 생산 호출 문장 1건 이상(0건만으로 미배선 판정 금지) · E1 착지 뒤 PR head가 main의 조상인지 확인 · ${e2} · E3 생산 진입점 시험 또는 mock 무대 · E4 운영 실물은 필수 아님`,
     ],
     stage,
     menuPresent: input.menu !== null,

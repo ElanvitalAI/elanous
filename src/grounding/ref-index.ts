@@ -151,6 +151,25 @@ export function buildReferenceCard(
   };
 }
 
+/**
+ * Cards for a whole registry/discovery batch. Read-only: no writes anywhere.
+ * Non-local kinds and unreadable paths are skipped — one bad source must not
+ * sink the batch. Pure value out.
+ */
+export function buildReferenceCardsForRegistry(
+  sources: readonly GroundingSource[],
+  fs: RefIndexFs = nodeRefIndexFs,
+  limits: Partial<RefIndexLimits> = {},
+): ReferenceCard[] {
+  const cards: ReferenceCard[] = [];
+  for (const source of sources) {
+    if ((source.kind !== 'local-repo' && source.kind !== 'local-docs') || !source.path) continue;
+    if (fs.mtimeMs(source.path) === undefined) continue;
+    cards.push(buildReferenceCard(source, fs, limits));
+  }
+  return cards;
+}
+
 function receivedAtOf(source: GroundingSource, fs: RefIndexFs, root: string): string | undefined {
   if (source.kind === 'local-repo') {
     const commit = fs.lastCommitAt(root);

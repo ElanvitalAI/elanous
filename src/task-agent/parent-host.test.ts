@@ -498,7 +498,7 @@ describe('원격 인자 — HQ 병합 권한을 넘기지 않는다', () => {
   });
   test('원격 셸 한 줄 — 런 id env · 따옴표 · 로그 · pid', () => {
     const script = remoteLaunchScript(TARGET, ['harness', 'say', '--merge-by-host', "it's a goal\nline2"], { ELANOUS_RUN_ID: 'run-abcd1234' });
-    expect(script).toContain('env ELANOUS_RUN_ID=run-abcd1234 ELANOUS_STATE_DIR="$HOME"/.elanous nohup');
+    expect(script).toContain('env ELANOUS_RUN_ID=run-abcd1234 ELANOUS_STATE_DIR="$HOME"/.elanous ELANOUS_STATE_DIR_SOURCE=explicit nohup');
     expect(script).toContain(`"$HOME"/.local/share/elanous/bin/elanous --config-dir "$HOME"/.elanous harness say --no-auto-merge`);
     expect(script).toContain(`'it'\\''s a goal\nline2'`);
     expect(script).toContain('remote-parents/run-abcd1234.log');
@@ -508,10 +508,28 @@ describe('원격 인자 — HQ 병합 권한을 넘기지 않는다', () => {
     const script = remoteLaunchScript({ ...TARGET, configDir: '/srv/elanous state' }, ['harness', 'say', '--merge-by-host'], {
       ELANOUS_RUN_ID: 'run-abcd1234', ELANOUS_TASK_CARD_ID: 'ta-card-123', OPENROUTER_API_KEY: 'secret value', ELANOUS_STATE_DIR: '/old/worktree/.elanous-test',
     });
-    expect(script).toContain("ELANOUS_RUN_ID=run-abcd1234 ELANOUS_TASK_CARD_ID=ta-card-123 OPENROUTER_API_KEY='secret value' ELANOUS_STATE_DIR='/srv/elanous state' nohup");
+    expect(script).toContain("ELANOUS_RUN_ID=run-abcd1234 ELANOUS_TASK_CARD_ID=ta-card-123 OPENROUTER_API_KEY='secret value' ELANOUS_STATE_DIR='/srv/elanous state' ELANOUS_STATE_DIR_SOURCE=explicit nohup");
     expect(script).toContain("--config-dir '/srv/elanous state' harness say --no-auto-merge");
     expect(script).not.toContain('/old/worktree/.elanous-test');
     expect(script).toContain("'/srv/elanous state/remote-parents/run-abcd1234.log'");
+  });
+  test('REMOTE-PARENT-OBS: 상태 루트는 출처 태그와 한 벌 — HQ 의 derived(worktree) 태그를 넘기지 않는다', () => {
+    // HQ 가 git worktree/`--test` 면 context.env 에 ELANOUS_STATE_DIR_SOURCE=derived 가 실린다.
+    // 루트만 원격 값으로 바꾸고 태그를 흘리면 원격 부모는 «운영 루트 + 파생 태그»를 받아
+    // 자기 우주를 test 로 오독한다(codexCredentialRoot·harnessLaunchPolicyConfig 가 그 태그를 본다).
+    const hqWorktreeEnv = {
+      ELANOUS_RUN_ID: 'run-abcd1234', ELANOUS_TASK_CARD_ID: 'ta-card-123', OPENROUTER_API_KEY: 'secret value',
+      ELANOUS_STATE_DIR: '/old/worktree/.elanous-test', ELANOUS_STATE_DIR_SOURCE: 'derived',
+    };
+    const defaultScript = remoteLaunchScript(TARGET, ['harness', 'say', '--merge-by-host'], hqWorktreeEnv);
+    expect(defaultScript).toContain('env ELANOUS_RUN_ID=run-abcd1234 ELANOUS_TASK_CARD_ID=ta-card-123 OPENROUTER_API_KEY=\'secret value\' ELANOUS_STATE_DIR="$HOME"/.elanous ELANOUS_STATE_DIR_SOURCE=explicit nohup');
+    expect(defaultScript).not.toContain('derived');
+    expect(defaultScript).not.toContain('/old/worktree/.elanous-test');
+    const customScript = remoteLaunchScript({ ...TARGET, configDir: '/srv/elanous state' }, ['harness', 'say', '--merge-by-host'], hqWorktreeEnv);
+    expect(customScript).toContain("ELANOUS_STATE_DIR='/srv/elanous state' ELANOUS_STATE_DIR_SOURCE=explicit nohup");
+    expect(customScript).toContain("--config-dir '/srv/elanous state' harness say --no-auto-merge");
+    expect(customScript).not.toContain('derived');
+    expect(customScript).not.toContain('/old/worktree/.elanous-test');
   });
 });
 
@@ -1086,6 +1104,75 @@ describe('원격 스크립트 — 실제 셸', () => {
     expect(log).not.toContain(join(cwd, '.elanous-test'));
     try { process.kill(out.pid); } catch { /* 이미 끝남 */ }
   });
+
+  test('REMOTE-PARENT-OBS: 원격 부모 발사 env에 원격 configDir과 같은 ELANOUS_STATE_DIR을', () => {
+    const probe = 'echo "args: $*"; echo "run=$ELANOUS_RUN_ID"; echo "card=$ELANOUS_TASK_CARD_ID"; echo "key=$OPENROUTER_API_KEY"; echo "state=$ELANOUS_STATE_DIR"; sleep 3';
+    const harnessArgs = ['harness', 'say', '--merge-by-host', 'goal'];
+    const worktreeTestState = (cwd: string) => join(cwd, '.elanous-test');
+    const { home, cwd } = fakeHome(probe);
+    try {
+      // 기본 configDir — 원격 셸이 $HOME 을 확장해 운영 상태 루트로 바인딩한다.
+      const basic = launchRemoteParent({ host: 'h', cwd }, harnessArgs,
+        { ELANOUS_RUN_ID: 'run-obs-0001', ELANOUS_TASK_CARD_ID: 'ta-obs-1', OPENROUTER_API_KEY: 'obs key', ELANOUS_STATE_DIR: worktreeTestState(cwd) },
+        localShell(home));
+      expect(basic.pid).toBeGreaterThan(0);
+      const basicLog = readFileSync(join(home, '.elanous/remote-parents/run-obs-0001.log'), 'utf8');
+      expect(basicLog).toContain('args: --config-dir');
+      expect(basicLog).toContain('harness say --no-auto-merge goal');
+      expect(basicLog).toContain('run=run-obs-0001');
+      expect(basicLog).toContain('card=ta-obs-1');
+      expect(basicLog).toContain('key=obs key');
+      expect(basicLog).toContain(`state=${join(home, '.elanous')}`);
+      expect(basicLog).not.toContain(`state=${worktreeTestState(cwd)}`);
+      try { process.kill(basic.pid); } catch { /* 이미 끝남 */ }
+
+      // 사용자 지정 절대 configDir — 그 경로 그대로 운영 상태 루트로 바인딩한다.
+      const configDir = join(home, 'obs state');
+      const custom = launchRemoteParent({ host: 'h', cwd, configDir }, harnessArgs,
+        { ELANOUS_RUN_ID: 'run-obs-0001', ELANOUS_TASK_CARD_ID: 'ta-obs-1', OPENROUTER_API_KEY: 'obs key', ELANOUS_STATE_DIR: worktreeTestState(cwd) },
+        localShell(home));
+      expect(custom.pid).toBeGreaterThan(0);
+      const customLog = readFileSync(join(configDir, 'remote-parents/run-obs-0001.log'), 'utf8');
+      expect(customLog).toContain('harness say --no-auto-merge goal');
+      expect(customLog).toContain('run=run-obs-0001');
+      expect(customLog).toContain('card=ta-obs-1');
+      expect(customLog).toContain('key=obs key');
+      expect(customLog).toContain(`state=${configDir}`);
+      expect(customLog).not.toContain(worktreeTestState(cwd));
+      try { process.kill(custom.pid); } catch { /* 이미 끝남 */ }
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }, { timeout: 20_000 });
+
+  test('REMOTE-PARENT-OBS: HQ 의 derived(worktree) 상태 태그가 원격 부모로 흐르지 않고 explicit 로 찍힌다', () => {
+    const probe = 'echo "state=$ELANOUS_STATE_DIR"; echo "source=$ELANOUS_STATE_DIR_SOURCE"; sleep 3';
+    const harnessArgs = ['harness', 'say', '--merge-by-host', 'goal'];
+    const worktreeTestState = (cwd: string) => join(cwd, '.elanous-test');
+    const { home, cwd } = fakeHome(probe);
+    try {
+      // HQ 쪽 env — git worktree 파생 test 우주가 «루트 + 태그» 한 벌로 실린 상태(src/agent/identity-env.ts).
+      const hqEnv = { ...env, ELANOUS_TASK_CARD_ID: 'ta-obs-2', ELANOUS_STATE_DIR: worktreeTestState(cwd), ELANOUS_STATE_DIR_SOURCE: 'derived' };
+      // 기본 configDir — 원격 셸이 $HOME 을 확장한 운영 상태 루트 + explicit 태그.
+      const basic = launchRemoteParent({ host: 'h', cwd }, harnessArgs, hqEnv, localShell(home));
+      expect(basic.pid).toBeGreaterThan(0);
+      const basicLog = readFileSync(join(home, '.elanous/remote-parents/run-shell0001.log'), 'utf8');
+      expect(basicLog).toContain(`state=${join(home, '.elanous')}`);
+      expect(basicLog).toContain('source=explicit');
+      expect(basicLog).not.toContain('derived');
+      expect(basicLog).not.toContain(worktreeTestState(cwd));
+      try { process.kill(basic.pid); } catch { /* 이미 끝남 */ }
+
+      // 사용자 지정 절대 configDir — 같은 한 벌.
+      const configDir = join(home, 'obs state');
+      const custom = launchRemoteParent({ host: 'h', cwd, configDir }, harnessArgs, { ...hqEnv, ELANOUS_RUN_ID: 'run-obs-0002' }, localShell(home));
+      expect(custom.pid).toBeGreaterThan(0);
+      const customLog = readFileSync(join(configDir, 'remote-parents/run-obs-0002.log'), 'utf8');
+      expect(customLog).toContain(`state=${configDir}`);
+      expect(customLog).toContain('source=explicit');
+      expect(customLog).not.toContain('derived');
+      expect(customLog).not.toContain(worktreeTestState(cwd));
+      try { process.kill(custom.pid); } catch { /* 이미 끝남 */ }
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  }, { timeout: 20_000 });
 
   test('조기 종료 → 확실히 안 떴다(로컬로 가도 된다)', () => {
     const { home, cwd } = fakeHome('echo boom-reason; exit 2');

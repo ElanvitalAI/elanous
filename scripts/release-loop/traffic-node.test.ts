@@ -95,6 +95,35 @@ test('a failure before npm publish restores the exact pre-cut mode', async () =>
   } finally { run.cleanup(); }
 });
 
+test('an already restored failure event is idempotent success for the graph node', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-traffic-already-restored-'));
+  const trafficFile = join(root, 'traffic.json');
+  const initial: TrafficFile = {
+    global: 'green', reason: 'operator-policy',
+    seats: Object.fromEntries(['OP', 'TC', 'MK', 'UX'].map((seat) => [seat, { perCycle: 8 }])),
+    releaseLifecycle: { runId: 'already-restored-run', version: '0.2.38-rc.1', stage: 3,
+      event: 'failed', updatedAt: '2026-10-28T04:00:00.000Z',
+      beforeCut: { global: 'green', perCycle: { OP: 8, TC: 8, MK: 8, UX: 8 } } },
+  };
+  writeFileSync(trafficFile, JSON.stringify(initial));
+  const before = readFileSync(trafficFile, 'utf8');
+  const context: GraphContext = { nodeId: 'traffic-failed-restore', runId: 'already-restored-run',
+    input: { version: '0.2.38-rc.1', previousVersion: '0.2.37' }, outputs: {} };
+  const output: string[] = [];
+  const reports: string[] = [];
+  const originalLog = console.log;
+  console.log = (line?: unknown) => output.push(String(line ?? ''));
+  try {
+    const exitCode = await runTrafficNode(context.nodeId, {
+      ELANOUS_GRAPH_CONTEXT: JSON.stringify(context), ELANOUS_STATE_DIR: root,
+    }, { options: { trafficFile }, report: (body) => reports.push(body) });
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.at(-1)!)).toMatchObject({ outcome: 'ok', verdict: 'pass', summary: 'failed already-restored' });
+    expect(reports).toHaveLength(0);
+    expect(readFileSync(trafficFile, 'utf8')).toBe(before);
+  } finally { console.log = originalLog; rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a failure after npm publish keeps full traffic and reports the follow-up failure', async () => {
   const run = await scenario('docs-land');
   try {

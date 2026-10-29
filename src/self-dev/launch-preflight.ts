@@ -695,7 +695,7 @@ export interface AskPreflightDeps {
   /** 던지면 그 축은 `unknown` 이 된다. */
   readonly listUnfinishedRuns: (path?: string) => readonly PreflightUnfinishedRun[];
   /** 실제 실행 확신 판정. 기본은 테스트 우주까지 포함한 `queryRunningRuns`이며, 실패는 경고 한 줄로만 남긴다. */
-  readonly queryRunningRuns?: (options: { includeTest: true }) => RunningRunsResult;
+  readonly queryRunningRuns?: (options: { includeTest: true; timeBudgetMs?: number }) => RunningRunsResult;
   /** 이미 완료된 런 조회. `plannedPaths`는 원장 정규화 결과라 경로 겹침 판정에 재사용한다. */
   readonly listCompletedRuns?: (limit: number, paths?: string | readonly string[]) => PreflightCompletedRunsQuery;
   /** 이미 종료된 중단 런 조회. `plannedPaths`는 원장 정규화 결과라 경로 겹침 판정에 재사용한다. */
@@ -1019,9 +1019,14 @@ export type RunningRunsConfidenceAssessment =
     readonly includesTest: true;
   };
 
-export function assessRunningRunsConfidence(query: (options: { includeTest: true }) => RunningRunsResult, nowMs: number = Date.now()): RunningRunsConfidenceAssessment {
+const LAUNCH_PREFLIGHT_RUNNING_RUNS_BUDGET_MS = 3_000;
+
+export function assessRunningRunsConfidence(query: (options: { includeTest: true; timeBudgetMs?: number }) => RunningRunsResult, nowMs: number = Date.now()): RunningRunsConfidenceAssessment {
   try {
-    const running = query({ includeTest: true });
+    const running = query({ includeTest: true, timeBudgetMs: LAUNCH_PREFLIGHT_RUNNING_RUNS_BUDGET_MS });
+    if (running.stalled) {
+      throw new Error(`조회 예산 초과(${running.stalled.stage}: ${running.stalled.reason})`);
+    }
     const confirmedCount = running.counts.running;
     const probableCount = running.counts['probable-running'];
     if (!Number.isSafeInteger(confirmedCount) || confirmedCount < 0 || !Number.isSafeInteger(probableCount) || probableCount < 0) {
@@ -1055,7 +1060,7 @@ export function assessRunningRunsConfidence(query: (options: { includeTest: true
 }
 
 /** 나이 기반 기존 집계와 별도로 실제 PTY·원장을 교차한 확신 판정을 사람이 읽는 한 줄로 만든다. */
-export function renderRunningRunsConfidenceAppendix(query: (options: { includeTest: true }) => RunningRunsResult, nowMs: number = Date.now()): string {
+export function renderRunningRunsConfidenceAppendix(query: (options: { includeTest: true; timeBudgetMs?: number }) => RunningRunsResult, nowMs: number = Date.now()): string {
   return assessRunningRunsConfidence(query, nowMs).appendix;
 }
 

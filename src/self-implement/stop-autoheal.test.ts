@@ -6,7 +6,7 @@ import { debug } from '../debug/log.js';
 import { defaultOverlaysDir, loadGraphOverlays, selectOverlays } from './graph-overlay-yaml.js';
 import { GRAPH_SPECS } from './graph-templates.js';
 import type { RunLedgerEntry } from './run-ledger.js';
-import { RUN_STOP_CLASSES, type RunStopClass, type RunStopRecord } from './run-stop.js';
+import { classifyPodExitStop, recordRunStop, RUN_STOP_CLASSES, type RunStopClass, type RunStopRecord } from './run-stop.js';
 import {
   AUTOHEAL_ACTION_BY_CLASS, AUTOHEAL_EVENT, autohealAlreadyAttempted, autohealFromStop, parseAutohealMode,
   repeatedStop,
@@ -116,6 +116,7 @@ const EXPECTED: Record<RunStopClass, AutohealAction> = {
   'evidence-uncovered': 'derive-evidence-rejudge',
   'review-repeat': 'needs-owner',
   'review-out-of-scope': 'needs-owner',
+  'review-budget-exhausted': 'needs-owner',
   'scope-escape': 'needs-owner',
   fabric: 'needs-owner',
   'launch-failed': 'needs-owner',
@@ -140,7 +141,7 @@ describe('STOP-AUTOHEAL shadow', () => {
     test(`${cls}: records the would-be action and runs nothing`, async () => {
       const led = memLedger();
       const spy = spyActions();
-      const res = await autohealFromStop({ runId: 'r1', record: record(cls) }, { mode: 'shadow', actions: spy.actions, ...led });
+      const res = await autohealFromStop({ runId: 'r1', record: record(cls) }, { mode: 'shadow', loadLadder: codeDefaultLadder, actions: spy.actions, ...led });
       expect(spy.calls).toEqual([]);
       expect(res.action).toBe(EXPECTED[cls]);
       expect(res.outcome).toBe(EXPECTED[cls] === 'needs-owner' ? 'needs-owner' : 'would-act');
@@ -164,7 +165,7 @@ describe('STOP-AUTOHEAL live', () => {
     test(`${cls}: dispatches ${EXPECTED[cls]}`, async () => {
       const led = memLedger();
       const spy = spyActions();
-      const res = await autohealFromStop({ runId: 'r1', record: record(cls) }, { mode: 'live', actions: spy.actions, ...led });
+      const res = await autohealFromStop({ runId: 'r1', record: record(cls) }, { mode: 'live', loadLadder: codeDefaultLadder, actions: spy.actions, ...led });
       if (EXPECTED[cls] === 'needs-owner') {
         expect(spy.calls).toEqual([]);
         expect(res.outcome).toBe('needs-owner');
@@ -220,6 +221,41 @@ describe('STOP-AUTOHEAL live', () => {
   });
 });
 
+describe('STOP-HEAL mock pod-failure scenario', () => {
+  test('mock-pod-failure: injected stop records the safe salvage prescription and sim outcome', async () => {
+    const runId = 'run-stop-heal-pod-failure-fixture';
+    const led = memLedger();
+    const actionSpy = spyActions();
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const record: RunStopRecord = {
+      class: classifyPodExitStop('pod-failure'),
+      site: 'pod-exit',
+      cause: 'pod-failure fixture: child container exited before a result line',
+      evidenceRef: 'mock-fixture:pod-failure/exit',
+      nextMove: 'inspect salvage evidence before any retry',
+      terminationReason: 'pod-job-failed',
+    };
+
+    try {
+      const stop = recordRunStop({ runId, ...record }, led.writeLedger);
+      const result = await autohealFromStop({ runId, record }, { mode: 'shadow', actions: actionSpy.actions, ...led });
+
+      expect(stop).toMatchObject({ runId, event: 'stop', data: { class: 'pod-died', site: 'pod-exit', terminationReason: 'pod-job-failed' } });
+      expect(result).toMatchObject({ runId, class: 'pod-died', action: 'resume-from-salvage', mode: 'shadow', outcome: 'would-act' });
+      expect(actionSpy.calls).toEqual([]);
+      expect(led.entries.map((entry) => entry.event)).toEqual(['stop', AUTOHEAL_EVENT]);
+      expect(led.entries[1]!.data).toMatchObject({
+        class: 'pod-died', action: 'resume-from-salvage', mode: 'shadow', phase: 'result', outcome: 'would-act',
+        evidenceRef: 'mock-fixture:pod-failure/exit', nextMove: 'inspect salvage evidence before any retry',
+      });
+      expect(log).toHaveBeenCalledWith('self-implement.autoheal', 'would-act', expect.objectContaining({
+        runId, class: 'pod-died', action: 'resume-from-salvage', mode: 'shadow',
+      }));
+      console.log(`[sim-receipt] runId=${runId} event=stop class=pod-died source=pod-failure; event=${AUTOHEAL_EVENT} action=resume-from-salvage mode=shadow outcome=would-act; verificationCommand=bun test src/self-implement/stop-autoheal.test.ts -t mock-pod-failure`);
+    } finally { log.mockRestore(); }
+  });
+});
+
 describe('STOP-AUTOHEAL one-attempt guard', () => {
   test('second dispatch for the same run·class·mode does nothing', async () => {
     const led = memLedger();
@@ -266,6 +302,10 @@ function ladderFromDisk(): AutohealLadder {
   };
 }
 
+function codeDefaultLadder(): AutohealLadder {
+  return { template: GRAPH_SPECS['self-implement'], overlays: [] };
+}
+
 describe('STOP-AUTOHEAL repeat-stop guard', () => {
   test('repeatedStop: same class in priorStops reaches the threshold; absent prior is false', () => {
     const prior: RunStopRecord[] = [record('env-unrelated'), record('env-unrelated'), record('main-sync')];
@@ -302,14 +342,43 @@ describe('STOP-AUTOHEAL repeat-stop guard', () => {
 });
 
 describe('STOP-AUTOHEAL ladder declaration (graphs/overlays/stop-heal-ladder.yaml)', () => {
-  test('every stop class picks the same action from the overlay as from the code table', async () => {
+  test('code defaults cover every stop class when no exit overlay is declared', async () => {
     for (const cls of RUN_STOP_CLASSES) {
-      const picked = pickAutohealAction(cls);
+      const picked = pickAutohealAction(cls, codeDefaultLadder);
       expect({ cls, action: picked.action }).toEqual({ cls, action: AUTOHEAL_ACTION_BY_CLASS[cls] });
-      expect(picked.source).toBe(AUTOHEAL_ACTION_BY_CLASS[cls] === 'needs-owner' ? 'code-default' : 'graph');
-      const res = await autohealFromStop({ runId: `r-${cls}`, record: record(cls) }, { mode: 'shadow', ...memLedger() });
+      expect(picked.source).toBe('code-default');
+      const res = await autohealFromStop({ runId: `r-${cls}`, record: record(cls) }, { mode: 'shadow', loadLadder: codeDefaultLadder, ...memLedger() });
       expect(res.action).toBe(AUTOHEAL_ACTION_BY_CLASS[cls]);
     }
+  });
+
+  test('missing reauthor node hands off with an explicit reason instead of assuming a future exit', async () => {
+    const ladder = ladderFromDisk();
+    const withoutReauthor: AutohealLadder = {
+      ...ladder,
+      overlays: ladder.overlays.filter((overlay) => overlay.overlayId !== 'stop-heal-ladder-review-budget-exhausted'),
+    };
+    const picked = pickAutohealAction('review-budget-exhausted', () => withoutReauthor);
+    expect(picked).toEqual({ action: 'needs-owner', source: 'code-default', fallbackReason: 'declared-node-unavailable: review-round-reauthor' });
+
+    const led = memLedger();
+    const res = await autohealFromStop({ runId: 'r-review-no-node', record: record('review-budget-exhausted') }, {
+      mode: 'live', loadLadder: () => withoutReauthor, ...led,
+    });
+    expect(res).toMatchObject({
+      action: 'needs-owner', source: 'code-default', outcome: 'needs-owner',
+      reason: expect.stringContaining('declared-node-unavailable: review-round-reauthor'),
+    });
+    expect(led.entries.at(-1)?.data).toMatchObject({
+      action: 'needs-owner', outcome: 'needs-owner', fallbackReason: 'declared-node-unavailable: review-round-reauthor',
+    });
+  });
+
+  test('a declared reauthor overlay selects its exit without assuming the exit implementation exists', () => {
+    const picked = pickAutohealAction('review-budget-exhausted', ladderFromDisk);
+    expect(picked).toMatchObject({
+      action: 'review-round-reauthor', source: 'graph', overlayId: 'stop-heal-ladder-review-budget-exhausted',
+    });
   });
 
   test('missing ladder overlay falls back to code-default with source recorded', async () => {
@@ -360,7 +429,7 @@ describe('STOP-AUTOHEAL ladder declaration (graphs/overlays/stop-heal-ladder.yam
     const graphId = GRAPH_SPECS['self-implement']!.graphId;
     const overlays = loadGraphOverlays(defaultOverlaysDir()).overlays;
     expect(overlays.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')).map((overlay) => overlay.stage))
-      .toEqual(['heal', 'heal', 'heal', 'heal']);
+      .toEqual(['heal', 'heal', 'heal', 'heal', 'heal']);
     for (const cls of RUN_STOP_CLASSES) {
       for (const stage of ['launch', 'runtime'] as const) {
         const { applied } = selectOverlays(overlays, { graphId, stage, state: { stop_class: cls } });

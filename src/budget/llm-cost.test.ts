@@ -181,6 +181,19 @@ describe('readLlmConfigPricing — operational config overlay', () => {
 });
 
 describe('estimateLlmCost — cache read rate', () => {
+  it('prices GPT-6.1 Terra and Sol including their explicit cached-input rates', () => {
+    for (const [model, input, output, cache] of [
+      ['gpt-6.1-terra', 1, 5, 0.05],
+      ['gpt-6.1-sol', 2, 10, 0.1],
+    ] as const) {
+      expect(findCodexModel(model)?.pricingUsd).toEqual({ inputPerM: input, outputPerM: output, cacheReadPerM: cache });
+      expect(estimateLlmCost({ model, inputTokens: MILLION, outputTokens: MILLION, cacheReadInputTokens: MILLION })).toEqual({
+        kind: 'known', model, usd: input + output + cache, source: 'catalog',
+        cacheReadPricedAt: 'cache-read', cacheWritePricedAt: 'input-rate',
+      });
+    }
+  });
+
   it('uses cacheReadPerM when the catalog reports it', () => {
     const claude = findClaudeModel('claude-sonnet-4-6')!;
     const rate = cacheReadPerMOf(claude.pricingUsd!);

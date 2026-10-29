@@ -1529,6 +1529,9 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(!cancelling && disp?.stopReason ? { stopReason: disp.stopReason } : {}),
           ...(disp?.completionDisposition ? { completionDisposition: disp.completionDisposition } : {}),
           ...(disp?.failureClassification ? { failureClassification: disp.failureClassification } : {}),
+          ...(disp?.childEvidence?.classificationBasis ? { classificationBasis: disp.childEvidence.classificationBasis } : {}),
+          ...(typeof disp?.childEvidence?.terminationReason === 'string'
+            ? { terminationReason: disp.childEvidence.terminationReason } : {}),
           ...(disp?.providerErrors ? { providerErrors: disp.providerErrors } : {}),
           ...(disp?.rework ? { rework: disp.rework } : {}),
           ...(disp?.mustFix ? { reviewMustFix: disp.mustFix } : {}),
@@ -1542,7 +1545,17 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     };
 
     // S3 — persist a resumable checkpoint after each job settles (fail-soft).
+    let checkpointRound = 0;
     const doCheckpoint = (): void => {
+      checkpointRound++;
+      const progressResults = buildResults();
+      const progress = summarizeResults(progressResults);
+      const remaining = Math.max(0, progressResults.length - progress.done - progress.failed - progress.cancelled);
+      try { debug.log('self-dev.orchestrate', 'progress', {
+        runId: runId ?? null, round: checkpointRound, total: progressResults.length,
+        done: progress.done, failed: progress.failed, cancelled: progress.cancelled,
+        landed: progress.landed, remaining,
+      }); } catch { /* progress observation must not change orchestration */ }
       if (opts.checkpoint) { try { opts.checkpoint(buildResults()); } catch { /* fail-soft */ } }
       if (opts.onSnapshot) { try { opts.onSnapshot(graph.snapshot().tasks); } catch { /* fail-soft */ } }
     };
@@ -1559,6 +1572,8 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
             stage: result.stage ?? null,
             mergeReason: result.mergeReason ?? null,
             failureClassification: result.failureClassification ?? null,
+            classificationBasis: result.classificationBasis ?? null,
+            terminationReason: result.terminationReason ?? null,
             prNumber: result.prNumber ?? null,
           });
         } catch { /* terminal observation must not change the result */ }

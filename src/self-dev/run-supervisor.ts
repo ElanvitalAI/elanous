@@ -44,6 +44,11 @@ export interface SupervisorRound {
   /** PR 없는 미분류 실패에 대해 실제 분해 실행기로 수복한 원래 골. 새 taskId에도 한 번 상한을 지킨다. */
   selfHealDecomposeFeatures?: string[];
   /**
+   * NEEDS-HUMAN-REASON-REPAIR — 사유별 자가 수복 1회의 소진 기억(사유 → 그때 수복한 골 전문).
+   * 사유가 다르면 다른 시도다. 옛 원장엔 이 칸이 없다 = 「안 쟀다」이지 「시도했다」가 아니다.
+   */
+  selfHealRepairFeatures?: Partial<Record<NeedsHumanRepairReason, string[]>>;
+  /**
    * Tasks of this round that ended `status=failed` without a PR. Omitted when there are none — and on older
    * history, which never measured it, so the no-PR streak guard reads it as «not measured» and stays off.
    */
@@ -137,7 +142,96 @@ export interface SupervisorDecision {
   };
   oscillation?: { taskIds: string[]; helper: 'review-oscillation'; signature: string; repairGoals?: Record<string, string>; heldTaskIds?: string[] };
   pendingDecision?: 'attempt-care-escalation';
-  selfHeal?: { reason: 'supervisor-unclassified-decompose'; attempt: 1; taskIds: string[] };
+  selfHeal?: { reason: SelfHealReason; attempt: 1; taskIds: string[]; repairGoals?: Record<string, string> };
+}
+
+/**
+ * NEEDS-HUMAN-REASON-REPAIR — needs-human 으로 접히기 «전»에 한 번 수복해 볼 사유.
+ * 각 사유의 수복은 다르다: 없는 경로 → 재접지 · 범위 확장 → 좁히기 · 시간 초과 → 좁은 시험 · 조각 없음 → 조각 재걸기.
+ */
+export type NeedsHumanRepairReason = 'missing-path' | 'scope-expansion' | 'step-timeout' | 'no-piece';
+
+/** 선행 0.2.38 의 분해 수복 사유까지 포함한 자가 수복 사유 전체. */
+export type SelfHealReason = 'supervisor-unclassified-decompose' | `supervisor-${NeedsHumanRepairReason}`;
+
+const NEEDS_HUMAN_REPAIR_REASONS: readonly NeedsHumanRepairReason[] = ['missing-path', 'scope-expansion', 'step-timeout', 'no-piece'];
+
+/** 파일 부재의 두 코드 — 없는 경로(ENOENT)와 중간 성분이 파일인 경로(ENOTDIR). */
+const MISSING_PATH_ERROR_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ENOTDIR']);
+
+const NEEDS_HUMAN_REPAIR_INSTRUCTION: Record<NeedsHumanRepairReason, string> = {
+  'missing-path': '없는 경로를 다시 접지한다 — 저장소에 있는 파일이나 골에 명시된 대상 경로만 고르고, 새 파일은 골이 신설을 요구할 때만 만든다',
+  'scope-expansion': '범위 확장을 좁힌다 — 대상 경로 밖으로 나간 변경을 되돌리고 골의 대상·완료 경계 안에서만 구현한다',
+  'step-timeout': '단계 예산을 넘겼다 — 좁은 시험 하나로 판정선을 먼저 세우고 나머지 실행은 그 뒤로 미룬다',
+  'no-piece': '조각 없이 실패했다 — 같은 골을 다시 걸되 완료 경계를 한 조각 분량으로 잘라 건다',
+};
+
+function normalizedRepairPath(path: string): string {
+  return path.replace(/^\.\//u, '').replace(/[),.;:]+$/u, '');
+}
+
+/** 경로가 범위 집합 안인가 — 정확 일치 · 디렉터리 접두 · (언급이 파일 이름뿐이면) 파일 이름 일치. */
+function pathWithinScope(path: string, scope: readonly string[]): boolean {
+  const p = normalizedRepairPath(path);
+  return scope.some((raw) => {
+    const s = normalizedRepairPath(raw);
+    if (s === p) return true;
+    if (s.endsWith('/') ? p.startsWith(s) : p.startsWith(`${s}/`)) return true;
+    return !p.includes('/') && s.split('/').at(-1) === p;
+  });
+}
+
+/**
+ * 범위 확장 — «밖»이라고 잰 변경 전부.
+ * ⛔ 대상 경로를 모르면 `changedFiles` 로는 «밖»을 단정하지 않는다(둘 다 쟀을 때만).
+ *    다만 실행 범위 가드가 «대상 밖»으로 직접 잰 값(`outsideTargetFiles`)은 그 자체가 측정이다.
+ */
+function expandedBeyondTargetPaths(result: SupervisorJobResult): string[] {
+  const measured = result.outsideTargetFiles ?? [];
+  const changed = result.changedFiles;
+  const targets = result.targetPaths;
+  const byScope = changed !== undefined && targets !== undefined && targets.length > 0
+    ? changed.filter((file) => !pathWithinScope(file, targets))
+    : [];
+  return [...new Set([...measured, ...byScope])];
+}
+
+/**
+ * needs-human 앞의 수복 사유 discriminator — 결과에 이미 실리는 판정 재료만 본다:
+ * 단계(`timed-out`) · 오류 코드(ENOENT/ENOTDIR) · 변경 파일 vs 골 대상 경로 · 분해 제안 조각 수.
+ * PR 이 있는 결과(사람이 볼 PR)와 재시도 재료가 있는 결과는 여기 대상이 아니다(undefined).
+ */
+export function needsHumanRepairReason(result: SupervisorJobResult): NeedsHumanRepairReason | undefined {
+  if (result.status !== 'failed' || result.prNumber !== undefined || result.prUrl) return undefined;
+  if (result.stage === 'timed-out') return 'step-timeout';
+  if (result.error?.code !== undefined && MISSING_PATH_ERROR_CODES.has(result.error.code)) return 'missing-path';
+  if (expandedBeyondTargetPaths(result).length > 0) return 'scope-expansion';
+  if ((result.decomposeProposal?.pieces.length ?? 0) < 2) return 'no-piece';
+  return undefined;
+}
+
+/** 사유별 수복 골 원문 — 사유의 수복 지시 + 골의 대상 경로 + 관측된 원인 + 원래 골. */
+export function needsHumanRepairGoal(result: SupervisorJobResult, reason: NeedsHumanRepairReason): string {
+  const outside = expandedBeyondTargetPaths(result);
+  const repairTargets = result.targetPaths?.length ? result.targetPaths : undefined;
+  return [
+    `[supervisor-needs-human-repair:${reason}] ${NEEDS_HUMAN_REPAIR_INSTRUCTION[reason]}`,
+    ...(repairTargets?.length ? [`대상 경로: ${repairTargets.join(', ')}`] : []),
+    ...(outside.length ? [`대상 경로 밖 변경: ${outside.join(', ')}`] : []),
+    ...(result.error?.message ? [`이전 실패: ${result.error.message.slice(0, 200)}`] : []),
+    result.feature,
+  ].join('\n');
+}
+
+/** 수복 사유가 붙은 자가 수복인가 — 선행 분해 수복('supervisor-unclassified-decompose')과 갈라낸다. */
+function needsHumanRepairDecisionReason(reason: SelfHealReason): NeedsHumanRepairReason | undefined {
+  return NEEDS_HUMAN_REPAIR_REASONS.find((candidate) => reason === `supervisor-${candidate}`);
+}
+
+/** 사유별 소진 기억에 이 조각이 이미 있는가 — 새 taskId 여도 골 전문으로 짝을 맞춘다. */
+function needsHumanRepairSpent(history: readonly SupervisorRound[], reason: NeedsHumanRepairReason, feature: string): boolean {
+  const key = resumeKey(feature);
+  return history.some((entry) => (entry.selfHealRepairFeatures?.[reason] ?? []).some((spent) => resumeKey(spent) === key));
 }
 
 export interface SupervisorLimits {
@@ -245,6 +339,11 @@ export type SupervisorJobResult = SelfDevJobResult & {
   reviewReason?: string;
   salvage?: 'launched' | 'parked';
   next?: SupervisorNext;
+  /**
+   * NEEDS-HUMAN-REASON-REPAIR — 실행 범위 가드가 «대상 경로 밖»으로 직접 잰 변경.
+   * 골이 대상 경로를 안 선언했어도 이 값은 측정이다 — `changedFiles` 와 달리 «밖»을 단정할 수 있다.
+   */
+  outsideTargetFiles?: readonly string[];
 };
 
 export function aggregateReviewTrend(results: readonly SelfDevJobResult[]): ReviewRework['trend'] | undefined {
@@ -360,6 +459,8 @@ export function decideNextRun(input: {
   reviewMustFixTrend?: ReviewRework['trend'];
   /** True: the rerun consumes the authored goal. False: it cannot, so oscillation stops for a human. Undefined: pure decision. */
   repairGoalExecution?: boolean;
+  /** Separate opt-in for needs-human reason repairs; omitted keeps the new repair execution disabled. */
+  needsHumanReasonRepairExecution?: boolean;
   /** 분해 제안을 실제 조각 실행으로 승격할 수 있는 supervisor 경로에만 true. */
   decompositionExecution?: boolean;
 }): SupervisorDecision {
@@ -550,7 +651,52 @@ export function decideNextRun(input: {
         why: `supervisor-unclassified-decompose (attempt: 1/1) — PR 없는 미분류 조각 ${taskIds.length}개를 실증된 분해 제안으로 한 번 재걸기`,
       };
     }
+    // NEEDS-HUMAN-REASON-REPAIR — 사람에게 접기 «전»에 사유별로 한 번 수복한다. 수복 골은 rerun 이 그대로 실행한다.
+    //   ⛔ 실행기가 선언되지 않았으면(repairGoalExecution !== true) 수복 대신 지금처럼 사람에게 간다.
+    if (input.repairGoalExecution === true && input.needsHumanReasonRepairExecution === true && round + 1 <= maxRounds) {
+      const repairable = activeResults.flatMap((result) => {
+        if (!t.needsHuman.includes(result.taskId)) return [];
+        if (!t.classifications.some((classification) => classification.taskId === result.taskId && classification.kind === 'unclassified')) return [];
+        const reason = needsHumanRepairReason(result);
+        if (reason === undefined || (result.targetPaths?.length ?? 0) === 0) return [];
+        return needsHumanRepairSpent(history, reason, result.feature) ? [] : [{ result, reason }];
+      });
+      const first = repairable[0];
+      const single = first !== undefined && repairable.length === 1 && t.needsHuman.every((id) => id === first.result.taskId)
+        ? first : undefined;
+      if (single) {
+        const taskIds = [single.result.taskId];
+        return {
+          ...base,
+          action: 'relaunch',
+          needsHuman: t.needsHuman.filter((id) => !taskIds.includes(id)),
+          selfHeal: {
+            reason: `supervisor-${single.reason}`,
+            attempt: 1,
+            taskIds,
+            repairGoals: { [single.result.taskId]: needsHumanRepairGoal(single.result, single.reason) },
+          },
+          why: `supervisor-${single.reason} (attempt: 1/1) — ${NEEDS_HUMAN_REPAIR_INSTRUCTION[single.reason]}`,
+        };
+      }
+    }
     if (t.needsHuman.length > 0) {
+      // 이미 한 번 수복했는데 같은 사유로 다시 섰다 — 사유·시도를 원문으로 남기고 사람에게 넘긴다.
+      const exhausted = activeResults.flatMap((result) => {
+        if (!t.needsHuman.includes(result.taskId)) return [];
+        const reason = needsHumanRepairReason(result);
+        if (reason === undefined || !needsHumanRepairSpent(history, reason, result.feature)) return [];
+        return [{ result, reason }];
+      });
+      if (exhausted.length > 0) {
+        return {
+          ...base,
+          action: 'stop',
+          stopReason: 'needs-human',
+          why: withGoalPlanRevisionObservation(`${exhausted.map(({ result, reason }) =>
+            `supervisor-${reason} (attempt: 1/1) — ${NEEDS_HUMAN_REPAIR_INSTRUCTION[reason]} 을 한 번 시도했으나 같은 조각이 다시 실패했다(${result.taskId})`).join(' · ')} · 사람이 볼 것 ${t.needsHuman.length}`),
+        };
+      }
       return {
         ...base,
         action: 'stop',
@@ -802,6 +948,9 @@ export function appendRound(
     if (result.durationMs === undefined) { unknownTimeTaskIds.add(result.taskId); continue; }
     lostTimeMsByTask[result.taskId] = (lostTimeMsByTask[result.taskId] ?? 0) + result.durationMs;
   }
+  const selfHealRepairReason = decision?.action !== 'stop' && decision?.selfHeal
+    ? needsHumanRepairDecisionReason(decision.selfHeal.reason)
+    : undefined;
   return [...history, {
     round: history.length,
     landed: countLanded(results),
@@ -825,6 +974,15 @@ export function appendRound(
         const feature = results.find((result) => result.taskId === id)?.feature;
         return feature === undefined ? [] : [feature];
       }),
+    } : {}),
+    // NEEDS-HUMAN-REASON-REPAIR — 사유별 수복 1회 소진을 회차 원장에 남긴다(사유가 다르면 다른 시도).
+    ...(selfHealRepairReason !== undefined && decision?.selfHeal ? {
+      selfHealRepairFeatures: {
+        [selfHealRepairReason]: decision.selfHeal.taskIds.flatMap((id) => {
+          const feature = results.find((result) => result.taskId === id)?.feature;
+          return feature === undefined ? [] : [feature];
+        }),
+      },
     } : {}),
     ...(decision?.action === 'add-repair-task' && decision.oscillation ? (() => {
       // Each repaired task is recorded under its original goal feature and, when a rerun runs the authored goal as
@@ -1048,6 +1206,7 @@ export interface SuperviseRunOptions {
   sweepPendingMerges?: typeof sweepFrozenMerges;
   /** True only when rerun consumes `invocation.repairGoals`; omitted or false → a review oscillation stops for a human. */
   repairGoalExecution?: boolean;
+  needsHumanReasonRepairExecution?: boolean;
   /**
    * TASK-AGENT-SHADOW — 멈춤이 확정되면 판단부를 그림자로 부른다(기본 `recordTaskAgentShadowMove`).
    * `false` 면 끈다. 던져도 런의 결말은 바뀌지 않는다(fail-soft).
@@ -1097,6 +1256,7 @@ export async function rejudgeTerminalTaskCard(runId: string | null, deps: {
 export async function superviseRun(opts: SuperviseRunOptions): Promise<SupervisorJobResult[]> {
   let results = [...opts.initial];
   let history: SupervisorRound[] = [];
+  const maxRounds = opts.limits?.maxRounds ?? DEFAULT_MAX_ROUNDS;
 
   for (;;) {
     try {
@@ -1144,6 +1304,7 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
       decompositionExecution: opts.promoteDecomposition !== undefined,
       // Undeclared = cannot run the repair goal: an add-repair-task would otherwise be a same-strategy relaunch.
       repairGoalExecution: opts.repairGoalExecution === true,
+      ...(opts.needsHumanReasonRepairExecution === undefined ? {} : { needsHumanReasonRepairExecution: opts.needsHumanReasonRepairExecution }),
       ...(aggregateReviewTrend(results) ? { reviewMustFixTrend: aggregateReviewTrend(results) } : {}),
       ...(opts.limits ? { limits: opts.limits } : {}),
       ...(observed.deployFindings ? { deployFindings: observed.deployFindings } : {}),
@@ -1153,6 +1314,21 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
         ...(allUnreviewedAreNoDiff ? { reviewReason: 'no-diff' } : {}),
       } : {}),
     });
+
+    const reasonRepairSkipped = decision.action !== 'stop' || decision.stopReason !== 'needs-human' || history.length + 1 > maxRounds
+      ? [] : results.flatMap((result) => {
+      if (!decision.needsHuman.includes(result.taskId) || needsHumanRepairReason(result) === undefined) return [];
+      if (!decision.classifications.some((classification) => classification.taskId === result.taskId && classification.kind === 'unclassified')) return [];
+      const repairReason = needsHumanRepairReason(result)!;
+      if (needsHumanRepairSpent(history, repairReason, result.feature)) return [];
+      const reason = opts.repairGoalExecution !== true || opts.needsHumanReasonRepairExecution !== true
+        ? 'disabled' : 'no-target-paths';
+      if (reason === 'no-target-paths' && (result.targetPaths?.length ?? 0) > 0) return [];
+      return [{ taskId: result.taskId, reason }];
+    });
+    for (const skipped of reasonRepairSkipped) {
+      try { opts.observe?.('supervisor.reason-repair-skipped', skipped); } catch { /* fail-soft */ }
+    }
 
     // The supervisor consumes knowhow when it judges a failed piece. Keep the child prompt untouched.
     const failedPiece = results.find((result) => result.status === 'failed' && result.feature.trim());
@@ -1188,7 +1364,13 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
         decomposePromotion = { attempted: true, reason: `shim-failed: ${String(error)}` };
       }
     }
-    if (decision.selfHeal) {
+    if (decision.selfHeal && needsHumanRepairDecisionReason(decision.selfHeal.reason) !== undefined) {
+      // NEEDS-HUMAN-REASON-REPAIR — 수복 시도는 rerun 이 사유별 수복 골로 실행한다(아래 repairGoals).
+      //   여기서는 «한 번 시도했다»를 관측하고 relaunch 를 유지한다 — 실패는 다음 라운드 판정이 사유·시도 원문으로 접는다.
+      try { opts.observe?.('supervisor-self-heal', { runId, reason: decision.selfHeal.reason,
+        attempt: decision.selfHeal.attempt, taskIds: decision.selfHeal.taskIds,
+        outcome: 'relaunching', repairGoalTasks: Object.keys(decision.selfHeal.repairGoals ?? {}) }); } catch { /* fail-open */ }
+    } else if (decision.selfHeal) {
       const promoted = decomposePromotion.attempted && (decomposePromotion.pieceCount ?? 0) >= 2;
       try { opts.observe?.('supervisor-self-heal', { runId, reason: decision.selfHeal.reason,
         attempt: decision.selfHeal.attempt, taskIds: decision.selfHeal.taskIds,
@@ -1309,7 +1491,7 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
     // but their results stay in the round so the human hand-off (and the final review-oscillating stop) keeps them.
     const held = decision.oscillation?.heldTaskIds ?? [];
     const heldResults = results.filter((result) => held.includes(result.taskId));
-    const repairGoals = { ...decision.relaunchGoals, ...decision.oscillation?.repairGoals };
+    const repairGoals = { ...decision.relaunchGoals, ...decision.selfHeal?.repairGoals, ...decision.oscillation?.repairGoals };
     const rerunResults = await opts.rerun(held.length ? results.filter((result) => !held.includes(result.taskId)) : results,
       { relaunch: true, ...(Object.keys(repairGoals).length > 0 ? { repairGoals } : {}) });
     results = [...rerunResults, ...heldResults.filter((heldResult) => !rerunResults.some((result) => result.taskId === heldResult.taskId))];

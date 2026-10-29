@@ -3673,6 +3673,113 @@ describe('dev CLI help tiers', () => {
 });
 
 describe('self gate explicit remote CLI wiring', () => {
+  test('SEAT-GATE-TRAIN-ONLY refuses seat calls without the train marker and leaves human/train calls alone', async () => {
+    const remote = await import('./self-implement/gate-remote.js');
+    const dispatch = spyOn(remote, 'dispatchHeavyCheck').mockResolvedValue(0);
+    const artifactDir = await mkdtemp(join(tmpdir(), 'seat-train-gate-marker-'));
+    const actualTrack = process.env.ELANOUS_TRACK;
+    const actualTrainGate = process.env.ELANOUS_TRAIN_GATE;
+    const actualExitCode = process.exitCode;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const invoke = async () => {
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'self', 'gate', '--changed', '--base', 'HEAD', '--artifact-dir', artifactDir]);
+      return process.exitCode;
+    };
+    try {
+      process.env.ELANOUS_TRACK = 'TC';
+      delete process.env.ELANOUS_TRAIN_GATE;
+      expect(await invoke()).toBe(2);
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith('self-gate', 'seat-refused', { track: 'TC', requiredMarker: 'ELANOUS_TRAIN_GATE=1' });
+      expect(log).toHaveBeenCalledWith('self-gate', 'train-gate-marker', { track: 'TC', received: false });
+      expect(JSON.parse(readFileSync(join(artifactDir, 'summary.json'), 'utf8'))).toMatchObject({
+        trainGate: false, verdict: 'seat-refused', exitCode: 2,
+      });
+
+      process.env.ELANOUS_TRAIN_GATE = '1';
+      expect(await invoke()).toBe(0);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(log).toHaveBeenCalledWith('self-gate', 'train-gate-marker', { track: 'TC', received: true });
+      expect(JSON.parse(readFileSync(join(artifactDir, 'summary.json'), 'utf8'))).toMatchObject({ trainGate: true });
+
+      delete process.env.ELANOUS_TRACK;
+      delete process.env.ELANOUS_TRAIN_GATE;
+      expect(await invoke()).toBe(0);
+      expect(dispatch).toHaveBeenCalledTimes(2);
+      expect(log).toHaveBeenCalledWith('self-gate', 'train-gate-marker', { track: null, received: false });
+      expect(JSON.parse(readFileSync(join(artifactDir, 'summary.json'), 'utf8'))).toMatchObject({ trainGate: false });
+    } finally {
+      if (actualTrack === undefined) delete process.env.ELANOUS_TRACK;
+      else process.env.ELANOUS_TRACK = actualTrack;
+      if (actualTrainGate === undefined) delete process.env.ELANOUS_TRAIN_GATE;
+      else process.env.ELANOUS_TRAIN_GATE = actualTrainGate;
+      log.mockRestore();
+      dispatch.mockRestore();
+      process.exitCode = actualExitCode ?? 0;
+      await rm(artifactDir, { recursive: true, force: true });
+    }
+  });
+
+  test('remote self-gate artifacts preserve the entry marker on fetch success and failure', async () => {
+    const remote = await import('./self-implement/gate-remote.js');
+    const artifactDir = await mkdtemp(join(tmpdir(), 'seat-train-remote-marker-'));
+    const actualTrack = process.env.ELANOUS_TRACK;
+    const actualTrainGate = process.env.ELANOUS_TRAIN_GATE;
+    const actualExitCode = process.exitCode;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    let fetchFails = false;
+    let flipMarkerAfterRemoteOutcome = true;
+    const summary = {
+      head40: 'a'.repeat(40), base40: 'b'.repeat(40), envKey: 'test', shards: 0,
+      cohort: [], shardsDetail: [], verdict: 'passed', exitCode: 0,
+      introduced: null, preexisting: null, unknown: null, preconditionUnmet: null, unrunImporters: null,
+    };
+    const encoded = Buffer.from(JSON.stringify(summary)).toString('base64');
+    const runner: import('./self-implement/gate-remote.js').GateRemoteRunner = {
+      local: () => ({ rc: 0, stdout: '', stderr: '' }),
+      ssh: () => fetchFails
+        ? { rc: 255, stdout: '', stderr: 'ssh unreachable' }
+        : { rc: 0, stdout: `summary.json\n${encoded}\n__GATE_ARTIFACTS_END__\n`, stderr: '' },
+    };
+    const dispatch = spyOn(remote, 'dispatchHeavyCheck').mockImplementation(async (opts) => {
+      opts.onRemoteOutcome?.({ kind: 'ran', rc: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), commit: 'a'.repeat(40), host: 'node-b', ms: 1 }, 'node-b', runner);
+      if (flipMarkerAfterRemoteOutcome) {
+        if (process.env.ELANOUS_TRAIN_GATE === '1') delete process.env.ELANOUS_TRAIN_GATE;
+        else process.env.ELANOUS_TRAIN_GATE = '1';
+      }
+      return 0;
+    });
+    const invoke = async () => {
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b', '--artifact-dir', artifactDir]);
+      return process.exitCode;
+    };
+    try {
+      delete process.env.ELANOUS_TRACK;
+      process.env.ELANOUS_TRAIN_GATE = '1';
+      fetchFails = false;
+      expect(await invoke()).toBe(0);
+      expect(JSON.parse(readFileSync(join(artifactDir, 'summary.json'), 'utf8'))).toMatchObject({ trainGate: true, remoteHost: 'node-b' });
+      expect(log).toHaveBeenCalledWith('self-gate', 'train-gate-marker', { track: null, received: true });
+
+      delete process.env.ELANOUS_TRAIN_GATE;
+      fetchFails = true;
+      expect(await invoke()).toBe(0);
+      expect(JSON.parse(readFileSync(join(artifactDir, 'summary.json'), 'utf8'))).toMatchObject({ trainGate: false, artifactsUnavailable: 'remote-fetch-failed' });
+      expect(log).toHaveBeenCalledWith('self-gate', 'train-gate-marker', { track: null, received: false });
+    } finally {
+      if (actualTrack === undefined) delete process.env.ELANOUS_TRACK;
+      else process.env.ELANOUS_TRACK = actualTrack;
+      if (actualTrainGate === undefined) delete process.env.ELANOUS_TRAIN_GATE;
+      else process.env.ELANOUS_TRAIN_GATE = actualTrainGate;
+      process.exitCode = actualExitCode ?? 0;
+      dispatch.mockRestore();
+      log.mockRestore();
+      await rm(artifactDir, { recursive: true, force: true });
+    }
+  });
+
   test('remote self-gate failures never invoke the local gate; automatic fallback remains visible for other tools; remote rc and host survive', async () => {
     const remote = await import('./self-implement/gate-remote.js');
     const reservationRoot = mkdtempSync(join(tmpdir(), 'index-gate-reservation-'));

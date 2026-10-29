@@ -351,19 +351,38 @@ describe('조각 2 — 자식 완료 ∧ 자리 TUI ∧ 유휴 → H2 문으로 
     globalTaskNotificationQueue.clear();
   }, 120_000); // 콜드 기동(임시 git·preamble 조립)에서 bun 기본 5s 를 넘긴다 — K-OP-035.
 
-  test('턴 중(busy) → 그 순간 0 · «대기»(NotIdle) → 턴 끝나 입력칸이 다시 뜨면 아직 안 실린 결과로 1회', () => {
-    const h = seatHarness();
+  test('턴 중(busy) → 그 순간 0 · «대기»(NotIdle) → 턴 끝 재개와 완료 XML 보존', () => {
+    globalTaskNotificationQueue.clear();
+    const h = seatHarness({ queue: globalTaskNotificationQueue });
+    const runId = `tui-wake-not-seat-drop-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const notification = pending(`${runId}-task`, {
+      output: 'outcome=completed\nrc=0\nstdoutTail=WAKE-STDOUT\nstderrTail=WAKE-STDERR',
+    });
     h.mount();
     h.state.running = true;
-    h.queue.enqueue(pending('t1'));
+    h.queue.enqueue(notification);
     expect(h.opened()).toHaveLength(0);
-    expect(h.wakeRows('deferred')[0]!.data).toMatchObject({ reason: 'NotIdle', detail: 'turn-running' });
+    expect(h.wakeRows('deferred')[0]!.data).toMatchObject({ taskId: notification.taskId, seat: 'OPC', reason: 'NotIdle', detail: 'turn-running' });
     h.state.running = false;
     h.mount(); h.flush();
     expect(h.opened()).toHaveLength(1);
-    expect(h.wakeRows('opened')[0]!.data).toMatchObject({ trigger: 'input-mounted' });
+    expect(h.wakeRows('opened')[0]!.data).toMatchObject({ taskId: notification.taskId, seat: 'OPC', trigger: 'input-mounted' });
+    const request = h.gate.takePending();
+    expect(request?.origin).toBe('child-complete');
+    const fakeConfig = { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig>;
+    const cwd = mkdtempSync(join(tmpdir(), 'agent-wake-deferred-preamble-'));
+    let turn: ReturnType<typeof buildDashboardTurnPreamble>;
+    try { turn = buildDashboardTurnPreamble({ userText: request!.input, cwd, userConfig: fakeConfig }); }
+    finally { rmSync(cwd, { recursive: true, force: true }); }
+    const carried = turn.find((m) => m.role === 'user' && String(m.content).includes(notification.taskId));
+    const xml = String(carried?.content ?? '');
+    expect(xml).toContain('<task-notification kind="status-receipt" request="none">');
+    expect(xml).toContain(`id="${notification.taskId}"`);
+    expect(xml).toContain('status="done"');
+    expect(xml).toContain('outcome=completed\nrc=0\nstdoutTail=WAKE-STDOUT\nstderrTail=WAKE-STDERR');
+    console.log(`TUI_WAKE_SIM ${JSON.stringify({ runId, events: h.logs.filter((row) => row.category === 'tui.agent-wake').map(({ event, data }) => ({ event, data })), llmRequestUserXml: xml })}`);
     // 재시도는 한 번 — 다시 떠도 더 열지 않는다.
-    h.gate.takePending(); h.mount(); h.flush();
+    h.mount(); h.flush();
     expect(h.opened()).toHaveLength(1);
   });
 
@@ -417,6 +436,34 @@ describe('조각 2 — 자식 완료 ∧ 자리 TUI ∧ 유휴 → H2 문으로 
     unknown.queue.enqueue(pending('t2'));
     expect(unknown.opened()).toHaveLength(0);
     expect(unknown.wakeRows('rejected')[0]!.data).toMatchObject({ reason: 'seat-unknown', detail: 'EACCES' });
+  });
+
+  test('seat=null 거부는 완료를 보존하고 다음 일반 사용자 턴의 XML에 전달한다', () => {
+    globalTaskNotificationQueue.clear();
+    const human = seatHarness({ seat: null, queue: globalTaskNotificationQueue });
+    const cwd = mkdtempSync(join(tmpdir(), 'agent-wake-seat-null-'));
+    try {
+      human.mount();
+      globalTaskNotificationQueue.enqueue(pending('shell:seat-null:1', {
+        agentName: 'RunShell', state: 'error',
+        output: 'taskId=shell:seat-null:1 outcome=error exitCode=7 stdoutTail=OUT stderrTail=ERR',
+      }));
+      expect(human.opened()).toHaveLength(0);
+      expect(human.wakeRows('rejected')[0]!.data).toMatchObject({ reason: 'not-seat' });
+      expect(globalTaskNotificationQueue.has('shell:seat-null:1')).toBe(true);
+
+      const turn = buildDashboardTurnPreamble({ userText: 'continue', cwd,
+        userConfig: { chat: { conciseness: 'balanced' } } as unknown as ReturnType<typeof getUserConfig> });
+      const delivered = turn.find(message => message.role === 'user'
+        && String(message.content).includes('<task-notification'));
+      expect(String(delivered?.content)).toContain('id="shell:seat-null:1"');
+      expect(String(delivered?.content)).toContain('outcome=error exitCode=7');
+      expect(String(delivered?.content)).toContain('stdoutTail=OUT stderrTail=ERR');
+      expect(globalTaskNotificationQueue.size).toBe(0);
+    } finally {
+      globalTaskNotificationQueue.clear();
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test('반증 대조 — openTurn 을 안 넘기면(조각 1 배선) 자리 TUI ∧ 유휴여도 턴 0', () => {

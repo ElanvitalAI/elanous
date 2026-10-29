@@ -1,12 +1,18 @@
 import type { Database } from 'bun:sqlite';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
+import { withFileLockSync } from '../storage/file-lock.js';
 import { calendarFields, resolveTimeZone } from '../time/format.js';
 import { cronMatches } from './cron-match.js';
 import { listScheduleRuns } from './schedule-runs.js';
 import { listSchedules, openSchedulesDb, type ScheduleRow } from './schedule-registry.js';
 import type { SpawnOutcome } from './schedule-runner.js';
+import { classifyTcellHealthCards, type TcellHealthCard, type TcellHealthClassification } from '../harness/harness-incidents.js';
 
 export interface GuardianPlan {
   jobs: readonly (Pick<ScheduleRow, 'id' | 'cron' | 'enabled' | 'source' | 'run_via'> & Partial<Pick<ScheduleRow, 'command'>>)[];
@@ -21,7 +27,145 @@ export interface GuardianDeps {
   grokExpiry?: () => string | null;
   /** Injected in tests; production reevaluates recorded doctor visits without dispatching a prescription. */
   doctorShadow?: () => void | Promise<void>;
+  /** Read-only health-card source. T-cell classification remains shadow-only and never dispatches an action. */
+  readTcellHealthCards?: (now: Date) => readonly TcellHealthCard[] | Promise<readonly TcellHealthCard[]>;
+  /** Test-only path override; production uses the resolved state root. */
+  tcellDedupeStatePath?: string;
   hostName?: string;
+}
+
+type TcellPatrolSummary = Pick<TcellHealthClassification, 'total' | 'measured' | 'counts'> & { unmeasured: number };
+
+type TcellShadowMailTarget = 'doctor' | 'macrophage';
+interface TcellShadowMailProposal {
+  causeGroupId: string;
+  target: TcellShadowMailTarget;
+  reason: 'no-progress-30m' | 'risk-signal' | 'cause-quorum';
+  runIds: string[];
+  runIdsTruncated: boolean;
+  causeGroupSize: number;
+}
+
+const TCELL_SHADOW_DEDUPE_WINDOW_MS = 60 * 60_000;
+interface TcellShadowDedupeState {
+  version: 1;
+  lastProposedAt: Record<string, number>;
+}
+interface TcellShadowMailSuppression {
+  proposal: TcellShadowMailProposal;
+  lastProposedAt?: number;
+  eligibleAt?: number;
+  suppressionReason: 'hourly-dedupe' | 'dedupe-state-unavailable';
+}
+
+function tcellShadowDedupePath(): string {
+  return join(elanousStateRoot(), 'guardian', 'tcell-dedupe.json');
+}
+
+function loadTcellShadowDedupeState(path: string): TcellShadowDedupeState {
+  let raw: string;
+  try { raw = readFileSync(path, 'utf8'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1, lastProposedAt: {} };
+    throw error;
+  }
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid T-cell dedupe state');
+  const record = parsed as Record<string, unknown>;
+  if (record.version !== 1 || !record.lastProposedAt || typeof record.lastProposedAt !== 'object' || Array.isArray(record.lastProposedAt)) {
+    throw new Error('invalid T-cell dedupe state shape');
+  }
+  const lastProposedAt: Record<string, number> = Object.create(null) as Record<string, number>;
+  for (const [causeGroupId, at] of Object.entries(record.lastProposedAt)) {
+    if (!causeGroupId || !Number.isSafeInteger(at) || (at as number) < 0) throw new Error('invalid T-cell dedupe timestamp');
+    lastProposedAt[causeGroupId] = at as number;
+  }
+  return { version: 1, lastProposedAt };
+}
+
+/** Reserve the per-cause hourly shadow proposal before logging it, so concurrent guardian ticks share the limit. */
+function reserveTcellShadowMail(proposals: readonly TcellShadowMailProposal[], nowMs: number, statePath?: string): {
+  proposed: TcellShadowMailProposal[];
+  suppressed: TcellShadowMailSuppression[];
+  stateError?: unknown;
+} {
+  if (proposals.length === 0) return { proposed: [], suppressed: [] };
+  const path = statePath ?? tcellShadowDedupePath();
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    return withFileLockSync(`${path}.lock`, () => {
+      const state = loadTcellShadowDedupeState(path);
+      const lastProposedAt = Object.assign(Object.create(null) as Record<string, number>, state.lastProposedAt);
+      let changed = false;
+      for (const [causeGroupId, at] of Object.entries(lastProposedAt)) {
+        if (nowMs - at >= TCELL_SHADOW_DEDUPE_WINDOW_MS) {
+          delete lastProposedAt[causeGroupId];
+          changed = true;
+        }
+      }
+
+      const proposed: TcellShadowMailProposal[] = [];
+      const suppressed: TcellShadowMailSuppression[] = [];
+      for (const proposal of proposals) {
+        const last = lastProposedAt[proposal.causeGroupId];
+        if (last !== undefined && nowMs - last < TCELL_SHADOW_DEDUPE_WINDOW_MS) {
+          suppressed.push({ proposal, lastProposedAt: last, eligibleAt: last + TCELL_SHADOW_DEDUPE_WINDOW_MS,
+            suppressionReason: 'hourly-dedupe' });
+          continue;
+        }
+        lastProposedAt[proposal.causeGroupId] = nowMs;
+        changed = true;
+        proposed.push(proposal);
+      }
+
+      if (changed) {
+        const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+        try {
+          writeFileSync(tmp, `${JSON.stringify({ version: 1, lastProposedAt }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+          renameSync(tmp, path);
+        } finally {
+          try { unlinkSync(tmp); } catch { /* rename succeeded or temp was never created */ }
+        }
+      }
+      return { proposed, suppressed };
+    });
+  } catch (stateError) {
+    return { proposed: [], suppressed: proposals.map(proposal => ({ proposal, suppressionReason: 'dedupe-state-unavailable' })), stateError };
+  }
+}
+
+function proposeTcellShadowMail(classification: TcellHealthClassification): {
+  proposals: TcellShadowMailProposal[]; proposalsTruncated: number; missingCause: number;
+} {
+  const byCause = new Map<string, typeof classification.decisions>();
+  let missingCause = 0;
+  for (const decision of classification.decisions) {
+    if (decision.classification !== 'stalled' && decision.classification !== 'infected') continue;
+    if (!decision.causeGroupId || !decision.causeGroupSize) { missingCause++; continue; }
+    const group = byCause.get(decision.causeGroupId) ?? [];
+    group.push(decision);
+    byCause.set(decision.causeGroupId, group);
+  }
+
+  const proposals: TcellShadowMailProposal[] = [];
+  for (const [causeGroupId, decisions] of byCause) {
+    const infected = decisions.filter(decision => decision.classification === 'infected');
+    const selected = infected.length ? infected : decisions;
+    const first = selected[0]!;
+    const reason = infected.length
+      ? (infected.some(decision => decision.reason === 'cause-quorum') ? 'cause-quorum' : 'risk-signal')
+      : 'no-progress-30m';
+    const runIds = [...new Set(selected.map(decision => decision.runId))];
+    proposals.push({
+      causeGroupId,
+      target: infected.length ? 'macrophage' : 'doctor',
+      reason,
+      runIds: runIds.slice(0, 25),
+      runIdsTruncated: runIds.length > 25,
+      causeGroupSize: first.causeGroupSize!,
+    });
+  }
+  return { proposals: proposals.slice(0, 100), proposalsTruncated: Math.max(0, proposals.length - 100), missingCause };
 }
 
 export const GROK_EXPIRY_ALERT_WINDOW_MS = 4 * 60 * 60 * 1000;
@@ -85,7 +229,7 @@ function liveCommand(jobId: string, raw: string): string {
 }
 
 /** One five-minute guardian observation. No schedule state or crontab is mutated in shadow mode. */
-export async function guardianTick(now: Date, plan: GuardianPlan, deps: GuardianDeps = {}): Promise<{ mode: 'shadow' | 'live'; wouldRun: string[]; executed: number; credentialAlert?: string }> {
+export async function guardianTick(now: Date, plan: GuardianPlan, deps: GuardianDeps = {}): Promise<{ mode: 'shadow' | 'live'; wouldRun: string[]; executed: number; credentialAlert?: string; tcellPatrol?: TcellPatrolSummary }> {
   if (!Number.isFinite(now.getTime())) throw new RangeError('invalid tick time');
   const mode = deps.config?.guardian?.mode === 'live' ? 'live' : 'shadow';
   let expiryLine: string | null = null;
@@ -109,6 +253,51 @@ export async function guardianTick(now: Date, plan: GuardianPlan, deps: Guardian
       errorName: error instanceof Error ? error.name : 'unknown',
     });
   }
+  let tcellPatrol: TcellPatrolSummary | undefined;
+  if (deps.readTcellHealthCards) {
+    try {
+      const cards = await deps.readTcellHealthCards(now);
+      const classification = classifyTcellHealthCards(cards, now.getTime());
+      const shadowMail = proposeTcellShadowMail(classification);
+      const reservedMail = reserveTcellShadowMail(shadowMail.proposals, now.getTime(), deps.tcellDedupeStatePath);
+      tcellPatrol = { total: classification.total, measured: classification.measured,
+        unmeasured: classification.unmeasuredRunIds.length, counts: classification.counts };
+      // One bounded shadow observation per guardian tick. Cause signatures are represented only by a digest.
+      debug.log('guardian.tcell', 'shadow-classification', {
+        mode: 'shadow', ...tcellPatrol,
+        shadowMailProposed: reservedMail.proposed.length,
+        shadowMailSuppressed: reservedMail.suppressed.length,
+        shadowMailProposalsTruncated: shadowMail.proposalsTruncated,
+        shadowMailMissingCause: shadowMail.missingCause,
+        decisions: classification.decisions.slice(0, 100).map(({ runId, stage, classification: verdict, reason, causeGroupId, causeGroupSize }) => ({
+          runId, stage, classification: verdict, reason, ...(causeGroupId ? { causeGroupId, causeGroupSize } : {}),
+        })),
+        decisionsTruncated: classification.decisions.length > 100,
+      });
+      if (reservedMail.stateError) {
+        debug.log('guardian.tcell', 'shadow-mail-dedupe-unavailable', {
+          mode: 'shadow', errorName: reservedMail.stateError instanceof Error ? reservedMail.stateError.name : 'unknown',
+          suppressed: reservedMail.suppressed.length,
+        });
+      }
+      for (const suppressed of reservedMail.suppressed) {
+        debug.log('guardian.tcell', 'shadow-mail-suppressed', {
+          mode: 'shadow', ...suppressed.proposal, suppressionReason: suppressed.suppressionReason,
+          ...(suppressed.lastProposedAt !== undefined ? { lastProposedAt: suppressed.lastProposedAt } : {}),
+          ...(suppressed.eligibleAt !== undefined ? { eligibleAt: suppressed.eligibleAt } : {}),
+        });
+      }
+      for (const proposal of reservedMail.proposed) {
+        debug.log('guardian.tcell', 'shadow-mail-proposed', {
+          mode: 'shadow', recipientCandidate: 'OP', ownerRule: 'first-recipient-ack', ...proposal,
+        });
+      }
+    } catch (error) {
+      debug.log('guardian.tcell', 'observation-failed', {
+        mode: 'shadow', errorName: error instanceof Error ? error.name : 'unknown',
+      });
+    }
+  }
   const timeZone = plan.timeZone ?? resolveTimeZone().timeZone;
   const wouldRun: string[] = [];
   let executed = 0;
@@ -125,7 +314,7 @@ export async function guardianTick(now: Date, plan: GuardianPlan, deps: Guardian
       if (outcome.code !== 0) throw new Error(`guardian job ${job.id} exited ${outcome.code}`);
     }
   }
-  return { mode, wouldRun, executed, ...(expiryLine ? { credentialAlert: expiryLine } : {}) };
+  return { mode, wouldRun, executed, ...(expiryLine ? { credentialAlert: expiryLine } : {}), ...(tcellPatrol ? { tcellPatrol } : {}) };
 }
 
 export interface GuardianDayDeps {

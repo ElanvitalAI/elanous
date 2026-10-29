@@ -123,6 +123,8 @@ export interface PodChildEvidence {
   /** Bounded, redacted diagnostics copied only from a failed child terminal result. */
   error?: string;
   detail?: string;
+  /** Tail of the child detail, retained separately so long reports keep their final diagnostic lines. */
+  detailTail?: string;
   stderr?: string;
   /** Bounded, redacted complete Pod log tail. Separate from child stderr to avoid replacing stronger child facts. */
   podLogTail?: string[];
@@ -130,6 +132,8 @@ export interface PodChildEvidence {
   podLogUnavailable?: string;
   exitCode?: number;
   classification?: string;
+  /** Why the child assigned its failure classification; independent from the label itself. */
+  classificationBasis?: string;
   scopeEscape?: true;
   outOfScopeEdits?: unknown;
   /** SCOPE-ESCAPE-AS-REFINE — why held out-of-scope edits stop the run (deletion · protected path · cap). Present only with scopeEscape. */
@@ -154,6 +158,14 @@ export interface PodChildEvidence {
   harvestable?: true;
   prNumber?: number;
   goalPlanRevision?: SelfDevJobResult['goalPlanRevision'];
+}
+
+function utf8Tail(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, 'utf8');
+  let start = Math.max(0, bytes.length - maxBytes);
+  // Move past continuation bytes so decoding starts at a complete UTF-8 code point.
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+  return bytes.subarray(start).toString('utf8');
 }
 
 const SCOPE_STOP_REASON_ORDER: readonly ScopeStopReason[] = SCOPE_STOP_REASONS;
@@ -218,12 +230,18 @@ export function podChildEvidenceFromResult(o: Record<string, unknown>): PodChild
   const classification = scopeEscape ? 'scope-escape'
     : typeof abandoned?.classification === 'string' ? redactSecretText(abandoned.classification)
       : typeof o.failureClassification === 'string' ? redactSecretText(o.failureClassification) : undefined;
+  const rawClassificationBasis = abandoned?.classificationBasis ?? o.classificationBasis;
+  const classificationBasis = typeof rawClassificationBasis === 'string' && rawClassificationBasis.trim()
+    ? redactSecretText(rawClassificationBasis).slice(0, 200) : undefined;
   const evidence: PodChildEvidence = {
     ...(failedText(o.error) ? { error: failedText(o.error) } : {}),
     ...(failedText(o.detail) ? { detail: failedText(o.detail) } : {}),
+    ...(o.ok === false && typeof o.detail === 'string' && o.detail.trim()
+      ? { detailTail: utf8Tail(redactSecretText(o.detail), 4_096) } : {}),
     ...(failedText(o.stderr) ? { stderr: failedText(o.stderr) } : {}),
     ...(failureExitCode !== undefined ? { exitCode: failureExitCode } : {}),
     ...(classification ? { classification } : {}),
+    ...(classificationBasis ? { classificationBasis } : {}),
     ...(scopeEscape ? { scopeEscape: true, scopeStopReasons } : {}),
     ...(outOfScopeEdits !== undefined ? { outOfScopeEdits } : {}),
     ...(newScope ? { newScope } : {}),

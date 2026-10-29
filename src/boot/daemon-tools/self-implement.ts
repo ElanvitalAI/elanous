@@ -13,9 +13,9 @@
 //   - onProgress ← ux.progress (각 스테이지 진행을 서피스로).
 //   - 큰 gate log → ux.spillFile (파일 첨부).
 
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import type { LLMToolSpec } from '../../llm.js';
 import { childLifetimeSignal } from '../../turn-abort-scope.js';
 import { buildSelfImplementSpec } from '../../self-implement/self-implement-runtime.js';
@@ -48,7 +48,13 @@ export function resolveDispatchEntry(ctx: DaemonToolDispatchCtx): import('../../
 
 /** 데몬 서피스용 스펙 — 내부 툴과 단일 출처(buildSelfImplementSpec) 공유. */
 export function buildSelfImplementDaemonSpec(): LLMToolSpec {
-  return buildSelfImplementSpec();
+  const spec = buildSelfImplementSpec();
+  const properties = spec.parameters.properties as Record<string, Record<string, unknown>>;
+  properties.goalFile = {
+    type: 'string',
+    description: '기존 SelfImplement 골 문서를 재개할 때만 지정한다. 문서에 결정을 반영한 뒤 같은 골을 다시 실행하며, 저장소 내부 GOAL-* 문서 경로만 허용된다.',
+  };
+  return spec;
 }
 
 // ⭐ 판정은 `../../self-implement/observe-only.js` **한 자리**가 한다 — 이 스위치를 타는 경로가
@@ -90,7 +96,7 @@ const END_STAGES: readonly SelfImplementProgressStage[] = ['pr-opened', 'aborted
 export type SelfImplementLaunchedToolResult = SelfImplementResult & { runId: string; kind: 'launched'; message: string; next: string; missing: string[] };
 export type SelfImplementPendingToolResult = Partial<SelfImplementResult> & { kind: 'pending'; message: string; next: string; missing: string[] };
 export type SelfImplementObservedOnlyToolResult = { kind: 'observed-only'; observed: true; message: string; next: string; missing: ['runId', 'node'] };
-export type SelfImplementFailedToolResult = Partial<SelfImplementResult> & { kind: 'failed'; reason: string; message: string; next: string; missing: string[] };
+export type SelfImplementFailedToolResult = Partial<SelfImplementResult> & { kind: 'failed'; reason: string; message: string; next: string; missing: string[]; goalFile?: string };
 export type SelfImplementToolResult = SelfImplementLaunchedToolResult | SelfImplementPendingToolResult | SelfImplementObservedOnlyToolResult | SelfImplementFailedToolResult;
 
 /** 하니스가 런을 맡았다 — 파일 편집은 하니스 몫이므로 모델의 직접 Write/Edit 을 문면으로 막는다. */
@@ -220,6 +226,7 @@ const GOAL_ORIGINAL_TEXT_LIMIT = null;
 
 type GoalAuthorSummary = {
   authored: boolean;
+  reused: boolean;
   goalFile: string | null;
   userTextState: 'absent' | 'empty' | 'present';
   originalChars: number | null;
@@ -231,8 +238,21 @@ type GoalAuthorSummary = {
 function emitGoalAuthorSummary(ux: SurfaceUx, summary: GoalAuthorSummary): void {
   const message = summary.authored
     ? `goal-author authored ${basename(summary.goalFile!)} (${summary.userTextState}; ${summary.storedChars} chars; truncated=${summary.truncated})`
-    : `goal-author not authored (${summary.userTextState}; no goal source)`;
+    : summary.reused
+      ? `goal-author resumed ${basename(summary.goalFile!)} (${summary.userTextState})`
+      : `goal-author not authored (${summary.userTextState}; no goal source)`;
   ux.progress(message, { phase: 'delta' });
+}
+
+function resolveResumableGoalFile(requestedPath: string, cwd: string): string {
+  const root = realpathSync(cwd);
+  const candidate = realpathSync(isAbsolute(requestedPath) ? requestedPath : resolve(root, requestedPath));
+  const relativePath = relative(root, candidate);
+  if (!relativePath || relativePath === '..' || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)
+    || !/^GOAL-[^/\\]+\.(?:md|txt)$/i.test(basename(candidate))) {
+    throw new Error('goalFile must point to an existing GOAL-*.md or GOAL-*.txt document inside the repository');
+  }
+  return candidate;
 }
 
 /** Observability only; tool selection remains model-led. */
@@ -293,7 +313,18 @@ export async function dispatchSelfImplement(
   }
 
   let goalFile: string | undefined;
-  if (goalSourceText !== undefined) {
+  let resumedGoal = false;
+  if (args.goalFile !== undefined) {
+    if (typeof args.goalFile !== 'string' || !args.goalFile.trim()) {
+      return buildFailedToolResult('goalFile must be a non-empty path to an existing authored goal document');
+    }
+    try {
+      goalFile = resolveResumableGoalFile(args.goalFile, ctx.cwd);
+      resumedGoal = true;
+    } catch (error) {
+      return buildFailedToolResult(error instanceof Error ? error.message : String(error));
+    }
+  } else if (goalSourceText !== undefined) {
     const recentStepCounts = readRecentStepCountsFailOpen(recentStepCountReader);
     goalFile = (await authorGoal(goalSourceText, ctx.cwd, {
       goalTitle: feature,
@@ -334,7 +365,7 @@ export async function dispatchSelfImplement(
     if (clarification.decisionRequired.length > 0) {
       const ledger = decisionLedgerFactory?.() ?? new DecisionLedger();
       const decisions = clarification.decisionRequired.map((item) => {
-        const ref = `self-implement-clarification:${args.runId ?? goalFile}:${item.questionId}`;
+        const ref = `self-implement-clarification:${goalFile}:${item.questionId}`;
         return ledger.raiseOnce({
           title: `SelfImplement 확인 필요: ${item.header}`.slice(0, 120),
           category: item.category,
@@ -360,7 +391,12 @@ export async function dispatchSelfImplement(
         unanswered: clarification.decisionRequired.length,
         reason: 'safety-critical-clarification-requires-recorded-decision',
       });
-      return buildFailedToolResult(`goal author clarification requires a recorded decision before launch; record the answer in the goal document and rerun SelfImplement (${decisions.map((decision) => decision.id).join(', ')})`);
+      const reason = `goal author clarification requires a recorded decision before launch (${decisions.map((decision) => decision.id).join(', ')})`;
+      const next = `Edit ${goalFile} with the explicit answer, then rerun SelfImplement using the same feature and goalFile=${goalFile}; the decision card alone does not launch or resume work`;
+      return {
+        kind: 'failed', reason, goalFile, next, missing: ['runId', 'node'],
+        message: `SelfImplement did not launch: ${reason}. Record the answer in ${goalFile}, then rerun the same feature with goalFile=${goalFile}. A decision-card choice alone does not resume the run.`,
+      };
     }
     if (clarification.unanswered > 0) {
       debug.log('daemon-tools.self-implement', 'goal-clarification-assumption-incomplete', {
@@ -372,7 +408,8 @@ export async function dispatchSelfImplement(
     }
   }
   const goalAuthorSummary: GoalAuthorSummary = {
-    authored: goalFile !== undefined,
+    authored: goalFile !== undefined && !resumedGoal,
+    reused: resumedGoal,
     goalFile: goalFile ?? null,
     userTextState: originalUserText === undefined ? 'absent' : originalUserText === '' ? 'empty' : 'present',
     originalChars,

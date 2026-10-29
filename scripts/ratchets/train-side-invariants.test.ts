@@ -8,7 +8,6 @@ import { rmSync } from 'node:fs';
 const script = resolve(import.meta.dir, 'train-side-invariants.sh');
 const expected = [
   'scripts/ratchets/test-interference-patterns.test.ts',
-  'scripts/ratchets/next-tui-entry-budget.test.ts',
   'src/domains/finance-cli.test.ts',
   'src/instance/state-dir-provenance-ratchet.test.ts',
   'src/self-implement/graph-yaml.test.ts',

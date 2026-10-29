@@ -129,6 +129,7 @@ export class MsgStore {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_msg_messages_recipient_id ON msg_messages(recipient, id);
+    CREATE INDEX IF NOT EXISTS idx_msg_messages_created_at_id ON msg_messages(created_at, id);
     CREATE TABLE IF NOT EXISTS msg_cursors (
       recipient TEXT PRIMARY KEY,
       last_id INTEGER NOT NULL DEFAULT 0 CHECK(last_id >= 0)
@@ -305,6 +306,16 @@ export class MsgStore {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
     return this.readWithSchema(hasReplyTo => (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
       WHERE id > ? ORDER BY id ASC LIMIT ?`).all(after, limit) as MessageRow[]).map(fromRow));
+  }
+
+  /** Read a half-open UTC timestamp window for periodic message-mirror summaries. */
+  listCreatedBetween(start: string, end: string): Message[] {
+    const startMs = Date.parse(start);
+    const endMs = Date.parse(end);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) throw new Error('invalid message time window');
+    return this.readWithSchema(hasReplyTo => (this.db.query(`SELECT id, sender, recipient, body, kind,
+      ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+      WHERE created_at >= ? AND created_at < ? ORDER BY id ASC`).all(new Date(startMs).toISOString(), new Date(endMs).toISOString()) as MessageRow[]).map(fromRow));
   }
 
   latestId(): number {

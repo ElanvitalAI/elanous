@@ -49,12 +49,12 @@ export function setAutoProviderDecisionForTest(fn: (() => LLMProviderName | unde
 /** config/tier 해석이 «실패»했을 때만 타는 최후 폴백. 티어 사다리가 안 읽히는
  *  상황(부팅 초기·손상된 config)에서도 지점이 «성능 등급에 맞는» 모델을 얻게 한다. */
 const LEGACY_TIER_FALLBACK: Readonly<Record<ModelTier, string>> = {
-  // 🩸 2026-09-23 — 이 폴백이 GPT-6 이관 뒤에도 gpt-5.6-* 였다(결정 지적 · GPT-6 에는 terra 가 없다).
+  // Keep the fallback aligned with the GPT-6.1 Codex ladder if config/tier lookup fails.
   //   사다리가 안 읽힐 때만 쓰이므로 codex 사다리의 «현재 값»과 같게 둔다(시험이 사다리와 대조한다).
   budget: 'gpt-6-luna',
-  balanced: 'gpt-6-sol',
-  better: 'gpt-6-sol',
-  best: 'gpt-6-sol',
+  balanced: 'gpt-6.1-terra',
+  better: 'gpt-6.1-terra',
+  best: 'gpt-6.1-sol',
   loaded: 'gpt-6-astra',
 };
 

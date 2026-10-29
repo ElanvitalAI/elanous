@@ -6,6 +6,42 @@ import { mockSeatPtySequence } from '../ux-sim/mock-seat-pty-sequence.js';
 
 const BIN = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
 
+test('next TUI /help shows Commands and Keys in the terminal screen', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'next-tui-help-keys-'));
+  try {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({
+      onboarding: { completed: true },
+      errorReports: { enabled: false },
+      llm: { goalLoop: { enabled: false }, memoryJudge: { enabled: false, crossRecall: false } },
+    }));
+    const run = await mockSeatPtySequence({
+      executable: process.execPath,
+      args: [BIN, '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
+      root,
+      rows: 24,
+      cols: 100,
+      env: { ELANOUS_SESSION_ROOT: join(root, 'sessions') },
+      ready: { label: 'next-tui-ready', timeoutMs: 30_000, until: (screen) => screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료') },
+      steps: [{
+        label: 'help-keys-visible',
+        text: '/help',
+        timeoutMs: 30_000,
+        until: (screen) => screen.includes('Commands') && screen.includes('Keys') && screen.includes('PgUp/PgDn'),
+      }],
+      quitKeys: '\x11',
+    });
+
+    const helpScreen = run.frames.at(-1)?.screen ?? '';
+    expect(helpScreen).toContain('Commands');
+    expect(helpScreen).toContain('Keys');
+    expect(helpScreen).toContain('PgUp/PgDn');
+    expect(helpScreen).toContain('Ctrl+\\');
+    expect(run.exitCode).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 45_000);
+
 test('next TUI shows idle retry status and the retried answer in its PTY screen', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-tui-stream-idle-'));
   try {

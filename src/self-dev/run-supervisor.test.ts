@@ -7,7 +7,7 @@ import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-
 import { rejudgeCardOnHead } from '../task-agent/rejudge-on-head.js';
 import * as rejudgeOnHead from '../task-agent/rejudge-on-head.js';
 import { saveSelfDevRun, loadSelfDevRun, selfDevRunsDir } from './run-store.js';
-import { decideNextRun, superviseRun, rejudgeTerminalTaskCard, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, SUPERVISOR_STOP_REASONS, mineFailurePatterns, bindPatternMineKey, patternMineLivesFromRounds, patternMineSignaturesFromDecision, type SupervisorRound, type SupervisorStopReason } from './run-supervisor.js';
+import { decideNextRun, superviseRun, rejudgeTerminalTaskCard, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, needsHumanRepairReason, needsHumanRepairGoal, SUPERVISOR_STOP_REASONS, mineFailurePatterns, bindPatternMineKey, patternMineLivesFromRounds, patternMineSignaturesFromDecision, type SupervisorRound, type SupervisorStopReason, type SupervisorJobResult } from './run-supervisor.js';
 
 const merged = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'merged', merged: true }) as never;
 const worktreeCompleted = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'worktree-completed' }) as never;
@@ -32,14 +32,14 @@ const repairable = (id: string) => ({
 const mystery = (id: string) => ({
   taskId: id, feature: id, status: 'failed', stage: 'error',
   error: { code: 'BOOM', message: 'TypeError: undefined is not a function' },
-}) as never;
+}) as unknown as SupervisorJobResult;
 const mysteryWithProposal = (id: string) => ({ ...mystery(id),
   decomposeProposal: { pieces: [{ id: 'piece-a', feature: 'bounded piece a', dependsOn: [] }, { id: 'piece-b', feature: 'bounded piece b', dependsOn: [] }] },
-}) as never;
+}) as unknown as SupervisorJobResult;
 const falseFailure = (id: string) => ({
   taskId: id, feature: id, status: 'failed', stage: 'merged', merged: true,
   error: { code: 'PARENT_SIGNAL_LOST', message: 'parent lost child completion signal' },
-}) as never;
+}) as unknown as SupervisorJobResult;
 
 describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
   test('NEEDS-HUMAN-SELF-HEAL-FIRST: PR 없는 unclassified+실증 조각은 실행기가 있을 때만 한 번 분해한다', () => {
@@ -65,7 +65,7 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
       { ...result, providerErrors: { category: 'request', provider: 'openrouter', count: 1 } },
       { ...result, blockReason: 'parent-unlanded' },
       { ...result, blockReason: 'dependency-needs-human' },
-    ]) {
+    ] as unknown as SupervisorJobResult[]) {
       expect(decideNextRun({ results: [unsafe], decompositionExecution: true })).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
     }
   });
@@ -124,6 +124,137 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     expect(events.filter((e) => e.event === 'decision').map((e) => [e.data.action, e.data.stopReason]))
       .toEqual([['relaunch', null], ['stop', 'needs-human']]);
   });
+  test('NEEDS-HUMAN-REASON-REPAIR: 네 사유가 각각 한 번의 수복 시도로 이어지고 실패하면 사유·시도 원문과 함께 needs-human', async () => {
+    const fixtures = [
+      {
+        reason: 'missing-path',
+        piece: { taskId: 'missing-path-piece', feature: 'missing path piece', status: 'failed', stage: 'error',
+          targetPaths: ['src/gone.ts'],
+          error: { code: 'ENOENT', message: "ENOENT: no such file or directory, open 'src/gone.ts'" } },
+        goalText: '없는 경로를 다시 접지한다',
+      },
+      {
+        reason: 'scope-expansion',
+        piece: { taskId: 'scope-expansion-piece', feature: 'scope expansion piece', status: 'failed', stage: 'error',
+          error: { code: 'SCOPE_OUTSIDE', message: 'changed files outside the goal target paths' },
+          changedFiles: ['src/other/expanded.ts'], targetPaths: ['src/self-dev/run-supervisor.ts'] },
+        goalText: '범위 확장을 좁힌다',
+      },
+      {
+        reason: 'step-timeout',
+        piece: { taskId: 'step-timeout-piece', feature: 'step timeout piece', status: 'failed', stage: 'timed-out',
+          targetPaths: ['src/self-dev/run-supervisor.ts'],
+          error: { code: 'ETIMEDOUT', message: 'review step exceeded its budget' } },
+        goalText: '좁은 시험',
+      },
+      {
+        reason: 'no-piece',
+        piece: { taskId: 'no-piece-piece', feature: 'no piece piece', status: 'failed', stage: 'error',
+          targetPaths: ['src/self-dev/run-supervisor.ts'],
+          error: { code: 'BOOM', message: 'TypeError: undefined is not a function' } },
+        goalText: '조각 없이 실패했다',
+      },
+    ] as const;
+    for (const { reason, piece, goalText } of fixtures) {
+      const runId = `run-sim-needs-human-reason-repair-20261028-${reason}`;
+      const operatorDir = mkdtempSync(join(tmpdir(), 'needs-human-reason-repair-sim-'));
+      const decisions: Array<{ action: string; stopReason?: string; why: string; selfHeal?: { reason: string; attempt: number } }> = [];
+      const selfHeals: Array<Record<string, unknown>> = [];
+      const repairGoalsSeen: Array<Record<string, string> | undefined> = [];
+      let reruns = 0;
+      try {
+        await superviseRun({
+          initial: [piece as never],
+          repairGoalExecution: true,
+          needsHumanReasonRepairExecution: true,
+          runStore: { runId, operatorDir },
+          // 수복 라운드도 같은 실패로 돌아온다 — 한 번 시도하고 멈추는지가 판정선이다.
+          rerun: async (_previous, invocation) => { reruns++; repairGoalsSeen.push(invocation.repairGoals); return [piece as never]; },
+          onDecision: (decision) => decisions.push(decision),
+          observe: (event, data) => { if (event === 'supervisor-self-heal') selfHeals.push(data); },
+          sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+          taskAgentShadow: false, taskAgentRejudge: false,
+        });
+        expect(reruns).toBe(1);
+        expect(decisions[0]).toMatchObject({ action: 'relaunch', selfHeal: { reason: `supervisor-${reason}`, attempt: 1 } });
+        expect(repairGoalsSeen[0]?.[piece.taskId]).toContain(goalText);
+        expect(selfHeals).toHaveLength(1);
+        expect(selfHeals[0]).toMatchObject({ runId, reason: `supervisor-${reason}`, attempt: 1,
+          taskIds: [piece.taskId], outcome: 'relaunching', repairGoalTasks: [piece.taskId] });
+        expect(decisions.filter((decision) => decision.action === 'stop')).toHaveLength(1);
+        expect(decisions.at(-1)).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+        expect(decisions.at(-1)!.why).toContain(`supervisor-${reason} (attempt: 1/1)`);
+        expect(decisions.at(-1)!.why).toContain(goalText);
+      } finally {
+        rmSync(operatorDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('NEEDS-HUMAN-REASON-REPAIR: 실행 범위 가드가 잰 대상 밖 변경(outsideTargetFiles)도 범위 확장 사유가 된다', () => {
+    const piece = { taskId: 'scope-guard-piece', feature: 'scope guard piece', status: 'failed', stage: 'error',
+      error: { code: 'BOOM', message: 'held: edits outside the declared target paths' },
+      targetPaths: ['src/self-dev/run-supervisor.ts'],
+      outsideTargetFiles: ['src/other/expanded.ts'] } as unknown as SupervisorJobResult;
+    expect(needsHumanRepairReason(piece)).toBe('scope-expansion');
+    expect(needsHumanRepairGoal(piece, 'scope-expansion')).toContain('대상 경로 밖 변경: src/other/expanded.ts');
+    expect(decideNextRun({ results: [piece], repairGoalExecution: true, needsHumanReasonRepairExecution: true }))
+      .toMatchObject({ action: 'relaunch', selfHeal: { reason: 'supervisor-scope-expansion', attempt: 1 } });
+    expect(decideNextRun({ results: [piece], repairGoalExecution: true, needsHumanReasonRepairExecution: false }))
+      .toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    expect(decideNextRun({ results: [piece], repairGoalExecution: false, needsHumanReasonRepairExecution: true }))
+      .toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    expect(decideNextRun({ results: [{ ...piece, targetPaths: [] }], repairGoalExecution: true, needsHumanReasonRepairExecution: true }))
+      .toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    // 대상 경로를 «모르는» changedFiles 만으로는 밖을 단정하지 않는다(지금 동작 그대로).
+    expect(needsHumanRepairReason({ ...piece, outsideTargetFiles: undefined, targetPaths: undefined,
+      changedFiles: ['src/other/expanded.ts'] } as unknown as SupervisorJobResult)).toBe('no-piece');
+  });
+
+  test('reason-repair 후보 경로만 있고 targetPaths가 없으면 수복하지 않는다', () => {
+    const piece = { taskId: 'a', feature: 'a', status: 'failed', stage: 'error',
+      changedFiles: ['src/a.ts'], reasonRepairTargetPaths: ['src/a.ts'] } as unknown as SupervisorJobResult;
+    expect(needsHumanRepairReason(piece)).toBe('no-piece');
+    const missingDeclaredTarget = decideNextRun({ results: [piece],
+      repairGoalExecution: true, needsHumanReasonRepairExecution: true });
+    expect(missingDeclaredTarget).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+    const emptyDeclaredTarget = decideNextRun({ results: [{ ...piece, targetPaths: [] }],
+      repairGoalExecution: true, needsHumanReasonRepairExecution: true });
+    expect(emptyDeclaredTarget).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+  });
+
+  test('다중 needs-human 작업은 targetPaths 있는 조각만으로도 relaunch하지 않는다', () => {
+    const withTarget = { taskId: 'targeted', feature: 'targeted', status: 'failed', stage: 'error',
+      targetPaths: ['src/targeted.ts'], error: { code: 'BOOM', message: 'failure' } } as unknown as SupervisorJobResult;
+    const withoutTarget = { ...withTarget, taskId: 'untargeted', feature: 'untargeted', targetPaths: undefined };
+    expect(decideNextRun({ results: [withTarget, withoutTarget], repairGoalExecution: true,
+      needsHumanReasonRepairExecution: true })).toMatchObject({ action: 'stop', stopReason: 'needs-human' });
+  });
+
+  test('NEEDS-HUMAN-REASON-REPAIR: disabled·zero-path skip 사건만 내고 rerun은 호출하지 않는다', async () => {
+    const candidate = { taskId: 'reason-skip', feature: 'reason skip', status: 'failed' as const, stage: 'error' as const,
+      error: { code: 'BOOM', message: 'unclassified failure' } } as unknown as SupervisorJobResult;
+    const runCase = async (needsHumanReasonRepairExecution: boolean, result: SupervisorJobResult | SupervisorJobResult[] = candidate) => {
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      let reruns = 0;
+      await superviseRun({ initial: Array.isArray(result) ? result : [result], repairGoalExecution: true, needsHumanReasonRepairExecution,
+        rerun: async (previous) => { reruns++; return previous; }, taskAgentShadow: false,
+        sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+        observe: (event, data) => { if (event === 'supervisor.reason-repair-skipped') events.push({ event, data }); },
+      });
+      return { events, reruns };
+    };
+    expect(await runCase(false)).toMatchObject({ reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'disabled' } }] });
+    expect(await runCase(false, [candidate, { ...candidate, taskId: 'reason-skip-2' }])).toMatchObject({
+      reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'disabled' } }, { data: { taskId: 'reason-skip-2', reason: 'disabled' } }],
+    });
+    expect(await runCase(true, { ...candidate, targetPaths: [] })).toMatchObject({
+      reruns: 0, events: [{ data: { taskId: 'reason-skip', reason: 'no-target-paths' } }],
+    });
+    expect(await runCase(false, { ...candidate, prNumber: 12 })).toMatchObject({ reruns: 0, events: [] });
+    expect(await runCase(false, { ...candidate, blockReason: 'dependency-needs-human' })).toMatchObject({ reruns: 0, events: [] });
+  });
+
   test('default terminal helper resolves exactly its launched TA land card and calls real rejudge entry', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ta-terminal-default-'));
     const statePath = join(dir, 'task-agent-actions.json');
@@ -1489,7 +1620,7 @@ describe('merge conflict relaunch', () => {
     taskId: id, feature, status: 'failed', stage: 'merge-conflict', branch: 'self-impl/big', harvestable: true,
     mergeReason: 'main-sync-conflict-unresolved',
     goalPlanRevision: { status: 'read', attempted: 0, applied: 0, failureReasons: [] },
-  }) as never;
+  }) as unknown as SupervisorJobResult;
   const quiet = { taskAgentShadow: false as const, sweepPendingMerges: async () => ({ pending: 0, merged: 0 }) };
 
   test('stage merge-conflict 첫 번은 relaunch-on-main · 슈퍼바이저 action relaunch', () => {

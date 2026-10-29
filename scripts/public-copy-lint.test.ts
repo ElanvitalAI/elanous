@@ -9,6 +9,75 @@ const stateDir = mkdtempSync(join(tmpdir(), 'public-copy-lint-'));
 afterAll(() => rmSync(stateDir, { recursive: true, force: true }));
 
 describe('public copy warning-only shadow lint', () => {
+  test('warns on unmeasured or unstated one-click claims only in README and docs/marketing', () => {
+    const unsafe = scanPublicCopy([
+      { label: 'README.md', text: 'One click starts the entire workflow.' },
+      { label: 'docs/marketing/one-click.md', text: '원 클릭으로 모두 처리합니다.' },
+      { label: 'docs/usage/howto.md', text: 'One click starts the entire workflow.' },
+    ], () => []);
+    expect(unsafe.findings.map(({ source, rule }) => `${source}:${rule}`)).toEqual([
+      'docs/marketing/one-click.md:ONE-CLICK-APPROVAL-STATUS', 'docs/marketing/one-click.md:ONE-CLICK-MEASURED-SCOPE',
+      'README.md:ONE-CLICK-APPROVAL-STATUS', 'README.md:ONE-CLICK-MEASURED-SCOPE',
+    ]);
+
+    const adversarial = scanPublicCopy([
+      { label: 'README.md', text: 'One click completes the entire workflow; scope is not measured. A separate release is approved for publication.' },
+      { label: 'docs/marketing/one-click.md', text: '원 클릭으로 모두 처리합니다. 측정 범위 없음. 별도 문서는 게시 승인됨.' },
+    ], () => []);
+    expect(adversarial.findings.map(({ source, rule }) => `${source}:${rule}`)).toEqual([
+      'docs/marketing/one-click.md:ONE-CLICK-APPROVAL-STATUS', 'docs/marketing/one-click.md:ONE-CLICK-MEASURED-SCOPE',
+      'README.md:ONE-CLICK-APPROVAL-STATUS', 'README.md:ONE-CLICK-MEASURED-SCOPE',
+    ]);
+
+    const explicitHold = scanPublicCopy([
+      { label: 'README.md', text: 'One click: publication scope is unmeasured and not approved for publication.' },
+    ], () => []);
+    expect(explicitHold.findings).toEqual([
+      { source: 'README.md', line: 1, rule: 'ONE-CLICK-MEASURED-SCOPE' },
+    ]);
+
+    const outOfScopeCopy = scanPublicCopy([{ label: 'docs/usage/howto.md', text: 'One click starts the entire workflow. 곧 출시' }], () => []);
+    expect(outOfScopeCopy.findings.filter(({ rule }) => rule.startsWith('ONE-CLICK-'))).toEqual([]);
+    expect(outOfScopeCopy.findings).toContainEqual({ source: 'docs/usage/howto.md', line: 1, rule: 'BRAND-SOON' });
+    expect(scanPublicCopy([{ label: 'README.md', text: '`elanous login openai-codex`' }], () => []).findings).toEqual([]);
+
+    const multipleClaims = scanPublicCopy([{
+      label: 'README.md',
+      text: 'One click: measured scope limited to 1 job, approved for publication. One click completes every workflow.',
+    }], () => []);
+    expect(multipleClaims.findings).toContainEqual({ source: 'README.md', line: 1, rule: 'ONE-CLICK-MEASURED-SCOPE' });
+    expect(multipleClaims.findings).toContainEqual({ source: 'README.md', line: 1, rule: 'ONE-CLICK-APPROVAL-STATUS' });
+
+    const unrelatedMeasurement = scanPublicCopy([{
+      label: 'README.md',
+      text: 'One click completes every workflow, measured scope limited to 1 demo, approved for publication.',
+    }], () => []);
+    expect(unrelatedMeasurement.findings).toContainEqual({ source: 'README.md', line: 1, rule: 'ONE-CLICK-MEASURED-SCOPE' });
+
+    const mismatchedMeasuredUnit = scanPublicCopy([{
+      label: 'README.md',
+      text: 'One click completes 1 workflow, measured scope limited to 1 demo, approved for publication.',
+    }], () => []);
+    expect(mismatchedMeasuredUnit.findings).toContainEqual({ source: 'README.md', line: 1, rule: 'ONE-CLICK-MEASURED-SCOPE' });
+
+    const validClaim = scanPublicCopy([{
+      label: 'README.md',
+      text: 'One click completes 1 job, measured scope limited to 1 job, approved for publication.',
+    }], () => []);
+    expect(validClaim.findings.filter(({ rule }) => rule.startsWith('ONE-CLICK-'))).toEqual([]);
+
+    const loginAndCompetitor = scanPublicCopy([{
+      label: 'README.md', text: '`elanous login openai-codex`; OpenClaw is faster than Elanous',
+    }], () => []);
+    expect(loginAndCompetitor.findings).toContainEqual({ source: 'README.md', line: 1, rule: 'BRAND-UNSUPPORTED-COMPARISON' });
+    expect(scanPublicCopy([{
+      label: 'README.md', text: '`elanous login openai-codex`',
+    }], () => []).findings.filter(({ rule }) => rule === 'BRAND-UNSUPPORTED-COMPARISON')).toEqual([]);
+    expect(scanPublicCopy([{
+      label: 'README.md', text: 'OpenClaw is faster than Elanous; source: example; measured on the same workload.',
+    }], () => []).findings.filter(({ rule }) => rule === 'BRAND-UNSUPPORTED-COMPARISON')).toEqual([]);
+  });
+
   test('flags existing timing, competitor, and unsourced-number rules without echoing matched text', () => {
     const doc: PublicCopyInput = {
       label: 'docs/marketing/BLOG-shadow-test.md',
@@ -16,7 +85,7 @@ describe('public copy warning-only shadow lint', () => {
     };
     const findings = lintPublicCopy([doc], () => []);
     expect(findings.map(({ line, rule }) => `${line}:${rule}`)).toEqual([
-      '1:BRAND-SOON', '2:BRAND-COMPETITOR-NAME', '3:B4-NUMBER-SOURCE',
+      '1:BRAND-SOON', '2:BRAND-UNSUPPORTED-COMPARISON', '3:B4-NUMBER-SOURCE',
     ]);
     expect(JSON.stringify(findings)).not.toContain('OpenClaw');
   });
@@ -50,6 +119,56 @@ describe('public copy warning-only shadow lint', () => {
     expect(result.findings).toContainEqual({ source: 'docs/marketing/BLOG-public.md', line: 1, rule: 'B8' });
   });
 
+  test('limits competitor scans to visible prose and returns per-document company and placeholder counts', () => {
+    const result = scanPublicCopy([
+      { label: 'docs/marketing/BLOG-public.md', text: [
+        '---', 'evidence: ChatGPT', '---',
+        'Claude Code is in this sentence; another coding agent is a placeholder.',
+        '`--backend codex`',
+        'See [source](https://openai.com/ChatGPT).',
+        '<!-- Grok -->',
+        '```sh', 'elanous login openai-codex', '```',
+      ].join('\n') },
+    ], () => []);
+    expect(result.findings.filter(({ rule }) => rule === 'BRAND-UNSUPPORTED-COMPARISON')).toEqual([]);
+    expect(result.findings).toContainEqual({ source: 'docs/marketing/BLOG-public.md', line: 4, rule: 'PUBLIC-COPY-PLACEHOLDER' });
+    expect(result.documents).toEqual([{ source: 'docs/marketing/BLOG-public.md', findings: 1, companyNameMentions: 1, placeholderMentions: 1 }]);
+  });
+
+  test('counts a mechanical synonym list as a placeholder without flagging ordinary provider language', () => {
+    const result = scanPublicCopy([{
+      label: 'docs/marketing/DRAFT-launch.md',
+      text: 'A model provider handles sign-in.\nA coding tool, the coding CLI, an AI model, a model provider.',
+    }], () => []);
+    expect(result.findings).toContainEqual({ source: 'docs/marketing/DRAFT-launch.md', line: 2, rule: 'PUBLIC-COPY-PLACEHOLDER' });
+    expect(result.documents).toEqual([{ source: 'docs/marketing/DRAFT-launch.md', findings: 1, companyNameMentions: 0, placeholderMentions: 1 }]);
+  });
+
+  test('excludes internal research and asset manifests with a reason while scanning publishable drafts', () => {
+    const result = scanPublicCopy([
+      { label: 'docs/marketing/RESEARCH-landscape.md', text: 'OpenAI ChatGPT source research' },
+      { label: 'docs/marketing/teaser-v4/MANIFEST.md', text: 'Codex source asset' },
+      { label: 'docs/marketing/BLOG-02-the-agent-drives-the-agent-2026-09-29.md', text: 'Published Codex and ChatGPT record' },
+      { label: 'docs/marketing/DRAFT-0.2.7-announcement-2026-10-01.md', text: 'Historical Grok release note' },
+      { label: 'docs/marketing/SCRIPT-ax-demo-1008-2026-10-08.md', text: 'Historical visitor demo script' },
+      { label: 'docs/marketing/launch/0.2.8-loop-final/blog.md', text: 'Published release blog' },
+      { label: 'docs/marketing/DRAFT-launch.md', text: 'We coordinate coding work.' },
+      { label: 'docs/usage/BLOG-02-example.md', text: 'A published usage note.' },
+    ], () => []);
+    expect(result.excludedSources).toEqual([
+      { source: 'docs/marketing/RESEARCH-landscape.md', reason: 'internal-marketing-source' },
+      { source: 'docs/marketing/teaser-v4/MANIFEST.md', reason: 'asset-manifest' },
+      { source: 'docs/marketing/BLOG-02-the-agent-drives-the-agent-2026-09-29.md', reason: 'internal-marketing-source' },
+      { source: 'docs/marketing/DRAFT-0.2.7-announcement-2026-10-01.md', reason: 'internal-marketing-source' },
+      { source: 'docs/marketing/SCRIPT-ax-demo-1008-2026-10-08.md', reason: 'internal-marketing-source' },
+      { source: 'docs/marketing/launch/0.2.8-loop-final/blog.md', reason: 'internal-marketing-source' },
+    ]);
+    expect(result.documents).toEqual([
+      { source: 'docs/marketing/DRAFT-launch.md', findings: 0, companyNameMentions: 0, placeholderMentions: 0 },
+      { source: 'docs/usage/BLOG-02-example.md', findings: 0, companyNameMentions: 0, placeholderMentions: 0 },
+    ]);
+  });
+
   test('normalizes goal paths before exclusion so traversal aliases cannot hide public docs', () => {
     const result = scanPublicCopy([
       { label: './docs/goals/GOAL-internal.md', text: '곧 20 PRs' },
@@ -65,13 +184,13 @@ describe('public copy warning-only shadow lint', () => {
     const missingLedger = new PatentLedger({ stateDir: join(stateDir, 'missing-ledger') });
     const result = scanPublicCopy([{ label: 'posts/draft.md', text: '일반 문장' }],
       (text) => missingLedger.unapprovedCandidateLineNumbers(text), join(stateDir, 'missing-rules.yaml'));
-    expect(result).toEqual({ findings: [], excludedSources: [], brandRulesAvailable: false, patentLedgerAvailable: false });
+    expect(result).toEqual({ findings: [], excludedSources: [], documents: [{ source: 'posts/draft.md', findings: 0, companyNameMentions: 0, placeholderMentions: 0 }], brandRulesAvailable: false, patentLedgerAvailable: false });
     expect(existsSync(missingLedger.path)).toBe(false);
   });
 
   test('marks an empty scan as unmeasured', () => {
     expect(scanPublicCopy([], () => [])).toEqual({
-      findings: [], excludedSources: [], brandRulesAvailable: false, patentLedgerAvailable: false,
+      findings: [], excludedSources: [], documents: [], brandRulesAvailable: false, patentLedgerAvailable: false,
     });
   });
 
@@ -104,6 +223,68 @@ describe('public copy warning-only shadow lint', () => {
     expect(result.excludedSources).toContainEqual({ source: 'docs/goals/GOAL-test.md', reason: 'internal-goal-document' });
     expect(output).not.toContain('private rotor phrase');
     expect(output).not.toContain('PRIVATE-CANDIDATE');
+  });
+
+  test('CLI recursively scans the requested marketing directory and measures its patent ledger', () => {
+    const root = join(stateDir, 'directory-cli-root');
+    mkdirSync(join(root, 'docs', 'marketing', 'nested'), { recursive: true });
+    writeFileSync(join(root, 'docs', 'marketing', 'nested', 'BLOG-public.md'), 'private rotor phrase');
+    const ledger = new PatentLedger({ stateDir: join(root, '.state') });
+    ledger.add({ id: 'PRIVATE-CANDIDATE', title: 'private rotor phrase', track: '비공개' });
+    let output = '';
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => { output += `${args.join(' ')}\n`; };
+    try { expect(run(['--files', 'docs/marketing', '--json'], root, ledger)).toBe(0); }
+    finally { console.log = originalLog; }
+    const result = JSON.parse(output) as {
+      findings: Array<{ source: string; line: number; rule: string }>;
+      patentLedgerAvailable: boolean;
+    };
+    expect(result.patentLedgerAvailable).toBe(true);
+    expect(result.findings).toContainEqual({
+      source: 'docs/marketing/nested/BLOG-public.md', line: 1, rule: 'PRIVATE-PATENT-CANDIDATE',
+    });
+  });
+
+  test('production CLI scans the actual README and changed pitch deck', () => {
+    const root = process.cwd();
+    const deck = 'docs/marketing/decks/elanous-pitch-2026-10.html';
+    expect(existsSync(join(root, deck))).toBe(true);
+    const ledger = new PatentLedger({ stateDir: join(stateDir, 'actual-documents-ledger') });
+    let output = '';
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => { output += `${args.join(' ')}\n`; };
+    try {
+      expect(run(['--files', 'README.md', deck, '--json'], root, ledger)).toBe(0);
+    } finally { console.log = originalLog; }
+    const result = JSON.parse(output) as {
+      documentsScanned: number;
+      findings: Array<{ source: string; line: number; rule: string }>;
+      documents: Array<{ source: string; companyNameMentions: number }>;
+    };
+    expect(result.documentsScanned).toBe(2);
+    expect(result.documents.reduce((sum, document) => sum + document.companyNameMentions, 0)).toBeGreaterThan(0);
+    expect(result.findings.filter(({ rule }) => rule.startsWith('ONE-CLICK-'))).toEqual([]);
+  });
+
+  test('counts names and catches unsupported comparisons from a scratch README', () => {
+    const root = join(stateDir, 'unsupported-comparison-root');
+    mkdirSync(root, { recursive: true });
+    writeFileSync(join(root, 'README.md'), 'OpenClaw is faster than Elanous.');
+    let output = '';
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => { output += `${args.join(' ')}\n`; };
+    try {
+      expect(run(['--files', 'README.md', '--json'], root,
+        new PatentLedger({ stateDir: join(stateDir, 'unsupported-comparison-ledger') }))).toBe(0);
+    } finally { console.log = originalLog; }
+
+    const result = JSON.parse(output) as {
+      documents: Array<{ source: string; companyNameMentions: number }>;
+      findings: Array<{ source: string; line: number; rule: string }>;
+    };
+    expect(result.documents).toEqual([{ source: 'README.md', findings: 1, companyNameMentions: 1, placeholderMentions: 0 }]);
+    expect(result.findings).toContainEqual({ source: 'README.md', line: 1, rule: 'BRAND-UNSUPPORTED-COMPARISON' });
   });
 
   test('text CLI reports skipped files separately from scanned document count', () => {

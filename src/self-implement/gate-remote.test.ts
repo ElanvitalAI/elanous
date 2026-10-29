@@ -9,7 +9,7 @@ import {
   gateRemoteHostCap, gateReservationAlternateHosts, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, remoteSupervisorScript, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type SshResult,
 } from './gate-remote.js';
 import { parseGateRemoteConfig } from '../user-config.js';
-import { reserveReleaseGateHosts } from '../release-loop/gate-host-reservation.js';
+import { readGateHostResources, reserveReleaseGateHosts } from '../release-loop/gate-host-reservation.js';
 
 // Spawned CLI integration checks can exceed Bun's 5 s unit-test default under concurrent gate load.
 setDefaultTimeout(60_000);
@@ -432,6 +432,86 @@ describe('onRemoteOutcome hook (self gate --artifact-dir fetch)', () => {
 });
 
 describe('self gate explicit remote placement', () => {
+  test('production probe resolves the configured Pod pool and reads its ledger without an injected runner', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'production-probe-seed', ['node-b']);
+    release();
+    const leaseRoot = slotDir();
+    const previousLeaseDir = process.env.ELANOUS_POD_LEASE_DIR;
+    process.env.ELANOUS_POD_LEASE_DIR = leaseRoot;
+    try {
+      await withFakeBins({ kubectl: { stdout: '{"items":[]}' } }, async (fakeBins) => {
+        const io = sink();
+        const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: process.cwd(), flags: { local: false, remote: 'node-b' },
+          reservationRoot: root, explicitRemoteOnly: true, localOnlyReason: 'intentional fixture stop', remoteArgv: ['x'], runLocal: () => 0 },
+        { settings, env: { ...fakeBins.env, ELANOUS_POD_POOL: 'probe-node-b@node-b:1', NODE_ENV: 'test' }, load1: 1, write: io.write });
+        expect(rc).toBe(1);
+        expect(io.err.join('')).toContain('intentional fixture stop');
+        expect(io.err.join('')).not.toContain('host-reserved');
+        expect(fakeBins.calls().filter(call => call.name === 'kubectl')).toContainEqual(expect.objectContaining({
+          argv: expect.arrayContaining(['--context', 'probe-node-b', 'get', 'pods', '--all-namespaces']),
+        }));
+      });
+    } finally {
+      if (previousLeaseDir === undefined) delete process.env.ELANOUS_POD_LEASE_DIR;
+      else process.env.ELANOUS_POD_LEASE_DIR = previousLeaseDir;
+    }
+  });
+
+  test('the selected gate host is probed from resource ledgers before dispatch', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'test-probe-seed', ['node-b']);
+    release();
+    const measured = readGateHostResources({ leases: [], activeJobs: [] });
+    const hosts: string[] = [];
+    const runner = fakeRunner();
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+      reservationRoot: root, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('remote only'); } },
+    { runner, settings, env: {}, load1: 1, write: sink().write, readHostResources: host => { hosts.push(host); return measured; } });
+    expect(rc).toBe(0);
+    expect(hosts).toEqual(['node-b']);
+    expect(runner.calls.some(([kind, host]) => kind === 'ssh' && host === 'node-b')).toBe(true);
+  });
+
+  test('an unreadable Pod ledger does not hide a concrete release reservation owner', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'graph-run-live', ['node-b']);
+    try {
+      const runner = fakeRunner();
+      const io = sink();
+      const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+        reservationRoot: root, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('remote only'); } },
+      { runner, settings, env: {}, load1: 1, write: io.write,
+        readHostResources: () => ({ status: 'unmeasurable', empty: null, reason: 'pod-list-unavailable' }) });
+      expect(rc).toBe(1);
+      expect(runner.calls.some(([kind]) => kind === 'ssh')).toBe(false);
+      expect(io.err.join('')).toContain('graph-run-live holds node-b');
+      expect(io.err.join('')).toContain('owner=graph-run-live');
+    } finally { release(); }
+  });
+
+  test('an occupied Pod ledger reroutes the selected gate host to a measured free pool host', async () => {
+    const root = slotDir();
+    const release = reserveReleaseGateHosts(root, 'resource-probe-seed', ['node-b']);
+    release();
+    const occupied = readGateHostResources({ leases: [{ pid: 44, startedAt: 'start', at: 'now', stage: 'authoring' }], activeJobs: [] });
+    const free = readGateHostResources({ leases: [], activeJobs: [] });
+    const probed: string[] = [];
+    const runner = fakeRunner();
+    const io = sink();
+    const rc = await dispatchHeavyCheck({ tool: 'self-gate', repo: '/r', flags: { local: false, remote: 'node-b' },
+      reservationRoot: root, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('remote only'); } },
+    { runner, settings, env: {}, load1: 1, write: io.write, readHostResources: host => {
+      probed.push(host);
+      return host === 'node-b' ? occupied : free;
+    } });
+    expect(rc).toBe(0);
+    expect(probed).toEqual(['node-b', 'host-e-wsl']);
+    expect(runner.calls).toContainEqual(['ssh', 'host-e-wsl']);
+    expect(io.err.join('')).toContain('Pod resource pool occupied (1 reservations)');
+    expect(io.err.join('')).toContain('rerouting to host-e-wsl');
+  });
+
   test('changed typecheck keeps node-b fixed and becomes unmeasured during a release reservation', async () => {
     const root = slotDir();
     const release = reserveReleaseGateHosts(root, 'gate-run', ['node-b']);
@@ -1010,7 +1090,7 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('invalid --remote host');
   });
-  test('a valid --remote call reaches the dispatcher: missing origin/main refuses local measurement for tsc and self gate', () => {
+  test('a valid --remote call reaches the dispatcher: missing origin/main refuses local measurement for tsc and self gate', async () => {
     // A scratch repo with no origin/main: the dispatcher refuses before any push/ssh, so no host is contacted.
     const scratch = slotDir();
     spawnSync('git', ['init', '-q'], { cwd: scratch });
@@ -1025,14 +1105,21 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     expect(tsc.stderr).toContain('merge-base(HEAD, origin/main) 을 이 트리에서 풀 수 없다');
     expect(tsc.stderr).toContain('node-b 를 띄우지 않는다');
     expect(tsc.status).toBe(2);
-    const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b'], { cwd: scratch, encoding: 'utf8', env });
-    expect(gate.stderr).toContain('[gate.remote] remote unmeasured on node-b (stage=preflight, rc=unknown) — origin-main-unresolved');
-    expect(gate.status).toBe(1);
-    expect(`${gate.stdout}${gate.stderr}`).not.toContain('gate: no changed files');
+    await withFakeBins({ kubectl: { stdout: '{"items":[]}' } }, async (fakeBins) => {
+      const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = fakeBins.env;
+      const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b'], {
+        cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test', ELANOUS_STATE_DIR: env.ELANOUS_STATE_DIR,
+          ELANOUS_POD_LEASE_DIR: slotDir(), ELANOUS_POD_POOL: 'probe-node-b@node-b:1' },
+      });
+      expect(gate.stderr).toContain('[gate.remote] remote unmeasured on node-b (stage=preflight, rc=unknown) — origin-main-unresolved');
+      expect(gate.status).toBe(1);
+      expect(`${gate.stdout}${gate.stderr}`).not.toContain('gate: no changed files');
+      expect(fakeBins.calls().filter(call => call.name === 'kubectl')).toHaveLength(1);
+    });
   });
 
   test('spawned self gate --remote preserves the SSH failure and never starts the local gate', async () => {
-    await withFakeBins({ ssh: { stderr: 'ssh: isolated gate failure\noriginal detail: connection refused\n', exitCode: 255 } }, async (fakeBins) => {
+    await withFakeBins({ kubectl: { stdout: '{"items":[]}' }, ssh: { stderr: 'ssh: isolated gate failure\noriginal detail: connection refused\n', exitCode: 255 } }, async (fakeBins) => {
     const scratch = slotDir();
     expect(spawnSync('git', ['init', '-q'], { cwd: scratch }).status).toBe(0);
     expect(spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: scratch }).status).toBe(0);
@@ -1040,8 +1127,10 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     mkdirSync(join(scratch, '.elanous-test', 'release', 'gate-host-reservations'), { recursive: true });
     writeFileSync(join(scratch, '.git', 'info', 'exclude'), 'bin/\n.elanous-test/\nlog/\n');
     const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = fakeBins.env;
+    const podLeaseDir = slotDir();
+    const podPool = 'probe-node-b@node-b:1,probe-isolated@isolated-host:1';
     const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'isolated-host'], {
-      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test' },
+      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test', ELANOUS_POD_LEASE_DIR: podLeaseDir, ELANOUS_POD_POOL: podPool },
     });
     expect(gate.status).toBe(1);
     expect(gate.stderr).toContain('remote unmeasured on isolated-host (stage=push, rc=128)');
@@ -1052,22 +1141,23 @@ describe('entry-point wiring (spawned, no remote work)', () => {
     expect(gate.stdout).toBe('');
     console.log(`isolated self gate CLI: rc=${gate.status} local=${localRuns} stdout=${JSON.stringify(gate.stdout)} stderr=${JSON.stringify(gate.stderr)}`);
     const automatic = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD'], {
-      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test' },
+      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test', ELANOUS_POD_LEASE_DIR: podLeaseDir, ELANOUS_POD_POOL: podPool },
     });
     expect(automatic.status).toBe(1);
     expect(automatic.stderr).toContain('remote unmeasured on node-b (stage=push, rc=128)');
     expect(automatic.stderr).toContain('ssh: isolated gate failure\noriginal detail: connection refused\n');
     expect(automatic.stdout).toBe('');
     const local = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--local'], {
-      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test' },
+      cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test', ELANOUS_POD_LEASE_DIR: podLeaseDir, ELANOUS_POD_POOL: podPool },
     });
     expect(local.status).toBe(0);
     expect(local.stdout).toContain('[self gate] changed=0 base=HEAD reason=no-changes');
     expect((local.stdout.match(/\[self gate\]/g) ?? []).length).toBe(1);
     expect(`${local.stdout}${local.stderr}`).not.toContain('ssh: isolated gate failure');
-    expect(fakeBins.calls().filter((call) => call.name === 'ssh').length).toBe(2);
-    expect(fakeBins.calls()[0]?.argv).toContain('isolated-host');
-    expect(fakeBins.calls()[1]?.argv).toContain('node-b');
+    const sshCalls = fakeBins.calls().filter((call) => call.name === 'ssh');
+    expect(sshCalls).toHaveLength(2);
+    expect(sshCalls[0]?.argv).toContain('isolated-host');
+    expect(sshCalls[1]?.argv).toContain('node-b');
     });
   });
 
@@ -1089,40 +1179,51 @@ describe('entry-point wiring (spawned, no remote work)', () => {
 
     await withFakeBins({
       gh: { stdout: JSON.stringify({ headRefOid: requestedPrHead, files: [{ path: 'src/example.ts' }] }) },
+      kubectl: { stdout: '{"items":[]}' },
       ssh: { stdout: `gate: passed head=${reportedRemoteHead}\n`, stderr: '__GATE_REMOTE_RC=0\n' },
     }, async (fakeBins) => {
       const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = fakeBins.env;
       // Keep the normal production CLI path; NODE_ENV=test activates test-only routing seams.
       const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--test', 'self', 'gate', '--changed', '--base', 'HEAD', '--pr', '123', '--remote', 'isolated-host'], {
-        cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'development' },
+        cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'development', ELANOUS_POD_LEASE_DIR: slotDir(),
+          ELANOUS_POD_POOL: 'probe-node-b@node-b:1,probe-isolated@isolated-host:1' },
       });
       expect(gate.status).toBe(1);
       expect(gate.stdout).toBe('');
       expect(gate.stderr).toContain('remote unmeasured');
       expect(gate.stderr).toContain('--pr');
       expect(`${gate.stdout}${gate.stderr}`).not.toContain('gate: passed');
-      expect(fakeBins.calls()).toEqual([]);
+      expect(fakeBins.calls().filter(call => call.name === 'kubectl')).toHaveLength(1);
+      expect(fakeBins.calls().some(call => call.name === 'ssh' || call.name === 'gh')).toBe(false);
     });
   });
 
-  test('the spawned self gate CLI reads the live release reservation and reroutes off the reserved host', () => {
-    const scratch = slotDir();
-    const state = slotDir();
-    spawnSync('git', ['init', '-q'], { cwd: scratch });
-    spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: scratch });
-    const release = reserveReleaseGateHosts(state, 'graph-run-live', ['node-b']);
-    try {
-      const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = process.env;
-      const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--config-dir', state, 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b'],
-        { cwd: scratch, encoding: 'utf8', env: { ...inherited, NODE_ENV: 'test', ELANOUS_STATE_DIR: state } });
-      expect(gate.status).toBe(1);
-      expect(gate.stderr).toContain('host-reserved: node-b (release gate graph-run-live holds node-b)');
-      expect(gate.stderr).toContain('owner=graph-run-live');
-      const stamp = /reserved-at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/.exec(gate.stderr);
-      expect(stamp).toBeTruthy();
-      expect(Math.abs(Date.parse(`${stamp![1]}Z`) - Date.now())).toBeLessThan(120_000);
-      expect(gate.stderr).toContain('rerouting to host-e-wsl');
-    } finally { release(); }
+  test('the spawned self gate CLI reads the live release reservation and reroutes off the reserved host', async () => {
+    await withFakeBins({ kubectl: { stdout: '{"items":[]}' } }, fakeBins => {
+      const scratch = slotDir();
+      const state = slotDir();
+      const leaseRoot = slotDir();
+      expect(spawnSync('git', ['init', '-q'], { cwd: scratch }).status).toBe(0);
+      expect(spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'init'], { cwd: scratch }).status).toBe(0);
+      const release = reserveReleaseGateHosts(state, 'graph-run-live', ['node-b']);
+      try {
+        const { ELANOUS_GATE_REMOTE_CHILD: _child, ...inherited } = fakeBins.env;
+        const gate = spawnSync('bun', [join(repoRoot, 'bin/elanous.mjs'), '--config-dir', state, 'self', 'gate', '--changed', '--base', 'HEAD', '--remote', 'node-b'], {
+          cwd: scratch, encoding: 'utf8', timeout: 60_000,
+          env: { ...inherited, NODE_ENV: 'test', ELANOUS_STATE_DIR: state, ELANOUS_POD_LEASE_DIR: leaseRoot,
+            ELANOUS_POD_POOL: 'probe-node-b@node-b:1,probe-wsl@host-e-wsl:1' },
+        });
+        expect(gate.status).toBe(1);
+        expect(gate.stderr).toContain('host-reserved: node-b (release gate graph-run-live holds node-b)');
+        expect(gate.stderr).toContain('owner=graph-run-live');
+        const stamp = /reserved-at=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/.exec(gate.stderr);
+        expect(stamp).toBeTruthy();
+        expect(Math.abs(Date.parse(`${stamp![1]}Z`) - Date.now())).toBeLessThan(120_000);
+        expect(gate.stderr).toContain('rerouting to host-e-wsl');
+        expect(gate.stderr).toContain('remote unmeasured on host-e-wsl (stage=preflight, rc=unknown) — origin-main-unresolved');
+        expect(fakeBins.calls().filter(call => call.name === 'kubectl')).toHaveLength(2);
+      } finally { release(); }
+    });
   });
 
   test('self gate: --remote with --local, or an invalid host, is refused (rc 2)', () => {

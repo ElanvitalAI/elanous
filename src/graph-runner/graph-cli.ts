@@ -258,10 +258,31 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
           const { createScheduleSource } = await import('../workflow-runtime/triggers/schedule-source.js');
           const graphFile = resolve(file);
           const source = createScheduleSource();
+          const graphDocument = parseYaml(readFileSync(graphFile, 'utf8')) as { graph_id?: string; loop?: { trigger?: { events?: string[] } } };
+          const cutEventSubscribed = graphDocument.graph_id === 'release-loop'
+            && graphDocument.loop?.trigger?.events?.includes('release.cut.due') === true;
           // The CLI tick callback is the graph counterpart of the workflow scheduler's onEmit.
           const onScheduledTick = async () => {
             try {
               const { notifyGraphEvents } = await import('./graph-notify.js');
+              if (cutEventSubscribed) {
+                const { emitDueReleaseCutEvents } = await import('../release-loop/release-schedule.js');
+                const { runUnattendedRelease } = await import('../../scripts/release-loop/unattended-release.js');
+                try {
+                  await emitDueReleaseCutEvents(new Date().toISOString(), async event => {
+                    const fired = await runUnattendedRelease({ version: event.version, triggerEvent: event });
+                    await notifyGraphEvents();
+                    if (fired.state?.status === 'failed') console.error(`graph tick: ${fired.state.runId}: failed`);
+                  });
+                } catch (error) {
+                  debug.log('graph.runner', 'cut-event-failed', { file: graphFile, error: error instanceof Error ? error.message : String(error) });
+                  console.error(`graph cut event: ${error instanceof Error ? error.message : String(error)}`);
+                }
+                const resumed = await graphTick(graphFile, { deps: { notify: async () => { await notifyGraphEvents(); } } });
+                if (resumed.status === 'refused') console.error(`graph tick: refused: ${resumed.reason}`);
+                else if (resumed.status === 'failed') console.error(`graph tick: ${resumed.runId}: failed`);
+                return;
+              }
               const result = await graphTick(graphFile, { startIfIdle: true, deps: { notify: async () => { await notifyGraphEvents(); } } });
               if (result.status === 'refused') console.error(`graph tick: refused: ${result.reason}`);
               else if (result.status === 'failed') console.error(`graph tick: ${result.runId}: failed`);

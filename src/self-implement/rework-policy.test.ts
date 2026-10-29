@@ -438,12 +438,11 @@ describe('resolveEscalateTarget — 단일 중간 모델/provider/effort', () =>
   it('자식을 모르면(명시 자식이 아니면) 이 해석은 승급하지 않는다 — 기본 경로는 resolveEscalateTarget 이다', () => {
     expect(resolveExplicitChildEscalateTarget('sol', {})).toBeNull();
   });
-  it('🩸 2026-09-23 — 승급 타깃에 옛 세대(gpt-5.6-*)·GPT-6 에 없는 terra 가 나오지 않는다', () => {
+  it('승급 타깃은 현재 Codex 사다리를 따르고 옛 gpt-5.6 세대를 쓰지 않는다', () => {
     const targets = [resolveEscalateTarget('sol', {}), resolveEscalateTarget('opus', {}),
       resolveExplicitChildEscalateTarget('sol', {}, { provider: 'openai-codex', model: lookupLlmTierSpec('openai-codex', 'budget').model })];
     for (const t of targets) {
       expect(t!.model).not.toMatch(/^gpt-5\.6-/);
-      expect(t!.model).not.toMatch(/terra/);
     }
     expect(resolveEscalateTarget('opus', {})!.model).toBe(lookupLlmTierSpec('anthropic', 'loaded').model);
   });

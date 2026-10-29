@@ -1,8 +1,11 @@
-import { describe, expect, test } from 'bun:test';
-import { boundRunStopCause, classifyMergeHoldStop, classifyPodExitStop, readRunStopRecord, recordRunStop, runStopRecorded, RUN_STOP_CLASSES } from './run-stop.js';
+import { beforeAll, describe, expect, test } from 'bun:test';
+import { boundRunStopCause, classifyMergeHoldStop, classifyPodExitStop, classifyTerminalHarnessFailure, readRunStopRecord, recordRunStop, runStopRecorded, RUN_STOP_CLASSES } from './run-stop.js';
 import { debug } from '../debug/log.js';
 import { spyOn } from 'bun:test';
 import type { RunLedgerEntry } from './run-ledger.js';
+
+// Warm the module before test bodies so a slow cold import cannot spill into the next test.
+beforeAll(async () => { await import('./stop-autoheal.js'); }, 30_000);
 
 describe('recordRunStop', () => {
   test('appends one stop with a closed class and preserves earlier entries', () => {
@@ -12,7 +15,7 @@ describe('recordRunStop', () => {
     expect(entries).toHaveLength(2);
     expect(entries[0]).toBe(prior);
     expect(entries[1]).toMatchObject({ runId: 'run-test', event: 'stop', data: { class: 'main-sync', cause: 'merge held: main-sync-conflict-unresolved', evidenceRef: 'run-ledger:run-test:merge-decision', nextMove: 'Review merge decision' } });
-    expect(RUN_STOP_CLASSES).toEqual(['env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat', 'review-out-of-scope', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified']);
+    expect(RUN_STOP_CLASSES).toEqual(['env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat', 'review-out-of-scope', 'review-budget-exhausted', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified']);
   });
 
   test('unknown class is unclassified; cause is one line at most 120 characters without truncation marker', () => {
@@ -44,6 +47,7 @@ describe('recordRunStop', () => {
     expect(classifyMergeHoldStop('required-evidence-uncovered')).toBe('evidence-uncovered');
     expect(classifyMergeHoldStop('review-must-fix')).toBe('review-repeat');
     expect(classifyMergeHoldStop('review-warn-with-must-fix')).toBe('review-repeat');
+    expect(classifyMergeHoldStop('review-budget-exhausted')).toBe('review-budget-exhausted');
     expect(classifyMergeHoldStop('no-real-review')).toBe('review-out-of-scope');
     expect(classifyMergeHoldStop('something-new')).toBe('unclassified');
     expect(classifyMergeHoldStop(undefined)).toBe('unclassified');
@@ -53,6 +57,23 @@ describe('recordRunStop', () => {
     expect(classifyPodExitStop('OOMKilled')).toBe('pod-died');
     expect(classifyPodExitStop('no-launch')).toBe('launch-failed');
     expect(classifyPodExitStop('unknown')).toBe('unclassified');
+  });
+
+  test('HARNESS-HEAL-EXITS routes exhausted failure shapes into the existing prescription ladder', async () => {
+    const cases = [
+      [{ stage: 'aborted', abandonedClassification: 'report-deficit' }, 'pod-died', 'resume-from-salvage'],
+      [{ stage: 'gate-failed' }, 'gate-failed', 'needs-owner'],
+      [{ stage: 'review-blocked', supervisorVerdict: 'EXTEND' }, 'review-repeat', 'needs-owner'],
+      [{ stage: 'aborted', providerErrorCategory: 'credential', abandonedClassification: 'credential-failure' }, 'launch-failed', 'needs-owner'],
+      [{ stage: 'aborted', supervisorVerdict: 'UNCONVERGEABLE' }, 'review-repeat', 'needs-owner'],
+      [{ stage: 'review-blocked', mergeReason: 'review-budget-exhausted' }, 'review-budget-exhausted', 'review-round-reauthor'],
+    ] as const;
+    const { pickAutohealAction } = await import('./stop-autoheal.js');
+    for (const [failure, expectedClass, expectedAction] of cases) {
+      const actualClass = classifyTerminalHarnessFailure(failure);
+      expect(actualClass).toBe(expectedClass);
+      expect(pickAutohealAction(actualClass).action).toBe(expectedAction);
+    }
   });
 
   test('records the observation and remembers the run; readRunStopRecord round-trips the schema', () => {

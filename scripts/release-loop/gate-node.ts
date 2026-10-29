@@ -9,7 +9,7 @@ import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink
 import { landingFreezeMessage, readLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
-import { diffFailures, junitFailures, parseFailures, parseTimedOutFailures } from './gate-diff';
+import { collapseGateFailureAttempts, diffFailures, GateFailureAttributionMismatch, junitFailures, parseFailureAttempts, parseFailures, parseTimedOutFailures } from './gate-diff';
 import { loadEnvKnownFailures, splitKnownEnv } from './env-known-failures';
 import { loadGateBatchSafe } from './gate-batch-safe';
 import { observeGatePrewarmCutShadow, type GatePrewarmInput } from './gate-prewarm-plan.js';
@@ -52,6 +52,8 @@ import { runWithReleaseGateTraffic } from './gate-traffic-mode.js';
 import { emitPodLifecycle, gatePodLifecycleEvent, gatePodOutcome } from '../../src/task-orchestrator/surfaces/pod-lifecycle-stages.js';
 import { gateHostReservationRoot, reserveReleaseGateHosts } from '../../src/release-loop/gate-host-reservation.js';
 import { normRoot } from '../../src/instance/resolve.js';
+import { cleanRetryVerdict, junitFailedCaseIds, junitTestcaseCount, junitTestcaseFiles } from './gate-shard-load-flaky.js';
+import { decideAndRecordGateAutoheal, gateAutohealCause, type GateAutohealDecision } from './gate-autoheal.js';
 
 export interface WarmShadowObservation {
   files: string[];
@@ -76,6 +78,10 @@ export function warmCommandMatchesRequest(command: WarmWorkerCommand, request: O
 }
 
 interface CommandResult { rc: number; output: string; passedIds?: string[]; stalledEnv?: Array<{ file: string; reason: 'no-output' }>; timedOut?: boolean;
+  /** Same-Pod per-file retry passed with complete log/JUnit evidence; these original ids are excluded from introduced. */
+  loadFlaky?: string[];
+  /** Files already given their one same-Pod retry; prevent the later timeout-only path from retrying them again. */
+  loadFlakyAttemptedFiles?: string[];
   /** Identity and complete selected inventory of this Pod sweep; only the producer may issue it. */
   podSweep?: { id: string; shards: number; files: string[] };
   /** Complete, source-bound one-file Job result for shadow comparison; absent means unmeasured. */
@@ -331,6 +337,9 @@ export interface GateResult {
   baselineSource?: 'ledger' | 'instance' | 'cut-logs' | 'swept';
   /** GATE-BASELINE-CACHE — isolated baseline files answered from the ledger (hits) or run now (misses). */
   baselineCache?: { hits: number; misses: number };
+  /** A residual summary/name mismatch triggers an explicit baseline rerun before the gate stays fail-closed. */
+  attributionRecheck?: { summary: number; observed: number; identified: number; collapsed: number;
+    targetFiles: string[]; baselineResult: 'completed' | 'failed' | 'timeout' };
   /** GATE-SPEED A4 — a swept baseline ran only the cut's failing files that exist at the previous release. */
   baselineDeferred?: { cutFiles: number; swept: number };
   durationMs: number;
@@ -351,14 +360,16 @@ export interface GateResult {
   partialFailures?: SweepFailures;
   /** GATE-PARTIAL — this verdict re-ran only these files and carried the prior gate's results for the rest. */
   partial?: { priorCommit: string; files: number };
-  /** GATE-INTRO-RECHECK — new failures that were only the «timed out» shape and passed one isolated re-run with a
-   *  {@link GATE_TIMEOUT_RECHECK_MS} per-test limit: a warning (flaky under load), not an introduced regression. */
+  /** A failure that passed an evidence-checked isolated re-run: warning (flaky under load), not an introduced regression. */
   loadFlaky?: string[];
   /** File-level unhandled errors that reproduced or could not be measured in isolation. They keep the gate red. */
   unmeasuredErrors?: Array<{ file: string; reason: 'reproduced' | 'timeout' | 'unreadable'; ids: string[] }>;
   /** Shard-only unhandled errors whose file-level replay completed cleanly. */
   interferenceErrors?: string[];
   rehearsalTui?: ExecutedTuiCheck;
+  /** Recovery recommendation is persisted with the failed graph node so the resume coordinator can act on it. */
+  autoheal?: GateAutohealDecision;
+  autoheals?: GateAutohealDecision[];
 }
 
 const sha = /^[0-9a-f]{7,40}$/i;
@@ -768,7 +779,8 @@ export function gateShardShell(o: { parts: readonly (readonly string[])[]; cdpPa
     // run_part body changes the shell hash once for this feature; keeping the
     // multi-file invocation unchanged avoids another cache-key change.
     const warmFile = part.length === 1 ? `WARM_REFERENCE_FILE=${quote(part[0]!)} ` : '';
-    return `${warmFile}run_part ${index} ${[...runner, ...(o.testTimeoutMs !== undefined ? ['--timeout', String(o.testTimeoutMs)] : spawnParts.includes(index) ? ['--timeout=120000'] : []), ...ignores, ...part.map(asPath)].map(quote).join(' ')}`;
+    const manifest = `printf '%s\\n' ${part.map(quote).join(' ')} > "$O/part-${index}.files"; `;
+    return `${manifest}${warmFile}run_part ${index} ${[...runner, ...(o.testTimeoutMs !== undefined ? ['--timeout', String(o.testTimeoutMs)] : spawnParts.includes(index) ? ['--timeout=120000'] : []), ...ignores, ...part.map(asPath)].map(quote).join(' ')}`;
   });
   // Only file-isolation batches use this path. A bounded group shares one clone/install, but every test process gets
   // its own HOME, state and tmp directory; part logs/JUnit remain separate and the existing artifact reader judges them.
@@ -826,6 +838,24 @@ export function gateShardShell(o: { parts: readonly (readonly string[])[]; cdpPa
     ...(spawnParts.length ? ['  local test_start; test_start=$(date +%s)'] : []),
     `  { if [ -n "\${WARM_REFERENCE_FILE:-}" ]; then printf "[warm-worker] file=%s\\n" "$WARM_REFERENCE_FILE"; ${o.sourceBinding ? `printf "[warm-worker] cut=%s attempt=%s\\n" ${quote(o.sourceBinding.cutSha)} ${quote(o.sourceBinding.attemptId)}; ` : ''}fi; "\${run_env[@]}" timeout -k 10 "$left" "$@" --reporter=junit --reporter-outfile="$O/part-$i.junit.xml"; } > "$O/part-$i.log" 2>&1`,
     '  local prc=$?',
+    '  if [ -s "$O/part-$i.junit.xml" ]; then',
+    '    if bun run scripts/release-loop/gate-shard-load-flaky.ts "$O/part-$i.junit.xml" "$O/part-$i.retry-files" "$O/part-$i.files"; then',
+    '      local retry_index=0 retry_left retry_rc retry_file',
+    '      while IFS= read -r retry_file; do',
+    '        [ -n "$retry_file" ] || continue',
+    '        retry_left=$(( gate_end - $(date +%s) ))',
+    '        [ "$retry_left" -gt 0 ] || break',
+    '        [ "$retry_left" -le 120 ] || retry_left=120',
+    '        stage "part-$i-retry-$retry_index-start"',
+    '        : > "$O/part-$i.retry-$retry_index.started"',
+    '        timeout -k 10 "$retry_left" "${run_env[@]}" bun run scripts/test-deterministic.ts "$retry_file" --timeout 120000 --reporter=junit --reporter-outfile="$O/part-$i.retry-$retry_index.junit.xml" > "$O/part-$i.retry-$retry_index.log" 2>&1',
+    '        retry_rc=$?',
+    '        echo "$retry_rc" > "$O/part-$i.retry-$retry_index.rc"',
+    '        stage "part-$i-retry-$retry_index-end"',
+    '        retry_index=$(( retry_index + 1 ))',
+    '      done < "$O/part-$i.retry-files"',
+    '    fi',
+    '  fi',
     '  if [ -n "${WARM_REFERENCE_FILE:-}" ] && [ -f "$O/part-$i.junit.xml" ]; then',
     '    local junit_sha; junit_sha=$(sha256sum "$O/part-$i.junit.xml" 2>/dev/null | awk \'{print $1}\')',
     '    if [ -z "$junit_sha" ]; then junit_sha=$(shasum -a 256 "$O/part-$i.junit.xml" 2>/dev/null | awk \'{print $1}\'); fi',
@@ -1136,6 +1166,10 @@ export interface ShardArtifacts {
   finished: string[];
   /** Raw logs of the parts that did not finish (diagnostics · last started file). */
   unfinishedLog?: string;
+  /** Original failure ids whose one same-Pod standalone retry completed cleanly. */
+  loadFlaky?: string[];
+  /** Files for which a same-Pod retry completed, even if it remained failing. */
+  loadFlakyAttemptedFiles?: string[];
 }
 /** Reads a shard Pod's outbox: the part layout ({@link gateShardShell}) or the older single-run one (shard.log · shard.rc · junit.xml). */
 export function readShardArtifacts(dir: string, parts: readonly (readonly string[])[]): ShardArtifacts {
@@ -1150,12 +1184,17 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
   }
   const timedOut = read('shard.timeout') !== undefined;
   if (installRc !== 0) return { output: install, ...(installRc !== undefined ? { rc: installRc } : {}), timedOut, finished: [] };
-  const good: Array<{ log: string; junit?: string; rc: 0 | 1; files: readonly string[] }> = [];
+  const good: Array<{ log: string; junit?: string; rc: 0 | 1; files: readonly string[]; loadFlaky?: string[]; loadFlakyAttemptedFiles?: string[] }> = [];
   const bad: string[] = [];
   const exitAnomaly: string[] = [];
+  const attemptedFiles = new Set<string>();
   let otherBad = false;
   let badRc: number | undefined;
   parts.forEach((files, index) => {
+    const retryManifest = (read(`part-${index}.retry-files`) ?? '').split(/\r?\n/).filter(Boolean);
+    retryManifest.forEach((file, retryIndex) => {
+      if (files.includes(file) && read(`part-${index}.retry-${retryIndex}.started`) !== undefined) attemptedFiles.add(file);
+    });
     const log = read(`part-${index}.log`);
     const rc = rcOf(read(`part-${index}.rc`));
     const clean = log?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
@@ -1166,9 +1205,32 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
       otherBad = true;
       return;
     }
-    if (clean !== undefined && (rc === 0 || rc === 1) && lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/)) {
+    const summary = clean === undefined ? undefined : lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/);
+    const summaryTests = Number(summary?.[1] ?? NaN);
+    const summaryPass = clean === undefined ? NaN : summaryCount(clean, 'pass');
+    const summaryFail = clean === undefined ? NaN : summaryCount(clean, 'fail');
+    const summaryErrors = clean === undefined ? NaN : summaryCount(clean, 'error');
+    const partJunit = read(`part-${index}.junit.xml`) ?? '';
+    const testcaseFiles = junitTestcaseFiles(partJunit);
+    const expectedFiles = [...files].sort();
+    const timedOutComplete = rc === 124 && summary !== undefined && summary !== null && Number(summary[2]) === files.length
+      && summaryPass + summaryFail + (Number.isNaN(summaryErrors) ? 0 : summaryErrors) === summaryTests
+      && junitTestcaseCount(partJunit) === summaryTests
+      && testcaseFiles !== null && testcaseFiles.length === expectedFiles.length && expectedFiles.every((file, fileIndex) => testcaseFiles[fileIndex] === file);
+    if (clean !== undefined && ((rc === 0 || rc === 1) || timedOutComplete) && summary) {
       const junit = read(`part-${index}.junit.xml`);
-      good.push({ log: clean, rc, files, ...(junit !== undefined ? { junit } : {}) });
+      const retryFiles = retryManifest;
+      const loadFlaky = retryFiles.flatMap((file, retryIndex) => {
+        if (!files.includes(file)) return [];
+        const retryRc = rcOf(read(`part-${index}.retry-${retryIndex}.rc`));
+        const retryLog = read(`part-${index}.retry-${retryIndex}.log`);
+        const retryJunit = read(`part-${index}.retry-${retryIndex}.junit.xml`);
+        const originalFailures = (junitFailedCaseIds(junit ?? '') ?? []).filter((id) => fileOf(id) === file);
+        const verdict = cleanRetryVerdict(retryRc, retryLog, retryJunit, file, originalFailures);
+        if (!verdict.clean) return [];
+        return originalFailures;
+      });
+      good.push({ log: clean, rc: rc === 0 ? 0 : 1, files, ...(junit !== undefined ? { junit } : {}), ...(loadFlaky.length ? { loadFlaky } : {}) });
       return;
     }
     if (log !== undefined) bad.push(`# part ${index} (${rc === undefined ? 'unfinished' : `rc=${rc}`})\n${log}`);
@@ -1194,6 +1256,9 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
     ...(rc !== undefined ? { rc } : {}),
     timedOut: !complete && timedOut && badRc === undefined,
     finished: good.flatMap((part) => [...part.files]),
+    ...([ ...new Set(good.flatMap((part) => part.loadFlaky ?? [])) ].length
+      ? { loadFlaky: [...new Set(good.flatMap((part) => part.loadFlaky ?? []))].sort() } : {}),
+    ...(attemptedFiles.size ? { loadFlakyAttemptedFiles: [...attemptedFiles].sort() } : {}),
     ...(bad.length ? { unfinishedLog: bad.join('\n') } : {}),
     ...(exitAnomaly.length && !otherBad ? { exitCodeOnly: exitAnomaly } : {}),
   };
@@ -1290,7 +1355,6 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
   const errorCount = subruns?.error ?? (Number.isNaN(reportedErrors) ? 0 : reportedErrors);
   const incomplete = (reason: string) => new Error(`${label} incomplete (rc=${run.rc}; Ran=${ran ? ran[0] : 'missing'}; errors=${subruns || !Number.isNaN(reportedErrors) ? errorCount : 'missing'}; ${reason})\n${tail40(output)}`);
   const count = subruns?.fail ?? summaryCount(output, 'fail');
-  const failures = parseFailures(output);
   // Bun repeats failed test names under "N tests failed:". A validated Pod sweep joins
   // separately checked shards, so a summary in one shard can precede real failures
   // from later shards. Remove each repeated block, not everything after the last one.
@@ -1301,6 +1365,11 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
     ? output.replace(/^\d+ tests? failed:\r?\n(?:\(fail\)[^\r\n]*(?:\r?\n|$))*(?:[ \t]*\r?\n)*/gm, '')
     : failureSummary ? output.slice(0, failureSummary.index) : output;
   const occurrences = [...executionOutput.matchAll(/^[ \t]*\(fail\)[ \t]+.+?(?:[ \t]+\[[\d.]+(?:ms|s)\])?[ \t]*\r?$/gm)].length;
+  const collapsed = collapseGateFailureAttempts(parseFailureAttempts(executionOutput));
+  const failures = collapsed.failures;
+  if (collapsed.collapsed > 0) debug.log('release-loop.gate', 'failure-attribution-deduplicated', {
+    label, summary: count, observed: occurrences, identified: collapsed.failures.length, collapsed: collapsed.collapsed,
+  });
   // A test that leaves process.exitCode set leaks a non-zero exit into a run whose own summary is complete and clean
   // (0.2.7 gate: agent-cli at v0.2.6 · 12 pass · 0 fail · rc 2). The summary is the verdict; read that exit as clean.
   const leakedExit = !!ran && run.rc !== 0 && run.rc !== 1 && count === 0 && errorCount === 0 && occurrences === 0
@@ -1319,7 +1388,11 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
     }
   }
   if (errors.length !== errorCount) throw incomplete(`error attribution identified=${errors.length}`);
-  if (!Number.isFinite(count) || (count !== occurrences && !(run.validatedShards && occurrences > count && failures.length === count)) || (subruns && failures.length !== count) || (count > 0 && failures.length === 0)
+  const retryDuplicatesExplainCount = occurrences > count && collapsed.observed === occurrences && failures.length === count;
+  if (Number.isFinite(count) && (failures.length !== count || (occurrences !== count && !retryDuplicatesExplainCount))) {
+    throw new GateFailureAttributionMismatch(label, count, occurrences, failures.length, collapsed.collapsed, failures);
+  }
+  if (!Number.isFinite(count) || (count > 0 && failures.length === 0)
     || (rc === 1 && count === 0 && errorCount === 0) || (rc === 0 && count + errorCount > 0)) {
     throw incomplete(`failure attribution incomplete: summary=${count}, identified=${failures.length}`);
   }
@@ -1408,6 +1481,7 @@ class SettledRecheckFailures extends Error {
 
 /** Isolated re-runs (host stall re-run · cut and baseline re-checks) are time-limited; sweeps and installs keep their full time. */
 export const GATE_ISOLATED_TIMEOUT_MS = 300_000;
+export const GATE_ATTRIBUTION_RECHECK_FILE_LIMIT = 64;
 /** Default final recheck window size; overflow continues in later windows. */
 export const GATE_HOST_RECHECK_FILE_LIMIT = 32;
 /** Two isolated test processes in each of four Pods = eight at most, with one checkout/install per eight files. */
@@ -1832,7 +1906,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       return { ...(podName ? { podName } : {}), ...(termination ? { termination } : {}), ...(logs?.status === 0 ? { logTail: logs.stdout } : {}),
         ...(errors.length ? { error: `수거 실패 · ${errors.join(' · ')}` } : {}) };
     });
-    type ShardRun = { output: string; rc: number; pass: number; fail: number; errors: number; ran: number; files: number; passedIds: string[] };
+    type ShardRun = { output: string; rc: number; pass: number; fail: number; errors: number; ran: number; files: number; passedIds: string[]; loadFlaky?: string[]; loadFlakyAttemptedFiles?: string[] };
     type ShardReason = NonNullable<GateResult['stalledShards']>[number]['reason'];
     // 깊이 끝 OOM 조각은 «조각 전체»를 파일 하나씩 격리한다 — 상한 40 이면 나머지가 못 잰 채 남았다(09-30 ① 7번 조각 110 파일).
     const isolationRemaining = shards.map((item) => item.files.length);
@@ -2005,6 +2079,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       let batchArtifactsComplete = true;
       let junit: string | undefined;
       let rc: number | undefined;
+      let shardLoadFlaky: string[] = [];
+      let shardLoadFlakyAttemptedFiles: string[] = [];
       let jobExitCode: number | undefined;
       let batchArtifactDir: string | undefined;
       let lastFile: string | undefined;
@@ -2135,6 +2211,31 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         if (job.exitCode !== 0) captureFailure();
         batchArtifactDir = job.artifactsDir;
         const read = readShardArtifacts(job.artifactsDir, parts);
+        if (logDir) {
+          mkdirSync(logDir, { recursive: true });
+          let retryArtifactIndex = 0;
+          const retryEvidence = parts.flatMap((files, partIndex) => {
+            const path = join(job.artifactsDir, `part-${partIndex}.retry-files`);
+            if (!existsSync(path)) return [];
+            const retryFiles = readFileSync(path, 'utf8').split(/\r?\n/).filter((file) => file && files.includes(file));
+            return retryFiles.map((file, retryIndex) => {
+              const prefix = `part-${partIndex}.retry-${retryIndex}`;
+              const persisted: Record<string, unknown> = { file, started: existsSync(join(job.artifactsDir, `${prefix}.started`)), rc: existsSync(join(job.artifactsDir, `${prefix}.rc`))
+                ? readFileSync(join(job.artifactsDir, `${prefix}.rc`), 'utf8').trim() : null };
+              for (const suffix of ['log', 'junit.xml'] as const) {
+                const source = join(job.artifactsDir, `${prefix}.${suffix}`);
+                if (!existsSync(source)) continue;
+                const targetName = `pod-${shard}${branch}.retry-${retryArtifactIndex}.${suffix}`;
+                copyFileSync(source, join(logDir, targetName)); chmodSync(join(logDir, targetName), 0o600);
+                persisted[suffix === 'log' ? 'log' : 'junit'] = targetName;
+              }
+              retryArtifactIndex++;
+              return persisted;
+            });
+          });
+          if (retryEvidence.length) writeFileSync(join(logDir, `pod-${shard}${branch}.retries.json`), JSON.stringify(retryEvidence, null, 2) + '\n', { mode: 0o600 });
+          else rmSync(join(logDir, `pod-${shard}${branch}.retries.json`), { force: true });
+        }
         batchArtifactsComplete = !batchIsolation || parts.every((_, index) =>
           ['rc', 'log', 'junit.xml'].every((suffix) => existsSync(join(job.artifactsDir, `part-${index}.${suffix}`))));
         const stagesPath = join(job.artifactsDir, 'stages.tsv');
@@ -2149,6 +2250,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           }
         }
         stamp('artifactsRead');
+        shardLoadFlaky = read.loadFlaky ?? [];
+        shardLoadFlakyAttemptedFiles = read.loadFlakyAttemptedFiles ?? [];
         ({ output, junit, rc, timedOut, finished, unfinishedLog, exitCodeOnly } = read);
         // A stall counts only when the Job also left no verdict (a failed stop can let a late shard finish after all).
         const stalledAt = watch?.stalled();
@@ -2201,6 +2304,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         if (unfinishedLog !== undefined) writeFileSync(unfinishedDestination, unfinishedLog, { mode: 0o600 });
         else rmSync(unfinishedDestination, { force: true });
         writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ completed: true, jobName: jobNameForCapture, durationMs, rc: rc ?? null,
+          ...(shardLoadFlakyAttemptedFiles.length ? { samePodRetryFiles: shardLoadFlakyAttemptedFiles } : {}),
+          ...(shardLoadFlaky.length ? { loadFlaky: shardLoadFlaky } : {}),
           ...(stall ? { reason: 'stall', finishedFiles: 0, stallSeconds: stall.seconds, sinceCheckoutMs: stall.sinceCheckoutMs } : timedOut ? { reason: 'timeout', finishedFiles: finished.length } : {}), files: paths, plannedSeconds: estimated(paths), deadlineSeconds: shardDeadline, shardCount: shards.length, sweepId, commit, runKey, attemptId, ...(parentAttempt ? { parentAttempt } : {}), jobExitCode: jobExitCode ?? null, jobFailed, ...(placedOn ? { host: placedOn } : {}),
           ...(Object.keys(phaseTimes).length ? { phaseTimes } : {}), ...(podStages ? { podStages } : {}),
           ...(podLifecycle && Object.keys(podLifecycle).length ? { podLifecycle } : {}),
@@ -2448,7 +2553,9 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       if (reused) debug.log('release-loop.gate', 'pod-shard-resumed', { shard, branch, files: paths.length, rc, durationMs: reused.durationMs ?? null });
       return { runs: [{ output: clean!, rc: rc!, pass: passes, fail: fails,
         errors: Number.isNaN(errors) ? 0 : errors,
-        ran: Number(ran![1]), files: Number(ran![2]), passedIds: junit ? junitPassedIds(junit) : [] }], stalled: [] };
+        ran: Number(ran![1]), files: Number(ran![2]), passedIds: junit ? junitPassedIds(junit) : [],
+        ...(shardLoadFlaky.length ? { loadFlaky: shardLoadFlaky } : {}),
+        ...(shardLoadFlakyAttemptedFiles.length ? { loadFlakyAttemptedFiles: shardLoadFlakyAttemptedFiles } : {}) }], stalled: [] };
     };
     const runShard = async (...args: Parameters<typeof runShardImpl>): ReturnType<typeof runShardImpl> => {
       const [paths, shard, depth = 0, branch = '', , , parentAttempt, hostRetries = 0] = args;
@@ -2618,6 +2725,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     return { rc: total.fail + total.errors ? 1 : 0, output: outputs.join('\n') + `\n${total.pass} pass\n${total.fail} fail\n${total.errors} errors\nRan ${total.ran} tests across ${total.files} files.\n`, validatedShards: true,
       podSweep: { id: sweepId, shards: shards.length, files: assignable },
       passedIds: [...new Set(measured.flatMap((run) => run.passedIds))].sort(),
+      ...(measured.some((run) => run.loadFlaky?.length)
+        ? { loadFlaky: [...new Set(measured.flatMap((run) => run.loadFlaky ?? []))].sort() } : {}),
+      ...(measured.some((run) => run.loadFlakyAttemptedFiles?.length)
+        ? { loadFlakyAttemptedFiles: [...new Set(measured.flatMap((run) => run.loadFlakyAttemptedFiles ?? []))].sort() } : {}),
       stalledEnv: stalledShards.flatMap((item) => item.files.map((file) => ({ file, reason: 'no-output' as const }))),
       ...(abortedShards ? { abortedShards } : {}),
       ...(riskLane ? { riskLane } : {}) };
@@ -3248,7 +3359,45 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       debug.log('release-loop.gate', 'pod-shard-stalled-env', { files: stalled.map(({ file, reason }) => ({ file, reason })), local });
       return measured;
     };
-    const measuredCut = cutRun ? await localStalled(cutRun, cutTree, opts.commit, 'cut') : { failures: [], errors: [] };
+    let measuredCut: SweepFailures;
+    try {
+      measuredCut = cutRun ? await localStalled(cutRun, cutTree, opts.commit, 'cut') : { failures: [], errors: [] };
+    } catch (error) {
+      if (!(error instanceof GateFailureAttributionMismatch) || error.label !== 'cut sweep') throw error;
+      const targetFiles = [...new Set(error.failures.map(fileOf))].sort();
+      const attribution = { summary: error.summary, observed: error.observed, identified: error.identified,
+        collapsed: error.collapsed, targetFiles,
+        baselineResult: 'failed' as 'completed' | 'failed' | 'timeout' };
+      result.attributionRecheck = attribution;
+      debug.log('release-loop.gate', 'failure-attribution-baseline-recheck', { ...attribution, phase: 'started' });
+      try {
+        if (!targetFiles.length || targetFiles.length > GATE_ATTRIBUTION_RECHECK_FILE_LIMIT)
+          throw new Error(`baseline recheck target count ${targetFiles.length} outside safe bound 1..${GATE_ATTRIBUTION_RECHECK_FILE_LIMIT}`);
+        if (!work) throw new Error('gate workspace missing before baseline attribution recheck');
+        const recheckTree = join(work, 'baseline-attribution-recheck');
+        trees.push(recheckTree);
+        const baseShaForRecheck = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);
+        await runner.add(recheckTree, baseShaForRecheck);
+        for (const dir of [recheckTree, join(recheckTree, 'apps/pwa')])
+          check(await runner.command('bun', ['install'], dir), `bun install ${dir}`);
+        const rechecked = await runner.sweep(recheckTree,
+          join(root, 'release', opts.version, 'gate-logs', 'baseline-attribution-recheck'),
+          opts.pod ? { ...opts.pod, durationSource } : undefined,
+          targetFiles);
+        if (rechecked.timedOut || rechecked.abortedShards || rechecked.stalledEnv?.length) {
+          attribution.baselineResult = 'timeout';
+          throw new Error('baseline sweep timed out or stalled');
+        }
+        failuresOf(rechecked, 'baseline attribution recheck');
+        attribution.baselineResult = 'completed';
+      } catch (recheckError) {
+        debug.log('release-loop.gate', 'failure-attribution-baseline-recheck', { ...attribution, phase: 'failed', error: String(recheckError) });
+        throw new Error(`baseline recheck ${attribution.baselineResult}; cut attribution unresolved (summary=${attribution.summary}, identified=${attribution.identified})`);
+      }
+      debug.log('release-loop.gate', 'failure-attribution-baseline-recheck', { ...attribution, phase: 'completed',
+        disposition: 'cut names remain unresolved; baseline success cannot identify unnamed cut failures; fail closed' });
+      throw new Error(`baseline recheck completed; cut attribution still unresolved (summary=${attribution.summary}, identified=${attribution.identified})`);
+    }
     // A between-tests error proves only that the shared process failed. Re-run each affected file by itself using the
     // same isolated path as ordinary new-failure rechecks, even when the error was present in the baseline ledger.
     // Replace that file's shard observations with its isolated observations before the existing regression comparison.
@@ -3289,6 +3438,21 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       }
     }
     const cut = partial ? mergePartialFailures(partial, measuredCut) : measuredCut;
+    const samePodFlaky = [...new Set(cutRun?.loadFlaky ?? [])].sort();
+    if (samePodFlaky.length) {
+      const flaky = new Set(samePodFlaky);
+      cut.failures = cut.failures.filter((id) => !flaky.has(id));
+      cut.errors = cut.errors.filter((id) => !flaky.has(id));
+      result.loadFlaky = [...new Set([...(result.loadFlaky ?? []), ...samePodFlaky])].sort();
+      debug.log('release-loop.gate', 'same-pod-load-flaky', { ids: samePodFlaky, files: [...new Set(samePodFlaky.map(fileOf))].sort() });
+      try {
+        const path = loadFlakyCensusPath(ledger);
+        mkdirSync(dirname(path), { recursive: true });
+        const at = new Date().toISOString();
+        appendFileSync(path, samePodFlaky.map((id) => JSON.stringify({ at, version: opts.version, commit: opts.commit, id,
+          host: opts.pod ? `pod:${opts.pod.pool}` : opts.remote ?? 'local', retry: 'same-pod-standalone' }) + '\n').join(''), { mode: 0o600 });
+      } catch (error) { debug.log('release-loop.gate', 'load-flaky-census-write-failed', { ids: samePodFlaky, error: String(error) }); }
+    }
     if (partial) result.partial = { priorCommit: partial.priorCommit, files: partial.files.length };
     cutFailures = cut;
     const baseSha = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);
@@ -3432,7 +3596,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       // per-test limit, on the same runner (node-b when the gate is remote). Passing there = flaky under load (warning);
       // an assertion failure, a failure again, or a run that cannot be read stays introduced.
       const timedOut = cutCheck === undefined ? new Set<string>() : new Set(parseTimedOutFailures(stripPodRepoRoot(cutCheck.output)));
-      const shaped = candidates.filter((id) => timedOut.has(id) && isolatedCut.failures.includes(id));
+      const samePodRetried = new Set(cutRun?.loadFlakyAttemptedFiles ?? []);
+      const shaped = candidates.filter((id) => timedOut.has(id) && isolatedCut.failures.includes(id) && !samePodRetried.has(fileOf(id)));
       if (shaped.length) {
         const relaxed = opts.pod && runner.recheckPod
           ? await runner.recheckPod(file, opts.commit, { ...opts.pod, warmCutSha: opts.commit, warmBaselineSha: baseSha,
@@ -3651,11 +3816,13 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       ...(result.interferenceErrors?.length ? { interferenceErrors: [...result.interferenceErrors].sort() } : {}),
     };
     const observed = { ...(result.selectionMs !== undefined ? { selectionMs: result.selectionMs } : {}),
-      ...(result.warmShadow?.length ? { warmShadow: result.warmShadow } : {}) };
+      ...(result.warmShadow?.length ? { warmShadow: result.warmShadow } : {}),
+      ...(result.attributionRecheck ? { attributionRecheck: result.attributionRecheck } : {}) };
     // Receipt is advisory for a later radius gate. Missing identity makes reuse invalid, never this gate's verdict.
     const baselineReceipt = gateBaselineReceipt({ root, version: opts.version, commit: opts.commit,
       graphPins: gateGraphPins(root, opts.graphRunId) ?? (opts.rehearsalBaseline ? gateSourcePins(repo, opts.commit) : null),
       envFingerprint: gateEnvFingerprint(process.env),
+      ...(result.attributionRecheck ? { attributionRecheck: result.attributionRecheck } : {}),
       fullSweep: result.outcome === 'ok' && cutSweepUsable && !result.partial && !!cutFailures
         && !result.rcNonzeroNoFailures.length && !result.stalledShards?.length && !result.stalledEnv.length
         && !result.unmeasuredRecheckFiles?.length && !result.unmeasuredErrors?.length });
@@ -3736,7 +3903,7 @@ export function graphGateResult(result: GateResult, graph: boolean) {
     summary: (result.partial ? `부분 재검 ${result.partial.files}파일(앞 게이트 ${result.partial.priorCommit.slice(0, 9)} 결과 이음) · ` : '')
       + (result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed ?? '못 셈(기준선 미루기)'}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}`) + ` · 환경 알려진 실패 ${result.knownEnv}`
       + (result.rcNonzeroNoFailures.length ? ` · ⚠ 종료코드만 비영 ${result.rcNonzeroNoFailures.length}` : '')
-      + (result.loadFlaky?.length ? ` · ⚠ 부하 흔들림 ${result.loadFlaky.length}(시간 초과 꼴 · ${GATE_TIMEOUT_RECHECK_MS / 1000}s 재실행 통과 · 막지 않음)` : '')
+      + (result.loadFlaky?.length ? ` · ⚠ 부하 흔들림 ${result.loadFlaky.length}(독립 재실행 통과 · 막지 않음)` : '')
       + (result.stalledEnv.length ? ` · 환경 멈춤 ${result.stalledEnv.length} (Pod 밖 통과 ${result.stalledEnv.filter((item) => item.local === 'passed').length})` : '')
       + (result.abortedShards ? ` · 중단 조각 ${result.abortedShards}(중간 매달림 · 시험만 끊고 재확인)` : '') };
 }
@@ -3889,10 +4056,13 @@ export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOption
 /** The node's run: judge, emit the graph result line, and return the process exit code (ok 0 · regression 1 · else 2).
  *  `runner` is a seam for tests; the process entry passes none. */
 export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner?: GateRunner,
-  judge: (opts: GateOptions, runner?: GateRunner) => Promise<GateResult> = judgeGate): Promise<number> {
+  judge: (opts: GateOptions, runner?: GateRunner, imageProbe?: typeof preflightGateImageDigest) => Promise<GateResult> = judgeGate,
+  imageProbe: typeof preflightGateImageDigest = preflightGateImageDigest): Promise<number> {
   const start = Date.now();
   let result: GateResult;
   let version = '';
+  let graphRunId: string | null = null;
+  let autohealStoreRoot = '';
   let placement: { executor: string | null; host: string | null } | undefined;
   try {
     const parsed = parseOptions(argv, env);
@@ -3911,8 +4081,10 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
       return 0;
     }
     version = opts.version;
+    autohealStoreRoot = opts.ledgerRoot ?? releaseLedgerRoot();
     // The graph's existing gate-node execution path delegates verdict classification and persistence here.
     const context = usesGraphContext(argv, env) ? readGraphContext(env) : undefined;
+    graphRunId = context?.runId ?? null;
     // Let the gate's existing SSH host validation report an invalid host before any reservation is published.
     const hosts = opts.remote && !/^(?:[\w.-]+@)?[\w.-]+$/.test(opts.remote) ? [] : reservedGateHosts(opts);
     const reservationRoot = context ? gateHostReservationRoot() : undefined;
@@ -3920,11 +4092,27 @@ export async function runGateNode(argv: string[], env: NodeJS.ProcessEnv, runner
       throw new Error('release gate host reservation requires graph runId and pinned state root');
     const releaseHosts = context && hosts.length
       ? reserveReleaseGateHosts(reservationRoot!, context.runId!, hosts) : () => undefined;
-    try { result = await judge(context?.runId ? { ...opts, graphRunId: context.runId } : opts, runner); }
+    try { result = await judge(context?.runId ? { ...opts, graphRunId: context.runId } : opts, runner, imageProbe); }
     finally { releaseHosts(); }
   } catch (error) {
     result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: Date.now() - start, error: String(error) };
     placement ??= requestedGateExecutor(argv, env);
+  }
+  if (versionPattern.test(version) && result.stalledShards?.length) {
+    result.autoheals = result.stalledShards.map((shard, index) => {
+      const shardKey = `pod-${shard.shard}`;
+      const signature = createHash('sha256').update(JSON.stringify({ shard: shard.shard,
+        files: [...shard.files].sort(), reason: shard.reason })).digest('hex');
+      const cause = gateAutohealCause({ outcome: result.outcome, introduced: result.introduced, durationMs: result.durationMs,
+        error: result.error, stalledShards: [shard], interferenceErrors: result.interferenceErrors, loadFlaky: result.loadFlaky }) ?? 'environment';
+      const decision = decideAndRecordGateAutoheal({ cause, signature, version, runId: graphRunId ?? 'direct', shardKey,
+        shardKeys: [shardKey], shardElapsedMs: result.durationMs,
+        overallElapsedMs: index === 0 ? result.durationMs : 0,
+        storeRoot: autohealStoreRoot || releaseLedgerRoot() });
+      debug.log('release-loop.gate-autoheal', 'decision', { runId: graphRunId, version, ...decision });
+      return decision;
+    });
+    result.autoheal = result.autoheals.find((decision) => decision.action === 'hitl') ?? result.autoheals[0];
   }
   if (result.error) console.error(result.error);
   debug.log('release-loop.gate', 'result', { version, outcome: result.outcome, ...(placement ?? {}) });

@@ -5,7 +5,9 @@ loop:
   title: 릴리스
   description: 승인된 판을 빌드·검증·게시한다
   trigger:
-    events: [manual]
+    events: [manual, release.cut.due]
+triggers:
+  schedule: { type: cron, cron: '* * * * *' }
 version: 1
 entry_node: version-release
 dry_run_await_approval: true

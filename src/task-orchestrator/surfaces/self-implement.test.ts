@@ -9,11 +9,30 @@ import {
   createSelfImplementAdapter,
   defaultSelfImplementSpawn,
   parseSelfImplementJson,
+  podChildEvidenceFromResult,
   resolveSpawnElanousBin,
   type SelfImplementJobSpawn,
   type SelfImplementJobDone,
   reportUnmappedDispositionFields,
 } from './self-implement.js';
+
+test('failed child detail tail is capped and redacted independently of the leading summary', () => {
+  const secret = `OPENROUTER_API_KEY=sk-${'a'.repeat(32)}`;
+  let detail = '';
+  for (let count = 1_366; ; count++) {
+    detail = `${'한'.repeat(count)}\n${secret}\nfinal diagnostic`;
+    const bytes = Buffer.from(detail, 'utf8');
+    if ((bytes[bytes.length - 4_096]! & 0xc0) === 0x80) break;
+  }
+  const bytes = Buffer.from(detail, 'utf8');
+  expect((bytes[bytes.length - 4_096]! & 0xc0) === 0x80).toBe(true); // cap starts inside a 3-byte code point
+  const evidence = podChildEvidenceFromResult({ ok: false, detail });
+  expect(Buffer.byteLength(evidence?.detailTail ?? '', 'utf8')).toBeLessThanOrEqual(4_096);
+  expect(evidence?.detailTail?.startsWith('한')).toBe(true);
+  expect(evidence?.detailTail).not.toContain('�');
+  expect(evidence?.detailTail?.endsWith('final diagnostic')).toBe(true);
+  expect(evidence?.detailTail).not.toContain(secret);
+});
 
 function makeTask(feature = 'add a helper', extra: Record<string, unknown> = {}): Task {
   return createTask({
@@ -100,8 +119,9 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
     expect(parseSelfImplementJson(JSON.stringify(child))?.childEvidence).toMatchObject({ classification: 'implementation-deficit' });
     expect(parseSelfImplementJson(JSON.stringify(child))?.childEvidence).not.toHaveProperty('scopeEscape');
     const parsed = parseSelfImplementJson(JSON.stringify({ ...child, scopeStopReasons: ['deletion'] }));
-    expect(parsed?.childEvidence).toEqual({ classification: 'scope-escape', scopeEscape: true, scopeStopReasons: ['deletion'], abandonedClassification,
+    expect(parsed?.childEvidence).toEqual({ classification: 'scope-escape', classificationBasis: 'no-clean-worktree', scopeEscape: true, scopeStopReasons: ['deletion'], abandonedClassification,
       detail: 'Out-of-scope edits held in the worktree; gate and publication skipped.',
+      detailTail: 'Out-of-scope edits held in the worktree; gate and publication skipped.',
       supervisorVerdict: 'UNCONVERGEABLE', goalCauseObserved: true,
       terminationReason: 'goal-only-rework-exhausted', accountAvailability });
     expect(parsed?.failureClassification).toBe('implementation-deficit');

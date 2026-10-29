@@ -60,6 +60,18 @@ test('post reads piped stdin, accepts literal body and kind; human and JSON outp
   expect(JSON.parse(f.stdout[0]!).body).toBe('from flag');
 });
 
+test('msg mirror with no configured target or pointer fails closed before opening the ledger or GitHub transport', async () => {
+  const f = fixture('', () => ({
+    mirrorTarget: null,
+    mirrorState: { read: () => null, write: () => { throw new Error('disabled mirror must not write state'); } },
+    mirrorTransport: {} as NonNullable<MsgCliDeps['mirrorTransport']>,
+  }));
+  await f.run('mirror', '--dry-run', '--json');
+  expect(f.stdout).toEqual(['{"status":"disabled","reason":"msgMirror.target is not configured","target":null}']);
+  expect(f.stderr).toEqual([]);
+  expect(existsSync(f.path)).toBe(false);
+});
+
 test('post warns for recipients without a reply body and leaves loop aliases invalid', async () => {
   const f = fixture();
   for (const recipient of ['GUARDIAN', 'ORCHESTRATOR', 'STEWARD']) {

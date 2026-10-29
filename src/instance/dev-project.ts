@@ -3,10 +3,14 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { appendBoundaryResponseLine, HARNESS_BOUNDARY_RESPONSES_ENV } from '../harness/harness-space.js';
+import { anonymousExport, suggestProjectForFolder } from '../project/project-store.js';
 
 export interface DevProjectDeps {
   git?: (dir: string, args: readonly string[]) => string | null;
   stateDir?: string;
+  /** TENANT-BOUNDARY (0.2.41): 회신 mailbox 경계 채널용 env — 생산은 process.env 기본값. */
+  env?: Record<string, string | undefined>;
 }
 
 interface DevProjectRegistry {
@@ -60,7 +64,28 @@ export function resolveDevProject(dir: string, deps: DevProjectDeps = {}): strin
   try {
     writeJsonAtomically(join(root, '.elanous', 'project.json'), { identityKey, devProject: id } satisfies DevProjectCache);
   } catch { /* cache only */ }
+
+  exportTenantBoundaryRecord(root, id, deps.env ?? process.env);
   return id;
+}
+
+/**
+ * TENANT-BOUNDARY (0.2.41 · nfr:security): 고객 원장의 설치 밖 출구는 익명 내보내기 하나다.
+ * 경계 회신 mailbox(HARNESS_BOUNDARY_RESPONSES_ENV)가 열려 있을 때만, 고객 프로젝트 원장을
+ * `anonymousExport`(식별 필드 → 토큰)로 바꿔 한 줄(JSONL)로 남긴다. 원장 식별 원문은 절대
+ * 설치 밖으로 나가지 않는다. 채널이 없으면 아무 일도 일어나지 않고(기본 동작 보존),
+ * 채널 쓰기가 실패해도 id 해소를 막지 않는다(fail-open).
+ */
+function exportTenantBoundaryRecord(root: string, devProject: string, env: Record<string, string | undefined>): void {
+  const mailbox = env[HARNESS_BOUNDARY_RESPONSES_ENV]?.trim();
+  if (!mailbox) return;
+  try {
+    const project = suggestProjectForFolder(root);
+    appendBoundaryResponseLine(env as NodeJS.ProcessEnv, {
+      devProject,
+      ...(project ? { project: anonymousExport(project) } : {}),
+    });
+  } catch { /* boundary export must never block id resolution */ }
 }
 
 function runGit(dir: string, args: readonly string[]): string | null {

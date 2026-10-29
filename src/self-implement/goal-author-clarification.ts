@@ -84,7 +84,7 @@ export interface GoalAuthorSelfResolutionContext {
 
 export type GoalAuthorSelfResolution =
   | { answer: string; evidence: readonly string[]; assumption?: string; declined?: undefined }
-  | { answer?: undefined; evidence?: undefined; declined?: boolean };
+  | { answer?: undefined; evidence?: undefined; declined?: boolean; failed?: boolean };
 
 export interface GoalAuthorClarificationResolutionDeps {
   /** Elanousic authoring seam; it must return no answer when the available evidence is insufficient. */
@@ -227,7 +227,7 @@ export async function defaultGoalAuthorSelfResolve(
       parsed = JSON.parse(result);
     } catch {
       observeSelfResolve('self-resolve-parse-failed', context, startedAt, { usage: deriveUsage(usages) });
-      return {};
+      return { failed: true };
     }
     const answer = parsed !== null && typeof parsed === 'object'
       ? (parsed as { answer?: unknown }).answer
@@ -256,7 +256,7 @@ export async function defaultGoalAuthorSelfResolve(
       startedAt,
       { usage: deriveUsage(usages) },
     );
-    return {};
+    return { failed: true };
   } finally {
     clearTimeout(timeout);
   }
@@ -530,7 +530,7 @@ export function goalClarificationDecisionCategory(
   const text = [clarification.header, clarification.question, ...clarification.options.flatMap((option) => [option.label, option.description])]
     .join(' ')
     .toLocaleLowerCase();
-  if (/\b(payment|purchase|spend|budget|credit|charge|price|cost|paid)\b|결제|구매|지출|예산|크레딧|과금|가격|비용/.test(text)) return 'money';
+  if (/\b(payment|purchase|spend|budget|credit|charge|price|cost|paid|refund|reimburse(?:ment)?|chargeback|transfer|wire(?:\s+transfer)?|withdraw(?:al)?|deposit|invoice|subscribe|subscription|renewal)\b|결제|구매|지출|예산|크레딧|과금|가격|비용|환불|환급|송금|이체|구독|정기결제/.test(text)) return 'money';
   if (/\b(security|credential|token|secret|password|authorization|authentication|permission|access control)\b|보안|자격 증명|토큰|비밀키|비밀번호|인가|인증|권한/.test(text)) return 'security';
   if (/\b(publish|publication|deploy|send|delete|release|irreversible|external side effect|production)\b|발행|게시|배포|전송|삭제|릴리스|되돌릴 수 없|외부 효과|운영 환경/.test(text)) return 'irreversible';
   return undefined;
@@ -827,7 +827,7 @@ export async function selfAnswerGoalDocumentClarifications(
     runId?: string;
     skipQuestionIds?: ReadonlySet<string>;
   },
-): Promise<{ document: string; asked: number; answered: number; unanswered: number; newlyAnswered: number }> {
+): Promise<{ document: string; asked: number; answered: number; unanswered: number; newlyAnswered: number; resolverFailedQuestionIds: string[] }> {
   const clarifications = parseGoalDocumentClarifications(document);
   const pending = clarifications.filter((item) => !item.answered);
   // The first say pass may already have self-answered some questions while authoring: count those,
@@ -837,6 +837,7 @@ export async function selfAnswerGoalDocumentClarifications(
     : 0;
   let updated = document;
   let answered = 0;
+  const resolverFailedQuestionIds: string[] = [];
   const evidence = options.evidence ?? document.split(/\r?\n/)
     .filter((line) => /^(?:\s*- (?:\[code:|\[document:|TRACED PATHS|evidence:|Evidence:)|\s*-?\s*`?(?:src|test|scripts)\/[^\s`]+:\d+)/i.test(line))
     .slice(0, 40);
@@ -844,6 +845,8 @@ export async function selfAnswerGoalDocumentClarifications(
     if (parseGoalDocumentClarifications(updated).filter((entry) => entry.questionId === item.questionId).length !== 1) continue;
     let response: Awaited<ReturnType<typeof resolveGoalAuthorClarification>>;
     let declined = false;
+    let resolverFailed = false;
+    const baseResolver = options.resolver ?? defaultGoalAuthorSelfResolve;
     try { response = await resolveGoalAuthorClarification({
       questionId: item.questionId,
       kind: 'scope',
@@ -853,17 +856,25 @@ export async function selfAnswerGoalDocumentClarifications(
       blocking: false,
     }, {
       selfResolve: async (context) => {
-        const resolution = await (options.resolver ?? defaultGoalAuthorSelfResolve)(context);
-        declined = resolution.declined === true;
-        return resolution;
+        try {
+          const resolution = await baseResolver(context);
+          declined = resolution.declined === true;
+          resolverFailed = 'failed' in resolution && resolution.failed === true;
+          return resolution;
+        } catch (error) {
+          resolverFailed = true;
+          throw error;
+        }
       },
       evidence,
       ask: options.ask,
       selfResolutionSelected: true,
     }); } catch {
       // A resolver failure leaves this question unanswered; the remaining questions are still attempted.
+      resolverFailedQuestionIds.push(item.questionId);
       continue;
     }
+    if (resolverFailed) resolverFailedQuestionIds.push(item.questionId);
     let defaultExportCount: number | undefined;
     if (response.answer === null && item.questionId === 'preservation_contract'
       && declined) {
@@ -916,7 +927,7 @@ export async function selfAnswerGoalDocumentClarifications(
     path: options.path, asked, answered, unanswered,
     reason: unanswered === 0 ? 'answered' : 'insufficient-evidence',
   });
-  return { document: updated, asked, answered, unanswered, newlyAnswered };
+  return { document: updated, asked, answered, unanswered, newlyAnswered, resolverFailedQuestionIds };
 }
 
 /** SelfImplement boundary: resolve pending questions itself and record a bounded policy assumption if that fails.
@@ -940,15 +951,23 @@ export async function selfAnswerOrAssumeGoalDocumentClarifications(
   const decisionRequired: Array<{ questionId: string; header: string; question: string; category: GoalClarificationDecisionCategory }> =
     safetyQuestions.map(({ entry, category }) => ({ questionId: entry.questionId, header: entry.header, question: entry.question, category }));
   for (const item of parseGoalDocumentClarifications(updated).filter((entry) => !entry.answered)) {
+    if (attempted.resolverFailedQuestionIds.includes(item.questionId)) continue;
     const category = goalClarificationDecisionCategory(item);
     if (category) continue;
     const offered = item.options.filter((option) => option.label.trim() && !/[\r\n]/.test(option.label));
-    const useOfferedOption = !item.includeOther && offered.length > 0;
+    const requestText = (options.ask ?? '').toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+    const inScopeOptions = item.includeOther ? [] : offered.filter((option) =>
+      [option.label, option.description ?? ''].some((candidate) => {
+        const normalized = candidate.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+        return normalized.length >= 4 && requestText.includes(normalized);
+      }));
+    if (!item.includeOther && inScopeOptions.length !== 1) continue;
+    const useOfferedOption = !item.includeOther;
     const answer = useOfferedOption
-      ? offered[0]!.label.trim()
+      ? inScopeOptions[0]!.label.trim()
       : '근거가 부족하므로 요청에 명시된 범위만 진행한다고 가정한다';
     const assumption = useOfferedOption
-      ? '자가 해소가 답을 내지 못해 자유 답변 없이 제시된 첫 후보를 정책 가정으로 선택했다'
+      ? '요청 원문에 명시된 후보만 허용되어 그 후보를 정책 가정으로 선택했다'
       : '자가 해소가 답을 내지 못해 추가 범위를 만들지 않고 요청에 명시된 범위만 진행한다고 가정했다';
     try {
       const current = findUnansweredGoalDocumentClarification(updated, item.questionId);

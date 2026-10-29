@@ -4,6 +4,9 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { resolveDevProject, type DevProjectDeps } from './dev-project.js';
+import { createProject } from '../project/project-store.js';
+import { HARNESS_BOUNDARY_RESPONSES_ENV } from '../harness/harness-space.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 
 const temporaryRoots: string[] = [];
 
@@ -152,6 +155,41 @@ describe('resolveDevProject', () => {
       expect(resolveDevProject(readOnlyRoot, { git, stateDir })).toMatch(/^prj-/);
     } finally {
       chmodSync(readOnlyRoot, 0o700);
+    }
+  });
+
+  test('TENANT-BOUNDARY: 경계 채널이 열리면 resolveDevProject 는 익명 내보내기만 회신 mailbox 에 남긴다', () => {
+    const base = makeTempRoot();
+    const root = join(base, 'repository');
+    const stateDir = join(base, 'state');
+    const configRoot = join(base, 'config');
+    const responses = join(base, 'boundary', 'responses.jsonl');
+    setElanousConfigDir(configRoot);
+    try {
+      const git: NonNullable<DevProjectDeps['git']> = (_dir, args) => {
+        if (args[0] === 'rev-parse') return `${resolve(root)}\n`;
+        if (args[0] === 'rev-list') return '0123456789abcdef\n';
+        if (args[0] === 'remote') return 'https://github.com/Acme/SecretRepo.git\n';
+        return null;
+      };
+      const created = createProject({ name: 'Acme Secret', primaryFolder: resolve(root) });
+      const id = resolveDevProject(root, { git, stateDir, env: { [HARNESS_BOUNDARY_RESPONSES_ENV]: responses } });
+      const lines = readFileSync(responses, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+      expect(lines).toHaveLength(1);
+      const payload = lines[0];
+      expect(payload.devProject).toBe(id);
+      expect(payload.project.id).toBe(created.id);
+      expect(payload.project.name).toMatch(/^project-[0-9a-f]{16}$/);
+      expect(payload.project.primaryFolder).toMatch(/^folder-[0-9a-f]{16}$/);
+      expect(JSON.stringify(payload)).not.toContain('Acme Secret');
+      expect(JSON.stringify(payload)).not.toContain('SecretRepo');
+      expect(JSON.stringify(payload)).not.toContain(resolve(root));
+
+      // 경계 채널이 없으면 아무 파일도 생기지 않는다(fail-open · 기본 동작 보존)
+      resolveDevProject(join(base, 'other'), { git, stateDir });
+      expect(existsSync(join(base, 'boundary-quiet'))).toBe(false);
+    } finally {
+      resetElanousConfigDir();
     }
   });
 });

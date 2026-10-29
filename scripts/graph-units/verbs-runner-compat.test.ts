@@ -139,7 +139,7 @@ test('research-report permits a second verify visit after the first verify exits
   roots.push(root);
   const units = join(root, 'units');
   mkdirSync(units, { recursive: true });
-  for (const unit of ['make-doc', 'verify']) {
+  for (const unit of ['research', 'make-doc', 'verify']) {
     writeFileSync(join(units, `verb-${unit}.yaml`), readFileSync(new URL(`../../graphs/units/verbs/${unit}.yaml`, import.meta.url), 'utf8'));
   }
   writeFileSync(join(units, 'recipes.yaml'), readFileSync(new URL('../../graphs/units/verbs/recipes.yaml', import.meta.url), 'utf8'));
@@ -167,6 +167,7 @@ test('research-report permits a second verify visit after the first verify exits
           reviewCalls += 1;
           return { stdout: JSON.stringify({ outcome: 'pass', verdict: 'pass', reviewed: true, 'must-fix': [], 'review-summary': 'clean' }), stderr: '', exitCode: 0 };
         }
+        if (body.startsWith('bun scripts/graph-units/verbs/research.ts')) return { stdout: JSON.stringify({ outcome: 'done', result: { result: { title: 'Write a short research report.', collectedAt: '2026-10-29T00:00:00Z', facts: ['source notes'], sources: ['https://example.test/source'] }, evidence: { sources: ['https://example.test/source'] } }, evidence: { outcome: 'complete' } }), stderr: '', exitCode: 0 };
         if (body.includes('headless-goal-loop.ts')) {
           if (context.graphId === 'verb-make-doc') return { stdout: JSON.stringify({ outcome: 'done', result: 'draft written', evidence: { 'document-drafts': ['docs/research-report.md'] } }), stderr: '', exitCode: 0 };
           failedReworkCalls += 1;
@@ -179,7 +180,7 @@ test('research-report permits a second verify visit after the first verify exits
   });
 
   expect(run.status).toBe('done');
-  expect(run.path).toEqual(['make-doc', 'verify', 'make-doc', 'verify', 'done']);
+  expect(run.path).toEqual(['research', 'make-doc', 'verify', 'make-doc', 'verify', 'done']);
   expect(run.unitCalls?.filter((call) => call.unit === 'verb-verify').map((call) => call.exit)).toEqual(['rework', 'done']);
   expect(gateCalls).toBe(2);
   expect(reviewCalls).toBe(1);

@@ -63,6 +63,22 @@ async function run(messages: LLMMessage[], userText?: string): Promise<void> {
 }
 
 describe('runCoreTurn surface input isolation', () => {
+  test('sets the bounded tool-result policy for the TUI/core-turn history path', async () => {
+    let toolResultInlineLimitBytes: number | undefined;
+    spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, _handlers, opts) => {
+      toolResultInlineLimitBytes = opts?.toolResultInlineLimitBytes;
+      return 'done';
+    });
+    await runCoreTurn({
+      sessionId: 'tool-result-inline-limit',
+      messages: [{ role: 'user', content: 'inspect output' }],
+      tools: [tool],
+      dispatchTool: async () => 'large output',
+      signal,
+    });
+    expect(toolResultInlineLimitBytes).toBe(50 * 1024);
+  });
+
   test('forwards transient status callbacks from the stream to the host', async () => {
     const statuses: string[] = [];
     spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (_messages, handlers) => {

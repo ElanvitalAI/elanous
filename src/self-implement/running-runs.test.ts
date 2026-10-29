@@ -82,6 +82,35 @@ test('counts only verified terminated-run launch parents and reports each exclud
   expect(renderRunningRuns(result)).toContain('lingering launch parents: 1 without pid: 1 uncounted: 1 reused pid: 1');
 });
 
+test('queryRunningRuns returns partial ledger rows and skips later observations after its deadline', () => {
+  let ptyRead = false;
+  const result = queryRunningRuns({ timeBudgetMs: 0 }, {
+    queryLedgers: (options) => {
+      expect(options.deadlineAtMs).toBeDefined();
+      return {
+        entries: [ledger('run-partial', 'live', '/state/run-partial', '2026-10-28T00:00:00.000Z')],
+        ledgerDirectories: ['/state'], goalsDirectory: '/goals', unreadableLedgerCount: 0,
+        unreadableLedgerDirectoryCount: 0, missingLedgerDirectoryCount: 0,
+        unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0,
+        reconciledTerminatedElsewhereCount: 0, cacheHits: 0, cacheMisses: 0,
+        scope: 'self-implement-run-ledger-federated', note: 'fixture', timedOut: true, stalledStage: 'ledger-scan',
+      };
+    },
+    ptyTargets: () => [],
+    listPtyRefs: () => { ptyRead = true; return { refs: [], unreadable: [] }; },
+    readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+    loadRun: () => null,
+    isProcessAlive: () => false,
+    processStartedAt: () => null,
+  });
+
+  expect(ptyRead).toBe(false);
+  expect(result.stalled).toEqual({ stage: 'ledger-scan', reason: 'deadline-exceeded' });
+  expect(result.completeness).toBe('partial');
+  expect(result.entries.map((entry) => entry.runId)).toEqual(['run-partial']);
+  expect(result.count).toMatchObject({ count: null, lowerBound: 0 });
+});
+
 test('does not count a second-resolution process start whose interval overlaps the run creation instant', () => {
   const result = assessLingeringLaunchParents(
     [ledger('run-same-second', 'human-stopped')],

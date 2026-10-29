@@ -35,6 +35,7 @@ export interface GateBaselineReceipt {
   imageDigest: string | null;
   files: number;
   shards: number;
+  attributionRecheck?: { summary: number; observed: number; identified: number; baselineResult: string; targetFiles: string[] };
 }
 
 /** A direct hard rehearsal has no graph run state. Pin the graph and recipe bytes at its Git SHA. */
@@ -83,11 +84,17 @@ export function gateGraphPins(root: string, runId: string | undefined): { graphS
 }
 
 export function gateBaselineReceipt(input: { root: string; version: string; commit: string; fullSweep: boolean;
-  graphPins: { graphSha: string; recipeSha: string } | null; envFingerprint: string }): GateBaselineReceipt {
+  graphPins: { graphSha: string; recipeSha: string } | null; envFingerprint: string;
+  attributionRecheck?: { summary: number; observed: number; identified: number; baselineResult: string; targetFiles: string[] } }): GateBaselineReceipt {
   const { root, version, commit, graphPins, envFingerprint } = input;
   const base = { schema: 1 as const, version, commit, graphSha: graphPins?.graphSha ?? null,
     recipeSha: graphPins?.recipeSha ?? null, envFingerprint, imageDigest: null as string | null, files: 0, shards: 0 };
   const invalid = (reason: string): GateBaselineReceipt => ({ ...base, valid: false, reason });
+  if (input.attributionRecheck) {
+    const evidence = input.attributionRecheck;
+    return { ...invalid(`failure attribution unresolved after baseline recheck (${evidence.baselineResult}): summary=${evidence.summary}, observed=${evidence.observed}, identified=${evidence.identified}`),
+      attributionRecheck: { ...evidence, targetFiles: [...evidence.targetFiles].sort() } };
+  }
   if (!input.fullSweep) return invalid('gate was not a complete clean full sweep');
   if (!graphPins) return invalid('pinned graph or recipe SHA absent');
   if (!SHA256.test(envFingerprint)) return invalid('gate environment fingerprint absent');
