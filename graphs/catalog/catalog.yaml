@@ -238,7 +238,7 @@ roles:
   - role: triage
     kind: judge
     grain: atom
-    outcomes: [harness-fixable, untestable, child-fixable, goal-wrong, environment-claimed, needs-deeper-observation, needs-grounding, exhausted]
+    outcomes: [harness-fixable, untestable, child-fixable, goal-wrong, reauthor-from-materialized, environment-claimed, needs-deeper-observation, needs-grounding, exhausted]
     effects: none
     spawn: runtime
     body: { ref: "(신설 · H1)", symbol: "결정론 먼저(gate facts · 미검증 집합 · importer 미실행 · 반복 열쇠 · classify-abandonment) · 모호할 때만 LLM", llm: false }

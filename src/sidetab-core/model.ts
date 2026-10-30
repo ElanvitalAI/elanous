@@ -181,11 +181,13 @@ export const NEXT_SIDETAB_TOOL_NAME = 'NextSidetab';
 const NEXT_SIDETAB_CALL = 'elanous.sidetab.call';
 const NEXT_SIDETAB_RESULT = 'elanous.sidetab.result';
 
-export type NextSidetabAction = 'list' | 'switch' | 'attach' | 'detach' | 'new' | 'kill';
+export type NextSidetabAction = 'list' | 'switch' | 'attach' | 'detach' | 'new' | 'mission' | 'kill';
 export interface NextSidetabRequest {
   action: NextSidetabAction;
   target?: string;
   character?: 'shell' | 'elanous';
+  mission?: string;
+  agent?: 'codex' | 'claude';
   confirm?: boolean;
 }
 export interface NextSidetabCall { type: typeof NEXT_SIDETAB_CALL; callId: string; request: NextSidetabRequest }
@@ -198,6 +200,7 @@ export interface NextSidetabHostDeps {
   attach(row: SidetabRow): Promise<unknown>;
   detach(): unknown;
   spawn(character: 'shell' | 'elanous'): unknown;
+  runMission?(agent: 'codex' | 'claude', mission: string): Promise<unknown>;
   kill(row: SidetabRow): unknown;
 }
 export interface NextSidetabIpcProcess {
@@ -207,13 +210,15 @@ export interface NextSidetabIpcProcess {
 
 export const nextSidetabToolSpec: LLMToolSpec = {
   name: NEXT_SIDETAB_TOOL_NAME,
-  description: 'Control the Next TUI side tab: list/view sessions and PTYs, switch sessions, attach or detach, start a local shell or elanous PTY, or kill a PTY. Ask the user to confirm before calling kill with confirm=true. Starting coding agents is not supported.',
+  description: 'Control the Next TUI side tab: list/view sessions and PTYs, switch sessions, attach or detach, start a local shell or elanous PTY, run a mission in a visible Codex or Claude side-tab and return its verified result file, or kill a PTY. Ask the user to confirm before calling kill with confirm=true.',
   parameters: {
     type: 'object',
     properties: {
-      action: { type: 'string', enum: ['list', 'switch', 'attach', 'detach', 'new', 'kill'] },
+      action: { type: 'string', enum: ['list', 'switch', 'attach', 'detach', 'new', 'mission', 'kill'] },
       target: { type: 'string', description: 'Optional exact or partial row id/label; required for targeted actions.' },
       character: { type: 'string', enum: ['shell', 'elanous'], description: 'Only used with action=new.' },
+      mission: { type: 'string', description: 'Mission text to type visibly into a new Codex or Claude side-tab PTY; the tool appends a result-file path and checks the completion marker.' },
+      agent: { type: 'string', enum: ['codex', 'claude'], description: 'Coding agent for action=mission; defaults to codex.' },
       confirm: { type: 'boolean', description: 'Must be true only after the user explicitly confirmed killing the selected PTY.' },
     },
     required: ['action'],
@@ -236,12 +241,19 @@ export async function answerNextSidetabCall(handler: NextSidetabHandler, call: N
 
 export function createNextSidetabHostHandler(deps: NextSidetabHostDeps): NextSidetabHandler {
   return async (request) => {
-    if (!request || !['list', 'switch', 'attach', 'detach', 'new', 'kill'].includes(request.action)) {
+    if (!request || !['list', 'switch', 'attach', 'detach', 'new', 'mission', 'kill'].includes(request.action)) {
       return { error: '지원하지 않는 사이드탭 동작입니다' };
     }
     if (request.action === 'new') {
       if (request.character !== 'shell' && request.character !== 'elanous') return { error: 'character는 shell 또는 elanous여야 합니다' };
       return deps.spawn(request.character);
+    }
+    if (request.action === 'mission') {
+      const mission = request.mission?.trim();
+      if (!mission) return { error: 'mission 텍스트가 필요합니다' };
+      if (!deps.runMission) return { error: '사이드탭 미션 실행기가 연결되지 않았습니다' };
+      if (request.agent !== undefined && request.agent !== 'codex' && request.agent !== 'claude') return { error: 'agent는 codex 또는 claude여야 합니다' };
+      return deps.runMission(request.agent ?? 'codex', mission);
     }
     if (request.action === 'detach') return deps.detach();
     const rows = await deps.rows();
@@ -265,6 +277,7 @@ export function createReplNextSidetabTool(
   proc: NextSidetabIpcProcess,
   env: NodeJS.ProcessEnv = process.env,
   timeoutMs = 15_000,
+  missionTimeoutMs = 420_000,
 ): { spec: LLMToolSpec; dispatch: (args: Record<string, unknown>) => Promise<unknown> } | null {
   if (env.ELANOUS_NEXT_TUI_SIDETAB_IPC !== '1' || typeof proc.send !== 'function') return null;
   const send = proc.send.bind(proc);
@@ -283,10 +296,11 @@ export function createReplNextSidetabTool(
     spec: nextSidetabToolSpec,
     dispatch: (args) => new Promise((resolve) => {
       const callId = `s${++sequence}`;
+      const callTimeoutMs = args.action === 'mission' ? missionTimeoutMs : timeoutMs;
       const timer = setTimeout(() => {
         if (!waiting.delete(callId)) return;
         resolve({ error: 'Next TUI did not answer the side-tab request' });
-      }, timeoutMs);
+      }, callTimeoutMs);
       waiting.set(callId, (result) => { clearTimeout(timer); resolve(result); });
       try {
         send({ type: NEXT_SIDETAB_CALL, callId, request: args as unknown as NextSidetabRequest } satisfies NextSidetabCall);

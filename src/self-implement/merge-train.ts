@@ -18,6 +18,11 @@ export type TrainObservation = {
 export type TrainGit = (args: readonly string[], repo: string) => { status: number | null; stdout: string; stderr: string };
 export type TangledPair = { first: number; then: number; failures: number };
 
+/**
+ * Same PR-number axis as TrainDeferred.with and planTrain overlap deferrals: normalize each sibling
+ * pair ({5,7}={7,5}), count its conflict-resolution/regate failures, and return only pairs at or
+ * above threshold (default 2) — first = smaller number = lands first, then = re-synced later.
+ */
 export function tangledPairs(
   failures: readonly { pr: number; with: number }[],
   { threshold = 2 }: { threshold?: number } = {},

@@ -110,6 +110,18 @@ describe('dispatchElanousSkillsList · query filter', () => {
     ]);
   });
 
+  test('matches spoken slug variants with spaces or omitted punctuation', async () => {
+    mkdirSync(join(skillsDir, 'kr-flow'));
+    mkdirSync(join(skillsDir, 'omni-crawl'));
+    mkdirSync(join(skillsDir, 'omni-market'));
+    const kr = await dispatchElanousSkillsList({ query: 'krflow' }, { skillsDir });
+    const omni = await dispatchElanousSkillsList({ query: 'omni crawl' }, { skillsDir });
+    const market = await dispatchElanousSkillsList({ query: 'omni market' }, { skillsDir });
+    expect(kr.entries.map((entry) => entry.name)).toEqual(['kr-flow']);
+    expect(omni.entries.map((entry) => entry.name)).toEqual(['omni-crawl']);
+    expect(market.entries.map((entry) => entry.name)).toEqual(['omni-market']);
+  });
+
   test('empty query returns all', async () => {
     const r = await dispatchElanousSkillsList({ query: '' }, { skillsDir });
     expect(r.entries).toHaveLength(3);

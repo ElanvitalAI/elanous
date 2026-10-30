@@ -46,6 +46,11 @@ export type AutohealAction =
   | 'resume-from-salvage'
   | 'derive-evidence-rejudge'
   | 'review-round-reauthor'
+  | 'reauthor-from-materialized'
+  | 'switch-provider'
+  | 'retry-provider'
+  | 'wait-release'
+  | 'remeasure-gate'
   | 'needs-owner';
 
 /** 닫힌 목록 전체를 덮는다 — 새 class 가 생기면 여기서 타입 오류가 난다. */
@@ -64,11 +69,19 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
   'launch-failed': 'needs-owner',
   'gate-failed': 'needs-owner',
   unclassified: 'needs-owner',
+  'implement-aborted': 'reauthor-from-materialized',
+  'out-of-scope-held': 'reauthor-from-materialized',
+  'provider-auth-missing': 'switch-provider',
+  'provider-unavailable': 'retry-provider',
+  'merge-held-release-path': 'wait-release',
+  'pr-guard-failed': 'reauthor-from-materialized',
+  'gate-unmeasured': 'remeasure-gate',
 };
 
 /** 처방 노드 id 로 인정하는 이름 — 오버레이가 더한 노드 중 이 넷만 처방으로 읽는다. */
 const HEAL_ACTION_NODE_IDS: ReadonlySet<string> = new Set<Exclude<AutohealAction, 'needs-owner'>>([
   'clean-workspace-regate', 'rebase-regate', 'resume-from-salvage', 'derive-evidence-rejudge', 'review-round-reauthor',
+  'reauthor-from-materialized', 'switch-provider', 'retry-provider', 'wait-release', 'remeasure-gate',
 ]);
 
 /** 처방이 «어디서» 왔나 — `graph` = 그 갈래에 얹힌 오버레이가 더한 노드 · `code-default` = 위 표. */

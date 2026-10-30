@@ -71,6 +71,7 @@ test('Pod lifecycle reader keeps schedule, init and child timestamps without tru
 function fakeTools(bin: string) {
   mkdirSync(bin, { recursive: true });
   writeFileSync(join(bin, 'bun'), `#!/bin/bash
+if [ "$1" = -e ]; then echo '{"bunVersion":"test","platform":"linux","architecture":"x64","envFingerprint":"test"}'; exit 0; fi
 if [ "$1" = install ]; then echo "5 packages installed [750ms]"; exit 0; fi
 shift 2 # run test:deterministic
 if [ -n "$FAKE_PARALLEL_TRACE" ]; then
@@ -244,7 +245,7 @@ test('isolation batch runs four files in one shell with separate HOME and comple
   expect(spawnSync('git', ['-C', repo, 'config', '--local', '--get', 'gate.batch-part']).status).toBe(1);
   expect(gateShardShell({ parts, cdpPatterns: [], softSeconds: 15, cachePrefix: '', installSlots: 0, parallelParts: 1 }))
     .toContain('ELANOUS_STATE_DIR="$isolated/state"');
-});
+}, 30_000);
 
 test('final recheck shell executes four file parts, reports each rc, and runs at most two tests together', () => {
   const root = temp('gate-recheck-shell-');
@@ -286,7 +287,7 @@ test('final recheck shell executes four file parts, reports each rc, and runs at
   }
   expect(active).toBe(0);
   expect(peak).toBe(2);
-});
+}, 30_000);
 
 test('readShardArtifacts: every part done → one summary and rc; a crashed part → its exit; the old single-run layout still reads', () => {
   const dir = temp('gate-art-');

@@ -123,6 +123,7 @@ export class AgentRegistry {
       id: randomUUID(),
       definition: opts.definition,
       prompt: opts.prompt,
+      ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
       depth,
       ...(opts.label ? { label: opts.label } : {}),
       ...(opts.correlationId ? { correlationId: opts.correlationId } : {}),
@@ -136,6 +137,7 @@ export class AgentRegistry {
       ...(opts.teamName ? { teamName: opts.teamName } : {}),
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
       ...(opts.background ? { background: true } : {}),
+      ...(opts.completionDelivery ? { completionDelivery: opts.completionDelivery } : {}),
       // MSS M1.2: brand the spawn with an AgentUri (caller may pre-mint
       // for cross-task tracing; default = fresh mint). The legacy UUID
       // `id` stays the registry key — agentUri rides alongside.

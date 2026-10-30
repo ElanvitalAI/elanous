@@ -73,6 +73,8 @@ export interface ControlObservation {
   readonly subjectPtyId?: string;
   /** 이 판단이 속한 harness run. harness 밖 감독자는 생략한다. */
   readonly runId?: string;
+  /** Recent same-run chart cells pulled immediately before this supervision judgment. */
+  readonly runChart?: readonly { device: string; stopKey: string; observed: string; verdict: string; action: string; handoff: string | null; why: string }[];
   /** Last structured action that could not be performed; brain sees the reason next round. */
   readonly unavailableAction?: string;
 }

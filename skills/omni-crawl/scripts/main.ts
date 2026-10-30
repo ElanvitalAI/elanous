@@ -153,7 +153,7 @@ async function main(query: string) {
 
 // ── Deep research 파이프라인 (자체 합성 — Tavily Research 엔드포인트 미사용·비용 예측성) ──
 //
-// 1) 다각도 tavily advanced ×3 (사실/전망/리스크 각도) 병렬
+// 1) 다각도 웹 검색 ×3 (Tavily 사용 가능 시 Tavily, 아니면 Firecrawl) 병렬
 // 2) URL dedup → 상위 K=5 를 firecrawl 풀스크랩 (maxAge 2h 캐시)
 // 3) grok-community 1콜 (X+레딧 여론 각도)
 // 카버당 비용: tavily ~6cr + firecrawl ~5cr + grok ~$0.03 — 예측 가능.
@@ -173,15 +173,11 @@ async function runDeep(query: string): Promise<CrawlResult[]> {
   const results: CrawlResult[] = [];
 
   // 1) 다각도 검색 + grok-community 동시 발사
-  // ⛔⭐ 2026-08-06 (공식 결정) — tavily 각도 검색은 **기본 OFF**(deep 1회당 advanced ×3 ≈ 6cr 고정비).
-  //    켜기: `.env` 또는 셸에 `OMNI_CRAWL_TAVILY=1`. 끄면 아래 `!gotTavily` 분기가 **이미 있는**
-  //    ddg 무료 각도 검색을 대신 돌린다(별도 배선 불필요).
+  // 키 부재·비활성뿐 아니라 Tavily/Firecrawl 런타임 공백도 다음 엔진으로 넘긴다.
+  // Tavily 부재 시 Firecrawl이 우선이며 DDG는 두 유료 검색축이 모두 비었을 때만 최후 폴백.
+  const angleEngines = deepAngleSearchOrder(tavilyEnabled() && tavilyAvailable(), firecrawlAvailable());
   const searchTasks: Array<Promise<CrawlResult | null>> = [
-    ...(tavilyEnabled() ? angles.map(a =>
-      searchTavily(a.q, { depth: 'advanced', maxResults: 5, chunksPerSource: 3, timeRange: flags['time-range'] })
-        .then(r => ({ ...r, engine: `tavily:${a.label}` }))
-        .catch(e => { console.log(`  [deep] tavily(${a.label}) 실패: ${e.message?.slice(0, 80)}`); return null; }),
-    ) : []),
+    ...angles.map(a => searchDeepAngle(a, angleEngines)),
     searchGrok({ query, mode: 'community' })
       .catch(e => { console.log(`  [deep] grok-community 실패: ${e.message?.slice(0, 80)}`); return null; }),
     // 기술 주제면 개발자 인덱스 1콜 추가(실측 ~2cr) — 패시지가 곧 인용이라 풀스크랩 콜을 아낀다.
@@ -193,20 +189,11 @@ async function runDeep(query: string): Promise<CrawlResult[]> {
   const settled = await Promise.all(searchTasks);
   for (const r of settled) if (r) results.push(r as CrawlResult);
 
-  // 1-b) tavily 축이 비면(기본 OFF · 키 없음 · 장애) ddg 무료가 각도 검색을 담당한다.
-  const gotTavily = results.some(r => r.engine.startsWith('tavily') && r.totalItems > 0);
-  if (!gotTavily) {
-    console.log('  [deep] ddg 무료 티어로 각도 검색');
-    const ddgResults = await Promise.all(angles.map(a =>
-      searchDdg(a.q, { maxResults: 5 }).then(r => ({ ...r, engine: `ddg:${a.label}` })).catch(() => null)));
-    for (const r of ddgResults) if (r && r.totalItems > 0) results.push(r as CrawlResult);
-  }
-
   // 2) 검색 히트에서 상위 URL 추출 → firecrawl 풀스크랩 (병렬·캐시 2h)
   const seen = new Set<string>();
   const topUrls: string[] = [];
   for (const r of results) {
-    if (!r.engine.startsWith('tavily') && !r.engine.startsWith('ddg')) continue;
+    if (!r.engine.startsWith('tavily') && !r.engine.startsWith('firecrawl') && !r.engine.startsWith('ddg')) continue;
     for (const it of r.items) {
       if (!it.url || seen.has(it.url)) continue;
       seen.add(it.url);
@@ -217,9 +204,21 @@ async function runDeep(query: string): Promise<CrawlResult[]> {
   }
   if (topUrls.length) {
     console.log(`  [deep] 상위 ${topUrls.length}개 URL 풀스크랩 (firecrawl·캐시 2h)`);
-    const scraped = await Promise.all(topUrls.map(u =>
-      scrapeFirecrawl(u, { maxAge: 2 * 3600_000 }).catch(() => null),
-    ));
+    const scraped = await Promise.all(topUrls.map(async u => {
+      const startedAt = Date.now();
+      try {
+        const result = await scrapeFirecrawl(u, { maxAge: 2 * 3600_000 });
+        if (!result) {
+          console.log(`  [deep:firecrawl:scrape] ${u} · 실패 · ${Date.now() - startedAt}ms · 본문 없음`);
+          return null;
+        }
+        console.log(`  [deep:firecrawl:scrape] ${u} · ${Date.now() - startedAt}ms · ${result.content.length}자`);
+        return result;
+      } catch (e: any) {
+        console.log(`  [deep:firecrawl:scrape] ${u} · 실패 · ${Date.now() - startedAt}ms · ${e.message?.slice(0, 80)}`);
+        return null;
+      }
+    }));
     const items: CrawlItem[] = [];
     for (let i = 0; i < scraped.length; i++) {
       const s = scraped[i];
@@ -248,10 +247,52 @@ async function runDeep(query: string): Promise<CrawlResult[]> {
         if (s) items.push({ engine: 'fc-deep', query, url: missed[i], text: s.content.slice(0, 6000), metadata: { via: s.method, title: s.title } });
       }
     }
-    if (items.length) results.push({ engine: 'deep-fullscrape', query, items, totalItems: items.length, costNote: `firecrawl ~${scraped.filter(Boolean).length}cr + 무료` });
+    if (items.length) {
+      console.log(`  [deep:firecrawl:fullscrape] ${items.length}/${topUrls.length}건 본문 확보`);
+      results.push({ engine: 'deep-fullscrape', query, items, totalItems: items.length, costNote: `firecrawl ~${scraped.filter(Boolean).length}cr + 무료` });
+    } else {
+      console.log(`  [deep:firecrawl:fullscrape] 0/${topUrls.length}건 본문 확보`);
+    }
   }
 
   return results;
+}
+
+type DeepAngleEngine = 'tavily' | 'firecrawl' | 'ddg';
+
+function deepAngleSearchOrder(tavilyReady: boolean, firecrawlReady: boolean): DeepAngleEngine[] {
+  return [
+    ...(tavilyReady ? ['tavily' as const] : []),
+    ...(firecrawlReady ? ['firecrawl' as const] : []),
+    'ddg',
+  ];
+}
+
+function firecrawlTbsFromTimeRange(timeRange?: string): string | undefined {
+  if (!timeRange) return undefined;
+  return ({ day: 'qdr:d', week: 'qdr:w', month: 'qdr:m', year: 'qdr:y' } as Record<string, string>)[timeRange];
+}
+
+async function searchDeepAngle(
+  angle: { q: string; label: string },
+  engines: DeepAngleEngine[],
+): Promise<CrawlResult | null> {
+  for (const engine of engines) {
+    const startedAt = Date.now();
+    try {
+      const result = engine === 'tavily'
+        ? await searchTavily(angle.q, { depth: 'advanced', maxResults: 5, chunksPerSource: 3, timeRange: flags['time-range'] })
+        : engine === 'firecrawl'
+          ? await searchFirecrawl(angle.q, { limit: 5, tbs: firecrawlTbsFromTimeRange(flags['time-range']) })
+          : await searchDdg(angle.q, { maxResults: 5 });
+      const elapsedMs = Date.now() - startedAt;
+      console.log(`  [deep:${engine}:${angle.label}] ${result.totalItems}건 · ${elapsedMs}ms`);
+      if (result.totalItems > 0) return { ...result, engine: `${engine}:${angle.label}` };
+    } catch (e: any) {
+      console.log(`  [deep:${engine}:${angle.label}] 실패 · ${Date.now() - startedAt}ms · ${e.message?.slice(0, 80)}`);
+    }
+  }
+  return null;
 }
 
 // ── 폴백 체인: tavily ↔ firecrawl → (최후) ddg 무료 (웹 검색 축 공백 방지) ──
@@ -492,6 +533,26 @@ function runSelfTest() {
     const got = looksTechnical(q);
     if (got === expect) { console.log(`  PASS: looksTechnical("${q}") = ${got}`); passed++; }
     else { console.log(`  FAIL: looksTechnical("${q}") expect ${expect}, got ${got}`); failed++; }
+  }
+
+  const angleEngineCases: Array<[string, boolean, boolean, string]> = [
+    ['Tavily and Firecrawl ready', true, true, 'tavily,firecrawl,ddg'],
+    ['Tavily unavailable', false, true, 'firecrawl,ddg'],
+    ['Tavily disabled', false, true, 'firecrawl,ddg'],
+    ['both paid search engines unavailable', false, false, 'ddg'],
+  ];
+  for (const [label, tavilyReady, firecrawlReady, expected] of angleEngineCases) {
+    const got = deepAngleSearchOrder(tavilyReady, firecrawlReady).join(',');
+    if (got === expected) { console.log(`  PASS: deep angle fallback ${label} → ${got}`); passed++; }
+    else { console.log(`  FAIL: deep angle fallback ${label} expect ${expected}, got ${got}`); failed++; }
+  }
+  const tbsCases: Array<[string, string | undefined]> = [
+    ['day', 'qdr:d'], ['week', 'qdr:w'], ['month', 'qdr:m'], ['year', 'qdr:y'], ['unset', undefined],
+  ];
+  for (const [timeRange, expected] of tbsCases) {
+    const got = firecrawlTbsFromTimeRange(timeRange === 'unset' ? undefined : timeRange);
+    if (got === expected) { console.log(`  PASS: Firecrawl time range ${timeRange} → ${got ?? 'unset'}`); passed++; }
+    else { console.log(`  FAIL: Firecrawl time range ${timeRange} expect ${expected}, got ${got}`); failed++; }
   }
 
   console.log(`\n결과: ${passed} passed, ${failed} failed`);

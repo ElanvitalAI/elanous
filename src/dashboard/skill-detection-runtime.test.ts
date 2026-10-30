@@ -52,6 +52,12 @@ describe('detectDashboardSkillRoute', () => {
         provider: 'gemini',
         source: 'config-role',
       });
+      const timings = log.mock.calls.filter(([category]) => category === 'skill.router.timing');
+      expect(timings.map(([, event]) => event)).toEqual([
+        'classifier-role-ready', 'classifier-stream-complete', 'detection-complete',
+      ]);
+      expect(timings.every(([, , data]) => typeof (data as Record<string, unknown> | undefined)?.elapsedMs === 'number')).toBe(true);
+      expect(JSON.stringify(timings)).not.toContain('fixture prompt');
     } finally {
       log.mockRestore();
       setUserConfigOverlay(null);
@@ -78,6 +84,10 @@ describe('detectDashboardSkillRoute', () => {
       expect(detection).toEqual({ candidates: [], top: null, unambiguous: false });
       expect(streamCalls).toEqual([]);
       expect(log.mock.calls.find(([category, event]) => category === 'llm.role-pin' && event === 'resolved')).toBeUndefined();
+      const timing = log.mock.calls.find(([category, event]) => category === 'skill.router.timing' && event === 'detection-complete');
+      const timingData = timing?.[2] as Record<string, unknown> | undefined;
+      expect(timingData).toMatchObject({ mode: 'keyword', skillCount: 0, candidateCount: 0 });
+      expect(typeof timingData?.elapsedMs).toBe('number');
     } finally {
       log.mockRestore();
     }

@@ -184,6 +184,37 @@ export function createPodLedgerFollower(opts: {
   if (!Number.isFinite(stallMinutes) || stallMinutes <= 0) throw new RangeError('stallMinutes must be positive');
   const onStall = opts.onStall ?? ((message: string) => console.error(message));
   const path = runLedgerPath(opts.runId, dir);   // runId 검증(경로·셸에 안전한 문자만)도 여기서 된다
+  function activityTimestamp(epoch: number): string {
+    const iso = new Date(Math.floor(epoch / 1_000) * 1_000).toISOString();
+    return `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}${iso.slice(11, 13)}${iso.slice(14, 16)}.${iso.slice(17, 19)}`;
+  }
+  function activityCommand(since: string, until: string, offset: number, sinceTimestamp: string, untilTimestamp: string): string {
+    return [
+      `s="\${ELANOUS_STATE_DIR:-$HOME/.elanous}"`,
+      `f="$s/run-ledger/${opts.runId}.jsonl"`,
+      'w="$s/worktrees"',
+      'if [ -f "$f" ]; then tail -c +' + (offset + 1) + ' "$f" || exit 1; fi',
+      "target=''; matches=0",
+      'for tree in "$w"/*/*.worktrees/*; do',
+      '  [ -e "$tree/.git" ] || continue',
+      '  owner=$(git -C "$tree" config --worktree --get elanous.harness.owner 2>/dev/null) || continue',
+      `  [ "$owner" = 'dev:${opts.runId}' ] || continue`,
+      '  target="$tree"; matches=$((matches + 1))',
+      'done',
+      'if [ "$matches" -eq 1 ]; then',
+      '  touch_activity_ref() { stamp_value=$1; fallback=$2; ref=$3; touch -d "@$stamp_value" "$ref" 2>/dev/null && return 0; TZ=UTC touch -t "$fallback" "$ref"; }',
+      `  activity_since="$s/.pod-activity-${opts.runId}-$$-since"`,
+      `  activity_until="$s/.pod-activity-${opts.runId}-$$-until"`,
+      "  activity=''",
+      `  if : > "$activity_since" && : > "$activity_until" && touch_activity_ref '${since}' '${sinceTimestamp}' "$activity_since" && touch_activity_ref '${until}' '${untilTimestamp}' "$activity_until"; then`,
+      '    activity=$(find "$target" -type d \\( -name .git -o -name node_modules \\) -prune -o -type f -newer "$activity_since" ! -newer "$activity_until" -exec printf . \\; 2>/dev/null)',
+      '    activity_status=$?',
+      '  else activity_status=1; fi',
+      '  rm -f "$activity_since" "$activity_until"',
+      '  if [ "$activity_status" -eq 0 ]; then printf \'\\nELANOUS_ACTIVITY %s\\n\' "\${#activity}"; else printf \'\\nELANOUS_ACTIVITY_ERROR\\n\'; fi',
+      "else printf '\\nELANOUS_ACTIVITY_ERROR\\n'; fi",
+    ].join('\n');
+  }
   let offset = 0;
   let pending = '';
   let owned = false;
@@ -218,7 +249,13 @@ export function createPodLedgerFollower(opts: {
       const since = `${Math.floor(lastActivityMeasuredAt / 1000)}.${String(lastActivityMeasuredAt % 1000).padStart(3, '0')}`;
       const measurementStartedAt = now();
       const until = `${Math.floor(measurementStartedAt / 1000)}.${String(measurementStartedAt % 1000).padStart(3, '0')}`;
-      const r = opts.exec(`s="\${ELANOUS_STATE_DIR:-$HOME/.elanous}"; f="$s/run-ledger/${opts.runId}.jsonl"; w="$s/worktrees"; if [ -f "$f" ]; then tail -c +${offset + 1} "$f" || exit 1; fi; target=''; matches=0; for tree in "$w"/*/*.worktrees/*; do [ -e "$tree/.git" ] || continue; owner=$(git -C "$tree" config --worktree --get elanous.harness.owner 2>/dev/null) || continue; [ "$owner" = 'dev:${opts.runId}' ] || continue; target="$tree"; matches=$((matches + 1)); done; if [ "$matches" -eq 1 ]; then activity=$(find "$target" -type d \\( -name .git -o -name node_modules \\) -prune -o -type f -newermt '@${since}' ! -newermt '@${until}' -printf . 2>/dev/null) && printf '\\nELANOUS_ACTIVITY %s\\n' "\${#activity}" || printf '\\nELANOUS_ACTIVITY_ERROR\\n'; else printf '\\nELANOUS_ACTIVITY_ERROR\\n'; fi`);
+      const r = opts.exec(activityCommand(
+        since,
+        until,
+        offset,
+        activityTimestamp(lastActivityMeasuredAt),
+        activityTimestamp(measurementStartedAt),
+      ));
       if (r.status !== 0) { log('self-implement.pod', 'ledger-live-unavailable', { runId: opts.runId, status: r.status, stderr: r.stderr.trim().slice(0, 200) }); checkStall(false, false); return { ledgerRead: false, activityMeasured: false }; }
       const marker = r.stdout.lastIndexOf('\nELANOUS_ACTIVITY');
       const activityLine = marker < 0 ? '' : r.stdout.slice(marker + 1);

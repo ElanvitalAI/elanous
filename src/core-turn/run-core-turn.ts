@@ -78,6 +78,21 @@ function selectSurfaceUserText(ctx: CoreTurnContext): string | undefined {
   return ctx.userText;
 }
 
+/** An explicit named-skill request must reach the normal tool loop before
+ *  the research turn's text-only provisional answer. That provisional pass
+ *  has no tools by design and otherwise tells the user the requested skill
+ *  cannot be invoked, even when the skill router already resolved it. */
+function requestsNamedSkill(text: string | undefined): boolean {
+  if (!text) return false;
+  const action = '(?:use|invoke|run|call|execute|launch|trigger|apply|start)';
+  return new RegExp(`\\b${action}\\s+(?:(?:the|a|an)\\s+)?skill\\s+(?:named|called)\\s+['"“‘]([a-z0-9][a-z0-9 _-]{1,60}?)['"”’](?=$|[\\s.,;!?])`, 'i').test(text)
+    || new RegExp(`\\b${action}\\s+(?:the\\s+)?['"“‘]([a-z0-9][a-z0-9 _-]{1,60}?)['"”’](?=$|[\\s.,;!?])`, 'i').test(text)
+    || new RegExp(`\\b${action}\\s+(?:the\\s+)?([a-z0-9][a-z0-9-]{1,40})\\s+skill\\b`, 'i').test(text)
+    || /스킬\s+(?:이름(?:은|이)?\s*)?['"“‘「]([\p{L}\p{N}][\p{L}\p{N}\p{M}_ -]{1,60}?)['"”’」]\s*(?:을|를)?\s*(?:사용|호출|실행)/iu.test(text)
+    || /['"“‘「]([\p{L}\p{N}][\p{L}\p{N}\p{M}_ -]{1,60}?)['"”’」]\s*스킬?\s*(?:을|를)?\s*(?:사용|호출|실행)/iu.test(text)
+    || /([\p{L}\p{N}_-]{2,60})\s+스킬\s*(?:을|를)?\s*(?:사용|호출|실행)/iu.test(text);
+}
+
 /**
  * Execute one agent turn against the configured LLM provider using
  * the tool catalog and dispatcher the caller injected. Returns when
@@ -104,7 +119,71 @@ function selectSurfaceUserText(ctx: CoreTurnContext): string | undefined {
  */
 export interface RunCoreTurnOptions {
   now?: () => number;
-  runResearch?: (request: string) => Promise<{ ok: boolean; output: string; error?: string }>;
+  runResearch?: (request: string, signal: AbortSignal) => Promise<{ ok: boolean; output: string; error?: string }>;
+}
+
+type AbortRace<T> = { aborted: true } | { aborted: false; value: T };
+
+function settleBeforeAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<AbortRace<T>> {
+  if (signal.aborted) return Promise.resolve({ aborted: true });
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      resolve({ aborted: true });
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      value => { signal.removeEventListener('abort', onAbort); resolve({ aborted: false, value }); },
+      error => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
+  });
+}
+
+type TurnCompletion = Parameters<NonNullable<StreamWithToolsHandlers['onTurnComplete']>>[0];
+
+function createStagedHandlers(handlers: StreamWithToolsHandlers) {
+  let text = '';
+  let completion: TurnCompletion | undefined;
+  return {
+    handlers: {
+      ...handlers,
+      onText: (_delta: string, full: string) => { text = full; },
+      onTurnComplete: (messages: TurnCompletion) => { completion = messages; },
+    } satisfies StreamWithToolsHandlers,
+    text: () => text,
+    completion: () => completion,
+  };
+}
+
+function commitCompletion(
+  messages: TurnCompletion | undefined,
+  handlers: StreamWithToolsHandlers,
+  setFinalPhaseAnswer: (value: boolean) => void,
+): void {
+  if (!messages) return;
+  const lastAssistant = [...messages].reverse().find(message => message.role === 'assistant');
+  setFinalPhaseAnswer(lastAssistant?.phase === 'final_answer');
+  handlers.onTurnComplete?.(messages);
+}
+
+function commitProvisionalTurn(
+  messages: TurnCompletion | undefined,
+  handlers: StreamWithToolsHandlers,
+  setFinalPhaseAnswer: (value: boolean) => void,
+): void {
+  commitCompletion(messages, handlers, setFinalPhaseAnswer);
+}
+
+function commitStagedTurn(
+  messages: TurnCompletion | undefined,
+  handlers: StreamWithToolsHandlers,
+  text: string,
+  replaceVisibleText: boolean,
+  setFinalPhaseAnswer: (value: boolean) => void,
+  onReplaceText?: (fullText: string) => void,
+): void {
+  commitCompletion(messages, handlers, setFinalPhaseAnswer);
+  if (replaceVisibleText && text) onReplaceText?.(text);
 }
 
 export async function runCoreTurn(
@@ -112,6 +191,9 @@ export async function runCoreTurn(
   options: RunCoreTurnOptions = {},
 ): Promise<CoreTurnResult> {
   const now = options.now ?? Date.now;
+  let turnStartedAt: number | undefined;
+  let researchStartedAt: number | undefined;
+  let researchFirstTokenRecorded = false;
   // ⭐⭐⭐ 스코프를 열기 **전에** 간선을 남긴다 — 열고 나서 찍으면 그 행마저 코어 세션으로 귀속돼
   //   ***채팅 세션 조회에 안 걸리고, 이 수리가 고치려는 결함을 그대로 반복한다***(원장 `MEAS-S14`).
   //   ⚠️ 세션 값은 바꾸지 않는다. 없던 **간선**만 는다.
@@ -136,6 +218,15 @@ export async function runCoreTurn(
     const handlers: StreamWithToolsHandlers = {
     onText: (delta, full) => {
       accumulatedText = full;
+      if (researchStartedAt !== undefined && !researchFirstTokenRecorded && delta.length > 0) {
+        researchFirstTokenRecorded = true;
+        debug.log('research.turn', 'first-token', {
+          sessionId: ctx.sessionId,
+          sinceTurnStartMs: turnStartedAt === undefined ? undefined : now() - turnStartedAt,
+          sinceResearchStartMs: now() - researchStartedAt,
+          outputChars: full.length,
+        });
+      }
       ctx.callbacks?.onText?.(delta, full);
     },
     ...(ctx.callbacks?.onStatus ? { onStatus: (line: string) => ctx.callbacks?.onStatus?.(line) } : {}),
@@ -264,106 +355,236 @@ export async function runCoreTurn(
   ) {
     messages.unshift(buildResearchDateSystemMessage());
   }
-  if (researchTurn && surfaceUserText?.trim()) {
-    debug.log('research.turn', 'tui-research-started', { sessionId: ctx.sessionId });
-    try {
-      const result = await (options.runResearch ?? (async (request) => {
-        // Keep the Bloom/skill pipeline out of ordinary and packaged TUI startup graphs.
-        const { researchTurnForGrounding, runResearchQuestionLadder } = await import('../auto-research/research-turn.js');
-        return researchTurnForGrounding(await runResearchQuestionLadder(request));
-      }))(surfaceUserText);
-      if (result.output.trim()) {
-        messages.unshift({
-          role: 'system',
-          content: `<bloom-research>\n${result.output.trim()}\n</bloom-research>\nUse this axis evidence and counterevidence in the answer; preserve uncertainty and distinguish sourced facts from inference.`,
-        });
-      }
-      debug.log('research.turn', 'tui-research-completed', {
+    let researchResultPromise: Promise<{ ok: boolean; output: string; error?: string } | null> | undefined;
+    const explicitSkillToolRequest = requestsNamedSkill(surfaceUserText)
+      && tools.some((tool) => tool.name === 'skill_exec');
+    if (researchTurn && surfaceUserText?.trim() && !explicitSkillToolRequest) {
+      turnStartedAt = now();
+      researchStartedAt = turnStartedAt;
+      debug.log('research.turn', 'tui-research-started', {
         sessionId: ctx.sessionId,
-        ok: result.ok,
-        outputChars: result.output.length,
-        fallbackReason: result.error,
+        sinceTurnStartMs: researchStartedAt - turnStartedAt,
       });
-    } catch (error) {
-      debug.log('research.turn', 'tui-research-fallback', {
-        sessionId: ctx.sessionId,
-        reason: error instanceof Error ? error.message : String(error),
-      }, { level: 'warn' });
+      // Start evidence collection beside the first answer. The user gets an
+      // immediate, visible status and an initial answer while research runs;
+      // a second text-only synthesis then reconciles that answer with evidence.
+      try { ctx.callbacks?.onStatus?.('먼저 답변을 시작하고 근거를 확인합니다.'); } catch { /* UI feedback is fail-soft. */ }
+      researchResultPromise = (async () => {
+        try {
+          const result = await (options.runResearch ?? (async (request, signal) => {
+            // Keep the Bloom/skill pipeline out of ordinary and packaged TUI startup graphs.
+            const { researchTurnForGrounding, runResearchQuestionLadder } = await import('../auto-research/research-turn.js');
+            return researchTurnForGrounding(await runResearchQuestionLadder(request, { signal }));
+          }))(surfaceUserText, ctx.signal);
+          debug.log('research.turn', 'tui-research-completed', {
+            sessionId: ctx.sessionId,
+            ok: result.ok,
+            outputChars: result.output.length,
+            fallbackReason: result.error,
+            elapsedMs: researchStartedAt === undefined ? undefined : now() - researchStartedAt,
+          });
+          return result;
+        } catch (error) {
+          debug.log('research.turn', 'tui-research-fallback', {
+            sessionId: ctx.sessionId,
+            reason: error instanceof Error ? error.message : String(error),
+            elapsedMs: researchStartedAt === undefined ? undefined : now() - researchStartedAt,
+          }, { level: 'warn' });
+          return null;
+        }
+      })();
     }
-  }
-  if (debug.enabled) {
-    debug.log('llm.request', 'tools-tier', {
+    const streamOptions = (turnTools: typeof tools) => ({
+      tools: turnTools,
+      researchTurn,
+      signal: ctx.signal,
+      ...(ctx.requestSizeGuard ? { requestSizeGuard: ctx.requestSizeGuard } : {}),
+      toolResultInlineLimitBytes: CORE_TURN_TOOL_RESULT_INLINE_LIMIT_BYTES,
+      ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
+      ...(ctx.maxToolTurns !== undefined ? { maxTurns: ctx.maxToolTurns } : {}),
+      ...(ctx.initialProvider !== undefined
+        ? { initialProvider: ctx.initialProvider, ...(ctx.skipProviders ? { skipProviders: ctx.skipProviders } : {}) }
+        : ctx.modelOverride !== undefined ? { model: ctx.modelOverride } : {}),
+      ...(ctx.callbacks?.onResolvedProvider !== undefined ? { onResolvedProvider: ctx.callbacks.onResolvedProvider } : {}),
+      ...(ctx.budgetGrant !== undefined ? { budgetGrant: ctx.budgetGrant } : {}),
+      ...(ctx.terminalToolNames !== undefined ? { terminalToolNames: ctx.terminalToolNames } : {}),
+      ...(ctx.terminalPriorAnswerVisible !== undefined ? { terminalPriorAnswerVisible: ctx.terminalPriorAnswerVisible } : {}),
+      ...(ctx.terminalCompletionAccepted !== undefined ? { terminalCompletionAccepted: ctx.terminalCompletionAccepted } : {}),
+      ...(ctx.sessionId !== undefined ? { drainPendingUserInput: () => drainPendingUserInput(ctx.sessionId!) } : {}),
+    });
+
+    let finalText = '';
+    if (debug.enabled) {
+      debug.log('llm.request', 'tools-tier', {
+        sessionId: ctx.sessionId,
+        totalSpecs: ctx.tools.length,
+        activeCount: stats.activeCount,
+        deferredCount: stats.deferredCount,
+        warmPreloaded: stats.warmPreloaded,
+        injected: stats.injected,
+        mode: deferredEnabled ? 'always' : 'off',
+      });
+    }
+    debug.log('capability.resolve', 'tool-tier-split', {
       sessionId: ctx.sessionId,
-      totalSpecs: ctx.tools.length,
+      surfaceId: surface.id,
+      surfaceSelectionReason: surface.selectionReason,
       activeCount: stats.activeCount,
       deferredCount: stats.deferredCount,
+      immediateCount: stats.activeCount,
+      immediate: tools.map((tool) => tool.name),
       warmPreloaded: stats.warmPreloaded,
-      injected: stats.injected,
-      mode: deferredEnabled ? 'always' : 'off',
-    });
-  }
-  debug.log('capability.resolve', 'tool-tier-split', {
-    sessionId: ctx.sessionId,
-    surfaceId: surface.id,
-    surfaceSelectionReason: surface.selectionReason,
-    activeCount: stats.activeCount,
-    deferredCount: stats.deferredCount,
-    immediateCount: stats.activeCount,
-    immediate: tools.map((tool) => tool.name),
-    warmPreloaded: stats.warmPreloaded,
-    deferred: stats.deferredNames,
-    unhydratable: stats.unhydratableNames,
-  }, { compact: { arrayMax: Number.MAX_SAFE_INTEGER } });
-  if (stats.unhydratableCount > 0) {
-    debug.log('capability.resolve', 'unhydratable-capabilities', {
-      sessionId: ctx.sessionId,
-      unhydratableCount: stats.unhydratableCount,
+      deferred: stats.deferredNames,
       unhydratable: stats.unhydratableNames,
-    }, { level: 'warn' });
-  }
-
-  try {
-    const finalText = await streamLLMWithTools(
-      messages,
-      handlers,
-      {
-        tools,
-        researchTurn,
-        signal: ctx.signal,
-        ...(ctx.requestSizeGuard ? { requestSizeGuard: ctx.requestSizeGuard } : {}),
-        toolResultInlineLimitBytes: CORE_TURN_TOOL_RESULT_INLINE_LIMIT_BYTES,
-        ...(ctx.sessionId !== undefined ? { sessionId: ctx.sessionId } : {}),
-        ...(ctx.maxToolTurns !== undefined ? { maxTurns: ctx.maxToolTurns } : {}),
-        ...(ctx.initialProvider !== undefined
-          ? { initialProvider: ctx.initialProvider, ...(ctx.skipProviders ? { skipProviders: ctx.skipProviders } : {}) }
-          : ctx.modelOverride !== undefined ? { model: ctx.modelOverride } : {}),
-        ...(ctx.callbacks?.onResolvedProvider !== undefined ? { onResolvedProvider: ctx.callbacks.onResolvedProvider } : {}),
-        ...(ctx.budgetGrant !== undefined ? { budgetGrant: ctx.budgetGrant } : {}),
-        ...(ctx.terminalToolNames !== undefined ? { terminalToolNames: ctx.terminalToolNames } : {}),
-        ...(ctx.terminalPriorAnswerVisible !== undefined ? { terminalPriorAnswerVisible: ctx.terminalPriorAnswerVisible } : {}),
-        ...(ctx.terminalCompletionAccepted !== undefined ? { terminalCompletionAccepted: ctx.terminalCompletionAccepted } : {}),
-        // ⭐⭐⭐ `B3`(2026-08-19 · 대표 지시 ②) — 도는 턴 «안»으로 들어오는 사용자 발화의 배수구.
-        //   ⛔ 종전엔 스트리밍 중 친 발화가 ***턴이 끝난 뒤***에야 나갔다.
-        //   ⭐ 이제 «다음 모델 요청을 만들기 직전»(루프 경계)에 이력으로 들어가고,
-        //     문면이 「기존 작업을 마저 끝내라」를 같이 준다(`chat/interjection.ts`).
-        ...(ctx.sessionId !== undefined
-          ? { drainPendingUserInput: () => drainPendingUserInput(ctx.sessionId!) }
-          : {}),
-      },
-    );
-    try {
-      debug.log('core.turn', 'dispatch-summary', {
+    }, { compact: { arrayMax: Number.MAX_SAFE_INTEGER } });
+    if (stats.unhydratableCount > 0) {
+      debug.log('capability.resolve', 'unhydratable-capabilities', {
         sessionId: ctx.sessionId,
-        dispatchCount,
-      });
-    } catch {
-      // Observability must not prevent a completed turn from returning.
+        unhydratableCount: stats.unhydratableCount,
+        unhydratable: stats.unhydratableNames,
+      }, { level: 'warn' });
     }
-    return {
-      stopReason: ctx.signal.aborted ? 'aborted' : 'end_turn',
-      finalText,
-      ...(ctx.callbacks?.onTurnComplete ? { finalPhaseAnswer } : {}),
-    };
+
+    try {
+      let provisionalTurnMessages: Parameters<NonNullable<StreamWithToolsHandlers['onTurnComplete']>>[0] | undefined;
+      const firstPassHandlers: StreamWithToolsHandlers = researchResultPromise && handlers.onTurnComplete
+        ? { ...handlers, onTurnComplete: (newMessages) => { provisionalTurnMessages = newMessages; } }
+        : handlers;
+      const firstPassMessages = researchResultPromise
+        ? [...messages, {
+          role: 'system' as const,
+          content: 'This is a provisional first response while source evidence is being gathered. Answer concisely from available context, mark uncertainty, and do not claim current facts are verified. A later evidence-reconciliation phase can use tools; do not claim a requested tool or skill is unavailable in this provisional response.',
+        }]
+        : messages;
+      const firstPassStartedAt = researchResultPromise ? now() : undefined;
+      finalText = await streamLLMWithTools(firstPassMessages, firstPassHandlers, streamOptions(researchResultPromise ? [] : tools));
+      if (researchResultPromise && firstPassStartedAt !== undefined) {
+        debug.log('research.turn', 'first-pass-answer-ready', {
+          sessionId: ctx.sessionId,
+          durationMs: now() - firstPassStartedAt,
+          sinceTurnStartMs: turnStartedAt === undefined ? undefined : now() - turnStartedAt,
+          sinceResearchStartMs: researchStartedAt === undefined ? undefined : now() - researchStartedAt,
+          outputChars: finalText.length,
+        });
+      }
+      if (researchResultPromise) {
+        const racedResearch = await settleBeforeAbort(researchResultPromise, ctx.signal);
+        if (racedResearch.aborted) {
+          commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
+          return { stopReason: 'aborted', finalText };
+        }
+        const result = racedResearch.value;
+        if (ctx.signal.aborted) {
+          commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
+          return { stopReason: 'aborted', finalText };
+        }
+        if (result?.ok && result.output.trim() && !ctx.signal.aborted) {
+          try { ctx.callbacks?.onStatus?.('근거를 반영해 답변을 보강합니다.'); } catch { /* UI feedback is fail-soft. */ }
+          const synthesisStartedAt = now();
+          debug.log('research.turn', 'synthesis-started', {
+            sessionId: ctx.sessionId,
+            sinceTurnStartMs: turnStartedAt === undefined ? undefined : synthesisStartedAt - turnStartedAt,
+            researchElapsedMs: researchStartedAt === undefined ? undefined : synthesisStartedAt - researchStartedAt,
+          });
+          const provisionalText = finalText;
+          accumulatedText = provisionalText;
+          const staged = createStagedHandlers(handlers);
+          messages.push(
+            { role: 'assistant', content: provisionalText.trim() },
+            { role: 'system', content: `<bloom-research>\n${result.output.trim()}\n</bloom-research>` },
+            { role: 'system', content: 'Revise the answer above using this research evidence. Correct any unsupported or contradicted claims, preserve uncertainty, and answer in natural prose. Do not output JSON or a tool transcript. If the evidence does not materially change the answer, state the answer directly.' },
+          );
+          const synthesisTools = tools.filter(tool => !['WebSearch', 'OmniSearch'].includes(tool.name));
+          try {
+            const synthesizedText = await streamLLMWithTools(messages, staged.handlers, streamOptions(synthesisTools));
+            if (ctx.signal.aborted) {
+              commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
+              return { stopReason: 'aborted', finalText: provisionalText };
+            }
+            finalText = synthesizedText || staged.text() || provisionalText;
+            accumulatedText = finalText;
+            debug.log('research.turn', 'synthesis-completed', {
+              sessionId: ctx.sessionId,
+              elapsedMs: now() - synthesisStartedAt,
+              sinceTurnStartMs: turnStartedAt === undefined ? undefined : now() - turnStartedAt,
+              outputChars: finalText.length,
+            });
+            if (staged.completion()) {
+              commitStagedTurn(staged.completion(), handlers, finalText, finalText !== provisionalText,
+                value => { finalPhaseAnswer = value; }, ctx.callbacks?.onReplaceText);
+            } else {
+              commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
+            }
+          } catch (error) {
+            commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
+            const stopReason = classifyStopReason(error, ctx.signal);
+            if (stopReason === 'aborted') return { stopReason, finalText: provisionalText };
+            if (stopReason === 'auth_rejected') {
+              return {
+                stopReason,
+                finalText: provisionalText,
+                errorMessage: redactSecretText(error instanceof Error ? error.message : String(error)),
+              };
+            }
+            try { ctx.callbacks?.onStatus?.('근거 반영에 실패해 첫 답변을 유지합니다.'); } catch { /* UI feedback is fail-soft. */ }
+            return { stopReason: 'end_turn', finalText: provisionalText, ...(handlers.onTurnComplete ? { finalPhaseAnswer } : {}) };
+          }
+        } else if (tools.some(tool => !['WebSearch', 'OmniSearch'].includes(tool.name))) {
+          try { ctx.callbacks?.onStatus?.('근거 검색은 실패해 사용할 수 있는 도구로 답변을 마무리합니다.'); } catch { /* UI feedback is fail-soft. */ }
+          const provisionalText = finalText;
+          const staged = createStagedHandlers(handlers);
+          messages.push(
+            { role: 'assistant', content: provisionalText.trim() },
+            { role: 'system', content: 'Research evidence was unavailable. Continue answering the user using available non-search tools as needed. Do not invoke web search.' },
+          );
+          const fallbackTools = tools.filter(tool => !['WebSearch', 'OmniSearch'].includes(tool.name));
+          try {
+            const fallbackText = await streamLLMWithTools(messages, staged.handlers, streamOptions(fallbackTools));
+            if (ctx.signal.aborted) {
+              commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
+              return { stopReason: 'aborted', finalText: provisionalText };
+            }
+            finalText = fallbackText || staged.text() || provisionalText;
+            accumulatedText = finalText;
+            if (staged.completion()) {
+              commitStagedTurn(staged.completion(), handlers, finalText, finalText !== provisionalText,
+                value => { finalPhaseAnswer = value; }, ctx.callbacks?.onReplaceText);
+            } else {
+              commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
+            }
+          } catch (error) {
+            commitProvisionalTurn(provisionalTurnMessages, handlers, value => { finalPhaseAnswer = value; });
+            const stopReason = classifyStopReason(error, ctx.signal);
+            if (stopReason === 'aborted') return { stopReason, finalText: provisionalText };
+            if (stopReason === 'auth_rejected') {
+              return {
+                stopReason,
+                finalText: provisionalText,
+                errorMessage: redactSecretText(error instanceof Error ? error.message : String(error)),
+              };
+            }
+            try { ctx.callbacks?.onStatus?.('도구 fallback이 실패해 첫 답변을 유지합니다.'); } catch { /* UI feedback is fail-soft. */ }
+            return { stopReason: 'end_turn', finalText: provisionalText, ...(handlers.onTurnComplete ? { finalPhaseAnswer } : {}) };
+          }
+        } else if (provisionalTurnMessages && ctx.callbacks?.onTurnComplete) {
+          const lastAssistant = [...provisionalTurnMessages].reverse().find(message => message.role === 'assistant');
+          finalPhaseAnswer = lastAssistant?.phase === 'final_answer';
+          ctx.callbacks.onTurnComplete(provisionalTurnMessages);
+        }
+      }
+      try {
+        debug.log('core.turn', 'dispatch-summary', {
+          sessionId: ctx.sessionId,
+          dispatchCount,
+        });
+      } catch {
+        // Observability must not prevent a completed turn from returning.
+      }
+      return {
+        stopReason: ctx.signal.aborted ? 'aborted' : 'end_turn',
+        finalText,
+        ...(ctx.callbacks?.onTurnComplete ? { finalPhaseAnswer } : {}),
+      };
     } catch (err) {
       const stopReason = classifyStopReason(err, ctx.signal);
       if (stopReason === 'aborted') {

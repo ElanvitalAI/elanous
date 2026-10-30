@@ -34,10 +34,12 @@ const BLOOM_BY_LEVEL = Object.fromEntries(COGNITIVE_BY_LEVEL.map((cognitive, ind
   return [index + 1, cell];
 })) as Record<BloomExemplarLevel, Bloom2D>;
 
-// Public source tree intentionally contains only two original exemplars.
+// Public source tree intentionally contains a small set of original exemplars.
 const PUBLIC_EXEMPLARS: readonly BloomExemplar[] = [
   { domain: 'finance', level: 4, bloom: BLOOM_BY_LEVEL[4], question: '채권 금리 변화가 만기 구조와 발행자의 차환 위험에 어떤 경로로 연결되는가?' },
   { domain: 'finance', level: 5, bloom: BLOOM_BY_LEVEL[5], question: '현재 금리 전망을 반박할 수 있는 시장 지표와 그 신뢰도는 무엇인가?' },
+  { domain: 'technology', level: 4, bloom: BLOOM_BY_LEVEL[4], question: 'AI 데이터센터의 추론 처리량 증가가 GPU 전력밀도와 냉각 부하, 랙당 계통용량 요구에 어떤 경로로 이어지는가?' },
+  { domain: 'technology', level: 5, bloom: BLOOM_BY_LEVEL[5], question: 'AI 데이터센터 전력수요 전망을 반박할 수 있는 GPU 이용률·전력사용효율·계통접속 자료는 무엇이며 각 지표의 한계는 무엇인가?' },
 ];
 
 const DOMAIN_TERMS: Record<BloomExemplarDomain, readonly string[]> = {

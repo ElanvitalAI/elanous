@@ -7,7 +7,7 @@ import { registerPublishCommands } from './cli/publish-cli.js';
 import { registerKnowCommand } from './cli/know-cli.js';
 import { program } from './index.js';
 import type { KnowFindDeps } from './knowledge/know-find.js';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { spawnRealCliBytes, type RealCliSpawnBytesResult } from './testing/real-cli-spawn.js';
@@ -686,6 +686,58 @@ describe('agent-mission backend help', () => {
       expect(agentMission.description()).toContain(backend);
       expect(mission.description()).toContain(backend);
       expect(backendOption.description).toContain(backend);
+    }
+  });
+
+  test('production mission entry prints detected status before pipeline launch', async () => {
+    const { program, setAgentMissionCliDepsForTesting, setAgentMissionLogSinkForTesting } = await import('./index.js');
+    const order: string[] = [];
+    const originalError = console.error;
+    const originalPath = process.env.PATH;
+    const fakeBin = mkdtempSync(join(tmpdir(), 'agent-mission-entry-bin-'));
+    const emptyBin = mkdtempSync(join(tmpdir(), 'agent-mission-entry-empty-bin-'));
+    const codex = join(fakeBin, 'codex');
+    writeFileSync(codex, '#!/bin/sh\ncase "$1" in\n  --version) echo "Codex 1.2.3" ;;\n  login) echo "Logged in" ;;\n  *) exit 2 ;;\nesac\n');
+    chmodSync(codex, 0o755);
+    process.env.PATH = fakeBin;
+    console.error = (...args: unknown[]) => { order.push(`stderr:${args.map(String).join(' ')}`); };
+    const exit = spyOn(process, 'exit').mockImplementation(((code?: number) => { order.push(`exit:${code}`); return undefined as never; }) as never);
+    try {
+      setAgentMissionLogSinkForTesting(async (surface) => { order.push(`log-sink:${surface}`); return true; });
+      setAgentMissionCliDepsForTesting({
+        runDevPipeline: (async () => {
+          order.push('pipeline');
+          return { kind: 'agent-mission', plan: {}, result: { ok: true, worktree: '/tmp/wt', branch: 'wt/test', rounds: 1, evidencePath: '/tmp/e', committed: true, usedOmniCrawl: false, detail: 'ok' } } as never;
+        }) as never,
+      });
+
+      await program.parseAsync(['node', 'elanous', 'agent-mission', 'mission', '--branch', 'wt/test', '--backend', 'codex', 'do work']);
+
+      expect(order[0]).toBe('log-sink:agent-mission');
+      expect(order[1]).toBe('stderr:[agent-mission] codex: 설치됨, 로그인 확인됨');
+      expect(order.indexOf('pipeline')).toBeGreaterThan(order.indexOf('stderr:[agent-mission] codex: 설치됨, 로그인 확인됨'));
+      expect(order.at(-1)).toBe('exit:0');
+
+      order.length = 0;
+      process.env.PATH = emptyBin;
+      exit.mockImplementation(((code?: number) => {
+        order.push(`exit:${code}`);
+        if (code !== 0) throw new Error(`PROCESS_EXIT_${code}`);
+        return undefined as never;
+      }) as never);
+      await expect(program.parseAsync(['node', 'elanous', 'agent-mission', 'mission', '--branch', 'wt/missing', '--backend', 'codex', 'do work']))
+        .rejects.toThrow('PROCESS_EXIT_1');
+      expect(order.some((line) => line.startsWith('stderr:[agent-mission] codex: 설치되지 않음'))).toBe(true);
+      expect(order).not.toContain('pipeline');
+    } finally {
+      console.error = originalError;
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      exit.mockRestore();
+      setAgentMissionCliDepsForTesting(undefined);
+      setAgentMissionLogSinkForTesting(undefined);
+      await rm(fakeBin, { recursive: true, force: true });
+      await rm(emptyBin, { recursive: true, force: true });
     }
   });
 });

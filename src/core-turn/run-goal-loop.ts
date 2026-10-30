@@ -389,6 +389,8 @@ export interface GoalLoopOptions {
   contextPressureRatio?: number;
   /** 테스트 seam — runCoreTurn 주입(모듈 mock 오염 회피). 기본 = 실제 runCoreTurn. */
   runTurn?: (ctx: CoreTurnContext) => Promise<CoreTurnResult>;
+  /** Drain evidence that arrived while the previous iteration was running. */
+  drainIterationMessages?: () => readonly LLMMessage[];
   /** Test seam — process-owned lifecycle bridge attach. */
   attachLifecycleBridge?: (bus: ChannelBus, runId: string) => () => void;
   /** Test seam — snapshot the child worktree at successful completion. */
@@ -816,6 +818,22 @@ export async function runGoalLoop(
           appended: tail !== undefined && tail.role === 'user',
         }, { level: 'info' });
       }
+    }
+    // Child results can arrive while runCoreTurn is active. Harvest them at this live
+    // iteration boundary so the next model call sees them without waiting for a new turn.
+    try {
+      const arrived = opts.drainIterationMessages?.() ?? [];
+      if (arrived.length > 0) {
+        messages.push(...arrived);
+        debug.log('goal.loop', 'iteration-messages-drained', {
+          sessionId: ctx.sessionId, ...runAttribution, iteration: iterations + 1, count: arrived.length,
+        }, { level: 'info' });
+      }
+    } catch (error) {
+      debug.log('goal.loop', 'iteration-message-drain-failed', {
+        sessionId: ctx.sessionId, ...runAttribution, iteration: iterations + 1,
+        error: error instanceof Error ? error.message : String(error),
+      }, { level: 'warn' });
     }
     iterations += 1;
 

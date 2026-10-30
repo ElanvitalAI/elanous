@@ -117,12 +117,15 @@ describe('buildSeatBootSystemMessages — 자리 부트 카드', () => {
       ['card-skipped', 'no-seat-state'],
       // TUI-SEAT-MEMORY-RECALL — 카드를 만들 때 직전 인계 회상을 한 번 잰다(이 시험엔 손 인계가 없어 hit:false).
       ['memory-recall', null],
+      // TUI-SEAT-MEMORY-IMPORT — 세션 시작에 읽기 전용 자리 기억 스냅샷을 한 번 만든다.
+      ['memory-import', null],
       ['card-injected', null],
       // TUI-SELFIMPLEMENT-UNDERUSE-MEASURE — 카드를 실은 대화는 의도 승격 흐름도 실었다고 남긴다.
       ['intent.escalate', null],
     ]);
     expect(events[2]!.data).toEqual({ source: null, chars: 0, hit: false });
-    expect(events[3]!.data).toEqual(expect.objectContaining({ seat: 'OP', source: 'cwd', unread: null }));
+    expect(events[3]!.data).toEqual(expect.objectContaining({ seat: 'OP', chars: expect.any(Number) }));
+    expect(events[4]!.data).toEqual(expect.objectContaining({ seat: 'OP', source: 'cwd', unread: null }));
   });
 
   test('대화마다 한 번 — 같은 대화는 같은 문면(세션이 많아도 축출 없음), 새 대화(/session new)는 새 카드', () => {

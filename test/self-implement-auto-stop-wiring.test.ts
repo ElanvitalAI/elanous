@@ -18,13 +18,17 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, spyOn } from 'bun:test';
+import { beforeAll, describe, expect, it, spyOn } from 'bun:test';
 import type { ControlObservation, RunSupervisor } from '../src/autopilot/pty-control-loop.js';
 import { runHeadlessGoalLoopPty } from '../src/self-implement/headless-elanous-driver.js';
 import { STALL_RUNGS_MS } from '../src/capture/frame-observation.js';
 import { debug } from '../src/debug/log.js';
 import { runSelfImplement, type SelfImplementSeams } from '../src/self-implement/orchestrator.js';
 import { defaultSeams } from '../src/self-implement/seams.js';
+
+beforeAll(async () => {
+  await Promise.all([import('../src/elanous-config-dir.js'), import('../src/user-config.js')]);
+}, 120_000);
 
 /** 화면이 **끝까지 바뀌지 않는** 자식 — stall 을 만들기 위한 대역. 살아 있는 채로 계속 폴린다. */
 function stalledHandle(maxPolls: number) {
@@ -160,59 +164,49 @@ describe('S4 P3b 정지 맥락 — 드라이버→brain 배선(런타임)', () =
 //
 // 파서 테스트는 config 를 읽는 것까지, 드라이버 테스트는 옵션을 받은 뒤부터 본다. 그 **사이**
 // (`defaultSeams` 가 `getUserConfig().tools.selfImplement.autoStop` 를 실제로 넘기는가)는 둘 다
-// 통과하면서 끊길 수 있다. 실 spawn 경로를 태워 `autostop.config` 관측으로 잠근다.
+// 통과하면서 끊길 수 있다. `defaultSeams` 자체와 config 경로는 실제로 쓰고 PTY seam만 대역해
+// 전달값을 단언한다. 자식 self-dev 런은 만들지 않아 이 배선 시험이 병렬 하니스 실행을 열지 않는다.
 describe('S4 P3 자동 종료 — seams→config→driver 전달 경로', () => {
   it('⭐ defaultSeams 가 user-config 의 노브를 드라이버까지 실어 나른다', async () => {
-    const { spawnSync } = await import('node:child_process');
-    const { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } = await import('node:fs');
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
-    const { join: j, dirname } = await import('node:path');
-    const home = mkdtempSync(j(tmpdir(), 'as-home-'));
-    const tree = mkdtempSync(j(tmpdir(), 'as-tree-'));
-    const stub = mkdtempSync(j(tmpdir(), 'as-bin-'));
+    const { join: j } = await import('node:path');
+    const { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } = await import('../src/elanous-config-dir.js');
+    const { resetUserConfig } = await import('../src/user-config.js');
+    const root = mkdtempSync(j(tmpdir(), 'as-wiring-'));
+    const configDir = j(root, '.elanous');
+    const tree = j(root, 'tree');
+    const priorConfigDir = getElanousConfigDirOverride();
+    const received: Array<{ wired: boolean; enabled: boolean | undefined; minRung: number | undefined; brainWired: boolean }> = [];
     try {
-      mkdirSync(j(home, '.elanous'));
+      mkdirSync(configDir);
+      mkdirSync(tree);
+      setElanousConfigDir(configDir);
+      resetUserConfig();
       // ★ 노브를 **기본이 아닌 값**으로 켠다 — 기본값이 흘러도 통과하는 테스트가 되지 않게.
-      writeFileSync(j(home, '.elanous', 'config.json'), JSON.stringify({
+      writeFileSync(j(configDir, 'config.json'), JSON.stringify({
         onboarding: { completed: true }, llm: { provider: 'openai-codex' },
         tools: { selfImplement: { autoStop: { enabled: true, minRung: 1 } } },
       }));
-      writeFileSync(j(home, '.elanous', 'leader.json'), JSON.stringify({ tree: '/other', promotedAt: 'x' }));
-      writeFileSync(j(home, '.zshenv'), `export PATH="${dirname(process.execPath)}:$PATH"\n`);
-      spawnSync('git', ['init', '-q'], { cwd: tree });
-      mkdirSync(j(stub, 'bin'));
-      writeFileSync(j(stub, 'bin', 'elanous.mjs'), 'process.exit(0);\n');
-      const out = j(stub, 'observed.json');
-
-      const script = `
-        const {defaultSeams}=require('${process.cwd()}/src/self-implement/seams.ts');
-        let seen=null;
-        const seams=defaultSeams({
-          elanousBinRoot:'${stub}', implementMaxWaitSec:3, ptyAvailable:()=>true,
-          runHeadlessGoalLoopPty:async (opts)=>{
-            seen={wired:opts.autoStop!==undefined,enabled:opts.autoStop?.enabled,minRung:opts.autoStop?.minRung,brainWired:opts.brain!==undefined};
-            return {ok:false};
-          },
-        });
-        seams.implement({cwd:'${tree}', feature:'noop'}).finally(()=>{
-          require('node:fs').writeFileSync('${out}', JSON.stringify(seen||{}));
-        });
-      `;
-      spawnSync('bun', ['-e', script], {
-        encoding: 'utf8', timeout: 150_000, cwd: tree,
-        env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: '', ELANOUS_CONFIG_DIR: '', ELANOUS_NEXUS_DIR: '', ELANOUS_NEST_DEPTH: '0' },
+      execFileSync('git', ['init', '-q'], { cwd: tree });
+      const seams = defaultSeams({
+        implementMaxWaitSec: 3,
+        ptyAvailable: () => true,
+        runHeadlessGoalLoopPty: async (opts) => {
+          received.push({ wired: opts.autoStop !== undefined, enabled: opts.autoStop?.enabled,
+            minRung: opts.autoStop?.minRung, brainWired: opts.brain !== undefined });
+          return { ok: true, reachedCompletion: false, transcript: '', toolCalls: 0, timedOut: false,
+            exitReason: 'child-exit', exitCode: 0, ptyId: 'mock-pty' };
+        },
       });
-
-      expect(existsSync(out)).toBe(true);
-      const seen = JSON.parse(readFileSync(out, 'utf-8')) as Record<string, unknown>;
-      expect(seen.wired).toBe(true);        // ★ seams 가 노브를 넘겼다(끊기면 false)
-      expect(seen.enabled).toBe(true);      // ★ config 값이 그대로 도착했다
-      expect(seen.minRung).toBe(1);         //    기본(2)이 아니라 내가 쓴 값
-      expect(seen.brainWired).toBe(true);
+      await seams.implement({ cwd: tree, feature: 'noop', runId: 'auto-stop-wiring-test' });
+      expect(received).toEqual([{ wired: true, enabled: true, minRung: 1, brainWired: true }]);
     } finally {
-      for (const d of [home, tree, stub]) rmSync(d, { recursive: true, force: true });
+      resetUserConfig();
+      if (priorConfigDir) setElanousConfigDir(priorConfigDir); else resetElanousConfigDir();
+      rmSync(root, { recursive: true, force: true });
     }
-  }, 180_000);
+  }, 60_000);
 });
 
 

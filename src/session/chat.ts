@@ -42,9 +42,15 @@ import {
 // ⭐ substrate 통합(PLAN-unified-autonomous-agent-substrate-2026-07-20) — goal-loop 아밍 시
 // chat 툴루프를 canonical 엔진(runGoalLoop→runCoreTurn→streamLLMWithTools)으로 라우팅.
 // ACP bridge(core-turn-bridge.ts)·dashboard(runGoalLoopHook)와 동일 엔진 재사용(재발명 제거).
-import { runGoalLoop, type CoreTurnContext, type CoreTurnDispatchTool } from '../core-turn/index.js';
+import { runCoreTurn, runGoalLoop, type CoreTurnContext, type CoreTurnDispatchTool } from '../core-turn/index.js';
 import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
+import { isResearchAgentIntent } from '../tool-hints/signals.js';
+import {
+  buildSessionRuntimeTurnSystemMessages,
+  createSessionPostureState,
+  resolveSessionTurnProfileWithHistory,
+} from '../session-runtime/index.js';
 
 export interface RunTurnOpts {
   userConfig: UserConfig;
@@ -59,6 +65,8 @@ export interface RunTurnOpts {
   /** Optional callback for each streamed text delta — telegram uses this to
    *  accumulate; CLI uses it to render live. */
   onDelta?: (delta: string) => void;
+  /** Replace a provisional streamed answer after a grounded TUI synthesis completes. */
+  onReplaceText?: (fullText: string) => void;
   /** Optional transient stream recovery status for the originating UI. */
   onStatusLine?: (line: string) => void;
   /** Optional provider override — for tests. */
@@ -294,6 +302,24 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // just skip and continue.
   let memoryIds: string[] = [];
   let effectiveSystemPrompt = opts.systemPrompt;
+  // The Next TUI runs through this shared session adapter rather than the classic dashboard
+  // preamble. Give research turns the same verified-reconciliation instruction on this path.
+  if (meta.source === 'tui' && !effectiveSystemPrompt?.includes('## Proactive Reconciliation')) {
+    const priorUserTexts = messages
+      .filter(message => message.role === 'user' && typeof message.content === 'string')
+      .map(message => String(message.content));
+    const turnProfile = resolveSessionTurnProfileWithHistory({
+      userText: opts.userText,
+      priorUserTexts,
+      chatModeState: createSessionPostureState(),
+    });
+    const reconciliation = buildSessionRuntimeTurnSystemMessages(turnProfile, opts.userText)
+      .filter(message => String(message.content).includes('## Proactive Reconciliation'));
+    if (reconciliation.length > 0) {
+      const block = reconciliation.map(message => String(message.content)).join('\n\n');
+      effectiveSystemPrompt = effectiveSystemPrompt ? `${effectiveSystemPrompt}\n\n${block}` : block;
+    }
+  }
   if (!opts.skipMemoryInjection) {
     try {
       // LLM-judge recall(2026-07-19 · 기본 ON·대표 지시) — 키워드 대신 luna 의미판정으로 관련
@@ -485,7 +511,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     // streamLLMWithTools)으로 라우팅. 미아밍이면 아래 기존 single-turn 경로 그대로(회귀 0).
     const goalLoopCfg = opts.userConfig.llm.goalLoop;
     const armGoalLoop = opts.goalLoop === true || goalLoopCfg?.enabled === true;
-    if (armGoalLoop) {
+    const armTuiResearchTurn = opts.utteranceSurface === 'tui' && turnTools.length > 0 && isResearchAgentIntent(opts.userText);
+    if (armGoalLoop || armTuiResearchTurn) {
       // ⭐ CHILD-CONTEXT-BUDGET(0.2.35 칸) — 구현 자식(self-implement 공간)의 첫 goal-loop
       //    턴에서 실제 effectiveSystemPrompt·turnTools 스키마·userText(골)의 구성 바이트를
       //    composeChildContext 로 계측해 child.context-composition 사건 1회로 남긴다.
@@ -520,6 +547,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         signal: opts.signal ?? new AbortController().signal,
         callbacks: {
           onText: (delta) => { opts.onDelta?.(delta); },
+          onReplaceText: (fullText) => { opts.onReplaceText?.(fullText); },
           onGoalInterim: (interimText) => {
             appendMessage(opts.sessionId, {
               role: 'assistant', content: interimText, ts: new Date().toISOString(),
@@ -540,8 +568,14 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           ? { requestSizeGuard: guardedTurnLlmOpts.requestSizeGuard } : {}),
       };
       const maxIterations = opts.goalLoopMaxIterations ?? goalLoopCfg?.maxIterations;
-      const gl = await runGoalLoop(coreCtx, maxIterations !== undefined ? { maxIterations } : {});
-      text = gl.finalText;
+      if (armGoalLoop) {
+        const gl = await runGoalLoop(coreCtx, maxIterations !== undefined ? { maxIterations } : {});
+        text = gl.finalText;
+      } else {
+        const coreResult = await runCoreTurn(coreCtx);
+        text = coreResult.finalText;
+        if (coreResult.stopReason === 'auth_rejected') throw new Error(coreResult.errorMessage ?? 'Authentication was rejected');
+      }
     } else {
     text = await streamLLMWithTools(
       kept,

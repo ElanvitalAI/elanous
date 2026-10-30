@@ -42,6 +42,29 @@ test('⑴ 문서만 미검증이면 acknowledge · done · next=review', () => {
   expect(outputOf(json, 'acknowledge')?.next).toBe('review');
 }, 120_000);
 
+test('materialized mismatch uses collect output to refine a goal and request one relaunch', () => {
+  const goal = '목표: 구현한다\n대상 경로: src/expected.ts\n검증 무대: 기존 시험';
+  const triage = roleResult('triage', { input: { failure: { noProgressReason: 'unchanged diff' } }, outputs: { 'observe-deeper': {}, 'ground-external': {} } });
+  expect(triage.outcome).toBe('reauthor-from-materialized');
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const revised = roleResult('revise-goal', { runId: 'hra-fixture', input: { goal }, outputs: { collect: { entries: [{
+    materializedPaths: ['src/actual.ts'], failedTestNames: ['node-b-fixture'], passedTestNames: ['smoke'], mustFix: ['same contract gap'],
+    diffSummary: ['changed implementation'], doctorVisits: [{ action: 'doctor' }], noProgressReason: 'unchanged diff',
+  }] } } }, { writeLedger: (entry) => { events.push({ event: entry.event, data: entry.data }); } });
+  expect(revised).toMatchObject({ outcome: 'ok', next: 'implement', reauthor: true, relaunchCount: 1, event: 'goal-refined' });
+  expect(revised.goalDiff).toEqual(['- 대상 경로: src/expected.ts', '+ 대상 경로: src/actual.ts']);
+  expect(revised.revisedGoal).toContain('대상 경로: src/actual.ts');
+  expect(revised.evidence).toMatchObject({ passedTestNames: ['smoke'], mustFix: ['same contract gap'], doctorVisits: [{ action: 'doctor' }] });
+  expect(events.filter((event) => event.event === 'goal-refined')).toHaveLength(1);
+  expect(events.filter((event) => event.event === 'reauthor-relaunch-request')).toHaveLength(1);
+});
+
+test('revise-goal cannot claim success without collected materialized paths or an exact target line', () => {
+  const goal = '목표: 구현한다\n검증 무대: 기존 시험';
+  const result = roleResult('revise-goal', { runId: 'hra-no-evidence', input: { goal }, outputs: { collect: { entries: [{ materializedPaths: [], doctorVisits: [] }] } } });
+  expect(result).toMatchObject({ outcome: 'fail', needsHuman: true, reason: 'insufficient-materialized-evidence' });
+});
+
 test('⑵ importer 미실행은 heal-harness 를 거쳐 triage 로 돌아온다', () => {
   const { json } = graphRun({ failure: { failedTests: 0, importerUnrunTests: 1, unverified: ['src/a.ts'] } });
   expect(json.path).toContain('heal-harness');

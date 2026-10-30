@@ -104,6 +104,11 @@ function spyActions(ok = true) {
     'rebase-regate': mk('rebase-regate'),
     'resume-from-salvage': mk('resume-from-salvage'),
     'derive-evidence-rejudge': mk('derive-evidence-rejudge'),
+    'reauthor-from-materialized': mk('reauthor-from-materialized'),
+    'switch-provider': mk('switch-provider'),
+    'retry-provider': mk('retry-provider'),
+    'wait-release': mk('wait-release'),
+    'remeasure-gate': mk('remeasure-gate'),
   };
   return { calls, actions };
 }
@@ -121,6 +126,13 @@ const EXPECTED: Record<RunStopClass, AutohealAction> = {
   fabric: 'needs-owner',
   'launch-failed': 'needs-owner',
   'gate-failed': 'needs-owner',
+  'implement-aborted': 'reauthor-from-materialized',
+  'out-of-scope-held': 'reauthor-from-materialized',
+  'provider-auth-missing': 'switch-provider',
+  'provider-unavailable': 'retry-provider',
+  'merge-held-release-path': 'wait-release',
+  'pr-guard-failed': 'reauthor-from-materialized',
+  'gate-unmeasured': 'remeasure-gate',
   unclassified: 'needs-owner',
 };
 
@@ -429,7 +441,8 @@ describe('STOP-AUTOHEAL ladder declaration (graphs/overlays/stop-heal-ladder.yam
     const graphId = GRAPH_SPECS['self-implement']!.graphId;
     const overlays = loadGraphOverlays(defaultOverlaysDir()).overlays;
     expect(overlays.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')).map((overlay) => overlay.stage))
-      .toEqual(['heal', 'heal', 'heal', 'heal', 'heal']);
+      .toHaveLength(12);
+    expect(overlays.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')).every((overlay) => overlay.stage === 'heal')).toBe(true);
     for (const cls of RUN_STOP_CLASSES) {
       for (const stage of ['launch', 'runtime'] as const) {
         const { applied } = selectOverlays(overlays, { graphId, stage, state: { stop_class: cls } });

@@ -27,6 +27,7 @@ import {
   DEFAULT_PROVIDER,
 } from './config.js';
 import { debug, redactSecrets, redactSecretText } from './debug/log.js';
+import { estimateMessagesTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
@@ -274,6 +275,13 @@ export interface LLMMessage {
   phase?: 'commentary' | 'partial_answer' | 'final_answer';
   /** Opaque Codex stateless reasoning items, before this assistant message. */
   codexReasoningItems?: Array<{ type: 'reasoning'; encrypted_content: string; summary: unknown[]; id?: string }>;
+  /** TUI-PROMPT-CACHE-PREFIX — a `system` message whose text changes between
+   *  requests of one session (seat boot card · git snapshot · memory · self
+   *  health · per-turn guidance). The Codex Responses serializer keeps these
+   *  OUT of `instructions` (which must stay byte-stable for prompt-cache
+   *  prefix reuse) and sends them as a `developer` item placed just before
+   *  the latest user message. Other providers ignore the flag. */
+  cacheVolatile?: boolean;
 }
 
 /** JSONSchema-shaped tool definition sent to the provider (no handler). */
@@ -1707,6 +1715,15 @@ export interface MessagesToResponsesInputOpts {
   replayCodexReasoning?: boolean;
   acceptUserMessageImages?: boolean;
   onOrphanToolResult?: (callId: string) => void;
+  /** TUI-PROMPT-CACHE-PREFIX — keep `instructions` stable for the prompt
+   *  cache prefix. When true: (a) leading `system` messages flagged
+   *  `cacheVolatile` are merged into ONE `developer` item inserted right
+   *  before the latest user text message (after the cached history), and
+   *  (b) `system` messages that appear after the conversation started
+   *  (loop self-notes, mid-turn hints) are emitted IN PLACE as `developer`
+   *  items instead of being folded into `instructions`. Default false keeps
+   *  the legacy "every system → instructions" fold. */
+  stablePrefix?: boolean;
 }
 
 /** Exported for tests. Converts the unified LLMMessage shape into the
@@ -1747,6 +1764,11 @@ export function messagesToResponsesInput(
 
   const sys: string[] = [];
   const input: ResponsesInputItem[] = [];
+  const stablePrefix = opts.stablePrefix === true;
+  // Leading volatile system text (stablePrefix only) — spliced in before the
+  // latest user text message once the whole input is assembled.
+  const volatileSys: string[] = [];
+  let conversationStarted = false;
   for (const m of messages) {
     // Build typed content blocks: text accumulated into one block,
     // images appended as separate input_image entries. The old
@@ -1873,9 +1895,20 @@ export function messagesToResponsesInput(
     }
 
     if (m.role === 'system') {
+      if (stablePrefix && conversationStarted) {
+        // Mid-conversation system note → in-place developer item. Folding it
+        // into `instructions` would rewrite the cache prefix every round.
+        if (textBuf) input.push({ role: 'developer', content: [{ type: 'input_text', text: textBuf }] });
+        continue;
+      }
+      if (stablePrefix && m.cacheVolatile) {
+        if (textBuf) volatileSys.push(textBuf);
+        continue;
+      }
       sys.push(textBuf);
       continue;
     }
+    conversationStarted = true;
 
     // Stateless Codex requires the opaque reasoning item in its original
     // position before the corresponding assistant message/tool calls.
@@ -1901,11 +1934,29 @@ export function messagesToResponsesInput(
     }
     input.push(...trailingItems);
   }
+  if (volatileSys.length > 0) {
+    const developerItem: ResponsesInputItem = {
+      role: 'developer',
+      content: [{ type: 'input_text', text: volatileSys.join('\n\n') }],
+    };
+    input.splice(latestUserTextIndex(input), 0, developerItem);
+  }
   if (input.length === 0) input.push({ role: 'user', content: [{ type: 'input_text', text: '' }] });
   return {
     instructions: sys.length ? sys.join('\n\n') : 'You are a helpful assistant.',
     input,
   };
+}
+
+/** Index of the latest user message carrying text/image content (not a bare
+ *  tool output). Volatile per-turn context goes right before it, so the
+ *  history before it stays a stable cached prefix. No such message → end. */
+function latestUserTextIndex(input: readonly ResponsesInputItem[]): number {
+  for (let i = input.length - 1; i >= 0; i--) {
+    const item = input[i]!;
+    if ('role' in item && item.role === 'user') return i;
+  }
+  return input.length;
 }
 
 /** store=true wave: compute the incremental tail when `current` is a
@@ -1958,6 +2009,35 @@ export function getIncrementalItems(
 export function computePromptCacheKey(model: string, instructions: string): string {
   const prefix = (instructions || '').slice(0, 500);
   return createHash('sha256').update(`${model}::${prefix}`).digest('hex').slice(0, 32);
+}
+
+/** TUI-PROMPT-CACHE-PREFIX — per-conversation cache affinity for the Codex
+ *  Responses backend. Mirrors ref/codex `core/src/client.rs`
+ *  (`PromptCacheKey::SessionDerived` → the session id itself is the
+ *  `prompt_cache_key`, and the same id rides the `session-id` header —
+ *  `codex-api/src/requests/headers.rs`; the underscored `session_id` alias
+ *  was dropped upstream in #22193 because proxies reject `_` headers).
+ *
+ *  Precedence: chat `sessionId` → harness run `ELANOUS_RUN_ID`. Neither →
+ *  null and the caller falls back to the legacy instructions-prefix key.
+ *  Ids that are long (> 64 chars — the prompt_cache_key limit) or carry
+ *  characters outside `[A-Za-z0-9._:-]` fold to `elanous-<sha256/32>`. */
+export function codexSessionCacheKey(
+  sessionId: string | undefined,
+  runId: string | undefined,
+): { key: string; source: 'session' | 'run'; hashed: boolean } | null {
+  const s = sessionId && sessionId.trim() ? sessionId : undefined;
+  const r = runId && runId.trim() ? runId : undefined;
+  const raw = s ?? r;
+  if (!raw) return null;
+  const source = s ? 'session' : 'run';
+  if (raw.length <= 64 && /^[A-Za-z0-9._:-]+$/.test(raw)) return { key: raw, source, hashed: false };
+  return { key: `elanous-${createHash('sha256').update(raw).digest('hex').slice(0, 32)}`, source, hashed: true };
+}
+
+/** Short content hash for request-stability observation (logs only). */
+function stabilityHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 16);
 }
 
 /** Cycle order for the HUD pill click + `/reasoning` no-arg form. */
@@ -2240,8 +2320,12 @@ function buildCodexResponsesWireBody(
     previousResponseId?: string;
   },
   promptCache: boolean,
+  /** Session-derived key (codexSessionCacheKey). Absent → legacy key. */
+  sessionCacheKey?: string,
 ): Record<string, unknown> {
-  const cacheKey = promptCache ? computePromptCacheKey(body.model, body.instructions) : undefined;
+  const cacheKey = promptCache
+    ? (sessionCacheKey ?? computePromptCacheKey(body.model, body.instructions))
+    : undefined;
   return {
     ...body,
     stream: true,
@@ -2259,8 +2343,9 @@ function buildCodexResponsesWireBody(
 function serializeCodexResponsesWireBody(
   body: Parameters<typeof buildCodexResponsesWireBody>[0],
   promptCache: boolean,
+  sessionCacheKey?: string,
 ): string {
-  return JSON.stringify(buildCodexResponsesWireBody(body, promptCache));
+  return JSON.stringify(buildCodexResponsesWireBody(body, promptCache, sessionCacheKey));
 }
 
 export async function* streamCodexResponsesEvents(
@@ -2320,9 +2405,14 @@ export async function* streamCodexResponsesEvents(
     onResponseCreated?: (id: string) => void;
     /** Unused configured fallbacks. Overload k times switches before retries. */
     remainingFallbacks?: number;
+    /** TUI-PROMPT-CACHE-PREFIX — conversation id for cache affinity. When
+     *  set (or `ELANOUS_RUN_ID` is), `prompt_cache_key` is session-derived
+     *  and the `session-id` header is sent (ref/codex parity). */
+    sessionId?: string;
   } = {},
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   const startedAt = Date.now();
+  const sessionAffinity = codexSessionCacheKey(extra.sessionId, process.env.ELANOUS_RUN_ID);
   // See comment in streamOpenAIEvents — we drop the raw body by
   // default. `/debug verbose on` restores the full body for deep
   // reproduction.
@@ -2340,6 +2430,16 @@ export async function* streamCodexResponsesEvents(
       inputChars: (() => { try { return JSON.stringify(body.input).length; } catch { return -1; } })(),
       toolChars: (() => { try { return JSON.stringify(body.tools ?? []).length; } catch { return -1; } })(),
       instructionChars: body.instructions.length,
+      // TUI-PROMPT-CACHE-PREFIX — prefix stability: two requests of one
+      // session must log the same instructionsHash ⊕ toolsHash ⊕ cacheKey.
+      instructionsHash: stabilityHash(body.instructions),
+      toolsHash: (() => { try { return stabilityHash(JSON.stringify(body.tools ?? [])); } catch { return 'unhashable'; } })(),
+      toolChoice: body.tool_choice ?? null,
+      promptCacheKey: extra.promptCache === false
+        ? null
+        : (sessionAffinity?.key ?? computePromptCacheKey(body.model, body.instructions)).slice(0, 24),
+      cacheKeySource: extra.promptCache === false ? 'off' : (sessionAffinity?.source ?? 'instructions-prefix'),
+      sessionHeader: sessionAffinity !== null,
       tools: observeRequestTools(body.tools),
       instructions: body.instructions.slice(0, 200),
       accountId: extra.accountId ? `${extra.accountId.slice(0, 8)}…` : '(none)',
@@ -2367,7 +2467,7 @@ export async function* streamCodexResponsesEvents(
   const promptCache = extra.promptCache !== false;
   // TUI-REQUEST-SIZE-COMPACT — the exact serializer is shared with the
   // preflight guard, so the size decision and fetch body cannot drift.
-  const wireBody = buildCodexResponsesWireBody(body, promptCache);
+  const wireBody = buildCodexResponsesWireBody(body, promptCache, sessionAffinity?.key);
   const wireJson = extra.serializedWireBody ?? JSON.stringify(wireBody);
   debug.log('llm.request', 'request-size', {
     provider: 'openai-codex',
@@ -2391,6 +2491,9 @@ export async function* streamCodexResponsesEvents(
         // is treated as an old client → 400 "requires a newer version of
         // Codex". See getCodexUserAgent (oauth/codex.ts).
         'User-Agent': getCodexUserAgent(),
+        // ChatGPT derives cache affinity from this header (ref/codex
+        // client.rs `responses_session_id` → `build_session_headers`).
+        ...(sessionAffinity ? { 'session-id': sessionAffinity.key } : {}),
       },
       body: wireJson,
       signal,
@@ -5828,8 +5931,19 @@ async function tryForceSynthesisPass(args: {
    *  / error), this function emits a clear signal to wipe any
    *  partial text it streamed. */
   streamingHandlers?: { onText: (delta: string, accumulated: string) => void };
+  /** TUI-PROMPT-CACHE-PREFIX — the turn's session + tools. On Codex the pass
+   *  keeps the same tools array (tool_choice:'none') and session cache key so
+   *  it reuses the cached prefix instead of rewriting it with tools dropped. */
+  sessionId?: string;
+  tools?: LLMToolSpec[];
 }): Promise<string | null> {
   const { provider, model, history, turn, modelFamily, streamingHandlers } = args;
+  const keepToolsNoCall = provider.name === 'openai-codex' && (args.tools?.length ?? 0) > 0;
+  const synthesisOpts: LLMOpts = {
+    model,
+    ...(args.sessionId ? { sessionId: args.sessionId } : {}),
+    ...(keepToolsNoCall ? { tools: args.tools, toolChoice: 'none' as const } : {}),
+  };
   const synthesisPromptMsg: LLMMessage = {
     role: 'user',
     content:
@@ -5862,7 +5976,7 @@ async function tryForceSynthesisPass(args: {
   try {
     let collected = '';
     const MAX_OUTPUT_CHARS = 8000;
-    for await (const delta of provider.chat(synthesisHistory, { model, signal: f2Controller.signal })) {
+    for await (const delta of provider.chat(synthesisHistory, { ...synthesisOpts, signal: f2Controller.signal })) {
       collected += delta;
       // Live progressive emit — TUI shows synthesis text as it
       // generates instead of all-at-once at the end (user-reported
@@ -8889,6 +9003,10 @@ export async function streamLLMWithTools(
   //   read-time projection 등 교체. 문맥관리를 substrate 프리미티브로 통일(streamLLMWithTools 인라인 산재 해소).
   const { createDefaultContextStrategy: _makeContextStrategy } = require('./agent-substrate/context-strategy.js') as typeof import('./agent-substrate/context-strategy.js');
   const _contextStrategy = opts.contextStrategy ?? _makeContextStrategy();
+  // Latest provider prompt usage is the trigger baseline. Add estimated growth
+  // appended to history after that request (usually tool output) at the next loop.
+  let previousInputTokens: number | undefined;
+  let previousRequestEstimatedTokens: number | undefined;
   let loopTermination: 'budget-exhausted' | 'aborted' = 'budget-exhausted';
   let terminalTurn = maxTurns;
 
@@ -8976,7 +9094,21 @@ export async function streamLLMWithTools(
             // ★ 조각2 — pluggable context 전략(기본=2-tier compaction·무회귀 이관). 판정+압축을 substrate 프리미티브가
             //   수행 → caller 는 splice/관측/breaker 만. 주입(opts.contextStrategy)으로 read-time projection 등 교체 가능.
             const beforeLen = history.length;
-            const outcome = await _contextStrategy.compact(history, { model: effectiveModel, ...(opts.sessionId ? { sessionId: opts.sessionId } : {}), config: acCfg });
+            const outcome = await _contextStrategy.compact(history, {
+              model: effectiveModel,
+              ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+              config: acCfg,
+              ...(previousInputTokens !== undefined ? {
+                observedInputTokens: previousInputTokens + Math.max(
+                  0,
+                  estimateMessagesTokens(history) - (previousRequestEstimatedTokens ?? estimateMessagesTokens(history)),
+                ),
+              } : {}),
+            });
+            // This usage event belongs to the request before this compaction
+            // decision; do not carry it into another loop iteration.
+            previousInputTokens = undefined;
+            previousRequestEstimatedTokens = undefined;
             if (outcome.fired && outcome.reduced) {
               history.splice(0, history.length, ...outcome.messages);
               // ★ 관측(2026-07-21) — beforeTokens/afterTokens 포함(reduced 는 개수 아닌 **토큰** 감소로 판정).
@@ -9029,7 +9161,19 @@ export async function streamLLMWithTools(
     // revert to auto (see above).
     const buildTurnOpts = () => {
       const remainingFallbacks = opts.provider ? 0 : remainingFallbackProviderNames(attemptedProviders, opts).length;
-      const base = { ...opts, model: activeModel, tools: completionNeedsFinalTurn ? [] : activeTools, remainingFallbacks };
+      // TUI-PROMPT-CACHE-PREFIX — on Codex the final-answer turn shares the
+      // session cache key, so dropping tools would rewrite the cached prefix
+      // (measured toolChars 67k → 2). Keep the same tools and forbid calls
+      // with tool_choice:'none' instead. Other providers keep the legacy
+      // empty tools (some ignore toolChoice).
+      const keepToolsNoCall = completionNeedsFinalTurn && activeProvider.name === 'openai-codex';
+      const base = {
+        ...opts,
+        model: activeModel,
+        tools: completionNeedsFinalTurn && !keepToolsNoCall ? [] : activeTools,
+        remainingFallbacks,
+      };
+      if (keepToolsNoCall) return { ...base, toolChoice: 'none' as const };
       return turn === 0 ? base : { ...base, toolChoice: undefined };
     };
     let turnOpts = buildTurnOpts();
@@ -9148,6 +9292,7 @@ export async function streamLLMWithTools(
               : turnOpts.toolChoice,
           };
           const providerMessages = mapProviderToolNamesInMessages(history, nameMap.toProviderName);
+          previousRequestEstimatedTokens = estimateMessagesTokens(providerMessages);
           streamIter = restoreProviderToolCallNames(
             activeProvider.streamChat!(providerMessages, providerOpts),
             nameMap.toOriginalName,
@@ -9397,6 +9542,10 @@ export async function streamLLMWithTools(
       } else if (ev.type === 'usage') {
         // Provider parsers normalize inputTokens to uncached input; cache
         // reads/writes are separate fields (prompt-cache/types.ts contract).
+        const observedPromptTokens = (ev.usage.inputTokens ?? 0)
+          + (ev.usage.cacheReadInputTokens ?? 0)
+          + (ev.usage.cacheCreationInputTokens ?? 0);
+        if (observedPromptTokens > 0) previousInputTokens = observedPromptTokens;
         // ⭐ 주 에이전트 턴의 토큰·비용을 «게이트 없이» 남긴다(2026-09-24 실측: 이 줄이 없어 3시간 `llm.usage`
         //   18행이 전부 곁가지 두 자리였고, 하니스 런 비용의 거의 전부가 관측 밖이었다). 곁가지와 같은 모양 ·
         //   모르는 모델은 금액 대신 `cost.kind='unknown'`. runId 는 debug.log 가 붙인다. 실패해도 턴은 계속.
@@ -11552,6 +11701,8 @@ export async function streamLLMWithTools(
           history,
           turn,
           modelFamily,
+          ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+          tools: activeTools,
           // Live progressive streaming — deltas emit through handlers
           // during collection so TUI shows synthesis text as it
           // generates instead of one big chunk at the end.
@@ -12198,6 +12349,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
           acceptToolImages: codexAcceptToolImages,
           acceptUserMessageImages: codexAcceptUserImages,
           replayCodexReasoning: !useStore,
+          stablePrefix: true,
           onOrphanToolResult: (callId) => {
             try { debug.log('llm.codex', 'orphan-tool-output-dropped', { callId }); }
             catch { /* observation must not block the request */ }
@@ -12254,6 +12406,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
           ? messagesToResponsesInput(messages, {
               acceptToolImages: codexAcceptToolImages,
               acceptUserMessageImages: codexAcceptUserImages,
+              stablePrefix: true,
             }).input
           : input);
         const wirePrevId = (delta && lastResponseId) ? lastResponseId : undefined;
@@ -12274,9 +12427,12 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         };
         const requestGuard = opts.requestSizeGuard;
         const promptCache = opts.promptCache !== false;
+        // TUI-PROMPT-CACHE-PREFIX — the preflight must measure the same body
+        // streamCodexResponsesEvents would build (session-derived key).
+        const sessionCacheKey = codexSessionCacheKey(opts.sessionId, process.env.ELANOUS_RUN_ID)?.key;
         let serializedWireBody: string | undefined;
         if (requestGuard) {
-          serializedWireBody = serializeCodexResponsesWireBody(requestBody, promptCache);
+          serializedWireBody = serializeCodexResponsesWireBody(requestBody, promptCache, sessionCacheKey);
           let requestChars = serializedWireBody.length;
           const initialRequestChars = requestChars;
           let requestCompacted = false;
@@ -12295,9 +12451,10 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
                   // Compaction runs only when store threading is off, matching
                   // the original non-threaded wire input policy.
                   replayCodexReasoning: !useStore,
+                  stablePrefix: true,
                 });
                 const compactBody = { ...requestBody, instructions: compactInput.instructions, input: compactInput.input };
-                const compactWireBody = serializeCodexResponsesWireBody(compactBody, promptCache);
+                const compactWireBody = serializeCodexResponsesWireBody(compactBody, promptCache, sessionCacheKey);
                 const compactChars = compactWireBody.length;
                 if (compactChars < requestChars) {
                   messages.splice(0, messages.length, ...compacted.messages);
@@ -12341,6 +12498,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         yield* streamCodexResponsesEvents(responsesUrl, tokens.accessToken, requestBody, opts.signal, {
           accountId,
           promptCache,
+          ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
           ...(serializedWireBody ? { serializedWireBody } : {}),
           // Capture the new response id from the SSE stream so the
           // next call can thread it. If the backend skips the event

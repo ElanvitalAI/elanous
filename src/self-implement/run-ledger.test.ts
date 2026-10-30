@@ -68,6 +68,69 @@ describe('run-ledger dev project annotation', () => {
   });
 });
 
+describe('run-ledger graph event sequence', () => {
+  it('assigns one monotonic sequence to graph and traversal events at both append boundaries', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-graph-seq-'));
+    const runId = 'run-00000000-0000-4000-8000-000000000906';
+    try {
+      appendRunLedgerEntry({ runId, event: 'start', data: {} }, directory);
+      appendRunLedgerEntry({ runId, event: 'pipeline-node-entry', data: { node: 'investigate' } }, directory);
+      appendRunLedgerEntry({ runId, event: 'node-added', data: { node: 'source-check' } }, directory);
+      const checked = appendRunLedgerEntryChecked(runId, () => ({
+        append: true,
+        entry: { runId, event: 'pipeline-node-exit', data: { node: 'investigate', outcome: 'ok' } },
+      }), directory);
+
+      expect(checked.appended).toBe(true);
+      expect((loadRunLedger(runId, directory) ?? []).map(({ event, seq }) => [event, seq])).toEqual([
+        ['start', undefined], ['pipeline-node-entry', 1], ['node-added', 2], ['pipeline-node-exit', 3],
+      ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('does not restore or mutate a ledger when a checked append is declined', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-graph-seq-decline-'));
+    const runId = 'run-00000000-0000-4000-8000-000000000907';
+    try {
+      const result = appendRunLedgerEntryChecked(runId, () => ({ append: false, result: 'declined' }), directory);
+      expect(result).toEqual({ appended: false, result: 'declined', refusal: null });
+      expect(existsSync(runLedgerPath(runId, directory))).toBe(false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('assembles a valid multi-chunk final record without a newline before appending', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-graph-seq-long-tail-'));
+    const runId = 'run-00000000-0000-4000-8000-000000000908';
+    try {
+      writeFileSync(runLedgerPath(runId, directory), JSON.stringify({ runId, event: 'start', data: { padding: 'x'.repeat(12_000) } }));
+      appendRunLedgerEntry({ runId, event: 'pipeline-node-entry', data: { node: 'investigate' } }, directory);
+      const entries = loadRunLedger(runId, directory) ?? [];
+      expect(entries).toHaveLength(2);
+      expect(entries[1]).toMatchObject({ event: 'pipeline-node-entry', seq: 1 });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('matches loadRunLedger by rejecting a malformed complete row before appending', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-graph-seq-malformed-'));
+    const runId = 'run-00000000-0000-4000-8000-000000000909';
+    try {
+      const path = runLedgerPath(runId, directory);
+      writeFileSync(path, '{broken}\n');
+      expect(() => appendRunLedgerEntry({ runId, event: 'pipeline-node-entry', data: { node: 'investigate' } }, directory))
+        .toThrow('invalid run ledger JSON');
+      expect(readFileSync(path, 'utf8')).toBe('{broken}\n');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
 // ⛔⭐⭐⭐ 미완 «판별» — 종전엔 이 조회가 낸 것이 한 값(`terminal-status-missing`)뿐이었다.
 //   📏 2026-08-11 실측: 그 한 값에 「실제로 도는 것 2 · 5.2일 된 잔해 51 · 종료를 «다른 이름»으로
 //     적은 것 5」가 섞여 있었다 ⇒ 회고에서 「무엇이 내 찌꺼기인가」를 못 갈랐다.

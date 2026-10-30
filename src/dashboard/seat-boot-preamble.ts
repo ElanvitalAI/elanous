@@ -95,6 +95,9 @@ export const SEAT_INTENT_ESCALATION_FLOW =
 export const SEAT_MEMORY_RECALL_PREFIX = '🧠 직전 인계 회상:';
 export const SEAT_MEMORY_RECALL_MAX_CHARS = 360;
 const RECALL_READ_BYTES = 16_384;
+export const SEAT_MEMORY_IMPORT_PREFIX = '🧠 자리 기억 스냅샷:';
+export const SEAT_MEMORY_IMPORT_MAX_CHARS = 2_000;
+const SEAT_MEMORY_HANDOFF_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 /** 발췌(제목 — 첫 줄)에 남길 최소 글자 — 이보다 모자라면 전문 경로를 짧은 꼴로 바꾼다. */
 const RECALL_MIN_EXCERPT = 60;
 /** 줄에 싣는 파일명 최대 글자. */
@@ -184,6 +187,162 @@ function seatMemoryRecallLine(seatDir: string): string | null {
   return recall.line;
 }
 
+interface SeatMemorySource {
+  path: string | null;
+  mtimeMs: number | null;
+}
+
+function regularMemorySource(path: string): SeatMemorySource {
+  try {
+    const stat = lstatSync(path);
+    return stat.isFile() ? { path, mtimeMs: stat.mtimeMs } : { path: null, mtimeMs: null };
+  } catch {
+    return { path: null, mtimeMs: null };
+  }
+}
+
+function handoffPriorityExcerpt(path: string): { priority: string | null; evidence: string | null } {
+  // Only inspect a bounded prefix and extract explicit priority/evidence labels;
+  // arbitrary handoff prose can contain account values or stale historical claims.
+  const lines = readHead(path).split(/\r\n|[\n\r\u0085\u2028\u2029]/);
+  const priorityLabel = /^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(?:다음 한 수|현재 우선순위|1순위|최우선|next step|priority)\s*[:：]/i;
+  const evidenceLabel = /^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(?:근거|증거|evidence|source)\s*[:：]/i;
+  const priorityRaw = lines.find((line) => priorityLabel.test(line.replace(/\*\*/g, '')));
+  const evidenceRaw = lines.find((line) => evidenceLabel.test(line.replace(/\*\*/g, '')));
+  const cleanExcerpt = (line: string | undefined): string | null => {
+    if (!line || SHELL_CHARS.test(line)) return null;
+    const clean = oneLine(line.replace(/\*\*/g, '').replace(/^\s*[-*]\s*/, ''));
+    return clean || null;
+  };
+  const evidencePathStart = /(?:seat-state|docs|src|apps|test)\//gu;
+  const evidencePathPattern = /(?:seat-state|docs|src|apps|test)\/[\p{L}\p{N}._/@+-]+/u;
+  const paths = (line: string | undefined): { values: string[]; complete: boolean } => {
+    if (!line) return { values: [], complete: true };
+    const values: string[] = [];
+    let complete = true;
+    for (const startMatch of line.matchAll(evidencePathStart)) {
+      const start = startMatch.index ?? -1;
+      if (start < 0) {
+        complete = false;
+        continue;
+      }
+      const candidate = line.slice(start).match(evidencePathPattern)?.[0];
+      if (!candidate) {
+        complete = false;
+        continue;
+      }
+      const after = line[start + candidate.length];
+      const afterNext = line[start + candidate.length + 1];
+      const boundary = after === undefined || /\s/u.test(after)
+        || (/[;,!?()[\]{}<>]/u.test(after) && (afterNext === undefined || /\s/u.test(afterNext)));
+      const spacedTail = after === ' '
+        ? line.slice(start + candidate.length).match(/^\s+([^·,;!?]*?)(?=\s*[·,;!?]|$)/u)?.[1]?.trim()
+        : undefined;
+      const looksLikeSpacedPath = Boolean(spacedTail && /\.[\p{L}\p{N}]{1,12}$/u.test(spacedTail));
+      if (!boundary || looksLikeSpacedPath) {
+        // Never publish a prefix when the source may contain a wider path token.
+        complete = false;
+        continue;
+      }
+      values.push(redactSecretText(candidate));
+    }
+    return { values, complete };
+  };
+  const priorityPaths = paths(priorityRaw);
+  const priority = priorityPaths.complete
+    ? cleanExcerpt(priorityRaw)?.replace(new RegExp(evidencePathPattern.source, 'gu'), '〔경로는 근거 포인터 참조〕') ?? null
+    : null;
+  const evidencePaths = [...new Set([...priorityPaths.values, ...paths(evidenceRaw).values])].slice(0, 2);
+  return {
+    priority: priority ? priority.slice(0, 700) : null,
+    evidence: evidencePaths.length ? evidencePaths.join(' · ') : null,
+  };
+}
+
+/** Session-start only: bounded source pointers plus a short, explicitly labeled priority excerpt.
+ *  The card cache keeps this snapshot stable for the conversation; newer files appear next session. */
+function buildSeatMemoryImport(cwd: string, seat: string, home: string, now: Date): string {
+  const seatDir = join(home, 'elanous-hq', 'seat-state', seat);
+  const handoff = newestHandoff(seatDir);
+  const handoffSource = handoff ? { path: handoff.path, mtimeMs: handoff.mtime.getTime() } : { path: null, mtimeMs: null };
+  const memory = regularMemorySource(join(home, 'elanous-hq', 'seat-state', 'memory', 'MEMORY.md'));
+  const knowhowCandidates = [
+    join(cwd, 'docs', 'roles', seat, 'KNOWHOW.md'),
+    join(home, 'elanous-hq', 'seats', seat, 'docs', 'roles', seat, 'KNOWHOW.md'),
+  ];
+  const knowhow = knowhowCandidates.map(regularMemorySource).find((source) => source.path) ?? { path: null, mtimeMs: null };
+  const stamp = (source: SeatMemorySource): string => source.mtimeMs === null ? '미상' : new Date(source.mtimeMs).toISOString();
+  const stale = (source: SeatMemorySource): boolean => source.mtimeMs === null || handoffSource.mtimeMs === null ||
+    now.getTime() - handoffSource.mtimeMs > SEAT_MEMORY_HANDOFF_MAX_AGE_MS ||
+    handoffSource.mtimeMs > now.getTime() || source.mtimeMs > now.getTime() || source.mtimeMs < handoffSource.mtimeMs;
+  const handoffStale = handoffSource.mtimeMs === null || now.getTime() - handoffSource.mtimeMs > SEAT_MEMORY_HANDOFF_MAX_AGE_MS ||
+    handoffSource.mtimeMs > now.getTime();
+  const handoffLabel = handoffSource.path
+    ? `seat-state/${seat}/${redactSecretText(basename(handoffSource.path))}`
+    : `seat-state/${seat}/HANDOFF-*.md 없음`;
+  const memoryLabel = memory.path ? 'seat-state/memory/MEMORY.md' : 'seat-state/memory/MEMORY.md 없음';
+  const knowhowLabel = knowhow.path ? `docs/roles/${seat}/KNOWHOW.md` : `docs/roles/${seat}/KNOWHOW.md 없음`;
+  const sourceLines = [
+    `- 인계 포인터: ${handoffLabel} · 갱신 ${stamp(handoffSource)}${handoffStale ? ' · stale/unknown' : ''}`,
+    `- 공통 기억 색인: ${memoryLabel} · 갱신 ${stamp(memory)}${stale(memory) ? ' · stale/unknown' : ''}`,
+    `- 역할 노하우: ${knowhowLabel} · 갱신 ${stamp(knowhow)}${stale(knowhow) ? ' · stale/unknown' : ''}`,
+  ];
+  let priority: string | null = null;
+  let evidence: string | null = null;
+  if (!handoffStale && handoffSource.path) {
+    try {
+      ({ priority, evidence } = handoffPriorityExcerpt(handoffSource.path));
+    } catch { /* missing/unreadable excerpt is unknown, but pointers remain useful */ }
+  }
+  const priorityPrefix = '- 현재 우선순위(인계 발췌): ';
+  const evidencePrefix = '- 근거 포인터(인계 발췌): ';
+  const priorityAvailable = !handoffStale && Boolean(priority);
+  const evidencePaths = !handoffStale && evidence ? evidence.split(' · ') : [];
+  const summary = priorityAvailable ? priorityPrefix : '- 현재 우선순위: 미관측(오래됐거나 명시된 우선순위 줄이 없음) · unknown';
+  const evidenceLine = evidencePaths.length ? evidencePrefix : '- 근거 포인터: 미관측 · 원본 확인 필요';
+  const guidance = 'stale/unknown 또는 상충하는 기억은 사실로 단정하지 말고 unknown으로 답한 뒤 위 포인터의 정본을 확인한다. 비밀·계정 값은 기억에서 가져오지 않는다.';
+  const fixedLines = [
+    `${SEAT_MEMORY_IMPORT_PREFIX} 읽기 전용 · 세션 시작 스냅샷 · 다음 세션부터 갱신`,
+    ...sourceLines,
+    summary,
+    evidenceLine,
+    guidance,
+  ];
+  // Reserve space separately for each excerpt. Never slice the assembled card:
+  // that could cut a path in half or remove the stale/unknown safety guidance.
+  const excerptRoom = Math.max(0, SEAT_MEMORY_IMPORT_MAX_CHARS - fixedLines.join('\n').length);
+  const excerptCount = Number(priorityAvailable) + Number(evidencePaths.length > 0);
+  const excerptBudget = Math.min(520, Math.floor(excerptRoom / (excerptCount || 1)));
+  const priorityText = priorityAvailable
+    ? (priority!.length > excerptBudget ? `${priority!.slice(0, Math.max(0, excerptBudget - 1))}…` : priority!)
+    : '';
+  const evidenceParts: string[] = [];
+  let evidenceRoom = excerptBudget;
+  let omittedEvidencePaths = 0;
+  for (const path of evidencePaths) {
+    const separator = evidenceParts.length ? ' · ' : '';
+    if (separator.length + path.length <= evidenceRoom) {
+      evidenceParts.push(path);
+      evidenceRoom -= separator.length + path.length;
+    } else {
+      omittedEvidencePaths++;
+    }
+  }
+  let evidenceText = evidenceParts.join(' · ');
+  if (omittedEvidencePaths) {
+    const note = `${evidenceText ? ' · ' : ''}${omittedEvidencePaths}개 긴 경로 생략(원문 인계 포인터 참조)`;
+    if (note.length <= evidenceRoom) evidenceText += note;
+  }
+  const content = [
+    `${SEAT_MEMORY_IMPORT_PREFIX} 읽기 전용 · 세션 시작 스냅샷 · 다음 세션부터 갱신`,
+    ...sourceLines,
+    `${summary}${priorityText}`,
+    `${evidenceLine}${evidenceText}`,
+    guidance,
+  ].join('\n');
+  return content;
+}
+
 function buildCardMessages(cwd: string, deps: SeatBootDeps): { messages: LLMMessage[]; observed: Record<string, unknown> } {
   const detection = detectSeat(cwd, deps.env ?? process.env);
   if (!detection) return { messages: [], observed: { reason: 'no-seat' } };
@@ -194,13 +353,24 @@ function buildCardMessages(cwd: string, deps: SeatBootDeps): { messages: LLMMess
   if (!isSeatDir) return { messages: [], observed: { reason: 'no-seat-state', seat: detection.seat, source: detection.source } };
   const { sections, unread } = collectSeatBootSections(detection.seat, { home, msgPath: deps.msgPath ?? defaultMsgStorePath() });
   const card = renderSeatBootCard(detection.seat, sections, null);
-  const at = (deps.now?.() ?? new Date()).toISOString();
+  const snapshotAt = deps.now?.() ?? new Date();
+  const at = snapshotAt.toISOString();
   const recall = seatMemoryRecallLine(seatDir);
+  const memoryImport = buildSeatMemoryImport(cwd, detection.seat, home, snapshotAt);
+  debug.log('dashboard.seat-boot', 'memory-import', {
+    seat: detection.seat,
+    chars: memoryImport.length,
+    priority: memoryImport.includes('- 현재 우선순위(인계 발췌):'),
+    evidence: memoryImport.includes('- 근거 포인터(인계 발췌):'),
+    unknown: memoryImport.includes('- 현재 우선순위: 미관측'),
+    updatedAt: snapshotAt.toISOString(),
+  });
   const content =
     `## 자리 부트 카드 — 너는 이 작업 디렉터리의 ${detection.seat} 자리에서 일한다\n` +
     `(판정: ${detection.source === 'cwd' ? `cwd 의 /seats/${detection.seat}` : 'COORD_ID'} · 세션 시작 스냅샷 ${at} · 이후 바뀐 값은 다시 조회하라)\n` +
     `사람이 다른 일을 먼저 시키지 않았다면, 첫 답에서 자리 이름·'자리 역할' 절의 역할·안 읽은 우편 수를 각각 명시하고 처리할 일을 제안하라. 역할이 미관측이면 추측하지 말고 미관측이라고 말하라.\n` +
     (recall ? `${recall}\n` : '') +
+    `${memoryImport}\n` +
     '\n' +
     `${SEAT_INTENT_ESCALATION_FLOW}\n\n` +
     card;

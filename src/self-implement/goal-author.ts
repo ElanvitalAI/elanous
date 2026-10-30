@@ -1,6 +1,6 @@
 import { classifyObservation } from '../design/behaviour-signal.js';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, type Dirent } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { isRepositoryImplementationCandidate, type CodebaseGrounding } from '../autopilot/codebase-grounding.js';
@@ -121,6 +121,12 @@ export interface GoalAuthorDeps {
   decomposeSteps?: (objective: string, opts?: { context?: string; runId?: string; goalId?: string }) => Promise<readonly string[]>;
   /** Optional launch preflight result supplied by the caller; authoring never reads the ledger or logs itself. */
   launchPreflight?: LaunchPreflightResult;
+  /**
+   * SELF-REVIEW-PRELAUNCH ⑤ — 완료 경계 증거 명령이 «현재 main» 에서 실행 가능한지 판정하는
+   * 읽기 전용 존재 심. 저작 코어(`authorGoal`)는 파일을 열지 않으므로 심이 없으면 판정을
+   * `not-applicable` 로 남기고, 생산 진입점(`writeAuthoredGoal`)이 repositoryRoot 기준 심을 공급한다.
+   */
+  selfReviewExistsOnMain?: (repositoryRelativePath: string) => boolean | undefined;
   /** Optional in-process notification for each authored-goal phase transition. */
   onProgress?: (phase: GoalAuthorPhase, event: 'start' | 'end') => void;
   /** AUTHOR-TIMEBOX: budget for the `ground` phase. Omitted means `GOAL_AUTHOR_GROUND_TIMEBOX_MS`. */
@@ -1013,7 +1019,7 @@ function targetPathsInLabelPiece(piece: string): string[] {
   return askPathTokens(piece).filter((path) => classifyTracedPathToken(path).kind === 'path');
 }
 
-function declaredTargetPaths(document: string): string[] {
+export function declaredTargetPaths(document: string): string[] {
   return linesOutsideFencedCode(document).flatMap(({ text }) => {
     const match = TARGET_PATH_LABEL.exec(text.trim());
     return match ? match[1].split(/\s+[·,]\s*|[·,]\s+/).flatMap(targetPathsInLabelPiece) : [];
@@ -5804,6 +5810,278 @@ function acceptanceCriteria(
   return acceptance;
 }
 
+// ── SELF-REVIEW-PRELAUNCH — 발사 전 self-review 페이즈(다섯 검사 · 1회 재저작 · 잔여 needs-human) ─────────────
+/**
+ * ⭐ 저작물이 «발사 전에» 자기를 검열한다 — ask 밖 목표·칸 밖 경로·미래 가정·mock 무대 누락·
+ *   main 에서 실행 불가능한 완료 경계 증거 명령을 lint·발사 흐름 «앞에서» 잡는다.
+ * ⛔ 검사 대상은 «모델이 만든 목표 줄»(`- Checkable requested criterion:` · 분해 조각)뿐이다 —
+ *   사람 ask(verbatim 울타리 안)와 저작기의 결정론 계약 줄(완료 경계 3행·보존·배선 줄)은 손대지 않는다.
+ * ⭐ 걸리면 «1회» 재저작한다: ① 상 조각 재분해 ⊕ ② 줄 제거 ⊕ ③ FU(후속 조각) 화.
+ *   그 뒤에도 남으면 «해당 조각만» needs-human verdict 로 남긴다(author.self-review 관측).
+ */
+export const GOAL_AUTHOR_SELF_REVIEW_CHECKS = ['slice-difficulty', 'ask-scope', 'future-assumption', 'mock-stage', 'evidence-command'] as const;
+export type GoalSelfReviewCheck = (typeof GOAL_AUTHOR_SELF_REVIEW_CHECKS)[number];
+export type GoalSelfReviewVerdict = 'pass' | 'fixed' | 'needs-human' | 'not-applicable';
+
+export interface GoalSelfReviewItem {
+  readonly check: GoalSelfReviewCheck;
+  readonly verdict: GoalSelfReviewVerdict;
+  readonly detail: string;
+  readonly slice?: string;
+  readonly fix?: string;
+  readonly judgment?: 'main-runnable' | 'main-not-runnable' | 'unknown';
+}
+
+export interface GoalSelfReviewAttempt {
+  readonly attempt: 1 | 2;
+  readonly reauthored: boolean;
+  readonly items: readonly GoalSelfReviewItem[];
+}
+
+export interface GoalAuthorSelfReviewOutcome {
+  readonly document: string;
+  readonly reviews: readonly GoalSelfReviewAttempt[];
+}
+
+export interface GoalAuthorSelfReviewInput {
+  readonly ask: string;
+  readonly document: string;
+  readonly steps: readonly string[] | undefined;
+  readonly checklist: readonly string[];
+  readonly facts: CodebaseGrounding | null;
+  readonly decomposeSteps?: GoalAuthorDeps['decomposeSteps'];
+  readonly existsOnMain?: (repositoryRelativePath: string) => boolean | undefined;
+  readonly runId?: string;
+  readonly goalId?: string;
+}
+
+const SLICE_DIFFICULTY_DECLARATION = /(?:난이도|difficulty)\s*[:：]?\s*(하|중|상|low|medium|high)/iu;
+const SLICE_LANDABLE_DECLARATION = /(착지\s*가능|완료\s*경계|completion\s*boundary|landable)/iu;
+const SLICE_PREREQUISITE_DECLARATION = /(선행|depends\s*on|prerequisite|prereq)/iu;
+const SLICE_TIER_BY_DECLARATION: Record<string, '하' | '중' | '상'> = { 하: '하', 중: '중', 상: '상', low: '하', medium: '중', high: '상' };
+/** 미래 가정 — 현재 main 상태가 아니라 «앞으로 생길 것»을 전제하는 문면(제거하거나 FU 조각화). */
+const FUTURE_ASSUMPTION_DECLARATION = /나중에|향후|미래(?:에|의)|다음\s*(?:판|버전)|(?:착지|머지|반영|merge|land)(?:되|된|한다)?\s*(?:면|후|뒤|한\s*뒤)|after\s+#\d+|once\s+#\d+|#\d+\s+(?:lands|merges)|will\s+be\s+(?:added|landed|merged|available)|future\s+assumptions?/iu;
+/** ask 가 이름대지 않은 칸 id — ask 밖 목표의 결정론 표지(숫자로 시작하는 두번째 마디 `MS-02` 는 제외). */
+const OUT_OF_ASK_CELL_ID = /\b[A-Z][A-Z0-9]{1,}-[A-Z][A-Z0-9-]*\b/g;
+
+function declaredSliceTier(step: string): '하' | '중' | '상' | null {
+  const match = SLICE_DIFFICULTY_DECLARATION.exec(step);
+  return match ? SLICE_TIER_BY_DECLARATION[match[1]!.toLowerCase()] ?? null : null;
+}
+
+/** 칸 = ask ⊕ 접지 — 사람이 이름댔거나 접지가 Read 한 경로가 «칸 안»이다. */
+function inCellPathTokens(ask: string, facts: CodebaseGrounding | null): Set<string> {
+  return new Set([
+    ...declaredTargetPaths(ask),
+    ...evidencePaths(ask),
+    ...(facts?.files ?? []),
+    ...(facts?.persistentEvidence ?? []).flatMap((entry) => evidencePaths(entry)),
+  ]);
+}
+
+function outOfCellReasons(criterion: string, ask: string, inCellPaths: ReadonlySet<string>): string[] {
+  const reasons: string[] = [];
+  const outPaths = evidencePaths(criterion).filter((path) => !inCellPaths.has(path) && !ask.includes(path));
+  if (outPaths.length) reasons.push(`칸 밖 경로: ${outPaths.join(' · ')}`);
+  const ids = [...criterion.matchAll(OUT_OF_ASK_CELL_ID)].map((match) => match[0]).filter((id) => !ask.includes(id));
+  if (ids.length) reasons.push(`ask 밖 목표(칸 id): ${ids.join(' · ')}`);
+  return reasons;
+}
+
+/** ④ mock 무대 — 검증 계획(TDD) 의 무대 줄이 MS id·사건 주입·관측 줄을 갖췄나. */
+function mockStageSelfReviewItem(document: string): GoalSelfReviewItem {
+  const start = document.indexOf(VERIFICATION_PLAN_HEADING);
+  if (start === -1) return { check: 'mock-stage', verdict: 'not-applicable', detail: '검증 계획(TDD) 절이 없어 mock 무대 줄을 검사하지 않는다.' };
+  const rest = document.slice(start + VERIFICATION_PLAN_HEADING.length);
+  const nextHeading = rest.indexOf('\n## ');
+  const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+  const missing = [
+    ...(/MS-\d+/u.test(section) ? [] : ['MS id']),
+    ...(section.includes('사건 주입') ? [] : ['사건 주입 줄']),
+    ...(section.includes('관측:') ? [] : ['관측 줄']),
+  ];
+  return missing.length
+    ? { check: 'mock-stage', verdict: 'needs-human', detail: `mock 무대 줄 미비 — ${missing.join(' · ')} — 사람이 무대를 확정한다.` }
+    : { check: 'mock-stage', verdict: 'pass', detail: 'mock 무대가 MS id·사건 주입·관측 줄을 갖췄다.' };
+}
+
+/** ⑤ 완료 경계 증거 명령 — 경로 인자가 «현재 main» 에 있는지 판정한다(심이 없으면 판정을 남기지 못한다). */
+function evidenceCommandSelfReviewItem(document: string, existsOnMain: ((repositoryRelativePath: string) => boolean | undefined) | undefined): GoalSelfReviewItem {
+  const command = inspectGoalDoneBoundary(document).values['완료 경계 증거 명령'];
+  if (command === undefined) return { check: 'evidence-command', verdict: 'not-applicable', detail: '완료 경계 증거 명령이 없어 main 실행 가능 판정을 하지 않는다.' };
+  if (existsOnMain === undefined) return { check: 'evidence-command', verdict: 'not-applicable', detail: 'main 존재 심(selfReviewExistsOnMain)이 없어 판정하지 못한다 — 생산 진입점이 심을 공급한다.', slice: command };
+  const paths = evidencePaths(command);
+  if (!paths.length) return { check: 'evidence-command', verdict: 'pass', judgment: 'main-runnable', detail: `증거 명령에 저장소 경로 인자가 없다 — 현재 main 에서 그대로 실행된다: ${command}` };
+  const presence = paths.map((path) => [path, existsOnMain(path)] as const);
+  const unknown = presence.filter(([, exists]) => exists === undefined).map(([path]) => path);
+  if (unknown.length) return { check: 'evidence-command', verdict: 'needs-human', judgment: 'unknown', detail: `origin/main 에서 경로 존재를 잴 수 없음: ${unknown.join(' · ')} — main 실행 가능성을 확인할 수 없어 사람이 판정한다.`, slice: command };
+  const missing = presence.filter(([, exists]) => exists === false).map(([path]) => path);
+  return missing.length
+    ? { check: 'evidence-command', verdict: 'needs-human', judgment: 'main-not-runnable', detail: `현재 main 에 없는 경로: ${missing.join(' · ')} — 신설 경로면 착지 뒤에 실행 가능하다.`, slice: command }
+    : { check: 'evidence-command', verdict: 'pass', judgment: 'main-runnable', detail: `증거 명령의 모든 경로 인자가 현재 main 에 있다: ${paths.join(' · ')}` };
+}
+
+interface SelfReviewPass {
+  readonly items: readonly GoalSelfReviewItem[];
+  readonly removeCriterionLines: readonly string[];
+  readonly fuCriterionLines: readonly (readonly [line: string, fuLine: string])[];
+  readonly fuStepLines: readonly (readonly [line: string, fuLine: string])[];
+  readonly oversizeSteps: readonly string[];
+}
+
+function passGoalSelfReview(input: {
+  readonly document: string;
+  readonly steps: readonly string[] | undefined;
+  readonly modelCriteria: readonly string[];
+  readonly ask: string;
+  readonly inCellPaths: ReadonlySet<string>;
+  readonly existsOnMain: ((repositoryRelativePath: string) => boolean | undefined) | undefined;
+}): SelfReviewPass {
+  const items: GoalSelfReviewItem[] = [];
+  const removeCriterionLines: string[] = [];
+  const fuCriterionLines: Array<readonly [string, string]> = [];
+  const fuStepLines: Array<readonly [string, string]> = [];
+  const oversizeSteps: string[] = [];
+
+  // ① 조각 난이도 하·중·착지 가능·선행 명시 — 상이면 더 분해한다.
+  if (input.steps === undefined || input.steps.length === 0) {
+    items.push({ check: 'slice-difficulty', verdict: 'not-applicable', detail: '검토할 분해 조각이 없다 — 난이도·착지 가능·선행 명시를 검사하지 않는다.' });
+  } else {
+    for (const step of input.steps) {
+      const tier = declaredSliceTier(step);
+      const missing = [
+        ...(tier === null ? ['난이도(하·중)'] : []),
+        ...(SLICE_LANDABLE_DECLARATION.test(step) ? [] : ['착지 가능']),
+        ...(SLICE_PREREQUISITE_DECLARATION.test(step) ? [] : ['선행']),
+      ];
+      if (tier === '상') {
+        oversizeSteps.push(step);
+        items.push({ check: 'slice-difficulty', verdict: 'needs-human', detail: `난이도 상 — 더 분해해야 한다 (미명시: ${missing.join(' · ')})`, slice: step });
+        continue;
+      }
+      items.push(missing.length
+        ? { check: 'slice-difficulty', verdict: 'needs-human', detail: `조각이 난이도 하·중·착지 가능·선행을 명시하지 않았다 — 미명시: ${missing.join(' · ')}`, slice: step }
+        : { check: 'slice-difficulty', verdict: 'pass', detail: `난이도 ${tier} · 착지 가능 · 선행 명시 확인`, slice: step });
+    }
+  }
+
+  const documentLines = input.document.split('\n');
+  const modelCriterionLines = input.modelCriteria
+    .map((criterion) => ({ criterion, line: requestedCriterionLine(criterion) }))
+    .filter(({ line }) => documentLines.includes(line));
+
+  // ② ask 밖 목표·칸 밖 경로 제거 — 칸 = ask ⊕ 접지.
+  for (const { criterion, line } of modelCriterionLines) {
+    const reasons = outOfCellReasons(criterion, input.ask, input.inCellPaths);
+    if (!reasons.length) continue;
+    items.push({ check: 'ask-scope', verdict: 'fixed', detail: `ask 밖 목표·칸 밖 경로 — ${reasons.join(' · ')}`, slice: criterion, fix: '1회 재저작에서 이 목표 줄을 문서에서 제거한다.' });
+    removeCriterionLines.push(line);
+  }
+  if (!removeCriterionLines.length) items.push({ check: 'ask-scope', verdict: 'pass', detail: 'ask 밖 목표·칸 밖 경로가 없다.' });
+
+  // ③ 미래 가정 — 제거하거나 FU(후속 조각) 로 바꾼다.
+  for (const { criterion, line } of modelCriterionLines) {
+    if (removeCriterionLines.includes(line) || !FUTURE_ASSUMPTION_DECLARATION.test(criterion)) continue;
+    items.push({ check: 'future-assumption', verdict: 'fixed', detail: '미래 가정 — 현재 main 상태가 아니라 앞으로 생길 것을 전제한다.', slice: criterion, fix: '1회 재저작에서 FU(후속 조각) 줄로 바꾼다.' });
+    fuCriterionLines.push([line, `- FU(후속 조각): ${criterion}`]);
+  }
+  for (const step of input.steps ?? []) {
+    // A declared step dependency is a present plan relationship, not an assumption
+    // that an external future event will happen (e.g. shadow → live after step ① lands).
+    if (SLICE_PREREQUISITE_DECLARATION.test(step) || !FUTURE_ASSUMPTION_DECLARATION.test(step)) continue;
+    items.push({ check: 'future-assumption', verdict: 'fixed', detail: '미래 가정 조각 — 현재 main 상태가 아니라 앞으로 생길 것을 전제한다.', slice: step, fix: '1회 재저작에서 FU(후속 조각) 줄로 바꾼다.' });
+    fuStepLines.push([`- ${step}`, `- FU(후속 조각): ${step}`]);
+  }
+  if (!fuCriterionLines.length && !fuStepLines.length) items.push({ check: 'future-assumption', verdict: 'pass', detail: '미래 가정이 없다.' });
+
+  items.push(mockStageSelfReviewItem(input.document));
+  items.push(evidenceCommandSelfReviewItem(input.document, input.existsOnMain));
+  return { items, removeCriterionLines, fuCriterionLines, fuStepLines, oversizeSteps };
+}
+
+function renderGoalStepsSection(steps: readonly string[]): string {
+  return ['## STEPS', ...(steps.length ? steps.map((step) => `- ${step}`) : ['- No externally injected steps.']), '', ''].join('\n');
+}
+
+function replaceGoalStepsSection(document: string, steps: readonly string[]): string {
+  const outside = linesOutsideFencedCode(document);
+  const start = outside.find((line) => line.text === '## STEPS');
+  const next = start && outside.find((line) => line.start > start.start && line.text === '## ACCEPTANCE CRITERIA');
+  if (!start || !next) return document;
+  return `${document.slice(0, start.start)}${renderGoalStepsSection(steps)}${document.slice(next.start)}`;
+}
+
+function reviseGoalDocumentLines(document: string, revision: { remove: readonly string[]; fu: readonly (readonly [line: string, fuLine: string])[] }): string {
+  const remove = new Set(revision.remove);
+  const fu = new Map(revision.fu);
+  return document.split('\n').flatMap((line) => {
+    if (remove.has(line)) return [];
+    const fuLine = fu.get(line);
+    return fuLine ? [fuLine] : [line];
+  }).join('\n');
+}
+
+/**
+ * 발사 전 self-review 엔진 — 1차 검사 → (결정론적 수정이 있으면) 1회 재저작 → 2차 검사.
+ * 파일·원장·LLM 효과는 없다: 재분해는 주입된 `decomposeSteps` 심으로만, main 존재 판정은 주입된 심으로만.
+ */
+export async function runGoalAuthorSelfReview(input: GoalAuthorSelfReviewInput): Promise<GoalAuthorSelfReviewOutcome> {
+  const modelCriteria = withoutDedicatedSectionDuplicates(input.checklist, input.ask);
+  const inCellPaths = inCellPathTokens(input.ask, input.facts);
+  const first = passGoalSelfReview({ document: input.document, steps: input.steps, modelCriteria, ask: input.ask, inCellPaths, existsOnMain: input.existsOnMain });
+  const canRedecompose = first.oversizeSteps.length > 0 && input.decomposeSteps !== undefined;
+  const fixable = first.removeCriterionLines.length > 0 || first.fuCriterionLines.length > 0 || first.fuStepLines.length > 0 || canRedecompose;
+  if (!fixable) return { document: input.document, reviews: [{ attempt: 1, reauthored: false, items: first.items }] };
+
+  // 1회 재저작 — ① 상 조각 재분해 ⊕ ② ask 밖 목표 제거 ⊕ ③ 미래 가정 FU 화.
+  let document = input.document;
+  let steps = input.steps;
+  let stepsReauthored = false;
+  if (canRedecompose) {
+    const feedback = [
+      'SELF-REVIEW ①: 이전 분해 조각이 난이도 상이거나 하·중·착지 가능·선행을 명시하지 않았다.',
+      `상 조각: ${first.oversizeSteps.join(' · ')}`,
+      '전체 계획을 다시 내라 — 각 조각에 난이도(하|중)·착지 가능·선행을 명시하고, 상 조각은 하·중 조각으로 더 분해하라.',
+    ].join('\n');
+    const reDecomposed = await input.decomposeSteps!(input.ask, {
+      context: feedback,
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(input.goalId === undefined ? {} : { goalId: input.goalId }),
+    });
+    if (reDecomposed.length) {
+      const replacementSteps = [...reDecomposed];
+      const replacementDocument = replaceGoalStepsSection(document, replacementSteps);
+      if (replacementDocument !== document) {
+        steps = replacementSteps;
+        document = replacementDocument;
+        stepsReauthored = true;
+      }
+    }
+  }
+  const oversizeStepLines = new Set(canRedecompose ? first.oversizeSteps.map((step) => `- ${step}`) : []);
+  const fuStepLines = first.fuStepLines.filter(([line]) => !oversizeStepLines.has(line));
+  document = reviseGoalDocumentLines(document, { remove: first.removeCriterionLines, fu: [...first.fuCriterionLines, ...fuStepLines] });
+  const fuSteps = new Set(fuStepLines.map(([line]) => line.slice(2)));
+  const second = passGoalSelfReview({
+    document,
+    steps: steps?.filter((step) => !fuSteps.has(step)),
+    modelCriteria,
+    ask: input.ask,
+    inCellPaths,
+    existsOnMain: input.existsOnMain,
+  });
+  const attempt1Items = first.items.map((item) => item.check === 'slice-difficulty' && item.verdict === 'needs-human' && item.slice !== undefined && first.oversizeSteps.includes(item.slice) && stepsReauthored
+    ? { ...item, verdict: 'fixed' as const, fix: '1회 재저작에서 상 조각을 재분해로 대체했다.' }
+    : item);
+  return {
+    document,
+    reviews: [
+      { attempt: 1, reauthored: true, items: attempt1Items },
+      { attempt: 2, reauthored: true, items: second.items },
+    ],
+  };
+}
+
 /** Compose one grounded goal artifact without filesystem, process, pipeline, or daemon effects. */
 export async function authorGoal(ask: string, deps: GoalAuthorDeps): Promise<AuthoredGoal> {
   if ('supersessionRootIntent' in deps) {
@@ -6397,7 +6675,7 @@ async function authorGoalWithSupersededRootIntent(
     ? tracedPathsSection(facts, ask, deps.repositoryRoot, narrative.tracedPathsUnavailableEvidence, authorRunId, deps.recordTracedPath)
     : [];
   if (goalType === 'implement') observeEmptyPersistentEvidence(facts, tracedPathsForDocument, authorRunId);
-  const document = [
+  let document = [
     explicitGoalTitle ?? goalSummary(enhancement.original),
     `- GoalId: ${assignedGoalId}`,
     ...(deps.authoringLessonIds?.length ? [`- AuthoringLessons: ${deps.authoringLessonIds.join(', ')}`] : []),
@@ -6483,6 +6761,38 @@ async function authorGoalWithSupersededRootIntent(
     endAssembleSubphase();
     assembleCompleted = true;
     endGoalAuthorPhase('assemble', assembleStartedAt, authorRunId, deps.onProgress);
+    // ⭐ SELF-REVIEW-PRELAUNCH — assemble 완료 뒤·발사(lint→return→파일 쓰기) 직전에 저작물을 검열한다.
+    //   ⛔ lite 저작은 assemble 단계 자체가 없다 — self-review 는 full 저작 경로에만 붙는다(의도적 경계).
+    //   외부 페이즈 관측 계약(ground→enhance→assemble→lint)은 그대로 보존한다 — 검열 자국은
+    //   author.self-review 관측(attempt·항목별 verdict)으로만 남는다.
+    try {
+      const selfReview = await runGoalAuthorSelfReview({
+        ask,
+        document,
+        steps: resolvedSteps,
+        checklist: enhancement.checklist,
+        facts,
+        decomposeSteps: deps.decomposeSteps,
+        existsOnMain: deps.selfReviewExistsOnMain,
+        runId: authorRunId,
+        goalId: assignedGoalId,
+      });
+      for (const review of selfReview.reviews) {
+        try {
+          observeGoalAuthor('goal-author', 'author.self-review', {
+            authorRunId,
+            goalId: assignedGoalId,
+            attempt: review.attempt,
+            reauthored: review.reauthored,
+            items: review.items,
+          });
+        } catch { /* observation is fail-soft */ }
+      }
+      document = selfReview.document;
+    } catch (error) {
+      // 검열은 저작을 막지 않는다 — 실패는 관측으로 남기고 종전 문서를 그대로 발사한다.
+      try { observeGoalAuthor('goal-author', 'author.self-review-failed', { authorRunId, error: error instanceof Error ? error.message : String(error) }); } catch { /* observation is fail-soft */ }
+    }
     const lintStartedAt = startGoalAuthorPhase('lint', authorRunId, deps.onProgress);
     let lintPassed = false;
     try {
@@ -6688,6 +6998,19 @@ export async function writeAuthoredGoal(
     ...deps,
     repositoryRoot: deps.repositoryRoot ?? groundingRoot,
   };
+  // ⭐ SELF-REVIEW-PRELAUNCH ⑤ — 완료 경계 증거 명령의 origin/main 실행 가능 판정 심(읽기 전용).
+  //    현재 worktree 파일 존재를 main 증거로 오인하지 않는다. ref를 못 읽으면 unknown 으로 남긴다.
+  resolvedDeps.selfReviewExistsOnMain = deps.selfReviewExistsOnMain
+    ?? ((repositoryRelativePath: string) => {
+      try {
+        const entry = execFileSync('git', ['-C', resolvedDeps.repositoryRoot, 'ls-tree', '-r', '--name-only', 'origin/main', '--', repositoryRelativePath], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        return entry.trim().length > 0;
+      } catch {
+        return undefined;
+      }
+    });
   const mandatoryGoalContextEvidence = goalContextEvidence(cwd);
   const authoringLessons = selectRelevantAuthoringLessons(cwd, ask, elanousStateRoot());
   observeGoalAuthor('goal-author', 'authoring-lessons', {

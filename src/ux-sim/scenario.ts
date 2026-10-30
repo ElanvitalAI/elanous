@@ -1,10 +1,10 @@
-import { closeSync, constants, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { extname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
+import type { LogSink } from '../mss/logging/sink.js';
 import { streamCodexResponsesEvents } from '../llm.js';
 import { LogStore, StoreSink, type LogStoreRow } from '../mss/logging/log-store.js';
 import { getTestStateRoot } from '../nexus/paths.js';
@@ -24,8 +24,10 @@ export interface ScenarioV0 {
 
 export interface ScenarioResult {
   id: string;
+  runId: string;
   seed: number;
   evidenceArtifact: string;
+  runEvidence: { category: string; event: string; persisted: boolean };
   pass: boolean;
   trigger: { id: string; type: string; status: number | null; expectedCount: number; fetchCount: number; error: string | null };
   screen: { pass: boolean; containsMissing: string[]; excludesFound: string[]; snapshot: string };
@@ -35,6 +37,7 @@ export interface ScenarioResult {
 
 let previousScenarioTurn: Promise<void> = Promise.resolve();
 const REPOSITORY_ROOT = fileURLToPath(new URL('../..', import.meta.url));
+const SENSITIVE_EXPECTATION_KEY = /(?:token|secret|password|prompt|authorization|credential|api.?key|request.?body)/i;
 
 function record(value: unknown, where: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${where} must be an object`);
@@ -44,6 +47,21 @@ function record(value: unknown, where: string): Record<string, unknown> {
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[], where: string): void {
   const extra = Object.keys(value).filter((key) => !allowed.includes(key));
   if (extra.length) throw new Error(`${where} has unsupported key(s): ${extra.join(', ')}`);
+}
+
+function validateExpectationData(value: Record<string, unknown>, where = 'scenario.expect.logs[0].data'): void {
+  for (const [key, entry] of Object.entries(value)) {
+    if (SENSITIVE_EXPECTATION_KEY.test(key)) throw new Error(`${where} cannot include sensitive field: ${key}`);
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      validateExpectationData(entry as Record<string, unknown>, `${where}.${key}`);
+    } else if (Array.isArray(entry)) {
+      entry.forEach((item, index) => {
+        if (item && typeof item === 'object' && !Array.isArray(item)) {
+          validateExpectationData(item as Record<string, unknown>, `${where}.${key}[${index}]`);
+        }
+      });
+    }
+  }
 }
 
 function requiredString(value: unknown, where: string): string {
@@ -88,10 +106,19 @@ export function parseScenarioV0(source: string): ScenarioV0 {
   exactKeys(expectedLog, ['category', 'event', 'level', 'count', 'data'], 'scenario.expect.logs[0]');
   const category = requiredString(expectedLog.category, 'scenario.expect.logs[0].category');
   const event = requiredString(expectedLog.event, 'scenario.expect.logs[0].event');
+  if (category === 'ux.sim.scenario' && event === 'completed') {
+    throw new Error('scenario.expect.logs cannot use reserved event ux.sim.scenario/completed');
+  }
   const level = requiredString(expectedLog.level, 'scenario.expect.logs[0].level');
   if (expectedLog.count !== undefined && (!Number.isInteger(expectedLog.count) || (expectedLog.count as number) < 0)) throw new Error('scenario.expect.logs[0].count must be a non-negative integer');
   if (expectedLog.count === 0 && trigger.type !== 'codex.responses.fetch-network-error') throw new Error('zero expected log events are allowed only for codex.responses.fetch-network-error');
-  if (expectedLog.data !== undefined) record(expectedLog.data, 'scenario.expect.logs[0].data');
+  if (expectedLog.data !== undefined) {
+    const data = record(expectedLog.data, 'scenario.expect.logs[0].data');
+    validateExpectationData(data);
+    if (category === 'llm.codex' && event === 'request-rejected-shape' && 'status' in data && typeof data.status !== 'number') {
+      throw new Error('scenario.expect.logs[0].data.status must be numeric');
+    }
+  }
 
   return {
     version: 0,
@@ -191,9 +218,53 @@ export async function runScenarioV0(scenario: ScenarioV0): Promise<ScenarioResul
 }
 
 async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioResult> {
-  const root = mkdtempSync(join(tmpdir(), `ux-sim-${scenario.id}-`));
-  const store = new LogStore(join(root, 'logs.db'), { instance: `ux-sim:${scenario.id}` });
-  const sink = new StoreSink(store, `ux-sim:${scenario.id}`, { installExitHandlers: false });
+  const stateRoot = getTestStateRoot()!;
+  assertNoSymlinkComponents(stateRoot);
+  mkdirSync(stateRoot, { recursive: true });
+  if (!lstatSync(stateRoot).isDirectory()) throw new Error('scenario test-state root must be a directory');
+  const logsDir = join(stateRoot, 'logs');
+  assertNoSymlinkComponents(logsDir);
+  mkdirSync(logsDir, { recursive: true });
+  assertNoSymlinkComponents(logsDir);
+  if (!lstatSync(logsDir).isDirectory()) throw new Error('scenario logs path must be a directory');
+  const logsPath = join(logsDir, 'logs.db');
+  assertNoSymlinkComponents(logsPath);
+  try {
+    const logsStat = lstatSync(logsPath);
+    if (!logsStat.isFile()) throw new Error('scenario logs path must be a regular file');
+    if (logsStat.nlink > 1) throw new Error('scenario logs path must not be a hardlink');
+  } catch (error) {
+    if (error instanceof Error && error.message === 'scenario logs path must be a regular file') throw error;
+    if (error instanceof Error && error.message === 'scenario logs path must not be a hardlink') throw error;
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const runId = randomUUID();
+  const instance = `ux-sim:${scenario.id}:${runId}`;
+  const store = new LogStore(logsPath, { instance });
+  const storeSink = new StoreSink(store, instance, { installExitHandlers: false });
+  const expectedLog = scenario.expect.logs[0];
+  const sink: LogSink = {
+    name: storeSink.name,
+    emit(rec) {
+      if (rec.category === 'ux.sim.scenario' && rec.event === 'completed') {
+        const data = rec.data && typeof rec.data === 'object' ? rec.data as Record<string, unknown> : {};
+        storeSink.emit({
+          ts: rec.ts,
+          category: rec.category,
+          event: rec.event,
+          data: { runId, scenarioId: scenario.id, deviceVerdict: data.deviceVerdict },
+        });
+      } else if (rec.category === expectedLog?.category && rec.event === expectedLog.event) {
+        storeSink.emit({
+          ts: rec.ts,
+          category: rec.category,
+          event: rec.event,
+          level: rec.level,
+          ...(expectedLog.data ? { data: projectSubset(rec.data, expectedLog.data) } : {}),
+        });
+      }
+    },
+  };
   const off = debug.registerSink(sink);
   const originalFetch = globalThis.fetch;
   const trigger = scenario.triggers[0];
@@ -222,9 +293,9 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
     const containsMissing = scenario.expect.screen.snapshot.contains.filter((fragment) => !screenText.includes(fragment));
     const excludesFound = (scenario.expect.screen.snapshot.excludes ?? []).filter((fragment) => screenText.includes(fragment));
 
-    sink.flush();
+    storeSink.flush();
     const expected = scenario.expect.logs[0];
-    const rows = store.query({ exactCategories: [expected.category], events: [expected.event], limit: 1000 });
+    const rows = store.query({ exactCategories: [expected.category], events: [expected.event], instances: [instance], limit: 1000 });
     const expectedCount = expected.count ?? 1;
     const levelMismatch = rows.some((row) => row.level !== expected.level);
     const dataMismatch = expected.data ? rows.flatMap((row) => matchesSubset(rowData(row), expected.data!)) : [];
@@ -240,10 +311,25 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
     if (levelMismatch) failureReasons.push(`log-level-mismatch:expected-${expected.level}-observed-${rows[0]?.level ?? 'none'}`);
     if (dataMismatch.length) failureReasons.push('log-data-mismatch');
 
+    const devicePass = failureReasons.length === 0;
+    const runEvidence = { category: 'ux.sim.scenario', event: 'completed' } as const;
+    debug.log(runEvidence.category, runEvidence.event, {
+      runId,
+      scenarioId: scenario.id,
+      deviceVerdict: devicePass ? 'PASS' : 'FAIL',
+    });
+    storeSink.flush();
+    const persistedRunEvents = store.queryByDataKeys({ exactCategories: [runEvidence.category], runIds: [runId] })
+      .filter((row) => row.event === runEvidence.event);
+    const runEventPersisted = persistedRunEvents.length === 1;
+    if (!runEventPersisted) failureReasons.push('run-evidence-event-not-persisted');
+
     const result: ScenarioResult = {
       id: scenario.id,
+      runId,
       seed: scenario.seed,
       evidenceArtifact: '',
+      runEvidence: { ...runEvidence, persisted: runEventPersisted },
       pass: failureReasons.length === 0,
       trigger: { id: trigger.id, type: trigger.type, status: trigger.status ?? null, expectedCount: expectedTriggerCount, fetchCount, error: errorMessage },
       screen: { pass: screenPass, containsMissing, excludesFound, snapshot: screenText },
@@ -271,37 +357,44 @@ async function runScenarioV0Exclusive(scenario: ScenarioV0): Promise<ScenarioRes
     mkdirSync(evidenceDir, { recursive: true });
     assertNoSymlinkComponents(evidenceDir);
     if (!lstatSync(evidenceDir).isDirectory()) throw new Error('scenario evidence directory must stay inside test state');
-    const evidenceArtifact = join(evidenceDir, `${scenario.id}-seed-${scenario.seed}.json`);
+    const evidenceArtifact = join(evidenceDir, `${scenario.id}-seed-${scenario.seed}-run-${runId}.json`);
     result.evidenceArtifact = evidenceArtifact;
     const artifact = {
       version: 0,
       id: scenario.id,
+      runId,
       seed: scenario.seed,
       pass: result.pass,
       trigger: { type: result.trigger.type, ...(result.trigger.status !== null ? { status: result.trigger.status } : {}), expectedCount: result.trigger.expectedCount, fetchCount: result.trigger.fetchCount, errorObserved: result.trigger.error !== null },
       screen: { pass: result.screen.pass, snapshotSha256: createHash('sha256').update(result.screen.snapshot).digest('hex'), containsMissingCount: result.screen.containsMissing.length, excludesFoundCount: result.screen.excludesFound.length },
       logs: { pass: result.logs.pass, expectedCount: result.logs.expectedCount, observedCount: result.logs.observedCount, levelMismatch: result.logs.levelMismatch, dataMismatchCount: result.logs.dataMismatch.length },
+      runEvidence: { runId: result.runId, persisted: result.runEvidence.persisted },
       failureReasonCount: result.failureReasons.length,
     };
-    const tempArtifact = join(evidenceDir, `.${scenario.id}-${randomUUID()}.tmp`);
-    const fd = openSync(tempArtifact, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-    try {
-      writeFileSync(fd, `${JSON.stringify(artifact, null, 2)}\n`);
-      closeSync(fd);
-      assertNoSymlinkComponents(evidenceDir);
-      renameSync(tempArtifact, evidenceArtifact);
-    } catch (error) {
-      try { closeSync(fd); } catch { /* already closed */ }
-      try { unlinkSync(tempArtifact); } catch { /* absent after successful rename */ }
-      throw error;
-    }
+    writeScenarioEvidenceArtifact(evidenceDir, evidenceArtifact, artifact);
     return result;
   } finally {
     globalThis.fetch = originalFetch;
     off();
-    sink.close();
+    storeSink.close();
     store.close();
-    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+/** Write one already-validated evidence record atomically without following a target link. */
+export function writeScenarioEvidenceArtifact(evidenceDir: string, evidenceArtifact: string, artifact: unknown): void {
+  assertNoSymlinkComponents(evidenceDir);
+  const tempArtifact = join(evidenceDir, `.${randomUUID()}.tmp`);
+  const fd = openSync(tempArtifact, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  try {
+    writeFileSync(fd, `${JSON.stringify(artifact, null, 2)}\n`);
+    closeSync(fd);
+    assertNoSymlinkComponents(evidenceDir);
+    renameSync(tempArtifact, evidenceArtifact);
+  } catch (error) {
+    try { closeSync(fd); } catch { /* already closed */ }
+    try { unlinkSync(tempArtifact); } catch { /* absent after successful rename */ }
+    throw error;
   }
 }
 

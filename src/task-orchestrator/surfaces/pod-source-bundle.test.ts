@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { packSourceBundle } from './pod-source-bundle.js';
@@ -73,7 +73,7 @@ describe('packSourceBundle', () => {
       expect(bundle.fileCount).toBe(3);
       expect(bundle.sizeBytes).toBeGreaterThan(0);
       expect(bundle.sha256).toBe(createHash('sha256').update(readFileSync(bundle.bundlePath)).digest('hex'));
-      expect(events).toContainEqual({ category: 'pod.source', event: 'bundle-packed', data: { kind: 'worktree', baseCommit: f.base, headCommit: bundle.headCommit, fileCount: 3, sizeBytes: bundle.sizeBytes, ms: expect.any(Number) } });
+      expect(events).toContainEqual({ category: 'pod.source', event: 'bundle-packed', data: expect.objectContaining({ kind: 'worktree', baseCommit: f.base, headCommit: bundle.headCommit, fileCount: 3, bundleMode: 'full', bundleReason: 'mirror-head-unspecified', sizeBytes: bundle.sizeBytes, ms: expect.any(Number) }) });
       const dest = fetchBundle(f, bundle.bundlePath);
       expect(git(dest, 'show', `${bundle.headCommit}:a.txt`)).toBe('changed a');
       expect(git(dest, 'show', `${bundle.headCommit}:new.txt`)).toBe('new');
@@ -87,13 +87,25 @@ describe('packSourceBundle', () => {
     const f = fixture();
     try {
       writeFileSync(join(f.repo, 'a.txt'), 'no mirror disk version\n');
-      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out });
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, log: (_c, event, data) => events.push({ event, data }) });
+      expect(events).toContainEqual({ event: 'bundle-packed', data: expect.objectContaining({ bundleMode: 'full', bundleReason: 'mirror-head-unspecified', sizeBytes: bundle.sizeBytes }) });
       const empty = join(f.dir, 'empty');
       git(f.dir, 'init', empty);
       git(empty, 'bundle', 'verify', bundle.bundlePath);
       git(empty, 'fetch', bundle.bundlePath, 'refs/elanous/pod-source/*:refs/remotes/bundle/*');
       expect(git(empty, 'show', `${bundle.headCommit}:a.txt`)).toBe('no mirror disk version');
       expect(git(empty, 'rev-parse', `${bundle.headCommit}^`)).toBe(f.base);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('explicit null mirrorHead reports a known missing pin and full bundle size', () => {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.repo, 'a.txt'), 'null mirror disk version\n');
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, mirrorHead: null, log: (_c, event, data) => events.push({ event, data }) });
+      expect(events).toContainEqual({ event: 'bundle-packed', data: expect.objectContaining({ bundleMode: 'full', bundleReason: 'mirror-head-missing', sizeBytes: bundle.sizeBytes }) });
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 
@@ -110,7 +122,9 @@ describe('packSourceBundle', () => {
       writeFileSync(join(f.repo, 'a.txt'), 'chosen disk version\n');
       writeFileSync(join(f.repo, 'b.txt'), 'unrelated disk version\n');
       const before = snapshot(f.repo);
-      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'files', base, paths: ['a.txt'], outDir: f.out, mirrorHead: f.base });
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'files', base, paths: ['a.txt'], outDir: f.out, mirrorHead: f.base, log: (_c, event, data) => events.push({ event, data }) });
+      expect(events).toContainEqual({ event: 'bundle-packed', data: expect.objectContaining({ bundleMode: 'thin', bundleReason: 'shared-history', sizeBytes: bundle.sizeBytes }) });
       expect(snapshot(f.repo)).toEqual(before);
       expect(bundle.baseCommit).toBe(base);
       expect(bundle.fileCount).toBe(1);
@@ -143,8 +157,10 @@ describe('packSourceBundle', () => {
       git(f.repo, 'fetch', orphan, 'HEAD');
       const unrelatedHead = git(f.repo, 'rev-parse', 'FETCH_HEAD');
       const before = snapshot(f.repo);
-      for (const mirrorHead of ['f'.repeat(40), unrelatedHead]) {
-        const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, mirrorHead });
+      for (const [mirrorHead, expectedReason] of [['f'.repeat(40), 'mirror-head-unavailable'], [unrelatedHead, 'mirror-head-not-ancestor']] as const) {
+        const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+        const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, mirrorHead, log: (_c, event, data) => events.push({ event, data }) });
+        expect(events).toContainEqual({ event: 'bundle-packed', data: expect.objectContaining({ bundleMode: 'full', bundleReason: expectedReason, sizeBytes: bundle.sizeBytes }) });
         const empty = join(f.dir, `empty-${mirrorHead}`);
         git(f.dir, 'init', empty);
         git(empty, 'bundle', 'verify', bundle.bundlePath);
@@ -155,6 +171,55 @@ describe('packSourceBundle', () => {
       expect(snapshot(f.repo)).toEqual(before);
       expect(existsSync(join(f.out, 'index.tmp'))).toBe(false);
       expect(git(f.repo, 'for-each-ref', '--format=%(refname)', 'refs/elanous/pod-source')).toBe('');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('Git probe execution errors are logged as check failures and still fall back to a full bundle', () => {
+    const f = fixture();
+    const originalPath = process.env.PATH;
+    try {
+      writeFileSync(join(f.repo, 'a.txt'), 'probe error fallback\n');
+      const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+      const shimDir = join(f.dir, 'git-shim');
+      mkdirSync(shimDir);
+      const shim = join(shimDir, 'git');
+      writeFileSync(shim, `#!/bin/sh\nif [ "$1" = "cat-file" ]; then echo 'injected git probe failure' >&2; exit 1; fi\nexec '${realGit}' "$@"\n`);
+      chmodSync(shim, 0o755);
+      process.env.PATH = `${shimDir}:${originalPath ?? ''}`;
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const mirrorHead = git(f.repo, 'rev-parse', 'HEAD');
+      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, mirrorHead, log: (_c, event, data) => events.push({ event, data }) });
+      expect(events).toContainEqual({ event: 'bundle-packed', data: expect.objectContaining({ bundleMode: 'full', bundleReason: 'mirror-head-check-failed', sizeBytes: bundle.sizeBytes }) });
+      const empty = join(f.dir, 'empty');
+      git(f.dir, 'init', empty);
+      git(empty, 'bundle', 'verify', bundle.bundlePath);
+      git(empty, 'fetch', bundle.bundlePath, 'refs/elanous/pod-source/*:refs/remotes/bundle/*');
+      expect(git(empty, 'show', `${bundle.headCommit}:a.txt`)).toBe('probe error fallback');
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test('merge-base exit 1 with stderr is a probe error and falls back to a full bundle', () => {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.repo, 'a.txt'), 'merge-base error fallback\n');
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const bundle = packSourceBundle({
+        repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, mirrorHead: f.base,
+        probeGit: (_repoDir, _env, ...args) => args[0] === 'cat-file'
+          ? { status: 0, stderr: '' }
+          : { status: 1, stderr: 'injected merge-base execution failure' },
+        log: (_c, event, data) => events.push({ event, data }),
+      });
+      expect(events).toContainEqual({ event: 'bundle-packed', data: expect.objectContaining({ bundleMode: 'full', bundleReason: 'mirror-head-check-failed', sizeBytes: bundle.sizeBytes }) });
+      const empty = join(f.dir, 'empty');
+      git(f.dir, 'init', empty);
+      git(empty, 'bundle', 'verify', bundle.bundlePath);
+      git(empty, 'fetch', bundle.bundlePath, 'refs/elanous/pod-source/*:refs/remotes/bundle/*');
+      expect(git(empty, 'show', `${bundle.headCommit}:a.txt`)).toBe('merge-base error fallback');
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 
@@ -208,7 +273,7 @@ describe('packSourceBundle', () => {
       const before = snapshot(f.repo);
       const events: Array<{ event: string; data: Record<string, unknown> }> = [];
       expect(() => packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: 'HEAD', outDir: f.out, log: (_c, event, data) => events.push({ event, data }) })).toThrow('not on origin default branch');
-      expect(events).toContainEqual({ event: 'bundle-refused', data: { kind: 'worktree', reason: expect.stringContaining('not on origin default branch') } });
+      expect(events).toContainEqual({ event: 'bundle-refused', data: expect.objectContaining({ kind: 'worktree', reason: expect.stringContaining('not on origin default branch'), bundleMode: 'unknown', bundleReason: 'decision-not-reached', sizeBytes: null }) });
       expect(snapshot(f.repo)).toEqual(before);
       expect(existsSync(f.out)).toBe(false);
       expect(git(f.repo, 'for-each-ref', '--format=%(refname)', 'refs/elanous/pod-source')).toBe('');
@@ -251,7 +316,7 @@ describe('packSourceBundle', () => {
       const before = snapshot(f.repo);
       const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
       expect(() => packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, log: (category, event, data) => events.push({ category, event, data }) })).toThrow('not on origin default branch');
-      expect(events).toContainEqual({ category: 'pod.source', event: 'bundle-refused', data: { kind: 'worktree', reason: expect.stringContaining('origin cannot supply this base') } });
+      expect(events).toContainEqual({ category: 'pod.source', event: 'bundle-refused', data: expect.objectContaining({ kind: 'worktree', reason: expect.stringContaining('origin cannot supply this base'), bundleMode: 'unknown', bundleReason: 'decision-not-reached', sizeBytes: null }) });
       expect(snapshot(f.repo)).toEqual(before);
       expect(git(f.repo, 'for-each-ref', '--format=%(refname)', 'refs/elanous/pod-source')).toBe('');
       expect(existsSync(f.out)).toBe(false);
@@ -336,9 +401,9 @@ describe('packSourceBundle', () => {
     try {
       writeFileSync(join(f.repo, 'a.txt'), 'oversize');
       const before = snapshot(f.repo);
-      const events: string[] = [];
-      expect(() => packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, maxSizeBytes: 1, log: (_c, event) => events.push(event) })).toThrow('exceeds limit');
-      expect(events).toContain('bundle-refused');
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      expect(() => packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, maxSizeBytes: 1, log: (_c, event, data) => events.push({ event, data }) })).toThrow('exceeds limit');
+      expect(events).toContainEqual({ event: 'bundle-refused', data: expect.objectContaining({ bundleMode: 'full', bundleReason: 'mirror-head-unspecified', sizeBytes: expect.any(Number) }) });
       expect(snapshot(f.repo)).toEqual(before);
       expect(git(f.repo, 'for-each-ref', '--format=%(refname)', 'refs/elanous/pod-source')).toBe('');
       expect(existsSync(join(f.out, 'index.tmp'))).toBe(false);

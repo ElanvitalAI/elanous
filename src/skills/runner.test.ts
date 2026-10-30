@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +27,9 @@ const TOOL_OUTPUT = body(4);
 let streamFailure: Error | null = null;
 let streamWaitForAbort = false;
 let observedStreamSignal: AbortSignal | undefined;
+let streamToolCall: { name: string; args: Record<string, unknown> } = {
+  name: 'Read', args: { file_path: '/tmp/demo.txt' },
+};
 
 const testProvider: LLMProvider = {
   name: 'test',
@@ -53,9 +56,12 @@ mock.module('../llm.js', () => ({
       });
     }
     if (streamFailure) throw streamFailure;
-    const call = { id: 'call-1', name: 'Read', args: { file_path: '/tmp/demo.txt' } };
+    const call = { id: 'call-1', ...streamToolCall };
     handlers.onToolCall?.(call);
-    handlers.onToolResult?.({ id: call.id, name: call.name, result: TOOL_OUTPUT });
+    const result = call.name === 'MermaidRender'
+      ? await handlers.dispatchTool(call.name, call.args, { callId: call.id })
+      : TOOL_OUTPUT;
+    handlers.onToolResult?.({ id: call.id, name: call.name, result });
     return 'ok';
   },
 }));
@@ -105,8 +111,9 @@ describe('executeSkill cancellation', () => {
 
     try {
       await expect(run).rejects.toThrow('follow-up budget exhausted');
-      expect(observedStreamSignal).toBe(controller.signal);
-      expect(observedStreamSignal?.aborted).toBe(true);
+      const observed = observedStreamSignal as AbortSignal | undefined;
+      expect(observed).toBe(controller.signal);
+      expect(observed?.aborted).toBe(true);
     } finally {
       streamWaitForAbort = false;
       observedStreamSignal = undefined;
@@ -178,6 +185,38 @@ describe('executeSkill final response', () => {
     expect(result.fullResponse).toContain('Read');
     expect(result.finalResponse).toBe('ok');
     expect(result.finalResponse).not.toContain('Read');
+  }, 20_000);
+});
+
+describe('DIAG-LITE: existing mock stage dispatches MermaidRender once and returns a real render with zero Python calls', () => {
+  test('dispatches through runner.ts dispatchHostTool without invoking the fake Python binary', async () => {
+    const fakeBin = mkdtempSync(join(tmpdir(), 'mermaid-render-fake-bin-'));
+    const pythonCallLog = join(fakeBin, 'python-calls.log');
+    const fakePython = join(fakeBin, 'python3');
+    const previousPath = process.env.PATH;
+    writeFileSync(fakePython, `#!/bin/sh\nprintf 'called\\n' >> ${JSON.stringify(pythonCallLog)}\n`);
+    chmodSync(fakePython, 0o755);
+    process.env.PATH = `${fakeBin}:${previousPath ?? ''}`;
+    streamToolCall = {
+      name: 'MermaidRender',
+      args: { source: 'flowchart LR\n  A[Start] --> B[End]', format: 'ascii' },
+    };
+
+    try {
+      const { display, result } = await runExecuteSkill();
+
+      expect(result.finalResponse).toBe('ok');
+      expect(result.fullResponse).toBe(display);
+      expect(display).toContain('MermaidRender');
+      expect(display).toContain('Start');
+      expect(display).toContain('End');
+      expect(existsSync(pythonCallLog)).toBe(false);
+    } finally {
+      streamToolCall = { name: 'Read', args: { file_path: '/tmp/demo.txt' } };
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(fakeBin, { recursive: true, force: true });
+    }
   }, 20_000);
 });
 

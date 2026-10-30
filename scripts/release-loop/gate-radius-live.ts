@@ -5,9 +5,10 @@ import { join } from 'node:path';
 import { changedFilesBetween, planPartialRegate, testFileOfId, type PartialPlan } from './gate-partial.js';
 import { CODE_FILE, gitClosureTree, testsReachingChanged } from './gate-closure.js';
 import { versionOnlyBumps } from './gate-radius-shadow.js';
-import { gateAssignableTestsAtCommit, gateBaselineReceipt, type GateBaselineReceipt } from './gate-baseline-receipt.js';
-import { parsePodPool, remoteImageId } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { gateAssignableTestsAtCommit, gateBaselineReceipt, gateEnvFingerprint, type GateBaselineReceipt, type GatePodRuntimeIdentity } from './gate-baseline-receipt.js';
+import { defaultRemoteRun, NODE_REGISTRY, parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { podCommandImageFor } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
+import { gateTestBaseline } from '../lib/gate-test-env.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
@@ -27,18 +28,91 @@ export function hardRehearsalGateArgs(version: string, runId: string, commit: st
 
 export interface LiveRadiusDecision { plan: PartialPlan | null; reason: string; rehearsalRunId?: string }
 
-/** Read the image ID on every candidate host before deciding. A later Job must still prove its actual image. */
-export function preflightGateImageDigest(pool: string): string | null {
+export interface GatePodExecutionIdentity extends GatePodRuntimeIdentity { imageDigest: string }
+
+const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+
+/** Registry v2 manifest digest is the identity Kubernetes reports in containerStatuses.imageID. */
+export function parseGateRepoDigestResponse(headers: string): string | null {
+  const match = /^docker-content-digest:\s*(sha256:[0-9a-f]{64})\s*$/im.exec(headers);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+export interface GateRepoDigestProbeRequest { url: string; acceptHeader: string; command: string }
+
+export function gateRepoDigestProbeRequest(registry: string, image: string, commit: string): GateRepoDigestProbeRequest | null {
+  const port = /:(\d+)$/.exec(registry)?.[1];
+  if (!port || !SHA.test(commit)) return null;
+  const imageName = image.startsWith('elanous-harness-lite:') ? 'elanous-harness-lite' : 'elanous-harness';
+  const tag = commit.slice(0, 12);
+  const url = `http://localhost:${port}/v2/${imageName}/manifests/${tag}`;
+  const accept = 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json';
+  const acceptHeader = `Accept: ${accept}`;
+  return { url, acceptHeader, command: `curl -fsS --max-time 8 -D - -o /dev/null -H ${shellQuote(acceptHeader)} ${shellQuote(url)}` };
+}
+
+function probeGateRepoDigest(member: ReturnType<typeof parsePodPool>[number], image: string, commit: string): string | null {
+  const registry = member.registry ?? NODE_REGISTRY;
+  const request = gateRepoDigestProbeRequest(registry, image, commit);
+  if (!request) return null;
+  const result = member.sshHost
+    ? defaultRemoteRun(member.sshHost, request.command)
+    : spawnSync('curl', ['-fsS', '--max-time', '8', '-D', '-', '-o', '/dev/null', '-H', request.acceptHeader, request.url],
+      { encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+  return result.status === 0 ? parseGateRepoDigestResponse(result.stdout) : null;
+}
+
+function gateRegistryHostImage(member: ReturnType<typeof parsePodPool>[number], image: string, commit: string): string | null {
+  const registry = member.registry ?? NODE_REGISTRY;
+  const port = /:(\d+)$/.exec(registry)?.[1];
+  if (!port) return null;
+  const imageName = image.startsWith('elanous-harness-lite:') ? 'elanous-harness-lite' : 'elanous-harness';
+  return `localhost:${port}/${imageName}:${commit.slice(0, 12)}`;
+}
+
+/** Read the immutable pushed image manifest on every candidate host. Local Docker Image IDs are diagnostic only. */
+export function preflightGateImageDigest(pool: string, commit?: string): string | null {
   try {
+    if (!commit || !SHA.test(commit)) return null;
     const image = podCommandImageFor([], true);
     const members = parsePodPool(pool);
     if (!members.length) return null;
-    const ids = members.map((member) => {
-      if (member.sshHost) return remoteImageId(member, image);
-      const result = spawnSync('docker', ['image', 'inspect', image, '--format', '{{.Id}}'], { encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
-      return result.status === 0 ? result.stdout.trim() : null;
+    const digests = members.map((member) => probeGateRepoDigest(member, image, commit));
+    return digests.every((digest) => digest && DIGEST.test(digest) && digest === digests[0]) ? digests[0]! : null;
+  } catch { return null; }
+}
+
+/** Probe each candidate's exact gate image/runtime and deterministic environment without a Kubernetes Job. */
+export function preflightGateExecutionIdentity(pool: string, env: NodeJS.ProcessEnv, commit?: string): GatePodExecutionIdentity | null {
+  try {
+    if (!commit || !SHA.test(commit)) return null;
+    const image = podCommandImageFor([], true);
+    const members = parsePodPool(pool);
+    if (!members.length) return null;
+    const baseline = gateTestBaseline(env);
+    const expectedEnvFingerprint = gateEnvFingerprint(env);
+    const script = "const {createHash}=require('node:crypto');const keys=['ELANOUS_TEST_FAKE_LLM','LANG','LC_ALL','TZ'];const e=Object.fromEntries(keys.sort().map(k=>[k,process.env[k]??'']));const envFingerprint=createHash('sha256').update(JSON.stringify(e)).digest('hex');console.log(JSON.stringify({bunVersion:Bun.version,platform:process.platform,architecture:process.arch,envFingerprint}));";
+    const rows = members.map((member): GatePodExecutionIdentity | null => {
+      const imageDigest = probeGateRepoDigest(member, image, commit);
+      if (!imageDigest || !DIGEST.test(imageDigest)) return null;
+      const hostImage = gateRegistryHostImage(member, image, commit);
+      if (!hostImage) return null;
+      const args = ['run', '--rm', '--pull=never', '--network=none', ...Object.entries(baseline).flatMap(([key, value]) => ['-e', `${key}=${value}`]), '--entrypoint', 'bun', hostImage, '-e', script];
+      const result = member.sshHost
+        ? defaultRemoteRun(member.sshHost, `docker ${args.map(shellQuote).join(' ')}`)
+        : spawnSync('docker', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      if (result.status !== 0) return null;
+      try {
+        const row = JSON.parse(result.stdout.trim()) as Partial<GatePodRuntimeIdentity>;
+        if (typeof row.bunVersion !== 'string' || typeof row.platform !== 'string' || typeof row.architecture !== 'string'
+          || row.envFingerprint !== expectedEnvFingerprint) return null;
+        return { imageDigest, bunVersion: row.bunVersion, platform: row.platform, architecture: row.architecture,
+          envFingerprint: row.envFingerprint };
+      } catch { return null; }
     });
-    return ids.every((id) => id && DIGEST.test(id) && id === ids[0]) ? ids[0]! : null;
+    if (rows.some((row) => row === null)) return null;
+    const first = rows[0]!;
+    return rows.every((row) => JSON.stringify(row) === JSON.stringify(first)) ? first : null;
   } catch { return null; }
 }
 
@@ -82,10 +156,15 @@ export function partialGateImagesMatch(root: string, version: string, digest: st
 /** Every missing or mismatched proof returns a full gate. The caller uses this only when no explicit resume plan exists. */
 export function planHardRehearsalRadius(input: { root: string; repo: string; version: string; forCommit: string;
   graphPins: { graphSha: string; recipeSha: string } | null; envFingerprint: string;
-  imageDigest: string | null }): LiveRadiusDecision {
+  imageDigest: string | null; executionIdentity: GatePodExecutionIdentity | null }): LiveRadiusDecision {
   const full = (reason: string): LiveRadiusDecision => ({ plan: null, reason });
   if (!/^\d+\.\d+\.\d+$/.test(input.version) || !SHA.test(input.forCommit)) return full('invalid release identity');
-  if (!input.graphPins || !/^[0-9a-f]{64}$/i.test(input.envFingerprint) || !input.imageDigest || !DIGEST.test(input.imageDigest))
+  if (!input.graphPins || !/^[0-9a-f]{64}$/i.test(input.envFingerprint) || !input.imageDigest || !DIGEST.test(input.imageDigest)
+    || !input.executionIdentity || input.executionIdentity.imageDigest !== input.imageDigest.toLowerCase()
+    || input.executionIdentity.envFingerprint !== input.envFingerprint
+    || !/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(input.executionIdentity.bunVersion)
+    || !/^[a-z0-9_-]{1,32}$/.test(input.executionIdentity.platform)
+    || !/^[a-z0-9_-]{1,32}$/.test(input.executionIdentity.architecture))
     return full('current graph, environment or Pod image identity unmeasured');
   try {
     const stamps = ['hard-5h', 'hard-mid'].map((step) => {
@@ -118,14 +197,19 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
       if (verdict.commit !== stamp.sha || verdict.outcome !== 'ok' || failures.commit !== stamp.sha
         || !Array.isArray(failures.failures) || failures.failures.length !== 0
         || !Array.isArray(failures.errors) || failures.errors.length !== 0
-        || !receipt || receipt.schema !== 1 || !receipt.valid || receipt.version !== gateVersion || receipt.commit !== stamp.sha
+        || !receipt || receipt.schema !== 2 || !receipt.valid || receipt.version !== gateVersion || receipt.commit !== stamp.sha
         || receipt.graphSha !== input.graphPins.graphSha || receipt.recipeSha !== input.graphPins.recipeSha
         || receipt.envFingerprint !== input.envFingerprint || receipt.imageDigest !== input.imageDigest.toLowerCase()
+        || !receipt.executionIdentity
+        || JSON.stringify(receipt.executionIdentity) !== JSON.stringify({ bunVersion: input.executionIdentity.bunVersion,
+          platform: input.executionIdentity.platform, architecture: input.executionIdentity.architecture,
+          envFingerprint: input.executionIdentity.envFingerprint })
         || !Number.isSafeInteger(receipt.files) || receipt.files < 1 || !Number.isSafeInteger(receipt.shards) || receipt.shards < 1)
         return full('hard rehearsal receipt or current execution identity differs');
       const recomputed = gateBaselineReceipt({ root: input.root, version: gateVersion, commit: stamp.sha,
         fullSweep: true, graphPins: input.graphPins, envFingerprint: input.envFingerprint });
-      if (!recomputed.valid || recomputed.imageDigest !== receipt.imageDigest || recomputed.files !== receipt.files
+      if (!recomputed.valid || recomputed.imageDigest !== receipt.imageDigest
+        || JSON.stringify(recomputed.executionIdentity) !== JSON.stringify(receipt.executionIdentity) || recomputed.files !== receipt.files
         || recomputed.shards !== receipt.shards) return full(`hard rehearsal Pod proof differs: ${recomputed.reason}`);
       const ancestor = spawnSync('git', ['merge-base', '--is-ancestor', stamp.sha, input.forCommit], { cwd: input.repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
       if (ancestor.status !== 0 || ancestor.error) return full('hard rehearsal commit is not an ancestor');

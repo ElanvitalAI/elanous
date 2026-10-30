@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { authorGoal, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyEmptyPersistentEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, selectRelevantAuthoringLessons, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
+import { authorGoal, runGoalAuthorSelfReview, GOAL_AUTHOR_SELF_REVIEW_CHECKS, resolveGoalAuthorGrade, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, classifyTracedPathToken, canonicalTracedPathToken, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyEmptyPersistentEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, selectRelevantAuthoringLessons, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, isAskPathLocatorToken, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
 import { GOAL_AUTHOR_GROUND_TIMEBOX_MS, readGoalAuthorGroundingTimebox } from './goal-author.js';
 import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR, requiredEvidenceFromGoal } from './off-diff-evidence.js';
@@ -94,6 +94,21 @@ function existingGoalDocumentsRoot(prefix: string): string {
   temporaryDirectories.push(cwd);
   mkdirSync(join(cwd, 'docs', 'goals'), { recursive: true });
   return cwd;
+}
+
+function initializeEvidenceOriginMain(root: string, paths: readonly string[] = []): void {
+  execFileSync('git', ['init', '-q', '-b', 'main', root]);
+  execFileSync('git', ['-C', root, 'config', 'user.email', 'goal-author-test@example.com']);
+  execFileSync('git', ['-C', root, 'config', 'user.name', 'goal-author-test']);
+  writeFileSync(join(root, 'README.md'), 'fixture main tree\n');
+  for (const path of paths) {
+    const absolute = join(root, path);
+    mkdirSync(join(absolute, '..'), { recursive: true });
+    writeFileSync(absolute, 'fixture evidence test\n');
+  }
+  execFileSync('git', ['-C', root, 'add', '-A', '--', '.']);
+  execFileSync('git', ['-C', root, 'commit', '-qm', 'fixture main']);
+  execFileSync('git', ['-C', root, 'update-ref', 'refs/remotes/origin/main', 'HEAD']);
 }
 
 afterEach(() => {
@@ -11315,6 +11330,241 @@ describe('ACCEPTANCE-FROM-VERIFY-MENU: authored «검증 계획(TDD)»', () => {
     } finally {
       log.mockRestore();
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── SELF-REVIEW-PRELAUNCH — 발사 전 self-review 페이즈(다섯 검사 · 1회 재저작 · 잔여 needs-human) ──
+describe('SELF-REVIEW-PRELAUNCH: 발사 전 self-review 페이즈', () => {
+  /** author.self-review 관측만 캡처한다 — 카테고리도 함께 남겨 채널 쌍을 문다. */
+  function captureAuthorSelfReview(): { events: Array<Record<string, unknown>>; categories: string[]; restore: () => void } {
+    const events: Array<Record<string, unknown>> = [];
+    const categories: string[] = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string, data: unknown) => {
+      if (event === 'author.self-review') {
+        categories.push(category);
+        events.push(data as Record<string, unknown>);
+      }
+    }) as typeof debug.log;
+    return { events, categories, restore: () => { debug.log = originalLog; } };
+  }
+
+  function selfReviewItems(events: Array<Record<string, unknown>>, attempt: number): Array<Record<string, unknown>> {
+    const review = events.find((data) => data.attempt === attempt) ?? events.at(-1);
+    return (review?.items ?? []) as Array<Record<string, unknown>>;
+  }
+
+  test('an explicit predecessor dependency after landing is not a future assumption', async () => {
+    const steps = [
+      '① 그림자 — 이 골의 배선이 자율 결정을 기록만 한다. 판정 = 시험 통과.',
+      '② live 스위치 — 선행 = ① 그림자 착지. 같은 배선의 자율 실행을 켠다.',
+    ];
+    const document = `## STEPS\n${steps.map((step) => `- ${step}`).join('\n')}\n`;
+    const outcome = await runGoalAuthorSelfReview({
+      ask: '분할: 그림자 먼저', document, steps, checklist: [], facts: null,
+    });
+    expect(outcome.document).toBe(document);
+    expect(outcome.reviews).toHaveLength(1);
+    expect(outcome.reviews[0]!.items).toContainEqual(expect.objectContaining({
+      check: 'future-assumption', verdict: 'pass',
+    }));
+  });
+
+  test('self-review check inventory is the observed five-check contract', async () => {
+    const capture = captureAuthorSelfReview();
+    try {
+      await authorGoal('대상 경로: src/example.ts', {
+        ...deps, ground: async () => facts,
+        enhance: async (raw) => ({ original: raw, checklist: [], verbatimPreserved: true }),
+      });
+      const first = selfReviewItems(capture.events, 1);
+      expect([...new Set(first.map((item) => item.check))].sort()).toEqual([...GOAL_AUTHOR_SELF_REVIEW_CHECKS].sort());
+    } finally { capture.restore(); }
+  });
+
+  test('reattempt replaces only the real STEPS section, not a heading copied inside the fenced ask', async () => {
+    const fencedAsk = ['Original ask (verbatim, unmodified):', '```', '## STEPS', '- ask text', '## ACCEPTANCE CRITERIA', '```'].join('\n');
+    const oversize = '조각 A · 난이도: 상';
+    const replacement = '조각 A1 · 난이도: 하 · 착지 가능: focused 시험 · 선행: 없음';
+    const document = [
+      '## WHAT TO BUILD', fencedAsk, '', '## STEPS', `- ${oversize}`, '',
+      '## ACCEPTANCE CRITERIA', 'criteria',
+    ].join('\n');
+    const outcome = await runGoalAuthorSelfReview({
+      ask: 'self-review를 수행한다', document, steps: [oversize], checklist: [], facts: null,
+      decomposeSteps: async () => [replacement],
+    });
+    expect(outcome.document).toContain(fencedAsk);
+    expect(outcome.document).toContain(`## STEPS\n- ${replacement}\n\n## ACCEPTANCE CRITERIA`);
+    expect(outcome.document).not.toContain(`- ${oversize}`);
+    expect(outcome.reviews[0]!.items).toContainEqual(expect.objectContaining({ check: 'slice-difficulty', verdict: 'fixed', slice: oversize }));
+  });
+
+  test('empty re-decomposition preserves needs-human instead of reporting the old oversized slice fixed', async () => {
+    const oversize = '조각 A · 난이도: 상';
+    const document = `## STEPS\n- ${oversize}\n\n## ACCEPTANCE CRITERIA\ncriteria\n`;
+    const outcome = await runGoalAuthorSelfReview({
+      ask: 'self-review를 수행한다', document, steps: [oversize], checklist: [], facts: null,
+      decomposeSteps: async () => [],
+    });
+    expect(outcome.document).toBe(document);
+    expect(outcome.reviews[0]!.items).toContainEqual(expect.objectContaining({ check: 'slice-difficulty', verdict: 'needs-human', slice: oversize }));
+    expect(outcome.reviews[1]!.items).toContainEqual(expect.objectContaining({ check: 'slice-difficulty', verdict: 'needs-human', slice: oversize }));
+    expect(outcome.reviews[0]!.items).not.toContainEqual(expect.objectContaining({ check: 'slice-difficulty', verdict: 'fixed', slice: oversize }));
+  });
+
+  test('DECOMPOSE-SLICE-LANDABLE: self-review 페이즈를 ① 조각 난이도 하·중·착지 가능·선행 명시상 조각은 1회 재분해하고 잔여 조각만 needs-human으로 남긴다', async () => {
+    const capture = captureAuthorSelfReview();
+    try {
+      const decomposeSteps = mock(async (_objective: string, opts?: { context?: string }) =>
+        opts?.context?.includes('SELF-REVIEW ①')
+          ? ['대상 경로: src/example.ts · 동작: 경계 분기 검사 · 난이도: 하 · 착지 가능: focused 시험 통과 · 선행: 없음']
+          : ['대상 경로: src/example.ts · 동작: 경계 분기 검사 · 난이도: 상']);
+      const authored = await authorGoal('대상 경로: src/example.ts\n판정선(반증): 조각이 난이도 하·중·착지 가능·선행을 명시한다.', {
+        ...deps,
+        goalId: '0123456789abcdef',
+        decomposeSteps,
+      });
+      // 상 조각은 1회만 더 분해된다 — 조립 1회 ⊕ 재저작 1회.
+      expect(decomposeSteps).toHaveBeenCalledTimes(2);
+      expect(authored.document).toContain('난이도: 하');
+      expect(authored.document).not.toContain('난이도: 상');
+      const first = selfReviewItems(capture.events, 1);
+      expect(first).toContainEqual(expect.objectContaining({
+        check: 'slice-difficulty',
+        verdict: 'fixed',
+        slice: expect.stringContaining('난이도: 상'),
+        fix: expect.stringContaining('재분해'),
+      }));
+      const second = selfReviewItems(capture.events, 2);
+      expect(second).toContainEqual(expect.objectContaining({
+        check: 'slice-difficulty',
+        verdict: 'pass',
+        slice: expect.stringContaining('난이도: 하'),
+      }));
+      expect(second.filter((item) => item.check === 'slice-difficulty' && item.verdict === 'needs-human')).toEqual([]);
+      // 다섯 검사는 매 시도에 항목별 verdict 로 남는다.
+      expect([...new Set(first.map((item) => item.check))].sort())
+        .toEqual([...GOAL_AUTHOR_SELF_REVIEW_CHECKS].sort());
+      expect(capture.categories).toEqual(expect.arrayContaining(['goal-author', 'harness.author']));
+    } finally {
+      capture.restore();
+    }
+  });
+
+  // 골 #32327·#32740 의 원 문면은 src/self-dev/decompose.test.ts 의 원 골 feature 를 그대로 재생하고,
+  // #32561 은 같은 날 길어진 골의 저작 실패 양상(ask 밖 목표·칸 밖 경로·미래 가정)을 재현하는 fixture 다.
+  test.each([
+    {
+      goal: '#32327 STOP-AUTOHEAL',
+      ask: '대상 경로: src/autopilot/stop-autoheal.ts\nstop-autoheal 분류를 확장하고 stop/run ledger 동작을 안정적으로 보존한다.\n판정선(반증): stop-autoheal 분류가 격리 시험에서 관측된다.',
+      target: 'src/autopilot/stop-autoheal.ts',
+      keep: 'stop/run ledger 동작을 안정적으로 보존한다',
+      outOfCell: '칸 밖 경로: src/task-orchestrator/workflow-runtime.ts 런타임도 함께 재작성한다',
+      askOutside: 'TRAIN-FLEET-POLICY 칸의 pod 검증 목표도 함께 진행한다',
+      future: 'PR #99999 가 착지되면 이어서 리팩터링한다',
+    },
+    {
+      goal: '#32740 train-fleet policy',
+      ask: '대상 경로: src/autopilot/train-fleet-policy.ts\nhost podPool 신원을 검증하고, 도입 시험을 분류하고, 반복 same-head 실패를 park 하고, 읽기 전용 shadow CLI 로 결과를 노출한다.\n판정선(반증): train-fleet 정책 판정이 격리 시험에서 관측된다.',
+      target: 'src/autopilot/train-fleet-policy.ts',
+      keep: '반복 same-head 실패를 park 하는 정책을 보존한다',
+      outOfCell: '칸 밖 경로: src/knowledge/graph-store.ts 지식 그래프도 함께 고친다',
+      askOutside: 'RUN-AUTOPSY-LOOP 칸의 런 부검 목표도 포함한다',
+      future: '다음 버전에 shadow CLI 를 live 로 전환할 예정이다',
+    },
+    {
+      goal: '#32561 goal-author 발사 전 검열',
+      ask: '대상 경로: src/self-implement/goal-author.ts\ngoal-author 저작 경로에 발사 전 검열 단계를 추가한다.\n판정선(반증): 저작물 검열이 격리 시험에서 관측된다.',
+      target: 'src/self-implement/goal-author.ts',
+      keep: 'goal-author 의 기존 저작 단계를 보존한다',
+      outOfCell: '칸 밖 경로: src/harness/harness-plan.ts 계획 런타임도 함께 재작성한다',
+      askOutside: 'KNOWHOW-PACK-TDD-AUTHORING 칸의 팩 편집 목표도 함께 진행한다',
+      future: '향후 review 라운드에서 재저작 루프를 자동화한다',
+    },
+  ])('$goal 원 저작을 mock LLM 으로 replay해 ② ask 밖 목표·칸 밖 경로와 ③ 미래 가정 탐지를 보인다', async ({ ask: goalAsk, target, keep, outOfCell, askOutside, future }) => {
+    const capture = captureAuthorSelfReview();
+    try {
+      const authored = await authorGoal(goalAsk, {
+        ...deps,
+        ground: async () => ({ ...facts, files: [target], persistentEvidence: [`${target}:1 — Read-verified authoring path.`] }),
+        enhance: async (raw) => ({ original: raw, checklist: [keep, outOfCell, askOutside, future], verbatimPreserved: true }),
+      });
+      const first = selfReviewItems(capture.events, 1);
+      expect(first).toContainEqual(expect.objectContaining({
+        check: 'ask-scope', verdict: 'fixed', slice: outOfCell, fix: expect.stringContaining('제거'),
+      }));
+      expect(first).toContainEqual(expect.objectContaining({ check: 'ask-scope', verdict: 'fixed', slice: askOutside }));
+      expect(first).toContainEqual(expect.objectContaining({
+        check: 'future-assumption', verdict: 'fixed', slice: future, fix: expect.stringContaining('FU'),
+      }));
+      expect(authored.document).toContain(`- Checkable requested criterion: ${keep}`);
+      expect(authored.document).not.toContain(`- Checkable requested criterion: ${outOfCell}`);
+      expect(authored.document).not.toContain(`- Checkable requested criterion: ${askOutside}`);
+      expect(authored.document).not.toContain(`- Checkable requested criterion: ${future}`);
+      expect(authored.document).toContain(`- FU(후속 조각): ${future}`);
+      const second = selfReviewItems(capture.events, 2);
+      expect(second).toContainEqual(expect.objectContaining({ check: 'ask-scope', verdict: 'pass' }));
+      expect(second).toContainEqual(expect.objectContaining({ check: 'future-assumption', verdict: 'pass' }));
+      expect(lintGoalFile(authored.document, 'main').filter((finding) => finding.level === 'ERROR')).toEqual([]);
+    } finally {
+      capture.restore();
+    }
+  });
+
+  test('④ mock 무대 MS id·사건 주입·관측 줄 검사와 ⑤ 완료 경계 증거 명령의 현재 main 실행 가능 판정 — writeAuthoredGoal 배선', async () => {
+    const cwd = existingGoalDocumentsRoot('goal-author-self-review-main-');
+    initializeEvidenceOriginMain(cwd, ['src/example.test.ts']);
+    const request = [
+      '대상 경로: src/example.ts',
+      '완료 경계 코드: src/example.ts에 문면의 요청 동작을 구현한다',
+      '완료 경계 실물: 격리 시험에서 생산 경로를 관측한다',
+      '완료 경계 증거 명령: bun test src/example.test.ts',
+      '판정선(반증): 완료 경계 증거 명령의 main 실행 가능 판정이 관측에 남는다',
+    ].join('\n');
+    const capture = captureAuthorSelfReview();
+    try {
+      await writeAuthoredGoal(request, cwd, { ...deps, repositoryRoot: cwd });
+      const first = selfReviewItems(capture.events, 1);
+      expect(first).toContainEqual(expect.objectContaining({
+        check: 'evidence-command', verdict: 'pass', judgment: 'main-runnable',
+        detail: expect.stringContaining('src/example.test.ts'),
+      }));
+      expect(first).toContainEqual(expect.objectContaining({ check: 'mock-stage' }));
+    } finally {
+      capture.restore();
+    }
+
+    const missingCwd = existingGoalDocumentsRoot('goal-author-self-review-missing-');
+    initializeEvidenceOriginMain(missingCwd);
+    mkdirSync(join(missingCwd, 'src'), { recursive: true });
+    writeFileSync(join(missingCwd, 'src', 'not-yet-created.test.ts'), "import { test } from 'bun:test';\n");
+    const missingCapture = captureAuthorSelfReview();
+    try {
+      await writeAuthoredGoal(request.replace('src/example.test.ts', 'src/not-yet-created.test.ts'), missingCwd, { ...deps, repositoryRoot: missingCwd });
+      const first = selfReviewItems(missingCapture.events, 1);
+      expect(first).toContainEqual(expect.objectContaining({
+        check: 'evidence-command', verdict: 'needs-human', judgment: 'main-not-runnable',
+        detail: expect.stringContaining('src/not-yet-created.test.ts'),
+      }));
+    } finally {
+      missingCapture.restore();
+    }
+
+    const unknownCwd = existingGoalDocumentsRoot('goal-author-self-review-unknown-');
+    mkdirSync(join(unknownCwd, 'src'), { recursive: true });
+    writeFileSync(join(unknownCwd, 'src', 'example.test.ts'), "import { test } from 'bun:test';\n");
+    const unknownCapture = captureAuthorSelfReview();
+    try {
+      await writeAuthoredGoal(request, unknownCwd, { ...deps, repositoryRoot: unknownCwd });
+      const first = selfReviewItems(unknownCapture.events, 1);
+      expect(first).toContainEqual(expect.objectContaining({
+        check: 'evidence-command', verdict: 'needs-human', judgment: 'unknown',
+        detail: expect.stringContaining('origin/main'),
+      }));
+    } finally {
+      unknownCapture.restore();
     }
   });
 });

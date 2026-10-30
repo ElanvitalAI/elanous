@@ -5630,7 +5630,7 @@ const selfOrchestrateCmd = selfCmd
           catch (e) { ui.error(`--pod-source: ${e instanceof Error ? e.message : String(e)}`); process.exit(2); }
           const outDir = join(elanousStateRoot(), 'pod-sources', runId);
           const baseRef = opts.base ?? 'origin/HEAD';
-          try { podSource = resolvePodSource(parsed, { base: baseRef, outDir }); }
+          try { podSource = resolvePodSource(parsed, { base: baseRef, outDir, mirrorHead: image.imageCommit }); }
           catch (e) { ui.error(`--pod-source: ${e instanceof Error ? e.message : String(e)}`); process.exit(2); }
           debug.log('self-implement.pod', 'source', {
             kind: podSource.kind,
@@ -5642,7 +5642,7 @@ const selfOrchestrateCmd = selfCmd
         if (childFlags.childLlmProvider?.trim()) debug.log('self-implement.pod', 'child-provider-named', { provider: childFlags.childLlmProvider.trim(), model: childFlags.childLlmModel ?? null, podProvider });
         // BEDROCK-POD-PROVIDER-DROP — provider·account 는 한 곳(podLaunchProviderOptions)에서 — 손 나열이 bedrock 을 떨궈 codex(team)로 돌았다(10-11).
         const podProviderOptions = (await import('./task-orchestrator/surfaces/pod-child-providers.js')).podLaunchProviderOptions(podProvider, { explicitPodAccount, grokApiKeyOptIn });
-        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
+        const podBase = { hostSupervised: opts.supervise === true, ...podChildLlm, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), ...podProviderOptions, ...(accountBroker ? { accountBroker, rotationAccounts } : {}), passEnv, warmReuseConfig: () => getUserConfig().pod?.warmReuse, warmReuseEvidence: () => undefined, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}), ...(repairBaseHead && podSource?.kind === 'pr' ? { repairCommitOnly: { pr: podSource.number, baseHead: repairBaseHead } } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
@@ -6938,6 +6938,21 @@ const agentCmd = program
   .alias('codex')
   .description(`Agent-mission CLI — 외부 에이전트 backend(${agentBackendHelpList}) 미션·리뷰 워치·셋업. \`codex\` 는 deprecated alias(하위호환).`);
 
+let agentMissionCliDepsForTesting: Partial<import('./agent-mission/mission-cli.js').MissionCliDeps> | undefined;
+let agentMissionLogSinkForTesting: ((surface: string) => Promise<boolean>) | undefined;
+/** 실제 agent-mission mission 진입점의 탐지·실행 순서를 검증한다. */
+export function setAgentMissionCliDepsForTesting(
+  deps: Partial<import('./agent-mission/mission-cli.js').MissionCliDeps> | undefined,
+): void {
+  agentMissionCliDepsForTesting = deps;
+}
+/** 진입점 회귀 테스트에서 logs.db 쓰기를 차단한다. */
+export function setAgentMissionLogSinkForTesting(
+  register: ((surface: string) => Promise<boolean>) | undefined,
+): void {
+  agentMissionLogSinkForTesting = register;
+}
+
 // ★ 제1원칙 관측 — agent-mission 전 서브커맨드에 logs.db 싱크를 중앙 배선(preAction 훅)하고, 레거시
 //   `codex` alias 진입이면 브레드크럼(명명 중립화 이행률 추적 → alias 제거 안전시점 판정 근거).
 //   • 균일 커버리지: 훅은 mission/review-*/setup/models/config-migrate 모든 액션 앞에 1회 실행 →
@@ -6955,8 +6970,11 @@ const AGENT_MISSION_SURFACE_BY_SUB: Record<string, string> = {
 agentCmd.hook('preAction', async (_thisCommand, actionCommand) => {
   const surface = AGENT_MISSION_SURFACE_BY_SUB[actionCommand.name()] ?? 'agent-mission';
   try {
-    const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js');
-    await registerStandaloneLogSink(surface);
+    if (agentMissionLogSinkForTesting) await agentMissionLogSinkForTesting(surface);
+    else {
+      const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js');
+      await registerStandaloneLogSink(surface);
+    }
   } catch { /* fail-open */ }
   try {
     const { isLegacyCodexInvocation, AGENT_ALIAS_LOG_CATEGORY } = await import('./agent-mission/legacy-alias.js');
@@ -7078,6 +7096,7 @@ agentCmd
     // ★ U4b — 액션 글루(backend 검증·mission-file/text·evidence·spec 빌드·통일 진입점 실행)는
     //   runAgentMissionCliCommand(테스트 가능 seam)로 추출. 액션은 I/O(print/exit)만 담당.
     const { resolveBackend } = await import('./agent-mission/driver.js');
+    const { detectAgentCli } = await import('./agent-mission/tool-install.js');
     const { runAgentMissionCliCommand } = await import('./agent-mission/mission-cli.js');
     const controller = new AbortController();
     const onSigint = (): void => { controller.abort(); };
@@ -7085,7 +7104,8 @@ agentCmd
     let outcome: Awaited<ReturnType<typeof runAgentMissionCliCommand>>;
     try {
       outcome = await runAgentMissionCliCommand(textParts, opts as import('./agent-mission/mission-cli.js').MissionCliOpts,
-        { resolveBackend, signal: controller.signal });
+        { resolveBackend, detectAgentCli, onStatus: (line) => console.error(`[agent-mission] ${line}`), signal: controller.signal,
+          ...agentMissionCliDepsForTesting });
     } finally {
       process.removeListener('SIGINT', onSigint);
     }
@@ -8779,6 +8799,15 @@ missionCmd
     const cfg = getUserConfig();
     persistMissionOutcome(setMissionMode(cfg.llm.missionRouting, mode));
   });
+
+// Stateless shell bridge for Codex/Claude agent missions. State is scoped to
+// the active Elanous instance; replies are persisted and mirrored to logs.db.
+if (!INDEX_FAST_ROOT) {
+  const { registerMissionOutCommand } = require('./agent-mission/mission-out.js') as typeof import('./agent-mission/mission-out.js');
+  registerMissionOutCommand(program, {
+    emit: (event) => debug.log('mission.reply', 'reply', event),
+  });
+}
 
 registerTasksCommands(program);
 registerBriefCommands(program);

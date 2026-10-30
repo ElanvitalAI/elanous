@@ -62,8 +62,13 @@ function runNextMdCheck(cwd: string): LandGlobalChecksRun {
   const prfaq = join(dir, 'prfaq.md');
   writeFileSync(prfaq, '');
   try {
+    // The parent may itself be a release graph node. Its context points at temporary graph outputs
+    // (including docs worktrees already removed by the time pr land runs); this checker must inspect
+    // the checkout paths passed below instead of inheriting that unrelated graph input.
+    const env = { ...process.env };
+    delete env.ELANOUS_GRAPH_CONTEXT;
     const r = spawnSync('bun', [CHECK_NODE_SCRIPT, '--landing', '--prfaq', prfaq, '--files', 'release/next.md'], {
-      cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 60_000,
+      cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 60_000, env,
     });
     return { status: r.status, output: `${r.stdout ?? ''}\n${r.stderr ?? ''}`, ...(r.error ? { error: r.error.message } : {}) };
   } finally {

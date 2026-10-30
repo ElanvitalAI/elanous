@@ -12,7 +12,7 @@ import { detectTestInterference, failedNamesFromStreams, parseFailureCount, runB
 import { MAX_INSPECTED_TEST_FILES, runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 import { pwaGraph, pwaReach } from '../../scripts/ci-pwa-build-gate.js';
 import { changedPathPairs, changedTsFiles, readGitFile, requiredExportFieldsInChanges } from '../../scripts/ci-typecheck-changed.js';
-import { classifyMergeFailure, clipRegateDetail, parseConflictFiles, type HostRegateFailure } from './regate-detail.js';
+import { classifyMergeFailure, clipRegateDetail, parseConflictFiles, type HostRegateFailure, type HostRegatePrHeadFailureCondition, type HostRegatePrHeadSnapshot } from './regate-detail.js';
 import { buildImporterTestIndex, isTestPath } from './importer-test-index.js';
 import type { GateReceipt, GateReceiptIdentity } from './gate-receipt-registry.js';
 
@@ -386,9 +386,32 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     release = await (deps.acquire ?? acquireSlot)(input.repoRoot);
     type PrView = { headRefOid?: string; baseRefName?: string; baseRefOid?: string; state?: string; isDraft?: boolean };
     const readPr = (): PrView => JSON.parse(run('gh', ['pr', 'view', String(input.prNumber), '--json', 'headRefOid,baseRefName,baseRefOid,state,isDraft'], input.repoRoot));
-    const prHeadFailure = (seen: PrView): HostRegateResult => result('unmeasured', 'pr-head',
-      `PR head, base commit, ready state or open state unavailable or changed (state=${seen.state ?? 'unknown'} · isDraft=${String(seen.isDraft)} · base=${seen.baseRefName ?? 'unknown'}@${seen.baseRefOid ?? 'unknown'})`,
-      { expectedHead: input.headCommit, actualHead: typeof seen.headRefOid === 'string' ? seen.headRefOid : null });
+    const prHeadFailure = (seen: PrView): HostRegateResult => {
+      const failedConditions: HostRegatePrHeadFailureCondition[] = [];
+      const validHead = typeof seen.headRefOid === 'string' && /^[0-9a-f]{40}$/i.test(seen.headRefOid);
+      if (!validHead) failedConditions.push('head-unavailable');
+      else if (seen.headRefOid !== input.headCommit) failedConditions.push('head-mismatch');
+      if (typeof seen.state !== 'string') failedConditions.push('state-unavailable');
+      else if (seen.state !== 'OPEN') failedConditions.push('state-not-open');
+      if (typeof seen.isDraft !== 'boolean') failedConditions.push('draft-status-unavailable');
+      else if (seen.isDraft && !input.allowDraft) failedConditions.push('pr-is-draft');
+      if (!seen.baseRefName) failedConditions.push('base-name-unavailable');
+      const validBaseOid = typeof seen.baseRefOid === 'string' && /^[0-9a-f]{40}$/i.test(seen.baseRefOid);
+      if (!validBaseOid) failedConditions.push('base-oid-invalid');
+      failedConditions.sort();
+      const state: HostRegatePrHeadSnapshot['state'] =
+        seen.state === 'OPEN' || seen.state === 'CLOSED' || seen.state === 'MERGED' ? seen.state : typeof seen.state === 'string' ? 'OTHER' : null;
+      const snapshot: HostRegatePrHeadSnapshot = {
+        headRefOid: validHead ? seen.headRefOid! : null,
+        state,
+        isDraft: typeof seen.isDraft === 'boolean' ? seen.isDraft : null,
+        baseRefName: !seen.baseRefName ? null : seen.baseRefName === 'main' ? 'main' : 'other',
+        baseRefOid: validBaseOid ? seen.baseRefOid! : null,
+      };
+      return result('unmeasured', 'pr-head',
+        `PR head preflight failed: ${failedConditions.join(', ') || 'unknown'} (state=${snapshot.state ?? 'unknown'} · isDraft=${String(snapshot.isDraft)} · base=${snapshot.baseRefName ?? 'unknown'}@${snapshot.baseRefOid ?? 'unknown'})`,
+        { expectedHead: input.headCommit, actualHead: snapshot.headRefOid, failedConditions, prHeadSnapshot: snapshot });
+    };
     let view: PrView;
     try { view = readPr(); }
     catch (e) { return result('unmeasured', 'pr-view', String(e)); }

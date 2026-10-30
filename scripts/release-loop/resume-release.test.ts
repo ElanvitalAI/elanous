@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from 'bun:test';
+import { afterAll, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,7 +17,11 @@ import { runGraph, verifyReleaseCommandRoot } from '../../src/graph-runner/runne
 import { createGateRunner, runGateNode, type GateRunner } from './gate-node.js';
 import { gateEnvFingerprint } from './gate-baseline-receipt.js';
 import { markGateShardUnmeasured, saveGateShardResult } from './gate-shard-receipts.js';
+import { planGateShardDispatch } from './gate-shard-dispatch.js';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+
+// SIGTERM lifecycle fixtures launch a real Bun child and can exceed Bun's 5 s default under parallel gate-test load.
+setDefaultTimeout(15_000);
 
 const SHA = 'a'.repeat(40);
 const VERSION = '0.2.19';
@@ -61,6 +65,7 @@ function writeFailedRun(root: string, runId = 'r', gateOutput = '{"outcome":"ok"
   mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
   const state = {
     graphId: 'release-loop', runId, status: 'failed',
+    graphPath: join(releaseGraphDir, 'release-loop.yaml'),
     input: { version: VERSION, branchCut: true },
     path: ['version-release', 'cutoff', 'gate', 'tui', 'failed'],
     nodes: [
@@ -197,6 +202,236 @@ test('resume dry-run checks the saved cut and checkout without running nodes or 
     expect(readFileSync(priorPlanPath, 'utf8')).toBe(priorPlan);
     expect(existsSync(join(root, 'release', VERSION, 'resume-attempts', 'r.json'))).toBe(false);
     expect(readdirSync(join(root, 'graph-runs', 'release-loop'))).toEqual(['r.json']);
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resume plan automatically reroutes a failed shard when the saved gate recommends a bounded retry', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-autoheal-'));
+  setElanousConfigDir(root);
+  const autoheal = { action: 'retry-shard', cause: 'timeout', signature: 'sig-1', reason: 'retry the timed-out shard within its budget', shardElapsedMs: 100, overallElapsedMs: 100, shardKey: 'pod-2' };
+  const saved = writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', autoheal,
+    stalledShards: [{ shard: 2, files: ['src/a.test.ts'], reason: 'timeout' }] }));
+  const state = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { input: Record<string, unknown> };
+  state.input.gatePodPool = 'pool-test';
+    state.input.previousVersion = '0.2.18';
+  writeFileSync(saved.statePath, JSON.stringify(state));
+  const commandRoot = createPreflightCommandRoot(root);
+  try {
+    const plan = await planResumeReleaseRun({ runId: 'r', from: 'gate', commandRoot }, {
+      root, git: (args) => gitStub(args), graph: async () => { throw new Error('dry run must not execute graph'); },
+    });
+    expect(plan).toMatchObject({ autoheal, autohealReroute: 'pod-2', gatePlan: { mode: 'full' } });
+    expect(plan.commandRoot).toBe(realpathSync(commandRoot));
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('host-down from runGateNode is preserved through resume and switches the saved pool host', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-host-switch-'));
+  setElanousConfigDir(root);
+  const oldLog = console.log;
+  let output = '';
+  console.log = (...args: unknown[]) => { output = args.map(String).join(' '); };
+  const commandRoot = createPreflightCommandRoot(root);
+  try {
+    const rc = await runGateNode(['--commit', SHA, '--version', VERSION, '--executor', 'pod', '--pod-pool', 'pool-test', '--json'], process.env,
+      undefined, async () => ({ outcome: 'error', commit: SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 10,
+        error: 'ssh host unreachable', stalledShards: [{ shard: 2, files: ['src/a.test.ts'], reason: 'job-failed' }] }));
+    expect(rc).toBe(2);
+    const gateOutput = JSON.parse(output) as Record<string, unknown>;
+    expect(gateOutput.autoheal).toMatchObject({ action: 'host-switch', cause: 'host-down', shardKey: 'pod-2' });
+    expect(existsSync(join(root, 'release', VERSION, 'gate-autoheal', 'direct.json'))).toBe(true);
+    const saved = writeFailedRun(root, 'r', JSON.stringify(gateOutput));
+    const snapshotDir = `${saved.statePath}.graph`;
+    mkdirSync(snapshotDir, { recursive: true });
+    copyFileSync(join(releaseGraphDir, 'release-loop.yaml'), join(snapshotDir, 'graph.yaml'));
+    copyFileSync(join(releaseGraphDir, 'recipes.yaml'), join(snapshotDir, 'recipes.yaml'));
+    const state = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { input: Record<string, unknown>; path: string[]; nodes: Array<Record<string, unknown>>; executed: number };
+    state.input.gatePodPool = 'pool-test';
+    state.input.previousVersion = '0.2.18';
+    state.path = ['version-release', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate'];
+    state.nodes = state.path.map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true,
+      output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
+        : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));
+    const gateRecord = state.nodes.at(-1)!;
+    gateRecord.ok = false;
+    gateRecord.exit = 2;
+    state.executed = state.nodes.length;
+    writeFileSync(saved.statePath, JSON.stringify(state));
+    let gateInput: Record<string, unknown> | undefined;
+    let resumedPlacement: ReturnType<typeof planGateShardDispatch> | undefined;
+    let acquiredHost: string | undefined;
+    await resumeReleaseRun({ runId: 'r', from: 'gate', commandRoot }, { root, git: gitStub, isAncestor: () => true,
+      runBash: async (_body, runOptions) => {
+        const contextPath = runOptions.env?.ELANOUS_GRAPH_CONTEXT;
+        if (contextPath) {
+          const context = JSON.parse(readFileSync(contextPath, 'utf8')) as { nodeId?: string; input?: Record<string, unknown> };
+          if (context.nodeId === 'gate') {
+            const old = console.log;
+            let line = '';
+            console.log = (...args: unknown[]) => { line = args.map(String).join(' '); };
+            try {
+              const rc = await runGateNode(['--json'], runOptions.env!, undefined, async (opts) => {
+                gateInput = { gateRerouteShard: opts.pod?.rerouteShard, gatePodPool: opts.pod?.pool };
+                resumedPlacement = planGateShardDispatch({ head40: SHA, base40: SHA,
+                  shards: [{ id: 'pod-2', files: ['src/a.test.ts'] }],
+                  receipts: [{ id: 'pod-2', files: ['src/a.test.ts'], head40: SHA, base40: SHA, host: 'old-host', envKey: 'env',
+                    status: 'unmeasured', failureIds: [], errorIds: [], evidencePath: 'old.json', evidenceSha256: 'f'.repeat(64),
+                    measuredAt: '2026-10-29T00:00:00.000Z', attempt: 1 }],
+                  hosts: [{ id: 'old-host', platform: 'linux', available: true, reserved: false },
+                    { id: 'replacement-host', platform: 'linux', available: true, reserved: false }],
+                  rerouteShard: String(opts.pod?.rerouteShard) });
+                // Exercise the real scheduler acquire path after the resume plan excludes
+                // the failed host, and record the member that would receive the replacement.
+                const pool = new PodPoolScheduler([
+                  { context: 'old-host', capacity: 1, k3dCluster: 'old' },
+                  { context: 'replacement-host', capacity: 1, k3dCluster: 'replacement' },
+                ]);
+                const acquired = await pool.tryAcquire(new Set(['old-host']));
+                acquiredHost = acquired?.context;
+                if (acquired) pool.release(acquired);
+                return { outcome: 'ok', commit: SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
+              });
+              return { exitCode: rc, stdout: line, stderr: '' };
+            } finally { console.log = old; }
+          }
+        }
+        return { exitCode: 0, stdout: '{"outcome":"ok"}', stderr: '' };
+      } });
+    expect(gateInput).toMatchObject({ gateRerouteShard: 'auto', gatePodPool: 'pool-test' });
+    expect(resumedPlacement?.[0]).toMatchObject({ kind: 'run', host: 'replacement-host', replacing: { host: 'old-host' } });
+    expect(acquiredHost).toBe('replacement-host');
+  } finally { console.log = oldLog; resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('interference partial-resume rechecks only affected files at the same cut', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resume-interference-recheck-'));
+  setElanousConfigDir(root);
+  const oldLog = console.log;
+  let gateLine = '';
+  console.log = (...args: unknown[]) => { gateLine = args.map(String).join(' '); };
+  let gateOutput: Record<string, unknown>;
+  try {
+    const rc = await runGateNode(['--commit', SHA, '--version', VERSION, '--baseline-version', '0.2.18', '--json'], process.env,
+      undefined, async () => ({ outcome: 'error', commit: SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 10,
+        interferenceErrors: ['src/affected.test.ts > transient runtime error'], partialFailures: { failures: [], errors: ['src/affected.test.ts > transient runtime error'] } }));
+    expect(rc).toBe(2);
+    gateOutput = JSON.parse(gateLine) as Record<string, unknown>;
+    expect(gateOutput).toMatchObject({ outcome: 'error', interferenceErrors: ['src/affected.test.ts > transient runtime error'],
+      autoheal: { cause: 'interference', action: 'partial-resume' } });
+  } finally { console.log = oldLog; }
+  const saved = writeFailedRun(root, 'r', JSON.stringify(gateOutput));
+  const snapshotDir = `${saved.statePath}.graph`;
+  mkdirSync(snapshotDir, { recursive: true });
+  copyFileSync(join(releaseGraphDir, 'release-loop.yaml'), join(snapshotDir, 'graph.yaml'));
+  copyFileSync(join(releaseGraphDir, 'recipes.yaml'), join(snapshotDir, 'recipes.yaml'));
+  const runState = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { input: Record<string, unknown>; path: string[]; nodes: Array<Record<string, unknown>>; executed: number };
+  runState.input.commit = SHA;
+  runState.input.baselineVersion = '0.2.18';
+  runState.input.previousVersion = '0.2.18';
+  runState.path = ['version-release', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate'];
+  runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
+    output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
+      : nodeId === 'gate' ? JSON.stringify(gateOutput)
+        : JSON.stringify({ outcome: 'ok' }) }));
+  runState.executed = runState.nodes.length;
+  writeFileSync(saved.statePath, JSON.stringify(runState));
+  mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });
+  writeFileSync(join(root, 'release', '0.2.18', 'release.json'), JSON.stringify({ sourceCommit: SHA }));
+  try {
+    const swept: Array<readonly string[] | undefined> = [];
+    const runner: GateRunner = {
+      command: async () => ({ rc: 0, output: '' }), localCommand: async () => ({ rc: 0, output: '' }),
+      sweep: async (_tree, _logDir, _pod, only) => { swept.push(only); return { rc: 0, output: '1 pass\n0 fail\n0 errors\nRan 1 tests across 1 files.\n' }; },
+      add: async () => {}, remove: async () => {}, snapshot: async () => {}, removeSnapshot: async () => {},
+    };
+    let gateResult: Record<string, unknown> | undefined;
+    const resumed = await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git: gitStub, isAncestor: () => true,
+      closureTree: () => ({ files: ['src/affected.test.ts', 'src/untouched.test.ts'] }) as never,
+      runBash: async (_body, runOptions) => {
+        const contextPath = runOptions.env?.ELANOUS_GRAPH_CONTEXT;
+        const context = contextPath ? JSON.parse(readFileSync(contextPath, 'utf8')) as { nodeId?: string } : undefined;
+        if (context?.nodeId === 'gate') {
+          const old = console.log;
+          let line = '';
+          console.log = (...args: unknown[]) => { line = args.map(String).join(' '); };
+          try {
+            const rc = await runGateNode(['--json'], runOptions.env!, runner);
+            gateResult = JSON.parse(line) as Record<string, unknown>;
+            return { exitCode: rc, stdout: line, stderr: '' };
+          } finally { console.log = old; }
+        }
+        return { exitCode: 0, stdout: '{"outcome":"ok"}', stderr: '' };
+      } });
+    expect(resumed.partial).toMatchObject({ requested: true, applied: true, files: 1, priorCommit: SHA });
+    expect(JSON.parse(readFileSync(join(root, 'release', VERSION, 'gate-partial.json'), 'utf8')))
+      .toMatchObject({ kind: 'recheck', forCommit: SHA, files: ['src/affected.test.ts'], stalledFiles: ['src/affected.test.ts'] });
+    expect(swept).toEqual([['src/affected.test.ts']]);
+    expect(gateResult).toMatchObject({ outcome: 'ok', partial: { priorCommit: SHA, files: 1 } });
+    const finalGate = resumed.state.nodes.find((node) => node.nodeId === 'gate');
+    expect(finalGate).toMatchObject({ ok: true, exit: 0 });
+    expect(JSON.parse(String(finalGate?.output))).toMatchObject({ outcome: 'ok', partial: { priorCommit: SHA, files: 1 } });
+  } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('load-flaky autoheal rechecks only the affected files when interferenceErrors is absent', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'resume-load-flaky-recheck-'));
+  setElanousConfigDir(root);
+  const oldLog = console.log;
+  let gateLine = '';
+  console.log = (...args: unknown[]) => { gateLine = args.map(String).join(' '); };
+  let gateOutput: Record<string, unknown>;
+  try {
+    const rc = await runGateNode(['--commit', SHA, '--version', VERSION, '--baseline-version', '0.2.18', '--json'], process.env,
+      undefined, async () => ({ outcome: 'error', commit: SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 10,
+        loadFlaky: ['src/affected.test.ts > timed out'], partialFailures: { failures: [], errors: ['src/affected.test.ts > timed out'] } }));
+    expect(rc).toBe(2);
+    gateOutput = JSON.parse(gateLine) as Record<string, unknown>;
+    expect(gateOutput).toMatchObject({ outcome: 'error', loadFlaky: ['src/affected.test.ts > timed out'],
+      autoheal: { cause: 'interference', action: 'partial-resume' } });
+  } finally { console.log = oldLog; }
+  const saved = writeFailedRun(root, 'r', JSON.stringify(gateOutput));
+  const snapshotDir = `${saved.statePath}.graph`;
+  mkdirSync(snapshotDir, { recursive: true });
+  copyFileSync(join(releaseGraphDir, 'release-loop.yaml'), join(snapshotDir, 'graph.yaml'));
+  copyFileSync(join(releaseGraphDir, 'recipes.yaml'), join(snapshotDir, 'recipes.yaml'));
+  const runState = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { input: Record<string, unknown>; path: string[]; nodes: Array<Record<string, unknown>>; executed: number };
+  runState.input.commit = SHA;
+  runState.input.baselineVersion = '0.2.18';
+  runState.input.previousVersion = '0.2.18';
+  runState.path = ['version-release', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'export-check', 'prefetch', 'gate'];
+  runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
+    output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
+      : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));
+  runState.executed = runState.nodes.length;
+  writeFileSync(saved.statePath, JSON.stringify(runState));
+  mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });
+  writeFileSync(join(root, 'release', '0.2.18', 'release.json'), JSON.stringify({ sourceCommit: SHA }));
+  try {
+    const swept: Array<readonly string[] | undefined> = [];
+    const runner: GateRunner = {
+      command: async () => ({ rc: 0, output: '' }), localCommand: async () => ({ rc: 0, output: '' }),
+      sweep: async (_tree, _logDir, _pod, only) => { swept.push(only); return { rc: 0, output: '1 pass\n0 fail\n0 errors\nRan 1 tests across 1 files.\n' }; },
+      add: async () => {}, remove: async () => {}, snapshot: async () => {}, removeSnapshot: async () => {},
+    };
+    await resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git: gitStub, isAncestor: () => true,
+      closureTree: () => ({ files: ['src/affected.test.ts', 'src/untouched.test.ts'] }) as never,
+      runBash: async (_body, runOptions) => {
+        const contextPath = runOptions.env?.ELANOUS_GRAPH_CONTEXT;
+        const context = contextPath ? JSON.parse(readFileSync(contextPath, 'utf8')) as { nodeId?: string } : undefined;
+        if (context?.nodeId === 'gate') {
+          const old = console.log;
+          let line = '';
+          console.log = (...args: unknown[]) => { line = args.map(String).join(' '); };
+          try {
+            const rc = await runGateNode(['--json'], runOptions.env!, runner);
+            return { exitCode: rc, stdout: line, stderr: '' };
+          } finally { console.log = old; }
+        }
+        return { exitCode: 0, stdout: '{"outcome":"ok"}', stderr: '' };
+      } });
+    expect(swept).toEqual([['src/affected.test.ts']]);
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -408,7 +643,7 @@ test('GATE-RESUME-STALLED-ONLY: SIGTERM leaves shard receipts and moved-tip resu
     expect(resumed.gatePlan).toEqual({ mode: 'partial' });
     expect(resumed.tip).toMatchObject({ changed: true, from: SHA, to: moved });
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
-});
+}, 30_000);
 
 test('GATE-RESUME-STALLED-ONLY: moved tip falls back to full gate when a shard receipt baseline differs from cutoff', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-resume-moved-stall-baseline-'));

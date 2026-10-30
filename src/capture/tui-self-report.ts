@@ -31,7 +31,7 @@
 import type { SelfReportFrame } from './self-report-frame.js';
 import { resolveInstanceName } from '../instance-identity.js';
 import { getHarnessRunId } from '../harness/harness-space.js';
-import { injectKey, setFrameObserver, splitKeys, termSize as tuiTermSize, type Key } from '../tui.js';
+import { injectKey, routeExternalTuiKey, setFrameObserver, splitKeys, termSize as tuiTermSize, type Key } from '../tui.js';
 import { canTransitionAccessMode, type PtyAccessMode, type PtyTransitionPolicy } from '../pty-shell/pty-ref.js';
 import { resolveWriteDecision, type PtyWriteActor } from '../pty-shell/pty-write-arbiter.js';
 import { registerPtyControlTarget, startPtyControlPoller, type PtyControlTarget } from '../pty-shell/registry.js';
@@ -43,7 +43,7 @@ import {
   updatePtyManifestBuild,
 } from '../pty-shell/pty-manifest.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';
-import { runningBuild, startTuiRunStateRecorder } from '../pty-shell/tui-run-state.js';
+import { runningBuild, seatCompareDepsFromEnv, startTuiRunStateRecorder } from '../pty-shell/tui-run-state.js';
 import type { TuiSelfRestartDeps } from '../pty-shell/tui-run-state.js';
 import { lastHumanKeyAt } from '../tui.js';
 import { debug } from '../debug/log.js';
@@ -176,9 +176,19 @@ export function createTuiControlTarget(surfaceId: string, deps: TuiControlTarget
     stopTurn: (force: true) => force && stopTurn(),
     canWrite: (actor: PtyWriteActor = 'human') => resolveWriteDecision(accessMode, actor).allow,
     write(chars: string): void {
+      const keys = parse(chars);
+      const remaining: Key[] = [];
+      let routedToModal = false;
+      for (const key of keys) {
+        if (routeExternalTuiKey(key)) routedToModal = true;
+        else remaining.push(key);
+      }
+      if (routedToModal) {
+        if (remaining.length > 0 && !remaining.every(inject)) throw new Error('tui-input-undelivered');
+        return;
+      }
       // ⭐ 이 write 는 «바깥»(제어 IPC)에서만 온다 — 키보드와 섞이기 전에 라우터가 먼저 가른다.
       if (routeExternal(chars) !== 'passthrough') return;
-      const keys = parse(chars);
       if (!keys.length || !keys.every(inject)) throw new Error('tui-input-undelivered');
     },
     resize: () => { throw new Error('tui-resize-unsupported'); },
@@ -444,9 +454,15 @@ export function startTuiSelfReport(deps: TuiSelfReportDeps = {}): () => void {
   const startRunState = deps.startRunState
     ?? (deps.registerRow
       ? () => () => {}
-      : (id: string) => startTuiRunStateRecorder(id, {
-        selfRestart: deps.selfRestart === null ? undefined : (deps.selfRestart ?? productionTuiSelfRestart(readActiveSessionId)),
-      }));
+      : (id: string) => {
+        // TUI-SEAT-PILOT-2H-COMPARE — 판정 신호 한 줄은 env(ELANOUS_SEAT_COMPARE_RUN_ID)가 있을 때만 켜진다.
+        // env 가 없으면 빈 spread → 종전 기록 경로 그대로(보존 계약).
+        const seatCompare = seatCompareDepsFromEnv();
+        return startTuiRunStateRecorder(id, {
+          selfRestart: deps.selfRestart === null ? undefined : (deps.selfRestart ?? productionTuiSelfRestart(readActiveSessionId)),
+          ...(seatCompare ? { seatCompare } : {}),
+        });
+      });
   try { stopRunState = startRunState(surfaceId); } catch { /* fail-soft — recorder logs its own write failures */ }
   // 미룬 우편 깨움(TUI-H4) — 이 TUI 가 턴 중·5분 창이라 못 받은 깨움을 idle 로 «기록»된 뒤 한 번 다시 두드린다.
   // 실 행 등록과 짝일 때만(시험이 행 등록을 갈아 끼우면 0) · 무거운 모듈은 늦게 불러온다.

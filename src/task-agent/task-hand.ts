@@ -29,10 +29,12 @@ import { checkCompletionEvidence, deliverableReceiptEvidence } from './completio
 import { judgeNextMove } from './judge.js';
 import { checklistDevVersion, listChecklist } from '../release-loop/checklist.js';
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+import { POD_DISTRIBUTOR_ENTRY_ENV, TASK_HAND_POD_DISTRIBUTOR_ENTRY } from './pod-distributor-entry.js';
 // Keep doctor-visit recording synchronous: updateTaskCard callers observe it before the transition returns.
 import { recordTaskAgentNeedsOwnerVisit } from '../self-implement/doctor-visit.js';
 import { applyRunIdentityTag, applyRunIdentityTags, deriveBirthIdentity, parseRunIdentityTag, runIdentityFieldText, runIdentityQueuePriority, runPriorityClass, validateRunIdentity, type RunIdentity, type RunIdentityCell, type RunIdentityOrigin } from './run-identity.js';
 import { parseWorkOrder, renderWorkOrderGoal, WORK_ORDER_FILE_PATTERN, type WorkOrder } from './work-order.js';
+import { recordCoordinatorShadowDispatch, resolveCoordinatorShadowRoot } from '../loops/orchestrator/coordinator-shadow.js';
 import { inspectPrelaunchAlreadyDone, type AlreadyDoneDecision, type AlreadyDoneCandidate,
   type PrelaunchGitRunnerForTest } from './prelaunch-already-done.js';
 import { draftClaimComment, draftClaimRecordLive, draftClaimState, draftReleaseComment } from '../self-dev/draft-triage-rules.js';
@@ -1089,6 +1091,10 @@ export type TaskLauncher = (args: string[], cwd?: string, context?: TaskLaunchCo
 export interface HandTaskOptions {
   text: string;
   seat?: TaskSeat;
+  /** Validated order parsed by the CLI; its canonical rendering is used only for shadow evidence. */
+  workOrder?: WorkOrder;
+  /** Repository root for shadow dispatch evidence; production defaults to the invoking repository. */
+  coordinatorShadowRoot?: string;
   checklistId?: string;
   completion?: TaskCard['completion'];
   /** `--project <id> --target <dir>` — target 은 존재 확인 뒤 절대 경로로 바꿔 싣는다. */
@@ -1625,6 +1631,7 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     ...(cardPrNumber(card) ? { ELANOUS_TASK_BOUND_PR: String(cardPrNumber(card)) } : {}),
     ...(card.checklistId ? { ELANOUS_POD_SLOT_ID: card.checklistId } : {}),
     ...(card.seat ? { ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: card.seat } : {}),
+    ...(podLaunch ? { [POD_DISTRIBUTOR_ENTRY_ENV]: TASK_HAND_POD_DISTRIBUTOR_ENTRY } : {}),
     ...(card.taLand ? { [TA_LAND_ENV]: '1' } : {}) }, cardLabelContext: taskCardLabelContext(card),
     // An omitted card provider uses the established Pod default. Carry the effective value explicitly so
     // remote-parent code never has to infer a provider from the serialized CLI argv.
@@ -1644,6 +1651,26 @@ export async function handTask(opts: HandTaskOptions): Promise<HandTaskResult> {
     writeCard(path, failed);
     try { debug.log('task-agent', 'launch-failed', { taskId: id, seat: card.seat ?? null, reason }); } catch { /* fail-soft */ }
     throw new TaskLaunchError(failed, reason);
+  }
+  // Record only an accepted dispatch: failed launcher attempts must not create a three-day retirement signal.
+  if (opts.workOrder !== undefined) {
+    const agent = process.env.ELANOUS_SEAT?.trim() || process.env.AI_AGENT?.trim();
+    if (agent) {
+      try {
+        const directive = createHash('sha256').update(renderWorkOrderGoal(opts.workOrder)).digest('hex');
+        recordCoordinatorShadowDispatch(resolveCoordinatorShadowRoot(opts.coordinatorShadowRoot ?? process.cwd()), {
+          date: (opts.now ?? (() => new Date()))().toISOString().slice(0, 10),
+          agent,
+          ...(opts.seat ? { recipient: opts.seat } : {}),
+          cell: opts.workOrder.cellId,
+          directive,
+        });
+      } catch (error) {
+        try { debug.log('task-agent.work-order', 'shadow-dispatch-record-failed', {
+          cellId: opts.workOrder.cellId, reason: error instanceof Error ? error.message : String(error),
+        }, { level: 'warn' }); } catch { /* shadow evidence is fail-soft */ }
+      }
+    }
   }
   const launchedAt = (opts.now ?? (() => new Date()))().toISOString();
   const receivedRunId = receipt && typeof receipt.runId === 'string' ? receipt.runId.trim() : '';

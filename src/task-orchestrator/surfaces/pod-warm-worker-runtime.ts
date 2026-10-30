@@ -7,6 +7,7 @@ import { warmReferenceFromJobArtifacts } from '../../../scripts/release-loop/gat
 import { stateDirSourceForChild } from '../../agent/identity-env.js';
 import { debug } from '../../debug/log.js';
 import { decidePodReuseCleanup } from './pod-reuse-cleanup.js';
+import { podSourceScript, type PodSource } from './pod-source-receive.js';
 import type { WarmWorkerCommand, WarmWorkerFileResult, WarmWorkerReply } from './pod-warm-worker-protocol.js';
 
 const token = (s: unknown): s is string => typeof s === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(s);
@@ -23,6 +24,31 @@ const withoutGitEnvironment = (): NodeJS.ProcessEnv => {
   for (const name of Object.keys(env)) if (name.startsWith('GIT_')) delete env[name];
   return env;
 };
+
+const installedLockHashPath = (repoDir: string): string => join(repoDir, 'node_modules', '.elanous-installed-lock-hash');
+
+function readInstalledLockHash(repoDir: string): string | null {
+  try {
+    const modules = lstatSync(join(repoDir, 'node_modules'));
+    if (!modules.isDirectory() || modules.isSymbolicLink()) return null;
+    const marker = installedLockHashPath(repoDir);
+    const stat = lstatSync(marker);
+    if (!stat.isFile() || stat.isSymbolicLink()) return null;
+    const value = readFileSync(marker, 'utf8').trim();
+    return /^[a-f0-9]{64}$/.test(value) ? value : null;
+  } catch { return null; }
+}
+
+/** Record the image's installed dependency lock once source verification ties it to the worker key. */
+function rememberInstalledLockHash(repoDir: string, lockHash: string): void {
+  try {
+    const modules = lstatSync(join(repoDir, 'node_modules'));
+    if (!modules.isDirectory() || modules.isSymbolicLink()) return;
+    const marker = installedLockHashPath(repoDir);
+    if (existsSync(marker)) return;
+    writeFileSync(marker, `${lockHash}\n`, { mode: 0o600, flag: 'wx' });
+  } catch { /* an unknown installation stays unknown and min-sync will install before reuse */ }
+}
 
 function resolveThroughExistingAncestor(path: string): string | null {
   let ancestor = resolve(path);
@@ -147,6 +173,12 @@ export class WarmWorkerRuntime {
     runGit?: (args: readonly string[]) => WarmWorkerGitResult;
     removeScratch?: (path: string) => void;
     now?: () => number;
+    /** POD-REUSE-MIN-SYNC — 새 base 요청의 최소 동기화 원천: 호스트 미러 마운트(기본 /host-mirror). */
+    mirrorPath?: string;
+    /** POD-REUSE-MIN-SYNC — 부모가 넘긴 git bundle(있으면 호스트 미러보다 먼저). */
+    minSyncBundle?: { bundlePath: string; sha256: string; sizeBytes: number };
+    /** 시험 심 — min-sync 수신 스크립트 실행(기본: 체크아웃 안에서 bash -c). */
+    runMinSync?: (script: string) => { status: number | null; stdout: string; stderr: string };
   }) {}
 
   handle(command: WarmWorkerCommand): Promise<WarmWorkerOutcome> {
@@ -177,9 +209,18 @@ export class WarmWorkerRuntime {
       return { reply: null, quarantineWorker: true, reason: 'execution-error' };
     }
     const repo = realpathSync(this.options.repoDir);
-    if (!warmWorkerSourceMatches(repo, command.cutSha, command.key.lockHash)) {
-      this.quarantined = true;
-      return { reply: null, quarantineWorker: true, reason: 'quarantined' };
+    const sourceMatches = warmWorkerSourceMatches(repo, command.cutSha, command.key.lockHash);
+    if (sourceMatches && readInstalledLockHash(repo) === null) rememberInstalledLockHash(repo, command.key.lockHash);
+    if (!sourceMatches || readInstalledLockHash(repo) !== command.key.lockHash) {
+      // POD-REUSE-MIN-SYNC — 같은 웜 Pod 로 들어온 새 base 요청: 상주 체크아웃을 호스트 미러(또는 부모가
+      // 넘긴 bundle)에서만 최소 동기화한 뒤 같은 검증으로 다시 본다. min-sync 가 아니거나 실패면
+      // 기존 폐기(quarantine) 판정이 그대로 선다.
+      if (!this.minSyncReceive(repo, command)
+        || !warmWorkerSourceMatches(repo, command.cutSha, command.key.lockHash)
+        || readInstalledLockHash(repo) !== command.key.lockHash) {
+        this.quarantined = true;
+        return { reply: null, quarantineWorker: true, reason: 'quarantined' };
+      }
     }
     debug.log('pod.warm', 'resident-checkout-verified', { runId: command.runId,
       attemptId: command.attemptId, workerId: command.workerId,
@@ -362,5 +403,41 @@ export class WarmWorkerRuntime {
       return { reply: null, quarantineWorker: true, reason: 'execution-error', artifactsDir };
     }
     return { reply, quarantineWorker: false, reason: 'complete', artifactsDir };
+  }
+
+  /** POD-REUSE-MIN-SYNC — 체크아웃 head 또는 실제 설치 lock hash 가 요청과 다를 때만 시도한다.
+   *  dirty source bytes 는 min-sync 대상으로 삼지 않는다. base 는 호스트 미러/부모 bundle 에서만 받는다(GitHub 호출 0) ·
+   *  차이 파일만 checkout/reset 하고 남은 untracked·빌드 산출만 clean 한다. 성공 표지
+   *  `ELANOUS_POD_STAGE min-sync <호출 수> <바뀐 파일 수> <소요 초>` 를 관측(pod.warm/min-sync)으로 남긴다. */
+  private minSyncReceive(repo: string, command: WarmWorkerCommand): boolean {
+    const git = (args: readonly string[]): WarmWorkerGitResult => {
+      try {
+        return this.options.runGit?.(args) ?? spawnSync('git', ['-C', repo, ...args], {
+          encoding: 'utf8', env: withoutGitEnvironment(), maxBuffer: 16 * 1024 * 1024,
+        });
+      } catch { return { status: null, stdout: null }; }
+    };
+    const resident = git(['rev-parse', 'HEAD']);
+    const previousHead = resident.status === 0 ? (resident.stdout ?? '').trim() : '';
+    if (!sha(previousHead)) return false;
+    const source: PodSource = {
+      kind: 'min-sync', baseSha: command.cutSha, previousHead, lockHash: command.key.lockHash,
+      ...(this.options.minSyncBundle ? { bundle: this.options.minSyncBundle } : {}),
+    };
+    const script = podSourceScript(source, 'https://github.com/unused/repo', this.options.mirrorPath ?? '/host-mirror', { checkoutDir: repo });
+    let run: { status: number | null; stdout?: string | null };
+    try {
+      run = this.options.runMinSync?.(script) ?? spawnSync('bash', ['-c', script], {
+        encoding: 'utf8', cwd: repo, env: withoutGitEnvironment(), maxBuffer: 16 * 1024 * 1024,
+      });
+    } catch { return false; }
+    const out = run.stdout ?? '';
+    const stage = /^ELANOUS_POD_STAGE min-sync (\d+) (\d+) (\d+)\r?$/m.exec(out);
+    try {
+      debug.log('pod.warm', 'min-sync', { runId: command.runId, attemptId: command.attemptId, workerId: command.workerId,
+        baseSha: command.cutSha, previousHead, ok: run.status === 0,
+        githubCalls: stage ? Number(stage[1]) : null, changedFiles: stage ? Number(stage[2]) : null, seconds: stage ? Number(stage[3]) : null });
+    } catch { /* observation is fail-soft */ }
+    return run.status === 0 && !!stage;
   }
 }

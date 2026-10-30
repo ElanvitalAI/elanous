@@ -1,4 +1,10 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { debug } from '../debug/log.js';
+import { _resetKeyCacheForTests } from '../config.js';
+import { resolveGrokCredential } from '../grok/credential.js';
 import { grokAgentSearch } from '../grok/agent-search.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { _resetWebSearchProvidersForTests, addWebSearchProvider, listWebSearchProviders, searchWeb } from './index.js';
@@ -87,6 +93,47 @@ describe('Grok subscription search default', () => {
     expect(captured?.init?.headers).toMatchObject({ authorization: 'Bearer test-subscription-token', 'x-grok-client-version': '1.0.41' });
     expect(JSON.parse(String(captured?.init?.body)).model).toBe('grok-4.6');
     expect(result).toMatchObject({ ok: true, status: 200, text: 'Answer', citations: [{ url: 'https://example.org/source', title: 'Source' }] });
+  });
+
+  test('search prefers API key while the unqualified LLM credential remains subscription-first', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'grok-search-credential-'));
+    mkdirSync(join(home, '.grok'), { recursive: true });
+    writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({
+      'https://auth.x.ai::fixture': { key: 'subscription-test-token', expires_at: '2030-01-01T00:00:00Z' },
+    }));
+    const previousApiKey = process.env.XAI_API_KEY;
+    const previousKeepEnvKeys = process.env.ELANOUS_KEEP_ENV_KEYS;
+    const previousFetch = globalThis.fetch;
+    process.env.XAI_API_KEY = 'api-key-test-value';
+    process.env.ELANOUS_KEEP_ENV_KEYS = '1';
+    _resetKeyCacheForTests();
+    setUserConfigOverlay(c => ({ ...c, webSearch: {} }));
+    const logSpy = spyOn(debug, 'log');
+    let captured: { url: string; init?: RequestInit } | undefined;
+    globalThis.fetch = async (url, init) => {
+      captured = { url: String(url), init };
+      return new Response(JSON.stringify({ output: [] }), { status: 200 });
+    };
+    try {
+      const credentialEnv = { ...process.env, XAI_API_KEY: 'api-key-test-value' } as NodeJS.ProcessEnv;
+      expect(resolveGrokCredential({ home, env: credentialEnv, model: 'grok-4.6' })?.kind).toBe('subscription');
+      expect(resolveGrokCredential({ home, env: credentialEnv, model: 'grok-4.6', prefer: 'api_key' })?.kind).toBe('api_key');
+      const result = await searchWeb({ query: 'latest release' }, { providerId: 'grok' });
+      expect(result.providerName).toBe('grok');
+      expect(captured?.url).toBe('https://api.x.ai/v1/responses');
+      expect(captured?.init?.headers).toMatchObject({ authorization: 'Bearer api-key-test-value' });
+      expect(logSpy).toHaveBeenCalledWith('grok.agent-search', 'credential-selected', { kind: 'api_key', source: 'XAI_API_KEY' });
+      expect(JSON.stringify(logSpy.mock.calls)).not.toContain('api-key-test-value');
+      expect(JSON.stringify(logSpy.mock.calls)).not.toContain('subscription-test-token');
+    } finally {
+      logSpy.mockRestore();
+      globalThis.fetch = previousFetch;
+      if (previousApiKey === undefined) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = previousApiKey;
+      if (previousKeepEnvKeys === undefined) delete process.env.ELANOUS_KEEP_ENV_KEYS;
+      else process.env.ELANOUS_KEEP_ENV_KEYS = previousKeepEnvKeys;
+      _resetKeyCacheForTests();
+    }
   });
 
   test('an endpoint base already ending in /responses does not duplicate the path', async () => {

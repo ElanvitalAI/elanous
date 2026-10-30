@@ -6,6 +6,7 @@ import { writePeerEdit } from '../nexus/api/graph-peer-edit.js';
 import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { Command } from 'commander';
 import { registerGraphCommands } from './graph-cli.js';
+import { runGraph } from './runner.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -291,6 +292,75 @@ test('graph tick waits for approval and resumes the same run without replaying c
   expect(JSON.parse(resumed.stdout)).toEqual({ action: 'resumed', runId: first.runId, status: 'done' });
   expect(readFileSync(executed, 'utf8')).toBe('ab');
 }, 30000);
+
+test('release graph approve resumes publish immediately and rejection takes restore route', async () => {
+  const exercise = async (reject: boolean) => {
+    const dir = mkdtempSync(join(tmpdir(), 'graph-release-approve-continue-'));
+    dirs.push(dir);
+    const stateRoot = join(dir, 'state');
+    const graphRoot = join(dir, 'graphs');
+    const releaseDir = join(graphRoot, 'release');
+    mkdirSync(releaseDir, { recursive: true });
+    const graphPath = join(releaseDir, 'release-loop.yaml');
+    writeFileSync(graphPath, `graph_id: release-loop
+version: 1
+entry_node: approve-publish
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }
+  - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1 }
+  - { node_id: traffic-failed-restore, kind: gate, recipe: 'cmd:traffic-failed-restore', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: approve-publish
+    on: outcome
+    map: { ok: publish, fail: traffic-failed-restore }
+  - from: publish
+    on: outcome
+    map: { ok: done, fail: traffic-failed-restore, error: traffic-failed-restore }
+  - { from: traffic-failed-restore, on: outcome, map: { ok: failed, fail: failed, error: failed } }
+`);
+    writeFileSync(join(releaseDir, 'recipes.yaml'), `publish-command:
+  command: 'bun scripts/release-loop/publish-node.ts'
+  timeout_ms: 60000
+traffic-failed-restore:
+  command: 'bun scripts/release-loop/traffic-node.ts traffic-failed-restore'
+  timeout_ms: 60000
+publish:
+  approval: 'v{{input.version}} 공개 발행 — 되돌릴 수 없다. 승인하시겠습니까?'
+`);
+    const commands: string[] = [];
+    const runBash = async (command: string) => {
+      commands.push(command);
+      return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
+    };
+    const waiting = await runGraph(graphPath, { input: { version: '0.2.42' }, deps: { root: stateRoot, runBash } });
+    expect(waiting).toMatchObject({ graphId: 'release-loop', status: 'awaiting-approval', path: ['approve-publish'] });
+    const laterWaiting = await runGraph(graphPath, { input: { version: '0.2.42' }, deps: { root: stateRoot, runBash } });
+    expect(laterWaiting.status).toBe('awaiting-approval');
+
+    const program = new Command();
+    program.exitOverride();
+    registerGraphCommands(program, { root: stateRoot, graphRoots: [graphRoot], runBash });
+    await program.parseAsync(['node', 'test', 'graph', 'approve', 'release-loop', waiting.runId,
+      ...(reject ? ['--reject'] : [])]);
+    const final = JSON.parse(readFileSync(waiting.statePath, 'utf8'));
+    const laterFinal = JSON.parse(readFileSync(laterWaiting.statePath, 'utf8'));
+    return { final, laterFinal, commands };
+  };
+
+  const approved = await exercise(false);
+  expect(approved.final).toMatchObject({ status: 'done', path: expect.arrayContaining(['approve-publish', 'publish']) });
+  expect(approved.laterFinal.status).toBe('awaiting-approval');
+  expect(approved.commands).toContain('bun scripts/release-loop/publish-node.ts');
+
+  const rejected = await exercise(true);
+  expect(rejected.final).toMatchObject({ status: 'failed', path: expect.arrayContaining(['approve-publish', 'traffic-failed-restore']) });
+  expect(rejected.laterFinal.status).toBe('awaiting-approval');
+  expect(rejected.commands).toContain('bun scripts/release-loop/traffic-node.ts traffic-failed-restore');
+  expect(rejected.commands).not.toContain('bun scripts/release-loop/publish-node.ts');
+}, 60000);
 
 test('graph tick rejects invalid input and inputs without --start before creating any run', () => {
   const dir = mkdtempSync(join(tmpdir(), 'graph-cli-tick-input-'));

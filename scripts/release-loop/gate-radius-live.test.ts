@@ -1,12 +1,55 @@
 import { afterEach, expect, test } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hardRehearsalGateArgs, hardRehearsalGateVersion, partialGateImagesMatch, planHardRehearsalRadius } from './gate-radius-live';
+import { gateRepoDigestProbeRequest, hardRehearsalGateArgs, hardRehearsalGateVersion, parseGateRepoDigestResponse, partialGateImagesMatch, planHardRehearsalRadius } from './gate-radius-live';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test('gate image probe uses the registry RepoDigest paired with, but distinct from, the host-local Image ID', () => {
+  const imageId = `sha256:${'a'.repeat(64)}`;
+  const repoDigest = `sha256:${'b'.repeat(64)}`;
+  const probeFixture = { image: 'elanous-harness:local', commit: 'c'.repeat(40), imageId, repoDigest };
+  const headers = `HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nDocker-Content-Digest: ${probeFixture.repoDigest}\r\n\r\n`;
+  expect(parseGateRepoDigestResponse(headers)).toBe(repoDigest);
+  expect(parseGateRepoDigestResponse(headers)).not.toBe(probeFixture.imageId);
+  expect(parseGateRepoDigestResponse('HTTP/1.1 200 OK\r\n\r\n')).toBeNull();
+});
+
+test('remote gate image probe sends Accept to a registry and parses its RepoDigest', async () => {
+  const repoDigest = `sha256:${'b'.repeat(64)}`;
+  let receivedAccept = '';
+  const server = createServer((request, response) => {
+    receivedAccept = request.headers.accept ?? '';
+    response.writeHead(200, { 'Docker-Content-Digest': repoDigest });
+    response.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, 'localhost', resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test registry did not bind a TCP port');
+    const request = gateRepoDigestProbeRequest(`localhost:${address.port}`, 'elanous-harness:local', 'c'.repeat(40));
+    expect(request).not.toBeNull();
+    const result = await new Promise<{ code: number | null; stdout: string }>((resolve, reject) => {
+      const child = spawn('sh', ['-c', request!.command], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let stdout = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+      child.once('error', reject);
+      child.once('close', (code) => resolve({ code, stdout }));
+    });
+    expect(result.code).toBe(0);
+    expect(receivedAccept).toContain('application/vnd.oci.image.index.v1+json');
+    expect(parseGateRepoDigestResponse(result.stdout)).toBe(repoDigest);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 
 function fixture() {
   const repo = mkdtempSync(join(tmpdir(), 'radius-live-repo-'));
@@ -36,6 +79,8 @@ function fixture() {
   const pins = { graphSha: 'c'.repeat(64), recipeSha: 'd'.repeat(64) };
   const envFingerprint = 'e'.repeat(64);
   const imageDigest = `sha256:${'f'.repeat(64)}`;
+  const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint };
+  const executionIdentity = { imageDigest, ...runtimeIdentity };
   const stampDir = join(root, 'release', version, 'rehearsal');
   const gateDir = join(root, 'release', gateVersion);
   mkdirSync(stampDir, { recursive: true }); mkdirSync(gateDir, { recursive: true });
@@ -43,15 +88,15 @@ function fixture() {
     endedAt: '2026-10-20T10:00:00.000Z',
     hardGateRunId: runId, hardGate: { outcome: 'ok', commit: priorCommit, executor: 'pod', introduced: [] } }));
   writeFileSync(join(gateDir, 'gate-verdict.json'), JSON.stringify({ commit: priorCommit, outcome: 'ok',
-    baselineReceipt: { schema: 1, valid: true, reason: 'complete clean full sweep', version: gateVersion, commit: priorCommit,
-      ...pins, envFingerprint, imageDigest, files: 3, shards: 1 } }));
+    baselineReceipt: { schema: 2, valid: true, reason: 'complete clean full sweep', version: gateVersion, commit: priorCommit,
+      ...pins, envFingerprint, imageDigest, executionIdentity: runtimeIdentity, files: 3, shards: 1 } }));
   writeFileSync(join(gateDir, 'gate-failures.json'), JSON.stringify({ commit: priorCommit, failures: [], errors: [] }));
   mkdirSync(join(gateDir, 'gate-logs', 'cut'), { recursive: true });
   writeFileSync(join(gateDir, 'gate-logs', 'cut', 'pod-0.json'), JSON.stringify({
-    commit: priorCommit, files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], imageDigest,
+    commit: priorCommit, files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], imageDigest, runtimeIdentity,
     shardCount: 1, sweepId: 'sweep-one', attemptId: 'attempt-one',
   }));
-  const input = { root, repo, version, forCommit, graphPins: pins, envFingerprint, imageDigest };
+  const input = { root, repo, version, forCommit, graphPins: pins, envFingerprint, imageDigest, executionIdentity };
   return { input, stampDir, gateDir, gateVersion, priorCommit };
 }
 
@@ -76,15 +121,24 @@ test('missing or mismatched receipt identities return a full gate', () => {
   expect(planHardRehearsalRadius({ ...input, graphPins: { ...input.graphPins, graphSha: 'a'.repeat(64) } }).plan).toBeNull();
   expect(planHardRehearsalRadius({ ...input, envFingerprint: 'a'.repeat(64) }).plan).toBeNull();
   expect(planHardRehearsalRadius({ ...input, imageDigest: `sha256:${'a'.repeat(64)}` }).plan).toBeNull();
+  expect(planHardRehearsalRadius({ ...input, executionIdentity: null }).plan).toBeNull();
+  expect(planHardRehearsalRadius({ ...input, executionIdentity: { ...input.executionIdentity, bunVersion: '1.4.3' } }).plan).toBeNull();
+  expect(planHardRehearsalRadius({ ...input, executionIdentity: { ...input.executionIdentity, architecture: 'arm64' } }).plan).toBeNull();
   const path = join(gateDir, 'gate-verdict.json');
   const verdict = JSON.parse(readFileSync(path, 'utf8'));
   verdict.baselineReceipt.files = 1;
   writeFileSync(path, JSON.stringify(verdict));
   expect(planHardRehearsalRadius(input)).toMatchObject({ plan: null, reason: expect.stringContaining('hard rehearsal Pod proof differs') });
   verdict.baselineReceipt.files = 3;
+  verdict.baselineReceipt.executionIdentity.bunVersion = '1.4.3';
+  writeFileSync(path, JSON.stringify(verdict));
+  expect(planHardRehearsalRadius(input).plan).toBeNull();
+  verdict.baselineReceipt.executionIdentity.bunVersion = input.executionIdentity.bunVersion;
   writeFileSync(path, JSON.stringify(verdict));
   writeFileSync(join(gateDir, 'gate-logs', 'cut', 'pod-0.json'), JSON.stringify({
     commit: input.forCommit, files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], imageDigest: input.imageDigest,
+    runtimeIdentity: { bunVersion: input.executionIdentity.bunVersion, platform: input.executionIdentity.platform,
+      architecture: input.executionIdentity.architecture, envFingerprint: input.executionIdentity.envFingerprint },
     shardCount: 1, sweepId: 'sweep-one', attemptId: 'attempt-one',
   }));
   expect(planHardRehearsalRadius(input).plan).toBeNull();

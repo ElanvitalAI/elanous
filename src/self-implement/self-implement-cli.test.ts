@@ -9,6 +9,7 @@ import { planDevPipeline, type DevPipelineDeps, type DevPipelineSpec } from '../
 import type { SelfImplementResult } from './orchestrator.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { debug } from '../debug/log.js';
+import { declaredTargetPaths } from './goal-author.js';
 
 const RESULT = (over: Partial<SelfImplementResult> = {}): SelfImplementResult =>
   ({ ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed', ...over } as SelfImplementResult);
@@ -556,7 +557,7 @@ describe('단일 실행의 런 슈퍼바이저 (E2)', () => {
     setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
       selfImplement: { ...config.tools.selfImplement, supervisor: { reasonRepair: true } } } }));
     await runSelfImplementCliCommand(
-      '# Scope expansion repair\n\n## TRACED PATHS\n- src/self-implement/self-implement-cli.ts — verified target',
+      '# Scope expansion repair\n\n## TRACED PATHS\n- src/self-implement/self-implement-cli.ts — verified target\n- src/self-dev/run-supervisor.ts — verified repair target',
       { ...opts(), supervise: { rounds: 3, onDecision: (d: { action: string; stopReason?: string; why: string; selfHeal?: { reason: string; attempt: number } }) => { decisions.push(d); } } } as never,
       { executeReroute: cap.executeReroute, taskAgentShadow: false, taskAgentRejudge: false,
         sweepPendingMerges: async () => ({ pending: 0, merged: 0 }) },
@@ -566,6 +567,8 @@ describe('단일 실행의 런 슈퍼바이저 (E2)', () => {
     // 수복 골이 «실제로» 실행됐다 — 좁히기 지시 ⊕ 잰 이름이 그 골에 실린다.
     const repairInput = cap.last().input;
     const repairText = 'text' in repairInput ? repairInput.text : '';
+    expect(repairText.split(/\r?\n/u)[0]).toBe('대상 경로: src/self-implement/self-implement-cli.ts, src/self-dev/run-supervisor.ts');
+    expect(declaredTargetPaths(repairText)).toEqual(['src/self-implement/self-implement-cli.ts', 'src/self-dev/run-supervisor.ts']);
     expect(repairText).toContain('[supervisor-needs-human-repair:scope-expansion]');
     expect(repairText).toContain('src/other/expanded.ts');
     expect(decisions[0]).toMatchObject({ action: 'relaunch', selfHeal: { reason: 'supervisor-scope-expansion', attempt: 1 } });

@@ -998,11 +998,20 @@ export interface HarnessRunsSinceResponse extends HarnessRunsResponse {
 export interface HarnessTraversalStepWire {
   node: string; round: number | null; outcome: string | null; at: string; durationMs: number | null;
   visit: number; maxVisits: number | null; detail: string | null;
+  /** Shared per-run ledger order; absent for legacy runs. */
+  sourceSeq?: number;
 }
+export type HarnessGraphEventWire =
+  | { seq: number; ts: string; type: 'node-added'; node: string; kind: string; decider: string; reason: string; trigger?: unknown; undo?: unknown }
+  | { seq: number; ts: string; type: 'edge-rerouted'; from: string; outcome: string; to: string; was: string; decider: string; reason: string }
+  | { seq: number; ts: string; type: 'unit-expanded'; node: string; unit: string; childRunId: string; resolution: number; decider: string; reason: string }
+  | { seq: number; ts: string; type: 'unit-collapsed'; node: string; resolution: number; decider: string; reason: string };
 export interface HarnessRunTraversal {
   runId: string; graphId: string | null; title: string | null; status: string; stage: string | null;
   startedAt: string | null; endedAt: string | null; prNumber: number | null; substrate: string | null;
   steps: HarnessTraversalStepWire[]; ledgerEvents: number;
+  /** Structural graph events ordered on the same per-run sequence as step sourceSeq. */
+  graphEvents?: HarnessGraphEventWire[];
 }
 export interface LogRow {
   id?: number;

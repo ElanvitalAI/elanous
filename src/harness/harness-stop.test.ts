@@ -1,9 +1,9 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AmbiguousHarnessStopRunIdError, discoverStopProcesses, formatHarnessStop, psProcessStartMs, readPidRecordFrom, stopGoalPathFromLedger, stopHarnessRun, stopRunIdCandidates, START_TOLERANCE_MS, type HarnessStopDeps } from './harness-stop.js';
+import { AmbiguousHarnessStopRunIdError, defaultHarnessStopDeps, discoverStopProcesses, formatHarnessStop, psProcessStartMs, readPidRecordFrom, stopGoalPathFromLedger, stopHarnessRun, stopRunIdCandidates, START_TOLERANCE_MS, type HarnessStopDeps } from './harness-stop.js';
 import { debug } from '../debug/log.js';
 
 function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; starts: Array<number | null>; contexts?: string[]; jobs?: number; table?: string; scanFailed?: boolean; goalPath?: string | null; cwd?: (pid: number) => string | null; kubectlScript?: (args: readonly string[]) => { status: number; stdout: string; stderr: string } }) {
@@ -65,6 +65,172 @@ test('ps start rejects an unreaped zombie instead of calling it live', () => {
 });
 
 describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭제', () => {
+  test('stopHarnessRun captures bounded Pod evidence immediately before deleting the matched Job', async () => {
+    const calls: string[][] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const previousSeat = process.env.ELANOUS_HARNESS_SEAT;
+    process.env.ELANOUS_HARNESS_SEAT = 'OPT';
+    const podList = JSON.stringify({ items: [{
+      metadata: { name: 'si-child-abc', labels: { 'elanous.child-run': 'run-child-uuid' }, ownerReferences: [{ kind: 'Job', name: 'si-child' }] },
+      spec: { activeDeadlineSeconds: 300 },
+      status: { phase: 'Failed', startTime: '2026-10-29T00:00:00.000Z', reason: 'DeadlineExceeded',
+        conditions: [{ type: 'Ready', status: 'False', reason: 'PodFailed', message: 'container exited', lastTransitionTime: '2026-10-29T00:05:00.000Z' }],
+        containerStatuses: [{ name: 'child', state: { terminated: { reason: 'Error', exitCode: 143, signal: 15, finishedAt: '2026-10-29T00:04:59.000Z' } } }] },
+    }] });
+    const deps = defaultHarnessStopDeps({ namespace: 'test-ns', kubeContexts: () => ['ctx-a'], readPidRecord: () => null,
+      runIdCandidates: () => [], scanProcesses: () => ({ status: 'ok', candidates: [] }), kubectl: (args) => {
+      calls.push([...args]);
+      if (args.includes('get')) return { status: 0, stdout: podList, stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: 'last child output', stderr: '' };
+      return { status: 0, stdout: 'job.batch/si-child deleted', stderr: '' };
+    } });
+    try {
+      const stopped = await stopHarnessRun('run-parent-uuid', deps);
+      expect(stopped.jobsDeleted).toBe(1);
+      expect(calls[0]).toEqual(['--context', 'ctx-a', '-n', 'test-ns', 'get', 'pods', '-l', 'elanous.run=run-parent-uuid', '-o', 'json']);
+      expect(calls[1]).toEqual(['--context', 'ctx-a', '-n', 'test-ns', 'logs', 'pod/si-child-abc', '-c', 'child', '--tail=20']);
+      expect(calls[2]).toEqual(['--context', 'ctx-a', '-n', 'test-ns', 'delete', 'job', '-l', 'elanous.run=run-parent-uuid', '--wait=false', '-o', 'name']);
+      expect(log).toHaveBeenCalledWith('harness.stop', 'job-termination-predelete', expect.objectContaining({
+        runId: 'run-parent-uuid', reporter: 'harness-stop', reporterSeat: 'OPT', reporterCommand: 'harness stop',
+        status: 'observed', omittedPods: 0,
+        pods: [expect.objectContaining({ pod: 'si-child-abc', job: 'si-child', childRunId: 'run-child-uuid',
+          phase: 'Failed', reason: 'DeadlineExceeded', nodeName: null, activeDeadlineSeconds: 300,
+          containers: [expect.objectContaining({ name: 'child', terminated: { reason: 'Error', exitCode: 143, signal: 15, finishedAt: '2026-10-29T00:04:59.000Z' } })],
+          tailSource: 'kubectl-logs-merged-streams', tailStatus: 'observed', tail: ['last child output'] })],
+      }));
+      const event = log.mock.calls.find(([category, name]) => category === 'harness.stop' && name === 'job-termination-predelete')?.[2] as { requestedAt?: string; processGraceDeadlineAt?: string } | undefined;
+      expect(typeof event?.requestedAt).toBe('string');
+      expect(event?.processGraceDeadlineAt).toBeUndefined();
+    } finally {
+      log.mockRestore();
+      if (previousSeat === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
+      else process.env.ELANOUS_HARNESS_SEAT = previousSeat;
+    }
+  });
+
+  test('empty pre-delete Pod list is observed before Job deletion and remains distinct from unavailable', async () => {
+    const timeline: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category !== 'harness.stop') return;
+      const detail = data as Record<string, unknown>;
+      if (event === 'job-termination-predelete') {
+        events.push(detail);
+        timeline.push(`predelete:${String(detail.matchedBy)}:${String(detail.status)}`);
+      } else if (event === 'job-delete') {
+        timeline.push(`job-delete:${String(detail.outcome)}`);
+      }
+    }) as typeof debug.log);
+    const deps = defaultHarnessStopDeps({ namespace: 'test-ns', kubeContexts: () => ['ctx-a'], readPidRecord: () => null,
+      runIdCandidates: () => [], scanProcesses: () => ({ status: 'ok', candidates: [] }), kubectl: (args) => {
+        const label = args.find((arg) => arg.startsWith('elanous.run=') || arg.startsWith('elanous.child-run='))?.split('=')[0] ?? 'unknown';
+        if (args.includes('get') && args.includes('json')) {
+          timeline.push(`pod-list:${label}`);
+          return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+        }
+        if (args.includes('delete')) {
+          timeline.push(`delete-job:${label}`);
+          return { status: 0, stdout: '', stderr: '' };
+        }
+        timeline.push(`remaining-pods:${label}`);
+        return { status: 0, stdout: '', stderr: '' };
+      } });
+    try {
+      const stopped = await stopHarnessRun('run-empty-pod-list', deps);
+      expect(stopped.jobsDeleted).toBe(0);
+      expect(stopped.jobDeletes).toEqual([{ context: 'ctx-a', outcome: 'none', matchedBy: null, deleted: 0 }]);
+      expect(events).toHaveLength(2);
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ runId: 'run-empty-pod-list', context: 'ctx-a', matchedBy: 'elanous.run', status: 'observed', pods: [], omittedPods: 0 }),
+        expect.objectContaining({ runId: 'run-empty-pod-list', context: 'ctx-a', matchedBy: 'elanous.child-run', status: 'observed', pods: [], omittedPods: 0 }),
+      ]));
+      expect(timeline).toEqual([
+        'pod-list:elanous.run', 'predelete:elanous.run:observed', 'delete-job:elanous.run',
+        'pod-list:elanous.child-run', 'predelete:elanous.child-run:observed', 'delete-job:elanous.child-run',
+        'remaining-pods:elanous.run', 'remaining-pods:elanous.child-run', 'job-delete:none',
+      ]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('invalid Pod array shapes are logged and do not block matched Job deletion', async () => {
+    const calls: string[][] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const deps = defaultHarnessStopDeps({ namespace: 'test-ns', kubeContexts: () => ['ctx-a'], readPidRecord: () => null,
+      runIdCandidates: () => [], scanProcesses: () => ({ status: 'ok', candidates: [] }), kubectl: (args) => {
+        calls.push([...args]);
+        return args.includes('get') ? { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'bad-pod' }, spec: { containers: 'not-an-array' }, status: { conditions: {} } }] }), stderr: '' }
+          : { status: 0, stdout: 'job.batch/si-child deleted', stderr: '' };
+      } });
+    try {
+      const stopped = await stopHarnessRun('run-invalid', deps);
+      expect(stopped.jobsDeleted).toBe(1);
+      expect(calls.map((args) => args.includes('delete') ? 'delete' : 'get')).toEqual(['get', 'delete']);
+      expect(log).toHaveBeenCalledWith('harness.stop', 'job-termination-predelete', expect.objectContaining({
+        status: 'observed', pods: [{ status: 'invalid-pod-record' }],
+      }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('pre-delete capture caps Pods and marks the omitted evidence count', async () => {
+    const calls: string[][] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const deps = defaultHarnessStopDeps({ namespace: 'test-ns', kubeContexts: () => ['ctx-a'], readPidRecord: () => null,
+      runIdCandidates: () => [], scanProcesses: () => ({ status: 'ok', candidates: [] }), kubectl: (args) => {
+        calls.push([...args]);
+        return args.includes('get') ? { status: 0, stdout: JSON.stringify({ items: ['pod-1', 'pod-2', 'pod-3'].map((name) => ({ metadata: { name } })) }), stderr: '' }
+          : args.includes('logs') ? { status: 0, stdout: 'bounded output', stderr: '' }
+            : { status: 0, stdout: 'job.batch/si-child deleted', stderr: '' };
+      } });
+    try {
+      await stopHarnessRun('run-capped', deps);
+      expect(calls.filter((args) => args.includes('logs'))).toHaveLength(2);
+      expect(log).toHaveBeenCalledWith('harness.stop', 'job-termination-predelete', expect.objectContaining({ omittedPods: 1 }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('pre-delete Pod evidence cap is shared across contexts and label selectors', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'harness.stop' && event === 'job-termination-predelete') events.push(data as Record<string, unknown>);
+    }) as typeof debug.log);
+    const deps = defaultHarnessStopDeps({ namespace: 'test-ns', kubeContexts: () => ['ctx-a'], readPidRecord: () => null,
+      runIdCandidates: () => [], scanProcesses: () => ({ status: 'ok', candidates: [] }), kubectl: (args) => {
+        if (args.includes('get')) return { status: 0, stdout: JSON.stringify({ items: ['pod-a', 'pod-b', 'pod-c'].map((name) => ({ metadata: { name } })) }), stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      } });
+    try {
+      await stopHarnessRun('run-global-cap', deps);
+      expect(events).toHaveLength(2);
+      expect(events.reduce((sum, event) => sum + (Array.isArray(event.pods) ? event.pods.length : 0), 0)).toBe(2);
+      expect(events.map((event) => event.omittedPods)).toEqual([1, 3]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('each stopHarnessRun call receives a fresh observation budget with reused dependencies', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'harness.stop' && event === 'job-termination-predelete') events.push(data as Record<string, unknown>);
+    }) as typeof debug.log);
+    const deps = defaultHarnessStopDeps({ namespace: 'test-ns', kubeContexts: () => ['ctx-a'], readPidRecord: () => null,
+      runIdCandidates: () => [], scanProcesses: () => ({ status: 'ok', candidates: [] }), kubectl: (args) =>
+        args.includes('get') ? { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' }
+          : { status: 0, stdout: 'job.batch/si-child deleted', stderr: '' } });
+    try {
+      await stopHarnessRun('run-reused-budget', deps);
+      await stopHarnessRun('run-reused-budget', deps);
+      expect(events).toHaveLength(2);
+      expect(events.map((event) => event.status)).toEqual(['observed', 'observed']);
+    } finally { log.mockRestore(); }
+  });
+
+  test('a failing optional pre-delete observer cannot prevent existing Job deletion', async () => {
+    const f = fakeDeps({ record: null, starts: [null], jobs: 1 });
+    f.deps.observePodsBeforeDelete = () => { throw new Error('synthetic malformed observation'); };
+    const r = await stopHarnessRun('run-observer-throws', f.deps);
+    expect(r.jobsDeleted).toBe(1);
+    expect(f.kubectlCalls[0]).toEqual(['--context', 'ctx-a', '-n', 'elanous-test', 'delete', 'job', '-l', 'elanous.run=run-observer-throws', '--wait=false', '-o', 'name']);
+  });
+
   test('유일한 원장 접두는 전체 runId 로 풀어 pid 와 Job 라벨에 함께 쓴다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'stop-prefix-'));
     const ledger = join(dir, 'ledger');
@@ -194,6 +360,28 @@ describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭�
     expect(f.signals).toEqual([[4242, 'SIGTERM']]);
     expect(f.kubectlCalls).toEqual([['--context', 'ctx-a', '-n', 'elanous-test', 'delete', 'job', '-l', 'elanous.run=run-abc', '--wait=false', '-o', 'name']]);
     expect(r.jobsDeleted).toBe(2);
+  });
+
+  test('process stop log identifies signal request time, target PID, discovery path and reporting command', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const previousSeat = process.env.ELANOUS_HARNESS_SEAT;
+    process.env.ELANOUS_HARNESS_SEAT = 'UX';
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'harness.stop' && event === 'process-signal-request') events.push(data as Record<string, unknown>);
+    }) as typeof debug.log);
+    try {
+      const f = fakeDeps({ record: { pid: 4242, startedAt: 1_000_000 }, starts: [1_000_000, null] });
+      await stopHarnessRun('run-signal-request', f.deps);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ runId: 'run-signal-request', signal: 'SIGTERM', targetPid: 4242,
+        targetStartedAt: new Date(1_000_000).toISOString(), targetDiscovery: 'pid.json', delivery: 'accepted',
+        reporter: 'harness-stop', reporterSeat: 'UX', reporterCommand: 'harness stop' });
+      expect(typeof events[0]?.requestAt).toBe('string');
+    } finally {
+      log.mockRestore();
+      if (previousSeat === undefined) delete process.env.ELANOUS_HARNESS_SEAT;
+      else process.env.ELANOUS_HARNESS_SEAT = previousSeat;
+    }
   });
 
   test('시작 시각이 다르면(PID 재사용) 신호 0 · owner-mismatch · Job 삭제는 그대로', async () => {

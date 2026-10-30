@@ -119,6 +119,17 @@ function checkSelectedReviewAttempts(input: VerifyOverlapEvidenceInput, e: Parti
   let selectedRecord: Record<string, unknown> | undefined;
   try { selectedRecord = lastReviewRecord(input.readFile(selected)); } catch { return { ok: false, reason: 'review-unreadable' }; }
   const hasResolvedPrior = hasResolvedPriorDeclaration(selectedRecord);
+  if (selectedRecord?.reviewer === 'OP-waiver') {
+    const waiver = validOpWaiver(selectedRecord, input.pr, selectedHead);
+    if (!waiver.ok) return { ok: false, reason: waiver.reason };
+    const linkedSameHeadFailure = candidates.some((path) => {
+      if (path === selected || !adjudicatesReviewFile(waiver.adjudicates, path)) return false;
+      const failed = checkReview(input, { reviewResult: path }, selectedHead);
+      return !failed.ok && /^review-(?:verdict-fail|must-fix-[1-9][0-9]*)$/.test(failed.reason)
+        && reviewAttemptHasExactSameHeadFail(input, path, selectedHead);
+    });
+    if (!linkedSameHeadFailure) return { ok: false, reason: 'review-op-waiver-same-head-failure-missing' };
+  }
   if (entries?.length || hasResolvedPrior) {
     try { selectedTime = input.reviewMtime(selected); } catch { return { ok: false, reason: 'review-attempt-time-unmeasured' }; }
     if (!Number.isFinite(selectedTime)) return { ok: false, reason: 'review-attempt-time-unmeasured' };
@@ -196,8 +207,77 @@ function lastReviewRecord(text: string): Record<string, unknown> | undefined {
   return undefined;
 }
 
+const OP_WAIVER_DISPOSITIONS = new Set(['already-fixed', 'out-of-scope-followup', 'reviewer-error']);
+
+function canonicalWaiverDisposition(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  if (OP_WAIVER_DISPOSITIONS.has(value)) return value;
+  // These labels occur in OP's saved, approved adjudications; accept only their
+  // narrow semantic aliases while new decisions use the canonical vocabulary.
+  if (value === 'fixed-in-this-head') return 'already-fixed';
+  if (value === 'evidence-provided' || value === 'reviewer-misread-contract') return 'reviewer-error';
+  return undefined;
+}
+
+function opWaiverTestResult(value: unknown, head: string): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const run = value as Record<string, unknown>;
+  if (typeof run.sha !== 'string' || run.sha.toLowerCase() !== head || (run.exit !== undefined && run.exit !== 0)) return false;
+  const hasRunDescription = ['command', 'scope', 'rawOutput'].some((key) => typeof run[key] === 'string' && (run[key] as string).trim());
+  if (!hasRunDescription) return false;
+  let pass = typeof run.pass === 'number' && Number.isSafeInteger(run.pass) ? run.pass : undefined;
+  let fail = typeof run.fail === 'number' && Number.isSafeInteger(run.fail) ? run.fail : undefined;
+  if ((pass === undefined || fail === undefined) && run.tests && typeof run.tests === 'object' && !Array.isArray(run.tests)) {
+    const rows = Object.values(run.tests as Record<string, unknown>);
+    const parsed = rows.map((row) => typeof row === 'string' ? /^(\d+)\/(\d+)$/.exec(row) : null);
+    if (rows.length > 0 && parsed.every(Boolean)) {
+      pass = parsed.reduce((sum, row) => sum + Number(row![1]), 0);
+      fail = parsed.reduce((sum, row) => sum + Number(row![2]), 0);
+    }
+  }
+  return pass !== undefined && pass > 0 && fail === 0;
+}
+
+function validOpWaiver(record: Record<string, unknown> | undefined, pr: number, head: string):
+  | { ok: true; adjudicates: string; findingCount: number }
+  | { ok: false; reason: string } {
+  if (!record || record.reviewer !== 'OP-waiver') return { ok: false, reason: 'review-op-waiver-reviewer' };
+  const waiver = record.waiver;
+  if (!waiver || typeof waiver !== 'object' || Array.isArray(waiver)) return { ok: false, reason: 'review-op-waiver-missing' };
+  const value = waiver as Record<string, unknown>;
+  if (value.by !== 'OP' || typeof value.approvedBy !== 'string' || !value.approvedBy.trim()) {
+    return { ok: false, reason: 'review-op-waiver-approval-missing' };
+  }
+  if (typeof value.adjudicates !== 'string' || !value.adjudicates.trim()) return { ok: false, reason: 'review-op-waiver-adjudication-missing' };
+  if (!opWaiverTestResult(value.headTestRun, head)) return { ok: false, reason: 'review-op-waiver-head-test-missing' };
+  if (!Array.isArray(value.dispositions) || value.dispositions.length === 0) return { ok: false, reason: 'review-op-waiver-dispositions-missing' };
+  const findings = new Set<number>();
+  for (const raw of value.dispositions) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'review-op-waiver-disposition-invalid' };
+    const item = raw as Record<string, unknown>;
+    if (!Number.isSafeInteger(item.finding) || (item.finding as number) < 1 || findings.has(item.finding as number)
+      || !canonicalWaiverDisposition(item.disposition)
+      || typeof item.evidence !== 'string' || !item.evidence.trim()) return { ok: false, reason: 'review-op-waiver-disposition-invalid' };
+    if (canonicalWaiverDisposition(item.disposition) === 'out-of-scope-followup'
+      && !/(?:#[1-9]\d*|\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+\b)/.test(item.evidence)) {
+      return { ok: false, reason: 'review-op-waiver-followup-missing' };
+    }
+    findings.add(item.finding as number);
+  }
+  const ordered = [...findings].sort((a, b) => a - b);
+  if (ordered.some((finding, index) => finding !== index + 1)) return { ok: false, reason: 'review-op-waiver-findings-incomplete' };
+  const recordPr = typeof record.pr === 'number' ? record.pr : Number(record.pr);
+  if (!Number.isSafeInteger(recordPr) || recordPr !== pr) return { ok: false, reason: 'review-op-waiver-pr-mismatch' };
+  return { ok: true, adjudicates: value.adjudicates, findingCount: findings.size };
+}
+
+function adjudicatesReviewFile(adjudicates: string, path: string): boolean {
+  return adjudicates.split(/[\s,;()]+/).includes(basename(path));
+}
+
 function hasResolvedPriorDeclaration(review: Record<string, unknown> | undefined): boolean {
   if (!review) return false;
+  if (review.reviewer === 'OP-waiver' && review.waiver && typeof review.waiver === 'object' && !Array.isArray(review.waiver)) return true;
   const value = review.resolvedPrior;
   if (value === true) return true;
   if (Array.isArray(value) && value.length > 0) return true;
@@ -250,11 +330,17 @@ function reviewAttemptExplicitlyResolved(input: VerifyOverlapEvidenceInput, sele
   let failed: Record<string, unknown> | undefined;
   try { failed = lastReviewRecord(input.readFile(failedPath)); } catch { return false; }
   if (!failed || failed.pr === undefined || String(failed.pr) !== String(input.pr)
-    || (typeof failed.headCommit === 'string' && failed.headCommit.toLowerCase() !== head)
+    || typeof failed.headCommit !== 'string' || failed.headCommit.toLowerCase() !== head
     || (typeof failed.currentHeadCommit === 'string' && failed.currentHeadCommit.toLowerCase() !== head)) return false;
   const rawFindings = findingList(failed.mustFix).map((finding) => finding.trim());
   const findings = rawFindings.map(normalizedFinding);
   if (findings.length === 0) return false;
+
+  const waiver = validOpWaiver(selected, input.pr, head);
+  if (waiver.ok) {
+    if (failed.reviewed !== true || failed.verdict !== 'fail' || rawFindings.length === 0) return false;
+    return adjudicatesReviewFile(waiver.adjudicates, failedPath) && waiver.findingCount === rawFindings.length;
+  }
 
   const declared = selected.resolvedPrior;
   if (declared !== undefined && declared !== false && containsUnresolvedDeclaration(declared)) return false;
@@ -327,6 +413,15 @@ function reviewAttemptExplicitlyResolved(input: VerifyOverlapEvidenceInput, sele
   return findings.every((finding) => resolvedSet.has(finding));
 }
 
+function reviewAttemptHasExactSameHeadFail(input: VerifyOverlapEvidenceInput, failedPath: string, head: string): boolean {
+  let failed: Record<string, unknown> | undefined;
+  try { failed = lastReviewRecord(input.readFile(failedPath)); } catch { return false; }
+  return Boolean(failed && failed.pr !== undefined && String(failed.pr) === String(input.pr)
+    && failed.reviewed === true && failed.verdict === 'fail'
+    && typeof failed.headCommit === 'string' && failed.headCommit.toLowerCase() === head
+    && findingList(failed.mustFix).length > 0);
+}
+
 type Checked = { ok: false; reason: string; baseTip?: string; gateBase?: string; windowCommits?: number }
   | (OverlapEvidenceVerdict & { ok: true; baseTip?: string });
 
@@ -359,6 +454,10 @@ function checkReview(input: Pick<VerifyOverlapEvidenceInput, 'pr' | 'readFile'> 
   // The capture parser projects away model provenance; inspect the same last result-shaped line here.
   const raw = lastReviewRecord(text);
   if (raw) {
+    if (raw.reviewer === 'OP-waiver') {
+      const waiver = validOpWaiver(raw, input.pr, head);
+      if (!waiver.ok) return { ok: false, reason: waiver.reason, baseTip };
+    }
     const actualBackend = typeof raw.actualBackend === 'string' ? raw.actualBackend.trim().toLowerCase() : '';
     const model = typeof raw.model === 'string' ? raw.model.trim().toLowerCase() : '';
     const route = typeof raw.reviewRoute === 'string' ? raw.reviewRoute.trim().toLowerCase() : '';

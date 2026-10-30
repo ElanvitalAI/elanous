@@ -154,6 +154,8 @@ export interface AgentTask {
    *  the runner drains events in the background; completion emits
    *  a task-notification (PFC-S1 P2). */
   background?: boolean;
+  /** How a background completion reaches an idle parent TUI. */
+  completionDelivery?: 'follow-up' | 'supplement';
   /** MSS M1.2: branded URI form of this spawn's identity. The
    *  registry mints one alongside the UUID-keyed `id`. Downstream
    *  MSS bridges (M3 signal sender · M4 memory participant) reference
@@ -183,6 +185,8 @@ export interface AgentSpawnOpts {
   definition: AgentDefinition;
   /** User message / query the agent should answer. */
   prompt: string;
+  /** Session that owns this spawn; scopes background completion delivery. */
+  parentSessionId?: string;
   /** Short task label — used by UI panes (e.g. agent-roster in
    *  wd-scratch) to distinguish spawns that share a definition.
    *  Stored verbatim on AgentTask.label. Optional; when omitted,
@@ -225,6 +229,8 @@ export interface AgentSpawnOpts {
    *  immediately and drains events off-thread. Completion emits a
    *  task-notification (see src/agent/task-notification.ts, P2). */
   background?: boolean;
+  /** Parent-selected routing for background completions. */
+  completionDelivery?: 'follow-up' | 'supplement';
   /** MSS M1.2: when the caller has already minted an AgentUri (e.g. a
    *  parent spawn pre-allocating ids for tracing), pass it here.
    *  Otherwise registry.spawn mints one. */

@@ -3,7 +3,8 @@ import { invokeResearchAxes } from '../research-bridge/index.js';
 import { invokeResearch } from '../research-bridge/invoke.js';
 import type { AxisFanoutResult } from '../research/axis-fanout.js';
 import { routeResearchOutput } from '../research/output-router.js';
-import { runGapFollowup } from '../research/gap-followup.js';
+import { planGapFollowup, runGapFollowup } from '../research/gap-followup.js';
+import type { ResearchGapFollowupInput, ResearchGapFollowupPlan } from '../research/gap-followup.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import {
   buildWorkingBackwardsContractPrompt,
@@ -16,13 +17,16 @@ import { attachResearchEvidence, buildResearchQuestionLadderPrompt,
   type SixLevelResearchQuestionLadder } from './question-ladder-contract.js';
 
 export interface ResearchQuestionLadderRunOptions {
-  generateContract?: (prompt: string) => Promise<string>;
-  generate?: (prompt: string) => Promise<string>;
-  invokeAxes?: (questions: SixLevelResearchQuestionLadder['questions']) => Promise<AxisFanoutResult>;
+  signal?: AbortSignal;
+  generateContract?: (prompt: string, signal?: AbortSignal) => Promise<string>;
+  generate?: (prompt: string, signal?: AbortSignal) => Promise<string>;
+  invokeAxes?: (questions: SixLevelResearchQuestionLadder['questions'], signal?: AbortSignal) => Promise<AxisFanoutResult>;
   routeOutput?: typeof routeResearchOutput;
-  invokeOutputSkill?: (skill: string, args: string) => Promise<{ ok: boolean; output: string; error?: string }>;
+  invokeOutputSkill?: (skill: string, args: string, signal?: AbortSignal) => Promise<{ ok: boolean; output: string; error?: string }>;
   /** Test seam for the bounded Bloom 4/5 evidence-gap follow-up. */
   gapFollowup?: typeof runGapFollowup;
+  /** Test seam for deciding whether production gap-follow-up has any runnable calls. */
+  planGapFollowup?: (input: ResearchGapFollowupInput) => ResearchGapFollowupPlan;
   /** Test/config seam for an explicitly installed private Bloom exemplar pack. */
   bloomExemplarPackPath?: string;
 }
@@ -205,9 +209,10 @@ export async function runResearchQuestionLadder(
   const initial: SixLevelResearchQuestionLadder = { request, questions: [], evidence: [] };
   let contractRaw: string;
   try {
-    contractRaw = await (options.generateContract ?? ((prompt) => defaultGenerate(prompt, 'research-working-backwards-contract')))(
-      buildWorkingBackwardsContractPrompt(request),
+    contractRaw = await (options.generateContract ?? ((prompt, signal) => defaultGenerate(prompt, 'research-working-backwards-contract', signal)))(
+      buildWorkingBackwardsContractPrompt(request), options.signal,
     );
+    if (options.signal?.aborted) return { ok: false, ladder: initial, output: '', error: 'research aborted' };
   } catch (error) {
     const reason = errorText(error);
     debug.log('research.lens', 'working-backwards-contract-failed', { reason }, { level: 'warn' });
@@ -247,9 +252,11 @@ export async function runResearchQuestionLadder(
       domain: exemplar.domain, domainSignal: exemplar.domainSignal,
       source: exemplar.source, count: exemplar.count, levels: exemplar.levels,
     });
-    raw = await (options.generate ?? ((prompt) => defaultGenerate(prompt, 'research-question-ladder')))(
+    raw = await (options.generate ?? ((prompt, signal) => defaultGenerate(prompt, 'research-question-ladder', signal)))(
       `${buildResearchQuestionLadderPrompt(request, sectionIds)}\n\n${exemplar.context ? `${exemplar.context}\n\n` : ''}${ladderContext}${retroGroundingContext(request)}`,
+      options.signal,
     );
+    if (options.signal?.aborted) return { ok: false, ladder: initial, outputContract, output: '', error: 'research aborted' };
     debug.log('research.turn', 'bloom-generated', { questionCount: 6 });
   } catch (error) {
     debug.log('research.turn', 'bloom-failed', { reason: errorText(error) }, { level: 'warn' });
@@ -276,7 +283,8 @@ export async function runResearchQuestionLadder(
   const observedAt = new Date().toISOString();
   let fanout: AxisFanoutResult;
   try {
-    fanout = await (options.invokeAxes ?? invokeResearchAxes)(ladder.questions);
+    fanout = await (options.invokeAxes ?? ((questions, signal) => invokeResearchAxes(questions, { signal })))(ladder.questions, options.signal);
+    if (options.signal?.aborted) return { ok: false, ladder, outputContract, output: '', error: 'research aborted' };
     debug.log('research.turn', 'axis-evidence-collected', {
       axisCount: fanout.axes.length,
       evidenceCount: fanout.axes.reduce((count, axis) => count + axis.evidence.length, 0),
@@ -327,47 +335,92 @@ export async function runResearchQuestionLadder(
       stage: 'axis-fanout', reason: 'every output-contract section slot is filled',
     });
   }
-  if (!finalBoundary.complete) {
-    try {
-      const followup = await (options.gapFollowup ?? runGapFollowup)({
-        request,
-        questions: ladder.questions,
-        evidence: ladder.evidence,
-      });
-      const followupLines = [
-        '## Bounded research gap follow-up',
-        `Rounds: ${followup.rounds} · budget: ${followup.timeBudgetMs}ms`,
-        ...followup.classifications.map((item) => `- ${item.questionId} [${item.action}/${item.reason}]${item.skill ? ` · ${item.skill}` : ''}: ${item.gap}`),
-      ];
-      for (const envelope of followup.followupEvidence) {
-        const attached = attachResearchEvidence(ladder, envelope);
-        if (!attached.ok) {
-          evidenceRejected = true;
-          followupLines.push(`- Evidence rejected: ${attached.reason}`);
-          continue;
-        }
-        ladder.evidence = attached.value.evidence;
-        followupLines.push(`- [${envelope.outcome}] ${envelope.sourceKind} · ${envelope.source}: ${envelope.content}`);
-      }
-      for (const card of followup.discoveryCards ?? []) followupLines.push(card);
-      if (followup.classifications.length || followup.followupEvidence.length) sections.push(...followupLines);
-      debug.log('research.turn', 'gap-followup-completed', {
-        rounds: followup.rounds,
-        classifications: followup.classifications.length,
-        evidenceCount: followup.followupEvidence.length,
-        evidenceAttached: ladder.evidence.length,
-      });
-      finalBoundary = planWorkingBackwardsCompletion(outputContract, ladder.questions, ladder.evidence);
-      logCompletionBoundary('gap-followup', finalBoundary);
-      if (finalBoundary.complete) {
-        debug.log('research.turn', 'completion-boundary-stop', {
-          stage: 'gap-followup', reason: 'every output-contract section slot is filled',
+  if (!finalBoundary.complete && !options.signal?.aborted) {
+    const followupStartedAt = performance.now();
+    const followupInput: ResearchGapFollowupInput = {
+      request,
+      questions: ladder.questions,
+      evidence: ladder.evidence,
+      ...(options.signal ? { signal: options.signal } : {}),
+    };
+    let followupPlan: ResearchGapFollowupPlan | undefined;
+    if (options.planGapFollowup || !options.gapFollowup) {
+      try {
+        followupPlan = (options.planGapFollowup ?? planGapFollowup)(followupInput);
+        debug.log('research.turn', 'gap-followup-planned', {
+          rounds: followupPlan.rounds,
+          classifications: followupPlan.classifications.length,
+          calls: followupPlan.followups.length,
+          elapsedMs: Math.round((performance.now() - followupStartedAt) * 10) / 10,
         });
+      } catch (error) {
+        debug.log('research.turn', 'gap-followup-plan-failed', {
+          reason: errorText(error),
+          elapsedMs: Math.round((performance.now() - followupStartedAt) * 10) / 10,
+        }, { level: 'warn' });
       }
-    } catch (error) {
-      debug.log('research.turn', 'gap-followup-failed', { reason: errorText(error) }, { level: 'warn' });
+    }
+    if (followupPlan && followupPlan.followups.length === 0) {
+      if (followupPlan.classifications.length > 0) {
+        sections.push(
+          '## Bounded research gap follow-up',
+          `Rounds: ${followupPlan.rounds} · budget: ${followupPlan.timeBudgetMs}ms`,
+          ...followupPlan.classifications.map((item) => `- ${item.questionId} [${item.action}/${item.reason}]${item.skill ? ` · ${item.skill}` : ''}: ${item.gap}`),
+        );
+      }
+      debug.log('research.turn', 'gap-followup-skipped', {
+        reason: 'no-runnable-followup-calls',
+        classifications: followupPlan.classifications.length,
+        timeBudgetMs: followupPlan.timeBudgetMs,
+      });
+    } else {
+      const executionStartedAt = performance.now();
+      debug.log('research.turn', 'gap-followup-started', {
+        evidenceCount: ladder.evidence.length,
+        completeEvidenceCount: ladder.evidence.filter((item) => item.outcome === 'complete').length,
+      });
+      try {
+        const followup = await (options.gapFollowup ?? runGapFollowup)(followupInput);
+        const followupLines = [
+          '## Bounded research gap follow-up',
+          `Rounds: ${followup.rounds} · budget: ${followup.timeBudgetMs}ms`,
+          ...followup.classifications.map((item) => `- ${item.questionId} [${item.action}/${item.reason}]${item.skill ? ` · ${item.skill}` : ''}: ${item.gap}`),
+        ];
+        for (const envelope of followup.followupEvidence) {
+          const attached = attachResearchEvidence(ladder, envelope);
+          if (!attached.ok) {
+            evidenceRejected = true;
+            followupLines.push(`- Evidence rejected: ${attached.reason}`);
+            continue;
+          }
+          ladder.evidence = attached.value.evidence;
+          followupLines.push(`- [${envelope.outcome}] ${envelope.sourceKind} · ${envelope.source}: ${envelope.content}`);
+        }
+        for (const card of followup.discoveryCards ?? []) followupLines.push(card);
+        if (followup.classifications.length || followup.followupEvidence.length) sections.push(...followupLines);
+        debug.log('research.turn', 'gap-followup-completed', {
+          rounds: followup.rounds,
+          classifications: followup.classifications.length,
+          evidenceCount: followup.followupEvidence.length,
+          evidenceAttached: ladder.evidence.length,
+          elapsedMs: Math.round((performance.now() - executionStartedAt) * 10) / 10,
+        });
+        finalBoundary = planWorkingBackwardsCompletion(outputContract, ladder.questions, ladder.evidence);
+        logCompletionBoundary('gap-followup', finalBoundary);
+        if (finalBoundary.complete) {
+          debug.log('research.turn', 'completion-boundary-stop', {
+            stage: 'gap-followup', reason: 'every output-contract section slot is filled',
+          });
+        }
+      } catch (error) {
+        debug.log('research.turn', 'gap-followup-failed', {
+          reason: errorText(error),
+          elapsedMs: Math.round((performance.now() - executionStartedAt) * 10) / 10,
+        }, { level: 'warn' });
+      }
     }
   }
+  if (options.signal?.aborted) return { ok: false, ladder, outputContract, output: '', error: 'research aborted' };
 
   const outputContractSectionIndex = sections.findIndex((section) => section.startsWith('## Output contract\n'));
   if (outputContractSectionIndex < 0) throw new Error('output contract section is missing from research output');
@@ -405,24 +458,43 @@ export async function runResearchQuestionLadder(
     fallbackReason: route?.fallbackReason ?? (route ? undefined : 'router-failed'),
   });
   let routedOutput = '';
-  if (route?.skillCallPlan) {
+  const hasCompleteEvidence = ladder.evidence.some((item) => item.outcome === 'complete');
+  if (route?.skillCallPlan && !hasCompleteEvidence) {
+    debug.log('research.turn', 'output-skill-skipped', {
+      skill: route.skillCallPlan.skill,
+      reason: 'no-complete-evidence',
+      evidenceCount: ladder.evidence.length,
+    });
+  } else if (route?.skillCallPlan) {
+    const outputSkillStartedAt = performance.now();
+    debug.log('research.turn', 'output-skill-started', {
+      skill: route.skillCallPlan.skill,
+      evidenceCount: ladder.evidence.length,
+      completeEvidenceCount: ladder.evidence.filter((item) => item.outcome === 'complete').length,
+    });
     try {
       const formatted = await (options.invokeOutputSkill ?? defaultInvokeOutputSkill)(
-        route.skillCallPlan.skill, route.skillCallPlan.args,
+        route.skillCallPlan.skill, route.skillCallPlan.args, options.signal,
       );
       if (formatted.ok && formatted.output.trim()) {
         routedOutput = `\n\n## Routed ${route.format} output (${route.skillCallPlan.skill})\n\n${formatted.output.trim()}`;
-        debug.log('research.turn', 'output-skill-completed', { skill: route.skillCallPlan.skill, outputChars: formatted.output.length });
+        debug.log('research.turn', 'output-skill-completed', {
+          skill: route.skillCallPlan.skill,
+          outputChars: formatted.output.length,
+          elapsedMs: Math.round((performance.now() - outputSkillStartedAt) * 10) / 10,
+        });
       } else {
         debug.log('research.turn', 'output-skill-fallback', {
           skill: route.skillCallPlan.skill,
           reason: formatted.error ?? 'empty output',
+          elapsedMs: Math.round((performance.now() - outputSkillStartedAt) * 10) / 10,
         }, { level: 'warn' });
       }
     } catch (error) {
       debug.log('research.turn', 'output-skill-fallback', {
         skill: route.skillCallPlan.skill,
         reason: errorText(error),
+        elapsedMs: Math.round((performance.now() - outputSkillStartedAt) * 10) / 10,
       }, { level: 'warn' });
     }
   }
@@ -436,8 +508,8 @@ export async function runResearchQuestionLadder(
   };
 }
 
-async function defaultInvokeOutputSkill(skill: string, args: string) {
-  const result = await invokeResearch(args, { skill });
+async function defaultInvokeOutputSkill(skill: string, args: string, signal?: AbortSignal) {
+  const result = await invokeResearch(args, { skill, signal });
   return { ok: result.ok, output: result.output, ...(result.error ? { error: result.error } : {}) };
 }
 
@@ -451,10 +523,11 @@ export function researchTurnForGrounding(result: ResearchQuestionLadderRunResult
   };
 }
 
-async function defaultGenerate(prompt: string, usageSite: string): Promise<string> {
+async function defaultGenerate(prompt: string, usageSite: string, signal?: AbortSignal): Promise<string> {
   return streamLLM([{ role: 'user', content: prompt }], () => {}, {
     usageSite,
     usagePhase: 'research',
+    ...(signal ? { signal } : {}),
   });
 }
 

@@ -30,6 +30,21 @@ test('uses the existing Bloom2D taxonomy and selects finance level 4/5 exemplars
   expect(fallback.context).toContain('L5 evaluate/metacognitive');
 });
 
+test('selects two public technology L4/L5 exemplars for the AI data-center demo question', () => {
+  const result = getBloomExemplarContext(
+    '2030년 AI 데이터센터 전력수요는 낮음·기준·높음 시나리오에서 각각 얼마나 늘어날까?',
+    '/missing/bloom-exemplars.json',
+  );
+
+  expect(result).toMatchObject({
+    domain: 'technology', domainSignal: 'matched', source: 'public-fallback', count: 2, levels: [4, 5],
+  });
+  expect(result.context).toContain('L4 analyze/conceptual');
+  expect(result.context).toContain('L5 evaluate/metacognitive');
+  expect(result.context).toContain('추론 처리량');
+  expect(result.context).toContain('전력수요 전망을 반박');
+});
+
 test('accepts only the complete 7×6×5 premium bank and selects three examples at both requested stages', () => {
   const pack = fullPack();
   expect(pack.exemplars).toHaveLength(210);

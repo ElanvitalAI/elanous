@@ -13,8 +13,9 @@ type PackOptions = {
   paths?: string[];
   outDir: string;
   maxSizeBytes?: number;
-  mirrorHead?: string;
+  mirrorHead?: string | null;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  probeGit?: typeof gitProbe;
 };
 
 type PackedBundle = {
@@ -35,10 +36,21 @@ function git(repoDir: string, env: NodeJS.ProcessEnv, ...args: string[]): string
   }
 }
 
+function gitProbe(repoDir: string, env: NodeJS.ProcessEnv, ...args: string[]): { status: number; stderr: string } {
+  try {
+    execFileSync('git', args, { cwd: repoDir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return { status: 0, stderr: '' };
+  } catch (error) {
+    const e = error as Error & { status?: number; stderr?: Buffer | string };
+    return { status: e.status ?? -1, stderr: String(e.stderr ?? e.message).trim() };
+  }
+}
+
 /** Package the host's on-disk files above a fetchable remote base without touching the user's index. */
 export function packSourceBundle(options: PackOptions): PackedBundle {
   const { repoDir, kind, base, paths, outDir } = options;
   const log = options.log ?? ((category: string, event: string, data: Record<string, unknown>) => debug.log(category, event, data));
+  const probeGit = options.probeGit ?? gitProbe;
   const started = Date.now();
   let root = resolve(repoDir);
   const output = resolve(outDir);
@@ -50,6 +62,9 @@ export function packSourceBundle(options: PackOptions): PackedBundle {
   let headCommit: string | undefined;
   let ownsIndex = false;
   let createdBundle = false;
+  let bundleMode: 'thin' | 'full' | 'unknown' = 'unknown';
+  let bundleReason = 'decision-not-reached';
+  let bundleSizeBytes: number | null = null;
   try {
     root = git(root, env, 'rev-parse', '--show-toplevel');
     const outputRelative = relative(root, output);
@@ -110,16 +125,36 @@ export function packSourceBundle(options: PackOptions): PackedBundle {
     git(root, env, 'update-ref', ref, headCommit);
     createdBundle = true;
     let bundleRevision = ref;
-    if (options.mirrorHead !== undefined) {
+    if (options.mirrorHead === undefined) {
+      bundleMode = 'full';
+      bundleReason = 'mirror-head-unspecified';
+    } else if (options.mirrorHead === null) {
+      bundleMode = 'full';
+      bundleReason = 'mirror-head-missing';
+    } else {
+      bundleMode = 'full';
+      bundleReason = 'mirror-head-invalid';
       // A thin bundle is usable only when its excluded history belongs to the packed base's lineage.
       const mirrorHead = options.mirrorHead;
       let sharedHistory = false;
       if (/^[0-9a-f]{40,64}$/.test(mirrorHead)) {
-        try {
-          git(root, env, 'cat-file', '-e', `${mirrorHead}^{commit}`);
-          git(root, env, 'merge-base', '--is-ancestor', mirrorHead, baseCommit);
-          sharedHistory = true;
-        } catch { /* The mirror is unavailable or unrelated; include all history instead. */ }
+        const commitProbe = probeGit(root, { ...env, GIT_NO_LAZY_FETCH: '1' }, 'cat-file', '-e', `${mirrorHead}^{commit}`);
+        if (commitProbe.status === 0) {
+          const ancestorProbe = probeGit(root, env, 'merge-base', '--is-ancestor', mirrorHead, baseCommit);
+          if (ancestorProbe.status === 0) sharedHistory = true;
+          else if (ancestorProbe.status === 1 && !ancestorProbe.stderr) bundleReason = 'mirror-head-not-ancestor';
+          else bundleReason = 'mirror-head-check-failed';
+        } else if ((commitProbe.status === 1 && !commitProbe.stderr) || (commitProbe.status === 128 && /not a valid object name|could not get object info/i.test(commitProbe.stderr))) {
+          bundleReason = 'mirror-head-unavailable';
+        } else {
+          bundleReason = 'mirror-head-check-failed';
+        }
+      } else {
+        bundleReason = 'mirror-head-invalid';
+      }
+      if (sharedHistory) {
+        bundleMode = 'thin';
+        bundleReason = 'shared-history';
       }
       bundleRevision = sharedHistory ? `${mirrorHead}..${ref}` : ref;
     }
@@ -127,15 +162,16 @@ export function packSourceBundle(options: PackOptions): PackedBundle {
     git(root, env, 'update-ref', '-d', ref, headCommit);
     ref = undefined;
     const sizeBytes = statSync(bundlePath).size;
+    bundleSizeBytes = sizeBytes;
     if (sizeBytes > limit) throw new Error(`bundle size ${sizeBytes} exceeds limit ${limit} bytes`);
     const sha256 = createHash('sha256').update(readFileSync(bundlePath)).digest('hex');
     const result = { bundlePath, sha256, sizeBytes, baseCommit, headCommit, fileCount };
-    log('pod.source', 'bundle-packed', { kind, baseCommit, headCommit, fileCount, sizeBytes, ms: Date.now() - started });
+    log('pod.source', 'bundle-packed', { kind, baseCommit, headCommit, fileCount, bundleMode, bundleReason, sizeBytes, ms: Date.now() - started });
     return result;
   } catch (error) {
     if (createdBundle) rmSync(bundlePath, { force: true });
     const reason = error instanceof Error ? error.message : String(error);
-    log('pod.source', 'bundle-refused', { kind, reason });
+    log('pod.source', 'bundle-refused', { kind, reason, bundleMode, bundleReason, sizeBytes: bundleSizeBytes });
     throw error;
   } finally {
     if (ref && headCommit) git(root, env, 'update-ref', '-d', ref, headCommit);

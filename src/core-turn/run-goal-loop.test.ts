@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { CoreTurnContext, CoreTurnResult } from './types.js';
 import { debug } from '../debug/log.js';
 import { DELEGATE_HINT } from '../agent/delegate-hint.js';
+import { TaskNotificationQueue, renderTaskNotificationsXml } from '../agent/task-notification.js';
 import { boundReadableText } from '../self-implement/orchestrator.js';
 import {
   CHILD_LIVENESS_HEARTBEAT_ENV,
@@ -412,6 +413,93 @@ describe('runGoalLoop completion answer deduplication', () => {
     } finally {
       debug.log = originalLog;
     }
+  });
+});
+
+describe('runGoalLoop drains background results between live iterations', () => {
+  test('a legacy child receipt without parentSessionId reaches the next live parent turn', async () => {
+    const queue = new TaskNotificationQueue();
+    const users: string[] = [];
+    let turns = 0;
+    const result = await runGoalLoop(baseCtx(), {
+      maxIterations: 3,
+      drainIterationMessages: () => {
+        const pending = queue.drainForParentSessionOrUnscoped('child-liveness');
+        const xml = renderTaskNotificationsXml(pending);
+        return xml ? [{ role: 'user' as const, content: xml }] : [];
+      },
+      runTurn: async (ctx) => {
+        turns += 1;
+        const lastUser = [...ctx.messages].reverse().find((message) => message.role === 'user');
+        users.push(String(lastUser?.content ?? ''));
+        if (turns === 1) {
+          queue.enqueue({
+            taskId: 'legacy-unscoped-child', agentName: 'researcher', state: 'done',
+            output: 'receipt without parentSessionId', truncated: false, durationMs: 1, finishedAt: 1,
+          });
+          ctx.callbacks?.onTurnComplete?.([{
+            role: 'assistant', content: [{ type: 'tool_use', id: 'continue', name: 'Read', input: {} }],
+          }]);
+          return { stopReason: 'end_turn', finalText: 'Continue with the child result.' } satisfies CoreTurnResult;
+        }
+        expect(lastUser?.content).toContain('legacy-unscoped-child');
+        ctx.callbacks?.onTurnComplete?.([{
+          role: 'assistant', content: [{
+            type: 'tool_use', id: 'goal', name: 'update_goal',
+            input: { status: 'complete', evidence: 'legacy child receipt was received' },
+          }],
+        }]);
+        return { stopReason: 'end_turn', finalText: 'The child result was received.' } satisfies CoreTurnResult;
+      },
+    });
+
+    expect(result).toMatchObject({ goalComplete: true, stopReason: 'goal_complete' });
+    expect(turns).toBe(2);
+    expect(users[1]).toContain('legacy-unscoped-child');
+    expect(queue.size).toBe(0);
+  });
+
+  test('four parallel child results with a 5-minute max are in the parent final turn by 6 minutes', async () => {
+    let elapsedMs = 0;
+    let turns = 0;
+    const childResults = [60_000, 120_000, 180_000, 300_000].map((finishedAt, index) => ({
+      finishedAt,
+      message: { role: 'user' as const, content: `<task-notification id="child-${index + 1}">result-${index + 1}</task-notification>` },
+    }));
+    const result = await runGoalLoop(baseCtx(), {
+      maxIterations: 8,
+      now: () => elapsedMs,
+      drainIterationMessages: () => {
+        const arrived = childResults.filter((child) => child.finishedAt <= elapsedMs);
+        for (const child of arrived) childResults.splice(childResults.indexOf(child), 1);
+        return arrived.map((child) => child.message);
+      },
+      runTurn: async (ctx) => {
+        turns += 1;
+        ctx.callbacks?.onTurnComplete?.([{
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: `work-${turns}`, name: 'Read', input: { path: `simulated-child-progress-${turns}` } }],
+        }]);
+        const carried = ctx.messages.filter((message) => message.role === 'user' && typeof message.content === 'string')
+          .map((message) => message.content as string).join('\n');
+        const allChildrenPresent = [1, 2, 3, 4].every((child) => carried.includes(`id="child-${child}"`));
+        if (allChildrenPresent) {
+          elapsedMs += 60_000; // One bounded parent turn to synthesize the last child result.
+          ctx.callbacks?.onTurnComplete?.([{
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'goal', name: 'update_goal', input: { status: 'complete', evidence: 'all four child results harvested' } }],
+          }]);
+          return { stopReason: 'end_turn', finalText: 'All four parallel results were incorporated.' } satisfies CoreTurnResult;
+        }
+        elapsedMs += 60_000;
+        return { stopReason: 'end_turn', finalText: `Waiting for child research (${turns}).` } satisfies CoreTurnResult;
+      },
+    });
+
+    expect(result).toMatchObject({ goalComplete: true, stopReason: 'goal_complete' });
+    expect(turns).toBeLessThanOrEqual(7);
+    expect(elapsedMs).toBeLessThanOrEqual(6 * 60_000);
+    expect(childResults).toHaveLength(0);
   });
 });
 

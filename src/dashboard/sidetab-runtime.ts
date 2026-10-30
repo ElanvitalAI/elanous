@@ -3,6 +3,82 @@ import type { ModalSurface } from '../display/modal-stack.js';
 import type { Key } from '../tui.js';
 import { loadSidetabRows, type SidetabRow } from '../sidetab-core/model.js';
 
+export interface DashboardLocalAgentSession {
+  id: string;
+  title: string;
+  kind: 'shell' | 'coding-agent';
+  agentBrand?: 'claude-code' | 'codex' | 'gemini';
+  state: 'foreground' | 'background' | 'exited';
+}
+
+export interface DashboardMissionResult {
+  ok: boolean;
+  path: string;
+  content?: string;
+  firstLine?: string;
+  promptReady: boolean;
+  missionVisible: boolean;
+  promptReturned: boolean;
+  completionMarker: boolean;
+  error?: string;
+}
+
+/** Convert popup startup/adapter exceptions into the same explicit mission outcome. */
+export async function runDashboardAgentMission<TSession, TModal>(deps: {
+  agent: string;
+  requestedOutputPath?: string;
+  open: () => TSession | undefined;
+  modal: (session: TSession) => TModal | null | undefined;
+  outputPath: (session: TSession, requested?: string) => string;
+  run: (session: TSession, modal: TModal, outputPath: string) => Promise<DashboardMissionResult>;
+  close: (session: TSession) => void;
+}): Promise<DashboardMissionResult> {
+  let session: TSession | undefined;
+  let resultPath = deps.requestedOutputPath ?? '';
+  try {
+    session = deps.open();
+    if (session === undefined) throw new Error(`${deps.agent} PTY could not start`);
+    const modal = deps.modal(session);
+    if (!modal) throw new Error(`${deps.agent} PTY could not start`);
+    resultPath = deps.outputPath(session, deps.requestedOutputPath);
+    return await deps.run(session, modal, resultPath);
+  } catch (error) {
+    return {
+      ok: false,
+      path: resultPath,
+      promptReady: false,
+      missionVisible: false,
+      promptReturned: false,
+      completionMarker: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    if (session !== undefined) {
+      try { deps.close(session); } catch { /* closing a failed popup must not replace its mission result */ }
+    }
+  }
+}
+
+/** Keep locally spawned coding-agent tabs attachable even when no PTY manifest row exists. */
+export function mergeLocalAgentSessions(
+  rows: readonly SidetabRow[],
+  sessions: readonly DashboardLocalAgentSession[],
+): SidetabRow[] {
+  const knownSessionIds = new Set(rows.map((row) => row.sessionId).filter((id): id is string => Boolean(id)));
+  const localAgents = sessions
+    .filter((session) => session.kind === 'coding-agent' && session.state !== 'exited' && !knownSessionIds.has(session.id))
+    .map((session): SidetabRow => ({
+      id: session.id,
+      label: session.title,
+      kind: session.agentBrand ?? 'coding-agent',
+      // Terminal foreground/background says where the session is attached,
+      // not whether the agent is currently working. Do not infer turn state.
+      badge: 'unknown',
+      sessionId: session.id,
+    }));
+  return [...rows, ...localAgents];
+}
+
 export interface DashboardSidetabRuntimeDeps {
   currentSessionId: () => string | undefined;
   termSize: () => { cols: number; rows: number };
@@ -10,6 +86,8 @@ export interface DashboardSidetabRuntimeDeps {
   pushModal: (surface: ModalSurface) => { dispose: () => void };
   attach: (row: SidetabRow) => void;
   spawnShell: () => void;
+  spawnAgent: (agent: 'codex' | 'claude') => void;
+  runMission: (agent: 'codex' | 'claude', mission: string, outputPath?: string) => Promise<DashboardMissionResult>;
   detach: (row: SidetabRow | null) => void;
   kill: (row: SidetabRow) => void;
   returnToParent: () => void;
@@ -17,8 +95,11 @@ export interface DashboardSidetabRuntimeDeps {
 }
 
 export interface DashboardSidetabRuntime {
+  loadRows: (sessionId?: string) => SidetabRow[];
   routeKey: (key: Key) => boolean;
   beginPrefix: () => void;
+  openAgent: DashboardSidetabRuntimeDeps['spawnAgent'];
+  runMission: DashboardSidetabRuntimeDeps['runMission'];
   close: () => void;
 }
 
@@ -196,6 +277,11 @@ export function createDashboardSidetabRuntime(
         deps.spawnShell();
         return true;
       }
+      if (!key.ctrl && !key.alt && (name === 'c' || name === 'a')) {
+        closePanel();
+        deps.spawnAgent(name === 'c' ? 'codex' : 'claude');
+        return true;
+      }
       if (!key.ctrl && !key.alt && name === 'd') {
         closePanel();
         deps.detach(null);
@@ -207,7 +293,7 @@ export function createDashboardSidetabRuntime(
         confirmKill(row);
         return true;
       }
-      deps.status('사이드탭 키: s 목록 · p 부모 · 1–9 연결 · n 새 셸 · d 분리 · k 종료');
+      deps.status('사이드탭 키: s 목록 · p 부모 · 1–9 연결 · c Codex · a Claude · n 새 셸 · d 분리 · k 종료');
       return true;
     }
     if (key.ctrl && !key.alt && (key.name === '\\' || key.name === 'backslash')) {
@@ -218,8 +304,11 @@ export function createDashboardSidetabRuntime(
   };
 
   return {
+    loadRows: (sessionId) => getRows(sessionId ?? deps.currentSessionId()),
     routeKey,
     beginPrefix,
+    openAgent: deps.spawnAgent,
+    runMission: deps.runMission,
     close() {
       prefixPending = false;
       closePanel();

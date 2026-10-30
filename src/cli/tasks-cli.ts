@@ -66,6 +66,10 @@ export interface TasksCliDeps {
   taskStatePath?: string;
   /** 조합 선택 시험에서만 그래프 저장소 루트를 바꾼다. */
   taskCompositionRoot?: string;
+  /** COORD-ENTRANCE-FOLD test seam; production uses the invoking repository root. */
+  coordinatorShadowRoot?: string;
+  /** Deterministic task-hand time in isolated tests. */
+  taskNow?: () => Date;
   /** DRAFT-CLAIM-AUTO-2-FU — `tasks hand --draft-claim <pr>` 의 관측·게시·수확 리뷰 포트(시험 주입). 기본 = `defaultDraftClaimGhPorts()`(gh CLI ⊕ 생산 리뷰 러너). */
   draftClaimGh?: DraftClaimGhPorts;
   /** logs.db 싱크 등록(시험 주입). 기본 = `registerStandaloneLogSink`. `hand`·`show` 가 부른다. */
@@ -2336,6 +2340,9 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         }
         const handOpts = {
           text: resolved.text,
+          ...(resolved.kind === 'work-order' ? { workOrder: resolved.order } : {}),
+          ...(deps.coordinatorShadowRoot ? { coordinatorShadowRoot: deps.coordinatorShadowRoot } : {}),
+          ...(deps.taskNow ? { now: deps.taskNow } : {}),
           ...(opts.project !== undefined && opts.target !== undefined ? { project: { id: opts.project, target: opts.target } } : {}),
           ...(opts.goal !== undefined ? { goal: opts.goal } : {}),
           ...(opts.milestone !== undefined ? { milestone: opts.milestone } : {}),

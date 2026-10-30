@@ -98,3 +98,16 @@ S: 골 저작기와 Pod 자식은 HQ의 private `seat-state` 파일을 읽지 �
 | 열차 사이드 gate | 같은 PR head의 통합·원격 gate 결과를 확인하는 대기열/receipt 장면 |
 | 운영 실물 | 운영 데이터·실제 사건을 입력으로 하는 대상별 기록; 공통 fixture는 만들지 않음 |
 | 로그 관측 | 지정 인스턴스에서 이벤트를 조회하고 실제 로그 필드·시간 창·상관 키를 확인하는 장면 |
+
+## UX simulation device index
+
+The UX simulation device catalog is [`src/ux-sim/mock-scenario-catalog.json`](../../src/ux-sim/mock-scenario-catalog.json). Its IDs use the `UX-MS-` prefix so they do not collide with the reusable verification scenes MS-01–05 defined above.
+
+```bash
+bun scripts/ux-sim.ts list
+bun scripts/ux-sim.ts show UX-MS-01
+```
+
+Each UX entry names the real implementation, focused tests, injected condition, observations, and expected verdict. The list includes child report deficit, release gate regression, review cap/no verdict, Pod credential failure, UI/gate stall, landing train rejection, and Pod pool/query error. The catalog contract test requires every runtime TypeScript module in `src/ux-sim/` to be indexed and checks that referenced files exist.
+
+The catalog is a reference index: `list` and `show` do not execute every entry through ScenarioV0. This run evidence contract applies only to an actual ScenarioV0 YAML execution in test mode: it generates a UUID `runId`, emits `ux.sim.scenario/completed` with that value in `data.runId`, verifies the row in `<test-state>/logs/logs.db`, and writes the same ID into a per-run evidence artifact. Missing persisted event evidence makes that run fail. Other script and test fixture roots remain discovery candidates; this catalog does not claim every repository fake or stub is reusable.

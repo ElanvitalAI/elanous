@@ -56,6 +56,7 @@ export interface ToolRuntimeContext {
    *  supported (e.g. streaming fetch, long-running agent calls). */
   signal?: AbortSignal;
   /** Parent catalog and dispatcher inherited by an Agent runtime's child. */
+  parentSessionId?: string;
   agentHostTools?: LLMToolSpec[];
   /** Host-selected working directory for an Agent spawned through MCP. */
   agentCwd?: string;

@@ -167,11 +167,17 @@ test('generated Pod shell measures a real merged head/main tree and emits parsea
     mkdirSync(bin);
     writeFileSync(join(bin, 'bun'), '#!/bin/sh\ncase "$1" in\n  install) exit 0;;\n  scripts/ci-typecheck-changed.ts) echo "[tsc-gate] root-plan {\\"mode\\":\\"affected\\",\\"roots\\":2,\\"promoted\\":false,\\"reason\\":null}"; exit 0;;\n  bin/elanous.mjs) exit 0;;\nesac\nexit 3\n');
     chmodSync(join(bin, 'bun'), 0o755);
+    // The production command runs `bash -lc` (login shell); a host profile that rewrites PATH would
+    // drop the fake-bin injection. Pin HOME to a fixture home whose .bash_profile re-prepends it,
+    // after /etc/profile, so the fake `bun` stays first in PATH on every host.
+    const home = join(root, 'fixture-home');
+    mkdirSync(home);
+    writeFileSync(join(home, '.bash_profile'), `export PATH="${bin}:$PATH"\n`);
     let output = '';
     const parsed = await runLandingPodShadowJob({ head: sourceHead, main: sourceMain }, {
       runPod: async (options) => {
         const result = spawnSync(options.command[0]!, options.command.slice(1), {
-          cwd: shallow, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+          cwd: shallow, encoding: 'utf8', env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH ?? ''}` },
         });
         output = result.stdout;
         expect(result.status).toBe(0);

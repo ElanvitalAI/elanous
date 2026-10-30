@@ -12,7 +12,7 @@
 // 판독(CLI 쪽): `describePtyRunState` 가 행 ⊕ 설치본 기록 ⊕ (체크아웃이면) 그 뿌리의 HEAD 로 판정한다.
 
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +30,7 @@ import {
   updatePtyManifestAbortRequested, updatePtyManifestBuild, updatePtyManifestProgress, updatePtyManifestTurn,
   type PtyBuildIdentity, type PtyManifestRow, type PtyTurnState,
 } from './pty-manifest.js';
+import { ptyEventLogDbPath, readPtyEventsAfterAt } from './pty-event-log.js';
 
 const CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -496,6 +497,139 @@ export function judgeTurnProgress(input: TurnProgressInput): TurnProgressJudgmen
   return 'progressing';
 }
 
+// ── TUI-SEAT-PILOT-2H-COMPARE — 좌석 대조 판정 신호 한 줄 ──
+//
+// 완료 경계는 «실행 명령·runId·시작/끝 시각·두 표면의 원장 행·산출 바이트·오류 수·결과» 를
+// `seat-state/OP/tools/sim-log.sh` 한 줄로 남기라고 한다. 그 한 줄의 «형식» 은 순수 함수가 정하고,
+// 두 표면의 원장 행은 각자의 생산 원장에서 읽는다 — tui-run-state 는 pty_manifest 행, pty-event-log 는
+// `pty_events` 의 그 표면 행이다. ⛔ 재지 못한 항목은 «미측정» 으로 남긴다 — 측정된 `0` 과 섞지 않는다(null ≠ 0).
+
+/** 재지 못한 항목의 직렬화 값. 측정된 `0`·빈 문자열과 구별된다. */
+export const SEAT_COMPARE_UNMEASURED = '미측정';
+
+/** 한 표면의 원장 요약. `rows === null` 은 «못 읽었다» 이지 «0행» 이 아니다. */
+export interface SeatCompareLedgerSummary {
+  readonly surface: string;
+  readonly rows: number | null;
+  readonly lastSeq: number | null;
+  readonly lastState: string | null;
+}
+
+/** 판정 신호 입력 — 완료 경계가 이름으로 요구한 항목 그대로. */
+export interface SeatCompareSignalInput {
+  readonly runId: string | null;
+  readonly command: string | null;
+  readonly startedAt: number | null;
+  readonly endedAt: number | null;
+  /** 이 TUI 좌석 표면의 원장 행 요약(pty_manifest 턴 행). */
+  readonly tuiRunState: SeatCompareLedgerSummary;
+  /** 비교 상대 표면의 원장 행 요약(`pty_events`). */
+  readonly ptyEventLog: SeatCompareLedgerSummary;
+  readonly outputBytes: number | null;
+  readonly errors: number | null;
+  readonly result: string | null;
+}
+
+function seatCompareText(value: string | null | undefined): string {
+  if (value === null || value === undefined) return SEAT_COMPARE_UNMEASURED;
+  // 한 줄 계약 — 값 안의 개행·연속 공백은 접어서 줄을 쪼개지 못하게 한다.
+  const flat = value.replace(/\s+/g, ' ').trim();
+  return flat.length > 0 ? flat : SEAT_COMPARE_UNMEASURED;
+}
+
+function seatCompareCount(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return SEAT_COMPARE_UNMEASURED;
+  return String(value);
+}
+
+function seatCompareAt(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms)) return SEAT_COMPARE_UNMEASURED;
+  return new Date(ms).toISOString();
+}
+
+function seatCompareLedger(summary: SeatCompareLedgerSummary): string {
+  return [
+    `ledger:${seatCompareText(summary.surface)}`,
+    `rows=${seatCompareCount(summary.rows)}`,
+    `lastSeq=${seatCompareCount(summary.lastSeq)}`,
+    `lastState=${seatCompareText(summary.lastState)}`,
+  ].join(' ');
+}
+
+/** 판정 신호 한 줄 — 새 줄 없이 ` · ` 로 잇는다. 못 잰 항목은 «미측정» 으로 남는다. */
+export function buildSeatCompareSignalLine(input: SeatCompareSignalInput): string {
+  return [
+    `run=${seatCompareText(input.runId)}`,
+    `cmd=${seatCompareText(input.command)}`,
+    `start=${seatCompareAt(input.startedAt)}`,
+    `end=${seatCompareAt(input.endedAt)}`,
+    seatCompareLedger(input.tuiRunState),
+    seatCompareLedger(input.ptyEventLog),
+    `bytes=${seatCompareCount(input.outputBytes)}`,
+    `errors=${seatCompareCount(input.errors)}`,
+    `result=${seatCompareText(input.result)}`,
+  ].join(' · ');
+}
+
+/** 생산 이음매 — `pty_events` 원장에서 이 표면의 행을 실제로 읽어 요약한다. 못 읽으면 rows=null(미측정). */
+export function readPtyEventLogLedger(surfaceId: string, dbPath: string = ptyEventLogDbPath()): SeatCompareLedgerSummary {
+  const surface = 'pty-event-log';
+  const read = readPtyEventsAfterAt(dbPath, 0, { surfaceId });
+  if (read.status !== 'ok') return { surface, rows: null, lastSeq: null, lastState: null };
+  const last = read.rows.length > 0 ? read.rows[read.rows.length - 1] : undefined;
+  return { surface, rows: read.rows.length, lastSeq: last ? last.seq : 0, lastState: last?.state ?? null };
+}
+
+/** 기본 기록 위치 — 셸 도구와 같은 파일(`seat-state/OP/tools/sim-log.log`). `ELANOUS_SEAT_COMPARE_LOG` 로 바꾼다. */
+export const SEAT_COMPARE_LOG_PATH = join(CODE_ROOT, 'seat-state', 'OP', 'tools', 'sim-log.log');
+
+export interface SeatCompareWriteDeps {
+  readonly path?: string;
+  /** append 이음매 — 시험이 임시 파일·메모리로 바꾼다. */
+  readonly append?: (path: string, line: string) => void;
+}
+
+/** 판정 신호 한 줄을 sim-log 에 append 한다. 실패(권한 등)는 false — 종료 경로를 깨지 않는다. */
+export function appendSeatCompareSignalLine(line: string, deps: SeatCompareWriteDeps = {}): boolean {
+  const path = deps.path ?? (process.env.ELANOUS_SEAT_COMPARE_LOG?.trim() || SEAT_COMPARE_LOG_PATH);
+  try {
+    if (deps.append) {
+      deps.append(path, line);
+    } else {
+      mkdirSync(dirname(path), { recursive: true });
+      appendFileSync(path, `${line}\n`, 'utf8');
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 생산 진입점 스위치 — `ELANOUS_SEAT_COMPARE_RUN_ID` 가 있을 때만 좌석 대조 원장을 켠다.
+ * 없으면 `null` = 녹음기가 그 한 줄을 안 남긴다(«미실행은 미측정»).
+ */
+export function seatCompareDepsFromEnv(env: NodeJS.ProcessEnv = process.env): TuiSeatCompareDeps | null {
+  const runId = env.ELANOUS_SEAT_COMPARE_RUN_ID?.trim();
+  if (!runId) return null;
+  const command = env.ELANOUS_SEAT_COMPARE_COMMAND?.trim() || [process.execPath, ...process.argv.slice(1)].join(' ');
+  return { runId, command };
+}
+
+/** 좌석 대조 판정 신호를 켜는 손잡이 — 주면 녹음기 종료 경로가 두 표면 원장을 읽어 한 줄을 남긴다. */
+export interface TuiSeatCompareDeps {
+  readonly runId: string | null;
+  readonly command?: string | null;
+  /** 산출 바이트 — 녹음기가 못 재면 생략(«미측정»). */
+  readonly outputBytes?: number | null;
+  /** 결과 판정 문구 — 생략하면 종료 시 마지막 턴 상태. */
+  readonly result?: string | null;
+  /** 원장 요약 읽기 이음매(시험: 가짜 원장). 생략하면 실 `pty_events`. */
+  readonly readLedger?: (surfaceId: string) => SeatCompareLedgerSummary;
+  /** 기록 이음매(시험: 메모리). 생략하면 sim-log 파일 append. */
+  readonly write?: (line: string) => boolean;
+}
+
 // ── 기록(TUI) ──
 
 export interface TuiRunStateRecorderDeps {
@@ -524,6 +658,11 @@ export interface TuiRunStateRecorderDeps {
    * 생략하면 감시를 안 건다 — 이 축을 켜는 것은 호출자(생산 진입점)의 결정이다.
    */
   readonly selfRestart?: TuiSelfRestartDeps;
+  /**
+   * TUI-SEAT-PILOT-2H-COMPARE 좌석 대조 판정 신호. 주면 종료 경로가 두 표면(pty_manifest 턴 행 ⊕
+   * `pty_events`)의 원장행을 읽어 «한 줄» 을 sim-log 에 남긴다. 생략하면 아무것도 안 남긴다(미실행=미측정).
+   */
+  readonly seatCompare?: TuiSeatCompareDeps;
 }
 
 interface ActiveRecorder {
@@ -550,9 +689,29 @@ const defaultLog = (event: string, data: Record<string, unknown>): void => { deb
 export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRecorderDeps = {}): () => void {
   const now = deps.now ?? Date.now;
   const log = deps.log ?? defaultLog;
-  const writeTurn = deps.writeTurn ?? updatePtyManifestTurn;
+  const writeTurnBase = deps.writeTurn ?? updatePtyManifestTurn;
   const writeProgress = deps.writeProgress ?? updatePtyManifestProgress;
   const writeAbortRequested = deps.writeAbortRequested ?? updatePtyManifestAbortRequested;
+  // 좌석 대조 신호가 켜졌을 때만 턴 행 수·쓰기 실패를 센다 — 꺼져 있으면 판정 신호 비용 0.
+  const seatCompare = deps.seatCompare ?? null;
+  // 시작 시각도 신호가 켜졌을 때만 잰다 — 꺼져 있으면 종전과 같이 now() 를 한 번도 더 부르지 않는다.
+  const seatCompareStartedAt = seatCompare ? now() : 0;
+  let seatCompareTurnRows = 0;
+  let seatCompareWriteFailures = 0;
+  const writeTurn = seatCompare
+    ? (id: string, turn: PtyTurnState, at: number): boolean => {
+      let ok = false;
+      try {
+        ok = writeTurnBase(id, turn, at);
+      } catch (error) {
+        seatCompareWriteFailures += 1;
+        throw error;
+      }
+      if (ok) seatCompareTurnRows += 1;
+      else seatCompareWriteFailures += 1;
+      return ok;
+    }
+    : writeTurnBase;
   // 기본 신고기는 기본 manifest 쓰기와 짝일 때만. writeTurn 주입(시험)은 herdr 를 안 만든다.
   const herdr = deps.herdr !== undefined
     ? deps.herdr
@@ -564,6 +723,7 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
   if (build) {
     const ok = (() => { try { return (deps.writeBuild ?? updatePtyManifestBuild)(surfaceId, build); } catch { return false; } })();
     log(ok ? 'build-recorded' : 'build-write-failed', { ptyId: surfaceId, sha: build.sha, version: build.version, source: build.source });
+    if (!ok) seatCompareWriteFailures += 1;
   }
   // 기동 순서: 판 → manifest 초기 idle → herdr 신고. herdr start 가 idle 을 신고하므로 초기 idle 을 turn 으로 다시 안 보낸다.
   const recorder: ActiveRecorder = { surfaceId, now, writeTurn, writeProgress, writeAbortRequested, log, herdr, herdrLast: herdr ? 'idle' : undefined };
@@ -662,6 +822,32 @@ export function startTuiRunStateRecorder(surfaceId: string, deps: TuiRunStateRec
     try { unwatch(); } catch { /* 종료 경로를 깨지 않는다 */ }
     try { unguard(); } catch { /* 종료 경로를 깨지 않는다 */ }
     if (herdr) { try { herdr.release(); } catch { /* 종료 경로를 깨지 않는다 */ } }
+    // 좌석 대조 판정 신호 — 두 표면의 원장 행을 «여기서» 읽어 한 줄로 남긴다.
+    if (seatCompare) {
+      try {
+        const readLedger = seatCompare.readLedger ?? readPtyEventLogLedger;
+        const line = buildSeatCompareSignalLine({
+          runId: seatCompare.runId,
+          command: seatCompare.command ?? null,
+          startedAt: seatCompareStartedAt,
+          endedAt: now(),
+          tuiRunState: {
+            surface: 'tui-run-state',
+            rows: seatCompareTurnRows,
+            lastSeq: null,
+            lastState: recorder.last ?? null,
+          },
+          ptyEventLog: readLedger(surfaceId),
+          outputBytes: seatCompare.outputBytes ?? null,
+          errors: seatCompareWriteFailures,
+          result: seatCompare.result ?? recorder.last ?? null,
+        });
+        const written = (seatCompare.write ?? appendSeatCompareSignalLine)(line);
+        log(written ? 'seat-compare-signal' : 'seat-compare-signal-write-failed', { ptyId: surfaceId, line });
+      } catch (error) {
+        log('seat-compare-signal-failed', { ptyId: surfaceId, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     if (active === recorder) active = null;
   };
 }

@@ -18,6 +18,7 @@ export interface ResearchGapFollowupInput {
   request: string;
   questions: readonly BloomResearchQuestion[];
   evidence: readonly ResearchEvidenceEnvelope[];
+  signal?: AbortSignal;
   /** Optional remaining time supplied by the owning turn; omitted uses the fixed 2-minute cap. */
   remainingBudgetMs?: number;
   roundsUsed?: number;
@@ -128,6 +129,7 @@ export async function runGapFollowup(
   deps: ResearchGapFollowupDeps = {},
 ): Promise<ResearchGapFollowupResult> {
   const plan = planGapFollowup(input);
+  if (input.signal?.aborted) return { ...plan, followupEvidence: [], discoveryCards: [] };
   const startedAt = (deps.now ?? Date.now)();
   const deadline = startedAt + plan.timeBudgetMs;
   const discover = async (failedQuestions: ReadonlySet<string>): Promise<{ cards: string[]; evidence: ResearchEvidenceEnvelope[] }> => {
@@ -139,6 +141,9 @@ export async function runGapFollowup(
       const remainingMs = deadline - (deps.now ?? Date.now)();
       if (remainingMs <= 0) break;
       const controller = new AbortController();
+      const abortFromParent = () => controller.abort(input.signal?.reason);
+      input.signal?.addEventListener('abort', abortFromParent, { once: true });
+      if (input.signal?.aborted) abortFromParent();
       const timer = setTimeout(() => controller.abort(new Error('plugin discovery time budget exhausted')),
         Math.min(10_000, remainingMs));
       try {
@@ -158,7 +163,10 @@ export async function runGapFollowup(
           questionId: gap.questionId, reason: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160),
         }, { level: 'warn' });
       }
-      finally { clearTimeout(timer); }
+      finally {
+        clearTimeout(timer);
+        input.signal?.removeEventListener('abort', abortFromParent);
+      }
     }
     return { cards, evidence };
   };
@@ -168,6 +176,9 @@ export async function runGapFollowup(
   }
 
   const controller = new AbortController();
+  const abortFromParent = () => controller.abort(input.signal?.reason);
+  input.signal?.addEventListener('abort', abortFromParent, { once: true });
+  if (input.signal?.aborted) abortFromParent();
   const timer = setTimeout(() => controller.abort(new Error('research gap follow-up time budget exhausted')),
     Math.max(1, deadline - (deps.now ?? Date.now)()));
   try {
@@ -200,6 +211,7 @@ export async function runGapFollowup(
     return { ...plan, followupEvidence: [...outcomes, ...discovered.evidence], discoveryCards: discovered.cards };
   } finally {
     clearTimeout(timer);
+    input.signal?.removeEventListener('abort', abortFromParent);
   }
 }
 

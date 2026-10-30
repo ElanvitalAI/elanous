@@ -24,6 +24,7 @@
 // Reference: https://docs.x.ai/docs/guides/tools/overview
 
 import { getGrokApiKey, refreshKeyFromCache } from '../config.js';
+import { resolveFreshGrokCredential } from './credential.js';
 import { debug } from '../debug/log.js';
 
 /** Agent Tools API endpoint (distinct from GROK_API_URL=chat/completions). */
@@ -58,6 +59,10 @@ export interface GrokAgentSearchOpts {
   /** Subscription proxy endpoint and required CLI headers. Omit for the metered xAI API. */
   baseUrl?: string;
   headers?: Record<string, string>;
+  /** Opt-in credential order for search callers; unset preserves the direct API-key behavior. */
+  credentialPreference?: 'api_key';
+  /** Model used only when resolving a fallback subscription credential. */
+  credentialModel?: string;
 }
 
 export interface GrokCitation {
@@ -89,7 +94,11 @@ export async function grokAgentSearch(
   query: string,
   opts: GrokAgentSearchOpts = {},
 ): Promise<GrokAgentSearchResult> {
-  const apiKey = opts.apiKey ?? getGrokApiKey();
+  const credential = opts.credentialPreference
+    ? resolveFreshGrokCredential({ prefer: opts.credentialPreference, ...(opts.credentialModel ? { model: opts.credentialModel } : {}) })
+    : null;
+  if (credential) debug.log('grok.agent-search', 'credential-selected', { kind: credential.kind, source: credential.source });
+  const apiKey = opts.apiKey ?? credential?.token ?? getGrokApiKey();
   if (!apiKey) return { ok: false, status: 0, text: '', citations: [], error: 'missing-api-key' };
 
   const fetchImpl = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike);
@@ -109,13 +118,14 @@ export async function grokAgentSearch(
 
   let res: Response;
   try {
-    const endpoint = opts.baseUrl
-      ? `${opts.baseUrl.replace(/\/$/, '').replace(/\/responses$/, '')}/responses`
+    const baseUrl = opts.baseUrl ?? credential?.baseUrl;
+    const endpoint = baseUrl
+      ? `${baseUrl.replace(/\/$/, '').replace(/\/responses$/, '')}/responses`
       : GROK_RESPONSES_URL;
     res = await fetchImpl(endpoint, {
       method: 'POST',
       signal: ac.signal,
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}`, ...opts.headers },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}`, ...credential?.headers, ...opts.headers },
       body: JSON.stringify({
         model,
         input,

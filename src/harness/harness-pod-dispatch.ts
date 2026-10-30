@@ -107,7 +107,29 @@ export function podOrchestrateArgs(input: HarnessPodDispatchInput, goalFile: str
   ];
 }
 
-type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => number | null; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn; onOutput?: (text: string) => void; recordRunLedgerEntry?: typeof appendRunLedgerEntry; nowMs?: number };
+type PodDispatchExitObservation = {
+  status: number | null;
+  parentSignalReceived: NodeJS.Signals | null;
+  parentSignalReceivedAt: string | null;
+  parentSignalLastReceived?: NodeJS.Signals | null;
+  parentSignalLastReceivedAt?: string | null;
+  signalDelivery: 'requested' | 'child-not-running' | 'kill-failed' | null;
+  signalDeliveryFor?: NodeJS.Signals | null;
+  orchestratorProcessSignal: NodeJS.Signals | null;
+  observedAt: string;
+};
+type PodDispatchRunResult = number | null | PodDispatchExitObservation;
+type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => PodDispatchRunResult; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn; onOutput?: (text: string) => void; recordRunLedgerEntry?: typeof appendRunLedgerEntry; nowMs?: number };
+
+export function classifyPodDispatchSignalSource(observation: Pick<PodDispatchExitObservation, 'parentSignalReceived' | 'signalDelivery' | 'orchestratorProcessSignal' | 'status'> & Partial<Pick<PodDispatchExitObservation, 'parentSignalLastReceived' | 'signalDeliveryFor'>>): 'parent-signal-forward-requested' | 'orchestrator-process-signaled' | 'unknown-143' | 'unknown-signal-exit' | 'non-signal-exit' {
+  const lastSignal = observation.parentSignalLastReceived ?? observation.parentSignalReceived;
+  const deliveryFor = observation.signalDeliveryFor ?? lastSignal;
+  if (lastSignal && observation.signalDelivery === 'requested' && deliveryFor === lastSignal) return 'parent-signal-forward-requested';
+  if (observation.orchestratorProcessSignal) return 'orchestrator-process-signaled';
+  if (observation.status === 143) return 'unknown-143';
+  if (observation.status === 130 || observation.status === null) return 'unknown-signal-exit';
+  return 'non-signal-exit';
+}
 
 /** Default Pod source clones origin HEAD. Never infer its file occupation from an unrelated worktree. */
 function defaultPodSourceHeadAt(root: string): string | undefined {
@@ -294,39 +316,83 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     childLlmProvider: input.childLlmProvider ?? null, childLlmModel: input.childLlmModel ?? null,
     goalChars, ...(input.entrance === 'cli-harness-ask' ? { goalPath: input.input } : {}),
   });
-  const run = deps.run ?? ((cmd: string, a: readonly string[], childEnv: NodeJS.ProcessEnv) => new Promise<number>((resolveStatus) => {
+  const run = deps.run ?? ((cmd: string, a: readonly string[], childEnv: NodeJS.ProcessEnv) => new Promise<PodDispatchExitObservation>((resolveStatus) => {
     const ownsOutput = Boolean(deps.onOutput);
     const child = (deps.spawnChild ?? spawn)(cmd, [...a], {
-      stdio: ownsOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit',
-      env: childEnv,
+      stdio: ownsOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit', env: childEnv,
     });
     child.stdout?.setEncoding('utf8');
     child.stdout?.on('data', (chunk: string) => { process.stdout.write(chunk); deps.onOutput?.(chunk); });
     if (ownsOutput) forwardChildStderr(child.stderr);
-    let forwarded: NodeJS.Signals | undefined;
+    let parentSignalReceived: NodeJS.Signals | undefined;
+    let parentSignalReceivedAt: string | undefined;
+    let parentSignalLastReceived: NodeJS.Signals | undefined;
+    let parentSignalLastReceivedAt: string | undefined;
+    let signalDelivery: PodDispatchExitObservation['signalDelivery'];
+    let signalDeliveryFor: NodeJS.Signals | undefined;
     const forward = (signal: NodeJS.Signals) => {
-      forwarded = signal;
-      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+      const receivedAt = new Date().toISOString();
+      parentSignalReceived ??= signal;
+      parentSignalReceivedAt ??= receivedAt;
+      parentSignalLastReceived = signal;
+      parentSignalLastReceivedAt = receivedAt;
+      signalDeliveryFor = signal;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        signalDelivery = 'child-not-running';
+        return;
+      }
+      try { signalDelivery = child.kill(signal) ? 'requested' : 'kill-failed'; }
+      catch { signalDelivery = 'kill-failed'; }
     };
     const onTerm = () => forward('SIGTERM');
     const onInt = () => forward('SIGINT');
     process.on('SIGTERM', onTerm);
     process.on('SIGINT', onInt);
     const cleanup = () => { process.off('SIGTERM', onTerm); process.off('SIGINT', onInt); };
-    child.once('error', () => { cleanup(); resolveStatus(1); });
-    child.once('close', (code, signal) => { cleanup(); resolveStatus(code ?? ((signal ?? forwarded) === 'SIGINT' ? 130 : 143)); });
+    child.once('error', () => {
+      cleanup();
+      resolveStatus({ status: 1, parentSignalReceived: parentSignalReceived ?? null, parentSignalReceivedAt: parentSignalReceivedAt ?? null,
+        parentSignalLastReceived: parentSignalLastReceived ?? null, parentSignalLastReceivedAt: parentSignalLastReceivedAt ?? null,
+        signalDelivery: signalDelivery ?? null, signalDeliveryFor: signalDeliveryFor ?? null,
+        orchestratorProcessSignal: null, observedAt: new Date().toISOString() });
+    });
+    child.once('close', (code, signal) => {
+      cleanup();
+      resolveStatus({
+        status: code ?? ((signal ?? parentSignalReceived) === 'SIGINT' ? 130 : 143),
+        parentSignalReceived: parentSignalReceived ?? null,
+        parentSignalReceivedAt: parentSignalReceivedAt ?? null,
+        parentSignalLastReceived: parentSignalLastReceived ?? null,
+        parentSignalLastReceivedAt: parentSignalLastReceivedAt ?? null,
+        signalDelivery: signalDelivery ?? null,
+        signalDeliveryFor: signalDeliveryFor ?? null,
+        orchestratorProcessSignal: signal ?? null,
+        observedAt: new Date().toISOString(),
+      });
+    });
   }));
+  const recordExit = (result: PodDispatchRunResult): number => {
+    const observation = typeof result === 'number' || result === null
+      ? { status: result, parentSignalReceived: null, parentSignalReceivedAt: null, parentSignalLastReceived: null, parentSignalLastReceivedAt: null,
+        signalDelivery: null, signalDeliveryFor: null, orchestratorProcessSignal: null, observedAt: new Date().toISOString() }
+      : result;
+    debug.log('harness.substrate', 'dispatch-pod-exit', {
+      entrance: input.entrance,
+      reporterSeat: input.seat ?? process.env.ELANOUS_HARNESS_SEAT ?? null,
+      reporterCommand: input.entrance === 'cli-harness-ask' ? 'harness ask' : 'harness say',
+      ...observation, signalSource: classifyPodDispatchSignalSource(observation),
+    });
+    return observation.status ?? 1;
+  };
   const cleanup = () => { if (tempDir) rmSync(tempDir, { recursive: true, force: true }); };
   try {
     const status = run(process.execPath, args, env);
-    if (typeof status === 'number' || status === null) {
+    if (typeof status === 'number' || status === null || !('then' in status)) {
       cleanup();
-      debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status });
-      return status ?? 1;
+      return recordExit(status);
     }
-    return status.then((code) => {
-      debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status: code });
-      return code;
+    return status.then((result) => {
+      return recordExit(result);
     }).finally(cleanup);
   } catch (error) {
     cleanup();

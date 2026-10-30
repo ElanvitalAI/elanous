@@ -1,4 +1,8 @@
 import { describe, it, expect } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setResearchArchiveDir } from './store.js';
 import type { SkillManifest } from '../skills/runner.js';
 import {
   withResearchIsolation,
@@ -7,6 +11,7 @@ import {
   researchOutcomeFromSkillRun,
   invokeResearch,
   setResearchInvoker,
+  setResearchSkillExecutorForTest,
 } from './invoke.js';
 
 const mf = (over: Partial<SkillManifest> = {}): SkillManifest =>
@@ -72,6 +77,30 @@ describe('invokeResearch cancellation', () => {
       expect(received).toBe(controller.signal);
     } finally {
       setResearchInvoker(null);
+    }
+  });
+});
+
+describe('invokeResearch selected skill root', () => {
+  it('parses the canonical skill from the selected index root without calling an LLM', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'research-skill-root-'));
+    setResearchArchiveDir(join(root, 'archive'));
+    mkdirSync(join(root, 'kr-flow'));
+    writeFileSync(join(root, 'kr-flow', 'SKILL.md'), '---\nname: kr-flow\ndescription: fixture\n---\nbody\n');
+    let executedName = '';
+    setResearchSkillExecutorForTest(async (manifest, args) => {
+      executedName = manifest.name;
+      expect(args).toBe('mock replay');
+      return { finalResponse: 'mock result' };
+    });
+    try {
+      const result = await invokeResearch('mock replay', { skill: 'kr-flow', skillRootDir: root });
+      expect(executedName).toBe('kr-flow');
+      expect(result).toMatchObject({ skill: 'kr-flow', ok: true, output: 'mock result' });
+    } finally {
+      setResearchSkillExecutorForTest(null);
+      setResearchArchiveDir(null);
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

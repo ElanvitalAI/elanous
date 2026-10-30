@@ -1,11 +1,12 @@
-// ── Grok 자격 해석 — ⭐ **구독(OAuth)이 언제나 1순위, API 키는 2순위** ──
+// ── Grok 자격 해석 — ⭐ 기본은 구독 1순위, 검색은 명시적으로 API 키 우선 ──
 //
 // 대표 지시 2026-08-13: *"엘라누스 안에서 grok 이 구독으로 도는 경우도 진행해야 합니다.
 // 구독이 있는 경우 api key 는 항상 2순위로 되게 해주세요."*
 //
-// ⛔ **왜 이 파일이 «하나»여야 하나** — elanous 에는 grok 이 나가는 경로가 둘이다:
+// ⛔ **왜 이 파일이 «하나»여야 하나** — elanous 에는 grok 이 나가는 경로가 여럿이다:
 //   ⑴ ACP 백엔드   `grok agent stdio` (자식 바이너리가 auth.json 을 직접 읽는다)
 //   ⑵ LLM 프로바이더 `streamChat` (elanous 가 Bearer 를 «직접» 실어 보낸다)
+//   ⑶ 검색          검색만 `prefer: 'api_key'` 로 비용 출처를 분리하고, 키가 없으면 구독으로 폴백한다
 // 예전엔 ⑴만 구독을 강제(env 스크럽)하고 ⑵는 무조건 API 키였다. 규칙이 갈리면
 // 「구독을 켰는데 지갑이 열리는」 사고가 난다. ⇒ 두 경로가 이 파일 하나를 읽는다.
 //
@@ -29,6 +30,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { keyFromCacheOrEnv } from '../config.js';
 
 /** 구독 프록시 베이스. ⛔ `api.x.ai` 가 «아니다** — 그쪽은 API 키(토큰 과금) 전용. */
 export const GROK_SUBSCRIPTION_BASE_URL = 'https://cli-chat-proxy.grok.com/v1';
@@ -312,10 +314,29 @@ function readGrokCredential(opts: {
   home?: string;
   model?: string;
   cliVersion?: string;
+  /** Search surfaces may prefer metered API credentials; all other callers retain subscription-first. */
+  prefer?: 'api_key';
   /** 구독을 «건너뛴다** — 401 을 맞은 뒤 호출자가 강등할 때만 쓴다. */
   skipSubscription?: boolean;
 } = {}): GrokCredential | null {
   const env = opts.env ?? process.env;
+
+  const readApiKey = (cacheFirst = false): GrokCredential | null => {
+    for (const name of ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'] as const) {
+      const useCache = cacheFirst && (!opts.env || opts.env === process.env);
+      const value = useCache ? keyFromCacheOrEnv(name) : env[name];
+      if (value && value.length > 0) {
+        const source = env[name] === value ? name : `${name.toLowerCase()}-cache`;
+        return { kind: 'api_key', baseUrl: GROK_API_BASE_URL, token: value, headers: {}, source };
+      }
+    }
+    return null;
+  };
+
+  if (opts.prefer === 'api_key') {
+    const apiKey = readApiKey(true);
+    if (apiKey) return apiKey;
+  }
 
   if (opts.skipSubscription !== true) {
     const sub = readSubscriptionToken(grokAuthFilePath(opts.home));
@@ -335,18 +356,12 @@ function readGrokCredential(opts: {
     }
   }
 
-  // 2순위 — API 키(토큰 과금). 이름 순서는 xAI 문서 관례를 따른다.
-  for (const name of ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'] as const) {
-    const value = env[name];
-    if (value && value.length > 0) {
-      return { kind: 'api_key', baseUrl: GROK_API_BASE_URL, token: value, headers: {}, source: name };
-    }
-  }
-  return null;
+  // Default callers keep subscription-first. Search surfaces opt into API-key-first above.
+  return readApiKey();
 }
 
 /** Read-only credential check for synchronous provider availability. Never refreshes or calls the network. */
-export function peekGrokCredential(opts: { home?: string; model?: string } = {}): GrokCredential | null {
+export function peekGrokCredential(opts: { home?: string; model?: string; prefer?: 'api_key' } = {}): GrokCredential | null {
   return readGrokCredential(opts);
 }
 
@@ -607,6 +622,8 @@ export interface ResolveFreshGrokOpts {
   model?: string;
   cliVersion?: string;
   skipSubscription?: boolean;
+  /** Search surfaces may prefer API-key billing; omitted callers remain subscription-first. */
+  prefer?: 'api_key';
   /** ⛔ 테스트 심 — 실 바이너리 없이 계약을 문다. */
   execImpl?: (cmd: string, args: string[], timeoutMs: number) => void;
   now?: () => number;

@@ -497,6 +497,86 @@ describe('explicit review attempt selection', () => {
   });
 });
 
+describe('official OP review waiver fixtures', () => {
+  const fixtureDir = join(import.meta.dir, 'fixtures/review-loop-breaker');
+  const cases = [
+    'opwaiver-32853-bd8f73595c83.json',
+    'opwaiver-33097-1cc85900413c.json',
+    'opwaiver-33106-972f31e4a3ca.json',
+    'opwaiver-32646-1694ccc7a170.json',
+    'opwaiver-33113-3ab51f05968f.json',
+  ];
+  const runFixture = (name: string, mutate?: (value: Record<string, unknown>) => void) => {
+    const selectedText = readFileSync(join(fixtureDir, name), 'utf8');
+    const selectedRecord = JSON.parse(selectedText) as Record<string, unknown>;
+    if (mutate) mutate(selectedRecord);
+    const text = JSON.stringify(selectedRecord);
+    const pr = Number(selectedRecord.pr);
+    const head = String(selectedRecord.head ?? selectedRecord.headCommit);
+    const selectedName = name;
+    const priorName = pr === 33097 ? 'pr-33097-1cc85900413c.json' : undefined;
+    const names = [selectedName, ...(priorName ? [priorName] : [])];
+    const selectedPath = `${STD_DIR}/${selectedName}`;
+    const evidencePath = '/evidence.json';
+    const evidence = JSON.stringify({ pr, head, reviewResult: selectedPath });
+    const run: CmdRunner = () => ({ ok: true, out: '', err: '' });
+    return verifyOverlapEvidence({
+      evidencePath, pr, expectedHead: head, remote: 'origin', branch: 'main', cwd: '/repo', run,
+      reviewResultsDir: STD_DIR, listDir: () => names, reviewMtime: (path) => path.endsWith(selectedName) ? 20 : 10,
+      reviewRealPath: (path) => path,
+      readFile: (path) => path === evidencePath ? evidence
+        : path === selectedPath ? text
+          : path.endsWith(priorName ?? '\0') ? readFileSync(join(fixtureDir, priorName!), 'utf8')
+            : (() => { throw new Error(`unexpected fixture read: ${path}`); })(),
+      overlappingLandings: ['abcdef1234567'],
+    });
+  };
+
+  test('replays copied OP adjudications but accepts only the fixture with linked same-head FAIL evidence', () => {
+    const sameHeadPair = 'opwaiver-33097-1cc85900413c.json';
+    expect(runFixture(sameHeadPair)).toMatchObject({ ok: true, mode: 'already-ancestor' });
+    for (const name of cases.filter((item) => item !== sameHeadPair)) {
+      expect(runFixture(name)).toMatchObject({ ok: false, reason: 'review-op-waiver-same-head-failure-missing' });
+    }
+  });
+
+  test('refuses an OP-waiver PASS without exact-head zero-fail test evidence or complete approved dispositions', () => {
+    const fixture = 'opwaiver-33097-1cc85900413c.json';
+    expect(runFixture(fixture, (value) => {
+      const waiver = value.waiver as Record<string, unknown>;
+      (waiver.headTestRun as Record<string, unknown>).sha = 'f'.repeat(40);
+    })).toMatchObject({ ok: false, reason: 'review-op-waiver-head-test-missing' });
+    expect(runFixture(fixture, (value) => {
+      const waiver = value.waiver as Record<string, unknown>;
+      (waiver.dispositions as Array<Record<string, unknown>>)[0]!.evidence = '';
+    })).toMatchObject({ ok: false, reason: 'review-op-waiver-disposition-invalid' });
+    expect(runFixture(fixture, (value) => {
+      const waiver = value.waiver as Record<string, unknown>;
+      waiver.approvedBy = '';
+    })).toMatchObject({ ok: false, reason: 'review-op-waiver-approval-missing' });
+  });
+
+  test('same-head OP waiver must name the failed review and disposition every finding', () => {
+    const fixture = 'opwaiver-33097-1cc85900413c.json';
+    expect(runFixture(fixture, (value) => {
+      const waiver = value.waiver as Record<string, unknown>;
+      waiver.adjudicates = 'a different failed review';
+    })).toMatchObject({ ok: false, reason: 'review-op-waiver-same-head-failure-missing' });
+    expect(runFixture(fixture, (value) => {
+      const waiver = value.waiver as Record<string, unknown>;
+      (waiver.dispositions as unknown[]).pop();
+    })).toMatchObject({ ok: false, reason: expect.stringContaining('review-attempt-not-superseded') });
+  });
+
+  test('adjudicated review names require an exact filename token', () => {
+    const pairFixture = 'opwaiver-33097-1cc85900413c.json';
+    expect(runFixture(pairFixture, (value) => {
+      const waiver = value.waiver as Record<string, unknown>;
+      waiver.adjudicates = 'old note pr-33097-1cc85900413c.json-unrelated-suffix';
+    })).toMatchObject({ ok: false, reason: 'review-op-waiver-same-head-failure-missing' });
+  });
+});
+
 describe('rebased overlap evidence (① re-base · ② re-gate · ③ review)', () => {
   const selectedName = `card-${PR}-${HEAD.slice(0, 12)}.json`;
   const selectedPath = `${STD_DIR}/${selectedName}`;

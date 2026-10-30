@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { runPodCommand, type RunPodCommandOptions, type PodCommandResult } from '../task-orchestrator/surfaces/pod-command-job.js';
 import { redactSecretText } from '../debug/log.js';
 import type { RootPlanSummary } from './pr-land-heavy-remote.js';
+import type { WarmReuseEvidence, WarmReuseEvidenceByConsumer } from '../task-orchestrator/surfaces/pod-warm-switch.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
 const MARKER = 'ELANOUS_PRLAND_SHADOW';
@@ -106,4 +107,63 @@ export async function runLandingPodShadowJob(input: LandingPodShadowInput, deps:
   const tscRc = Number(match[1]);
   const gateRc = Number(match[2]);
   return { measured: true, ok: tscRc === 0 && gateRc === 0, rootPlan, tscRc, gateRc, job: job.job };
+}
+
+/** WARM-REUSE-LAND-CONSUMER-WIRE — land shadow Job 결과 표본(착지쌍·lock·lease·카나리아·그림자 일치). */
+export interface LandingShadowSample {
+  /** shadow Job 이 잰 착지쌍 — 원격 게이트가 잰 head/main 와 정확히 같아야 표본으로 센다. */
+  head: string;
+  main: string;
+  /** shadow Job 이 돈 Pod generation lock — 원값 그대로 대조한다. */
+  lock: string;
+  /** shadow Job 이 lease 를 잡고 끝까지 쟀나. */
+  leaseValid: boolean;
+  /** shadow Job 카나리아(착지 tsc+gate) 통과. */
+  canaryPassed: boolean;
+  /** 같은 착지의 fresh(원격 게이트) 판정과 그림자 비교 일치 — 불일치 표본은 최근 mismatch 로 센다. */
+  agree: boolean;
+}
+
+/** land 소비자 판정 증거 입력 — 최근 창 표본 ⊕ 이번 착지가 기대하는 warm 워커 lock ⊕ 선행 소비자 증거. */
+export interface LandShadowSampleWindow {
+  /** 최근 창 — 마지막 원소가 가장 최근 shadow 결과다. */
+  samples: LandingShadowSample[];
+  /** 이번 착지가 기대하는 warm 워커 lock(현재 Pod generation). */
+  lock: string;
+  /** 선행 소비자(gate-recheck)의 자기 증거 — land 는 이 칸이 live 여야 live 가 될 수 있다(비면 off). */
+  gateRecheck?: WarmReuseEvidence;
+}
+
+/**
+ * WARM-REUSE-LAND-CONSUMER-WIRE — land shadow Job 결과에서 소비자('land') 판정 증거를 만든다.
+ * 판정 본체는 pod-warm-switch.ts `decideWarmReuse` — 이 모듈은 증거의 산지만 담당한다.
+ * 창이 없거나 비면 land 증거 칸이 비어 off 다 — 못 잰 증거는 통과가 아니다.
+ * 원값은 고쳐 읽지 않고 정확히 비교한다(신원 형식 어긋남은 pod-warm-switch 판정이 끊는다).
+ */
+export function buildLandWarmEvidence(
+  window: LandShadowSampleWindow | undefined,
+  expected: { head: string; main: string },
+): WarmReuseEvidenceByConsumer {
+  const evidence: WarmReuseEvidenceByConsumer = window?.gateRecheck ? { 'gate-recheck': window.gateRecheck } : {};
+  if (!window || window.samples.length === 0) return evidence;
+  const latest = window.samples[window.samples.length - 1]!;
+  let consecutiveMatchSamples = 0;
+  for (let index = window.samples.length - 1; index >= 0; index--) {
+    const sample = window.samples[index]!;
+    if (sample.head !== expected.head || sample.main !== expected.main || sample.lock !== window.lock
+      || sample.leaseValid !== true || sample.canaryPassed !== true || sample.agree !== true) break;
+    consecutiveMatchSamples++;
+  }
+  const recentMismatchCount = window.samples.filter((sample) => sample.agree === false).length;
+  return {
+    ...evidence,
+    land: {
+      consecutiveMatchSamples,
+      recentMismatchCount,
+      leaseValid: latest.leaseValid,
+      canaryPassed: latest.canaryPassed,
+      expected: { head: expected.head, main: expected.main, lock: window.lock },
+      worker: { head: latest.head, main: latest.main, lock: latest.lock },
+    },
+  };
 }

@@ -9,11 +9,22 @@ import {
   decomposeModel,
   parseSelfDevDecomposition,
   foldRegistrationOnlyGoals,
-  decomposeSelfDevGoal,
+  decomposeSelfDevGoal as decomposeSelfDevGoalImpl,
   FabricDecompositionRejectedError,
   inferHotPaths,
   SELF_DEV_DECOMPOSITION_FEATURE_MAX_LENGTH,
 } from './decompose.js';
+
+// Serialize the exact fake-model payload; fixture fields are explicit at call sites.
+function fixtureResponse(value: { subtasks: unknown[] }): string { return JSON.stringify(value); }
+
+const fixtureEvidence = {
+  completionBoundary: 'Fixture slice has an independently observable result.',
+  mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+  futureAssumptions: [],
+};
+
+const decomposeSelfDevGoal = decomposeSelfDevGoalImpl;
 
 describe('inferHotPaths (G6 · 결정론 hotPaths 추론)', () => {
   test('src/docs/scripts 경로 추출·dedup', () => {
@@ -76,6 +87,105 @@ describe('buildSelfDevDecomposePrompt', () => {
     expect(selfContainedIndex).toBeGreaterThanOrEqual(0);
     expect(defineFromWireIndex).toBeLessThan(selfContainedIndex);
     expect(p).toContain('dead-code');
+  });
+
+  test('requires each slice to declare a standalone boundary, mock scenario, explicit predecessors, and no future assumptions', () => {
+    const prompt = buildSelfDevDecomposePrompt('repair a multi-stage flow');
+
+    expect(prompt).toContain('completionBoundary');
+    expect(prompt).toContain('mockScenario.id');
+    expect(prompt).toContain('mockScenario.injection');
+    expect(prompt).toContain('mockScenario.observation');
+    expect(prompt).toContain('futureAssumptions');
+    expect(prompt).toContain('dependsOn');
+    expect(prompt).toContain('split it further or omit it');
+  });
+});
+
+describe('landable slice contract', () => {
+  const contract = (id: string, feature: string, dependsOn: string[] = []) => ({
+    id,
+    feature,
+    completionBoundary: `${feature} is independently observable in a focused test.`,
+    mockScenario: { id: 'MS-01', injection: 'inject the requested failure', observation: 'observe the expected recovery event' },
+    futureAssumptions: [],
+    dependsOn,
+  });
+
+  test.each([
+    {
+      id: '#32327 STOP-AUTOHEAL',
+      feature: 'Extend stop-autoheal classification and keep stop/run ledger behavior stable.',
+      slices: [contract('diagnose', 'Collect run-stop evidence into a doctor visit.'), contract('heal', 'Apply one eligible autoheal action.', ['diagnose'])],
+    },
+    {
+      id: '#32740 train-fleet policy',
+      feature: 'Validate host podPool identity, classify introduced tests, park repeated same-head failures, and expose the result through a read-only shadow CLI.',
+      slices: [contract('policy', 'Classify host and same-head retry decisions.'), contract('shadow-cli', 'Expose the policy decision in a read-only CLI.', ['policy'])],
+    },
+  ])('$id decomposes the original goal into independently evidenced slices', async ({ feature, slices }) => {
+    let prompt = '';
+    const result = await decomposeSelfDevGoalImpl(feature, {
+      llm: async (value) => { prompt = value; return JSON.stringify({ subtasks: slices }); },
+    });
+
+    expect(prompt).toContain(feature);
+    expect(result.goals).toHaveLength(2);
+    expect(result.goals[0]?.completionBoundary).toBe(slices[0]?.completionBoundary);
+    expect(result.goals[0]?.mockScenario).toEqual(slices[0]?.mockScenario);
+    expect(result.goals[1]?.completionBoundary).toBe(slices[1]?.completionBoundary);
+    expect(result.goals[1]?.mockScenario).toEqual(slices[1]?.mockScenario);
+    expect(result.goals[1]!.dependsOn).toEqual([slices[1]!.dependsOn[0]]);
+    expect(result.goals.every((goal) => goal.completionBoundary && goal.mockScenario?.injection && goal.mockScenario.observation)).toBe(true);
+  });
+
+  test('rejects future-dependent and incomplete slices with reason events and rejects their dependents', async () => {
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await decomposeSelfDevGoalImpl('a staged recovery flow', {
+        llm: async () => JSON.stringify({ subtasks: [
+          contract('base', 'Add a focused recovery decision.'),
+          { ...contract('future', 'Wire recovery after the future controller ships.'), futureAssumptions: ['future controller'] },
+          contract('consumer', 'Use the future recovery decision.', ['future']),
+          contract('future-proof', 'Add future-proof compatibility handling for the existing interface.'),
+          { id: 'missing', feature: 'Add an incomplete slice', futureAssumptions: [] },
+        ] }),
+      });
+
+      expect(result.goals.map(({ id }) => id)).toEqual(['base', 'future-proof']);
+      expect(result.decomposition.outcome).toBe('decomposed');
+      expect(events.filter(({ event }) => event === 'decompose.slice-rejected')).toHaveLength(3);
+      const rejected = events.filter(({ event }) => event === 'decompose.slice-rejected');
+      expect(rejected.map(({ data }) => data.sliceId)).toEqual(['future', 'missing', 'consumer']);
+      expect(rejected[0]?.data.reasons).toContain('future assumptions require split or omission');
+      expect(result.goals.map(({ id }) => id)).toContain('future-proof');
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
+  test('falls back to the original goal when every slice fails the contract', async () => {
+    const result = await decomposeSelfDevGoalImpl('keep the whole request intact', {
+      llm: async () => JSON.stringify({ subtasks: [{ id: 'future', feature: 'wire a later runtime component', futureAssumptions: ['later runtime'] }] }),
+    });
+
+    expect(result.goals).toEqual([{ id: '0', feature: 'keep the whole request intact' }]);
+    expect(result.decomposition.outcome).toBe('slice-rejected');
+  });
+
+  test('rejects a slice whose explicit empty dependsOn array is omitted', async () => {
+    const result = await decomposeSelfDevGoalImpl('an atomic flow', {
+      llm: async () => JSON.stringify({ subtasks: [{
+        id: 'atomic', feature: 'Implement one unit.', completionBoundary: 'Unit behavior is observable.',
+        mockScenario: { id: 'MS-01', injection: 'inject input', observation: 'observe output' }, futureAssumptions: [],
+      }] }),
+    });
+    expect(result.goals).toEqual([{ id: '0', feature: 'an atomic flow' }]);
+    expect(result.decomposition.outcome).toBe('slice-rejected');
   });
 });
 
@@ -140,9 +250,15 @@ describe('foldRegistrationOnlyGoals', () => {
   test('DOCTOR-RX-SLICE: partitions explicit parent targets and gives both children one-line completion criteria', async () => {
     const parentTargets = ['src/doctor/visit.ts', 'src/doctor/repair.ts'];
     const result = await decomposeSelfDevGoal(`too-big goal\n대상 경로: ${parentTargets.join(' · ')}`, {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
-        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
 
@@ -158,9 +274,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('partitions parent targets while preserving a helper explicitly declared in one child target line', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit' },
-        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -171,9 +293,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('partitions parent targets while preserving distinct helpers explicitly declared by each child', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/visit-helper.ts\nImplement visit' },
-        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts · src/doctor/repair-helper.ts\nImplement repair' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/visit-helper.ts\nImplement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts · src/doctor/repair-helper.ts\nImplement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -185,9 +313,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('keeps the original decomposition when both children explicitly target the same external helper', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit' },
-        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts · src/doctor/helper.ts\nImplement repair' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts · src/doctor/helper.ts\nImplement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -199,9 +333,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('keeps one completion criterion in the inferred partition branch', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\n완료 기준: visit check\n완료 기준: second visit check' },
-        { id: 'repair', feature: 'Implement repair' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\n완료 기준: visit check\n완료 기준: second visit check',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: 'Implement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.every((goal) => goal.feature.match(/^완료 기준: .+$/gm)?.length === 1)).toBe(true);
@@ -210,9 +350,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('splits two pathless implementation children into disjoint target paths with a check for each', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts\nImplement the two units', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: 'Implement the visit unit' },
-        { id: 'repair', feature: 'Implement the repair unit' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: 'Implement the visit unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: 'Implement the repair unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -226,9 +372,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('assigns named target paths by child intent even when model order is reversed', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'repair', feature: 'Implement the repair unit' },
-        { id: 'visit', feature: 'Implement the visit unit' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'repair', feature: 'Implement the repair unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'visit', feature: 'Implement the visit unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -238,9 +390,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('fills the other child when only the second child names a target', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'repair', feature: 'Implement unit two' },
-        { id: 'visit', feature: 'Implement visit' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'repair', feature: 'Implement unit two',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'visit', feature: 'Implement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -250,9 +408,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('balances four parent targets after respecting one named child', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts · src/doctor/report.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'repair', feature: 'Implement repair' },
-        { id: 'other', feature: 'Implement the remaining unit' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'repair', feature: 'Implement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'other', feature: 'Implement the remaining unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths?.length)).toEqual([2, 2]);
@@ -262,9 +426,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('keeps a unique three-to-one name ownership split without overlap', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts · src/doctor/report.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'main', feature: 'Implement visit, repair, and summary' },
-        { id: 'report', feature: 'Implement report' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'main', feature: 'Implement visit, repair, and summary',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'report', feature: 'Implement report',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -275,9 +445,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('keeps all parent paths once when there are more than two targets', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: 'Implement the visit unit' },
-        { id: 'repair', feature: 'Implement the repair unit' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: 'Implement the visit unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: 'Implement the repair unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     const paths = result.goals.flatMap((goal) => goal.hotPaths ?? []);
@@ -287,9 +463,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('normalizes repeated completion criteria to exactly one line', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\n완료 기준: first check\n완료 기준: second check' },
-        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\n완료 기준: repair check' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\n완료 기준: first check\n완료 기준: second check',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\n완료 기준: repair check',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
 
@@ -299,9 +481,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('keeps disjoint explicit child targets and adds one completion criterion to each', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
-        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -315,10 +503,16 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('gives the remaining parent target to the pathless child when its sibling declares one', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
+      llm: async () => fixtureResponse({ subtasks: [
         { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair',
-          hotPaths: ['src/doctor/repair.ts'] },
-        { id: 'visit', feature: 'Implement visit' },
+          hotPaths: ['src/doctor/repair.ts'],
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'visit', feature: 'Implement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -330,9 +524,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('preserves a sibling three-path declaration and assigns the fourth path once', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts · src/doctor/report.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'main', feature: '대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts\nImplement main' },
-        { id: 'report', feature: 'Implement report' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'main', feature: '대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts\nImplement main',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'report', feature: 'Implement report',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -344,9 +544,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('preserves a unique helper outside the parent targets while splitting the remaining target', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit' },
-        { id: 'repair', feature: 'Implement repair' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts · src/doctor/helper.ts\nImplement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: 'Implement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -358,9 +564,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('assigns every unclaimed parent path to the child without a target declaration', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts · src/doctor/summary.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
-        { id: 'other', feature: 'Implement the remaining unit' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'other', feature: 'Implement the remaining unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -371,9 +583,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('does not treat reporting as a filename hint for report.ts', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/report.ts · src/doctor/visit.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'reporting', feature: 'Implement reporting metrics' },
-        { id: 'report', feature: 'Implement report' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'reporting', feature: 'Implement reporting metrics',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'report', feature: 'Implement report',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -383,9 +601,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('treats a child hot path as ownership when no target line is present', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'repair', feature: 'Implement the first unit', hotPaths: ['src/doctor/repair.ts'] },
-        { id: 'visit', feature: 'Implement the second unit' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'repair', feature: 'Implement the first unit', hotPaths: ['src/doctor/repair.ts'],
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'visit', feature: 'Implement the second unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -396,9 +620,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('keeps original scope when both child descriptions claim the same file name', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'a', feature: 'Implement visit coordination' },
-        { id: 'b', feature: 'Implement visit repair flow' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'a', feature: 'Implement visit coordination',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'b', feature: 'Implement visit repair flow',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals.map((goal) => goal.hotPaths)).toEqual([
@@ -410,9 +640,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('does not give a child another file when it names its sibling declared target', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
-        { id: 'other', feature: 'Implement repair integration' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'other', feature: 'Implement repair integration',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals[1]?.feature).toContain('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts');
@@ -421,37 +657,37 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test.each([
     ['children only declare distinct parent targets', [
-      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit' },
-      { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair' },
+      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', completionBoundary: 'Visit result is observable.', mockScenario: { id: 'MS-01', injection: 'inject visit input', observation: 'observe visit output' }, futureAssumptions: [], dependsOn: [] },
+      { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair', completionBoundary: 'Repair result is observable.', mockScenario: { id: 'MS-02', injection: 'inject repair input', observation: 'observe repair output' }, futureAssumptions: [], dependsOn: [] },
     ]],
     ['children declare distinct targets and share a parent-external reference', [
-      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'] },
-      { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair', hotPaths: ['src/shared.ts'] },
+      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'], completionBoundary: 'Visit result is observable.', mockScenario: { id: 'MS-01', injection: 'inject visit input', observation: 'observe visit output' }, futureAssumptions: [], dependsOn: [] },
+      { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair', hotPaths: ['src/shared.ts'], completionBoundary: 'Repair result is observable.', mockScenario: { id: 'MS-02', injection: 'inject repair input', observation: 'observe repair output' }, futureAssumptions: [], dependsOn: [] },
     ]],
     ['one child declares its target and only that child has an external reference', [
-      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'] },
-      { id: 'repair', feature: 'Implement repair flow' },
+      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'], completionBoundary: 'Visit result is observable.', mockScenario: { id: 'MS-01', injection: 'inject visit input', observation: 'observe visit output' }, futureAssumptions: [], dependsOn: [] },
+      { id: 'repair', feature: 'Implement repair flow', completionBoundary: 'Repair result is observable.', mockScenario: { id: 'MS-02', injection: 'inject repair input', observation: 'observe repair output' }, futureAssumptions: [], dependsOn: [] },
     ]],
     ['one child declares its target and both children have different external references', [
-      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'] },
-      { id: 'repair', feature: 'Implement repair flow', hotPaths: ['docs/doctor/guide.md'] },
+      { id: 'visit', feature: '대상 경로: src/doctor/visit.ts\nImplement visit', hotPaths: ['src/shared.ts'], completionBoundary: 'Visit result is observable.', mockScenario: { id: 'MS-01', injection: 'inject visit input', observation: 'observe visit output' }, futureAssumptions: [], dependsOn: [] },
+      { id: 'repair', feature: 'Implement repair flow', hotPaths: ['docs/doctor/guide.md'], completionBoundary: 'Repair result is observable.', mockScenario: { id: 'MS-02', injection: 'inject repair input', observation: 'observe repair output' }, futureAssumptions: [], dependsOn: [] },
     ]],
     ['pathless children have one-sided external reference', [
-      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'] },
-      { id: 'repair', feature: 'Implement repair flow' },
+      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'], completionBoundary: 'Visit result is observable.', mockScenario: { id: 'MS-01', injection: 'inject visit input', observation: 'observe visit output' }, futureAssumptions: [], dependsOn: [] },
+      { id: 'repair', feature: 'Implement repair flow', completionBoundary: 'Repair result is observable.', mockScenario: { id: 'MS-02', injection: 'inject repair input', observation: 'observe repair output' }, futureAssumptions: [], dependsOn: [] },
     ]],
     ['pathless children have different external references', [
-      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'] },
-      { id: 'repair', feature: 'Implement repair flow', hotPaths: ['docs/doctor/guide.md'] },
+      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'], completionBoundary: 'Visit result is observable.', mockScenario: { id: 'MS-01', injection: 'inject visit input', observation: 'observe visit output' }, futureAssumptions: [], dependsOn: [] },
+      { id: 'repair', feature: 'Implement repair flow', hotPaths: ['docs/doctor/guide.md'], completionBoundary: 'Repair result is observable.', mockScenario: { id: 'MS-02', injection: 'inject repair input', observation: 'observe repair output' }, futureAssumptions: [], dependsOn: [] },
     ]],
     ['pathless children share only a parent-external reference', [
-      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'] },
-      { id: 'repair', feature: 'Implement repair', hotPaths: ['src/shared.ts'] },
+      { id: 'visit', feature: 'Implement visit', hotPaths: ['src/shared.ts'], completionBoundary: 'Visit result is observable.', mockScenario: { id: 'MS-01', injection: 'inject visit input', observation: 'observe visit output' }, futureAssumptions: [], dependsOn: [] },
+      { id: 'repair', feature: 'Implement repair', hotPaths: ['src/shared.ts'], completionBoundary: 'Repair result is observable.', mockScenario: { id: 'MS-02', injection: 'inject repair input', observation: 'observe repair output' }, futureAssumptions: [], dependsOn: [] },
     ]],
   ])('separates targets from shared parent-external references (%s)', async (_case, subtasks) => {
     const parentTargets = ['src/doctor/visit.ts', 'src/doctor/repair.ts'];
     const result = await decomposeSelfDevGoal(`대상 경로: ${parentTargets.join(' · ')}`, {
-      llm: async () => JSON.stringify({ subtasks }),
+      llm: async () => fixtureResponse({ subtasks }),
     });
     const childTargets = result.goals.map((goal) => goal.hotPaths ?? []);
     expect(result.goals).toHaveLength(2);
@@ -464,9 +700,15 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('does not split when a child names a parent path outside its target line', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
-        { id: 'visit', feature: 'Implement visit using src/doctor/repair.ts' },
-        { id: 'repair', feature: 'Implement repair' },
+      llm: async () => fixtureResponse({ subtasks: [
+        { id: 'visit', feature: 'Implement visit using src/doctor/repair.ts',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'repair', feature: 'Implement repair',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals[0]?.feature).toContain('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts');
@@ -475,10 +717,16 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('does not narrow a child whose declared hot paths include its sibling target', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/doctor/visit.ts · src/doctor/repair.ts', {
-      llm: async () => JSON.stringify({ subtasks: [
+      llm: async () => fixtureResponse({ subtasks: [
         { id: 'repair', feature: '대상 경로: src/doctor/repair.ts\nImplement repair',
-          hotPaths: ['src/doctor/visit.ts', 'src/doctor/repair.ts'] },
-        { id: 'visit', feature: 'Implement visit' },
+          hotPaths: ['src/doctor/visit.ts', 'src/doctor/repair.ts'],
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'visit', feature: 'Implement visit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       ] }),
     });
     expect(result.goals[0]?.hotPaths).toEqual(['src/doctor/visit.ts', 'src/doctor/repair.ts']);
@@ -487,10 +735,19 @@ describe('foldRegistrationOnlyGoals', () => {
 
   test('a decomposed child without paths inherits the parent card target paths in its ask and hot path fence', async () => {
     const result = await decomposeSelfDevGoal('대상 경로: src/alpha.ts · src/beta.ts\nImplement both units', {
-      llm: async () => JSON.stringify({ subtasks: [{ id: 'a', feature: 'Implement the first unit' },
-        { id: 'b', feature: '대상 경로: src/beta.ts\nEdit src/beta.ts', hotPaths: ['src/beta.ts'] },
+      llm: async () => fixtureResponse({ subtasks: [{ id: 'a', feature: 'Implement the first unit',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'b', feature: '대상 경로: src/beta.ts\nEdit src/beta.ts', hotPaths: ['src/beta.ts'],
+        ...fixtureEvidence,
+        dependsOn: []
+       },
         { id: 'c', feature: 'Read docs/goals/GOAL-parent.md and docs/reports/context.md, then implement the missing unit',
-          hotPaths: ['docs/goals/GOAL-parent.md', 'docs/reports/context.md'] }] }),
+          hotPaths: ['docs/goals/GOAL-parent.md', 'docs/reports/context.md'],
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }),
     });
     expect(result.goals[0]).toMatchObject({ hotPaths: ['src/alpha.ts', 'src/beta.ts'],
       feature: 'Implement the first unit\n대상 경로: src/alpha.ts · src/beta.ts' });
@@ -505,11 +762,18 @@ describe('foldRegistrationOnlyGoals', () => {
       events.push({ category, event, data });
     }) as typeof debug.log;
     try {
-      const result = await decomposeSelfDevGoal('add a handler', { llm: async () => JSON.stringify({ subtasks: [
-        { id: 'a', feature: 'Implement handler', hotPaths: ['src/nexus/api/foo.ts'] },
-        { id: 'b', feature: 'Register route', hotPaths: ['src/nexus/api/http-server.ts'], dependsOn: ['a'] },
+      const result = await decomposeSelfDevGoal('add a handler', { llm: async () => fixtureResponse({ subtasks: [
+        { id: 'a', feature: 'Implement handler', hotPaths: ['src/nexus/api/foo.ts'],
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'b', feature: 'Register route', hotPaths: ['src/nexus/api/http-server.ts'], dependsOn: ['a'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
       ] }) });
-      expect(result.goals).toEqual([{ id: 'a', feature: 'Implement handler\nAlso register: Register route', hotPaths: ['src/nexus/api/foo.ts', 'src/nexus/api/http-server.ts'] }]);
+    expect(result.goals).toMatchObject([{ id: 'a', feature: 'Implement handler\nAlso register: Register route', hotPaths: ['src/nexus/api/foo.ts', 'src/nexus/api/http-server.ts'], completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } }]);
       expect(events.filter(({ event }) => event === 'fold-registration')).toEqual([{
         category: 'self-dev.decompose', event: 'fold-registration',
         data: { from: 'b', into: 'a', files: ['src/nexus/api/http-server.ts'] },
@@ -541,13 +805,27 @@ describe('foldRegistrationOnlyGoals', () => {
     ['nested non-graph path', ['other/graphs/operate-loop.yaml'], ['a']],
   ])('does not fold %s', async (_reason, hotPaths, dependsOn) => {
     const subtasks = [
-      { id: 'a', feature: 'Handler', hotPaths: ['src/nexus/api/foo.ts'] },
-      { id: 'b', feature: 'Registration', hotPaths, dependsOn },
-      { id: 'd', feature: 'Second dependency', hotPaths: ['src/other.ts'] },
+      { id: 'a', feature: 'Handler', hotPaths: ['src/nexus/api/foo.ts'],
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'b', feature: 'Registration', hotPaths, dependsOn,
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
+      { id: 'd', feature: 'Second dependency', hotPaths: ['src/other.ts'],
+        ...fixtureEvidence,
+        dependsOn: []
+       },
     ];
     const result = await decomposeSelfDevGoal('ordinary decomposition', {
-      llm: async () => JSON.stringify({ subtasks }),
+      llm: async () => fixtureResponse({ subtasks }),
     });
+    if (dependsOn.includes('absent')) {
+      expect(foldRegistrationOnlyGoals(subtasks)).toEqual(subtasks);
+      return;
+    }
     expect(result.goals.map((goal) => goal.id)).toEqual(['a', 'b', 'd']);
     expect(result.goals[1]?.hotPaths).toEqual(hotPaths.length ? hotPaths : undefined);
     expect(result.goals[1]?.feature).toBe('Registration');
@@ -578,9 +856,16 @@ describe('foldRegistrationOnlyGoals', () => {
   });
 
   test('preserves ordinary decomposition unchanged', () => {
-    const goals = parseSelfDevDecomposition(JSON.stringify({ subtasks: [
-      { id: 'a', feature: 'Implement handler', hotPaths: ['src/nexus/api/foo.ts'] },
-      { id: 'b', feature: 'Implement service', hotPaths: ['src/nexus/api/bar.ts'], dependsOn: ['a'] },
+    const goals = parseSelfDevDecomposition(fixtureResponse({ subtasks: [
+      { id: 'a', feature: 'Implement handler', hotPaths: ['src/nexus/api/foo.ts'],
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'b', feature: 'Implement service', hotPaths: ['src/nexus/api/bar.ts'], dependsOn: ['a'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
     ] }));
     expect(foldRegistrationOnlyGoals(goals)).toEqual(goals);
   });
@@ -631,7 +916,14 @@ describe('deriveSelfDevArcsFromGrouping', () => {
 
 describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   test('returns the decomposed DAG from the llm seam', async () => {
-    const llm = async () => '{"subtasks":[{"id":"t","feature":"types"},{"id":"c","feature":"consumer","dependsOn":["t"]}]}';
+    const llm = async () => fixtureResponse({ subtasks: [{ id: 't', feature: 'types',
+        ...fixtureEvidence,
+        dependsOn: []
+       }, { id: 'c', feature: 'consumer', dependsOn: ['t'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       }] });
     const result = await decomposeSelfDevGoal('big feature', { llm });
     expect(result.goals.length).toBe(2);
     expect(result.goals[1]!.dependsOn).toEqual(['t']);
@@ -645,9 +937,12 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     }) as typeof debug.log;
     try {
       const result = await decomposeSelfDevGoal('default request', {
-        llm: async () => JSON.stringify({ subtasks: [{ id: 'default', feature: 'default goal' }] }),
+        llm: async () => fixtureResponse({ subtasks: [{ id: 'default', feature: 'default goal',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }),
       });
-      expect(result.goals).toEqual([{ id: 'default', feature: 'default goal' }]);
+      expect(result.goals).toMatchObject([{ id: 'default', feature: 'default goal', completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } }]);
       expect(events.filter(({ event }) => event === 'decomposition.decomposer-selection')).toEqual([
         { event: 'decomposition.decomposer-selection', data: { decomposer: 'default', goalId: null, goalIdStatus: 'unknown', runId: null } },
       ]);
@@ -754,7 +1049,10 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     let defaultCalls = 0;
     const result = await decomposeSelfDevGoal('fabric request', {
       decomposer: 'fabric',
-      llm: async () => { defaultCalls++; return JSON.stringify({ subtasks: [{ id: 'default', feature: 'must not run' }] }); },
+      llm: async () => { defaultCalls++; return fixtureResponse({ subtasks: [{ id: 'default', feature: 'must not run',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }); },
       fabric: {
         context: { goal: 'unused', groundingContext: 'grounded context' },
         resolve: async () => 'unused',
@@ -786,7 +1084,10 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     try {
       await expect(decomposeSelfDevGoal('rejected request', {
         decomposer: 'fabric',
-        llm: async () => { defaultCalls++; return JSON.stringify({ subtasks: [{ id: 'fallback', feature: 'default fallback' }] }); },
+        llm: async () => { defaultCalls++; return fixtureResponse({ subtasks: [{ id: 'fallback', feature: 'default fallback',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }); },
       })).rejects.toMatchObject({
         name: 'FabricDecompositionRejectedError',
         result: { status: 'missing-research-context', message: 'explicit fabric decomposition requires fabric context and resolver' },
@@ -811,7 +1112,10 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
       let defaultCalls = 0;
       await expect(decomposeSelfDevGoal('rejected request', {
         decomposer: 'fabric',
-        llm: async () => { defaultCalls++; return JSON.stringify({ subtasks: [{ id: 'fallback', feature: 'default fallback' }] }); },
+        llm: async () => { defaultCalls++; return fixtureResponse({ subtasks: [{ id: 'fallback', feature: 'default fallback',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }); },
         fabric: {
           context: { goal: 'unused', groundingContext: 'grounded context' },
           resolve: async () => 'unused',
@@ -835,16 +1139,27 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   });
 
   test('preserves allowed, missing, and invalid goal types from the injected LLM', async () => {
-    const llm = async () => JSON.stringify({ subtasks: [
-      { id: 'research', feature: 'research first', goalType: 'research' },
-      { id: 'missing', feature: 'implement next', dependsOn: ['research'] },
-      { id: 'invalid', feature: 'write runbook', goalType: 'unknown', dependsOn: ['missing'] },
+    const llm = async () => fixtureResponse({ subtasks: [
+      { id: 'research', feature: 'research first', goalType: 'research',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'missing', feature: 'implement next', dependsOn: ['research'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
+      { id: 'invalid', feature: 'write runbook', goalType: 'unknown', dependsOn: ['missing'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
     ] });
     const result = await decomposeSelfDevGoal('research, implement, and document', { llm });
 
     expect(result.goals.map((goal) => goal.goalType)).toEqual(['research', undefined, undefined]);
-    expect(result.goals[1]).toEqual({ id: 'missing', feature: 'implement next', dependsOn: ['research'] });
-    expect(result.goals[2]).toEqual({ id: 'invalid', feature: 'write runbook', dependsOn: ['missing'] });
+    expect(result.goals[1]).toMatchObject({ id: 'missing', feature: 'implement next', dependsOn: ['research'], completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } });
+    expect(result.goals[2]).toMatchObject({ id: 'invalid', feature: 'write runbook', dependsOn: ['missing'], completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } });
     expect(result.decomposition).toEqual({
       recommendedMaxTasks: 6,
       actualTaskCount: 3,
@@ -861,14 +1176,18 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
       events.push({ category, event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
     try {
-      const llm = async () => JSON.stringify({ subtasks: Array.from({ length: 9 }, (_, i) => ({
+      const llm = async () => fixtureResponse({ subtasks: Array.from({ length: 9 }, (_, i) => ({
         id: `task-${i}`,
         feature: `task ${i}`,
-        ...(i === 0 ? { dependsOn: ['task-8'] } : {}),
-      })) });
+        dependsOn: i === 0 ? ['task-1'] : [],
+
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       })) });
       const result = await decomposeSelfDevGoal('big feature', { llm, maxTasks: 3 });
       expect(result.goals).toHaveLength(6);
-      expect(result.goals[0]).toEqual({ id: 'task-0', feature: 'task 0' });
+      expect(result.goals[0]).toMatchObject({ id: 'task-0', feature: 'task 0', dependsOn: ['task-1'], completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } });
       expect(result.goals.flatMap((goal) => goal.dependsOn ?? [])).not.toContain('task-8');
       expect(result.decomposition).toEqual({
         recommendedMaxTasks: 3,
@@ -883,7 +1202,7 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
       expect(data).toMatchObject(result.decomposition);
       expect(data.subtasks).toEqual(Array.from({ length: 6 }, (_, i) => ({
         id: `task-${i}`,
-        dependsOn: [],
+        dependsOn: i === 0 ? ['task-1'] : [],
         feature: `task ${i}`,
         featureTruncated: false,
         pathGrounding: { candidateStatus: 'no-candidates', candidateCount: 0, missingCount: 0 },
@@ -902,7 +1221,10 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     try {
       for (const observation of [undefined, { goalId: '' }, { event: 'prelaunch-decomposition', goalId: '' }]) {
         await decomposeSelfDevGoal('unknown identity request', {
-          llm: async () => JSON.stringify({ subtasks: [{ id: 'one', feature: 'one piece' }] }),
+          llm: async () => fixtureResponse({ subtasks: [{ id: 'one', feature: 'one piece',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }),
           ...(observation === undefined ? {} : { observation }),
         });
       }
@@ -926,7 +1248,10 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     }) as typeof debug.log;
     try {
       await decomposeSelfDevGoal('identified request', {
-        llm: async () => JSON.stringify({ subtasks: [{ id: 'one', feature: 'one piece' }] }),
+        llm: async () => fixtureResponse({ subtasks: [{ id: 'one', feature: 'one piece',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }),
         observation: { goalId: '0123456789abcdef', runId: 'run-123' },
       });
       expect(events.filter(({ event }) => event === 'decomposition.decomposer-selection' || event === 'decomposition')).toEqual([
@@ -948,10 +1273,21 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
       events.push({ category, event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
     try {
-      const result = await decomposeSelfDevGoal('DAG', { llm: async () => JSON.stringify({ subtasks: [
-        { id: 'types', feature: 'Define shared types' },
-        { id: 'service', feature: 'Implement service', dependsOn: ['types'] },
-        { id: 'ui', feature: 'Render UI', dependsOn: ['types'] },
+      const result = await decomposeSelfDevGoal('DAG', { llm: async () => fixtureResponse({ subtasks: [
+        { id: 'types', feature: 'Define shared types',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'service', feature: 'Implement service', dependsOn: ['types'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
+        { id: 'ui', feature: 'Render UI', dependsOn: ['types'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
       ] }) });
       const data = events.find(({ category, event }) => category === 'self-dev' && event === 'decomposition')!.data;
       expect(data).toMatchObject(result.decomposition);
@@ -974,7 +1310,10 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     }) as typeof debug.log;
     try {
       const result = await decomposeSelfDevGoal('launch recommendation', {
-        llm: async () => JSON.stringify({ subtasks: [{ id: 'one', feature: 'one piece' }] }),
+        llm: async () => fixtureResponse({ subtasks: [{ id: 'one', feature: 'one piece',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }),
         observation: { category: 'self-dev', event: 'launch-decomposition' },
       });
       expect(result.decomposition.outcome).toBe('decomposed');
@@ -994,7 +1333,7 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
       events.push({ category, event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
     try {
-      const result = await decomposeSelfDevGoal('atomic feature', { llm: async () => JSON.stringify({ subtasks: [] }) });
+      const result = await decomposeSelfDevGoal('atomic feature', { llm: async () => fixtureResponse({ subtasks: [] }) });
       const data = events.find(({ category, event }) => category === 'self-dev' && event === 'decomposition')!.data;
       expect(data).toMatchObject(result.decomposition);
       expect(data).toMatchObject({
@@ -1015,18 +1354,29 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     const oversizedFeature = `${'x'.repeat(SELF_DEV_DECOMPOSITION_FEATURE_MAX_LENGTH)} investigate, design, implement`;
     const secondOversizedFeature = `${'y'.repeat(SELF_DEV_DECOMPOSITION_FEATURE_MAX_LENGTH)} investigate, design, implement`;
     const subtasks = [
-      { id: 'large-one', feature: oversizedFeature },
-      { id: 'large-two', feature: secondOversizedFeature },
-      { id: 'small', feature: 'implement' },
+      { id: 'large-one', feature: oversizedFeature,
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'large-two', feature: secondOversizedFeature,
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'small', feature: 'implement',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
     ];
     const expectedGrades = subtasks.map(({ id, feature }) => gradePhaseCompletability({ id, title: feature, prompt: feature, acceptance: [] }));
     (debug as { log: typeof debug.log }).log = ((category, event, data) => {
       events.push({ category, event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
     try {
-      const result = await decomposeSelfDevGoal('sizing request', { llm: async () => JSON.stringify({ subtasks }) });
+      const result = await decomposeSelfDevGoal('sizing request', { llm: async () => fixtureResponse({ subtasks }) });
       const data = events.find(({ category, event }) => category === 'self-dev' && event === 'decomposition')!.data;
-      expect(result.goals).toEqual(subtasks);
+      expect(result.goals.map(({ id, feature }) => ({ id, feature })))
+        .toEqual(subtasks.map(({ id, feature }) => ({ id, feature })));
+      expect(result.goals.every((goal) => goal.completionBoundary && goal.mockScenario?.id === 'MS-01')).toBe(true);
       expect(data).toMatchObject({
         tooLargeSubtaskCount: expectedGrades.filter(({ verdict }) => verdict === 'too_large').length,
         tooSmallSubtaskCount: expectedGrades.filter(({ verdict }) => verdict === 'too_small').length,
@@ -1051,14 +1401,18 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     }) as typeof debug.log;
     try {
       const result = await decomposeSelfDevGoal('path grounding', {
-        llm: async () => JSON.stringify({ subtasks: [{ id: 'paths', feature }] }),
+        llm: async () => fixtureResponse({ subtasks: [{ id: 'paths', feature,
+          completionBoundary: 'Path result is observable.',
+          mockScenario: { id: 'MS-01', injection: 'inject path input', observation: 'observe path output' },
+          futureAssumptions: [], dependsOn: [],
+        }] }),
         pathGrounding: {
           repoRoot: '/repo',
           probe: (path) => path === '/repo/src/present.ts' ? 'present' : 'missing',
         },
       });
       const data = events.find(({ category, event }) => category === 'self-dev' && event === 'decomposition')!.data;
-      expect(result.goals).toEqual([{ id: 'paths', feature, hotPaths: ['src/present.ts', 'src/missing.ts'] }]);
+      expect(result.goals).toMatchObject([{ id: 'paths', feature, hotPaths: ['src/present.ts', 'src/missing.ts'], completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } }]);
       expect(data.subtasks).toEqual([{
         id: 'paths',
         dependsOn: [],
@@ -1077,9 +1431,18 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     const oversizedFeature = `${'x'.repeat(SELF_DEV_DECOMPOSITION_FEATURE_MAX_LENGTH)} investigate, design, implement`;
     const secondOversizedFeature = `${'y'.repeat(SELF_DEV_DECOMPOSITION_FEATURE_MAX_LENGTH)} investigate, design, implement`;
     const subtasks = [
-      { id: 'large-one', feature: oversizedFeature },
-      { id: 'large-two', feature: secondOversizedFeature },
-      { id: 'small', feature: 'implement' },
+      { id: 'large-one', feature: oversizedFeature,
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'large-two', feature: secondOversizedFeature,
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'small', feature: 'implement',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
     ];
     const expectedGrades = subtasks.map(({ id, feature }) => gradePhaseCompletability({
       id,
@@ -1091,7 +1454,7 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
       events.push({ category, event, data: data as Record<string, unknown> });
     }) as typeof debug.log;
     try {
-      await decomposeSelfDevGoal('sizing rationale', { llm: async () => JSON.stringify({ subtasks }) });
+      await decomposeSelfDevGoal('sizing rationale', { llm: async () => fixtureResponse({ subtasks }) });
       const data = events.find(({ category, event }) => category === 'self-dev' && event === 'decomposition')!.data;
       expect(data).toEqual(expect.objectContaining({
         tooLargeSubtaskCount: expectedGrades.filter(({ verdict }) => verdict === 'too_large').length,
@@ -1154,9 +1517,16 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     }) as typeof debug.log;
     try {
       const feature = 'x'.repeat(SELF_DEV_DECOMPOSITION_FEATURE_MAX_LENGTH + 1);
-      await decomposeSelfDevGoal('long text', { llm: async () => JSON.stringify({ subtasks: [
-        { id: 'short', feature: 'Short text' },
-        { id: 'long', feature },
+      await decomposeSelfDevGoal('long text', { llm: async () => fixtureResponse({ subtasks: [
+        { id: 'short', feature: 'Short text',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'long', feature,
+          completionBoundary: 'Long slice result is observable.',
+          mockScenario: { id: 'MS-02', injection: 'inject long input', observation: 'observe long output' },
+          futureAssumptions: [], dependsOn: [],
+        },
       ] }) });
       const data = events.find(({ category, event }) => category === 'self-dev' && event === 'decomposition')!.data;
       expect(data.subtasks).toEqual([
@@ -1175,13 +1545,28 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   });
 
   test('hard-caps raw output before validation, without backfilling invalid leading entries', async () => {
-    const llm = async () => JSON.stringify({ subtasks: [
+    const llm = async () => fixtureResponse({ subtasks: [
       { id: 'invalid' },
-      { id: 'first', feature: 'first valid task' },
-      { id: 'second', feature: 'second valid task' },
-      { id: 'third', feature: 'third valid task' },
-      { id: 'outside', feature: 'must not be backfilled from beyond hard cap' },
-      { id: 'outside-two', feature: 'also beyond hard cap' },
+      { id: 'first', feature: 'first valid task',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'second', feature: 'second valid task',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'third', feature: 'third valid task',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'outside', feature: 'must not be backfilled from beyond hard cap',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'outside-two', feature: 'also beyond hard cap',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
     ] });
     const result = await decomposeSelfDevGoal('big feature', { llm, maxTasks: 2 });
     expect(result.goals.map((goal) => goal.id)).toEqual(['first', 'second', 'third']);
@@ -1196,12 +1581,24 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   });
 
   test('preserves raw count and pre-validation cap when a capped entry is null', async () => {
-    const llm = async () => JSON.stringify({ subtasks: [
-      { id: 'first', feature: 'first valid task' },
+    const llm = async () => fixtureResponse({ subtasks: [
+      { id: 'first', feature: 'first valid task',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
       null,
-      { id: 'second', feature: 'second valid task' },
-      { id: 'third', feature: 'third valid task' },
-      { id: 'outside', feature: 'must not backfill the null entry' },
+      { id: 'second', feature: 'second valid task',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'third', feature: 'third valid task',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+      { id: 'outside', feature: 'must not backfill the null entry',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
     ] });
     const result = await decomposeSelfDevGoal('big feature', { llm, maxTasks: 2 });
     expect(result.goals.map((goal) => goal.id)).toEqual(['first', 'second', 'third']);
@@ -1216,7 +1613,10 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   });
 
   test('preserves a response above the recommendation but within the hard cap', async () => {
-    const llm = async () => JSON.stringify({ subtasks: Array.from({ length: 4 }, (_, i) => ({ id: `task-${i}`, feature: `task ${i}` })) });
+    const llm = async () => fixtureResponse({ subtasks: Array.from({ length: 4 }, (_, i) => ({ id: `task-${i}`, feature: `task ${i}`,
+        ...fixtureEvidence,
+        dependsOn: []
+       })) });
     const result = await decomposeSelfDevGoal('big feature', { llm, maxTasks: 3 });
     expect(result.goals).toHaveLength(4);
     expect(result.decomposition).toEqual({
@@ -1229,9 +1629,15 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   });
 
   test('keeps the existing array result within the recommendation', async () => {
-    const llm = async () => '{"subtasks":[{"id":"a","feature":"A"},{"id":"b","feature":"B"}]}';
+    const llm = async () => fixtureResponse({ subtasks: [{ id: 'a', feature: 'A',
+        ...fixtureEvidence,
+        dependsOn: []
+       }, { id: 'b', feature: 'B',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] });
     const result = await decomposeSelfDevGoal('big feature', { llm, maxTasks: 3 });
-    expect(result.goals).toEqual([{ id: 'a', feature: 'A' }, { id: 'b', feature: 'B' }]);
+    expect(result.goals).toMatchObject([{ id: 'a', feature: 'A', completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } }, { id: 'b', feature: 'B', completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } }]);
     expect(result.decomposition).toEqual({
       recommendedMaxTasks: 3,
       actualTaskCount: 2,
@@ -1242,7 +1648,10 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   });
 
   test.each([0, -1, Number.NaN, 1.5])('rejects invalid maxTasks %p', async (maxTasks) => {
-    const llm = async () => '{"subtasks":[{"id":"a","feature":"A"}]}';
+    const llm = async () => fixtureResponse({ subtasks: [{ id: 'a', feature: 'A',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] });
     await expect(decomposeSelfDevGoal('big feature', { llm, maxTasks })).rejects.toThrow('maxTasks must be a positive integer');
   });
 
@@ -1250,7 +1659,7 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   //   ⛔ 종전엔 둘 다 actualTaskCount:0 으로만 남아 바깥에서 구분이 불가능했고,
   //     그래서 「너무 큰 골이 안 쪼개진 채 발사」된 원인을 사후에 못 밝혔다(`[T]` 실패 B).
   test('llm 이 답했는데 서브태스크가 없으면 single-no-subtasks 로 «갈린다»', async () => {
-    const llm = async () => JSON.stringify({ subtasks: [] });
+    const llm = async () => fixtureResponse({ subtasks: [] });
     const result = await decomposeSelfDevGoal('whole thing', { llm });
     expect(result.goals).toEqual([{ id: '0', feature: 'whole thing' }]);
     expect(result.decomposition).toMatchObject({ actualTaskCount: 0, outcome: 'single-no-subtasks' });
@@ -1303,12 +1712,18 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     const result = await decomposeSelfDevGoal('whole thing', {
       llm: async () => {
         calls++;
-        return JSON.stringify({ subtasks: [{ id: 'a', feature: 'A' }, { id: 'b', feature: 'B' }] });
+        return fixtureResponse({ subtasks: [{ id: 'a', feature: 'A',
+        ...fixtureEvidence,
+        dependsOn: []
+       }, { id: 'b', feature: 'B',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] });
       },
     });
     expect(calls).toBe(1);
-    expect(result).toEqual({
-      goals: [{ id: 'a', feature: 'A' }, { id: 'b', feature: 'B' }],
+    expect(result).toMatchObject({
+      goals: [{ id: 'a', feature: 'A', completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } }, { id: 'b', feature: 'B', completionBoundary: expect.any(String), mockScenario: { id: 'MS-01' } }],
       decomposition: { recommendedMaxTasks: 6, actualTaskCount: 2, truncatedAtHardMax: false, exceededRecommendedMax: false, outcome: 'decomposed' },
     });
   });
@@ -1325,10 +1740,21 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
           { name: 'Foundation', intent: 'types', tasks: [1], dependsOn: [] },
           { name: 'Delivery', intent: 'consumer', tasks: [2, 3], dependsOn: [1] },
         ] })
-        : JSON.stringify({ subtasks: [
-          { id: 'types', feature: 'Define types' },
-          { id: 'service', feature: 'Implement service', dependsOn: ['types'] },
-          { id: 'ui', feature: 'Render UI', dependsOn: ['service'] },
+        : fixtureResponse({ subtasks: [
+          { id: 'types', feature: 'Define types',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+          { id: 'service', feature: 'Implement service', dependsOn: ['types'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
+          { id: 'ui', feature: 'Render UI', dependsOn: ['service'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
         ] });
       const result = await decomposeSelfDevGoal('whole thing', { llm, arcHint: 3 });
       const data = events.find(({ category, event }) => category === 'self-dev' && event === 'decomposition')!.data;
@@ -1354,7 +1780,13 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
     }) as typeof debug.log;
     try {
       await decomposeSelfDevGoal('whole thing', {
-        llm: async () => JSON.stringify({ subtasks: [{ id: 'a', feature: 'A' }, { id: 'b', feature: 'B' }] }),
+        llm: async () => fixtureResponse({ subtasks: [{ id: 'a', feature: 'A',
+        ...fixtureEvidence,
+        dependsOn: []
+       }, { id: 'b', feature: 'B',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }),
       });
       const data = events.find(({ category, event }) => category === 'self-dev' && event === 'decomposition')!.data;
       expect(data).not.toHaveProperty('arcs');
@@ -1373,10 +1805,21 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
   ])('invalid arc grouping (%s) falls back to the existing flat result', async (_reason, arcs) => {
     const llm = async (prompt: string) => prompt.startsWith('Group the decomposed')
       ? JSON.stringify({ arcs })
-      : JSON.stringify({ subtasks: [
-        { id: 'types', feature: 'Define types' },
-        { id: 'service', feature: 'Implement service', dependsOn: ['types'] },
-        { id: 'ui', feature: 'Render UI', dependsOn: ['service'] },
+      : fixtureResponse({ subtasks: [
+        { id: 'types', feature: 'Define types',
+        ...fixtureEvidence,
+        dependsOn: []
+       },
+        { id: 'service', feature: 'Implement service', dependsOn: ['types'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
+        { id: 'ui', feature: 'Render UI', dependsOn: ['service'],
+        completionBoundary: 'Fixture slice has an independently observable result.',
+        mockScenario: { id: 'MS-01', injection: 'inject fixture input', observation: 'observe fixture output' },
+        futureAssumptions: []
+       },
       ] });
     const result = await decomposeSelfDevGoal('whole thing', { llm, arcHint: 2 });
     expect(result.goals.map((goal) => goal.id)).toEqual(['types', 'service', 'ui']);
@@ -1386,7 +1829,13 @@ describe('decomposeSelfDevGoal (fake llm — no live model)', () => {
 
   test('classification LLM failure and invalid arcHint preserve or reject at their respective boundary', async () => {
     const result = await decomposeSelfDevGoal('whole thing', {
-      llm: async () => JSON.stringify({ subtasks: [{ id: 'a', feature: 'A' }, { id: 'b', feature: 'B' }] }),
+      llm: async () => fixtureResponse({ subtasks: [{ id: 'a', feature: 'A',
+        ...fixtureEvidence,
+        dependsOn: []
+       }, { id: 'b', feature: 'B',
+        ...fixtureEvidence,
+        dependsOn: []
+       }] }),
       arcHint: 2,
       arcLlm: async () => { throw new Error('classifier down'); },
     });

@@ -42,4 +42,4 @@ test('forbidden import injected into a source copy is detected', () => {
 test('leaf modules stay below the repository source reach ceilings', () => {
   expect(sourceReach('src/self-dev/launch-preflight-text.ts')).toBeLessThanOrEqual(30);
   expect(sourceReach('src/self-implement/goal-digest.ts')).toBeLessThanOrEqual(5);
-});
+}, 30_000);

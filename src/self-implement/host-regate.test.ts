@@ -899,6 +899,48 @@ describe('host regate: never merge without a measured host pass', () => {
     expect(events).toContain('release');
   });
 
+  test('PR head preflight records the exact failing clauses and observed snapshot for log and ledger', async () => {
+    const run = async (prView: Record<string, unknown>, options: { allowDraft?: true; verifyOnly?: true } = {}) => {
+      const { deps } = mock();
+      const command = deps.command!;
+      const logged: Array<{ event: string; data: Record<string, unknown> }> = [];
+      deps.command = (bin, args, cwd, env) => bin === 'gh' && args[0] === 'pr' && args[1] === 'view'
+        ? { status: 0, stdout: JSON.stringify(prView), stderr: '' }
+        : command(bin, args, cwd, env);
+      deps.log = (event, data) => logged.push({ event, data });
+      return { result: await runHostRegate({ ...input, ...options }, deps), logged };
+    };
+    const draftView = { headRefOid: HEAD, baseRefName: 'main', baseRefOid: BASE, state: 'OPEN', isDraft: true };
+    const draft = await run(draftView);
+    const draftFailure = draft.result.failures[0]!;
+    expect(draftFailure).toMatchObject({ step: 'pr-head', failedConditions: ['pr-is-draft'],
+      expectedHead: HEAD, actualHead: HEAD, prHeadSnapshot: draftView });
+    expect(draft.logged[0]).toMatchObject({ event: 'unmeasured', data: {
+      failedStep: 'pr-head', failedConditions: ['pr-is-draft'], prHeadSnapshot: draftView,
+    } });
+    expect(regateFailureFacts(draftFailure)).toMatchObject({ failedConditions: ['pr-is-draft'], prHeadSnapshot: draftView });
+
+    const draftWithWrongHead = await run({ ...draftView, headRefOid: 'c'.repeat(40) }, { allowDraft: true, verifyOnly: true });
+    expect(draftWithWrongHead.result.failures[0]).toMatchObject({ step: 'pr-head', failedConditions: ['head-mismatch'] });
+    expect(draftWithWrongHead.logged[0]).toMatchObject({ data: { failedConditions: ['head-mismatch'] } });
+
+    const baseView = { ...draftView, isDraft: false, baseRefOid: 'not-a-sha' };
+    const base = await run(baseView);
+    expect(base.result.failures[0]).toMatchObject({ step: 'pr-head', failedConditions: ['base-oid-invalid'],
+      prHeadSnapshot: { ...baseView, baseRefOid: null } });
+    expect(base.logged[0]).toMatchObject({ data: { failedConditions: ['base-oid-invalid'],
+      prHeadSnapshot: { ...baseView, baseRefOid: null } } });
+
+    const secret = 'ghp-secret-value';
+    const unsafe = await run({ headRefOid: secret, state: 'token-secret', isDraft: true,
+      baseRefName: 'credential-secret', baseRefOid: 'token-secret' });
+    expect(unsafe.result.failures[0]).toMatchObject({ step: 'pr-head', failedConditions: [
+      'base-oid-invalid', 'head-unavailable', 'pr-is-draft', 'state-not-open',
+    ], prHeadSnapshot: { headRefOid: null, state: 'OTHER', isDraft: true, baseRefName: 'other', baseRefOid: null } });
+    expect(JSON.stringify(unsafe.result.failures)).not.toContain('secret');
+    expect(JSON.stringify(unsafe.logged)).not.toContain('secret');
+  });
+
   test('combined test failure is never a passing regate', async () => {
     const { deps, calls } = mock({ interference: async () => ({ passed: false, detail: 'combined 2 fail' }) });
     const result = await runHostRegate(input, deps);

@@ -1,7 +1,10 @@
+#!/usr/bin/env bun
+import { readFileSync } from 'node:fs';
 import type { PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
 
 /** In-memory Kubernetes boundary for real pool admission and warm-provider tests. Unknown operations fail closed. */
-export function createFakeKubectl(options: { context: string; node: string; jobState?: 'running' | 'complete' }) {
+export function createFakeKubectl(options: { context: string; node: string; jobState?: 'running' | 'complete';
+  failGetPods?: string; podReadinessOnCreate?: boolean }) {
   const jobs = new Map<string, Record<string, unknown>>();
   const pods = new Map<string, Record<string, any>>();
   const calls: string[][] = [];
@@ -9,6 +12,7 @@ export function createFakeKubectl(options: { context: string; node: string; jobS
   const jobCreates: string[] = [];
   const jobDeletes: string[] = [];
   let lease: { workerId: string; podUid: string; key: unknown; job?: string; state: 'idle' | 'leased' | 'released' | 'quarantined' } | null = null;
+  let loseNextLeaseResponse = false;
   const ok = (value: unknown) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
   const missing = (kind: string) => ({ status: 1, stdout: '', stderr: `${kind} not found` });
   const kubectl: PoolKubectl = (args, input) => {
@@ -59,7 +63,10 @@ export function createFakeKubectl(options: { context: string; node: string; jobS
       if (query.includes('.status.conditions')) return { status: 0, stdout: (job.status as { conditions?: Array<{ type?: string }> })?.conditions?.map((condition) => condition.type).join(' ') ?? '', stderr: '' };
       return ok(job);
     }
-    if (verb === 'get' && args[at + 1] === 'pods') return ok({ items: [...pods.values()] });
+    if (verb === 'get' && args[at + 1] === 'pods') {
+      if (options.failGetPods) return { status: 1, stdout: '', stderr: options.failGetPods };
+      return ok({ apiVersion: 'v1', kind: 'PodList', metadata: { resourceVersion: '1', continue: '' }, items: [...pods.values()] });
+    }
     if (verb === 'get' && (args[at + 1] === 'pod' || args[at + 1]?.startsWith('pod/'))) {
       const name = args[at + 1] === 'pod' ? args[at + 2] : args[at + 1]?.slice(4);
       const pod = pods.get(name ?? '');
@@ -70,7 +77,8 @@ export function createFakeKubectl(options: { context: string; node: string; jobS
       try { manifest = JSON.parse(input); } catch { return missing('invalid manifest'); }
       const name = manifest.metadata?.name;
       if (typeof name !== 'string' || pods.has(name)) return missing('existing or invalid pod');
-      const created = { ...manifest, metadata: { ...manifest.metadata, uid: `${name}-uid`, resourceVersion: '1' } };
+      const created = { ...manifest, metadata: { ...manifest.metadata, uid: `${name}-uid`, resourceVersion: '1' },
+        ...(options.podReadinessOnCreate ? { status: { phase: 'Running', conditions: [{ type: 'Ready', status: 'True' }] } } : {}) };
       pods.set(name, created);
       return ok(created);
     }
@@ -102,6 +110,10 @@ export function createFakeKubectl(options: { context: string; node: string; jobS
       if (!lease || lease.state !== 'idle' || (lease.job && !jobs.has(lease.job)))
         return Response.json({ unavailable: true }, { status: 503 });
       lease.state = 'leased';
+      if (loseNextLeaseResponse) {
+        loseNextLeaseResponse = false;
+        throw new TypeError('simulated response lost after lease commit');
+      }
       return Response.json({ name: lease.workerId, attrs: { key: lease.key, leaseId: 'lease-1',
         generation: 1, podUid: lease.podUid, state: 'leased' } });
     }
@@ -127,6 +139,7 @@ export function createFakeKubectl(options: { context: string; node: string; jobS
     setWarmLease: (value: { workerId: string; podUid: string; key: unknown; job?: string }) => {
       lease = { ...value, state: 'idle' };
     },
+    loseNextLeaseResponse: () => { loseNextLeaseResponse = true; },
     warmLeaseState: () => lease?.state ?? null,
     putPod: (pod: Record<string, any>) => { pods.set(pod.metadata.name, structuredClone(pod)); },
     replacePodUid: (name: string, uid: string) => {
@@ -139,4 +152,25 @@ export function createFakeKubectl(options: { context: string; node: string; jobS
     removeJob: (name: string) => { jobs.delete(name); },
     hasJob: (name: string) => jobs.has(name),
   };
+}
+
+if (import.meta.main) {
+  const endpoint = process.env.ELANOUS_FAKE_KUBECTL_URL;
+  if (!endpoint) {
+    process.stderr.write('fake-kubectl requires ELANOUS_FAKE_KUBECTL_URL\n');
+    process.exitCode = 2;
+  } else {
+    try {
+      const input = readFileSync(0, 'utf8');
+      const response = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ args: process.argv.slice(2), input }) });
+      const result = await response.json() as { status: number | null; stdout: string; stderr: string };
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      process.exitCode = result.status ?? 2;
+    } catch (error) {
+      process.stderr.write(`fake-kubectl: ${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 2;
+    }
+  }
 }

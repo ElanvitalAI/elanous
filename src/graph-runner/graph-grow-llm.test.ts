@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GraphTemplateSpec } from '../self-implement/graph-yaml.js';
-import { proposeGrowth } from './graph-grow.js';
+import type { DecisionEntry } from '../decisions/decision-ledger.js';
+import { proposeGrowth, type GrowthDecisionDeps } from './graph-grow.js';
 import { createLLMGrowthProposer, graphGrowthLlmOptions } from './graph-grow-llm.js';
 import { getUserConfig, isModelRole, MODEL_ROLES } from '../user-config.js';
 import { runGraph } from './runner.js';
@@ -20,6 +21,18 @@ const graph: GraphTemplateSpec = {
 const input = { graph, nodeId: 'judge', outcome: 'needs-research', runId: 'run-1', output: `prefix-${'x'.repeat(5000)}-last-line` };
 const answer = JSON.stringify({ node: { nodeId: 'research', kind: 'agent', recipe: 'none', maxVisits: 1,
   contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'done', reason: 'research the missing evidence' });
+
+function fakeDecisionLedger(refs: string[]): NonNullable<GrowthDecisionDeps['ledger']> {
+  return { raiseOnce: (input, ref) => {
+    refs.push(ref);
+    const entry: DecisionEntry = {
+      id: 'D-test', title: input.title, category: input.category, scqa: input.scqa,
+      options: input.options, recommendation: input.recommendation, raisedBy: input.raisedBy,
+      status: 'open', refs: input.refs, dueAt: input.dueAt, history: [],
+    };
+    return entry;
+  } };
+}
 
 test('graph-grow role chooses its configured provider and model; missing role keeps the default chain', () => {
   const config = getUserConfig();
@@ -102,11 +115,13 @@ test('grow on rejects malformed LLM JSON via the existing fallback and parks a s
     [answer.replace('"recipe":"none"', '"recipe":"cmd:publish"'), 'awaiting-approval'],
   ] as const) {
     const root = mkdtempSync(join(tmpdir(), 'graph-grow-llm-reject-'));
+    const decisionRefs: string[] = [];
     try {
       const path = join(root, 'graph.yaml');
       writeFileSync(join(root, 'recipes.yaml'), 'judge:\n  command: "exit 0"\npublish:\n  command: "exit 0"\n');
       writeFileSync(path, `grow: on\ngraph_id: growth\nversion: 1\nentry_node: judge\nterminal_nodes: [done]\nnodes:\n  - { node_id: judge, kind: judge, recipe: 'cmd:judge', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - from: judge\n    on: outcome\n    map: { ok: done }\n`);
       const run = await runGraph(path, { deps: { root,
+        growthDecision: { ledger: fakeDecisionLedger(decisionRefs) },
         runBash: async () => ({ stdout: '{"outcome":"needs-research"}\n', stderr: '', exitCode: 0 }),
         growthLLM: async () => { if (reply === 'throw') throw new Error('offline'); return reply; },
       } });
@@ -116,9 +131,12 @@ test('grow on rejects malformed LLM JSON via the existing fallback and parks a s
       if (expected === 'done') {
         expect(run.path).toEqual(['judge', 'done']);
         expect(run.growthRejections?.[0]?.reason).toBe(reply === 'throw' ? 'proposer failed: Error: offline' : 'no proposal');
+        expect(decisionRefs).toHaveLength(0);
       } else {
         expect(run.path).toEqual(['judge']);
         expect(run.growthPark?.reason).toContain('사람 확인 필요');
+        expect(decisionRefs).toHaveLength(1);
+        expect(decisionRefs[0]).toMatch(/^graph-growth:[a-f0-9]{64}$/);
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
@@ -132,9 +150,14 @@ test('malformed, empty and invalid model replies are not accepted as growth', as
 });
 
 test('fake LLM cannot bypass trusted side-effect classification', async () => {
+  const decisionRefs: string[] = [];
   const result = await proposeGrowth(input, createLLMGrowthProposer(async () =>
-    answer.replace('"recipe":"none"', '"recipe":"cmd:publish"')));
+    answer.replace('"recipe":"none"', '"recipe":"cmd:publish"')), undefined,
+  { ledger: fakeDecisionLedger(decisionRefs) });
   expect(result).toMatchObject({ ok: false, park: true, reason: expect.stringContaining('사람 확인 필요') });
+  expect(result).toMatchObject({ decisionId: 'D-test' });
+  expect(decisionRefs).toHaveLength(1);
+  expect(decisionRefs[0]).toMatch(/^graph-growth:[a-f0-9]{64}$/);
 });
 
 test('LLM errors and invalid graph variants keep the original graph with a reason', async () => {

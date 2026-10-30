@@ -1062,6 +1062,13 @@ export async function degradationDeps(node: Node, deps: { config?: () => Partial
   return mode === 'live' ? { degradation: () => ({ llm: signal.llm, board: signal.board }) } : {};
 }
 
+// COORD-ENTRANCE-FOLD (0.2.42 칸 · TASK-AGENT OP 디스패처) — 조율자 루프 하루 틱 생산 진입이
+// tick() 을 호출하게 배선한다: 그림자 디스패치(날짜·대상 에이전트·칸·지시서 id)에서 ④ 빌더
+// 같은 칸·같은 지시서 달력 기준 3일 연속을 감지하면 «셸 디스패처 은퇴» 결정 카드를 기존 결정
+// 원장(DecisionLedger) 부가 형식 그대로 1장 적는다(같은 스탬프=칸+지시서 중복 방지).
+// 구현 본체: src/loops/orchestrator/coordinator-shadow.ts · 완료 경계 시험: tick.test.ts.
+import { tick as runCoordinatorShadowTick } from './coordinator-shadow.js';
+
 if (import.meta.main) {
   const node = process.argv[2];
   const index = process.argv.indexOf('--window');
@@ -1078,6 +1085,12 @@ if (import.meta.main) {
     void (async () => {
       try { await (await import('../../domains/standalone-log-sink.js')).registerStandaloneLogSink('orchestrator'); }
       catch { /* local execution can still use the per-run file */ }
+      // 관측(그림자 틱)은 본 루프를 봉쇄할 수 없다: 파손 원장 등으로 reject 하면 원인만 warn 로그로 남기고 본 노드 실행은 계속한다.
+      try { await runCoordinatorShadowTick({}); }
+      catch (error) {
+        try { debug.log('loop.orchestrator', 'coordinator-shadow-tick-failed', { node, error: String(error).slice(0, 200) }, { level: 'warn' }); }
+        catch { /* even the diagnostic sink must not block the node */ }
+      }
       await runOrchestratorNode(node as Node, { window: window as Window | undefined, ...await degradationDeps(node as Node) });
     })().catch(error => { console.error(`orchestrator ${node}: ${String(error)}`); process.exitCode = 1; });
   }

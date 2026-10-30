@@ -20,7 +20,7 @@ export interface ResourceRecord {
 export type ResourceView = ResourceRecord & { ageMs: number; expired: boolean };
 
 export interface PodWorkerKey { context: string; imageDigest: string; lockHash: string; architecture: string }
-type PodWorkerState = 'idle' | 'leased' | 'sanitizing' | 'quarantined';
+type PodWorkerState = 'idle' | 'leased' | 'sanitizing' | 'timeout-fenced' | 'quarantined';
 interface PodWorkerLeaseAttrs {
   key: PodWorkerKey;
   podUid: string;
@@ -32,6 +32,9 @@ interface PodWorkerLeaseAttrs {
   /** The just-sanitized generation remains fenceable until the next acquisition. */
   lastLeaseId?: string;
   lastLeaseOwner?: string;
+  timeoutFenceUntil?: number;
+  timeoutRunId?: string;
+  timeoutAttemptId?: string;
   runId?: string;
   attemptId?: string;
   reason?: string;
@@ -231,22 +234,65 @@ export class ResourceLedger {
     return this.mutate(() => {
     const at = now ?? Date.now();
     const rows = this.read();
+    let expiredFenceChanged = false;
+    for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      const candidate = rows[rowIndex]!;
+      if (candidate.kind !== 'pod-worker-lease') continue;
+      const candidateAttrs = workerAttrs(candidate);
+      if (candidateAttrs.state !== 'timeout-fenced' || candidateAttrs.timeoutFenceUntil === undefined
+        || candidateAttrs.timeoutFenceUntil > at || candidateAttrs.leaseId) continue;
+      const idleAttrs: PodWorkerLeaseAttrs = { ...candidateAttrs, state: 'idle' };
+      delete idleAttrs.leaseId; delete idleAttrs.leaseOwner; delete idleAttrs.runId; delete idleAttrs.attemptId;
+      delete idleAttrs.timeoutFenceUntil; delete idleAttrs.timeoutRunId; delete idleAttrs.timeoutAttemptId;
+      rows[rowIndex] = { ...candidate, attrs: idleAttrs as unknown as Record<string, unknown>, observedAt: at,
+        ttlMs: candidateAttrs.idleTtlMs };
+      expiredFenceChanged = true;
+    }
     const index = rows.findIndex(row => row.kind === 'pod-worker-lease' && (!request.machine || row.machine === request.machine)
       && Math.max(0, at - row.observedAt) < row.ttlMs && workerAttrs(row).state === 'idle'
       && typeof workerAttrs(row).podUid === 'string' && workerAttrs(row).podUid.trim().length > 0
       && sameWorkerKey(workerAttrs(row).key, request.key));
-    if (index < 0) throw new ResourceLedgerError(409, 'no-warm-worker');
+    if (index < 0) {
+      if (expiredFenceChanged) this.write(rows);
+      throw new ResourceLedgerError(409, 'no-warm-worker');
+    }
     const row = rows[index]!;
     const attrs = workerAttrs(row);
     const nextAttrs: PodWorkerLeaseAttrs = { ...attrs, state: 'leased', generation: attrs.generation + 1,
       leaseId: randomUUID(), leaseOwner: request.owner, runId: request.runId, attemptId: request.attemptId };
     delete nextAttrs.lastLeaseId;
     delete nextAttrs.lastLeaseOwner;
+    delete nextAttrs.timeoutFenceUntil; delete nextAttrs.timeoutRunId; delete nextAttrs.timeoutAttemptId;
     const next: ResourceRecord = { ...row, attrs: nextAttrs as unknown as Record<string, unknown>,
       observedAt: at, ttlMs: request.ttlMs };
     rows[index] = next;
     this.write(rows);
     return next;
+    });
+  }
+
+  fenceTimedOutPodWorker(id: string, request: { owner: string; runId: string; attemptId: string; fenceMs: number }, now?: number): ResourceRecord {
+    return this.mutate(() => {
+      const at = now ?? Date.now();
+      const rows = this.read();
+      const index = rows.findIndex(row => row.id === id && row.kind === 'pod-worker-lease');
+      if (index < 0) throw new ResourceLedgerError(404, 'not-found');
+      const row = rows[index]!;
+      const attrs = workerAttrs(row);
+      const sameFence = attrs.state === 'timeout-fenced' && attrs.timeoutRunId === request.runId
+        && attrs.timeoutAttemptId === request.attemptId;
+      const sameLease = attrs.state === 'leased' && attrs.leaseOwner === request.owner
+        && attrs.runId === request.runId && attrs.attemptId === request.attemptId;
+      const available = attrs.state === 'idle';
+      if (!request.owner || !request.runId || !request.attemptId || !Number.isSafeInteger(request.fenceMs)
+        || request.fenceMs < 1 || !(sameFence || sameLease || available))
+        throw new ResourceLedgerError(409, 'stale-timeout-fence');
+      const nextAttrs: PodWorkerLeaseAttrs = { ...attrs, state: 'timeout-fenced',
+        timeoutFenceUntil: at + request.fenceMs, timeoutRunId: request.runId, timeoutAttemptId: request.attemptId };
+      const next: ResourceRecord = { ...row, attrs: nextAttrs as unknown as Record<string, unknown>, observedAt: at };
+      rows[index] = next;
+      this.write(rows);
+      return next;
     });
   }
 
@@ -260,11 +306,14 @@ export class ResourceLedger {
     const attrs = workerAttrs(row);
     const lateIdleQuarantine = request.action === 'quarantine' && attrs.state === 'idle'
       && attrs.lastLeaseId === request.leaseId && attrs.generation === request.generation;
+    const timeoutFencedQuarantine = request.action === 'quarantine' && attrs.state === 'timeout-fenced'
+      && attrs.leaseId === request.leaseId && attrs.generation === request.generation;
     if (!request.leaseId || (attrs.leaseId !== request.leaseId && !lateIdleQuarantine)
       || attrs.generation !== request.generation) throw new ResourceLedgerError(409, 'stale-worker-lease');
     const permitted = request.action === 'sanitize' ? row.owner === request.owner
       : request.action === 'quarantine' ? row.owner === request.owner || attrs.leaseOwner === request.owner
         || (lateIdleQuarantine && attrs.lastLeaseOwner === request.owner)
+        || (timeoutFencedQuarantine && attrs.leaseOwner === request.owner)
       : attrs.leaseOwner === request.owner;
     if (!permitted) {
       throw new ResourceLedgerError(403, 'not-owner');
@@ -283,6 +332,7 @@ export class ResourceLedger {
     } else if (state === 'quarantined') {
       delete nextAttrs.lastLeaseId;
       delete nextAttrs.lastLeaseOwner;
+      delete nextAttrs.timeoutFenceUntil; delete nextAttrs.timeoutRunId; delete nextAttrs.timeoutAttemptId;
     }
     const ttlMs = state === 'idle' ? attrs.idleTtlMs : request.ttlMs ?? row.ttlMs;
     const next: ResourceRecord = { ...row, attrs: nextAttrs as unknown as Record<string, unknown>, observedAt: now, ttlMs };

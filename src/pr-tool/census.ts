@@ -41,7 +41,7 @@ export interface GuardReason { code: GuardCode; detail: string; prs?: readonly n
 /** PR-GUARD-HUNK-WARN (대표 10-17): 줄 겹침은 기본 경고 — 착지 쪽 스마트 머지가 푼다. 'refuse' = 옛 거부 동작. */
 export type HunkOverlapMode = 'refuse' | 'warn';
 export interface GuardVerdict { status: 'allow' | 'refuse' | 'unknown'; reasons: readonly GuardReason[]; warnings: readonly GuardReason[];
-  sameCellConflicts?: readonly { pr: number; cardId: string | null; slice?: { slice: number; total: number } | null }[];
+  sameCellConflicts?: readonly { pr: number; branch: string | null; headSha: string; cardId: string | null; slice?: { slice: number; total: number } | null }[];
   sameCellReuse?: { number: number; branch: string; headSha: string; cellId: string; cardId: string; legacyBound?: true } }
 
 const SEATS = ['OP', 'TC', 'MK', 'UX'] as const;
@@ -511,7 +511,8 @@ export function guardNewPr(input: { files: readonly string[] | null; seat?: Seat
     ? { number: sameCell[0].number, branch: sameCell[0].headRefName, headSha: sameCell[0].headSha,
       cellId: input.cellId!, cardId: input.cardId, ...(legacyBound ? { legacyBound: true as const } : {}) } : undefined;
   return { status, reasons, warnings,
-    ...(sameCell.length ? { sameCellConflicts: sameCell.map(pr => ({ pr: pr.number, cardId: pr.cardId ?? null, slice: pr.slice ?? null })) } : {}),
+    ...(sameCell.length ? { sameCellConflicts: sameCell.map(pr => ({ pr: pr.number, branch: pr.headRefName ?? null,
+      headSha: pr.headSha, cardId: pr.cardId ?? null, slice: pr.slice ?? null })) } : {}),
     ...(reusable ? { sameCellReuse: reusable } : {}) };
 }
 

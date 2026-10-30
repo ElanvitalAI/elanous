@@ -147,6 +147,16 @@ function shardIdentityFeature(feature: string, identity: SelfDevShardIdentity | 
     : `${feature}\n\n## Shard identity\n${JSON.stringify(identity)}`;
 }
 
+function selfDevGoalFeature(goal: SelfDevGoal): string {
+  const { completionBoundary, mockScenario } = goal;
+  const acceptance: string[] = [];
+  if (completionBoundary?.trim()) acceptance.push(`Completion boundary: ${completionBoundary.trim()}`);
+  if (mockScenario?.id?.trim()) acceptance.push(`Mock scenario: ${mockScenario.id.trim()}`);
+  if (mockScenario?.injection?.trim()) acceptance.push(`Injection: ${mockScenario.injection.trim()}`);
+  if (mockScenario?.observation?.trim()) acceptance.push(`Observation: ${mockScenario.observation.trim()}`);
+  return acceptance.length ? `${goal.feature}\n\n## Slice acceptance\n${acceptance.join('\n')}` : goal.feature;
+}
+
 const SHARD_WORKING_MEMORY_EMIT_HINT =
   '\n\n## Working-memory handoff\nA downstream shard depends on this work. Before your final response, emit the following marker and one JSON object so it can reuse your findings. Put reusable boundaries in `reusables` and your key choices in `decisions`; use empty arrays when there are none.\n[WORKING-MEMORY]\n{"reusables":[],"decisions":[],"summary":"What this shard established for downstream work."}';
 
@@ -1236,7 +1246,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     surfaceKind: 'self-implement',
     surface: (goal) => ({
       kind: 'self-implement',
-      feature: goal.feature,
+      feature: selfDevGoalFeature(goal),
       ...(goal.after !== undefined ? { after: goal.after } : {}),
       ...(goal.base !== undefined ? { base: goal.base } : {}),
       ...(goal.autoMerge !== undefined ? { autoMerge: goal.autoMerge } : {}),
@@ -1386,7 +1396,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       const task = graph.getTask(taskId);
       if (task?.surface.kind === 'self-implement') {
         graph.updateTask(taskId, {
-          surface: { ...task.surface, feature: shardIdentityFeature(shard.goal.feature, identity) },
+          surface: { ...task.surface, feature: shardIdentityFeature(selfDevGoalFeature(shard.goal), identity) },
         }, { now: now() });
       }
     }

@@ -10,6 +10,37 @@ import { decideNextRun } from './run-supervisor.js';
 import type { SelfImplementJobSpawn, SelfImplementJobDone } from '../task-orchestrator/surfaces/self-implement.js';
 import type { LogRecord } from '../mss/logging/record.js';
 
+test('decomposed slice acceptance contract reaches the child implementation prompt', async () => {
+  let childFeature = '';
+  await orchestrateSelfDev({
+    goals: [{
+      id: 'recover',
+      feature: 'Implement the recovery path.',
+      completionBoundary: 'A recovered run emits one terminal event.',
+      mockScenario: { id: 'MS-01', injection: 'inject a recoverable pod exit', observation: 'observe one terminal event' },
+    }],
+    spawn: (input) => {
+      childFeature = input.feature;
+      return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '' }) };
+    },
+  });
+  expect(childFeature).toContain('Completion boundary: A recovered run emits one terminal event.');
+  expect(childFeature).toContain('Mock scenario: MS-01\nInjection: inject a recoverable pod exit\nObservation: observe one terminal event');
+});
+
+test('known acceptance fields are forwarded independently when sibling metadata is absent', async () => {
+  const received: string[] = [];
+  await orchestrateSelfDev({
+    goals: [
+      { id: 'boundary-only', feature: 'boundary only', completionBoundary: 'Standalone boundary.' },
+      { id: 'scenario-only', feature: 'scenario only', mockScenario: { id: 'MS-02', injection: 'inject A', observation: 'observe B' } },
+    ],
+    spawn: (input) => { received.push(input.feature); return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '' }) }; },
+  });
+  expect(received.some((feature) => feature.includes('Completion boundary: Standalone boundary.'))).toBe(true);
+  expect(received.some((feature) => feature.includes('Mock scenario: MS-02\nInjection: inject A\nObservation: observe B'))).toBe(true);
+});
+
 test('TA 분해 조각마다 부모 완료 경계 3행을 상속해 자식 발사 문면에 싣는다', async () => {
   let launches = 0;
   const features: string[] = [];

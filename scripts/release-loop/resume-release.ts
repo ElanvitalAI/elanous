@@ -22,6 +22,7 @@ import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { cutReleaseBranch } from './cut-branch.js';
 import { releaseLoopConfig } from './unattended-release.js';
 import { trafficOptionsFromConfig } from './traffic-transition.js';
+import type { GateAutohealDecision } from './gate-autoheal.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
@@ -67,7 +68,34 @@ export interface ResumeReleaseOptions {
 export interface ResumeReleasePlan {
   runId: string; version: string; fromNode: string; commandRoot: string; tip: TipRefresh;
   partial: PartialOutcome; gatePlan: { mode: 'not-run' | 'partial' | 'full'; reason?: string };
+  /** Most recent failed gate's autoheal recommendation, carried into the resume plan for the caller. */
+  autoheal?: GateAutohealDecision;
+  autohealReroute?: string;
   nextAttempt: number; priorCountKnown: boolean; preflight: 'passed';
+}
+
+function priorGateAutoheal(run: GraphRunState): GateAutohealDecision | undefined {
+  const gate = lastJsonObject(run.nodes.find((node) => node.nodeId === 'gate')?.output);
+  const value = gate?.autoheal;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const candidate = value as Partial<GateAutohealDecision>;
+  if (!['reroute-shard', 'retry-shard', 'partial-resume', 'host-switch', 'hitl'].includes(String(candidate.action))) return undefined;
+  if (!['shard-pod-death', 'timeout', 'host-down', 'interference', 'true-regression', 'environment'].includes(String(candidate.cause))) return undefined;
+  if (typeof candidate.signature !== 'string' || typeof candidate.reason !== 'string'
+    || typeof candidate.shardElapsedMs !== 'number' || typeof candidate.overallElapsedMs !== 'number') return undefined;
+  return candidate as GateAutohealDecision;
+}
+
+function automaticReroute(run: GraphRunState, autoheal: GateAutohealDecision | undefined, tipChanged: boolean, from: string): string | undefined {
+  if (!autoheal || tipChanged || from !== 'gate' || typeof (run.input as Record<string, unknown> | undefined)?.gatePodPool !== 'string'
+    || (autoheal.action !== 'retry-shard' && autoheal.action !== 'reroute-shard' && autoheal.action !== 'host-switch')) return undefined;
+  const key = autoheal.shardKey;
+  if (autoheal?.action === 'host-switch') return 'auto';
+  if (typeof key === 'string' && /^pod-\d+$/.test(key)) return key;
+  if (typeof key === 'string' && /^\d+$/.test(key)) return `pod-${key}`;
+  const gate = lastJsonObject(run.nodes.find((node) => node.nodeId === 'gate')?.output);
+  const stalled = gate?.stalledShards;
+  return Array.isArray(stalled) && stalled.length > 0 ? 'auto' : undefined;
 }
 
 /** CLI entry files: a production file that only names one (help text, a goal's command line) does not run it. */
@@ -428,6 +456,42 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     const saved = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;
     const gateRecord = saved.nodes.find((node) => node.nodeId === 'gate');
     const previousGate = gateRecord ? lastJsonObject(gateRecord.output) as Record<string, unknown> | undefined : undefined;
+    // `loadFlaky` is also a partial-resume cause, but it is emitted separately from
+    // shard-only interference. Carry both sets into the same affected-file recheck.
+    const interference = [...new Set([
+      ...(Array.isArray(previousGate?.interferenceErrors) ? previousGate.interferenceErrors : []),
+      ...(Array.isArray(previousGate?.loadFlaky) ? previousGate.loadFlaky : []),
+    ])];
+    if (previousGate?.outcome === 'error' && previousGate.commit === tip.to && previousGate.autoheal
+      && typeof previousGate.autoheal === 'object' && (previousGate.autoheal as { action?: unknown }).action === 'partial-resume') {
+      if (!Array.isArray(interference) || !interference.length || !interference.every((id) => typeof id === 'string'))
+        return fallback('partial-resume has no complete interference error record');
+      let closure: ClosureTree;
+      try { closure = (deps.closureTree ?? ((commit: string) => gitClosureTree(deps.repo ?? process.cwd(), commit)))(tip.to); }
+      catch (error) { return fallback(`tip tree unreadable: ${String(error instanceof Error ? error.message : error).slice(0, 200)}`); }
+      const tracked = new Set(closure.files);
+      const planned = planSameCommitRecheck({ version: tip.version, measuredCommit: tip.to, forCommit: tip.to,
+        failures: [], errors: interference as string[], existsAtCommit: (file) => tracked.has(file) });
+      if (!planned.ok) return fallback(planned.reason);
+      // The gate consumer only executes same-cut partial work for the stalled-only recheck shape.
+      // Interference files are likewise unmeasured, so mark exactly this set as the recheck boundary.
+      const partialFailures = previousGate.partialFailures as { failures?: unknown; errors?: unknown } | undefined;
+      if (!Array.isArray(partialFailures?.failures) || !partialFailures.failures.every((id) => typeof id === 'string')
+        || !Array.isArray(partialFailures.errors) || !partialFailures.errors.every((id) => typeof id === 'string'))
+        return fallback('partial-resume has no complete prior failure record');
+      let priorFailures: string[];
+      let priorErrors: string[];
+      try {
+        const affected = new Set(planned.plan.files);
+        priorFailures = (partialFailures.failures as string[]).filter((id) => !affected.has(testFileOfId(id)));
+        priorErrors = (partialFailures.errors as string[]).filter((id) => !affected.has(testFileOfId(id)));
+      } catch { return fallback('partial-resume prior failure record is malformed'); }
+      const recheckPlan = { ...planned.plan, priorFailures, priorErrors, stalledFiles: planned.plan.files };
+      const path = dryRun ? undefined : writeRecheckPlan(root, recheckPlan);
+      debug.log('release-loop.resume', 'interference-recheck-planned', { version: tip.version, commit: tip.to,
+        remeasureFileCount: recheckPlan.files.length, fallbackReason: null, ...(path ? { path } : {}), dryRun });
+      return { requested: true, applied: true, files: recheckPlan.files.length, priorCommit: tip.to, ...(auto ? { auto: true as const } : {}) };
+    }
     const stalled = previousGate?.stalledShards;
     const summary = previousGate?.partialSummary as { pass?: unknown; fail?: unknown; errors?: unknown; ran?: unknown; files?: unknown } | undefined;
     const measured = previousGate?.partialFailures as { failures?: unknown; errors?: unknown } | undefined;
@@ -600,19 +664,25 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
     waiverCommit = recorded;
   }
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
+  const fromIndex = savedRun.path.indexOf(opts.from);
+  const gateIndex = savedRun.path.indexOf('gate');
+  const gateWillRun = fromIndex >= 0 && gateIndex >= fromIndex;
   if (opts.rerouteShard !== undefined && tip.changed) throw new Error('shard reroute requires the original cut head; moved tip needs a full re-gate');
   verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, tip.version);
   const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), tip.to, deps.git);
   verifyResumePreflight(savedRun, opts, deps, tip.version, tip.from, tip.to, commandRoot);
-  const partial = preparePartial(tip, opts.rerouteShard !== undefined ? { ...opts, partial: false } : opts, deps, true);
-  const fromIndex = savedRun.path.indexOf(opts.from);
-  const gateIndex = savedRun.path.indexOf('gate');
-  const gateWillRun = fromIndex >= 0 && gateIndex >= fromIndex;
+  const autoheal = gateWillRun ? priorGateAutoheal(savedRun) : undefined;
+  const autoReroute = opts.rerouteShard === undefined ? automaticReroute(savedRun, autoheal, tip.changed, opts.from) : undefined;
+  const automaticShardReroute = autoReroute ? releaseResumeGateShardReroute(savedRun, { from: opts.from, shard: autoReroute }) : undefined;
+  const effectiveOpts = automaticShardReroute ? { ...opts, rerouteShard: automaticShardReroute.set.gateRerouteShard } : opts;
+  const partial = preparePartial(tip, effectiveOpts.rerouteShard !== undefined ? { ...effectiveOpts, partial: false } : effectiveOpts, deps, true);
   const gatePlan = !gateWillRun ? { mode: 'not-run' as const }
     : partial.requested && partial.applied ? { mode: 'partial' as const }
       : { mode: 'full' as const, reason: partial.requested ? partial.reason : opts.partial === false ? 'partial recheck disabled' : 'no partial plan applies' };
+  if (autoheal) debug.log('release-loop.resume', 'gate-autoheal-plan', { runId: opts.runId, version: tip.version, appliedReroute: automaticShardReroute?.set.gateRerouteShard ?? null, ...autoheal });
   return { runId: opts.runId, version: tip.version, fromNode: opts.from, commandRoot, tip, partial,
-    gatePlan, nextAttempt: attempt.attempt, priorCountKnown: attempt.priorCountKnown, preflight: 'passed' };
+    gatePlan, ...(autoheal ? { autoheal } : {}), ...(automaticShardReroute ? { autohealReroute: automaticShardReroute.set.gateRerouteShard } : {}),
+    nextAttempt: attempt.attempt, priorCountKnown: attempt.priorCountKnown, preflight: 'passed' };
 }
 
 async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeReleaseDeps): Promise<{ tip: TipRefresh; partial: PartialOutcome; state: GraphRunState }> {
@@ -667,7 +737,12 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), previewTip.to, deps.git);
   verifyResumePreflight(savedRun, opts, deps, previewTip.version, previewTip.from, previewTip.to, commandRoot);
   const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, false, previewTip.to);
-  const partial = preparePartial(tip, shardReroute ? { ...opts, partial: false } : opts, deps);
+  const autoheal = priorGateAutoheal(savedRun);
+  const autoReroute = !shardReroute ? automaticReroute(savedRun, autoheal, tip.changed, opts.from) : undefined;
+  const automaticShardReroute = autoReroute ? releaseResumeGateShardReroute(savedRun, { from: opts.from, shard: autoReroute }) : undefined;
+  const partial = preparePartial(tip, shardReroute || automaticShardReroute
+    ? { ...opts, rerouteShard: (shardReroute ?? automaticShardReroute)!.set.gateRerouteShard, partial: false } : opts, deps);
+  if (autoheal) debug.log('release-loop.resume', 'gate-autoheal-plan', { runId: opts.runId, version: tip.version, appliedReroute: automaticShardReroute?.set.gateRerouteShard ?? null, ...autoheal });
   // A failed preflight does not consume an observed release resume attempt.
   const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now });
   debug.log('release-loop.resume', 'attempt', { runId: opts.runId, attempt: attempt.attempt,
@@ -682,8 +757,8 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     ...(acceptedRegressions ? { releaseAcceptedRegressions: { requested: opts.acceptedRegressions!, acceptedRegressions } } : {}),
     ...(gateExecutor ? { releaseGateExecutor: { executor: gateExecutor.set.gateExecutor, ...(opts.gateHost !== undefined ? { host: opts.gateHost } : {}) } } : {}),
     ...(gatePodPool ? { releaseGatePodPool: gatePodPool.set.gatePodPool } : {}),
-    ...(shardReroute ? { releaseGateShardReroute: { shard: shardReroute.set.gateRerouteShard,
-      ...(shardReroute.set.gateShardHost ? { host: shardReroute.set.gateShardHost } : {}),
+    ...(shardReroute || automaticShardReroute ? { releaseGateShardReroute: { shard: (shardReroute ?? automaticShardReroute)!.set.gateRerouteShard,
+      ...((shardReroute ?? automaticShardReroute)!.set.gateShardHost ? { host: (shardReroute ?? automaticShardReroute)!.set.gateShardHost } : {}),
       ...(opts.shardOs ? { os: opts.shardOs } : {}) } } : {}),
     deps: { root: deps.root, ...(deps.runBash ? { runBash: deps.runBash } : {}) } });
   return { tip, partial, state };

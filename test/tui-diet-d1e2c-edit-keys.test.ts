@@ -5,6 +5,16 @@ import { textInput } from '../src/chat/index.js';
 import { resolveTextInputTextAction } from '../src/chat/input-text-key.js';
 import { applyTurnTypeaheadKey } from '../src/chat/turn-typeahead.js';
 
+async function withoutStdoutEcho<T>(run: () => Promise<T>): Promise<T> {
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  try {
+    return await run();
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+}
+
 describe('D1e-2c TUI edit-key wiring', () => {
   const parsed = (sequence: string) => {
     const [key] = splitKeys(sequence);
@@ -57,33 +67,37 @@ describe('D1e-2c TUI edit-key wiring', () => {
   });
 
   test('textInput routes Ctrl+Left to the word boundary before inserting', async () => {
-    const keys = splitKeys('\x1b[1;5DX\r');
-    const result = await textInput({
-      row: 1, col: 1, width: 80, initialText: 'abc def',
-      readKey: async () => keys.shift()!,
-    });
-    expect(result).toMatchObject({ text: 'abc Xdef', submitted: true });
+    await withoutStdoutEcho(async () => {
+      const keys = splitKeys('\x1b[1;5DX\r');
+      const result = await textInput({
+        row: 1, col: 1, width: 80, initialText: 'abc def',
+        readKey: async () => keys.shift()!,
+      });
+      expect(result).toMatchObject({ text: 'abc Xdef', submitted: true });
 
-    const rightKeys = splitKeys('\x1b[1;5D\x1b[1;5CX\r');
-    expect(await textInput({
-      row: 1, col: 1, width: 80, initialText: 'abc def',
-      readKey: async () => rightKeys.shift()!,
-    })).toMatchObject({ text: 'abc defX', submitted: true });
+      const rightKeys = splitKeys('\x1b[1;5D\x1b[1;5CX\r');
+      expect(await textInput({
+        row: 1, col: 1, width: 80, initialText: 'abc def',
+        readKey: async () => rightKeys.shift()!,
+      })).toMatchObject({ text: 'abc defX', submitted: true });
+    });
   });
 
   test('textInput handles Ctrl+W and bare Delete in the actual key loop', async () => {
-    const wordKeys = splitKeys('\x17X\r');
-    const wordResult = await textInput({
-      row: 1, col: 1, width: 80, initialText: 'abc def',
-      readKey: async () => wordKeys.shift()!,
-    });
-    expect(wordResult).toMatchObject({ text: 'abc X', submitted: true });
+    await withoutStdoutEcho(async () => {
+      const wordKeys = splitKeys('\x17X\r');
+      const wordResult = await textInput({
+        row: 1, col: 1, width: 80, initialText: 'abc def',
+        readKey: async () => wordKeys.shift()!,
+      });
+      expect(wordResult).toMatchObject({ text: 'abc X', submitted: true });
 
-    const keys = splitKeys('\x1b[D\x1b[D\x1b[3~\r');
-    expect(await textInput({
-      row: 1, col: 1, width: 80, initialText: 'abc',
-      readKey: async () => keys.shift()!,
-    })).toMatchObject({ text: 'ac', submitted: true });
+      const keys = splitKeys('\x1b[D\x1b[D\x1b[3~\r');
+      expect(await textInput({
+        row: 1, col: 1, width: 80, initialText: 'abc',
+        readKey: async () => keys.shift()!,
+      })).toMatchObject({ text: 'ac', submitted: true });
+    });
   });
 
   test('other Ctrl combinations do not become text edits', () => {

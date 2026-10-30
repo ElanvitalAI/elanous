@@ -428,15 +428,32 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     const first = { number: 7, headRefName: 'old-branch', title: 'old', draft: true,
       updatedAt: '2026-10-19T00:00:00Z', headSha: head, labels: [], files: ['src/old.ts'], seat: null,
       cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' };
+    const events: Array<{ event: string; data: unknown }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => { events.push({ event, data }); });
     let checks = 0;
     const guard = () => guardNewPr({ files: ['src/new.ts'], cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123' }, {
-      status: 'checked', prs: ++checks === 1 ? [first] : [first, { ...first, number: 8, headRefName: 'second-branch' }],
+      status: 'checked', prs: ++checks === 1 ? [first] : [{ ...first, headRefName: 'renamed-branch', headSha: 'b'.repeat(40) },
+        { ...first, number: 8, headRefName: 'second-branch', headSha: 'c'.repeat(40) }],
     });
-    expect(makePrManager(run, guard).upsertPr({ ...input, body })).toMatchObject({
-      ok: false, reason: 'guard', detail: expect.stringContaining('OPEN PR inventory changed before push'),
-    });
-    expect(checks).toBe(2);
-    expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(false);
+    try {
+      expect(makePrManager(run, guard).upsertPr({ ...input, body })).toMatchObject({
+        ok: false, reason: 'guard', detail: expect.stringContaining('OPEN PR inventory changed before push'),
+      });
+      expect(checks).toBe(2);
+      expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(false);
+      const event = events.find((row) => row.event === 'same-cell-push-decision');
+      expect(event?.data).toMatchObject({
+        cardId: 'ta-123', ref: 'refs/heads/old-branch',
+        reason: 'OPEN PR inventory changed before push',
+        inventoryBefore: { conflicts: [{ pr: 7, branch: 'old-branch', headSha: head, cardId: 'ta-123', slice: null }],
+          reusable: { number: 7, branch: 'old-branch', headSha: head, cellId: 'PR-SAME-CELL-REUSE', cardId: 'ta-123', legacyBound: false } },
+        inventoryAfter: { conflicts: [{ pr: 7, branch: 'renamed-branch', headSha: 'b'.repeat(40), cardId: 'ta-123', slice: null },
+          { pr: 8, branch: 'second-branch', headSha: 'c'.repeat(40), cardId: 'ta-123', slice: null }], reusable: null },
+        inventoryDiff: { added: [{ pr: 8, branch: 'second-branch', headSha: 'c'.repeat(40), cardId: 'ta-123', slice: null }], removed: [],
+          changed: [{ pr: 7, before: { pr: 7, branch: 'old-branch', headSha: head, cardId: 'ta-123', slice: null },
+            after: { pr: 7, branch: 'renamed-branch', headSha: 'b'.repeat(40), cardId: 'ta-123', slice: null } }], reusableChanged: true },
+      });
+    } finally { log.mockRestore(); }
   });
 
   it('병합 중 PR head가 움직이거나 본문 카드가 모호해지면 push 전에 멈춘다', () => {

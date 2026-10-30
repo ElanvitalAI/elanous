@@ -29,6 +29,49 @@ export interface GateShardHost {
   reserved: boolean;
 }
 
+export type GateProgressState = 'pending' | 'running' | 'done' | 'failed' | 'timeout' | 'unmeasured';
+
+/** A host group or planned Pod shard as seen by the release gate's live progress observer. */
+export interface GateProgressGroup {
+  id: string;
+  state: GateProgressState;
+  host?: string;
+  startedAtMs?: number;
+  endedAtMs?: number;
+}
+
+export interface GateProgressSummary {
+  executor: 'host' | 'pod';
+  host: string | null;
+  completed: number;
+  total: number;
+  failed: number;
+  groups: Array<{ id: string; state: GateProgressState; host: string | null; elapsedMs: number | null }>;
+}
+
+/** Keep the progress event shape identical for serial host groups and parallel Pod shards. */
+export function summarizeGateProgress(input: {
+  executor: 'host' | 'pod';
+  groups: readonly GateProgressGroup[];
+  nowMs: number;
+}): GateProgressSummary {
+  const terminal = new Set<GateProgressState>(['done', 'failed', 'timeout', 'unmeasured']);
+  const hosts = [...new Set(input.groups.flatMap((group) => group.host?.trim() ? [group.host.trim()] : []))].sort();
+  return {
+    executor: input.executor,
+    host: hosts.length ? hosts.join(',') : null,
+    completed: input.groups.filter((group) => terminal.has(group.state)).length,
+    total: input.groups.length,
+    failed: input.groups.filter((group) => group.state === 'failed' || group.state === 'timeout').length,
+    groups: input.groups.map((group) => {
+      const end = group.endedAtMs ?? input.nowMs;
+      const elapsedMs = Number.isFinite(group.startedAtMs) && Number.isFinite(end)
+        ? Math.max(0, end - group.startedAtMs!) : null;
+      return { id: group.id, state: group.state, host: group.host?.trim() || null, elapsedMs };
+    }),
+  };
+}
+
 export interface GateShardDispatchInput {
   head40: string;
   base40: string;

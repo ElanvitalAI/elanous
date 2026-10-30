@@ -12,6 +12,59 @@ export function registerClassicSideSlash(
 ): void {
   registry.register(['side'], async (args, ctx) => {
     const sub = (args[0] ?? 'list').toLowerCase();
+    const getRows = (): SidetabRow[] => ctx.classicSidetabAgent?.loadRows(ctx.chatPersona?.sessionId())
+      ?? loadRows(ctx.chatPersona?.sessionId());
+    if (sub === 'open') {
+      const agent = (args[1] ?? '').toLowerCase();
+      if (args.length !== 2 || (agent !== 'codex' && agent !== 'claude')) {
+        ctx.chatLines.push(ctx.warning('  사용법: /side open codex|claude'));
+      } else if (!ctx.classicSidetabAgent) {
+        ctx.chatLines.push(ctx.warning('  classic agent sidetab을 사용할 수 없습니다'));
+      } else {
+        ctx.classicSidetabAgent.openAgent(agent);
+      }
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
+    if (sub === 'mission') {
+      const agent = (args[1] ?? '').toLowerCase();
+      const missionArgs = args.slice(2);
+      let outputPath: string | undefined;
+      const outputFlag = missionArgs.indexOf('--out');
+      if (outputFlag >= 0) {
+        outputPath = missionArgs[outputFlag + 1];
+        if (!outputPath) {
+          ctx.chatLines.push(ctx.warning('  사용법: /side mission codex|claude [--out <path>] <mission>'));
+          ctx.setChatScrollOffset(-1);
+          return;
+        }
+        missionArgs.splice(outputFlag, 2);
+      }
+      const mission = missionArgs.join(' ').trim();
+      if ((agent !== 'codex' && agent !== 'claude') || !mission) {
+        ctx.chatLines.push(ctx.warning('  사용법: /side mission codex|claude [--out <path>] <mission>'));
+      } else if (!ctx.classicSidetabAgent) {
+        ctx.chatLines.push(ctx.warning('  classic agent sidetab을 사용할 수 없습니다'));
+      } else {
+        const result = await ctx.classicSidetabAgent.runMission(agent, mission, outputPath);
+        if (result.ok) {
+          ctx.chatLines.push(ctx.success(`  ${agent} 미션 완료`));
+          ctx.chatLines.push(ctx.muted(`  promptReady=${Boolean(result.promptReady)}`));
+          ctx.chatLines.push(ctx.muted(`  missionVisible=${Boolean(result.missionVisible)}`));
+          ctx.chatLines.push(ctx.muted(`  promptReturned=${Boolean(result.promptReturned)}`));
+          ctx.chatLines.push(ctx.muted(`  completionMarker=${Boolean(result.completionMarker)}`));
+          ctx.chatLines.push(ctx.muted(`  결과 파일: ${result.path}${result.firstLine ? ` · ${result.firstLine}` : ''}`));
+        } else {
+          ctx.chatLines.push(ctx.muted(`  promptReady=${Boolean(result.promptReady)}`));
+          ctx.chatLines.push(ctx.muted(`  missionVisible=${Boolean(result.missionVisible)}`));
+          ctx.chatLines.push(ctx.muted(`  promptReturned=${Boolean(result.promptReturned)}`));
+          ctx.chatLines.push(ctx.muted(`  completionMarker=${Boolean(result.completionMarker)}`));
+          ctx.chatLines.push(ctx.warning(`  ${agent} 미션 실패 · ${result.error ?? '결과 확인 실패'}${result.path ? ` · ${result.path}` : ''}`));
+        }
+      }
+      ctx.setChatScrollOffset(-1);
+      return;
+    }
     if (sub === 'new') {
       if (args.length > 1) ctx.chatLines.push(ctx.warning('  사용법: /side new'));
       else ctx.termSlash.openNewTerminal();
@@ -25,7 +78,7 @@ export function registerClassicSideSlash(
     }
     // Use the same filtered manifest rows for display and numeric resolution;
     // never let an exited row shift the number shown to the user.
-    const rows = loadRows(ctx.chatPersona?.sessionId()).filter(row => row.badge !== 'exited');
+    const rows = getRows().filter(row => row.badge !== 'exited');
     if (sub === 'list') {
       if (rows.length === 0) ctx.chatLines.push(ctx.muted('  사이드탭 없음'));
       rows.forEach((row, i) => ctx.chatLines.push(ctx.muted(`  ${i + 1}. ${row.badge} ${row.label}`)));

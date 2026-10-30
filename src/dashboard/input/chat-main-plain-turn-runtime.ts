@@ -355,6 +355,7 @@ export async function runDashboardChatMainPlainTurn(
     // 기록되므로 request→first-token 구간은 그대로 측정된다. ISO 시각 좌표는
     // pty record 및 TUI-BOOT-TIME(src/index.ts) 부팅 계측과의 대응용이다.
     let firstTokenLogged = false;
+    let modelRequestStartedAt: number | null = null;
     const logFirstToken = (chunk: string): void => {
       if (firstTokenLogged || !chunk || abortCtrl.signal.aborted) return;
       firstTokenLogged = true;
@@ -362,6 +363,7 @@ export async function runDashboardChatMainPlainTurn(
       try {
         deps.debugLog?.('chat.turn', 'first-token', {
           ms: firstTokenAt - deps.turnStartedAt,
+          modelRequestMs: modelRequestStartedAt === null ? null : firstTokenAt - modelRequestStartedAt,
           turnStartedAt: deps.turnStartedAt,
           turnStartedAtIso,
           firstTokenAtIso: new Date(firstTokenAt).toISOString(),
@@ -391,6 +393,13 @@ export async function runDashboardChatMainPlainTurn(
         const attempt = async (stage: string): Promise<boolean> => {
           let emitted = false;
           try {
+            modelRequestStartedAt = Date.now();
+            try {
+              deps.debugLog?.('chat.turn.stage', 'model-request-start', {
+                attempt: stage,
+                msSinceTurnStart: modelRequestStartedAt - deps.turnStartedAt,
+              });
+            } catch { /* observation must never delay a turn */ }
             await deps.acpSession.send({
               ...opts,
               // 라우팅 줄은 브리지가 모델 호출 «전»에 보낸다 — 모델 출력이 아니므로 재시도를 막지 않는다.

@@ -7,6 +7,8 @@ import { authorRepairGoal } from '../harness/helper-repair.js';
 export type { SupervisorStopReason } from './run-types.js';
 export { SUPERVISOR_STOP_REASONS } from './run-types.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
+import { readRunChart, recordRunChartDecision } from '../self-implement/run-chart.js';
+import { runLedgerDir } from '../self-implement/run-ledger.js';
 import { debug } from '../debug/log.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
 import { selectKnowhowPack } from '../self-implement/knowhow-pack.js';
@@ -215,8 +217,8 @@ export function needsHumanRepairGoal(result: SupervisorJobResult, reason: NeedsH
   const outside = expandedBeyondTargetPaths(result);
   const repairTargets = result.targetPaths?.length ? result.targetPaths : undefined;
   return [
-    `[supervisor-needs-human-repair:${reason}] ${NEEDS_HUMAN_REPAIR_INSTRUCTION[reason]}`,
     ...(repairTargets?.length ? [`대상 경로: ${repairTargets.join(', ')}`] : []),
+    `[supervisor-needs-human-repair:${reason}] ${NEEDS_HUMAN_REPAIR_INSTRUCTION[reason]}`,
     ...(outside.length ? [`대상 경로 밖 변경: ${outside.join(', ')}`] : []),
     ...(result.error?.message ? [`이전 실패: ${result.error.message.slice(0, 200)}`] : []),
     result.feature,
@@ -447,7 +449,7 @@ function mustFixScopeDecision(
   return { byTask, ...(split.length ? { split } : {}), ...(askOwner.length ? { askOwner } : {}) };
 }
 
-export function decideNextRun(input: {
+type DecideNextRunInput = {
   results: readonly SupervisorJobResult[];
   history?: readonly SupervisorRound[];
   limits?: SupervisorLimits;
@@ -463,7 +465,11 @@ export function decideNextRun(input: {
   needsHumanReasonRepairExecution?: boolean;
   /** 분해 제안을 실제 조각 실행으로 승격할 수 있는 supervisor 경로에만 true. */
   decompositionExecution?: boolean;
-}): SupervisorDecision {
+  /** Chart context available to the outer-supervisor judgment; pulled from this same run only. */
+  runChart?: readonly { device: string; stopKey: string; observed: string; verdict: string; action: string; handoff: string | null; why: string; readStopKeys: readonly string[] }[];
+};
+
+function decideNextRunCore(input: DecideNextRunInput): SupervisorDecision {
   const results = [...input.results];
   const history = [...(input.history ?? [])];
   const maxRounds = input.limits?.maxRounds ?? DEFAULT_MAX_ROUNDS;
@@ -923,6 +929,26 @@ export function decideNextRun(input: {
   };
 }
 
+/** Consume an unread doctor→reauthor chart handoff before returning a terminal exit. */
+export function decideNextRun(input: DecideNextRunInput): SupervisorDecision {
+  const decision = decideNextRunCore(input);
+  if (decision.action !== 'stop' || decision.stopReason === 'max-rounds') return decision;
+  const pendingReauthor = [...(input.runChart ?? [])].reverse().find((cell) => cell.handoff === 'reauthor'
+    && !input.runChart?.some((later) => later.device === 'outer-supervisor' && later.readStopKeys.includes(cell.stopKey)));
+  if (!pendingReauthor) return decision;
+  const eligible = input.results.filter((result) => decision.needsHuman.includes(result.taskId)
+    && result.status === 'failed' && result.feature.trim() && result.prNumber === undefined && !result.prUrl);
+  if (eligible.length === 0 || decision.round > (input.limits?.maxRounds ?? DEFAULT_MAX_ROUNDS)) return decision;
+  const taskIds = eligible.map((result) => result.taskId);
+  return { ...decision, action: 'relaunch', stopReason: undefined,
+    rerunnable: [...new Set([...decision.rerunnable, ...taskIds])],
+    needsHuman: decision.needsHuman.filter((taskId) => !taskIds.includes(taskId)),
+    classifications: decision.classifications.map((classification) => taskIds.includes(classification.taskId)
+      ? { ...classification, action: 'rerun' as const } : classification),
+    why: `run-chart handoff=reauthor consumed (${pendingReauthor.stopKey}) — needs-human 조각 ${taskIds.length}개를 재발사`,
+  };
+}
+
 export function appendRound(
   history: readonly SupervisorRound[],
   results: readonly SupervisorJobResult[],
@@ -1298,6 +1324,10 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
     const allUnreviewedAreNoDiff = unreviewed.length > 0
       && unreviewed.every((result) => result.reviewReason === 'no-diff');
 
+    const chartRunId = opts.runStore?.runId ?? results.find((result) => result.runId?.trim())?.runId ?? null;
+    const chartDir = opts.runStore?.dir ?? runLedgerDir();
+    const chartBeforeJudgment = chartRunId ? readRunChart(chartRunId, 'outer-supervisor', chartDir) : [];
+
     let decision = decideNextRun({
       results,
       history,
@@ -1309,11 +1339,19 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
       ...(opts.limits ? { limits: opts.limits } : {}),
       ...(observed.deployFindings ? { deployFindings: observed.deployFindings } : {}),
       deliverableObservation: observed.state,
+      runChart: chartBeforeJudgment,
       ...(unreviewed.length > 0 ? {
         reviewed: false,
         ...(allUnreviewedAreNoDiff ? { reviewReason: 'no-diff' } : {}),
       } : {}),
     });
+    if (chartRunId) {
+      recordRunChartDecision({ runId: chartRunId, device: 'outer-supervisor',
+        stopKey: `${chartRunId}:outer-supervisor:${history.length + 1}`, observed: `results=${results.length}`,
+        verdict: decision.action, action: decision.action === 'stop' ? decision.stopReason ?? 'stop' : 'relaunch',
+        handoff: decision.action === 'stop' ? 'human' : 'macrophage', why: decision.why,
+        readStopKeys: chartBeforeJudgment.map((cell) => cell.stopKey), dir: chartDir });
+    }
 
     const reasonRepairSkipped = decision.action !== 'stop' || decision.stopReason !== 'needs-human' || history.length + 1 > maxRounds
       ? [] : results.flatMap((result) => {
@@ -1342,7 +1380,7 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
       }
     }
 
-    const runId = opts.runStore?.runId ?? results.find((result) => result.runId?.trim())?.runId ?? null;
+    const runId = chartRunId;
 
     let decomposePromotion: DecomposePromotionObservation = decision.decomposable.length === 0
       ? { attempted: false, reason: 'no-decomposable-decision' }

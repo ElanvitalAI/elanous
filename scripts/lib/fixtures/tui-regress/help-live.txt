@@ -1,0 +1,42 @@
+PtyShellSnapshot process_id=pty_43b7df65 status=running source=live
+[screen 160x40 cursor=(row 36, col 2, visible true)]
+─┤ ChatLog ├───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  elanous | daemon: absent · start: elanous --test=/private/var/folders/ws/f7tkbp2d4mg7_98pvhllpt140000gn/T/elanous-drive-UG60Kh nexus run --hmr
+
+
+
+
+
+                        ┌─────────────────────────────────────────────── Dashboard help ───────────────────────────────────────────────┐
+                        │Commands                                                                                                      │
+                        │▸ 시작                                                 /clear (cls)  대화 기록 지우기                         │
+                        │/help (?)  명령과 키 보기                              /model (m)  모델 바꾸기 — /model 빠름|보통|깊음 (코드… │
+                        │/resume  지난 대화 이어 가기 · /resume <id 앞자리>     /status (st)  지금 상태 — 모델 · 연결 · 계정           │
+                        │▸ 지켜보기                                             /now  현재 맥락과 출처 표 — /now [주제]                │
+                        │/remaining  계정별 남은 사용량                         ▸ 조사하기                                             │
+                        │/context (ctx)  Show / clear / drop attached files     ▸ 판단하기                                             │
+                        │/decide (dec)  열린 결정 카드 보기·답하기 — /decide [… ▸ 만들기                                               │
+                        │/harness  Harness — /harness <goal> (self-dev) · plan… ▸ 기억하기                                             │
+                        │/memory (mem)  Memory ops — list / show / search / ad… /session (sess)  Session resume — list / load / sync … │
+                        │▸ 그 밖                                                /quit (q, exit)  나가기                                │
+                        │/setup  상세 설정 — /setup · /setup reset(다음 실행 …  /side  사이드탭 기초 — 목록 · 셸 생성 · 번호로 PTY 보… │
+                        │                                                                                                              │
+                        │Keys                                                                                                          │
+                        │Enter  Send message                                                                                           │
+                        │Esc  Stop the answer (Esc again = rewind) · clear input / close help                                          │
+                        │Ctrl+U  Clear text before cursor                                                                              │
+                        │Ctrl+W  Delete previous word                                                                                  │
+                        │Ctrl+← / →  Move by word                                                                                      │
+                        │Delete  Delete next character                                                                                 │
+                        │Home / End  Move to start / end of line                                                                       │
+                        │Ctrl+A / E  Move to start / end of line                                                                       │
+                        │PgUp / PgDn  Scroll chat log                                                                                  │
+                        │Ctrl+↑  Recall all queued lines (Enter while answering queues · empty Enter pushes now)                       │
+                        └──────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯                                                                                                                                                              
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ 📁 work/OP-release-0241-resume  │ ⌥ 트리 HEAD@02594ba │ ▶ 실행 02594ba │ gpt-6-luna │ ⛭ pid:56132 │ ctx 0 │ 🖥 MacBookProM5

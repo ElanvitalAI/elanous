@@ -4,7 +4,6 @@
 // layout via the plugin host.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
 import { fileURLToPath } from 'node:url';
 import { createRunningBuildStatus } from './running-build-status.js';
 import { reportTuiAbortRequested, reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
@@ -165,7 +164,7 @@ function loadLastSelection(): LastSelection | null {
 import { getLocalSkills, executeSync } from '../sync.js';
 import { computeDiff } from '../smart.js';
 import { summarizeDiff, isAnalyzerAvailable } from '../grok.js';
-import { C, ICONS, ansi, initTui, closeTui, setExitNotice, readKey, setKeyTracer, render, termSize, pad, stripAnsi, hLine, showHelp, invalidateRenderCacheRow, wrapAnsiByWidth, injectKey } from '../tui.js';
+import { C, ICONS, ansi, initTui, closeTui, setExitNotice, readKey, setKeyTracer, render, termSize, pad, stripAnsi, hLine, showHelp, invalidateRenderCacheRow, wrapAnsiByWidth, injectKey, setExternalTuiKeyRoute } from '../tui.js';
 import { paintCursor, type CursorState } from '../display/cursor-state.js';
 import type { CursorDecision } from '../display/cursor-owner.js';
 import type { Key, RenderOptions } from '../tui.js';
@@ -775,6 +774,21 @@ export function getEscAbortRunningCount(
     return Math.max(1, registeredRunning);
   }
 }
+
+/** The classic dashboard's ACP callbacks use this exact tested mission adapter. */
+export function createDashboardClassicSidetabMissionCallbacks(
+  runMission: (agent: 'codex' | 'claude', mission: string, context?: ClassicSidetabMissionDispatchContext) => Promise<ClassicSidetabMissionResult>,
+  cancelMission?: (interactionId: string) => Promise<boolean>,
+): ClassicSidetabMissionIntegration {
+  return createClassicSidetabMissionIntegration(runMission, cancelMission);
+}
+
+/** Bind the classic sidetab runtime to the ACP tool callbacks used by the dashboard. */
+export function createDashboardClassicSidetabMissionAcpBridge(runtime: {
+  runMission: (agent: 'codex' | 'claude', mission: string) => Promise<ClassicSidetabMissionResult>;
+}): ClassicSidetabMissionIntegration {
+  return createDashboardClassicSidetabMissionCallbacks((agent, mission) => runtime.runMission(agent, mission));
+}
 import { needsOnboarding, resetOnboardingMarker } from '../onboarding.js';
 import {
   getUserConfig, reloadUserConfig, saveUserConfig,
@@ -955,7 +969,11 @@ import {
   runDashboardScratchExportAction,
 } from './context-menu-action-runtime.js';
 import { createDashboardTerminalPopupRuntime } from './terminal-popup-runtime.js';
-import { createDashboardSidetabRuntime } from './sidetab-runtime.js';
+import { createDashboardSidetabRuntime, mergeLocalAgentSessions, runDashboardAgentMission } from './sidetab-runtime.js';
+import { CLASSIC_SIDETAB_MISSION_TOOL_NAME, createClassicSidetabMissionIntegration, type ClassicSidetabMissionDispatchContext, type ClassicSidetabMissionIntegration, type ClassicSidetabMissionResult } from './classic-sidetab-mission.js';
+import { cancelClassicMissionCli, startClassicMissionCli } from './mission-cli-consumer.js';
+import { enqueueClassicSidetabMissionCompletion } from './classic-sidetab-mission-job.js';
+import { loadSidetabRows } from '../sidetab-core/model.js';
 import { toggleDashboardAssistantRenderState } from './assistant-render-state-runtime.js';
 import { bootDashboardAcpBgSweep } from './acp-bg-sweep-boot.js';
 import { bootDashboardConfigTools } from './config-tools-boot.js';
@@ -1165,7 +1183,7 @@ import { userMessagePositions, truncateBeforeNthUser } from '../acp/session-fork
 import { resolveEscEscRewind } from '../chat/esc-esc-rewind.js';
 import { wirePersistence } from '../terminal/session-persistence.js';
 import { renderMarkdown as renderMarkdownGlow } from '../markdown-preview.js';
-import { basename, dirname } from 'path';
+import { basename, dirname, isAbsolute, join, resolve } from 'path';
 import { statSync } from 'fs';
 import {
   FIGURES, toolHeader, toolResult,
@@ -7629,7 +7647,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   try { refreshSkills(skillView); refreshSkillFiles(skillView); } catch { /* missing root fine */ }
   // SK2 — a skill the index could not read is a one-line notice with the repair command, never a crash.
   try {
-    getSkillIndex();
+    const skillIndexStartedAt = performance.now();
+    const skillIndex = getSkillIndex();
+    debug.log('tui.skill-index', 'startup-ready', {
+      elapsedMs: Math.round((performance.now() - skillIndexStartedAt) * 10) / 10,
+      skillCount: skillIndex.length,
+    });
     const problems = skillIndexProblems();
     const notice = skillRepairNotice(problems);
     if (notice) chatLines.push(C.info(notice));
@@ -13552,6 +13575,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const openInteractiveTerminalPopup = (req: TerminalPopupRequest): TerminalSession | null => {
       const { cols: tc, rows: tr } = termSize();
       let spawnedSessionId: string | null = null;
+      let releaseExternalKeyRoute: () => void = () => {};
       const sessionLabel = req.kind === 'coding-agent' ? req.brand : 'shell';
 
       if (debug.enabled) {
@@ -13566,6 +13590,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         if (terminalModalRouter.current()?.id === s.id) {
           terminalModalRouter.set(null);
         }
+        releaseExternalKeyRoute();
         try { s.modal?.dispose(); } catch { /* ignore */ }
         s.modal = null;
         chatLines.push(C.muted(`  terminal exited: ${s.id}`));
@@ -13624,6 +13649,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         if (terminalModalRouter.current()?.id === sid) {
           terminalModalRouter.set(null);
         }
+        releaseExternalKeyRoute();
         try {
           if (action === 'minimize') sessionRegistry.detach(sid);
           else sessionRegistry.kill(sid);
@@ -13694,7 +13720,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
       if (session.modal) {
         terminalModalRouter.set(session.modal, {
-          onClose: () => { sessionRegistry.detach(session.id); draw(); },
+          onClose: () => { releaseExternalKeyRoute(); sessionRegistry.detach(session.id); draw(); },
+        });
+        releaseExternalKeyRoute = setExternalTuiKeyRoute((key) => {
+          if (terminalModalRouter.current()?.id !== session.id) return false;
+          const result = terminalModalRouter.handleKey(toDashboardKeyEvent(key));
+          if (result === 'closed') draw();
+          return true;
         });
         if (debug.enabled) {
           debug.log('window.terminalModalRouter.set', session.modal.id, {
@@ -13747,6 +13779,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const classicSidetabRuntime = createDashboardSidetabRuntime({
       currentSessionId: () => currentChatPersonaSessionId(),
       termSize,
+      loadRows: (sessionId) => mergeLocalAgentSessions(loadSidetabRows(false, sessionId), sessionRegistry.list()),
       pushModal: (surface) => {
         attachSurfaceToWorkspace(surface, currentWorkspaceOwnerId());
         const handle = display.pushModal(surface);
@@ -13782,6 +13815,36 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           });
       },
       spawnShell: () => { spawnGlobalTerminalModal(); },
+      spawnAgent: (agent) => {
+        TerminalPopup.agent(agent === 'claude' ? 'claude-code' : 'codex').cwd(workingDir.cwd).open();
+      },
+      runMission: async (agent, mission, requestedOutputPath) => {
+        return runDashboardAgentMission({
+          agent,
+          requestedOutputPath,
+          open: () => TerminalPopup.agent(agent === 'claude' ? 'claude-code' : 'codex').cwd(workingDir.cwd).open() ?? undefined,
+          modal: (session) => session.modal,
+          outputPath: (session, requestedPath) => requestedPath
+            ? (isAbsolute(requestedPath) ? requestedPath : resolve(session.cwd, requestedPath))
+            : join(session.cwd, '.elanous', 'mission-results', `classic-sidetab-${Date.now()}.md`),
+          run: async (session, modal, outputPath) => {
+            const [{ runVisibleAgentMission }, { codexBackend, claudeBackend }] = await Promise.all([
+              import('../sidetab-core/visible-agent-mission.js'),
+              import('../agent-mission/driver.js'),
+            ]);
+            const backend = agent === 'codex' ? codexBackend : claudeBackend;
+            return runVisibleAgentMission({
+              pty: modal,
+              mission,
+              outputPath,
+              handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
+            });
+          },
+          close: (session) => {
+            if (terminalModalRouter.current()?.id === session.id) terminalModalRouter.close();
+          },
+        });
+      },
       detach: (row) => {
         if (row?.currentProcess) {
           chatLines.push(C.muted('  현재 classic TUI는 분리할 수 없습니다'));
@@ -13822,6 +13885,26 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       },
     });
     closeClassicSidetabRuntime = () => classicSidetabRuntime.close();
+    const classicSidetabMission = createDashboardClassicSidetabMissionCallbacks(async (agent, mission, context) => {
+      const started = await startClassicMissionCli({
+        agent,
+        prompt: mission,
+        onInteractionId: (interactionId) => debug.log('classic-sidetab.mission', 'started', {
+          interactionId,
+          toolCallId: context?.callId ?? null,
+        }),
+      });
+      if (!('completion' in started)) return started;
+      const job = started;
+      enqueueClassicSidetabMissionCompletion(job, agent, (notification) => globalTaskNotificationQueue.enqueue(notification));
+      return {
+        ok: true,
+        status: 'running',
+        interactionId: job.interactionId,
+        path: job.path,
+        content: 'Independent sidetab job started; this conversation can continue.',
+      };
+    }, cancelClassicMissionCli);
     disposeClassicSigquit = registerClassicSigquitHandler(() => {
       classicSidetabRuntime.beginPrefix();
     });
@@ -15323,6 +15406,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         // pure assembly over already-loaded specs.
         getPreamble: ({ sessionId, userText }) => {
           const runtime = acpToolRuntime;
+          const turnUserConfig = getUserConfig();
+          const activeModel = inspectActiveProvider().model;
           const tools = runtime
             ? buildSessionRuntimeToolSpecs({
                 userText,
@@ -15332,6 +15417,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 surface: acpTurnRef.turnProfile?.surface,
               })
             : [];
+          const classicTools = runtime ? classicSidetabMission.getTools(tools) : tools;
           return [
             ...tuiChatPersonaMessages(currentChatPersonaSessionId(), chatPersonaSelection),
             ...buildDashboardTurnPreamble({
@@ -15339,13 +15425,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               sessionId,
               cwd: getSessionCwd(),
               turnProfile: acpTurnRef.turnProfile,
-              userConfig: getUserConfig(),
+              userConfig: turnUserConfig,
+              skillCatalog: applySkillFilter(getSkillIndex(), turnUserConfig.skills),
+              skillCatalogModelId: activeModel,
               // Resolved per-turn so a mid-session model switch (codex →
               // claude or vice-versa) takes effect immediately. Drives the
               // codex-only behavioral addendum (fix L-1) inside the
               // universal preamble.
-              modelFamily: getModelFamily(inspectActiveProvider().model),
-              enabledTools: tools.map(t => t.name),
+              modelFamily: getModelFamily(activeModel),
+              enabledTools: classicTools.map(t => t.name),
               seatBoot: true,
             }),
           ];
@@ -15360,6 +15448,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             optionalTools: acpTurnRef.optionalSpecs,
             surface: acpTurnRef.turnProfile?.surface,
           });
+          const classicTools = classicSidetabMission.getTools(tools);
           // ⭐ Remember this turn's catalog so a spawned sub-agent can inherit it.
           //
           //  `dispatchAgent` computes `childTools = (hostTools ?? []).filter(...)`,
@@ -15367,8 +15456,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           //  or edit anything, which is the whole point of delegating code work.
           //  Exposing `Agent` without this wiring is worse than not exposing it:
           //  the model picks a delegate that provably cannot act.
-          acpTurnToolSpecs = tools;
-          return tools;
+          acpTurnToolSpecs = classicTools.filter(tool => tool.name !== CLASSIC_SIDETAB_MISSION_TOOL_NAME);
+          return classicTools;
         },
         // R2 essential TUI execution boundary: ACP receives the same
         // Codex-first decision as every other surface. The core bridge now
@@ -15384,6 +15473,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // Count at the server-side boundary, before any tool effect and
           // before the ACP notification can reach the TUI client.
           acpToolDispatchCount++;
+          const classicMissionResult = classicSidetabMission.dispatchTool(name, args, {
+            callId: ctx?.callId,
+          });
+          if (classicMissionResult) return classicMissionResult;
+          // For Agent with no `hand` or `hand: internal`, the sidetab
+          // interceptor deliberately returns undefined; keep the established
+          // session-runtime Agent dispatcher below as the built-in fallback.
           const runtime = acpToolRuntime;
           const persist = acpPersistToolOutputPreview;
           if (!runtime || !persist) {
@@ -15403,6 +15499,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             signalAlreadyAborted: turnSignal.aborted,
           });
           const dispatchPromise = dispatchDashboardSessionRuntimeTool(name, args, {
+            sessionId: ctx?.sessionId,
             contextUserText,
             turnRefUserText,
             muted: C.muted,
@@ -15434,6 +15531,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             dispatchToolRuntime: (toolName, input, toolCallId) =>
               runtime.dispatchToolByName(toolName, input, {
                 surface: 'tui',
+                parentSessionId: ctx?.sessionId,
                 toolCallId,
                 signal: hasParentTurnAbortSignal ? turnSignal : undefined,
                 // ⭐ Agent-family context. Without these two the sub-agent runs
@@ -17535,6 +17633,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             const slashCtx: DashboardSlashContext = {
               ad: { run: (args) => dispatchDashboardAdSlash(adSlashRuntime, [...args], () => { draw(); }) },
               chatLines,
+              classicSidetabAgent: {
+                loadRows: (sessionId) => classicSidetabRuntime.loadRows(sessionId),
+                openAgent: (agent) => classicSidetabRuntime.openAgent(agent),
+                runMission: (agent, mission, outputPath) => classicSidetabRuntime.runMission(agent, mission, outputPath),
+              },
               getStatusLines: getDashboardStatusLines,
               ...(clarificationSurfaceUx ? { surfaceUx: clarificationSurfaceUx } : {}),
               attachmentRowMap,
@@ -18765,16 +18868,26 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             // project. The raw index cache stays shared across callers —
             // this filter is applied on read.
             const skillsCfg = getUserConfig().skills;
-            const visibleIndex = applySkillFilter(getSkillIndex(), {
+            const skillIndexStartedAt = performance.now();
+            const skillIndex = getSkillIndex();
+            const visibleIndex = applySkillFilter(skillIndex, {
               allow: skillsCfg.allow, deny: skillsCfg.deny,
             });
+            try {
+              debug.log('chat.turn.stage', 'skill-index-ready', {
+                elapsedMs: Math.round((performance.now() - skillIndexStartedAt) * 10) / 10,
+                skillCount: skillIndex.length,
+                visibleSkillCount: visibleIndex.length,
+              });
+            } catch { /* observation must never delay a turn */ }
             let detection: DetectResult = { candidates: [], top: null, unambiguous: false };
+            const routeStartedAt = performance.now();
+            let routeOutcome: 'complete' | 'aborted' | 'failed' = 'failed';
             try {
               // Tier-aware full-menu routing (2026-07-20): pass the active
               // model tier so a T1 frontier model can route the whole skill
               // menu when keyword matching is weak/empty (Korean prompts).
               const detectTier = getModelTier(getUserConfig().llm.provider, getUserConfig().llm.model);
-              const routeStartedAt = Date.now();
               const route = await runAbortableDashboardSkillRoute({
                 attachKeys: (ctrl: AbortController) => attachChatStreamingKeys(ctrl, { turnEnd: false }),
                 detect: (signal) => detectDashboardSkillRoute(tok.text, visibleIndex, {
@@ -18789,12 +18902,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 }),
               });
               if (route.aborted) {
-                debug.log('skill.router', 'route-aborted-by-esc', { elapsedMs: Date.now() - routeStartedAt });
+                debug.log('skill.router', 'route-aborted-by-esc', { elapsedMs: Math.round((performance.now() - routeStartedAt) * 10) / 10 });
+                routeOutcome = 'aborted';
                 thinking.stop({ status: 'interrupted' });
                 draw();
                 continue;
               }
               detection = route.detection;
+              routeOutcome = 'complete';
               // Observability (2026-07-20) — the routing DECISION had no
               // debug category (only surfaced as a UI hint). Emit it so
               // `elanous logs --category skill.router` shows trigger/triage
@@ -18809,8 +18924,22 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 unambiguous: detection.unambiguous,
               });
             } catch (err) {
-              debug.log('skill.router', 'decision-error', { text: tok.text.slice(0, 80), error: (err as any)?.message ?? String(err) }, { level: 'error' });
+              debug.log('skill.router', 'decision-error', {
+                text: tok.text.slice(0, 80),
+                error: (err as any)?.message ?? String(err),
+                elapsedMs: Math.round((performance.now() - routeStartedAt) * 10) / 10,
+              }, { level: 'error' });
               /* router must never block chat */
+            } finally {
+              try {
+                debug.log('chat.turn.stage', 'skill-router-complete', {
+                  elapsedMs: Math.round((performance.now() - routeStartedAt) * 10) / 10,
+                  outcome: routeOutcome,
+                  llmFallback: userCfg.llmFallback,
+                  visibleSkillCount: visibleIndex.length,
+                  candidateCount: detection.candidates.length,
+                });
+              } catch { /* observation must never delay a turn */ }
             }
 
             // Session 21 — session-scoped decline short-circuit. If the
@@ -18945,6 +19074,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 getActivePluginName: () => pluginHost.active()?.name,
               },
               inputSource,
+              chat.history
+                .filter(message => message.role === 'user' && typeof message.content === 'string')
+                .map(message => String(message.content)),
             ),
             buildTurnMessage: (args) => buildDashboardTurnMessage({
               userText: args.userText,
@@ -18986,6 +19118,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   cwd: args.cwd,
                   turnProfile: args.turnProfile as SessionTurnProfile,
                   userConfig: args.userConfig,
+                  skillCatalog: applySkillFilter(getSkillIndex(), args.userConfig.skills),
+                  skillCatalogModelId: inspectActiveProvider().model,
                   enabledTools: tools.map(t => t.name),
                   seatBoot: true,
                 }),

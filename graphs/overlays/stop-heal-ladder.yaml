@@ -66,6 +66,7 @@ overlay_id: stop-heal-ladder-pod-died
 target: self-implement
 stage: heal
 applies_when: stop_class == pod-died
+reason_map: { pod-died: pod-died, OOMKilled: pod-died, OOM: pod-died }
 patch:
   - op: add
     path: /nodes/-
@@ -124,3 +125,115 @@ patch:
   - op: add
     path: /edges/-
     value: { from: review-round-reauthor, on: outcome, map: { healed: dispatch, follow-up: stopped, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-implement-aborted
+target: self-implement
+stage: heal
+applies_when: stop_class == implement-aborted
+reason_map: { implement aborted: implement-aborted, implement-aborted: implement-aborted }
+patch:
+  - op: add
+    path: /nodes/-
+    value: { nodeId: reauthor-from-materialized, kind: judge, recipe: revise-goal, maxVisits: 1, journeyStage: recover, contract: { inputs: [goal, materialized-run], tools: read-only, outputs: [revised-goal, relaunch-request] } }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { implement-aborted: reauthor-from-materialized } }
+  - op: add
+    path: /edges/-
+    value: { from: reauthor-from-materialized, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-out-of-scope-held
+target: self-implement
+stage: heal
+applies_when: stop_class == out-of-scope-held
+reason_map: { Out-of-scope edits held: out-of-scope-held, out-of-scope-held: out-of-scope-held }
+patch:
+  - op: add
+    path: /nodes/-
+    value: { nodeId: reauthor-from-materialized, kind: judge, recipe: revise-goal, maxVisits: 1, journeyStage: recover, contract: { inputs: [goal, materialized-run], tools: read-only, outputs: [revised-goal, relaunch-request] } }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { out-of-scope-held: reauthor-from-materialized } }
+  - op: add
+    path: /edges/-
+    value: { from: reauthor-from-materialized, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-provider-auth-missing
+target: self-implement
+stage: heal
+applies_when: stop_class == provider-auth-missing
+reason_map: { provider-auth-missing: provider-auth-missing, credential-failure: provider-auth-missing }
+patch:
+  - op: add
+    path: /nodes/-
+    value: { nodeId: switch-provider, kind: judge, recipe: stop-autoheal:switch-provider, maxVisits: 1, journeyStage: recover, contract: { inputs: [provider-error], tools: read-only, outputs: [alternate-provider, owner-notice] } }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { provider-auth-missing: switch-provider } }
+  - op: add
+    path: /edges/-
+    value: { from: switch-provider, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-provider-unavailable
+target: self-implement
+stage: heal
+applies_when: stop_class == provider-unavailable
+reason_map: { provider-unavailable: provider-unavailable, openrouter_unavailable: provider-unavailable }
+patch:
+  - op: add
+    path: /nodes/-
+    value: { nodeId: retry-provider, kind: judge, recipe: stop-autoheal:retry-provider, maxVisits: 1, journeyStage: recover, contract: { inputs: [provider-error], tools: read-only, outputs: [retry-or-alternate] } }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { provider-unavailable: retry-provider } }
+  - op: add
+    path: /edges/-
+    value: { from: retry-provider, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-release-path-hold
+target: self-implement
+stage: heal
+applies_when: stop_class == merge-held-release-path
+reason_map: { release-path-hold: merge-held-release-path }
+patch:
+  - op: add
+    path: /nodes/-
+    value: { nodeId: wait-release, kind: judge, recipe: stop-autoheal:wait-release, maxVisits: 1, journeyStage: recover, contract: { inputs: [release-window], tools: read-only, outputs: [deferred] } }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { merge-held-release-path: wait-release } }
+  - op: add
+    path: /edges/-
+    value: { from: wait-release, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-pr-guard-failed
+target: self-implement
+stage: heal
+applies_when: stop_class == pr-guard-failed
+reason_map: { pr-guard-failed: pr-guard-failed }
+patch:
+  - op: add
+    path: /nodes/-
+    value: { nodeId: reauthor-from-materialized, kind: judge, recipe: revise-goal, maxVisits: 1, journeyStage: recover, contract: { inputs: [goal, guard-reason], tools: read-only, outputs: [revised-goal, relaunch-request] } }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { pr-guard-failed: reauthor-from-materialized } }
+  - op: add
+    path: /edges/-
+    value: { from: reauthor-from-materialized, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
+overlay_id: stop-heal-ladder-gate-unmeasured
+target: self-implement
+stage: heal
+applies_when: stop_class == gate-unmeasured
+reason_map: { gate-unmeasured: gate-unmeasured, ssh-rc255: gate-unmeasured }
+patch:
+  - op: add
+    path: /nodes/-
+    value: { nodeId: remeasure-gate, kind: gate, recipe: stop-autoheal:remeasure-gate, maxVisits: 1, journeyStage: recover, contract: { inputs: [gate-command], tools: read-only, outputs: [measurement] } }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: stop_class, map: { gate-unmeasured: remeasure-gate } }
+  - op: add
+    path: /edges/-
+    value: { from: remeasure-gate, on: outcome, map: { healed: dispatch, needs-owner: stopped } }

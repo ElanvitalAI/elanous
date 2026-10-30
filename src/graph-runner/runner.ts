@@ -1227,7 +1227,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         ? (lastPriorOutput as Record<string, unknown>).result : undefined;
       const inputs: Record<string, unknown> = Object.create(null);
       for (const key of contract.inputs) {
-        const value = Object.hasOwn(supplied, key) ? supplied[key] : key === 'prior' ? priorResult : previous[key];
+        const value = Object.hasOwn(supplied, key) ? supplied[key] : key === 'prior' ? (priorResult === undefined ? {} : priorResult) : previous[key];
         if (value !== undefined) inputs[key] = value;
       }
       const alreadySpent = state.path.length + (state.unitCalls ?? []).reduce((sum, call) => sum + call.steps, 0);

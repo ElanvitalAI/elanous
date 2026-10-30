@@ -10,6 +10,7 @@ import type { LeaseHolderView } from './lease-holder.js';
 export const DEFAULT_CONTROL_PORT = PORT_BANDS.reserved[0];
 export const CONTROL_HOSTNAME = '127.0.0.1';
 const MAX_POD_WORKER_TTL_MS = 24 * 60 * 60 * 1000;
+const POD_WORKER_TIMEOUT_FENCE_MS = 150_000;
 
 export function allowedControlHostname(hostname: string): boolean {
   if (hostname === '127.0.0.1' || hostname === '::1') return true;
@@ -126,7 +127,7 @@ export function startControlServer(opts: ControlServerOptions = {}): {
         const leaseRenewal = /^\/v1\/leases\/port\/([^/]+)\/heartbeat$/.exec(path);
         const workerRegister = path === '/v1/workers/pod' && method === 'POST';
         const workerAcquire = path === '/v1/leases/pod-worker' && method === 'POST';
-        const workerTransition = /^\/v1\/leases\/pod-worker\/([^/]+)\/(renew|release|sanitize|quarantine)$/.exec(path);
+        const workerTransition = /^\/v1\/leases\/pod-worker\/([^/]+)\/(renew|release|sanitize|quarantine|timeout)$/.exec(path);
         if (!resourcePath && !registerPath && !leaseRequest && !workerRegister && !workerAcquire && !(workerTransition && method === 'POST') && !(leaseDeletion && method === 'DELETE') && !(leaseRenewal && method === 'POST') && !(heartbeat && method === 'POST') && !(deletion && method === 'DELETE')) {
           return json({ error: 'not-found' }, 404);
         }
@@ -191,7 +192,20 @@ export function startControlServer(opts: ControlServerOptions = {}): {
           if (workerTransition) {
             const workerId = decodeURIComponent(workerTransition[1]!);
             if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$/.test(workerId)) throw new ResourceLedgerError(400, 'invalid-worker-id');
-            const action = workerTransition[2] as 'renew' | 'release' | 'sanitize' | 'quarantine';
+            const action = workerTransition[2] as 'renew' | 'release' | 'sanitize' | 'quarantine' | 'timeout';
+            if (action === 'timeout') {
+              if (scope !== 'member') throw new ResourceLedgerError(403, 'worker-timeout-scope');
+              const body = podWorkerBody(await req.json());
+              const { runId, attemptId } = body;
+              if (typeof runId !== 'string' || !runId.trim() || typeof attemptId !== 'string' || !attemptId.trim())
+                throw new ResourceLedgerError(400, 'invalid-pod-worker-timeout');
+              const id = `pod-worker-lease:${workerId}`;
+              requireTarget(id);
+              const stale = await currentWorkerPrimary();
+              if (stale) return stale;
+              return json(await ledger.withGuardedWorkerMutation(async () => !(await currentWorkerPrimary()),
+                () => ledger.fenceTimedOutPodWorker(id, { owner, runId, attemptId, fenceMs: POD_WORKER_TIMEOUT_FENCE_MS })));
+            }
             if (action === 'sanitize' ? !machine : (action === 'renew' || action === 'release') && scope !== 'member') {
               throw new ResourceLedgerError(403, 'worker-scope');
             }

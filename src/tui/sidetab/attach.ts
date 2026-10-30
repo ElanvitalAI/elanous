@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import { resolveBackendSpawn, claudeBackend, codexBackend } from '../../agent-mission/driver.js';
 import { DisplayCoordinator } from '../../display/coordinator.js';
 import { createDisplayEventBus } from '../../display/events.js';
@@ -6,6 +7,7 @@ import { createTerminalModalRouter } from '../../terminal/terminal-modal-router.
 import { getSessionCwd } from '../../session/working-dir.js';
 import { TerminalSessionRegistry, type TerminalSession } from '../../terminal/session-registry.js';
 import { requestRemotePtyControl } from '../../pty-shell/pty-control-ipc.js';
+import { runVisibleAgentMission } from '../../sidetab-core/visible-agent-mission.js';
 import type { Key } from '../../tui.js';
 import type { SidetabRow } from './list.js';
 
@@ -16,6 +18,7 @@ export interface SidetabAttachmentController {
   select(row: SidetabRow): boolean;
   showMain(): void;
   spawn(character: SidetabCharacter): boolean;
+  runMission(agent: 'codex' | 'claude', mission: string): Promise<Awaited<ReturnType<typeof runVisibleAgentMission>>>;
   kill(row: SidetabRow): boolean;
   handleKey(key: Key): boolean;
   hasModal(): boolean;
@@ -24,11 +27,21 @@ export interface SidetabAttachmentController {
   close(): void;
 }
 
+export interface AgentCliDetection {
+  agent: 'codex' | 'claude';
+  installed: boolean;
+  version: string | null;
+  login: 'ready' | 'needed' | 'unknown';
+  message: string;
+}
+
 export function createSidetabAttachmentController(deps: {
   drawBase(): void;
   termSize(): { cols: number; rows: number };
   setStatus(message: string): void;
   drawRemoteFrame(frame: string): void;
+  /** Owned by OPT; a missing detector keeps the hook inert until its API lands. */
+  detectAgentCli?(agent: 'codex' | 'claude'): Promise<AgentCliDetection>;
 }): SidetabAttachmentController {
   const eventBus = createDisplayEventBus();
   const coordinator = new DisplayCoordinator({
@@ -45,6 +58,7 @@ export function createSidetabAttachmentController(deps: {
   let remoteFrameTimer: ReturnType<typeof setInterval> | null = null;
   let remoteFramePending = false;
   let remoteHasFrame = false;
+  let lastSpawnedSession: TerminalSession | null = null;
 
   const stopRemote = (): void => {
     if (remoteFrameTimer !== null) clearInterval(remoteFrameTimer);
@@ -164,6 +178,7 @@ export function createSidetabAttachmentController(deps: {
           }
         },
       }, { termCols: cols, termRows: rows });
+      lastSpawnedSession = session;
       if (character === 'codex' || character === 'claude') {
         deps.setStatus(`${character} 실행 · agent-mission 구독 경로 scrub 적용(${unsetEnv?.length ?? 0}개 env 제거)`);
       }
@@ -204,6 +219,38 @@ export function createSidetabAttachmentController(deps: {
     },
     showMain,
     spawn,
+    async runMission(agent, mission) {
+      if (deps.detectAgentCli) {
+        let detection: AgentCliDetection;
+        try { detection = await deps.detectAgentCli(agent); }
+        catch (error) {
+          const message = `${agent} CLI 확인에 실패했습니다: ${error instanceof Error ? error.message : String(error)}`;
+          deps.setStatus(message);
+          return { ok: false, path: '', promptReady: false, missionVisible: false, completionMarker: false, error: message };
+        }
+        if (!detection.installed) {
+          const message = `${detection.message} · 설치 확인 후 미션을 다시 요청하세요`;
+          deps.setStatus(message);
+          return { ok: false, path: '', promptReady: false, missionVisible: false, completionMarker: false, error: message };
+        }
+      }
+      lastSpawnedSession = null;
+      if (!spawn(agent) || !lastSpawnedSession?.modal) {
+        return { ok: false, path: '', promptReady: false, missionVisible: false, completionMarker: false, error: `${agent} side-tab PTY could not start` };
+      }
+      const session = lastSpawnedSession;
+      const outputPath = join(session.cwd, '.elanous', 'mission-results', `sidetab-${Date.now()}.md`);
+      const backend = agent === 'codex' ? codexBackend : claudeBackend;
+      const result = await runVisibleAgentMission({
+        pty: session.modal,
+        mission,
+        outputPath,
+        handleTrust: (screen, write) => backend.handleTrust?.(screen, write) ?? false,
+      });
+      showMain();
+      deps.setStatus(result.ok ? `미션 결과 확인 · ${result.path}` : `미션 확인 실패 · ${result.error}`);
+      return result;
+    },
     kill(row) {
       if (row.currentProcess) {
         deps.setStatus('현재 TUI 세션은 사이드탭에서 종료할 수 없습니다');

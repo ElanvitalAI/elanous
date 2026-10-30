@@ -20,16 +20,33 @@
 //   bun scripts/ux-sim.ts --fault sqlite-busy # 결함 주입: 실제 SQLite 잠금 → 로그 배치 버퍼·복구
 //   bun scripts/ux-sim.ts emit child-error-long --json # 사건 주입(L0): 격리 우주 원장에 주입 줄 → 소비자 목록
 //
-// ⛔ 이 CLI 는 «실제 위젯 render()» 를 부른다 — 흉내 렌더러가 아니다.
+// catalog list/show 는 재사용 장치의 참조를 보여 준다. 선언된 TUI 장면은 실제 위젯 render() 를 부른다 — 흉내 렌더러가 아니다.
 import { simRenderLogFrame } from '../src/ux-sim/render-frame.js';
 import { simTypeaheadState, type TurnPhase, type TurnSimSpec } from '../src/ux-sim/turn-states.js';
 import { renderTurnTypeaheadQueueRow, renderTurnTypeaheadEcho } from '../src/chat/turn-typeahead.js';
+import { loadMockScenarioCatalog, renderMockScenarioDetails, renderMockScenarioList } from '../src/ux-sim/mock-scenario-catalog.js';
 
 const PHASES: TurnPhase[] = [
   'idle', 'thinking', 'streaming', 'streaming-with-subagents', 'harness-child', 'interrupted',
 ];
 
 const argv = process.argv.slice(2);
+
+if (argv[0] === 'list') {
+  if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts list'); process.exit(2); }
+  console.log(renderMockScenarioList(loadMockScenarioCatalog()).join('\n'));
+  process.exit(0);
+}
+if (argv[0] === 'show') {
+  if (argv.length !== 2) { console.error('usage: bun scripts/ux-sim.ts show <MS-id>'); process.exit(2); }
+  try {
+    console.log(renderMockScenarioDetails(loadMockScenarioCatalog(), argv[1]!).join('\n'));
+    process.exit(0);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(2);
+  }
+}
 
 // ── 사건 주입 «이벤트 몽키» (SIM-EVENT-MONKEY · L0) — 자기 플래그를 가진 하위 명령 ──
 //   bun scripts/ux-sim.ts emit <kind> [--run <id>] [--variant allowed|refused] [--state-dir <dir>] [--json]

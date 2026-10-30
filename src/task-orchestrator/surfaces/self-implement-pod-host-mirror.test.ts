@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { getUserConfig, saveUserConfig } from '../../user-config.js';
 import { podJobManifest, podJobName, podSelfImplementSpawn, type Kubectl, type PodSpawnOptions } from './self-implement-pod.js';
 import type { PodSource } from './pod-source-receive.js';
+import { podSourceScript } from './pod-source-receive.js';
 
 const base = { name: 'si-test', namespace: 'test', image: 'image', repoUrl: 'https://example.invalid/r', args: [], passEnv: [], deadlineSeconds: 60 };
 const creds = () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 'test' });
@@ -332,7 +334,7 @@ describe('si-task Job result marker and mirror seed', () => {
           expect(seeds).toEqual([{ host: 'node-b', commit: HEAD, cwd: '/tmp/tree', callsBefore: expect.any(Number) }]);
           const script = job.spec.template.spec.containers[0].args[0] as string;
           expect(script).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${HEAD}`);
-          expect(script).toContain(`git fetch --quiet --no-write-fetch-head '/host-mirror' '${HEAD}'`);
+          expect(script).toContain(`git -C repo fetch --quiet --no-write-fetch-head '/host-mirror' '${HEAD}'`);
           expect(script).not.toContain('git ls-remote --symref origin HEAD');
           expect(script).not.toContain('git fetch --depth 50 origin HEAD');
           const applies = run.calls.map((call, index) => call.endsWith('apply -f -') ? index : -1).filter((index) => index >= 0);
@@ -370,4 +372,60 @@ describe('si-task Job result marker and mirror seed', () => {
       expect(ioRows[0]).toMatchObject({ hostOriginCalls: 1, originCalls: 0, sourceVia: 'mirror' });
     } finally { off(); }
   }, 15_000);
+});
+
+describe('Pod host mirror raw-SHA fetch (real git, production upload-pack settings)', () => {
+  test('an exact-SHA fetch from a push-seeded bare host mirror checks out the parent-resolved SHA with no refs and no branch route', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-host-mirror-raw-'));
+    try {
+      const work = join(root, 'work');
+      const mirror = join(root, 'mirror.git');
+      const job = join(root, 'job');
+      mkdirSync(work); mkdirSync(job);
+      execFileSync('git', ['init', '-q', '-b', 'main', work]);
+      execFileSync('git', ['-C', work, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', work, 'config', 'user.name', 'pod']);
+      writeFileSync(join(work, 'README'), 'base\n');
+      execFileSync('git', ['-C', work, 'add', 'README']);
+      execFileSync('git', ['-C', work, 'commit', '-qm', 'base']);
+      writeFileSync(join(work, 'NEXT'), 'next\n');
+      execFileSync('git', ['-C', work, 'add', 'NEXT']);
+      execFileSync('git', ['-C', work, 'commit', '-qm', 'next']);
+      const baseSha = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      // 프로덕션 미러 구성: bare 저장소를 push 전송으로 심는다 — upload-pack 기본 설정, 어떤 uploadpack.* 재정의도 없다.
+      // (호스트 pre-push git-guard 훅(K-TC-24)은 이 심기와 무관하게 core.hooksPath= 로 명시적으로 끈다.)
+      execFileSync('git', ['init', '-q', '--bare', '-b', 'main', mirror]);
+      execFileSync('git', ['-c', 'core.hooksPath=', '-C', work, 'push', '-q', '--mirror', mirror]);
+      // 프로덕션 구성 증거: 미러에 upload-pack 재정이 하나도 없다(allowAnySHA1InWant·allowFilter 없이 raw-SHA fetch 가 성립해야 한다).
+      const uploadPackOverrides = (() => {
+        try { return execFileSync('git', ['-C', mirror, 'config', '--get-regexp', '^uploadpack\\.'], { encoding: 'utf8' }).trim(); } catch { return ''; }
+      })();
+      expect(uploadPackOverrides).toBe('');
+
+      // (1) 브랜치/refs 경유 없이 raw-SHA fetch 가 기본 upload-pack 설정에서 성공한다.
+      execFileSync('git', ['init', '-q', '-b', 'main', job]);
+      execFileSync('git', ['-C', job, 'fetch', '--quiet', '--no-write-fetch-head', mirror, baseSha]);
+      execFileSync('git', ['-C', job, 'checkout', '-q', '-B', 'main', baseSha]);
+      expect(execFileSync('git', ['-C', job, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(baseSha);
+
+      // (2) 실제 Pod source-receive 스크립트가 같은 raw-SHA fetch 로 정확한 SHA 를 checkout 한다 (GitHub 호출 0).
+      // 부재 commit 파일로 image 라우트를 끈다 — 기본 /opt/elanous-* 경로가 실재하는 환경에선 그 트리를 repo 로 가로채 공용 object store 의 alternates 를 오염시킨다.
+      const jobScript = join(root, 'job-script');
+      mkdirSync(jobScript);
+      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/unused/repo', mirror, { imageCommitFile: join(root, 'absent-image-commit') });
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd: jobScript });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror');
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE default ${baseSha}`);
+      expect(execFileSync('git', ['-C', join(jobScript, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(baseSha);
+      const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+      expect(io).toBeTruthy();
+      expect(JSON.parse(io!)).toMatchObject({ originCalls: 0, sourceVia: 'mirror', sourceStatus: 'complete' });
+      expect(script).toContain(`git -C repo fetch --quiet --no-write-fetch-head '${mirror}' '${baseSha}'`);
+      expect(script).not.toContain('git ls-remote');
+      expect(script).not.toContain('git fetch --depth 50 origin');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

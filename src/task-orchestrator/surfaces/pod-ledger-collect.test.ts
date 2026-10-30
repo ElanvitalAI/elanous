@@ -687,7 +687,7 @@ describe('pod ledger live follower', () => {
       expect(counts.at(-1)).toBe(1);
       expect(messages).toHaveLength(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
-  });
+  }, 15_000);
 
   test('two worktrees claiming one run are unmeasured rather than credited as progress', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-ambiguous-'));

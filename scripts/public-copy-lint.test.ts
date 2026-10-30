@@ -267,6 +267,37 @@ describe('public copy warning-only shadow lint', () => {
     expect(result.findings.filter(({ rule }) => rule.startsWith('ONE-CLICK-'))).toEqual([]);
   });
 
+  test('production CLI keeps approval and measurement scope on one README claim and scans only requested marketing paths', () => {
+    const root = join(stateDir, 'requested-public-copy-root');
+    mkdirSync(join(root, 'docs', 'marketing', 'nested'), { recursive: true });
+    mkdirSync(join(root, 'docs', 'usage'), { recursive: true });
+    writeFileSync(join(root, 'README.md'), 'One click completes 2 tasks, measured scope limited to 2 tasks, approved for publication.[^src]\n\n[^src]: fixture measurement');
+    writeFileSync(join(root, 'docs', 'marketing', 'nested', 'draft.md'), 'One click completes the entire workflow. private rotor phrase');
+    writeFileSync(join(root, 'docs', 'usage', 'out-of-scope.md'), 'One click completes the entire workflow.');
+    const ledger = new PatentLedger({ stateDir: join(root, '.state') });
+    ledger.add({ id: 'PRIVATE-CANDIDATE', title: 'private rotor phrase', track: '비공개' });
+    let output = '';
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => { output += `${args.join(' ')}\n`; };
+    try { expect(run(['--files', 'README.md', 'docs/marketing', '--json'], root, ledger)).toBe(0); }
+    finally { console.log = originalLog; }
+    const result = JSON.parse(output) as {
+      mode: string;
+      documentsScanned: number;
+      findings: Array<{ source: string; line: number; rule: string }>;
+      documents: Array<{ source: string }>;
+    };
+    expect(result.mode).toBe('warning-only');
+    expect(result.documentsScanned).toBe(2);
+    expect(result.documents.map(({ source }) => source).sort()).toEqual(['README.md', 'docs/marketing/nested/draft.md']);
+    expect(result.findings.filter(({ source, rule }) => source === 'README.md' && rule.startsWith('ONE-CLICK-'))).toEqual([]);
+    expect(result.findings).toContainEqual({ source: 'docs/marketing/nested/draft.md', line: 1, rule: 'ONE-CLICK-MEASURED-SCOPE' });
+    expect(result.findings).toContainEqual({ source: 'docs/marketing/nested/draft.md', line: 1, rule: 'ONE-CLICK-APPROVAL-STATUS' });
+    expect(result.findings).toContainEqual({ source: 'docs/marketing/nested/draft.md', line: 1, rule: 'PRIVATE-PATENT-CANDIDATE' });
+    expect(result.documents.some(({ source }) => source.includes('out-of-scope'))).toBe(false);
+    expect(output).not.toContain('private rotor phrase');
+  });
+
   test('counts names and catches unsupported comparisons from a scratch README', () => {
     const root = join(stateDir, 'unsupported-comparison-root');
     mkdirSync(root, { recursive: true });

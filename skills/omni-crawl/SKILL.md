@@ -81,12 +81,15 @@ requires: []
 자체 합성 파이프라인 (Tavily Research 엔드포인트 미사용 — 콜당 15~250cr 폭탄 회피):
 
 ```
-1) 다각도 tavily advanced ×3 (core/outlook/risk) 병렬   ~6cr  ⚙️ OMNI_CRAWL_TAVILY=0 이면 ddg 무료 ×3 (0cr)
-2) URL dedup → 상위 5개 firecrawl 풀스크랩 (캐시 2h)     ~5cr
+1) 다각도 검색 ×3 (Tavily 사용 가능 시 Tavily, 키 없음/비활성 시 Firecrawl) 병렬
+   런타임 0건/실패면 다음 유료 엔진, 두 검색축이 모두 비었을 때만 DDG 무료 최후 폴백
+2) URL dedup → 상위 5개 Firecrawl 풀스크랩 (캐시 2h)
 3) grok-community 1콜 (X+레딧 여론 각도)                 ~$0.05
 4) 기술 주제면 fc-dev 1콜 자동 가세 (looksTechnical 게이트)  ~2cr
 → 통합 마크다운 (풀본문이 스니펫보다 dedup 우선 생존)
 ```
+
+각 각도 검색과 URL 스크랩은 엔진·단계별 경과 시간을 로그에 남긴다. Tavily 키가 없는 정상 경로는 Firecrawl 검색으로 세 각도를 채우며, DDG는 Tavily와 Firecrawl이 모두 없거나 0건일 때만 최후 폴백으로 호출한다.
 
 ## 실행
 

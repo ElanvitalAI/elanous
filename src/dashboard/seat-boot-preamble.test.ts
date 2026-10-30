@@ -10,7 +10,10 @@ import { debug } from '../debug/log.js';
 import {
   buildSeatBootSystemMessages,
   resetSeatBootCacheForTest,
+  startSeatBootConversation,
   SEAT_INTENT_ESCALATION_FLOW,
+  SEAT_MEMORY_IMPORT_MAX_CHARS,
+  SEAT_MEMORY_IMPORT_PREFIX,
   SEAT_MEMORY_RECALL_MAX_CHARS,
   SEAT_MEMORY_RECALL_PREFIX,
 } from './seat-boot-preamble.js';
@@ -249,5 +252,209 @@ describe('자리 부트 카드 — 직전 인계 회상 한 줄(memory-recall)',
       resetSeatBootCacheForTest();
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+// TUI-SEAT-MEMORY-IMPORT — the conversation gets one bounded, read-only
+// snapshot; source timestamps and explicit priority/evidence pointers travel
+// with it, and a new conversation is the only refresh boundary.
+describe('자리 부트 카드 — 세션 시작 자리 기억 스냅샷(memory-import)', () => {
+  const importBlock = (home: string, cwd: string, now: Date): string => {
+    const text = buildSeatBootSystemMessages({ cwd }, { home, msgPath: join(home, 'msg.db'), env: {}, now: () => now })
+      .map((message) => String(message.content)).join('\n');
+    const start = text.indexOf(SEAT_MEMORY_IMPORT_PREFIX);
+    if (start < 0) return '';
+    const end = text.indexOf('\n\n', start);
+    return text.slice(start, end < 0 ? undefined : end);
+  };
+  const touch = (path: string, at: Date): void => utimesSync(path, at, at);
+
+  test('신선한 UX 인계의 우선순위·증거 포인터를 싣고 비밀·본문은 빼며 대화 중 스냅샷을 고정한다', () => {
+    resetSeatBootCacheForTest();
+    const { home, cwd } = seatHome('UX');
+    const seatDir = join(home, 'elanous-hq', 'seat-state', 'UX');
+    const memoryDir = join(home, 'elanous-hq', 'seat-state', 'memory');
+    const knowhow = join(cwd, 'docs', 'roles', 'UX', 'KNOWHOW.md');
+    mkdirSync(memoryDir, { recursive: true });
+    mkdirSync(join(cwd, 'docs', 'roles', 'UX'), { recursive: true });
+    const handoff = join(seatDir, 'HANDOFF-now.md');
+    const memory = join(memoryDir, 'MEMORY.md');
+    const at = new Date('2026-10-28T10:00:00.000Z');
+    try {
+      writeFileSync(handoff, '# UX 이어받기\n**다음 한 수:** P0 first cell token=ultra-secret-value-123 docs/evidence/current.md\n- 근거: docs/evidence/current.md\n');
+      writeFileSync(memory, '# [기억 포인터]\nDO_NOT_IMPORT_MEMORY_BODY\n');
+      writeFileSync(knowhow, '# UX 노하우\nDO_NOT_IMPORT_KNOWHOW_BODY\n');
+      touch(handoff, new Date('2026-10-28T09:30:00.000Z'));
+      touch(memory, new Date('2026-10-28T09:35:00.000Z'));
+      touch(knowhow, new Date('2026-10-28T09:40:00.000Z'));
+
+      const first = importBlock(home, cwd, at);
+      expect(first.length).toBeLessThanOrEqual(SEAT_MEMORY_IMPORT_MAX_CHARS);
+      expect(first).toContain('P0 first cell token=***');
+      expect(first).toContain('docs/evidence/current.md');
+      expect(first).toContain('seat-state/UX/HANDOFF-now.md');
+      expect(first).toContain('seat-state/memory/MEMORY.md');
+      expect(first).toContain('docs/roles/UX/KNOWHOW.md');
+      expect(first).not.toContain('ultra-secret-value-123');
+      expect(first).not.toContain('DO_NOT_IMPORT_');
+      expect(first).toContain('stale/unknown 또는 상충');
+
+      writeFileSync(handoff, '# UX 이어받기\n**다음 한 수:** SECOND PRIORITY docs/evidence/second.md\n');
+      touch(handoff, new Date('2026-10-28T09:50:00.000Z'));
+      expect(importBlock(home, cwd, at)).toBe(first);
+      startSeatBootConversation({ reason: 'session-new' });
+      expect(importBlock(home, cwd, at)).toContain('SECOND PRIORITY');
+    } finally { resetSeatBootCacheForTest(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('근거 경로 안의 토큰 모양 문자열도 발췌 전에 가린다', () => {
+    resetSeatBootCacheForTest();
+    const { home, cwd } = seatHome('UX');
+    const handoff = join(home, 'elanous-hq', 'seat-state', 'UX', 'HANDOFF-now.md');
+    const openAiKey = 'sk-proj-abcdefghijklmnopqrstuvwxyz12345678901234567890';
+    const githubToken = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';
+    const now = new Date('2026-10-28T10:00:00.000Z');
+    try {
+      writeFileSync(handoff, `# UX 이어받기\n**다음 한 수:** 검증 ${openAiKey} docs/evidence/${openAiKey}/ticket.md\n- 근거: docs/evidence/${githubToken}/proof.md\n`);
+      touch(handoff, new Date(now.getTime() - 60_000));
+
+      const text = importBlock(home, cwd, now);
+      expect(text).toContain('docs/evidence/sk-proj-***/ticket.md');
+      expect(text).toContain('docs/evidence/ghp_***/proof.md');
+      expect(text).not.toContain(openAiKey);
+      expect(text).not.toContain(githubToken);
+    } finally { resetSeatBootCacheForTest(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('특수문자 경로는 온전히 보존하고 공백 경로의 부분 접두는 unknown 처리한다', () => {
+    resetSeatBootCacheForTest();
+    const { home, cwd } = seatHome('UX');
+    const handoff = join(home, 'elanous-hq', 'seat-state', 'UX', 'HANDOFF-path-boundary.md');
+    const now = new Date('2026-10-28T10:00:00.000Z');
+    const evidenceRoot = `${['docs', 'evidence'].join('/')}/`;
+    const spacedPath = `${evidenceRoot}proof report.md`;
+    const extensionSpacedPath = `${evidenceRoot}proof.md report.md`;
+    const multiwordSpacedPath = `${evidenceRoot}proof draft report.md`;
+    const delimiterPath = `${evidenceRoot}proof#2.md`;
+    const asciiSpecialPath = `${evidenceRoot}proof${String.fromCharCode(64)}2.md`;
+    const unicodeSpecialPath = `${evidenceRoot}검증${String.fromCharCode(64)}2.md`;
+    try {
+      writeFileSync(handoff, `# UX 이어받기\n**다음 한 수:** 확인이 필요할 수 있음\n- 근거: ${spacedPath} · ${extensionSpacedPath} · ${multiwordSpacedPath} · ${delimiterPath} · ${asciiSpecialPath} · ${unicodeSpecialPath}\n`);
+      touch(handoff, new Date(now.getTime() - 60_000));
+
+      const text = importBlock(home, cwd, now);
+      expect(text).toContain(asciiSpecialPath);
+      expect(text).toContain(unicodeSpecialPath);
+      expect(text).not.toContain(`${evidenceRoot}proof ·`);
+      expect(text).not.toContain(`${evidenceRoot}proof.md ·`);
+      expect(text).not.toContain(spacedPath);
+      expect(text).not.toContain(extensionSpacedPath);
+      expect(text).not.toContain(multiwordSpacedPath);
+      expect(text).not.toContain(delimiterPath);
+      expect(text).toContain('stale/unknown 또는 상충하는 기억은 사실로 단정하지 말고 unknown으로 답한 뒤 위 포인터의 정본을 확인한다. 비밀·계정 값은 기억에서 가져오지 않는다.');
+    } finally { resetSeatBootCacheForTest(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('HANDOFF 포인터 파일명의 토큰 모양 문자열도 가린다', () => {
+    resetSeatBootCacheForTest();
+    const { home, cwd } = seatHome('UX');
+    const token = 'sk-proj-abcdefghijklmnopqrstuvwxyz12345678901234567890';
+    const handoff = join(home, 'elanous-hq', 'seat-state', 'UX', `HANDOFF-${token}.md`);
+    const now = new Date('2026-10-28T10:00:00.000Z');
+    try {
+      writeFileSync(handoff, '# UX 이어받기\n**다음 한 수:** 안전한 다음 작업\n');
+      touch(handoff, new Date(now.getTime() - 60_000));
+
+      const text = importBlock(home, cwd, now);
+      expect(text).toContain('seat-state/UX/HANDOFF-sk-proj-***.md');
+      expect(text).not.toContain(token);
+    } finally { resetSeatBootCacheForTest(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('긴 근거 경로는 중간에서 자르지 않고 제외하며 짧은 포인터와 unknown 지침은 보존한다', () => {
+    resetSeatBootCacheForTest();
+    const { home, cwd } = seatHome('UX');
+    const handoff = join(home, 'elanous-hq', 'seat-state', 'UX', 'HANDOFF-long-evidence.md');
+    const longPath = `docs/evidence/${'deep/'.repeat(140)}proof.md`;
+    const shortPath = 'docs/evidence/short/proof.md';
+    const now = new Date('2026-10-29T10:00:00.000Z');
+    try {
+      writeFileSync(handoff, `# UX 이어받기\n**다음 한 수:** P0 검증 ${longPath}\n- 근거: ${shortPath}\n`);
+      touch(handoff, new Date(now.getTime() - 60_000));
+
+      const text = importBlock(home, cwd, now);
+      expect(text.length).toBeLessThanOrEqual(SEAT_MEMORY_IMPORT_MAX_CHARS);
+      expect(text).toContain('P0 검증 〔경로는 근거 포인터 참조〕');
+      expect(text).toContain(shortPath);
+      expect(text).toContain('1개 긴 경로 생략(원문 인계 포인터 참조)');
+      expect(text).not.toContain(longPath);
+      expect(text).not.toContain(longPath.slice(0, 100));
+      expect(text).toContain('stale/unknown 또는 상충하는 기억은 사실로 단정하지 말고 unknown으로 답한 뒤 위 포인터의 정본을 확인한다. 비밀·계정 값은 기억에서 가져오지 않는다.');
+    } finally { resetSeatBootCacheForTest(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('24시간 지난 인계는 요약·근거를 unknown 처리하고 오래된 memory/knowhow를 stale로 표시한다', () => {
+    resetSeatBootCacheForTest();
+    const { home, cwd } = seatHome('UX');
+    const seatDir = join(home, 'elanous-hq', 'seat-state', 'UX');
+    const memoryDir = join(home, 'elanous-hq', 'seat-state', 'memory');
+    const knowhow = join(cwd, 'docs', 'roles', 'UX', 'KNOWHOW.md');
+    mkdirSync(memoryDir, { recursive: true });
+    mkdirSync(join(cwd, 'docs', 'roles', 'UX'), { recursive: true });
+    const handoff = join(seatDir, 'HANDOFF-now.md');
+    try {
+      writeFileSync(handoff, '# 오래된 인계\n**다음 한 수:** STALE PRIORITY docs/evidence/old.md\n');
+      writeFileSync(join(memoryDir, 'MEMORY.md'), '# stale memory\n');
+      writeFileSync(knowhow, '# stale knowhow\n');
+      const now = new Date('2026-10-29T10:00:00.000Z');
+      touch(handoff, new Date(now.getTime() - 25 * 60 * 60 * 1_000));
+      touch(join(memoryDir, 'MEMORY.md'), new Date(now.getTime() - 26 * 60 * 60 * 1_000));
+      touch(knowhow, new Date(now.getTime() - 26 * 60 * 60 * 1_000));
+      const text = importBlock(home, cwd, now);
+      expect(text).toContain('현재 우선순위: 미관측');
+      expect(text).toContain('근거 포인터: 미관측');
+      expect(text).not.toContain('STALE PRIORITY');
+      expect(text).not.toContain('docs/evidence/old.md');
+      expect(text.match(/stale\/unknown/g)?.length).toBeGreaterThanOrEqual(3);
+    } finally { resetSeatBootCacheForTest(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('현재보다 미래인 HANDOFF는 즉시 unknown 처리한다', () => {
+    resetSeatBootCacheForTest();
+    const { home, cwd } = seatHome('UX');
+    const handoff = join(home, 'elanous-hq', 'seat-state', 'UX', 'HANDOFF-now.md');
+    try {
+      writeFileSync(handoff, '# UX 이어받기\n**다음 한 수:** FUTURE HANDOFF PRIORITY docs/evidence/future.md\n');
+      touch(handoff, new Date('2026-10-28T10:00:01.000Z'));
+      const text = importBlock(home, cwd, new Date('2026-10-28T10:00:00.000Z'));
+      expect(text).toContain('현재 우선순위: 미관측');
+      expect(text).toContain('인계 포인터: seat-state/UX/HANDOFF-now.md');
+      expect(text).toContain('stale/unknown');
+      expect(text).not.toContain('FUTURE HANDOFF PRIORITY');
+      expect(text).not.toContain('docs/evidence/future.md');
+    } finally { resetSeatBootCacheForTest(); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('미래 mtime의 MEMORY·KNOWHOW는 HANDOFF보다 최신이어도 stale로 표시한다', () => {
+    resetSeatBootCacheForTest();
+    const { home, cwd } = seatHome('UX');
+    const seatDir = join(home, 'elanous-hq', 'seat-state', 'UX');
+    const memoryDir = join(home, 'elanous-hq', 'seat-state', 'memory');
+    const memory = join(memoryDir, 'MEMORY.md');
+    const knowhow = join(cwd, 'docs', 'roles', 'UX', 'KNOWHOW.md');
+    const handoff = join(seatDir, 'HANDOFF-now.md');
+    mkdirSync(memoryDir, { recursive: true });
+    mkdirSync(join(cwd, 'docs', 'roles', 'UX'), { recursive: true });
+    try {
+      writeFileSync(handoff, '# UX 이어받기\n**다음 한 수:** CURRENT PRIORITY docs/evidence/current.md\n');
+      writeFileSync(memory, '# future memory\n');
+      writeFileSync(knowhow, '# future knowhow\n');
+      touch(handoff, new Date('2026-10-28T09:30:00.000Z'));
+      touch(memory, new Date('2026-10-28T10:00:01.000Z'));
+      touch(knowhow, new Date('2026-10-28T10:00:02.000Z'));
+      const text = importBlock(home, cwd, new Date('2026-10-28T10:00:00.000Z'));
+      expect(text).toContain('현재 우선순위(인계 발췌): 다음 한 수: CURRENT PRIORITY');
+      expect(text.match(/ · stale\/unknown/g)?.length).toBe(2);
+    } finally { resetSeatBootCacheForTest(); rmSync(home, { recursive: true, force: true }); }
   });
 });

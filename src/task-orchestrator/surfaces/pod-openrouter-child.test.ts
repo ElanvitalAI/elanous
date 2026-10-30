@@ -1,10 +1,18 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { podNamedChildProvider, podChildLlmArgs, podSelfImplementSpawn, POD_OPENROUTER_REVIEWER_PINS, resolvePodOpenRouterReviewer, type Kubectl } from './self-implement-pod.js';
-import { getUserConfig, resolveRoleLlm, type UserConfig } from '../../user-config.js';
+import { getUserConfig, resetUserConfig, resolveRoleLlm, type UserConfig } from '../../user-config.js';
 import { resolveImplementationChildModel } from '../../self-dev/dev-cli.js';
 import { stablePodManifestText } from './pod-manifest-test-normalize.js';
 import { inspectCodexRotation } from '../../oauth/codex-account-store.js';
+import { runArrivalElaboration } from '../../self-implement/goal-elaborate.js';
+import { buildDefaultSelfImplementSeams, planDevPipeline } from '../../self-dev/dev-pipeline.js';
+import { streamLLM } from '../../llm.js';
+import { getOpenAIApiKey, getOpenRouterApiKey, _resetKeyCacheForTests } from '../../config.js';
+import { resetElanousConfigDir, setElanousConfigDir, getElanousConfigDirOverride } from '../../elanous-config-dir.js';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const model = 'openrouter/z-ai/glm-5.3-flash';
 const key = 'test-openrouter-secret-not-in-job';
@@ -170,6 +178,157 @@ describe('explicit OpenRouter Pod child', () => {
       expect(resolveRoleLlm('implement', { config: podConfig, env: { ELANOUS_ROLE_LLM_REVIEW: POD_OPENROUTER_REVIEWER_PINS.glm } }).provider).toBe('openrouter');
       expect(resolveRoleLlm('review', { config: podConfig, env: { ELANOUS_ROLE_LLM_REVIEW: 'not-json' } }).model).toBe('openrouter/moonshotai/kimi-k3');
     });
+
+    test('Codex Job passes an available OpenRouter reviewer key through its Secret; keyless remains launchable', async () => {
+      const pin = POD_OPENROUTER_REVIEWER_PINS.glm;
+      const fallbackConfig = () => ({ llm: { provider: 'openai-codex' } }) as UserConfig;
+      const withKey = capture();
+      const result = await podSelfImplementSpawn({ provider: 'openai-codex', env: { OPENROUTER_API_KEY: key }, credentials: codexCreds,
+        extraArgs: ['--child-llm-provider', 'openai-codex'], armEnv: { ELANOUS_ROLE_LLM_REVIEW: pin },
+        fallbackConfig, readKeyCache: () => undefined, kubectl: withKey.kubectl, sleep: async () => {},
+      })({ feature: 'review provider credential', spaceId: 'codex-openrouter-review-key' }).done;
+      expect(result.exitCode).toBe(0);
+      const secret = withKey.applied.find((entry) => entry.kind === 'Secret')!;
+      const job = withKey.applied.find((entry) => entry.kind === 'Job')!;
+      expect(secret.stringData['env-OPENROUTER_API_KEY']).toBe(key);
+      expect(job.spec.template.spec.containers[0].env).toContainEqual({ name: 'OPENROUTER_API_KEY', valueFrom: { secretKeyRef: { name: secret.metadata.name, key: 'env-OPENROUTER_API_KEY' } } });
+      expect(JSON.stringify(job)).not.toContain(key);
+    }, 15_000);
+
+    test('keyless fake Pod review provider failure skips elaboration and continues the run', async () => {
+      const fakePod = capture();
+      await podSelfImplementSpawn({ provider: 'openai-codex', env: {}, credentials: creds,
+        extraArgs: ['--child-llm-provider', 'openai-codex'],
+        armEnv: { ELANOUS_ROLE_LLM_REVIEW: POD_OPENROUTER_REVIEWER_PINS.glm }, readKeyCache: () => undefined,
+        fallbackConfig: () => ({ llm: { provider: 'openai-codex' } }) as UserConfig,
+        kubectl: fakePod.kubectl, sleep: async () => {},
+      })({ feature: 'keyless review provider', spaceId: 'keyless-review-provider' }).done;
+      const job = fakePod.applied.find((entry) => entry.kind === 'Job')!;
+      const podSpec = job.spec.template.spec;
+      const containers = [...(podSpec.initContainers ?? []), ...podSpec.containers];
+      const childCommand = podSpec.containers[0].args[0];
+      const podEnv = Object.fromEntries(containerEnv(job).filter((entry) => entry.value !== undefined)
+        .map((entry) => [entry.name, entry.value!]));
+      expect(childCommand).toContain("'--child-llm-provider' 'openai-codex'");
+      expect(podEnv.OPENROUTER_API_KEY).toBeUndefined();
+      expect(containers.flatMap((container) => container.env ?? []).some((entry) => /OPENROUTER_API_KEY/i.test(entry.name))).toBe(false);
+      expect(containers.flatMap((container) => container.envFrom ?? [])).toEqual([]);
+      const referencedSecretNames = new Set<string>();
+      const secretVolumeNames = new Set<string>();
+      for (const container of containers) {
+        for (const entry of container.env ?? []) {
+          if (entry.valueFrom?.secretKeyRef?.name) referencedSecretNames.add(entry.valueFrom.secretKeyRef.name);
+        }
+        for (const entry of container.envFrom ?? []) {
+          if (entry.secretRef?.name) referencedSecretNames.add(entry.secretRef.name);
+        }
+      }
+      for (const volume of podSpec.volumes ?? []) {
+        if (volume.secret?.secretName) {
+          referencedSecretNames.add(volume.secret.secretName);
+          secretVolumeNames.add(volume.name);
+        }
+        for (const source of volume.projected?.sources ?? []) {
+          if (source.secret?.name) {
+            referencedSecretNames.add(source.secret.name);
+            secretVolumeNames.add(volume.name);
+          }
+        }
+      }
+      const mountedSecretVolumeNames = new Set(containers.flatMap((container) => container.volumeMounts ?? [])
+        .filter((mount) => secretVolumeNames.has(mount.name)).map((mount) => mount.name));
+      expect(mountedSecretVolumeNames).toEqual(secretVolumeNames);
+      const referencedSecrets = fakePod.applied.filter((entry) => entry.kind === 'Secret'
+        && referencedSecretNames.has(entry.metadata.name));
+      expect(referencedSecrets.map((entry) => entry.metadata.name).sort()).toEqual([...referencedSecretNames].sort());
+      const referencedSecretKeys = referencedSecrets.flatMap((entry) => [
+        ...Object.keys(entry.stringData ?? {}), ...Object.keys(entry.data ?? {}),
+      ]);
+      expect(referencedSecretKeys.some((name) => /OPENROUTER/i.test(name))).toBe(false);
+      const referencedSecretPayloads = referencedSecrets.flatMap((entry) => [
+        ...Object.values(entry.stringData ?? {}),
+        ...Object.values(entry.data ?? {}).map((value: string) => Buffer.from(value, 'base64').toString('utf8')),
+      ]);
+      expect(referencedSecretPayloads.some((value) => value.includes(key))).toBe(false);
+      expect(podEnv.ELANOUS_ROLE_LLM_REVIEW).toBe(POD_OPENROUTER_REVIEWER_PINS.glm);
+      expect(resolveRoleLlm('review', { config: { llm: { provider: 'openai-codex' } } as UserConfig, env: podEnv }))
+        .toMatchObject({ provider: 'openrouter', source: 'environment' });
+
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const attemptedProviders: string[] = [];
+      let missingCredentialFailure: string | undefined;
+      const oldEnv = { ...process.env };
+      const oldConfigDirOverride = getElanousConfigDirOverride();
+      const isolationRoot = mkdtempSync(join(tmpdir(), 'opt-keyless-openrouter-'));
+      const keyCacheDir = join(isolationRoot, 'cache');
+      mkdirSync(keyCacheDir);
+      writeFileSync(join(isolationRoot, 'config.json'), JSON.stringify({ llm: { reviewFallbackModels: ['gpt-4o-mini'] } }));
+      setElanousConfigDir(isolationRoot);
+      try {
+        // Rebuild the main Pod container environment from literal env entries and Secret key refs.
+        const secretByName = new Map(referencedSecrets.map((entry) => [entry.metadata.name, entry]));
+        const podProcessEnv: Record<string, string> = {};
+        for (const container of podSpec.containers) {
+          for (const entry of container.env ?? []) {
+            if (entry.value !== undefined) podProcessEnv[entry.name] = entry.value;
+            const ref = entry.valueFrom?.secretKeyRef;
+            if (ref) {
+              const secret = secretByName.get(ref.name);
+              const value = secret?.stringData?.[ref.key] ?? (secret?.data?.[ref.key]
+                ? Buffer.from(secret.data[ref.key], 'base64').toString('utf8') : undefined);
+              if (value !== undefined) podProcessEnv[entry.name] = value;
+            }
+          }
+        }
+        for (const name of Object.keys(process.env)) delete process.env[name];
+        Object.assign(process.env, podProcessEnv, {
+          ELANOUS_KEY_CACHE_DIR: keyCacheDir,
+          ELANOUS_STATE_DIR: join(isolationRoot, 'state'),
+        });
+        mkdirSync(process.env.ELANOUS_STATE_DIR!, { recursive: true });
+        _resetKeyCacheForTests();
+        resetUserConfig();
+        expect(getOpenRouterApiKey()).toBeUndefined();
+        expect(getOpenAIApiKey()).toBeUndefined();
+        const seams = await buildDefaultSelfImplementSeams(planDevPipeline({ input: { text: 'keyless Pod review' }, context: 'mission' }), {
+          toolReviewerRate: 0,
+          streamLLM: async (_messages, _onChunk, opts) => {
+            const providerName = opts?.provider?.name ?? 'default';
+            attemptedProviders.push(providerName);
+            // Let every production provider attempt resolve its own cache+env credential. The isolated
+            // config selects only a keyless OpenAI fallback, so neither attempt can reach the network.
+            try {
+              return await streamLLM(_messages, _onChunk, opts);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              if (message === 'openrouter unavailable: configure apiKey via `elanous setup`') {
+                missingCredentialFailure = message;
+              }
+              throw error;
+            }
+          },
+        });
+        const step = await runArrivalElaboration({
+          goal: '키 없는 Pod에서도 원래 골로 계속 진행한다', prompt: 'ROUND0', fileExists: () => true,
+          callLLM: seams.elaborateCallLLM,
+          observe: (event, data) => events.push({ event, data }),
+        });
+        expect(attemptedProviders[0]).toBe('openrouter');
+        expect(attemptedProviders.every((provider) => provider === 'openrouter' || provider === 'openai')).toBe(true);
+        expect(missingCredentialFailure).toBe('openrouter unavailable: configure apiKey via `elanous setup`');
+        expect(step).toMatchObject({ parked: false, prompt: 'ROUND0' });
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ event: 'goal-elaboration-skipped', data: { outcome: 'skipped', reason: 'provider-failed' } });
+      } finally {
+        _resetKeyCacheForTests();
+        resetUserConfig();
+        if (oldConfigDirOverride === undefined) resetElanousConfigDir();
+        else setElanousConfigDir(oldConfigDirOverride);
+        for (const name of Object.keys(process.env)) delete process.env[name];
+        Object.assign(process.env, oldEnv);
+        rmSync(isolationRoot, { recursive: true, force: true });
+      }
+    }, 15_000);
 
     test('codex-sol (opt-in) ships the codex auth only when a credential is available; otherwise skips and keeps kimi', async () => {
       const armed = await spawnOr({ openrouterReviewer: 'codex-sol', credentials: codexCreds }, 'or-review-sol');

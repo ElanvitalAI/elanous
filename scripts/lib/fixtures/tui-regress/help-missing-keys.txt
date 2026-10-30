@@ -1,0 +1,21 @@
+elanous 0.2.41 · owner · daemon: online
+┌─ Dashboard help ─────────────────────────────────────────────┐
+│ Commands                                                     │
+│ ▸ 대화                                                         │
+│   /help       이 명령들 목록                                       │
+│   /new        새 대화 시작                                        │
+│   /quit       종료                                             │
+│ ▸ 지시                                                         │
+│   /directive  대표 지시                                          │
+│   /decide     결정 요청                                          │
+│ ▸ 작업                                                         │
+│   /missions   미션 목록                                          │
+│   /tasks      작업 목록                                          │
+│   /review     리뷰 열기                                          │
+│   /publish    발행                                             │
+│ ▸ 시스템                                                        │
+│   /provider   LLM 공급자                                        │
+│   /model      모델                                             │
+│   /settings   설정                                             │
+└──────────────────────────────────────────────────────────────┘
+❯

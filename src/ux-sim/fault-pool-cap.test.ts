@@ -27,6 +27,19 @@ describe('simPoolCap — 결함 주입 «풀 상한 없음»', () => {
     expect(() => simPoolCap({ spec: 'pool-node-b@node-b:20,pool-node-c@node-c', running: { 'pool-node-b': 20 } })).toThrow('pool-node-c');
   });
 
+  test('a kubectl query failure preserves unknown occupancy and suppresses admission', () => {
+    const obs = simPoolCap({
+      spec: 'pool-node-b@node-b',
+      running: {},
+      queryFailures: { 'pool-node-b': 'kubectl get pods: connection refused' },
+    });
+    expect(obs.members[0]).toMatchObject({ queryError: 'kubectl get pods: connection refused' });
+    expect(obs.members[0]?.running).toBeUndefined();
+    expect(obs.recommendation).toBeNull();
+    expect(renderPoolCap([obs])[1]).toContain('unknown/2(기본) query-error=kubectl get pods: connection refused');
+    expect(renderPoolCap([obs])[1]).toContain('승인 unknown · limitedBy=unknown');
+  });
+
   test('the sweep renders one line per scenario with the default-cap marker', () => {
     const lines = renderPoolCap(poolCapSweep());
     expect(lines).toHaveLength(1 + poolCapSweep().length);

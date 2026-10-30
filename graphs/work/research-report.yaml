@@ -26,8 +26,16 @@ nodes:
     call: verb-verify@1
     budget: { inner_steps: 16 }
     contract: { inputs: [ask, context, prior], tools: read-and-run-tests, outputs: [result, evidence] }
-  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
-  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+  - node_id: done
+    kind: gate
+    recipe: none
+    max_visits: 1
+    contract: { inputs: [result, evidence], tools: none, outputs: [result, evidence] }
+  - node_id: failed
+    kind: gate
+    recipe: none
+    max_visits: 1
+    contract: { inputs: [result, evidence], tools: none, outputs: [result, evidence] }
 edges:
   - from: research
     on: outcome

@@ -87,14 +87,14 @@ import type { ChannelBus } from '../terminal-matrix/channel-bus.js';
 import { federationObservation } from './orchestrator.js';
 // ⛔ 배달 상태는 「정하는 쪽」(orchestrator)이 소유한다 — 여기는 받아서 찍기만 한다.
 import type { SupervisorDeliveryLine, SupervisorDeliveryState } from './orchestrator.js';
-import type { RunShardIdentity } from './run-ledger.js';
+import { runLedgerDir, type RunShardIdentity } from './run-ledger.js';
+import { readRunChart, recordRunChartDecision, recordRunChartWaitHandoff, RUN_DOCTOR_HANDOFF_WAIT_THRESHOLD, RUN_DOCTOR_HANDOFF_INPUT_PREFIX } from './run-chart.js';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // Boundary requests observed up to about 788 characters; preserve the complete request record.
 const HARNESS_BOUNDARY_REQUEST_STRING_MAX = 1024;
 const WAIT_SUPERVISION_PROGRESS_BATCH_SIZE = 5;
-
 /** Renders untrusted boundary metadata as one inert terminal line for the parent surface. */
 export function singleLineBoundarySurfaceValue(value: string): string {
   return value
@@ -1267,6 +1267,9 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
   let sameCommandStallCount = 0;
   let pendingWaitSupervisionCount = 0;
   let pendingWaitLatestJudgment: string | undefined;
+  let consecutiveWaitDecisionCount = 0;
+  let waitStreakHandoffSent = false;
+  let waitStreakIndex = 0;
   // Repetition identity is exact full instruction-text equality after the existing delivery trim;
   // the first occurrence omits the surface marker, and later occurrences are only annotated.
   const inputInstructionOccurrences = new Map<string, number>();
@@ -1699,6 +1702,8 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                 descriptor: { controlStance: stance },
               });
               previousIntervention = intervention;
+              const chartDir = runLedgerDir(opts.stateDir);
+              const chartBeforeJudgment = readRunChart(runId, 'run-supervisor', chartDir);
               const controlObs: ControlObservation = {
                   screen: rendered,
                   state: curState,
@@ -1708,6 +1713,8 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                   sameScreenMs: Math.max(0, nowMs - frameObs.screenSinceMs),
                   stallRung: frameObs.stallRung,
                   ...(roundContext ? { roundContext } : {}),
+                  runId,
+                  runChart: chartBeforeJudgment,
                 };
                 const controller = new AbortController();
                 let rejectParentAbort: ((reason: Error) => void) | undefined;
@@ -1821,11 +1828,14 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                   debug.log('self-implement', 'brain.suggestion', supervisionVerdictPayload);
                   debug.log('self-implement', 'run-supervision.verdict', supervisionVerdictPayload);
                   if (decision.action === 'wait') {
+                    consecutiveWaitDecisionCount += 1;
                     pendingWaitSupervisionCount += 1;
                     pendingWaitLatestJudgment = decision.action;
                     if (pendingWaitSupervisionCount >= WAIT_SUPERVISION_PROGRESS_BATCH_SIZE) flushWaitSupervisionProgress();
                   } else {
                     flushWaitSupervisionProgress();
+                    consecutiveWaitDecisionCount = 0;
+                    waitStreakHandoffSent = false;
                     const input = decision.action === 'input' ? decision.text.trim() : '';
                     const inputInstructionOccurrence = input ? countInputInstructionOccurrence(input) : undefined;
                     const delivery = input ? (opts.onSupervisorInput ? 'queued' : 'not-delivered') : undefined;
@@ -1856,6 +1866,25 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                         ...(nextReason ? { deliveryReason: nextReason } : {}),
                         ...(inputInstructionOccurrence ? { inputInstructionOccurrence } : {}),
                       }), 'supervision');
+                    });
+                  }
+                  const handoffNow = decision.action === 'wait'
+                    && consecutiveWaitDecisionCount >= RUN_DOCTOR_HANDOFF_WAIT_THRESHOLD && !waitStreakHandoffSent;
+                  const chartStopKey = handoffNow ? `${runId}:wait-streak:${waitStreakIndex + 1}` : `${runId}:supervisor:${i}`;
+                  const chartWrite = handoffNow
+                    ? recordRunChartWaitHandoff({ runId, stopKey: chartStopKey, waitCount: consecutiveWaitDecisionCount,
+                      readStopKeys: chartBeforeJudgment.map((cell) => cell.stopKey), dir: chartDir })
+                    : recordRunChartDecision({ runId, device: 'run-supervisor', stopKey: chartStopKey,
+                      observed: `${curState}; stallRung=${st?.rung ?? NO_STALL}`, verdict: decision.action,
+                      action: decision.action === 'input' ? decision.text.slice(0, 120) : decision.action,
+                      handoff: decision.action === 'no-progress' ? 'macrophage' : null,
+                      why: decision.action === 'no-progress' ? decision.reason : `supervisor ${decision.action}`,
+                      readStopKeys: chartBeforeJudgment.map((cell) => cell.stopKey), dir: chartDir });
+                  if (handoffNow && (chartWrite === 'recorded' || chartWrite === 'already-recorded')) {
+                    waitStreakHandoffSent = true; waitStreakIndex += 1;
+                    debug.log('run-supervisor', 'doctor-handoff', { runId, stopKey: chartStopKey, waitCount: consecutiveWaitDecisionCount, handoff: 'doctor' });
+                    opts.onSupervisorInput?.(`${RUN_DOCTOR_HANDOFF_INPUT_PREFIX} runId=${runId} stopKey=${chartStopKey} waitCount=${consecutiveWaitDecisionCount}`, (delivery, reason) => {
+                      try { debug.log('run-supervisor', 'doctor-handoff-delivery', { runId, stopKey: chartStopKey, delivery, ...(reason ? { reason } : {}) }); } catch { /* observation is fail-soft */ }
                     });
                   }
                   debug.log('self-implement', 'brain.input-outcome', {

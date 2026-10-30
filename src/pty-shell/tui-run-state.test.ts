@@ -952,3 +952,163 @@ describe('SURVIVAL-PROGRESS-CLOCK — 진전·Esc 청구 기록(recorder)', () =
     stop();
   });
 });
+
+// TUI-SEAT-PILOT-2H-COMPARE — 판정 신호 한 줄: 실행 명령·runId·시작/끝 시각·두 표면의 원장 행·
+// 산출 바이트·오류 수·결과를 «한 줄» 로 직렬화하고, 재지 못한 필드는 «미측정» 으로 남겨 측정된 0 과 섞지 않는다.
+// 무대 = 격리 ELANOUS_STATE_DIR + fake clock(now 주입) + 실제 SQLite pty_events 경유.
+describe('TUI-SEAT-PILOT-2H-COMPARE: 판정 신호 한 줄', () => {
+  test('판정 신호 한 줄 — 실행 명령·runId·시작/끝 시각·두 표면 원장 행·산출 바이트·오류 수·결과를 직렬화하고 미측정 필드는 «미측정»으로 0과 구분된다', async () => {
+    const ptyEventLog = await import('./pty-event-log.js');
+    ptyEventLog.resetPtyEventLogForTesting();
+    const surfaceId = `tui:seat-compare-${Date.now()}`;
+    ptyEventLog.appendPtyEvent({ instance: 'test', surfaceId, kind: 'state', state: 'working', agent: 'codex', now: 1_000 });
+    const lastSeq = ptyEventLog.appendPtyEvent({ instance: 'test', surfaceId, kind: 'state', state: 'idle', agent: 'codex', now: 2_000 });
+
+    const startedAt = 1_700_000_000_000;
+    let clock = startedAt;
+    const lines: string[] = [];
+    const stop = startTuiRunStateRecorder(surfaceId, {
+      now: () => clock,
+      build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+      writeBuild: () => true,
+      writeTurn: () => true,
+      writeProgress: () => true,
+      log: () => {},
+      seatCompare: {
+        runId: 'run-seat-2h-1',
+        command: 'elanous tui --test',
+        result: 'idle',
+        write: (line) => { lines.push(line); return true; },
+      },
+    });
+    reportTuiTurn('busy');
+    reportTuiTurn('idle');
+    clock = startedAt + 2 * 60 * 60_000;
+    stop();
+
+    expect(lines).toHaveLength(1);
+    const line = lines[0]!;
+    expect(line.includes('\n')).toBe(false);
+    expect(line).toContain('run=run-seat-2h-1');
+    expect(line).toContain('cmd=elanous tui --test');
+    expect(line).toContain('start=2023-11-14T22:13:20.000Z');
+    expect(line).toContain('end=2023-11-15T00:13:20.000Z');
+    expect(line).toContain(`ledger:pty-event-log rows=2 lastSeq=${lastSeq} lastState=idle`);
+    expect(line).toContain('ledger:tui-run-state rows=3 lastSeq=미측정 lastState=idle');
+    expect(line).toContain('bytes=미측정');
+    expect(line).toContain('errors=0');
+    expect(line).toContain('result=idle');
+  });
+
+  test('생산 스위치 — ELANOUS_SEAT_COMPARE_RUN_ID 가 켠 녹음기의 종료 경로가 실 sim-log 파일에 한 줄을 append 한다', async () => {
+    const { readFileSync, existsSync } = await import('node:fs');
+    const { seatCompareDepsFromEnv } = await import('./tui-run-state.js');
+    const logPath = join(mkdtempSync(join(stateDir, 'seat-compare-env-')), 'sim-log.log');
+    const savedRunId = process.env.ELANOUS_SEAT_COMPARE_RUN_ID;
+    const savedCommand = process.env.ELANOUS_SEAT_COMPARE_COMMAND;
+    const savedLog = process.env.ELANOUS_SEAT_COMPARE_LOG;
+    try {
+      process.env.ELANOUS_SEAT_COMPARE_RUN_ID = 'run-seat-env-1';
+      process.env.ELANOUS_SEAT_COMPARE_COMMAND = 'elanous tui --test';
+      process.env.ELANOUS_SEAT_COMPARE_LOG = logPath;
+      // 스위치가 꺼져 있으면 녹음기는 아무 줄도 안 남긴다(미실행=미측정).
+      expect(seatCompareDepsFromEnv({})).toBeNull();
+      const seatCompare = seatCompareDepsFromEnv();
+      expect(seatCompare).not.toBeNull();
+      let clock = 1_700_000_000_000;
+      const stop = startTuiRunStateRecorder(`tui:seat-compare-env-${Date.now()}`, {
+        now: () => clock,
+        build: () => ({ version: 'v', sha: SHA_A, source: 'installed' }),
+        writeBuild: () => true,
+        writeTurn: () => true,
+        writeProgress: () => true,
+        log: () => {},
+        seatCompare: seatCompare!,
+      });
+      reportTuiTurn('busy');
+      reportTuiTurn('idle');
+      clock += 60_000;
+      stop();
+
+      expect(existsSync(logPath)).toBe(true);
+      const written = readFileSync(logPath, 'utf8').trimEnd().split('\n');
+      expect(written).toHaveLength(1);
+      expect(written[0]).toContain('run=run-seat-env-1');
+      expect(written[0]).toContain('cmd=elanous tui --test');
+      expect(written[0]).toContain('result=idle');
+    } finally {
+      if (savedRunId === undefined) delete process.env.ELANOUS_SEAT_COMPARE_RUN_ID;
+      else process.env.ELANOUS_SEAT_COMPARE_RUN_ID = savedRunId;
+      if (savedCommand === undefined) delete process.env.ELANOUS_SEAT_COMPARE_COMMAND;
+      else process.env.ELANOUS_SEAT_COMPARE_COMMAND = savedCommand;
+      if (savedLog === undefined) delete process.env.ELANOUS_SEAT_COMPARE_LOG;
+      else process.env.ELANOUS_SEAT_COMPARE_LOG = savedLog;
+    }
+  });
+
+  test('미측정 ≠ 0 — 못 잰 필드는 «미측정», 측정된 0 은 0 으로 직렬화된다', async () => {
+    const { buildSeatCompareSignalLine, SEAT_COMPARE_UNMEASURED } = await import('./tui-run-state.js');
+    const unknown = buildSeatCompareSignalLine({
+      runId: null, command: null, startedAt: null, endedAt: null, outputBytes: null, errors: null, result: null,
+      tuiRunState: { surface: 'tui-run-state', rows: null, lastSeq: null, lastState: null },
+      ptyEventLog: { surface: 'pty-event-log', rows: null, lastSeq: null, lastState: null },
+    });
+    const measured = buildSeatCompareSignalLine({
+      runId: 'run-0', command: 'elanous tui', startedAt: 0, endedAt: 0, outputBytes: 0, errors: 0, result: 'ok',
+      tuiRunState: { surface: 'tui-run-state', rows: 0, lastSeq: 0, lastState: 'idle' },
+      ptyEventLog: { surface: 'pty-event-log', rows: 0, lastSeq: 0, lastState: 'idle' },
+    });
+    expect(SEAT_COMPARE_UNMEASURED).toBe('미측정');
+    expect(unknown).toContain('bytes=미측정');
+    expect(unknown).toContain('errors=미측정');
+    expect(unknown).toContain('ledger:pty-event-log rows=미측정 lastSeq=미측정 lastState=미측정');
+    expect(unknown).toContain('start=미측정');
+    expect(measured).toContain('bytes=0');
+    expect(measured).toContain('errors=0');
+    expect(measured).toContain('ledger:pty-event-log rows=0');
+    expect(measured).toContain('start=1970-01-01T00:00:00.000Z');
+  });
+
+  test('run-f398f7dd fixture — 같은 Pod 종료로 뭉친 자식 실패 원인을 result로 구분하고 누락은 미측정으로 남긴다', async () => {
+    const { buildSeatCompareSignalLine, SEAT_COMPARE_UNMEASURED } = await import('./tui-run-state.js');
+    const common = {
+      runId: 'run-f398f7dd',
+      command: 'TUI-SEAT-PILOT-2H-COMPARE',
+      startedAt: 1_700_000_000_000,
+      endedAt: 1_700_000_001_000,
+      tuiRunState: { surface: 'tui-run-state', rows: 1, lastSeq: 1, lastState: 'idle' },
+      ptyEventLog: { surface: 'pty-event-log', rows: 1, lastSeq: 1, lastState: 'idle' },
+      outputBytes: 0,
+      errors: 1,
+    } as const;
+    const outcomes = [
+      buildSeatCompareSignalLine({ ...common, result: 'provider-failed:goal-elaboration' }),
+      buildSeatCompareSignalLine({ ...common, result: 'boundary-rejected:sed' }),
+      buildSeatCompareSignalLine({ ...common, result: 'aborted:no-change' }),
+      buildSeatCompareSignalLine({ ...common, result: null }),
+    ];
+
+    expect(new Set(outcomes).size).toBe(4);
+    expect(outcomes[0]).toContain('result=provider-failed:goal-elaboration');
+    expect(outcomes[1]).toContain('result=boundary-rejected:sed');
+    expect(outcomes[2]).toContain('result=aborted:no-change');
+    expect(outcomes[3]).toContain(`result=${SEAT_COMPARE_UNMEASURED}`);
+  });
+
+  test('sim-log 기록 도구 — 한 줄을 append 하고 미실행이면 아무 줄도 남기지 않는다', async () => {
+    const { appendSeatCompareSignalLine, buildSeatCompareSignalLine } = await import('./tui-run-state.js');
+    const logPath = join(mkdtempSync(join(stateDir, 'sim-log-')), 'nested', 'sim-log.log');
+    const line = buildSeatCompareSignalLine({
+      runId: 'run-append', command: 'bun test', startedAt: 5, endedAt: 9, outputBytes: 12, errors: 1, result: 'fail',
+      tuiRunState: { surface: 'tui-run-state', rows: 1, lastSeq: null, lastState: 'idle' },
+      ptyEventLog: { surface: 'pty-event-log', rows: 0, lastSeq: 0, lastState: 'idle' },
+    });
+    expect(existsSync(logPath)).toBe(false);
+    expect(appendSeatCompareSignalLine(line, { path: logPath })).toBe(true);
+    expect(appendSeatCompareSignalLine(line, { path: logPath })).toBe(true);
+    const written = readFileSync(logPath, 'utf8').trimEnd().split('\n');
+    expect(written).toHaveLength(2);
+    expect(written[0]).toBe(line);
+  });
+
+});

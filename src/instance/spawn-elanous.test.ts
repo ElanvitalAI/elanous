@@ -12,6 +12,14 @@ describe('spawnElanous 우주 도장', () => {
     expect(inv.args.slice(1)).toEqual(['where']);
   });
 
+  test('installed executable keeps its command while receiving both universe identity fields', () => {
+    const inv = elanousInvocation(['mission', 'status'], { executable: 'eln', stateDir: '/tmp/u-installed', env: { PATH: '/usr/bin' } });
+    expect(inv.command).toBe('eln');
+    expect(inv.args).toEqual(['mission', 'status']);
+    expect(inv.env).toMatchObject({ PATH: '/usr/bin', ELANOUS_STATE_DIR: '/tmp/u-installed',
+      ELANOUS_STATE_DIR_SOURCE: expect.any(String) });
+  });
+
   test('생략하면 부모 effectiveInstanceRoot 가 도장이 된다', () => {
     const inv = elanousInvocation(['where'], { env: {} });
     expect(inv.env.ELANOUS_STATE_DIR).toBeTruthy();

@@ -5,6 +5,8 @@ import { WarmPodProvider } from '../task-orchestrator/surfaces/pod-warm-worker-p
 import { WarmPodTransport, warmWorkerPodManifest, type WarmPodSpec } from '../task-orchestrator/surfaces/pod-warm-worker-pod.js';
 import { cleanAndReturnChildPod, type ChildPodLease } from '../task-orchestrator/surfaces/pod-child-reuse.js';
 import { podSelfImplementSpawn } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { podSpawnWithSiWarm } from '../task-orchestrator/surfaces/pod-si-warm-entry.js';
+import { SiWarmPodProvider } from '../task-orchestrator/surfaces/pod-si-warm-provider.js';
 import { HostPoolLease } from '../pod-lease/host-lease.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +19,13 @@ const spec: WarmPodSpec = { name: 'warm-node-c', namespace: 'elanous-test', kube
   memoryLimit: '16Gi', nodeName: 'pool-node-c-server-0', hostProbeUrl: 'http://host.orb.internal:10001/health',
   prodProbeUrl: 'http://core.elanous-prod:10002/' };
 const member = parsePodPool('node-c:1')[0]!;
+test('MOCK-FAKE-KUBECTL: pod listing matches Kubernetes PodList metadata contract', () => {
+  const device = createFakeKubectl({ context: 'fake', node: 'fake-node' });
+  const result = device.kubectl(['--context', 'fake', 'get', 'pods', '-l', 'elanous.kind=warm-worker', '--limit=10', '-o', 'json']);
+  expect(result.status).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ apiVersion: 'v1', kind: 'PodList', metadata: { resourceVersion: '1', continue: '' }, items: [] });
+});
+
 const replay = () => ({ protocol: 1 as const, runId: 'run-1', attemptId: 'attempt-1', cutSha: spec.cutSha,
   deadlineAt: Date.now() + 60_000, files: ['src/example.test.ts'], envProfile: 'gate-v1' as const });
 
@@ -57,6 +66,29 @@ test('MOCK-FAKE-KUBECTL: tracks Job disappearance, Pod UID and fenced lease tran
   expect(JSON.parse(device.kubectl([...command, 'get', 'jobs', '-o', 'json']).stdout).items).toHaveLength(0);
   expect(JSON.parse(device.kubectl([...command, 'get', 'pod', spec.name, '-o', 'json']).stdout).metadata.uid).toBe('uid-2');
   expect((await device.fetchLease('http://control/v1/leases/pod-worker')).status).toBe(503);
+});
+
+test('MOCK-FAKE-KUBECTL: lost warm-lease reply reconciles without starting a duplicate Pod Job', async () => {
+  const device = createFakeKubectl({ context: member.context, node: spec.nodeName! });
+  device.setWarmLease({ workerId: spec.workerId, podUid: 'uid-1', key });
+  device.loseNextLeaseResponse();
+  const provider = new SiWarmPodProvider({ candidates: [{ host: 'node-c', tier: 'standard', spec }],
+    controlUrl: 'http://control/', memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
+    kubectl: device.kubectl, fetch: device.fetchLease, siRunnerReady: () => true,
+  });
+  const spawn = await podSpawnWithSiWarm({ kubectl: device.kubectl, env: {}, siWarmLedger: () => {} },
+    { ELANOUS_SI_WARM_REUSE: '1' }, {
+      acquire: async _input => provider.acquire({ runId: 'run-lost-reply', attemptId: 'attempt-lost-reply',
+        executionKey: 'd'.repeat(64), sourceSha: spec.cutSha, deadlineAt: Date.now() + 60_000,
+        payload: new Uint8Array([1]), credentialBundle: new Uint8Array([2]), adopt: async () => {} }),
+      postprocess: async (_input, result) => result,
+    });
+
+  const result = await spawn({ feature: 'request with ambiguous lease response', spaceId: 'lost-lease-reply' }).done;
+  expect(result.error?.code).toBe('si-warm-reconcile-only');
+  expect(result.error?.message).toContain('lease-response-lost');
+  expect(device.warmLeaseState()).toBe('leased');
+  expect(device.jobCreates).toHaveLength(0);
 });
 
 test('MOCK-FAKE-KUBECTL: delete accepts both Kubernetes job target forms and rejects unsupported targets', () => {

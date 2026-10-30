@@ -325,7 +325,7 @@ function joinWithBlankLine(prefix: string, block: string): string {
 
 function appendTextToMessage(msg: LLMMessage, block: string): LLMMessage {
   if (typeof msg.content === 'string') {
-    return { role: msg.role, content: joinWithBlankLine(msg.content, block) };
+    return { ...msg, content: joinWithBlankLine(msg.content, block) };
   }
   // ContentBlock[] — append to the LAST text block; if none exists,
   // push a fresh one. Other block kinds (image / tool_use / tool_result)
@@ -336,11 +336,11 @@ function appendTextToMessage(msg: LLMMessage, block: string): LLMMessage {
     if (b.type === 'text') {
       const text = (b as { text?: string }).text ?? '';
       blocks[i] = { ...b, text: joinWithBlankLine(text, block) };
-      return { role: msg.role, content: blocks };
+      return { ...msg, content: blocks };
     }
   }
   blocks.push({ type: 'text', text: block } as ContentBlock);
-  return { role: msg.role, content: blocks };
+  return { ...msg, content: blocks };
 }
 
 /** Wave 2 W2.4 + W2.5 convenience — split specs AND inject the

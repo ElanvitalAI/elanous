@@ -56,6 +56,6 @@ test('make-doc and verify rework use the configured-default recipe with its time
   expect(draftRecipe).toBe('cmd:headless-goal-loop');
   expect(reworkRecipe).toBe(draftRecipe);
   expect(configured.timeout_ms).toBe(300000);
-  expect(configured.command).toBe('bun scripts/graph-units/verbs/headless-goal-loop.ts');
+  expect(configured.command).toBe('bun "$ELANOUS_GRAPH_DIR/../../../scripts/graph-units/verbs/headless-goal-loop.ts"');
   expect(configured.command).not.toMatch(/ELANOUS_GRAPH_CHILD_LLM_(?:PROVIDER|MODEL)=/);
 });

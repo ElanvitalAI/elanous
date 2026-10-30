@@ -14,7 +14,7 @@
 // isolation without standing up the LLM stack.
 
 import type { ExternalResearchResult, InvokeResearchOpts } from './types.js';
-import type { SkillManifest } from '../skills/runner.js';
+import type { ExecuteSkillOpts, SkillManifest } from '../skills/runner.js';
 import type { BloomResearchQuestion } from '../auto-research/question-ladder-contract.js';
 import type { AxisFanoutDeps, AxisFanoutResult } from '../research/axis-fanout.js';
 import { recordResult } from './store.js';
@@ -76,7 +76,22 @@ export type ResearchInvoker = (
   args: string,
   onProgress?: (delta: string) => void,
   signal?: AbortSignal,
+  skillRootDir?: string,
 ) => Promise<ResearchInvocationOutcome>;
+
+export type ResearchSkillExecutorForTest = (
+  manifest: SkillManifest,
+  args: string,
+  onProgress?: (delta: string) => void,
+  opts?: ExecuteSkillOpts,
+) => Promise<{ finalResponse: string }>;
+
+let researchSkillExecutorForTest: ResearchSkillExecutorForTest | null = null;
+
+/** Replace only skill execution in tests; manifest parsing still uses the real selected skill root. */
+export function setResearchSkillExecutorForTest(executor: ResearchSkillExecutorForTest | null): void {
+  researchSkillExecutorForTest = executor;
+}
 
 let invoker: ResearchInvoker | null = null;
 
@@ -103,19 +118,21 @@ async function defaultInvoker(
   args: string,
   onProgress?: (delta: string) => void,
   signal?: AbortSignal,
+  skillRootDir?: string,
 ): Promise<ResearchInvocationOutcome> {
   const { parseSkillMd, executeSkill } = await import('../skills/runner.js');
-  const manifest = parseSkillMd(skillName);
+  const manifest = parseSkillMd(skillName, skillRootDir);
   if (!manifest) {
     return {
       output: '',
       ok: false,
-      error: `skill "${skillName}" not found under ~/.claude/skills/`,
+      error: `skill "${skillName}" not found under ${skillRootDir ?? '~/.claude/skills'}/`,
     };
   }
   try {
     // ★ research 격리 — 파일-쓰기 도구 deny 주입(main 트리 오염 차단). Bash·검색도구는 유지.
-    const result = await executeSkill(withResearchIsolation(manifest), args, (delta) => {
+    const run = researchSkillExecutorForTest ?? executeSkill;
+    const result = await run(withResearchIsolation(manifest), args, (delta) => {
       if (onProgress) onProgress(delta);
     }, { signal });
     return researchOutcomeFromSkillRun(result);
@@ -138,7 +155,7 @@ export async function invokeResearch(
 ): Promise<ExternalResearchResult> {
   const skillName = opts.skill || DEFAULT_SKILL;
   const startedAt = new Date();
-  const outcome = await (invoker ?? defaultInvoker)(skillName, topic, opts.onProgress, opts.signal);
+  const outcome = await (invoker ?? defaultInvoker)(skillName, topic, opts.onProgress, opts.signal, opts.skillRootDir);
   const finishedAt = new Date();
   const result: ExternalResearchResult = {
     topic,

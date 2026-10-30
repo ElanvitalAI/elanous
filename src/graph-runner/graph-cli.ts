@@ -5,10 +5,10 @@ import { parse as parseYaml } from 'yaml';
 import { writeStdoutJson } from '../cli/stdout-json.js';
 import type { GraphVariantPlan } from '../self-implement/graph-variant.js';
 import { debug } from '../debug/log.js';
-import { decideGraphApproval, graphRunAlive, lastJsonObject, latestGraphRun, listGraphRuns, manageGraphRun, runGraph, type GraphRunState } from './runner.js';
+import { decideGraphApproval, graphRunAlive, lastJsonObject, latestGraphRun, listGraphRuns, manageGraphRun, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
 
-function findGraphFile(graphId: string): string | undefined {
-  const roots = [resolve('graphs'), resolve(import.meta.dir, '../../graphs')];
+function findGraphFile(graphId: string, extraRoots: string[] = []): string | undefined {
+  const roots = [...extraRoots.map((root) => resolve(root)), resolve('graphs'), resolve(import.meta.dir, '../../graphs')];
   for (const root of roots) {
     for (const dir of [root, ...['release', 'ops'].map((part) => join(root, part))]) {
       if (!existsSync(dir)) continue;
@@ -26,7 +26,10 @@ function findGraphFile(graphId: string): string | undefined {
   return undefined;
 }
 
-export function registerGraphCommands(program: Command, runsDeps: { root?: string; processStartMs?: (pid: number) => number | null } = {}): void {
+export function registerGraphCommands(program: Command, runsDeps: {
+  root?: string; processStartMs?: (pid: number) => number | null; graphRoots?: string[];
+  runBash?: NonNullable<GraphRunOptions['deps']>['runBash'];
+} = {}): void {
   const graph = program.command('graph').description('Run a declared command graph or inspect its latest run');
   graph.command('adapt-report')
     .description('Measure recorded graph path diversity, unit calls, adaptations and landings for one goal')
@@ -333,10 +336,23 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
   graph.command('approve <graph_id> <run_id>')
     .option('--reject', 'Reject instead of approving')
     .option('--by <name>', 'Record the approver name')
-    .action((graphId: string, runId: string, opts: { reject?: boolean; by?: string }) => {
+    .action(async (graphId: string, runId: string, opts: { reject?: boolean; by?: string }) => {
       try {
-        const state = decideGraphApproval(graphId, runId, opts.reject ? 'rejected' : 'approved', opts.by);
-        console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision}`);
+        // A release approval is the decision point for a live publish run. Resume its
+        // saved graph immediately so approval does not depend on a later manual tick.
+        // Resolve the release graph before recording the irreversible decision; if it
+        // is unavailable, leave the approval undecided so an operator can retry.
+        const releaseGraph = graphId === 'release-loop' ? findGraphFile(graphId, runsDeps.graphRoots) : undefined;
+        if (graphId === 'release-loop' && !releaseGraph) throw new Error('release-loop graph file not found; approval was not recorded');
+        const state = decideGraphApproval(graphId, runId, opts.reject ? 'rejected' : 'approved', opts.by, runsDeps.root);
+        if (releaseGraph) {
+          await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
+          const { graphTick } = await import('./graph-tick.js');
+          const result = await graphTick(releaseGraph, { resumeRunId: runId, deps: { root: runsDeps.root, runBash: runsDeps.runBash } });
+          console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision} · ${result.action} ${result.status ?? ''}`.trim());
+        } else {
+          console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision}`);
+        }
       } catch (error) {
         console.error(`graph approve: ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;

@@ -77,7 +77,7 @@ export const FEATURE_MATURITY = {
     'provider:rotate': 'beta', 'provider:use': 'beta', 'status-bar': 'beta',
     schedule: 'beta', guardian: 'beta', intake: 'beta', logs: 'stable', retro: 'beta', ad: 'beta', docs: 'beta',
     decisions: 'beta', directives: 'beta', claims: 'beta', lesson: 'beta', fleet: 'beta', ops: 'stable', outputs: 'beta', publish: 'beta',
-    env: 'beta', 'agent-mission': 'beta', dev: 'beta', keys: 'beta', finance: 'beta',
+    env: 'beta', 'agent-mission': 'beta', mission: 'beta', dev: 'beta', keys: 'beta', finance: 'beta',
     config: 'stable', tasks: 'stable', brief: 'beta', notify: 'beta', away: 'beta', labels: 'beta', msg: 'beta', ask: 'stable',
     onboarding: 'beta', login: 'stable', session: 'beta', chat: 'stable', repl: 'stable',
     agent: 'stable', registry: 'beta', tier: 'stable', local: 'beta', scheduler: 'beta',

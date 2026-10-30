@@ -18,6 +18,7 @@ import type { LogStore } from '../../mss/logging/log-store.js';
 const POD_READY_WAIT_SECONDS = 900;
 const POD_READY_RECHECK_SECONDS = 300;
 const POD_READY_RETRY_DELAY_MS = 1_000;
+const WARM_CONTROL_REQUEST_TIMEOUT_MS = 2_000;
 
 function throwIfPrepareAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
@@ -70,6 +71,11 @@ export interface WarmPodProviderOptions {
   prepareFlock?: WarmPrepareFlock | null | false;
   /** Gate file this pool serves, used to bind cold prepare legs to their 1-file gate measurement key. */
   pairingGateFile?: string;
+}
+type WarmPodProviderRuntimeOverrides = Pick<WarmPodProviderOptions, 'fetch' | 'kubectl' | 'prepareLockDirectory'>;
+export interface WarmPodProviderLoadOptions {
+  pairingGateFile?: string;
+  runtimeOverrides?: Partial<WarmPodProviderRuntimeOverrides>;
 }
 
 export interface WarmPoolReconcileResult {
@@ -293,6 +299,15 @@ export class WarmPodProvider {
     return { status: response.status, value };
   }
 
+  private async controlBounded(path: string, credential: string, body: Record<string, unknown>, timeoutMs: number): Promise<{ status: number; value: any }> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([this.control(path, credential, body), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('warm control request timed out')), timeoutMs);
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
   /** The child owns kubectl. Timeout terminates only this child process group and fences its lease. */
   private async runTransport(spec: WarmPodSpec, command: WarmWorkerCommand): Promise<WarmPodTransportResult> {
     if (this.options.transport) return this.options.transport(spec).request(command);
@@ -468,12 +483,37 @@ export class WarmPodProvider {
       && Object.entries(metadata.annotations).every(([key, value]) => pod.metadata.annotations?.[key] === value)
       && pod.spec?.nodeName === nodeName
       && sameSpec(normalizedSpec(pod.spec), template);
-    // Read the whole namespace: a Pod for this host on another node must block
-    // creation, and another host's standing worker must not consume this slot.
-    const listed = parse(kubectl(['get', 'pods', '-o', 'json']));
-    if (!Array.isArray(listed?.items)) return false;
-    const hostPods = listed.items.filter((row: any) => row?.metadata?.name === spec.name
+    // Resolve the pinned Pod independently; namespace size must not affect this read.
+    const namedResult = kubectl(['get', 'pods', `--field-selector=metadata.name=${spec.name}`, '-o', 'json']);
+    const namedList = parse(namedResult);
+    if (!Array.isArray(namedList?.items) || !namedList.metadata || typeof namedList.metadata !== 'object'
+      || Array.isArray(namedList.metadata)) return false;
+    const namedMatches = namedList.items.filter((row: any) => row?.metadata?.name === spec.name);
+    if (namedMatches.length > 1) return false;
+    const namedPod = namedMatches[0] ?? null;
+
+    // Kubectl's continuation token is consumed explicitly so no partial page can
+    // authorize a create. A hard page cap turns a non-terminating listing into failure.
+    const warmPods: any[] = [];
+    let continuation = '';
+    const seenContinuations = new Set<string>();
+    for (let page = 0; page < 100; page++) {
+      const args = ['get', 'pods', '-l', 'elanous.kind=warm-worker', '--limit=10', '-o', 'json'];
+      if (continuation) args.splice(5, 0, '--continue', continuation);
+      const result = kubectl(args);
+      const listed = parse(result);
+      if (!listed || !Array.isArray(listed.items) || !listed.metadata || typeof listed.metadata !== 'object'
+        || Array.isArray(listed.metadata)
+        || (listed.metadata.continue !== undefined && typeof listed.metadata.continue !== 'string')) return false;
+      warmPods.push(...listed.items);
+      continuation = listed.metadata?.continue ?? '';
+      if (!continuation) break;
+      if (seenContinuations.has(continuation) || page === 99) return false;
+      seenContinuations.add(continuation);
+    }
+    const hostPods = warmPods.filter((row: any) => row?.metadata?.name === spec.name
       || row?.metadata?.annotations?.['elanous.dev/warm-worker-id'] === spec.workerId);
+    if (namedPod && !hostPods.some((row: any) => row?.metadata?.name === spec.name)) hostPods.push(namedPod);
     if (hostPods.length > 1) return false;
     let pod = hostPods[0];
     const preexisting = !!pod;
@@ -481,7 +521,7 @@ export class WarmPodProvider {
     if (pod && !matches(pod)) return false;
     // Old generations still occupy memory even when their ledger rows are quarantined.
     // Count physical warm Pods on the pinned node before admitting a new one.
-    const physical = listed.items.filter((row: any) => row?.metadata?.labels?.['elanous.kind'] === 'warm-worker'
+    const physical = warmPods.filter((row: any) => row?.metadata?.labels?.['elanous.kind'] === 'warm-worker'
       && row?.spec?.nodeName === nodeName && !row?.metadata?.deletionTimestamp
       && row?.status?.phase !== 'Succeeded' && row?.status?.phase !== 'Failed'
       && row?.spec?.containers?.[0]?.resources?.limits?.memory === spec.memoryLimit).length;
@@ -602,13 +642,77 @@ export class WarmPodProvider {
     const contextFailure = probeWarmPodContext(spec.kubectlContext, this.options.kubectl);
     if (contextFailure) { lastFallback = { command: null, transport: contextFailure }; continue; }
     let acquired: { status: number; value: any };
+    const acquisition = this.control('/v1/leases/pod-worker', this.options.memberToken, {
+      machine: host, key: spec.key, runId: input.runId, attemptId: input.attemptId,
+      ttlMs: this.options.leaseTtlMs ?? 30 * 60_000,
+    });
+    const timedOut = Symbol('warm-acquisition-timeout');
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let acquisitionFailed = false;
+    let acquisitionResult: typeof timedOut | { status: number; value: any };
     try {
-      acquired = await this.control('/v1/leases/pod-worker', this.options.memberToken, {
-        machine: host, key: spec.key, runId: input.runId, attemptId: input.attemptId,
-        ttlMs: this.options.leaseTtlMs ?? 30 * 60_000,
-      });
-    } catch { lastFallback = fallback('lease-unavailable'); continue; }
+      const remainingMs = input.deadlineAt - this.now();
+      if (remainingMs <= 0) acquisitionResult = timedOut;
+      else acquisitionResult = await Promise.race([acquisition, new Promise<typeof timedOut>(resolve => {
+        deadlineTimer = setTimeout(() => resolve(timedOut), remainingMs);
+      })]);
+    } catch { acquisitionFailed = true; acquisitionResult = timedOut; }
+    finally { if (deadlineTimer) clearTimeout(deadlineTimer); }
+    if (acquisitionResult === timedOut) {
+      void acquisition.then(async late => {
+        const row = late.value;
+        const lateWorkerId = row?.name;
+        const leaseId = row?.attrs?.leaseId;
+        const generation = row?.attrs?.generation;
+        const podUid = row?.attrs?.podUid;
+        const lateCandidate = this.candidates.find(candidate => candidate.spec.workerId === lateWorkerId
+          && candidate.host === host && keyEquals(candidate.spec.key, spec.key));
+        if (late.status !== 200 || !lateCandidate || !row?.attrs?.key || !keyEquals(row.attrs.key, lateCandidate.spec.key)
+          || typeof leaseId !== 'string' || !leaseId
+          || !Number.isSafeInteger(generation) || typeof podUid !== 'string' || !podUid) return;
+        const lateSpec = lateCandidate.spec;
+        const command: WarmWorkerCommand = { ...input, leaseId, generation, podUid,
+          podName: lateSpec.name, podContext: lateSpec.kubectlContext, image: lateSpec.image,
+          requestedAt: new Date(this.now()).toISOString(), workerId: lateSpec.workerId, key: lateSpec.key };
+        debug.log('pod.warm', 'lease-response-after-deadline', { workerId: command.workerId,
+          leaseId, generation, podUid, runId: command.runId, attemptId: command.attemptId }, { level: 'warn' });
+        debug.log('pod.provenance', 'lease-start', { pod: lateSpec.name, podUid, leaseId,
+          runId: command.runId, attemptId: command.attemptId, requestedAt: command.requestedAt,
+          metadata: warmLeaseMetadata(command).annotations });
+        try {
+          const fenced = await this.controlBounded(`/v1/leases/pod-worker/${encodeURIComponent(lateWorkerId)}/timeout`,
+            this.options.memberToken, { runId: input.runId, attemptId: input.attemptId }, WARM_CONTROL_REQUEST_TIMEOUT_MS);
+          if (fenced.status !== 200) throw new Error(`warm timeout fence returned ${fenced.status}`);
+        } catch (error) { debug.log('pod.warm', 'late-lease-timeout-fence-failed', { workerId: lateWorkerId,
+          leaseId, generation, error: String(error) }, { level: 'warn' }); }
+        let quarantineTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([this.quarantine(command, 'lease-response-after-deadline'), new Promise<never>((_, reject) => {
+            quarantineTimer = setTimeout(() => reject(new Error('warm late-lease quarantine timed out')), WARM_CONTROL_REQUEST_TIMEOUT_MS);
+          })]);
+        }
+        catch (error) { debug.log('pod.warm', 'late-lease-quarantine-failed', { workerId: command.workerId,
+          leaseId, generation, error: String(error) }, { level: 'warn' }); }
+        finally { if (quarantineTimer) clearTimeout(quarantineTimer); }
+      }, error => debug.log('pod.warm', 'late-lease-response-failed', { workerId: spec.workerId,
+        runId: input.runId, attemptId: input.attemptId, error: String(error) }, { level: 'warn' }));
+      if (acquisitionFailed) continue;
+      return fallback('lease-unavailable');
+    }
+    acquired = acquisitionResult;
     if (acquired.status === 409 || acquired.status === 503) {
+      if (acquired.status === 409) {
+        try {
+          const query = new URLSearchParams({ kind: 'pod-worker-lease', machine: host, name: spec.workerId });
+          const observed = await this.control(`/v1/resources?${query}`, this.options.memberToken);
+          const row = observed.status === 200 && Array.isArray(observed.value?.resources)
+            ? observed.value.resources.find((entry: any) => entry?.name === spec.workerId) : undefined;
+          if (row?.attrs?.state === 'quarantined' || row?.attrs?.state === 'timeout-fenced') {
+            debug.log('pod.warm', 'quarantine-holds-slot', { workerId: spec.workerId,
+              state: row.attrs.state, at: new Date(this.now()).toISOString() }, { level: 'warn' });
+          }
+        } catch { /* Slot observation never changes the Job's cold fallback. */ }
+      }
       lastFallback = fallback('lease-unavailable');
       continue;
     }
@@ -620,6 +724,16 @@ export class WarmPodProvider {
     if (!workerId(row?.name) || typeof leasedId !== 'string' || !leasedId
       || typeof podUid !== 'string' || !podUid
       || !Number.isSafeInteger(generation) || generation < 1) return fallback('lease-unavailable');
+    // One terminal transition per workerId·leaseId·generation·Pod UID. A lease the
+    // control plane already settled (finalize/quarantine raced this acquisition)
+    // must never be re-adopted — not by this late reply, not by the next warm request.
+    // An uncertain ending keeps its quarantined / cold-Job verdict.
+    const terminalKey = JSON.stringify([row.name, leasedId, generation, podUid]);
+    if (this.terminalLeases.has(terminalKey) || this.quarantineRequested.has(terminalKey)) {
+      debug.log('pod.warm', 'lease-terminal-refused', { workerId: row.name, leaseId: leasedId,
+        generation, podUid, runId: input.runId, attemptId: input.attemptId }, { level: 'warn' });
+      return fallback('lease-unavailable');
+    }
     // Acquisition selects by host/key, not by worker ID. Resolve the returned worker
     // before choosing its transport; an unknown worker must not be executed or fenced.
     const leasedCandidate = this.candidates.find(entry => entry.host === host
@@ -641,6 +755,20 @@ export class WarmPodProvider {
       podName: leasedCandidate.spec.name, podContext: leasedCandidate.spec.kubectlContext, image: leasedCandidate.spec.image,
       requestedAt: new Date(this.now()).toISOString(),
       workerId: row.name, key: leasedCandidate.spec.key };
+    if (command.deadlineAt <= this.now()) {
+      debug.log('pod.warm', 'lease-response-after-deadline', { workerId: command.workerId,
+        leaseId: command.leaseId, generation: command.generation, podUid: command.podUid,
+        runId: command.runId, attemptId: command.attemptId }, { level: 'warn' });
+      // The control plane granted a lease, even though the caller's budget expired before Pod adoption.
+      // Record its short lifetime as a paired start/end and quarantine it without running transport.
+      debug.log('pod.provenance', 'lease-start', { pod: leasedCandidate.spec.name, podUid: command.podUid,
+        leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId,
+        requestedAt: command.requestedAt, metadata: warmLeaseMetadata(command).annotations });
+      try { await this.quarantine(command, 'lease-response-after-deadline'); }
+      catch (error) { debug.log('pod.warm', 'late-lease-quarantine-failed', { workerId: command.workerId,
+        leaseId: command.leaseId, generation: command.generation, error: String(error) }, { level: 'warn' }); }
+      return fallback('lease-unavailable');
+    }
     // Acquisition is by pool key. A healthy sibling or replacement Pod must remain eligible.
     // Never run transport on the old Pod while its previous lease is being quarantined.
     if (this.quarantiningPods.has(JSON.stringify([command.workerId, command.podUid]))) {
@@ -710,20 +838,26 @@ export class WarmPodProvider {
   }
 
   private async finalizeOnce(command: WarmWorkerCommand): Promise<'sanitized' | 'quarantined'> {
+    const key = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
     const candidate = this.candidates.find(row => row.spec.workerId === command.workerId);
     if (!candidate) throw new Error('warm finalize candidate missing');
     const released = await this.transition(command, 'release');
     const machineToken = this.options.machineTokens?.[candidate.host];
     // Sanitizing is the producer's machine-scoped acknowledgement, after transport's cleanup and ACK.
-    const cleared = released ? patchWarmLeaseMetadata(candidate.spec, command, 'idle', this.options.kubectl)
+    // Always verify and clear this exact Pod UID/lease metadata before telling the control plane it is reusable.
+    // A missing local adoption record is not evidence that no pod-side leased state exists.
+    const cleared = released
+      ? patchWarmLeaseMetadata(candidate.spec, command, 'idle', this.options.kubectl)
       : { ok: false, reason: 'release-failed' };
     if (!cleared.ok) debug.log('pod.provenance', 'lease-patch-refused', { pod: candidate.spec.name,
       podUid: command.podUid, leaseId: command.leaseId, reason: cleared.reason }, { level: 'warn' });
     if (!cleared.ok || !token(machineToken) || !await this.transition(command, 'sanitize', machineToken)) {
-      await this.quarantineOnce(command, 'sanitize-unavailable', true);
+      if (!this.quarantineRequested.has(key)) {
+        this.quarantineRequested.add(key);
+        await this.quarantineOnce(command, 'sanitize-unavailable', true);
+      }
       return 'quarantined';
     }
-    const key = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
     if (!this.quarantineRequested.has(key)) {
       debug.log('pod.provenance', 'lease-end', { pod: candidate.spec.name, podUid: command.podUid,
         leaseId: command.leaseId, runId: command.runId, attemptId: command.attemptId,
@@ -740,19 +874,21 @@ export class WarmPodProvider {
     this.quarantiningPods.add(podKey);
     const prior = this.terminalLeases.get(key);
     if (prior) {
+      if (this.quarantineRequested.has(key)) {
+        try { await prior; this.quarantiningPods.delete(podKey); }
+        catch (error) { if (this.terminalLeases.get(key) === prior) this.terminalLeases.delete(key); throw error; }
+        return;
+      }
       this.quarantineRequested.add(key);
-      const terminal = prior.then(async outcome => {
-        if (outcome === 'sanitized') {
-          await this.quarantineOnce(command, reason, leaseStarted);
-          return 'quarantined' as const;
-        }
-        return outcome;
-      });
+      // Fence the control-plane lease immediately. Waiting for sanitize to settle leaves a window
+      // where another request could acquire the just-idled worker before this quarantine lands.
+      const terminal = this.quarantineOnce(command, reason, leaseStarted).then(() => 'quarantined' as const);
       this.terminalLeases.set(key, terminal);
       try { await terminal; this.quarantiningPods.delete(podKey); }
       catch (error) { if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key); throw error; }
       return;
     }
+    this.quarantineRequested.add(key);
     const terminal = this.quarantineOnce(command, reason, leaseStarted).then(() => 'quarantined' as const);
     this.terminalLeases.set(key, terminal);
     try { await terminal; this.quarantiningPods.delete(podKey); }
@@ -783,7 +919,11 @@ let configuredProvider: WarmPodProvider | null = null;
 /** The trusted producer configures this once; an absent provider fails closed without creating a Pod. */
 export function configureWarmPodProvider(provider: WarmPodProvider | null): void { configuredProvider = provider; }
 /** Optional private producer config; a missing/unsafe file leaves the Job path untouched. */
-export function loadWarmPodProvider(path: string, pairingGateFile?: string): WarmPodProvider {
+export function loadWarmPodProvider(path: string, pairingGateFileOrOptions?: string | WarmPodProviderLoadOptions): WarmPodProvider {
+  const pairingGateFile = typeof pairingGateFileOrOptions === 'string'
+    ? pairingGateFileOrOptions : pairingGateFileOrOptions?.pairingGateFile;
+  const runtimeOverrides = typeof pairingGateFileOrOptions === 'object'
+    ? pairingGateFileOrOptions?.runtimeOverrides ?? {} : {};
   if (!isAbsolute(path) || (statSync(path).mode & 0o077) !== 0) throw new Error('warm provider config must be private');
   const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid warm provider config');
@@ -797,7 +937,7 @@ export function loadWarmPodProvider(path: string, pairingGateFile?: string): War
     if (!pairingGateFile.trim()) throw new Error('warm provider pairing gate file must not be empty');
     options.pairingGateFile = pairingGateFile;
   }
-  return new WarmPodProvider(options);
+  return new WarmPodProvider({ ...options, ...runtimeOverrides });
 }
 function currentProvider(): WarmPodProvider | null {
   if (configuredProvider) return configuredProvider;
@@ -851,35 +991,55 @@ export function parseWarmPodProviderArgs(argv: readonly string[]): { action: '--
   throw usage();
 }
 
-if (import.meta.main) {
-  const { action, workerId, gateFile } = parseWarmPodProviderArgs(process.argv.slice(2));
+export interface WarmPodProviderCliDependencies {
+  providerRuntime?: Partial<WarmPodProviderRuntimeOverrides>;
+  write?: (line: string) => void;
+  registerLogSink?: (name: string) => Promise<void>;
+  sleep?: (milliseconds: number) => Promise<void>;
+}
+
+export async function runWarmPodProviderCli(argv: readonly string[] = process.argv.slice(2),
+  dependencies: WarmPodProviderCliDependencies = {}): Promise<{
+    exitCode: number;
+    result?: WarmPoolReconcileResult | null;
+    prepared?: boolean;
+  }> {
+  const { action, workerId, gateFile } = parseWarmPodProviderArgs(argv);
+  const write = dependencies.write ?? ((line: string) => { process.stdout.write(line); });
   const file = process.env.ELANOUS_WARM_POD_PROVIDER_CONFIG;
   // The 1-file gate key this pool serves, bound into every cold prepare leg of this process.
-  const load = () => (file ? loadWarmPodProvider(file, gateFile) : null);
+  const load = () => {
+    if (!file) return null;
+    return loadWarmPodProvider(file, { pairingGateFile: gateFile, runtimeOverrides: dependencies.providerRuntime });
+  };
   if (action === '--pairs') {
     // Read-only: join the cold CLI legs and the warm gate legs both processes wrote to logs.db.
     try {
       const storeMod = await import('../../mss/logging/log-store.js');
       const dbPath = storeMod.logsDbPath();
       // No logs.db yet means no leg was ever measured: an empty pair list, not a failed query.
-      if (!existsSync(dbPath)) process.stdout.write(JSON.stringify({ warmReuseTimePairs: [] }) + '\n');
+      if (!existsSync(dbPath)) write(JSON.stringify({ warmReuseTimePairs: [] }) + '\n');
       else {
         const store = storeMod.LogStore.openReadOnly(dbPath);
-        try { process.stdout.write(JSON.stringify({ warmReuseTimePairs: readWarmReuseTimePairs(store) }) + '\n'); }
+        try { write(JSON.stringify({ warmReuseTimePairs: readWarmReuseTimePairs(store) }) + '\n'); }
         finally { store.close(); }
       }
     } catch (error) {
-      process.stdout.write(JSON.stringify({ warmReuseTimePairs: null, reason: 'logs-unavailable', detail: String(error) }) + '\n');
-      process.exitCode = 2;
+      write(JSON.stringify({ warmReuseTimePairs: null, reason: 'logs-unavailable', detail: String(error) }) + '\n');
+      return { exitCode: 2 };
     }
+    return { exitCode: 0 };
   }
   // The cold legs must reach the same logs.db the warm gate process (gate-node) writes; fail-open.
-  if (action !== '--pairs') try { await (await import('../../domains/standalone-log-sink.js')).registerStandaloneLogSink('pod-warm'); }
+  try {
+    if (dependencies.registerLogSink) await dependencies.registerLogSink('pod-warm');
+    else await (await import('../../domains/standalone-log-sink.js')).registerStandaloneLogSink('pod-warm');
+  }
   catch { /* the file trail stays the source of truth */ }
   // This process's own legs, echoed for the caller; the pair itself is read with --pairs.
   const emitPairs = (provider: WarmPodProvider) => {
     const legs = provider.warmReuseTimeLegs();
-    if (legs.length) process.stdout.write(JSON.stringify({ warmReuseTimeLegs: legs }) + '\n');
+    if (legs.length) write(JSON.stringify({ warmReuseTimeLegs: legs }) + '\n');
   };
   if (action === '--serve') {
     // Reloading the private config lets the owner rotate a quarantined slot to a new worker ID.
@@ -888,30 +1048,40 @@ if (import.meta.main) {
       try {
         const provider = load();
         const result = provider ? await provider.reconcilePool() : null;
-        process.stdout.write(JSON.stringify(result ?? { target: 0, ready: 0, failed: ['config-unavailable'] }) + '\n');
+        write(JSON.stringify(result ?? { target: 0, ready: 0, failed: ['config-unavailable'] }) + '\n');
         if (provider) emitPairs(provider);
       } catch {
         debug.log('pod.warm', 'pool-reconcile-unavailable', { reason: 'config-unavailable' }, { level: 'warn' });
-        process.stdout.write(JSON.stringify({ target: 0, ready: 0, failed: ['config-unavailable'] }) + '\n');
+        write(JSON.stringify({ target: 0, ready: 0, failed: ['config-unavailable'] }) + '\n');
       }
-      await Bun.sleep(60_000);
+      await (dependencies.sleep ?? Bun.sleep)(60_000);
     }
+    return { exitCode: 0 };
   }
   if (action === '--reconcile') {
     let result: WarmPoolReconcileResult | null = null;
     let provider: WarmPodProvider | null = null;
     try { provider = load(); result = provider ? await provider.reconcilePool() : null; }
     catch { /* An invalid private config is a failed pass, never a Pod mutation. */ }
-    process.stdout.write(JSON.stringify(result ?? { target: 0, ready: 0, failed: ['config-unavailable'] }) + '\n');
+    write(JSON.stringify(result ?? { target: 0, ready: 0, failed: ['config-unavailable'] }) + '\n');
     if (provider) emitPairs(provider);
-    if (!result || result.ready !== result.target) process.exitCode = 2;
+    return { exitCode: !result || result.ready !== result.target ? 2 : 0, result };
   } else if (action === '--prepare') {
     let prepared = false;
     let provider: WarmPodProvider | null = null;
     try { provider = load(); prepared = provider ? await provider.prepareWorker(workerId!) : false; }
     catch { /* An invalid private config is a failed preparation, never a Pod mutation. */ }
-    process.stdout.write(JSON.stringify({ workerId, prepared }) + '\n');
+    write(JSON.stringify({ workerId, prepared }) + '\n');
     if (provider) emitPairs(provider);
-    if (!prepared) process.exitCode = 2;
+    return { exitCode: prepared ? 0 : 2, prepared };
+  }
+  return { exitCode: 2 };
+}
+
+if (import.meta.main) {
+  try { process.exitCode = (await runWarmPodProviderCli()).exitCode; }
+  catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 2;
   }
 }

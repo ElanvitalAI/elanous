@@ -27,6 +27,10 @@ export interface SelfDevGoal {
   kind?: JobKind;
   /** Decomposition intent; deliberately distinct from executable `kind`. */
   goalType?: SelfDevGoalType;
+  /** Required for default-LLM decomposition slices; included in the child task prompt. */
+  completionBoundary?: string;
+  /** Existing simulation evidence required to make a decomposed slice independently reviewable. */
+  mockScenario?: { id: string; injection: string; observation: string };
   /** Feature/goal text → `elanous self implement <feature>` for dev jobs. */
   feature: string;
   /** Pod lease predecessor goal ID or PR number. */

@@ -55,6 +55,22 @@ function fixture() {
   return { queries, client };
 }
 
+async function waitUntil(ready: () => boolean) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    let isReady = false;
+    await act(async () => {
+      isReady = ready();
+      if (!isReady) await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    if (isReady) return;
+  }
+  throw new Error('RunGraphView query/render did not reach the requested state');
+}
+
+function hasEnabledButton(renderer: ReturnType<typeof create>, label: string): boolean {
+  return renderer.root.findAllByType('button').some((button) => button.children.includes(label) && !button.props.disabled);
+}
+
 test('RunGraphView renders a core list and non-interactive outcome-labelled canvas without write controls', async () => {
   const { queries, client } = fixture();
   let renderer!: ReturnType<typeof create>;
@@ -105,7 +121,7 @@ test('RunGraphView does not fall back to raw graph when static flattening fails'
   const failingClient = { ...client, getRunGraphFlat: async () => { throw new Error('flat unavailable'); } } as unknown as NexusClient;
   let renderer!: ReturnType<typeof create>;
   await act(async () => { renderer = create(<NexusProvider client={failingClient} queryClient={queries}><RunGraphView /></NexusProvider>); });
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  await waitUntil(() => JSON.stringify(renderer.toJSON()).includes('정적 그래프를 불러오지 못했습니다.'));
   expect(renderer.root.findAllByType(ReactFlow)).toHaveLength(0);
   expect(JSON.stringify(renderer.toJSON())).toContain('정적 그래프를 불러오지 못했습니다.');
   await act(async () => renderer.unmount());
@@ -165,7 +181,7 @@ test('a mine graph validates before saving and warns about ignored keys without 
   await act(async () => {
     renderer = create(<NexusProvider client={mine} queryClient={queries}><RunGraphView /></NexusProvider>);
   });
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  await waitUntil(() => hasEnabledButton(renderer, '저장'));
   const text = JSON.stringify(renderer.toJSON());
   expect(text).toContain('내 그래프');
   expect(text).toContain('agent');
@@ -202,7 +218,7 @@ test('mine graph edits consume YAML history through undo, redo and a new branch'
   await act(async () => {
     renderer = create(<NexusProvider client={mine} queryClient={queries}><RunGraphView /></NexusProvider>);
   });
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  await waitUntil(() => hasEnabledButton(renderer, '저장'));
   const button = (label: string) => renderer.root.findAllByType('button').find((item) => item.children.includes(label))!;
   expect(button('되돌리기').props.disabled).toBe(true);
   expect(button('다시 실행').props.disabled).toBe(true);
@@ -251,6 +267,49 @@ test('node failure picker persists the chosen outcome fail route in graph YAML',
   queries.clear();
 });
 
+test('DEMO-GRAPH-LIVE-SHOWCASE: RunGraphView 쇼케이스 진입/복귀는 현행 LiveRunGraph·런 원장 계약을 재사용한다', async () => {
+  const { queries, client } = fixture();
+  const mine = {
+    ...client,
+    getRunGraphs: async () => ({ graphs: [{ id: 'mine', source: 'mine' as const, editable: true, nodeCount: 0 }] }),
+    getRunGraph: async () => ({ ...detail, id: 'mine', source: 'mine' as const, editable: true }),
+    getRunGraphYaml: async () => ({ id: 'mine', source: 'mine' as const, editable: true, yaml: 'graph_id: mine\nnodes: []\n' }),
+    putRunGraphYaml: async (_id: string, _yaml: string) => ({ id: 'mine', source: 'mine', editable: true, saved: true }),
+    getHarnessRunsSince: async () => ({
+      entries: [{ runId: '49669d4d-75d9-44bd-9679-2e080c78fb0e', status: 'running', lastActivityTimestamp: '2026-10-29T09:26:42.631Z', objective: '스튜어드' }],
+      finished: [],
+    }),
+  } as unknown as NexusClient;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(<NexusProvider client={mine} queryClient={queries}><RunGraphView /></NexusProvider>);
+  });
+  await waitUntil(() => hasEnabledButton(renderer, '저장'));
+  const button = (label: string) => renderer.root.findAllByType('button').find((item) => item.children.includes(label))!;
+  const addNodeReady = () => renderer.root.findAllByType('button').some((item) => item.children.includes('노드 추가') && !item.props.disabled);
+  await waitUntil(() => hasEnabledButton(renderer, '저장') && addNodeReady());
+  // 편집 초안을 만들어 둔다 — 되돌리기 스택에 한 단계.
+  await act(async () => button('노드 추가').props.onClick());
+  await waitUntil(() => button('되돌리기').props.disabled === false);
+  // 명시적 쇼케이스 진입.
+  await act(async () => button('쇼케이스').props.onClick());
+  await waitUntil(() => JSON.stringify(renderer.toJSON()).includes('49669d4d-75d9-44bd-9679-2e080c78fb0e'));
+  const showcaseText = JSON.stringify(renderer.toJSON());
+  expect(showcaseText).toContain('편집으로 복귀');
+  expect(showcaseText).toContain('49669d4d-75d9-44bd-9679-2e080c78fb0e');
+  expect(showcaseText).toContain('스튜어드');
+  // 쇼케이스 중에는 편집 컨트롤이 물러나 있다.
+  expect(renderer.root.findAllByType('button').find((item) => item.children.includes('노드 추가'))).toBeUndefined();
+  // 편집으로 복귀 — YAML 초안·undo 스택 그대로.
+  await act(async () => button('편집으로 복귀').props.onClick());
+  expect(button('되돌리기').props.disabled).toBe(false);
+  await act(async () => button('되돌리기').props.onClick());
+  expect(button('되돌리기').props.disabled).toBe(true);
+  expect(button('다시 실행').props.disabled).toBe(false);
+  await act(async () => renderer.unmount());
+  queries.clear();
+});
+
 test('valid mine graph saves after validation and keeps ignored-key warning visible', async () => {
   const { queries, client } = fixture();
   const calls: string[] = [];
@@ -272,7 +331,7 @@ test('valid mine graph saves after validation and keeps ignored-key warning visi
   await act(async () => {
     renderer = create(<NexusProvider client={mine} queryClient={queries}><RunGraphView /></NexusProvider>);
   });
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  await waitUntil(() => hasEnabledButton(renderer, '저장'));
   const save = renderer.root.findAllByType('button').find((button) => button.children.includes('저장'));
   await act(async () => save!.props.onClick());
   expect(calls).toEqual(['validate:harness:graph_id: mine\n', 'put:mine:graph_id: mine\n']);

@@ -136,15 +136,30 @@ function card(gap: string, candidates: readonly PluginDiscoveryCandidate[], inst
 
 /** One bounded, fail-soft discovery attempt for a research capability gap. */
 export async function discoverResearchPlugin(gapText: string, deps: PluginDiscoveryDeps = {}): Promise<PluginDiscoveryResult> {
-  const gap = safeGap(gapText);
-  if (!gap) return { candidates: [], card: 'Plugin discovery skipped: unsafe or empty gap.', outcome: 'invalid-gap' };
-  const aborted = (): PluginDiscoveryResult => ({ candidates: [], card: 'Plugin discovery skipped: time budget exhausted.', outcome: 'create-suggestion' });
-  if (deps.signal?.aborted) return aborted();
+  const discoveryStartedAt = performance.now();
   const log = deps.log ?? ((event: string, data: Record<string, unknown>) => debug.log('research.plugin-discovery', event, data));
+  const observe = (event: string, data: Record<string, unknown>): void => {
+    try { log(event, data); } catch { /* timing must not change discovery behavior */ }
+  };
+  observe('started', {});
+  const finish = (result: PluginDiscoveryResult): PluginDiscoveryResult => {
+    observe('completed', {
+      elapsedMs: Math.round((performance.now() - discoveryStartedAt) * 10) / 10,
+      outcome: result.outcome,
+      candidateCount: result.candidates.length,
+      installed: result.installed !== undefined,
+    });
+    return result;
+  };
+  const gap = safeGap(gapText);
+  if (!gap) return finish({ candidates: [], card: 'Plugin discovery skipped: unsafe or empty gap.', outcome: 'invalid-gap' });
+  const aborted = (): PluginDiscoveryResult => ({ candidates: [], card: 'Plugin discovery skipped: time budget exhausted.', outcome: 'create-suggestion' });
+  if (deps.signal?.aborted) return finish(aborted());
   const threshold = Number.isSafeInteger(deps.githubStarThreshold) && (deps.githubStarThreshold as number) > 0
     ? deps.githubStarThreshold as number : configuredStarThreshold();
   const candidates: PluginDiscoveryCandidate[] = [];
 
+  const marketStartedAt = performance.now();
   try {
     const market = await (deps.market ?? (() => ensureMarketIndex('elanous')))();
     // A signed index is the only built-in source with a verifiable install spec.
@@ -159,15 +174,19 @@ export async function discoverResearchPlugin(gapText: string, deps: PluginDiscov
           installSpec: `${entry.name}@elanous` });
       }
     }
-  } catch { log('market-unavailable', { gap: gap.slice(0, 80) }); }
-  if (deps.signal?.aborted) return aborted();
+  } catch { observe('market-unavailable', { gap: gap.slice(0, 80) }); }
+  finally {
+    observe('stage-complete', { stage: 'signed-market', elapsedMs: Math.round((performance.now() - marketStartedAt) * 10) / 10 });
+  }
+  if (deps.signal?.aborted) return finish(aborted());
 
+  const searchStartedAt = performance.now();
   try {
     const found = await (deps.search ?? ((query: string, signal?: AbortSignal) => discoverCapability(query,
       { layer: 'skill', limit: MAX_CANDIDATES, community: false, signal })))(gap, deps.signal);
-    if (deps.signal?.aborted) return aborted();
+    if (deps.signal?.aborted) return finish(aborted());
     for (const hit of found.slice(0, MAX_CANDIDATES)) {
-      if (deps.signal?.aborted) return aborted();
+      if (deps.signal?.aborted) return finish(aborted());
       let url: URL;
       try { url = new URL(hit.url); } catch { continue; }
       if (url.protocol !== 'https:' || url.username || url.password) continue;
@@ -186,8 +205,11 @@ export async function discoverResearchPlugin(gapText: string, deps: PluginDiscov
           ? { installSpec: `https://github.com/${repo!.owner}/${repo!.repo}.git#${github.sha}` } : {}),
       });
     }
-  } catch { log('search-unavailable', { gap: gap.slice(0, 80) }); }
-  if (deps.signal?.aborted) return aborted();
+  } catch { observe('search-unavailable', { gap: gap.slice(0, 80) }); }
+  finally {
+    observe('stage-complete', { stage: 'capability-search', elapsedMs: Math.round((performance.now() - searchStartedAt) * 10) / 10 });
+  }
+  if (deps.signal?.aborted) return finish(aborted());
 
   const deduped = candidates.filter((item, index) => candidates.findIndex(other => other.url === item.url && other.name === item.name) === index)
     .slice(0, MAX_CANDIDATES);
@@ -197,20 +219,20 @@ export async function discoverResearchPlugin(gapText: string, deps: PluginDiscov
   if (installable.length === 1) {
     const candidate = installable[0]!;
     try {
-      if (deps.signal?.aborted) return aborted();
+      if (deps.signal?.aborted) return finish(aborted());
       const item = await (deps.install ?? defaultInstall)(candidate.installSpec!);
       const undo = `eln plugin remove ${item.name}`;
       installed = { name: item.name, path: item.path,
         notice: `Reason: missing research capability ${gap}; source: ${candidate.source}; permissions: ${candidate.permissions.join(', ') || 'none declared'}.`, undo };
-      log('installed', { name: item.name, source: candidate.source, undo });
+      observe('installed', { name: item.name, source: candidate.source, undo });
     } catch (error) {
-      log('install-refused', { name: candidate.name, reason: error instanceof Error ? error.message.slice(0, 120) : 'unknown' });
+      observe('install-refused', { name: candidate.name, reason: error instanceof Error ? error.message.slice(0, 120) : 'unknown' });
     }
   }
   const outcome: PluginDiscoveryResult['outcome'] = installed ? 'installed' : deduped.length ? 'proposed' : 'create-suggestion';
   const result = { candidates: deduped, installed, card: card(gap, deduped, installed), outcome };
-  log(outcome, { gap: gap.slice(0, 80), count: deduped.length, installed: installed?.name });
-  return result;
+  observe(outcome, { gap: gap.slice(0, 80), count: deduped.length, installed: installed?.name });
+  return finish(result);
 }
 
 /** Re-query through exactly one installed, declared read-only skill with no local-file or shell tools. */

@@ -16,12 +16,14 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { debug } from '../debug/log.js';
+import { incidentLastLines } from './harness-incidents.js';
 import { selfDevRunsDir } from '../self-dev/run-store.js';
 import { launchBindingRunIds, launchRegistryDir, readLaunchBinding } from './launch-registry.js';
 import { loadRunLedger, resolveFederatedRunLedgerDirectories, runLedgerDir } from '../self-implement/run-ledger.js';
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const FULL_RUN_ID = /^run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const STOP_POD_OBSERVATION_BUDGET_MS = 4_000;
 
 export class AmbiguousHarnessStopRunIdError extends Error {
   constructor(given: string, candidates: readonly string[]) {
@@ -151,12 +153,14 @@ export interface HarnessStopDeps {
   kill: (pid: number, signal: NodeJS.Signals) => void;
   sleep: (ms: number) => Promise<void>;
   kubeContexts: () => string[];
-  kubectl: (args: readonly string[]) => { status: number | null; stdout: string; stderr: string };
+  kubectl: (args: readonly string[], timeoutMs?: number) => { status: number | null; stdout: string; stderr: string };
   namespace: string;
   graceMs: number;
+  observePodsBeforeDelete?: (runId: string, context: string, label: HarnessStopJobMatchedBy, budget: HarnessStopObservationBudget) => void;
 }
 
 export type HarnessStopJobMatchedBy = 'elanous.run' | 'elanous.child-run';
+type HarnessStopObservationBudget = { startedAt: number | null; budgetMs: number; observedPods: number };
 
 /**
  * 문맥 하나의 Pod Job 삭제 결과(HARNESS-STOP-POD-LABEL) — «0개 지움» 의 종류를 가른다.
@@ -218,11 +222,129 @@ export function psProcessStartMs(pid: number): number | null {
 
 export function defaultHarnessStopDeps(overrides: Partial<HarnessStopDeps> = {}, opts: { launchRegistryDir?: string } = {}): HarnessStopDeps {
   const registry = opts.launchRegistryDir ?? launchRegistryDir();
+  const namespace = overrides.namespace ?? 'elanous-test';
+  const graceMs = overrides.graceMs ?? 10_000;
   const env = { ...process.env };
   for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[key];
-  const kubectl = (args: readonly string[]) => {
-    const r = spawnSync('kubectl', [...args], { encoding: 'utf8', timeout: 15_000, env, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+  const kubectl = (args: readonly string[], timeoutMs = 15_000) => {
+    const r = spawnSync('kubectl', [...args], { encoding: 'utf8', timeout: timeoutMs, env, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? String(r.error ?? '') };
+  };
+  const runKubectl = overrides.kubectl ?? kubectl;
+  const maxObservedPods = 2;
+  const listTimeoutMs = 1_500;
+  const logTimeoutMs = 750;
+  const observePodsBeforeDelete = (runId: string, context: string, label: HarnessStopJobMatchedBy, budget: HarnessStopObservationBudget): void => {
+    const requestedAt = new Date().toISOString();
+    const reporterSeat = process.env.ELANOUS_HARNESS_SEAT ?? null;
+    budget.startedAt ??= performance.now();
+    const remainingMs = () => Math.max(0, budget.budgetMs - (performance.now() - budget.startedAt!));
+    const emit = (data: Record<string, unknown>) => debug.log('harness.stop', 'job-termination-predelete', {
+      runId, context, matchedBy: label, requestedAt, reporter: 'harness-stop', reporterSeat, reporterCommand: 'harness stop', ...data,
+    });
+    if (remainingMs() <= 0) {
+      emit({ status: 'budget-exhausted', pods: [], omittedPods: null, observationBudgetMs: budget.budgetMs });
+      return;
+    }
+    try {
+      const listed = runKubectl(['--context', context, '-n', namespace, 'get', 'pods', '-l', `${label}=${runId}`, '-o', 'json'], Math.min(listTimeoutMs, remainingMs()));
+      let pods: unknown[] = [];
+      let listStatus: 'observed' | 'unavailable' | 'invalid' = 'observed';
+      if (listed.status !== 0) listStatus = 'unavailable';
+      else {
+        try {
+          const parsed = JSON.parse(listed.stdout) as { items?: unknown };
+          if (!Array.isArray(parsed.items)) listStatus = 'invalid';
+          else pods = parsed.items;
+        } catch { listStatus = 'invalid'; }
+      }
+      const selectedPods = pods.slice(0, Math.max(0, maxObservedPods - budget.observedPods));
+      budget.observedPods += selectedPods.length;
+      const evidence = selectedPods.map((raw) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { status: 'invalid-pod-record' };
+        const pod = raw as {
+          metadata?: { name?: unknown; labels?: unknown; ownerReferences?: unknown };
+          spec?: { nodeName?: unknown; activeDeadlineSeconds?: unknown; containers?: unknown };
+          status?: { phase?: unknown; reason?: unknown; message?: unknown; startTime?: unknown; conditions?: unknown; containerStatuses?: unknown };
+        };
+        const meta = pod.metadata && typeof pod.metadata === 'object' ? pod.metadata : {};
+        const spec = pod.spec && typeof pod.spec === 'object' ? pod.spec : {};
+        const status = pod.status && typeof pod.status === 'object' ? pod.status : {};
+        const arraysValid = (meta.ownerReferences === undefined || Array.isArray(meta.ownerReferences))
+          && (spec.containers === undefined || Array.isArray(spec.containers))
+          && (status.conditions === undefined || Array.isArray(status.conditions))
+          && (status.containerStatuses === undefined || Array.isArray(status.containerStatuses));
+        if (!arraysValid) return { status: 'invalid-pod-record' };
+        const name = typeof meta.name === 'string' ? meta.name : null;
+        const deadlineSeconds = typeof spec.activeDeadlineSeconds === 'number' && Number.isFinite(spec.activeDeadlineSeconds) && spec.activeDeadlineSeconds >= 0 ? spec.activeDeadlineSeconds : null;
+        const startedAt = typeof status.startTime === 'string' ? status.startTime : null;
+        let deadlineAt: string | null = null;
+        if (deadlineSeconds !== null && startedAt) {
+          const startMs = Date.parse(startedAt);
+          const deadlineMs = startMs + deadlineSeconds * 1000;
+          if (Number.isFinite(startMs) && Number.isFinite(deadlineMs)) {
+            try { deadlineAt = new Date(deadlineMs).toISOString(); } catch { deadlineAt = null; }
+          }
+        }
+        let tail: string[] | null = null;
+        let tailStatus: 'observed' | 'unavailable' | 'not-requested' | 'budget-exhausted' = 'not-requested';
+        if (name && remainingMs() > 0) {
+          const logs = runKubectl(['--context', context, '-n', namespace, 'logs', `pod/${name}`, '-c', 'child', '--tail=20'], Math.min(logTimeoutMs, remainingMs()));
+          if (logs.status === 0) { tail = incidentLastLines(logs.stdout); tailStatus = 'observed'; }
+          else { tail = incidentLastLines(logs.stderr); tailStatus = 'unavailable'; }
+        } else if (name) tailStatus = 'budget-exhausted';
+        const owners = Array.isArray(meta.ownerReferences) ? (meta.ownerReferences as Array<{ kind?: unknown; name?: unknown }>).slice(0, 20) : [];
+        const labels = meta.labels && typeof meta.labels === 'object' ? meta.labels as Record<string, unknown> : {};
+        const containers = Array.isArray(spec.containers) ? (spec.containers as Array<{ name?: unknown; image?: unknown; imagePullPolicy?: unknown }>).slice(0, 20) : [];
+        const conditions = Array.isArray(status.conditions) ? (status.conditions as Array<{ type?: unknown; status?: unknown; reason?: unknown; message?: unknown; lastTransitionTime?: unknown }>).slice(0, 20) : [];
+        const containerStatuses = Array.isArray(status.containerStatuses) ? (status.containerStatuses as Array<{ name?: unknown; imageID?: unknown; state?: unknown }>).slice(0, 20) : [];
+        return {
+          pod: name,
+          job: owners.find((owner) => owner?.kind === 'Job' && typeof owner.name === 'string')?.name ?? null,
+          childRunId: typeof labels['elanous.child-run'] === 'string' ? labels['elanous.child-run'] : null,
+          nodeName: typeof spec.nodeName === 'string' ? spec.nodeName : null,
+          images: containers.map((container) => container && typeof container === 'object' ? ({
+            name: typeof container.name === 'string' ? container.name : null,
+            image: typeof container.image === 'string' ? container.image : null,
+            imagePullPolicy: typeof container.imagePullPolicy === 'string' ? container.imagePullPolicy : null,
+          }) : { status: 'invalid-container-record' }),
+          phase: typeof status.phase === 'string' ? status.phase : null,
+          reason: typeof status.reason === 'string' ? status.reason : null,
+          message: typeof status.message === 'string' ? incidentLastLines(status.message).at(-1) ?? null : null,
+          startTime: startedAt, activeDeadlineSeconds: deadlineSeconds, deadlineAt,
+          conditions: conditions.map((condition) => condition && typeof condition === 'object' ? ({
+            type: typeof condition.type === 'string' ? condition.type : null,
+            status: typeof condition.status === 'string' ? condition.status : null,
+            reason: typeof condition.reason === 'string' ? condition.reason : null,
+            message: typeof condition.message === 'string' ? incidentLastLines(condition.message).at(-1) ?? null : null,
+            lastTransitionTime: typeof condition.lastTransitionTime === 'string' ? condition.lastTransitionTime : null,
+          }) : { status: 'invalid-condition-record' }),
+          containers: containerStatuses.map((container) => {
+            if (!container || typeof container !== 'object') return { status: 'invalid-container-status-record' };
+            const state = container.state && typeof container.state === 'object' ? container.state as Record<string, unknown> : {};
+            const waiting = state.waiting && typeof state.waiting === 'object' ? state.waiting as { reason?: unknown; message?: unknown } : null;
+            const terminated = state.terminated && typeof state.terminated === 'object' ? state.terminated as { reason?: unknown; exitCode?: unknown; signal?: unknown; finishedAt?: unknown } : null;
+            return {
+              name: typeof container.name === 'string' ? container.name : null,
+              imageID: typeof container.imageID === 'string' ? container.imageID : null,
+              waiting: waiting ? { reason: typeof waiting.reason === 'string' ? waiting.reason : null, message: typeof waiting.message === 'string' ? incidentLastLines(waiting.message).at(-1) ?? null : null } : null,
+              terminated: terminated ? {
+                reason: typeof terminated.reason === 'string' ? terminated.reason : null,
+                exitCode: typeof terminated.exitCode === 'number' && Number.isFinite(terminated.exitCode) ? terminated.exitCode : null,
+                signal: typeof terminated.signal === 'number' && Number.isFinite(terminated.signal) ? terminated.signal : null,
+                finishedAt: typeof terminated.finishedAt === 'string' ? terminated.finishedAt : null,
+              } : null,
+            };
+          }),
+          tailSource: 'kubectl-logs-merged-streams', tailStatus, tail,
+        };
+      });
+      emit({ status: listStatus, pods: evidence, omittedPods: Math.max(0, pods.length - selectedPods.length), observationBudgetMs: budget.budgetMs,
+        ...(listStatus === 'unavailable' ? { reason: incidentLastLines(listed.stderr).at(-1) ?? 'kubectl failed' } : {}) });
+    } catch (error) {
+      emit({ status: 'invalid', pods: [], omittedPods: null, observationBudgetMs: budget.budgetMs,
+        reason: incidentLastLines(error instanceof Error ? error.message : String(error)).at(-1) ?? 'observation failed' });
+    }
   };
   return {
     // This universe first; then the host-wide launch binding, so a run launched from another worktree is still found.
@@ -243,12 +365,13 @@ export function defaultHarnessStopDeps(overrides: Partial<HarnessStopDeps> = {},
     kill: (pid, signal) => { process.kill(pid, signal); },
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     kubeContexts: () => {
-      const r = kubectl(['config', 'get-contexts', '-o', 'name']);
+      const r = runKubectl(['config', 'get-contexts', '-o', 'name']);
       return r.status === 0 ? r.stdout.split('\n').map((l) => l.trim()).filter(Boolean) : [];
     },
-    kubectl,
-    namespace: 'elanous-test',
-    graceMs: 10_000,
+    kubectl: runKubectl,
+    observePodsBeforeDelete,
+    namespace,
+    graceMs,
     ...overrides,
   };
 }
@@ -271,7 +394,7 @@ function countDeletedJobLines(stdout: string): number {
 }
 
 /** 문맥 하나의 Pod Job 삭제 — 결과를 넷(deleted·none·unreachable·pods-only)으로 가르고 문맥마다 관측 `harness.stop` `job-delete` 를 남긴다. */
-function deleteRunPodJobs(deps: HarnessStopDeps, runId: string, context: string): HarnessStopJobDelete {
+function deleteRunPodJobs(deps: HarnessStopDeps, runId: string, context: string, budget: HarnessStopObservationBudget): HarnessStopJobDelete {
   const unreachable = (stderr: string): HarnessStopJobDelete => {
     const error = stderr.slice(0, 200);
     debug.log('harness.stop', 'job-delete', { runId, context, outcome: 'unreachable', matchedBy: null, error }, { level: 'warn' });
@@ -281,6 +404,14 @@ function deleteRunPodJobs(deps: HarnessStopDeps, runId: string, context: string)
   for (const label of POD_JOB_LABELS) {
     // `-o name` → «job.batch/<name>» 한 줄씩. 맨 출력은 «job.batch "<name>" deleted» 라 «job.batch/» 로만 세면
     //   지워도 늘 0 이었다(10-11 · 여섯 번 «0개 지움» 뒤 Pod Terminating). 두 꼴을 다 센다(#26194).
+    try { deps.observePodsBeforeDelete?.(runId, context, label, budget); }
+    catch (error) {
+      debug.log('harness.stop', 'job-termination-predelete', {
+        runId, context, matchedBy: label, reporter: 'harness-stop', reporterSeat: process.env.ELANOUS_HARNESS_SEAT ?? null,
+        reporterCommand: 'harness stop', status: 'invalid', pods: [], omittedPods: null,
+        reason: incidentLastLines(error instanceof Error ? error.message : String(error)).at(-1) ?? 'observation failed',
+      }, { level: 'warn' });
+    }
     const r = deps.kubectl(['--context', context, '-n', deps.namespace, 'delete', 'job', '-l', `${label}=${runId}`, '--wait=false', '-o', 'name']);
     if (r.status !== 0) return unreachable(r.stderr);
     const deleted = countDeletedJobLines(r.stdout);
@@ -326,6 +457,18 @@ export async function stopHarnessRun(runId: string, deps: HarnessStopDeps, conte
   const add = (candidate: StopProcessCandidate) => {
     if (!seen.has(candidate.pid)) { seen.add(candidate.pid); candidates.push(candidate); }
   };
+  const requestSignal = (candidate: StopProcessCandidate, signal: NodeJS.Signals) => {
+    const requestAt = new Date().toISOString();
+    let delivery: 'accepted' | 'failed' = 'accepted';
+    try { deps.kill(candidate.pid, signal); }
+    catch { delivery = 'failed'; }
+    debug.log('harness.stop', 'process-signal-request', {
+      runId, signal, requestAt, targetPid: candidate.pid, targetStartedAt: new Date(candidate.startedAt).toISOString(),
+      targetDiscovery: candidate.via, delivery, reporter: 'harness-stop',
+      reporterSeat: process.env.ELANOUS_HARNESS_SEAT ?? null, reporterCommand: 'harness stop',
+    });
+    return delivery === 'accepted';
+  };
   let recordMismatch = false;
   if (record) {
     const recordedStart = deps.processStartMs(record.pid);
@@ -350,7 +493,7 @@ export async function stopHarnessRun(runId: string, deps: HarnessStopDeps, conte
       verified.push(candidate);
     }
     for (const candidate of verified) {
-      try { deps.kill(candidate.pid, 'SIGTERM'); } catch { /* 방금 끝났다 */ }
+      requestSignal(candidate, 'SIGTERM');
     }
     for (const candidate of verified) {
       processState = 'stopped';
@@ -362,14 +505,15 @@ export async function stopHarnessRun(runId: string, deps: HarnessStopDeps, conte
       const still = deps.processStartMs(candidate.pid);
       const expectedStart = candidate.via === 'pid.json' ? record!.startedAt : candidate.startedAt;
       if (still !== null && Math.abs(still - expectedStart) <= START_TOLERANCE_MS) {
-        try { deps.kill(candidate.pid, 'SIGKILL'); processState = 'killed'; } catch { /* 끝났다 */ }
+        if (requestSignal(candidate, 'SIGKILL')) processState = 'killed';
       }
     }
     if (processState === 'absent' && (scan.status === 'failed' || candidates.length > 0)) processState = 'unmeasured';
   }
   // ── ⓑ Pod Job (라벨로만) ───────────────────────────────────
   const targets = dryRun ? [] : contexts && contexts.length > 0 ? [...contexts] : deps.kubeContexts();
-  const jobDeletes = targets.map((context) => deleteRunPodJobs(deps, runId, context));
+  const observationBudget: HarnessStopObservationBudget = { startedAt: null, budgetMs: STOP_POD_OBSERVATION_BUDGET_MS, observedPods: 0 };
+  const jobDeletes = targets.map((context) => deleteRunPodJobs(deps, runId, context, observationBudget));
   const jobsDeleted = jobDeletes.reduce((sum, job) => sum + job.deleted, 0);
   const result: HarnessStopResult = { runId, ...(given !== runId ? { givenRunId: given } : {}), process: processState, ...(record ? { pid: record.pid } : {}), candidates, scanned: scan.status === 'ok', pidRecordFound: record !== null, dryRun, jobsDeleted, jobDeletes, contexts: targets };
   debug.log('harness.stop', 'stopped', { runId, process: processState, jobsDeleted, contexts: targets.length });

@@ -5,7 +5,7 @@ import {
   type PromptBankStore,
 } from '../prompt-bank/index.js';
 import {
-  resolveSessionTurnProfile,
+  resolveSessionTurnProfileWithHistory,
   type SessionTurnProfile,
 } from '../session-runtime/index.js';
 import type { InputSourceRef } from '../input/input-source-kind.js';
@@ -39,6 +39,7 @@ export function buildDashboardTurnPromptRuntime(
   turnId: string,
   deps: DashboardTurnPromptRuntimeDeps,
   inputSource?: InputSourceRef | null,
+  priorUserTexts: readonly string[] = [],
 ): DashboardTurnPromptRuntimeResult {
   const turnIntents = ['chat', ...classifyUserIntents(userText)];
   const promptBankInjection = deps.promptBankConfig.enabled && deps.promptBankConfig.dashboardTurns
@@ -62,8 +63,9 @@ export function buildDashboardTurnPromptRuntime(
         slots: ['context', 'tool-hint', 'user-prefix'],
       })
     : '';
-  const turnProfile = resolveSessionTurnProfile({
+  const turnProfile = resolveSessionTurnProfileWithHistory({
     userText,
+    priorUserTexts,
     chatModeState: deps.chatModeState,
     inputSource,
   });

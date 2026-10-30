@@ -38,6 +38,21 @@ export function parseConflictFiles(text: string): string[] {
 
 export type MergeFailureKind = 'base-modified' | 'head-moved' | 'conflict' | 'branch-policy' | 'other';
 
+export const HOST_REGATE_PR_HEAD_FAILURE_CONDITIONS = [
+  'head-unavailable', 'head-mismatch', 'state-unavailable', 'state-not-open',
+  'draft-status-unavailable', 'pr-is-draft', 'base-name-unavailable', 'base-oid-invalid',
+] as const;
+export type HostRegatePrHeadFailureCondition = typeof HOST_REGATE_PR_HEAD_FAILURE_CONDITIONS[number];
+
+export interface HostRegatePrHeadSnapshot {
+  headRefOid: string | null;
+  state: 'OPEN' | 'CLOSED' | 'MERGED' | 'OTHER' | null;
+  isDraft: boolean | null;
+  /** The only raw ref retained is the conventional base; all other non-empty values collapse to `other`. */
+  baseRefName: 'main' | 'other' | null;
+  baseRefOid: string | null;
+}
+
 /** Classify a `gh pr merge` failure so a reader can tell a race from a conflict from a policy block without the raw text. */
 export function classifyMergeFailure(detail: string, expectedHead?: string, actualHead?: string | null): MergeFailureKind {
   if (/base branch was modified/i.test(detail)) return 'base-modified';
@@ -48,12 +63,16 @@ export function classifyMergeFailure(detail: string, expectedHead?: string, actu
   return 'other';
 }
 
-/** One host-regate failure. The optional facts are filled for the pr-head, merge-conflict and merge steps. */
+/** One host-regate failure. The optional facts are filled for PR-head, merge-conflict and merge steps. */
 export interface HostRegateFailure {
   step: string;
   detail: string;
   expectedHead?: string;
   actualHead?: string | null;
+  /** Discrete clauses that failed the initial PR-head readiness check. */
+  failedConditions?: HostRegatePrHeadFailureCondition[];
+  /** Bounded structured facts from the same `gh pr view` used for the check. */
+  prHeadSnapshot?: HostRegatePrHeadSnapshot;
   conflictFiles?: string[];
   /** Number omitted from conflictFiles when the ledger's 200-path bound is reached. */
   conflictFilesOmitted?: number;
@@ -66,12 +85,30 @@ export function regateFailureFacts(failure: unknown): Omit<HostRegateFailure, 's
   const f = failure as Record<string, unknown>;
   const sha = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
   const kinds: readonly MergeFailureKind[] = ['base-modified', 'head-moved', 'conflict', 'branch-policy', 'other'];
+  const headConditions: readonly HostRegatePrHeadFailureCondition[] = HOST_REGATE_PR_HEAD_FAILURE_CONDITIONS;
   const conflictFiles = Array.isArray(f.conflictFiles) ? f.conflictFiles.filter((p): p is string => typeof p === 'string') : undefined;
   const priorOmitted = Number.isSafeInteger(f.conflictFilesOmitted) && (f.conflictFilesOmitted as number) > 0 ? f.conflictFilesOmitted as number : 0;
   const conflictFilesOmitted = Math.max(0, (conflictFiles?.length ?? 0) - 200) + priorOmitted;
+  const failedConditions = Array.isArray(f.failedConditions)
+    ? [...new Set(f.failedConditions.filter((condition): condition is HostRegatePrHeadFailureCondition => typeof condition === 'string' && headConditions.includes(condition as HostRegatePrHeadFailureCondition)))].sort()
+    : undefined;
+  const snapshot = f.prHeadSnapshot && typeof f.prHeadSnapshot === 'object' ? f.prHeadSnapshot as Record<string, unknown> : undefined;
+  const states = ['OPEN', 'CLOSED', 'MERGED', 'OTHER'] as const;
+  const prHeadSnapshot = snapshot
+    && (sha(snapshot.headRefOid) || snapshot.headRefOid === null)
+    && ((typeof snapshot.state === 'string' && states.includes(snapshot.state as typeof states[number])) || snapshot.state === null)
+    && (typeof snapshot.isDraft === 'boolean' || snapshot.isDraft === null)
+    && ((snapshot.baseRefName === 'main' || snapshot.baseRefName === 'other') || snapshot.baseRefName === null)
+    && (sha(snapshot.baseRefOid) || snapshot.baseRefOid === null)
+    ? { headRefOid: snapshot.headRefOid as string | null, state: snapshot.state as HostRegatePrHeadSnapshot['state'],
+      isDraft: snapshot.isDraft as boolean | null, baseRefName: snapshot.baseRefName as HostRegatePrHeadSnapshot['baseRefName'],
+      baseRefOid: snapshot.baseRefOid as string | null }
+    : undefined;
   return {
     ...(sha(f.expectedHead) ? { expectedHead: f.expectedHead } : {}),
     ...(sha(f.actualHead) || f.actualHead === null ? { actualHead: f.actualHead as string | null } : {}),
+    ...(failedConditions?.length ? { failedConditions } : {}),
+    ...(prHeadSnapshot ? { prHeadSnapshot } : {}),
     ...(conflictFiles ? { conflictFiles: conflictFiles.slice(0, 200) } : {}),
     ...(conflictFilesOmitted > 0 ? { conflictFilesOmitted } : {}),
     ...(typeof f.mergeFailureKind === 'string' && kinds.includes(f.mergeFailureKind as MergeFailureKind) ? { mergeFailureKind: f.mergeFailureKind as MergeFailureKind } : {}),

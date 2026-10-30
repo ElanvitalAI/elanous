@@ -41,6 +41,8 @@ import {
   type UserConfig,
 } from '../user-config.js';
 import { setAmbientSessionId, debug } from '../debug/log.js';
+import { buildInstalledSkillCatalogMessage, type InstalledSkillSummary } from '../dashboard/skill-catalog-preamble.js';
+import { resolveModelContextWindow } from '../models/context-window.js';
 import { decideSigintAction } from './sigint.js';
 import { decideSessionStart, observeSessionStart } from '../session/session-start.js';
 import { buildReplayTurnsFromSession } from './replay.js';
@@ -275,13 +277,39 @@ export function buildReplSystemPrompt(ctx: {
   sessionId?: string | undefined;
   /** 시험·임베디드 호출부용 시임 — 기본은 실제 홈·msg 원장·process.env. */
   seatBootDeps?: SeatBootDeps | undefined;
+  /** Installed skill summaries are injectable for deterministic prompt tests. */
+  skillCatalog?: readonly InstalledSkillSummary[] | undefined;
+  skillCatalogContextWindow?: number | null | undefined;
 }): string | undefined {
   const base = ctx.enabledToolNames === undefined
     ? undefined
     : buildAgentSystemPrompt(ctx.cfg, ctx.enabledToolNames);
+  const skillToolsEnabled = ctx.enabledToolNames?.includes('skill_exec') === true
+    && ctx.enabledToolNames.includes('elanous_skills_list');
+  let skillCatalogText = '';
+  if (skillToolsEnabled) {
+    try {
+      const catalog = ctx.skillCatalog ?? (() => {
+        const skills = require('../skills/index.js') as typeof import('../skills/index.js');
+        return skills.applySkillFilter(skills.getSkillIndex(), ctx.cfg.skills)
+          .map(({ name, description }) => ({ name, description }));
+      })();
+      const built = buildInstalledSkillCatalogMessage(
+        catalog,
+        ctx.skillCatalogContextWindow ?? resolveModelContextWindow(ctx.cfg.llm.model),
+      );
+      skillCatalogText = built.message?.content ?? '';
+      debug.log('repl.skill-catalog', 'built', {
+        skillCount: built.skillCount, estimatedTokens: built.estimatedTokens,
+        budgetTokens: built.budgetTokens, mode: built.mode,
+      });
+    } catch (error) {
+      debug.log('repl.skill-catalog', 'failed', { reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+    }
+  }
   const card = buildSeatBootCardText(ctx);
-  if (card.length === 0) return base;
-  return base === undefined || base.length === 0 ? card : `${base}\n\n${card}`;
+  const parts = [skillCatalogText, base ?? '', card].filter(part => part.length > 0);
+  return parts.length > 0 ? parts.join('\n\n') : undefined;
 }
 
 /** 자리 부트 카드 문면(system 메시지 0~1개를 이어 붙인 것). 자리가 아니면 ''. */
@@ -344,6 +372,7 @@ async function runOneTurn(
   nextTuiDelivery?: { pending: PendingTaskNotification[] },
   onJsonDelta?: (delta: string) => void,
   onJsonStatus?: (line: string) => void,
+  onJsonReplace?: (fullText: string) => void,
 ): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null }> {
   const startedAt = Date.now();
   const replyChunks: string[] = [];
@@ -374,6 +403,7 @@ async function runOneTurn(
     userConfig: cfg,
     sessionId,
     userText,
+    utteranceSurface: 'tui',
     systemPrompt,
     userImages: userImages.length > 0 ? userImages : undefined,
     ...(process.env.ELANOUS_TEST_FAKE_LLM === '1' && Number.isFinite(Number(process.env.ELANOUS_TEST_FAKE_LLM_IDLE_TIMEOUT_MS))
@@ -386,6 +416,14 @@ async function runOneTurn(
         onJsonDelta?.(d);
       }
       else process.stdout.write(d);
+    },
+    onReplaceText: (fullText) => {
+      if (jsonOutput) {
+        replyChunks.splice(0, replyChunks.length, fullText);
+        onJsonReplace?.(fullText);
+      } else {
+        process.stdout.write(`\n\n  [근거 반영된 답변]\n  ${fullText}\n`);
+      }
     },
     onStatusLine: (line) => { onJsonStatus?.(line); },
     tools: replToolSpecs,
@@ -794,6 +832,9 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
             : undefined,
           process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
             ? (text) => { process.stdout.write(`${JSON.stringify({ event: 'status', turnId: turn.id, text })}\n`); }
+            : undefined,
+          process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
+            ? (text) => { process.stdout.write(`${JSON.stringify({ event: 'replace', turnId: turn.id, text })}\n`); }
             : undefined,
         );
       } catch (error) {

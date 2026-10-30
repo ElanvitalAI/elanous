@@ -28,6 +28,7 @@ describe('MAT1a CLI root maturity', () => {
   test('registered canonical names have exactly one grade and docs classify the stable set', () => {
     expect(new Set(names).size).toBe(names.length);
     for (const command of commands) expect(cliRootMaturity(command.name())).toBeDefined();
+    expect(cliRootMaturity('mission')).toBe('beta');
     expect(cliRootMaturity('resource')).toBe('beta');
     for (const name of absentPrivateLedger) expect(names).not.toContain(name);
     expect(Object.keys(grades).sort()).toEqual([...names, ...system.filter(name => !names.includes(name)), ...absentPrivateLedger].sort());

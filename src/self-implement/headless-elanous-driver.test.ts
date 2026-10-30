@@ -26,6 +26,7 @@ import {
 } from './headless-elanous-driver.js';
 import { CHILD_LIVENESS_HEARTBEAT_ENV } from '../core-turn/child-liveness-heartbeat.js';
 import { DEFAULT_STEP_TIMEOUTS } from './orchestrator.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerDir } from './run-ledger.js';
 
 const previousStateDir = process.env.ELANOUS_STATE_DIR;
 const previousHarnessSpace = process.env.ELANOUS_HARNESS_SPACE;
@@ -468,6 +469,29 @@ describe('headless supervisor delivery observation', () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  test('three consecutive waits append one run-chart doctor handoff and notify the owning supervisor', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'run-supervisor-doctor-handoff-'));
+    stateDirs.push(stateDir);
+    const runId = 'run-11111111-1111-4111-8111-111111111111';
+    appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId, event: 'start', data: { feature: 'wait handoff fixture' } }, runLedgerDir(stateDir));
+    const notices: string[] = [];
+    await runHeadlessGoalLoopPty({
+      binRoot: '/tmp/repo', cwd: '/tmp/worktree', featurePrompt: 'x', runId, stateDir,
+      maxWaitSec: 12, maxHardWaitSec: 12, pollMs: 1, activityGraceSec: 100,
+      nowMs: (() => { let i = 0; return () => 2_000 + (i++ * 2_000); })(),
+      ptyAvailable: () => true, spawn: alternatingStatePty('supervisor_wait_handoff'),
+      autoAssist: { enabled: true, minRung: 2 }, brain: { decide: () => ({ action: 'wait' }) },
+      onSupervisorInput: (text, updateDelivery) => { notices.push(text); updateDelivery('delivered'); },
+    });
+    const entries = loadRunLedger(runId, runLedgerDir(stateDir)) ?? [];
+    const handoffs = entries.filter((entry) => entry.event === 'run-chart-cell' && entry.data.device === 'run-supervisor' && entry.data.handoff === 'run-doctor');
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0]?.data).toMatchObject({ waitCount: 3, verdict: 'wait', handoff: 'run-doctor', failureClass: 'implement-aborted' });
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('[run-chart handoff=doctor]');
+    expect(notices[0]).toContain(`stopKey=${runId}:wait-streak:1`);
   });
 
   test('continues delivery and surface progress when the delivery verdict log fails', async () => {

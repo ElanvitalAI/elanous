@@ -31,6 +31,8 @@ export interface GraphOverlaySpec {
   /** ⛔ 조건도 «값»이다 — 사람이 판단해 얹는 경로를 두지 않는다. */
   readonly appliesWhen: string;
   readonly patch: readonly OverlayPatchOp[];
+  /** Stop-reason vocabulary lives with heal declarations, not in TypeScript tables. */
+  readonly reasonMap?: Readonly<Record<string, string>>;
 }
 
 export interface OverlayParseResult {
@@ -93,6 +95,10 @@ function overlayFromRaw(raw: unknown, label: string): { overlay?: GraphOverlaySp
   if (!appliesWhen) errors.push({ path: `${label}/applies_when`, message: 'applies_when 이 없거나 문자열이 아니다' });
 
   const patch: OverlayPatchOp[] = [];
+  const reasonMapRaw = doc.reason_map;
+  const reasonMap = reasonMapRaw && typeof reasonMapRaw === 'object' && !Array.isArray(reasonMapRaw)
+    ? Object.fromEntries(Object.entries(reasonMapRaw as Record<string, unknown>).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+    : undefined;
   const rawPatch = Array.isArray(doc.patch) ? doc.patch : [];
   if (rawPatch.length === 0) errors.push({ path: `${label}/patch`, message: 'patch 가 비었다 — 아무것도 안 바꾸는 오버레이다' });
   for (const [index, entry] of rawPatch.entries()) {
@@ -109,6 +115,7 @@ function overlayFromRaw(raw: unknown, label: string): { overlay?: GraphOverlaySp
   return {
     overlay: {
       overlayId: overlayId!, target: target!, stage: stage!, appliesWhen: appliesWhen!, patch,
+      ...(reasonMap && Object.keys(reasonMap).length ? { reasonMap } : {}),
     },
     errors,
   };

@@ -16,20 +16,22 @@ const realStream = llmModule.streamLLMWithTools;
 const ANSWER = '대조 완료 — 남은 조치 0건입니다.';
 const tool: LLMToolSpec = { name: 'RunShell', description: 'run', parameters: { type: 'object', properties: {} } };
 
-function scriptedProvider(turns: LLMStreamEvent[][], name = 'scripted'): { provider: LLMProvider; callsSeen: () => number; toolCounts: number[] } {
+function scriptedProvider(turns: LLMStreamEvent[][], name = 'scripted'): { provider: LLMProvider; callsSeen: () => number; toolCounts: number[]; toolChoices: Array<unknown> } {
   let call = 0;
   const toolCounts: number[] = [];
+  const toolChoices: Array<unknown> = [];
   const p: LLMProvider = {
     name,
     defaultModel: 'd',
     available: () => true,
     async *streamChat(_messages, opts) {
       toolCounts.push(opts?.tools?.length ?? 0);
+      toolChoices.push(opts?.toolChoice ?? null);
       for (const ev of turns[call++] ?? []) yield ev;
     },
     async *chat() {},
   };
-  return { provider: p, callsSeen: () => call, toolCounts };
+  return { provider: p, callsSeen: () => call, toolCounts, toolChoices };
 }
 
 beforeEach(() => {
@@ -57,7 +59,7 @@ const ANSWER_THEN_SIGNAL: LLMStreamEvent[][] = [
 ];
 
 async function drive(dropTerminal: boolean, turns: LLMStreamEvent[][] = ANSWER_THEN_SIGNAL, providerName = 'scripted', maxTurns = 10, userText = '우편 확인하고 대조해') {
-  const { provider, callsSeen, toolCounts } = scriptedProvider(turns, providerName);
+  const { provider, callsSeen, toolCounts, toolChoices } = scriptedProvider(turns, providerName);
   const seenTerminal: Array<readonly string[] | undefined> = [];
   spyOn(llmModule, 'streamLLMWithTools').mockImplementation(async (messages, handlers, opts = {}) => {
     seenTerminal.push(opts.terminalToolNames);
@@ -86,7 +88,7 @@ async function drive(dropTerminal: boolean, turns: LLMStreamEvent[][] = ANSWER_T
     attachLifecycleBridge: () => () => {},
     startLivenessHeartbeat: () => () => {},
   });
-  return { result, calls: callsSeen(), toolCounts, seenTerminal, shown: shown.join('') };
+  return { result, calls: callsSeen(), toolCounts, toolChoices, seenTerminal, shown: shown.join('') };
 }
 
 describe('goal loop terminal signal wiring (TUI-GOAL-LOOP-FRICTION)', () => {
@@ -188,7 +190,10 @@ describe('goal loop terminal signal wiring (TUI-GOAL-LOOP-FRICTION)', () => {
     ];
     const r = await drive(false, turns, 'openai-codex');
     expect(r.calls).toBe(2);
-    expect(r.toolCounts).toEqual([expect.any(Number), 0]);
+    // Codex retains the stable tool prefix for cache reuse, but forbids calls
+    // on the synthesis turn. Other providers keep the legacy empty-tools path.
+    expect(r.toolCounts[1]).toBe(r.toolCounts[0]);
+    expect(r.toolChoices[1]).toBe('none');
     expect(r.result).toMatchObject({ stopReason: 'goal_complete', goalComplete: true, iterations: 1 });
     expect(r.result.finalText).toBe(ANSWER);
   });

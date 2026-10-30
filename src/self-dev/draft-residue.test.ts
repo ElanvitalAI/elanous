@@ -920,9 +920,12 @@ describe('Pod terminal residue', () => {
   test('host-regate failure reason survives classification and the pr-terminal ledger row (AUT-HOST-REGATE-REASON-LOST)', async () => {
     const rawDetail = `error\n  TS2345:   Argument of type 'string' is not assignable to parameter of type 'number'. ${'noise '.repeat(120)}`;
     const folded = rawDetail.split(/\s+/).filter(Boolean).join(' ');
+    const prHeadSnapshot = { headRefOid: 'a'.repeat(40), state: 'OPEN', isDraft: true, baseRefName: 'main', baseRefOid: 'b'.repeat(40) };
     const failed = classifyPodTerminal({ ...input, disposition: { ...input.disposition,
-      hostRegate: { passed: false, failures: [{ step: 'typecheck', detail: rawDetail }], os: 'ubuntu-24.04' } } });
-    expect(failed.hostRegateFailure).toEqual({ step: 'typecheck', detail: folded, os: 'ubuntu-24.04' });
+      hostRegate: { passed: false, failures: [{ step: 'typecheck', detail: rawDetail,
+        failedConditions: ['pr-is-draft'], prHeadSnapshot }], os: 'ubuntu-24.04' } } });
+    expect(failed.hostRegateFailure).toEqual({ step: 'typecheck', detail: folded, failedConditions: ['pr-is-draft'],
+      prHeadSnapshot, os: 'ubuntu-24.04' });
     // HOST-REGATE-REASON-LOST (2nd): the ~800-char detail is no longer cut at 300 — the whole folded text survives.
     expect(failed.hostRegateFailure?.detail.length).toBeGreaterThan(300);
     // A merge failure keeps its tail (the GraphQL reason), the heads and the kind; a long detail stays bounded.
@@ -954,7 +957,27 @@ describe('Pod terminal residue', () => {
       expect(await applyPodTerminal(failed, f.ctx)).toEqual({ status: 'recorded' });
       const terminals = loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal');
       expect(terminals).toEqual([expect.objectContaining({ data: expect.objectContaining({
-        childRunId: runId, hostRegateFailure: { step: 'typecheck', detail: folded, os: 'ubuntu-24.04' } }) })]);
+        childRunId: runId, hostRegateFailure: { step: 'typecheck', detail: folded, failedConditions: ['pr-is-draft'],
+          prHeadSnapshot, os: 'ubuntu-24.04' } }) })]);
+    } finally { f.cleanup(); }
+  });
+
+  test('untrusted PR-head snapshot strings are dropped before the pr-terminal ledger', async () => {
+    const secret = 'ghp-secret-value';
+    const record = classifyPodTerminal({ ...input, disposition: { ...input.disposition, stage: 'host-regate-failed',
+      hostRegate: { passed: false, os: 'ubuntu-24.04', failures: [{ step: 'pr-head',
+        detail: 'PR head preflight failed: state=OTHER · isDraft=null · base=other@unknown',
+        failedConditions: ['head-unavailable'], prHeadSnapshot: { headRefOid: secret, state: secret,
+          isDraft: null, baseRefName: secret, baseRefOid: secret } as never }] } } });
+    expect(JSON.stringify(record)).not.toContain(secret);
+    const f = fixture();
+    try {
+      expect(await applyPodTerminal(record, f.ctx)).toEqual({ status: 'recorded' });
+      const terminals = loadRunLedger(runId, f.dir)?.filter((row) => row.event === 'pr-terminal');
+      expect(JSON.stringify(terminals)).not.toContain(secret);
+      expect(terminals).toEqual([expect.objectContaining({ data: expect.objectContaining({
+        hostRegateFailure: expect.objectContaining({ step: 'pr-head', failedConditions: ['head-unavailable'] }),
+      }) })]);
     } finally { f.cleanup(); }
   });
 

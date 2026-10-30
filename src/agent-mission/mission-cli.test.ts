@@ -22,6 +22,48 @@ function captureRun(result: AgentMissionResult = RESULT): { fn: typeof import('.
 const baseOpts = (over: Partial<MissionCliOpts> = {}): MissionCliOpts => ({ branch: 'wt/a', maxRounds: '16', ...over });
 
 describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => {
+  it('실제 주입 경로는 외부 CLI 설치·로그인 상태를 한 줄로 알리고 pipeline 전 검사한다', async () => {
+    const order: string[] = [];
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts(), {
+      resolveBackend: () => BACKEND,
+      detectAgentCli: (agent) => {
+        order.push(`detect:${agent}`);
+        return { agent, installed: true, executable: 'present', login: 'ready', message: `${agent}: 설치됨 · 로그인 확인됨` };
+      },
+      onStatus: (line) => { order.push(`status:${line}`); },
+      runDevPipeline: async (spec, deps) => {
+        order.push('launch');
+        return cap.fn(spec, deps);
+      },
+    });
+    expect(out.ok).toBe(true);
+    expect(order).toEqual(['detect:codex', 'status:codex: 설치됨 · 로그인 확인됨', 'launch']);
+  });
+
+  it.each([
+    [{ installed: false, executable: 'missing', login: 'unknown', message: 'codex: 설치되지 않음' }, '공식 설치'],
+    [{ installed: null, executable: 'present', login: 'unknown', message: 'codex: 실행 파일 있음, 버전 확인 불가' }, '확인한 뒤'],
+    [{ installed: true, executable: 'present', login: 'needed', message: 'codex: 로그인 필요' }, 'login 후'],
+    [{ installed: true, executable: 'present', login: 'api-key', message: 'codex: API 키 로그인됨 (구독 로그인 아님)' }, '동의 화면이 아직 없어 미션을 시작하지 않습니다'],
+  ] as const)('미설치·불명·로그아웃 상태에서 launch를 막고 상태를 보인다', async (detection, guidance) => {
+    let launched = false;
+    let shownStatus = '';
+    const out = await runAgentMissionCliCommand(['M'], baseOpts(), {
+      resolveBackend: () => BACKEND,
+      detectAgentCli: (agent) => ({ agent, ...detection }),
+      onStatus: (line) => { shownStatus = line; },
+      runDevPipeline: (async () => {
+        launched = true;
+        return { plan: {} as ResolvedDevPlan, kind: 'agent-mission' as const, result: RESULT };
+      }) as typeof import('../self-dev/dev-pipeline.js').runDevPipeline,
+    });
+    expect(out).toMatchObject({ ok: false, exitCode: 1 });
+    expect(shownStatus).toBe(detection.message);
+    if (!out.ok) expect(out.message).toContain(guidance);
+    expect(launched).toBe(false);
+  });
+
   it('SIGINT signal reaches the pipeline and preserves the interrupted exit code', async () => {
     const cap = captureRun({ ...RESULT, ok: false, reason: 'aborted', committed: false, detail: 'aborted' });
     const controller = new AbortController();

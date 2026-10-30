@@ -121,6 +121,7 @@ edges:
       untestable: acknowledge
       child-fixable: rework-note
       goal-wrong: replan
+      reauthor-from-materialized: replan
       environment-claimed: verify-evidence
       needs-deeper-observation: observe-deeper
       needs-grounding: ground-external

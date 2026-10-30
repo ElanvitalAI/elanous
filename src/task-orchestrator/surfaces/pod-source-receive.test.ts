@@ -1,12 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gateChangedFiles } from '../../self-implement/seams.js';
 import { packSourceBundle } from './pod-source-bundle.js';
-import { podSourceScript, type PodSource } from './pod-source-receive.js';
+import { podSourceScript, PodSourceShaFormatError, type PodSource } from './pod-source-receive.js';
 
 describe('podSourceScript', () => {
   test('default source uses the parent-resolved base SHA from the host mirror without Pod origin calls', () => {
@@ -25,7 +25,9 @@ describe('podSourceScript', () => {
       const baseSha = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       execFileSync('git', ['clone', '-q', '--bare', work, mirror]);
 
-      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/unused/repo', mirror);
+      // 부재 commit 파일로 image 라우트를 끈다. 실제 Pod 이미지의 /opt/elanous-source 는 존재할 수 있고,
+      // image 라우트를 켜 두면 테스트 repo 를 가로채 공용 object store alternates 를 오염시킬 수 있다.
+      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/unused/repo', mirror, { imageCommitFile: join(root, 'absent-image-commit') });
       const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
       expect(result.exitCode, result.stderr.toString()).toBe(0);
       expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror');
@@ -34,6 +36,9 @@ describe('podSourceScript', () => {
       const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
       expect(io).toBeTruthy();
       expect(JSON.parse(io!)).toMatchObject({ originCalls: 0, sourceVia: 'mirror', sourceStatus: 'complete' });
+      const outcome = /^ELANOUS_POD_SOURCE_RESULT (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+      expect(outcome).toBeTruthy();
+      expect(JSON.parse(outcome!)).toMatchObject({ sourceStage: 'source-complete', sourceKind: 'default', sourceVia: 'mirror', sourceStatus: 'complete', baseSha, exitCode: 0, failureCode: null });
       expect(script).not.toContain('git ls-remote');
       expect(script).not.toContain('git clone -q --depth 50');
       expect(script).not.toContain('git fetch --depth 50 origin');
@@ -42,16 +47,29 @@ describe('podSourceScript', () => {
     }
   }, 30_000);
 
+  test('rejects an invalid resolved default base SHA before any source-receive script is constructed', () => {
+    const metachar = `$(touch ${'pwned'})`;
+    expect(() => podSourceScript({ kind: 'default', baseSha: metachar }, 'https://github.com/unused/repo', '/host-mirror')).toThrow(PodSourceShaFormatError);
+    expect(() => podSourceScript({ kind: 'default', baseSha: metachar }, 'https://github.com/unused/repo', '/host-mirror')).toThrow(/base sha must be 40 hex characters/);
+    expect(() => podSourceScript({ kind: 'default', baseSha: 'ABCDEF0123456789abcdef0123456789abcdef01' }, 'https://github.com/unused/repo')).toThrow(PodSourceShaFormatError);
+    expect(() => podSourceScript({ kind: 'default', baseSha: `${'a'.repeat(39)}G` }, 'https://github.com/unused/repo')).toThrow(PodSourceShaFormatError);
+    // 형식이 틀린 값이 어떤 git 명령 줄에도 삽입되지 않는다 — 거부는 검증 단계에서 끝난다.
+    expect(() => podSourceScript({ kind: 'default', baseSha: `${metachar}\\n` }, 'https://github.com/unused/repo')).toThrow(PodSourceShaFormatError);
+  });
+
   test('parent-resolved default SHA fails closed when neither image nor host mirror has a checkout', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-parent-base-missing-'));
     try {
       const cwd = join(root, 'job');
       mkdirSync(cwd);
       const baseSha = '1'.repeat(40);
-      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/unused/repo', join(root, 'missing-mirror'));
+      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/unused/repo', join(root, 'missing-mirror'), { imageCommitFile: join(root, 'absent-image-commit') });
       const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
       expect(result.exitCode).toBe(5);
       expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE ${baseSha}`);
+      const outcome = /^ELANOUS_POD_SOURCE_RESULT (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+      expect(outcome).toBeTruthy();
+      expect(JSON.parse(outcome!)).toMatchObject({ sourceStage: 'base-sha', sourceKind: 'default', sourceStatus: 'failed', baseSha, exitCode: 5, failureCode: 'base-sha-unavailable' });
       const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
       expect(io).toBeTruthy();
       expect(JSON.parse(io!)).toMatchObject({ originCalls: 0, sourceStatus: 'incomplete' });
@@ -145,7 +163,7 @@ describe('podSourceScript', () => {
       execFileSync('git', ['clone', '-q', '--bare', origin, remote]);
       execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/7/head', pr]);
       execFileSync('git', ['-C', remote, 'symbolic-ref', 'HEAD', 'refs/heads/absent']);
-      const script = podSourceScript({ kind: 'pr', number: 7 }, `file://${remote}`, join(root, 'no-mirror'));
+      const script = podSourceScript({ kind: 'pr', number: 7 }, `file://${remote}`, join(root, 'no-mirror'), { imageCommitFile: join(root, 'absent-image-commit') });
       const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
       expect(result.exitCode).toBe(5);
       expect(result.stdout.toString()).toContain('ELANOUS_POD_COMPARISON_BASE unavailable');
@@ -176,7 +194,7 @@ describe('podSourceScript', () => {
       execFileSync('git', ['-C', origin, 'checkout', '-q', 'main']);
       execFileSync('git', ['clone', '-q', '--bare', origin, remote]);
       execFileSync('git', ['-C', remote, 'update-ref', 'refs/pull/7/head', pr]);
-      const script = podSourceScript({ kind: 'pr', number: 7 }, `file://${remote}`, join(root, 'no-mirror'));
+      const script = podSourceScript({ kind: 'pr', number: 7 }, `file://${remote}`, join(root, 'no-mirror'), { imageCommitFile: join(root, 'absent-image-commit') });
       const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
       expect(result.exitCode, result.stderr.toString()).toBe(0);
       expect(result.stdout.toString()).toContain('ELANOUS_POD_COMPARISON_BASE unavailable');
@@ -253,13 +271,17 @@ describe('podSourceScript', () => {
       const pushOrigin = join(root, 'push.git');
       execFileSync('git', ['clone', '-q', '--bare', origin, pushOrigin]);
       execFileSync('git', ['-C', join(cwd, 'repo'), 'remote', 'set-url', '--push', 'origin', pushOrigin]);
+      // 호스트가 전역 pre-push guard([pod] git-guard — core.hooksPath)를 깔아 둔 환경에서도
+      // fixture push 가 그 guard 에 걸리지 않게 이 repo 의 hook 을 끈다(pod-source-bundle.test.ts 관례).
+      execFileSync('git', ['-C', join(cwd, 'repo'), 'config', 'core.hooksPath', '/dev/null']);
       execFileSync('git', ['-C', join(cwd, 'repo'), 'config', 'push.default', 'simple']);
       execFileSync('git', ['-C', join(cwd, 'repo'), 'config', 'user.email', 'pod@example.com']);
       execFileSync('git', ['-C', join(cwd, 'repo'), 'config', 'user.name', 'pod']);
       writeFileSync(join(cwd, 'repo', 'push-proof.txt'), 'default push follows trunk\n');
       execFileSync('git', ['-C', join(cwd, 'repo'), 'add', 'push-proof.txt']);
       execFileSync('git', ['-C', join(cwd, 'repo'), 'commit', '-qm', 'push proof']);
-      execFileSync('git', ['-C', join(cwd, 'repo'), 'push'], { stdio: 'pipe' });
+      // 호스트 pre-push git-guard 훅(K-TC-24)은 임시 픽스처 refs/heads/trunk push 를 거부한다 — 증명 대상은 브랜치 배선이지 훅이 아니므로 core.hooksPath= 로 끈다.
+      execFileSync('git', ['-c', 'core.hooksPath=', '-C', join(cwd, 'repo'), 'push'], { stdio: 'pipe' });
       expect(execFileSync('git', ['-C', pushOrigin, 'rev-parse', 'refs/heads/trunk'], { encoding: 'utf8' }).trim())
         .toBe(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
       execFileSync('git', ['-C', join(cwd, 'repo'), 'fetch', '--unshallow', 'origin'], { stdio: 'pipe' });
@@ -539,17 +561,21 @@ describe('podSourceScript', () => {
       execFileSync('git', ['init', '-q', '-b', 'main', origin]);
       execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
       execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      // 호스트가 전역 pre-push guard([pod] git-guard — core.hooksPath)를 깔아 둔 환경에서도
+      // fixture push 가 그 guard 에 걸리지 않게 이 repo 의 hook 을 끈다(pod-source-bundle.test.ts 관례).
+      execFileSync('git', ['-C', origin, 'config', 'core.hooksPath', '/dev/null']);
       writeFileSync(join(origin, 'README'), 'mirror base\n');
       execFileSync('git', ['-C', origin, 'add', 'README']);
       execFileSync('git', ['-C', origin, 'commit', '-qm', 'base']);
       execFileSync('git', ['-C', origin, 'remote', 'add', 'origin', remote]);
-      execFileSync('git', ['-C', origin, 'push', '-q', 'origin', 'main']);
+      // 픽스처 setup push 도 같은 이유로 호스트 git-guard 훅을 끈다(K-TC-24).
+      execFileSync('git', ['-c', 'core.hooksPath=', '-C', origin, 'push', '-q', 'origin', 'main']);
       execFileSync('git', ['-C', remote, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
       const mirrorHead = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       execFileSync('git', ['clone', '-q', '--bare', remote, mirror]);
       writeFileSync(join(origin, 'README'), 'new base\n');
       execFileSync('git', ['-C', origin, 'commit', '-qam', 'advance']);
-      execFileSync('git', ['-C', origin, 'push', '-q', 'origin', 'main']);
+      execFileSync('git', ['-c', 'core.hooksPath=', '-C', origin, 'push', '-q', 'origin', 'main']);
       const base = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       writeFileSync(join(origin, 'README'), 'local contents\n');
       const packed = packSourceBundle({ repoDir: origin, kind: 'worktree', base, mirrorHead, outDir: join(root, 'out') });
@@ -651,4 +677,331 @@ describe('podSourceScript', () => {
       rmSync(work, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test('POD-REUSE-MIN-SYNC: 같은 웜 Pod 재사용 — 둘째 요청 GitHub 호출 0 · 바뀐 파일 수 = 두 base diff 수 · 소요 ≤ 새 Pod의 1/3', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-min-sync-'));
+    try {
+      // 무대: 격리 임시 git ⊕ fake clock·fake bun(fake-bin) — 같은 웜 Pod 요청 2회 사건 주입 시뮬.
+      const fakeBin = join(root, 'fake-bin');
+      const clockState = join(root, 'clock');
+      const bunCalls = join(root, 'bun-calls');
+      mkdirSync(fakeBin); mkdirSync(clockState);
+      writeFileSync(join(clockState, 'base'), '1000\n');
+      const setClock = (step: number) => {
+        writeFileSync(join(clockState, 'step'), `${step}\n`);
+        writeFileSync(join(clockState, 'n'), '0\n');
+      };
+      writeFileSync(join(fakeBin, 'date'), [
+        '#!/bin/sh',
+        `n=$(cat '${clockState}/n' 2>/dev/null || echo 0)`,
+        `base=$(cat '${clockState}/base' 2>/dev/null || echo 1000)`,
+        `step=$(cat '${clockState}/step' 2>/dev/null || echo 0)`,
+        'echo $((base + n * step))',
+        `echo $((n + 1)) > '${clockState}/n'`,
+        '',
+      ].join('\n'));
+      writeFileSync(join(fakeBin, 'bun'), `#!/bin/sh\necho called >> '${bunCalls}'\nexit 0\n`);
+      chmodSync(join(fakeBin, 'date'), 0o755);
+      chmodSync(join(fakeBin, 'bun'), 0o755);
+      const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}` };
+
+      const origin = join(root, 'origin');
+      const mirror = join(root, 'mirror.git');
+      const warm = join(root, 'warm');
+      mkdirSync(origin); mkdirSync(join(origin, 'src')); mkdirSync(join(origin, 'docs')); mkdirSync(warm);
+      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
+      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      const commitAll = (message: string) => {
+        execFileSync('git', ['-C', origin, 'add', '-A']);
+        execFileSync('git', ['-C', origin, 'commit', '-qm', message]);
+      };
+      writeFileSync(join(origin, 'README'), 'base-one\n');
+      writeFileSync(join(origin, 'src/keep.ts'), 'keep-one\n');
+      writeFileSync(join(origin, 'docs/guide.md'), 'unchanged\n');
+      writeFileSync(join(origin, 'old.txt'), 'gone-soon\n');
+      writeFileSync(join(origin, 'bun.lock'), 'pinned-lock-1\n');
+      writeFileSync(join(origin, '.gitignore'), 'node_modules/\n');
+      execFileSync('git', ['-C', origin, 'add', '-A']);
+      commitAll('base one');
+      const base1 = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', origin, mirror]);
+      const lockHash = createHash('sha256').update('pinned-lock-1\n').digest('hex');
+
+      // 요청 1 — 새 Pod 첫 수신(호스트 미러 복제 · GitHub 호출 0). fake clock 한 걸음 9초 → 소요 9초.
+      // imageCommitFile 을 없는 경로로: 이 무대가 Pod 안에서 돌 때 /opt/elanous-source(이미지 고정 트리)
+      // 로 우연히 image 갈래가 켜지지 않게 — 기존 시험들의 같은 관례.
+      setClock(9);
+      const first = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'default', baseSha: base1 }, 'https://github.com/unused/repo', mirror, { imageCommitFile: join(root, 'absent-image-commit') })}`], { cwd: warm, env });
+      expect(first.exitCode, first.stderr.toString()).toBe(0);
+      const firstIo = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(first.stdout.toString())?.[1];
+      expect(JSON.parse(firstIo!)).toMatchObject({ originCalls: 0, sourceVia: 'mirror', sourceStatus: 'complete' });
+      const newPodSeconds = (JSON.parse(firstIo!) as { sourceSeconds: number }).sourceSeconds;
+      expect(newPodSeconds).toBe(9);
+
+      // 같은 웜 Pod 의 상주 상태: 첫 수신 때 깔린 node_modules · 요청 사이 빌드 찌꺼기
+      const repo = join(warm, 'repo');
+      mkdirSync(join(repo, 'node_modules', 'dep'), { recursive: true });
+      writeFileSync(join(repo, 'node_modules', 'dep', 'keep.txt'), 'installed at first receive');
+      writeFileSync(join(repo, 'node_modules', '.elanous-installed-lock-hash'), `${lockHash}\n`);
+      writeFileSync(join(repo, 'build-artifact.tmp'), 'build residue');
+      const unchanged = join(repo, 'docs', 'guide.md');
+      const oldTime = new Date('2020-01-01T00:00:00.000Z');
+      utimesSync(unchanged, oldTime, oldTime);
+
+      // 미러를 새 base 로 진전(호스트 시드) — 이 시뮬 안에서 GitHub 원격 호출은 0이어야 한다.
+      writeFileSync(join(origin, 'README'), 'base-two\n');
+      writeFileSync(join(origin, 'src/keep.ts'), 'keep-two\n');
+      rmSync(join(origin, 'old.txt'));
+      writeFileSync(join(origin, 'src/new.ts'), 'new-file\n');
+      commitAll('base two');
+      const base2 = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['-C', mirror, 'fetch', '-q', origin, '+refs/heads/main:refs/heads/main']);
+      const diffFiles = execFileSync('git', ['-C', origin, 'diff', '--name-only', base1, base2], { encoding: 'utf8' }).trim().split('\n').filter(Boolean);
+      expect(diffFiles.length).toBe(4);
+
+      // 요청 2 — 같은 웜 Pod 재사용 min-sync. fake clock 한 걸음 1초 → 새 Pod 9초의 1/3 이하.
+      setClock(1);
+      const script = podSourceScript({ kind: 'min-sync', baseSha: base2, previousHead: base1, lockHash }, 'https://github.com/unused/repo', mirror);
+      expect(script).not.toContain('ls-remote');
+      expect(script).not.toContain('git fetch --depth');
+      const second = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd: warm, env });
+      expect(second.exitCode, second.stderr.toString()).toBe(0);
+      const out = second.stdout.toString();
+      const stage = /^ELANOUS_POD_STAGE min-sync (\d+) (\d+) (\d+)$/m.exec(out);
+      expect(stage).toBeTruthy();
+      expect(Number(stage![1])).toBe(0);                                    // 둘째 요청 GitHub 호출 0
+      expect(Number(stage![2])).toBe(diffFiles.length);                     // 바뀐 파일 수 = 두 base diff 수
+      expect(Number(stage![3]) * 3).toBeLessThanOrEqual(newPodSeconds);     // 소요 ≤ 새 Pod 의 1/3
+      expect(out).toContain(`ELANOUS_POD_SOURCE min-sync ${base2}`);
+      const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(out)?.[1];
+      expect(JSON.parse(io!)).toMatchObject({
+        originCalls: 0, checkoutFiles: diffFiles.length, sourceVia: 'min-sync',
+        sourceStatus: 'complete', installRan: false, installSeconds: null,
+      });
+      expect(execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(base2);
+      expect(execFileSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' }).trim()).toBe('');
+      expect(readFileSync(join(repo, 'README'), 'utf8')).toBe('base-two\n');
+      expect(readFileSync(join(repo, 'src', 'keep.ts'), 'utf8')).toBe('keep-two\n');
+      expect(readFileSync(join(repo, 'src', 'new.ts'), 'utf8')).toBe('new-file\n');
+      expect(existsSync(join(repo, 'old.txt'))).toBe(false);
+      expect(existsSync(join(repo, 'build-artifact.tmp'))).toBe(false);     // 남은 untracked·빌드 산출만 clean
+      expect(readFileSync(join(repo, 'node_modules', 'dep', 'keep.txt'), 'utf8')).toBe('installed at first receive');
+      expect(statSync(unchanged).mtimeMs).toBe(oldTime.getTime());          // 기존 작업 트리를 지우지 않는다
+      expect(existsSync(bunCalls)).toBe(false);                             // lockfile 해시가 같으면 설치를 건너뛴다
+
+      // 요청 3 — lockfile 해시가 다른 새 base → 재설치한다(installRan) · node_modules 는 clean 보존 목록에 든다.
+      writeFileSync(join(origin, 'bun.lock'), 'pinned-lock-2\n');
+      commitAll('base three');
+      const base3 = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const lockHash2 = createHash('sha256').update('pinned-lock-2\n').digest('hex');
+      execFileSync('git', ['-C', mirror, 'fetch', '-q', origin, '+refs/heads/main:refs/heads/main']);
+      setClock(1);
+      const third = Bun.spawnSync(['bash', '-c', `set -e\n${podSourceScript({ kind: 'min-sync', baseSha: base3, previousHead: base2, lockHash: lockHash2 }, 'https://github.com/unused/repo', mirror)}`], { cwd: warm, env });
+      expect(third.exitCode, third.stderr.toString()).toBe(0);
+      expect(existsSync(bunCalls)).toBe(true);
+      expect(readFileSync(join(repo, 'node_modules', '.elanous-installed-lock-hash'), 'utf8').trim()).toBe(lockHash2);
+      const thirdIo = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(third.stdout.toString())?.[1];
+      expect(JSON.parse(thirdIo!)).toMatchObject({ originCalls: 0, checkoutFiles: 1, installRan: true });
+      expect(readFileSync(join(repo, 'node_modules', 'dep', 'keep.txt'), 'utf8')).toBe('installed at first receive');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('POD-REUSE-MIN-SYNC: 미러·bundle 어디에도 base 가 없으면 GitHub 폴백 없이 fail-closed 된다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-min-sync-absent-'));
+    try {
+      const origin = join(root, 'origin');
+      const warm = join(root, 'warm');
+      mkdirSync(origin); mkdirSync(warm);
+      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
+      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      writeFileSync(join(origin, 'README'), 'base\n');
+      execFileSync('git', ['-C', origin, 'add', 'README']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'base']);
+      const base1 = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', origin, join(warm, 'repo')]);
+      const missing = 'e'.repeat(40);
+      const script = podSourceScript({ kind: 'min-sync', baseSha: missing, previousHead: base1 }, 'https://github.com/unused/repo', join(root, 'absent'));
+      expect(script).not.toContain('ls-remote');
+      expect(script).not.toContain('git fetch --depth');
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd: warm });
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE ${missing}`);
+      const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
+      expect(JSON.parse(io!)).toMatchObject({ originCalls: 0, sourceStatus: 'incomplete', sourceVia: 'min-sync' });
+      expect(execFileSync('git', ['-C', join(warm, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(base1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+/** 저장소의 upload-pack 설정 재정 목록. 프로덕션 기본값(재정 없음)이면 빈 문자열이다. */
+function uploadPackOverrides(repo: string): string {
+  try {
+    return execFileSync('git', ['-C', repo, 'config', '--get-regexp', '^uploadpack\\.'], { encoding: 'utf8' }).trim();
+  } catch {
+    return '';
+  }
+}
+
+type PodGithubObservation = {
+  /** Pod 프로세스에 넘길 환경 — PATH 와 GIT_EXEC_PATH 가 관측 심으로 향한다. */
+  env: Record<string, string | undefined>;
+  /** 차단기에 잡힌 원격 전송 호출 = Pod 의 GitHub 접촉. 배열 하나 = 호출 하나. */
+  githubCalls(): string[][];
+  /** 래퍼에 잡힌 git 호출 전부 — 로컬 라우트가 실제로 흘렀는지 대조한다. */
+  gitCalls(): string[][];
+};
+
+/** Pod GitHub 접촉의 외부 관측자. 스크립트 마커가 아니라 프로세스 «밖»에서 실제 전송 시도를 본다.
+ *  PATH·GIT_EXEC_PATH 에 git 래퍼(호출 기록)와 git-remote-https·git-remote-http 차단기를 심는다 —
+ *  로컬 전송(경로 미러·file://)은 실제 git 으로 통과시키고 원격 전송만 기록 후 실패시킨다. */
+function observePodGithubTraffic(dir: string): PodGithubObservation {
+  const bin = join(dir, 'observer-bin');
+  mkdirSync(bin);
+  const realGit = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+  const execPath = execFileSync(realGit, ['--exec-path'], { encoding: 'utf8' }).trim();
+  const gitTrace = join(dir, 'git-calls.log');
+  const githubTrace = join(dir, 'github-calls.log');
+  const record = (traceVar: string) => `printf "%s\\n" "$@" >> "$${traceVar}"\nprintf "\\036\\n" >> "$${traceVar}"`;
+  for (const name of readdirSync(execPath)) {
+    if (name === 'git' || name === 'git-remote-http' || name === 'git-remote-https') continue;
+    symlinkSync(join(execPath, name), join(bin, name));
+  }
+  writeFileSync(join(bin, 'git'), `#!/bin/sh\n${record('ELANOUS_POD_OBSERVER_GIT_TRACE')}\nexec "${realGit}" "$@"\n`);
+  const blocked = `#!/bin/sh\n${record('ELANOUS_POD_OBSERVER_GITHUB_TRACE')}\necho "fatal: external observer blocked a Pod GitHub call" >&2\nexit 128\n`;
+  writeFileSync(join(bin, 'git-remote-https'), blocked);
+  writeFileSync(join(bin, 'git-remote-http'), blocked);
+  chmodSync(join(bin, 'git'), 0o755);
+  chmodSync(join(bin, 'git-remote-https'), 0o755);
+  chmodSync(join(bin, 'git-remote-http'), 0o755);
+  const read = (path: string): string[][] => existsSync(path)
+    ? readFileSync(path, 'utf8').split('\u001e').map((entry) => entry.split('\n').filter((arg) => arg !== '')).filter((argv) => argv.length > 0)
+    : [];
+  return {
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ''}`,
+      GIT_EXEC_PATH: bin,
+      GIT_TERMINAL_PROMPT: '0',
+      ELANOUS_POD_OBSERVER_GIT_TRACE: gitTrace,
+      ELANOUS_POD_OBSERVER_GITHUB_TRACE: githubTrace,
+    },
+    githubCalls: () => read(githubTrace),
+    gitCalls: () => read(gitTrace),
+  };
+}
+
+describe('podSourceScript under an external GitHub traffic observer', () => {
+  test('a parent-resolved SHA reaches the checkout through the host mirror with zero Pod GitHub calls observed outside the Pod', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-external-obs-'));
+    try {
+      const observation = observePodGithubTraffic(root);
+      const work = join(root, 'work');
+      const mirror = join(root, 'host-mirror.git');
+      const cwd = join(root, 'job');
+      mkdirSync(work); mkdirSync(cwd);
+      execFileSync('git', ['init', '-q', '-b', 'main', work]);
+      execFileSync('git', ['-C', work, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', work, 'config', 'user.name', 'pod']);
+      writeFileSync(join(work, 'README'), 'base\n');
+      execFileSync('git', ['-C', work, 'add', 'README']);
+      execFileSync('git', ['-C', work, 'commit', '-qm', 'base']);
+      const baseSha = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', work, mirror]);
+      expect(uploadPackOverrides(mirror)).toBe('');
+
+      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/elanous/elanous.git', mirror, { imageCommitFile: join(root, 'absent-image-commit') });
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd, env: observation.env });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA mirror');
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_BASE_SHA_FROM mirror');
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE default ${baseSha}`);
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(baseSha);
+      const summary = JSON.parse(/^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1] ?? 'null') as { originCalls: number; sourceVia: string; sourceStatus: string };
+      expect(summary).toMatchObject({ originCalls: 0, sourceVia: 'mirror', sourceStatus: 'complete' });
+      // 외부 관측과 io-summary 정합: 밖에서 본 GitHub 전송 호출 수 == Pod 가 보고한 origin 호출 수 == 0.
+      expect(observation.githubCalls()).toEqual([]);
+      expect(observation.githubCalls().length).toBe(summary.originCalls);
+      // 관측기가 git 자체를 막은 게 아니다 — 로컬 미러 라우트는 실제로 흘렀다.
+      expect(observation.gitCalls().some((argv) => argv.includes('--no-write-fetch-head') && argv.includes(baseSha))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('a resolved SHA already inside the pinned image object store checks out with zero Pod GitHub calls observed outside the Pod', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-external-obs-image-'));
+    try {
+      const observation = observePodGithubTraffic(root);
+      const origin = join(root, 'origin');
+      const mirror = join(root, 'host-mirror.git');
+      const image = join(root, 'image');
+      const imageGit = join(root, 'pin.git');
+      const marker = join(root, 'image-commit');
+      const cwd = join(root, 'job');
+      for (const path of [origin, image, cwd]) execFileSync('mkdir', ['-p', path]);
+      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
+      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
+      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
+      writeFileSync(join(origin, 'README'), 'pinned image contents\n');
+      execFileSync('git', ['-C', origin, 'add', 'README']);
+      execFileSync('git', ['-C', origin, 'commit', '-qm', 'pin']);
+      const baseSha = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      execFileSync('git', ['clone', '-q', '--bare', origin, mirror]);
+      execFileSync('git', ['clone', '-q', '--bare', '--depth', '1', `file://${origin}`, imageGit]);
+      expect(readFileSync(join(imageGit, 'shallow'), 'utf8').trim()).toBe(baseSha);
+      copyFileSync(join(origin, 'README'), join(image, 'README'));
+      writeFileSync(marker, `${baseSha}\n`);
+      expect(uploadPackOverrides(mirror)).toBe('');
+
+      const script = podSourceScript({ kind: 'default', baseSha }, 'https://github.com/elanous/elanous.git', mirror, { imageSourceDir: image, imageCommitFile: marker, imageGitDir: imageGit });
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd, env: observation.env });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_VIA image\n');
+      // «실제 객체 출처» 마커 — 해결된 SHA 는 image 핀 객체에서 왔고 미러 clone 은 일어나지 않았다.
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_BASE_SHA_FROM image\n');
+      expect(result.stdout.toString()).toContain(`ELANOUS_POD_SOURCE default ${baseSha}`);
+      expect(readFileSync(join(cwd, 'repo', 'README'), 'utf8')).toBe('pinned image contents\n');
+      expect(execFileSync('git', ['-C', join(cwd, 'repo'), 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(baseSha);
+      const summary = JSON.parse(/^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1] ?? 'null') as { originCalls: number; sourceVia: string; sourceStatus: string };
+      expect(summary).toMatchObject({ originCalls: 0, sourceVia: 'image', sourceStatus: 'complete' });
+      expect(observation.githubCalls()).toEqual([]);
+      expect(observation.githubCalls().length).toBe(summary.originCalls);
+      expect(observation.gitCalls().some((argv) => argv.includes('--shared'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('without a resolved SHA the legacy origin clone still runs and the same observer sees the Pod GitHub call it counts', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-external-obs-legacy-'));
+    try {
+      const observation = observePodGithubTraffic(root);
+      const cwd = join(root, 'job');
+      mkdirSync(cwd);
+      const repoUrl = 'https://github.com/elanous/elanous.git';
+      // 미러 부재 + image 핀 부재 + 해결된 SHA 없음 = 문서화된 legacy 분기(origin clone)만 남는다.
+      const script = podSourceScript({ kind: 'default' }, repoUrl, join(root, 'absent-mirror'), { imageCommitFile: join(root, 'absent-image-commit') });
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd, env: observation.env });
+      // 관측기가 전송을 끊었으니 clone 이 실패한다 — legacy 경로가 실제로 origin 을 불렀다는 증거.
+      expect(result.exitCode).toBe(5);
+      expect(`${result.stdout.toString()}${result.stderr.toString()}`).toContain('external observer blocked a Pod GitHub call');
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_MIRROR_SKIP no-mount');
+      const summary = JSON.parse(/^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1] ?? 'null') as { originCalls: number; sourceVia: string; sourceStatus: string };
+      expect(summary).toMatchObject({ originCalls: 1, sourceStatus: 'incomplete' });
+      // clone 이 라우트를 확정하기 전에 끝났으므로 sourceVia 는 미확정으로 남는다.
+      expect(summary.sourceVia).toBe('unknown');
+      const githubCalls = observation.githubCalls();
+      expect(githubCalls.length).toBe(1);
+      expect(githubCalls[0]!).toContain(repoUrl);
+      expect(githubCalls.length).toBe(summary.originCalls);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

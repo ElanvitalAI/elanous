@@ -22,14 +22,24 @@ const config: DecomposeAbConfig = {
   treatment: { anchor: 'Fewer is better', replacement: 'Always split into independent pieces' },
 };
 
+const subtask = (id: string, feature: string, dependsOn: string[] = []) => ({
+  id,
+  feature,
+  completionBoundary: `${feature} is independently complete`,
+  mockScenario: { id: 'MS-01', injection: `Run ${id}`, observation: `Observe ${id}` },
+  futureAssumptions: [],
+  dependsOn,
+  goalType: 'implement',
+});
+
 const outputs = new Map<string, string>([
-  ['split this request', JSON.stringify({ subtasks: [{ id: 'a', feature: 'A' }, { id: 'b', feature: 'B', dependsOn: ['a'] }, { id: 'c', feature: 'C' }, { id: 'd', feature: 'D' }, { id: 'e', feature: 'E' }] })],
+  ['split this request', JSON.stringify({ subtasks: [subtask('a', 'A'), subtask('b', 'B', ['a']), subtask('c', 'C'), subtask('d', 'D'), subtask('e', 'E')] })],
   ['atomic request', JSON.stringify({ subtasks: [] })],
 ]);
 
 const fakeLlm = async (prompt: string): Promise<string> => {
   if (prompt.includes('Always split')) return prompt.includes('atomic request')
-    ? JSON.stringify({ subtasks: [{ id: 'only', feature: 'unwanted' }, { id: 'extra', feature: 'over-split' }] })
+    ? JSON.stringify({ subtasks: [subtask('only', 'unwanted'), subtask('extra', 'over-split')] })
     : outputs.get('split this request')!;
   return prompt.includes('atomic request') ? outputs.get('atomic request')! : outputs.get('split this request')!;
 };
@@ -86,6 +96,7 @@ describe('decompose A/B pure contracts', () => {
       'missing-research-context': 0,
       'grounding-empty': 0,
       'authored-empty': 0,
+      'slice-rejected': 0,
       'llm-failed': 1,
     });
   });
@@ -240,7 +251,8 @@ describe('decompose A/B pure contracts', () => {
     const out = join(dir, 'result.json');
     try {
       writeFileSync(corpus, JSON.stringify({ corpus: [{ id: 'atomic', feature: 'atomic request', negativeControl: true }], maxTasks: 2 }));
-      writeFileSync(module, `export const llm = async (prompt) => prompt.includes('Always split') ? '{"subtasks":[{"id":"only","feature":"one"}]}' : '{"subtasks":[{"id":"only","feature":"one"}]}'`);
+      const cliSubtask = JSON.stringify(subtask('only', 'one'));
+      writeFileSync(module, `export const llm = async () => JSON.stringify({ subtasks: [${cliSubtask}] })`);
       const logs: string[] = [];
       const original = console.log;
       console.log = (line: string) => { logs.push(line); };

@@ -18,6 +18,7 @@
 
 import { loadFederatedRunLedger, loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../../self-implement/run-ledger.js';
 import { redactSecretText } from '../../debug/log.js';
+import { projectRunLedgerSteps, type RunStep } from '../../self-implement/run-step-projection.js';
 
 export interface TraversalStepWire {
   node: string;
@@ -29,6 +30,8 @@ export interface TraversalStepWire {
   visit: number;
   maxVisits: number | null;
   detail: string | null;
+  /** Ledger sequence of this traversal entry; absent on legacy records. */
+  sourceSeq?: number;
 }
 
 export interface RunTraversalWire {
@@ -43,6 +46,8 @@ export interface RunTraversalWire {
   prNumber: number | null;
   substrate: string | null;
   steps: TraversalStepWire[];
+  /** Structural graph changes in the same per-run sequence domain as `steps[].sourceSeq`. */
+  graphEvents?: RunStep[];
   ledgerEvents: number;
 }
 
@@ -153,6 +158,7 @@ export function buildRunTraversal(runId: string, entries: readonly RunLedgerEntr
     if (isLast && terminal) outcome = TERMINAL_FAIL.has(status) ? 'fail' : (outcome ?? 'pass');
     const endIso = nextAt !== undefined ? sorted[nextAt]!.timestamp : terminal?.timestamp;
     const duration = ms(endIso) - ms(entry.timestamp);
+    const sourceSeq = (entry as RunLedgerEntry & { seq?: unknown }).seq ?? entry.data.seq;
     return {
       node,
       round: num(entry.data.round),
@@ -162,11 +168,15 @@ export function buildRunTraversal(runId: string, entries: readonly RunLedgerEntr
       visit,
       maxVisits: num(budget?.data.maxVisits),
       detail,
+      ...(typeof sourceSeq === 'number' && Number.isSafeInteger(sourceSeq) && sourceSeq > 0 ? { sourceSeq } : {}),
     };
   });
 
   const contract = sorted.find((entry) => entry.event === 'graph-run-contract-resolved')?.data;
   const pr = [...sorted].reverse().find((entry) => entry.event === 'pr-opened')?.data;
+  const projected = projectRunLedgerSteps(runId, sorted);
+  const graphEvents = projected.steps.filter((step) =>
+    step.type === 'node-added' || step.type === 'edge-rerouted' || step.type === 'unit-expanded' || step.type === 'unit-collapsed');
   return {
     runId,
     graphId: str(contract?.graphId) ?? str(sorted.find((entry) => entry.event === 'pipeline-node-entry')?.data.graphId),
@@ -178,6 +188,7 @@ export function buildRunTraversal(runId: string, entries: readonly RunLedgerEntr
     prNumber: num(pr?.number),
     substrate: str(contract?.actualSubstrate),
     steps,
+    ...(graphEvents.length ? { graphEvents } : {}),
     ledgerEvents: sorted.length,
   };
 }

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { DaemonSessionHistory } from '../boot/daemon-runtime.js';
 import { abortAgentTurn, createAgentTurnRunner } from './agent-turn.js';
 import { buildReplSystemPrompt } from './index.js';
+import { buildDashboardTurnPreamble } from '../dashboard/turn-preamble.js';
 import { resetSeatBootCacheForTest, SEAT_MEMORY_RECALL_PREFIX } from '../dashboard/seat-boot-preamble.js';
 import { MsgStore } from '../msg/msg-store.js';
 import type { UserConfig } from '../user-config.js';
@@ -212,6 +213,37 @@ describe('새 TUI REPL 시스템 프롬프트 — 자리 부트 카드(TUI-SESSI
 
   const seatDeps = (home: string, msgPath: string) => ({ home, msgPath, env: { COORD_ID: 'OP' } });
   const plainDeps = (home: string, msgPath: string) => ({ home, msgPath, env: {} });
+
+  test('the same mock research request exposes the same three skill choices in classic and Next TUI', () => {
+    const mockRequest = '이번 주 한국 시장과 업계 변화를 조사해 비교해줘';
+    const skillCatalog = [
+      { name: 'omni-crawl', description: 'Search and enrich public web context.' },
+      { name: 'omni-market', description: 'Compare market offerings.' },
+      { name: 'kr-flow', description: 'Research Korean market flows.' },
+    ];
+    const prompt = buildReplSystemPrompt({
+      cfg: fakeConfig,
+      enabledToolNames: ['skill_exec', 'elanous_skills_list'],
+      cwd: process.cwd(),
+      skillCatalog,
+      skillCatalogContextWindow: 128_000,
+    }) ?? '';
+    const classicPrompt = buildDashboardTurnPreamble({
+      userText: mockRequest,
+      cwd: process.cwd(),
+      userConfig: fakeConfig,
+      memory: false,
+      skillCatalog,
+      skillCatalogContextWindow: 128_000,
+    }).find(message => String(message.content).includes('[Installed skills]'))?.content;
+
+    const catalogText = String(classicPrompt);
+    expect(catalogText).toContain('call skill_exec with its exact name');
+    expect(prompt).toContain(catalogText);
+    for (const skill of ['omni-crawl', 'omni-market', 'kr-flow']) {
+      expect(catalogText).toContain(`- ${skill}:`);
+    }
+  });
 
   test('자리 REPL 첫 턴 — 역할·미읽음 수가 «한 번» 들어간다', () => {
     const f = seatFixture();

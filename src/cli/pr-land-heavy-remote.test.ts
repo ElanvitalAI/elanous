@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -7,6 +7,8 @@ import { ensurePrLandHeavyRemote, PR_LAND_HEAVY_HOSTS } from './pr-land-heavy-re
 import { GATE_REMOTE_DEFAULTS, type RemoteRunOptions } from '../self-implement/gate-remote.js';
 import { runBunShard } from '../self-dev/shard-run.js';
 import { runSelfGateCli } from '../self-implement/gate-cli.js';
+import { debug } from '../debug/log.js';
+import type { LandShadowSampleWindow, LandingShadowSample } from './pr-land-pod-shadow-job.js';
 
 const HEAD = 'a'.repeat(40);
 const MAIN = 'b'.repeat(40);
@@ -813,4 +815,109 @@ test('a slot that frees exactly at the deadline is not used', () => {
     expect(clock).toBe(20_000);
     expect(existsSync(join(evidenceDir, '72.json'))).toBe(false);
   } finally { rmSync(evidenceDir, { recursive: true, force: true }); }
+});
+
+test('WARM-REUSE-LAND-CONSUMER-WIRE: heavy land gate decides warm reuse once per landing — no evidence=off · 3 matching shadow results=live · 1 mismatch=recent-mismatch', () => {
+  const evidenceDir = mkdtempSync(join(tmpdir(), 'pr-land-heavy-'));
+  const LOCK = 'sha256:pod-land-lock';
+  const passRemote = () => ({ kind: 'ran' as const, rc: 0, stdout: Buffer.from(
+    '[tsc-gate] root-plan {"mode":"affected","roots":12,"promoted":false,"reason":null}\n[pr-land-extra-gates] pass global=measured interference=measured files=2\n'),
+    stderr: Buffer.alloc(0), commit: HEAD, host: 'node-b', ms: 5 });
+  const sample = (agree: boolean): LandingShadowSample => ({ head: HEAD, main: MAIN, lock: LOCK, leaseValid: true, canaryPassed: true, agree });
+  const gateRecheckLive = { consecutiveMatchSamples: 3, recentMismatchCount: 0, leaseValid: true, canaryPassed: true,
+    expected: { head: HEAD, main: MAIN, lock: LOCK }, worker: { head: HEAD, main: MAIN, lock: LOCK } };
+  const window = (samples: LandingShadowSample[]): LandShadowSampleWindow => ({ samples, lock: LOCK, gateRecheck: gateRecheckLive });
+  const allOn = { gateRecheck: true, land: true };
+  const landing = (pr: number, extra: Record<string, unknown> = {}) => ensurePrLandHeavyRemote({ pr, head: HEAD, main: MAIN, repo: '/repo', evidenceDir }, {
+    settings: GATE_REMOTE_DEFAULTS, observe: (): void => {}, runRemote: passRemote, ...extra,
+  });
+  const spy = spyOn(debug, 'log');
+  const landDecisions = () => (spy.mock.calls as Array<[string, string, Record<string, unknown>, unknown?]>)
+    .filter(([category, event, data]) => category === 'pod.warm' && event === 'switch-decision' && data?.['consumer'] === 'land')
+    .map(([, , data]) => data!);
+  try {
+    // 매 착지 1줄 — config 기본(끔)이면 이유 flag-off 로 매 판정이 남는다.
+    expect(landing(81)).toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'flag-off' });
+    spy.mockClear();
+    // 증거 없음 = off — flag 를 켜도 land shadow Job 결과 창이 없으면 off(선행 소비자 칸도 비어 있다).
+    expect(landing(82, { warmReuseConfig: () => allOn })).toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'predecessor-off:gate-recheck' });
+    spy.mockClear();
+    // land 표본 창만 비면 land 칸 증거 없음 = off.
+    expect(landing(83, { warmReuseConfig: () => allOn, landShadowSamples: () => window([]) }))
+      .toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'evidence-unmeasured' });
+    spy.mockClear();
+    // 가짜 shadow 결과 3건 일치 주입 → live.
+    expect(landing(84, { warmReuseConfig: () => allOn, landShadowSamples: () => window([sample(true), sample(true), sample(true)]) }))
+      .toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: true, reason: 'live', flag: true, minMatchSamples: 3, samples: 3, recentMismatchCount: 0 });
+    spy.mockClear();
+    // 최근 창의 mismatch 1건 → recent-mismatch.
+    expect(landing(85, { warmReuseConfig: () => allOn, landShadowSamples: () => window([sample(true), sample(true), sample(true), sample(false)]) }))
+      .toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'recent-mismatch', samples: 0, recentMismatchCount: 1 });
+    spy.mockClear();
+
+    // Lease invalidity fails closed even when the shadow otherwise agrees and identity matches.
+    const invalidLease = landing(86, {
+      warmReuseConfig: () => allOn,
+      landShadowSamples: () => window([
+        sample(true), sample(true), sample(true), { ...sample(true), leaseValid: false },
+      ]),
+    });
+    expect(invalidLease).toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'lease-invalid' });
+    spy.mockClear();
+
+    // An agreeing verdict with a different worker head is still rejected by the evidence builder/identity gate.
+    const identityMismatch = landing(87, {
+      warmReuseConfig: () => allOn,
+      landShadowSamples: () => window([
+        sample(true), sample(true), sample(true), { ...sample(true), head: 'c'.repeat(40) },
+      ]),
+    });
+    expect(identityMismatch).toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'identity-mismatch:head' });
+    spy.mockClear();
+
+    const lockMismatch = landing(88, {
+      warmReuseConfig: () => allOn,
+      landShadowSamples: () => window([
+        sample(true), sample(true), sample(true), { ...sample(true), lock: 'sha256:different-lock' },
+      ]),
+    });
+    expect(lockMismatch).toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'identity-mismatch:lock' });
+    spy.mockClear();
+
+    const configReadFailure = landing(89, {
+      warmReuseConfig: () => { throw new Error('config unavailable'); },
+    });
+    expect(configReadFailure).toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'flag-off' });
+    spy.mockClear();
+
+    const evidenceReadFailure = landing(90, {
+      warmReuseConfig: () => allOn,
+      landShadowSamples: () => { throw new Error('shadow window unavailable'); },
+    });
+    expect(evidenceReadFailure).toMatchObject({ ok: true, source: 'remote' });
+    expect(landDecisions()).toHaveLength(1);
+    expect(landDecisions()[0]!).toMatchObject({ consumer: 'land', live: false, reason: 'predecessor-off:gate-recheck' });
+    spy.mockClear();
+  } finally {
+    spy.mockRestore();
+    rmSync(evidenceDir, { recursive: true, force: true });
+  }
 });

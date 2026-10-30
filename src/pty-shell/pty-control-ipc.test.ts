@@ -22,6 +22,7 @@ const { upsertPtyManifest, ptyManifestDbPath, getPtyManifest } = await import('.
 const { resetPtyEventLogForTesting } = await import('./pty-event-log.js');
 const { getPtyControlTarget, registerPtyControlTarget, resetForTesting, setPtyAdapterForTesting, startPty } = await import('./registry.js');
 const { createTuiControlTarget, startTuiSelfReport } = await import('../capture/tui-self-report.js');
+const { setExternalTuiKeyRoute } = await import('../tui.js');
 const { stopPtyRecording } = await import('./pty-recording.js');
 const { readFileSync, writeFileSync } = await import('node:fs');
 const registryIds: string[] = [];
@@ -779,6 +780,69 @@ describe('pty-control-ipc round-trip', () => {
     await expect(request).resolves.toEqual({ status: 'success' });
     expect(injected).toEqual(['up']);
     unregister();
+  });
+
+  test('external TUI keys and text go to the active terminal modal before the parent input queue', async () => {
+    const id = freshId();
+    register(id);
+    const routeAKeys: string[] = [];
+    const routeBKeys: string[] = [];
+    const parentKeys: string[] = [];
+    const externalQueue: string[] = [];
+    const releaseA = setExternalTuiKeyRoute((key) => { routeAKeys.push(key.name); return true; });
+    const releaseB = setExternalTuiKeyRoute((key) => { routeBKeys.push(key.name); return true; });
+    const unregister = registerPtyControlTarget(createTuiControlTarget(id, {
+      injectKey: (key) => { parentKeys.push(key.name); return true; },
+      routeExternal: (chars) => { externalQueue.push(chars); return 'passthrough'; },
+    }));
+    const send = async (action: 'input-key' | 'input-text', chars: string): Promise<void> => {
+      const request = requestRemotePtyControl(id, action, { chars }, 2000);
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      await expect(request).resolves.toEqual({ status: 'success' });
+    };
+    try {
+      releaseA();
+      await send('input-key', '\x1b[B');
+      await send('input-text', '3');
+      await send('input-key', '\r');
+      expect(routeAKeys).toEqual([]);
+      expect(routeBKeys).toEqual(['down', '3', 'enter']);
+      expect(parentKeys).toEqual([]);
+      expect(externalQueue).toEqual([]);
+      releaseB();
+      await send('input-text', 'x');
+      expect(routeBKeys).toEqual(['down', '3', 'enter']);
+      expect(parentKeys).toEqual(['x']);
+      expect(externalQueue).toEqual(['x']);
+    } finally {
+      releaseA();
+      releaseB();
+      unregister();
+    }
+  });
+
+  test('active terminal-modal route errors fail the IPC write instead of falling through as delivered', async () => {
+    const id = freshId();
+    register(id);
+    const parentKeys: string[] = [];
+    const externalQueue: string[] = [];
+    const release = setExternalTuiKeyRoute(() => { throw new Error('modal route failed'); });
+    const unregister = registerPtyControlTarget(createTuiControlTarget(id, {
+      injectKey: (key) => { parentKeys.push(key.name); return true; },
+      routeExternal: (chars) => { externalQueue.push(chars); return 'passthrough'; },
+    }));
+    const request = requestRemotePtyControl(id, 'input-key', { chars: '\x1b[B' }, 2000);
+    try {
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      await expect(request).resolves.toMatchObject({ status: 'write-failed', reason: 'adapter-write' });
+      expect(parentKeys).toEqual([]);
+      expect(externalQueue).toEqual([]);
+    } finally {
+      release();
+      unregister();
+    }
   });
 
   test('IPC rename reaches a live TUI control target (no PtyHandle) instead of unknown-pty; a dead one stays unknown', async () => {

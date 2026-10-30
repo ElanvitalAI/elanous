@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { debug } from '../debug/log.js';
+import { readRunChart, recordRunChartDecision } from './run-chart.js';
 import { selectKnowhowPack } from './knowhow-pack.js';
 import { loadReviewRoundBrief, type ReviewRoundBrief } from './review-round-brief.js';
 import { findIncidentPrecedents, type IncidentPrecedent } from '../harness/harness-incidents.js';
@@ -15,6 +16,8 @@ import {
   type RunLedgerCheckedAppendOutcome,
   type RunLedgerLookupOptions,
 } from './run-ledger.js';
+import { pickAutohealAction, type AutohealAction } from './stop-autoheal.js';
+import { RUN_STOP_CLASSES, type RunStopClass } from './run-stop.js';
 /** 사고 원장 루트 기본값 — 운영/시험 우주 상태 디렉터리(없으면 빈 선례 · fail-soft). */
 export function doctorVisitIncidentRoot(): string {
   return elanousStateRoot();
@@ -249,6 +252,91 @@ export function recordParentNeedsOwnerVisit(input: {
 }
 
 export type ReadDoctorVisitsOptions = RunLedgerLookupOptions;
+
+export interface RunDoctorHandoffResult {
+  status: 'acted' | 'already-acted' | 'needs-human' | 'missing-handoff';
+  action?: AutohealAction;
+  outcome?: string;
+  stopKey: string;
+}
+
+/** Consume one persisted run-supervisor handoff through PR1's graph-aware stop prescription. */
+export async function runDoctorHandoff(input: {
+  runId: string;
+  stopKey: string;
+  dir?: string;
+  dispatch: (action: AutohealAction, handoff: Record<string, unknown>) => Promise<{ outcome: string; detail?: string }> | { outcome: string; detail?: string };
+}): Promise<RunDoctorHandoffResult> {
+  const entries = loadRunLedger(input.runId, input.dir);
+  if (entries === null) return { status: 'missing-handoff', stopKey: input.stopKey };
+  const latestHandoff = [...entries].reverse().find((entry) => entry.event === 'run-chart-cell'
+    && entry.data.device === 'run-supervisor' && entry.data.handoff === 'run-doctor');
+  const handoff = latestHandoff?.data.stopKey === input.stopKey ? latestHandoff : undefined;
+  if (!handoff) return { status: 'missing-handoff', stopKey: input.stopKey };
+  const prior = entries.filter((entry) => entry.event === 'doctor-rx' && entry.data.stopKey === input.stopKey);
+  const completed = prior.find((entry) => entry.data.status === 'completed' || entry.data.status === 'needs-human');
+  if (completed) return { status: completed.data.status === 'completed' ? 'already-acted' : 'needs-human',
+    ...(typeof completed.data.action === 'string' ? { action: completed.data.action as AutohealAction } : {}),
+    ...(typeof completed.data.outcome === 'string' ? { outcome: completed.data.outcome } : {}), stopKey: input.stopKey };
+  if (prior.some((entry) => entry.data.status === 'started')) {
+    const outcome = 'needs-human: prior doctor action started without a recorded result';
+    return { status: 'needs-human', outcome, stopKey: input.stopKey };
+  }
+
+  const chartBefore = readRunChart(input.runId, 'run-doctor', input.dir ?? runLedgerDir());
+  const rawClass = handoff.data.failureClass ?? (handoff.data.verdict === 'wait' ? 'implement-aborted' : undefined);
+  const failureClass = typeof rawClass === 'string' && (RUN_STOP_CLASSES as readonly string[]).includes(rawClass)
+    ? rawClass as RunStopClass : 'unclassified';
+  const prescription = pickAutohealAction(failureClass);
+  const visitAppend = appendRunLedgerEntryChecked(input.runId, (current) => {
+    if (current === null) return { append: false, result: false };
+    if (current.some((entry) => entry.event === 'doctor-visit' && entry.data.stopKey === input.stopKey)) return { append: false, result: true };
+    return { append: true, entry: { timestamp: new Date().toISOString(), runId: input.runId,
+      event: 'doctor-visit', data: { from: 'supervisor', symptom: 'no-progress', stopKey: input.stopKey,
+        evidence: `consecutive wait decisions=${String(handoff.data.waitCount ?? 'unknown')}`, prescription: prescription.action } } };
+  }, input.dir);
+  if (!visitAppend.appended && visitAppend.result !== true) return { status: 'missing-handoff', stopKey: input.stopKey };
+  const claim = appendRunLedgerEntryChecked(input.runId, (current) => {
+    if (current === null) return { append: false, result: 'missing-ledger' as const };
+    const priorAction = current.find((entry) => entry.event === 'doctor-rx' && entry.data.stopKey === input.stopKey);
+    if (priorAction) return { append: false, result: priorAction.data.status === 'completed' ? 'completed' as const
+      : priorAction.data.status === 'needs-human' ? 'needs-human' as const : 'in-progress' as const };
+    return { append: true, entry: { timestamp: new Date().toISOString(), runId: input.runId, event: 'doctor-rx',
+      data: { device: 'run-doctor', stopKey: input.stopKey, status: 'started', action: prescription.action,
+        source: prescription.source, ...(prescription.overlayId ? { overlayId: prescription.overlayId } : {}), executed: false } } };
+  }, input.dir);
+  if (!claim.appended) {
+    if (claim.result === 'completed') return { status: 'already-acted', action: prescription.action, stopKey: input.stopKey };
+    return { status: 'needs-human', action: prescription.action,
+      outcome: claim.result === 'needs-human' ? 'needs-human: prior action requires a person'
+        : claim.result === 'missing-ledger' ? 'needs-human: run ledger missing' : 'needs-human: doctor action already in progress',
+      stopKey: input.stopKey };
+  }
+
+  let outcome: string;
+  let detail: string | undefined;
+  try {
+    const result = await input.dispatch(prescription.action, handoff.data);
+    outcome = result.outcome;
+    detail = result.detail;
+  } catch (error) {
+    outcome = 'needs-human';
+    detail = error instanceof Error ? error.message : String(error);
+  }
+  const needsHuman = outcome === 'needs-human' || outcome.startsWith('needs-human:');
+  appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId: input.runId, event: 'doctor-rx',
+    data: { device: 'run-doctor', stopKey: input.stopKey, status: needsHuman ? 'needs-human' : 'completed',
+      action: prescription.action, source: prescription.source, outcome, executed: !needsHuman,
+      ...(detail ? { detail: detail.slice(0, 300) } : {}) } }, input.dir);
+  recordRunChartDecision({ runId: input.runId, device: 'run-doctor', stopKey: input.stopKey,
+    observed: String(handoff.data.observed ?? 'supervisor handoff'), verdict: needsHuman ? 'needs-human' : 'acted',
+    action: prescription.action, handoff: needsHuman ? 'outer-supervisor'
+      : prescription.action === 'reauthor-from-materialized' ? 'reauthor' : null,
+    why: detail ?? outcome, readStopKeys: chartBefore.map((cell) => cell.stopKey), dir: input.dir ?? runLedgerDir() });
+  debug.log('run-doctor', 'action', { runId: input.runId, stopKey: input.stopKey, action: prescription.action,
+    source: prescription.source, outcome, executed: !needsHuman });
+  return { status: needsHuman ? 'needs-human' : 'acted', action: prescription.action, outcome, stopKey: input.stopKey };
+}
 
 /** Project logged review briefs into status without changing the run-ledger schema. Keep the latest observation per PR. */
 export function doctorReviewVisits(events: readonly { timestamp?: string; sequence?: number; runId?: string; key?: string; evidence?: string }[]): (Omit<DoctorVisit, 'runId'> & { runId?: string })[] {

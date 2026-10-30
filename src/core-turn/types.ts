@@ -84,6 +84,8 @@ export interface CoreTurnCallbacks {
   /** Streaming text delta — `full` is the accumulated text across the
    *  entire turn (not just the current round). */
   onText?(delta: string, full: string): void;
+  /** Replace a provisional visible answer after staged synthesis succeeds. */
+  onReplaceText?(full: string): void;
   /** Transient runtime status (for example, a stream retry notice). */
   onStatus?(line: string): void;
   /** The final answer came back enriched with a runtime verification

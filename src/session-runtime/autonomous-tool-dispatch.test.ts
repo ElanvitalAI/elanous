@@ -2,13 +2,23 @@ import { describe, expect, test } from 'bun:test';
 import {
   buildSessionRuntimeToolSpecs,
   dispatchSessionRuntimeTool,
+  resolveDynamicSessionNativeToolSpecs,
   type SessionRuntimeDispatchDeps,
 } from './index.js';
 import { applyDeferredTools } from './tier-flip.js';
 import { getSessionCwd } from '../session/working-dir.js';
 import type { FeedbackEnvelope } from '../feedback/envelope.js';
+import { addWebSearchProvider, _resetWebSearchProvidersForTests } from '../web-search/index.js';
+import type { WebSearchProvider } from '../web-search/provider.js';
 
 const names = ['SelfImplement', 'RunDevHarness'] as const;
+
+function searchProvider(id: string): WebSearchProvider {
+  return {
+    id, displayName: id, available: () => true,
+    search: async () => ({ providerName: id, durationMs: 1, hits: [{ url: `https://${id}.example`, title: id, snippet: id }] }),
+  };
+}
 
 function depsFor(calls: string[]): SessionRuntimeDispatchDeps {
   return {
@@ -33,6 +43,43 @@ function depsFor(calls: string[]): SessionRuntimeDispatchDeps {
 }
 
 describe('session-runtime autonomous tool dispatch', () => {
+  test('deep research availability matches its research-only dispatch provider set', () => {
+    _resetWebSearchProvidersForTests(false);
+    addWebSearchProvider(searchProvider('tavily'));
+    addWebSearchProvider(searchProvider('ddg'));
+    try {
+      const withoutResearchPair = resolveDynamicSessionNativeToolSpecs({ userText: 'Research HBM4 vendors and compare sources.' });
+      expect(withoutResearchPair.map(spec => spec.name)).not.toContain('OmniSearch');
+      addWebSearchProvider(searchProvider('firecrawl'));
+      addWebSearchProvider(searchProvider('grok-api'));
+      const withResearchPair = resolveDynamicSessionNativeToolSpecs({ userText: 'Research HBM4 vendors and compare sources.' });
+      expect(withResearchPair.map(spec => spec.name)).toContain('OmniSearch');
+    } finally {
+      _resetWebSearchProvidersForTests();
+    }
+  });
+
+  test('OmniSearch surface dispatch uses the research-only provider route', async () => {
+    _resetWebSearchProvidersForTests(false);
+    const calls: string[] = [];
+    for (const id of ['grok', 'grok-api', 'firecrawl', 'tavily', 'ddg']) {
+      const source = searchProvider(id);
+      addWebSearchProvider({ ...source, search: async query => {
+        calls.push(id);
+        return source.search(query);
+      } });
+    }
+    try {
+      const result = await dispatchSessionRuntimeTool('OmniSearch', { query: 'HBM4' }, depsFor([])) as {
+        metadata: { perEngine: Record<string, unknown> };
+      };
+      expect(calls.sort()).toEqual(['firecrawl', 'grok']);
+      expect(Object.keys(result.metadata.perEngine).sort()).toEqual(['firecrawl', 'grok']);
+    } finally {
+      _resetWebSearchProvidersForTests();
+    }
+  });
+
   for (const name of names) {
     test(`${name} dispatches through the autonomous helper before runtime or plugin fallbacks`, async () => {
       const calls: string[] = [];

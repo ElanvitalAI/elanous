@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { readdir, readFile } from 'node:fs/promises';
 import { defaultSkillDirs } from '../user-config.js';
 import { SKILLS_LIST_DESCRIPTION } from '../onboarding/entry-hints.js';
+import { normalizeSkillName } from '../skills/name-match.js';
 import type { LLMToolSpec } from '../llm.js';
 import type { ToolRuntime } from './types.js';
 
@@ -69,6 +70,7 @@ export async function dispatchElanousSkillsList(
   const skillsDir = dirs[0] ?? ''; // 단일 경로 계약 보존(첫 dir)·전체는 skillsDirs
   const label = dirs.join(', ');   // 표시용(다중 루트면 콤마 결합)
   const query = (args.query ?? '').toLowerCase();
+  const normalizedQuery = normalizeSkillName(query);
   const seen = new Set<string>();
   const entries: ElanousSkillsListEntry[] = [];
   const errors: string[] = [];
@@ -91,7 +93,9 @@ export async function dispatchElanousSkillsList(
     }
   }
   let filtered = entries;
-  if (query.length > 0) filtered = entries.filter((e) => e.name.toLowerCase().includes(query));
+  if (query.length > 0) filtered = entries.filter((e) =>
+    e.name.toLowerCase().includes(query)
+    || (normalizedQuery.length > 0 && normalizeSkillName(e.name).includes(normalizedQuery)));
   filtered.sort((a, b) => a.name.localeCompare(b.name));
   // 모든 dir 열거 실패(산출 0)면 실패 보고(단일 dir 부재 계약 보존).
   if (entries.length === 0 && errors.length > 0 && errors.length === dirs.length) {

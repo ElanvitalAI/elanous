@@ -8,10 +8,12 @@ import { peerEditRunGate } from '../nexus/api/graph-peer-edit.js';
 import { observeModelInputTokens } from '../harness/model-input-observation.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
-import { latestGraphRun, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
+import { latestGraphRun, listGraphRuns, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
 
 export interface GraphTickOptions {
   startIfIdle?: boolean;
+  /** Resume this exact persisted run instead of whichever run happens to be latest. */
+  resumeRunId?: string;
   input?: unknown;
   mineDir?: string;
   deps?: GraphRunOptions['deps'] & { notify?: () => void | Promise<void>; isAlive?: (pid: number) => boolean };
@@ -96,7 +98,13 @@ export async function graphTick(path: string, options: GraphTickOptions = {}): P
     if (refusedAfterNotify) return refusedAfterNotify;
     // The run identity and executed bytes must agree with the ledger and the gate.
     if (current.graphId !== graphId) throw new Error(`graph id changed during tick: ${graphId} -> ${current.graphId}`);
-    const latest = latestGraphRun(graphId, root);
+    const latest = options.resumeRunId
+      ? listGraphRuns(root).runs.find(run => run.graphId === graphId && run.runId === options.resumeRunId) ?? null
+      : latestGraphRun(graphId, root);
+    if (options.resumeRunId && !latest) throw new Error(`graph run not found: ${graphId}/${options.resumeRunId}`);
+    if (options.resumeRunId && (latest?.status !== 'awaiting-approval' || !latest.pending?.decision)) {
+      throw new Error(`graph run is not awaiting a recorded decision: ${graphId}/${options.resumeRunId}`);
+    }
     const growthCard = latest?.growthPark
       ? (options.deps?.growthDecision?.list ?? ((filters: { status: 'all' }) => new DecisionLedger({ stateDir: root }).list(filters)))({ status: 'all' })
         .find(entry => entry.id === latest.growthPark?.decisionId && entry.refs?.includes(latest.growthPark.decisionRef))

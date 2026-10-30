@@ -47,4 +47,18 @@ describe('regate detail (HOST-REGATE-REASON-LOST)', () => {
     expect(regateFailureFacts({ conflictFiles: files.slice(0, 200), conflictFilesOmitted: 2 })).toEqual({ conflictFiles: files.slice(0, 200), conflictFilesOmitted: 2 });
     expect(regateFailureFacts(undefined)).toEqual({});
   });
+
+  test('PR-head facts preserve known conditions and bounded snapshots while rejecting malformed nested values', () => {
+    expect(regateFailureFacts({ failedConditions: ['pr-is-draft', 'unknown', 'base-oid-invalid', 'pr-is-draft'],
+      prHeadSnapshot: { headRefOid: 'a'.repeat(40), state: 'OPEN', isDraft: true,
+        baseRefName: 'main', baseRefOid: 'b'.repeat(40) } }))
+      .toEqual({ failedConditions: ['base-oid-invalid', 'pr-is-draft'],
+        prHeadSnapshot: { headRefOid: 'a'.repeat(40), state: 'OPEN', isDraft: true,
+          baseRefName: 'main', baseRefOid: 'b'.repeat(40) } });
+    expect(regateFailureFacts({ prHeadSnapshot: { headRefOid: 'a'.repeat(40), state: 'OPEN', isDraft: 'true',
+      baseRefName: 'main', baseRefOid: 'b'.repeat(40) } })).toEqual({});
+    expect(regateFailureFacts({ failedConditions: ['head-unavailable'], prHeadSnapshot: { headRefOid: 'ghp-secret-value',
+      state: 'token-secret', isDraft: null, baseRefName: 'credential-secret', baseRefOid: 'token-secret' } }))
+      .toEqual({ failedConditions: ['head-unavailable'] });
+  });
 });

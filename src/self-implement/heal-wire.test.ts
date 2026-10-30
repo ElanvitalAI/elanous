@@ -28,7 +28,8 @@ test('terminal gate failure writes one harness-run line with stage, runId and fi
   expect(first).toMatchObject({ ok: false, stage: 'gate-failed', runId: options.runId });
   await runSelfImplement({ ...options, seams: seams({ gateResults: [false] }) });
   expect(readFailureInbox({}, root)).toEqual([{
-    source: 'harness-run', kind: 'gate-failed', ref: options.runId, summary: 'Repair the gate', at: expect.any(String),
+    source: 'harness-run', kind: 'gate-failed', ref: options.runId, summary: 'Repair the gate',
+    goalText: options.feature, at: expect.any(String),
   }]);
 });
 

@@ -1,3 +1,5 @@
+import { parseTargetPathHintLine } from '../release-loop/checklist-target-path-hint.js';
+
 export type WorktreePathTouchAxis = 'touched' | 'untouched' | 'unreadable';
 
 /** 겹친 경로가 실제로 손대어졌는지의 읽기 전용 관측. */
@@ -534,15 +536,12 @@ export interface AskTargetPathHintsParseResult {
 }
 
 export function parseAskTargetPathHintsResult(askText: string): AskTargetPathHintsParseResult {
-  // ⛔ 첫 «비어 있지 않은» 줄만 본다 — 본문 전체를 훑으면 산문 속 경로까지 끌려와 오탐이 된다.
-  const firstLine = askText.split(/\r?\n/).find((line) => line.trim() !== '');
-  if (firstLine === undefined) return { paths: [], rejected: [], labelMissing: true };
-  const match = /^\s*(?:대상\s*경로|target\s*paths?)\s*[:：]\s*(.*)$/i.exec(firstLine);
-  if (!match) return { paths: [], rejected: [], labelMissing: true };
+  const parsed = parseTargetPathHintLine(askText);
+  if (parsed.labelMissing) return { paths: [], rejected: [], labelMissing: true };
 
   const paths: string[] = [];
   const rejected: AskTargetPathHintRejection[] = [];
-  for (const fragment of match[1]!.split(/[·,]/)) {
+  for (const fragment of parsed.fragments) {
     const piece = fragment.trim().replace(/^`+|`+$/g, '');
     if (piece === '') rejected.push({ fragment, reason: 'empty' });
     // ⛔ 「경로처럼 생긴 것」만 남긴다 — 확장자나 디렉터리 구분자가 있어야 한다.

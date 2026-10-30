@@ -46,6 +46,19 @@ test('tangledPairs combines reversed pairs and returns only pairs at the thresho
   expect(tangledPairs([{ pr: 5, with: 7 }, { pr: 7, with: 5 }, { pr: 8, with: 9 }])).toEqual([
     { first: 5, then: 7, failures: 2 },
   ]);
+  expect(tangledPairs([{ pr: 5, with: 7 }, { pr: 8, with: 9 }], { threshold: 1 })).toEqual([
+    { first: 5, then: 7, failures: 1 }, { first: 8, then: 9, failures: 1 },
+  ]);
+  expect(tangledPairs([{ pr: 5, with: 7 }, { pr: 7, with: 5 }], { threshold: 3 })).toEqual([]);
+});
+
+test('tangledPairs honors an explicit threshold option', () => {
+  const failures = [{ pr: 5, with: 7 }, { pr: 7, with: 5 }, { pr: 8, with: 9 }];
+  expect(tangledPairs(failures, { threshold: 2 })).toEqual([{ first: 5, then: 7, failures: 2 }]);
+  expect(tangledPairs(failures, { threshold: 3 })).toEqual([]);
+  expect(tangledPairs(failures, { threshold: 1 })).toEqual([
+    { first: 5, then: 7, failures: 2 }, { first: 8, then: 9, failures: 1 },
+  ]);
 });
 
 test('planTrain selects disjoint PRs in order and defers overlap and unmeasured files', () => {

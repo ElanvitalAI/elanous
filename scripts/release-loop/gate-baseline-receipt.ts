@@ -24,7 +24,7 @@ export function gateAssignableTestsAtCommit(repo: string, commit: string): strin
 }
 
 export interface GateBaselineReceipt {
-  schema: 1;
+  schema: 2;
   valid: boolean;
   reason: string;
   version: string;
@@ -33,9 +33,35 @@ export interface GateBaselineReceipt {
   recipeSha: string | null;
   envFingerprint: string;
   imageDigest: string | null;
+  executionIdentity: GatePodRuntimeIdentity | null;
   files: number;
   shards: number;
   attributionRecheck?: { summary: number; observed: number; identified: number; baselineResult: string; targetFiles: string[] };
+}
+
+export interface GatePodRuntimeIdentity {
+  bunVersion: string;
+  platform: string;
+  architecture: string;
+  envFingerprint: string;
+}
+
+const validRuntimeIdentity = (value: unknown): value is GatePodRuntimeIdentity => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Partial<GatePodRuntimeIdentity>;
+  return Object.keys(value).sort().join(',') === 'architecture,bunVersion,envFingerprint,platform'
+    && typeof row.bunVersion === 'string' && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(row.bunVersion)
+    && typeof row.platform === 'string' && /^[a-z0-9_-]{1,32}$/.test(row.platform)
+    && typeof row.architecture === 'string' && /^[a-z0-9_-]{1,32}$/.test(row.architecture)
+    && typeof row.envFingerprint === 'string' && SHA256.test(row.envFingerprint);
+};
+
+/** Parse runtime facts written by the gate Pod before its tests start. */
+export function parseGatePodRuntimeIdentity(text: string): GatePodRuntimeIdentity | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return validRuntimeIdentity(value) ? value : null;
+  } catch { return null; }
 }
 
 /** A direct hard rehearsal has no graph run state. Pin the graph and recipe bytes at its Git SHA. */
@@ -87,8 +113,9 @@ export function gateBaselineReceipt(input: { root: string; version: string; comm
   graphPins: { graphSha: string; recipeSha: string } | null; envFingerprint: string;
   attributionRecheck?: { summary: number; observed: number; identified: number; baselineResult: string; targetFiles: string[] } }): GateBaselineReceipt {
   const { root, version, commit, graphPins, envFingerprint } = input;
-  const base = { schema: 1 as const, version, commit, graphSha: graphPins?.graphSha ?? null,
-    recipeSha: graphPins?.recipeSha ?? null, envFingerprint, imageDigest: null as string | null, files: 0, shards: 0 };
+  const base = { schema: 2 as const, version, commit, graphSha: graphPins?.graphSha ?? null,
+    recipeSha: graphPins?.recipeSha ?? null, envFingerprint, imageDigest: null as string | null,
+    executionIdentity: null as GatePodRuntimeIdentity | null, files: 0, shards: 0 };
   const invalid = (reason: string): GateBaselineReceipt => ({ ...base, valid: false, reason });
   if (input.attributionRecheck) {
     const evidence = input.attributionRecheck;
@@ -102,12 +129,14 @@ export function gateBaselineReceipt(input: { root: string; version: string; comm
     const dir = join(root, 'release', version, 'gate-logs', 'cut');
     if (!existsSync(dir)) return invalid('cut Pod logs absent');
     const names = readdirSync(dir).filter((name) => /^pod-\d+(?:-[\w-]+)?\.json$/.test(name));
-    const roots = new Map<number, { files: string[]; shardCount: number; sweepId: string; attemptId: string }>();
-    const descendants: Array<{ name: string; commit?: string; imageDigest?: string; sweepId?: string; parentAttempt?: string; attemptId?: string }> = [];
+    const roots = new Map<number, { files: string[]; shardCount: number; sweepId: string; attemptId: string; runtimeIdentity?: GatePodRuntimeIdentity }>();
+    const descendants: Array<{ name: string; commit?: string; imageDigest?: string; sweepId?: string; parentAttempt?: string; attemptId?: string; runtimeIdentity?: GatePodRuntimeIdentity }> = [];
     const images = new Set<string>();
+    const identities = new Map<string, GatePodRuntimeIdentity>();
     for (const name of names) {
       const row = JSON.parse(readFileSync(join(dir, name), 'utf8')) as
-        { commit?: string; files?: unknown; shardCount?: number; sweepId?: string; imageDigest?: string; parentAttempt?: string; attemptId?: string };
+        { commit?: string; files?: unknown; shardCount?: number; sweepId?: string; imageDigest?: string; parentAttempt?: string; attemptId?: string; runtimeIdentity?: unknown };
+      const runtimeIdentity = validRuntimeIdentity(row.runtimeIdentity) ? row.runtimeIdentity : undefined;
       const match = /^pod-(\d+)\.json$/.exec(name);
       if (match) {
         if (row.commit !== commit) return invalid(`root cut Pod ${name} belongs to another commit`);
@@ -115,12 +144,16 @@ export function gateBaselineReceipt(input: { root: string; version: string; comm
           return invalid(`root cut Pod ${name} has no file list`);
         if (!row.attemptId) return invalid(`root cut Pod ${name} has no attempt`);
         if (!row.sweepId) return invalid(`root cut Pod ${name} has no sweep identity`);
-        roots.set(Number(match[1]), { files: row.files as string[], shardCount: row.shardCount ?? 0, sweepId: row.sweepId, attemptId: row.attemptId });
+        roots.set(Number(match[1]), { files: row.files as string[], shardCount: row.shardCount ?? 0,
+          sweepId: row.sweepId, attemptId: row.attemptId, runtimeIdentity });
       } else descendants.push({ name, commit: row.commit, imageDigest: row.imageDigest, sweepId: row.sweepId,
-        parentAttempt: row.parentAttempt, attemptId: row.attemptId });
+        parentAttempt: row.parentAttempt, attemptId: row.attemptId, runtimeIdentity });
       if (match) {
         if (!row.imageDigest || !IMAGE_DIGEST.test(row.imageDigest)) return invalid(`actual Pod image digest absent: ${name}`);
+        if (!runtimeIdentity) return invalid(`actual Pod runtime identity absent: ${name}`);
+        if (runtimeIdentity.envFingerprint !== envFingerprint) return invalid(`actual Pod environment differs: ${name}`);
         images.add(row.imageDigest.toLowerCase());
+        identities.set(JSON.stringify(runtimeIdentity), runtimeIdentity);
       }
     }
     if (!roots.size) return invalid('root cut shards absent');
@@ -144,7 +177,10 @@ export function gateBaselineReceipt(input: { root: string; version: string; comm
         if (row.sweepId !== sweepId) return invalid(`cut Pod ${row.name} belongs to another sweep`);
         if (!row.imageDigest || !IMAGE_DIGEST.test(row.imageDigest)) return invalid(`actual Pod image digest absent: ${row.name}`);
         if (!row.attemptId) return invalid(`cut Pod ${row.name} has no attempt`);
+        if (!row.runtimeIdentity) return invalid(`actual Pod runtime identity absent: ${row.name}`);
+        if (row.runtimeIdentity.envFingerprint !== envFingerprint) return invalid(`actual Pod environment differs: ${row.name}`);
         images.add(row.imageDigest.toLowerCase());
+        identities.set(JSON.stringify(row.runtimeIdentity), row.runtimeIdentity);
         attempts.add(row.attemptId);
       }
       pending = next;
@@ -157,6 +193,8 @@ export function gateBaselineReceipt(input: { root: string; version: string; comm
       if (row.commit === commit && !row.sweepId) return invalid(`cut Pod ${row.name} has no sweep identity`);
     }
     if (images.size !== 1) return invalid('cut Pods used different image digests');
-    return { ...base, valid: true, reason: 'complete clean full sweep', imageDigest: [...images][0]!, files: files.length, shards: count };
+    if (identities.size !== 1) return invalid('cut Pods used different runtime identities');
+    return { ...base, valid: true, reason: 'complete clean full sweep', imageDigest: [...images][0]!,
+      executionIdentity: identities.values().next().value!, files: files.length, shards: count };
   } catch (error) { return invalid(`cut Pod evidence unreadable: ${String(error)}`); }
 }

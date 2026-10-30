@@ -72,13 +72,25 @@ export async function detectDashboardSkillRoute(
   visibleIndex: SkillIndexEntry[],
   deps: DashboardSkillDetectionRuntimeDeps,
 ): Promise<DetectResult> {
+  const detectionStartedAt = performance.now();
   const detectKeyword = deps.detectKeyword ?? detectSkillTrigger;
   const detectWithLLM = deps.detectWithLLM ?? detectLLM;
   const parseClassifier = deps.parseClassifier ?? parseClassifierJson;
   const keywordDetection = detectKeyword(userText, visibleIndex, {});
-  if (!deps.llmFallback) return keywordDetection;
+  if (!deps.llmFallback) {
+    try {
+      debug.log('skill.router.timing', 'detection-complete', {
+        mode: 'keyword',
+        elapsedMs: Math.round((performance.now() - detectionStartedAt) * 10) / 10,
+        skillCount: visibleIndex.length,
+        candidateCount: keywordDetection.candidates.length,
+      });
+    } catch { /* observation must never delay routing */ }
+    return keywordDetection;
+  }
 
   const classify = async (prompt: string, signal?: AbortSignal): Promise<LLMClassifyResult> => {
+    const roleStartedAt = performance.now();
     const resolved = resolveRoleLlm('classify');
     const provider = llm.PROVIDERS[resolved.provider];
     if (!provider) throw new Error(`Unknown classify provider: ${resolved.provider}`);
@@ -89,21 +101,49 @@ export async function detectDashboardSkillRoute(
       provider: resolved.provider,
       source: resolved.source,
     });
-    const raw = await deps.streamLLM(
-      [{ role: 'user', content: prompt }],
-      () => {},
-      { signal, maxTokens: 120, temperature: 0, model: resolved.model, provider, usageRole: 'classify' },
-    );
+    try {
+      debug.log('skill.router.timing', 'classifier-role-ready', {
+        elapsedMs: Math.round((performance.now() - roleStartedAt) * 10) / 10,
+        provider: resolved.provider,
+        source: resolved.source,
+      });
+    } catch { /* observation must never delay routing */ }
+    const streamStartedAt = performance.now();
+    let raw: string;
+    try {
+      raw = await deps.streamLLM(
+        [{ role: 'user', content: prompt }],
+        () => {},
+        { signal, maxTokens: 120, temperature: 0, model: resolved.model, provider, usageRole: 'classify' },
+      );
+    } finally {
+      try {
+        debug.log('skill.router.timing', 'classifier-stream-complete', {
+          elapsedMs: Math.round((performance.now() - streamStartedAt) * 10) / 10,
+          provider: resolved.provider,
+        });
+      } catch { /* observation must never delay routing */ }
+    }
     return parseClassifier(raw);
   };
 
-  return detectWithLLM(userText, visibleIndex, {
-    classify,
-    keywordScoreThreshold: deps.keywordScoreThreshold,
-    llmConfidenceThreshold: deps.llmConfidenceThreshold,
-    ...(deps.signal ? { signal: deps.signal } : {}),
-    ...(deps.activeTier ? { activeTier: deps.activeTier } : {}),
-    ...(deps.fullMenuTier ? { fullMenuTier: deps.fullMenuTier } : {}),
-    ...(deps.fullMenuConfidenceThreshold != null ? { fullMenuConfidenceThreshold: deps.fullMenuConfidenceThreshold } : {}),
-  });
+  try {
+    return await detectWithLLM(userText, visibleIndex, {
+      classify,
+      keywordScoreThreshold: deps.keywordScoreThreshold,
+      llmConfidenceThreshold: deps.llmConfidenceThreshold,
+      ...(deps.signal ? { signal: deps.signal } : {}),
+      ...(deps.activeTier ? { activeTier: deps.activeTier } : {}),
+      ...(deps.fullMenuTier ? { fullMenuTier: deps.fullMenuTier } : {}),
+      ...(deps.fullMenuConfidenceThreshold != null ? { fullMenuConfidenceThreshold: deps.fullMenuConfidenceThreshold } : {}),
+    });
+  } finally {
+    try {
+      debug.log('skill.router.timing', 'detection-complete', {
+        mode: 'llm-fallback',
+        elapsedMs: Math.round((performance.now() - detectionStartedAt) * 10) / 10,
+        skillCount: visibleIndex.length,
+      });
+    } catch { /* observation must never delay routing */ }
+  }
 }

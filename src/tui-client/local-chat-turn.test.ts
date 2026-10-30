@@ -2,7 +2,7 @@ import { expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closeLocalChatSession, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, runLocalChatTurn } from './local-chat-turn.js';
+import { closeLocalChatSession, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, runLocalChatTurn, setNextSidetabHandler, setNextSidetabIpcEnabled } from './local-chat-turn.js';
 import { debug } from '../debug/log.js';
 import { BackgroundJobStatus } from '../tui/chat/background-job-status.js';
 import { appendMessage, createSession, loadSession, setActiveSessionId } from '../session/index.js';
@@ -22,6 +22,7 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
   const cli = join(dir, 'fake-cli.ts');
   writeFileSync(cli, `
     import { createInterface } from 'node:readline';
+    if (process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC !== '0') process.exit(9);
     for await (const line of createInterface({ input: process.stdin })) {
       const input = JSON.parse(line);
       if (input.prompt !== 'private prompt text') process.exit(4);
@@ -32,14 +33,54 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
     }
   `);
   const routeLog = spyOn(debug, 'log');
+  const priorSidetabIpc = process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC;
   try {
+    process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC = '1';
+    setNextSidetabHandler(null);
+    setNextSidetabIpcEnabled(false);
     await expect(runLocalChatTurn('test-session', 'private prompt text', new AbortController().signal, cli)).resolves.toBeUndefined();
     expect(routeLog).toHaveBeenCalledWith('llm.route-decision', 'local-chat-executed', {
       surface: 'tui-local', sessionId: 'test-session', provider: 'grok', model: 'grok-4.7',
     });
   } finally {
     await closeLocalChatSession('test-session');
+    setNextSidetabIpcEnabled(false);
+    if (priorSidetabIpc === undefined) delete process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC;
+    else process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC = priorSidetabIpc;
     routeLog.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the sticky REPL resolves sidetab IPC against the current TUI handler', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-sidetab-ipc-'));
+  const cli = join(dir, 'sidetab-ipc-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    if (process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC !== '1') process.exit(8);
+    let call = 0;
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      const response = new Promise((resolve) => process.once('message', resolve));
+      process.send({ type: 'elanous.sidetab.call', callId: String(++call), request: { action: 'list' } });
+      const result = await response;
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: JSON.stringify(result.result) }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'done', provider: 'test', model: 'ipc' }));
+    }
+  `);
+  const replies: string[] = [];
+  try {
+    setNextSidetabIpcEnabled(true);
+    setNextSidetabHandler(null);
+    await runLocalChatTurn('sidetab-ipc', 'first', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    setNextSidetabHandler(async () => [{ id: 'live-handler' }]);
+    await runLocalChatTurn('sidetab-ipc', 'second', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    expect(JSON.parse(replies[0] ?? 'null')).toEqual({ error: 'Next TUI sidetab handler is not ready' });
+    expect(JSON.parse(replies[1] ?? 'null')).toEqual([{ id: 'live-handler' }]);
+  } finally {
+    setNextSidetabHandler(null);
+    setNextSidetabIpcEnabled(false);
+    await closeLocalChatSession('sidetab-ipc');
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -144,6 +185,32 @@ test('self health frames require the active turn and session and clear on child 
   } finally {
     stop();
     await closeLocalChatSession('health-session');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('replace frames atomically replace the provisional answer for the active turn', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-replace-'));
+  const cli = join(dir, 'replace-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    for await (const line of createInterface({ input: process.stdin })) {
+      const input = JSON.parse(line);
+      console.log(JSON.stringify({ event: 'delta', turnId: input.id, text: 'provisional' }));
+      console.log(JSON.stringify({ event: 'replace', turnId: input.id, text: 'grounded answer' }));
+      console.log(JSON.stringify({ event: 'result', turnId: input.id, reply: 'grounded answer' }));
+    }
+  `);
+  const frames: Array<{ text: string; replace?: boolean }> = [];
+  try {
+    await runLocalChatTurn('replace-session', 'question', new AbortController().signal, cli, undefined,
+      (text, replace) => frames.push({ text, replace }));
+    expect(frames).toEqual([
+      { text: 'provisional', replace: undefined },
+      { text: 'grounded answer', replace: true },
+    ]);
+  } finally {
+    await closeLocalChatSession('replace-session');
     rmSync(dir, { recursive: true, force: true });
   }
 });

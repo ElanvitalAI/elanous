@@ -81,6 +81,29 @@ describe('TaskNotificationQueue — wake/drain multi-consumer hooks', () => {
     expect(queue.size).toBe(0);
   });
 
+  test('drainForParentSession consumes only the owning session receipts', () => {
+    const { queue } = freshQueue();
+    queue.enqueue(pending({ taskId: 'a1', parentSessionId: 'session-a' }));
+    queue.enqueue(pending({ taskId: 'b1', parentSessionId: 'session-b' }));
+
+    expect(queue.drainForParentSession('session-a').map((item) => item.taskId)).toEqual(['a1']);
+    expect(queue.size).toBe(1);
+    expect(queue.drainForParentSession('session-b').map((item) => item.taskId)).toEqual(['b1']);
+    expect(queue.size).toBe(0);
+  });
+
+  test('drainForParentSessionOrUnscoped preserves sibling receipts while delivering legacy notices', () => {
+    const { queue } = freshQueue();
+    queue.enqueue(pending({ taskId: 'a1', parentSessionId: 'session-a' }));
+    queue.enqueue(pending({ taskId: 'legacy' }));
+    queue.enqueue(pending({ taskId: 'b1', parentSessionId: 'session-b' }));
+
+    expect(queue.drainForParentSessionOrUnscoped('session-a').map((item) => item.taskId)).toEqual(['a1', 'legacy']);
+    expect(queue.size).toBe(1);
+    expect(queue.drainForParentSessionOrUnscoped('session-b').map((item) => item.taskId)).toEqual(['b1']);
+    expect(queue.size).toBe(0);
+  });
+
   test('oversized output is truncated, persisted to resultPath, and rendered as such', () => {
     const { queue, dir } = freshQueue();
     const big = 'x'.repeat(TASK_NOTIFICATION_OUTPUT_CAP + 10);

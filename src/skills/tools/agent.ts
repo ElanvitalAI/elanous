@@ -271,6 +271,10 @@ export interface AgentToolArgs {
    *  child keeps running; completion emits a task-notification
    *  (P2) which the parent sees in the next turn's user message. */
   run_in_background?: boolean;
+  /** How a background completion reaches an idle parent TUI. */
+  completion_delivery?: 'follow-up' | 'supplement';
+  /** Best-effort wall-clock budget for a research child, in minutes. */
+  budget_minutes?: number;
   /** When true, a background launch that hits the fan-out ceiling WAITS on
    *  the session's shared admission queue instead of being refused: it spawns
    *  as soon as a live background agent terminals (subagent waits are
@@ -349,6 +353,7 @@ export function buildAgentTool(): LLMToolSpec {
       'Delegate heavy multistep work that would overflow your context, fan out independent units in parallel, ' +
       'and hand off long investigations; use run_in_background for long-running work so you can keep coordinating ' +
       'and finish after the results arrive.\n' +
+      'For parallel research, prefer completion_delivery="supplement" and budget_minutes=8: ask each child for its best verified evidence within the budget; late results appear as one chat line without reopening a TUI turn.\n' +
       '\n' +
       'The sub-agent gets its own tools (Bash/Read/Edit/Grep/WebFetch by default) and its own ' +
       'turn budget (default 20). It returns ONE final message which becomes your tool_result. ' +
@@ -376,6 +381,17 @@ export function buildAgentTool(): LLMToolSpec {
         run_in_background: {
           type: 'boolean',
           description: 'When true, returns the spawn handle immediately instead of waiting for completion. The child keeps running; its final message arrives in your next turn as a <task-notification> user message. Use for long-running explorations (multi-minute research, 10+ tool calls) so you can keep working in parallel.',
+        },
+        completion_delivery: {
+          type: 'string',
+          enum: ['follow-up', 'supplement'],
+          description: 'Background-only routing. supplement adds one concise chat line when the child finishes and never opens a new TUI turn; follow-up keeps default result retrieval.',
+        },
+        budget_minutes: {
+          type: 'number',
+          minimum: 1,
+          maximum: 60,
+          description: 'Background-only best-effort wall-clock research budget. Ask the child to stop researching at this point and return currently verified evidence; default 8 minutes for supplement delivery.',
         },
         wait_for_slot: {
           type: 'boolean',
@@ -423,6 +439,8 @@ export function buildAgentTool(): LLMToolSpec {
 }
 
 export interface DispatchAgentOpts {
+  /** Owning conversation session, copied to background completion receipts. */
+  parentSessionId?: string;
   /** Tools the host makes available — typically the same tool list the
    *  parent skill is using, MINUS the Agent tool itself (no recursion).
    *  When omitted, the sub-agent runs with no tools (text-only). */
@@ -507,6 +525,10 @@ export async function dispatchAgent(
 
   // PFC-S1 P1: new optional fields.
   const runInBackground = args.run_in_background === true;
+  const completionDelivery = args.completion_delivery === 'supplement' ? 'supplement' : 'follow-up';
+  const requestedBudgetMinutes = typeof args.budget_minutes === 'number' && Number.isFinite(args.budget_minutes)
+    ? Math.max(1, Math.min(60, Math.floor(args.budget_minutes)))
+    : (completionDelivery === 'supplement' ? 8 : undefined);
   const waitsForSlot = args.wait_for_slot === true;
   const spawnName = typeof args.name === 'string' && args.name.trim() ? args.name.trim() : undefined;
   const teamName = typeof args.team_name === 'string' && args.team_name.trim() ? args.team_name.trim() : undefined;
@@ -923,9 +945,12 @@ export async function dispatchAgent(
   }
 
   const hasNoTools = childTools.length === 0;
-  const childPrompt = hasNoTools
+  const budgetPrompt = runInBackground && completionDelivery === 'supplement' && requestedBudgetMinutes
+    ? `\n\n[Research time budget: ${requestedBudgetMinutes} minutes]\nReturn the best currently verified evidence within this budget. Do not wait for more sources or extend the research; state remaining uncertainty in the final message.`
+    : '';
+  const childPrompt = (hasNoTools
     ? `${prompt}\n\nNo tools are available; if a request requires reading files or executing commands, report that as unavailable rather than guessing.`
-    : prompt;
+    : prompt) + budgetPrompt;
 
   debug.log('agent.spawn', 'dispatch', {
     cid: debugCorrelationId,
@@ -935,6 +960,7 @@ export async function dispatchAgent(
     promptChars: childPrompt.length,
     model: definition.model || '(inherit)',
     maxTurns: requestedMaxTurns,
+    ...(runInBackground ? { completionDelivery, ...(requestedBudgetMinutes ? { researchBudgetMinutes: requestedBudgetMinutes } : {}) } : {}),
     tools: childTools.map(t => t.name),
     noTools: hasNoTools,
   });
@@ -943,6 +969,7 @@ export async function dispatchAgent(
   const handle = globalAgentRegistry.spawn({
     definition,
     prompt: childPrompt,
+    ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
     label: spawnName ?? description,   // PFC-S1 P1: explicit `name`
                           // wins, else fall back to the task label
                           // (kept for existing callers).
@@ -963,6 +990,7 @@ export async function dispatchAgent(
     ...(teamName ? { teamName } : {}),
     ...(childCwd ? { cwd: childCwd } : {}),
     ...(runInBackground ? { background: true } : {}),
+    ...(runInBackground ? { completionDelivery } : {}),
   });
 
   // Terminal release for this dispatch's reserved fan-out slot: the

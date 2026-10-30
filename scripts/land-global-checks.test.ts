@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LAND_GLOBAL_CHECKS, landGlobalChecks, runLandGlobalChecksGate, type LandGlobalChecksRun } from './land-global-checks.js';
+import { LAND_GLOBAL_CHECKS, landGlobalChecks, landNextMdGate, runLandGlobalChecksGate, type LandGlobalChecksRun } from './land-global-checks.js';
 import { TUI_ENTRY_PATH } from '../test/helpers/dashboard-source.js';
 
 const ROOT = join(import.meta.dir, '..');
@@ -81,6 +81,35 @@ test('게이트: 끌려온 시험만 러너에 넘기고, 실패하면 막는다
 test('게이트: 러너가 못 돌았으면 「통과」가 아니라 던진다', () => {
   const g = gate(['release/next.md'], { status: null, output: '', error: 'spawnSync bun ETIMEDOUT' });
   expect(() => g.run()).toThrow('ETIMEDOUT');
+});
+
+test('release note checker ignores a parent graph context and reads this checkout next.md', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'land-next-md-context-'));
+  const originalContext = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    mkdirSync(join(cwd, 'release'), { recursive: true });
+    writeFileSync(join(cwd, 'release', 'next.md'), '# Next\n\n## Fix\n\n- fix — Add a deterministic release gate.\n');
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({
+      outputs: { docs: { notes: join(cwd, 'removed-release-docs-worktree', '0.2.41.md'), flipped: [] } },
+    });
+    const logs: string[] = [];
+    const errors: string[] = [];
+    expect(landNextMdGate(cwd, { log: (message) => logs.push(message), error: (message) => errors.push(message) })).toBe(true);
+    expect(logs.join('\n')).toContain('release/next.md 발행 노트 검사(check-node) PASS');
+    expect(errors).toEqual([]);
+
+    writeFileSync(join(cwd, 'release', 'next.md'), '# Next\n\n## Fix\n\n- fix — 신설: checkout 문서의 한국어 위반.\n');
+    const invalidLogs: string[] = [];
+    const invalidErrors: string[] = [];
+    expect(landNextMdGate(cwd, { log: (message) => invalidLogs.push(message), error: (message) => invalidErrors.push(message) })).toBe(false);
+    expect(invalidErrors.join('\n')).toContain('B11');
+    expect(invalidErrors.join('\n')).toContain('release/next.md');
+    expect(invalidLogs).toEqual([]);
+  } finally {
+    if (originalContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = originalContext;
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test('게이트(기본 러너): 실제 spawn 으로 끌려온 시험만 넘기고, 그 종료 코드가 실패면 막는다', () => {

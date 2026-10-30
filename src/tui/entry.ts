@@ -357,6 +357,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
 
   const ensureSidetabAttachments = async (): Promise<void> => {
     if (sidetabAttachments) return;
+    const installer = await import('../agent-mission/tool-install.js') as unknown as {
+      detectAgentCli?: (agent: 'codex' | 'claude') => Promise<{
+        agent: 'codex' | 'claude'; installed: boolean; version: string | null;
+        login: 'ready' | 'needed' | 'unknown'; message: string;
+      }>;
+    };
     sidetabAttachments = (await import('./sidetab/attach.js')).createSidetabAttachmentController({
       drawBase: () => {
         paintingCoordinatorFrame = true;
@@ -364,6 +370,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       },
       termSize: () => ({ cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 }),
       setStatus: (message) => { status = safeStatusText(message); },
+      ...(installer.detectAgentCli ? { detectAgentCli: installer.detectAgentCli } : {}),
       drawRemoteFrame: (frame) => {
         sidetabRemoteFrame = frame || null;
         if (sidetabRemoteFrame !== null) {
@@ -575,7 +582,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       .then(({ runLocalChatTurn, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus }) => {
         observeSession(turnSessionId, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus);
         let firstResponseSeen = false;
-        return runLocalChatTurn(turnSessionId, turnText, abort.signal, undefined, undefined, (delta) => {
+        return runLocalChatTurn(turnSessionId, turnText, abort.signal, undefined, undefined, (delta, replace = false) => {
           // 스트림 텍스트 = 진전 신호 — 마지막 진전 시각을 올린다(녹음기 없으면 아무 일도 안 한다).
           reportTuiProgress();
           // 첫 응답 경계: 첫 스트림 델타에서 턴 시작 트레이스를 닫는다(endedBy=stream-open).
@@ -585,7 +592,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           }
           // The first model token is visible before the final JSONL frame. Keep only
           // a bounded tail until session history becomes the canonical display.
-          streamingReply = (streamingReply + delta).slice(-32_768);
+          streamingReply = replace ? delta.slice(-32_768) : (streamingReply + delta).slice(-32_768);
           activity = streamReplyLines(streamingReply, process.stdout.columns || 80);
           const now = performance.now();
           if (streamRenderAt === 0 || now - streamRenderAt >= 33) {
@@ -692,8 +699,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   try {
     {
       const { createNextTuiWakeup, setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');
-      const { setNextSidetabHandler } = await import('../tui-client/local-chat-turn.js');
+      const { setNextSidetabHandler, setNextSidetabIpcEnabled } = await import('../tui-client/local-chat-turn.js');
       const { createNextSidetabHostHandler } = await import('./sidetab/nl-tool.js');
+      setNextSidetabIpcEnabled(true);
       wakeup = createNextTuiWakeup({
         isTurnRunning: () => busy,
         getBufferText: () => editor.text,
@@ -722,6 +730,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         attach: async (row) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.select(row); render(); return { ok, action: 'attach', target: row.id }; },
         detach: () => { if (sidetabAttachments?.hasRemoteView()) sidetabAttachments.showMain(); else if (sidetabAttachments?.hasModal()) { sidetabAttachments.handleKey({ name: '\\', ctrl: true, shift: false, raw: '' }); sidetabAttachments.handleKey({ name: 'd', ctrl: false, shift: false, raw: 'd' }); } render(); return { ok: true, action: 'detach' }; },
         spawn: async (character) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.spawn(character); refreshSidetabRows(); render(); return { ok, action: 'new', character }; },
+        runMission: async (agent, mission) => { await ensureSidetabAttachments(); const result = await sidetabAttachments!.runMission(agent, mission); refreshSidetabRows(); render(); return result; },
         kill: async (row) => { await ensureSidetabAttachments(); const ok = sidetabAttachments!.kill(row); refreshSidetabRows(); render(); return { ok, action: 'kill', target: row.id }; },
       }));
       const gate = wakeup.gate;
@@ -1390,8 +1399,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       const { setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');
       setNextTuiWakeupTool(null);
     }
-    const { setNextSidetabHandler } = await import('../tui-client/local-chat-turn.js');
+    const { setNextSidetabHandler, setNextSidetabIpcEnabled } = await import('../tui-client/local-chat-turn.js');
     setNextSidetabHandler(null);
+    setNextSidetabIpcEnabled(false);
     turnAbort?.abort();
     await turnDone;
     backgroundSubscription.stop?.();

@@ -1,11 +1,15 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, beforeAll, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { psProcessStartMs } from '../harness/harness-stop.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { appendRunLedgerEntry, runLedgerDir } from './run-ledger.js';
 import { readFailureInbox, recordFailureEvent, startHealLoop, type FailureEvent } from './heal-intake.js';
+import { makeRunObserver } from './orchestrator.js';
+
+beforeAll(async () => { await import('../graph-runner/runner.js'); }, 120_000);
 
 const dirs: string[] = [];
 function root(): string {
@@ -21,8 +25,8 @@ afterEach(() => {
 const base = { source: 'release-run' as const, kind: 'graph-run', ref: 'release/run-1', summary: 'failed node', at: '2026-10-04T13:00:00.000Z' };
 
 function loopSpy() {
-  const starts: Array<{ file: string; options: { runId: string; input: { failureEvent: FailureEvent }; deps: { root: string } } }> = [];
-  const start = async (file: string, options: { runId: string; input: { failureEvent: FailureEvent }; deps: { root: string } }) => {
+  const starts: Array<{ file: string; options: Parameters<typeof startHealLoop>[1] }> = [];
+  const start = async (file: string, options: Parameters<typeof startHealLoop>[1]) => {
     starts.push({ file, options });
   };
   return { starts, start };
@@ -225,6 +229,62 @@ test('pre-ledger start failure releases its claim for a later inbox intake witho
   await settleLoopStart();
   expect(attempts.filter(id => id === attempts[0])).toHaveLength(2);
   expect(readFailureInbox({}, dir)).toHaveLength(3);
+});
+
+test('real heal graph collect output reaches the outer relaunch and its per-cell claim persists', async () => {
+  const dir = root();
+  const goal = '목표: 실체를 고친다\n대상 경로: src/expected.ts\n검증 무대: 지정 시험';
+  const event: FailureEvent = { ...base, ref: 'run-11111111-1111-4111-8111-111111111111', summary: '[tdd-evidence-missing] reauthor', goalText: goal };
+  const write = (entry: Parameters<typeof appendRunLedgerEntry>[0]) => appendRunLedgerEntry(entry, runLedgerDir(dir));
+  const observe = makeRunObserver(event.ref, undefined, () => {}, write);
+  observe('implemented', { ok: false, round: 0, materializedPaths: ['src/actual.ts'] });
+  observe('review-round-triage', { round: 1, rawMustFix: ['same finding', 'same finding'] });
+  appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId: event.ref, event: 'doctor-visit',
+    data: { from: 'supervisor', symptom: 'no-progress', evidence: 'prior materialized attempt' } }, runLedgerDir(dir));
+  recordFailureEvent(event, dir, async () => {});
+  await settleLoopStart();
+  const launched: Array<{ goalText: string; goalId?: string; cellKey: string }> = [];
+  const run = async (file: string, options: Parameters<typeof startHealLoop>[1]) => {
+    const { runGraph } = await import('../graph-runner/runner.js');
+    return runGraph(file, { ...options, pinChildUniverse: true, deps: { root: dir } });
+  };
+  const relaunch = async (input: { goalText: string; goalId?: string; cellKey: string }) => { launched.push(input); return { runId: 'outer-relaunch' }; };
+  const options = { runId: 'manual-heal-run', input: { failureEvent: event }, deps: { root: dir } };
+  const first = await startHealLoop(join(import.meta.dir, '../../graphs/heal/heal-loop.yaml'), options, {}, run, relaunch);
+  expect(first).toMatchObject({ reauthor: 'relaunched', result: { status: 'done' } });
+  expect(launched).toHaveLength(1);
+  expect(launched[0]).toMatchObject({ goalText: expect.stringContaining('대상 경로: src/actual.ts') });
+  const graphNodes = (first as { result: { nodes: Array<{ nodeId: string; output?: string }> } }).result.nodes;
+  const firstTriage = JSON.parse(graphNodes.find((node) => node.nodeId === 'triage')!.output!) as { evidence?: string[] };
+  expect(firstTriage.evidence).toContain('same must-fix repeated');
+  const attemptFiles = readdirSync(join(dir, 'heal/reauthor-attempts'));
+  expect(attemptFiles).toHaveLength(1);
+  const repeat: FailureEvent = { ...event, ref: 'run-22222222-2222-4222-8222-222222222222', at: '2026-10-04T14:00:00.000Z',
+    goalText: '목표: 재작성된 골\n대상 경로: src/actual.ts\n검증 무대: 지정 시험', cellKey: launched[0]!.cellKey };
+  makeRunObserver(repeat.ref, undefined, () => {}, write)('implemented', { ok: false, round: 0, materializedPaths: ['src/actual-after-retry.ts'] });
+  recordFailureEvent(repeat, dir, async () => {});
+  const second = await startHealLoop(join(import.meta.dir, '../../graphs/heal/heal-loop.yaml'), options, {}, run, relaunch);
+  expect(second).toMatchObject({ reauthor: 'already-attempted' });
+  expect(launched).toHaveLength(1);
+});
+
+test('a failed outer reauthor run is reported as needs-human, never started', async () => {
+  const dir = root();
+  const event: FailureEvent = { ...base, ref: 'run-33333333-3333-4333-8333-333333333333', summary: '[tdd-evidence-missing] retry', goalText: '목표: retry\n대상 경로: src/a.ts' };
+  appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId: event.ref, event: 'unrelated-observation',
+    data: { paths: ['src/unrelated.ts'], changedFiles: ['src/also-unrelated.ts'] } }, runLedgerDir(dir));
+  recordFailureEvent(event, dir, async () => {});
+  await settleLoopStart();
+  const run = async (file: string, options: Parameters<typeof startHealLoop>[1]) => {
+    const { runGraph } = await import('../graph-runner/runner.js');
+    return runGraph(file, { ...options, pinChildUniverse: true, deps: { root: dir } });
+  };
+  const relaunch = async () => ({ runId: 'must-not-relaunch' });
+  const failed = await startHealLoop(join(import.meta.dir, '../../graphs/heal/heal-loop.yaml'),
+    { runId: 'manual-relaunch-failure', input: { failureEvent: event }, deps: { root: dir } }, {}, run, relaunch);
+  expect(failed).toMatchObject({ reauthor: 'needs-human', result: { status: 'failed' }, reason: 'insufficient-materialized-evidence' });
+  const entries = readFileSync(join(runLedgerDir(dir), `${event.ref}.jsonl`), 'utf8');
+  expect(entries).toContain('"outcome":"needs-human"');
 });
 
 test('a start that writes its ledger before throwing retains its claim and does not replay', async () => {

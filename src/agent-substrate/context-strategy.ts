@@ -39,9 +39,9 @@ export interface CompactionOutcome {
  *  선택 필드로 읽는다. 미설정(구 config·테스트)이면 기본 1(첫 앵커 pin). 0=비활성. */
 interface AutoCompactCfgWithAnchor { preserveFirstN?: number }
 
-/** context 전략 계약 — loop 이 매 턴(turn>0) 호출. 기본=2-tier compaction. 주입으로 교체(read-time projection 등). */
+/** context 전략 계약 — loop 이 mid-loop(turn>0) 호출. 기본=2-tier compaction. 주입으로 교체(read-time projection 등). */
 export interface ContextStrategy {
-  compact(messages: LLMMessage[], ctx: { model: string; sessionId?: string; config: unknown }): Promise<CompactionOutcome>;
+  compact(messages: LLMMessage[], ctx: { model: string; sessionId?: string; config: unknown; observedInputTokens?: number }): Promise<CompactionOutcome>;
 }
 
 /**
@@ -54,8 +54,8 @@ export function createDefaultContextStrategy(): ContextStrategy {
     async compact(messages, ctx): Promise<CompactionOutcome> {
       const { shouldAutoCompact } = require('../compact/auto.js') as typeof import('../compact/auto.js');
       const acCfg = ctx.config as Parameters<typeof shouldAutoCompact>[2];
-      const decision = shouldAutoCompact(messages, ctx.model, acCfg);
-      const beforeTokens = decision.usedTokens; // estimateMessagesTokens(messages) 동일 계측
+      const decision = shouldAutoCompact(messages, ctx.model, acCfg, ctx.observedInputTokens);
+      const beforeTokens = estimateMessagesTokens(messages);
       if (!decision.fire) {
         return { fired: false, messages, reduced: false, escalated: false, ratio: decision.ratio, usedTokens: decision.usedTokens, beforeTokens, afterTokens: beforeTokens };
       }

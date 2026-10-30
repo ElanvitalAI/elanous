@@ -38,6 +38,7 @@ import { nextTurnFallbackProvider, resolveDefaultProvider, type LLMMessage, type
 import { readAutohealProviderFallback } from '../self-health/autoheal.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { CoreTurnAuthRejectedError } from '../core-turn/auth-rejected-notice.js';
+import { globalTaskNotificationQueue, renderTaskNotificationsXml } from '../agent/task-notification.js';
 import {
   runCoreTurn,
   runGoalLoop,
@@ -452,6 +453,11 @@ export function bridgeCoreTurnToAcp(
           ? runGoalLoop(c, {
               // ACP owns an interactive provider loop: keep its post-completion response contract.
               terminalCompletionShortcut: false,
+              drainIterationMessages: () => {
+                const pending = globalTaskNotificationQueue.drainForParentSessionOrUnscoped(c.sessionId);
+                const xml = renderTaskNotificationsXml(pending);
+                return xml ? [{ role: 'user', content: xml }] : [];
+              },
               ...(goalLoopCfg?.maxIterations !== undefined ? { maxIterations: goalLoopCfg.maxIterations } : {}),
               // #29 처방 — 자리 판정으로 goal loop 에 «되돌아온» 턴만 빈 evidence 완료를 답으로 받는다.
               ...(route.reason.startsWith('seat-') ? { lenientCompletionEvidence: true } : {}),
@@ -542,6 +548,13 @@ export function bridgeCoreTurnToAcp(
             if (delta.length > 0) reasoningThoughts.flush();
             streamedTextSum += delta;
             void turnCtx.push(delta);
+          },
+          onReplaceText: (full) => {
+            reasoningThoughts.flush();
+            streamedTextSum = full;
+            // Match the existing ACP clear/replace convention used for final synthesis.
+            void turnCtx.push('');
+            void turnCtx.push(full);
           },
           // P2-bridge-ext — forward tool + usage events as ACP
           // sessionUpdate notifications so extension-aware clients

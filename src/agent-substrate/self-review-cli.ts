@@ -20,7 +20,7 @@ import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, reviewIntentFingerprint, safeLogText } from './review-observation.js';
-import { checkCitedReviewPathsAtHead, citedReviewPaths } from './review-finding-key.js';
+import { checkCitedReviewPathsAtHead, citedReviewPaths, reviewFindingKey } from './review-finding-key.js';
 import { DEFAULT_REVIEW_BACKEND, defaultAcpReviewTimeoutSec } from './acp-reviewer.js';
 import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
 import { debug } from '../debug/log.js';
@@ -179,8 +179,88 @@ export interface SelfReviewCliOutcome {
 
 interface SavedReviewEvidence {
   heads: string[];
-  records: Array<{ head: string; reviewedAt: number }>;
+  records: Array<{ head: string; reviewedAt: number; model?: string }>;
+  loopRounds: Array<{ head: string; reviewedAt: number; state: 'clear' | 'stale-reopen' }>;
+  fixedFindings: string[];
+  priorFindings: string[];
   unreadableFiles: string[];
+}
+
+export interface ReviewLoopBreakerAssessment {
+  state: 'clear' | 'stale-reopen';
+  staleFindings: Array<{ finding: string; reason: 'fixed-finding-reopened' | 'author-test-evidence' }>;
+}
+
+export function assessReviewLoopBreaker(input: {
+  priorFindings: string[];
+  previouslyFixedFindings?: string[];
+  deltaFindings: Array<{ finding: string; status: 'fixed' | 'open' }>;
+  currentFindings: string[];
+  changedFiles: string[];
+}): ReviewLoopBreakerAssessment {
+  const changedTestFiles = new Set(input.changedFiles.filter((file) => /\.test\.[cm]?[jt]sx?$/i.test(file)));
+  const staleFindings: ReviewLoopBreakerAssessment['staleFindings'] = [];
+  const add = (finding: string, reason: ReviewLoopBreakerAssessment['staleFindings'][number]['reason']) => {
+    if (!staleFindings.some((entry) => reviewFindingKey(entry.finding).key === reviewFindingKey(finding).key)) staleFindings.push({ finding, reason });
+  };
+  for (const fixed of input.deltaFindings.filter((entry) => entry.status === 'fixed')) {
+    if (input.currentFindings.some((current) => reviewFindingKey(current).key === reviewFindingKey(fixed.finding).key)) {
+      add(fixed.finding, 'fixed-finding-reopened');
+    }
+  }
+  for (const fixed of input.previouslyFixedFindings ?? []) {
+    if (input.currentFindings.some((current) => reviewFindingKey(current).key === reviewFindingKey(fixed).key)) {
+      add(fixed, 'fixed-finding-reopened');
+    }
+  }
+  for (const prior of input.priorFindings) {
+    const priorPaths = new Set(citedReviewPaths(prior));
+    for (const current of input.currentFindings) {
+      const sameFinding = reviewFindingKey(prior).key === reviewFindingKey(current).key
+        || citedReviewPaths(current).some((path) => priorPaths.has(path));
+      if (!sameFinding) continue;
+      const citedChangedTest = [...changedTestFiles].some((file) => {
+        const escapedFile = file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp('(?:^|[\\s`])' + escapedFile + ':\\d+(?::\\d+)?(?:\\b|[`),.;])').test(current);
+      });
+      if (citedChangedTest) add(current, 'author-test-evidence');
+    }
+  }
+  return { state: staleFindings.length ? 'stale-reopen' : 'clear', staleFindings };
+}
+
+function trailingStaleReopenRounds(rounds: SavedReviewEvidence['loopRounds']): number {
+  let count = 0;
+  for (const round of [...rounds].sort((a, b) => a.reviewedAt - b.reviewedAt).reverse()) {
+    if (round.state !== 'stale-reopen') break;
+    count++;
+  }
+  return count;
+}
+
+function savedFindingList(value: unknown): string[] {
+  const values = Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
+  return values.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0);
+}
+
+function reviewLoopBreakerLockPath(pr: string, root = effectiveInstanceRoot()): string {
+  return join(root, 'review-results', `review-loop-breaker-${pr}.json`);
+}
+
+function readReviewLoopBreakerLock(pr: string, root = effectiveInstanceRoot()): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(readFileSync(reviewLoopBreakerLockPath(pr, root), 'utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    return record.pr === pr && typeof record.head === 'string' && COMMIT_OID.test(record.head)
+      && record.state === 'waiver-needed' ? record : undefined;
+  } catch { return undefined; }
+}
+
+function writeReviewLoopBreakerLock(pr: string, head: string, reason: string, root = effectiveInstanceRoot()): void {
+  const path = reviewLoopBreakerLockPath(pr, root);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ pr, head, state: 'waiver-needed', reason, writtenAt: Date.now() }) + '\n');
 }
 
 interface SavedReviewForDelta {
@@ -304,10 +384,13 @@ function savedReviewEvidence(
 ): SavedReviewEvidence {
   const dir = join(root, 'review-results');
   let names: string[];
-  try { names = readdirSync(dir); } catch { return { heads: [], records: [], unreadableFiles: [] }; }
+  try { names = readdirSync(dir); } catch { return { heads: [], records: [], loopRounds: [], fixedFindings: [], priorFindings: [], unreadableFiles: [] }; }
   const escapedPr = pr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const matchingPrInName = new RegExp(`(?:^|-)${escapedPr}(?:-|\\.json$)`, 'i');
-  const records = new Map<string, { head: string; reviewedAt: number }>();
+  const records = new Map<string, { head: string; reviewedAt: number; model?: string }>();
+  const loopRounds = new Map<string, { head: string; reviewedAt: number; state: 'clear' | 'stale-reopen' }>();
+  const fixedFindings = new Map<string, string>();
+  let latestFindings: { reviewedAt: number; findings: string[] } | undefined;
   const unreadableFiles: string[] = [];
   for (const name of names) {
     if (!name.toLowerCase().endsWith('.json')) continue;
@@ -338,16 +421,40 @@ function savedReviewEvidence(
       const recordPath = join(dir, name);
       const reviewedAt = typeof result.reviewedAt === 'number' && Number.isFinite(result.reviewedAt)
         ? result.reviewedAt : statSync(recordPath).mtimeMs;
+      const findings = savedFindingList(result.mustFix);
+      if (!latestFindings || reviewedAt > latestFindings.reviewedAt) latestFindings = { reviewedAt, findings };
       const normalized = head.toLowerCase();
+      const model = [result.model, result.respondedModel, result.requestedModel]
+        .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
       const existing = records.get(normalized);
-      if (!existing || reviewedAt > existing.reviewedAt) records.set(normalized, { head: normalized, reviewedAt });
+      if (!existing || reviewedAt > existing.reviewedAt) records.set(normalized, { head: normalized, reviewedAt, ...(model ? { model } : {}) });
+      const loopBreaker = result.loopBreaker;
+      if (loopBreaker && typeof loopBreaker === 'object' && !Array.isArray(loopBreaker)) {
+        const loopRecord = loopBreaker as Record<string, unknown>;
+        const state = loopRecord.state;
+        if (Array.isArray(loopRecord.fixedFindings)) for (const finding of loopRecord.fixedFindings) {
+          if (typeof finding === 'string' && finding.trim()) fixedFindings.set(reviewFindingKey(finding).key, finding);
+        }
+        if (state === 'clear' || state === 'stale-reopen') {
+          const prior = loopRounds.get(normalized);
+          if (!prior || reviewedAt > prior.reviewedAt) loopRounds.set(normalized, { head: normalized, reviewedAt, state });
+        }
+      }
+      if (Array.isArray(result.deltaFindings)) for (const entry of result.deltaFindings) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        const delta = entry as Record<string, unknown>;
+        if (delta.status === 'fixed' && typeof delta.finding === 'string' && delta.finding.trim()) {
+          fixedFindings.set(reviewFindingKey(delta.finding).key, delta.finding);
+        }
+      }
     } catch {
       // A filename can associate an unreadable record with this PR; fail closed at the cap.
       if (nameSuggestsPr) { unreadableFiles.push(name); onUnreadable?.(name); }
     }
   }
   const saved = [...records.values()];
-  return { heads: saved.map(({ head }) => head), records: saved, unreadableFiles };
+  return { heads: saved.map(({ head }) => head), records: saved, loopRounds: [...loopRounds.values()],
+    fixedFindings: [...fixedFindings.values()], priorFindings: latestFindings?.findings ?? [], unreadableFiles };
 }
 
 export function savedReviewHeads(pr: string, root = effectiveInstanceRoot()): string[] {
@@ -1980,23 +2087,28 @@ async function runSelfReviewCliCommandPinned(
     const shouldPersistCapResult = previousRoundCount >= 5 && !opts.reviewerMixPrimaryLane;
     const reason = opts.overCapReason?.trim();
     const authorization = previousRoundCount >= 5 ? readCapOverride(pr) : undefined;
+    const capPreflightHead = previousRoundCount >= 5 ? prHeadCommit(pr, deps).value.toLowerCase() : undefined;
     deps.observeDoctorReview?.('round-counted', { pr, previousRoundCount, round: previousRoundCount + 1 });
     const opAllowed = previousRoundCount >= 5 && opAllowsReviewOverCap(pr);
     if (previousRoundCount >= 5) {
       deps.observeDoctorReview?.('cap-attempt', { pr, previousRoundCount, round: previousRoundCount + 1, reasonProvided: Boolean(reason), opAllowed }, { level: 'warn' });
     }
     if (previousRoundCount >= 5 && (!opAllowed || (!authorization && !reason && !opts.reviewerMixCapClaimed))) {
-      const refusalHead = prHeadCommit(pr, deps).value;
+      const refusalHead = capPreflightHead ?? prHeadCommit(pr, deps).value;
+      if (COMMIT_OID.test(refusalHead)) writeReviewLoopBreakerLock(pr, refusalHead, 'review-cap-exceeded');
       const message = !opAllowed
         ? `PR ${pr}: r5 상한 초과 리뷰는 OP traffic.json reviewOverCapAllow 허용 목록에 있어야 합니다.`
         : `PR ${pr}: 저장된 서로 다른 head 리뷰 ${previousRoundCount}개로 r5 상한에 도달했습니다. OP 허용 상태와 --over-cap-reason <사유>가 필요합니다.`;
-      deps.observeDoctorReview?.('cap-refused', { pr, head: refusalHead, previousRoundCount, round: previousRoundCount + 1, reason: opAllowed ? 'missing-reason' : 'not-op-allowlisted' }, { level: 'warn' });
+      deps.observeDoctorReview?.('cap-refused', { pr, head: refusalHead, previousRoundCount, round: previousRoundCount + 1,
+        reason: opAllowed ? 'missing-reason' : 'not-op-allowlisted' }, { level: 'warn' });
+      deps.log('review.loop-breaker', { pr, head: refusalHead, state: 'waiver-needed', reason: 'review-cap-exceeded', previousRoundCount }, { level: 'warn' });
       if (opts.sinceReview !== undefined) deps.log('review.delta-heal', {
         pr, cause: 'cap-refused', prescription: 'retain-explicit-refusal', result: 'refused', headCommit: refusalHead,
       }, { level: 'warn' });
       deps.error(message);
-      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused',
-        ...(opts.sinceReview !== undefined ? { verdict: null, deltaOutcome: 'refused', deltaRefusal: 'cap-refused' } : {}),
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'waiver-needed', failureReason: 'waiver-needed',
+        loopBreaker: { state: 'waiver-needed', reason: 'review-cap-exceeded' },
+        ...(opts.sinceReview !== undefined ? { verdict: null, deltaOutcome: 'refused', deltaRefusal: 'waiver-needed' } : {}),
         previousRoundCount, headCommit: refusalHead });
       failed += 1;
       continue;
@@ -2042,6 +2154,17 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     const diffRead = diffResult.read;
+    const loopLock = readReviewLoopBreakerLock(pr);
+    if (loopLock) {
+      const message = `PR ${pr}: 반복 리뷰 중단 (${String(loopLock.reason ?? 'waiver-needed')}); OP 웨이버가 필요합니다.`;
+      deps.observeDoctorReview?.('loop-breaker', { pr, head: diffRead.headCommit, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
+      deps.log('review.loop-breaker', { pr, head: diffRead.headCommit, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
+      if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,
+        refusal: 'waiver-needed', failureReason: 'waiver-needed', loopBreaker: { state: 'waiver-needed', reason: loopLock.reason }, headCommit: diffRead.headCommit });
+      else deps.error(message);
+      failed += 1;
+      continue;
+    }
     const canonicalResultPath = COMMIT_OID.test(diffRead.headCommit)
       ? join(effectiveInstanceRoot(), 'review-results', `pr-${pr}-${diffRead.headCommit.slice(0, 12)}.json`)
       : undefined;
@@ -2073,7 +2196,8 @@ async function runSelfReviewCliCommandPinned(
       failed += 1;
       continue;
     }
-    if (previousRoundCount >= 5 && authorization && diffRead.headCommit.toLowerCase() === authorization.head && !opts.reviewerMixCapClaimed) {
+    if (previousRoundCount >= 5 && authorization && diffRead.headCommit.toLowerCase() === authorization.head
+      && !opts.reviewerMixCapClaimed) {
       const resultExists = canonicalResultPath && existsSync(canonicalResultPath);
       const message = resultExists
         ? `PR ${pr}: 동일 head 리뷰 결과가 이미 저장되어 있습니다: ${canonicalResultPath}`
@@ -2169,7 +2293,8 @@ async function runSelfReviewCliCommandPinned(
       diffRead.diff = delta;
       diffRead.baseCommit = mergeOnlyDeltaRange.base;
     }
-    if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed && !claimCapOverride(pr, diffRead.headCommit, authorization.reason, deps.now())) {
+    if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed
+      && !claimCapOverride(pr, diffRead.headCommit, authorization.reason, deps.now())) {
       const message = `PR ${pr}: 후속 head 승인 사용 기록을 남기지 못했습니다.`;
       deps.error(message);
       if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-refused', previousRoundCount, headCommit: diffRead.headCommit });
@@ -2554,6 +2679,9 @@ async function runSelfReviewCliCommandPinned(
     }
     const reviewDurationMs = Math.max(0, deps.now() - startedAt);
     let deltaReceipt: Record<string, unknown> = {};
+    let deltaFindingsForLoop: Array<{ finding: string; status: 'fixed' | 'open' }> = [];
+    // An unreviewed failure has no loop-breaker assessment; do not report a false `clear` round.
+    let loopBreakerOutput: Record<string, unknown> = {};
     if (deltaBase) {
       const assessed = assessDeltaReview(review, deltaBase);
       const inputRatio = reviewInputChars / deltaBase.reviewInputChars;
@@ -2576,11 +2704,48 @@ async function runSelfReviewCliCommandPinned(
           deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency,
           deltaOutcome: 'refused', deltaRefusal: assessed.reason };
       } else {
+        deltaFindingsForLoop = assessed.deltaFindings;
         review = { ...review, reviewed: true, verdict: assessed.mustFix.length ? 'fail' : 'pass',
           mustFix: assessed.mustFix, shouldFix: [] };
         deltaReceipt = { basedOn: deltaBase.headCommit, basedOnReview: deltaBase.file,
           deltaFindings: assessed.deltaFindings, excludedNewFindings: assessed.excludedNewFindings,
           deltaInputChars: reviewInputChars, deltaDurationMs: reviewDurationMs, deltaEfficiency, deltaOutcome: 'reviewed' };
+      }
+    }
+    if (review.reviewed === true) {
+      const loopAssessment = assessReviewLoopBreaker({
+        priorFindings: deltaBase?.mustFix ?? savedEvidence.priorFindings,
+        previouslyFixedFindings: savedEvidence.fixedFindings,
+        deltaFindings: deltaFindingsForLoop,
+        currentFindings: review.mustFix,
+        changedFiles: diffFilePaths(diffRead.diff.stdout),
+      });
+      const priorStreak = trailingStaleReopenRounds(savedEvidence.loopRounds);
+      const nextStreak = loopAssessment.state === 'stale-reopen' ? priorStreak + 1 : 0;
+      const fixedFindings = [...new Map([...savedEvidence.fixedFindings,
+        ...deltaFindingsForLoop.filter((entry) => entry.status === 'fixed').map((entry) => entry.finding)]
+      .map((finding) => [reviewFindingKey(finding).key, finding])).values()];
+      let loopState: 'clear' | 'stale-reopen' | 'waiver-needed' = loopAssessment.state;
+      let loopReason: string | undefined;
+      if (nextStreak >= 2) {
+        loopReason = 'two-consecutive-stale-reopen-rounds';
+        writeReviewLoopBreakerLock(pr, diffRead.headCommit, loopReason);
+        review = { ...review, reviewed: false, verdict: 'fail', failureReason: 'waiver-needed' };
+        loopState = 'waiver-needed';
+        if (deltaBase) deltaReceipt = { ...deltaReceipt, deltaOutcome: 'refused', deltaRefusal: 'waiver-needed' };
+      }
+      loopBreakerOutput = { loopBreaker: { state: loopState, fixedFindings,
+        ...(loopReason ? { reason: loopReason } : {}),
+        ...(loopAssessment.staleFindings.length ? { staleFindings: loopAssessment.staleFindings } : {}),
+        staleReopenRounds: nextStreak } };
+      if (loopState !== 'clear' || deltaBase || fixedFindings.length) {
+        deps.observeDoctorReview?.('loop-breaker', { pr, head: diffRead.headCommit, state: loopState,
+          ...(loopReason ? { reason: loopReason } : {}), staleReopenRounds: nextStreak,
+          staleFindingCount: loopAssessment.staleFindings.length });
+        deps.log('review.loop-breaker', { pr, head: diffRead.headCommit, state: loopState,
+          ...(loopReason ? { reason: loopReason } : {}), staleReopenRounds: nextStreak,
+          staleFindingCount: loopAssessment.staleFindings.length },
+        { level: loopState === 'clear' ? 'info' : 'warn' });
       }
     }
     reviewPin?.remove();
@@ -2727,7 +2892,7 @@ async function runSelfReviewCliCommandPinned(
       ...(deltaBase ? {} : { deltaOutcome: review.reviewed === true && landingGateAdmitted ? 'healed-full-review' : 'refused' }),
       deltaHeal: { ...deltaHeal, result: deltaHealResult },
     } : {};
-    const resultOutput = { pr, model: selectedModel, ...jsonReview, reviewInputChars, reviewDurationMs,
+    const resultOutput = { pr, model: selectedModel, ...jsonReview, ...loopBreakerOutput, reviewInputChars, reviewDurationMs,
       ...(deltaBase ? deltaReceipt : {}), ...deltaHealOutput, ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
       ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields,
       findingPathHeadChecks, pathWarnings, evidence: evidence.evidence, prDiffFiles: evidence.prDiffFiles,

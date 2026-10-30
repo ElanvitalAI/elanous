@@ -3,6 +3,8 @@ import * as harnessSkillExec from '../harness/skill-exec.js';
 import { invokeResearch } from '../research-bridge/invoke.js';
 import * as skillIndex from '../skills/index.js';
 import type { SkillIndexEntry } from '../skills/index.js';
+import { dirname } from 'node:path';
+import { resolveSkillName } from '../skills/name-match.js';
 import { getUserConfig } from '../user-config.js';
 import type { LLMToolSpec } from '../llm.js';
 import type { ToolRuntime } from './types.js';
@@ -17,7 +19,7 @@ export interface SkillExecRunOptions {
 }
 
 export interface SkillExecArgs {
-  /** Exact name of the skill to execute. */
+  /** Installed skill name; spaces/punctuation may be omitted if the match is unique. */
   skill: string;
   /** Task text passed verbatim to the named skill. */
   task: string;
@@ -33,6 +35,8 @@ export interface SkillExecResult extends Record<string, unknown> {
 
 export interface SkillExecDiscoveryDeps {
   discoverPlugin?: (gap: string, deps?: { signal?: AbortSignal }) => Promise<{ card: string }>;
+  /** Test seam for the bounded plugin-discovery follow-up. */
+  discoveryTimeoutMs?: number;
 }
 
 export type SkillExecIndexProvider = () => readonly SkillIndexEntry[];
@@ -71,13 +75,13 @@ function obtainSkillIndex(): readonly SkillIndexEntry[] {
 export function buildSkillExecTool(): LLMToolSpec {
   return {
     name: 'skill_exec',
-    description: 'Execute one explicitly named allowlisted skill with the supplied task. If you do not know the exact skill name, call elanous_skills_list first. Does not infer a skill name.',
+    description: 'Execute one explicitly named allowlisted skill with the supplied task. Names may omit spaces or punctuation (for example, "krflow" resolves to "kr-flow") only when the installed match is unique. Call elanous_skills_list when uncertain.',
     parameters: {
       type: 'object',
       properties: {
         skill: {
           type: 'string',
-          description: 'Exact name of the skill to execute.',
+          description: 'Installed skill name; spaces and punctuation may be omitted when the match is unique.',
         },
         task: {
           type: 'string',
@@ -95,9 +99,19 @@ export async function dispatchSkillExec(
   deps: SkillExecDiscoveryDeps = {},
   options: SkillExecRunOptions = {},
 ): Promise<SkillExecResult> {
-  const { skill, task } = args;
+  const { skill: requestedSkill, task } = args;
+  if (requestedSkill !== requestedSkill.trim()) {
+    return { skill: requestedSkill, ok: false, output: REJECT_OUTPUT(requestedSkill) };
+  }
   const extra = getUserConfig().skillRouter.harnessExecAllowlist;
   const index = obtainSkillIndex();
+  const resolution = resolveSkillName(requestedSkill, index);
+  const skill = resolution.entry?.name ?? requestedSkill;
+  if (resolution.ambiguous.length > 0) {
+    const candidates = resolution.ambiguous.map((entry) => entry.name).sort().join(', ');
+    return { skill: requestedSkill, ok: false, output: `스킬 이름이 여러 항목과 일치합니다: ${candidates}. elanous_skills_list에서 정확한 이름을 골라 다시 호출하세요.` };
+  }
+  const selected = resolution.entry;
   const allowlist = harnessSkillExec.resolveHarnessExecAllowlist(
     extra,
     (rejected, reason) => observe('allowlist-reject', { skill: rejected, reason }),
@@ -163,13 +177,18 @@ export async function dispatchSkillExec(
   let interruption: 'skill-exec-timeout' | 'skill-exec-cancelled' | undefined;
   try {
     const outcome = await Promise.race([
-      invokeResearch(task, { skill, signal: child.signal, onProgress: (delta) => {
-        progressChunks += 1;
-        progressBytes += delta.length;
-        if (progressChunks === 1 || progressChunks % 32 === 0) {
-          observe('progress', { skill, progressChunks, progressBytes });
-        }
-      } }).then((value) => ({ result: value })),
+      invokeResearch(task, {
+        skill,
+        ...(selected ? { skillRootDir: dirname(selected.skillDir) } : {}),
+        signal: child.signal,
+        onProgress: (delta) => {
+          progressChunks += 1;
+          progressBytes += delta.length;
+          if (progressChunks === 1 || progressChunks % 32 === 0) {
+            observe('progress', { skill, progressChunks, progressBytes });
+          }
+        },
+      }).then((value) => ({ result: value })),
       interrupted.then((reason) => ({ interruption: reason })),
     ]);
     settled = true;
@@ -195,10 +214,11 @@ export async function dispatchSkillExec(
   // A low-quality research result is a capability gap. Keep the original failure,
   // and attach a bounded discovery card rather than silently switching tools.
   let discoveryCard: string | undefined;
-  if (!result.ok && /\b(?:no data|no evidence|missing|unavailable|not found|empty)\b|(?:자료가 없|데이터가 없|자료 부족|미확인|찾지 못)/i
+  const localSkillMissing = /not found under (?:~\/\.claude\/skills|\/)/i.test(result.error ?? '');
+  if (!result.ok && !localSkillMissing && /\b(?:no data|no evidence|missing|unavailable|not found|empty)\b|(?:자료가 없|데이터가 없|자료 부족|미확인|찾지 못)/i
     .test(`${result.output} ${result.error ?? ''}`)) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('plugin discovery time budget exhausted')), 10_000);
+    const timer = setTimeout(() => controller.abort(new Error('plugin discovery time budget exhausted')), deps.discoveryTimeoutMs ?? 10_000);
     try {
       const discovery = deps.discoverPlugin ?? (await import('../research/plugin-discovery.js')).discoverResearchPlugin;
       const found = await discovery(task, { signal: controller.signal });

@@ -27,33 +27,46 @@ const HINT = /한 번 더 누르면 나갑니다/;
 const ok = (reason: string): Verdict => ({ ok: true, reason });
 const no = (reason: string): Verdict => ({ ok: false, reason });
 
-/** The input row: the last screen line that starts with the prompt marker. */
-export function inputRow(screen: string): string | undefined {
-  return screen.split('\n').filter((line) => line.trimStart().startsWith('❯')).at(-1);
+/** The TUI draws panels with box/block borders (box drawing and block elements, U+2500–U+259F) — a judge must read
+ *  the same «content lines» whether a screen renders a plain list or a bordered panel (0.2.41 incident:
+ *  R6 warned on the healthy «│Keys …│» screen). Border characters become spaces, so a line keeps its
+ *  own indentation, and a line left with nothing but whitespace was the frame itself and is dropped. */
+export function contentLines(screen: string): string[] {
+  return screen
+    .split('\n')
+    .map((line) => line.replace(/[\u2500-\u259F]/g, ' '))
+    .filter((line) => line.trim().length > 0);
 }
 
-/** Palette entries visible after typing a slash prefix (lines other than the input row that show `/name`). */
+/** The input row: the last content line that starts with the prompt marker. */
+export function inputRow(screen: string): string | undefined {
+  return contentLines(screen).filter((line) => line.trimStart().startsWith('❯')).at(-1);
+}
+
+/** Palette entries visible after typing a slash prefix (content lines other than the input row that show `/name`). */
 export function paletteHas(screen: string, name: string): boolean {
+  const lines = contentLines(screen);
   const row = inputRow(screen);
-  return screen.split('\n').some((line) => line !== row && line.includes(`/${name}`));
+  return lines.some((line) => line !== row && line.includes(`/${name}`));
 }
 
 export function judgeFirstScreen(screen: string): Verdict {
-  if (/Step 1/.test(screen)) return no('«Step 1» 마법사가 떴다');
+  const lines = contentLines(screen);
+  if (lines.some((line) => /Step 1/.test(line))) return no('«Step 1» 마법사가 떴다');
   if (!inputRow(screen)) return no('입력칸 «❯» 가 없다');
   return ok('입력칸이 보이고 «Step 1» 이 없다');
 }
 
 export function judgeHintAppearsThenClears(armed: string, later: string): Verdict {
-  if (!HINT.test(armed)) return no('빈 입력 Ctrl+C 뒤 안내가 안 보인다');
-  if (HINT.test(later)) return no('2.6초 뒤에도 안내가 남아 있다');
+  if (!contentLines(armed).some((line) => HINT.test(line))) return no('빈 입력 Ctrl+C 뒤 안내가 안 보인다');
+  if (contentLines(later).some((line) => HINT.test(line))) return no('2.6초 뒤에도 안내가 남아 있다');
   return ok('안내가 떴다가 2초 뒤 사라졌다');
 }
 
 export function judgeCtrlCClearsText(typed: string, after: string, text: string): Verdict {
   if (!(inputRow(typed) ?? '').includes(text)) return no('친 글이 입력칸에 안 보인다(준비 실패)');
   if ((inputRow(after) ?? '').includes(text)) return no('Ctrl+C 뒤에도 글이 남아 있다');
-  if (HINT.test(after)) return no('글을 지우는 Ctrl+C 에 나가기 안내가 떴다');
+  if (contentLines(after).some((line) => HINT.test(line))) return no('글을 지우는 Ctrl+C 에 나가기 안내가 떴다');
   return ok('글이 지워지고 안내는 없다');
 }
 
@@ -67,11 +80,18 @@ export function judgePalette(screens: Record<string, string>, expectations: Reco
 }
 
 /** U1b — the help is drawn (key section ⊕ a run of command rows) and the prompt survives below it.
- *  Not «the whole grid fits»: an owner sees 60+ commands, which exceed a 50-row screen and scroll (PgUp). */
+ *  Not «the whole grid fits»: an owner sees 60+ commands, which exceed a 50-row screen and scroll (PgUp).
+ *  Border-agnostic (0.2.41 R6 오탐): judged on content lines, so the bordered «│Keys …│» panel reads
+ *  like the plain list. */
 export function judgeHelpShown(screen: string): Verdict {
-  const lines = screen.split('\n');
-  const commandRows = lines.filter((line) => /^\s+\/[a-z][a-z-]*/.test(line)).length;
-  if (!lines.some((line) => /^\s*Keys\s*$/.test(line))) return no('/help 의 Keys 절이 안 보인다');
+  const lines = contentLines(screen);
+  const commandsAt = lines.findIndex((line) => /^\s*Commands\s*$/.test(line));
+  const keysAt = lines.findIndex((line) => /^\s*Keys\s*$/.test(line));
+  if (commandsAt < 0) return no('/help 의 Commands 절이 안 보인다');
+  if (keysAt <= commandsAt) return no('/help 의 Keys 절이 안 보인다');
+  // Count command-bearing rows only within the panel section; commands may be in either column.
+  const commandRows = lines.slice(commandsAt + 1, keysAt)
+    .filter((line) => /(?:^|\s)\/[a-z][a-z-]*(?=\s|$)/.test(line)).length;
   if (commandRows < 10) return no(`명령 줄이 ${commandRows}개뿐이다`);
   if (!inputRow(screen)) return no('도움말을 연 뒤 입력칸이 화면 밖으로 밀렸다');
   return ok(`도움말이 그려졌다(명령 줄 ${commandRows} · Keys 절 · 입력칸 유지)`);
@@ -79,7 +99,7 @@ export function judgeHelpShown(screen: string): Verdict {
 
 /** U1c2 — lines typed while a reply streams show up as «my» lines, in order, each above its own answer. */
 export function judgeQueuedEcho(screen: string): Verdict {
-  const lines = screen.split('\n');
+  const lines = contentLines(screen);
   const at = (re: RegExp, after = -1) => lines.findIndex((line, i) => i > after && re.test(line));
   const u2 = at(/Q2MARK 라고만/);
   if (u2 < 0) return no('줄 서 있던 «Q2MARK 라고만» 이 내 말로 안 보인다');

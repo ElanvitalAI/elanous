@@ -9,6 +9,7 @@ import { useGraphHistory } from './use-graph-history';
 import { NexusApiError, type GraphKindEntry } from '@/nexus/client';
 import { RUN_NODE_WIDTH, runGraphToFlow, type RunGraphNodeData } from '@/lib/run-graph-flow';
 import { TIDY_EDGE_TYPES } from './TidyEdge';
+import { RunGraphShowcase } from './RunGraphShowcase';
 import {
   CORE_GRAPH_KINDS,
   addRunGraphEdge,
@@ -95,6 +96,8 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId, onNewGrap
   const [saveError, setSaveError] = useState<string | null>(null);
   const [ignoredKeys, setIgnoredKeys] = useState<string[]>([]);
   const [validationError, setValidationError] = useState<string | null>(null);
+  // DEMO-GRAPH-LIVE-SHOWCASE — 명시적 쇼케이스 진입/복귀. 진입해도 편집 상태(YAML 초안·undo 스택·선택 노드)는 컴포넌트 트리 안에 그대로 남는다.
+  const [showcase, setShowcase] = useState(false);
   const history = useGraphHistory();
   const list = useQuery({ queryKey: ['run-graphs'], queryFn: () => client.getRunGraphs() });
   const kinds = useQuery({
@@ -234,7 +237,15 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId, onNewGrap
         ))}</ul>
       </aside>
       <section className="relative flex min-w-0 flex-1 flex-col bg-surface" aria-label="실행 그래프 캔버스">
+        {showcase ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <RunGraphShowcase onExit={() => setShowcase(false)} />
+          </div>
+        ) : (
+        <>
         <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
+          <button type="button" data-testid="showcase-toggle" onClick={() => setShowcase(true)}
+            className="rounded border border-border px-2 py-1 text-xs">쇼케이스</button>
           {summary && !summary.editable && (
             <button type="button" onClick={() => clone.mutate()} disabled={clone.isPending}
               className="rounded border border-border px-2 py-1 text-xs">복제해서 고치기</button>
@@ -323,6 +334,8 @@ export function RunGraphView({ palette: sharedPalette, initialGraphId, onNewGrap
             <Background />
             <Controls showInteractive={false} />
           </ReactFlow>
+        )}
+        </>
         )}
       </section>
     </div>

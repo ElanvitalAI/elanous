@@ -6,6 +6,8 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig } from '../user-config.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type RemoteRunOutcome } from '../self-implement/gate-remote.js';
+import { decideWarmReuse, type WarmReuseEvidenceByConsumer, type WarmReuseSwitchConfig } from '../task-orchestrator/surfaces/pod-warm-switch.js';
+import { buildLandWarmEvidence, type LandShadowSampleWindow } from './pr-land-pod-shadow-job.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
 // This is the stable fallback order when settings.host is unavailable; an explicitly configured allowlisted host
@@ -66,6 +68,10 @@ export interface HeavyRemoteDeps {
   /** Test seam — same cadence as self gate (`dispatchHeavyCheck`): sleep at most 15s while a host stays busy. */
   sleep?: (ms: number) => void;
   observe?: (event: string, data: Record<string, unknown>) => void;
+  /** WARM-REUSE-LAND-CONSUMER-WIRE — land warm 재사용 config seam(기본은 `getUserConfig().pod?.warmReuse`). */
+  warmReuseConfig?: () => WarmReuseSwitchConfig | undefined;
+  /** WARM-REUSE-LAND-CONSUMER-WIRE — land shadow Job 결과 창 seam(기본 없음 = 증거 없음 = off). */
+  landShadowSamples?: () => LandShadowSampleWindow | undefined;
 }
 
 function evidencePath(input: HeavyRemoteInput): string {
@@ -209,6 +215,32 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
   if (!Number.isSafeInteger(input.pr) || input.pr <= 0 || !SHA.test(input.head) || !SHA.test(input.main)) {
     return { ok: false, source: 'unmeasured', reason: 'invalid-pr-head-or-main', elapsedMs: 0, evidencePath: path };
   }
+  // WARM-REUSE-LAND-CONSUMER-WIRE — 무거운 착지 판정마다 land 소비자 판정을 1줄 남긴다(pod.warm/switch-decision).
+  // 판정은 그림자 전용이다: live 여부와 무관하게 원격 게이트는 기존(fresh) 경로를 그대로 간다.
+  // 증거는 land shadow Job 결과 창(주입 seam · 기본 없음=증거 없음=off)에서 만들고, 판정 실패는 착지를 깨지 않는다.
+  let warmConfig: WarmReuseSwitchConfig | undefined;
+  let warmEvidence: WarmReuseEvidenceByConsumer | undefined;
+  let warmStage: 'config' | 'evidence' = 'config';
+  try {
+    warmConfig = deps.warmReuseConfig?.() ?? getUserConfig().pod?.warmReuse;
+  } catch (error) {
+    debug.log('pod.warm', 'land-shadow-unavailable', {
+      pr: input.pr, stage: warmStage,
+      reason: `warm-${warmStage}-read-failed`,
+      detail: error instanceof Error ? error.message : String(error), execution: 'fresh-gate',
+    }, { level: 'warn' });
+  }
+  try {
+    warmStage = 'evidence';
+    warmEvidence = buildLandWarmEvidence(deps.landShadowSamples?.(), { head: input.head, main: input.main });
+  } catch (error) {
+    debug.log('pod.warm', 'land-shadow-unavailable', {
+      pr: input.pr, stage: warmStage, reason: 'warm-evidence-read-failed',
+      detail: error instanceof Error ? error.message : String(error), execution: 'fresh-gate',
+    }, { level: 'warn' });
+  }
+  // Read failures leave config/evidence absent, but every valid landing still emits one fail-closed decision.
+  decideWarmReuse('land', warmConfig, warmEvidence);
   // A cached success is still a landing claim; accept only a measured host in the landing allowlist.
   const settings = deps.settings ?? resolveGateRemoteSettings(getUserConfig().gateRemote);
   if (!allowedHost(settings.host)) {

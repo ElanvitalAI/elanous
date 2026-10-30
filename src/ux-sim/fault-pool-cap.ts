@@ -18,12 +18,14 @@ export interface PoolCapScenario {
   readonly spec: string;
   /** 멤버(컨텍스트)마다 지금 Running 인 하니스 Pod 수 — 멤버마다 «반드시» 준다(빠지면 0 으로 꾸미지 않고 던진다). */
   readonly running: Readonly<Record<string, number>>;
+  /** Query failures for a context stay unknown and suppress the admission recommendation. */
+  readonly queryFailures?: Readonly<Record<string, string>>;
 }
 
 export interface PoolCapObservation {
   readonly scenario: PoolCapScenario;
-  readonly members: ReadonlyArray<{ context: string; capacity: number; capacityDefaulted: boolean; running: number }>;
-  readonly recommendation: PoolLeaseRecommendation;
+  readonly members: ReadonlyArray<{ context: string; capacity: number; capacityDefaulted: boolean; running?: number; queryError?: string }>;
+  readonly recommendation: PoolLeaseRecommendation | null;
 }
 
 /** 메모리·CPU 가 넉넉한 노드 한 대 — 승인이 상한(capacity)으로만 갈리게 한다. */
@@ -48,10 +50,13 @@ export function simPoolCap(scenario: PoolCapScenario): PoolCapObservation {
   const parsed = parsePodPool(scenario.spec);
   const members = parsed.map((m) => ({
     context: m.context, capacity: m.capacity, capacityDefaulted: (m as { capacityDefaulted?: boolean }).capacityDefaulted === true,
-    running: runningOf(scenario, m.context),
+    ...(scenario.queryFailures?.[m.context]
+      ? { queryError: scenario.queryFailures[m.context] }
+      : { running: runningOf(scenario, m.context) }),
   }));
+  if (members.some((member) => member.queryError)) return { scenario, members, recommendation: null };
   const recommendation = recommendConcurrency(
-    { members: members.map((m) => roomyMember(m.context, m.capacity, m.capacityDefaulted, m.running)) },
+    { members: members.map((m) => roomyMember(m.context, m.capacity, m.capacityDefaulted, m.running!)) },
     { capacity: members.reduce((sum, m) => sum + m.capacity, 0), accounts: -1, perAccount: -1 },
   );
   return { scenario, members, recommendation };
@@ -74,8 +79,8 @@ export function renderPoolCap(rows: readonly PoolCapObservation[]): string[] {
   return [
     'pool-cap · `:N` 없는 멤버 = 기본 상한 2(capacityDefaulted)',
     ...rows.map((r) => {
-      const occ = r.members.map((m) => `${m.context} ${m.running}/${m.capacity}${m.capacityDefaulted ? '(기본)' : ''}`).join(' · ');
-      return `  ${r.scenario.spec.padEnd(36)} ${occ.padEnd(40)} → 승인 ${String(r.recommendation.recommended)} · limitedBy=${String(r.recommendation.limitedBy)}`;
+      const occ = r.members.map((m) => `${m.context} ${m.running === undefined ? 'unknown' : m.running}/${m.capacity}${m.capacityDefaulted ? '(기본)' : ''}${m.queryError ? ` query-error=${m.queryError}` : ''}`).join(' · ');
+      return `  ${r.scenario.spec.padEnd(36)} ${occ.padEnd(40)} → 승인 ${String(r.recommendation?.recommended ?? 'unknown')} · limitedBy=${String(r.recommendation?.limitedBy ?? 'unknown')}`;
     }),
   ];
 }

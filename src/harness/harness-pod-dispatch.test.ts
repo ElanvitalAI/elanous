@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
-import { dispatchHarnessOnPod, podOrchestrateArgs, resolveHarnessPodPool } from './harness-pod-dispatch.js';
+import { classifyPodDispatchSignalSource, dispatchHarnessOnPod, podOrchestrateArgs, resolveHarnessPodPool } from './harness-pod-dispatch.js';
 import { installTuiStderrOwner } from '../surface/tui-stderr-owner.js';
 import { podMemoryLimitFor } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
@@ -26,6 +26,92 @@ function matchDefaultPodSource(root: string): string {
 }
 
 describe('harness say/ask --substrate pod', () => {
+  test('same status 143 distinguishes requested parent forwarding from the local orchestrator signal', () => {
+    const forwarded = { status: 143, parentSignalReceived: 'SIGTERM' as const, parentSignalReceivedAt: '2026-10-29T00:00:00.000Z', signalDelivery: 'requested' as const, orchestratorProcessSignal: null };
+    const local = { status: 143, parentSignalReceived: null, parentSignalReceivedAt: null, signalDelivery: null, orchestratorProcessSignal: 'SIGTERM' as const };
+    const failedForward = { status: 143, parentSignalReceived: 'SIGTERM' as const, parentSignalReceivedAt: '2026-10-29T00:00:00.000Z', signalDelivery: 'child-not-running' as const, orchestratorProcessSignal: null };
+    expect(classifyPodDispatchSignalSource(forwarded)).toBe('parent-signal-forward-requested');
+    expect(classifyPodDispatchSignalSource(local)).toBe('orchestrator-process-signaled');
+    expect(classifyPodDispatchSignalSource(failedForward)).toBe('unknown-143');
+    expect(classifyPodDispatchSignalSource({ status: 143, parentSignalReceived: null, signalDelivery: null, orchestratorProcessSignal: null })).toBe('unknown-143');
+    expect(classifyPodDispatchSignalSource({ status: 130, parentSignalReceived: null, signalDelivery: null, orchestratorProcessSignal: null })).toBe('unknown-signal-exit');
+    expect(classifyPodDispatchSignalSource({ status: null, parentSignalReceived: null, signalDelivery: null, orchestratorProcessSignal: null })).toBe('unknown-signal-exit');
+  });
+
+  test('dispatch exit observation logs signal receipt, delivery attempt and local process signal independently', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'goal' }, {
+        run: () => ({ status: 143, parentSignalReceived: 'SIGTERM', parentSignalReceivedAt: '2026-10-29T00:00:00.000Z', signalDelivery: 'requested', orchestratorProcessSignal: null, observedAt: '2026-10-29T00:00:00.250Z' }),
+      });
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'dispatch-pod-exit', expect.objectContaining({
+        status: 143, parentSignalReceived: 'SIGTERM', signalDelivery: 'requested', orchestratorProcessSignal: null,
+        parentSignalReceivedAt: '2026-10-29T00:00:00.000Z',
+        observedAt: '2026-10-29T00:00:00.250Z', signalSource: 'parent-signal-forward-requested',
+      }));
+    } finally { log.mockRestore(); }
+  });
+
+  test('real child process records parent signal receipt separately from the local close signal', async () => {
+    const priorListeners = new Set(process.listeners('SIGTERM'));
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'harness.substrate' && event === 'dispatch-pod-exit') events.push(data as Record<string, unknown>);
+    }) as typeof debug.log);
+    try {
+      const spawnChild = ((...args: Parameters<typeof spawn>) => spawn(process.execPath, ['-e', "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)"], args[2])) as typeof spawn;
+      const pending = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'real child' }, { spawnChild });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const listener = process.listeners('SIGTERM').find((candidate) => !priorListeners.has(candidate));
+      expect(listener).toBeDefined();
+      (listener as () => void)();
+      expect(await pending).toBe(0);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ parentSignalReceived: 'SIGTERM', signalDelivery: 'requested', orchestratorProcessSignal: null, signalSource: 'parent-signal-forward-requested' });
+      expect(typeof events[0]?.parentSignalReceivedAt).toBe('string');
+      expect(typeof events[0]?.observedAt).toBe('string');
+    } finally { log.mockRestore(); }
+  });
+
+  test('repeated parent signals retain first receipt and the latest signal delivery pair', async () => {
+    const priorTerm = new Set(process.listeners('SIGTERM'));
+    const priorInt = new Set(process.listeners('SIGINT'));
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'harness.substrate' && event === 'dispatch-pod-exit') events.push(data as Record<string, unknown>);
+    }) as typeof debug.log);
+    try {
+      const spawnChild = ((...args: Parameters<typeof spawn>) => spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); process.on('SIGINT', () => process.exit(0)); setInterval(() => {}, 1000)"], args[2])) as typeof spawn;
+      const pending = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'repeated signal' }, { spawnChild });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const termListener = process.listeners('SIGTERM').find((candidate) => !priorTerm.has(candidate));
+      const intListener = process.listeners('SIGINT').find((candidate) => !priorInt.has(candidate));
+      expect(termListener).toBeDefined();
+      expect(intListener).toBeDefined();
+      (termListener as () => void)();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      (intListener as () => void)();
+      expect(await pending).toBe(0);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ parentSignalReceived: 'SIGTERM', parentSignalLastReceived: 'SIGINT', signalDelivery: 'requested', signalDeliveryFor: 'SIGINT' });
+      expect(Date.parse(String(events[0]?.parentSignalReceivedAt))).toBeLessThanOrEqual(Date.parse(String(events[0]?.parentSignalLastReceivedAt)));
+      expect(events[0]?.signalSource).toBe('parent-signal-forward-requested');
+    } finally { log.mockRestore(); }
+  });
+
+  test('real child self-termination is identified as the local orchestrator process signal', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'harness.substrate' && event === 'dispatch-pod-exit') events.push(data as Record<string, unknown>);
+    }) as typeof debug.log);
+    try {
+      const spawnChild = ((...args: Parameters<typeof spawn>) => spawn(process.execPath, ['-e', "process.kill(process.pid, 'SIGTERM')"], args[2])) as typeof spawn;
+      const result = await dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'self terminate' }, { spawnChild });
+      expect(result).toBe(143);
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({ parentSignalReceived: null, signalDelivery: null, orchestratorProcessSignal: 'SIGTERM', signalSource: 'orchestrator-process-signaled' });
+    } finally { log.mockRestore(); }
+  });
   test('TA source request and GOAL must carry three completion lines before Pod child spawn', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-ta-boundary-'));
     const goal = join(root, 'GOAL-ta-boundary.md');

@@ -19,7 +19,7 @@
 
 import { getGrokApiKey } from '../config.js';
 import { grokAgentSearch, GROK_SEARCH_MODEL, type GrokAgentSearchOpts } from '../grok/agent-search.js';
-import { peekGrokCredential, resolveFreshGrokCredential } from '../grok/credential.js';
+import { peekGrokCredential } from '../grok/credential.js';
 import { wantsXSearch } from './x-intent.js';
 import type { WebSearchHit, WebSearchProvider, WebSearchResult } from './provider.js';
 
@@ -34,15 +34,11 @@ export function buildGrokWebSearchProvider(opts: { id?: string } = {}): WebSearc
     () => !!getGrokApiKey(), () => ({}));
 }
 
-/** Subscription search uses the proven cli-chat-proxy /responses route. No API-key fallback. */
+/** Search prefers the metered xAI API key, falling back to the subscription proxy if absent. */
 export function buildGrokSubscriptionWebSearchProvider(): WebSearchProvider {
-  return makeGrokProvider('grok', 'Grok (subscription search)',
-    () => peekGrokCredential({ model: GROK_SUBSCRIPTION_SEARCH_MODEL })?.kind === 'subscription',
-    () => {
-      const credential = resolveFreshGrokCredential({ model: GROK_SUBSCRIPTION_SEARCH_MODEL });
-      if (credential?.kind !== 'subscription') throw new Error('Grok subscription search unavailable');
-      return { apiKey: credential.token, baseUrl: credential.baseUrl, headers: credential.headers, model: GROK_SUBSCRIPTION_SEARCH_MODEL };
-    });
+  return makeGrokProvider('grok', 'Grok (API-key-first search)',
+    () => peekGrokCredential({ model: GROK_SUBSCRIPTION_SEARCH_MODEL, prefer: 'api_key' }) !== null,
+    () => ({ credentialPreference: 'api_key', credentialModel: GROK_SUBSCRIPTION_SEARCH_MODEL }));
 }
 
 function makeGrokProvider(

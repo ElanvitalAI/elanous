@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import type { ModalSurface } from '../display/modal-stack.js';
 import type { Key } from '../tui.js';
-import { createDashboardSidetabRuntime } from './sidetab-runtime.js';
+import { createDashboardSidetabRuntime, mergeLocalAgentSessions, runDashboardAgentMission } from './sidetab-runtime.js';
 import type { SidetabRow } from '../sidetab-core/model.js';
 
 const key = (name: string, ctrl = false): Key => ({ name, ctrl, shift: false, raw: name });
@@ -13,6 +13,8 @@ function fixture(rows: SidetabRow[]) {
   const detached: (SidetabRow | null)[] = [];
   const killed: SidetabRow[] = [];
   const statuses: string[] = [];
+  const spawnedAgents: ('codex' | 'claude')[] = [];
+  const missions: { agent: 'codex' | 'claude'; text: string }[] = [];
   let disposed = 0;
   let spawned = 0;
   let returned = 0;
@@ -26,18 +28,39 @@ function fixture(rows: SidetabRow[]) {
     },
     attach: (row) => { attached.push(row); },
     spawnShell: () => { spawned++; },
+    spawnAgent: (agent) => { spawnedAgents.push(agent); },
+    runMission: async (agent, text) => {
+      missions.push({ agent, text });
+      return { ok: true, path: `/tmp/${agent}-result.md`, firstLine: 'result', promptReady: true, missionVisible: true, promptReturned: true, completionMarker: true };
+    },
     detach: (row) => { detached.push(row); },
     kill: (row) => { killed.push(row); },
     returnToParent: () => { returned++; },
     status: (message) => { statuses.push(message); },
   });
-  return { runtime, surfaces, attached, detached, killed, statuses, get disposed() { return disposed; }, get spawned() { return spawned; }, get returned() { return returned; } };
+  return { runtime, surfaces, attached, detached, killed, statuses, spawnedAgents, missions, get disposed() { return disposed; }, get spawned() { return spawned; }, get returned() { return returned; } };
 }
 
 const sampleRows: SidetabRow[] = [
   { id: 'tui:1', label: 'current', kind: 'tui', badge: 'idle', sessionId: 'chat-session', currentProcess: true },
   { id: 'shell:2', label: 'child shell', kind: 'shell', badge: 'idle', sessionId: 'terminal-2', ptyId: 'shell:2' },
 ];
+
+test('popup startup exceptions become explicit mission failures', async () => {
+  const result = await runDashboardAgentMission({
+    agent: 'codex',
+    open: (): { id: string; modal?: object } => { throw new Error('popup failed'); },
+    modal: session => session.modal,
+    outputPath: () => '/tmp/result.md',
+    run: async () => { throw new Error('unreachable'); },
+    close: () => {},
+  });
+
+  expect(result).toEqual({
+    ok: false, path: '', promptReady: false, missionVisible: false,
+    promptReturned: false, completionMarker: false, error: 'popup failed',
+  });
+});
 
 test('Ctrl+\\ prefix opens the current-session sidetab panel and Enter selects a child', () => {
   const f = fixture(sampleRows);
@@ -133,4 +156,31 @@ test('runtime close disposes an open sidetab modal and clears pending prefix sta
   f.runtime.close();
   expect(f.disposed).toBe(1);
   expect(f.runtime.routeKey(key('n'))).toBe(false);
+});
+
+test('classic prefix launches Codex and Claude tabs and mission requests share the host runner', async () => {
+  const f = fixture(sampleRows);
+  f.runtime.beginPrefix();
+  expect(f.runtime.routeKey(key('c'))).toBe(true);
+  f.runtime.beginPrefix();
+  expect(f.runtime.routeKey(key('a'))).toBe(true);
+  expect(f.spawnedAgents).toEqual(['codex', 'claude']);
+  const result = await f.runtime.runMission('codex', 'write a small report');
+  expect(f.missions).toEqual([{ agent: 'codex', text: 'write a small report' }]);
+  expect(result).toMatchObject({ ok: true, path: '/tmp/codex-result.md' });
+});
+
+test('classic sidetab adds local agent sessions once and keeps them attachable by session id', () => {
+  const rows = mergeLocalAgentSessions(sampleRows, [
+    { id: 'local-codex', title: 'Codex [repo]', kind: 'coding-agent', agentBrand: 'codex', state: 'background' },
+    { id: 'local-claude', title: 'Claude [repo]', kind: 'coding-agent', agentBrand: 'claude-code', state: 'foreground' },
+    { id: 'local-shell', title: 'shell', kind: 'shell', state: 'background' },
+    { id: 'chat-session', title: 'duplicate', kind: 'coding-agent', agentBrand: 'codex', state: 'foreground' },
+    { id: 'dead-agent', title: 'exited', kind: 'coding-agent', agentBrand: 'codex', state: 'exited' },
+  ]);
+  expect(rows).toHaveLength(sampleRows.length + 2);
+  expect(rows.slice(sampleRows.length)).toEqual([
+    { id: 'local-codex', label: 'Codex [repo]', kind: 'codex', badge: 'unknown', sessionId: 'local-codex' },
+    { id: 'local-claude', label: 'Claude [repo]', kind: 'claude-code', badge: 'unknown', sessionId: 'local-claude' },
+  ]);
 });

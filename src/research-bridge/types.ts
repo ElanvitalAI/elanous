@@ -28,6 +28,8 @@ export interface ExternalResearchResult {
 export interface InvokeResearchOpts {
   /** Skill name override; default 'omni-crawl'. */
   skill?: string;
+  /** Root directory containing the selected catalog entry. */
+  skillRootDir?: string;
   /** Stream progress chunks back to the caller (e.g. dashboard chat
    *  pane) so the user sees activity for long-running invocations. */
   onProgress?: (delta: string) => void;

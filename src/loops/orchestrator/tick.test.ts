@@ -1794,3 +1794,148 @@ describe('COORD-ABSORB-OP-BRIDGES-FU: 세 브리지(coordinator 수신 소비 ·
     } finally { resetElanousConfigDir(); rmSync(configDir, { recursive: true, force: true }); }
   }), 30_000);
 });
+// ── COORD-ENTRANCE-FOLD (0.2.42 칸 · TASK-AGENT OP 디스패처) ─────────────────────
+// 셸 디스패처 은퇴 결정 카드: 조율자 그림자가 ④ 빌더로 같은 칸·같은 지시서를 달력 기준
+// 3일 연속 디스패치하면 결정 원장(DecisionLedger)에 정확히 1장 적는다.
+// 무대: mock 시나리오 + 격리 임시 루트/원장 + 가짜 시계 — 생산 호출 경로
+// (tick() → DecisionLedger.raiseOnce)를 그대로 통과한다(소스 문자열 검사가 아니다).
+describe('COORD-ENTRANCE-FOLD · 셸 디스패처 은퇴 결정 카드', () => {
+  const shadow = (): Promise<typeof import('./coordinator-shadow.js')> => import('./coordinator-shadow.js');
+  const today = '2026-03-02';
+  const now = (): Date => new Date(today + 'T09:00:00Z');
+  const CELL = 'src/loops/orchestrator/tick.ts';
+  const DIRECTIVE = 'DIR-coord-entrance-fold';
+  type ShadowDispatch = { date: string; agent: string; cell: string; directive: string };
+  const row = (date: string, overrides: Partial<ShadowDispatch> = {}): ShadowDispatch =>
+    ({ date, agent: 'builder-4', cell: CELL, directive: DIRECTIVE, ...overrides });
+  const stampOf = (): string => 'coordinator-shadow-streak:' + CELL + ':' + DIRECTIVE;
+
+  const stage = async (rows: readonly unknown[]) => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const mod = await shadow();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'coord-shadow-tick-'));
+    fs.mkdirSync(path.join(root, 'seat-state', 'OP'), { recursive: true });
+    fs.writeFileSync(mod.coordinatorShadowJournalPath(root), rows.map(r => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+    return { fs, root, stateDir: path.join(root, '.elanous-state') };
+  };
+  const retirementCards = async (stateDir: string) => {
+    const dl = await import('../../decisions/decision-ledger.js');
+    const ledger = new dl.DecisionLedger({ stateDir, now });
+    return ledger.list({ status: 'all' }).filter(entry => entry.title.startsWith('셸 디스패처 은퇴'));
+  };
+
+  test('④ 빌더 같은 칸·같은 지시서 3일 연속 → 은퇴 결정 카드를 원장에 정확히 1장', async () => {
+    const { fs, root, stateDir } = await stage([
+      row('2026-02-28'),
+      { day: '2026-03-01', target: 'builder-4', lane: CELL, directiveId: DIRECTIVE } as never,
+      row(today),
+    ]);
+    try {
+      const mod = await shadow();
+      const first = await mod.tick({ root, stateDir, now });
+      expect(first.checked).toBe(today);
+      expect(first.skipped).toBeUndefined();
+      expect(first.evidence?.dates).toEqual(['2026-02-28', '2026-03-01', today]);
+      expect(first.evidence?.agent).toBe('builder-4');
+      const raised = await retirementCards(stateDir);
+      expect(raised.length).toBe(1);
+      expect(raised[0].title).toBe('셸 디스패처 은퇴 — ' + CELL + ' × ' + DIRECTIVE + ' 3일 연속');
+      expect(raised[0].category).toBe('other');
+      expect(raised[0].status).toBe('open');
+      expect(raised[0].raisedBy).toEqual({ agent: 'orchestrator-tick', track: 'OP' });
+      expect(raised[0].refs).toContain(stampOf());
+      expect(raised[0].refs).toContain('agent:builder-4');
+      expect(raised[0].refs).toContain('cell:' + CELL);
+      expect(raised[0].refs).toContain('directive:' + DIRECTIVE);
+      expect(raised[0].refs).toContain('dates:2026-02-28,2026-03-01,2026-03-02');
+      expect(first.cardId).toBe(raised[0].id);
+      const second = await mod.tick({ root, stateDir, now });
+      expect(second.skipped).toBe('duplicate');
+      expect(second.cardId).toBe(raised[0].id);
+      expect((await retirementCards(stateDir)).length).toBe(1);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }, 30000);
+
+  test('연속 끊김(무디스패치·다른 지시서·다른 칸)이면 카드를 적지 않는다', async () => {
+    for (const rows of [
+      [row('2026-02-28'), row(today)],
+      [row('2026-02-28'), row('2026-03-01'), row(today, { directive: 'DIR-other' })],
+      [row('2026-02-28'), row('2026-03-01'), row(today, { cell: 'src/other.ts' })],
+      [],
+    ]) {
+      const { fs, root, stateDir } = await stage(rows);
+      try {
+        const mod = await shadow();
+        const result = await mod.tick({ root, stateDir, now });
+        expect(result.evidence).toBeNull();
+        expect(result.cardId).toBeUndefined();
+        expect((await retirementCards(stateDir)).length).toBe(0);
+      } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    }
+  });
+
+  test('월 경계 달력 계산 + ④ 빌더 표기 변형 + 비빌더 배제', async () => {
+    const mod = await shadow();
+    expect(mod.detectBuilderThreeDayStreak([row('2026-02-28'), row('2026-03-01'), row(today)], today)?.dates)
+      .toEqual(['2026-02-28', '2026-03-01', today]);
+    expect(mod.detectBuilderThreeDayStreak([row('2026-03-01'), row(today)], today)).toBeNull();
+    expect(mod.detectBuilderThreeDayStreak(
+      [row('2026-02-28', { agent: 'runner' }), row('2026-03-01', { agent: 'runner' }), row(today, { agent: 'runner' })],
+      today,
+    )).toBeNull();
+    expect(mod.isFourthBuilderAgent('builder-4')).toBe(true);
+    expect(mod.isFourthBuilderAgent('Builder_4')).toBe(true);
+    expect(mod.isFourthBuilderAgent('④빌더')).toBe(true);
+    expect(mod.isFourthBuilderAgent('빌더4')).toBe(true);
+    expect(mod.isFourthBuilderAgent('b4')).toBe(true);
+    expect(mod.isFourthBuilderAgent('builder-3')).toBe(false);
+    expect(mod.isFourthBuilderAgent('runner')).toBe(false);
+  });
+
+  test('4일째 새 3일 창도 같은 칸·지시서 카드 하나만 재사용한다', async () => {
+    const { fs, root, stateDir } = await stage([row('2026-02-27'), row('2026-02-28'), row('2026-03-01')]);
+    try {
+      const mod = await shadow();
+      const first = await mod.tick({ root, stateDir, now: (): Date => new Date('2026-03-01T09:00:00Z') });
+      expect(first.cardId).toBeDefined();
+      const fourthDay = new Date('2026-03-03T09:00:00Z');
+      fs.writeFileSync(
+        mod.coordinatorShadowJournalPath(root),
+        [row('2026-03-01'), row('2026-03-02'), row('2026-03-03')].map(r => JSON.stringify(r)).join('\n') + '\n',
+        'utf8',
+      );
+      const second = await mod.tick({ root, stateDir, now: () => fourthDay });
+      expect(second.skipped).toBe('duplicate');
+      expect(second.cardId).toBe(first.cardId);
+      const raised = await retirementCards(stateDir);
+      expect(raised.length).toBe(1);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }, 30000);
+
+  test('main 배선 격리: 그림자 틱이 reject 해도 본 노드 실행을 계속한다(관측은 본 루프를 봉쇄할 수 없다)', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'coord-shadow-cwd-'));
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'coord-shadow-state-'));
+    try {
+      // 원장 경로를 디렉터리로 점유해 그림자 틱이 reject 하게 한다 — 판독 가드와 무관하게 배선 격리 자체를 잰다.
+      fs.mkdirSync(path.join(cwd, 'seat-state', 'OP', 'coordinator-shadow-dispatch.jsonl'), { recursive: true });
+      const env: Record<string, string | undefined> = { ...process.env, ELANOUS_STATE_DIR: stateRoot };
+      delete env.ELANOUS_GRAPH_CONTEXT;
+      const child = Bun.spawn([process.execPath, path.join(import.meta.dir, 'tick.ts'), 'intake', '--window', '08'], {
+        cwd, env, stdout: 'ignore', stderr: 'ignore',
+      });
+      expect(await child.exited).toBe(0);
+      const files = fs.readdirSync(path.join(stateRoot, 'loop', 'orchestrator')).filter(name => name.endsWith('-08.json'));
+      expect(files.length).toBe(1);
+      const state = JSON.parse(fs.readFileSync(path.join(stateRoot, 'loop', 'orchestrator', files[0]!), 'utf8'));
+      expect(state.nodes.intake).toBe('ok');
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+      fs.rmSync(stateRoot, { recursive: true, force: true });
+    }
+  }, 60_000);
+});

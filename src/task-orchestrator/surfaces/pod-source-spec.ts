@@ -57,11 +57,11 @@ function gitRoot(start: string): string {
 }
 
 /** commit·pr 는 그대로. worktree·files 는 `packSourceBundle` 로 `{ kind: 'bundle' }`. */
-export function resolvePodSource(parsed: ParsedPodSource, opts: { base: string; outDir: string }): PodSource {
+export function resolvePodSource(parsed: ParsedPodSource, opts: { base: string; outDir: string; mirrorHead?: string | null; log?: (category: string, event: string, data: Record<string, unknown>) => void }): PodSource {
   if (parsed.kind === 'commit') return { kind: 'commit', sha: parsed.sha };
   if (parsed.kind === 'pr') return { kind: 'pr', number: parsed.number };
   if (parsed.kind === 'worktree') {
-    const packed = packSourceBundle({ repoDir: resolve(parsed.path), kind: 'worktree', base: opts.base, outDir: opts.outDir });
+    const packed = packSourceBundle({ repoDir: resolve(parsed.path), kind: 'worktree', base: opts.base, outDir: opts.outDir, mirrorHead: opts.mirrorHead, log: opts.log });
     return { kind: 'bundle', bundlePath: packed.bundlePath, sha256: packed.sha256, sizeBytes: packed.sizeBytes, headCommit: packed.headCommit };
   }
   const first = resolve(parsed.paths[0]!);
@@ -72,6 +72,6 @@ export function resolvePodSource(parsed: ParsedPodSource, opts: { base: string; 
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) throw new Error(`files path '${path}' is outside git root ${root}`);
     return rel.split('\\').join('/');
   });
-  const packed = packSourceBundle({ repoDir: root, kind: 'files', base: opts.base, paths, outDir: opts.outDir });
+  const packed = packSourceBundle({ repoDir: root, kind: 'files', base: opts.base, paths, outDir: opts.outDir, mirrorHead: opts.mirrorHead, log: opts.log });
   return { kind: 'bundle', bundlePath: packed.bundlePath, sha256: packed.sha256, sizeBytes: packed.sizeBytes, headCommit: packed.headCommit };
 }

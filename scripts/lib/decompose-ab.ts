@@ -204,6 +204,7 @@ function armSummary(records: readonly DecomposeAbRecord[], expectedRecords: numb
     'missing-research-context': 0,
     'grounding-empty': 0,
     'authored-empty': 0,
+    'slice-rejected': 0,
     'llm-failed': 0,
   };
   for (const record of observed) outcomes[record.measurement.outcome] += 1;

@@ -5,6 +5,9 @@ import { isAbsolute, join } from 'node:path';
 import * as store from './feature-store.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
+import { parseTargetPathHintLine } from './checklist-target-path-hint.js';
+export { parseTargetPathHintLine } from './checklist-target-path-hint.js';
+export type { TargetPathHintLine } from './checklist-target-path-hint.js';
 
 export type ChecklistStatus = 'green' | 'yellow' | 'red' | 'done';
 export type ChecklistDisposition = 'move' | 'known-issue' | 'block';
@@ -248,6 +251,11 @@ export function isMergeOrTypecheckOnlyEvidence(value: string): boolean {
   return signal;
 }
 
+/** Parsed target path fragments, preserving order and raw path spelling while trimming separator whitespace. */
+export function parseChecklistTargetPaths(text: string): string[] {
+  return parseTargetPathHintLine(text).fragments.map((fragment) => fragment.trim().replace(/^`+|`+$/g, ''));
+}
+
 /** Shadow check at checklist authorship. Callers supply the origin/main file probe and merged-PR file reader. */
 export function inspectChecklistTargetPaths(input: {
   title: string; evidence?: string; refs?: readonly string[]; dispatchKind?: ChecklistDispatchKind;
@@ -256,7 +264,7 @@ export function inspectChecklistTargetPaths(input: {
 } {
   const lines = input.title.split(/\r?\n/);
   const first = /^대상 경로:\s*(.*)$/.exec(lines[0] ?? '');
-  const rawTargets = first?.[1]?.split(' · ').map((path) => path.trim()) ?? [];
+  const rawTargets = parseChecklistTargetPaths(lines[0] ?? '');
   const validPath = (path: string): boolean => path.length > 0 && path.length < 4096
     && !path.startsWith('/') && !path.includes('\\') && !/[\u0000-\u001f\u007f]/u.test(path)
     && path.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');

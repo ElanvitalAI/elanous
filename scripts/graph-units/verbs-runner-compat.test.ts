@@ -10,8 +10,12 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 
 const projectRoot = new URL('../..', import.meta.url).pathname;
 function executeActualRecipe(body: string, env?: Record<string, string | undefined>) {
-  const args = body.trim().split(/\s+/).slice(1);
-  return { stdout: execFileSync('bun', args, { cwd: projectRoot, env: { ...process.env, ...env }, encoding: 'utf8' }), stderr: '', exitCode: 0 };
+  const output = execFileSync('/bin/bash', ['-c', body], {
+    cwd: projectRoot,
+    env: { ...process.env, ...env, ELANOUS_GRAPH_DIR: join(projectRoot, 'graphs/units/verbs') },
+    encoding: 'utf8',
+  });
+  return { stdout: output, stderr: '', exitCode: 0 };
 }
 
 test('verb-make-doc receives the previous result and routes its named rework exit', async () => {
@@ -46,7 +50,7 @@ test('verb-make-doc receives the previous result and routes its named rework exi
         };
 
         if (body.includes('seed')) return { stdout: '{"result":"seed-output"}', stderr: '', exitCode: 0 };
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) {
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) {
           if (body.includes('make-doc-input')) receivedPrior = context.input?.prior;
           return executeActualRecipe(body, opts.env);
         }
@@ -81,7 +85,7 @@ test('verb-make-doc receives the previous result and routes its named rework exi
         root,
         runBash: async (body, opts) => {
           if (body.includes('seed')) return { stdout: '{"result":"seed-output"}', stderr: '', exitCode: 0 };
-          if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+          if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
           if (body.includes('headless-goal-loop.ts')) return { stdout: JSON.stringify({ outcome: exit, result: `draft-${exit}`, evidence: { draft: exit } }), stderr: '', exitCode: 0 };
           throw new Error('unexpected make-doc exit command: ' + body);
         },
@@ -123,7 +127,7 @@ edges:
   const run = await runGraph(graph, {
     input: { ask: 'Exercise nested fallback', context: {}, prior: null },
     deps: { root, runBash: async (body, opts) => {
-      if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+      if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
       if (body.includes('headless-goal-loop.ts')) return { stdout: JSON.stringify({ outcome: 'done', result: 'fallback executed', evidence: { exercised: true } }), stderr: '', exitCode: 0 };
       throw new Error('unexpected nested fallback command: ' + body);
     } },
@@ -159,21 +163,21 @@ test('research-report permits a second verify visit after the first verify exits
         const context = contextPath ? JSON.parse(readFileSync(contextPath, 'utf8')) as { graphId?: string } : {};
         if (body.includes('make-doc-input')) return { stdout: JSON.stringify({ goal: 'Write the report', worktree: '/tmp/research-report-rehearsal', branch: 'work/research-report', 'review-intent': 'Review the report', prior: null }), stderr: '', exitCode: 0 };
         if (body.includes('verify-envelope')) return { stdout: JSON.stringify({ outcome: 'gate', worktree: '/tmp/research-report-rehearsal', 'changed-files': ['docs/research-report.md'], diff: 'report diff', 'review-intent': 'Review the report' }), stderr: '', exitCode: 0 };
-        if (body.includes('verify-stage.ts gate')) {
+        if (body.includes('verify-stage.ts') && body.includes(' gate')) {
           gateCalls += 1;
           return { stdout: JSON.stringify({ outcome: gateCalls === 1 ? 'fail' : 'pass', passed: gateCalls !== 1, 'gate-log': `gate-${gateCalls}` }), stderr: '', exitCode: 0 };
         }
-        if (body.includes('verify-stage.ts review')) {
+        if (body.includes('verify-stage.ts') && body.includes(' review')) {
           reviewCalls += 1;
           return { stdout: JSON.stringify({ outcome: 'pass', verdict: 'pass', reviewed: true, 'must-fix': [], 'review-summary': 'clean' }), stderr: '', exitCode: 0 };
         }
-        if (body.startsWith('bun scripts/graph-units/verbs/research.ts')) return { stdout: JSON.stringify({ outcome: 'done', result: { result: { title: 'Write a short research report.', collectedAt: '2026-10-29T00:00:00Z', facts: ['source notes'], sources: ['https://example.test/source'] }, evidence: { sources: ['https://example.test/source'] } }, evidence: { outcome: 'complete' } }), stderr: '', exitCode: 0 };
+        if (body.includes('/scripts/graph-units/verbs/research.ts')) return { stdout: JSON.stringify({ outcome: 'done', result: { result: { title: 'Write a short research report.', collectedAt: '2026-10-29T00:00:00Z', facts: ['source notes'], sources: ['https://example.test/source'] }, evidence: { sources: ['https://example.test/source'] } }, evidence: { outcome: 'complete' } }), stderr: '', exitCode: 0 };
         if (body.includes('headless-goal-loop.ts')) {
           if (context.graphId === 'verb-make-doc') return { stdout: JSON.stringify({ outcome: 'done', result: 'draft written', evidence: { 'document-drafts': ['docs/research-report.md'] } }), stderr: '', exitCode: 0 };
           failedReworkCalls += 1;
           return { stdout: JSON.stringify({ outcome: 'failed', result: 'first verification rework could not converge', evidence: { attempt: failedReworkCalls } }), stderr: '', exitCode: 0 };
         }
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
         throw new Error('unexpected research-report command: ' + body);
       },
     },
@@ -185,6 +189,68 @@ test('research-report permits a second verify visit after the first verify exits
   expect(gateCalls).toBe(2);
   expect(reviewCalls).toBe(1);
   expect(failedReworkCalls).toBe(1);
+});
+
+test('make-doc unit recipe resolves from its graph directory when caller cwd is empty', async () => {
+  const callerCwd = mkdtempSync(join(tmpdir(), 'verbs-empty-cwd-'));
+  roots.push(callerCwd);
+  const graph = new URL('../../graphs/units/verbs/make-doc.yaml', import.meta.url).pathname;
+  const run = await runGraph(graph, {
+    input: { ask: 'Write the requested document.', context: { worktree: '/tmp/research-report' }, prior: null },
+    deps: {
+      root: callerCwd,
+      runBash: async (body, opts) => {
+        if (body.includes('/scripts/graph-units/verbs/headless-goal-loop.ts')) {
+          return { stdout: JSON.stringify({ outcome: 'needs-human', result: 'test stop', evidence: { reason: 'test' } }), stderr: '', exitCode: 0 };
+        }
+        try {
+          const result = execFileSync('/bin/bash', ['-c', body], {
+            cwd: callerCwd,
+            env: { ...process.env, ...opts.env },
+            encoding: 'utf8',
+          });
+          return { stdout: result, stderr: '', exitCode: 0 };
+        } catch (error) {
+          const failed = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; status?: number };
+          return { stdout: String(failed.stdout ?? ''), stderr: String(failed.stderr ?? failed.message), exitCode: failed.status ?? 1 };
+        }
+      },
+    },
+  });
+
+  expect(run.status).toBe('done');
+  expect(run.path).toEqual(['prepare', 'document-draft', 'needs-human']);
+  expect(run.nodes[0]?.error).toBeUndefined();
+  expect(run.unitCalls).toBeUndefined();
+});
+
+test('research unit recipe starts its graph-root script from an empty caller cwd', async () => {
+  const callerCwd = mkdtempSync(join(tmpdir(), 'verbs-research-empty-cwd-'));
+  roots.push(callerCwd);
+  const graph = new URL('../../graphs/units/verbs/research.yaml', import.meta.url).pathname;
+  const run = await runGraph(graph, {
+    input: { ask: '' },
+    deps: {
+      root: callerCwd,
+      runBash: async (body, opts) => {
+        try {
+          const stdout = execFileSync('/bin/bash', ['-c', body], {
+            cwd: callerCwd,
+            env: { ...process.env, ...opts.env },
+            encoding: 'utf8',
+          });
+          return { stdout, stderr: '', exitCode: 0 };
+        } catch (error) {
+          const failed = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; status?: number };
+          return { stdout: String(failed.stdout ?? ''), stderr: String(failed.stderr ?? failed.message), exitCode: failed.status ?? 1 };
+        }
+      },
+    },
+  });
+
+  expect(run.status).toBe('failed');
+  expect(run.nodes[0]?.error).toContain('verb-research input missing: ask');
+  expect(run.nodes[0]?.error).not.toContain('Module not found');
 });
 
 test('verb-verify executes actual unit YAML, recipes and CLI through the default gate path', async () => {
@@ -212,12 +278,12 @@ test('verb-verify executes actual unit YAML, recipes and CLI through the default
           input?: Record<string, unknown>;
           outputs?: Record<string, Record<string, unknown>>;
         };
-        if (body.includes('verify-stage.ts gate')) return { stdout: JSON.stringify({ outcome: 'pass', passed: true, 'gate-log': 'fresh-gate.log' }), stderr: '', exitCode: 0 };
-        if (body.includes('verify-stage.ts review')) {
+        if (body.includes('verify-stage.ts') && body.includes(' gate')) return { stdout: JSON.stringify({ outcome: 'pass', passed: true, 'gate-log': 'fresh-gate.log' }), stderr: '', exitCode: 0 };
+        if (body.includes('verify-stage.ts') && body.includes(' review')) {
           reviewIntentAtReviewer = context.outputs?.prepare?.['review-intent'];
           return { stdout: JSON.stringify({ outcome: 'pass', verdict: 'pass', 'review-summary': 'reviewed', 'must-fix': [] }), stderr: '', exitCode: 0 };
         }
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
         throw new Error('unexpected verify graph command: ' + body);
       },
     },
@@ -244,8 +310,8 @@ test('verb-verify executes actual unit YAML, recipes and CLI through the default
     deps: {
       root,
       runBash: async (body, opts) => {
-        if (body.includes('verify-stage.ts review')) return { stdout: JSON.stringify({ outcome: 'pass', verdict: 'pass', review_summary: 'resumed review' }), stderr: '', exitCode: 0 };
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('verify-stage.ts') && body.includes(' review')) return { stdout: JSON.stringify({ outcome: 'pass', verdict: 'pass', review_summary: 'resumed review' }), stderr: '', exitCode: 0 };
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
         throw new Error('unexpected resume graph command: ' + body);
       },
     },
@@ -262,13 +328,13 @@ test('verb-verify executes actual unit YAML, recipes and CLI through the default
     deps: {
       root,
       runBash: async (body, opts) => {
-        if (body.includes('verify-stage.ts review')) {
+        if (body.includes('verify-stage.ts') && body.includes(' review')) {
           reviewCalls += 1;
           return { stdout: JSON.stringify({ outcome: reviewCalls === 1 ? 'fail' : 'pass', verdict: reviewCalls === 1 ? 'fail' : 'pass', review_summary: `review-${reviewCalls}`, 'must-fix': reviewCalls === 1 ? ['fix me'] : [] }), stderr: '', exitCode: 0 };
         }
         if (body.includes('headless-goal-loop.ts')) return { stdout: JSON.stringify({ outcome: 'done', diff: 'reworked diff', 'must-fix': [], evidence: { 'rework-note': 'updated' } }), stderr: '', exitCode: 0 };
-        if (body.includes('verify-stage.ts gate')) return { stdout: JSON.stringify({ outcome: 'pass', passed: true, 'gate-log': reviewCalls > 0 ? 'gate-after-rework' : 'test gate' }), stderr: '', exitCode: 0 };
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('verify-stage.ts') && body.includes(' gate')) return { stdout: JSON.stringify({ outcome: 'pass', passed: true, 'gate-log': reviewCalls > 0 ? 'gate-after-rework' : 'test gate' }), stderr: '', exitCode: 0 };
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
         throw new Error('unexpected retry graph command: ' + body);
       },
     },
@@ -288,10 +354,10 @@ test('verb-verify executes actual unit YAML, recipes and CLI through the default
     deps: {
       root,
       runBash: async (body, opts) => {
-        if (body.includes('verify-stage.ts review')) return { stdout: JSON.stringify({ outcome: 'fail', verdict: 'fail', 'must-fix': ['review issue'] }), stderr: '', exitCode: 0 };
+        if (body.includes('verify-stage.ts') && body.includes(' review')) return { stdout: JSON.stringify({ outcome: 'fail', verdict: 'fail', 'must-fix': ['review issue'] }), stderr: '', exitCode: 0 };
         if (body.includes('headless-goal-loop.ts')) return { stdout: JSON.stringify({ outcome: 'failed', 'must-fix': ['updated issue'], evidence: { 'rework-log': 'fresh-rework.log' } }), stderr: '', exitCode: 0 };
-        if (body.includes('verify-stage.ts gate')) return { stdout: JSON.stringify({ outcome: 'pass', passed: true, 'gate-log': 'test gate' }), stderr: '', exitCode: 0 };
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('verify-stage.ts') && body.includes(' gate')) return { stdout: JSON.stringify({ outcome: 'pass', passed: true, 'gate-log': 'test gate' }), stderr: '', exitCode: 0 };
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
         throw new Error('unexpected rework graph command: ' + body);
       },
     },
@@ -311,8 +377,8 @@ test('verb-verify executes actual unit YAML, recipes and CLI through the default
     deps: {
       root,
       runBash: async (body, opts) => {
-        if (body.includes('verify-stage.ts review')) return { stdout: JSON.stringify({ outcome: 'needs-human', verdict: 'needs-human', review_summary: 'human decision required' }), stderr: '', exitCode: 0 };
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('verify-stage.ts') && body.includes(' review')) return { stdout: JSON.stringify({ outcome: 'needs-human', verdict: 'needs-human', review_summary: 'human decision required' }), stderr: '', exitCode: 0 };
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
         throw new Error('unexpected needs-human graph command: ' + body);
       },
     },
@@ -329,13 +395,13 @@ test('verb-verify executes actual unit YAML, recipes and CLI through the default
     deps: {
       root,
       runBash: async (body, opts) => {
-        if (body.includes('verify-stage.ts review')) {
+        if (body.includes('verify-stage.ts') && body.includes(' review')) {
           escalationReviewCalls += 1;
           return { stdout: JSON.stringify({ outcome: 'fail', verdict: 'fail', review_summary: 'review before retry', 'must-fix': ['retry'] }), stderr: '', exitCode: 0 };
         }
         if (body.includes('headless-goal-loop.ts')) return { stdout: JSON.stringify({ outcome: 'done', diff: 'retry diff', 'must-fix': [], evidence: { 'gate-log': 'stale-rework-gate', 'rework-note': 'done' } }), stderr: '', exitCode: 0 };
-        if (body.includes('verify-stage.ts gate')) return { stdout: JSON.stringify({ outcome: 'needs-human', passed: false, 'gate-log': 'human-gate.log' }), stderr: '', exitCode: 0 };
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('verify-stage.ts') && body.includes(' gate')) return { stdout: JSON.stringify({ outcome: 'needs-human', passed: false, 'gate-log': 'human-gate.log' }), stderr: '', exitCode: 0 };
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
         throw new Error('unexpected gate needs-human command: ' + body);
       },
     },
@@ -351,8 +417,8 @@ test('verb-verify executes actual unit YAML, recipes and CLI through the default
     deps: {
       root,
       runBash: async (body, opts) => {
-        if (body.includes('verify-stage.ts gate')) return { stdout: JSON.stringify({ outcome: 'failed', passed: false, 'gate-log': 'gate crashed' }), stderr: '', exitCode: 0 };
-        if (body.startsWith('bun scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
+        if (body.includes('verify-stage.ts') && body.includes(' gate')) return { stdout: JSON.stringify({ outcome: 'failed', passed: false, 'gate-log': 'gate crashed' }), stderr: '', exitCode: 0 };
+        if (body.includes('/scripts/graph-units/verbs-envelope.ts')) return executeActualRecipe(body, opts.env);
         throw new Error('unexpected failed graph command: ' + body);
       },
     },

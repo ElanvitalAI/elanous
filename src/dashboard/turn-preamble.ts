@@ -41,6 +41,8 @@ import {
 import type { getUserConfig } from '../user-config.js';
 import { isNativeStructureEnabledForProvider, resolveActiveProvider } from '../user-config.js';
 import { measureInputLagTurnStart } from '../tui/input-lag-probe.js';
+import { resolveModelContextWindow } from '../models/context-window.js';
+import { buildInstalledSkillCatalogMessage, type InstalledSkillSummary } from './skill-catalog-preamble.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { buildSelfHealthLine, type InstalledRecord, type SelfHealthErrors } from '../pty-shell/tui-run-state.js';
 import type { PtyBuildIdentity } from '../pty-shell/pty-manifest.js';
@@ -71,6 +73,12 @@ export interface DashboardTurnPreambleContext {
    *  one-liner directives (e.g. AskUserQuestion → use for tool-deny
    *  clarification). Pass `tools.map(t => t.name)` from the caller. */
   enabledTools?: readonly string[];
+  /** Installed frontmatter summaries for the stable skill-routing prompt prefix. */
+  skillCatalog?: readonly InstalledSkillSummary[];
+  /** Active model context size, when known. Unknown models use the conservative helper default. */
+  skillCatalogContextWindow?: number | null;
+  /** Runtime-selected model can differ from the configured default model. */
+  skillCatalogModelId?: string;
   /** 🪪 L1 자리 부트 카드를 싣나(`seat-boot-preamble.ts`). 대화형 TUI 호출부만 켠다 — 기본 꺼짐이라
    *  다른 호출부·시험은 셸의 `COORD_ID` 에 따라 출력이 갈리지 않는다. */
   seatBoot?: boolean | SeatBootDeps;
@@ -98,6 +106,12 @@ export interface DashboardTurnPreambleContext {
     readInstalled?: () => InstalledRecord;
     readCheckoutHead?: (codeRoot: string) => string | undefined;
   };
+}
+
+/** Flag per-prompt system layers so the Codex Responses serializer keeps
+ *  them out of the cached `instructions` prefix (TUI-PROMPT-CACHE-PREFIX). */
+function markCacheVolatile(messages: readonly LLMMessage[]): LLMMessage[] {
+  return messages.map((m) => (m.role === 'system' ? { ...m, cacheVolatile: true } : m));
 }
 
 export function buildControllerSystemMessage(controller: string, channels?: string): LLMMessage {
@@ -172,6 +186,15 @@ function buildDashboardTurnPreambleUnmeasured(
 ): LLMMessage[] {
   const builderMs: BuilderMs | null = debug.enabled ? {} : null;
   const startedAt = builderMs === null ? 0 : performance.now();
+  // This is the first stable block in the system preamble. Its cached content changes only
+  // when the installed/visible skill list or model context budget changes.
+  const skillCatalogBuild = ctx.skillCatalog
+    ? timed(builderMs, 'skillCatalog', () => buildInstalledSkillCatalogMessage(
+      ctx.skillCatalog!,
+      ctx.skillCatalogContextWindow ?? resolveModelContextWindow(ctx.skillCatalogModelId ?? ctx.userConfig.llm.model),
+    ))
+    : null;
+  const skillCatalogSystemMsgs = skillCatalogBuild?.message ? [skillCatalogBuild.message] : [];
   // Universal preamble — surface-agnostic anchor (AGENTS.md +
   // CLAUDE.md). Spread first so the project context lands BEFORE any
   // surface-specific guidance, mirroring Claude Code's Phase 0
@@ -294,21 +317,30 @@ function buildDashboardTurnPreambleUnmeasured(
   const controllerSystemMsgs = controller
     ? timed(builderMs, 'controller', () => [buildControllerSystemMessage(controller, controlEnv.channels)])
     : [];
-  const preamble = [
+  // TUI-PROMPT-CACHE-PREFIX — only the universal anchor (AGENTS.md ·
+  // CLAUDE.md · tool discipline) is stable for the life of a session. Every
+  // other layer can change between prompts (boot card · memory · git
+  // snapshot · plan/approval mode · per-userText guidance · self health), so
+  // it is flagged `cacheVolatile`: the Codex serializer then keeps it out of
+  // `instructions` and sends it as a developer item after the cached history.
+  const preamble: LLMMessage[] = [
+    ...skillCatalogSystemMsgs,
     ...universalPreamble,
-    ...seatBootSystemMsgs,
-    ...planModeSystemMsgs,
-    ...askSystemMsgs,
-    ...approvalSystemMsgs,
-    ...sandboxSystemMsgs,
-    ...memorySystemMsgs,
-    ...gitSnapshotSystemMsgs,
-    ...surfaceSystemMsgs,
-    ...selfOpsSystemMsgs,
-    ...selfHealthSystemMsgs,
-    ...controllerSystemMsgs,
-    ...implDisciplineSystemMsgs,
-    ...concisenessSystemMsgs,
+    ...markCacheVolatile([
+      ...seatBootSystemMsgs,
+      ...planModeSystemMsgs,
+      ...askSystemMsgs,
+      ...approvalSystemMsgs,
+      ...sandboxSystemMsgs,
+      ...memorySystemMsgs,
+      ...gitSnapshotSystemMsgs,
+      ...surfaceSystemMsgs,
+      ...selfOpsSystemMsgs,
+      ...selfHealthSystemMsgs,
+      ...controllerSystemMsgs,
+      ...implDisciplineSystemMsgs,
+      ...concisenessSystemMsgs,
+    ]),
   ];
   // Capture exactly what the ACP path's getPreamble emits so we can
   // verify what codex actually sees as system prompt at turn-start.
@@ -328,7 +360,9 @@ function buildDashboardTurnPreambleUnmeasured(
       if (notificationOnlyWake) {
         preamble.push({ role: 'system', content: '[알림 전용 턴] 이것은 완료 알림을 전달한 비요청 status receipt다. 작업 요청으로 취급하지 말고 Agent 또는 SelfImplement 위임을 시작하지 않는다. 포함된 결과를 바탕으로 한 번의 간결한 상태 요약만 답하고 멈춘다. 결과가 전달되지 않았다면 결과가 아직 제공되지 않았다고 알리고 내용을 추측하지 않는다.' });
       }
-      const pendingNotifications = globalTaskNotificationQueue.drain();
+      const pendingNotifications = ctx.sessionId
+        ? globalTaskNotificationQueue.drainForParentSessionOrUnscoped(ctx.sessionId)
+        : globalTaskNotificationQueue.drain();
       taskNotificationCount = pendingNotifications.length;
       if (pendingNotifications.length === 0) {
         if (notificationOnlyWake) {
@@ -370,6 +404,7 @@ function buildDashboardTurnPreambleUnmeasured(
       hasTurnProfile: ctx.turnProfile != null,
       builderCounts: {
         universal: universalPreamble.length,
+        ...(ctx.skillCatalog ? { skillCatalog: skillCatalogSystemMsgs.length } : {}),
         seatBoot: seatBootSystemMsgs.length,
         planMode: planModeSystemMsgs.length,
         ask: askSystemMsgs.length,
@@ -390,6 +425,9 @@ function buildDashboardTurnPreambleUnmeasured(
       builderTotalMs: Math.round((performance.now() - startedAt) * 10) / 10,
       totalMessageCount: preamble.length,
       taskNotificationCount,
+      skillCatalogTokens: skillCatalogBuild?.estimatedTokens ?? 0,
+      skillCatalogBudgetTokens: skillCatalogBuild?.budgetTokens ?? 0,
+      skillCatalogMode: skillCatalogBuild?.mode ?? 'not-provided',
       totalChars: total,
       userTextPreview: ctx.userText.length > 80 ? `${ctx.userText.slice(0, 80)}…` : ctx.userText,
     });

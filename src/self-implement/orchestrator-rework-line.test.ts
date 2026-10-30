@@ -31,7 +31,7 @@ describe('rework progress line', () => {
   it('wires the incremented ordinal to the rework formatter without a run-supervisor dependency', () => {
     expect(orchestratorSource).toContain('const attemptOrdinal = incrementRunAttemptOrdinal(runId);');
     expect(orchestratorSource).toContain('formatReworkProgressLine(round, effectiveMax, escalateTier, attemptOrdinal)');
-    expect(orchestratorSource).not.toContain('run-supervisor');
+    expect(orchestratorSource).not.toMatch(/(?:from\s+|import\s*\()\s*['"][^'"]*run-supervisor/);
   });
 
   it('emits a run-scoped rework decision without changing the progress line or existing rework observation', async () => {

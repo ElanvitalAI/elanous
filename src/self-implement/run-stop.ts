@@ -10,13 +10,19 @@
  * ⭐ 이 스키마(`RunStopRecord`·`RUN_STOP_CLASSES`)는 STOP-AUTOHEAL 이 읽는다 — 칸 이름·닫힌 목록을 바꾸지 않는다(더하기만).
  */
 import { debug } from '../debug/log.js';
-import { appendRunLedgerEntry, type RunLedgerEntry, type RunLedgerWriter, type RunShardIdentity } from './run-ledger.js';
+import { createHash } from 'node:crypto';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { appendRunLedgerEntry, runLedgerDir, runLedgerPath, type RunLedgerEntry, type RunLedgerWriter, type RunShardIdentity } from './run-ledger.js';
 import type { PodChildEvidence } from '../task-orchestrator/surfaces/self-implement.js';
+import { defaultOverlaysDir, loadGraphOverlays } from './graph-overlay-yaml.js';
 
 /** 닫힌 목록 — 못 고르면 `unclassified`. */
 export const RUN_STOP_CLASSES = [
   'env-unrelated', 'main-sync', 'pod-died', 'pod-vanished', 'review-repeat',
-  'review-out-of-scope', 'review-budget-exhausted', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed', 'unclassified',
+  'review-out-of-scope', 'review-budget-exhausted', 'scope-escape', 'evidence-uncovered', 'fabric', 'launch-failed', 'gate-failed',
+  'implement-aborted', 'out-of-scope-held', 'provider-auth-missing', 'provider-unavailable',
+  'merge-held-release-path', 'pr-guard-failed', 'gate-unmeasured', 'unclassified',
 ] as const;
 export type RunStopClass = typeof RUN_STOP_CLASSES[number];
 
@@ -35,6 +41,32 @@ export interface RunStopRecord {
   childEvidence?: PodChildEvidence;
   /** Exact structured Pod error code, when the host received one. */
   terminationReason?: 'pod-job-failed';
+  /** Safe terminal-attempt facts and a digest-addressed artifact; raw provider/child text is excluded. */
+  terminalEvidence?: RunStopTerminalEvidence;
+}
+
+export type RunStopReasonCode = 'tdd-evidence-missing' | 'goal-only-same-cell' | 'decomposition-401-invalid-api-key' | 'provider-credential-failure' | 'unknown';
+export type RunStopFact = string | number | boolean | 'unknown';
+export interface RunStopChildAttempt {
+  childRunId: RunStopFact;
+  job: RunStopFact;
+  attempt: RunStopFact;
+  stage: RunStopFact;
+  outcome: RunStopFact;
+  exitCode: RunStopFact;
+  reasonCode: RunStopReasonCode;
+}
+export interface RunStopTerminalEvidence {
+  childRunId: RunStopFact;
+  job: RunStopFact;
+  attempt: RunStopFact;
+  stage: RunStopFact;
+  node: RunStopFact;
+  outcome: RunStopFact;
+  exitCode: RunStopFact;
+  reasonCode: RunStopReasonCode;
+  childAttempts: RunStopChildAttempt[];
+  detailArtifact: { path: RunStopFact; byteLength: RunStopFact; sha256: RunStopFact };
 }
 
 export const RUN_STOP_EVENT = 'stop';
@@ -62,6 +94,127 @@ export interface RunStopInput {
   site?: string;
   childEvidence?: PodChildEvidence;
   terminationReason?: 'pod-job-failed';
+  terminalEvidence?: Omit<RunStopTerminalEvidence, 'detailArtifact'>;
+  /** Test seam; production persists only the sanitized structured artifact. */
+  writeEvidenceArtifact?: (path: string, bytes: Buffer) => void;
+}
+
+const UNKNOWN: RunStopFact = 'unknown';
+const SAFE_TOKEN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,159}$/u;
+const RUN_STOP_REASON_CODES: readonly RunStopReasonCode[] = ['tdd-evidence-missing', 'goal-only-same-cell', 'decomposition-401-invalid-api-key', 'provider-credential-failure', 'unknown'];
+
+function safeRunStopFact(value: unknown): RunStopFact {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isSafeInteger(value) ? value : UNKNOWN;
+  if (typeof value !== 'string' || !value.trim() || !SAFE_TOKEN.test(value.trim())) return UNKNOWN;
+  return value.trim();
+}
+
+function safeRunStopReasonCode(value: unknown): RunStopReasonCode {
+  return typeof value === 'string' && (RUN_STOP_REASON_CODES as readonly string[]).includes(value) ? value as RunStopReasonCode : 'unknown';
+}
+
+function writeTerminalEvidenceArtifact(input: RunStopInput, record: Omit<RunStopRecord, 'terminalEvidence'>): RunStopTerminalEvidence | undefined {
+  if (!input.terminalEvidence) return undefined;
+  const facts = input.terminalEvidence;
+  const safeEvidence = {
+    childRunId: safeRunStopFact(facts.childRunId), job: safeRunStopFact(facts.job), attempt: safeRunStopFact(facts.attempt),
+    stage: safeRunStopFact(facts.stage), node: safeRunStopFact(facts.node), outcome: safeRunStopFact(facts.outcome),
+    exitCode: safeRunStopFact(facts.exitCode), reasonCode: safeRunStopReasonCode(facts.reasonCode),
+    childAttempts: facts.childAttempts.slice(-8).map((item) => ({
+      childRunId: safeRunStopFact(item.childRunId), job: safeRunStopFact(item.job), attempt: safeRunStopFact(item.attempt),
+      stage: safeRunStopFact(item.stage), outcome: safeRunStopFact(item.outcome), exitCode: safeRunStopFact(item.exitCode),
+      reasonCode: safeRunStopReasonCode(item.reasonCode),
+    })),
+  };
+  const bytes = Buffer.from(`${JSON.stringify({ runId: input.runId, site: safeRunStopFact(input.site), class: record.class, terminalEvidence: safeEvidence }, null, 2)}\n`, 'utf8');
+  try {
+    // Validate the run id through the canonical ledger contract before using it in a path.
+    runLedgerPath(input.runId);
+    const path = join(runLedgerDir(), 'stop-cause-evidence', `${input.runId}.json`);
+    if (input.writeEvidenceArtifact) input.writeEvidenceArtifact(path, bytes);
+    else {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      writeFileSync(path, bytes, { mode: 0o600 });
+    }
+    return { ...safeEvidence, detailArtifact: { path, byteLength: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex') } };
+  } catch {
+    return { ...safeEvidence, detailArtifact: { path: UNKNOWN, byteLength: UNKNOWN, sha256: UNKNOWN } };
+  }
+}
+
+/** Classify only named failure markers. Free-form strings are inspected, never copied to durable evidence. */
+export function classifyRunStopReason(input: { detail?: unknown; terminationReason?: unknown; providerErrorCategory?: unknown; observedText?: readonly unknown[] }): RunStopReasonCode {
+  const text = [input.detail, ...(input.observedText ?? [])].filter((value): value is string => typeof value === 'string').join('\n').toLowerCase();
+  if (input.terminationReason === 'goal-only-rework-exhausted') return 'goal-only-same-cell';
+  if (/goal-only-rework-exhausted/u.test(text)) return 'goal-only-same-cell';
+  if (/tdd-evidence-missing/u.test(text)) return 'tdd-evidence-missing';
+  // Require a decomposition context as well as both credential markers; generic 401s are not this diagnosis.
+  if (/decompos.{0,256}\b401\b.{0,256}invalid api key|decompos.{0,256}invalid api key.{0,256}\b401\b|decomposition-401-invalid-api-key/u.test(text)) return 'decomposition-401-invalid-api-key';
+  if (input.providerErrorCategory === 'credential') return 'provider-credential-failure';
+  return 'unknown';
+}
+
+/** Extract child attempt metadata without carrying untrusted child/provider text into the stop artifact. */
+export function runStopChildAttempts(entries: readonly RunLedgerEntry[], classify: (values: readonly unknown[]) => RunStopReasonCode = () => 'unknown'): RunStopChildAttempt[] {
+  const attempts: RunStopChildAttempt[] = [];
+  const attemptByJob = new Map<string, number>();
+  for (const entry of entries) {
+    const data = entry.data;
+    if (entry.event === 'pod-oom-retry-intent') {
+      if (typeof data.job === 'string' && Number.isSafeInteger(data.attempt) && typeof data.attempt === 'number') attemptByJob.set(data.job, data.attempt);
+      continue;
+    }
+    if (entry.event !== 'pod-child-evidence') continue;
+    const childRunId = safeRunStopFact(data.childRunId);
+    const childResult = data.childResult && typeof data.childResult === 'object' && !Array.isArray(data.childResult) ? data.childResult as Record<string, unknown> : {};
+    const pod = data.podTermination && typeof data.podTermination === 'object' && !Array.isArray(data.podTermination) ? data.podTermination as Record<string, unknown> : {};
+    const text = [childResult.error, data.childEvidence, entry.data].filter((value) => value !== undefined);
+    const stage = safeRunStopFact(childResult.stage);
+    const exitCode = safeRunStopFact(pod.exitCode);
+    const childOutcome = typeof childResult.ok === 'boolean' ? (childResult.ok ? 'completed' : 'failed')
+      : typeof exitCode === 'number' ? (exitCode === 0 ? 'completed' : 'failed') : UNKNOWN;
+    const job = safeRunStopFact(data.job);
+    attempts.push({ childRunId, job, attempt: typeof job === 'string' ? attemptByJob.get(job) ?? UNKNOWN : UNKNOWN,
+      stage, outcome: childOutcome, exitCode, reasonCode: classify(text) });
+  }
+  return attempts.slice(-8);
+}
+
+/** Join the final outcome to the latest recorded child attempt; missing fields stay explicit unknowns. */
+export function buildRunStopTerminalEvidence(input: {
+  stage: unknown;
+  node: unknown;
+  outcome: unknown;
+  detail?: unknown;
+  terminationReason?: unknown;
+  providerErrorCategory?: unknown;
+  entries: readonly RunLedgerEntry[];
+}): Omit<RunStopTerminalEvidence, 'detailArtifact'> {
+  const observedText = input.entries
+    .filter((entry) => entry.event === 'pod-child-evidence' || entry.event.includes('decomposition'))
+    .map((entry) => {
+      try { return `${entry.event} ${JSON.stringify(entry.data)}`.slice(0, 24_000); } catch { return ''; }
+    }).filter(Boolean);
+  const classify = (values: readonly unknown[]) => classifyRunStopReason({
+    observedText: values.map((value) => typeof value === 'string' ? value : (() => { try { return JSON.stringify(value); } catch { return ''; } })()),
+  });
+  const childAttempts = runStopChildAttempts(input.entries, classify);
+  const current = childAttempts.at(-1);
+  const classified = classifyRunStopReason({ detail: input.detail, terminationReason: input.terminationReason,
+    providerErrorCategory: input.providerErrorCategory, observedText: observedText.slice(-1) });
+  const reasonCode = classified !== 'unknown' ? classified : current?.reasonCode ?? 'unknown';
+  return {
+    childRunId: current?.childRunId ?? UNKNOWN,
+    job: current?.job ?? UNKNOWN,
+    attempt: current?.attempt ?? UNKNOWN,
+    stage: safeRunStopFact(input.stage),
+    node: safeRunStopFact(input.node),
+    outcome: safeRunStopFact(input.outcome),
+    exitCode: current?.exitCode ?? UNKNOWN,
+    reasonCode,
+    childAttempts,
+  };
 }
 
 export function isRunStopClass(value: unknown): value is RunStopClass {
@@ -79,6 +232,8 @@ export function boundRunStopCause(raw: string): string {
 /** 병합 보류 사유 → 닫힌 목록. 모르면 `unclassified`. */
 export function classifyMergeHoldStop(mergeReason: string | undefined): RunStopClass {
   const reason = mergeReason ?? '';
+  const graphClass = classifyStopReasonFromGraph(reason);
+  if (graphClass) return graphClass;
   if (reason.startsWith('main-sync') || reason === 'default-branch-unresolved') return 'main-sync';
   if (reason === 'required-evidence-uncovered') return 'evidence-uncovered';
   if (reason.startsWith('review-budget')) return 'review-budget-exhausted';
@@ -100,11 +255,21 @@ export function classifyPodExitStop(reason: string | undefined, stage?: string):
 /** Terminal implementation failures are classified only after the inner repair/round budget has ended. */
 export function classifyTerminalHarnessFailure(input: {
   stage: string;
+  cause?: string;
   mergeReason?: string;
   abandonedClassification?: string;
   providerErrorCategory?: string;
   supervisorVerdict?: string;
 }): RunStopClass {
+  const graphClass = classifyStopReasonFromGraph(input.cause ?? input.mergeReason ?? '');
+  if (graphClass) return graphClass;
+  if (input.abandonedClassification === 'implement-aborted') return 'implement-aborted';
+  if (input.abandonedClassification === 'out-of-scope-held') return 'out-of-scope-held';
+  if (input.providerErrorCategory === 'credential' || input.providerErrorCategory === 'provider-auth-missing') return 'provider-auth-missing';
+  if (input.providerErrorCategory === 'provider-unavailable') return 'provider-unavailable';
+  if (input.mergeReason === 'release-path-hold') return 'merge-held-release-path';
+  if (input.mergeReason === 'pr-guard-failed') return 'pr-guard-failed';
+  if (input.mergeReason === 'gate-unmeasured') return 'gate-unmeasured';
   if (input.mergeReason) return classifyMergeHoldStop(input.mergeReason);
   if (input.providerErrorCategory === 'credential' || input.abandonedClassification === 'credential-failure') return 'launch-failed';
   if (input.abandonedClassification === 'report-deficit') return 'pod-died';
@@ -113,6 +278,21 @@ export function classifyTerminalHarnessFailure(input: {
   if (input.stage === 'merge-conflict') return 'main-sync';
   if (input.stage === 'timed-out') return 'pod-died';
   return 'unclassified';
+}
+
+/** Exact reason vocabulary declared by heal graph overlays; unknown phrases remain unclassified. */
+export function classifyStopReasonFromGraph(reason: string): RunStopClass | undefined {
+  const normalized = reason.trim().toLowerCase();
+  if (!normalized) return undefined;
+  try {
+    for (const overlay of loadGraphOverlays(defaultOverlaysDir()).overlays) {
+      for (const [phrase, cls] of Object.entries(overlay.reasonMap ?? {})) {
+        const escaped = phrase.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`).test(normalized) && isRunStopClass(cls)) return cls;
+      }
+    }
+  } catch { /* malformed or unavailable graph declarations are not classifier evidence */ }
+  return undefined;
 }
 
 /** 이 프로세스에서 stop 을 이미 쓴 런 — 한 런이 두 자리(예: draft PR 실패 ⊕ aborted)에서 두 줄을 쓰지 않게. */
@@ -131,7 +311,7 @@ export function forgetRunStop(runId: string): void {
 
 /** 멈춘 런에 stop 한 줄을 더한다 — 기존 관측은 바꾸지 않는다. 쓴 줄을 돌려준다. */
 export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appendRunLedgerEntry): RunLedgerEntry {
-  const record: RunStopRecord = {
+  const base: Omit<RunStopRecord, 'terminalEvidence'> = {
     class: isRunStopClass(input.class) ? input.class : 'unclassified',
     ...(input.site ? { site: input.site } : {}),
     cause: boundRunStopCause(input.cause),
@@ -140,6 +320,8 @@ export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appe
     ...(input.childEvidence ? { childEvidence: input.childEvidence } : {}),
     ...(input.terminationReason ? { terminationReason: input.terminationReason } : {}),
   };
+  const terminalEvidence = writeTerminalEvidenceArtifact(input, base);
+  const record: RunStopRecord = { ...base, ...(terminalEvidence ? { terminalEvidence } : {}) };
   const entry: RunLedgerEntry = {
     timestamp: new Date().toISOString(), runId: input.runId, event: RUN_STOP_EVENT,
     data: { ...record },
@@ -153,6 +335,7 @@ export function recordRunStop(input: RunStopInput, write: RunLedgerWriter = appe
     try { listener(entry); } catch { /* wake consumers cannot change run outcome */ }
   }
   try {
+    debug.log('self-implement.run-stop', 'cause-classified', { runId: input.runId, terminalEvidence });
     debug.log('self-implement.run-stop', 'recorded', { runId: input.runId, site: input.site ?? null, ...record, requestedClass: input.class ?? null });
   } catch { /* observation is fail-soft */ }
   return entry;
@@ -166,5 +349,6 @@ export function readRunStopRecord(entry: RunLedgerEntry): RunStopRecord | undefi
   return { class: isRunStopClass(data.class) ? data.class : 'unclassified', cause: data.cause, evidenceRef: data.evidenceRef, nextMove: data.nextMove,
     ...(typeof data.site === 'string' ? { site: data.site } : {}),
     ...(data.childEvidence ? { childEvidence: data.childEvidence } : {}),
-    ...(data.terminationReason === 'pod-job-failed' ? { terminationReason: data.terminationReason } : {}) };
+    ...(data.terminationReason === 'pod-job-failed' ? { terminationReason: data.terminationReason } : {}),
+    ...(data.terminalEvidence && typeof data.terminalEvidence === 'object' ? { terminalEvidence: data.terminalEvidence as RunStopTerminalEvidence } : {}) };
 }

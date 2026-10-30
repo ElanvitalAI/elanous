@@ -13,6 +13,7 @@ import { getUserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { MsgStore } from '../msg/msg-store.js';
 import { createSessionPostureState, resolveSessionTurnProfile } from '../session-runtime/index.js';
+import { buildDashboardTurnPromptRuntime } from './turn-prompt-runtime.js';
 import { withSimClock } from '../ux-sim/fake-clock.js';
 import {
   createDashboardAgentWakeNotify,
@@ -44,6 +45,69 @@ test('research surface carries the current date and allows a full sourced report
     expect(ordinary).not.toContain('Current local date:');
     expect(ordinary).toContain('Keep the final response to at most');
   } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('classic research TUI preamble carries same-turn proactive reconciliation guidance', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'research-reconcile-preamble-'));
+  try {
+    const userText = '앞 답의 스킬 사용을 재확인하고 실제 이번 주 한국 시장 분석을 다시 해주세요.';
+    const turnProfile = resolveSessionTurnProfile({
+      userText,
+      chatModeState: createSessionPostureState(),
+      preferredSurfaceId: 'research/agent',
+    });
+    const messages = buildDashboardTurnPreamble({
+      userText, cwd, userConfig: fakeConfig, memory: false, turnProfile,
+      enabledTools: ['WebSearch', 'WebFetch', 'OmniSearch'],
+    });
+    const prompt = messages.map(message => String(message.content)).join('\n');
+    expect(prompt).toContain('## Proactive Reconciliation');
+    expect(prompt).toContain('continue in this same user turn');
+    expect(prompt).toContain('redo the original task');
+    expect(prompt.toLowerCase()).toContain('do not emit a raw json dump unless explicitly requested');
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('classic turn prompt runtime recognizes the CEO challenge and restores its prior research profile', () => {
+  const challenge = '스킬을 제대로 찾으라고 이야기했음에도 확인 후 결말을 조정하지 않았습니다.';
+  const originalRequest = '이번 주 한국 시장 변화와 관련 뉴스를 조사해 분석해줘.';
+  const turnRuntime = buildDashboardTurnPromptRuntime(challenge, 'evidence-reconcile-test', {
+    promptBankConfig: { enabled: false, dashboardTurns: false, budgetTokens: 0, limit: 0, record: false },
+    chatModeState: createSessionPostureState(),
+    buildPromptRuntimeState: () => ({} as never),
+    getPromptBankStore: () => ({} as never),
+    inspectActiveProvider: () => ({ model: 'test-model' }),
+    getActivePluginName: () => undefined,
+  }, undefined, [originalRequest]);
+  const preamble = buildDashboardTurnPreamble({
+    userText: challenge,
+    cwd: process.cwd(),
+    userConfig: getUserConfig(),
+    memory: false,
+    turnProfile: turnRuntime.turnProfile,
+  });
+  const text = preamble.map(message => String(message.content)).join('\n');
+
+  expect(turnRuntime.turnProfile.surface.id).toBe('research/agent');
+  expect(text).toContain('## Proactive Reconciliation');
+  expect(text).toContain('continue in this same user turn');
+});
+
+test('installed skill summaries lead the stable system preamble and respect the active catalog snapshot', () => {
+  const preamble = buildDashboardTurnPreamble({
+    userText: 'omni crawl',
+    cwd: process.cwd(),
+    userConfig: getUserConfig(),
+    memory: false,
+    skillCatalogContextWindow: 128_000,
+    skillCatalog: [
+      { name: 'omni-crawl', description: 'Gather relevant web context.' },
+      { name: 'kr-flow', description: 'Research Korean workflows.' },
+    ],
+  });
+  expect(preamble[0]?.content).toContain('[Installed skills]');
+  expect(preamble[0]?.content).toContain('- omni-crawl: Gather relevant web context.');
+  expect(preamble[0]?.content).toContain('- kr-flow: Research Korean workflows.');
 });
 
 describe('buildDashboardTurnPreamble — L1 자리 부트 카드(TUI-SESSION-BOOT)', () => {
@@ -157,11 +221,12 @@ describe('buildDashboardTurnPreamble — 제어 표면', () => {
 });
 
 describe('buildDashboardTurnPreamble — 자기접근 규율', () => {
-  test('drains queued task notifications into one user message only once', () => {
+  test('drains only this session task notifications into one user message once', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'preamble-'));
     globalTaskNotificationQueue.clear();
     globalTaskNotificationQueue.enqueue({
       taskId: 'task-dashboard-notification',
+      parentSessionId: 'session-a',
       agentName: 'dashboard-agent',
       state: 'done',
       output: 'background result',
@@ -169,19 +234,72 @@ describe('buildDashboardTurnPreamble — 자기접근 규율', () => {
       durationMs: 50,
       finishedAt: Date.now(),
     });
+    globalTaskNotificationQueue.enqueue({
+      taskId: 'task-other-session-notification', parentSessionId: 'session-b',
+      agentName: 'other-agent', state: 'done', output: 'other result', truncated: false,
+      durationMs: 50, finishedAt: Date.now(),
+    });
 
-    const idle = buildDashboardTurnPreamble({ userText: '', cwd, userConfig: fakeConfig });
+    const idle = buildDashboardTurnPreamble({ userText: '', cwd, userConfig: fakeConfig, sessionId: 'session-a' });
     expect(idle.some((message) => String(message.content).includes('<task-notification'))).toBe(false);
-    expect(globalTaskNotificationQueue.size).toBe(1);
-    const first = buildDashboardTurnPreamble({ userText: 'continue', cwd, userConfig: fakeConfig });
+    expect(globalTaskNotificationQueue.size).toBe(2);
+    const first = buildDashboardTurnPreamble({ userText: 'continue', cwd, userConfig: fakeConfig, sessionId: 'session-a' });
     const notification = first.find((message) => message.role === 'user'
       && String(message.content).includes('<task-notification'));
     expect(notification?.content).toContain('background result');
 
-    const second = buildDashboardTurnPreamble({ userText: 'continue', cwd, userConfig: fakeConfig });
+    const second = buildDashboardTurnPreamble({ userText: 'continue', cwd, userConfig: fakeConfig, sessionId: 'session-a' });
     expect(second).toHaveLength(first.length - 1);
     expect(second.some((message) => String(message.content).includes('<task-notification'))).toBe(false);
+    expect(globalTaskNotificationQueue.size).toBe(1);
+    const otherSession = buildDashboardTurnPreamble({ userText: 'continue', cwd, userConfig: fakeConfig, sessionId: 'session-b' });
+    expect(otherSession.some((message) => String(message.content).includes('other result'))).toBe(true);
     globalTaskNotificationQueue.clear();
+  });
+
+  test('classic TUI continuation replay harvests four parallel child results by 5m + 1m', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'classic-tui-child-replay-'));
+    const sessionId = 'classic-tui-parent';
+    const childFinishedAt = [60_000, 120_000, 180_000, 300_000];
+    const enqueued = new Set<number>();
+    const delivered = new Set<number>();
+    let elapsedMs = 0;
+    globalTaskNotificationQueue.clear();
+    try {
+      for (let turn = 1; turn <= 7; turn += 1) {
+        childFinishedAt.forEach((finishedAt, index) => {
+          if (finishedAt > elapsedMs || enqueued.has(index + 1)) return;
+          enqueued.add(index + 1);
+          globalTaskNotificationQueue.enqueue({
+            taskId: `child-${index + 1}`, parentSessionId: sessionId, agentName: 'research-child',
+            state: 'done', output: `verified-${index + 1}`, truncated: false, durationMs: finishedAt,
+            finishedAt,
+          });
+        });
+
+        const preamble = buildDashboardTurnPreamble({
+          userText: turn === 1 ? 'research in parallel' : '[goal continuation] incorporate new child evidence',
+          cwd, userConfig: fakeConfig, sessionId,
+        });
+        const deliveredXml = preamble.filter((message) => message.role === 'user'
+          && String(message.content).includes('<task-notification'))
+          .map((message) => String(message.content)).join('\n');
+        for (const match of deliveredXml.matchAll(/id="child-(\d+)"/gu)) delivered.add(Number(match[1]));
+
+        if (delivered.size === 4) {
+          elapsedMs += 60_000; // Allow one parent turn to synthesize the last arriving result.
+          break;
+        }
+        elapsedMs += 60_000;
+      }
+
+      expect(delivered).toEqual(new Set([1, 2, 3, 4]));
+      expect(elapsedMs).toBeLessThanOrEqual(6 * 60_000);
+      expect(globalTaskNotificationQueue.size).toBe(0);
+    } finally {
+      globalTaskNotificationQueue.clear();
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   test('자동 완료 턴에는 원문 task id와 결과의 로그·PR 포인터를 함께 보존한다', () => {

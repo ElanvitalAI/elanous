@@ -192,6 +192,28 @@ describe('run ledger archive', () => {
     expect(readRunLedgerSummaries(dir)).toEqual([]);
   }));
 
+  it('continues the graph event sequence after restoring a compacted ledger', () => inDirectory((dir) => {
+    const runId = id('d004');
+    const original = lines([
+      entry(runId, 'pipeline-node-entry', old, { node: 'investigate', seq: 1 }),
+      entry(runId, 'node-added', old, { node: 'source-check', kind: 'agent', decider: 'supervisor', reason: 'verify', seq: 2 }),
+      entry(runId, 'run-status', old, { runStatus: 'completed' }),
+    ]);
+    writeFileSync(runLedgerPath(runId, dir), original);
+    const plan = planLedgerCompaction({ dir, now });
+    expect(applyLedgerCompaction(plan).moved).toBe(1);
+
+    appendRunLedgerEntry({ runId, event: 'edge-rerouted', data: {
+      from: 'source-check', outcome: 'pass', to: 'summarize', was: 'gate', decider: 'orchestrator', reason: 'evidence found',
+    } }, dir);
+
+    const rows = loadRunLedger(runId, dir) ?? [];
+    expect(rows.filter((row) => row.event === 'pipeline-node-entry' || row.event === 'node-added' || row.event === 'edge-rerouted')
+      .map(({ event, seq, data }) => [event, seq ?? data.seq])).toEqual([
+      ['pipeline-node-entry', 1], ['node-added', 2], ['edge-rerouted', 3],
+    ]);
+  }));
+
   it('finishes an interrupted restore when apply is the next caller', () => inDirectory((dir) => {
     const runId = id('d004');
     const another = id('d005');

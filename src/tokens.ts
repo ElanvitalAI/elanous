@@ -33,7 +33,32 @@ export function estimateTokens(text: string): number {
   return Math.ceil(ascii / 4 + wide / 2);
 }
 
-export interface MessageLike { role: string; content: string | unknown[] }
+export interface MessageLike {
+  role: string;
+  content: string | unknown[];
+  /** Opaque reasoning replayed by the Codex Responses adapter. */
+  codexReasoningItems?: unknown[];
+}
+
+function estimateStructuredTokens(value: unknown, ancestors = new Set<object>()): number {
+  if (typeof value === 'string') return estimateTokens(value);
+  if (value === null || typeof value !== 'object') return 1;
+  if (ancestors.has(value)) return 200; // malformed cyclic extension: conservative block floor
+  ancestors.add(value);
+  let total = 2; // JSON brackets/braces
+  if (Array.isArray(value)) {
+    total += Math.ceil(value.length / 4); // commas
+    for (const item of value) total += estimateStructuredTokens(item, ancestors);
+  } else {
+    const entries = Object.entries(value);
+    total += Math.ceil(entries.length / 4); // commas
+    for (const [key, item] of entries) {
+      total += estimateTokens(key) + 1 + estimateStructuredTokens(item, ancestors);
+    }
+  }
+  ancestors.delete(value);
+  return total;
+}
 
 export function estimateMessagesTokens(messages: MessageLike[]): number {
   let total = 0;
@@ -44,7 +69,12 @@ export function estimateMessagesTokens(messages: MessageLike[]): number {
       for (const block of m.content) {
         if (!block || typeof block !== 'object') continue;
         const obj = block as Record<string, unknown>;
-        if (typeof obj.text === 'string') {
+        if (obj.type === 'tool_use' || obj.type === 'tool_result') {
+          // These payloads are replayed as structured JSON; fixed block cost
+          // misses large args/results. Retain the old 200-token floor for
+          // tiny blocks so many small calls cannot under-trigger compaction.
+          total += Math.max(200, estimateStructuredTokens(obj));
+        } else if (typeof obj.text === 'string') {
           total += estimateTokens(obj.text);
         } else if (typeof obj.content === 'string') {
           // Wave 2 (2026-05-04) · tool_result block content matters
@@ -57,6 +87,9 @@ export function estimateMessagesTokens(messages: MessageLike[]): number {
           total += 200;
         }
       }
+    }
+    if (m.role === 'assistant' && m.codexReasoningItems?.length) {
+      total += estimateStructuredTokens(m.codexReasoningItems);
     }
   }
   return total;

@@ -26,7 +26,7 @@ import type { ToolRunResult, ToolRuntime } from '../tool-runtime/types.js';
 import { blockWriteToolSearchHydration, type ToolSearchRunResult } from '../tool-runtime/tool-search-runtime.js';
 import { findNativeTool, isNativeToolModelExposed } from '../native-tool-catalog.js';
 import { hasAstGrep } from '../skills/tools/ast-grep.js';
-import { buildOmniSearchTool, omniSearchAvailable } from '../skills/tools/omni-search.js';
+import { buildOmniSearchTool, researchOmniSearchAvailable } from '../skills/tools/omni-search.js';
 import { buildWebSearchTool } from '../skills/tools/web-search.js';
 import { buildWebFetchTool } from '../skills/tools/webfetch.js';
 import { buildSelfImplementDaemonSpec } from '../boot/daemon-tools/self-implement.js';
@@ -170,6 +170,8 @@ export interface SessionPostureSnapshot {
 }
 
 export interface SessionRuntimeDispatchDeps {
+  /** Current conversation session; used to scope background Agent receipts. */
+  sessionId?: string;
   signal?: AbortSignal;
   /** Current LLM tool call, for correlating a foreground harness stop target with the TUI call. */
   toolCallId?: string;
@@ -429,6 +431,7 @@ interface SessionNativeToolRule {
     signal?: AbortSignal,
     opts?: {
       pathPolicy?: PathPolicy;
+      sessionId?: string;
       agentHostTools?: LLMToolSpec[];
       agentDispatchTool?: (name: string, args: Record<string, unknown>) => Promise<unknown>;
       buildChildToolCatalog?: (cwd: string) => {
@@ -512,6 +515,7 @@ const SESSION_NATIVE_TOOL_RULES: SessionNativeToolRule[] = [
     build: () => buildAgentTool(),
     match: () => false,
     dispatch: async (args, signal, opts) => await dispatchAgent(args, {
+      parentSessionId: opts?.sessionId,
       signal,
       hostTools: opts?.agentHostTools,
       dispatchTool: opts?.agentDispatchTool,
@@ -587,10 +591,10 @@ const SESSION_NATIVE_TOOL_RULES: SessionNativeToolRule[] = [
     description: 'Multi-source research and triangulation across external signals.',
     build: () => buildOmniSearchTool(),
     match: (text) => hasResearchSearchIntent(text),
-    isAvailable: () => omniSearchAvailable(),
+    isAvailable: () => researchOmniSearchAvailable(),
     dispatch: async (args) => {
-      const { dispatchOmniSearch } = await import('../skills/tools/omni-search.js');
-      return await dispatchOmniSearch(args);
+      const { dispatchResearchOmniSearch } = await import('../skills/tools/omni-search.js');
+      return await dispatchResearchOmniSearch(args);
     },
   },
   {
@@ -969,7 +973,45 @@ export function buildSessionRuntimeTurnSystemMessages(
   if (scopedGuidance) {
     messages.push({ role: 'system', content: scopedGuidance });
   }
+  const reconcileGuidance = buildProactiveReconcileGuidance(userText);
+  if (turnProfile.surface.domain === 'research') {
+    if (reconcileGuidance) {
+      messages.push({ role: 'system', content: PROACTIVE_RECONCILIATION_GUIDANCE.join('\n') });
+    }
+  } else if (reconcileGuidance) {
+    messages.push({ role: 'system', content: reconcileGuidance });
+  }
   return messages;
+}
+
+/** A challenged tool/source claim is a request to repair the answer, not just
+ *  to narrate whether the earlier answer was grounded. Keep this guidance
+ *  scoped to explicit evidence challenges so ordinary turns stay unchanged. */
+function buildProactiveReconcileGuidance(userText?: string): string | null {
+  const text = String(userText ?? '').toLowerCase();
+  if (!text.trim()) return null;
+
+  const explicitChallenge = [
+    /\b(?:did you|have you|were you)\b.{0,80}\b(?:actually|really|use|used|run|check|verify|consult|cite)\b/,
+    /\b(?:you (?:did not|didn't|never)\s+(?:use|run|check|verify|consult))\b/,
+    /\b(?:verify|check|recheck|re-check|confirm)\b.{0,80}\b(?:previous|prior|original|earlier)\b/,
+    /\b(?:earlier|previous|prior|last)\b.{0,40}\b(?:skill|tool|source|evidence)\b.{0,40}\b(?:used|ran|checked|verified|cited)\b.{0,30}\b(?:actually|really|right|correct)\b/,
+    /(?:앞서|이전|직전|기존|그때).{0,40}(?:스킬|도구|툴).{0,40}(?:쓴|사용한|실행한).{0,30}(?:맞|했나|했는지)/,
+    /(?:스킬|도구|툴).{0,40}(?:제대로|실제로).{0,40}(?:찾았는지|찾았나|사용했는지|사용했나|썼는지|썼나)/,
+    /(?:라고\s*(?:했는데|했음에도|말했는데)|이야기했음에도).{0,80}(?:확인|결말|결론|답).{0,40}(?:조정|수정|바꾸|고치)/,
+    /(?:스킬|도구|근거|출처).{0,60}(?:실제로\s*사용|제대로\s*사용|확인했나|썼나|쓴\s*게\s*맞|안\s*썼|못\s*찾|재확인)/,
+  ];
+  if (!explicitChallenge.some(pattern => pattern.test(text))) return null;
+
+  return [
+    '## Proactive Reconciliation — Tool-use Correction — Reconcile the Original Request This Turn',
+    '',
+    'The user is challenging whether the prior answer used the requested tool, skill, source, or evidence.',
+    'Treat the original task as still open. Recover it and the prior conclusion from the conversation, then verify the challenged claim with an available capability.',
+    'If verification changes or invalidates the prior conclusion, shows the original task was not completed, or finds that evidence is missing, incomplete, or insufficient, continue the original task in this same user turn with verified available tools and give a corrected, evidence-grounded result.',
+    'If the requested capability is unavailable, say so plainly and continue the original task with another suitable available source when possible. Never claim a tool or skill ran when it did not.',
+    'Do not stop at an apology or verification-only report, do not ask the user to repeat the task, and do not emit a raw JSON dump unless explicitly requested. Answer in concise prose.',
+  ].join('\n');
 }
 
 function buildTurnScopedExplorationGuidance(userText?: string): string | null {
@@ -1239,6 +1281,7 @@ function buildSurfaceOperationalGuidance(surface: SessionSurfaceProfile): string
         'Bias toward multi-source external investigation: use WebSearch, WebFetch, and OmniSearch before concluding.',
         'WebSearch is provider-backed and may route through Grok live-search or Firecrawl; OmniSearch is the wider parallel path when you want triangulation across providers.',
         'Prefer cited, current, cross-checked findings over repo-local assumptions when the question reaches beyond the workspace.',
+        '',
       ].join('\n');
     case 'research/turn':
       return [
@@ -1247,6 +1290,7 @@ function buildSurfaceOperationalGuidance(surface: SessionSurfaceProfile): string
         'You are in `research/turn`.',
         'Handle the current turn as a lightweight external lookup. Prefer quick verification and concise sourced answers over deep autonomous exploration.',
         'Keep WebSearch ready by default. It is provider-backed and may use Grok live-search or Firecrawl; use WebFetch for full page bodies and OmniSearch when the user asks for deeper cross-provider research.',
+        '',
       ].join('\n');
     case 'control/agent':
       return [
@@ -1274,6 +1318,13 @@ function buildSurfaceOperationalGuidance(surface: SessionSurfaceProfile): string
       return null;
   }
 }
+
+const PROACTIVE_RECONCILIATION_GUIDANCE = [
+  '## Proactive Reconciliation — Tool-use Correction — Reconcile the Original Request This Turn',
+  'When the user asks you to verify how an earlier answer was produced (tools, skills, or sources), check the actual results and compare them with the earlier conclusion.',
+  'Treat the original task as still open. If verification changes or invalidates that conclusion, shows the original task was not completed, or finds that the evidence is missing, incomplete, or insufficient to support the conclusion, treat it as unreliable and continue in this same user turn: redo the original task with verified available tools and answer the original task with the corrected, evidence-grounded result in ordinary prose.',
+  'Do not stop at an apology or verification-only report, do not ask the user to repeat the task, and do not emit a raw JSON dump unless explicitly requested. Answer in concise prose.',
+];
 
 export function createSessionPostureState(): SessionPostureState {
   return createChatModeState();
@@ -1560,6 +1611,40 @@ export function resolveSessionTurnProfile(opts: {
   };
 }
 
+function isProactiveReconciliationFollowUp(userText: string): boolean {
+  const referencesPrior = /(?:earlier|previous|prior|last|앞선|앞서|이전|직전|기존|그때|라고\s*(?:했|말)|이야기했|요청했)/i.test(userText);
+  const referencesEvidence = /(?:answer|response|analysis|conclusion|tool|skill|source|evidence|답|응답|분석|결론|도구|툴|스킬|출처|근거)/i.test(userText);
+  const asksToVerify = /(?:verify|recheck|check|confirm|validate|challenge|correct|used|맞|확인|검증|재확인|사용|사실|실제)/i.test(userText);
+  return referencesPrior && referencesEvidence && asksToVerify;
+}
+
+/** Preserve an active research turn's surface when the user challenges its prior evidence. */
+export function resolveSessionTurnProfileWithHistory(opts: {
+  userText: string;
+  priorUserTexts?: readonly string[];
+  chatModeState: ChatModeState;
+  inputSource?: InputSourceRef | null;
+}): SessionTurnProfile {
+  const current = resolveSessionTurnProfile(opts);
+  if (current.surface.domain === 'research' || !isProactiveReconciliationFollowUp(opts.userText)) return current;
+  for (const priorUserText of [...(opts.priorUserTexts ?? [])].reverse()) {
+    const prior = resolveSessionTurnProfile({
+      userText: priorUserText,
+      chatModeState: opts.chatModeState,
+      inputSource: opts.inputSource,
+    });
+    if (prior.surface.domain === 'research') {
+      return resolveSessionTurnProfile({
+        userText: opts.userText,
+        chatModeState: opts.chatModeState,
+        preferredSurfaceId: prior.surface.id,
+        inputSource: opts.inputSource,
+      });
+    }
+  }
+  return current;
+}
+
 export function resolveSessionSurfaceStatus(opts: {
   userText?: string;
   chatModeState: ChatModeState;
@@ -1736,6 +1821,7 @@ export function buildSessionRuntimeToolSpecs(opts: {
   preferredSurfaceId?: SessionSurfaceId;
   controlMode?: boolean;
 }): LLMToolSpec[] {
+  const catalogStartedAt = performance.now();
   // TUI-DIET-D1-TAIL — the legacy userText-driven catalog (`rich !== false`) is gone;
   // every caller already passed rich=false, so the essential catalog is the only path.
   // The surface profile is still resolved for the always-on observation below.
@@ -1799,6 +1885,13 @@ export function buildSessionRuntimeToolSpecs(opts: {
       userTextChars: opts.userText.length,
     });
   }
+  try {
+    debug.log('session-runtime.latency', 'tool-catalog-ready', {
+      elapsedMs: Math.round((performance.now() - catalogStartedAt) * 10) / 10,
+      toolCount: finalSpecs.length,
+      surfaceId: surface.id,
+    });
+  } catch { /* observation must never delay a turn */ }
   return finalSpecs;
 }
 
@@ -2025,6 +2118,7 @@ export async function dispatchSessionRuntimeTool(
       }
       result = await nativeRule.dispatch(normalizedArgs, deps.signal, {
         pathPolicy: deps.pathPolicy,
+        sessionId: deps.sessionId,
         agentHostTools: deps.agentHostTools,
         agentDispatchTool: deps.agentDispatchTool,
         buildChildToolCatalog: deps.buildChildToolCatalog,

@@ -47,7 +47,7 @@ const base = {
 const testProvenance = { actorKind: 'seat', actor: 'OPC', kind: 'command', run: 'test-run-12345678',
   phase: 'exec', requestedAt: '2026-10-20T09:00:00Z' };
 // The required launch identity changes the baseline bytes; optional Job fields must still leave this baseline untouched.
-const PROVENANCE_MANIFEST_SHA256 = '885410325c0a6335a8132ed1e56052e85dabaf1b4c4ba0ae4a57bd2c880c6251';
+const PROVENANCE_MANIFEST_SHA256 = 'f91a618d2917695e06beb846ad7baf02c1cd68c39847a7fbef1f479d8add0e65';
 const runPodCommand = (options: RunPodCommandOptions) => runPodCommandImpl({ provenance: testProvenance, ...options });
 
 function manifest(over: Partial<Parameters<typeof podCommandJobManifest>[0]> = {}) {

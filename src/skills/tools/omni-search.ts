@@ -73,16 +73,39 @@ export function buildOmniSearchTool(): LLMToolSpec {
   };
 }
 
+const RESEARCH_GROK_TIMEOUT_MS = 8_000;
+
 export async function dispatchOmniSearch(
   rawArgs: Record<string, unknown>,
   opts: OmniSearchDispatchOpts = {},
 ): Promise<OmniSearchResult> {
+  return dispatchWithProviders(validate(rawArgs), opts);
+}
+
+export async function dispatchResearchOmniSearch(
+  rawArgs: Record<string, unknown>,
+  opts: OmniSearchDispatchOpts = {},
+): Promise<OmniSearchResult> {
   const args = validate(rawArgs);
+  const selected = getAvailableResearchProviders();
+  const requested = args.engines === undefined ? undefined : new Set(args.engines.map(id => id.toLowerCase()));
+  const providers = requested === undefined
+    ? selected
+    : selected.filter(provider => requested.has(provider.id.toLowerCase()));
+  return dispatchWithProviders(args, opts, providers, { grokTimeoutMs: RESEARCH_GROK_TIMEOUT_MS });
+}
+
+async function dispatchWithProviders(
+  args: OmniSearchArgs,
+  opts: OmniSearchDispatchOpts,
+  selectedProviders?: ReturnType<typeof getAvailableWebSearchProviders>,
+  researchLimits?: { grokTimeoutMs: number },
+): Promise<OmniSearchResult> {
   const merge = args.merge ?? 'interleave';
   const limit = Math.max(1, Math.min(args.limit ?? DEFAULT_LIMIT, MAX_LIMIT));
 
-  let providers = getAvailableWebSearchProviders();
-  if (args.engines && args.engines.length > 0) {
+  let providers = selectedProviders ?? getAvailableWebSearchProviders();
+  if (!selectedProviders && args.engines && args.engines.length > 0) {
     const wanted = new Set(args.engines.map(e => e.toLowerCase()));
     providers = providers.filter(p => wanted.has(p.id.toLowerCase()));
   }
@@ -105,13 +128,33 @@ export async function dispatchOmniSearch(
     const start = Date.now();
     emit({ engine: p.id, phase: 'start' });
     try {
-      const result = await p.search({
+      const query = {
         query: args.query,
         limit,
         allowDomains: args.allow_domains,
         blockDomains: args.block_domains,
         recencyDays: args.recency_days,
-      });
+      };
+      let result;
+      if (researchLimits && (p.id === 'grok' || p.id === 'grok-api')) {
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          result = await Promise.race([
+            p.search(query, controller.signal),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => {
+                controller.abort();
+                reject(new DOMException(`Grok research search timed out after ${researchLimits.grokTimeoutMs}ms`, 'TimeoutError'));
+              }, researchLimits.grokTimeoutMs);
+            }),
+          ]);
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      } else {
+        result = await p.search(query);
+      }
       perEngine[p.id] = { hits: result.hits, durationMs: Date.now() - start };
       for (const hit of result.hits) {
         try {
@@ -165,9 +208,28 @@ export async function dispatchOmniSearch(
   };
 }
 
-/** Probe-compatible: at least 2 search providers available. */
+/** Probe-compatible: at least 2 search providers available for ordinary omni_search. */
 export function omniSearchAvailable(): boolean {
   return getAvailableWebSearchProviders().length >= 2;
+}
+
+/** Research-only probe: require the bounded Grok/Firecrawl research pair. */
+export function researchOmniSearchAvailable(): boolean {
+  return getAvailableResearchProviders().length >= 2;
+}
+
+export function getAvailableResearchSearchEngineIds(): string[] {
+  return getAvailableResearchProviders().map(provider => provider.id);
+}
+
+function getAvailableResearchProviders(): ReturnType<typeof getAvailableWebSearchProviders> {
+  const available = getAvailableWebSearchProviders();
+  const grok = available.find(provider => provider.id === 'grok')
+    ?? available.find(provider => provider.id === 'grok-api');
+  return [
+    ...(grok ? [grok] : []),
+    ...available.filter(provider => provider.id === 'firecrawl'),
+  ];
 }
 
 function interleaveHits(perEngine: Record<string, { hits: WebSearchHit[] }>): WebSearchHit[] {

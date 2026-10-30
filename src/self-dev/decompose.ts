@@ -107,7 +107,7 @@ export interface SelfDevDecompositionMeta {
    *  `authored-empty`           Fabric 저작이 분해할 arc를 만들지 못했다
    *  `llm-failed`               LLM 호출 자체가 «실패»했다(타임아웃·제공자 장애) ⇒ 분해를 «못 한» 것이다
    *  ⛔ 「쪼갤 필요가 없었다」와 Fabric 사전분해 실패는 다른 값이다. */
-  outcome: 'decomposed' | 'single-no-subtasks' | 'missing-research-context' | 'grounding-empty' | 'authored-empty' | 'llm-failed';
+  outcome: 'decomposed' | 'single-no-subtasks' | 'slice-rejected' | 'missing-research-context' | 'grounding-empty' | 'authored-empty' | 'llm-failed';
   /** `llm-failed` 일 때만 실린다 — 문면의 «머리»를 자르지 않는다. */
   error?: string;
   /** Present for Fabric decomposition, including zero, to distinguish no omissions from no report. */
@@ -399,6 +399,10 @@ export function buildSelfDevDecomposePrompt(feature: string, maxTasks = DEFAULT_
     '- SEPARATE DEFINE FROM WIRE: adding a new function/type/export is a SEPARATE task from wiring it into an existing runtime call site. A task that both defines a new symbol AND integrates it across modules tends to leave dead-code (defined but never called) that fails integration gates. Pattern: (a) add the function + its unit test; then (b) a dependent task that wires it into the specific existing call site — name the exact `file.ts:function` to modify.',
     '- Exception to SEPARATE DEFINE FROM WIRE: Keep a definition and its registration/wiring in the same sub-feature — a handler with its route, a command with its CLI registration, a node with its graph/recipe entry.',
     '- Each sub-feature must be a self-contained, mergeable unit of work.',
+    '- LANDABLE SLICE CONTRACT: every sub-feature must state a completionBoundary that can be implemented and verified without a later sub-feature, future component, or unwired operational path. If it cannot stand alone, split it further or omit it.',
+    '- Every sub-feature must name one existing mock scenario as mockScenario.id (MS-01, MS-02, ...), plus a concrete mockScenario.injection and mockScenario.observation. Describe the event or input injected and the output/event that proves the slice works.',
+    '- List every required earlier slice explicitly in dependsOn. An empty list means this slice has no predecessor; never rely on implicit order or a future capability.',
+    '- Declare futureAssumptions as an array. If the slice needs any future component, later slice, or unwired operational path, list it there; that slice will be rejected with a decompose.slice-rejected event containing its id and reason, and must be split or omitted.',
     '- `dependsOn`: list the `id`s of sub-features that MUST land first (e.g. a shared',
     '  type/interface before its consumers). Independent sub-features share NO dependency',
     '  so they run in parallel. No cycles.',
@@ -410,8 +414,10 @@ export function buildSelfDevDecomposePrompt(feature: string, maxTasks = DEFAULT_
     '',
     '## Output (STRICT JSON — no prose, no code fence)',
     '{"subtasks":[{"id":"<short-slug>","feature":"<imperative sub-feature text>",',
-    '  "dependsOn":["<id>",...],"hotPaths":["<path>",...],',
-    '  "goalType":"<implement|research|document|operate>"}]}',
+    '  "completionBoundary":"<standalone change and observable outcome>",',
+    '  "mockScenario":{"id":"MS-01","injection":"<input/event injected>","observation":"<output/event observed>"},',
+    '  "futureAssumptions":[],"dependsOn":["<explicit predecessor id>",...],',
+    '  "hotPaths":["<path>",...],"goalType":"<implement|research|document|operate>"}]}',
   ].join('\n');
 }
 
@@ -421,6 +427,19 @@ interface RawSubtask {
   dependsOn?: unknown;
   hotPaths?: unknown;
   goalType?: unknown;
+  completionBoundary?: unknown;
+  mockScenario?: unknown;
+  futureAssumptions?: unknown;
+}
+
+interface RejectedDecompositionSlice {
+  id: string | null;
+  reasons: string[];
+}
+
+interface ValidatedDecomposition {
+  goals: SelfDevGoal[];
+  rejected: RejectedDecompositionSlice[];
 }
 
 const SELF_DEV_GOAL_TYPES = new Set(['implement', 'research', 'document', 'operate'] as const);
@@ -625,6 +644,90 @@ export function parseSelfDevDecomposition(
   return goals;
 }
 
+/** Parse the production decomposition contract and keep a reason for each rejected slice. */
+function parseValidatedSelfDevDecomposition(
+  subtasks: readonly unknown[],
+  defaults: { base?: string; autoMerge?: boolean },
+): ValidatedDecomposition {
+  const goals: SelfDevGoal[] = [];
+  const rejected: RejectedDecompositionSlice[] = [];
+  const allIds = new Set(subtasks.flatMap((value) => isRawSubtask(value)
+    && typeof value.id === 'string' && value.id.trim() ? [value.id.trim()] : []));
+  const seenIds = new Set<string>();
+
+  subtasks.forEach((value, index) => {
+    if (!isRawSubtask(value)) {
+      rejected.push({ id: null, reasons: ['slice must be an object'] });
+      return;
+    }
+    const feature = typeof value.feature === 'string' ? value.feature.trim() : '';
+    const id = typeof value.id === 'string' && value.id.trim() ? value.id.trim() : String(index);
+    const reasons: string[] = [];
+    const completionBoundary = typeof value.completionBoundary === 'string' ? value.completionBoundary.trim() : '';
+    if (!feature) reasons.push('feature is missing');
+    if (!completionBoundary) reasons.push('completionBoundary is missing');
+
+    const mock = value.mockScenario as { id?: unknown; injection?: unknown; observation?: unknown } | undefined;
+    const scenarioId = typeof mock?.id === 'string' ? mock.id.trim() : '';
+    const injection = typeof mock?.injection === 'string' ? mock.injection.trim() : '';
+    const observation = typeof mock?.observation === 'string' ? mock.observation.trim() : '';
+    if (!/^MS-[A-Z0-9][A-Z0-9-]*$/i.test(scenarioId)) reasons.push('mockScenario.id must be an MS id');
+    if (!injection) reasons.push('mockScenario.injection is missing');
+    if (!observation) reasons.push('mockScenario.observation is missing');
+
+    if (!Array.isArray(value.futureAssumptions)) reasons.push('futureAssumptions must be declared as an array');
+    else if (value.futureAssumptions.length > 0) reasons.push('future assumptions require split or omission');
+
+    if (value.dependsOn === undefined) reasons.push('dependsOn is missing; declare an explicit id array');
+    else if (!Array.isArray(value.dependsOn)) reasons.push('dependsOn must be an explicit id array');
+    const dependsOn = Array.isArray(value.dependsOn)
+      ? value.dependsOn.filter((dependency): dependency is string => typeof dependency === 'string' && dependency.trim().length > 0)
+      : [];
+    if (Array.isArray(value.dependsOn) && dependsOn.length !== value.dependsOn.length) reasons.push('dependsOn contains an invalid predecessor id');
+    for (const dependency of dependsOn) {
+      if (dependency === id || !allIds.has(dependency)) reasons.push(`dependsOn references a missing or self predecessor: ${dependency}`);
+    }
+
+    let uniqueId = id;
+    if (seenIds.has(uniqueId)) uniqueId = `${uniqueId}-${index}`;
+    seenIds.add(uniqueId);
+    if (reasons.length) {
+      rejected.push({ id, reasons: [...new Set(reasons)] });
+      return;
+    }
+
+    const llmHot = Array.isArray(value.hotPaths)
+      ? value.hotPaths.filter((path): path is string => typeof path === 'string')
+      : [];
+    const hotPaths = [...new Set([...llmHot, ...inferHotPaths(feature)])];
+    goals.push({
+      id: uniqueId,
+      feature,
+      completionBoundary,
+      mockScenario: { id: scenarioId, injection, observation },
+      ...(dependsOn.length ? { dependsOn } : {}),
+      ...(hotPaths.length ? { hotPaths } : {}),
+      ...(isSelfDevGoalType(value.goalType) ? { goalType: value.goalType } : {}),
+      ...defaults,
+    });
+  });
+
+  // A dependent slice cannot stay independently landable when its predecessor was rejected.
+  let removedDependent = true;
+  while (removedDependent) {
+    removedDependent = false;
+    const validIds = new Set(goals.map((goal) => goal.id));
+    for (const goal of [...goals]) {
+      const missing = (goal.dependsOn ?? []).filter((dependency) => !validIds.has(dependency));
+      if (missing.length === 0) continue;
+      goals.splice(goals.indexOf(goal), 1);
+      rejected.push({ id: goal.id ?? null, reasons: [`dependsOn references a rejected predecessor: ${missing.join(', ')}`] });
+      removedDependent = true;
+    }
+  }
+  return { goals, rejected };
+}
+
 /**
  * Decompose a feature into a self-dev DAG via the LLM seam. Falls back to
  * a single goal (the whole feature) when decomposition yields nothing —
@@ -710,10 +813,21 @@ export async function decomposeSelfDevGoal(
   const rawSubtasks = extractRawSubtasks(raw);
   const actualTaskCount = rawSubtasks.length;
   const decomposition: SelfDevDecompositionMeta = { recommendedMaxTasks: maxTasks, actualTaskCount, truncatedAtHardMax: actualTaskCount > hardMaxTasks, exceededRecommendedMax: actualTaskCount > maxTasks, outcome: actualTaskCount === 0 ? 'single-no-subtasks' : 'decomposed' };
-  const parsedGoals = parseSelfDevDecomposition(JSON.stringify({ subtasks: rawSubtasks.slice(0, hardMaxTasks) }), defaults);
+  const validated = parseValidatedSelfDevDecomposition(rawSubtasks.slice(0, hardMaxTasks), defaults);
+  for (const rejection of validated.rejected) {
+    debug.log(opts.observation?.category ?? 'self-dev.decompose', 'decompose.slice-rejected', {
+      ...observationIdentity(opts.observation ?? {}),
+      sliceId: rejection.id,
+      reasons: rejection.reasons,
+    }, { level: 'warn' });
+  }
+  const parsedGoals = validated.goals;
   const foldedGoals = foldRegistrationOnlyGoals(parsedGoals);
   const goals = parsedGoals.length > 0 ? pruneDanglingDependencies(foldedGoals) : [single];
-  return finalizeDecomposition(feature, goals, decomposition, opts, parsedGoals.length > 0 ? arcHint : undefined, parsedGoals.length - foldedGoals.length);
+  const finalDecomposition = parsedGoals.length === 0 && validated.rejected.length > 0
+    ? { ...decomposition, outcome: 'slice-rejected' as const }
+    : decomposition;
+  return finalizeDecomposition(feature, goals, finalDecomposition, opts, parsedGoals.length > 0 ? arcHint : undefined, parsedGoals.length - foldedGoals.length);
 }
 
 /** Where the decompose model came from — `'explicit'` is the caller's `model` argument layer. */

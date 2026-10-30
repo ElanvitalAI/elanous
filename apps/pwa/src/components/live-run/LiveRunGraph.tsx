@@ -130,7 +130,13 @@ function LiveEdge({ id, data, markerEnd, style }: EdgeProps) {
 
 const NODE_TYPES = { live: LiveNode, ...GROUP_BOX_NODE_TYPES };
 const EDGE_TYPES = { live: LiveEdge };
-export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; /** `?units=folded` — start with every unit folded. */ initialFolded?: boolean }) {
+export function LiveRunGraph({ runId, initialFolded = false, sceneOnly = false }: {
+  runId: string;
+  /** `?units=folded` — start with every unit folded. */
+  initialFolded?: boolean;
+  /** Render the current ledger scene without exposing replay/fold controls. */
+  sceneOnly?: boolean;
+}) {
   const client = useNexusClient();
   const traversal = useQuery({
     queryKey: ['harness-run-traversal', runId],
@@ -175,7 +181,7 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
 
   const live = run?.status === 'running';
   const [mode, setMode] = useState<'live' | 'replay' | null>(null);
-  const effectiveMode = mode ?? (live ? 'live' : 'replay');
+  const effectiveMode = sceneOnly ? 'live' : mode ?? (live ? 'live' : 'replay');
   const [cursor, setCursor] = useState(-1);
   const [entering, setEntering] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -202,9 +208,9 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
   useEffect(() => {
     if (!run || started.current || steps.length === 0) return;
     started.current = true;
-    if (run.status === 'running') { setCursor(steps.length - 1); setEntering(steps.at(-1)!.outcome === null); }
+    if (run.status === 'running' || sceneOnly) { setCursor(steps.length - 1); setEntering(steps.at(-1)!.outcome === null); }
     else { setCursor(0); setEntering(true); setPlaying(true); }
-  }, [run, steps]);
+  }, [run, steps, sceneOnly]);
 
   // 라이브 따라가기 — 새 노드가 원장에 들어오면 커서가 따라간다.
   useEffect(() => {
@@ -318,13 +324,13 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
       </div>
 
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <div role="group" aria-label="보기" className="flex overflow-hidden rounded border border-border">
+        {!sceneOnly && <div role="group" aria-label="보기" className="flex overflow-hidden rounded border border-border">
           <button type="button" disabled={!live} onClick={() => { setMode('live'); setPlaying(false); }}
             className={`px-2 py-1 ${effectiveMode === 'live' ? 'bg-primary text-primary-foreground' : ''} disabled:opacity-40`}>● 라이브</button>
           <button type="button" onClick={() => { setMode('replay'); }}
             className={`px-2 py-1 ${effectiveMode === 'replay' ? 'bg-primary text-primary-foreground' : ''}`}>리플레이</button>
-        </div>
-        {effectiveMode === 'replay' && (
+        </div>}
+        {!sceneOnly && effectiveMode === 'replay' && (
           <>
             <button type="button" aria-label={playing ? '일시정지' : '재생'} onClick={() => {
               if (!playing && cursor >= steps.length - 1) { setCursor(0); setEntering(true); }
@@ -345,7 +351,7 @@ export function LiveRunGraph({ runId, initialFolded = false }: { runId: string; 
         <button type="button" onClick={() => { setFollow(false); zoomTo(null); }} className="rounded border border-border px-2 py-1">전체 보기</button>
         <button type="button" aria-pressed={follow} onClick={() => { setFollow(!follow); setFocus(null); }}
           className={`rounded border px-2 py-1 ${follow ? 'border-primary text-primary' : 'border-border'}`}>카메라 따라가기</button>
-        {units.length > 0 && (
+        {!sceneOnly && units.length > 0 && (
           <button type="button" data-testid="toggle-units" onClick={() => { setFocus(null); setCollapsed(collapsed.size === units.length ? new Set() : new Set(units)); }}
             className="rounded border border-border px-2 py-1">{collapsed.size === units.length ? '묶음 펼치기 (통합 보기)' : '묶음 접기'}</button>
         )}

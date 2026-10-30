@@ -607,7 +607,7 @@ test('actual bridge fences a host run because the file runner requires a dedicat
     const outcome = JSON.parse(run.stdout);
     expect(outcome.quarantineWorker).toBe(true);
     expect(outcome.reply).toBeNull();
-    expect(outcome.reason).toBe('execution-error');
-    expect(readFileSync(join(data, 'control/quarantine'), 'utf8')).toBe('execution-error');
+    expect(outcome.reason).toBe('quarantined');
+    expect(readFileSync(join(data, 'control/quarantine'), 'utf8')).toBe('quarantined');
   } finally { rmSync(data, { recursive: true, force: true }); }
 }, 120_000);

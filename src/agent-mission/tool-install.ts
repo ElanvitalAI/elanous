@@ -1,11 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
 import { detectDistroFamily, toolInstallLine, type DistroFamily } from '../cli/doctor-distro.js';
 import { debug } from '../debug/log.js';
 import { emitDecision, type DecisionEvent } from '../live/detail-switch.js';
+import { checkClaudeSubscription } from './claude-subscription.js';
+import { claudeBackend, codexBackend, resolveBackendSpawn } from './driver.js';
 
 type RemedyTool = 'gh' | 'rg' | 'node' | 'codex' | 'jq' | 'ffmpeg';
 export type SmokeTool = RemedyTool | 'git';
@@ -24,6 +26,90 @@ type ExecResult = { status: number | null; stdout?: string; stderr?: string };
 type PtyProbe = { status: 'ok'; output: string; exitCode: number } | { status: 'unavailable'; detail: string };
 export interface SmokeDeps {
   exec?: (cmd: string[], opts: { stdin?: string; timeoutMs: number }) => ExecResult;
+}
+
+export type AgentCli = 'claude' | 'codex';
+export type AgentCliDetection = {
+  agent: AgentCli;
+  /** null means the executable/version probe could not establish installation state. */
+  installed: boolean | null;
+  executable: 'present' | 'missing' | 'unknown';
+  login: 'ready' | 'needed' | 'api-key' | 'unknown';
+  message: string;
+};
+
+type AgentCliRunner = (command: string, args: string[], options: {
+  encoding: 'utf8'; timeout: number; env: Record<string, string>;
+}) => ReturnType<typeof spawnSync>;
+
+function verifiedAgentVersion(agent: AgentCli, raw: string): boolean {
+  const prefix = agent === 'claude' ? /^(?:Claude(?: Code)?\s+)?v?/i : /^(?:Codex(?:-CLI)?\s+)?v?/i;
+  const versioned = raw.replace(prefix, '');
+  // Probe output is untrusted: validate its shape but never return any part of it.
+  return /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?(?: \(Claude Code\))?$/i.test(versioned);
+}
+
+function agentExecutableExists(command: string, env: Record<string, string>): boolean {
+  if (command.includes('/')) return existsSync(isAbsolute(command) ? command : resolve(command));
+  return (env.PATH ?? '').split(delimiter).some((directory) => existsSync(join(directory || process.cwd(), command)));
+}
+
+/** Inspect the local agent CLI without returning auth output or credential values. */
+export function detectAgentCli(
+  agent: AgentCli,
+  options: { env?: Record<string, string | undefined>; runCli?: AgentCliRunner } = {},
+): AgentCliDetection {
+  const backend = agent === 'claude' ? claudeBackend : codexBackend;
+  const spawn = resolveBackendSpawn(backend, options.env ?? process.env);
+  const runCli = options.runCli ?? spawnSync;
+  const run = (args: string[]) => runCli(agent, args, {
+    encoding: 'utf8', timeout: 5_000, env: spawn.env,
+  });
+  let versionResult: ReturnType<typeof spawnSync>;
+  try { versionResult = run(['--version']); }
+  catch (error) {
+    if ((error as { code?: string })?.code === 'ENOENT') {
+      const present = agentExecutableExists(spawn.cmd, spawn.env);
+      return { agent, installed: present ? null : false, executable: present ? 'unknown' : 'missing', login: 'unknown', message: present ? `${agent}: 실행 파일을 실행할 수 없어 상태 확인 불가` : `${agent}: 설치되지 않음` };
+    }
+    return { agent, installed: null, executable: 'unknown', login: 'unknown', message: `${agent}: 설치 여부 확인 불가` };
+  }
+  if ((versionResult.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+    const present = agentExecutableExists(spawn.cmd, spawn.env);
+    return { agent, installed: present ? null : false, executable: present ? 'unknown' : 'missing', login: 'unknown', message: present ? `${agent}: 실행 파일을 실행할 수 없어 상태 확인 불가` : `${agent}: 설치되지 않음` };
+  }
+  const rawVersion = `${versionResult.stdout ?? ''}\n${versionResult.stderr ?? ''}`.trim().split(/\r?\n/, 1)[0] ?? '';
+  const versionVerified = versionResult.status === 0 && verifiedAgentVersion(agent, rawVersion);
+  if (!versionVerified) {
+    const executable = versionResult.status === null || versionResult.error ? 'unknown' : 'present';
+    return {
+      agent, installed: null, executable, login: 'unknown',
+      message: executable === 'present' ? `${agent}: 실행 파일 있음, 버전 확인 불가` : `${agent}: 설치 여부 확인 불가`,
+    };
+  }
+
+  let login: AgentCliDetection['login'] = 'unknown';
+  if (agent === 'claude') {
+    const auth = checkClaudeSubscription({ env: spawn.env, runCli });
+    login = auth.ok ? 'ready' : auth.reason === 'logged-out' || auth.reason === 'api-key' ? 'needed' : 'unknown';
+  } else {
+    try {
+      const auth = run(['login', 'status']);
+      const output = `${auth.stdout ?? ''}\n${auth.stderr ?? ''}`;
+      const normalized = output.trim();
+      if (auth.status === 0 && /^logged in using an api key\.?$/i.test(normalized)) login = 'api-key';
+      else if (auth.status === 0 && /^logged in(?: using (?:chatgpt|openai))?\.?$/i.test(normalized)) login = 'ready';
+      else if (/\bnot\b.*\blogged in\b|\blogged out\b|\blogout\b|\bplease log in\b|\brun codex login\b/i.test(normalized)) login = 'needed';
+    } catch { /* Keep authentication unknown when the probe itself fails. */ }
+  }
+  const message = login === 'ready'
+    ? `${agent}: 설치됨, 로그인 확인됨`
+    : login === 'api-key'
+      ? `${agent}: API 키 로그인됨 (구독 로그인 아님)`
+    : login === 'needed'
+      ? `${agent}: 설치됨, 로그인 필요`
+      : `${agent}: 설치됨, 로그인 상태 확인 불가`;
+  return { agent, installed: true, executable: 'present', login, message };
 }
 
 function defaultExec(cmd: string[], opts: { stdin?: string; timeoutMs: number }): ExecResult {

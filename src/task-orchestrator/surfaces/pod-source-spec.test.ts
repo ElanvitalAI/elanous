@@ -62,9 +62,11 @@ describe('resolvePodSource', () => {
       const parsed = parsePodSourceSpec(`worktree:${repo}`);
       expect(parsed.kind).toBe('worktree');
       if (parsed.kind !== 'worktree') return;
-      const source = resolvePodSource(parsed, { base, outDir });
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const source = resolvePodSource(parsed, { base, outDir, mirrorHead: base, log: (_category, event, data) => events.push({ event, data }) });
       expect(source.kind).toBe('bundle');
       if (source.kind !== 'bundle') return;
+      expect(events).toContainEqual({ event: 'bundle-packed', data: expect.objectContaining({ bundleMode: 'thin', bundleReason: 'shared-history', sizeBytes: source.sizeBytes }) });
       expect(source.sha256).toMatch(/^[0-9a-f]{64}$/);
       expect(source.sizeBytes).toBeGreaterThan(0);
       expect(source.headCommit).toMatch(/^[0-9a-f]{40}$/);

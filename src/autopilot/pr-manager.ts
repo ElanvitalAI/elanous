@@ -488,12 +488,15 @@ function editExistingPr(run: CmdRunner, input: UpsertPrInput, url: string): Upse
 /** Same-card rework may have a new run branch. Merge the bound PR head into that work,
  * then update the bound branch with a plain fast-forward push. Every identity read is
  * checked again after the inventory snapshot; an ambiguous or moved PR stays refused. */
-function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullable<GuardVerdict['sameCellReuse']>, recheck: () => GuardVerdict): UpsertPrOutcome {
+function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullable<GuardVerdict['sameCellReuse']>,
+  initialInventory: GuardVerdict, recheck: () => GuardVerdict): UpsertPrOutcome {
   const cwd = input.worktreePath;
   const pushEvidence = { ref: `refs/heads/${target.branch}`, remoteHead: target.headSha, cardId: target.cardId };
-  const fail = (detail: string): UpsertPrOutcome => {
+  const fail = (detail: string, inventoryEvidence?: { inventoryBefore: unknown; inventoryAfter: unknown; inventoryDiff: unknown }): UpsertPrOutcome => {
     const safeDetail = sanitizeCredentialText(detail).slice(0, 300);
-    debug.log('autopilot.pr-manager', 'same-cell-push-decision', { ...pushEvidence, outcome: 'refused', reason: safeDetail }, { level: 'warn' });
+    debug.log('autopilot.pr-manager', 'same-cell-push-decision', {
+      ...pushEvidence, outcome: 'refused', reason: safeDetail, ...inventoryEvidence,
+    }, { level: 'warn' });
     return { ok: false, reason: 'guard', detail: `same-cell reuse: ${safeDetail}` };
   };
   if (!/^[0-9a-f]{40}$/i.test(target.headSha) || !Number.isSafeInteger(target.number) || target.number < 1
@@ -617,11 +620,39 @@ function reuseSameCellPr(run: CmdRunner, input: UpsertPrInput, target: NonNullab
     || finalPr.url !== pr.url) return fail('PR changed before push');
   const finalRemote = run('git', ['-C', cwd, 'ls-remote', '--exit-code', 'origin', remoteRef]);
   if (!finalRemote.ok || finalRemote.out.trim() !== `${target.headSha}\t${remoteRef}`) return fail('remote head changed before push');
-  const latest = recheck().sameCellReuse;
+  const latestInventory = recheck();
+  const latest = latestInventory.sameCellReuse;
   if (!latest || latest.number !== target.number || latest.branch !== target.branch
     || latest.headSha !== target.headSha || latest.cellId !== target.cellId
-    || latest.cardId !== target.cardId || Boolean(latest.legacyBound) !== Boolean(target.legacyBound))
-    return fail('OPEN PR inventory changed before push');
+    || latest.cardId !== target.cardId || Boolean(latest.legacyBound) !== Boolean(target.legacyBound)) {
+    const snapshot = (verdict: GuardVerdict) => ({
+      conflicts: [...(verdict.sameCellConflicts ?? [])].map((row) => ({ pr: row.pr,
+        branch: row.branch === null ? null : sanitizeCredentialText(row.branch).slice(0, 180),
+        headSha: /^[0-9a-f]{40}$/i.test(row.headSha) ? row.headSha.toLowerCase() : 'invalid',
+        cardId: row.cardId === null ? null : sanitizeCredentialText(row.cardId).slice(0, 128), slice: row.slice ?? null,
+      })).sort((a, b) => a.pr - b.pr),
+      reusable: verdict.sameCellReuse ? { number: verdict.sameCellReuse.number,
+        branch: sanitizeCredentialText(verdict.sameCellReuse.branch).slice(0, 180),
+        headSha: /^[0-9a-f]{40}$/i.test(verdict.sameCellReuse.headSha) ? verdict.sameCellReuse.headSha.toLowerCase() : 'invalid',
+        cellId: sanitizeCredentialText(verdict.sameCellReuse.cellId).slice(0, 128),
+        cardId: sanitizeCredentialText(verdict.sameCellReuse.cardId).slice(0, 128),
+        legacyBound: Boolean(verdict.sameCellReuse.legacyBound) } : null,
+    });
+    const before = snapshot(initialInventory);
+    const after = snapshot(latestInventory);
+    const beforeByPr = new Map(before.conflicts.map((row) => [row.pr, row]));
+    const afterByPr = new Map(after.conflicts.map((row) => [row.pr, row]));
+    const inventoryDiff = {
+      added: after.conflicts.filter((row) => !beforeByPr.has(row.pr)),
+      removed: before.conflicts.filter((row) => !afterByPr.has(row.pr)),
+      changed: after.conflicts.flatMap((row) => {
+        const old = beforeByPr.get(row.pr);
+        return old && JSON.stringify(old) !== JSON.stringify(row) ? [{ pr: row.pr, before: old, after: row }] : [];
+      }),
+      reusableChanged: JSON.stringify(before.reusable) !== JSON.stringify(after.reusable),
+    };
+    return fail('OPEN PR inventory changed before push', { inventoryBefore: before, inventoryAfter: after, inventoryDiff });
+  }
   // The result descends from the exact fetched head. The explicit lease binds the
   // remote update to that head, so a delete or move between reads cannot be revived.
   // The Pod hook receives these values for this one push only. It checks the Pod card,
@@ -857,7 +888,7 @@ export function makePrManager(
       };
       const earlyVerdict = earlyGuard ? siblingSliceAllowed(earlyGuard) : undefined;
       const freshGuard = () => checkCreate!({ cwd, base: comparisonBase, seat: input.seat ?? seatFromEnvironment(), body: input.body }, run);
-      if (earlyVerdict?.sameCellReuse) return reuseSameCellPr(run, input, earlyVerdict.sameCellReuse, freshGuard);
+      if (earlyVerdict?.sameCellReuse) return reuseSameCellPr(run, input, earlyVerdict.sameCellReuse, earlyVerdict, freshGuard);
       if (earlyVerdict?.status === 'refuse') return { ok: false, reason: 'guard', detail: sameCellGuardDetail(earlyVerdict, candidateCardId) };
       const earlyInventoryUnknown = !!candidateCardId && (!checkCreate || (earlyVerdict?.status === 'unknown'
         && earlyVerdict.reasons.length === 1 && earlyVerdict.reasons[0]?.code === 'inventory-unknown'));

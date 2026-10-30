@@ -121,6 +121,25 @@ test('credential-like gap text never reaches external discovery', async () => {
   expect(result.card).not.toContain('sk-secret123');
 });
 
+test('records bounded stage and total latency without changing discovery output', async () => {
+  const events: Array<[string, Record<string, unknown>]> = [];
+  const result = await discoverResearchPlugin('period premium data', {
+    market: async () => { throw new Error('offline'); },
+    search: async () => [{ url: 'https://example.test/premium', title: 'premium data',
+      snippet: 'period premium data skill', source: 'web' }],
+    log: (event, data) => { events.push([event, data]); },
+  });
+  expect(result.outcome).toBe('proposed');
+  expect(events[0]?.[0]).toBe('started');
+  expect(events.filter(([event]) => event === 'stage-complete').map(([, data]) => data.stage))
+    .toEqual(['signed-market', 'capability-search']);
+  for (const [event, data] of events.filter(([event]) => event === 'stage-complete' || event === 'completed')) {
+    expect(data.elapsedMs).toEqual(expect.any(Number));
+  }
+  expect(events.at(-1)?.[0]).toBe('completed');
+  expect(events.at(-1)?.[1]).toMatchObject({ outcome: 'proposed', candidateCount: 1, installed: false });
+});
+
 test('expired discovery budget prevents a late search result from installing', async () => {
   const controller = new AbortController();
   let installed = false;

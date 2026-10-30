@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +22,7 @@ const directCalls: Array<{ messages: LLMMessage[]; opts: LLMOpts }> = [];
 let activeProvider: LLMProvider | undefined;
 const OMIT_DISPATCH_CTX = Symbol('omit-dispatch-ctx');
 let nextDispatchCtx: unknown = OMIT_DISPATCH_CTX;
+let activeStreamScript: ((messages: LLMMessage[], handlers: StreamWithToolsHandlers) => Promise<string>) | undefined;
 
 mock.module('../memory.js', () => ({
   ...actualMemory,
@@ -47,6 +48,11 @@ mock.module('../llm.js', () => ({
     _handlers: StreamWithToolsHandlers,
     opts: LLMOpts & { tools?: LLMToolSpec[]; provider?: LLMProvider } = {},
   ) => {
+    if (activeStreamScript) {
+      const text = await activeStreamScript(messages, _handlers);
+      streamCalls.push({ messages, opts, dispatchResult: text });
+      return text;
+    }
     const dispatchResult = nextDispatchCtx === OMIT_DISPATCH_CTX
       ? await _handlers.dispatchTool('PtyShellScreenshot', {})
       : await _handlers.dispatchTool(
@@ -60,6 +66,7 @@ mock.module('../llm.js', () => ({
 }));
 
 const { runTurn } = await import('./chat.js');
+const coreTurnModule = await import('../core-turn/index.js');
 
 function tool(name: string): LLMToolSpec {
   return {
@@ -137,6 +144,7 @@ describe('session chat terminal-capable turns', () => {
     resetAutoCompactStateForTest();
     activeProvider = undefined;
     nextDispatchCtx = OMIT_DISPATCH_CTX;
+    activeStreamScript = undefined;
     if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
     delete process.env.ELANOUS_SESSION_ROOT;
   });
@@ -559,5 +567,118 @@ describe('session chat child context composition', () => {
 
     expect(streamCalls.length).toBeGreaterThan(0);
     expect(compositionEvents()).toHaveLength(0);
+  });
+});
+
+test('Next TUI replays a short evidence challenge through real tools and answers in the same turn', async () => {
+  const sessionRoot = mkdtempSync(join(tmpdir(), 'next-tui-proactive-reconcile-'));
+  const savedRoot = process.env.ELANOUS_SESSION_ROOT;
+  process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+  const userText = '앞서 그 스킬을 쓴 게 맞나요?';
+  const originalRequest = '이번 주 한국 시장 변화와 관련 뉴스를 omni-crawl, omni-market, kr-flow로 조사해 분석해줘.';
+  const correctedAnswerPrefix = '확인된 도구 결과를 반영해 원래 이번 주 시장 분석을 다시 했습니다.';
+  const provider: LLMProvider = {
+    name: 'reconcile-test-provider', defaultModel: 'reconcile-test-model', available: () => true,
+    async *chat() { yield 'unused'; },
+    async *streamChat() { yield { type: 'text', delta: 'unused' } as const; },
+  };
+  activeProvider = provider;
+  const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+  appendMessage(session.id, {
+    role: 'user', content: originalRequest, ts: '2026-10-29T00:00:00.000Z',
+  });
+  appendMessage(session.id, {
+    role: 'assistant', content: '{"summary":{"결론":"스킬 사용을 확인할 수 없습니다."},"skill_status":{}}',
+    ts: '2026-10-29T00:00:01.000Z',
+  });
+  const calledTools: string[] = [];
+  const toolResults: unknown[] = [];
+  let correctedAnswer = '';
+  activeStreamScript = async (messages, handlers) => {
+    expect(messages.some(message => message.role === 'system'
+      && String(message.content).includes('## Proactive Reconciliation'))).toBe(true);
+    expect(messages.some(message => message.role === 'system'
+      && String(message.content).includes('You are in `research/agent`.'))).toBe(false);
+    expect(messages.filter(message => message.role === 'user')).toHaveLength(2);
+    expect(messages.some(message => message.role === 'user' && message.content === originalRequest)).toBe(true);
+    expect(messages.some(message => message.role === 'user' && message.content === userText)).toBe(true);
+    expect(messages.some(message => message.role === 'assistant'
+      && String(message.content).includes('"skill_status"'))).toBe(true);
+    for (const [index, name, args] of [
+      [0, 'elanous_skills_list', { query: 'omni market flow' }],
+      [1, 'skill_exec', { name: 'omni-crawl' }],
+      [2, 'skill_exec', { name: 'omni-market' }],
+      [3, 'skill_exec', { name: 'kr-flow' }],
+      [4, 'OmniSearch', { query: '이번 주 한국 시장 변화' }],
+    ] as const) {
+      calledTools.push(name);
+      toolResults.push(await handlers.dispatchTool(name, args, { callId: `next-reconcile-${index}` }));
+    }
+    const evidence = toolResults.map(result => String((result as { evidence?: string }).evidence ?? '')).join(' · ');
+    expect(evidence).toContain('verified:skill_exec:omni-crawl');
+    correctedAnswer = `${correctedAnswerPrefix} (${evidence})`;
+    handlers.onText(correctedAnswer, correctedAnswer);
+    handlers.onTurnComplete?.([{ role: 'assistant', content: correctedAnswer, phase: 'final_answer' }]);
+    return correctedAnswer;
+  };
+  try {
+    const result = await runTurn({
+      userConfig: testConfig(provider, false), sessionId: session.id, userText,
+      utteranceSurface: 'tui', systemPrompt: 'base session prompt', skipMemoryInjection: true,
+      tools: [
+        tool('elanous_skills_list'), tool('skill_exec'), tool('OmniSearch'),
+      ],
+      dispatchTool: async (name, args) => ({
+        ok: true, evidence: `verified:${name}:${String(args.name ?? args.query ?? '')}`,
+      }), provider,
+      goalLoop: true, goalLoopMaxIterations: 1,
+    });
+    expect(streamCalls).toHaveLength(1);
+    expect(calledTools).toEqual(['elanous_skills_list', 'skill_exec', 'skill_exec', 'skill_exec', 'OmniSearch']);
+    expect(toolResults).toHaveLength(5);
+    expect(result.text).toBe(correctedAnswer);
+    expect(result.text.startsWith('{')).toBe(false);
+  } finally {
+    activeStreamScript = undefined;
+    activeProvider = undefined;
+    if (savedRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+    else process.env.ELANOUS_SESSION_ROOT = savedRoot;
+    rmSync(sessionRoot, { recursive: true, force: true });
+  }
+});
+
+describe('Next TUI research turn routing', () => {
+  let sessionRoot: string;
+
+  afterEach(() => {
+    if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
+    delete process.env.ELANOUS_SESSION_ROOT;
+    activeProvider = undefined;
+  });
+
+  test('uses the shared first-reply core turn with the across-turn goal loop disabled', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-next-tui-research-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'test-provider', defaultModel: 'test-model', available: () => true,
+      async *chat() { yield 'plain'; }, async *streamChat() { yield { type: 'text', delta: 'plain' } as const; },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    const core = spyOn(coreTurnModule, 'runCoreTurn').mockImplementation(async () => ({
+      stopReason: 'end_turn', finalText: 'fast research answer',
+    }));
+    try {
+      const result = await runTurn({
+        userConfig: testConfig(provider, false), sessionId: session.id,
+        userText: '이번 주 한국 시장과 업계 변화를 조사해 비교해줘', utteranceSurface: 'tui', systemPrompt: 'TUI prompt',
+        skipMemoryInjection: true, tools: [tool('Read')], dispatchTool: async () => 'read result', provider,
+      });
+      expect(core).toHaveBeenCalledTimes(1);
+      expect(core.mock.calls[0]?.[0].userText).toBe('이번 주 한국 시장과 업계 변화를 조사해 비교해줘');
+      expect(result.text).toBe('fast research answer');
+    } finally {
+      core.mockRestore();
+    }
   });
 });

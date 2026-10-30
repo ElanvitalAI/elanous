@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import * as harnessSkillExec from '../harness/skill-exec.js';
 import { findNativeTool } from '../native-tool-catalog.js';
-import { setResearchInvoker } from '../research-bridge/invoke.js';
+import { setResearchInvoker, setResearchSkillExecutorForTest } from '../research-bridge/invoke.js';
+import { setResearchArchiveDir } from '../research-bridge/store.js';
 import * as skillIndex from '../skills/index.js';
 import type { SkillIndexEntry } from '../skills/index.js';
 import { resetUserConfig, setUserConfigOverlay } from '../user-config.js';
@@ -22,6 +26,8 @@ beforeEach(() => {
 afterEach(() => {
   mock.restore();
   setResearchInvoker(null);
+  setResearchSkillExecutorForTest(null);
+  setResearchArchiveDir(null);
   setSkillExecIndexProvider(null);
   setUserConfigOverlay(null);
   resetUserConfig();
@@ -226,6 +232,101 @@ describe('skill_exec runtime', () => {
       });
     } finally {
       restore();
+    }
+  });
+
+  test('resolves an unpunctuated spoken skill name uniquely before allowlist and execution', async () => {
+    setSkillExecIndexProvider(() => [entry({ name: 'kr-flow', skillDir: '/skills/kr-flow' })]);
+    let received: { skill: string; task: string; skillRootDir?: string } | undefined;
+    setResearchInvoker(async (skill, task, _progress, _signal, skillRootDir) => {
+      received = { skill, task, skillRootDir };
+      return { ok: true, output: 'mock replay result' };
+    });
+
+    const result = await dispatchSkillExec({ skill: 'krflow', task: 'replay fixture' });
+
+    expect(received).toEqual({ skill: 'kr-flow', task: 'replay fixture', skillRootDir: '/skills' });
+    expect(result).toMatchObject({ skill: 'kr-flow', ok: true, output: 'mock replay result' });
+  });
+
+  test('does not guess when normalized skill names are ambiguous', async () => {
+    setSkillExecIndexProvider(() => [
+      entry({ name: 'kr-flow', skillDir: '/skills/kr-flow' }),
+      entry({ name: 'krflow', skillDir: '/other/krflow' }),
+    ]);
+    let invoked = false;
+    setResearchInvoker(async () => { invoked = true; return { ok: true, output: 'unexpected' }; });
+
+    const result = await dispatchSkillExec({ skill: 'kr flow', task: 'replay fixture' });
+
+    expect(invoked).toBe(false);
+    expect(result.output).toContain('kr-flow, krflow');
+  });
+
+  test('rejects an exact spelling when a different installed name normalizes to the same slug', async () => {
+    setSkillExecIndexProvider(() => [
+      entry({ name: 'kr-flow', skillDir: '/skills/kr-flow' }),
+      entry({ name: 'krflow', skillDir: '/other/krflow' }),
+    ]);
+    let invoked = false;
+    setResearchInvoker(async () => { invoked = true; return { ok: true, output: 'unexpected' }; });
+
+    const result = await dispatchSkillExec({ skill: 'krflow', task: 'replay fixture' });
+
+    expect(invoked).toBe(false);
+    expect(result.output).toContain('kr-flow, krflow');
+  });
+
+  test('rejects surrounding whitespace at the execution boundary', async () => {
+    setUserConfigOverlay((cfg) => ({ ...cfg, skillRouter: { ...cfg.skillRouter, harnessExecAllowlist: [' omni-digest '] } }));
+    let invoked = false;
+    setResearchInvoker(async () => { invoked = true; return { ok: true, output: 'unexpected' }; });
+
+    const result = await dispatchSkillExec({ skill: ' omni-digest ', task: 'replay fixture' });
+
+    expect(invoked).toBe(false);
+    expect(result.ok).toBe(false);
+  });
+
+  test('does not invoke plugin discovery for a local skill path miss', async () => {
+    setUserConfigOverlay((cfg) => ({ ...cfg, skillRouter: { ...cfg.skillRouter, harnessExecAllowlist: ['omni-crawl'] } }));
+    setResearchInvoker(async () => ({
+      ok: false,
+      output: '',
+      error: 'skill "omni-crawl" not found under /skills/',
+    }));
+    let discoveries = 0;
+
+    const result = await dispatchSkillExec({ skill: 'omni-crawl', task: 'replay fixture' }, {
+      discoverPlugin: async () => { discoveries += 1; return { card: 'unexpected' }; },
+    });
+
+    expect(discoveries).toBe(0);
+    expect(result.error).toContain('not found under /skills/');
+  });
+
+  test('resolves a listed skill from its indexed root with zero plugin-discovery budget (mock replay, LLM 0)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'skill-exec-index-root-'));
+    const skillDir = join(root, 'omni-crawl');
+    mkdirSync(skillDir);
+    writeFileSync(join(skillDir, 'SKILL.md'), '---\nname: omni-crawl\ndescription: fixture\n---\nbody\n');
+    setResearchArchiveDir(join(root, 'archive'));
+    setUserConfigOverlay((cfg) => ({ ...cfg, skillRouter: { ...cfg.skillRouter, harnessExecAllowlist: ['omni-crawl'] } }));
+    setSkillExecIndexProvider(() => [entry({ name: 'omni-crawl', skillDir })]);
+    setResearchSkillExecutorForTest(async (manifest) => {
+      expect(manifest.name).toBe('omni-crawl');
+      return { finalResponse: 'mock replay result' };
+    });
+    let discoveries = 0;
+    try {
+      const result = await dispatchSkillExec({ skill: 'omni-crawl', task: 'mock replay' }, {
+        discoveryTimeoutMs: 0,
+        discoverPlugin: async () => { discoveries += 1; return { card: 'unexpected' }; },
+      });
+      expect(result).toMatchObject({ skill: 'omni-crawl', ok: true, output: 'mock replay result' });
+      expect(discoveries).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

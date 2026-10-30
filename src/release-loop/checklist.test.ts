@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, cellsReferencingDoc, claimItem, checklistEvidenceChain, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, cellsReferencingDoc, claimItem, checklistEvidenceChain, checklistGate, checklistHistory, cutChecklistGate, devVersion, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseChecklistTargetPaths, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, setMust, summarize, summarizeChecklist } from './checklist.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
 import { collectChecklistEvidenceStages, registerReleaseChecklistReadCommands, type ChecklistEvidenceCommandRunner, type ChecklistEvidenceReader } from '../cli/release-checklist-read-cli.js';
 import * as features from './feature-store.js';
@@ -16,6 +16,19 @@ import * as features from './feature-store.js';
 const roots: string[] = [];
 function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checklist-')); roots.push(dir); setElanousConfigDir(dir); return dir; }
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test('PATH-SEPARATOR-MULTI: release checklist storage preserves comma, middle-dot, and semicolon target paths', async () => {
+  root();
+  const title = '대상 경로: src/release-loop/checklist.ts, src/self-dev/launch-preflight.ts · src/index.ts; src/cli/release-cli.ts\n- 완료 경계 코드: shared parser\n- 완료 경계 실물: isolated CLI storage\n- 완료 경계 증거 명령: bun test src/release-loop/checklist.test.ts';
+  const expected = ['src/release-loop/checklist.ts', 'src/self-dev/launch-preflight.ts', 'src/index.ts', 'src/cli/release-cli.ts'];
+  expect(parseChecklistTargetPaths(title)).toEqual(expected);
+  expect(inspectChecklistTargetPaths({ title }, { existsAtMain: () => true }).targets).toEqual(expected);
+
+  const program = new Command();
+  registerReleaseCommands(program);
+  await program.parseAsync(['release', 'checklist', '--version', '9.9.9', 'add', 'PATH-SEPARATOR-MULTI', title], { from: 'user' });
+  expect(listChecklist('9.9.9').items.find((item) => item.id === 'PATH-SEPARATOR-MULTI')?.title).toBe(title);
+});
 
 describe('release checklist ledger', () => {
   test('CHECKLIST-EVIDENCE-CHAIN: any missing/unmeasurable stage fails closed without mutating the ledger', () => {
@@ -66,6 +79,47 @@ describe('release checklist ledger', () => {
     expect(stages.map(({ id, state }) => [id, state])).toEqual([['E1', 'observed'], ['E3', 'observed'], ['E4', 'observed'], ['E5', 'missing']]);
     expect(calls.some((call) => call.includes('git merge-base --is-ancestor'))).toBe(true);
     expect(calls.some((call) => call.includes('git cat-file -e'))).toBe(true);
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: E3 accepts the product repository origin alias', () => {
+    const mergeSha = 'a'.repeat(40);
+    const pinSha = 'b'.repeat(40);
+    const runner: ChecklistEvidenceCommandRunner = (command, args) => {
+      if (command === 'eln' && args[0] === 'gh') return { status: 0, stdout: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: mergeSha } }), stderr: '' };
+      if (command === 'eln' && args[0] === '--version') return { status: 0, stdout: pinSha, stderr: '' };
+      if (command === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: '/repo/product\n', stderr: '' };
+      if (command === 'git' && args[0] === 'remote') return { status: 0, stdout: 'git@github.com:ElanvitalAI/elanous.git\n', stderr: '' };
+      if (command === 'git' && args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+      if (command === 'git' && args[0] === 'merge-base') return { status: 0, stdout: '', stderr: '' };
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    };
+    const item = { id: 'CHAIN', title: 'x', evidence: `PR #42 merge ${mergeSha}` } as ReturnType<typeof listChecklist>['items'][number];
+    expect(collectChecklistEvidenceStages(item, runner).find(({ id }) => id === 'E3')).toMatchObject({ state: 'observed', reason: '설치본 pin이 merge SHA의 후손이다' });
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: E4 accepts missionId and taskId joins', () => {
+    const cases = [['missionId', 'mission-123', 'missionId'], ['taskId', 'task-456', 'taskId'], ['RUNID', 'run-789', 'runId']] as const;
+    for (const [label, id, expectedField] of cases) {
+      let queried = '';
+      let payloadKey: string = expectedField === 'missionId' ? 'taskId' : 'missionId';
+      const runner: ChecklistEvidenceCommandRunner = (command, args) => {
+        if (command === 'eln' && args[0] === 'logs') {
+          queried = args[2] ?? '';
+          return { status: 0, stdout: `${JSON.stringify({ event: 'complete', data: JSON.stringify({ [payloadKey]: id }) })}\n`, stderr: '' };
+        }
+        throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+      };
+      const item = { id: 'CHAIN', title: '- 완료 경계 증거 명령: bun test src/a.test.ts', evidence: `${label}=${id} event=complete` } as ReturnType<typeof listChecklist>['items'][number];
+      expect(collectChecklistEvidenceStages(item, runner).find(({ id }) => id === 'E4')).toMatchObject({ state: 'missing' });
+      payloadKey = expectedField;
+      expect(collectChecklistEvidenceStages(item, runner).find(({ id }) => id === 'E4')).toMatchObject({ state: 'observed' });
+      expect(queried).toBe(id);
+    }
+  });
+
+  test('CHECKLIST-EVIDENCE-CHAIN: E5 accepts a boundary line without a markdown bullet', () => {
+    const item = { id: 'CHAIN', title: '완료 경계 실물: CLI 결과 확인', evidence: '실물 확인: CLI 결과 확인' } as ReturnType<typeof listChecklist>['items'][number];
+    expect(collectChecklistEvidenceStages(item, () => { throw new Error('unexpected external command'); }).find(({ id }) => id === 'E5')).toMatchObject({ state: 'observed', reason: '완료 경계 실물 문구가 기록된 근거와 일치한다' });
   });
 
   test('CHECKLIST-EVIDENCE-CHAIN: E3 is unmeasurable outside the elanous source repository', () => {
@@ -173,8 +227,9 @@ describe('release checklist ledger', () => {
     expect(inspectChecklistTargetPaths({ title: `대상 경로: new-tool\n신설: new-tool${boundary}` }, deps).warnings).toEqual([]);
     expect(inspectChecklistTargetPaths({ title: `대상 경로: src/real.ts\n신설: src/real.ts${boundary}` }, deps).warnings).toContain('src/real.ts: 이미 있는 파일은 신설:에서 뺀다');
     expect(inspectChecklistTargetPaths({ title: `대상 경로: src/view.vue · bin/eln · Makefile${boundary}` }, deps).warnings).toEqual([]);
-    expect(inspectChecklistTargetPaths({ title: `대상 경로: src/real.ts, src/ref.ts${boundary}` }, deps).warnings)
-      .toContain('src/real.ts, src/ref.ts: origin/main에 없는 파일 · 신설: 줄에 해당 경로 선언 필요');
+    const commaSeparated = inspectChecklistTargetPaths({ title: `대상 경로: src/real.ts, src/ref.ts${boundary}` }, deps);
+    expect(commaSeparated.targets).toEqual(['src/real.ts', 'src/ref.ts']);
+    expect(commaSeparated.warnings).toEqual([]);
     expect(inspectChecklistTargetPaths({ title: `설명만 있음\n신설:${boundary}` }, deps).warnings).toEqual(['첫 줄 대상 경로가 없다', '신설: (빈 항목): 정확한 새 파일 경로가 아니다']);
     expect(inspectChecklistTargetPaths({ title: '대상 경로: src/real.ts', dispatchKind: 'code' }, deps).warnings).toHaveLength(3);
     expect(inspectChecklistTargetPaths({ title: '운영 판정', dispatchKind: 'ops' }, deps).warnings).toEqual([]);

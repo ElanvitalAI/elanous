@@ -109,8 +109,11 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
       const origin = run('git', ['remote', 'get-url', 'origin']);
       const pinObject = run('git', ['cat-file', '-e', `${pinSha}^{commit}`]);
       const repoUrl = origin.stdout.trim().replace(/^git@github\.com:/i, 'https://github.com/').replace(/\.git$/i, '').replace(/\/$/u, '').toLowerCase();
-      const expectedRepo = 'https://github.com/elanvitalai/elanous';
-      if (repoRoot.status !== 0 || !repoRoot.stdout.trim() || origin.status !== 0 || repoUrl !== expectedRepo || pinObject.status !== 0) {
+      const expectedRepos = new Set([
+        'https://github.com/elanvitalai/elanous',
+        'https://github.com/ElanvitalAI/elanous',
+      ]);
+      if (repoRoot.status !== 0 || !repoRoot.stdout.trim() || origin.status !== 0 || !expectedRepos.has(repoUrl) || pinObject.status !== 0) {
         e3.reason = '현재 git 저장소가 elanous 원본이 아니거나 설치본 pin 객체가 없어 조상 관계를 판정할 수 없다';
       } else {
       const ancestry = run('git', ['merge-base', '--is-ancestor', mergeSha, pinSha]);
@@ -122,11 +125,15 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
     }
   }
 
-  const runId = /\b(run-[a-f0-9]{8}-[a-f0-9-]{27,})\b/i.exec(evidence)?.[1]
-    ?? /\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b/i.exec(evidence)?.[1];
+  const identityToken = '(?:run-[a-f0-9]{8}-[a-f0-9-]{27,}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}|[a-z0-9][a-z0-9._:-]{2,})';
+  const labelledIdentity = new RegExp(`\\b(runId|missionId|taskId)\\s*[:=]?\\s*(${identityToken})\\b`, 'i').exec(evidence);
+  const runId = labelledIdentity?.[2]
+    ?? /\b(run-[a-f0-9]{8}-[a-f0-9-]{27,}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b/i.exec(evidence)?.[1];
+  const identityLabel = labelledIdentity?.[1]?.toLowerCase();
+  const identityField = identityLabel === 'missionid' ? 'missionId' : identityLabel === 'taskid' ? 'taskId' : 'runId';
   const event = /(?:event|이벤트)\s*[:=]\s*([A-Za-z0-9_.:-]+)/iu.exec(evidence)?.[1];
   const verificationCommand = /(?:완료 경계 증거 명령|증거 명령|verification command)\s*[:=]\s*([^\r\n]+)/iu.exec(`${item.title}\n${evidence}`)?.[1]?.trim() ?? null;
-  const e4: ChecklistEvidenceStage = { id: 'E4', state: 'missing', source: null, measuredAt, verificationCommand, reason: '근거에 runId·event·원문 검증 명령이 모두 필요하다' };
+  const e4: ChecklistEvidenceStage = { id: 'E4', state: 'missing', source: null, measuredAt, verificationCommand, reason: '근거에 runId·missionId·taskId 중 하나와 event·원문 검증 명령이 모두 필요하다' };
   if (runId && event && verificationCommand) {
     const logs = run('eln', ['logs', '--grep', runId, '--since', '365d', '--all', '--include-test', '--limit', '1000', '--json'], 30_000);
     if (logs.status !== 0) { e4.state = 'unmeasurable'; e4.reason = `runId 로그 조회 실패${logs.error ? `: ${logs.error}` : ''}`; }
@@ -135,16 +142,19 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
       const truncated = rows.length >= 1000 || rows.some((row) => row._meta && typeof row._meta === 'object' && (row._meta as { limitReached?: unknown }).limitReached === true);
       const observed = rows.some((row) => {
         if (row.event !== event || typeof row.data !== 'string') return false;
-        try { return (JSON.parse(row.data) as { runId?: unknown }).runId === runId; } catch { return false; }
+        try {
+          const data = JSON.parse(row.data) as { runId?: unknown; missionId?: unknown; taskId?: unknown };
+          return data[identityField] === runId;
+        } catch { return false; }
       });
-      e4.source = `eln logs --grep ${runId} --since 365d --all --include-test --limit 1000 --json (event=${event})`;
-      if (observed) { e4.state = 'observed'; e4.reason = `같은 runId의 ${event} 실물 이벤트를 찾았다`; }
+      e4.source = `eln logs --grep ${runId} --since 365d --all --include-test --limit 1000 --json (${identityField}=${runId}, event=${event})`;
+      if (observed) { e4.state = 'observed'; e4.reason = `같은 ${identityField}의 ${event} 실물 이벤트를 찾았다`; }
       else if (truncated) { e4.state = 'unmeasurable'; e4.reason = '로그 결과가 잘려 사건 부재를 판정할 수 없다'; }
-      else { e4.reason = `같은 runId의 ${event} 이벤트가 없다`; }
+      else { e4.reason = `같은 ${identityField}의 ${event} 이벤트가 없다`; }
     }
   }
 
-  const acceptance = /- 완료 경계 실물:([^\r\n]+)/u.exec(item.title)?.[1]?.trim();
+  const acceptance = /^\s*(?:[-*]\s*)?완료 경계 실물\s*:\s*([^\r\n]+)/mu.exec(item.title)?.[1]?.trim();
   const e5Observed = Boolean(acceptance && evidence.includes(acceptance));
   const e5: ChecklistEvidenceStage = { id: 'E5', state: e5Observed ? 'observed' : 'missing', source: 'checklist title/evidence exact acceptance-text comparison', measuredAt,
     reason: e5Observed ? '완료 경계 실물 문구가 기록된 근거와 일치한다' : '완료 경계 실물 문구와 일치하는 근거가 없다' };

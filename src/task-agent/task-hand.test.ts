@@ -19,7 +19,9 @@ import { listHarnessQueue, queueHeadBefore, type HarnessQueueDeps } from '../har
 import { installHarnessCliCommand } from '../harness/harness-cli-command.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { deriveBirthIdentity, parseRunIdentityTag, runPriorityClass, validateRunIdentity, type RunIdentity } from './run-identity.js';
-import { parseWorkOrder } from './work-order.js';
+import { parseWorkOrder, renderWorkOrderGoal } from './work-order.js';
+import { buildWorkOrder } from './work-order-build.js';
+import { coordinatorShadowJournalPath, tick as tickCoordinatorShadow } from '../loops/orchestrator/coordinator-shadow.js';
 import { draftReleaseComment } from '../self-dev/draft-triage-rules.js';
 import { KNOWHOW_PACK_MAX_BYTES, selectKnowhowPack } from '../self-implement/knowhow-pack.js';
 import { authorGoal, inspectGoalDoneBoundary, type GoalAuthorDeps } from '../self-implement/goal-author.js';
@@ -662,7 +664,7 @@ test('live handTask 는 카드 라벨 맥락을 기존 launcher 호출에 싣고
   expect(calls[0]!.context).toMatchObject({
     substrate: 'pod', podGoal: result.card.text,
     cardLabelContext: { cardId: result.card.id, labels: { [TASK_CARD_LABEL]: result.card.id } },
-    env: { ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: result.card.id, ELANOUS_POD_SLOT_ID: 'CELL-1', ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: 'TC' },
+    env: { ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: result.card.id, ELANOUS_POD_SLOT_ID: 'CELL-1', ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: 'TC', ELANOUS_POD_DISTRIBUTOR_ENTRY: 'tasks-hand' },
   });
   expect(calls[0]!.context!.launchId).toStartWith('tl-');
   expect(result).toMatchObject({ mode: 'live', launched: true, cwd: target, move: { kind: 'launch', command: calls[0]!.args }, card: { status: 'launched', runId: calls[0]!.context!.runId, launchId: calls[0]!.context!.launchId } });
@@ -927,7 +929,7 @@ test('--completion <kind> 는 카드에 종결 종류를 싣고 모르는 값은
   expect(mission.code).toBe(1);
 });
 
-test('TA-LIVE-LAND-2: task hand --ta-land --live writes card taLand and launches with ELANOUS_TA_LAND=1 (command unchanged)', async () => {
+test('TA-LIVE-LAND-2: task hand --ta-land --live writes card taLand and marks the tasks-hand admission entry', async () => {
   const path = statePath();
   const text = liveGoal('ship it');
   const calls: Array<{ args: string[]; context?: TaskLaunchContext }> = [];
@@ -939,13 +941,13 @@ test('TA-LIVE-LAND-2: task hand --ta-land --live writes card taLand and launches
   expect(calls).toHaveLength(1);
   expect(calls[0]!.args).toEqual(['harness', 'say', '--substrate', 'pod', '--merge-by-host', text]);
   const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { id: string; taLand?: boolean; runId?: string }> }>(path).tasks);
-  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_TA_LAND: '1' });
+  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_POD_DISTRIBUTOR_ENTRY: 'tasks-hand', ELANOUS_TA_LAND: '1' });
   expect(cards).toHaveLength(1);
   expect(cards[0]).toMatchObject({ taLand: true, runId: calls[0]!.context!.runId });
   expect(lines.join('\n')).toContain('ELANOUS_TA_LAND=1');
 });
 
-test('TA-LIVE-LAND-2: without --ta-land the card has no taLand and the launch env carries only the run id', async () => {
+test('TA-LIVE-LAND-2: without --ta-land the card has no taLand but keeps the tasks-hand admission entry', async () => {
   const path = statePath();
   const calls: Array<{ context?: TaskLaunchContext }> = [];
   const { code } = await cli(['task', 'hand', liveGoal('ship it'), '--live'], {
@@ -954,7 +956,7 @@ test('TA-LIVE-LAND-2: without --ta-land the card has no taLand and the launch en
   });
   expect(code).toBe(0);
   const cards = Object.values(readTaskAgentState<{ tasks: Record<string, { id: string; taLand?: boolean }> }>(path).tasks);
-  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id });
+  expect(calls[0]!.context!.env).toEqual({ ELANOUS_RUN_ID: calls[0]!.context!.runId, ELANOUS_TASK_CARD_ID: cards[0]!.id, ELANOUS_POD_DISTRIBUTOR_ENTRY: 'tasks-hand' });
   expect(Object.hasOwn(cards[0]!, 'taLand')).toBe(false);
 });
 
@@ -1665,6 +1667,107 @@ const fullWorkOrder = {
   precedents: '같은 칸 앞 생애 없음 — must-fix 서명 0',
   escalation: '판정선 밖이면 조율자(OP)에게 · 돈·보안은 대표 결정',
 };
+
+test('COORD-ENTRANCE-FOLD: 실제 tasks hand work-order 발사가 원문 hash 행을 남기고 tick 은 3일 streak 를 감지한다', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'coord-work-order-dispatch-'));
+  const repoRoot = join(root, 'repo');
+  const state = join(root, 'task-agent-actions.json');
+  const file = join(root, 'coord.work-order.json');
+  const order = buildWorkOrder({ cellId: 'COORD-ENTRANCE-FOLD', version: '0.2.42', priority: 'P0', boundary: 'src/loops/orchestrator/tick.ts' });
+  writeFileSync(file, `${JSON.stringify(order)}\n`);
+  const savedAgent = process.env.ELANOUS_SEAT;
+  const savedAiAgent = process.env.AI_AGENT;
+  const days = ['2026-10-27T12:00:00Z', '2026-10-28T12:00:00Z', '2026-10-29T12:00:00Z'];
+  const launches: string[] = [];
+  process.env.ELANOUS_SEAT = 'builder-4';
+  try {
+    for (const day of days) {
+      const response = await cli(['tasks', 'hand', file, '--seat', 'UX', '--live', '--json'], {
+        taskStatePath: state,
+        coordinatorShadowRoot: repoRoot,
+        taskNow: () => new Date(day),
+        taskLauncher: (args, _cwd, context) => { launches.push(context!.runId); return { runId: context!.runId }; },
+      });
+      if (response.code !== 0) throw new Error(response.lines.join('\n'));
+      expect(JSON.parse(response.lines[0]!).launched).toBe(true);
+    }
+    expect(launches).toHaveLength(3);
+    const journal = coordinatorShadowJournalPath(repoRoot);
+    const rows = readFileSync(journal, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const directive = createHash('sha256').update(renderWorkOrderGoal(order)).digest('hex');
+    expect(rows).toEqual(days.map((day) => ({ date: day.slice(0, 10), agent: 'builder-4', recipient: 'UX', cell: order.cellId, directive })));
+    const decisionsDir = join(root, 'decisions');
+    const raised = await tickCoordinatorShadow({ root: repoRoot, stateDir: decisionsDir, now: () => new Date(days[2]!) });
+    expect(raised.evidence).toEqual({ agent: 'builder-4', recipient: 'UX', cell: order.cellId, directive, dates: days.map((day) => day.slice(0, 10)) });
+    expect(raised.cardId).toBeDefined();
+    // 수신 seat는 호출자 agent의 증거가 아니다. 호출자 식별자가 없으면 기록을 생략한다.
+    delete process.env.ELANOUS_SEAT;
+    delete process.env.AI_AGENT;
+    const unknownCaller = await cli(['tasks', 'hand', file, '--seat', 'UX', '--live', '--json'], {
+      taskStatePath: state,
+      coordinatorShadowRoot: repoRoot,
+      taskNow: () => new Date('2026-10-30T12:00:00Z'),
+      taskLauncher: (args, _cwd, context) => ({ runId: context!.runId }),
+    });
+    expect(unknownCaller.code).toBe(0);
+    expect(readFileSync(journal, 'utf8').trim().split('\n')).toHaveLength(3);
+    process.env.ELANOUS_SEAT = 'builder-4';
+    const failed = await cli(['tasks', 'hand', file, '--seat', 'UX', '--live', '--json'], {
+      taskStatePath: state,
+      coordinatorShadowRoot: repoRoot,
+      taskNow: () => new Date('2026-10-31T12:00:00Z'),
+      taskLauncher: () => { throw new Error('launcher rejected dispatch'); },
+    });
+    expect(failed.code).toBe(1);
+    expect(readFileSync(journal, 'utf8').trim().split('\n')).toHaveLength(3);
+  } finally {
+    if (savedAgent === undefined) delete process.env.ELANOUS_SEAT; else process.env.ELANOUS_SEAT = savedAgent;
+    if (savedAiAgent === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = savedAiAgent;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20000);
+
+test('COORD-ENTRANCE-FOLD: 중첩 cwd의 실제 tasks hand 진입은 주입 없이 checkout 루트에 기록한다', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'coord-shadow-nested-cwd-'));
+  const repoRoot = join(temp, 'repo');
+  const nested = join(repoRoot, 'packages', 'nested');
+  const stateDir = join(temp, 'state');
+  const state = join(temp, 'task-agent-actions.json');
+  const orderFile = join(temp, 'nested.work-order.json');
+  mkdirSync(nested, { recursive: true });
+  execFileSync('git', ['init', '-q', repoRoot]);
+  const order = buildWorkOrder({ cellId: 'COORD-NESTED-CWD', version: '0.2.42', priority: 'P0', boundary: 'src/loops/orchestrator/tick.ts' });
+  writeFileSync(orderFile, `${JSON.stringify(order)}\n`);
+  const modulePath = join(import.meta.dir, '../cli/tasks-cli.ts');
+  const script = `
+    import { Command } from 'commander';
+    const { registerTasksCommands } = await import(process.env.TASKS_CLI_MODULE);
+    const program = new Command().name('elanous').exitOverride();
+    registerTasksCommands(program, {
+      taskStatePath: process.env.TASK_STATE_PATH,
+      taskNow: () => new Date('2026-10-29T12:00:00Z'),
+      taskLauncher: (_args, _cwd, context) => ({ runId: context.runId }),
+    });
+    await program.parseAsync(['node', 'elanous', 'tasks', 'hand', process.env.ORDER_FILE, '--seat', 'UX', '--live', '--json']);
+  `;
+  const env = { ...process.env, TASKS_CLI_MODULE: modulePath, TASK_STATE_PATH: state, ORDER_FILE: orderFile,
+    ELANOUS_SEAT: 'builder-4', ELANOUS_STATE_DIR: stateDir };
+  delete env.AI_AGENT;
+  delete env.ELANOUS_CONFIG_DIR;
+  try {
+    const child = Bun.spawnSync([process.execPath, '-e', script], { cwd: nested, env, stdout: 'pipe', stderr: 'pipe' });
+    expect(child.exitCode).toBe(0);
+    expect(new TextDecoder().decode(child.stderr)).toBe('');
+    const journal = coordinatorShadowJournalPath(repoRoot);
+    const rows = readFileSync(journal, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ agent: 'builder-4', recipient: 'UX', cell: order.cellId });
+    const result = await tickCoordinatorShadow({ root: repoRoot, stateDir: join(temp, 'decisions'), now: () => new Date('2026-10-29T12:00:00Z'),
+      dispatches: [rows[0], { ...rows[0], date: '2026-10-27' }, { ...rows[0], date: '2026-10-28' }] });
+    expect(result.evidence?.recipient).toBe('UX');
+    expect(result.cardId).toBeDefined();
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
 
 test('TA-WORK-ORDER ① 칸 아홉이 찬 지시서는 work-order 로 펼쳐지고 unknownFields 가 0이다', () => {
   const events: Array<{ category: string; event: string; data?: unknown }> = [];

@@ -157,13 +157,16 @@ export function resolveDaemonTtsProviderIdWithDepsForTesting(deps: TtsAvailabili
   return resolveProviderId(deps);
 }
 
-export async function initDaemonTtsProvider(): Promise<TTSProvider | null> {
+async function initDaemonTtsProviderWithAvailabilityDeps(
+  deps: TtsAvailabilityDeps,
+  instantiate: typeof instantiateForId = instantiateForId,
+): Promise<TTSProvider | null> {
   if (cached) return cached;
   if (initInFlight) return initInFlight;
   initInFlight = (async () => {
-    const id = resolveProviderId();
+    const id = resolveProviderId(deps);
     try {
-      const provider = await instantiateForId(id);
+      const provider = await instantiate(id);
       cached = provider;
       if (debug.enabled) {
         debug.log('voice.tts.singleton', 'init.ok', {
@@ -184,6 +187,18 @@ export async function initDaemonTtsProvider(): Promise<TTSProvider | null> {
     }
   })();
   return initInFlight;
+}
+
+export function initDaemonTtsProvider(): Promise<TTSProvider | null> {
+  return initDaemonTtsProviderWithAvailabilityDeps(defaultTtsAvailabilityDeps);
+}
+
+/** Initialize with a fixed host-availability probe for deterministic tests. */
+export function initDaemonTtsProviderWithDepsForTesting(
+  deps: TtsAvailabilityDeps,
+  instantiate: typeof instantiateForId = instantiateForId,
+): Promise<TTSProvider | null> {
+  return initDaemonTtsProviderWithAvailabilityDeps(deps, instantiate);
 }
 
 /** Sync getter — returns the cached singleton or null. Call after

@@ -1,7 +1,10 @@
 // runSelfImplement — Fix A rework 루프(gate 실패 시 clean 에러 재주입 self-heal) 테스트
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, test, expect, spyOn } from 'bun:test';
-beforeAll(async () => { await import('./graph-stage-units.js'); }, 30_000);
+beforeAll(async () => {
+  await Promise.all([import('./graph-stage-units.js'), import('../task-orchestrator/surfaces/self-implement.js'),
+    import('../task-orchestrator/surfaces/pod-failure-reason.js')]);
+}, 120_000);
 import { debug } from '../debug/log.js';
 import { buildReviewIntent } from '../agent-substrate/review-intent.js';
 import { REVIEW_FINDING_KEY_VERSION, reviewFindingKey as sharedReviewFindingKey } from '../agent-substrate/review-finding-key.js';
@@ -18,8 +21,10 @@ import { runSelfImplementCliCommand } from './self-implement-cli.js';
 import { runDraftSweep } from '../self-dev/draft-sweep.js';
 import { parseAskTargetPathHints } from '../self-dev/launch-preflight-text.js';
 import { GoalRunStore } from './goal-run-store.js';
-import { appendRunLedgerEntry, loadRunLedger, runLedgerPath } from './run-ledger.js';
-import { compactForLog, debug } from '../debug/log.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath } from './run-ledger.js';
+import { RUN_DOCTOR_HANDOFF_INPUT_PREFIX } from './run-chart.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { compactForLog } from '../debug/log.js';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { disableLandingFreeze, enableLandingFreeze } from '../release-loop/landing-freeze.js';
@@ -5046,6 +5051,7 @@ describe('runSelfImplement — Fix A rework', () => {
       const r = await runSelfImplement({
         feature: 'F',
         seams: seams({
+          changedFilesForGateRoute: () => ['src/materialized.ts'],
           writeRunLedger: (entry) => appendRunLedgerEntry(entry, isolatedStateDir),
           implement: async () => ({ ok: false, completionDisposition: 'completed-without-changes', summary: 'verified existing seam' }),
         }),
@@ -5069,6 +5075,7 @@ describe('runSelfImplement — Fix A rework', () => {
         previousEvidence: source?.previousEvidence, action: 'remeasure' });
       const ledger = readFileSync(runLedgerPath(source!.runId as string, isolatedStateDir), 'utf8')
         .trim().split('\n').map((line) => JSON.parse(line) as { event: string; runId: string; data: Record<string, unknown> });
+      expect(ledger.find((row) => row.event === 'implemented')?.data.materializedPaths).toEqual(['src/materialized.ts']);
       expect(ledger.find((row) => row.event === 'repair-next-move-input')).toMatchObject({
         runId: source?.runId, data: { evidenceId: source?.evidenceId, previousEvidence: source?.previousEvidence,
           classification: expect.objectContaining({ classification: 'report-deficit' }) },
@@ -8309,7 +8316,7 @@ type ContextBudgetObservation = {
   contextTruncatedItems: number;
   contextOmittedItems: number;
 };
-type Rev = { verdict: 'pass' | 'warn' | 'fail'; reviewed?: boolean; mustFix?: string[]; shouldFix?: string[]; contextBudget?: ContextBudgetObservation };
+type Rev = { verdict: 'pass' | 'warn' | 'fail'; reviewed?: boolean; failureReason?: string; mustFix?: string[]; shouldFix?: string[]; contextBudget?: ContextBudgetObservation };
 function revSeams(opts: {
   gateResults?: boolean[]; reviews?: Rev[]; merged?: boolean;
   features?: string[]; withApprove?: boolean;
@@ -8343,6 +8350,7 @@ function revSeams(opts: {
         shouldFix: r.shouldFix ?? [],
         summary: 'review',
         reviewed,
+        ...(r.failureReason !== undefined ? { failureReason: r.failureReason } : {}),
         ...(reviewed ? { diffTruncated: false, diffShownChars: 100, diffTotalChars: 100, diffOmittedFiles: 0 } : {}),
         ...(r.contextBudget ?? {}),
       };
@@ -13827,6 +13835,31 @@ describe('runSelfImplement — rework budget judgment', () => {
     expect(features).toHaveLength(1);
   });
 
+  test('모든 판단 제공자의 자격 부재는 rework를 건너뛰고 미리뷰 산출물을 draft로 보존한다', async () => {
+    const features: string[] = [];
+    const opened: Array<{ draft?: boolean; body: string }> = [];
+    const s = revSeams({
+      features,
+      reviews: [{ verdict: 'fail', reviewed: false, failureReason: 'openrouter unavailable: configure apiKey via `elanous setup`', mustFix: ['미검토 항목'] }],
+    });
+    s.diagnose = async () => 'BUDGET: EXTEND\nREASON: repair the reported finding';
+    s.judgmentCallLLM = async () => { throw new Error('openrouter unavailable: configure apiKey via `elanous setup`'); };
+    const originalOpenPr = s.openPr;
+    s.openPr = async (input) => {
+      opened.push({ draft: input.draft, body: input.body });
+      return originalOpenPr!(input);
+    };
+
+    const result = await runSelfImplement({ feature: 'preserve review artifacts when provider credentials are unavailable', maxReworkRounds: 2, seams: s });
+
+    expect(result).toMatchObject({ ok: false, stage: 'review-blocked', node: 'rework', prNumber: 9 });
+    expect(result.detail).toContain('credentials unavailable');
+    expect(result.review).toMatchObject({ reviewed: false, failureReason: 'openrouter unavailable: configure apiKey via `elanous setup`' });
+    expect(features).toHaveLength(1);
+    expect(opened).toHaveLength(1);
+    expect(opened[0]).toMatchObject({ draft: true, body: expect.stringContaining('credentials unavailable') });
+  });
+
   test('workflow provider의 네 분류는 실제 rework 실행 결말과 일치한다', async () => {
     const extendFeatures: string[] = [];
     const extend = seams({ features: extendFeatures, gateResults: [false, true] });
@@ -16982,6 +17015,30 @@ describe('runSelfImplement — PR title path extraction', () => {
 });
 
 describe('runSelfImplement — supervisor input next-round reinjection', () => {
+  test('routes a run-doctor handoff to runDoctorHandoff with the resolved state-root ledger directory', async () => {
+    let runId = '';
+    let stopKey = '';
+    const calls: Array<Parameters<NonNullable<SelfImplementSeams['runDoctorHandoff']>>[0]> = [];
+    const deliveries: Array<{ state: string; reason?: string }> = [];
+    const s = revSeams({ gateResults: [true], reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.runDoctorHandoff = async (input) => {
+      calls.push(input);
+      return { status: 'acted', action: 'reauthor-from-materialized', outcome: 'heal-graph-requested', stopKey: input.stopKey };
+    };
+    s.implement = async ({ runId: activeRunId, onSupervisorInput }) => {
+      runId = activeRunId;
+      stopKey = `${runId}:wait-streak:3`;
+      onSupervisorInput?.(`${RUN_DOCTOR_HANDOFF_INPUT_PREFIX} runId=${runId} stopKey=${stopKey}`, (state, reason) => deliveries.push({ state, reason }));
+      return { ok: true, summary: 'impl' };
+    };
+
+    await runSelfImplement({ feature: 'run-doctor supervisor handoff route', seams: s });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ runId, stopKey, dir: runLedgerDir(elanousStateRoot() || undefined) });
+    expect(deliveries).toEqual([{ state: 'delivered' }]);
+  });
+
   test('sends a terminal supervisor-only proposal once to the active child inbox', async () => {
     const features: string[] = [];
     const deliveries: Array<{ state: string; reason?: string }> = [];

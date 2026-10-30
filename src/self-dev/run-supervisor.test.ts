@@ -70,6 +70,20 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     }
   });
 
+  test('바깥 감독자는 아직 읽히지 않은 doctor reauthor handoff를 needs-human 출구보다 먼저 재발사로 소비한다', () => {
+    const result = mystery('chart-reauthor-candidate');
+    const reauthor = { device: 'run-doctor', stopKey: 'same-run:doctor:stop-1', observed: 'doctor reauthor accepted',
+      verdict: 'acted', action: 'reauthor-from-materialized', handoff: 'reauthor', why: 'PR1 intake accepted', readStopKeys: [] };
+    expect(decideNextRun({ results: [result], runChart: [reauthor] })).toMatchObject({
+      action: 'relaunch', rerunnable: ['chart-reauthor-candidate'], needsHuman: [],
+    });
+    const consumed = { device: 'outer-supervisor', stopKey: 'same-run:outer:1', observed: 'read reauthor',
+      verdict: 'relaunch', action: 'relaunch', handoff: null, why: 'consumed', readStopKeys: [reauthor.stopKey] };
+    expect(decideNextRun({ results: [result], runChart: [reauthor, consumed] })).toMatchObject({
+      action: 'stop', stopReason: 'needs-human',
+    });
+  });
+
   test('NEEDS-HUMAN-SELF-HEAL-FIRST: 승격 성공만 재실행하고 실패는 고정 사유로 HITL', async () => {
     const result = mysteryWithProposal('unknown-with-pieces');
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];

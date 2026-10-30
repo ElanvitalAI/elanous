@@ -1014,6 +1014,28 @@ export function injectKey(key: Key): boolean {
   return true;
 }
 
+// A foreground dashboard may own an interactive child terminal modal. External
+// control-IPC input must be routed to that modal before it enters the dashboard
+// readKey queue; while the parent loop is busy there may be no readKey consumer.
+let _externalTuiKeyRoutes: Array<{ token: symbol; route: (key: Key) => boolean }> = [];
+
+export function setExternalTuiKeyRoute(route: ((key: Key) => boolean) | null): () => void {
+  if (!route) return () => {};
+  const entry = { token: Symbol('external-tui-key-route'), route };
+  _externalTuiKeyRoutes.push(entry);
+  return () => {
+    _externalTuiKeyRoutes = _externalTuiKeyRoutes.filter((candidate) => candidate.token !== entry.token);
+  };
+}
+
+export function routeExternalTuiKey(key: Key): boolean {
+  const routes = [..._externalTuiKeyRoutes];
+  for (let index = routes.length - 1; index >= 0; index -= 1) {
+    if (routes[index]!.route(key)) return true;
+  }
+  return false;
+}
+
 /** `injectKey` 로 들어온 키 표지 — `takeInjectedKeys` 가 stdin 잔여 키(readKey 몫)는 두고 주입 키만 꺼낸다. */
 const _injectedKeys = new WeakSet<Key>();
 

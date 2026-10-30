@@ -118,6 +118,52 @@ test('late gate fallback can quarantine the just-sanitized generation before ano
     .toThrow('no-warm-worker');
 });
 
+test('a timeout fence blocks only its worker, quarantines late replies, and retains ambiguous leases', () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-worker-timeout-fence-'));
+  roots.push(root);
+  const ledger = new ResourceLedger(root);
+  const key = { context: 'node-c', imageDigest: 'sha256:image', lockHash: 'lock-a', architecture: 'arm64' };
+  const firstId = 'worker-timeout';
+  const secondId = 'worker-sibling';
+  ledger.registerPodWorker({ workerId: firstId, machine: 'node-c', podUid: 'pod-timeout', key, owner: 'host', ttlMs: 10_000 }, 100);
+  ledger.registerPodWorker({ workerId: secondId, machine: 'node-b', podUid: 'pod-sibling', key, owner: 'host', ttlMs: 10_000 }, 100);
+  const first = ledger.acquirePodWorker({ key, owner: 'gate', runId: 'late-run', attemptId: 'late-attempt', ttlMs: 30_000 }, 101);
+  const leaseId = first.attrs.leaseId as string;
+  const generation = first.attrs.generation as number;
+  const fenced = ledger.fenceTimedOutPodWorker(`pod-worker-lease:${firstId}`,
+    { owner: 'gate', runId: 'late-run', attemptId: 'late-attempt', fenceMs: 150 }, 102);
+  expect(fenced.attrs).toMatchObject({ state: 'timeout-fenced', leaseId, generation, timeoutFenceUntil: 252 });
+  expect(() => ledger.acquirePodWorker({ machine: 'node-c', key, owner: 'next', runId: 'next-run', attemptId: 'next-attempt', ttlMs: 100 }, 103))
+    .toThrow('no-warm-worker');
+  const sibling = ledger.acquirePodWorker({ key, owner: 'next', runId: 'next-run', attemptId: 'next-attempt', ttlMs: 100 }, 104);
+  expect(sibling.name).toBe(secondId);
+  const quarantined = ledger.transitionPodWorker(first.id, { owner: 'gate', leaseId, generation, action: 'quarantine', reason: 'late-response' }, 105);
+  expect(quarantined.attrs).toMatchObject({ state: 'quarantined', generation, reason: 'late-response' });
+
+  const unansweredRoot = mkdtempSync(join(tmpdir(), 'elanous-worker-timeout-expiry-'));
+  roots.push(unansweredRoot);
+  const unanswered = new ResourceLedger(unansweredRoot);
+  unanswered.registerPodWorker({ workerId: firstId, machine: 'node-c', podUid: 'pod-idle', key, owner: 'host', ttlMs: 10_000 }, 100);
+  unanswered.fenceTimedOutPodWorker(`pod-worker-lease:${firstId}`,
+    { owner: 'gate', runId: 'no-response-run', attemptId: 'no-response-attempt', fenceMs: 150 }, 102);
+  const returned = unanswered.acquirePodWorker({ key, owner: 'next', runId: 'next-run', attemptId: 'next-attempt', ttlMs: 100 }, 252);
+  expect(returned.name).toBe(firstId);
+  expect(returned.attrs).toMatchObject({ state: 'leased', generation: 1 });
+
+  const lostReplyRoot = mkdtempSync(join(tmpdir(), 'elanous-worker-timeout-lost-reply-'));
+  roots.push(lostReplyRoot);
+  const lostReply = new ResourceLedger(lostReplyRoot);
+  lostReply.registerPodWorker({ workerId: firstId, machine: 'node-c', podUid: 'pod-ambiguous', key, owner: 'host', ttlMs: 10_000 }, 100);
+  const ambiguous = lostReply.acquirePodWorker({ key, owner: 'gate', runId: 'ambiguous-run', attemptId: 'ambiguous-attempt', ttlMs: 30_000 }, 101);
+  lostReply.fenceTimedOutPodWorker(`pod-worker-lease:${firstId}`,
+    { owner: 'gate', runId: 'ambiguous-run', attemptId: 'ambiguous-attempt', fenceMs: 150 }, 102);
+  expect(() => lostReply.acquirePodWorker({ key, owner: 'next', runId: 'next-run', attemptId: 'next-attempt', ttlMs: 100 }, 252))
+    .toThrow('no-warm-worker');
+  expect(lostReply.list({ name: firstId })[0]?.attrs).toMatchObject({
+    state: 'timeout-fenced', leaseId: ambiguous.attrs.leaseId, generation: ambiguous.attrs.generation,
+  });
+});
+
 test('a legacy idle row with a whitespace Pod UID cannot be leased', () => {
   const root = mkdtempSync(join(tmpdir(), 'elanous-worker-blank-uid-'));
   roots.push(root);

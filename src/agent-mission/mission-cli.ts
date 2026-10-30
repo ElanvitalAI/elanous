@@ -6,6 +6,7 @@
 
 import { readFileSync } from 'node:fs';
 import type { AgentBackend, AgentMissionResult, EvidenceMode } from './driver.js';
+import type { AgentCliDetection } from './tool-install.js';
 import { buildAgentMissionDevSpec, executeAgentMissionReroute, type runDevPipeline } from '../self-dev/dev-pipeline.js';
 import { parsePositiveInt } from '../self-dev/dev-cli.js';
 import { parsePluginRef } from './in-agent-plugin.js';
@@ -33,6 +34,8 @@ export interface MissionCliOpts {
 
 export interface MissionCliDeps {
   resolveBackend: (name?: string) => AgentBackend;
+  detectAgentCli?: (agent: 'claude' | 'codex') => AgentCliDetection;
+  onStatus?: (line: string) => void;
   signal?: AbortSignal;
   readFile?: (path: string) => string;
   runDevPipeline?: typeof runDevPipeline;
@@ -114,6 +117,27 @@ export async function runAgentMissionCliCommand(
     ...(opts.deliverable ? { deliverableHint: opts.deliverable } : {}),
     ...(opts.screens ? { screensDir: opts.screens } : {}),
   });
+  // The production CLI injects the host probe; injected tests can assert this preflight
+  // without spawning an agent CLI. For a chain, inspect each external CLI before any launch.
+  const externalAgents = [...new Set((chain ?? [agentBackend.name]).filter(
+    (name): name is 'claude' | 'codex' => name === 'claude' || name === 'codex',
+  ))];
+  const detections = deps.detectAgentCli ? externalAgents.map((agent) => deps.detectAgentCli!(agent)) : [];
+  const statusLine = detections.map(({ message }) => message).join(' · ');
+  if (statusLine) deps.onStatus?.(statusLine);
+  const notReady = detections.find(({ installed, login }) => installed !== true || login !== 'ready');
+  if (notReady) {
+    const message = notReady.installed === false
+      ? `${notReady.message}; 공식 설치 후 다시 실행`
+      : notReady.installed === null
+        ? `${notReady.message}; 설치 상태를 확인한 뒤 다시 실행`
+        : notReady.login === 'api-key'
+          ? `${notReady.message}; API 키 요금 고지와 동의 화면이 아직 없어 미션을 시작하지 않습니다 — Codex 구독 로그인(codex login) 후 다시 실행`
+        : notReady.login === 'needed'
+          ? `${notReady.message}; ${notReady.agent} login 후 다시 실행`
+          : `${notReady.message}; 로그인 상태를 확인한 뒤 다시 실행`;
+    return { ok: false, message, exitCode: 1 };
+  }
   const { result, exitCode } = await executeAgentMissionReroute(
     spec, agentBackend,
     { ...(deps.runDevPipeline ? { runDevPipeline: deps.runDevPipeline } : {}), ...(deps.signal ? { signal: deps.signal } : {}) },

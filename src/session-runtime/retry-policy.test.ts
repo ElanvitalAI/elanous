@@ -274,6 +274,7 @@ describe('provider-unavailable classification does not over-match', () => {
   // 📏 지어낸 문면이 아니다 — src/llm.ts 의 실제 발생원에서 그대로 옮겼다.
   const REAL_PROVIDER_UNAVAILABLE = [
     'Anthropic unavailable: configure apiKey via `elanous setup`',
+    'OpenRouter unavailable: configure apiKey via `elanous setup`',
     'openai-codex unavailable: run `elanous login openai-codex` or set `llm.apiKey`',
     'Grok unavailable: run `grok login` (구독) 또는 XAI_API_KEY/GROK_API_KEY 설정',
     'OpenAI unavailable: set OPENAI_API_KEY',
@@ -307,5 +308,10 @@ describe('provider-unavailable classification does not over-match', () => {
     const decision = decideRetry(new Error('OpenAI unavailable: set OPENAI_API_KEY'), { attempt: 0, doomStatus: 'normal' });
     expect(decision.action).toBe('abort');
     expect(decision.category).toBe('provider-unavailable');
+  });
+
+  test('missing OpenRouter credentials abort the same-provider retry', () => {
+    const decision = decideRetry(new Error('OpenRouter unavailable: configure apiKey via `elanous setup`'), { attempt: 0, doomStatus: 'normal' });
+    expect(decision).toMatchObject({ action: 'abort', category: 'provider-unavailable' });
   });
 });

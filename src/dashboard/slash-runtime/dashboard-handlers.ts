@@ -422,6 +422,21 @@ const COST_SLASH_DESCRIPTOR = buildCostSlashCommand();
 const MEMORY_SLASH_DESCRIPTOR = buildMemorySlashCommand();
 
 export interface DashboardSlashContext {
+  /** Classic /side agent commands supplied by the dashboard host. */
+  classicSidetabAgent?: {
+    loadRows(sessionId?: string): import('../../sidetab-core/model.js').SidetabRow[];
+    openAgent(agent: 'codex' | 'claude'): void;
+    runMission(agent: 'codex' | 'claude', mission: string, outputPath?: string): Promise<{
+      ok: boolean;
+      path: string;
+      firstLine?: string;
+      promptReady: boolean;
+      missionVisible: boolean;
+      promptReturned: boolean;
+      completionMarker: boolean;
+      error?: string;
+    }>;
+  };
   // Chat surface refs / mutators
   chatLines: string[];
   /** Same status-line producer the agent immediate executor uses. Absent in tests → empty. */

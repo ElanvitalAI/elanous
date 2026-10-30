@@ -152,6 +152,36 @@ test('routes the synthesized evidence through the selected output skill and pres
   expect(result.output).toContain('Scenario diagram summary.');
 });
 
+test('skips paid output formatting when every research axis failed', async () => {
+  const eventsBefore = debug.events(500).length;
+  let outputSkillCalls = 0;
+  const result = await runResearchQuestionLadder('Analyze the latest company results', {
+    generateContract,
+    generate: async () => JSON.stringify({ questions }),
+    invokeAxes: async (axes) => ({
+      plan: [],
+      axes: axes.map((axis) => ({ questionId: axis.id, error: 'provider unavailable', evidence: [{
+        questionId: axis.id, sourceKind: 'search-query', source: axis.searchTerms[0]!,
+        content: 'provider unavailable', outcome: 'failed' as const, truncated: false,
+      }] })),
+    }),
+    gapFollowup: async () => ({ rounds: 0, timeBudgetMs: 0, classifications: [], followups: [], followupEvidence: [] }),
+    routeOutput: () => ({
+      weight: 'heavy', weightSource: 'estimated', format: 'diagram',
+      skillCallPlan: { skill: 'diagram-master', args: 'format failed searches' },
+      observation: { resultChars: 1, axisCount: 6, estimatedWeight: 'heavy', selectedSkill: 'diagram-master' },
+    }),
+    invokeOutputSkill: async () => { outputSkillCalls += 1; return { ok: true, output: 'diagram' }; },
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.output).toContain('provider unavailable');
+  expect(result.output).not.toContain('Routed diagram output');
+  expect(outputSkillCalls).toBe(0);
+  expect(debug.events(500).slice(eventsBefore).some((event) => event.category === 'research.turn' && event.event === 'output-skill-skipped'))
+    .toBe(true);
+});
+
 test('keeps raw Bloom evidence when the output router fails', async () => {
   const result = await runResearchQuestionLadder('Compare bond yield scenarios', {
     generateContract,
@@ -293,6 +323,64 @@ test('grounding rejects the research result when all six axes fail', async () =>
   expect(result.ok).toBe(false);
   expect(researchTurnForGrounding(result).ok).toBe(false);
   expect(researchTurnForGrounding(result).output).toContain('[failed]');
+});
+
+test('skips gap discovery when its plan has no runnable auto-fill call', async () => {
+  const eventsBefore = debug.events(500).length;
+  let followupRunnerCalls = 0;
+  const result = await runResearchQuestionLadder('synthetic research request', {
+    generateContract,
+    generate: async () => JSON.stringify({ questions }),
+    invokeAxes: async (axes) => ({
+      plan: [],
+      axes: axes.map((question) => ({ questionId: question.id, evidence: [{
+        questionId: question.id, sourceKind: 'search-query', source: question.searchTerms[0]!,
+        content: 'provider unavailable', outcome: 'failed' as const, truncated: false,
+      }] })),
+    }),
+    planGapFollowup: () => ({
+      rounds: 0, timeBudgetMs: 120_000,
+      classifications: [{ questionId: 'q4', gap: 'no match', action: 'followup', reason: 'no-skill-match' }],
+      followups: [],
+    }),
+    gapFollowup: async () => {
+      followupRunnerCalls += 1;
+      return { rounds: 0, timeBudgetMs: 120_000, classifications: [], followups: [], followupEvidence: [] };
+    },
+    routeOutput: noOutputSkillRoute,
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.output).toContain('provider unavailable');
+  expect(result.output).toContain('[followup/no-skill-match]: no match');
+  expect(followupRunnerCalls).toBe(0);
+  expect(debug.events(500).slice(eventsBefore).some((event) => event.category === 'research.turn' && event.event === 'gap-followup-skipped'))
+    .toBe(true);
+});
+
+test('falls back to bounded gap execution when planning throws', async () => {
+  let followupRunnerCalls = 0;
+  const result = await runResearchQuestionLadder('synthetic research request', {
+    generateContract,
+    generate: async () => JSON.stringify({ questions }),
+    invokeAxes: async (axes) => ({
+      plan: [],
+      axes: axes.map((question) => ({ questionId: question.id, evidence: [{
+        questionId: question.id, sourceKind: 'search-query', source: question.searchTerms[0]!,
+        content: 'provider unavailable', outcome: 'failed' as const, truncated: false,
+      }] })),
+    }),
+    planGapFollowup: () => { throw new Error('planner unavailable'); },
+    gapFollowup: async () => {
+      followupRunnerCalls += 1;
+      return { rounds: 0, timeBudgetMs: 120_000, classifications: [], followups: [], followupEvidence: [] };
+    },
+    routeOutput: noOutputSkillRoute,
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.output).toContain('provider unavailable');
+  expect(followupRunnerCalls).toBe(1);
 });
 
 test('THINK-LENS-T1-WORKING-BACKWARDS: 원문이 대상 경로로 지목한 src/auto-research/research-turn.ts에 완료 경계 코드 행을 붙인다 — 다 차면 stop(debug.log)하고 갭 후속을 건너뛴다', async () => {

@@ -212,6 +212,9 @@ describe('classifyReviewProviderFailure — 「제공자가 아픈가」만 문�
     expect(classifyReviewProviderFailure('prompt too long: 200000 tokens')).toBe('other');
     expect(classifyReviewProviderFailure('invalid api key')).toBe('other');
   });
+  test('OpenRouter 자격 미설정은 다른 프로바이더로 넘길 수 있는 가용성 실패다', () => {
+    expect(classifyReviewProviderFailure('openrouter unavailable: configure apiKey via `elanous setup`')).toBe('credentials-unavailable');
+  });
 });
 
 describe('self review isolated CLI model routing', () => {
@@ -456,6 +459,22 @@ describe('runReviewWithFallback — 계약 넷', () => {
     // ⛔ 「왜 넘어갔나」가 값으로 남는다 — 나중에 세려면 이게 있어야 한다
     expect(seen[1]!.after).toBe('overloaded');
     expect(seen[2]!.after).toBe('overloaded');
+  });
+
+  test('OpenRouter 자격이 없으면 설정된 다음 제공자를 시도한다', async () => {
+    const openrouter = { model: 'openrouter/z-ai/glm-5.3', provider: getProvider('openrouter/z-ai/glm-5.3')!, label: 'openrouter' };
+    const calls: string[] = [];
+    const seen: Array<{ event: string; data: ReviewFallbackObservation }> = [];
+    const result = await runReviewWithFallback([openrouter, B], async (attempt) => {
+      calls.push(attempt.label);
+      if (attempt === openrouter) throw new Error('openrouter unavailable: configure apiKey via `elanous setup`');
+      return 'PASS from grok';
+    }, (event, data) => seen.push({ event, data }));
+
+    expect(calls).toEqual(['openrouter', 'grok']);
+    expect(result).toMatchObject({ text: 'PASS from grok', used: B, attemptIndex: 1 });
+    expect(seen.map(({ event }) => event)).toEqual(['attempt', 'fallback', 'attempt', 'completed']);
+    expect(seen[1]?.data).toMatchObject({ afterReason: 'credentials-unavailable' });
   });
 
   test('② 폴백 불가능한 오류는 사유를 남기고 즉시 던진다 — 다른 모델로 안 샌다', async () => {

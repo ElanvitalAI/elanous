@@ -230,6 +230,7 @@ export async function runSubscriptionReviewer(
 }
 
 export type ReviewFailureReason =
+  | 'credentials-unavailable'
   | 'overloaded'
   | 'rate-limited'
   | 'server-error'
@@ -238,11 +239,17 @@ export type ReviewFailureReason =
   | 'unknown-model-provider'
   | 'other';
 
-export type ReviewFallbackReason = Extract<ReviewFailureReason, 'overloaded' | 'rate-limited' | 'server-error' | 'timeout'>;
+export type ReviewFallbackReason = Extract<ReviewFailureReason, 'credentials-unavailable' | 'overloaded' | 'rate-limited' | 'server-error' | 'timeout'>;
 
 /** 실패 사유는 집계 가능한 유한 값으로 남긴다. */
 export function classifyReviewProviderFailure(message: string): ReviewFailureReason {
   const m = message.toLowerCase();
+  // Credential absence is provider-local: move to the next configured provider, then let the caller
+  // preserve its current artifact if every configured provider is keyless.
+  if ((m.includes('unavailable') && /(api\s*key|credentials?)/.test(m))
+    || /configure\s+(?:an?\s+)?api\s*key/.test(m)
+    || /(?:missing|no)\s+(?:provider\s+)?(?:api\s*)?key\b/.test(m)
+    || /credentials?\s+(?:are\s+)?unavailable/.test(m)) return 'credentials-unavailable';
   // ⭐ 실물 문면을 먼저 둔다 — `#10069` 가 낸 그 문장이다.
   if (m.includes('overloaded') || m.includes('server_overloaded')) return 'overloaded';
   if (m.includes('rate limit') || m.includes('rate_limit') || m.includes('429')) return 'rate-limited';
@@ -253,7 +260,7 @@ export function classifyReviewProviderFailure(message: string): ReviewFailureRea
 }
 
 function isReviewFallbackReason(reason: ReviewFailureReason): reason is ReviewFallbackReason {
-  return reason === 'overloaded' || reason === 'rate-limited' || reason === 'server-error' || reason === 'timeout';
+  return reason === 'credentials-unavailable' || reason === 'overloaded' || reason === 'rate-limited' || reason === 'server-error' || reason === 'timeout';
 }
 
 export interface ReviewProviderAttempt {

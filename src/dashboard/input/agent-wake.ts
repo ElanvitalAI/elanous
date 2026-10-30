@@ -28,6 +28,7 @@ import { homedir } from 'node:os';
 import type { TextInputInternalTurnYieldPort } from '../../chat/index.js';
 import { debug } from '../../debug/log.js';
 import type { PendingTaskNotification } from '../../agent/task-notification.js';
+import { CLASSIC_SIDETAB_MISSION_LABEL } from '../classic-sidetab-mission-job.js';
 import { detectSeatTui, type SeatDetection } from '../seat-boot-preamble.js';
 import type { InternalTurnRejectReason, StartTurnIfIdleOptions, StartTurnIfIdleResult } from './internal-turn.js';
 
@@ -77,6 +78,16 @@ function displayName(n: Pick<PendingTaskNotification, 'label' | 'agentName'>): s
   return ((n.label ?? '').trim() || n.agentName).replace(/\s+/g, ' ').slice(0, 60);
 }
 
+/** Late research results remain visible as one compact line without opening a turn. */
+export function formatAgentSupplementNotice(
+  n: Pick<PendingTaskNotification, 'label' | 'agentName' | 'state' | 'output'>,
+): string {
+  const summary = n.output.replace(/\s+/gu, ' ').trim();
+  const excerpt = summary.length > 180 ? `${summary.slice(0, 177)}…` : summary;
+  const status = n.state === 'done' ? '' : ` (${n.state})`;
+  return `↳ 보강: ${displayName(n)}${status}${excerpt ? ` — ${excerpt}` : ' — 결과 없음'}`;
+}
+
 /** 채팅 한 줄 — «✓ 위임 끝: <이름> — 다음 턴에 결과»(실패·중단이면 ✗ ⊕ 상태). */
 export function formatAgentWakeNotice(n: Pick<PendingTaskNotification, 'label' | 'agentName' | 'state'>): string {
   const name = displayName(n);
@@ -86,7 +97,10 @@ export function formatAgentWakeNotice(n: Pick<PendingTaskNotification, 'label' |
 }
 
 /** 자리 TUI 에서 여는 내부 턴의 입력 — 결과 본문은 turn-preamble 이 `<task-notification>` 으로 싣는다. */
-export function formatAgentWakePrompt(n: Pick<PendingTaskNotification, 'label' | 'agentName' | 'state'>): string {
+export function formatAgentWakePrompt(n: Pick<PendingTaskNotification, 'taskId' | 'label' | 'agentName' | 'state'>): string {
+  if (n.label === CLASSIC_SIDETAB_MISSION_LABEL) {
+    return `[자동 재개] 사이드탭 미션 완료: ${n.taskId} (${n.state}) — <task-notification> 결과를 원래 요청과 대조해 수용·부분 수용·기각을 판단하고, 필요하면 원래 대화를 계속 진행`;
+  }
   return `[자동 재개] 위임 끝: ${displayName(n)} (${n.state}) — <task-notification> 의 결과를 읽고 이어서 처리`;
 }
 
@@ -141,6 +155,14 @@ export function createAgentWake(deps: AgentWakeDeps): AgentWakeController {
       return false;
     }
     handled.add(n.taskId);
+    if (n.completionDelivery === 'supplement') {
+      let notifyError: string | null = null;
+      try { deps.notify(formatAgentSupplementNotice(n)); } catch (error) {
+        notifyError = error instanceof Error ? error.message : String(error);
+      }
+      log('tui.agent-wake', 'supplemented', { ...base, shown: notifyError === null, ...(notifyError !== null ? { notifyError } : {}) });
+      return true;
+    }
     // 그리기 실패가 큐·형제 리스너를 막지 않는다 — 대신 관측에 남긴다(알림이 실제로 안 보였음을 볼 수 있게).
     let notifyError: string | null = null;
     try { deps.notify(formatAgentWakeNotice(n)); } catch (error) {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  createNextSidetabHostHandler, isNextSidetabCall, nextSidetabToolSpec,
+  createNextSidetabHostHandler, createReplNextSidetabTool, isNextSidetabCall, nextSidetabToolSpec,
   type SidetabRow,
 } from './model.js';
 
@@ -12,7 +12,7 @@ const rows: SidetabRow[] = [
 describe('renderer-independent sidetab model and actions', () => {
   test('publishes the same bounded action contract without importing a renderer', () => {
     expect(nextSidetabToolSpec.name).toBe('NextSidetab');
-    expect(nextSidetabToolSpec.parameters.properties.action.enum).toEqual(['list', 'switch', 'attach', 'detach', 'new', 'kill']);
+    expect(nextSidetabToolSpec.parameters.properties.action.enum).toEqual(['list', 'switch', 'attach', 'detach', 'new', 'mission', 'kill']);
     expect(isNextSidetabCall({ type: 'elanous.sidetab.call', callId: 'one', request: { action: 'list' } })).toBe(true);
     expect(isNextSidetabCall({ type: 'bad', callId: 'one', request: { action: 'list' } })).toBe(false);
   });
@@ -55,4 +55,29 @@ describe('renderer-independent sidetab model and actions', () => {
     });
     expect(kills).toBe(1);
   });
+
+  test('gives visible missions enough IPC time to complete', async () => {
+    const tool = createReplNextSidetabTool({ send: () => true, on: () => {} }, { ELANOUS_NEXT_TUI_SIDETAB_IPC: '1' }, 5, 35)!;
+    const started = Date.now();
+    const result = await tool.dispatch({ action: 'mission', agent: 'codex', mission: 'create a demo note' });
+    expect(result).toEqual({ error: 'Next TUI did not answer the side-tab request' });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(25);
+  });
+});
+
+test('routes a mission through the visible Codex sidetab runner and requires mission text', async () => {
+  const missions: string[] = [];
+  const handler = createNextSidetabHostHandler({
+    rows: () => rows, selected: () => 0,
+    switchSession: async () => ({}), attach: async () => ({}), detach: () => ({}),
+    spawn: () => ({}), kill: () => ({}),
+    runMission: async (agent, mission) => { missions.push(`${agent}:${mission}`); return { ok: true, path: '/tmp/result.md', firstLine: '# done' }; },
+  });
+  expect(await handler({ action: 'mission', mission: '  Write a note.  ' })).toEqual({
+    ok: true, path: '/tmp/result.md', firstLine: '# done',
+  });
+  expect(await handler({ action: 'mission', agent: 'claude', mission: 'Review the note.' })).toMatchObject({ ok: true });
+  expect(await handler({ action: 'mission', agent: 'gemini' as never, mission: 'Review the note.' })).toEqual({ error: 'agent는 codex 또는 claude여야 합니다' });
+  expect(await handler({ action: 'mission' })).toEqual({ error: 'mission 텍스트가 필요합니다' });
+  expect(missions).toEqual(['codex:Write a note.', 'claude:Review the note.']);
 });

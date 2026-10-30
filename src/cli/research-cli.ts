@@ -1,12 +1,11 @@
 import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { isLiveDetailOn } from '../live/detail-switch.js';
-import { dispatchOmniSearch } from '../skills/tools/omni-search.js';
-import { getAvailableWebSearchProviders } from '../web-search/index.js';
+import { dispatchResearchOmniSearch, getAvailableResearchSearchEngineIds } from '../skills/tools/omni-search.js';
 
 export interface ResearchCliDeps {
   readonly out?: { log: (line: string) => void; error: (line: string) => void };
-  readonly search?: typeof dispatchOmniSearch;
+  readonly search?: typeof dispatchResearchOmniSearch;
   readonly availableEngines?: () => string[];
   readonly maxDetailOn?: (runId?: string) => boolean;
   readonly log?: typeof debug.log;
@@ -23,7 +22,7 @@ export function registerResearchCommand(program: Command, deps: ResearchCliDeps 
       const query = parts.join(' ').trim();
       const limit = Number(opts.limit);
       const engines = opts.engines?.split(',').map(id => id.trim()).filter(Boolean);
-      const available = (deps.availableEngines ?? (() => getAvailableWebSearchProviders().map(p => p.id)))();
+      const available = (deps.availableEngines ?? getAvailableResearchSearchEngineIds)();
       const unknown = engines?.filter(id => !available.some(p => p.toLowerCase() === id.toLowerCase())) ?? [];
       if (!query || !Number.isInteger(limit) || limit < 1 || limit > 20 || (opts.engines !== undefined && !engines?.length) || unknown.length) {
         out.error(unknown.length ? `research: 사용할 수 없는 엔진: ${unknown.join(', ')} (사용 가능: ${available.join(', ') || '없음'})`
@@ -41,7 +40,7 @@ export function registerResearchCommand(program: Command, deps: ResearchCliDeps 
       if (!wanted.length) log('research.query', 'query', { query, engines: [], limit });
       for (const engine of wanted) log('research.query', 'query', { query, engine, limit });
       try {
-        const result = await (deps.search ?? dispatchOmniSearch)({ query, ...(engines?.length ? { engines } : {}), limit }, {
+        const result = await (deps.search ?? dispatchResearchOmniSearch)({ query, ...(engines?.length ? { engines } : {}), limit }, {
           onEngine: event => {
             if (event.phase === 'complete') log('research.result', 'result', { query, engine: event.engine, hits: event.hits, durationMs: event.durationMs, ...(event.error ? { error: event.error } : {}) });
           },

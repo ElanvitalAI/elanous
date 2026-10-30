@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runGraph } from '../../src/graph-runner/runner';
 import { parseGraphTemplateYaml } from '../../src/self-implement/graph-yaml';
 import { buildMakeDocOutput, buildVerifyEnvelope, buildVerifyOutput, unpackMakeDocEnvelope } from './verbs-envelope';
 
@@ -84,4 +87,90 @@ test('verify exit emits the shared result/evidence envelope and carries findings
     .toEqual({ result: 'rework', evidence: { 'review-summary': null, 'must-fix': null, 'gate-log': 'prior-gate.log' } });
   expect(buildVerifyOutput({ input: { prior: { result: 'keep-prior', evidence: { 'prior-result': 'stale' } } }, outputs: {} }, 'failed').evidence)
     .toMatchObject({ 'prior-result': 'keep-prior' });
+});
+
+test('MAKE-DOC-UNIT-EXIT-MISSING: research-report preserves the complete make-doc envelope and every terminal output', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'research-report-envelope-'));
+  const graph = join(root, 'research-report.yaml');
+  const units = join(root, 'units');
+  const sourceRoot = new URL('../..', import.meta.url);
+  const ask = 'Write the research report';
+  const context = { worktree: '/tmp/research-report-envelope', branch: 'research/envelope', goal: 'Preserve the supplied envelope' };
+  const prior = { result: 'existing research', evidence: { source: 'prior-source' } };
+  const exits = ['done', 'rework', 'needs-human', 'failed'] as const;
+
+  try {
+    mkdirSync(units, { recursive: true });
+    for (const unit of ['research', 'make-doc', 'verify']) {
+      writeFileSync(join(units, `verb-${unit}.yaml`), readFileSync(new URL(`graphs/units/verbs/${unit}.yaml`, sourceRoot), 'utf8'));
+    }
+    writeFileSync(join(units, 'recipes.yaml'), readFileSync(new URL('graphs/units/verbs/recipes.yaml', sourceRoot), 'utf8'));
+    writeFileSync(join(root, 'recipes.yaml'), '{}\n');
+    writeFileSync(graph, readFileSync(new URL('graphs/work/research-report.yaml', sourceRoot), 'utf8'));
+
+    const template = parseGraphTemplateYaml(readFileSync(graph, 'utf8'), graph).template!;
+    for (const terminal of ['done', 'failed']) {
+      expect(template.nodes.find(node => node.nodeId === terminal)?.contract?.outputs).toEqual(['result', 'evidence']);
+    }
+
+    const observedExits = new Set<string>();
+    let inputMissing = 0;
+    let exitMissing = 0;
+    for (const selectedExit of exits) {
+      let makeDocVisits = 0;
+      const receivedInputs: Array<Record<string, unknown>> = [];
+      const run = await runGraph(graph, {
+        input: { ask, context, prior },
+        deps: {
+          root,
+          runBash: async (body, options) => {
+            const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
+            if (!contextPath) throw new Error(`missing graph context for ${body}`);
+            const recipeContext = JSON.parse(readFileSync(contextPath, 'utf8')) as { graphId?: string; input?: Record<string, unknown>; outputs?: Record<string, unknown> };
+            const output = (value: unknown) => ({ stdout: `${JSON.stringify(value)}\n`, stderr: '', exitCode: 0 });
+            if (body.includes('verbs/research.ts')) return output({ outcome: 'done', result: 'research complete', evidence: { research: 'source' } });
+            if (body.includes('make-doc-input')) {
+              receivedInputs.push(recipeContext.input ?? {});
+              return output(unpackMakeDocEnvelope(recipeContext.input ?? {}));
+            }
+            if (body.includes('headless-goal-loop.ts') && recipeContext.graphId === 'verb-make-doc') {
+              makeDocVisits += 1;
+              const outcome = selectedExit === 'rework' && makeDocVisits === 1 ? 'rework' : selectedExit === 'rework' ? 'done' : selectedExit;
+              return output({ outcome, result: `draft-${outcome}`, evidence: { draft: outcome } });
+            }
+            if (body.includes('make-doc-output')) return output(buildMakeDocOutput(recipeContext as never));
+            if (body.includes('verify-envelope')) return output(buildVerifyEnvelope(recipeContext as never));
+            if (body.includes('verify-stage.ts gate')) return output({ outcome: 'pass', passed: true, 'gate-log': 'gate-pass' });
+            if (body.includes('verify-stage.ts review')) return output({ outcome: 'pass', verdict: 'pass', 'must-fix': [], 'review-summary': 'review-pass' });
+            if (body.includes('verify-output done')) return output(buildVerifyOutput(recipeContext as never, 'done'));
+            throw new Error(`unexpected research-report recipe: ${body}`);
+          },
+        },
+      });
+
+      expect(receivedInputs).not.toHaveLength(0);
+      for (const received of receivedInputs) {
+        if (received.ask !== ask || JSON.stringify(received.context) !== JSON.stringify(context) || JSON.stringify(received.prior) !== JSON.stringify(prior)) inputMissing += 1;
+      }
+      const makeDocCalls = run.unitCalls?.filter(call => call.node === 'make-doc') ?? [];
+      exitMissing += makeDocCalls.filter(call => !call.exit).length;
+      for (const call of makeDocCalls) observedExits.add(call.exit);
+      const makeDocOutputs = run.nodes.filter(node => node.nodeId === 'make-doc').map(node => JSON.parse(String(node.output)) as Record<string, unknown>);
+      expect(makeDocOutputs).toHaveLength(makeDocCalls.length);
+      for (const output of makeDocOutputs) {
+        expect(output).toHaveProperty('result');
+        expect(output).toHaveProperty('evidence');
+      }
+      for (const call of makeDocCalls) {
+        const child = JSON.parse(readFileSync(join(root, 'graph-runs', 'verb-make-doc', `${call.childRunId}.json`), 'utf8')) as { nodes: Array<{ nodeId: string; output: string }> };
+        const terminal = child.nodes.find(node => node.nodeId === call.exit);
+        expect(JSON.parse(terminal!.output)).toEqual(expect.objectContaining({ result: expect.anything(), evidence: expect.any(Object) }));
+      }
+    }
+    expect(observedExits).toEqual(new Set(exits));
+    expect(inputMissing).toBe(0);
+    expect(exitMissing).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

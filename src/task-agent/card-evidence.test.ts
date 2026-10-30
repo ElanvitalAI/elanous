@@ -60,7 +60,7 @@ test('live hand: 발사기가 받은 런 id 를 카드에 한 번 적고 env 로
     expect(contexts).toHaveLength(1);
     const ctx = contexts[0]!;
     expect(ctx.runId).toMatch(/^run-[0-9a-f-]{36}$/);
-    expect(ctx.env).toEqual({ ELANOUS_RUN_ID: ctx.runId, ELANOUS_TASK_CARD_ID: card.id });
+    expect(ctx.env).toEqual({ ELANOUS_RUN_ID: ctx.runId, ELANOUS_TASK_CARD_ID: card.id, ELANOUS_POD_DISTRIBUTOR_ENTRY: 'tasks-hand' });
     expect(ctx.launchId).toMatch(/^tl-[0-9a-f]{12}$/);
     const disk = readTaskCard(card.id, path)!;
     expect(disk).toMatchObject({ status: 'launched', runId: ctx.runId, launchId: ctx.launchId });

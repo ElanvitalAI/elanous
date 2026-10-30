@@ -268,9 +268,9 @@ edges:
   return { graph, root, unit };
 }
 
-function unitFixtureWithPriorResult(result: string | null = 'from-previous-verb'): { graph: string; root: string; unit: string } {
+function unitFixtureWithPriorResult(result: string | null | 'absent' = 'from-previous-verb'): { graph: string; root: string; unit: string } {
   const fixture = unitFixture();
-  writeFileSync(join(fixture.root, 'recipes.yaml'), `seed:\n  command: >-\n    printf '%s' '${result === null ? '{"other":"no-result"}' : JSON.stringify({ result })}'\n`);
+  writeFileSync(join(fixture.root, 'recipes.yaml'), `seed:\n  command: >-\n    printf '%s' '${result === 'absent' ? '{"other":"no-result"}' : JSON.stringify({ result })}'\n`);
   writeFileSync(join(fixture.root, 'units', 'recipes.yaml'), `produce:\n  command: >-\n    bun -e 'const c=JSON.parse(require("fs").readFileSync(process.env.ELANOUS_GRAPH_CONTEXT,"utf8")); console.log(JSON.stringify({answer:c.input.prior}))'\n`);
   writeFileSync(fixture.graph, readFileSync(fixture.graph, 'utf8')
     .replace('entry_node: invoke', 'entry_node: seed')
@@ -333,14 +333,26 @@ test('explicit input prior takes precedence over the previous node result', asyn
   }
 });
 
-test('unit prior contract fails closed when the previous result is absent', async () => {
+test('unit prior input defaults to an empty object when the previous result is absent', async () => {
+  const { graph, root } = unitFixtureWithPriorResult('absent');
+  try {
+    const result = await runGraph(graph, { deps: { root } });
+    expect(result.status).toBe('done');
+    expect(result.path).toEqual(['seed', 'invoke', 'done']);
+    expect(result.nodes.find(node => node.nodeId === 'invoke')?.output)
+      .toBe('{"outcome":"done","answer":{}}');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unit prior input preserves an explicit null previous result', async () => {
   const { graph, root } = unitFixtureWithPriorResult(null);
   try {
     const result = await runGraph(graph, { deps: { root } });
-    expect(result.status).toBe('failed');
-    expect(result.path).toEqual(['seed', 'invoke']);
-    expect(result.nodes.find(node => node.nodeId === 'invoke')?.error).toContain('unit input missing: invoke.prior');
-    expect(result.unitCalls ?? []).toHaveLength(0);
+    expect(result.status).toBe('done');
+    expect(result.nodes.find(node => node.nodeId === 'invoke')?.output)
+      .toBe('{"outcome":"done","answer":null}');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'bun:test';
-import { fanOutAxisEvidence, planAxisToolCalls } from './axis-fanout.js';
+import { createResearchAxisSearcher, fanOutAxisEvidence, planAxisToolCalls, RESEARCH_SEARCH_BUDGET_MS } from './axis-fanout.js';
 import { invokeResearchAxes, setResearchInvoker } from '../research-bridge/invoke.js';
 import type { BloomResearchQuestion } from '../auto-research/question-ladder-contract.js';
+import type { WebSearchProvider } from '../web-search/provider.js';
+import { addWebSearchProvider, _resetWebSearchProvidersForTests } from '../web-search/index.js';
 
 const axes = [
   { id: 'us-rate', level: 1, prompt: '미국 10년물 금리는?', requestedWindow: '2026-10', searchTerms: ['US 10 year Treasury yield October 2026'] },
@@ -10,6 +12,11 @@ const axes = [
 ] as BloomResearchQuestion[];
 
 describe('research axis fanout', () => {
+  it('bounds the total paid-engine fanout below the 15s dead-search ceiling', () => {
+    expect(RESEARCH_SEARCH_BUDGET_MS).toBeLessThanOrEqual(15_000);
+    expect(RESEARCH_SEARCH_BUDGET_MS).toBe(14_500);
+  });
+
   it('각 축의 질문 ID와 검색어를 독립 도구 호출 계획으로 남긴다', () => {
     expect(planAxisToolCalls(axes)).toEqual([
       { questionId: 'us-rate', tool: 'OmniSearch', query: axes[0]!.searchTerms[0] },
@@ -121,5 +128,81 @@ describe('research axis fanout', () => {
     }) });
     expect(result.axes[0]!.evidence.map(item => item.outcome)).toEqual(['complete', 'failed']);
     expect(result.axes[0]!.error).toContain('firecrawl: timeout');
+  });
+
+  it('연구 fanout은 Grok/Firecrawl만 선택하고 무료 엔진을 호출하지 않는다', async () => {
+    const calls: string[] = [];
+    const provider = (id: string): WebSearchProvider => ({
+      id, displayName: id, available: () => true,
+      search: async ({ query }) => {
+        calls.push(`${id}:${query}`);
+        return { providerName: id, durationMs: 1, hits: [{ url: `https://example.org/${id}`, title: id, snippet: query }] };
+      },
+    });
+    const search = createResearchAxisSearcher([provider('grok'), provider('firecrawl'), provider('ddg-free')]);
+    const results = await Promise.all([search('first axis'), search('second axis')]);
+    expect(calls.map(call => call.split(':')[0]).sort()).toEqual(['firecrawl', 'firecrawl', 'grok', 'grok']);
+    expect(results.flatMap(result => Array.isArray(result) ? result : result.hits).map(hit => hit.engine).sort())
+      .toEqual(['firecrawl', 'firecrawl', 'grok', 'grok']);
+  });
+
+  it('research abort signal reaches each queued axis search', async () => {
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    const pending = fanOutAxisEvidence([axes[0]!], {
+      signal: controller.signal,
+      search: async (_query, signal) => {
+        received = signal;
+        return new Promise(resolve => signal?.addEventListener('abort', () => resolve([]), { once: true }));
+      },
+    });
+    controller.abort();
+    await pending;
+    expect(received).toBe(controller.signal);
+  });
+
+  it('기본 axis 경로는 등록 provider 중 Grok 한 경로와 Firecrawl만 검색한다', async () => {
+    _resetWebSearchProvidersForTests(false);
+    const calls: string[] = [];
+    for (const id of ['grok', 'grok-api', 'firecrawl', 'tavily', 'ddg']) {
+      addWebSearchProvider({
+        id, displayName: id, available: () => true,
+        search: async () => {
+          calls.push(id);
+          return { providerName: id, durationMs: 1, hits: [{ url: `https://${id}.example`, title: id, snippet: 'axis evidence' }] };
+        },
+      });
+    }
+    try {
+      const result = await fanOutAxisEvidence([axes[0]!]);
+      expect(calls.sort()).toEqual(['firecrawl', 'grok']);
+      expect(result.axes[0]!.evidence.map(item => item.sourceKind).sort()).toEqual(['web-search:firecrawl', 'web-search:grok']);
+    } finally {
+      _resetWebSearchProvidersForTests();
+    }
+  });
+
+  it('첫 timeout에서 해당 엔진 breaker를 열되 다른 엔진의 queued 축 검색은 보존한다', async () => {
+    let grokCalls = 0;
+    let firecrawlCalls = 0;
+    const grok: WebSearchProvider = {
+      id: 'grok', displayName: 'Grok', available: () => true,
+      search: async () => { grokCalls += 1; throw new DOMException('timed out', 'TimeoutError'); },
+    };
+    const firecrawl: WebSearchProvider = {
+      id: 'firecrawl', displayName: 'Firecrawl', available: () => true,
+      search: async ({ query }) => {
+        firecrawlCalls += 1;
+        return { providerName: 'firecrawl', durationMs: 1,
+          hits: [{ url: 'https://example.org/source', title: query, snippet: 'evidence' }] };
+      },
+    };
+    const search = createResearchAxisSearcher([grok, firecrawl]);
+    const [first, second] = await Promise.all([search('first axis'), search('queued axis')]);
+    expect(grokCalls).toBe(1);
+    expect(firecrawlCalls).toBe(2);
+    expect(Array.isArray(first) ? [] : first.errors).toContain('grok: timed out');
+    expect(Array.isArray(second) ? [] : second.errors).toEqual([]);
+    expect((Array.isArray(second) ? second : second.hits).map(hit => hit.engine)).toEqual(['firecrawl']);
   });
 });

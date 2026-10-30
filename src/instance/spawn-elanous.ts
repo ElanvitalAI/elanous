@@ -11,6 +11,8 @@ export interface SpawnElanousOptions {
   stateDir?: string;
   /** 실행할 elanous 진입 스크립트. 생략하면 이 트리의 bin/elanous.mjs. */
   bin?: string;
+  /** Installed command entry (for callers that must honor the user's installed CLI). */
+  executable?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
 }
@@ -26,20 +28,20 @@ export function elanousInvocation(args: readonly string[], opts: SpawnElanousOpt
   const root = opts.stateDir?.trim() || effectiveInstanceRoot();
   const base = opts.env ?? process.env;
   return {
-    command: process.execPath,
-    args: [opts.bin ?? DEFAULT_BIN, ...args],
+    command: opts.executable?.trim() || process.execPath,
+    args: opts.executable?.trim() ? [...args] : [opts.bin ?? DEFAULT_BIN, ...args],
     env: { ...base, ELANOUS_STATE_DIR: root, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(root, base) },
   };
 }
 
 export function spawnElanous(args: readonly string[], opts: SpawnElanousOptions & Omit<SpawnOptions, 'env' | 'cwd'> = {}): ChildProcess {
-  const { stateDir: _s, bin: _b, env: _e, ...rest } = opts;
+  const { stateDir: _s, bin: _b, executable: _x, env: _e, ...rest } = opts;
   const inv = elanousInvocation(args, opts);
   return spawn(inv.command, inv.args, { ...rest, cwd: opts.cwd, env: inv.env });
 }
 
 export function spawnElanousSync(args: readonly string[], opts: SpawnElanousOptions & Omit<SpawnSyncOptions, 'env' | 'cwd'> = {}): SpawnSyncReturns<string | Buffer> {
-  const { stateDir: _s, bin: _b, env: _e, ...rest } = opts;
+  const { stateDir: _s, bin: _b, executable: _x, env: _e, ...rest } = opts;
   const inv = elanousInvocation(args, opts);
   return spawnSync(inv.command, inv.args, { ...rest, cwd: opts.cwd, env: inv.env });
 }

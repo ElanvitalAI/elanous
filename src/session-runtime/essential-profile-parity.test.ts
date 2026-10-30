@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSessionRuntimeToolSpecs, type SessionSurfaceId } from './index.js';
+import { debug } from '../debug/log.js';
 import { resetUserConfig } from '../user-config.js';
 import { findNativeTool, isNativeToolModelExposed } from '../native-tool-catalog.js';
 import { registerAllDefaultToolRuntimes } from '../tool-runtime/index.js';
@@ -149,4 +150,28 @@ describe('essential fixed catalog and coding profile parity', () => {
     expect(essentialNames).toContain('PersistentGrounding');
   });
 
+});
+
+describe('session runtime catalog timing', () => {
+  it('records tool-catalog assembly duration and count without input text', () => {
+    debug.clear();
+    try {
+      registerAllDefaultToolRuntimes();
+      const input = 'private timing fixture text';
+      const specs = buildSessionRuntimeToolSpecs({
+        userText: input,
+        hostTools: [],
+        runtimeTools: listToolRuntimes('tui'),
+        optionalTools: [],
+      });
+      const timing = debug.events().find(event => event.category === 'session-runtime.latency'
+        && event.event === 'tool-catalog-ready');
+      const timingData = timing?.data as Record<string, unknown> | undefined;
+      expect(timingData).toMatchObject({ toolCount: specs.length });
+      expect(typeof timingData?.elapsedMs).toBe('number');
+      expect(JSON.stringify(timing)).not.toContain(input);
+    } finally {
+      debug.clear();
+    }
+  });
 });

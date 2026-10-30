@@ -679,6 +679,26 @@ describe('session-runtime turn system messages', () => {
     expect(opsFleetMessages[1]?.content).toContain('status pages');
   });
 
+  test('adds research reconciliation guidance only when prior evidence is challenged', () => {
+    const researchState = createSessionPostureState();
+    setSessionPreferredSurface(researchState, 'research/agent');
+    const ordinaryText = '최신 반응을 여러 소스로 조사해줘';
+    const ordinaryMessages = buildSessionRuntimeTurnSystemMessages(resolveSessionTurnProfile({
+      userText: ordinaryText,
+      chatModeState: researchState,
+    }), ordinaryText);
+    expect(ordinaryMessages).toHaveLength(2);
+    expect(ordinaryMessages.some(message => message.content.includes('## Proactive Reconciliation'))).toBe(false);
+
+    const challengeText = '앞선 답변에서 출처를 확인했나? 근거가 빠졌다면 원래 질문을 다시 조사해 정정해줘.';
+    const challengeMessages = buildSessionRuntimeTurnSystemMessages(resolveSessionTurnProfile({
+      userText: challengeText,
+      chatModeState: researchState,
+    }), challengeText);
+    expect(challengeMessages).toHaveLength(3);
+    expect(challengeMessages[2]?.content).toContain('## Proactive Reconciliation — Tool-use Correction');
+  });
+
   test('adds general scoped exploration guidance for structural analysis requests', () => {
     const chatModeState = createSessionPostureState();
     const profile = resolveSessionTurnProfile({

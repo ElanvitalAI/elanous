@@ -5,7 +5,7 @@
 // "(running in background)" message on the same turn. To surface the
 // eventual result, we collect a `PendingTaskNotification` per completed
 // background task and inject a `<task-notification>` XML user message
-// at the start of the parent's NEXT turn.
+// at the start of the parent's next turn or at a live goal-loop boundary.
 //
 // Why XML injection instead of a tool ──
 //  • Tool-loop parents would need to remember to poll; the reliability
@@ -43,11 +43,14 @@ export const TASK_NOTIFICATION_OUTPUT_CAP = 500;
 
 export interface PendingTaskNotification {
   taskId: string;
+  parentSessionId?: string;
   agentName: string;
   /** Caller-supplied short label (Agent tool's `name` arg). */
   label?: string;
   /** Team context this task belonged to (Agent tool's `team_name`). */
   teamName?: string;
+  /** Parent-selected route; supplemental results never reopen a TUI turn. */
+  completionDelivery?: 'follow-up' | 'supplement';
   /** Final state of the task — parent LLM sees this to choose follow-up. */
   state: 'done' | 'error' | 'aborted';
   /** Child's final text (capped at TASK_NOTIFICATION_OUTPUT_CAP). */
@@ -150,11 +153,26 @@ export class TaskNotificationQueue {
     }
   }
 
-  /** Return all pending notifications AND clear the queue. Parents
-   *  call this exactly once per turn-start. */
+  /** Return all pending notifications and remove them from the queue. */
   drain(): PendingTaskNotification[] {
-    const out = this.queue;
-    this.queue = [];
+    return this.drainMatching(() => true);
+  }
+
+  /** Drain only results owned by one parent session; leave sibling sessions queued. */
+  drainForParentSession(parentSessionId: string): PendingTaskNotification[] {
+    return this.drainMatching((item) => item.parentSessionId === parentSessionId);
+  }
+
+  /** Drain one session's receipts plus legacy sessionless receipts; keep sibling sessions queued. */
+  drainForParentSessionOrUnscoped(parentSessionId: string): PendingTaskNotification[] {
+    return this.drainMatching((item) => item.parentSessionId === undefined || item.parentSessionId === parentSessionId);
+  }
+
+  private drainMatching(matches: (item: PendingTaskNotification) => boolean): PendingTaskNotification[] {
+    const out = this.queue.filter(matches);
+    if (out.length === 0) return out;
+    const drained = new Set(out);
+    this.queue = this.queue.filter((item) => !drained.has(item));
     this.persist();
     // NOTE: we keep `seen` populated so a listener firing a second
     // time for the same task (rare but possible under races) still
@@ -260,9 +278,11 @@ function buildPendingFromTask(task: AgentTask): PendingTaskNotification | null {
   const output = task.result ?? '';
   return {
     taskId: task.id,
+    ...(task.parentSessionId ? { parentSessionId: task.parentSessionId } : {}),
     agentName: task.definition.name,
     ...(task.label ? { label: task.label } : {}),
     ...(task.teamName ? { teamName: task.teamName } : {}),
+    ...(task.completionDelivery ? { completionDelivery: task.completionDelivery } : {}),
     state,
     output,
     truncated: false,

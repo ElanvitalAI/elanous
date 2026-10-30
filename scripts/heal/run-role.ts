@@ -16,7 +16,8 @@ import {
   type HealTriageHistory,
   type PathExists,
 } from '../../src/self-implement/heal-triage.js';
-import { loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../../src/self-implement/run-ledger.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, type RunLedgerEntry, type RunLedgerWriter } from '../../src/self-implement/run-ledger.js';
+import { readDoctorVisits } from '../../src/self-implement/doctor-visit.js';
 
 interface GraphContext {
   graphId?: string;
@@ -51,6 +52,38 @@ function citationsOf(value: unknown): HealCitation[] {
   });
 }
 
+function stringsAt(record: Record<string, unknown>, keys: readonly string[]): string[] {
+  return keys.flatMap((key) => {
+    const value = record[key];
+    return typeof value === 'string' ? [value] : Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  }).map((value) => value.trim()).filter(Boolean);
+}
+
+function materializedFacts(entries: readonly RunLedgerEntry[]): Record<string, unknown> {
+  const paths = new Set<string>();
+  const passed = new Set<string>();
+  const failed = new Set<string>();
+  const mustFix: string[] = [];
+  const diff: string[] = [];
+  let noProgressReason: string | undefined;
+  let reportDeficit = false;
+  for (const entry of entries) {
+    const data = entry.data ?? {};
+    if (entry.event === 'implemented') {
+      stringsAt(data, ['materializedPaths']).forEach((path) => paths.add(path));
+    }
+    stringsAt(data, ['passedTestNames', 'passedTests', 'testsPassed']).forEach((name) => passed.add(name));
+    stringsAt(data, ['failedTestNames', 'failedTests', 'testsFailed']).forEach((name) => failed.add(name));
+    if (entry.event === 'review-round-triage') stringsAt(data, ['rawMustFix']).forEach((item) => mustFix.push(item));
+    stringsAt(data, ['diffSummary', 'summary']).forEach((line) => diff.push(line.slice(0, 500)));
+    if (typeof data.noProgressReason === 'string') noProgressReason = data.noProgressReason;
+    if (data.terminationReason === 'no-progress') noProgressReason ??= typeof data.cause === 'string' ? data.cause : 'no-progress';
+    if (data.class === 'report-deficit' || data.abandonedClassification === 'report-deficit') reportDeficit = true;
+  }
+  return { ...(entries.length ? { materializedPaths: [...paths] } : {}), passedTestNames: [...passed], failedTestNames: [...failed], mustFix,
+    diffSummary: diff.slice(-10), ...(noProgressReason ? { noProgressReason } : {}), reportDeficit };
+}
+
 function failureOf(ctx: GraphContext): HealFailureSignature {
   const input = asRecord(ctx.input);
   const raw = asRecord(input?.failure) ?? input ?? {};
@@ -66,6 +99,11 @@ function failureOf(ctx: GraphContext): HealFailureSignature {
     ...(typeof raw.environmentClaim === 'string' ? { environmentClaim: raw.environmentClaim } : {}),
     ...(typeof raw.namedSource === 'string' ? { namedSource: raw.namedSource } : {}),
     ...(typeof raw.errorText === 'string' ? { errorText: raw.errorText } : {}),
+    ...(typeof raw.goalText === 'string' ? { goalText: raw.goalText } : {}),
+    ...(typeof raw.noProgressReason === 'string' ? { noProgressReason: raw.noProgressReason } : {}),
+    ...(typeof raw.reportDeficit === 'boolean' ? { reportDeficit: raw.reportDeficit } : {}),
+    ...(Array.isArray(raw.mustFix) ? { mustFix: raw.mustFix.filter((item): item is string => typeof item === 'string') } : {}),
+    ...(Array.isArray(raw.materializedPaths) ? { materializedPaths: raw.materializedPaths.filter((item): item is string => typeof item === 'string') } : {}),
     ...(citations.length ? { citations } : {}),
   };
 }
@@ -103,6 +141,8 @@ export interface HealRoleDeps {
   ledgerDir?: string;
   search?: (query: string) => unknown;
   stateRoot?: string;
+  writeLedger?: RunLedgerWriter;
+  readVisits?: (runId: string) => ReturnType<typeof readDoctorVisits>;
 }
 
 function gitHeadExists(worktree: string, path: string): PathExists {
@@ -132,6 +172,11 @@ function signatureFromUnknown(value: unknown): HealFailureSignature | undefined 
     ...(typeof raw.environmentClaim === 'string' ? { environmentClaim: raw.environmentClaim } : {}),
     ...(typeof raw.namedSource === 'string' ? { namedSource: raw.namedSource } : {}),
     ...(typeof raw.errorText === 'string' ? { errorText: raw.errorText } : {}),
+    ...(typeof raw.goalText === 'string' ? { goalText: raw.goalText } : {}),
+    ...(typeof raw.noProgressReason === 'string' ? { noProgressReason: raw.noProgressReason } : {}),
+    ...(typeof raw.reportDeficit === 'boolean' ? { reportDeficit: raw.reportDeficit } : {}),
+    ...(Array.isArray(raw.mustFix) ? { mustFix: raw.mustFix.filter((item): item is string => typeof item === 'string') } : {}),
+    ...(Array.isArray(raw.materializedPaths) ? { materializedPaths: raw.materializedPaths.filter((item): item is string => typeof item === 'string') } : {}),
     ...(citations.length ? { citations } : {}),
   };
   return Object.keys(signature).length ? signature : undefined;
@@ -255,17 +300,36 @@ export function roleResult(role: string, ctx: GraphContext, deps: HealRoleDeps =
           .filter(row => row.source === selector.source && row.ref === selector.ref)
           .sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).at(0);
         if (!event) return withAddedFacts({ outcome: 'empty', reason: 'inbox-event-not-found' }, []);
-        return withAddedFacts({ outcome: 'ok', entries: [{ errorText: event.summary }], event }, ['errorText']);
+        const runId = event.ref;
+        let ledger: RunLedgerEntry[] | null = null;
+        let visits: ReturnType<typeof readDoctorVisits> = [];
+        try {
+          ledger = deps.loadLedger ? deps.loadLedger(runId)
+            : loadRunLedger(runId, deps.ledgerDir ?? (deps.stateRoot ? runLedgerDir(deps.stateRoot) : undefined));
+          visits = deps.readVisits ? deps.readVisits(runId)
+            : readDoctorVisits(runId, deps.ledgerDir || deps.stateRoot ? { dir: deps.ledgerDir ?? runLedgerDir(deps.stateRoot!) } : {});
+        } catch { /* inbox refs can be non-ledger identifiers; absent evidence remains absent */ }
+        const facts = materializedFacts(ledger ?? []);
+        return withAddedFacts({ outcome: 'ok', entries: [{ errorText: event.summary, goalText: event.goalText,
+          goalId: event.goalId, goalFile: event.goalFile, ...facts, doctorVisits: visits }], event }, ['errorText', 'materializedPaths', 'doctorVisits']);
       }
       if (!asRecord(input.failure) && Object.keys(failure).length === 0) return withAddedFacts({ outcome: 'empty' }, []);
       const worktree = typeof input.worktree === 'string' ? input.worktree : '';
+      const runId = typeof input.runId === 'string' ? input.runId : '';
+      const ledger = runId ? (deps.loadLedger
+        ? deps.loadLedger(runId)
+        : loadRunLedger(runId, deps.ledgerDir ?? (process.env.ELANOUS_STATE_DIR ? runLedgerDir(process.env.ELANOUS_STATE_DIR) : undefined))) : null;
+      const doctorVisits = runId ? readDoctorVisits(runId, deps.ledgerDir ? { dir: deps.ledgerDir } : {}) : [];
       const paths = signature.unverified ?? [];
-      if (!worktree || paths.length === 0) return withAddedFacts({ outcome: 'ok', entries: [signature] }, []);
+      const materialized = (ledger ?? []).filter((entry) => ['implemented', 'gated', 'reviewed', 'implement-abort-reason'].includes(entry.event))
+        .map((entry) => ({ event: entry.event, data: entry.data }));
+      const runEvidence = runId ? { materialized, doctorVisits } : {};
+      if (!worktree || paths.length === 0) return withAddedFacts({ outcome: 'ok', entries: [{ ...signature, ...runEvidence }] }, []);
       const exists = deps.exists ?? defaultExists(worktree);
       const marked = markDeletedUnverified(paths, exists);
       const changed = marked.some((path, index) => path !== paths[index]);
       const entry: HealFailureSignature = { ...signature, unverified: marked };
-      return withAddedFacts({ outcome: 'ok', entries: [entry] }, changed ? ['unverified'] : []);
+      return withAddedFacts({ outcome: 'ok', entries: [{ ...entry, ...runEvidence }] }, changed ? ['unverified'] : []);
     }
     case 'triage': {
       const merged = mergedContextSignature(signature, ctx.outputs);
@@ -294,8 +358,38 @@ export function roleResult(role: string, ctx: GraphContext, deps: HealRoleDeps =
       const urls = citations.length ? `\n근거: ${citations.map((citation) => citation.url).join(' · ')}` : '';
       return withAddedFacts({ outcome: 'ok', next: 'implement', 'rework-note': `${file} 의 ${symbol} 을 고친다${urls}` }, []);
     }
+    case 'revise-goal': {
+      const collected = outputRecord(ctx.outputs, 'collect');
+      const collectedEntry = Array.isArray(collected?.entries) ? asRecord(collected.entries[0]) : undefined;
+      const goal = typeof input.goal === 'string' ? input.goal : typeof collectedEntry?.goalText === 'string' ? collectedEntry.goalText
+        : typeof failure.goal === 'string' ? failure.goal : '';
+      const paths = stringsAt(collectedEntry ?? failure, ['materializedPaths']);
+      const failures = stringsAt(collectedEntry ?? failure, ['failedTestNames']);
+      const mustFix = stringsAt(collectedEntry ?? failure, ['mustFix']);
+      const doctorVisits = Array.isArray(collectedEntry?.doctorVisits) ? collectedEntry.doctorVisits : [];
+      const before = goal.split(/\r?\n/).find((line) => /^\s*(?:[-*]\s*)?대상 경로\s*[:：]/i.test(line));
+      if (!paths.length || !before) return withAddedFacts({ outcome: 'fail', reason: 'insufficient-materialized-evidence', needsHuman: true,
+        evidence: { changedPaths: paths, targetLineFound: Boolean(before), doctorVisits } }, []);
+      const after = `대상 경로: ${paths.join(', ')}`;
+      const revised = before !== after ? goal.replace(before, after) : '';
+      if (!revised) return withAddedFacts({ outcome: 'fail', reason: 'goal-not-revisable', needsHuman: true,
+        evidence: { changedPaths: paths, doctorVisits } }, []);
+      const changed = revised !== goal;
+      const diff = changed ? [`- ${before}`, `+ ${after}`] : [];
+      const runId = typeof input.runId === 'string' ? input.runId : typeof ctx.runId === 'string' ? ctx.runId : '';
+      if (runId) {
+        const at = new Date().toISOString();
+        const write = deps.writeLedger ?? ((entry: RunLedgerEntry) => { appendRunLedgerEntry(entry, deps.ledgerDir ?? (process.env.ELANOUS_STATE_DIR ? runLedgerDir(process.env.ELANOUS_STATE_DIR) : undefined)); });
+        write({ timestamp: at, runId, event: 'goal-refined', data: { outcome: 'refined', reason: 'materialized-run-mismatch', changedLines: diff, relaunchCount: 1 } });
+        write({ timestamp: at, runId, event: 'reauthor-relaunch-request', data: { target: 'same-cell', count: 1, revisedGoal: revised } });
+      }
+      return withAddedFacts({ outcome: 'ok', next: 'implement', reauthor: true, revisedGoal: revised,
+        goalDiff: diff, evidence: { changedPaths: paths, failedTests: failures, mustFix, noProgressReason: collectedEntry?.noProgressReason ?? signature.noProgressReason ?? '', doctorVisits,
+          passedTestNames: stringsAt(collectedEntry ?? failure, ['passedTestNames']), diffSummary: stringsAt(collectedEntry ?? failure, ['diffSummary']) },
+        followUpSuggestion: '<CELL>-FU: 남은 한 조각을 별도 칸으로 제안한다.', relaunchCount: 1,
+        event: 'goal-refined', eventData: { reason: 'materialized-run-mismatch', goalDiff: diff } }, ['revisedGoal', 'goalDiff']);
+    }
     case 'verify':
-    case 'revise-goal':
       return withAddedFacts({ outcome: 'fail', reason: 'not-wired' }, []);
     case 'observe-deeper': {
       const runId = typeof input.runId === 'string' ? input.runId : '';

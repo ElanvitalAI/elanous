@@ -11,6 +11,7 @@ export type HealTriageOutcome =
   | 'needs-deeper-observation'
   | 'needs-grounding'
   | 'rework-with-citations'
+  | 'reauthor-from-materialized'
   | 'exhausted';
 
 export interface HealCitation {
@@ -30,6 +31,12 @@ export interface HealFailureSignature {
   readonly importerUnrunTests?: number;
   readonly environmentClaim?: string;
   readonly namedSource?: string;
+  /** Observations from the failed materialized run; no new collector is implied. */
+  readonly noProgressReason?: string;
+  readonly reportDeficit?: boolean;
+  readonly mustFix?: readonly string[];
+  readonly materializedPaths?: readonly string[];
+  readonly goalText?: string;
 }
 
 /** 게이트 사실로 채울 수 있는 칸. 없는 칸만 채운다. */
@@ -226,6 +233,19 @@ export function triageFailure(signature: HealFailureSignature, history?: HealTri
   const unverified = signature.unverified ?? [];
   const importer = signature.importerUnrunTests ?? 0;
   const claim = signature.environmentClaim?.trim() ?? '';
+
+  const mustFix = (signature.mustFix ?? []).map((item) => item.trim()).filter(Boolean);
+  const repeatedMustFix = mustFix.some((item, index) => mustFix.slice(0, index).includes(item));
+  if (signature.noProgressReason?.trim() || signature.reportDeficit || signature.materializedPaths?.length === 0
+    || repeatedMustFix || (signature.errorText ?? '').includes('tdd-evidence-missing')) {
+    return { outcome: 'reauthor-from-materialized', evidence: [
+      ...(signature.noProgressReason ? [`no-progress: ${signature.noProgressReason}`] : []),
+      ...(signature.reportDeficit ? ['report-deficit'] : []),
+      ...(signature.materializedPaths?.length === 0 ? ['actual target paths: 0'] : []),
+      ...(repeatedMustFix ? ['same must-fix repeated'] : []),
+      ...((signature.errorText ?? '').includes('tdd-evidence-missing') ? ['tdd-evidence-missing'] : []),
+    ] };
+  }
 
   if (claim && ENVIRONMENT_CLAIM.test(claim) && !visited(history, 'verify-evidence')) {
     return {

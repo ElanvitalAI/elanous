@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stateDirSourceForChild } from '../../agent/identity-env.js';
@@ -22,15 +22,19 @@ function root(parentDir?: string) {
   const dir = mkdtempSync(join(parentDir ?? tmpdir(), 'warm-runtime-'));
   roots.push(dir);
   mkdirSync(join(dir, 'src/example'), { recursive: true });
+  writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
   writeFileSync(join(dir, file), 'test(() => {})');
   writeFileSync(join(dir, 'bun.lock'), 'pinned-lock');
-  for (const args of [['init', '-q'], ['add', '--', file, 'bun.lock'],
+  for (const args of [['init', '-q'], ['add', '--', '.gitignore', file, 'bun.lock'],
     ['-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'fixture']]) {
     const result = spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
     if (result.status !== 0) throw new Error(result.stderr);
   }
   const cutSha = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
   const lockHash = createHash('sha256').update('pinned-lock').digest('hex');
+  // A warm Pod starts with an installed dependency tree tied to its image lockfile.
+  mkdirSync(join(dir, 'node_modules'), { recursive: true });
+  writeFileSync(join(dir, 'node_modules', '.elanous-installed-lock-hash'), `${lockHash}\n`);
   return { repoDir: dir, scratchDir: join(dir, 'scratch[1]'), artifactsRoot: join(dir, 'artifacts[1]'), workerId: 'worker-1',
     request: (attemptId: string) => command(cutSha, lockHash, attemptId) };
 }
@@ -456,7 +460,7 @@ test('tracked symlink cannot redirect a test to untracked bytes', async () => {
   let calls = 0;
   const runtime = new WarmWorkerRuntime({ ...options, runFile: async () => { calls++; return 0; } });
   expect(await runtime.handle({ ...options.request('linked'), files: [linked] }))
-    .toMatchObject({ reason: 'quarantined', reply: null });
+    .toMatchObject({ reason: 'invalid-command', quarantineWorker: false, reply: null });
   expect(calls).toBe(0);
 });
 
@@ -603,4 +607,122 @@ test('deadline crossed at reply creation quarantines worker and leaves no reply'
   expect(result).toMatchObject({ reply: null, quarantineWorker: true, reason: 'execution-error' });
   expect(existsSync(join(result.artifactsDir!, 'reply.json'))).toBe(false);
   expect(await runtime.handle({ ...options.request('later'), deadlineAt: 100 })).toMatchObject({ reason: 'quarantined' });
+});
+
+test('POD-REUSE-MIN-SYNC: 같은 웜 Pod 로 들어온 새 base 요청은 직렬 경계에서 호스트 미러 min-sync 로 맞춘다(GitHub 호출 0)', async () => {
+  const options = root();
+  const previousHead = spawnSync('git', ['-C', options.repoDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const mirrorRoot = mkdtempSync(join(tmpdir(), 'warm-min-sync-mirror-'));
+  roots.push(mirrorRoot);
+  const mirror = join(mirrorRoot, 'mirror.git');
+  const seeded = spawnSync('git', ['clone', '-q', '--bare', options.repoDir, mirror], { encoding: 'utf8' });
+  if (seeded.status !== 0) throw new Error(seeded.stderr);
+  // 새 base 는 별도 클론에서 만들어 미러로만 흘린다 — 상주 체크아웃은 그 커밋을 모른다(미러 fetch 경로).
+  const work = mkdtempSync(join(tmpdir(), 'warm-min-sync-base2-'));
+  roots.push(work);
+  const cloned = spawnSync('git', ['clone', '-q', options.repoDir, work], { encoding: 'utf8' });
+  if (cloned.status !== 0) throw new Error(cloned.stderr);
+  writeFileSync(join(work, 'src/example/next.ts'), 'second base\n');
+  for (const args of [['add', '--', 'src/example/next.ts'], ['-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'second base']]) {
+    const result = spawnSync('git', ['-C', work, ...args], { encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+  }
+  const cutSha2 = spawnSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const workBranch = spawnSync('git', ['-C', work, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const fetched = spawnSync('git', ['-C', mirror, 'fetch', '-q', work, `+refs/heads/${workBranch}:refs/heads/warm-next`], { encoding: 'utf8' });
+  if (fetched.status !== 0) throw new Error(fetched.stderr);
+  // 웜 Pod 상주 설치물 — 같은 lockfile 해시면 min-sync 뒤에도 그대로 재사용된다.
+  mkdirSync(join(options.repoDir, 'node_modules', 'dep'), { recursive: true });
+  writeFileSync(join(options.repoDir, 'node_modules', 'dep', 'keep.txt'), 'warm install');
+  const currentLockHash = createHash('sha256').update(readFileSync(join(options.repoDir, 'bun.lock'))).digest('hex');
+  writeFileSync(join(options.repoDir, 'node_modules', '.elanous-installed-lock-hash'), `${currentLockHash}\n`);
+  const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+  const original = debug.log;
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+    events.push({ category, event, data: data as Record<string, unknown> });
+  }) as typeof debug.log;
+  let calls = 0;
+  try {
+    const runtime = new WarmWorkerRuntime({ ...options, mirrorPath: mirror,
+      runFile: async request => { calls++; expect(request.cutSha).toBe(cutSha2); complete(request); return 0; } });
+    const result = await runtime.handle({ ...options.request('min-sync'), cutSha: cutSha2 });
+    expect(result.reason).toBe('complete');
+    expect(result.reply?.cutSha).toBe(cutSha2);
+    expect(calls).toBe(1);
+    expect(spawnSync('git', ['-C', options.repoDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim()).toBe(cutSha2);
+    expect(readFileSync(join(options.repoDir, 'src/example/next.ts'), 'utf8')).toBe('second base\n');
+    expect(readFileSync(join(options.repoDir, 'node_modules', 'dep', 'keep.txt'), 'utf8')).toBe('warm install');
+    const observed = events.find(event => event.category === 'pod.warm' && event.event === 'min-sync');
+    expect(observed?.data).toMatchObject({ ok: true, baseSha: cutSha2, previousHead, githubCalls: 0, changedFiles: 1 });
+  } finally {
+    (debug as { log: typeof debug.log }).log = original;
+  }
+});
+
+test('POD-REUSE-MIN-SYNC: 같은 런타임의 두 요청 사이 bun.lock 변경은 상주 설치 해시와 비교해 재설치한다', async () => {
+  const options = root();
+  const previousHead = spawnSync('git', ['-C', options.repoDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const previousLockHash = createHash('sha256').update(readFileSync(join(options.repoDir, 'bun.lock'))).digest('hex');
+  mkdirSync(join(options.repoDir, 'node_modules', 'dep'), { recursive: true });
+  writeFileSync(join(options.repoDir, 'node_modules', 'dep', 'keep.txt'), 'old install');
+
+  const mirrorRoot = mkdtempSync(join(tmpdir(), 'warm-lock-change-mirror-'));
+  roots.push(mirrorRoot);
+  const mirror = join(mirrorRoot, 'mirror.git');
+  const seeded = spawnSync('git', ['clone', '-q', '--bare', options.repoDir, mirror]);
+  if (seeded.status !== 0) throw new Error(seeded.stderr);
+  const work = mkdtempSync(join(tmpdir(), 'warm-lock-change-base2-'));
+  roots.push(work);
+  const cloned = spawnSync('git', ['clone', '-q', options.repoDir, work]);
+  if (cloned.status !== 0) throw new Error(cloned.stderr);
+  writeFileSync(join(work, 'bun.lock'), 'pinned-lock-2\n');
+  writeFileSync(join(work, 'src/example/next.ts'), 'second base\n');
+  for (const args of [['add', '--', 'bun.lock', 'src/example/next.ts'], ['-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'second base changes lock']]) {
+    const result = spawnSync('git', ['-C', work, ...args], { encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+  }
+  const cutSha2 = spawnSync('git', ['-C', work, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const newLockHash = createHash('sha256').update(readFileSync(join(work, 'bun.lock'))).digest('hex');
+  const workBranch = spawnSync('git', ['-C', work, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const fetched = spawnSync('git', ['-C', mirror, 'fetch', '-q', work, `+refs/heads/${workBranch}:refs/heads/warm-next`], { encoding: 'utf8' });
+  if (fetched.status !== 0) throw new Error(fetched.stderr);
+
+  const fakeBin = join(options.repoDir, 'node_modules', '.elanous-fake-bin');
+  mkdirSync(fakeBin, { recursive: true });
+  const installCalls = join(options.repoDir, 'node_modules', 'install-calls');
+  writeFileSync(join(fakeBin, 'bun'), `#!/bin/sh\necho install >> '${installCalls}'\nexit 0\n`);
+  chmodSync(join(fakeBin, 'bun'), 0o755);
+  const runMinSync = (script: string) => {
+    const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` };
+    for (const name of Object.keys(env)) if (name.startsWith('GIT_')) delete env[name];
+    const result = spawnSync('bash', ['-c', script], { cwd: options.repoDir, env, encoding: 'utf8' });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  };
+  const original = debug.log;
+  const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+  (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
+    events.push({ category, event, data: data as Record<string, unknown> });
+  }) as typeof debug.log;
+  try {
+    const runtime = new WarmWorkerRuntime({ ...options, mirrorPath: mirror, runMinSync,
+      runFile: async request => { complete(request); return 0; } });
+    const firstRequest = options.request('first-lock');
+    const first = await runtime.handle({ ...firstRequest, cutSha: previousHead });
+    expect(first.reason).toBe('complete');
+    expect(readFileSync(join(options.repoDir, 'node_modules', '.elanous-installed-lock-hash'), 'utf8').trim()).toBe(previousLockHash);
+    expect(existsSync(installCalls)).toBe(false);
+
+    const next = options.request('second-lock');
+    const second = await runtime.handle({ ...next, cutSha: cutSha2, key: { ...next.key, lockHash: newLockHash } });
+    expect(second.reason).toBe('complete');
+    expect(second.reply?.cutSha).toBe(cutSha2);
+    expect(readFileSync(join(options.repoDir, 'bun.lock'), 'utf8')).toBe('pinned-lock-2\n');
+    expect(readFileSync(join(options.repoDir, 'node_modules', '.elanous-installed-lock-hash'), 'utf8').trim()).toBe(newLockHash);
+    expect(readFileSync(installCalls, 'utf8').trim().split('\n')).toEqual(['install']);
+    expect(readFileSync(join(options.repoDir, 'node_modules', 'dep', 'keep.txt'), 'utf8')).toBe('old install');
+    const observed = events.find(event => event.category === 'pod.warm' && event.event === 'min-sync');
+    expect(observed?.data).toMatchObject({ ok: true, baseSha: cutSha2, previousHead, githubCalls: 0, changedFiles: 2 });
+  } finally {
+    (debug as { log: typeof debug.log }).log = original;
+  }
 });

@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
@@ -17,6 +17,8 @@ import { withRunLedgerLock, restoreArchivedRunLedger } from './run-ledger-compac
 
 export interface RunLedgerEntry {
   timestamp?: string;
+  /** Monotonic per-run ordering for graph/traversal events. Legacy rows may omit it. */
+  seq?: number;
   runId: string;
   event: string;
   data: Record<string, unknown>;
@@ -28,6 +30,89 @@ export interface RunLedgerEntry {
   pieceIndex?: number;
   pieceTotal?: number;
   shardIdentityReadFailure?: RunShardIdentityReadFailure;
+}
+
+const RUN_GRAPH_STEP_EVENTS = new Set([
+  'node-enter', 'node-exit', 'edge-taken', 'node-skipped', 'node-added', 'edge-rerouted',
+  'unit-expanded', 'unit-collapsed', 'pipeline-node-entry', 'pipeline-node-exit', 'graph-edge-taken',
+]);
+
+function isRunGraphStepEvent(entry: RunLedgerEntry): boolean {
+  return RUN_GRAPH_STEP_EVENTS.has(entry.event)
+    || (entry.event === 'applied' && ['add-node', 'reroute', 'zoom-in', 'collapse'].includes(String(entry.data.op)));
+}
+
+/** Assign a monotonic sequence at the locked append boundary; never infer it later from timestamps. */
+function sequenceRunGraphEvent(entry: RunLedgerEntry, max: number): RunLedgerEntry {
+  if (!isRunGraphStepEvent(entry)) return entry;
+  const explicit = entry.seq ?? entry.data.seq;
+  if (typeof explicit === 'number' && Number.isSafeInteger(explicit) && explicit > max) {
+    return { ...entry, seq: explicit, ...(entry.data.seq === undefined ? {} : { data: { ...entry.data, seq: explicit } }) };
+  }
+  if (max >= Number.MAX_SAFE_INTEGER) throw new Error(`run graph event sequence exhausted: ${entry.runId}`);
+  const seq = max + 1;
+  return { ...entry, seq, ...(entry.data.seq === undefined ? {} : { data: { ...entry.data, seq } }) };
+}
+
+/** Read backward to the last sequenced graph step; repeated appends stay O(tail), not O(ledger²). */
+function lastRunGraphEventSequence(runId: string, dir: string): number {
+  const path = runLedgerPath(runId, dir);
+  if (!existsSync(path)) return 0;
+  const fd = openSync(path, 'r');
+  try {
+    const size = statSync(path).size;
+    const chunkSize = 8 * 1024;
+    let end = size;
+    let carry = '';
+    while (end > 0) {
+      const start = Math.max(0, end - chunkSize);
+      const bytes = Buffer.alloc(end - start);
+      readSync(fd, bytes, 0, bytes.length, start);
+      const text = `${bytes.toString('utf8')}${carry}`;
+      const lines = text.split(/\r?\n/);
+      carry = lines[0] ?? '';
+      for (let index = lines.length - 1; index > 0; index -= 1) {
+        const line = lines[index]?.trim();
+        if (!line) continue;
+        let row: RunLedgerEntry;
+        try { row = parseRunLedgerEntry(line, 0, runId); }
+        catch (error) {
+          if (index === lines.length - 1 && !text.endsWith('\n') && isIncompleteJsonPrefix(line)) {
+            throw new Error(`incomplete trailing run ledger entry: ${runId}`);
+          }
+          throw error;
+        }
+        if (!isRunGraphStepEvent(row)) continue;
+        const seq = row.seq ?? row.data.seq;
+        if (typeof seq === 'number' && Number.isSafeInteger(seq) && seq > 0) return seq;
+      }
+      end = start;
+    }
+    if (carry.trim()) {
+      let row: RunLedgerEntry;
+      try { row = parseRunLedgerEntry(carry, 0, runId); }
+      catch (error) {
+        if (isIncompleteJsonPrefix(carry)) throw new Error(`incomplete trailing run ledger entry: ${runId}`);
+        throw error;
+      }
+      if (!isRunGraphStepEvent(row)) return 0;
+      const seq = row.seq ?? row.data.seq;
+      if (typeof seq === 'number' && Number.isSafeInteger(seq) && seq > 0) return seq;
+    }
+    return 0;
+  } finally { closeSync(fd); }
+}
+
+function separateAppendedLedgerLine(path: string, line: string): string {
+  if (!existsSync(path)) return line;
+  const size = statSync(path).size;
+  if (size === 0) return line;
+  const fd = openSync(path, 'r');
+  try {
+    const lastByte = Buffer.alloc(1);
+    readSync(fd, lastByte, 0, 1, size - 1);
+    return lastByte[0] === 0x0a ? line : `\n${line}`;
+  } finally { closeSync(fd); }
 }
 
 export type RunShardIdentityReadFailure = 'malformed-structure' | 'invalid-values';
@@ -712,12 +797,21 @@ export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const live = runLedgerPath(entry.runId, dir);
   const devProject = process.env.ELANOUS_DEV_PROJECT;
-  const row = entry.devProject === undefined && typeof devProject === 'string' && devProject.startsWith('prj-')
-    ? { ...entry, devProject }
-    : entry;
   withRunLedgerLock(dir, entry.runId, () => {
-    const line = `${JSON.stringify(row)}\n`;
-    if (!restoreArchivedRunLedger(dir, entry.runId, line)) appendFileSync(live, line, 'utf8');
+    let sequenced = entry;
+    if (isRunGraphStepEvent(entry)) {
+      // Restore a compacted ledger before choosing its next sequence so appends keep the
+      // same per-run order across the live/archive boundary.
+      restoreArchivedRunLedger(dir, entry.runId);
+      sequenced = sequenceRunGraphEvent(entry, lastRunGraphEventSequence(entry.runId, dir));
+    }
+    const sequencedRow = sequenced.devProject === undefined && typeof devProject === 'string' && devProject.startsWith('prj-')
+      ? { ...sequenced, devProject }
+      : sequenced;
+    const line = `${JSON.stringify(sequencedRow)}\n`;
+    const appendLine = isRunGraphStepEvent(entry) ? separateAppendedLedgerLine(live, line) : line;
+    if (!isRunGraphStepEvent(entry) && restoreArchivedRunLedger(dir, entry.runId, appendLine)) return;
+    appendFileSync(live, appendLine, 'utf8');
   });
   try {
     recordRunRequestVsEffectiveFromLedger(entry.runId, dir, entry);
@@ -790,7 +884,8 @@ export function appendRunLedgerEntryChecked<T>(
 ): RunLedgerCheckedAppendOutcome<T> {
   if (refuseProductionLedgerWriteInTest(dir, 'run-ledger')) return { appended: false, result: null, refusal: 'ledger-write-refused' as const };
   return withRunLedgerLock(dir, runId, () => {
-    const decision = decide(loadRunLedger(runId, dir));
+    const existing = loadRunLedger(runId, dir);
+    const decision = decide(existing);
     if (!decision.append) return { appended: false, result: decision.result, refusal: null };
     const entry = decision.entry;
     if (entry.runId !== runId) {
@@ -798,11 +893,16 @@ export function appendRunLedgerEntryChecked<T>(
     }
     const live = runLedgerPath(entry.runId, dir);
     const devProject = process.env.ELANOUS_DEV_PROJECT;
-    const row = entry.devProject === undefined && typeof devProject === 'string' && devProject.startsWith('prj-')
-      ? { ...entry, devProject }
-      : entry;
+    const isGraphStep = isRunGraphStepEvent(entry);
+    if (isGraphStep) restoreArchivedRunLedger(dir, runId);
+    const sequenced = isGraphStep ? sequenceRunGraphEvent(entry, lastRunGraphEventSequence(runId, dir)) : entry;
+    const row = sequenced.devProject === undefined && typeof devProject === 'string' && devProject.startsWith('prj-')
+      ? { ...sequenced, devProject }
+      : sequenced;
     const line = `${JSON.stringify(row)}\n`;
-    if (!restoreArchivedRunLedger(dir, entry.runId, line)) appendFileSync(live, line, 'utf8');
+    const appendLine = isGraphStep ? separateAppendedLedgerLine(live, line) : line;
+    if (!isGraphStep && restoreArchivedRunLedger(dir, entry.runId, appendLine)) return { appended: true, result: null, refusal: null };
+    appendFileSync(live, appendLine, 'utf8');
     return { appended: true, result: null, refusal: null };
   });
 }
@@ -925,6 +1025,7 @@ function parseRunLedgerEntry(line: string, lineNumber: number, expectedRunId: st
   }
   const entry = parsed as Partial<RunLedgerEntry>;
   if ((entry.timestamp !== undefined && typeof entry.timestamp !== 'string') || typeof entry.runId !== 'string' || typeof entry.event !== 'string'
+    || (entry.seq !== undefined && (!Number.isSafeInteger(entry.seq) || entry.seq < 1))
     || !entry.data || typeof entry.data !== 'object' || Array.isArray(entry.data)
     || (entry.goalId !== undefined && typeof entry.goalId !== 'string')
     || (entry.orchestrationId !== undefined && typeof entry.orchestrationId !== 'string')

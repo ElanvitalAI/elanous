@@ -106,11 +106,12 @@ export function formatAutoMergeSuccessMessage(input: {
 import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-run-store.js';
 import { writeGoalRunRecordFragment } from './goal-execution-records.js';
 import { getUserConfig } from '../user-config.js';
-import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
-import { classifyMergeHoldStop, classifyTerminalHarnessFailure, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
+import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, runLedgerDir, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
+import { buildRunStopTerminalEvidence, classifyMergeHoldStop, classifyTerminalHarnessFailure, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
 import { autohealFromStop, parseAutohealMode, pickAutohealAction, type AutohealActions, type AutohealResult } from './stop-autoheal.js';
 import { operationalAutohealActions } from './stop-autoheal-operational.js';
-import { recordParentNeedsOwnerVisit } from './doctor-visit.js';
+import { recordParentNeedsOwnerVisit, runDoctorHandoff } from './doctor-visit.js';
+import { readRunChart, recordRunChartDecision, RUN_DOCTOR_HANDOFF_INPUT_PREFIX } from './run-chart.js';
 import { emitSessionEvent, type SessionEventInput } from '../context-bus/session-events.js';
 import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSupersedeOpenDraft } from './lineage-supersede.js';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -356,6 +357,9 @@ import {
 } from '../ask-user-question/tool.js';
 import { acquireClarificationResolverLease, decideClarificationResolverInstall } from './clarification-resolver-lease.js';
 import { inspectCodexRotation } from '../oauth/codex-account-store.js';
+import { resolveGrokCredential } from '../grok/credential.js';
+import { resolveChildLlmPreference } from './child-llm-preference.js';
+import { reselectChildForRework } from './rework-child-provider.js';
 import { resolveDefaultProvider } from '../llm.js';
 import { createWidgetAskUserResolver } from '../expression/widget/adapters/ask-user-resolver.js';
 import { createNodeReadlineHost } from '../expression/widget/readline-host.js';
@@ -1077,6 +1081,8 @@ export interface SelfImplementSeams {
   emitContextEvent?: (input: SessionEventInput) => void;
   /** Registers this run as an ephemeral loop-agent asset; failures are observed but never affect execution. */
   registerLoopAgent?: (input: LoopAgentInput) => void;
+  /** Executes a persisted run-doctor supervisor handoff; injectable to verify the parent delivery route. */
+  runDoctorHandoff?: typeof runDoctorHandoff;
   /** Wraps implementation and gate promises with their effective wall-clock timeout; tests observe the actual stage budgets. */
   withStepTimeout?: <T>(promise: Promise<T>, ms: number, step: keyof StepTimeouts) => Promise<T>;
   /** Samples the one-minute machine load at the end of a gate observation. */
@@ -2208,6 +2214,8 @@ export interface SelfImplementOptions {
   runId?: string;
   /** Authored goal document's stable identity, carried into self-implement observations when present. */
   goalId?: string;
+  /** Stable heal-cell identity propagated across supervisor reauthor retries. */
+  healCellKey?: string;
   /** Optional opaque ID for joining this request with correlated execution records. */
   correlationId?: string;
   /** Optional opaque ID for the parent correlation in a nested request. */
@@ -3580,6 +3588,9 @@ async function autohealRecordedStop(stopEntry: RunLedgerEntry, s: SelfImplementS
   try {
     const record = readRunStopRecord(stopEntry);
     if (!record) return;
+    const chartDir = runLedgerDir();
+    const chartBefore = readRunChart(stopEntry.runId, 'macrophage', chartDir);
+    const chartStopKey = JSON.stringify([stopEntry.timestamp, record.site ?? '', record.class, record.cause, record.evidenceRef]);
     try { debug.log('harness.heal', 'symptom', { runId: stopEntry.runId, class: record.class, cause: record.cause, evidenceRef: record.evidenceRef }); } catch { /* observation is fail-soft */ }
     const pick = pickAutohealAction(record.class);
     try { debug.log('harness.heal', 'prescription', { runId: stopEntry.runId, class: record.class, action: pick.action, source: pick.source, ...(pick.overlayId ? { overlayId: pick.overlayId } : {}) }); } catch { /* observation is fail-soft */ }
@@ -3596,10 +3607,13 @@ async function autohealRecordedStop(stopEntry: RunLedgerEntry, s: SelfImplementS
       ...(s?.writeRunLedger ? { writeLedger: s.writeRunLedger } : {}),
     });
     try { debug.log('harness.heal', 'outcome', { runId: stopEntry.runId, class: result.class, action: result.action, mode: result.mode, outcome: result.outcome, ...(result.reason ? { reason: result.reason } : {}), ...(result.detail ? { detail: result.detail } : {}) }); } catch { /* observation is fail-soft */ }
+    recordRunChartDecision({ runId: stopEntry.runId, device: 'macrophage', stopKey: chartStopKey,
+      observed: `${record.class}: ${record.cause}`, verdict: result.action, action: result.outcome,
+      handoff: result.action === 'needs-owner' ? 'outer-supervisor' : null,
+      why: result.reason ?? result.detail ?? record.cause, readStopKeys: chartBefore.map((cell) => cell.stopKey), dir: chartDir });
     if (result.action === 'needs-owner') {
       try {
-        const stopKey = JSON.stringify([stopEntry.timestamp, record.site ?? '', record.class, record.cause, record.evidenceRef]);
-        const visit = recordParentNeedsOwnerVisit({ runId: stopEntry.runId, stopKey, evidence: result.reason ?? record.cause });
+        const visit = recordParentNeedsOwnerVisit({ runId: stopEntry.runId, stopKey: chartStopKey, evidence: result.reason ?? record.cause });
         if (visit.status === 'missing-ledger') {
           debug.log('run-doctor', 'visit-failed', { runId: stopEntry.runId, from: 'parent', symptom: 'needs-owner', error: 'run-ledger-missing' });
         }
@@ -3626,10 +3640,22 @@ async function dispatchTerminalHarnessHeal(input: {
   if (runStopRecorded(runId)) return;
   const stopClass = mergeHeld ? classifyMergeHoldStop(result.mergeReason) : classifyTerminalHarnessFailure({
     stage: result.stage,
+    cause: result.detail,
     mergeReason: result.mergeReason,
     abandonedClassification: result.abandonedClassification?.classification,
     providerErrorCategory: result.providerErrors?.category,
     supervisorVerdict: result.supervisorVerdict,
+  });
+  let priorLedger: RunLedgerEntry[] = [];
+  try { priorLedger = loadRunLedger(runId) ?? []; } catch { /* terminal observation must not change the run result */ }
+  const terminalEvidence = buildRunStopTerminalEvidence({
+    stage: result.stage,
+    node: result.node,
+    outcome: result.outcome,
+    detail: result.detail,
+    terminationReason: result.terminationReason,
+    providerErrorCategory: result.providerErrors?.category,
+    entries: priorLedger,
   });
   let stopEntry: RunLedgerEntry | undefined;
   try {
@@ -3639,9 +3665,11 @@ async function dispatchTerminalHarnessHeal(input: {
       shardIdentity,
       site: mergeHeld ? 'merge-hold' : `terminal-${result.stage}`,
       class: stopClass,
-      cause: mergeHeld ? `merge held: ${result.mergeReason}` : result.detail ?? `terminal failure: ${result.stage}`,
+      // Never copy free-form provider/child text into the durable stop summary.
+      cause: mergeHeld ? `merge held: ${result.mergeReason}` : `terminal failure: ${result.stage}; ${terminalEvidence.reasonCode}`,
       evidenceRef: result.prUrl ?? `run-ledger:${runId}:${result.stage}`,
       nextMove: `Existing heal ladder: ${stopClass}; failure disposition remains until its prescribed action resolves`,
+      terminalEvidence,
     }, seams.writeRunLedger ?? appendRunLedgerEntry);
   } catch { /* stop observation cannot change the run outcome */ }
   if (stopEntry) await autohealRecordedStop(stopEntry, seams);
@@ -4661,6 +4689,10 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
           summary: reworkCap
             ? reworkCapFailureSummary(opts.feature, reworkCap)
             : opts.feature.split(/\r?\n/, 1)[0]?.trim() || `Harness run ${runId} failed`,
+          goalText: opts.feature,
+          ...(opts.goalId ? { goalId: opts.goalId } : {}),
+          ...(opts.goalFile ? { goalFile: opts.goalFile } : {}),
+          ...(opts.healCellKey ? { cellKey: opts.healCellKey } : {}),
           at: new Date().toISOString(),
         });
       }
@@ -6112,6 +6144,7 @@ async function runSelfImplementInner(
   };
   let preservationBase = wt.resolvedBase;
   const runProviderName = opts.childLlm?.provider ?? (s.currentProviderName?.() ?? currentProviderName());
+  let activeChildLlm = opts.childLlm;
   let cachedQuotaExhaustionAssessment: QuotaExhaustionAssessment | undefined;
   const quotaExhaustionAssessmentForRun = (): QuotaExhaustionAssessment => {
     cachedQuotaExhaustionAssessment ??= readQuotaExhausted(s.inspectCodexRotation, runProviderName);
@@ -7240,7 +7273,38 @@ async function runSelfImplementInner(
           if (fabricObservation) observe('rework-budget-fabric-shadow', fabricObservation);
         }
       } catch (error) {
-        if (judgmentStarted) throw error;
+        if (judgmentStarted) {
+          const failureKind = classifyReviewProviderFailure(safeErrorDescription(error));
+          if (failureKind === 'credentials-unavailable') {
+            const blockedStage = isReviewRework(reworkKind) ? 'review-blocked' : 'gate-failed';
+            const reason = 'rework skipped: provider credentials unavailable';
+            observe('rework-skipped-provider-unavailable', { round, kind: reworkKind, reason: failureKind }, { level: 'warn' });
+            finalizeSupervisorDeliveries('rework-provider-credentials-unavailable');
+            if (blockedStage === 'review-blocked') recordPendingReviewTriage('follow-up', 'review-blocked', effectiveMax);
+            const pr = await preserveBlockedArtifacts({
+              stage: blockedStage,
+              reason,
+              gate,
+              failureKind,
+              salvageStatusExpected: false,
+            });
+            const common = {
+              ok: false as const,
+              node: 'rework' as const,
+              ...resolveRunOutcome({ termination: 'abandoned' }),
+              sessionId,
+              worktreePath: wt.path,
+              branch: wt.branch,
+              gate,
+              ...(review ? { review } : {}),
+              quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(),
+            };
+            return blockedStage === 'review-blocked'
+              ? { ...common, ...reviewBlockedResult(pr), detail: reason }
+              : { ...common, stage: 'gate-failed' as const, ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
+          }
+          throw error;
+        }
         consecutiveUnresolvedBudget = 0;
       }
     } else if (round > 0) {
@@ -7513,6 +7577,29 @@ async function runSelfImplementInner(
     let supervisorInputClosed = false;
     const closeSupervisorInput = (): void => { supervisorInputClosed = true; };
     try {
+      if (round > 0 && activeChildLlm?.provider === 'grok') {
+        const { readGrokQuotaForLaunch, defaultChildLlmModel } = await import('../self-dev/dev-cli.js');
+        const grokQuota = readGrokQuotaForLaunch();
+        const grokCredential = resolveGrokCredential() ? 'available' as const : 'unavailable' as const;
+        let codexRotation: ReturnType<typeof inspectCodexRotation> | undefined;
+        try { codexRotation = (s.inspectCodexRotation ?? inspectCodexRotation)(); } catch { codexRotation = undefined; }
+        const preference = resolveChildLlmPreference(getUserConfig());
+        const alternateSlot = preference.chain.find((slot) => slot.provider === 'openai-codex' && slot.provider !== activeChildLlm!.provider);
+        const hasCodexCredential = (codexRotation?.knownAccountCount ?? 0) > 0;
+        const codexQuota = readQuotaExhausted(s.inspectCodexRotation, 'openai-codex');
+        const alternate = hasCodexCredential ? {
+          provider: 'openai-codex', model: alternateSlot?.model ?? defaultChildLlmModel('openai-codex'), source: 'config' as const,
+        } : undefined;
+        const decision = reselectChildForRework({ current: activeChildLlm, grokQuota, grokCredential,
+          ...(alternate ? { alternate } : {}), alternateCredential: hasCodexCredential ? 'available' : 'unavailable',
+          alternateQuotaExhausted: codexQuota.exhausted });
+        if (decision.action === 'reselect') {
+          activeChildLlm = decision.selection;
+          observe('rework-child-model-reselected', { round, previousProvider: decision.previous.provider, previousModel: decision.previous.model,
+            provider: activeChildLlm.provider, model: activeChildLlm.model, reason: decision.reason, quota: grokQuota,
+            grokCredential, alternateQuotaExhausted: codexQuota.exhausted ?? null });
+        }
+      }
       implementPromise = s.implement({
       sessionId, cwd: wt.path, feature, runId, shardIdentity, signal: implementAbortController.signal,
       ...(harnessSeededPaths.length ? { harnessSeededPaths } : {}),
@@ -7523,6 +7610,31 @@ async function runSelfImplementInner(
         const normalized = text.trim();
         if (!normalized) {
           updateDelivery?.('not-delivered', 'empty-supervisor-input');
+          return;
+        }
+        if (normalized.startsWith(RUN_DOCTOR_HANDOFF_INPUT_PREFIX)) {
+          const runIdMatch = /(?:^|\s)runId=([^\s]+)/u.exec(normalized);
+          const stopKeyMatch = /(?:^|\s)stopKey=([^\s]+)/u.exec(normalized);
+          if (!runIdMatch?.[1] || runIdMatch[1] !== runId || !stopKeyMatch?.[1]) {
+            updateDelivery?.('not-delivered', 'invalid-run-doctor-handoff');
+            return;
+          }
+          void (s.runDoctorHandoff ?? runDoctorHandoff)({ runId, stopKey: stopKeyMatch[1], dir: runLedgerDir(elanousStateRoot() || undefined),
+            dispatch: (action, handoff) => {
+              if (action !== 'reauthor-from-materialized') return { outcome: 'needs-human', detail: `prescription executor not wired: ${action}` };
+              const accepted = recordFailureEvent({ source: 'harness-run', kind: 'run-supervisor-wait-streak', ref: runId,
+                summary: `[implement aborted] run-supervisor wait streak ${String(handoff.waitCount ?? 'unknown')} · doctor reauthor handoff`,
+                goalText: feature, ...(opts.goalId ? { goalId: opts.goalId } : {}), ...(opts.goalFile ? { goalFile: opts.goalFile } : {}),
+                ...(opts.healCellKey ? { cellKey: opts.healCellKey } : {}), at: new Date().toISOString() });
+              return { outcome: accepted.folded ? 'heal-event-already-present' : 'heal-graph-requested',
+                detail: accepted.folded ? 'same-run heal event already recorded' : 'PR1 heal intake accepted the materialized reauthor action' };
+            },
+          }).then((result) => {
+            updateDelivery?.(result.status === 'acted' || result.status === 'already-acted' ? 'delivered' : 'not-delivered',
+              result.status === 'needs-human' ? result.outcome : result.status === 'missing-handoff' ? 'run-chart-handoff-missing' : undefined);
+          }).catch((error: unknown) => {
+            updateDelivery?.('not-delivered', error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120));
+          });
           return;
         }
         if (supervisorInputClosed) {
@@ -7540,7 +7652,7 @@ async function runSelfImplementInner(
         supervisorDeliveryUpdates.push({ text: normalized, update: updateDelivery });
       },
       ...(escalateTier !== 'none' ? { escalateTier } : {}),
-      ...(opts.childLlm ? { childLlm: opts.childLlm } : {}),
+      ...(activeChildLlm ? { childLlm: activeChildLlm } : {}),
       ...(opts.documentReferences ? { documentReferences: opts.documentReferences } : {}),
     });
     } catch (error) {
@@ -7615,7 +7727,7 @@ async function runSelfImplementInner(
               ...(harnessSeededPaths.length ? { harnessSeededPaths } : {}),
               onSurfaceProgress: line => progress('implementing', line.trimEnd()),
               roundContext: { round: retryRound, effectiveMax, previousRoundFailure: retryNote },
-              ...(opts.childLlm ? { childLlm: opts.childLlm } : {}),
+              ...(activeChildLlm ? { childLlm: activeChildLlm } : {}),
               ...(opts.documentReferences ? { documentReferences: opts.documentReferences } : {}),
             }), T.implement, 'implement');
           } catch (error) {
@@ -7716,7 +7828,7 @@ async function runSelfImplementInner(
             ...(harnessSeededPaths.length ? { harnessSeededPaths } : {}),
             onSurfaceProgress: (line) => progress('implementing', line.trimEnd()),
             roundContext: { round: tddRetryRound, effectiveMax, previousRoundFailure: tddRetryNote },
-            ...(opts.childLlm ? { childLlm: opts.childLlm } : {}),
+            ...(activeChildLlm ? { childLlm: activeChildLlm } : {}),
             ...(opts.documentReferences ? { documentReferences: opts.documentReferences } : {}),
           }), T.implement, 'implement');
         } catch (error) {
@@ -7911,7 +8023,10 @@ async function runSelfImplementInner(
     }, { compact: { stringMax: Math.max(MAX_HARVESTED_EVIDENCE_CHARS, harvestObs.harvestedEvidence?.length ?? 0) } });
     if (impl.ok) completionDisposition = finishedChildCommitMissing || finishedChildCommitted ? undefined : impl.completionDisposition;
     const effectiveDisposition = impl.ok ? completionDisposition : impl.completionDisposition;
-    observe('implemented', { ok: impl.ok, round, ...(effectiveDisposition ? { completionDisposition: effectiveDisposition } : {}) });
+    let materializedPaths: readonly string[] | undefined;
+    try { materializedPaths = (s.changedFilesForGateRoute ?? changedFiles)(wt.path); } catch { /* unknown diff is not path evidence */ }
+    observe('implemented', { ok: impl.ok, round, ...(materializedPaths ? { materializedPaths: [...materializedPaths] } : {}),
+      ...(effectiveDisposition ? { completionDisposition: effectiveDisposition } : {}) });
     progress('implemented', impl.ok ? (round === 0 ? '구현 완료' : `rework ${round} 완료`) : impl.completionDisposition ? '변경 없이 완료 검증' : '구현 실패(worktree 보존)');
     if (!impl.ok) {
       finalizeSupervisorDeliveries('next-round-implement-not-ok');

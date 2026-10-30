@@ -5,10 +5,11 @@
 //    이 파일의 상수 기대치(프록시 URL·필수 헤더)로 굳어 있다.
 
 import { describe, expect, it } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { _resetKeyCacheForTests } from '../config.js';
 import {
   GROK_API_BASE_URL,
   GROK_SUBSCRIPTION_BASE_URL,
@@ -49,6 +50,39 @@ describe('resolveGrokCredential — ⭐ 구독 1순위 / API 키 2순위', () =>
     expect(c?.baseUrl).toBe(GROK_SUBSCRIPTION_BASE_URL);
     expect(c?.token).toBe('sub-token');
     expect(c?.source).toBe('auth.json');
+  });
+
+  it('검색이 API 키 우선을 요청하면 API를 쓰고 기본 LLM 해석은 구독 우선을 유지한다', () => {
+    const home = homeWithAuth({
+      'https://auth.x.ai::client-uuid': { key: 'sub-token', expires_at: '2026-09-01T00:00:00Z', user_id: 'u1' },
+    });
+    expect(resolveGrokCredential({ home, env: KEY_ENV, model: 'grok-4.6', prefer: 'api_key' }))
+      .toMatchObject({ kind: 'api_key', source: 'XAI_API_KEY', token: 'xai-test-key' });
+    expect(resolveGrokCredential({ home, env: KEY_ENV, model: 'grok-4.6' }))
+      .toMatchObject({ kind: 'subscription', source: 'auth.json', token: 'sub-token' });
+    expect(resolveGrokCredential({ home, env: {} as NodeJS.ProcessEnv, model: 'grok-4.6', prefer: 'api_key' }))
+      .toMatchObject({ kind: 'subscription', source: 'auth.json', token: 'sub-token' });
+  });
+
+  it('API-key-first search reports the cache source when it overrides a different environment value', () => {
+    const cacheDir = mkdtempSync(join(tmpdir(), 'grok-api-key-cache-'));
+    const priorCacheDir = process.env.ELANOUS_KEY_CACHE_DIR;
+    const priorApiKey = process.env.XAI_API_KEY;
+    writeFileSync(join(cacheDir, 'xai_api_key'), 'cached-xai-key');
+    process.env.ELANOUS_KEY_CACHE_DIR = cacheDir;
+    process.env.XAI_API_KEY = 'different-env-key';
+    _resetKeyCacheForTests();
+    try {
+      const credential = resolveGrokCredential({ env: process.env, home: EMPTY_HOME(), prefer: 'api_key' });
+      expect(credential).toMatchObject({ kind: 'api_key', token: 'cached-xai-key', source: 'xai_api_key-cache' });
+    } finally {
+      if (priorCacheDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR;
+      else process.env.ELANOUS_KEY_CACHE_DIR = priorCacheDir;
+      if (priorApiKey === undefined) delete process.env.XAI_API_KEY;
+      else process.env.XAI_API_KEY = priorApiKey;
+      _resetKeyCacheForTests();
+      rmSync(cacheDir, { recursive: true, force: true });
+    }
   });
 
   it('구독이 없을 때만 API 키로 간다', () => {

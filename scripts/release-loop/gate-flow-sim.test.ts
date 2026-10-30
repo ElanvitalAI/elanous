@@ -17,15 +17,18 @@ import { createGateRunner, runGateNode, type GateRunner, type GateTools } from '
 import { withSimClock } from '../../src/ux-sim/fake-clock';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { runGraph } from '../../src/graph-runner/runner.js';
+import { debug } from '../../src/debug/log.js';
 import type { PodCommandResult, RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 
 setDefaultTimeout(60_000);
+const initialCwd = process.cwd();
+afterEach(() => { if (process.cwd() !== initialCwd) process.chdir(initialCwd); });
 
-const CUT = 'a'.repeat(40);
-const BASE = 'b'.repeat(40);
+const IMAGE_DIGEST = `sha256:${'c'.repeat(64)}`;
 const FILES = ['src/broken.test.ts', 'src/ok.test.ts'];
 /** The one new failure this scenario reproduces — the S1 node transition's payload. */
 const FAILURE = 'src/broken.test.ts > breaks';
+const RUN_ID = 'run-1e3d9b2a-2ca0-4c29-8703-242f751c4c1d';
 /** Wall time the fake Pod reports for every Job; the fake clock advances exactly this much per Pod. */
 const POD_SECONDS = 90;
 const SIM_EPOCH = Date.parse('2026-10-16T00:00:00.000Z');
@@ -91,7 +94,7 @@ function writeTools(bin: string): void {
 }
 
 /** A checkout the gate's own shells can clone: the isolated parts really run `git clone --shared`. */
-function fakeCheckout(repo: string): void {
+function fakeCheckout(repo: string): { base: string; cut: string } {
   mkdirSync(join(repo, 'src'), { recursive: true });
   mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
   mkdirSync(join(repo, 'node_modules'), { recursive: true });
@@ -100,12 +103,19 @@ function fakeCheckout(repo: string): void {
   const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
   expect(git('init', '-q').status).toBe(0);
   expect(git('add', '.').status).toBe(0);
+  expect(git('-c', 'user.name=Sim', '-c', 'user.email=sim@example.invalid', 'commit', '-qm', 'base').status).toBe(0);
+  const base = git('rev-parse', 'HEAD').stdout.trim();
+  writeFileSync(join(repo, '.sim-cut'), 'cut\n');
+  expect(git('add', '.sim-cut').status).toBe(0);
   expect(git('-c', 'user.name=Sim', '-c', 'user.email=sim@example.invalid', 'commit', '-qm', 'cut').status).toBe(0);
+  return { base, cut: git('rev-parse', 'HEAD').stdout.trim() };
 }
 
 test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transition, and the real remote calls are 0', async () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-flow-sim-'));
   dirs.push(root);
+  const repo = join(root, 'work', 'repo');
+  const { base: BASE, cut: CUT } = fakeCheckout(repo);
   const instanceRoot = join(root, 'instance');
   mkdirSync(join(instanceRoot, 'release/1.0.0'), { recursive: true });
   writeFileSync(join(instanceRoot, 'release/1.0.0/release.json'), JSON.stringify({ sourceCommit: BASE }));
@@ -113,8 +123,6 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
   writeFileSync(join(instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: BASE, failures: [] }));
   setElanousConfigDir(instanceRoot);
 
-  const repo = join(root, 'work', 'repo');
-  fakeCheckout(repo);
   writeTools(join(root, 'bin'));
   const tripwire = join(root, 'real-remote-calls.log');
 
@@ -132,6 +140,8 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
   process.env.GATE_SIM_TRIPWIRE = tripwire;
   try {
     const emitted: Array<Record<string, unknown>> = [];
+    const progressLogSpy = spyOn(debug, 'log');
+    spies.push(progressLogSpy);
     spies.push(spyOn(console, 'log').mockImplementation(((line?: unknown) => {
       if (typeof line !== 'string') return;
       try {
@@ -144,7 +154,7 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
       // ① the fake clock. Its epoch freezes the process clock for the whole run (no scenario needs real wall time), and
       // the gate's own clock starts there — every later second comes only from the Pods below, through the seam. The
       // global clock is never advanced, so a gate that read `Date.now` instead would measure 0 ms and this fails.
-      let gateNow = clock.now();
+      let progressTick: (() => void) | undefined;
       // ② the fake Pod: the production shard shell, fake bun/timeout, one artifacts dir per Job.
       const podCalls: Array<{ commit: string; files: string[] }> = [];
       const shells: string[] = [];
@@ -156,7 +166,8 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
         podCalls.push({ commit, files });
         shells.push(shell);
         // This Pod's wall time, in the gate's clock.
-        gateNow += POD_SECONDS * 1000;
+        clock.tick(POD_SECONDS * 1000);
+        progressTick?.();
         const home = join(root, `pod-home-${podCalls.length}`);
         mkdirSync(home, { recursive: true });
         const run = spawnSync('bash', ['-c', shell.replace(/^(pod_age|boot_age)=\$\(awk.*$/gm, (_line, name: string) => `${name}=0`)], {
@@ -179,7 +190,9 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
       // The seam: clock + fake Pod + fake kubectl/ssh + the shard admission. No positional fake and no pool override,
       // so the gate walks its own pool-readiness path (checkPodPool) through the injected kubectl.
       const runner = createGateRunner(repo, undefined, command, undefined, undefined, undefined,
-        { now: () => gateNow, podCommand: pod, kubectl, ssh, remoteRun,
+        { now: () => clock.now(), podCommand: pod, kubectl, ssh, remoteRun,
+          progressScheduler: (tick, intervalMs) => { expect(intervalMs).toBe(60_000); progressTick = tick; return () => { progressTick = undefined; }; },
+          podImageDigest: () => IMAGE_DIGEST,
           admission: { acquire: async () => () => {}, waitReason: () => null } });
 
       const graph = join(root, 'gate-flow-sim.yaml');
@@ -198,19 +211,23 @@ edges:
     map: { ok: done, fail: failed }
 `);
 
-      const run = await runGraph(graph, {
-        runId: 'gate-flow-sim-s1',
+      const run = await (async () => {
+        const previousCwd = process.cwd();
+        process.chdir(repo);
+        try { return await runGraph(graph, {
+        runId: RUN_ID,
         pinChildUniverse: true,
         input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gatePodPool: 'pool-sim:1', gatePodShards: 1,
           gatePodInstallSlots: 0, gatePodStallSeconds: 0, gatePodMidRunStallSeconds: 0 },
         deps: {
           root: instanceRoot,
           runBash: async (_body, opts) => {
-            const rc = await runGateNode(['--json'], opts.env!, runner);
+            const rc = await runGateNode(['--json'], opts.env!, runner, undefined, () => IMAGE_DIGEST);
             return { exitCode: rc, stdout: JSON.stringify(emitted.at(-1) ?? {}), stderr: '' };
           },
         },
-      });
+        }); } finally { process.chdir(previousCwd); }
+      })();
 
       // ── the gate node transition, verbatim ──────────────────────────────────────────────────────────────
       expect(run.status).toBe('failed');
@@ -221,14 +238,24 @@ edges:
       expect(line).toEqual({
         outcome: 'fail', verdict: 'fail', commit: CUT,
         introduced: [FAILURE], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [],
+        autoheal: { action: 'hitl', cause: 'true-regression', signature: expect.any(String), shardKey: 'gate', reason: 'measured regression requires a human decision', shardElapsedMs: POD_SECONDS * 1000 * 3, overallElapsedMs: POD_SECONDS * 1000 * 3 },
         stalledEnv: [], rcNonzeroNoFailures: [],
         // ① exactly three Pods, each ninety seconds on the injected clock: no real (or global) clock produces this.
         durationMs: POD_SECONDS * 1000 * 3,
         baselineSource: 'instance', baselineCache: { hits: 0, misses: 1 }, selectionMs: 0,
+        trainReceiptReuse: { carried: 0, total: 2, receipts: 0, reasons: ['gate receipt registry empty'] },
         summary: '게이트 regression: 1 new regressions · 환경 알려진 실패 0',
         executor: 'pod', host: null,
       });
       expect(JSON.parse(String(gateRecord.output))).toEqual(line);
+      const progressPath = join(instanceRoot, 'graph-runs/release-loop', `${RUN_ID}.json.contexts/gate-progress.jsonl`);
+      const progress = readFileSync(progressPath, 'utf8').trim().split('\n').map((row) => JSON.parse(row) as Record<string, unknown>);
+      expect(progress.some((event) => Array.isArray(event.groups)
+        && (event.groups as Array<Record<string, unknown>>).some((group) => group.state === 'running' && group.elapsedMs === POD_SECONDS * 1000))).toBe(true);
+      expect(progress.length).toBeGreaterThan(0);
+      expect(progress.every((event) => event.runId === RUN_ID && event.executor === 'pod' && event.total === 1)).toBe(true);
+      expect(progressLogSpy.mock.calls.some(([category, event, data]) => category === 'release-loop.gate' && event === 'progress'
+        && (data as Record<string, unknown> | undefined)?.runId === RUN_ID)).toBe(true);
 
       // ── the Pod stage this scenario ran, and the ledger it left ────────────────────────────────────────
       expect(podCalls).toEqual([

@@ -22,7 +22,7 @@ import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
-import { POD_JOB_DEADLINE_SECONDS, POD_DEADLINE_AFTER_WAIT, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podDeadlineWatchdogScript, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podJobFinishedTiming, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, recordPodSourceIoSummary, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
+import { POD_JOB_DEADLINE_SECONDS, POD_DEADLINE_AFTER_WAIT, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podDeadlineWatchdogScript, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podJobFinishedTiming, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, recordPodSourceIoSummary, parsePodSourceAttemptOutcome, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
 import type { SiWarmChildAttempt } from './self-implement-pod.js';
 import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
 import { stablePodRunGuard } from './pod-manifest-test-normalize.js';
@@ -63,6 +63,7 @@ import { statSync } from 'node:fs';
 import { orchestrateSelfDev } from '../../self-dev/orchestrate.js';
 import { mintGroundingToken } from '../../grounding/token.js';
 import { handlePodGithubCredential, resetPodCredentialRateForTesting } from '../../nexus/api/pod-credential-api.js';
+import { POD_DISTRIBUTOR_ENTRY_ENV, TASK_HAND_POD_DISTRIBUTOR_ENTRY } from '../../task-agent/pod-distributor-entry.js';
 
 const CREDS = () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' });
 
@@ -316,6 +317,42 @@ test('Pod slot wait records one correlated request, queue, and admission observa
     expect(slotEvents.map((row) => row.event)).toEqual(['requested', 'queued', 'admitted']);
     expect(slotEvents[1]?.data).toMatchObject({ observationKey: rows[0]?.data.observationKey, parentId: parentRunId, queued: true });
   } finally { debugSpy.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('POD-DISTRIBUTOR-WIRE routes tasks-hand Pod admission through adapter and keeps other entries direct', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-distributor-wire-'));
+  const parentRunId = 'run-pod-distributor-wire';
+  const { k, calls } = fakeKubectl(['Complete'], '{"ok":true,"stage":"complete"}\n');
+  let poolCalls = 0;
+  const pool = {
+    members: [{ context: 'pool-node-b', capacity: 3, k3dCluster: 'node-b' }],
+    tryAcquire: () => { poolCalls++; return { context: 'pool-node-b', capacity: 3 }; },
+    release: () => {}, snapshot: () => ({ 'pool-node-b': 1 }),
+  };
+  const admissions: Array<Record<string, unknown>> = [];
+  const podDistributorAdapter = { acquire: async (request: Record<string, unknown>) => {
+    admissions.push(request);
+    return { context: 'pool-node-b', capacity: 3 };
+  } };
+  try {
+    const wired = await podSelfImplementSpawn({ kubectl: k, pool: pool as never, podDistributorAdapter: podDistributorAdapter as never,
+      credentials: CREDS, pollMs: 0, sleep: async () => {},
+      env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId, [POD_DISTRIBUTOR_ENTRY_ENV]: TASK_HAND_POD_DISTRIBUTOR_ENTRY, ELANOUS_TASK_CARD_ID: 'ta-wire-1', ELANOUS_POD_OWNER_KIND: 'seat', ELANOUS_POD_OWNER_ID: 'UX' } })
+      ({ feature: 'distributor wire', spaceId: 'pod-distributor-wire-task-hand' }).done;
+    expect(wired.exitCode).toBe(0);
+    expect(admissions).toHaveLength(1);
+    expect(admissions[0]).toMatchObject({ lane: 'ta', owner: { cardId: 'ta-wire-1', seat: 'UX' }, workload: { kind: expect.any(String), memoryLimit: expect.any(String) } });
+    expect(poolCalls).toBe(0);
+    const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((manifest) => manifest.kind === 'Job');
+    expect(JSON.stringify(job)).not.toContain(POD_DISTRIBUTOR_ENTRY_ENV);
+
+    const direct = await podSelfImplementSpawn({ kubectl: k, pool: pool as never, podDistributorAdapter: podDistributorAdapter as never,
+      credentials: CREDS, pollMs: 0, sleep: async () => {}, env: { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: parentRunId } })
+      ({ feature: 'direct wire', spaceId: 'pod-distributor-wire-direct' }).done;
+    expect(direct.exitCode).toBe(0);
+    expect(admissions).toHaveLength(1);
+    expect(poolCalls).toBe(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('aborted Pod slot wait retains the first reasonCode on its no-launch result and incident rows', async () => {
@@ -715,6 +752,15 @@ describe('Pod kubectl output limit', () => {
 });
 
 describe('pod source delivery', () => {
+  test('distinguishes explicit source failure from source status that was not recorded', () => {
+    expect(parsePodSourceAttemptOutcome('ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE 1111111111111111111111111111111111111111\n', { sourceKind: 'default' }))
+      .toMatchObject({ classification: 'explicit-source-failure', sourceStage: 'base-sha', sourceKind: 'default', sourceStatus: null, failureCode: 'base-sha-unavailable' });
+    expect(parsePodSourceAttemptOutcome('ELANOUS_POD_SOURCE_IO {"sourceStatus":"incomplete","sourceVia":"image"}\n', { sourceKind: 'default' }))
+      .toMatchObject({ classification: 'status-not-recorded', sourceKind: 'default', sourceVia: 'image', sourceStatus: 'incomplete', failureCode: null });
+    expect(parsePodSourceAttemptOutcome(null, { sourceKind: 'bundle' }))
+      .toMatchObject({ classification: 'status-not-recorded', sourceKind: 'bundle', sourceStatus: null, baseSha: null, exitCode: null });
+  });
+
   test('records source IO marker as one debug event and warns on malformed marker', () => {
     const rows: Array<{ category: string; event: string; data: Record<string, unknown>; options?: { level?: string } }> = [];
     const log = (category: string, event: string, data: Record<string, unknown>, options?: { level?: string }) => rows.push({ category, event, data, options });
@@ -1399,7 +1445,7 @@ test('TA card slot reaches the Pod child as an explicit environment value', () =
   expect(manifest.spec.template.spec.containers[0]!.env).toContainEqual({ name: 'ELANOUS_POD_SLOT_ID', value: 'TA-DRAFT-NO-LEFTOVER' });
 });
 
-test('TA warm reuse decision is observed but missing TA evidence keeps the existing fresh Job path', async () => {
+test('WARM-REUSE-TA-FLAG-WIRE: TA evidence gates the injected SI warm provider and preserves fresh fallback', async () => {
   const { k, calls } = fakeKubectl(['Complete'], '');
   const warmEvents: Array<{ event: string; data: unknown }> = [];
   const logSpy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
@@ -1416,50 +1462,38 @@ test('TA warm reuse decision is observed but missing TA evidence keeps the exist
         worker: { head: 'h', main: 'm', lock: 'l' }, recentMismatchCount: 0, consecutiveMatchSamples: 3,
       },
     } as const;
+    let unmeasuredAttempts = 0;
     const unmeasuredRun = await podSelfImplementSpawn({
       kubectl: k, credentials: CREDS, env: { ELANOUS_TASK_CARD_ID: 'ta-test-card' },
       warmReuseConfig: () => ({ gateRecheck: true, land: true, ta: true }),
       warmReuseEvidence: () => evidence,
-    })({ feature: 'fix it', spaceId: 'ta-warm-shadow' }).done;
+      siWarmAttempt: async () => { unmeasuredAttempts++; return null; },
+      siWarmHostPostprocess: async (result) => result,
+    })({ feature: 'fix it', spaceId: 'ta-warm-unmeasured' }).done;
     expect(unmeasuredRun.exitCode).toBe(0);
-
+    expect(unmeasuredAttempts).toBe(0);
     expect(warmEvents).toContainEqual({ event: 'switch-decision', data: expect.objectContaining({ consumer: 'ta', live: false, reason: 'evidence-unmeasured' }) });
-    expect(warmEvents).toContainEqual({ event: 'ta-shadow-observation', data: expect.objectContaining({ consumer: 'ta', live: false, execution: 'fresh-job' }) });
+    expect(warmEvents).toContainEqual({ event: 'ta-admission-decision', data: expect.objectContaining({ consumer: 'ta', live: false, reason: 'evidence-unmeasured', execution: 'fresh-job' }) });
     const appliedJobs = calls.filter((call) => call.args.endsWith('apply -f -') && JSON.parse(call.input ?? '{}').kind === 'Job');
     expect(appliedJobs).toHaveLength(1);
 
     warmEvents.length = 0;
+    let liveAttempts = 0;
     const fullyMeasured = { ...evidence, ta: evidence.land };
     const livePath = fakeKubectl(['Complete'], '');
     const measuredRun = await podSelfImplementSpawn({
       kubectl: livePath.k, credentials: CREDS, env: { ELANOUS_TASK_CARD_ID: 'ta-test-card' },
       warmReuseConfig: () => ({ gateRecheck: true, land: true, ta: true }),
       warmReuseEvidence: () => fullyMeasured,
-    })({ feature: 'fix it', spaceId: 'ta-warm-shadow-live-decision' }).done;
+      siWarmAttempt: async () => { liveAttempts++; return null; },
+      siWarmHostPostprocess: async (result) => result,
+    })({ feature: 'fix it', spaceId: 'ta-warm-live-decision' }).done;
     expect(measuredRun.exitCode).toBe(0);
-    // `live: true` means eligible by the shadow switch only; both cases must execute an identical fresh Job spec.
+    expect(liveAttempts).toBe(1);
     expect(warmEvents).toContainEqual({ event: 'switch-decision', data: expect.objectContaining({ consumer: 'ta', live: true, reason: 'live' }) });
-    expect(warmEvents).toContainEqual({ event: 'ta-shadow-observation', data: expect.objectContaining({ consumer: 'ta', live: true, execution: 'fresh-job' }) });
+    expect(warmEvents).toContainEqual({ event: 'ta-admission-decision', data: expect.objectContaining({ consumer: 'ta', live: true, reason: 'live', execution: 'warm-attempt' }) });
     const measuredJobs = livePath.calls.filter((call) => call.args.endsWith('apply -f -') && JSON.parse(call.input ?? '{}').kind === 'Job');
     expect(measuredJobs).toHaveLength(1);
-    const jobTemplateSpec = (call: typeof appliedJobs[number]) => JSON.parse(call.input ?? '{}').spec.template.spec;
-    const comparableJobTemplateSpec = (call: typeof appliedJobs[number]) => {
-      const spec = structuredClone(jobTemplateSpec(call));
-      for (const container of spec.containers ?? []) {
-        const runId = container.env?.find((entry: { name: string }) => entry.name === 'ELANOUS_RUN_ID');
-        if (runId) runId.value = '<run-id>';
-        // POD-LAUNCH-PROVENANCE — the provenance run id and request time are launch-specific like ELANOUS_RUN_ID.
-        for (const entry of container.env ?? []) if (entry.name === 'ELANOUS_POD_RUN' || entry.name === 'ELANOUS_POD_REQUESTED_AT') entry.value = '<launch>';
-        if (typeof container.args?.[0] === 'string') container.args[0] = stablePodRunGuard(container.args[0])
-          .replace(/ELANOUS_POD_DEADLINE_RESULT [A-Za-z0-9_.:-]+ [A-Za-z0-9_.:-]+ stop-cause=/g,
-            'ELANOUS_POD_DEADLINE_RESULT <job> <run> stop-cause=');
-      }
-      for (const volume of spec.volumes ?? []) {
-        if (volume.secret?.secretName) volume.secret.secretName = '<credential-secret>';
-      }
-      return spec;
-    };
-    expect(comparableJobTemplateSpec(measuredJobs[0]!)).toEqual(comparableJobTemplateSpec(appliedJobs[0]!));
   } finally {
     logSpy.mockRestore();
   }
@@ -1468,7 +1502,7 @@ test('TA warm reuse decision is observed but missing TA evidence keeps the exist
 test('TA warm configuration failure leaves the fresh Job path available', async () => {
   const unavailable: string[] = [];
   const logSpy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: Record<string, unknown>) => {
-    if (category === 'pod.warm' && event === 'ta-shadow-unavailable') unavailable.push(String(data.reason));
+    if (category === 'pod.warm' && event === 'ta-admission-unavailable') unavailable.push(String(data.reason));
   }) as typeof debug.log);
   try {
     for (const failing of ['config', 'evidence'] as const) {
@@ -3518,6 +3552,44 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     }
   });
 
+  test('empty failed Pod logs keep the missing result and termination fields in the ledger and debug event', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-no-result-empty-observation-'));
+    const parent = 'run-parent-no-result-empty-observation';
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const base = fakeKubectl(['Failed'], 'no result here\n', 1);
+    const diagnostics: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-no-result-empty-observation', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'no-result-log-tail') diagnostics.push(record.data as Record<string, unknown>);
+    } });
+    const k: Kubectl = (args, input) => {
+      if (args.includes('logs') && args.includes('--tail=80')) return { status: 0, stdout: '', stderr: '' };
+      if (args.some((arg) => arg.includes('conditions[?(@.type=="Failed")].reason'))) return { status: 0, stdout: 'BackoffLimitExceeded', stderr: '' };
+      return base.k(args, input);
+    };
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS,
+        env: { ELANOUS_RUN_ID: parent, ELANOUS_STATE_DIR: root } })({ feature: 'empty terminal evidence', spaceId: 'no-result-empty-observation' }).done;
+      expect(result.exitCode).toBe(1);
+      const evidence = loadRunLedger(parent, runLedgerDir(root))?.find((entry) => entry.event === 'pod-child-evidence')?.data as {
+        childEvidence?: { observation?: Record<string, unknown> } } | undefined;
+      const observation = evidence?.childEvidence?.observation;
+      expect(observation).toMatchObject({
+        classification: 'insufficient-evidence', resultParsed: false, resultLineObserved: false, childLedgerResultPresent: false,
+        pod: { jobReason: 'BackoffLimitExceeded', containerReason: 'Error', exitCode: 1 },
+        childLog: { available: false, readState: 'empty', reason: 'empty log output', lines: 0, normalizedTailBytes: 0 },
+        missing: ['child-ledger-result', 'child-result-line', 'child-result-classification', 'child-log-cause-lines'],
+      });
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toMatchObject({ classification: 'insufficient-evidence', resultLineObserved: false, childLedgerResultPresent: false, childLog: { normalizedTailBytes: 0 } });
+    } finally {
+      off();
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('a failed Job with an unavailable container exit code still collects no-result logs', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-no-result-unknown-exit-'));
     const parent = 'run-parent-no-result-unknown-exit';
@@ -3835,6 +3907,44 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     expect(Object.keys(secret.stringData)).not.toContain('env-ANTHROPIC_API_KEY');
     // ⭐ 과금 키만 본다 — run-origin 칸(ELANOUS_POD_NAME 등)은 별도 시험이 문다.
     expect(job.spec.template.spec.containers[0].env.map((e: { name: string }) => e.name).filter((n: string) => n.endsWith('_API_KEY'))).toEqual(['OPENROUTER_API_KEY']);
+  });
+
+  test('delegated OpenRouter child carries the host key by Secret ref even without a provider option', async () => {
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS,
+      extraArgs: ['--child-llm-provider', 'openrouter', '--child-llm-model', 'openrouter/z-ai/glm-5.3'],
+      env: { OPENROUTER_API_KEY: 'test-openrouter-key' }, readKeyCache: () => undefined,
+      openrouterGhToken: () => 'test-gh-token' })({ feature: 'x', spaceId: 'delegated-openrouter' }).done;
+    const manifests = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+    expect(manifests).toHaveLength(2);
+    const [secret, job] = manifests;
+    expect(secret.stringData['env-OPENROUTER_API_KEY']).toBe('test-openrouter-key');
+    const keyEnv = job.spec.template.spec.containers[0].env.find((entry: { name: string }) => entry.name === 'OPENROUTER_API_KEY');
+    expect(keyEnv).toEqual({ name: 'OPENROUTER_API_KEY', valueFrom: { secretKeyRef: { name: `${job.metadata.name}-creds`, key: 'env-OPENROUTER_API_KEY' } } });
+    for (const manifest of manifests.slice(1)) expect(JSON.stringify(manifest)).not.toContain('test-openrouter-key');
+  });
+
+  test('delegated OpenRouter child refuses missing credentials before creating a Secret or Job', async () => {
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    const result = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS,
+      extraArgs: ['--child-llm-provider', 'openrouter', '--child-llm-model', 'openrouter/z-ai/glm-5.3'],
+      env: {}, readKeyCache: () => undefined, openrouterGhToken: () => 'test-gh-token' })({ feature: 'x', spaceId: 'delegated-openrouter-no-key' }).done;
+    expect(result.error?.message).toContain('Pod 에 openrouter 키 없음');
+    expect(calls.filter((c) => c.args.endsWith('apply -f -'))).toEqual([]);
+  });
+
+  test('explicit Codex child ignores a stale OpenRouter arm env and does not receive its key', async () => {
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS,
+      extraArgs: ['--child-llm-provider', 'openai-codex'],
+      armEnv: { ELANOUS_LLM_PROVIDER: 'openrouter' },
+      env: { OPENROUTER_API_KEY: 'test-openrouter-key' }, readKeyCache: () => undefined })({ feature: 'x', spaceId: 'codex-stale-openrouter-arm' }).done;
+    const manifests = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+    expect(manifests).toHaveLength(2);
+    expect(manifests[0].stringData['env-OPENROUTER_API_KEY']).toBeUndefined();
+    expect(JSON.stringify(manifests)).not.toContain('test-openrouter-key');
+    const job = manifests[1];
+    expect(job.spec.template.spec.containers[0].env.some((entry: { name: string }) => entry.name === 'OPENROUTER_API_KEY')).toBe(false);
   });
 
   test('an OpenGateway child receives only its selected billing key from the host cache', async () => {
@@ -4272,23 +4382,27 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
         }
         return device.kubectl(args, input);
       };
-      return { kubectl, calls: device.calls, jobName };
+      return { kubectl, calls: device.calls, jobName, get childRunId() { return childRunId; } };
     }
 
     async function runAndRecord(launch: ReturnType<typeof terminationLaunch>, spaceId: string, parent: string, resultMarker: boolean) {
       const root = mkdtempSync(join(tmpdir(), 'pod-termination-'));
       const previousState = process.env.ELANOUS_STATE_DIR;
       const finished: Array<Record<string, unknown>> = [];
+      const markerEvents: Array<Record<string, unknown>> = [];
       const off = debug.registerSink({ name: `pod-termination-${spaceId}`, emit: (record) => {
         if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+        if (record.category === 'self-implement.pod' && record.event === 'result-marker-early') markerEvents.push(record.data as Record<string, unknown>);
       } });
       try {
         process.env.ELANOUS_STATE_DIR = root;
         const result = await podSelfImplementSpawn({ kubectl: launch.kubectl, credentials: CREDS, sleep: async () => {}, resultMarker,
           env: { ELANOUS_RUN_ID: parent, ELANOUS_STATE_DIR: root } })({ feature: 'x', spaceId }).done;
-        const evidence = loadRunLedger(parent, runLedgerDir(root))?.filter((entry) => entry.event === 'pod-child-evidence').at(-1)?.data;
+        const ledger = loadRunLedger(parent, runLedgerDir(root)) ?? [];
+        const evidence = ledger.filter((entry) => entry.event === 'pod-child-evidence').at(-1)?.data;
+        const markerResult = ledger.filter((entry) => entry.event === 'pod-launch-finished').at(-1)?.data;
         recordClassifiedHarnessPodExit(parent, 'unknown', result.exitCode ?? 1, { output: result.output });
-        return { result, finished, evidence, exits: readRunExits(root) };
+        return { result, finished, markerEvents, evidence, markerResult, exits: readRunExits(root) };
       } finally {
         off();
         if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
@@ -4322,13 +4436,25 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       const launch = terminationLaunch({ spaceId: 'term-marker', markerRc: 3, logs: '',
         event: { kind: 'result-marker-running', jobUid: uid, jobConditionType: '', activeDeadlineSeconds: 14400, podPhase: 'Running',
           containerReason: null, containerExitCode: null, containerFinishedAt: null } });
-      const { result, finished, exits } = await runAndRecord(launch, 'term-marker', 'run-parent-term-marker', true);
+      const { result, finished, markerEvents, markerResult, exits } = await runAndRecord(launch, 'term-marker', 'run-parent-term-marker', true);
       expect(result.exitCode).toBe(1);
+      expect(markerEvents).toContainEqual(expect.objectContaining({ job: launch.jobName, runId: launch.childRunId, rc: 3 }));
+      expect(markerResult).toMatchObject({ run: launch.childRunId, exitCode: 3, phase: 'failed' });
       const expected = { job: launch.jobName, path: 'result-marker', jobLookup: 'ok', jobUid: uid, jobConditionReason: 'unknown', deadlineExceeded: 'unknown',
         activeDeadlineSeconds: 14400, podLookup: 'running', containerReason: 'unknown', exitCode: 'unknown', finishedAt: 'unknown', oomKilled: 'unknown',
         collectionAttempts: 2, collectionFailureReason: 'pod-still-running-after-retry' };
       expect(finished.at(-1)).toMatchObject({ state: 'failed', podTermination: expected });
       expect(exits).toMatchObject([{ runId: 'run-parent-term-marker', podTermination: expected }]);
+    });
+
+    test('success marker carries the same child runId and rc=0 into the parent completion row', async () => {
+      const launch = terminationLaunch({ spaceId: 'term-marker-success', markerRc: 0, logs: '',
+        event: { kind: 'result-marker-running', jobConditionType: '', activeDeadlineSeconds: 14400, podPhase: 'Running',
+          containerReason: null, containerExitCode: null, containerFinishedAt: null } });
+      const { result, markerEvents, markerResult } = await runAndRecord(launch, 'term-marker-success', 'run-parent-term-marker-success', true);
+      expect(result.exitCode).toBe(0);
+      expect(markerEvents).toContainEqual(expect.objectContaining({ job: launch.jobName, runId: launch.childRunId, rc: 0 }));
+      expect(markerResult).toMatchObject({ run: launch.childRunId, exitCode: 0, phase: 'complete' });
     });
 
     test('result marker early exit: retry captures terminated child facts in the incident', async () => {
@@ -4823,8 +4949,10 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
     const hostDir = runLedgerDir(root);
     const oldState = process.env.ELANOUS_STATE_DIR;
     const finished: Array<Record<string, unknown>> = [];
+    const sourceOutcomes: Array<Record<string, unknown>> = [];
     const logSpy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
       if (category === 'self-implement.pod' && event === 'job-finished') finished.push(data ?? {});
+      if (category === 'pod.source' && event === 'attempt-outcome') sourceOutcomes.push(data ?? {});
     }) as typeof debug.log);
     process.env.ELANOUS_STATE_DIR = root;
     try {
@@ -4841,7 +4969,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
         calls.push([...args]);
         if (args.includes('current-context')) return { status: 0, stdout: 'test-context', stderr: '' };
         if (args.includes('get')) return { status: 0, stdout: 'Complete', stderr: '' };
-        if (args.includes('logs')) return { status: 0, stdout: args.includes('--tail=400') ? `${json}\n` : `${line}\n${json}\n`, stderr: '' };
+        if (args.includes('logs')) return { status: 0, stdout: args.includes('--tail=400') ? `${json}\n` : `${line}\nELANOUS_POD_SOURCE_RESULT {"sourceStage":"source-complete","sourceKind":"default","sourceVia":"image","sourceStatus":"complete","baseSha":"${'1'.repeat(40)}","exitCode":0,"failureCode":null}\n${json}\n`, stderr: '' };
         return { status: 0, stdout: '', stderr: '' };
       };
       const result = await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: { ELANOUS_STATE_DIR: root } })({ feature: 'x', spaceId: 's' }).done;
@@ -4850,6 +4978,7 @@ mock.module(${JSON.stringify(cliModule)}, () => ({ ...cli, runSelfImplementCliCo
       expect(result.disposition?.runId).toBe(id);
       expect(result.disposition?.childRunId).toBe(id);
       expect(finished).toHaveLength(1);
+      expect(sourceOutcomes).toContainEqual(expect.objectContaining({ job: podJobName('s'), captureStatus: 'captured', classification: 'source-complete', sourceStage: 'source-complete', sourceVia: 'image', sourceStatus: 'complete' }));
       expect(finished[0]).toMatchObject({ state: 'complete', stage: 'merged', childRunId: expect.stringMatching(/^run-[0-9a-f-]{36}$/), ledgerCompleteness: 'missing' });
       expect(readFileSync(runLedgerPath(id, hostDir), 'utf8')).toBe(contents);
       expect(calls.filter((args) => args.includes('logs'))).toHaveLength(2);
@@ -5467,7 +5596,7 @@ describe('pod remote continuity', () => {
       calls.push([...args]);
       if (args.includes('current-context')) return { status: 0, stdout: 'ctx\n', stderr: '' };
       if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: existing ? 0 : 1, stdout: existing, stderr: existing ? '' : 'NotFound' };
-      if (args.includes('jsonpath={.metadata.uid}')) return { status: 0, stdout: 'uid-1', stderr: '' };
+      if (args.includes('jsonpath={.metadata.uid}')) return { status: 0, stdout: '0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b', stderr: '' };
       if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     };
@@ -5684,7 +5813,15 @@ describe('pod remote continuity', () => {
     const patch = r.calls.find((c) => c.includes('patch') && c.includes('secret'));
     expect(patch).toBeDefined();
     expect(patch!.join(' ')).toContain('"ownerReferences":[{"apiVersion":"batch/v1","kind":"Job"');
-    expect(patch!.join(' ')).toContain('"uid":"uid-1"');
+    expect(patch!.join(' ')).toContain('"uid":"0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"');
+    const secretApply = r.calls.findIndex((c) => c.includes('apply') && c.includes('-f'));
+    const jobUidRead = r.calls.findIndex((c) => c.includes('get') && c.includes('job') && c.some((a) => a === 'jsonpath={.metadata.uid}'));
+    const ownerPatch = r.calls.findIndex((c) => c.includes('patch') && c.includes('secret'));
+    const firstPodWait = r.calls.findIndex((c) => c.includes('get') && c.includes('pods'));
+    expect(secretApply).toBeGreaterThanOrEqual(0);
+    expect(jobUidRead).toBeGreaterThan(secretApply);
+    expect(ownerPatch).toBeGreaterThan(jobUidRead);
+    expect(firstPodWait === -1 || ownerPatch < firstPodWait).toBe(true);
   });
 });
 
@@ -6152,14 +6289,14 @@ fi
       // then keep byte-for-byte equality for the rest of the frozen human Job.
       const sourceStart = (script: string) => script.slice(script.indexOf('if [ -e repo ]; then exit 5; fi\n'), script.indexOf("printf 'ELANOUS_POD_SOURCE_VIA"));
       const currentSourceStart = sourceStart(child.args[0]);
-      expect(createHash('sha256').update(currentSourceStart).digest('hex')).toBe('c586f42492c51da561829089905124e4e25a901390ed10de872f5feb04d1c1f9');
+      expect(createHash('sha256').update(currentSourceStart).digest('hex')).toBe('675c538d698ae917cf228c494c5ae257545586af4c58d36690c5b039c42e4e58');
       frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!.replace(sourceStart(frozenArgs[frozenArgs.length - 1]!), currentSourceStart);
       const sourceTail = (script: string) => script.slice(script.indexOf("printf 'ELANOUS_POD_SOURCE_VIA"), script.indexOf("printf 'ELANOUS_POD_SOURCE default"));
       const currentSourceTail = sourceTail(child.args[0]);
       expect(createHash('sha256').update(currentSourceTail).digest('hex')).toBe('3aa8d082b6e63d5f9204694bcf50b2b886229c5c62353f4bb3e7a445a5ce76c8');
       frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!.replace(sourceTail(frozenArgs[frozenArgs.length - 1]!), currentSourceTail);
       const sourceIoPrelude = (script: string) => {
-        const start = script.indexOf('pod_source_io_origin_calls=');
+        const start = script.indexOf('pod_source_kind=');
         if (start < 0) return '';
         return script.slice(start, script.indexOf('if [ -e repo ]; then exit 5; fi\n', start));
       };

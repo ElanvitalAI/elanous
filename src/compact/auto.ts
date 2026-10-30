@@ -31,8 +31,15 @@ export function shouldAutoCompact(
   messages: MessageLike[],
   modelId: string | undefined,
   config: ChatAutoCompactConfig,
+  observedInputTokens?: number,
 ): AutoCompactDecision {
-  const usedTokens = estimateMessagesTokens(messages);
+  const hasObservedInputTokens = typeof observedInputTokens === 'number'
+    && Number.isFinite(observedInputTokens)
+    && observedInputTokens >= 0;
+  const estimatedTokens = estimateMessagesTokens(messages);
+  // Provider usage captures model/tokenizer overhead; current history also
+  // includes tool output appended since that provider response.
+  const usedTokens = hasObservedInputTokens ? Math.max(observedInputTokens, estimatedTokens) : estimatedTokens;
   const windowTokens = resolveModelContextWindow(modelId) ?? inferContextWindow(modelId);
   const configuredBudget = config.workingBudgetTokens;
   const budgetTokens = typeof configuredBudget === 'number'
