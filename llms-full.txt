@@ -5170,6 +5170,28 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.2.43
+
+Source: https://docs.elanous.ai/releases/0-2-43/
+
+## Behavior changes
+
+- Search tries Exa first and falls back to the existing search providers when Exa is unavailable. Target: next. (#33493)
+- Before starting a Claude or Codex mission, elanous checks installation, version, and sign-in status, and asks before installing a missing CLI. Target: next. (#33609)
+- Build a Linear work tree within the specified team scope, preview a read-only progress summary, then optionally sync it to Linear. Target: next. (#33774, #33668)
+- In the TUI sidetab, inspect Herdr session approval, completion, and stop states, then provide input when needed. Target: next. (#32560)
+- The plugin wizard gathers task results from Claude and Codex, validates the candidates, and records the selected result. Target: next. (#33951, #33993)
+- Run a research graph hand mission from the current TUI and inspect its result. Target: next. (#33859)
+- Use `eln tui test` to prepare an isolated TUI test environment and inspect its PTY, run ID, and screen snapshot path. Target: next. (#33953)
+- Claude and Codex update notices no longer block sidetab mission startup; startup failures and in-run failures are shown separately. Target: next. (#34049)
+- Temporary answers shown during research are replaced by the final synthesis, preventing duplicate answers in one turn. Target: next. (#34010)
+- Research answers lead with the conclusion and follow with supporting evidence as needed. Target: next. (#33715)
+- Results from standalone `eln research` runs are now available in `eln logs`. Target: next. (#34012)
+
+Plus 149 internal changes.
+
+---
+
 # 0.2.42
 
 Source: https://docs.elanous.ai/releases/0-2-42/
